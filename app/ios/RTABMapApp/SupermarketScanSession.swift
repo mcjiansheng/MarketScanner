@@ -42,6 +42,19 @@ enum SegmentTriggerReason: String {
     case database
     case memory
     case manual
+
+    var localizedText: String {
+        switch self {
+        case .area:
+            return "面积达到阈值"
+        case .database:
+            return "数据库达到阈值"
+        case .memory:
+            return "内存达到阈值"
+        case .manual:
+            return "手动保存"
+        }
+    }
 }
 
 final class FloorAreaEstimator {
@@ -107,6 +120,7 @@ final class SupermarketScanSession {
     private let fileManager = FileManager.default
     private let documentsDirectory: URL
     private let areaEstimator = FloorAreaEstimator()
+    private var customBaseDirectory: URL?
     private(set) var rootDirectory: URL?
     private(set) var segmentIndex: Int = 0
     private(set) var currentAreaM2: Double = 0
@@ -123,10 +137,36 @@ final class SupermarketScanSession {
         self.documentsDirectory = documentsDirectory
     }
 
+    var baseDirectory: URL {
+        return documentsDirectory
+    }
+
+    func setCustomBaseDirectory(_ url: URL?) {
+        customBaseDirectory = url
+    }
+
+    func clearCustomBaseDirectory() {
+        customBaseDirectory = nil
+    }
+
+    func refreshUnsavedSessionLocation() {
+        if segmentIndex <= 1 {
+            rootDirectory = nil
+        }
+    }
+
+    func startAccessingBaseDirectorySecurityScope() -> Bool {
+        return customBaseDirectory?.startAccessingSecurityScopedResource() ?? false
+    }
+
+    func stopAccessingBaseDirectorySecurityScope() {
+        customBaseDirectory?.stopAccessingSecurityScopedResource()
+    }
+
     func startNewSessionIfNeeded() throws {
         if rootDirectory == nil {
             let stamp = Date().getFormattedDate(format: "yyyyMMdd-HHmmss")
-            let root = documentsDirectory.appendingPathComponent("SupermarketSession-\(stamp)", isDirectory: true)
+            let root = baseDirectory.appendingPathComponent("SupermarketSession-\(stamp)", isDirectory: true)
             try fileManager.createDirectory(at: root, withIntermediateDirectories: true)
             rootDirectory = root
             segmentIndex = 1
@@ -150,6 +190,64 @@ final class SupermarketScanSession {
         let dir = rootDirectory!.appendingPathComponent(String(format: "segment_%04d", segmentIndex), isDirectory: true)
         try fileManager.createDirectory(at: dir, withIntermediateDirectories: true)
         return dir
+    }
+
+    func copySegmentToCustomBaseDirectory(from localSegmentDirectory: URL) throws -> URL? {
+        guard let customBaseDirectory = customBaseDirectory, let rootDirectory = rootDirectory else {
+            return nil
+        }
+
+        let exportRoot = customBaseDirectory.appendingPathComponent(rootDirectory.lastPathComponent, isDirectory: true)
+        let exportSegment = exportRoot.appendingPathComponent(localSegmentDirectory.lastPathComponent, isDirectory: true)
+        let localSummary = try directoryFileSummary(localSegmentDirectory)
+        try fileManager.createDirectory(at: exportRoot, withIntermediateDirectories: true)
+        if fileManager.fileExists(atPath: exportSegment.path) {
+            try fileManager.removeItem(at: exportSegment)
+        }
+        try fileManager.copyItem(at: localSegmentDirectory, to: exportSegment)
+        let exportSummary = try directoryFileSummary(exportSegment)
+        guard localSummary == exportSummary else {
+            throw NSError(
+                domain: "SupermarketScanSession",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "外部副本校验失败，本地分段已保留。"])
+        }
+        return exportSegment
+    }
+
+    func removeLocalSegmentDirectory(_ localSegmentDirectory: URL) throws {
+        guard localSegmentDirectory.path.hasPrefix(documentsDirectory.path) else {
+            throw NSError(
+                domain: "SupermarketScanSession",
+                code: 2,
+                userInfo: [NSLocalizedDescriptionKey: "拒绝删除非本地沙盒内的分段目录。"])
+        }
+        if fileManager.fileExists(atPath: localSegmentDirectory.path) {
+            try fileManager.removeItem(at: localSegmentDirectory)
+        }
+    }
+
+    private func directoryFileSummary(_ directory: URL) throws -> (files: Int, bytes: UInt64) {
+        guard let enumerator = fileManager.enumerator(
+            at: directory,
+            includingPropertiesForKeys: [.isRegularFileKey, .fileSizeKey],
+            options: [.skipsHiddenFiles]) else {
+            throw NSError(
+                domain: "SupermarketScanSession",
+                code: 3,
+                userInfo: [NSLocalizedDescriptionKey: "无法读取分段目录内容。"])
+        }
+
+        var fileCount = 0
+        var totalBytes: UInt64 = 0
+        for case let fileURL as URL in enumerator {
+            let values = try fileURL.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey])
+            if values.isRegularFile == true {
+                fileCount += 1
+                totalBytes += UInt64(values.fileSize ?? 0)
+            }
+        }
+        return (fileCount, totalBytes)
     }
 
     func updateArea(x: Float, z: Float) -> Double {
