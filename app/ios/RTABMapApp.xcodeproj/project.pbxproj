@@ -88,6 +88,7 @@
 		4EA100012F00000100100001 /* SupermarketScanSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA100012F00000100100002 /* SupermarketScanSession.swift */; };
 		4EA100012F00000100100003 /* PriceTagNFCReader.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA100012F00000100100004 /* PriceTagNFCReader.swift */; };
 		4EA100012F00000100100005 /* CoreNFC.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 4EA100012F00000100100006 /* CoreNFC.framework */; };
+		4EA200012F12B00100100001 /* Localizable.strings in Resources */ = {isa = PBXBuildFile; fileRef = 4EA200012F12B00100100002 /* Localizable.strings */; };
 		4EB1A66625A0D90B0043C7BF /* RTABMap.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EB1A66525A0D90B0043C7BF /* RTABMap.swift */; };
 		4EE016B3259BE441008CCE65 /* ViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EE016AF259BE441008CCE65 /* ViewController.swift */; };
 		4EE016B4259BE441008CCE65 /* SceneDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EE016B0259BE441008CCE65 /* SceneDelegate.swift */; };
@@ -199,6 +200,8 @@
 		4EE016B8259BE449008CCE65 /* AppDelegate.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; name = AppDelegate.swift; path = RTABMapApp/AppDelegate.swift; sourceTree = "<group>"; };
 		4EE016BC259BE45C008CCE65 /* Info.plist */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = text.plist.xml; name = Info.plist; path = RTABMapApp/Info.plist; sourceTree = "<group>"; };
 		4EE016C0259BE464008CCE65 /* Base */ = {isa = PBXFileReference; lastKnownFileType = file.storyboard; name = Base; path = RTABMapApp/Base.lproj/Main.storyboard; sourceTree = "<group>"; };
+		4EA200012F12B00100100003 /* zh-Hans */ = {isa = PBXFileReference; lastKnownFileType = text.plist.strings; name = "zh-Hans"; path = "RTABMapApp/zh-Hans.lproj/Main.strings"; sourceTree = "<group>"; };
+		4EA200012F12B00100100004 /* zh-Hans */ = {isa = PBXFileReference; lastKnownFileType = text.plist.strings; name = "zh-Hans"; path = "RTABMapApp/zh-Hans.lproj/Localizable.strings"; sourceTree = "<group>"; };
 		4EE016C2259BE464008CCE65 /* Base */ = {isa = PBXFileReference; lastKnownFileType = file.storyboard; name = Base; path = RTABMapApp/Base.lproj/LaunchScreen.storyboard; sourceTree = "<group>"; };
 		4EE016C6259BE46F008CCE65 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; name = Assets.xcassets; path = RTABMapApp/Assets.xcassets; sourceTree = "<group>"; };
 		4EE016E1259BE96A008CCE65 /* RTABMapApp-Bridging-Header.h */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.h; name = "RTABMapApp-Bridging-Header.h"; path = "RTABMapApp/RTABMapApp-Bridging-Header.h"; sourceTree = "<group>"; };
@@ -487,6 +490,7 @@
 				4EE016AF259BE441008CCE65 /* ViewController.swift */,
 				4EA100012F00000100100002 /* SupermarketScanSession.swift */,
 				4EA100012F00000100100004 /* PriceTagNFCReader.swift */,
+				4EA200012F12B00100100002 /* Localizable.strings */,
 				4EE016BF259BE464008CCE65 /* Main.storyboard */,
 				4EE016C1259BE464008CCE65 /* LaunchScreen.storyboard */,
 				4EE016BC259BE45C008CCE65 /* Info.plist */,
@@ -803,6 +807,7 @@
 			knownRegions = (
 				en,
 				Base,
+				"zh-Hans",
 			);
 			mainGroup = 4EE015B9259A2AF0008CCE65;
 			packageReferences = (
@@ -824,6 +829,7 @@
 			files = (
 				4E0D83832621F52C00C879AC /* Settings.bundle in Resources */,
 				4E20B24E266AB94300316EE6 /* Images.xcassets in Resources */,
+				4EA200012F12B00100100001 /* Localizable.strings in Resources */,
 				4EE016C3259BE464008CCE65 /* Main.storyboard in Resources */,
 				4E20B250266AB95600316EE6 /* Images.xcassets in Resources */,
 				4EE016C4259BE464008CCE65 /* LaunchScreen.storyboard in Resources */,
@@ -908,8 +914,17 @@
 			isa = PBXVariantGroup;
 			children = (
 				4EE016C0259BE464008CCE65 /* Base */,
+				4EA200012F12B00100100003 /* zh-Hans */,
 			);
 			name = Main.storyboard;
+			sourceTree = "<group>";
+		};
+		4EA200012F12B00100100002 /* Localizable.strings */ = {
+			isa = PBXVariantGroup;
+			children = (
+				4EA200012F12B00100100004 /* zh-Hans */,
+			);
+			name = Localizable.strings;
 			sourceTree = "<group>";
 		};
 		4EE016C1259BE464008CCE65 /* LaunchScreen.storyboard */ = {

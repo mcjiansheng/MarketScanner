@@ -1,0 +1,7 @@
+"Supermarket Scan" = "超市扫描";
+"When automatic segmentation is enabled, reaching any area, database size or memory threshold saves the current segment and continues scanning. Choose a local folder or external storage in Settings -> Supermarket Scan Settings inside the app." = "自动分段开启后，达到面积、数据库大小或内存阈值中的任一条件时，会保存当前分段并继续扫描。保存位置可在 App 内的“设置 -> 超市扫描设置”中选择本地文件夹或外接存储。";
+"Automatic Segment Export" = "自动分段保存";
+"Segment Area Threshold m2" = "分段面积阈值 m2";
+"Database Threshold MB" = "数据库阈值 MB";
+"Memory Threshold MB" = "内存阈值 MB";
+"Minimum Nodes Before Segment" = "分段前最少节点数";

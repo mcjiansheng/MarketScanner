@@ -28,6 +28,7 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
     private var rtabmap: RTABMap?
     private var supermarketSession: SupermarketScanSession?
     private var priceTagNFCReader: PriceTagNFCReader?
+    private var startupCompleted = false
     
     private var databases = [URL]()
     private var currentDatabaseIndex: Int = 0
@@ -59,6 +60,12 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
     private let supermarketAutoSegmentKey = "SupermarketAutoSegmentExportEnabled"
     private let supermarketSaveLocationBookmarkKey = "SupermarketSaveLocationBookmark"
     private let supermarketSaveLocationNameKey = "SupermarketSaveLocationName"
+    private let supermarketDefaultsVersionKey = "SupermarketDefaultsVersion"
+    private let supermarketDefaultAreaThresholdM2 = 120.0
+    private let supermarketDefaultDatabaseThresholdMB = 700
+    private let supermarketDefaultMemoryThresholdMB = 1200
+    private let supermarketDefaultMinimumNodes = 30
+    private let supermarketDefaultsVersion = 2
     
     // UI states
     private enum State {
@@ -73,26 +80,29 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         STATE_VISUALIZING_AND_MEASURING    // Camera/Motion on  - Showing optimized mesh without localizing and measuring tools enabled
     }
     private var mState: State = State.STATE_WELCOME;
+    private func localized(_ key: String) -> String {
+        return NSLocalizedString(key, comment: "")
+    }
     private func getStateString(state: State) -> String {
         switch state {
         case .STATE_WELCOME:
-            return "欢迎"
+            return localized("Welcome")
         case .STATE_CAMERA:
-            return "相机预览"
+            return localized("Camera Preview")
         case .STATE_MAPPING:
-            return mDataRecording ? "数据录制" : "建图中"
+            return mDataRecording ? localized("Data Recording") : localized("Mapping")
         case .STATE_PROCESSING:
-            return "处理中"
+            return localized("Processing")
         case .STATE_VISUALIZING:
-            return "查看地图"
+            return localized("Visualizing")
         case .STATE_VISUALIZING_CAMERA:
-            return "相机定位"
+            return localized("Visualizing with Camera")
         case .STATE_VISUALIZING_WHILE_LOADING:
-            return "加载中"
+            return localized("Visualizing while Loading")
         case .STATE_VISUALIZING_AND_MEASURING:
-            return "测量中"
+            return localized("Measuring")
         default: // IDLE
-            return "空闲"
+            return localized("Idle")
         }
     }
     
@@ -157,7 +167,9 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
     
     @objc func defaultsChanged(){
         print("defaultsChanged()")
-        updateDisplayFromDefaults()
+        if rtabmap != nil {
+            updateDisplayFromDefaults()
+        }
     }
     
     func showToast(message : String, seconds: Double){
@@ -244,8 +256,6 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         
         depthSupported = ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth)
         
-        rtabmap = RTABMap()
-        rtabmap?.setupCallbacksWithCPP()
         supermarketSession = SupermarketScanSession(documentsDirectory: getDocumentDirectory())
         applySupermarketSettings()
         
@@ -255,7 +265,6 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         if let view = self.view as? GLKView, let context = context {
             view.context = context
             delegate = self
-            rtabmap?.initGlContent()
         }
         
         menuButton.showsMenuAsPrimaryAction = true
@@ -277,10 +286,7 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         notificationCenter.addObserver(self, selector: #selector(appMovedToForeground), name: UIApplication.willEnterForegroundNotification, object: nil)
         notificationCenter.addObserver(self, selector: #selector(defaultsChanged), name: UserDefaults.didChangeNotification, object: nil)
         
-        rtabmap!.addObserver(self)
-        
         registerSettingsBundle()
-        updateDisplayFromDefaults()
         
         maxPolygonsPickerView = UIPickerView(frame: CGRect(x: 10, y: 50, width: 250, height: 150))
         maxPolygonsPickerView.delegate = self
@@ -297,6 +303,24 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
             self.updateState(state: self.mState)
         }
+    }
+
+    private func finishStartup() {
+        guard !startupCompleted else {
+            return
+        }
+        startupCompleted = true
+
+        rtabmap = RTABMap()
+        rtabmap?.setupCallbacksWithCPP()
+        rtabmap?.addObserver(self)
+
+        if let context = context {
+            EAGLContext.setCurrent(context)
+            rtabmap?.initGlContent()
+        }
+
+        updateDisplayFromDefaults()
     }
 
     func progressStatusUpdate() {
@@ -422,10 +446,10 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
             if self.statusShown {
                 self.statusLabel.text =
                     self.statusLabel.text! +
-                    "状态：\(self.getStateString(state: self.mState))\n" +
-                    "内存使用 (MB)：\(usedMem) / \(self.mMaximumMemory)" +
-                    String(format: "\n已扫描面积：%.1f m2", estimatedArea) +
-                    "\n当前分段：\(self.supermarketSession?.segmentIndex ?? 0)"
+                    String(format: self.localized("Status: %@\n"), self.getStateString(state: self.mState)) +
+                    String(format: self.localized("RAM Usage (MB): %d / %d"), usedMem, self.mMaximumMemory) +
+                    String(format: self.localized("\nScanned Area: %.1f m2"), estimatedArea) +
+                    String(format: self.localized("\nSegment: %d"), self.supermarketSession?.segmentIndex ?? 0)
             }
             if self.debugShown {
                 self.statusLabel.text =
@@ -484,10 +508,10 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
             {
                 if(loopClosureId > 0) {
                     if(self.mState == .STATE_VISUALIZING_CAMERA) {
-                        self.showToast(message: "已重定位！", seconds: 1);
+                        self.showToast(message: self.localized("Localized!"), seconds: 1);
                     }
                     else {
-                        self.showToast(message: "检测到闭环！", seconds: 1);
+                        self.showToast(message: self.localized("Loop closure detected!"), seconds: 1);
                     }
                 }
                 else if(rejected > 0)
@@ -496,20 +520,20 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                     {
                         if(optimizationMaxError > 0.0)
                         {
-                            self.showToast(message: String(format: "闭环被拒绝，图优化误差过大（%.3fm：ratio=%.3f < factor=%.1fx）。", optimizationMaxError, optimizationMaxErrorRatio, UserDefaults.standard.float(forKey: "MaxOptimizationError")), seconds: 1);
+                            self.showToast(message: String(format: self.localized("Loop closure rejected, too high graph optimization error (%.3fm: ratio=%.3f < factor=%.1fx)."), optimizationMaxError, optimizationMaxErrorRatio, UserDefaults.standard.float(forKey: "MaxOptimizationError")), seconds: 1);
                         }
                         else
                         {
-                            self.showToast(message: "闭环被拒绝，图优化失败！可在建图设置中尝试其他图优化器。", seconds: 1);
+                            self.showToast(message: self.localized("Loop closure rejected, graph optimization failed! You may try a different Graph Optimizer in Mapping settings."), seconds: 1);
                         }
                     }
                     else
                     {
-                        self.showToast(message: String(format: "闭环被拒绝，可靠匹配点不足（%d/%d < %d）。", inliers, matches, UserDefaults.standard.integer(forKey: "MinInliers")), seconds: 1);
+                        self.showToast(message: String(format: self.localized("Loop closure rejected, not enough inliers (%d/%d < %d)."), inliers, matches, UserDefaults.standard.integer(forKey: "MinInliers")), seconds: 1);
                     }
                 }
                 else if(landmarkDetected > 0) {
-                    self.showToast(message: "检测到标记点 \(landmarkDetected)！", seconds: 1);
+                    self.showToast(message: String(format: self.localized("Landmark %d detected!"), landmarkDetected), seconds: 1);
                 }
             }
             if(self.mState == .STATE_MAPPING)
@@ -896,163 +920,169 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         }
         
         // PointCloud menu
-        let pointCloudMenu = UIMenu(title: "点云...", children: [
-            UIAction(title: "当前密度", handler: { _ in
+        let pointCloudMenu = UIMenu(title: localized("Point cloud..."), children: [
+            UIAction(title: localized("Current Density"), handler: { _ in
                 self.export(isOBJ: false, meshing: false, regenerateCloud: false, optimized: false, optimizedMaxPolygons: 0, previousState: self.mState)
             }),
-            UIAction(title: "最高密度", handler: { _ in
+            UIAction(title: localized("Max Density"), handler: { _ in
                 self.export(isOBJ: false, meshing: false, regenerateCloud: true, optimized: false, optimizedMaxPolygons: 0, previousState: self.mState)
             })
         ])
         // Optimized Mesh menu
-        let optimizedMeshMenu = UIMenu(title: "优化网格...", children: [
-            UIAction(title: "彩色网格", handler: { _ in
+        let optimizedMeshMenu = UIMenu(title: localized("Optimized mesh..."), children: [
+            UIAction(title: localized("Colored Mesh"), handler: { _ in
                 self.exportMesh(isOBJ: false)
             }),
-            UIAction(title: "纹理网格", handler: { _ in
+            UIAction(title: localized("Textured Mesh"), handler: { _ in
                 self.exportMesh(isOBJ: true)
             })
         ])
         
         // Export menu
-        let exportMenu = UIMenu(title: "组装...", children: [pointCloudMenu, optimizedMeshMenu])
+        let exportMenu = UIMenu(title: localized("Assemble..."), children: [pointCloudMenu, optimizedMeshMenu])
         
         // Optimized Mesh menu
-        let optimizeAdvancedMenu = UIMenu(title: "高级...", children: [
-            UIAction(title: "全局轨迹图优化", handler: { _ in
+        let optimizeAdvancedMenu = UIMenu(title: localized("Advanced..."), children: [
+            UIAction(title: localized("Global Graph Optimization"), handler: { _ in
                 self.optimization(approach: 0)
             }),
-            UIAction(title: "检测更多闭环", handler: { _ in
+            UIAction(title: localized("Detect More Loop Closures"), handler: { _ in
                 self.optimization(approach: 2)
             }),
-            UIAction(title: "颜色调整（快速）", handler: { _ in
+            UIAction(title: localized("Adjust Colors (Fast)"), handler: { _ in
                 self.optimization(approach: 5)
             }),
-            UIAction(title: "颜色调整（完整）", handler: { _ in
+            UIAction(title: localized("Adjust Colors (Full)"), handler: { _ in
                 self.optimization(approach: 6)
             }),
-            UIAction(title: "网格平滑", handler: { _ in
+            UIAction(title: localized("Mesh Smoothing"), handler: { _ in
                 self.optimization(approach: 7)
             }),
-            UIAction(title: "束调整", handler: { _ in
+            UIAction(title: localized("Bundle Adjustment"), handler: { _ in
                 self.optimization(approach: 1)
             }),
-            UIAction(title: "噪声过滤", handler: { _ in
+            UIAction(title: localized("Noise Filtering"), handler: { _ in
                 self.optimization(approach: 4)
             })
         ])
         
         // Optimize menu
-        let optimizeMenu = UIMenu(title: "优化...", children: [
-            UIAction(title: "标准优化", handler: { _ in
+        let optimizeMenu = UIMenu(title: localized("Optimize..."), children: [
+            UIAction(title: localized("Standard Optimization"), handler: { _ in
                 self.optimization(approach: -1)
             }),
             optimizeAdvancedMenu])
 
         // Advanced menu
-        let advancedMenu = UIMenu(title: "高级...", children: [
-            UIAction(title: "新建数据录制", image: UIImage(systemName: "plus.app"), attributes: actionNewDataRecording ? [] : .disabled, state: .off, handler: { _ in
+        let advancedMenu = UIMenu(title: localized("Advanced..."), children: [
+            UIAction(title: localized("New Data Recording"), image: UIImage(systemName: "plus.app"), attributes: actionNewDataRecording ? [] : .disabled, state: .off, handler: { _ in
             	self.newScan(dataRecordingMode: true)
         	})
         ])
         
         // Measuring menu
-        let measuringMenu = UIMenu(title: "测量...", image: UIImage(systemName: "ruler"), children: [
-            UIAction(title: "平面到平面", image: measuringMode == 0 ? UIImage(systemName: "checkmark.circle") : UIImage(systemName: "circle"), handler: { _ in
+        let measuringMenu = UIMenu(title: localized("Measuring..."), image: UIImage(systemName: "ruler"), children: [
+            UIAction(title: localized("Plane to Plane Mode"), image: measuringMode == 0 ? UIImage(systemName: "checkmark.circle") : UIImage(systemName: "circle"), handler: { _ in
                 self.measuringMode = 0
                 self.rtabmap!.setMeasuringMode(self.measuringMode)
                 self.resetNoTouchTimer(true)
             }),
-            UIAction(title: "点到点", image: measuringMode == 2 ? UIImage(systemName: "checkmark.circle") : UIImage(systemName: "circle"), handler: { _ in
+            UIAction(title: localized("Point to Point Mode"), image: measuringMode == 2 ? UIImage(systemName: "checkmark.circle") : UIImage(systemName: "circle"), handler: { _ in
                 self.measuringMode = 2
                 self.rtabmap!.setMeasuringMode(self.measuringMode)
                 self.resetNoTouchTimer(true)
             }),
-            UIAction(title: "清除所有测量", image: UIImage(systemName: "trash"), state: .off, handler: { _ in
+            UIAction(title: localized("Clear All Measures"), image: UIImage(systemName: "trash"), state: .off, handler: { _ in
                 self.clearMeasures();
                 self.resetNoTouchTimer(true)
             })
         ])
                 
         var fileMenuChildren: [UIMenuElement] = []
-        fileMenuChildren.append(UIAction(title: "新建扫描", image: UIImage(systemName: "plus.app"), attributes: actionNewScanEnabled ? [] : .disabled, state: .off, handler: { _ in
+        let savedSegmentCount = supermarketSession?.savedSegmentDatabaseCount() ?? 0
+        let currentUnsavedSegmentCount = (self.mState == .STATE_MAPPING && self.mMapNodes > 0) ? 1 : 0
+        let mergeableSegmentCount = savedSegmentCount + currentUnsavedSegmentCount
+        fileMenuChildren.append(UIAction(title: localized("New Mapping Session"), image: UIImage(systemName: "plus.app"), attributes: actionNewScanEnabled ? [] : .disabled, state: .off, handler: { _ in
             self.newScan()
         }))
-        fileMenuChildren.append(UIAction(title: "读取价签 NFC", image: UIImage(systemName: "tag"), attributes: self.mState == .STATE_MAPPING ? [] : .disabled, state: .off, handler: { _ in
+        fileMenuChildren.append(UIAction(title: localized("Read Price Tag NFC"), image: UIImage(systemName: "tag"), attributes: self.mState == .STATE_MAPPING ? [] : .disabled, state: .off, handler: { _ in
             self.readPriceTagNFC()
         }))
-        fileMenuChildren.append(UIAction(title: "保存当前分段", image: UIImage(systemName: "externaldrive"), attributes: self.mState == .STATE_MAPPING ? [] : .disabled, state: .off, handler: { _ in
+        fileMenuChildren.append(UIAction(title: localized("Save Current Segment"), image: UIImage(systemName: "externaldrive"), attributes: self.mState == .STATE_MAPPING ? [] : .disabled, state: .off, handler: { _ in
             self.rolloverCurrentSegment(reason: .manual)
+        }))
+        fileMenuChildren.append(UIAction(title: localized("Merge Saved Segments"), image: UIImage(systemName: "square.stack.3d.up"), attributes: mergeableSegmentCount >= 2 && self.mState != .STATE_PROCESSING && !(supermarketSession?.isExportingSegment ?? false) ? [] : .disabled, state: .off, handler: { _ in
+            self.mergeSavedSegments()
         }))
         if(actionOptimizeEnabled) {
             fileMenuChildren.append(optimizeMenu)
         }
         else {
-            fileMenuChildren.append(UIAction(title: "优化...", attributes: .disabled, state: .off, handler: { _ in
+            fileMenuChildren.append(UIAction(title: localized("Optimize..."), attributes: .disabled, state: .off, handler: { _ in
             }))
         }
         if(actionExportEnabled) {
             fileMenuChildren.append(exportMenu)
         }
         else {
-            fileMenuChildren.append(UIAction(title: "组装...", attributes: .disabled, state: .off, handler: { _ in
+            fileMenuChildren.append(UIAction(title: localized("Assemble..."), attributes: .disabled, state: .off, handler: { _ in
             }))
         }
-        fileMenuChildren.append(UIAction(title: "保存", image: UIImage(systemName: "square.and.arrow.down"), attributes: actionSaveEnabled ? [] : .disabled, state: .off, handler: { _ in
+        fileMenuChildren.append(UIAction(title: localized("Save"), image: UIImage(systemName: "square.and.arrow.down"), attributes: actionSaveEnabled ? [] : .disabled, state: .off, handler: { _ in
             self.save()
         }))
-        fileMenuChildren.append(UIAction(title: "追加扫描", image: UIImage(systemName: "play.fill"), attributes: actionResumeEnabled ? [] : .disabled, state: .off, handler: { _ in
+        fileMenuChildren.append(UIAction(title: localized("Append Scan"), image: UIImage(systemName: "play.fill"), attributes: actionResumeEnabled ? [] : .disabled, state: .off, handler: { _ in
             self.resumeScan()
         }))
         if(actionMeasuringEnabled) {
             fileMenuChildren.append(measuringMenu)
         }
         else {
-            fileMenuChildren.append(UIAction(title: "测量...", image: UIImage(systemName: "ruler"), attributes: .disabled, state: .off, handler: { _ in
+            fileMenuChildren.append(UIAction(title: localized("Measuring..."), image: UIImage(systemName: "ruler"), attributes: .disabled, state: .off, handler: { _ in
             }))
         }
         fileMenuChildren.append(advancedMenu)
         
         // File menu
-        let fileMenu = UIMenu(title: "文件", options: .displayInline, children: fileMenuChildren)
+        let fileMenu = UIMenu(title: localized("File"), options: .displayInline, children: fileMenuChildren)
         
         // Visibility menu
-        let visibilityMenu = UIMenu(title: "显示...", children: [
-            UIAction(title: "状态", image: statusShown ? UIImage(systemName: "checkmark.circle") : UIImage(systemName: "circle"), attributes: (self.mState != .STATE_WELCOME) ? [] : .disabled, handler: { _ in
+        let visibilityMenu = UIMenu(title: localized("Visibility..."), children: [
+            UIAction(title: localized("Status"), image: statusShown ? UIImage(systemName: "checkmark.circle") : UIImage(systemName: "circle"), attributes: (self.mState != .STATE_WELCOME) ? [] : .disabled, handler: { _ in
                 self.statusShown = !self.statusShown
                 self.resetNoTouchTimer(true)
             }),
-            UIAction(title: "调试信息", image: debugShown ? UIImage(systemName: "checkmark.circle") : UIImage(systemName: "circle"), attributes: (self.mState != .STATE_WELCOME) ? [] : .disabled, handler: { _ in
+            UIAction(title: localized("Debug"), image: debugShown ? UIImage(systemName: "checkmark.circle") : UIImage(systemName: "circle"), attributes: (self.mState != .STATE_WELCOME) ? [] : .disabled, handler: { _ in
                 self.debugShown = !self.debugShown
                 self.resetNoTouchTimer(true)
             }),
-            UIAction(title: "显示里程计", image: odomShown ? UIImage(systemName: "checkmark.circle") : UIImage(systemName: "circle"), attributes: (self.mState == .STATE_MAPPING || self.mState == .STATE_CAMERA || self.mState == .STATE_VISUALIZING_CAMERA || self.mState == .STATE_VISUALIZING_AND_MEASURING) ? [] : .disabled, handler: { _ in
+            UIAction(title: localized("Odom Visible"), image: odomShown ? UIImage(systemName: "checkmark.circle") : UIImage(systemName: "circle"), attributes: (self.mState == .STATE_MAPPING || self.mState == .STATE_CAMERA || self.mState == .STATE_VISUALIZING_CAMERA || self.mState == .STATE_VISUALIZING_AND_MEASURING) ? [] : .disabled, handler: { _ in
                 self.odomShown = !self.odomShown
                 self.rtabmap!.setOdomCloudShown(shown: self.odomShown)
                 self.resetNoTouchTimer(true)
             }),
-            UIAction(title: "显示轨迹图", image: graphShown ? UIImage(systemName: "checkmark.circle") : UIImage(systemName: "circle"), attributes: (self.mState == .STATE_MAPPING || self.mState == .STATE_CAMERA || self.mState == .STATE_IDLE) ? [] : .disabled, handler: { _ in
+            UIAction(title: localized("Graph Visible"), image: graphShown ? UIImage(systemName: "checkmark.circle") : UIImage(systemName: "circle"), attributes: (self.mState == .STATE_MAPPING || self.mState == .STATE_CAMERA || self.mState == .STATE_IDLE) ? [] : .disabled, handler: { _ in
                 self.graphShown = !self.graphShown
                 self.rtabmap!.setGraphVisible(visible: self.graphShown)
                 self.resetNoTouchTimer(true)
             }),
-            UIAction(title: "显示栅格", image: gridShown ? UIImage(systemName: "checkmark.circle") : UIImage(systemName: "circle"), handler: { _ in
+            UIAction(title: localized("Grid Visible"), image: gridShown ? UIImage(systemName: "checkmark.circle") : UIImage(systemName: "circle"), handler: { _ in
                 self.gridShown = !self.gridShown
                 self.rtabmap!.setGridVisible(visible: self.gridShown)
                 self.resetNoTouchTimer(true)
             }),
-            UIAction(title: "优化轨迹图", image: optimizedGraphShown ? UIImage(systemName: "checkmark.circle") : UIImage(systemName: "circle"), attributes: (self.mState == .STATE_IDLE) ? [] : .disabled, handler: { _ in
+            UIAction(title: localized("Optimized Graph"), image: optimizedGraphShown ? UIImage(systemName: "checkmark.circle") : UIImage(systemName: "circle"), attributes: (self.mState == .STATE_IDLE) ? [] : .disabled, handler: { _ in
                 self.optimizedGraphShown = !self.optimizedGraphShown
                 self.rtabmap!.setGraphOptimization(enabled: self.optimizedGraphShown)
                 self.resetNoTouchTimer(true)
             })
         ])
         
-        let settingsMenu = UIMenu(title: "设置", options: .displayInline, children: [visibilityMenu,
-            UIAction(title: "超市扫描设置", image: UIImage(systemName: "slider.horizontal.3"), attributes: actionSettingsEnabled ? [] : .disabled, state: .off, handler: { _ in
+        let settingsMenu = UIMenu(title: localized("Settings"), options: .displayInline, children: [visibilityMenu,
+            UIAction(title: localized("Supermarket Scan Settings"), image: UIImage(systemName: "slider.horizontal.3"), attributes: actionSettingsEnabled ? [] : .disabled, state: .off, handler: { _ in
                 self.showSupermarketScanSettings()
             }),
-            UIAction(title: "系统设置", image: UIImage(systemName: "gearshape.2"), attributes: actionSettingsEnabled ? [] : .disabled, state: .off, handler: { _ in
+            UIAction(title: localized("System Settings"), image: UIImage(systemName: "gearshape.2"), attributes: actionSettingsEnabled ? [] : .disabled, state: .off, handler: { _ in
                 guard let settingsUrl = URL(string: UIApplication.openSettingsURLString) else {
                     return
                 }
@@ -1063,10 +1093,10 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                     })
                 }
             }),
-            UIAction(title: "恢复全部默认设置", attributes: actionSettingsEnabled ? [] : .disabled, state: .off, handler: { _ in
+            UIAction(title: localized("Restore All Default Settings"), attributes: actionSettingsEnabled ? [] : .disabled, state: .off, handler: { _ in
                 
-                let ac = UIAlertController(title: "恢复全部默认设置", message: "确定要把所有设置恢复为默认值吗？", preferredStyle: .alert)
-                ac.addAction(UIAlertAction(title: "确定", style: .default, handler: { _ in
+                let ac = UIAlertController(title: self.localized("Reset All Default Settings"), message: self.localized("Do you want to reset all settings to default?"), preferredStyle: .alert)
+                ac.addAction(UIAlertAction(title: self.localized("Yes"), style: .default, handler: { _ in
                     let notificationCenter = NotificationCenter.default
                     notificationCenter.removeObserver(self, name: UserDefaults.didChangeNotification, object: nil)
                     UserDefaults.standard.reset()
@@ -1074,7 +1104,7 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                     self.updateDisplayFromDefaults();
                     notificationCenter.addObserver(self, selector: #selector(self.defaultsChanged), name: UserDefaults.didChangeNotification, object: nil)
                 }))
-                ac.addAction(UIAlertAction(title: "取消", style: .cancel, handler: nil))
+                ac.addAction(UIAlertAction(title: self.localized("No"), style: .cancel, handler: nil))
                 self.present(ac, animated: true)
              })
         ])
@@ -1351,6 +1381,11 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         // The screen shouldn't dim during AR experiences.
         UIApplication.shared.isIdleTimerDisabled = true
     }
+
+    override func viewDidAppear(_ animated: Bool) {
+        super.viewDidAppear(animated)
+        finishStartup()
+    }
     
     var statusBarOrientation: UIInterfaceOrientation? {
         get {
@@ -1532,10 +1567,10 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
     
     func registerSettingsBundle(){
         let appDefaults: [String:Any] = [
-            supermarketAreaThresholdKey: 250.0,
-            supermarketDatabaseThresholdKey: 900,
-            supermarketMemoryThresholdKey: 2500,
-            supermarketMinimumNodesKey: 30,
+            supermarketAreaThresholdKey: supermarketDefaultAreaThresholdM2,
+            supermarketDatabaseThresholdKey: supermarketDefaultDatabaseThresholdMB,
+            supermarketMemoryThresholdKey: supermarketDefaultMemoryThresholdMB,
+            supermarketMinimumNodesKey: supermarketDefaultMinimumNodes,
             supermarketAutoSegmentKey: true
         ]
         UserDefaults.standard.register(defaults: appDefaults)
@@ -1546,6 +1581,9 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         //Get the defaults
         let defaults = UserDefaults.standard
         applySupermarketSettings()
+        guard rtabmap != nil else {
+            return
+        }
  
         //let appendMode = defaults.bool(forKey: "AppendMode")
         
@@ -1793,7 +1831,7 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                 supermarketSession?.resetCurrentSegment()
             }
             catch {
-                showToast(message: "无法创建超市扫描会话：\(error.localizedDescription)", seconds: 4)
+                showToast(message: String(format: localized("Could not create supermarket session: %@"), error.localizedDescription), seconds: 4)
                 if didStartSecurityScope {
                     supermarketSession?.stopAccessingBaseDirectorySecurityScope()
                 }
@@ -1802,7 +1840,7 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
             if didStartSecurityScope {
                 supermarketSession?.stopAccessingBaseDirectorySecurityScope()
             }
-            let inMemory = UserDefaults.standard.bool(forKey: "DatabaseInMemory") && !dataRecordingMode
+            let inMemory = dataRecordingMode ? UserDefaults.standard.bool(forKey: "DatabaseInMemory") : false
             mDataRecording = dataRecordingMode
             self.rtabmap!.setDataRecorderMode(enabled: dataRecordingMode)
             self.optimizedGraphShown = true // Always reset to true when opening a database
@@ -1858,11 +1896,12 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         }
 
         let defaults = UserDefaults.standard
+        migrateSupermarketDefaultsIfNeeded(defaults)
         mAutoSegmentExportEnabled = defaults.bool(forKey: supermarketAutoSegmentKey)
-        scanSession.areaThresholdM2 = max(1.0, supermarketDoubleDefault(supermarketAreaThresholdKey, fallback: 250.0))
-        scanSession.databaseThresholdMB = max(1, supermarketIntDefault(supermarketDatabaseThresholdKey, fallback: 900))
-        scanSession.usedMemoryThresholdMB = max(1, supermarketIntDefault(supermarketMemoryThresholdKey, fallback: 2500))
-        scanSession.minimumNodesBeforeRollover = max(1, supermarketIntDefault(supermarketMinimumNodesKey, fallback: 30))
+        scanSession.areaThresholdM2 = max(1.0, supermarketDoubleDefault(supermarketAreaThresholdKey, fallback: supermarketDefaultAreaThresholdM2))
+        scanSession.databaseThresholdMB = max(1, supermarketIntDefault(supermarketDatabaseThresholdKey, fallback: supermarketDefaultDatabaseThresholdMB))
+        scanSession.usedMemoryThresholdMB = max(1, supermarketIntDefault(supermarketMemoryThresholdKey, fallback: supermarketDefaultMemoryThresholdMB))
+        scanSession.minimumNodesBeforeRollover = max(1, supermarketIntDefault(supermarketMinimumNodesKey, fallback: supermarketDefaultMinimumNodes))
 
         if let bookmarkData = defaults.data(forKey: supermarketSaveLocationBookmarkKey) {
             do {
@@ -1888,6 +1927,30 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         }
     }
 
+    private func migrateSupermarketDefaultsIfNeeded(_ defaults: UserDefaults)
+    {
+        guard defaults.integer(forKey: supermarketDefaultsVersionKey) < supermarketDefaultsVersion else {
+            return
+        }
+
+        if defaults.object(forKey: supermarketAreaThresholdKey) == nil ||
+            abs(supermarketDoubleDefault(supermarketAreaThresholdKey, fallback: 250.0) - 250.0) < 0.001 {
+            defaults.set(supermarketDefaultAreaThresholdM2, forKey: supermarketAreaThresholdKey)
+        }
+        if defaults.object(forKey: supermarketDatabaseThresholdKey) == nil ||
+            supermarketIntDefault(supermarketDatabaseThresholdKey, fallback: 900) == 900 {
+            defaults.set(supermarketDefaultDatabaseThresholdMB, forKey: supermarketDatabaseThresholdKey)
+        }
+        if defaults.object(forKey: supermarketMemoryThresholdKey) == nil ||
+            supermarketIntDefault(supermarketMemoryThresholdKey, fallback: 2500) == 2500 {
+            defaults.set(supermarketDefaultMemoryThresholdMB, forKey: supermarketMemoryThresholdKey)
+        }
+        if defaults.object(forKey: supermarketMinimumNodesKey) == nil {
+            defaults.set(supermarketDefaultMinimumNodes, forKey: supermarketMinimumNodesKey)
+        }
+        defaults.set(supermarketDefaultsVersion, forKey: supermarketDefaultsVersionKey)
+    }
+
     private func saveSupermarketLocationBookmark(_ url: URL)
     {
         do {
@@ -1896,59 +1959,80 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
             UserDefaults.standard.set(url.lastPathComponent, forKey: supermarketSaveLocationNameKey)
         }
         catch {
-            showToast(message: "无法保存分段目录权限：\(error.localizedDescription)", seconds: 3)
+            showToast(message: String(format: localized("Could not save segment folder permission: %@"), error.localizedDescription), seconds: 3)
         }
     }
 
     private func selectedSupermarketLocationName() -> String
     {
-        return UserDefaults.standard.string(forKey: supermarketSaveLocationNameKey) ?? "默认位置"
+        return UserDefaults.standard.string(forKey: supermarketSaveLocationNameKey) ?? localized("Default Location")
+    }
+
+    private func hasEnoughLocalSpaceForSegment(at directory: URL, databaseMemoryMB: Int) -> (ok: Bool, message: String?)
+    {
+        do {
+            let values = try directory.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
+            guard let availableBytes = values.volumeAvailableCapacityForImportantUsage else {
+                return (true, nil)
+            }
+            let estimatedDatabaseBytes = Int64(max(databaseMemoryMB, 100)) * 1024 * 1024
+            let requiredBytes = estimatedDatabaseBytes * 2 + 512 * 1024 * 1024
+            if availableBytes < requiredBytes {
+                let availableGB = Double(availableBytes) / 1024.0 / 1024.0 / 1024.0
+                let requiredGB = Double(requiredBytes) / 1024.0 / 1024.0 / 1024.0
+                return (false, String(format: localized("Not enough local free space to export this segment. Available: %.1f GB, recommended: %.1f GB."), availableGB, requiredGB))
+            }
+        }
+        catch {
+            print("Could not check local free space: \(error)")
+        }
+        return (true, nil)
     }
 
     private func showSupermarketScanSettings()
     {
         applySupermarketSettings()
         let defaults = UserDefaults.standard
-        let message = "当前保存位置：\(selectedSupermarketLocationName())\n\n自动分段开启后，达到任一阈值会保存当前分段并继续扫描。"
-        let alert = UIAlertController(title: "超市扫描设置", message: message, preferredStyle: .alert)
+        let message = String(format: localized("Current save location: %@\n\nWhen automatic segmentation is enabled, reaching any threshold saves the current segment and continues scanning."), selectedSupermarketLocationName())
+        let alert = UIAlertController(title: localized("Supermarket Scan Settings"), message: message, preferredStyle: .alert)
 
         alert.addTextField { textField in
-            textField.placeholder = "扫描面积阈值 m2"
+            textField.placeholder = self.localized("Area threshold m2")
             textField.keyboardType = .decimalPad
-            textField.text = String(format: "%.0f", self.supermarketDoubleDefault(self.supermarketAreaThresholdKey, fallback: 250.0))
+            textField.text = String(format: "%.0f", self.supermarketDoubleDefault(self.supermarketAreaThresholdKey, fallback: self.supermarketDefaultAreaThresholdM2))
         }
         alert.addTextField { textField in
-            textField.placeholder = "数据库阈值 MB"
+            textField.placeholder = self.localized("Database threshold MB")
             textField.keyboardType = .numberPad
-            textField.text = "\(self.supermarketIntDefault(self.supermarketDatabaseThresholdKey, fallback: 900))"
+            textField.text = "\(self.supermarketIntDefault(self.supermarketDatabaseThresholdKey, fallback: self.supermarketDefaultDatabaseThresholdMB))"
         }
         alert.addTextField { textField in
-            textField.placeholder = "内存阈值 MB"
+            textField.placeholder = self.localized("Memory threshold MB")
             textField.keyboardType = .numberPad
-            textField.text = "\(self.supermarketIntDefault(self.supermarketMemoryThresholdKey, fallback: 2500))"
+            textField.text = "\(self.supermarketIntDefault(self.supermarketMemoryThresholdKey, fallback: self.supermarketDefaultMemoryThresholdMB))"
         }
         alert.addTextField { textField in
-            textField.placeholder = "最少节点数"
+            textField.placeholder = self.localized("Minimum node count")
             textField.keyboardType = .numberPad
-            textField.text = "\(self.supermarketIntDefault(self.supermarketMinimumNodesKey, fallback: 30))"
+            textField.text = "\(self.supermarketIntDefault(self.supermarketMinimumNodesKey, fallback: self.supermarketDefaultMinimumNodes))"
         }
 
-        alert.addAction(UIAlertAction(title: mAutoSegmentExportEnabled ? "关闭自动分段" : "开启自动分段", style: .default, handler: { _ in
+        alert.addAction(UIAlertAction(title: mAutoSegmentExportEnabled ? localized("Disable Automatic Segmentation") : localized("Enable Automatic Segmentation"), style: .default, handler: { _ in
             defaults.set(!self.mAutoSegmentExportEnabled, forKey: self.supermarketAutoSegmentKey)
             self.applySupermarketSettings()
-            self.showToast(message: self.mAutoSegmentExportEnabled ? "自动分段已开启" : "自动分段已关闭", seconds: 2)
+            self.showToast(message: self.mAutoSegmentExportEnabled ? self.localized("Automatic segmentation enabled") : self.localized("Automatic segmentation disabled"), seconds: 2)
         }))
-        alert.addAction(UIAlertAction(title: "选择保存位置", style: .default, handler: { _ in
+        alert.addAction(UIAlertAction(title: localized("Choose Save Location"), style: .default, handler: { _ in
             self.presentSupermarketSaveLocationPicker()
         }))
-        alert.addAction(UIAlertAction(title: "使用默认位置", style: .default, handler: { _ in
+        alert.addAction(UIAlertAction(title: localized("Use Default Location"), style: .default, handler: { _ in
             defaults.removeObject(forKey: self.supermarketSaveLocationBookmarkKey)
             defaults.removeObject(forKey: self.supermarketSaveLocationNameKey)
             self.applySupermarketSettings()
             self.supermarketSession?.refreshUnsavedSessionLocation()
-            self.showToast(message: "已改用默认保存位置", seconds: 2)
+            self.showToast(message: self.localized("Using default save location"), seconds: 2)
         }))
-        alert.addAction(UIAlertAction(title: "保存", style: .default, handler: { _ in
+        alert.addAction(UIAlertAction(title: localized("Save"), style: .default, handler: { _ in
             if let areaText = alert.textFields?[0].text, let area = Double(areaText), area > 0 {
                 defaults.set(area, forKey: self.supermarketAreaThresholdKey)
             }
@@ -1962,9 +2046,9 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                 defaults.set(nodes, forKey: self.supermarketMinimumNodesKey)
             }
             self.applySupermarketSettings()
-            self.showToast(message: "超市扫描设置已保存", seconds: 2)
+            self.showToast(message: self.localized("Supermarket scan settings saved"), seconds: 2)
         }))
-        alert.addAction(UIAlertAction(title: "取消", style: .cancel, handler: nil))
+        alert.addAction(UIAlertAction(title: localized("Cancel"), style: .cancel, handler: nil))
         present(alert, animated: true)
     }
 
@@ -1985,18 +2069,18 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         saveSupermarketLocationBookmark(url)
         applySupermarketSettings()
         supermarketSession?.refreshUnsavedSessionLocation()
-        showToast(message: "分段保存位置已设置为：\(url.lastPathComponent)", seconds: 3)
+        showToast(message: String(format: localized("Segment save location set to: %@"), url.lastPathComponent), seconds: 3)
     }
 
     func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController)
     {
-        showToast(message: "已取消选择保存位置", seconds: 2)
+        showToast(message: localized("Save location selection canceled"), seconds: 2)
     }
 
     func readPriceTagNFC()
     {
         guard mState == .STATE_MAPPING else {
-            showToast(message: "请先开始建图，再读取价签。", seconds: 2)
+            showToast(message: localized("Start mapping before reading a price tag."), seconds: 2)
             return
         }
         priceTagNFCReader = PriceTagNFCReader { result in
@@ -2015,9 +2099,9 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                         roll: pose.roll,
                         pitch: pose.pitch,
                         yaw: pose.yaw)
-                    self.showToast(message: "价签已记录：\(record?.tagIdentifier ?? tag.identifier)", seconds: 2)
+                    self.showToast(message: String(format: self.localized("Price tag recorded: %@"), record?.tagIdentifier ?? tag.identifier), seconds: 2)
                 case .failure(let error):
-                    self.showToast(message: "NFC 读取失败：\(error.localizedDescription)", seconds: 3)
+                    self.showToast(message: String(format: self.localized("NFC read failed: %@"), error.localizedDescription), seconds: 3)
                 }
                 self.priceTagNFCReader = nil
             }
@@ -2025,13 +2109,15 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         priceTagNFCReader?.begin()
     }
 
-    func rolloverCurrentSegment(reason: SegmentTriggerReason)
+    func rolloverCurrentSegment(reason: SegmentTriggerReason, resumeAfterSave: Bool = true, completion: ((Bool) -> Void)? = nil)
     {
         guard let scanSession = supermarketSession, !scanSession.isExportingSegment else {
+            completion?(false)
             return
         }
         guard mMapNodes > 0 else {
-            showToast(message: "还没有可保存的建图数据。", seconds: 2)
+            showToast(message: localized("No mapping data to save yet."), seconds: 2)
+            completion?(false)
             return
         }
 
@@ -2052,11 +2138,23 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
             if didStartSecurityScope {
                 scanSession.stopAccessingBaseDirectorySecurityScope()
             }
-            showToast(message: "无法创建分段文件夹：\(error.localizedDescription)", seconds: 4)
+            showToast(message: String(format: localized("Could not create segment folder: %@"), error.localizedDescription), seconds: 4)
+            completion?(false)
             return
         }
 
-        showToast(message: "正在保存分段 \(segmentIndex)（\(reason.localizedText)）...", seconds: 2)
+        let localSpaceCheck = hasEnoughLocalSpaceForSegment(at: segmentDir, databaseMemoryMB: dbMemoryMB)
+        guard localSpaceCheck.ok else {
+            scanSession.isExportingSegment = false
+            if didStartSecurityScope {
+                scanSession.stopAccessingBaseDirectorySecurityScope()
+            }
+            showToast(message: localSpaceCheck.message ?? localized("Not enough local free space to export this segment."), seconds: 5)
+            completion?(false)
+            return
+        }
+
+        showToast(message: String(format: localized("Saving segment %d (%@)..."), segmentIndex, reason.localizedText), seconds: 2)
         session.pause()
         locationManager?.stopUpdatingLocation()
         rtabmap?.setPausedMapping(paused: true)
@@ -2116,31 +2214,133 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
 
             let tmpDatabase = self.getDocumentDirectory().appendingPathComponent(self.RTABMAP_TMP_DB)
             self.rtabmap!.openDatabase(databasePath: tmpDatabase.path, databaseInMemory: false, optimize: false, clearDatabase: true)
-            self.setGLCamera(type: 0)
-            self.startCamera()
-            if previousState == .STATE_MAPPING {
-                self.rtabmap?.setPausedMapping(paused: false)
-                self.updateState(state: .STATE_MAPPING)
+            if resumeAfterSave {
+                self.setGLCamera(type: 0)
+                self.startCamera()
+                if previousState == .STATE_MAPPING {
+                    self.rtabmap?.setPausedMapping(paused: false)
+                    self.updateState(state: .STATE_MAPPING)
+                }
+                else {
+                    self.updateState(state: .STATE_CAMERA)
+                }
             }
             else {
-                self.updateState(state: .STATE_CAMERA)
+                self.setGLCamera(type: 2)
+                self.rtabmap?.setPausedMapping(paused: true)
+                self.updateState(state: .STATE_IDLE)
+                self.statusLabel.text = ""
             }
             scanSession.isExportingSegment = false
             if let copyErrorMessage = copyErrorMessage {
-                self.showToast(message: "分段 \(segmentIndex) 已保存到本地，但复制到所选位置失败：\(copyErrorMessage)", seconds: 5)
+                self.showToast(message: String(format: self.localized("Segment %d was saved locally, but copying to the selected location failed: %@"), segmentIndex, copyErrorMessage), seconds: 5)
             }
             else if copiedSegmentPath != nil, let cleanupErrorMessage = cleanupErrorMessage {
-                self.showToast(message: "分段 \(segmentIndex) 已复制到所选位置，但本地副本清理失败：\(cleanupErrorMessage)", seconds: 5)
+                self.showToast(message: String(format: self.localized("Segment %d was copied to the selected location, but local cleanup failed: %@"), segmentIndex, cleanupErrorMessage), seconds: 5)
             }
             else if copiedSegmentPath != nil && localSegmentRemoved {
-                self.showToast(message: "分段 \(segmentIndex) 已保存到所选位置并清理本地副本，继续扫描分段 \(scanSession.segmentIndex)。", seconds: 3)
+                self.showToast(message: String(format: self.localized("Segment %d was saved to the selected location and the local copy was removed. Continuing with segment %d."), segmentIndex, scanSession.segmentIndex), seconds: 3)
             }
             else if copiedSegmentPath != nil {
-                self.showToast(message: "分段 \(segmentIndex) 已复制到所选位置，继续扫描分段 \(scanSession.segmentIndex)。", seconds: 3)
+                self.showToast(message: String(format: self.localized("Segment %d was copied to the selected location. Continuing with segment %d."), segmentIndex, scanSession.segmentIndex), seconds: 3)
             }
             else {
-                self.showToast(message: "分段 \(segmentIndex) 已保存，继续扫描分段 \(scanSession.segmentIndex)。", seconds: 3)
+                self.showToast(message: String(format: self.localized("Segment %d saved. Continuing with segment %d."), segmentIndex, scanSession.segmentIndex), seconds: 3)
             }
+            completion?(true)
+        })
+    }
+
+    func mergeSavedSegments()
+    {
+        guard let scanSession = supermarketSession else {
+            return
+        }
+
+        if scanSession.isExportingSegment {
+            showToast(message: localized("A segment is already being saved. Please wait before merging."), seconds: 2)
+            return
+        }
+
+        let didStartSecurityScope = scanSession.startAccessingBaseDirectorySecurityScope()
+        var segmentDatabases = scanSession.savedSegmentDatabaseURLs()
+
+        if mState == .STATE_MAPPING && mMapNodes > 0 {
+            if didStartSecurityScope {
+                scanSession.stopAccessingBaseDirectorySecurityScope()
+            }
+            showToast(message: localized("Saving current segment before merging..."), seconds: 2)
+            rolloverCurrentSegment(reason: .manual, resumeAfterSave: false) { saved in
+                if saved {
+                    self.mergeSavedSegments()
+                }
+                else {
+                    self.showToast(message: self.localized("Current segment could not be saved, so merging was canceled."), seconds: 3)
+                }
+            }
+            return
+        }
+
+        guard segmentDatabases.count >= 2 else {
+            if didStartSecurityScope {
+                scanSession.stopAccessingBaseDirectorySecurityScope()
+            }
+            showToast(message: localized("At least two saved segment databases are required to merge."), seconds: 3)
+            return
+        }
+
+        session.pause()
+        locationManager?.stopUpdatingLocation()
+        rtabmap?.setPausedMapping(paused: true)
+        rtabmap?.stopCamera()
+        segmentDatabases = segmentDatabases.sorted { $0.lastPathComponent < $1.lastPathComponent }
+
+        let outputName = "SupermarketMerged-\(Date().getFormattedDate(format: "yyMMdd-HHmmss")).db"
+        let outputURL = getDocumentDirectory().appendingPathComponent(outputName)
+        let previousState = mState
+        let alertView = UIAlertController(
+            title: localized("Merging Segments"),
+            message: String(format: localized("Merging %d saved segment databases..."), segmentDatabases.count),
+            preferredStyle: .alert)
+        alertView.addAction(UIAlertAction(title: localized("Cancel"), style: .cancel, handler: { _ in
+            self.dismiss(animated: true)
+            self.progressView = nil
+            self.rtabmap?.cancelProcessing()
+        }))
+
+        updateState(state: .STATE_PROCESSING)
+        present(alertView, animated: true, completion: {
+            let margin: CGFloat = 8.0
+            let rect = CGRect(x: margin, y: 84.0, width: alertView.view.frame.width - margin * 2.0, height: 2.0)
+            self.progressView = UIProgressView(frame: rect)
+            self.progressView!.progress = 0
+            self.progressView!.tintColor = self.view.tintColor
+            alertView.view.addSubview(self.progressView!)
+
+            var success = false
+            DispatchQueue.background(background: {
+                success = self.rtabmap?.mergeDatabases(
+                    inputDatabasePaths: segmentDatabases.map { $0.path },
+                    outputDatabasePath: outputURL.path) ?? false
+            }, completion: {
+                if didStartSecurityScope {
+                    scanSession.stopAccessingBaseDirectorySecurityScope()
+                }
+
+                self.dismiss(animated: true, completion: {
+                    self.progressView = nil
+                    if success {
+                        self.openedDatabasePath = outputURL
+                        self.updateDatabases()
+                        self.showToast(message: String(format: self.localized("Merged %d segments into %@."), segmentDatabases.count, outputName), seconds: 3)
+                        self.openDatabase(fileUrl: outputURL)
+                    }
+                    else {
+                        self.updateState(state: previousState)
+                        self.showToast(message: self.localized("Segment merge failed."), seconds: 4)
+                    }
+                })
+            })
         })
     }
     
@@ -2392,6 +2592,17 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
     
     private func optimization(withStandardMeshExport: Bool = false, approach: Int)
     {
+        guard mMapNodes > 0 else {
+            let savedSegments = supermarketSession?.savedSegmentDatabaseCount() ?? 0
+            if savedSegments > 0 {
+                showToast(message: String(format: localized("%d saved segment databases are available. Use Merge Saved Segments to combine them."), savedSegments), seconds: 5)
+            }
+            else {
+                showToast(message: localized("No mapping data to optimize yet."), seconds: 3)
+            }
+            return
+        }
+
         if(mState == State.STATE_VISUALIZING)
         {
             closeVisualization()
@@ -2465,11 +2676,12 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
     
     func stopMapping(ignoreSaving: Bool, offerPostProcessing: Bool = true)
     {
+        let hasCurrentMapData = mMapNodes > 0
         session.pause()
         locationManager?.stopUpdatingLocation()
         rtabmap?.setPausedMapping(paused: true)
         rtabmap?.stopCamera()
-        if(mDataRecording) {
+        if(mDataRecording && hasCurrentMapData) {
             // this will show the trajectory before saving
             self.rtabmap!.setGraphOptimization(enabled: false)
         }
@@ -2480,7 +2692,7 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         }
         updateState(state: mState == .STATE_VISUALIZING_CAMERA || mState == .STATE_VISUALIZING_AND_MEASURING ? .STATE_VISUALIZING : .STATE_IDLE);
         
-        if !ignoreSaving
+        if !ignoreSaving && hasCurrentMapData
         {
             if(mDataRecording || !offerPostProcessing)
             {
@@ -2490,27 +2702,27 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
             else
             {
                 dismiss(animated: true, completion: {
-                    var msg = "是否现在执行标准轨迹图优化，并生成一个组装后的网格模型？也可以稍后在“优化”和“组装”菜单中执行。"
+                    var msg = self.localized("Do you want to do standard graph optimization and make a nice assembled mesh now? This can also be done later using the Optimize and Assemble menus.")
                     let depthUsed = self.depthSupported && UserDefaults.standard.bool(forKey: "LidarMode")
                     if !depthUsed
                     {
-                        msg = "是否现在执行标准轨迹图优化？也可以稍后在“优化”菜单中执行。"
+                        msg = self.localized("Do you want to do standard graph optimization now? This can also be done later using the Optimize menu.")
                     }
-                    let alert = UIAlertController(title: "建图已停止，是否现在优化？", message: msg, preferredStyle: .alert)
+                    let alert = UIAlertController(title: self.localized("Mapping Stopped! Optimize Now?"), message: msg, preferredStyle: .alert)
                     if depthUsed {
-                        let alertActionOnlyGraph = UIAlertAction(title: "仅优化", style: .default)
+                        let alertActionOnlyGraph = UIAlertAction(title: self.localized("Only Optimize"), style: .default)
                         {
                             (UIAlertAction) -> Void in
                             self.optimization(withStandardMeshExport: false, approach: -1)
                         }
                         alert.addAction(alertActionOnlyGraph)
                     }
-                    let alertActionNo = UIAlertAction(title: "先保存", style: .cancel) {
+                    let alertActionNo = UIAlertAction(title: self.localized("Save First"), style: .cancel) {
                         (UIAlertAction) -> Void in
                         self.save()
                     }
                     alert.addAction(alertActionNo)
-                    let alertActionYes = UIAlertAction(title: "是", style: .default) {
+                    let alertActionYes = UIAlertAction(title: self.localized("Yes"), style: .default) {
                         (UIAlertAction) -> Void in
                         self.optimization(withStandardMeshExport: depthUsed, approach: -1)
                     }
@@ -2519,8 +2731,12 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                 })
             }
         }
-        else if(mMapNodes == 0)
+        else if(!hasCurrentMapData)
         {
+            let savedSegments = supermarketSession?.savedSegmentDatabaseCount() ?? 0
+            if !ignoreSaving && savedSegments > 0 {
+                showToast(message: String(format: localized("%d saved segment databases are available. Use Merge Saved Segments to combine them."), savedSegments), seconds: 5)
+            }
             updateState(state: State.STATE_WELCOME);
             statusLabel.text = ""
         }

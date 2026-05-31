@@ -10,15 +10,15 @@
 			<key>Type</key>
 			<string>PSGroupSpecifier</string>
 			<key>Title</key>
-			<string>超市扫描</string>
+			<string>Supermarket Scan</string>
 			<key>FooterText</key>
-			<string>自动分段开启后，达到面积、数据库大小或内存阈值中的任一条件时，会保存当前分段并继续扫描。保存位置可在 App 内的“设置 -> 超市扫描设置”中选择本地文件夹或外接存储。</string>
+			<string>When automatic segmentation is enabled, reaching any area, database size or memory threshold saves the current segment and continues scanning. Choose a local folder or external storage in Settings -> Supermarket Scan Settings inside the app.</string>
 		</dict>
 		<dict>
 			<key>Type</key>
 			<string>PSToggleSwitchSpecifier</string>
 			<key>Title</key>
-			<string>自动分段保存</string>
+			<string>Automatic Segment Export</string>
 			<key>Key</key>
 			<string>SupermarketAutoSegmentExportEnabled</string>
 			<key>DefaultValue</key>
@@ -28,11 +28,11 @@
 			<key>Type</key>
 			<string>PSTextFieldSpecifier</string>
 			<key>Title</key>
-			<string>分段面积阈值 m2</string>
+			<string>Segment Area Threshold m2</string>
 			<key>Key</key>
 			<string>SupermarketAreaThresholdM2</string>
 			<key>DefaultValue</key>
-			<string>250</string>
+			<string>120</string>
 			<key>KeyboardType</key>
 			<string>NumbersAndPunctuation</string>
 		</dict>
@@ -40,11 +40,11 @@
 			<key>Type</key>
 			<string>PSTextFieldSpecifier</string>
 			<key>Title</key>
-			<string>数据库阈值 MB</string>
+			<string>Database Threshold MB</string>
 			<key>Key</key>
 			<string>SupermarketDatabaseThresholdMB</string>
 			<key>DefaultValue</key>
-			<string>900</string>
+			<string>700</string>
 			<key>KeyboardType</key>
 			<string>NumberPad</string>
 		</dict>
@@ -52,11 +52,11 @@
 			<key>Type</key>
 			<string>PSTextFieldSpecifier</string>
 			<key>Title</key>
-			<string>内存阈值 MB</string>
+			<string>Memory Threshold MB</string>
 			<key>Key</key>
 			<string>SupermarketUsedMemoryThresholdMB</string>
 			<key>DefaultValue</key>
-			<string>2500</string>
+			<string>1200</string>
 			<key>KeyboardType</key>
 			<string>NumberPad</string>
 		</dict>
@@ -64,7 +64,7 @@
 			<key>Type</key>
 			<string>PSTextFieldSpecifier</string>
 			<key>Title</key>
-			<string>分段前最少节点数</string>
+			<string>Minimum Nodes Before Segment</string>
 			<key>Key</key>
 			<string>SupermarketMinimumNodesBeforeRollover</string>
 			<key>DefaultValue</key>
