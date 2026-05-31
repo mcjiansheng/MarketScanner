@@ -163,6 +163,7 @@ class RTABMapApp : public UEventsHandler {
   void save(const std::string & databasePath);
   bool recover(const std::string & from, const std::string & to);
   void cancelProcessing();
+  bool mergeDatabases(const std::string & inputDatabasePaths, const std::string & outputDatabasePath);
   bool exportMesh(
 		  float cloudVoxelSize,
 		  bool regenerateCloud,

@@ -140,7 +140,7 @@ class RTABMap {
     
     func save(databasePath:String) {
         databasePath.utf8CString.withUnsafeBufferPointer { buffer in
-            saveNative(native_rtabmap, databasePath)
+            saveNative(native_rtabmap, buffer.baseAddress)
         }
     }
     
@@ -148,6 +148,14 @@ class RTABMap {
         from.utf8CString.withUnsafeBufferPointer { bufferFrom -> Bool in
             to.utf8CString.withUnsafeBufferPointer { bufferTo -> Bool in
                 return recoverNative(native_rtabmap, bufferFrom.baseAddress, bufferTo.baseAddress)
+            }
+        }
+    }
+
+    func mergeDatabases(inputDatabasePaths: [String], outputDatabasePath: String) -> Bool {
+        inputDatabasePaths.joined(separator: ";").utf8CString.withUnsafeBufferPointer { bufferInput -> Bool in
+            outputDatabasePath.utf8CString.withUnsafeBufferPointer { bufferOutput -> Bool in
+                return mergeDatabasesNative(native_rtabmap, bufferInput.baseAddress, bufferOutput.baseAddress)
             }
         }
     }
@@ -597,4 +605,3 @@ extension String {
     return UnsafePointer<UInt8>(buffer)
   }
 }
-

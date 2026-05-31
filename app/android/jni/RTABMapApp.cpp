@@ -64,6 +64,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <rtabmap/core/Memory.h>
 #include <rtabmap/core/GainCompensator.h>
 #include <rtabmap/core/DBDriver.h>
+#include <rtabmap/core/DBReader.h>
 #include <rtabmap/core/Recovery.h>
 #include <rtabmap/core/lidar/LidarVLP16.h>
 #include <pcl/common/common.h>
@@ -3330,6 +3331,140 @@ void RTABMapApp::cancelProcessing()
 	progressionStatus_.setCanceled(true);
 }
 
+bool RTABMapApp::mergeDatabases(const std::string & inputDatabasePaths, const std::string & outputDatabasePath)
+{
+	std::list<std::string> databases = uSplit(inputDatabasePaths, ';');
+	if(databases.size() < 2)
+	{
+		UERROR("At least two input databases are required for merging.");
+		return false;
+	}
+
+	int totalIds = 0;
+	for(std::list<std::string>::const_iterator iter = databases.begin(); iter != databases.end(); ++iter)
+	{
+		if(!UFile::exists(*iter))
+		{
+			UERROR("Input database \"%s\" doesn't exist!", iter->c_str());
+			return false;
+		}
+		if(UFile::getExtension(*iter).compare("db") != 0)
+		{
+			UERROR("Input file \"%s\" is not a database (*.db).", iter->c_str());
+			return false;
+		}
+
+		std::shared_ptr<rtabmap::DBDriver> dbDriver(rtabmap::DBDriver::create());
+		if(!dbDriver->openConnection(*iter, false))
+		{
+			UERROR("Failed opening input database \"%s\".", iter->c_str());
+			return false;
+		}
+		std::set<int> ids;
+		dbDriver->getAllNodeIds(ids, false, false, true);
+		if(ids.empty())
+		{
+			UWARN("Input database \"%s\" doesn't have any nodes saved in it.", iter->c_str());
+		}
+		totalIds += (int)ids.size();
+		dbDriver->closeConnection(false);
+	}
+
+	if(totalIds == 0)
+	{
+		UERROR("Input databases don't contain any nodes to merge.");
+		return false;
+	}
+
+	if(UFile::exists(outputDatabasePath))
+	{
+		UFile::erase(outputDatabasePath);
+	}
+
+	rtabmap::ParametersMap parameters = getRtabmapParameters();
+	uInsert(parameters, rtabmap::ParametersPair(rtabmap::Parameters::kRtabmapWorkingDirectory(), UDirectory::getDir(outputDatabasePath)));
+	uInsert(parameters, rtabmap::ParametersPair(rtabmap::Parameters::kDbSqlite3InMemory(), "false"));
+	uInsert(parameters, rtabmap::ParametersPair(rtabmap::Parameters::kMemIncrementalMemory(), "true"));
+	uInsert(parameters, rtabmap::ParametersPair(rtabmap::Parameters::kMemGenerateIds(), "true"));
+	uInsert(parameters, rtabmap::ParametersPair(rtabmap::Parameters::kMemUseOdomFeatures(), "false"));
+	uInsert(parameters, rtabmap::ParametersPair(rtabmap::Parameters::kRtabmapPublishStats(), "true"));
+
+	bool intermediateNodes = rtabmap::Parameters::defaultRtabmapCreateIntermediateNodes();
+	rtabmap::Parameters::parse(parameters, rtabmap::Parameters::kRtabmapCreateIntermediateNodes(), intermediateNodes);
+	bool rgbdEnabled = rtabmap::Parameters::defaultRGBDEnabled();
+	rtabmap::Parameters::parse(parameters, rtabmap::Parameters::kRGBDEnabled(), rgbdEnabled);
+	bool odometryIgnored = !rgbdEnabled;
+
+	progressionStatus_.reset(totalIds);
+	progressionStatus_.setCanceled(false);
+
+	rtabmap::Rtabmap merged;
+	merged.init(parameters, outputDatabasePath);
+
+	rtabmap::DBReader * dbReader = new rtabmap::DBReader(
+			databases,
+			0,
+			odometryIgnored,
+			false,
+			false,
+			0,
+			std::vector<unsigned int>(),
+			0,
+			!intermediateNodes,
+			false,
+			true,
+			0,
+			-1,
+			false,
+			false);
+	if(!dbReader->init())
+	{
+		UERROR("Failed initializing database reader for merge.");
+		delete dbReader;
+		merged.close(false);
+		return false;
+	}
+
+	rtabmap::SensorCaptureInfo info;
+	rtabmap::SensorData data = dbReader->takeData(&info);
+	int processed = 0;
+	while(data.isValid() && !progressionStatus_.isCanceled())
+	{
+		if(!odometryIgnored && !info.odomCovariance.empty() && info.odomCovariance.at<double>(0,0) >= 9999 && processed > 0)
+		{
+			merged.triggerNewMap();
+		}
+
+		if(!odometryIgnored && info.odomPose.isNull())
+		{
+			UWARN("Skipping node %d as it doesn't have odometry pose set.", data.id());
+		}
+		else if(!merged.process(data, info.odomPose, info.odomCovariance, info.odomVelocity))
+		{
+			UWARN("Failed processing node %d while merging.", data.id());
+		}
+
+		++processed;
+		progressionStatus_.increment();
+		data = dbReader->takeData(&info);
+	}
+
+	delete dbReader;
+
+	if(progressionStatus_.isCanceled())
+	{
+		merged.close(false);
+		if(UFile::exists(outputDatabasePath))
+		{
+			UFile::erase(outputDatabasePath);
+		}
+		return false;
+	}
+
+	merged.close(true);
+	return processed > 0 && UFile::exists(outputDatabasePath);
+}
+
 bool RTABMapApp::exportMesh(
 		float cloudVoxelSize,
 		bool regenerateCloud,
@@ -5099,4 +5234,3 @@ bool RTABMapApp::handleEvent(UEvent * event)
 	}
 	return false;
 }
-

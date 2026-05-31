@@ -37,6 +37,7 @@ int openDatabaseNative(const void *object, const char * databasePath, bool datab
 void saveNative(const void *object, const char * databasePath);
 bool recoverNative(const void *object, const char * from, const char * to);
 void cancelProcessingNative(const void * object);
+bool mergeDatabasesNative(const void *object, const char * inputDatabasePaths, const char * outputDatabasePath);
 int postProcessingNative(const void *object, int approach);
 bool exportMeshNative(
             const void *object,

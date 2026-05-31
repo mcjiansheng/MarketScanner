@@ -120,6 +120,19 @@ void cancelProcessingNative(const void *object)
     }
 }
 
+bool mergeDatabasesNative(const void *object, const char * inputDatabasePaths, const char * outputDatabasePath)
+{
+    if(object)
+    {
+        return native(object)->mergeDatabases(inputDatabasePaths, outputDatabasePath);
+    }
+    else
+    {
+        UERROR("object is null!");
+    }
+    return false;
+}
+
 int postProcessingNative(const void *object, int approach)
 {
     if(object)

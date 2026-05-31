@@ -46,13 +46,13 @@ enum SegmentTriggerReason: String {
     var localizedText: String {
         switch self {
         case .area:
-            return "面积达到阈值"
+            return NSLocalizedString("area threshold reached", comment: "Segment trigger reason")
         case .database:
-            return "数据库达到阈值"
+            return NSLocalizedString("database threshold reached", comment: "Segment trigger reason")
         case .memory:
-            return "内存达到阈值"
+            return NSLocalizedString("memory threshold reached", comment: "Segment trigger reason")
         case .manual:
-            return "手动保存"
+            return NSLocalizedString("manual save", comment: "Segment trigger reason")
         }
     }
 }
@@ -192,6 +192,45 @@ final class SupermarketScanSession {
         return dir
     }
 
+    func savedSegmentDatabaseURLs() -> [URL] {
+        guard let rootDirectory = rootDirectory,
+              segmentIndex > 1 else {
+            return []
+        }
+
+        var roots = [rootDirectory]
+        if let customBaseDirectory = customBaseDirectory {
+            roots.append(customBaseDirectory.appendingPathComponent(rootDirectory.lastPathComponent, isDirectory: true))
+        }
+
+        var urlsByPath = [String: URL]()
+        for root in roots {
+            guard let enumerator = fileManager.enumerator(
+                at: root,
+                includingPropertiesForKeys: [.isRegularFileKey],
+                options: [.skipsHiddenFiles]) else {
+                continue
+            }
+
+            for case let fileURL as URL in enumerator {
+                guard fileURL.pathExtension == "db",
+                      fileURL.lastPathComponent.hasPrefix("rtabmap_segment_") else {
+                    continue
+                }
+                if let values = try? fileURL.resourceValues(forKeys: [.isRegularFileKey]),
+                   values.isRegularFile == true {
+                    urlsByPath[fileURL.path] = fileURL
+                }
+            }
+        }
+
+        return urlsByPath.values.sorted { $0.path < $1.path }
+    }
+
+    func savedSegmentDatabaseCount() -> Int {
+        return savedSegmentDatabaseURLs().count
+    }
+
     func copySegmentToCustomBaseDirectory(from localSegmentDirectory: URL) throws -> URL? {
         guard let customBaseDirectory = customBaseDirectory, let rootDirectory = rootDirectory else {
             return nil
@@ -210,7 +249,7 @@ final class SupermarketScanSession {
             throw NSError(
                 domain: "SupermarketScanSession",
                 code: 1,
-                userInfo: [NSLocalizedDescriptionKey: "外部副本校验失败，本地分段已保留。"])
+                userInfo: [NSLocalizedDescriptionKey: NSLocalizedString("External copy verification failed. The local segment was kept.", comment: "Segment copy verification error")])
         }
         return exportSegment
     }
@@ -220,7 +259,7 @@ final class SupermarketScanSession {
             throw NSError(
                 domain: "SupermarketScanSession",
                 code: 2,
-                userInfo: [NSLocalizedDescriptionKey: "拒绝删除非本地沙盒内的分段目录。"])
+                userInfo: [NSLocalizedDescriptionKey: NSLocalizedString("Refused to delete a segment outside the local app sandbox.", comment: "Segment cleanup safety error")])
         }
         if fileManager.fileExists(atPath: localSegmentDirectory.path) {
             try fileManager.removeItem(at: localSegmentDirectory)
@@ -235,7 +274,7 @@ final class SupermarketScanSession {
             throw NSError(
                 domain: "SupermarketScanSession",
                 code: 3,
-                userInfo: [NSLocalizedDescriptionKey: "无法读取分段目录内容。"])
+                userInfo: [NSLocalizedDescriptionKey: NSLocalizedString("Unable to read the segment directory contents.", comment: "Segment directory read error")])
         }
 
         var fileCount = 0
