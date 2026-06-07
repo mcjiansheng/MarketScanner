@@ -187,6 +187,10 @@ final class SupermarketScanSession {
         return documentsDirectory
     }
 
+    var hasCustomBaseDirectory: Bool {
+        return customBaseDirectory != nil
+    }
+
     func setCustomBaseDirectory(_ url: URL?) {
         customBaseDirectory = url
     }

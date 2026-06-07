@@ -2141,6 +2141,7 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         let area = scanSession.currentAreaM2
         let usedMem = mMaximumMemory - getAvailableMemory()
         let dbMemoryMB = mLatestDatabaseMemoryMB
+        let rolloverStartedAt = Date()
 
         let segmentDir: URL
         do {
@@ -2188,37 +2189,24 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
             thresholdUsedMemoryMB: scanSession.usedMemoryThresholdMB,
             priceTagCount: scanSession.priceTags.count)
 
-        var copiedSegmentPath: String?
-        var copyErrorMessage: String?
-        var cleanupErrorMessage: String?
-        var localSegmentRemoved = false
+        var localSaveSeconds = 0.0
+        var sidecarSeconds = 0.0
         DispatchQueue.background(background: {
+            let saveStartedAt = Date()
             self.rtabmap?.save(databasePath: databasePath)
+            localSaveSeconds = Date().timeIntervalSince(saveStartedAt)
             do {
+                let sidecarStartedAt = Date()
                 try scanSession.writeSidecarFiles(to: segmentDir, metadata: metadata)
+                sidecarSeconds = Date().timeIntervalSince(sidecarStartedAt)
             }
             catch {
                 print("Could not write segment sidecar files: \(error)")
             }
-            do {
-                if let copiedSegment = try scanSession.copySegmentToCustomBaseDirectory(from: segmentDir) {
-                    copiedSegmentPath = copiedSegment.path
-                    do {
-                        try scanSession.removeLocalSegmentDirectory(segmentDir)
-                        localSegmentRemoved = true
-                    }
-                    catch {
-                        cleanupErrorMessage = error.localizedDescription
-                        print("Could not remove local segment after external copy: \(error)")
-                    }
-                }
-            }
-            catch {
-                copyErrorMessage = error.localizedDescription
-                print("Could not copy segment to selected location: \(error)")
-            }
         }, completion: {
-            if didStartSecurityScope {
+            let resumeStartedAt = Date()
+            let needsBackgroundCopy = scanSession.hasCustomBaseDirectory
+            if didStartSecurityScope && !needsBackgroundCopy {
                 scanSession.stopAccessingBaseDirectorySecurityScope()
             }
             scanSession.nextSegment()
@@ -2248,6 +2236,68 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                 self.statusLabel.text = ""
             }
             scanSession.isExportingSegment = false
+            let resumeSeconds = Date().timeIntervalSince(resumeStartedAt)
+            let pausedSeconds = Date().timeIntervalSince(rolloverStartedAt)
+            print(String(format: "Segment %d rollover timing: save=%.2fs sidecar=%.2fs resume=%.2fs paused=%.2fs",
+                         segmentIndex, localSaveSeconds, sidecarSeconds, resumeSeconds, pausedSeconds))
+
+            if needsBackgroundCopy {
+                self.showToast(message: String(format: self.localized("Segment %d saved locally. Continuing with segment %d while copying in background."), segmentIndex, scanSession.segmentIndex), seconds: 3)
+                self.copySegmentInBackground(
+                    scanSession: scanSession,
+                    segmentDir: segmentDir,
+                    segmentIndex: segmentIndex,
+                    didStartSecurityScope: didStartSecurityScope,
+                    localSaveSeconds: localSaveSeconds,
+                    sidecarSeconds: sidecarSeconds,
+                    pausedSeconds: pausedSeconds)
+            }
+            else {
+                self.showToast(message: String(format: self.localized("Segment %d saved. Continuing with segment %d. Pause: %.1fs."), segmentIndex, scanSession.segmentIndex, pausedSeconds), seconds: 3)
+            }
+            completion?(true)
+        })
+    }
+
+    private func copySegmentInBackground(scanSession: SupermarketScanSession,
+                                         segmentDir: URL,
+                                         segmentIndex: Int,
+                                         didStartSecurityScope: Bool,
+                                         localSaveSeconds: Double,
+                                         sidecarSeconds: Double,
+                                         pausedSeconds: Double)
+    {
+        var copiedSegmentPath: String?
+        var copyErrorMessage: String?
+        var cleanupErrorMessage: String?
+        var localSegmentRemoved = false
+        var copySeconds = 0.0
+        DispatchQueue.background(background: {
+            let copyStartedAt = Date()
+            do {
+                if let copiedSegment = try scanSession.copySegmentToCustomBaseDirectory(from: segmentDir) {
+                    copiedSegmentPath = copiedSegment.path
+                    do {
+                        try scanSession.removeLocalSegmentDirectory(segmentDir)
+                        localSegmentRemoved = true
+                    }
+                    catch {
+                        cleanupErrorMessage = error.localizedDescription
+                        print("Could not remove local segment after external copy: \(error)")
+                    }
+                }
+            }
+            catch {
+                copyErrorMessage = error.localizedDescription
+                print("Could not copy segment to selected location: \(error)")
+            }
+            copySeconds = Date().timeIntervalSince(copyStartedAt)
+        }, completion: {
+            if didStartSecurityScope {
+                scanSession.stopAccessingBaseDirectorySecurityScope()
+            }
+            print(String(format: "Segment %d background copy timing: save=%.2fs sidecar=%.2fs paused=%.2fs copy=%.2fs",
+                         segmentIndex, localSaveSeconds, sidecarSeconds, pausedSeconds, copySeconds))
             if let copyErrorMessage = copyErrorMessage {
                 self.showToast(message: String(format: self.localized("Segment %d was saved locally, but copying to the selected location failed: %@"), segmentIndex, copyErrorMessage), seconds: 5)
             }
@@ -2255,15 +2305,11 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                 self.showToast(message: String(format: self.localized("Segment %d was copied to the selected location, but local cleanup failed: %@"), segmentIndex, cleanupErrorMessage), seconds: 5)
             }
             else if copiedSegmentPath != nil && localSegmentRemoved {
-                self.showToast(message: String(format: self.localized("Segment %d was saved to the selected location and the local copy was removed. Continuing with segment %d."), segmentIndex, scanSession.segmentIndex), seconds: 3)
+                self.showToast(message: String(format: self.localized("Segment %d was copied to the selected location in background and the local copy was removed. Copy: %.1fs."), segmentIndex, copySeconds), seconds: 3)
             }
             else if copiedSegmentPath != nil {
-                self.showToast(message: String(format: self.localized("Segment %d was copied to the selected location. Continuing with segment %d."), segmentIndex, scanSession.segmentIndex), seconds: 3)
+                self.showToast(message: String(format: self.localized("Segment %d was copied to the selected location in background. Copy: %.1fs."), segmentIndex, copySeconds), seconds: 3)
             }
-            else {
-                self.showToast(message: String(format: self.localized("Segment %d saved. Continuing with segment %d."), segmentIndex, scanSession.segmentIndex), seconds: 3)
-            }
-            completion?(true)
         })
     }
 
