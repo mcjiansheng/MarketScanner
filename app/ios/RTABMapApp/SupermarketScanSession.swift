@@ -7,6 +7,7 @@
 //
 
 import Foundation
+import UIKit
 
 struct PriceTagRecord: Codable {
     let id: Int
@@ -35,6 +36,13 @@ struct ScanSegmentMetadata: Codable {
     let thresholdDatabaseMB: Int
     let thresholdUsedMemoryMB: Int
     let priceTagCount: Int
+}
+
+struct ScanAreaCells: Codable {
+    let segmentIndex: Int
+    let cellSizeM: Double
+    let scanRadiusM: Double
+    let cells: [[Int]]
 }
 
 enum SegmentTriggerReason: String {
@@ -97,6 +105,31 @@ final class FloorAreaEstimator {
 
     var areaM2: Double {
         return Double(occupiedCells.count) * cellSize * cellSize
+    }
+
+    var cellSizeM: Double {
+        return cellSize
+    }
+
+    var scanRadiusM: Double {
+        return scanRadius
+    }
+
+    func occupiedCellCoordinates() -> [[Int]] {
+        return occupiedCells.compactMap { key in
+            let parts = key.split(separator: ":")
+            guard parts.count == 2,
+                  let x = Int(parts[0]),
+                  let y = Int(parts[1]) else {
+                return nil
+            }
+            return [x, y]
+        }.sorted {
+            if $0[0] == $1[0] {
+                return $0[1] < $1[1]
+            }
+            return $0[0] < $1[0]
+        }
     }
 
     private func markDisk(x: Double, z: Double) {
@@ -344,6 +377,14 @@ final class SupermarketScanSession {
             to: segmentDirectory.appendingPathComponent("price_tags.csv"),
             atomically: true,
             encoding: .utf8)
+
+        let areaCells = ScanAreaCells(
+            segmentIndex: metadata.segmentIndex,
+            cellSizeM: areaEstimator.cellSizeM,
+            scanRadiusM: areaEstimator.scanRadiusM,
+            cells: areaEstimator.occupiedCellCoordinates())
+        let areaCellsData = try encoder.encode(areaCells)
+        try areaCellsData.write(to: segmentDirectory.appendingPathComponent("scan_area_cells.json"), options: .atomic)
     }
 
     private func priceTagsCSV() -> String {
@@ -371,5 +412,253 @@ final class SupermarketScanSession {
     private func csv(_ value: String) -> String {
         let escaped = value.replacingOccurrences(of: "\"", with: "\"\"")
         return "\"\(escaped)\""
+    }
+
+    func generate2DMapPackage() throws -> URL {
+        guard let rootDirectory = rootDirectory else {
+            throw NSError(
+                domain: "SupermarketScanSession",
+                code: 10,
+                userInfo: [NSLocalizedDescriptionKey: NSLocalizedString("No supermarket scan session is available.", comment: "2D map generation error")])
+        }
+
+        let outputRoot: URL
+        if let customBaseDirectory = customBaseDirectory {
+            outputRoot = customBaseDirectory.appendingPathComponent(rootDirectory.lastPathComponent, isDirectory: true)
+        }
+        else {
+            outputRoot = rootDirectory
+        }
+        try fileManager.createDirectory(at: outputRoot, withIntermediateDirectories: true)
+
+        let segmentDirectories = savedSegmentDirectories()
+        guard !segmentDirectories.isEmpty else {
+            throw NSError(
+                domain: "SupermarketScanSession",
+                code: 11,
+                userInfo: [NSLocalizedDescriptionKey: NSLocalizedString("No saved segments are available for 2D map generation.", comment: "2D map generation error")])
+        }
+
+        var areaCellsBySegment = [Int: ScanAreaCells]()
+        var tags = [PriceTagRecord]()
+        var metadataList = [ScanSegmentMetadata]()
+        let decoder = JSONDecoder()
+        for segmentDirectory in segmentDirectories {
+            if let data = try? Data(contentsOf: segmentDirectory.appendingPathComponent("scan_area_cells.json")),
+               let cells = try? decoder.decode(ScanAreaCells.self, from: data) {
+                areaCellsBySegment[cells.segmentIndex] = cells
+            }
+            if let data = try? Data(contentsOf: segmentDirectory.appendingPathComponent("price_tags.json")),
+               let segmentTags = try? decoder.decode([PriceTagRecord].self, from: data) {
+                tags.append(contentsOf: segmentTags)
+            }
+            if let data = try? Data(contentsOf: segmentDirectory.appendingPathComponent("metadata.json")),
+               let metadata = try? decoder.decode(ScanSegmentMetadata.self, from: data) {
+                metadataList.append(metadata)
+            }
+        }
+
+        guard !areaCellsBySegment.isEmpty else {
+            throw NSError(
+                domain: "SupermarketScanSession",
+                code: 12,
+                userInfo: [NSLocalizedDescriptionKey: NSLocalizedString("Saved segments do not contain 2D scan coverage sidecar files. Save a new segment before generating a mobile 2D map.", comment: "2D map generation error")])
+        }
+
+        let mapDirectory = outputRoot.appendingPathComponent("Map2D-\(Date().getFormattedDate(format: "yyyyMMdd-HHmmss"))", isDirectory: true)
+        try fileManager.createDirectory(at: mapDirectory, withIntermediateDirectories: true)
+
+        let cellSize = areaCellsBySegment.values.map { $0.cellSizeM }.min() ?? 0.25
+        let allCells = areaCellsBySegment.values.flatMap { cells in
+            cells.cells.map { (segment: cells.segmentIndex, x: $0[0], y: $0[1]) }
+        }
+        let minCellX = allCells.map { $0.x }.min() ?? 0
+        let maxCellX = allCells.map { $0.x }.max() ?? 0
+        let minCellY = allCells.map { $0.y }.min() ?? 0
+        let maxCellY = allCells.map { $0.y }.max() ?? 0
+        let marginCells = 8
+        let originCellX = minCellX - marginCells
+        let originCellY = minCellY - marginCells
+        let width = max(1, maxCellX - minCellX + marginCells * 2 + 1)
+        let height = max(1, maxCellY - minCellY + marginCells * 2 + 1)
+        var freeCells = Set<String>()
+        for cell in allCells {
+            freeCells.insert("\(cell.x):\(cell.y)")
+        }
+
+        let imageSize = CGSize(width: width, height: height)
+        let renderer = UIGraphicsImageRenderer(size: imageSize)
+        let occupancyImage = renderer.image { context in
+            UIColor(white: 0.74, alpha: 1.0).setFill()
+            context.fill(CGRect(origin: .zero, size: imageSize))
+            UIColor.white.setFill()
+            for key in freeCells {
+                let parts = key.split(separator: ":")
+                guard parts.count == 2,
+                      let x = Int(parts[0]),
+                      let y = Int(parts[1]) else {
+                    continue
+                }
+                let px = x - originCellX
+                let py = height - 1 - (y - originCellY)
+                context.fill(CGRect(x: px, y: py, width: 1, height: 1))
+            }
+        }
+        try occupancyImage.pngData()?.write(to: mapDirectory.appendingPathComponent("occupancy_grid.png"), options: .atomic)
+
+        let previewImage = renderer.image { context in
+            occupancyImage.draw(in: CGRect(origin: .zero, size: imageSize))
+            UIColor.systemGreen.setFill()
+            for tag in tags {
+                let cellX = Int(floor(Double(tag.x) / cellSize))
+                let cellY = Int(floor(Double(tag.z) / cellSize))
+                let px = cellX - originCellX
+                let py = height - 1 - (cellY - originCellY)
+                context.cgContext.fillEllipse(in: CGRect(x: px - 2, y: py - 2, width: 5, height: 5))
+            }
+        }
+        try previewImage.pngData()?.write(to: mapDirectory.appendingPathComponent("preview.png"), options: .atomic)
+
+        let originX = Double(originCellX) * cellSize
+        let originY = Double(originCellY) * cellSize
+        let gridAreaM2 = Double(width * height) * cellSize * cellSize
+        let scannedAreaM2 = Double(freeCells.count) * cellSize * cellSize
+        let unknownAreaM2 = max(0, gridAreaM2 - scannedAreaM2)
+
+        try writeText(
+            [
+                "image: occupancy_grid.png",
+                String(format: "resolution: %.6f", cellSize),
+                String(format: "origin: [%.6f, %.6f, 0.0]", originX, originY),
+                "negate: 0",
+                "occupied_thresh: 0.65",
+                "free_thresh: 0.20",
+                ""
+            ].joined(separator: "\n"),
+            to: mapDirectory.appendingPathComponent("occupancy_grid.yaml"))
+
+        try writeJSON([
+            "format": "SupermarketMobileMap2D",
+            "version": 1,
+            "generatedAt": Date().getFormattedDate(format: "yyyy-MM-dd HH:mm:ss"),
+            "sourceSession": rootDirectory.lastPathComponent,
+            "coordinateFrame": [
+                "name": "map_2d",
+                "horizontalAxes": "x/z",
+                "origin": [originX, originY],
+                "resolutionM": cellSize
+            ],
+            "outputs": [
+                "occupancy_grid.png",
+                "occupancy_grid.yaml",
+                "preview.png",
+                "semantic_layers.json",
+                "price_tags.geojson",
+                "quality_report.json"
+            ]
+        ], to: mapDirectory.appendingPathComponent("map.json"))
+
+        try writeJSON([
+            "layers": [
+                ["id": "walkable_confirmed", "kind": "scan_coverage", "areaM2": scannedAreaM2],
+                ["id": "unknown", "kind": "unobserved", "areaM2": unknownAreaM2]
+            ]
+        ], to: mapDirectory.appendingPathComponent("semantic_layers.json"))
+
+        try writeJSON(priceTagsGeoJSON(tags: tags), to: mapDirectory.appendingPathComponent("price_tags.geojson"))
+
+        try writeJSON([
+            "generatedAt": Date().getFormattedDate(format: "yyyy-MM-dd HH:mm:ss"),
+            "session": rootDirectory.lastPathComponent,
+            "segmentCount": segmentDirectories.count,
+            "segments": metadataList.map {
+                [
+                    "segmentIndex": $0.segmentIndex,
+                    "nodeCount": $0.nodeCount,
+                    "knownAreaM2": $0.knownAreaM2,
+                    "databaseMemoryMB": $0.databaseMemoryMB,
+                    "usedMemoryMB": $0.usedMemoryMB,
+                    "priceTagCount": $0.priceTagCount
+                ]
+            },
+            "grid": [
+                "width": width,
+                "height": height,
+                "resolutionM": cellSize,
+                "scannedAreaM2": scannedAreaM2,
+                "unknownAreaM2": unknownAreaM2,
+                "freeCellCount": freeCells.count
+            ],
+            "priceTags": [
+                "total": tags.count,
+                "needsReview": tags.count
+            ],
+            "warnings": [
+                "Mobile 2D map uses scan coverage sidecars and price tags only. Run the offline Supermarket2DMap tool for structural occupied layers from point clouds."
+            ]
+        ], to: mapDirectory.appendingPathComponent("quality_report.json"))
+
+        return mapDirectory
+    }
+
+    private func savedSegmentDirectories() -> [URL] {
+        guard let rootDirectory = rootDirectory else {
+            return []
+        }
+
+        var roots = [rootDirectory]
+        if let customBaseDirectory = customBaseDirectory {
+            roots.append(customBaseDirectory.appendingPathComponent(rootDirectory.lastPathComponent, isDirectory: true))
+        }
+
+        var directoriesByIndex = [Int: URL]()
+        for root in roots {
+            guard let children = try? fileManager.contentsOfDirectory(at: root, includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsHiddenFiles]) else {
+                continue
+            }
+            for child in children where child.lastPathComponent.hasPrefix("segment_") {
+                guard let values = try? child.resourceValues(forKeys: [.isDirectoryKey]),
+                      values.isDirectory == true,
+                      let index = Int(child.lastPathComponent.replacingOccurrences(of: "segment_", with: "")) else {
+                    continue
+                }
+                directoriesByIndex[index] = child
+            }
+        }
+
+        return directoriesByIndex.keys.sorted().compactMap { directoriesByIndex[$0] }
+    }
+
+    private func priceTagsGeoJSON(tags: [PriceTagRecord]) -> [String: Any] {
+        return [
+            "type": "FeatureCollection",
+            "features": tags.map { tag in
+                [
+                    "type": "Feature",
+                    "properties": [
+                        "tag_id": tag.tagIdentifier,
+                        "payload": tag.payload,
+                        "segment": tag.segmentIndex,
+                        "node_count": tag.nodeCount,
+                        "confidence": 0.35,
+                        "needs_review": true,
+                        "timestamp": tag.timestamp
+                    ],
+                    "geometry": [
+                        "type": "Point",
+                        "coordinates": [tag.x, tag.z]
+                    ]
+                ]
+            }
+        ]
+    }
+
+    private func writeText(_ text: String, to url: URL) throws {
+        try text.write(to: url, atomically: true, encoding: .utf8)
+    }
+
+    private func writeJSON(_ object: Any, to url: URL) throws {
+        let data = try JSONSerialization.data(withJSONObject: object, options: [.prettyPrinted, .sortedKeys])
+        try data.write(to: url, options: .atomic)
     }
 }

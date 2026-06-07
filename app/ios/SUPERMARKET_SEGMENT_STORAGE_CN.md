@@ -10,6 +10,8 @@
 
 ```text
 当前分段采集
+  -> 使用磁盘临时数据库，避免大型分段长期占用大量 RAM
+  -> 保存前检查本地临时空间是否足够
   -> RTAB-Map 原生数据库先保存到 App 本地沙盒
   -> 写出 metadata.json / price_tags.json / price_tags.csv
   -> 如果用户选择了外部保存位置，复制整个 segment 到外部目录
@@ -35,6 +37,17 @@
 
 如果用户没有选择保存位置，系统使用默认 App Documents 目录，并保留本地 segment。
 
+当前默认阈值偏向保守，适合先保证大场景稳定：
+
+```text
+扫描面积阈值 = 120 m2
+数据库阈值 = 700 MB
+内存阈值 = 1200 MB
+分段前最少节点数 = 30
+```
+
+如果现场设备内存和存储余量更充足，可以在 App 内适当调高；如果导出时仍有闪退或系统内存警告，应继续调低面积或内存阈值。
+
 ## 输出目录结构
 
 每次扫描会话会创建一个目录：
@@ -46,14 +59,31 @@ SupermarketSession-YYYYMMDD-HHMMSS/
     metadata.json
     price_tags.json
     price_tags.csv
+    scan_area_cells.json
   segment_0002/
     rtabmap_segment_0002.db
     metadata.json
     price_tags.json
     price_tags.csv
+    scan_area_cells.json
 ```
 
 如果选择了外部保存位置，外部目录中会生成同样的 `SupermarketSession-...` 目录。复制成功并校验通过后，本地 `segment_000x` 会被删除，继续扫描时只保留当前正在使用的临时数据库和后续分段所需的运行数据。
+
+`scan_area_cells.json` 是手机端二维地图生成使用的轻量扫描覆盖栅格。它记录当前分段面积估算器中已覆盖的地面栅格，不包含重型点云或货架结构。App 菜单中的 `生成二维地图包` 会读取各分段的 `scan_area_cells.json` 和 `price_tags.json`，生成 `Map2D-...` 目录：
+
+```text
+Map2D-YYYYMMDD-HHMMSS/
+  map.json
+  occupancy_grid.png
+  occupancy_grid.yaml
+  preview.png
+  semantic_layers.json
+  price_tags.geojson
+  quality_report.json
+```
+
+手机端二维地图包主要用于快速查看扫描覆盖范围和价签位置。需要更精细的墙体、货架、障碍物 occupied 图层时，应使用离线 `tools/Supermarket2DMap` 工具并输入点云/局部栅格导出的结构点。
 
 ## 自动分段触发条件
 
@@ -62,10 +92,12 @@ SupermarketSession-YYYYMMDD-HHMMSS/
 ```text
 估算扫描面积 >= 用户设置的面积阈值
 RTAB-Map 数据库内存 >= 用户设置的数据库阈值
-App 已用内存 >= 用户设置的内存阈值
+当前分段内 App 内存增长 >= 用户设置的内存阈值
 ```
 
 同时需要当前分段节点数达到“分段前最少节点数”，避免刚开始扫描时过早切分。
+
+内存阈值使用“当前分段开始后的内存增长”，而不是 App 启动后的总内存占用。这样可以避免第一次分段保存、复制和重开数据库后留下的系统缓存被算入后续分段，导致后续分段越来越小。
 
 ## 失败保护
 
@@ -79,6 +111,11 @@ App 已用内存 >= 用户设置的内存阈值
 处理结果如下：
 
 ```text
+本地临时空间不足
+  -> 不开始导出
+  -> 保持当前扫描数据
+  -> 显示空间不足提示
+
 外部复制成功且校验成功
   -> 删除本地 segment 副本
 
@@ -104,7 +141,8 @@ RTAB-Map 数据库保存由原生 C++ 层执行。iOS 的外接盘、文件提�
 
 ## 注意事项
 
-- 本地仍需要容纳“当前正在保存的单个 segment”的临时空间。
+- 本地仍需要容纳“当前正在保存的单个 segment”的临时空间，并且导出时会预留额外安全余量。
+- 超市扫描会强制使用磁盘临时数据库，不使用 `Database in Memory`，以降低大分段保存时的内存峰值。
 - 外部设备拔出、权限变化或空间不足时，系统会保留本地副本。
 - 复制和清理发生在每次分段保存时，分段阈值越小，本地峰值存储越可控，但保存次数会更多。
 - 用户更换保存位置后，新的分段会复制到新的位置；已成功导出的旧分段不会自动迁移。

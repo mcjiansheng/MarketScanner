@@ -50,6 +50,7 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
     private var mReviewRequested = false
     
     private var mMaximumMemory: Int = 0
+    private var mSegmentStartUsedMemoryMB: Int = 0
     private var mLatestDatabaseMemoryMB: Int = 0
     private var mLatestPose = (x: Float(0), y: Float(0), z: Float(0), roll: Float(0), pitch: Float(0), yaw: Float(0))
     private var mAutoSegmentExportEnabled = true
@@ -421,7 +422,8 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                            yaw: Float)
     {
         let availableMem = self.getAvailableMemory()
-        let usedMem = self.mMaximumMemory - availableMem;
+        let usedMem = max(0, self.mMaximumMemory - availableMem)
+        let segmentUsedMem = max(0, usedMem - self.mSegmentStartUsedMemoryMB)
         
         if(loopClosureId > 0)
         {
@@ -448,6 +450,7 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                     self.statusLabel.text! +
                     String(format: self.localized("Status: %@\n"), self.getStateString(state: self.mState)) +
                     String(format: self.localized("RAM Usage (MB): %d / %d"), usedMem, self.mMaximumMemory) +
+                    String(format: self.localized("\nSegment RAM Growth (MB): %d"), segmentUsedMem) +
                     String(format: self.localized("\nScanned Area: %.1f m2"), estimatedArea) +
                     String(format: self.localized("\nSegment: %d"), self.supermarketSession?.segmentIndex ?? 0)
             }
@@ -540,7 +543,7 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
             {
                 if let session = self.supermarketSession,
                    self.mAutoSegmentExportEnabled,
-                   let reason = session.rolloverReason(nodes: nodes, databaseMemoryMB: databaseMemoryUsed, usedMemoryMB: usedMem) {
+                   let reason = session.rolloverReason(nodes: nodes, databaseMemoryMB: databaseMemoryUsed, usedMemoryMB: segmentUsedMem) {
                     self.rolloverCurrentSegment(reason: reason)
                     return
                 }
@@ -647,7 +650,7 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         rtabmap!.setCamera(type: type);
     }
     
-    func startCamera()
+    func startCamera(resetTracking: Bool = true)
     {
         switch AVCaptureDevice.authorizationStatus(for: .video) {
             case .authorized: // The user has previously granted access to the camera.
@@ -673,7 +676,8 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                 	}
             	}
                 
-                session.run(configuration, options: [.resetSceneReconstruction, .resetTracking, .removeExistingAnchors])
+                let runOptions: ARSession.RunOptions = resetTracking ? [.resetSceneReconstruction, .resetTracking, .removeExistingAnchors] : []
+                session.run(configuration, options: runOptions)
                 
                 switch mState {
                 case .STATE_VISUALIZING_AND_MEASURING,
@@ -1013,6 +1017,9 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         }))
         fileMenuChildren.append(UIAction(title: localized("Merge Saved Segments"), image: UIImage(systemName: "square.stack.3d.up"), attributes: mergeableSegmentCount >= 2 && self.mState != .STATE_PROCESSING && !(supermarketSession?.isExportingSegment ?? false) ? [] : .disabled, state: .off, handler: { _ in
             self.mergeSavedSegments()
+        }))
+        fileMenuChildren.append(UIAction(title: localized("Generate 2D Map Package"), image: UIImage(systemName: "map"), attributes: mergeableSegmentCount > 0 && self.mState != .STATE_PROCESSING && !(supermarketSession?.isExportingSegment ?? false) ? [] : .disabled, state: .off, handler: { _ in
+            self.generate2DMapPackage()
         }))
         if(actionOptimizeEnabled) {
             fileMenuChildren.append(optimizeMenu)
@@ -1845,6 +1852,8 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
             self.rtabmap!.setDataRecorderMode(enabled: dataRecordingMode)
             self.optimizedGraphShown = true // Always reset to true when opening a database
             self.rtabmap!.openDatabase(databasePath: tmpDatabase.path, databaseInMemory: inMemory, optimize: false, clearDatabase: true)
+            self.mLatestDatabaseMemoryMB = 0
+            self.mSegmentStartUsedMemoryMB = max(0, self.mMaximumMemory - self.getAvailableMemory())
             
             if(!(self.mState == State.STATE_CAMERA || self.mState == State.STATE_MAPPING))
             {
@@ -2209,14 +2218,16 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
             }
             scanSession.nextSegment()
             self.mMapNodes = 0
+            self.mLatestDatabaseMemoryMB = 0
             self.mTotalLoopClosures = 0
             self.lowMemoryWarningShown = false
 
             let tmpDatabase = self.getDocumentDirectory().appendingPathComponent(self.RTABMAP_TMP_DB)
             self.rtabmap!.openDatabase(databasePath: tmpDatabase.path, databaseInMemory: false, optimize: false, clearDatabase: true)
+            self.mSegmentStartUsedMemoryMB = max(0, self.mMaximumMemory - self.getAvailableMemory())
             if resumeAfterSave {
                 self.setGLCamera(type: 0)
-                self.startCamera()
+                self.startCamera(resetTracking: false)
                 if previousState == .STATE_MAPPING {
                     self.rtabmap?.setPausedMapping(paused: false)
                     self.updateState(state: .STATE_MAPPING)
@@ -2341,6 +2352,58 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                     }
                 })
             })
+        })
+    }
+
+    func generate2DMapPackage()
+    {
+        guard let scanSession = supermarketSession else {
+            return
+        }
+
+        if scanSession.isExportingSegment {
+            showToast(message: localized("A segment is already being saved. Please wait before generating the 2D map."), seconds: 2)
+            return
+        }
+
+        if mState == .STATE_MAPPING && mMapNodes > 0 {
+            showToast(message: localized("Saving current segment before generating the 2D map..."), seconds: 2)
+            rolloverCurrentSegment(reason: .manual, resumeAfterSave: false) { saved in
+                if saved {
+                    self.generate2DMapPackage()
+                }
+                else {
+                    self.showToast(message: self.localized("Current segment could not be saved, so 2D map generation was canceled."), seconds: 3)
+                }
+            }
+            return
+        }
+
+        let didStartSecurityScope = scanSession.startAccessingBaseDirectorySecurityScope()
+        let previousState = mState
+        updateState(state: .STATE_PROCESSING)
+        showToast(message: localized("Generating 2D map package..."), seconds: 2)
+
+        var outputURL: URL?
+        var errorMessage: String?
+        DispatchQueue.background(background: {
+            do {
+                outputURL = try scanSession.generate2DMapPackage()
+            }
+            catch {
+                errorMessage = error.localizedDescription
+            }
+        }, completion: {
+            if didStartSecurityScope {
+                scanSession.stopAccessingBaseDirectorySecurityScope()
+            }
+            self.updateState(state: previousState)
+            if let outputURL = outputURL {
+                self.showToast(message: String(format: self.localized("2D map package generated: %@"), outputURL.lastPathComponent), seconds: 4)
+            }
+            else {
+                self.showToast(message: String(format: self.localized("2D map generation failed: %@"), errorMessage ?? self.localized("Unknown error")), seconds: 5)
+            }
         })
     }
     

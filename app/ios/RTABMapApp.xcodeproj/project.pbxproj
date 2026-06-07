@@ -180,9 +180,6 @@
 		4E2C516525A63119005CEDBD /* DatabaseView.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; name = DatabaseView.swift; path = RTABMapApp/DatabaseView.swift; sourceTree = "<group>"; };
 		4E2C516625A63119005CEDBD /* VerticalScrollerView.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; name = VerticalScrollerView.swift; path = RTABMapApp/VerticalScrollerView.swift; sourceTree = "<group>"; };
 		4E3525562DE4C6E500F39D8F /* libg2o_solver_cholmod.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libg2o_solver_cholmod.a; path = RTABMapApp/Libraries/lib/libg2o_solver_cholmod.a; sourceTree = "<group>"; };
-		4EA100012F00000100100002 /* SupermarketScanSession.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = SupermarketScanSession.swift; path = RTABMapApp/SupermarketScanSession.swift; sourceTree = "<group>"; };
-		4EA100012F00000100100004 /* PriceTagNFCReader.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = PriceTagNFCReader.swift; path = RTABMapApp/PriceTagNFCReader.swift; sourceTree = "<group>"; };
-		4EA100012F00000100100006 /* CoreNFC.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = CoreNFC.framework; path = System/Library/Frameworks/CoreNFC.framework; sourceTree = SDKROOT; };
 		4E3525582DE4C6F600F39D8F /* libcholmod.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libcholmod.a; path = RTABMapApp/Libraries/lib/libcholmod.a; sourceTree = "<group>"; };
 		4E35255A2DE4C71000F39D8F /* libcxsparse.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libcxsparse.a; path = RTABMapApp/Libraries/lib/libcxsparse.a; sourceTree = "<group>"; };
 		4E35255B2DE4C71000F39D8F /* libcolamd.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libcolamd.a; path = RTABMapApp/Libraries/lib/libcolamd.a; sourceTree = "<group>"; };
@@ -192,6 +189,9 @@
 		4E3525632DE4C71C00F39D8F /* libspqr.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libspqr.a; path = RTABMapApp/Libraries/lib/libspqr.a; sourceTree = "<group>"; };
 		4E3525662DE4C72D00F39D8F /* libamd.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libamd.a; path = RTABMapApp/Libraries/lib/libamd.a; sourceTree = "<group>"; };
 		4E401BE825CC92C100240A56 /* ProgressionStatus.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; name = ProgressionStatus.h; path = ../android/jni/ProgressionStatus.h; sourceTree = "<group>"; };
+		4EA100012F00000100100002 /* SupermarketScanSession.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = SupermarketScanSession.swift; path = RTABMapApp/SupermarketScanSession.swift; sourceTree = "<group>"; };
+		4EA100012F00000100100004 /* PriceTagNFCReader.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = PriceTagNFCReader.swift; path = RTABMapApp/PriceTagNFCReader.swift; sourceTree = "<group>"; };
+		4EA100012F00000100100006 /* CoreNFC.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = CoreNFC.framework; path = System/Library/Frameworks/CoreNFC.framework; sourceTree = SDKROOT; };
 		4EB1A66525A0D90B0043C7BF /* RTABMap.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; name = RTABMap.swift; path = RTABMapApp/RTABMap.swift; sourceTree = "<group>"; };
 		4ED73AD02D7FECF3007899C2 /* liblaszip.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = liblaszip.a; path = RTABMapApp/Libraries/lib/liblaszip.a; sourceTree = "<group>"; };
 		4EE015C2259A2AF0008CCE65 /* RTABMapApp.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = RTABMapApp.app; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -1068,7 +1068,7 @@
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
 				DEFINES_MODULE = YES;
-				DEVELOPMENT_TEAM = 3RRB6NV8U9;
+				DEVELOPMENT_TEAM = MC9ZJHZ2RL;
 				EXCLUDED_ARCHS = "";
 				FRAMEWORK_SEARCH_PATHS = (
 					"$(inherited)",
@@ -1082,6 +1082,7 @@
 				);
 				GCC_UNROLL_LOOPS = NO;
 				INFOPLIST_FILE = RTABMapApp/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 14.3;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
@@ -1094,7 +1095,7 @@
 				);
 				MARKETING_VERSION = 0.22.0;
 				OTHER_CFLAGS = "";
-				PRODUCT_BUNDLE_IDENTIFIER = com.introlab.rtabmap;
+				PRODUCT_BUNDLE_IDENTIFIER = com.mcjiansheng.rtabmap;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				PROVISIONING_PROFILE_SPECIFIER = "";
 				SWIFT_OBJC_BRIDGING_HEADER = "RTABMapApp/$(SWIFT_MODULE_NAME)-Bridging-Header.h";
@@ -1102,6 +1103,9 @@
 				SWIFT_VERSION = 5.0;
 				SYSTEM_FRAMEWORK_SEARCH_PATHS = "\"$(SRCROOT)/RTABMapApp/Libraries/lib\"";
 				SYSTEM_HEADER_SEARCH_PATHS = (
+					"\"$(SRCROOT)/../../corelib/include\"",
+					"\"$(SRCROOT)/../../guilib/include\"",
+					"\"$(SRCROOT)/../../utilite/include\"",
 					"\"$(SRCROOT)/RTABMapApp/Libraries/include\"",
 					"\"$(SRCROOT)/RTABMapApp/Libraries/include/eigen3\"",
 					"\"$(SRCROOT)/RTABMapApp/Libraries/include/pcl-1.15\"",
@@ -1128,7 +1132,7 @@
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
 				DEFINES_MODULE = YES;
-				DEVELOPMENT_TEAM = 3RRB6NV8U9;
+				DEVELOPMENT_TEAM = MC9ZJHZ2RL;
 				FRAMEWORK_SEARCH_PATHS = (
 					"$(inherited)",
 					"$(PROJECT_DIR)/RTABMapApp/Libraries/lib",
@@ -1142,6 +1146,7 @@
 				);
 				GCC_UNROLL_LOOPS = NO;
 				INFOPLIST_FILE = RTABMapApp/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 14.3;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
@@ -1155,7 +1160,7 @@
 				MARKETING_VERSION = 0.22.0;
 				ONLY_ACTIVE_ARCH = YES;
 				OTHER_CFLAGS = "";
-				PRODUCT_BUNDLE_IDENTIFIER = com.introlab.rtabmap;
+				PRODUCT_BUNDLE_IDENTIFIER = com.mcjiansheng.rtabmap;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				PROVISIONING_PROFILE_SPECIFIER = "";
 				SWIFT_OBJC_BRIDGING_HEADER = "RTABMapApp/$(SWIFT_MODULE_NAME)-Bridging-Header.h";
@@ -1163,6 +1168,9 @@
 				SWIFT_VERSION = 5.0;
 				SYSTEM_FRAMEWORK_SEARCH_PATHS = "\"$(SRCROOT)/RTABMapApp/Libraries/lib\"";
 				SYSTEM_HEADER_SEARCH_PATHS = (
+					"\"$(SRCROOT)/../../corelib/include\"",
+					"\"$(SRCROOT)/../../guilib/include\"",
+					"\"$(SRCROOT)/../../utilite/include\"",
 					"\"$(SRCROOT)/RTABMapApp/Libraries/include\"",
 					"\"$(SRCROOT)/RTABMapApp/Libraries/include/eigen3\"",
 					"\"$(SRCROOT)/RTABMapApp/Libraries/include/pcl-1.15\"",

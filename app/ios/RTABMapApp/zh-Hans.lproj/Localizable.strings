@@ -11,6 +11,7 @@
 
 "Status: %@\n" = "状态：%@\n";
 "RAM Usage (MB): %d / %d" = "内存使用 (MB)：%d / %d";
+"\nSegment RAM Growth (MB): %d" = "\n当前分段内存增长 (MB)：%d";
 "\nScanned Area: %.1f m2" = "\n已扫描面积：%.1f m2";
 "\nSegment: %d" = "\n当前分段：%d";
 
@@ -114,12 +115,23 @@
 "%d saved segment databases are available. Use Merge Saved Segments to combine them." = "已有 %d 个已保存的分段数据库。请使用“合并已保存分段”将它们合并。";
 "No mapping data to optimize yet." = "还没有可优化的建图数据。";
 "Merge Saved Segments" = "合并已保存分段";
+"Generate 2D Map Package" = "生成二维地图包";
 "Save the current segment before merging saved segments." = "请先保存当前分段，再合并已保存分段。";
 "A segment is already being saved. Please wait before merging." = "正在保存分段，请稍后再合并。";
+"A segment is already being saved. Please wait before generating the 2D map." = "正在保存分段，请稍后再生成二维地图。";
 "Saving current segment before merging..." = "正在先保存当前分段，然后合并...";
+"Saving current segment before generating the 2D map..." = "正在先保存当前分段，然后生成二维地图...";
 "Current segment could not be saved, so merging was canceled." = "当前分段保存失败，已取消合并。";
+"Current segment could not be saved, so 2D map generation was canceled." = "当前分段保存失败，已取消二维地图生成。";
 "At least two saved segment databases are required to merge." = "至少需要两个已保存的分段数据库才能合并。";
 "Merging Segments" = "正在合并分段";
 "Merging %d saved segment databases..." = "正在合并 %d 个已保存的分段数据库...";
 "Merged %d segments into %@." = "已将 %d 个分段合并为 %@。";
 "Segment merge failed." = "分段合并失败。";
+"Generating 2D map package..." = "正在生成二维地图包...";
+"2D map package generated: %@" = "二维地图包已生成：%@";
+"2D map generation failed: %@" = "二维地图生成失败：%@";
+"Unknown error" = "未知错误";
+"No supermarket scan session is available." = "当前没有可用的超市扫描会话。";
+"No saved segments are available for 2D map generation." = "没有可用于生成二维地图的已保存分段。";
+"Saved segments do not contain 2D scan coverage sidecar files. Save a new segment before generating a mobile 2D map." = "已保存分段缺少二维扫描覆盖数据。请先保存一个新的分段，再生成手机端二维地图。";
