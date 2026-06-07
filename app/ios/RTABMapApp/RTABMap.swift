@@ -261,6 +261,10 @@ class RTABMap {
     func stopCamera() {
         stopCameraNative(native_rtabmap)
     }
+
+    func setPreserveCameraOrigin(enabled: Bool) {
+        setPreserveCameraOriginNative(native_rtabmap, enabled)
+    }
     
     func setCamera(type: Int) {
         setCameraNative(native_rtabmap, Int32(type))

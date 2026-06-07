@@ -601,6 +601,38 @@ final class SupermarketScanSession {
         return mapDirectory
     }
 
+    func latest2DMapPackage() -> URL? {
+        guard let rootDirectory = rootDirectory else {
+            return nil
+        }
+
+        var roots = [rootDirectory]
+        if let customBaseDirectory = customBaseDirectory {
+            roots.append(customBaseDirectory.appendingPathComponent(rootDirectory.lastPathComponent, isDirectory: true))
+        }
+
+        var latest: URL?
+        var latestDate = Date.distantPast
+        for root in roots {
+            guard let children = try? fileManager.contentsOfDirectory(at: root, includingPropertiesForKeys: [.isDirectoryKey, .contentModificationDateKey], options: [.skipsHiddenFiles]) else {
+                continue
+            }
+            for child in children where child.lastPathComponent.hasPrefix("Map2D-") {
+                guard let values = try? child.resourceValues(forKeys: [.isDirectoryKey, .contentModificationDateKey]),
+                      values.isDirectory == true,
+                      fileManager.fileExists(atPath: child.appendingPathComponent("preview.png").path) else {
+                    continue
+                }
+                let date = values.contentModificationDate ?? Date.distantPast
+                if date > latestDate {
+                    latestDate = date
+                    latest = child
+                }
+            }
+        }
+        return latest
+    }
+
     private func savedSegmentDirectories() -> [URL] {
         guard let rootDirectory = rootDirectory else {
             return []

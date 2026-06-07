@@ -97,6 +97,7 @@ class RTABMapApp : public UEventsHandler {
   int Render();
 
   void stopCamera();
+  void setPreserveCameraOrigin(bool enabled);
 
   // Set render camera's viewing angle, first person, third person or top down.
   //
@@ -260,6 +261,8 @@ class RTABMapApp : public UEventsHandler {
   rtabmap::ParametersMap mappingParameters_;
 
   bool dataRecorderMode_;
+  bool preserveCameraOrigin_;
+  rtabmap::Transform preservedCameraOriginOffset_;
   bool clearSceneOnNextRender_;
   bool openingDatabase_;
   bool exporting_;

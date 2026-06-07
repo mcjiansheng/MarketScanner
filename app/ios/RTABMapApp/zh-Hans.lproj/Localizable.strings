@@ -116,6 +116,7 @@
 "No mapping data to optimize yet." = "还没有可优化的建图数据。";
 "Merge Saved Segments" = "合并已保存分段";
 "Generate 2D Map Package" = "生成二维地图包";
+"View Latest 2D Map" = "查看最新二维地图";
 "Save the current segment before merging saved segments." = "请先保存当前分段，再合并已保存分段。";
 "A segment is already being saved. Please wait before merging." = "正在保存分段，请稍后再合并。";
 "A segment is already being saved. Please wait before generating the 2D map." = "正在保存分段，请稍后再生成二维地图。";
@@ -131,6 +132,8 @@
 "Generating 2D map package..." = "正在生成二维地图包...";
 "2D map package generated: %@" = "二维地图包已生成：%@";
 "2D map generation failed: %@" = "二维地图生成失败：%@";
+"No generated 2D map package is available." = "还没有已生成的二维地图包。";
+"2D map preview could not be opened: %@" = "无法打开二维地图预览：%@";
 "Unknown error" = "未知错误";
 "No supermarket scan session is available." = "当前没有可用的超市扫描会话。";
 "No saved segments are available for 2D map generation." = "没有可用于生成二维地图的已保存分段。";

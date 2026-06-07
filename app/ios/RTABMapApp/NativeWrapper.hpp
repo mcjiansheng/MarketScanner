@@ -68,6 +68,7 @@ void setPausedMappingNative(const void *object, bool paused);
 int renderNative(const void *object);
 bool startCameraNative(const void *object);
 void stopCameraNative(const void *object);
+void setPreserveCameraOriginNative(const void *object, bool enabled);
 void setCameraNative(const void *object, int type);
 void postOdometryEventNative(const void *object,
                        float x, float y, float z, float qx, float qy, float qz, float qw,

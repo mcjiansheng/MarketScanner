@@ -258,6 +258,7 @@ RTABMapApp::RTABMapApp() :
         upstreamRelocalizationMaxAcc_(0.0f),
 		exportPointCloudFormat_("ply"),
 		dataRecorderMode_(false),
+		preserveCameraOrigin_(false),
 		clearSceneOnNextRender_(false),
 		openingDatabase_(false),
 		exporting_(false),
@@ -1031,6 +1032,10 @@ bool RTABMapApp::startCamera()
 
 	if(camera_->init())
 	{
+		if(preserveCameraOrigin_ && !preservedCameraOriginOffset_.isNull())
+		{
+			camera_->resetOrigin(preservedCameraOriginOffset_);
+		}
 		camera_->setScreenRotationAndSize(main_scene_.getScreenRotation(), main_scene_.getViewPortWidth(), main_scene_.getViewPortHeight());
 
 		//update mesh decimation based on camera calibration
@@ -1068,6 +1073,10 @@ void RTABMapApp::stopCamera()
 		boost::mutex::scoped_lock  lock(cameraMutex_);
 		if(sensorCaptureThread_!=0)
 		{
+			if(preserveCameraOrigin_ && camera_ && !camera_->getOriginOffset().isNull())
+			{
+				preservedCameraOriginOffset_ = camera_->getOriginOffset();
+			}
             camera_->close();
 			sensorCaptureThread_->join(true);
 			delete sensorCaptureThread_; // camera_ is closed and deleted inside
@@ -1080,6 +1089,20 @@ void RTABMapApp::stopCamera()
         delete main_scene_.background_renderer_;
         main_scene_.background_renderer_ = 0;
     }
+}
+
+void RTABMapApp::setPreserveCameraOrigin(bool enabled)
+{
+	boost::mutex::scoped_lock lock(cameraMutex_);
+	preserveCameraOrigin_ = enabled;
+	if(!enabled)
+	{
+		preservedCameraOriginOffset_.setNull();
+	}
+	else if(camera_ && !camera_->getOriginOffset().isNull())
+	{
+		preservedCameraOriginOffset_ = camera_->getOriginOffset();
+	}
 }
 
 std::vector<pcl::Vertices> RTABMapApp::filterOrganizedPolygons(

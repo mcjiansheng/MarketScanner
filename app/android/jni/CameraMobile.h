@@ -97,6 +97,7 @@ public:
 	void updateOnRender();
 
 	void resetOrigin(const rtabmap::Transform & offset = rtabmap::Transform());
+	const rtabmap::Transform & getOriginOffset() const {return originOffset_;}
 	virtual bool isCalibrated() const;
 
 	virtual bool odomProvided() const { return true; }

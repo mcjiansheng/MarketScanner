@@ -1021,6 +1021,9 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         fileMenuChildren.append(UIAction(title: localized("Generate 2D Map Package"), image: UIImage(systemName: "map"), attributes: mergeableSegmentCount > 0 && self.mState != .STATE_PROCESSING && !(supermarketSession?.isExportingSegment ?? false) ? [] : .disabled, state: .off, handler: { _ in
             self.generate2DMapPackage()
         }))
+        fileMenuChildren.append(UIAction(title: localized("View Latest 2D Map"), image: UIImage(systemName: "map.fill"), attributes: supermarketSession?.latest2DMapPackage() != nil && self.mState != .STATE_PROCESSING ? [] : .disabled, state: .off, handler: { _ in
+            self.viewLatest2DMapPackage()
+        }))
         if(actionOptimizeEnabled) {
             fileMenuChildren.append(optimizeMenu)
         }
@@ -1850,6 +1853,7 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
             let inMemory = dataRecordingMode ? UserDefaults.standard.bool(forKey: "DatabaseInMemory") : false
             mDataRecording = dataRecordingMode
             self.rtabmap!.setDataRecorderMode(enabled: dataRecordingMode)
+            self.rtabmap!.setPreserveCameraOrigin(enabled: false)
             self.optimizedGraphShown = true // Always reset to true when opening a database
             self.rtabmap!.openDatabase(databasePath: tmpDatabase.path, databaseInMemory: inMemory, optimize: false, clearDatabase: true)
             self.mLatestDatabaseMemoryMB = 0
@@ -2167,6 +2171,7 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         session.pause()
         locationManager?.stopUpdatingLocation()
         rtabmap?.setPausedMapping(paused: true)
+        rtabmap?.setPreserveCameraOrigin(enabled: true)
         rtabmap?.stopCamera()
         updateState(state: .STATE_PROCESSING)
 
@@ -2400,11 +2405,77 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
             self.updateState(state: previousState)
             if let outputURL = outputURL {
                 self.showToast(message: String(format: self.localized("2D map package generated: %@"), outputURL.lastPathComponent), seconds: 4)
+                self.show2DMapPackage(outputURL)
             }
             else {
                 self.showToast(message: String(format: self.localized("2D map generation failed: %@"), errorMessage ?? self.localized("Unknown error")), seconds: 5)
             }
         })
+    }
+
+    func viewLatest2DMapPackage()
+    {
+        guard let outputURL = supermarketSession?.latest2DMapPackage() else {
+            showToast(message: localized("No generated 2D map package is available."), seconds: 3)
+            return
+        }
+        show2DMapPackage(outputURL)
+    }
+
+    private func show2DMapPackage(_ mapDirectory: URL)
+    {
+        let previewURL = mapDirectory.appendingPathComponent("preview.png")
+        guard let image = UIImage(contentsOfFile: previewURL.path) else {
+            showToast(message: String(format: localized("2D map preview could not be opened: %@"), previewURL.lastPathComponent), seconds: 4)
+            return
+        }
+
+        let controller = UIViewController()
+        controller.view.backgroundColor = .black
+        controller.title = mapDirectory.lastPathComponent
+
+        let imageView = UIImageView(image: image)
+        imageView.translatesAutoresizingMaskIntoConstraints = false
+        imageView.contentMode = .scaleAspectFit
+        imageView.backgroundColor = .black
+        controller.view.addSubview(imageView)
+
+        let closeButton = UIButton(type: .system)
+        closeButton.translatesAutoresizingMaskIntoConstraints = false
+        closeButton.setTitle(localized("Close"), for: .normal)
+        closeButton.tintColor = .white
+        closeButton.backgroundColor = UIColor.black.withAlphaComponent(0.55)
+        closeButton.layer.cornerRadius = 8
+        closeButton.contentEdgeInsets = UIEdgeInsets(top: 8, left: 14, bottom: 8, right: 14)
+        closeButton.addAction(UIAction(handler: { _ in
+            controller.dismiss(animated: true)
+        }), for: .touchUpInside)
+        controller.view.addSubview(closeButton)
+
+        let infoLabel = UILabel()
+        infoLabel.translatesAutoresizingMaskIntoConstraints = false
+        infoLabel.text = mapDirectory.lastPathComponent
+        infoLabel.textColor = .white
+        infoLabel.font = UIFont.systemFont(ofSize: 14, weight: .medium)
+        infoLabel.backgroundColor = UIColor.black.withAlphaComponent(0.55)
+        infoLabel.textAlignment = .center
+        infoLabel.numberOfLines = 2
+        controller.view.addSubview(infoLabel)
+
+        NSLayoutConstraint.activate([
+            imageView.leadingAnchor.constraint(equalTo: controller.view.leadingAnchor),
+            imageView.trailingAnchor.constraint(equalTo: controller.view.trailingAnchor),
+            imageView.topAnchor.constraint(equalTo: controller.view.topAnchor),
+            imageView.bottomAnchor.constraint(equalTo: controller.view.bottomAnchor),
+            closeButton.trailingAnchor.constraint(equalTo: controller.view.safeAreaLayoutGuide.trailingAnchor, constant: -16),
+            closeButton.topAnchor.constraint(equalTo: controller.view.safeAreaLayoutGuide.topAnchor, constant: 16),
+            infoLabel.leadingAnchor.constraint(equalTo: controller.view.safeAreaLayoutGuide.leadingAnchor, constant: 16),
+            infoLabel.trailingAnchor.constraint(lessThanOrEqualTo: closeButton.leadingAnchor, constant: -12),
+            infoLabel.centerYAnchor.constraint(equalTo: closeButton.centerYAnchor)
+        ])
+
+        controller.modalPresentationStyle = .fullScreen
+        present(controller, animated: true)
     }
     
     func save()

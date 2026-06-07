@@ -287,6 +287,17 @@ void stopCameraNative(const void *object) {
     }
 }
 
+void setPreserveCameraOriginNative(const void *object, bool enabled) {
+    if(object)
+    {
+        native(object)->setPreserveCameraOrigin(enabled);
+    }
+    else
+    {
+        UERROR("object is null!");
+    }
+}
+
 void setCameraNative(const void *object, int type) {
     if(object)
     {
