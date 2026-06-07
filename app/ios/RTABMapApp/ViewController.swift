@@ -433,7 +433,7 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         mMapNodes = nodes;
         mLatestDatabaseMemoryMB = databaseMemoryUsed
         mLatestPose = (x, y, z, roll, pitch, yaw)
-        let estimatedArea = (self.mState == .STATE_MAPPING) ? (supermarketSession?.updateArea(x: x, z: z) ?? 0.0) : (supermarketSession?.currentAreaM2 ?? 0.0)
+        let estimatedArea = (self.mState == .STATE_MAPPING) ? (supermarketSession?.updateArea(timestamp: Date().timeIntervalSince1970, nodeCount: nodes, x: x, y: y, z: z, roll: roll, pitch: pitch, yaw: yaw) ?? 0.0) : (supermarketSession?.currentAreaM2 ?? 0.0)
         
         let formattedDate = Date().getFormattedDate(format: "HH:mm:ss.SSS")
         
@@ -1274,7 +1274,7 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
             status = "Camera Is Occluded Or Lighting Is Too Dark"
         }
 
-        if let rotation = UIApplication.shared.windows.first?.windowScene?.interfaceOrientation
+        if accept, let rotation = UIApplication.shared.windows.first?.windowScene?.interfaceOrientation
         {
             rtabmap?.postOdometryEvent(frame: frame, orientation: rotation, viewport: self.view.frame.size)
         }

@@ -45,6 +45,18 @@ struct ScanAreaCells: Codable {
     let cells: [[Int]]
 }
 
+struct ScanPoseSample: Codable {
+    let timestamp: TimeInterval
+    let segmentIndex: Int
+    let nodeCount: Int
+    let x: Float
+    let y: Float
+    let z: Float
+    let roll: Float
+    let pitch: Float
+    let yaw: Float
+}
+
 enum SegmentTriggerReason: String {
     case area
     case database
@@ -158,6 +170,7 @@ final class SupermarketScanSession {
     private(set) var segmentIndex: Int = 0
     private(set) var currentAreaM2: Double = 0
     private(set) var priceTags: [PriceTagRecord] = []
+    private(set) var poseSamples: [ScanPoseSample] = []
     private var nextTagId: Int = 1
 
     var areaThresholdM2: Double = 250
@@ -211,6 +224,7 @@ final class SupermarketScanSession {
         areaEstimator.reset()
         currentAreaM2 = 0
         priceTags.removeAll()
+        poseSamples.removeAll()
     }
 
     func nextSegment() {
@@ -322,8 +336,18 @@ final class SupermarketScanSession {
         return (fileCount, totalBytes)
     }
 
-    func updateArea(x: Float, z: Float) -> Double {
+    func updateArea(timestamp: TimeInterval, nodeCount: Int, x: Float, y: Float, z: Float, roll: Float, pitch: Float, yaw: Float) -> Double {
         currentAreaM2 = areaEstimator.update(x: x, z: z)
+        poseSamples.append(ScanPoseSample(
+            timestamp: timestamp,
+            segmentIndex: segmentIndex,
+            nodeCount: nodeCount,
+            x: x,
+            y: y,
+            z: z,
+            roll: roll,
+            pitch: pitch,
+            yaw: yaw))
         return currentAreaM2
     }
 
@@ -385,6 +409,14 @@ final class SupermarketScanSession {
             cells: areaEstimator.occupiedCellCoordinates())
         let areaCellsData = try encoder.encode(areaCells)
         try areaCellsData.write(to: segmentDirectory.appendingPathComponent("scan_area_cells.json"), options: .atomic)
+
+        let poseSamplesData = try encoder.encode(poseSamples)
+        try poseSamplesData.write(to: segmentDirectory.appendingPathComponent("trajectory_samples.json"), options: .atomic)
+
+        try trajectorySamplesCSV().write(
+            to: segmentDirectory.appendingPathComponent("trajectory_samples.csv"),
+            atomically: true,
+            encoding: .utf8)
     }
 
     private func priceTagsCSV() -> String {
@@ -404,6 +436,24 @@ final class SupermarketScanSession {
                 String(format: "%.5f", tag.pitch),
                 String(format: "%.5f", tag.yaw),
                 csv(tag.note)
+            ].joined(separator: ","))
+        }
+        return rows.joined(separator: "\n") + "\n"
+    }
+
+    private func trajectorySamplesCSV() -> String {
+        var rows = ["timestamp,segmentIndex,nodeCount,x,y,z,roll,pitch,yaw"]
+        for sample in poseSamples {
+            rows.append([
+                String(format: "%.6f", sample.timestamp),
+                String(sample.segmentIndex),
+                String(sample.nodeCount),
+                String(format: "%.4f", sample.x),
+                String(format: "%.4f", sample.y),
+                String(format: "%.4f", sample.z),
+                String(format: "%.5f", sample.roll),
+                String(format: "%.5f", sample.pitch),
+                String(format: "%.5f", sample.yaw)
             ].joined(separator: ","))
         }
         return rows.joined(separator: "\n") + "\n"
@@ -442,11 +492,16 @@ final class SupermarketScanSession {
         var areaCellsBySegment = [Int: ScanAreaCells]()
         var tags = [PriceTagRecord]()
         var metadataList = [ScanSegmentMetadata]()
+        var trajectorySamples = [ScanPoseSample]()
         let decoder = JSONDecoder()
         for segmentDirectory in segmentDirectories {
             if let data = try? Data(contentsOf: segmentDirectory.appendingPathComponent("scan_area_cells.json")),
                let cells = try? decoder.decode(ScanAreaCells.self, from: data) {
                 areaCellsBySegment[cells.segmentIndex] = cells
+            }
+            if let data = try? Data(contentsOf: segmentDirectory.appendingPathComponent("trajectory_samples.json")),
+               let samples = try? decoder.decode([ScanPoseSample].self, from: data) {
+                trajectorySamples.append(contentsOf: samples)
             }
             if let data = try? Data(contentsOf: segmentDirectory.appendingPathComponent("price_tags.json")),
                let segmentTags = try? decoder.decode([PriceTagRecord].self, from: data) {
@@ -469,9 +524,15 @@ final class SupermarketScanSession {
         try fileManager.createDirectory(at: mapDirectory, withIntermediateDirectories: true)
 
         let cellSize = areaCellsBySegment.values.map { $0.cellSizeM }.min() ?? 0.25
-        let allCells = areaCellsBySegment.values.flatMap { cells in
+        var allCells = areaCellsBySegment.values.flatMap { cells in
             cells.cells.map { (segment: cells.segmentIndex, x: $0[0], y: $0[1]) }
         }
+        allCells.append(contentsOf: trajectorySamples.map {
+            (segment: $0.segmentIndex, x: Int(floor(Double($0.x) / cellSize)), y: Int(floor(Double($0.z) / cellSize)))
+        })
+        allCells.append(contentsOf: tags.map {
+            (segment: $0.segmentIndex, x: Int(floor(Double($0.x) / cellSize)), y: Int(floor(Double($0.z) / cellSize)))
+        })
         let minCellX = allCells.map { $0.x }.min() ?? 0
         let maxCellX = allCells.map { $0.x }.max() ?? 0
         let minCellY = allCells.map { $0.y }.min() ?? 0
@@ -479,11 +540,26 @@ final class SupermarketScanSession {
         let marginCells = 8
         let originCellX = minCellX - marginCells
         let originCellY = minCellY - marginCells
-        let width = max(1, maxCellX - minCellX + marginCells * 2 + 1)
-        let height = max(1, maxCellY - minCellY + marginCells * 2 + 1)
+        let width = max(1, maxCellX - originCellX + marginCells + 1)
+        let height = max(1, maxCellY - originCellY + marginCells + 1)
         var freeCells = Set<String>()
-        for cell in allCells {
-            freeCells.insert("\(cell.x):\(cell.y)")
+        for cells in areaCellsBySegment.values {
+            for cell in cells.cells {
+                freeCells.insert("\(cell[0]):\(cell[1])")
+            }
+        }
+
+        func imagePoint(x: Float, z: Float) -> CGPoint {
+            let cellX = Int(floor(Double(x) / cellSize))
+            let cellY = Int(floor(Double(z) / cellSize))
+            return CGPoint(
+                x: CGFloat(cellX - originCellX) + 0.5,
+                y: CGFloat(height - 1 - (cellY - originCellY)) + 0.5)
+        }
+
+        func segmentColor(_ segment: Int) -> UIColor {
+            let hue = CGFloat((segment * 47) % 360) / 360.0
+            return UIColor(hue: hue, saturation: 0.72, brightness: 0.88, alpha: 1.0)
         }
 
         let imageSize = CGSize(width: width, height: height)
@@ -508,16 +584,40 @@ final class SupermarketScanSession {
 
         let previewImage = renderer.image { context in
             occupancyImage.draw(in: CGRect(origin: .zero, size: imageSize))
+            let cg = context.cgContext
+            cg.setLineCap(.round)
+            cg.setLineJoin(.round)
+            cg.setLineWidth(2.0)
+
+            let samplesBySegment = Dictionary(grouping: trajectorySamples.sorted {
+                if $0.segmentIndex == $1.segmentIndex {
+                    return $0.timestamp < $1.timestamp
+                }
+                return $0.segmentIndex < $1.segmentIndex
+            }, by: { $0.segmentIndex })
+            for (segment, samples) in samplesBySegment.sorted(by: { $0.key < $1.key }) where samples.count > 1 {
+                segmentColor(segment).setStroke()
+                cg.beginPath()
+                let first = imagePoint(x: samples[0].x, z: samples[0].z)
+                cg.move(to: first)
+                for sample in samples.dropFirst() {
+                    cg.addLine(to: imagePoint(x: sample.x, z: sample.z))
+                }
+                cg.strokePath()
+            }
+
             UIColor.systemGreen.setFill()
             for tag in tags {
-                let cellX = Int(floor(Double(tag.x) / cellSize))
-                let cellY = Int(floor(Double(tag.z) / cellSize))
-                let px = cellX - originCellX
-                let py = height - 1 - (cellY - originCellY)
-                context.cgContext.fillEllipse(in: CGRect(x: px - 2, y: py - 2, width: 5, height: 5))
+                let point = imagePoint(x: tag.x, z: tag.z)
+                context.cgContext.fillEllipse(in: CGRect(x: point.x - 2.5, y: point.y - 2.5, width: 5, height: 5))
             }
         }
         try previewImage.pngData()?.write(to: mapDirectory.appendingPathComponent("preview.png"), options: .atomic)
+
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        let trajectoryData = try encoder.encode(trajectorySamples)
+        try trajectoryData.write(to: mapDirectory.appendingPathComponent("trajectory_samples.json"), options: .atomic)
 
         let originX = Double(originCellX) * cellSize
         let originY = Double(originCellY) * cellSize
@@ -552,6 +652,7 @@ final class SupermarketScanSession {
                 "occupancy_grid.png",
                 "occupancy_grid.yaml",
                 "preview.png",
+                "trajectory_samples.json",
                 "semantic_layers.json",
                 "price_tags.geojson",
                 "quality_report.json"
@@ -589,12 +690,17 @@ final class SupermarketScanSession {
                 "unknownAreaM2": unknownAreaM2,
                 "freeCellCount": freeCells.count
             ],
+            "trajectory": [
+                "sampleCount": trajectorySamples.count,
+                "segmentsWithSamples": Set(trajectorySamples.map { $0.segmentIndex }).count
+            ],
             "priceTags": [
                 "total": tags.count,
                 "needsReview": tags.count
             ],
             "warnings": [
-                "Mobile 2D map uses scan coverage sidecars and price tags only. Run the offline Supermarket2DMap tool for structural occupied layers from point clouds."
+                "Mobile 2D map preview uses scan coverage and trajectory sidecars. Gray means unknown, white means estimated covered floor, colored lines are recorded segment trajectories.",
+                "Structural occupied layers for shelves/walls require point-cloud or local-grid extraction; use offline Supermarket2DMap for that richer map."
             ]
         ], to: mapDirectory.appendingPathComponent("quality_report.json"))
 

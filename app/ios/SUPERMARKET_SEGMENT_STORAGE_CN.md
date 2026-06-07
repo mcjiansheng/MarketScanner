@@ -60,6 +60,8 @@ SupermarketSession-YYYYMMDD-HHMMSS/
     price_tags.json
     price_tags.csv
     scan_area_cells.json
+    trajectory_samples.json
+    trajectory_samples.csv
   segment_0002/
     rtabmap_segment_0002.db
     metadata.json
@@ -70,7 +72,11 @@ SupermarketSession-YYYYMMDD-HHMMSS/
 
 如果选择了外部保存位置，外部目录中会生成同样的 `SupermarketSession-...` 目录。复制成功并校验通过后，本地 `segment_000x` 会被删除，继续扫描时只保留当前正在使用的临时数据库和后续分段所需的运行数据。
 
-`scan_area_cells.json` 是手机端二维地图生成使用的轻量扫描覆盖栅格。它记录当前分段面积估算器中已覆盖的地面栅格，不包含重型点云或货架结构。App 菜单中的 `生成二维地图包` 会读取各分段的 `scan_area_cells.json` 和 `price_tags.json`，生成 `Map2D-...` 目录：
+`scan_area_cells.json` 是手机端二维地图生成使用的轻量扫描覆盖栅格。它记录当前分段面积估算器中已覆盖的地面栅格，不包含重型点云或货架结构。
+
+`trajectory_samples.json/csv` 记录当前分段中 RTAB-Map 统计回调返回的二维轨迹采样点。手机端二维预览会用它绘制分段轨迹中心线，帮助判断分支位置错误来自真实轨迹漂移，还是来自二维栅格渲染。
+
+App 菜单中的 `生成二维地图包` 会读取各分段的 `scan_area_cells.json`、`trajectory_samples.json` 和 `price_tags.json`，生成 `Map2D-...` 目录：
 
 ```text
 Map2D-YYYYMMDD-HHMMSS/
@@ -78,12 +84,13 @@ Map2D-YYYYMMDD-HHMMSS/
   occupancy_grid.png
   occupancy_grid.yaml
   preview.png
+  trajectory_samples.json
   semantic_layers.json
   price_tags.geojson
   quality_report.json
 ```
 
-手机端二维地图包主要用于快速查看扫描覆盖范围和价签位置。需要更精细的墙体、货架、障碍物 occupied 图层时，应使用离线 `tools/Supermarket2DMap` 工具并输入点云/局部栅格导出的结构点。
+手机端二维地图包主要用于快速查看扫描覆盖范围、分段轨迹和价签位置。灰色表示未知区域，白色表示基于行走轨迹估计的已覆盖地面，彩色线表示各分段轨迹中心线。需要更精细的墙体、货架、障碍物 occupied 图层时，应使用离线 `tools/Supermarket2DMap` 工具并输入点云/局部栅格导出的结构点。
 
 ## 自动分段触发条件
 
@@ -147,3 +154,4 @@ RTAB-Map 数据库保存由原生 C++ 层执行。iOS 的外接盘、文件提�
 - 复制和清理发生在每次分段保存时，分段阈值越小，本地峰值存储越可控，但保存次数会更多。
 - 用户更换保存位置后，新的分段会复制到新的位置；已成功导出的旧分段不会自动迁移。
 - 分段保存会暂停并重启 RTAB-Map 采集线程，但不会重新定义移动端相机原点。这样可以避免长直走廊在分段边界处因为 CameraMobile origin 重置而出现明显折角。
+- ARKit 处于初始化、不可用或重定位状态时，App 不会继续把空 pose 的图像/深度帧送入 RTAB-Map，避免原生层把短暂重定位误判为需要重置移动端相机原点。
