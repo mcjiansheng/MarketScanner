@@ -468,6 +468,135 @@ final class SupermarketScanSession {
         return "\"\(escaped)\""
     }
 
+    private func cellKey(_ x: Int, _ y: Int) -> String {
+        return "\(x):\(y)"
+    }
+
+    private func parseCellKey(_ key: String) -> (x: Int, y: Int)? {
+        let parts = key.split(separator: ":")
+        guard parts.count == 2,
+              let x = Int(parts[0]),
+              let y = Int(parts[1]) else {
+            return nil
+        }
+        return (x, y)
+    }
+
+    private func dilatedCells(_ cells: Set<String>, radius: Int) -> Set<String> {
+        guard radius > 0 else {
+            return cells
+        }
+        var result = cells
+        for key in cells {
+            guard let cell = parseCellKey(key) else {
+                continue
+            }
+            for dx in (-radius)...radius {
+                for dy in (-radius)...radius {
+                    result.insert(cellKey(cell.x + dx, cell.y + dy))
+                }
+            }
+        }
+        return result
+    }
+
+    private func erodedCells(_ cells: Set<String>, radius: Int) -> Set<String> {
+        guard radius > 0 else {
+            return cells
+        }
+        var result = Set<String>()
+        for key in cells {
+            guard let cell = parseCellKey(key) else {
+                continue
+            }
+            var keep = true
+            for dx in (-radius)...radius {
+                for dy in (-radius)...radius where !cells.contains(cellKey(cell.x + dx, cell.y + dy)) {
+                    keep = false
+                    break
+                }
+                if !keep {
+                    break
+                }
+            }
+            if keep {
+                result.insert(key)
+            }
+        }
+        return result
+    }
+
+    private func removeSmallComponents(_ cells: Set<String>, minCells: Int) -> (cells: Set<String>, removed: Int) {
+        guard minCells > 1, !cells.isEmpty else {
+            return (cells, 0)
+        }
+
+        var visited = Set<String>()
+        var components = [[String]]()
+        let neighbors = [
+            (-1, -1), (0, -1), (1, -1),
+            (-1, 0),           (1, 0),
+            (-1, 1),  (0, 1),  (1, 1)
+        ]
+
+        for key in cells where !visited.contains(key) {
+            guard let start = parseCellKey(key) else {
+                continue
+            }
+            var stack = [(start.x, start.y)]
+            var component = [String]()
+            visited.insert(key)
+
+            while let current = stack.popLast() {
+                let currentKey = cellKey(current.0, current.1)
+                component.append(currentKey)
+                for offset in neighbors {
+                    let nextKey = cellKey(current.0 + offset.0, current.1 + offset.1)
+                    if cells.contains(nextKey), !visited.contains(nextKey) {
+                        visited.insert(nextKey)
+                        stack.append((current.0 + offset.0, current.1 + offset.1))
+                    }
+                }
+            }
+            components.append(component)
+        }
+
+        let keptComponents = components.filter { $0.count >= minCells }
+        if keptComponents.isEmpty, let largest = components.max(by: { $0.count < $1.count }) {
+            return (Set(largest), max(0, cells.count - largest.count))
+        }
+
+        let result = Set(keptComponents.flatMap { $0 })
+        return (result, max(0, cells.count - result.count))
+    }
+
+    private func smoothedCoverageCells(_ rawCells: Set<String>, cellSize: Double) -> (cells: Set<String>, removedIslands: Int, addedByClosing: Int) {
+        let closed = erodedCells(dilatedCells(rawCells, radius: 1), radius: 1)
+        let minIslandAreaM2 = 0.5
+        let minIslandCells = max(3, Int(ceil(minIslandAreaM2 / max(cellSize * cellSize, 0.0001))))
+        let filtered = removeSmallComponents(closed, minCells: minIslandCells)
+        return (
+            cells: filtered.cells,
+            removedIslands: filtered.removed,
+            addedByClosing: max(0, closed.count - rawCells.count)
+        )
+    }
+
+    private func boundaryCells(_ cells: Set<String>) -> Set<String> {
+        var result = Set<String>()
+        let neighbors = [(0, -1), (-1, 0), (1, 0), (0, 1)]
+        for key in cells {
+            guard let cell = parseCellKey(key) else {
+                continue
+            }
+            for offset in neighbors where !cells.contains(cellKey(cell.x + offset.0, cell.y + offset.1)) {
+                result.insert(key)
+                break
+            }
+        }
+        return result
+    }
+
     func generate2DMapPackage() throws -> URL {
         guard let rootDirectory = rootDirectory else {
             throw NSError(
@@ -546,12 +675,15 @@ final class SupermarketScanSession {
         let originCellY = minCellY - marginCells
         let width = max(1, maxCellX - originCellX + marginCells + 1)
         let height = max(1, maxCellY - originCellY + marginCells + 1)
-        var freeCells = Set<String>()
+        var rawFreeCells = Set<String>()
         for cells in areaCellsBySegment.values {
             for cell in cells.cells {
-                freeCells.insert("\(cell[0]):\(cell[1])")
+                rawFreeCells.insert(cellKey(cell[0], cell[1]))
             }
         }
+        let smoothing = smoothedCoverageCells(rawFreeCells, cellSize: cellSize)
+        let freeCells = smoothing.cells
+        let observedBoundaryCells = boundaryCells(freeCells)
 
         func imagePoint(x: Float, z: Float) -> CGPoint {
             let cellX = Int(floor(Double(x) / cellSize))
@@ -566,6 +698,71 @@ final class SupermarketScanSession {
             return UIColor(hue: hue, saturation: 0.72, brightness: 0.88, alpha: 1.0)
         }
 
+        func cellRect(_ key: String) -> CGRect? {
+            guard let cell = parseCellKey(key) else {
+                return nil
+            }
+            return CGRect(
+                x: CGFloat(cell.x - originCellX),
+                y: CGFloat(height - 1 - (cell.y - originCellY)),
+                width: 1,
+                height: 1)
+        }
+
+        func drawObservedBoundary(_ cg: CGContext, lineWidth: CGFloat) {
+            cg.saveGState()
+            cg.setStrokeColor(UIColor(white: 0.18, alpha: 0.95).cgColor)
+            cg.setLineCap(.square)
+            cg.setLineWidth(lineWidth)
+            for key in observedBoundaryCells {
+                guard let cell = parseCellKey(key) else {
+                    continue
+                }
+                let px = CGFloat(cell.x - originCellX)
+                let py = CGFloat(height - 1 - (cell.y - originCellY))
+                if !freeCells.contains(cellKey(cell.x - 1, cell.y)) {
+                    cg.move(to: CGPoint(x: px, y: py))
+                    cg.addLine(to: CGPoint(x: px, y: py + 1))
+                }
+                if !freeCells.contains(cellKey(cell.x + 1, cell.y)) {
+                    cg.move(to: CGPoint(x: px + 1, y: py))
+                    cg.addLine(to: CGPoint(x: px + 1, y: py + 1))
+                }
+                if !freeCells.contains(cellKey(cell.x, cell.y + 1)) {
+                    cg.move(to: CGPoint(x: px, y: py))
+                    cg.addLine(to: CGPoint(x: px + 1, y: py))
+                }
+                if !freeCells.contains(cellKey(cell.x, cell.y - 1)) {
+                    cg.move(to: CGPoint(x: px, y: py + 1))
+                    cg.addLine(to: CGPoint(x: px + 1, y: py + 1))
+                }
+            }
+            cg.strokePath()
+            cg.restoreGState()
+        }
+
+        func drawDirectionArrow(_ cg: CGContext, from: CGPoint, to: CGPoint, color: UIColor, size: CGFloat) {
+            let dx = to.x - from.x
+            let dy = to.y - from.y
+            let length = max(0.001, sqrt(dx * dx + dy * dy))
+            let ux = dx / length
+            let uy = dy / length
+            let px = -uy
+            let py = ux
+            let tip = to
+            let left = CGPoint(x: tip.x - ux * size + px * size * 0.45, y: tip.y - uy * size + py * size * 0.45)
+            let right = CGPoint(x: tip.x - ux * size - px * size * 0.45, y: tip.y - uy * size - py * size * 0.45)
+            cg.saveGState()
+            cg.setFillColor(color.withAlphaComponent(0.9).cgColor)
+            cg.beginPath()
+            cg.move(to: tip)
+            cg.addLine(to: left)
+            cg.addLine(to: right)
+            cg.closePath()
+            cg.fillPath()
+            cg.restoreGState()
+        }
+
         let imageSize = CGSize(width: width, height: height)
         let renderer = UIGraphicsImageRenderer(size: imageSize)
         let occupancyImage = renderer.image { context in
@@ -573,25 +770,53 @@ final class SupermarketScanSession {
             context.fill(CGRect(origin: .zero, size: imageSize))
             UIColor.white.setFill()
             for key in freeCells {
-                let parts = key.split(separator: ":")
-                guard parts.count == 2,
-                      let x = Int(parts[0]),
-                      let y = Int(parts[1]) else {
-                    continue
+                if let rect = cellRect(key) {
+                    context.fill(rect)
                 }
-                let px = x - originCellX
-                let py = height - 1 - (y - originCellY)
-                context.fill(CGRect(x: px, y: py, width: 1, height: 1))
             }
         }
         try occupancyImage.pngData()?.write(to: mapDirectory.appendingPathComponent("occupancy_grid.png"), options: .atomic)
 
-        let previewImage = renderer.image { context in
-            occupancyImage.draw(in: CGRect(origin: .zero, size: imageSize))
+        let maxOverviewPixels = 4096
+        let maxGridDimension = max(width, height)
+        let pixelsPerCell = CGFloat(max(1, min(8, maxOverviewPixels / max(1, maxGridDimension))))
+        let overviewSize = CGSize(width: CGFloat(width) * pixelsPerCell, height: CGFloat(height) * pixelsPerCell)
+        let overviewRenderer = UIGraphicsImageRenderer(size: overviewSize)
+        let overviewImage = overviewRenderer.image { context in
             let cg = context.cgContext
-            cg.setLineCap(.round)
-            cg.setLineJoin(.round)
-            cg.setLineWidth(2.0)
+            cg.setAllowsAntialiasing(true)
+            cg.setShouldAntialias(true)
+            UIColor(red: 0.88, green: 0.90, blue: 0.91, alpha: 1.0).setFill()
+            context.fill(CGRect(origin: .zero, size: overviewSize))
+            cg.saveGState()
+            cg.scaleBy(x: pixelsPerCell, y: pixelsPerCell)
+
+            let gridStepCells = max(1, Int(round(1.0 / max(cellSize, 0.01))))
+            cg.setStrokeColor(UIColor(white: 0.62, alpha: 0.22).cgColor)
+            cg.setLineWidth(max(0.08, 1.0 / pixelsPerCell))
+            if gridStepCells > 0 {
+                var gx = CGFloat(gridStepCells)
+                while gx < CGFloat(width) {
+                    cg.move(to: CGPoint(x: gx, y: 0))
+                    cg.addLine(to: CGPoint(x: gx, y: CGFloat(height)))
+                    gx += CGFloat(gridStepCells)
+                }
+                var gy = CGFloat(gridStepCells)
+                while gy < CGFloat(height) {
+                    cg.move(to: CGPoint(x: 0, y: gy))
+                    cg.addLine(to: CGPoint(x: CGFloat(width), y: gy))
+                    gy += CGFloat(gridStepCells)
+                }
+                cg.strokePath()
+            }
+
+            UIColor(red: 0.98, green: 0.975, blue: 0.94, alpha: 1.0).setFill()
+            for key in freeCells {
+                if let rect = cellRect(key) {
+                    context.fill(rect)
+                }
+            }
+            drawObservedBoundary(cg, lineWidth: max(0.35, 2.0 / pixelsPerCell))
 
             let samplesBySegment = Dictionary(grouping: trajectorySamples.sorted {
                 if $0.segmentIndex == $1.segmentIndex {
@@ -600,7 +825,11 @@ final class SupermarketScanSession {
                 return $0.segmentIndex < $1.segmentIndex
             }, by: { $0.segmentIndex })
             for (segment, samples) in samplesBySegment.sorted(by: { $0.key < $1.key }) where samples.count > 1 {
-                segmentColor(segment).setStroke()
+                let color = segmentColor(segment)
+                color.setStroke()
+                cg.setLineCap(.round)
+                cg.setLineJoin(.round)
+                cg.setLineWidth(max(0.45, 3.0 / pixelsPerCell))
                 cg.beginPath()
                 let first = imagePoint(x: samples[0].x, z: samples[0].z)
                 cg.move(to: first)
@@ -608,15 +837,36 @@ final class SupermarketScanSession {
                     cg.addLine(to: imagePoint(x: sample.x, z: sample.z))
                 }
                 cg.strokePath()
+
+                let arrowStride = max(8, samples.count / 8)
+                if samples.count > arrowStride {
+                    for index in stride(from: arrowStride, to: samples.count, by: arrowStride) {
+                        let from = imagePoint(x: samples[index - 1].x, z: samples[index - 1].z)
+                        let to = imagePoint(x: samples[index].x, z: samples[index].z)
+                        drawDirectionArrow(cg, from: from, to: to, color: color, size: max(1.2, 7.0 / pixelsPerCell))
+                    }
+                }
             }
 
             UIColor.systemGreen.setFill()
             for tag in tags {
                 let point = imagePoint(x: tag.x, z: tag.z)
-                context.cgContext.fillEllipse(in: CGRect(x: point.x - 2.5, y: point.y - 2.5, width: 5, height: 5))
+                let radius = max(1.4, 5.0 / pixelsPerCell)
+                context.cgContext.fillEllipse(in: CGRect(x: point.x - radius, y: point.y - radius, width: radius * 2, height: radius * 2))
             }
+
+            let scaleBarMeters = 5.0
+            let scaleBarCells = CGFloat(scaleBarMeters / max(cellSize, 0.01))
+            let scaleBarOrigin = CGPoint(x: 6, y: CGFloat(height) - 6)
+            cg.setStrokeColor(UIColor(white: 0.12, alpha: 0.9).cgColor)
+            cg.setLineWidth(max(0.5, 3.0 / pixelsPerCell))
+            cg.move(to: scaleBarOrigin)
+            cg.addLine(to: CGPoint(x: min(CGFloat(width) - 6, scaleBarOrigin.x + scaleBarCells), y: scaleBarOrigin.y))
+            cg.strokePath()
+            cg.restoreGState()
         }
-        try previewImage.pngData()?.write(to: mapDirectory.appendingPathComponent("preview.png"), options: .atomic)
+        try overviewImage.pngData()?.write(to: mapDirectory.appendingPathComponent("overview_map.png"), options: .atomic)
+        try overviewImage.pngData()?.write(to: mapDirectory.appendingPathComponent("preview.png"), options: .atomic)
 
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
@@ -655,6 +905,7 @@ final class SupermarketScanSession {
             "outputs": [
                 "occupancy_grid.png",
                 "occupancy_grid.yaml",
+                "overview_map.png",
                 "preview.png",
                 "trajectory_samples.json",
                 "semantic_layers.json",
@@ -666,6 +917,7 @@ final class SupermarketScanSession {
         try writeJSON([
             "layers": [
                 ["id": "walkable_confirmed", "kind": "scan_coverage", "areaM2": scannedAreaM2],
+                ["id": "observed_boundary", "kind": "estimated_coverage_boundary", "cellCount": observedBoundaryCells.count],
                 ["id": "unknown", "kind": "unobserved", "areaM2": unknownAreaM2]
             ]
         ], to: mapDirectory.appendingPathComponent("semantic_layers.json"))
@@ -692,7 +944,14 @@ final class SupermarketScanSession {
                 "resolutionM": cellSize,
                 "scannedAreaM2": scannedAreaM2,
                 "unknownAreaM2": unknownAreaM2,
-                "freeCellCount": freeCells.count
+                "rawFreeCellCount": rawFreeCells.count,
+                "freeCellCount": freeCells.count,
+                "boundaryCellCount": observedBoundaryCells.count,
+                "edgeSmoothing": [
+                    "method": "close_radius_1_remove_small_islands",
+                    "addedByClosing": smoothing.addedByClosing,
+                    "removedIslandCells": smoothing.removedIslands
+                ]
             ],
             "trajectory": [
                 "sampleCount": trajectorySamples.count,
@@ -703,7 +962,7 @@ final class SupermarketScanSession {
                 "needsReview": tags.count
             ],
             "warnings": [
-                "Mobile 2D map preview uses scan coverage and trajectory sidecars. Gray means unknown, white means estimated covered floor, colored lines are recorded segment trajectories.",
+                "Mobile 2D overview uses smoothed scan coverage, estimated observed boundary, trajectory sidecars and price tags. It is a top-down evidence map, not a measured shelf/wall occupied layer.",
                 "Structural occupied layers for shelves/walls require point-cloud or local-grid extraction; use offline Supermarket2DMap for that richer map."
             ]
         ], to: mapDirectory.appendingPathComponent("quality_report.json"))

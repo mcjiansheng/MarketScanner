@@ -83,6 +83,7 @@ Map2D-YYYYMMDD-HHMMSS/
   map.json
   occupancy_grid.png
   occupancy_grid.yaml
+  overview_map.png
   preview.png
   trajectory_samples.json
   semantic_layers.json
@@ -90,7 +91,7 @@ Map2D-YYYYMMDD-HHMMSS/
   quality_report.json
 ```
 
-手机端二维地图包主要用于快速查看扫描覆盖范围、分段轨迹和价签位置。灰色表示未知区域，白色表示基于行走轨迹估计的已覆盖地面，彩色线表示各分段轨迹中心线。需要更精细的墙体、货架、障碍物 occupied 图层时，应使用离线 `tools/Supermarket2DMap` 工具并输入点云/局部栅格导出的结构点。
+手机端二维地图包主要用于快速查看扫描覆盖范围、分段轨迹和价签位置。`occupancy_grid.png` 保留机器可读的灰/白栅格；`overview_map.png` 和 `preview.png` 是给用户查看的二维俯瞰证据图，会叠加米级网格、平滑后的已观测地面、估算边界、分段轨迹方向、价签位置和比例尺。需要更精细的墙体、货架、障碍物 occupied 图层时，应使用离线 `tools/Supermarket2DMap` 工具并输入点云/局部栅格导出的结构点。
 
 ## 自动分段触发条件
 
@@ -157,3 +158,4 @@ RTAB-Map 数据库保存由原生 C++ 层执行。iOS 的外接盘、文件提�
 - 分段保存会暂停并重启 RTAB-Map 采集线程，但不会重新定义移动端相机原点。这样可以避免长直走廊在分段边界处因为 CameraMobile origin 重置而出现明显折角。
 - ARKit 处于初始化、不可用或重定位状态时，App 不会继续把空 pose 的图像/深度帧送入 RTAB-Map，避免原生层把短暂重定位误判为需要重置移动端相机原点。
 - 分段保存会打印性能日志，包括本地保存、sidecar 写入、恢复扫描和后台复制耗时，便于对比不同设备和存储介质。
+- 手机端二维俯瞰图会对扫描覆盖边缘做闭运算平滑和小孤岛清理，以减少边缘毛刺；但它不会把未知区域伪装成货架或墙体。
