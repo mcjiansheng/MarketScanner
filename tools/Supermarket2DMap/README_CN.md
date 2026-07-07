@@ -70,6 +70,107 @@ python3 tools/Supermarket2DMap/supermarket_2d_map.py \
 --horizontal-axes xz
 ```
 
+## 单设备多阶段扫描
+
+大型超市中，一台手机也建议按阶段扫描。`segment` 是手机端自动保存的数据单位，`stage` 是 PC 后处理时用于控制累积误差的路线/区域单位。一个 stage 可以包含多个 segment。
+
+新增工具：
+
+```bash
+python3 tools/Supermarket2DMap/supermarket_staged_map.py \
+  /path/to/SupermarketSession-20260606-120000 \
+  --stage-config /path/to/stage_config.json \
+  --output /path/to/StageMap2D-output
+```
+
+`stage_config.json` 示例：
+
+```json
+{
+  "format": "SupermarketStageConfig",
+  "version": 1,
+  "stages": [
+    {
+      "id": "anchor",
+      "name": "入口锚定区",
+      "segments": [1],
+      "role": "anchor",
+      "transform": {"dx": 0.0, "dy": 0.0, "yaw_deg": 0.0}
+    },
+    {
+      "id": "aisle_a",
+      "name": "A 区主通道",
+      "segments": [2, 3],
+      "transform": {"dx": 0.2, "dy": -0.1, "yaw_deg": 1.0}
+    }
+  ],
+  "segment_transforms": {
+    "3": {"dx": 0.1, "dy": 0.0, "yaw_deg": -0.3}
+  }
+}
+```
+
+输出会在普通 2D 地图包基础上增加：
+
+- `stage_manifest.json`：stage、segment 和实际应用变换的映射。
+- `stage_quality_report.json`：每个 stage 的节点数、轨迹长度、起终点距离、与前一 stage 的连接距离和警告。
+- `alignment_config_used.json`：本次生成使用的 stage/segment 校正配置。
+
+如果不提供 `--stage-config`，工具会默认每个 segment 一个 stage，第一个 stage 作为 anchor。该工具不会修改原始 RTAB-Map 数据库或 sidecar，只在输出地图包时应用校正。
+
+## 多设备 PC 合并
+
+在单设备 stage 流程稳定后，可以用 PC 端多设备工具合并多台手机的 session。多设备工具会先处理每台设备内部的 stage，再应用设备级变换，最后输出统一地图包。
+
+直接传入多个 session：
+
+```bash
+python3 tools/Supermarket2DMap/supermarket_multi_device_map.py \
+  /path/phone_a/SupermarketSession-20260606-090000 \
+  /path/phone_b/SupermarketSession-20260606-090100 \
+  --align-common-start \
+  --output /path/to/MultiDeviceMap2D-output
+```
+
+使用配置文件：
+
+```bash
+python3 tools/Supermarket2DMap/supermarket_multi_device_map.py \
+  --config /path/to/multi_device_config.json \
+  --output /path/to/MultiDeviceMap2D-output
+```
+
+`multi_device_config.json` 示例：
+
+```json
+{
+  "format": "SupermarketMultiDeviceConfig",
+  "version": 1,
+  "reference_device": "phone_a",
+  "align_common_start": true,
+  "devices": [
+    {
+      "id": "phone_a",
+      "session": "sessions/phone_a/SupermarketSession-20260606-090000",
+      "stage_config": "configs/phone_a_stage_config.json",
+      "transform": {"dx": 0.0, "dy": 0.0, "yaw_deg": 0.0}
+    },
+    {
+      "id": "phone_b",
+      "session": "sessions/phone_b/SupermarketSession-20260606-090100",
+      "stage_config": "configs/phone_b_stage_config.json"
+    }
+  ]
+}
+```
+
+如果设备配置中提供了 `transform`，工具会使用该手动设备级变换；否则在 `--align-common-start` 或配置中的 `align_common_start=true` 开启时，会把该设备第一个有效 pose 对齐到参考设备第一个有效 pose。该自动对齐只适合作为公共起点初值，最终仍应查看 `preview.png`、`multi_device_manifest.json` 和 `quality_report.json` 后人工微调。
+
+多设备输出会额外包含：
+
+- `multi_device_manifest.json`：设备、session、设备级变换、全局 segment id 与本地 segment 的映射。
+- `alignment_config_used.json`：本次使用的设备级配置。
+
 ## 输出
 
 ```text
