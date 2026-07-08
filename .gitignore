@@ -1,5 +1,11 @@
 /lib
 /build/
+/.tools/
+/app/ios/RTABMapApp/Libraries/
+/corelib/include/rtabmap/core/Version.h
+/corelib/include/rtabmap/core/rtabmap_core_export.h
+/guilib/include/rtabmap/gui/rtabmap_gui_export.h
+/utilite/include/rtabmap/utilite/utilite_export.h
 .DS_Store
 .settings/language.settings.xml
 .idea/
