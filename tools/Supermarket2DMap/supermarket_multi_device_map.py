@@ -35,6 +35,19 @@ def device_id_from_session(path: Path) -> str:
     return path.name
 
 
+def resolve_path_list(raw: Any, base_dir: Path) -> List[Path]:
+    if raw is None:
+        return []
+    values = raw if isinstance(raw, list) else [raw]
+    paths: List[Path] = []
+    for value in values:
+        path = Path(str(value))
+        if not path.is_absolute():
+            path = (base_dir / path).resolve()
+        paths.append(path)
+    return paths
+
+
 def load_inputs(args: argparse.Namespace) -> Tuple[List[Dict[str, Any]], Dict[str, Any], Optional[Path]]:
     config_path = Path(args.config).resolve() if args.config else None
     config = read_json(config_path, {})
@@ -65,6 +78,7 @@ def load_inputs(args: argparse.Namespace) -> Tuple[List[Dict[str, Any]], Dict[st
                     "transform": staged.parse_transform(raw.get("transform")),
                     "has_explicit_transform": isinstance(raw.get("transform"), dict),
                     "stage_config": stage_config_path,
+                    "points_csv": resolve_path_list(raw.get("points_csv"), config_base),
                     "raw": raw,
                 }
             )
@@ -78,6 +92,7 @@ def load_inputs(args: argparse.Namespace) -> Tuple[List[Dict[str, Any]], Dict[st
                 "transform": {"dx": 0.0, "dy": 0.0, "yaw": 0.0},
                 "has_explicit_transform": False,
                 "stage_config": None,
+                "points_csv": [],
                 "raw": {},
             }
         )
@@ -196,7 +211,7 @@ def generate(args: argparse.Namespace) -> Path:
     for device in devices:
         segments = base.discover_segments(device["session"], config)
         stages, stage_by_segment, stage_transforms, segment_transforms, stage_config = staged.load_stage_config(device.get("stage_config"), segments)
-        point_paths = [Path(p).resolve() for p in args.points_csv]
+        point_paths = list(device.get("points_csv", []))
         point_paths.extend(sorted(device["session"].glob("segment_*/points.csv")))
         point_paths.extend(sorted(device["session"].glob("points.csv")))
         points = base.load_projected_points(point_paths, config.horizontal_axes)
@@ -234,6 +249,10 @@ def generate(args: argparse.Namespace) -> Path:
         segment_manifest.extend(entries)
         all_segments.extend(state["segments"])
         all_points.extend(state["points"])
+
+    global_point_paths = [Path(p).resolve() for p in args.points_csv]
+    global_points = base.load_projected_points(global_point_paths, config.horizontal_axes)
+    all_points.extend(global_points)
 
     tags = [tag for segment in all_segments for tag in segment.price_tags]
     base.snap_price_tags(tags, all_points, config.tag_snap_distance)
@@ -304,6 +323,9 @@ def generate(args: argparse.Namespace) -> Path:
     source_files = []
     for state in device_states:
         source_files.extend(base.source_manifest(state["session"], state["segments"], state["point_paths"]).get("files", []))
+    for path in global_point_paths:
+        if path.exists():
+            source_files.append({"path": str(path), "sha256": base.sha256_file(path)})
     (output_dir / "source_manifest.json").write_text(
         json.dumps({"format": "SupermarketMultiDeviceSourceManifest", "files": source_files}, ensure_ascii=False, indent=2),
         encoding="utf-8",
@@ -349,7 +371,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--config", help="Optional multi_device_config.json.")
     parser.add_argument("--output", help="Output MultiDeviceMap2D directory.")
     parser.add_argument("--align-common-start", action="store_true", help="Align each device first pose to the reference device first pose unless an explicit transform is configured.")
-    parser.add_argument("--points-csv", action="append", default=[], help="Additional projected point CSV shared by all devices.")
+    parser.add_argument("--points-csv", action="append", default=[], help="Additional projected point CSV already in the global map frame.")
     parser.add_argument("--resolution", type=float, default=0.05, help="Occupancy grid resolution in meters.")
     parser.add_argument("--preview-resolution", type=float, default=0.10, help="Reserved for future preview downsampling.")
     parser.add_argument("--trajectory-radius", type=float, default=1.25, help="Free-space radius around scan trajectory.")

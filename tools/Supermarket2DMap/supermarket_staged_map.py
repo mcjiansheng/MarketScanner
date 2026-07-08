@@ -44,6 +44,16 @@ def transform_to_json(transform: Dict[str, float]) -> Dict[str, float]:
     }
 
 
+def compose_transform(first: Dict[str, float], second: Dict[str, float]) -> Dict[str, float]:
+    """Return a transform equivalent to applying first, then second."""
+    dx, dy = base.transform_point(first.get("dx", 0.0), first.get("dy", 0.0), second.get("dx", 0.0), second.get("dy", 0.0), second.get("yaw", 0.0))
+    return {
+        "dx": dx,
+        "dy": dy,
+        "yaw": first.get("yaw", 0.0) + second.get("yaw", 0.0),
+    }
+
+
 def apply_transform_to_pose(pose: base.Pose2D, transform: Dict[str, float]) -> None:
     pose.x, pose.y = base.transform_point(pose.x, pose.y, transform["dx"], transform["dy"], transform["yaw"])
     pose.yaw += transform["yaw"]
@@ -293,11 +303,7 @@ def generate(args: argparse.Namespace) -> Path:
     (output_dir / "semantic_layers.json").write_text(json.dumps(base.semantic_layers(grid), ensure_ascii=False, indent=2), encoding="utf-8")
 
     transforms_for_report = {
-        segment.index: {
-            "dx": applied[segment.index]["stage_transform"]["dx"] + applied[segment.index]["segment_transform"]["dx"],
-            "dy": applied[segment.index]["stage_transform"]["dy"] + applied[segment.index]["segment_transform"]["dy"],
-            "yaw": applied[segment.index]["stage_transform"]["yaw"] + applied[segment.index]["segment_transform"]["yaw"],
-        }
+        segment.index: compose_transform(applied[segment.index]["segment_transform"], applied[segment.index]["stage_transform"])
         for segment in segments
     }
     report = base.quality_report(session_dir, segments, points, tags, grid, transforms_for_report)

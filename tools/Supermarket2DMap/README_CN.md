@@ -153,6 +153,7 @@ python3 tools/Supermarket2DMap/supermarket_multi_device_map.py \
       "id": "phone_a",
       "session": "sessions/phone_a/SupermarketSession-20260606-090000",
       "stage_config": "configs/phone_a_stage_config.json",
+      "points_csv": "points/phone_a_points.csv",
       "transform": {"dx": 0.0, "dy": 0.0, "yaw_deg": 0.0}
     },
     {
@@ -165,6 +166,8 @@ python3 tools/Supermarket2DMap/supermarket_multi_device_map.py \
 ```
 
 如果设备配置中提供了 `transform`，工具会使用该手动设备级变换；否则在 `--align-common-start` 或配置中的 `align_common_start=true` 开启时，会把该设备第一个有效 pose 对齐到参考设备第一个有效 pose。该自动对齐只适合作为公共起点初值，最终仍应查看 `preview.png`、`multi_device_manifest.json` 和 `quality_report.json` 后人工微调。
+
+设备配置中的 `points_csv` 会随该设备的 stage 和 device transform 一起变换。命令行 `--points-csv` 则表示已经位于全局 `map_2d` 坐标系的额外结构点，不会再套用某台设备的变换。
 
 多设备输出会额外包含：
 

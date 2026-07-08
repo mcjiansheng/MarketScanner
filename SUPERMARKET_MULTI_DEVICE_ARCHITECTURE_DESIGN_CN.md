@@ -251,6 +251,11 @@ global_segment_id = 按输入设备顺序和 local segment 顺序递增
 
 ### 3. 设备对齐
 
+结构点输入分两类：
+
+- 设备本地 `points_csv`：在设备配置中声明，会先应用该设备内部的 stage/segment 校正，再应用 device transform。
+- 全局 `--points-csv`：命令行传入，表示已经位于最终 `map_2d` 坐标系，不再套用某台设备的变换。
+
 ```text
 for each device:
   if config transform:
@@ -298,6 +303,7 @@ price_tags[]
     {
       "id": "phone_a",
       "session": "sessions/phone_a/SupermarketSession-...",
+      "points_csv": "points/phone_a_points.csv",
       "transform": {"dx": 0, "dy": 0, "yaw_deg": 0}
     },
     {

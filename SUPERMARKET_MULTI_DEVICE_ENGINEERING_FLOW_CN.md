@@ -70,6 +70,7 @@ python3 tools/Supermarket2DMap/supermarket_multi_device_map.py \
     {
       "id": "phone_a",
       "session": "sessions/phone_a/SupermarketSession-20260707-090000",
+      "points_csv": "points/phone_a_points.csv",
       "transform": {"dx": 0.0, "dy": 0.0, "yaw_deg": 0.0}
     },
     {
