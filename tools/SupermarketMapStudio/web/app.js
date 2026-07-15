@@ -7,17 +7,20 @@ const mapCanvas = $("#map-canvas");
 const sceneCanvas = $("#scene-canvas");
 const emptyPreview = $("#empty-preview");
 const previewMeta = $("#preview-meta");
-let activeMode = "map";
-let activePreview = "2d";
+let activeMode = "single";
+let activePreview = "2d-color";
 let activeJobId = null;
 let completedJobId = null;
 let activeJobKey = null;
 let completedJobKey = null;
+let sessionRestoreTimer = null;
+let sessionSelectionToken = 0;
 
 const viewer2d = { image: null, scale: 1, offsetX: 0, offsetY: 0, dragging: false, startX: 0, startY: 0 };
+const viewerTop = { center: [0, 0, 0], distance: 1 };
 const viewer3d = {
   data: null, yaw: -0.72, pitch: 0.68, distance: 1, dragging: false,
-  startX: 0, startY: 0, center: [0, 0, 0], span: 1,
+  startX: 0, startY: 0, center: [0, 0, 0], span: 1, planSpan: 1,
   gl: null, program: null, locations: null, buffers: null,
   showSurface: true, showCloud: false, showTrajectory: true, pointSize: 2,
   artifactRoot: "", surfaceLoadToken: 0,
@@ -51,8 +54,9 @@ async function choosePath(inputId, title, mode = "directory") {
     if (result.path) {
       const input = $("#" + inputId);
       input.value = result.path;
-      if (["map-output", "stage-output", "multi-output"].includes(inputId)) input.dataset.autoOutput = "false";
-      applySessionOutputDefault(inputId, result.path);
+      if (["single-output", "multi-output"].includes(inputId)) input.dataset.autoOutput = "false";
+      if (inputId === "single-session") await selectSingleSession(result.path);
+      else applySessionOutputDefault(inputId, result.path);
     }
     return result.path || "";
   } catch (error) {
@@ -79,8 +83,24 @@ function setOutputDefault(outputId, session, prefix) {
 }
 
 function applySessionOutputDefault(inputId, session) {
-  if (inputId === "map-session") setOutputDefault("map-output", session, "MapStudio-Session");
-  if (inputId === "stage-session") setOutputDefault("stage-output", session, "MapStudio-Stage");
+  if (inputId === "single-session") setOutputDefault("single-output", session, "MapStudio-Single");
+}
+
+async function selectSingleSession(session) {
+  const token = ++sessionSelectionToken;
+  const output = $("#single-output");
+  completedJobId = null;
+  completedJobKey = null;
+  $("#open-output").disabled = true;
+  output.value = "";
+  output.dataset.autoOutput = "true";
+  output.dataset.restored = "false";
+  if (!session) {
+    setStatus("就绪");
+    return;
+  }
+  applySessionOutputDefault("single-session", session);
+  await restoreExistingResult(session, token);
 }
 
 function mapOptions() {
@@ -91,6 +111,20 @@ function mapOptions() {
     horizontal_axes: $("#option-axes").value,
     preview_3d_quality: $("#option-3d-quality").value,
   };
+}
+
+function applyRestoredOptions(map) {
+  const parameters = map?.parameters || {};
+  if (parameters.resolution != null) $("#option-resolution").value = parameters.resolution;
+  if (parameters.trajectory_radius != null) $("#option-trajectory-radius").value = parameters.trajectory_radius;
+  if (parameters.tag_snap_distance != null) $("#option-tag-snap").value = parameters.tag_snap_distance;
+  if (["xz", "xy"].includes(parameters.horizontal_axes)) $("#option-axes").value = parameters.horizontal_axes;
+  if (["quick", "detailed", "maximum"].includes(map?.preview_3d_quality)) {
+    $("#option-3d-quality").value = map.preview_3d_quality;
+  }
+  if (!$("#stage-list").children.length) {
+    $("#single-auto-align").checked = Boolean(parameters.auto_align_segments);
+  }
 }
 
 function clearNode(node) {
@@ -133,6 +167,38 @@ async function inspectSession(inputId) {
     setStatus("会话检查完成", "complete");
   } catch (error) {
     setStatus(error.message, "failed");
+  }
+}
+
+async function restoreExistingResult(session, token = sessionSelectionToken) {
+  if (!session || activeMode !== "single") return false;
+  try {
+    setStatus("正在查找已有合并结果", "running");
+    const result = await request("/api/session/result", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session }),
+    });
+    if (token !== sessionSelectionToken || $("#single-session").value.trim() !== session) return false;
+    if (!result.found) {
+      setStatus("未找到已有结果，可以开始生成");
+      return false;
+    }
+    const output = $("#single-output");
+    output.value = result.job.output_dir;
+    output.dataset.autoOutput = "false";
+    output.dataset.restored = "true";
+    completedJobId = result.job.id;
+    applyRestoredOptions(result.job.map);
+    completedJobKey = activeRequestKey(activeRequest());
+    $("#open-output").disabled = false;
+    await renderJob(result.job);
+    setStatus("已加载会话中的已有合并结果", "complete");
+    return true;
+  } catch (error) {
+    if (token !== sessionSelectionToken) return false;
+    setStatus(error.message, "failed");
+    return false;
   }
 }
 
@@ -252,29 +318,32 @@ function addStage() {
   remove.type = "button";
   remove.textContent = "删除";
   remove.setAttribute("aria-label", "删除阶段");
-  remove.addEventListener("click", () => row.remove());
+  remove.addEventListener("click", () => {
+    row.remove();
+    updateSingleAlignmentState();
+  });
   row.appendChild(remove);
   list.appendChild(row);
+  updateSingleAlignmentState();
+}
+
+function updateSingleAlignmentState() {
+  const autoAlign = $("#single-auto-align");
+  const hasStages = $("#stage-list").children.length > 0;
+  if (hasStages) autoAlign.checked = false;
+  autoAlign.disabled = hasStages;
 }
 
 function activeRequest() {
-  if (activeMode === "map") {
+  if (activeMode === "single") {
+    const stages = stageConfig();
     return {
-      kind: "map",
-      session: $("#map-session").value.trim(),
-      output: $("#map-output").value.trim(),
-      points_csv: $("#map-points").value.trim() ? [$("#map-points").value.trim()] : [],
-      auto_align_segments: $("#map-auto-align").checked,
-      options: mapOptions(),
-    };
-  }
-  if (activeMode === "stage") {
-    return {
-      kind: "stage",
-      session: $("#stage-session").value.trim(),
-      output: $("#stage-output").value.trim(),
-      points_csv: $("#stage-points").value.trim() ? [$("#stage-points").value.trim()] : [],
-      stage_config: stageConfig(),
+      kind: stages ? "stage" : "map",
+      session: $("#single-session").value.trim(),
+      output: $("#single-output").value.trim(),
+      points_csv: $("#single-points").value.trim() ? [$("#single-points").value.trim()] : [],
+      auto_align_segments: $("#single-auto-align").checked,
+      stage_config: stages,
       options: mapOptions(),
     };
   }
@@ -289,18 +358,26 @@ function activeRequest() {
 
 function activeRequestKey(payload) {
   const comparable = JSON.parse(JSON.stringify(payload));
-  const outputId = payload.kind === "map" ? "map-output" : payload.kind === "stage" ? "stage-output" : "multi-output";
+  const outputId = payload.kind === "multi" ? "multi-output" : "single-output";
   if ($("#" + outputId).dataset.autoOutput === "true") delete comparable.output;
   return JSON.stringify(comparable);
 }
 
 async function runActiveJob() {
   try {
-    const payload = activeRequest();
-    const requestKey = activeRequestKey(payload);
+    let payload = activeRequest();
+    let requestKey = activeRequestKey(payload);
     if (completedJobId && completedJobKey === requestKey) {
       setStatus("当前设置已经生成，继续显示上次结果", "complete");
       return;
+    }
+    if (activeMode === "single" && $("#single-output").dataset.restored === "true") {
+      const output = $("#single-output");
+      output.value = defaultOutputPath(payload.session, "MapStudio-Single");
+      output.dataset.autoOutput = "true";
+      output.dataset.restored = "false";
+      payload = activeRequest();
+      requestKey = activeRequestKey(payload);
     }
     setBusy(true);
     setStatus("正在创建任务", "running");
@@ -414,7 +491,7 @@ function cssColor(name, fallback) {
 }
 
 function syncEmptyPreview() {
-  emptyPreview.hidden = Boolean((activePreview === "2d" && viewer2d.image) || (activePreview === "3d" && viewer3d.data));
+  emptyPreview.hidden = Boolean((activePreview === "2d-map" && viewer2d.image) || (activePreview !== "2d-map" && viewer3d.data));
 }
 
 function load2D(url) {
@@ -423,7 +500,7 @@ function load2D(url) {
     viewer2d.image = image;
     reset2D();
     syncEmptyPreview();
-    if (activePreview === "2d") draw2D();
+    if (activePreview === "2d-map") draw2D();
   };
   image.src = `${url}?v=${Date.now()}`;
 }
@@ -439,7 +516,7 @@ function reset2D() {
 }
 
 function draw2D() {
-  if (!viewer2d.image || activePreview !== "2d") return;
+  if (!viewer2d.image || activePreview !== "2d-map") return;
   const { width, height } = canvasMetrics(mapCanvas);
   const ctx = mapCanvas.getContext("2d");
   ctx.fillStyle = cssColor("--canvas-bg", "#ecf0f2");
@@ -477,6 +554,9 @@ function load3D(data, previewUrl = "") {
   if (positionCount) {
     viewer3d.center = minima.map((value, index) => (value + maxima[index]) / 2);
     viewer3d.span = Math.max(1, maxima[0] - minima[0], maxima[1] - minima[1], maxima[2] - minima[2]);
+    viewer3d.planSpan = Math.max(1, maxima[0] - minima[0], maxima[1] - minima[1]);
+    viewerTop.center = [...viewer3d.center];
+    viewerTop.distance = 1;
   }
   build3DBuffers();
   reset3D();
@@ -487,7 +567,13 @@ function reset3D() {
   viewer3d.yaw = -0.72;
   viewer3d.pitch = 0.68;
   viewer3d.distance = 1;
-  if (activePreview === "3d") draw3D();
+  if (activePreview === "3d") drawScene();
+}
+
+function resetTopDown() {
+  viewerTop.center = [...viewer3d.center];
+  viewerTop.distance = 1;
+  if (activePreview === "2d-color") drawScene();
 }
 
 function compile3DShader(gl, type, source) {
@@ -684,12 +770,12 @@ async function loadSurfaceBuffers(frames, token) {
       const surface = webGLIndexedBuffer(gl, positions, colors, frame.indices || []);
       if (surface) viewer3d.buffers.surfaces.push(surface);
       loaded += 1;
-      if (loaded % 8 === 0 && activePreview === "3d") draw3D();
+      if (loaded % 8 === 0 && activePreview !== "2d-map") drawScene();
     } catch (error) {
       console.warn(error.message);
     }
   }
-  if (token === viewer3d.surfaceLoadToken && activePreview === "3d") draw3D();
+  if (token === viewer3d.surfaceLoadToken && activePreview !== "2d-map") drawScene();
 }
 
 function draw3DBuffer(buffer, pointSize = 1, roundPoints = false) {
@@ -712,8 +798,9 @@ function draw3DBuffer(buffer, pointSize = 1, roundPoints = false) {
   }
 }
 
-function draw3D() {
-  if (!viewer3d.data || activePreview !== "3d") return;
+function drawScene() {
+  if (!viewer3d.data || activePreview === "2d-map") return;
+  const topDown = activePreview === "2d-color";
   const metrics = canvasMetrics(sceneCanvas);
   const gl = ensure3DRenderer();
   gl.viewport(0, 0, metrics.width, metrics.height);
@@ -723,23 +810,26 @@ function draw3D() {
   gl.depthFunc(gl.LEQUAL);
   gl.useProgram(viewer3d.program);
   const locations = viewer3d.locations;
-  gl.uniform3fv(locations.center, viewer3d.center);
-  gl.uniform1f(locations.yaw, viewer3d.yaw);
-  gl.uniform1f(locations.pitch, viewer3d.pitch);
-  gl.uniform1f(locations.scale, 2 / (viewer3d.span * 1.45 * viewer3d.distance));
+  gl.uniform3fv(locations.center, topDown ? viewerTop.center : viewer3d.center);
+  gl.uniform1f(locations.yaw, topDown ? 0 : viewer3d.yaw);
+  gl.uniform1f(locations.pitch, topDown ? -Math.PI / 2 : viewer3d.pitch);
+  const span = topDown ? viewer3d.planSpan * 1.12 * viewerTop.distance : viewer3d.span * 1.45 * viewer3d.distance;
+  gl.uniform1f(locations.scale, 2 / span);
   gl.uniform1f(locations.aspect, metrics.width / metrics.height);
-  draw3DBuffer(viewer3d.buffers?.grid, 1, false);
-  if (viewer3d.showSurface) {
+  if (!topDown) draw3DBuffer(viewer3d.buffers?.grid, 1, false);
+  if (topDown || viewer3d.showSurface) {
     (viewer3d.buffers?.surfaces || []).forEach((buffer) => draw3DBuffer(buffer, 1, false));
   }
-  if (viewer3d.showCloud) {
+  if ((!viewer3d.buffers?.surfaces?.length && topDown) || viewer3d.showCloud) {
     draw3DBuffer(viewer3d.buffers?.cloud, Math.max(1, metrics.ratio * viewer3d.pointSize), true);
   }
-  if (viewer3d.showTrajectory) {
+  if (!topDown && viewer3d.showTrajectory) {
     (viewer3d.buffers?.trajectories || []).forEach((buffer) => draw3DBuffer(buffer, 1, false));
   }
-  draw3DBuffer(viewer3d.buffers?.structure, Math.max(2, metrics.ratio * 2), true);
-  draw3DBuffer(viewer3d.buffers?.tags, Math.max(5, metrics.ratio * 4), true);
+  if (!topDown) {
+    draw3DBuffer(viewer3d.buffers?.structure, Math.max(2, metrics.ratio * 2), true);
+    draw3DBuffer(viewer3d.buffers?.tags, Math.max(5, metrics.ratio * 4), true);
+  }
 }
 
 function updatePreview(kind) {
@@ -749,11 +839,11 @@ function updatePreview(kind) {
     button.classList.toggle("is-active", selected);
     button.setAttribute("aria-selected", String(selected));
   });
-  mapCanvas.hidden = kind !== "2d";
-  sceneCanvas.hidden = kind !== "3d";
+  mapCanvas.hidden = kind !== "2d-map";
+  sceneCanvas.hidden = kind === "2d-map";
   $("#scene-controls").hidden = kind !== "3d";
   syncEmptyPreview();
-  if (kind === "2d") draw2D(); else draw3D();
+  if (kind === "2d-map") reset2D(); else drawScene();
 }
 
 function pointerPosition(event, canvas) {
@@ -795,14 +885,28 @@ function connect3DControls() {
   sceneCanvas.addEventListener("pointermove", (event) => {
     if (!viewer3d.dragging) return;
     const [x, y] = pointerPosition(event, sceneCanvas);
-    viewer3d.yaw += (x - viewer3d.startX) / 260;
-    viewer3d.pitch = Math.max(-1.35, Math.min(1.35, viewer3d.pitch + (y - viewer3d.startY) / 260));
-    viewer3d.startX = x; viewer3d.startY = y; draw3D();
+    if (activePreview === "2d-color") {
+      const metrics = canvasMetrics(sceneCanvas);
+      const scale = 2 / (viewer3d.planSpan * 1.12 * viewerTop.distance);
+      const worldPerPixel = 2 / (metrics.height * scale);
+      viewerTop.center[0] -= (x - viewer3d.startX) * worldPerPixel;
+      viewerTop.center[1] += (y - viewer3d.startY) * worldPerPixel;
+    } else {
+      viewer3d.yaw += (x - viewer3d.startX) / 260;
+      viewer3d.pitch = Math.max(-1.35, Math.min(1.35, viewer3d.pitch + (y - viewer3d.startY) / 260));
+    }
+    viewer3d.startX = x; viewer3d.startY = y; drawScene();
   });
   sceneCanvas.addEventListener("pointerup", () => { viewer3d.dragging = false; });
   sceneCanvas.addEventListener("wheel", (event) => {
     if (!viewer3d.data) return;
-    event.preventDefault(); viewer3d.distance = Math.max(0.35, Math.min(4, viewer3d.distance * (event.deltaY < 0 ? 0.88 : 1.14))); draw3D();
+    event.preventDefault();
+    if (activePreview === "2d-color") {
+      viewerTop.distance = Math.max(0.2, Math.min(6, viewerTop.distance * (event.deltaY < 0 ? 0.88 : 1.14)));
+    } else {
+      viewer3d.distance = Math.max(0.35, Math.min(4, viewer3d.distance * (event.deltaY < 0 ? 0.88 : 1.14)));
+    }
+    drawScene();
   }, { passive: false });
 }
 
@@ -817,31 +921,37 @@ function bindEvents() {
   $$(".preview-tab").forEach((button) => button.addEventListener("click", () => updatePreview(button.dataset.preview)));
   $$('[data-pick]').forEach((button) => button.addEventListener("click", () => choosePath(button.dataset.pick, button.dataset.title)));
   $$('[data-pick-file]').forEach((button) => button.addEventListener("click", () => choosePath(button.dataset.pickFile, button.dataset.title, "file")));
-  $("#inspect-map-session").addEventListener("click", () => inspectSession("map-session"));
-  $("#inspect-stage-session").addEventListener("click", () => inspectSession("stage-session"));
-  $("#run-map").addEventListener("click", runActiveJob);
-  $("#run-stage").addEventListener("click", runActiveJob);
+  $("#inspect-single-session").addEventListener("click", () => inspectSession("single-session"));
+  $("#run-single").addEventListener("click", runActiveJob);
   $("#run-multi").addEventListener("click", runActiveJob);
   $("#add-device").addEventListener("click", addDevice);
   $("#add-stage").addEventListener("click", addStage);
-  $("#show-surface").addEventListener("change", (event) => { viewer3d.showSurface = event.target.checked; draw3D(); });
-  $("#show-cloud").addEventListener("change", (event) => { viewer3d.showCloud = event.target.checked; draw3D(); });
-  $("#show-trajectory").addEventListener("change", (event) => { viewer3d.showTrajectory = event.target.checked; draw3D(); });
-  $("#point-size").addEventListener("input", (event) => { viewer3d.pointSize = Number(event.target.value); draw3D(); });
-  ["map-session", "stage-session"].forEach((id) => {
-    $("#" + id).addEventListener("input", () => applySessionOutputDefault(id, $("#" + id).value.trim()));
+  $("#show-surface").addEventListener("change", (event) => { viewer3d.showSurface = event.target.checked; drawScene(); });
+  $("#show-cloud").addEventListener("change", (event) => { viewer3d.showCloud = event.target.checked; drawScene(); });
+  $("#show-trajectory").addEventListener("change", (event) => { viewer3d.showTrajectory = event.target.checked; drawScene(); });
+  $("#point-size").addEventListener("input", (event) => { viewer3d.pointSize = Number(event.target.value); drawScene(); });
+  $("#single-session").addEventListener("input", () => {
+    window.clearTimeout(sessionRestoreTimer);
+    sessionRestoreTimer = window.setTimeout(() => selectSingleSession($("#single-session").value.trim()), 500);
   });
-  ["map-output", "stage-output", "multi-output"].forEach((id) => {
-    $("#" + id).addEventListener("input", () => { $("#" + id).dataset.autoOutput = "false"; });
+  ["single-output", "multi-output"].forEach((id) => {
+    $("#" + id).addEventListener("input", () => {
+      $("#" + id).dataset.autoOutput = "false";
+      $("#" + id).dataset.restored = "false";
+    });
   });
-  $("#reset-view").addEventListener("click", () => { if (activePreview === "2d") reset2D(); else reset3D(); });
+  $("#reset-view").addEventListener("click", () => {
+    if (activePreview === "2d-map") reset2D();
+    else if (activePreview === "2d-color") resetTopDown();
+    else reset3D();
+  });
   $("#open-output").addEventListener("click", async () => {
     if (!completedJobId) return;
     try { await request(`/api/jobs/${completedJobId}/open`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({}) }); }
     catch (error) { setStatus(error.message, "failed"); }
   });
   connect2DControls(); connect3DControls();
-  new ResizeObserver(() => { if (activePreview === "2d") draw2D(); else draw3D(); }).observe($(".canvas-wrap"));
+  new ResizeObserver(() => { if (activePreview === "2d-map") draw2D(); else drawScene(); }).observe($(".canvas-wrap"));
 }
 
 bindEvents();

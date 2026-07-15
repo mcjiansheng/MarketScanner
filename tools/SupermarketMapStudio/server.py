@@ -98,6 +98,24 @@ class StudioState:
             if status in {"complete", "failed"}:
                 job.finished_at = time.time()
 
+    def restore(self, kind: str, output_dir: Path) -> Job:
+        with self.lock:
+            resolved = output_dir.resolve()
+            for existing in self.jobs.values():
+                if existing.output_dir.resolve() == resolved and existing.status == "complete":
+                    return existing
+            timestamp = (resolved / "map.json").stat().st_mtime
+            job = Job(
+                identifier=uuid.uuid4().hex[:12],
+                kind=kind,
+                output_dir=resolved,
+                created_at=timestamp,
+                status="complete",
+                finished_at=timestamp,
+            )
+            self.jobs[job.identifier] = job
+            return job
+
 
 STATE = StudioState()
 
@@ -248,6 +266,29 @@ def inspect_session(session: Path) -> Dict[str, Any]:
             for segment in segments
         ],
     }
+
+
+def find_existing_result(session: Path) -> Optional[Job]:
+    required = ("map.json", "preview.png", "preview_3d.json", "quality_report.json")
+    candidates = []
+    for directory in session.iterdir():
+        if not directory.is_dir() or not directory.name.startswith(("MapStudio-", "Map2D-", "StageMap2D-")):
+            continue
+        if not all((directory / name).is_file() for name in required):
+            continue
+        metadata = load_json(directory / "map.json", {})
+        if metadata.get("format") not in {"SupermarketMap2D", "SupermarketStageMap2D"}:
+            continue
+        source_session = metadata.get("session")
+        if source_session and Path(source_session).expanduser().resolve() != session.resolve():
+            continue
+        candidates.append(directory)
+    if not candidates:
+        return None
+    latest = max(candidates, key=lambda path: (path / "map.json").stat().st_mtime)
+    metadata = load_json(latest / "map.json", {})
+    kind = "stage" if metadata.get("format") == "SupermarketStageMap2D" else "map"
+    return STATE.restore(kind, latest)
 
 
 def run_stage(data: Dict[str, Any], output: Path) -> None:
@@ -434,6 +475,10 @@ class StudioHandler(BaseHTTPRequestHandler):
                 return
             if path == "/api/session/inspect":
                 self.send_json(HTTPStatus.OK, inspect_session(require_session(data.get("session"))))
+                return
+            if path == "/api/session/result":
+                job = find_existing_result(require_session(data.get("session")))
+                self.send_json(HTTPStatus.OK, {"found": job is not None, "job": job_payload(job) if job else None})
                 return
             if path == "/api/jobs":
                 job = start_job(data)

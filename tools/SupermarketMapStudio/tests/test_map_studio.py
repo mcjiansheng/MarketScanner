@@ -161,6 +161,11 @@ class MapStudioApiTests(unittest.TestCase):
         self.assertEqual(manifest["stages"][0]["name"], "anchor")
         self.assertAlmostEqual(manifest["stages"][0]["stage_transform"]["dx"], 0.2, places=4)
 
+        restored = self.api("/api/session/result", {"session": str(self.session_a)})
+        self.assertTrue(restored["found"])
+        self.assertEqual(restored["job"]["status"], "complete")
+        self.assertEqual(Path(restored["job"]["output_dir"]).resolve(), output.resolve())
+
     def test_multi_device_job_creates_merge_manifest(self) -> None:
         add_rgbd_frame(self.session_a)
         add_rgbd_frame(self.session_b)

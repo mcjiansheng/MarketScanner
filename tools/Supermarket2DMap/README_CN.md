@@ -2,7 +2,7 @@
 
 `supermarket_2d_map.py` 根据 iOS 超市分段扫描结果生成二维地图交付包。它对应文档 `app/ios/SUPERMARKET_2D_MAP_ROADMAP_CN.md` 中的第一阶段到第二阶段实现：读取分段数据，解析 RTAB-Map 节点轨迹，融合可选结构点，输出二维占据图、轨迹、价签、矢量结构草图和质量报告。
 
-需要图形界面时，优先使用相邻目录中的 [Supermarket Map Studio](../SupermarketMapStudio/README_CN.md)。它提供单会话快速合并、单设备分阶段、多设备合并与 2D/3D 结果预览；本文件保留脚本接口说明，便于自动化和高级排障。
+需要图形界面时，优先使用相邻目录中的 [Supermarket Map Studio](../SupermarketMapStudio/README_CN.md)。它提供统一单设备合并、可选阶段校正、多设备合并、RGB 彩色俯视、结构图与 3D 结果预览；本文件保留脚本接口说明，便于自动化和高级排障。
 
 ## 输入
 

@@ -17,72 +17,43 @@
 
   <main>
     <nav class="mode-tabs" aria-label="处理模式">
-      <button class="tab is-active" type="button" data-mode="map" title="按分段顺序直接合并，不设置阶段校正">单会话快速合并</button>
-      <button class="tab" type="button" data-mode="stage" title="将分段编组为阶段，并设置每阶段的平移和旋转校正">单设备分阶段</button>
+      <button class="tab is-active" type="button" data-mode="single">单设备合并</button>
       <button class="tab" type="button" data-mode="multi">多设备合并</button>
     </nav>
 
     <section class="workbench" aria-label="地图处理工作台">
       <div class="control-panel">
-        <section class="mode-panel is-active" data-panel="map" aria-label="单会话快速合并输入">
+        <section class="mode-panel is-active" data-panel="single" aria-label="单设备合并输入">
           <div class="field-row">
-            <label for="map-session">扫描会话</label>
+            <label for="single-session">扫描会话</label>
             <div class="path-control">
-              <input id="map-session" class="path-input" type="text" spellcheck="false">
-              <button class="secondary" type="button" data-pick="map-session" data-title="选择扫描会话">选择文件夹</button>
+              <input id="single-session" class="path-input" type="text" spellcheck="false">
+              <button class="secondary" type="button" data-pick="single-session" data-title="选择扫描会话">选择文件夹</button>
             </div>
           </div>
           <div class="field-row">
-            <label for="map-output">输出目录</label>
+            <label for="single-output">输出目录</label>
             <div class="path-control">
-              <input id="map-output" class="path-input" type="text" spellcheck="false">
-              <button class="secondary" type="button" data-pick="map-output" data-title="选择空输出目录">选择文件夹</button>
+              <input id="single-output" class="path-input" type="text" spellcheck="false">
+              <button class="secondary" type="button" data-pick="single-output" data-title="选择空输出目录">选择文件夹</button>
             </div>
           </div>
           <div class="field-row">
-            <label for="map-points">可选结构点 CSV</label>
+            <label for="single-points">可选结构点 CSV</label>
             <div class="path-control">
-              <input id="map-points" class="path-input" type="text" spellcheck="false">
-              <button class="secondary" type="button" data-pick-file="map-points" data-title="选择结构点 CSV">选择文件</button>
+              <input id="single-points" class="path-input" type="text" spellcheck="false">
+              <button class="secondary" type="button" data-pick-file="single-points" data-title="选择结构点 CSV">选择文件</button>
             </div>
           </div>
-          <label class="check-row"><input id="map-auto-align" type="checkbox"> 自动对齐相邻分段</label>
-          <div class="button-row">
-            <button id="inspect-map-session" class="secondary" type="button">检查会话</button>
-            <button id="run-map" class="primary" type="button">生成会话地图</button>
-          </div>
-        </section>
-
-        <section class="mode-panel" data-panel="stage" aria-label="单设备分阶段输入">
-          <div class="field-row">
-            <label for="stage-session">扫描会话</label>
-            <div class="path-control">
-              <input id="stage-session" class="path-input" type="text" spellcheck="false">
-              <button class="secondary" type="button" data-pick="stage-session" data-title="选择扫描会话">选择文件夹</button>
-            </div>
-          </div>
-          <div class="field-row">
-            <label for="stage-output">输出目录</label>
-            <div class="path-control">
-              <input id="stage-output" class="path-input" type="text" spellcheck="false">
-              <button class="secondary" type="button" data-pick="stage-output" data-title="选择空输出目录">选择文件夹</button>
-            </div>
-          </div>
-          <div class="field-row">
-            <label for="stage-points">可选结构点 CSV</label>
-            <div class="path-control">
-              <input id="stage-points" class="path-input" type="text" spellcheck="false">
-              <button class="secondary" type="button" data-pick-file="stage-points" data-title="选择结构点 CSV">选择文件</button>
-            </div>
-          </div>
+          <label class="check-row"><input id="single-auto-align" type="checkbox"> 自动对齐相邻分段</label>
           <div class="stage-toolbar">
-            <span>阶段校正</span>
+            <span>阶段校正（可选）</span>
             <button id="add-stage" class="secondary" type="button">添加阶段</button>
           </div>
           <div id="stage-list" class="stage-list" aria-live="polite"></div>
           <div class="button-row">
-            <button id="inspect-stage-session" class="secondary" type="button">检查会话</button>
-            <button id="run-stage" class="primary" type="button">生成阶段地图</button>
+            <button id="inspect-single-session" class="secondary" type="button">检查会话</button>
+            <button id="run-single" class="primary" type="button">生成单设备地图</button>
           </div>
         </section>
 
@@ -118,7 +89,8 @@
       <section class="preview-panel" aria-label="结果预览">
         <div class="preview-toolbar">
           <div class="preview-tabs" role="tablist" aria-label="预览视图">
-            <button class="preview-tab is-active" type="button" data-preview="2d" role="tab" aria-selected="true">2D 地图</button>
+            <button class="preview-tab is-active" type="button" data-preview="2d-color" role="tab" aria-selected="true">2D 彩色俯视</button>
+            <button class="preview-tab" type="button" data-preview="2d-map" role="tab" aria-selected="false">2D 结构图</button>
             <button class="preview-tab" type="button" data-preview="3d" role="tab" aria-selected="false">3D 彩色模型</button>
           </div>
           <div class="preview-actions">
@@ -133,8 +105,8 @@
           </div>
         </div>
         <div class="canvas-wrap">
-          <canvas id="map-canvas" aria-label="二维地图预览"></canvas>
-          <canvas id="scene-canvas" aria-label="三维扫描预览" hidden></canvas>
+          <canvas id="map-canvas" aria-label="二维结构地图预览" hidden></canvas>
+          <canvas id="scene-canvas" aria-label="彩色扫描预览"></canvas>
           <div id="empty-preview" class="empty-preview">等待地图结果</div>
         </div>
         <div id="preview-meta" class="preview-meta"></div>
