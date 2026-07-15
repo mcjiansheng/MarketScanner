@@ -1,0 +1,157 @@
+from __future__ import annotations
+
+import json
+import sqlite3
+import struct
+import sys
+import tempfile
+import threading
+import time
+import unittest
+from pathlib import Path
+from urllib.request import Request, urlopen
+
+
+STUDIO_DIR = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(STUDIO_DIR))
+import server  # noqa: E402
+
+
+def transform_blob(x: float, y: float, z: float) -> bytes:
+    return struct.pack("<12f", 1.0, 0.0, 0.0, x, 0.0, 1.0, 0.0, y, 0.0, 0.0, 1.0, z)
+
+
+def create_session(root: Path, name: str, offset: float) -> Path:
+    session = root / name
+    segment = session / "segment_0001"
+    segment.mkdir(parents=True)
+    db = segment / "rtabmap_segment_0001.db"
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE Node (id INTEGER PRIMARY KEY, pose BLOB, stamp REAL)")
+    conn.execute("INSERT INTO Node VALUES (?, ?, ?)", (1, transform_blob(offset, 1.1, 0.0), 1.0))
+    conn.execute("INSERT INTO Node VALUES (?, ?, ?)", (2, transform_blob(offset + 2.0, 1.5, 1.0), 2.0))
+    conn.commit()
+    conn.close()
+    (segment / "metadata.json").write_text(json.dumps({"segmentIndex": 1}), encoding="utf-8")
+    (segment / "price_tags.json").write_text("[]", encoding="utf-8")
+    return session
+
+
+class MapStudioApiTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.httpd = server.create_server(0)
+        cls.port = cls.httpd.server_port
+        cls.thread = threading.Thread(target=cls.httpd.serve_forever, daemon=True)
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+        cls.thread.join(timeout=2)
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        root = Path(self.temp.name)
+        self.session_a = create_session(root, "SupermarketSession-A", 0.0)
+        self.session_b = create_session(root, "SupermarketSession-B", 0.4)
+        self.root = root
+
+    def tearDown(self) -> None:
+        self.temp.cleanup()
+
+    def api(self, path: str, payload: dict | None = None) -> dict:
+        url = f"http://127.0.0.1:{self.port}{path}"
+        if payload is None:
+            with urlopen(url, timeout=10) as response:
+                return json.loads(response.read())
+        request = Request(url, data=json.dumps(payload).encode("utf-8"), headers={"Content-Type": "application/json"}, method="POST")
+        with urlopen(request, timeout=10) as response:
+            return json.loads(response.read())
+
+    def wait_for_job(self, identifier: str) -> dict:
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            job = self.api(f"/api/jobs/{identifier}")
+            if job["status"] in {"complete", "failed"}:
+                return job
+            time.sleep(0.05)
+        self.fail("Timed out waiting for map job")
+
+    def test_inspect_and_stage_job_write_preview_artifacts(self) -> None:
+        inspection = self.api("/api/session/inspect", {"session": str(self.session_a)})
+        self.assertEqual(inspection["segment_count"], 1)
+        self.assertEqual(inspection["node_count"], 2)
+
+        output = self.root / "stage-output"
+        job = self.api(
+            "/api/jobs",
+            {
+                "kind": "stage",
+                "session": str(self.session_a),
+                "output": str(output),
+                "stage_config": {
+                    "format": "SupermarketStageConfig",
+                    "version": 1,
+                    "stages": [
+                        {
+                            "id": "stage_1",
+                            "name": "anchor",
+                            "segments": [1],
+                            "transform": {"dx": 0.2, "dy": 0, "yaw_deg": 0},
+                        }
+                    ],
+                },
+                "options": {},
+            },
+        )
+        result = self.wait_for_job(job["id"])
+        self.assertEqual(result["status"], "complete", result.get("error"))
+        self.assertIn("preview.png", result["artifacts"])
+        self.assertIn("preview_3d.json", result["artifacts"])
+        preview = self.api(result["artifacts"]["preview_3d.json"])
+        self.assertEqual(preview["format"], "SupermarketMap3DPreview")
+        self.assertEqual(len(preview["segments"][0]["trajectory"]), 2)
+        self.assertAlmostEqual(preview["segments"][0]["trajectory"][0][2], 1.1, places=4)
+        manifest = self.api(result["artifacts"]["stage_manifest.json"])
+        self.assertEqual(manifest["stages"][0]["name"], "anchor")
+        self.assertAlmostEqual(manifest["stages"][0]["stage_transform"]["dx"], 0.2, places=4)
+
+    def test_multi_device_job_creates_merge_manifest(self) -> None:
+        output = self.root / "multi-output"
+        job = self.api(
+            "/api/jobs",
+            {
+                "kind": "multi",
+                "output": str(output),
+                "align_common_start": True,
+                "devices": [
+                    {"id": "phone_a", "session": str(self.session_a), "dx": 0, "dy": 0, "yaw_deg": 0},
+                    {"id": "phone_b", "session": str(self.session_b), "dx": 0, "dy": 0, "yaw_deg": 0},
+                ],
+                "options": {},
+            },
+        )
+        result = self.wait_for_job(job["id"])
+        self.assertEqual(result["status"], "complete", result.get("error"))
+        self.assertIn("multi_device_manifest.json", result["artifacts"])
+        manifest = self.api(result["artifacts"]["multi_device_manifest.json"])
+        self.assertEqual(len(manifest["devices"]), 2)
+
+    def test_projected_points_keep_height_for_3d_preview(self) -> None:
+        points_csv = self.root / "points.csv"
+        points_csv.write_text("x,y,z,kind,segmentIndex\n1,2,3,wall,1\n", encoding="utf-8")
+        point = server.base.load_projected_points([points_csv], "xz")[0]
+        self.assertEqual((point.x, point.y, point.height), (1.0, 3.0, 2.0))
+
+    def test_nonempty_output_is_rejected(self) -> None:
+        output = self.root / "occupied-output"
+        output.mkdir()
+        (output / "existing.txt").write_text("x", encoding="utf-8")
+        with self.assertRaises(Exception):
+            self.api("/api/jobs", {"kind": "map", "session": str(self.session_a), "output": str(output), "options": {}})
+
+
+if __name__ == "__main__":
+    unittest.main()

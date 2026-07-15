@@ -300,6 +300,7 @@ def generate(args: argparse.Namespace) -> Path:
     base.write_geojson(output_dir / "trajectory.geojson", base.trajectory_geojson(segments))
     base.write_geojson(output_dir / "price_tags.geojson", base.price_tags_geojson(tags))
     base.write_geojson(output_dir / "vector_map.geojson", base.vector_map_geojson(grid))
+    base.write_preview_3d(output_dir / "preview_3d.json", segments, points, tags, config.horizontal_axes)
     (output_dir / "semantic_layers.json").write_text(json.dumps(base.semantic_layers(grid), ensure_ascii=False, indent=2), encoding="utf-8")
 
     transforms_for_report = {
@@ -369,6 +370,7 @@ def generate(args: argparse.Namespace) -> Path:
             "occupancy_grid.png",
             "occupancy_grid.yaml",
             "preview.png",
+            "preview_3d.json",
             "trajectory.geojson",
             "price_tags.geojson",
             "vector_map.geojson",

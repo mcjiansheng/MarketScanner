@@ -43,6 +43,7 @@ class Pose2D:
     yaw: float = 0.0
     stamp: Optional[float] = None
     source: str = "db"
+    height: float = 0.0
 
 
 @dataclasses.dataclass
@@ -69,6 +70,7 @@ class ProjectedPoint:
     kind: str
     segment_index: int
     node_id: Optional[int] = None
+    height: float = 0.0
 
 
 @dataclasses.dataclass
@@ -115,20 +117,28 @@ def sha256_file(path: Path) -> Optional[str]:
     return h.hexdigest()
 
 
-def parse_rtabmap_transform(blob: bytes, axes: str) -> Optional[Tuple[float, float, float]]:
-    """Parse RTAB-Map Transform stored as 12 little-endian floats."""
+def parse_rtabmap_transform_3d(blob: bytes, axes: str) -> Optional[Tuple[float, float, float, float]]:
+    """Parse RTAB-Map Transform into map-plane x/y, height and yaw."""
     if not blob or len(blob) != 12 * 4:
         return None
     values = struct.unpack("<12f", blob)
     tx, ty, tz = values[3], values[7], values[11]
     yaw_xy = math.atan2(values[4], values[0])
     if axes == "xy":
-        return tx, ty, yaw_xy
+        return tx, ty, tz, yaw_xy
     if axes == "xz":
         # The iOS supermarket prototype estimates area from pose.x and pose.z.
         yaw_xz = math.atan2(values[8], values[0])
-        return tx, tz, yaw_xz
+        return tx, tz, ty, yaw_xz
     raise ValueError(f"Unsupported horizontal axes: {axes}")
+
+
+def parse_rtabmap_transform(blob: bytes, axes: str) -> Optional[Tuple[float, float, float]]:
+    parsed = parse_rtabmap_transform_3d(blob, axes)
+    if parsed is None:
+        return None
+    x, y, _height, yaw = parsed
+    return x, y, yaw
 
 
 def table_columns(conn: sqlite3.Connection, table: str) -> List[str]:
@@ -170,10 +180,10 @@ def extract_db_poses(db_path: Path, segment_index: int, axes: str) -> Tuple[List
         stamp_expr = "stamp" if "stamp" in columns else "NULL AS stamp"
         query = f"SELECT id, pose, {stamp_expr} FROM Node ORDER BY id"
         for node_id, pose_blob, stamp in conn.execute(query):
-            parsed = parse_rtabmap_transform(pose_blob, axes)
+            parsed = parse_rtabmap_transform_3d(pose_blob, axes)
             if parsed is None:
                 continue
-            x, y, yaw = parsed
+            x, y, height, yaw = parsed
             poses.append(
                 Pose2D(
                     node_id=int(node_id),
@@ -182,6 +192,7 @@ def extract_db_poses(db_path: Path, segment_index: int, axes: str) -> Tuple[List
                     y=y,
                     yaw=yaw,
                     stamp=float(stamp) if stamp is not None else None,
+                    height=height,
                 )
             )
     except sqlite3.Error as exc:
@@ -298,6 +309,7 @@ def load_projected_points(paths: Sequence[Path], axes: str) -> List[ProjectedPoi
                         kind=kind,
                         segment_index=segment_index,
                         node_id=int(node_raw) if node_raw else None,
+                        height=y if axes == "xz" else z,
                     )
                 )
     return points
@@ -607,6 +619,66 @@ def trajectory_geojson(segments: Sequence[Segment]) -> Dict[str, Any]:
     return feature_collection(features)
 
 
+def write_preview_3d(
+    path: Path,
+    segments: Sequence[Segment],
+    points: Sequence[ProjectedPoint],
+    tags: Sequence[PriceTag],
+    horizontal_axes: str,
+) -> None:
+    """Write a compact, renderer-neutral 3D preview for the local UI."""
+    max_trajectory_points = 2500
+    max_structure_points = 8000
+
+    def compact_triplets(rows: Sequence[Tuple[float, float, float]], limit: int) -> List[List[float]]:
+        if not rows:
+            return []
+        stride = max(1, math.ceil(len(rows) / limit))
+        sampled = rows[::stride]
+        if sampled[-1] != rows[-1]:
+            sampled.append(rows[-1])
+        return [[round(x, 4), round(y, 4), round(z, 4)] for x, y, z in sampled]
+
+    segment_entries = []
+    for segment in segments:
+        trajectory = compact_triplets([(pose.x, pose.y, pose.height) for pose in segment.poses], max_trajectory_points)
+        if trajectory:
+            segment_entries.append({"segment": segment.index, "trajectory": trajectory})
+
+    sampled_points = list(points)
+    if len(sampled_points) > max_structure_points:
+        stride = math.ceil(len(sampled_points) / max_structure_points)
+        sampled_points = sampled_points[::stride]
+
+    data = {
+        "format": "SupermarketMap3DPreview",
+        "version": 1,
+        "horizontal_axes": horizontal_axes,
+        "segments": segment_entries,
+        "points": [
+            {
+                "position": [round(point.x, 4), round(point.y, 4), round(point.height, 4)],
+                "kind": point.kind,
+                "segment": point.segment_index,
+            }
+            for point in sampled_points
+        ],
+        "price_tags": [
+            {
+                "position": [
+                    round(tag.snapped_x if tag.snapped_x is not None else tag.raw_x, 4),
+                    round(tag.snapped_y if tag.snapped_y is not None else tag.raw_y, 4),
+                    0.0,
+                ],
+                "id": tag.tag_id,
+                "segment": tag.segment_index,
+            }
+            for tag in tags
+        ],
+    }
+    path.write_text(json.dumps(data, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+
+
 def price_tags_geojson(tags: Sequence[PriceTag]) -> Dict[str, Any]:
     features = []
     for tag in tags:
@@ -807,6 +879,7 @@ def generate(args: argparse.Namespace) -> Path:
     write_geojson(output_dir / "trajectory.geojson", trajectory_geojson(segments))
     write_geojson(output_dir / "price_tags.geojson", price_tags_geojson(tags))
     write_geojson(output_dir / "vector_map.geojson", vector_map_geojson(grid))
+    write_preview_3d(output_dir / "preview_3d.json", segments, points, tags, config.horizontal_axes)
     (output_dir / "semantic_layers.json").write_text(json.dumps(semantic_layers(grid), ensure_ascii=False, indent=2), encoding="utf-8")
 
     report = quality_report(session_dir, segments, points, tags, grid, transforms)
@@ -837,6 +910,7 @@ def generate(args: argparse.Namespace) -> Path:
             "trajectory.geojson",
             "quality_report.json",
             "preview.png",
+            "preview_3d.json",
             "review_items.json",
             "source_manifest.json",
         ],

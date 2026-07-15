@@ -2,6 +2,8 @@
 
 `supermarket_2d_map.py` 根据 iOS 超市分段扫描结果生成二维地图交付包。它对应文档 `app/ios/SUPERMARKET_2D_MAP_ROADMAP_CN.md` 中的第一阶段到第二阶段实现：读取分段数据，解析 RTAB-Map 节点轨迹，融合可选结构点，输出二维占据图、轨迹、价签、矢量结构草图和质量报告。
 
+需要图形界面时，优先使用相邻目录中的 [Supermarket Map Studio](../SupermarketMapStudio/README_CN.md)。它提供单设备阶段、多设备合并与 2D/3D 结果预览；本文件保留脚本接口说明，便于自动化和高级排障。
+
 ## 输入
 
 推荐输入目录：
@@ -183,6 +185,7 @@ Map2D-YYYYMMDD-HHMMSS/
   occupancy_grid.png
   occupancy_grid.yaml
   preview.png
+  preview_3d.json
   vector_map.geojson
   semantic_layers.json
   price_tags.geojson
@@ -195,6 +198,7 @@ Map2D-YYYYMMDD-HHMMSS/
 
 - `occupancy_grid.png`：二维占据栅格。灰色未知，白色可通行，黑色占据，红色冲突。
 - `preview.png`：占据栅格叠加蓝色轨迹和绿色价签。
+- `preview_3d.json`：用于 Supermarket Map Studio 的轻量三维预览数据，包含抽样轨迹、结构点和价签，不是纹理 mesh。
 - `trajectory.geojson`：每个 segment 的扫描轨迹。
 - `price_tags.geojson`：价签位置和置信度。
 - `vector_map.geojson`：从 occupied 栅格提取的结构组件草图。
