@@ -95,6 +95,10 @@
           </div>
           <div class="preview-actions">
             <div id="scene-controls" class="scene-controls" hidden>
+              <div class="drag-mode" role="group" aria-label="三维拖动方式">
+                <button id="drag-rotate" class="view-tool is-active" type="button" aria-pressed="true">旋转</button>
+                <button id="drag-pan" class="view-tool" type="button" aria-pressed="false">平移</button>
+              </div>
               <label><input id="show-surface" type="checkbox" checked>彩色表面</label>
               <label><input id="show-cloud" type="checkbox">点云</label>
               <label><input id="show-trajectory" type="checkbox" checked>轨迹</label>

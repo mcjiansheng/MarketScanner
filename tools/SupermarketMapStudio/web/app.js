@@ -20,7 +20,8 @@ const viewer2d = { image: null, scale: 1, offsetX: 0, offsetY: 0, dragging: fals
 const viewerTop = { center: [0, 0, 0], distance: 1 };
 const viewer3d = {
   data: null, yaw: -0.72, pitch: 0.68, distance: 1, dragging: false,
-  startX: 0, startY: 0, center: [0, 0, 0], span: 1, planSpan: 1,
+  startX: 0, startY: 0, center: [0, 0, 0], viewCenter: [0, 0, 0], span: 1, planSpan: 1,
+  dragMode: "rotate", dragGesture: "rotate",
   gl: null, program: null, locations: null, buffers: null,
   showSurface: true, showCloud: false, showTrajectory: true, pointSize: 2,
   artifactRoot: "", surfaceLoadToken: 0,
@@ -553,6 +554,7 @@ function load3D(data, previewUrl = "") {
   $("#show-cloud").checked = viewer3d.showCloud;
   if (positionCount) {
     viewer3d.center = minima.map((value, index) => (value + maxima[index]) / 2);
+    viewer3d.viewCenter = [...viewer3d.center];
     viewer3d.span = Math.max(1, maxima[0] - minima[0], maxima[1] - minima[1], maxima[2] - minima[2]);
     viewer3d.planSpan = Math.max(1, maxima[0] - minima[0], maxima[1] - minima[1]);
     viewerTop.center = [...viewer3d.center];
@@ -567,6 +569,7 @@ function reset3D() {
   viewer3d.yaw = -0.72;
   viewer3d.pitch = 0.68;
   viewer3d.distance = 1;
+  viewer3d.viewCenter = [...viewer3d.center];
   if (activePreview === "3d") drawScene();
 }
 
@@ -810,7 +813,7 @@ function drawScene() {
   gl.depthFunc(gl.LEQUAL);
   gl.useProgram(viewer3d.program);
   const locations = viewer3d.locations;
-  gl.uniform3fv(locations.center, topDown ? viewerTop.center : viewer3d.center);
+  gl.uniform3fv(locations.center, topDown ? viewerTop.center : viewer3d.viewCenter);
   gl.uniform1f(locations.yaw, topDown ? 0 : viewer3d.yaw);
   gl.uniform1f(locations.pitch, topDown ? -Math.PI / 2 : viewer3d.pitch);
   const span = topDown ? viewer3d.planSpan * 1.12 * viewerTop.distance : viewer3d.span * 1.45 * viewer3d.distance;
@@ -841,6 +844,7 @@ function updatePreview(kind) {
   });
   mapCanvas.hidden = kind !== "2d-map";
   sceneCanvas.hidden = kind === "2d-map";
+  sceneCanvas.dataset.dragMode = kind === "2d-color" ? "pan" : viewer3d.dragMode;
   $("#scene-controls").hidden = kind !== "3d";
   syncEmptyPreview();
   if (kind === "2d-map") reset2D(); else drawScene();
@@ -880,7 +884,12 @@ function connect3DControls() {
   sceneCanvas.addEventListener("pointerdown", (event) => {
     if (!viewer3d.data) return;
     const [x, y] = pointerPosition(event, sceneCanvas);
-    viewer3d.dragging = true; viewer3d.startX = x; viewer3d.startY = y; sceneCanvas.setPointerCapture(event.pointerId);
+    viewer3d.dragGesture = activePreview === "2d-color" || viewer3d.dragMode === "pan" || event.shiftKey || event.button === 1 || event.button === 2
+      ? "pan"
+      : "rotate";
+    viewer3d.dragging = true; viewer3d.startX = x; viewer3d.startY = y;
+    sceneCanvas.classList.add("is-dragging");
+    sceneCanvas.setPointerCapture(event.pointerId);
   });
   sceneCanvas.addEventListener("pointermove", (event) => {
     if (!viewer3d.dragging) return;
@@ -891,13 +900,32 @@ function connect3DControls() {
       const worldPerPixel = 2 / (metrics.height * scale);
       viewerTop.center[0] -= (x - viewer3d.startX) * worldPerPixel;
       viewerTop.center[1] += (y - viewer3d.startY) * worldPerPixel;
+    } else if (viewer3d.dragGesture === "pan") {
+      const metrics = canvasMetrics(sceneCanvas);
+      const scale = 2 / (viewer3d.span * 1.45 * viewer3d.distance);
+      const worldPerPixel = 2 / (metrics.height * scale);
+      const dx = (x - viewer3d.startX) * worldPerPixel;
+      const dy = (y - viewer3d.startY) * worldPerPixel;
+      const cy = Math.cos(viewer3d.yaw);
+      const sy = Math.sin(viewer3d.yaw);
+      const cp = Math.cos(viewer3d.pitch);
+      const sp = Math.sin(viewer3d.pitch);
+      viewer3d.viewCenter[0] += -cy * dx - sy * sp * dy;
+      viewer3d.viewCenter[1] += sy * dx - cy * sp * dy;
+      viewer3d.viewCenter[2] += cp * dy;
     } else {
       viewer3d.yaw += (x - viewer3d.startX) / 260;
       viewer3d.pitch = Math.max(-1.35, Math.min(1.35, viewer3d.pitch + (y - viewer3d.startY) / 260));
     }
     viewer3d.startX = x; viewer3d.startY = y; drawScene();
   });
-  sceneCanvas.addEventListener("pointerup", () => { viewer3d.dragging = false; });
+  const finishDrag = () => {
+    viewer3d.dragging = false;
+    sceneCanvas.classList.remove("is-dragging");
+  };
+  sceneCanvas.addEventListener("pointerup", finishDrag);
+  sceneCanvas.addEventListener("pointercancel", finishDrag);
+  sceneCanvas.addEventListener("contextmenu", (event) => event.preventDefault());
   sceneCanvas.addEventListener("wheel", (event) => {
     if (!viewer3d.data) return;
     event.preventDefault();
@@ -908,6 +936,17 @@ function connect3DControls() {
     }
     drawScene();
   }, { passive: false });
+}
+
+function set3DDragMode(mode) {
+  viewer3d.dragMode = mode;
+  sceneCanvas.dataset.dragMode = activePreview === "2d-color" ? "pan" : mode;
+  [["drag-rotate", "rotate"], ["drag-pan", "pan"]].forEach(([id, value]) => {
+    const button = $("#" + id);
+    const selected = value === mode;
+    button.classList.toggle("is-active", selected);
+    button.setAttribute("aria-pressed", String(selected));
+  });
 }
 
 function switchMode(mode) {
@@ -930,6 +969,8 @@ function bindEvents() {
   $("#show-cloud").addEventListener("change", (event) => { viewer3d.showCloud = event.target.checked; drawScene(); });
   $("#show-trajectory").addEventListener("change", (event) => { viewer3d.showTrajectory = event.target.checked; drawScene(); });
   $("#point-size").addEventListener("input", (event) => { viewer3d.pointSize = Number(event.target.value); drawScene(); });
+  $("#drag-rotate").addEventListener("click", () => set3DDragMode("rotate"));
+  $("#drag-pan").addEventListener("click", () => set3DDragMode("pan"));
   $("#single-session").addEventListener("input", () => {
     window.clearTimeout(sessionRestoreTimer);
     sessionRestoreTimer = window.setTimeout(() => selectSingleSession($("#single-session").value.trim()), 500);
@@ -955,6 +996,7 @@ function bindEvents() {
 }
 
 bindEvents();
+set3DDragMode("rotate");
 addDevice();
 addDevice();
 setStatus("就绪");
