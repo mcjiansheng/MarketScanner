@@ -39,10 +39,39 @@ async function choosePath(inputId, title, mode = "directory") {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ mode, title }),
     });
-    if (result.path) $("#" + inputId).value = result.path;
+    if (result.path) {
+      const input = $("#" + inputId);
+      input.value = result.path;
+      if (["map-output", "stage-output", "multi-output"].includes(inputId)) input.dataset.autoOutput = "false";
+      applySessionOutputDefault(inputId, result.path);
+    }
+    return result.path || "";
   } catch (error) {
     setStatus(error.message, "failed");
+    return "";
   }
+}
+
+function timestampForPath() {
+  const now = new Date();
+  const pad = (value) => String(value).padStart(2, "0");
+  return `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
+}
+
+function defaultOutputPath(session, prefix) {
+  return `${session.replace(/[\\/]+$/, "")}/${prefix}-${timestampForPath()}`;
+}
+
+function setOutputDefault(outputId, session, prefix) {
+  const output = $("#" + outputId);
+  if (!output || (output.value.trim() && output.dataset.autoOutput !== "true")) return;
+  output.value = defaultOutputPath(session, prefix);
+  output.dataset.autoOutput = "true";
+}
+
+function applySessionOutputDefault(inputId, session) {
+  if (inputId === "map-session") setOutputDefault("map-output", session, "MapStudio-2D");
+  if (inputId === "stage-session") setOutputDefault("stage-output", session, "MapStudio-Stage");
 }
 
 function mapOptions() {
@@ -136,9 +165,17 @@ function addDevice() {
   choose.className = "secondary choose-device";
   choose.type = "button";
   choose.textContent = "选择";
-  choose.addEventListener("click", () => choosePath(sessionField.querySelector("input").id, "选择设备扫描会话"));
+  choose.addEventListener("click", async () => {
+    const selected = await choosePath(sessionField.querySelector("input").id, "选择设备扫描会话");
+    if (selected && !$("#multi-output").value.trim()) setOutputDefault("multi-output", selected, "MapStudio-Multi");
+  });
   const sessionInput = sessionField.querySelector("input");
   sessionInput.id = `device-session-${number}-${Date.now()}`;
+  sessionInput.addEventListener("input", () => {
+    if (sessionInput.value.trim() && !$("#multi-output").value.trim()) {
+      setOutputDefault("multi-output", sessionInput.value.trim(), "MapStudio-Multi");
+    }
+  });
   row.appendChild(choose);
   const remove = document.createElement("button");
   remove.className = "remove-device";
@@ -554,6 +591,12 @@ function bindEvents() {
   $("#run-multi").addEventListener("click", runActiveJob);
   $("#add-device").addEventListener("click", addDevice);
   $("#add-stage").addEventListener("click", addStage);
+  ["map-session", "stage-session"].forEach((id) => {
+    $("#" + id).addEventListener("input", () => applySessionOutputDefault(id, $("#" + id).value.trim()));
+  });
+  ["map-output", "stage-output", "multi-output"].forEach((id) => {
+    $("#" + id).addEventListener("input", () => { $("#" + id).dataset.autoOutput = "false"; });
+  });
   $("#reset-view").addEventListener("click", () => { if (activePreview === "2d") reset2D(); else reset3D(); });
   $("#open-output").addEventListener("click", async () => {
     if (!completedJobId) return;

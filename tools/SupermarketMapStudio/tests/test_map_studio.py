@@ -84,7 +84,7 @@ class MapStudioApiTests(unittest.TestCase):
         self.assertEqual(inspection["segment_count"], 1)
         self.assertEqual(inspection["node_count"], 2)
 
-        output = self.root / "stage-output"
+        output = self.session_a / "MapStudio-Stage-test"
         job = self.api(
             "/api/jobs",
             {
