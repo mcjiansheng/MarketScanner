@@ -97,6 +97,17 @@ class MapConfig:
     auto_align_segments: bool
 
 
+@dataclasses.dataclass
+class CameraCalibration:
+    width: int
+    height: int
+    fx: float
+    fy: float
+    cx: float
+    cy: float
+    local_transform: Tuple[float, ...]
+
+
 def read_json(path: Path, default: Any) -> Any:
     try:
         with path.open("r", encoding="utf-8") as f:
@@ -132,6 +143,144 @@ def parse_rtabmap_transform_3d(blob: bytes, axes: str) -> Optional[Tuple[float, 
         yaw_xz = math.atan2(-values[9], values[5])
         return -ty, -tx, tz, yaw_xz
     raise ValueError(f"Unsupported horizontal axes: {axes}")
+
+
+def parse_transform_matrix(blob: bytes) -> Optional[Tuple[float, ...]]:
+    if not blob or len(blob) != 12 * 4:
+        return None
+    return struct.unpack("<12f", blob)
+
+
+def transform_xyz(matrix: Sequence[float], point: Sequence[float]) -> Tuple[float, float, float]:
+    x, y, z = point
+    return (
+        matrix[0] * x + matrix[1] * y + matrix[2] * z + matrix[3],
+        matrix[4] * x + matrix[5] * y + matrix[6] * z + matrix[7],
+        matrix[8] * x + matrix[9] * y + matrix[10] * z + matrix[11],
+    )
+
+
+def parse_camera_calibration(blob: bytes) -> Optional[CameraCalibration]:
+    """Read the first serialized RTAB-Map mono CameraModel."""
+    if not blob or len(blob) < 44:
+        return None
+    header = struct.unpack_from("<11i", blob)
+    if header[3] != 0:
+        return None
+    width, height = header[4], header[5]
+    counts = header[6:10]
+    if any(count < 0 for count in counts) or counts[0] not in {0, 9} or counts[3] not in {0, 12}:
+        return None
+    matrix_bytes = sum(counts) * 8
+    local_size = header[10]
+    required = 44 + matrix_bytes + local_size * 4
+    if width <= 0 or height <= 0 or len(blob) < required:
+        return None
+    if counts[3] == 12:
+        projection_offset = 44 + sum(counts[:3]) * 8
+        projection = struct.unpack_from("<12d", blob, projection_offset)
+        fx, fy, cx, cy = projection[0], projection[5], projection[2], projection[6]
+    elif counts[0] == 9:
+        camera_matrix = struct.unpack_from("<9d", blob, 44)
+        fx, fy, cx, cy = camera_matrix[0], camera_matrix[4], camera_matrix[2], camera_matrix[5]
+    else:
+        return None
+    local_offset = 44 + matrix_bytes
+    if local_size == 12:
+        local_transform = struct.unpack_from("<12f", blob, local_offset)
+    elif local_size == 0:
+        local_transform = (1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0)
+    else:
+        return None
+    if fx <= 0.0 or fy <= 0.0:
+        return None
+    return CameraCalibration(width, height, fx, fy, cx, cy, local_transform)
+
+
+def _paeth_predictor(left: int, above: int, upper_left: int) -> int:
+    estimate = left + above - upper_left
+    left_distance = abs(estimate - left)
+    above_distance = abs(estimate - above)
+    upper_left_distance = abs(estimate - upper_left)
+    if left_distance <= above_distance and left_distance <= upper_left_distance:
+        return left
+    return above if above_distance <= upper_left_distance else upper_left
+
+
+def decode_png_pixels(blob: bytes) -> Tuple[int, int, int, int, bytes]:
+    """Decode non-interlaced 8/16-bit PNG scanlines using only stdlib."""
+    if not blob.startswith(b"\x89PNG\r\n\x1a\n"):
+        raise ValueError("Depth image is not PNG encoded.")
+    offset = 8
+    width = height = bit_depth = color_type = interlace = 0
+    compressed = bytearray()
+    while offset + 12 <= len(blob):
+        length = struct.unpack_from(">I", blob, offset)[0]
+        chunk_type = blob[offset + 4 : offset + 8]
+        payload_start = offset + 8
+        payload_end = payload_start + length
+        if payload_end + 4 > len(blob):
+            raise ValueError("PNG chunk is truncated.")
+        payload = blob[payload_start:payload_end]
+        if chunk_type == b"IHDR":
+            width, height, bit_depth, color_type, _compression, _filter, interlace = struct.unpack(">IIBBBBB", payload)
+        elif chunk_type == b"IDAT":
+            compressed.extend(payload)
+        elif chunk_type == b"IEND":
+            break
+        offset = payload_end + 4
+
+    channels = {0: 1, 2: 3, 4: 2, 6: 4}.get(color_type, 0)
+    if width <= 0 or height <= 0 or channels == 0 or bit_depth not in {8, 16} or interlace != 0:
+        raise ValueError(f"Unsupported PNG layout: {width}x{height}, depth={bit_depth}, color={color_type}, interlace={interlace}")
+    bytes_per_pixel = channels * (bit_depth // 8)
+    row_size = width * bytes_per_pixel
+    raw = zlib.decompress(bytes(compressed))
+    if len(raw) != height * (row_size + 1):
+        raise ValueError("PNG scanline size does not match its header.")
+
+    decoded = bytearray(height * row_size)
+    previous = bytearray(row_size)
+    source_offset = 0
+    for row_index in range(height):
+        filter_type = raw[source_offset]
+        source_offset += 1
+        row = bytearray(raw[source_offset : source_offset + row_size])
+        source_offset += row_size
+        for index in range(row_size):
+            left = row[index - bytes_per_pixel] if index >= bytes_per_pixel else 0
+            above = previous[index]
+            upper_left = previous[index - bytes_per_pixel] if index >= bytes_per_pixel else 0
+            if filter_type == 1:
+                row[index] = (row[index] + left) & 0xFF
+            elif filter_type == 2:
+                row[index] = (row[index] + above) & 0xFF
+            elif filter_type == 3:
+                row[index] = (row[index] + ((left + above) // 2)) & 0xFF
+            elif filter_type == 4:
+                row[index] = (row[index] + _paeth_predictor(left, above, upper_left)) & 0xFF
+            elif filter_type != 0:
+                raise ValueError(f"Unsupported PNG filter type: {filter_type}")
+        destination = row_index * row_size
+        decoded[destination : destination + row_size] = row
+        previous = row
+    return width, height, bit_depth, color_type, bytes(decoded)
+
+
+def decode_depth_image(blob: bytes) -> Tuple[int, int, List[float]]:
+    width, height, bit_depth, color_type, pixels = decode_png_pixels(blob)
+    if color_type == 6 and bit_depth == 8:
+        # OpenCV writes CV_32FC1 as BGRA bytes in a PNG RGBA image. Restore
+        # channel order before interpreting each four bytes as a float.
+        float_bytes = bytearray(len(pixels))
+        for offset in range(0, len(pixels), 4):
+            float_bytes[offset : offset + 4] = bytes((pixels[offset + 2], pixels[offset + 1], pixels[offset], pixels[offset + 3]))
+        values = [value[0] for value in struct.iter_unpack("<f", float_bytes)]
+        return width, height, values
+    if color_type == 0 and bit_depth == 16:
+        values = [value[0] / 1000.0 for value in struct.iter_unpack(">H", pixels)]
+        return width, height, values
+    raise ValueError(f"Unsupported RTAB-Map depth PNG: bit_depth={bit_depth}, color_type={color_type}")
 
 
 def parse_rtabmap_transform(blob: bytes, axes: str) -> Optional[Tuple[float, float, float]]:
@@ -674,13 +823,161 @@ def trajectory_geojson(segments: Sequence[Segment]) -> Dict[str, Any]:
     return feature_collection(features)
 
 
+def _evenly_sampled_rows(rows: Sequence[Any], limit: int) -> List[Any]:
+    if len(rows) <= limit:
+        return list(rows)
+    if limit <= 1:
+        return [rows[0]]
+    indices = [round(index * (len(rows) - 1) / (limit - 1)) for index in range(limit)]
+    return [rows[index] for index in dict.fromkeys(indices)]
+
+
+def extract_depth_point_cloud(
+    segments: Sequence[Segment],
+    horizontal_axes: str,
+    max_frames: int = 96,
+    pixel_step: int = 8,
+    max_depth: float = 5.0,
+    max_points: int = 100000,
+) -> Dict[str, Any]:
+    """Build a bounded preview cloud from RTAB-Map RGB-D node data."""
+    candidates: List[Tuple[Segment, int]] = []
+    for segment in segments:
+        if segment.database_path is None or not segment.database_path.is_file():
+            continue
+        pose_ids = {pose.node_id for pose in segment.poses}
+        if not pose_ids:
+            continue
+        try:
+            with sqlite3.connect(str(segment.database_path)) as conn:
+                tables = set(sqlite_tables(conn))
+                if "Data" not in tables:
+                    continue
+                for (node_id,) in conn.execute(
+                    "SELECT id FROM Data WHERE length(depth)>0 AND length(calibration)>0 ORDER BY id"
+                ):
+                    if int(node_id) in pose_ids:
+                        candidates.append((segment, int(node_id)))
+        except sqlite3.Error:
+            continue
+
+    selected = _evenly_sampled_rows(candidates, max_frames)
+    selected_by_database: Dict[Path, List[Tuple[Segment, int]]] = defaultdict(list)
+    for segment, node_id in selected:
+        if segment.database_path is not None:
+            selected_by_database[segment.database_path].append((segment, node_id))
+
+    points: List[List[Any]] = []
+    decoded_frames = 0
+    skipped_frames = 0
+    warnings: List[str] = []
+    effective_steps: List[int] = []
+    palette = [(17, 132, 141), (47, 123, 202), (147, 89, 170), (189, 106, 50), (88, 125, 53)]
+
+    for database_path, rows in selected_by_database.items():
+        segment = rows[0][0]
+        selected_ids = {node_id for _segment, node_id in rows}
+        current_by_node = {pose.node_id: pose for pose in segment.poses}
+        placeholders = ",".join("?" for _ in selected_ids)
+        query = (
+            "SELECT n.id,n.pose,d.depth,d.calibration FROM Node n "
+            "JOIN Data d ON d.id=n.id WHERE n.id IN (" + placeholders + ") ORDER BY n.id"
+        )
+        try:
+            with sqlite3.connect(str(database_path)) as conn:
+                database_rows = conn.execute(query, sorted(selected_ids)).fetchall()
+        except sqlite3.Error as exc:
+            warnings.append(f"segment_{segment.index:04d}: point cloud SQLite read failed: {exc}")
+            skipped_frames += len(rows)
+            continue
+
+        base_color = palette[(segment.index - 1) % len(palette)]
+        for node_id, pose_blob, depth_blob, calibration_blob in database_rows:
+            current_pose = current_by_node.get(int(node_id))
+            raw_matrix = parse_transform_matrix(pose_blob)
+            raw_projected = parse_rtabmap_transform_3d(pose_blob, horizontal_axes)
+            calibration = parse_camera_calibration(calibration_blob)
+            if current_pose is None or raw_matrix is None or raw_projected is None or calibration is None:
+                skipped_frames += 1
+                continue
+            try:
+                depth_width, depth_height, depths = decode_depth_image(depth_blob)
+            except (ValueError, zlib.error, struct.error) as exc:
+                skipped_frames += 1
+                if len(warnings) < 8:
+                    warnings.append(f"segment_{segment.index:04d} node {node_id}: depth decode failed: {exc}")
+                continue
+
+            raw_x, raw_y, _raw_height, raw_yaw = raw_projected
+            correction_yaw = current_pose.yaw - raw_yaw
+            rotated_raw_x, rotated_raw_y = transform_point(raw_x, raw_y, 0.0, 0.0, correction_yaw)
+            correction_dx = current_pose.x - rotated_raw_x
+            correction_dy = current_pose.y - rotated_raw_y
+            scale_x = depth_width / calibration.width
+            scale_y = depth_height / calibration.height
+            fx = calibration.fx * scale_x
+            fy = calibration.fy * scale_y
+            cx = calibration.cx * scale_x
+            cy = calibration.cy * scale_y
+
+            frame_budget = max(1, max_points // max(1, len(selected)))
+            effective_step = max(1, pixel_step)
+            while math.ceil(depth_width / effective_step) * math.ceil(depth_height / effective_step) > frame_budget:
+                effective_step += 1
+            effective_steps.append(effective_step)
+
+            frame_points = 0
+            for row in range(0, depth_height, effective_step):
+                for column in range(0, depth_width, effective_step):
+                    depth = depths[row * depth_width + column]
+                    if not math.isfinite(depth) or depth <= 0.05 or depth > max_depth:
+                        continue
+                    camera_point = ((column - cx) * depth / fx, (row - cy) * depth / fy, depth)
+                    local_point = transform_xyz(calibration.local_transform, camera_point)
+                    native_world = transform_xyz(raw_matrix, local_point)
+                    if horizontal_axes == "xz":
+                        point_x, point_y, point_height = -native_world[1], -native_world[0], native_world[2]
+                    else:
+                        point_x, point_y, point_height = native_world
+                    point_x, point_y = transform_point(
+                        point_x, point_y, correction_dx, correction_dy, correction_yaw
+                    )
+                    depth_shade = 0.72 + 0.28 * (1.0 - min(1.0, depth / max_depth))
+                    height_shade = 0.82 + 0.18 * max(0.0, min(1.0, point_height / 3.0))
+                    shade = depth_shade * height_shade
+                    color = [min(255, round(channel * shade)) for channel in base_color]
+                    points.append(
+                        [round(point_x, 3), round(point_y, 3), round(point_height, 3), *color]
+                    )
+                    frame_points += 1
+            if frame_points:
+                decoded_frames += 1
+            else:
+                skipped_frames += 1
+
+    return {
+        "points": points,
+        "point_count": len(points),
+        "available_frames": len(candidates),
+        "sampled_frames": len(selected),
+        "decoded_frames": decoded_frames,
+        "skipped_frames": skipped_frames,
+        "minimum_pixel_step": pixel_step,
+        "effective_pixel_step_max": max(effective_steps, default=pixel_step),
+        "max_depth_m": max_depth,
+        "max_points": max_points,
+        "color_mode": "segment_depth_shading",
+        "warnings": warnings,
+    }
+
+
 def write_preview_3d(
     path: Path,
     segments: Sequence[Segment],
     points: Sequence[ProjectedPoint],
     tags: Sequence[PriceTag],
     horizontal_axes: str,
-) -> None:
+) -> Dict[str, Any]:
     """Write a compact, renderer-neutral 3D preview for the local UI."""
     max_trajectory_points = 2500
     max_structure_points = 8000
@@ -705,9 +1002,10 @@ def write_preview_3d(
         stride = math.ceil(len(sampled_points) / max_structure_points)
         sampled_points = sampled_points[::stride]
 
+    point_cloud = extract_depth_point_cloud(segments, horizontal_axes)
     data = {
         "format": "SupermarketMap3DPreview",
-        "version": 1,
+        "version": 2,
         "horizontal_axes": horizontal_axes,
         "segments": segment_entries,
         "points": [
@@ -730,8 +1028,10 @@ def write_preview_3d(
             }
             for tag in tags
         ],
+        "point_cloud": point_cloud,
     }
     path.write_text(json.dumps(data, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+    return {key: value for key, value in point_cloud.items() if key not in {"points"}}
 
 
 def price_tags_geojson(tags: Sequence[PriceTag]) -> Dict[str, Any]:
@@ -833,10 +1133,10 @@ def quality_report(
             warnings.append(f"segment_{segment.index:04d}: no db poses available")
         if segment.has_local_grid_blobs:
             warnings.append(
-                f"segment_{segment.index:04d}: RTAB-Map occupancy blobs detected but not decoded by this Python tool"
+                f"segment_{segment.index:04d}: RTAB-Map occupancy blobs are not decoded for 2D structure extraction"
             )
     if not points:
-        warnings.append("No projected structure points were provided; occupancy is based on trajectory free-space only.")
+        warnings.append("No projected structure points were provided; 2D occupancy is based on trajectory free-space only.")
     if counts["conflict"] / max(1, total) > 0.05:
         warnings.append("Conflict grid ratio is above 5%; inspect segment alignment and dynamic obstacles.")
     return {
@@ -935,10 +1235,11 @@ def generate(args: argparse.Namespace) -> Path:
     write_geojson(output_dir / "trajectory.geojson", trajectory_geojson(segments))
     write_geojson(output_dir / "price_tags.geojson", price_tags_geojson(tags))
     write_geojson(output_dir / "vector_map.geojson", vector_map_geojson(grid))
-    write_preview_3d(output_dir / "preview_3d.json", segments, points, tags, config.horizontal_axes)
+    preview_3d_summary = write_preview_3d(output_dir / "preview_3d.json", segments, points, tags, config.horizontal_axes)
     (output_dir / "semantic_layers.json").write_text(json.dumps(semantic_layers(grid), ensure_ascii=False, indent=2), encoding="utf-8")
 
     report = quality_report(session_dir, segments, points, tags, grid, transforms)
+    report["preview_3d"] = preview_3d_summary
     (output_dir / "quality_report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     (output_dir / "source_manifest.json").write_text(
         json.dumps(source_manifest(session_dir, segments, point_paths), ensure_ascii=False, indent=2),

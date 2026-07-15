@@ -17,8 +17,8 @@
 
   <main>
     <nav class="mode-tabs" aria-label="处理模式">
-      <button class="tab is-active" type="button" data-mode="map">单会话快速合并</button>
-      <button class="tab" type="button" data-mode="stage">单设备分阶段</button>
+      <button class="tab is-active" type="button" data-mode="map" title="按分段顺序直接合并，不设置阶段校正">单会话快速合并</button>
+      <button class="tab" type="button" data-mode="stage" title="将分段编组为阶段，并设置每阶段的平移和旋转校正">单设备分阶段</button>
       <button class="tab" type="button" data-mode="multi">多设备合并</button>
     </nav>
 
@@ -117,10 +117,15 @@
       <section class="preview-panel" aria-label="结果预览">
         <div class="preview-toolbar">
           <div class="preview-tabs" role="tablist" aria-label="预览视图">
-            <button class="preview-tab is-active" type="button" data-preview="2d" role="tab" aria-selected="true">2D 结果</button>
-            <button class="preview-tab" type="button" data-preview="3d" role="tab" aria-selected="false">3D 结果</button>
+            <button class="preview-tab is-active" type="button" data-preview="2d" role="tab" aria-selected="true">2D 地图</button>
+            <button class="preview-tab" type="button" data-preview="3d" role="tab" aria-selected="false">3D 点云</button>
           </div>
           <div class="preview-actions">
+            <div id="scene-controls" class="scene-controls" hidden>
+              <label><input id="show-cloud" type="checkbox" checked>点云</label>
+              <label><input id="show-trajectory" type="checkbox" checked>轨迹</label>
+              <label class="point-size-control">点大小<input id="point-size" type="range" min="1" max="5" step="0.5" value="2"></label>
+            </div>
             <button id="reset-view" class="secondary" type="button">重置视图</button>
             <button id="open-output" class="secondary" type="button" disabled>打开输出目录</button>
           </div>

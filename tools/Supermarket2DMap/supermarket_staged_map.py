@@ -237,7 +237,7 @@ def stage_quality(
         )
 
     if not has_points:
-        warnings.append({"type": "map", "message": "No projected structure points were provided; output is mainly trajectory coverage, not final shelf/wall structure."})
+        warnings.append({"type": "map", "message": "No projected structure points were provided; the 2D output is mainly trajectory coverage, not final shelf/wall structure."})
 
     return {"stages": stage_entries, "warnings": warnings}, warnings
 
@@ -301,7 +301,9 @@ def generate(args: argparse.Namespace) -> Path:
     base.write_geojson(output_dir / "trajectory.geojson", base.trajectory_geojson(segments))
     base.write_geojson(output_dir / "price_tags.geojson", base.price_tags_geojson(tags))
     base.write_geojson(output_dir / "vector_map.geojson", base.vector_map_geojson(grid))
-    base.write_preview_3d(output_dir / "preview_3d.json", segments, points, tags, config.horizontal_axes)
+    preview_3d_summary = base.write_preview_3d(
+        output_dir / "preview_3d.json", segments, points, tags, config.horizontal_axes
+    )
     (output_dir / "semantic_layers.json").write_text(json.dumps(base.semantic_layers(grid), ensure_ascii=False, indent=2), encoding="utf-8")
 
     transforms_for_report = {
@@ -309,6 +311,7 @@ def generate(args: argparse.Namespace) -> Path:
         for segment in segments
     }
     report = base.quality_report(session_dir, segments, points, tags, grid, transforms_for_report)
+    report["preview_3d"] = preview_3d_summary
     stage_report, stage_warnings = stage_quality(stages, segments, stage_by_segment, stage_transforms, segment_transforms, bool(points))
     report["stage_summary"] = {
         "stage_count": len(stages),

@@ -15,7 +15,12 @@ let activeJobKey = null;
 let completedJobKey = null;
 
 const viewer2d = { image: null, scale: 1, offsetX: 0, offsetY: 0, dragging: false, startX: 0, startY: 0 };
-const viewer3d = { data: null, yaw: -0.72, pitch: 0.68, distance: 1, dragging: false, startX: 0, startY: 0, center: [0, 0, 0], span: 1 };
+const viewer3d = {
+  data: null, yaw: -0.72, pitch: 0.68, distance: 1, dragging: false,
+  startX: 0, startY: 0, center: [0, 0, 0], span: 1,
+  gl: null, program: null, locations: null, buffers: null,
+  showCloud: true, showTrajectory: true, pointSize: 2,
+};
 
 function setStatus(text, tone = "") {
   statusNode.textContent = text;
@@ -73,7 +78,7 @@ function setOutputDefault(outputId, session, prefix) {
 }
 
 function applySessionOutputDefault(inputId, session) {
-  if (inputId === "map-session") setOutputDefault("map-output", session, "MapStudio-2D");
+  if (inputId === "map-session") setOutputDefault("map-output", session, "MapStudio-Session");
   if (inputId === "stage-session") setOutputDefault("stage-output", session, "MapStudio-Stage");
 }
 
@@ -354,7 +359,9 @@ async function renderJob(job) {
     load3D(data);
   }
   const summary = job.quality_report?.grid;
-  previewMeta.textContent = summary ? `${summary.width} x ${summary.height} 栅格  |  ${summary.resolution_m} m  |  ${Number(summary.area_m2).toFixed(2)} m2` : job.output_dir;
+  const cloud = job.quality_report?.preview_3d;
+  const cloudText = cloud?.point_count ? `  |  3D ${cloud.point_count.toLocaleString()} 点 / ${cloud.decoded_frames} 关键帧` : "";
+  previewMeta.textContent = summary ? `${summary.width} x ${summary.height} 栅格  |  ${summary.resolution_m} m  |  ${Number(summary.area_m2).toFixed(2)} m2${cloudText}` : job.output_dir;
 }
 
 function renderReview(report, review) {
@@ -442,6 +449,7 @@ function load3D(data) {
   (data.segments || []).forEach((segment) => positions.push(...(segment.trajectory || [])));
   (data.points || []).forEach((point) => positions.push(point.position));
   (data.price_tags || []).forEach((tag) => positions.push(tag.position));
+  (data.point_cloud?.points || []).forEach((point) => positions.push(point.slice(0, 3)));
   viewer3d.data = positions.length ? data : null;
   if (positions.length) {
     const minima = [Infinity, Infinity, Infinity];
@@ -453,6 +461,7 @@ function load3D(data) {
     viewer3d.center = minima.map((value, index) => (value + maxima[index]) / 2);
     viewer3d.span = Math.max(1, maxima[0] - minima[0], maxima[1] - minima[1], maxima[2] - minima[2]);
   }
+  build3DBuffers();
   reset3D();
   syncEmptyPreview();
 }
@@ -464,74 +473,187 @@ function reset3D() {
   if (activePreview === "3d") draw3D();
 }
 
-function project3D(point, width, height) {
-  const [cx, cy, cz] = viewer3d.center;
-  const x = point[0] - cx;
-  const y = point[1] - cy;
-  const z = point[2] - cz;
-  const cosYaw = Math.cos(viewer3d.yaw);
-  const sinYaw = Math.sin(viewer3d.yaw);
-  const cosPitch = Math.cos(viewer3d.pitch);
-  const sinPitch = Math.sin(viewer3d.pitch);
-  const rx = x * cosYaw - y * sinYaw;
-  const ry = x * sinYaw + y * cosYaw;
-  const rz = z;
-  const py = ry * cosPitch - rz * sinPitch;
-  const pz = ry * sinPitch + rz * cosPitch;
-  const depth = viewer3d.span * (2.8 * viewer3d.distance) + py;
-  const scale = Math.min(width, height) / Math.max(1, viewer3d.span * 3.6 * viewer3d.distance);
-  return [width / 2 + rx * scale, height / 2 - pz * scale, depth];
+function compile3DShader(gl, type, source) {
+  const shader = gl.createShader(type);
+  gl.shaderSource(shader, source);
+  gl.compileShader(shader);
+  if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+    throw new Error(gl.getShaderInfoLog(shader) || "3D shader compilation failed");
+  }
+  return shader;
 }
 
-function drawLine(ctx, points, color, width, metrics) {
-  if (points.length < 2) return;
-  ctx.beginPath();
-  points.forEach((point, index) => {
-    const [x, y] = project3D(point, metrics.width, metrics.height);
-    if (index === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+function ensure3DRenderer() {
+  if (viewer3d.gl && viewer3d.program) return viewer3d.gl;
+  const gl = sceneCanvas.getContext("webgl", { antialias: true, alpha: false, depth: true });
+  if (!gl) throw new Error("当前浏览器无法创建 WebGL 三维视图");
+  const vertex = compile3DShader(gl, gl.VERTEX_SHADER, `
+    attribute vec3 a_position;
+    attribute vec3 a_color;
+    uniform vec3 u_center;
+    uniform float u_yaw;
+    uniform float u_pitch;
+    uniform float u_scale;
+    uniform float u_aspect;
+    uniform float u_point_size;
+    varying vec3 v_color;
+    void main() {
+      vec3 p = a_position - u_center;
+      float cy = cos(u_yaw);
+      float sy = sin(u_yaw);
+      float cp = cos(u_pitch);
+      float sp = sin(u_pitch);
+      float rx = p.x * cy - p.y * sy;
+      float ry = p.x * sy + p.y * cy;
+      float screen_y = p.z * cp - ry * sp;
+      float depth = p.z * sp + ry * cp;
+      gl_Position = vec4(rx * u_scale / u_aspect, screen_y * u_scale, depth * u_scale * 0.18, 1.0);
+      gl_PointSize = u_point_size;
+      v_color = a_color;
+    }
+  `);
+  const fragment = compile3DShader(gl, gl.FRAGMENT_SHADER, `
+    precision mediump float;
+    uniform float u_round_points;
+    varying vec3 v_color;
+    void main() {
+      if (u_round_points > 0.5 && distance(gl_PointCoord, vec2(0.5)) > 0.5) discard;
+      gl_FragColor = vec4(v_color, 1.0);
+    }
+  `);
+  const program = gl.createProgram();
+  gl.attachShader(program, vertex);
+  gl.attachShader(program, fragment);
+  gl.linkProgram(program);
+  if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+    throw new Error(gl.getProgramInfoLog(program) || "3D shader linking failed");
+  }
+  viewer3d.gl = gl;
+  viewer3d.program = program;
+  viewer3d.locations = {
+    position: gl.getAttribLocation(program, "a_position"),
+    color: gl.getAttribLocation(program, "a_color"),
+    center: gl.getUniformLocation(program, "u_center"),
+    yaw: gl.getUniformLocation(program, "u_yaw"),
+    pitch: gl.getUniformLocation(program, "u_pitch"),
+    scale: gl.getUniformLocation(program, "u_scale"),
+    aspect: gl.getUniformLocation(program, "u_aspect"),
+    pointSize: gl.getUniformLocation(program, "u_point_size"),
+    roundPoints: gl.getUniformLocation(program, "u_round_points"),
+  };
+  return gl;
+}
+
+function webGLBuffer(gl, positions, colors, mode) {
+  if (!positions.length) return null;
+  const positionBuffer = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, positionBuffer);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(positions), gl.STATIC_DRAW);
+  const colorBuffer = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, colorBuffer);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(colors), gl.STATIC_DRAW);
+  return { positionBuffer, colorBuffer, count: positions.length / 3, mode };
+}
+
+function repeatedColor(color, count) {
+  return Array.from({ length: count }, () => color).flat();
+}
+
+function dispose3DBuffers() {
+  if (!viewer3d.gl || !viewer3d.buffers) return;
+  const buffers = [
+    viewer3d.buffers.cloud,
+    viewer3d.buffers.structure,
+    viewer3d.buffers.tags,
+    viewer3d.buffers.grid,
+    ...(viewer3d.buffers.trajectories || []),
+  ].filter(Boolean);
+  buffers.forEach((buffer) => {
+    viewer3d.gl.deleteBuffer(buffer.positionBuffer);
+    viewer3d.gl.deleteBuffer(buffer.colorBuffer);
   });
-  ctx.strokeStyle = color;
-  ctx.lineWidth = width * metrics.ratio;
-  ctx.stroke();
+  viewer3d.buffers = null;
+}
+
+function build3DBuffers() {
+  dispose3DBuffers();
+  if (!viewer3d.data) {
+    return;
+  }
+  const gl = ensure3DRenderer();
+  const data = viewer3d.data;
+  const cloudPositions = [];
+  const cloudColors = [];
+  (data.point_cloud?.points || []).forEach((point) => {
+    cloudPositions.push(point[0], point[1], point[2]);
+    cloudColors.push((point[3] || 70) / 255, (point[4] || 130) / 255, (point[5] || 150) / 255);
+  });
+  const structurePositions = [];
+  (data.points || []).forEach((point) => structurePositions.push(...point.position));
+  const tagPositions = [];
+  (data.price_tags || []).forEach((tag) => tagPositions.push(...tag.position));
+  const segmentColors = [[0.05, 0.49, 0.53], [0.18, 0.48, 0.79], [0.58, 0.35, 0.67], [0.74, 0.42, 0.20], [0.35, 0.49, 0.21]];
+  const trajectories = (data.segments || []).map((segment, index) => {
+    const positions = (segment.trajectory || []).flat();
+    return webGLBuffer(gl, positions, repeatedColor(segmentColors[index % segmentColors.length], positions.length / 3), gl.LINE_STRIP);
+  }).filter(Boolean);
+  const span = viewer3d.span * 0.65;
+  const gridPositions = [];
+  for (let index = -5; index <= 5; index += 1) {
+    const x = viewer3d.center[0] + (index / 5) * span;
+    gridPositions.push(x, viewer3d.center[1] - span, 0, x, viewer3d.center[1] + span, 0);
+    const y = viewer3d.center[1] + (index / 5) * span;
+    gridPositions.push(viewer3d.center[0] - span, y, 0, viewer3d.center[0] + span, y, 0);
+  }
+  viewer3d.buffers = {
+    cloud: webGLBuffer(gl, cloudPositions, cloudColors, gl.POINTS),
+    structure: webGLBuffer(gl, structurePositions, repeatedColor([0.20, 0.23, 0.25], structurePositions.length / 3), gl.POINTS),
+    tags: webGLBuffer(gl, tagPositions, repeatedColor([0.65, 0.33, 0.10], tagPositions.length / 3), gl.POINTS),
+    trajectories,
+    grid: webGLBuffer(gl, gridPositions, repeatedColor([0.70, 0.74, 0.77], gridPositions.length / 3), gl.LINES),
+  };
+}
+
+function draw3DBuffer(buffer, pointSize = 1, roundPoints = false) {
+  if (!buffer) return;
+  const gl = viewer3d.gl;
+  const locations = viewer3d.locations;
+  gl.bindBuffer(gl.ARRAY_BUFFER, buffer.positionBuffer);
+  gl.vertexAttribPointer(locations.position, 3, gl.FLOAT, false, 0, 0);
+  gl.enableVertexAttribArray(locations.position);
+  gl.bindBuffer(gl.ARRAY_BUFFER, buffer.colorBuffer);
+  gl.vertexAttribPointer(locations.color, 3, gl.FLOAT, false, 0, 0);
+  gl.enableVertexAttribArray(locations.color);
+  gl.uniform1f(locations.pointSize, pointSize);
+  gl.uniform1f(locations.roundPoints, roundPoints ? 1 : 0);
+  gl.drawArrays(buffer.mode, 0, buffer.count);
 }
 
 function draw3D() {
   if (!viewer3d.data || activePreview !== "3d") return;
   const metrics = canvasMetrics(sceneCanvas);
-  const ctx = sceneCanvas.getContext("2d");
-  ctx.fillStyle = cssColor("--canvas-bg", "#ecf0f2");
-  ctx.fillRect(0, 0, metrics.width, metrics.height);
-  const muted = cssColor("--line", "#cbd3d8");
-  const accent = cssColor("--accent", "#0c7c86");
-  const warning = cssColor("--warning", "#a65419");
-  const segmentColors = [
-    accent,
-    cssColor("--segment-2", "#2f7bca"),
-    cssColor("--segment-3", "#9b5eae"),
-    cssColor("--segment-4", "#bd6a32"),
-    cssColor("--segment-5", "#587d35"),
-  ];
-  const span = viewer3d.span * 0.65;
-  for (let index = -5; index <= 5; index += 1) {
-    const coordinate = viewer3d.center[0] + (index / 5) * span;
-    drawLine(ctx, [[coordinate, viewer3d.center[1] - span, 0], [coordinate, viewer3d.center[1] + span, 0]], muted, 0.55, metrics);
-    const other = viewer3d.center[1] + (index / 5) * span;
-    drawLine(ctx, [[viewer3d.center[0] - span, other, 0], [viewer3d.center[0] + span, other, 0]], muted, 0.55, metrics);
+  const gl = ensure3DRenderer();
+  gl.viewport(0, 0, metrics.width, metrics.height);
+  gl.clearColor(0.925, 0.941, 0.949, 1);
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+  gl.enable(gl.DEPTH_TEST);
+  gl.depthFunc(gl.LEQUAL);
+  gl.useProgram(viewer3d.program);
+  const locations = viewer3d.locations;
+  gl.uniform3fv(locations.center, viewer3d.center);
+  gl.uniform1f(locations.yaw, viewer3d.yaw);
+  gl.uniform1f(locations.pitch, viewer3d.pitch);
+  gl.uniform1f(locations.scale, 2 / (viewer3d.span * 1.45 * viewer3d.distance));
+  gl.uniform1f(locations.aspect, metrics.width / metrics.height);
+  draw3DBuffer(viewer3d.buffers?.grid, 1, false);
+  if (viewer3d.showCloud) {
+    draw3DBuffer(viewer3d.buffers?.cloud, Math.max(1, metrics.ratio * viewer3d.pointSize), true);
   }
-  (viewer3d.data.segments || []).forEach((segment, index) => drawLine(ctx, segment.trajectory || [], segmentColors[index % segmentColors.length], 1.45, metrics));
-  const structure = viewer3d.data.points || [];
-  ctx.fillStyle = cssColor("--structure", "#343b40");
-  structure.forEach((point) => {
-    const [x, y] = project3D(point.position, metrics.width, metrics.height);
-    ctx.fillRect(x - metrics.ratio, y - metrics.ratio, metrics.ratio * 2, metrics.ratio * 2);
-  });
-  ctx.fillStyle = warning;
-  (viewer3d.data.price_tags || []).forEach((tag) => {
-    const [x, y] = project3D(tag.position, metrics.width, metrics.height);
-    ctx.beginPath();
-    ctx.arc(x, y, 3 * metrics.ratio, 0, Math.PI * 2);
-    ctx.fill();
-  });
+  if (viewer3d.showTrajectory) {
+    (viewer3d.buffers?.trajectories || []).forEach((buffer) => draw3DBuffer(buffer, 1, false));
+  }
+  draw3DBuffer(viewer3d.buffers?.structure, Math.max(2, metrics.ratio * 2), true);
+  draw3DBuffer(viewer3d.buffers?.tags, Math.max(5, metrics.ratio * 4), true);
 }
 
 function updatePreview(kind) {
@@ -543,6 +665,7 @@ function updatePreview(kind) {
   });
   mapCanvas.hidden = kind !== "2d";
   sceneCanvas.hidden = kind !== "3d";
+  $("#scene-controls").hidden = kind !== "3d";
   syncEmptyPreview();
   if (kind === "2d") draw2D(); else draw3D();
 }
@@ -615,6 +738,9 @@ function bindEvents() {
   $("#run-multi").addEventListener("click", runActiveJob);
   $("#add-device").addEventListener("click", addDevice);
   $("#add-stage").addEventListener("click", addStage);
+  $("#show-cloud").addEventListener("change", (event) => { viewer3d.showCloud = event.target.checked; draw3D(); });
+  $("#show-trajectory").addEventListener("change", (event) => { viewer3d.showTrajectory = event.target.checked; draw3D(); });
+  $("#point-size").addEventListener("input", (event) => { viewer3d.pointSize = Number(event.target.value); draw3D(); });
   ["map-session", "stage-session"].forEach((id) => {
     $("#" + id).addEventListener("input", () => applySessionOutputDefault(id, $("#" + id).value.trim()));
   });

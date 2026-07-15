@@ -8,6 +8,7 @@ import tempfile
 import threading
 import time
 import unittest
+import zlib
 from pathlib import Path
 from urllib.request import Request, urlopen
 
@@ -19,6 +20,27 @@ import server  # noqa: E402
 
 def transform_blob(x: float, y: float, z: float) -> bytes:
     return struct.pack("<12f", 1.0, 0.0, 0.0, x, 0.0, 1.0, 0.0, y, 0.0, 0.0, 1.0, z)
+
+
+def png_chunk(kind: bytes, payload: bytes) -> bytes:
+    return struct.pack(">I", len(payload)) + kind + payload + struct.pack(">I", zlib.crc32(kind + payload) & 0xFFFFFFFF)
+
+
+def depth_png(width: int, height: int, values: list[float]) -> bytes:
+    rows = bytearray()
+    for row in range(height):
+        rows.append(0)
+        for value in values[row * width : (row + 1) * width]:
+            bgra = struct.pack("<f", value)
+            rows.extend((bgra[2], bgra[1], bgra[0], bgra[3]))
+    header = struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0)
+    return b"\x89PNG\r\n\x1a\n" + png_chunk(b"IHDR", header) + png_chunk(b"IDAT", zlib.compress(rows)) + png_chunk(b"IEND", b"")
+
+
+def calibration_blob(width: int, height: int) -> bytes:
+    header = struct.pack("<11i", 0, 23, 5, 0, width, height, 9, 0, 0, 0, 12)
+    camera = struct.pack("<9d", 2.0, 0.0, width / 2, 0.0, 2.0, height / 2, 0.0, 0.0, 1.0)
+    return header + camera + transform_blob(0.0, 0.0, 0.0)
 
 
 def create_session(root: Path, name: str, offset: float) -> Path:
@@ -149,6 +171,23 @@ class MapStudioApiTests(unittest.TestCase):
     def test_database_pose_is_converted_to_ios_xz_frame(self) -> None:
         parsed = server.base.parse_rtabmap_transform_3d(transform_blob(2.0, 1.5, 1.0), "xz")
         self.assertEqual(parsed, (-1.5, -2.0, 1.0, 0.0))
+
+    def test_depth_png_and_calibration_create_point_cloud_preview(self) -> None:
+        database = self.session_a / "segment_0001" / "rtabmap_segment_0001.db"
+        with sqlite3.connect(database) as conn:
+            conn.execute("CREATE TABLE Data (id INTEGER PRIMARY KEY, depth BLOB, calibration BLOB)")
+            conn.execute(
+                "INSERT INTO Data VALUES (?, ?, ?)",
+                (1, depth_png(2, 2, [1.0, 1.5, 2.0, 2.5]), calibration_blob(2, 2)),
+            )
+        config = server.base.MapConfig(0.05, 0.1, 1.25, 1.0, 0.1, 8.0, "xz", False)
+        segments = server.base.discover_segments(self.session_a, config)
+        preview = server.base.extract_depth_point_cloud(
+            segments, "xz", max_frames=1, pixel_step=1, max_depth=5.0
+        )
+        self.assertEqual(preview["decoded_frames"], 1)
+        self.assertEqual(preview["point_count"], 4)
+        self.assertEqual([round(value, 3) for value in server.base.decode_depth_image(depth_png(2, 2, [1.0, 1.5, 2.0, 2.5]))[2]], [1.0, 1.5, 2.0, 2.5])
 
     def test_trajectory_sidecar_is_used_when_database_is_missing(self) -> None:
         session = self.root / "SupermarketSession-Sidecar"

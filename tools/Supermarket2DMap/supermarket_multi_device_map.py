@@ -266,15 +266,18 @@ def generate(args: argparse.Namespace) -> Path:
     base.write_geojson(output_dir / "trajectory.geojson", base.trajectory_geojson(all_segments))
     base.write_geojson(output_dir / "price_tags.geojson", base.price_tags_geojson(tags))
     base.write_geojson(output_dir / "vector_map.geojson", base.vector_map_geojson(grid))
-    base.write_preview_3d(output_dir / "preview_3d.json", all_segments, all_points, tags, config.horizontal_axes)
+    preview_3d_summary = base.write_preview_3d(
+        output_dir / "preview_3d.json", all_segments, all_points, tags, config.horizontal_axes
+    )
     (output_dir / "semantic_layers.json").write_text(json.dumps(base.semantic_layers(grid), ensure_ascii=False, indent=2), encoding="utf-8")
 
     report = base.quality_report(output_dir, all_segments, all_points, tags, grid, {})
+    report["preview_3d"] = preview_3d_summary
     multi_warnings: List[Dict[str, Any]] = []
     if len(device_states) < 2:
         multi_warnings.append({"type": "multi_device", "message": "Only one device session was provided."})
     if not all_points:
-        multi_warnings.append({"type": "map", "message": "No projected structure points were provided; output is mainly trajectory coverage, not final shelf/wall structure."})
+        multi_warnings.append({"type": "map", "message": "No projected structure points were provided; the 2D output is mainly trajectory coverage, not final shelf/wall structure."})
     for state in device_states:
         multi_warnings.extend(state["stage_warnings"])
         if first_pose(state["segments"]) is None:
