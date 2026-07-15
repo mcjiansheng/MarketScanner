@@ -127,9 +127,10 @@ def parse_rtabmap_transform_3d(blob: bytes, axes: str) -> Optional[Tuple[float, 
     if axes == "xy":
         return tx, ty, tz, yaw_xy
     if axes == "xz":
-        # The iOS supermarket prototype estimates area from pose.x and pose.z.
-        yaw_xz = math.atan2(values[8], values[0])
-        return tx, tz, ty, yaw_xz
+        # Convert RTAB-Map's native frame to the iOS pose frame used by the
+        # supermarket trajectory sidecars: ios(x,y,z)=(-native_y,native_z,-native_x).
+        yaw_xz = math.atan2(-values[9], values[5])
+        return -ty, -tx, tz, yaw_xz
     raise ValueError(f"Unsupported horizontal axes: {axes}")
 
 
@@ -240,6 +241,54 @@ def load_price_tags(path: Path, axes: str) -> List[PriceTag]:
     return tags
 
 
+def load_trajectory_samples(segment_dir: Path, segment_index: int, axes: str) -> List[Pose2D]:
+    rows: List[Dict[str, Any]] = []
+    json_path = segment_dir / "trajectory_samples.json"
+    raw_json = read_json(json_path, [])
+    if isinstance(raw_json, list):
+        rows = [row for row in raw_json if isinstance(row, dict)]
+    if not rows:
+        csv_path = segment_dir / "trajectory_samples.csv"
+        if csv_path.is_file():
+            with csv_path.open("r", encoding="utf-8", newline="") as stream:
+                rows = [dict(row) for row in csv.DictReader(stream)]
+
+    poses: List[Pose2D] = []
+    for row_index, row in enumerate(rows, start=1):
+        try:
+            x = float(row.get("x", 0.0))
+            y = float(row.get("y", 0.0))
+            z = float(row.get("z", 0.0))
+            yaw = float(row.get("yaw", 0.0))
+            node_id = int(float(row.get("nodeCount") or row.get("node_id") or row_index))
+            stamp_raw = row.get("timestamp") or row.get("stamp")
+            stamp = float(stamp_raw) if stamp_raw not in (None, "") else None
+        except (TypeError, ValueError):
+            continue
+        px, py = project_xy(x, y, z, axes)
+        poses.append(
+            Pose2D(
+                node_id=node_id,
+                segment_index=segment_index,
+                x=px,
+                y=py,
+                yaw=yaw,
+                stamp=stamp,
+                source="trajectory_samples",
+                height=y if axes == "xz" else z,
+            )
+        )
+    return poses
+
+
+def require_map_evidence(segments: Sequence[Segment], points: Sequence[ProjectedPoint]) -> None:
+    pose_count = sum(len(segment.poses) for segment in segments)
+    if pose_count == 0 and not points:
+        raise ValueError(
+            "No valid trajectory or structure points were found. Check the segment databases and trajectory_samples files."
+        )
+
+
 def discover_segments(session_dir: Path, config: MapConfig) -> List[Segment]:
     segment_dirs = sorted([p for p in session_dir.glob("segment_*") if p.is_dir()])
     segments: List[Segment] = []
@@ -251,13 +300,19 @@ def discover_segments(session_dir: Path, config: MapConfig) -> List[Segment]:
             segment_index = idx
 
         metadata = read_json(segment_dir / "metadata.json", {})
-        db_candidates = sorted(segment_dir.glob("*.db"))
-        database_path = db_candidates[0] if db_candidates else None
+        expected_database = segment_dir / f"rtabmap_segment_{segment_index:04d}.db"
+        db_candidates = sorted(path for path in segment_dir.glob("*.db") if not path.name.startswith("."))
+        database_path = expected_database if expected_database.is_file() else (db_candidates[0] if db_candidates else None)
         poses: List[Pose2D] = []
         has_grids = False
         warnings: List[str] = []
         if database_path:
             poses, has_grids, warnings = extract_db_poses(database_path, segment_index, config.horizontal_axes)
+        if not poses:
+            sidecar_poses = load_trajectory_samples(segment_dir, segment_index, config.horizontal_axes)
+            if sidecar_poses:
+                poses = sidecar_poses
+                warnings.append("Using trajectory_samples sidecar because database poses were unavailable.")
         price_tags = load_price_tags(segment_dir / "price_tags.json", config.horizontal_axes)
         for tag in price_tags:
             if tag.segment_index == 0:
@@ -848,7 +903,6 @@ def write_review_items(path: Path, report: Dict[str, Any], tags: Sequence[PriceT
 def generate(args: argparse.Namespace) -> Path:
     session_dir = Path(args.session).resolve()
     output_dir = Path(args.output).resolve() if args.output else session_dir / f"Map2D-{time.strftime('%Y%m%d-%H%M%S')}"
-    output_dir.mkdir(parents=True, exist_ok=True)
 
     config = MapConfig(
         resolution=args.resolution,
@@ -866,6 +920,8 @@ def generate(args: argparse.Namespace) -> Path:
     point_paths.extend(sorted(session_dir.glob("segment_*/points.csv")))
     point_paths.extend(sorted(session_dir.glob("points.csv")))
     points = load_projected_points(point_paths, config.horizontal_axes)
+    require_map_evidence(segments, points)
+    output_dir.mkdir(parents=True, exist_ok=True)
     transforms = apply_segment_transforms(segments, points, Path(args.corrections).resolve() if args.corrections else None, config.auto_align_segments)
 
     tags = [tag for segment in segments for tag in segment.price_tags]

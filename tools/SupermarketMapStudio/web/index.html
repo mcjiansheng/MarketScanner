@@ -17,14 +17,14 @@
 
   <main>
     <nav class="mode-tabs" aria-label="处理模式">
-      <button class="tab is-active" type="button" data-mode="map">2D 地图</button>
-      <button class="tab" type="button" data-mode="stage">单设备阶段</button>
+      <button class="tab is-active" type="button" data-mode="map">单会话快速合并</button>
+      <button class="tab" type="button" data-mode="stage">单设备分阶段</button>
       <button class="tab" type="button" data-mode="multi">多设备合并</button>
     </nav>
 
     <section class="workbench" aria-label="地图处理工作台">
       <div class="control-panel">
-        <section class="mode-panel is-active" data-panel="map" aria-label="2D 地图输入">
+        <section class="mode-panel is-active" data-panel="map" aria-label="单会话快速合并输入">
           <div class="field-row">
             <label for="map-session">扫描会话</label>
             <div class="path-control">
@@ -49,11 +49,11 @@
           <label class="check-row"><input id="map-auto-align" type="checkbox"> 自动对齐相邻分段</label>
           <div class="button-row">
             <button id="inspect-map-session" class="secondary" type="button">检查会话</button>
-            <button id="run-map" class="primary" type="button">生成 2D 地图</button>
+            <button id="run-map" class="primary" type="button">生成会话地图</button>
           </div>
         </section>
 
-        <section class="mode-panel" data-panel="stage" aria-label="单设备阶段输入">
+        <section class="mode-panel" data-panel="stage" aria-label="单设备分阶段输入">
           <div class="field-row">
             <label for="stage-session">扫描会话</label>
             <div class="path-control">
@@ -117,8 +117,8 @@
       <section class="preview-panel" aria-label="结果预览">
         <div class="preview-toolbar">
           <div class="preview-tabs" role="tablist" aria-label="预览视图">
-            <button class="preview-tab is-active" type="button" data-preview="2d" role="tab" aria-selected="true">2D</button>
-            <button class="preview-tab" type="button" data-preview="3d" role="tab" aria-selected="false">3D</button>
+            <button class="preview-tab is-active" type="button" data-preview="2d" role="tab" aria-selected="true">2D 结果</button>
+            <button class="preview-tab" type="button" data-preview="3d" role="tab" aria-selected="false">3D 结果</button>
           </div>
           <div class="preview-actions">
             <button id="reset-view" class="secondary" type="button">重置视图</button>

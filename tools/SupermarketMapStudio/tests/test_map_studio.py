@@ -32,6 +32,7 @@ def create_session(root: Path, name: str, offset: float) -> Path:
     conn.execute("INSERT INTO Node VALUES (?, ?, ?)", (2, transform_blob(offset + 2.0, 1.5, 1.0), 2.0))
     conn.commit()
     conn.close()
+    (segment / "._rtabmap_segment_0001.db").write_bytes(b"AppleDouble metadata")
     (segment / "metadata.json").write_text(json.dumps({"segmentIndex": 1}), encoding="utf-8")
     (segment / "price_tags.json").write_text("[]", encoding="utf-8")
     return session
@@ -113,7 +114,7 @@ class MapStudioApiTests(unittest.TestCase):
         preview = self.api(result["artifacts"]["preview_3d.json"])
         self.assertEqual(preview["format"], "SupermarketMap3DPreview")
         self.assertEqual(len(preview["segments"][0]["trajectory"]), 2)
-        self.assertAlmostEqual(preview["segments"][0]["trajectory"][0][2], 1.1, places=4)
+        self.assertAlmostEqual(preview["segments"][0]["trajectory"][0][2], 0.0, places=4)
         manifest = self.api(result["artifacts"]["stage_manifest.json"])
         self.assertEqual(manifest["stages"][0]["name"], "anchor")
         self.assertAlmostEqual(manifest["stages"][0]["stage_transform"]["dx"], 0.2, places=4)
@@ -144,6 +145,46 @@ class MapStudioApiTests(unittest.TestCase):
         points_csv.write_text("x,y,z,kind,segmentIndex\n1,2,3,wall,1\n", encoding="utf-8")
         point = server.base.load_projected_points([points_csv], "xz")[0]
         self.assertEqual((point.x, point.y, point.height), (1.0, 3.0, 2.0))
+
+    def test_database_pose_is_converted_to_ios_xz_frame(self) -> None:
+        parsed = server.base.parse_rtabmap_transform_3d(transform_blob(2.0, 1.5, 1.0), "xz")
+        self.assertEqual(parsed, (-1.5, -2.0, 1.0, 0.0))
+
+    def test_trajectory_sidecar_is_used_when_database_is_missing(self) -> None:
+        session = self.root / "SupermarketSession-Sidecar"
+        segment = session / "segment_0001"
+        segment.mkdir(parents=True)
+        (segment / "metadata.json").write_text('{"segmentIndex": 1}', encoding="utf-8")
+        (segment / "price_tags.json").write_text("[]", encoding="utf-8")
+        (segment / "trajectory_samples.json").write_text(
+            json.dumps(
+                [
+                    {"nodeCount": 1, "timestamp": 1, "x": 0, "y": 1.2, "z": 0, "yaw": 0},
+                    {"nodeCount": 2, "timestamp": 2, "x": 2, "y": 1.3, "z": 1, "yaw": 0.2},
+                ]
+            ),
+            encoding="utf-8",
+        )
+        inspection = self.api("/api/session/inspect", {"session": str(session)})
+        self.assertEqual(inspection["node_count"], 2)
+
+        output = self.root / "sidecar-output"
+        job = self.api("/api/jobs", {"kind": "map", "session": str(session), "output": str(output), "options": {}})
+        result = self.wait_for_job(job["id"])
+        self.assertEqual(result["status"], "complete", result.get("error"))
+
+    def test_empty_map_evidence_fails_without_creating_output(self) -> None:
+        session = self.root / "SupermarketSession-Empty"
+        segment = session / "segment_0001"
+        segment.mkdir(parents=True)
+        (segment / "metadata.json").write_text('{"segmentIndex": 1}', encoding="utf-8")
+        (segment / "price_tags.json").write_text("[]", encoding="utf-8")
+        output = self.root / "empty-output"
+        job = self.api("/api/jobs", {"kind": "map", "session": str(session), "output": str(output), "options": {}})
+        result = self.wait_for_job(job["id"])
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("No valid trajectory", result["error"])
+        self.assertFalse(output.exists())
 
     def test_nonempty_output_is_rejected(self) -> None:
         output = self.root / "occupied-output"

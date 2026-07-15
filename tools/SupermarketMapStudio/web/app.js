@@ -11,6 +11,8 @@ let activeMode = "map";
 let activePreview = "2d";
 let activeJobId = null;
 let completedJobId = null;
+let activeJobKey = null;
+let completedJobKey = null;
 
 const viewer2d = { image: null, scale: 1, offsetX: 0, offsetY: 0, dragging: false, startX: 0, startY: 0 };
 const viewer3d = { data: null, yaw: -0.72, pitch: 0.68, distance: 1, dragging: false, startX: 0, startY: 0, center: [0, 0, 0], span: 1 };
@@ -23,6 +25,7 @@ function setStatus(text, tone = "") {
 function setBusy(busy) {
   $$(".primary").forEach((button) => { button.disabled = busy; });
   $$(".secondary").forEach((button) => { button.disabled = busy && button.id !== "reset-view"; });
+  $$(".tab").forEach((button) => { button.disabled = busy; });
 }
 
 async function request(path, options = {}) {
@@ -277,18 +280,33 @@ function activeRequest() {
   };
 }
 
+function activeRequestKey(payload) {
+  const comparable = JSON.parse(JSON.stringify(payload));
+  const outputId = payload.kind === "map" ? "map-output" : payload.kind === "stage" ? "stage-output" : "multi-output";
+  if ($("#" + outputId).dataset.autoOutput === "true") delete comparable.output;
+  return JSON.stringify(comparable);
+}
+
 async function runActiveJob() {
   try {
+    const payload = activeRequest();
+    const requestKey = activeRequestKey(payload);
+    if (completedJobId && completedJobKey === requestKey) {
+      setStatus("当前设置已经生成，继续显示上次结果", "complete");
+      return;
+    }
     setBusy(true);
     setStatus("正在创建任务", "running");
     const job = await request("/api/jobs", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(activeRequest()),
+      body: JSON.stringify(payload),
     });
     activeJobId = job.id;
+    activeJobKey = requestKey;
     pollJob();
   } catch (error) {
+    activeJobKey = null;
     setBusy(false);
     setStatus(error.message, "failed");
   }
@@ -306,15 +324,21 @@ async function pollJob() {
     activeJobId = null;
     setBusy(false);
     if (job.status === "failed") {
+      activeJobKey = null;
       setStatus(job.error || "任务失败", "failed");
       return;
     }
     completedJobId = job.id;
+    completedJobKey = activeJobKey;
+    activeJobKey = null;
     $("#open-output").disabled = false;
-    setStatus("地图生成完成", "complete");
+    const warningCount = (job.quality_report?.warnings || []).length
+      + (job.quality_report?.multi_device_summary?.alignment_warnings || []).length;
+    setStatus(warningCount ? `地图生成完成（${warningCount} 条警告）` : "地图生成完成", "complete");
     await renderJob(job);
   } catch (error) {
     activeJobId = null;
+    activeJobKey = null;
     setBusy(false);
     setStatus(error.message, "failed");
   }
@@ -330,7 +354,7 @@ async function renderJob(job) {
     load3D(data);
   }
   const summary = job.quality_report?.grid;
-  previewMeta.textContent = summary ? `${summary.width} x ${summary.height} 栅格  |  ${summary.resolution_m} m  |  ${summary.area_m2} m2` : job.output_dir;
+  previewMeta.textContent = summary ? `${summary.width} x ${summary.height} 栅格  |  ${summary.resolution_m} m  |  ${Number(summary.area_m2).toFixed(2)} m2` : job.output_dir;
 }
 
 function renderReview(report, review) {
@@ -414,11 +438,11 @@ function draw2D() {
 }
 
 function load3D(data) {
-  viewer3d.data = data;
   const positions = [];
   (data.segments || []).forEach((segment) => positions.push(...(segment.trajectory || [])));
   (data.points || []).forEach((point) => positions.push(point.position));
   (data.price_tags || []).forEach((tag) => positions.push(tag.position));
+  viewer3d.data = positions.length ? data : null;
   if (positions.length) {
     const minima = [Infinity, Infinity, Infinity];
     const maxima = [-Infinity, -Infinity, -Infinity];

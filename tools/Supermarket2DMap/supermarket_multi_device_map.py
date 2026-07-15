@@ -193,7 +193,6 @@ def reindex_device_segments(
 
 def generate(args: argparse.Namespace) -> Path:
     output_dir = Path(args.output).resolve() if args.output else Path.cwd() / f"MultiDeviceMap2D-{time.strftime('%Y%m%d-%H%M%S')}"
-    output_dir.mkdir(parents=True, exist_ok=True)
 
     devices, raw_config, config_path = load_inputs(args)
     config = base.MapConfig(
@@ -253,6 +252,8 @@ def generate(args: argparse.Namespace) -> Path:
     global_point_paths = [Path(p).resolve() for p in args.points_csv]
     global_points = base.load_projected_points(global_point_paths, config.horizontal_axes)
     all_points.extend(global_points)
+    base.require_map_evidence(all_segments, all_points)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     tags = [tag for segment in all_segments for tag in segment.price_tags]
     base.snap_price_tags(tags, all_points, config.tag_snap_distance)

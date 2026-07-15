@@ -266,7 +266,6 @@ def write_review_items(path: Path, base_report: Dict[str, Any], stage_warnings: 
 def generate(args: argparse.Namespace) -> Path:
     session_dir = Path(args.session).resolve()
     output_dir = Path(args.output).resolve() if args.output else session_dir / f"StageMap2D-{time.strftime('%Y%m%d-%H%M%S')}"
-    output_dir.mkdir(parents=True, exist_ok=True)
 
     config = base.MapConfig(
         resolution=args.resolution,
@@ -286,6 +285,8 @@ def generate(args: argparse.Namespace) -> Path:
     point_paths.extend(sorted(session_dir.glob("segment_*/points.csv")))
     point_paths.extend(sorted(session_dir.glob("points.csv")))
     points = base.load_projected_points(point_paths, config.horizontal_axes)
+    base.require_map_evidence(segments, points)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     applied = apply_stage_transforms(segments, points, stage_by_segment, stage_transforms, segment_transforms)
 
