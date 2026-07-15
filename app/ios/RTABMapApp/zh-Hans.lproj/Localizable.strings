@@ -99,6 +99,8 @@
 "Segment %d was copied to the selected location. Continuing with segment %d." = "分段 %d 已复制到所选位置，继续扫描分段 %d。";
 "Segment %d saved. Continuing with segment %d." = "分段 %d 已保存，继续扫描分段 %d。";
 "Segment %d saved. Continuing with segment %d. Pause: %.1fs." = "分段 %d 已保存，继续扫描分段 %d。暂停：%.1f 秒。";
+"Segment %d saved. Scanning stopped. Pause: %.1fs." = "分段 %d 已保存，扫描已停止。暂停：%.1f 秒。";
+"Segment %d saved locally. Scanning stopped while copying in background." = "分段 %d 已保存在本机，扫描已停止，正在后台复制。";
 "Segment %d saved locally. Continuing with segment %d while copying in background." = "分段 %d 已本地保存，继续扫描分段 %d，并在后台复制。";
 "Segment %d was copied to the selected location in background and the local copy was removed. Copy: %.1fs." = "分段 %d 已在后台复制到所选位置并清理本地副本。复制：%.1f 秒。";
 "Segment %d was copied to the selected location in background. Copy: %.1fs." = "分段 %d 已在后台复制到所选位置。复制：%.1f 秒。";

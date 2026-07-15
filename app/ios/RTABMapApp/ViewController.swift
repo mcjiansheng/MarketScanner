@@ -2242,7 +2242,14 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                          segmentIndex, localSaveSeconds, sidecarSeconds, resumeSeconds, pausedSeconds))
 
             if needsBackgroundCopy {
-                self.showToast(message: String(format: self.localized("Segment %d saved locally. Continuing with segment %d while copying in background."), segmentIndex, scanSession.segmentIndex), seconds: 3)
+                let message: String
+                if resumeAfterSave {
+                    message = String(format: self.localized("Segment %d saved locally. Continuing with segment %d while copying in background."), segmentIndex, scanSession.segmentIndex)
+                }
+                else {
+                    message = String(format: self.localized("Segment %d saved locally. Scanning stopped while copying in background."), segmentIndex)
+                }
+                self.showToast(message: message, seconds: 3)
                 self.copySegmentInBackground(
                     scanSession: scanSession,
                     segmentDir: segmentDir,
@@ -2253,7 +2260,14 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                     pausedSeconds: pausedSeconds)
             }
             else {
-                self.showToast(message: String(format: self.localized("Segment %d saved. Continuing with segment %d. Pause: %.1fs."), segmentIndex, scanSession.segmentIndex, pausedSeconds), seconds: 3)
+                let message: String
+                if resumeAfterSave {
+                    message = String(format: self.localized("Segment %d saved. Continuing with segment %d. Pause: %.1fs."), segmentIndex, scanSession.segmentIndex, pausedSeconds)
+                }
+                else {
+                    message = String(format: self.localized("Segment %d saved. Scanning stopped. Pause: %.1fs."), segmentIndex, pausedSeconds)
+                }
+                self.showToast(message: message, seconds: 3)
             }
             completion?(true)
         })
@@ -2857,6 +2871,18 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
     func stopMapping(ignoreSaving: Bool, offerPostProcessing: Bool = true)
     {
         let hasCurrentMapData = mMapNodes > 0
+
+        // A supermarket session must export its active database as a segment before
+        // stopping, otherwise the final segment bypasses the selected export folder.
+        if !ignoreSaving,
+           hasCurrentMapData,
+           let scanSession = supermarketSession,
+           scanSession.rootDirectory != nil,
+           !scanSession.isExportingSegment {
+            rolloverCurrentSegment(reason: .manual, resumeAfterSave: false)
+            return
+        }
+
         session.pause()
         locationManager?.stopUpdatingLocation()
         rtabmap?.setPausedMapping(paused: true)
