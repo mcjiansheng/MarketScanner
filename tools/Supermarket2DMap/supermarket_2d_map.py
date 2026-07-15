@@ -33,6 +33,12 @@ FREE = 1
 OCCUPIED = 2
 CONFLICT = 3
 
+PREVIEW_3D_PROFILES = {
+    "quick": {"max_frames": 96, "pixel_step": 8, "max_points": 100000},
+    "detailed": {"max_frames": 192, "pixel_step": 4, "max_points": 400000},
+    "maximum": {"max_frames": 320, "pixel_step": 3, "max_points": 800000},
+}
+
 
 @dataclasses.dataclass
 class Pose2D:
@@ -652,7 +658,7 @@ class OccupancyGrid:
     def classify(self, ix: int, iy: int) -> int:
         occ = self.occ[iy][ix]
         free = self.free[iy][ix]
-        if occ >= 2 and free >= 3:
+        if 0 < occ < 3 and free >= 3:
             return CONFLICT
         if occ > 0:
             return OCCUPIED
@@ -688,6 +694,9 @@ def build_grid(segments: List[Segment], points: List[ProjectedPoint], config: Ma
     for point in points:
         if point.kind in {"free", "empty", "ground"}:
             grid.add_disk(point.x, point.y, config.resolution, occupied=False)
+            continue
+        if point.kind == "depth_surface":
+            grid.add_disk(point.x, point.y, config.occupied_inflate_radius, occupied=True)
             continue
         nearest_pose = nearest(point.x, point.y, poses_by_segment.get(point.segment_index, []))
         if nearest_pose is not None:
@@ -755,10 +764,10 @@ def render_grid(
     tags: Sequence[PriceTag] = (),
 ) -> None:
     colors = {
-        UNKNOWN: (190, 190, 190),
-        FREE: (248, 248, 248),
-        OCCUPIED: (30, 30, 30),
-        CONFLICT: (220, 60, 50),
+        UNKNOWN: (224, 230, 233),
+        FREE: (250, 252, 252),
+        OCCUPIED: (34, 43, 47),
+        CONFLICT: (224, 117, 52),
     }
     pixels = [[colors[grid.classify(ix, iy)] for ix in range(grid.width)] for iy in range(grid.height)]
 
@@ -835,10 +844,11 @@ def _evenly_sampled_rows(rows: Sequence[Any], limit: int) -> List[Any]:
 def extract_depth_point_cloud(
     segments: Sequence[Segment],
     horizontal_axes: str,
-    max_frames: int = 96,
-    pixel_step: int = 8,
+    max_frames: int = 192,
+    pixel_step: int = 4,
     max_depth: float = 5.0,
-    max_points: int = 100000,
+    max_points: int = 400000,
+    frame_output_dir: Optional[Path] = None,
 ) -> Dict[str, Any]:
     """Build a bounded preview cloud from RTAB-Map RGB-D node data."""
     candidates: List[Tuple[Segment, int]] = []
@@ -872,6 +882,7 @@ def extract_depth_point_cloud(
     skipped_frames = 0
     warnings: List[str] = []
     effective_steps: List[int] = []
+    surface_frames: List[Dict[str, Any]] = []
     palette = [(17, 132, 141), (47, 123, 202), (147, 89, 170), (189, 106, 50), (88, 125, 53)]
 
     for database_path, rows in selected_by_database.items():
@@ -879,12 +890,14 @@ def extract_depth_point_cloud(
         selected_ids = {node_id for _segment, node_id in rows}
         current_by_node = {pose.node_id: pose for pose in segment.poses}
         placeholders = ",".join("?" for _ in selected_ids)
-        query = (
-            "SELECT n.id,n.pose,d.depth,d.calibration FROM Node n "
-            "JOIN Data d ON d.id=n.id WHERE n.id IN (" + placeholders + ") ORDER BY n.id"
-        )
         try:
             with sqlite3.connect(str(database_path)) as conn:
+                data_columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(Data)")}
+                image_expression = "d.image" if "image" in data_columns else "NULL"
+                query = (
+                    f"SELECT n.id,n.pose,d.depth,d.calibration,{image_expression} FROM Node n "
+                    "JOIN Data d ON d.id=n.id WHERE n.id IN (" + placeholders + ") ORDER BY n.id"
+                )
                 database_rows = conn.execute(query, sorted(selected_ids)).fetchall()
         except sqlite3.Error as exc:
             warnings.append(f"segment_{segment.index:04d}: point cloud SQLite read failed: {exc}")
@@ -892,7 +905,7 @@ def extract_depth_point_cloud(
             continue
 
         base_color = palette[(segment.index - 1) % len(palette)]
-        for node_id, pose_blob, depth_blob, calibration_blob in database_rows:
+        for node_id, pose_blob, depth_blob, calibration_blob, image_blob in database_rows:
             current_pose = current_by_node.get(int(node_id))
             raw_matrix = parse_transform_matrix(pose_blob)
             raw_projected = parse_rtabmap_transform_3d(pose_blob, horizontal_axes)
@@ -920,13 +933,21 @@ def extract_depth_point_cloud(
             cx = calibration.cx * scale_x
             cy = calibration.cy * scale_y
 
-            frame_budget = max(1, max_points // max(1, len(selected)))
+            # WebGL 1 indexed geometry uses 16-bit indices. Keep every frame
+            # below that limit even when processing a one-frame database.
+            frame_budget = min(65000, max(1, max_points // max(1, len(selected))))
             effective_step = max(1, pixel_step)
             while math.ceil(depth_width / effective_step) * math.ceil(depth_height / effective_step) > frame_budget:
                 effective_step += 1
             effective_steps.append(effective_step)
 
             frame_points = 0
+            grid_width = math.ceil(depth_width / effective_step)
+            grid_height = math.ceil(depth_height / effective_step)
+            grid_indices = [-1] * (grid_width * grid_height)
+            frame_vertices: List[List[float]] = []
+            frame_uv: List[List[float]] = []
+            frame_depths: List[float] = []
             for row in range(0, depth_height, effective_step):
                 for column in range(0, depth_width, effective_step):
                     depth = depths[row * depth_width + column]
@@ -947,11 +968,64 @@ def extract_depth_point_cloud(
                     shade = depth_shade * height_shade
                     color = [min(255, round(channel * shade)) for channel in base_color]
                     points.append(
-                        [round(point_x, 3), round(point_y, 3), round(point_height, 3), *color]
+                        [round(point_x, 3), round(point_y, 3), round(point_height, 3), *color, segment.index]
                     )
+                    local_index = len(frame_vertices)
+                    grid_indices[(row // effective_step) * grid_width + (column // effective_step)] = local_index
+                    frame_vertices.append([round(point_x, 3), round(point_y, 3), round(point_height, 3)])
+                    frame_uv.append(
+                        [
+                            round(column / max(1, depth_width - 1), 5),
+                            round(row / max(1, depth_height - 1), 5),
+                        ]
+                    )
+                    frame_depths.append(depth)
                     frame_points += 1
             if frame_points:
                 decoded_frames += 1
+                frame_indices: List[int] = []
+
+                def append_triangle(first: int, second: int, third: int) -> None:
+                    if min(first, second, third) < 0:
+                        return
+                    triangle_depths = (frame_depths[first], frame_depths[second], frame_depths[third])
+                    depth_jump_limit = 0.08 + min(triangle_depths) * 0.04
+                    if max(triangle_depths) - min(triangle_depths) <= depth_jump_limit:
+                        frame_indices.extend((first, second, third))
+
+                for grid_row in range(grid_height - 1):
+                    for grid_column in range(grid_width - 1):
+                        top_left = grid_indices[grid_row * grid_width + grid_column]
+                        top_right = grid_indices[grid_row * grid_width + grid_column + 1]
+                        bottom_left = grid_indices[(grid_row + 1) * grid_width + grid_column]
+                        bottom_right = grid_indices[(grid_row + 1) * grid_width + grid_column + 1]
+                        append_triangle(top_left, top_right, bottom_left)
+                        append_triangle(top_right, bottom_right, bottom_left)
+
+                image_name: Optional[str] = None
+                if frame_output_dir is not None and image_blob:
+                    if image_blob.startswith(b"\xff\xd8"):
+                        suffix = ".jpg"
+                    elif image_blob.startswith(b"\x89PNG"):
+                        suffix = ".png"
+                    else:
+                        suffix = ""
+                    if suffix:
+                        frame_output_dir.mkdir(parents=True, exist_ok=True)
+                        image_name = f"segment_{segment.index:04d}_node_{int(node_id):06d}{suffix}"
+                        (frame_output_dir / image_name).write_bytes(image_blob)
+                if image_name and frame_indices:
+                    surface_frames.append(
+                        {
+                            "segment": segment.index,
+                            "node": int(node_id),
+                            "image": f"preview_frames/{image_name}",
+                            "vertices": frame_vertices,
+                            "uv": frame_uv,
+                            "indices": frame_indices,
+                            "triangles": len(frame_indices) // 3,
+                        }
+                    )
             else:
                 skipped_frames += 1
 
@@ -966,9 +1040,49 @@ def extract_depth_point_cloud(
         "effective_pixel_step_max": max(effective_steps, default=pixel_step),
         "max_depth_m": max_depth,
         "max_points": max_points,
-        "color_mode": "segment_depth_shading",
+        "color_mode": "rgb_surface_with_segment_cloud_fallback",
+        "surface_frames": surface_frames,
+        "surface_frame_count": len(surface_frames),
+        "surface_triangle_count": sum(frame["triangles"] for frame in surface_frames),
         "warnings": warnings,
     }
+
+
+def projected_depth_surface_points(
+    point_cloud: Dict[str, Any],
+    resolution: float,
+) -> List[ProjectedPoint]:
+    rows = point_cloud.get("points", [])
+    if not rows:
+        return []
+    heights = sorted(float(row[2]) for row in rows if len(row) >= 3 and math.isfinite(float(row[2])))
+    if not heights:
+        return []
+    floor_height = heights[min(len(heights) - 1, int(len(heights) * 0.05))]
+    point_cloud["estimated_floor_height_m"] = round(floor_height, 3)
+    cell_size = max(0.05, resolution)
+    selected: Dict[Tuple[int, int, int], List[Any]] = {}
+    for row in rows:
+        if len(row) < 7:
+            continue
+        x, y, height = float(row[0]), float(row[1]), float(row[2])
+        if height < floor_height + 0.25 or height > floor_height + 2.8:
+            continue
+        key = (int(row[6]), round(x / cell_size), round(y / cell_size))
+        previous = selected.get(key)
+        if previous is None or abs(height - (floor_height + 1.2)) < abs(float(previous[2]) - (floor_height + 1.2)):
+            selected[key] = row
+    return [
+        ProjectedPoint(
+            x=float(row[0]),
+            y=float(row[1]),
+            z=float(row[2]),
+            kind="depth_surface",
+            segment_index=int(row[6]),
+            height=float(row[2]),
+        )
+        for row in selected.values()
+    ]
 
 
 def write_preview_3d(
@@ -977,6 +1091,8 @@ def write_preview_3d(
     points: Sequence[ProjectedPoint],
     tags: Sequence[PriceTag],
     horizontal_axes: str,
+    quality: str = "detailed",
+    point_cloud: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Write a compact, renderer-neutral 3D preview for the local UI."""
     max_trajectory_points = 2500
@@ -1002,7 +1118,14 @@ def write_preview_3d(
         stride = math.ceil(len(sampled_points) / max_structure_points)
         sampled_points = sampled_points[::stride]
 
-    point_cloud = extract_depth_point_cloud(segments, horizontal_axes)
+    if point_cloud is None:
+        profile = PREVIEW_3D_PROFILES.get(quality, PREVIEW_3D_PROFILES["detailed"])
+        point_cloud = extract_depth_point_cloud(
+            segments,
+            horizontal_axes,
+            frame_output_dir=path.parent / "preview_frames",
+            **profile,
+        )
     data = {
         "format": "SupermarketMap3DPreview",
         "version": 2,
@@ -1031,7 +1154,7 @@ def write_preview_3d(
         "point_cloud": point_cloud,
     }
     path.write_text(json.dumps(data, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
-    return {key: value for key, value in point_cloud.items() if key not in {"points"}}
+    return {key: value for key, value in point_cloud.items() if key not in {"points", "surface_frames"}}
 
 
 def price_tags_geojson(tags: Sequence[PriceTag]) -> Dict[str, Any]:
@@ -1127,13 +1250,14 @@ def quality_report(
     cell_area = grid.resolution * grid.resolution
     review_tags = sum(1 for tag in tags if tag.needs_review)
     warnings = []
+    depth_surface_segments = {point.segment_index for point in points if point.kind == "depth_surface"}
     for segment in segments:
         warnings.extend([f"segment_{segment.index:04d}: {w}" for w in segment.sqlite_warnings])
         if not segment.poses:
             warnings.append(f"segment_{segment.index:04d}: no db poses available")
-        if segment.has_local_grid_blobs:
+        if segment.has_local_grid_blobs and segment.index not in depth_surface_segments:
             warnings.append(
-                f"segment_{segment.index:04d}: RTAB-Map occupancy blobs are not decoded for 2D structure extraction"
+                f"segment_{segment.index:04d}: RTAB-Map local occupancy blobs were not decoded and no RGB-D surface projection was available"
             )
     if not points:
         warnings.append("No projected structure points were provided; 2D occupancy is based on trajectory free-space only.")
@@ -1224,6 +1348,16 @@ def generate(args: argparse.Namespace) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
     transforms = apply_segment_transforms(segments, points, Path(args.corrections).resolve() if args.corrections else None, config.auto_align_segments)
 
+    preview_3d_quality = getattr(args, "preview_3d_quality", "detailed")
+    preview_profile = PREVIEW_3D_PROFILES.get(preview_3d_quality, PREVIEW_3D_PROFILES["detailed"])
+    point_cloud = extract_depth_point_cloud(
+        segments,
+        config.horizontal_axes,
+        frame_output_dir=output_dir / "preview_frames",
+        **preview_profile,
+    )
+    points.extend(projected_depth_surface_points(point_cloud, config.resolution))
+
     tags = [tag for segment in segments for tag in segment.price_tags]
     snap_price_tags(tags, points, config.tag_snap_distance)
     grid = build_grid(segments, points, config)
@@ -1235,7 +1369,15 @@ def generate(args: argparse.Namespace) -> Path:
     write_geojson(output_dir / "trajectory.geojson", trajectory_geojson(segments))
     write_geojson(output_dir / "price_tags.geojson", price_tags_geojson(tags))
     write_geojson(output_dir / "vector_map.geojson", vector_map_geojson(grid))
-    preview_3d_summary = write_preview_3d(output_dir / "preview_3d.json", segments, points, tags, config.horizontal_axes)
+    preview_3d_summary = write_preview_3d(
+        output_dir / "preview_3d.json",
+        segments,
+        points,
+        tags,
+        config.horizontal_axes,
+        quality=preview_3d_quality,
+        point_cloud=point_cloud,
+    )
     (output_dir / "semantic_layers.json").write_text(json.dumps(semantic_layers(grid), ensure_ascii=False, indent=2), encoding="utf-8")
 
     report = quality_report(session_dir, segments, points, tags, grid, transforms)
@@ -1258,6 +1400,7 @@ def generate(args: argparse.Namespace) -> Path:
             "resolution_m": grid.resolution,
         },
         "parameters": dataclasses.asdict(config),
+        "preview_3d_quality": preview_3d_quality,
         "outputs": [
             "occupancy_grid.png",
             "occupancy_grid.yaml",
@@ -1268,6 +1411,7 @@ def generate(args: argparse.Namespace) -> Path:
             "quality_report.json",
             "preview.png",
             "preview_3d.json",
+            "preview_frames/",
             "review_items.json",
             "source_manifest.json",
         ],
@@ -1289,6 +1433,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--preview-resolution", type=float, default=0.10, help="Reserved for future preview downsampling.")
     parser.add_argument("--trajectory-radius", type=float, default=1.25, help="Free-space radius around scan trajectory.")
     parser.add_argument("--tag-snap-distance", type=float, default=1.0, help="Maximum distance for snapping price tags to occupied points.")
+    parser.add_argument(
+        "--preview-3d-quality",
+        choices=sorted(PREVIEW_3D_PROFILES),
+        default="detailed",
+        help="RGB-D surface preview sampling quality.",
+    )
     parser.add_argument("--occupied-inflate-radius", type=float, default=0.08, help="Inflation radius for projected occupied points.")
     parser.add_argument("--free-ray-max-range", type=float, default=8.0, help="Maximum ray clearing range from pose to occupied point.")
     parser.add_argument("--horizontal-axes", choices=["xz", "xy"], default="xz", help="RTAB-Map transform axes used for the 2D floor plane.")

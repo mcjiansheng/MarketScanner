@@ -27,6 +27,7 @@ SupermarketSession-YYYYMMDD-HHMMSS/
 - `segment_*/metadata.json`
 - `segment_*/price_tags.json`
 - `segment_*/*.db` 中的 `Node.pose`
+- `segment_*/*.db` 中的 `Data.depth`、`Data.calibration` 和 `Data.image`，用于二维结构投影和彩色三维表面
 - `segment_*/points.csv`，如果存在
 - session 根目录下的 `points.csv`，如果存在
 
@@ -51,7 +52,7 @@ x,y,z,kind,segmentIndex,nodeId
 - `segmentIndex`：所属分段。
 - `nodeId`：可选，来源节点。
 
-如果没有 `points.csv`，工具仍会基于节点轨迹生成可通行区域、价签图层和质量报告，但不会凭空生成货架/墙体结构。
+如果没有 `points.csv`，工具会优先从数据库的 RGB-D 关键帧投影地面以上的墙体、货架和障碍结构；数据库缺少可解析深度或标定时，才会退化为仅基于节点轨迹生成可通行区域、价签图层和质量报告。
 
 ## 运行
 
@@ -70,6 +71,7 @@ python3 tools/Supermarket2DMap/supermarket_2d_map.py \
 --corrections /path/to/corrections.json
 --auto-align-segments
 --horizontal-axes xz
+--preview-3d-quality detailed
 ```
 
 ## 单设备多阶段扫描
@@ -186,6 +188,7 @@ Map2D-YYYYMMDD-HHMMSS/
   occupancy_grid.yaml
   preview.png
   preview_3d.json
+  preview_frames/
   vector_map.geojson
   semantic_layers.json
   price_tags.geojson
@@ -196,9 +199,10 @@ Map2D-YYYYMMDD-HHMMSS/
 
 输出说明：
 
-- `occupancy_grid.png`：二维占据栅格。灰色未知，白色可通行，黑色占据，红色冲突。
+- `occupancy_grid.png`：二维占据栅格。灰色未知，白色可通行，黑色占据，橙色冲突。占据证据可来自 `points.csv` 或 RGB-D 表面投影。
 - `preview.png`：占据栅格叠加蓝色轨迹和绿色价签。
-- `preview_3d.json`：用于 Supermarket Map Studio 的轻量三维预览数据，包含抽样轨迹、结构点和价签，不是纹理 mesh。
+- `preview_3d.json`：用于 Supermarket Map Studio 的三维预览数据，包含抽样轨迹、结构点、RGB-D 顶点、UV 和三角面。
+- `preview_frames/`：被抽取关键帧的 RGB 图像，由浏览器映射为三角表面的真实颜色。
 - `trajectory.geojson`：每个 segment 的扫描轨迹。
 - `price_tags.geojson`：价签位置和置信度。
 - `vector_map.geojson`：从 occupied 栅格提取的结构组件草图。
@@ -232,8 +236,10 @@ Map2D-YYYYMMDD-HHMMSS/
 - 多 segment 地图包生成。
 - 轨迹 free-space 栅格化。
 - 可选 projected points 占据融合。
+- RGB-D 深度表面投影和二维货架/墙体结构证据。
+- 三档关键帧/点数预算的彩色三角表面预览。
 - 价签读取、吸附和 GeoJSON 输出。
 - 冲突/未知/可通行/占据统计。
 - 输入文件 hash 和质量报告。
 
-当前工具暂未直接解压 RTAB-Map `Data.ground_cells / obstacle_cells / empty_cells` blob。脚本会检测到这些 blob 并在质量报告中提示。后续可以新增一个 C++/RTAB-Map 提取器，将局部 grid 或点云导出为 `points.csv`，再由本工具完成统一地图生成。
+当前工具暂未直接解压 RTAB-Map `Data.ground_cells / obstacle_cells / empty_cells` blob；当同一 segment 已成功生成 RGB-D 表面投影时，这不会再作为缺少二维结构的警告。当前三维结果是抽样关键帧级、顶点着色的表面集合，不执行全局图优化、网格融合、孔洞修复、重纹理或 OBJ/PLY/GLB 导出。最终高质量可交付模型仍需要后续接入 RTAB-Map C++ 提取器和 mesh 后处理管线。

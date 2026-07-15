@@ -110,6 +110,7 @@
             <label>轨迹半径 (m)<input id="option-trajectory-radius" type="number" value="1.25" min="0.1" step="0.05"></label>
             <label>价签吸附距离 (m)<input id="option-tag-snap" type="number" value="1.0" min="0.1" step="0.1"></label>
             <label>水平坐标<select id="option-axes"><option value="xz">X/Z</option><option value="xy">X/Y</option></select></label>
+            <label>3D 表面质量<select id="option-3d-quality"><option value="quick">快速</option><option value="detailed" selected>详细</option><option value="maximum">最高</option></select></label>
           </div>
         </details>
       </div>
@@ -118,11 +119,12 @@
         <div class="preview-toolbar">
           <div class="preview-tabs" role="tablist" aria-label="预览视图">
             <button class="preview-tab is-active" type="button" data-preview="2d" role="tab" aria-selected="true">2D 地图</button>
-            <button class="preview-tab" type="button" data-preview="3d" role="tab" aria-selected="false">3D 点云</button>
+            <button class="preview-tab" type="button" data-preview="3d" role="tab" aria-selected="false">3D 彩色模型</button>
           </div>
           <div class="preview-actions">
             <div id="scene-controls" class="scene-controls" hidden>
-              <label><input id="show-cloud" type="checkbox" checked>点云</label>
+              <label><input id="show-surface" type="checkbox" checked>彩色表面</label>
+              <label><input id="show-cloud" type="checkbox">点云</label>
               <label><input id="show-trajectory" type="checkbox" checked>轨迹</label>
               <label class="point-size-control">点大小<input id="point-size" type="range" min="1" max="5" step="0.5" value="2"></label>
             </div>

@@ -14,13 +14,14 @@ Supermarket Map Studio 是运行在本机浏览器中的离线可视化工作台
 4. 选定会话后，默认在其内部生成独立的 `MapStudio-*` 输出子目录；非空输出目录会被拒绝，避免覆盖旧成果或原始扫描数据。
 5. 显示任务状态、错误信息、输出路径、质量警告和待复核项。
 6. 在界面内平移、缩放二维预览图。
-7. 从 RTAB-Map 节点深度图、相机标定和位姿重建受控规模的三维点云，在界面内用 WebGL 旋转、缩放，并显示平面栅格与各 segment 轨迹。
-8. 打开输出目录以及导出后的 `preview.png`、GeoJSON、JSON 报告等成果文件。
-9. 对输入会话执行只读检查，显示 segment、数据库、节点与价签数量。
+7. 从 RTAB-Map 节点 RGB 图像、深度图、相机标定和位姿重建受控规模的彩色三角表面与点云，在界面内用 WebGL 旋转、缩放，并显示平面栅格与各 segment 轨迹。
+8. 将地面以上的 RGB-D 表面投影为二维结构证据，生成包含墙体、货架和障碍轮廓的占据图。
+9. 打开输出目录以及导出后的 `preview.png`、GeoJSON、JSON 报告等成果文件。
+10. 对输入会话执行只读检查，显示 segment、数据库、节点与价签数量。
 
 ## 明确的边界
 
-- 现有映射工具的核心产物仍是二维地图包；三维视图现已包含由 RGB-D 节点重建的真实几何点云，但不是完整高精度纹理 mesh。
+- 现有映射工具的核心产物仍是二维地图包；三维视图包含由 RGB-D 关键帧重建的真实彩色三角表面，但不是全局融合、封闭且完成重纹理的高精度 mesh。
 - 不提供自动 ICP、全局图优化、纹理融合或编辑 mesh。这些需要后续接入 RTAB-Map/C++ 提取和配准模块。
 - 不修改原始数据库、sidecar 或价签记录；校正仅影响本次输出。
 - 通过“停止映射”保存的最后一个 segment 必须先在 iOS 端导出完成，再导入 PC。
@@ -32,11 +33,11 @@ Supermarket Map Studio 是运行在本机浏览器中的离线可视化工作台
   -> HTTP JSON API（本机 127.0.0.1）
   -> Map Studio Python 编排层
   -> supermarket_staged_map.py / supermarket_multi_device_map.py
-  -> Map2D 输出包 + preview_3d.json
+  -> Map2D 输出包 + preview_3d.json + preview_frames/
   -> 2D Canvas / 3D WebGL / 报告面板
 ```
 
-后端只使用 Python 标准库：`http.server`、`sqlite3`、`threading`、`json`、`zlib` 和 `webbrowser`。深度 PNG 解码、相机标定解析与点云生成同样不依赖 OpenCV/PCL，因此无需 `pip install`、Node.js、Qt、Electron、Docker 或网络服务。点云预览均匀抽样关键帧并限制像素密度，避免大型会话把全部深度像素一次送入浏览器。
+后端只使用 Python 标准库：`http.server`、`sqlite3`、`threading`、`json`、`zlib` 和 `webbrowser`。深度 PNG 解码、相机标定解析、三角面生成与二维结构投影不依赖 OpenCV/PCL，因此无需 `pip install`、Node.js、Qt、Electron、Docker 或网络服务。浏览器按关键帧加载 RGB 图像并采样为顶点颜色，GPU 仅保留顶点、颜色和索引缓冲。预览均匀抽样关键帧，并通过质量档位和总点数预算限制像素密度，避免大型会话把全部深度像素一次送入浏览器。
 
 ## 交互与数据流
 
@@ -78,6 +79,6 @@ Supermarket Map Studio 是运行在本机浏览器中的离线可视化工作台
 
 1. 仅凭 Python 3 即可启动，不依赖第三方包。
 2. 单设备和多设备示例会话均能通过 UI API 产出完整地图包。
-3. 产物含 `preview.png`、`preview_3d.json`、`quality_report.json` 与相应 manifest。
+3. 产物含 `preview.png`、带三角表面的 `preview_3d.json`、`preview_frames/`、`quality_report.json` 与相应 manifest。
 4. 2D 画布支持缩放和拖拽；3D 画布支持旋转、缩放和重置。
 5. 自动化测试覆盖输入检查、单设备任务、多设备任务与结果文件访问。

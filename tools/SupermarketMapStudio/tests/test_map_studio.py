@@ -60,6 +60,22 @@ def create_session(root: Path, name: str, offset: float) -> Path:
     return session
 
 
+def add_rgbd_frame(session: Path) -> None:
+    database = session / "segment_0001" / "rtabmap_segment_0001.db"
+    depths = [0.5] * (9 * 4) + [1.0] * (9 * 5)
+    with sqlite3.connect(database) as conn:
+        conn.execute("CREATE TABLE Data (id INTEGER PRIMARY KEY, depth BLOB, calibration BLOB, image BLOB)")
+        conn.execute(
+            "INSERT INTO Data VALUES (?, ?, ?, ?)",
+            (
+                1,
+                depth_png(9, 9, depths),
+                calibration_blob(9, 9),
+                b"\xff\xd8test",
+            ),
+        )
+
+
 class MapStudioApiTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -92,6 +108,10 @@ class MapStudioApiTests(unittest.TestCase):
         request = Request(url, data=json.dumps(payload).encode("utf-8"), headers={"Content-Type": "application/json"}, method="POST")
         with urlopen(request, timeout=10) as response:
             return json.loads(response.read())
+
+    def fetch(self, path: str) -> tuple[bytes, str]:
+        with urlopen(f"http://127.0.0.1:{self.port}{path}", timeout=10) as response:
+            return response.read(), response.headers.get_content_type()
 
     def wait_for_job(self, identifier: str) -> dict:
         deadline = time.time() + 10
@@ -142,6 +162,8 @@ class MapStudioApiTests(unittest.TestCase):
         self.assertAlmostEqual(manifest["stages"][0]["stage_transform"]["dx"], 0.2, places=4)
 
     def test_multi_device_job_creates_merge_manifest(self) -> None:
+        add_rgbd_frame(self.session_a)
+        add_rgbd_frame(self.session_b)
         output = self.root / "multi-output"
         job = self.api(
             "/api/jobs",
@@ -161,6 +183,10 @@ class MapStudioApiTests(unittest.TestCase):
         self.assertIn("multi_device_manifest.json", result["artifacts"])
         manifest = self.api(result["artifacts"]["multi_device_manifest.json"])
         self.assertEqual(len(manifest["devices"]), 2)
+        preview = self.api(result["artifacts"]["preview_3d.json"])
+        self.assertEqual(preview["point_cloud"]["surface_frame_count"], 2)
+        alignment_warnings = result["quality_report"]["multi_device_summary"]["alignment_warnings"]
+        self.assertFalse(any(warning.get("type") == "map" for warning in alignment_warnings))
 
     def test_projected_points_keep_height_for_3d_preview(self) -> None:
         points_csv = self.root / "points.csv"
@@ -175,19 +201,68 @@ class MapStudioApiTests(unittest.TestCase):
     def test_depth_png_and_calibration_create_point_cloud_preview(self) -> None:
         database = self.session_a / "segment_0001" / "rtabmap_segment_0001.db"
         with sqlite3.connect(database) as conn:
-            conn.execute("CREATE TABLE Data (id INTEGER PRIMARY KEY, depth BLOB, calibration BLOB)")
+            conn.execute("CREATE TABLE Data (id INTEGER PRIMARY KEY, depth BLOB, calibration BLOB, image BLOB)")
             conn.execute(
-                "INSERT INTO Data VALUES (?, ?, ?)",
-                (1, depth_png(2, 2, [1.0, 1.5, 2.0, 2.5]), calibration_blob(2, 2)),
+                "INSERT INTO Data VALUES (?, ?, ?, ?)",
+                (1, depth_png(2, 2, [1.0, 1.02, 1.03, 1.04]), calibration_blob(2, 2), b"\xff\xd8test"),
             )
         config = server.base.MapConfig(0.05, 0.1, 1.25, 1.0, 0.1, 8.0, "xz", False)
         segments = server.base.discover_segments(self.session_a, config)
         preview = server.base.extract_depth_point_cloud(
-            segments, "xz", max_frames=1, pixel_step=1, max_depth=5.0
+            segments,
+            "xz",
+            max_frames=1,
+            pixel_step=1,
+            max_depth=5.0,
+            frame_output_dir=self.root / "frames",
         )
         self.assertEqual(preview["decoded_frames"], 1)
         self.assertEqual(preview["point_count"], 4)
-        self.assertEqual([round(value, 3) for value in server.base.decode_depth_image(depth_png(2, 2, [1.0, 1.5, 2.0, 2.5]))[2]], [1.0, 1.5, 2.0, 2.5])
+        self.assertEqual(preview["surface_frame_count"], 1)
+        self.assertGreater(preview["surface_triangle_count"], 0)
+        projected = server.base.projected_depth_surface_points(
+            {
+                "points": [
+                    [0.0, 0.0, 0.0, 0, 0, 0, 1],
+                    [0.0, 0.0, 1.0, 0, 0, 0, 1],
+                    [0.1, 0.0, 1.2, 0, 0, 0, 1],
+                ]
+            },
+            0.05,
+        )
+        self.assertTrue(projected)
+        self.assertEqual(projected[0].kind, "depth_surface")
+        self.assertEqual(
+            [round(value, 3) for value in server.base.decode_depth_image(depth_png(2, 2, [1.0, 1.02, 1.03, 1.04]))[2]],
+            [1.0, 1.02, 1.03, 1.04],
+        )
+
+        database_without_image = self.session_b / "segment_0001" / "rtabmap_segment_0001.db"
+        with sqlite3.connect(database_without_image) as conn:
+            conn.execute("CREATE TABLE Data (id INTEGER PRIMARY KEY, depth BLOB, calibration BLOB)")
+            conn.execute(
+                "INSERT INTO Data VALUES (?, ?, ?)",
+                (1, depth_png(2, 2, [1.0, 1.02, 1.03, 1.04]), calibration_blob(2, 2)),
+            )
+        legacy_segments = server.base.discover_segments(self.session_b, config)
+        legacy_preview = server.base.extract_depth_point_cloud(
+            legacy_segments, "xz", max_frames=1, pixel_step=1, max_depth=5.0
+        )
+        self.assertEqual(legacy_preview["decoded_frames"], 1)
+        self.assertEqual(legacy_preview["surface_frame_count"], 0)
+
+    def test_nested_preview_frame_artifact_is_served_from_job_output(self) -> None:
+        output = self.root / "surface-output"
+        frames = output / "preview_frames"
+        frames.mkdir(parents=True)
+        image = b"\xff\xd8surface-frame"
+        (frames / "node.jpg").write_bytes(image)
+        job = server.STATE.add("map", output)
+        server.STATE.set_status(job.identifier, "complete")
+
+        content, content_type = self.fetch(f"/api/jobs/{job.identifier}/artifact/preview_frames/node.jpg")
+        self.assertEqual(content, image)
+        self.assertEqual(content_type, "image/jpeg")
 
     def test_trajectory_sidecar_is_used_when_database_is_missing(self) -> None:
         session = self.root / "SupermarketSession-Sidecar"

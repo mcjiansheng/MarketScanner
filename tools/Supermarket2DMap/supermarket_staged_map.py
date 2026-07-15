@@ -290,6 +290,18 @@ def generate(args: argparse.Namespace) -> Path:
 
     applied = apply_stage_transforms(segments, points, stage_by_segment, stage_transforms, segment_transforms)
 
+    preview_3d_quality = getattr(args, "preview_3d_quality", "detailed")
+    preview_profile = base.PREVIEW_3D_PROFILES.get(
+        preview_3d_quality, base.PREVIEW_3D_PROFILES["detailed"]
+    )
+    point_cloud = base.extract_depth_point_cloud(
+        segments,
+        config.horizontal_axes,
+        frame_output_dir=output_dir / "preview_frames",
+        **preview_profile,
+    )
+    points.extend(base.projected_depth_surface_points(point_cloud, config.resolution))
+
     tags = [tag for segment in segments for tag in segment.price_tags]
     base.snap_price_tags(tags, points, config.tag_snap_distance)
     grid = base.build_grid(segments, points, config)
@@ -302,7 +314,13 @@ def generate(args: argparse.Namespace) -> Path:
     base.write_geojson(output_dir / "price_tags.geojson", base.price_tags_geojson(tags))
     base.write_geojson(output_dir / "vector_map.geojson", base.vector_map_geojson(grid))
     preview_3d_summary = base.write_preview_3d(
-        output_dir / "preview_3d.json", segments, points, tags, config.horizontal_axes
+        output_dir / "preview_3d.json",
+        segments,
+        points,
+        tags,
+        config.horizontal_axes,
+        quality=preview_3d_quality,
+        point_cloud=point_cloud,
     )
     (output_dir / "semantic_layers.json").write_text(json.dumps(base.semantic_layers(grid), ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -370,11 +388,13 @@ def generate(args: argparse.Namespace) -> Path:
             "resolution_m": grid.resolution,
         },
         "parameters": dataclasses.asdict(config),
+        "preview_3d_quality": preview_3d_quality,
         "outputs": [
             "occupancy_grid.png",
             "occupancy_grid.yaml",
             "preview.png",
             "preview_3d.json",
+            "preview_frames/",
             "trajectory.geojson",
             "price_tags.geojson",
             "vector_map.geojson",
@@ -404,6 +424,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--preview-resolution", type=float, default=0.10, help="Reserved for future preview downsampling.")
     parser.add_argument("--trajectory-radius", type=float, default=1.25, help="Free-space radius around scan trajectory.")
     parser.add_argument("--tag-snap-distance", type=float, default=1.0, help="Maximum distance for snapping price tags to occupied points.")
+    parser.add_argument(
+        "--preview-3d-quality",
+        choices=sorted(base.PREVIEW_3D_PROFILES),
+        default="detailed",
+        help="RGB-D surface preview sampling quality.",
+    )
     parser.add_argument("--occupied-inflate-radius", type=float, default=0.08, help="Inflation radius for projected occupied points.")
     parser.add_argument("--free-ray-max-range", type=float, default=8.0, help="Maximum ray clearing range from pose to occupied point.")
     parser.add_argument("--horizontal-axes", choices=["xz", "xy"], default="xz", help="RTAB-Map transform axes used for the 2D floor plane.")

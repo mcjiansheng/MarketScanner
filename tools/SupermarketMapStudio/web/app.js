@@ -19,7 +19,8 @@ const viewer3d = {
   data: null, yaw: -0.72, pitch: 0.68, distance: 1, dragging: false,
   startX: 0, startY: 0, center: [0, 0, 0], span: 1,
   gl: null, program: null, locations: null, buffers: null,
-  showCloud: true, showTrajectory: true, pointSize: 2,
+  showSurface: true, showCloud: false, showTrajectory: true, pointSize: 2,
+  artifactRoot: "", surfaceLoadToken: 0,
 };
 
 function setStatus(text, tone = "") {
@@ -88,6 +89,7 @@ function mapOptions() {
     trajectory_radius: $("#option-trajectory-radius").value,
     tag_snap_distance: $("#option-tag-snap").value,
     horizontal_axes: $("#option-axes").value,
+    preview_3d_quality: $("#option-3d-quality").value,
   };
 }
 
@@ -355,12 +357,14 @@ async function renderJob(job) {
   const artifacts = job.artifacts || {};
   if (artifacts["preview.png"]) load2D(artifacts["preview.png"]);
   if (artifacts["preview_3d.json"]) {
-    const data = await request(artifacts["preview_3d.json"]);
-    load3D(data);
+    const previewUrl = artifacts["preview_3d.json"];
+    const data = await request(previewUrl);
+    load3D(data, previewUrl);
   }
   const summary = job.quality_report?.grid;
   const cloud = job.quality_report?.preview_3d;
-  const cloudText = cloud?.point_count ? `  |  3D ${cloud.point_count.toLocaleString()} 点 / ${cloud.decoded_frames} 关键帧` : "";
+  const surfaceText = cloud?.surface_triangle_count ? ` / ${cloud.surface_triangle_count.toLocaleString()} 面` : "";
+  const cloudText = cloud?.point_count ? `  |  3D ${cloud.point_count.toLocaleString()} 点${surfaceText} / ${cloud.decoded_frames} 关键帧` : "";
   previewMeta.textContent = summary ? `${summary.width} x ${summary.height} 栅格  |  ${summary.resolution_m} m  |  ${Number(summary.area_m2).toFixed(2)} m2${cloudText}` : job.output_dir;
 }
 
@@ -444,20 +448,33 @@ function draw2D() {
   ctx.drawImage(viewer2d.image, viewer2d.offsetX, viewer2d.offsetY, viewer2d.image.width * viewer2d.scale, viewer2d.image.height * viewer2d.scale);
 }
 
-function load3D(data) {
-  const positions = [];
-  (data.segments || []).forEach((segment) => positions.push(...(segment.trajectory || [])));
-  (data.points || []).forEach((point) => positions.push(point.position));
-  (data.price_tags || []).forEach((tag) => positions.push(tag.position));
-  (data.point_cloud?.points || []).forEach((point) => positions.push(point.slice(0, 3)));
-  viewer3d.data = positions.length ? data : null;
-  if (positions.length) {
-    const minima = [Infinity, Infinity, Infinity];
-    const maxima = [-Infinity, -Infinity, -Infinity];
-    positions.forEach((point) => point.forEach((value, index) => {
+function load3D(data, previewUrl = "") {
+  const minima = [Infinity, Infinity, Infinity];
+  const maxima = [-Infinity, -Infinity, -Infinity];
+  let positionCount = 0;
+  const includePosition = (point) => {
+    if (!point || point.length < 3) return;
+    for (let index = 0; index < 3; index += 1) {
+      const value = point[index];
       minima[index] = Math.min(minima[index], value);
       maxima[index] = Math.max(maxima[index], value);
-    }));
+    }
+    positionCount += 1;
+  };
+  (data.segments || []).forEach((segment) => (segment.trajectory || []).forEach(includePosition));
+  (data.points || []).forEach((point) => includePosition(point.position));
+  (data.price_tags || []).forEach((tag) => includePosition(tag.position));
+  (data.point_cloud?.points || []).forEach(includePosition);
+  (data.point_cloud?.surface_frames || []).forEach((frame) => (frame.vertices || []).forEach(includePosition));
+  viewer3d.data = positionCount ? data : null;
+  viewer3d.artifactRoot = previewUrl ? previewUrl.slice(0, previewUrl.lastIndexOf("/") + 1) : "";
+  viewer3d.surfaceLoadToken += 1;
+  const hasSurfaces = Boolean(data.point_cloud?.surface_frames?.length && viewer3d.artifactRoot);
+  viewer3d.showSurface = hasSurfaces;
+  viewer3d.showCloud = !hasSurfaces;
+  $("#show-surface").checked = viewer3d.showSurface;
+  $("#show-cloud").checked = viewer3d.showCloud;
+  if (positionCount) {
     viewer3d.center = minima.map((value, index) => (value + maxima[index]) / 2);
     viewer3d.span = Math.max(1, maxima[0] - minima[0], maxima[1] - minima[1], maxima[2] - minima[2]);
   }
@@ -555,6 +572,15 @@ function webGLBuffer(gl, positions, colors, mode) {
   return { positionBuffer, colorBuffer, count: positions.length / 3, mode };
 }
 
+function webGLIndexedBuffer(gl, positions, colors, indices) {
+  if (!positions.length || !indices.length) return null;
+  const buffer = webGLBuffer(gl, positions, colors, gl.TRIANGLES);
+  const indexBuffer = gl.createBuffer();
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, indexBuffer);
+  gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, new Uint16Array(indices), gl.STATIC_DRAW);
+  return { ...buffer, indexBuffer, count: indices.length, indexed: true };
+}
+
 function repeatedColor(color, count) {
   return Array.from({ length: count }, () => color).flat();
 }
@@ -567,10 +593,12 @@ function dispose3DBuffers() {
     viewer3d.buffers.tags,
     viewer3d.buffers.grid,
     ...(viewer3d.buffers.trajectories || []),
+    ...(viewer3d.buffers.surfaces || []),
   ].filter(Boolean);
   buffers.forEach((buffer) => {
     viewer3d.gl.deleteBuffer(buffer.positionBuffer);
     viewer3d.gl.deleteBuffer(buffer.colorBuffer);
+    if (buffer.indexBuffer) viewer3d.gl.deleteBuffer(buffer.indexBuffer);
   });
   viewer3d.buffers = null;
 }
@@ -610,8 +638,58 @@ function build3DBuffers() {
     structure: webGLBuffer(gl, structurePositions, repeatedColor([0.20, 0.23, 0.25], structurePositions.length / 3), gl.POINTS),
     tags: webGLBuffer(gl, tagPositions, repeatedColor([0.65, 0.33, 0.10], tagPositions.length / 3), gl.POINTS),
     trajectories,
+    surfaces: [],
     grid: webGLBuffer(gl, gridPositions, repeatedColor([0.70, 0.74, 0.77], gridPositions.length / 3), gl.LINES),
   };
+  loadSurfaceBuffers(data.point_cloud?.surface_frames || [], viewer3d.surfaceLoadToken);
+}
+
+function imageFromUrl(url) {
+  return new Promise((resolve, reject) => {
+    const image = new Image();
+    image.onload = () => resolve(image);
+    image.onerror = () => reject(new Error(`无法读取彩色帧: ${url}`));
+    image.src = url;
+  });
+}
+
+function artifactFrameUrl(path) {
+  return viewer3d.artifactRoot + path.split("/").map((part) => encodeURIComponent(part)).join("/");
+}
+
+async function loadSurfaceBuffers(frames, token) {
+  if (!frames.length || !viewer3d.artifactRoot || !viewer3d.buffers) return;
+  const gl = viewer3d.gl;
+  const sampleCanvas = document.createElement("canvas");
+  const context = sampleCanvas.getContext("2d", { willReadFrequently: true });
+  if (!context) return;
+  let loaded = 0;
+  for (const frame of frames) {
+    if (token !== viewer3d.surfaceLoadToken || !viewer3d.buffers) return;
+    try {
+      const image = await imageFromUrl(artifactFrameUrl(frame.image));
+      if (token !== viewer3d.surfaceLoadToken || !viewer3d.buffers) return;
+      sampleCanvas.width = image.naturalWidth;
+      sampleCanvas.height = image.naturalHeight;
+      context.drawImage(image, 0, 0);
+      const pixels = context.getImageData(0, 0, sampleCanvas.width, sampleCanvas.height).data;
+      const positions = (frame.vertices || []).flat();
+      const colors = [];
+      (frame.uv || []).forEach(([u, v]) => {
+        const x = Math.max(0, Math.min(sampleCanvas.width - 1, Math.round(u * (sampleCanvas.width - 1))));
+        const y = Math.max(0, Math.min(sampleCanvas.height - 1, Math.round(v * (sampleCanvas.height - 1))));
+        const offset = (y * sampleCanvas.width + x) * 4;
+        colors.push(pixels[offset] / 255, pixels[offset + 1] / 255, pixels[offset + 2] / 255);
+      });
+      const surface = webGLIndexedBuffer(gl, positions, colors, frame.indices || []);
+      if (surface) viewer3d.buffers.surfaces.push(surface);
+      loaded += 1;
+      if (loaded % 8 === 0 && activePreview === "3d") draw3D();
+    } catch (error) {
+      console.warn(error.message);
+    }
+  }
+  if (token === viewer3d.surfaceLoadToken && activePreview === "3d") draw3D();
 }
 
 function draw3DBuffer(buffer, pointSize = 1, roundPoints = false) {
@@ -626,7 +704,12 @@ function draw3DBuffer(buffer, pointSize = 1, roundPoints = false) {
   gl.enableVertexAttribArray(locations.color);
   gl.uniform1f(locations.pointSize, pointSize);
   gl.uniform1f(locations.roundPoints, roundPoints ? 1 : 0);
-  gl.drawArrays(buffer.mode, 0, buffer.count);
+  if (buffer.indexed) {
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, buffer.indexBuffer);
+    gl.drawElements(buffer.mode, buffer.count, gl.UNSIGNED_SHORT, 0);
+  } else {
+    gl.drawArrays(buffer.mode, 0, buffer.count);
+  }
 }
 
 function draw3D() {
@@ -646,6 +729,9 @@ function draw3D() {
   gl.uniform1f(locations.scale, 2 / (viewer3d.span * 1.45 * viewer3d.distance));
   gl.uniform1f(locations.aspect, metrics.width / metrics.height);
   draw3DBuffer(viewer3d.buffers?.grid, 1, false);
+  if (viewer3d.showSurface) {
+    (viewer3d.buffers?.surfaces || []).forEach((buffer) => draw3DBuffer(buffer, 1, false));
+  }
   if (viewer3d.showCloud) {
     draw3DBuffer(viewer3d.buffers?.cloud, Math.max(1, metrics.ratio * viewer3d.pointSize), true);
   }
@@ -738,6 +824,7 @@ function bindEvents() {
   $("#run-multi").addEventListener("click", runActiveJob);
   $("#add-device").addEventListener("click", addDevice);
   $("#add-stage").addEventListener("click", addStage);
+  $("#show-surface").addEventListener("change", (event) => { viewer3d.showSurface = event.target.checked; draw3D(); });
   $("#show-cloud").addEventListener("change", (event) => { viewer3d.showCloud = event.target.checked; draw3D(); });
   $("#show-trajectory").addEventListener("change", (event) => { viewer3d.showTrajectory = event.target.checked; draw3D(); });
   $("#point-size").addEventListener("input", (event) => { viewer3d.pointSize = Number(event.target.value); draw3D(); });

@@ -158,6 +158,9 @@ def map_options(data: Dict[str, Any]) -> Dict[str, Any]:
     axes = options.get("horizontal_axes", "xz")
     if axes not in {"xz", "xy"}:
         raise RequestError("Horizontal axes must be xz or xy.")
+    preview_3d_quality = str(options.get("preview_3d_quality", "detailed"))
+    if preview_3d_quality not in base.PREVIEW_3D_PROFILES:
+        raise RequestError("3D preview quality must be quick, detailed or maximum.")
     return {
         "resolution": number(options.get("resolution"), "Resolution", 0.05),
         "preview_resolution": number(options.get("preview_resolution"), "Preview resolution", 0.10),
@@ -166,6 +169,7 @@ def map_options(data: Dict[str, Any]) -> Dict[str, Any]:
         "occupied_inflate_radius": number(options.get("occupied_inflate_radius"), "Occupied inflation radius", 0.08),
         "free_ray_max_range": number(options.get("free_ray_max_range"), "Free ray maximum range", 8.0),
         "horizontal_axes": axes,
+        "preview_3d_quality": preview_3d_quality,
     }
 
 
@@ -461,13 +465,13 @@ class StudioHandler(BaseHTTPRequestHandler):
         if len(parts) == 4:
             self.send_json(HTTPStatus.OK, job_payload(job))
             return
-        if len(parts) == 6 and parts[4] == "artifact":
-            self.serve_artifact(job, parts[5])
+        if len(parts) >= 6 and parts[4] == "artifact":
+            self.serve_artifact(job, "/".join(parts[5:]))
             return
         self.send_json(HTTPStatus.NOT_FOUND, {"error": "Unknown job endpoint."})
 
     def serve_artifact(self, job: Job, name: str) -> None:
-        if name not in ARTIFACTS:
+        if name not in ARTIFACTS and not name.startswith("preview_frames/"):
             self.send_json(HTTPStatus.NOT_FOUND, {"error": "Artifact is not available."})
             return
         path = (job.output_dir / name).resolve()
@@ -476,6 +480,8 @@ class StudioHandler(BaseHTTPRequestHandler):
             return
         content_type = {
             ".png": "image/png",
+            ".jpg": "image/jpeg",
+            ".jpeg": "image/jpeg",
             ".json": "application/json; charset=utf-8",
             ".geojson": "application/geo+json; charset=utf-8",
         }.get(path.suffix, "application/octet-stream")
