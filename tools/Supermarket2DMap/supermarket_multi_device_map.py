@@ -307,6 +307,7 @@ def generate(args: argparse.Namespace) -> Path:
 
     base.render_grid(grid, output_dir / "occupancy_grid.png")
     base.render_shelf_outline(grid, shelf_outline, output_dir / "shelf_outline.png")
+    base.write_shelf_outline_evidence(output_dir / "shelf_outline_evidence.json", grid, shelf_outline)
     base.render_grid(grid, output_dir / "preview.png", trajectories=poses, tags=tags)
     base.write_preview_layers(
         output_dir / "preview_layers.json", grid, all_segments, tags, shelf_outline
@@ -422,6 +423,7 @@ def generate(args: argparse.Namespace) -> Path:
         "outputs": [
             "occupancy_grid.png",
             "shelf_outline.png",
+            "shelf_outline_evidence.json",
             "occupancy_grid.yaml",
             "preview.png",
             "preview_layers.json",

@@ -157,6 +157,7 @@ MapStudio-*/
   occupancy_grid.png
   occupancy_grid.yaml
   shelf_outline.png
+  shelf_outline_evidence.json
   preview_3d.json
   preview_frames/
   trajectory.geojson
@@ -173,7 +174,7 @@ MapStudio-*/
 
 其中 `source_manifest.json` 用于记录输入文件 hash，`quality_report.json` 和 `review_items.json` 用于自动检查及人工复核，`offline_processing_report.json` 记录实际命令、优化路径、耗时、闭环和发布判定。
 
-`shelf_outline.png` 使用白底黑线表达可靠的货架、墙体和其他竖直结构投影。生成器从 RGB-D 三角表面法向中排除地板与货架顶面等水平面，再依据同一地面栅格内的高度跨度、连续长度和小间隙闭合过滤噪声。它是几何“竖直结构”结果；仅凭深度几何不能绝对区分货架与墙体，缺少足够竖直视角的区域也不会被虚构补全。正式输出应使用默认的“最高”RGB-D 质量；“快速”会减少抽样帧，适合流程检查但黑线可能更稀疏。
+`shelf_outline.png` 使用白底黑线表达可靠的货架、墙体和其他竖直结构投影。生成器从 RGB-D 三角表面法向中排除地板与货架顶面等水平面，再依据同一地面栅格内的高度跨度、连续长度和小间隙闭合过滤噪声。`shelf_outline_evidence.json` 保存轻量栅格证据；Map Studio 可通过“更干净—更完整”滑杆、三档预设或高级门槛即时重算显示，并下载当前自定义 PNG，不必重新执行 PC 优化，也不会覆盖默认成果。它是几何“竖直结构”结果；仅凭深度几何不能绝对区分货架与墙体，缺少足够竖直视角的区域也不会被虚构补全。正式输出应使用默认的“最高”RGB-D 质量；“快速”会减少抽样帧，适合流程检查但黑线可能更稀疏。
 
 ## 快速开始
 

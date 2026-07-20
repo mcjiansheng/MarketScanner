@@ -106,28 +106,69 @@
       </div>
 
       <section class="preview-panel" aria-label="结果预览">
-        <div class="preview-toolbar">
-          <div class="preview-tabs" role="tablist" aria-label="预览视图">
-            <button class="preview-tab is-active" type="button" data-preview="2d-color" role="tab" aria-selected="true">2D 彩色俯视</button>
-            <button class="preview-tab" type="button" data-preview="2d-map" role="tab" aria-selected="false">2D 结构图</button>
-            <button id="shelf-preview-tab" class="preview-tab" type="button" data-preview="2d-shelf" role="tab" aria-selected="false" hidden>2D 货架轮廓</button>
-            <button class="preview-tab" type="button" data-preview="3d" role="tab" aria-selected="false">3D 彩色模型</button>
-          </div>
-          <div class="preview-actions">
-            <div id="scene-controls" class="scene-controls" hidden>
-              <div class="drag-mode" role="group" aria-label="三维拖动方式">
-                <button id="drag-rotate" class="view-tool is-active" type="button" aria-pressed="true">旋转</button>
-                <button id="drag-pan" class="view-tool" type="button" aria-pressed="false">平移</button>
-              </div>
-              <label><input id="show-surface" type="checkbox" checked>彩色表面</label>
-              <label><input id="show-cloud" type="checkbox">点云</label>
-              <label><input id="show-trajectory" type="checkbox" checked>轨迹</label>
-              <label class="point-size-control">点大小<input id="point-size" type="range" min="1" max="5" step="0.5" value="2"></label>
+        <div class="preview-header">
+          <div class="preview-toolbar">
+            <div class="preview-tabs" role="tablist" aria-label="预览视图">
+              <button class="preview-tab is-active" type="button" data-preview="2d-color" role="tab" aria-selected="true">2D 彩色俯视</button>
+              <button class="preview-tab" type="button" data-preview="2d-map" role="tab" aria-selected="false">2D 结构图</button>
+              <button id="shelf-preview-tab" class="preview-tab" type="button" data-preview="2d-shelf" role="tab" aria-selected="false" hidden>2D 货架轮廓</button>
+              <button class="preview-tab" type="button" data-preview="3d" role="tab" aria-selected="false">3D 彩色模型</button>
             </div>
-            <button id="reset-view" class="secondary" type="button">重置视图</button>
-            <button id="preview-fullscreen" class="secondary" type="button" aria-pressed="false">全屏预览</button>
-            <button id="open-output" class="secondary" type="button" disabled>打开输出目录</button>
+            <div class="preview-actions">
+              <div id="scene-controls" class="scene-controls" hidden>
+                <div class="drag-mode" role="group" aria-label="三维拖动方式">
+                  <button id="drag-rotate" class="view-tool is-active" type="button" aria-pressed="true">旋转</button>
+                  <button id="drag-pan" class="view-tool" type="button" aria-pressed="false">平移</button>
+                </div>
+                <label><input id="show-surface" type="checkbox" checked>彩色表面</label>
+                <label><input id="show-cloud" type="checkbox">点云</label>
+                <label><input id="show-trajectory" type="checkbox" checked>轨迹</label>
+                <label class="point-size-control">点大小<input id="point-size" type="range" min="1" max="5" step="0.5" value="2"></label>
+              </div>
+              <button id="reset-view" class="secondary" type="button">重置视图</button>
+              <button id="preview-fullscreen" class="secondary" type="button" aria-pressed="false">全屏预览</button>
+              <button id="open-output" class="secondary" type="button" disabled>打开输出目录</button>
+            </div>
           </div>
+          <section id="shelf-tuning" class="shelf-tuning" aria-label="轮廓判定调整" hidden>
+            <div id="shelf-tuning-unavailable" class="shelf-tuning-unavailable" hidden>此结果没有可调证据数据；重新生成地图后即可实时调整轮廓。</div>
+            <div id="shelf-tuning-controls" hidden>
+              <div class="shelf-tuning-main">
+                <div class="shelf-slider-block">
+                  <div class="shelf-tuning-heading">
+                    <strong>轮廓完整度</strong>
+                    <output id="shelf-completeness-value" for="shelf-completeness">平衡 · 50</output>
+                  </div>
+                  <input id="shelf-completeness" type="range" min="0" max="100" step="1" value="50" aria-label="轮廓完整度">
+                  <div class="shelf-slider-labels"><span>更干净</span><span>更完整</span></div>
+                </div>
+                <div class="shelf-presets" role="group" aria-label="轮廓判定预设">
+                  <button type="button" data-shelf-preset="20">严格降噪</button>
+                  <button class="is-active" type="button" data-shelf-preset="50">平衡推荐</button>
+                  <button type="button" data-shelf-preset="85">优先补全</button>
+                </div>
+                <div class="shelf-tuning-actions">
+                  <button id="shelf-reset" class="secondary" type="button">恢复默认</button>
+                  <button id="shelf-download" class="secondary" type="button">下载当前轮廓 PNG</button>
+                </div>
+              </div>
+              <div class="shelf-tuning-status">
+                <span id="shelf-tuning-stats">等待轮廓证据</span>
+                <span>调高完整度会补回弱线和小间隙，也可能带入少量噪声。</span>
+              </div>
+              <details class="shelf-advanced">
+                <summary>高级判定参数</summary>
+                <div class="shelf-options-grid">
+                  <label>最小竖直高度跨度 (m)<input id="shelf-min-span" type="number" min="0.05" max="2.00" step="0.05"></label>
+                  <label>最高证据离地至少 (m)<input id="shelf-min-height" type="number" min="0.05" max="2.50" step="0.05"></label>
+                  <label>最小表面竖直度<input id="shelf-min-verticality" type="number" min="0" max="1" step="0.05"></label>
+                  <label>最小三角证据数<input id="shelf-min-triangles" type="number" min="1" max="20" step="1"></label>
+                  <label>最多连接间隙 (栅格)<input id="shelf-max-gap" type="number" min="0" max="3" step="1"></label>
+                  <label>最短连续轮廓 (m)<input id="shelf-min-length" type="number" min="0.05" max="2.00" step="0.05"></label>
+                </div>
+              </details>
+            </div>
+          </section>
         </div>
         <div class="canvas-wrap">
           <canvas id="map-canvas" aria-label="二维结构地图预览" hidden></canvas>

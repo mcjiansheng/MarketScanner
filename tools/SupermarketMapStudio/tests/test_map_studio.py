@@ -293,12 +293,18 @@ class MapStudioApiTests(unittest.TestCase):
         self.assertEqual(result["logs"][0]["stage"], "任务已启动")
         self.assertIn("preview.png", result["artifacts"])
         self.assertIn("shelf_outline.png", result["artifacts"])
+        self.assertIn("shelf_outline_evidence.json", result["artifacts"])
         self.assertIn("preview_3d.json", result["artifacts"])
         self.assertTrue((output / "shelf_outline.png").is_file())
+        evidence = self.api(result["artifacts"]["shelf_outline_evidence.json"])
+        self.assertEqual(evidence["format"], "SupermarketShelfOutlineEvidence")
+        self.assertEqual(evidence["version"], 1)
+        self.assertEqual(evidence["defaults"]["maximum_gap_cells"], 1)
         preview_layers = self.api(result["artifacts"]["preview_layers.json"])
         self.assertEqual(preview_layers["version"], 2)
         self.assertIn("shelf_outline", {layer["id"] for layer in preview_layers["layers"]})
         self.assertIn("runs", preview_layers["shelf_outline"])
+        self.assertEqual(preview_layers["shelf_outline"]["evidence"], "shelf_outline_evidence.json")
         preview = self.api(result["artifacts"]["preview_3d.json"])
         self.assertEqual(preview["format"], "SupermarketMap3DPreview")
         self.assertEqual(len(preview["segments"][0]["trajectory"]), 2)
@@ -585,10 +591,17 @@ class MapStudioApiTests(unittest.TestCase):
         self.assertIn(b'id="option-gpu-backend"', html)
         self.assertIn(b'id="gpu-capability"', html)
         self.assertIn(b'id="shelf-preview-tab"', html)
+        self.assertIn(b'id="shelf-completeness"', html)
+        self.assertIn(b'data-shelf-preset="50"', html)
+        self.assertIn(b'id="shelf-download"', html)
+        self.assertIn("高级判定参数".encode("utf-8"), html)
         self.assertIn("RGB-D 结构/3D 质量".encode("utf-8"), html)
         self.assertIn(b'<option value="maximum" selected>', html)
         self.assertIn(b"max-width: 1920px", css)
         self.assertIn(b".preview-panel:fullscreen", css)
+        script, _ = self.fetch("/app.js")
+        self.assertIn(b"SupermarketShelfOutlineEvidence", script)
+        self.assertIn(b"renderShelfOutline", script)
 
     def test_unsafe_optimized_pose_jump_is_rejected_before_publication(self) -> None:
         session = create_session(self.root, "SupermarketSession-UnsafeOptimization", 0.0, "continuous_streaming")
@@ -872,6 +885,7 @@ class MapStudioApiTests(unittest.TestCase):
         self.assertEqual(result["status"], "complete", result.get("error"))
         self.assertIn("multi_device_manifest.json", result["artifacts"])
         self.assertIn("shelf_outline.png", result["artifacts"])
+        self.assertIn("shelf_outline_evidence.json", result["artifacts"])
         manifest = self.api(result["artifacts"]["multi_device_manifest.json"])
         self.assertEqual(len(manifest["devices"]), 2)
         self.assertEqual(manifest["devices"][0]["input_scan"]["scan_mode"], "continuous_streaming")
@@ -967,6 +981,7 @@ class MapStudioApiTests(unittest.TestCase):
         outline = server.base.build_shelf_outline(point_cloud, grid)
         self.assertEqual(len(outline.components), 1)
         self.assertGreaterEqual(len(outline.cells), 10)
+        self.assertTrue(outline.evidence_cells)
 
         output = self.root / "shelf-outline.png"
         server.base.render_shelf_outline(grid, outline, output)
@@ -977,6 +992,35 @@ class MapStudioApiTests(unittest.TestCase):
             if pixels[index:index + 3] == bytes((12, 16, 18))
         )
         self.assertEqual(black_pixels, len(outline.cells))
+
+        evidence_output = self.root / "shelf-outline-evidence.json"
+        server.base.write_shelf_outline_evidence(evidence_output, grid, outline)
+        payload = json.loads(evidence_output.read_text(encoding="utf-8"))
+        self.assertEqual(payload["format"], "SupermarketShelfOutlineEvidence")
+        self.assertEqual(payload["defaults"]["minimum_height_span_m"], 0.45)
+        self.assertEqual(len(payload["evidence_cells"]), len(outline.evidence_cells))
+
+        weak_point_cloud = {
+            "estimated_floor_height_m": 0.0,
+            "vertical_surface_triangle_count": 5,
+            "_vertical_surface_evidence": [
+                [0.20 + index * 0.10, 0.50, 0.10, 0.42, 1, 0.005, 0.50]
+                for index in range(5)
+            ],
+        }
+        strict_outline = server.base.build_shelf_outline(weak_point_cloud, grid)
+        complete_outline = server.base.build_shelf_outline(
+            weak_point_cloud,
+            grid,
+            minimum_height_span_m=0.20,
+            minimum_height_above_floor_m=0.30,
+            minimum_component_length_m=0.05,
+            minimum_verticality=0.45,
+            minimum_triangle_count=1,
+            maximum_gap_cells=3,
+        )
+        self.assertFalse(strict_outline.cells)
+        self.assertTrue(complete_outline.cells)
 
     def test_nested_preview_frame_artifact_is_served_from_job_output(self) -> None:
         output = self.root / "surface-output"

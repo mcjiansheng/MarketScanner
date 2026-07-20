@@ -143,11 +143,17 @@ class ShelfOutline:
 
     cells: Set[Tuple[int, int]] = dataclasses.field(default_factory=set)
     components: List[List[Tuple[int, int]]] = dataclasses.field(default_factory=list)
+    evidence_cells: List[List[float]] = dataclasses.field(default_factory=list, repr=False)
     evidence_cell_count: int = 0
     candidate_cell_count: int = 0
     vertical_triangle_count: int = 0
     floor_height_m: Optional[float] = None
     minimum_height_span_m: float = 0.45
+    minimum_height_above_floor_m: float = 0.55
+    minimum_verticality: float = 0.60
+    minimum_triangle_count: int = 3
+    maximum_gap_cells: int = 1
+    minimum_component_length_m: float = 0.20
 
     def summary(self, resolution: float) -> Dict[str, Any]:
         return {
@@ -159,6 +165,11 @@ class ShelfOutline:
             "vertical_triangle_count": self.vertical_triangle_count,
             "floor_height_m": self.floor_height_m,
             "minimum_height_span_m": self.minimum_height_span_m,
+            "minimum_height_above_floor_m": self.minimum_height_above_floor_m,
+            "minimum_verticality": self.minimum_verticality,
+            "minimum_triangle_count": self.minimum_triangle_count,
+            "maximum_gap_cells": self.maximum_gap_cells,
+            "minimum_component_length_m": self.minimum_component_length_m,
             "line_coverage_m2": round(len(self.cells) * resolution * resolution, 3),
         }
 
@@ -1131,6 +1142,7 @@ def write_preview_layers(
         "shelf_outline": {
             "runs": shelf_outline_runs(shelf_outline, grid) if shelf_outline is not None else [],
             "summary": shelf_outline.summary(grid.resolution) if shelf_outline is not None else None,
+            "evidence": "shelf_outline_evidence.json" if shelf_outline is not None else None,
         },
         "export_scales": [1, 2, 4],
     }
@@ -1562,12 +1574,15 @@ def build_shelf_outline(
     minimum_height_span_m: float = 0.45,
     minimum_height_above_floor_m: float = 0.55,
     minimum_component_length_m: float = 0.20,
+    minimum_verticality: float = 0.60,
+    minimum_triangle_count: int = 3,
+    maximum_gap_cells: int = 1,
 ) -> ShelfOutline:
     """Extract thin shelf/wall traces from vertically observed RGB-D faces.
 
     Evidence is accumulated in a 3x3 grid neighborhood so small LiDAR depth
-    jitter does not split one physical face into adjacent columns. One-cell
-    gaps are closed, then short isolated fragments are removed. Horizontal
+    jitter does not split one physical face into adjacent columns. Small gaps
+    are closed, then short isolated fragments are removed. Horizontal
     floor and shelf-top surfaces have already been rejected by their normals.
     """
     raw_evidence = point_cloud.get("_vertical_surface_evidence", [])
@@ -1578,6 +1593,11 @@ def build_shelf_outline(
         vertical_triangle_count=int(point_cloud.get("vertical_surface_triangle_count") or 0),
         floor_height_m=round(floor_height, 3) if floor_height is not None else None,
         minimum_height_span_m=minimum_height_span_m,
+        minimum_height_above_floor_m=minimum_height_above_floor_m,
+        minimum_verticality=minimum_verticality,
+        minimum_triangle_count=max(1, int(minimum_triangle_count)),
+        maximum_gap_cells=max(0, int(maximum_gap_cells)),
+        minimum_component_length_m=minimum_component_length_m,
     )
     if not raw_evidence:
         return outline
@@ -1617,6 +1637,20 @@ def build_shelf_outline(
             accumulated[3] += area
             accumulated[4] += verticality * triangle_count
 
+    outline.evidence_cells = [
+        [
+            ix,
+            iy,
+            round(values[0], 3),
+            round(values[1], 3),
+            int(round(values[2])),
+            round(values[4] / max(1.0, values[2]), 4),
+        ]
+        for (ix, iy), values in sorted(
+            evidence_by_cell.items(), key=lambda item: (item[0][1], item[0][0])
+        )
+    ]
+
     candidates: Set[Tuple[int, int]] = set()
     for ix, iy in evidence_by_cell:
         neighbors = [
@@ -1635,7 +1669,7 @@ def build_shelf_outline(
             continue
         if floor_height is not None and maximum_height < floor_height + minimum_height_above_floor_m:
             continue
-        if triangle_count < 3 or weighted_verticality < 0.60:
+        if triangle_count < outline.minimum_triangle_count or weighted_verticality < minimum_verticality:
             continue
         candidates.add((ix, iy))
 
@@ -1643,16 +1677,21 @@ def build_shelf_outline(
     if not candidates:
         return outline
 
-    # Close a single missing 2D cell without expanding the measured outline.
+    # Bridge only bounded gaps between two measured candidates. This fills
+    # broken traces without dilating every outline edge into a thick region.
     closed = set(candidates)
-    for ix, iy in candidates:
-        for dx, dy in ((1, 0), (0, 1), (1, 1), (1, -1)):
-            far = (ix + 2 * dx, iy + 2 * dy)
-            middle = (ix + dx, iy + dy)
-            if far in candidates and grid.in_bounds(*middle):
-                closed.add(middle)
+    for gap_size in range(1, outline.maximum_gap_cells + 1):
+        for ix, iy in candidates:
+            for dx, dy in ((1, 0), (0, 1), (1, 1), (1, -1)):
+                far = (ix + (gap_size + 1) * dx, iy + (gap_size + 1) * dy)
+                if far not in candidates:
+                    continue
+                for step in range(1, gap_size + 1):
+                    middle = (ix + step * dx, iy + step * dy)
+                    if grid.in_bounds(*middle):
+                        closed.add(middle)
 
-    minimum_cells = max(3, int(math.ceil(minimum_component_length_m / grid.resolution)))
+    minimum_cells = max(1, int(math.ceil(minimum_component_length_m / grid.resolution)))
     remaining = set(closed)
     components: List[List[Tuple[int, int]]] = []
     while remaining:
@@ -1706,6 +1745,28 @@ def render_shelf_outline(grid: OccupancyGrid, outline: ShelfOutline, path: Path)
             row.extend((12, 16, 18) if (ix, iy) in outline.cells else (255, 255, 255))
         rows.append(bytes(row))
     write_png(path, grid.width, grid.height, rows)
+
+
+def write_shelf_outline_evidence(path: Path, grid: OccupancyGrid, outline: ShelfOutline) -> None:
+    """Write compact grid evidence used for instant browser-side retuning."""
+    payload = {
+        "format": "SupermarketShelfOutlineEvidence",
+        "version": 1,
+        "width": grid.width,
+        "height": grid.height,
+        "resolution_m": grid.resolution,
+        "floor_height_m": outline.floor_height_m,
+        "defaults": {
+            "minimum_height_span_m": outline.minimum_height_span_m,
+            "minimum_height_above_floor_m": outline.minimum_height_above_floor_m,
+            "minimum_verticality": outline.minimum_verticality,
+            "minimum_triangle_count": outline.minimum_triangle_count,
+            "maximum_gap_cells": outline.maximum_gap_cells,
+            "minimum_component_length_m": outline.minimum_component_length_m,
+        },
+        "evidence_cells": outline.evidence_cells,
+    }
+    path.write_text(json.dumps(payload, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
 
 
 def write_preview_3d(
@@ -2065,6 +2126,7 @@ def generate(args: argparse.Namespace) -> Path:
 
     render_grid(grid, output_dir / "occupancy_grid.png")
     render_shelf_outline(grid, shelf_outline, output_dir / "shelf_outline.png")
+    write_shelf_outline_evidence(output_dir / "shelf_outline_evidence.json", grid, shelf_outline)
     render_grid(grid, output_dir / "preview.png", trajectories=poses, tags=tags)
     write_preview_layers(output_dir / "preview_layers.json", grid, segments, tags, shelf_outline)
     write_yaml(output_dir / "occupancy_grid.yaml", grid, "occupancy_grid.png")
@@ -2110,6 +2172,7 @@ def generate(args: argparse.Namespace) -> Path:
         "outputs": [
             "occupancy_grid.png",
             "shelf_outline.png",
+            "shelf_outline_evidence.json",
             "occupancy_grid.yaml",
             "vector_map.geojson",
             "semantic_layers.json",

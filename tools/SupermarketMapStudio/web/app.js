@@ -26,6 +26,16 @@ const viewer2d = {
   images: { "2d-map": null, "2d-shelf": null },
   scale: 1, offsetX: 0, offsetY: 0, dragging: false, startX: 0, startY: 0,
 };
+const shelfTuning = {
+  evidence: null,
+  cellMap: null,
+  cells: [],
+  defaults: null,
+  loadToken: 0,
+  renderTimer: null,
+  loading: false,
+  profileLabel: "balanced",
+};
 const viewerTop = { center: [0, 0, 0], distance: 1 };
 const viewer3d = {
   data: null, yaw: -0.72, pitch: 0.68, distance: 1, dragging: false,
@@ -609,6 +619,8 @@ async function pollJob() {
 }
 
 async function renderJob(job) {
+  const shelfLoadToken = ++shelfTuning.loadToken;
+  clearShelfTuning(Boolean(job.artifacts?.["shelf_outline_evidence.json"]));
   renderJobProgress(job);
   renderJobLogs(job.logs || []);
   renderReview(job.quality_report || {}, job.review_items || { items: [] });
@@ -619,7 +631,19 @@ async function renderJob(job) {
   $("#shelf-preview-tab").hidden = true;
   if (activePreview === "2d-shelf" && !artifacts["shelf_outline.png"]) updatePreview("2d-map");
   if (artifacts["preview.png"]) load2D(artifacts["preview.png"], "2d-map");
-  if (artifacts["shelf_outline.png"]) load2D(artifacts["shelf_outline.png"], "2d-shelf");
+  const shelfImagePromise = artifacts["shelf_outline.png"]
+    ? load2D(artifacts["shelf_outline.png"], "2d-shelf")
+    : Promise.resolve(null);
+  const evidencePromise = artifacts["shelf_outline_evidence.json"]
+    ? request(artifacts["shelf_outline_evidence.json"]).catch(() => null)
+    : Promise.resolve(null);
+  await shelfImagePromise;
+  const evidence = await evidencePromise;
+  if (shelfLoadToken === shelfTuning.loadToken) {
+    shelfTuning.loading = false;
+    if (evidence) installShelfEvidence(evidence);
+    else syncShelfTuningVisibility();
+  }
   if (artifacts["preview_3d.json"]) {
     const previewUrl = artifacts["preview_3d.json"];
     const data = await request(previewUrl);
@@ -722,14 +746,299 @@ function syncEmptyPreview() {
 
 function load2D(url, kind) {
   const image = new Image();
-  image.onload = () => {
-    viewer2d.images[kind] = image;
-    if (kind === "2d-shelf") $("#shelf-preview-tab").hidden = false;
-    if (activePreview === kind) reset2D();
-    syncEmptyPreview();
-    if (activePreview === kind) draw2D();
+  return new Promise((resolve) => {
+    image.onload = () => {
+      viewer2d.images[kind] = image;
+      if (kind === "2d-shelf") $("#shelf-preview-tab").hidden = false;
+      if (activePreview === kind) reset2D();
+      syncEmptyPreview();
+      syncShelfTuningVisibility();
+      if (activePreview === kind) draw2D();
+      resolve(image);
+    };
+    image.onerror = () => resolve(null);
+    image.src = `${url}?v=${Date.now()}`;
+  });
+}
+
+function clearShelfTuning(loading = false) {
+  window.clearTimeout(shelfTuning.renderTimer);
+  shelfTuning.evidence = null;
+  shelfTuning.cellMap = null;
+  shelfTuning.cells = [];
+  shelfTuning.defaults = null;
+  shelfTuning.loading = loading;
+  shelfTuning.profileLabel = "balanced";
+  syncShelfTuningVisibility();
+}
+
+function syncShelfTuningVisibility() {
+  const panel = $("#shelf-tuning");
+  const visible = activePreview === "2d-shelf" && !$("#shelf-preview-tab").hidden;
+  panel.hidden = !visible;
+  if (!visible) return;
+  const available = Boolean(shelfTuning.evidence);
+  $("#shelf-tuning-controls").hidden = !available;
+  $("#shelf-tuning-unavailable").hidden = available;
+  $("#shelf-tuning-unavailable").textContent = shelfTuning.loading
+    ? "正在载入可调轮廓证据…"
+    : "此结果没有可调证据数据；重新生成地图后即可实时调整轮廓。";
+}
+
+function boundedNumber(value, fallback, minimum, maximum) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return fallback;
+  return Math.max(minimum, Math.min(maximum, number));
+}
+
+function normalizedShelfParameters(raw = {}) {
+  return {
+    minimum_height_span_m: boundedNumber(raw.minimum_height_span_m, 0.45, 0.05, 2),
+    minimum_height_above_floor_m: boundedNumber(raw.minimum_height_above_floor_m, 0.55, 0.05, 2.5),
+    minimum_verticality: boundedNumber(raw.minimum_verticality, 0.60, 0, 1),
+    minimum_triangle_count: Math.round(boundedNumber(raw.minimum_triangle_count, 3, 1, 20)),
+    maximum_gap_cells: Math.round(boundedNumber(raw.maximum_gap_cells, 1, 0, 3)),
+    minimum_component_length_m: boundedNumber(raw.minimum_component_length_m, 0.20, 0.05, 2),
   };
-  image.src = `${url}?v=${Date.now()}`;
+}
+
+function installShelfEvidence(payload) {
+  if (payload?.format !== "SupermarketShelfOutlineEvidence" || payload.version !== 1) return;
+  const width = Math.max(1, Math.round(Number(payload.width)));
+  const height = Math.max(1, Math.round(Number(payload.height)));
+  const rows = Array.isArray(payload.evidence_cells) ? payload.evidence_cells : [];
+  if (!Number.isFinite(width) || !Number.isFinite(height)) return;
+  const cells = [];
+  const cellMap = new Map();
+  rows.forEach((row) => {
+    if (!Array.isArray(row) || row.length < 6) return;
+    const x = Math.round(Number(row[0]));
+    const y = Math.round(Number(row[1]));
+    const minimumHeight = Number(row[2]);
+    const maximumHeight = Number(row[3]);
+    const triangleCount = Math.max(1, Number(row[4]));
+    const verticality = boundedNumber(row[5], 0, 0, 1);
+    if (![x, y, minimumHeight, maximumHeight, triangleCount].every(Number.isFinite)) return;
+    if (x < 0 || y < 0 || x >= width || y >= height) return;
+    const cell = { x, y, minimumHeight, maximumHeight, triangleCount, verticality };
+    cells.push(cell);
+    cellMap.set(y * width + x, cell);
+  });
+  shelfTuning.evidence = {
+    width,
+    height,
+    resolution: boundedNumber(payload.resolution_m, 0.05, 0.001, 10),
+    floorHeight: payload.floor_height_m !== null && Number.isFinite(Number(payload.floor_height_m))
+      ? Number(payload.floor_height_m)
+      : null,
+  };
+  shelfTuning.cells = cells;
+  shelfTuning.cellMap = cellMap;
+  shelfTuning.defaults = normalizedShelfParameters(payload.defaults);
+  $("#shelf-completeness").value = "50";
+  setShelfParameterFields(shelfTuning.defaults);
+  updateShelfProfileLabel(50, "balanced");
+  syncShelfTuningVisibility();
+  renderShelfOutline(shelfTuning.defaults);
+}
+
+function interpolateShelfParameters(start, end, fraction) {
+  const linear = (key) => start[key] + (end[key] - start[key]) * fraction;
+  return normalizedShelfParameters({
+    minimum_height_span_m: linear("minimum_height_span_m"),
+    minimum_height_above_floor_m: linear("minimum_height_above_floor_m"),
+    minimum_verticality: linear("minimum_verticality"),
+    minimum_triangle_count: Math.round(linear("minimum_triangle_count")),
+    maximum_gap_cells: Math.round(linear("maximum_gap_cells")),
+    minimum_component_length_m: linear("minimum_component_length_m"),
+  });
+}
+
+function shelfParametersForScore(score) {
+  const balanced = shelfTuning.defaults || normalizedShelfParameters();
+  const strict = normalizedShelfParameters({
+    minimum_height_span_m: Math.max(0.75, balanced.minimum_height_span_m),
+    minimum_height_above_floor_m: Math.max(0.80, balanced.minimum_height_above_floor_m),
+    minimum_verticality: Math.max(0.78, balanced.minimum_verticality),
+    minimum_triangle_count: Math.max(7, balanced.minimum_triangle_count),
+    maximum_gap_cells: 0,
+    minimum_component_length_m: Math.max(0.50, balanced.minimum_component_length_m),
+  });
+  const complete = normalizedShelfParameters({
+    minimum_height_span_m: Math.min(0.20, balanced.minimum_height_span_m),
+    minimum_height_above_floor_m: Math.min(0.30, balanced.minimum_height_above_floor_m),
+    minimum_verticality: Math.min(0.45, balanced.minimum_verticality),
+    minimum_triangle_count: 1,
+    maximum_gap_cells: 3,
+    minimum_component_length_m: Math.min(0.05, balanced.minimum_component_length_m),
+  });
+  return score <= 50
+    ? interpolateShelfParameters(strict, balanced, score / 50)
+    : interpolateShelfParameters(balanced, complete, (score - 50) / 50);
+}
+
+const shelfParameterFields = {
+  minimum_height_span_m: "#shelf-min-span",
+  minimum_height_above_floor_m: "#shelf-min-height",
+  minimum_verticality: "#shelf-min-verticality",
+  minimum_triangle_count: "#shelf-min-triangles",
+  maximum_gap_cells: "#shelf-max-gap",
+  minimum_component_length_m: "#shelf-min-length",
+};
+
+function setShelfParameterFields(parameters) {
+  Object.entries(shelfParameterFields).forEach(([key, selector]) => {
+    const integer = key === "minimum_triangle_count" || key === "maximum_gap_cells";
+    $(selector).value = integer ? String(parameters[key]) : Number(parameters[key]).toFixed(2);
+  });
+}
+
+function shelfParametersFromFields() {
+  const values = {};
+  Object.entries(shelfParameterFields).forEach(([key, selector]) => { values[key] = $(selector).value; });
+  return normalizedShelfParameters({ ...(shelfTuning.defaults || {}), ...values });
+}
+
+function updateShelfProfileLabel(score, label = null) {
+  const resolved = label || (score < 35 ? "strict" : score > 65 ? "complete" : "balanced");
+  shelfTuning.profileLabel = resolved;
+  const names = { strict: "严格降噪", balanced: "平衡", complete: "优先补全", custom: "自定义" };
+  $("#shelf-completeness-value").textContent = resolved === "custom" ? names[resolved] : `${names[resolved]} · ${score}`;
+  $$('[data-shelf-preset]').forEach((button) => {
+    button.classList.toggle("is-active", resolved !== "custom" && Number(button.dataset.shelfPreset) === score);
+  });
+}
+
+function applyShelfScore(score) {
+  const normalizedScore = Math.max(0, Math.min(100, Math.round(score)));
+  $("#shelf-completeness").value = String(normalizedScore);
+  const parameters = shelfParametersForScore(normalizedScore);
+  setShelfParameterFields(parameters);
+  updateShelfProfileLabel(normalizedScore);
+  scheduleShelfRender(parameters);
+}
+
+function scheduleShelfRender(parameters = shelfParametersFromFields()) {
+  window.clearTimeout(shelfTuning.renderTimer);
+  $("#shelf-tuning-stats").textContent = "正在重算轮廓…";
+  shelfTuning.renderTimer = window.setTimeout(() => renderShelfOutline(parameters), 80);
+}
+
+function renderShelfOutline(rawParameters) {
+  const evidence = shelfTuning.evidence;
+  if (!evidence || !shelfTuning.cellMap) return;
+  const parameters = normalizedShelfParameters(rawParameters);
+  const { width, height, resolution, floorHeight } = evidence;
+  const candidates = new Set();
+  shelfTuning.cells.forEach((source) => {
+    let minimumHeight = Infinity;
+    let maximumHeight = -Infinity;
+    let triangleCount = 0;
+    let weightedVerticality = 0;
+    for (let y = source.y - 1; y <= source.y + 1; y += 1) {
+      for (let x = source.x - 1; x <= source.x + 1; x += 1) {
+        if (x < 0 || y < 0 || x >= width || y >= height) continue;
+        const neighbor = shelfTuning.cellMap.get(y * width + x);
+        if (!neighbor) continue;
+        minimumHeight = Math.min(minimumHeight, neighbor.minimumHeight);
+        maximumHeight = Math.max(maximumHeight, neighbor.maximumHeight);
+        triangleCount += neighbor.triangleCount;
+        weightedVerticality += neighbor.verticality * neighbor.triangleCount;
+      }
+    }
+    if (maximumHeight - minimumHeight < parameters.minimum_height_span_m) return;
+    if (floorHeight !== null && maximumHeight < floorHeight + parameters.minimum_height_above_floor_m) return;
+    if (triangleCount < parameters.minimum_triangle_count) return;
+    if (weightedVerticality / Math.max(1, triangleCount) < parameters.minimum_verticality) return;
+    candidates.add(source.y * width + source.x);
+  });
+
+  const closed = new Set(candidates);
+  for (let gap = 1; gap <= parameters.maximum_gap_cells; gap += 1) {
+    candidates.forEach((key) => {
+      const y = Math.floor(key / width);
+      const x = key - y * width;
+      [[1, 0], [0, 1], [1, 1], [1, -1]].forEach(([dx, dy]) => {
+        const farX = x + (gap + 1) * dx;
+        const farY = y + (gap + 1) * dy;
+        if (farX < 0 || farY < 0 || farX >= width || farY >= height) return;
+        if (!candidates.has(farY * width + farX)) return;
+        for (let step = 1; step <= gap; step += 1) {
+          closed.add((y + step * dy) * width + x + step * dx);
+        }
+      });
+    });
+  }
+
+  const minimumCells = Math.max(1, Math.ceil(parameters.minimum_component_length_m / resolution));
+  const remaining = new Set(closed);
+  const retained = [];
+  let componentCount = 0;
+  while (remaining.size) {
+    const start = remaining.values().next().value;
+    remaining.delete(start);
+    const queue = [start];
+    const component = [start];
+    for (let index = 0; index < queue.length; index += 1) {
+      const key = queue[index];
+      const y = Math.floor(key / width);
+      const x = key - y * width;
+      for (let neighborY = y - 1; neighborY <= y + 1; neighborY += 1) {
+        for (let neighborX = x - 1; neighborX <= x + 1; neighborX += 1) {
+          if (neighborX < 0 || neighborY < 0 || neighborX >= width || neighborY >= height) continue;
+          const neighborKey = neighborY * width + neighborX;
+          if (!remaining.delete(neighborKey)) continue;
+          queue.push(neighborKey);
+          component.push(neighborKey);
+        }
+      }
+    }
+    if (component.length < minimumCells) continue;
+    retained.push(...component);
+    componentCount += 1;
+  }
+
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+  const context = canvas.getContext("2d");
+  const pixels = context.createImageData(width, height);
+  pixels.data.fill(255);
+  retained.forEach((key) => {
+    const y = Math.floor(key / width);
+    const x = key - y * width;
+    const offset = ((height - 1 - y) * width + x) * 4;
+    pixels.data[offset] = 12;
+    pixels.data[offset + 1] = 16;
+    pixels.data[offset + 2] = 18;
+  });
+  context.putImageData(pixels, 0, 0);
+  const previous = viewer2d.images["2d-shelf"];
+  viewer2d.images["2d-shelf"] = canvas;
+  if (activePreview === "2d-shelf") {
+    if (!previous || previous.width !== width || previous.height !== height) reset2D();
+    else draw2D();
+  }
+  syncEmptyPreview();
+  $("#shelf-tuning-stats").textContent = `${componentCount.toLocaleString()} 组 · ${retained.length.toLocaleString()} 栅格 · 候选 ${candidates.size.toLocaleString()}`;
+}
+
+function downloadCurrentShelfOutline() {
+  const image = viewer2d.images["2d-shelf"];
+  if (!image) return;
+  const canvas = document.createElement("canvas");
+  canvas.width = image.width;
+  canvas.height = image.height;
+  canvas.getContext("2d").drawImage(image, 0, 0);
+  canvas.toBlob((blob) => {
+    if (!blob) return;
+    const link = document.createElement("a");
+    const suffix = shelfTuning.profileLabel === "custom" ? "custom" : $("#shelf-completeness").value;
+    link.href = URL.createObjectURL(blob);
+    link.download = `shelf_outline_${suffix}.png`;
+    link.click();
+    URL.revokeObjectURL(link.href);
+  }, "image/png");
 }
 
 function reset2D() {
@@ -1118,6 +1427,7 @@ function updatePreview(kind) {
   mapCanvas.setAttribute("aria-label", kind === "2d-shelf" ? "二维货架和竖直结构轮廓预览" : "二维结构地图预览");
   sceneCanvas.dataset.dragMode = kind === "2d-color" ? "pan" : viewer3d.dragMode;
   $("#scene-controls").hidden = kind !== "3d";
+  syncShelfTuningVisibility();
   syncEmptyPreview();
   if (planPreview) reset2D(); else drawScene();
 }
@@ -1243,6 +1553,16 @@ function bindEvents() {
   $("#show-cloud").addEventListener("change", (event) => { viewer3d.showCloud = event.target.checked; drawScene(); });
   $("#show-trajectory").addEventListener("change", (event) => { viewer3d.showTrajectory = event.target.checked; drawScene(); });
   $("#point-size").addEventListener("input", (event) => { viewer3d.pointSize = Number(event.target.value); drawScene(); });
+  $("#shelf-completeness").addEventListener("input", (event) => applyShelfScore(Number(event.target.value)));
+  $$('[data-shelf-preset]').forEach((button) => button.addEventListener("click", () => applyShelfScore(Number(button.dataset.shelfPreset))));
+  Object.values(shelfParameterFields).forEach((selector) => {
+    $(selector).addEventListener("input", () => {
+      updateShelfProfileLabel(Number($("#shelf-completeness").value), "custom");
+      scheduleShelfRender();
+    });
+  });
+  $("#shelf-reset").addEventListener("click", () => applyShelfScore(50));
+  $("#shelf-download").addEventListener("click", downloadCurrentShelfOutline);
   $("#drag-rotate").addEventListener("click", () => set3DDragMode("rotate"));
   $("#drag-pan").addEventListener("click", () => set3DDragMode("pan"));
   $("#single-session").addEventListener("input", () => {

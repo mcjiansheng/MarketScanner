@@ -42,6 +42,7 @@ ARTIFACTS = (
     "preview.png",
     "occupancy_grid.png",
     "shelf_outline.png",
+    "shelf_outline_evidence.json",
     "preview_layers.json",
     "preview_3d.json",
     "quality_report.json",
