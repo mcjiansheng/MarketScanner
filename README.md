@@ -19,7 +19,7 @@ iPhone Pro RGB-D / LiDAR / IMU / ARKit 采集
   -> 完整会话导出到 PC
   -> 数据库检查与自适应离线闭环/全局优化
   -> 轨迹安全验证
-  -> 2D 占据图、彩色俯视图、3D 预览与业务图层
+  -> 2D 占据图、货架/竖直结构轮廓、彩色俯视图、3D 预览与业务图层
   -> 质量报告、来源清单和人工复核
 ```
 
@@ -45,7 +45,7 @@ iPhone Pro RGB-D / LiDAR / IMU / ARKit 采集
 | 移动原生层 | 增加相机原点保持、连续地图模式、有界实时渲染、数据库操作和 Swift/C++ 桥接能力 |
 | 稳定性 | 对 ARKit tracking 恢复和不合理位姿跳变进行质量门控；按内存、磁盘和热状态降低预览或安全结束 |
 | PC 优化 | 扩展 `rtabmap-reprocess` 的进度、约束统计和最终求解流程，支持工作台执行自适应离线优化 |
-| 地图生成 | 新增单设备、历史多阶段、多设备二维地图脚本，输出占据图、轨迹、GeoJSON 和质量报告；保留旧价签数据兼容解析 |
+| 地图生成 | 新增单设备、历史多阶段、多设备二维地图脚本，输出占据图、基于 RGB-D 高度跨度与竖直面的货架轮廓、轨迹、GeoJSON 和质量报告；保留旧价签数据兼容解析 |
 | 可视化工作台 | 新增仅监听本机的 Web 工作台，统一进行输入检查、处理编排、2D/3D 预览、日志和结果检查 |
 | 性能加速 | 提供 Release/OpenMP 配置，以及 Apple Metal 或 NVIDIA CUDA 深度投影 helper；不可用时明确回退 CPU |
 
@@ -125,7 +125,7 @@ SupermarketSession-YYYYMMDD-HHMMSS/
 - SQLite 完整性、RGB-D/标定、时间戳和节点统计检查；
 - `rtabmap-reprocess` 离线闭环与全局优化编排；
 - 优化前后轨迹覆盖率、步长、旋转、垂直跨度和尺度验证；
-- 二维结构图、彩色 RGB-D 俯视图和 WebGL 三维预览；
+- 二维结构图、白底黑线货架/竖直结构轮廓、彩色 RGB-D 俯视图和 WebGL 三维预览；
 - 手机采集日志、PC 处理日志、质量结论与成果文件浏览；
 - 已完成结果发现和相同参数结果复用。
 
@@ -156,10 +156,11 @@ MapStudio-*/
   preview.png
   occupancy_grid.png
   occupancy_grid.yaml
+  shelf_outline.png
   preview_3d.json
   preview_frames/
   trajectory.geojson
-  price_tags.geojson
+  price_tags.geojson            # 仅在旧输入含价签记录时有数据
   vector_map.geojson
   semantic_layers.json
   quality_report.json
@@ -171,6 +172,8 @@ MapStudio-*/
 ```
 
 其中 `source_manifest.json` 用于记录输入文件 hash，`quality_report.json` 和 `review_items.json` 用于自动检查及人工复核，`offline_processing_report.json` 记录实际命令、优化路径、耗时、闭环和发布判定。
+
+`shelf_outline.png` 使用白底黑线表达可靠的货架、墙体和其他竖直结构投影。生成器从 RGB-D 三角表面法向中排除地板与货架顶面等水平面，再依据同一地面栅格内的高度跨度、连续长度和小间隙闭合过滤噪声。它是几何“竖直结构”结果；仅凭深度几何不能绝对区分货架与墙体，缺少足够竖直视角的区域也不会被虚构补全。正式输出应使用默认的“最高”RGB-D 质量；“快速”会减少抽样帧，适合流程检查但黑线可能更稀疏。
 
 ## 快速开始
 

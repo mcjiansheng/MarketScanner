@@ -41,6 +41,7 @@ import gpu_acceleration as gpu
 ARTIFACTS = (
     "preview.png",
     "occupancy_grid.png",
+    "shelf_outline.png",
     "preview_layers.json",
     "preview_3d.json",
     "quality_report.json",
@@ -695,7 +696,7 @@ def run_stage(data: Dict[str, Any], output: Path, progress: Optional[ProgressCal
             database_overrides=database_overrides,
             **options,
         )
-        report_progress(progress, 72, "生成阶段地图", f"正在用 {acceleration.effective} 投影结构、轨迹和扫描帧")
+        report_progress(progress, 72, "生成阶段地图", f"正在用 {acceleration.effective} 投影结构、提取货架轮廓并整理扫描帧")
         with gpu.DepthProjector(acceleration) as projector:
             args.depth_projector = projector
             staged.generate(args)
@@ -738,7 +739,7 @@ def run_basic_map(data: Dict[str, Any], output: Path, progress: Optional[Progres
             database_overrides=database_overrides,
             **options,
         )
-        report_progress(progress, 72, "生成地图", f"正在用 {acceleration.effective} 生成二维结构图和彩色三维预览")
+        report_progress(progress, 72, "生成地图", f"正在用 {acceleration.effective} 生成二维结构、货架轮廓和彩色三维预览")
         with gpu.DepthProjector(acceleration) as projector:
             args.depth_projector = projector
             base.generate(args)
@@ -811,7 +812,7 @@ def run_multi(data: Dict[str, Any], output: Path, progress: Optional[ProgressCal
             points_csv=optional_points(data.get("points_csv")),
             **options,
         )
-        report_progress(progress, 72, "合并多设备地图", f"正在用 {acceleration.effective} 对齐设备轨迹并融合地图")
+        report_progress(progress, 72, "合并多设备地图", f"正在用 {acceleration.effective} 对齐设备轨迹并融合结构与货架轮廓")
         with gpu.DepthProjector(acceleration) as projector:
             args.depth_projector = projector
             multi.generate(args)

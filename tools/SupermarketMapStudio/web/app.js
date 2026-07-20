@@ -22,7 +22,10 @@ let sessionSelectionToken = 0;
 let currentSingleScanMode = null;
 let currentSingleOfflineSupported = null;
 
-const viewer2d = { image: null, scale: 1, offsetX: 0, offsetY: 0, dragging: false, startX: 0, startY: 0 };
+const viewer2d = {
+  images: { "2d-map": null, "2d-shelf": null },
+  scale: 1, offsetX: 0, offsetY: 0, dragging: false, startX: 0, startY: 0,
+};
 const viewerTop = { center: [0, 0, 0], distance: 1 };
 const viewer3d = {
   data: null, yaw: -0.72, pitch: 0.68, distance: 1, dragging: false,
@@ -611,7 +614,12 @@ async function renderJob(job) {
   renderReview(job.quality_report || {}, job.review_items || { items: [] });
   renderArtifacts(job.artifacts || {});
   const artifacts = job.artifacts || {};
-  if (artifacts["preview.png"]) load2D(artifacts["preview.png"]);
+  viewer2d.images["2d-map"] = null;
+  viewer2d.images["2d-shelf"] = null;
+  $("#shelf-preview-tab").hidden = true;
+  if (activePreview === "2d-shelf" && !artifacts["shelf_outline.png"]) updatePreview("2d-map");
+  if (artifacts["preview.png"]) load2D(artifacts["preview.png"], "2d-map");
+  if (artifacts["shelf_outline.png"]) load2D(artifacts["shelf_outline.png"], "2d-shelf");
   if (artifacts["preview_3d.json"]) {
     const previewUrl = artifacts["preview_3d.json"];
     const data = await request(previewUrl);
@@ -624,7 +632,9 @@ async function renderJob(job) {
   const qualityText = qualityLabels[quality] ? ` / ${qualityLabels[quality]}质量` : "";
   const surfaceText = cloud?.surface_triangle_count ? ` / ${cloud.surface_triangle_count.toLocaleString()} 面` : "";
   const cloudText = cloud?.point_count ? `  |  3D ${cloud.point_count.toLocaleString()} 点${surfaceText} / ${cloud.decoded_frames} 关键帧${qualityText}` : "";
-  previewMeta.textContent = summary ? `${summary.width} x ${summary.height} 栅格  |  ${summary.resolution_m} m  |  ${Number(summary.area_m2).toFixed(2)} m2${cloudText}` : job.output_dir;
+  const shelf = job.quality_report?.shelf_outline;
+  const shelfText = shelf?.cell_count ? `  |  货架/竖直轮廓 ${shelf.component_count} 组` : "";
+  previewMeta.textContent = summary ? `${summary.width} x ${summary.height} 栅格  |  ${summary.resolution_m} m  |  ${Number(summary.area_m2).toFixed(2)} m2${shelfText}${cloudText}` : job.output_dir;
 }
 
 function renderReview(report, review) {
@@ -698,42 +708,53 @@ function cssColor(name, fallback) {
   return getComputedStyle(document.documentElement).getPropertyValue(name).trim() || fallback;
 }
 
-function syncEmptyPreview() {
-  emptyPreview.hidden = Boolean((activePreview === "2d-map" && viewer2d.image) || (activePreview !== "2d-map" && viewer3d.data));
+function isPlanPreview(kind = activePreview) {
+  return kind === "2d-map" || kind === "2d-shelf";
 }
 
-function load2D(url) {
+function current2DImage() {
+  return isPlanPreview() ? viewer2d.images[activePreview] : null;
+}
+
+function syncEmptyPreview() {
+  emptyPreview.hidden = Boolean((isPlanPreview() && current2DImage()) || (!isPlanPreview() && viewer3d.data));
+}
+
+function load2D(url, kind) {
   const image = new Image();
   image.onload = () => {
-    viewer2d.image = image;
-    reset2D();
+    viewer2d.images[kind] = image;
+    if (kind === "2d-shelf") $("#shelf-preview-tab").hidden = false;
+    if (activePreview === kind) reset2D();
     syncEmptyPreview();
-    if (activePreview === "2d-map") draw2D();
+    if (activePreview === kind) draw2D();
   };
   image.src = `${url}?v=${Date.now()}`;
 }
 
 function reset2D() {
-  if (!viewer2d.image) return;
+  const image = current2DImage();
+  if (!image) return;
   const { width, height } = canvasMetrics(mapCanvas);
-  const scale = Math.min(width / viewer2d.image.width, height / viewer2d.image.height) * 0.92;
+  const scale = Math.min(width / image.width, height / image.height) * 0.92;
   viewer2d.scale = scale;
-  viewer2d.offsetX = (width - viewer2d.image.width * scale) / 2;
-  viewer2d.offsetY = (height - viewer2d.image.height * scale) / 2;
+  viewer2d.offsetX = (width - image.width * scale) / 2;
+  viewer2d.offsetY = (height - image.height * scale) / 2;
   draw2D();
 }
 
 function draw2D() {
-  if (!viewer2d.image || activePreview !== "2d-map") return;
+  const image = current2DImage();
+  if (!image || !isPlanPreview()) return;
   const { width, height, ratio } = canvasMetrics(mapCanvas);
   const ctx = mapCanvas.getContext("2d");
-  ctx.fillStyle = cssColor("--canvas-bg", "#ecf0f2");
+  ctx.fillStyle = activePreview === "2d-shelf" ? "#ffffff" : cssColor("--canvas-bg", "#ecf0f2");
   ctx.fillRect(0, 0, width, height);
   // Downscaling a large metric grid benefits from the browser's best filter;
   // zoomed-in cells remain exact and unsmoothed for engineering inspection.
   ctx.imageSmoothingEnabled = viewer2d.scale / ratio < 1;
   ctx.imageSmoothingQuality = "high";
-  ctx.drawImage(viewer2d.image, viewer2d.offsetX, viewer2d.offsetY, viewer2d.image.width * viewer2d.scale, viewer2d.image.height * viewer2d.scale);
+  ctx.drawImage(image, viewer2d.offsetX, viewer2d.offsetY, image.width * viewer2d.scale, image.height * viewer2d.scale);
 }
 
 function previewIsExpanded() {
@@ -751,7 +772,7 @@ function updatePreviewFullscreenButton() {
 
 function redrawExpandedPreview() {
   window.requestAnimationFrame(() => {
-    if (activePreview === "2d-map") reset2D();
+    if (isPlanPreview()) reset2D();
     else drawScene();
   });
 }
@@ -1022,12 +1043,12 @@ async function loadSurfaceBuffers(frames, token) {
       const surface = webGLIndexedBuffer(gl, positions, colors, frame.indices || []);
       if (surface) viewer3d.buffers.surfaces.push(surface);
       loaded += 1;
-      if (loaded % 8 === 0 && activePreview !== "2d-map") drawScene();
+      if (loaded % 8 === 0 && !isPlanPreview()) drawScene();
     } catch (error) {
       console.warn(error.message);
     }
   }
-  if (token === viewer3d.surfaceLoadToken && activePreview !== "2d-map") drawScene();
+  if (token === viewer3d.surfaceLoadToken && !isPlanPreview()) drawScene();
 }
 
 function draw3DBuffer(buffer, pointSize = 1, roundPoints = false) {
@@ -1051,7 +1072,7 @@ function draw3DBuffer(buffer, pointSize = 1, roundPoints = false) {
 }
 
 function drawScene() {
-  if (!viewer3d.data || activePreview === "2d-map") return;
+  if (!viewer3d.data || isPlanPreview()) return;
   const topDown = activePreview === "2d-color";
   const metrics = canvasMetrics(sceneCanvas);
   const gl = ensure3DRenderer();
@@ -1091,12 +1112,14 @@ function updatePreview(kind) {
     button.classList.toggle("is-active", selected);
     button.setAttribute("aria-selected", String(selected));
   });
-  mapCanvas.hidden = kind !== "2d-map";
-  sceneCanvas.hidden = kind === "2d-map";
+  const planPreview = isPlanPreview(kind);
+  mapCanvas.hidden = !planPreview;
+  sceneCanvas.hidden = planPreview;
+  mapCanvas.setAttribute("aria-label", kind === "2d-shelf" ? "二维货架和竖直结构轮廓预览" : "二维结构地图预览");
   sceneCanvas.dataset.dragMode = kind === "2d-color" ? "pan" : viewer3d.dragMode;
   $("#scene-controls").hidden = kind !== "3d";
   syncEmptyPreview();
-  if (kind === "2d-map") reset2D(); else drawScene();
+  if (planPreview) reset2D(); else drawScene();
 }
 
 function pointerPosition(event, canvas) {
@@ -1107,7 +1130,7 @@ function pointerPosition(event, canvas) {
 
 function connect2DControls() {
   mapCanvas.addEventListener("pointerdown", (event) => {
-    if (!viewer2d.image) return;
+    if (!current2DImage()) return;
     const [x, y] = pointerPosition(event, mapCanvas);
     viewer2d.dragging = true; viewer2d.startX = x - viewer2d.offsetX; viewer2d.startY = y - viewer2d.offsetY;
     mapCanvas.setPointerCapture(event.pointerId);
@@ -1119,7 +1142,7 @@ function connect2DControls() {
   });
   mapCanvas.addEventListener("pointerup", () => { viewer2d.dragging = false; });
   mapCanvas.addEventListener("wheel", (event) => {
-    if (!viewer2d.image) return;
+    if (!current2DImage()) return;
     event.preventDefault();
     const [x, y] = pointerPosition(event, mapCanvas);
     const factor = event.deltaY < 0 ? 1.12 : 0.89;
@@ -1236,7 +1259,7 @@ function bindEvents() {
     });
   });
   $("#reset-view").addEventListener("click", () => {
-    if (activePreview === "2d-map") reset2D();
+    if (isPlanPreview()) reset2D();
     else if (activePreview === "2d-color") resetTopDown();
     else reset3D();
   });
@@ -1259,7 +1282,7 @@ function bindEvents() {
     catch (error) { setStatus(error.message, "failed"); }
   });
   connect2DControls(); connect3DControls();
-  new ResizeObserver(() => { if (activePreview === "2d-map") draw2D(); else drawScene(); }).observe($(".canvas-wrap"));
+  new ResizeObserver(() => { if (isPlanPreview()) draw2D(); else drawScene(); }).observe($(".canvas-wrap"));
 }
 
 bindEvents();

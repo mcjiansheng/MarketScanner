@@ -292,7 +292,13 @@ class MapStudioApiTests(unittest.TestCase):
         self.assertTrue(result["logs"])
         self.assertEqual(result["logs"][0]["stage"], "任务已启动")
         self.assertIn("preview.png", result["artifacts"])
+        self.assertIn("shelf_outline.png", result["artifacts"])
         self.assertIn("preview_3d.json", result["artifacts"])
+        self.assertTrue((output / "shelf_outline.png").is_file())
+        preview_layers = self.api(result["artifacts"]["preview_layers.json"])
+        self.assertEqual(preview_layers["version"], 2)
+        self.assertIn("shelf_outline", {layer["id"] for layer in preview_layers["layers"]})
+        self.assertIn("runs", preview_layers["shelf_outline"])
         preview = self.api(result["artifacts"]["preview_3d.json"])
         self.assertEqual(preview["format"], "SupermarketMap3DPreview")
         self.assertEqual(len(preview["segments"][0]["trajectory"]), 2)
@@ -578,6 +584,8 @@ class MapStudioApiTests(unittest.TestCase):
         self.assertIn(b'id="option-pc-local-staging"', html)
         self.assertIn(b'id="option-gpu-backend"', html)
         self.assertIn(b'id="gpu-capability"', html)
+        self.assertIn(b'id="shelf-preview-tab"', html)
+        self.assertIn("RGB-D 结构/3D 质量".encode("utf-8"), html)
         self.assertIn(b'<option value="maximum" selected>', html)
         self.assertIn(b"max-width: 1920px", css)
         self.assertIn(b".preview-panel:fullscreen", css)
@@ -863,6 +871,7 @@ class MapStudioApiTests(unittest.TestCase):
         result = self.wait_for_job(job["id"])
         self.assertEqual(result["status"], "complete", result.get("error"))
         self.assertIn("multi_device_manifest.json", result["artifacts"])
+        self.assertIn("shelf_outline.png", result["artifacts"])
         manifest = self.api(result["artifacts"]["multi_device_manifest.json"])
         self.assertEqual(len(manifest["devices"]), 2)
         self.assertEqual(manifest["devices"][0]["input_scan"]["scan_mode"], "continuous_streaming")
@@ -934,6 +943,40 @@ class MapStudioApiTests(unittest.TestCase):
         )
         self.assertEqual(legacy_preview["decoded_frames"], 1)
         self.assertEqual(legacy_preview["surface_frame_count"], 0)
+
+    def test_vertical_height_span_creates_black_shelf_outline(self) -> None:
+        vertical = server.base.vertical_triangle_sample(
+            (0.0, 0.0, 0.0), (0.0, 0.0, 1.0), (0.0, 1.0, 0.0)
+        )
+        horizontal = server.base.vertical_triangle_sample(
+            (0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0)
+        )
+        self.assertIsNotNone(vertical)
+        self.assertIsNone(horizontal)
+
+        grid = server.base.OccupancyGrid(0.05, [(0.0, 0.0), (1.0, 1.0)], 0.1)
+        evidence = [
+            [x / 20.0, 0.5, 0.20, 1.80, 8, 0.01, 0.95]
+            for x in range(4, 17)
+        ]
+        point_cloud = {
+            "estimated_floor_height_m": 0.0,
+            "vertical_surface_triangle_count": len(evidence) * 8,
+            "_vertical_surface_evidence": evidence,
+        }
+        outline = server.base.build_shelf_outline(point_cloud, grid)
+        self.assertEqual(len(outline.components), 1)
+        self.assertGreaterEqual(len(outline.cells), 10)
+
+        output = self.root / "shelf-outline.png"
+        server.base.render_shelf_outline(grid, outline, output)
+        width, height, _bit_depth, color_type, pixels = server.base.decode_png_pixels(output.read_bytes())
+        self.assertEqual((width, height, color_type), (grid.width, grid.height, 2))
+        black_pixels = sum(
+            1 for index in range(0, len(pixels), 3)
+            if pixels[index:index + 3] == bytes((12, 16, 18))
+        )
+        self.assertEqual(black_pixels, len(outline.cells))
 
     def test_nested_preview_frame_artifact_is_served_from_job_output(self) -> None:
         output = self.root / "surface-output"

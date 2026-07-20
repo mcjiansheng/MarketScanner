@@ -100,7 +100,7 @@
             <label>轨迹半径 (m)<input id="option-trajectory-radius" type="number" value="1.25" min="0.1" step="0.05"></label>
             <input id="option-tag-snap" type="hidden" value="1.0">
             <label>水平坐标<select id="option-axes"><option value="xz">X/Z</option><option value="xy">X/Y</option></select></label>
-            <label>3D 表面质量<select id="option-3d-quality"><option value="quick">快速</option><option value="detailed">详细</option><option value="maximum" selected>最高（推荐）</option></select></label>
+            <label>RGB-D 结构/3D 质量<select id="option-3d-quality"><option value="quick">快速</option><option value="detailed">详细</option><option value="maximum" selected>最高（推荐）</option></select></label>
           </div>
         </details>
       </div>
@@ -110,6 +110,7 @@
           <div class="preview-tabs" role="tablist" aria-label="预览视图">
             <button class="preview-tab is-active" type="button" data-preview="2d-color" role="tab" aria-selected="true">2D 彩色俯视</button>
             <button class="preview-tab" type="button" data-preview="2d-map" role="tab" aria-selected="false">2D 结构图</button>
+            <button id="shelf-preview-tab" class="preview-tab" type="button" data-preview="2d-shelf" role="tab" aria-selected="false" hidden>2D 货架轮廓</button>
             <button class="preview-tab" type="button" data-preview="3d" role="tab" aria-selected="false">3D 彩色模型</button>
           </div>
           <div class="preview-actions">

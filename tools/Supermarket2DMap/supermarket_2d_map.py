@@ -26,7 +26,7 @@ import zlib
 from collections import defaultdict, deque
 from contextlib import closing
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 
 UNKNOWN = 0
@@ -135,6 +135,32 @@ class CameraCalibration:
     cx: float
     cy: float
     local_transform: Tuple[float, ...]
+
+
+@dataclasses.dataclass
+class ShelfOutline:
+    """Filtered floor-plan cells supported by vertically observed RGB-D surfaces."""
+
+    cells: Set[Tuple[int, int]] = dataclasses.field(default_factory=set)
+    components: List[List[Tuple[int, int]]] = dataclasses.field(default_factory=list)
+    evidence_cell_count: int = 0
+    candidate_cell_count: int = 0
+    vertical_triangle_count: int = 0
+    floor_height_m: Optional[float] = None
+    minimum_height_span_m: float = 0.45
+
+    def summary(self, resolution: float) -> Dict[str, Any]:
+        return {
+            "status": "available" if self.cells else "no_reliable_vertical_structure",
+            "cell_count": len(self.cells),
+            "component_count": len(self.components),
+            "evidence_cell_count": self.evidence_cell_count,
+            "candidate_cell_count": self.candidate_cell_count,
+            "vertical_triangle_count": self.vertical_triangle_count,
+            "floor_height_m": self.floor_height_m,
+            "minimum_height_span_m": self.minimum_height_span_m,
+            "line_coverage_m2": round(len(self.cells) * resolution * resolution, 3),
+        }
 
 
 def metadata_scan_mode(metadata: Dict[str, Any]) -> Optional[str]:
@@ -998,6 +1024,7 @@ def write_preview_layers(
     grid: OccupancyGrid,
     segments: Sequence[Segment],
     tags: Sequence[PriceTag],
+    shelf_outline: Optional[ShelfOutline] = None,
     trajectory_point_limit: int = 100_000,
 ) -> Dict[str, Any]:
     """Write lightweight layer controls without duplicating the full grid image."""
@@ -1051,6 +1078,15 @@ def write_preview_layers(
         }
         for layer_id, label, class_value, default_visible in GRID_LAYER_DEFINITIONS
     ]
+    layers.append(
+        {
+            "id": "shelf_outline",
+            "label": "货架/竖直结构轮廓",
+            "kind": "shelf_outline",
+            "color": [12, 16, 18],
+            "default_visible": True,
+        }
+    )
     layers.extend(
         (
             {
@@ -1078,7 +1114,7 @@ def write_preview_layers(
     )
     payload = {
         "format": "SupermarketMap2DPreviewLayers",
-        "version": 1,
+        "version": 2,
         "width": grid.width,
         "height": grid.height,
         "resolution_m": grid.resolution,
@@ -1092,6 +1128,10 @@ def write_preview_layers(
             "stride": stride,
         },
         "price_tags": tag_entries,
+        "shelf_outline": {
+            "runs": shelf_outline_runs(shelf_outline, grid) if shelf_outline is not None else [],
+            "summary": shelf_outline.summary(grid.resolution) if shelf_outline is not None else None,
+        },
         "export_scales": [1, 2, 4],
     }
     path.write_text(json.dumps(payload, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
@@ -1147,6 +1187,46 @@ def _evenly_sampled_rows(rows: Sequence[Any], limit: int) -> List[Any]:
     return [rows[index] for index in dict.fromkeys(indices)]
 
 
+def vertical_triangle_sample(
+    first: Sequence[float],
+    second: Sequence[float],
+    third: Sequence[float],
+    maximum_vertical_normal_ratio: float = 0.55,
+) -> Optional[Tuple[float, float, float, float, float, float]]:
+    """Return compact evidence when a triangle belongs to a near-vertical surface.
+
+    The third coordinate is height. A vertical wall/shelf face has an almost
+    horizontal normal, so the absolute height component of its unit normal is
+    small. Horizontal floor and shelf-top triangles are rejected.
+    """
+    if min(len(first), len(second), len(third)) < 3:
+        return None
+    ux = float(second[0]) - float(first[0])
+    uy = float(second[1]) - float(first[1])
+    uz = float(second[2]) - float(first[2])
+    vx = float(third[0]) - float(first[0])
+    vy = float(third[1]) - float(first[1])
+    vz = float(third[2]) - float(first[2])
+    normal_x = uy * vz - uz * vy
+    normal_y = uz * vx - ux * vz
+    normal_z = ux * vy - uy * vx
+    normal_length = math.sqrt(normal_x * normal_x + normal_y * normal_y + normal_z * normal_z)
+    if normal_length <= 1e-8:
+        return None
+    normal_height_ratio = abs(normal_z) / normal_length
+    if normal_height_ratio > maximum_vertical_normal_ratio:
+        return None
+    heights = (float(first[2]), float(second[2]), float(third[2]))
+    return (
+        (float(first[0]) + float(second[0]) + float(third[0])) / 3.0,
+        (float(first[1]) + float(second[1]) + float(third[1])) / 3.0,
+        min(heights),
+        max(heights),
+        normal_length * 0.5,
+        1.0 - normal_height_ratio,
+    )
+
+
 def extract_depth_point_cloud(
     segments: Sequence[Segment],
     horizontal_axes: str,
@@ -1156,6 +1236,7 @@ def extract_depth_point_cloud(
     max_points: int = 400000,
     frame_output_dir: Optional[Path] = None,
     depth_projector: Optional[Any] = None,
+    structure_resolution: float = 0.05,
 ) -> Dict[str, Any]:
     """Build a bounded preview cloud from RTAB-Map RGB-D node data."""
     candidates: List[Tuple[Segment, int]] = []
@@ -1193,6 +1274,9 @@ def extract_depth_point_cloud(
     gpu_projected_frames = 0
     gpu_projection_failures = 0
     palette = [(17, 132, 141), (47, 123, 202), (147, 89, 170), (189, 106, 50), (88, 125, 53)]
+    structure_cell_size = max(0.025, float(structure_resolution))
+    vertical_surface_cells: Dict[Tuple[int, int], List[float]] = {}
+    vertical_triangle_count = 0
 
     for database_path, rows in selected_by_database.items():
         segment = rows[0][0]
@@ -1330,12 +1414,37 @@ def extract_depth_point_cloud(
                 frame_indices: List[int] = []
 
                 def append_triangle(first: int, second: int, third: int) -> None:
+                    nonlocal vertical_triangle_count
                     if min(first, second, third) < 0:
                         return
                     triangle_depths = (frame_depths[first], frame_depths[second], frame_depths[third])
                     depth_jump_limit = 0.08 + min(triangle_depths) * 0.04
                     if max(triangle_depths) - min(triangle_depths) <= depth_jump_limit:
                         frame_indices.extend((first, second, third))
+                        evidence = vertical_triangle_sample(
+                            frame_vertices[first], frame_vertices[second], frame_vertices[third]
+                        )
+                        if evidence is not None:
+                            x, y, minimum_height, maximum_height, area, verticality = evidence
+                            key = (round(x / structure_cell_size), round(y / structure_cell_size))
+                            accumulated = vertical_surface_cells.get(key)
+                            if accumulated is None:
+                                # min height, max height, triangle count,
+                                # accumulated area, accumulated verticality.
+                                vertical_surface_cells[key] = [
+                                    minimum_height,
+                                    maximum_height,
+                                    1.0,
+                                    area,
+                                    verticality,
+                                ]
+                            else:
+                                accumulated[0] = min(accumulated[0], minimum_height)
+                                accumulated[1] = max(accumulated[1], maximum_height)
+                                accumulated[2] += 1.0
+                                accumulated[3] += area
+                                accumulated[4] += verticality
+                            vertical_triangle_count += 1
 
                 for grid_row in range(grid_height - 1):
                     for grid_column in range(grid_width - 1):
@@ -1391,6 +1500,21 @@ def extract_depth_point_cloud(
         "gpu_projection_backend": getattr(depth_projector, "backend", "cpu") if depth_projector else "cpu",
         "gpu_projected_frames": gpu_projected_frames,
         "gpu_projection_failures": gpu_projection_failures,
+        "vertical_surface_triangle_count": vertical_triangle_count,
+        "vertical_surface_evidence_cell_count": len(vertical_surface_cells),
+        "vertical_surface_evidence_resolution_m": structure_cell_size,
+        "_vertical_surface_evidence": [
+            [
+                key[0] * structure_cell_size,
+                key[1] * structure_cell_size,
+                values[0],
+                values[1],
+                int(values[2]),
+                values[3],
+                values[4] / max(1.0, values[2]),
+            ]
+            for key, values in vertical_surface_cells.items()
+        ],
         "warnings": warnings,
     }
 
@@ -1430,6 +1554,158 @@ def projected_depth_surface_points(
         )
         for row in selected.values()
     ]
+
+
+def build_shelf_outline(
+    point_cloud: Dict[str, Any],
+    grid: OccupancyGrid,
+    minimum_height_span_m: float = 0.45,
+    minimum_height_above_floor_m: float = 0.55,
+    minimum_component_length_m: float = 0.20,
+) -> ShelfOutline:
+    """Extract thin shelf/wall traces from vertically observed RGB-D faces.
+
+    Evidence is accumulated in a 3x3 grid neighborhood so small LiDAR depth
+    jitter does not split one physical face into adjacent columns. One-cell
+    gaps are closed, then short isolated fragments are removed. Horizontal
+    floor and shelf-top surfaces have already been rejected by their normals.
+    """
+    raw_evidence = point_cloud.get("_vertical_surface_evidence", [])
+    floor_raw = point_cloud.get("estimated_floor_height_m")
+    floor_height = float(floor_raw) if isinstance(floor_raw, (int, float)) else None
+    outline = ShelfOutline(
+        evidence_cell_count=len(raw_evidence),
+        vertical_triangle_count=int(point_cloud.get("vertical_surface_triangle_count") or 0),
+        floor_height_m=round(floor_height, 3) if floor_height is not None else None,
+        minimum_height_span_m=minimum_height_span_m,
+    )
+    if not raw_evidence:
+        return outline
+
+    # Each value contains min height, max height, triangle count, area and
+    # triangle-count-weighted verticality.
+    evidence_by_cell: Dict[Tuple[int, int], List[float]] = {}
+    for row in raw_evidence:
+        if not isinstance(row, list) or len(row) < 7:
+            continue
+        try:
+            x, y = float(row[0]), float(row[1])
+            minimum_height, maximum_height = float(row[2]), float(row[3])
+            triangle_count = max(1.0, float(row[4]))
+            area = max(0.0, float(row[5]))
+            verticality = max(0.0, min(1.0, float(row[6])))
+        except (TypeError, ValueError):
+            continue
+        if not all(math.isfinite(value) for value in (x, y, minimum_height, maximum_height, area, verticality)):
+            continue
+        cell = grid.cell(x, y)
+        if not grid.in_bounds(*cell):
+            continue
+        accumulated = evidence_by_cell.get(cell)
+        if accumulated is None:
+            evidence_by_cell[cell] = [
+                minimum_height,
+                maximum_height,
+                triangle_count,
+                area,
+                verticality * triangle_count,
+            ]
+        else:
+            accumulated[0] = min(accumulated[0], minimum_height)
+            accumulated[1] = max(accumulated[1], maximum_height)
+            accumulated[2] += triangle_count
+            accumulated[3] += area
+            accumulated[4] += verticality * triangle_count
+
+    candidates: Set[Tuple[int, int]] = set()
+    for ix, iy in evidence_by_cell:
+        neighbors = [
+            evidence_by_cell[(nx, ny)]
+            for ny in range(iy - 1, iy + 2)
+            for nx in range(ix - 1, ix + 2)
+            if (nx, ny) in evidence_by_cell
+        ]
+        if not neighbors:
+            continue
+        minimum_height = min(value[0] for value in neighbors)
+        maximum_height = max(value[1] for value in neighbors)
+        triangle_count = sum(value[2] for value in neighbors)
+        weighted_verticality = sum(value[4] for value in neighbors) / max(1.0, triangle_count)
+        if maximum_height - minimum_height < minimum_height_span_m:
+            continue
+        if floor_height is not None and maximum_height < floor_height + minimum_height_above_floor_m:
+            continue
+        if triangle_count < 3 or weighted_verticality < 0.60:
+            continue
+        candidates.add((ix, iy))
+
+    outline.candidate_cell_count = len(candidates)
+    if not candidates:
+        return outline
+
+    # Close a single missing 2D cell without expanding the measured outline.
+    closed = set(candidates)
+    for ix, iy in candidates:
+        for dx, dy in ((1, 0), (0, 1), (1, 1), (1, -1)):
+            far = (ix + 2 * dx, iy + 2 * dy)
+            middle = (ix + dx, iy + dy)
+            if far in candidates and grid.in_bounds(*middle):
+                closed.add(middle)
+
+    minimum_cells = max(3, int(math.ceil(minimum_component_length_m / grid.resolution)))
+    remaining = set(closed)
+    components: List[List[Tuple[int, int]]] = []
+    while remaining:
+        start = remaining.pop()
+        queue = deque([start])
+        component = [start]
+        while queue:
+            cx, cy = queue.popleft()
+            for ny in range(cy - 1, cy + 2):
+                for nx in range(cx - 1, cx + 2):
+                    if (nx, ny) == (cx, cy) or (nx, ny) not in remaining:
+                        continue
+                    remaining.remove((nx, ny))
+                    queue.append((nx, ny))
+                    component.append((nx, ny))
+        if len(component) >= minimum_cells:
+            components.append(sorted(component, key=lambda cell: (cell[1], cell[0])))
+
+    outline.components = sorted(components, key=len, reverse=True)
+    outline.cells = {cell for component in outline.components for cell in component}
+    return outline
+
+
+def shelf_outline_runs(outline: ShelfOutline, grid: OccupancyGrid) -> List[List[int]]:
+    """Run-length encode outline cells in image coordinates for browser drawing."""
+    rows: Dict[int, List[int]] = defaultdict(list)
+    for ix, iy in outline.cells:
+        rows[grid.height - 1 - iy].append(ix)
+    runs: List[List[int]] = []
+    for image_y, xs in sorted(rows.items()):
+        ordered = sorted(set(xs))
+        if not ordered:
+            continue
+        start = previous = ordered[0]
+        for x in ordered[1:]:
+            if x == previous + 1:
+                previous = x
+                continue
+            runs.append([image_y, start, previous - start + 1])
+            start = previous = x
+        runs.append([image_y, start, previous - start + 1])
+    return runs
+
+
+def render_shelf_outline(grid: OccupancyGrid, outline: ShelfOutline, path: Path) -> None:
+    """Write a reference-style white floor plan with black vertical traces."""
+    rows: List[bytes] = []
+    for iy in range(grid.height - 1, -1, -1):
+        row = bytearray()
+        for ix in range(grid.width):
+            row.extend((12, 16, 18) if (ix, iy) in outline.cells else (255, 255, 255))
+        rows.append(bytes(row))
+    write_png(path, grid.width, grid.height, rows)
 
 
 def write_preview_3d(
@@ -1473,6 +1749,9 @@ def write_preview_3d(
             frame_output_dir=path.parent / "preview_frames",
             **profile,
         )
+    public_point_cloud = {
+        key: value for key, value in point_cloud.items() if not key.startswith("_")
+    }
     data = {
         "format": "SupermarketMap3DPreview",
         "version": 2,
@@ -1498,10 +1777,14 @@ def write_preview_3d(
             }
             for tag in tags
         ],
-        "point_cloud": point_cloud,
+        "point_cloud": public_point_cloud,
     }
     path.write_text(json.dumps(data, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
-    return {key: value for key, value in point_cloud.items() if key not in {"points", "surface_frames"}}
+    return {
+        key: value
+        for key, value in public_point_cloud.items()
+        if key not in {"points", "surface_frames"}
+    }
 
 
 def price_tags_geojson(tags: Sequence[PriceTag]) -> Dict[str, Any]:
@@ -1571,17 +1854,24 @@ def vector_map_geojson(grid: OccupancyGrid) -> Dict[str, Any]:
     return feature_collection(features)
 
 
-def semantic_layers(grid: OccupancyGrid) -> Dict[str, Any]:
+def semantic_layers(grid: OccupancyGrid, shelf_outline: Optional[ShelfOutline] = None) -> Dict[str, Any]:
     counts = grid.class_counts()
     cell_area = grid.resolution * grid.resolution
-    return {
-        "layers": [
-            {"id": "occupied", "kind": "structure_or_obstacle", "area_m2": counts["occupied"] * cell_area},
-            {"id": "walkable_confirmed", "kind": "free_space", "area_m2": counts["free"] * cell_area},
-            {"id": "unknown", "kind": "unobserved", "area_m2": counts["unknown"] * cell_area},
-            {"id": "conflict", "kind": "needs_review", "area_m2": counts["conflict"] * cell_area},
-        ]
-    }
+    layers = [
+        {"id": "occupied", "kind": "structure_or_obstacle", "area_m2": counts["occupied"] * cell_area},
+        {"id": "walkable_confirmed", "kind": "free_space", "area_m2": counts["free"] * cell_area},
+        {"id": "unknown", "kind": "unobserved", "area_m2": counts["unknown"] * cell_area},
+        {"id": "conflict", "kind": "needs_review", "area_m2": counts["conflict"] * cell_area},
+    ]
+    if shelf_outline is not None:
+        layers.append(
+            {
+                "id": "shelf_outline",
+                "kind": "vertical_structure_trace",
+                **shelf_outline.summary(grid.resolution),
+            }
+        )
+    return {"layers": layers}
 
 
 def quality_report(
@@ -1591,6 +1881,7 @@ def quality_report(
     tags: Sequence[PriceTag],
     grid: OccupancyGrid,
     transforms: Dict[int, Dict[str, float]],
+    shelf_outline: Optional[ShelfOutline] = None,
 ) -> Dict[str, Any]:
     counts = grid.class_counts()
     total = grid.width * grid.height
@@ -1645,6 +1936,10 @@ def quality_report(
         warnings.append("No projected structure points were provided; 2D occupancy is based on trajectory free-space only.")
     if counts["conflict"] / max(1, total) > 0.05:
         warnings.append("Conflict grid ratio is above 5%; inspect segment alignment and dynamic obstacles.")
+    if shelf_outline is not None and shelf_outline.evidence_cell_count and not shelf_outline.cells:
+        warnings.append(
+            "Vertical RGB-D surface evidence was detected, but no shelf/wall outline passed the height-span and continuity filters."
+        )
     return {
         "session": str(session_dir),
         "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -1672,6 +1967,7 @@ def quality_report(
             "class_areas_m2": {k: round(v * cell_area, 3) for k, v in counts.items()},
         },
         "projected_points": len(points),
+        "shelf_outline": shelf_outline.summary(grid.resolution) if shelf_outline is not None else None,
         "price_tags": {"total": len(tags), "needs_review": review_tags},
         "segment_transforms": transforms,
         "warnings": warnings,
@@ -1756,6 +2052,7 @@ def generate(args: argparse.Namespace) -> Path:
         config.horizontal_axes,
         frame_output_dir=output_dir / "preview_frames",
         depth_projector=getattr(args, "depth_projector", None),
+        structure_resolution=config.resolution,
         **preview_profile,
     )
     points.extend(projected_depth_surface_points(point_cloud, config.resolution))
@@ -1763,11 +2060,13 @@ def generate(args: argparse.Namespace) -> Path:
     tags = [tag for segment in segments for tag in segment.price_tags]
     snap_price_tags(tags, points, config.tag_snap_distance)
     grid = build_grid(segments, points, config)
+    shelf_outline = build_shelf_outline(point_cloud, grid)
     poses = [pose for segment in segments for pose in segment.poses]
 
     render_grid(grid, output_dir / "occupancy_grid.png")
+    render_shelf_outline(grid, shelf_outline, output_dir / "shelf_outline.png")
     render_grid(grid, output_dir / "preview.png", trajectories=poses, tags=tags)
-    write_preview_layers(output_dir / "preview_layers.json", grid, segments, tags)
+    write_preview_layers(output_dir / "preview_layers.json", grid, segments, tags, shelf_outline)
     write_yaml(output_dir / "occupancy_grid.yaml", grid, "occupancy_grid.png")
     write_geojson(output_dir / "trajectory.geojson", trajectory_geojson(segments))
     write_geojson(output_dir / "price_tags.geojson", price_tags_geojson(tags))
@@ -1781,9 +2080,12 @@ def generate(args: argparse.Namespace) -> Path:
         quality=preview_3d_quality,
         point_cloud=point_cloud,
     )
-    (output_dir / "semantic_layers.json").write_text(json.dumps(semantic_layers(grid), ensure_ascii=False, indent=2), encoding="utf-8")
+    (output_dir / "semantic_layers.json").write_text(
+        json.dumps(semantic_layers(grid, shelf_outline), ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
 
-    report = quality_report(session_dir, segments, points, tags, grid, transforms)
+    report = quality_report(session_dir, segments, points, tags, grid, transforms, shelf_outline)
     report["preview_3d"] = preview_3d_summary
     (output_dir / "quality_report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     (output_dir / "source_manifest.json").write_text(
@@ -1793,7 +2095,7 @@ def generate(args: argparse.Namespace) -> Path:
     write_review_items(output_dir / "review_items.json", report, tags)
     map_json = {
         "format": "SupermarketMap2D",
-        "version": 1,
+        "version": 2,
         "session": str(session_dir),
         "generated_at": report["generated_at"],
         "input_scan": input_scan,
@@ -1807,6 +2109,7 @@ def generate(args: argparse.Namespace) -> Path:
         "preview_3d_quality": preview_3d_quality,
         "outputs": [
             "occupancy_grid.png",
+            "shelf_outline.png",
             "occupancy_grid.yaml",
             "vector_map.geojson",
             "semantic_layers.json",

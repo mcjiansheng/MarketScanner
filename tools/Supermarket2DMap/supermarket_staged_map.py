@@ -305,6 +305,7 @@ def generate(args: argparse.Namespace) -> Path:
         config.horizontal_axes,
         frame_output_dir=output_dir / "preview_frames",
         depth_projector=getattr(args, "depth_projector", None),
+        structure_resolution=config.resolution,
         **preview_profile,
     )
     points.extend(base.projected_depth_surface_points(point_cloud, config.resolution))
@@ -312,11 +313,13 @@ def generate(args: argparse.Namespace) -> Path:
     tags = [tag for segment in segments for tag in segment.price_tags]
     base.snap_price_tags(tags, points, config.tag_snap_distance)
     grid = base.build_grid(segments, points, config)
+    shelf_outline = base.build_shelf_outline(point_cloud, grid)
     poses = [pose for segment in segments for pose in segment.poses]
 
     base.render_grid(grid, output_dir / "occupancy_grid.png")
+    base.render_shelf_outline(grid, shelf_outline, output_dir / "shelf_outline.png")
     base.render_grid(grid, output_dir / "preview.png", trajectories=poses, tags=tags)
-    base.write_preview_layers(output_dir / "preview_layers.json", grid, segments, tags)
+    base.write_preview_layers(output_dir / "preview_layers.json", grid, segments, tags, shelf_outline)
     base.write_yaml(output_dir / "occupancy_grid.yaml", grid, "occupancy_grid.png")
     base.write_geojson(output_dir / "trajectory.geojson", base.trajectory_geojson(segments))
     base.write_geojson(output_dir / "price_tags.geojson", base.price_tags_geojson(tags))
@@ -330,13 +333,18 @@ def generate(args: argparse.Namespace) -> Path:
         quality=preview_3d_quality,
         point_cloud=point_cloud,
     )
-    (output_dir / "semantic_layers.json").write_text(json.dumps(base.semantic_layers(grid), ensure_ascii=False, indent=2), encoding="utf-8")
+    (output_dir / "semantic_layers.json").write_text(
+        json.dumps(base.semantic_layers(grid, shelf_outline), ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
 
     transforms_for_report = {
         segment.index: compose_transform(applied[segment.index]["segment_transform"], applied[segment.index]["stage_transform"])
         for segment in segments
     }
-    report = base.quality_report(session_dir, segments, points, tags, grid, transforms_for_report)
+    report = base.quality_report(
+        session_dir, segments, points, tags, grid, transforms_for_report, shelf_outline
+    )
     report["preview_3d"] = preview_3d_summary
     stage_report, stage_warnings = stage_quality(stages, segments, stage_by_segment, stage_transforms, segment_transforms, bool(points))
     report["stage_summary"] = {
@@ -388,7 +396,7 @@ def generate(args: argparse.Namespace) -> Path:
 
     map_json = {
         "format": "SupermarketStageMap2D",
-        "version": 1,
+        "version": 2,
         "session": str(session_dir),
         "generated_at": report["generated_at"],
         "input_scan": input_scan,
@@ -402,6 +410,7 @@ def generate(args: argparse.Namespace) -> Path:
         "preview_3d_quality": preview_3d_quality,
         "outputs": [
             "occupancy_grid.png",
+            "shelf_outline.png",
             "occupancy_grid.yaml",
             "preview.png",
             "preview_layers.json",
