@@ -269,7 +269,9 @@ python3 -m unittest discover -s tools/SupermarketMapStudio/tests -v
 
 ## 许可与上游资料
 
-本项目继承并保留仓库根目录的 [BSD 许可证](LICENSE)。使用、分发或二次修改时，请同时遵守 RTAB-Map 及其第三方依赖的许可要求。
+除文件中另有声明的内容外，RTAB-Map 原始代码及 MarketScanner 改编代码均按仓库根目录的 [BSD 3-Clause 许可证](LICENSE) 提供。上游 RTAB-Map 的版权声明保持不变；MarketScanner 改编部分以 `mcjiansheng` 作为公开版权标识。仓库中单独标注许可证的第三方代码和依赖仍遵循各自的许可条款。
+
+使用、分发或二次修改源码时必须保留许可证要求的版权声明、许可条件和免责条款。发布 iOS App、安装包或其他二进制成果时，也应在随附文档或应用内“开源许可/致谢”页面中提供相应声明。许可证管理代码的使用与分发，不决定 GitHub 仓库的协作者或分支写入权限。
 
 - RTAB-Map 官方主页：<https://introlab.github.io/rtabmap/>
 - RTAB-Map 上游仓库：<https://github.com/introlab/rtabmap>
