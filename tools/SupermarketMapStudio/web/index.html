@@ -15,15 +15,23 @@
     <div id="job-status" class="status" role="status">就绪</div>
   </header>
 
+  <section id="processing-progress" class="processing-progress" aria-live="polite" hidden>
+    <div class="progress-labels">
+      <strong id="progress-stage">等待处理</strong>
+      <span id="progress-percent">0%</span>
+    </div>
+    <progress id="progress-bar" max="100" value="0">0%</progress>
+  </section>
+
   <main>
     <nav class="mode-tabs" aria-label="处理模式">
-      <button class="tab is-active" type="button" data-mode="single">单设备合并</button>
+      <button class="tab is-active" type="button" data-mode="single">单设备处理</button>
       <button class="tab" type="button" data-mode="multi">多设备合并</button>
     </nav>
 
     <section class="workbench" aria-label="地图处理工作台">
       <div class="control-panel">
-        <section class="mode-panel is-active" data-panel="single" aria-label="单设备合并输入">
+        <section class="mode-panel is-active" data-panel="single" aria-label="单设备扫描输入">
           <div class="field-row">
             <label for="single-session">扫描会话</label>
             <div class="path-control">
@@ -45,12 +53,16 @@
               <button class="secondary" type="button" data-pick-file="single-points" data-title="选择结构点 CSV">选择文件</button>
             </div>
           </div>
-          <label class="check-row"><input id="single-auto-align" type="checkbox"> 自动对齐相邻分段</label>
-          <div class="stage-toolbar">
-            <span>阶段校正（可选）</span>
-            <button id="add-stage" class="secondary" type="button">添加阶段</button>
-          </div>
-          <div id="stage-list" class="stage-list" aria-live="polite"></div>
+          <details id="legacy-segment-options" class="legacy-options">
+            <summary>旧版分段数据兼容（仅历史扫描）</summary>
+            <p>只用于导入旧版多段会话；连续流式扫描检查通过后，此区域会自动隐藏且不会参与处理。</p>
+            <label class="check-row"><input id="single-auto-align" type="checkbox"> 自动对齐旧版相邻分段</label>
+            <div class="stage-toolbar">
+              <span>旧版分段阶段校正（可选）</span>
+              <button id="add-stage" class="secondary" type="button">添加阶段</button>
+            </div>
+            <div id="stage-list" class="stage-list" aria-live="polite"></div>
+          </details>
           <div class="button-row">
             <button id="inspect-single-session" class="secondary" type="button">检查会话</button>
             <button id="run-single" class="primary" type="button">生成单设备地图</button>
@@ -77,11 +89,18 @@
         <details class="advanced-options">
           <summary>地图参数</summary>
           <div class="options-grid">
+            <label class="check-row"><input id="option-offline-optimize" type="checkbox" checked>PC 离线闭环与全局优化</label>
+            <label>rtabmap-reprocess（可选路径）<input id="option-reprocess-binary" type="text" spellcheck="false" placeholder="自动检测 PATH 或 build/bin"></label>
+            <label>PC 工作线程<input id="option-pc-threads" type="number" value="4" min="1" max="64" step="1"></label>
+            <label class="check-row"><input id="option-pc-local-staging" type="checkbox" checked>先在本机高速盘处理，再发布到输出目录</label>
+            <label>GPU 计算后端<select id="option-gpu-backend"><option value="auto" selected>自动检测（推荐）</option><option value="apple_metal">Apple Metal</option><option value="nvidia_cuda">NVIDIA CUDA</option><option value="cpu">仅 CPU / OpenMP</option></select></label>
+            <label>GPU helper（可选路径）<input id="option-gpu-helper" type="text" spellcheck="false" placeholder="自动检测 build-pc-*/bin"></label>
+            <div id="gpu-capability" class="field-hint">正在检测 GPU...</div>
             <label>栅格分辨率 (m)<input id="option-resolution" type="number" value="0.05" min="0.01" step="0.01"></label>
             <label>轨迹半径 (m)<input id="option-trajectory-radius" type="number" value="1.25" min="0.1" step="0.05"></label>
             <label>价签吸附距离 (m)<input id="option-tag-snap" type="number" value="1.0" min="0.1" step="0.1"></label>
             <label>水平坐标<select id="option-axes"><option value="xz">X/Z</option><option value="xy">X/Y</option></select></label>
-            <label>3D 表面质量<select id="option-3d-quality"><option value="quick">快速</option><option value="detailed" selected>详细</option><option value="maximum">最高</option></select></label>
+            <label>3D 表面质量<select id="option-3d-quality"><option value="quick">快速</option><option value="detailed">详细</option><option value="maximum" selected>最高（推荐）</option></select></label>
           </div>
         </details>
       </div>
@@ -105,6 +124,7 @@
               <label class="point-size-control">点大小<input id="point-size" type="range" min="1" max="5" step="0.5" value="2"></label>
             </div>
             <button id="reset-view" class="secondary" type="button">重置视图</button>
+            <button id="preview-fullscreen" class="secondary" type="button" aria-pressed="false">全屏预览</button>
             <button id="open-output" class="secondary" type="button" disabled>打开输出目录</button>
           </div>
         </div>
@@ -129,6 +149,21 @@
       <div class="result-section">
         <h2>成果文件</h2>
         <div id="artifacts" class="artifacts">尚无结果</div>
+      </div>
+      <div class="result-section log-section">
+        <h2>扫描与处理日志</h2>
+        <div class="log-grid">
+          <div>
+            <h3>iPhone 扫描日志</h3>
+            <div id="scan-log-summary" class="log-summary">选择扫描会话后显示</div>
+            <pre id="scan-log-output" class="log-output">尚无日志</pre>
+          </div>
+          <div>
+            <h3>PC 处理日志</h3>
+            <div id="job-log-summary" class="log-summary">任务启动后显示</div>
+            <pre id="job-log-output" class="log-output">尚无日志</pre>
+          </div>
+        </div>
       </div>
     </section>
   </main>

@@ -9,6 +9,7 @@
 #include "NativeWrapper.hpp"
 #include "RTABMapApp.h"
 #include <rtabmap/core/DBDriverSqlite3.h>
+#include <rtabmap/utilite/UFile.h>
 
 inline RTABMapApp *native(const void *object) {
   return (RTABMapApp *)object;
@@ -83,16 +84,40 @@ int openDatabaseNative(const void *object, const char * databasePath, bool datab
     }
 }
 
-void saveNative(const void *object, const char * databasePath)
+bool saveNative(const void *object, const char * databasePath, bool savePreview)
 {
     if(object)
     {
-        return native(object)->save(databasePath);
+        native(object)->save(databasePath, savePreview);
+        if(!UFile::exists(databasePath) || UFile::length(databasePath) <= 0)
+        {
+            UERROR("Saved database is missing or empty: %s", databasePath);
+            return false;
+        }
+
+        // Existence alone is not a useful success check for continuous mode:
+        // the active on-disk database already exists before finalization. Open
+        // a separate read-only connection and verify that it is an RTAB-Map
+        // database containing mapping nodes.
+        rtabmap::DBDriverSqlite3 verifier;
+        if(!verifier.openConnection(databasePath, false, true))
+        {
+            UERROR("Saved database cannot be opened read-only: %s", databasePath);
+            return false;
+        }
+        const bool valid = !verifier.getDatabaseVersion().empty() && verifier.getTotalNodesSize() > 0;
+        verifier.closeConnection(false);
+        if(!valid)
+        {
+            UERROR("Saved database has no valid RTAB-Map version or mapping nodes: %s", databasePath);
+        }
+        return valid;
     }
     else
     {
         UERROR("object is null!");
     }
+    return false;
 }
 
 bool recoverNative(const void *object, const char * from, const char * to)
@@ -240,11 +265,11 @@ void onTouchEventNative(const void *object, int touch_count, int event, float x0
     }
 }
 
-void setPausedMappingNative(const void *object, bool paused)
+void setPausedMappingNative(const void *object, bool paused, bool triggerNewMap)
 {
     if(object)
     {
-        return native(object)->setPausedMapping(paused);
+        native(object)->setPausedMapping(paused, triggerNewMap);
     }
     else
     {
@@ -291,6 +316,29 @@ void setPreserveCameraOriginNative(const void *object, bool enabled) {
     if(object)
     {
         native(object)->setPreserveCameraOrigin(enabled);
+    }
+    else
+    {
+        UERROR("object is null!");
+    }
+}
+
+bool getCameraOriginOffsetNative(
+        const void *object,
+        float * x, float * y, float * z,
+        float * qx, float * qy, float * qz, float * qw) {
+    if(object && x && y && z && qx && qy && qz && qw)
+    {
+        return native(object)->getCameraOriginOffset(*x, *y, *z, *qx, *qy, *qz, *qw);
+    }
+    UERROR("object or output pointer is null!");
+    return false;
+}
+
+void setStreamingMapModeNative(const void *object, bool enabled, int maxRenderedNodes) {
+    if(object)
+    {
+        native(object)->setStreamingMapMode(enabled, maxRenderedNodes);
     }
     else
     {

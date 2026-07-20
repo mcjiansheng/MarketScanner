@@ -38,6 +38,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <rtabmap/core/SensorCaptureThread.h>
 #include <rtabmap/core/Odometry.h>
 #include <rtabmap/core/OdometryInfo.h>
+#include <rtabmap/core/Optimizer.h>
 #include <rtabmap/utilite/UFile.h>
 #include <rtabmap/utilite/UDirectory.h>
 #include <rtabmap/utilite/UTimer.h>
@@ -82,6 +83,9 @@ void showUsage()
 			"     -stop #     Last node to process.\n"
 			"     -start_s #  Start from this map session ID.\n"
 			"     -stop_s #   Last map session to process.\n"
+			"     -final_opt_iterations #  Run one final global graph optimization with # iterations after replay.\n"
+			"                               This lets replay use fewer online iterations while preserving a high-quality final solve.\n"
+			"     -final_opt_epsilon #.#   Early-stop threshold for the final optimization (default: inherit Optimizer/Epsilon).\n"
 			"     -a          Append mode: if Mem/IncrementalMemory is true, RTAB-Map is initialized with the first input database,\n"
 			"                 then next databases are reprocessed on top of the first one.\n"
 			"     -cam #      Camera index to stream. Ignored if a database doesn't contain multi-camera data. Can also be multiple \n"
@@ -270,6 +274,8 @@ int main(int argc, char * argv[])
 	int stopId = 0;
 	int startMapId = 0;
 	int stopMapId = -1;
+	int finalOptimizationIterations = 0;
+	double finalOptimizationEpsilon = -1.0;
 	bool appendMode = false;
 	std::vector<unsigned int> cameraIndices;
 	std::vector<Transform> cameraLocalTransformOverrides;
@@ -414,6 +420,44 @@ int main(int argc, char * argv[])
 			else
 			{
 				printf("-stop option requires a value\n");
+				showUsage();
+			}
+		}
+		else if (strcmp(argv[i], "-final_opt_iterations") == 0 || strcmp(argv[i], "--final_opt_iterations") == 0)
+		{
+			++i;
+			if(i < argc - 2)
+			{
+				finalOptimizationIterations = atoi(argv[i]);
+				if(finalOptimizationIterations < 0)
+				{
+					printf("-final_opt_iterations must be greater than or equal to zero.\n");
+					showUsage();
+				}
+				printf("Final graph optimization iterations = %d.\n", finalOptimizationIterations);
+			}
+			else
+			{
+				printf("-final_opt_iterations option requires a value\n");
+				showUsage();
+			}
+		}
+		else if (strcmp(argv[i], "-final_opt_epsilon") == 0 || strcmp(argv[i], "--final_opt_epsilon") == 0)
+		{
+			++i;
+			if(i < argc - 2)
+			{
+				finalOptimizationEpsilon = uStr2Double(argv[i]);
+				if(finalOptimizationEpsilon < 0.0)
+				{
+					printf("-final_opt_epsilon must be greater than or equal to zero.\n");
+					showUsage();
+				}
+				printf("Final graph optimization epsilon = %.12g.\n", finalOptimizationEpsilon);
+			}
+			else
+			{
+				printf("-final_opt_epsilon option requires a value\n");
 				showUsage();
 			}
 		}
@@ -1126,11 +1170,32 @@ int main(int argc, char * argv[])
 							iter->second.type() == Link::kUserClosure) &&
 							iter->second.to() < data.id())
 						{
-							if(!iter->second.transform().isNull() &&
-								rtabmap.getMemory()->getWorkingMem().find(iter->second.to()) != rtabmap.getMemory()->getWorkingMem().end() &&
-								rtabmap.addLink(iter->second))
+							bool persisted = false;
+							if(!iter->second.transform().isNull())
 							{
-								printf("Added link %d->%d from input database.\n", iter->second.from(), iter->second.to());
+								Memory * memory = const_cast<Memory *>(rtabmap.getMemory());
+								const Signature * from = memory->getSignature(iter->second.from());
+								if(from && from->hasLink(iter->second.to()))
+								{
+									std::map<int, Link>::const_iterator existing = from->getLinks().find(iter->second.to());
+									if(existing->second.type() != Link::kNeighbor &&
+									   existing->second.type() != Link::kNeighborMerged)
+									{
+										memory->updateLink(iter->second, true);
+									}
+									// A neighbor edge already represents the same node pair and
+									// should not be replaced by a duplicate closure edge.
+									persisted = true;
+								}
+								else
+								{
+									persisted = memory->addLink(iter->second, true);
+								}
+							}
+							if(persisted)
+							{
+								printf("Persisted link %d->%d type=%d from input database.\n",
+										iter->second.from(), iter->second.to(), (int)iter->second.type());
 							}
 						}
 					}
@@ -1386,6 +1451,74 @@ int main(int argc, char * argv[])
 			}
 			printf("Sessions linked to last pose: %ld/%ld\n", mapIds.size(), databases.size());
 		}
+	}
+
+	if(incrementalMemory && finalOptimizationIterations > 0 && g_loopForever)
+	{
+		std::map<int, Transform> poses;
+		std::multimap<int, Link> constraints;
+		rtabmap.getGraph(poses, constraints, false, true, 0, false, false, false, false, false, false);
+		if(poses.empty() || constraints.empty() || poses.lower_bound(1) == poses.end())
+		{
+			printf("FINAL_OPTIMIZATION_FAILED reason=empty_or_invalid_graph poses=%d constraints=%d\n",
+					(int)poses.size(), (int)constraints.size());
+			rtabmap.close(false);
+			delete odometry;
+			return 2;
+		}
+
+		ParametersMap finalParameters = parameters;
+		uInsert(finalParameters, ParametersPair(
+				Parameters::kOptimizerIterations(),
+				uNumber2Str(finalOptimizationIterations)));
+		if(finalOptimizationEpsilon >= 0.0)
+		{
+			uInsert(finalParameters, ParametersPair(
+					Parameters::kOptimizerEpsilon(),
+					uNumber2Str(finalOptimizationEpsilon)));
+		}
+
+		bool optimizeFromGraphEnd = Parameters::defaultRGBDOptimizeFromGraphEnd();
+		Parameters::parse(finalParameters, Parameters::kRGBDOptimizeFromGraphEnd(), optimizeFromGraphEnd);
+		int rootId = optimizeFromGraphEnd?poses.rbegin()->first:poses.lower_bound(1)->first;
+		std::shared_ptr<Optimizer> optimizer(Optimizer::create(finalParameters));
+		std::map<int, Transform> connectedPoses;
+		std::multimap<int, Link> connectedConstraints;
+		optimizer->getConnectedGraph(rootId, poses, constraints, connectedPoses, connectedConstraints);
+
+		printf("FINAL_OPTIMIZATION_START poses=%d constraints=%d root=%d iterations=%d epsilon=%.12g\n",
+				(int)connectedPoses.size(),
+				(int)connectedConstraints.size(),
+				rootId,
+				finalOptimizationIterations,
+				finalOptimizationEpsilon >= 0.0?finalOptimizationEpsilon:optimizer->epsilon());
+		fflush(stdout);
+		UTimer finalOptimizationTimer;
+		double finalError = 0.0;
+		int finalIterationsDone = 0;
+		std::map<int, Transform> finalPoses = optimizer->optimize(
+				rootId,
+				connectedPoses,
+				connectedConstraints,
+				0,
+				&finalError,
+				&finalIterationsDone);
+		if(finalPoses.empty() || finalPoses.size() != connectedPoses.size())
+		{
+			printf("FINAL_OPTIMIZATION_FAILED reason=optimizer_returned_incomplete_graph input_poses=%d output_poses=%d\n",
+					(int)connectedPoses.size(), (int)finalPoses.size());
+			rtabmap.close(false);
+			delete odometry;
+			return 2;
+		}
+		rtabmap.setOptimizedPoses(finalPoses, connectedConstraints);
+		printf("FINAL_OPTIMIZATION_DONE poses=%d constraints=%d iterations_done=%d error=%.12g seconds=%.6f\n",
+				(int)finalPoses.size(),
+				(int)connectedConstraints.size(),
+				finalIterationsDone,
+				finalError,
+				finalOptimizationTimer.ticks());
+		fflush(stdout);
 	}
 
 	printf("Closing database \"%s\"...\n", outputDatabasePath.c_str());

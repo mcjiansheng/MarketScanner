@@ -278,7 +278,13 @@ def generate(args: argparse.Namespace) -> Path:
         auto_align_segments=False,
     )
 
-    segments = base.discover_segments(session_dir, config)
+    raw_overrides = getattr(args, "database_overrides", None) or {}
+    database_overrides = {
+        int(index): Path(path).resolve()
+        for index, path in raw_overrides.items()
+    }
+    segments = base.discover_segments(session_dir, config, database_overrides)
+    input_scan = base.session_scan_summary(segments)
     stages, stage_by_segment, stage_transforms, segment_transforms, raw_config = load_stage_config(Path(args.stage_config).resolve() if args.stage_config else None, segments)
 
     point_paths = [Path(p).resolve() for p in args.points_csv]
@@ -290,14 +296,15 @@ def generate(args: argparse.Namespace) -> Path:
 
     applied = apply_stage_transforms(segments, points, stage_by_segment, stage_transforms, segment_transforms)
 
-    preview_3d_quality = getattr(args, "preview_3d_quality", "detailed")
+    preview_3d_quality = getattr(args, "preview_3d_quality", base.DEFAULT_PREVIEW_3D_QUALITY)
     preview_profile = base.PREVIEW_3D_PROFILES.get(
-        preview_3d_quality, base.PREVIEW_3D_PROFILES["detailed"]
+        preview_3d_quality, base.PREVIEW_3D_PROFILES[base.DEFAULT_PREVIEW_3D_QUALITY]
     )
     point_cloud = base.extract_depth_point_cloud(
         segments,
         config.horizontal_axes,
         frame_output_dir=output_dir / "preview_frames",
+        depth_projector=getattr(args, "depth_projector", None),
         **preview_profile,
     )
     points.extend(base.projected_depth_surface_points(point_cloud, config.resolution))
@@ -309,6 +316,7 @@ def generate(args: argparse.Namespace) -> Path:
 
     base.render_grid(grid, output_dir / "occupancy_grid.png")
     base.render_grid(grid, output_dir / "preview.png", trajectories=poses, tags=tags)
+    base.write_preview_layers(output_dir / "preview_layers.json", grid, segments, tags)
     base.write_yaml(output_dir / "occupancy_grid.yaml", grid, "occupancy_grid.png")
     base.write_geojson(output_dir / "trajectory.geojson", base.trajectory_geojson(segments))
     base.write_geojson(output_dir / "price_tags.geojson", base.price_tags_geojson(tags))
@@ -343,6 +351,7 @@ def generate(args: argparse.Namespace) -> Path:
         "version": 1,
         "session": str(session_dir),
         "generated_at": report["generated_at"],
+        "input_scan": input_scan,
         "stages": stage_report["stages"],
         "segments": [
             {
@@ -366,6 +375,7 @@ def generate(args: argparse.Namespace) -> Path:
         "format": "SupermarketStageConfigUsed",
         "version": 1,
         "source_config": raw_config,
+        "input_scan": input_scan,
         "stage_transforms": {stage_id: transform_to_json(transform) for stage_id, transform in stage_transforms.items()},
         "segment_transforms": {str(segment): transform_to_json(transform) for segment, transform in segment_transforms.items()},
     }
@@ -381,6 +391,7 @@ def generate(args: argparse.Namespace) -> Path:
         "version": 1,
         "session": str(session_dir),
         "generated_at": report["generated_at"],
+        "input_scan": input_scan,
         "coordinate_frame": {
             "name": "map_2d",
             "horizontal_axes": config.horizontal_axes,
@@ -393,6 +404,7 @@ def generate(args: argparse.Namespace) -> Path:
             "occupancy_grid.png",
             "occupancy_grid.yaml",
             "preview.png",
+            "preview_layers.json",
             "preview_3d.json",
             "preview_frames/",
             "trajectory.geojson",
@@ -427,7 +439,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--preview-3d-quality",
         choices=sorted(base.PREVIEW_3D_PROFILES),
-        default="detailed",
+        default=base.DEFAULT_PREVIEW_3D_QUALITY,
         help="RGB-D surface preview sampling quality.",
     )
     parser.add_argument("--occupied-inflate-radius", type=float, default=0.08, help="Inflation radius for projected occupied points.")

@@ -24,6 +24,7 @@ import sys
 import time
 import zlib
 from collections import defaultdict, deque
+from contextlib import closing
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -33,11 +34,33 @@ FREE = 1
 OCCUPIED = 2
 CONFLICT = 3
 
+GRID_COLORS = {
+    UNKNOWN: (224, 230, 233),
+    FREE: (250, 252, 252),
+    OCCUPIED: (34, 43, 47),
+    CONFLICT: (224, 117, 52),
+}
+GRID_LAYER_DEFINITIONS = (
+    ("unknown", "未知区域", UNKNOWN, True),
+    ("free", "可通行区域", FREE, True),
+    ("occupied", "墙体/货架/障碍", OCCUPIED, True),
+    ("conflict", "结构冲突", CONFLICT, True),
+)
+
 PREVIEW_3D_PROFILES = {
     "quick": {"max_frames": 96, "pixel_step": 8, "max_points": 100000},
-    "detailed": {"max_frames": 192, "pixel_step": 4, "max_points": 400000},
-    "maximum": {"max_frames": 320, "pixel_step": 3, "max_points": 800000},
+    "detailed": {"max_frames": 240, "pixel_step": 3, "max_points": 500000},
+    "maximum": {"max_frames": 384, "pixel_step": 2, "max_points": 1000000},
 }
+DEFAULT_PREVIEW_3D_QUALITY = "maximum"
+
+SCAN_MODE_CONTINUOUS_STREAMING = "continuous_streaming"
+SCAN_MODE_SEGMENTED = "segmented"
+SCAN_MODE_LEGACY_SINGLE_DATABASE = "legacy_single_database"
+SCAN_MODE_MIXED = "mixed"
+
+CV_32S = 4
+CV_32F = 5
 
 
 @dataclasses.dataclass
@@ -112,6 +135,69 @@ class CameraCalibration:
     cx: float
     cy: float
     local_transform: Tuple[float, ...]
+
+
+def metadata_scan_mode(metadata: Dict[str, Any]) -> Optional[str]:
+    """Normalize the iOS scan-mode marker while accepting early aliases."""
+    raw = metadata.get("scanMode") or metadata.get("scan_mode")
+    if not isinstance(raw, str):
+        return None
+    normalized = raw.strip().lower().replace("-", "_")
+    if normalized in {"continuous", "streaming", "streaming_single_database", SCAN_MODE_CONTINUOUS_STREAMING}:
+        return SCAN_MODE_CONTINUOUS_STREAMING
+    if normalized in {"segment", "legacy_segmented", SCAN_MODE_SEGMENTED}:
+        return SCAN_MODE_SEGMENTED
+    return normalized or None
+
+
+def session_scan_summary(segments: Sequence[Segment]) -> Dict[str, Any]:
+    """Describe whether PC processing joins segments or reuses one graph."""
+    explicit_modes = {
+        mode
+        for segment in segments
+        for mode in [metadata_scan_mode(segment.metadata)]
+        if mode is not None
+    }
+    has_streaming_marker = SCAN_MODE_CONTINUOUS_STREAMING in explicit_modes
+    if has_streaming_marker and len(segments) == 1:
+        scan_mode = SCAN_MODE_CONTINUOUS_STREAMING
+    elif has_streaming_marker:
+        scan_mode = SCAN_MODE_MIXED
+    elif SCAN_MODE_SEGMENTED in explicit_modes or len(segments) > 1:
+        scan_mode = SCAN_MODE_SEGMENTED
+    else:
+        scan_mode = SCAN_MODE_LEGACY_SINGLE_DATABASE
+
+    database_count = sum(1 for segment in segments if segment.database_path is not None)
+    finalized_values = [
+        segment.metadata.get("finalized")
+        for segment in segments
+        if isinstance(segment.metadata.get("finalized"), bool)
+    ]
+    finalized: Optional[bool]
+    if any(value is False for value in finalized_values):
+        finalized = False
+    elif len(finalized_values) == len(segments) and finalized_values:
+        finalized = True
+    else:
+        finalized = None
+
+    if scan_mode == SCAN_MODE_CONTINUOUS_STREAMING:
+        strategy = "reuse_continuous_database"
+    elif len(segments) > 1:
+        strategy = "align_and_combine_segments"
+    else:
+        strategy = "reuse_single_database"
+
+    return {
+        "scan_mode": scan_mode,
+        "segment_count": len(segments),
+        "database_count": database_count,
+        "merge_required": len(segments) > 1,
+        "segment_alignment_supported": len(segments) > 1 and not has_streaming_marker,
+        "processing_strategy": strategy,
+        "finalized": finalized,
+    }
 
 
 def read_json(path: Path, default: Any) -> Any:
@@ -306,6 +392,70 @@ def sqlite_tables(conn: sqlite3.Connection) -> List[str]:
     return [row[0] for row in rows]
 
 
+def uncompress_cv_matrix(blob: Optional[bytes], expected_type: int) -> Optional[Tuple[int, int, bytes]]:
+    """Decode RTAB-Map's compressData2() payload without requiring OpenCV.
+
+    The final three native-endian int32 values contain rows, columns and the
+    OpenCV matrix type. zlib ignores those trailing values while inflating the
+    matrix bytes, matching corelib/src/Compression.cpp::uncompressData().
+    """
+    if blob is None or len(blob) < 12:
+        return None
+    rows, columns, matrix_type = struct.unpack_from("<3i", blob, len(blob) - 12)
+    if rows <= 0 or columns <= 0 or matrix_type != expected_type:
+        return None
+    element_size = 4
+    expected_size = rows * columns * element_size
+    if expected_size <= 0 or expected_size > 512 * 1024 * 1024:
+        return None
+    try:
+        payload = zlib.decompress(blob)
+    except zlib.error:
+        return None
+    if len(payload) != expected_size:
+        return None
+    return rows, columns, payload
+
+
+def extract_optimized_pose_blobs(conn: sqlite3.Connection) -> Dict[int, bytes]:
+    """Return the globally optimized graph saved in Admin.opt_poses.
+
+    Node.pose is RTAB-Map's odometry input and intentionally remains unchanged
+    after graph optimization. Admin.opt_poses is therefore the authoritative
+    trajectory for PC map assembly when it is present.
+    """
+    if "Admin" not in set(sqlite_tables(conn)):
+        return {}
+    columns = set(table_columns(conn, "Admin"))
+    if not {"opt_ids", "opt_poses"}.issubset(columns):
+        return {}
+    try:
+        rows = conn.execute(
+            "SELECT opt_ids, opt_poses FROM Admin "
+            "WHERE length(opt_ids)>0 AND length(opt_poses)>0 ORDER BY rowid DESC"
+        ).fetchall()
+    except sqlite3.Error:
+        return {}
+    for ids_blob, poses_blob in rows:
+        ids_matrix = uncompress_cv_matrix(ids_blob, CV_32S)
+        poses_matrix = uncompress_cv_matrix(poses_blob, CV_32F)
+        if ids_matrix is None or poses_matrix is None:
+            continue
+        _ids_rows, ids_columns, ids_payload = ids_matrix
+        _poses_rows, poses_columns, poses_payload = poses_matrix
+        node_ids = [value[0] for value in struct.iter_unpack("<i", ids_payload)]
+        pose_values = [value[0] for value in struct.iter_unpack("<f", poses_payload)]
+        if len(node_ids) != ids_columns or len(pose_values) != poses_columns:
+            continue
+        if len(pose_values) != len(node_ids) * 12:
+            continue
+        return {
+            int(node_id): struct.pack("<12f", *pose_values[index * 12 : (index + 1) * 12])
+            for index, node_id in enumerate(node_ids)
+        }
+    return {}
+
+
 def extract_db_poses(db_path: Path, segment_index: int, axes: str) -> Tuple[List[Pose2D], bool, List[str]]:
     poses: List[Pose2D] = []
     warnings: List[str] = []
@@ -333,10 +483,12 @@ def extract_db_poses(db_path: Path, segment_index: int, axes: str) -> Tuple[List
             warnings.append("Node table has no id/pose columns.")
             return poses, has_grid_blobs, warnings
 
+        optimized_pose_blobs = extract_optimized_pose_blobs(conn)
         stamp_expr = "stamp" if "stamp" in columns else "NULL AS stamp"
         query = f"SELECT id, pose, {stamp_expr} FROM Node ORDER BY id"
         for node_id, pose_blob, stamp in conn.execute(query):
-            parsed = parse_rtabmap_transform_3d(pose_blob, axes)
+            optimized_blob = optimized_pose_blobs.get(int(node_id))
+            parsed = parse_rtabmap_transform_3d(optimized_blob or pose_blob, axes)
             if parsed is None:
                 continue
             x, y, height, yaw = parsed
@@ -349,7 +501,14 @@ def extract_db_poses(db_path: Path, segment_index: int, axes: str) -> Tuple[List
                     yaw=yaw,
                     stamp=float(stamp) if stamp is not None else None,
                     height=height,
+                    source="db_optimized" if optimized_blob is not None else "db",
                 )
+            )
+        if optimized_pose_blobs:
+            optimized_count = sum(1 for pose in poses if pose.source == "db_optimized")
+            warnings.append(
+                f"Using {optimized_count} globally optimized poses from Admin.opt_poses "
+                f"({len(poses) - optimized_count} odometry-pose fallbacks)."
             )
     except sqlite3.Error as exc:
         warnings.append(f"SQLite read failed: {exc}")
@@ -444,7 +603,11 @@ def require_map_evidence(segments: Sequence[Segment], points: Sequence[Projected
         )
 
 
-def discover_segments(session_dir: Path, config: MapConfig) -> List[Segment]:
+def discover_segments(
+    session_dir: Path,
+    config: MapConfig,
+    database_overrides: Optional[Dict[int, Path]] = None,
+) -> List[Segment]:
     segment_dirs = sorted([p for p in session_dir.glob("segment_*") if p.is_dir()])
     segments: List[Segment] = []
     for idx, segment_dir in enumerate(segment_dirs, start=1):
@@ -457,7 +620,10 @@ def discover_segments(session_dir: Path, config: MapConfig) -> List[Segment]:
         metadata = read_json(segment_dir / "metadata.json", {})
         expected_database = segment_dir / f"rtabmap_segment_{segment_index:04d}.db"
         db_candidates = sorted(path for path in segment_dir.glob("*.db") if not path.name.startswith("."))
-        database_path = expected_database if expected_database.is_file() else (db_candidates[0] if db_candidates else None)
+        override = database_overrides.get(segment_index) if database_overrides else None
+        if override is not None and not override.is_file():
+            raise ValueError(f"Optimized database override does not exist: {override}")
+        database_path = override or (expected_database if expected_database.is_file() else (db_candidates[0] if db_candidates else None))
         poses: List[Pose2D] = []
         has_grids = False
         warnings: List[str] = []
@@ -490,6 +656,13 @@ def discover_segments(session_dir: Path, config: MapConfig) -> List[Segment]:
         metadata = read_json(session_dir / "metadata.json", {})
         tags = load_price_tags(session_dir / "price_tags.json", config.horizontal_axes)
         segments.append(Segment(1, session_dir, None, metadata if isinstance(metadata, dict) else {}, [], tags))
+
+    scan_summary = session_scan_summary(segments)
+    if scan_summary["scan_mode"] == SCAN_MODE_MIXED:
+        raise ValueError(
+            "A continuous_streaming database cannot be combined with additional segment_* directories in one session. "
+            "Remove duplicate/legacy segment directories or process them as separate sessions."
+        )
     return segments
 
 
@@ -763,25 +936,53 @@ def render_grid(
     trajectories: Sequence[Pose2D] = (),
     tags: Sequence[PriceTag] = (),
 ) -> None:
-    colors = {
-        UNKNOWN: (224, 230, 233),
-        FREE: (250, 252, 252),
-        OCCUPIED: (34, 43, 47),
-        CONFLICT: (224, 117, 52),
-    }
-    pixels = [[colors[grid.classify(ix, iy)] for ix in range(grid.width)] for iy in range(grid.height)]
+    pixels = [[GRID_COLORS[grid.classify(ix, iy)] for ix in range(grid.width)] for iy in range(grid.height)]
 
-    def paint(x: float, y: float, color: Tuple[int, int, int], radius_cells: int) -> None:
-        ix, iy = grid.cell(x, y)
+    def paint_cell(ix: int, iy: int, color: Tuple[int, int, int], radius_cells: int) -> None:
         for yy in range(iy - radius_cells, iy + radius_cells + 1):
             for xx in range(ix - radius_cells, ix + radius_cells + 1):
                 if grid.in_bounds(xx, yy):
                     pixels[yy][xx] = color
 
+    def paint_line(first: Tuple[int, int], second: Tuple[int, int], color: Tuple[int, int, int]) -> None:
+        x0, y0 = first
+        x1, y1 = second
+        dx = abs(x1 - x0)
+        sx = 1 if x0 < x1 else -1
+        dy = -abs(y1 - y0)
+        sy = 1 if y0 < y1 else -1
+        error = dx + dy
+        while True:
+            paint_cell(x0, y0, color, 1)
+            if x0 == x1 and y0 == y1:
+                break
+            doubled = 2 * error
+            if doubled >= dy:
+                error += dy
+                x0 += sx
+            if doubled <= dx:
+                error += dx
+                y0 += sy
+
+    trajectories_by_segment: Dict[int, List[Pose2D]] = defaultdict(list)
     for pose in trajectories:
-        paint(pose.x, pose.y, (35, 110, 230), 1)
+        trajectories_by_segment[pose.segment_index].append(pose)
+    for segment_poses in trajectories_by_segment.values():
+        previous_cell: Optional[Tuple[int, int]] = None
+        for pose in segment_poses:
+            current_cell = grid.cell(pose.x, pose.y)
+            if previous_cell is not None:
+                paint_line(previous_cell, current_cell, (35, 110, 230))
+            else:
+                paint_cell(*current_cell, (35, 110, 230), 1)
+            previous_cell = current_cell
     for tag in tags:
-        paint(tag.snapped_x if tag.snapped_x is not None else tag.raw_x, tag.snapped_y if tag.snapped_y is not None else tag.raw_y, (35, 170, 80), 2)
+        tag_cell = grid.cell(
+            tag.snapped_x if tag.snapped_x is not None else tag.raw_x,
+            tag.snapped_y if tag.snapped_y is not None else tag.raw_y,
+        )
+        paint_cell(*tag_cell, (18, 96, 57), 3)
+        paint_cell(*tag_cell, (65, 200, 118), 1)
 
     rows: List[bytes] = []
     for iy in range(grid.height - 1, -1, -1):
@@ -790,6 +991,111 @@ def render_grid(
             row.extend((r, g, b))
         rows.append(bytes(row))
     write_png(path, grid.width, grid.height, rows)
+
+
+def write_preview_layers(
+    path: Path,
+    grid: OccupancyGrid,
+    segments: Sequence[Segment],
+    tags: Sequence[PriceTag],
+    trajectory_point_limit: int = 100_000,
+) -> Dict[str, Any]:
+    """Write lightweight layer controls without duplicating the full grid image."""
+    segment_paths: List[Dict[str, Any]] = []
+    total_points = 0
+    raw_paths: List[Tuple[int, List[List[int]]]] = []
+    for segment in segments:
+        pixels: List[List[int]] = []
+        previous: Optional[List[int]] = None
+        for pose in segment.poses:
+            ix, iy = grid.cell(pose.x, pose.y)
+            if not grid.in_bounds(ix, iy):
+                continue
+            current = [ix, grid.height - 1 - iy]
+            if current != previous:
+                pixels.append(current)
+                previous = current
+        if pixels:
+            raw_paths.append((segment.index, pixels))
+            total_points += len(pixels)
+
+    stride = max(1, math.ceil(total_points / max(1, trajectory_point_limit)))
+    for segment_index, pixels in raw_paths:
+        sampled = pixels[::stride]
+        if sampled[-1] != pixels[-1]:
+            sampled.append(pixels[-1])
+        segment_paths.append({"segment": segment_index, "points": sampled})
+
+    tag_entries = []
+    for tag in tags:
+        x = tag.snapped_x if tag.snapped_x is not None else tag.raw_x
+        y = tag.snapped_y if tag.snapped_y is not None else tag.raw_y
+        ix, iy = grid.cell(x, y)
+        if grid.in_bounds(ix, iy):
+            tag_entries.append(
+                {
+                    "id": tag.tag_id,
+                    "pixel": [ix, grid.height - 1 - iy],
+                    "needs_review": tag.needs_review,
+                }
+            )
+
+    layers = [
+        {
+            "id": layer_id,
+            "label": label,
+            "kind": "structure_class",
+            "class_value": class_value,
+            "color": list(GRID_COLORS[class_value]),
+            "default_visible": default_visible,
+        }
+        for layer_id, label, class_value, default_visible in GRID_LAYER_DEFINITIONS
+    ]
+    layers.extend(
+        (
+            {
+                "id": "metric_grid",
+                "label": "米制网格",
+                "kind": "metric_grid",
+                "color": [92, 108, 117],
+                "default_visible": False,
+            },
+            {
+                "id": "trajectory",
+                "label": "扫描轨迹",
+                "kind": "trajectory",
+                "color": [35, 110, 230],
+                "default_visible": True,
+            },
+            {
+                "id": "price_tags",
+                "label": "价签位置/编号",
+                "kind": "price_tags",
+                "color": [35, 170, 80],
+                "default_visible": True,
+            },
+        )
+    )
+    payload = {
+        "format": "SupermarketMap2DPreviewLayers",
+        "version": 1,
+        "width": grid.width,
+        "height": grid.height,
+        "resolution_m": grid.resolution,
+        "origin": [grid.origin_x, grid.origin_y],
+        "structure_image": "occupancy_grid.png",
+        "layers": layers,
+        "trajectory": {
+            "segments": segment_paths,
+            "source_point_count": total_points,
+            "exported_point_count": sum(len(entry["points"]) for entry in segment_paths),
+            "stride": stride,
+        },
+        "price_tags": tag_entries,
+        "export_scales": [1, 2, 4],
+    }
+    path.write_text(json.dumps(payload, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+    return payload
 
 
 def write_yaml(path: Path, grid: OccupancyGrid, image_name: str) -> None:
@@ -849,6 +1155,7 @@ def extract_depth_point_cloud(
     max_depth: float = 5.0,
     max_points: int = 400000,
     frame_output_dir: Optional[Path] = None,
+    depth_projector: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """Build a bounded preview cloud from RTAB-Map RGB-D node data."""
     candidates: List[Tuple[Segment, int]] = []
@@ -859,7 +1166,7 @@ def extract_depth_point_cloud(
         if not pose_ids:
             continue
         try:
-            with sqlite3.connect(str(segment.database_path)) as conn:
+            with closing(sqlite3.connect(str(segment.database_path))) as conn:
                 tables = set(sqlite_tables(conn))
                 if "Data" not in tables:
                     continue
@@ -883,6 +1190,8 @@ def extract_depth_point_cloud(
     warnings: List[str] = []
     effective_steps: List[int] = []
     surface_frames: List[Dict[str, Any]] = []
+    gpu_projected_frames = 0
+    gpu_projection_failures = 0
     palette = [(17, 132, 141), (47, 123, 202), (147, 89, 170), (189, 106, 50), (88, 125, 53)]
 
     for database_path, rows in selected_by_database.items():
@@ -891,7 +1200,7 @@ def extract_depth_point_cloud(
         current_by_node = {pose.node_id: pose for pose in segment.poses}
         placeholders = ",".join("?" for _ in selected_ids)
         try:
-            with sqlite3.connect(str(database_path)) as conn:
+            with closing(sqlite3.connect(str(database_path))) as conn:
                 data_columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(Data)")}
                 image_expression = "d.image" if "image" in data_columns else "NULL"
                 query = (
@@ -948,21 +1257,56 @@ def extract_depth_point_cloud(
             frame_vertices: List[List[float]] = []
             frame_uv: List[List[float]] = []
             frame_depths: List[float] = []
+            projected_grid = None
+            if depth_projector is not None:
+                try:
+                    projected_grid = depth_projector.project(
+                        depths=depths,
+                        width=depth_width,
+                        height=depth_height,
+                        step=effective_step,
+                        horizontal_axes=horizontal_axes,
+                        max_depth=max_depth,
+                        fx=fx,
+                        fy=fy,
+                        cx=cx,
+                        cy=cy,
+                        correction_dx=correction_dx,
+                        correction_dy=correction_dy,
+                        correction_yaw=correction_yaw,
+                        local_transform=calibration.local_transform,
+                        raw_transform=raw_matrix,
+                    )
+                    if projected_grid is not None:
+                        gpu_projected_frames += 1
+                except Exception as exc:
+                    gpu_projection_failures += 1
+                    projected_grid = None
+                    if len(warnings) < 8:
+                        warnings.append(
+                            f"segment_{segment.index:04d} node {node_id}: GPU projection failed, using CPU: {exc}"
+                        )
             for row in range(0, depth_height, effective_step):
                 for column in range(0, depth_width, effective_step):
                     depth = depths[row * depth_width + column]
                     if not math.isfinite(depth) or depth <= 0.05 or depth > max_depth:
                         continue
-                    camera_point = ((column - cx) * depth / fx, (row - cy) * depth / fy, depth)
-                    local_point = transform_xyz(calibration.local_transform, camera_point)
-                    native_world = transform_xyz(raw_matrix, local_point)
-                    if horizontal_axes == "xz":
-                        point_x, point_y, point_height = -native_world[1], -native_world[0], native_world[2]
+                    cell_index = (row // effective_step) * grid_width + (column // effective_step)
+                    if projected_grid is not None:
+                        point_x, point_y, point_height, projected_depth = projected_grid[cell_index]
+                        if not all(math.isfinite(value) for value in (point_x, point_y, point_height, projected_depth)):
+                            continue
                     else:
-                        point_x, point_y, point_height = native_world
-                    point_x, point_y = transform_point(
-                        point_x, point_y, correction_dx, correction_dy, correction_yaw
-                    )
+                        camera_point = ((column - cx) * depth / fx, (row - cy) * depth / fy, depth)
+                        local_point = transform_xyz(calibration.local_transform, camera_point)
+                        native_world = transform_xyz(raw_matrix, local_point)
+                        if horizontal_axes == "xz":
+                            point_x, point_y, point_height = -native_world[1], -native_world[0], native_world[2]
+                        else:
+                            point_x, point_y, point_height = native_world
+                        point_x, point_y = transform_point(
+                            point_x, point_y, correction_dx, correction_dy, correction_yaw
+                        )
                     depth_shade = 0.72 + 0.28 * (1.0 - min(1.0, depth / max_depth))
                     height_shade = 0.82 + 0.18 * max(0.0, min(1.0, point_height / 3.0))
                     shade = depth_shade * height_shade
@@ -971,7 +1315,7 @@ def extract_depth_point_cloud(
                         [round(point_x, 3), round(point_y, 3), round(point_height, 3), *color, segment.index]
                     )
                     local_index = len(frame_vertices)
-                    grid_indices[(row // effective_step) * grid_width + (column // effective_step)] = local_index
+                    grid_indices[cell_index] = local_index
                     frame_vertices.append([round(point_x, 3), round(point_y, 3), round(point_height, 3)])
                     frame_uv.append(
                         [
@@ -1044,6 +1388,9 @@ def extract_depth_point_cloud(
         "surface_frames": surface_frames,
         "surface_frame_count": len(surface_frames),
         "surface_triangle_count": sum(frame["triangles"] for frame in surface_frames),
+        "gpu_projection_backend": getattr(depth_projector, "backend", "cpu") if depth_projector else "cpu",
+        "gpu_projected_frames": gpu_projected_frames,
+        "gpu_projection_failures": gpu_projection_failures,
         "warnings": warnings,
     }
 
@@ -1091,7 +1438,7 @@ def write_preview_3d(
     points: Sequence[ProjectedPoint],
     tags: Sequence[PriceTag],
     horizontal_axes: str,
-    quality: str = "detailed",
+    quality: str = DEFAULT_PREVIEW_3D_QUALITY,
     point_cloud: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Write a compact, renderer-neutral 3D preview for the local UI."""
@@ -1119,7 +1466,7 @@ def write_preview_3d(
         sampled_points = sampled_points[::stride]
 
     if point_cloud is None:
-        profile = PREVIEW_3D_PROFILES.get(quality, PREVIEW_3D_PROFILES["detailed"])
+        profile = PREVIEW_3D_PROFILES.get(quality, PREVIEW_3D_PROFILES[DEFAULT_PREVIEW_3D_QUALITY])
         point_cloud = extract_depth_point_cloud(
             segments,
             horizontal_axes,
@@ -1253,6 +1600,41 @@ def quality_report(
     depth_surface_segments = {point.segment_index for point in points if point.kind == "depth_surface"}
     for segment in segments:
         warnings.extend([f"segment_{segment.index:04d}: {w}" for w in segment.sqlite_warnings])
+        capture_health = segment.metadata.get("captureHealth") or segment.metadata.get("capture_health")
+        if isinstance(capture_health, dict):
+            sensor_count = int(capture_health.get("sensorPoseCount") or 0)
+            normal_count = int(capture_health.get("normalTrackingPoseCount") or 0)
+            degraded_ratio = (sensor_count - normal_count) / max(1, sensor_count)
+            longest_gap = float(capture_health.get("longestSensorGapSeconds") or 0.0)
+            if sensor_count and degraded_ratio > 0.10:
+                warnings.append(
+                    f"segment_{segment.index:04d}: ARKit tracking was degraded for "
+                    f"{degraded_ratio * 100:.1f}% of recorded sensor poses; inspect this route for drift."
+                )
+            if longest_gap > 0.5:
+                warnings.append(
+                    f"segment_{segment.index:04d}: longest ARKit sensor-pose gap was {longest_gap:.2f}s."
+                )
+            evaluated_frames = int(capture_health.get("evaluatedMappingFrameCount") or 0)
+            rejected_frames = int(capture_health.get("rejectedMappingFrameCount") or 0)
+            rejected_ratio = rejected_frames / max(1, evaluated_frames)
+            if evaluated_frames and rejected_ratio > 0.15:
+                warnings.append(
+                    f"segment_{segment.index:04d}: software pose quality gating rejected "
+                    f"{rejected_ratio * 100:.1f}% of mapping frames; inspect low-texture or fast-motion areas."
+                )
+            compensation_count = int(capture_health.get("poseDiscontinuityCompensationCount") or 0)
+            if compensation_count:
+                warnings.append(
+                    f"segment_{segment.index:04d}: {compensation_count} implausible ARKit pose "
+                    "discontinuities were removed before entering the map graph."
+                )
+            low_feature_frames = int(capture_health.get("lowVisualFeatureFrameCount") or 0)
+            if evaluated_frames and low_feature_frames / evaluated_frames > 0.25:
+                warnings.append(
+                    f"segment_{segment.index:04d}: more than 25% of evaluated frames had fewer "
+                    "than 50 ARKit visual features."
+                )
         if not segment.poses:
             warnings.append(f"segment_{segment.index:04d}: no db poses available")
         if segment.has_local_grid_blobs and segment.index not in depth_surface_segments:
@@ -1266,6 +1648,7 @@ def quality_report(
     return {
         "session": str(session_dir),
         "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "input_scan": session_scan_summary(segments),
         "segments": [
             {
                 "index": segment.index,
@@ -1274,6 +1657,8 @@ def quality_report(
                 "node_count": len(segment.poses),
                 "price_tag_count": len(segment.price_tags),
                 "has_local_grid_blobs": segment.has_local_grid_blobs,
+                "scan_mode": metadata_scan_mode(segment.metadata),
+                "capture_health": segment.metadata.get("captureHealth") or segment.metadata.get("capture_health"),
             }
             for segment in segments
         ],
@@ -1302,7 +1687,11 @@ def source_manifest(session_dir: Path, segments: Sequence[Segment], extra_inputs
         for path in [segment.directory / "metadata.json", segment.directory / "price_tags.json", segment.database_path]:
             if path and path.exists():
                 files.append({"path": str(path), "sha256": sha256_file(path)})
-    return {"session": str(session_dir), "files": files}
+    return {
+        "session": str(session_dir),
+        "input_scan": session_scan_summary(segments),
+        "files": files,
+    }
 
 
 def write_review_items(path: Path, report: Dict[str, Any], tags: Sequence[PriceTag]) -> None:
@@ -1339,7 +1728,17 @@ def generate(args: argparse.Namespace) -> Path:
         auto_align_segments=args.auto_align_segments,
     )
 
-    segments = discover_segments(session_dir, config)
+    raw_overrides = getattr(args, "database_overrides", None) or {}
+    database_overrides = {
+        int(index): Path(path).resolve()
+        for index, path in raw_overrides.items()
+    }
+    segments = discover_segments(session_dir, config, database_overrides)
+    input_scan = session_scan_summary(segments)
+    if input_scan["scan_mode"] == SCAN_MODE_CONTINUOUS_STREAMING:
+        # The graph is already continuous. Segment-boundary alignment would
+        # be both unnecessary and conceptually wrong for this input mode.
+        config.auto_align_segments = False
     point_paths = [Path(p).resolve() for p in args.points_csv]
     point_paths.extend(sorted(session_dir.glob("segment_*/points.csv")))
     point_paths.extend(sorted(session_dir.glob("points.csv")))
@@ -1348,12 +1747,15 @@ def generate(args: argparse.Namespace) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
     transforms = apply_segment_transforms(segments, points, Path(args.corrections).resolve() if args.corrections else None, config.auto_align_segments)
 
-    preview_3d_quality = getattr(args, "preview_3d_quality", "detailed")
-    preview_profile = PREVIEW_3D_PROFILES.get(preview_3d_quality, PREVIEW_3D_PROFILES["detailed"])
+    preview_3d_quality = getattr(args, "preview_3d_quality", DEFAULT_PREVIEW_3D_QUALITY)
+    preview_profile = PREVIEW_3D_PROFILES.get(
+        preview_3d_quality, PREVIEW_3D_PROFILES[DEFAULT_PREVIEW_3D_QUALITY]
+    )
     point_cloud = extract_depth_point_cloud(
         segments,
         config.horizontal_axes,
         frame_output_dir=output_dir / "preview_frames",
+        depth_projector=getattr(args, "depth_projector", None),
         **preview_profile,
     )
     points.extend(projected_depth_surface_points(point_cloud, config.resolution))
@@ -1365,6 +1767,7 @@ def generate(args: argparse.Namespace) -> Path:
 
     render_grid(grid, output_dir / "occupancy_grid.png")
     render_grid(grid, output_dir / "preview.png", trajectories=poses, tags=tags)
+    write_preview_layers(output_dir / "preview_layers.json", grid, segments, tags)
     write_yaml(output_dir / "occupancy_grid.yaml", grid, "occupancy_grid.png")
     write_geojson(output_dir / "trajectory.geojson", trajectory_geojson(segments))
     write_geojson(output_dir / "price_tags.geojson", price_tags_geojson(tags))
@@ -1393,6 +1796,7 @@ def generate(args: argparse.Namespace) -> Path:
         "version": 1,
         "session": str(session_dir),
         "generated_at": report["generated_at"],
+        "input_scan": input_scan,
         "coordinate_frame": {
             "name": "map_2d",
             "horizontal_axes": config.horizontal_axes,
@@ -1410,6 +1814,7 @@ def generate(args: argparse.Namespace) -> Path:
             "trajectory.geojson",
             "quality_report.json",
             "preview.png",
+            "preview_layers.json",
             "preview_3d.json",
             "preview_frames/",
             "review_items.json",
@@ -1436,7 +1841,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--preview-3d-quality",
         choices=sorted(PREVIEW_3D_PROFILES),
-        default="detailed",
+        default=DEFAULT_PREVIEW_3D_QUALITY,
         help="RGB-D surface preview sampling quality.",
     )
     parser.add_argument("--occupied-inflate-radius", type=float, default=0.08, help="Inflation radius for projected occupied points.")

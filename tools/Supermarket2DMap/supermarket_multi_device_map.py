@@ -71,6 +71,14 @@ def load_inputs(args: argparse.Namespace) -> Tuple[List[Dict[str, Any]], Dict[st
             stage_config_path = Path(str(stage_config)) if stage_config else None
             if stage_config_path and not stage_config_path.is_absolute():
                 stage_config_path = (config_base / stage_config_path).resolve()
+            raw_overrides = raw.get("database_overrides", {})
+            database_overrides: Dict[int, Path] = {}
+            if isinstance(raw_overrides, dict):
+                for index, value in raw_overrides.items():
+                    override = Path(str(value))
+                    if not override.is_absolute():
+                        override = (config_base / override).resolve()
+                    database_overrides[int(index)] = override
             devices.append(
                 {
                     "id": str(raw.get("id") or device_id_from_session(session)),
@@ -79,6 +87,7 @@ def load_inputs(args: argparse.Namespace) -> Tuple[List[Dict[str, Any]], Dict[st
                     "has_explicit_transform": isinstance(raw.get("transform"), dict),
                     "stage_config": stage_config_path,
                     "points_csv": resolve_path_list(raw.get("points_csv"), config_base),
+                    "database_overrides": database_overrides,
                     "raw": raw,
                 }
             )
@@ -93,6 +102,7 @@ def load_inputs(args: argparse.Namespace) -> Tuple[List[Dict[str, Any]], Dict[st
                 "has_explicit_transform": False,
                 "stage_config": None,
                 "points_csv": [],
+                "database_overrides": {},
                 "raw": {},
             }
         )
@@ -208,7 +218,12 @@ def generate(args: argparse.Namespace) -> Path:
 
     device_states: List[Dict[str, Any]] = []
     for device in devices:
-        segments = base.discover_segments(device["session"], config)
+        segments = base.discover_segments(
+            device["session"],
+            config,
+            device.get("database_overrides") or None,
+        )
+        input_scan = base.session_scan_summary(segments)
         stages, stage_by_segment, stage_transforms, segment_transforms, stage_config = staged.load_stage_config(device.get("stage_config"), segments)
         point_paths = list(device.get("points_csv", []))
         point_paths.extend(sorted(device["session"].glob("segment_*/points.csv")))
@@ -220,6 +235,7 @@ def generate(args: argparse.Namespace) -> Path:
             {
                 "id": device["id"],
                 "session": device["session"],
+                "input_scan": input_scan,
                 "segments": segments,
                 "points": points,
                 "stage_report": stage_report,
@@ -255,14 +271,15 @@ def generate(args: argparse.Namespace) -> Path:
     base.require_map_evidence(all_segments, all_points)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    preview_3d_quality = getattr(args, "preview_3d_quality", "detailed")
+    preview_3d_quality = getattr(args, "preview_3d_quality", base.DEFAULT_PREVIEW_3D_QUALITY)
     preview_profile = base.PREVIEW_3D_PROFILES.get(
-        preview_3d_quality, base.PREVIEW_3D_PROFILES["detailed"]
+        preview_3d_quality, base.PREVIEW_3D_PROFILES[base.DEFAULT_PREVIEW_3D_QUALITY]
     )
     point_cloud = base.extract_depth_point_cloud(
         all_segments,
         config.horizontal_axes,
         frame_output_dir=output_dir / "preview_frames",
+        depth_projector=getattr(args, "depth_projector", None),
         **preview_profile,
     )
     depth_surface_points = base.projected_depth_surface_points(point_cloud, config.resolution)
@@ -288,6 +305,7 @@ def generate(args: argparse.Namespace) -> Path:
 
     base.render_grid(grid, output_dir / "occupancy_grid.png")
     base.render_grid(grid, output_dir / "preview.png", trajectories=poses, tags=tags)
+    base.write_preview_layers(output_dir / "preview_layers.json", grid, all_segments, tags)
     base.write_yaml(output_dir / "occupancy_grid.yaml", grid, "occupancy_grid.png")
     base.write_geojson(output_dir / "trajectory.geojson", base.trajectory_geojson(all_segments))
     base.write_geojson(output_dir / "price_tags.geojson", base.price_tags_geojson(tags))
@@ -304,6 +322,14 @@ def generate(args: argparse.Namespace) -> Path:
     (output_dir / "semantic_layers.json").write_text(json.dumps(base.semantic_layers(grid), ensure_ascii=False, indent=2), encoding="utf-8")
 
     report = base.quality_report(output_dir, all_segments, all_points, tags, grid, {})
+    report["input_scan"] = {
+        "scan_mode": "multi_device",
+        "device_count": len(device_states),
+        "device_scan_modes": {
+            state["id"]: state["input_scan"]["scan_mode"] for state in device_states
+        },
+        "processing_strategy": "device_level_alignment",
+    }
     report["preview_3d"] = preview_3d_summary
     multi_warnings: List[Dict[str, Any]] = []
     if len(device_states) < 2:
@@ -333,6 +359,7 @@ def generate(args: argparse.Namespace) -> Path:
                 "session": str(state["session"]),
                 "alignment_mode": state["alignment_mode"],
                 "device_transform": staged.transform_to_json(state["device_transform"]),
+                "input_scan": state["input_scan"],
                 "stage_count": len(state["stage_report"]["stages"]),
                 "segment_count": len(state["segments"]),
                 "node_count": sum(len(segment.poses) for segment in state["segments"]),
@@ -373,6 +400,7 @@ def generate(args: argparse.Namespace) -> Path:
         "format": "SupermarketMultiDeviceMap2D",
         "version": 1,
         "generated_at": report["generated_at"],
+        "input_scan": report["input_scan"],
         "coordinate_frame": {
             "name": "map_2d",
             "horizontal_axes": config.horizontal_axes,
@@ -385,6 +413,7 @@ def generate(args: argparse.Namespace) -> Path:
             "occupancy_grid.png",
             "occupancy_grid.yaml",
             "preview.png",
+            "preview_layers.json",
             "preview_3d.json",
             "preview_frames/",
             "trajectory.geojson",
@@ -419,7 +448,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--preview-3d-quality",
         choices=sorted(base.PREVIEW_3D_PROFILES),
-        default="detailed",
+        default=base.DEFAULT_PREVIEW_3D_QUALITY,
         help="RGB-D surface preview sampling quality.",
     )
     parser.add_argument("--occupied-inflate-radius", type=float, default=0.08, help="Inflation radius for projected occupied points.")

@@ -10,6 +10,7 @@ import ARKit
 import Zip
 import StoreKit
 import UniformTypeIdentifiers
+import simd
 
 extension Array {
     func size() -> Int {
@@ -50,23 +51,15 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
     private var mReviewRequested = false
     
     private var mMaximumMemory: Int = 0
-    private var mSegmentStartUsedMemoryMB: Int = 0
     private var mLatestDatabaseMemoryMB: Int = 0
+    private var mLatestScanStorageBytes: UInt64 = 0
     private var mLatestPose = (x: Float(0), y: Float(0), z: Float(0), roll: Float(0), pitch: Float(0), yaw: Float(0))
-    private var mAutoSegmentExportEnabled = true
-    private let supermarketAreaThresholdKey = "SupermarketAreaThresholdM2"
-    private let supermarketDatabaseThresholdKey = "SupermarketDatabaseThresholdMB"
-    private let supermarketMemoryThresholdKey = "SupermarketUsedMemoryThresholdMB"
-    private let supermarketMinimumNodesKey = "SupermarketMinimumNodesBeforeRollover"
-    private let supermarketAutoSegmentKey = "SupermarketAutoSegmentExportEnabled"
+    private let supermarketStreamingMemoryNodesKey = "SupermarketStreamingMemoryNodes"
     private let supermarketSaveLocationBookmarkKey = "SupermarketSaveLocationBookmark"
     private let supermarketSaveLocationNameKey = "SupermarketSaveLocationName"
     private let supermarketDefaultsVersionKey = "SupermarketDefaultsVersion"
-    private let supermarketDefaultAreaThresholdM2 = 120.0
-    private let supermarketDefaultDatabaseThresholdMB = 700
-    private let supermarketDefaultMemoryThresholdMB = 1200
-    private let supermarketDefaultMinimumNodes = 30
-    private let supermarketDefaultsVersion = 2
+    private let supermarketDefaultStreamingMemoryNodes = 300
+    private let supermarketDefaultsVersion = 4
     
     // UI states
     private enum State {
@@ -81,6 +74,11 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         STATE_VISUALIZING_AND_MEASURING    // Camera/Motion on  - Showing optimized mesh without localizing and measuring tools enabled
     }
     private var mState: State = State.STATE_WELCOME;
+    private var mCaptureStateBeforeSystemInterruption: State?
+    private var mSystemInterruptionInProgress = false
+    private var mSystemInterruptionRequiresTrackingReset = false
+    private var mSystemInterruptionBeganAt: Date?
+    private var mSystemInterruptionReason = ""
     private func localized(_ key: String) -> String {
         return NSLocalizedString(key, comment: "")
     }
@@ -126,7 +124,20 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
     private var mHudVisible: Bool = true
     private var mLastTimeHudShown: DispatchTime = .now()
     private var mMenuOpened: Bool = false
-    private var lowMemoryWarningShown: Bool = false
+    private var mLastStreamingCheckpointAt: TimeInterval = 0
+    private var mStreamingCheckpointInFlight = false
+    private var mStreamingDiskWarningShown = false
+    private var mStreamingCriticalStopRequested = false
+    private var mStreamingThermalWarningShown = false
+    private var mStreamingMemoryPressureLevel = 0
+    private var mLastLoggedTrackingState = ""
+    private var mARPoseCorrection = matrix_identity_float4x4
+    private var mLastAcceptedARPose: simd_float4x4?
+    private var mLastAcceptedARTimestamp: TimeInterval?
+    private var mTrackingWasDegraded = true
+    private var mConsecutiveNormalTrackingFrames = 0
+    private var mLastTrackingGuidanceAt: TimeInterval = 0
+    private let mRequiredNormalFramesAfterTrackingRecovery = 6
     static var previewImages: [String: UIImage] = [:]
     private var measuringMode: Int = 0
     private var visualizationType: Int = 0 // 0=Cloud, 1=Mesh, 2=Texture Mesh
@@ -284,7 +295,9 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         
         let notificationCenter = NotificationCenter.default
         notificationCenter.addObserver(self, selector: #selector(appMovedToBackground), name: UIApplication.willResignActiveNotification, object: nil)
-        notificationCenter.addObserver(self, selector: #selector(appMovedToForeground), name: UIApplication.willEnterForegroundNotification, object: nil)
+        // didBecomeActive also covers short interruptions (Control Center,
+        // notification shade, Siri, NFC UI) which never enter the background.
+        notificationCenter.addObserver(self, selector: #selector(appMovedToForeground), name: UIApplication.didBecomeActiveNotification, object: nil)
         notificationCenter.addObserver(self, selector: #selector(defaultsChanged), name: UserDefaults.didChangeNotification, object: nil)
         
         registerSettingsBundle()
@@ -423,7 +436,7 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
     {
         let availableMem = self.getAvailableMemory()
         let usedMem = max(0, self.mMaximumMemory - availableMem)
-        let segmentUsedMem = max(0, usedMem - self.mSegmentStartUsedMemoryMB)
+        let scanStorageBytes = currentContinuousScanStorageBytes()
         
         if(loopClosureId > 0)
         {
@@ -432,12 +445,19 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         let previousNodes = mMapNodes
         mMapNodes = nodes;
         mLatestDatabaseMemoryMB = databaseMemoryUsed
+        mLatestScanStorageBytes = scanStorageBytes
         mLatestPose = (x, y, z, roll, pitch, yaw)
         let estimatedArea = (self.mState == .STATE_MAPPING) ? (supermarketSession?.updateArea(timestamp: Date().timeIntervalSince1970, nodeCount: nodes, x: x, y: y, z: z, roll: roll, pitch: pitch, yaw: yaw) ?? 0.0) : (supermarketSession?.currentAreaM2 ?? 0.0)
         
         let formattedDate = Date().getFormattedDate(format: "HH:mm:ss.SSS")
         
         DispatchQueue.main.async {
+            if self.mState == .STATE_MAPPING {
+                self.updateStreamingCaptureHealth(
+                    nodeCount: nodes,
+                    databaseMemoryMB: databaseMemoryUsed,
+                    usedMemoryMB: usedMem)
+            }
             
             if(self.mMapNodes>0 && previousNodes==0 && self.mState != .STATE_MAPPING)
             {
@@ -450,9 +470,8 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                     self.statusLabel.text! +
                     String(format: self.localized("Status: %@\n"), self.getStateString(state: self.mState)) +
                     String(format: self.localized("RAM Usage (MB): %d / %d"), usedMem, self.mMaximumMemory) +
-                    String(format: self.localized("\nSegment RAM Growth (MB): %d"), segmentUsedMem) +
-                    String(format: self.localized("\nScanned Area: %.1f m2"), estimatedArea) +
-                    String(format: self.localized("\nSegment: %d"), self.supermarketSession?.segmentIndex ?? 0)
+                    String(format: self.localized("\nScan Storage: %@"), self.formattedStorageSize(scanStorageBytes)) +
+                    String(format: self.localized("\nScanned Area: %.1f m2"), estimatedArea)
             }
             if self.debugShown {
                 self.statusLabel.text =
@@ -510,6 +529,12 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
             if(self.mState == .STATE_MAPPING || self.mState == .STATE_VISUALIZING_CAMERA)
             {
                 if(loopClosureId > 0) {
+                    if self.mState == .STATE_MAPPING {
+                        self.supermarketSession?.appendScanEvent(
+                            event: "loop_closure",
+                            message: "Loop closure detected",
+                            fields: ["loopClosureId": "\(loopClosureId)", "nodeCount": "\(nodes)", "inliers": "\(inliers)"])
+                    }
                     if(self.mState == .STATE_VISUALIZING_CAMERA) {
                         self.showToast(message: self.localized("Localized!"), seconds: 1);
                     }
@@ -519,6 +544,13 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                 }
                 else if(rejected > 0)
                 {
+                    if self.mState == .STATE_MAPPING {
+                        self.supermarketSession?.appendScanEvent(
+                            level: "warning",
+                            event: "loop_closure_rejected",
+                            message: "Loop closure candidate was rejected",
+                            fields: ["nodeCount": "\(nodes)", "inliers": "\(inliers)", "matches": "\(matches)", "optimizationMaxError": "\(optimizationMaxError)"])
+                    }
                     if(inliers >= UserDefaults.standard.integer(forKey: "MinInliers"))
                     {
                         if(optimizationMaxError > 0.0)
@@ -536,51 +568,13 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                     }
                 }
                 else if(landmarkDetected > 0) {
+                    if self.mState == .STATE_MAPPING {
+                        self.supermarketSession?.appendScanEvent(
+                            event: "landmark_detected",
+                            message: "Landmark detected",
+                            fields: ["landmarkId": "\(landmarkDetected)", "nodeCount": "\(nodes)"])
+                    }
                     self.showToast(message: String(format: self.localized("Landmark %d detected!"), landmarkDetected), seconds: 1);
-                }
-            }
-            if(self.mState == .STATE_MAPPING)
-            {
-                if let session = self.supermarketSession,
-                   self.mAutoSegmentExportEnabled,
-                   let reason = session.rolloverReason(nodes: nodes, databaseMemoryMB: databaseMemoryUsed, usedMemoryMB: segmentUsedMem) {
-                    self.rolloverCurrentSegment(reason: reason)
-                    return
-                }
-
-                if(availableMem < 400)
-                {
-                    let msg = "Scanning will be stopped because the free memory is too "
-                    + "low (\(availableMem) MB). You should be able to save the database but some post-processing and exporting options may fail. "
-                    + "\n\nNote that for large environments, you can save multiple databases and "
-                    + "merge them with RTAB-Map Desktop version."
-                    let alert = UIAlertController(title: "Memory is full!", message: msg, preferredStyle: .alert)
-                    let alertActionYes = UIAlertAction(title: "Ok", style: .default) {
-                        (UIAlertAction) -> Void in
-                        self.stopMapping(ignoreSaving: false, offerPostProcessing: false);
-                    }
-                    alert.addAction(alertActionYes)
-                    self.present(alert, animated: true, completion: nil)
-                }
-                else if(!self.lowMemoryWarningShown && usedMem*3 > availableMem && !self.mDataRecording)
-                {
-                    self.lowMemoryWarningShown = true
-                    let msg = "Available memory (\(availableMem) MB) should be at least 3 times the "
-                    + "memory used (\(usedMem) MB) so that some post-processing and exporting options "
-                    + "have enough memory to work correctly. If you just want to save the database "
-                    + "after scanning, you can continue until the next warning.\n\n"
-                    + "Note that showing only point clouds and/or decrease density reduce memory needed for rendering."
-                    let alert = UIAlertController(title: "Memory is full!", message: msg, preferredStyle: .alert)
-                    let alertActionYes = UIAlertAction(title: "Stop Now", style: .default) {
-                        (UIAlertAction) -> Void in
-                        self.stopMapping(ignoreSaving: false);
-                    }
-                    alert.addAction(alertActionYes)
-                    let alertActionNo = UIAlertAction(title: "Continue", style: .cancel) {
-                        (UIAlertAction) -> Void in
-                    }
-                    alert.addAction(alertActionNo)
-                    self.present(alert, animated: true, completion: nil)
                 }
             }
         }
@@ -602,31 +596,114 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
     
     @objc func appMovedToBackground() {
         print("appMovedToBackground()")
-        if(mState == .STATE_VISUALIZING_CAMERA || mState == .STATE_VISUALIZING_AND_MEASURING || mState == .STATE_MAPPING || mState == .STATE_CAMERA)
-        {
+        if mState == .STATE_MAPPING || mState == .STATE_CAMERA {
+            suspendCaptureForSystemInterruption(reason: "application resigned active")
+        }
+        else if mState == .STATE_VISUALIZING_CAMERA || mState == .STATE_VISUALIZING_AND_MEASURING {
             stopMapping(ignoreSaving: true)
         }
+    }
+
+    private func suspendCaptureForSystemInterruption(reason: String)
+    {
+        guard !mSystemInterruptionInProgress,
+              mState == .STATE_MAPPING || mState == .STATE_CAMERA else {
+            return
+        }
+
+        mSystemInterruptionInProgress = true
+        mCaptureStateBeforeSystemInterruption = mState
+        mSystemInterruptionBeganAt = Date()
+        mSystemInterruptionReason = reason
+        mTrackingWasDegraded = true
+        mConsecutiveNormalTrackingFrames = 0
+        supermarketSession?.appendScanEvent(
+            level: "warning",
+            event: "system_interruption_started",
+            message: "Capture suspended without ending the scan",
+            fields: ["reason": reason, "state": getStateString(state: mState)])
+
+        // Keep the database open and preserve the CameraMobile origin. Only
+        // the producers are paused, so no save/finalize or map boundary is
+        // introduced by a temporary iOS interruption.
+        session.pause()
+        locationManager?.stopUpdatingLocation()
+        rtabmap?.setPausedMapping(paused: true)
+        rtabmap?.setPreserveCameraOrigin(enabled: true)
+        rtabmap?.stopCamera()
+        print("Capture suspended without ending scan: \(reason)")
+    }
+
+    @discardableResult
+    private func resumeCaptureAfterSystemInterruption(resetTracking: Bool = false) -> Bool
+    {
+        guard UIApplication.shared.applicationState == .active,
+              mSystemInterruptionInProgress,
+              let previousState = mCaptureStateBeforeSystemInterruption else {
+            return false
+        }
+
+        let shouldResetTracking = resetTracking || mSystemInterruptionRequiresTrackingReset
+        let interruptionSeconds = Date().timeIntervalSince(mSystemInterruptionBeganAt ?? Date())
+        let interruptionReason = mSystemInterruptionReason
+
+        // Recreate CameraMobile with its saved origin before restarting the
+        // RTAB-Map worker. triggerNewMap=false is essential: the next frame is
+        // appended to the same trajectory instead of creating a fake segment.
+        guard startCamera(resetTracking: shouldResetTracking) else {
+            showToast(
+                message: localized("The camera could not resume. The active scan remains open; return to the app to retry or use Stop to save it."),
+                seconds: 5)
+            return false
+        }
+        if previousState == .STATE_MAPPING {
+            rtabmap?.setPausedMapping(paused: false, triggerNewMap: false)
+            updateState(state: .STATE_MAPPING)
+        }
+        else {
+            updateState(state: .STATE_CAMERA)
+        }
+        rtabmap?.setPreserveCameraOrigin(enabled: false)
+
+        mSystemInterruptionInProgress = false
+        mCaptureStateBeforeSystemInterruption = nil
+        mSystemInterruptionRequiresTrackingReset = false
+        mSystemInterruptionBeganAt = nil
+        mSystemInterruptionReason = ""
+
+        supermarketSession?.appendScanEvent(
+            event: "system_interruption_ended",
+            message: "Capture resumed on the same continuous trajectory",
+            fields: [
+                "reason": interruptionReason,
+                "durationSeconds": String(format: "%.3f", interruptionSeconds),
+                "resetTracking": shouldResetTracking ? "true" : "false"
+            ])
+
+        print(String(format: "Capture resumed after %.2fs (%@), resetTracking=%@",
+                     interruptionSeconds, interruptionReason, shouldResetTracking ? "true" : "false"))
+        showToast(
+            message: shouldResetTracking ?
+                localized("System interruption ended. Scanning resumed; move slowly until tracking stabilizes.") :
+                localized("Scanning resumed automatically after a temporary interruption."),
+            seconds: 4)
+        return true
+    }
+
+    private func cancelAutomaticCaptureResume()
+    {
+        mSystemInterruptionInProgress = false
+        mCaptureStateBeforeSystemInterruption = nil
+        mSystemInterruptionRequiresTrackingReset = false
+        mSystemInterruptionBeganAt = nil
+        mSystemInterruptionReason = ""
     }
     
     @objc func appMovedToForeground() {
         print("appMovedToForeground()")
         updateDisplayFromDefaults()
-        updateState(state: mState)
-        
-        if(mMapNodes > 0 && self.openedDatabasePath == nil)
-        {
-            let msg = "RTAB-Map has been pushed to background while mapping. Do you want to save the map now?"
-            let alert = UIAlertController(title: mDataRecording ? "Data Recording Stopped" : "Mapping Stopped!", message: msg, preferredStyle: .alert)
-            let alertActionNo = UIAlertAction(title: "Ignore", style: .cancel) {
-                (UIAlertAction) -> Void in
-            }
-            alert.addAction(alertActionNo)
-            let alertActionYes = UIAlertAction(title: "Yes", style: .default) {
-                (UIAlertAction) -> Void in
-                self.save()
-            }
-            alert.addAction(alertActionYes)
-            self.present(alert, animated: true, completion: nil)
+        if !resumeCaptureAfterSystemInterruption() {
+            updateState(state: mState)
         }
     }
     
@@ -650,12 +727,16 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         rtabmap!.setCamera(type: type);
     }
     
-    func startCamera(resetTracking: Bool = true)
+    @discardableResult
+    func startCamera(resetTracking: Bool = true, runARSession: Bool = true) -> Bool
     {
         switch AVCaptureDevice.authorizationStatus(for: .video) {
             case .authorized: // The user has previously granted access to the camera.
                 print("Start Camera")
-            	rtabmap!.startCamera()
+                guard rtabmap?.startCamera() == true else {
+                    print("Could not start native CameraMobile")
+                    return false
+                }
                 let configuration = ARWorldTrackingConfiguration()
                 var message = ""
             	if(mState != .STATE_VISUALIZING_AND_MEASURING)
@@ -676,8 +757,10 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                 	}
             	}
                 
-                let runOptions: ARSession.RunOptions = resetTracking ? [.resetSceneReconstruction, .resetTracking, .removeExistingAnchors] : []
-                session.run(configuration, options: runOptions)
+                if runARSession {
+                    let runOptions: ARSession.RunOptions = resetTracking ? [.resetSceneReconstruction, .resetTracking, .removeExistingAnchors] : []
+                    session.run(configuration, options: runOptions)
+                }
                 
                 switch mState {
                 case .STATE_VISUALIZING_AND_MEASURING,
@@ -696,6 +779,7 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                     alertController.addAction(okAction)
                     present(alertController, animated: true)
                 }
+                return true
             
             case .notDetermined: // The user has not yet been asked for camera access.
                 AVCaptureDevice.requestAccess(for: .video) { granted in
@@ -705,6 +789,7 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                         }
                     }
                 }
+                return false
             
         default:
             let alertController = UIAlertController(title: "Camera Disabled", message: "Camera permission is required to start the camera. You can enable it in Settings.", preferredStyle: .alert)
@@ -726,6 +811,7 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
             alertController.addAction(okAction)
             
             present(alertController, animated: true)
+            return false
         }
     }
     
@@ -770,8 +856,10 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
             addMeasureButton.isHidden = true
             removeMeasureButton.isHidden = true
             measuringModeButton.isHidden = true
-            actionNewScanEnabled = !mDataRecording
-            actionNewDataRecording = mDataRecording
+            // While capture is active, only the dedicated Stop button may end
+            // or replace the current scan.
+            actionNewScanEnabled = false
+            actionNewDataRecording = false
             actionSaveEnabled = false
             actionResumeEnabled = false
             actionExportEnabled = false
@@ -1003,26 +1091,11 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         ])
                 
         var fileMenuChildren: [UIMenuElement] = []
-        let savedSegmentCount = supermarketSession?.savedSegmentDatabaseCount() ?? 0
-        let currentUnsavedSegmentCount = (self.mState == .STATE_MAPPING && self.mMapNodes > 0) ? 1 : 0
-        let mergeableSegmentCount = savedSegmentCount + currentUnsavedSegmentCount
         fileMenuChildren.append(UIAction(title: localized("New Mapping Session"), image: UIImage(systemName: "plus.app"), attributes: actionNewScanEnabled ? [] : .disabled, state: .off, handler: { _ in
             self.newScan()
         }))
         fileMenuChildren.append(UIAction(title: localized("Read Price Tag NFC"), image: UIImage(systemName: "tag"), attributes: self.mState == .STATE_MAPPING ? [] : .disabled, state: .off, handler: { _ in
             self.readPriceTagNFC()
-        }))
-        fileMenuChildren.append(UIAction(title: localized("Save Current Segment"), image: UIImage(systemName: "externaldrive"), attributes: self.mState == .STATE_MAPPING ? [] : .disabled, state: .off, handler: { _ in
-            self.rolloverCurrentSegment(reason: .manual)
-        }))
-        fileMenuChildren.append(UIAction(title: localized("Merge Saved Segments"), image: UIImage(systemName: "square.stack.3d.up"), attributes: mergeableSegmentCount >= 2 && self.mState != .STATE_PROCESSING && !(supermarketSession?.isExportingSegment ?? false) ? [] : .disabled, state: .off, handler: { _ in
-            self.mergeSavedSegments()
-        }))
-        fileMenuChildren.append(UIAction(title: localized("Generate 2D Map Package"), image: UIImage(systemName: "map"), attributes: mergeableSegmentCount > 0 && self.mState != .STATE_PROCESSING && !(supermarketSession?.isExportingSegment ?? false) ? [] : .disabled, state: .off, handler: { _ in
-            self.generate2DMapPackage()
-        }))
-        fileMenuChildren.append(UIAction(title: localized("View Latest 2D Map"), image: UIImage(systemName: "map.fill"), attributes: supermarketSession?.latest2DMapPackage() != nil && self.mState != .STATE_PROCESSING ? [] : .disabled, state: .off, handler: { _ in
-            self.viewLatest2DMapPackage()
         }))
         if(actionOptimizeEnabled) {
             fileMenuChildren.append(optimizeMenu)
@@ -1243,27 +1316,158 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         return !mHudVisible
     }
 
+    private func resetSoftwarePoseStabilizer()
+    {
+        mARPoseCorrection = matrix_identity_float4x4
+        mLastAcceptedARPose = nil
+        mLastAcceptedARTimestamp = nil
+        mTrackingWasDegraded = true
+        mConsecutiveNormalTrackingFrames = 0
+        mLastTrackingGuidanceAt = 0
+    }
+
+    private func rotationAngleDegrees(_ transform: simd_float4x4) -> Double
+    {
+        let trace = transform.columns.0.x + transform.columns.1.y + transform.columns.2.z
+        let cosine = min(Float(1), max(Float(-1), (trace - 1) / 2))
+        return Double(acos(cosine) * 180 / .pi)
+    }
+
+    /// Return a pose that is safe to feed into the continuous RTAB-Map graph.
+    /// ARKit still runs and every sensor pose is audited while frames rejected
+    /// here simply do not create an unreliable map constraint.
+    private func stabilizedMappingPose(
+        for frame: ARFrame,
+        trackingState: String
+    ) -> simd_float4x4?
+    {
+        let rawFeatureCount = frame.rawFeaturePoints?.points.count ?? 0
+        guard trackingState == "normal" else {
+            mTrackingWasDegraded = true
+            mConsecutiveNormalTrackingFrames = 0
+            supermarketSession?.recordMappingFrameQuality(
+                accepted: false,
+                rejectionReason: "degraded_tracking",
+                rawFeatureCount: rawFeatureCount)
+            return nil
+        }
+        guard rawFeatureCount > 0 else {
+            supermarketSession?.recordMappingFrameQuality(
+                accepted: false,
+                rejectionReason: "no_visual_features",
+                rawFeatureCount: 0)
+            return nil
+        }
+
+        if mTrackingWasDegraded {
+            mConsecutiveNormalTrackingFrames += 1
+            if mConsecutiveNormalTrackingFrames < mRequiredNormalFramesAfterTrackingRecovery {
+                supermarketSession?.recordMappingFrameQuality(
+                    accepted: false,
+                    rejectionReason: "tracking_recovery",
+                    rawFeatureCount: rawFeatureCount)
+                return nil
+            }
+            mTrackingWasDegraded = false
+            supermarketSession?.appendScanEvent(
+                event: "tracking_recovery_stabilized",
+                message: "ARKit tracking remained normal long enough to resume mapping frames",
+                fields: ["normalFrames": "\(mConsecutiveNormalTrackingFrames)"])
+        }
+
+        let rawPose = frame.camera.transform
+        let correctedPose = simd_mul(mARPoseCorrection, rawPose)
+        var linearSpeed: Double?
+        var angularSpeed: Double?
+        if let previousPose = mLastAcceptedARPose,
+           let previousTimestamp = mLastAcceptedARTimestamp {
+            let elapsed = frame.timestamp - previousTimestamp
+            if elapsed > 0 {
+                let delta = simd_mul(simd_inverse(previousPose), correctedPose)
+                let translation = SIMD3<Float>(
+                    delta.columns.3.x,
+                    delta.columns.3.y,
+                    delta.columns.3.z)
+                let distance = Double(simd_length(translation))
+                let rotation = rotationAngleDegrees(delta)
+                linearSpeed = distance / elapsed
+                angularSpeed = rotation / elapsed
+
+                // A walking scanner cannot move this far between submitted
+                // frames. Treat it as an ARKit coordinate jump, keep the last
+                // continuous pose and rebase subsequent raw poses into that
+                // coordinate system. PC loop closures can then correct drift
+                // without inheriting a false neighbor edge.
+                let translationLimit = max(0.45, min(elapsed, 2.0) * 3.0)
+                let rotationLimit = max(35.0, min(elapsed, 2.0) * 180.0)
+                if distance > translationLimit || rotation > rotationLimit {
+                    mARPoseCorrection = simd_mul(previousPose, simd_inverse(rawPose))
+                    supermarketSession?.recordMappingFrameQuality(
+                        accepted: false,
+                        rejectionReason: "pose_discontinuity",
+                        rawFeatureCount: rawFeatureCount,
+                        linearSpeedMps: linearSpeed,
+                        angularSpeedDegPerSecond: angularSpeed)
+                    supermarketSession?.appendScanEvent(
+                        level: "warning",
+                        event: "pose_discontinuity_compensated",
+                        message: "An implausible ARKit pose jump was removed from the map trajectory",
+                        fields: [
+                            "distanceM": String(format: "%.4f", distance),
+                            "rotationDeg": String(format: "%.3f", rotation),
+                            "elapsedSeconds": String(format: "%.4f", elapsed),
+                            "linearSpeedMps": String(format: "%.3f", linearSpeed ?? 0),
+                            "angularSpeedDegPerSecond": String(format: "%.2f", angularSpeed ?? 0)
+                        ])
+                    return nil
+                }
+            }
+        }
+
+        mLastAcceptedARPose = correctedPose
+        mLastAcceptedARTimestamp = frame.timestamp
+        supermarketSession?.recordMappingFrameQuality(
+            accepted: true,
+            rawFeatureCount: rawFeatureCount,
+            linearSpeedMps: linearSpeed,
+            angularSpeedDegPerSecond: angularSpeed)
+        return correctedPose
+    }
+
     //This is called when a new frame has been updated.
     func session(_ session: ARSession, didUpdate frame: ARFrame)
     {
+        // ARSession can still deliver a queued frame after pause(). Do not let
+        // that stale frame race with CameraMobile shutdown/recreation.
+        guard !mSystemInterruptionInProgress else {
+            return
+        }
+
         var status = ""
         var accept = false
+        var trackingStateLabel = "unknown"
         
         switch frame.camera.trackingState {
         case .normal:
             accept = true
+            trackingStateLabel = "normal"
         case .notAvailable:
             status = "Tracking not available"
+            trackingStateLabel = "notAvailable"
         case .limited(.excessiveMotion):
             accept = true
             status = "Please Slow Your Movement"
+            trackingStateLabel = "limited.excessiveMotion"
         case .limited(.insufficientFeatures):
             accept = true
             status = "Avoid Featureless Surfaces"
+            trackingStateLabel = "limited.insufficientFeatures"
         case .limited(.initializing):
             status = "Initializing"
+            trackingStateLabel = "limited.initializing"
         case .limited(.relocalizing):
             status = "Relocalizing"
+            trackingStateLabel = "limited.relocalizing"
         default:
             status = "Unknown tracking state"
         }
@@ -1274,15 +1478,65 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
             status = "Camera Is Occluded Or Lighting Is Too Dark"
         }
 
-        if accept, let rotation = UIApplication.shared.windows.first?.windowScene?.interfaceOrientation
+        if let rotation = UIApplication.shared.windows.first?.windowScene?.interfaceOrientation
         {
-            rtabmap?.postOdometryEvent(frame: frame, orientation: rotation, viewport: self.view.frame.size)
+            let pose = frame.camera.transform
+            supermarketSession?.updateSensorPose(
+                timestamp: frame.timestamp,
+                matrixColumnMajor: [
+                    pose[0,0], pose[0,1], pose[0,2], pose[0,3],
+                    pose[1,0], pose[1,1], pose[1,2], pose[1,3],
+                    pose[2,0], pose[2,1], pose[2,2], pose[2,3],
+                    pose[3,0], pose[3,1], pose[3,2], pose[3,3]
+                ],
+                trackingState: trackingStateLabel)
+            if mState == .STATE_MAPPING && trackingStateLabel != mLastLoggedTrackingState {
+                let level = trackingStateLabel == "normal" ? "info" : "warning"
+                supermarketSession?.appendScanEvent(
+                    level: level,
+                    event: "tracking_state_changed",
+                    message: "ARKit tracking state changed",
+                    fields: ["from": mLastLoggedTrackingState.isEmpty ? "unknown" : mLastLoggedTrackingState, "to": trackingStateLabel])
+                mLastLoggedTrackingState = trackingStateLabel
+            }
+            if mState == .STATE_MAPPING && !mDataRecording {
+                if let correctedPose = stabilizedMappingPose(
+                    for: frame,
+                    trackingState: trackingStateLabel) {
+                    rtabmap?.postOdometryEvent(
+                        frame: frame,
+                        orientation: rotation,
+                        viewport: self.view.frame.size,
+                        poseOverride: correctedPose)
+                }
+            }
+            else if accept {
+                rtabmap?.postOdometryEvent(frame: frame, orientation: rotation, viewport: self.view.frame.size)
+            }
         }
         
         if !status.isEmpty {
-            DispatchQueue.main.async {
-                self.showToast(message: status, seconds: 2)
+            let now = Date().timeIntervalSince1970
+            if now - mLastTrackingGuidanceAt >= 2.0 {
+                mLastTrackingGuidanceAt = now
+                DispatchQueue.main.async {
+                    self.showToast(message: status, seconds: 2)
+                }
             }
+        }
+    }
+
+    func sessionWasInterrupted(_ session: ARSession)
+    {
+        DispatchQueue.main.async {
+            self.suspendCaptureForSystemInterruption(reason: "ARSession interrupted")
+        }
+    }
+
+    func sessionInterruptionEnded(_ session: ARSession)
+    {
+        DispatchQueue.main.async {
+            _ = self.resumeCaptureAfterSystemInterruption()
         }
     }
     
@@ -1298,6 +1552,22 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         ]
         let errorMessage = messages.compactMap({ $0 }).joined(separator: "\n")
         DispatchQueue.main.async {
+            if self.mState == .STATE_MAPPING ||
+               self.mState == .STATE_CAMERA ||
+               self.mSystemInterruptionInProgress {
+                // A failed ARSession is an Apple-level interruption, not a
+                // user request to end capture. Preserve the database/camera
+                // origin and retry automatically with a tracking reset.
+                self.mSystemInterruptionRequiresTrackingReset = true
+                self.suspendCaptureForSystemInterruption(reason: "ARSession failed: \(errorMessage)")
+                if UIApplication.shared.applicationState == .active {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+                        _ = self.resumeCaptureAfterSystemInterruption(resetTracking: true)
+                    }
+                }
+                return
+            }
+
             // Present an alert informing about the error that has occurred.
             let alertController = UIAlertController(title: "The AR session failed.", message: errorMessage, preferredStyle: .alert)
             let restartAction = UIAlertAction(title: "Restart Session", style: .default) { _ in
@@ -1577,11 +1847,7 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
     
     func registerSettingsBundle(){
         let appDefaults: [String:Any] = [
-            supermarketAreaThresholdKey: supermarketDefaultAreaThresholdM2,
-            supermarketDatabaseThresholdKey: supermarketDefaultDatabaseThresholdMB,
-            supermarketMemoryThresholdKey: supermarketDefaultMemoryThresholdMB,
-            supermarketMinimumNodesKey: supermarketDefaultMinimumNodes,
-            supermarketAutoSegmentKey: true
+            supermarketStreamingMemoryNodesKey: supermarketDefaultStreamingMemoryNodes
         ]
         UserDefaults.standard.register(defaults: appDefaults)
     }
@@ -1630,9 +1896,13 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         rtabmap!.setMappingParameter(key: "RGBD/MaxOdomCacheSize", value: defaults.string(forKey: "MaximumOdometryCacheSize")!);
         rtabmap!.setMappingParameter(key: "Optimizer/Strategy", value: defaults.string(forKey: "GraphOptimizer")!);
         rtabmap!.setMappingParameter(key: "RGBD/ProximityBySpace", value: defaults.string(forKey: "ProximityDetection")!);
+        applyStreamingMappingSettings()
 
         let markerDetection = defaults.integer(forKey: "ArUcoMarkerDetection")
-        if(markerDetection == -1)
+        // Continuous supermarket scanning currently uses the software-only
+        // profile. Do not let an old Settings value silently add AprilTag,
+        // ArUco or landmark constraints to this graph.
+        if(markerDetection == -1 || !mDataRecording)
         {
             rtabmap!.setMappingParameter(key: "RGBD/MarkerDetection", value: "false");
         }
@@ -1713,6 +1983,13 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
     
     func newScan(dataRecordingMode: Bool = false)
     {
+        guard mState != .STATE_MAPPING else {
+            showToast(
+                message: localized("A scan is in progress. Use the Stop button before starting another scan."),
+                seconds: 4)
+            return
+        }
+
         print("databases.size() = \(databases.size())")
         if(databases.count >= 10 && !mReviewRequested && self.depthSupported)
         {
@@ -1850,14 +2127,50 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
             if didStartSecurityScope {
                 supermarketSession?.stopAccessingBaseDirectorySecurityScope()
             }
+            var activeDatabase = tmpDatabase
+            if !dataRecordingMode {
+                do {
+                    guard let streamURL = try supermarketSession?.streamingDatabaseURL() else {
+                        throw NSError(
+                            domain: "SupermarketScan",
+                            code: 1,
+                            userInfo: [NSLocalizedDescriptionKey: localized("Streaming database path is unavailable")])
+                    }
+                    activeDatabase = streamURL
+                }
+                catch {
+                    showToast(message: String(format: localized("Could not create streaming database: %@"), error.localizedDescription), seconds: 4)
+                    return
+                }
+            }
             let inMemory = dataRecordingMode ? UserDefaults.standard.bool(forKey: "DatabaseInMemory") : false
             mDataRecording = dataRecordingMode
             self.rtabmap!.setDataRecorderMode(enabled: dataRecordingMode)
+            applyStreamingMappingSettings()
             self.rtabmap!.setPreserveCameraOrigin(enabled: false)
             self.optimizedGraphShown = true // Always reset to true when opening a database
-            self.rtabmap!.openDatabase(databasePath: tmpDatabase.path, databaseInMemory: inMemory, optimize: false, clearDatabase: true)
+            self.rtabmap!.openDatabase(databasePath: activeDatabase.path, databaseInMemory: inMemory, optimize: false, clearDatabase: true)
             self.mLatestDatabaseMemoryMB = 0
-            self.mSegmentStartUsedMemoryMB = max(0, self.mMaximumMemory - self.getAvailableMemory())
+            self.mLatestScanStorageBytes = 0
+            self.mLastStreamingCheckpointAt = 0
+            self.mStreamingCheckpointInFlight = false
+            self.mStreamingDiskWarningShown = false
+            self.mStreamingCriticalStopRequested = false
+            self.mStreamingThermalWarningShown = false
+            self.mStreamingMemoryPressureLevel = 0
+            self.mLastLoggedTrackingState = ""
+            self.resetSoftwarePoseStabilizer()
+            if !dataRecordingMode {
+                self.supermarketSession?.appendScanEvent(
+                    event: "scan_started",
+                    message: "Continuous streaming scan started",
+                    fields: [
+                        "database": activeDatabase.lastPathComponent,
+                        "workingMemoryNodes": "\(self.supermarketIntDefault(self.supermarketStreamingMemoryNodesKey, fallback: self.supermarketDefaultStreamingMemoryNodes))",
+                        "errorOptimizationProfile": "software_only_no_fiducials",
+                        "fiducialsEnabled": "false"
+                    ])
+            }
             
             if(!(self.mState == State.STATE_CAMERA || self.mState == State.STATE_MAPPING))
             {
@@ -1878,18 +2191,6 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         }
     }
 
-    private func supermarketDoubleDefault(_ key: String, fallback: Double) -> Double
-    {
-        let value = UserDefaults.standard.object(forKey: key)
-        if let number = value as? NSNumber {
-            return number.doubleValue
-        }
-        if let text = value as? String, let parsed = Double(text) {
-            return parsed
-        }
-        return fallback
-    }
-
     private func supermarketIntDefault(_ key: String, fallback: Int) -> Int
     {
         let value = UserDefaults.standard.object(forKey: key)
@@ -1904,17 +2205,8 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
 
     private func applySupermarketSettings()
     {
-        guard let scanSession = supermarketSession else {
-            return
-        }
-
         let defaults = UserDefaults.standard
         migrateSupermarketDefaultsIfNeeded(defaults)
-        mAutoSegmentExportEnabled = defaults.bool(forKey: supermarketAutoSegmentKey)
-        scanSession.areaThresholdM2 = max(1.0, supermarketDoubleDefault(supermarketAreaThresholdKey, fallback: supermarketDefaultAreaThresholdM2))
-        scanSession.databaseThresholdMB = max(1, supermarketIntDefault(supermarketDatabaseThresholdKey, fallback: supermarketDefaultDatabaseThresholdMB))
-        scanSession.usedMemoryThresholdMB = max(1, supermarketIntDefault(supermarketMemoryThresholdKey, fallback: supermarketDefaultMemoryThresholdMB))
-        scanSession.minimumNodesBeforeRollover = max(1, supermarketIntDefault(supermarketMinimumNodesKey, fallback: supermarketDefaultMinimumNodes))
 
         if let bookmarkData = defaults.data(forKey: supermarketSaveLocationBookmarkKey) {
             do {
@@ -1924,19 +2216,19 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                     options: [],
                     relativeTo: nil,
                     bookmarkDataIsStale: &isStale)
-                scanSession.setCustomBaseDirectory(url)
+                supermarketSession?.setCustomBaseDirectory(url)
                 if isStale {
                     saveSupermarketLocationBookmark(url)
                 }
             }
             catch {
-                scanSession.clearCustomBaseDirectory()
+                supermarketSession?.clearCustomBaseDirectory()
                 defaults.removeObject(forKey: supermarketSaveLocationBookmarkKey)
                 defaults.removeObject(forKey: supermarketSaveLocationNameKey)
             }
         }
         else {
-            scanSession.clearCustomBaseDirectory()
+            supermarketSession?.clearCustomBaseDirectory()
         }
     }
 
@@ -1946,22 +2238,73 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
             return
         }
 
-        if defaults.object(forKey: supermarketAreaThresholdKey) == nil ||
-            abs(supermarketDoubleDefault(supermarketAreaThresholdKey, fallback: 250.0) - 250.0) < 0.001 {
-            defaults.set(supermarketDefaultAreaThresholdM2, forKey: supermarketAreaThresholdKey)
-        }
-        if defaults.object(forKey: supermarketDatabaseThresholdKey) == nil ||
-            supermarketIntDefault(supermarketDatabaseThresholdKey, fallback: 900) == 900 {
-            defaults.set(supermarketDefaultDatabaseThresholdMB, forKey: supermarketDatabaseThresholdKey)
-        }
-        if defaults.object(forKey: supermarketMemoryThresholdKey) == nil ||
-            supermarketIntDefault(supermarketMemoryThresholdKey, fallback: 2500) == 2500 {
-            defaults.set(supermarketDefaultMemoryThresholdMB, forKey: supermarketMemoryThresholdKey)
-        }
-        if defaults.object(forKey: supermarketMinimumNodesKey) == nil {
-            defaults.set(supermarketDefaultMinimumNodes, forKey: supermarketMinimumNodesKey)
+        // Remove obsolete runtime switches so an older installation cannot
+        // silently reactivate database rollover or memory-triggered segments.
+        [
+            "SupermarketAreaThresholdM2",
+            "SupermarketDatabaseThresholdMB",
+            "SupermarketUsedMemoryThresholdMB",
+            "SupermarketMinimumNodesBeforeRollover",
+            "SupermarketAutoSegmentExportEnabled",
+            "SupermarketStreamingScanEnabled"
+        ].forEach { defaults.removeObject(forKey: $0) }
+        if defaults.object(forKey: supermarketStreamingMemoryNodesKey) == nil {
+            defaults.set(supermarketDefaultStreamingMemoryNodes, forKey: supermarketStreamingMemoryNodesKey)
         }
         defaults.set(supermarketDefaultsVersion, forKey: supermarketDefaultsVersionKey)
+    }
+
+    private func applyStreamingMappingSettings()
+    {
+        guard let rtabmap = rtabmap else {
+            return
+        }
+        let defaults = UserDefaults.standard
+        let memoryNodes = max(
+            50,
+            supermarketIntDefault(
+                supermarketStreamingMemoryNodesKey,
+                fallback: supermarketDefaultStreamingMemoryNodes))
+        let streamingActive = !mDataRecording
+        rtabmap.setStreamingMapMode(
+            enabled: streamingActive,
+            maxRenderedNodes: memoryNodes + 50)
+        if streamingActive {
+            // RTAB-Map continuously saves transferred nodes through
+            // DBDriver::asyncSave(). Important/high-weight and recent nodes stay
+            // in WM, while older low-weight nodes become on-disk LTM entries.
+            rtabmap.setMappingParameter(key: "Mem/IncrementalMemory", value: "true")
+            rtabmap.setMappingParameter(key: "Mem/STMSize", value: "20")
+            rtabmap.setMappingParameter(key: "Mem/ImageKept", value: "false")
+            rtabmap.setMappingParameter(key: "Mem/InitWMWithAllNodes", value: "false")
+            rtabmap.setMappingParameter(key: "Mem/RecentWmRatio", value: "0.2")
+            rtabmap.setMappingParameter(key: "Mem/TransferSortingByWeightId", value: "false")
+            rtabmap.setMappingParameter(key: "Rtabmap/MemoryThr", value: "\(memoryNodes)")
+            // Keep enough phone-side visual feedback to catch bad coverage and
+            // obvious loop closures, while PC reprocessing remains authoritative.
+            rtabmap.setMappingParameter(key: "Kp/MaxFeatures", value: "500")
+            rtabmap.setMappingParameter(key: "Rtabmap/MaxRetrieved", value: "3")
+            rtabmap.setMappingParameter(key: "Rtabmap/LoopThr", value: "0.15")
+            rtabmap.setMappingParameter(key: "RGBD/MaxLocalRetrieved", value: "3")
+            rtabmap.setMappingParameter(key: "RGBD/ProximityByTime", value: "true")
+            rtabmap.setMappingParameter(key: "RGBD/ProximityBySpace", value: "true")
+            rtabmap.setMappingParameter(key: "RGBD/ProximityOdomGuess", value: "true")
+            rtabmap.setMappingParameter(key: "RGBD/OptimizeMaxError", value: "2.0")
+            rtabmap.setMappingParameter(key: "RGBD/OptimizeMaxErrorRepairRadius", value: "1.0")
+            rtabmap.setMappingParameter(key: "Vis/MinInliers", value: "40")
+            rtabmap.setMappingParameter(key: "Mem/UseOdomGravity", value: "true")
+            rtabmap.setMappingParameter(key: "Optimizer/Iterations", value: "30")
+            rtabmap.setMappingParameter(key: "Optimizer/GravitySigma", value: "0.2")
+            rtabmap.setMappingParameter(key: "Optimizer/Robust", value: "true")
+            rtabmap.setMappingParameter(key: "Optimizer/PriorsIgnored", value: "true")
+            rtabmap.setMappingParameter(key: "Optimizer/LandmarksIgnored", value: "true")
+            rtabmap.setMappingParameter(key: "RGBD/MarkerDetection", value: "false")
+        }
+        else {
+            rtabmap.setMappingParameter(
+                key: "Rtabmap/MemoryThr",
+                value: defaults.string(forKey: "MemoryLimit") ?? "0")
+        }
     }
 
     private func saveSupermarketLocationBookmark(_ url: URL)
@@ -1972,7 +2315,7 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
             UserDefaults.standard.set(url.lastPathComponent, forKey: supermarketSaveLocationNameKey)
         }
         catch {
-            showToast(message: String(format: localized("Could not save segment folder permission: %@"), error.localizedDescription), seconds: 3)
+            showToast(message: String(format: localized("Could not save scan folder permission: %@"), error.localizedDescription), seconds: 3)
         }
     }
 
@@ -1981,60 +2324,272 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         return UserDefaults.standard.string(forKey: supermarketSaveLocationNameKey) ?? localized("Default Location")
     }
 
-    private func hasEnoughLocalSpaceForSegment(at directory: URL, databaseMemoryMB: Int) -> (ok: Bool, message: String?)
+    private func currentThermalStateText() -> String
     {
+        switch ProcessInfo.processInfo.thermalState {
+        case .nominal:
+            return "nominal"
+        case .fair:
+            return "fair"
+        case .serious:
+            return "serious"
+        case .critical:
+            return "critical"
+        @unknown default:
+            return "unknown"
+        }
+    }
+
+    private func availableDiskBytes(at directory: URL) -> Int64?
+    {
+        return try? directory.resourceValues(
+            forKeys: [.volumeAvailableCapacityForImportantUsageKey])
+            .volumeAvailableCapacityForImportantUsage
+    }
+
+    private func databaseBytes(at url: URL) -> UInt64
+    {
+        guard let values = try? url.resourceValues(forKeys: [.fileSizeKey]) else {
+            return 0
+        }
+        return UInt64(max(0, values.fileSize ?? 0))
+    }
+
+    private func databaseStorageBytes(at url: URL) -> UInt64
+    {
+        // SQLite may hold recently streamed frames in WAL/journal sidecars.
+        // Include them so the HUD reports actual storage, not RTAB-Map's WM.
+        let candidates = [
+            url,
+            URL(fileURLWithPath: url.path + "-wal"),
+            URL(fileURLWithPath: url.path + "-shm"),
+            URL(fileURLWithPath: url.path + "-journal")
+        ]
+        return candidates.reduce(UInt64(0)) { $0 + databaseBytes(at: $1) }
+    }
+
+    private func captureDirectoryStorageBytes(at directory: URL) -> UInt64
+    {
+        guard let files = try? FileManager.default.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: [.isRegularFileKey, .fileSizeKey],
+            options: [.skipsHiddenFiles]) else {
+            return 0
+        }
+        return files.reduce(UInt64(0)) { total, file in
+            guard let values = try? file.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey]),
+                  values.isRegularFile == true else {
+                return total
+            }
+            return total + UInt64(max(0, values.fileSize ?? 0))
+        }
+    }
+
+    private func currentContinuousScanStorageBytes() -> UInt64
+    {
+        guard !mDataRecording,
+              mState == .STATE_MAPPING,
+              let scanSession = supermarketSession,
+              scanSession.rootDirectory != nil,
+              let captureDirectory = try? scanSession.currentSegmentDirectory() else {
+            return mLatestScanStorageBytes
+        }
+        return captureDirectoryStorageBytes(at: captureDirectory)
+    }
+
+    private func formattedStorageSize(_ bytes: UInt64) -> String
+    {
+        let formatter = ByteCountFormatter()
+        formatter.allowedUnits = [.useMB, .useGB]
+        formatter.countStyle = .file
+        formatter.includesUnit = true
+        formatter.isAdaptive = true
+        return formatter.string(fromByteCount: Int64(min(bytes, UInt64(Int64.max))))
+    }
+
+    private func applyStreamingMemoryPressurePolicy(availableMemoryMB: Int)
+    {
+        guard !mDataRecording else {
+            return
+        }
+        let level: Int
+        let memoryNodes: Int
+        let renderedNodes: Int
+        if availableMemoryMB < 350 {
+            level = 3
+            memoryNodes = 60
+            renderedNodes = 80
+        }
+        else if availableMemoryMB < 700 {
+            level = 2
+            memoryNodes = 100
+            renderedNodes = 130
+        }
+        else if availableMemoryMB < 1200 {
+            level = 1
+            memoryNodes = 180
+            renderedNodes = 220
+        }
+        else {
+            return
+        }
+        guard level > mStreamingMemoryPressureLevel else {
+            return
+        }
+        mStreamingMemoryPressureLevel = level
+        // This transfers older WM nodes to the same on-disk database and
+        // trims only disposable live rendering. Capture, ARKit and timestamps
+        // continue without a modal dialog or trajectory boundary.
+        rtabmap?.setStreamingMapMode(enabled: true, maxRenderedNodes: renderedNodes)
+        rtabmap?.setMappingParameter(key: "Rtabmap/MemoryThr", value: "\(memoryNodes)")
+        supermarketSession?.appendScanEvent(
+            level: "warning",
+            event: "memory_policy_adjusted",
+            message: "Live memory window reduced; streaming capture continued",
+            fields: [
+                "availableMemoryMB": "\(availableMemoryMB)",
+                "workingMemoryNodes": "\(memoryNodes)",
+                "renderedNodes": "\(renderedNodes)"
+            ])
+        showToast(
+            message: localized("Memory pressure detected. Older frames remain on disk; live preview was reduced without stopping the scan."),
+            seconds: 4)
+    }
+
+    private func updateStreamingCaptureHealth(nodeCount: Int, databaseMemoryMB: Int, usedMemoryMB: Int)
+    {
+        guard !mDataRecording,
+              !mStreamingCriticalStopRequested,
+              let scanSession = supermarketSession else {
+            return
+        }
+        let now = Date().timeIntervalSince1970
+        guard now - mLastStreamingCheckpointAt >= 15.0 else {
+            return
+        }
+        mLastStreamingCheckpointAt = now
+
+        let segmentDirectory: URL
+        let databaseURL: URL
         do {
-            let values = try directory.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
-            guard let availableBytes = values.volumeAvailableCapacityForImportantUsage else {
-                return (true, nil)
-            }
-            let estimatedDatabaseBytes = Int64(max(databaseMemoryMB, 100)) * 1024 * 1024
-            let requiredBytes = estimatedDatabaseBytes * 2 + 512 * 1024 * 1024
-            if availableBytes < requiredBytes {
-                let availableGB = Double(availableBytes) / 1024.0 / 1024.0 / 1024.0
-                let requiredGB = Double(requiredBytes) / 1024.0 / 1024.0 / 1024.0
-                return (false, String(format: localized("Not enough local free space to export this segment. Available: %.1f GB, recommended: %.1f GB."), availableGB, requiredGB))
-            }
+            segmentDirectory = try scanSession.currentSegmentDirectory()
+            databaseURL = try scanSession.streamingDatabaseURL()
         }
         catch {
-            print("Could not check local free space: \(error)")
+            print("Could not create streaming health checkpoint: \(error)")
+            return
         }
-        return (true, nil)
+
+        let freeDiskBytes = availableDiskBytes(at: segmentDirectory)
+        let actualDatabaseBytes = databaseStorageBytes(at: databaseURL)
+        let scanStorageBytes = captureDirectoryStorageBytes(at: segmentDirectory)
+        mLatestScanStorageBytes = scanStorageBytes
+        let thermalState = currentThermalStateText()
+        let checkpoint = scanSession.makeLiveCheckpoint(
+            nodeCount: nodeCount,
+            databaseBytes: actualDatabaseBytes,
+            availableDiskBytes: freeDiskBytes,
+            usedMemoryMB: usedMemoryMB,
+            thermalState: thermalState)
+
+        applyStreamingMemoryPressurePolicy(availableMemoryMB: getAvailableMemory())
+        scanSession.appendScanEvent(
+            event: "health_checkpoint",
+            message: "Continuous capture health checkpoint",
+            fields: [
+                "nodeCount": "\(nodeCount)",
+                "databaseMemoryMB": "\(databaseMemoryMB)",
+                "scanStorageBytes": "\(scanStorageBytes)",
+                "usedMemoryMB": "\(usedMemoryMB)",
+                "availableDiskBytes": freeDiskBytes.map(String.init) ?? "unknown",
+                "thermalState": thermalState
+            ])
+
+        if !mStreamingCheckpointInFlight {
+            mStreamingCheckpointInFlight = true
+            DispatchQueue.background(background: {
+                do {
+                    try scanSession.writeLiveCheckpoint(
+                        to: segmentDirectory,
+                        checkpoint: checkpoint)
+                }
+                catch {
+                    print("Could not write live scan checkpoint: \(error)")
+                }
+            }, completion: {
+                self.mStreamingCheckpointInFlight = false
+            })
+        }
+
+        if let freeDiskBytes = freeDiskBytes {
+            let freeGB = Double(freeDiskBytes) / 1024.0 / 1024.0 / 1024.0
+            if freeDiskBytes < 1024 * 1024 * 1024 {
+                mStreamingCriticalStopRequested = true
+                scanSession.appendScanEvent(
+                    level: "error",
+                    event: "storage_exhausted",
+                    message: "Scan finalized because device storage was critically low",
+                    fields: ["availableDiskBytes": "\(freeDiskBytes)"])
+                showToast(
+                    message: String(format: localized("Only %.1f GB of storage remains. Finalizing the scan to protect the database."), freeGB),
+                    seconds: 5)
+                stopMapping(ignoreSaving: false, offerPostProcessing: false)
+                return
+            }
+            if freeDiskBytes < 8 * 1024 * 1024 * 1024 && !mStreamingDiskWarningShown {
+                mStreamingDiskWarningShown = true
+                scanSession.appendScanEvent(
+                    level: "warning",
+                    event: "storage_low",
+                    message: "Device storage is getting low",
+                    fields: ["availableDiskBytes": "\(freeDiskBytes)"])
+                showToast(
+                    message: String(format: localized("Storage is getting low (%.1f GB free). Finish the route or free space soon."), freeGB),
+                    seconds: 5)
+            }
+        }
+
+        if thermalState == "critical" {
+            mStreamingCriticalStopRequested = true
+            scanSession.appendScanEvent(
+                level: "error",
+                event: "thermal_critical",
+                message: "Scan finalized because the device reached critical thermal state")
+            showToast(
+                message: localized("The iPhone is critically hot. Finalizing the scan to protect data integrity."),
+                seconds: 5)
+            stopMapping(ignoreSaving: false, offerPostProcessing: false)
+        }
+        else if thermalState == "serious" && !mStreamingThermalWarningShown {
+            mStreamingThermalWarningShown = true
+            // Reduce only the disposable online window. Disk recording and the
+            // continuous ARKit pose chain remain untouched.
+            rtabmap?.setStreamingMapMode(enabled: true, maxRenderedNodes: 200)
+            rtabmap?.setMappingParameter(key: "Rtabmap/MemoryThr", value: "150")
+            scanSession.appendScanEvent(
+                level: "warning",
+                event: "thermal_policy_adjusted",
+                message: "Live preview reduced because the device is hot",
+                fields: ["workingMemoryNodes": "150", "renderedNodes": "200"])
+            showToast(
+                message: localized("The iPhone is hot. Live preview memory was reduced; continuous data recording is unchanged."),
+                seconds: 5)
+        }
     }
 
     private func showSupermarketScanSettings()
     {
         applySupermarketSettings()
         let defaults = UserDefaults.standard
-        let message = String(format: localized("Current save location: %@\n\nWhen automatic segmentation is enabled, reaching any threshold saves the current segment and continues scanning."), selectedSupermarketLocationName())
+        let modeText = localized("Continuous streaming is always enabled: old working-memory nodes are written to one on-disk database without stopping ARKit. Map optimization and generation run on the PC.") + "\n\n" + localized("Software error optimization is enabled. Unstable tracking frames and implausible pose jumps are excluded; AprilTag and landmark priors are not used.")
+        let message = String(format: localized("Current save location: %@\n\n%@"), selectedSupermarketLocationName(), modeText)
         let alert = UIAlertController(title: localized("Supermarket Scan Settings"), message: message, preferredStyle: .alert)
 
         alert.addTextField { textField in
-            textField.placeholder = self.localized("Area threshold m2")
-            textField.keyboardType = .decimalPad
-            textField.text = String(format: "%.0f", self.supermarketDoubleDefault(self.supermarketAreaThresholdKey, fallback: self.supermarketDefaultAreaThresholdM2))
-        }
-        alert.addTextField { textField in
-            textField.placeholder = self.localized("Database threshold MB")
+            textField.placeholder = self.localized("Streaming working-memory nodes")
             textField.keyboardType = .numberPad
-            textField.text = "\(self.supermarketIntDefault(self.supermarketDatabaseThresholdKey, fallback: self.supermarketDefaultDatabaseThresholdMB))"
+            textField.text = "\(self.supermarketIntDefault(self.supermarketStreamingMemoryNodesKey, fallback: self.supermarketDefaultStreamingMemoryNodes))"
         }
-        alert.addTextField { textField in
-            textField.placeholder = self.localized("Memory threshold MB")
-            textField.keyboardType = .numberPad
-            textField.text = "\(self.supermarketIntDefault(self.supermarketMemoryThresholdKey, fallback: self.supermarketDefaultMemoryThresholdMB))"
-        }
-        alert.addTextField { textField in
-            textField.placeholder = self.localized("Minimum node count")
-            textField.keyboardType = .numberPad
-            textField.text = "\(self.supermarketIntDefault(self.supermarketMinimumNodesKey, fallback: self.supermarketDefaultMinimumNodes))"
-        }
-
-        alert.addAction(UIAlertAction(title: mAutoSegmentExportEnabled ? localized("Disable Automatic Segmentation") : localized("Enable Automatic Segmentation"), style: .default, handler: { _ in
-            defaults.set(!self.mAutoSegmentExportEnabled, forKey: self.supermarketAutoSegmentKey)
-            self.applySupermarketSettings()
-            self.showToast(message: self.mAutoSegmentExportEnabled ? self.localized("Automatic segmentation enabled") : self.localized("Automatic segmentation disabled"), seconds: 2)
-        }))
         alert.addAction(UIAlertAction(title: localized("Choose Save Location"), style: .default, handler: { _ in
             self.presentSupermarketSaveLocationPicker()
         }))
@@ -2046,19 +2601,12 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
             self.showToast(message: self.localized("Using default save location"), seconds: 2)
         }))
         alert.addAction(UIAlertAction(title: localized("Save"), style: .default, handler: { _ in
-            if let areaText = alert.textFields?[0].text, let area = Double(areaText), area > 0 {
-                defaults.set(area, forKey: self.supermarketAreaThresholdKey)
-            }
-            if let databaseText = alert.textFields?[1].text, let database = Int(databaseText), database > 0 {
-                defaults.set(database, forKey: self.supermarketDatabaseThresholdKey)
-            }
-            if let memoryText = alert.textFields?[2].text, let memory = Int(memoryText), memory > 0 {
-                defaults.set(memory, forKey: self.supermarketMemoryThresholdKey)
-            }
-            if let nodesText = alert.textFields?[3].text, let nodes = Int(nodesText), nodes > 0 {
-                defaults.set(nodes, forKey: self.supermarketMinimumNodesKey)
+            if let streamingNodesText = alert.textFields?[0].text,
+               let streamingNodes = Int(streamingNodesText), streamingNodes >= 50 {
+                defaults.set(streamingNodes, forKey: self.supermarketStreamingMemoryNodesKey)
             }
             self.applySupermarketSettings()
+            self.applyStreamingMappingSettings()
             self.showToast(message: self.localized("Supermarket scan settings saved"), seconds: 2)
         }))
         alert.addAction(UIAlertAction(title: localized("Cancel"), style: .cancel, handler: nil))
@@ -2082,7 +2630,7 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         saveSupermarketLocationBookmark(url)
         applySupermarketSettings()
         supermarketSession?.refreshUnsavedSessionLocation()
-        showToast(message: String(format: localized("Segment save location set to: %@"), url.lastPathComponent), seconds: 3)
+        showToast(message: String(format: localized("Scan save location set to: %@"), url.lastPathComponent), seconds: 3)
     }
 
     func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController)
@@ -2112,6 +2660,10 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                         roll: pose.roll,
                         pitch: pose.pitch,
                         yaw: pose.yaw)
+                    self.supermarketSession?.appendScanEvent(
+                        event: "price_tag_recorded",
+                        message: "NFC price tag recorded",
+                        fields: ["tagIdentifier": record?.tagIdentifier ?? tag.identifier, "nodeCount": "\(self.mMapNodes)"])
                     self.showToast(message: String(format: self.localized("Price tag recorded: %@"), record?.tagIdentifier ?? tag.identifier), seconds: 2)
                 case .failure(let error):
                     self.showToast(message: String(format: self.localized("NFC read failed: %@"), error.localizedDescription), seconds: 3)
@@ -2122,422 +2674,240 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         priceTagNFCReader?.begin()
     }
 
-    func rolloverCurrentSegment(reason: SegmentTriggerReason, resumeAfterSave: Bool = true, completion: ((Bool) -> Void)? = nil)
+    private func finalizeStreamingScan(completion: ((Bool) -> Void)? = nil)
     {
-        guard let scanSession = supermarketSession, !scanSession.isExportingSegment else {
-            completion?(false)
-            return
-        }
-        guard mMapNodes > 0 else {
-            showToast(message: localized("No mapping data to save yet."), seconds: 2)
+        guard let scanSession = supermarketSession,
+              !scanSession.isFinalizingScan,
+              mMapNodes > 0 else {
             completion?(false)
             return
         }
 
-        scanSession.isExportingSegment = true
-        let didStartSecurityScope = scanSession.startAccessingBaseDirectorySecurityScope()
-        let previousState = mState
-        let segmentIndex = scanSession.segmentIndex
-        let area = scanSession.currentAreaM2
-        let usedMem = mMaximumMemory - getAvailableMemory()
-        let dbMemoryMB = mLatestDatabaseMemoryMB
-        let rolloverStartedAt = Date()
-
-        let segmentDir: URL
+        let segmentDirectory: URL
+        let databaseURL: URL
         do {
-            segmentDir = try scanSession.currentSegmentDirectory()
+            segmentDirectory = try scanSession.currentSegmentDirectory()
+            databaseURL = try scanSession.streamingDatabaseURL()
         }
         catch {
-            scanSession.isExportingSegment = false
-            if didStartSecurityScope {
-                scanSession.stopAccessingBaseDirectorySecurityScope()
-            }
-            showToast(message: String(format: localized("Could not create segment folder: %@"), error.localizedDescription), seconds: 4)
+            showToast(message: String(format: localized("Could not finalize streaming scan: %@"), error.localizedDescription), seconds: 4)
             completion?(false)
             return
         }
 
-        let localSpaceCheck = hasEnoughLocalSpaceForSegment(at: segmentDir, databaseMemoryMB: dbMemoryMB)
-        guard localSpaceCheck.ok else {
-            scanSession.isExportingSegment = false
-            if didStartSecurityScope {
-                scanSession.stopAccessingBaseDirectorySecurityScope()
-            }
-            showToast(message: localSpaceCheck.message ?? localized("Not enough local free space to export this segment."), seconds: 5)
-            completion?(false)
-            return
+        scanSession.isFinalizingScan = true
+        scanSession.appendScanEvent(
+            event: "scan_finalization_started",
+            message: "Finalizing the continuous streaming database",
+            fields: ["nodeCount": "\(mMapNodes)", "scanStorageBytes": "\(mLatestScanStorageBytes)"])
+        let exportBaseDirectory = scanSession.customBaseDirectorySnapshot()
+        let didStartSecurityScope = exportBaseDirectory?.startAccessingSecurityScopedResource() ?? false
+        let originValues = rtabmap?.cameraOriginOffset()
+        let originOffset: ScanTransform?
+        if let values = originValues, values.count == 7 {
+            originOffset = ScanTransform(
+                x: values[0], y: values[1], z: values[2],
+                qx: values[3], qy: values[4], qz: values[5], qw: values[6])
         }
+        else {
+            originOffset = nil
+        }
+        let usedMemory = max(0, mMaximumMemory - getAvailableMemory())
+        let boundary = scanSession.boundarySnapshot()
+        let correctionQuaternion = simd_quatf(mARPoseCorrection)
+        let softwarePoseCorrection = ScanTransform(
+            x: mARPoseCorrection.columns.3.x,
+            y: mARPoseCorrection.columns.3.y,
+            z: mARPoseCorrection.columns.3.z,
+            qx: correctionQuaternion.imag.x,
+            qy: correctionQuaternion.imag.y,
+            qz: correctionQuaternion.imag.z,
+            qw: correctionQuaternion.real)
+        let finalNodeCount = mMapNodes
+        let finalDatabaseMemoryMB = mLatestDatabaseMemoryMB
+        let finalKnownAreaM2 = scanSession.currentAreaM2
+        let finalPriceTagCount = scanSession.priceTags.count
+        let finalizedAt = Date().getFormattedDate(format: "yyyy-MM-dd HH:mm:ss")
+        let availableBytesAtFinalization = availableDiskBytes(at: segmentDirectory)
+        let thermalStateAtFinalization = currentThermalStateText()
 
-        showToast(message: String(format: localized("Saving segment %d (%@)..."), segmentIndex, reason.localizedText), seconds: 2)
         session.pause()
         locationManager?.stopUpdatingLocation()
         rtabmap?.setPausedMapping(paused: true)
-        rtabmap?.setPreserveCameraOrigin(enabled: true)
         rtabmap?.stopCamera()
         updateState(state: .STATE_PROCESSING)
+        showToast(message: localized("Finalizing continuous streaming database..."), seconds: 2)
 
-        let databasePath = segmentDir.appendingPathComponent(String(format: "rtabmap_segment_%04d.db", segmentIndex)).path
-        let metadata = ScanSegmentMetadata(
-            segmentIndex: segmentIndex,
-            exportedAt: Date().getFormattedDate(format: "yyyy-MM-dd HH:mm:ss"),
-            knownAreaM2: area,
-            nodeCount: mMapNodes,
-            databaseMemoryMB: dbMemoryMB,
-            usedMemoryMB: usedMem,
-            thresholdAreaM2: scanSession.areaThresholdM2,
-            thresholdDatabaseMB: scanSession.databaseThresholdMB,
-            thresholdUsedMemoryMB: scanSession.usedMemoryThresholdMB,
-            priceTagCount: scanSession.priceTags.count)
-
-        var localSaveSeconds = 0.0
+        var saveSucceeded = false
+        var sidecarError: String?
+        var saveSeconds = 0.0
         var sidecarSeconds = 0.0
+        var finalDatabaseBytes: UInt64 = 0
+        var snapshot: ScanSegmentSidecarSnapshot?
         DispatchQueue.background(background: {
             let saveStartedAt = Date()
-            self.rtabmap?.save(databasePath: databasePath)
-            localSaveSeconds = Date().timeIntervalSince(saveStartedAt)
-            do {
+            saveSucceeded = self.rtabmap?.save(databasePath: databaseURL.path, savePreview: false) ?? false
+            saveSeconds = Date().timeIntervalSince(saveStartedAt)
+            if saveSucceeded {
                 let sidecarStartedAt = Date()
-                try scanSession.writeSidecarFiles(to: segmentDir, metadata: metadata)
+                do {
+                    // SQLite may flush WAL pages during save, so measure the
+                    // database only after RTAB-Map has completed finalization.
+                    finalDatabaseBytes = self.databaseStorageBytes(at: databaseURL)
+                    let metadata = ScanSegmentMetadata(
+                        segmentIndex: 1,
+                        scanMode: "continuous_streaming",
+                        finalized: true,
+                        processingProfile: "iphone_continuous_pc_offline_software_error_v2_no_fiducials",
+                        exportedAt: finalizedAt,
+                        knownAreaM2: finalKnownAreaM2,
+                        nodeCount: finalNodeCount,
+                        databaseMemoryMB: finalDatabaseMemoryMB,
+                        usedMemoryMB: usedMemory,
+                        priceTagCount: finalPriceTagCount,
+                        trackingSessionId: scanSession.trackingSessionId,
+                        sensorStartPose: boundary.sensorStartPose,
+                        sensorEndPose: boundary.sensorEndPose,
+                        rtabmapStartPose: boundary.rtabmapStartPose,
+                        rtabmapEndPose: boundary.rtabmapEndPose,
+                        rtabmapOriginOffset: originOffset,
+                        softwarePoseCorrection: softwarePoseCorrection,
+                        databaseBytes: finalDatabaseBytes,
+                        availableDiskBytes: availableBytesAtFinalization,
+                        thermalState: thermalStateAtFinalization,
+                        captureHealth: boundary.captureHealth)
+                    let finalSnapshot = scanSession.makeSidecarSnapshot(metadata: metadata)
+                    snapshot = finalSnapshot
+                    try scanSession.writeSidecarFiles(to: segmentDirectory, snapshot: finalSnapshot)
+                }
+                catch {
+                    sidecarError = error.localizedDescription
+                }
                 sidecarSeconds = Date().timeIntervalSince(sidecarStartedAt)
             }
-            catch {
-                print("Could not write segment sidecar files: \(error)")
-            }
         }, completion: {
-            let resumeStartedAt = Date()
-            let needsBackgroundCopy = scanSession.hasCustomBaseDirectory
-            if didStartSecurityScope && !needsBackgroundCopy {
-                scanSession.stopAccessingBaseDirectorySecurityScope()
-            }
-            scanSession.nextSegment()
-            self.mMapNodes = 0
-            self.mLatestDatabaseMemoryMB = 0
-            self.mTotalLoopClosures = 0
-            self.lowMemoryWarningShown = false
-
-            let tmpDatabase = self.getDocumentDirectory().appendingPathComponent(self.RTABMAP_TMP_DB)
-            self.rtabmap!.openDatabase(databasePath: tmpDatabase.path, databaseInMemory: false, optimize: false, clearDatabase: true)
-            self.mSegmentStartUsedMemoryMB = max(0, self.mMaximumMemory - self.getAvailableMemory())
-            if resumeAfterSave {
+            guard saveSucceeded, sidecarError == nil, let snapshot = snapshot else {
+                if didStartSecurityScope {
+                    exportBaseDirectory?.stopAccessingSecurityScopedResource()
+                }
+                scanSession.isFinalizingScan = false
+                scanSession.appendScanEvent(
+                    level: "error",
+                    event: "scan_finalization_failed",
+                    message: sidecarError ?? "Streaming database save failed")
+                self.showToast(message: sidecarError.map { String(format: self.localized("Streaming database was saved, but metadata failed: %@"), $0) } ?? self.localized("Streaming database save failed."), seconds: 5)
                 self.setGLCamera(type: 0)
                 self.startCamera(resetTracking: false)
-                if previousState == .STATE_MAPPING {
-                    self.rtabmap?.setPausedMapping(paused: false)
-                    self.updateState(state: .STATE_MAPPING)
-                }
-                else {
-                    self.updateState(state: .STATE_CAMERA)
-                }
+                self.rtabmap?.setPausedMapping(paused: false)
+                self.updateState(state: .STATE_MAPPING)
+                completion?(false)
+                return
             }
-            else {
-                self.setGLCamera(type: 2)
-                self.rtabmap?.setPausedMapping(paused: true)
-                self.updateState(state: .STATE_IDLE)
-                self.statusLabel.text = ""
-            }
-            scanSession.isExportingSegment = false
-            let resumeSeconds = Date().timeIntervalSince(resumeStartedAt)
-            let pausedSeconds = Date().timeIntervalSince(rolloverStartedAt)
-            print(String(format: "Segment %d rollover timing: save=%.2fs sidecar=%.2fs resume=%.2fs paused=%.2fs",
-                         segmentIndex, localSaveSeconds, sidecarSeconds, resumeSeconds, pausedSeconds))
 
-            if needsBackgroundCopy {
-                let message: String
-                if resumeAfterSave {
-                    message = String(format: self.localized("Segment %d saved locally. Continuing with segment %d while copying in background."), segmentIndex, scanSession.segmentIndex)
-                }
-                else {
-                    message = String(format: self.localized("Segment %d saved locally. Scanning stopped while copying in background."), segmentIndex)
-                }
-                self.showToast(message: message, seconds: 3)
-                self.copySegmentInBackground(
+            scanSession.appendScanEvent(
+                event: "scan_finalized",
+                message: "Continuous streaming database finalized",
+                fields: [
+                    "nodeCount": "\(snapshot.metadata.nodeCount)",
+                    "databaseBytes": "\(finalDatabaseBytes)",
+                    "saveSeconds": String(format: "%.3f", saveSeconds),
+                    "sidecarSeconds": String(format: "%.3f", sidecarSeconds)
+                ])
+            let finalScanStorageBytes = self.captureDirectoryStorageBytes(at: segmentDirectory)
+
+            // Detach RTAB-Map from the completed database before a background
+            // external copy is allowed to remove the local capture directory.
+            let tmpDatabase = self.getDocumentDirectory().appendingPathComponent(self.RTABMAP_TMP_DB)
+            self.rtabmap!.openDatabase(databasePath: tmpDatabase.path, databaseInMemory: false, optimize: false, clearDatabase: true)
+            self.mMapNodes = 0
+            self.mLatestDatabaseMemoryMB = 0
+            self.mLatestScanStorageBytes = finalScanStorageBytes
+            self.setGLCamera(type: 2)
+            self.updateState(state: .STATE_IDLE)
+            print(String(format: "Streaming scan finalized: save=%.2fs sidecar=%.2fs", saveSeconds, sidecarSeconds))
+
+            // The verified local database is already complete. Release this
+            // session now so the next scan can start while a large external
+            // copy continues against captured immutable paths.
+            scanSession.completeCurrentSession()
+            scanSession.isFinalizingScan = false
+            self.showToast(message: self.localized("Continuous streaming scan finalized as one database."), seconds: 3)
+            completion?(true)
+
+            if let exportBaseDirectory = exportBaseDirectory {
+                self.copyCaptureInBackground(
                     scanSession: scanSession,
-                    segmentDir: segmentDir,
-                    segmentIndex: segmentIndex,
+                    captureDir: segmentDirectory,
+                    exportBaseDirectory: exportBaseDirectory,
                     didStartSecurityScope: didStartSecurityScope,
-                    localSaveSeconds: localSaveSeconds,
-                    sidecarSeconds: sidecarSeconds,
-                    pausedSeconds: pausedSeconds)
+                    localSaveSeconds: saveSeconds,
+                    sidecarSeconds: sidecarSeconds)
             }
             else {
-                let message: String
-                if resumeAfterSave {
-                    message = String(format: self.localized("Segment %d saved. Continuing with segment %d. Pause: %.1fs."), segmentIndex, scanSession.segmentIndex, pausedSeconds)
+                if didStartSecurityScope {
+                    exportBaseDirectory?.stopAccessingSecurityScopedResource()
                 }
-                else {
-                    message = String(format: self.localized("Segment %d saved. Scanning stopped. Pause: %.1fs."), segmentIndex, pausedSeconds)
-                }
-                self.showToast(message: message, seconds: 3)
             }
-            completion?(true)
         })
     }
 
-    private func copySegmentInBackground(scanSession: SupermarketScanSession,
-                                         segmentDir: URL,
-                                         segmentIndex: Int,
+    private func copyCaptureInBackground(scanSession: SupermarketScanSession,
+                                         captureDir: URL,
+                                         exportBaseDirectory: URL,
                                          didStartSecurityScope: Bool,
                                          localSaveSeconds: Double,
                                          sidecarSeconds: Double,
-                                         pausedSeconds: Double)
+                                         completion: (() -> Void)? = nil)
     {
-        var copiedSegmentPath: String?
+        var copiedCapturePath: String?
         var copyErrorMessage: String?
         var cleanupErrorMessage: String?
-        var localSegmentRemoved = false
+        var localCaptureRemoved = false
         var copySeconds = 0.0
         DispatchQueue.background(background: {
             let copyStartedAt = Date()
             do {
-                if let copiedSegment = try scanSession.copySegmentToCustomBaseDirectory(from: segmentDir) {
-                    copiedSegmentPath = copiedSegment.path
+                if let copiedCapture = try scanSession.copyCaptureToCustomBaseDirectory(
+                    from: captureDir,
+                    destinationBaseDirectory: exportBaseDirectory) {
+                    copiedCapturePath = copiedCapture.path
                     do {
-                        try scanSession.removeLocalSegmentDirectory(segmentDir)
-                        localSegmentRemoved = true
+                        try scanSession.removeLocalCaptureDirectory(captureDir)
+                        localCaptureRemoved = true
                     }
                     catch {
                         cleanupErrorMessage = error.localizedDescription
-                        print("Could not remove local segment after external copy: \(error)")
+                        print("Could not remove local scan after external copy: \(error)")
                     }
                 }
             }
             catch {
                 copyErrorMessage = error.localizedDescription
-                print("Could not copy segment to selected location: \(error)")
+                print("Could not copy scan to selected location: \(error)")
             }
             copySeconds = Date().timeIntervalSince(copyStartedAt)
         }, completion: {
             if didStartSecurityScope {
-                scanSession.stopAccessingBaseDirectorySecurityScope()
+                exportBaseDirectory.stopAccessingSecurityScopedResource()
             }
-            print(String(format: "Segment %d background copy timing: save=%.2fs sidecar=%.2fs paused=%.2fs copy=%.2fs",
-                         segmentIndex, localSaveSeconds, sidecarSeconds, pausedSeconds, copySeconds))
+            print(String(format: "Scan background copy timing: save=%.2fs sidecar=%.2fs copy=%.2fs",
+                         localSaveSeconds, sidecarSeconds, copySeconds))
             if let copyErrorMessage = copyErrorMessage {
-                self.showToast(message: String(format: self.localized("Segment %d was saved locally, but copying to the selected location failed: %@"), segmentIndex, copyErrorMessage), seconds: 5)
+                self.showToast(message: String(format: self.localized("The scan was saved locally, but copying to the selected location failed: %@"), copyErrorMessage), seconds: 5)
             }
-            else if copiedSegmentPath != nil, let cleanupErrorMessage = cleanupErrorMessage {
-                self.showToast(message: String(format: self.localized("Segment %d was copied to the selected location, but local cleanup failed: %@"), segmentIndex, cleanupErrorMessage), seconds: 5)
+            else if copiedCapturePath != nil, let cleanupErrorMessage = cleanupErrorMessage {
+                self.showToast(message: String(format: self.localized("The scan was copied to the selected location, but local cleanup failed: %@"), cleanupErrorMessage), seconds: 5)
             }
-            else if copiedSegmentPath != nil && localSegmentRemoved {
-                self.showToast(message: String(format: self.localized("Segment %d was copied to the selected location in background and the local copy was removed. Copy: %.1fs."), segmentIndex, copySeconds), seconds: 3)
+            else if copiedCapturePath != nil && localCaptureRemoved {
+                self.showToast(message: String(format: self.localized("The scan was copied in background and the local copy was removed. Copy: %.1fs."), copySeconds), seconds: 3)
             }
-            else if copiedSegmentPath != nil {
-                self.showToast(message: String(format: self.localized("Segment %d was copied to the selected location in background. Copy: %.1fs."), segmentIndex, copySeconds), seconds: 3)
+            else if copiedCapturePath != nil {
+                self.showToast(message: String(format: self.localized("The scan was copied to the selected location in background. Copy: %.1fs."), copySeconds), seconds: 3)
             }
+            completion?()
         })
     }
 
-    func mergeSavedSegments()
-    {
-        guard let scanSession = supermarketSession else {
-            return
-        }
-
-        if scanSession.isExportingSegment {
-            showToast(message: localized("A segment is already being saved. Please wait before merging."), seconds: 2)
-            return
-        }
-
-        let didStartSecurityScope = scanSession.startAccessingBaseDirectorySecurityScope()
-        var segmentDatabases = scanSession.savedSegmentDatabaseURLs()
-
-        if mState == .STATE_MAPPING && mMapNodes > 0 {
-            if didStartSecurityScope {
-                scanSession.stopAccessingBaseDirectorySecurityScope()
-            }
-            showToast(message: localized("Saving current segment before merging..."), seconds: 2)
-            rolloverCurrentSegment(reason: .manual, resumeAfterSave: false) { saved in
-                if saved {
-                    self.mergeSavedSegments()
-                }
-                else {
-                    self.showToast(message: self.localized("Current segment could not be saved, so merging was canceled."), seconds: 3)
-                }
-            }
-            return
-        }
-
-        guard segmentDatabases.count >= 2 else {
-            if didStartSecurityScope {
-                scanSession.stopAccessingBaseDirectorySecurityScope()
-            }
-            showToast(message: localized("At least two saved segment databases are required to merge."), seconds: 3)
-            return
-        }
-
-        session.pause()
-        locationManager?.stopUpdatingLocation()
-        rtabmap?.setPausedMapping(paused: true)
-        rtabmap?.stopCamera()
-        segmentDatabases = segmentDatabases.sorted { $0.lastPathComponent < $1.lastPathComponent }
-
-        let outputName = "SupermarketMerged-\(Date().getFormattedDate(format: "yyMMdd-HHmmss")).db"
-        let outputURL = getDocumentDirectory().appendingPathComponent(outputName)
-        let previousState = mState
-        let alertView = UIAlertController(
-            title: localized("Merging Segments"),
-            message: String(format: localized("Merging %d saved segment databases..."), segmentDatabases.count),
-            preferredStyle: .alert)
-        alertView.addAction(UIAlertAction(title: localized("Cancel"), style: .cancel, handler: { _ in
-            self.dismiss(animated: true)
-            self.progressView = nil
-            self.rtabmap?.cancelProcessing()
-        }))
-
-        updateState(state: .STATE_PROCESSING)
-        present(alertView, animated: true, completion: {
-            let margin: CGFloat = 8.0
-            let rect = CGRect(x: margin, y: 84.0, width: alertView.view.frame.width - margin * 2.0, height: 2.0)
-            self.progressView = UIProgressView(frame: rect)
-            self.progressView!.progress = 0
-            self.progressView!.tintColor = self.view.tintColor
-            alertView.view.addSubview(self.progressView!)
-
-            var success = false
-            DispatchQueue.background(background: {
-                success = self.rtabmap?.mergeDatabases(
-                    inputDatabasePaths: segmentDatabases.map { $0.path },
-                    outputDatabasePath: outputURL.path) ?? false
-            }, completion: {
-                if didStartSecurityScope {
-                    scanSession.stopAccessingBaseDirectorySecurityScope()
-                }
-
-                self.dismiss(animated: true, completion: {
-                    self.progressView = nil
-                    if success {
-                        self.openedDatabasePath = outputURL
-                        self.updateDatabases()
-                        self.showToast(message: String(format: self.localized("Merged %d segments into %@."), segmentDatabases.count, outputName), seconds: 3)
-                        self.openDatabase(fileUrl: outputURL)
-                    }
-                    else {
-                        self.updateState(state: previousState)
-                        self.showToast(message: self.localized("Segment merge failed."), seconds: 4)
-                    }
-                })
-            })
-        })
-    }
-
-    func generate2DMapPackage()
-    {
-        guard let scanSession = supermarketSession else {
-            return
-        }
-
-        if scanSession.isExportingSegment {
-            showToast(message: localized("A segment is already being saved. Please wait before generating the 2D map."), seconds: 2)
-            return
-        }
-
-        if mState == .STATE_MAPPING && mMapNodes > 0 {
-            showToast(message: localized("Saving current segment before generating the 2D map..."), seconds: 2)
-            rolloverCurrentSegment(reason: .manual, resumeAfterSave: false) { saved in
-                if saved {
-                    self.generate2DMapPackage()
-                }
-                else {
-                    self.showToast(message: self.localized("Current segment could not be saved, so 2D map generation was canceled."), seconds: 3)
-                }
-            }
-            return
-        }
-
-        let didStartSecurityScope = scanSession.startAccessingBaseDirectorySecurityScope()
-        let previousState = mState
-        updateState(state: .STATE_PROCESSING)
-        showToast(message: localized("Generating 2D map package..."), seconds: 2)
-
-        var outputURL: URL?
-        var errorMessage: String?
-        DispatchQueue.background(background: {
-            do {
-                outputURL = try scanSession.generate2DMapPackage()
-            }
-            catch {
-                errorMessage = error.localizedDescription
-            }
-        }, completion: {
-            if didStartSecurityScope {
-                scanSession.stopAccessingBaseDirectorySecurityScope()
-            }
-            self.updateState(state: previousState)
-            if let outputURL = outputURL {
-                self.showToast(message: String(format: self.localized("2D map package generated: %@"), outputURL.lastPathComponent), seconds: 4)
-                self.show2DMapPackage(outputURL)
-            }
-            else {
-                self.showToast(message: String(format: self.localized("2D map generation failed: %@"), errorMessage ?? self.localized("Unknown error")), seconds: 5)
-            }
-        })
-    }
-
-    func viewLatest2DMapPackage()
-    {
-        guard let outputURL = supermarketSession?.latest2DMapPackage() else {
-            showToast(message: localized("No generated 2D map package is available."), seconds: 3)
-            return
-        }
-        show2DMapPackage(outputURL)
-    }
-
-    private func show2DMapPackage(_ mapDirectory: URL)
-    {
-        let previewURL = mapDirectory.appendingPathComponent("preview.png")
-        guard let image = UIImage(contentsOfFile: previewURL.path) else {
-            showToast(message: String(format: localized("2D map preview could not be opened: %@"), previewURL.lastPathComponent), seconds: 4)
-            return
-        }
-
-        let controller = UIViewController()
-        controller.view.backgroundColor = .black
-        controller.title = mapDirectory.lastPathComponent
-
-        let imageView = UIImageView(image: image)
-        imageView.translatesAutoresizingMaskIntoConstraints = false
-        imageView.contentMode = .scaleAspectFit
-        imageView.backgroundColor = .black
-        controller.view.addSubview(imageView)
-
-        let closeButton = UIButton(type: .system)
-        closeButton.translatesAutoresizingMaskIntoConstraints = false
-        closeButton.setTitle(localized("Close"), for: .normal)
-        closeButton.tintColor = .white
-        closeButton.backgroundColor = UIColor.black.withAlphaComponent(0.55)
-        closeButton.layer.cornerRadius = 8
-        closeButton.contentEdgeInsets = UIEdgeInsets(top: 8, left: 14, bottom: 8, right: 14)
-        closeButton.addAction(UIAction(handler: { _ in
-            controller.dismiss(animated: true)
-        }), for: .touchUpInside)
-        controller.view.addSubview(closeButton)
-
-        let infoLabel = UILabel()
-        infoLabel.translatesAutoresizingMaskIntoConstraints = false
-        infoLabel.text = mapDirectory.lastPathComponent
-        infoLabel.textColor = .white
-        infoLabel.font = UIFont.systemFont(ofSize: 14, weight: .medium)
-        infoLabel.backgroundColor = UIColor.black.withAlphaComponent(0.55)
-        infoLabel.textAlignment = .center
-        infoLabel.numberOfLines = 2
-        controller.view.addSubview(infoLabel)
-
-        NSLayoutConstraint.activate([
-            imageView.leadingAnchor.constraint(equalTo: controller.view.leadingAnchor),
-            imageView.trailingAnchor.constraint(equalTo: controller.view.trailingAnchor),
-            imageView.topAnchor.constraint(equalTo: controller.view.topAnchor),
-            imageView.bottomAnchor.constraint(equalTo: controller.view.bottomAnchor),
-            closeButton.trailingAnchor.constraint(equalTo: controller.view.safeAreaLayoutGuide.trailingAnchor, constant: -16),
-            closeButton.topAnchor.constraint(equalTo: controller.view.safeAreaLayoutGuide.topAnchor, constant: 16),
-            infoLabel.leadingAnchor.constraint(equalTo: controller.view.safeAreaLayoutGuide.leadingAnchor, constant: 16),
-            infoLabel.trailingAnchor.constraint(lessThanOrEqualTo: closeButton.leadingAnchor, constant: -12),
-            infoLabel.centerYAnchor.constraint(equalTo: closeButton.centerYAnchor)
-        ])
-
-        controller.modalPresentationStyle = .fullScreen
-        present(controller, animated: true)
-    }
-    
     func save()
     {
         //Step : 1
@@ -2787,13 +3157,7 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
     private func optimization(withStandardMeshExport: Bool = false, approach: Int)
     {
         guard mMapNodes > 0 else {
-            let savedSegments = supermarketSession?.savedSegmentDatabaseCount() ?? 0
-            if savedSegments > 0 {
-                showToast(message: String(format: localized("%d saved segment databases are available. Use Merge Saved Segments to combine them."), savedSegments), seconds: 5)
-            }
-            else {
-                showToast(message: localized("No mapping data to optimize yet."), seconds: 3)
-            }
+            showToast(message: localized("No mapping data to optimize yet."), seconds: 3)
             return
         }
 
@@ -2870,16 +3234,20 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
     
     func stopMapping(ignoreSaving: Bool, offerPostProcessing: Bool = true)
     {
+        // Any call reaching this method is an intentional terminal/safety path;
+        // it must not be undone later by didBecomeActive.
+        cancelAutomaticCaptureResume()
         let hasCurrentMapData = mMapNodes > 0
 
-        // A supermarket session must export its active database as a segment before
-        // stopping, otherwise the final segment bypasses the selected export folder.
+        // Continuous supermarket capture has one terminal action: finalize the
+        // active on-disk database. No rollover/merge path is reachable here.
         if !ignoreSaving,
+           !mDataRecording,
            hasCurrentMapData,
            let scanSession = supermarketSession,
            scanSession.rootDirectory != nil,
-           !scanSession.isExportingSegment {
-            rolloverCurrentSegment(reason: .manual, resumeAfterSave: false)
+           !scanSession.isFinalizingScan {
+            finalizeStreamingScan()
             return
         }
 
@@ -2939,10 +3307,6 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         }
         else if(!hasCurrentMapData)
         {
-            let savedSegments = supermarketSession?.savedSegmentDatabaseCount() ?? 0
-            if !ignoreSaving && savedSegments > 0 {
-                showToast(message: String(format: localized("%d saved segment databases are available. Use Merge Saved Segments to combine them."), savedSegments), seconds: 5)
-            }
             updateState(state: State.STATE_WELCOME);
             statusLabel.text = ""
         }
@@ -3324,8 +3688,13 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
 
     @IBAction func recordAction(_ sender: UIButton) {
         rtabmap?.setPausedMapping(paused: false);
-        lowMemoryWarningShown = false
         updateState(state: .STATE_MAPPING)
+        if !mDataRecording {
+            supermarketSession?.appendScanEvent(
+                event: "mapping_started",
+                message: "User started continuous mapping",
+                fields: ["nodeCount": "\(mMapNodes)"])
+        }
     }
     
     @IBAction func newScanAction(_ sender: UIButton) {
@@ -3338,7 +3707,7 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
     }
     
     @IBAction func stopCameraAction(_ sender: UIButton) {
-        appMovedToBackground();
+        stopMapping(ignoreSaving: true)
     }
     
     @IBAction func exportOBJPLYAction(_ sender: UIButton) {

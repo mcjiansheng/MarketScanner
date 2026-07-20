@@ -873,7 +873,10 @@ generate_export_header(rtabmap_core
  DEPRECATED_MACRO_NAME RTABMAP_DEPRECATED)
 
 target_include_directories(rtabmap_core PUBLIC 
-  "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR};${CMAKE_CURRENT_SOURCE_DIR}/../include;${CMAKE_CURRENT_BINARY_DIR};${CMAKE_CURRENT_BINARY_DIR}/include>"
+  # Build-specific generated headers (Version.h and export declarations) must
+  # take precedence over generated headers left in the source tree by another
+  # platform build, otherwise iOS feature defines can leak into desktop builds.
+  "$<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR};${CMAKE_CURRENT_BINARY_DIR}/include;${CMAKE_CURRENT_SOURCE_DIR};${CMAKE_CURRENT_SOURCE_DIR}/../include>"
   "$<INSTALL_INTERFACE:${INSTALL_INCLUDE_DIR}>")
 
 target_include_directories(rtabmap_core SYSTEM PUBLIC 

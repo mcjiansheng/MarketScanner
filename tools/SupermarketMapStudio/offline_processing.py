@@ -1,0 +1,1084 @@
+#!/usr/bin/env python3
+"""RTAB-Map PC reprocessing for continuous iPhone supermarket scans.
+
+The phone database is treated as immutable input. Reprocessing always writes a
+new database through a temporary path, validates it, and only then publishes it
+as the optimized database consumed by Map Studio.
+"""
+
+from __future__ import annotations
+
+import json
+import math
+import os
+import re
+import shutil
+import sqlite3
+import subprocess
+import tempfile
+import threading
+import time
+from contextlib import closing
+from pathlib import Path
+from typing import Any, Callable, Dict, Iterable, Optional
+
+import supermarket_2d_map as base
+
+
+REPROCESS_ENV = "RTABMAP_REPROCESS"
+REPROCESS_TEMP_ENV = "SUPERMARKET_PC_TEMP"
+DEFAULT_PC_THREADS = min(4, max(1, os.cpu_count() or 1))
+DEFAULT_ONLINE_OPTIMIZATION_ITERATIONS = 5
+DEFAULT_FINAL_OPTIMIZATION_ITERATIONS = 50
+DEFAULT_FINAL_OPTIMIZATION_EPSILON = 0.00001
+ADAPTIVE_PROFILE = "adaptive_constraint_reuse_then_discovery_v1"
+FAST_REUSE_PROFILE = "constraint_reuse_fast_v1"
+DISCOVERY_PROFILE = "orb_loop_discovery_v2"
+FAST_REUSE_PARAMETERS = (
+    ("RGBD/LoopClosureReextractFeatures", "false"),
+    ("RGBD/ProximityByTime", "false"),
+    ("RGBD/ProximityBySpace", "false"),
+    ("Rtabmap/LoopThr", "1.0"),
+)
+ReprocessProgressCallback = Callable[[float, str, str], None]
+REPROCESS_PARAMETERS = (
+    ("Mem/IncrementalMemory", "true"),
+    ("Mem/InitWMWithAllNodes", "false"),
+    ("Mem/STMSize", "30"),
+    ("Mem/RehearsalSimilarity", "0.6"),
+    ("Mem/UseOdomGravity", "true"),
+    ("Rtabmap/MemoryThr", "2000"),
+    ("Rtabmap/TimeThr", "0"),
+    ("Rtabmap/MaxRetrieved", "5"),
+    ("Rtabmap/LoopThr", "0.15"),
+    # ORB is substantially faster than GFTT/BRIEF for PC re-extraction on the
+    # iPhone frames while retaining enough correspondences for strict loop
+    # validation. Phone odometry features remain in the immutable source DB.
+    ("Kp/DetectorStrategy", "2"),
+    ("Vis/FeatureType", "2"),
+    ("Kp/MaxFeatures", "500"),
+    ("Vis/MinInliers", "40"),
+    ("RGBD/LinearUpdate", "0"),
+    ("RGBD/AngularUpdate", "0"),
+    ("RGBD/MaxLocalRetrieved", "5"),
+    # ARKit VIO already supplies dense metric neighbor constraints. Refining
+    # every adjacent pair repeats visual work without adding global
+    # observability; reserve PC visual registration for loop/proximity edges.
+    ("RGBD/NeighborLinkRefining", "false"),
+    ("RGBD/ProximityByTime", "true"),
+    ("RGBD/ProximityBySpace", "true"),
+    ("RGBD/ProximityMaxGraphDepth", "100"),
+    ("RGBD/ProximityMaxPaths", "5"),
+    ("RGBD/ProximityOdomGuess", "true"),
+    ("RGBD/LoopClosureReextractFeatures", "true"),
+    ("RGBD/OptimizeFromGraphEnd", "true"),
+    ("RGBD/OptimizeMaxError", "2.0"),
+    ("RGBD/OptimizeMaxErrorRepairRadius", "1.0"),
+    # This profile deliberately uses no fiducial or externally positioned
+    # anchors. ARKit VIO, RGB-D registration and appearance/proximity loop
+    # closures are the only constraints entering the graph.
+    ("RGBD/MarkerDetection", "false"),
+    # Robust kernels and gravity constraints require g2o/GTSAM. Pin g2o so
+    # results don't change with whichever optional solver a PC happens to
+    # have installed.
+    ("Optimizer/Strategy", "1"),
+    # Replaying a long capture with 50 iterations at every graph update makes
+    # total cost grow superlinearly. A warm-started online solve only keeps the
+    # graph coherent for loop/proximity decisions; one full solve is run after
+    # replay by rtabmap-reprocess's -final_opt_iterations option.
+    ("Optimizer/Iterations", str(DEFAULT_ONLINE_OPTIMIZATION_ITERATIONS)),
+    ("Optimizer/GravitySigma", "0.2"),
+    ("Optimizer/Robust", "true"),
+    ("Optimizer/PriorsIgnored", "true"),
+    ("Optimizer/LandmarksIgnored", "true"),
+    ("g2o/RobustKernelDelta", "8"),
+    # Homebrew g2o may be built without CSparse/CHOLMOD. Explicitly select the
+    # always-available sparse Eigen backend instead of silently falling back to
+    # PCG, which is especially slow for this graph shape.
+    ("g2o/Solver", "3"),
+    ("DbSqlite3/InMemory", "false"),
+)
+
+
+_PROCESSED_NODE_RE = re.compile(r"Processed\s+(\d+)/(\d+)\s+nodes.*?\.\.\.\s+(\d+)ms")
+_FINAL_START_RE = re.compile(
+    r"FINAL_OPTIMIZATION_START\s+poses=(\d+)\s+constraints=(\d+).*?iterations=(\d+)"
+)
+_FINAL_DONE_RE = re.compile(
+    r"FINAL_OPTIMIZATION_DONE\s+poses=(\d+)\s+constraints=(\d+)\s+"
+    r"iterations_done=(\d+)\s+error=([^\s]+)\s+seconds=([^\s]+)"
+)
+
+
+class OfflineProcessingError(RuntimeError):
+    pass
+
+
+def _executable(path: Path) -> bool:
+    return path.is_file() and os.access(path, os.X_OK)
+
+
+def find_reprocess_binary(explicit: Optional[str] = None, prefer_cuda: bool = False) -> Optional[Path]:
+    candidates = []
+    if explicit:
+        candidates.append(Path(explicit).expanduser())
+    if os.environ.get(REPROCESS_ENV):
+        candidates.append(Path(os.environ[REPROCESS_ENV]).expanduser())
+    repository = Path(__file__).resolve().parents[2]
+    # Prefer the project-local optimized build over an older system/debug
+    # binary, while still letting an explicit path or environment override win.
+    if prefer_cuda:
+        candidates.append(repository / "build-pc-cuda/bin/rtabmap-reprocess")
+    candidates.append(repository / "build-pc-release/bin/rtabmap-reprocess")
+    discovered = shutil.which("rtabmap-reprocess")
+    if discovered:
+        candidates.append(Path(discovered))
+
+    candidates.extend(
+        repository / relative
+        for relative in (
+            "build/bin/rtabmap-reprocess",
+            "build-pc-debug/bin/rtabmap-reprocess",
+            "build/tools/Reprocess/rtabmap-reprocess",
+            "build/Release/rtabmap-reprocess",
+            "bin/rtabmap-reprocess",
+            "build/bin/Release/rtabmap-reprocess.exe",
+            "build/tools/Reprocess/Release/rtabmap-reprocess.exe",
+        )
+    )
+    for candidate in candidates:
+        resolved = candidate.resolve()
+        if _executable(resolved):
+            return resolved
+    return None
+
+
+def inspect_database(path: Path) -> Dict[str, Any]:
+    result: Dict[str, Any] = {
+        "path": str(path),
+        "size_bytes": path.stat().st_size if path.is_file() else 0,
+        "integrity": "missing",
+        "node_count": 0,
+        "rgbd_frame_count": 0,
+        "optimized_pose_count": 0,
+        "timestamp_regressions": 0,
+        "link_table_present": False,
+        "link_type_counts": {},
+        "neighbor_link_count": 0,
+        "loop_closure_count": 0,
+        "loop_closure_pair_count": 0,
+        "long_range_loop_pair_count": 0,
+        "landmark_link_count": 0,
+        "pose_prior_link_count": 0,
+    }
+    if not path.is_file():
+        return result
+    try:
+        with closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)) as conn:
+            integrity_row = conn.execute("PRAGMA quick_check").fetchone()
+            result["integrity"] = str(integrity_row[0]) if integrity_row else "unknown"
+            tables = set(base.sqlite_tables(conn))
+            if "Node" in tables:
+                result["node_count"] = int(conn.execute("SELECT count(*) FROM Node WHERE id>0").fetchone()[0])
+                node_columns = set(base.table_columns(conn, "Node"))
+                if "stamp" in node_columns:
+                    previous = None
+                    regressions = 0
+                    for (stamp,) in conn.execute("SELECT stamp FROM Node WHERE id>0 ORDER BY id"):
+                        if stamp is not None and previous is not None and float(stamp) < previous:
+                            regressions += 1
+                        if stamp is not None:
+                            previous = float(stamp)
+                    result["timestamp_regressions"] = regressions
+            if "Data" in tables:
+                data_columns = set(base.table_columns(conn, "Data"))
+                required_columns = {"image", "depth", "calibration"}
+                if required_columns.issubset(data_columns):
+                    predicates = [f"length({column})>0" for column in sorted(required_columns)]
+                    result["rgbd_frame_count"] = int(
+                        conn.execute("SELECT count(*) FROM Data WHERE " + " AND ".join(predicates)).fetchone()[0]
+                    )
+            result["optimized_pose_count"] = len(base.extract_optimized_pose_blobs(conn))
+            if "Link" in tables:
+                result["link_table_present"] = True
+                link_counts = {
+                    int(link_type): int(count)
+                    for link_type, count in conn.execute(
+                        "SELECT type, count(*) FROM Link GROUP BY type"
+                    )
+                }
+                loop_pairs = {
+                    (min(int(from_id), int(to_id)), max(int(from_id), int(to_id)))
+                    for from_id, to_id in conn.execute(
+                        "SELECT from_id, to_id FROM Link WHERE type BETWEEN 1 AND 5"
+                    )
+                    if int(from_id) != int(to_id)
+                }
+                result["link_type_counts"] = {
+                    str(link_type): count for link_type, count in sorted(link_counts.items())
+                }
+                result["neighbor_link_count"] = link_counts.get(0, 0) + link_counts.get(6, 0)
+                result["loop_closure_count"] = sum(link_counts.get(kind, 0) for kind in (1, 2, 3, 4, 5))
+                result["loop_closure_pair_count"] = len(loop_pairs)
+                result["long_range_loop_pair_count"] = sum(
+                    1 for from_id, to_id in loop_pairs if abs(to_id - from_id) >= 30
+                )
+                result["pose_prior_link_count"] = link_counts.get(7, 0)
+                result["landmark_link_count"] = link_counts.get(8, 0)
+    except sqlite3.Error as exc:
+        result["integrity"] = f"error: {exc}"
+    return result
+
+
+def _constraint_pairs(path: Path, link_types: tuple[int, ...]) -> set[tuple[int, int]]:
+    if not path.is_file() or not link_types:
+        return set()
+    placeholders = ",".join("?" for _ in link_types)
+    try:
+        with closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)) as conn:
+            if "Link" not in set(base.sqlite_tables(conn)):
+                return set()
+            return {
+                (min(int(from_id), int(to_id)), max(int(from_id), int(to_id)))
+                for from_id, to_id in conn.execute(
+                    f"SELECT from_id, to_id FROM Link WHERE type IN ({placeholders})",
+                    link_types,
+                )
+                if int(from_id) != int(to_id)
+            }
+    except sqlite3.Error:
+        return set()
+
+
+def validate_capture_database(path: Path) -> Dict[str, Any]:
+    inspection = inspect_database(path)
+    if inspection["integrity"] != "ok":
+        raise OfflineProcessingError(
+            f"Input database integrity check failed ({inspection['integrity']}): {path}"
+        )
+    if inspection["node_count"] <= 0:
+        raise OfflineProcessingError(f"Input database has no mapping nodes: {path}")
+    if inspection["rgbd_frame_count"] <= 0:
+        raise OfflineProcessingError(
+            f"Input database has no complete RGB-D/calibration frames and cannot be reprocessed: {path}"
+        )
+    if inspection["timestamp_regressions"]:
+        raise OfflineProcessingError(
+            f"Input database has {inspection['timestamp_regressions']} timestamp regressions; "
+            "the continuous trajectory is unsafe to reprocess automatically."
+        )
+    return inspection
+
+
+def _command(
+    binary: Path,
+    input_database: Path,
+    output_database: Path,
+    extra_parameters: Iterable[tuple[str, str]] = (),
+    final_optimization_iterations: int = DEFAULT_FINAL_OPTIMIZATION_ITERATIONS,
+    final_optimization_epsilon: float = DEFAULT_FINAL_OPTIMIZATION_EPSILON,
+    republish_input_loop_closures: bool = True,
+) -> list[str]:
+    command = [str(binary), "-default"]
+    if republish_input_loop_closures:
+        # Accepted phone loop closures are valuable constraints, especially
+        # when thermal throttling limited the number found during capture.
+        command.append("-pub_loops")
+    for key, value in REPROCESS_PARAMETERS:
+        command.extend((f"--{key}", value))
+    for key, value in extra_parameters:
+        command.extend((f"--{key}", value))
+    if final_optimization_iterations > 0:
+        command.extend(("-final_opt_iterations", str(final_optimization_iterations)))
+        command.extend(("-final_opt_epsilon", f"{final_optimization_epsilon:.12g}"))
+    # Deliberately omit -odom: ARKit VIO is the continuous metric prior. PC
+    # feature matching adds loop/proximity constraints and globally optimizes
+    # that graph without introducing a second odometry chain by default.
+    command.extend((str(input_database), str(output_database)))
+    return command
+
+
+def parse_reprocess_runtime(log_text: str) -> Dict[str, Any]:
+    node_samples = [
+        (int(match.group(1)), int(match.group(2)), int(match.group(3)))
+        for match in _PROCESSED_NODE_RE.finditer(log_text)
+    ]
+    durations = [sample[2] for sample in node_samples]
+    final_start = list(_FINAL_START_RE.finditer(log_text))
+    final_done = list(_FINAL_DONE_RE.finditer(log_text))
+    runtime: Dict[str, Any] = {
+        "processed_node_count": node_samples[-1][0] if node_samples else 0,
+        "total_node_count": node_samples[-1][1] if node_samples else 0,
+        "node_timing_sample_count": len(durations),
+        "node_time_ms": {
+            "median": round(_percentile([float(value) for value in durations], 0.5), 3),
+            "p95": round(_percentile([float(value) for value in durations], 0.95), 3),
+            "maximum": max(durations, default=0),
+        },
+        "final_optimization": {
+            "started": bool(final_start),
+            "completed": bool(final_done),
+        },
+    }
+    if final_start:
+        match = final_start[-1]
+        runtime["final_optimization"].update(
+            {
+                "pose_count": int(match.group(1)),
+                "constraint_count": int(match.group(2)),
+                "requested_iterations": int(match.group(3)),
+            }
+        )
+    if final_done:
+        match = final_done[-1]
+        runtime["final_optimization"].update(
+            {
+                "pose_count": int(match.group(1)),
+                "constraint_count": int(match.group(2)),
+                "iterations_done": int(match.group(3)),
+                "final_error": float(match.group(4)),
+                "elapsed_seconds": float(match.group(5)),
+            }
+        )
+    return runtime
+
+
+def _monitor_reprocess_log(
+    path: Path,
+    done: threading.Event,
+    callback: ReprocessProgressCallback,
+) -> None:
+    offset = 0
+    fragment = ""
+    processed = 0
+    total = 0
+    last_emit = 0.0
+    started = time.monotonic()
+    final_stage = False
+    while not done.wait(0.5):
+        if not path.is_file():
+            continue
+        with path.open("r", encoding="utf-8", errors="replace") as handle:
+            handle.seek(offset)
+            chunk = handle.read()
+            offset = handle.tell()
+        if chunk:
+            lines = (fragment + chunk).split("\n")
+            fragment = lines.pop()
+            for line in lines:
+                node_match = _PROCESSED_NODE_RE.search(line)
+                if node_match:
+                    processed = int(node_match.group(1))
+                    total = int(node_match.group(2))
+                if _FINAL_START_RE.search(line):
+                    final_stage = True
+                    callback(0.92, "最终全局优化", "回放完成，正在执行一次高质量全图求解")
+                if _FINAL_DONE_RE.search(line):
+                    callback(0.98, "最终全局优化", "最终全图求解完成，正在验证输出数据库")
+        now = time.monotonic()
+        if processed and total and not final_stage and now - last_emit >= 1.0:
+            fraction = min(0.90, 0.02 + 0.88 * processed / max(1, total))
+            elapsed = int(now - started)
+            callback(
+                fraction,
+                "节点回放与在线优化",
+                f"已处理 {processed}/{total} 节点（{processed * 100 / total:.1f}%），已用时 "
+                f"{elapsed // 60}分{elapsed % 60}秒",
+            )
+            last_emit = now
+
+
+def _tail(text: str, limit: int = 12000) -> str:
+    return text[-limit:] if len(text) > limit else text
+
+
+def _tail_file(path: Path, limit: int = 12000) -> str:
+    if not path.is_file():
+        return ""
+    with path.open("rb") as handle:
+        handle.seek(0, os.SEEK_END)
+        size = handle.tell()
+        handle.seek(max(0, size - limit * 4), os.SEEK_SET)
+        return _tail(handle.read().decode("utf-8", errors="replace"), limit)
+
+
+def _log_contains(path: Path, messages: tuple[str, ...]) -> bool:
+    if not path.is_file():
+        return False
+    with path.open("r", encoding="utf-8", errors="replace") as handle:
+        return any(any(message in line.lower() for message in messages) for line in handle)
+
+
+def _existing_directory(path: Path) -> Path:
+    candidate = path
+    while not candidate.is_dir():
+        parent = candidate.parent
+        if parent == candidate:
+            raise OfflineProcessingError(f"No existing parent directory was found for: {path}")
+        candidate = parent
+    return candidate
+
+
+def _thread_environment(thread_count: int) -> Dict[str, str]:
+    threads = max(1, int(thread_count))
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "OMP_NUM_THREADS": str(threads),
+            "OMP_DYNAMIC": "FALSE",
+            "OMP_WAIT_POLICY": "PASSIVE",
+            # OpenCV 4 reads this before initializing its TBB/OpenMP backend.
+            "OPENCV_FOR_THREADS_NUM": str(threads),
+        }
+    )
+    return environment
+
+
+def _staging_directory() -> Path:
+    configured = os.environ.get(REPROCESS_TEMP_ENV)
+    root = Path(configured).expanduser() if configured else Path(tempfile.gettempdir())
+    root = root.resolve()
+    if not root.is_dir():
+        raise OfflineProcessingError(f"PC staging directory does not exist: {root}")
+    return root
+
+
+def _copy_and_sync(source: Path, destination: Path) -> None:
+    shutil.copy2(source, destination)
+    with destination.open("rb") as handle:
+        os.fsync(handle.fileno())
+
+
+def _database_poses(path: Path, optimized: bool) -> Dict[int, tuple[float, ...]]:
+    poses: Dict[int, tuple[float, ...]] = {}
+    with closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)) as conn:
+        if "Node" not in set(base.sqlite_tables(conn)):
+            return poses
+        optimized_blobs = base.extract_optimized_pose_blobs(conn) if optimized else {}
+        for node_id, raw_blob in conn.execute("SELECT id, pose FROM Node WHERE id>0 ORDER BY id"):
+            blob = optimized_blobs.get(int(node_id)) if optimized else raw_blob
+            matrix = base.parse_transform_matrix(blob) if blob else None
+            if matrix is not None:
+                poses[int(node_id)] = matrix
+    return poses
+
+
+def _percentile(values: list[float], ratio: float) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    index = min(len(ordered) - 1, max(0, int(round((len(ordered) - 1) * ratio))))
+    return ordered[index]
+
+
+def _translation(matrix: tuple[float, ...]) -> tuple[float, float, float]:
+    return matrix[3], matrix[7], matrix[11]
+
+
+def _rotation_difference_degrees(first: tuple[float, ...], second: tuple[float, ...]) -> float:
+    # trace(Ra^T Rb) is the Frobenius inner product of the two 3x3 rotations.
+    rotation_indices = (0, 1, 2, 4, 5, 6, 8, 9, 10)
+    trace = sum(first[index] * second[index] for index in rotation_indices)
+    cosine = min(1.0, max(-1.0, (trace - 1.0) / 2.0))
+    return math.degrees(math.acos(cosine))
+
+
+def trajectory_metrics(poses: Dict[int, tuple[float, ...]]) -> Dict[str, Any]:
+    node_ids = sorted(poses)
+    finite_ids = [
+        node_id
+        for node_id in node_ids
+        if all(math.isfinite(value) for value in poses[node_id])
+    ]
+    positions = [_translation(poses[node_id]) for node_id in finite_ids]
+    step_distances: list[float] = []
+    step_rotations: list[float] = []
+    for first_id, second_id in zip(finite_ids, finite_ids[1:]):
+        first_position = _translation(poses[first_id])
+        second_position = _translation(poses[second_id])
+        step_distances.append(math.dist(first_position, second_position))
+        step_rotations.append(_rotation_difference_degrees(poses[first_id], poses[second_id]))
+    vertical_values = [position[2] for position in positions]
+    start_end_distance = math.dist(positions[0], positions[-1]) if len(positions) > 1 else 0.0
+    return {
+        "pose_count": len(node_ids),
+        "finite_pose_count": len(finite_ids),
+        "nonfinite_pose_count": len(node_ids) - len(finite_ids),
+        "trajectory_length_m": round(sum(step_distances), 4),
+        "start_end_distance_m": round(start_end_distance, 4),
+        "median_step_m": round(_percentile(step_distances, 0.5), 4),
+        "p95_step_m": round(_percentile(step_distances, 0.95), 4),
+        "max_step_m": round(max(step_distances, default=0.0), 4),
+        "p95_step_rotation_deg": round(_percentile(step_rotations, 0.95), 3),
+        "max_step_rotation_deg": round(max(step_rotations, default=0.0), 3),
+        "vertical_span_m": round(max(vertical_values) - min(vertical_values), 4) if vertical_values else 0.0,
+    }
+
+
+def assess_optimized_trajectory(input_database: Path, output_database: Path) -> Dict[str, Any]:
+    raw_all = _database_poses(input_database, optimized=False)
+    optimized_all = _database_poses(output_database, optimized=True)
+    common_ids = sorted(set(raw_all) & set(optimized_all))
+    raw = {node_id: raw_all[node_id] for node_id in common_ids}
+    optimized = {node_id: optimized_all[node_id] for node_id in common_ids}
+    raw_metrics = trajectory_metrics(raw)
+    optimized_metrics = trajectory_metrics(optimized)
+    input_database_inspection = inspect_database(input_database)
+    optimized_database = inspect_database(output_database)
+    input_loop_pairs = _constraint_pairs(input_database, (1, 2, 3, 4, 5))
+    output_graph_pairs = _constraint_pairs(output_database, (0, 1, 2, 3, 4, 5, 6))
+    retained_input_loop_pairs = input_loop_pairs & output_graph_pairs
+    input_long_range_loop_pairs = {
+        pair for pair in input_loop_pairs if abs(pair[1] - pair[0]) >= 30
+    }
+    retained_long_range_loop_pairs = input_long_range_loop_pairs & output_graph_pairs
+    input_loop_retention = (
+        len(retained_input_loop_pairs) / len(input_loop_pairs) if input_loop_pairs else 1.0
+    )
+    input_long_range_retention = (
+        len(retained_long_range_loop_pairs) / len(input_long_range_loop_pairs)
+        if input_long_range_loop_pairs
+        else 1.0
+    )
+    coverage = len(common_ids) / max(1, len(raw_all))
+    warnings: list[str] = []
+    rejection_reasons: list[str] = []
+    score = 100
+
+    if coverage < 0.98:
+        warnings.append(f"Only {coverage * 100:.1f}% of input poses have optimized counterparts.")
+        score -= 20
+    if coverage < 0.90:
+        rejection_reasons.append("Optimized pose coverage is below 90%.")
+    if optimized_metrics["nonfinite_pose_count"]:
+        rejection_reasons.append("The optimized trajectory contains non-finite poses.")
+
+    raw_max_step = float(raw_metrics["max_step_m"])
+    optimized_max_step = float(optimized_metrics["max_step_m"])
+    step_limit = max(3.0, raw_max_step * 3.0 + 0.5)
+    if optimized_max_step > step_limit:
+        rejection_reasons.append(
+            f"Optimized neighbor step {optimized_max_step:.2f} m exceeds the safe {step_limit:.2f} m limit."
+        )
+
+    raw_p95 = float(raw_metrics["p95_step_m"])
+    optimized_p95 = float(optimized_metrics["p95_step_m"])
+    if optimized_p95 > max(1.5, raw_p95 * 2.5 + 0.1):
+        warnings.append("The optimized trajectory enlarged normal frame-to-frame translation unusually.")
+        score -= 20
+
+    raw_rotation = float(raw_metrics["max_step_rotation_deg"])
+    optimized_rotation = float(optimized_metrics["max_step_rotation_deg"])
+    rotation_limit = max(75.0, raw_rotation * 2.0 + 20.0)
+    if optimized_rotation > rotation_limit:
+        rejection_reasons.append(
+            f"Optimized neighbor rotation {optimized_rotation:.1f}° exceeds the safe {rotation_limit:.1f}° limit."
+        )
+
+    raw_vertical = float(raw_metrics["vertical_span_m"])
+    optimized_vertical = float(optimized_metrics["vertical_span_m"])
+    if optimized_vertical > max(raw_vertical + 0.75, raw_vertical * 1.75 + 0.25):
+        warnings.append("Vertical drift increased after optimization despite gravity constraints.")
+        score -= 15
+
+    raw_length = float(raw_metrics["trajectory_length_m"])
+    optimized_length = float(optimized_metrics["trajectory_length_m"])
+    length_ratio = optimized_length / raw_length if raw_length > 1e-6 else 1.0
+    if length_ratio < 0.65 or length_ratio > 1.35:
+        warnings.append(f"Trajectory length changed substantially after optimization (ratio {length_ratio:.3f}).")
+        score -= 15
+    if length_ratio < 0.25 or length_ratio > 3.0:
+        rejection_reasons.append("Trajectory scale changed beyond the automatic safety envelope.")
+
+    # Smooth odometry alone cannot correct accumulated global drift. For a
+    # non-trivial graph, make the lack of any loop/proximity constraint visible
+    # instead of presenting numerical continuity as successful error closure.
+    if (
+        optimized_database["link_table_present"]
+        and len(common_ids) >= 50
+        and optimized_database["loop_closure_count"] == 0
+    ):
+        warnings.append(
+            "No visual or proximity loop-closure constraint was saved; global accumulated drift remains unobservable."
+        )
+        score -= 20
+
+    if input_long_range_loop_pairs and input_long_range_retention < 0.80:
+        warnings.append(
+            f"Only {input_long_range_retention * 100:.1f}% of accepted long-range input loop-closure pairs remain represented in the output graph."
+        )
+        score -= 25
+    if input_long_range_loop_pairs and input_long_range_retention < 0.50:
+        rejection_reasons.append("More than half of the accepted long-range input loop-closure pairs were lost.")
+
+    # A handful of short temporal links cannot constrain drift over a long
+    # supermarket route. Mark the graph as weak so the adaptive workflow can
+    # run the more expensive keyframe/appearance discovery pass only when it
+    # is actually needed.
+    minimum_long_range_pairs = max(2, len(common_ids) // 500)
+    if (
+        len(common_ids) >= 200
+        and optimized_database["long_range_loop_pair_count"] < minimum_long_range_pairs
+    ):
+        warnings.append(
+            "The graph has too few long-range loop-closure pairs for its trajectory length; accumulated drift may remain weakly observable."
+        )
+        score -= 15
+
+    if rejection_reasons:
+        score = min(score, 25)
+        status = "rejected"
+    elif warnings:
+        status = "warning"
+    else:
+        status = "pass"
+    return {
+        "format": "SupermarketTrajectoryErrorAssessment",
+        "version": 1,
+        "profile": "software_only_no_fiducials",
+        "status": status,
+        "quality_score": max(0, score),
+        "optimized_pose_coverage": round(coverage, 6),
+        "common_pose_count": len(common_ids),
+        "raw": raw_metrics,
+        "optimized": optimized_metrics,
+        "trajectory_length_ratio": round(length_ratio, 6),
+        "constraints": {
+            "link_table_present": optimized_database["link_table_present"],
+            "neighbor_link_count": optimized_database["neighbor_link_count"],
+            "loop_closure_count": optimized_database["loop_closure_count"],
+            "loop_closure_pair_count": optimized_database["loop_closure_pair_count"],
+            "long_range_loop_pair_count": optimized_database["long_range_loop_pair_count"],
+            "input_loop_closure_pair_count": len(input_loop_pairs),
+            "retained_input_loop_closure_pair_count": len(retained_input_loop_pairs),
+            "input_loop_closure_retention": round(input_loop_retention, 6),
+            "input_long_range_loop_pair_count": input_database_inspection["long_range_loop_pair_count"],
+            "retained_input_long_range_loop_pair_count": len(retained_long_range_loop_pairs),
+            "input_long_range_loop_retention": round(input_long_range_retention, 6),
+            "landmark_link_count": optimized_database["landmark_link_count"],
+            "pose_prior_link_count": optimized_database["pose_prior_link_count"],
+        },
+        "warnings": warnings,
+        "rejection_reasons": rejection_reasons,
+    }
+
+
+def run_reprocess(
+    input_database: Path,
+    output_database: Path,
+    explicit_binary: Optional[str] = None,
+    timeout_seconds: int = 24 * 60 * 60,
+    thread_count: int = DEFAULT_PC_THREADS,
+    use_local_staging: bool = True,
+    accelerator_backend: str = "cpu",
+    extra_parameters: Iterable[tuple[str, str]] = (),
+    online_optimization_iterations: int = DEFAULT_ONLINE_OPTIMIZATION_ITERATIONS,
+    final_optimization_iterations: int = DEFAULT_FINAL_OPTIMIZATION_ITERATIONS,
+    final_optimization_epsilon: float = DEFAULT_FINAL_OPTIMIZATION_EPSILON,
+    progress_callback: Optional[ReprocessProgressCallback] = None,
+    profile_name: str = DISCOVERY_PROFILE,
+) -> Dict[str, Any]:
+    if online_optimization_iterations < 1:
+        raise OfflineProcessingError("Online optimization iterations must be at least 1.")
+    if final_optimization_iterations < 1:
+        raise OfflineProcessingError("Final optimization iterations must be at least 1.")
+    if final_optimization_epsilon < 0.0:
+        raise OfflineProcessingError("Final optimization epsilon cannot be negative.")
+    accelerator_parameters = tuple(extra_parameters)
+    runtime_parameters = accelerator_parameters + (
+        ("Optimizer/Iterations", str(int(online_optimization_iterations))),
+    )
+    binary = find_reprocess_binary(explicit_binary, prefer_cuda=accelerator_backend == "nvidia_cuda")
+    if binary is None:
+        raise OfflineProcessingError(
+            "rtabmap-reprocess was not found. Build the repository with BUILD_TOOLS=ON, "
+            f"add it to PATH, or set {REPROCESS_ENV}/the Map Studio binary path."
+        )
+    input_database = input_database.resolve()
+    output_database = output_database.resolve()
+    if input_database == output_database:
+        raise OfflineProcessingError(
+            "The optimized database must use a different path; the phone capture is immutable input."
+        )
+    source = validate_capture_database(input_database)
+    threads = max(1, min(64, int(thread_count)))
+
+    output_parent = output_database.parent
+    output_parent_existed = output_parent.is_dir()
+    free_bytes = shutil.disk_usage(_existing_directory(output_parent)).free
+    recommended_bytes = max(2 * 1024**3, source["size_bytes"] * 2)
+    if free_bytes < recommended_bytes:
+        raise OfflineProcessingError(
+            f"Not enough PC disk space for safe reprocessing: {free_bytes / 1024**3:.1f} GB free, "
+            f"{recommended_bytes / 1024**3:.1f} GB recommended."
+        )
+
+    publish_partial = output_database.with_name(
+        output_database.stem + ".partial" + output_database.suffix
+    )
+    started_at = time.time()
+    staging_root = _staging_directory() if use_local_staging else output_database.parent
+    if use_local_staging:
+        staging_free_bytes = shutil.disk_usage(staging_root).free
+        staging_recommended_bytes = max(2 * 1024**3, source["size_bytes"] * 3)
+        if staging_free_bytes < staging_recommended_bytes:
+            raise OfflineProcessingError(
+                f"Not enough local PC staging space: {staging_free_bytes / 1024**3:.1f} GB free, "
+                f"{staging_recommended_bytes / 1024**3:.1f} GB recommended in {staging_root}. "
+                f"Set {REPROCESS_TEMP_ENV} to another fast local directory if needed."
+            )
+
+    output_parent.mkdir(parents=True, exist_ok=True)
+    publish_partial.unlink(missing_ok=True)
+
+    temporary: Optional[tempfile.TemporaryDirectory[str]] = None
+    log_path: Optional[Path] = None
+    copy_in_seconds = 0.0
+    copy_out_seconds = 0.0
+    try:
+        try:
+            if use_local_staging:
+                temporary = tempfile.TemporaryDirectory(
+                    prefix="supermarket-rtabmap-",
+                    dir=staging_root,
+                )
+                work_directory = Path(temporary.name)
+                work_input = work_directory / "capture.db"
+                work_output = work_directory / "optimized.partial.db"
+                copy_started = time.time()
+                _copy_and_sync(input_database, work_input)
+                copy_in_seconds = time.time() - copy_started
+            else:
+                work_directory = output_database.parent
+                work_input = input_database
+                work_output = publish_partial
+
+            command = _command(
+                binary,
+                work_input,
+                work_output,
+                runtime_parameters,
+                final_optimization_iterations,
+                final_optimization_epsilon,
+            )
+            log_path = work_directory / "rtabmap-reprocess.log"
+            monitor_done = threading.Event()
+            monitor_thread: Optional[threading.Thread] = None
+            if progress_callback is not None:
+                progress_callback(0.01, "准备优化", "输入数据库校验完成，正在启动节点回放")
+                monitor_thread = threading.Thread(
+                    target=_monitor_reprocess_log,
+                    args=(log_path, monitor_done, progress_callback),
+                    name="rtabmap-reprocess-progress",
+                    daemon=True,
+                )
+                monitor_thread.start()
+            with log_path.open("w", encoding="utf-8", errors="replace") as log_handle:
+                try:
+                    completed = subprocess.run(
+                        command,
+                        stdout=log_handle,
+                        stderr=subprocess.STDOUT,
+                        text=True,
+                        timeout=timeout_seconds,
+                        check=False,
+                        cwd=str(work_directory),
+                        env=_thread_environment(threads),
+                    )
+                finally:
+                    monitor_done.set()
+                    if monitor_thread is not None:
+                        monitor_thread.join(timeout=2)
+        except subprocess.TimeoutExpired as exc:
+            raise OfflineProcessingError(
+                f"rtabmap-reprocess exceeded the {timeout_seconds}-second safety timeout."
+            ) from exc
+        except OSError as exc:
+            raise OfflineProcessingError(
+                f"PC staging or rtabmap-reprocess I/O failed: {exc}"
+            ) from exc
+
+        if completed.returncode != 0:
+            returned_log = (getattr(completed, "stdout", None) or "") + "\n" + (
+                getattr(completed, "stderr", None) or ""
+            )
+            detail = _tail((returned_log.strip() or _tail_file(log_path, 4000)), 4000)
+            raise OfflineProcessingError(
+                f"rtabmap-reprocess failed with exit code {completed.returncode}: {detail}"
+            )
+
+        unavailable_features = (
+            "g2o optimizer not available",
+            "vertigo robust optimization is not available",
+        )
+        returned_log = (getattr(completed, "stdout", None) or "") + "\n" + (
+            getattr(completed, "stderr", None) or ""
+        )
+        if any(message in returned_log.lower() for message in unavailable_features) or _log_contains(
+            log_path, unavailable_features
+        ):
+            raise OfflineProcessingError(
+                "rtabmap-reprocess completed only after disabling or replacing the requested g2o/Vertigo optimizer. "
+                "Rebuild the PC tool with WITH_G2O=ON and WITH_VERTIGO=ON."
+            )
+
+        gpu_fallback_messages = (
+            "gpu version of gftt not available",
+            "gpu version of gftt is not implemented",
+            "nearest neighobr strategy \"knnbruteforcegpu\" chosen but",
+            "no cuda device(s) detected",
+            "no gpu found",
+        )
+        rtabmap_gpu_fallback = accelerator_backend == "nvidia_cuda" and (
+            any(message in returned_log.lower() for message in gpu_fallback_messages)
+            or _log_contains(log_path, gpu_fallback_messages)
+        )
+
+        full_log = log_path.read_text(encoding="utf-8", errors="replace") if log_path.is_file() else ""
+        runtime = parse_reprocess_runtime(returned_log + "\n" + full_log)
+        if not runtime["final_optimization"]["completed"]:
+            raise OfflineProcessingError(
+                "rtabmap-reprocess did not report completion of the required final global optimization. "
+                "Rebuild the project-local reprocess tool before using the staged optimization profile."
+            )
+
+        optimized = inspect_database(work_output)
+        if optimized["integrity"] != "ok" or optimized["node_count"] <= 0:
+            raise OfflineProcessingError(
+                f"Reprocessed database validation failed: integrity={optimized['integrity']}, "
+                f"nodes={optimized['node_count']}"
+            )
+        if optimized["optimized_pose_count"] <= 0:
+            raise OfflineProcessingError(
+                "Reprocessing completed but no Admin.opt_poses graph was saved; refusing to use raw odometry poses as optimized output."
+            )
+        error_optimization = assess_optimized_trajectory(input_database, work_output)
+        if error_optimization["status"] == "rejected":
+            reasons = " ".join(error_optimization["rejection_reasons"])
+            raise OfflineProcessingError(
+                "Optimized trajectory failed software error validation and was not published: " + reasons
+            )
+
+        if use_local_staging:
+            copy_started = time.time()
+            _copy_and_sync(work_output, publish_partial)
+            copy_out_seconds = time.time() - copy_started
+        os.replace(publish_partial, output_database)
+        optimized["path"] = str(output_database)
+        logical_command = _command(
+            binary,
+            input_database,
+            output_database,
+            runtime_parameters,
+            final_optimization_iterations,
+            final_optimization_epsilon,
+        )
+        return {
+            "format": "SupermarketOfflineProcessingReport",
+            "version": 1,
+            "status": "complete",
+            "strategy": "software_only_vio_rgbd_loop_closure_and_robust_global_optimization",
+            "fiducials_used": False,
+            "landmark_constraints_used": False,
+            "pose_priors_used": False,
+            "started_at": started_at,
+            "elapsed_seconds": round(time.time() - started_at, 3),
+            "binary": str(binary),
+            "command": logical_command,
+            "execution": {
+                "profile": profile_name,
+                "thread_count": threads,
+                "openmp_wait_policy": "PASSIVE",
+                "opencv_thread_limit": threads,
+                "local_staging": use_local_staging,
+                "staging_root": str(staging_root) if use_local_staging else None,
+                "copy_in_seconds": round(copy_in_seconds, 3),
+                "copy_out_seconds": round(copy_out_seconds, 3),
+                "accelerator_backend": accelerator_backend,
+                "rtabmap_gpu_parameters": dict(accelerator_parameters),
+                "rtabmap_gpu_fallback_detected": rtabmap_gpu_fallback,
+                "online_optimization_iterations": online_optimization_iterations,
+                "final_optimization_iterations": final_optimization_iterations,
+                "final_optimization_epsilon": final_optimization_epsilon,
+                "g2o_solver": "eigen_sparse",
+            },
+            "runtime": runtime,
+            "input": source,
+            "output": optimized,
+            "error_optimization": error_optimization,
+            "stdout_tail": _tail(returned_log) if returned_log.strip() else _tail_file(log_path),
+            "stderr_tail": "",
+        }
+    finally:
+        publish_partial.unlink(missing_ok=True)
+        if log_path is not None:
+            log_path.unlink(missing_ok=True)
+        if temporary is not None:
+            temporary.cleanup()
+        if not output_parent_existed:
+            try:
+                output_parent.rmdir()
+            except OSError:
+                pass
+
+
+def _adaptive_pass_summary(report: Dict[str, Any]) -> Dict[str, Any]:
+    assessment = report.get("error_optimization", {})
+    output = report.get("output", {})
+    return {
+        "profile": report.get("execution", {}).get("profile"),
+        "elapsed_seconds": report.get("elapsed_seconds", 0.0),
+        "processed_node_count": report.get("runtime", {}).get("processed_node_count", 0),
+        "node_time_ms": report.get("runtime", {}).get("node_time_ms", {}),
+        "final_optimization": report.get("runtime", {}).get("final_optimization", {}),
+        "quality_status": assessment.get("status", "unknown"),
+        "quality_score": assessment.get("quality_score", 0),
+        "loop_closure_pair_count": output.get("loop_closure_pair_count", 0),
+        "long_range_loop_pair_count": output.get("long_range_loop_pair_count", 0),
+    }
+
+
+def run_adaptive_reprocess(
+    input_database: Path,
+    output_database: Path,
+    explicit_binary: Optional[str] = None,
+    timeout_seconds: int = 24 * 60 * 60,
+    thread_count: int = DEFAULT_PC_THREADS,
+    use_local_staging: bool = True,
+    accelerator_backend: str = "cpu",
+    extra_parameters: Iterable[tuple[str, str]] = (),
+    progress_callback: Optional[ReprocessProgressCallback] = None,
+) -> Dict[str, Any]:
+    """Reuse accepted phone constraints first, then discover loops only if needed.
+
+    This keeps well-constrained long captures close to linear replay cost while
+    preserving the more expensive ORB discovery pass for weak graphs.
+    """
+    started = time.time()
+    base_parameters = tuple(extra_parameters)
+
+    def fast_progress(fraction: float, stage: str, message: str) -> None:
+        if progress_callback is not None:
+            progress_callback(
+                min(0.25, max(0.0, fraction) * 0.25),
+                "快速约束复用" if stage != "最终全局优化" else stage,
+                message,
+            )
+
+    fast_report: Optional[Dict[str, Any]] = None
+    fast_error: Optional[str] = None
+    try:
+        fast_report = run_reprocess(
+            input_database,
+            output_database,
+            explicit_binary=explicit_binary,
+            timeout_seconds=timeout_seconds,
+            thread_count=thread_count,
+            use_local_staging=use_local_staging,
+            accelerator_backend=accelerator_backend,
+            extra_parameters=base_parameters + FAST_REUSE_PARAMETERS,
+            progress_callback=fast_progress,
+            profile_name=FAST_REUSE_PROFILE,
+        )
+    except OfflineProcessingError as exc:
+        fast_error = str(exc)
+
+    if fast_report is not None:
+        node_count = int(fast_report.get("output", {}).get("node_count", 0))
+        long_range_pairs = int(
+            fast_report.get("output", {}).get("long_range_loop_pair_count", 0)
+        )
+        long_range_retention = float(
+            fast_report.get("error_optimization", {})
+            .get("constraints", {})
+            .get("input_long_range_loop_retention", 1.0)
+        )
+    else:
+        node_count = int(inspect_database(input_database)["node_count"])
+        long_range_pairs = 0
+        long_range_retention = 0.0
+    required_long_range_pairs = max(2, node_count // 500) if node_count >= 200 else 0
+    discovery_reasons: list[str] = []
+    if fast_error is not None:
+        discovery_reasons.append("constraint-reuse pass failed validation")
+    if long_range_pairs < required_long_range_pairs:
+        discovery_reasons.append(
+            f"long-range loop pairs {long_range_pairs} < required {required_long_range_pairs}"
+        )
+    if long_range_retention < 0.80:
+        discovery_reasons.append(
+            f"accepted long-range loop retention {long_range_retention * 100:.1f}% < 80%"
+        )
+
+    passes = (
+        [_adaptive_pass_summary(fast_report)]
+        if fast_report is not None
+        else [
+            {
+                "profile": FAST_REUSE_PROFILE,
+                "quality_status": "failed",
+                "error": fast_error,
+            }
+        ]
+    )
+    selected_report = fast_report
+    selected_pass = FAST_REUSE_PROFILE
+    if discovery_reasons:
+        if progress_callback is not None:
+            progress_callback(
+                0.25,
+                "补充闭环发现",
+                "快速图的长程约束不足，开始 ORB 关键视觉闭环发现",
+            )
+
+        def discovery_progress(fraction: float, stage: str, message: str) -> None:
+            if progress_callback is not None:
+                progress_callback(
+                    0.25 + min(0.75, max(0.0, fraction) * 0.75),
+                    stage,
+                    message,
+                )
+
+        selected_report = run_reprocess(
+            input_database,
+            output_database,
+            explicit_binary=explicit_binary,
+            timeout_seconds=timeout_seconds,
+            thread_count=thread_count,
+            use_local_staging=use_local_staging,
+            accelerator_backend=accelerator_backend,
+            extra_parameters=base_parameters,
+            progress_callback=discovery_progress,
+            profile_name=DISCOVERY_PROFILE,
+        )
+        passes.append(_adaptive_pass_summary(selected_report))
+        selected_pass = DISCOVERY_PROFILE
+
+    if selected_report is None:
+        raise OfflineProcessingError("Adaptive processing did not produce a publishable result.")
+
+    selected_report["elapsed_seconds"] = round(time.time() - started, 3)
+    selected_report["execution"]["profile"] = ADAPTIVE_PROFILE
+    selected_report["execution"]["selected_pass_profile"] = selected_pass
+    selected_report["adaptive"] = {
+        "profile": ADAPTIVE_PROFILE,
+        "selected_pass": selected_pass,
+        "discovery_required": bool(discovery_reasons),
+        "discovery_reasons": discovery_reasons,
+        "required_long_range_loop_pairs": required_long_range_pairs,
+        "passes": passes,
+    }
+    if progress_callback is not None:
+        progress_callback(1.0, "自适应优化完成", f"已选择 {selected_pass} 结果")
+    return selected_report
+
+
+def write_report(path: Path, reports: Iterable[Dict[str, Any]]) -> None:
+    entries = list(reports)
+    payload = {
+        "format": "SupermarketOfflineProcessingBundle",
+        "version": 1,
+        "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "databases": entries,
+    }
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")

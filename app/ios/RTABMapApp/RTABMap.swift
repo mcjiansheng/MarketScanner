@@ -7,6 +7,7 @@
 
 import Foundation
 import ARKit
+import simd
 
 class RTABMap {
     var native_rtabmap: UnsafeMutableRawPointer
@@ -138,9 +139,10 @@ class RTABMap {
         }
     }
     
-    func save(databasePath:String) {
+    @discardableResult
+    func save(databasePath:String, savePreview: Bool = true) -> Bool {
         databasePath.utf8CString.withUnsafeBufferPointer { buffer in
-            saveNative(native_rtabmap, buffer.baseAddress)
+            saveNative(native_rtabmap, buffer.baseAddress, savePreview)
         }
     }
     
@@ -246,8 +248,8 @@ class RTABMap {
         onTouchEventNative(native_rtabmap, Int32(touch_count), Int32(event), x0, y0, x1, y1)
     }
     
-    func setPausedMapping(paused: Bool) {
-        setPausedMappingNative(native_rtabmap, paused)
+    func setPausedMapping(paused: Bool, triggerNewMap: Bool = true) {
+        setPausedMappingNative(native_rtabmap, paused, triggerNewMap)
     }
     
     func render() -> Int {
@@ -265,13 +267,38 @@ class RTABMap {
     func setPreserveCameraOrigin(enabled: Bool) {
         setPreserveCameraOriginNative(native_rtabmap, enabled)
     }
+
+    func cameraOriginOffset() -> [Float]? {
+        var x: Float = 0
+        var y: Float = 0
+        var z: Float = 0
+        var qx: Float = 0
+        var qy: Float = 0
+        var qz: Float = 0
+        var qw: Float = 1
+        guard getCameraOriginOffsetNative(native_rtabmap, &x, &y, &z, &qx, &qy, &qz, &qw) else {
+            return nil
+        }
+        return [x, y, z, qx, qy, qz, qw]
+    }
+
+    func setStreamingMapMode(enabled: Bool, maxRenderedNodes: Int) {
+        setStreamingMapModeNative(native_rtabmap, enabled, Int32(maxRenderedNodes))
+    }
     
     func setCamera(type: Int) {
         setCameraNative(native_rtabmap, Int32(type))
     }
 
-    func postOdometryEvent(frame: ARFrame, orientation: UIInterfaceOrientation, viewport: CGSize) {
-        let pose = frame.camera.transform   // ViewMatrix
+    func postOdometryEvent(
+        frame: ARFrame,
+        orientation: UIInterfaceOrientation,
+        viewport: CGSize,
+        poseOverride: simd_float4x4? = nil
+    ) {
+        // The image/depth calibration still comes from the ARFrame. Only the
+        // global VIO pose may be rebased to remove an impossible ARKit jump.
+        let pose = poseOverride ?? frame.camera.transform
         let rotation = GLKMatrix3(
             m: (pose[0,0], pose[0,1], pose[0,2],
             pose[1,0], pose[1,1], pose[1,2],
@@ -285,7 +312,14 @@ class RTABMap {
 
         if points != nil && (depthMap != nil || points!.count>0)
         {
-            let v = frame.camera.viewMatrix(for: orientation)
+            var v = frame.camera.viewMatrix(for: orientation)
+            if let poseOverride = poseOverride {
+                // Keep the first-person projection in the same rebased world
+                // frame as the odometry pose. C = correctedWorld_T_rawWorld,
+                // therefore corrected view = raw view * inverse(C).
+                let correction = simd_mul(poseOverride, simd_inverse(frame.camera.transform))
+                v = simd_mul(v, simd_inverse(correction))
+            }
             let p = frame.camera.projectionMatrix(for: orientation, viewportSize: viewport, zNear: 0.5, zFar: 50.0)
             
             let rotation = GLKMatrix3(

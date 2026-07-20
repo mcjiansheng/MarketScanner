@@ -7,6 +7,10 @@ const mapCanvas = $("#map-canvas");
 const sceneCanvas = $("#scene-canvas");
 const emptyPreview = $("#empty-preview");
 const previewMeta = $("#preview-meta");
+const processingProgress = $("#processing-progress");
+const progressBar = $("#progress-bar");
+const progressStage = $("#progress-stage");
+const progressPercent = $("#progress-percent");
 let activeMode = "single";
 let activePreview = "2d-color";
 let activeJobId = null;
@@ -15,6 +19,8 @@ let activeJobKey = null;
 let completedJobKey = null;
 let sessionRestoreTimer = null;
 let sessionSelectionToken = 0;
+let currentSingleScanMode = null;
+let currentSingleOfflineSupported = null;
 
 const viewer2d = { image: null, scale: 1, offsetX: 0, offsetY: 0, dragging: false, startX: 0, startY: 0 };
 const viewerTop = { center: [0, 0, 0], distance: 1 };
@@ -32,10 +38,52 @@ function setStatus(text, tone = "") {
   statusNode.className = `status ${tone}`;
 }
 
+function renderJobProgress(job) {
+  const progress = Math.max(0, Math.min(100, Number(job?.progress || 0)));
+  processingProgress.hidden = false;
+  progressBar.value = progress;
+  progressBar.textContent = `${progress}%`;
+  progressStage.textContent = job?.stage || "正在处理";
+  progressPercent.textContent = `${progress}%`;
+}
+
+function renderJobLogs(logs = []) {
+  const output = $("#job-log-output");
+  const summary = $("#job-log-summary");
+  const recent = logs.slice(-300);
+  summary.textContent = logs.length ? `${logs.length} 条处理事件${logs.length > recent.length ? "（显示最近 300 条）" : ""}` : "任务启动后显示";
+  output.textContent = recent.length
+    ? recent.map((item) => `[${item.timestamp || ""}] ${item.progress ?? 0}% ${item.stage || ""} — ${item.message || ""}`).join("\n")
+    : "尚无日志";
+  output.scrollTop = output.scrollHeight;
+}
+
+function renderScanLogs(scanLogs = {}) {
+  const output = $("#scan-log-output");
+  const summary = $("#scan-log-summary");
+  const events = scanLogs.events || [];
+  if (!scanLogs.available) {
+    summary.textContent = "该会话没有结构化扫描日志（可能由旧版 App 生成）";
+    output.textContent = "尚无日志";
+    return;
+  }
+  const suffix = scanLogs.truncated ? "（仅显示最近事件）" : "";
+  const malformed = scanLogs.malformed_lines ? `，${scanLogs.malformed_lines} 行无法解析` : "";
+  summary.textContent = `${scanLogs.event_count || events.length} 条扫描事件${suffix}${malformed}`;
+  output.textContent = events.map((item) => {
+    const fields = item.fields && Object.keys(item.fields).length ? ` ${JSON.stringify(item.fields)}` : "";
+    return `[${item.timestamp || ""}] ${(item.level || "info").toUpperCase()} ${item.event || "event"} — ${item.message || ""}${fields}`;
+  }).join("\n") || "日志文件为空";
+  output.scrollTop = output.scrollHeight;
+}
+
 function setBusy(busy) {
   $$(".primary").forEach((button) => { button.disabled = busy; });
-  $$(".secondary").forEach((button) => { button.disabled = busy && button.id !== "reset-view"; });
+  $$(".secondary").forEach((button) => {
+    button.disabled = busy && !["reset-view", "preview-fullscreen"].includes(button.id);
+  });
   $$(".tab").forEach((button) => { button.disabled = busy; });
+  if (!busy) updateSingleAlignmentState();
 }
 
 async function request(path, options = {}) {
@@ -47,6 +95,7 @@ async function request(path, options = {}) {
 
 async function choosePath(inputId, title, mode = "directory") {
   try {
+    setStatus(mode === "file" ? "正在打开系统文件选择器" : "正在打开系统文件夹选择器", "running");
     const result = await request("/api/dialog", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -57,7 +106,13 @@ async function choosePath(inputId, title, mode = "directory") {
       input.value = result.path;
       if (["single-output", "multi-output"].includes(inputId)) input.dataset.autoOutput = "false";
       if (inputId === "single-session") await selectSingleSession(result.path);
-      else applySessionOutputDefault(inputId, result.path);
+      else {
+        applySessionOutputDefault(inputId, result.path);
+        setStatus("路径已选择", "complete");
+      }
+    }
+    else {
+      setStatus("已取消选择");
     }
     return result.path || "";
   } catch (error) {
@@ -96,16 +151,54 @@ async function selectSingleSession(session) {
   output.value = "";
   output.dataset.autoOutput = "true";
   output.dataset.restored = "false";
+  currentSingleScanMode = null;
+  currentSingleOfflineSupported = null;
+  renderJobLogs([]);
+  $("#option-offline-optimize").checked = true;
+  updateSingleAlignmentState();
   if (!session) {
     setStatus("就绪");
     return;
   }
   applySessionOutputDefault("single-session", session);
+  try {
+    const inspection = await request("/api/session/inspect", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session }),
+    });
+    if (token !== sessionSelectionToken || $("#single-session").value.trim() !== session) return;
+    renderInspection(inspection);
+    applyInspectionCapabilities(inspection);
+    if (inspection.active_job) {
+      output.value = inspection.active_job.output_dir;
+      output.dataset.autoOutput = "false";
+      output.dataset.restored = "false";
+      activeJobId = inspection.active_job.id;
+      activeJobKey = activeRequestKey(activeRequest());
+      setBusy(true);
+      renderJobProgress(inspection.active_job);
+      renderJobLogs(inspection.active_job.logs || []);
+      setStatus(`${inspection.active_job.stage || "正在处理"} · ${inspection.active_job.progress || 0}%`, "running");
+      pollJob();
+      return;
+    }
+  } catch (error) {
+    if (token !== sessionSelectionToken) return;
+    setStatus(error.message, "failed");
+    return;
+  }
   await restoreExistingResult(session, token);
 }
 
 function mapOptions() {
   return {
+    offline_optimize: $("#option-offline-optimize").checked,
+    reprocess_binary: $("#option-reprocess-binary").value.trim(),
+    pc_threads: $("#option-pc-threads").value,
+    pc_local_staging: $("#option-pc-local-staging").checked,
+    gpu_backend: $("#option-gpu-backend").value,
+    gpu_helper: $("#option-gpu-helper").value.trim(),
     resolution: $("#option-resolution").value,
     trajectory_radius: $("#option-trajectory-radius").value,
     tag_snap_distance: $("#option-tag-snap").value,
@@ -116,6 +209,16 @@ function mapOptions() {
 
 function applyRestoredOptions(map) {
   const parameters = map?.parameters || {};
+  // Missing marker means this is an older phone-pose-only result. Do not let
+  // it masquerade as equivalent to a newly requested PC-optimized result.
+  $("#option-offline-optimize").checked = Boolean(map?.pc_offline_processing?.enabled);
+  const execution = map?.pc_offline_processing?.execution || {};
+  if (execution.thread_count != null) $("#option-pc-threads").value = execution.thread_count;
+  if (execution.local_staging != null) $("#option-pc-local-staging").checked = Boolean(execution.local_staging);
+  const acceleration = map?.pc_acceleration || {};
+  if (["auto", "cpu", "apple_metal", "nvidia_cuda"].includes(acceleration.requested_backend)) {
+    $("#option-gpu-backend").value = acceleration.requested_backend;
+  }
   if (parameters.resolution != null) $("#option-resolution").value = parameters.resolution;
   if (parameters.trajectory_radius != null) $("#option-trajectory-radius").value = parameters.trajectory_radius;
   if (parameters.tag_snap_distance != null) $("#option-tag-snap").value = parameters.tag_snap_distance;
@@ -143,13 +246,62 @@ function appendText(parent, tag, text, className = "") {
 function renderInspection(data) {
   const target = $("#inspection");
   clearNode(target);
-  appendText(target, "div", `${data.segment_count} 个分段  |  ${data.node_count} 个节点  |  ${data.price_tag_count} 个价签`);
+  const streaming = data.scan_mode === "continuous_streaming";
+  const mode = streaming ? "连续流式单库" : (data.scan_mode === "segmented" ? "传统分段" : "兼容单库");
+  const strategy = data.merge_required ? "需要段间合并/校正" : "无需段间合并";
+  appendText(target, "div", `${mode}  |  ${data.database_count} 个数据库  |  ${data.node_count} 个节点  |  ${data.price_tag_count} 个价签`);
+  appendText(target, "div", strategy, streaming ? "complete" : "");
+  const pc = data.pc_processing || {};
+  if (pc.uses_optimized_poses) {
+    appendText(target, "div", "数据库已包含 PC 全局优化位姿", "complete");
+  } else if (pc.reprocess_available) {
+    appendText(target, "div", `PC 离线优化器已就绪：${pc.reprocess_binary}`);
+  } else if (streaming) {
+    appendText(target, "div", "未检测到 rtabmap-reprocess；生成前请构建 RTAB-Map 工具或填写二进制路径", "warning");
+  }
+  if (data.active_job) {
+    appendText(
+      target,
+      "div",
+      `检测到正在运行的任务 ${data.active_job.id}：${data.active_job.stage} · ${data.active_job.progress}%（将自动接回，不会重复启动）`,
+      "complete",
+    );
+  }
   const list = document.createElement("ul");
   data.segments.forEach((segment) => {
     const warning = segment.warnings?.length ? `；${segment.warnings.join(" ")}` : "";
-    appendText(list, "li", `分段 ${segment.index}: ${segment.nodes} 节点，${segment.price_tags} 价签${warning}`);
+    const label = streaming ? "连续数据库" : `分段 ${segment.index}`;
+    const optimized = segment.optimized_poses ? `，${segment.optimized_poses} 个优化位姿` : "";
+    appendText(list, "li", `${label}: ${segment.nodes} 节点${optimized}，${segment.price_tags} 价签${warning}`);
   });
   target.appendChild(list);
+  renderScanLogs(data.scan_logs || {});
+}
+
+async function loadGpuCapabilities() {
+  const target = $("#gpu-capability");
+  try {
+    const payload = await request("/api/gpu/capabilities");
+    const metal = payload.backends?.apple_metal || {};
+    const cuda = payload.backends?.nvidia_cuda || {};
+    const labels = [];
+    labels.push(metal.available ? `Metal 已就绪：${metal.device || "Apple GPU"}` : "Metal 不可用");
+    labels.push(cuda.available ? `CUDA 已就绪：${cuda.device || "NVIDIA GPU"}` : "CUDA 不可用");
+    target.textContent = labels.join("  |  ");
+    target.className = `field-hint ${metal.available || cuda.available ? "complete" : "warning"}`;
+  } catch (error) {
+    target.textContent = `GPU 检测失败：${error.message}`;
+    target.className = "field-hint warning";
+  }
+}
+
+function applyInspectionCapabilities(data) {
+  currentSingleScanMode = data?.scan_mode || null;
+  currentSingleOfflineSupported = data?.database_count === 1;
+  updateSingleAlignmentState();
+  $("#run-single").textContent = currentSingleScanMode === "continuous_streaming"
+    ? "PC 优化并生成地图"
+    : "生成单设备地图";
 }
 
 async function inspectSession(inputId) {
@@ -160,11 +312,13 @@ async function inspectSession(inputId) {
   }
   try {
     setStatus("正在检查会话", "running");
-    renderInspection(await request("/api/session/inspect", {
+    const inspection = await request("/api/session/inspect", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ session }),
-    }));
+    });
+    renderInspection(inspection);
+    if (inputId === "single-session") applyInspectionCapabilities(inspection);
     setStatus("会话检查完成", "complete");
   } catch (error) {
     setStatus(error.message, "failed");
@@ -278,6 +432,7 @@ function parseSegments(raw) {
 }
 
 function stageConfig() {
+  if (currentSingleScanMode === "continuous_streaming") return undefined;
   const rows = $$(".stage-row");
   if (!rows.length) return undefined;
   const assigned = new Set();
@@ -305,6 +460,7 @@ function stageConfig() {
 }
 
 function addStage() {
+  if (currentSingleScanMode === "continuous_streaming") return;
   const list = $("#stage-list");
   const number = list.children.length + 1;
   const row = document.createElement("div");
@@ -330,9 +486,25 @@ function addStage() {
 
 function updateSingleAlignmentState() {
   const autoAlign = $("#single-auto-align");
+  const legacyOptions = $("#legacy-segment-options");
   const hasStages = $("#stage-list").children.length > 0;
-  if (hasStages) autoAlign.checked = false;
-  autoAlign.disabled = hasStages;
+  const streaming = currentSingleScanMode === "continuous_streaming";
+  const offlineOptimize = $("#option-offline-optimize");
+  const offlineUnsupported = activeMode === "single" && currentSingleOfflineSupported === false;
+  if (hasStages || streaming) autoAlign.checked = false;
+  autoAlign.disabled = hasStages || streaming;
+  legacyOptions.hidden = streaming;
+  if (streaming) legacyOptions.open = false;
+  $("#add-stage").disabled = streaming;
+  $$("#stage-list input, #stage-list button").forEach((control) => { control.disabled = streaming; });
+  if (offlineUnsupported) offlineOptimize.checked = false;
+  offlineOptimize.disabled = offlineUnsupported;
+  const pcExecutionDisabled = offlineUnsupported || !offlineOptimize.checked;
+  $("#option-pc-threads").disabled = pcExecutionDisabled;
+  $("#option-pc-local-staging").disabled = pcExecutionDisabled;
+  offlineOptimize.title = offlineUnsupported
+    ? "传统多段会话应先按边界信息合并；当前逐库离线重处理仅接受每台设备一个连续数据库。"
+    : "";
 }
 
 function activeRequest() {
@@ -389,6 +561,8 @@ async function runActiveJob() {
     });
     activeJobId = job.id;
     activeJobKey = requestKey;
+    renderJobProgress(job);
+    renderJobLogs(job.logs || []);
     pollJob();
   } catch (error) {
     activeJobKey = null;
@@ -401,8 +575,10 @@ async function pollJob() {
   if (!activeJobId) return;
   try {
     const job = await request(`/api/jobs/${activeJobId}`);
+    renderJobProgress(job);
+    renderJobLogs(job.logs || []);
     if (job.status === "queued" || job.status === "running") {
-      setStatus(`正在处理 ${job.kind === "multi" ? "多设备地图" : "地图"}`, "running");
+      setStatus(`${job.stage || "正在处理"} · ${job.progress || 0}%`, "running");
       window.setTimeout(pollJob, 650);
       return;
     }
@@ -430,6 +606,8 @@ async function pollJob() {
 }
 
 async function renderJob(job) {
+  renderJobProgress(job);
+  renderJobLogs(job.logs || []);
   renderReview(job.quality_report || {}, job.review_items || { items: [] });
   renderArtifacts(job.artifacts || {});
   const artifacts = job.artifacts || {};
@@ -441,8 +619,11 @@ async function renderJob(job) {
   }
   const summary = job.quality_report?.grid;
   const cloud = job.quality_report?.preview_3d;
+  const qualityLabels = { quick: "快速", detailed: "详细", maximum: "最高" };
+  const quality = job.map?.preview_3d_quality;
+  const qualityText = qualityLabels[quality] ? ` / ${qualityLabels[quality]}质量` : "";
   const surfaceText = cloud?.surface_triangle_count ? ` / ${cloud.surface_triangle_count.toLocaleString()} 面` : "";
-  const cloudText = cloud?.point_count ? `  |  3D ${cloud.point_count.toLocaleString()} 点${surfaceText} / ${cloud.decoded_frames} 关键帧` : "";
+  const cloudText = cloud?.point_count ? `  |  3D ${cloud.point_count.toLocaleString()} 点${surfaceText} / ${cloud.decoded_frames} 关键帧${qualityText}` : "";
   previewMeta.textContent = summary ? `${summary.width} x ${summary.height} 栅格  |  ${summary.resolution_m} m  |  ${Number(summary.area_m2).toFixed(2)} m2${cloudText}` : job.output_dir;
 }
 
@@ -454,6 +635,32 @@ function renderReview(report, review) {
   const warningMessages = new Set(warnings.map((warning) => typeof warning === "string" ? warning : warning.message || JSON.stringify(warning)));
   const reviewItems = items.filter((item) => !warningMessages.has(item.message || JSON.stringify(item)));
   appendText(target, "div", `${warnings.length} 条警告  |  ${reviewItems.length} 个待复核项`);
+  const optimization = report.pc_offline_processing?.error_optimization;
+  if (optimization) {
+    const status = optimization.status === "pass" ? "通过" : "需要复核";
+    appendText(
+      target,
+      "div",
+      `纯软件误差优化：${status}  |  质量分 ${optimization.quality_score ?? 0}/100  |  未使用 AprilTag/地标先验`,
+      optimization.status === "pass" ? "complete" : "warning",
+    );
+  }
+  const acceleration = report.pc_acceleration;
+  if (acceleration) {
+    const device = acceleration.device ? ` · ${acceleration.device}` : "";
+    const projected = acceleration.projected_frames ? ` · GPU 投影 ${acceleration.projected_frames} 帧` : "";
+    const accelerationWarning = Boolean(
+      acceleration.runtime_failures?.length ||
+      acceleration.rtabmap_gpu_fallback_detected ||
+      acceleration.warnings?.length
+    );
+    appendText(
+      target,
+      "div",
+      `计算后端：${acceleration.effective_backend || acceleration.projection_backend || "cpu"}${device}${projected}`,
+      accelerationWarning ? "warning" : "complete",
+    );
+  }
   const list = document.createElement("ul");
   warnings.slice(0, 6).forEach((warning) => appendText(list, "li", typeof warning === "string" ? warning : warning.message || JSON.stringify(warning), "warning"));
   reviewItems.slice(0, 6).forEach((item) => appendText(list, "li", item.message || JSON.stringify(item)));
@@ -518,12 +725,54 @@ function reset2D() {
 
 function draw2D() {
   if (!viewer2d.image || activePreview !== "2d-map") return;
-  const { width, height } = canvasMetrics(mapCanvas);
+  const { width, height, ratio } = canvasMetrics(mapCanvas);
   const ctx = mapCanvas.getContext("2d");
   ctx.fillStyle = cssColor("--canvas-bg", "#ecf0f2");
   ctx.fillRect(0, 0, width, height);
-  ctx.imageSmoothingEnabled = false;
+  // Downscaling a large metric grid benefits from the browser's best filter;
+  // zoomed-in cells remain exact and unsmoothed for engineering inspection.
+  ctx.imageSmoothingEnabled = viewer2d.scale / ratio < 1;
+  ctx.imageSmoothingQuality = "high";
   ctx.drawImage(viewer2d.image, viewer2d.offsetX, viewer2d.offsetY, viewer2d.image.width * viewer2d.scale, viewer2d.image.height * viewer2d.scale);
+}
+
+function previewIsExpanded() {
+  const panel = $(".preview-panel");
+  return document.fullscreenElement === panel || panel.classList.contains("is-expanded");
+}
+
+function updatePreviewFullscreenButton() {
+  const expanded = previewIsExpanded();
+  const button = $("#preview-fullscreen");
+  button.textContent = expanded ? "退出全屏" : "全屏预览";
+  button.setAttribute("aria-pressed", String(expanded));
+  document.body.classList.toggle("preview-overlay-open", expanded && !document.fullscreenElement);
+}
+
+function redrawExpandedPreview() {
+  window.requestAnimationFrame(() => {
+    if (activePreview === "2d-map") reset2D();
+    else drawScene();
+  });
+}
+
+async function togglePreviewFullscreen() {
+  const panel = $(".preview-panel");
+  if (panel.classList.contains("is-expanded")) {
+    panel.classList.remove("is-expanded");
+  } else if (document.fullscreenElement) {
+    await document.exitFullscreen();
+  } else if (panel.requestFullscreen) {
+    try {
+      await panel.requestFullscreen();
+    } catch (_error) {
+      panel.classList.add("is-expanded");
+    }
+  } else {
+    panel.classList.add("is-expanded");
+  }
+  updatePreviewFullscreenButton();
+  redrawExpandedPreview();
 }
 
 function load3D(data, previewUrl = "") {
@@ -953,6 +1202,7 @@ function switchMode(mode) {
   activeMode = mode;
   $$(".tab").forEach((button) => button.classList.toggle("is-active", button.dataset.mode === mode));
   $$(".mode-panel").forEach((panel) => panel.classList.toggle("is-active", panel.dataset.panel === mode));
+  updateSingleAlignmentState();
 }
 
 function bindEvents() {
@@ -965,6 +1215,7 @@ function bindEvents() {
   $("#run-multi").addEventListener("click", runActiveJob);
   $("#add-device").addEventListener("click", addDevice);
   $("#add-stage").addEventListener("click", addStage);
+  $("#option-offline-optimize").addEventListener("change", updateSingleAlignmentState);
   $("#show-surface").addEventListener("change", (event) => { viewer3d.showSurface = event.target.checked; drawScene(); });
   $("#show-cloud").addEventListener("change", (event) => { viewer3d.showCloud = event.target.checked; drawScene(); });
   $("#show-trajectory").addEventListener("change", (event) => { viewer3d.showTrajectory = event.target.checked; drawScene(); });
@@ -972,6 +1223,9 @@ function bindEvents() {
   $("#drag-rotate").addEventListener("click", () => set3DDragMode("rotate"));
   $("#drag-pan").addEventListener("click", () => set3DDragMode("pan"));
   $("#single-session").addEventListener("input", () => {
+    currentSingleScanMode = null;
+    currentSingleOfflineSupported = null;
+    updateSingleAlignmentState();
     window.clearTimeout(sessionRestoreTimer);
     sessionRestoreTimer = window.setTimeout(() => selectSingleSession($("#single-session").value.trim()), 500);
   });
@@ -986,6 +1240,19 @@ function bindEvents() {
     else if (activePreview === "2d-color") resetTopDown();
     else reset3D();
   });
+  $("#preview-fullscreen").addEventListener("click", togglePreviewFullscreen);
+  document.addEventListener("fullscreenchange", () => {
+    updatePreviewFullscreenButton();
+    redrawExpandedPreview();
+  });
+  document.addEventListener("keydown", (event) => {
+    const panel = $(".preview-panel");
+    if (event.key === "Escape" && panel.classList.contains("is-expanded")) {
+      panel.classList.remove("is-expanded");
+      updatePreviewFullscreenButton();
+      redrawExpandedPreview();
+    }
+  });
   $("#open-output").addEventListener("click", async () => {
     if (!completedJobId) return;
     try { await request(`/api/jobs/${completedJobId}/open`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({}) }); }
@@ -996,6 +1263,7 @@ function bindEvents() {
 }
 
 bindEvents();
+loadGpuCapabilities();
 set3DDragMode("rotate");
 addDevice();
 addDevice();

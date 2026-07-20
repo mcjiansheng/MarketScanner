@@ -1,6 +1,12 @@
 /lib
 /build/
+/build-pc-debug/
+/build-pc-release/
+/build-pc-cuda/
 /.tools/
+/doc/.local/
+/AGENTS.md
+/扫描结果/
 /app/ios/RTABMapApp/Libraries/
 /corelib/include/rtabmap/core/Version.h
 /corelib/include/rtabmap/core/rtabmap_core_export.h
@@ -18,4 +24,6 @@ app/android/res/raw/
 compile_flags.txt
 tags
 build_*
+__pycache__/
+*.pyc
 *.bak

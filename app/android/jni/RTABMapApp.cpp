@@ -259,6 +259,8 @@ RTABMapApp::RTABMapApp() :
 		exportPointCloudFormat_("ply"),
 		dataRecorderMode_(false),
 		preserveCameraOrigin_(false),
+		streamingMapMode_(false),
+		streamingMaxRenderedNodes_(0),
 		clearSceneOnNextRender_(false),
 		openingDatabase_(false),
 		exporting_(false),
@@ -1083,6 +1085,14 @@ void RTABMapApp::stopCamera()
 			sensorCaptureThread_ = 0;
 			camera_ = 0;
 		}
+		else if(camera_!=0)
+		{
+			// startCamera() may allocate CameraMobile and then fail init()
+			// before a SensorCaptureThread is created. Keep retries leak-free.
+			camera_->close();
+			delete camera_;
+			camera_ = 0;
+		}
 	}
     {
         boost::mutex::scoped_lock  lock(renderingMutex_);
@@ -1103,6 +1113,46 @@ void RTABMapApp::setPreserveCameraOrigin(bool enabled)
 	{
 		preservedCameraOriginOffset_ = camera_->getOriginOffset();
 	}
+}
+
+bool RTABMapApp::getCameraOriginOffset(
+		float & x, float & y, float & z,
+		float & qx, float & qy, float & qz, float & qw)
+{
+	boost::mutex::scoped_lock lock(cameraMutex_);
+	rtabmap::Transform offset;
+	if(camera_ && !camera_->getOriginOffset().isNull())
+	{
+		offset = camera_->getOriginOffset();
+	}
+	else if(preserveCameraOrigin_ && !preservedCameraOriginOffset_.isNull())
+	{
+		offset = preservedCameraOriginOffset_;
+	}
+	else
+	{
+		return false;
+	}
+
+	Eigen::Quaternionf quaternion = offset.getQuaternionf();
+	x = offset.x();
+	y = offset.y();
+	z = offset.z();
+	qx = quaternion.x();
+	qy = quaternion.y();
+	qz = quaternion.z();
+	qw = quaternion.w();
+	return true;
+}
+
+void RTABMapApp::setStreamingMapMode(bool enabled, int maxRenderedNodes)
+{
+	boost::mutex::scoped_lock lock(renderingMutex_);
+	streamingMapMode_ = enabled;
+	streamingMaxRenderedNodes_ = enabled?(maxRenderedNodes > 0?maxRenderedNodes:1):0;
+	LOGI("Streaming map mode=%d max rendered nodes=%d",
+			streamingMapMode_?1:0,
+			streamingMaxRenderedNodes_);
 }
 
 std::vector<pcl::Vertices> RTABMapApp::filterOrganizedPolygons(
@@ -2267,13 +2317,30 @@ int RTABMapApp::Render()
 						iter!=addedClouds.end();
 						++iter)
 					{
-						if(*iter > 0 && poses.find(*iter) == poses.end())
+					if(*iter > 0 && poses.find(*iter) == poses.end())
+					{
+						std::map<int, rtabmap::Mesh>::iterator meshIter = createdMeshes_.find(*iter);
+						UASSERT(meshIter!=createdMeshes_.end());
+						if(streamingMapMode_ &&
+							streamingMaxRenderedNodes_ > 0 &&
+							(int)createdMeshes_.size() > streamingMaxRenderedNodes_)
+						{
+							// Nodes transferred from WM to the on-disk LTM are no longer
+							// part of the live optimized pose set. Release their point cloud
+							// and GL buffers as well, otherwise rendering memory would keep
+							// growing even though RTAB-Map's working memory is bounded.
+							totalPoints_ -= meshIter->second.indices.get()?(int)meshIter->second.indices->size():0;
+							totalPolygons_ -= (int)meshIter->second.polygons.size();
+							main_scene_.removeCloudOrMesh(*iter);
+							createdMeshes_.erase(meshIter);
+							rawPoses_.erase(*iter);
+						}
+						else
 						{
 							main_scene_.setCloudVisible(*iter, false);
-							std::map<int, rtabmap::Mesh>::iterator meshIter = createdMeshes_.find(*iter);
-							UASSERT(meshIter!=createdMeshes_.end());
 							meshIter->second.visible = false;
 						}
+					}
 					}
 				}
 
@@ -2923,7 +2990,7 @@ void RTABMapApp::OnTouchEvent(int touch_count,
   main_scene_.OnTouchEvent(touch_count, event, x0, y0, x1, y1);
 }
 
-void RTABMapApp::setPausedMapping(bool paused)
+void RTABMapApp::setPausedMapping(bool paused, bool triggerNewMap)
 {
 	{
 		boost::mutex::scoped_lock  lock(renderingMutex_);
@@ -2941,7 +3008,14 @@ void RTABMapApp::setPausedMapping(bool paused)
 		else if(!rtabmapThread_->isRunning() && !paused)
 		{
 			LOGW("Resume!");
-			rtabmap_->triggerNewMap();
+			// Normal Record/Append actions intentionally create a new map. A
+			// transient iOS interruption, however, must resume the same map so
+			// that opening Control Center, locking the screen or taking a call
+			// cannot introduce an artificial sub-map boundary.
+			if(triggerNewMap)
+			{
+				rtabmap_->triggerNewMap();
+			}
 			rtabmap_->parseParameters(getRtabmapParameters());
 			rtabmapThread_->registerToEventsManager();
 			rtabmapThread_->start();
@@ -3273,17 +3347,24 @@ void RTABMapApp::addEnvSensor(int type, float value)
 	}
 }
 
-void RTABMapApp::save(const std::string & databasePath)
+void RTABMapApp::save(const std::string & databasePath, bool savePreview)
 {
 	LOGI("Saving database to %s", databasePath.c_str());
 	rtabmapThread_->unregisterFromEventsManager();
 	rtabmapThread_->join(true);
 
-	LOGI("Taking screenshot...");
-	takeScreenshotOnNextRender_ = true;
-	if(!screenshotReady_.acquire(1, 2000))
+	if(savePreview)
 	{
-		UERROR("Failed to take a screenshot after 2 sec!");
+		LOGI("Taking screenshot...");
+		takeScreenshotOnNextRender_ = true;
+		if(!screenshotReady_.acquire(1, 2000))
+		{
+			UERROR("Failed to take a screenshot after 2 sec!");
+		}
+	}
+	else
+	{
+		LOGI("Skipping database preview screenshot for fast segment rollover.");
 	}
 
 	// save mapping parameters in the database
@@ -3424,55 +3505,146 @@ bool RTABMapApp::mergeDatabases(const std::string & inputDatabasePaths, const st
 	rtabmap::Rtabmap merged;
 	merged.init(parameters, outputDatabasePath);
 
-	rtabmap::DBReader * dbReader = new rtabmap::DBReader(
-			databases,
-			0,
-			odometryIgnored,
-			false,
-			false,
-			0,
-			std::vector<unsigned int>(),
-			0,
-			!intermediateNodes,
-			false,
-			true,
-			0,
-			-1,
-			false,
-			false);
-	if(!dbReader->init())
-	{
-		UERROR("Failed initializing database reader for merge.");
-		delete dbReader;
-		merged.close(false);
-		return false;
-	}
-
-	rtabmap::SensorCaptureInfo info;
-	rtabmap::SensorData data = dbReader->takeData(&info);
 	int processed = 0;
-	while(data.isValid() && !progressionStatus_.isCanceled())
+	rtabmap::Transform previousOdomPose;
+	cv::Mat previousOdomCovariance;
+	double previousStamp = 0.0;
+	int databaseIndex = 0;
+
+	for(std::list<std::string>::const_iterator databaseIter = databases.begin();
+		databaseIter != databases.end() && !progressionStatus_.isCanceled();
+		++databaseIter, ++databaseIndex)
 	{
-		if(!odometryIgnored && !info.odomCovariance.empty() && info.odomCovariance.at<double>(0,0) >= 9999 && processed > 0)
+		// Use one reader per database so that a segment boundary can be
+		// distinguished from a real odometry reset inside a segment. The
+		// multi-database DBReader resets its internal map state for every file,
+		// making both cases look identical (covariance=9999).
+		rtabmap::DBReader dbReader(
+				*databaseIter,
+				0,
+				odometryIgnored,
+				false,
+				false,
+				0,
+				std::vector<unsigned int>(),
+				0,
+				!intermediateNodes,
+				false,
+				true,
+				0,
+				-1,
+				false,
+				false);
+		if(!dbReader.init())
 		{
-			merged.triggerNewMap();
+			UERROR("Failed initializing database reader for merge: %s", databaseIter->c_str());
+			merged.close(false);
+			return false;
 		}
 
-		if(!odometryIgnored && info.odomPose.isNull())
+		bool firstNodeInDatabase = true;
+		rtabmap::SensorCaptureInfo info;
+		rtabmap::SensorData data = dbReader.takeData(&info);
+		while(data.isValid() && !progressionStatus_.isCanceled())
 		{
-			UWARN("Skipping node %d as it doesn't have odometry pose set.", data.id());
-		}
-		else if(!merged.process(data, info.odomPose, info.odomCovariance, info.odomVelocity))
-		{
-			UWARN("Failed processing node %d while merging.", data.id());
-		}
+			cv::Mat covariance = info.odomCovariance;
+			const bool newMapMarker = !odometryIgnored &&
+					!covariance.empty() &&
+					covariance.at<double>(0,0) >= 9999.0;
 
-		++processed;
-		progressionStatus_.increment();
-		data = dbReader->takeData(&info);
+			if(newMapMarker && processed > 0)
+			{
+				bool connectSegmentBoundary = firstNodeInDatabase &&
+						!previousOdomPose.isNull() &&
+						!info.odomPose.isNull();
+				float boundaryDistance = 0.0f;
+				float boundaryAngle = 0.0f;
+				double boundaryDelay = previousStamp > 0.0 && data.stamp() > 0.0?
+						data.stamp() - previousStamp : 0.0;
+
+				if(connectSegmentBoundary)
+				{
+					rtabmap::Transform delta = previousOdomPose.inverse() * info.odomPose;
+					boundaryDistance = delta.getNorm();
+					boundaryAngle = delta.getAngle(rtabmap::Transform::getIdentity());
+					// A normal rollover pauses capture briefly while keeping the same
+					// ARSession. Large jumps or non-monotonic timestamps instead mean
+					// that tracking/origin continuity cannot be trusted.
+					connectSegmentBoundary = uIsFinite(boundaryDistance) &&
+							uIsFinite(boundaryAngle) &&
+							boundaryDistance <= 10.0f &&
+							boundaryAngle <= 2.0943951f &&
+							(boundaryDelay == 0.0 || (boundaryDelay > 0.0 && boundaryDelay <= 300.0));
+				}
+
+				if(connectSegmentBoundary)
+				{
+					// The first frame of every CameraMobile instance is deliberately
+					// saved with covariance=9999. Replace that sentinel with a
+					// conservative boundary covariance so Memory creates a neighbor
+					// link from the previous segment's last node to this first node.
+					covariance = cv::Mat::zeros(6, 6, CV_64FC1);
+					for(int i=0; i<6; ++i)
+					{
+						double variance = 0.0;
+						if(previousOdomCovariance.rows == 6 &&
+							previousOdomCovariance.cols == 6 &&
+							previousOdomCovariance.type() == CV_64FC1)
+						{
+							variance = previousOdomCovariance.at<double>(i,i) * 10.0;
+						}
+						const double minimumVariance = i < 3 || i == 5? 0.0001 : 0.00001;
+						covariance.at<double>(i,i) = uIsFinite(variance) && variance > minimumVariance?
+								variance : minimumVariance;
+					}
+					UINFO("Connecting segment database %d boundary using continuous odometry: distance=%f m angle=%f rad delay=%f s",
+							databaseIndex + 1,
+							boundaryDistance,
+							boundaryAngle,
+							boundaryDelay);
+				}
+				else
+				{
+					UWARN("Starting a new map at %s node %d: segment boundary continuity is unavailable or unsafe (distance=%f m angle=%f rad delay=%f s).",
+							databaseIter->c_str(),
+							data.id(),
+							boundaryDistance,
+							boundaryAngle,
+							boundaryDelay);
+					merged.triggerNewMap();
+				}
+			}
+
+			bool nodeProcessed = false;
+			if(!odometryIgnored && info.odomPose.isNull())
+			{
+				UWARN("Skipping node %d as it doesn't have odometry pose set.", data.id());
+			}
+			else if(!merged.process(data, info.odomPose, covariance, info.odomVelocity))
+			{
+				UWARN("Failed processing node %d while merging.", data.id());
+			}
+			else
+			{
+				nodeProcessed = true;
+			}
+
+			if(nodeProcessed && !odometryIgnored)
+			{
+				previousOdomPose = info.odomPose;
+				previousStamp = data.stamp();
+				if(!covariance.empty() && covariance.at<double>(0,0) < 9999.0)
+				{
+					previousOdomCovariance = covariance.clone();
+				}
+			}
+
+			++processed;
+			firstNodeInDatabase = false;
+			progressionStatus_.increment();
+			data = dbReader.takeData(&info);
+		}
 	}
-
-	delete dbReader;
 
 	if(progressionStatus_.isCanceled())
 	{

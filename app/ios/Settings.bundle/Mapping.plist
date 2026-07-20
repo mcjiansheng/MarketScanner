@@ -12,63 +12,17 @@
 			<key>Title</key>
 			<string>Supermarket Scan</string>
 			<key>FooterText</key>
-			<string>When automatic segmentation is enabled, reaching any area, database size or memory threshold saves the current segment and continues scanning. Choose a local folder or external storage in Settings -> Supermarket Scan Settings inside the app.</string>
-		</dict>
-		<dict>
-			<key>Type</key>
-			<string>PSToggleSwitchSpecifier</string>
-			<key>Title</key>
-			<string>Automatic Segment Export</string>
-			<key>Key</key>
-			<string>SupermarketAutoSegmentExportEnabled</string>
-			<key>DefaultValue</key>
-			<true/>
+			<string>Supermarket scans use one continuous on-disk database and software pose quality gating. Final robust optimization runs on the PC without AprilTag or landmark priors.</string>
 		</dict>
 		<dict>
 			<key>Type</key>
 			<string>PSTextFieldSpecifier</string>
 			<key>Title</key>
-			<string>Segment Area Threshold m2</string>
+			<string>Streaming Working-Memory Nodes</string>
 			<key>Key</key>
-			<string>SupermarketAreaThresholdM2</string>
+			<string>SupermarketStreamingMemoryNodes</string>
 			<key>DefaultValue</key>
-			<string>120</string>
-			<key>KeyboardType</key>
-			<string>NumbersAndPunctuation</string>
-		</dict>
-		<dict>
-			<key>Type</key>
-			<string>PSTextFieldSpecifier</string>
-			<key>Title</key>
-			<string>Database Threshold MB</string>
-			<key>Key</key>
-			<string>SupermarketDatabaseThresholdMB</string>
-			<key>DefaultValue</key>
-			<string>700</string>
-			<key>KeyboardType</key>
-			<string>NumberPad</string>
-		</dict>
-		<dict>
-			<key>Type</key>
-			<string>PSTextFieldSpecifier</string>
-			<key>Title</key>
-			<string>Memory Threshold MB</string>
-			<key>Key</key>
-			<string>SupermarketUsedMemoryThresholdMB</string>
-			<key>DefaultValue</key>
-			<string>1200</string>
-			<key>KeyboardType</key>
-			<string>NumberPad</string>
-		</dict>
-		<dict>
-			<key>Type</key>
-			<string>PSTextFieldSpecifier</string>
-			<key>Title</key>
-			<string>Minimum Nodes Before Segment</string>
-			<key>Key</key>
-			<string>SupermarketMinimumNodesBeforeRollover</string>
-			<key>DefaultValue</key>
-			<string>30</string>
+			<string>300</string>
 			<key>KeyboardType</key>
 			<string>NumberPad</string>
 		</dict>

@@ -98,6 +98,8 @@ class RTABMapApp : public UEventsHandler {
 
   void stopCamera();
   void setPreserveCameraOrigin(bool enabled);
+  bool getCameraOriginOffset(float & x, float & y, float & z, float & qx, float & qy, float & qz, float & qw);
+  void setStreamingMapMode(bool enabled, int maxRenderedNodes);
 
   // Set render camera's viewing angle, first person, third person or top down.
   //
@@ -117,7 +119,7 @@ class RTABMapApp : public UEventsHandler {
   void OnTouchEvent(int touch_count, tango_gl::GestureCamera::TouchEvent event,
                     float x0, float y0, float x1, float y1);
 
-  void setPausedMapping(bool paused);
+  void setPausedMapping(bool paused, bool triggerNewMap = true);
   void setOnlineBlending(bool enabled);
   void setMapCloudShown(bool shown);
   void setOdomCloudShown(bool shown);
@@ -161,7 +163,7 @@ class RTABMapApp : public UEventsHandler {
   void setGPS(const rtabmap::GPS & gps);
   void addEnvSensor(int type, float value);
 
-  void save(const std::string & databasePath);
+  void save(const std::string & databasePath, bool savePreview = true);
   bool recover(const std::string & from, const std::string & to);
   void cancelProcessing();
   bool mergeDatabases(const std::string & inputDatabasePaths, const std::string & outputDatabasePath);
@@ -263,6 +265,8 @@ class RTABMapApp : public UEventsHandler {
   bool dataRecorderMode_;
   bool preserveCameraOrigin_;
   rtabmap::Transform preservedCameraOriginOffset_;
+  bool streamingMapMode_;
+  int streamingMaxRenderedNodes_;
   bool clearSceneOnNextRender_;
   bool openingDatabase_;
   bool exporting_;

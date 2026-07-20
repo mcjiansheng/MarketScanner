@@ -34,7 +34,7 @@ void setupCallbacksNative(const void *object, void * classPtr,
 void destroyNativeApplication(const void *object);
 void setScreenRotationNative(const void *object, int displayRotation);
 int openDatabaseNative(const void *object, const char * databasePath, bool databaseInMemory, bool optimize, bool clearDatabase);
-void saveNative(const void *object, const char * databasePath);
+bool saveNative(const void *object, const char * databasePath, bool savePreview);
 bool recoverNative(const void *object, const char * from, const char * to);
 void cancelProcessingNative(const void * object);
 bool mergeDatabasesNative(const void *object, const char * inputDatabasePaths, const char * outputDatabasePath);
@@ -64,11 +64,13 @@ void initGlContentNative(const void *object);
 void setupGraphicNative(const void *object, int width, int height);
 void onTouchEventNative(const void *object, int touch_count, int event, float x0, float y0, float x1,
                         float y1);
-void setPausedMappingNative(const void *object, bool paused);
+void setPausedMappingNative(const void *object, bool paused, bool triggerNewMap);
 int renderNative(const void *object);
 bool startCameraNative(const void *object);
 void stopCameraNative(const void *object);
 void setPreserveCameraOriginNative(const void *object, bool enabled);
+bool getCameraOriginOffsetNative(const void *object, float * x, float * y, float * z, float * qx, float * qy, float * qz, float * qw);
+void setStreamingMapModeNative(const void *object, bool enabled, int maxRenderedNodes);
 void setCameraNative(const void *object, int type);
 void postOdometryEventNative(const void *object,
                        float x, float y, float z, float qx, float qy, float qz, float qw,

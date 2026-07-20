@@ -40,7 +40,15 @@ if(NOT Eigen3_FIND_VERSION)
 endif()
 
 macro(_eigen3_check_version)
-  file(READ "${EIGEN3_INCLUDE_DIR}/Eigen/src/Core/util/Macros.h" _eigen3_version_header)
+  # Eigen 5 moved the version defines out of Macros.h into Eigen/Version.
+  # Keep supporting the legacy location used by Eigen 3 and 4 so that this
+  # module can also be used by dependencies (notably g2o) during configure.
+  if(EXISTS "${EIGEN3_INCLUDE_DIR}/Eigen/Version")
+    set(_eigen3_version_header_path "${EIGEN3_INCLUDE_DIR}/Eigen/Version")
+  else()
+    set(_eigen3_version_header_path "${EIGEN3_INCLUDE_DIR}/Eigen/src/Core/util/Macros.h")
+  endif()
+  file(READ "${_eigen3_version_header_path}" _eigen3_version_header)
 
   string(REGEX MATCH "define[ \t]+EIGEN_WORLD_VERSION[ \t]+([0-9]+)" _eigen3_world_version_match "${_eigen3_version_header}")
   set(EIGEN3_WORLD_VERSION "${CMAKE_MATCH_1}")
