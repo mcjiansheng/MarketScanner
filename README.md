@@ -2,7 +2,7 @@
 
 > 文档状态：**当前有效**。最后一次与源码交叉核对日期：2026-07-20。
 
-本项目是在开源 **RTAB-Map** 基础上进行的业务化改造，面向大型超市、仓储卖场等室内场景，形成从 iPhone Pro 连续采集，到 PC 端离线优化，再到二维地图、彩色俯视图、三维预览和电子价签空间数据交付的一套本地工作流。
+本项目是在开源 **RTAB-Map** 基础上进行的业务化改造，面向大型超市、仓储卖场等室内场景，形成从 iPhone Pro 连续采集，到 PC 端离线优化，再到二维地图、彩色俯视图和三维预览的一套本地工作流。
 
 当前源码中的 RTAB-Map 版本为 **0.23.5**。上游项目原始 README 已保存在 [doc/README.md](doc/README.md)，便于查询 RTAB-Map 官方主页、安装说明、ROS 支持和上游 CI 信息。
 
@@ -16,7 +16,6 @@
 iPhone Pro RGB-D / LiDAR / IMU / ARKit 采集
   -> 连续写入单个 RTAB-Map SQLite 数据库
   -> 位姿质量门控、内存与设备安全保护
-  -> NFC 电子价签与空间位姿绑定
   -> 完整会话导出到 PC
   -> 数据库检查与自适应离线闭环/全局优化
   -> 轨迹安全验证
@@ -42,11 +41,11 @@ iPhone Pro RGB-D / LiDAR / IMU / ARKit 采集
 
 | 范围 | 改编内容 |
 | --- | --- |
-| iOS 采集 | 增加超市扫描会话、连续流式单库、中文界面、扫描状态、NFC 价签、sidecar 数据和外部目录复制 |
+| iOS 采集 | 增加超市扫描会话、连续流式单库、中文界面、扫描状态、sidecar 数据和外部目录复制 |
 | 移动原生层 | 增加相机原点保持、连续地图模式、有界实时渲染、数据库操作和 Swift/C++ 桥接能力 |
 | 稳定性 | 对 ARKit tracking 恢复和不合理位姿跳变进行质量门控；按内存、磁盘和热状态降低预览或安全结束 |
 | PC 优化 | 扩展 `rtabmap-reprocess` 的进度、约束统计和最终求解流程，支持工作台执行自适应离线优化 |
-| 地图生成 | 新增单设备、历史多阶段、多设备二维地图脚本，输出占据图、轨迹、价签、GeoJSON 和质量报告 |
+| 地图生成 | 新增单设备、历史多阶段、多设备二维地图脚本，输出占据图、轨迹、GeoJSON 和质量报告；保留旧价签数据兼容解析 |
 | 可视化工作台 | 新增仅监听本机的 Web 工作台，统一进行输入检查、处理编排、2D/3D 预览、日志和结果检查 |
 | 性能加速 | 提供 Release/OpenMP 配置，以及 Apple Metal 或 NVIDIA CUDA 深度投影 helper；不可用时明确回退 CPU |
 
@@ -62,6 +61,12 @@ Android 目录中的部分 C++ 原生实现也因共享移动渲染和数据库�
 - 实时渲染节点数有独立上限，释放退出工作图的点云和图形缓冲，避免预览内存无限增长。
 - 暂时打开控制中心、锁屏或发生系统中断后，恢复到同一条连续轨迹，不人为创建新子图。
 - `segment_0001` 仅为兼容早期 PC 工具保留的目录名，不表示生产模式仍会自动分段。
+
+### NFC 功能暂停
+
+当前项目暂停 NFC 相关功能的使用与开发。原因是 iOS 调起 Core NFC 会中断正在运行的摄像头采集，从而破坏连续扫描；同时，未具备相应认证、entitlement 和 provisioning profile 的 Apple 开发者账号无法在真机上调试 NFC。
+
+因此当前版本隐藏 NFC 菜单和调试入口，不把 NFC 纳入扫描验收流程。`PriceTagNFCReader.swift`、相关数据结构、旧 `price_tags.*` 文件解析和地图兼容代码暂时保留，仅用于历史数据兼容及未来在具备认证条件、且完成摄像头连续性方案后恢复。不得在生产扫描过程中直接重新启用该入口。
 
 ### 纯软件误差控制
 
@@ -91,8 +96,8 @@ SupermarketSession-YYYYMMDD-HHMMSS/
   segment_0001/
     rtabmap_segment_0001.db
     metadata.json
-    price_tags.json
-    price_tags.csv
+    price_tags.json             # 暂停功能的兼容空文件
+    price_tags.csv              # 暂停功能的兼容空文件
     scan_area_cells.json
     trajectory_samples.json
     trajectory_samples.csv
@@ -103,10 +108,10 @@ SupermarketSession-YYYYMMDD-HHMMSS/
 
 - `rtabmap_segment_0001.db`：RGB-D 帧、节点、约束、位姿和 RTAB-Map 管理数据。
 - `metadata.json`：扫描模式、完成状态、节点数、面积、存储、设备状态和处理配置。
-- `price_tags.*`：NFC 电子价签标识、载荷、时间、节点和采集时空间位姿。
+- `price_tags.*`：为旧会话兼容保留；当前扫描不采集 NFC，正常情况下为空。
 - `scan_area_cells.json`：移动端轻量覆盖面积估算使用的栅格。
 - `trajectory_samples.*`：移动端采样轨迹，供检查和兼容流程使用。
-- `scan_events.jsonl`：tracking、中断恢复、内存、热状态、磁盘、闭环、NFC 和结束事件的结构化日志。
+- `scan_events.jsonl`：tracking、中断恢复、内存、热状态、磁盘、闭环和结束事件的结构化日志。
 
 如果会话中仍存在 `live_checkpoint.json`，PC 工作台会把它视为正在写入或异常未完成的数据，拒绝自动重处理。
 
@@ -230,13 +235,13 @@ python3 -m unittest discover -s tools/SupermarketMapStudio/tests -v
 
 ### 5. 构建 iOS 应用
 
-使用 Xcode 打开 `app/ios/RTABMapApp.xcodeproj`。完整扫描流程需要支持 ARKit、LiDAR 和 NFC 的真机，建议使用 iPhone Pro 系列设备。首次构建前仍需按上游 iOS 工程方式准备 RTAB-Map 依赖库和签名；生成的本地 Libraries 目录不会提交到 Git。
+使用 Xcode 打开 `app/ios/RTABMapApp.xcodeproj`。完整扫描流程需要支持 ARKit 和 LiDAR 的真机，建议使用 iPhone Pro 系列设备。NFC 当前暂停，不属于构建或验收范围。首次构建前仍需按上游 iOS 工程方式准备 RTAB-Map 依赖库和签名；生成的本地 Libraries 目录不会提交到 Git。
 
 ## 目录导航
 
 | 路径 | 作用 |
 | --- | --- |
-| `app/ios/RTABMapApp/` | iOS 采集、会话、NFC、状态管理和 Swift/C++ 桥接 |
+| `app/ios/RTABMapApp/` | iOS 采集、会话、状态管理和 Swift/C++ 桥接；NFC 代码仅保留未启用 |
 | `app/android/jni/` | 共享移动原生、数据库和渲染能力 |
 | `corelib/` | 上游 RTAB-Map 核心 SLAM 与数据库实现 |
 | `guilib/` | 上游桌面可视化组件 |

@@ -249,7 +249,7 @@ function renderInspection(data) {
   const streaming = data.scan_mode === "continuous_streaming";
   const mode = streaming ? "连续流式单库" : (data.scan_mode === "segmented" ? "传统分段" : "兼容单库");
   const strategy = data.merge_required ? "需要段间合并/校正" : "无需段间合并";
-  appendText(target, "div", `${mode}  |  ${data.database_count} 个数据库  |  ${data.node_count} 个节点  |  ${data.price_tag_count} 个价签`);
+  appendText(target, "div", `${mode}  |  ${data.database_count} 个数据库  |  ${data.node_count} 个节点`);
   appendText(target, "div", strategy, streaming ? "complete" : "");
   const pc = data.pc_processing || {};
   if (pc.uses_optimized_poses) {
@@ -272,7 +272,7 @@ function renderInspection(data) {
     const warning = segment.warnings?.length ? `；${segment.warnings.join(" ")}` : "";
     const label = streaming ? "连续数据库" : `分段 ${segment.index}`;
     const optimized = segment.optimized_poses ? `，${segment.optimized_poses} 个优化位姿` : "";
-    appendText(list, "li", `${label}: ${segment.nodes} 节点${optimized}，${segment.price_tags} 价签${warning}`);
+    appendText(list, "li", `${label}: ${segment.nodes} 节点${optimized}${warning}`);
   });
   target.appendChild(list);
   renderScanLogs(data.scan_logs || {});

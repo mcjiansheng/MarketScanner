@@ -418,6 +418,11 @@ def scan_event_logs(session: Path, limit: int = 1000) -> Dict[str, Any]:
                     malformed_lines += 1
                     continue
                 if isinstance(event, dict):
+                    # NFC capture is paused and should not appear in the active
+                    # scan-debug surface. Old event data remains untouched on
+                    # disk and the compatibility parser is retained.
+                    if event.get("event") == "price_tag_recorded":
+                        continue
                     event["source"] = str(path.relative_to(session))
                     event_count += 1
                     recent_events.append(event)
@@ -443,13 +448,11 @@ def inspect_session(session: Path) -> Dict[str, Any]:
         **input_scan,
         "segment_count": len(segments),
         "node_count": sum(len(segment.poses) for segment in segments),
-        "price_tag_count": sum(len(segment.price_tags) for segment in segments),
         "segments": [
             {
                 "index": segment.index,
                 "database": str(segment.database_path) if segment.database_path else None,
                 "nodes": len(segment.poses),
-                "price_tags": len(segment.price_tags),
                 "scan_mode": base.metadata_scan_mode(segment.metadata),
                 "finalized": segment.metadata.get("finalized"),
                 "warnings": segment.sqlite_warnings,

@@ -238,6 +238,26 @@ class MapStudioApiTests(unittest.TestCase):
         self.assertTrue(result["truncated"])
         self.assertEqual([event["event"] for event in result["events"]], ["event_3", "event_4"])
 
+    def test_nfc_is_hidden_from_active_debug_information(self) -> None:
+        log = self.session_a / "segment_0001" / "scan_events.jsonl"
+        events = [
+            {"timestampUnix": 1.0, "event": "scan_started", "message": "scan"},
+            {"timestampUnix": 2.0, "event": "price_tag_recorded", "message": "legacy NFC event"},
+        ]
+        log.write_text("\n".join(json.dumps(event) for event in events) + "\n", encoding="utf-8")
+
+        inspection = self.api("/api/session/inspect", {"session": str(self.session_a)})
+        self.assertEqual(inspection["scan_logs"]["event_count"], 1)
+        self.assertEqual([event["event"] for event in inspection["scan_logs"]["events"]], ["scan_started"])
+        self.assertNotIn("price_tag_count", inspection)
+        self.assertNotIn("price_tags", inspection["segments"][0])
+
+        html, _ = self.fetch("/")
+        script, _ = self.fetch("/app.js")
+        self.assertIn(b'<input id="option-tag-snap" type="hidden"', html)
+        self.assertNotIn("价签吸附".encode("utf-8"), html)
+        self.assertNotIn("个价签".encode("utf-8"), script)
+
     def test_inspect_and_stage_job_write_preview_artifacts(self) -> None:
         inspection = self.api("/api/session/inspect", {"session": str(self.session_a)})
         self.assertEqual(inspection["segment_count"], 1)

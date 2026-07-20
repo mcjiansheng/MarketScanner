@@ -29,6 +29,11 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
     private var rtabmap: RTABMap?
     private var supermarketSession: SupermarketScanSession?
     private var priceTagNFCReader: PriceTagNFCReader?
+    // NFC is intentionally paused. Presenting Core NFC interrupts the active
+    // camera capture on iOS, and the entitlement cannot be debugged with an
+    // unprovisioned Apple developer account. Keep the implementation for a
+    // future certified workflow, but expose no production/debug entry point.
+    private let supermarketNFCEnabled = false
     private var startupCompleted = false
     
     private var databases = [URL]()
@@ -296,7 +301,7 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         let notificationCenter = NotificationCenter.default
         notificationCenter.addObserver(self, selector: #selector(appMovedToBackground), name: UIApplication.willResignActiveNotification, object: nil)
         // didBecomeActive also covers short interruptions (Control Center,
-        // notification shade, Siri, NFC UI) which never enter the background.
+        // notification shade or Siri) which never enter the background.
         notificationCenter.addObserver(self, selector: #selector(appMovedToForeground), name: UIApplication.didBecomeActiveNotification, object: nil)
         notificationCenter.addObserver(self, selector: #selector(defaultsChanged), name: UserDefaults.didChangeNotification, object: nil)
         
@@ -1094,9 +1099,11 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         fileMenuChildren.append(UIAction(title: localized("New Mapping Session"), image: UIImage(systemName: "plus.app"), attributes: actionNewScanEnabled ? [] : .disabled, state: .off, handler: { _ in
             self.newScan()
         }))
-        fileMenuChildren.append(UIAction(title: localized("Read Price Tag NFC"), image: UIImage(systemName: "tag"), attributes: self.mState == .STATE_MAPPING ? [] : .disabled, state: .off, handler: { _ in
-            self.readPriceTagNFC()
-        }))
+        if supermarketNFCEnabled {
+            fileMenuChildren.append(UIAction(title: localized("Read Price Tag NFC"), image: UIImage(systemName: "tag"), attributes: self.mState == .STATE_MAPPING ? [] : .disabled, state: .off, handler: { _ in
+                self.readPriceTagNFC()
+            }))
+        }
         if(actionOptimizeEnabled) {
             fileMenuChildren.append(optimizeMenu)
         }
@@ -2640,6 +2647,9 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
 
     func readPriceTagNFC()
     {
+        guard supermarketNFCEnabled else {
+            return
+        }
         guard mState == .STATE_MAPPING else {
             showToast(message: localized("Start mapping before reading a price tag."), seconds: 2)
             return
