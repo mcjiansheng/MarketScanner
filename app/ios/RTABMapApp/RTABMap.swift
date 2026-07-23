@@ -71,7 +71,7 @@ class RTABMap {
                 }
              },
              //statsUpdatedCallback
-             {(observer, nodes, words, points, polygons, updateTime, loopClosureId, highestHypId, databaseMemoryUsed, inliers, matches, featuresExtracted, hypothesis, nodesDrawn, fps, rejected, rehearsalValue, optimizationMaxError, optimizationMaxErrorRatio, distanceTravelled, fastMovement, landmarkDetected, x, y, z, roll, pitch, yaw) -> Void in
+             {(observer, nodes, words, points, polygons, updateTime, loopClosureId, highestHypId, databaseMemoryUsed, inliers, matches, featuresExtracted, hypothesis, nodesDrawn, fps, rejected, rehearsalValue, optimizationMaxError, optimizationMaxErrorRatio, distanceTravelled, fastMovement, landmarkDetected, loopClosureType, loopClosureCurrentId, loopClosureTargetId, mapCorrectionX, mapCorrectionY, mapCorrectionZ, mapCorrectionQx, mapCorrectionQy, mapCorrectionQz, mapCorrectionQw, x, y, z, roll, pitch, yaw) -> Void in
                          // Extract pointer to `self` from void pointer:
                 let mySelf = Unmanaged<RTABMap>.fromOpaque(observer!).takeUnretainedValue()
                          // Call instance method:
@@ -84,7 +84,7 @@ class RTABMap {
                         continue
                     }
 
-                    observer.statsUpdated(mySelf, nodes: Int(nodes), words: Int(words), points: Int(points), polygons: Int(polygons), updateTime: updateTime, loopClosureId: Int(loopClosureId), highestHypId: Int(highestHypId), databaseMemoryUsed: Int(databaseMemoryUsed), inliers: Int(inliers), matches: Int(matches), featuresExtracted: Int(featuresExtracted), hypothesis: hypothesis, nodesDrawn: Int(nodesDrawn), fps: fps, rejected: Int(rejected), rehearsalValue: rehearsalValue, optimizationMaxError: optimizationMaxError, optimizationMaxErrorRatio: optimizationMaxErrorRatio, distanceTravelled: distanceTravelled, fastMovement: Int(fastMovement), landmarkDetected: Int(landmarkDetected), x: x, y: y, z: z, roll: roll, pitch: pitch, yaw: yaw)
+                    observer.statsUpdated(mySelf, nodes: Int(nodes), words: Int(words), points: Int(points), polygons: Int(polygons), updateTime: updateTime, loopClosureId: Int(loopClosureId), highestHypId: Int(highestHypId), databaseMemoryUsed: Int(databaseMemoryUsed), inliers: Int(inliers), matches: Int(matches), featuresExtracted: Int(featuresExtracted), hypothesis: hypothesis, nodesDrawn: Int(nodesDrawn), fps: fps, rejected: Int(rejected), rehearsalValue: rehearsalValue, optimizationMaxError: optimizationMaxError, optimizationMaxErrorRatio: optimizationMaxErrorRatio, distanceTravelled: distanceTravelled, fastMovement: Int(fastMovement), landmarkDetected: Int(landmarkDetected), loopClosureType: Int(loopClosureType), loopClosureCurrentId: Int(loopClosureCurrentId), loopClosureTargetId: Int(loopClosureTargetId), mapCorrectionX: mapCorrectionX, mapCorrectionY: mapCorrectionY, mapCorrectionZ: mapCorrectionZ, mapCorrectionQx: mapCorrectionQx, mapCorrectionQy: mapCorrectionQy, mapCorrectionQz: mapCorrectionQz, mapCorrectionQw: mapCorrectionQw, x: x, y: y, z: z, roll: roll, pitch: pitch, yaw: yaw)
                 }
              },
              //cameraInfoEventCallback
@@ -616,6 +616,16 @@ protocol RTABMapObserver: class {
                       distanceTravelled: Float,
                       fastMovement: Int,
                       landmarkDetected: Int,
+                      loopClosureType: Int,
+                      loopClosureCurrentId: Int,
+                      loopClosureTargetId: Int,
+                      mapCorrectionX: Float,
+                      mapCorrectionY: Float,
+                      mapCorrectionZ: Float,
+                      mapCorrectionQx: Float,
+                      mapCorrectionQy: Float,
+                      mapCorrectionQz: Float,
+                      mapCorrectionQw: Float,
                       x: Float,
                       y: Float,
                       z: Float,

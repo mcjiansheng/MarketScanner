@@ -139,38 +139,116 @@ class CameraCalibration:
 
 @dataclasses.dataclass
 class ShelfOutline:
-    """Filtered floor-plan cells supported by vertically observed RGB-D surfaces."""
+    """Closed shelf boundaries reconstructed from an internal footprint mask."""
 
     cells: Set[Tuple[int, int]] = dataclasses.field(default_factory=set)
     components: List[List[Tuple[int, int]]] = dataclasses.field(default_factory=list)
+    shelf_cells: Set[Tuple[int, int]] = dataclasses.field(default_factory=set)
+    vertical_structure_cells: Set[Tuple[int, int]] = dataclasses.field(default_factory=set)
+    has_orientation_evidence: bool = False
+    has_ground_conflict_evidence: bool = False
+    instance_count: int = 0
+    line_candidate_count: int = 0
     evidence_cells: List[List[float]] = dataclasses.field(default_factory=list, repr=False)
     evidence_cell_count: int = 0
     candidate_cell_count: int = 0
     vertical_triangle_count: int = 0
+    ground_evidence_cell_count: int = 0
+    ground_conflict_candidate_count: int = 0
+    ground_conflict_rejected_count: int = 0
+    measured_seed_cell_count: int = 0
+    elevated_evidence_cell_count: int = 0
+    stable_elevated_cell_count: int = 0
     floor_height_m: Optional[float] = None
-    minimum_height_span_m: float = 0.45
-    minimum_height_above_floor_m: float = 0.55
-    minimum_verticality: float = 0.60
-    minimum_triangle_count: int = 3
-    maximum_gap_cells: int = 1
-    minimum_component_length_m: float = 0.20
+    minimum_height_span_m: float = 0.38
+    minimum_height_above_floor_m: float = 0.48
+    minimum_verticality: float = 0.56
+    minimum_triangle_count: int = 2
+    minimum_orientation_coherence: float = 0.40
+    minimum_observation_count: int = 2
+    minimum_ground_observation_count: int = 2
+    maximum_ground_conflict_ratio: float = 0.66
+    duplicate_suppression_cells: int = 1
+    maximum_gap_cells: int = 8
+    minimum_component_length_m: float = 0.60
+    minimum_line_support_ratio: float = 0.30
+    maximum_fill_distance_m: float = 0.62
+    maximum_ground_search_m: float = 1.12
+    minimum_region_area_m2: float = 0.40
+    morphology_radius_cells: int = 1
+    minimum_elevated_observation_count: int = 2
+    ground_cells: Set[Tuple[int, int]] = dataclasses.field(default_factory=set, repr=False)
+    elevated_cells: Set[Tuple[int, int]] = dataclasses.field(default_factory=set, repr=False)
+    stable_elevated_cells: Set[Tuple[int, int]] = dataclasses.field(default_factory=set, repr=False)
+    free_space_cells: Set[Tuple[int, int]] = dataclasses.field(default_factory=set, repr=False)
+    elevated_observation_counts: Dict[Tuple[int, int], int] = dataclasses.field(
+        default_factory=dict, repr=False
+    )
+    maximum_hole_area_m2: float = 0.90
+    minimum_free_observation_count: int = 12
+    free_space_margin_m: float = 0.0
+    maximum_bridge_width_m: float = 0.50
+    boundary_thickness_cells: int = 2
+    free_space_evidence_cell_count: int = 0
+    bridge_split_count: int = 0
+    closed_contour_count: int = 0
+    structure_available_frame_count: int = 0
+    structure_sampled_frame_count: int = 0
+    structure_decoded_frame_count: int = 0
+    structure_pixel_step: int = 0
 
     def summary(self, resolution: float) -> Dict[str, Any]:
         return {
-            "status": "available" if self.cells else "no_reliable_vertical_structure",
+            "status": "available" if self.cells else "no_reliable_shelf_contour",
             "cell_count": len(self.cells),
             "component_count": len(self.components),
+            "region_count": len(self.components),
+            "instance_count": self.instance_count,
+            "line_candidate_count": self.line_candidate_count,
+            "shelf_cell_count": len(self.shelf_cells),
+            "vertical_structure_cell_count": len(self.vertical_structure_cells),
             "evidence_cell_count": self.evidence_cell_count,
             "candidate_cell_count": self.candidate_cell_count,
             "vertical_triangle_count": self.vertical_triangle_count,
+            "ground_evidence_cell_count": self.ground_evidence_cell_count,
+            "ground_conflict_candidate_count": self.ground_conflict_candidate_count,
+            "ground_conflict_rejected_count": self.ground_conflict_rejected_count,
+            "measured_seed_cell_count": self.measured_seed_cell_count,
+            "elevated_evidence_cell_count": self.elevated_evidence_cell_count,
+            "stable_elevated_cell_count": self.stable_elevated_cell_count,
+            "free_space_evidence_cell_count": self.free_space_evidence_cell_count,
+            "bridge_split_count": self.bridge_split_count,
+            "closed_contour_count": self.closed_contour_count,
+            "structure_available_frame_count": self.structure_available_frame_count,
+            "structure_sampled_frame_count": self.structure_sampled_frame_count,
+            "structure_decoded_frame_count": self.structure_decoded_frame_count,
+            "structure_pixel_step": self.structure_pixel_step,
+            "direct_support_cell_count": len(self.shelf_cells & self.vertical_structure_cells),
+            "inferred_cell_count": len(self.shelf_cells - self.vertical_structure_cells),
+            "direct_support_ratio": round(
+                len(self.shelf_cells & self.vertical_structure_cells) / max(1, len(self.shelf_cells)), 4
+            ),
             "floor_height_m": self.floor_height_m,
             "minimum_height_span_m": self.minimum_height_span_m,
             "minimum_height_above_floor_m": self.minimum_height_above_floor_m,
             "minimum_verticality": self.minimum_verticality,
             "minimum_triangle_count": self.minimum_triangle_count,
-            "maximum_gap_cells": self.maximum_gap_cells,
-            "minimum_component_length_m": self.minimum_component_length_m,
-            "line_coverage_m2": round(len(self.cells) * resolution * resolution, 3),
+            "minimum_orientation_coherence": self.minimum_orientation_coherence,
+            "minimum_observation_count": self.minimum_observation_count,
+            "minimum_ground_observation_count": self.minimum_ground_observation_count,
+            "maximum_ground_conflict_ratio": self.maximum_ground_conflict_ratio,
+            "maximum_fill_distance_m": self.maximum_fill_distance_m,
+            "maximum_ground_search_m": self.maximum_ground_search_m,
+            "minimum_region_area_m2": self.minimum_region_area_m2,
+            "morphology_radius_cells": self.morphology_radius_cells,
+            "minimum_elevated_observation_count": self.minimum_elevated_observation_count,
+            "maximum_hole_area_m2": self.maximum_hole_area_m2,
+            "minimum_free_observation_count": self.minimum_free_observation_count,
+            "free_space_margin_m": self.free_space_margin_m,
+            "maximum_bridge_width_m": self.maximum_bridge_width_m,
+            "boundary_thickness_cells": self.boundary_thickness_cells,
+            "area_m2": round(len(self.shelf_cells) * resolution * resolution, 3),
+            "contour_length_m": round(len(self.cells) * resolution, 3),
         }
 
 
@@ -509,7 +587,12 @@ def extract_db_poses(db_path: Path, segment_index: int, axes: str) -> Tuple[List
         tables = set(sqlite_tables(conn))
         if "Data" in tables:
             columns = set(table_columns(conn, "Data"))
-            has_grid_blobs = bool({"ground_cells", "obstacle_cells", "empty_cells"} & columns)
+            grid_columns = sorted({"ground_cells", "obstacle_cells", "empty_cells"} & columns)
+            if grid_columns:
+                populated = " OR ".join(f"length({column})>0" for column in grid_columns)
+                has_grid_blobs = conn.execute(
+                    f"SELECT EXISTS(SELECT 1 FROM Data WHERE {populated} LIMIT 1)"
+                ).fetchone()[0] == 1
 
         if "Node" not in tables:
             warnings.append("No Node table found; trajectory will rely on sidecar/CSV only.")
@@ -1092,8 +1175,8 @@ def write_preview_layers(
     layers.append(
         {
             "id": "shelf_outline",
-            "label": "货架/竖直结构轮廓",
-            "kind": "shelf_outline",
+            "label": "货架闭合边界",
+            "kind": "shelf_closed_contour",
             "color": [12, 16, 18],
             "default_visible": True,
         }
@@ -1125,7 +1208,7 @@ def write_preview_layers(
     )
     payload = {
         "format": "SupermarketMap2DPreviewLayers",
-        "version": 2,
+        "version": 4,
         "width": grid.width,
         "height": grid.height,
         "resolution_m": grid.resolution,
@@ -1141,8 +1224,17 @@ def write_preview_layers(
         "price_tags": tag_entries,
         "shelf_outline": {
             "runs": shelf_outline_runs(shelf_outline, grid) if shelf_outline is not None else [],
+            "shelf_runs": shelf_outline_runs(shelf_outline, grid, shelf_outline.shelf_cells)
+            if shelf_outline is not None
+            else [],
+            "vertical_structure_runs": shelf_outline_runs(
+                shelf_outline, grid, shelf_outline.vertical_structure_cells
+            )
+            if shelf_outline is not None
+            else [],
             "summary": shelf_outline.summary(grid.resolution) if shelf_outline is not None else None,
             "evidence": "shelf_outline_evidence.json" if shelf_outline is not None else None,
+            "display": "closed_contours",
         },
         "export_scales": [1, 2, 4],
     }
@@ -1204,7 +1296,7 @@ def vertical_triangle_sample(
     second: Sequence[float],
     third: Sequence[float],
     maximum_vertical_normal_ratio: float = 0.55,
-) -> Optional[Tuple[float, float, float, float, float, float]]:
+) -> Optional[Tuple[float, float, float, float, float, float, float, float]]:
     """Return compact evidence when a triangle belongs to a near-vertical surface.
 
     The third coordinate is height. A vertical wall/shelf face has an almost
@@ -1229,6 +1321,16 @@ def vertical_triangle_sample(
     if normal_height_ratio > maximum_vertical_normal_ratio:
         return None
     heights = (float(first[2]), float(second[2]), float(third[2]))
+    # A shelf/wall trace runs perpendicular to the horizontal surface normal.
+    # Store its undirected angle as cos(2a), sin(2a), so observations pointing
+    # in opposite directions reinforce instead of cancelling each other.
+    horizontal_normal_length = math.hypot(normal_x, normal_y)
+    if horizontal_normal_length <= 1e-8:
+        return None
+    tangent_x = -normal_y / horizontal_normal_length
+    tangent_y = normal_x / horizontal_normal_length
+    orientation_cos2 = tangent_x * tangent_x - tangent_y * tangent_y
+    orientation_sin2 = 2.0 * tangent_x * tangent_y
     return (
         (float(first[0]) + float(second[0]) + float(third[0])) / 3.0,
         (float(first[1]) + float(second[1]) + float(third[1])) / 3.0,
@@ -1236,6 +1338,41 @@ def vertical_triangle_sample(
         max(heights),
         normal_length * 0.5,
         1.0 - normal_height_ratio,
+        orientation_cos2,
+        orientation_sin2,
+    )
+
+
+def horizontal_triangle_sample(
+    first: Sequence[float],
+    second: Sequence[float],
+    third: Sequence[float],
+    minimum_horizontal_normal_ratio: float = 0.85,
+) -> Optional[Tuple[float, float, float, float, float]]:
+    """Return a compact sample for a near-horizontal triangle.
+
+    These samples are retained until the global floor level is estimated.
+    Shelf tops are therefore harmless: only samples close to that floor level
+    become ground evidence. Ground is used as temporal conflict evidence, not
+    as a prerequisite for accepting a shelf.
+    """
+    ab = tuple(float(second[index]) - float(first[index]) for index in range(3))
+    ac = tuple(float(third[index]) - float(first[index]) for index in range(3))
+    normal_x = ab[1] * ac[2] - ab[2] * ac[1]
+    normal_y = ab[2] * ac[0] - ab[0] * ac[2]
+    normal_z = ab[0] * ac[1] - ab[1] * ac[0]
+    normal_length = math.sqrt(normal_x * normal_x + normal_y * normal_y + normal_z * normal_z)
+    if normal_length <= 1e-8:
+        return None
+    horizontality = abs(normal_z) / normal_length
+    if horizontality < minimum_horizontal_normal_ratio:
+        return None
+    return (
+        (float(first[0]) + float(second[0]) + float(third[0])) / 3.0,
+        (float(first[1]) + float(second[1]) + float(third[1])) / 3.0,
+        (float(first[2]) + float(second[2]) + float(third[2])) / 3.0,
+        normal_length * 0.5,
+        horizontality,
     )
 
 
@@ -1249,8 +1386,16 @@ def extract_depth_point_cloud(
     frame_output_dir: Optional[Path] = None,
     depth_projector: Optional[Any] = None,
     structure_resolution: float = 0.05,
+    structure_max_frames: int = 0,
+    structure_pixel_step: int = 5,
 ) -> Dict[str, Any]:
-    """Build a bounded preview cloud from RTAB-Map RGB-D node data."""
+    """Build a bounded preview cloud and an independent structure evidence pass.
+
+    The WebGL preview remains frame/point bounded, while shelf extraction uses
+    all RGB-D frames by default at a coarser pixel step.  Keeping the two
+    budgets separate prevents missing shelf sides and aisle floor evidence
+    merely because the browser preview has already reached its size limit.
+    """
     candidates: List[Tuple[Segment, int]] = []
     for segment in segments:
         if segment.database_path is None or not segment.database_path.is_file():
@@ -1271,7 +1416,26 @@ def extract_depth_point_cloud(
         except sqlite3.Error:
             continue
 
-    selected = _evenly_sampled_rows(candidates, max_frames)
+    preview_selected = _evenly_sampled_rows(candidates, max_frames)
+    structure_selected = (
+        list(candidates)
+        if structure_max_frames <= 0
+        else _evenly_sampled_rows(candidates, structure_max_frames)
+    )
+    preview_keys = {
+        (segment.database_path, node_id)
+        for segment, node_id in preview_selected
+    }
+    structure_keys = {
+        (segment.database_path, node_id)
+        for segment, node_id in structure_selected
+    }
+    selected_by_key: Dict[Tuple[Optional[Path], int], Tuple[Segment, int]] = {}
+    for segment, node_id in preview_selected:
+        selected_by_key[(segment.database_path, node_id)] = (segment, node_id)
+    for segment, node_id in structure_selected:
+        selected_by_key[(segment.database_path, node_id)] = (segment, node_id)
+    selected = list(selected_by_key.values())
     selected_by_database: Dict[Path, List[Tuple[Segment, int]]] = defaultdict(list)
     for segment, node_id in selected:
         if segment.database_path is not None:
@@ -1280,15 +1444,26 @@ def extract_depth_point_cloud(
     points: List[List[Any]] = []
     decoded_frames = 0
     skipped_frames = 0
+    structure_decoded_frames = 0
+    structure_skipped_frames = 0
     warnings: List[str] = []
     effective_steps: List[int] = []
+    structure_effective_steps: List[int] = []
     surface_frames: List[Dict[str, Any]] = []
     gpu_projected_frames = 0
     gpu_projection_failures = 0
+    structure_gpu_projected_frames = 0
+    structure_gpu_projection_failures = 0
+    optimized_projection_pose_count = 0
+    raw_projection_pose_count = 0
     palette = [(17, 132, 141), (47, 123, 202), (147, 89, 170), (189, 106, 50), (88, 125, 53)]
     structure_cell_size = max(0.025, float(structure_resolution))
     vertical_surface_cells: Dict[Tuple[int, int], List[float]] = {}
+    horizontal_surface_cells: Dict[Tuple[int, int, int], List[float]] = {}
+    structure_height_histogram: Dict[int, int] = defaultdict(int)
+    structure_height_bin_m = 0.02
     vertical_triangle_count = 0
+    horizontal_triangle_count = 0
 
     for database_path, rows in selected_by_database.items():
         segment = rows[0][0]
@@ -1297,6 +1472,7 @@ def extract_depth_point_cloud(
         placeholders = ",".join("?" for _ in selected_ids)
         try:
             with closing(sqlite3.connect(str(database_path))) as conn:
+                optimized_pose_blobs = extract_optimized_pose_blobs(conn)
                 data_columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(Data)")}
                 image_expression = "d.image" if "image" in data_columns else "NULL"
                 query = (
@@ -1306,31 +1482,54 @@ def extract_depth_point_cloud(
                 database_rows = conn.execute(query, sorted(selected_ids)).fetchall()
         except sqlite3.Error as exc:
             warnings.append(f"segment_{segment.index:04d}: point cloud SQLite read failed: {exc}")
-            skipped_frames += len(rows)
+            skipped_frames += sum(
+                (database_path, node_id) in preview_keys for _segment, node_id in rows
+            )
+            structure_skipped_frames += sum(
+                (database_path, node_id) in structure_keys for _segment, node_id in rows
+            )
             continue
 
         base_color = palette[(segment.index - 1) % len(palette)]
         for node_id, pose_blob, depth_blob, calibration_blob, image_blob in database_rows:
+            frame_key = (database_path, int(node_id))
+            collect_preview = frame_key in preview_keys
+            collect_structure = frame_key in structure_keys
             current_pose = current_by_node.get(int(node_id))
-            raw_matrix = parse_transform_matrix(pose_blob)
-            raw_projected = parse_rtabmap_transform_3d(pose_blob, horizontal_axes)
+            optimized_blob = optimized_pose_blobs.get(int(node_id))
+            projection_blob = optimized_blob or pose_blob
+            projection_matrix = parse_transform_matrix(projection_blob)
+            projection_pose = parse_rtabmap_transform_3d(projection_blob, horizontal_axes)
             calibration = parse_camera_calibration(calibration_blob)
-            if current_pose is None or raw_matrix is None or raw_projected is None or calibration is None:
-                skipped_frames += 1
+            if current_pose is None or projection_matrix is None or projection_pose is None or calibration is None:
+                skipped_frames += int(collect_preview)
+                structure_skipped_frames += int(collect_structure)
                 continue
             try:
                 depth_width, depth_height, depths = decode_depth_image(depth_blob)
             except (ValueError, zlib.error, struct.error) as exc:
-                skipped_frames += 1
+                skipped_frames += int(collect_preview)
+                structure_skipped_frames += int(collect_structure)
                 if len(warnings) < 8:
                     warnings.append(f"segment_{segment.index:04d} node {node_id}: depth decode failed: {exc}")
                 continue
 
-            raw_x, raw_y, _raw_height, raw_yaw = raw_projected
-            correction_yaw = current_pose.yaw - raw_yaw
-            rotated_raw_x, rotated_raw_y = transform_point(raw_x, raw_y, 0.0, 0.0, correction_yaw)
-            correction_dx = current_pose.x - rotated_raw_x
-            correction_dy = current_pose.y - rotated_raw_y
+            # Admin.opt_poses contains RTAB-Map's complete SE(3) solution.  Use
+            # that 3-D pose for depth projection instead of projecting with
+            # Node.pose and correcting only x/y/yaw afterwards.  The remaining
+            # planar correction is deliberately retained for explicit
+            # stage/device transforms applied after database discovery.
+            pose_x, pose_y, projection_height, pose_yaw = projection_pose
+            correction_yaw = current_pose.yaw - pose_yaw
+            rotated_pose_x, rotated_pose_y = transform_point(
+                pose_x, pose_y, 0.0, 0.0, correction_yaw
+            )
+            correction_dx = current_pose.x - rotated_pose_x
+            correction_dy = current_pose.y - rotated_pose_y
+            if optimized_blob is not None:
+                optimized_projection_pose_count += 1
+            else:
+                raw_projection_pose_count += 1
             scale_x = depth_width / calibration.width
             scale_y = depth_height / calibration.height
             fx = calibration.fx * scale_x
@@ -1340,11 +1539,16 @@ def extract_depth_point_cloud(
 
             # WebGL 1 indexed geometry uses 16-bit indices. Keep every frame
             # below that limit even when processing a one-frame database.
-            frame_budget = min(65000, max(1, max_points // max(1, len(selected))))
-            effective_step = max(1, pixel_step)
-            while math.ceil(depth_width / effective_step) * math.ceil(depth_height / effective_step) > frame_budget:
-                effective_step += 1
-            effective_steps.append(effective_step)
+            if collect_preview:
+                frame_budget = min(65000, max(1, max_points // max(1, len(preview_selected))))
+                effective_step = max(1, pixel_step)
+                while math.ceil(depth_width / effective_step) * math.ceil(depth_height / effective_step) > frame_budget:
+                    effective_step += 1
+                effective_steps.append(effective_step)
+            else:
+                effective_step = max(1, structure_pixel_step)
+            if collect_structure:
+                structure_effective_steps.append(effective_step)
 
             frame_points = 0
             grid_width = math.ceil(depth_width / effective_step)
@@ -1353,6 +1557,7 @@ def extract_depth_point_cloud(
             frame_vertices: List[List[float]] = []
             frame_uv: List[List[float]] = []
             frame_depths: List[float] = []
+            frame_evidence_heights: List[float] = []
             projected_grid = None
             if depth_projector is not None:
                 try:
@@ -1371,12 +1576,14 @@ def extract_depth_point_cloud(
                         correction_dy=correction_dy,
                         correction_yaw=correction_yaw,
                         local_transform=calibration.local_transform,
-                        raw_transform=raw_matrix,
+                        raw_transform=projection_matrix,
                     )
                     if projected_grid is not None:
-                        gpu_projected_frames += 1
+                        gpu_projected_frames += int(collect_preview)
+                        structure_gpu_projected_frames += int(collect_structure)
                 except Exception as exc:
-                    gpu_projection_failures += 1
+                    gpu_projection_failures += int(collect_preview)
+                    structure_gpu_projection_failures += int(collect_structure)
                     projected_grid = None
                     if len(warnings) < 8:
                         warnings.append(
@@ -1395,7 +1602,7 @@ def extract_depth_point_cloud(
                     else:
                         camera_point = ((column - cx) * depth / fx, (row - cy) * depth / fy, depth)
                         local_point = transform_xyz(calibration.local_transform, camera_point)
-                        native_world = transform_xyz(raw_matrix, local_point)
+                        native_world = transform_xyz(projection_matrix, local_point)
                         if horizontal_axes == "xz":
                             point_x, point_y, point_height = -native_world[1], -native_world[0], native_world[2]
                         else:
@@ -1406,49 +1613,102 @@ def extract_depth_point_cloud(
                     depth_shade = 0.72 + 0.28 * (1.0 - min(1.0, depth / max_depth))
                     height_shade = 0.82 + 0.18 * max(0.0, min(1.0, point_height / 3.0))
                     shade = depth_shade * height_shade
-                    color = [min(255, round(channel * shade)) for channel in base_color]
-                    points.append(
-                        [round(point_x, 3), round(point_y, 3), round(point_height, 3), *color, segment.index]
-                    )
+                    evidence_height = point_height - projection_height
+                    if collect_preview:
+                        color = [min(255, round(channel * shade)) for channel in base_color]
+                        points.append(
+                            [
+                                round(point_x, 3),
+                                round(point_y, 3),
+                                round(point_height, 3),
+                                *color,
+                                segment.index,
+                                # Point height and the matching optimized camera
+                                # height share any residual vertical graph drift.
+                                # Their difference remains the conservative signal
+                                # used to separate floor, shelf slab and tall
+                                # vertical structure. Keep the fully optimized
+                                # world height at index 2 for the 3-D preview.
+                                round(evidence_height, 3),
+                            ]
+                        )
+                    if collect_structure:
+                        structure_height_histogram[round(evidence_height / structure_height_bin_m)] += 1
                     local_index = len(frame_vertices)
                     grid_indices[cell_index] = local_index
                     frame_vertices.append([round(point_x, 3), round(point_y, 3), round(point_height, 3)])
-                    frame_uv.append(
-                        [
-                            round(column / max(1, depth_width - 1), 5),
-                            round(row / max(1, depth_height - 1), 5),
-                        ]
-                    )
+                    if collect_preview:
+                        frame_uv.append(
+                            [
+                                round(column / max(1, depth_width - 1), 5),
+                                round(row / max(1, depth_height - 1), 5),
+                            ]
+                        )
                     frame_depths.append(depth)
+                    frame_evidence_heights.append(evidence_height)
                     frame_points += 1
             if frame_points:
-                decoded_frames += 1
+                decoded_frames += int(collect_preview)
+                structure_decoded_frames += int(collect_structure)
                 frame_indices: List[int] = []
+                frame_vertical_cells: Set[Tuple[int, int]] = set()
+                frame_horizontal_cells: Set[Tuple[int, int, int]] = set()
 
                 def append_triangle(first: int, second: int, third: int) -> None:
-                    nonlocal vertical_triangle_count
+                    nonlocal vertical_triangle_count, horizontal_triangle_count
                     if min(first, second, third) < 0:
                         return
                     triangle_depths = (frame_depths[first], frame_depths[second], frame_depths[third])
                     depth_jump_limit = 0.08 + min(triangle_depths) * 0.04
                     if max(triangle_depths) - min(triangle_depths) <= depth_jump_limit:
-                        frame_indices.extend((first, second, third))
+                        if collect_preview:
+                            frame_indices.extend((first, second, third))
+                        if not collect_structure:
+                            return
                         evidence = vertical_triangle_sample(
-                            frame_vertices[first], frame_vertices[second], frame_vertices[third]
+                            (
+                                frame_vertices[first][0],
+                                frame_vertices[first][1],
+                                frame_evidence_heights[first],
+                            ),
+                            (
+                                frame_vertices[second][0],
+                                frame_vertices[second][1],
+                                frame_evidence_heights[second],
+                            ),
+                            (
+                                frame_vertices[third][0],
+                                frame_vertices[third][1],
+                                frame_evidence_heights[third],
+                            ),
                         )
                         if evidence is not None:
-                            x, y, minimum_height, maximum_height, area, verticality = evidence
+                            (
+                                x,
+                                y,
+                                minimum_height,
+                                maximum_height,
+                                area,
+                                verticality,
+                                orientation_cos2,
+                                orientation_sin2,
+                            ) = evidence
                             key = (round(x / structure_cell_size), round(y / structure_cell_size))
+                            frame_vertical_cells.add(key)
                             accumulated = vertical_surface_cells.get(key)
                             if accumulated is None:
                                 # min height, max height, triangle count,
-                                # accumulated area, accumulated verticality.
+                                # accumulated area/verticality, doubled-angle
+                                # orientation sums and independent frame count.
                                 vertical_surface_cells[key] = [
                                     minimum_height,
                                     maximum_height,
                                     1.0,
                                     area,
                                     verticality,
+                                    orientation_cos2 * area,
+                                    orientation_sin2 * area,
+                                    0.0,
                                 ]
                             else:
                                 accumulated[0] = min(accumulated[0], minimum_height)
@@ -1456,7 +1716,45 @@ def extract_depth_point_cloud(
                                 accumulated[2] += 1.0
                                 accumulated[3] += area
                                 accumulated[4] += verticality
+                                accumulated[5] += orientation_cos2 * area
+                                accumulated[6] += orientation_sin2 * area
                             vertical_triangle_count += 1
+                        horizontal = horizontal_triangle_sample(
+                            (
+                                frame_vertices[first][0],
+                                frame_vertices[first][1],
+                                frame_evidence_heights[first],
+                            ),
+                            (
+                                frame_vertices[second][0],
+                                frame_vertices[second][1],
+                                frame_evidence_heights[second],
+                            ),
+                            (
+                                frame_vertices[third][0],
+                                frame_vertices[third][1],
+                                frame_evidence_heights[third],
+                            ),
+                        )
+                        if horizontal is not None:
+                            x, y, height, area, horizontality = horizontal
+                            key = (
+                                round(x / structure_cell_size),
+                                round(y / structure_cell_size),
+                                round(height / structure_cell_size),
+                            )
+                            frame_horizontal_cells.add(key)
+                            accumulated = horizontal_surface_cells.get(key)
+                            if accumulated is None:
+                                # Triangle count, accumulated area,
+                                # triangle-count weighted horizontality and
+                                # independent frame count.
+                                horizontal_surface_cells[key] = [1.0, area, horizontality, 0.0]
+                            else:
+                                accumulated[0] += 1.0
+                                accumulated[1] += area
+                                accumulated[2] += horizontality
+                            horizontal_triangle_count += 1
 
                 for grid_row in range(grid_height - 1):
                     for grid_column in range(grid_width - 1):
@@ -1467,8 +1765,13 @@ def extract_depth_point_cloud(
                         append_triangle(top_left, top_right, bottom_left)
                         append_triangle(top_right, bottom_right, bottom_left)
 
+                for key in frame_vertical_cells:
+                    vertical_surface_cells[key][7] += 1.0
+                for key in frame_horizontal_cells:
+                    horizontal_surface_cells[key][3] += 1.0
+
                 image_name: Optional[str] = None
-                if frame_output_dir is not None and image_blob:
+                if collect_preview and frame_output_dir is not None and image_blob:
                     if image_blob.startswith(b"\xff\xd8"):
                         suffix = ".jpg"
                     elif image_blob.startswith(b"\x89PNG"):
@@ -1479,7 +1782,7 @@ def extract_depth_point_cloud(
                         frame_output_dir.mkdir(parents=True, exist_ok=True)
                         image_name = f"segment_{segment.index:04d}_node_{int(node_id):06d}{suffix}"
                         (frame_output_dir / image_name).write_bytes(image_blob)
-                if image_name and frame_indices:
+                if collect_preview and image_name and frame_indices:
                     surface_frames.append(
                         {
                             "segment": segment.index,
@@ -1492,17 +1795,36 @@ def extract_depth_point_cloud(
                         }
                     )
             else:
-                skipped_frames += 1
+                skipped_frames += int(collect_preview)
+                structure_skipped_frames += int(collect_structure)
 
-    return {
+    estimated_floor_height: Optional[float] = None
+    if structure_height_histogram:
+        target = max(1, int(sum(structure_height_histogram.values()) * 0.05))
+        accumulated = 0
+        for height_bin, count in sorted(structure_height_histogram.items()):
+            accumulated += count
+            if accumulated >= target:
+                estimated_floor_height = height_bin * structure_height_bin_m
+                break
+
+    result = {
         "points": points,
         "point_count": len(points),
         "available_frames": len(candidates),
-        "sampled_frames": len(selected),
+        "sampled_frames": len(preview_selected),
         "decoded_frames": decoded_frames,
         "skipped_frames": skipped_frames,
         "minimum_pixel_step": pixel_step,
         "effective_pixel_step_max": max(effective_steps, default=pixel_step),
+        "structure_available_frames": len(candidates),
+        "structure_sampled_frames": len(structure_selected),
+        "structure_decoded_frames": structure_decoded_frames,
+        "structure_skipped_frames": structure_skipped_frames,
+        "structure_pixel_step": structure_pixel_step,
+        "structure_effective_pixel_step_max": max(
+            structure_effective_steps, default=structure_pixel_step
+        ),
         "max_depth_m": max_depth,
         "max_points": max_points,
         "color_mode": "rgb_surface_with_segment_cloud_fallback",
@@ -1512,6 +1834,11 @@ def extract_depth_point_cloud(
         "gpu_projection_backend": getattr(depth_projector, "backend", "cpu") if depth_projector else "cpu",
         "gpu_projected_frames": gpu_projected_frames,
         "gpu_projection_failures": gpu_projection_failures,
+        "structure_gpu_projected_frames": structure_gpu_projected_frames,
+        "structure_gpu_projection_failures": structure_gpu_projection_failures,
+        "projection_pose_source": "admin_opt_poses_with_node_pose_fallback",
+        "optimized_projection_pose_count": optimized_projection_pose_count,
+        "raw_projection_pose_count": raw_projection_pose_count,
         "vertical_surface_triangle_count": vertical_triangle_count,
         "vertical_surface_evidence_cell_count": len(vertical_surface_cells),
         "vertical_surface_evidence_resolution_m": structure_cell_size,
@@ -1524,11 +1851,32 @@ def extract_depth_point_cloud(
                 int(values[2]),
                 values[3],
                 values[4] / max(1.0, values[2]),
+                int(values[7]),
+                values[5] / max(1e-9, values[3]),
+                values[6] / max(1e-9, values[3]),
+                min(1.0, math.hypot(values[5], values[6]) / max(1e-9, values[3])),
             ]
             for key, values in vertical_surface_cells.items()
         ],
+        "horizontal_surface_triangle_count": horizontal_triangle_count,
+        "horizontal_surface_evidence_cell_count": len(horizontal_surface_cells),
+        "_horizontal_surface_evidence": [
+            [
+                key[0] * structure_cell_size,
+                key[1] * structure_cell_size,
+                key[2] * structure_cell_size,
+                int(values[0]),
+                values[1],
+                int(values[3]),
+                values[2] / max(1.0, values[0]),
+            ]
+            for key, values in horizontal_surface_cells.items()
+        ],
         "warnings": warnings,
     }
+    if estimated_floor_height is not None:
+        result["estimated_floor_height_m"] = round(estimated_floor_height, 3)
+    return result
 
 
 def projected_depth_surface_points(
@@ -1538,22 +1886,37 @@ def projected_depth_surface_points(
     rows = point_cloud.get("points", [])
     if not rows:
         return []
-    heights = sorted(float(row[2]) for row in rows if len(row) >= 3 and math.isfinite(float(row[2])))
+    # New RGB-D rows carry a camera-relative evidence height at index 7.  It
+    # cancels trajectory Z drift while the original world height at index 2 is
+    # retained for rendering.  Older cached inputs remain supported.
+    evidence_height = lambda row: float(row[7] if len(row) >= 8 else row[2])
+    heights = sorted(
+        evidence_height(row)
+        for row in rows
+        if len(row) >= 3 and math.isfinite(evidence_height(row))
+    )
     if not heights:
         return []
-    floor_height = heights[min(len(heights) - 1, int(len(heights) * 0.05))]
+    floor_raw = point_cloud.get("estimated_floor_height_m")
+    floor_height = (
+        float(floor_raw)
+        if isinstance(floor_raw, (int, float))
+        else heights[min(len(heights) - 1, int(len(heights) * 0.05))]
+    )
     point_cloud["estimated_floor_height_m"] = round(floor_height, 3)
     cell_size = max(0.05, resolution)
     selected: Dict[Tuple[int, int, int], List[Any]] = {}
     for row in rows:
         if len(row) < 7:
             continue
-        x, y, height = float(row[0]), float(row[1]), float(row[2])
+        x, y, height = float(row[0]), float(row[1]), evidence_height(row)
         if height < floor_height + 0.25 or height > floor_height + 2.8:
             continue
         key = (int(row[6]), round(x / cell_size), round(y / cell_size))
         previous = selected.get(key)
-        if previous is None or abs(height - (floor_height + 1.2)) < abs(float(previous[2]) - (floor_height + 1.2)):
+        if previous is None or abs(height - (floor_height + 1.2)) < abs(
+            evidence_height(previous) - (floor_height + 1.2)
+        ):
             selected[key] = row
     return [
         ProjectedPoint(
@@ -1568,24 +1931,41 @@ def projected_depth_surface_points(
     ]
 
 
-def build_shelf_outline(
+def _build_shelf_lines_legacy(
     point_cloud: Dict[str, Any],
     grid: OccupancyGrid,
     minimum_height_span_m: float = 0.45,
     minimum_height_above_floor_m: float = 0.55,
-    minimum_component_length_m: float = 0.20,
+    minimum_component_length_m: float = 0.60,
+    minimum_line_support_ratio: float = 0.30,
     minimum_verticality: float = 0.60,
     minimum_triangle_count: int = 3,
-    maximum_gap_cells: int = 1,
+    minimum_orientation_coherence: float = 0.45,
+    minimum_observation_count: int = 2,
+    minimum_ground_observation_count: int = 2,
+    maximum_ground_conflict_ratio: float = 0.60,
+    duplicate_suppression_cells: int = 1,
+    maximum_gap_cells: int = 8,
 ) -> ShelfOutline:
     """Extract thin shelf/wall traces from vertically observed RGB-D faces.
 
     Evidence is accumulated in a 3x3 grid neighborhood so small LiDAR depth
-    jitter does not split one physical face into adjacent columns. Small gaps
-    are closed, then short isolated fragments are removed. Horizontal
-    floor and shelf-top surfaces have already been rejected by their normals.
+    jitter does not split one physical face into adjacent columns. New evidence
+    also carries an undirected floor-plane orientation and independent frame
+    count. Direction-incoherent clutter is rejected, nearby duplicate ridges
+    are suppressed perpendicular to the surface, and gaps are bridged only
+    along the measured structure direction. This prevents crossing aisles and
+    centimetre-scale pose drift from becoming one dense connected blob.
+
+    Ground observations are deliberately not required: a shelf normally hides
+    the floor below its footprint. Instead, repeatedly observed ground at the
+    exact same cell conflicts with a sparse vertical observation and is used
+    to reject likely people, carts and other transient structure. Version-1
+    evidence without orientation remains supported and follows the legacy
+    gap/component path so previously generated results keep working.
     """
     raw_evidence = point_cloud.get("_vertical_surface_evidence", [])
+    raw_horizontal_evidence = point_cloud.get("_horizontal_surface_evidence", [])
     floor_raw = point_cloud.get("estimated_floor_height_m")
     floor_height = float(floor_raw) if isinstance(floor_raw, (int, float)) else None
     outline = ShelfOutline(
@@ -1596,15 +1976,63 @@ def build_shelf_outline(
         minimum_height_above_floor_m=minimum_height_above_floor_m,
         minimum_verticality=minimum_verticality,
         minimum_triangle_count=max(1, int(minimum_triangle_count)),
+        minimum_orientation_coherence=max(0.0, min(1.0, minimum_orientation_coherence)),
+        minimum_observation_count=max(1, int(minimum_observation_count)),
+        minimum_ground_observation_count=max(1, int(minimum_ground_observation_count)),
+        maximum_ground_conflict_ratio=max(0.0, min(1.0, maximum_ground_conflict_ratio)),
+        duplicate_suppression_cells=max(0, int(duplicate_suppression_cells)),
         maximum_gap_cells=max(0, int(maximum_gap_cells)),
         minimum_component_length_m=minimum_component_length_m,
+        minimum_line_support_ratio=max(0.0, min(1.0, minimum_line_support_ratio)),
     )
     if not raw_evidence:
         return outline
 
-    # Each value contains min height, max height, triangle count, area and
-    # triangle-count-weighted verticality.
+    # Horizontal evidence is height-binned during extraction. Only bins close
+    # to the estimated floor become ground evidence; shelf tops and counters
+    # remain outside this window. Counts are per independent RGB-D frame.
+    ground_by_cell: Dict[Tuple[int, int], List[float]] = {}
+    if floor_height is not None and isinstance(raw_horizontal_evidence, list):
+        for row in raw_horizontal_evidence:
+            if not isinstance(row, list) or len(row) < 7:
+                continue
+            try:
+                x, y, height = float(row[0]), float(row[1]), float(row[2])
+                triangle_count = max(1.0, float(row[3]))
+                area = max(0.0, float(row[4]))
+                observation_count = max(1.0, float(row[5]))
+                horizontality = max(0.0, min(1.0, float(row[6])))
+            except (TypeError, ValueError):
+                continue
+            if not all(
+                math.isfinite(value)
+                for value in (x, y, height, triangle_count, area, observation_count, horizontality)
+            ):
+                continue
+            if height < floor_height - 0.15 or height > floor_height + 0.20:
+                continue
+            cell = grid.cell(x, y)
+            if not grid.in_bounds(*cell):
+                continue
+            accumulated = ground_by_cell.get(cell)
+            if accumulated is None:
+                ground_by_cell[cell] = [observation_count, triangle_count, area, horizontality]
+            else:
+                # Multiple nearby height bins can describe the same floor.
+                # Use the maximum frame count instead of summing it, otherwise
+                # one frame would be counted once per height bin.
+                accumulated[0] = max(accumulated[0], observation_count)
+                accumulated[1] += triangle_count
+                accumulated[2] += area
+                accumulated[3] = max(accumulated[3], horizontality)
+    outline.ground_evidence_cell_count = len(ground_by_cell)
+    outline.has_ground_conflict_evidence = bool(ground_by_cell)
+
+    # Each value contains min/max height, triangle count, area,
+    # triangle-count-weighted verticality, maximum independent observation
+    # count, area-weighted doubled-angle orientation and orientation weight.
     evidence_by_cell: Dict[Tuple[int, int], List[float]] = {}
+    has_orientation_evidence = False
     for row in raw_evidence:
         if not isinstance(row, list) or len(row) < 7:
             continue
@@ -1614,9 +2042,27 @@ def build_shelf_outline(
             triangle_count = max(1.0, float(row[4]))
             area = max(0.0, float(row[5]))
             verticality = max(0.0, min(1.0, float(row[6])))
+            observation_count = max(1.0, float(row[7])) if len(row) >= 11 else 1.0
+            orientation_cos2 = float(row[8]) if len(row) >= 11 else 0.0
+            orientation_sin2 = float(row[9]) if len(row) >= 11 else 0.0
+            orientation_coherence = max(0.0, min(1.0, float(row[10]))) if len(row) >= 11 else 0.0
         except (TypeError, ValueError):
             continue
-        if not all(math.isfinite(value) for value in (x, y, minimum_height, maximum_height, area, verticality)):
+        if not all(
+            math.isfinite(value)
+            for value in (
+                x,
+                y,
+                minimum_height,
+                maximum_height,
+                area,
+                verticality,
+                observation_count,
+                orientation_cos2,
+                orientation_sin2,
+                orientation_coherence,
+            )
+        ):
             continue
         cell = grid.cell(x, y)
         if not grid.in_bounds(*cell):
@@ -1629,6 +2075,10 @@ def build_shelf_outline(
                 triangle_count,
                 area,
                 verticality * triangle_count,
+                observation_count,
+                orientation_cos2 * area,
+                orientation_sin2 * area,
+                area if len(row) >= 11 else 0.0,
             ]
         else:
             accumulated[0] = min(accumulated[0], minimum_height)
@@ -1636,6 +2086,13 @@ def build_shelf_outline(
             accumulated[2] += triangle_count
             accumulated[3] += area
             accumulated[4] += verticality * triangle_count
+            accumulated[5] = max(accumulated[5], observation_count)
+            accumulated[6] += orientation_cos2 * area
+            accumulated[7] += orientation_sin2 * area
+            accumulated[8] += area if len(row) >= 11 else 0.0
+        has_orientation_evidence = has_orientation_evidence or len(row) >= 11
+
+    outline.has_orientation_evidence = has_orientation_evidence
 
     outline.evidence_cells = [
         [
@@ -1645,13 +2102,56 @@ def build_shelf_outline(
             round(values[1], 3),
             int(round(values[2])),
             round(values[4] / max(1.0, values[2]), 4),
+            int(round(values[5])),
+            round(values[6] / max(1e-9, values[8]), 5) if values[8] else 0.0,
+            round(values[7] / max(1e-9, values[8]), 5) if values[8] else 0.0,
+            round(min(1.0, math.hypot(values[6], values[7]) / max(1e-9, values[8])), 4)
+            if values[8]
+            else 0.0,
+            round(values[8], 6),
+            int(round(ground_by_cell.get((ix, iy), [0.0])[0])),
+            int(round(ground_by_cell.get((ix, iy), [0.0, 0.0])[1])),
+            round(
+                ground_by_cell.get((ix, iy), [0.0])[0]
+                / max(1.0, ground_by_cell.get((ix, iy), [0.0])[0] + values[5]),
+                4,
+            ),
         ]
         for (ix, iy), values in sorted(
             evidence_by_cell.items(), key=lambda item: (item[0][1], item[0][0])
         )
     ]
 
-    candidates: Set[Tuple[int, int]] = set()
+    directions = (
+        (1.0, 0.0),
+        (math.cos(math.pi / 8.0), math.sin(math.pi / 8.0)),
+        (math.sqrt(0.5), math.sqrt(0.5)),
+        (math.sin(math.pi / 8.0), math.cos(math.pi / 8.0)),
+        (0.0, 1.0),
+        (-math.sin(math.pi / 8.0), math.cos(math.pi / 8.0)),
+        (-math.sqrt(0.5), math.sqrt(0.5)),
+        (-math.cos(math.pi / 8.0), math.sin(math.pi / 8.0)),
+    )
+
+    def compatible_direction(first: Optional[int], second: Optional[int]) -> bool:
+        if first is None or second is None:
+            return True
+        difference = abs(first - second)
+        return min(difference, len(directions) - difference) <= 1
+
+    def orientation_bin(cos2: float, sin2: float) -> int:
+        angle = 0.5 * math.atan2(sin2, cos2)
+        axis_x, axis_y = math.cos(angle), math.sin(angle)
+        return max(
+            range(len(directions)),
+            key=lambda index: abs(
+                (axis_x * directions[index][0] + axis_y * directions[index][1])
+                / math.hypot(*directions[index])
+            ),
+        )
+
+    # Candidate metadata: evidence score, direction bin and coherence.
+    candidates: Dict[Tuple[int, int], Tuple[float, Optional[int], float]] = {}
     for ix, iy in evidence_by_cell:
         neighbors = [
             evidence_by_cell[(nx, ny)]
@@ -1665,33 +2165,190 @@ def build_shelf_outline(
         maximum_height = max(value[1] for value in neighbors)
         triangle_count = sum(value[2] for value in neighbors)
         weighted_verticality = sum(value[4] for value in neighbors) / max(1.0, triangle_count)
+        observation_count = max(value[5] for value in neighbors)
+        orientation_weight = sum(value[8] for value in neighbors)
+        orientation_cos2 = sum(value[6] for value in neighbors)
+        orientation_sin2 = sum(value[7] for value in neighbors)
+        coherence = (
+            min(1.0, math.hypot(orientation_cos2, orientation_sin2) / max(1e-9, orientation_weight))
+            if orientation_weight
+            else 0.0
+        )
         if maximum_height - minimum_height < minimum_height_span_m:
             continue
         if floor_height is not None and maximum_height < floor_height + minimum_height_above_floor_m:
             continue
         if triangle_count < outline.minimum_triangle_count or weighted_verticality < minimum_verticality:
             continue
-        candidates.add((ix, iy))
+        if has_orientation_evidence and coherence < outline.minimum_orientation_coherence:
+            continue
+        if observation_count < outline.minimum_observation_count:
+            continue
+        ground_observation_count = ground_by_cell.get((ix, iy), [0.0])[0]
+        ground_conflict_ratio = ground_observation_count / max(
+            1.0, ground_observation_count + observation_count
+        )
+        if ground_observation_count >= outline.minimum_ground_observation_count:
+            outline.ground_conflict_candidate_count += 1
+            if ground_conflict_ratio > outline.maximum_ground_conflict_ratio:
+                outline.ground_conflict_rejected_count += 1
+                continue
+        direction_index = orientation_bin(orientation_cos2, orientation_sin2) if orientation_weight else None
+        score = (
+            triangle_count
+            * max(0.05, weighted_verticality)
+            * (0.5 + coherence if orientation_weight else 1.0)
+            * (1.0 + math.log1p(observation_count))
+        )
+        candidates[(ix, iy)] = (score, direction_index, coherence)
 
     outline.candidate_cell_count = len(candidates)
     if not candidates:
         return outline
 
+    # Non-maximum suppression collapses centimetre-scale parallel duplicates
+    # caused by depth jitter or slightly misregistered repeat passes. The
+    # radius is intentionally much smaller than a normal shelf width, so the
+    # two physical long faces of a shelf remain distinct.
+    thinned = dict(candidates)
+    if has_orientation_evidence and outline.duplicate_suppression_cells:
+        thinned = {}
+        for cell, metadata in candidates.items():
+            score, direction_index, _coherence = metadata
+            if direction_index is None:
+                thinned[cell] = metadata
+                continue
+            axis_x, axis_y = directions[direction_index]
+            suppressed = False
+            radius = outline.duplicate_suppression_cells
+            for offset_y in range(-radius, radius + 1):
+                for offset_x in range(-radius, radius + 1):
+                    if offset_x == 0 and offset_y == 0:
+                        continue
+                    along = abs(offset_x * axis_x + offset_y * axis_y)
+                    across = abs(-offset_x * axis_y + offset_y * axis_x)
+                    if along > 0.75 or across > radius + 0.25:
+                        continue
+                    neighbor = (cell[0] + offset_x, cell[1] + offset_y)
+                    neighbor_metadata = candidates.get(neighbor)
+                    if neighbor_metadata is None or not compatible_direction(
+                        neighbor_metadata[1], direction_index
+                    ):
+                        continue
+                    neighbor_score = neighbor_metadata[0]
+                    if neighbor_score > score or (neighbor_score == score and neighbor < cell):
+                        suppressed = True
+                        break
+                if suppressed:
+                    break
+            if not suppressed:
+                thinned[cell] = metadata
+
+        # Reject isolated oriented points that have no support along their
+        # measured trace. This removes product corners and small mesh fans
+        # without eroding the ends of genuine long shelf faces.
+        supported: Dict[Tuple[int, int], Tuple[float, Optional[int], float]] = {}
+        support_radius = max(2, int(math.ceil(minimum_component_length_m / grid.resolution)))
+        for cell, metadata in thinned.items():
+            direction_index = metadata[1]
+            if direction_index is None:
+                supported[cell] = metadata
+                continue
+            axis_x, axis_y = directions[direction_index]
+            support_slots: Set[int] = {0}
+            for offset_y in range(-support_radius, support_radius + 1):
+                for offset_x in range(-support_radius, support_radius + 1):
+                    if offset_x == 0 and offset_y == 0:
+                        continue
+                    along = offset_x * axis_x + offset_y * axis_y
+                    across = abs(-offset_x * axis_y + offset_y * axis_x)
+                    if abs(along) > support_radius + 0.5 or across > 1.1:
+                        continue
+                    neighbor_metadata = thinned.get((cell[0] + offset_x, cell[1] + offset_y))
+                    if neighbor_metadata is None or not compatible_direction(
+                        neighbor_metadata[1], direction_index
+                    ):
+                        continue
+                    support_slots.add(round(along))
+            if len(support_slots) >= 3:
+                supported[cell] = metadata
+        thinned = supported
+
+    if not thinned:
+        return outline
+
     # Bridge only bounded gaps between two measured candidates. This fills
     # broken traces without dilating every outline edge into a thick region.
-    closed = set(candidates)
-    for gap_size in range(1, outline.maximum_gap_cells + 1):
-        for ix, iy in candidates:
-            for dx, dy in ((1, 0), (0, 1), (1, 1), (1, -1)):
-                far = (ix + (gap_size + 1) * dx, iy + (gap_size + 1) * dy)
-                if far not in candidates:
+    # Oriented evidence is bridged only along its own measured direction.
+    closed = set(thinned)
+    closed_directions = {cell: metadata[1] for cell, metadata in thinned.items()}
+    def raster_line(first: Tuple[int, int], second: Tuple[int, int]) -> List[Tuple[int, int]]:
+        x0, y0 = first
+        x1, y1 = second
+        dx = abs(x1 - x0)
+        step_x = 1 if x0 < x1 else -1
+        dy = -abs(y1 - y0)
+        step_y = 1 if y0 < y1 else -1
+        error = dx + dy
+        cells = []
+        while True:
+            cells.append((x0, y0))
+            if x0 == x1 and y0 == y1:
+                return cells
+            doubled = 2 * error
+            if doubled >= dy:
+                error += dy
+                x0 += step_x
+            if doubled <= dx:
+                error += dx
+                y0 += step_y
+
+    for (ix, iy), metadata in thinned.items():
+        direction_index = metadata[1]
+        if not has_orientation_evidence or direction_index is None:
+            bridge_directions = ((1, 0), (0, 1), (1, 1), (1, -1))
+            for gap_size in range(1, outline.maximum_gap_cells + 1):
+                for dx, dy in bridge_directions:
+                    far = (ix + (gap_size + 1) * dx, iy + (gap_size + 1) * dy)
+                    if far not in thinned:
+                        continue
+                    for middle in raster_line((ix, iy), far)[1:-1]:
+                        if grid.in_bounds(*middle):
+                            closed.add(middle)
+                            closed_directions[middle] = None
+            continue
+        axis_x, axis_y = directions[direction_index]
+        search_radius = outline.maximum_gap_cells + 2
+        best_far: Optional[Tuple[int, int]] = None
+        best_along = math.inf
+        for offset_y in range(-search_radius, search_radius + 1):
+            for offset_x in range(-search_radius, search_radius + 1):
+                far = (ix + offset_x, iy + offset_y)
+                far_metadata = thinned.get(far)
+                if far_metadata is None or not compatible_direction(far_metadata[1], direction_index):
                     continue
-                for step in range(1, gap_size + 1):
-                    middle = (ix + step * dx, iy + step * dy)
-                    if grid.in_bounds(*middle):
-                        closed.add(middle)
+                along = abs(offset_x * axis_x + offset_y * axis_y)
+                across = abs(-offset_x * axis_y + offset_y * axis_x)
+                if along <= 1.1 or along > outline.maximum_gap_cells + 1.6 or across > 0.8:
+                    continue
+                if along < best_along:
+                    best_far = far
+                    best_along = along
+        if best_far is not None:
+            for middle in raster_line((ix, iy), best_far)[1:-1]:
+                if grid.in_bounds(*middle):
+                    closed.add(middle)
+                    closed_directions[middle] = direction_index
 
     minimum_cells = max(1, int(math.ceil(minimum_component_length_m / grid.resolution)))
+    # Directional fragments may be shorter than the final accepted line. Keep
+    # them long enough to establish a direction, then decide after collinear
+    # merging whether the completed line has enough measured support.
+    minimum_fragment_cells = (
+        max(3, int(math.ceil(minimum_cells * 0.25)))
+        if has_orientation_evidence
+        else minimum_cells
+    )
     remaining = set(closed)
     components: List[List[Tuple[int, int]]] = []
     while remaining:
@@ -1704,21 +2361,730 @@ def build_shelf_outline(
                 for nx in range(cx - 1, cx + 2):
                     if (nx, ny) == (cx, cy) or (nx, ny) not in remaining:
                         continue
+                    current_direction = closed_directions.get((cx, cy))
+                    neighbor_direction = closed_directions.get((nx, ny))
+                    if (
+                        has_orientation_evidence
+                        and current_direction is not None
+                        and neighbor_direction is not None
+                        and not compatible_direction(current_direction, neighbor_direction)
+                    ):
+                        continue
                     remaining.remove((nx, ny))
                     queue.append((nx, ny))
                     component.append((nx, ny))
-        if len(component) >= minimum_cells:
+        if len(component) < minimum_fragment_cells:
+            continue
+        component_direction = closed_directions.get(component[0])
+        if has_orientation_evidence and component_direction is not None:
+            dx, dy = directions[component_direction]
+            norm = math.hypot(dx, dy)
+            projected = [(cell[0] * dx + cell[1] * dy) / norm for cell in component]
+            span_m = (max(projected) - min(projected) + 1.0) * grid.resolution
+            if span_m < max(grid.resolution * minimum_fragment_cells, 0.15):
+                continue
+        if len(component) >= minimum_fragment_cells:
             components.append(sorted(component, key=lambda cell: (cell[1], cell[0])))
+
+    if has_orientation_evidence and components:
+        # Convert each direction-consistent pixel component into a straight
+        # floor-plan segment, then merge only collinear fragments separated by
+        # a short longitudinal gap. This removes jagged/nested mesh boundaries
+        # while keeping parallel shelf sides farther apart than the duplicate
+        # suppression radius as distinct lines.
+        records: List[Dict[str, Any]] = []
+        for component in components:
+            counts: Dict[int, int] = defaultdict(int)
+            for cell in component:
+                direction_index = closed_directions.get(cell)
+                if direction_index is not None:
+                    counts[direction_index] += 1
+            if not counts:
+                continue
+            direction_index = max(counts, key=counts.get)
+            axis_x, axis_y = directions[direction_index]
+            normal_x, normal_y = -axis_y, axis_x
+            longitudinal = [cell[0] * axis_x + cell[1] * axis_y for cell in component]
+            transverse = sorted(cell[0] * normal_x + cell[1] * normal_y for cell in component)
+            measured_cells = [cell for cell in component if cell in thinned]
+            records.append(
+                {
+                    "cells": component,
+                    "measured_cells": measured_cells,
+                    "direction": direction_index,
+                    "minimum": min(longitudinal),
+                    "maximum": max(longitudinal),
+                    "normal": transverse[len(transverse) // 2],
+                }
+            )
+
+        parents = list(range(len(records)))
+
+        def find(index: int) -> int:
+            while parents[index] != index:
+                parents[index] = parents[parents[index]]
+                index = parents[index]
+            return index
+
+        def unite(first: int, second: int) -> None:
+            first_root, second_root = find(first), find(second)
+            if first_root != second_root:
+                parents[second_root] = first_root
+
+        # Repeated passes over a long aisle can leave the same shelf face
+        # shifted by 10--15 cm. Permit that small transverse drift and up to a
+        # 1.5 m longitudinal hole at the balanced preset. The final measured
+        # support-ratio check below prevents sparse, unrelated fragments from
+        # being promoted into a long invented line.
+        maximum_merge_gap_cells = max(12, min(36, outline.maximum_gap_cells * 3 + 6))
+        maximum_normal_distance = max(2.5, outline.duplicate_suppression_cells + 2.0)
+        for first_index, first in enumerate(records):
+            for second_index in range(first_index + 1, len(records)):
+                second = records[second_index]
+                if first["direction"] != second["direction"]:
+                    continue
+                if abs(first["normal"] - second["normal"]) > maximum_normal_distance:
+                    continue
+                interval_gap = max(
+                    0.0,
+                    first["minimum"] - second["maximum"],
+                    second["minimum"] - first["maximum"],
+                )
+                if interval_gap <= maximum_merge_gap_cells:
+                    unite(first_index, second_index)
+
+        grouped: Dict[int, List[Tuple[int, int]]] = defaultdict(list)
+        grouped_measured: Dict[int, List[Tuple[int, int]]] = defaultdict(list)
+        grouped_directions: Dict[int, int] = {}
+        for index, record in enumerate(records):
+            root = find(index)
+            grouped[root].extend(record["cells"])
+            grouped_measured[root].extend(record["measured_cells"])
+            grouped_directions[root] = record["direction"]
+
+        fitted_records: List[Dict[str, Any]] = []
+        for root, cells in grouped.items():
+            direction_index = grouped_directions[root]
+            axis_x, axis_y = directions[direction_index]
+            normal_x, normal_y = -axis_y, axis_x
+            longitudinal = [cell[0] * axis_x + cell[1] * axis_y for cell in cells]
+            transverse = sorted(cell[0] * normal_x + cell[1] * normal_y for cell in cells)
+            normal = transverse[len(transverse) // 2]
+            minimum, maximum = min(longitudinal), max(longitudinal)
+            first = (
+                round(minimum * axis_x + normal * normal_x),
+                round(minimum * axis_y + normal * normal_y),
+            )
+            second = (
+                round(maximum * axis_x + normal * normal_x),
+                round(maximum * axis_y + normal * normal_y),
+            )
+            fitted = [cell for cell in raster_line(first, second) if grid.in_bounds(*cell)]
+            measured_longitudinal_slots = {
+                round(cell[0] * axis_x + cell[1] * axis_y)
+                for cell in grouped_measured[root]
+            }
+            support_ratio = len(measured_longitudinal_slots) / max(1, len(fitted))
+            if (
+                len(fitted) >= minimum_cells
+                and support_ratio >= outline.minimum_line_support_ratio
+            ):
+                fitted_records.append(
+                    {
+                        "cells": fitted,
+                        "direction": direction_index,
+                        "minimum": minimum,
+                        "maximum": maximum,
+                        "normal": normal,
+                        "support_ratio": support_ratio,
+                    }
+                )
+
+        # A scan provides shelf faces, not reliable closed shelf footprints.
+        # Keep each supported collinear face as a line and never invent an end
+        # cap between two parallel faces: doing so produces plausible-looking
+        # but false rectangles when a wall, person or neighboring aisle is
+        # accidentally paired with a shelf side.
+        components = [record["cells"] for record in fitted_records]
+        outline.line_candidate_count = len(components)
+        outline.instance_count = 0
+        outline.shelf_cells = {cell for component in components for cell in component}
+        outline.vertical_structure_cells = set()
 
     outline.components = sorted(components, key=len, reverse=True)
     outline.cells = {cell for component in outline.components for cell in component}
+    if not has_orientation_evidence:
+        outline.shelf_cells = set(outline.cells)
+        outline.vertical_structure_cells = set()
+        outline.line_candidate_count = len(outline.components)
     return outline
 
 
-def shelf_outline_runs(outline: ShelfOutline, grid: OccupancyGrid) -> List[List[int]]:
+def build_shelf_outline(
+    point_cloud: Dict[str, Any],
+    grid: OccupancyGrid,
+    minimum_height_span_m: float = 0.38,
+    minimum_height_above_floor_m: float = 0.48,
+    minimum_verticality: float = 0.56,
+    minimum_triangle_count: int = 2,
+    minimum_orientation_coherence: float = 0.40,
+    minimum_observation_count: int = 2,
+    minimum_ground_observation_count: int = 2,
+    maximum_ground_conflict_ratio: float = 0.66,
+    maximum_fill_distance_m: float = 0.62,
+    maximum_ground_search_m: float = 1.12,
+    minimum_region_area_m2: float = 0.40,
+    morphology_radius_cells: int = 1,
+    minimum_elevated_observation_count: int = 2,
+    maximum_hole_area_m2: float = 0.90,
+    minimum_free_observation_count: int = 12,
+    free_space_margin_m: float = 0.0,
+    maximum_bridge_width_m: float = 0.50,
+    boundary_thickness_cells: int = 2,
+    **_legacy_parameters: Any,
+) -> ShelfOutline:
+    """Reconstruct independent shelf footprints and emit closed boundaries.
+
+    The evidence height produced by :func:`extract_depth_point_cloud` is
+    relative to the camera pose, so trajectory Z drift is cancelled before
+    floor and shelf layers are separated.  Vertically observed shelf faces
+    and stable elevated horizontal surfaces form measured seeds.  A seed may
+    grow only through cells where floor was not observed, inside surveyed
+    space, and only when observed floor can be found on two opposite sides.
+    This turns the characteristic "floor on both aisles, no floor under the
+    shelf" pattern into an internal footprint without fitting rectangles or
+    inventing line end caps.  Stable ray-cleared/free cells protect aisles.
+
+    Small opening/closing removes noise, and a constrained watershed separates
+    components joined only by narrow bridges.  Only the exterior boundary of
+    each retained footprint is published, so shelf interiors remain white and
+    every shelf is represented by a closed measured/inferred contour rather
+    than by open fitted segments.  When floor evidence is unavailable the
+    function deliberately returns no inferred footprint rather than filling
+    unknown space from a single edge.
+    """
+    raw_vertical = point_cloud.get("_vertical_surface_evidence", [])
+    raw_horizontal = point_cloud.get("_horizontal_surface_evidence", [])
+    floor_raw = point_cloud.get("estimated_floor_height_m")
+    floor_height = float(floor_raw) if isinstance(floor_raw, (int, float)) else None
+    outline = ShelfOutline(
+        evidence_cell_count=len(raw_vertical) if isinstance(raw_vertical, list) else 0,
+        vertical_triangle_count=int(point_cloud.get("vertical_surface_triangle_count") or 0),
+        floor_height_m=round(floor_height, 3) if floor_height is not None else None,
+        minimum_height_span_m=max(0.05, float(minimum_height_span_m)),
+        minimum_height_above_floor_m=max(0.05, float(minimum_height_above_floor_m)),
+        minimum_verticality=max(0.0, min(1.0, float(minimum_verticality))),
+        minimum_triangle_count=max(1, int(minimum_triangle_count)),
+        minimum_orientation_coherence=max(0.0, min(1.0, float(minimum_orientation_coherence))),
+        minimum_observation_count=max(1, int(minimum_observation_count)),
+        minimum_ground_observation_count=max(1, int(minimum_ground_observation_count)),
+        maximum_ground_conflict_ratio=max(0.0, min(1.0, float(maximum_ground_conflict_ratio))),
+        maximum_fill_distance_m=max(grid.resolution, float(maximum_fill_distance_m)),
+        maximum_ground_search_m=max(grid.resolution, float(maximum_ground_search_m)),
+        minimum_region_area_m2=max(grid.resolution * grid.resolution, float(minimum_region_area_m2)),
+        morphology_radius_cells=max(0, int(morphology_radius_cells)),
+        minimum_elevated_observation_count=max(1, int(minimum_elevated_observation_count)),
+        maximum_hole_area_m2=max(0.0, float(maximum_hole_area_m2)),
+        minimum_free_observation_count=max(1, int(minimum_free_observation_count)),
+        free_space_margin_m=max(0.0, float(free_space_margin_m)),
+        maximum_bridge_width_m=max(0.0, float(maximum_bridge_width_m)),
+        boundary_thickness_cells=max(1, min(4, int(boundary_thickness_cells))),
+        structure_available_frame_count=int(point_cloud.get("structure_available_frames") or 0),
+        structure_sampled_frame_count=int(point_cloud.get("structure_sampled_frames") or 0),
+        structure_decoded_frame_count=int(point_cloud.get("structure_decoded_frames") or 0),
+        structure_pixel_step=int(point_cloud.get("structure_pixel_step") or 0),
+    )
+
+    # cell -> independent observations, triangle count, accumulated area,
+    # strongest horizontality.  Height bins close to the recovered floor are
+    # ground; bins above it are shelf slabs/tops and counter surfaces.
+    ground_by_cell: Dict[Tuple[int, int], List[float]] = {}
+    elevated_by_cell: Dict[Tuple[int, int], List[float]] = {}
+    if floor_height is not None and isinstance(raw_horizontal, list):
+        for row in raw_horizontal:
+            if not isinstance(row, list) or len(row) < 7:
+                continue
+            try:
+                x, y, height = float(row[0]), float(row[1]), float(row[2])
+                triangles = max(1.0, float(row[3]))
+                area = max(0.0, float(row[4]))
+                observations = max(1.0, float(row[5]))
+                horizontality = max(0.0, min(1.0, float(row[6])))
+            except (TypeError, ValueError):
+                continue
+            if not all(
+                math.isfinite(value)
+                for value in (x, y, height, triangles, area, observations, horizontality)
+            ):
+                continue
+            relative = height - floor_height
+            target: Optional[Dict[Tuple[int, int], List[float]]] = None
+            if -0.15 <= relative <= 0.20:
+                target = ground_by_cell
+            elif 0.25 <= relative <= 2.80:
+                target = elevated_by_cell
+            if target is None:
+                continue
+            cell = grid.cell(x, y)
+            if not grid.in_bounds(*cell):
+                continue
+            accumulated = target.get(cell)
+            if accumulated is None:
+                target[cell] = [observations, triangles, area, horizontality]
+            else:
+                # Adjacent height bins may come from one frame.  Do not sum
+                # their frame count; keep the strongest independent count.
+                accumulated[0] = max(accumulated[0], observations)
+                accumulated[1] += triangles
+                accumulated[2] += area
+                accumulated[3] = max(accumulated[3], horizontality)
+
+    ground_cells = {
+        cell
+        for cell, values in ground_by_cell.items()
+        if values[3] >= 0.85 and (values[1] >= 2.0 or values[2] >= 0.0005)
+    }
+    elevated_cells = {
+        cell
+        for cell, values in elevated_by_cell.items()
+        if values[3] >= 0.85 and (values[1] >= 2.0 or values[2] >= 0.0005)
+    }
+    stable_elevated = {
+        cell
+        for cell, values in elevated_by_cell.items()
+        if values[0] >= outline.minimum_elevated_observation_count
+        and values[1] >= 3.0
+        and values[3] >= 0.85
+    }
+    outline.ground_cells = ground_cells
+    outline.elevated_cells = elevated_cells
+    outline.stable_elevated_cells = stable_elevated
+    outline.elevated_observation_counts = {
+        cell: int(round(values[0]))
+        for cell, values in elevated_by_cell.items()
+        if cell in elevated_cells
+    }
+    outline.ground_evidence_cell_count = len(ground_cells)
+    outline.elevated_evidence_cell_count = len(elevated_cells)
+    outline.stable_elevated_cell_count = len(stable_elevated)
+    outline.has_ground_conflict_evidence = bool(ground_cells)
+    # Ray-cleared occupancy evidence complements directly observed floor.  It
+    # is used only when the cell was repeatedly cleared and never occupied,
+    # making it suitable as a hard aisle separator without treating one noisy
+    # depth ray as traversable space.
+    stable_free_cells = {
+        (ix, iy)
+        for iy in range(grid.height)
+        for ix in range(grid.width)
+        if grid.free[iy][ix] >= outline.minimum_free_observation_count
+        and grid.occ[iy][ix] == 0
+    }
+    outline.free_space_cells = stable_free_cells
+    outline.free_space_evidence_cell_count = len(stable_free_cells)
+
+    # Aggregate vertical mesh samples at grid resolution.  Each value contains
+    # min/max height, triangle count, area, weighted verticality, strongest
+    # frame count and area-weighted doubled-angle orientation.
+    evidence_by_cell: Dict[Tuple[int, int], List[float]] = {}
+    has_orientation = False
+    if isinstance(raw_vertical, list):
+        for row in raw_vertical:
+            if not isinstance(row, list) or len(row) < 7:
+                continue
+            try:
+                x, y = float(row[0]), float(row[1])
+                minimum_height, maximum_height = float(row[2]), float(row[3])
+                triangles = max(1.0, float(row[4]))
+                area = max(0.0, float(row[5]))
+                verticality = max(0.0, min(1.0, float(row[6])))
+                observations = max(1.0, float(row[7])) if len(row) >= 11 else 1.0
+                cos2 = float(row[8]) if len(row) >= 11 else 0.0
+                sin2 = float(row[9]) if len(row) >= 11 else 0.0
+            except (TypeError, ValueError):
+                continue
+            if not all(
+                math.isfinite(value)
+                for value in (x, y, minimum_height, maximum_height, triangles, area, verticality, observations, cos2, sin2)
+            ):
+                continue
+            cell = grid.cell(x, y)
+            if not grid.in_bounds(*cell):
+                continue
+            accumulated = evidence_by_cell.get(cell)
+            if accumulated is None:
+                evidence_by_cell[cell] = [
+                    minimum_height,
+                    maximum_height,
+                    triangles,
+                    area,
+                    verticality * triangles,
+                    observations,
+                    cos2 * area,
+                    sin2 * area,
+                    area if len(row) >= 11 else 0.0,
+                ]
+            else:
+                accumulated[0] = min(accumulated[0], minimum_height)
+                accumulated[1] = max(accumulated[1], maximum_height)
+                accumulated[2] += triangles
+                accumulated[3] += area
+                accumulated[4] += verticality * triangles
+                accumulated[5] = max(accumulated[5], observations)
+                accumulated[6] += cos2 * area
+                accumulated[7] += sin2 * area
+                accumulated[8] += area if len(row) >= 11 else 0.0
+            has_orientation = has_orientation or len(row) >= 11
+    outline.has_orientation_evidence = has_orientation
+
+    outline.evidence_cells = [
+        [
+            ix,
+            iy,
+            round(values[0], 3),
+            round(values[1], 3),
+            int(round(values[2])),
+            round(values[4] / max(1.0, values[2]), 4),
+            int(round(values[5])),
+            round(values[6] / max(1e-9, values[8]), 5) if values[8] else 0.0,
+            round(values[7] / max(1e-9, values[8]), 5) if values[8] else 0.0,
+            round(min(1.0, math.hypot(values[6], values[7]) / max(1e-9, values[8])), 4)
+            if values[8]
+            else 0.0,
+            round(values[8], 6),
+            int(round(ground_by_cell.get((ix, iy), [0.0])[0])),
+            int(round(ground_by_cell.get((ix, iy), [0.0, 0.0])[1])),
+            round(
+                ground_by_cell.get((ix, iy), [0.0])[0]
+                / max(1.0, ground_by_cell.get((ix, iy), [0.0])[0] + values[5]),
+                4,
+            ),
+        ]
+        for (ix, iy), values in sorted(evidence_by_cell.items(), key=lambda item: (item[0][1], item[0][0]))
+    ]
+
+    vertical_candidates: Set[Tuple[int, int]] = set()
+    for ix, iy in evidence_by_cell:
+        neighbors = [
+            evidence_by_cell[(nx, ny)]
+            for ny in range(iy - 1, iy + 2)
+            for nx in range(ix - 1, ix + 2)
+            if (nx, ny) in evidence_by_cell
+        ]
+        minimum_height = min(value[0] for value in neighbors)
+        maximum_height = max(value[1] for value in neighbors)
+        triangles = sum(value[2] for value in neighbors)
+        verticality = sum(value[4] for value in neighbors) / max(1.0, triangles)
+        observations = max(value[5] for value in neighbors)
+        orientation_weight = sum(value[8] for value in neighbors)
+        cos2 = sum(value[6] for value in neighbors)
+        sin2 = sum(value[7] for value in neighbors)
+        coherence = (
+            min(1.0, math.hypot(cos2, sin2) / max(1e-9, orientation_weight))
+            if orientation_weight
+            else 0.0
+        )
+        if maximum_height - minimum_height < outline.minimum_height_span_m:
+            continue
+        if floor_height is not None and maximum_height < floor_height + outline.minimum_height_above_floor_m:
+            continue
+        if triangles < outline.minimum_triangle_count or verticality < outline.minimum_verticality:
+            continue
+        if has_orientation and coherence < outline.minimum_orientation_coherence:
+            continue
+        ground_observations = ground_by_cell.get((ix, iy), [0.0])[0]
+        conflict_ratio = ground_observations / max(1.0, ground_observations + observations)
+        if ground_observations >= outline.minimum_ground_observation_count:
+            outline.ground_conflict_candidate_count += 1
+            if conflict_ratio > outline.maximum_ground_conflict_ratio:
+                outline.ground_conflict_rejected_count += 1
+                continue
+        if observations < outline.minimum_observation_count:
+            continue
+        vertical_candidates.add((ix, iy))
+    outline.candidate_cell_count = len(vertical_candidates)
+
+    def disk_offsets(radius: int) -> List[Tuple[int, int]]:
+        return [
+            (dx, dy)
+            for dy in range(-radius, radius + 1)
+            for dx in range(-radius, radius + 1)
+            if dx * dx + dy * dy <= radius * radius
+        ]
+
+    def dilate(cells: Set[Tuple[int, int]], radius: int) -> Set[Tuple[int, int]]:
+        if radius <= 0:
+            return set(cells)
+        offsets = disk_offsets(radius)
+        return {
+            (x + dx, y + dy)
+            for x, y in cells
+            for dx, dy in offsets
+            if grid.in_bounds(x + dx, y + dy)
+        }
+
+    def erode(cells: Set[Tuple[int, int]], radius: int) -> Set[Tuple[int, int]]:
+        if radius <= 0:
+            return set(cells)
+        offsets = disk_offsets(radius)
+        return {
+            (x, y)
+            for x, y in cells
+            if all((x + dx, y + dy) in cells for dx, dy in offsets)
+        }
+
+    def between_opposite_ground(
+        cells: Set[Tuple[int, int]], ground: Set[Tuple[int, int]], radius: int
+    ) -> Set[Tuple[int, int]]:
+        pairs = (
+            ((1, 0), (-1, 0)),
+            ((0, 1), (0, -1)),
+            ((1, 1), (-1, -1)),
+            ((1, -1), (-1, 1)),
+        )
+
+        def hit(x: int, y: int, dx: int, dy: int) -> bool:
+            return any((x + dx * step, y + dy * step) in ground for step in range(1, radius + 1))
+
+        return {
+            (x, y)
+            for x, y in cells
+            if any(hit(x, y, *first) and hit(x, y, *second) for first, second in pairs)
+        }
+
+    free_support = ground_cells | stable_free_cells
+    if not vertical_candidates or not free_support:
+        return outline
+
+    near_vertical = dilate(vertical_candidates, max(1, int(math.ceil(0.20 / grid.resolution))))
+    measured_seeds = (
+        vertical_candidates
+        | stable_elevated
+        | (elevated_cells & near_vertical)
+    ) - ground_cells
+    outline.measured_seed_cell_count = len(measured_seeds)
+    if not measured_seeds:
+        return outline
+
+    # Protect measured floor and repeatedly ray-cleared cells before region
+    # growth.  The small margin keeps a real aisle white even when footprint
+    # evidence is blurred by a few centimetres of pose drift.
+    free_margin_cells = int(math.ceil(outline.free_space_margin_m / grid.resolution))
+    protected_free = dilate(free_support, free_margin_cells) - measured_seeds
+    ground_radius = max(1, int(math.ceil(outline.maximum_ground_search_m / grid.resolution)))
+    fill_radius = max(1, int(math.ceil(outline.maximum_fill_distance_m / grid.resolution)))
+    grown = dilate(measured_seeds, fill_radius) - protected_free
+    footprint = between_opposite_ground(grown, free_support, ground_radius)
+    radius = outline.morphology_radius_cells
+    if radius:
+        # Opening removes narrow transient bridges and closing repairs small
+        # acquisition gaps.  Protected free space is restored afterwards so
+        # morphology can never consume a measured aisle.
+        footprint = dilate(erode(footprint, radius), radius)
+        footprint = erode(dilate(footprint, radius), radius)
+        footprint -= protected_free
+
+    # A one-cell majority pass removes staircase spikes while retaining broad
+    # shelf bodies and non-rectangular/rounded fixtures.
+    smoothed: Set[Tuple[int, int]] = set()
+    for cell in dilate(footprint, 1):
+        x, y = cell
+        if cell in protected_free:
+            continue
+        neighbor_count = sum(
+            (nx, ny) in footprint
+            for ny in range(y - 1, y + 2)
+            for nx in range(x - 1, x + 2)
+        )
+        if neighbor_count >= 5 or (cell in footprint and neighbor_count >= 4):
+            smoothed.add(cell)
+    footprint = smoothed
+
+    minimum_cells = max(1, int(math.ceil(outline.minimum_region_area_m2 / (grid.resolution ** 2))))
+    maximum_hole_cells = int(math.floor(outline.maximum_hole_area_m2 / (grid.resolution ** 2)))
+
+    def connected_components(cells: Set[Tuple[int, int]]) -> List[Set[Tuple[int, int]]]:
+        remaining = set(cells)
+        result: List[Set[Tuple[int, int]]] = []
+        while remaining:
+            start = remaining.pop()
+            queue = deque([start])
+            component = {start}
+            while queue:
+                cx, cy = queue.popleft()
+                for ny in range(cy - 1, cy + 2):
+                    for nx in range(cx - 1, cx + 2):
+                        neighbor = (nx, ny)
+                        if neighbor == (cx, cy) or neighbor not in remaining:
+                            continue
+                        remaining.remove(neighbor)
+                        component.add(neighbor)
+                        queue.append(neighbor)
+            result.append(component)
+        return result
+
+    def exterior_background(component_cells: Set[Tuple[int, int]]) -> Set[Tuple[int, int]]:
+        minimum_x = max(0, min(cell[0] for cell in component_cells) - 1)
+        maximum_x = min(grid.width - 1, max(cell[0] for cell in component_cells) + 1)
+        minimum_y = max(0, min(cell[1] for cell in component_cells) - 1)
+        maximum_y = min(grid.height - 1, max(cell[1] for cell in component_cells) + 1)
+        background = {
+            (x, y)
+            for y in range(minimum_y, maximum_y + 1)
+            for x in range(minimum_x, maximum_x + 1)
+            if (x, y) not in component_cells
+        }
+        queue = deque(
+            cell
+            for cell in background
+            if cell[0] in {minimum_x, maximum_x} or cell[1] in {minimum_y, maximum_y}
+        )
+        exterior = set(queue)
+        while queue:
+            x, y = queue.popleft()
+            for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                neighbor = (x + dx, y + dy)
+                if neighbor in background and neighbor not in exterior:
+                    exterior.add(neighbor)
+                    queue.append(neighbor)
+        return exterior
+
+    def fill_component_holes(component_cells: Set[Tuple[int, int]]) -> Set[Tuple[int, int]]:
+        if not component_cells or maximum_hole_cells <= 0:
+            return component_cells
+        minimum_x = max(0, min(cell[0] for cell in component_cells) - 1)
+        maximum_x = min(grid.width - 1, max(cell[0] for cell in component_cells) + 1)
+        minimum_y = max(0, min(cell[1] for cell in component_cells) - 1)
+        maximum_y = min(grid.height - 1, max(cell[1] for cell in component_cells) + 1)
+        background = {
+            (x, y)
+            for y in range(minimum_y, maximum_y + 1)
+            for x in range(minimum_x, maximum_x + 1)
+            if (x, y) not in component_cells
+        }
+        interior = background - exterior_background(component_cells)
+        filled = set(component_cells)
+        for hole in connected_components(interior):
+            if len(hole) <= maximum_hole_cells:
+                filled.update(hole)
+        return filled
+
+    def split_narrow_bridges(component_cells: Set[Tuple[int, int]]) -> List[Set[Tuple[int, int]]]:
+        if outline.maximum_bridge_width_m <= 0.0:
+            return [component_cells]
+        split_radius = max(
+            1,
+            int(math.ceil(outline.maximum_bridge_width_m / (2.0 * grid.resolution))),
+        )
+        core_components = [
+            core
+            for core in connected_components(erode(component_cells, split_radius))
+            if len(core) >= max(4, minimum_cells // 8)
+        ]
+        if len(core_components) <= 1:
+            return [component_cells]
+
+        owner: Dict[Tuple[int, int], int] = {}
+        distance: Dict[Tuple[int, int], int] = {}
+        queue: deque[Tuple[int, int]] = deque()
+        for label, core in enumerate(core_components):
+            for cell in core:
+                owner[cell] = label
+                distance[cell] = 0
+                queue.append(cell)
+        while queue:
+            cell = queue.popleft()
+            label = owner[cell]
+            if label < 0:
+                continue
+            x, y = cell
+            candidate_distance = distance[cell] + 1
+            for ny in range(y - 1, y + 2):
+                for nx in range(x - 1, x + 2):
+                    neighbor = (nx, ny)
+                    if neighbor == cell or neighbor not in component_cells:
+                        continue
+                    if neighbor not in distance:
+                        distance[neighbor] = candidate_distance
+                        owner[neighbor] = label
+                        queue.append(neighbor)
+                    elif distance[neighbor] == candidate_distance and owner[neighbor] != label:
+                        owner[neighbor] = -1
+
+        # Remove the meeting seam between competing cores.  This is the
+        # constrained-watershed equivalent of reopening a narrow aisle; it
+        # never cuts a component that has only one substantial eroded core.
+        interface = {cell for cell, label in owner.items() if label < 0}
+        for cell, label in list(owner.items()):
+            if label < 0:
+                continue
+            x, y = cell
+            if any(
+                owner.get((nx, ny), label) not in {label, -1}
+                for ny in range(y - 1, y + 2)
+                for nx in range(x - 1, x + 2)
+            ):
+                interface.add(cell)
+        groups: List[Set[Tuple[int, int]]] = []
+        for label in range(len(core_components)):
+            owned = {
+                cell for cell, cell_label in owner.items()
+                if cell_label == label and cell not in interface
+            }
+            groups.extend(
+                part for part in connected_components(owned)
+                if len(part) >= minimum_cells
+            )
+        if len(groups) >= 2:
+            outline.bridge_split_count += len(groups) - 1
+            return groups
+        return [component_cells]
+
+    def outer_boundary(component_cells: Set[Tuple[int, int]]) -> Set[Tuple[int, int]]:
+        exterior = exterior_background(component_cells)
+        boundary = {
+            (x, y)
+            for x, y in component_cells
+            if any((x + dx, y + dy) in exterior for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)))
+        }
+        if outline.boundary_thickness_cells > 1:
+            boundary = dilate(boundary, outline.boundary_thickness_cells - 1) & component_cells
+        return boundary
+
+    footprint_components: List[Set[Tuple[int, int]]] = []
+    for component in connected_components(footprint):
+        if len(component) < minimum_cells:
+            continue
+        filled_component = fill_component_holes(component)
+        footprint_components.extend(split_narrow_bridges(filled_component))
+
+    footprint_components = sorted(
+        (component for component in footprint_components if len(component) >= minimum_cells),
+        key=len,
+        reverse=True,
+    )
+    boundary_components = [outer_boundary(component) for component in footprint_components]
+    boundary_components = [component for component in boundary_components if component]
+    outline.components = [
+        sorted(component, key=lambda cell: (cell[1], cell[0]))
+        for component in boundary_components
+    ]
+    outline.cells = {cell for component in boundary_components for cell in component}
+    outline.shelf_cells = {cell for component in footprint_components for cell in component}
+    outline.vertical_structure_cells = measured_seeds
+    outline.instance_count = len(boundary_components)
+    outline.closed_contour_count = len(boundary_components)
+    outline.line_candidate_count = 0
+    return outline
+
+
+def shelf_outline_runs(
+    outline: ShelfOutline,
+    grid: OccupancyGrid,
+    cells: Optional[Set[Tuple[int, int]]] = None,
+) -> List[List[int]]:
     """Run-length encode outline cells in image coordinates for browser drawing."""
     rows: Dict[int, List[int]] = defaultdict(list)
-    for ix, iy in outline.cells:
+    for ix, iy in outline.cells if cells is None else cells:
         rows[grid.height - 1 - iy].append(ix)
     runs: List[List[int]] = []
     for image_y, xs in sorted(rows.items()):
@@ -1737,12 +3103,16 @@ def shelf_outline_runs(outline: ShelfOutline, grid: OccupancyGrid) -> List[List[
 
 
 def render_shelf_outline(grid: OccupancyGrid, outline: ShelfOutline, path: Path) -> None:
-    """Write a reference-style white floor plan with black vertical traces."""
+    """Write thin closed exterior boundaries for reconstructed shelf instances."""
     rows: List[bytes] = []
     for iy in range(grid.height - 1, -1, -1):
         row = bytearray()
         for ix in range(grid.width):
-            row.extend((12, 16, 18) if (ix, iy) in outline.cells else (255, 255, 255))
+            cell = (ix, iy)
+            if cell in outline.cells:
+                row.extend((12, 16, 18))
+            else:
+                row.extend((255, 255, 255))
         rows.append(bytes(row))
     write_png(path, grid.width, grid.height, rows)
 
@@ -1751,20 +3121,55 @@ def write_shelf_outline_evidence(path: Path, grid: OccupancyGrid, outline: Shelf
     """Write compact grid evidence used for instant browser-side retuning."""
     payload = {
         "format": "SupermarketShelfOutlineEvidence",
-        "version": 1,
+        "version": 6,
         "width": grid.width,
         "height": grid.height,
         "resolution_m": grid.resolution,
         "floor_height_m": outline.floor_height_m,
+        "has_orientation_evidence": outline.has_orientation_evidence,
+        "has_ground_conflict_evidence": outline.has_ground_conflict_evidence,
+        "source_frames": {
+            "available": outline.structure_available_frame_count,
+            "sampled": outline.structure_sampled_frame_count,
+            "decoded": outline.structure_decoded_frame_count,
+            "pixel_step": outline.structure_pixel_step,
+        },
         "defaults": {
             "minimum_height_span_m": outline.minimum_height_span_m,
             "minimum_height_above_floor_m": outline.minimum_height_above_floor_m,
             "minimum_verticality": outline.minimum_verticality,
             "minimum_triangle_count": outline.minimum_triangle_count,
-            "maximum_gap_cells": outline.maximum_gap_cells,
-            "minimum_component_length_m": outline.minimum_component_length_m,
+            "minimum_orientation_coherence": outline.minimum_orientation_coherence,
+            "minimum_observation_count": outline.minimum_observation_count,
+            "minimum_ground_observation_count": outline.minimum_ground_observation_count,
+            "maximum_ground_conflict_ratio": outline.maximum_ground_conflict_ratio,
+            "maximum_fill_distance_m": outline.maximum_fill_distance_m,
+            "maximum_ground_search_m": outline.maximum_ground_search_m,
+            "minimum_region_area_m2": outline.minimum_region_area_m2,
+            "morphology_radius_cells": outline.morphology_radius_cells,
+            "minimum_elevated_observation_count": outline.minimum_elevated_observation_count,
+            "maximum_hole_area_m2": outline.maximum_hole_area_m2,
+            "minimum_free_observation_count": outline.minimum_free_observation_count,
+            "free_space_margin_m": outline.free_space_margin_m,
+            "maximum_bridge_width_m": outline.maximum_bridge_width_m,
+            "boundary_thickness_cells": outline.boundary_thickness_cells,
         },
         "evidence_cells": outline.evidence_cells,
+        # Compact image-row runs keep the full floor/elevated masks small
+        # enough for instant browser-side retuning.
+        "ground_runs": shelf_outline_runs(outline, grid, outline.ground_cells),
+        "elevated_runs": shelf_outline_runs(outline, grid, outline.elevated_cells),
+        "stable_elevated_runs": shelf_outline_runs(outline, grid, outline.stable_elevated_cells),
+        "free_space_runs": shelf_outline_runs(outline, grid, outline.free_space_cells),
+        # Preserve the independent-frame count so the browser can apply the
+        # same stable-surface threshold as the offline extractor at every
+        # completeness setting, rather than being locked to the default mask.
+        "elevated_observation_cells": [
+            [cell[0], cell[1], count]
+            for cell, count in sorted(
+                outline.elevated_observation_counts.items(), key=lambda item: (item[0][1], item[0][0])
+            )
+        ],
     }
     path.write_text(json.dumps(payload, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
 
@@ -1928,7 +3333,7 @@ def semantic_layers(grid: OccupancyGrid, shelf_outline: Optional[ShelfOutline] =
         layers.append(
             {
                 "id": "shelf_outline",
-                "kind": "vertical_structure_trace",
+                "kind": "closed_shelf_contours",
                 **shelf_outline.summary(grid.resolution),
             }
         )

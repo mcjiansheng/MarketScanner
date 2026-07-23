@@ -48,10 +48,20 @@ struct ScanSegmentMetadata: Codable {
     let rtabmapEndPose: ScanPoseSample?
     let rtabmapOriginOffset: ScanTransform?
     let softwarePoseCorrection: ScanTransform?
+    /// Latest RTAB-Map map→odom correction in the ARKit/OpenGL world frame.
+    /// It is kept separate from `softwarePoseCorrection`, which only removes
+    /// impossible discontinuities in the raw ARKit odometry stream.
+    let rtabmapMapToOdomCorrection: ScanTransform?
+    let onlineLoopClosureCount: Int?
+    let reliableLoopClosureCount: Int?
     let databaseBytes: UInt64?
     let availableDiskBytes: Int64?
     let thermalState: String?
     let captureHealth: ScanCaptureHealth?
+    /// Lightweight phone-side coverage guidance statistics. This is not a
+    /// semantic shelf map; the authoritative geometry remains in the RGB-D
+    /// database and is reconstructed on the PC.
+    let structureCoverage: ScanStructureCoverageSummary?
 }
 
 struct ScanAreaCells: Codable {
@@ -97,6 +107,7 @@ struct ScanSegmentSidecarSnapshot {
     let priceTags: [PriceTagRecord]
     let areaCells: ScanAreaCells
     let poseSamples: [ScanPoseSample]
+    let structureCoverage: ScanStructureCoverageSnapshot?
 }
 
 struct ScanCaptureHealth: Codable {
@@ -141,6 +152,7 @@ struct ScanLiveCheckpoint: Codable {
     let thermalState: String
     let sensorEndPose: ScanSensorPose?
     let captureHealth: ScanCaptureHealth
+    let structureCoverage: ScanStructureCoverageSummary?
 }
 
 struct ScanEventRecord: Codable {
@@ -271,6 +283,8 @@ final class SupermarketScanSession {
     private var lowVisualFeatureFrameCount = 0
     private var maximumObservedLinearSpeedMps = 0.0
     private var maximumObservedAngularSpeedDegPerSecond = 0.0
+    private var latestStructureCoverageSnapshot: ScanStructureCoverageSnapshot?
+    private var latestStructureCoverageSummary: ScanStructureCoverageSummary?
     private let maximumTrajectorySamples = 50_000
     private var nextTagId: Int = 1
 
@@ -397,6 +411,8 @@ final class SupermarketScanSession {
         lowVisualFeatureFrameCount = 0
         maximumObservedLinearSpeedMps = 0
         maximumObservedAngularSpeedDegPerSecond = 0
+        latestStructureCoverageSnapshot = nil
+        latestStructureCoverageSummary = nil
     }
 
     func currentSegmentDirectory() throws -> URL {
@@ -608,7 +624,27 @@ final class SupermarketScanSession {
                 cellSizeM: areaEstimator.cellSizeM,
                 scanRadiusM: areaEstimator.scanRadiusM,
                 cells: areaEstimator.occupiedCellCoordinates()),
-            poseSamples: poseSamples)
+            poseSamples: poseSamples,
+            structureCoverage: latestStructureCoverageSnapshot)
+    }
+
+    func updateStructureCoverageSnapshot(_ snapshot: ScanStructureCoverageSnapshot) {
+        captureLock.lock()
+        defer { captureLock.unlock() }
+        latestStructureCoverageSnapshot = snapshot
+        latestStructureCoverageSummary = snapshot.summary
+    }
+
+    func updateStructureCoverageSummary(_ summary: ScanStructureCoverageSummary) {
+        captureLock.lock()
+        defer { captureLock.unlock() }
+        latestStructureCoverageSummary = summary
+    }
+
+    func structureCoverageSummary() -> ScanStructureCoverageSummary? {
+        captureLock.lock()
+        defer { captureLock.unlock() }
+        return latestStructureCoverageSummary
     }
 
     func boundarySnapshot() -> ScanBoundarySnapshot {
@@ -645,7 +681,8 @@ final class SupermarketScanSession {
             usedMemoryMB: usedMemoryMB,
             thermalState: thermalState,
             sensorEndPose: sensorEndPose,
-            captureHealth: captureHealthLocked())
+            captureHealth: captureHealthLocked(),
+            structureCoverage: latestStructureCoverageSummary)
     }
 
     private func captureHealthLocked() -> ScanCaptureHealth {
@@ -709,6 +746,13 @@ final class SupermarketScanSession {
             to: segmentDirectory.appendingPathComponent("trajectory_samples.csv"),
             atomically: true,
             encoding: .utf8)
+
+        if let structureCoverage = snapshot.structureCoverage {
+            let structureCoverageData = try encoder.encode(structureCoverage)
+            try structureCoverageData.write(
+                to: segmentDirectory.appendingPathComponent("structure_coverage_cells.json"),
+                options: .atomic)
+        }
 
         if snapshot.metadata.finalized == true {
             // A final metadata.json supersedes the crash-recovery heartbeat.

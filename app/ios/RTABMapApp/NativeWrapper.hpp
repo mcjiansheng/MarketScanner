@@ -29,6 +29,8 @@ void setupCallbacksNative(const void *object, void * classPtr,
                                                    int,
                                                    float, float, float, float,
                                                    int, int,
+                                                   int, int, int,
+                                                   float, float, float, float, float, float, float,
                                                    float, float, float, float, float, float),
                           void(*cameraInfoEventCallback)(void *, int, const char*, const char*));
 void destroyNativeApplication(const void *object);

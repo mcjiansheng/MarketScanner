@@ -36,6 +36,7 @@ import supermarket_multi_device_map as multi
 import supermarket_staged_map as staged
 import offline_processing as offline
 import gpu_acceleration as gpu
+import merge_processing as merge
 
 
 ARTIFACTS = (
@@ -59,6 +60,9 @@ ARTIFACTS = (
     "source_manifest.json",
     "offline_processing_report.json",
     "pc_acceleration_report.json",
+    "merge_edits.json",
+    "merge_manifest.json",
+    "merge_report.json",
 )
 
 
@@ -439,6 +443,36 @@ def scan_event_logs(session: Path, limit: int = 1000) -> Dict[str, Any]:
     }
 
 
+def structure_coverage_summary(session: Path) -> Dict[str, Any]:
+    """Read the bounded phone-side coverage evidence without loading its cells."""
+    files = sorted(session.glob("segment_*/structure_coverage_cells.json"))
+    summaries: list[Dict[str, Any]] = []
+    malformed_files: list[str] = []
+    for path in files:
+        payload = load_json(path, {})
+        summary = payload.get("summary") if isinstance(payload, dict) else None
+        if not isinstance(summary, dict):
+            malformed_files.append(str(path.relative_to(session)))
+            continue
+        summaries.append(
+            {
+                "source": str(path.relative_to(session)),
+                "cell_size_m": payload.get("cellSizeM"),
+                "floor_height_m": payload.get("floorHeightM"),
+                **summary,
+            }
+        )
+    return {
+        "available": bool(summaries),
+        "files": [str(path.relative_to(session)) for path in files],
+        "malformed_files": malformed_files,
+        # A production continuous scan has one segment. Keep the per-segment
+        # list so legacy inputs never have unrelated grids silently merged.
+        "segments": summaries,
+        "summary": summaries[-1] if summaries else None,
+    }
+
+
 def inspect_session(session: Path) -> Dict[str, Any]:
     config = base.MapConfig(0.05, 0.1, 1.25, 1.0, 0.08, 8.0, "xz", False)
     segments = base.discover_segments(session, config)
@@ -472,6 +506,7 @@ def inspect_session(session: Path) -> Dict[str, Any]:
                 for pose in segment.poses
             ),
         },
+        "structure_coverage": structure_coverage_summary(session),
         "scan_logs": scan_event_logs(session),
         "active_job": job_payload(active_job) if active_job else None,
     }
@@ -563,12 +598,26 @@ def attach_offline_reports(output: Path, reports: List[Dict[str, Any]]) -> None:
     summary = {
         "enabled": True,
         "database_count": len(reports),
-        "strategy": "software_only_vio_rgbd_loop_closure_and_robust_global_optimization",
+        "strategy": (
+            "manual_user_closure_and_robust_global_optimization"
+            if any(bool(report.get("user_constraints_used")) for report in reports)
+            else "software_only_vio_rgbd_loop_closure_and_robust_global_optimization"
+        ),
         "fiducials_used": False,
         "landmark_constraints_used": False,
         "pose_priors_used": False,
+        "user_constraints_used": any(
+            bool(report.get("user_constraints_used")) for report in reports
+        ),
+        "user_constraint_count": sum(
+            int(report.get("user_constraint_count", 0)) for report in reports
+        ),
         "execution": {
-            "profile": offline.ADAPTIVE_PROFILE,
+            "profile": (
+                "manual_region_merge_v1"
+                if any(bool(report.get("user_constraints_used")) for report in reports)
+                else offline.ADAPTIVE_PROFILE
+            ),
             "selected_pass_profiles": sorted(
                 {
                     str(report.get("adaptive", {}).get("selected_pass", "unknown"))
@@ -666,6 +715,183 @@ def find_existing_result(session: Path) -> Optional[Job]:
     metadata = load_json(latest / "map.json", {})
     kind = "stage" if metadata.get("format") == "SupermarketStageMap2D" else "map"
     return STATE.restore(kind, latest)
+
+
+def _manual_merge_output(session: Path, raw: Any) -> Path:
+    if raw not in (None, ""):
+        return require_output(raw)
+    stem = f"MapStudio-Merge-{time.strftime('%Y%m%d-%H%M%S')}"
+    candidate = session / stem
+    suffix = 2
+    while candidate.exists():
+        candidate = session / f"{stem}-{suffix}"
+        suffix += 1
+    return candidate
+
+
+def merge_preview(job: Job, data: Dict[str, Any]) -> Dict[str, Any]:
+    if job.status != "complete":
+        raise RequestError("Manual repair requires a completed map result.")
+    if not (job.output_dir / "preview_layers.json").is_file():
+        raise RequestError(
+            "This result has no metric preview evidence. Regenerate the map before manual repair."
+        )
+    try:
+        return merge.preview_merge(job.output_dir, data)
+    except merge.MergeProcessingError as exc:
+        raise RequestError(str(exc)) from exc
+
+
+def run_manual_merge(
+    base_job: Job,
+    data: Dict[str, Any],
+    output: Path,
+    progress: Optional[ProgressCallback] = None,
+) -> None:
+    report_progress(progress, 3, "验证人工修复", "正在重新校验框选区域和位姿对应关系")
+    preview = merge_preview(base_job, data)
+    if not preview.get("can_apply"):
+        raise RequestError("The regional alignment did not pass the preview confidence threshold.")
+    session = require_session(preview["source_session"])
+    source_database = resolve_path(preview["source_database"], "Merge source database")
+    if not source_database.is_file():
+        raise RequestError(f"Merge source database does not exist: {source_database}")
+
+    options = map_options(data)
+    base_map = load_json(base_job.output_dir / "map.json", {})
+    base_parameters = (
+        base_map.get("parameters", {}) if isinstance(base_map, dict) else {}
+    )
+    if isinstance(base_parameters, dict):
+        for key in (
+            "resolution",
+            "preview_resolution",
+            "trajectory_radius",
+            "tag_snap_distance",
+            "occupied_inflate_radius",
+            "free_ray_max_range",
+            "horizontal_axes",
+        ):
+            if base_parameters.get(key) is not None:
+                options[key] = base_parameters[key]
+    # Constraint transforms were derived in the base result's map plane. The
+    # regenerated version must keep that plane even if the form was changed.
+    options["horizontal_axes"] = preview["geometry"]["horizontal_axes"]
+    options["resolution"] = preview["geometry"]["resolution_m"]
+    acceleration = acceleration_selection(options, progress)
+    config = base.MapConfig(
+        options["resolution"],
+        options["preview_resolution"],
+        options["trajectory_radius"],
+        options["tag_snap_distance"],
+        options["occupied_inflate_radius"],
+        options["free_ray_max_range"],
+        options["horizontal_axes"],
+        False,
+    )
+    segments = base.discover_segments(session, config)
+    if len(segments) != 1 or segments[0].database_path is None:
+        raise RequestError(
+            "Manual regional repair currently requires one continuous RTAB-Map database."
+        )
+    optimized_database = output / "rtabmap_optimized" / "manual_merge_optimized.db"
+
+    def reprocess_progress(fraction: float, stage: str, message: str) -> None:
+        mapped = 12 + round(max(0.0, min(1.0, fraction)) * 54)
+        report_progress(progress, mapped, stage, message)
+
+    report_progress(
+        progress,
+        10,
+        "注入人工闭环",
+        f"将 {len(preview['constraints'])} 条 kUserClosure 约束写入一次性数据库副本",
+    )
+    report = offline.run_reprocess(
+        source_database,
+        optimized_database,
+        explicit_binary=options["reprocess_binary"],
+        thread_count=options["pc_threads"],
+        use_local_staging=options["pc_local_staging"],
+        accelerator_backend=acceleration.effective,
+        extra_parameters=acceleration.rtabmap_parameters + offline.FAST_REUSE_PARAMETERS,
+        progress_callback=reprocess_progress,
+        profile_name="manual_region_merge_v1",
+        link_injections=preview["constraints"],
+    )
+    report["session"] = str(session)
+    report["scan_mode"] = base.session_scan_summary(segments)["scan_mode"]
+    report_progress(progress, 68, "验证人工修复", "正在检查人工约束残差和全图位姿位移")
+    validation = merge.validate_optimized_merge(
+        source_database,
+        optimized_database,
+        preview["constraints"],
+        preview["geometry"]["horizontal_axes"],
+    )
+    if validation["status"] != "pass":
+        output.mkdir(parents=True, exist_ok=True)
+        merge.write_merge_artifacts(output, preview, validation, base_job.output_dir)
+        reasons = " ".join(validation["rejection_reasons"])
+        raise RequestError(
+            "Manual repair failed post-optimization safety validation and was not rendered: "
+            + reasons
+        )
+
+    args = SimpleNamespace(
+        session=str(session),
+        output=str(output),
+        points_csv=optional_points(data.get("points_csv")),
+        corrections=None,
+        auto_align_segments=False,
+        database_overrides={segments[0].index: str(optimized_database)},
+        **options,
+    )
+    report_progress(
+        progress,
+        72,
+        "重建修复地图",
+        f"人工闭环已通过验证，正在用 {acceleration.effective} 重投影完整地图",
+    )
+    with gpu.DepthProjector(acceleration) as projector:
+        args.depth_projector = projector
+        base.generate(args)
+        acceleration_report = projector.report()
+    report_progress(progress, 94, "写入修复版本", "正在保存人工操作、约束和验证报告")
+    attach_offline_reports(output, [report])
+    attach_acceleration_report(output, acceleration_report, [report])
+    merge.write_merge_artifacts(output, preview, validation, base_job.output_dir)
+    report_progress(progress, 98, "校验成果", "人工误差修复版本已写入，原结果保持不变")
+
+
+def start_manual_merge(base_job: Job, data: Dict[str, Any]) -> Job:
+    if not boolean(data.get("confirmed"), False):
+        raise RequestError("Confirm the preview before applying manual regional repair.")
+    preview = merge_preview(base_job, data)
+    session = require_session(preview["source_session"])
+    output = _manual_merge_output(session, data.get("output"))
+    job = STATE.add("merge", output, (str(session),))
+
+    def worker() -> None:
+        STATE.set_status(job.identifier, "running")
+        progress = lambda value, stage, message="": STATE.update_progress(
+            job.identifier, value, stage, message
+        )
+        progress(1, "任务已启动", f"基于 {base_job.output_dir.name} 创建人工修复版本")
+        try:
+            run_manual_merge(base_job, data, output, progress)
+        except Exception as exc:
+            progress(99, "处理失败", str(exc))
+            STATE.set_status(job.identifier, "failed", str(exc))
+            print(traceback.format_exc(), file=sys.stderr, flush=True)
+        else:
+            progress(99, "完成校验", "人工修复版本已通过生成流程校验")
+            STATE.set_status(job.identifier, "complete")
+
+    threading.Thread(
+        target=worker,
+        name=f"map-studio-merge-{job.identifier}",
+        daemon=True,
+    ).start()
+    return job
 
 
 def run_stage(data: Dict[str, Any], output: Path, progress: Optional[ProgressCallback] = None) -> None:
@@ -959,6 +1185,21 @@ class StudioHandler(BaseHTTPRequestHandler):
             if path == "/api/jobs":
                 job = start_job(data)
                 self.send_json(HTTPStatus.ACCEPTED, job_payload(job))
+                return
+            if path.startswith("/api/jobs/") and path.endswith("/merge/preview"):
+                job_id = path.split("/")[3]
+                job = STATE.get(job_id)
+                if job is None:
+                    raise RequestError("Completed base job not found.")
+                self.send_json(HTTPStatus.OK, merge_preview(job, data))
+                return
+            if path.startswith("/api/jobs/") and path.endswith("/merge/apply"):
+                job_id = path.split("/")[3]
+                job = STATE.get(job_id)
+                if job is None:
+                    raise RequestError("Completed base job not found.")
+                merge_job = start_manual_merge(job, data)
+                self.send_json(HTTPStatus.ACCEPTED, job_payload(merge_job))
                 return
             if path.startswith("/api/jobs/") and path.endswith("/open"):
                 job_id = path.split("/")[3]

@@ -71,6 +71,8 @@ class RTABMapApp : public UEventsHandler {
                                                     int,
                                                     float, float, float, float,
                                                     int, int,
+                                                    int, int, int,
+                                                    float, float, float, float, float, float, float,
                                                     float, float, float, float, float, float),
                            void(*cameraInfoCallback)(void *, int, const char*, const char*));
     
@@ -347,6 +349,8 @@ class RTABMapApp : public UEventsHandler {
                              int,
                              float, float, float, float,
                              int, int,
+                             int, int, int,
+                             float, float, float, float, float, float, float,
                              float, float, float, float, float, float);
     void(*swiftCameraInfoEventCallback)(void *, int, const char *, const char *);
     

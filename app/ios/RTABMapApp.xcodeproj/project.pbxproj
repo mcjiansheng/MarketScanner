@@ -88,6 +88,7 @@
 		4EA100012F00000100100001 /* SupermarketScanSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA100012F00000100100002 /* SupermarketScanSession.swift */; };
 		4EA100012F00000100100003 /* PriceTagNFCReader.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA100012F00000100100004 /* PriceTagNFCReader.swift */; };
 		4EA100012F00000100100005 /* CoreNFC.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 4EA100012F00000100100006 /* CoreNFC.framework */; };
+		4EA300012F20000100100001 /* SupermarketStructureCoverage.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA300012F20000100100002 /* SupermarketStructureCoverage.swift */; };
 		4EA200012F12B00100100001 /* Localizable.strings in Resources */ = {isa = PBXBuildFile; fileRef = 4EA200012F12B00100100002 /* Localizable.strings */; };
 		4EB1A66625A0D90B0043C7BF /* RTABMap.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EB1A66525A0D90B0043C7BF /* RTABMap.swift */; };
 		4EE016B3259BE441008CCE65 /* ViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EE016AF259BE441008CCE65 /* ViewController.swift */; };
@@ -192,6 +193,7 @@
 		4EA100012F00000100100002 /* SupermarketScanSession.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = SupermarketScanSession.swift; path = RTABMapApp/SupermarketScanSession.swift; sourceTree = "<group>"; };
 		4EA100012F00000100100004 /* PriceTagNFCReader.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = PriceTagNFCReader.swift; path = RTABMapApp/PriceTagNFCReader.swift; sourceTree = "<group>"; };
 		4EA100012F00000100100006 /* CoreNFC.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = CoreNFC.framework; path = System/Library/Frameworks/CoreNFC.framework; sourceTree = SDKROOT; };
+		4EA300012F20000100100002 /* SupermarketStructureCoverage.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = SupermarketStructureCoverage.swift; path = RTABMapApp/SupermarketStructureCoverage.swift; sourceTree = "<group>"; };
 		4EB1A66525A0D90B0043C7BF /* RTABMap.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; name = RTABMap.swift; path = RTABMapApp/RTABMap.swift; sourceTree = "<group>"; };
 		4ED73AD02D7FECF3007899C2 /* liblaszip.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = liblaszip.a; path = RTABMapApp/Libraries/lib/liblaszip.a; sourceTree = "<group>"; };
 		4EE015C2259A2AF0008CCE65 /* RTABMapApp.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = RTABMapApp.app; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -489,6 +491,7 @@
 				4EE016B0259BE441008CCE65 /* SceneDelegate.swift */,
 				4EE016AF259BE441008CCE65 /* ViewController.swift */,
 				4EA100012F00000100100002 /* SupermarketScanSession.swift */,
+				4EA300012F20000100100002 /* SupermarketStructureCoverage.swift */,
 				4EA100012F00000100100004 /* PriceTagNFCReader.swift */,
 				4EA200012F12B00100100002 /* Localizable.strings */,
 				4EE016BF259BE464008CCE65 /* Main.storyboard */,
@@ -871,6 +874,7 @@
 				4E2C516825A63119005CEDBD /* VerticalScrollerView.swift in Sources */,
 				4EE016B3259BE441008CCE65 /* ViewController.swift in Sources */,
 				4EA100012F00000100100001 /* SupermarketScanSession.swift in Sources */,
+				4EA300012F20000100100001 /* SupermarketStructureCoverage.swift in Sources */,
 				4EA100012F00000100100003 /* PriceTagNFCReader.swift in Sources */,
 				4E2C516725A63119005CEDBD /* DatabaseView.swift in Sources */,
 				4EFD0BAA259D501E00575D88 /* triangle.cpp in Sources */,

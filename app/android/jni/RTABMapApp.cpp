@@ -353,6 +353,8 @@ void RTABMapApp::setupSwiftCallbacks(void * classPtr,
                                                               int,
                                                               float, float, float, float,
                                                               int, int,
+                                                              int, int, int,
+                                                              float, float, float, float, float, float, float,
                                                               float, float, float, float, float, float),
                                      void(*cameraInfoEventCallback)(void *, int, const char*, const char*))
 {
@@ -5283,13 +5285,29 @@ bool RTABMapApp::handleEvent(UEvent * event)
 		LOGI("Received PostRenderEvent!");
 
 		int loopClosureId = 0;
+		int loopClosureType = 0; // 0=none, 1=global visual, 2=local-space proximity
+		int loopClosureCurrentId = 0;
+		int loopClosureTargetId = 0;
 		int featuresExtracted = 0;
 		if(((PostRenderEvent*)event)->getRtabmapEvent())
 		{
             LOGI("Received PostRenderEvent! has getRtabmapEvent");
             
 			const rtabmap::Statistics & stats = ((PostRenderEvent*)event)->getRtabmapEvent()->getStats();
-			loopClosureId = stats.loopClosureId()>0?stats.loopClosureId():stats.proximityDetectionId()>0?stats.proximityDetectionId():0;
+			if(stats.loopClosureId() > 0)
+			{
+				loopClosureType = 1;
+				loopClosureTargetId = stats.loopClosureId();
+			}
+			else if(stats.proximityDetectionId() > 0)
+			{
+				loopClosureType = 2;
+				loopClosureTargetId = stats.proximityDetectionId();
+			}
+			loopClosureCurrentId = stats.refImageId() > 0?
+					stats.refImageId():
+					stats.getLastSignatureData().id();
+			loopClosureId = loopClosureTargetId;
 			featuresExtracted = stats.getLastSignatureData().getWords().size();
 
 			uInsert(bufferedStatsData_, std::make_pair<std::string, float>(rtabmap::Statistics::kMemoryWorking_memory_size(), uValue(stats.data(), rtabmap::Statistics::kMemoryWorking_memory_size(), 0.0f)));
@@ -5327,6 +5345,19 @@ bool RTABMapApp::handleEvent(UEvent * event)
 		float distanceTravelled = uValue(bufferedStatsData_, rtabmap::Statistics::kMemoryDistance_travelled(), 0.0f);
 		int fastMovement = (int)uValue(bufferedStatsData_, rtabmap::Statistics::kMemoryFast_movement(), 0.0f);
 		int landmarkDetected = (int)uValue(bufferedStatsData_, rtabmap::Statistics::kLoopLandmark_detected(), 0.0f);
+		float mapCorrectionX=0.0f,mapCorrectionY=0.0f,mapCorrectionZ=0.0f;
+		Eigen::Quaternionf mapCorrectionQuaternion = Eigen::Quaternionf::Identity();
+		if(!mapToOdom_.isNull())
+		{
+			const rtabmap::Transform mapCorrection =
+					rtabmap::opengl_world_T_rtabmap_world *
+					mapToOdom_ *
+					rtabmap::rtabmap_world_T_opengl_world;
+			mapCorrectionX = mapCorrection.x();
+			mapCorrectionY = mapCorrection.y();
+			mapCorrectionZ = mapCorrection.z();
+			mapCorrectionQuaternion = mapCorrection.getQuaternionf();
+		}
 		rtabmap::Transform currentPose = main_scene_.GetCameraPose();
 		float x=0.0f,y=0.0f,z=0.0f,roll=0.0f,pitch=0.0f,yaw=0.0f;
 		if(!currentPose.isNull())
@@ -5410,6 +5441,16 @@ bool RTABMapApp::handleEvent(UEvent * event)
                                           distanceTravelled,
                                           fastMovement,
                                           landmarkDetected,
+                                          loopClosureType,
+                                          loopClosureCurrentId,
+                                          loopClosureTargetId,
+                                          mapCorrectionX,
+                                          mapCorrectionY,
+                                          mapCorrectionZ,
+                                          mapCorrectionQuaternion.x(),
+                                          mapCorrectionQuaternion.y(),
+                                          mapCorrectionQuaternion.z(),
+                                          mapCorrectionQuaternion.w(),
                                           x,
                                           y,
                                           z,
