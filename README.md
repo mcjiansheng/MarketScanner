@@ -60,6 +60,8 @@ Android 目录中的部分 C++ 原生实现也因共享移动渲染和数据库�
 - **自由扫描建图**：继续使用既有 ARKit/RGB-D/LiDAR 连续单库采集和 PC 离线优化，默认行为与输出兼容不变。
 - **已有地图辅助扫描（阶段一）**：先把 `Element Info` XLSX 转换为版本化先验地图包，在 iPhone 五步向导中选择地图、楼层、起点和朝向；扫描时用 `T_map_from_arkit` 显示 2D 位置，并以 2 Hz 道路候选做有上限的软约束。定位较弱或丢失不会停止 RTAB-Map 原始数据库记录，人工位置确认写入独立审计 sidecar。
 
+当前已有地图模式按**单次扫描、单一楼层**工作：开始前绑定一个楼层，扫描中不自动切层，也不支持跨楼层定位。楼层内部允许坡道、地面起伏等少量竖直位移；二维先验定位忽略 ARKit 高度分量，而原始 ARKit/RTAB-Map 数据仍完整保留三维运动。
+
 阶段一**尚未实现** LiDAR/视觉结构自动地图匹配、Vision 扫码或价签位置测量，界面不会把初始/道路辅助定位称为精准定位。完整架构、格式、UI、测试和当前状态见 [docs/map-assisted-localization/](docs/map-assisted-localization/)。
 
 ### 连续流式单数据库
@@ -253,7 +255,7 @@ python3 tools/PriorMap/xlsx_to_prior_map.py /path/to/map.xlsx \
 python3 tools/PriorMap/validate_prior_map.py /path/to/PriorMap-output
 ```
 
-源 XLSX 只读；输出记录源 SHA-256、楼层、bounds、元素统计、道路连通性、空间索引、warning 和确定性 PNG 预览。
+源 XLSX 只读；输出记录源 SHA-256、楼层、bounds、元素统计、道路连通性、结构/道路空间索引、warning、默认 PNG 和逐楼层确定性 PNG 预览。一个地图包可以保存多个楼层，但一次手机扫描只绑定其中一个楼层。
 
 ### 3. 直接生成二维地图
 

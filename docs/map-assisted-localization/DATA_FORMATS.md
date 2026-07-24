@@ -33,6 +33,8 @@
 }
 ```
 
+`floorId` 在会话开始时固定，当前版本没有扫描中楼层切换事件。二维 `rawPose/estimatedPose` 只表达所选楼层内的 `x/y/yaw`：ARKit `+x` 对应地图 `+x`，ARKit `-z` 对应地图 `+y`，地图 yaw 0 指向 `+y` 且逆时针为正。ARKit 竖直 `y` 不写入二维定位 sidecar，但仍由原始 ARKit/RTAB-Map 三维链路保存。
+
 实时 `live_checkpoint.json` 同步记录业务模式和地图身份。正常结束后仍删除 checkpoint。
 
 ## localization_trace.jsonl

@@ -31,6 +31,13 @@ struct PriorMapBounds: Codable {
 struct PriorMapFloor: Codable {
     let id: String
     let bounds: PriorMapBounds
+    let previewFile: String?
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case bounds
+        case previewFile = "preview_file"
+    }
 }
 
 struct PriorMapManifest: Codable {
@@ -86,16 +93,76 @@ struct PriorMapRoadGraph: Codable {
     let edges: [PriorMapRoadEdge]
 }
 
+struct PriorMapSpatialFloor: Codable {
+    let cells: [String: [String]]
+    let roadCells: [String: [String]]
+
+    enum CodingKeys: String, CodingKey {
+        case cells
+        case roadCells = "road_cells"
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        cells = try container.decodeIfPresent([String: [String]].self, forKey: .cells) ?? [:]
+        roadCells = try container.decodeIfPresent(
+            [String: [String]].self,
+            forKey: .roadCells) ?? [:]
+    }
+}
+
+struct PriorMapSpatialIndexPayload: Codable {
+    let format: String
+    let version: Int
+    let cellSizeM: Double
+    let floors: [String: PriorMapSpatialFloor]
+
+    enum CodingKeys: String, CodingKey {
+        case format
+        case version
+        case cellSizeM = "cell_size_m"
+        case floors
+    }
+}
+
 struct PriorMapPackage {
     let directory: URL
     let manifest: PriorMapManifest
     let roadGraph: PriorMapRoadGraph
+    let spatialIndex: PriorMapSpatialIndexPayload
     let preview: UIImage
+    let previewsByFloor: [String: UIImage]
+
+    func preview(floorId: String) -> UIImage {
+        return previewsByFloor[floorId] ?? preview
+    }
 
     static func load(directory: URL) throws -> PriorMapPackage {
         let decoder = JSONDecoder()
+        let requiredJSONFormats = [
+            "manifest.json": "MarketScannerPriorMap",
+            "elements.json": "MarketScannerPriorMapElements",
+            "shelves.json": "MarketScannerPriorMapShelves",
+            "fixed_structures.json": "MarketScannerPriorMapStructures",
+            "road_graph.json": "MarketScannerRoadGraph",
+            "spatial_index.json": "MarketScannerSpatialIndex",
+            "validation_report.json": "MarketScannerPriorMapValidation",
+        ]
+        for (name, expectedFormat) in requiredJSONFormats {
+            let data = try Data(
+                contentsOf: directory.appendingPathComponent(name))
+            guard let payload = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  payload["format"] as? String == expectedFormat,
+                  payload["version"] as? Int == 1 else {
+                throw NSError(
+                    domain: "PriorMap",
+                    code: 5,
+                    userInfo: [NSLocalizedDescriptionKey: "\(name) 无法通过地图包格式校验。"])
+            }
+        }
         let manifestURL = directory.appendingPathComponent("manifest.json")
         let graphURL = directory.appendingPathComponent("road_graph.json")
+        let spatialURL = directory.appendingPathComponent("spatial_index.json")
         let previewURL = directory.appendingPathComponent("preview.png")
         let manifest = try decoder.decode(
             PriorMapManifest.self,
@@ -124,17 +191,43 @@ struct PriorMapPackage {
         let graph = try decoder.decode(
             PriorMapRoadGraph.self,
             from: Data(contentsOf: graphURL))
+        let spatial = try decoder.decode(
+            PriorMapSpatialIndexPayload.self,
+            from: Data(contentsOf: spatialURL))
+        guard spatial.format == "MarketScannerSpatialIndex",
+              spatial.version == 1,
+              spatial.cellSizeM > 0 else {
+            throw NSError(
+                domain: "PriorMap",
+                code: 6,
+                userInfo: [NSLocalizedDescriptionKey: "地图空间索引无效，请在 PC 工作台重新生成。"])
+        }
         guard let preview = UIImage(contentsOfFile: previewURL.path) else {
             throw NSError(
                 domain: "PriorMap",
                 code: 3,
                 userInfo: [NSLocalizedDescriptionKey: "地图预览无法读取。源 Excel 不受影响，请重新生成地图包。"])
         }
+        var previewsByFloor: [String: UIImage] = [:]
+        for floor in manifest.floors {
+            guard let filename = floor.previewFile,
+                  URL(fileURLWithPath: filename).lastPathComponent == filename,
+                  let floorPreview = UIImage(
+                    contentsOfFile: directory.appendingPathComponent(filename).path) else {
+                throw NSError(
+                    domain: "PriorMap",
+                    code: 7,
+                    userInfo: [NSLocalizedDescriptionKey: "楼层 \(floor.id) 的预览无法读取，请重新生成地图包。"])
+            }
+            previewsByFloor[floor.id] = floorPreview
+        }
         return PriorMapPackage(
             directory: directory,
             manifest: manifest,
             roadGraph: graph,
-            preview: preview)
+            spatialIndex: spatial,
+            preview: preview,
+            previewsByFloor: previewsByFloor)
     }
 }
 
@@ -172,11 +265,14 @@ private struct PriorMapProjectedCandidate {
 final class PriorMapStageOneLocalizer {
     private let floorId: String
     private var initialMapPose: PriorMapPose2D
-    private let segments: [PriorMapRoadSegment]
+    private let segmentsById: [String: PriorMapRoadSegment]
+    private let roadCells: [String: [String]]
+    private let cellSizeM: Double
     private var arkitOrigin: PriorMapPose2D?
     private let softGain = 0.15
     private let maximumCorrectionM = 0.25
     private let ambiguityMarginM = 0.35
+    private let candidateRadiusM = 3.0
 
     init(package: PriorMapPackage, floorId: String, initialMapPose: PriorMapPose2D) {
         self.floorId = floorId
@@ -186,7 +282,7 @@ final class PriorMapStageOneLocalizer {
             where node.floorId == floorId && node.positionM.count >= 2 {
             positions[node.id] = SIMD2<Double>(node.positionM[0], node.positionM[1])
         }
-        self.segments = package.roadGraph.edges.compactMap { edge in
+        let segments: [PriorMapRoadSegment] = package.roadGraph.edges.compactMap { edge in
             guard edge.floorId == floorId,
                   let start = positions[edge.from],
                   let end = positions[edge.to] else {
@@ -194,6 +290,27 @@ final class PriorMapStageOneLocalizer {
             }
             return PriorMapRoadSegment(id: edge.id, start: start, end: end)
         }
+        self.segmentsById = Dictionary(
+            uniqueKeysWithValues: segments.map { ($0.id, $0) })
+        self.roadCells = package.spatialIndex.floors[floorId]?.roadCells ?? [:]
+        self.cellSizeM = package.spatialIndex.cellSizeM
+    }
+
+    private func nearbySegments(_ point: SIMD2<Double>) -> [PriorMapRoadSegment] {
+        guard !roadCells.isEmpty else {
+            return segmentsById.keys.sorted().compactMap { segmentsById[$0] }
+        }
+        let minimumX = Int(floor((point.x - candidateRadiusM) / cellSizeM))
+        let maximumX = Int(floor((point.x + candidateRadiusM) / cellSizeM))
+        let minimumY = Int(floor((point.y - candidateRadiusM) / cellSizeM))
+        let maximumY = Int(floor((point.y + candidateRadiusM) / cellSizeM))
+        var identifiers = Set<String>()
+        for cellX in minimumX...maximumX {
+            for cellY in minimumY...maximumY {
+                identifiers.formUnion(roadCells["\(cellX),\(cellY)"] ?? [])
+            }
+        }
+        return identifiers.sorted().compactMap { segmentsById[$0] }
     }
 
     func update(
@@ -212,7 +329,7 @@ final class PriorMapStageOneLocalizer {
             initialMapPose: initialMapPose)
         let projected = SIMD2<Double>(rawPose.xM, rawPose.yM)
         var candidates: [PriorMapProjectedCandidate] = []
-        for segment in segments {
+        for segment in nearbySegments(projected) {
             let deltaX = segment.end.x - segment.start.x
             let deltaY = segment.end.y - segment.start.y
             let denominator = max(
@@ -230,7 +347,7 @@ final class PriorMapStageOneLocalizer {
             let differenceY = projected.y - point.y
             let distance = sqrt(
                 differenceX * differenceX + differenceY * differenceY)
-            if distance <= 3.0 {
+            if distance <= candidateRadiusM {
                 candidates.append(
                     PriorMapProjectedCandidate(
                         segment: segment,
@@ -271,7 +388,7 @@ final class PriorMapStageOneLocalizer {
         let distance = topCandidates.first?.distanceM ?? Double.infinity
         let state: String
         let confidence: Double
-        if trackingState == "notAvailable" || segments.isEmpty {
+        if trackingState == "notAvailable" || segmentsById.isEmpty {
             state = "lost"
             confidence = 0.0
         }
@@ -320,11 +437,11 @@ final class PriorMapStageOneLocalizer {
             -transform.columns.2.x,
             -transform.columns.2.y,
             -transform.columns.2.z)
-        let yaw = atan2(Double(forward.x), Double(-forward.z))
-        return PriorMapPose2D(
-            xM: Double(transform.columns.3.x),
-            yM: Double(transform.columns.3.z),
-            yawRad: yaw)
+        return PriorMapStageOneMath.arkitHorizontalPose(
+            positionX: Double(transform.columns.3.x),
+            positionZ: Double(transform.columns.3.z),
+            forwardX: Double(forward.x),
+            forwardZ: Double(forward.z))
     }
 
 }
@@ -462,6 +579,7 @@ final class PriorMapWizardViewController: UIViewController, UIDocumentPickerDele
     private let content = UIStackView()
     private let backButton = UIButton(type: .system)
     private let nextButton = UIButton(type: .system)
+    private var cameraPermissionRequestInFlight = false
 
     private let steps = [
         "1. 选择地图",
@@ -540,12 +658,14 @@ final class PriorMapWizardViewController: UIViewController, UIDocumentPickerDele
             nextButton.isEnabled = package != nil
         case 1:
             guard let package = package else { return }
-            addText("请选择本次扫描所在楼层。")
+            addText("请选择本次扫描所在楼层。本次连续扫描将始终绑定该楼层，不支持扫描中切换或跨楼层定位。楼层内坡道、地面起伏等少量竖直位移不会改变二维先验地图位置。")
             let control = UISegmentedControl(items: package.manifest.floors.map { $0.id })
             control.selectedSegmentIndex = min(selectedFloorIndex, package.manifest.floors.count - 1)
             control.addTarget(self, action: #selector(floorChanged(_:)), for: .valueChanged)
             content.addArrangedSubview(control)
-            addPreview(package.preview, height: 280)
+            addPreview(
+                package.preview(floorId: package.manifest.floors[selectedFloorIndex].id),
+                height: 280)
             nextButton.isEnabled = true
         case 2:
             guard let package = package else { return }
@@ -557,7 +677,7 @@ final class PriorMapWizardViewController: UIViewController, UIDocumentPickerDele
             }
             addText("点击地图设置起点；双指缩放/平移。拖动下方方向滑杆调整箭头。起点和方向错误会影响定位。")
             let picker = PriorMapPosePickerView(
-                image: package.preview,
+                image: package.preview(floorId: floor.id),
                 bounds: floor.bounds,
                 pose: selectedPose)
             picker.heightAnchor.constraint(equalToConstant: 300).isActive = true
@@ -598,23 +718,48 @@ final class PriorMapWizardViewController: UIViewController, UIDocumentPickerDele
             nextButton.isEnabled = true
         case 3:
             addText("设备检查")
-            let camera = AVCaptureDevice.authorizationStatus(for: .video) == .authorized
+            let cameraStatus = AVCaptureDevice.authorizationStatus(for: .video)
+            let camera = cameraStatus == .authorized
+            if cameraStatus == .notDetermined && !cameraPermissionRequestInFlight {
+                cameraPermissionRequestInFlight = true
+                AVCaptureDevice.requestAccess(for: .video) { [weak self] _ in
+                    DispatchQueue.main.async {
+                        self?.cameraPermissionRequestInFlight = false
+                        self?.renderStep()
+                    }
+                }
+            }
+            let arkitSupported = ARWorldTrackingConfiguration.isSupported
             let depth = ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth)
             let thermal = ProcessInfo.processInfo.thermalState
             let thermalOK = thermal != .critical
             let freeBytes = ((try? FileManager.default.attributesOfFileSystem(
                 forPath: NSHomeDirectory())[.systemFreeSize]) as? NSNumber)?.int64Value ?? 0
-            addCheck("相机权限", camera, camera ? "可用" : "请到系统设置允许相机")
-            addCheck("ARKit tracking", true, "启动后持续监测；不稳定时保留原始扫描")
+            let cameraDetail: String
+            if camera {
+                cameraDetail = "可用"
+            }
+            else if cameraStatus == .notDetermined {
+                cameraDetail = "正在请求系统权限"
+            }
+            else {
+                cameraDetail = "未授权，请到系统设置允许相机"
+            }
+            addCheck("相机权限", camera, cameraDetail)
+            addCheck(
+                "ARKit 设备支持",
+                arkitSupported,
+                arkitSupported ? "支持世界跟踪" : "此设备不支持 ARKit 世界跟踪")
+            addInfo("ARKit tracking", "待扫描启动后实时监测；不稳定时保留原始扫描")
             addCheck("LiDAR / 深度", depth, depth ? "可用" : "不可用，阶段一仍可使用初始/道路辅助定位")
             addCheck("剩余空间", freeBytes > 2_000_000_000, String(format: "%.1f GB", Double(freeBytes) / 1_000_000_000.0))
             addCheck("温度", thermalOK, "\(thermal)")
             addCheck("先验地图完整性", package != nil, package == nil ? "未选择" : "已通过版本检查")
             addCheck("保存位置", true, "连续数据库和 sidecar 写入当前扫描目录")
-            nextButton.isEnabled = camera && thermalOK && package != nil
+            nextButton.isEnabled = camera && arkitSupported && thermalOK && package != nil
         default:
             guard let package = package else { return }
-            addText("即将开始已有地图辅助扫描。手机仍会连续写入完整 RTAB-Map 数据库；道路只做小幅软约束，不会跨通道强制跳转。")
+            addText("即将开始已有地图辅助扫描。手机仍会连续写入完整 RTAB-Map 三维数据库；二维先验定位只使用选定楼层，楼层内少量竖直位移保留在原始数据中但不参与二维位置计算。道路只做小幅软约束，不会跨通道强制跳转。")
             addText("地图：\(package.manifest.name)\n楼层：\(package.manifest.floors[selectedFloorIndex].id)\n起点：\(String(format: "%.2f, %.2f m", selectedPose.xM, selectedPose.yM))")
             addText("阶段一尚未实现 LiDAR 自动匹配。定位较弱或丢失时，原始扫描继续保存，并可人工确认位置。")
             nextButton.isEnabled = true
@@ -647,6 +792,14 @@ final class PriorMapWizardViewController: UIViewController, UIDocumentPickerDele
         content.addArrangedSubview(label)
     }
 
+    private func addInfo(_ title: String, _ detail: String) {
+        let label = UILabel()
+        label.numberOfLines = 0
+        label.text = "○ \(title)：\(detail)"
+        label.textColor = .secondaryLabel
+        content.addArrangedSubview(label)
+    }
+
     @objc private func choosePackage() {
         let picker = UIDocumentPickerViewController(forOpeningContentTypes: [.folder])
         picker.delegate = self
@@ -675,25 +828,39 @@ final class PriorMapWizardViewController: UIViewController, UIDocumentPickerDele
             try FileManager.default.createDirectory(
                 at: importedRoot,
                 withIntermediateDirectories: true)
-            let manifestData = try Data(
-                contentsOf: source.appendingPathComponent("manifest.json"))
-            let manifest = try JSONDecoder().decode(PriorMapManifest.self, from: manifestData)
-            guard !manifest.priorMapId.isEmpty,
-                  manifest.priorMapId.count <= 128,
-                  manifest.sourceSha256.count == 64,
-                  manifest.sourceSha256.allSatisfy({ $0.isHexDigit }) else {
-                throw NSError(
-                    domain: "PriorMap",
-                    code: 4,
-                    userInfo: [NSLocalizedDescriptionKey: "地图包身份或来源摘要无效，请在 PC 工作台重新生成。"])
+            let temporary = importedRoot.appendingPathComponent(
+                ".import-\(UUID().uuidString)",
+                isDirectory: true)
+            defer {
+                if FileManager.default.fileExists(atPath: temporary.path) {
+                    try? FileManager.default.removeItem(at: temporary)
+                }
             }
+            try FileManager.default.copyItem(at: source, to: temporary)
+            let validatedPackage = try PriorMapPackage.load(directory: temporary)
+            let manifest = validatedPackage.manifest
             let destination = importedRoot.appendingPathComponent(
                 "PriorMap-\(manifest.sourceSha256.prefix(16))",
                 isDirectory: true)
             if FileManager.default.fileExists(atPath: destination.path) {
-                try FileManager.default.removeItem(at: destination)
+                let backupName = ".backup-\(UUID().uuidString)"
+                _ = try FileManager.default.replaceItemAt(
+                    destination,
+                    withItemAt: temporary,
+                    backupItemName: backupName,
+                    options: [])
+                let backup = importedRoot.appendingPathComponent(
+                    backupName,
+                    isDirectory: true)
+                if FileManager.default.fileExists(atPath: backup.path) {
+                    try? FileManager.default.removeItem(at: backup)
+                }
             }
-            try FileManager.default.copyItem(at: source, to: destination)
+            else {
+                try FileManager.default.moveItem(
+                    at: temporary,
+                    to: destination)
+            }
             package = try PriorMapPackage.load(directory: destination)
             selectedFloorIndex = 0
             selectedPose = PriorMapPose2D(xM: 0, yM: 0, yawRad: 0)
@@ -714,6 +881,7 @@ final class PriorMapWizardViewController: UIViewController, UIDocumentPickerDele
         selectedFloorIndex = max(0, sender.selectedSegmentIndex)
         selectedPose = PriorMapPose2D(xM: 0, yM: 0, yawRad: selectedPose.yawRad)
         hasSelectedInitialPose = false
+        renderStep()
     }
 
     @objc private func yawChanged(_ sender: UISlider) {
@@ -771,7 +939,7 @@ final class PriorMapLiveMapView: UIView {
         layer.cornerRadius = 12
         layer.borderColor = UIColor.separator.cgColor
         layer.borderWidth = 1
-        previewView.image = package.preview
+        previewView.image = package.preview(floorId: floorId)
         previewView.contentMode = .scaleAspectFit
         previewView.layer.addSublayer(arrow)
         arrow.fillColor = UIColor.systemRed.cgColor

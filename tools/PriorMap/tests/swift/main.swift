@@ -34,6 +34,51 @@ let ready = PriorMapScanConfiguration(
     initialMapPose: PriorMapPose2D(xM: 2, yM: 3, yawRad: .pi / 2))
 require(ready.isReadyToStart, "complete prior-map setup must start")
 
+let identity = PriorMapStageOneMath.arkitHorizontalPose(
+    positionX: 0,
+    positionZ: 0,
+    forwardX: 0,
+    forwardZ: -1)
+require(close(identity.xM, 0), "identity map x")
+require(close(identity.yM, 0), "identity map y")
+require(close(identity.yawRad, 0), "identity yaw must point toward map +y")
+
+let forward = PriorMapStageOneMath.arkitHorizontalPose(
+    positionX: 0,
+    positionZ: -1,
+    forwardX: 0,
+    forwardZ: -1)
+require(close(forward.xM, 0), "forward x")
+require(close(forward.yM, 1), "ARKit -z forward must be map +y")
+
+let backward = PriorMapStageOneMath.arkitHorizontalPose(
+    positionX: 0,
+    positionZ: 1,
+    forwardX: 0,
+    forwardZ: -1)
+require(close(backward.yM, -1), "ARKit +z backward must be map -y")
+
+let right = PriorMapStageOneMath.arkitHorizontalPose(
+    positionX: 1,
+    positionZ: 0,
+    forwardX: 0,
+    forwardZ: -1)
+require(close(right.xM, 1), "ARKit +x must be map +x")
+
+let leftTurn = PriorMapStageOneMath.arkitHorizontalPose(
+    positionX: 0,
+    positionZ: 0,
+    forwardX: -1,
+    forwardZ: 0)
+require(close(leftTurn.yawRad, .pi / 2), "left turn must be positive map yaw")
+
+let rightTurn = PriorMapStageOneMath.arkitHorizontalPose(
+    positionX: 0,
+    positionZ: 0,
+    forwardX: 1,
+    forwardZ: 0)
+require(close(rightTurn.yawRad, -.pi / 2), "right turn must be negative map yaw")
+
 let projected = PriorMapStageOneMath.project(
     arkitPose: PriorMapPose2D(xM: 11, yM: 20, yawRad: 0),
     arkitOrigin: PriorMapPose2D(xM: 10, yM: 20, yawRad: 0),
@@ -41,8 +86,43 @@ let projected = PriorMapStageOneMath.project(
 require(close(projected.xM, 2), "rotated map x")
 require(close(projected.yM, 4), "rotated map y")
 require(close(projected.yawRad, .pi / 2), "map yaw")
+
+let nonzeroOrigin = PriorMapStageOneMath.project(
+    arkitPose: PriorMapPose2D(xM: 3, yM: 6, yawRad: .pi / 2),
+    arkitOrigin: PriorMapPose2D(xM: 3, yM: 5, yawRad: .pi / 2),
+    initialMapPose: PriorMapPose2D(xM: 10, yM: 20, yawRad: -.pi / 2))
+require(close(nonzeroOrigin.xM, 10), "nonzero origin x")
+require(close(nonzeroOrigin.yM, 19), "nonzero origin y")
+require(close(nonzeroOrigin.yawRad, -.pi / 2), "nonzero origin yaw")
+
 require(
     close(PriorMapStageOneMath.normalizeAngle(3 * .pi), .pi),
     "angle normalization")
+
+let updateGate = PriorMapUpdateGate(minimumInterval: 0.5)
+guard case .accepted(let firstTicket) = updateGate.begin(timestamp: 10.0) else {
+    require(false, "first update must be accepted")
+    exit(1)
+}
+require(
+    updateGate.begin(timestamp: 10.1) == .throttled,
+    "updates inside the interval must be throttled")
+require(
+    updateGate.begin(timestamp: 10.6) == .busy(droppedCount: 1),
+    "a new update must be dropped while one is in flight")
+updateGate.reset()
+guard case .accepted(let secondTicket) = updateGate.begin(timestamp: 1.0) else {
+    require(false, "reset must accept a new generation")
+    exit(1)
+}
+updateGate.finish(ticket: firstTicket)
+require(
+    updateGate.begin(timestamp: 2.0) == .busy(droppedCount: 1),
+    "a stale completion must not release a newer update")
+updateGate.finish(ticket: secondTicket)
+guard case .accepted = updateGate.begin(timestamp: 2.0) else {
+    require(false, "the active ticket completion must release the gate")
+    exit(1)
+}
 
 print("PriorMapLocalizationCore Swift tests passed")

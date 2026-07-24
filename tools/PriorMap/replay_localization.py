@@ -123,19 +123,30 @@ def replay(
     travelled = 0.0
     samples: list[dict[str, Any]] = []
     errors: list[float] = []
+    yaw_errors: list[float] = []
     previous = truth[0]
+    arkit_x = 0.0
+    arkit_y = 0.0
     for index, target in enumerate(truth):
-        travelled += math.hypot(target.x_m - previous.x_m, target.y_m - previous.y_m)
-        drift_x = travelled * float(translation_drift_per_m)
+        map_delta_x = target.x_m - previous.x_m
+        map_delta_y = target.y_m - previous.y_m
+        segment_distance = math.hypot(map_delta_x, map_delta_y)
+        travelled += segment_distance
         drift_yaw = math.radians(float(rotation_drift_deg_per_m)) * travelled
-        map_dx = target.x_m - truth[0].x_m
-        map_dy = target.y_m - truth[0].y_m
         origin_cosine = math.cos(truth[0].yaw_rad)
         origin_sine = math.sin(truth[0].yaw_rad)
-        local_x = origin_cosine * map_dx + origin_sine * map_dy
-        local_y = -origin_sine * map_dx + origin_cosine * map_dy
-        noisy_x = local_x + drift_x + rng.gauss(0.0, noise_std_m)
-        noisy_y = local_y + rng.gauss(0.0, noise_std_m)
+        local_delta_x = origin_cosine * map_delta_x + origin_sine * map_delta_y
+        local_delta_y = -origin_sine * map_delta_x + origin_cosine * map_delta_y
+        drift_cosine = math.cos(drift_yaw)
+        drift_sine = math.sin(drift_yaw)
+        arkit_x += (
+            drift_cosine * local_delta_x
+            - drift_sine * local_delta_y
+            + segment_distance * float(translation_drift_per_m)
+        )
+        arkit_y += drift_sine * local_delta_x + drift_cosine * local_delta_y
+        noisy_x = arkit_x + rng.gauss(0.0, noise_std_m)
+        noisy_y = arkit_y + rng.gauss(0.0, noise_std_m)
         arkit = Pose2D(noisy_x, noisy_y, normalize_angle(target.yaw_rad - truth[0].yaw_rad + drift_yaw))
         tracking = (
             "notAvailable"
@@ -145,7 +156,11 @@ def replay(
         update = localizer.update(arkit, tracking)
         estimated = update["estimated_pose"]
         error = math.hypot(float(estimated["x_m"]) - target.x_m, float(estimated["y_m"]) - target.y_m)
+        yaw_error = abs(
+            normalize_angle(float(estimated["yaw_rad"]) - target.yaw_rad)
+        )
         errors.append(error)
+        yaw_errors.append(yaw_error)
         samples.append(
             {
                 "index": index,
@@ -153,6 +168,7 @@ def replay(
                 "arkit_pose": arkit.as_dict(),
                 "estimated_pose": estimated,
                 "error_m": rounded(error),
+                "yaw_error_deg": rounded(math.degrees(yaw_error)),
                 "road_assignment": (
                     update["road_constraint"]["candidates"][0]["edge_id"]
                     if update["road_constraint"]["candidates"]
@@ -167,6 +183,7 @@ def replay(
         previous = target
 
     sorted_errors = sorted(errors)
+    sorted_yaw_errors = sorted(yaw_errors)
     percentile_index = min(len(sorted_errors) - 1, int(math.floor(len(sorted_errors) * 0.95)))
     report = {
         "format": "MarketScannerLocalizationReplay",
@@ -188,6 +205,13 @@ def replay(
             "mean_error_m": rounded(sum(errors) / len(errors)),
             "maximum_error_m": rounded(max(errors)),
             "p95_error_m": rounded(sorted_errors[percentile_index]),
+            "mean_yaw_error_deg": rounded(
+                math.degrees(sum(yaw_errors) / len(yaw_errors))
+            ),
+            "maximum_yaw_error_deg": rounded(math.degrees(max(yaw_errors))),
+            "p95_yaw_error_deg": rounded(
+                math.degrees(sorted_yaw_errors[percentile_index])
+            ),
             "accepted_soft_constraint_count": sum(item["constraint_accepted"] for item in samples),
             "state_counts": {
                 state: sum(item["localization_state"] == state for item in samples)
@@ -210,6 +234,7 @@ def replay(
                 "estimated_x_m",
                 "estimated_y_m",
                 "error_m",
+                "yaw_error_deg",
                 "road_assignment",
                 "localization_state",
                 "tracking_state",
@@ -224,6 +249,7 @@ def replay(
                     item["estimated_pose"]["x_m"],
                     item["estimated_pose"]["y_m"],
                     item["error_m"],
+                    item["yaw_error_deg"],
                     item["road_assignment"] or "",
                     item["localization_state"],
                     item["tracking_state"],

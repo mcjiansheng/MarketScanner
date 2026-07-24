@@ -367,6 +367,7 @@ def _road_graph(
 
 def _spatial_index(
     elements: list[dict[str, Any]],
+    graph: dict[str, Any],
     cell_size_m: float = 5.0,
 ) -> dict[str, Any]:
     floors: dict[str, dict[str, Any]] = {}
@@ -393,7 +394,37 @@ def _spatial_index(
             "cells": {
                 key: sorted(set(value))
                 for key, value in sorted(cells.items())
-            }
+            },
+            "road_cells": {},
+        }
+    node_positions = {
+        str(node["id"]): node["position_m"]
+        for node in graph.get("nodes", [])
+        if isinstance(node, dict) and len(node.get("position_m", [])) >= 2
+    }
+    road_cells_by_floor: dict[str, dict[str, list[str]]] = defaultdict(
+        lambda: defaultdict(list)
+    )
+    for edge in graph.get("edges", []):
+        start = node_positions.get(str(edge.get("from")))
+        end = node_positions.get(str(edge.get("to")))
+        if start is None or end is None:
+            continue
+        floor_id = str(edge["floor_id"])
+        min_x = math.floor(min(float(start[0]), float(end[0])) / cell_size_m)
+        max_x = math.floor(max(float(start[0]), float(end[0])) / cell_size_m)
+        min_y = math.floor(min(float(start[1]), float(end[1])) / cell_size_m)
+        max_y = math.floor(max(float(start[1]), float(end[1])) / cell_size_m)
+        for cell_x in range(min_x, max_x + 1):
+            for cell_y in range(min_y, max_y + 1):
+                road_cells_by_floor[floor_id][f"{cell_x},{cell_y}"].append(
+                    str(edge["id"])
+                )
+    for floor_id, road_cells in sorted(road_cells_by_floor.items()):
+        floor = floors.setdefault(floor_id, {"cells": {}, "road_cells": {}})
+        floor["road_cells"] = {
+            key: sorted(set(value))
+            for key, value in sorted(road_cells.items())
         }
     return {
         "format": "MarketScannerSpatialIndex",
@@ -436,6 +467,9 @@ def convert_workbook(
     floors = _floor_bounds(elements)
     if not floors:
         raise ConversionError("No valid geometry was found in the workbook.")
+    for index, floor in enumerate(floors):
+        safe_floor = SAFE_NAME.sub("-", str(floor["id"])).strip("-") or "floor"
+        floor["preview_file"] = f"preview_floor_{index + 1:03d}_{safe_floor}.png"
     base_name = SAFE_NAME.sub("-", source_path.stem).strip("-") or "map"
     prior_map_id = f"{base_name}-{source_hash[:12]}"
     output_path = (
@@ -476,6 +510,11 @@ def convert_workbook(
                 "yaw": "counter_clockwise_radians",
                 "transform": "x_m=x_cm/100; y_m=-y_cm/100; yaw_rad=-rotation_deg*pi/180",
             },
+            "localization_scope": {
+                "floor_mode": "single_floor_per_scan",
+                "cross_floor_switching": False,
+                "vertical_motion": "ignored_in_prior_map_2d_preserved_in_raw_3d",
+            },
             "floors": floors,
             "bounds": merge_bounds(
                 Bounds(
@@ -494,7 +533,7 @@ def convert_workbook(
         }
         graph = _road_graph(elements, warnings)
         manifest["warning_count"] = len(warnings) + len(result.malformed_rows)
-        spatial = _spatial_index(elements)
+        spatial = _spatial_index(elements, graph)
         shelves = [item for item in elements if item["shape_type"] == "MapShelf"]
         fixed = [
             item
@@ -532,6 +571,12 @@ def convert_workbook(
         }
         _json_write(temporary / "validation_report.json", validation_report)
         render_package(temporary)
+        for floor in floors:
+            render_package(
+                temporary,
+                temporary / str(floor["preview_file"]),
+                str(floor["id"]),
+            )
         package_validation = validate_package(temporary)
         if not package_validation["valid"]:
             raise ConversionError(

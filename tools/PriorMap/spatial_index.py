@@ -14,12 +14,14 @@ class PriorMapSpatialIndex:
         self,
         cell_size_m: float,
         floor_cells: dict[str, dict[str, list[str]]],
+        floor_road_cells: dict[str, dict[str, list[str]]],
         elements: dict[str, dict[str, Any]],
     ) -> None:
         if cell_size_m <= 0:
             raise ValueError("Spatial-index cell size must be positive.")
         self.cell_size_m = float(cell_size_m)
         self.floor_cells = floor_cells
+        self.floor_road_cells = floor_road_cells
         self.elements = elements
 
     @classmethod
@@ -34,7 +36,36 @@ class PriorMapSpatialIndex:
             str(floor_id): floor.get("cells", {})
             for floor_id, floor in payload.get("floors", {}).items()
         }
-        return cls(float(payload["cell_size_m"]), floor_cells, elements)
+        floor_road_cells = {
+            str(floor_id): floor.get("road_cells", {})
+            for floor_id, floor in payload.get("floors", {}).items()
+        }
+        return cls(
+            float(payload["cell_size_m"]),
+            floor_cells,
+            floor_road_cells,
+            elements,
+        )
+
+    def _query_cells(
+        self,
+        floor_cells: dict[str, dict[str, list[str]]],
+        floor_id: str,
+        x_m: float,
+        y_m: float,
+        radius_m: float,
+    ) -> list[str]:
+        radius = max(0.0, float(radius_m))
+        minimum_x = math.floor((float(x_m) - radius) / self.cell_size_m)
+        maximum_x = math.floor((float(x_m) + radius) / self.cell_size_m)
+        minimum_y = math.floor((float(y_m) - radius) / self.cell_size_m)
+        maximum_y = math.floor((float(y_m) + radius) / self.cell_size_m)
+        cells = floor_cells.get(str(floor_id), {})
+        identifiers: set[str] = set()
+        for cell_x in range(minimum_x, maximum_x + 1):
+            for cell_y in range(minimum_y, maximum_y + 1):
+                identifiers.update(cells.get(f"{cell_x},{cell_y}", []))
+        return sorted(identifiers)
 
     def query_ids(
         self,
@@ -43,17 +74,28 @@ class PriorMapSpatialIndex:
         y_m: float,
         radius_m: float = 0.0,
     ) -> list[str]:
-        radius = max(0.0, float(radius_m))
-        minimum_x = math.floor((float(x_m) - radius) / self.cell_size_m)
-        maximum_x = math.floor((float(x_m) + radius) / self.cell_size_m)
-        minimum_y = math.floor((float(y_m) - radius) / self.cell_size_m)
-        maximum_y = math.floor((float(y_m) + radius) / self.cell_size_m)
-        cells = self.floor_cells.get(str(floor_id), {})
-        identifiers: set[str] = set()
-        for cell_x in range(minimum_x, maximum_x + 1):
-            for cell_y in range(minimum_y, maximum_y + 1):
-                identifiers.update(cells.get(f"{cell_x},{cell_y}", []))
-        return sorted(identifiers)
+        return self._query_cells(
+            self.floor_cells,
+            floor_id,
+            x_m,
+            y_m,
+            radius_m,
+        )
+
+    def query_road_edge_ids(
+        self,
+        floor_id: str,
+        x_m: float,
+        y_m: float,
+        radius_m: float = 0.0,
+    ) -> list[str]:
+        return self._query_cells(
+            self.floor_road_cells,
+            floor_id,
+            x_m,
+            y_m,
+            radius_m,
+        )
 
     def query(
         self,

@@ -241,6 +241,20 @@ class PriorMapConversionTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temp.cleanup()
 
+    def corrupted_package(self, source: Path, name: str) -> Path:
+        destination = self.root / name
+        shutil.copytree(source, destination)
+        return destination
+
+    @staticmethod
+    def rewrite_json(path: Path, mutate: object) -> None:
+        value = json.loads(path.read_text(encoding="utf-8"))
+        mutate(value)
+        path.write_text(
+            json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+
     def test_conversion_preserves_supported_unknown_hidden_and_business_fields(self) -> None:
         package = convert_workbook(self.workbook, self.root / "package")
         manifest = json.loads((package / "manifest.json").read_text())
@@ -272,6 +286,73 @@ class PriorMapConversionTests(unittest.TestCase):
         identifiers = index.query_ids("1", 2.5, -2.5, 1.0)
         self.assertIn("f1-r2", identifiers)
         self.assertNotIn("f1-r3", identifiers)
+        self.assertEqual(index.query_road_edge_ids("1", 5.0, -5.0, 0.5), ["1:1--2"])
+
+    def test_spatial_road_query_does_not_scan_a_large_index(self) -> None:
+        road_cells = {
+            f"{cell_x},{cell_y}": [f"edge-{cell_x}-{cell_y}"]
+            for cell_x in range(100)
+            for cell_y in range(100)
+        }
+        index = PriorMapSpatialIndex(5.0, {}, {"1": road_cells}, {})
+        nearby = index.query_road_edge_ids("1", 252.0, 252.0, 1.0)
+        self.assertEqual(nearby, ["edge-50-50"])
+        self.assertLess(len(nearby), len(road_cells) // 100)
+
+    def test_validator_rejects_corrupt_or_cross_file_inconsistent_packages(self) -> None:
+        package = convert_workbook(self.workbook, self.root / "package")
+        cases: list[tuple[str, str, object]] = [
+            (
+                "bad-hash",
+                "manifest.json",
+                lambda value: value.__setitem__("source_sha256", "not-a-sha"),
+            ),
+            (
+                "bad-count",
+                "manifest.json",
+                lambda value: value.__setitem__("element_count", 999),
+            ),
+            (
+                "bad-bounds",
+                "manifest.json",
+                lambda value: value["floors"][0]["bounds"].__setitem__("max_x_m", 999),
+            ),
+            (
+                "bad-shelves",
+                "shelves.json",
+                lambda value: value.__setitem__("shelves", []),
+            ),
+            (
+                "bad-road",
+                "road_graph.json",
+                lambda value: value["edges"][0].__setitem__("to", "missing"),
+            ),
+            (
+                "bad-spatial-road",
+                "spatial_index.json",
+                lambda value: value["floors"]["1"]["road_cells"].__setitem__(
+                    "0,0", ["missing-edge"]
+                ),
+            ),
+            (
+                "bad-report",
+                "validation_report.json",
+                lambda value: value["summary"].__setitem__("floor_count", 99),
+            ),
+        ]
+        for name, filename, mutate in cases:
+            with self.subTest(name=name):
+                corrupted = self.corrupted_package(package, name)
+                self.rewrite_json(corrupted / filename, mutate)
+                self.assertFalse(validate_package(corrupted)["valid"])
+
+        invalid_json = self.corrupted_package(package, "invalid-json")
+        (invalid_json / "fixed_structures.json").write_text("{", encoding="utf-8")
+        self.assertFalse(validate_package(invalid_json)["valid"])
+
+        invalid_png = self.corrupted_package(package, "invalid-png")
+        (invalid_png / "preview.png").write_bytes(b"\x89PNG\r\n\x1a\ntruncated")
+        self.assertFalse(validate_package(invalid_png)["valid"])
 
     def test_conversion_is_reproducible(self) -> None:
         first = convert_workbook(self.workbook, self.root / "first")
@@ -305,6 +386,28 @@ class PriorMapConversionTests(unittest.TestCase):
         self.assertGreaterEqual(report["summary"]["state_counts"]["lost"], 2)
         self.assertTrue(any(item["road_assignment"] for item in report["samples"]))
         self.assertGreaterEqual(report["summary"]["maximum_error_m"], 0.0)
+        self.assertGreater(report["summary"]["maximum_yaw_error_deg"], 0.0)
+
+    def test_rotation_drift_changes_xy_and_reports_yaw_error(self) -> None:
+        package = convert_workbook(self.workbook, self.root / "package")
+        baseline = replay(package, self.root / "baseline", floor_id="1", seed=12)
+        rotated = replay(
+            package,
+            self.root / "rotated",
+            floor_id="1",
+            rotation_drift_deg_per_m=3.0,
+            seed=12,
+        )
+        self.assertEqual(baseline["summary"]["maximum_yaw_error_deg"], 0.0)
+        self.assertGreater(rotated["summary"]["maximum_yaw_error_deg"], 0.0)
+        self.assertGreater(
+            rotated["summary"]["maximum_error_m"],
+            baseline["summary"]["maximum_error_m"],
+        )
+        self.assertNotEqual(
+            rotated["samples"][-1]["estimated_pose"],
+            baseline["samples"][-1]["estimated_pose"],
+        )
 
 
 class StageOneLocalizerTests(unittest.TestCase):
@@ -336,6 +439,26 @@ class StageOneLocalizerTests(unittest.TestCase):
         self.assertAlmostEqual(calibrated["raw_pose"]["x_m"], 8.0, places=6)
         self.assertAlmostEqual(calibrated["raw_pose"]["y_m"], 0.0, places=6)
         self.assertAlmostEqual(calibrated["raw_pose"]["yaw_rad"], -0.5, places=6)
+
+    def test_manual_calibration_reduces_a_known_initial_alignment_error(self) -> None:
+        localizer = StageOneLocalizer(
+            self.single_road_graph(),
+            "1",
+            Pose2D(0, 2, 0),
+        )
+        before = localizer.update(Pose2D(2, 0, 0))
+        before_error = math.hypot(
+            before["estimated_pose"]["x_m"] - 2,
+            before["estimated_pose"]["y_m"],
+        )
+        localizer.manual_calibrate(Pose2D(2, 0, 0), Pose2D(2, 0, 0))
+        after = localizer.update(Pose2D(2, 0, 0))
+        after_error = math.hypot(
+            after["estimated_pose"]["x_m"] - 2,
+            after["estimated_pose"]["y_m"],
+        )
+        self.assertGreater(before_error, 0.0)
+        self.assertAlmostEqual(after_error, 0.0, places=6)
 
     def test_wrong_start_outside_candidate_radius_stays_weak_without_jump(self) -> None:
         localizer = StageOneLocalizer(
@@ -378,7 +501,21 @@ class StageOneLocalizerTests(unittest.TestCase):
         result = localizer.update(Pose2D(2, 0, 0))
         correction = abs(result["estimated_pose"]["y_m"] - result["raw_pose"]["y_m"])
         self.assertTrue(result["road_constraint"]["accepted"])
+        self.assertEqual(result["road_constraint"]["candidates"][0]["edge_id"], "road")
         self.assertLessEqual(correction, 0.200001)
+
+    def test_tracking_states_drive_explicit_localization_transitions(self) -> None:
+        localizer = StageOneLocalizer(
+            self.single_road_graph(),
+            "1",
+            Pose2D(0, 0, 0),
+        )
+        self.assertEqual(localizer.update(Pose2D(1, 0, 0), "normal")["localization_state"], "stable")
+        self.assertEqual(localizer.update(Pose2D(1, 0, 0), "limited")["localization_state"], "weak")
+        self.assertEqual(
+            localizer.update(Pose2D(1, 0, 0), "notAvailable")["localization_state"],
+            "lost",
+        )
 
 
 if __name__ == "__main__":

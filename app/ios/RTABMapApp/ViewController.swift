@@ -32,8 +32,7 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
     private var priorMapLocalizer: PriorMapStageOneLocalizer?
     private var priorMapOverlay: PriorMapLiveMapView?
     private var priorMapLatestUpdate: PriorMapLocalizationUpdate?
-    private var priorMapLastUpdateAt: TimeInterval = 0
-    private var priorMapUpdateInFlight = false
+    private let priorMapUpdateGate = PriorMapUpdateGate(minimumInterval: 0.5)
     private var priorMapGeneration = UUID()
     private let priorMapQueue = DispatchQueue(
         label: "com.introlab.rtabmap.prior-map-localization",
@@ -2455,7 +2454,7 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
             ])
             priorMapOverlay = overlay
             priorMapGeneration = UUID()
-            priorMapLastUpdateAt = 0
+            priorMapUpdateGate.reset()
             return true
         }
         catch {
@@ -2476,7 +2475,7 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         priorMapGeneration = UUID()
         priorMapLocalizer = nil
         priorMapLatestUpdate = nil
-        priorMapLastUpdateAt = 0
+        priorMapUpdateGate.reset()
         let overlay = priorMapOverlay
         priorMapOverlay = nil
         if Thread.isMainThread {
@@ -2494,11 +2493,25 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         trackingState: String
     ) {
         guard activeScanConfiguration.workflowMode == .priorMapLocalized,
-              let localizer = priorMapLocalizer,
-              frame.timestamp - priorMapLastUpdateAt >= 0.5 else {
+              let localizer = priorMapLocalizer else {
             return
         }
-        priorMapLastUpdateAt = frame.timestamp
+        let ticket: Int
+        switch priorMapUpdateGate.begin(timestamp: frame.timestamp) {
+        case .throttled:
+            return
+        case .busy(let droppedCount):
+            if droppedCount == 1 || droppedCount % 20 == 0 {
+                supermarketSession?.appendScanEvent(
+                    level: "warning",
+                    event: "prior_map_update_dropped",
+                    message: "Skipped a stale prior-map update while the previous one was still running",
+                    fields: ["dropped_count": String(droppedCount)])
+            }
+            return
+        case .accepted(let acceptedTicket):
+            ticket = acceptedTicket
+        }
         let generation = priorMapGeneration
         let transform = frame.camera.transform
         let timestamp = frame.timestamp
@@ -2507,6 +2520,7 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                 transform: transform,
                 timestamp: timestamp,
                 trackingState: trackingState)
+            self.priorMapUpdateGate.finish(ticket: ticket)
             guard generation == self.priorMapGeneration else {
                 return
             }

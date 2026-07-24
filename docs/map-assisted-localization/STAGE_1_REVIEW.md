@@ -1,94 +1,78 @@
-# 阶段一实现自审记录
+# 阶段一代码审查与整改记录
 
-> 文档状态：**当前有效**。最后核对日期：2026-07-24。
-> 审查性质：实现会话内的只读 Pass A 与修复复验，不冒充独立 Review Agent。合并前仍建议由另一会话按测试审查 Prompt 复核。
+> 文档状态：**当前有效，整改完成后待独立复审**。最后核对日期：2026-07-24。
+> 审查来源：用户提供的独立审查文档 `MarketScanner_STAGE_1_CODE_REVIEW_UPDATED.md`。该审查结论为 **REJECTED**；本文件记录对应整改，不把实现者自测写成独立批准。
 
-## 范围与环境
+## 范围
 
-- 基线：`b390b98`；
-- 分支：`feature/prior-map-localization`；
-- 平台：macOS arm64，Xcode 真机 SDK，无代码签名构建；
-- 用户样例：`map/mapcase01/mapcase01.xlsx`，仅只读使用并由根 `.gitignore` 排除；
-- 范围：先验地图转换、道路图/空间索引、Map Studio 导入、iOS 双模式与五步向导、阶段一道路软约束、sidecar、回放和文档；
-- 排除：阶段二 LiDAR/视觉扫描匹配、条码和价签测量，阶段三 PC 复核发布。
+- 先验地图转换、schema、道路图/空间索引和逐楼层预览；
+- Map Studio 导入和检查；
+- iOS 双模式、五步向导、ARKit 水平位姿、道路软约束和审计 sidecar；
+- 合成/记录轨迹回放；
+- 阶段一明确只支持单次扫描绑定一个楼层。
 
-## 需求覆盖矩阵
+阶段一仍不包含 LiDAR/视觉结构自动匹配、条码/价签测量或 PC 价签复核。
 
-| 审查项 | 结论 | 证据 |
+## 独立审查问题与整改
+
+| 等级 | 审查问题 | 整改 |
 | --- | --- | --- |
-| 六类元素、损坏 JSON、未知/隐藏元素 | 通过 | `tools/PriorMap/tests/test_prior_map.py` |
-| 唯一 cm→m/轴向/旋转实现 | 通过 | `coordinate_system.py`、关键坐标测试、样例预览 |
-| 旋转 polygon、bounds、SHA-256、可复现 | 通过 | 转换测试；样例 hash `0cf694…4906` |
-| 道路 ID 归一、连通统计、5 m 有界索引 | 通过 | road graph/spatial index 数值测试 |
-| PC 导入、进度、统计、warning、artifact 安全 | 通过 | Map Studio API 测试与 artifact allowlist |
-| 自由扫描旧流程 | 通过 | 默认 `free_mapping`；storage `scanMode=continuous_streaming` 不变；53 项回归通过 |
-| iOS 双模式与五步向导 | 通过（构建/代码） | arm64 iphoneos 完整构建；地图/楼层/锚点/起点方向/设备检查 |
-| SE(2) 投影和模式门控 | 通过 | 自动编译运行 `PriorMapLocalizationCore.swift` |
-| 道路软约束与跨通道安全 | 通过 | Top-3、歧义拒绝、0.15 gain、0.25 m 上限测试 |
-| weak/lost 保留原始扫描 | 通过（代码/回放） | 定位队列不控制 RTAB-Map 记录；tracking loss 回放 |
-| 人工校准审计 | 通过（代码） | `manual_localization_events.jsonl` 和 scan event |
-| 原始数据库不可变 | 通过 | 新功能不打开/重写 PC 输入 DB；手机沿用原连续写入职责 |
-| 文档真实性 | 通过 | `IMPLEMENTATION_STATUS.md` 明确阶段二/三与可选增强未实现 |
+| HIGH | ARKit `x/z`、地图 `x/y`、yaw 和 UI 箭头定义不一致 | 统一为 ARKit `+x -> map +x`、ARKit `-z -> map +y`，map yaw 0 指向 `+y`、逆时针为正；增加恒等、前后左右和非零原点 Swift 金标 |
+| MEDIUM | 校验器主要检查文件存在，缺少跨文件一致性 | 解析全部 JSON/PNG；核对 hash、count、bounds、子集、道路引用、结构/道路索引完整覆盖、验证报告统计和逐楼层预览；增加损坏包负向测试 |
+| MEDIUM | 旋转漂移只改 yaw，没有影响 XY，测试不足 | 回放改为逐段积分带旋转漂移的局部位移；报告 mean/max/p95 yaw 误差；测试断言旋转漂移改变 XY 误差 |
+| MEDIUM | iOS 未使用空间索引，in-flight 门控未生效 | 地图包增加 `road_cells`；iOS 只查询附近道路边；同一时刻只执行一个更新，忙时丢弃并记录计数 |
+| MEDIUM | iOS 更新缓存采用先删后拷贝 | 改为临时目录复制、完整加载校验，再原子 move/replace；失败时保留外部源包和旧缓存 |
+| MEDIUM | 设备检查把 ARKit tracking 硬编码为成功 | 相机权限按系统状态请求/显示，检查设备是否支持世界跟踪；运行时 tracking 在扫描启动后实时报告，不再预先标绿 |
+| 文档 | 多楼层、回放路线和完成度表述过强 | 明确一个地图包可含多层，但一次扫描固定一层；当前回放是道路图合成遍历而非业务蛇形路线；保留独立审查 REJECTED 事实 |
 
-## 测试证据
+## 单楼层边界
+
+- 五步向导开始前选择一个 `floorId`，整个连续扫描保持不变；
+- 不支持楼梯、电梯、自动切层或跨层重定位；
+- 同一楼层内可以有坡道、地面起伏等少量竖直位移；
+- 二维先验位姿忽略 ARKit 竖直 `y`，原始 ARKit/RTAB-Map 连续数据库仍保留完整三维运动；
+- 地图包为每层生成独立预览，HUD 和起点选择只显示本次目标楼层。
+
+## 自动验证证据
+
+当前整改新增/加强的测试包括：
+
+- ARKit 水平坐标与 UI 朝向金标；
+- 损坏 JSON/PNG、错误 hash/count/bounds/子集/道路引用/空间索引/验证报告拒绝；
+- 大型道路网格附近查询；
+- 平移与旋转漂移、XY/yaw 误差、tracking 状态转换；
+- 人工校准前后误差和实际道路边 ID；
+- 地图包逐字节可复现和逐楼层预览。
+
+完整命令和现场干跑步骤见 `TEST_PLAN.md`。自动测试与真机构建结果应以当前提交的 CI/本地复验输出为准，不以旧审查记录代替。
+
+本次整改提交前复验：
 
 ```text
-PriorMap unittest: 10 passed
+PriorMap unittest: 15 passed
 Map Studio unittest: 53 passed
-Python py_compile: passed
-JavaScript node --check: passed
-Swift parse: passed
+Python py_compile / JavaScript node --check / project.pbxproj plutil: passed
+mapcase01 实转与校验: valid，1563 elements，floor 1/2 独立预览，源 SHA-256 不变
+500 点回放: 8 lost samples，输出 XY 与 yaw 误差
 Xcode iphoneos arm64 Debug build, CODE_SIGNING_ALLOWED=NO: passed
-project.pbxproj plutil: passed
 git diff --check: passed
 ```
 
-样例实转结果：
+## 仍需独立验证
 
-```text
-elements=1563
-floors=1,2
-road nodes=281
-road edges=333
-connected components=3
-malformed rows=0
-package validation=valid
-```
+1. 在支持 ARKit/LiDAR 的真实 iPhone 上完成相机权限、文件选择器、地图缓存替换、tracking 中断、结束落盘和 sidecar 干跑。
+2. 用具有长直线和转弯的记录轨迹复核旋转漂移与人工校准，不把合成道路遍历当作现场精度证据。
+3. 由独立审查者复核整改 diff，重新给出批准或拒绝结论。
 
-带平移/旋转漂移、随机噪声和 8 帧 tracking loss 的 500 点回放成功生成误差、道路分配、状态统计和 CSV trace。阶段一道路约束仅修正横向小误差，不承诺消除长距离 ARKit 纵向漂移。
+## 数据与提交边界
 
-## 问题分级与处置
+- `map/`、`AGENTS.md`、`doc/.local/`、`.workbuddy-ai/` 和 `.workbuddy/` 不提交；
+- 不提交 `.db`、扫描图像、checkpoint、DerivedData 或转换输出；
+- 源 XLSX、外部地图包和原始扫描数据库保持只读；
+- 转换和 iOS 缓存更新均采用临时目录验证后发布。
 
-### BLOCKER / HIGH
+## 当前结论
 
-无未解决项。
+**REMEDIATED — PENDING INDEPENDENT RE-REVIEW**
 
-审查中发现导入地图包原先直接使用 manifest ID 组成缓存目录，恶意 ID 可能造成路径边界风险。已改为校验 64 位十六进制来源摘要，并只用摘要前缀组成缓存目录；修复后真机构建通过。
-
-### MEDIUM
-
-1. 尚未在真实支持 LiDAR 的 iPhone 上完成向导、ARKit 中断、结束落盘的办公室干跑。自动构建与数值测试不能替代相机权限、文件选择器和生命周期实测。
-2. 当前 App 复用上游首页并提供双模式入口，尚未重构为完整五入口业务首页；不影响阶段一采集链路，但属于后续 UX 收敛。
-
-### LOW
-
-1. 外部预定路线文件导入尚未实现；当前可选锚点和道路图 synthetic 蛇形路线已覆盖阶段一定位/回放接口。
-2. 仓库真机静态库不能链接 Simulator；arm64 iphoneos 构建成功。这是现有依赖产物边界，应在后续依赖升级时处理。
-
-## 数据安全与 Git
-
-- `map/` 被根 `.gitignore` 排除；
-- `.workbuddy-ai/`、`.workbuddy/` 属于用户现有未跟踪文件，不纳入阶段一；
-- 未生成或提交 `.db`、扫描图像、checkpoint、DerivedData 或转换输出；
-- 样例转换与回放输出位于 `/private/tmp`；
-- Map Studio 输出要求不存在或为空目录，转换采用同父目录临时目录后原子 rename；
-- iOS 只复制已选择的地图包到应用 `Documents/PriorMaps`，不修改外部源包。
-
-## 结论
-
-**APPROVED WITH CONDITIONS**
-
-代码、格式、回放、PC 回归和 arm64 真机构建满足阶段一软件验收。合并或开始阶段二前，条件是：
-
-1. 在支持 ARKit/LiDAR 的 iPhone 完成 `FIELD_TEST_PLAN.md` 中的阶段一办公室干跑；
-2. 使用独立会话复核本记录和最终提交范围，尤其检查 UI 生命周期与 sidecar 实际落盘。
+独立审查提出的一个 HIGH 和五个 MEDIUM 代码问题已逐项整改并增加回归覆盖；正式结论仍由后续独立复审和真实 iPhone 干跑决定。
