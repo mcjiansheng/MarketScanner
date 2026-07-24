@@ -28,8 +28,11 @@ from urllib.parse import unquote, urlparse
 APP_DIR = Path(__file__).resolve().parent
 WEB_DIR = APP_DIR / "web"
 MAPPER_DIR = APP_DIR.parent / "Supermarket2DMap"
+PRIOR_MAP_DIR = APP_DIR.parent / "PriorMap"
 if str(MAPPER_DIR) not in sys.path:
     sys.path.insert(0, str(MAPPER_DIR))
+if str(APP_DIR.parent) not in sys.path:
+    sys.path.insert(0, str(APP_DIR.parent))
 
 import supermarket_2d_map as base
 import supermarket_multi_device_map as multi
@@ -37,6 +40,8 @@ import supermarket_staged_map as staged
 import offline_processing as offline
 import gpu_acceleration as gpu
 import merge_processing as merge
+from PriorMap.prior_map_schema import validate_package as validate_prior_map_package
+from PriorMap.xlsx_to_prior_map import convert_workbook as convert_prior_map_workbook
 
 
 ARTIFACTS = (
@@ -63,6 +68,13 @@ ARTIFACTS = (
     "merge_edits.json",
     "merge_manifest.json",
     "merge_report.json",
+    "manifest.json",
+    "elements.json",
+    "shelves.json",
+    "fixed_structures.json",
+    "road_graph.json",
+    "spatial_index.json",
+    "validation_report.json",
 )
 
 
@@ -397,9 +409,20 @@ def job_payload(job: Job) -> Dict[str, Any]:
     }
     if job.status == "complete":
         payload["artifacts"] = job_artifacts(job)
-        payload["quality_report"] = load_json(job.output_dir / "quality_report.json", {})
-        payload["review_items"] = load_json(job.output_dir / "review_items.json", {"items": []})
-        payload["map"] = load_json(job.output_dir / "map.json", {})
+        if job.kind == "prior_map":
+            validation = load_json(job.output_dir / "validation_report.json", {})
+            payload["quality_report"] = {
+                "warnings": validation.get("warnings", []),
+                "prior_map": validation.get("summary", {}),
+            }
+            payload["review_items"] = {
+                "items": validation.get("malformed_rows", [])
+            }
+            payload["map"] = load_json(job.output_dir / "manifest.json", {})
+        else:
+            payload["quality_report"] = load_json(job.output_dir / "quality_report.json", {})
+            payload["review_items"] = load_json(job.output_dir / "review_items.json", {"items": []})
+            payload["map"] = load_json(job.output_dir / "map.json", {})
     return payload
 
 
@@ -1096,6 +1119,75 @@ def start_job(data: Dict[str, Any]) -> Job:
     return job
 
 
+def start_prior_map_job(data: Dict[str, Any]) -> Job:
+    source = resolve_path(data.get("xlsx"), "Prior-map workbook")
+    if not source.is_file() or source.suffix.lower() != ".xlsx":
+        raise RequestError("请选择包含 Element Info 工作表的 .xlsx 地图文件。")
+    output = resolve_path(data.get("output"), "Prior-map output directory")
+    if output.exists() and (not output.is_dir() or any(output.iterdir())):
+        raise RequestError("先验地图输出目录必须为空；源 Excel 不会被修改。")
+    if not output.parent.is_dir():
+        raise RequestError(f"先验地图输出目录的上级目录不存在：{output.parent}")
+    job = STATE.add("prior_map", output, (str(source),))
+
+    def worker() -> None:
+        STATE.set_status(job.identifier, "running")
+        STATE.update_progress(
+            job.identifier,
+            5,
+            "读取先验地图",
+            "正在读取 Element Info；源 Excel 保持只读。",
+        )
+        try:
+            STATE.update_progress(
+                job.identifier,
+                25,
+                "转换坐标与几何",
+                "正在统一厘米、坐标轴、旋转矩形和楼层范围。",
+            )
+            convert_prior_map_workbook(
+                source,
+                output,
+                str(data.get("name") or "").strip() or None,
+            )
+            STATE.update_progress(
+                job.identifier,
+                82,
+                "校验地图包",
+                "正在检查道路连通性、空间索引和版本化文件。",
+            )
+            validation = validate_prior_map_package(output)
+            if not validation["valid"]:
+                raise RequestError(
+                    "地图包校验失败："
+                    + "；".join(item["message"] for item in validation["errors"])
+                )
+            STATE.update_progress(
+                job.identifier,
+                98,
+                "生成预览",
+                "地图包和可缩放预览已生成；可安全用于手机导入。",
+            )
+        except Exception as exc:
+            STATE.update_progress(
+                job.identifier,
+                99,
+                "导入失败",
+                f"地图未发布，源 Excel 不受影响：{exc}",
+            )
+            STATE.set_status(job.identifier, "failed", str(exc))
+            print(traceback.format_exc(), file=sys.stderr, flush=True)
+        else:
+            STATE.set_status(job.identifier, "complete")
+
+    threading.Thread(
+        target=worker,
+        name=f"map-studio-prior-map-{job.identifier}",
+        daemon=True,
+    ).start()
+    return job
+
+
 def choose_path(mode: str, title: str) -> str:
     if mode not in {"directory", "file"}:
         raise RequestError("Dialog mode must be directory or file.")
@@ -1181,6 +1273,24 @@ class StudioHandler(BaseHTTPRequestHandler):
             if path == "/api/session/result":
                 job = find_existing_result(require_session(data.get("session")))
                 self.send_json(HTTPStatus.OK, {"found": job is not None, "job": job_payload(job) if job else None})
+                return
+            if path == "/api/prior-map/convert":
+                job = start_prior_map_job(data)
+                self.send_json(HTTPStatus.ACCEPTED, job_payload(job))
+                return
+            if path == "/api/prior-map/inspect":
+                package = resolve_path(data.get("package"), "Prior-map package")
+                validation = validate_prior_map_package(package)
+                self.send_json(
+                    HTTPStatus.OK if validation["valid"] else HTTPStatus.BAD_REQUEST,
+                    {
+                        **validation,
+                        "manifest": load_json(package / "manifest.json", {}),
+                        "validation_report": load_json(
+                            package / "validation_report.json", {}
+                        ),
+                    },
+                )
                 return
             if path == "/api/jobs":
                 job = start_job(data)

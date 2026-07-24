@@ -7,6 +7,7 @@
 /doc/.local/
 /AGENTS.md
 /扫描结果/
+/map/
 /app/ios/RTABMapApp/Libraries/
 /corelib/include/rtabmap/core/Version.h
 /corelib/include/rtabmap/core/rtabmap_core_export.h

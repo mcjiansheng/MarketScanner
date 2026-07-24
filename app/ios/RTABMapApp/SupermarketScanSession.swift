@@ -62,6 +62,16 @@ struct ScanSegmentMetadata: Codable {
     /// semantic shelf map; the authoritative geometry remains in the RGB-D
     /// database and is reconstructed on the PC.
     let structureCoverage: ScanStructureCoverageSummary?
+    /// Business workflow mode is separate from `scanMode`, which remains the
+    /// storage-layout compatibility marker (`continuous_streaming`).
+    let formatVersion: Int?
+    let workflowMode: String?
+    let priorMapId: String?
+    let priorMapSha256: String?
+    let floorId: String?
+    let initialMapPose: PriorMapPose2D?
+    let localizationTrace: String?
+    let manualLocalizationEvents: String?
 }
 
 struct ScanAreaCells: Codable {
@@ -153,6 +163,22 @@ struct ScanLiveCheckpoint: Codable {
     let sensorEndPose: ScanSensorPose?
     let captureHealth: ScanCaptureHealth
     let structureCoverage: ScanStructureCoverageSummary?
+    let workflowMode: String?
+    let priorMapId: String?
+    let priorMapSha256: String?
+    let floorId: String?
+    let initialMapPose: PriorMapPose2D?
+}
+
+struct ManualLocalizationEvent: Codable {
+    let format: String
+    let version: Int
+    let timestamp: String
+    let timestampUnix: TimeInterval
+    let trackingSessionId: String
+    let reason: String
+    let arkitPose: PriorMapPose2D
+    let confirmedMapPose: PriorMapPose2D
 }
 
 struct ScanEventRecord: Codable {
@@ -257,6 +283,7 @@ final class SupermarketScanSession {
     private let captureLock = NSRecursiveLock()
     private let sidecarWriteLock = NSLock()
     private let eventLogLock = NSLock()
+    private let localizationLogLock = NSLock()
     private var customBaseDirectory: URL?
     private(set) var rootDirectory: URL?
     private(set) var segmentIndex: Int = 0
@@ -287,6 +314,7 @@ final class SupermarketScanSession {
     private var latestStructureCoverageSummary: ScanStructureCoverageSummary?
     private let maximumTrajectorySamples = 50_000
     private var nextTagId: Int = 1
+    private(set) var scanConfiguration = PriorMapScanConfiguration.freeMapping
 
     private var finalizingScan = false
     var isFinalizingScan: Bool {
@@ -322,6 +350,12 @@ final class SupermarketScanSession {
 
     func setCustomBaseDirectory(_ url: URL?) {
         customBaseDirectory = url
+    }
+
+    func configureScan(_ configuration: PriorMapScanConfiguration) {
+        captureLock.lock()
+        defer { captureLock.unlock() }
+        scanConfiguration = configuration
     }
 
     func clearCustomBaseDirectory() {
@@ -382,6 +416,7 @@ final class SupermarketScanSession {
         rootDirectory = nil
         segmentIndex = 0
         nextTagId = 1
+        scanConfiguration = .freeMapping
         resetCurrentSegment()
     }
 
@@ -682,7 +717,12 @@ final class SupermarketScanSession {
             thermalState: thermalState,
             sensorEndPose: sensorEndPose,
             captureHealth: captureHealthLocked(),
-            structureCoverage: latestStructureCoverageSummary)
+            structureCoverage: latestStructureCoverageSummary,
+            workflowMode: scanConfiguration.workflowMode.rawValue,
+            priorMapId: scanConfiguration.priorMapId,
+            priorMapSha256: scanConfiguration.priorMapSha256,
+            floorId: scanConfiguration.floorId,
+            initialMapPose: scanConfiguration.initialMapPose)
     }
 
     private func captureHealthLocked() -> ScanCaptureHealth {
@@ -754,6 +794,18 @@ final class SupermarketScanSession {
                 options: .atomic)
         }
 
+        if scanConfiguration.workflowMode == .priorMapLocalized {
+            for fileName in [
+                "localization_trace.jsonl",
+                "manual_localization_events.jsonl",
+            ] {
+                let url = segmentDirectory.appendingPathComponent(fileName)
+                if !fileManager.fileExists(atPath: url.path) {
+                    try Data().write(to: url, options: .atomic)
+                }
+            }
+        }
+
         if snapshot.metadata.finalized == true {
             // A final metadata.json supersedes the crash-recovery heartbeat.
             try? fileManager.removeItem(
@@ -811,6 +863,70 @@ final class SupermarketScanSession {
         }
         catch {
             print("Could not append scan event log: \(error)")
+        }
+    }
+
+    func appendLocalizationTrace(_ update: PriorMapLocalizationUpdate) {
+        appendLocalizationRecord(
+            update,
+            fileName: "localization_trace.jsonl")
+    }
+
+    func appendManualLocalizationEvent(
+        reason: String,
+        arkitPose: PriorMapPose2D,
+        confirmedMapPose: PriorMapPose2D
+    ) {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let now = Date()
+        let event = ManualLocalizationEvent(
+            format: "MarketScannerManualLocalizationEvent",
+            version: 1,
+            timestamp: formatter.string(from: now),
+            timestampUnix: now.timeIntervalSince1970,
+            trackingSessionId: trackingSessionId,
+            reason: reason,
+            arkitPose: arkitPose,
+            confirmedMapPose: confirmedMapPose)
+        appendLocalizationRecord(
+            event,
+            fileName: "manual_localization_events.jsonl")
+    }
+
+    private func appendLocalizationRecord<T: Encodable>(
+        _ record: T,
+        fileName: String
+    ) {
+        let directory: URL
+        do {
+            directory = try currentSegmentDirectory()
+        }
+        catch {
+            print("Could not create localization log directory: \(error)")
+            return
+        }
+        localizationLogLock.lock()
+        defer { localizationLogLock.unlock() }
+        do {
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.sortedKeys]
+            var data = try encoder.encode(record)
+            data.append(0x0A)
+            let url = directory.appendingPathComponent(fileName)
+            if !fileManager.fileExists(atPath: url.path) {
+                try data.write(to: url, options: .atomic)
+            }
+            else {
+                let handle = try FileHandle(forWritingTo: url)
+                handle.seekToEndOfFile()
+                handle.write(data)
+                handle.synchronizeFile()
+                handle.closeFile()
+            }
+        }
+        catch {
+            print("Could not append localization record: \(error)")
         }
     }
 

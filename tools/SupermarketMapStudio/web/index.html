@@ -27,6 +27,7 @@
     <nav class="mode-tabs" aria-label="处理模式">
       <button class="tab is-active" type="button" data-mode="single">单设备处理</button>
       <button class="tab" type="button" data-mode="multi">多设备合并</button>
+      <button class="tab" type="button" data-mode="prior">导入/管理先验地图</button>
     </nav>
 
     <section class="workbench" aria-label="地图处理工作台">
@@ -86,7 +87,31 @@
           <button id="run-multi" class="primary full" type="button">合并多设备</button>
         </section>
 
-        <details class="advanced-options">
+        <section class="mode-panel" data-panel="prior" aria-label="先验地图导入">
+          <p class="mode-explanation">把已有货架结构 Excel 转换为手机和 PC 共用的版本化地图包。源 Excel 只读，不会被改写。</p>
+          <div class="field-row">
+            <label for="prior-xlsx">货架结构 Excel</label>
+            <div class="path-control">
+              <input id="prior-xlsx" class="path-input" type="text" spellcheck="false" placeholder="请选择包含 Element Info 的 .xlsx">
+              <button class="secondary" type="button" data-pick-file="prior-xlsx" data-title="选择先验地图 Excel">选择文件</button>
+            </div>
+          </div>
+          <div class="field-row">
+            <label for="prior-name">地图名称（可选）</label>
+            <input id="prior-name" class="path-input" type="text" placeholder="例如：一号店货架图">
+          </div>
+          <div class="field-row">
+            <label for="prior-output">地图包保存目录</label>
+            <div class="path-control">
+              <input id="prior-output" class="path-input" type="text" spellcheck="false">
+              <button class="secondary" type="button" data-pick="prior-output" data-title="选择空的先验地图输出目录">选择文件夹</button>
+            </div>
+          </div>
+          <div class="field-hint">转换后会显示楼层、范围、元素统计、道路连通性和所有警告。阶段一只提供初始位置与道路软约束，不声称已实现 LiDAR 自动定位。</div>
+          <button id="run-prior" class="primary full" type="button">导入并校验先验地图</button>
+        </section>
+
+        <details class="advanced-options" data-scan-options>
           <summary>地图参数</summary>
           <div class="options-grid">
             <label class="check-row"><input id="option-offline-optimize" type="checkbox" checked>PC 离线闭环与全局优化</label>

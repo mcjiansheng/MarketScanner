@@ -28,6 +28,16 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
     private var context: EAGLContext?
     private var rtabmap: RTABMap?
     private var supermarketSession: SupermarketScanSession?
+    private var activeScanConfiguration = PriorMapScanConfiguration.freeMapping
+    private var priorMapLocalizer: PriorMapStageOneLocalizer?
+    private var priorMapOverlay: PriorMapLiveMapView?
+    private var priorMapLatestUpdate: PriorMapLocalizationUpdate?
+    private var priorMapLastUpdateAt: TimeInterval = 0
+    private var priorMapUpdateInFlight = false
+    private var priorMapGeneration = UUID()
+    private let priorMapQueue = DispatchQueue(
+        label: "com.introlab.rtabmap.prior-map-localization",
+        qos: .userInitiated)
     private var priceTagNFCReader: PriceTagNFCReader?
     // NFC is intentionally paused. Presenting Core NFC interrupts the active
     // camera capture on iOS, and the entitlement cannot be debugged with an
@@ -1293,7 +1303,7 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                 
         var fileMenuChildren: [UIMenuElement] = []
         fileMenuChildren.append(UIAction(title: localized("New Mapping Session"), image: UIImage(systemName: "plus.app"), attributes: actionNewScanEnabled ? [] : .disabled, state: .off, handler: { _ in
-            self.newScan()
+            self.presentNewScanModePicker()
         }))
         if supermarketNFCEnabled {
             fileMenuChildren.append(UIAction(title: localized("Read Price Tag NFC"), image: UIImage(systemName: "tag"), attributes: self.mState == .STATE_MAPPING ? [] : .disabled, state: .off, handler: { _ in
@@ -1829,6 +1839,11 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                     pose[3,0], pose[3,1], pose[3,2], pose[3,3]
                 ],
                 trackingState: trackingStateLabel)
+            if mState == .STATE_MAPPING && !mDataRecording {
+                updatePriorMapLocalization(
+                    frame: frame,
+                    trackingState: trackingStateLabel)
+            }
             if mState == .STATE_MAPPING && trackingStateLabel != mLastLoggedTrackingState {
                 let level = trackingStateLabel == "normal" ? "info" : "warning"
                 supermarketSession?.appendScanEvent(
@@ -2332,14 +2347,296 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         setGLCamera(type: 0);
         startCamera();
     }
-    
-    func newScan(dataRecordingMode: Bool = false)
+
+    private func presentNewScanModePicker()
     {
         guard mState != .STATE_MAPPING else {
             showToast(
                 message: localized("A scan is in progress. Use the Stop button before starting another scan."),
                 seconds: 4)
             return
+        }
+        let message = """
+        自由扫描建图
+        无需已有地图，继续使用当前连续扫描流程。
+
+        已有地图辅助扫描
+        在已有货架图上显示位置，并使用道路做保守辅助；阶段一尚未启用 LiDAR 自动匹配。
+        """
+        let alert = UIAlertController(
+            title: localized("新建扫描"),
+            message: message,
+            preferredStyle: .actionSheet)
+        alert.addAction(UIAlertAction(
+            title: localized("自由扫描建图"),
+            style: .default,
+            handler: { _ in
+                self.newScan(configuration: .freeMapping)
+            }))
+        alert.addAction(UIAlertAction(
+            title: localized("已有地图辅助扫描"),
+            style: .default,
+            handler: { _ in
+                let wizard = PriorMapWizardViewController(
+                    completion: { configuration in
+                        self.newScan(configuration: configuration)
+                    },
+                    onCancel: {})
+                self.present(wizard, animated: true)
+            }))
+        alert.addAction(UIAlertAction(title: localized("Cancel"), style: .cancel))
+        if let popover = alert.popoverPresentationController {
+            popover.sourceView = newScanButtonLarge
+            popover.sourceRect = newScanButtonLarge.bounds
+        }
+        present(alert, animated: true)
+    }
+
+    private func preparePriorMapLocalization(
+        configuration: PriorMapScanConfiguration
+    ) -> Bool {
+        clearPriorMapLocalization()
+        activeScanConfiguration = configuration
+        supermarketSession?.configureScan(configuration)
+        guard configuration.workflowMode == .priorMapLocalized else {
+            return true
+        }
+        guard configuration.isReadyToStart else {
+            showToast(
+                message: localized("The prior-map setup is incomplete. No scan was started and existing data is safe."),
+                seconds: 5)
+            activeScanConfiguration = .freeMapping
+            supermarketSession?.configureScan(.freeMapping)
+            return false
+        }
+        guard let directory = configuration.packageDirectory,
+              let floorId = configuration.floorId,
+              let initialPose = configuration.initialMapPose else {
+            showToast(
+                message: localized("The prior map, floor or starting position is missing. No scan was started."),
+                seconds: 5)
+            activeScanConfiguration = .freeMapping
+            supermarketSession?.configureScan(.freeMapping)
+            return false
+        }
+        do {
+            let package = try PriorMapPackage.load(directory: directory)
+            guard package.manifest.priorMapId == configuration.priorMapId,
+                  package.manifest.sourceSha256 == configuration.priorMapSha256,
+                  package.manifest.floors.contains(where: { $0.id == floorId }) else {
+                throw NSError(
+                    domain: "PriorMap",
+                    code: 4,
+                    userInfo: [NSLocalizedDescriptionKey: localized("The selected prior-map identity or floor no longer matches the setup.")])
+            }
+            priorMapLocalizer = PriorMapStageOneLocalizer(
+                package: package,
+                floorId: floorId,
+                initialMapPose: initialPose)
+            let overlay = PriorMapLiveMapView(package: package, floorId: floorId)
+            overlay.translatesAutoresizingMaskIntoConstraints = false
+            overlay.confirmButton.addTarget(
+                self,
+                action: #selector(confirmPriorMapPosition),
+                for: .touchUpInside)
+            overlay.reselectButton.addTarget(
+                self,
+                action: #selector(reselectPriorMapPosition),
+                for: .touchUpInside)
+            view.addSubview(overlay)
+            NSLayoutConstraint.activate([
+                overlay.trailingAnchor.constraint(
+                    equalTo: view.safeAreaLayoutGuide.trailingAnchor,
+                    constant: -12),
+                overlay.topAnchor.constraint(
+                    equalTo: view.safeAreaLayoutGuide.topAnchor,
+                    constant: 12),
+                overlay.widthAnchor.constraint(equalToConstant: 330),
+            ])
+            priorMapOverlay = overlay
+            priorMapGeneration = UUID()
+            priorMapLastUpdateAt = 0
+            return true
+        }
+        catch {
+            showToast(
+                message: String(
+                    format: localized("The prior map could not be opened: %@. No scan was started and existing data is safe."),
+                    error.localizedDescription),
+                seconds: 6)
+            activeScanConfiguration = .freeMapping
+            supermarketSession?.configureScan(.freeMapping)
+            clearPriorMapLocalization()
+            return false
+        }
+    }
+
+    private func clearPriorMapLocalization()
+    {
+        priorMapGeneration = UUID()
+        priorMapLocalizer = nil
+        priorMapLatestUpdate = nil
+        priorMapLastUpdateAt = 0
+        let overlay = priorMapOverlay
+        priorMapOverlay = nil
+        if Thread.isMainThread {
+            overlay?.removeFromSuperview()
+        }
+        else {
+            DispatchQueue.main.async {
+                overlay?.removeFromSuperview()
+            }
+        }
+    }
+
+    private func updatePriorMapLocalization(
+        frame: ARFrame,
+        trackingState: String
+    ) {
+        guard activeScanConfiguration.workflowMode == .priorMapLocalized,
+              let localizer = priorMapLocalizer,
+              frame.timestamp - priorMapLastUpdateAt >= 0.5 else {
+            return
+        }
+        priorMapLastUpdateAt = frame.timestamp
+        let generation = priorMapGeneration
+        let transform = frame.camera.transform
+        let timestamp = frame.timestamp
+        priorMapQueue.async {
+            let update = localizer.update(
+                transform: transform,
+                timestamp: timestamp,
+                trackingState: trackingState)
+            guard generation == self.priorMapGeneration else {
+                return
+            }
+            self.supermarketSession?.appendLocalizationTrace(update)
+            DispatchQueue.main.async {
+                guard generation == self.priorMapGeneration else {
+                    return
+                }
+                self.priorMapLatestUpdate = update
+                self.priorMapOverlay?.update(update)
+            }
+        }
+    }
+
+    @objc private func confirmPriorMapPosition()
+    {
+        guard let update = priorMapLatestUpdate else {
+            showToast(
+                message: localized("Wait for the first location update, then confirm again."),
+                seconds: 3)
+            return
+        }
+        applyManualPriorMapPose(
+            update.estimatedPose,
+            reason: "user_confirmed_current_estimate")
+    }
+
+    @objc private func reselectPriorMapPosition()
+    {
+        let initial = priorMapLatestUpdate?.estimatedPose
+            ?? activeScanConfiguration.initialMapPose
+            ?? PriorMapPose2D(xM: 0, yM: 0, yawRad: 0)
+        let alert = UIAlertController(
+            title: localized("在地图上确认当前位置"),
+            message: localized("输入地图坐标和方向。大幅修正只在您明确确认后应用，并会写入审计日志。"),
+            preferredStyle: .alert)
+        for (placeholder, value) in [
+            ("X (m)", String(format: "%.3f", initial.xM)),
+            ("Y (m)", String(format: "%.3f", initial.yM)),
+            ("方向 (°)", String(format: "%.1f", initial.yawRad * 180.0 / .pi)),
+        ] {
+            alert.addTextField { field in
+                field.placeholder = placeholder
+                field.text = value
+                field.keyboardType = .numbersAndPunctuation
+            }
+        }
+        alert.addAction(UIAlertAction(title: localized("Cancel"), style: .cancel))
+        alert.addAction(UIAlertAction(
+            title: localized("确认位置"),
+            style: .default,
+            handler: { _ in
+                guard let fields = alert.textFields,
+                      fields.count == 3,
+                      let x = Double(fields[0].text ?? ""),
+                      let y = Double(fields[1].text ?? ""),
+                      let degrees = Double(fields[2].text ?? "") else {
+                    self.showToast(
+                        message: self.localized("The position was not changed because one or more values were invalid."),
+                        seconds: 4)
+                    return
+                }
+                self.applyManualPriorMapPose(
+                    PriorMapPose2D(
+                        xM: x,
+                        yM: y,
+                        yawRad: degrees * .pi / 180.0),
+                    reason: "user_reselected_map_pose")
+            }))
+        present(alert, animated: true)
+    }
+
+    private func applyManualPriorMapPose(
+        _ mapPose: PriorMapPose2D,
+        reason: String
+    ) {
+        guard let transform = session.currentFrame?.camera.transform,
+              let localizer = priorMapLocalizer else {
+            showToast(
+                message: localized("ARKit is not ready. The position was not changed and scanning data remains safe."),
+                seconds: 4)
+            return
+        }
+        let generation = priorMapGeneration
+        priorMapQueue.async {
+            let poses = localizer.confirmCurrentPosition(
+                transform: transform,
+                mapPose: mapPose)
+            guard generation == self.priorMapGeneration else {
+                return
+            }
+            self.supermarketSession?.appendManualLocalizationEvent(
+                reason: reason,
+                arkitPose: poses.0,
+                confirmedMapPose: poses.1)
+            self.supermarketSession?.appendScanEvent(
+                event: "manual_localization_confirmed",
+                message: "User confirmed a prior-map position",
+                fields: [
+                    "reason": reason,
+                    "xM": "\(mapPose.xM)",
+                    "yM": "\(mapPose.yM)",
+                    "yawRad": "\(mapPose.yawRad)",
+                ])
+            DispatchQueue.main.async {
+                self.showToast(
+                    message: self.localized("Position confirmed. The adjustment was added to the audit log."),
+                    seconds: 3)
+            }
+        }
+    }
+    
+    func newScan(
+        dataRecordingMode: Bool = false,
+        configuration: PriorMapScanConfiguration = .freeMapping
+    )
+    {
+        guard mState != .STATE_MAPPING else {
+            showToast(
+                message: localized("A scan is in progress. Use the Stop button before starting another scan."),
+                seconds: 4)
+            return
+        }
+        if dataRecordingMode {
+            _ = preparePriorMapLocalization(configuration: .freeMapping)
+        }
+        else {
+            guard preparePriorMapLocalization(configuration: configuration) else {
+                return
+            }
         }
 
         print("databases.size() = \(databases.size())")
@@ -2372,7 +2669,9 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                     catch {
                         print("Could not clear tmp database: \(error)")
                     }
-                    self.newScan(dataRecordingMode: dataRecordingMode)
+                    self.newScan(
+                        dataRecordingMode: dataRecordingMode,
+                        configuration: configuration)
                 }
                 alert.addAction(alertActionNo)
                 let alertActionCancel = UIAlertAction(title: "Cancel", style: .cancel) {
@@ -2468,6 +2767,7 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
             do {
                 try supermarketSession?.startNewSessionIfNeeded()
                 supermarketSession?.resetCurrentSegment()
+                supermarketSession?.configureScan(configuration)
             }
             catch {
                 showToast(message: String(format: localized("Could not create supermarket session: %@"), error.localizedDescription), seconds: 4)
@@ -2526,7 +2826,10 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                         "onlinePoseCorrection": "rtabmap_map_to_odom_v1",
                         "reliableLoopMinimumNodeSpan": "\(self.mReliableLoopMinimumNodeSpan)",
                         "structureCoverageAdvisor": "map_frame_world_grid_v2",
-                        "adaptiveDetectionRateHz": "1.0-2.0"
+                        "adaptiveDetectionRateHz": "1.0-2.0",
+                        "workflowMode": configuration.workflowMode.rawValue,
+                        "priorMapId": configuration.priorMapId ?? "",
+                        "floorId": configuration.floorId ?? ""
                     ])
             }
             
@@ -3181,7 +3484,19 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                         availableDiskBytes: availableBytesAtFinalization,
                         thermalState: thermalStateAtFinalization,
                         captureHealth: boundary.captureHealth,
-                        structureCoverage: scanSession.structureCoverageSummary())
+                        structureCoverage: scanSession.structureCoverageSummary(),
+                        formatVersion: 1,
+                        workflowMode: scanSession.scanConfiguration.workflowMode.rawValue,
+                        priorMapId: scanSession.scanConfiguration.priorMapId,
+                        priorMapSha256: scanSession.scanConfiguration.priorMapSha256,
+                        floorId: scanSession.scanConfiguration.floorId,
+                        initialMapPose: scanSession.scanConfiguration.initialMapPose,
+                        localizationTrace: scanSession.scanConfiguration.workflowMode == .priorMapLocalized
+                            ? "localization_trace.jsonl"
+                            : nil,
+                        manualLocalizationEvents: scanSession.scanConfiguration.workflowMode == .priorMapLocalized
+                            ? "manual_localization_events.jsonl"
+                            : nil)
                     let finalSnapshot = scanSession.makeSidecarSnapshot(metadata: metadata)
                     snapshot = finalSnapshot
                     try scanSession.writeSidecarFiles(to: segmentDirectory, snapshot: finalSnapshot)
@@ -3241,6 +3556,8 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
             // copy continues against captured immutable paths.
             scanSession.completeCurrentSession()
             scanSession.isFinalizingScan = false
+            self.activeScanConfiguration = .freeMapping
+            self.clearPriorMapLocalization()
             self.showToast(message: self.localized("Continuous streaming scan finalized as one database."), seconds: 3)
             completion?(true)
 
@@ -4108,7 +4425,7 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
     }
     
     @IBAction func newScanAction(_ sender: UIButton) {
-        newScan()
+        presentNewScanModePicker()
     }
     
     @IBAction func closeVisualizationAction(_ sender: UIButton) {

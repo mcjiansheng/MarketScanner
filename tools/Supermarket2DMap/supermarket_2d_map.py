@@ -304,8 +304,33 @@ def session_scan_summary(segments: Sequence[Segment]) -> Dict[str, Any]:
     else:
         strategy = "reuse_single_database"
 
+    workflow_values = {
+        str(segment.metadata.get("workflowMode") or segment.metadata.get("workflow_mode")).strip()
+        for segment in segments
+        if segment.metadata.get("workflowMode") or segment.metadata.get("workflow_mode")
+    }
+    if not workflow_values:
+        workflow_mode = "free_mapping"
+        workflow_legacy = True
+    elif len(workflow_values) == 1:
+        workflow_mode = next(iter(workflow_values))
+        workflow_legacy = False
+    else:
+        workflow_mode = "mixed"
+        workflow_legacy = False
+    prior_map_ids = sorted(
+        {
+            str(segment.metadata.get("priorMapId") or segment.metadata.get("prior_map_id"))
+            for segment in segments
+            if segment.metadata.get("priorMapId") or segment.metadata.get("prior_map_id")
+        }
+    )
+
     return {
         "scan_mode": scan_mode,
+        "workflow_mode": workflow_mode,
+        "workflow_legacy": workflow_legacy,
+        "prior_map_ids": prior_map_ids,
         "segment_count": len(segments),
         "database_count": database_count,
         "merge_required": len(segments) > 1,

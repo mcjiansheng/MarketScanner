@@ -553,6 +553,14 @@ function updateSingleAlignmentState() {
 }
 
 function activeRequest() {
+  if (activeMode === "prior") {
+    return {
+      kind: "prior_map",
+      xlsx: $("#prior-xlsx").value.trim(),
+      output: $("#prior-output").value.trim(),
+      name: $("#prior-name").value.trim(),
+    };
+  }
   if (activeMode === "single") {
     const stages = stageConfig();
     return {
@@ -576,7 +584,9 @@ function activeRequest() {
 
 function activeRequestKey(payload) {
   const comparable = JSON.parse(JSON.stringify(payload));
-  const outputId = payload.kind === "multi" ? "multi-output" : "single-output";
+  const outputId = payload.kind === "multi"
+    ? "multi-output"
+    : (payload.kind === "prior_map" ? "prior-output" : "single-output");
   if ($("#" + outputId).dataset.autoOutput === "true") delete comparable.output;
   return JSON.stringify(comparable);
 }
@@ -599,7 +609,8 @@ async function runActiveJob() {
     }
     setBusy(true);
     setStatus("正在创建任务", "running");
-    const job = await request("/api/jobs", {
+    const endpoint = payload.kind === "prior_map" ? "/api/prior-map/convert" : "/api/jobs";
+    const job = await request(endpoint, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
@@ -640,7 +651,8 @@ async function pollJob() {
     $("#open-output").disabled = false;
     const warningCount = (job.quality_report?.warnings || []).length
       + (job.quality_report?.multi_device_summary?.alignment_warnings || []).length;
-    setStatus(warningCount ? `地图生成完成（${warningCount} 条警告）` : "地图生成完成", "complete");
+    const completionLabel = job.kind === "prior_map" ? "先验地图导入完成" : "地图生成完成";
+    setStatus(warningCount ? `${completionLabel}（${warningCount} 条警告）` : completionLabel, "complete");
     await renderJob(job);
   } catch (error) {
     activeJobId = null;
@@ -666,6 +678,28 @@ async function renderJob(job) {
   renderReview(job.quality_report || {}, job.review_items || { items: [] });
   renderArtifacts(job.artifacts || {});
   const artifacts = job.artifacts || {};
+  if (job.kind === "prior_map") {
+    clearShelfTuning(false);
+    $("#merge-toggle").hidden = true;
+    viewer2d.images["2d-map"] = null;
+    viewer2d.images["2d-shelf"] = null;
+    if (artifacts["preview.png"]) {
+      await load2D(artifacts["preview.png"], "2d-map");
+      updatePreview("2d-map");
+    }
+    const manifest = job.map || {};
+    const stats = manifest.element_statistics || {};
+    const floors = (manifest.floors || []).map((item) => item.id).join("、") || "无";
+    const bounds = manifest.bounds || {};
+    previewMeta.textContent = `先验地图 ${manifest.name || ""}  |  楼层 ${floors}  |  ${Number(bounds.width_m || 0).toFixed(2)} × ${Number(bounds.height_m || 0).toFixed(2)} m  |  ${Number(manifest.element_count || 0).toLocaleString()} 个元素`;
+    const inspection = $("#inspection");
+    clearNode(inspection);
+    appendText(inspection, "div", `地图 ID：${manifest.prior_map_id || "未知"}`, "complete");
+    appendText(inspection, "div", `源文件 SHA-256：${manifest.source_sha256 || "缺失"}`);
+    appendText(inspection, "div", `楼层：${floors}；货架 ${stats.MapShelf || 0}，柜台 ${stats.MapTable || 0}，柱子 ${stats.MapPillar || 0}，道路 ${stats.MapCross || 0}`);
+    appendText(inspection, "div", "阶段一定位：初始位置投影 + 道路软约束；尚未启用 LiDAR 自动地图匹配。", "warning");
+    return;
+  }
   viewer2d.images["2d-map"] = null;
   viewer2d.images["2d-shelf"] = null;
   $("#shelf-preview-tab").hidden = true;
@@ -2621,6 +2655,7 @@ function switchMode(mode) {
   activeMode = mode;
   $$(".tab").forEach((button) => button.classList.toggle("is-active", button.dataset.mode === mode));
   $$(".mode-panel").forEach((panel) => panel.classList.toggle("is-active", panel.dataset.panel === mode));
+  $$("[data-scan-options]").forEach((panel) => { panel.hidden = mode === "prior"; });
   updateSingleAlignmentState();
 }
 
@@ -2632,6 +2667,7 @@ function bindEvents() {
   $("#inspect-single-session").addEventListener("click", () => inspectSession("single-session"));
   $("#run-single").addEventListener("click", runActiveJob);
   $("#run-multi").addEventListener("click", runActiveJob);
+  $("#run-prior").addEventListener("click", runActiveJob);
   $("#add-device").addEventListener("click", addDevice);
   $("#add-stage").addEventListener("click", addStage);
   $("#option-offline-optimize").addEventListener("change", updateSingleAlignmentState);
@@ -2669,7 +2705,7 @@ function bindEvents() {
     window.clearTimeout(sessionRestoreTimer);
     sessionRestoreTimer = window.setTimeout(() => selectSingleSession($("#single-session").value.trim()), 500);
   });
-  ["single-output", "multi-output"].forEach((id) => {
+  ["single-output", "multi-output", "prior-output"].forEach((id) => {
     $("#" + id).addEventListener("input", () => {
       $("#" + id).dataset.autoOutput = "false";
       $("#" + id).dataset.restored = "false";

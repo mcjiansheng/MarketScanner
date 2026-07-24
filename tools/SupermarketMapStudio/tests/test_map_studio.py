@@ -11,6 +11,7 @@ import threading
 import time
 import unittest
 import zlib
+import zipfile
 from contextlib import closing
 from pathlib import Path
 from types import SimpleNamespace
@@ -104,6 +105,100 @@ def create_session(root: Path, name: str, offset: float, scan_mode: str | None =
     (segment / "metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
     (segment / "price_tags.json").write_text("[]", encoding="utf-8")
     return session
+
+
+def create_prior_map_workbook(path: Path) -> None:
+    elements = [
+        {
+            "shapeType": "MapShelf",
+            "x": 100,
+            "y": 200,
+            "width": 300,
+            "height": 100,
+            "rotation": 90,
+            "code": "Shelf-A",
+            "crossCode": "Cross-A",
+            "rowFlag": "Row-A",
+            "visible": True,
+        },
+        {
+            "shapeType": "MapCross",
+            "points": [0, 500, 1000, 500],
+            "lineWidth": 200,
+            "code": "Cross-A",
+            "visible": True,
+        },
+        {
+            "shapeType": "MapRoadPoint",
+            "x": 100,
+            "y": 500,
+            "code": "Road-1",
+            "crossCodes": ["Cross-A"],
+            "visible": True,
+        },
+        {
+            "shapeType": "MapRoadPoint",
+            "x": 900,
+            "y": 500,
+            "code": "Road-2",
+            "crossCodes": ["Cross-A"],
+            "visible": True,
+        },
+    ]
+    strings = ["floor", "element"]
+    for element in elements:
+        strings.extend(("1", json.dumps(element)))
+    shared = "".join(
+        f"<si><t>{value.replace('&', '&amp;').replace('<', '&lt;')}</t></si>"
+        for value in strings
+    )
+    rows = [
+        '<row r="1"><c r="A1" t="s"><v>0</v></c><c r="B1" t="s"><v>1</v></c></row>'
+    ]
+    for row_index in range(2, len(elements) + 2):
+        string_index = 2 + (row_index - 2) * 2
+        rows.append(
+            f'<row r="{row_index}"><c r="A{row_index}" t="s"><v>{string_index}</v></c>'
+            f'<c r="B{row_index}" t="s"><v>{string_index + 1}</v></c></row>'
+        )
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr(
+            "[Content_Types].xml",
+            '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+            '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+            '<Default Extension="xml" ContentType="application/xml"/>'
+            '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
+            '<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+            '<Override PartName="/xl/sharedStrings.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml"/>'
+            "</Types>",
+        )
+        archive.writestr(
+            "_rels/.rels",
+            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+            '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>'
+            "</Relationships>",
+        )
+        archive.writestr(
+            "xl/workbook.xml",
+            '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+            'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+            '<sheets><sheet name="Element Info" sheetId="1" r:id="rId1"/></sheets></workbook>',
+        )
+        archive.writestr(
+            "xl/_rels/workbook.xml.rels",
+            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+            '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>'
+            "</Relationships>",
+        )
+        archive.writestr(
+            "xl/sharedStrings.xml",
+            f'<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="{len(strings)}" uniqueCount="{len(strings)}">{shared}</sst>',
+        )
+        archive.writestr(
+            "xl/worksheets/sheet1.xml",
+            '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+            f"<sheetData>{''.join(rows)}</sheetData></worksheet>",
+        )
 
 
 def add_rgbd_frame(session: Path) -> None:
@@ -264,6 +359,66 @@ class MapStudioApiTests(unittest.TestCase):
             )
         self.assertEqual(result["path"], str(self.session_a))
         self.assertEqual(run.call_args.args[0][2:], ["directory", "选择扫描会话"])
+
+    def test_prior_map_api_converts_validates_and_serves_preview(self) -> None:
+        workbook = self.root / "prior-map.xlsx"
+        output = self.root / "PriorMap-output"
+        create_prior_map_workbook(workbook)
+        source_before = workbook.read_bytes()
+        job = self.api(
+            "/api/prior-map/convert",
+            {"xlsx": str(workbook), "output": str(output), "name": "测试货架图"},
+        )
+        completed = self.wait_for_job(job["id"])
+        self.assertEqual(completed["status"], "complete", completed.get("error"))
+        self.assertEqual(completed["kind"], "prior_map")
+        self.assertEqual(completed["map"]["name"], "测试货架图")
+        self.assertEqual(completed["map"]["element_statistics"]["MapShelf"], 1)
+        self.assertIn("preview.png", completed["artifacts"])
+        preview, content_type = self.fetch(completed["artifacts"]["preview.png"])
+        self.assertEqual(content_type, "image/png")
+        self.assertTrue(preview.startswith(b"\x89PNG\r\n\x1a\n"))
+        inspection = self.api(
+            "/api/prior-map/inspect",
+            {"package": str(output)},
+        )
+        self.assertTrue(inspection["valid"])
+        self.assertEqual(inspection["manifest"]["prior_map_id"], completed["map"]["prior_map_id"])
+        self.assertEqual(workbook.read_bytes(), source_before)
+
+    def test_session_inspection_keeps_storage_and_workflow_modes_separate(self) -> None:
+        legacy = self.api(
+            "/api/session/inspect",
+            {"session": str(self.session_a)},
+        )
+        self.assertEqual(legacy["workflow_mode"], "free_mapping")
+        self.assertTrue(legacy["workflow_legacy"])
+
+        session = create_session(
+            self.root,
+            "SupermarketSession-Prior",
+            0.0,
+            "continuous_streaming",
+        )
+        metadata_path = session / "segment_0001" / "metadata.json"
+        metadata = json.loads(metadata_path.read_text())
+        metadata.update(
+            {
+                "workflowMode": "prior_map_localized",
+                "priorMapId": "fixture-map",
+                "priorMapSha256": "0" * 64,
+                "floorId": "1",
+                "initialMapPose": {"x_m": 1.0, "y_m": 2.0, "yaw_rad": 0.5},
+            }
+        )
+        metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+        inspected = self.api(
+            "/api/session/inspect",
+            {"session": str(session)},
+        )
+        self.assertEqual(inspected["scan_mode"], "continuous_streaming")
+        self.assertEqual(inspected["workflow_mode"], "prior_map_localized")
+        self.assertEqual(inspected["prior_map_ids"], ["fixture-map"])
 
     def test_manual_merge_preview_maps_regions_to_user_closures(self) -> None:
         _session, _database, output = create_manual_merge_result(self.root)

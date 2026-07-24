@@ -73,6 +73,7 @@ main { max-width: 1920px; margin: 0 auto; padding: 20px 24px 32px; }
 .control-panel, .preview-panel, .result-section { background: var(--surface); border: 1px solid var(--line); border-radius: 6px; }
 .control-panel { padding: 18px; }
 .mode-panel { display: none; }.mode-panel.is-active { display: block; }
+.mode-explanation { margin: 0 0 16px; color: var(--muted); }
 .field-row { display: grid; gap: 6px; margin-bottom: 14px; }.field-row > label, .device-toolbar span { font-weight: 600; }
 .path-control { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; }
 .path-input, textarea, input[type="number"], select { min-width: 0; width: 100%; border: 1px solid var(--line); border-radius: 4px; color: var(--ink); background: var(--field); padding: 7px 8px; }
