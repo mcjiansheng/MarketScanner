@@ -1,6 +1,6 @@
 # RTAB-Map 大型超市扫描与地图工作台
 
-> 文档状态：**当前有效**。最后一次与源码交叉核对日期：2026-07-23。
+> 文档状态：**当前有效**。最后一次与源码交叉核对日期：2026-07-24。
 
 本项目是在开源 **RTAB-Map** 基础上进行的业务化改造，面向大型超市、仓储卖场等室内场景，形成从 iPhone Pro 连续采集，到 PC 端离线优化，再到二维地图、彩色俯视图和三维预览的一套本地工作流。
 
@@ -52,6 +52,15 @@ iPhone Pro RGB-D / LiDAR / IMU / ARKit 采集
 Android 目录中的部分 C++ 原生实现也因共享移动渲染和数据库能力而被扩展，但当前完整的超市现场采集交互主要实现在 iOS 应用中。
 
 ## 当前采集方案
+
+### 自由扫描与已有地图辅助扫描
+
+项目现在保留两个并列入口：
+
+- **自由扫描建图**：继续使用既有 ARKit/RGB-D/LiDAR 连续单库采集和 PC 离线优化，默认行为与输出兼容不变。
+- **已有地图辅助扫描（阶段一）**：先把 `Element Info` XLSX 转换为版本化先验地图包，在 iPhone 五步向导中选择地图、楼层、起点和朝向；扫描时用 `T_map_from_arkit` 显示 2D 位置，并以 2 Hz 道路候选做有上限的软约束。定位较弱或丢失不会停止 RTAB-Map 原始数据库记录，人工位置确认写入独立审计 sidecar。
+
+阶段一**尚未实现** LiDAR/视觉结构自动地图匹配、Vision 扫码或价签位置测量，界面不会把初始/道路辅助定位称为精准定位。完整架构、格式、UI、测试和当前状态见 [docs/map-assisted-localization/](docs/map-assisted-localization/)。
 
 ### 连续流式单数据库
 
@@ -236,6 +245,16 @@ tools\SupermarketMapStudio\start.bat
 
 浏览器将打开 `http://127.0.0.1:8765/`。选择完整的 `SupermarketSession-*`、确认新的输出目录，然后执行单设备处理或多设备合并。
 
+工作台“导入/管理先验地图”页签可把已有货架 Excel 转换为手机/PC 共用地图包。也可直接运行：
+
+```bash
+python3 tools/PriorMap/xlsx_to_prior_map.py /path/to/map.xlsx \
+  --output /path/to/PriorMap-output
+python3 tools/PriorMap/validate_prior_map.py /path/to/PriorMap-output
+```
+
+源 XLSX 只读；输出记录源 SHA-256、楼层、bounds、元素统计、道路连通性、空间索引、warning 和确定性 PNG 预览。
+
 ### 3. 直接生成二维地图
 
 ```bash
@@ -265,6 +284,8 @@ python3 -m unittest discover -s tools/SupermarketMapStudio/tests -v
 | `tools/Reprocess/` | 本项目扩展后的数据库重处理工具 |
 | `tools/Supermarket2DMap/` | 二维、历史阶段和多设备地图生成脚本 |
 | `tools/SupermarketMapStudio/` | 本地 Web 工作台、离线处理、GPU helper 和测试 |
+| `tools/PriorMap/` | XLSX 先验地图转换、schema、预览、空间索引和定位回放 |
+| `docs/map-assisted-localization/` | 可提交的地图辅助定位权威架构、格式、UI、测试和状态文档 |
 | `doc/README.md` | 迁移保存的原始 RTAB-Map README |
 | `doc/.local/` | 本地开发/交接文档；被 Git 忽略，不属于可提交内容 |
 
