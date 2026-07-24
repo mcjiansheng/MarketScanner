@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import shutil
 import sqlite3
 import struct
@@ -26,6 +27,27 @@ import folder_dialog  # noqa: E402
 
 def transform_blob(x: float, y: float, z: float) -> bytes:
     return struct.pack("<12f", 1.0, 0.0, 0.0, x, 0.0, 1.0, 0.0, y, 0.0, 0.0, 1.0, z)
+
+
+def transform_yaw_blob(x: float, y: float, z: float, yaw_degrees: float) -> bytes:
+    yaw = yaw_degrees * 3.141592653589793 / 180.0
+    cosine = math.cos(yaw)
+    sine = math.sin(yaw)
+    return struct.pack(
+        "<12f",
+        cosine,
+        -sine,
+        0.0,
+        x,
+        sine,
+        cosine,
+        0.0,
+        y,
+        0.0,
+        0.0,
+        1.0,
+        z,
+    )
 
 
 def png_chunk(kind: bytes, payload: bytes) -> bytes:
@@ -323,6 +345,98 @@ class MapStudioApiTests(unittest.TestCase):
         )
         self.assertEqual(validation["status"], "rejected")
         self.assertGreater(validation["median_constraint_residual_m"], 1.0)
+
+    def test_manual_merge_validation_rejects_missing_constraint_nodes(self) -> None:
+        _session, source, output = create_manual_merge_result(self.root)
+        preview = server.merge.preview_merge(
+            output,
+            {
+                "regions": [
+                    {"rect_pixels": [15, 70, 75, 90]},
+                    {"rect_pixels": [115, 70, 175, 90]},
+                ],
+            },
+        )
+        optimized = self.root / "optimized-missing-node.db"
+        shutil.copy2(source, optimized)
+        aligned = {
+            index + 1: transform_blob(float(index), 0.0, 0.0)
+            for index in range(6)
+        }
+        aligned.update(
+            {
+                index + 101: transform_blob(float(index), 0.0, 0.0)
+                for index in range(6)
+            }
+        )
+        add_optimized_poses(optimized, aligned)
+        missing_node = int(preview["constraints"][0]["from_id"])
+        with closing(sqlite3.connect(optimized)) as conn, conn:
+            conn.execute("DELETE FROM Node WHERE id=?", (missing_node,))
+        add_optimized_poses(
+            optimized,
+            {
+                node_id: transform
+                for node_id, transform in aligned.items()
+                if node_id != missing_node
+            },
+        )
+
+        validation = server.merge.validate_optimized_merge(
+            source,
+            optimized,
+            preview["constraints"],
+            "xy",
+        )
+
+        self.assertEqual(validation["status"], "rejected")
+        self.assertEqual(
+            validation["requested_constraint_count"],
+            len(preview["constraints"]),
+        )
+        self.assertLess(
+            validation["evaluated_constraint_count"],
+            validation["requested_constraint_count"],
+        )
+        self.assertTrue(validation["missing_constraints"])
+
+    def test_manual_merge_validation_rejects_rotational_conflict(self) -> None:
+        _session, source, output = create_manual_merge_result(self.root)
+        preview = server.merge.preview_merge(
+            output,
+            {
+                "regions": [
+                    {"rect_pixels": [15, 70, 75, 90]},
+                    {"rect_pixels": [115, 70, 175, 90]},
+                ],
+            },
+        )
+        optimized = self.root / "optimized-rotational-conflict.db"
+        shutil.copy2(source, optimized)
+        rotated = {
+            index + 1: transform_blob(float(index), 0.0, 0.0)
+            for index in range(6)
+        }
+        rotated.update(
+            {
+                index + 101: transform_yaw_blob(
+                    float(index), 0.0, 0.0, 30.0
+                )
+                for index in range(6)
+            }
+        )
+        add_optimized_poses(optimized, rotated)
+
+        validation = server.merge.validate_optimized_merge(
+            source,
+            optimized,
+            preview["constraints"],
+            "xy",
+        )
+
+        self.assertEqual(validation["status"], "rejected")
+        self.assertLess(validation["median_constraint_residual_m"], 0.01)
+        self.assertGreater(validation["median_constraint_rotation_deg"], 20.0)
 
     def test_manual_merge_apply_creates_new_validated_map_version(self) -> None:
         _session, source, base_output = create_manual_merge_result(self.root)

@@ -34,6 +34,11 @@ INFORMATION_LEVELS = {
 }
 MAX_CONSTRAINTS = 12
 MIN_REGION_NODE_COUNT = 2
+MAX_MEDIAN_CONSTRAINT_TRANSLATION_M = 0.30
+MAX_TRANSLATION_OUTLIER_RATIO = 0.50
+MAX_MEDIAN_CONSTRAINT_ROTATION_DEG = 10.0
+MAX_ROTATION_OUTLIER_DEG = 15.0
+MAX_ROTATION_OUTLIER_RATIO = 0.50
 
 
 @dataclass(frozen=True)
@@ -671,10 +676,22 @@ def validate_optimized_merge(
         for node_id in common_ids
     ]
     residuals: List[Dict[str, Any]] = []
+    missing_constraints: List[Dict[str, Any]] = []
     for constraint in constraints:
         from_id = int(constraint["from_id"])
         to_id = int(constraint["to_id"])
         if from_id not in after or to_id not in after:
+            missing_constraints.append(
+                {
+                    "from_id": from_id,
+                    "to_id": to_id,
+                    "missing_node_ids": [
+                        node_id
+                        for node_id in (from_id, to_id)
+                        if node_id not in after
+                    ],
+                }
+            )
             continue
         predicted = _multiply(
             _inverse_rigid(_matrix4(after[from_id].matrix)),
@@ -692,10 +709,35 @@ def validate_optimized_merge(
             }
         )
     translation_residuals = [item["translation_m"] for item in residuals]
-    median_residual = statistics.median(translation_residuals) if translation_residuals else float("inf")
-    conflicting_ratio = (
-        sum(1 for value in translation_residuals if value > 0.30) / len(translation_residuals)
+    rotation_residuals = [item["rotation_deg"] for item in residuals]
+    median_residual = (
+        statistics.median(translation_residuals)
         if translation_residuals
+        else float("inf")
+    )
+    median_rotation = (
+        statistics.median(rotation_residuals)
+        if rotation_residuals
+        else float("inf")
+    )
+    conflicting_ratio = (
+        sum(
+            1
+            for value in translation_residuals
+            if value > MAX_MEDIAN_CONSTRAINT_TRANSLATION_M
+        )
+        / len(translation_residuals)
+        if translation_residuals
+        else 1.0
+    )
+    rotationally_conflicting_ratio = (
+        sum(
+            1
+            for value in rotation_residuals
+            if value > MAX_ROTATION_OUTLIER_DEG
+        )
+        / len(rotation_residuals)
+        if rotation_residuals
         else 1.0
     )
     sorted_displacements = sorted(displacements)
@@ -705,10 +747,26 @@ def validate_optimized_merge(
     rejection_reasons: List[str] = []
     if not residuals:
         rejection_reasons.append("No injected user constraints could be evaluated after optimization.")
-    if median_residual > 0.30 and conflicting_ratio > 0.50:
+    if missing_constraints:
         rejection_reasons.append(
-            "More than half of the manual constraints conflict with the optimized graph "
-            f"(median residual {median_residual:.2f} m)."
+            f"{len(missing_constraints)} of {len(constraints)} manual constraints "
+            "could not be evaluated because optimized graph nodes were missing."
+        )
+    if (
+        median_residual > MAX_MEDIAN_CONSTRAINT_TRANSLATION_M
+        or conflicting_ratio > MAX_TRANSLATION_OUTLIER_RATIO
+    ):
+        rejection_reasons.append(
+            "Manual constraints conflict with the optimized graph in translation "
+            f"(median {median_residual:.2f} m, outlier ratio {conflicting_ratio:.0%})."
+        )
+    if (
+        median_rotation > MAX_MEDIAN_CONSTRAINT_ROTATION_DEG
+        or rotationally_conflicting_ratio > MAX_ROTATION_OUTLIER_RATIO
+    ):
+        rejection_reasons.append(
+            "Manual constraints conflict with the optimized graph in rotation "
+            f"(median {median_rotation:.1f}°, outlier ratio {rotationally_conflicting_ratio:.0%})."
         )
     if displacement_max > 12.0:
         rejection_reasons.append(
@@ -719,10 +777,18 @@ def validate_optimized_merge(
         "version": 1,
         "status": "rejected" if rejection_reasons else "pass",
         "evaluated_pose_count": len(common_ids),
+        "requested_constraint_count": len(constraints),
         "evaluated_constraint_count": len(residuals),
+        "missing_constraints": missing_constraints,
         "constraint_residuals": residuals,
         "median_constraint_residual_m": round(median_residual, 6) if math.isfinite(median_residual) else None,
         "conflicting_constraint_ratio": round(conflicting_ratio, 6),
+        "median_constraint_rotation_deg": (
+            round(median_rotation, 6) if math.isfinite(median_rotation) else None
+        ),
+        "rotationally_conflicting_constraint_ratio": round(
+            rotationally_conflicting_ratio, 6
+        ),
         "displacement": {
             "p95_m": round(displacement_p95, 6),
             "max_m": round(displacement_max, 6),
