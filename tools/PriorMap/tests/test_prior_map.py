@@ -18,7 +18,11 @@ from tools.PriorMap.coordinate_system import (
 from tools.PriorMap.distance_field import decode_level
 from tools.PriorMap.prior_map_schema import validate_package
 from tools.PriorMap.replay_localization import replay
-from tools.PriorMap.replay_stage2 import replay as replay_stage2
+from tools.PriorMap.replay_stage2 import (
+    Pose as Stage2Pose,
+    match as stage2_match,
+    replay as replay_stage2,
+)
 from tools.PriorMap.spatial_index import PriorMapSpatialIndex
 from tools.PriorMap.stage1_localizer import Pose2D, StageOneLocalizer
 from tools.PriorMap.xlsx_to_prior_map import convert_workbook
@@ -461,6 +465,9 @@ class PriorMapConversionTests(unittest.TestCase):
             summary["median_predicted_error_m"],
         )
         self.assertGreater(summary["matcher_p95_ms"], 0)
+        self.assertGreater(summary["single_frame_geometry_candidate_count"], 0)
+        self.assertLess(summary["p95_estimated_yaw_error_deg"], 8)
+        self.assertEqual(summary["catastrophic_jump_count"], 0)
         self.assertTrue((self.root / "stage2-replay/stage2_replay_report.json").is_file())
 
         wrong = replay_stage2(
@@ -470,6 +477,42 @@ class PriorMapConversionTests(unittest.TestCase):
             wrong_initial_offset_m=3.0,
         )
         self.assertEqual(wrong["summary"]["accepted_count"], 0)
+
+        recovered = replay_stage2(
+            package,
+            seed=24,
+            dynamic_fraction=0.2,
+            tracking_loss_indices={8, 9},
+        )
+        self.assertEqual(recovered["samples"][8]["state"], "lost")
+        self.assertEqual(recovered["samples"][9]["state"], "lost")
+        self.assertIsNotNone(recovered["summary"]["tracking_recovery_frames"])
+        self.assertGreaterEqual(recovered["summary"]["tracking_recovery_frames"], 2)
+
+    def test_stage_two_periodic_structure_cannot_claim_uniqueness(self) -> None:
+        points = [(0.0, -1.5 + index * 3.0 / 79.0) for index in range(80)]
+        for name, separation in (
+            ("near_candidates", 0.4),
+            ("identical_shelf_ends", 0.6),
+            ("parallel_periodic_aisles", 0.8),
+            ("symmetric_pillar_rows", 1.2),
+        ):
+            with self.subTest(name=name):
+                class PeriodicLevel:
+                    truncation_m = 2.55
+
+                    @staticmethod
+                    def distance(x: float, _y: float) -> float:
+                        return min(abs(x), abs(x - separation), 2.55)
+
+                result = stage2_match(
+                    Stage2Pose(separation / 2, 0, 0),
+                    points,
+                    [PeriodicLevel(), PeriodicLevel(), PeriodicLevel()],
+                )
+                self.assertFalse(result["accepted"])
+                self.assertEqual(result["reason"], "ambiguous_structure_match")
+                self.assertLess(result["uniqueness"], 0.10)
 
 
 class StageOneLocalizerTests(unittest.TestCase):

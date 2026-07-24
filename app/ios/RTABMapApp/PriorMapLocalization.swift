@@ -98,6 +98,12 @@ private struct PriorMapShelvesPayload: Codable {
     let shelves: [PriorMapShelf]
 }
 
+private struct PriorMapStructuresPayload: Codable {
+    let format: String
+    let version: Int
+    let structures: [PriorMapFixedStructure]
+}
+
 struct PriorMapSpatialFloor: Codable {
     let cells: [String: [String]]
     let roadCells: [String: [String]]
@@ -137,6 +143,7 @@ struct PriorMapPackage {
     let spatialIndex: PriorMapSpatialIndexPayload
     let distanceFields: PriorMapDistanceFieldFile
     let shelves: [PriorMapShelf]
+    let fixedStructures: [PriorMapFixedStructure]
     let preview: UIImage
     let previewsByFloor: [String: UIImage]
 
@@ -173,6 +180,7 @@ struct PriorMapPackage {
         let spatialURL = directory.appendingPathComponent("spatial_index.json")
         let distanceURL = directory.appendingPathComponent("distance_fields.json")
         let shelvesURL = directory.appendingPathComponent("shelves.json")
+        let structuresURL = directory.appendingPathComponent("fixed_structures.json")
         let previewURL = directory.appendingPathComponent("preview.png")
         let manifest = try decoder.decode(
             PriorMapManifest.self,
@@ -210,6 +218,9 @@ struct PriorMapPackage {
         let shelvesPayload = try decoder.decode(
             PriorMapShelvesPayload.self,
             from: Data(contentsOf: shelvesURL))
+        let structuresPayload = try decoder.decode(
+            PriorMapStructuresPayload.self,
+            from: Data(contentsOf: structuresURL))
         guard spatial.format == "MarketScannerSpatialIndex",
               spatial.version == 1,
               spatial.cellSizeM > 0 else {
@@ -224,7 +235,9 @@ struct PriorMapPackage {
               distanceFields.truncationDistanceM <= 2.55,
               Set(distanceFields.floors.keys) == Set(manifest.floors.map(\.id)),
               shelvesPayload.format == "MarketScannerPriorMapShelves",
-              shelvesPayload.version == 1 else {
+              shelvesPayload.version == 1,
+              structuresPayload.format == "MarketScannerPriorMapStructures",
+              structuresPayload.version == 1 else {
             throw NSError(
                 domain: "PriorMap",
                 code: 8,
@@ -263,6 +276,7 @@ struct PriorMapPackage {
             spatialIndex: spatial,
             distanceFields: distanceFields,
             shelves: shelvesPayload.shelves,
+            fixedStructures: structuresPayload.structures,
             preview: preview,
             previewsByFloor: previewsByFloor)
     }
@@ -320,15 +334,16 @@ final class PriorMapStageOneLocalizer {
     private let depthSampler = PriorMapDepthSampler()
     private let matcher: PriorMapScanMatcher
     private let confidenceManager = PriorMapConfidenceManager()
-    private var lastCandidatePose: PriorMapPose2D?
-    private var consecutiveConsistentCandidates = 0
+    private let temporalCorrectionGate = PriorMapTemporalCorrectionGate()
     private let priorMapId: String
     private let priorMapSha256: String
     private let shelves: [PriorMapShelf]
-    private var latestFloorHeightWorldM: Double?
+    private let fixedStructures: [PriorMapFixedStructure]
+    private var latestFloorEstimate: PriorMapFloorEstimate?
     private(set) var latestEstimatedPose: PriorMapPose2D
     private(set) var latestConfidence = 0.0
     private(set) var latestPhase: PriorMapLocalizationPhase = .uninitialized
+    private var alignmentVersion = 0
 
     init(
         package: PriorMapPackage,
@@ -341,6 +356,7 @@ final class PriorMapStageOneLocalizer {
         self.priorMapId = package.manifest.priorMapId
         self.priorMapSha256 = package.manifest.sourceSha256
         self.shelves = package.shelves
+        self.fixedStructures = package.fixedStructures
         guard let distanceFloor = package.distanceFields.floors[floorId] else {
             throw NSError(
                 domain: "PriorMapLocalizer",
@@ -448,8 +464,8 @@ final class PriorMapStageOneLocalizer {
         let match = observation.map {
             matcher.match(predictedPose: rawPose, observation: $0)
         }
-        if let floorHeight = observation?.floorHeightWorldM {
-            latestFloorHeightWorldM = floorHeight
+        if let floorEstimate = observation?.floorEstimate {
+            latestFloorEstimate = floorEstimate
         }
         if let best = match?.candidates.first {
             let translation = hypot(
@@ -457,25 +473,13 @@ final class PriorMapStageOneLocalizer {
                 best.pose.yM - rawPose.yM)
             let yawDelta = abs(PriorMapStageOneMath.normalizeAngle(
                 best.pose.yawRad - rawPose.yawRad))
-            let consistent: Bool
-            if let prior = lastCandidatePose {
-                consistent = hypot(
-                    best.pose.xM - prior.xM,
-                    best.pose.yM - prior.yM) <= 0.30
-                    && abs(PriorMapStageOneMath.normalizeAngle(
-                        best.pose.yawRad - prior.yawRad)) <= 5.0 * .pi / 180.0
-            }
-            else {
-                consistent = false
-            }
-            consecutiveConsistentCandidates = consistent
-                ? consecutiveConsistentCandidates + 1
-                : 1
-            lastCandidatePose = best.pose
+            let temporallyTrusted = temporalCorrectionGate.observe(
+                rawPose: rawPose,
+                candidatePose: best.pose)
             if match?.acceptedByGeometry == true,
                translation <= 0.35,
                yawDelta <= 8.0 * .pi / 180.0,
-               consecutiveConsistentCandidates >= 2 {
+               temporallyTrusted {
                 let gain = 0.35
                 estimatedPose = PriorMapPose2D(
                     xM: rawPose.xM + (best.pose.xM - rawPose.xM) * gain,
@@ -488,6 +492,7 @@ final class PriorMapStageOneLocalizer {
                 // tracking and the scan database are never reset.
                 arkitOrigin = arkitPose
                 initialMapPose = estimatedPose
+                alignmentVersion += 1
                 accepted = true
                 reason = "trusted_structure_correction"
             }
@@ -502,8 +507,7 @@ final class PriorMapStageOneLocalizer {
             }
         }
         else {
-            consecutiveConsistentCandidates = 0
-            lastCandidatePose = nil
+            temporalCorrectionGate.reset()
             if observation != nil {
                 reason = match?.rejectionReason ?? "no_structure_candidate"
             }
@@ -556,6 +560,18 @@ final class PriorMapStageOneLocalizer {
             constraintReason: reason)
     }
 
+    func alignmentSnapshot(frameTimestamp: TimeInterval) -> PriorMapAlignmentSnapshot? {
+        guard let arkitOrigin else { return nil }
+        return PriorMapAlignmentSnapshot(
+            arkitOrigin: arkitOrigin,
+            initialMapPose: initialMapPose,
+            floorEstimate: latestFloorEstimate,
+            localizationState: latestPhase.rawValue,
+            localizationConfidence: latestConfidence,
+            alignmentVersion: alignmentVersion,
+            frameTimestamp: frameTimestamp)
+    }
+
     func confirmCurrentPosition(
         transform: simd_float4x4,
         mapPose: PriorMapPose2D
@@ -563,13 +579,13 @@ final class PriorMapStageOneLocalizer {
         let arkitPose = Self.pose(from: transform)
         arkitOrigin = arkitPose
         initialMapPose = mapPose
+        alignmentVersion += 1
         latestEstimatedPose = mapPose
         confidenceManager.reset(manual: true)
         latestPhase = .manualCorrection
         latestConfidence = 0.35
         depthSampler.reset()
-        lastCandidatePose = nil
-        consecutiveConsistentCandidates = 0
+        temporalCorrectionGate.reset()
         return (arkitPose, mapPose)
     }
 
@@ -577,11 +593,8 @@ final class PriorMapStageOneLocalizer {
         _ detection: PriceTagVisionDetection,
         trackingSessionId: String
     ) -> (PriorMapTagObservationRecord, LocalizedPriceTag) {
-        let cameraPose = Self.pose(from: detection.frame.camera.transform)
-        if arkitOrigin == nil {
-            arkitOrigin = cameraPose
-        }
-        let origin = arkitOrigin!
+        let snapshot = detection.alignmentSnapshot
+        let origin = snapshot.arkitOrigin
         let mapPoint: (SIMD3<Float>) -> PriorMapTagPoint3D = { world in
             let pointPose = PriorMapPose2D(
                 xM: Double(world.x),
@@ -590,7 +603,7 @@ final class PriorMapStageOneLocalizer {
             let projected = PriorMapStageOneMath.project(
                 arkitPose: pointPose,
                 arkitOrigin: origin,
-                initialMapPose: self.initialMapPose)
+                initialMapPose: snapshot.initialMapPose)
             return PriorMapTagPoint3D(
                 xM: projected.xM,
                 yM: projected.yM,
@@ -600,7 +613,10 @@ final class PriorMapStageOneLocalizer {
             detection: detection,
             floorId: floorId,
             shelves: shelves,
-            floorHeightWorldM: latestFloorHeightWorldM,
+            fixedStructures: fixedStructures,
+            floorEstimate: snapshot.floorEstimate,
+            poseTimestampDeltaMs: abs(
+                detection.frame.timestamp - snapshot.frameTimestamp) * 1000,
             mapPoint: mapPoint)
         let localized = ShelfAssociation.localizedTag(
             observationId: detection.observationId,
@@ -610,8 +626,9 @@ final class PriorMapStageOneLocalizer {
             rawPosition: measurement.rawMapPosition,
             cameraPosition: measurement.cameraMapPosition,
             shelves: shelves,
-            localizationState: latestPhase.rawValue,
-            localizationConfidence: latestConfidence,
+            fixedStructures: fixedStructures,
+            localizationState: snapshot.localizationState,
+            localizationConfidence: snapshot.localizationConfidence,
             measurementConfidence: measurement.confidence,
             measurementMethod: measurement.method,
             userConfirmed: false,
@@ -635,11 +652,13 @@ final class PriorMapStageOneLocalizer {
             ],
             frameTimestamp: detection.frame.timestamp,
             poseTimestampDeltaMs: measurement.poseTimestampDeltaMs,
+            alignmentVersion: snapshot.alignmentVersion,
+            alignmentSnapshotTimestamp: snapshot.frameTimestamp,
             rawMapPosition: measurement.rawMapPosition,
             measurementMethod: measurement.method,
             measurementConfidence: measurement.confidence,
-            localizationState: latestPhase.rawValue,
-            localizationConfidence: latestConfidence,
+            localizationState: snapshot.localizationState,
+            localizationConfidence: snapshot.localizationConfidence,
             priorMapId: priorMapId,
             priorMapSha256: priorMapSha256,
             floorId: floorId,

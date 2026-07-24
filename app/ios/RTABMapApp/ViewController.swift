@@ -38,6 +38,7 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         label: "com.introlab.rtabmap.prior-map-localization",
         qos: .userInitiated)
     private let priceTagVisionScanner = PriceTagVisionScanner()
+    private let priorMapAlignmentSnapshots = PriorMapAlignmentSnapshotStore()
     private var priceTagNFCReader: PriceTagNFCReader?
     // NFC is intentionally paused. Presenting Core NFC interrupts the active
     // camera capture on iOS, and the entitlement cannot be debugged with an
@@ -2482,6 +2483,7 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         priorMapLatestUpdate = nil
         priorMapUpdateGate.reset()
         priceTagVisionScanner.reset()
+        priorMapAlignmentSnapshots.reset()
         let overlay = priorMapOverlay
         priorMapOverlay = nil
         if Thread.isMainThread {
@@ -2503,7 +2505,26 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
             return
         }
         let generation = priorMapGeneration
-        priceTagVisionScanner.submitIfRequested(frame: frame) { result in
+        let trackingSessionId = supermarketSession?.trackingSessionId ?? ""
+        let interfaceOrientation = view.window?.windowScene?.interfaceOrientation
+            ?? .portrait
+        let imageOrientation: CGImagePropertyOrientation
+        switch interfaceOrientation {
+        case .portraitUpsideDown:
+            imageOrientation = .left
+        case .landscapeLeft:
+            imageOrientation = .up
+        case .landscapeRight:
+            imageOrientation = .down
+        default:
+            imageOrientation = .right
+        }
+        if let alignmentSnapshot = priorMapAlignmentSnapshots.snapshot() {
+            priceTagVisionScanner.submitIfRequested(
+                frame: frame,
+                orientation: imageOrientation,
+                alignmentSnapshot: alignmentSnapshot
+            ) { result in
             guard generation == self.priorMapGeneration else { return }
             switch result {
             case .failure(let error):
@@ -2516,7 +2537,7 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                     guard generation == self.priorMapGeneration else { return }
                     let result = localizer.localizePriceTag(
                         detection,
-                        trackingSessionId: self.supermarketSession?.trackingSessionId ?? "")
+                        trackingSessionId: trackingSessionId)
                     let observationSaved =
                         self.supermarketSession?.appendTagObservation(result.0) == true
                     DispatchQueue.main.async {
@@ -2532,6 +2553,7 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                     }
                 }
             }
+        }
         }
         let ticket: Int
         switch priorMapUpdateGate.begin(timestamp: frame.timestamp) {
@@ -2557,7 +2579,13 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
             guard generation == self.priorMapGeneration else {
                 return
             }
-            self.supermarketSession?.appendLocalizationTrace(update)
+            if let snapshot = localizer.alignmentSnapshot(
+                frameTimestamp: frame.timestamp) {
+                self.priorMapAlignmentSnapshots.publish(snapshot)
+            }
+            self.supermarketSession?.appendLocalizationTrace(
+                update,
+                expectedTrackingSessionId: trackingSessionId)
             DispatchQueue.main.async {
                 guard generation == self.priorMapGeneration else {
                     return
@@ -2704,7 +2732,7 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         _ mapPose: PriorMapPose2D,
         reason: String
     ) {
-        guard let transform = session.currentFrame?.camera.transform,
+        guard let frame = session.currentFrame,
               let localizer = priorMapLocalizer else {
             showToast(
                 message: localized("ARKit is not ready. The position was not changed and scanning data remains safe."),
@@ -2712,17 +2740,23 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
             return
         }
         let generation = priorMapGeneration
+        let trackingSessionId = supermarketSession?.trackingSessionId ?? ""
         priorMapQueue.async {
             let poses = localizer.confirmCurrentPosition(
-                transform: transform,
+                transform: frame.camera.transform,
                 mapPose: mapPose)
             guard generation == self.priorMapGeneration else {
                 return
             }
+            if let snapshot = localizer.alignmentSnapshot(
+                frameTimestamp: frame.timestamp) {
+                self.priorMapAlignmentSnapshots.publish(snapshot)
+            }
             self.supermarketSession?.appendManualLocalizationEvent(
                 reason: reason,
                 arkitPose: poses.0,
-                confirmedMapPose: poses.1)
+                confirmedMapPose: poses.1,
+                expectedTrackingSessionId: trackingSessionId)
             self.supermarketSession?.appendScanEvent(
                 event: "manual_localization_confirmed",
                 message: "User confirmed a prior-map position",
@@ -3504,10 +3538,27 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         }
 
         scanSession.isFinalizingScan = true
+        // Stop accepting new Vision/localization work before any final
+        // sidecar snapshot is taken. The bounded barrier lets already-running
+        // work leave the queue; session-level guards reject its writes even if
+        // a matcher takes longer than the drain budget.
+        priorMapGeneration = UUID()
+        priorMapUpdateGate.reset()
+        priceTagVisionScanner.reset()
+        priorMapAlignmentSnapshots.reset()
+        let priorMapDrain = DispatchSemaphore(value: 0)
+        priorMapQueue.async {
+            priorMapDrain.signal()
+        }
+        let priorMapDrained = priorMapDrain.wait(timeout: .now() + 2.0) == .success
         scanSession.appendScanEvent(
             event: "scan_finalization_started",
             message: "Finalizing the continuous streaming database",
-            fields: ["nodeCount": "\(mMapNodes)", "scanStorageBytes": "\(mLatestScanStorageBytes)"])
+            fields: [
+                "nodeCount": "\(mMapNodes)",
+                "scanStorageBytes": "\(mLatestScanStorageBytes)",
+                "priorMapQueueDrained": priorMapDrained ? "true" : "false",
+            ])
         let exportBaseDirectory = scanSession.customBaseDirectorySnapshot()
         let didStartSecurityScope = exportBaseDirectory?.startAccessingSecurityScopedResource() ?? false
         let originValues = rtabmap?.cameraOriginOffset()

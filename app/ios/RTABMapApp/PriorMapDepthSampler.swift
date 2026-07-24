@@ -21,10 +21,12 @@ final class PriorMapDepthSampler {
     private let maximumHistoryVoxels = 8_000
     private var frameIndex = 0
     private var voxelHistory: [PriorMapWorldVoxel: (hits: Int, lastFrame: Int)] = [:]
+    private let floorEstimator = PriorMapFloorPlaneEstimator()
 
     func reset() {
         frameIndex = 0
         voxelHistory.removeAll(keepingCapacity: true)
+        floorEstimator.reset()
     }
 
     func sample(frame: ARFrame) -> PriorMapStructureObservation? {
@@ -84,7 +86,7 @@ final class PriorMapDepthSampler {
         let inverseCosine = cos(-horizontalPose.yawRad)
         let inverseSine = sin(-horizontalPose.yawRad)
         var candidates: [(point: SIMD2<Double>, angle: Double)] = []
-        var floorCandidates: [Double] = []
+        var floorCandidates: [PriorMapFloorSample] = []
         var emittedVoxels = Set<PriorMapWorldVoxel>()
 
         for pixelY in stride(from: 0, to: height, by: step) {
@@ -109,8 +111,47 @@ final class PriorMapDepthSampler {
                     1)
                 let world = cameraTransform * cameraPoint
                 let relativeHeight = Double(world.y - cameraPosition.y)
-                if relativeHeight < -0.75 {
-                    floorCandidates.append(Double(world.y))
+                if relativeHeight <= -0.90, relativeHeight >= -2.30 {
+                    let neighborX = min(width - 1, pixelX + step)
+                    let neighborY = min(height - 1, pixelY + step)
+                    let rightDepth = depthRow[min(neighborX, depthStride - 1)]
+                    let downRow = depthBase
+                        .advanced(by: neighborY * CVPixelBufferGetBytesPerRow(depthMap))
+                        .assumingMemoryBound(to: Float32.self)
+                    let downDepth = downRow[min(pixelX, depthStride - 1)]
+                    if rightDepth.isFinite, downDepth.isFinite,
+                       rightDepth >= 0.25, rightDepth <= 8,
+                       downDepth >= 0.25, downDepth <= 8 {
+                        let rightCamera = SIMD4<Float>(
+                            (Float(neighborX) - cx) / fx * rightDepth,
+                            -(Float(pixelY) - cy) / fy * rightDepth,
+                            -rightDepth,
+                            1)
+                        let downCamera = SIMD4<Float>(
+                            (Float(pixelX) - cx) / fx * downDepth,
+                            -(Float(neighborY) - cy) / fy * downDepth,
+                            -downDepth,
+                            1)
+                        let rightWorld4 = cameraTransform * rightCamera
+                        let downWorld4 = cameraTransform * downCamera
+                        let world3 = SIMD3<Float>(world.x, world.y, world.z)
+                        let rightWorld = SIMD3<Float>(
+                            rightWorld4.x, rightWorld4.y, rightWorld4.z)
+                        let downWorld = SIMD3<Float>(
+                            downWorld4.x, downWorld4.y, downWorld4.z)
+                        let crossValue = simd_cross(
+                            rightWorld - world3,
+                            downWorld - world3)
+                        let length = simd_length(crossValue)
+                        if length > 1.0e-6 {
+                            let alignment = abs(Double(crossValue.y / length))
+                            floorCandidates.append(
+                                PriorMapFloorSample(
+                                    heightWorldM: Double(world.y),
+                                    relativeHeightM: relativeHeight,
+                                    upAlignment: alignment))
+                        }
+                    }
                     continue
                 }
                 // Remove likely floor/ceiling while retaining shelf faces,
@@ -160,19 +201,12 @@ final class PriorMapDepthSampler {
             $0.offset % outputStride == 0 ? $0.element : nil
         }
         let angles = output.map(\.angle)
-        let floorHeight: Double?
-        if floorCandidates.count >= 8 {
-            floorCandidates.sort()
-            floorHeight = floorCandidates[floorCandidates.count / 2]
-        }
-        else {
-            floorHeight = nil
-        }
+        let floorEstimate = floorEstimator.update(samples: floorCandidates)
         return PriorMapStructureObservation(
             points: output.map(\.point),
             validPointCount: output.count,
             coverageAngleRad: max(0, (angles.max() ?? 0) - (angles.min() ?? 0)),
-            floorHeightWorldM: floorHeight,
+            floorEstimate: floorEstimate,
             source: usesSmoothedDepth
                 ? "smoothed_scene_depth"
                 : "scene_depth")

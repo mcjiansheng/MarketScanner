@@ -75,10 +75,10 @@
 
 - `localization_constraints.jsonl`：每个匹配周期的预测/估计、Top‑3、残差、唯一性、有效点数、角覆盖、耗时、接受标记和原因。
 - `localization_events.jsonl`：状态发生变化时记录 previous/state/confidence/reason。
-- `tag_observations.jsonl`：每次成功 Vision 识别的原始观测，即使用户取消最终保存也保留；包含条码、归一化框、同帧时间差、原始地图点、测量方式、三维/定位置信度、地图身份、楼层和 `needs_review`。
+- `tag_observations.jsonl`：每次成功 Vision 识别的原始观测，即使用户取消最终保存也保留；包含条码、归一化框、捕获帧时间、`alignment_snapshot_timestamp`、真实 `pose_timestamp_delta_ms`、`alignment_version`、原始地图点、测量方式、三维/定位置信度、地图身份、楼层和 `needs_review`。地图点必须使用提交 Vision 时冻结的对齐快照计算。
 - `localized_price_tags.json`：用户确认后的数组；包含 shelf code、row flag、cross code、货架侧面、沿货架起点距离、相对地面高度、raw/snapped 位置、定位/测量/关联三项置信度、测量方式、`needs_review` 和 `user_confirmed`。
 
-JSONL 文件逐行独立编码和同步追加；最终价签数组用原子替换写入。价签 sidecar 与旧 `price_tags.json/.csv` 分开，后者继续只是暂停 NFC 功能的兼容空文件。
+JSONL 文件逐行独立编码和同步追加；最终价签数组用原子替换写入。写入前必须确认 tracking session ID 与活动会话一致且未进入 finalization，不允许日志接口自动创建新会话目录。价签 sidecar 与旧 `price_tags.json/.csv` 分开，后者继续只是暂停 NFC 功能的兼容空文件。
 
 ## manual_localization_events.jsonl
 

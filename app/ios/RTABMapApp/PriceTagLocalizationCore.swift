@@ -6,7 +6,82 @@
 //
 
 import Foundation
+import CoreGraphics
 import simd
+
+enum PriorMapCapturedImageOrientation: String, Codable {
+    case up
+    case down
+    case left
+    case right
+}
+
+enum PriorMapImageGeometry {
+    static func nativeSensorBounds(
+        visionBounds: CGRect,
+        orientation: PriorMapCapturedImageOrientation
+    ) -> CGRect {
+        let corners = [
+            CGPoint(x: visionBounds.minX, y: visionBounds.minY),
+            CGPoint(x: visionBounds.maxX, y: visionBounds.minY),
+            CGPoint(x: visionBounds.minX, y: visionBounds.maxY),
+            CGPoint(x: visionBounds.maxX, y: visionBounds.maxY),
+        ].map { point -> CGPoint in
+            switch orientation {
+            case .up:
+                return point
+            case .down:
+                return CGPoint(x: 1 - point.x, y: 1 - point.y)
+            case .right:
+                return CGPoint(x: 1 - point.y, y: point.x)
+            case .left:
+                return CGPoint(x: point.y, y: 1 - point.x)
+            }
+        }
+        let minimumX = corners.map(\.x).min() ?? 0
+        let maximumX = corners.map(\.x).max() ?? 0
+        let minimumY = corners.map(\.y).min() ?? 0
+        let maximumY = corners.map(\.y).max() ?? 0
+        return CGRect(
+            x: minimumX,
+            y: minimumY,
+            width: maximumX - minimumX,
+            height: maximumY - minimumY)
+    }
+}
+
+struct PriorMapAlignmentSnapshot {
+    let arkitOrigin: PriorMapPose2D
+    let initialMapPose: PriorMapPose2D
+    let floorEstimate: PriorMapFloorEstimate?
+    let localizationState: String
+    let localizationConfidence: Double
+    let alignmentVersion: Int
+    let frameTimestamp: TimeInterval
+}
+
+final class PriorMapAlignmentSnapshotStore {
+    private let lock = NSLock()
+    private var value: PriorMapAlignmentSnapshot?
+
+    func publish(_ snapshot: PriorMapAlignmentSnapshot) {
+        lock.lock()
+        value = snapshot
+        lock.unlock()
+    }
+
+    func snapshot() -> PriorMapAlignmentSnapshot? {
+        lock.lock()
+        defer { lock.unlock() }
+        return value
+    }
+
+    func reset() {
+        lock.lock()
+        value = nil
+        lock.unlock()
+    }
+}
 
 struct PriorMapShelf: Codable {
     let id: String
@@ -23,6 +98,39 @@ struct PriorMapShelf: Codable {
         case crossCode = "cross_code"
         case rowFlag = "row_flag"
         case geometry
+    }
+}
+
+struct PriorMapFixedStructure: Codable {
+    let id: String
+    let floorId: String
+    let shapeType: String
+    let code: String?
+    let crossCode: String?
+    let rowFlag: String?
+    let geometry: PriorMapShelfGeometry
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case floorId = "floor_id"
+        case shapeType = "shape_type"
+        case code
+        case crossCode = "cross_code"
+        case rowFlag = "row_flag"
+        case geometry
+    }
+
+    var associationSurface: PriorMapShelf? {
+        guard shapeType == "MapTable" || shapeType == "MapTableFeature" else {
+            return nil
+        }
+        return PriorMapShelf(
+            id: id,
+            floorId: floorId,
+            code: code,
+            crossCode: crossCode,
+            rowFlag: rowFlag,
+            geometry: geometry)
     }
 }
 
@@ -53,6 +161,8 @@ struct PriorMapTagObservationRecord: Codable {
     let normalizedBounds: [Double]
     let frameTimestamp: TimeInterval
     let poseTimestampDeltaMs: Double
+    let alignmentVersion: Int
+    let alignmentSnapshotTimestamp: TimeInterval
     let rawMapPosition: PriorMapTagPoint3D?
     let measurementMethod: String
     let measurementConfidence: Double
@@ -74,6 +184,8 @@ struct PriorMapTagObservationRecord: Codable {
         case normalizedBounds = "normalized_bounds"
         case frameTimestamp = "frame_timestamp"
         case poseTimestampDeltaMs = "pose_timestamp_delta_ms"
+        case alignmentVersion = "alignment_version"
+        case alignmentSnapshotTimestamp = "alignment_snapshot_timestamp"
         case rawMapPosition = "raw_map_position"
         case measurementMethod = "measurement_method"
         case measurementConfidence = "measurement_confidence"
@@ -184,6 +296,7 @@ private struct ShelfSideCandidate {
     let distanceM: Double
     let score: Double
     let occluded: Bool
+    let blockedByOtherStructure: Bool
 }
 
 private struct PriorMapShelfEdge {
@@ -195,6 +308,12 @@ private struct PriorMapShelfEdge {
 }
 
 enum ShelfAssociation {
+    private struct OccludingStructure {
+        let id: String
+        let geometry: PriorMapShelfGeometry
+        let associateable: Bool
+    }
+
     private static func projection(
         point: SIMD2<Double>,
         start: SIMD2<Double>,
@@ -241,15 +360,60 @@ enum ShelfAssociation {
         }
     }
 
+    private static func boundaryEdges(
+        _ geometry: PriorMapShelfGeometry
+    ) -> [(SIMD2<Double>, SIMD2<Double>)] {
+        let points = geometry.coordinates.compactMap { value -> SIMD2<Double>? in
+            guard value.count >= 2 else { return nil }
+            return SIMD2<Double>(value[0], value[1])
+        }
+        guard points.count >= 3 else { return [] }
+        return points.indices.compactMap { index in
+            let following = (index + 1) % points.count
+            let start = points[index]
+            let end = points[following]
+            return simd_length(end - start) > 1.0e-9 ? (start, end) : nil
+        }
+    }
+
+    private static func segmentIntersectsBeforeTarget(
+        origin: SIMD2<Double>,
+        target: SIMD2<Double>,
+        edgeStart: SIMD2<Double>,
+        edgeEnd: SIMD2<Double>
+    ) -> Bool {
+        let ray = target - origin
+        let edge = edgeEnd - edgeStart
+        let denominator = ray.x * edge.y - ray.y * edge.x
+        guard abs(denominator) > 1.0e-9 else { return false }
+        let delta = edgeStart - origin
+        let rayRatio = (delta.x * edge.y - delta.y * edge.x) / denominator
+        let edgeRatio = (delta.x * ray.y - delta.y * ray.x) / denominator
+        return rayRatio > 0.02
+            && rayRatio < 0.95
+            && edgeRatio >= 0
+            && edgeRatio <= 1
+    }
+
     private static func associationCandidates(
         rawPosition: PriorMapTagPoint3D,
         cameraPosition: SIMD2<Double>,
-        shelves: [PriorMapShelf]
+        shelves: [PriorMapShelf],
+        fixedStructures: [PriorMapFixedStructure]
     ) -> [ShelfSideCandidate] {
         let tag = SIMD2<Double>(rawPosition.xM, rawPosition.yM)
         let cameraRay = tag - cameraPosition
         let rayLength = max(1.0e-9, simd_length(cameraRay))
-        return shelves.flatMap { shelf in
+        let associationSurfaces = shelves + fixedStructures.compactMap(\.associationSurface)
+        let occluders = shelves.map {
+            OccludingStructure(id: $0.id, geometry: $0.geometry, associateable: true)
+        } + fixedStructures.map {
+            OccludingStructure(
+                id: $0.id,
+                geometry: $0.geometry,
+                associateable: $0.associationSurface != nil)
+        }
+        return associationSurfaces.flatMap { shelf in
             let sides = longSides(shelf)
             return sides.compactMap { edge -> ShelfSideCandidate? in
                 let projected = projection(
@@ -271,33 +435,31 @@ enum ShelfAssociation {
                 let endpointPenalty = projected.ratio <= 0.02 || projected.ratio >= 0.98
                     ? 0.18
                     : 0
-                let occluded = sides.contains { other in
-                    guard other.side != edge.side else { return false }
-                    let otherDelta = other.end - other.start
-                    let denominator =
-                        cameraRay.x * otherDelta.y
-                        - cameraRay.y * otherDelta.x
-                    guard abs(denominator) > 1.0e-9 else { return false }
-                    let originDelta = other.start - cameraPosition
-                    let rayRatio =
-                        (originDelta.x * otherDelta.y
-                            - originDelta.y * otherDelta.x)
-                        / denominator
-                    let edgeRatio =
-                        (originDelta.x * cameraRay.y
-                            - originDelta.y * cameraRay.x)
-                        / denominator
-                    return rayRatio > 0.02
-                        && rayRatio < 0.95
-                        && edgeRatio >= 0
-                        && edgeRatio <= 1
+                let blockedByOtherStructure = occluders.contains { structure in
+                    guard structure.id != shelf.id else { return false }
+                    return boundaryEdges(structure.geometry).contains { blocker in
+                        segmentIntersectsBeforeTarget(
+                            origin: cameraPosition,
+                            target: projected.point,
+                            edgeStart: blocker.0,
+                            edgeEnd: blocker.1)
+                    }
                 }
+                let hiddenByOwnFarFace = sides
+                    .filter { $0.side != edge.side }
+                    .contains { blocker in
+                        segmentIntersectsBeforeTarget(
+                            origin: cameraPosition,
+                            target: projected.point,
+                            edgeStart: blocker.start,
+                            edgeEnd: blocker.end)
+                    }
+                let occluded = blockedByOtherStructure || hiddenByOwnFarFace
                 let score = max(
                     0,
                     1
                         - projected.distance / 1.20
                         - endpointPenalty
-                        - (occluded ? 0.35 : 0)
                         + 0.20 * facing)
                 return ShelfSideCandidate(
                     shelf: shelf,
@@ -308,7 +470,8 @@ enum ShelfAssociation {
                     offsetM: projected.ratio * edgeLength,
                     distanceM: projected.distance,
                     score: min(1, score),
-                    occluded: occluded)
+                    occluded: occluded,
+                    blockedByOtherStructure: blockedByOtherStructure)
             }
         }.sorted { first, second in
             if first.score != second.score {
@@ -325,20 +488,32 @@ enum ShelfAssociation {
         origin: SIMD2<Double>,
         direction: SIMD2<Double>,
         shelves: [PriorMapShelf],
+        fixedStructures: [PriorMapFixedStructure] = [],
         floorId: String,
         maximumDistanceM: Double = 5.0
     ) -> PriorMapTagPoint3D? {
         let rayLength = simd_length(direction)
         guard rayLength > 1.0e-9 else { return nil }
         let ray = direction / rayLength
-        var nearest: (distance: Double, point: SIMD2<Double>)?
-        for shelf in shelves where shelf.floorId == floorId {
-            for edge in longSides(shelf) {
-                let deltaEdge = edge.end - edge.start
+        var nearest: (distance: Double, point: SIMD2<Double>, associateable: Bool)?
+        let structures = shelves
+            .filter { $0.floorId == floorId }
+            .map { OccludingStructure(id: $0.id, geometry: $0.geometry, associateable: true) }
+            + fixedStructures
+                .filter { $0.floorId == floorId }
+                .map {
+                    OccludingStructure(
+                        id: $0.id,
+                        geometry: $0.geometry,
+                        associateable: $0.associationSurface != nil)
+                }
+        for structure in structures {
+            for edge in boundaryEdges(structure.geometry) {
+                let deltaEdge = edge.1 - edge.0
                 let denominator =
                     ray.x * deltaEdge.y - ray.y * deltaEdge.x
                 guard abs(denominator) > 1.0e-8 else { continue }
-                let delta = edge.start - origin
+                let delta = edge.0 - origin
                 let distance =
                     (delta.x * deltaEdge.y - delta.y * deltaEdge.x)
                     / denominator
@@ -351,13 +526,15 @@ enum ShelfAssociation {
                 }
                 let point = origin + ray * distance
                 if nearest == nil || distance < nearest!.distance {
-                    nearest = (distance, point)
+                    nearest = (distance, point, structure.associateable)
                 }
             }
         }
-        return nearest.map {
-            PriorMapTagPoint3D(xM: $0.point.x, yM: $0.point.y, heightM: nil)
-        }
+        guard let nearest, nearest.associateable else { return nil }
+        return PriorMapTagPoint3D(
+            xM: nearest.point.x,
+            yM: nearest.point.y,
+            heightM: nil)
     }
 
     static func localizedTag(
@@ -368,6 +545,7 @@ enum ShelfAssociation {
         rawPosition: PriorMapTagPoint3D?,
         cameraPosition: SIMD2<Double>,
         shelves: [PriorMapShelf],
+        fixedStructures: [PriorMapFixedStructure] = [],
         localizationState: String,
         localizationConfidence: Double,
         measurementConfidence: Double,
@@ -382,10 +560,16 @@ enum ShelfAssociation {
             associationCandidates(
                 rawPosition: $0,
                 cameraPosition: cameraPosition,
-                shelves: shelves.filter { $0.floorId == floorId })
+                shelves: shelves.filter { $0.floorId == floorId },
+                fixedStructures: fixedStructures.filter { $0.floorId == floorId })
         } ?? []
-        let best = candidates.first
-        let second = candidates.dropFirst().first
+        // If the geometrically best surface is hidden, do not silently select
+        // a farther surface. The UI may still retain the raw observation for
+        // explicit review, but it receives no default structure assignment.
+        let best = candidates.first?.blockedByOtherStructure == false
+            ? candidates.first
+            : nil
+        let second = best == nil ? nil : candidates.dropFirst().first
         let margin = best.map { $0.score - (second?.score ?? 0) } ?? 0
         let associationConfidence = best.map {
             min(1, max(0, $0.score * min(1, margin / 0.20 + 0.35)))

@@ -324,6 +324,7 @@ final class SupermarketScanSession {
     private let sidecarWriteLock = NSLock()
     private let eventLogLock = NSLock()
     private let localizationLogLock = NSLock()
+    private let localizationTransactionLock = NSLock()
     private var customBaseDirectory: URL?
     private(set) var rootDirectory: URL?
     private(set) var segmentIndex: Int = 0
@@ -366,9 +367,15 @@ final class SupermarketScanSession {
             return finalizingScan
         }
         set {
+            if newValue {
+                localizationTransactionLock.lock()
+            }
             captureLock.lock()
-            defer { captureLock.unlock() }
             finalizingScan = newValue
+            captureLock.unlock()
+            if newValue {
+                localizationTransactionLock.unlock()
+            }
         }
     }
 
@@ -924,15 +931,21 @@ final class SupermarketScanSession {
         }
     }
 
-    func appendLocalizationTrace(_ update: PriorMapLocalizationUpdate) {
+    func appendLocalizationTrace(
+        _ update: PriorMapLocalizationUpdate,
+        expectedTrackingSessionId: String
+    ) {
+        localizationTransactionLock.lock()
+        defer { localizationTransactionLock.unlock() }
         appendLocalizationRecord(
             update,
-            fileName: "localization_trace.jsonl")
+            fileName: "localization_trace.jsonl",
+            expectedTrackingSessionId: expectedTrackingSessionId)
         let constraint = PriorMapConstraintRecord(
             format: "MarketScannerLocalizationConstraint",
             version: 1,
             timestamp: update.timestamp,
-            trackingSessionId: trackingSessionId,
+            trackingSessionId: expectedTrackingSessionId,
             priorMapId: scanConfiguration.priorMapId,
             priorMapSha256: scanConfiguration.priorMapSha256,
             floorId: scanConfiguration.floorId,
@@ -948,13 +961,14 @@ final class SupermarketScanSession {
             matcherElapsedMs: update.matcherElapsedMs)
         appendLocalizationRecord(
             constraint,
-            fileName: "localization_constraints.jsonl")
+            fileName: "localization_constraints.jsonl",
+            expectedTrackingSessionId: expectedTrackingSessionId)
         if lastLocalizationState != update.localizationState {
             let stateEvent = PriorMapStateEvent(
                 format: "MarketScannerLocalizationStateEvent",
                 version: 1,
                 timestamp: update.timestamp,
-                trackingSessionId: trackingSessionId,
+                trackingSessionId: expectedTrackingSessionId,
                 priorMapId: scanConfiguration.priorMapId,
                 priorMapSha256: scanConfiguration.priorMapSha256,
                 floorId: scanConfiguration.floorId,
@@ -964,26 +978,47 @@ final class SupermarketScanSession {
                 reason: update.constraintReason)
             appendLocalizationRecord(
                 stateEvent,
-                fileName: "localization_events.jsonl")
+                fileName: "localization_events.jsonl",
+                expectedTrackingSessionId: expectedTrackingSessionId)
             lastLocalizationState = update.localizationState
         }
     }
 
     @discardableResult
     func appendTagObservation(_ observation: PriorMapTagObservationRecord) -> Bool {
+        localizationTransactionLock.lock()
+        defer { localizationTransactionLock.unlock() }
         return appendLocalizationRecord(
             observation,
-            fileName: "tag_observations.jsonl")
+            fileName: "tag_observations.jsonl",
+            expectedTrackingSessionId: observation.trackingSessionId)
     }
 
     @discardableResult
     func recordLocalizedPriceTag(_ tag: LocalizedPriceTag) -> Bool {
+        localizationTransactionLock.lock()
+        defer { localizationTransactionLock.unlock() }
         captureLock.lock()
+        guard !finalizingScan,
+              tag.trackingSessionId == trackingSessionId,
+              let root = rootDirectory,
+              segmentIndex == 1 else {
+            captureLock.unlock()
+            return false
+        }
+        let directory = root.appendingPathComponent(
+            "segment_0001",
+            isDirectory: true)
         localizedPriceTags.append(tag)
         let snapshot = localizedPriceTags
         captureLock.unlock()
         do {
-            let directory = try currentSegmentDirectory()
+            guard fileManager.fileExists(atPath: directory.path) else {
+                throw NSError(
+                    domain: "SupermarketScanSession",
+                    code: 20,
+                    userInfo: [NSLocalizedDescriptionKey: "The active scan directory no longer exists."])
+            }
             let encoder = JSONEncoder()
             encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
             let data = try encoder.encode(snapshot)
@@ -1006,8 +1041,11 @@ final class SupermarketScanSession {
     func appendManualLocalizationEvent(
         reason: String,
         arkitPose: PriorMapPose2D,
-        confirmedMapPose: PriorMapPose2D
+        confirmedMapPose: PriorMapPose2D,
+        expectedTrackingSessionId: String
     ) {
+        localizationTransactionLock.lock()
+        defer { localizationTransactionLock.unlock() }
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         let now = Date()
@@ -1016,26 +1054,36 @@ final class SupermarketScanSession {
             version: 1,
             timestamp: formatter.string(from: now),
             timestampUnix: now.timeIntervalSince1970,
-            trackingSessionId: trackingSessionId,
+            trackingSessionId: expectedTrackingSessionId,
             reason: reason,
             arkitPose: arkitPose,
             confirmedMapPose: confirmedMapPose)
         appendLocalizationRecord(
             event,
-            fileName: "manual_localization_events.jsonl")
+            fileName: "manual_localization_events.jsonl",
+            expectedTrackingSessionId: expectedTrackingSessionId)
     }
 
     @discardableResult
     private func appendLocalizationRecord<T: Encodable>(
         _ record: T,
-        fileName: String
+        fileName: String,
+        expectedTrackingSessionId: String
     ) -> Bool {
-        let directory: URL
-        do {
-            directory = try currentSegmentDirectory()
+        captureLock.lock()
+        guard !finalizingScan,
+              expectedTrackingSessionId == trackingSessionId,
+              let root = rootDirectory,
+              segmentIndex == 1 else {
+            captureLock.unlock()
+            return false
         }
-        catch {
-            print("Could not create localization log directory: \(error)")
+        let directory = root.appendingPathComponent(
+            "segment_0001",
+            isDirectory: true)
+        captureLock.unlock()
+        guard fileManager.fileExists(atPath: directory.path) else {
+            print("Could not append localization record: active directory is unavailable")
             return false
         }
         localizationLogLock.lock()

@@ -32,13 +32,14 @@
 | --- | --- | --- |
 | 线程、状态、距离场与失败策略 | 已实现 | `STAGE_2_DESIGN.md`、`PriorMapScanMatcher.swift`、in-flight gate |
 | 多分辨率确定性距离场 | 已实现 | 0.40/0.20/0.10 m、2 m 截断、RLE、逐层 SHA-256、schema 负向测试 |
-| 深度结构提取和扫描匹配 | 已实现 | scene depth、跨帧 voxel 证据、600 点上限、粗中细搜索、Top‑3、歧义/修正门控 |
+| 深度结构提取和扫描匹配 | 已实现 | scene depth、跨帧 voxel 证据、600 点上限、粗中细多盆地传播、全窗真实次佳 Top‑3、周期结构保守拒绝 |
 | 状态和置信度滞回 | 已实现 | initializing/stable/usable/weak/lost/manualCorrection；连续可信和 stale 门限集中管理 |
-| Vision QR/条形码识别 | 已实现 | 用户触发；复用 `ARFrame.capturedImage`；QR/EAN/Code128/UPCE/PDF417；去重和单任务上限 |
-| 标签三维测量与货架关联 | 已实现 | 同帧 depth 中值/MAD；货架射线回退；侧面、offset、高度、歧义/端点/范围门控 |
+| Vision QR/条形码识别 | 已实现 | 用户触发；复用 `ARFrame.capturedImage`；捕获时对齐快照与版本；四方向 ROI；QR/EAN/Code128/UPCE/PDF417 |
+| 标签三维测量与结构关联 | 已实现 | 同帧 depth；楼面法向/残差/时序置信度；货架/柜台；跨结构遮挡；侧面、offset、高度和歧义门控 |
 | 阶段二 sidecar 和移动 UI | 已实现 | constraint/state/tag observation JSONL、localized tags JSON、结构指标 HUD 和确认 UI |
 | PC 会话检查 | 已实现 | `/api/session/inspect` 有界汇总约束、状态、观测、最终价签和 malformed 计数 |
-| 阶段二回放与指标 | 已实现 | `replay_stage2.py`；动态干扰、错误初始位姿、误差和 matcher p50/p95 |
+| 阶段二回放与指标 | 已实现 | iOS 同款校正门控/gain/锚点/状态；周期结构、动态干扰、错误初始位姿、tracking 恢复、yaw/通道/跳变和 matcher p50/p95 |
+| 结束并发一致性 | 已实现 | finalization 先失效 generation 并有界 drain；sidecar 写入校验 tracking session 和 finalizing，禁止隐式新会话 |
 
 ## 尚未完成的发布门槛
 

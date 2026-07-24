@@ -18,6 +18,8 @@ struct PriceTagVisionDetection {
     let symbology: String
     let normalizedBounds: CGRect
     let frame: ARFrame
+    let alignmentSnapshot: PriorMapAlignmentSnapshot
+    let imageOrientation: PriorMapCapturedImageOrientation
 }
 
 final class PriceTagVisionScanner {
@@ -49,6 +51,8 @@ final class PriceTagVisionScanner {
 
     func submitIfRequested(
         frame: ARFrame,
+        orientation: CGImagePropertyOrientation,
+        alignmentSnapshot: PriorMapAlignmentSnapshot,
         completion: @escaping (Result<PriceTagVisionDetection, Error>) -> Void
     ) {
         lock.lock()
@@ -75,7 +79,7 @@ final class PriceTagVisionScanner {
                 ]
                 let handler = VNImageRequestHandler(
                     cvPixelBuffer: frame.capturedImage,
-                    orientation: .right,
+                    orientation: orientation,
                     options: [:])
                 try handler.perform([request])
                 let candidates = (request.results ?? [])
@@ -102,13 +106,12 @@ final class PriceTagVisionScanner {
                         observationId: UUID().uuidString,
                         payload: payload,
                         symbology: best.symbology.rawValue,
-                        // Vision receives the native landscape sensor buffer
-                        // with EXIF .right. Convert its oriented, bottom-left
-                        // box back to native sensor-normalized coordinates so
-                        // the same-frame depth lookup addresses matching pixels.
-                        normalizedBounds: Self.nativeSensorBounds(
-                            visionBounds: best.boundingBox),
-                        frame: frame))
+                        normalizedBounds: PriorMapImageGeometry.nativeSensorBounds(
+                            visionBounds: best.boundingBox,
+                            orientation: Self.captureOrientation(orientation)),
+                        frame: frame,
+                        alignmentSnapshot: alignmentSnapshot,
+                        imageOrientation: Self.captureOrientation(orientation)))
             }
             catch {
                 result = .failure(error)
@@ -141,24 +144,19 @@ final class PriceTagVisionScanner {
         }
     }
 
-    private static func nativeSensorBounds(visionBounds: CGRect) -> CGRect {
-        let corners = [
-            CGPoint(x: visionBounds.minX, y: visionBounds.minY),
-            CGPoint(x: visionBounds.maxX, y: visionBounds.minY),
-            CGPoint(x: visionBounds.minX, y: visionBounds.maxY),
-            CGPoint(x: visionBounds.maxX, y: visionBounds.maxY),
-        ].map { point in
-            CGPoint(x: 1 - point.y, y: point.x)
+    private static func captureOrientation(
+        _ orientation: CGImagePropertyOrientation
+    ) -> PriorMapCapturedImageOrientation {
+        switch orientation {
+        case .up:
+            return .up
+        case .down:
+            return .down
+        case .left:
+            return .left
+        default:
+            return .right
         }
-        let minimumX = corners.map(\.x).min() ?? 0
-        let maximumX = corners.map(\.x).max() ?? 0
-        let minimumY = corners.map(\.y).min() ?? 0
-        let maximumY = corners.map(\.y).max() ?? 0
-        return CGRect(
-            x: minimumX,
-            y: minimumY,
-            width: maximumX - minimumX,
-            height: maximumY - minimumY)
     }
 }
 
@@ -173,7 +171,9 @@ struct PriceTagFrameMeasurement {
         detection: PriceTagVisionDetection,
         floorId: String,
         shelves: [PriorMapShelf],
-        floorHeightWorldM: Double?,
+        fixedStructures: [PriorMapFixedStructure],
+        floorEstimate: PriorMapFloorEstimate?,
+        poseTimestampDeltaMs: Double,
         mapPoint: (SIMD3<Float>) -> PriorMapTagPoint3D
     ) -> PriceTagFrameMeasurement {
         let frame = detection.frame
@@ -191,7 +191,10 @@ struct PriceTagFrameMeasurement {
                 depth: depth,
                 bounds: detection.normalizedBounds) {
             let mapped = mapPoint(worldPoint)
-            let height = floorHeightWorldM.map { Double(worldPoint.y) - $0 }
+            let height = floorEstimate.map {
+                Double(worldPoint.y) - $0.heightWorldM
+            }
+            let floorConfidence = floorEstimate?.confidence ?? 0
             return PriceTagFrameMeasurement(
                 rawMapPosition: PriorMapTagPoint3D(
                     xM: mapped.xM,
@@ -201,8 +204,10 @@ struct PriceTagFrameMeasurement {
                 method: frame.smoothedSceneDepth != nil
                     ? "smoothed_scene_depth"
                     : "scene_depth",
-                confidence: height == nil ? 0.72 : 0.90,
-                poseTimestampDeltaMs: 0)
+                confidence: height == nil
+                    ? 0.68
+                    : min(0.90, 0.68 + 0.22 * floorConfidence),
+                poseTimestampDeltaMs: poseTimestampDeltaMs)
         }
 
         let bounds = detection.normalizedBounds
@@ -226,13 +231,14 @@ struct PriceTagFrameMeasurement {
                 secondMap.xM - cameraMap.xM,
                 secondMap.yM - cameraMap.yM),
             shelves: shelves,
+            fixedStructures: fixedStructures,
             floorId: floorId)
         return PriceTagFrameMeasurement(
             rawMapPosition: fallback,
             cameraMapPosition: camera2D,
             method: fallback == nil ? "unavailable" : "shelf_plane_ray",
             confidence: fallback == nil ? 0 : 0.42,
-            poseTimestampDeltaMs: 0)
+            poseTimestampDeltaMs: poseTimestampDeltaMs)
     }
 
     private static func robustWorldPoint(

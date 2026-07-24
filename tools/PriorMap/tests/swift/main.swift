@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 
 func require(_ condition: @autoclosure () -> Bool, _ message: String) {
     if !condition() {
@@ -161,6 +162,88 @@ let weak = confidenceManager.update(
     mapMismatch: false)
 require(weak.phase == .weak, "limited tracking must degrade to weak")
 
+let temporalGate = PriorMapTemporalCorrectionGate()
+let firstMovingCandidate = temporalGate.observe(
+    rawPose: PriorMapPose2D(xM: 0, yM: 0, yawRad: 0),
+    candidatePose: PriorMapPose2D(xM: 0.2, yM: 0.05, yawRad: 0.02))
+let secondMovingCandidate = temporalGate.observe(
+    rawPose: PriorMapPose2D(xM: 1.2, yM: 0, yawRad: 0),
+    candidatePose: PriorMapPose2D(xM: 1.4, yM: 0.05, yawRad: 0.02))
+require(!firstMovingCandidate, "one correction must not pass the temporal gate")
+require(
+    secondMovingCandidate,
+    "normal walking with a stable correction transform must pass")
+temporalGate.reset()
+_ = temporalGate.observe(
+    rawPose: PriorMapPose2D(xM: 0, yM: 0, yawRad: .pi / 2),
+    candidatePose: PriorMapPose2D(xM: 0, yM: 0.2, yawRad: .pi / 2 + 0.02))
+require(
+    temporalGate.observe(
+        rawPose: PriorMapPose2D(xM: 0, yM: 1, yawRad: .pi / 2),
+        candidatePose: PriorMapPose2D(xM: 0, yM: 1.2, yawRad: .pi / 2 + 0.02)),
+    "turning motion must be removed before comparing correction transforms")
+
+let orientedBounds = CGRect(x: 0.1, y: 0.2, width: 0.3, height: 0.4)
+let rightBounds = PriorMapImageGeometry.nativeSensorBounds(
+    visionBounds: orientedBounds,
+    orientation: .right)
+require(close(rightBounds.origin.x, 0.4), "right orientation x mapping")
+require(close(rightBounds.origin.y, 0.1), "right orientation y mapping")
+require(close(rightBounds.width, 0.4), "right orientation width mapping")
+require(close(rightBounds.height, 0.3), "right orientation height mapping")
+let leftBounds = PriorMapImageGeometry.nativeSensorBounds(
+    visionBounds: orientedBounds,
+    orientation: .left)
+require(close(leftBounds.origin.x, 0.2), "left orientation x mapping")
+require(close(leftBounds.origin.y, 0.6), "left orientation y mapping")
+let downBounds = PriorMapImageGeometry.nativeSensorBounds(
+    visionBounds: orientedBounds,
+    orientation: .down)
+require(close(downBounds.origin.x, 0.6), "down orientation x mapping")
+require(close(downBounds.origin.y, 0.4), "down orientation y mapping")
+let upBounds = PriorMapImageGeometry.nativeSensorBounds(
+    visionBounds: orientedBounds,
+    orientation: .up)
+require(close(upBounds.origin.x, 0.1), "up orientation x mapping")
+require(close(upBounds.origin.y, 0.2), "up orientation y mapping")
+
+let floorEstimator = PriorMapFloorPlaneEstimator()
+let floorSamples = (0..<80).map {
+    PriorMapFloorSample(
+        heightWorldM: -1.5 + Double($0 % 5 - 2) * 0.002,
+        relativeHeightM: -1.5,
+        upAlignment: 0.98)
+}
+let firstFloor = floorEstimator.update(samples: floorSamples)
+var stableFloor = firstFloor
+for _ in 0..<5 {
+    stableFloor = floorEstimator.update(samples: floorSamples)
+}
+require(firstFloor != nil, "a supported horizontal floor plane must be estimated")
+require(
+    (stableFloor?.confidence ?? 0) > (firstFloor?.confidence ?? 1),
+    "floor confidence must depend on temporal stability")
+floorEstimator.reset()
+require(
+    floorEstimator.update(
+        samples: floorSamples.map { sample in
+            PriorMapFloorSample(
+                heightWorldM: sample.heightWorldM,
+                relativeHeightM: sample.relativeHeightM,
+                upAlignment: 0.3)
+        }) == nil,
+    "non-horizontal low objects must not become the floor")
+floorEstimator.reset()
+require(
+    floorEstimator.update(
+        samples: floorSamples.map { _ in
+            PriorMapFloorSample(
+                heightWorldM: -0.7,
+                relativeHeightM: -0.7,
+                upAlignment: 0.99)
+        }) == nil,
+    "a horizontal low shelf or cart must not become the floor")
+
 let shelf = PriorMapShelf(
     id: "shelf-1",
     floorId: "1",
@@ -218,6 +301,83 @@ let backside = ShelfAssociation.localizedTag(
     measurementMethod: "scene_depth",
     userConfirmed: false)
 require(backside.needsReview, "a shelf face hidden behind the near face requires review")
+
+let rearShelf = PriorMapShelf(
+    id: "rear",
+    floorId: "1",
+    code: "REAR",
+    crossCode: nil,
+    rowFlag: nil,
+    geometry: PriorMapShelfGeometry(
+        type: "Polygon",
+        coordinates: [[0, 2], [4, 2], [4, 3], [0, 3], [0, 2]]))
+let blockedRear = ShelfAssociation.localizedTag(
+    observationId: "blocked-rear",
+    payload: "blocked-rear",
+    symbology: "QR",
+    floorId: "1",
+    rawPosition: PriorMapTagPoint3D(xM: 2, yM: 1.95, heightM: 1.2),
+    cameraPosition: SIMD2<Double>(2, -2),
+    shelves: [shelf, rearShelf],
+    localizationState: "stable",
+    localizationConfidence: 0.9,
+    measurementConfidence: 0.9,
+    measurementMethod: "scene_depth",
+    userConfirmed: false)
+require(blockedRear.shelfCode == nil, "a rear shelf hidden by another shelf must not be preselected")
+require(blockedRear.needsReview, "cross-shelf occlusion must require review")
+
+let counter = PriorMapFixedStructure(
+    id: "counter",
+    floorId: "1",
+    shapeType: "MapTable",
+    code: "COUNTER",
+    crossCode: "C2",
+    rowFlag: nil,
+    geometry: PriorMapShelfGeometry(
+        type: "Polygon",
+        coordinates: [[6, 0], [10, 0], [10, 1], [8, 1.5], [6, 1], [6, 0]]))
+let counterTag = ShelfAssociation.localizedTag(
+    observationId: "counter",
+    payload: "counter",
+    symbology: "QR",
+    floorId: "1",
+    rawPosition: PriorMapTagPoint3D(xM: 8, yM: -0.1, heightM: 1.0),
+    cameraPosition: SIMD2<Double>(8, -2),
+    shelves: [],
+    fixedStructures: [counter],
+    localizationState: "stable",
+    localizationConfidence: 0.9,
+    measurementConfidence: 0.9,
+    measurementMethod: "scene_depth",
+    userConfirmed: false)
+require(counterTag.shelfCode == "COUNTER", "fixed counters must be associable")
+let pillar = PriorMapFixedStructure(
+    id: "pillar",
+    floorId: "1",
+    shapeType: "MapPillar",
+    code: "P1",
+    crossCode: nil,
+    rowFlag: nil,
+    geometry: PriorMapShelfGeometry(
+        type: "Polygon",
+        coordinates: [[7.7, -0.3], [8.3, -0.3], [8.3, 0.3], [7.7, 0.3], [7.7, -0.3]]))
+let pillarTag = ShelfAssociation.localizedTag(
+    observationId: "pillar",
+    payload: "pillar",
+    symbology: "QR",
+    floorId: "1",
+    rawPosition: PriorMapTagPoint3D(xM: 8, yM: 0, heightM: 1),
+    cameraPosition: SIMD2<Double>(8, -2),
+    shelves: [],
+    fixedStructures: [pillar],
+    localizationState: "stable",
+    localizationConfidence: 0.9,
+    measurementConfidence: 0.9,
+    measurementMethod: "scene_depth",
+    userConfirmed: false)
+require(pillarTag.shelfCode == nil, "pillars must remain blockers, not tag surfaces")
+require(pillarTag.needsReview, "a pillar-only hit must require review")
 
 let endpoint = ShelfAssociation.localizedTag(
     observationId: "endpoint",
@@ -311,5 +471,76 @@ let unsafe = ShelfAssociation.localizedTag(
     measurementMethod: "scene_depth",
     userConfirmed: false)
 require(unsafe.needsReview, "lost localization may never auto-confirm a tag")
+
+func distanceLevel(
+    resolution: Double,
+    verticalLines: [Double]
+) -> PriorMapDistanceFieldLevel {
+    let origin = [-2.0, -2.0]
+    let width = Int(4.0 / resolution)
+    let height = Int(4.0 / resolution)
+    let rowValues: [Int] = (0..<width).map { column in
+        let center = origin[0] + (Double(column) + 0.5) * resolution
+        let distance = verticalLines.map {
+            max(0, abs(center - $0) - resolution / 2)
+        }.min() ?? 2.55
+        return min(255, Int((distance * 100).rounded()))
+    }
+    var encodedRow: [Int] = []
+    for value in rowValues {
+        if encodedRow.count >= 2, encodedRow[encodedRow.count - 1] == value {
+            encodedRow[encodedRow.count - 2] += 1
+        }
+        else {
+            encodedRow.append(1)
+            encodedRow.append(value)
+        }
+    }
+    let rows = Array(repeating: encodedRow, count: height)
+    let canonical = "[" + rows.map {
+        "[" + $0.map(String.init).joined(separator: ",") + "]"
+    }.joined(separator: ",") + "]"
+    let digest = SHA256.hash(data: Data(canonical.utf8))
+        .map { String(format: "%02x", $0) }
+        .joined()
+    return PriorMapDistanceFieldLevel(
+        resolutionM: resolution,
+        originM: origin,
+        width: width,
+        height: height,
+        encoding: "row_rle_u8_cm",
+        dataSha256: digest,
+        rows: rows)
+}
+
+do {
+    let periodicFloor = PriorMapDistanceFieldFloor(
+        levels: [0.4, 0.2, 0.1].map {
+            distanceLevel(resolution: $0, verticalLines: [0, 0.6])
+        })
+    let periodicMatcher = try PriorMapScanMatcher(
+        floor: periodicFloor,
+        truncationM: 2.55)
+    let observation = PriorMapStructureObservation(
+        points: (0..<80).map {
+            SIMD2<Double>(0, -1.5 + Double($0) * 3.0 / 79.0)
+        },
+        validPointCount: 80,
+        coverageAngleRad: 1.2,
+        floorEstimate: nil,
+        source: "test")
+    let periodic = periodicMatcher.match(
+        predictedPose: PriorMapPose2D(xM: 0.3, yM: 0, yawRad: 0),
+        observation: observation)
+    require(
+        !periodic.acceptedByGeometry,
+        "periodic equal-cost structure basins must fail closed")
+    require(
+        periodic.uniqueness < 0.10,
+        "uniqueness must compare independent global basins")
+}
+catch {
+    require(false, "periodic matcher fixture must load: \(error)")
+}
 
 print("PriorMapLocalizationCore Swift tests passed")

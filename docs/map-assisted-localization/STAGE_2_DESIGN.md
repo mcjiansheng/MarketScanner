@@ -10,7 +10,7 @@
 - ARKit 高频水平预测；
 - scene depth 有界结构采样；
 - 单楼层先验结构距离场上的有限 SE(2) 搜索；
-- Top-3 假设、唯一性、连续性和多帧一致性门控；
+- 全搜索窗多盆地 Top-3 假设、唯一性、连续性和多帧校正变换一致性门控；
 - Vision QR/条形码识别；
 - 深度反投影或货架边射线求交；
 - 货架、侧面、沿货架起点距离和高度关联；
@@ -55,7 +55,8 @@ SupermarketScanSession.swift
 - `ARSessionDelegate` 把当前 `ARFrame` 引用交给有界调度器；最多一个结构任务和一个用户触发的 Vision 任务在途，任务结束后释放帧。
 - 结构匹配使用单独串行队列，目标 1–2 Hz；最多一个任务在途，忙时丢弃旧价值较低的新任务。
 - Vision 使用独立串行队列，只有用户点击“扫描价签”后才接受一个有时限请求，不启动第二相机。
-- 每个后台结果带 session generation 和 gate ticket；暂停、清理、结束或新会话会使旧结果失效。
+- 每个后台结果带 session generation、tracking session ID 和 gate ticket；暂停、清理、结束或新会话会使旧结果失效。
+- 结束扫描先递增 generation、停止 Vision 请求并对定位队列执行 2 秒有界 barrier；定位 sidecar 写入还必须同时满足 tracking session ID 一致且会话未进入 finalizing，不能隐式创建新目录。
 - 深度点最多 1,200 个，matcher 最多使用 600 点，搜索候选最多 3 个，标签去重窗口 2 秒。
 - 内存/温度保护继续由现有扫描控制器负责；原始采集按现有资源策略处理。
 
@@ -78,12 +79,12 @@ SupermarketScanSession.swift
 距离场由可见货架、柱子、柜台和柜台特征边界生成。扫描匹配：
 
 1. 以 ARKit 预测为中心；
-2. coarse/medium/fine 逐级搜索有限 `dx/dy/dyaw`；
+2. coarse/medium/fine 每一级保留最多 8 个空间分离盆地并分别向下展开，而不是只细化单个最佳盆地；
 3. 使用截断平方鲁棒损失；
-4. 计算有效点数、覆盖角、最佳/次佳分数和唯一性；
+4. 在整个允许搜索窗的独立局部极小值间计算最佳/次佳和唯一性；找不到真实次佳候选时按无法证明唯一处理并拒绝；
 5. 道路只保留为显示/弱先验，不参与结构唯一性的硬判定；
 6. 保留 Top-3 非极大候选；
-7. 通过平移、角度、连续性、多帧一致性和 tracking 恢复门后才更新 `T_map_from_arkit`；
+7. 以 `bestPose ⊖ rawPose` 校正变换而非相邻相机绝对位置判断多帧一致性；通过平移、角度、连续性和 tracking 恢复门后才更新 `T_map_from_arkit`；
 8. 普通单次接受上限 0.35 m / 8°，更大变化只能进入 recovery 或人工校准。
 
 地图长期不匹配时记录 `mapMismatch`，保持 ARKit 预测，不强拉到地图。
@@ -112,12 +113,15 @@ uninitialized -> initializing -> stable | usable | weak | lost
 
 - 使用 `VNDetectBarcodesRequest` 处理当前 `ARFrame.capturedImage`。
 - 支持 QR、EAN-8/EAN-13、Code 128、UPC-E 和 PDF417。
-- 识别请求由用户按钮触发，后台执行，保留 payload、symbology、归一化框和帧时间。
+- 识别请求由用户按钮触发，后台执行；按捕获时界面方向传入 Vision，并为 up/down/left/right 分别把框逆变换到原始深度像素。
+- 提交 Vision 时冻结 `T_map_from_arkit`、定位状态/置信度、楼面估计、对齐版本和来源帧时间；识别完成后不得读取更新后的对齐替代该快照。
 - 深度路径使用码框中心/角点及内点的有效深度中位数，拒绝非有限、过近/过远、离群和时间不匹配。
 - 无可靠深度时，只能用相机射线与候选货架边的竖直平面求交；若几何不唯一或射线方向不合理，保留 pending observation。
 - 永远同时记录 raw 与 snapped 位置；手机位置不得作为标签位置。
 
-货架关联评分综合到边距离、射线朝向、货架法线、边内投影和遮挡。最佳/次佳接近、超出边范围、背面或隔着其他结构时标记复核。
+楼面高度只从法向接近重力方向的低位点中估计，使用稳健平面残差、内点率和连续帧稳定性共同计算置信度；同一楼层坡道或地面起伏只允许每帧缓慢更新。
+
+货架/柜台关联评分综合到边距离、射线朝向、结构法线、边内投影和遮挡。`MapShelf`、`MapTable` 和 `MapTableFeature` 可关联，`MapPillar` 只作遮挡体。遮挡判断遍历所选楼层全部结构并使用最近射线命中；若几何最佳结构被另一结构遮挡，则不默认选择更远结构，只保留原始观测等待人工复核。
 
 ## Sidecar
 

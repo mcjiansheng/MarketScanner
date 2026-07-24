@@ -114,8 +114,97 @@ struct PriorMapStructureObservation {
     let points: [SIMD2<Double>]
     let validPointCount: Int
     let coverageAngleRad: Double
-    let floorHeightWorldM: Double?
+    let floorEstimate: PriorMapFloorEstimate?
     let source: String
+}
+
+struct PriorMapFloorSample {
+    let heightWorldM: Double
+    let relativeHeightM: Double
+    let upAlignment: Double
+}
+
+struct PriorMapFloorEstimate {
+    let heightWorldM: Double
+    let confidence: Double
+    let inlierRatio: Double
+    let residualM: Double
+    let sampleCount: Int
+    let stableFrameCount: Int
+}
+
+final class PriorMapFloorPlaneEstimator {
+    private var filteredHeight: Double?
+    private var stableFrameCount = 0
+
+    func reset() {
+        filteredHeight = nil
+        stableFrameCount = 0
+    }
+
+    func update(samples: [PriorMapFloorSample]) -> PriorMapFloorEstimate? {
+        let horizontal = samples.filter {
+            $0.heightWorldM.isFinite
+                && $0.relativeHeightM <= -1.0
+                && $0.relativeHeightM >= -2.30
+                && $0.upAlignment.isFinite
+                && $0.upAlignment >= 0.88
+        }
+        guard horizontal.count >= 16 else { return nil }
+        let heights = horizontal.map(\.heightWorldM).sorted()
+        // The floor is normally the lowest persistent horizontal surface in
+        // view. A lower quantile seed avoids letting carts or low shelves
+        // dominate a simple global median.
+        let seed = heights[min(heights.count - 1, heights.count / 5)]
+        let inliers = horizontal.filter {
+            abs($0.heightWorldM - seed) <= 0.06
+        }
+        guard inliers.count >= 12 else { return nil }
+        let orderedInliers = inliers.map(\.heightWorldM).sorted()
+        let rawHeight = orderedInliers[orderedInliers.count / 2]
+        let deviations = orderedInliers.map { abs($0 - rawHeight) }.sorted()
+        let residual = deviations[deviations.count / 2]
+        let inlierRatio = Double(inliers.count) / Double(horizontal.count)
+        guard residual <= 0.035, inlierRatio >= 0.20 else { return nil }
+
+        let height: Double
+        if let previous = filteredHeight {
+            let delta = rawHeight - previous
+            if abs(delta) <= 0.10 {
+                stableFrameCount += 1
+            }
+            else {
+                stableFrameCount = 1
+            }
+            // Preserve slow floor changes within one floor while preventing a
+            // transient low object from instantly redefining tag height.
+            height = previous + min(0.03, max(-0.03, delta))
+        }
+        else {
+            stableFrameCount = 1
+            height = rawHeight
+        }
+        filteredHeight = height
+        let normalScore = inliers.map(\.upAlignment).reduce(0, +)
+            / Double(inliers.count)
+        let residualScore = max(0, 1 - residual / 0.035)
+        let supportScore = min(1, Double(inliers.count) / 80.0)
+        let stabilityScore = min(1, Double(stableFrameCount) / 5.0)
+        let confidence = min(
+            1,
+            0.25 * normalScore
+                + 0.25 * residualScore
+                + 0.20 * supportScore
+                + 0.15 * min(1, inlierRatio / 0.60)
+                + 0.15 * stabilityScore)
+        return PriorMapFloorEstimate(
+            heightWorldM: height,
+            confidence: confidence,
+            inlierRatio: inlierRatio,
+            residualM: residual,
+            sampleCount: inliers.count,
+            stableFrameCount: stableFrameCount)
+    }
 }
 
 struct PriorMapScanMatchCandidate: Codable, Equatable {
@@ -131,6 +220,57 @@ struct PriorMapScanMatchResult {
     let acceptedByGeometry: Bool
     let rejectionReason: String
     let elapsedMs: Double
+}
+
+enum PriorMapCorrectionMath {
+    static func correction(
+        rawPose: PriorMapPose2D,
+        candidatePose: PriorMapPose2D
+    ) -> PriorMapPose2D {
+        let cosine = cos(-rawPose.yawRad)
+        let sine = sin(-rawPose.yawRad)
+        let deltaX = candidatePose.xM - rawPose.xM
+        let deltaY = candidatePose.yM - rawPose.yM
+        return PriorMapPose2D(
+            xM: cosine * deltaX - sine * deltaY,
+            yM: sine * deltaX + cosine * deltaY,
+            yawRad: PriorMapStageOneMath.normalizeAngle(
+                candidatePose.yawRad - rawPose.yawRad))
+    }
+}
+
+final class PriorMapTemporalCorrectionGate {
+    private var lastCorrection: PriorMapPose2D?
+    private(set) var consecutiveConsistent = 0
+
+    func reset() {
+        lastCorrection = nil
+        consecutiveConsistent = 0
+    }
+
+    func observe(
+        rawPose: PriorMapPose2D,
+        candidatePose: PriorMapPose2D
+    ) -> Bool {
+        let correction = PriorMapCorrectionMath.correction(
+            rawPose: rawPose,
+            candidatePose: candidatePose)
+        let consistent: Bool
+        if let previous = lastCorrection {
+            consistent = hypot(
+                correction.xM - previous.xM,
+                correction.yM - previous.yM) <= 0.12
+                && abs(PriorMapStageOneMath.normalizeAngle(
+                    correction.yawRad - previous.yawRad))
+                    <= 3.0 * .pi / 180.0
+        }
+        else {
+            consistent = false
+        }
+        consecutiveConsistent = consistent ? consecutiveConsistent + 1 : 1
+        lastCorrection = correction
+        return consecutiveConsistent >= 2
+    }
 }
 
 private struct DecodedDistanceLevel {
@@ -251,6 +391,70 @@ final class PriorMapScanMatcher {
         }
     }
 
+    private func separatedCandidates(
+        _ candidates: [PriorMapScanMatchCandidate],
+        limit: Int,
+        translationSeparationM: Double = 0.25,
+        yawSeparationDegrees: Double = 4
+    ) -> [PriorMapScanMatchCandidate] {
+        var selected: [PriorMapScanMatchCandidate] = []
+        let yawSeparation = yawSeparationDegrees * .pi / 180.0
+        for candidate in candidates {
+            let independent = selected.allSatisfy {
+                hypot(
+                    candidate.pose.xM - $0.pose.xM,
+                    candidate.pose.yM - $0.pose.yM) >= translationSeparationM
+                    || abs(PriorMapStageOneMath.normalizeAngle(
+                        candidate.pose.yawRad - $0.pose.yawRad)) >= yawSeparation
+            }
+            if independent {
+                selected.append(candidate)
+            }
+            if selected.count == limit {
+                break
+            }
+        }
+        return selected
+    }
+
+    private func refine(
+        centers: [PriorMapScanMatchCandidate],
+        fallback: PriorMapPose2D,
+        points: [SIMD2<Double>],
+        level: DecodedDistanceLevel,
+        translationRadius: Double,
+        translationStep: Double,
+        yawRadiusDegrees: Double,
+        yawStepDegrees: Double,
+        hypothesisLimit: Int
+    ) -> [PriorMapScanMatchCandidate] {
+        let poses = centers.isEmpty
+            ? [fallback]
+            : centers.map(\.pose)
+        let expanded = poses.flatMap {
+            search(
+                around: $0,
+                points: points,
+                level: level,
+                translationRadius: translationRadius,
+                translationStep: translationStep,
+                yawRadiusDegrees: yawRadiusDegrees,
+                yawStepDegrees: yawStepDegrees)
+        }.sorted {
+            if $0.cost != $1.cost {
+                return $0.cost < $1.cost
+            }
+            if $0.pose.xM != $1.pose.xM {
+                return $0.pose.xM < $1.pose.xM
+            }
+            if $0.pose.yM != $1.pose.yM {
+                return $0.pose.yM < $1.pose.yM
+            }
+            return $0.pose.yawRad < $1.pose.yawRad
+        }
+        return separatedCandidates(expanded, limit: hypothesisLimit)
+    }
+
     func match(
         predictedPose: PriorMapPose2D,
         observation: PriorMapStructureObservation
@@ -277,48 +481,44 @@ final class PriorMapScanMatcher {
             translationStep: max(0.4, levels[0].resolutionM),
             yawRadiusDegrees: 12,
             yawStepDegrees: 4)
-        let mediumCenter = coarse.first?.pose ?? predictedPose
-        let medium = search(
-            around: mediumCenter,
+        // Preserve spatially independent basins at every level. Selecting only
+        // the best coarse basin makes periodic aisles appear falsely unique.
+        let coarseHypotheses = separatedCandidates(
+            coarse,
+            limit: 8,
+            translationSeparationM: 0.35)
+        let medium = refine(
+            centers: coarseHypotheses,
+            fallback: predictedPose,
             points: points,
             level: levels[min(1, levels.count - 1)],
             translationRadius: 0.4,
             translationStep: 0.2,
             yawRadiusDegrees: 4,
-            yawStepDegrees: 2)
-        let fineCenter = medium.first?.pose ?? mediumCenter
-        let fine = search(
-            around: fineCenter,
+            yawStepDegrees: 2,
+            hypothesisLimit: 8)
+        let fine = refine(
+            centers: medium,
+            fallback: predictedPose,
             points: points,
             level: levels.last!,
             translationRadius: 0.2,
             translationStep: 0.1,
             yawRadiusDegrees: 2,
-            yawStepDegrees: 1)
-        var top: [PriorMapScanMatchCandidate] = []
-        for candidate in fine {
-            let separated = top.allSatisfy {
-                hypot(
-                    candidate.pose.xM - $0.pose.xM,
-                    candidate.pose.yM - $0.pose.yM) >= 0.25
-                    || abs(PriorMapStageOneMath.normalizeAngle(
-                        candidate.pose.yawRad - $0.pose.yawRad)) >= 4.0 * .pi / 180.0
-            }
-            if separated {
-                top.append(candidate)
-            }
-            if top.count == 3 {
-                break
-            }
-        }
+            yawStepDegrees: 1,
+            hypothesisLimit: 8)
+        let top = Array(fine.prefix(3))
         let bestCost = top.first?.cost ?? Double.infinity
-        let secondCost = top.dropFirst().first?.cost ?? bestCost + 0.2
-        let uniqueness = max(
-            0,
-            min(1, (secondCost - bestCost) / max(secondCost, 0.01)))
+        let secondCost = top.dropFirst().first?.cost
+        // A missing second independent minimum is absence of evidence, not
+        // proof of uniqueness. Fail closed instead of synthesizing a cost.
+        let uniqueness = secondCost.map {
+            max(0, min(1, ($0 - bestCost) / max($0, 0.01)))
+        } ?? 0
         let accepted = points.count >= 45
             && observation.coverageAngleRad >= 0.35
             && bestCost <= 0.10
+            && secondCost != nil
             && uniqueness >= 0.10
         let reason: String
         if observation.coverageAngleRad < 0.35 {
@@ -327,7 +527,7 @@ final class PriorMapScanMatcher {
         else if bestCost > 0.10 {
             reason = "map_mismatch"
         }
-        else if uniqueness < 0.10 {
+        else if secondCost == nil || uniqueness < 0.10 {
             reason = "ambiguous_structure_match"
         }
         else {
