@@ -26,6 +26,7 @@ if __package__ in {None, ""}:
         source_rectangle_polygon,
         source_rotation_to_yaw,
     )
+    from PriorMap.distance_field import build_distance_fields
     from PriorMap.prior_map_schema import (
         PACKAGE_FORMAT,
         PACKAGE_VERSION,
@@ -44,6 +45,7 @@ else:
         source_rectangle_polygon,
         source_rotation_to_yaw,
     )
+    from .distance_field import build_distance_fields
     from .prior_map_schema import (
         PACKAGE_FORMAT,
         PACKAGE_VERSION,
@@ -63,9 +65,16 @@ class ConversionError(ValueError):
     pass
 
 
-def _json_write(path: Path, payload: Any) -> None:
+def _json_write(path: Path, payload: Any, *, compact: bool = False) -> None:
     path.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            indent=None if compact else 2,
+            separators=(",", ":") if compact else None,
+            sort_keys=True,
+        )
+        + "\n",
         encoding="utf-8",
     )
 
@@ -534,6 +543,17 @@ def convert_workbook(
         graph = _road_graph(elements, warnings)
         manifest["warning_count"] = len(warnings) + len(result.malformed_rows)
         spatial = _spatial_index(elements, graph)
+        distance_fields = build_distance_fields(elements, floors)
+        manifest["distance_fields"] = {
+            "file": "distance_fields.json",
+            "format": distance_fields["format"],
+            "version": distance_fields["version"],
+            "resolutions_m": [
+                level["resolution_m"]
+                for level in next(iter(distance_fields["floors"].values()))["levels"]
+            ],
+            "truncation_distance_m": distance_fields["truncation_distance_m"],
+        }
         shelves = [item for item in elements if item["shape_type"] == "MapShelf"]
         fixed = [
             item
@@ -555,6 +575,14 @@ def convert_workbook(
         )
         _json_write(temporary / "road_graph.json", graph)
         _json_write(temporary / "spatial_index.json", spatial)
+        # Distance rows are already RLE-compressed. Pretty-printing every
+        # integer expands a two-floor production package by tens of MB, so
+        # keep this deterministic payload compact for mobile transfer.
+        _json_write(
+            temporary / "distance_fields.json",
+            distance_fields,
+            compact=True,
+        )
         validation_report = {
             "format": "MarketScannerPriorMapValidation",
             "version": 1,

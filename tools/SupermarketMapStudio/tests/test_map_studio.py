@@ -735,6 +735,50 @@ class MapStudioApiTests(unittest.TestCase):
         self.assertEqual(result["summary"]["multiViewStructureCellCount"], 31)
         self.assertEqual(result["summary"]["source"], "segment_0001/structure_coverage_cells.json")
 
+    def test_inspection_exposes_stage_two_localization_and_tag_audit_counts(self) -> None:
+        segment = self.session_a / "segment_0001"
+        constraints = [
+            {"accepted": True, "reason": "trusted_structure_correction"},
+            {"accepted": False, "reason": "ambiguous_structure_match"},
+        ]
+        events = [
+            {"state": "initializing"},
+            {"state": "stable"},
+            {"state": "weak"},
+        ]
+        observations = [
+            {"observation_id": "o1", "needs_review": False},
+            {"observation_id": "o2", "needs_review": True},
+        ]
+        for filename, records in (
+            ("localization_constraints.jsonl", constraints),
+            ("localization_events.jsonl", events),
+            ("tag_observations.jsonl", observations),
+        ):
+            (segment / filename).write_text(
+                "\n".join(json.dumps(record) for record in records) + "\n",
+                encoding="utf-8",
+            )
+        (segment / "localized_price_tags.json").write_text(
+            json.dumps(
+                [
+                    {"tag_id": "t1", "needs_review": False},
+                    {"tag_id": "t2", "needs_review": True},
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        inspection = self.api("/api/session/inspect", {"session": str(self.session_a)})
+        audit = inspection["prior_map_localization"]
+        self.assertTrue(audit["available"])
+        self.assertEqual(audit["constraints"], 2)
+        self.assertEqual(audit["accepted_constraints"], 1)
+        self.assertEqual(audit["state_counts"]["stable"], 1)
+        self.assertEqual(audit["tag_observations"], 2)
+        self.assertEqual(audit["localized_price_tags"], 2)
+        self.assertEqual(audit["needs_review"], 2)
+
     def test_scan_log_reader_keeps_only_the_requested_tail(self) -> None:
         log = self.session_a / "segment_0001" / "scan_events.jsonl"
         events = [

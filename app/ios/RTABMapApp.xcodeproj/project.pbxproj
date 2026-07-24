@@ -88,6 +88,10 @@
 		4EA100012F00000100100001 /* SupermarketScanSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA100012F00000100100002 /* SupermarketScanSession.swift */; };
 		4EA400012F30000100100001 /* PriorMapLocalization.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA400012F30000100100002 /* PriorMapLocalization.swift */; };
 		4EA400012F30000100100003 /* PriorMapLocalizationCore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA400012F30000100100004 /* PriorMapLocalizationCore.swift */; };
+		4EA500012F40000100100001 /* PriorMapScanMatcher.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA500012F40000100100002 /* PriorMapScanMatcher.swift */; };
+		4EA500012F40000100100003 /* PriorMapDepthSampler.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA500012F40000100100004 /* PriorMapDepthSampler.swift */; };
+		4EA500012F40000100100005 /* PriceTagLocalizationCore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA500012F40000100100006 /* PriceTagLocalizationCore.swift */; };
+		4EA500012F40000100100007 /* PriceTagVisionScanner.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA500012F40000100100008 /* PriceTagVisionScanner.swift */; };
 		4EA100012F00000100100003 /* PriceTagNFCReader.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA100012F00000100100004 /* PriceTagNFCReader.swift */; };
 		4EA100012F00000100100005 /* CoreNFC.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 4EA100012F00000100100006 /* CoreNFC.framework */; };
 		4EA300012F20000100100001 /* SupermarketStructureCoverage.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA300012F20000100100002 /* SupermarketStructureCoverage.swift */; };
@@ -196,6 +200,10 @@
 		4EA100012F00000100100004 /* PriceTagNFCReader.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = PriceTagNFCReader.swift; path = RTABMapApp/PriceTagNFCReader.swift; sourceTree = "<group>"; };
 		4EA400012F30000100100002 /* PriorMapLocalization.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = PriorMapLocalization.swift; path = RTABMapApp/PriorMapLocalization.swift; sourceTree = "<group>"; };
 		4EA400012F30000100100004 /* PriorMapLocalizationCore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = PriorMapLocalizationCore.swift; path = RTABMapApp/PriorMapLocalizationCore.swift; sourceTree = "<group>"; };
+		4EA500012F40000100100002 /* PriorMapScanMatcher.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = PriorMapScanMatcher.swift; path = RTABMapApp/PriorMapScanMatcher.swift; sourceTree = "<group>"; };
+		4EA500012F40000100100004 /* PriorMapDepthSampler.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = PriorMapDepthSampler.swift; path = RTABMapApp/PriorMapDepthSampler.swift; sourceTree = "<group>"; };
+		4EA500012F40000100100006 /* PriceTagLocalizationCore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = PriceTagLocalizationCore.swift; path = RTABMapApp/PriceTagLocalizationCore.swift; sourceTree = "<group>"; };
+		4EA500012F40000100100008 /* PriceTagVisionScanner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = PriceTagVisionScanner.swift; path = RTABMapApp/PriceTagVisionScanner.swift; sourceTree = "<group>"; };
 		4EA100012F00000100100006 /* CoreNFC.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = CoreNFC.framework; path = System/Library/Frameworks/CoreNFC.framework; sourceTree = SDKROOT; };
 		4EA300012F20000100100002 /* SupermarketStructureCoverage.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = SupermarketStructureCoverage.swift; path = RTABMapApp/SupermarketStructureCoverage.swift; sourceTree = "<group>"; };
 		4EB1A66525A0D90B0043C7BF /* RTABMap.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; name = RTABMap.swift; path = RTABMapApp/RTABMap.swift; sourceTree = "<group>"; };
@@ -497,6 +505,10 @@
 				4EA100012F00000100100002 /* SupermarketScanSession.swift */,
 				4EA400012F30000100100002 /* PriorMapLocalization.swift */,
 				4EA400012F30000100100004 /* PriorMapLocalizationCore.swift */,
+				4EA500012F40000100100002 /* PriorMapScanMatcher.swift */,
+				4EA500012F40000100100004 /* PriorMapDepthSampler.swift */,
+				4EA500012F40000100100006 /* PriceTagLocalizationCore.swift */,
+				4EA500012F40000100100008 /* PriceTagVisionScanner.swift */,
 				4EA300012F20000100100002 /* SupermarketStructureCoverage.swift */,
 				4EA100012F00000100100004 /* PriceTagNFCReader.swift */,
 				4EA200012F12B00100100002 /* Localizable.strings */,
@@ -882,6 +894,10 @@
 				4EA100012F00000100100001 /* SupermarketScanSession.swift in Sources */,
 				4EA400012F30000100100001 /* PriorMapLocalization.swift in Sources */,
 				4EA400012F30000100100003 /* PriorMapLocalizationCore.swift in Sources */,
+				4EA500012F40000100100001 /* PriorMapScanMatcher.swift in Sources */,
+				4EA500012F40000100100003 /* PriorMapDepthSampler.swift in Sources */,
+				4EA500012F40000100100005 /* PriceTagLocalizationCore.swift in Sources */,
+				4EA500012F40000100100007 /* PriceTagVisionScanner.swift in Sources */,
 				4EA300012F20000100100001 /* SupermarketStructureCoverage.swift in Sources */,
 				4EA100012F00000100100003 /* PriceTagNFCReader.swift in Sources */,
 				4E2C516725A63119005CEDBD /* DatabaseView.swift in Sources */,

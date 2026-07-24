@@ -26,27 +26,28 @@
 | 预定路线导入 | 未实现 | 可选增强项；当前只有道路图合成遍历和回放 |
 | iOS 核心契约测试 | 已实现 | ARKit 前后左右/非零原点金标、模式门控和 SE(2) 投影 |
 
-## 明确未实现
-
-- LiDAR/视觉结构自动地图匹配；
-- 距离场、Top-K 跨帧假设和定位状态滞回；
-- Vision 二维码/条形码；
-- 价签射线、深度、货架平面和货架侧面关联；
-- PC 辅助扫描轨迹/价签人工复核；
-- 正式超市场景验收。
-
-这些属于阶段二/三，UI 和文档不得表述为已完成。
-
 ## 阶段二
 
 | 能力 | 状态 | 代码/证据 |
 | --- | --- | --- |
-| 线程、状态、距离场与失败策略 | 设计完成 | `STAGE_2_DESIGN.md`；实现与测试待完成 |
-| 深度结构提取和扫描匹配 | 未实现 | 待实现 |
-| Vision QR/条形码识别 | 未实现 | 待实现 |
-| 标签三维测量与货架关联 | 未实现 | 待实现 |
-| 阶段二 sidecar 和移动 UI | 未实现 | 待实现 |
-| 阶段二回放与指标 | 未实现 | 待实现 |
+| 线程、状态、距离场与失败策略 | 已实现 | `STAGE_2_DESIGN.md`、`PriorMapScanMatcher.swift`、in-flight gate |
+| 多分辨率确定性距离场 | 已实现 | 0.40/0.20/0.10 m、2 m 截断、RLE、逐层 SHA-256、schema 负向测试 |
+| 深度结构提取和扫描匹配 | 已实现 | scene depth、跨帧 voxel 证据、600 点上限、粗中细搜索、Top‑3、歧义/修正门控 |
+| 状态和置信度滞回 | 已实现 | initializing/stable/usable/weak/lost/manualCorrection；连续可信和 stale 门限集中管理 |
+| Vision QR/条形码识别 | 已实现 | 用户触发；复用 `ARFrame.capturedImage`；QR/EAN/Code128/UPCE/PDF417；去重和单任务上限 |
+| 标签三维测量与货架关联 | 已实现 | 同帧 depth 中值/MAD；货架射线回退；侧面、offset、高度、歧义/端点/范围门控 |
+| 阶段二 sidecar 和移动 UI | 已实现 | constraint/state/tag observation JSONL、localized tags JSON、结构指标 HUD 和确认 UI |
+| PC 会话检查 | 已实现 | `/api/session/inspect` 有界汇总约束、状态、观测、最终价签和 malformed 计数 |
+| 阶段二回放与指标 | 已实现 | `replay_stage2.py`；动态干扰、错误初始位姿、误差和 matcher p50/p95 |
+
+## 尚未完成的发布门槛
+
+- 支持 LiDAR 的真实 iPhone 上完成完整开始、弱纹理、行人干扰、扫码、结束落盘和外部复制干跑；
+- 由独立审查者复审阶段一整改和阶段二实现；
+- 正式超市场景验收；
+- 阶段三 PC 轨迹/价签地图人工编辑与导出 UI。
+
+自动测试和模拟回放不替代以上现场与独立审查。
 
 ## 兼容说明
 

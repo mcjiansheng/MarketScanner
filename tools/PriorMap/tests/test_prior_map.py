@@ -15,8 +15,10 @@ from tools.PriorMap.coordinate_system import (
     source_rectangle_polygon,
     source_rotation_to_yaw,
 )
+from tools.PriorMap.distance_field import decode_level
 from tools.PriorMap.prior_map_schema import validate_package
 from tools.PriorMap.replay_localization import replay
+from tools.PriorMap.replay_stage2 import replay as replay_stage2
 from tools.PriorMap.spatial_index import PriorMapSpatialIndex
 from tools.PriorMap.stage1_localizer import Pose2D, StageOneLocalizer
 from tools.PriorMap.xlsx_to_prior_map import convert_workbook
@@ -206,7 +208,11 @@ class IOSCoreContractTests(unittest.TestCase):
         if xcrun is None:
             self.skipTest("xcrun is unavailable outside the macOS iOS build environment")
         repository = Path(__file__).resolve().parents[3]
-        core = repository / "app/ios/RTABMapApp/PriorMapLocalizationCore.swift"
+        swift_sources = [
+            repository / "app/ios/RTABMapApp/PriorMapLocalizationCore.swift",
+            repository / "app/ios/RTABMapApp/PriorMapScanMatcher.swift",
+            repository / "app/ios/RTABMapApp/PriceTagLocalizationCore.swift",
+        ]
         swift_test = Path(__file__).with_name("swift") / "main.swift"
         with tempfile.TemporaryDirectory() as temporary:
             executable = Path(temporary) / "prior-map-core-tests"
@@ -214,7 +220,14 @@ class IOSCoreContractTests(unittest.TestCase):
             environment["CLANG_MODULE_CACHE_PATH"] = str(Path(temporary) / "clang-cache")
             environment["SWIFT_MODULECACHE_PATH"] = str(Path(temporary) / "swift-cache")
             compile_result = subprocess.run(
-                [xcrun, "swiftc", str(core), str(swift_test), "-o", str(executable)],
+                [
+                    xcrun,
+                    "swiftc",
+                    *map(str, swift_sources),
+                    str(swift_test),
+                    "-o",
+                    str(executable),
+                ],
                 check=False,
                 capture_output=True,
                 text=True,
@@ -276,6 +289,29 @@ class PriorMapConversionTests(unittest.TestCase):
         self.assertIn("missing_cross", warning_codes)
         self.assertTrue(validate_package(package)["valid"])
         self.assertTrue((package / "preview.png").read_bytes().startswith(b"\x89PNG\r\n\x1a\n"))
+
+    def test_distance_fields_are_decodable_bounded_and_integrity_checked(self) -> None:
+        package = convert_workbook(self.workbook, self.root / "package")
+        payload = json.loads((package / "distance_fields.json").read_text())
+        self.assertEqual(payload["format"], "MarketScannerDistanceFields")
+        self.assertEqual(
+            [level["resolution_m"] for level in payload["floors"]["1"]["levels"]],
+            [0.4, 0.2, 0.1],
+        )
+        for level in payload["floors"]["1"]["levels"]:
+            values = decode_level(level)
+            self.assertEqual(len(values), level["width"] * level["height"])
+            self.assertIn(0, values)
+            self.assertLessEqual(max(values), 200)
+
+        corrupted = self.corrupted_package(package, "bad-distance-checksum")
+        self.rewrite_json(
+            corrupted / "distance_fields.json",
+            lambda value: value["floors"]["1"]["levels"][0].__setitem__(
+                "data_sha256", "0" * 64
+            ),
+        )
+        self.assertFalse(validate_package(corrupted)["valid"])
 
     def test_road_graph_normalizes_numeric_ids_and_spatial_query_is_bounded(self) -> None:
         package = convert_workbook(self.workbook, self.root / "package")
@@ -364,6 +400,7 @@ class PriorMapConversionTests(unittest.TestCase):
             "fixed_structures.json",
             "road_graph.json",
             "spatial_index.json",
+            "distance_fields.json",
             "preview.png",
             "validation_report.json",
         ):
@@ -408,6 +445,31 @@ class PriorMapConversionTests(unittest.TestCase):
             rotated["samples"][-1]["estimated_pose"],
             baseline["samples"][-1]["estimated_pose"],
         )
+
+    def test_stage_two_replay_improves_drift_and_rejects_wrong_initialization(self) -> None:
+        package = convert_workbook(self.workbook, self.root / "package")
+        report = replay_stage2(
+            package,
+            self.root / "stage2-replay",
+            seed=24,
+            dynamic_fraction=0.2,
+        )
+        summary = report["summary"]
+        self.assertGreater(summary["accepted_count"], 0)
+        self.assertLess(
+            summary["median_estimated_error_m"],
+            summary["median_predicted_error_m"],
+        )
+        self.assertGreater(summary["matcher_p95_ms"], 0)
+        self.assertTrue((self.root / "stage2-replay/stage2_replay_report.json").is_file())
+
+        wrong = replay_stage2(
+            package,
+            seed=24,
+            dynamic_fraction=0.2,
+            wrong_initial_offset_m=3.0,
+        )
+        self.assertEqual(wrong["summary"]["accepted_count"], 0)
 
 
 class StageOneLocalizerTests(unittest.TestCase):

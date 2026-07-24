@@ -14,7 +14,7 @@
 }
 ```
 
-`scanMode` 是存储布局标记，继续使用 `continuous_streaming`；不能改成业务模式，否则旧 PC 工具会把连续数据库误判为历史分段。`workflowMode` 是阶段一新增业务模式。旧会话缺少它时按 `free_mapping` 兼容，并由 PC 标记 `workflow_legacy=true`。
+`scanMode` 是存储布局标记，继续使用 `continuous_streaming`；不能改成业务模式，否则旧 PC 工具会把连续数据库误判为历史分段。`workflowMode` 是地图辅助扫描业务模式。旧会话缺少它时按 `free_mapping` 兼容，并由 PC 标记 `workflow_legacy=true`。
 
 已有地图模式还包含：
 
@@ -29,7 +29,12 @@
     "yaw_rad": 1.57
   },
   "localizationTrace": "localization_trace.jsonl",
-  "manualLocalizationEvents": "manual_localization_events.jsonl"
+  "manualLocalizationEvents": "manual_localization_events.jsonl",
+  "localizationConstraints": "localization_constraints.jsonl",
+  "localizationEvents": "localization_events.jsonl",
+  "tagObservations": "tag_observations.jsonl",
+  "localizedPriceTags": "localized_price_tags.json",
+  "localizedPriceTagCount": 12
 }
 ```
 
@@ -50,12 +55,30 @@
   "rawPose": {"x_m": 1, "y_m": 2, "yaw_rad": 0.1},
   "estimatedPose": {"x_m": 1.02, "y_m": 1.98, "yaw_rad": 0.1},
   "roadCandidates": [{"edgeId": "edge-1", "distanceM": 0.2}],
+  "structureSource": "smoothed_scene_depth",
+  "structurePointCount": 124,
+  "structureCoverageAngleRad": 1.1,
+  "matchCandidates": [
+    {"pose": {"x_m": 1.02, "y_m": 1.98, "yaw_rad": 0.1}, "cost": 0.02, "score": 0.78}
+  ],
+  "matchUniqueness": 0.31,
+  "matchResidualCost": 0.02,
+  "matcherElapsedMs": 18.4,
   "constraintAccepted": true,
-  "constraintReason": "nearby_unique_road_soft_constraint"
+  "constraintReason": "trusted_structure_correction"
 }
 ```
 
-接受和拒绝都记录原因。候选最多 3 个。`rawPose` 是纯初始 `T_map_from_arkit` 投影；`estimatedPose` 才包含道路小幅软约束。
+接受和拒绝都记录原因，结构候选最多 3 个。`rawPose` 是当前 ARKit 预测投影；`estimatedPose` 才包含通过安全门控的小幅地图对齐修正。道路候选仅保留为弱先验证据。
+
+## 阶段二定位审计
+
+- `localization_constraints.jsonl`：每个匹配周期的预测/估计、Top‑3、残差、唯一性、有效点数、角覆盖、耗时、接受标记和原因。
+- `localization_events.jsonl`：状态发生变化时记录 previous/state/confidence/reason。
+- `tag_observations.jsonl`：每次成功 Vision 识别的原始观测，即使用户取消最终保存也保留；包含条码、归一化框、同帧时间差、原始地图点、测量方式、三维/定位置信度、地图身份、楼层和 `needs_review`。
+- `localized_price_tags.json`：用户确认后的数组；包含 shelf code、row flag、cross code、货架侧面、沿货架起点距离、相对地面高度、raw/snapped 位置、定位/测量/关联三项置信度、测量方式、`needs_review` 和 `user_confirmed`。
+
+JSONL 文件逐行独立编码和同步追加；最终价签数组用原子替换写入。价签 sidecar 与旧 `price_tags.json/.csv` 分开，后者继续只是暂停 NFC 功能的兼容空文件。
 
 ## manual_localization_events.jsonl
 
@@ -67,8 +90,8 @@
 - 确认时 ARKit SE(2)；
 - 用户确认的地图 SE(2)。
 
-即使没有人工事件，正常 prior-map 会话也生成空文件，使 sidecar 清单稳定。
+即使没有事件或扫码，正常 prior-map 会话也生成空 JSONL 和空最终价签数组，使 sidecar 清单稳定。
 
 ## 原始数据
 
-上述 sidecar 不写入 SQLite，不作为外部 pose prior 注入 RTAB-Map。PC 离线处理继续复制数据库并在新输出目录优化。来源 hash 和参数分别保存在 prior-map manifest、会话 metadata 和现有 PC source manifest。
+上述 sidecar 不写入 SQLite，不作为外部 pose prior 注入 RTAB-Map。自动地图修正只改变先验地图 HUD 的 ARKit→地图对齐，不改写 ARKit、Node pose 或原始数据库。PC 离线处理继续复制数据库并在新输出目录优化。来源 hash 和参数分别保存在 prior-map manifest、会话 metadata 和现有 PC source manifest。

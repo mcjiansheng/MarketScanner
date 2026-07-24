@@ -68,13 +68,14 @@ PriorMap-<id>/
   fixed_structures.json
   road_graph.json
   spatial_index.json
+  distance_fields.json
   preview.png
   preview_floor_001_<floor>.png
   ...
   validation_report.json
 ```
 
-`prior_map_id` 为安全文件名化的源文件 stem 加源 SHA-256 前 12 位。所有 JSON 使用 UTF-8、排序 key 和稳定缩进；不写入当前时间，因此相同输入和参数产生逐字节相同输出。
+`prior_map_id` 为安全文件名化的源文件 stem 加源 SHA-256 前 12 位。所有 JSON 使用 UTF-8 和排序 key；距离场为控制手机包体采用稳定紧凑 JSON，其余文件采用稳定缩进。不写入当前时间，因此相同输入和参数产生逐字节相同输出。
 
 `manifest.json` 记录：
 
@@ -102,11 +103,13 @@ PriorMap-<id>/
 
 `spatial_index.json` 使用每层 5 m 网格：`cells` 索引可见货架、柱子、柜台和柜台特征，`road_cells` 索引道路边。iOS 查询只访问当前位置候选半径覆盖的网格，不在每次更新遍历全部道路。
 
+`distance_fields.json` 为每层保存 0.40/0.20/0.10 m 三层截断距离场。可见货架、柱子、柜台和柜台特征的 polygon 边界为零距离种子，距离在 2 m 截断并量化为无符号厘米；每行使用 `[run_length, value]` RLE。每层记录 canonical rows 的 SHA‑256，PC schema 和 iOS 导入都完整解码并核验。用户样例两层包的紧凑距离场为 5,547,756 bytes；该数值是包体基线，不是设备内存峰值。
+
 校验器不只检查文件存在：它解析全部 JSON 和 PNG，核对格式/版本、SHA-256、元素与楼层 bounds、子集内容、道路节点/边引用、结构/道路索引覆盖及验证报告统计。每层独立预览必须可解码；`preview.png` 是首层兼容预览。
 
 ## 单楼层定位边界
 
-地图包可以包含多个楼层，但每次扫描必须在开始前选择并绑定一个楼层。阶段一不允许扫描中切层或跨楼层匹配。地图二维位姿只使用水平运动：ARKit `+x -> 地图 +x`、ARKit `-z -> 地图 +y`，地图 yaw 0 指向 `+y`、正方向逆时针。ARKit 竖直 `y` 不进入二维位姿，因此同一楼层内少量坡度或高度变化可以存在；这些变化仍保存在原始三维采集数据中。
+地图包可以包含多个楼层，但每次扫描必须在开始前选择并绑定一个楼层。当前阶段不允许扫描中切层或跨楼层匹配。地图二维位姿只使用水平运动：ARKit `+x -> 地图 +x`、ARKit `-z -> 地图 +y`，地图 yaw 0 指向 `+y`、正方向逆时针。ARKit 竖直 `y` 不进入二维位姿，因此同一楼层内少量坡度或高度变化可以存在；这些变化仍保存在原始三维采集数据中，并可用于同层价签相对地面的高度估计。
 
 ## 命令
 

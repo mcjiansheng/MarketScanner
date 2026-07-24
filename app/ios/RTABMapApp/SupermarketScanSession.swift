@@ -72,6 +72,11 @@ struct ScanSegmentMetadata: Codable {
     let initialMapPose: PriorMapPose2D?
     let localizationTrace: String?
     let manualLocalizationEvents: String?
+    let localizationConstraints: String?
+    let localizationEvents: String?
+    let tagObservations: String?
+    let localizedPriceTags: String?
+    let localizedPriceTagCount: Int?
 }
 
 struct ScanAreaCells: Codable {
@@ -118,6 +123,7 @@ struct ScanSegmentSidecarSnapshot {
     let areaCells: ScanAreaCells
     let poseSamples: [ScanPoseSample]
     let structureCoverage: ScanStructureCoverageSnapshot?
+    let localizedPriceTags: [LocalizedPriceTag]
 }
 
 struct ScanCaptureHealth: Codable {
@@ -179,6 +185,40 @@ struct ManualLocalizationEvent: Codable {
     let reason: String
     let arkitPose: PriorMapPose2D
     let confirmedMapPose: PriorMapPose2D
+}
+
+struct PriorMapConstraintRecord: Codable {
+    let format: String
+    let version: Int
+    let timestamp: TimeInterval
+    let trackingSessionId: String
+    let priorMapId: String?
+    let priorMapSha256: String?
+    let floorId: String?
+    let accepted: Bool
+    let reason: String
+    let predictedPose: PriorMapPose2D
+    let estimatedPose: PriorMapPose2D
+    let candidates: [PriorMapScanMatchCandidate]
+    let uniqueness: Double
+    let residualCost: Double?
+    let effectivePointCount: Int
+    let coverageAngleRad: Double
+    let matcherElapsedMs: Double
+}
+
+struct PriorMapStateEvent: Codable {
+    let format: String
+    let version: Int
+    let timestamp: TimeInterval
+    let trackingSessionId: String
+    let priorMapId: String?
+    let priorMapSha256: String?
+    let floorId: String?
+    let previousState: String?
+    let state: String
+    let confidence: Double
+    let reason: String
 }
 
 struct ScanEventRecord: Codable {
@@ -290,6 +330,7 @@ final class SupermarketScanSession {
     private(set) var currentAreaM2: Double = 0
     private(set) var priceTags: [PriceTagRecord] = []
     private(set) var poseSamples: [ScanPoseSample] = []
+    private(set) var localizedPriceTags: [LocalizedPriceTag] = []
     private(set) var sensorStartPose: ScanSensorPose?
     private(set) var sensorEndPose: ScanSensorPose?
     private(set) var trackingSessionId = UUID().uuidString
@@ -314,6 +355,7 @@ final class SupermarketScanSession {
     private var latestStructureCoverageSummary: ScanStructureCoverageSummary?
     private let maximumTrajectorySamples = 50_000
     private var nextTagId: Int = 1
+    private var lastLocalizationState: String?
     private(set) var scanConfiguration = PriorMapScanConfiguration.freeMapping
 
     private var finalizingScan = false
@@ -426,6 +468,8 @@ final class SupermarketScanSession {
         areaEstimator.reset()
         currentAreaM2 = 0
         priceTags.removeAll()
+        localizedPriceTags.removeAll()
+        lastLocalizationState = nil
         poseSamples.removeAll()
         sensorStartPose = nil
         sensorEndPose = nil
@@ -660,7 +704,8 @@ final class SupermarketScanSession {
                 scanRadiusM: areaEstimator.scanRadiusM,
                 cells: areaEstimator.occupiedCellCoordinates()),
             poseSamples: poseSamples,
-            structureCoverage: latestStructureCoverageSnapshot)
+            structureCoverage: latestStructureCoverageSnapshot,
+            localizedPriceTags: localizedPriceTags)
     }
 
     func updateStructureCoverageSnapshot(_ snapshot: ScanStructureCoverageSnapshot) {
@@ -680,6 +725,12 @@ final class SupermarketScanSession {
         captureLock.lock()
         defer { captureLock.unlock() }
         return latestStructureCoverageSummary
+    }
+
+    func confirmedLocalizedPriceTagCount() -> Int {
+        captureLock.lock()
+        defer { captureLock.unlock() }
+        return localizedPriceTags.count
     }
 
     func boundarySnapshot() -> ScanBoundarySnapshot {
@@ -798,12 +849,19 @@ final class SupermarketScanSession {
             for fileName in [
                 "localization_trace.jsonl",
                 "manual_localization_events.jsonl",
+                "localization_constraints.jsonl",
+                "localization_events.jsonl",
+                "tag_observations.jsonl",
             ] {
                 let url = segmentDirectory.appendingPathComponent(fileName)
                 if !fileManager.fileExists(atPath: url.path) {
                     try Data().write(to: url, options: .atomic)
                 }
             }
+            let localizedTagsData = try encoder.encode(snapshot.localizedPriceTags)
+            try localizedTagsData.write(
+                to: segmentDirectory.appendingPathComponent("localized_price_tags.json"),
+                options: .atomic)
         }
 
         if snapshot.metadata.finalized == true {
@@ -870,6 +928,79 @@ final class SupermarketScanSession {
         appendLocalizationRecord(
             update,
             fileName: "localization_trace.jsonl")
+        let constraint = PriorMapConstraintRecord(
+            format: "MarketScannerLocalizationConstraint",
+            version: 1,
+            timestamp: update.timestamp,
+            trackingSessionId: trackingSessionId,
+            priorMapId: scanConfiguration.priorMapId,
+            priorMapSha256: scanConfiguration.priorMapSha256,
+            floorId: scanConfiguration.floorId,
+            accepted: update.constraintAccepted,
+            reason: update.constraintReason,
+            predictedPose: update.rawPose,
+            estimatedPose: update.estimatedPose,
+            candidates: update.matchCandidates,
+            uniqueness: update.matchUniqueness,
+            residualCost: update.matchResidualCost,
+            effectivePointCount: update.structurePointCount,
+            coverageAngleRad: update.structureCoverageAngleRad,
+            matcherElapsedMs: update.matcherElapsedMs)
+        appendLocalizationRecord(
+            constraint,
+            fileName: "localization_constraints.jsonl")
+        if lastLocalizationState != update.localizationState {
+            let stateEvent = PriorMapStateEvent(
+                format: "MarketScannerLocalizationStateEvent",
+                version: 1,
+                timestamp: update.timestamp,
+                trackingSessionId: trackingSessionId,
+                priorMapId: scanConfiguration.priorMapId,
+                priorMapSha256: scanConfiguration.priorMapSha256,
+                floorId: scanConfiguration.floorId,
+                previousState: lastLocalizationState,
+                state: update.localizationState,
+                confidence: update.confidence,
+                reason: update.constraintReason)
+            appendLocalizationRecord(
+                stateEvent,
+                fileName: "localization_events.jsonl")
+            lastLocalizationState = update.localizationState
+        }
+    }
+
+    @discardableResult
+    func appendTagObservation(_ observation: PriorMapTagObservationRecord) -> Bool {
+        return appendLocalizationRecord(
+            observation,
+            fileName: "tag_observations.jsonl")
+    }
+
+    @discardableResult
+    func recordLocalizedPriceTag(_ tag: LocalizedPriceTag) -> Bool {
+        captureLock.lock()
+        localizedPriceTags.append(tag)
+        let snapshot = localizedPriceTags
+        captureLock.unlock()
+        do {
+            let directory = try currentSegmentDirectory()
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+            let data = try encoder.encode(snapshot)
+            sidecarWriteLock.lock()
+            defer { sidecarWriteLock.unlock() }
+            try data.write(
+                to: directory.appendingPathComponent("localized_price_tags.json"),
+                options: .atomic)
+            return true
+        }
+        catch {
+            captureLock.lock()
+            localizedPriceTags.removeAll { $0.tagId == tag.tagId }
+            captureLock.unlock()
+            print("Could not persist localized price tag: \(error)")
+            return false
+        }
     }
 
     func appendManualLocalizationEvent(
@@ -894,17 +1025,18 @@ final class SupermarketScanSession {
             fileName: "manual_localization_events.jsonl")
     }
 
+    @discardableResult
     private func appendLocalizationRecord<T: Encodable>(
         _ record: T,
         fileName: String
-    ) {
+    ) -> Bool {
         let directory: URL
         do {
             directory = try currentSegmentDirectory()
         }
         catch {
             print("Could not create localization log directory: \(error)")
-            return
+            return false
         }
         localizationLogLock.lock()
         defer { localizationLogLock.unlock() }
@@ -924,9 +1056,11 @@ final class SupermarketScanSession {
                 handle.synchronizeFile()
                 handle.closeFile()
             }
+            return true
         }
         catch {
             print("Could not append localization record: \(error)")
+            return false
         }
     }
 

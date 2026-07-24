@@ -2,9 +2,8 @@
 //  PriorMapLocalization.swift
 //  RTABMapApp
 //
-//  Stage-one prior-map workflow: package loading, five-step setup, ARKit
-//  projection, conservative road soft constraints and an auditable 2D HUD.
-//  This file intentionally contains no LiDAR scan matcher.
+//  Prior-map package loading, setup, ARKit prediction, bounded depth matching,
+//  conservative road priors and an auditable 2D HUD.
 //
 
 import ARKit
@@ -93,6 +92,12 @@ struct PriorMapRoadGraph: Codable {
     let edges: [PriorMapRoadEdge]
 }
 
+private struct PriorMapShelvesPayload: Codable {
+    let format: String
+    let version: Int
+    let shelves: [PriorMapShelf]
+}
+
 struct PriorMapSpatialFloor: Codable {
     let cells: [String: [String]]
     let roadCells: [String: [String]]
@@ -130,6 +135,8 @@ struct PriorMapPackage {
     let manifest: PriorMapManifest
     let roadGraph: PriorMapRoadGraph
     let spatialIndex: PriorMapSpatialIndexPayload
+    let distanceFields: PriorMapDistanceFieldFile
+    let shelves: [PriorMapShelf]
     let preview: UIImage
     let previewsByFloor: [String: UIImage]
 
@@ -146,6 +153,7 @@ struct PriorMapPackage {
             "fixed_structures.json": "MarketScannerPriorMapStructures",
             "road_graph.json": "MarketScannerRoadGraph",
             "spatial_index.json": "MarketScannerSpatialIndex",
+            "distance_fields.json": "MarketScannerDistanceFields",
             "validation_report.json": "MarketScannerPriorMapValidation",
         ]
         for (name, expectedFormat) in requiredJSONFormats {
@@ -163,6 +171,8 @@ struct PriorMapPackage {
         let manifestURL = directory.appendingPathComponent("manifest.json")
         let graphURL = directory.appendingPathComponent("road_graph.json")
         let spatialURL = directory.appendingPathComponent("spatial_index.json")
+        let distanceURL = directory.appendingPathComponent("distance_fields.json")
+        let shelvesURL = directory.appendingPathComponent("shelves.json")
         let previewURL = directory.appendingPathComponent("preview.png")
         let manifest = try decoder.decode(
             PriorMapManifest.self,
@@ -194,6 +204,12 @@ struct PriorMapPackage {
         let spatial = try decoder.decode(
             PriorMapSpatialIndexPayload.self,
             from: Data(contentsOf: spatialURL))
+        let distanceFields = try decoder.decode(
+            PriorMapDistanceFieldFile.self,
+            from: Data(contentsOf: distanceURL))
+        let shelvesPayload = try decoder.decode(
+            PriorMapShelvesPayload.self,
+            from: Data(contentsOf: shelvesURL))
         guard spatial.format == "MarketScannerSpatialIndex",
               spatial.version == 1,
               spatial.cellSizeM > 0 else {
@@ -201,6 +217,25 @@ struct PriorMapPackage {
                 domain: "PriorMap",
                 code: 6,
                 userInfo: [NSLocalizedDescriptionKey: "地图空间索引无效，请在 PC 工作台重新生成。"])
+        }
+        guard distanceFields.format == "MarketScannerDistanceFields",
+              distanceFields.version == 1,
+              distanceFields.truncationDistanceM > 0,
+              distanceFields.truncationDistanceM <= 2.55,
+              Set(distanceFields.floors.keys) == Set(manifest.floors.map(\.id)),
+              shelvesPayload.format == "MarketScannerPriorMapShelves",
+              shelvesPayload.version == 1 else {
+            throw NSError(
+                domain: "PriorMap",
+                code: 8,
+                userInfo: [NSLocalizedDescriptionKey: "地图包的结构距离场或货架数据无效，请在 PC 工作台重新生成。"])
+        }
+        // Decode every level now so corrupted RLE or a checksum mismatch is
+        // rejected before a scan can begin.
+        for floor in distanceFields.floors.values {
+            for level in floor.levels {
+                _ = try level.decodedValues()
+            }
         }
         guard let preview = UIImage(contentsOfFile: previewURL.path) else {
             throw NSError(
@@ -226,6 +261,8 @@ struct PriorMapPackage {
             manifest: manifest,
             roadGraph: graph,
             spatialIndex: spatial,
+            distanceFields: distanceFields,
+            shelves: shelvesPayload.shelves,
             preview: preview,
             previewsByFloor: previewsByFloor)
     }
@@ -246,6 +283,13 @@ struct PriorMapLocalizationUpdate: Codable {
     let rawPose: PriorMapPose2D
     let estimatedPose: PriorMapPose2D
     let roadCandidates: [PriorMapRoadCandidate]
+    let structureSource: String
+    let structurePointCount: Int
+    let structureCoverageAngleRad: Double
+    let matchCandidates: [PriorMapScanMatchCandidate]
+    let matchUniqueness: Double
+    let matchResidualCost: Double?
+    let matcherElapsedMs: Double
     let constraintAccepted: Bool
     let constraintReason: String
 }
@@ -273,10 +317,39 @@ final class PriorMapStageOneLocalizer {
     private let maximumCorrectionM = 0.25
     private let ambiguityMarginM = 0.35
     private let candidateRadiusM = 3.0
+    private let depthSampler = PriorMapDepthSampler()
+    private let matcher: PriorMapScanMatcher
+    private let confidenceManager = PriorMapConfidenceManager()
+    private var lastCandidatePose: PriorMapPose2D?
+    private var consecutiveConsistentCandidates = 0
+    private let priorMapId: String
+    private let priorMapSha256: String
+    private let shelves: [PriorMapShelf]
+    private var latestFloorHeightWorldM: Double?
+    private(set) var latestEstimatedPose: PriorMapPose2D
+    private(set) var latestConfidence = 0.0
+    private(set) var latestPhase: PriorMapLocalizationPhase = .uninitialized
 
-    init(package: PriorMapPackage, floorId: String, initialMapPose: PriorMapPose2D) {
+    init(
+        package: PriorMapPackage,
+        floorId: String,
+        initialMapPose: PriorMapPose2D
+    ) throws {
         self.floorId = floorId
         self.initialMapPose = initialMapPose
+        self.latestEstimatedPose = initialMapPose
+        self.priorMapId = package.manifest.priorMapId
+        self.priorMapSha256 = package.manifest.sourceSha256
+        self.shelves = package.shelves
+        guard let distanceFloor = package.distanceFields.floors[floorId] else {
+            throw NSError(
+                domain: "PriorMapLocalizer",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "所选楼层没有结构距离场。"])
+        }
+        self.matcher = try PriorMapScanMatcher(
+            floor: distanceFloor,
+            truncationM: package.distanceFields.truncationDistanceM)
         var positions: [String: SIMD2<Double>] = [:]
         for node in package.roadGraph.nodes
             where node.floorId == floorId && node.positionM.count >= 2 {
@@ -294,6 +367,7 @@ final class PriorMapStageOneLocalizer {
             uniqueKeysWithValues: segments.map { ($0.id, $0) })
         self.roadCells = package.spatialIndex.floors[floorId]?.roadCells ?? [:]
         self.cellSizeM = package.spatialIndex.cellSizeM
+        confidenceManager.reset()
     }
 
     private func nearbySegments(_ point: SIMD2<Double>) -> [PriorMapRoadSegment] {
@@ -313,11 +387,9 @@ final class PriorMapStageOneLocalizer {
         return identifiers.sorted().compactMap { segmentsById[$0] }
     }
 
-    func update(
-        transform: simd_float4x4,
-        timestamp: TimeInterval,
-        trackingState: String
-    ) -> PriorMapLocalizationUpdate {
+    func update(frame: ARFrame, trackingState: String) -> PriorMapLocalizationUpdate {
+        let transform = frame.camera.transform
+        let timestamp = frame.timestamp
         let arkitPose = Self.pose(from: transform)
         if arkitOrigin == nil {
             arkitOrigin = arkitPose
@@ -367,50 +439,105 @@ final class PriorMapStageOneLocalizer {
                     >= ambiguityMarginM)
         var estimatedPose = rawPose
         var accepted = false
-        var reason = "no_candidate"
-        if trackingState != "normal" {
-            reason = "tracking_not_normal"
+        var reason = trackingState == "normal"
+            ? "structure_depth_unavailable"
+            : "tracking_not_normal"
+        let observation = trackingState == "normal"
+            ? depthSampler.sample(frame: frame)
+            : nil
+        let match = observation.map {
+            matcher.match(predictedPose: rawPose, observation: $0)
         }
-        else if !topCandidates.isEmpty && !unique {
-            reason = "ambiguous_parallel_roads"
+        if let floorHeight = observation?.floorHeightWorldM {
+            latestFloorHeightWorldM = floorHeight
         }
-        else if let best = topCandidates.first {
-            var correction = (best.point - projected) * softGain
-            let length = simd_length(correction)
-            if length > maximumCorrectionM {
-                correction *= maximumCorrectionM / length
+        if let best = match?.candidates.first {
+            let translation = hypot(
+                best.pose.xM - rawPose.xM,
+                best.pose.yM - rawPose.yM)
+            let yawDelta = abs(PriorMapStageOneMath.normalizeAngle(
+                best.pose.yawRad - rawPose.yawRad))
+            let consistent: Bool
+            if let prior = lastCandidatePose {
+                consistent = hypot(
+                    best.pose.xM - prior.xM,
+                    best.pose.yM - prior.yM) <= 0.30
+                    && abs(PriorMapStageOneMath.normalizeAngle(
+                        best.pose.yawRad - prior.yawRad)) <= 5.0 * .pi / 180.0
             }
-            estimatedPose.xM += correction.x
-            estimatedPose.yM += correction.y
-            accepted = true
-            reason = "nearby_unique_road_soft_constraint"
-        }
-        let distance = topCandidates.first?.distanceM ?? Double.infinity
-        let state: String
-        let confidence: Double
-        if trackingState == "notAvailable" || segmentsById.isEmpty {
-            state = "lost"
-            confidence = 0.0
-        }
-        else if trackingState != "normal" || !distance.isFinite || distance > 2.0 {
-            state = "weak"
-            confidence = 0.25
-        }
-        else if !unique || distance > 1.0 {
-            state = "usable"
-            confidence = 0.55
+            else {
+                consistent = false
+            }
+            consecutiveConsistentCandidates = consistent
+                ? consecutiveConsistentCandidates + 1
+                : 1
+            lastCandidatePose = best.pose
+            if match?.acceptedByGeometry == true,
+               translation <= 0.35,
+               yawDelta <= 8.0 * .pi / 180.0,
+               consecutiveConsistentCandidates >= 2 {
+                let gain = 0.35
+                estimatedPose = PriorMapPose2D(
+                    xM: rawPose.xM + (best.pose.xM - rawPose.xM) * gain,
+                    yM: rawPose.yM + (best.pose.yM - rawPose.yM) * gain,
+                    yawRad: PriorMapStageOneMath.normalizeAngle(
+                        rawPose.yawRad
+                            + PriorMapStageOneMath.normalizeAngle(
+                                best.pose.yawRad - rawPose.yawRad) * gain))
+                // Move only the map/ARKit alignment anchor. ARKit world
+                // tracking and the scan database are never reset.
+                arkitOrigin = arkitPose
+                initialMapPose = estimatedPose
+                accepted = true
+                reason = "trusted_structure_correction"
+            }
+            else if match?.acceptedByGeometry != true {
+                reason = match?.rejectionReason ?? "structure_rejected"
+            }
+            else if translation > 0.35 || yawDelta > 8.0 * .pi / 180.0 {
+                reason = "correction_exceeds_safety_gate"
+            }
+            else {
+                reason = "awaiting_temporal_consistency"
+            }
         }
         else {
-            state = "stable"
-            confidence = max(0.7, 1.0 - distance / 3.0)
+            consecutiveConsistentCandidates = 0
+            lastCandidatePose = nil
+            if observation != nil {
+                reason = match?.rejectionReason ?? "no_structure_candidate"
+            }
+            else if trackingState == "normal", unique, let bestRoad = topCandidates.first {
+                var correction = (bestRoad.point - projected) * softGain
+                let length = simd_length(correction)
+                if length > maximumCorrectionM {
+                    correction *= maximumCorrectionM / length
+                }
+                estimatedPose.xM += correction.x
+                estimatedPose.yM += correction.y
+                reason = "road_prior_display_only"
+            }
         }
+        let residualCost = match?.candidates.first?.cost ?? 0.15
+        let confidence = confidenceManager.update(
+            timestamp: timestamp,
+            trackingState: trackingState,
+            accepted: accepted,
+            validPointCount: observation?.validPointCount ?? 0,
+            coverageAngleRad: observation?.coverageAngleRad ?? 0,
+            uniqueness: match?.uniqueness ?? 0,
+            residualCost: residualCost,
+            mapMismatch: match?.rejectionReason == "map_mismatch")
+        latestEstimatedPose = estimatedPose
+        latestConfidence = confidence.confidence
+        latestPhase = confidence.phase
         return PriorMapLocalizationUpdate(
             format: "MarketScannerLocalizationTrace",
             version: 1,
             timestamp: timestamp,
             trackingState: trackingState,
-            localizationState: state,
-            confidence: confidence,
+            localizationState: confidence.phase.rawValue,
+            confidence: confidence.confidence,
             rawPose: rawPose,
             estimatedPose: estimatedPose,
             roadCandidates: topCandidates.map {
@@ -418,6 +545,13 @@ final class PriorMapStageOneLocalizer {
                     edgeId: $0.segment.id,
                     distanceM: $0.distanceM)
             },
+            structureSource: observation?.source ?? "unavailable",
+            structurePointCount: observation?.validPointCount ?? 0,
+            structureCoverageAngleRad: observation?.coverageAngleRad ?? 0,
+            matchCandidates: match?.candidates ?? [],
+            matchUniqueness: match?.uniqueness ?? 0,
+            matchResidualCost: match?.candidates.first?.cost,
+            matcherElapsedMs: match?.elapsedMs ?? 0,
             constraintAccepted: accepted,
             constraintReason: reason)
     }
@@ -429,7 +563,89 @@ final class PriorMapStageOneLocalizer {
         let arkitPose = Self.pose(from: transform)
         arkitOrigin = arkitPose
         initialMapPose = mapPose
+        latestEstimatedPose = mapPose
+        confidenceManager.reset(manual: true)
+        latestPhase = .manualCorrection
+        latestConfidence = 0.35
+        depthSampler.reset()
+        lastCandidatePose = nil
+        consecutiveConsistentCandidates = 0
         return (arkitPose, mapPose)
+    }
+
+    func localizePriceTag(
+        _ detection: PriceTagVisionDetection,
+        trackingSessionId: String
+    ) -> (PriorMapTagObservationRecord, LocalizedPriceTag) {
+        let cameraPose = Self.pose(from: detection.frame.camera.transform)
+        if arkitOrigin == nil {
+            arkitOrigin = cameraPose
+        }
+        let origin = arkitOrigin!
+        let mapPoint: (SIMD3<Float>) -> PriorMapTagPoint3D = { world in
+            let pointPose = PriorMapPose2D(
+                xM: Double(world.x),
+                yM: Double(-world.z),
+                yawRad: origin.yawRad)
+            let projected = PriorMapStageOneMath.project(
+                arkitPose: pointPose,
+                arkitOrigin: origin,
+                initialMapPose: self.initialMapPose)
+            return PriorMapTagPoint3D(
+                xM: projected.xM,
+                yM: projected.yM,
+                heightM: nil)
+        }
+        let measurement = PriceTagFrameMeasurement.measure(
+            detection: detection,
+            floorId: floorId,
+            shelves: shelves,
+            floorHeightWorldM: latestFloorHeightWorldM,
+            mapPoint: mapPoint)
+        let localized = ShelfAssociation.localizedTag(
+            observationId: detection.observationId,
+            payload: detection.payload,
+            symbology: detection.symbology,
+            floorId: floorId,
+            rawPosition: measurement.rawMapPosition,
+            cameraPosition: measurement.cameraMapPosition,
+            shelves: shelves,
+            localizationState: latestPhase.rawValue,
+            localizationConfidence: latestConfidence,
+            measurementConfidence: measurement.confidence,
+            measurementMethod: measurement.method,
+            userConfirmed: false,
+            trackingSessionId: trackingSessionId,
+            priorMapId: priorMapId,
+            priorMapSha256: priorMapSha256,
+            timestamp: Date().timeIntervalSince1970)
+        let bounds = detection.normalizedBounds
+        let observation = PriorMapTagObservationRecord(
+            format: "MarketScannerPriceTagObservation",
+            version: 1,
+            observationId: detection.observationId,
+            timestamp: Date().timeIntervalSince1970,
+            payload: detection.payload,
+            symbology: detection.symbology,
+            normalizedBounds: [
+                Double(bounds.minX),
+                Double(bounds.minY),
+                Double(bounds.width),
+                Double(bounds.height),
+            ],
+            frameTimestamp: detection.frame.timestamp,
+            poseTimestampDeltaMs: measurement.poseTimestampDeltaMs,
+            rawMapPosition: measurement.rawMapPosition,
+            measurementMethod: measurement.method,
+            measurementConfidence: measurement.confidence,
+            localizationState: latestPhase.rawValue,
+            localizationConfidence: latestConfidence,
+            priorMapId: priorMapId,
+            priorMapSha256: priorMapSha256,
+            floorId: floorId,
+            trackingSessionId: trackingSessionId,
+            needsReview: localized.needsReview)
+        return (observation, localized)
     }
 
     static func pose(from transform: simd_float4x4) -> PriorMapPose2D {
@@ -751,7 +967,7 @@ final class PriorMapWizardViewController: UIViewController, UIDocumentPickerDele
                 arkitSupported,
                 arkitSupported ? "支持世界跟踪" : "此设备不支持 ARKit 世界跟踪")
             addInfo("ARKit tracking", "待扫描启动后实时监测；不稳定时保留原始扫描")
-            addCheck("LiDAR / 深度", depth, depth ? "可用" : "不可用，阶段一仍可使用初始/道路辅助定位")
+            addCheck("LiDAR / 深度", depth, depth ? "可用，可进行结构匹配和价签深度测量" : "不可用；仅保留 ARKit 预测、道路弱先验和价签射线回退")
             addCheck("剩余空间", freeBytes > 2_000_000_000, String(format: "%.1f GB", Double(freeBytes) / 1_000_000_000.0))
             addCheck("温度", thermalOK, "\(thermal)")
             addCheck("先验地图完整性", package != nil, package == nil ? "未选择" : "已通过版本检查")
@@ -761,7 +977,7 @@ final class PriorMapWizardViewController: UIViewController, UIDocumentPickerDele
             guard let package = package else { return }
             addText("即将开始已有地图辅助扫描。手机仍会连续写入完整 RTAB-Map 三维数据库；二维先验定位只使用选定楼层，楼层内少量竖直位移保留在原始数据中但不参与二维位置计算。道路只做小幅软约束，不会跨通道强制跳转。")
             addText("地图：\(package.manifest.name)\n楼层：\(package.manifest.floors[selectedFloorIndex].id)\n起点：\(String(format: "%.2f, %.2f m", selectedPose.xM, selectedPose.yM))")
-            addText("阶段一尚未实现 LiDAR 自动匹配。定位较弱或丢失时，原始扫描继续保存，并可人工确认位置。")
+            addText("结构候选只有在唯一、连续一致且修正幅度安全时才会调整地图对齐。定位较弱或丢失时，原始扫描继续保存；价签不会自动确认。")
             nextButton.isEnabled = true
         }
     }
@@ -926,6 +1142,7 @@ final class PriorMapWizardViewController: UIViewController, UIDocumentPickerDele
 final class PriorMapLiveMapView: UIView {
     let confirmButton = UIButton(type: .system)
     let reselectButton = UIButton(type: .system)
+    let scanPriceTagButton = UIButton(type: .system)
     private let previewView = UIImageView()
     private let statusLabel = UILabel()
     private let roadLabel = UILabel()
@@ -949,10 +1166,18 @@ final class PriorMapLiveMapView: UIView {
         roadLabel.numberOfLines = 2
         confirmButton.setTitle("确认当前位置", for: .normal)
         reselectButton.setTitle("重新选择位置", for: .normal)
+        scanPriceTagButton.setTitle("扫描价签条码", for: .normal)
         let buttons = UIStackView(arrangedSubviews: [confirmButton, reselectButton])
         buttons.axis = .horizontal
         buttons.distribution = .fillEqually
-        let stack = UIStackView(arrangedSubviews: [statusLabel, roadLabel, previewView, buttons])
+        let stack = UIStackView(
+            arrangedSubviews: [
+                statusLabel,
+                roadLabel,
+                previewView,
+                buttons,
+                scanPriceTagButton,
+            ])
         stack.axis = .vertical
         stack.spacing = 6
         stack.translatesAutoresizingMaskIntoConstraints = false
@@ -993,17 +1218,30 @@ final class PriorMapLiveMapView: UIView {
 
     func update(_ value: PriorMapLocalizationUpdate) {
         let labels = [
+            "uninitialized": ("定位未初始化", UIColor.secondaryLabel),
+            "initializing": ("定位初始化中", UIColor.systemOrange),
             "stable": ("定位稳定", UIColor.systemGreen),
             "usable": ("定位可用", UIColor.systemBlue),
             "weak": ("定位较弱", UIColor.systemOrange),
             "lost": ("定位已丢失", UIColor.systemRed),
+            "manualCorrection": ("人工修正后验证中", UIColor.systemOrange),
         ]
         let state = labels[value.localizationState] ?? ("定位较弱", UIColor.systemOrange)
         statusLabel.text = "\(state.0) · \(Int(value.confidence * 100))%"
         statusLabel.textColor = state.1
-        roadLabel.text = value.roadCandidates.first.map {
-            "当前道路候选：\($0.edgeId) · \(String(format: "%.2f m", $0.distanceM))"
-        } ?? "当前没有可靠道路候选；继续走向交叉口、柱子或端头"
+        if let candidate = value.matchCandidates.first {
+            roadLabel.text = String(
+                format: "结构匹配 %.2f · 唯一性 %.2f · %d 点 · %.1f ms",
+                candidate.score,
+                value.matchUniqueness,
+                value.structurePointCount,
+                value.matcherElapsedMs)
+        }
+        else {
+            roadLabel.text = value.roadCandidates.first.map {
+                "道路先验：\($0.edgeId) · \(String(format: "%.2f m", $0.distanceM))；继续走向交叉口、柱子或端头"
+            } ?? "当前没有可靠结构候选；继续走向交叉口、柱子或端头"
+        }
         layoutIfNeeded()
         let width = max(0.001, boundsM.maxXM - boundsM.minXM)
         let height = max(0.001, boundsM.maxYM - boundsM.minYM)

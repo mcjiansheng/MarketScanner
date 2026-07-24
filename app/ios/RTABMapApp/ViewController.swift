@@ -37,6 +37,7 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
     private let priorMapQueue = DispatchQueue(
         label: "com.introlab.rtabmap.prior-map-localization",
         qos: .userInitiated)
+    private let priceTagVisionScanner = PriceTagVisionScanner()
     private var priceTagNFCReader: PriceTagNFCReader?
     // NFC is intentionally paused. Presenting Core NFC interrupts the active
     // camera capture on iOS, and the entitlement cannot be debugged with an
@@ -2428,7 +2429,7 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                     code: 4,
                     userInfo: [NSLocalizedDescriptionKey: localized("The selected prior-map identity or floor no longer matches the setup.")])
             }
-            priorMapLocalizer = PriorMapStageOneLocalizer(
+            priorMapLocalizer = try PriorMapStageOneLocalizer(
                 package: package,
                 floorId: floorId,
                 initialMapPose: initialPose)
@@ -2441,6 +2442,10 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
             overlay.reselectButton.addTarget(
                 self,
                 action: #selector(reselectPriorMapPosition),
+                for: .touchUpInside)
+            overlay.scanPriceTagButton.addTarget(
+                self,
+                action: #selector(scanPriorMapPriceTag),
                 for: .touchUpInside)
             view.addSubview(overlay)
             NSLayoutConstraint.activate([
@@ -2476,6 +2481,7 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         priorMapLocalizer = nil
         priorMapLatestUpdate = nil
         priorMapUpdateGate.reset()
+        priceTagVisionScanner.reset()
         let overlay = priorMapOverlay
         priorMapOverlay = nil
         if Thread.isMainThread {
@@ -2496,6 +2502,37 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
               let localizer = priorMapLocalizer else {
             return
         }
+        let generation = priorMapGeneration
+        priceTagVisionScanner.submitIfRequested(frame: frame) { result in
+            guard generation == self.priorMapGeneration else { return }
+            switch result {
+            case .failure(let error):
+                DispatchQueue.main.async {
+                    guard generation == self.priorMapGeneration else { return }
+                    self.showToast(message: error.localizedDescription, seconds: 4)
+                }
+            case .success(let detection):
+                self.priorMapQueue.async {
+                    guard generation == self.priorMapGeneration else { return }
+                    let result = localizer.localizePriceTag(
+                        detection,
+                        trackingSessionId: self.supermarketSession?.trackingSessionId ?? "")
+                    let observationSaved =
+                        self.supermarketSession?.appendTagObservation(result.0) == true
+                    DispatchQueue.main.async {
+                        guard generation == self.priorMapGeneration else { return }
+                        if observationSaved {
+                            self.presentPriceTagConfirmation(result.1)
+                        }
+                        else {
+                            self.showToast(
+                                message: self.localized("The price-tag observation could not be saved. The final tag was not created; the scan database is unchanged."),
+                                seconds: 6)
+                        }
+                    }
+                }
+            }
+        }
         let ticket: Int
         switch priorMapUpdateGate.begin(timestamp: frame.timestamp) {
         case .throttled:
@@ -2512,14 +2549,10 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         case .accepted(let acceptedTicket):
             ticket = acceptedTicket
         }
-        let generation = priorMapGeneration
-        let transform = frame.camera.transform
-        let timestamp = frame.timestamp
         priorMapQueue.async {
-            let update = localizer.update(
-                transform: transform,
-                timestamp: timestamp,
-                trackingState: trackingState)
+            let update = autoreleasepool {
+                localizer.update(frame: frame, trackingState: trackingState)
+            }
             self.priorMapUpdateGate.finish(ticket: ticket)
             guard generation == self.priorMapGeneration else {
                 return
@@ -2533,6 +2566,80 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                 self.priorMapOverlay?.update(update)
             }
         }
+    }
+
+    @objc private func scanPriorMapPriceTag()
+    {
+        guard activeScanConfiguration.workflowMode == .priorMapLocalized,
+              priorMapLocalizer != nil,
+              session.currentFrame != nil else {
+            showToast(
+                message: localized("ARKit or prior-map localization is not ready."),
+                seconds: 3)
+            return
+        }
+        guard priceTagVisionScanner.requestScan() else {
+            showToast(
+                message: localized("A price-tag scan is already pending."),
+                seconds: 2)
+            return
+        }
+        showToast(
+            message: localized("Aim at one barcode and hold the device steady."),
+            seconds: 2)
+    }
+
+    private func presentPriceTagConfirmation(_ tag: LocalizedPriceTag)
+    {
+        let shelf = tag.shelfCode ?? "未关联"
+        let side = tag.shelfSide ?? "未知"
+        let offset = tag.distanceFromShelfStartCm.map {
+            String(format: "%.0f cm", $0)
+        } ?? "未知"
+        let height = tag.heightCm.map {
+            String(format: "%.0f cm", $0)
+        } ?? "未知"
+        var message = """
+        条码：\(tag.payload)
+        货架：\(shelf) · 侧面 \(side)
+        沿货架：\(offset) · 高度：\(height)
+        测量：\(tag.measurementMethod)
+        定位/测量/关联置信度：\(Int(tag.localizationConfidence * 100))% / \(Int(tag.measurementConfidence * 100))% / \(Int(tag.associationConfidence * 100))%
+        """
+        if tag.needsReview {
+            message += "\n\n当前结果需要人工复核；弱定位或丢失状态绝不会自动确认。"
+        }
+        let alert = UIAlertController(
+            title: localized("确认价签位置"),
+            message: message,
+            preferredStyle: .alert)
+        alert.addAction(UIAlertAction(
+            title: localized("取消，仅保留观测"),
+            style: .cancel))
+        alert.addAction(UIAlertAction(
+            title: localized("确认并保存"),
+            style: .default,
+            handler: { _ in
+                let confirmed = tag.confirmedByUser()
+                guard self.supermarketSession?.recordLocalizedPriceTag(confirmed) == true else {
+                    self.showToast(
+                        message: self.localized("The localized price tag could not be saved. The scan database is unchanged."),
+                        seconds: 6)
+                    return
+                }
+                self.supermarketSession?.appendScanEvent(
+                    event: "localized_price_tag_confirmed",
+                    message: "User confirmed a Vision price-tag location",
+                    fields: [
+                        "tag_id": confirmed.tagId,
+                        "observation_id": confirmed.observationId,
+                        "needs_review": confirmed.needsReview ? "true" : "false",
+                    ])
+                self.showToast(
+                    message: self.localized("The localized price tag was saved."),
+                    seconds: 3)
+            }))
+        present(alert, animated: true)
     }
 
     @objc private func confirmPriorMapPosition()
@@ -3510,6 +3617,21 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                             : nil,
                         manualLocalizationEvents: scanSession.scanConfiguration.workflowMode == .priorMapLocalized
                             ? "manual_localization_events.jsonl"
+                            : nil,
+                        localizationConstraints: scanSession.scanConfiguration.workflowMode == .priorMapLocalized
+                            ? "localization_constraints.jsonl"
+                            : nil,
+                        localizationEvents: scanSession.scanConfiguration.workflowMode == .priorMapLocalized
+                            ? "localization_events.jsonl"
+                            : nil,
+                        tagObservations: scanSession.scanConfiguration.workflowMode == .priorMapLocalized
+                            ? "tag_observations.jsonl"
+                            : nil,
+                        localizedPriceTags: scanSession.scanConfiguration.workflowMode == .priorMapLocalized
+                            ? "localized_price_tags.json"
+                            : nil,
+                        localizedPriceTagCount: scanSession.scanConfiguration.workflowMode == .priorMapLocalized
+                            ? scanSession.confirmedLocalizedPriceTagCount()
                             : nil)
                     let finalSnapshot = scanSession.makeSidecarSnapshot(metadata: metadata)
                     snapshot = finalSnapshot

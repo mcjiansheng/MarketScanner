@@ -125,4 +125,191 @@ guard case .accepted = updateGate.begin(timestamp: 2.0) else {
     exit(1)
 }
 
+let confidenceManager = PriorMapConfidenceManager()
+confidenceManager.reset()
+let initializing = confidenceManager.update(
+    timestamp: 1,
+    trackingState: "normal",
+    accepted: false,
+    validPointCount: 0,
+    coverageAngleRad: 0,
+    uniqueness: 0,
+    residualCost: 0.15,
+    mapMismatch: false)
+require(initializing.phase == .initializing, "first unmatched frame must stay initializing")
+confidenceManager.reset()
+for timestamp in 1...3 {
+    _ = confidenceManager.update(
+        timestamp: Double(timestamp),
+        trackingState: "normal",
+        accepted: true,
+        validPointCount: 100,
+        coverageAngleRad: 1.2,
+        uniqueness: 0.3,
+        residualCost: 0.02,
+        mapMismatch: false)
+}
+require(confidenceManager.phase == .stable, "three trusted observations must enter stable")
+let weak = confidenceManager.update(
+    timestamp: 4,
+    trackingState: "limited",
+    accepted: false,
+    validPointCount: 40,
+    coverageAngleRad: 0.2,
+    uniqueness: 0,
+    residualCost: 0.15,
+    mapMismatch: false)
+require(weak.phase == .weak, "limited tracking must degrade to weak")
+
+let shelf = PriorMapShelf(
+    id: "shelf-1",
+    floorId: "1",
+    code: "S1",
+    crossCode: "C1",
+    rowFlag: "R1",
+    geometry: PriorMapShelfGeometry(
+        type: "Polygon",
+        coordinates: [[0, 0], [4, 0], [4, 1], [0, 1], [0, 0]]))
+let localized = ShelfAssociation.localizedTag(
+    observationId: "observation",
+    payload: "6900000000000",
+    symbology: "EAN13",
+    floorId: "1",
+    rawPosition: PriorMapTagPoint3D(xM: 2, yM: -0.1, heightM: 1.4),
+    cameraPosition: SIMD2<Double>(2, -2),
+    shelves: [shelf],
+    localizationState: "stable",
+    localizationConfidence: 0.9,
+    measurementConfidence: 0.9,
+    measurementMethod: "scene_depth",
+    userConfirmed: false)
+require(localized.shelfCode == "S1", "tag must associate with the expected shelf")
+require(localized.distanceFromShelfStartCm != nil, "tag must retain along-shelf offset")
+require(localized.heightCm == 140, "tag height must be expressed in centimetres")
+
+let oppositeSide = ShelfAssociation.localizedTag(
+    observationId: "opposite",
+    payload: "opposite",
+    symbology: "EAN13",
+    floorId: "1",
+    rawPosition: PriorMapTagPoint3D(xM: 2, yM: 1.1, heightM: 1.2),
+    cameraPosition: SIMD2<Double>(2, 2),
+    shelves: [shelf],
+    localizationState: "stable",
+    localizationConfidence: 0.9,
+    measurementConfidence: 0.9,
+    measurementMethod: "scene_depth",
+    userConfirmed: false)
+require(
+    localized.shelfSide != oppositeSide.shelfSide,
+    "opposite long faces must retain different shelf sides")
+
+let backside = ShelfAssociation.localizedTag(
+    observationId: "backside",
+    payload: "backside",
+    symbology: "EAN13",
+    floorId: "1",
+    rawPosition: PriorMapTagPoint3D(xM: 2, yM: 0.9, heightM: 1.2),
+    cameraPosition: SIMD2<Double>(2, -2),
+    shelves: [shelf],
+    localizationState: "stable",
+    localizationConfidence: 0.9,
+    measurementConfidence: 0.9,
+    measurementMethod: "scene_depth",
+    userConfirmed: false)
+require(backside.needsReview, "a shelf face hidden behind the near face requires review")
+
+let endpoint = ShelfAssociation.localizedTag(
+    observationId: "endpoint",
+    payload: "endpoint",
+    symbology: "QR",
+    floorId: "1",
+    rawPosition: PriorMapTagPoint3D(xM: 0, yM: -0.05, heightM: 1),
+    cameraPosition: SIMD2<Double>(0, -2),
+    shelves: [shelf],
+    localizationState: "stable",
+    localizationConfidence: 0.9,
+    measurementConfidence: 0.9,
+    measurementMethod: "scene_depth",
+    userConfirmed: false)
+require(endpoint.shelfCode == "S1", "shelf endpoint must remain associable")
+require(endpoint.needsReview, "endpoint ambiguity must require review")
+
+let duplicateShelf = PriorMapShelf(
+    id: "shelf-duplicate",
+    floorId: "1",
+    code: "S2",
+    crossCode: nil,
+    rowFlag: nil,
+    geometry: shelf.geometry)
+let ambiguous = ShelfAssociation.localizedTag(
+    observationId: "ambiguous",
+    payload: "ambiguous",
+    symbology: "QR",
+    floorId: "1",
+    rawPosition: PriorMapTagPoint3D(xM: 2, yM: -0.1, heightM: 1),
+    cameraPosition: SIMD2<Double>(2, -2),
+    shelves: [shelf, duplicateShelf],
+    localizationState: "stable",
+    localizationConfidence: 0.9,
+    measurementConfidence: 0.9,
+    measurementMethod: "scene_depth",
+    userConfirmed: false)
+require(ambiguous.needsReview, "overlapping shelves must be marked ambiguous")
+
+let rotatedShelf = PriorMapShelf(
+    id: "rotated",
+    floorId: "1",
+    code: "ROT",
+    crossCode: nil,
+    rowFlag: nil,
+    geometry: PriorMapShelfGeometry(
+        type: "Polygon",
+        coordinates: [[0, 0], [2, 2], [1.5, 2.5], [-0.5, 0.5], [0, 0]]))
+let rotated = ShelfAssociation.localizedTag(
+    observationId: "rotated",
+    payload: "rotated",
+    symbology: "QR",
+    floorId: "1",
+    rawPosition: PriorMapTagPoint3D(xM: 0.8, yM: 1.3, heightM: 1),
+    cameraPosition: SIMD2<Double>(-1, 2),
+    shelves: [rotatedShelf],
+    localizationState: "stable",
+    localizationConfidence: 0.9,
+    measurementConfidence: 0.9,
+    measurementMethod: "scene_depth",
+    userConfirmed: false)
+require(rotated.shelfCode == "ROT", "rotated shelf geometry must be supported")
+
+let outOfRange = ShelfAssociation.localizedTag(
+    observationId: "far",
+    payload: "far",
+    symbology: "QR",
+    floorId: "1",
+    rawPosition: PriorMapTagPoint3D(xM: 20, yM: 20, heightM: 1),
+    cameraPosition: SIMD2<Double>(19, 19),
+    shelves: [shelf],
+    localizationState: "stable",
+    localizationConfidence: 0.9,
+    measurementConfidence: 0.9,
+    measurementMethod: "scene_depth",
+    userConfirmed: false)
+require(outOfRange.shelfCode == nil, "out-of-range observations must not snap")
+require(outOfRange.needsReview, "out-of-range observations require review")
+
+let unsafe = ShelfAssociation.localizedTag(
+    observationId: "unsafe",
+    payload: "unsafe",
+    symbology: "QR",
+    floorId: "1",
+    rawPosition: PriorMapTagPoint3D(xM: 2, yM: -0.1, heightM: 1.4),
+    cameraPosition: SIMD2<Double>(2, -2),
+    shelves: [shelf],
+    localizationState: "lost",
+    localizationConfidence: 0,
+    measurementConfidence: 0.9,
+    measurementMethod: "scene_depth",
+    userConfirmed: false)
+require(unsafe.needsReview, "lost localization may never auto-confirm a tag")
+
 print("PriorMapLocalizationCore Swift tests passed")

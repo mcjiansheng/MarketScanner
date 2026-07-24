@@ -9,6 +9,8 @@ import zlib
 from pathlib import Path
 from typing import Any
 
+from .distance_field import decode_level
+
 
 PACKAGE_FORMAT = "MarketScannerPriorMap"
 PACKAGE_VERSION = 1
@@ -27,6 +29,7 @@ PACKAGE_FILES = {
     "fixed_structures.json",
     "road_graph.json",
     "spatial_index.json",
+    "distance_fields.json",
     "preview.png",
     "validation_report.json",
 }
@@ -227,6 +230,9 @@ def validate_package(directory: Path | str) -> dict[str, Any]:
     spatial = _payload(
         root, "spatial_index.json", "MarketScannerSpatialIndex", errors
     )
+    distance_fields = _payload(
+        root, "distance_fields.json", "MarketScannerDistanceFields", errors
+    )
     validation_report = _payload(
         root,
         "validation_report.json",
@@ -245,6 +251,7 @@ def validate_package(directory: Path | str) -> dict[str, Any]:
             structures_payload,
             graph,
             spatial,
+            distance_fields,
             validation_report,
         )
     ):
@@ -256,6 +263,7 @@ def validate_package(directory: Path | str) -> dict[str, Any]:
     assert structures_payload is not None
     assert graph is not None
     assert spatial is not None
+    assert distance_fields is not None
     assert validation_report is not None
 
     if not isinstance(manifest.get("prior_map_id"), str) or not manifest["prior_map_id"]:
@@ -289,7 +297,7 @@ def validate_package(directory: Path | str) -> dict[str, Any]:
         errors.append(
             {
                 "code": "localization_scope",
-                "message": "manifest 缺少阶段一单楼层定位范围声明。",
+                "message": "manifest 缺少当前单楼层定位范围声明。",
             }
         )
 
@@ -524,6 +532,63 @@ def validate_package(directory: Path | str) -> dict[str, Any]:
                 "message": "道路空间索引未完整且精确覆盖道路边。",
             }
         )
+    distance_manifest = manifest.get("distance_fields")
+    if (
+        not isinstance(distance_manifest, dict)
+        or distance_manifest.get("file") != "distance_fields.json"
+        or distance_manifest.get("format") != "MarketScannerDistanceFields"
+        or distance_manifest.get("version") != PACKAGE_VERSION
+    ):
+        errors.append({"code": "distance_manifest", "message": "manifest 距离场声明无效。"})
+    truncation = distance_fields.get("truncation_distance_m")
+    distance_floors = distance_fields.get("floors")
+    if (
+        not isinstance(truncation, (int, float))
+        or isinstance(truncation, bool)
+        or not 0 < float(truncation) <= 2.55
+        or not isinstance(distance_floors, dict)
+        or set(distance_floors) != set(floor_records)
+    ):
+        errors.append({"code": "distance_fields", "message": "距离场楼层或截断距离无效。"})
+        distance_floors = {}
+    expected_resolutions = distance_manifest.get("resolutions_m") if isinstance(distance_manifest, dict) else None
+    if expected_resolutions != [0.4, 0.2, 0.1]:
+        errors.append(
+            {
+                "code": "distance_resolutions",
+                "message": "距离场必须包含 0.40/0.20/0.10 m 三个层级。",
+            }
+        )
+    for floor_id, floor in distance_floors.items():
+        levels = floor.get("levels") if isinstance(floor, dict) else None
+        if not isinstance(levels, list) or not levels:
+            errors.append({"code": "distance_levels", "message": f"楼层 {floor_id} 缺少距离场层级。"})
+            continue
+        resolutions = [level.get("resolution_m") for level in levels if isinstance(level, dict)]
+        if resolutions != expected_resolutions:
+            errors.append({"code": "distance_resolutions", "message": f"楼层 {floor_id} 距离场分辨率不一致。"})
+        for level in levels:
+            try:
+                if (
+                    not isinstance(level, dict)
+                    or level.get("encoding") != "row_rle_u8_cm"
+                    or not isinstance(level.get("origin_m"), list)
+                    or len(level["origin_m"]) != 2
+                    or float(level.get("resolution_m", 0)) <= 0
+                ):
+                    raise ValueError("Distance-field metadata is invalid.")
+                values = decode_level(level)
+                if 0 not in values:
+                    raise ValueError(
+                        "Distance field contains no visible structure seed."
+                    )
+            except (TypeError, ValueError, OverflowError) as exc:
+                errors.append(
+                    {
+                        "code": "distance_data",
+                        "message": f"楼层 {floor_id} 距离场无法解码：{exc}",
+                    }
+                )
     summary = validation_report.get("summary")
     report_warnings = validation_report.get("warnings")
     malformed_rows = validation_report.get("malformed_rows")

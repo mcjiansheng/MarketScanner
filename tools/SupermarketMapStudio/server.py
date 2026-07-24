@@ -496,6 +496,89 @@ def structure_coverage_summary(session: Path) -> Dict[str, Any]:
     }
 
 
+def prior_map_localization_summary(session: Path) -> Dict[str, Any]:
+    """Inspect bounded Stage-2 audit sidecars without touching the scan DB."""
+    names = {
+        "constraints": "localization_constraints.jsonl",
+        "events": "localization_events.jsonl",
+        "observations": "tag_observations.jsonl",
+    }
+    result: Dict[str, Any] = {
+        "available": False,
+        "constraints": 0,
+        "accepted_constraints": 0,
+        "events": 0,
+        "tag_observations": 0,
+        "localized_price_tags": 0,
+        "needs_review": 0,
+        "malformed_records": 0,
+        "state_counts": {},
+        "files": [],
+    }
+    for category, filename in names.items():
+        for path in sorted(session.glob(f"segment_*/{filename}")):
+            result["files"].append(str(path.relative_to(session)))
+            result["available"] = True
+            try:
+                handle = path.open("r", encoding="utf-8", errors="replace")
+            except OSError:
+                result["malformed_records"] += 1
+                continue
+            with handle:
+                for line in handle:
+                    if not line.strip():
+                        continue
+                    if len(line) > 1_000_000:
+                        result["malformed_records"] += 1
+                        continue
+                    try:
+                        record = json.loads(line)
+                    except json.JSONDecodeError:
+                        result["malformed_records"] += 1
+                        continue
+                    if not isinstance(record, dict):
+                        result["malformed_records"] += 1
+                        continue
+                    if category == "constraints":
+                        result["constraints"] += 1
+                        result["accepted_constraints"] += int(
+                            record.get("accepted") is True
+                        )
+                    elif category == "events":
+                        result["events"] += 1
+                        state = str(record.get("state") or "unknown")
+                        result["state_counts"][state] = (
+                            result["state_counts"].get(state, 0) + 1
+                        )
+                    else:
+                        result["tag_observations"] += 1
+                        result["needs_review"] += int(
+                            record.get("needs_review") is True
+                        )
+    for path in sorted(session.glob("segment_*/localized_price_tags.json")):
+        result["files"].append(str(path.relative_to(session)))
+        result["available"] = True
+        try:
+            if path.stat().st_size > 20 * 1024 * 1024:
+                raise ValueError("localized price-tag sidecar exceeds inspection limit")
+            tags = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(tags, list):
+                raise ValueError("localized price-tag sidecar is not an array")
+            result["localized_price_tags"] += sum(
+                1 for tag in tags if isinstance(tag, dict)
+            )
+            result["needs_review"] += sum(
+                1
+                for tag in tags
+                if isinstance(tag, dict) and tag.get("needs_review") is True
+            )
+        except (OSError, ValueError, json.JSONDecodeError):
+            result["malformed_records"] += 1
+    result["files"].sort()
+    result["state_counts"] = dict(sorted(result["state_counts"].items()))
+    return result
+
+
 def inspect_session(session: Path) -> Dict[str, Any]:
     config = base.MapConfig(0.05, 0.1, 1.25, 1.0, 0.08, 8.0, "xz", False)
     segments = base.discover_segments(session, config)
@@ -530,6 +613,7 @@ def inspect_session(session: Path) -> Dict[str, Any]:
             ),
         },
         "structure_coverage": structure_coverage_summary(session),
+        "prior_map_localization": prior_map_localization_summary(session),
         "scan_logs": scan_event_logs(session),
         "active_job": job_payload(active_job) if active_job else None,
     }
