@@ -16,6 +16,8 @@
 
 "Localized!" = "已重定位！";
 "Loop closure detected!" = "检测到闭环！";
+"Loop completed. Map corrected (%d reliable loops)." = "已完成一次回环，地图已校正（累计 %d 次可靠回环）。";
+"Nearby loop match accepted. Continue to a previously scanned cross-aisle to complete a reliable loop." = "已接受邻近回环匹配；请继续返回已扫描过的横向通道，以完成可靠回环。";
 "Loop closure rejected, too high graph optimization error (%.3fm: ratio=%.3f < factor=%.1fx)." = "闭环被拒绝，图优化误差过大（%.3fm：ratio=%.3f < factor=%.1fx）。";
 "Loop closure rejected, graph optimization failed! You may try a different Graph Optimizer in Mapping settings." = "闭环被拒绝，图优化失败！可在建图设置中尝试其他图优化器。";
 "Loop closure rejected, not enough inliers (%d/%d < %d)." = "闭环被拒绝，可靠匹配点不足（%d/%d < %d）。";
@@ -85,6 +87,15 @@
 "Continuous streaming is always enabled: old working-memory nodes are written to one on-disk database without stopping ARKit. Map optimization and generation run on the PC." = "连续流式扫描始终启用：旧工作内存节点会写入同一个磁盘数据库，不会停止 ARKit；地图优化和生成在 PC 端执行。";
 "Software error optimization is enabled. Unstable tracking frames and implausible pose jumps are excluded; AprilTag and landmark priors are not used." = "纯软件误差优化已启用：不稳定 tracking 帧和不可能的位姿跳变不会进入地图；当前不使用 AprilTag 或地标先验。";
 "Memory pressure detected. Older frames remain on disk; live preview was reduced without stopping the scan." = "检测到内存压力。旧扫描帧仍保存在磁盘中，系统已降低实时预览开销，扫描不会中断。";
+"\nStructure coverage: %d stable / %d multi-view (%d%%)" = "\n结构覆盖：%d 个稳定栅格 / %d 个多视角栅格（%d%%）";
+"Depth is temporarily unavailable. Point the camera at the aisle floor and shelf base." = "暂时没有可用深度。请将镜头对准通道地面和货架底座。";
+"Floor reference is incomplete. Tilt the camera slightly downward while keeping the shelf base visible." = "地面参照不足。请在保持货架底座可见的同时，将镜头略微向下。";
+"Reliable depth is sparse. Move closer and avoid reflective packaging filling the view." = "可靠深度点较少。请适当靠近，并避免让反光包装占满画面。";
+"Shelf structure is visible, but floor context is weak. Tilt slightly downward without losing the shelf base." = "已经看到货架结构，但地面参照不足。请稍微向下调整镜头，同时保留货架底座。";
+"New shelf structure detected. Move slowly for a second observation." = "检测到新的货架结构。请放慢移动，以获得第二次观测。";
+"This shelf is mostly single-view. Shift the viewing angle gradually while keeping the aisle floor visible." = "该货架目前主要是单视角证据。请在保持通道地面可见的同时，缓慢改变观察角度。";
+"Reliable loop closure has been missing for a long distance. Return through the nearest previously scanned cross-aisle before continuing." = "较长距离内没有可靠闭环。请先经过最近已扫描的横向主通道返回，再继续扫描。";
+"The iPhone is warming up. Live rendering was reduced while structural capture remains active." = "iPhone 正在升温。系统已降低实时渲染开销，结构采集仍保持运行。";
 "Streaming working-memory nodes" = "流式工作内存节点数";
 "The scan was saved locally, but copying to the selected location failed: %@" = "扫描已保存在本机，但复制到所选位置失败：%@";
 "The scan was copied to the selected location, but local cleanup failed: %@" = "扫描已复制到所选位置，但清理本地副本失败：%@";

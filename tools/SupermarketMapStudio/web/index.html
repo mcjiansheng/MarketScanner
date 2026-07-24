@@ -100,33 +100,109 @@
             <label>轨迹半径 (m)<input id="option-trajectory-radius" type="number" value="1.25" min="0.1" step="0.05"></label>
             <input id="option-tag-snap" type="hidden" value="1.0">
             <label>水平坐标<select id="option-axes"><option value="xz">X/Z</option><option value="xy">X/Y</option></select></label>
-            <label>3D 表面质量<select id="option-3d-quality"><option value="quick">快速</option><option value="detailed">详细</option><option value="maximum" selected>最高（推荐）</option></select></label>
+            <label>彩色/3D 预览质量<select id="option-3d-quality"><option value="quick">快速</option><option value="detailed">详细</option><option value="maximum" selected>最高（推荐）</option></select></label>
           </div>
         </details>
       </div>
 
       <section class="preview-panel" aria-label="结果预览">
-        <div class="preview-toolbar">
-          <div class="preview-tabs" role="tablist" aria-label="预览视图">
-            <button class="preview-tab is-active" type="button" data-preview="2d-color" role="tab" aria-selected="true">2D 彩色俯视</button>
-            <button class="preview-tab" type="button" data-preview="2d-map" role="tab" aria-selected="false">2D 结构图</button>
-            <button class="preview-tab" type="button" data-preview="3d" role="tab" aria-selected="false">3D 彩色模型</button>
-          </div>
-          <div class="preview-actions">
-            <div id="scene-controls" class="scene-controls" hidden>
-              <div class="drag-mode" role="group" aria-label="三维拖动方式">
-                <button id="drag-rotate" class="view-tool is-active" type="button" aria-pressed="true">旋转</button>
-                <button id="drag-pan" class="view-tool" type="button" aria-pressed="false">平移</button>
-              </div>
-              <label><input id="show-surface" type="checkbox" checked>彩色表面</label>
-              <label><input id="show-cloud" type="checkbox">点云</label>
-              <label><input id="show-trajectory" type="checkbox" checked>轨迹</label>
-              <label class="point-size-control">点大小<input id="point-size" type="range" min="1" max="5" step="0.5" value="2"></label>
+        <div class="preview-header">
+          <div class="preview-toolbar">
+            <div class="preview-tabs" role="tablist" aria-label="预览视图">
+              <button class="preview-tab is-active" type="button" data-preview="2d-color" role="tab" aria-selected="true">2D 彩色俯视</button>
+              <button class="preview-tab" type="button" data-preview="2d-map" role="tab" aria-selected="false">2D 结构图</button>
+              <button id="shelf-preview-tab" class="preview-tab" type="button" data-preview="2d-shelf" role="tab" aria-selected="false" hidden>2D 货架轮廓</button>
+              <button class="preview-tab" type="button" data-preview="3d" role="tab" aria-selected="false">3D 彩色模型</button>
             </div>
-            <button id="reset-view" class="secondary" type="button">重置视图</button>
-            <button id="preview-fullscreen" class="secondary" type="button" aria-pressed="false">全屏预览</button>
-            <button id="open-output" class="secondary" type="button" disabled>打开输出目录</button>
+            <div class="preview-actions">
+              <div id="scene-controls" class="scene-controls" hidden>
+                <div class="drag-mode" role="group" aria-label="三维拖动方式">
+                  <button id="drag-rotate" class="view-tool is-active" type="button" aria-pressed="true">旋转</button>
+                  <button id="drag-pan" class="view-tool" type="button" aria-pressed="false">平移</button>
+                </div>
+                <label><input id="show-surface" type="checkbox" checked>彩色表面</label>
+                <label><input id="show-cloud" type="checkbox">点云</label>
+                <label><input id="show-trajectory" type="checkbox" checked>轨迹</label>
+                <label class="point-size-control">点大小<input id="point-size" type="range" min="1" max="5" step="0.5" value="2"></label>
+              </div>
+              <button id="merge-toggle" class="secondary" type="button" hidden>人工误差修复</button>
+              <button id="reset-view" class="secondary" type="button">重置视图</button>
+              <button id="preview-fullscreen" class="secondary" type="button" aria-pressed="false">全屏预览</button>
+              <button id="open-output" class="secondary" type="button" disabled>打开输出目录</button>
+            </div>
           </div>
+          <section id="shelf-tuning" class="shelf-tuning" aria-label="货架闭合轮廓判定调整" hidden>
+            <div id="shelf-tuning-unavailable" class="shelf-tuning-unavailable" hidden>此结果没有可调证据数据；重新生成地图后即可实时调整货架轮廓。</div>
+            <div id="shelf-tuning-controls" hidden>
+              <div class="shelf-tuning-main">
+                <div class="shelf-slider-block">
+                  <div class="shelf-tuning-heading">
+                    <strong>货架闭合完整度</strong>
+                    <output id="shelf-completeness-value" for="shelf-completeness">平衡 · 50</output>
+                  </div>
+                  <input id="shelf-completeness" type="range" min="0" max="100" step="1" value="50" aria-label="货架闭合完整度">
+                  <div class="shelf-slider-labels"><span>更干净</span><span>更完整</span></div>
+                </div>
+                <div class="shelf-presets" role="group" aria-label="货架闭合轮廓判定预设">
+                  <button type="button" data-shelf-preset="20">严格降噪</button>
+                  <button class="is-active" type="button" data-shelf-preset="50">平衡推荐</button>
+                  <button type="button" data-shelf-preset="85">优先补全</button>
+                </div>
+                <div class="shelf-tuning-actions">
+                  <button id="shelf-reset" class="secondary" type="button">恢复默认</button>
+                  <button id="shelf-download" class="secondary" type="button">下载当前货架轮廓 PNG</button>
+                </div>
+              </div>
+              <div class="shelf-tuning-status">
+                <span id="shelf-tuning-stats">等待货架证据</span>
+                <span>识别会独立读取全部可用深度帧，不受 3D 预览抽帧档位限制。黑色为货架实例的闭合外边界；跨帧重复观测抑制行人噪声，地面和稳定自由空间保护通道。</span>
+              </div>
+              <details class="shelf-advanced">
+                <summary>高级判定参数</summary>
+                <div class="shelf-options-grid">
+                  <label>最小竖直高度跨度 (m)<input id="shelf-min-span" type="number" min="0.05" max="2.00" step="0.05"></label>
+                  <label>最高证据离地至少 (m)<input id="shelf-min-height" type="number" min="0.05" max="2.50" step="0.05"></label>
+                  <label>最小表面竖直度<input id="shelf-min-verticality" type="number" min="0" max="1" step="0.05"></label>
+                  <label>最小三角证据数<input id="shelf-min-triangles" type="number" min="1" max="20" step="1"></label>
+                  <label>最小方向一致性<input id="shelf-min-orientation" type="number" min="0" max="1" step="0.05"></label>
+                  <label>最少独立观测帧<input id="shelf-min-observations" type="number" min="1" max="10" step="1"></label>
+                  <label>触发地面冲突的最少帧<input id="shelf-min-ground-observations" type="number" min="1" max="10" step="1"></label>
+                  <label>最大地面冲突率<input id="shelf-max-ground-conflict" type="number" min="0" max="1" step="0.05"></label>
+                  <label>从实测面向内最多补全 (m)<input id="shelf-fill-distance" type="number" min="0.10" max="1.50" step="0.05"></label>
+                  <label>两侧地板搜索范围 (m)<input id="shelf-ground-search" type="number" min="0.20" max="2.00" step="0.05"></label>
+                  <label>最小货架区域 (m²)<input id="shelf-min-area" type="number" min="0.02" max="5.00" step="0.05"></label>
+                  <label>细桥去噪半径 (栅格)<input id="shelf-morph-radius" type="number" min="0" max="4" step="1"></label>
+                  <label>层板面最少独立帧<input id="shelf-min-elevated-observations" type="number" min="1" max="10" step="1"></label>
+                  <label>最多填补内部孔洞 (m²)<input id="shelf-max-hole-area" type="number" min="0" max="3.00" step="0.05"></label>
+                  <label>自由空间保护边距 (m)<input id="shelf-free-margin" type="number" min="0" max="0.30" step="0.05"></label>
+                  <label>最大可拆粘连桥宽度 (m)<input id="shelf-bridge-width" type="number" min="0" max="1.00" step="0.05"></label>
+                  <label>闭合边界线宽 (栅格)<input id="shelf-boundary-thickness" type="number" min="1" max="4" step="1"></label>
+                </div>
+              </details>
+            </div>
+          </section>
+          <section id="merge-editor" class="merge-editor" aria-label="人工区域误差修复" hidden>
+            <div class="merge-heading">
+              <div>
+                <strong>人工区域误差修复</strong>
+                <div id="merge-instruction">先在结构图上框选正确的基准区域 A，再框选需要对齐的重影区域 B。按住空格可平移视图。</div>
+              </div>
+              <button id="merge-exit" class="secondary" type="button">退出修复</button>
+            </div>
+            <div class="merge-controls">
+              <label>水平微调 dx (m)<input id="merge-dx" type="number" step="0.05" placeholder="框选后自动估计"></label>
+              <label>垂直微调 dy (m)<input id="merge-dy" type="number" step="0.05" placeholder="框选后自动估计"></label>
+              <label>旋转 yaw (°)<input id="merge-yaw" type="number" min="-45" max="45" step="0.1" value="0"></label>
+              <label>约束强度<select id="merge-information"><option value="weak">弱（大范围修复）</option><option value="medium" selected>中（推荐）</option><option value="strong">强（仅高置信对应）</option></select></label>
+              <button id="merge-reset" class="secondary" type="button">重新框选</button>
+              <button id="merge-preview" class="secondary" type="button">预览约束</button>
+            </div>
+            <div class="merge-commit">
+              <span id="merge-status">尚未选择区域</span>
+              <label class="merge-confirm"><input id="merge-confirm" type="checkbox">我已检查预览，确认生成新的全图优化版本</label>
+              <button id="merge-apply" class="primary" type="button" disabled>应用并重新优化</button>
+            </div>
+          </section>
         </div>
         <div class="canvas-wrap">
           <canvas id="map-canvas" aria-label="二维结构地图预览" hidden></canvas>

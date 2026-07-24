@@ -22,7 +22,35 @@ let sessionSelectionToken = 0;
 let currentSingleScanMode = null;
 let currentSingleOfflineSupported = null;
 
-const viewer2d = { image: null, scale: 1, offsetX: 0, offsetY: 0, dragging: false, startX: 0, startY: 0 };
+const viewer2d = {
+  images: { "2d-map": null, "2d-shelf": null },
+  scale: 1, offsetX: 0, offsetY: 0, dragging: false, startX: 0, startY: 0,
+};
+const shelfTuning = {
+  evidence: null,
+  cellMap: null,
+  cells: [],
+  groundCells: new Set(),
+  elevatedCells: new Set(),
+  stableElevatedCells: new Set(),
+  freeSpaceCells: new Set(),
+  elevatedObservationCounts: new Map(),
+  defaults: null,
+  loadToken: 0,
+  renderTimer: null,
+  loading: false,
+  profileLabel: "balanced",
+};
+const manualMerge = {
+  active: false,
+  baseJobId: null,
+  available: false,
+  regions: [],
+  draft: null,
+  selecting: false,
+  preview: null,
+  spacePressed: false,
+};
 const viewerTop = { center: [0, 0, 0], distance: 1 };
 const viewer3d = {
   data: null, yaw: -0.72, pitch: 0.68, distance: 1, dragging: false,
@@ -266,6 +294,23 @@ function renderInspection(data) {
       `检测到正在运行的任务 ${data.active_job.id}：${data.active_job.stage} · ${data.active_job.progress}%（将自动接回，不会重复启动）`,
       "complete",
     );
+  }
+  const coverage = data.structure_coverage || {};
+  const coverageSummary = coverage.summary || null;
+  if (coverage.available && coverageSummary) {
+    const stable = Number(coverageSummary.stableStructureCellCount || 0);
+    const multiView = Number(coverageSummary.multiViewStructureCellCount || 0);
+    const conflicts = Number(coverageSummary.groundConflictCellCount || 0);
+    const score = Math.round(Number(coverageSummary.coverageScore || 0) * 100);
+    const rate = Number(coverageSummary.currentDetectionRateHz || 0).toFixed(1);
+    appendText(
+      target,
+      "div",
+      `手机结构覆盖：${stable} 个稳定栅格 / ${multiView} 个多视角（${score}%），地面冲突 ${conflicts}，结束时 ${rate} Hz`,
+      multiView > 0 ? "complete" : "warning",
+    );
+  } else if ((coverage.malformed_files || []).length) {
+    appendText(target, "div", "手机结构覆盖 sidecar 无法解析；原始 RGB-D 数据库仍可继续处理", "warning");
   }
   const list = document.createElement("ul");
   data.segments.forEach((segment) => {
@@ -606,12 +651,39 @@ async function pollJob() {
 }
 
 async function renderJob(job) {
+  exitManualMerge();
+  manualMerge.baseJobId = job.id;
+  manualMerge.available = Boolean(
+    job.status === "complete" &&
+    job.artifacts?.["preview_layers.json"] &&
+    ["map", "merge"].includes(job.kind),
+  );
+  $("#merge-toggle").hidden = !manualMerge.available;
+  const shelfLoadToken = ++shelfTuning.loadToken;
+  clearShelfTuning(Boolean(job.artifacts?.["shelf_outline_evidence.json"]));
   renderJobProgress(job);
   renderJobLogs(job.logs || []);
   renderReview(job.quality_report || {}, job.review_items || { items: [] });
   renderArtifacts(job.artifacts || {});
   const artifacts = job.artifacts || {};
-  if (artifacts["preview.png"]) load2D(artifacts["preview.png"]);
+  viewer2d.images["2d-map"] = null;
+  viewer2d.images["2d-shelf"] = null;
+  $("#shelf-preview-tab").hidden = true;
+  if (activePreview === "2d-shelf" && !artifacts["shelf_outline.png"]) updatePreview("2d-map");
+  if (artifacts["preview.png"]) load2D(artifacts["preview.png"], "2d-map");
+  const shelfImagePromise = artifacts["shelf_outline.png"]
+    ? load2D(artifacts["shelf_outline.png"], "2d-shelf")
+    : Promise.resolve(null);
+  const evidencePromise = artifacts["shelf_outline_evidence.json"]
+    ? request(artifacts["shelf_outline_evidence.json"]).catch(() => null)
+    : Promise.resolve(null);
+  await shelfImagePromise;
+  const evidence = await evidencePromise;
+  if (shelfLoadToken === shelfTuning.loadToken) {
+    shelfTuning.loading = false;
+    if (evidence) installShelfEvidence(evidence);
+    else syncShelfTuningVisibility();
+  }
   if (artifacts["preview_3d.json"]) {
     const previewUrl = artifacts["preview_3d.json"];
     const data = await request(previewUrl);
@@ -624,7 +696,11 @@ async function renderJob(job) {
   const qualityText = qualityLabels[quality] ? ` / ${qualityLabels[quality]}质量` : "";
   const surfaceText = cloud?.surface_triangle_count ? ` / ${cloud.surface_triangle_count.toLocaleString()} 面` : "";
   const cloudText = cloud?.point_count ? `  |  3D ${cloud.point_count.toLocaleString()} 点${surfaceText} / ${cloud.decoded_frames} 关键帧${qualityText}` : "";
-  previewMeta.textContent = summary ? `${summary.width} x ${summary.height} 栅格  |  ${summary.resolution_m} m  |  ${Number(summary.area_m2).toFixed(2)} m2${cloudText}` : job.output_dir;
+  const shelf = job.quality_report?.shelf_outline;
+  const shelfText = shelf?.cell_count
+    ? `  |  闭合货架轮廓 ${Number(shelf.closed_contour_count || shelf.region_count || shelf.component_count || 0).toLocaleString()} 个 / ${Number(shelf.area_m2 || 0).toFixed(1)} m² 占地 / 拆分 ${Number(shelf.bridge_split_count || 0).toLocaleString()} 处粘连`
+    : "";
+  previewMeta.textContent = summary ? `${summary.width} x ${summary.height} 栅格  |  ${summary.resolution_m} m  |  ${Number(summary.area_m2).toFixed(2)} m2${shelfText}${cloudText}` : job.output_dir;
 }
 
 function renderReview(report, review) {
@@ -698,42 +774,1338 @@ function cssColor(name, fallback) {
   return getComputedStyle(document.documentElement).getPropertyValue(name).trim() || fallback;
 }
 
-function syncEmptyPreview() {
-  emptyPreview.hidden = Boolean((activePreview === "2d-map" && viewer2d.image) || (activePreview !== "2d-map" && viewer3d.data));
+function isPlanPreview(kind = activePreview) {
+  return kind === "2d-map" || kind === "2d-shelf";
 }
 
-function load2D(url) {
+function current2DImage() {
+  return isPlanPreview() ? viewer2d.images[activePreview] : null;
+}
+
+function syncEmptyPreview() {
+  emptyPreview.hidden = Boolean((isPlanPreview() && current2DImage()) || (!isPlanPreview() && viewer3d.data));
+}
+
+function load2D(url, kind) {
   const image = new Image();
-  image.onload = () => {
-    viewer2d.image = image;
-    reset2D();
-    syncEmptyPreview();
-    if (activePreview === "2d-map") draw2D();
+  return new Promise((resolve) => {
+    image.onload = () => {
+      viewer2d.images[kind] = image;
+      if (kind === "2d-shelf") $("#shelf-preview-tab").hidden = false;
+      if (activePreview === kind) reset2D();
+      syncEmptyPreview();
+      syncShelfTuningVisibility();
+      if (activePreview === kind) draw2D();
+      resolve(image);
+    };
+    image.onerror = () => resolve(null);
+    image.src = `${url}?v=${Date.now()}`;
+  });
+}
+
+function clearShelfTuning(loading = false) {
+  window.clearTimeout(shelfTuning.renderTimer);
+  shelfTuning.evidence = null;
+  shelfTuning.cellMap = null;
+  shelfTuning.cells = [];
+  shelfTuning.groundCells = new Set();
+  shelfTuning.elevatedCells = new Set();
+  shelfTuning.stableElevatedCells = new Set();
+  shelfTuning.freeSpaceCells = new Set();
+  shelfTuning.elevatedObservationCounts = new Map();
+  shelfTuning.defaults = null;
+  shelfTuning.loading = loading;
+  shelfTuning.profileLabel = "balanced";
+  syncShelfTuningVisibility();
+}
+
+function syncShelfTuningVisibility() {
+  const panel = $("#shelf-tuning");
+  const visible = activePreview === "2d-shelf" && !$("#shelf-preview-tab").hidden;
+  panel.hidden = !visible;
+  if (!visible) return;
+  const available = Boolean(shelfTuning.evidence);
+  $("#shelf-tuning-controls").hidden = !available;
+  $("#shelf-tuning-unavailable").hidden = available;
+  $("#shelf-tuning-unavailable").textContent = shelfTuning.loading
+    ? "正在载入可调货架证据…"
+    : "此结果没有可调证据数据；重新生成地图后即可实时调整货架轮廓。";
+}
+
+function boundedNumber(value, fallback, minimum, maximum) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return fallback;
+  return Math.max(minimum, Math.min(maximum, number));
+}
+
+function normalizedShelfParameters(raw = {}) {
+  return {
+    minimum_height_span_m: boundedNumber(raw.minimum_height_span_m, 0.38, 0.05, 2),
+    minimum_height_above_floor_m: boundedNumber(raw.minimum_height_above_floor_m, 0.48, 0.05, 2.5),
+    minimum_verticality: boundedNumber(raw.minimum_verticality, 0.56, 0, 1),
+    minimum_triangle_count: Math.round(boundedNumber(raw.minimum_triangle_count, 2, 1, 20)),
+    minimum_orientation_coherence: boundedNumber(raw.minimum_orientation_coherence, 0.40, 0, 1),
+    minimum_observation_count: Math.round(boundedNumber(raw.minimum_observation_count, 2, 1, 10)),
+    minimum_ground_observation_count: Math.round(boundedNumber(raw.minimum_ground_observation_count, 2, 1, 10)),
+    maximum_ground_conflict_ratio: boundedNumber(raw.maximum_ground_conflict_ratio, 0.66, 0, 1),
+    maximum_fill_distance_m: boundedNumber(raw.maximum_fill_distance_m, 0.62, 0.10, 1.50),
+    maximum_ground_search_m: boundedNumber(raw.maximum_ground_search_m, 1.12, 0.20, 2.00),
+    minimum_region_area_m2: boundedNumber(raw.minimum_region_area_m2, 0.40, 0.02, 5.00),
+    morphology_radius_cells: Math.round(boundedNumber(raw.morphology_radius_cells, 1, 0, 4)),
+    minimum_elevated_observation_count: Math.round(boundedNumber(raw.minimum_elevated_observation_count, 2, 1, 10)),
+    maximum_hole_area_m2: boundedNumber(raw.maximum_hole_area_m2, 0.90, 0, 3.00),
+    minimum_free_observation_count: Math.round(boundedNumber(raw.minimum_free_observation_count, 12, 1, 100000)),
+    free_space_margin_m: boundedNumber(raw.free_space_margin_m, 0.0, 0, 0.30),
+    maximum_bridge_width_m: boundedNumber(raw.maximum_bridge_width_m, 0.50, 0, 1.00),
+    boundary_thickness_cells: Math.round(boundedNumber(raw.boundary_thickness_cells, 2, 1, 4)),
   };
-  image.src = `${url}?v=${Date.now()}`;
+}
+
+function installShelfEvidence(payload) {
+  if (payload?.format !== "SupermarketShelfOutlineEvidence" || ![4, 5, 6].includes(payload.version)) return;
+  const width = Math.max(1, Math.round(Number(payload.width)));
+  const height = Math.max(1, Math.round(Number(payload.height)));
+  const rows = Array.isArray(payload.evidence_cells) ? payload.evidence_cells : [];
+  if (!Number.isFinite(width) || !Number.isFinite(height)) return;
+  const cells = [];
+  const cellMap = new Map();
+  rows.forEach((row) => {
+    if (!Array.isArray(row) || row.length < 6) return;
+    const x = Math.round(Number(row[0]));
+    const y = Math.round(Number(row[1]));
+    const minimumHeight = Number(row[2]);
+    const maximumHeight = Number(row[3]);
+    const triangleCount = Math.max(1, Number(row[4]));
+    const verticality = boundedNumber(row[5], 0, 0, 1);
+    if (![x, y, minimumHeight, maximumHeight, triangleCount].every(Number.isFinite)) return;
+    if (x < 0 || y < 0 || x >= width || y >= height) return;
+    const observationCount = row.length >= 10 ? Math.max(1, Number(row[6])) : 1;
+    const orientationCos2 = row.length >= 10 ? Number(row[7]) : 0;
+    const orientationSin2 = row.length >= 10 ? Number(row[8]) : 0;
+    const orientationCoherence = row.length >= 10 ? boundedNumber(row[9], 0, 0, 1) : 0;
+    const orientationWeight = row.length >= 11
+      ? boundedNumber(row[10], triangleCount, 0, Number.MAX_SAFE_INTEGER)
+      : triangleCount;
+    const groundObservationCount = row.length >= 14 ? Math.max(0, Number(row[11])) : 0;
+    const groundTriangleCount = row.length >= 14 ? Math.max(0, Number(row[12])) : 0;
+    const cell = {
+      x, y, minimumHeight, maximumHeight, triangleCount, verticality,
+      observationCount, orientationCos2, orientationSin2, orientationCoherence, orientationWeight,
+      groundObservationCount, groundTriangleCount,
+    };
+    cells.push(cell);
+    cellMap.set(y * width + x, cell);
+  });
+  shelfTuning.evidence = {
+    width,
+    height,
+    resolution: boundedNumber(payload.resolution_m, 0.05, 0.001, 10),
+    floorHeight: payload.floor_height_m !== null && Number.isFinite(Number(payload.floor_height_m))
+      ? Number(payload.floor_height_m)
+      : null,
+    hasOrientation: payload.has_orientation_evidence ?? (payload.version >= 2),
+    hasGroundConflict: payload.has_ground_conflict_evidence ?? (payload.version >= 3),
+    sourceFrames: {
+      available: Math.max(0, Math.round(Number(payload.source_frames?.available) || 0)),
+      sampled: Math.max(0, Math.round(Number(payload.source_frames?.sampled) || 0)),
+      decoded: Math.max(0, Math.round(Number(payload.source_frames?.decoded) || 0)),
+      pixelStep: Math.max(0, Math.round(Number(payload.source_frames?.pixel_step) || 0)),
+    },
+  };
+  const decodeRuns = (runs) => {
+    const decoded = new Set();
+    (Array.isArray(runs) ? runs : []).forEach((run) => {
+      if (!Array.isArray(run) || run.length < 3) return;
+      const imageY = Math.round(Number(run[0]));
+      const start = Math.round(Number(run[1]));
+      const length = Math.max(0, Math.round(Number(run[2])));
+      const y = height - 1 - imageY;
+      if (![imageY, start, length].every(Number.isFinite) || y < 0 || y >= height) return;
+      for (let x = Math.max(0, start); x < Math.min(width, start + length); x += 1) {
+        decoded.add(y * width + x);
+      }
+    });
+    return decoded;
+  };
+  shelfTuning.cells = cells;
+  shelfTuning.cellMap = cellMap;
+  shelfTuning.groundCells = decodeRuns(payload.ground_runs);
+  shelfTuning.elevatedCells = decodeRuns(payload.elevated_runs);
+  shelfTuning.stableElevatedCells = decodeRuns(payload.stable_elevated_runs);
+  shelfTuning.freeSpaceCells = decodeRuns(payload.free_space_runs);
+  shelfTuning.elevatedObservationCounts = new Map();
+  (Array.isArray(payload.elevated_observation_cells) ? payload.elevated_observation_cells : []).forEach((row) => {
+    if (!Array.isArray(row) || row.length < 3) return;
+    const x = Math.round(Number(row[0]));
+    const y = Math.round(Number(row[1]));
+    const count = Math.max(1, Math.round(Number(row[2])));
+    if (![x, y, count].every(Number.isFinite) || x < 0 || y < 0 || x >= width || y >= height) return;
+    shelfTuning.elevatedObservationCounts.set(y * width + x, count);
+  });
+  shelfTuning.defaults = normalizedShelfParameters(payload.defaults);
+  $("#shelf-completeness").value = "50";
+  setShelfParameterFields(shelfTuning.defaults);
+  updateShelfProfileLabel(50, "balanced");
+  syncShelfTuningVisibility();
+  renderShelfOutline(shelfTuning.defaults);
+}
+
+function interpolateShelfParameters(start, end, fraction) {
+  const linear = (key) => start[key] + (end[key] - start[key]) * fraction;
+  return normalizedShelfParameters({
+    minimum_height_span_m: linear("minimum_height_span_m"),
+    minimum_height_above_floor_m: linear("minimum_height_above_floor_m"),
+    minimum_verticality: linear("minimum_verticality"),
+    minimum_triangle_count: Math.round(linear("minimum_triangle_count")),
+    minimum_orientation_coherence: linear("minimum_orientation_coherence"),
+    minimum_observation_count: Math.round(linear("minimum_observation_count")),
+    minimum_ground_observation_count: Math.round(linear("minimum_ground_observation_count")),
+    maximum_ground_conflict_ratio: linear("maximum_ground_conflict_ratio"),
+    maximum_fill_distance_m: linear("maximum_fill_distance_m"),
+    maximum_ground_search_m: linear("maximum_ground_search_m"),
+    minimum_region_area_m2: linear("minimum_region_area_m2"),
+    morphology_radius_cells: Math.round(linear("morphology_radius_cells")),
+    minimum_elevated_observation_count: Math.round(linear("minimum_elevated_observation_count")),
+    maximum_hole_area_m2: linear("maximum_hole_area_m2"),
+    minimum_free_observation_count: start.minimum_free_observation_count,
+    free_space_margin_m: linear("free_space_margin_m"),
+    maximum_bridge_width_m: linear("maximum_bridge_width_m"),
+    boundary_thickness_cells: Math.round(linear("boundary_thickness_cells")),
+  });
+}
+
+function shelfParametersForScore(score) {
+  const balanced = shelfTuning.defaults || normalizedShelfParameters();
+  const strict = normalizedShelfParameters({
+    minimum_height_span_m: Math.max(0.75, balanced.minimum_height_span_m),
+    minimum_height_above_floor_m: Math.max(0.80, balanced.minimum_height_above_floor_m),
+    minimum_verticality: Math.max(0.78, balanced.minimum_verticality),
+    minimum_triangle_count: Math.max(7, balanced.minimum_triangle_count),
+    minimum_orientation_coherence: Math.max(0.70, balanced.minimum_orientation_coherence),
+    minimum_observation_count: Math.max(3, balanced.minimum_observation_count),
+    minimum_ground_observation_count: Math.min(2, balanced.minimum_ground_observation_count),
+    maximum_ground_conflict_ratio: Math.min(0.45, balanced.maximum_ground_conflict_ratio),
+    maximum_fill_distance_m: Math.min(0.40, balanced.maximum_fill_distance_m),
+    maximum_ground_search_m: Math.min(0.80, balanced.maximum_ground_search_m),
+    minimum_region_area_m2: Math.max(0.90, balanced.minimum_region_area_m2),
+    morphology_radius_cells: Math.max(2, balanced.morphology_radius_cells),
+    minimum_elevated_observation_count: Math.max(3, balanced.minimum_elevated_observation_count),
+    maximum_hole_area_m2: Math.min(0.25, balanced.maximum_hole_area_m2),
+    free_space_margin_m: Math.max(0.05, balanced.free_space_margin_m),
+    maximum_bridge_width_m: Math.max(0.55, balanced.maximum_bridge_width_m),
+    boundary_thickness_cells: balanced.boundary_thickness_cells,
+  });
+  const complete = normalizedShelfParameters({
+    minimum_height_span_m: Math.min(0.20, balanced.minimum_height_span_m),
+    minimum_height_above_floor_m: Math.min(0.30, balanced.minimum_height_above_floor_m),
+    minimum_verticality: Math.min(0.45, balanced.minimum_verticality),
+    minimum_triangle_count: 1,
+    minimum_orientation_coherence: Math.min(0.30, balanced.minimum_orientation_coherence),
+    minimum_observation_count: 1,
+    minimum_ground_observation_count: Math.max(3, balanced.minimum_ground_observation_count),
+    maximum_ground_conflict_ratio: Math.max(0.80, balanced.maximum_ground_conflict_ratio),
+    maximum_fill_distance_m: Math.max(0.70, balanced.maximum_fill_distance_m),
+    maximum_ground_search_m: Math.max(1.30, balanced.maximum_ground_search_m),
+    minimum_region_area_m2: Math.min(0.20, balanced.minimum_region_area_m2),
+    morphology_radius_cells: Math.min(1, balanced.morphology_radius_cells),
+    minimum_elevated_observation_count: 1,
+    maximum_hole_area_m2: Math.max(1.20, balanced.maximum_hole_area_m2),
+    free_space_margin_m: 0,
+    maximum_bridge_width_m: Math.min(0.25, balanced.maximum_bridge_width_m),
+    boundary_thickness_cells: balanced.boundary_thickness_cells,
+  });
+  return score <= 50
+    ? interpolateShelfParameters(strict, balanced, score / 50)
+    : interpolateShelfParameters(balanced, complete, (score - 50) / 50);
+}
+
+const shelfParameterFields = {
+  minimum_height_span_m: "#shelf-min-span",
+  minimum_height_above_floor_m: "#shelf-min-height",
+  minimum_verticality: "#shelf-min-verticality",
+  minimum_triangle_count: "#shelf-min-triangles",
+  minimum_orientation_coherence: "#shelf-min-orientation",
+  minimum_observation_count: "#shelf-min-observations",
+  minimum_ground_observation_count: "#shelf-min-ground-observations",
+  maximum_ground_conflict_ratio: "#shelf-max-ground-conflict",
+  maximum_fill_distance_m: "#shelf-fill-distance",
+  maximum_ground_search_m: "#shelf-ground-search",
+  minimum_region_area_m2: "#shelf-min-area",
+  morphology_radius_cells: "#shelf-morph-radius",
+  minimum_elevated_observation_count: "#shelf-min-elevated-observations",
+  maximum_hole_area_m2: "#shelf-max-hole-area",
+  free_space_margin_m: "#shelf-free-margin",
+  maximum_bridge_width_m: "#shelf-bridge-width",
+  boundary_thickness_cells: "#shelf-boundary-thickness",
+};
+
+function setShelfParameterFields(parameters) {
+  Object.entries(shelfParameterFields).forEach(([key, selector]) => {
+    const integer = ["minimum_triangle_count", "minimum_observation_count", "minimum_ground_observation_count", "morphology_radius_cells", "minimum_elevated_observation_count", "boundary_thickness_cells"].includes(key);
+    $(selector).value = integer ? String(parameters[key]) : Number(parameters[key]).toFixed(2);
+  });
+}
+
+function shelfParametersFromFields() {
+  const values = {};
+  Object.entries(shelfParameterFields).forEach(([key, selector]) => { values[key] = $(selector).value; });
+  return normalizedShelfParameters({ ...(shelfTuning.defaults || {}), ...values });
+}
+
+function updateShelfProfileLabel(score, label = null) {
+  const resolved = label || (score < 35 ? "strict" : score > 65 ? "complete" : "balanced");
+  shelfTuning.profileLabel = resolved;
+  const names = { strict: "严格降噪", balanced: "平衡", complete: "优先补全", custom: "自定义" };
+  $("#shelf-completeness-value").textContent = resolved === "custom" ? names[resolved] : `${names[resolved]} · ${score}`;
+  $$('[data-shelf-preset]').forEach((button) => {
+    button.classList.toggle("is-active", resolved !== "custom" && Number(button.dataset.shelfPreset) === score);
+  });
+}
+
+function applyShelfScore(score) {
+  const normalizedScore = Math.max(0, Math.min(100, Math.round(score)));
+  $("#shelf-completeness").value = String(normalizedScore);
+  const parameters = shelfParametersForScore(normalizedScore);
+  setShelfParameterFields(parameters);
+  updateShelfProfileLabel(normalizedScore);
+  scheduleShelfRender(parameters);
+}
+
+function scheduleShelfRender(parameters = shelfParametersFromFields()) {
+  window.clearTimeout(shelfTuning.renderTimer);
+  $("#shelf-tuning-stats").textContent = "正在重算闭合货架轮廓…";
+  shelfTuning.renderTimer = window.setTimeout(() => renderShelfOutline(parameters), 80);
+}
+
+function orientedShelfCells(candidates, width, height, resolution, parameters) {
+  const directions = Array.from({ length: 8 }, (_, index) => {
+    const angle = index * Math.PI / 8;
+    return [Math.cos(angle), Math.sin(angle)];
+  });
+  const xy = (key) => {
+    const y = Math.floor(key / width);
+    return [key - y * width, y];
+  };
+  const keyAt = (x, y) => y * width + x;
+  const inBounds = (x, y) => x >= 0 && y >= 0 && x < width && y < height;
+  const compatible = (first, second) => {
+    if (first === null || second === null) return true;
+    const difference = Math.abs(first - second);
+    return Math.min(difference, directions.length - difference) <= 1;
+  };
+  const rasterLine = (first, second) => {
+    let [x0, y0] = first;
+    const [x1, y1] = second;
+    const dx = Math.abs(x1 - x0);
+    const sx = x0 < x1 ? 1 : -1;
+    const dy = -Math.abs(y1 - y0);
+    const sy = y0 < y1 ? 1 : -1;
+    let error = dx + dy;
+    const result = [];
+    while (true) {
+      if (inBounds(x0, y0)) result.push(keyAt(x0, y0));
+      if (x0 === x1 && y0 === y1) return result;
+      const doubled = 2 * error;
+      if (doubled >= dy) { error += dy; x0 += sx; }
+      if (doubled <= dx) { error += dx; y0 += sy; }
+    }
+  };
+
+  let thinned = new Map(candidates);
+  const radius = parameters.duplicate_suppression_cells;
+  if (radius > 0) {
+    thinned = new Map();
+    candidates.forEach((metadata, key) => {
+      const [x, y] = xy(key);
+      const [axisX, axisY] = directions[metadata.direction];
+      let suppressed = false;
+      for (let oy = -radius; oy <= radius && !suppressed; oy += 1) {
+        for (let ox = -radius; ox <= radius; ox += 1) {
+          if (ox === 0 && oy === 0) continue;
+          const along = Math.abs(ox * axisX + oy * axisY);
+          const across = Math.abs(-ox * axisY + oy * axisX);
+          if (along > 0.75 || across > radius + 0.25 || !inBounds(x + ox, y + oy)) continue;
+          const neighborKey = keyAt(x + ox, y + oy);
+          const neighbor = candidates.get(neighborKey);
+          if (!neighbor || !compatible(neighbor.direction, metadata.direction)) continue;
+          if (neighbor.score > metadata.score || (neighbor.score === metadata.score && neighborKey < key)) {
+            suppressed = true;
+            break;
+          }
+        }
+      }
+      if (!suppressed) thinned.set(key, metadata);
+    });
+
+    const supported = new Map();
+    const supportRadius = Math.max(2, Math.ceil(parameters.minimum_component_length_m / resolution));
+    thinned.forEach((metadata, key) => {
+      const [x, y] = xy(key);
+      const [axisX, axisY] = directions[metadata.direction];
+      const slots = new Set([0]);
+      for (let oy = -supportRadius; oy <= supportRadius; oy += 1) {
+        for (let ox = -supportRadius; ox <= supportRadius; ox += 1) {
+          if (ox === 0 && oy === 0) continue;
+          const along = ox * axisX + oy * axisY;
+          const across = Math.abs(-ox * axisY + oy * axisX);
+          if (Math.abs(along) > supportRadius + 0.5 || across > 1.1 || !inBounds(x + ox, y + oy)) continue;
+          const neighbor = thinned.get(keyAt(x + ox, y + oy));
+          if (neighbor && compatible(neighbor.direction, metadata.direction)) slots.add(Math.round(along));
+        }
+      }
+      if (slots.size >= 3) supported.set(key, metadata);
+    });
+    thinned = supported;
+  }
+
+  const closed = new Set(thinned.keys());
+  const closedDirections = new Map(Array.from(thinned, ([key, value]) => [key, value.direction]));
+  thinned.forEach((metadata, key) => {
+    const [x, y] = xy(key);
+    const [axisX, axisY] = directions[metadata.direction];
+    const searchRadius = parameters.maximum_gap_cells + 2;
+    let best = null;
+    let bestAlong = Infinity;
+    for (let oy = -searchRadius; oy <= searchRadius; oy += 1) {
+      for (let ox = -searchRadius; ox <= searchRadius; ox += 1) {
+        if (!inBounds(x + ox, y + oy)) continue;
+        const farKey = keyAt(x + ox, y + oy);
+        const far = thinned.get(farKey);
+        if (!far || !compatible(far.direction, metadata.direction)) continue;
+        const along = Math.abs(ox * axisX + oy * axisY);
+        const across = Math.abs(-ox * axisY + oy * axisX);
+        if (along <= 1.1 || along > parameters.maximum_gap_cells + 1.6 || across > 0.8) continue;
+        if (along < bestAlong) { best = [x + ox, y + oy]; bestAlong = along; }
+      }
+    }
+    if (best) rasterLine([x, y], best).slice(1, -1).forEach((middle) => {
+      closed.add(middle);
+      closedDirections.set(middle, metadata.direction);
+    });
+  });
+
+  const minimumCells = Math.max(1, Math.ceil(parameters.minimum_component_length_m / resolution));
+  const minimumFragmentCells = Math.max(3, Math.ceil(minimumCells * 0.25));
+  const remaining = new Set(closed);
+  const components = [];
+  while (remaining.size) {
+    const start = remaining.values().next().value;
+    remaining.delete(start);
+    const queue = [start];
+    const component = [start];
+    for (let index = 0; index < queue.length; index += 1) {
+      const key = queue[index];
+      const [x, y] = xy(key);
+      for (let ny = y - 1; ny <= y + 1; ny += 1) {
+        for (let nx = x - 1; nx <= x + 1; nx += 1) {
+          if (!inBounds(nx, ny)) continue;
+          const neighborKey = keyAt(nx, ny);
+          if (!remaining.has(neighborKey)) continue;
+          if (!compatible(closedDirections.get(key), closedDirections.get(neighborKey))) continue;
+          remaining.delete(neighborKey);
+          queue.push(neighborKey);
+          component.push(neighborKey);
+        }
+      }
+    }
+    if (component.length >= minimumFragmentCells) components.push(component);
+  }
+
+  const records = components.map((component) => {
+    const counts = new Map();
+    component.forEach((key) => {
+      const direction = closedDirections.get(key);
+      if (direction !== undefined) counts.set(direction, (counts.get(direction) || 0) + 1);
+    });
+    if (!counts.size) return null;
+    const direction = Array.from(counts).sort((a, b) => b[1] - a[1])[0][0];
+    const [axisX, axisY] = directions[direction];
+    const values = component.map((key) => xy(key));
+    const along = values.map(([x, y]) => x * axisX + y * axisY);
+    const across = values.map(([x, y]) => -x * axisY + y * axisX).sort((a, b) => a - b);
+    return {
+      component,
+      measured: component.filter((key) => thinned.has(key)),
+      direction,
+      minimum: Math.min(...along),
+      maximum: Math.max(...along),
+      normal: across[Math.floor(across.length / 2)],
+    };
+  }).filter(Boolean);
+
+  const parents = records.map((_, index) => index);
+  const find = (index) => {
+    let current = index;
+    while (parents[current] !== current) { parents[current] = parents[parents[current]]; current = parents[current]; }
+    return current;
+  };
+  const unite = (first, second) => { const a = find(first); const b = find(second); if (a !== b) parents[b] = a; };
+  const maxMergeGap = Math.max(12, Math.min(36, parameters.maximum_gap_cells * 3 + 6));
+  const maxNormalDistance = Math.max(2.5, parameters.duplicate_suppression_cells + 2);
+  records.forEach((first, i) => records.slice(i + 1).forEach((second, offset) => {
+    const j = i + 1 + offset;
+    if (first.direction !== second.direction || Math.abs(first.normal - second.normal) > maxNormalDistance) return;
+    const gap = Math.max(0, first.minimum - second.maximum, second.minimum - first.maximum);
+    if (gap <= maxMergeGap) unite(i, j);
+  }));
+
+  const grouped = new Map();
+  records.forEach((record, index) => {
+    const root = find(index);
+    if (!grouped.has(root)) grouped.set(root, { direction: record.direction, keys: [], measured: [] });
+    grouped.get(root).keys.push(...record.component);
+    grouped.get(root).measured.push(...record.measured);
+  });
+  const fitted = [];
+  grouped.forEach((group) => {
+    const [axisX, axisY] = directions[group.direction];
+    const values = group.keys.map((key) => xy(key));
+    const along = values.map(([x, y]) => x * axisX + y * axisY);
+    const across = values.map(([x, y]) => -x * axisY + y * axisX).sort((a, b) => a - b);
+    const minimum = Math.min(...along);
+    const maximum = Math.max(...along);
+    const normal = across[Math.floor(across.length / 2)];
+    const pointAt = (longitudinal) => [
+      Math.round(longitudinal * axisX - normal * axisY),
+      Math.round(longitudinal * axisY + normal * axisX),
+    ];
+    const keys = rasterLine(pointAt(minimum), pointAt(maximum));
+    const measuredSlots = new Set(group.measured.map((key) => {
+      const [x, y] = xy(key);
+      return Math.round(x * axisX + y * axisY);
+    }));
+    const supportRatio = measuredSlots.size / Math.max(1, keys.length);
+    if (keys.length >= minimumCells && supportRatio >= parameters.minimum_line_support_ratio) {
+      fitted.push({ direction: group.direction, minimum, maximum, normal, keys, supportRatio });
+    }
+  });
+  const retained = Array.from(new Set(fitted.flatMap((record) => record.keys)));
+  return {
+    retained,
+    componentCount: fitted.length,
+    lineCandidateCount: fitted.length,
+  };
+}
+
+function renderShelfOutlineLegacy(rawParameters) {
+  const evidence = shelfTuning.evidence;
+  if (!evidence || !shelfTuning.cellMap) return;
+  const parameters = normalizedShelfParameters(rawParameters);
+  const { width, height, resolution, floorHeight, hasOrientation, hasGroundConflict } = evidence;
+  const candidates = hasOrientation ? new Map() : new Set();
+  let groundConflictRejected = 0;
+  shelfTuning.cells.forEach((source) => {
+    let minimumHeight = Infinity;
+    let maximumHeight = -Infinity;
+    let triangleCount = 0;
+    let weightedVerticality = 0;
+    let observationCount = 1;
+    let orientationCos2 = 0;
+    let orientationSin2 = 0;
+    let orientationWeight = 0;
+    for (let y = source.y - 1; y <= source.y + 1; y += 1) {
+      for (let x = source.x - 1; x <= source.x + 1; x += 1) {
+        if (x < 0 || y < 0 || x >= width || y >= height) continue;
+        const neighbor = shelfTuning.cellMap.get(y * width + x);
+        if (!neighbor) continue;
+        minimumHeight = Math.min(minimumHeight, neighbor.minimumHeight);
+        maximumHeight = Math.max(maximumHeight, neighbor.maximumHeight);
+        triangleCount += neighbor.triangleCount;
+        weightedVerticality += neighbor.verticality * neighbor.triangleCount;
+        observationCount = Math.max(observationCount, neighbor.observationCount);
+        orientationCos2 += neighbor.orientationCos2 * neighbor.orientationWeight;
+        orientationSin2 += neighbor.orientationSin2 * neighbor.orientationWeight;
+        orientationWeight += neighbor.orientationWeight;
+      }
+    }
+    if (maximumHeight - minimumHeight < parameters.minimum_height_span_m) return;
+    if (floorHeight !== null && maximumHeight < floorHeight + parameters.minimum_height_above_floor_m) return;
+    if (triangleCount < parameters.minimum_triangle_count) return;
+    const verticality = weightedVerticality / Math.max(1, triangleCount);
+    if (verticality < parameters.minimum_verticality) return;
+    const coherence = Math.min(1, Math.hypot(orientationCos2, orientationSin2) / Math.max(1e-9, orientationWeight));
+    if (hasOrientation && coherence < parameters.minimum_orientation_coherence) return;
+    const groundObservationCount = source.groundObservationCount || 0;
+    const groundConflictRatio = groundObservationCount / Math.max(1, groundObservationCount + observationCount);
+    if (
+      hasGroundConflict
+      && groundObservationCount >= parameters.minimum_ground_observation_count
+      && groundConflictRatio > parameters.maximum_ground_conflict_ratio
+    ) {
+      groundConflictRejected += 1;
+      return;
+    }
+    const key = source.y * width + source.x;
+    if (hasOrientation) {
+      let angle = 0.5 * Math.atan2(orientationSin2, orientationCos2);
+      if (angle < 0) angle += Math.PI;
+      const direction = Math.round(angle / (Math.PI / 8)) % 8;
+      const score = triangleCount * Math.max(0.05, verticality) * (0.5 + coherence) * (1 + Math.log1p(observationCount));
+      candidates.set(key, { score, direction, coherence });
+    } else {
+      candidates.add(key);
+    }
+  });
+
+  if (hasOrientation) {
+    const result = orientedShelfCells(candidates, width, height, resolution, parameters);
+    const canvas = document.createElement("canvas");
+    canvas.width = width;
+    canvas.height = height;
+    const context = canvas.getContext("2d");
+    const pixels = context.createImageData(width, height);
+    pixels.data.fill(255);
+    result.retained.forEach((key) => {
+      const y = Math.floor(key / width);
+      const x = key - y * width;
+      const offset = ((height - 1 - y) * width + x) * 4;
+      pixels.data[offset] = 12;
+      pixels.data[offset + 1] = 16;
+      pixels.data[offset + 2] = 18;
+    });
+    context.putImageData(pixels, 0, 0);
+    const previous = viewer2d.images["2d-shelf"];
+    viewer2d.images["2d-shelf"] = canvas;
+    if (activePreview === "2d-shelf") {
+      if (!previous || previous.width !== width || previous.height !== height) reset2D();
+      else draw2D();
+    }
+    syncEmptyPreview();
+    $("#shelf-tuning-stats").textContent = `${result.lineCandidateCount.toLocaleString()} 条连续轮廓候选 · 过滤 ${groundConflictRejected.toLocaleString()} 个地面冲突 · ${result.retained.length.toLocaleString()} 栅格`;
+    return;
+  }
+
+  const closed = new Set(candidates);
+  for (let gap = 1; gap <= parameters.maximum_gap_cells; gap += 1) {
+    candidates.forEach((key) => {
+      const y = Math.floor(key / width);
+      const x = key - y * width;
+      [[1, 0], [0, 1], [1, 1], [1, -1]].forEach(([dx, dy]) => {
+        const farX = x + (gap + 1) * dx;
+        const farY = y + (gap + 1) * dy;
+        if (farX < 0 || farY < 0 || farX >= width || farY >= height) return;
+        if (!candidates.has(farY * width + farX)) return;
+        for (let step = 1; step <= gap; step += 1) {
+          closed.add((y + step * dy) * width + x + step * dx);
+        }
+      });
+    });
+  }
+
+  const minimumCells = Math.max(1, Math.ceil(parameters.minimum_component_length_m / resolution));
+  const remaining = new Set(closed);
+  const retained = [];
+  let componentCount = 0;
+  while (remaining.size) {
+    const start = remaining.values().next().value;
+    remaining.delete(start);
+    const queue = [start];
+    const component = [start];
+    for (let index = 0; index < queue.length; index += 1) {
+      const key = queue[index];
+      const y = Math.floor(key / width);
+      const x = key - y * width;
+      for (let neighborY = y - 1; neighborY <= y + 1; neighborY += 1) {
+        for (let neighborX = x - 1; neighborX <= x + 1; neighborX += 1) {
+          if (neighborX < 0 || neighborY < 0 || neighborX >= width || neighborY >= height) continue;
+          const neighborKey = neighborY * width + neighborX;
+          if (!remaining.delete(neighborKey)) continue;
+          queue.push(neighborKey);
+          component.push(neighborKey);
+        }
+      }
+    }
+    if (component.length < minimumCells) continue;
+    retained.push(...component);
+    componentCount += 1;
+  }
+
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+  const context = canvas.getContext("2d");
+  const pixels = context.createImageData(width, height);
+  pixels.data.fill(255);
+  retained.forEach((key) => {
+    const y = Math.floor(key / width);
+    const x = key - y * width;
+    const offset = ((height - 1 - y) * width + x) * 4;
+    pixels.data[offset] = 12;
+    pixels.data[offset + 1] = 16;
+    pixels.data[offset + 2] = 18;
+  });
+  context.putImageData(pixels, 0, 0);
+  const previous = viewer2d.images["2d-shelf"];
+  viewer2d.images["2d-shelf"] = canvas;
+  if (activePreview === "2d-shelf") {
+    if (!previous || previous.width !== width || previous.height !== height) reset2D();
+    else draw2D();
+  }
+  syncEmptyPreview();
+  $("#shelf-tuning-stats").textContent = `${componentCount.toLocaleString()} 组 · ${retained.length.toLocaleString()} 栅格 · 候选 ${candidates.size.toLocaleString()}`;
+}
+
+function renderShelfOutline(rawParameters) {
+  const evidence = shelfTuning.evidence;
+  if (!evidence || !shelfTuning.cellMap) return;
+  const parameters = normalizedShelfParameters(rawParameters);
+  const { width, height, resolution, floorHeight, hasOrientation, hasGroundConflict } = evidence;
+  const keyAt = (x, y) => y * width + x;
+  const xy = (key) => {
+    const y = Math.floor(key / width);
+    return [key - y * width, y];
+  };
+  const inBounds = (x, y) => x >= 0 && y >= 0 && x < width && y < height;
+  const offsetCache = new Map();
+  const diskOffsets = (radius) => {
+    if (!offsetCache.has(radius)) {
+      const offsets = [];
+      for (let dy = -radius; dy <= radius; dy += 1) {
+        for (let dx = -radius; dx <= radius; dx += 1) {
+          if (dx * dx + dy * dy <= radius * radius) offsets.push([dx, dy]);
+        }
+      }
+      offsetCache.set(radius, offsets);
+    }
+    return offsetCache.get(radius);
+  };
+  const dilate = (cells, radius) => {
+    if (radius <= 0) return new Set(cells);
+    const result = new Set();
+    const offsets = diskOffsets(radius);
+    cells.forEach((key) => {
+      const [x, y] = xy(key);
+      offsets.forEach(([dx, dy]) => {
+        if (inBounds(x + dx, y + dy)) result.add(keyAt(x + dx, y + dy));
+      });
+    });
+    return result;
+  };
+  const erode = (cells, radius) => {
+    if (radius <= 0) return new Set(cells);
+    const result = new Set();
+    const offsets = diskOffsets(radius);
+    cells.forEach((key) => {
+      const [x, y] = xy(key);
+      if (offsets.every(([dx, dy]) => inBounds(x + dx, y + dy) && cells.has(keyAt(x + dx, y + dy)))) {
+        result.add(key);
+      }
+    });
+    return result;
+  };
+  const subtract = (cells, blocked) => {
+    const result = new Set();
+    cells.forEach((key) => { if (!blocked.has(key)) result.add(key); });
+    return result;
+  };
+  const publish = (cells, status) => {
+    const canvas = document.createElement("canvas");
+    canvas.width = width;
+    canvas.height = height;
+    const context = canvas.getContext("2d");
+    const pixels = context.createImageData(width, height);
+    pixels.data.fill(255);
+    cells.forEach((key) => {
+      const [x, y] = xy(key);
+      const offset = ((height - 1 - y) * width + x) * 4;
+      pixels.data[offset] = 12;
+      pixels.data[offset + 1] = 16;
+      pixels.data[offset + 2] = 18;
+    });
+    context.putImageData(pixels, 0, 0);
+    const previous = viewer2d.images["2d-shelf"];
+    viewer2d.images["2d-shelf"] = canvas;
+    if (activePreview === "2d-shelf") {
+      if (!previous || previous.width !== width || previous.height !== height) reset2D();
+      else draw2D();
+    }
+    syncEmptyPreview();
+    $("#shelf-tuning-stats").textContent = status;
+  };
+
+  const verticalCandidates = new Set();
+  let groundConflictRejected = 0;
+  shelfTuning.cells.forEach((source) => {
+    let minimumHeight = Infinity;
+    let maximumHeight = -Infinity;
+    let triangleCount = 0;
+    let weightedVerticality = 0;
+    let observationCount = 1;
+    let orientationCos2 = 0;
+    let orientationSin2 = 0;
+    let orientationWeight = 0;
+    for (let y = source.y - 1; y <= source.y + 1; y += 1) {
+      for (let x = source.x - 1; x <= source.x + 1; x += 1) {
+        if (!inBounds(x, y)) continue;
+        const neighbor = shelfTuning.cellMap.get(keyAt(x, y));
+        if (!neighbor) continue;
+        minimumHeight = Math.min(minimumHeight, neighbor.minimumHeight);
+        maximumHeight = Math.max(maximumHeight, neighbor.maximumHeight);
+        triangleCount += neighbor.triangleCount;
+        weightedVerticality += neighbor.verticality * neighbor.triangleCount;
+        observationCount = Math.max(observationCount, neighbor.observationCount);
+        orientationCos2 += neighbor.orientationCos2 * neighbor.orientationWeight;
+        orientationSin2 += neighbor.orientationSin2 * neighbor.orientationWeight;
+        orientationWeight += neighbor.orientationWeight;
+      }
+    }
+    if (maximumHeight - minimumHeight < parameters.minimum_height_span_m) return;
+    if (floorHeight !== null && maximumHeight < floorHeight + parameters.minimum_height_above_floor_m) return;
+    if (triangleCount < parameters.minimum_triangle_count) return;
+    if (weightedVerticality / Math.max(1, triangleCount) < parameters.minimum_verticality) return;
+    const coherence = Math.min(1, Math.hypot(orientationCos2, orientationSin2) / Math.max(1e-9, orientationWeight));
+    if (hasOrientation && coherence < parameters.minimum_orientation_coherence) return;
+    if (observationCount < parameters.minimum_observation_count) return;
+    const groundObservationCount = source.groundObservationCount || 0;
+    const conflictRatio = groundObservationCount / Math.max(1, groundObservationCount + observationCount);
+    if (
+      hasGroundConflict
+      && groundObservationCount >= parameters.minimum_ground_observation_count
+      && conflictRatio > parameters.maximum_ground_conflict_ratio
+    ) {
+      groundConflictRejected += 1;
+      return;
+    }
+    if (observationCount < parameters.minimum_observation_count) return;
+    verticalCandidates.add(keyAt(source.x, source.y));
+  });
+
+  const ground = shelfTuning.groundCells;
+  const freeSupport = new Set(ground);
+  shelfTuning.freeSpaceCells.forEach((key) => freeSupport.add(key));
+  if (!freeSupport.size || !verticalCandidates.size) {
+    publish(new Set(), !freeSupport.size
+      ? "缺少地板或稳定自由空间证据，未推断未知区域"
+      : "当前阈值下没有可靠的货架种子");
+    return;
+  }
+  const stableElevated = new Set();
+  if (shelfTuning.elevatedObservationCounts.size) {
+    shelfTuning.elevatedCells.forEach((key) => {
+      if ((shelfTuning.elevatedObservationCounts.get(key) || 0) >= parameters.minimum_elevated_observation_count) {
+        stableElevated.add(key);
+      }
+    });
+  } else {
+    shelfTuning.stableElevatedCells.forEach((key) => stableElevated.add(key));
+  }
+
+  const nearVertical = dilate(verticalCandidates, Math.max(1, Math.ceil(0.20 / resolution)));
+  const measuredSeeds = new Set(verticalCandidates);
+  stableElevated.forEach((key) => measuredSeeds.add(key));
+  shelfTuning.elevatedCells.forEach((key) => { if (nearVertical.has(key)) measuredSeeds.add(key); });
+  ground.forEach((key) => measuredSeeds.delete(key));
+
+  const freeMargin = Math.max(0, Math.ceil(parameters.free_space_margin_m / resolution));
+  const protectedFree = dilate(freeSupport, freeMargin);
+  measuredSeeds.forEach((key) => protectedFree.delete(key));
+  const fillRadius = Math.max(1, Math.ceil(parameters.maximum_fill_distance_m / resolution));
+  const groundRadius = Math.max(1, Math.ceil(parameters.maximum_ground_search_m / resolution));
+  const grown = subtract(dilate(measuredSeeds, fillRadius), protectedFree);
+  const directionPairs = [
+    [[1, 0], [-1, 0]],
+    [[0, 1], [0, -1]],
+    [[1, 1], [-1, -1]],
+    [[1, -1], [-1, 1]],
+  ];
+  const hitsGround = (x, y, dx, dy) => {
+    for (let step = 1; step <= groundRadius; step += 1) {
+      const targetX = x + dx * step;
+      const targetY = y + dy * step;
+      if (!inBounds(targetX, targetY)) return false;
+      if (freeSupport.has(keyAt(targetX, targetY))) return true;
+    }
+    return false;
+  };
+  let footprint = new Set();
+  grown.forEach((key) => {
+    const [x, y] = xy(key);
+    if (directionPairs.some(([first, second]) => (
+      hitsGround(x, y, first[0], first[1]) && hitsGround(x, y, second[0], second[1])
+    ))) footprint.add(key);
+  });
+  if (parameters.morphology_radius_cells > 0) {
+    const radius = parameters.morphology_radius_cells;
+    footprint = dilate(erode(footprint, radius), radius);
+    footprint = erode(dilate(footprint, radius), radius);
+    footprint = subtract(footprint, protectedFree);
+  }
+
+  const smoothed = new Set();
+  dilate(footprint, 1).forEach((key) => {
+    if (protectedFree.has(key)) return;
+    const [x, y] = xy(key);
+    let neighbors = 0;
+    for (let neighborY = y - 1; neighborY <= y + 1; neighborY += 1) {
+      for (let neighborX = x - 1; neighborX <= x + 1; neighborX += 1) {
+        if (inBounds(neighborX, neighborY) && footprint.has(keyAt(neighborX, neighborY))) neighbors += 1;
+      }
+    }
+    if (neighbors >= 5 || (footprint.has(key) && neighbors >= 4)) smoothed.add(key);
+  });
+  footprint = smoothed;
+
+  const connectedComponents = (cells) => {
+    const remaining = new Set(cells);
+    const components = [];
+    while (remaining.size) {
+      const start = remaining.values().next().value;
+      remaining.delete(start);
+      const component = new Set([start]);
+      const queue = [start];
+      for (let index = 0; index < queue.length; index += 1) {
+        const [x, y] = xy(queue[index]);
+        for (let neighborY = y - 1; neighborY <= y + 1; neighborY += 1) {
+          for (let neighborX = x - 1; neighborX <= x + 1; neighborX += 1) {
+            if (!inBounds(neighborX, neighborY) || (neighborX === x && neighborY === y)) continue;
+            const neighbor = keyAt(neighborX, neighborY);
+            if (!remaining.delete(neighbor)) continue;
+            component.add(neighbor);
+            queue.push(neighbor);
+          }
+        }
+      }
+      components.push(component);
+    }
+    return components;
+  };
+
+  const boundsFor = (component) => {
+    let componentMinimumX = width;
+    let componentMaximumX = 0;
+    let componentMinimumY = height;
+    let componentMaximumY = 0;
+    component.forEach((key) => {
+      const [x, y] = xy(key);
+      componentMinimumX = Math.min(componentMinimumX, x);
+      componentMaximumX = Math.max(componentMaximumX, x);
+      componentMinimumY = Math.min(componentMinimumY, y);
+      componentMaximumY = Math.max(componentMaximumY, y);
+    });
+    return {
+      minimumX: Math.max(0, componentMinimumX - 1),
+      maximumX: Math.min(width - 1, componentMaximumX + 1),
+      minimumY: Math.max(0, componentMinimumY - 1),
+      maximumY: Math.min(height - 1, componentMaximumY + 1),
+    };
+  };
+
+  const exteriorBackground = (component) => {
+    const { minimumX, maximumX, minimumY, maximumY } = boundsFor(component);
+    const background = new Set();
+    for (let y = minimumY; y <= maximumY; y += 1) {
+      for (let x = minimumX; x <= maximumX; x += 1) {
+        const key = keyAt(x, y);
+        if (!component.has(key)) background.add(key);
+      }
+    }
+    const exterior = new Set();
+    const queue = [];
+    background.forEach((key) => {
+      const [x, y] = xy(key);
+      if (x === minimumX || x === maximumX || y === minimumY || y === maximumY) {
+        exterior.add(key);
+        queue.push(key);
+      }
+    });
+    for (let index = 0; index < queue.length; index += 1) {
+      const [x, y] = xy(queue[index]);
+      [[1, 0], [-1, 0], [0, 1], [0, -1]].forEach(([dx, dy]) => {
+        if (!inBounds(x + dx, y + dy)) return;
+        const neighbor = keyAt(x + dx, y + dy);
+        if (!background.has(neighbor) || exterior.has(neighbor)) return;
+        exterior.add(neighbor);
+        queue.push(neighbor);
+      });
+    }
+    return { background, exterior };
+  };
+
+  const maximumHoleCells = Math.floor(parameters.maximum_hole_area_m2 / (resolution * resolution));
+  const fillHoles = (component) => {
+    if (!component.size || maximumHoleCells <= 0) return component;
+    const { background, exterior } = exteriorBackground(component);
+    const interior = new Set();
+    background.forEach((key) => { if (!exterior.has(key)) interior.add(key); });
+    const filled = new Set(component);
+    connectedComponents(interior).forEach((hole) => {
+      if (hole.size <= maximumHoleCells) hole.forEach((key) => filled.add(key));
+    });
+    return filled;
+  };
+
+  const minimumCells = Math.max(1, Math.ceil(parameters.minimum_region_area_m2 / (resolution * resolution)));
+  let bridgeSplitCount = 0;
+  const splitNarrowBridges = (component) => {
+    if (parameters.maximum_bridge_width_m <= 0) return [component];
+    const splitRadius = Math.max(1, Math.ceil(parameters.maximum_bridge_width_m / (2 * resolution)));
+    const coreComponents = connectedComponents(erode(component, splitRadius))
+      .filter((core) => core.size >= Math.max(4, Math.floor(minimumCells / 8)));
+    if (coreComponents.length <= 1) return [component];
+
+    const owner = new Map();
+    const distance = new Map();
+    const queue = [];
+    coreComponents.forEach((core, label) => {
+      core.forEach((key) => {
+        owner.set(key, label);
+        distance.set(key, 0);
+        queue.push(key);
+      });
+    });
+    for (let index = 0; index < queue.length; index += 1) {
+      const key = queue[index];
+      const label = owner.get(key);
+      if (label < 0) continue;
+      const [x, y] = xy(key);
+      const candidateDistance = distance.get(key) + 1;
+      for (let neighborY = y - 1; neighborY <= y + 1; neighborY += 1) {
+        for (let neighborX = x - 1; neighborX <= x + 1; neighborX += 1) {
+          if (!inBounds(neighborX, neighborY) || (neighborX === x && neighborY === y)) continue;
+          const neighbor = keyAt(neighborX, neighborY);
+          if (!component.has(neighbor)) continue;
+          if (!distance.has(neighbor)) {
+            distance.set(neighbor, candidateDistance);
+            owner.set(neighbor, label);
+            queue.push(neighbor);
+          } else if (distance.get(neighbor) === candidateDistance && owner.get(neighbor) !== label) {
+            owner.set(neighbor, -1);
+          }
+        }
+      }
+    }
+
+    const seam = new Set();
+    owner.forEach((label, key) => { if (label < 0) seam.add(key); });
+    owner.forEach((label, key) => {
+      if (label < 0) return;
+      const [x, y] = xy(key);
+      for (let neighborY = y - 1; neighborY <= y + 1; neighborY += 1) {
+        for (let neighborX = x - 1; neighborX <= x + 1; neighborX += 1) {
+          const neighborLabel = owner.has(keyAt(neighborX, neighborY))
+            ? owner.get(keyAt(neighborX, neighborY))
+            : label;
+          if (neighborLabel >= 0 && neighborLabel !== label) seam.add(key);
+        }
+      }
+    });
+    const groups = [];
+    coreComponents.forEach((_core, label) => {
+      const owned = new Set();
+      owner.forEach((cellLabel, key) => {
+        if (cellLabel === label && !seam.has(key)) owned.add(key);
+      });
+      connectedComponents(owned).forEach((part) => {
+        if (part.size >= minimumCells) groups.push(part);
+      });
+    });
+    if (groups.length >= 2) {
+      bridgeSplitCount += groups.length - 1;
+      return groups;
+    }
+    return [component];
+  };
+
+  const outerBoundary = (component) => {
+    const { exterior } = exteriorBackground(component);
+    let boundary = new Set();
+    component.forEach((key) => {
+      const [x, y] = xy(key);
+      if ([[1, 0], [-1, 0], [0, 1], [0, -1]].some(([dx, dy]) => exterior.has(keyAt(x + dx, y + dy)))) {
+        boundary.add(key);
+      }
+    });
+    if (parameters.boundary_thickness_cells > 1) {
+      const thickened = dilate(boundary, parameters.boundary_thickness_cells - 1);
+      boundary = new Set([...thickened].filter((key) => component.has(key)));
+    }
+    return boundary;
+  };
+
+  const footprintComponents = [];
+  connectedComponents(footprint).forEach((component) => {
+    if (component.size < minimumCells) return;
+    splitNarrowBridges(fillHoles(component)).forEach((instance) => {
+      if (instance.size >= minimumCells) footprintComponents.push(instance);
+    });
+  });
+  const retainedFootprint = new Set();
+  const contours = new Set();
+  footprintComponents.forEach((component) => {
+    component.forEach((key) => retainedFootprint.add(key));
+    outerBoundary(component).forEach((key) => contours.add(key));
+  });
+  const area = retainedFootprint.size * resolution * resolution;
+  let directlySupported = 0;
+  retainedFootprint.forEach((key) => { if (measuredSeeds.has(key)) directlySupported += 1; });
+  const directSupportRatio = retainedFootprint.size
+    ? Math.round((directlySupported / retainedFootprint.size) * 100)
+    : 0;
+  const sourceFrames = evidence.sourceFrames || {};
+  const frameStatus = sourceFrames.sampled
+    ? ` · 证据 ${sourceFrames.decoded.toLocaleString()}/${sourceFrames.sampled.toLocaleString()} 帧`
+    : "";
+  publish(contours, `${footprintComponents.length.toLocaleString()} 个闭合货架轮廓 · ${area.toFixed(1)} m² 占地 · 直接扫描支持 ${directSupportRatio}%${frameStatus} · 拆分 ${bridgeSplitCount.toLocaleString()} 处粘连 · 过滤 ${groundConflictRejected.toLocaleString()} 个地面冲突`);
+}
+
+function downloadCurrentShelfOutline() {
+  const image = viewer2d.images["2d-shelf"];
+  if (!image) return;
+  const canvas = document.createElement("canvas");
+  canvas.width = image.width;
+  canvas.height = image.height;
+  canvas.getContext("2d").drawImage(image, 0, 0);
+  canvas.toBlob((blob) => {
+    if (!blob) return;
+    const link = document.createElement("a");
+    const suffix = shelfTuning.profileLabel === "custom" ? "custom" : $("#shelf-completeness").value;
+    link.href = URL.createObjectURL(blob);
+    link.download = `shelf_closed_contours_${suffix}.png`;
+    link.click();
+    URL.revokeObjectURL(link.href);
+  }, "image/png");
 }
 
 function reset2D() {
-  if (!viewer2d.image) return;
+  const image = current2DImage();
+  if (!image) return;
   const { width, height } = canvasMetrics(mapCanvas);
-  const scale = Math.min(width / viewer2d.image.width, height / viewer2d.image.height) * 0.92;
+  const scale = Math.min(width / image.width, height / image.height) * 0.92;
   viewer2d.scale = scale;
-  viewer2d.offsetX = (width - viewer2d.image.width * scale) / 2;
-  viewer2d.offsetY = (height - viewer2d.image.height * scale) / 2;
+  viewer2d.offsetX = (width - image.width * scale) / 2;
+  viewer2d.offsetY = (height - image.height * scale) / 2;
   draw2D();
 }
 
 function draw2D() {
-  if (!viewer2d.image || activePreview !== "2d-map") return;
+  const image = current2DImage();
+  if (!image || !isPlanPreview()) return;
   const { width, height, ratio } = canvasMetrics(mapCanvas);
   const ctx = mapCanvas.getContext("2d");
-  ctx.fillStyle = cssColor("--canvas-bg", "#ecf0f2");
+  ctx.fillStyle = activePreview === "2d-shelf" ? "#ffffff" : cssColor("--canvas-bg", "#ecf0f2");
   ctx.fillRect(0, 0, width, height);
   // Downscaling a large metric grid benefits from the browser's best filter;
   // zoomed-in cells remain exact and unsmoothed for engineering inspection.
   ctx.imageSmoothingEnabled = viewer2d.scale / ratio < 1;
   ctx.imageSmoothingQuality = "high";
-  ctx.drawImage(viewer2d.image, viewer2d.offsetX, viewer2d.offsetY, viewer2d.image.width * viewer2d.scale, viewer2d.image.height * viewer2d.scale);
+  ctx.drawImage(image, viewer2d.offsetX, viewer2d.offsetY, image.width * viewer2d.scale, image.height * viewer2d.scale);
+  drawManualMergeOverlay(ctx, ratio);
+}
+
+function imageToCanvas(point) {
+  return [
+    viewer2d.offsetX + point[0] * viewer2d.scale,
+    viewer2d.offsetY + point[1] * viewer2d.scale,
+  ];
+}
+
+function canvasToImage(point) {
+  const image = current2DImage();
+  if (!image) return [0, 0];
+  return [
+    Math.max(0, Math.min(image.width - 1, (point[0] - viewer2d.offsetX) / viewer2d.scale)),
+    Math.max(0, Math.min(image.height - 1, (point[1] - viewer2d.offsetY) / viewer2d.scale)),
+  ];
+}
+
+function normalizedMergeRect(region) {
+  const [x0, y0, x1, y1] = region.rect_pixels;
+  return [Math.min(x0, x1), Math.min(y0, y1), Math.max(x0, x1), Math.max(y0, y1)];
+}
+
+function drawMergeRect(ctx, region, label, color, ratio, dashed = false) {
+  const [x0, y0, x1, y1] = normalizedMergeRect(region);
+  const start = imageToCanvas([x0, y0]);
+  const end = imageToCanvas([x1, y1]);
+  ctx.save();
+  ctx.strokeStyle = color;
+  ctx.fillStyle = color;
+  ctx.globalAlpha = 0.95;
+  ctx.lineWidth = 2 * ratio;
+  ctx.setLineDash(dashed ? [7 * ratio, 5 * ratio] : []);
+  ctx.strokeRect(start[0], start[1], end[0] - start[0], end[1] - start[1]);
+  ctx.setLineDash([]);
+  ctx.font = `${12 * ratio}px -apple-system, BlinkMacSystemFont, sans-serif`;
+  ctx.fillRect(start[0], Math.max(0, start[1] - 19 * ratio), 22 * ratio, 18 * ratio);
+  ctx.fillStyle = "#ffffff";
+  ctx.fillText(label, start[0] + 6 * ratio, Math.max(13 * ratio, start[1] - 5 * ratio));
+  ctx.restore();
+}
+
+function drawManualMergeOverlay(ctx, ratio) {
+  if (!manualMerge.active || activePreview !== "2d-map") return;
+  const colors = ["#16825d", "#d36a21"];
+  manualMerge.regions.forEach((region, index) => {
+    drawMergeRect(ctx, region, index ? "B" : "A", colors[index], ratio);
+  });
+  if (manualMerge.draft) {
+    drawMergeRect(
+      ctx,
+      { rect_pixels: [...manualMerge.draft.start, ...manualMerge.draft.end] },
+      manualMerge.regions.length ? "B" : "A",
+      colors[manualMerge.regions.length] || colors[1],
+      ratio,
+      true,
+    );
+  }
+  const preview = manualMerge.preview;
+  if (!preview || manualMerge.regions.length !== 2) return;
+  const region = normalizedMergeRect(manualMerge.regions[1]);
+  const center = [(region[0] + region[2]) / 2, (region[1] + region[3]) / 2];
+  const resolution = Number(preview.geometry?.resolution_m || 0);
+  if (!(resolution > 0)) return;
+  const dx = Number(preview.alignment?.dx_m || 0) / resolution;
+  const dy = -Number(preview.alignment?.dy_m || 0) / resolution;
+  const theta = -Number(preview.alignment?.yaw_deg || 0) * Math.PI / 180;
+  const cosine = Math.cos(theta);
+  const sine = Math.sin(theta);
+  const corners = [
+    [region[0], region[1]], [region[2], region[1]],
+    [region[2], region[3]], [region[0], region[3]],
+  ].map((point) => {
+    const localX = point[0] - center[0];
+    const localY = point[1] - center[1];
+    return imageToCanvas([
+      center[0] + dx + cosine * localX - sine * localY,
+      center[1] + dy + sine * localX + cosine * localY,
+    ]);
+  });
+  ctx.save();
+  ctx.strokeStyle = "#8e44ad";
+  ctx.lineWidth = 2 * ratio;
+  ctx.setLineDash([8 * ratio, 5 * ratio]);
+  ctx.beginPath();
+  ctx.moveTo(corners[0][0], corners[0][1]);
+  corners.slice(1).forEach((point) => ctx.lineTo(point[0], point[1]));
+  ctx.closePath();
+  ctx.stroke();
+  ctx.restore();
+}
+
+function setMergeStatus(message, tone = "") {
+  const node = $("#merge-status");
+  node.textContent = message;
+  node.className = tone;
+}
+
+function invalidateMergePreview(message = "区域或微调参数已变化，请重新预览约束") {
+  manualMerge.preview = null;
+  $("#merge-confirm").checked = false;
+  $("#merge-apply").disabled = true;
+  if (manualMerge.active) setMergeStatus(message);
+  draw2D();
+}
+
+function resetManualMergeSelection() {
+  manualMerge.regions = [];
+  manualMerge.draft = null;
+  manualMerge.selecting = false;
+  manualMerge.preview = null;
+  $("#merge-dx").value = "";
+  $("#merge-dy").value = "";
+  $("#merge-yaw").value = "0";
+  $("#merge-confirm").checked = false;
+  $("#merge-apply").disabled = true;
+  setMergeStatus("尚未选择区域");
+  $("#merge-instruction").textContent = "先框选正确的基准区域 A，再框选需要对齐的重影区域 B。按住空格可平移视图。";
+  draw2D();
+}
+
+function beginManualMerge() {
+  if (!manualMerge.available || !manualMerge.baseJobId) return;
+  manualMerge.active = true;
+  $("#merge-editor").hidden = false;
+  mapCanvas.classList.add("merge-selecting");
+  updatePreview("2d-map");
+  resetManualMergeSelection();
+}
+
+function exitManualMerge() {
+  manualMerge.active = false;
+  manualMerge.regions = [];
+  manualMerge.draft = null;
+  manualMerge.selecting = false;
+  manualMerge.preview = null;
+  manualMerge.spacePressed = false;
+  const editor = $("#merge-editor");
+  if (editor) editor.hidden = true;
+  if (mapCanvas) mapCanvas.classList.remove("merge-selecting");
+  const apply = $("#merge-apply");
+  if (apply) apply.disabled = true;
+  if (current2DImage() && isPlanPreview()) draw2D();
+}
+
+function manualMergePayload(confirmed = false) {
+  if (manualMerge.regions.length !== 2) {
+    throw new Error("请先框选基准区域 A 和重影区域 B");
+  }
+  const alignment = {};
+  [
+    ["dx_m", "#merge-dx"],
+    ["dy_m", "#merge-dy"],
+    ["yaw_deg", "#merge-yaw"],
+  ].forEach(([key, selector]) => {
+    const raw = $(selector).value.trim();
+    if (raw !== "") alignment[key] = Number(raw);
+  });
+  return {
+    regions: manualMerge.regions,
+    alignment,
+    information_level: $("#merge-information").value,
+    confirmed,
+    points_csv: $("#single-points").value.trim() ? [$("#single-points").value.trim()] : [],
+    options: { ...mapOptions(), offline_optimize: true },
+  };
+}
+
+async function previewManualMerge() {
+  try {
+    setMergeStatus("正在把框选区域映射到位姿图…");
+    const preview = await request(`/api/jobs/${manualMerge.baseJobId}/merge/preview`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(manualMergePayload(false)),
+    });
+    manualMerge.preview = preview;
+    $("#merge-dx").value = Number(preview.alignment.dx_m).toFixed(3);
+    $("#merge-dy").value = Number(preview.alignment.dy_m).toFixed(3);
+    $("#merge-yaw").value = Number(preview.alignment.yaw_deg).toFixed(2);
+    const summary = preview.summary || {};
+    const warnings = preview.warnings || [];
+    const details = `评分 ${preview.alignment.score}/100 · A ${summary.target_node_count || 0} 节点 · B ${summary.source_node_count || 0} 节点 · ${summary.constraint_count || 0} 条人工闭环 · 中位对应残差 ${summary.median_preview_residual_m ?? "—"} m`;
+    setMergeStatus(
+      warnings.length ? `${details}；${warnings.join(" ")}` : details,
+      preview.can_apply ? (warnings.length ? "warning" : "complete") : "warning",
+    );
+    $("#merge-confirm").checked = false;
+    $("#merge-apply").disabled = true;
+    draw2D();
+  } catch (error) {
+    manualMerge.preview = null;
+    setMergeStatus(error.message, "warning");
+    $("#merge-apply").disabled = true;
+  }
+}
+
+async function applyManualMerge() {
+  if (!manualMerge.preview?.can_apply || !$("#merge-confirm").checked) return;
+  try {
+    setBusy(true);
+    setStatus("正在创建人工误差修复版本", "running");
+    const job = await request(`/api/jobs/${manualMerge.baseJobId}/merge/apply`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(manualMergePayload(true)),
+    });
+    activeJobId = job.id;
+    activeJobKey = null;
+    renderJobProgress(job);
+    renderJobLogs(job.logs || []);
+    pollJob();
+  } catch (error) {
+    setBusy(false);
+    setStatus(error.message, "failed");
+  }
 }
 
 function previewIsExpanded() {
@@ -751,7 +2123,7 @@ function updatePreviewFullscreenButton() {
 
 function redrawExpandedPreview() {
   window.requestAnimationFrame(() => {
-    if (activePreview === "2d-map") reset2D();
+    if (isPlanPreview()) reset2D();
     else drawScene();
   });
 }
@@ -1022,12 +2394,12 @@ async function loadSurfaceBuffers(frames, token) {
       const surface = webGLIndexedBuffer(gl, positions, colors, frame.indices || []);
       if (surface) viewer3d.buffers.surfaces.push(surface);
       loaded += 1;
-      if (loaded % 8 === 0 && activePreview !== "2d-map") drawScene();
+      if (loaded % 8 === 0 && !isPlanPreview()) drawScene();
     } catch (error) {
       console.warn(error.message);
     }
   }
-  if (token === viewer3d.surfaceLoadToken && activePreview !== "2d-map") drawScene();
+  if (token === viewer3d.surfaceLoadToken && !isPlanPreview()) drawScene();
 }
 
 function draw3DBuffer(buffer, pointSize = 1, roundPoints = false) {
@@ -1051,7 +2423,7 @@ function draw3DBuffer(buffer, pointSize = 1, roundPoints = false) {
 }
 
 function drawScene() {
-  if (!viewer3d.data || activePreview === "2d-map") return;
+  if (!viewer3d.data || isPlanPreview()) return;
   const topDown = activePreview === "2d-color";
   const metrics = canvasMetrics(sceneCanvas);
   const gl = ensure3DRenderer();
@@ -1085,18 +2457,22 @@ function drawScene() {
 }
 
 function updatePreview(kind) {
+  if (manualMerge.active && kind !== "2d-map") exitManualMerge();
   activePreview = kind;
   $$(".preview-tab").forEach((button) => {
     const selected = button.dataset.preview === kind;
     button.classList.toggle("is-active", selected);
     button.setAttribute("aria-selected", String(selected));
   });
-  mapCanvas.hidden = kind !== "2d-map";
-  sceneCanvas.hidden = kind === "2d-map";
+  const planPreview = isPlanPreview(kind);
+  mapCanvas.hidden = !planPreview;
+  sceneCanvas.hidden = planPreview;
+  mapCanvas.setAttribute("aria-label", kind === "2d-shelf" ? "二维货架和竖直结构轮廓预览" : "二维结构地图预览");
   sceneCanvas.dataset.dragMode = kind === "2d-color" ? "pan" : viewer3d.dragMode;
   $("#scene-controls").hidden = kind !== "3d";
+  syncShelfTuningVisibility();
   syncEmptyPreview();
-  if (kind === "2d-map") reset2D(); else drawScene();
+  if (planPreview) reset2D(); else drawScene();
 }
 
 function pointerPosition(event, canvas) {
@@ -1107,19 +2483,62 @@ function pointerPosition(event, canvas) {
 
 function connect2DControls() {
   mapCanvas.addEventListener("pointerdown", (event) => {
-    if (!viewer2d.image) return;
+    if (!current2DImage()) return;
     const [x, y] = pointerPosition(event, mapCanvas);
+    if (manualMerge.active && !manualMerge.spacePressed) {
+      event.preventDefault();
+      if (manualMerge.regions.length >= 2) resetManualMergeSelection();
+      manualMerge.selecting = true;
+      const point = canvasToImage([x, y]);
+      manualMerge.draft = { start: point, end: point };
+      mapCanvas.setPointerCapture(event.pointerId);
+      draw2D();
+      return;
+    }
     viewer2d.dragging = true; viewer2d.startX = x - viewer2d.offsetX; viewer2d.startY = y - viewer2d.offsetY;
     mapCanvas.setPointerCapture(event.pointerId);
   });
   mapCanvas.addEventListener("pointermove", (event) => {
+    if (manualMerge.selecting && manualMerge.draft) {
+      manualMerge.draft.end = canvasToImage(pointerPosition(event, mapCanvas));
+      draw2D();
+      return;
+    }
     if (!viewer2d.dragging) return;
     const [x, y] = pointerPosition(event, mapCanvas);
     viewer2d.offsetX = x - viewer2d.startX; viewer2d.offsetY = y - viewer2d.startY; draw2D();
   });
-  mapCanvas.addEventListener("pointerup", () => { viewer2d.dragging = false; });
+  mapCanvas.addEventListener("pointerup", () => {
+    viewer2d.dragging = false;
+    if (!manualMerge.selecting || !manualMerge.draft) return;
+    const rectangle = normalizedMergeRect({
+      rect_pixels: [...manualMerge.draft.start, ...manualMerge.draft.end],
+    });
+    manualMerge.selecting = false;
+    manualMerge.draft = null;
+    if (rectangle[2] - rectangle[0] < 4 || rectangle[3] - rectangle[1] < 4) {
+      setMergeStatus("框选区域过小，请重新拖动");
+      draw2D();
+      return;
+    }
+    manualMerge.regions.push({ rect_pixels: rectangle });
+    invalidateMergePreview(
+      manualMerge.regions.length === 1
+        ? "已选择基准区域 A，请继续框选需要对齐的重影区域 B"
+        : "两个区域已选择，请点击“预览约束”检查自动对应",
+    );
+    $("#merge-instruction").textContent = manualMerge.regions.length === 1
+      ? "现在框选同一货架或通道的重影区域 B。"
+      : "紫色虚线将在预览后显示 B 对齐到 A 的目标位置。";
+  });
+  mapCanvas.addEventListener("pointercancel", () => {
+    viewer2d.dragging = false;
+    manualMerge.selecting = false;
+    manualMerge.draft = null;
+    draw2D();
+  });
   mapCanvas.addEventListener("wheel", (event) => {
-    if (!viewer2d.image) return;
+    if (!current2DImage()) return;
     event.preventDefault();
     const [x, y] = pointerPosition(event, mapCanvas);
     const factor = event.deltaY < 0 ? 1.12 : 0.89;
@@ -1220,6 +2639,27 @@ function bindEvents() {
   $("#show-cloud").addEventListener("change", (event) => { viewer3d.showCloud = event.target.checked; drawScene(); });
   $("#show-trajectory").addEventListener("change", (event) => { viewer3d.showTrajectory = event.target.checked; drawScene(); });
   $("#point-size").addEventListener("input", (event) => { viewer3d.pointSize = Number(event.target.value); drawScene(); });
+  $("#shelf-completeness").addEventListener("input", (event) => applyShelfScore(Number(event.target.value)));
+  $$('[data-shelf-preset]').forEach((button) => button.addEventListener("click", () => applyShelfScore(Number(button.dataset.shelfPreset))));
+  Object.values(shelfParameterFields).forEach((selector) => {
+    $(selector).addEventListener("input", () => {
+      updateShelfProfileLabel(Number($("#shelf-completeness").value), "custom");
+      scheduleShelfRender();
+    });
+  });
+  $("#shelf-reset").addEventListener("click", () => applyShelfScore(50));
+  $("#shelf-download").addEventListener("click", downloadCurrentShelfOutline);
+  $("#merge-toggle").addEventListener("click", beginManualMerge);
+  $("#merge-exit").addEventListener("click", exitManualMerge);
+  $("#merge-reset").addEventListener("click", resetManualMergeSelection);
+  $("#merge-preview").addEventListener("click", previewManualMerge);
+  $("#merge-apply").addEventListener("click", applyManualMerge);
+  $("#merge-confirm").addEventListener("change", (event) => {
+    $("#merge-apply").disabled = !(event.target.checked && manualMerge.preview?.can_apply);
+  });
+  ["#merge-dx", "#merge-dy", "#merge-yaw", "#merge-information"].forEach((selector) => {
+    $(selector).addEventListener("input", () => invalidateMergePreview());
+  });
   $("#drag-rotate").addEventListener("click", () => set3DDragMode("rotate"));
   $("#drag-pan").addEventListener("click", () => set3DDragMode("pan"));
   $("#single-session").addEventListener("input", () => {
@@ -1236,7 +2676,7 @@ function bindEvents() {
     });
   });
   $("#reset-view").addEventListener("click", () => {
-    if (activePreview === "2d-map") reset2D();
+    if (isPlanPreview()) reset2D();
     else if (activePreview === "2d-color") resetTopDown();
     else reset3D();
   });
@@ -1247,10 +2687,25 @@ function bindEvents() {
   });
   document.addEventListener("keydown", (event) => {
     const panel = $(".preview-panel");
+    if (
+      manualMerge.active &&
+      event.code === "Space" &&
+      !["INPUT", "SELECT", "TEXTAREA"].includes(event.target.tagName)
+    ) {
+      manualMerge.spacePressed = true;
+      mapCanvas.classList.remove("merge-selecting");
+      event.preventDefault();
+    }
     if (event.key === "Escape" && panel.classList.contains("is-expanded")) {
       panel.classList.remove("is-expanded");
       updatePreviewFullscreenButton();
       redrawExpandedPreview();
+    }
+  });
+  document.addEventListener("keyup", (event) => {
+    if (manualMerge.active && event.code === "Space") {
+      manualMerge.spacePressed = false;
+      mapCanvas.classList.add("merge-selecting");
     }
   });
   $("#open-output").addEventListener("click", async () => {
@@ -1259,7 +2714,7 @@ function bindEvents() {
     catch (error) { setStatus(error.message, "failed"); }
   });
   connect2DControls(); connect3DControls();
-  new ResizeObserver(() => { if (activePreview === "2d-map") draw2D(); else drawScene(); }).observe($(".canvas-wrap"));
+  new ResizeObserver(() => { if (isPlanPreview()) draw2D(); else drawScene(); }).observe($(".canvas-wrap"));
 }
 
 bindEvents();

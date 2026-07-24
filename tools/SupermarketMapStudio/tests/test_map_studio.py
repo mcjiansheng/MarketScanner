@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import shutil
 import sqlite3
 import struct
@@ -26,6 +27,27 @@ import folder_dialog  # noqa: E402
 
 def transform_blob(x: float, y: float, z: float) -> bytes:
     return struct.pack("<12f", 1.0, 0.0, 0.0, x, 0.0, 1.0, 0.0, y, 0.0, 0.0, 1.0, z)
+
+
+def transform_yaw_blob(x: float, y: float, z: float, yaw_degrees: float) -> bytes:
+    yaw = yaw_degrees * 3.141592653589793 / 180.0
+    cosine = math.cos(yaw)
+    sine = math.sin(yaw)
+    return struct.pack(
+        "<12f",
+        cosine,
+        -sine,
+        0.0,
+        x,
+        sine,
+        cosine,
+        0.0,
+        y,
+        0.0,
+        0.0,
+        1.0,
+        z,
+    )
 
 
 def png_chunk(kind: bytes, payload: bytes) -> bytes:
@@ -100,6 +122,82 @@ def add_rgbd_frame(session: Path) -> None:
         )
 
 
+def create_manual_merge_result(root: Path) -> tuple[Path, Path, Path]:
+    session = create_session(
+        root,
+        "SupermarketSession-ManualMerge",
+        0.0,
+        "continuous_streaming",
+    )
+    database = session / "segment_0001" / "rtabmap_segment_0001.db"
+    transforms: dict[int, bytes] = {}
+    with closing(sqlite3.connect(database)) as conn, conn:
+        conn.execute("DELETE FROM Node")
+        for index in range(6):
+            target_id = index + 1
+            source_id = index + 101
+            target = transform_blob(float(index), 0.0, 0.0)
+            source = transform_blob(float(index + 10), 0.0, 0.0)
+            transforms[target_id] = target
+            transforms[source_id] = source
+            conn.execute(
+                "INSERT INTO Node VALUES (?, ?, ?)",
+                (target_id, target, float(target_id)),
+            )
+            conn.execute(
+                "INSERT INTO Node VALUES (?, ?, ?)",
+                (source_id, source, float(source_id)),
+            )
+        conn.execute(
+            "CREATE TABLE Link ("
+            "from_id INTEGER NOT NULL, to_id INTEGER NOT NULL, type INTEGER NOT NULL, "
+            "information_matrix BLOB NOT NULL, transform BLOB, user_data BLOB)"
+        )
+    add_optimized_poses(database, transforms)
+    add_rgbd_frame(session)
+
+    output = session / "MapStudio-ManualBase"
+    output.mkdir()
+    (output / "map.json").write_text(
+        json.dumps(
+            {
+                "format": "SupermarketMap2D",
+                "session": str(session),
+                "parameters": {
+                    "resolution": 0.1,
+                    "horizontal_axes": "xy",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    (output / "preview_layers.json").write_text(
+        json.dumps(
+            {
+                "format": "SupermarketPreviewLayers",
+                "version": 4,
+                "width": 220,
+                "height": 100,
+                "resolution_m": 0.1,
+                "origin": [-2.0, -2.0],
+                "layers": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (output / "offline_processing_report.json").write_text(
+        json.dumps(
+            {
+                "format": "SupermarketOfflineProcessingBundle",
+                "version": 1,
+                "databases": [{"output": {"path": str(database)}}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    return session, database, output
+
+
 class MapStudioApiTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -167,6 +265,246 @@ class MapStudioApiTests(unittest.TestCase):
         self.assertEqual(result["path"], str(self.session_a))
         self.assertEqual(run.call_args.args[0][2:], ["directory", "选择扫描会话"])
 
+    def test_manual_merge_preview_maps_regions_to_user_closures(self) -> None:
+        _session, _database, output = create_manual_merge_result(self.root)
+        job = server.STATE.add("map", output)
+        server.STATE.set_status(job.identifier, "complete")
+        preview = self.api(
+            f"/api/jobs/{job.identifier}/merge/preview",
+            {
+                "regions": [
+                    {"rect_pixels": [15, 70, 75, 90]},
+                    {"rect_pixels": [115, 70, 175, 90]},
+                ],
+                "information_level": "medium",
+            },
+        )
+        self.assertTrue(preview["can_apply"])
+        self.assertGreaterEqual(preview["summary"]["constraint_count"], 2)
+        self.assertAlmostEqual(preview["alignment"]["dx_m"], -10.0, places=3)
+        self.assertTrue(all(item["type"] == 4 for item in preview["constraints"]))
+        self.assertTrue(all(item["from_id"] > item["to_id"] for item in preview["constraints"]))
+
+    def test_manual_user_closures_are_injected_only_into_disposable_copy(self) -> None:
+        _session, source, output = create_manual_merge_result(self.root)
+        preview = server.merge.preview_merge(
+            output,
+            {
+                "regions": [
+                    {"rect_pixels": [15, 70, 75, 90]},
+                    {"rect_pixels": [115, 70, 175, 90]},
+                ],
+            },
+        )
+        disposable = self.root / "manual-staging.db"
+        shutil.copy2(source, disposable)
+        result = server.offline._inject_user_links(disposable, preview["constraints"])
+        self.assertEqual(result["injected_count"], len(preview["constraints"]))
+        with closing(sqlite3.connect(source)) as conn:
+            self.assertEqual(conn.execute("SELECT count(*) FROM Link").fetchone()[0], 0)
+        with closing(sqlite3.connect(disposable)) as conn:
+            rows = conn.execute(
+                "SELECT from_id, to_id, type, length(information_matrix), length(transform) "
+                "FROM Link ORDER BY from_id"
+            ).fetchall()
+        self.assertEqual(len(rows), len(preview["constraints"]))
+        self.assertTrue(all(row[0] > row[1] and row[2:] == (4, 288, 48) for row in rows))
+
+    def test_manual_merge_rejects_indistinguishable_overlapping_regions(self) -> None:
+        _session, _database, output = create_manual_merge_result(self.root)
+        with self.assertRaisesRegex(
+            server.merge.MergeProcessingError,
+            "overlap almost completely",
+        ):
+            server.merge.preview_merge(
+                output,
+                {
+                    "regions": [
+                        {"rect_pixels": [12, 68, 82, 92]},
+                        {"rect_pixels": [12, 68, 82, 92]},
+                    ],
+                },
+            )
+
+    def test_manual_merge_validation_rejects_unapplied_alignment(self) -> None:
+        _session, source, output = create_manual_merge_result(self.root)
+        preview = server.merge.preview_merge(
+            output,
+            {
+                "regions": [
+                    {"rect_pixels": [15, 70, 75, 90]},
+                    {"rect_pixels": [115, 70, 175, 90]},
+                ],
+            },
+        )
+        validation = server.merge.validate_optimized_merge(
+            source,
+            source,
+            preview["constraints"],
+            "xy",
+        )
+        self.assertEqual(validation["status"], "rejected")
+        self.assertGreater(validation["median_constraint_residual_m"], 1.0)
+
+    def test_manual_merge_validation_rejects_missing_constraint_nodes(self) -> None:
+        _session, source, output = create_manual_merge_result(self.root)
+        preview = server.merge.preview_merge(
+            output,
+            {
+                "regions": [
+                    {"rect_pixels": [15, 70, 75, 90]},
+                    {"rect_pixels": [115, 70, 175, 90]},
+                ],
+            },
+        )
+        optimized = self.root / "optimized-missing-node.db"
+        shutil.copy2(source, optimized)
+        aligned = {
+            index + 1: transform_blob(float(index), 0.0, 0.0)
+            for index in range(6)
+        }
+        aligned.update(
+            {
+                index + 101: transform_blob(float(index), 0.0, 0.0)
+                for index in range(6)
+            }
+        )
+        add_optimized_poses(optimized, aligned)
+        missing_node = int(preview["constraints"][0]["from_id"])
+        with closing(sqlite3.connect(optimized)) as conn, conn:
+            conn.execute("DELETE FROM Node WHERE id=?", (missing_node,))
+        add_optimized_poses(
+            optimized,
+            {
+                node_id: transform
+                for node_id, transform in aligned.items()
+                if node_id != missing_node
+            },
+        )
+
+        validation = server.merge.validate_optimized_merge(
+            source,
+            optimized,
+            preview["constraints"],
+            "xy",
+        )
+
+        self.assertEqual(validation["status"], "rejected")
+        self.assertEqual(
+            validation["requested_constraint_count"],
+            len(preview["constraints"]),
+        )
+        self.assertLess(
+            validation["evaluated_constraint_count"],
+            validation["requested_constraint_count"],
+        )
+        self.assertTrue(validation["missing_constraints"])
+
+    def test_manual_merge_validation_rejects_rotational_conflict(self) -> None:
+        _session, source, output = create_manual_merge_result(self.root)
+        preview = server.merge.preview_merge(
+            output,
+            {
+                "regions": [
+                    {"rect_pixels": [15, 70, 75, 90]},
+                    {"rect_pixels": [115, 70, 175, 90]},
+                ],
+            },
+        )
+        optimized = self.root / "optimized-rotational-conflict.db"
+        shutil.copy2(source, optimized)
+        rotated = {
+            index + 1: transform_blob(float(index), 0.0, 0.0)
+            for index in range(6)
+        }
+        rotated.update(
+            {
+                index + 101: transform_yaw_blob(
+                    float(index), 0.0, 0.0, 30.0
+                )
+                for index in range(6)
+            }
+        )
+        add_optimized_poses(optimized, rotated)
+
+        validation = server.merge.validate_optimized_merge(
+            source,
+            optimized,
+            preview["constraints"],
+            "xy",
+        )
+
+        self.assertEqual(validation["status"], "rejected")
+        self.assertLess(validation["median_constraint_residual_m"], 0.01)
+        self.assertGreater(validation["median_constraint_rotation_deg"], 20.0)
+
+    def test_manual_merge_apply_creates_new_validated_map_version(self) -> None:
+        _session, source, base_output = create_manual_merge_result(self.root)
+        source_contents = source.read_bytes()
+        base_job = server.STATE.add("map", base_output)
+        server.STATE.set_status(base_job.identifier, "complete")
+        fake_binary = self.root / "rtabmap-reprocess-manual"
+        fake_binary.write_text("fake", encoding="utf-8")
+        fake_binary.chmod(0o755)
+
+        def fake_run(command: list[str], **_kwargs: object) -> SimpleNamespace:
+            staged_source = Path(command[-2])
+            destination = Path(command[-1])
+            with closing(sqlite3.connect(staged_source)) as conn:
+                self.assertGreater(
+                    conn.execute("SELECT count(*) FROM Link WHERE type=4").fetchone()[0],
+                    1,
+                )
+            shutil.copy2(staged_source, destination)
+            optimized = {
+                index + 1: transform_blob(float(index), 0.0, 0.0)
+                for index in range(6)
+            }
+            optimized.update(
+                {
+                    index + 101: transform_blob(float(index), 0.0, 0.0)
+                    for index in range(6)
+                }
+            )
+            add_optimized_poses(destination, optimized)
+            return SimpleNamespace(
+                returncode=0,
+                stdout=(
+                    "Processed 12/12 nodes [id=106 map=0 graph=12 hyp=0]... 4ms\n"
+                    "FINAL_OPTIMIZATION_DONE poses=12 constraints=6 "
+                    "iterations_done=4 error=0.01 seconds=0.02"
+                ),
+                stderr="",
+            )
+
+        payload = {
+            "regions": [
+                {"rect_pixels": [15, 70, 75, 90]},
+                {"rect_pixels": [115, 70, 175, 90]},
+            ],
+            "confirmed": True,
+            "options": {
+                "reprocess_binary": str(fake_binary),
+                "pc_local_staging": True,
+                "gpu_backend": "cpu",
+                "horizontal_axes": "xy",
+                "resolution": 0.1,
+            },
+        }
+        with mock.patch.object(server.offline.subprocess, "run", side_effect=fake_run):
+            job = self.api(
+                f"/api/jobs/{base_job.identifier}/merge/apply",
+                payload,
+            )
+            result = self.wait_for_job(job["id"])
+        self.assertEqual(result["status"], "complete", result.get("error"))
+        self.assertIn("merge_manifest.json", result["artifacts"])
+        manifest = self.api(result["artifacts"]["merge_manifest.json"])
+        self.assertEqual(manifest["validation_status"], "pass")
+        self.assertGreaterEqual(manifest["constraint_count"], 2)
+        self.assertNotEqual(Path(result["output_dir"]), base_output)
+        self.assertEqual(source.read_bytes(), source_contents)
+
     def test_macos_dialog_uses_native_chooser_without_tkinter(self) -> None:
         with mock.patch.object(
             folder_dialog.subprocess,
@@ -216,6 +554,31 @@ class MapStudioApiTests(unittest.TestCase):
         self.assertEqual(inspection["scan_logs"]["event_count"], 2)
         self.assertEqual(inspection["scan_logs"]["events"][-1]["event"], "health_checkpoint")
         self.assertEqual(inspection["scan_logs"]["malformed_lines"], 0)
+
+    def test_inspection_exposes_phone_structure_coverage_summary(self) -> None:
+        coverage = {
+            "format": "SupermarketStructureCoverage",
+            "version": 1,
+            "cellSizeM": 0.2,
+            "floorHeightM": -1.4,
+            "summary": {
+                "stableStructureCellCount": 48,
+                "multiViewStructureCellCount": 31,
+                "groundConflictCellCount": 3,
+                "coverageScore": 0.61,
+                "currentDetectionRateHz": 1.5,
+            },
+            "cells": [],
+        }
+        path = self.session_a / "segment_0001" / "structure_coverage_cells.json"
+        path.write_text(json.dumps(coverage), encoding="utf-8")
+
+        inspection = self.api("/api/session/inspect", {"session": str(self.session_a)})
+        result = inspection["structure_coverage"]
+        self.assertTrue(result["available"])
+        self.assertEqual(result["summary"]["stableStructureCellCount"], 48)
+        self.assertEqual(result["summary"]["multiViewStructureCellCount"], 31)
+        self.assertEqual(result["summary"]["source"], "segment_0001/structure_coverage_cells.json")
 
     def test_scan_log_reader_keeps_only_the_requested_tail(self) -> None:
         log = self.session_a / "segment_0001" / "scan_events.jsonl"
@@ -292,7 +655,32 @@ class MapStudioApiTests(unittest.TestCase):
         self.assertTrue(result["logs"])
         self.assertEqual(result["logs"][0]["stage"], "任务已启动")
         self.assertIn("preview.png", result["artifacts"])
+        self.assertIn("shelf_outline.png", result["artifacts"])
+        self.assertIn("shelf_outline_evidence.json", result["artifacts"])
         self.assertIn("preview_3d.json", result["artifacts"])
+        self.assertTrue((output / "shelf_outline.png").is_file())
+        evidence = self.api(result["artifacts"]["shelf_outline_evidence.json"])
+        self.assertEqual(evidence["format"], "SupermarketShelfOutlineEvidence")
+        self.assertEqual(evidence["version"], 6)
+        self.assertEqual(evidence["defaults"]["maximum_fill_distance_m"], 0.62)
+        self.assertEqual(evidence["defaults"]["minimum_region_area_m2"], 0.40)
+        self.assertEqual(evidence["defaults"]["minimum_elevated_observation_count"], 2)
+        self.assertEqual(evidence["defaults"]["minimum_observation_count"], 2)
+        self.assertEqual(evidence["defaults"]["maximum_bridge_width_m"], 0.50)
+        self.assertIn("source_frames", evidence)
+        self.assertEqual(evidence["defaults"]["boundary_thickness_cells"], 2)
+        self.assertIn("ground_runs", evidence)
+        self.assertIn("elevated_runs", evidence)
+        self.assertIn("free_space_runs", evidence)
+        self.assertIn("elevated_observation_cells", evidence)
+        preview_layers = self.api(result["artifacts"]["preview_layers.json"])
+        self.assertEqual(preview_layers["version"], 4)
+        self.assertIn("shelf_outline", {layer["id"] for layer in preview_layers["layers"]})
+        self.assertIn("runs", preview_layers["shelf_outline"])
+        self.assertIn("shelf_runs", preview_layers["shelf_outline"])
+        self.assertIn("vertical_structure_runs", preview_layers["shelf_outline"])
+        self.assertEqual(preview_layers["shelf_outline"]["evidence"], "shelf_outline_evidence.json")
+        self.assertEqual(preview_layers["shelf_outline"]["display"], "closed_contours")
         preview = self.api(result["artifacts"]["preview_3d.json"])
         self.assertEqual(preview["format"], "SupermarketMap3DPreview")
         self.assertEqual(len(preview["segments"][0]["trajectory"]), 2)
@@ -509,7 +897,53 @@ class MapStudioApiTests(unittest.TestCase):
         self.assertEqual(projector.calls, 1)
         self.assertEqual(cloud["gpu_projection_backend"], "apple_metal")
         self.assertEqual(cloud["gpu_projected_frames"], 1)
+        self.assertEqual(cloud["structure_gpu_projected_frames"], 1)
         self.assertEqual(cloud["points"][0][:3], [42.0, 24.0, 1.5])
+
+    def test_depth_cloud_projects_with_full_optimized_pose(self) -> None:
+        add_rgbd_frame(self.session_a)
+        database = self.session_a / "segment_0001" / "rtabmap_segment_0001.db"
+        optimized = transform_blob(5.0, 6.0, 7.0)
+        add_optimized_poses(database, {1: optimized})
+        config = server.base.MapConfig(0.05, 0.1, 1.25, 1.0, 0.08, 8.0, "xz", False)
+        segments = server.base.discover_segments(self.session_a, config)
+
+        captured: dict[str, object] = {}
+
+        class CapturingProjector:
+            backend = "apple_metal"
+
+            def project(self, **kwargs: object) -> list[tuple[float, float, float, float]]:
+                captured.update(kwargs)
+                width = int(kwargs["width"])
+                height = int(kwargs["height"])
+                step = int(kwargs["step"])
+                count = ((width + step - 1) // step) * ((height + step - 1) // step)
+                return [(0.0, 0.0, 8.0, 1.0)] * count
+
+        cloud = server.base.extract_depth_point_cloud(
+            segments,
+            "xz",
+            max_frames=1,
+            pixel_step=3,
+            max_points=100,
+            depth_projector=CapturingProjector(),
+        )
+        self.assertEqual(tuple(captured["raw_transform"]), struct.unpack("<12f", optimized))
+        self.assertAlmostEqual(float(captured["correction_dx"]), 0.0, places=5)
+        self.assertAlmostEqual(float(captured["correction_dy"]), 0.0, places=5)
+        self.assertAlmostEqual(float(captured["correction_yaw"]), 0.0, places=5)
+        self.assertEqual(cloud["optimized_projection_pose_count"], 1)
+        self.assertEqual(cloud["raw_projection_pose_count"], 0)
+
+        cpu_cloud = server.base.extract_depth_point_cloud(
+            segments,
+            "xz",
+            max_frames=1,
+            pixel_step=3,
+            max_points=100,
+        )
+        self.assertGreater(min(point[2] for point in cpu_cloud["points"]), 7.0)
 
     def test_gpu_capability_api_has_both_platform_backends(self) -> None:
         payload = self.api("/api/gpu/capabilities")
@@ -578,9 +1012,32 @@ class MapStudioApiTests(unittest.TestCase):
         self.assertIn(b'id="option-pc-local-staging"', html)
         self.assertIn(b'id="option-gpu-backend"', html)
         self.assertIn(b'id="gpu-capability"', html)
+        self.assertIn(b'id="shelf-preview-tab"', html)
+        self.assertIn(b'id="shelf-completeness"', html)
+        self.assertIn(b'id="shelf-min-orientation"', html)
+        self.assertIn(b'id="shelf-min-observations"', html)
+        self.assertIn(b'id="shelf-min-ground-observations"', html)
+        self.assertIn(b'id="shelf-max-ground-conflict"', html)
+        self.assertIn(b'id="shelf-fill-distance"', html)
+        self.assertIn(b'id="shelf-ground-search"', html)
+        self.assertIn(b'id="shelf-min-area"', html)
+        self.assertIn(b'id="shelf-max-hole-area"', html)
+        self.assertIn(b'id="shelf-free-margin"', html)
+        self.assertIn(b'id="shelf-bridge-width"', html)
+        self.assertIn(b'id="shelf-boundary-thickness"', html)
+        self.assertNotIn(b'id="shelf-show-structures"', html)
+        self.assertNotIn(b'id="shelf-min-line-support"', html)
+        self.assertNotIn(b'id="shelf-duplicate-radius"', html)
+        self.assertIn(b'data-shelf-preset="50"', html)
+        self.assertIn(b'id="shelf-download"', html)
+        self.assertIn("高级判定参数".encode("utf-8"), html)
+        self.assertIn("彩色/3D 预览质量".encode("utf-8"), html)
         self.assertIn(b'<option value="maximum" selected>', html)
         self.assertIn(b"max-width: 1920px", css)
         self.assertIn(b".preview-panel:fullscreen", css)
+        script, _ = self.fetch("/app.js")
+        self.assertIn(b"SupermarketShelfOutlineEvidence", script)
+        self.assertIn(b"renderShelfOutline", script)
 
     def test_unsafe_optimized_pose_jump_is_rejected_before_publication(self) -> None:
         session = create_session(self.root, "SupermarketSession-UnsafeOptimization", 0.0, "continuous_streaming")
@@ -682,6 +1139,46 @@ class MapStudioApiTests(unittest.TestCase):
         self.assertEqual(assessment["status"], "warning")
         self.assertEqual(assessment["constraints"]["loop_closure_count"], 0)
         self.assertTrue(any("accumulated drift" in warning for warning in assessment["warnings"]))
+
+    def test_residual_single_floor_vertical_shift_requires_review(self) -> None:
+        source = self.root / "vertical-source.db"
+        optimized = self.root / "vertical-optimized.db"
+        raw_transforms = {
+            node_id: transform_blob(node_id * 0.10, 0.0, node_id * 0.015)
+            for node_id in range(1, 81)
+        }
+        optimized_transforms = {
+            node_id: transform_blob(node_id * 0.10, 0.0, node_id * 0.010)
+            for node_id in range(1, 81)
+        }
+        with closing(sqlite3.connect(source)) as conn, conn:
+            conn.execute("CREATE TABLE Node (id INTEGER PRIMARY KEY, pose BLOB, stamp REAL)")
+            conn.executemany(
+                "INSERT INTO Node VALUES (?, ?, ?)",
+                (
+                    (node_id, raw_transforms[node_id], float(node_id))
+                    for node_id in sorted(raw_transforms)
+                ),
+            )
+        shutil.copy2(source, optimized)
+        with closing(sqlite3.connect(optimized)) as conn, conn:
+            conn.execute("CREATE TABLE Link (from_id INTEGER, to_id INTEGER, type INTEGER)")
+            conn.executemany(
+                "INSERT INTO Link VALUES (?, ?, 0)",
+                ((node_id, node_id + 1) for node_id in range(1, 80)),
+            )
+            conn.execute("INSERT INTO Link VALUES (1, 80, 1)")
+        add_optimized_poses(optimized, optimized_transforms)
+
+        assessment = server.offline.assess_optimized_trajectory(source, optimized)
+        self.assertEqual(assessment["status"], "warning")
+        self.assertGreater(
+            abs(assessment["optimized"]["vertical_endpoint_band_shift_m"]), 0.45
+        )
+        self.assertIn("translation_correction_p95_m", assessment["optimization_displacement"])
+        self.assertTrue(
+            any("start and end bands" in warning for warning in assessment["warnings"])
+        )
 
     def test_pc_reprocess_rejects_optimizer_fallback(self) -> None:
         session = create_session(self.root, "SupermarketSession-Fallback", 0.0, "continuous_streaming")
@@ -863,6 +1360,8 @@ class MapStudioApiTests(unittest.TestCase):
         result = self.wait_for_job(job["id"])
         self.assertEqual(result["status"], "complete", result.get("error"))
         self.assertIn("multi_device_manifest.json", result["artifacts"])
+        self.assertIn("shelf_outline.png", result["artifacts"])
+        self.assertIn("shelf_outline_evidence.json", result["artifacts"])
         manifest = self.api(result["artifacts"]["multi_device_manifest.json"])
         self.assertEqual(len(manifest["devices"]), 2)
         self.assertEqual(manifest["devices"][0]["input_scan"]["scan_mode"], "continuous_streaming")
@@ -882,6 +1381,21 @@ class MapStudioApiTests(unittest.TestCase):
         parsed = server.base.parse_rtabmap_transform_3d(transform_blob(2.0, 1.5, 1.0), "xz")
         self.assertEqual(parsed, (-1.5, -2.0, 1.0, 0.0))
 
+    def test_local_grid_columns_require_an_actual_nonempty_blob(self) -> None:
+        database = self.session_a / "segment_0001" / "rtabmap_segment_0001.db"
+        with closing(sqlite3.connect(database)) as conn, conn:
+            conn.execute(
+                "CREATE TABLE Data (id INTEGER PRIMARY KEY, ground_cells BLOB, obstacle_cells BLOB, empty_cells BLOB)"
+            )
+            conn.execute("INSERT INTO Data VALUES (1, NULL, NULL, NULL)")
+        _poses, has_grids, _warnings = server.base.extract_db_poses(database, 1, "xz")
+        self.assertFalse(has_grids)
+
+        with closing(sqlite3.connect(database)) as conn, conn:
+            conn.execute("UPDATE Data SET ground_cells=? WHERE id=1", (b"grid",))
+        _poses, has_grids, _warnings = server.base.extract_db_poses(database, 1, "xz")
+        self.assertTrue(has_grids)
+
     def test_depth_png_and_calibration_create_point_cloud_preview(self) -> None:
         database = self.session_a / "segment_0001" / "rtabmap_segment_0001.db"
         with closing(sqlite3.connect(database)) as conn, conn:
@@ -889,6 +1403,10 @@ class MapStudioApiTests(unittest.TestCase):
             conn.execute(
                 "INSERT INTO Data VALUES (?, ?, ?, ?)",
                 (1, depth_png(2, 2, [1.0, 1.02, 1.03, 1.04]), calibration_blob(2, 2), b"\xff\xd8test"),
+            )
+            conn.execute(
+                "INSERT INTO Data VALUES (?, ?, ?, ?)",
+                (2, depth_png(2, 2, [1.1, 1.12, 1.13, 1.14]), calibration_blob(2, 2), b"\xff\xd8test2"),
             )
         config = server.base.MapConfig(0.05, 0.1, 1.25, 1.0, 0.1, 8.0, "xz", False)
         segments = server.base.discover_segments(self.session_a, config)
@@ -901,6 +1419,9 @@ class MapStudioApiTests(unittest.TestCase):
             frame_output_dir=self.root / "frames",
         )
         self.assertEqual(preview["decoded_frames"], 1)
+        self.assertEqual(preview["sampled_frames"], 1)
+        self.assertEqual(preview["structure_sampled_frames"], 2)
+        self.assertEqual(preview["structure_decoded_frames"], 2)
         self.assertEqual(preview["point_count"], 4)
         self.assertEqual(preview["surface_frame_count"], 1)
         self.assertGreater(preview["surface_triangle_count"], 0)
@@ -934,6 +1455,316 @@ class MapStudioApiTests(unittest.TestCase):
         )
         self.assertEqual(legacy_preview["decoded_frames"], 1)
         self.assertEqual(legacy_preview["surface_frame_count"], 0)
+
+    def _legacy_vertical_height_span_creates_black_shelf_outline(self) -> None:
+        vertical = server.base.vertical_triangle_sample(
+            (0.0, 0.0, 0.0), (0.0, 0.0, 1.0), (0.0, 1.0, 0.0)
+        )
+        horizontal = server.base.vertical_triangle_sample(
+            (0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0)
+        )
+        ground = server.base.horizontal_triangle_sample(
+            (0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0)
+        )
+        self.assertIsNotNone(vertical)
+        self.assertIsNone(horizontal)
+        self.assertIsNotNone(ground)
+
+        grid = server.base.OccupancyGrid(0.05, [(0.0, 0.0), (1.0, 1.0)], 0.1)
+        evidence = [
+            [x / 20.0, 0.5, 0.20, 1.80, 8, 0.01, 0.95]
+            for x in range(4, 17)
+        ]
+        point_cloud = {
+            "estimated_floor_height_m": 0.0,
+            "vertical_surface_triangle_count": len(evidence) * 8,
+            "_vertical_surface_evidence": evidence,
+        }
+        outline = server.base.build_shelf_outline(point_cloud, grid)
+        self.assertEqual(len(outline.components), 1)
+        self.assertGreaterEqual(len(outline.cells), 10)
+        self.assertTrue(outline.evidence_cells)
+
+        output = self.root / "shelf-outline.png"
+        server.base.render_shelf_outline(grid, outline, output)
+        width, height, _bit_depth, color_type, pixels = server.base.decode_png_pixels(output.read_bytes())
+        self.assertEqual((width, height, color_type), (grid.width, grid.height, 2))
+        black_pixels = sum(
+            1 for index in range(0, len(pixels), 3)
+            if pixels[index:index + 3] == bytes((12, 16, 18))
+        )
+        self.assertEqual(black_pixels, len(outline.cells))
+
+        evidence_output = self.root / "shelf-outline-evidence.json"
+        server.base.write_shelf_outline_evidence(evidence_output, grid, outline)
+        payload = json.loads(evidence_output.read_text(encoding="utf-8"))
+        self.assertEqual(payload["format"], "SupermarketShelfOutlineEvidence")
+        self.assertEqual(payload["version"], 3)
+        self.assertFalse(payload["has_orientation_evidence"])
+        self.assertFalse(payload["has_ground_conflict_evidence"])
+        self.assertEqual(payload["defaults"]["minimum_height_span_m"], 0.45)
+        self.assertEqual(payload["defaults"]["minimum_orientation_coherence"], 0.45)
+        self.assertEqual(payload["defaults"]["minimum_ground_observation_count"], 2)
+        self.assertEqual(payload["defaults"]["maximum_ground_conflict_ratio"], 0.60)
+        self.assertEqual(len(payload["evidence_cells"]), len(outline.evidence_cells))
+
+        weak_point_cloud = {
+            "estimated_floor_height_m": 0.0,
+            "vertical_surface_triangle_count": 5,
+            "_vertical_surface_evidence": [
+                [0.20 + index * 0.10, 0.50, 0.10, 0.42, 1, 0.005, 0.50]
+                for index in range(5)
+            ],
+        }
+        strict_outline = server.base.build_shelf_outline(weak_point_cloud, grid)
+        complete_outline = server.base.build_shelf_outline(
+            weak_point_cloud,
+            grid,
+            minimum_height_span_m=0.20,
+            minimum_height_above_floor_m=0.30,
+            minimum_component_length_m=0.05,
+            minimum_verticality=0.45,
+            minimum_triangle_count=1,
+            maximum_gap_cells=3,
+        )
+        self.assertFalse(strict_outline.cells)
+        self.assertTrue(complete_outline.cells)
+
+        oriented_evidence = []
+        for y in (0.40, 0.90):
+            oriented_evidence.extend(
+                [x / 20.0, y, 0.10, 1.80, 10, 0.01, 0.95, 3, 1.0, 0.0, 1.0]
+                for x in range(4, 29)
+            )
+        # A weaker duplicate ridge only 5 cm from the first physical face
+        # should be suppressed instead of producing a third parallel edge.
+        oriented_evidence.extend(
+            [x / 20.0, 0.45, 0.10, 1.80, 3, 0.005, 0.90, 1, 1.0, 0.0, 1.0]
+            for x in range(4, 29)
+        )
+        oriented_cloud = {
+            "estimated_floor_height_m": 0.0,
+            "vertical_surface_triangle_count": len(oriented_evidence) * 8,
+            "_vertical_surface_evidence": oriented_evidence,
+        }
+        instance_grid = server.base.OccupancyGrid(0.05, [(0.0, 0.0), (2.0, 2.0)], 0.1)
+        instance_outline = server.base.build_shelf_outline(oriented_cloud, instance_grid)
+        self.assertEqual(instance_outline.instance_count, 0)
+        self.assertEqual(instance_outline.line_candidate_count, 2)
+        self.assertEqual(len(instance_outline.components), 2)
+        self.assertGreater(len(instance_outline.cells), 40)
+        self.assertTrue(instance_outline.shelf_cells)
+        self.assertFalse(instance_outline.vertical_structure_cells)
+        # Parallel measured faces remain two open lines. The algorithm must
+        # never add the artificial end caps that previously formed rectangles.
+        self.assertNotIn(instance_grid.cell(0.20, 0.65), instance_outline.cells)
+        self.assertNotIn(instance_grid.cell(1.40, 0.65), instance_outline.cells)
+
+        sparse_fragments = [
+            [x / 20.0, 1.70, 0.10, 1.80, 10, 0.01, 0.95, 3, 1.0, 0.0, 1.0]
+            for x in (4, 5, 6, 31, 32, 33)
+        ]
+        sparse_outline = server.base.build_shelf_outline(
+            {
+                "estimated_floor_height_m": 0.0,
+                "vertical_surface_triangle_count": len(sparse_fragments) * 8,
+                "_vertical_surface_evidence": sparse_fragments,
+            },
+            instance_grid,
+        )
+        self.assertFalse(sparse_outline.cells)
+
+        # Ground is a conflict signal, never a prerequisite. A one-frame
+        # vertical trace survives where no floor was observed, but the same
+        # sparse trace is rejected where the floor was seen in four frames.
+        transient_vertical = [
+            [x / 20.0, 1.40, 0.10, 1.80, 8, 0.01, 0.95, 1, 1.0, 0.0, 1.0]
+            for x in range(4, 21)
+        ]
+        transient_ground = [
+            [x / 20.0, 1.40, 0.0, 8, 0.01, 4, 0.98]
+            for x in range(4, 21)
+        ]
+        no_ground_outline = server.base.build_shelf_outline(
+            {
+                "estimated_floor_height_m": 0.0,
+                "vertical_surface_triangle_count": len(transient_vertical) * 8,
+                "_vertical_surface_evidence": transient_vertical,
+            },
+            instance_grid,
+        )
+        self.assertTrue(no_ground_outline.cells)
+        self.assertTrue(no_ground_outline.shelf_cells)
+        self.assertFalse(no_ground_outline.vertical_structure_cells)
+        conflict_outline = server.base.build_shelf_outline(
+            {
+                "estimated_floor_height_m": 0.0,
+                "vertical_surface_triangle_count": len(transient_vertical) * 8,
+                "_vertical_surface_evidence": transient_vertical,
+                "_horizontal_surface_evidence": transient_ground,
+            },
+            instance_grid,
+        )
+        self.assertFalse(conflict_outline.cells)
+        self.assertGreater(conflict_outline.ground_conflict_rejected_count, 0)
+
+        persistent_vertical = [row[:7] + [3, 1.0, 0.0, 1.0] for row in transient_vertical]
+        persistent_outline = server.base.build_shelf_outline(
+            {
+                "estimated_floor_height_m": 0.0,
+                "vertical_surface_triangle_count": len(persistent_vertical) * 8,
+                "_vertical_surface_evidence": persistent_vertical,
+                "_horizontal_surface_evidence": [
+                    [x / 20.0, 1.40, 0.0, 8, 0.01, 2, 0.98]
+                    for x in range(4, 21)
+                ],
+            },
+            instance_grid,
+        )
+        self.assertTrue(persistent_outline.cells)
+
+    def test_floor_gap_and_surface_evidence_create_closed_shelf_contour(self) -> None:
+        vertical = server.base.vertical_triangle_sample(
+            (0.0, 0.0, 0.0), (0.0, 0.0, 1.0), (0.0, 1.0, 0.0)
+        )
+        horizontal = server.base.vertical_triangle_sample(
+            (0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0)
+        )
+        ground_triangle = server.base.horizontal_triangle_sample(
+            (0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0)
+        )
+        self.assertIsNotNone(vertical)
+        self.assertIsNone(horizontal)
+        self.assertIsNotNone(ground_triangle)
+
+        resolution = 0.05
+        grid = server.base.OccupancyGrid(resolution, [(0.0, 0.0), (2.0, 2.0)], 0.1)
+        shelf_x = [index * resolution for index in range(6, 35)]
+        vertical_evidence = [
+            [x, y, 0.10, 1.80, 8, 0.01, 0.95, 3, 1.0, 0.0, 1.0]
+            for y in (0.80, 1.20)
+            for x in shelf_x
+        ]
+        ground_evidence = [
+            [x, y, 0.0, 8, 0.01, 4, 0.98]
+            for y in (0.55, 1.45)
+            for x in shelf_x
+        ]
+        elevated_evidence = [
+            [x, y, 0.85, 6, 0.008, 3, 0.98]
+            for y in (0.90, 1.00, 1.10)
+            for x in shelf_x[2:-2:2]
+        ]
+        cloud = {
+            "estimated_floor_height_m": 0.0,
+            "vertical_surface_triangle_count": len(vertical_evidence) * 8,
+            "_vertical_surface_evidence": vertical_evidence,
+            "_horizontal_surface_evidence": ground_evidence + elevated_evidence,
+        }
+        outline = server.base.build_shelf_outline(
+            cloud,
+            grid,
+            minimum_region_area_m2=0.10,
+            maximum_fill_distance_m=0.50,
+            maximum_hole_area_m2=0.30,
+        )
+        self.assertEqual(outline.line_candidate_count, 0)
+        self.assertEqual(outline.instance_count, 1)
+        self.assertEqual(outline.closed_contour_count, 1)
+        self.assertEqual(len(outline.components), 1)
+        self.assertGreater(len(outline.shelf_cells), len(outline.cells))
+        self.assertIn(grid.cell(1.0, 1.0), outline.shelf_cells)
+        self.assertNotIn(grid.cell(1.0, 1.0), outline.cells)
+        self.assertNotIn(grid.cell(1.0, 0.55), outline.cells)
+        self.assertGreater(outline.summary(resolution)["area_m2"], 0.5)
+        for cell in outline.components[0]:
+            x, y = cell
+            adjacent = sum(
+                (nx, ny) in outline.cells
+                for ny in range(y - 1, y + 2)
+                for nx in range(x - 1, x + 2)
+                if (nx, ny) != cell
+            )
+            self.assertGreaterEqual(adjacent, 2)
+
+        output = self.root / "shelf-regions.png"
+        server.base.render_shelf_outline(grid, outline, output)
+        width, height, _bit_depth, color_type, pixels = server.base.decode_png_pixels(output.read_bytes())
+        self.assertEqual((width, height, color_type), (grid.width, grid.height, 2))
+        black_pixels = sum(
+            1 for index in range(0, len(pixels), 3)
+            if pixels[index:index + 3] == bytes((12, 16, 18))
+        )
+        self.assertEqual(black_pixels, len(outline.cells))
+
+        evidence_output = self.root / "shelf-region-evidence.json"
+        server.base.write_shelf_outline_evidence(evidence_output, grid, outline)
+        payload = json.loads(evidence_output.read_text(encoding="utf-8"))
+        self.assertEqual(payload["format"], "SupermarketShelfOutlineEvidence")
+        self.assertEqual(payload["version"], 6)
+        self.assertTrue(payload["ground_runs"])
+        self.assertTrue(payload["elevated_runs"])
+        self.assertTrue(payload["stable_elevated_runs"])
+        self.assertTrue(payload["elevated_observation_cells"])
+        self.assertIn("free_space_runs", payload)
+        self.assertEqual(payload["defaults"]["minimum_observation_count"], 2)
+        self.assertEqual(payload["defaults"]["maximum_bridge_width_m"], 0.50)
+        self.assertEqual(payload["source_frames"]["sampled"], 0)
+        self.assertEqual(payload["defaults"]["boundary_thickness_cells"], 2)
+        self.assertEqual(payload["defaults"]["minimum_region_area_m2"], 0.10)
+
+    def test_shelf_regions_reject_floor_conflicts_and_unknown_space(self) -> None:
+        resolution = 0.05
+        grid = server.base.OccupancyGrid(resolution, [(0.0, 0.0), (2.0, 2.0)], 0.1)
+        xs = [index * resolution for index in range(6, 35)]
+        transient_vertical = [
+            [x, 1.0, 0.10, 1.80, 8, 0.01, 0.95, 1, 1.0, 0.0, 1.0]
+            for x in xs
+        ]
+        same_cell_ground = [
+            [x, 1.0, 0.0, 8, 0.01, 4, 0.98]
+            for x in xs
+        ]
+        person_cloud = {
+            "estimated_floor_height_m": 0.0,
+            "vertical_surface_triangle_count": len(transient_vertical) * 8,
+            "_vertical_surface_evidence": transient_vertical,
+            "_horizontal_surface_evidence": same_cell_ground,
+        }
+        person_outline = server.base.build_shelf_outline(
+            person_cloud, grid, minimum_region_area_m2=0.05
+        )
+        self.assertFalse(person_outline.cells)
+        self.assertGreater(person_outline.ground_conflict_rejected_count, 0)
+
+        # Vertical evidence without floor observations on two opposite sides
+        # is unknown space, not a licence to invent a shelf footprint.
+        unknown_outline = server.base.build_shelf_outline(
+            {
+                "estimated_floor_height_m": 0.0,
+                "vertical_surface_triangle_count": len(transient_vertical) * 8,
+                "_vertical_surface_evidence": transient_vertical,
+            },
+            grid,
+            minimum_region_area_m2=0.05,
+        )
+        self.assertFalse(unknown_outline.cells)
+
+        one_sided_floor = [
+            [x, 0.70, 0.0, 8, 0.01, 4, 0.98]
+            for x in xs
+        ]
+        one_sided_outline = server.base.build_shelf_outline(
+            {
+                "estimated_floor_height_m": 0.0,
+                "vertical_surface_triangle_count": len(transient_vertical) * 8,
+                "_vertical_surface_evidence": transient_vertical,
+                "_horizontal_surface_evidence": one_sided_floor,
+            },
+            grid,
+            minimum_region_area_m2=0.05,
+        )
+        self.assertFalse(one_sided_outline.cells)
 
     def test_nested_preview_frame_artifact_is_served_from_job_output(self) -> None:
         output = self.root / "surface-output"

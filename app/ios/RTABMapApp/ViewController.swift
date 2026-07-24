@@ -134,15 +134,34 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
     private var mStreamingDiskWarningShown = false
     private var mStreamingCriticalStopRequested = false
     private var mStreamingThermalWarningShown = false
+    private var mStreamingThermalPolicyLevel = 0
     private var mStreamingMemoryPressureLevel = 0
     private var mLastLoggedTrackingState = ""
     private var mARPoseCorrection = matrix_identity_float4x4
+    private let mMapCorrectionLock = NSLock()
+    private var mMapToOdomCorrection = matrix_identity_float4x4
     private var mLastAcceptedARPose: simd_float4x4?
     private var mLastAcceptedARTimestamp: TimeInterval?
     private var mTrackingWasDegraded = true
     private var mConsecutiveNormalTrackingFrames = 0
     private var mLastTrackingGuidanceAt: TimeInterval = 0
     private let mRequiredNormalFramesAfterTrackingRecovery = 6
+    private let mStructureCoverageAdvisor = SupermarketStructureCoverageAdvisor()
+    private var mLastStructureCoverageGuidanceAt: TimeInterval = 0
+    private var mLastStructureCoverageSummaryAt: TimeInterval = 0
+    private var mLastAdaptiveDetectionRateUpdateAt: TimeInterval = 0
+    private var mAdaptiveDetectionRateHz = 1.0
+    private var mConsecutiveRejectedLoopClosures = 0
+    private let mReliableLoopMinimumNodeSpan = 50
+    private var mReliableLoopClosures = 0
+    private var mLastReliableLoopClosureDistance: Float = 0
+    private var mLastLoopHealthGuidanceAt: TimeInterval = 0
+    private var mLastNotifiedLoopClosureSignature = ""
+    private var mLastMapCorrectionTranslationM = 0.0
+    private var mLastMapCorrectionRotationDeg = 0.0
+    private var mLastMapCorrectionDeltaTranslationM = 0.0
+    private var mLastMapCorrectionDeltaRotationDeg = 0.0
+    private var mToastDismissWorkItem: DispatchWorkItem?
     static var previewImages: [String: UIImage] = [:]
     private var measuringMode: Int = 0
     private var visualizationType: Int = 0 // 0=Cloud, 1=Mesh, 2=Texture Mesh
@@ -189,16 +208,58 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         }
     }
     
-    func showToast(message : String, seconds: Double){
-        if(!self.toastLabel.isHidden)
+    func showToast(message: String, seconds: Double, replacingCurrent: Bool = false) {
+        if !self.toastLabel.isHidden && !replacingCurrent
         {
-            return;
+            return
         }
+
+        mToastDismissWorkItem?.cancel()
         self.toastLabel.text = message
         self.toastLabel.isHidden = false
-        DispatchQueue.main.asyncAfter(deadline: DispatchTime.now() + seconds) {
-            self.toastLabel.isHidden = true
+
+        let dismissWorkItem = DispatchWorkItem { [weak self] in
+            self?.toastLabel.isHidden = true
         }
+        mToastDismissWorkItem = dismissWorkItem
+        DispatchQueue.main.asyncAfter(
+            deadline: DispatchTime.now() + seconds,
+            execute: dismissWorkItem)
+    }
+
+    private func showLoopClosureFeedback(
+        reliable: Bool,
+        loopClosureType: Int,
+        currentNodeId: Int,
+        targetNodeId: Int
+    ) {
+        let signature = "\(loopClosureType):\(currentNodeId):\(targetNodeId)"
+        guard signature != mLastNotifiedLoopClosureSignature else {
+            return
+        }
+        mLastNotifiedLoopClosureSignature = signature
+
+        let message: String
+        if reliable {
+            let feedback = UINotificationFeedbackGenerator()
+            feedback.prepare()
+            feedback.notificationOccurred(.success)
+            message = String(
+                format: localized("Loop completed. Map corrected (%d reliable loops)."),
+                mReliableLoopClosures)
+        }
+        else {
+            let feedback = UIImpactFeedbackGenerator(style: .light)
+            feedback.prepare()
+            feedback.impactOccurred()
+            message = localized("Nearby loop match accepted. Continue to a previously scanned cross-aisle to complete a reliable loop.")
+        }
+
+        showToast(
+            message: message,
+            seconds: reliable ? 2.5 : 1.8,
+            replacingCurrent: reliable)
+        UIAccessibility.post(notification: .announcement, argument: message)
     }
     
     func resetNoTouchTimer(_ showHud: Bool = false) {
@@ -432,6 +493,16 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                            distanceTravelled: Float,
                            fastMovement: Int,
                            landmarkDetected: Int,
+                           loopClosureType: Int,
+                           loopClosureCurrentId: Int,
+                           loopClosureTargetId: Int,
+                           mapCorrectionX: Float,
+                           mapCorrectionY: Float,
+                           mapCorrectionZ: Float,
+                           mapCorrectionQx: Float,
+                           mapCorrectionQy: Float,
+                           mapCorrectionQz: Float,
+                           mapCorrectionQw: Float,
                            x: Float,
                            y: Float,
                            z: Float,
@@ -442,10 +513,96 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         let availableMem = self.getAvailableMemory()
         let usedMem = max(0, self.mMaximumMemory - availableMem)
         let scanStorageBytes = currentContinuousScanStorageBytes()
+        let structureCoverage = supermarketSession?.structureCoverageSummary()
+        let mapCorrection = makeRigidTransform(
+            x: mapCorrectionX,
+            y: mapCorrectionY,
+            z: mapCorrectionZ,
+            qx: mapCorrectionQx,
+            qy: mapCorrectionQy,
+            qz: mapCorrectionQz,
+            qw: mapCorrectionQw)
+        let previousMapCorrection = updateMapToOdomCorrection(mapCorrection)
+        let mapCorrectionDelta = simd_mul(
+            mapCorrection,
+            simd_inverse(previousMapCorrection))
+        let mapCorrectionTranslation = SIMD3<Float>(
+            mapCorrection.columns.3.x,
+            mapCorrection.columns.3.y,
+            mapCorrection.columns.3.z)
+        let mapCorrectionDeltaTranslation = SIMD3<Float>(
+            mapCorrectionDelta.columns.3.x,
+            mapCorrectionDelta.columns.3.y,
+            mapCorrectionDelta.columns.3.z)
+        let mapCorrectionTranslationM = Double(simd_length(mapCorrectionTranslation))
+        let mapCorrectionRotationDeg = rotationAngleDegrees(mapCorrection)
+        let mapCorrectionDeltaTranslationM = Double(simd_length(mapCorrectionDeltaTranslation))
+        let mapCorrectionDeltaRotationDeg = rotationAngleDegrees(mapCorrectionDelta)
+        mLastMapCorrectionTranslationM = mapCorrectionTranslationM
+        mLastMapCorrectionRotationDeg = mapCorrectionRotationDeg
+        mLastMapCorrectionDeltaTranslationM = mapCorrectionDeltaTranslationM
+        mLastMapCorrectionDeltaRotationDeg = mapCorrectionDeltaRotationDeg
+
+        let loopNodeSpan =
+            loopClosureCurrentId > 0 && loopClosureTargetId > 0 ?
+            abs(loopClosureCurrentId - loopClosureTargetId) : 0
+        let loopInlierRatio =
+            matches > 0 ? Double(inliers) / Double(matches) : 0.0
+        let loopClosureTypeLabel: String
+        switch loopClosureType {
+        case 1:
+            loopClosureTypeLabel = "global_visual"
+        case 2:
+            loopClosureTypeLabel = "local_space"
+        default:
+            loopClosureTypeLabel = "none"
+        }
+        // Accepted neighboring/local-time constraints help local consistency,
+        // but they do not make accumulated drift observable. Only an accepted
+        // global or local-space constraint spanning enough graph nodes resets
+        // the "distance without a reliable anchor" health metric.
+        let reliableLoopClosure =
+            loopClosureId > 0 &&
+            loopClosureTargetId > 0 &&
+            (loopClosureType == 1 || loopClosureType == 2) &&
+            loopNodeSpan >= mReliableLoopMinimumNodeSpan
         
+        var loopHealthGuidance: String?
         if(loopClosureId > 0)
         {
             mTotalLoopClosures += 1;
+        }
+        if reliableLoopClosure
+        {
+            mReliableLoopClosures += 1
+            mConsecutiveRejectedLoopClosures = 0
+            mLastReliableLoopClosureDistance = distanceTravelled
+        }
+        else if rejected > 0 && self.mState == .STATE_MAPPING {
+            mConsecutiveRejectedLoopClosures += 1
+        }
+        if self.mState == .STATE_MAPPING {
+            let distanceWithoutClosure = max(0, distanceTravelled - mLastReliableLoopClosureDistance)
+            let now = Date().timeIntervalSince1970
+            if (distanceWithoutClosure >= 25 && mConsecutiveRejectedLoopClosures >= 6) ||
+               distanceWithoutClosure >= 45 {
+                if now - mLastLoopHealthGuidanceAt >= 20 {
+                    mLastLoopHealthGuidanceAt = now
+                    loopHealthGuidance = localized("Reliable loop closure has been missing for a long distance. Return through the nearest previously scanned cross-aisle before continuing.")
+                    supermarketSession?.appendScanEvent(
+                        level: "warning",
+                        event: "loop_closure_health_degraded",
+                        message: "Long travel distance without a reliable long-range loop closure",
+                        fields: [
+                            "distanceWithoutClosureM": String(format: "%.2f", distanceWithoutClosure),
+                            "consecutiveRejectedCandidates": "\(mConsecutiveRejectedLoopClosures)",
+                            "reliableLoopClosures": "\(mReliableLoopClosures)",
+                            "mapCorrectionTranslationM": String(format: "%.3f", mLastMapCorrectionTranslationM),
+                            "mapCorrectionRotationDeg": String(format: "%.2f", mLastMapCorrectionRotationDeg),
+                            "nodeCount": "\(nodes)"
+                        ])
+                }
+            }
         }
         let previousNodes = mMapNodes
         mMapNodes = nodes;
@@ -477,6 +634,14 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                     String(format: self.localized("RAM Usage (MB): %d / %d"), usedMem, self.mMaximumMemory) +
                     String(format: self.localized("\nScan Storage: %@"), self.formattedStorageSize(scanStorageBytes)) +
                     String(format: self.localized("\nScanned Area: %.1f m2"), estimatedArea)
+                if let structureCoverage = structureCoverage {
+                    self.statusLabel.text = self.statusLabel.text! +
+                        String(
+                            format: self.localized("\nStructure coverage: %d stable / %d multi-view (%d%%)"),
+                            structureCoverage.stableStructureCellCount,
+                            structureCoverage.multiViewStructureCellCount,
+                            Int(round(structureCoverage.coverageScore * 100)))
+                }
             }
             if self.debugShown {
                 self.statusLabel.text =
@@ -525,6 +690,8 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                     "Features: \(featuresExtracted) / \(self.mMaxFeatures==0 ? "No Limit" : (self.mMaxFeatures == -1 ? "Disabled" : String(self.mMaxFeatures)))\n" +
                     "Rehearsal (%): \(Int(rehearsalValue*100))\n" +
                     "Loop closures: \(self.mTotalLoopClosures)\n" +
+                    "Reliable loop anchors: \(self.mReliableLoopClosures)\n" +
+                    String(format: "Map correction: %.2f m / %.1f deg (delta %.2f m / %.1f deg)\n", self.mLastMapCorrectionTranslationM, self.mLastMapCorrectionRotationDeg, self.mLastMapCorrectionDeltaTranslationM, self.mLastMapCorrectionDeltaRotationDeg) +
                     "Inliers: \(inliers)\n" +
                     "Hypothesis (%): \(Int(hypothesis*100)) / \(Int(self.mLoopThr*100)) (\(loopClosureId>0 ? loopClosureId : highestHypId))\n" +
                     String(format: "FPS (rendering): %.1f Hz\n", fps) +
@@ -538,13 +705,32 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                         self.supermarketSession?.appendScanEvent(
                             event: "loop_closure",
                             message: "Loop closure detected",
-                            fields: ["loopClosureId": "\(loopClosureId)", "nodeCount": "\(nodes)", "inliers": "\(inliers)"])
+                            fields: [
+                                "loopClosureId": "\(loopClosureId)",
+                                "loopClosureType": loopClosureTypeLabel,
+                                "currentNodeId": "\(loopClosureCurrentId)",
+                                "targetNodeId": "\(loopClosureTargetId)",
+                                "nodeSpan": "\(loopNodeSpan)",
+                                "reliableForDriftCorrection": reliableLoopClosure ? "true" : "false",
+                                "nodeCount": "\(nodes)",
+                                "inliers": "\(inliers)",
+                                "matches": "\(matches)",
+                                "inlierRatio": String(format: "%.3f", loopInlierRatio),
+                                "mapCorrectionTranslationM": String(format: "%.4f", mapCorrectionTranslationM),
+                                "mapCorrectionRotationDeg": String(format: "%.3f", mapCorrectionRotationDeg),
+                                "mapCorrectionDeltaTranslationM": String(format: "%.4f", mapCorrectionDeltaTranslationM),
+                                "mapCorrectionDeltaRotationDeg": String(format: "%.3f", mapCorrectionDeltaRotationDeg)
+                            ])
                     }
                     if(self.mState == .STATE_VISUALIZING_CAMERA) {
                         self.showToast(message: self.localized("Localized!"), seconds: 1);
                     }
                     else {
-                        self.showToast(message: self.localized("Loop closure detected!"), seconds: 1);
+                        self.showLoopClosureFeedback(
+                            reliable: reliableLoopClosure,
+                            loopClosureType: loopClosureType,
+                            currentNodeId: loopClosureCurrentId,
+                            targetNodeId: loopClosureTargetId)
                     }
                 }
                 else if(rejected > 0)
@@ -554,9 +740,19 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                             level: "warning",
                             event: "loop_closure_rejected",
                             message: "Loop closure candidate was rejected",
-                            fields: ["nodeCount": "\(nodes)", "inliers": "\(inliers)", "matches": "\(matches)", "optimizationMaxError": "\(optimizationMaxError)"])
+                            fields: [
+                                "nodeCount": "\(nodes)",
+                                "candidateNodeId": "\(highestHypId)",
+                                "inliers": "\(inliers)",
+                                "matches": "\(matches)",
+                                "inlierRatio": String(format: "%.3f", loopInlierRatio),
+                                "optimizationMaxError": "\(optimizationMaxError)"
+                            ])
                     }
-                    if(inliers >= UserDefaults.standard.integer(forKey: "MinInliers"))
+                    if let guidance = loopHealthGuidance {
+                        self.showToast(message: guidance, seconds: 4)
+                    }
+                    else if self.debugShown && inliers >= UserDefaults.standard.integer(forKey: "MinInliers")
                     {
                         if(optimizationMaxError > 0.0)
                         {
@@ -567,7 +763,7 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                             self.showToast(message: self.localized("Loop closure rejected, graph optimization failed! You may try a different Graph Optimizer in Mapping settings."), seconds: 1);
                         }
                     }
-                    else
+                    else if self.debugShown
                     {
                         self.showToast(message: String(format: self.localized("Loop closure rejected, not enough inliers (%d/%d < %d)."), inliers, matches, UserDefaults.standard.integer(forKey: "MinInliers")), seconds: 1);
                     }
@@ -1333,11 +1529,147 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         mLastTrackingGuidanceAt = 0
     }
 
+    private func resetSupermarketScanQualityAdvisors()
+    {
+        mStructureCoverageAdvisor.reset()
+        mLastStructureCoverageGuidanceAt = 0
+        mLastStructureCoverageSummaryAt = 0
+        mLastAdaptiveDetectionRateUpdateAt = 0
+        mAdaptiveDetectionRateHz = 1.0
+        mStructureCoverageAdvisor.setCurrentDetectionRateHz(mAdaptiveDetectionRateHz)
+        mConsecutiveRejectedLoopClosures = 0
+        mTotalLoopClosures = 0
+        mReliableLoopClosures = 0
+        mLastReliableLoopClosureDistance = 0
+        mLastLoopHealthGuidanceAt = 0
+        mLastNotifiedLoopClosureSignature = ""
+        mLastMapCorrectionTranslationM = 0
+        mLastMapCorrectionRotationDeg = 0
+        mLastMapCorrectionDeltaTranslationM = 0
+        mLastMapCorrectionDeltaRotationDeg = 0
+        mMapCorrectionLock.lock()
+        mMapToOdomCorrection = matrix_identity_float4x4
+        mMapCorrectionLock.unlock()
+    }
+
+    private func updateAdaptiveStructureCapture(
+        feedback: ScanStructureCoverageFeedback,
+        frameTimestamp: TimeInterval
+    )
+    {
+        guard feedback.processed else {
+            return
+        }
+        if mLastStructureCoverageSummaryAt == 0 ||
+           frameTimestamp - mLastStructureCoverageSummaryAt >= 10.0 {
+            mLastStructureCoverageSummaryAt = frameTimestamp
+            supermarketSession?.updateStructureCoverageSummary(
+                mStructureCoverageAdvisor.summary())
+        }
+        let proposedRate = feedback.recommendedDetectionRateHz
+        if abs(proposedRate - mAdaptiveDetectionRateHz) >= 0.20 &&
+           (mLastAdaptiveDetectionRateUpdateAt == 0 ||
+            frameTimestamp - mLastAdaptiveDetectionRateUpdateAt >= 4.0) {
+            mAdaptiveDetectionRateHz = proposedRate
+            mLastAdaptiveDetectionRateUpdateAt = frameTimestamp
+            mStructureCoverageAdvisor.setCurrentDetectionRateHz(proposedRate)
+            rtabmap?.setMappingParameter(
+                key: "Rtabmap/DetectionRate",
+                value: String(format: "%.2f", proposedRate))
+            supermarketSession?.appendScanEvent(
+                event: "adaptive_capture_rate_changed",
+                message: "RGB-D node rate adjusted from structural evidence novelty",
+                fields: [
+                    "detectionRateHz": String(format: "%.2f", proposedRate),
+                    "newElevatedCells": "\(feedback.newElevatedCellCount)",
+                    "newStableCells": "\(feedback.newlyStableCellCount)",
+                    "newMultiViewCells": "\(feedback.newlyMultiViewCellCount)",
+                    "floorCells": "\(feedback.currentFrameFloorCellCount)",
+                    "elevatedCells": "\(feedback.currentFrameElevatedCellCount)"
+                ])
+        }
+
+        if let guidance = feedback.guidance,
+           frameTimestamp - mLastStructureCoverageGuidanceAt >= 6.0 {
+            mLastStructureCoverageGuidanceAt = frameTimestamp
+            supermarketSession?.appendScanEvent(
+                event: "structure_coverage_guidance",
+                message: guidance,
+                fields: [
+                    "validDepthSamples": "\(feedback.validDepthSampleCount)",
+                    "newElevatedCells": "\(feedback.newElevatedCellCount)",
+                    "newStableCells": "\(feedback.newlyStableCellCount)",
+                    "newMultiViewCells": "\(feedback.newlyMultiViewCellCount)"
+                ])
+            DispatchQueue.main.async {
+                self.showToast(message: guidance, seconds: 3)
+            }
+        }
+    }
+
     private func rotationAngleDegrees(_ transform: simd_float4x4) -> Double
     {
         let trace = transform.columns.0.x + transform.columns.1.y + transform.columns.2.z
         let cosine = min(Float(1), max(Float(-1), (trace - 1) / 2))
         return Double(acos(cosine) * 180 / .pi)
+    }
+
+    private func makeRigidTransform(
+        x: Float,
+        y: Float,
+        z: Float,
+        qx: Float,
+        qy: Float,
+        qz: Float,
+        qw: Float
+    ) -> simd_float4x4
+    {
+        guard x.isFinite, y.isFinite, z.isFinite,
+              qx.isFinite, qy.isFinite, qz.isFinite, qw.isFinite else {
+            return matrix_identity_float4x4
+        }
+        let quaternionNorm = sqrt(qx*qx + qy*qy + qz*qz + qw*qw)
+        guard quaternionNorm > 0.000001 else {
+            return matrix_identity_float4x4
+        }
+        let quaternion = simd_quatf(
+            ix: qx / quaternionNorm,
+            iy: qy / quaternionNorm,
+            iz: qz / quaternionNorm,
+            r: qw / quaternionNorm)
+        var transform = simd_float4x4(quaternion)
+        transform.columns.3 = SIMD4<Float>(x, y, z, 1)
+        return transform
+    }
+
+    @discardableResult
+    private func updateMapToOdomCorrection(
+        _ correction: simd_float4x4
+    ) -> simd_float4x4
+    {
+        mMapCorrectionLock.lock()
+        let previous = mMapToOdomCorrection
+        mMapToOdomCorrection = correction
+        mMapCorrectionLock.unlock()
+        return previous
+    }
+
+    private func mapCorrectedPose(
+        from odometryPose: simd_float4x4
+    ) -> simd_float4x4
+    {
+        mMapCorrectionLock.lock()
+        let correction = mMapToOdomCorrection
+        mMapCorrectionLock.unlock()
+        return simd_mul(correction, odometryPose)
+    }
+
+    private func currentMapToOdomCorrection() -> simd_float4x4
+    {
+        mMapCorrectionLock.lock()
+        let correction = mMapToOdomCorrection
+        mMapCorrectionLock.unlock()
+        return correction
     }
 
     /// Return a pose that is safe to feed into the continuous RTAB-Map graph.
@@ -1510,6 +1842,19 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                 if let correctedPose = stabilizedMappingPose(
                     for: frame,
                     trackingState: trackingStateLabel) {
+                    // Coverage is a map-frame world grid. Reproject depth with
+                    // RTAB-Map's latest map→odom correction so cells observed
+                    // before and after a loop closure remain aligned. The
+                    // continuous odometry pose below intentionally stays
+                    // uncorrected to avoid applying the graph correction twice.
+                    let coverageMapPose = mapCorrectedPose(from: correctedPose)
+                    let coverageFeedback = mStructureCoverageAdvisor.evaluate(
+                        frame: frame,
+                        correctedPose: coverageMapPose,
+                        thermalState: currentThermalStateText())
+                    updateAdaptiveStructureCapture(
+                        feedback: coverageFeedback,
+                        frameTimestamp: frame.timestamp)
                     rtabmap?.postOdometryEvent(
                         frame: frame,
                         orientation: rotation,
@@ -2164,9 +2509,11 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
             self.mStreamingDiskWarningShown = false
             self.mStreamingCriticalStopRequested = false
             self.mStreamingThermalWarningShown = false
+            self.mStreamingThermalPolicyLevel = 0
             self.mStreamingMemoryPressureLevel = 0
             self.mLastLoggedTrackingState = ""
             self.resetSoftwarePoseStabilizer()
+            self.resetSupermarketScanQualityAdvisors()
             if !dataRecordingMode {
                 self.supermarketSession?.appendScanEvent(
                     event: "scan_started",
@@ -2175,7 +2522,11 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                         "database": activeDatabase.lastPathComponent,
                         "workingMemoryNodes": "\(self.supermarketIntDefault(self.supermarketStreamingMemoryNodesKey, fallback: self.supermarketDefaultStreamingMemoryNodes))",
                         "errorOptimizationProfile": "software_only_no_fiducials",
-                        "fiducialsEnabled": "false"
+                        "fiducialsEnabled": "false",
+                        "onlinePoseCorrection": "rtabmap_map_to_odom_v1",
+                        "reliableLoopMinimumNodeSpan": "\(self.mReliableLoopMinimumNodeSpan)",
+                        "structureCoverageAdvisor": "map_frame_world_grid_v2",
+                        "adaptiveDetectionRateHz": "1.0-2.0"
                     ])
             }
             
@@ -2287,6 +2638,9 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
             rtabmap.setMappingParameter(key: "Mem/RecentWmRatio", value: "0.2")
             rtabmap.setMappingParameter(key: "Mem/TransferSortingByWeightId", value: "false")
             rtabmap.setMappingParameter(key: "Rtabmap/MemoryThr", value: "\(memoryNodes)")
+            // Start conservatively, then let scan-time structure novelty raise
+            // the rate to 1.5-2 Hz only around new, fragmented shelf evidence.
+            rtabmap.setMappingParameter(key: "Rtabmap/DetectionRate", value: "1.0")
             // Keep enough phone-side visual feedback to catch bad coverage and
             // obvious loop closures, while PC reprocessing remains authoritative.
             rtabmap.setMappingParameter(key: "Kp/MaxFeatures", value: "500")
@@ -2492,6 +2846,7 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         let scanStorageBytes = captureDirectoryStorageBytes(at: segmentDirectory)
         mLatestScanStorageBytes = scanStorageBytes
         let thermalState = currentThermalStateText()
+        scanSession.updateStructureCoverageSummary(mStructureCoverageAdvisor.summary())
         let checkpoint = scanSession.makeLiveCheckpoint(
             nodeCount: nodeCount,
             databaseBytes: actualDatabaseBytes,
@@ -2569,6 +2924,7 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         }
         else if thermalState == "serious" && !mStreamingThermalWarningShown {
             mStreamingThermalWarningShown = true
+            mStreamingThermalPolicyLevel = 2
             // Reduce only the disposable online window. Disk recording and the
             // continuous ARKit pose chain remain untouched.
             rtabmap?.setStreamingMapMode(enabled: true, maxRenderedNodes: 200)
@@ -2581,6 +2937,24 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
             showToast(
                 message: localized("The iPhone is hot. Live preview memory was reduced; continuous data recording is unchanged."),
                 seconds: 5)
+        }
+        else if thermalState == "fair" && mStreamingThermalPolicyLevel < 1 {
+            mStreamingThermalPolicyLevel = 1
+            // Reduce rendering before the device reaches `serious`. Keep the
+            // 300-node working graph intact so loop-closure opportunities are
+            // not sacrificed merely to draw a denser phone preview.
+            rtabmap?.setStreamingMapMode(enabled: true, maxRenderedNodes: 220)
+            scanSession.appendScanEvent(
+                level: "warning",
+                event: "thermal_preview_preemptively_reduced",
+                message: "Live rendering was reduced before serious thermal throttling",
+                fields: [
+                    "renderedNodes": "220",
+                    "detectionRateCapHz": "1.5"
+                ])
+            showToast(
+                message: localized("The iPhone is warming up. Live rendering was reduced while structural capture remains active."),
+                seconds: 4)
         }
     }
 
@@ -2723,6 +3097,7 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
             originOffset = nil
         }
         let usedMemory = max(0, mMaximumMemory - getAvailableMemory())
+        scanSession.updateStructureCoverageSnapshot(mStructureCoverageAdvisor.snapshot())
         let boundary = scanSession.boundarySnapshot()
         let correctionQuaternion = simd_quatf(mARPoseCorrection)
         let softwarePoseCorrection = ScanTransform(
@@ -2733,6 +3108,23 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
             qy: correctionQuaternion.imag.y,
             qz: correctionQuaternion.imag.z,
             qw: correctionQuaternion.real)
+        let finalMapToOdomCorrection = currentMapToOdomCorrection()
+        let finalMapToOdomQuaternion = simd_quatf(finalMapToOdomCorrection)
+        let rtabmapMapToOdomCorrection = ScanTransform(
+            x: finalMapToOdomCorrection.columns.3.x,
+            y: finalMapToOdomCorrection.columns.3.y,
+            z: finalMapToOdomCorrection.columns.3.z,
+            qx: finalMapToOdomQuaternion.imag.x,
+            qy: finalMapToOdomQuaternion.imag.y,
+            qz: finalMapToOdomQuaternion.imag.z,
+            qw: finalMapToOdomQuaternion.real)
+        let finalMapCorrectionTranslationM = Double(simd_length(SIMD3<Float>(
+            finalMapToOdomCorrection.columns.3.x,
+            finalMapToOdomCorrection.columns.3.y,
+            finalMapToOdomCorrection.columns.3.z)))
+        let finalMapCorrectionRotationDeg = rotationAngleDegrees(finalMapToOdomCorrection)
+        let finalOnlineLoopClosureCount = mTotalLoopClosures
+        let finalReliableLoopClosureCount = mReliableLoopClosures
         let finalNodeCount = mMapNodes
         let finalDatabaseMemoryMB = mLatestDatabaseMemoryMB
         let finalKnownAreaM2 = scanSession.currentAreaM2
@@ -2782,10 +3174,14 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                         rtabmapEndPose: boundary.rtabmapEndPose,
                         rtabmapOriginOffset: originOffset,
                         softwarePoseCorrection: softwarePoseCorrection,
+                        rtabmapMapToOdomCorrection: rtabmapMapToOdomCorrection,
+                        onlineLoopClosureCount: finalOnlineLoopClosureCount,
+                        reliableLoopClosureCount: finalReliableLoopClosureCount,
                         databaseBytes: finalDatabaseBytes,
                         availableDiskBytes: availableBytesAtFinalization,
                         thermalState: thermalStateAtFinalization,
-                        captureHealth: boundary.captureHealth)
+                        captureHealth: boundary.captureHealth,
+                        structureCoverage: scanSession.structureCoverageSummary())
                     let finalSnapshot = scanSession.makeSidecarSnapshot(metadata: metadata)
                     snapshot = finalSnapshot
                     try scanSession.writeSidecarFiles(to: segmentDirectory, snapshot: finalSnapshot)
@@ -2820,6 +3216,10 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                 fields: [
                     "nodeCount": "\(snapshot.metadata.nodeCount)",
                     "databaseBytes": "\(finalDatabaseBytes)",
+                    "loopClosures": "\(finalOnlineLoopClosureCount)",
+                    "reliableLoopClosures": "\(finalReliableLoopClosureCount)",
+                    "mapCorrectionTranslationM": String(format: "%.4f", finalMapCorrectionTranslationM),
+                    "mapCorrectionRotationDeg": String(format: "%.3f", finalMapCorrectionRotationDeg),
                     "saveSeconds": String(format: "%.3f", saveSeconds),
                     "sidecarSeconds": String(format: "%.3f", sidecarSeconds)
                 ])

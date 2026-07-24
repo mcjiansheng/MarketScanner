@@ -14,6 +14,8 @@ import os
 import re
 import shutil
 import sqlite3
+import statistics
+import struct
 import subprocess
 import tempfile
 import threading
@@ -449,6 +451,168 @@ def _copy_and_sync(source: Path, destination: Path) -> None:
         os.fsync(handle.fileno())
 
 
+def _inject_user_links(
+    database: Path,
+    link_injections: Iterable[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Insert validated kUserClosure links into a disposable database copy."""
+    injections = tuple(link_injections)
+    if not injections:
+        return {
+            "requested_count": 0,
+            "injected_count": 0,
+            "pairs": [],
+        }
+    required_columns = {
+        "from_id",
+        "to_id",
+        "type",
+        "information_matrix",
+        "transform",
+        "user_data",
+    }
+    normalized: list[Dict[str, Any]] = []
+    seen_pairs: set[tuple[int, int]] = set()
+    for index, raw in enumerate(injections, start=1):
+        if not isinstance(raw, dict):
+            raise OfflineProcessingError(f"Manual constraint {index} must be an object.")
+        try:
+            from_id = int(raw["from_id"])
+            to_id = int(raw["to_id"])
+            link_type = int(raw.get("type", 4))
+            transform = tuple(float(value) for value in raw["transform"])
+            information = tuple(float(value) for value in raw["information_matrix"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise OfflineProcessingError(
+                f"Manual constraint {index} has invalid node ids or matrices."
+            ) from exc
+        if from_id <= 0 or to_id <= 0 or from_id == to_id:
+            raise OfflineProcessingError(
+                f"Manual constraint {index} must connect two different positive node ids."
+            )
+        if from_id < to_id:
+            raise OfflineProcessingError(
+                f"Manual constraint {index} must use RTAB-Map ordering from_id > to_id."
+            )
+        if link_type != 4:
+            raise OfflineProcessingError(
+                f"Manual constraint {index} must use RTAB-Map kUserClosure type 4."
+            )
+        if len(transform) != 12 or not all(math.isfinite(value) for value in transform):
+            raise OfflineProcessingError(
+                f"Manual constraint {index} must contain 12 finite transform floats."
+            )
+        if len(information) != 36 or not all(math.isfinite(value) for value in information):
+            raise OfflineProcessingError(
+                f"Manual constraint {index} must contain a finite 6x6 information matrix."
+            )
+        if any(information[axis * 6 + axis] <= 0.0 for axis in range(6)):
+            raise OfflineProcessingError(
+                f"Manual constraint {index} must have a positive information diagonal."
+            )
+        pair = (to_id, from_id)
+        if pair in seen_pairs:
+            raise OfflineProcessingError(
+                f"Manual constraint {index} duplicates node pair {from_id}->{to_id}."
+            )
+        seen_pairs.add(pair)
+        normalized.append(
+            {
+                "from_id": from_id,
+                "to_id": to_id,
+                "transform": transform,
+                "information": information,
+            }
+        )
+
+    try:
+        with closing(sqlite3.connect(database)) as connection:
+            tables = set(base.sqlite_tables(connection))
+            if not {"Node", "Link"}.issubset(tables):
+                raise OfflineProcessingError(
+                    "The disposable RTAB-Map database must contain Node and Link tables."
+                )
+            columns = set(base.table_columns(connection, "Link"))
+            if not required_columns.issubset(columns):
+                missing = ", ".join(sorted(required_columns - columns))
+                raise OfflineProcessingError(
+                    f"The RTAB-Map Link schema cannot store user closures; missing: {missing}."
+                )
+            node_ids = {
+                int(row[0])
+                for row in connection.execute("SELECT id FROM Node WHERE id > 0")
+            }
+            for item in normalized:
+                if item["from_id"] not in node_ids or item["to_id"] not in node_ids:
+                    raise OfflineProcessingError(
+                        "A manual constraint references a node that is not present in the database: "
+                        f"{item['from_id']}->{item['to_id']}."
+                    )
+                conflicts = list(
+                    connection.execute(
+                        "SELECT from_id, to_id, type FROM Link "
+                        "WHERE (from_id=? AND to_id=?) OR (from_id=? AND to_id=?)",
+                        (
+                            item["from_id"],
+                            item["to_id"],
+                            item["to_id"],
+                            item["from_id"],
+                        ),
+                    )
+                )
+                non_user = [row for row in conflicts if int(row[2]) != 4]
+                if non_user:
+                    raise OfflineProcessingError(
+                        "Manual repair refused to replace an existing non-user graph edge for "
+                        f"{item['from_id']}->{item['to_id']}."
+                    )
+                connection.execute(
+                    "DELETE FROM Link WHERE type=4 AND "
+                    "((from_id=? AND to_id=?) OR (from_id=? AND to_id=?))",
+                    (
+                        item["from_id"],
+                        item["to_id"],
+                        item["to_id"],
+                        item["from_id"],
+                    ),
+                )
+                connection.execute(
+                    "INSERT INTO Link("
+                    "from_id, to_id, type, information_matrix, transform, user_data"
+                    ") VALUES(?,?,?,?,?,NULL)",
+                    (
+                        item["from_id"],
+                        item["to_id"],
+                        4,
+                        sqlite3.Binary(struct.pack("<36d", *item["information"])),
+                        sqlite3.Binary(struct.pack("<12f", *item["transform"])),
+                    ),
+                )
+            connection.commit()
+            integrity_row = connection.execute("PRAGMA quick_check").fetchone()
+            integrity = str(integrity_row[0]) if integrity_row else "unknown"
+            if integrity != "ok":
+                raise OfflineProcessingError(
+                    f"Manual constraint staging database failed quick_check: {integrity}."
+                )
+    except sqlite3.Error as exc:
+        raise OfflineProcessingError(
+            f"Failed to inject manual user closures into the disposable database: {exc}"
+        ) from exc
+    return {
+        "requested_count": len(normalized),
+        "injected_count": len(normalized),
+        "pairs": [
+            {
+                "from_id": item["from_id"],
+                "to_id": item["to_id"],
+                "type": 4,
+            }
+            for item in normalized
+        ],
+    }
+
+
 def _database_poses(path: Path, optimized: bool) -> Dict[int, tuple[float, ...]]:
     poses: Dict[int, tuple[float, ...]] = {}
     with closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)) as conn:
@@ -500,6 +664,17 @@ def trajectory_metrics(poses: Dict[int, tuple[float, ...]]) -> Dict[str, Any]:
         step_rotations.append(_rotation_difference_degrees(poses[first_id], poses[second_id]))
     vertical_values = [position[2] for position in positions]
     start_end_distance = math.dist(positions[0], positions[-1]) if len(positions) > 1 else 0.0
+    endpoint_band_size = min(len(vertical_values) // 2, max(1, int(math.ceil(len(vertical_values) * 0.10))))
+    first_vertical_band = vertical_values[:endpoint_band_size]
+    last_vertical_band = vertical_values[-endpoint_band_size:]
+    vertical_endpoint_delta = (
+        vertical_values[-1] - vertical_values[0] if len(vertical_values) > 1 else 0.0
+    )
+    vertical_endpoint_band_shift = (
+        statistics.median(last_vertical_band) - statistics.median(first_vertical_band)
+        if first_vertical_band and last_vertical_band
+        else 0.0
+    )
     return {
         "pose_count": len(node_ids),
         "finite_pose_count": len(finite_ids),
@@ -512,6 +687,50 @@ def trajectory_metrics(poses: Dict[int, tuple[float, ...]]) -> Dict[str, Any]:
         "p95_step_rotation_deg": round(_percentile(step_rotations, 0.95), 3),
         "max_step_rotation_deg": round(max(step_rotations, default=0.0), 3),
         "vertical_span_m": round(max(vertical_values) - min(vertical_values), 4) if vertical_values else 0.0,
+        "vertical_endpoint_delta_m": round(vertical_endpoint_delta, 4),
+        "vertical_endpoint_band_shift_m": round(vertical_endpoint_band_shift, 4),
+        "vertical_endpoint_band_pose_count": endpoint_band_size,
+    }
+
+
+def optimization_displacement_metrics(
+    raw: Dict[int, tuple[float, ...]], optimized: Dict[int, tuple[float, ...]]
+) -> Dict[str, Any]:
+    """Summarize where optimization moved the trajectory without judging it.
+
+    Large corrections may be entirely legitimate, so these metrics are
+    diagnostic rather than a publication gate.  They make residual-drift and
+    local-warp investigations possible without reopening the databases.
+    """
+    common_ids = sorted(set(raw) & set(optimized))
+    translations: list[float] = []
+    vertical_corrections: list[float] = []
+    rotations: list[float] = []
+    correction_steps: list[float] = []
+    previous_correction: Optional[tuple[float, float, float]] = None
+    for node_id in common_ids:
+        raw_position = _translation(raw[node_id])
+        optimized_position = _translation(optimized[node_id])
+        correction = tuple(
+            optimized_position[index] - raw_position[index] for index in range(3)
+        )
+        translations.append(math.sqrt(sum(value * value for value in correction)))
+        vertical_corrections.append(abs(correction[2]))
+        rotations.append(_rotation_difference_degrees(raw[node_id], optimized[node_id]))
+        if previous_correction is not None:
+            correction_steps.append(math.dist(previous_correction, correction))
+        previous_correction = correction
+    return {
+        "pose_count": len(common_ids),
+        "translation_correction_median_m": round(_percentile(translations, 0.50), 4),
+        "translation_correction_p95_m": round(_percentile(translations, 0.95), 4),
+        "translation_correction_max_m": round(max(translations, default=0.0), 4),
+        "vertical_correction_p95_m": round(_percentile(vertical_corrections, 0.95), 4),
+        "vertical_correction_max_m": round(max(vertical_corrections, default=0.0), 4),
+        "rotation_correction_p95_deg": round(_percentile(rotations, 0.95), 3),
+        "rotation_correction_max_deg": round(max(rotations, default=0.0), 3),
+        "neighbor_correction_change_p95_m": round(_percentile(correction_steps, 0.95), 4),
+        "neighbor_correction_change_max_m": round(max(correction_steps, default=0.0), 4),
     }
 
 
@@ -523,6 +742,7 @@ def assess_optimized_trajectory(input_database: Path, output_database: Path) -> 
     optimized = {node_id: optimized_all[node_id] for node_id in common_ids}
     raw_metrics = trajectory_metrics(raw)
     optimized_metrics = trajectory_metrics(optimized)
+    displacement_metrics = optimization_displacement_metrics(raw, optimized)
     input_database_inspection = inspect_database(input_database)
     optimized_database = inspect_database(output_database)
     input_loop_pairs = _constraint_pairs(input_database, (1, 2, 3, 4, 5))
@@ -581,6 +801,22 @@ def assess_optimized_trajectory(input_database: Path, output_database: Path) -> 
         warnings.append("Vertical drift increased after optimization despite gravity constraints.")
         score -= 15
 
+    # This production profile assumes a single-floor supermarket.  A reduced
+    # vertical span can still hide a near-monotonic start-to-end height drift,
+    # as seen when both raw and optimized trajectories drift in the same
+    # direction. Compare robust endpoint bands so a single crouch/raised frame
+    # does not dominate the diagnostic. This is intentionally a warning, not a
+    # hard rejection, because genuine ramps and sustained posture changes are
+    # still possible.
+    optimized_band_shift = abs(float(optimized_metrics["vertical_endpoint_band_shift_m"]))
+    if len(common_ids) >= 50 and optimized_band_shift > 0.45:
+        warnings.append(
+            "The optimized single-floor trajectory retains a "
+            f"{optimized_band_shift:.2f} m vertical shift between its start and end bands; "
+            "residual height drift or a sustained device-height change requires review."
+        )
+        score -= 10
+
     raw_length = float(raw_metrics["trajectory_length_m"])
     optimized_length = float(optimized_metrics["trajectory_length_m"])
     length_ratio = optimized_length / raw_length if raw_length > 1e-6 else 1.0
@@ -634,7 +870,7 @@ def assess_optimized_trajectory(input_database: Path, output_database: Path) -> 
         status = "pass"
     return {
         "format": "SupermarketTrajectoryErrorAssessment",
-        "version": 1,
+        "version": 2,
         "profile": "software_only_no_fiducials",
         "status": status,
         "quality_score": max(0, score),
@@ -642,6 +878,7 @@ def assess_optimized_trajectory(input_database: Path, output_database: Path) -> 
         "common_pose_count": len(common_ids),
         "raw": raw_metrics,
         "optimized": optimized_metrics,
+        "optimization_displacement": displacement_metrics,
         "trajectory_length_ratio": round(length_ratio, 6),
         "constraints": {
             "link_table_present": optimized_database["link_table_present"],
@@ -677,6 +914,7 @@ def run_reprocess(
     final_optimization_epsilon: float = DEFAULT_FINAL_OPTIMIZATION_EPSILON,
     progress_callback: Optional[ReprocessProgressCallback] = None,
     profile_name: str = DISCOVERY_PROFILE,
+    link_injections: Iterable[Dict[str, Any]] = (),
 ) -> Dict[str, Any]:
     if online_optimization_iterations < 1:
         raise OfflineProcessingError("Online optimization iterations must be at least 1.")
@@ -685,6 +923,7 @@ def run_reprocess(
     if final_optimization_epsilon < 0.0:
         raise OfflineProcessingError("Final optimization epsilon cannot be negative.")
     accelerator_parameters = tuple(extra_parameters)
+    requested_link_injections = tuple(link_injections)
     runtime_parameters = accelerator_parameters + (
         ("Optimizer/Iterations", str(int(online_optimization_iterations))),
     )
@@ -717,8 +956,13 @@ def run_reprocess(
         output_database.stem + ".partial" + output_database.suffix
     )
     started_at = time.time()
-    staging_root = _staging_directory() if use_local_staging else output_database.parent
-    if use_local_staging:
+    needs_input_copy = use_local_staging or bool(requested_link_injections)
+    staging_root = (
+        _staging_directory()
+        if use_local_staging
+        else _existing_directory(output_database.parent)
+    )
+    if needs_input_copy:
         staging_free_bytes = shutil.disk_usage(staging_root).free
         staging_recommended_bytes = max(2 * 1024**3, source["size_bytes"] * 3)
         if staging_free_bytes < staging_recommended_bytes:
@@ -735,16 +979,25 @@ def run_reprocess(
     log_path: Optional[Path] = None
     copy_in_seconds = 0.0
     copy_out_seconds = 0.0
+    injected_links = {
+        "requested_count": 0,
+        "injected_count": 0,
+        "pairs": [],
+    }
     try:
         try:
-            if use_local_staging:
+            if needs_input_copy:
                 temporary = tempfile.TemporaryDirectory(
                     prefix="supermarket-rtabmap-",
                     dir=staging_root,
                 )
                 work_directory = Path(temporary.name)
                 work_input = work_directory / "capture.db"
-                work_output = work_directory / "optimized.partial.db"
+                work_output = (
+                    work_directory / "optimized.partial.db"
+                    if use_local_staging
+                    else publish_partial
+                )
                 copy_started = time.time()
                 _copy_and_sync(input_database, work_input)
                 copy_in_seconds = time.time() - copy_started
@@ -753,6 +1006,7 @@ def run_reprocess(
                 work_input = input_database
                 work_output = publish_partial
 
+            injected_links = _inject_user_links(work_input, requested_link_injections)
             command = _command(
                 binary,
                 work_input,
@@ -881,6 +1135,8 @@ def run_reprocess(
             "fiducials_used": False,
             "landmark_constraints_used": False,
             "pose_priors_used": False,
+            "user_constraints_used": injected_links["injected_count"] > 0,
+            "user_constraint_count": injected_links["injected_count"],
             "started_at": started_at,
             "elapsed_seconds": round(time.time() - started_at, 3),
             "binary": str(binary),
@@ -891,6 +1147,7 @@ def run_reprocess(
                 "openmp_wait_policy": "PASSIVE",
                 "opencv_thread_limit": threads,
                 "local_staging": use_local_staging,
+                "disposable_input_copy": needs_input_copy,
                 "staging_root": str(staging_root) if use_local_staging else None,
                 "copy_in_seconds": round(copy_in_seconds, 3),
                 "copy_out_seconds": round(copy_out_seconds, 3),
@@ -901,6 +1158,7 @@ def run_reprocess(
                 "final_optimization_iterations": final_optimization_iterations,
                 "final_optimization_epsilon": final_optimization_epsilon,
                 "g2o_solver": "eigen_sparse",
+                "injected_user_links": injected_links,
             },
             "runtime": runtime,
             "input": source,
