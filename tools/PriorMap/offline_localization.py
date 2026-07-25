@@ -733,55 +733,249 @@ def _stable_edges(element: dict[str, Any]) -> list[tuple[str, tuple[float, float
     return [(f"E{index:02d}", start, end) for index, (start, end) in enumerate(ordered, 1)]
 
 
+def _segment_intersection(
+    p1: tuple[float, float],
+    p2: tuple[float, float],
+    p3: tuple[float, float],
+    p4: tuple[float, float],
+) -> tuple[float, float, float] | None:
+    """Parametric segment intersection.
+
+    Returns ``(t, u, x, y)`` is not the contract here; instead returns
+    ``(t, u, dist)`` where ``t`` is the parameter along segment ``p1->p2``
+    (the ray from camera to tag) and ``u`` along ``p3->p4`` (the occluding
+    edge), and ``dist`` is the Euclidean distance from ``p1`` to the hit point.
+    Returns ``None`` if the segments do not properly intersect.
+
+    Handles collinear and endpoint cases with a small tolerance so that a ray
+    grazing a shelf endpoint is treated as an occlusion, not a miss.
+    """
+    eps = 1.0e-9
+    x1, y1 = p1
+    x2, y2 = p2
+    x3, y3 = p3
+    x4, y4 = p4
+    denom = (x2 - x1) * (y4 - y3) - (y2 - y1) * (x4 - x3)
+    if abs(denom) < eps:
+        # Parallel or collinear — treat as non-intersecting for occlusion.
+        return None
+    t = ((x3 - x1) * (y4 - y3) - (y3 - y1) * (x4 - x3)) / denom
+    u = ((x3 - x1) * (y2 - y1) - (y3 - y1) * (x2 - x1)) / denom
+    # Allow a tiny tolerance so endpoint grazes count as occlusion.
+    if t < -eps or t > 1.0 + eps or u < -eps or u > 1.0 + eps:
+        return None
+    hit_x = x1 + t * (x2 - x1)
+    hit_y = y1 + t * (y2 - y1)
+    dist = math.hypot(hit_x - x1, hit_y - y1)
+    return (max(0.0, min(1.0, t)), max(0.0, min(1.0, u)), dist)
+
+
 def _associate_tag(
     tag: dict[str, Any],
     elements: Sequence[dict[str, Any]],
+    camera_xy: tuple[float, float] | None = None,
 ) -> dict[str, Any]:
+    """Safe offline shelf re-association.
+
+    Candidate edges and occlusion edges are separate sets: every fixed
+    structure edge participates in occlusion regardless of its distance to the
+    tag, while only shelf/table/table-feature edges within ``candidate_radius``
+    compete for the association.
+
+    Auto-confirm requires: distance within threshold, camera and tag on the
+    visible side, ray not occluded by a nearer structure, not in an endpoint
+    ambiguity zone, sufficient independent-second-candidate margin, legal side
+    ID, and adequate localization/measurement confidence.  Any failure
+    produces ``needs_review=True`` with only a ``suggested_association``.
+    """
     position = tag.get("final_map_position") or tag.get("snapped_map_position")
     if not isinstance(position, dict):
         return tag
     point = (float(position.get("x_m", 0)), float(position.get("y_m", 0)))
-    candidates: list[tuple[float, dict[str, Any], str, float, tuple[float, float]]] = []
+
+    candidate_radius = 1.2
+    endpoint_ambiguity_m = 0.25
+    min_margin = 0.15
+    min_auto_confidence = 0.6
+
+    # Build candidate edges and the full occlusion edge set.
+    candidates: list[
+        tuple[float, dict[str, Any], str, float, tuple[float, float], tuple[float, float]]
+    ] = []
+    occlusion_edges: list[tuple[tuple[float, float], tuple[float, float]]] = []
     for element in elements:
-        if element.get("shape_type") not in {"MapShelf", "MapTable", "MapTableFeature"}:
-            continue
-        for edge_id, start, end in _stable_edges(element):
-            dx, dy = end[0] - start[0], end[1] - start[1]
-            length2 = dx * dx + dy * dy
-            ratio = max(
-                0.0,
-                min(1.0, ((point[0] - start[0]) * dx + (point[1] - start[1]) * dy) / length2),
-            )
-            snapped = (start[0] + ratio * dx, start[1] + ratio * dy)
-            distance = math.hypot(point[0] - snapped[0], point[1] - snapped[1])
-            if distance <= 1.2:
-                candidates.append((distance, element, edge_id, ratio * math.sqrt(length2), snapped))
+        shape = element.get("shape_type")
+        edges = _stable_edges(element)
+        if shape in {"MapShelf", "MapTable", "MapTableFeature"}:
+            for edge_id, start, end in edges:
+                dx, dy = end[0] - start[0], end[1] - start[1]
+                length2 = dx * dx + dy * dy
+                if length2 <= 1.0e-12:
+                    continue
+                ratio = max(
+                    0.0,
+                    min(1.0, ((point[0] - start[0]) * dx + (point[1] - start[1]) * dy) / length2),
+                )
+                snapped = (start[0] + ratio * dx, start[1] + ratio * dy)
+                distance = math.hypot(point[0] - snapped[0], point[1] - snapped[1])
+                if distance <= candidate_radius:
+                    candidates.append(
+                        (distance, element, edge_id, ratio * math.sqrt(length2), snapped, (start, end))
+                    )
+        # All fixed structures participate in occlusion, including pillars.
+        if shape in {"MapShelf", "MapTable", "MapTableFeature", "MapPillar"}:
+            for _edge_id, start, end in edges:
+                occlusion_edges.append((start, end))
+
     if not candidates:
         tag["needs_review"] = True
         return tag
+
     candidates.sort(key=lambda value: (value[0], str(value[1].get("id")), value[2]))
-    distance, element, edge_id, offset, snapped = candidates[0]
-    tag.update(
-        {
-            "shelf_code": element.get("code") or None,
-            "row_flag": element.get("row_flag") or None,
-            "cross_code": element.get("cross_code") or None,
-            "shelf_side": edge_id,
-            "distance_from_shelf_start_cm": round(offset * 100, 3),
-            "final_map_position": {
-                "x_m": round(snapped[0], 6),
-                "y_m": round(snapped[1], 6),
-                "height_m": position.get("height_m"),
-            },
-            "association_confidence": round(max(0.0, 1 - distance / 1.2), 6),
+    best = candidates[0]
+    best_distance, best_element, best_edge_id, best_offset, best_snapped, best_edge = best
+
+    # Compute the independent second-best candidate: must come from a different
+    # physical element so that two edges of the same shelf do not masquerade
+    # as a confirmatory second candidate.
+    second: tuple[float, dict[str, Any], str, float, tuple[float, float], tuple[float, float]] | None = None
+    for candidate in candidates[1:]:
+        if candidate[1].get("id") != best_element.get("id"):
+            second = candidate
+            break
+    margin = best_distance if second is None else (second[0] - best_distance)
+
+    # If a camera position is available, perform ray-based occlusion and
+    # visible-side checks.  Without a camera position we cannot auto-confirm.
+    ray_clear = True
+    visible_side_consistent = True
+    has_camera = camera_xy is not None and all(math.isfinite(v) for v in camera_xy)
+    if has_camera:
+        cam = camera_xy  # type: ignore[assignment]
+        ray_length = math.hypot(point[0] - cam[0], point[1] - cam[1])
+        if ray_length <= 1.0e-6:
+            has_camera = False
+        else:
+            # Check if any occlusion edge intersects the camera→tag ray
+            # closer than the tag itself.
+            tag_dist = ray_length
+            for occ_start, occ_end in occlusion_edges:
+                hit = _segment_intersection(cam, point, occ_start, occ_end)
+                if hit is not None and hit[2] < tag_dist - 0.05:
+                    ray_clear = False
+                    break
+            # Visible-side check: the tag should be on the same side of the
+            # shelf as the camera (i.e. the candidate edge faces the camera).
+            dx_edge = best_edge[1][0] - best_edge[0][0]
+            dy_edge = best_edge[1][1] - best_edge[0][1]
+            edge_len = math.hypot(dx_edge, dy_edge)
+            if edge_len > 1.0e-9:
+                # Outward normal of the best edge (pointing away from shelf center).
+                normal = (-dy_edge / edge_len, dx_edge / edge_len)
+                # Ensure normal points outward (away from element center).
+                center = best_element.get("center_m") or best_element.get("center")
+                if isinstance(center, list) and len(center) >= 2:
+                    cx, cy = float(center[0]), float(center[1])
+                    mid = ((best_edge[0][0] + best_edge[1][0]) / 2,
+                           (best_edge[0][1] + best_edge[1][1]) / 2)
+                    if ((mid[0] - cx) * normal[0] + (mid[1] - cy) * normal[1]) < 0:
+                        normal = (-normal[0], -normal[1])
+                # Camera and tag should both be on the outward side.
+                cam_side = (cam[0] - best_snapped[0]) * normal[0] + (cam[1] - best_snapped[1]) * normal[1]
+                tag_side = (point[0] - best_snapped[0]) * normal[0] + (point[1] - best_snapped[1]) * normal[1]
+                if cam_side < -0.05 or tag_side < -0.05:
+                    visible_side_consistent = False
+
+    # Endpoint ambiguity: tag very close to a shelf end may match either side.
+    edge_length = math.hypot(
+        best_edge[1][0] - best_edge[0][0], best_edge[1][1] - best_edge[0][1]
+    )
+    near_endpoint = best_offset < endpoint_ambiguity_m or best_offset > edge_length - endpoint_ambiguity_m
+
+    loc_conf = float(tag.get("localization_confidence", 0) or 0)
+    meas_conf = float(tag.get("measurement_confidence", 0) or 0)
+    manually_modified = bool(tag.get("manually_modified"))
+
+    can_auto_confirm = (
+        has_camera
+        and best_distance <= 0.45
+        and ray_clear
+        and visible_side_consistent
+        and not near_endpoint
+        and (second is None or margin >= min_margin)
+        and loc_conf >= min_auto_confidence
+        and meas_conf >= min_auto_confidence
+        and not manually_modified
+    )
+
+    if can_auto_confirm:
+        tag.update(
+            {
+                "shelf_code": best_element.get("code") or None,
+                "row_flag": best_element.get("row_flag") or None,
+                "cross_code": best_element.get("cross_code") or None,
+                "shelf_side": best_edge_id,
+                "distance_from_shelf_start_cm": round(best_offset * 100, 3),
+                "final_map_position": {
+                    "x_m": round(best_snapped[0], 6),
+                    "y_m": round(best_snapped[1], 6),
+                    "height_m": position.get("height_m"),
+                },
+                "association_confidence": round(max(0.0, 1 - best_distance / candidate_radius), 6),
+            }
+        )
+        tag["needs_review"] = bool(tag.get("needs_review")) or False
+    else:
+        # Fail-closed: keep original position, provide suggestion only.
+        tag["suggested_association"] = {
+            "shelf_code": best_element.get("code") or None,
+            "row_flag": best_element.get("row_flag") or None,
+            "cross_code": best_element.get("cross_code") or None,
+            "shelf_side": best_edge_id,
+            "distance_from_shelf_start_cm": round(best_offset * 100, 3),
+            "distance_m": round(best_distance, 6),
+            "reason": _association_reject_reason(
+                best_distance, ray_clear, visible_side_consistent, near_endpoint,
+                margin, second is not None, loc_conf, meas_conf, has_camera
+            ),
         }
-    )
-    tag["needs_review"] = bool(
-        tag.get("needs_review")
-        or distance > 0.45
-        or float(tag["association_confidence"]) < 0.65
-    )
+        tag["needs_review"] = True
+        if "association_confidence" not in tag:
+            tag["association_confidence"] = round(
+                max(0.0, 1 - best_distance / candidate_radius), 6
+            )
     return tag
+
+
+def _association_reject_reason(
+    distance: float,
+    ray_clear: bool,
+    visible_side: bool,
+    near_endpoint: bool,
+    margin: float,
+    has_second: bool,
+    loc_conf: float,
+    meas_conf: float,
+    has_camera: bool,
+) -> str:
+    reasons: list[str] = []
+    if distance > 0.45:
+        reasons.append(f"distance {distance:.2f}m exceeds 0.45m auto-confirm threshold")
+    if not has_camera:
+        reasons.append("no camera origin available for occlusion/visible-side check")
+    if not ray_clear:
+        reasons.append("camera-to-tag ray occluded by a nearer structure")
+    if not visible_side:
+        reasons.append("tag not on the camera-visible side of the shelf")
+    if near_endpoint:
+        reasons.append("tag near shelf endpoint, side ambiguous")
+    if has_second and margin < 0.15:
+        reasons.append(f"independent second candidate margin {margin:.2f}m below 0.15m")
+    if loc_conf < 0.6:
+        reasons.append(f"localization confidence {loc_conf:.2f} below 0.60")
+    if meas_conf < 0.6:
+        reasons.append(f"measurement confidence {meas_conf:.2f} below 0.60")
+    return "; ".join(reasons) if reasons else "unconfirmed"
 
 
 def apply_manual_edits(
@@ -1148,7 +1342,9 @@ def process_localized_session(
                 )
             except OfflineLocalizationError:
                 tag["needs_review"] = True
-                final_tags.append(_associate_tag(tag, elements))
+                final_tags.append(
+                    _associate_tag(tag, elements, (optimized_node.x, optimized_node.y))
+                )
                 continue
             tag["final_map_position"] = {
                 "x_m": round(final_x, 6),
@@ -1189,7 +1385,9 @@ def process_localized_session(
         })
         if node_time_delta is not None and node_time_delta > max_node_time_delta_seconds:
             tag["needs_review"] = True
-        final_tags.append(_associate_tag(tag, elements))
+        final_tags.append(
+            _associate_tag(tag, elements, (optimized_node.x, optimized_node.y))
+        )
     # Manual tag decisions are deliberately replayed after all automatic
     # reassociation so a reprocess never silently overwrites a human edit.
     _, final_tags, _ = apply_manual_edits([], final_tags, manual_edits)

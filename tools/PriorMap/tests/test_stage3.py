@@ -10,6 +10,7 @@ from pathlib import Path
 from tools.PriorMap.offline_localization import (
     Pose,
     OfflineLocalizationError,
+    _associate_tag,
     apply_pose_delta_to_point,
     append_manual_edit,
     build_road_soft_constraints,
@@ -217,6 +218,83 @@ class RobustSE2OptimizerTests(unittest.TestCase):
             all(item.kind == "manual_aisle_assignment" for item in constraints)
         )
         self.assertTrue(all(abs(item.y) < 1.0e-9 for item in constraints))
+
+
+class ShelfAssociationSafetyTests(unittest.TestCase):
+    """Wave 3B: occluded, endpoint-ambiguous, and multi-candidate tag
+    association must fail-closed with only suggested values."""
+
+    def _shelf_element(self, code: str, coords: list[tuple[float, float]], shape_type: str = "MapShelf") -> dict:
+        return {
+            "id": code,
+            "code": code,
+            "shape_type": shape_type,
+            "row_flag": "R1",
+            "cross_code": "C1",
+            "center_m": [
+                sum(p[0] for p in coords) / len(coords),
+                sum(p[1] for p in coords) / len(coords),
+            ],
+            "geometry": {
+                "type": "Polygon",
+                "coordinates": [list(p) for p in coords],
+            },
+        }
+
+    def _tag(self, x: float, y: float) -> dict[str, object]:
+        return {
+            "tag_id": "tag-1",
+            "final_map_position": {"x_m": x, "y_m": y, "height_m": 1.2},
+            "localization_confidence": 0.8,
+            "measurement_confidence": 0.8,
+            "needs_review": False,
+        }
+
+    def test_near_side_auto_confirmed(self) -> None:
+        # Shelf from (0,0) to (4,0) — camera at (2, 2) looking at near side.
+        shelf = self._shelf_element("SHELF-01", [(0.0, 0.0), (4.0, 0.0), (4.0, -0.5), (0.0, -0.5)])
+        tag = self._tag(2.0, 0.15)
+        result = _associate_tag(tag, [shelf], (2.0, 2.0))
+        self.assertEqual(result.get("shelf_code"), "SHELF-01")
+        self.assertFalse(result.get("needs_review"))
+
+    def test_far_side_fail_closed(self) -> None:
+        # Camera at (2, 2) on the near side, tag on the far side at (2, -0.6).
+        shelf = self._shelf_element("SHELF-01", [(0.0, 0.0), (4.0, 0.0), (4.0, -0.5), (0.0, -0.5)])
+        tag = self._tag(2.0, -0.6)
+        result = _associate_tag(tag, [shelf], (2.0, 2.0))
+        self.assertTrue(result.get("needs_review"))
+        self.assertIn("suggested_association", result)
+        self.assertNotIn("shelf_code", result)
+
+    def test_no_camera_fail_closed(self) -> None:
+        shelf = self._shelf_element("SHELF-01", [(0.0, 0.0), (4.0, 0.0), (4.0, -0.5), (0.0, -0.5)])
+        tag = self._tag(2.0, 0.15)
+        result = _associate_tag(tag, [shelf])
+        self.assertTrue(result.get("needs_review"))
+        self.assertIn("suggested_association", result)
+
+    def test_occluded_by_front_shelf(self) -> None:
+        # Front shelf at y=-1, rear at y=-3. Camera at (3, 2), tag at (3, -3.1).
+        front = self._shelf_element("FRONT", [(1.0, -1.0), (5.0, -1.0), (5.0, -1.5), (1.0, -1.5)])
+        rear = self._shelf_element("REAR", [(1.0, -3.0), (5.0, -3.0), (5.0, -3.5), (1.0, -3.5)])
+        tag = self._tag(3.0, -3.1)
+        result = _associate_tag(tag, [front, rear], (3.0, 2.0))
+        # The rear shelf should be occluded by the front shelf.
+        self.assertTrue(result.get("needs_review"))
+
+    def test_pillar_occludes(self) -> None:
+        pillar = self._shelf_element("PILLAR", [(2.8, 0.0), (3.2, 0.0), (3.2, -0.4), (2.8, -0.4)], "MapPillar")
+        shelf = self._shelf_element("SHELF", [(2.0, -1.0), (4.0, -1.0), (4.0, -1.5), (2.0, -1.5)])
+        tag = self._tag(3.0, -1.1)
+        result = _associate_tag(tag, [pillar, shelf], (3.0, 2.0))
+        self.assertTrue(result.get("needs_review"))
+
+    def test_endpoint_ambiguity_triggers_review(self) -> None:
+        shelf = self._shelf_element("SHELF", [(0.0, 0.0), (4.0, 0.0), (4.0, -0.5), (0.0, -0.5)])
+        tag = self._tag(0.1, 0.15)  # very close to the left endpoint
+        result = _associate_tag(tag, [shelf], (0.1, 2.0))
+        self.assertTrue(result.get("needs_review"))
 
 
 class ManualEditJournalTests(unittest.TestCase):
