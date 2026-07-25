@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import tempfile
 import unittest
 from pathlib import Path
 
 from tools.PriorMap.offline_localization import (
     Pose,
+    OfflineLocalizationError,
+    apply_pose_delta_to_point,
     append_manual_edit,
     build_road_soft_constraints,
     build_manual_aisle_constraints,
@@ -34,6 +37,90 @@ def jsonl_write(path: Path, values: list[dict[str, object]]) -> None:
         "".join(json.dumps(value, sort_keys=True) + "\n" for value in values),
         encoding="utf-8",
     )
+
+
+class SE2TagPropagationTests(unittest.TestCase):
+    """Wave 3A: verify that tag positions follow the full rigid-body delta,
+    not just dx/dy.  ``DeltaT = T_offline * inverse(T_baseline)``.
+    """
+
+    def _pose(self, x: float, y: float, yaw: float) -> Pose:
+        return Pose(1, 0.0, x, y, yaw)
+
+    def test_no_change_leaves_point_unchanged(self) -> None:
+        base = self._pose(3.0, 4.0, 0.5)
+        opt = self._pose(3.0, 4.0, 0.5)
+        x, y = apply_pose_delta_to_point(base, opt, (5.0, 6.0))
+        self.assertAlmostEqual(x, 5.0, places=9)
+        self.assertAlmostEqual(y, 6.0, places=9)
+
+    def test_pure_translation(self) -> None:
+        base = self._pose(0.0, 0.0, 0.0)
+        opt = self._pose(1.0, 2.0, 0.0)
+        x, y = apply_pose_delta_to_point(base, opt, (5.0, 6.0))
+        self.assertAlmostEqual(x, 6.0, places=9)
+        self.assertAlmostEqual(y, 8.0, places=9)
+
+    def test_positive_90_deg_rotation(self) -> None:
+        # Baseline node at origin facing 0; optimized node rotated +90deg.
+        # A tag at (1, 0) relative to node should move to (0, 1).
+        base = self._pose(0.0, 0.0, 0.0)
+        opt = self._pose(0.0, 0.0, math.pi / 2)
+        x, y = apply_pose_delta_to_point(base, opt, (1.0, 0.0))
+        self.assertAlmostEqual(x, 0.0, places=9)
+        self.assertAlmostEqual(y, 1.0, places=9)
+
+    def test_negative_90_deg_rotation(self) -> None:
+        base = self._pose(0.0, 0.0, 0.0)
+        opt = self._pose(0.0, 0.0, -math.pi / 2)
+        x, y = apply_pose_delta_to_point(base, opt, (1.0, 0.0))
+        self.assertAlmostEqual(x, 0.0, places=9)
+        self.assertAlmostEqual(y, -1.0, places=9)
+
+    def test_180_deg_rotation(self) -> None:
+        base = self._pose(0.0, 0.0, 0.0)
+        opt = self._pose(0.0, 0.0, math.pi)
+        x, y = apply_pose_delta_to_point(base, opt, (1.0, 0.0))
+        self.assertAlmostEqual(x, -1.0, places=9)
+        self.assertAlmostEqual(y, 0.0, places=9)
+
+    def test_translation_plus_rotation(self) -> None:
+        # Baseline node at (2, 1) yaw 0; optimized at (3, 2) yaw 90deg.
+        # Tag online at (4, 1) → relative to baseline: (2, 0).
+        # After +90 rotation: (0, 2). After adding delta_t:
+        #   delta_yaw = 90, R_delta * t_base = rotate (2,1) by 90 = (-1, 2)
+        #   delta_t = (3,2) - (-1, 2) = (4, 0)
+        #   final = R_delta * (4,1) + delta_t = (-1, 4) + (4, 0) = (3, 4)
+        base = self._pose(2.0, 1.0, 0.0)
+        opt = self._pose(3.0, 2.0, math.pi / 2)
+        x, y = apply_pose_delta_to_point(base, opt, (4.0, 1.0))
+        self.assertAlmostEqual(x, 3.0, places=9)
+        self.assertAlmostEqual(y, 4.0, places=9)
+
+    def test_angle_wrap_across_pi(self) -> None:
+        # Baseline yaw just below +pi, optimized yaw just above -pi;
+        # delta should be ~0, not ~2pi.
+        base = self._pose(0.0, 0.0, math.pi - 0.01)
+        opt = self._pose(0.0, 0.0, -math.pi + 0.01)
+        x, y = apply_pose_delta_to_point(base, opt, (1.0, 0.0))
+        # Delta yaw ~0.02 rad; point should barely move.
+        self.assertAlmostEqual(x, math.cos(0.02), places=4)
+        self.assertAlmostEqual(y, math.sin(0.02), places=4)
+
+    def test_node_own_point_equals_optimized_translation(self) -> None:
+        # If the tag sits exactly at the baseline node position, the result
+        # equals the optimized node translation.
+        base = self._pose(2.0, 3.0, 0.7)
+        opt = self._pose(5.0, 7.0, 1.2)
+        x, y = apply_pose_delta_to_point(base, opt, (2.0, 3.0))
+        self.assertAlmostEqual(x, 5.0, places=9)
+        self.assertAlmostEqual(y, 7.0, places=9)
+
+    def test_non_finite_coordinates_raise(self) -> None:
+        base = self._pose(0.0, 0.0, 0.0)
+        opt = self._pose(float("nan"), 0.0, 0.0)
+        with self.assertRaises(OfflineLocalizationError):
+            apply_pose_delta_to_point(base, opt, (1.0, 0.0))
 
 
 class RobustSE2OptimizerTests(unittest.TestCase):

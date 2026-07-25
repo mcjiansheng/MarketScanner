@@ -388,6 +388,42 @@ def align_relative_trajectory(
     return result
 
 
+def apply_pose_delta_to_point(
+    baseline_pose: Pose,
+    optimized_pose: Pose,
+    point_xy: tuple[float, float],
+) -> tuple[float, float]:
+    """Apply the full SE(2) rigid delta between two poses to a planar point.
+
+    Computes ``DeltaT = T_offline * inverse(T_baseline)`` and returns
+    ``DeltaT * P_online``.  The yaw of the baseline/optimized node rotates the
+    point around the baseline node translation; a pure ``dx/dy`` addition is
+    only correct when the yaw correction is zero.  Height is handled separately
+    by the caller because the 2-D yaw must not act on the vertical axis.
+
+    Raises :class:`OfflineLocalizationError` for non-finite inputs so callers
+    can route the tag to review instead of emitting invalid coordinates.
+    """
+    bx, by, byaw = baseline_pose.x, baseline_pose.y, baseline_pose.yaw
+    ox, oy, oyaw = optimized_pose.x, optimized_pose.y, optimized_pose.yaw
+    px, py = point_xy
+    if not all(
+        math.isfinite(value)
+        for value in (bx, by, byaw, ox, oy, oyaw, px, py)
+    ):
+        raise OfflineLocalizationError(
+            "Cannot apply SE(2) delta to a tag with non-finite coordinates."
+        )
+    delta_yaw = _normalize_angle(oyaw - byaw)
+    cos_d = math.cos(delta_yaw)
+    sin_d = math.sin(delta_yaw)
+    # DeltaT translation: t_off - R_delta * t_base
+    delta_x = ox - (cos_d * bx - sin_d * by)
+    delta_y = oy - (sin_d * bx + cos_d * by)
+    # P_final = R_delta * P_online + delta_t
+    return (cos_d * px - sin_d * py + delta_x, sin_d * px + cos_d * py + delta_y)
+
+
 def _huber_weight(residual: float, threshold: float) -> float:
     magnitude = abs(residual)
     return 1.0 if magnitude <= threshold else threshold / max(magnitude, 1.0e-12)
@@ -1090,27 +1126,69 @@ def process_localized_session(
     observations_by_id = {
         str(item.get("observation_id")): item for item in tag_observations
     }
+    max_node_time_delta_seconds = 1.5
     for tag in raw_tags:
         observation = observations_by_id.get(str(tag.get("observation_id")), {})
-        index = _nearest_pose_index(
-            baseline,
+        obs_timestamp = (
             float(observation["frame_timestamp"])
             if observation.get("frame_timestamp") is not None
-            else None,
+            else None
         )
-        dx = optimized[index].x - baseline[index].x
-        dy = optimized[index].y - baseline[index].y
+        index = _nearest_pose_index(baseline, obs_timestamp)
+        baseline_node = baseline[index]
+        optimized_node = optimized[index]
         original = tag.get("snapped_map_position") or tag.get("raw_map_position")
         if isinstance(original, dict):
             tag["online_map_position"] = dict(original)
+            try:
+                final_x, final_y = apply_pose_delta_to_point(
+                    baseline_node,
+                    optimized_node,
+                    (float(original.get("x_m", 0)), float(original.get("y_m", 0))),
+                )
+            except OfflineLocalizationError:
+                tag["needs_review"] = True
+                final_tags.append(_associate_tag(tag, elements))
+                continue
             tag["final_map_position"] = {
-                "x_m": float(original.get("x_m", 0)) + dx,
-                "y_m": float(original.get("y_m", 0)) + dy,
+                "x_m": round(final_x, 6),
+                "y_m": round(final_y, 6),
                 "height_m": original.get("height_m"),
             }
-            tag["online_offline_distance_cm"] = round(math.hypot(dx, dy) * 100, 3)
+            online_x = float(original.get("x_m", 0))
+            online_y = float(original.get("y_m", 0))
+            tag["online_offline_distance_cm"] = round(
+                math.hypot(final_x - online_x, final_y - online_y) * 100, 3
+            )
         tag.setdefault("manually_modified", False)
         tag.setdefault("approval_status", "pending" if tag.get("needs_review") else "auto_approved")
+        # Audit: record the binding node and SE(2) delta so reviewers can verify
+        # the rigid transform that propagated this tag from online to final.
+        node_time_delta: float | None = None
+        if obs_timestamp is not None and baseline_node.timestamp is not None:
+            node_time_delta = abs(obs_timestamp - baseline_node.timestamp)
+        tag.setdefault("transform_audit", {
+            "source_observation_id": str(tag.get("observation_id") or ""),
+            "bound_node_id": baseline_node.node_id,
+            "bound_node_stamp": baseline_node.timestamp,
+            "observation_stamp": obs_timestamp,
+            "time_delta_seconds": node_time_delta,
+            "baseline_pose": {
+                "x_m": round(baseline_node.x, 6),
+                "y_m": round(baseline_node.y, 6),
+                "yaw_rad": round(baseline_node.yaw, 6),
+            },
+            "optimized_pose": {
+                "x_m": round(optimized_node.x, 6),
+                "y_m": round(optimized_node.y, 6),
+                "yaw_rad": round(optimized_node.yaw, 6),
+            },
+            "delta_yaw_rad": round(
+                _normalize_angle(optimized_node.yaw - baseline_node.yaw), 6
+            ),
+        })
+        if node_time_delta is not None and node_time_delta > max_node_time_delta_seconds:
+            tag["needs_review"] = True
         final_tags.append(_associate_tag(tag, elements))
     # Manual tag decisions are deliberately replayed after all automatic
     # reassociation so a reprocess never silently overwrites a human edit.
