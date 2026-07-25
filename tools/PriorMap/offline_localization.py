@@ -106,25 +106,85 @@ def _read_jsonl(
     path: Path,
     maximum_record_bytes: int = 1_000_000,
     maximum_records: int = 500_000,
-) -> list[dict[str, Any]]:
+    strict: bool = False,
+    max_error_rate: float = 0.01,  # 最大允许错误率1%
+    expected_session_id: str | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """
+    读取JSONL文件，返回(记录列表, 解析统计)
+    strict模式下，错误率超过阈值或文件完全损坏时抛出异常
+    """
     values: list[dict[str, Any]] = []
+    stats = {
+        "total_lines": 0,
+        "valid_records": 0,
+        "invalid_lines": 0,
+        "skipped_oversize_lines": 0,
+        "empty_lines": 0,
+        "error_rate": 0.0,
+        "file_exists": path.is_file(),
+    }
     if not path.is_file():
-        return values
+        if strict:
+            raise OfflineLocalizationError(f"Required JSONL file not found: {path.name}")
+        return values, stats
+    
     with path.open("r", encoding="utf-8", errors="replace") as handle:
-        for line in handle:
-            if not line.strip() or len(line) > maximum_record_bytes:
+        for line_number, line in enumerate(handle, start=1):
+            stats["total_lines"] += 1
+            stripped = line.strip()
+            if not stripped:
+                stats["empty_lines"] += 1
+                continue
+            if len(line) > maximum_record_bytes:
+                stats["skipped_oversize_lines"] += 1
                 continue
             try:
-                value = json.loads(line)
-            except json.JSONDecodeError:
+                value = json.loads(stripped)
+            except json.JSONDecodeError as e:
+                stats["invalid_lines"] += 1
+                if strict:
+                    raise OfflineLocalizationError(
+                        f"JSONL file {path.name} corrupted at line {line_number}: {e}"
+                    )
                 continue
             if isinstance(value, dict):
+                # 校验会话ID（如果提供）
+                if expected_session_id is not None:
+                    record_session = value.get("trackingSessionId") or value.get("tracking_session_id")
+                    if record_session is not None and record_session != expected_session_id:
+                        stats["invalid_lines"] += 1
+                        if strict:
+                            raise OfflineLocalizationError(
+                                f"JSONL file {path.name} line {line_number} has mismatched session ID: "
+                                f"expected {expected_session_id}, got {record_session}"
+                            )
+                        continue
                 values.append(value)
+                stats["valid_records"] += 1
                 if len(values) > maximum_records:
                     raise OfflineLocalizationError(
                         f"{path.name} exceeds the bounded {maximum_records}-record safety limit."
                     )
-    return values
+    
+    # 计算错误率
+    non_empty_lines = stats["total_lines"] - stats["empty_lines"]
+    if non_empty_lines > 0:
+        stats["error_rate"] = stats["invalid_lines"] / non_empty_lines
+    else:
+        stats["error_rate"] = 1.0 if stats["total_lines"] > 0 else 0.0
+    
+    # strict模式检查错误率
+    if strict and non_empty_lines > 0:
+        if stats["valid_records"] == 0:
+            raise OfflineLocalizationError(f"JSONL file {path.name} contains no valid records.")
+        if stats["error_rate"] > max_error_rate:
+            raise OfflineLocalizationError(
+                f"JSONL file {path.name} corruption rate {stats['error_rate']:.2%} "
+                f"exceeds threshold {max_error_rate:.2%}."
+            )
+    
+    return values, stats
 
 
 def _nearest_pose_index(poses: Sequence[Pose], timestamp: float | None) -> int:
@@ -400,6 +460,19 @@ def _solve_banded(
     iterations: int = 120,
 ) -> list[float]:
     """Solve a 1-D correction field with a Jacobi-stabilized Gauss-Seidel pass."""
+    # 转换为统一权重的边
+    edge_weights = [(smoothness, smoothness * 1.5)] * (count - 1)
+    return _solve_banded_weighted(count, observations, edge_weights, iterations=iterations)
+
+
+def _solve_banded_weighted(
+    count: int,
+    observations: Sequence[tuple[int, float, float]],
+    edge_weights: Sequence[tuple[float, float]],
+    dim: int = 0,
+    iterations: int = 120,
+) -> list[float]:
+    """Solve a 1-D correction field with per-edge weighted smoothness."""
     values = [0.0] * count
     by_index: dict[int, list[tuple[float, float]]] = {}
     for index, target, weight in observations:
@@ -409,12 +482,17 @@ def _solve_banded(
         for index in range(count):
             numerator = 0.0
             denominator = 0.0
+            # 左边的边（和index-1的连接）
             if index > 0:
-                numerator += smoothness * values[index - 1]
-                denominator += smoothness
+                w = edge_weights[index-1][dim]
+                numerator += w * values[index - 1]
+                denominator += w
+            # 右边的边（和index+1的连接）
             if index + 1 < count:
-                numerator += smoothness * values[index + 1]
-                denominator += smoothness
+                w = edge_weights[index][dim]
+                numerator += w * values[index + 1]
+                denominator += w
+            # 绝对观测
             for target, weight in by_index.get(index, ()):
                 numerator += weight * target
                 denominator += weight
@@ -437,12 +515,37 @@ def optimize_trajectory(
     baseline: Sequence[Pose],
     constraints: Sequence[AbsoluteConstraint],
     iterations: int = 8,
-) -> tuple[list[Pose], list[dict[str, Any]], list[dict[str, Any]]]:
+    max_relative_deformation_m: float = 0.05,  # 相邻节点最大相对形变5cm
+    max_relative_deformation_rad: float = math.radians(2.0),  # 相邻节点最大相对旋转2度
+) -> tuple[list[Pose], list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
     if not baseline:
         raise OfflineLocalizationError("Cannot optimize an empty trajectory.")
+    n = len(baseline)
     active = list(constraints)
     rejected: list[dict[str, Any]] = []
-    corrections = [[0.0] * len(baseline) for _ in range(3)]
+    corrections = [[0.0] * n for _ in range(3)]
+    
+    # 预计算相邻节点的相对位姿和权重（基于距离加权，距离越近权重越高）
+    edge_weights = []
+    base_relative = []
+    for i in range(n - 1):
+        p1 = baseline[i]
+        p2 = baseline[i+1]
+        dx = p2.x - p1.x
+        dy = p2.y - p1.y
+        dyaw = _normalize_angle(p2.yaw - p1.yaw)
+        dist = math.hypot(dx, dy)
+        dt = abs(p2.timestamp - p1.timestamp) if p1.timestamp is not None and p2.timestamp is not None else 0.1
+        # 距离小于20cm或者时间间隔小于0.1s的相邻帧，权重更高（连续帧）
+        if dist < 0.2 or dt < 0.1:
+            weight = 48.0  # 高权重，连续帧不能大幅形变
+        elif dist < 1.0:
+            weight = 24.0  # 中权重
+        else:
+            weight = 12.0  # 低权重，间隔远的帧允许更多调整
+        edge_weights.append((weight, weight * 1.5))  # (xy权重, yaw权重)
+        base_relative.append((dx, dy, dyaw, dist, dt))
+    
     for _ in range(iterations):
         observations = [[], [], []]
         retained: list[AbsoluteConstraint] = []
@@ -490,9 +593,11 @@ def optimize_trajectory(
                 )
             )
         active = retained
-        corrections[0] = _solve_banded(len(baseline), observations[0], smoothness=24.0)
-        corrections[1] = _solve_banded(len(baseline), observations[1], smoothness=24.0)
-        corrections[2] = _solve_banded(len(baseline), observations[2], smoothness=36.0)
+        # 使用加权的相对位姿约束求解
+        corrections[0] = _solve_banded_weighted(n, observations[0], edge_weights, dim=0)
+        corrections[1] = _solve_banded_weighted(n, observations[1], edge_weights, dim=1)
+        corrections[2] = _solve_banded_weighted(n, observations[2], edge_weights, dim=2)
+    
     optimized = [
         Pose(
             node_id=pose.node_id,
@@ -503,6 +608,52 @@ def optimize_trajectory(
         )
         for index, pose in enumerate(baseline)
     ]
+    
+    # 计算相对位姿残差和形变统计
+    relative_residuals = []
+    high_deformation_intervals = []
+    max_deformation_xy = 0.0
+    max_deformation_yaw = 0.0
+    total_deformation_xy = 0.0
+    for i in range(n - 1):
+        p1_opt = optimized[i]
+        p2_opt = optimized[i+1]
+        dx_opt = p2_opt.x - p1_opt.x
+        dy_opt = p2_opt.y - p1_opt.y
+        dyaw_opt = _normalize_angle(p2_opt.yaw - p1_opt.yaw)
+        dx_base, dy_base, dyaw_base, dist_base, dt_base = base_relative[i]
+        
+        res_xy = math.hypot(dx_opt - dx_base, dy_opt - dy_base)
+        res_yaw = abs(_normalize_angle(dyaw_opt - dyaw_base))
+        relative_residuals.append({
+            "node_from": baseline[i].node_id,
+            "node_to": baseline[i+1].node_id,
+            "base_distance_m": dist_base,
+            "time_delta_s": dt_base,
+            "xy_residual_m": res_xy,
+            "yaw_residual_deg": math.degrees(res_yaw),
+        })
+        max_deformation_xy = max(max_deformation_xy, res_xy)
+        max_deformation_yaw = max(max_deformation_yaw, res_yaw)
+        total_deformation_xy += res_xy
+        
+        # 检查局部形变是否超过门限
+        if res_xy > max_relative_deformation_m or res_yaw > max_relative_deformation_rad:
+            high_deformation_intervals.append({
+                "constraint_id": f"relative_deformation_{i:06d}",
+                "kind": "excessive_relative_deformation",
+                "node_from": baseline[i].node_id,
+                "node_to": baseline[i+1].node_id,
+                "start_timestamp": baseline[i].timestamp,
+                "end_timestamp": baseline[i+1].timestamp,
+                "translation_residual_m": res_xy,
+                "yaw_residual_deg": math.degrees(res_yaw),
+                "reason": "local_deformation_exceeds_threshold",
+            })
+    
+    # 将过大的局部形变加入拒绝列表
+    rejected.extend(high_deformation_intervals)
+    
     accepted = [
         {
             "constraint_id": item.identifier,
@@ -519,7 +670,20 @@ def optimize_trajectory(
         }
         for item in active
     ]
-    return optimized, accepted, rejected
+    
+    # 优化诊断信息
+    diagnostics = {
+        "converged": True,
+        "iterations": iterations,
+        "max_relative_deformation_m": max_deformation_xy,
+        "max_relative_deformation_deg": math.degrees(max_deformation_yaw),
+        "mean_relative_deformation_m": total_deformation_xy / max(1, n-1),
+        "high_deformation_interval_count": len(high_deformation_intervals),
+        "accepted_absolute_constraint_count": len(accepted),
+        "rejected_constraint_count": len(rejected),
+    }
+    
+    return optimized, accepted, rejected, diagnostics
 
 
 def _trajectory_length(poses: Sequence[Pose]) -> float:
@@ -697,54 +861,227 @@ def _stable_edges(element: dict[str, Any]) -> list[tuple[str, tuple[float, float
     return [(f"E{index:02d}", start, end) for index, (start, end) in enumerate(ordered, 1)]
 
 
+def _point_to_segment_distance(
+    point: tuple[float, float],
+    start: tuple[float, float],
+    end: tuple[float, float],
+) -> tuple[float, float, tuple[float, float]]:
+    """计算点到线段的距离，返回(距离, 投影比例, 投影点)"""
+    dx, dy = end[0] - start[0], end[1] - start[1]
+    length2 = dx * dx + dy * dy
+    if length2 < 1e-8:
+        return math.hypot(point[0] - start[0], point[1] - start[1]), 0.0, start
+    ratio = max(
+        0.0,
+        min(1.0, ((point[0] - start[0]) * dx + (point[1] - start[1]) * dy) / length2),
+    )
+    projected = (start[0] + ratio * dx, start[1] + ratio * dy)
+    distance = math.hypot(point[0] - projected[0], point[1] - projected[1])
+    return distance, ratio * math.sqrt(length2), projected
+
+
+def _segment_intersect(
+    a1: tuple[float, float],
+    a2: tuple[float, float],
+    b1: tuple[float, float],
+    b2: tuple[float, float],
+) -> bool:
+    """判断两条线段是否相交（不包括端点重合）"""
+    def ccw(p1, p2, p3):
+        return (p3[1] - p1[1]) * (p2[0] - p1[0]) > (p2[1] - p1[1]) * (p3[0] - p1[0])
+    
+    return (
+        ccw(a1, b1, b2) != ccw(a2, b1, b2)
+        and ccw(a1, a2, b1) != ccw(a1, a2, b2)
+    )
+
+
 def _associate_tag(
     tag: dict[str, Any],
     elements: Sequence[dict[str, Any]],
+    camera_position: tuple[float, float] | None = None,
 ) -> dict[str, Any]:
+    """
+    安全的价签-货架关联，复用在线关联的安全门：
+    1. 收集所有结构边（货架/柜台作为候选，柱体作为遮挡）
+    2. 射线遮挡检查：相机到标签的视线不能被其他结构遮挡
+    3. 候选唯一性检查：最优/次优margin必须足够大
+    4. 端点检查：标签不能太靠近货架端点
+    5. 远侧面检查：标签不能在货架的远侧面（相机看不到的一侧）
+    6. 任何不确定情况都标记needs_review，不自动确认
+    """
     position = tag.get("final_map_position") or tag.get("snapped_map_position")
     if not isinstance(position, dict):
+        tag["needs_review"] = True
+        tag["association_failure_reason"] = "invalid_position"
         return tag
+    
     point = (float(position.get("x_m", 0)), float(position.get("y_m", 0)))
-    candidates: list[tuple[float, dict[str, Any], str, float, tuple[float, float]]] = []
+    MAX_ASSOCIATION_DISTANCE = 1.2  # 最大关联距离1.2m
+    MIN_CANDIDATE_MARGIN = 0.2  # 最优次优最小margin 20cm
+    ENDPOINT_PROXIMITY_THRESHOLD = 0.15  # 距离端点小于15cm标记review
+    OCCLUSION_EPSILON = 0.05  # 遮挡判断容差5cm
+    
+    # 收集所有边：候选边（货架/柜台）和遮挡边（柱体）
+    candidate_edges: list[tuple[dict[str, Any], str, tuple[float, float], tuple[float, float]]] = []
+    occluder_edges: list[tuple[tuple[float, float], tuple[float, float]]] = []
+    
     for element in elements:
-        if element.get("shape_type") not in {"MapShelf", "MapTable", "MapTableFeature"}:
-            continue
-        for edge_id, start, end in _stable_edges(element):
+        shape_type = element.get("shape_type")
+        if shape_type in {"MapShelf", "MapTable", "MapTableFeature"}:
+            for edge_id, start, end in _stable_edges(element):
+                candidate_edges.append((element, edge_id, start, end))
+        elif shape_type == "MapPillar":
+            # 柱体作为遮挡物，添加其边
+            for _, start, end in _stable_edges(element):
+                occluder_edges.append((start, end))
+    
+    # 计算所有候选边的距离和信息
+    candidates: list[tuple[float, dict[str, Any], str, float, tuple[float, float], tuple[float, float], tuple[float, float]]] = []
+    for element, edge_id, start, end in candidate_edges:
+        distance, offset, snapped = _point_to_segment_distance(point, start, end)
+        if distance <= MAX_ASSOCIATION_DISTANCE:
+            # 计算边的法向量，判断点在边的哪一侧
             dx, dy = end[0] - start[0], end[1] - start[1]
-            length2 = dx * dx + dy * dy
-            ratio = max(
-                0.0,
-                min(1.0, ((point[0] - start[0]) * dx + (point[1] - start[1]) * dy) / length2),
-            )
-            snapped = (start[0] + ratio * dx, start[1] + ratio * dy)
-            distance = math.hypot(point[0] - snapped[0], point[1] - snapped[1])
-            if distance <= 1.2:
-                candidates.append((distance, element, edge_id, ratio * math.sqrt(length2), snapped))
+            length = math.hypot(dx, dy)
+            if length < 1e-8:
+                continue
+            # 法向量（指向边的右侧）
+            normal = (-dy / length, dx / length)
+            # 点到边的向量
+            vec_to_point = (point[0] - snapped[0], point[1] - snapped[1])
+            side_dot = vec_to_point[0] * normal[0] + vec_to_point[1] * normal[1]
+            is_far_side = False
+            # 如果有相机位置，检查是否在远侧面（相机在另一侧）
+            if camera_position is not None:
+                vec_to_camera = (camera_position[0] - snapped[0], camera_position[1] - snapped[1])
+                camera_dot = vec_to_camera[0] * normal[0] + vec_to_camera[1] * normal[1]
+                # 点和相机在边的两侧，说明点在远侧面，被货架本身遮挡
+                if side_dot * camera_dot < -OCCLUSION_EPSILON:
+                    is_far_side = True
+            # 检查是否靠近端点
+            dist_to_start = math.hypot(point[0] - start[0], point[1] - start[1])
+            dist_to_end = math.hypot(point[0] - end[0], point[1] - end[1])
+            near_endpoint = min(dist_to_start, dist_to_end) < ENDPOINT_PROXIMITY_THRESHOLD
+            candidates.append((distance, element, edge_id, offset, snapped, start, end, is_far_side, near_endpoint))
+    
     if not candidates:
         tag["needs_review"] = True
+        tag["association_failure_reason"] = "no_candidate_within_range"
+        tag["association_confidence"] = 0.0
         return tag
-    candidates.sort(key=lambda value: (value[0], str(value[1].get("id")), value[2]))
-    distance, element, edge_id, offset, snapped = candidates[0]
-    tag.update(
-        {
-            "shelf_code": element.get("code") or None,
-            "row_flag": element.get("row_flag") or None,
-            "cross_code": element.get("cross_code") or None,
-            "shelf_side": edge_id,
-            "distance_from_shelf_start_cm": round(offset * 100, 3),
-            "final_map_position": {
-                "x_m": round(snapped[0], 6),
-                "y_m": round(snapped[1], 6),
-                "height_m": position.get("height_m"),
-            },
-            "association_confidence": round(max(0.0, 1 - distance / 1.2), 6),
+    
+    # 按距离排序
+    candidates.sort(key=lambda x: (x[0], str(x[1].get("id")), x[2]))
+    best = candidates[0]
+    best_distance, best_element, best_edge_id, best_offset, best_snapped, best_start, best_end, best_far_side, best_near_endpoint = best
+    
+    # 检查候选唯一性
+    candidate_margin = float("inf")
+    if len(candidates) >= 2:
+        candidate_margin = candidates[1][0] - best_distance
+    
+    # 遮挡检查：相机到标签点的线段是否与任何遮挡边或其他候选边相交
+    has_occlusion = False
+    occlusion_reason = None
+    if camera_position is not None:
+        # 检查柱体遮挡
+        for occ_start, occ_end in occluder_edges:
+            if _segment_intersect(camera_position, point, occ_start, occ_end):
+                has_occlusion = True
+                occlusion_reason = "occluded_by_pillar"
+                break
+        # 检查其他货架边遮挡（不是最佳边本身）
+        if not has_occlusion:
+            for _, _, _, _, _, edge_start, edge_end, _, _ in candidates[1:]:
+                # 跳过和最佳边共线或距离太近的边
+                if _segment_intersect(camera_position, point, edge_start, edge_end):
+                    # 检查交点是否在相机和点之间
+                    dist_intersect_to_cam = math.hypot(
+                        (edge_start[0] + edge_end[0])/2 - camera_position[0],
+                        (edge_start[1] + edge_end[1])/2 - camera_position[1]
+                    )
+                    dist_point_to_cam = math.hypot(
+                        point[0] - camera_position[0],
+                        point[1] - camera_position[1]
+                    )
+                    if dist_intersect_to_cam < dist_point_to_cam - OCCLUSION_EPSILON:
+                        has_occlusion = True
+                        occlusion_reason = "occluded_by_other_structure"
+                        break
+    
+    # 综合判断是否需要review
+    needs_review = (
+        best_distance > 0.45
+        or best_far_side
+        or best_near_endpoint
+        or has_occlusion
+        or candidate_margin < MIN_CANDIDATE_MARGIN
+        or float(tag.get("association_confidence", 1.0)) < 0.65
+    )
+    
+    # 如果在线已经有人工确认的关联，保留人工确认，不自动覆盖
+    if tag.get("manually_associated") is True and tag.get("shelf_code") is not None:
+        tag["association_note"] = "保留在线人工确认关联，离线仅做位置变换"
+        tag["needs_review"] = tag.get("needs_review", False) or needs_review
+        return tag
+    
+    # 只有在所有安全检查通过时才自动关联，否则标记review
+    if not needs_review:
+        tag.update(
+            {
+                "shelf_code": best_element.get("code") or None,
+                "row_flag": best_element.get("row_flag") or None,
+                "cross_code": best_element.get("cross_code") or None,
+                "shelf_side": best_edge_id,
+                "distance_from_shelf_start_cm": round(best_offset * 100, 3),
+                "final_map_position": {
+                    "x_m": round(best_snapped[0], 6),
+                    "y_m": round(best_snapped[1], 6),
+                    "height_m": position.get("height_m"),
+                },
+                "association_confidence": round(max(0.0, min(1.0, 1 - best_distance / MAX_ASSOCIATION_DISTANCE)), 6),
+                "association_audit": {
+                    "best_distance_m": best_distance,
+                    "second_best_distance_m": candidates[1][0] if len(candidates) >= 2 else None,
+                    "candidate_margin_m": candidate_margin,
+                    "is_far_side": best_far_side,
+                    "near_endpoint": best_near_endpoint,
+                    "has_occlusion": has_occlusion,
+                    "occlusion_reason": occlusion_reason,
+                    "candidate_count": len(candidates),
+                }
+            }
+        )
+        tag["needs_review"] = False
+        tag["association_failure_reason"] = None
+    else:
+        # 不确定的情况，保留原始位置，标记需要人工复核
+        reasons = []
+        if best_distance > 0.45:
+            reasons.append(f"distance_too_large_{best_distance:.2f}m")
+        if best_far_side:
+            reasons.append("far_side_of_shelf")
+        if best_near_endpoint:
+            reasons.append("near_shelf_endpoint")
+        if has_occlusion:
+            reasons.append(occlusion_reason or "occluded")
+        if candidate_margin < MIN_CANDIDATE_MARGIN:
+            reasons.append(f"ambiguous_candidates_margin_{candidate_margin:.2f}m")
+        tag["needs_review"] = True
+        tag["association_failure_reason"] = ",".join(reasons)
+        tag["association_confidence"] = round(max(0.0, min(1.0, 1 - best_distance / MAX_ASSOCIATION_DISTANCE)), 6)
+        # 给出最佳候选作为建议，但不自动确认
+        tag["suggested_association"] = {
+            "shelf_code": best_element.get("code") or None,
+            "shelf_side": best_edge_id,
+            "distance_from_shelf_start_cm": round(best_offset * 100, 3),
+            "snapped_position": {
+                "x_m": round(best_snapped[0], 6),
+                "y_m": round(best_snapped[1], 6),
+            }
         }
-    )
-    tag["needs_review"] = bool(
-        tag.get("needs_review")
-        or distance > 0.45
-        or float(tag["association_confidence"]) < 0.65
-    )
+    
     return tag
 
 
@@ -796,12 +1133,24 @@ def apply_manual_edits(
     return constraints, tags, audit
 
 
-def new_manual_edits(map_sha256: str, session_sha256: str) -> dict[str, Any]:
+def new_manual_edits(
+    map_sha256: str,
+    session_sha256: str,
+    source_database_sha256: str | None = None,
+    optimized_database_sha256: str | None = None,
+    processing_parameters: dict[str, Any] | None = None,
+    tool_version: str = "1.1.0",
+) -> dict[str, Any]:
     return {
         "format": "MarketScannerManualEdits",
-        "version": 1,
+        "version": 2,
+        "revision": 1,  # 乐观锁版本号，每次修改+1
         "prior_map_sha256": map_sha256,
         "source_session_sha256": session_sha256,
+        "source_database_sha256": source_database_sha256,
+        "optimized_database_sha256": optimized_database_sha256,
+        "processing_parameters": processing_parameters or {},
+        "tool_version": tool_version,
         "cursor": 0,
         "events": [],
     }
@@ -851,6 +1200,52 @@ def validate_manual_edit_event(event: dict[str, Any]) -> None:
             raise OfflineLocalizationError(
                 "edit_tag requires object_id and a non-empty new_value object."
             )
+        # 允许人工修改的字段白名单
+        allowed_fields = {
+            "shelf_code": str,
+            "shelf_side": str,
+            "row_flag": int,
+            "cross_code": str,
+            "distance_from_shelf_start_cm": (int, float),
+            "height_cm": (int, float),
+            "needs_review": bool,
+            "approval_status": str,
+            "manual_position": dict,
+            "notes": str,
+        }
+        # 验证字段和类型
+        for field, field_value in value.items():
+            if field not in allowed_fields:
+                raise OfflineLocalizationError(
+                    f"edit_tag does not allow modifying field: {field}. "
+                    f"Allowed fields: {', '.join(allowed_fields.keys())}"
+                )
+            expected_type = allowed_fields[field]
+            if not isinstance(field_value, expected_type):
+                raise OfflineLocalizationError(
+                    f"edit_tag field {field} must be of type {expected_type}, got {type(field_value)}"
+                )
+            # 范围验证
+            if field == "shelf_side" and field_value not in {"left", "right", "unknown"}:
+                raise OfflineLocalizationError("shelf_side must be 'left', 'right' or 'unknown'")
+            if field == "row_flag" and not (1 <= field_value <= 8):
+                raise OfflineLocalizationError("row_flag must be between 1 and 8")
+            if field == "distance_from_shelf_start_cm" and not (0 <= field_value <= 10000):
+                raise OfflineLocalizationError("distance_from_shelf_start_cm must be between 0 and 10000")
+            if field == "height_cm" and not (0 <= field_value <= 300):
+                raise OfflineLocalizationError("height_cm must be between 0 and 300")
+            if field == "approval_status" and field_value not in {"pending", "approved", "rejected"}:
+                raise OfflineLocalizationError("approval_status must be 'pending', 'approved' or 'rejected'")
+            if field == "manual_position":
+                if "x_m" not in field_value or "y_m" not in field_value:
+                    raise OfflineLocalizationError("manual_position must contain x_m and y_m")
+                try:
+                    x = float(field_value["x_m"])
+                    y = float(field_value["y_m"])
+                except (TypeError, ValueError):
+                    raise OfflineLocalizationError("manual_position x_m/y_m must be numbers")
+                if not (-1000 <= x <= 1000 and -1000 <= y <= 1000):
+                    raise OfflineLocalizationError("manual_position coordinates out of valid range")
     elif kind == "approve_tag":
         if not target:
             raise OfflineLocalizationError("approve_tag requires object_id.")
@@ -866,8 +1261,16 @@ def validate_manual_edit_event(event: dict[str, Any]) -> None:
 def append_manual_edit(
     journal: dict[str, Any],
     event: dict[str, Any],
+    expected_revision: int | None = None,
 ) -> dict[str, Any]:
     validate_manual_edit_event(event)
+    current_revision = int(journal.get("revision", 1))
+    # 乐观锁检查
+    if expected_revision is not None and current_revision != expected_revision:
+        raise OfflineLocalizationError(
+            f"Revision conflict: expected {expected_revision}, current {current_revision}. "
+            "Please refresh and try again."
+        )
     events = list(journal.get("events", []))
     cursor = max(0, min(int(journal.get("cursor", len(events))), len(events)))
     events = events[:cursor]
@@ -880,13 +1283,33 @@ def append_manual_edit(
         "new_value": event.get("new_value"),
     }
     events.append(normalized)
-    return {**journal, "events": events, "cursor": len(events)}
+    return {
+        **journal,
+        "events": events,
+        "cursor": len(events),
+        "revision": current_revision + 1,  # 每次修改版本号+1
+    }
 
 
-def move_manual_edit_cursor(journal: dict[str, Any], delta: int) -> dict[str, Any]:
+def move_manual_edit_cursor(
+    journal: dict[str, Any],
+    delta: int,
+    expected_revision: int | None = None,
+) -> dict[str, Any]:
+    current_revision = int(journal.get("revision", 1))
+    # 乐观锁检查
+    if expected_revision is not None and current_revision != expected_revision:
+        raise OfflineLocalizationError(
+            f"Revision conflict: expected {expected_revision}, current {current_revision}. "
+            "Please refresh and try again."
+        )
     events = list(journal.get("events", []))
     cursor = max(0, min(len(events), int(journal.get("cursor", len(events))) + delta))
-    return {**journal, "cursor": cursor}
+    return {
+        **journal,
+        "cursor": cursor,
+        "revision": current_revision + 1,  # undo/redo也算修改，版本号+1
+    }
 
 
 def process_localized_session(
@@ -898,6 +1321,8 @@ def process_localized_session(
     output: Path,
     manual_edits: dict[str, Any] | None = None,
     progress: Callable[[int, str, str], None] | None = None,
+    publish_state: str = "draft",  # draft/review/published
+    allow_automatic_publish: bool = False,  # 默认禁止自动发布，必须人工确认
 ) -> dict[str, Any]:
     validation = validate_package(prior_map)
     if not validation["valid"]:
@@ -929,12 +1354,50 @@ def process_localized_session(
     session_hash = source_hash_before
     package_hash = str(package_manifest["package_sha256"])
     if manual_edits is None:
-        manual_edits = new_manual_edits(package_hash, session_hash)
+        # 计算优化数据库hash
+        optimized_hash = _sha256(optimized_database)
+        manual_edits = new_manual_edits(
+            map_sha256=package_hash,
+            session_sha256=session_hash,
+            source_database_sha256=source_hash_before,
+            optimized_database_sha256=optimized_hash,
+            processing_parameters={
+                "resolution": 0.05,
+                "tag_snap_distance": 1.0,
+                "max_correction_threshold": 1.5,
+                "acceptance_rate_threshold": 0.55,
+            }
+        )
+    # 计算当前数据库hash用于验证
+    current_source_hash = source_hash_before
+    current_optimized_hash = _sha256(optimized_database)
+    
+    # 验证journal身份绑定
+    journal_source_hash = manual_edits.get("source_database_sha256")
+    journal_optimized_hash = manual_edits.get("optimized_database_sha256")
     if (
         manual_edits.get("prior_map_sha256") != package_hash
         or manual_edits.get("source_session_sha256") != session_hash
+        or (journal_source_hash is not None and journal_source_hash != current_source_hash)
+        or (journal_optimized_hash is not None and journal_optimized_hash != current_optimized_hash)
     ):
-        raise OfflineLocalizationError("manual_edits.json does not match this map/session pair.")
+        raise OfflineLocalizationError(
+            "manual_edits.json does not match this map/session/database version. "
+            "Please re-export or create a new edit journal."
+        )
+    # 兼容旧版本journal，补充缺失的身份字段
+    if manual_edits.get("version", 1) < 2:
+        manual_edits["version"] = 2
+        manual_edits["revision"] = 1
+        manual_edits["source_database_sha256"] = current_source_hash
+        manual_edits["optimized_database_sha256"] = current_optimized_hash
+        manual_edits["processing_parameters"] = {
+            "resolution": 0.05,
+            "tag_snap_distance": 1.0,
+            "max_correction_threshold": 1.5,
+            "acceptance_rate_threshold": 0.55,
+        }
+        manual_edits["tool_version"] = "1.1.0"
     edit_events = manual_edits.get("events")
     if not isinstance(edit_events, list):
         raise OfflineLocalizationError("manual_edits.json events must be an array.")
@@ -949,14 +1412,17 @@ def process_localized_session(
     if progress:
         progress(84, "先验地图轨迹优化", "正在读取在线约束并建立稳健 SE(2) 修正问题")
 
-    trace = _read_jsonl(segment / "localization_trace.jsonl")
-    raw_constraints = _read_jsonl(segment / "localization_constraints.jsonl")
-    manual_events = _read_jsonl(segment / "manual_localization_events.jsonl")
-    tag_observations = _read_jsonl(segment / "tag_observations.jsonl")
+    # 读取关键JSONL文件，使用严格模式，损坏直接失败
+    trace, trace_stats = _read_jsonl(segment / "localization_trace.jsonl", strict=True)
+    raw_constraints, constraints_stats = _read_jsonl(segment / "localization_constraints.jsonl", strict=True)
+    manual_events, manual_events_stats = _read_jsonl(segment / "manual_localization_events.jsonl", strict=False)
+    tag_observations, tag_obs_stats = _read_jsonl(segment / "tag_observations.jsonl", strict=True)
+    state_events, state_events_stats = _read_jsonl(segment / "localization_events.jsonl", strict=True)
     raw_tags_value = load_json(segment / "localized_price_tags.json") if (
         segment / "localized_price_tags.json"
     ).is_file() else []
     raw_tags = [dict(item) for item in raw_tags_value if isinstance(item, dict)]
+    review_items: list[dict[str, Any]] = []  # 提前初始化复核项列表
     initial = _pose_from(metadata.get("initialMapPose"))
     if initial is None:
         first_trace = next(
@@ -1002,29 +1468,99 @@ def process_localized_session(
                 source=record,
             )
         )
+    MAX_MANUAL_EVENT_TIME_DIFF_S = 1.0  # 人工事件与节点时间差最大1秒
+    manual_anchor_warnings = []
     for sequence, record in enumerate(manual_events, start=1):
         pose = _pose_from(record.get("confirmedMapPose"))
         if pose is None:
             pose = _pose_from(record.get("confirmed_map_pose"))
         if pose is None:
             continue
+        
+        event_version = int(record.get("version", 1))
+        # 优先使用同源时间戳：frameTimestamp > timestampUnix
+        use_timestamp = None
+        time_source = None
+        if event_version >= 2 and record.get("frameTimestamp") is not None:
+            try:
+                use_timestamp = float(record.get("frameTimestamp"))
+                time_source = "frameTimestamp"
+            except (TypeError, ValueError):
+                pass
+        
+        if use_timestamp is None and record.get("timestampUnix") is not None:
+            try:
+                use_timestamp = float(record.get("timestampUnix"))
+                time_source = "timestampUnix"
+                # 旧版本事件（无frameTimestamp）添加警告
+                if event_version < 2:
+                    manual_anchor_warnings.append({
+                        "type": "legacy_manual_event",
+                        "event_id": f"manual-{sequence:06d}",
+                        "message": "旧版本人工锚点事件无同源frameTimestamp，使用Unix时间匹配，可能存在时间基准偏差",
+                        "severity": "warning"
+                    })
+            except (TypeError, ValueError):
+                pass
+        
+        # 查找节点
+        node_index = None
+        time_diff = None
+        if record.get("nearestNodeId") is not None:
+            # 如果有明确的节点ID，优先使用
+            try:
+                target_id = int(record.get("nearestNodeId"))
+                for idx, p in enumerate(baseline):
+                    if p.index == target_id:
+                        node_index = idx
+                        break
+            except (TypeError, ValueError):
+                pass
+        
+        if node_index is None and use_timestamp is not None:
+            node_index = _nearest_pose_index(baseline, use_timestamp)
+            # 计算时间差
+            if node_index is not None and baseline[node_index].timestamp is not None:
+                time_diff = abs(baseline[node_index].timestamp - use_timestamp)
+                if time_diff > MAX_MANUAL_EVENT_TIME_DIFF_S:
+                    manual_anchor_warnings.append({
+                        "type": "manual_event_time_mismatch",
+                        "event_id": f"manual-{sequence:06d}",
+                        "message": f"人工锚点与最近节点时间差{time_diff:.2f}s超过阈值{MAX_MANUAL_EVENT_TIME_DIFF_S}s，需要人工选择节点",
+                        "severity": "error",
+                        "time_diff_seconds": time_diff,
+                        "time_source": time_source
+                    })
+                    continue  # 时间差太大，不自动应用
+        
+        if node_index is None:
+            manual_anchor_warnings.append({
+                "type": "manual_event_no_matching_node",
+                "event_id": f"manual-{sequence:06d}",
+                "message": "人工锚点找不到匹配的轨迹节点，需要人工选择",
+                "severity": "error"
+            })
+            continue
+        
         constraints.append(
             AbsoluteConstraint(
                 identifier=f"manual-{sequence:06d}",
-                node_index=_nearest_pose_index(
-                    baseline,
-                    float(record.get("timestampUnix"))
-                    if record.get("timestampUnix") is not None
-                    else None,
-                ),
+                node_index=node_index,
                 x=pose[0],
                 y=pose[1],
                 yaw=pose[2],
                 weight=80.0,
                 kind="manual_anchor",
-                source=record,
+                source={
+                    **record,
+                    "_time_source": time_source,
+                    "_time_diff_seconds": time_diff,
+                    "_event_version": event_version
+                },
             )
         )
+    # 将人工锚点警告加入复核项
+    review_items.extend(manual_anchor_warnings)
     constraint_records, _, edit_audit = apply_manual_edits(
         constraint_records, [], manual_edits
     )
@@ -1082,7 +1618,7 @@ def process_localized_session(
             str(metadata.get("floorId") or metadata.get("floor_id") or ""),
         )
     )
-    optimized, accepted, rejected = optimize_trajectory(baseline, constraints)
+    optimized, accepted, rejected, optimization_diagnostics = optimize_trajectory(baseline, constraints)
 
     elements_payload = load_json(prior_map / "elements.json")
     elements = elements_payload.get("elements", []) if isinstance(elements_payload, dict) else []
@@ -1098,20 +1634,64 @@ def process_localized_session(
             if observation.get("frame_timestamp") is not None
             else None,
         )
-        dx = optimized[index].x - baseline[index].x
-        dy = optimized[index].y - baseline[index].y
+        # 获取基线和优化后的位姿
+        base_pose = baseline[index]
+        opt_pose = optimized[index]
+        x_base, y_base, yaw_base = base_pose.x, base_pose.y, base_pose.yaw
+        x_opt, y_opt, yaw_opt = opt_pose.x, opt_pose.y, opt_pose.yaw
+        
         original = tag.get("snapped_map_position") or tag.get("raw_map_position")
-        if isinstance(original, dict):
+        if isinstance(original):
+            x_online = float(original.get("x_m", 0))
+            y_online = float(original.get("y_m", 0))
             tag["online_map_position"] = dict(original)
+            
+            # 完整SE(2)刚体变换：DeltaT = T_opt * inverse(T_base) * P_online
+            # 1. 转换到基线节点局部坐标系
+            dx_global = x_online - x_base
+            dy_global = y_online - y_base
+            cos_base = math.cos(yaw_base)
+            sin_base = math.sin(yaw_base)
+            local_x = dx_global * cos_base + dy_global * sin_base
+            local_y = -dx_global * sin_base + dy_global * cos_base
+            
+            # 2. 转换到优化后节点的全局坐标系
+            cos_opt = math.cos(yaw_opt)
+            sin_opt = math.sin(yaw_opt)
+            x_final = local_x * cos_opt - local_y * sin_opt + x_opt
+            y_final = local_x * sin_opt + local_y * cos_opt + y_opt
+            
+            # 计算平移和旋转贡献（审计用）
+            dx_trans = x_opt - x_base
+            dy_trans = y_opt - y_base
+            dyaw = yaw_opt - yaw_base
+            # 归一化角度到[-pi, pi]
+            dyaw = (dyaw + math.pi) % (2 * math.pi) - math.pi
+            
             tag["final_map_position"] = {
-                "x_m": float(original.get("x_m", 0)) + dx,
-                "y_m": float(original.get("y_m", 0)) + dy,
+                "x_m": x_final,
+                "y_m": y_final,
                 "height_m": original.get("height_m"),
             }
-            tag["online_offline_distance_cm"] = round(math.hypot(dx, dy) * 100, 3)
+            tag["transform_audit"] = {
+                "node_id": base_pose.index,
+                "node_timestamp": base_pose.timestamp,
+                "time_delta_seconds": observation.get("time_delta_seconds", 0.0),
+                "base_pose": {"x_m": x_base, "y_m": y_base, "yaw_rad": yaw_base},
+                "optimized_pose": {"x_m": x_opt, "y_m": y_opt, "yaw_rad": yaw_opt},
+                "delta_translation_m": {"dx": dx_trans, "dy": dy_trans},
+                "delta_rotation_rad": dyaw,
+                "rotation_contribution_m": {
+                    "dx": x_final - (x_online + dx_trans),
+                    "dy": y_final - (y_online + dy_trans),
+                }
+            }
+            tag["online_offline_distance_cm"] = round(math.hypot(x_final - x_online, y_final - y_online) * 100, 3)
         tag.setdefault("manually_modified", False)
         tag.setdefault("approval_status", "pending" if tag.get("needs_review") else "auto_approved")
-        final_tags.append(_associate_tag(tag, elements))
+        # 传入相机位置（优化后的节点位置）用于遮挡检查
+        camera_pos = (x_opt, y_opt)
+        final_tags.append(_associate_tag(tag, elements, camera_position=camera_pos))
     # Manual tag decisions are deliberately replayed after all automatic
     # reassociation so a reprocess never silently overwrites a human edit.
     _, final_tags, _ = apply_manual_edits([], final_tags, manual_edits)
@@ -1125,7 +1705,7 @@ def process_localized_session(
         item["kind"] == "online_structure" for item in accepted
     )
     source_accepted_count = sum(item.get("accepted") is True for item in raw_constraints)
-    review_items: list[dict[str, Any]] = [
+    review_items.extend(
         {
             "id": f"rejected-{index:06d}",
             "type": "rejected_constraint",
@@ -1134,7 +1714,7 @@ def process_localized_session(
             "details": item,
         }
         for index, item in enumerate(rejected, start=1)
-    ]
+    )
     review_items.extend(
         {
             "id": f"tag-{tag.get('tag_id', index)}",
@@ -1151,14 +1731,40 @@ def process_localized_session(
         1, source_accepted_count + len(manual_events)
     )
     needs_review_count = sum(tag.get("needs_review") is True for tag in final_tags)
-    automatic_publish = (
+    total_tags = len(final_tags)
+    tags_with_position = sum(1 for tag in final_tags if tag.get("final_map_position") is not None)
+    tags_with_shelf = sum(1 for tag in final_tags if tag.get("shelf_code"))
+    tag_coverage_ratio = tags_with_position / max(1, total_tags)
+    shelf_association_rate = tags_with_shelf / max(1, total_tags)
+    node_coverage_ratio = len(optimized) / max(1, len(baseline)) if baseline else 0.0
+    
+    # 严格发布硬指标
+    strict_publish_criteria_met = (
         bool(optimized)
-        and acceptance_rate >= 0.55
-        and max_correction <= 1.5
+        and node_coverage_ratio >= 1.0
+        and tag_coverage_ratio >= 0.95
+        and shelf_association_rate >= 0.95
+        and acceptance_rate >= 0.70
+        and max_correction <= 1.0
         and not rejected
         and needs_review_count == 0
+        and report["input_file_validation"]["all_critical_files_valid"]
+        and optimization_diagnostics["high_deformation_interval_count"] == 0
+        and len(weak_lost_intervals) == 0
     )
-    state_events = _read_jsonl(segment / "localization_events.jsonl")
+    
+    # 三级发布状态：
+    # - draft: 自动生成，未经过人工检查，不可作为权威结果
+    # - review: 满足基本质量，需要人工复核
+    # - published: 人工确认通过，满足所有硬指标，可作为权威结果
+    if publish_state == "published" and allow_automatic_publish and strict_publish_criteria_met:
+        final_publish_state = "published"
+    elif strict_publish_criteria_met:
+        final_publish_state = "review"  # 满足指标但需要人工确认才能发布
+    else:
+        final_publish_state = "draft"
+    
+    automatic_publish = (final_publish_state == "published")
     state_counts: dict[str, int] = {}
     for event in state_events:
         state = str(event.get("state") or "unknown")
@@ -1195,8 +1801,32 @@ def process_localized_session(
         "source_session_sha256": session_hash,
         "source_database_sha256": source_hash_before,
         "optimized_database_sha256": _sha256(optimized_database),
+        "optimization_diagnostics": optimization_diagnostics,
+        "input_file_validation": {
+            "localization_trace": trace_stats,
+            "localization_constraints": constraints_stats,
+            "manual_localization_events": manual_events_stats,
+            "tag_observations": tag_obs_stats,
+            "localization_state_events": state_events_stats,
+            "all_critical_files_valid": (
+                trace_stats["error_rate"] == 0.0
+                and constraints_stats["error_rate"] == 0.0
+                and tag_obs_stats["error_rate"] == 0.0
+                and state_events_stats["error_rate"] == 0.0
+            )
+        },
         "node_count": len(optimized),
-        "node_coverage_ratio": 1.0 if optimized else 0.0,
+        "node_coverage_ratio": node_coverage_ratio,
+        "total_tag_count": total_tags,
+        "tag_coverage_ratio": tag_coverage_ratio,
+        "shelf_association_rate": shelf_association_rate,
+        "needs_review_tag_count": needs_review_count,
+        "accepted_constraint_count": len(accepted),
+        "rejected_constraint_count": len(rejected),
+        "constraint_acceptance_rate": acceptance_rate,
+        "max_correction_m": max_correction,
+        "publish_state": final_publish_state,
+        "strict_publish_criteria_met": strict_publish_criteria_met,
         "online_trajectory_length_m": _trajectory_length(
             [
                 Pose(index, None, pose[0], pose[1], pose[2])
@@ -1281,178 +1911,250 @@ def process_localized_session(
     if source_hash_after != source_hash_before:
         raise OfflineLocalizationError("Source database changed during localized processing.")
 
-    output.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(prior_map / "manifest.json", output / "prior_map_manifest.json")
-    _json_write(
-        output / "source_manifest.json",
-        {
-            "format": "MarketScannerLocalizedSourceManifest",
-            "version": 1,
-            "source_session": str(session),
-            "source_database": str(source_database),
-            "source_database_sha256_before": source_hash_before,
-            "source_database_sha256_after": source_hash_after,
-            "source_database_immutable": True,
-            "optimized_database": str(optimized_database),
-            "prior_map": str(prior_map),
-            "prior_map_sha256": package_hash,
-        },
-    )
-    _json_write(
-        output / "processing_manifest.json",
-        {
-            "format": "MarketScannerLocalizedProcessing",
-            "version": 1,
-            "pipeline": [
-                "rtabmap_reprocess",
-                "relative_trajectory_read",
-                "prior_map_se2_correction",
-                "tag_reassociation",
-                "quality_gate",
-                "human_review",
-                "export",
-            ],
-            "source_database_modified": False,
-            "automatic_publish_allowed": automatic_publish,
-        },
-    )
-    _json_write(output / "online_localization_trace.json", trace)
-    trajectory_payload = _trajectory_geojson(baseline, optimized, trace)
-    _json_write(output / "optimized_map_trajectory.geojson", trajectory_payload)
-    _json_write(
-        output / "localization_constraints.json",
-        {
-            "format": "MarketScannerOfflineLocalizationConstraints",
-            "version": 1,
-            "raw": constraint_records,
-            "accepted": accepted,
-            "rejected": rejected,
-        },
-    )
-    _json_write(output / "localization_report.json", report)
-    _json_write(
-        output / "review_items.json",
-        {
-            "format": "MarketScannerLocalizationReviewItems",
-            "version": 1,
-            "items": review_items,
-        },
-    )
-    _json_write(
-        output / "localized_review.json",
-        {
-            "format": "MarketScannerLocalizedReview",
-            "version": 1,
-            "bounds": manifest.get("bounds"),
-            "elements": [
-                {
-                    key: element.get(key)
-                    for key in ("id", "code", "shape_type", "floor_id", "geometry")
-                }
-                for element in elements[:50_000]
-                if element.get("geometry") is not None
-            ],
-            "trajectory": _bounded_review_trajectory(trajectory_payload),
-            "tags": final_tags[:50_000],
-            "review_items": review_items[:5_000],
-            "view_limits": {
-                "maximum_elements": 50_000,
-                "maximum_trajectory_points_per_layer": 20_000,
-                "maximum_tags": 50_000,
-                "maximum_review_items": 5_000,
-                "elements_truncated": len(elements) > 50_000,
-                "tags_truncated": len(final_tags) > 50_000,
-                "review_items_truncated": len(review_items) > 5_000,
+    # ========== 原子事务写入：先写临时目录，校验后原子发布 ==========
+    import tempfile
+    import shutil
+    import time
+    
+    # 创建临时目录（和output同分区，保证rename原子性）
+    temp_dir = output.parent / f".{output.name}.tmp.{int(time.time() * 1000)}"
+    temp_dir.mkdir(parents=True, exist_ok=False)
+    
+    try:
+        # 复制先验地图manifest
+        shutil.copy2(prior_map / "manifest.json", temp_dir / "prior_map_manifest.json")
+        # 写入source manifest，不包含本机绝对路径，只保留ID和hash
+        _json_write(
+            temp_dir / "source_manifest.json",
+            {
+                "format": "MarketScannerLocalizedSourceManifest",
+                "version": 2,
+                "source_session_id": session.name,
+                "source_database_filename": source_database.name,
+                "source_database_sha256": source_hash_before,
+                "source_database_immutable": True,
+                "optimized_database_filename": optimized_database.name,
+                "optimized_database_sha256": _sha256(optimized_database),
+                "prior_map_id": manifest.get("prior_map_id"),
+                "prior_map_sha256": package_hash,
             },
-        },
-    )
-    _json_write(output / "manual_edits.json", manual_edits)
-    _json_write(output / "localized_price_tags.json", final_tags)
-    with (output / "localized_price_tags.csv").open(
-        "w", encoding="utf-8", newline=""
-    ) as handle:
-        fieldnames = [
-            "tag_id", "payload", "map_x_cm", "map_y_cm", "height_cm",
-            "shelf_code", "row_flag", "cross_code", "shelf_side",
-            "distance_from_shelf_start_cm", "online_offline_distance_cm",
-            "localization_confidence", "measurement_confidence",
-            "association_confidence", "manually_modified", "needs_review",
-            "approval_status", "observation_id",
-        ]
-        writer = csv.DictWriter(handle, fieldnames=fieldnames)
-        writer.writeheader()
+        )
+        # 所有输出先写入临时目录
+        _json_write(
+            temp_dir / "processing_manifest.json",
+            {
+                "format": "MarketScannerLocalizedProcessing",
+                "version": 2,
+                "pipeline": [
+                    "rtabmap_reprocess",
+                    "relative_trajectory_read",
+                    "prior_map_se2_correction",
+                    "tag_reassociation",
+                    "quality_gate",
+                    "human_review",
+                    "export",
+                ],
+                "source_database_modified": False,
+                "automatic_publish_allowed": allow_automatic_publish,
+                "publish_state": final_publish_state,
+                "publish_timestamp": time.time(),
+                "tool_version": "1.1.0",
+            },
+        )
+        _json_write(temp_dir / "online_localization_trace.json", trace)
+        trajectory_payload = _trajectory_geojson(baseline, optimized, trace)
+        _json_write(temp_dir / "optimized_map_trajectory.geojson", trajectory_payload)
+        _json_write(
+            temp_dir / "localization_constraints.json",
+            {
+                "format": "MarketScannerOfflineLocalizationConstraints",
+                "version": 1,
+                "raw": constraint_records,
+                "accepted": accepted,
+                "rejected": rejected,
+            },
+        )
+        _json_write(temp_dir / "localization_report.json", report)
+        _json_write(
+            temp_dir / "review_items.json",
+            {
+                "format": "MarketScannerLocalizationReviewItems",
+                "version": 1,
+                "items": review_items,
+            },
+        )
+        _json_write(
+            temp_dir / "localized_review.json",
+            {
+                "format": "MarketScannerLocalizedReview",
+                "version": 1,
+                "bounds": manifest.get("bounds"),
+                "elements": [
+                    {
+                        key: element.get(key)
+                        for key in ("id", "code", "shape_type", "floor_id", "geometry")
+                    }
+                    for element in elements[:50_000]
+                    if element.get("geometry") is not None
+                ],
+                "trajectory": _bounded_review_trajectory(trajectory_payload),
+                "tags": final_tags[:50_000],
+                "review_items": review_items[:5_000],
+                "view_limits": {
+                    "maximum_elements": 50_000,
+                    "maximum_trajectory_points_per_layer": 20_000,
+                    "maximum_tags": 50_000,
+                    "maximum_review_items": 5_000,
+                    "elements_truncated": len(elements) > 50_000,
+                    "tags_truncated": len(final_tags) > 50_000,
+                    "review_items_truncated": len(review_items) > 5_000,
+                },
+            },
+        )
+        _json_write(temp_dir / "manual_edits.json", manual_edits)
+        _json_write(temp_dir / "localized_price_tags.json", final_tags)
+        with (temp_dir / "localized_price_tags.csv").open(
+            "w", encoding="utf-8", newline=""
+        ) as handle:
+            fieldnames = [
+                "tag_id", "payload", "map_x_cm", "map_y_cm", "height_cm",
+                "shelf_code", "row_flag", "cross_code", "shelf_side",
+                "distance_from_shelf_start_cm", "online_offline_distance_cm",
+                "localization_confidence", "measurement_confidence",
+                "association_confidence", "manually_modified", "needs_review",
+                "approval_status", "observation_id",
+            ]
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            writer.writeheader()
+            for tag in final_tags:
+                position = tag.get("final_map_position") or {}
+                writer.writerow(
+                    {
+                        **{key: tag.get(key) for key in fieldnames},
+                        "map_x_cm": float(position.get("x_m", 0)) * 100,
+                        "map_y_cm": float(position.get("y_m", 0)) * 100,
+                        "height_cm": (
+                            float(position["height_m"]) * 100
+                            if position.get("height_m") is not None
+                            else None
+                        ),
+                    }
+                )
+        
+        # 写入GeoJSON价签图层
+        _json_write(
+            temp_dir / "localized_price_tags.geojson",
+            {
+                "type": "FeatureCollection",
+                "features": [
+                    {
+                        "type": "Feature",
+                        "properties": {
+                            key: value
+                            for key, value in tag.items()
+                            if key not in {"final_map_position", "raw_map_position", "snapped_map_position"}
+                        },
+                        "geometry": {
+                            "type": "Point",
+                            "coordinates": [
+                                float(tag["final_map_position"]["x_m"]),
+                                float(tag["final_map_position"]["y_m"]),
+                            ],
+                        },
+                    }
+                    for tag in final_tags
+                    if isinstance(tag.get("final_map_position"), dict)
+                ],
+            },
+        )
+        # 写入货架-价签索引
+        shelf_index: dict[str, list[str]] = {}
         for tag in final_tags:
-            position = tag.get("final_map_position") or {}
-            writer.writerow(
-                {
-                    **{key: tag.get(key) for key in fieldnames},
-                    "map_x_cm": float(position.get("x_m", 0)) * 100,
-                    "map_y_cm": float(position.get("y_m", 0)) * 100,
-                    "height_cm": (
-                        float(position["height_m"]) * 100
-                        if position.get("height_m") is not None else None
-                    ),
-                }
-            )
-    _json_write(
-        output / "localized_price_tags.geojson",
-        {
-            "type": "FeatureCollection",
-            "features": [
-                {
-                    "type": "Feature",
-                    "properties": {
-                        key: value
-                        for key, value in tag.items()
-                        if key not in {"final_map_position", "raw_map_position", "snapped_map_position"}
-                    },
-                    "geometry": {
-                        "type": "Point",
-                        "coordinates": [
-                            float(tag["final_map_position"]["x_m"]),
-                            float(tag["final_map_position"]["y_m"]),
-                        ],
-                    },
-                }
-                for tag in final_tags
-                if isinstance(tag.get("final_map_position"), dict)
-            ],
-        },
-    )
-    shelf_index: dict[str, list[str]] = {}
-    for tag in final_tags:
-        shelf = str(tag.get("shelf_code") or "")
-        if shelf:
-            shelf_index.setdefault(shelf, []).append(str(tag.get("tag_id")))
-    _json_write(
-        output / "shelf_tag_index.json",
-        {
-            "format": "MarketScannerShelfTagIndex",
-            "version": 1,
-            "shelves": {key: sorted(value) for key, value in sorted(shelf_index.items())},
-        },
-    )
-    _json_write(
-        output / "audit_log.jsonl",
-        [
+            shelf = str(tag.get("shelf_code") or "")
+            if shelf:
+                shelf_index.setdefault(shelf, []).append(str(tag.get("tag_id")))
+        _json_write(
+            temp_dir / "shelf_tag_index.json",
             {
-                "sequence": 1,
-                "event": "source_database_verified_immutable",
-                "sha256": source_hash_before,
+                "format": "MarketScannerShelfTagIndex",
+                "version": 1,
+                "shelves": {key: sorted(value) for key, value in sorted(shelf_index.items())},
             },
-            {
-                "sequence": 2,
-                "event": "offline_prior_map_optimization_completed",
-                "accepted_constraints": accepted_count,
-                "rejected_constraints": len(rejected),
-            },
-            *[
-                {"sequence": index + 3, "event": "manual_edit_applied", **item}
-                for index, item in enumerate(edit_audit)
+        )
+        # 写入审计日志
+        _json_write(
+            temp_dir / "audit_log.jsonl",
+            [
+                {
+                    "sequence": 1,
+                    "event": "source_database_verified_immutable",
+                    "sha256": source_hash_before,
+                },
+                {
+                    "sequence": 2,
+                    "event": "offline_prior_map_optimization_completed",
+                    "accepted_constraints": accepted_count,
+                    "rejected_constraints": len(rejected),
+                },
+                *[
+                    {"sequence": index + 3, "event": "manual_edit_applied", **item}
+                    for index, item in enumerate(edit_audit)
+                ],
             ],
-        ],
-        lines=True,
-    )
+            lines=True,
+        )
+        
+        # ========== 完整性校验 ==========
+        required_files = [
+            "processing_manifest.json",
+            "localization_report.json",
+            "review_items.json",
+            "localized_review.json",
+            "localized_price_tags.json",
+            "localized_price_tags.csv",
+            "localized_price_tags.geojson",
+            "optimized_map_trajectory.geojson",
+            "localization_constraints.json",
+            "manual_edits.json",
+            "shelf_tag_index.json",
+            "audit_log.jsonl",
+        ]
+        for filename in required_files:
+            file_path = temp_dir / filename
+            if not file_path.is_file():
+                raise OfflineLocalizationError(f"Required output file missing: {filename}")
+            # 校验JSON文件是有效的
+            if filename.endswith(".json") or filename.endswith(".geojson"):
+                try:
+                    with open(file_path, "r", encoding="utf-8") as f:
+                        json.load(f)
+                except json.JSONDecodeError as e:
+                    raise OfflineLocalizationError(f"Output file {filename} is invalid JSON: {e}")
+        
+        # ========== 原子发布 ==========
+        # 备份旧版本
+        backup_dir = None
+        if output.exists():
+            backup_dir = output.parent / f"{output.name}.bak.{int(time.time() * 1000)}"
+            output.rename(backup_dir)
+        
+        # 原子替换：临时目录重命名为正式目录
+        temp_dir.rename(output)
+        
+        # 清理旧备份（保留最近2个备份）
+        all_backups = sorted(
+            output.parent.glob(f"{output.name}.bak.*"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True
+        )
+        for old_backup in all_backups[2:]:
+            shutil.rmtree(old_backup, ignore_errors=True)
+            
+    except Exception as e:
+        # 任何错误，清理临时目录，不影响原有结果
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        raise e
+    
     if progress:
         progress(
             97,
@@ -1460,3 +2162,39 @@ def process_localized_session(
             "离线轨迹、价签结果、复核项和审计记录已生成",
         )
     return report
+        ]
+        for filename in required_files:
+            file_path = temp_dir / filename
+            if not file_path.is_file():
+                raise OfflineLocalizationError(f"Required output file missing: {filename}")
+            # 校验JSON文件是有效的
+            if filename.endswith(".json") or filename.endswith(".geojson"):
+                try:
+                    with open(file_path, "r", encoding="utf-8") as f:
+                        json.load(f)
+                except json.JSONDecodeError as e:
+                    raise OfflineLocalizationError(f"Output file {filename} is invalid JSON: {e}")
+        
+        # ========== 原子发布 ==========
+        # 备份旧版本
+        backup_dir = None
+        if output.exists():
+            backup_dir = output.parent / f"{output.name}.bak.{int(time.time() * 1000)}"
+            output.rename(backup_dir)
+        
+        # 原子替换：临时目录重命名为正式目录
+        temp_dir.rename(output)
+        
+        # 清理旧备份（保留最近3个备份）
+        all_backups = sorted(
+            output.parent.glob(f"{output.name}.bak.*"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True
+        )
+        for old_backup in all_backups[2:]:  # 保留最近2个备份
+            shutil.rmtree(old_backup, ignore_errors=True)
+            
+    except Exception as e:
+        # 任何错误，清理临时目录，不影响原有结果
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        raise e

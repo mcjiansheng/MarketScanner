@@ -2771,6 +2771,9 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                 reason: reason,
                 arkitPose: poses.0,
                 confirmedMapPose: poses.1,
+                frameTimestamp: frame.timestamp,
+                nearestNodeId: nil,  // 后续可补充最近节点ID，当前优先保证时间基准统一
+                alignmentVersion: localizer.alignmentVersion,
                 expectedTrackingSessionId: trackingSessionId)
             self.supermarketSession?.appendScanEvent(
                 event: "manual_localization_confirmed",

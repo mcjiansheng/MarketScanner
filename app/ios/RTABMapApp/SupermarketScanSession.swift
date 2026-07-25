@@ -181,6 +181,9 @@ struct ManualLocalizationEvent: Codable {
     let version: Int
     let timestamp: String
     let timestampUnix: TimeInterval
+    let frameTimestamp: TimeInterval  // ARFrame.timestamp，与RTAB-Map Node.stamp同源
+    let nearestNodeId: Int?           // 最近的RTAB-Map节点ID
+    let alignmentVersion: Int         // 对齐版本号
     let trackingSessionId: String
     let reason: String
     let arkitPose: PriorMapPose2D
@@ -1048,6 +1051,9 @@ final class SupermarketScanSession {
         reason: String,
         arkitPose: PriorMapPose2D,
         confirmedMapPose: PriorMapPose2D,
+        frameTimestamp: TimeInterval,
+        nearestNodeId: Int?,
+        alignmentVersion: Int,
         expectedTrackingSessionId: String
     ) {
         localizationTransactionLock.lock()
@@ -1057,9 +1063,12 @@ final class SupermarketScanSession {
         let now = Date()
         let event = ManualLocalizationEvent(
             format: "MarketScannerManualLocalizationEvent",
-            version: 1,
+            version: 2,  // 版本升级，新增时间基准字段
             timestamp: formatter.string(from: now),
             timestampUnix: now.timeIntervalSince1970,
+            frameTimestamp: frameTimestamp,
+            nearestNodeId: nearestNodeId,
+            alignmentVersion: alignmentVersion,
             trackingSessionId: expectedTrackingSessionId,
             reason: reason,
             arkitPose: arkitPose,
