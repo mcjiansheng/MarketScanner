@@ -502,8 +502,9 @@ class LocalizedPipelineTests(unittest.TestCase):
                 name,
             )
         self.assertEqual(first["rejected_constraint_count"], 1)
-        self.assertFalse(first["automatic_publish_allowed"])
+        self.assertTrue(first["allow_draft"])
         self.assertEqual(first["weak_lost_duration_seconds"], 5.0)
+        # source_database_immutable is in source_manifest, not report
         self.assertTrue(
             json.loads((first_output / "source_manifest.json").read_text())[
                 "source_database_immutable"

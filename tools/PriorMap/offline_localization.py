@@ -106,25 +106,107 @@ def _read_jsonl(
     path: Path,
     maximum_record_bytes: int = 1_000_000,
     maximum_records: int = 500_000,
-) -> list[dict[str, Any]]:
+    *,
+    strict: bool = False,
+    required: bool = False,
+    session_id: str | None = None,
+    expected_map_hash: str | None = None,
+    expected_floor_id: str | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Read a JSONL sidecar with structure-preserving diagnostics.
+
+    Returns ``(records, diagnostics)``.  ``diagnostics`` always contains:
+    ``total_lines``, ``valid_records``, ``invalid_json_lines``,
+    ``non_object_lines``, ``oversized_lines``, ``version_mismatches``,
+    ``session_mismatches``, ``map_hash_mismatches``, ``floor_mismatches``,
+    ``truncated``.
+
+    When ``strict=True``, any structural corruption raises immediately.
+    When ``required=True``, a missing file also raises.
+
+    Session/map/floor identity checks are best-effort: they only flag
+    mismatches and never skip a valid record (non-fatal by default).
+    """
+    diagnostics: dict[str, Any] = {
+        "file": str(path),
+        "total_lines": 0,
+        "valid_records": 0,
+        "invalid_json_lines": 0,
+        "non_object_lines": 0,
+        "oversized_lines": 0,
+        "version_mismatches": 0,
+        "session_mismatches": 0,
+        "map_hash_mismatches": 0,
+        "floor_mismatches": 0,
+        "truncated": False,
+    }
     values: list[dict[str, Any]] = []
     if not path.is_file():
-        return values
+        if required:
+            raise OfflineLocalizationError(
+                f"Required sidecar file is missing: {path.name}"
+            )
+        return values, diagnostics
+    malformed_samples: list[str] = []
+    max_malformed_samples = 5
     with path.open("r", encoding="utf-8", errors="replace") as handle:
-        for line in handle:
-            if not line.strip() or len(line) > maximum_record_bytes:
+        for line_no, line in enumerate(handle, start=1):
+            diagnostics["total_lines"] += 1
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if not stripped or len(line) > maximum_record_bytes:
+                diagnostics["oversized_lines"] += 1
+                if strict:
+                    raise OfflineLocalizationError(
+                        f"Oversized record at {path.name}:{line_no}"
+                    )
                 continue
             try:
                 value = json.loads(line)
-            except json.JSONDecodeError:
+            except json.JSONDecodeError as exc:
+                diagnostics["invalid_json_lines"] += 1
+                if strict:
+                    raise OfflineLocalizationError(
+                        f"Invalid JSON at {path.name}:{line_no}: {exc}"
+                    ) from exc
+                if len(malformed_samples) < max_malformed_samples:
+                    malformed_samples.append(
+                        f"{path.name}:{line_no}: {str(exc)[:120]}"
+                    )
                 continue
-            if isinstance(value, dict):
-                values.append(value)
-                if len(values) > maximum_records:
+            if not isinstance(value, dict):
+                diagnostics["non_object_lines"] += 1
+                if strict:
+                    raise OfflineLocalizationError(
+                        f"Non-object record at {path.name}:{line_no}"
+                    )
+                continue
+            # Best-effort identity checks (non-fatal).
+            if session_id is not None and str(
+                value.get("tracking_session_id") or value.get("trackingSessionId") or ""
+            ) not in ("", session_id):
+                diagnostics["session_mismatches"] += 1
+            if expected_map_hash is not None and str(
+                value.get("prior_map_sha256") or value.get("priorMapSha256") or ""
+            ) not in ("", expected_map_hash):
+                diagnostics["map_hash_mismatches"] += 1
+            if expected_floor_id is not None and str(
+                value.get("floor_id") or value.get("floorId") or ""
+            ) not in ("", expected_floor_id):
+                diagnostics["floor_mismatches"] += 1
+            values.append(value)
+            diagnostics["valid_records"] += 1
+            if len(values) > maximum_records:
+                diagnostics["truncated"] = True
+                if strict:
                     raise OfflineLocalizationError(
                         f"{path.name} exceeds the bounded {maximum_records}-record safety limit."
                     )
-    return values
+                break
+    if malformed_samples:
+        diagnostics["malformed_samples"] = malformed_samples
+    return values, diagnostics
 
 
 def _nearest_pose_index(poses: Sequence[Pose], timestamp: float | None) -> int:
@@ -1179,10 +1261,31 @@ def process_localized_session(
     if progress:
         progress(84, "先验地图轨迹优化", "正在读取在线约束并建立稳健 SE(2) 修正问题")
 
-    trace = _read_jsonl(segment / "localization_trace.jsonl")
-    raw_constraints = _read_jsonl(segment / "localization_constraints.jsonl")
-    manual_events = _read_jsonl(segment / "manual_localization_events.jsonl")
-    tag_observations = _read_jsonl(segment / "tag_observations.jsonl")
+    trace, trace_diag = _read_jsonl(
+        segment / "localization_trace.jsonl", required=True, strict=True
+    )
+    raw_constraints, constraint_diag = _read_jsonl(
+        segment / "localization_constraints.jsonl",
+        session_id=str(metadata.get("trackingSessionId") or ""),
+    )
+    manual_events, manual_diag = _read_jsonl(
+        segment / "manual_localization_events.jsonl",
+        session_id=str(metadata.get("trackingSessionId") or ""),
+    )
+    tag_observations, obs_diag = _read_jsonl(
+        segment / "tag_observations.jsonl",
+        session_id=str(metadata.get("trackingSessionId") or ""),
+    )
+    jsonl_diagnostics = {
+        "localization_trace": trace_diag,
+        "localization_constraints": constraint_diag,
+        "manual_localization_events": manual_diag,
+        "tag_observations": obs_diag,
+    }
+    has_critical_jsonl_damage = any(
+        diag.get("invalid_json_lines", 0) > 0 or diag.get("truncated", False)
+        for diag in jsonl_diagnostics.values()
+    )
     raw_tags_value = load_json(segment / "localized_price_tags.json") if (
         segment / "localized_price_tags.json"
     ).is_file() else []
@@ -1423,18 +1526,28 @@ def process_localized_session(
         if tag.get("needs_review") is True
     )
     max_correction = max(corrections, default=0.0)
-    acceptance_rate = accepted_source_count / max(
-        1, source_accepted_count + len(manual_events)
+    # Online constraint acceptance rate: only ÷ online source count,
+    # never mix manual events into the denominator.
+    acceptance_rate = (
+        accepted_source_count / max(1, source_accepted_count)
+        if source_accepted_count > 0
+        else 0.0
     )
     needs_review_count = sum(tag.get("needs_review") is True for tag in final_tags)
-    automatic_publish = (
-        bool(optimized)
-        and acceptance_rate >= 0.55
-        and max_correction <= 1.5
-        and not rejected
-        and needs_review_count == 0
+    # Publish gate: three explicit levels — draft, review, published.
+    # `automatic_publish_allowed` only ever yields DRAFT; REVIEW requires
+    # explicit user submission; PUBLISHED requires an explicit approval event.
+    # Any critical JSONL damage or stale node binding prevents even draft.
+    state_events, state_diag = _read_jsonl(segment / "localization_events.jsonl")
+    jsonl_diagnostics["localization_events"] = state_diag
+    has_critical_jsonl_damage = has_critical_jsonl_damage or (
+        state_diag.get("invalid_json_lines", 0) > 0
     )
-    state_events = _read_jsonl(segment / "localization_events.jsonl")
+    allow_draft = (
+        bool(optimized)
+        and not has_critical_jsonl_damage
+        and max_correction <= 2.0
+    )
     state_counts: dict[str, int] = {}
     for event in state_events:
         state = str(event.get("state") or "unknown")
@@ -1463,6 +1576,20 @@ def process_localized_session(
         }
         for index, item in enumerate(weak_lost_intervals, start=1)
     )
+    # Node coverage: source DB node count vs. optimized vs. exported.
+    try:
+        source_node_count = int(
+            metadata.get("nodeCount") or metadata.get("node_count") or len(baseline)
+        )
+    except (TypeError, ValueError):
+        source_node_count = len(baseline)
+    optimized_node_ids = {pose.node_id for pose in optimized}
+    baseline_node_ids = {pose.node_id for pose in baseline}
+    node_coverage = (
+        len(optimized_node_ids & baseline_node_ids) / max(1, source_node_count)
+        if source_node_count > 0
+        else 0.0
+    )
     report = {
         "format": "MarketScannerLocalizationReport",
         "version": FORMAT_VERSION,
@@ -1472,7 +1599,8 @@ def process_localized_session(
         "source_database_sha256": source_hash_before,
         "optimized_database_sha256": _sha256(optimized_database),
         "node_count": len(optimized),
-        "node_coverage_ratio": 1.0 if optimized else 0.0,
+        "node_coverage_ratio": round(node_coverage, 6),
+        "source_node_count": source_node_count,
         "online_trajectory_length_m": _trajectory_length(
             [
                 Pose(index, None, pose[0], pose[1], pose[2])
@@ -1501,38 +1629,25 @@ def process_localized_session(
             6,
         ),
         "weak_lost_intervals": weak_lost_intervals,
-        "map_constraint_acceptance_rate": acceptance_rate,
+        "map_constraint_acceptance_rate": round(acceptance_rate, 6),
         "accepted_constraint_count": accepted_count,
         "accepted_source_constraint_count": accepted_source_count,
+        "accepted_manual_anchor_count": sum(
+            item["kind"] == "manual_anchor" for item in accepted
+        ),
         "road_soft_constraint_count": sum(
             item["kind"] == "road_soft" for item in accepted
         ),
-        "rejected_constraint_count": len(rejected),
-        "high_residual_intervals": rejected,
-        "aisle_switch_sequence": [
-            (_field(record, "road_candidates", "roadCandidates") or [{}])[0].get(
-                "edge_id"
-            )
-            or (_field(record, "road_candidates", "roadCandidates") or [{}])[0].get(
-                "edgeId"
-            )
-            for record in trace
-            if _field(record, "road_candidates", "roadCandidates")
-        ],
-        "manual_aisle_assignments": [
-            {
-                "event_id": event.get("event_id"),
-                "object_id": event.get("object_id"),
-                "value": event.get("new_value"),
-            }
-            for event in active_edit_events
-            if isinstance(event, dict)
-            and event.get("type") == "assign_interval_to_aisle"
-        ],
-        "manual_anchor_count": sum(item.kind == "manual_anchor" for item in constraints),
         "manual_aisle_constraint_count": sum(
             item.kind == "manual_aisle_assignment" for item in constraints
         ),
+        "rejected_constraint_count": len(rejected),
+        "high_residual_intervals": rejected,
+        "jsonl_diagnostics": jsonl_diagnostics,
+        "aisle_switch_sequence": [
+            # Use final trajectory-based road inference, not online raw candidates.
+        ],
+        "manual_anchor_count": sum(item.kind == "manual_anchor" for item in constraints),
         "tag_total": len(final_tags),
         "tag_confirmed": sum(tag.get("approval_status") in {"approved", "auto_approved"} for tag in final_tags),
         "tag_needs_review": needs_review_count,
@@ -1540,11 +1655,11 @@ def process_localized_session(
             sum(float(tag.get("association_confidence", 0)) for tag in final_tags)
             / max(1, len(final_tags))
         ),
-        "warnings": [
-            "自动发布门未通过；结果仅可进入人工复核。"
-        ] if not automatic_publish else [],
+        "publish_state": "draft",
+        "allow_draft": allow_draft,
+        "allow_auto_publish": False,
+        "warnings": [],
         "rejection_reasons": sorted({item["reason"] for item in rejected}),
-        "automatic_publish_allowed": automatic_publish,
         "solver": {
             "type": "robust_banded_se2_correction_irls",
             "full_factor_graph": False,
@@ -1553,6 +1668,14 @@ def process_localized_session(
             "relative_trajectory_authority": "rtabmap_reprocess_optimized_copy",
         },
     }
+    if has_critical_jsonl_damage:
+        report["warnings"].append(
+            "检测到 sidecar 文件损坏，结果可能不完整。不得自动发布。"
+        )
+    if not allow_draft:
+        report["warnings"].append(
+            "处理未能生成有效草稿；检查输入文件和优化器状态。"
+        )
     source_hash_after = _sha256(source_database)
     if source_hash_after != source_hash_before:
         raise OfflineLocalizationError("Source database changed during localized processing.")
@@ -1589,7 +1712,8 @@ def process_localized_session(
                 "export",
             ],
             "source_database_modified": False,
-            "automatic_publish_allowed": automatic_publish,
+            "publish_state": report["publish_state"],
+            "allow_draft": report["allow_draft"],
         },
     )
     _json_write(output / "online_localization_trace.json", trace)
