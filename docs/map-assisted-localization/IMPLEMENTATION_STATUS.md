@@ -1,6 +1,6 @@
 # 地图辅助定位实现状态
 
-> 文档状态：**当前有效**。最后核对日期：2026-07-24。
+> 文档状态：**当前有效**。最后核对日期：2026-07-25。
 
 ## 阶段一
 
@@ -41,12 +41,30 @@
 | 阶段二回放与指标 | 已实现 | iOS 同款校正门控/gain/锚点/状态；周期结构、动态干扰、错误初始位姿、tracking 恢复、yaw/通道/跳变和 matcher p50/p95 |
 | 结束并发一致性 | 已实现 | finalization 先失效 generation 并有界 drain；sidecar 写入校验 tracking session 和 finalizing，禁止隐式新会话 |
 
+2026-07-25 综合审查整改：地图包新增全文件清单并由 iOS 做摘要/跨文件校验；货架面语义对正方形/环方向稳定，柜台支持全部边；价签改为密集 ROI 深度证据和快照时效门；拒绝候选不再预热校正门；HUD 增加有界轨迹/价签层并折叠诊断；finalization 不再在主线程等待。
+
+## 阶段三
+
+| 能力 | 状态 | 代码/证据 |
+| --- | --- | --- |
+| RTAB-Map 重处理前置和源库只读 | 已实现 | `run_localized_map` 强制 `rtabmap-reprocess`；前后 SHA‑256 一致 |
+| 先验地图 SE(2) 派生优化 | 已实现 | robust banded correction IRLS、yaw wrap、gauge、Huber、硬门限；明确非通用因子图 |
+| 在线/道路/人工约束与拒绝审计 | 已实现 | 在线结构约束、道路区域/方向低权重软约束、accepted/rejected residual、禁用约束、人工锚点 |
+| 标签离线重算和结构关联 | 已实现 | online/final 差值、稳定面 ID、JSON/CSV/GeoJSON/shelf index |
+| 质量报告和发布门 | 已实现 | `localization_report.json`、`review_items.json`、`automatic_publish_allowed` |
+| 人工编辑重放/撤销/重做 | 已实现 | hash 绑定 `manual_edits.json`、events/cursor、Map Studio API/UI |
+| PC 非专业向导 | 已实现 | 地图+会话选择、一键处理、三轨迹/价签联动画布、状态/货架筛选、问题带入、人工编辑区和 artifact |
+| 确定性 E2E fixture | 已实现 | 源库不变、漂移降低、错误约束拒绝、重现性、编辑分支测试 |
+| 正式现场验收 | 未执行 | 只完成 `FIELD_TEST_PLAN.md`；不能用模拟或构建替代 |
+
+操作流程、弱/丢失定位、人工复核、备份和失败恢复见 `USER_GUIDE.md`。
+
 ## 尚未完成的发布门槛
 
 - 支持 LiDAR 的真实 iPhone 上完成完整开始、弱纹理、行人干扰、扫码、结束落盘和外部复制干跑；
-- 由独立审查者复审阶段一整改和阶段二实现；
+- 由独立审查者复审本轮阶段一/二整改和阶段三实现；
 - 正式超市场景验收；
-- 阶段三 PC 轨迹/价签地图人工编辑与导出 UI。
+- 地图直接拖拽锚点等可用性增强（问题带入和核心 ID/JSON 编辑已可用）。
 
 自动测试和模拟回放不替代以上现场与独立审查。
 

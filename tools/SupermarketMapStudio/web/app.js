@@ -21,6 +21,7 @@ let sessionRestoreTimer = null;
 let sessionSelectionToken = 0;
 let currentSingleScanMode = null;
 let currentSingleOfflineSupported = null;
+const localizedReview = { data: null, selectedTagId: null };
 
 const viewer2d = {
   images: { "2d-map": null, "2d-shelf": null },
@@ -168,6 +169,7 @@ function setOutputDefault(outputId, session, prefix) {
 
 function applySessionOutputDefault(inputId, session) {
   if (inputId === "single-session") setOutputDefault("single-output", session, "MapStudio-Single");
+  if (inputId === "localized-session") setOutputDefault("localized-output", session, "MapStudio-Localized");
 }
 
 async function selectSingleSession(session) {
@@ -573,6 +575,16 @@ function activeRequest() {
       options: mapOptions(),
     };
   }
+  if (activeMode === "localized") {
+    return {
+      kind: "localized",
+      prior_map: $("#localized-prior-map").value.trim(),
+      session: $("#localized-session").value.trim(),
+      manual_edits: $("#localized-edits").value.trim(),
+      output: $("#localized-output").value.trim(),
+      options: { ...mapOptions(), offline_optimize: true },
+    };
+  }
   return {
     kind: "multi",
     devices: deviceRows(),
@@ -586,7 +598,9 @@ function activeRequestKey(payload) {
   const comparable = JSON.parse(JSON.stringify(payload));
   const outputId = payload.kind === "multi"
     ? "multi-output"
-    : (payload.kind === "prior_map" ? "prior-output" : "single-output");
+    : (payload.kind === "prior_map"
+      ? "prior-output"
+      : (payload.kind === "localized" ? "localized-output" : "single-output"));
   if ($("#" + outputId).dataset.autoOutput === "true") delete comparable.output;
   return JSON.stringify(comparable);
 }
@@ -651,7 +665,9 @@ async function pollJob() {
     $("#open-output").disabled = false;
     const warningCount = (job.quality_report?.warnings || []).length
       + (job.quality_report?.multi_device_summary?.alignment_warnings || []).length;
-    const completionLabel = job.kind === "prior_map" ? "先验地图导入完成" : "地图生成完成";
+    const completionLabel = job.kind === "prior_map"
+      ? "先验地图导入完成"
+      : (job.kind === "localized" ? "先验地图会话优化完成" : "地图生成完成");
     setStatus(warningCount ? `${completionLabel}（${warningCount} 条警告）` : completionLabel, "complete");
     await renderJob(job);
   } catch (error) {
@@ -671,6 +687,7 @@ async function renderJob(job) {
     ["map", "merge"].includes(job.kind),
   );
   $("#merge-toggle").hidden = !manualMerge.available;
+  $("#localized-review-editor").hidden = job.kind !== "localized";
   const shelfLoadToken = ++shelfTuning.loadToken;
   clearShelfTuning(Boolean(job.artifacts?.["shelf_outline_evidence.json"]));
   renderJobProgress(job);
@@ -697,7 +714,7 @@ async function renderJob(job) {
     appendText(inspection, "div", `地图 ID：${manifest.prior_map_id || "未知"}`, "complete");
     appendText(inspection, "div", `源文件 SHA-256：${manifest.source_sha256 || "缺失"}`);
     appendText(inspection, "div", `楼层：${floors}；货架 ${stats.MapShelf || 0}，柜台 ${stats.MapTable || 0}，柱子 ${stats.MapPillar || 0}，道路 ${stats.MapCross || 0}`);
-    appendText(inspection, "div", "阶段一定位：初始位置投影 + 道路软约束；尚未启用 LiDAR 自动地图匹配。", "warning");
+    appendText(inspection, "div", "阶段二实验能力：已启用有界 LiDAR 结构匹配；正式真机场测和大范围自动恢复尚未完成。", "warning");
     return;
   }
   viewer2d.images["2d-map"] = null;
@@ -735,6 +752,241 @@ async function renderJob(job) {
     ? `  |  闭合货架轮廓 ${Number(shelf.closed_contour_count || shelf.region_count || shelf.component_count || 0).toLocaleString()} 个 / ${Number(shelf.area_m2 || 0).toFixed(1)} m² 占地 / 拆分 ${Number(shelf.bridge_split_count || 0).toLocaleString()} 处粘连`
     : "";
   previewMeta.textContent = summary ? `${summary.width} x ${summary.height} 栅格  |  ${summary.resolution_m} m  |  ${Number(summary.area_m2).toFixed(2)} m2${shelfText}${cloudText}` : job.output_dir;
+  if (job.kind === "localized" && job.artifacts?.["localization_report.json"]) {
+    const report = await request(job.artifacts["localization_report.json"]);
+    const inspection = $("#inspection");
+    clearNode(inspection);
+    appendText(
+      inspection,
+      "div",
+      report.automatic_publish_allowed
+        ? "质量门禁：允许自动发布"
+        : "质量门禁：需要人工复核",
+      report.automatic_publish_allowed ? "complete" : "warning",
+    );
+    appendText(inspection, "div", `轨迹节点 ${report.node_count || 0} · 地图约束接受率 ${Math.round(Number(report.map_constraint_acceptance_rate || 0) * 100)}% · 最大修正 ${Number(report.maximum_correction_m || 0).toFixed(2)} m`);
+    appendText(inspection, "div", `价签 ${report.tag_total || 0} · 已确认 ${report.tag_confirmed || 0} · 待复核 ${report.tag_needs_review || 0}`);
+    appendText(inspection, "div", "人工锚点、禁用约束和价签修改保存在 manual_edits.json；重新处理会校验地图/会话 hash 后重放。");
+    await loadLocalizedReview(job.artifacts?.["localized_review.json"]);
+  }
+}
+
+function localizedTagPosition(tag) {
+  const position = tag.final_map_position || tag.online_map_position || tag.snapped_map_position;
+  if (!position) return null;
+  const x = Number(position.x_m);
+  const y = Number(position.y_m);
+  return Number.isFinite(x) && Number.isFinite(y) ? [x, y] : null;
+}
+
+function localizedReviewBounds(data) {
+  let minX = Infinity;
+  let minY = Infinity;
+  let maxX = -Infinity;
+  let maxY = -Infinity;
+  const include = (point) => {
+    const x = Number(point?.[0]);
+    const y = Number(point?.[1]);
+    if (!Number.isFinite(x) || !Number.isFinite(y)) return;
+    minX = Math.min(minX, x);
+    minY = Math.min(minY, y);
+    maxX = Math.max(maxX, x);
+    maxY = Math.max(maxY, y);
+  };
+  (data.elements || []).forEach((element) => {
+    (element.geometry?.coordinates || []).forEach(include);
+  });
+  (data.trajectory?.features || []).forEach((feature) => {
+    (feature.geometry?.coordinates || []).forEach(include);
+  });
+  (data.tags || []).forEach((tag) => {
+    const point = localizedTagPosition(tag);
+    if (point) include(point);
+  });
+  return Number.isFinite(minX) ? [minX, minY, maxX, maxY] : [-1, -1, 1, 1];
+}
+
+function drawLocalizedReview() {
+  const canvas = $("#localized-review-canvas");
+  const data = localizedReview.data;
+  if (!canvas || !data) return;
+  const ratio = window.devicePixelRatio || 1;
+  const width = Math.max(1, Math.floor(canvas.clientWidth * ratio));
+  const height = Math.max(1, Math.floor(canvas.clientHeight * ratio));
+  canvas.width = width;
+  canvas.height = height;
+  const context = canvas.getContext("2d");
+  context.fillStyle = cssColor("--canvas-bg", "#ecf0f2");
+  context.fillRect(0, 0, width, height);
+  const [minX, minY, maxX, maxY] = localizedReviewBounds(data);
+  const padding = 18 * ratio;
+  const scale = Math.min(
+    (width - padding * 2) / Math.max(1.0e-6, maxX - minX),
+    (height - padding * 2) / Math.max(1.0e-6, maxY - minY),
+  );
+  const project = (point) => [
+    padding + (Number(point[0]) - minX) * scale,
+    height - padding - (Number(point[1]) - minY) * scale,
+  ];
+  context.lineJoin = "round";
+  (data.elements || []).forEach((element) => {
+    const points = element.geometry?.coordinates || [];
+    if (points.length < 2) return;
+    context.beginPath();
+    points.forEach((point, index) => {
+      const projected = project(point);
+      if (index) context.lineTo(projected[0], projected[1]);
+      else context.moveTo(projected[0], projected[1]);
+    });
+    if (element.geometry?.type === "Polygon") context.closePath();
+    context.strokeStyle = cssColor("--structure", "#343b40");
+    context.globalAlpha = 0.55;
+    context.lineWidth = Math.max(1, ratio);
+    context.stroke();
+  });
+  context.globalAlpha = 1;
+  const colors = {
+    online_localization: "#d88921",
+    rtabmap_optimized: "#3988d1",
+    prior_map_offline_optimized: "#18a06b",
+  };
+  (data.trajectory?.features || []).forEach((feature) => {
+    const points = feature.geometry?.coordinates || [];
+    context.beginPath();
+    points.forEach((point, index) => {
+      const projected = project(point);
+      if (index) context.lineTo(projected[0], projected[1]);
+      else context.moveTo(projected[0], projected[1]);
+    });
+    context.strokeStyle = colors[feature.properties?.layer] || "#888";
+    context.lineWidth = 2.2 * ratio;
+    context.stroke();
+  });
+  (data.tags || []).forEach((tag) => {
+    const point = localizedTagPosition(tag);
+    if (!point) return;
+    const projected = project(point);
+    const selected = String(tag.tag_id) === localizedReview.selectedTagId;
+    context.beginPath();
+    context.arc(projected[0], projected[1], (selected ? 6 : 4) * ratio, 0, Math.PI * 2);
+    context.fillStyle = tag.needs_review ? "#d88921" : "#18a06b";
+    context.fill();
+    if (selected) {
+      context.strokeStyle = "#ffffff";
+      context.lineWidth = 2 * ratio;
+      context.stroke();
+    }
+  });
+}
+
+function renderLocalizedReviewList() {
+  const target = $("#localized-review-list");
+  const data = localizedReview.data;
+  clearNode(target);
+  if (!data) {
+    target.textContent = "该结果没有联动复核数据";
+    return;
+  }
+  const status = $("#localized-tag-filter").value;
+  const shelf = $("#localized-shelf-filter").value.trim().toLowerCase();
+  const tags = (data.tags || []).filter((tag) => {
+    if (status === "review" && tag.needs_review !== true) return false;
+    if (status === "approved" && !["approved", "auto_approved"].includes(tag.approval_status)) return false;
+    return !shelf || String(tag.shelf_code || "").toLowerCase().includes(shelf);
+  });
+  tags.forEach((tag) => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = `localized-review-item${tag.needs_review ? " warning" : ""}`;
+    if (String(tag.tag_id) === localizedReview.selectedTagId) button.classList.add("is-selected");
+    button.textContent = `${tag.payload || tag.tag_id} · ${tag.shelf_code || "未关联"} ${tag.shelf_side || ""} · ${tag.needs_review ? "待复核" : "已确认"}`;
+    button.addEventListener("click", () => {
+      localizedReview.selectedTagId = String(tag.tag_id);
+      $("#localized-edit-object").value = String(tag.tag_id);
+      $("#localized-edit-type").value = tag.needs_review ? "edit_tag" : "approve_tag";
+      renderLocalizedReviewList();
+      drawLocalizedReview();
+    });
+    target.appendChild(button);
+  });
+  (data.review_items || []).slice(0, 100).forEach((item) => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "localized-review-item warning";
+    button.textContent = item.message || item.id;
+    button.addEventListener("click", () => {
+      const objectId = item.object_id || item.details?.constraint_id || item.id || "";
+      $("#localized-edit-object").value = String(objectId);
+      $("#localized-edit-type").value = item.type === "rejected_constraint"
+        ? "disable_constraint"
+        : "set_anchor";
+    });
+    target.appendChild(button);
+  });
+  if (!target.children.length) target.textContent = "当前筛选条件下没有价签或问题";
+}
+
+async function loadLocalizedReview(url) {
+  localizedReview.data = url ? await request(url) : null;
+  localizedReview.selectedTagId = null;
+  renderLocalizedReviewList();
+  drawLocalizedReview();
+}
+
+function updateLocalizedEditHelp() {
+  const type = $("#localized-edit-type").value;
+  const examples = {
+    set_anchor: ["轨迹锚点", '{"timestamp":12.4,"x_m":3.2,"y_m":-5.1,"yaw_rad":0}'],
+    disable_constraint: ["输入问题列表中的 constraint ID", "true"],
+    assign_interval_to_aisle: ["可填写区间备注 ID", '{"aisle_id":"C1","start_timestamp":12.0,"end_timestamp":30.0}'],
+    edit_tag: ["输入 tag ID", '{"shelf_code":"S12","shelf_side":"A","distance_from_shelf_start_cm":125,"height_cm":120}'],
+    approve_tag: ["输入 tag ID", ""],
+    batch_approve_tags: ["可留空", '["tag-1","tag-2"]'],
+  };
+  const [objectHelp, valueExample] = examples[type];
+  $("#localized-edit-object").placeholder = objectHelp;
+  $("#localized-edit-value").placeholder = valueExample || "该操作不需要新值";
+  $("#localized-edit-help").textContent = `当前操作：${objectHelp}${valueExample ? `；新值示例 ${valueExample}` : "；无需填写新值"}`;
+}
+
+async function applyLocalizedEdit(action) {
+  if (!completedJobId) {
+    setStatus("请先完成一次先验地图会话优化", "failed");
+    return;
+  }
+  const status = $("#localized-edit-status");
+  try {
+    setBusy(true);
+    status.textContent = action === "undo" ? "正在撤销并重放…" : (action === "redo" ? "正在重做并重放…" : "正在应用并重放…");
+    const payload = { action };
+    if (action === "append") {
+      let newValue = null;
+      const text = $("#localized-edit-value").value.trim();
+      if (text) {
+        try { newValue = JSON.parse(text); }
+        catch (_error) { throw new Error("新值必须是有效 JSON"); }
+      }
+      payload.event = {
+        type: $("#localized-edit-type").value,
+        object_id: $("#localized-edit-object").value.trim(),
+        old_value: null,
+        new_value: newValue,
+      };
+    }
+    const result = await request(`/api/jobs/${completedJobId}/localized/edit`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    status.textContent = `已重放 ${result.cursor}/${result.event_count} 条人工编辑`;
+    await renderJob(result.job);
+    setStatus("人工编辑已应用，派生结果已重新计算", "complete");
+  } catch (error) {
+    status.textContent = error.message;
+    setStatus(error.message, "failed");
+  } finally {
+    setBusy(false);
+  }
 }
 
 function renderReview(report, review) {
@@ -2668,6 +2920,15 @@ function bindEvents() {
   $("#run-single").addEventListener("click", runActiveJob);
   $("#run-multi").addEventListener("click", runActiveJob);
   $("#run-prior").addEventListener("click", runActiveJob);
+  $("#run-localized").addEventListener("click", runActiveJob);
+  $("#localized-apply-edit").addEventListener("click", () => applyLocalizedEdit("append"));
+  $("#localized-undo").addEventListener("click", () => applyLocalizedEdit("undo"));
+  $("#localized-redo").addEventListener("click", () => applyLocalizedEdit("redo"));
+  $("#localized-edit-type").addEventListener("change", updateLocalizedEditHelp);
+  $("#localized-tag-filter").addEventListener("change", renderLocalizedReviewList);
+  $("#localized-shelf-filter").addEventListener("input", renderLocalizedReviewList);
+  window.addEventListener("resize", drawLocalizedReview);
+  updateLocalizedEditHelp();
   $("#add-device").addEventListener("click", addDevice);
   $("#add-stage").addEventListener("click", addStage);
   $("#option-offline-optimize").addEventListener("change", updateSingleAlignmentState);
@@ -2705,7 +2966,7 @@ function bindEvents() {
     window.clearTimeout(sessionRestoreTimer);
     sessionRestoreTimer = window.setTimeout(() => selectSingleSession($("#single-session").value.trim()), 500);
   });
-  ["single-output", "multi-output", "prior-output"].forEach((id) => {
+  ["single-output", "multi-output", "prior-output", "localized-output"].forEach((id) => {
     $("#" + id).addEventListener("input", () => {
       $("#" + id).dataset.autoOutput = "false";
       $("#" + id).dataset.restored = "false";

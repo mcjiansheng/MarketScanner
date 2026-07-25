@@ -740,6 +740,12 @@ final class SupermarketScanSession {
         return localizedPriceTags.count
     }
 
+    func localizedPriceTagSnapshot() -> [LocalizedPriceTag] {
+        captureLock.lock()
+        defer { captureLock.unlock() }
+        return localizedPriceTags
+    }
+
     func boundarySnapshot() -> ScanBoundarySnapshot {
         captureLock.lock()
         defer { captureLock.unlock() }

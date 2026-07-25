@@ -2362,7 +2362,7 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         无需已有地图，继续使用当前连续扫描流程。
 
         已有地图辅助扫描
-        在已有货架图上显示位置，并使用道路做保守辅助；阶段一尚未启用 LiDAR 自动匹配。
+        在已有货架图上显示位置，并实验性使用有界 LiDAR 结构匹配；真实超市验收尚未完成。
         """
         let alert = UIAlertController(
             title: localized("新建扫描"),
@@ -2423,7 +2423,7 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         do {
             let package = try PriorMapPackage.load(directory: directory)
             guard package.manifest.priorMapId == configuration.priorMapId,
-                  package.manifest.sourceSha256 == configuration.priorMapSha256,
+                  package.packageSha256 == configuration.priorMapSha256,
                   package.manifest.floors.contains(where: { $0.id == floorId }) else {
                 throw NSError(
                     domain: "PriorMap",
@@ -2619,6 +2619,11 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
 
     private func presentPriceTagConfirmation(_ tag: LocalizedPriceTag)
     {
+        let pendingPoint = tag.snappedMapPosition ?? tag.rawMapPosition
+        priorMapOverlay?.updateTagLayers(
+            confirmed: supermarketSession?.localizedPriceTagSnapshot()
+                .compactMap { $0.snappedMapPosition ?? $0.rawMapPosition } ?? [],
+            pending: pendingPoint.map { [$0] } ?? [])
         let shelf = tag.shelfCode ?? "未关联"
         let side = tag.shelfSide ?? "未知"
         let offset = tag.distanceFromShelfStartCm.map {
@@ -2643,7 +2648,13 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
             preferredStyle: .alert)
         alert.addAction(UIAlertAction(
             title: localized("取消，仅保留观测"),
-            style: .cancel))
+            style: .cancel,
+            handler: { _ in
+                self.priorMapOverlay?.updateTagLayers(
+                    confirmed: self.supermarketSession?.localizedPriceTagSnapshot()
+                        .compactMap { $0.snappedMapPosition ?? $0.rawMapPosition } ?? [],
+                    pending: [])
+            }))
         alert.addAction(UIAlertAction(
             title: localized("确认并保存"),
             style: .default,
@@ -2663,6 +2674,10 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                         "observation_id": confirmed.observationId,
                         "needs_review": confirmed.needsReview ? "true" : "false",
                     ])
+                self.priorMapOverlay?.updateTagLayers(
+                    confirmed: self.supermarketSession?.localizedPriceTagSnapshot()
+                        .compactMap { $0.snappedMapPosition ?? $0.rawMapPosition } ?? [],
+                    pending: [])
                 self.showToast(
                     message: self.localized("The localized price tag was saved."),
                     seconds: 3)
@@ -3550,7 +3565,12 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         priorMapQueue.async {
             priorMapDrain.signal()
         }
-        let priorMapDrained = priorMapDrain.wait(timeout: .now() + 2.0) == .success
+        let continueFinalization: (Bool) -> Void = { [weak self] priorMapDrained in
+        guard let self else {
+            scanSession.isFinalizingScan = false
+            completion?(false)
+            return
+        }
         scanSession.appendScanEvent(
             event: "scan_finalization_started",
             message: "Finalizing the continuous streaming database",
@@ -3763,6 +3783,17 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                 }
             }
         })
+        }
+        // The serial-queue barrier may legitimately take up to two seconds,
+        // but finalization is a UI action. Wait off the main thread, then
+        // continue the state machine on main without freezing camera controls.
+        DispatchQueue.global(qos: .userInitiated).async {
+            let priorMapDrained =
+                priorMapDrain.wait(timeout: .now() + 2.0) == .success
+            DispatchQueue.main.async {
+                continueFinalization(priorMapDrained)
+            }
+        }
     }
 
     private func copyCaptureInBackground(scanSession: SupermarketScanSession,

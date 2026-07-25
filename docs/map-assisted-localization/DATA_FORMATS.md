@@ -1,6 +1,6 @@
 # 已有地图辅助扫描数据格式
 
-> 文档状态：**当前有效（版本 1）**。最后核对日期：2026-07-24。
+> 文档状态：**当前有效（版本 1）**。最后核对日期：2026-07-25。
 
 ## 会话元数据
 
@@ -21,7 +21,7 @@
 ```json
 {
   "priorMapId": "mapcase01-0cf6949652d4",
-  "priorMapSha256": "<64 hex>",
+  "priorMapSha256": "<package_manifest.package_sha256, 64 hex>",
   "floorId": "1",
   "initialMapPose": {
     "x_m": 12.3,
@@ -75,7 +75,7 @@
 
 - `localization_constraints.jsonl`：每个匹配周期的预测/估计、Top‑3、残差、唯一性、有效点数、角覆盖、耗时、接受标记和原因。
 - `localization_events.jsonl`：状态发生变化时记录 previous/state/confidence/reason。
-- `tag_observations.jsonl`：每次成功 Vision 识别的原始观测，即使用户取消最终保存也保留；包含条码、归一化框、捕获帧时间、`alignment_snapshot_timestamp`、真实 `pose_timestamp_delta_ms`、`alignment_version`、原始地图点、测量方式、三维/定位置信度、地图身份、楼层和 `needs_review`。地图点必须使用提交 Vision 时冻结的对齐快照计算。
+- `tag_observations.jsonl`：每次成功 Vision 识别的原始观测，即使用户取消最终保存也保留；除条码、框和地图点外，记录 `alignment_age_ms/alignment_version_lag/alignment_freshness`，以及 `depth_sample_count/depth_inlier_count/depth_inlier_ratio/depth_median_m/depth_mad_m/plane_residual_m/surface_normal_camera`。地图点必须使用提交 Vision 时冻结且通过时效门的对齐快照计算。
 - `localized_price_tags.json`：用户确认后的数组；包含 shelf code、row flag、cross code、货架侧面、沿货架起点距离、相对地面高度、raw/snapped 位置、定位/测量/关联三项置信度、测量方式、`needs_review` 和 `user_confirmed`。
 
 JSONL 文件逐行独立编码和同步追加；最终价签数组用原子替换写入。写入前必须确认 tracking session ID 与活动会话一致且未进入 finalization，不允许日志接口自动创建新会话目录。价签 sidecar 与旧 `price_tags.json/.csv` 分开，后者继续只是暂停 NFC 功能的兼容空文件。
@@ -95,3 +95,24 @@ JSONL 文件逐行独立编码和同步追加；最终价签数组用原子替�
 ## 原始数据
 
 上述 sidecar 不写入 SQLite，不作为外部 pose prior 注入 RTAB-Map。自动地图修正只改变先验地图 HUD 的 ARKit→地图对齐，不改写 ARKit、Node pose 或原始数据库。PC 离线处理继续复制数据库并在新输出目录优化。来源 hash 和参数分别保存在 prior-map manifest、会话 metadata 和现有 PC source manifest。
+
+## 阶段三输出
+
+`MapStudio-Localized-*` 在既有 2D/3D 成果和 `rtabmap_optimized/optimized.db` 之外新增：
+
+```text
+prior_map_manifest.json        source_manifest.json
+processing_manifest.json       online_localization_trace.json
+optimized_map_trajectory.geojson
+localization_constraints.json  localization_report.json
+review_items.json              localized_review.json
+manual_edits.json
+localized_price_tags.json/.csv/.geojson
+shelf_tag_index.json           audit_log.jsonl
+```
+
+`localization_report.json` 包含地图/会话/数据库 hash、节点覆盖、在线/RTAB‑Map/离线轨迹长度、修正分布与最大值、weak/lost 次数/持续时长/区间、约束接受/拒绝、通道序列、人工锚点、价签确认/复核统计、关联置信度、warning/reason 和 `automatic_publish_allowed`。
+
+`localized_review.json` 是 Map Studio 的有界联动复核视图数据，包含先验结构、三条轨迹、价签、问题列表和明确的 `view_limits`/截断标记；它是派生展示文件，不替代各权威成果文件。
+
+`manual_edits.json` version 1 绑定 `prior_map_sha256` 与 `source_session_sha256`，使用 `events + cursor` 保存 `event_id/timestamp/type/object_id/old_value/new_value`。支持锚点、禁用约束、区间指定通道、价签修改/批准和批量批准；撤销只移动 cursor，撤销后新增事件会丢弃 redo 分支。hash 不匹配时拒绝重放。

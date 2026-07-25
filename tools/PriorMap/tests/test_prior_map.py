@@ -25,7 +25,7 @@ from tools.PriorMap.replay_stage2 import (
 )
 from tools.PriorMap.spatial_index import PriorMapSpatialIndex
 from tools.PriorMap.stage1_localizer import Pose2D, StageOneLocalizer
-from tools.PriorMap.xlsx_to_prior_map import convert_workbook
+from tools.PriorMap.xlsx_to_prior_map import _polyline_abscissa, convert_workbook
 
 
 def write_workbook(path: Path, rows: list[tuple[str, str]]) -> None:
@@ -216,6 +216,7 @@ class IOSCoreContractTests(unittest.TestCase):
             repository / "app/ios/RTABMapApp/PriorMapLocalizationCore.swift",
             repository / "app/ios/RTABMapApp/PriorMapScanMatcher.swift",
             repository / "app/ios/RTABMapApp/PriceTagLocalizationCore.swift",
+            repository / "app/ios/RTABMapApp/PriorMapPackageIntegrityCore.swift",
         ]
         swift_test = Path(__file__).with_name("swift") / "main.swift"
         with tempfile.TemporaryDirectory() as temporary:
@@ -246,6 +247,66 @@ class IOSCoreContractTests(unittest.TestCase):
             )
             self.assertEqual(run_result.returncode, 0, run_result.stderr)
             self.assertIn("Swift tests passed", run_result.stdout)
+            workbook = Path(temporary) / "integrity.xlsx"
+            write_workbook(workbook, fixture_rows())
+            package = convert_workbook(workbook, Path(temporary) / "package")
+            valid_result = subprocess.run(
+                [str(executable), str(package)],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(valid_result.returncode, 0, valid_result.stderr)
+
+            mutations = {
+                "swapped-shelves": lambda root: (
+                    (root / "shelves.json").write_bytes(
+                        (root / "fixed_structures.json").read_bytes()
+                    )
+                ),
+                "tampered-bounds": lambda root: self._rewrite_integrity_json(
+                    root / "manifest.json",
+                    lambda value: value["bounds"].__setitem__("max_x_m", 999),
+                ),
+                "broken-road-reference": lambda root: self._rewrite_integrity_json(
+                    root / "road_graph.json",
+                    lambda value: value["edges"][0].__setitem__("to", "missing"),
+                ),
+                "mixed-preview": lambda root: (
+                    (root / "preview.png").write_bytes(
+                        next(root.glob("preview_floor_*.png")).read_bytes() + b"mixed"
+                    )
+                ),
+                "mixed-distance-field": lambda root: self._rewrite_integrity_json(
+                    root / "distance_fields.json",
+                    lambda value: value["floors"].pop(next(iter(value["floors"]))),
+                ),
+                "invalid-report": lambda root: self._rewrite_integrity_json(
+                    root / "validation_report.json",
+                    lambda value: value.__setitem__("valid", False),
+                ),
+            }
+            for name, mutate in mutations.items():
+                with self.subTest(swift_integrity=name):
+                    corrupted = Path(temporary) / name
+                    shutil.copytree(package, corrupted)
+                    mutate(corrupted)
+                    invalid_result = subprocess.run(
+                        [str(executable), str(corrupted)],
+                        check=False,
+                        capture_output=True,
+                        text=True,
+                    )
+                    self.assertNotEqual(invalid_result.returncode, 0)
+
+    @staticmethod
+    def _rewrite_integrity_json(path: Path, mutate: object) -> None:
+        value = json.loads(path.read_text(encoding="utf-8"))
+        mutate(value)
+        path.write_text(
+            json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
 
 
 class PriorMapConversionTests(unittest.TestCase):
@@ -257,6 +318,14 @@ class PriorMapConversionTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.temp.cleanup()
+
+    def test_road_node_order_uses_full_l_shaped_polyline_abscissa(self) -> None:
+        road = [(0.0, 0.0), (0.0, 10.0), (10.0, 10.0)]
+        before_corner = _polyline_abscissa((0.0, 9.0), road)
+        after_corner = _polyline_abscissa((1.0, 10.0), road)
+        self.assertAlmostEqual(before_corner, 9.0)
+        self.assertAlmostEqual(after_corner, 11.0)
+        self.assertLess(before_corner, after_corner)
 
     def corrupted_package(self, source: Path, name: str) -> Path:
         destination = self.root / name
@@ -398,6 +467,7 @@ class PriorMapConversionTests(unittest.TestCase):
         first = convert_workbook(self.workbook, self.root / "first")
         second = convert_workbook(self.workbook, self.root / "second")
         for name in (
+            "package_manifest.json",
             "manifest.json",
             "elements.json",
             "shelves.json",

@@ -50,6 +50,153 @@ enum PriorMapImageGeometry {
     }
 }
 
+struct PriceTagDepthEvidence: Codable, Equatable {
+    let sampleCount: Int
+    let inlierCount: Int
+    let inlierRatio: Double
+    let medianM: Double?
+    let madM: Double?
+    let planeResidualM: Double?
+    let surfaceNormalCamera: [Double]?
+    let confidence: Double
+    let accepted: Bool
+    let rejectionReason: String?
+
+    static let unavailable = PriceTagDepthEvidence(
+        sampleCount: 0,
+        inlierCount: 0,
+        inlierRatio: 0,
+        medianM: nil,
+        madM: nil,
+        planeResidualM: nil,
+        surfaceNormalCamera: nil,
+        confidence: 0,
+        accepted: false,
+        rejectionReason: "depth_unavailable")
+
+    static func evaluate(_ rawDepths: [Float]) -> PriceTagDepthEvidence {
+        let depths = rawDepths.filter {
+            $0.isFinite && $0 >= 0.2 && $0 <= 8
+        }.sorted()
+        guard depths.count >= 12 else {
+            return PriceTagDepthEvidence(
+                sampleCount: depths.count,
+                inlierCount: 0,
+                inlierRatio: 0,
+                medianM: nil,
+                madM: nil,
+                planeResidualM: nil,
+                surfaceNormalCamera: nil,
+                confidence: 0,
+                accepted: false,
+                rejectionReason: "insufficient_depth_samples")
+        }
+        let globalMedian = depths[depths.count / 2]
+        // Find the nearest coherent surface cluster. It must also contain the
+        // global median; otherwise foreground/background evidence is
+        // ambiguous and the depth result is not trusted.
+        var bestRange: Range<Int>?
+        var end = 0
+        for start in depths.indices {
+            end = max(end, start)
+            while end < depths.count, depths[end] - depths[start] <= 0.10 {
+                end += 1
+            }
+            let candidate = start..<end
+            if candidate.count >= 12
+                && (
+                    bestRange == nil
+                    || depths[candidate.lowerBound] < depths[bestRange!.lowerBound] - 0.02
+                    || (
+                        abs(depths[candidate.lowerBound] - depths[bestRange!.lowerBound]) <= 0.02
+                        && candidate.count > bestRange!.count
+                    )
+                ) {
+                bestRange = candidate
+            }
+        }
+        guard let range = bestRange, !range.isEmpty else {
+            return .unavailable
+        }
+        let cluster = Array(depths[range])
+        let median = cluster[cluster.count / 2]
+        let deviations = cluster.map { abs($0 - median) }.sorted()
+        let mad = deviations[deviations.count / 2]
+        let inlierThreshold = max(0.02, 3 * mad)
+        let inliers = cluster.filter { abs($0 - median) <= inlierThreshold }
+        let ratio = Double(inliers.count) / Double(depths.count)
+        let containsGlobalMedian = globalMedian >= cluster.first!
+            && globalMedian <= cluster.last!
+        let accepted = inliers.count >= 12
+            && ratio >= 0.55
+            && mad <= 0.045
+            && containsGlobalMedian
+        let densityQuality = min(1, Double(inliers.count) / 36)
+        let ratioQuality = min(1, max(0, (ratio - 0.45) / 0.45))
+        let dispersionQuality = min(1, max(0, 1 - Double(mad) / 0.05))
+        let confidence = accepted
+            ? min(0.90, 0.48 + 0.18 * densityQuality
+                    + 0.16 * ratioQuality + 0.08 * dispersionQuality)
+            : min(0.49, 0.20 * densityQuality + 0.20 * ratioQuality)
+        return PriceTagDepthEvidence(
+            sampleCount: depths.count,
+            inlierCount: inliers.count,
+            inlierRatio: ratio,
+            medianM: Double(median),
+            madM: Double(mad),
+            // Without a stable local plane fit we expose dispersion as a
+            // conservative residual and leave the normal explicitly absent.
+            planeResidualM: Double(mad) * 1.4826,
+            surfaceNormalCamera: nil,
+            confidence: confidence,
+            accepted: accepted,
+            rejectionReason: accepted ? nil : (
+                containsGlobalMedian ? "unreliable_depth_surface" : "ambiguous_depth_layers"
+            ))
+    }
+
+    func rejected(_ reason: String) -> PriceTagDepthEvidence {
+        return PriceTagDepthEvidence(
+            sampleCount: sampleCount,
+            inlierCount: inlierCount,
+            inlierRatio: inlierRatio,
+            medianM: medianM,
+            madM: madM,
+            planeResidualM: planeResidualM,
+            surfaceNormalCamera: surfaceNormalCamera,
+            confidence: min(confidence, 0.49),
+            accepted: false,
+            rejectionReason: reason)
+    }
+
+    func withPlane(residualM: Double, normalCamera: SIMD3<Double>?) -> PriceTagDepthEvidence {
+        let validNormal = normalCamera.flatMap { normal -> [Double]? in
+            let length = simd_length(normal)
+            guard length > 1.0e-9 else { return nil }
+            let unit = normal / length
+            return [unit.x, unit.y, unit.z]
+        }
+        let planeAccepted = accepted
+            && residualM.isFinite
+            && residualM <= 0.06
+            && validNormal != nil
+        let planeQuality = min(1, max(0, 1 - residualM / 0.06))
+        return PriceTagDepthEvidence(
+            sampleCount: sampleCount,
+            inlierCount: inlierCount,
+            inlierRatio: inlierRatio,
+            medianM: medianM,
+            madM: madM,
+            planeResidualM: residualM,
+            surfaceNormalCamera: validNormal,
+            confidence: planeAccepted
+                ? min(0.92, confidence * (0.82 + 0.18 * planeQuality))
+                : min(0.49, confidence),
+            accepted: planeAccepted,
+            rejectionReason: planeAccepted ? nil : "unstable_depth_plane")
+    }
+}
+
 struct PriorMapAlignmentSnapshot {
     let arkitOrigin: PriorMapPose2D
     let initialMapPose: PriorMapPose2D
@@ -58,6 +205,38 @@ struct PriorMapAlignmentSnapshot {
     let localizationConfidence: Double
     let alignmentVersion: Int
     let frameTimestamp: TimeInterval
+}
+
+struct PriorMapAlignmentFreshnessResult: Equatable {
+    let label: String
+    let localizationState: String
+    let localizationConfidence: Double
+}
+
+enum PriorMapAlignmentFreshness {
+    static func evaluate(
+        ageMs: Double,
+        versionLag: Int,
+        localizationState: String,
+        localizationConfidence: Double
+    ) -> PriorMapAlignmentFreshnessResult {
+        if ageMs <= 250, versionLag == 0 {
+            return PriorMapAlignmentFreshnessResult(
+                label: "fresh",
+                localizationState: localizationState,
+                localizationConfidence: localizationConfidence)
+        }
+        if ageMs <= 600, versionLag == 0 {
+            return PriorMapAlignmentFreshnessResult(
+                label: "aging",
+                localizationState: "weak",
+                localizationConfidence: min(0.55, localizationConfidence * 0.70))
+        }
+        return PriorMapAlignmentFreshnessResult(
+            label: versionLag > 0 ? "version_stale" : "timestamp_stale",
+            localizationState: "lost",
+            localizationConfidence: min(0.30, localizationConfidence * 0.35))
+    }
 }
 
 final class PriorMapAlignmentSnapshotStore {
@@ -90,6 +269,9 @@ struct PriorMapShelf: Codable {
     let crossCode: String?
     let rowFlag: String?
     let geometry: PriorMapShelfGeometry
+    let shapeType: String?
+    let yawRad: Double?
+    let source: PriorMapShelfSource?
 
     enum CodingKeys: String, CodingKey {
         case id
@@ -98,7 +280,37 @@ struct PriorMapShelf: Codable {
         case crossCode = "cross_code"
         case rowFlag = "row_flag"
         case geometry
+        case shapeType = "shape_type"
+        case yawRad = "yaw_rad"
+        case source
     }
+
+    init(
+        id: String,
+        floorId: String,
+        code: String?,
+        crossCode: String?,
+        rowFlag: String?,
+        geometry: PriorMapShelfGeometry,
+        shapeType: String? = "MapShelf",
+        yawRad: Double? = nil,
+        source: PriorMapShelfSource? = nil
+    ) {
+        self.id = id
+        self.floorId = floorId
+        self.code = code
+        self.crossCode = crossCode
+        self.rowFlag = rowFlag
+        self.geometry = geometry
+        self.shapeType = shapeType
+        self.yawRad = yawRad
+        self.source = source
+    }
+}
+
+struct PriorMapShelfSource: Codable {
+    let width: Double?
+    let height: Double?
 }
 
 struct PriorMapFixedStructure: Codable {
@@ -109,6 +321,8 @@ struct PriorMapFixedStructure: Codable {
     let crossCode: String?
     let rowFlag: String?
     let geometry: PriorMapShelfGeometry
+    let yawRad: Double?
+    let source: PriorMapShelfSource?
 
     enum CodingKeys: String, CodingKey {
         case id
@@ -118,6 +332,30 @@ struct PriorMapFixedStructure: Codable {
         case crossCode = "cross_code"
         case rowFlag = "row_flag"
         case geometry
+        case yawRad = "yaw_rad"
+        case source
+    }
+
+    init(
+        id: String,
+        floorId: String,
+        shapeType: String,
+        code: String?,
+        crossCode: String?,
+        rowFlag: String?,
+        geometry: PriorMapShelfGeometry,
+        yawRad: Double? = nil,
+        source: PriorMapShelfSource? = nil
+    ) {
+        self.id = id
+        self.floorId = floorId
+        self.shapeType = shapeType
+        self.code = code
+        self.crossCode = crossCode
+        self.rowFlag = rowFlag
+        self.geometry = geometry
+        self.yawRad = yawRad
+        self.source = source
     }
 
     var associationSurface: PriorMapShelf? {
@@ -130,7 +368,10 @@ struct PriorMapFixedStructure: Codable {
             code: code,
             crossCode: crossCode,
             rowFlag: rowFlag,
-            geometry: geometry)
+            geometry: geometry,
+            shapeType: shapeType,
+            yawRad: yawRad,
+            source: source)
     }
 }
 
@@ -163,9 +404,19 @@ struct PriorMapTagObservationRecord: Codable {
     let poseTimestampDeltaMs: Double
     let alignmentVersion: Int
     let alignmentSnapshotTimestamp: TimeInterval
+    let alignmentAgeMs: Double
+    let alignmentVersionLag: Int
+    let alignmentFreshness: String
     let rawMapPosition: PriorMapTagPoint3D?
     let measurementMethod: String
     let measurementConfidence: Double
+    let depthSampleCount: Int
+    let depthInlierCount: Int
+    let depthInlierRatio: Double
+    let depthMedianM: Double?
+    let depthMadM: Double?
+    let planeResidualM: Double?
+    let surfaceNormalCamera: [Double]?
     let localizationState: String
     let localizationConfidence: Double
     let priorMapId: String
@@ -186,9 +437,19 @@ struct PriorMapTagObservationRecord: Codable {
         case poseTimestampDeltaMs = "pose_timestamp_delta_ms"
         case alignmentVersion = "alignment_version"
         case alignmentSnapshotTimestamp = "alignment_snapshot_timestamp"
+        case alignmentAgeMs = "alignment_age_ms"
+        case alignmentVersionLag = "alignment_version_lag"
+        case alignmentFreshness = "alignment_freshness"
         case rawMapPosition = "raw_map_position"
         case measurementMethod = "measurement_method"
         case measurementConfidence = "measurement_confidence"
+        case depthSampleCount = "depth_sample_count"
+        case depthInlierCount = "depth_inlier_count"
+        case depthInlierRatio = "depth_inlier_ratio"
+        case depthMedianM = "depth_median_m"
+        case depthMadM = "depth_mad_m"
+        case planeResidualM = "plane_residual_m"
+        case surfaceNormalCamera = "surface_normal_camera"
         case localizationState = "localization_state"
         case localizationConfidence = "localization_confidence"
         case priorMapId = "prior_map_id"
@@ -326,7 +587,7 @@ enum ShelfAssociation {
         return (projected, ratio, simd_length(point - projected))
     }
 
-    private static func longSides(_ shelf: PriorMapShelf) -> [PriorMapShelfEdge] {
+    private static func associationEdges(_ shelf: PriorMapShelf) -> [PriorMapShelfEdge] {
         let coordinates = shelf.geometry.coordinates
         guard coordinates.count >= 3 else { return [] }
         let points = coordinates.compactMap { value -> SIMD2<Double>? in
@@ -334,30 +595,95 @@ enum ShelfAssociation {
             return SIMD2<Double>(value[0], value[1])
         }
         guard points.count >= 3 else { return [] }
-        let edges: [PriorMapShelfEdge] = points.indices.map { index in
+        let rawEdges: [PriorMapShelfEdge] = points.indices.compactMap { index in
             let following = (index + 1) % points.count
-            let start = points[index]
-            let end = points[following]
+            var start = points[index]
+            var end = points[following]
             let length = simd_length(end - start)
+            guard length > 1.0e-9 else { return nil }
+            if start.x > end.x || (start.x == end.x && start.y > end.y) {
+                swap(&start, &end)
+            }
             return PriorMapShelfEdge(
                 side: "",
                 start: start,
                 end: end,
                 length: length,
                 sourceIndex: index)
-        }.sorted {
-            $0.length == $1.length
-                ? $0.sourceIndex < $1.sourceIndex
-                : $0.length > $1.length
         }
-        return edges.prefix(2).enumerated().map {
-            PriorMapShelfEdge(
-                side: $0.offset == 0 ? "A" : "B",
-                start: $0.element.start,
-                end: $0.element.end,
-                length: $0.element.length,
-                sourceIndex: $0.element.sourceIndex)
+        guard !rawEdges.isEmpty else { return [] }
+
+        if shelf.shapeType != "MapShelf" {
+            return rawEdges.sorted {
+                let firstMidpoint = ($0.start + $0.end) * 0.5
+                let secondMidpoint = ($1.start + $1.end) * 0.5
+                if firstMidpoint.x != secondMidpoint.x {
+                    return firstMidpoint.x < secondMidpoint.x
+                }
+                if firstMidpoint.y != secondMidpoint.y {
+                    return firstMidpoint.y < secondMidpoint.y
+                }
+                return $0.length < $1.length
+            }.enumerated().map {
+                PriorMapShelfEdge(
+                    side: String(format: "E%02d", $0.offset + 1),
+                    start: $0.element.start,
+                    end: $0.element.end,
+                    length: $0.element.length,
+                    sourceIndex: $0.element.sourceIndex)
+            }
         }
+
+        // MapShelf business faces are the two edges parallel to the stable
+        // local long axis. Width/yaw are authoritative even for square or
+        // near-square rectangles; principal-axis fallback is deterministic.
+        let center = points.reduce(SIMD2<Double>(repeating: 0), +)
+            / Double(points.count)
+        let axis: SIMD2<Double>
+        if let yaw = shelf.yawRad {
+            let widthIsLong = (shelf.source?.width ?? 0) >= (shelf.source?.height ?? 0)
+            let angle = yaw + (widthIsLong ? 0 : .pi / 2)
+            axis = SIMD2<Double>(cos(angle), sin(angle))
+        }
+        else {
+            let centered = points.map { $0 - center }
+            let xx = centered.reduce(0) { $0 + $1.x * $1.x }
+            let yy = centered.reduce(0) { $0 + $1.y * $1.y }
+            let xy = centered.reduce(0) { $0 + $1.x * $1.y }
+            let anisotropy = hypot(xx - yy, 2 * xy)
+            let angle = anisotropy <= max(1.0e-9, (xx + yy) * 1.0e-6)
+                ? 0
+                : 0.5 * atan2(2 * xy, xx - yy)
+            var value = SIMD2<Double>(cos(angle), sin(angle))
+            if value.x < 0 || (abs(value.x) <= 1.0e-9 && value.y < 0) {
+                value *= -1
+            }
+            axis = value
+        }
+        let aligned = rawEdges
+            .filter {
+                abs(simd_dot(($0.end - $0.start) / $0.length, axis)) >= cos(.pi / 6)
+            }
+            .sorted {
+                abs(simd_dot(($0.end - $0.start) / $0.length, axis))
+                    > abs(simd_dot(($1.end - $1.start) / $1.length, axis))
+            }
+        let selected = Array(aligned.prefix(2))
+        let positiveNormal = SIMD2<Double>(-axis.y, axis.x)
+        return selected.map { edge in
+            var start = edge.start
+            var end = edge.end
+            if simd_dot(end - start, axis) < 0 {
+                swap(&start, &end)
+            }
+            let midpoint = (start + end) * 0.5
+            return PriorMapShelfEdge(
+                side: simd_dot(midpoint - center, positiveNormal) >= 0 ? "A" : "B",
+                start: start,
+                end: end,
+                length: edge.length,
+                sourceIndex: edge.sourceIndex)
+        }.sorted { $0.side < $1.side }
     }
 
     private static func boundaryEdges(
@@ -414,7 +740,7 @@ enum ShelfAssociation {
                 associateable: $0.associationSurface != nil)
         }
         return associationSurfaces.flatMap { shelf in
-            let sides = longSides(shelf)
+            let sides = associationEdges(shelf)
             return sides.compactMap { edge -> ShelfSideCandidate? in
                 let projected = projection(
                     point: tag,

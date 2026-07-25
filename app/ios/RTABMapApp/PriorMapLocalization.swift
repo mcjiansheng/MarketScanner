@@ -146,12 +146,14 @@ struct PriorMapPackage {
     let fixedStructures: [PriorMapFixedStructure]
     let preview: UIImage
     let previewsByFloor: [String: UIImage]
+    let packageSha256: String
 
     func preview(floorId: String) -> UIImage {
         return previewsByFloor[floorId] ?? preview
     }
 
     static func load(directory: URL) throws -> PriorMapPackage {
+        let packageSha256 = try PriorMapPackageIntegrity.validate(directory: directory)
         let decoder = JSONDecoder()
         let requiredJSONFormats = [
             "manifest.json": "MarketScannerPriorMap",
@@ -278,7 +280,8 @@ struct PriorMapPackage {
             shelves: shelvesPayload.shelves,
             fixedStructures: structuresPayload.structures,
             preview: preview,
-            previewsByFloor: previewsByFloor)
+            previewsByFloor: previewsByFloor,
+            packageSha256: packageSha256)
     }
 }
 
@@ -354,7 +357,7 @@ final class PriorMapStageOneLocalizer {
         self.initialMapPose = initialMapPose
         self.latestEstimatedPose = initialMapPose
         self.priorMapId = package.manifest.priorMapId
-        self.priorMapSha256 = package.manifest.sourceSha256
+        self.priorMapSha256 = package.packageSha256
         self.shelves = package.shelves
         self.fixedStructures = package.fixedStructures
         guard let distanceFloor = package.distanceFields.floors[floorId] else {
@@ -473,13 +476,22 @@ final class PriorMapStageOneLocalizer {
                 best.pose.yM - rawPose.yM)
             let yawDelta = abs(PriorMapStageOneMath.normalizeAngle(
                 best.pose.yawRad - rawPose.yawRad))
-            let temporallyTrusted = temporalCorrectionGate.observe(
-                rawPose: rawPose,
-                candidatePose: best.pose)
-            if match?.acceptedByGeometry == true,
-               translation <= 0.35,
-               yawDelta <= 8.0 * .pi / 180.0,
-               temporallyTrusted {
+            let geometryAndSafetyAccepted = match?.acceptedByGeometry == true
+                && translation <= 0.35
+                && yawDelta <= 8.0 * .pi / 180.0
+            let temporallyTrusted: Bool
+            if geometryAndSafetyAccepted {
+                temporallyTrusted = temporalCorrectionGate.observe(
+                    rawPose: rawPose,
+                    candidatePose: best.pose)
+            }
+            else {
+                // Rejected, mismatched and unsafe candidates must never
+                // preheat the two-frame correction cluster.
+                temporalCorrectionGate.reset()
+                temporallyTrusted = false
+            }
+            if geometryAndSafetyAccepted, temporallyTrusted {
                 let gain = 0.35
                 estimatedPose = PriorMapPose2D(
                     xM: rawPose.xM + (best.pose.xM - rawPose.xM) * gain,
@@ -618,6 +630,17 @@ final class PriorMapStageOneLocalizer {
             poseTimestampDeltaMs: abs(
                 detection.frame.timestamp - snapshot.frameTimestamp) * 1000,
             mapPoint: mapPoint)
+        let alignmentAgeMs = abs(
+            detection.frame.timestamp - snapshot.frameTimestamp) * 1000
+        let alignmentVersionLag = max(0, alignmentVersion - snapshot.alignmentVersion)
+        let freshness = PriorMapAlignmentFreshness.evaluate(
+            ageMs: alignmentAgeMs,
+            versionLag: alignmentVersionLag,
+            localizationState: snapshot.localizationState,
+            localizationConfidence: snapshot.localizationConfidence)
+        let alignmentFreshness = freshness.label
+        let effectiveLocalizationState = freshness.localizationState
+        let effectiveLocalizationConfidence = freshness.localizationConfidence
         let localized = ShelfAssociation.localizedTag(
             observationId: detection.observationId,
             payload: detection.payload,
@@ -627,8 +650,8 @@ final class PriorMapStageOneLocalizer {
             cameraPosition: measurement.cameraMapPosition,
             shelves: shelves,
             fixedStructures: fixedStructures,
-            localizationState: snapshot.localizationState,
-            localizationConfidence: snapshot.localizationConfidence,
+            localizationState: effectiveLocalizationState,
+            localizationConfidence: effectiveLocalizationConfidence,
             measurementConfidence: measurement.confidence,
             measurementMethod: measurement.method,
             userConfirmed: false,
@@ -654,11 +677,21 @@ final class PriorMapStageOneLocalizer {
             poseTimestampDeltaMs: measurement.poseTimestampDeltaMs,
             alignmentVersion: snapshot.alignmentVersion,
             alignmentSnapshotTimestamp: snapshot.frameTimestamp,
+            alignmentAgeMs: alignmentAgeMs,
+            alignmentVersionLag: alignmentVersionLag,
+            alignmentFreshness: alignmentFreshness,
             rawMapPosition: measurement.rawMapPosition,
             measurementMethod: measurement.method,
             measurementConfidence: measurement.confidence,
-            localizationState: snapshot.localizationState,
-            localizationConfidence: snapshot.localizationConfidence,
+            depthSampleCount: measurement.depthEvidence.sampleCount,
+            depthInlierCount: measurement.depthEvidence.inlierCount,
+            depthInlierRatio: measurement.depthEvidence.inlierRatio,
+            depthMedianM: measurement.depthEvidence.medianM,
+            depthMadM: measurement.depthEvidence.madM,
+            planeResidualM: measurement.depthEvidence.planeResidualM,
+            surfaceNormalCamera: measurement.depthEvidence.surfaceNormalCamera,
+            localizationState: effectiveLocalizationState,
+            localizationConfidence: effectiveLocalizationConfidence,
             priorMapId: priorMapId,
             priorMapSha256: priorMapSha256,
             floorId: floorId,
@@ -1145,7 +1178,7 @@ final class PriorMapWizardViewController: UIViewController, UIDocumentPickerDele
             workflowMode: .priorMapLocalized,
             packageDirectory: package.directory,
             priorMapId: package.manifest.priorMapId,
-            priorMapSha256: package.manifest.sourceSha256,
+            priorMapSha256: package.packageSha256,
             floorId: package.manifest.floors[selectedFloorIndex].id,
             initialMapPose: selectedPose)
         dismiss(animated: true) {
@@ -1165,7 +1198,14 @@ final class PriorMapLiveMapView: UIView {
     private let previewView = UIImageView()
     private let statusLabel = UILabel()
     private let roadLabel = UILabel()
+    private let diagnosticsButton = UIButton(type: .system)
+    private let diagnosticsLabel = UILabel()
     private let arrow = CAShapeLayer()
+    private let trajectoryLayer = CAShapeLayer()
+    private let confirmedTagLayer = CAShapeLayer()
+    private let pendingTagLayer = CAShapeLayer()
+    private let routeLayer = CAShapeLayer()
+    private var recentTrajectory: [PriorMapPose2D] = []
     private let boundsM: PriorMapBounds
 
     init(package: PriorMapPackage, floorId: String) {
@@ -1177,12 +1217,42 @@ final class PriorMapLiveMapView: UIView {
         layer.borderWidth = 1
         previewView.image = package.preview(floorId: floorId)
         previewView.contentMode = .scaleAspectFit
+        let arrowPath = UIBezierPath()
+        arrowPath.move(to: CGPoint(x: 0, y: -11))
+        arrowPath.addLine(to: CGPoint(x: 7, y: 8))
+        arrowPath.addLine(to: CGPoint(x: 0, y: 5))
+        arrowPath.addLine(to: CGPoint(x: -7, y: 8))
+        arrowPath.close()
+        arrow.path = arrowPath.cgPath
+        routeLayer.strokeColor = UIColor.systemTeal.withAlphaComponent(0.65).cgColor
+        routeLayer.fillColor = UIColor.clear.cgColor
+        routeLayer.lineWidth = 2
+        routeLayer.lineDashPattern = [6, 4]
+        trajectoryLayer.strokeColor = UIColor.systemBlue.cgColor
+        trajectoryLayer.fillColor = UIColor.clear.cgColor
+        trajectoryLayer.lineWidth = 2
+        confirmedTagLayer.fillColor = UIColor.systemGreen.cgColor
+        pendingTagLayer.fillColor = UIColor.systemOrange.cgColor
+        previewView.layer.addSublayer(routeLayer)
+        previewView.layer.addSublayer(trajectoryLayer)
+        previewView.layer.addSublayer(confirmedTagLayer)
+        previewView.layer.addSublayer(pendingTagLayer)
         previewView.layer.addSublayer(arrow)
         arrow.fillColor = UIColor.systemRed.cgColor
         statusLabel.font = .preferredFont(forTextStyle: .headline)
         roadLabel.font = .preferredFont(forTextStyle: .caption1)
         roadLabel.textColor = .secondaryLabel
         roadLabel.numberOfLines = 2
+        diagnosticsButton.setTitle("定位诊断 ▸", for: .normal)
+        diagnosticsButton.contentHorizontalAlignment = .left
+        diagnosticsButton.addTarget(
+            self,
+            action: #selector(toggleDiagnostics),
+            for: .touchUpInside)
+        diagnosticsLabel.font = .preferredFont(forTextStyle: .caption2)
+        diagnosticsLabel.textColor = .secondaryLabel
+        diagnosticsLabel.numberOfLines = 2
+        diagnosticsLabel.isHidden = true
         confirmButton.setTitle("确认当前位置", for: .normal)
         reselectButton.setTitle("重新选择位置", for: .normal)
         scanPriceTagButton.setTitle("扫描价签条码", for: .normal)
@@ -1193,6 +1263,8 @@ final class PriorMapLiveMapView: UIView {
             arrangedSubviews: [
                 statusLabel,
                 roadLabel,
+                diagnosticsButton,
+                diagnosticsLabel,
                 previewView,
                 buttons,
                 scanPriceTagButton,
@@ -1212,6 +1284,13 @@ final class PriorMapLiveMapView: UIView {
 
     required init?(coder: NSCoder) {
         fatalError("init(coder:) has not been implemented")
+    }
+
+    @objc private func toggleDiagnostics() {
+        diagnosticsLabel.isHidden.toggle()
+        diagnosticsButton.setTitle(
+            diagnosticsLabel.isHidden ? "定位诊断 ▸" : "定位诊断 ▾",
+            for: .normal)
     }
 
     private func displayedPreviewRect() -> CGRect {
@@ -1248,8 +1327,17 @@ final class PriorMapLiveMapView: UIView {
         let state = labels[value.localizationState] ?? ("定位较弱", UIColor.systemOrange)
         statusLabel.text = "\(state.0) · \(Int(value.confidence * 100))%"
         statusLabel.textColor = state.1
+        let acceptedText = value.constraintAccepted ? "已安全修正" : "继续采集"
+        if value.localizationState == "lost" {
+            roadLabel.text = "已超出自动局部恢复窗口，请点击“重新选择位置”人工重定位"
+        }
+        else {
+            roadLabel.text = value.roadCandidates.first.map {
+                "当前通道：\($0.edgeId) · \(acceptedText)；走向交叉口或货架端头"
+            } ?? "当前通道未确认 · \(acceptedText)；走向交叉口或货架端头"
+        }
         if let candidate = value.matchCandidates.first {
-            roadLabel.text = String(
+            diagnosticsLabel.text = String(
                 format: "结构匹配 %.2f · 唯一性 %.2f · %d 点 · %.1f ms",
                 candidate.score,
                 value.matchUniqueness,
@@ -1257,27 +1345,61 @@ final class PriorMapLiveMapView: UIView {
                 value.matcherElapsedMs)
         }
         else {
-            roadLabel.text = value.roadCandidates.first.map {
-                "道路先验：\($0.edgeId) · \(String(format: "%.2f m", $0.distanceM))；继续走向交叉口、柱子或端头"
-            } ?? "当前没有可靠结构候选；继续走向交叉口、柱子或端头"
+            diagnosticsLabel.text = value.roadCandidates.first.map {
+                "道路距离 \(String(format: "%.2f m", $0.distanceM)) · \(value.constraintReason)"
+            } ?? "无候选 · \(value.constraintReason)"
         }
         layoutIfNeeded()
+        recentTrajectory.append(value.estimatedPose)
+        if recentTrajectory.count > 2000 {
+            recentTrajectory.removeFirst(recentTrajectory.count - 2000)
+        }
+        let trajectory = UIBezierPath()
+        for (index, pose) in recentTrajectory.enumerated() {
+            let point = previewPoint(xM: pose.xM, yM: pose.yM)
+            index == 0 ? trajectory.move(to: point) : trajectory.addLine(to: point)
+        }
+        trajectoryLayer.path = trajectory.cgPath
+        let arrowPoint = previewPoint(
+            xM: value.estimatedPose.xM,
+            yM: value.estimatedPose.yM)
+        arrow.position = arrowPoint
+        arrow.setAffineTransform(
+            CGAffineTransform(rotationAngle: CGFloat(-value.estimatedPose.yawRad)))
+    }
+
+    func updateTagLayers(
+        confirmed: [PriorMapTagPoint3D],
+        pending: [PriorMapTagPoint3D],
+        route: [PriorMapPose2D] = []
+    ) {
+        func markerPath(_ values: [PriorMapTagPoint3D]) -> CGPath {
+            let path = UIBezierPath()
+            for value in values {
+                let point = previewPoint(xM: value.xM, yM: value.yM)
+                path.append(UIBezierPath(
+                    ovalIn: CGRect(x: point.x - 4, y: point.y - 4, width: 8, height: 8)))
+            }
+            return path.cgPath
+        }
+        confirmedTagLayer.path = markerPath(confirmed)
+        pendingTagLayer.path = markerPath(pending)
+        let path = UIBezierPath()
+        for (index, pose) in route.enumerated() {
+            let point = previewPoint(xM: pose.xM, yM: pose.yM)
+            index == 0 ? path.move(to: point) : path.addLine(to: point)
+        }
+        routeLayer.path = path.cgPath
+    }
+
+    private func previewPoint(xM: Double, yM: Double) -> CGPoint {
         let width = max(0.001, boundsM.maxXM - boundsM.minXM)
         let height = max(0.001, boundsM.maxYM - boundsM.minYM)
         let imageRect = displayedPreviewRect()
-        let x = imageRect.minX
-            + CGFloat((value.estimatedPose.xM - boundsM.minXM) / width) * imageRect.width
-        let y = imageRect.minY
-            + CGFloat((boundsM.maxYM - value.estimatedPose.yM) / height) * imageRect.height
-        let path = UIBezierPath()
-        path.move(to: CGPoint(x: 0, y: -11))
-        path.addLine(to: CGPoint(x: 7, y: 8))
-        path.addLine(to: CGPoint(x: 0, y: 5))
-        path.addLine(to: CGPoint(x: -7, y: 8))
-        path.close()
-        arrow.path = path.cgPath
-        arrow.position = CGPoint(x: x, y: y)
-        arrow.setAffineTransform(
-            CGAffineTransform(rotationAngle: CGFloat(-value.estimatedPose.yawRad)))
+        let normalizedX = min(1, max(0, (xM - boundsM.minXM) / width))
+        let normalizedY = min(1, max(0, (boundsM.maxYM - yM) / height))
+        return CGPoint(
+            x: imageRect.minX + CGFloat(normalizedX) * imageRect.width,
+            y: imageRect.minY + CGFloat(normalizedY) * imageRect.height)
     }
 }

@@ -28,9 +28,11 @@ if __package__ in {None, ""}:
     )
     from PriorMap.distance_field import build_distance_fields
     from PriorMap.prior_map_schema import (
+        PACKAGE_MANIFEST_FILE,
         PACKAGE_FORMAT,
         PACKAGE_VERSION,
         SUPPORTED_TYPES,
+        build_package_manifest,
         validate_package,
     )
     from PriorMap.render_prior_map import render_package
@@ -47,9 +49,11 @@ else:
     )
     from .distance_field import build_distance_fields
     from .prior_map_schema import (
+        PACKAGE_MANIFEST_FILE,
         PACKAGE_FORMAT,
         PACKAGE_VERSION,
         SUPPORTED_TYPES,
+        build_package_manifest,
         validate_package,
     )
     from .render_prior_map import render_package
@@ -198,6 +202,35 @@ def _distance(first: Sequence[float], second: Sequence[float]) -> float:
     return math.hypot(float(first[0]) - float(second[0]), float(first[1]) - float(second[1]))
 
 
+def _polyline_abscissa(point: Sequence[float], polyline: Sequence[Sequence[float]]) -> float:
+    """Return arc length at the closest projection onto a possibly bent road."""
+    if len(polyline) < 2:
+        return 0.0
+    best_distance = math.inf
+    best_abscissa = 0.0
+    accumulated = 0.0
+    px, py = float(point[0]), float(point[1])
+    for start, end in zip(polyline, polyline[1:]):
+        sx, sy = float(start[0]), float(start[1])
+        dx, dy = float(end[0]) - sx, float(end[1]) - sy
+        length_squared = dx * dx + dy * dy
+        if length_squared <= 1.0e-18:
+            continue
+        ratio = max(0.0, min(1.0, ((px - sx) * dx + (py - sy) * dy) / length_squared))
+        projected_x = sx + ratio * dx
+        projected_y = sy + ratio * dy
+        distance = math.hypot(px - projected_x, py - projected_y)
+        segment_length = math.sqrt(length_squared)
+        abscissa = accumulated + ratio * segment_length
+        if distance < best_distance - 1.0e-12 or (
+            abs(distance - best_distance) <= 1.0e-12 and abscissa < best_abscissa
+        ):
+            best_distance = distance
+            best_abscissa = abscissa
+        accumulated += segment_length
+    return best_abscissa
+
+
 def _road_graph(
     elements: list[dict[str, Any]],
     warnings: list[dict[str, Any]],
@@ -295,17 +328,10 @@ def _road_graph(
     edges_by_key: dict[tuple[str, str], dict[str, Any]] = {}
     for key, cross_nodes in nodes_by_cross.items():
         cross = cross_by_key[key]
-        start, end = cross["points_m"][0], cross["points_m"][-1]
-        dx = float(end[0]) - float(start[0])
-        dy = float(end[1]) - float(start[1])
-        magnitude = max(1e-12, math.hypot(dx, dy))
-        unit_x = dx / magnitude
-        unit_y = dy / magnitude
         ordered = sorted(
             cross_nodes,
             key=lambda item: (
-                (float(item["position_m"][0]) - float(start[0])) * unit_x
-                + (float(item["position_m"][1]) - float(start[1])) * unit_y,
+                _polyline_abscissa(item["position_m"], cross["points_m"]),
                 item["id"],
             ),
         )
@@ -605,6 +631,10 @@ def convert_workbook(
                 temporary / str(floor["preview_file"]),
                 str(floor["id"]),
             )
+        _json_write(
+            temporary / PACKAGE_MANIFEST_FILE,
+            build_package_manifest(temporary),
+        )
         package_validation = validate_package(temporary)
         if not package_validation["valid"]:
             raise ConversionError(

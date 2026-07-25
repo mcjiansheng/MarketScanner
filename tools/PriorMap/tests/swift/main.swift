@@ -182,6 +182,23 @@ require(
         rawPose: PriorMapPose2D(xM: 0, yM: 1, yawRad: .pi / 2),
         candidatePose: PriorMapPose2D(xM: 0, yM: 1.2, yawRad: .pi / 2 + 0.02)),
     "turning motion must be removed before comparing correction transforms")
+temporalGate.reset()
+_ = temporalGate.observe(
+    rawPose: PriorMapPose2D(xM: 0, yM: 0, yawRad: 0),
+    candidatePose: PriorMapPose2D(xM: 0.2, yM: 0, yawRad: 0))
+// Simulate an ambiguous/mismatch/unsafe frame. Production calls reset before
+// observing any rejected geometry.
+temporalGate.reset()
+require(
+    !temporalGate.observe(
+        rawPose: PriorMapPose2D(xM: 1, yM: 0, yawRad: 0),
+        candidatePose: PriorMapPose2D(xM: 1.2, yM: 0, yawRad: 0)),
+    "a rejected frame must not preheat the next accepted correction")
+require(
+    temporalGate.observe(
+        rawPose: PriorMapPose2D(xM: 2, yM: 0, yawRad: 0),
+        candidatePose: PriorMapPose2D(xM: 2.2, yM: 0, yawRad: 0)),
+    "two post-reset consistent frames are required")
 
 let orientedBounds = CGRect(x: 0.1, y: 0.2, width: 0.3, height: 0.4)
 let rightBounds = PriorMapImageGeometry.nativeSensorBounds(
@@ -541,6 +558,99 @@ do {
 }
 catch {
     require(false, "periodic matcher fixture must load: \(error)")
+}
+
+let coherentDepth = PriceTagDepthEvidence.evaluate(
+    (0..<64).map { 1.20 + Float($0 % 5 - 2) * 0.002 })
+require(coherentDepth.accepted, "dense coherent barcode depth must be accepted")
+require(coherentDepth.inlierCount >= 48, "coherent depth must retain dense inliers")
+require(coherentDepth.confidence >= 0.65, "high confidence must be evidence-derived")
+let sparseDepth = PriceTagDepthEvidence.evaluate([1.0, 1.01, 0.99, 1.0])
+require(!sparseDepth.accepted, "a few valid depth pixels must not imply confidence")
+require(sparseDepth.confidence < 0.5, "sparse depth confidence must stay low")
+let backgroundMajority = PriceTagDepthEvidence.evaluate(
+    (0..<24).map { 0.9 + Float($0 % 3) * 0.002 }
+        + (0..<57).map { 2.4 + Float($0 % 5) * 0.003 })
+require(
+    !backgroundMajority.accepted,
+    "a foreground/background split with wrong-depth majority must fail closed")
+require(
+    backgroundMajority.rejectionReason == "ambiguous_depth_layers",
+    "ambiguous depth layers must be auditable")
+let fresh0 = PriorMapAlignmentFreshness.evaluate(
+    ageMs: 0, versionLag: 0, localizationState: "stable", localizationConfidence: 0.9)
+let fresh100 = PriorMapAlignmentFreshness.evaluate(
+    ageMs: 100, versionLag: 0, localizationState: "stable", localizationConfidence: 0.9)
+let aging300 = PriorMapAlignmentFreshness.evaluate(
+    ageMs: 300, versionLag: 0, localizationState: "stable", localizationConfidence: 0.9)
+let stale800 = PriorMapAlignmentFreshness.evaluate(
+    ageMs: 800, versionLag: 0, localizationState: "stable", localizationConfidence: 0.9)
+let versionStale = PriorMapAlignmentFreshness.evaluate(
+    ageMs: 100, versionLag: 1, localizationState: "stable", localizationConfidence: 0.9)
+require(fresh0.label == "fresh" && fresh100.label == "fresh", "0/100 ms must stay fresh")
+require(aging300.label == "aging" && aging300.localizationState == "weak", "300 ms must be pending/weak")
+require(stale800.label == "timestamp_stale" && stale800.localizationState == "lost", "800 ms must be stale")
+require(versionStale.label == "version_stale", "alignment changes after scan must invalidate the snapshot")
+
+let squareGeometry = PriorMapShelfGeometry(
+    type: "Polygon",
+    coordinates: [[0, 0], [2, 0], [2, 2], [0, 2]])
+let reversedSquareGeometry = PriorMapShelfGeometry(
+    type: "Polygon",
+    coordinates: [[2, 2], [2, 0], [0, 0], [0, 2]])
+let squareSource = PriorMapShelfSource(width: 200, height: 200)
+let square = PriorMapShelf(
+    id: "square",
+    floorId: "1",
+    code: "SQ",
+    crossCode: nil,
+    rowFlag: nil,
+    geometry: squareGeometry,
+    yawRad: 0,
+    source: squareSource)
+let reversedSquare = PriorMapShelf(
+    id: "square",
+    floorId: "1",
+    code: "SQ",
+    crossCode: nil,
+    rowFlag: nil,
+    geometry: reversedSquareGeometry,
+    yawRad: 0,
+    source: squareSource)
+func squareTag(_ value: PriorMapShelf) -> LocalizedPriceTag {
+    ShelfAssociation.localizedTag(
+        observationId: "square",
+        payload: "square",
+        symbology: "QR",
+        floorId: "1",
+        rawPosition: PriorMapTagPoint3D(xM: 0.6, yM: -0.05, heightM: 1),
+        cameraPosition: SIMD2<Double>(0.6, -2),
+        shelves: [value],
+        localizationState: "stable",
+        localizationConfidence: 0.9,
+        measurementConfidence: 0.9,
+        measurementMethod: "scene_depth",
+        userConfirmed: false)
+}
+let squareForward = squareTag(square)
+let squareReversed = squareTag(reversedSquare)
+require(squareForward.shelfSide == squareReversed.shelfSide, "square side ID must ignore ring order")
+require(
+    close(
+        squareForward.distanceFromShelfStartCm ?? -1,
+        squareReversed.distanceFromShelfStartCm ?? -2),
+    "square offset start must be stable under reversed ring order")
+
+if CommandLine.arguments.count == 2 {
+    do {
+        let digest = try PriorMapPackageIntegrity.validate(
+            directory: URL(fileURLWithPath: CommandLine.arguments[1]))
+        print("Package integrity passed \(digest)")
+    }
+    catch {
+        FileHandle.standardError.write(Data("Package integrity failed: \(error)\n".utf8))
+        exit(2)
+    }
 }
 
 print("PriorMapLocalizationCore Swift tests passed")

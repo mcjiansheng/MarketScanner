@@ -1,6 +1,6 @@
-# 阶段一测试计划
+# 地图辅助定位阶段一至阶段三测试计划
 
-> 文档状态：**当前有效**。最后核对日期：2026-07-24。
+> 文档状态：**当前有效**。最后核对日期：2026-07-25。
 
 ## 自动测试
 
@@ -11,7 +11,8 @@ python3 -m unittest discover -s tools/SupermarketMapStudio/tests -v
 python3 -m py_compile \
   tools/PriorMap/*.py \
   tools/Supermarket2DMap/supermarket_2d_map.py \
-  tools/SupermarketMapStudio/server.py
+  tools/SupermarketMapStudio/server.py \
+  tools/SupermarketMapStudio/offline_processing.py
 
 xcrun swiftc -parse \
   app/ios/RTABMapApp/PriorMapLocalizationCore.swift \
@@ -28,6 +29,7 @@ git diff --check
 - XLSX `Element Info`、六种 shape；
 - 损坏 JSON、未知类型、隐藏元素；
 - 损坏 PNG、错误 hash/count/bounds、错误子集、道路引用、空间索引和验证报告的拒绝；
+- Swift 对 swapped shelves、tampered bounds、broken road、mixed preview/distance 和 validation=false 的导入拒绝；
 - 业务字段保留；
 - 坐标轴、厘米/米、90° 旋转矩形、bounds；
 - 道路字符串/数字 ID、缺失引用、连通统计；
@@ -39,6 +41,25 @@ git diff --check
 - 直接编译运行 iOS 无 UI 核心，以恒等、前后左右和非零原点金标验证 ARKit `x/z` 到地图 `x/y/yaw`、UI 朝向约定、双模式启动门控和 SE(2) 投影；
 - 平行通道歧义拒绝、唯一道路软修正上限；
 - 平移/旋转 drift（旋转必须改变 XY 误差）、yaw 误差、tracking 状态转换、道路边分配和人工校准前后误差。
+- 正方形/近正方形和反转 ring 的稳定货架 `A/B`/offset，柜台所有边 `E##`；
+- 密集深度内点、稀疏孔洞和前后景错误多数拒绝，0/100/300/800 ms 与版本滞后的快照门；
+- 阶段三源 DB hash 不变、确定性输出、离线漂移降低、错误约束拒绝、人工编辑 undo/redo/分支重放；
+- 自由扫描默认入口和旧会话处理回归。
+
+阶段三快速 E2E：
+
+```bash
+python3 -m unittest tools.PriorMap.tests.test_stage3 -v
+```
+
+阶段三确定性性能/内存门：
+
+```bash
+python3 tools/PriorMap/benchmark_stage3.py \
+  --nodes 2000 --max-seconds 15 --max-peak-mib 64
+```
+
+该基准只测专用 SE(2) 派生修正器，不代表 `rtabmap-reprocess`、地图生成或真实 iPhone matcher 性能。
 
 ## 样例地图验收
 
@@ -69,4 +90,4 @@ python3 tools/PriorMap/replay_localization.py "$out" \
 5. 人工确认/重新选择位置，检查两个 JSONL。
 6. 正常结束，确认 metadata 地图身份、无 checkpoint、NFC 不可见。
 
-正式超市验收不属于阶段一。
+正式超市验收只按 `FIELD_TEST_PLAN.md` 执行；尚未执行时不得声称生产通过。

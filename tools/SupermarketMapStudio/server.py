@@ -42,6 +42,7 @@ import gpu_acceleration as gpu
 import merge_processing as merge
 from PriorMap.prior_map_schema import validate_package as validate_prior_map_package
 from PriorMap.xlsx_to_prior_map import convert_workbook as convert_prior_map_workbook
+from PriorMap import offline_localization as localized
 
 
 ARTIFACTS = (
@@ -53,6 +54,7 @@ ARTIFACTS = (
     "preview_3d.json",
     "quality_report.json",
     "review_items.json",
+    "localized_review.json",
     "map.json",
     "trajectory.geojson",
     "price_tags.geojson",
@@ -75,6 +77,19 @@ ARTIFACTS = (
     "road_graph.json",
     "spatial_index.json",
     "validation_report.json",
+    "package_manifest.json",
+    "prior_map_manifest.json",
+    "processing_manifest.json",
+    "online_localization_trace.json",
+    "optimized_map_trajectory.geojson",
+    "localization_constraints.json",
+    "localization_report.json",
+    "manual_edits.json",
+    "localized_price_tags.json",
+    "localized_price_tags.csv",
+    "localized_price_tags.geojson",
+    "shelf_tag_index.json",
+    "audit_log.jsonl",
 )
 
 
@@ -1086,6 +1101,176 @@ def run_basic_map(data: Dict[str, Any], output: Path, progress: Optional[Progres
         remove_temporary(corrections_path)
 
 
+def run_localized_map(
+    data: Dict[str, Any],
+    output: Path,
+    progress: Optional[ProgressCallback] = None,
+) -> None:
+    session = require_session(data.get("session"))
+    prior_map = resolve_path(data.get("prior_map"), "Prior-map package")
+    validation = validate_prior_map_package(prior_map)
+    if not validation["valid"]:
+        raise RequestError(
+            "先验地图校验失败："
+            + "；".join(item["message"] for item in validation["errors"])
+        )
+    options = map_options(data)
+    acceleration = acceleration_selection(options, progress)
+    report_progress(progress, 4, "检查地图与会话", "正在校验地图 hash、单库会话和只读源数据库")
+    config = base.MapConfig(
+        options["resolution"],
+        options["preview_resolution"],
+        options["trajectory_radius"],
+        options["tag_snap_distance"],
+        options["occupied_inflate_radius"],
+        options["free_ray_max_range"],
+        options["horizontal_axes"],
+        False,
+    )
+    original_segments = base.discover_segments(session, config)
+    if len(original_segments) != 1 or original_segments[0].database_path is None:
+        raise RequestError("先验地图离线优化只接受一个已完成的连续扫描数据库。")
+    database_overrides, offline_report = reprocess_single_session(
+        session,
+        output,
+        options["reprocess_binary"],
+        "optimized.db",
+        options["pc_threads"],
+        options["pc_local_staging"],
+        acceleration,
+        progress,
+        (10, 62),
+    )
+    report_progress(progress, 64, "生成 RTAB-Map 成果", "正在用优化数据库生成兼容的 2D/3D 地图成果")
+    args = SimpleNamespace(
+        session=str(session),
+        output=str(output),
+        points_csv=optional_points(data.get("points_csv")),
+        corrections=None,
+        auto_align_segments=False,
+        database_overrides=database_overrides,
+        **options,
+    )
+    with gpu.DepthProjector(acceleration) as projector:
+        args.depth_projector = projector
+        base.generate(args)
+        acceleration_report = projector.report()
+    optimized_segments = base.discover_segments(
+        session,
+        config,
+        {key: Path(value) for key, value in database_overrides.items()},
+    )
+    poses = [
+        localized.Pose(
+            node_id=pose.node_id,
+            timestamp=pose.stamp,
+            x=pose.x,
+            y=pose.y,
+            yaw=pose.yaw,
+        )
+        for pose in optimized_segments[0].poses
+    ]
+    manual_edits = None
+    raw_edits = data.get("manual_edits")
+    if raw_edits not in (None, ""):
+        edits_path = resolve_path(raw_edits, "Manual edits")
+        manual_edits = load_json(edits_path, None)
+        if not isinstance(manual_edits, dict):
+            raise RequestError("manual_edits.json 无效。")
+    localized.process_localized_session(
+        prior_map=prior_map,
+        session=session,
+        optimized_poses=poses,
+        source_database=original_segments[0].database_path,
+        optimized_database=Path(database_overrides[optimized_segments[0].index]),
+        output=output,
+        manual_edits=manual_edits,
+        progress=progress,
+    )
+    attach_offline_reports(output, [offline_report])
+    attach_acceleration_report(output, acceleration_report, [offline_report])
+
+
+def apply_localized_edit(job: Job, data: Dict[str, Any]) -> Dict[str, Any]:
+    if job.kind != "localized" or job.status != "complete":
+        raise RequestError("人工复核只适用于已完成的先验地图会话优化结果。")
+    journal = load_json(job.output_dir / "manual_edits.json", None)
+    if not isinstance(journal, dict):
+        raise RequestError("结果缺少有效的 manual_edits.json。")
+    action = str(data.get("action") or "append")
+    if action == "undo":
+        journal = localized.move_manual_edit_cursor(journal, -1)
+    elif action == "redo":
+        journal = localized.move_manual_edit_cursor(journal, 1)
+    elif action == "append":
+        event = data.get("event")
+        if not isinstance(event, dict):
+            raise RequestError("人工编辑事件必须是对象。")
+        if event.get("type") not in {
+            "set_anchor",
+            "disable_constraint",
+            "assign_interval_to_aisle",
+            "edit_tag",
+            "approve_tag",
+            "batch_approve_tags",
+        }:
+            raise RequestError("不支持的人工编辑类型。")
+        journal = localized.append_manual_edit(journal, event)
+    else:
+        raise RequestError("人工编辑 action 必须是 append、undo 或 redo。")
+
+    source = load_json(job.output_dir / "source_manifest.json", None)
+    map_payload = load_json(job.output_dir / "map.json", {})
+    if not isinstance(source, dict):
+        raise RequestError("结果缺少 source_manifest.json，无法安全重放。")
+    prior_map = resolve_path(source.get("prior_map"), "Prior-map package")
+    session = require_session(source.get("source_session"))
+    source_database = resolve_path(source.get("source_database"), "Source database")
+    optimized_database = resolve_path(
+        source.get("optimized_database"), "Optimized database"
+    )
+    if not source_database.is_file() or not optimized_database.is_file():
+        raise RequestError("源数据库或优化数据库不存在，无法重放人工编辑。")
+    parameters = map_payload.get("parameters", {}) if isinstance(map_payload, dict) else {}
+    config = base.MapConfig(
+        float(parameters.get("resolution", 0.05)),
+        float(parameters.get("preview_resolution", 0.1)),
+        float(parameters.get("trajectory_radius", 1.25)),
+        float(parameters.get("tag_snap_distance", 1.0)),
+        float(parameters.get("occupied_inflate_radius", 0.08)),
+        float(parameters.get("free_ray_max_range", 8.0)),
+        str(parameters.get("horizontal_axes", "xz")),
+        False,
+    )
+    segments = base.discover_segments(session, config, {1: optimized_database})
+    if len(segments) != 1:
+        raise RequestError("优化轨迹无法重新读取。")
+    poses = [
+        localized.Pose(
+            node_id=pose.node_id,
+            timestamp=pose.stamp,
+            x=pose.x,
+            y=pose.y,
+            yaw=pose.yaw,
+        )
+        for pose in segments[0].poses
+    ]
+    localized.process_localized_session(
+        prior_map=prior_map,
+        session=session,
+        optimized_poses=poses,
+        source_database=source_database,
+        optimized_database=optimized_database,
+        output=job.output_dir,
+        manual_edits=journal,
+    )
+    return {
+        "cursor": journal["cursor"],
+        "event_count": len(journal["events"]),
+        "job": job_payload(job),
+    }
+
+
 def run_multi(data: Dict[str, Any], output: Path, progress: Optional[ProgressCallback] = None) -> None:
     raw_devices = data.get("devices")
     if not isinstance(raw_devices, list) or len(raw_devices) < 2:
@@ -1161,14 +1346,19 @@ def run_multi(data: Dict[str, Any], output: Path, progress: Optional[ProgressCal
 
 def start_job(data: Dict[str, Any]) -> Job:
     kind = data.get("kind")
-    if kind not in {"map", "stage", "multi"}:
-        raise RequestError("Task kind must be map, stage or multi.")
+    if kind not in {"map", "stage", "multi", "localized"}:
+        raise RequestError("Task kind must be map, stage, multi or localized.")
     output = require_output(data.get("output"))
     options = map_options(data)
     input_keys: tuple[str, ...] = ()
-    if options["offline_optimize"]:
+    if kind == "localized" or options["offline_optimize"]:
         if kind in {"map", "stage"}:
             input_keys = (str(require_session(data.get("session"))),)
+        elif kind == "localized":
+            input_keys = (
+                str(require_session(data.get("session"))),
+                str(resolve_path(data.get("prior_map"), "Prior-map package")),
+            )
         else:
             raw_devices = data.get("devices")
             if not isinstance(raw_devices, list):
@@ -1189,6 +1379,8 @@ def start_job(data: Dict[str, Any]) -> Job:
                 run_basic_map(data, output, progress)
             elif kind == "stage":
                 run_stage(data, output, progress)
+            elif kind == "localized":
+                run_localized_map(data, output, progress)
             else:
                 run_multi(data, output, progress)
         except Exception as exc:
@@ -1394,6 +1586,13 @@ class StudioHandler(BaseHTTPRequestHandler):
                     raise RequestError("Completed base job not found.")
                 merge_job = start_manual_merge(job, data)
                 self.send_json(HTTPStatus.ACCEPTED, job_payload(merge_job))
+                return
+            if path.startswith("/api/jobs/") and path.endswith("/localized/edit"):
+                job_id = path.split("/")[3]
+                job = STATE.get(job_id)
+                if job is None:
+                    raise RequestError("Completed localized job not found.")
+                self.send_json(HTTPStatus.OK, apply_localized_edit(job, data))
                 return
             if path.startswith("/api/jobs/") and path.endswith("/open"):
                 job_id = path.split("/")[3]

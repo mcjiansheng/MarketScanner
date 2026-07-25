@@ -1,6 +1,6 @@
 # 先验地图格式与坐标证据
 
-> 文档状态：**当前有效（格式版本 1）**。最后核对日期：2026-07-24。
+> 文档状态：**当前有效（格式版本 1）**。最后核对日期：2026-07-25。
 
 ## 输入
 
@@ -62,6 +62,7 @@ PC 实现位于 `coordinate_system.py`。iOS 解码已经规范化的米制 poly
 
 ```text
 PriorMap-<id>/
+  package_manifest.json
   manifest.json
   elements.json
   shelves.json
@@ -76,6 +77,8 @@ PriorMap-<id>/
 ```
 
 `prior_map_id` 为安全文件名化的源文件 stem 加源 SHA-256 前 12 位。所有 JSON 使用 UTF-8 和排序 key；距离场为控制手机包体采用稳定紧凑 JSON，其余文件采用稳定缩进。不写入当前时间，因此相同输入和参数产生逐字节相同输出。
+
+`package_manifest.json` 是手机和 PC 共用的规范完整性入口，精确列出包内每个权威文件的文件名、字节数、SHA‑256、媒体类型以及 JSON 格式/版本，并记录规范化 `package_sha256`。清单不自哈希；包 hash 按清单顺序对 `file/bytes/sha256/format/version` 计算。iOS 在显示“完整性通过”前必须完成全部摘要和下述跨文件关系校验。
 
 `manifest.json` 记录：
 
@@ -96,7 +99,7 @@ PriorMap-<id>/
 
 - `MapRoadPoint` 为节点；
 - 每个 `crossCodes` 指向一条 `MapCross`；
-- 同一路上的节点按线段投影顺序连接；
+- 同一路上的节点按完整折线的最近投影弧长排序连接，不能用首尾弦替代弯折道路；
 - 字符串/数字 ID 统一转为字符串；
 - 重复 ID 获得稳定后缀，不丢节点；
 - 缺失道路、零长度边和孤立点进入 warning/statistics。
@@ -106,6 +109,13 @@ PriorMap-<id>/
 `distance_fields.json` 为每层保存 0.40/0.20/0.10 m 三层截断距离场。可见货架、柱子、柜台和柜台特征的 polygon 边界为零距离种子，距离在 2 m 截断并量化为无符号厘米；每行使用 `[run_length, value]` RLE。每层记录 canonical rows 的 SHA‑256，PC schema 和 iOS 导入都完整解码并核验。用户样例两层包的紧凑距离场为 5,547,756 bytes；该数值是包体基线，不是设备内存峰值。
 
 校验器不只检查文件存在：它解析全部 JSON 和 PNG，核对格式/版本、SHA-256、元素与楼层 bounds、子集内容、道路节点/边引用、结构/道路索引覆盖及验证报告统计。每层独立预览必须可解码；`preview.png` 是首层兼容预览。
+
+## 结构关联边语义
+
+- `MapShelf` 使用源 `width/height/yaw_rad` 定义稳定局部长轴；即使正方形、近正方形、polygon 起点旋转或环方向反转，仍只产生相对局部长轴法向稳定的 `A/B` 两个业务面。
+- `A` 是局部长轴正方向左侧的面，`B` 是右侧；offset 起点沿局部长轴正方向固定。
+- `MapTable/MapTableFeature` 允许所有可见边参与关联，按稳定几何顺序使用 `E01/E02/...`，不强制解释成两个长边。
+- `MapPillar` 仅作为遮挡/结构证据，不是价签关联面。
 
 ## 单楼层定位边界
 

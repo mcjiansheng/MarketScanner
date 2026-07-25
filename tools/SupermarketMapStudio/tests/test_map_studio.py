@@ -1238,6 +1238,28 @@ class MapStudioApiTests(unittest.TestCase):
         self.assertIn(b"SupermarketShelfOutlineEvidence", script)
         self.assertIn(b"renderShelfOutline", script)
 
+    def test_map_studio_exposes_localized_stage_three_review_controls(self) -> None:
+        html, _ = self.fetch("/")
+        script, _ = self.fetch("/app.js")
+        for marker in (
+            b'data-mode="localized"',
+            b'id="localized-prior-map"',
+            b'id="localized-session"',
+            b'id="run-localized"',
+            b'id="localized-review-editor"',
+            b'id="localized-review-canvas"',
+            b'id="localized-tag-filter"',
+            b'id="localized-shelf-filter"',
+            b'id="localized-undo"',
+            b'id="localized-redo"',
+            b'id="localized-apply-edit"',
+        ):
+            self.assertIn(marker, html)
+        self.assertIn(b'kind: "localized"', script)
+        self.assertIn(b"/localized/edit", script)
+        self.assertIn(b"automatic_publish_allowed", script)
+        self.assertIn(b"drawLocalizedReview", script)
+
     def test_unsafe_optimized_pose_jump_is_rejected_before_publication(self) -> None:
         session = create_session(self.root, "SupermarketSession-UnsafeOptimization", 0.0, "continuous_streaming")
         add_rgbd_frame(session)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import math
 import struct
 import zlib
@@ -14,6 +15,8 @@ from .distance_field import decode_level
 
 PACKAGE_FORMAT = "MarketScannerPriorMap"
 PACKAGE_VERSION = 1
+PACKAGE_MANIFEST_FORMAT = "MarketScannerPriorMapPackageManifest"
+PACKAGE_MANIFEST_FILE = "package_manifest.json"
 SUPPORTED_TYPES = {
     "MapShelf",
     "MapTable",
@@ -23,6 +26,7 @@ SUPPORTED_TYPES = {
     "MapRoadPoint",
 }
 PACKAGE_FILES = {
+    PACKAGE_MANIFEST_FILE,
     "manifest.json",
     "elements.json",
     "shelves.json",
@@ -37,6 +41,160 @@ PACKAGE_FILES = {
 
 class PriorMapValidationError(ValueError):
     pass
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def package_digest(artifacts: list[dict[str, Any]]) -> str:
+    canonical = "".join(
+        "\0".join(
+            (
+                str(item.get("file", "")),
+                str(item.get("bytes", "")),
+                str(item.get("sha256", "")),
+                str(item.get("format") or ""),
+                str(item.get("version") if item.get("version") is not None else ""),
+            )
+        )
+        + "\n"
+        for item in artifacts
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def build_package_manifest(root: Path) -> dict[str, Any]:
+    """Describe every authoritative package artifact without a self-hash cycle."""
+    artifacts: list[dict[str, Any]] = []
+    for path in sorted(
+        item
+        for item in root.iterdir()
+        if item.is_file() and item.name != PACKAGE_MANIFEST_FILE
+    ):
+        record: dict[str, Any] = {
+            "file": path.name,
+            "bytes": path.stat().st_size,
+            "sha256": sha256_file(path),
+            "media_type": "image/png" if path.suffix.lower() == ".png" else "application/json",
+        }
+        if path.suffix.lower() == ".json":
+            payload = load_json(path)
+            if not isinstance(payload, dict):
+                raise PriorMapValidationError(f"{path.name} 顶层必须是对象。")
+            record["format"] = payload.get("format")
+            record["version"] = payload.get("version")
+        artifacts.append(record)
+    return {
+        "format": PACKAGE_MANIFEST_FORMAT,
+        "version": PACKAGE_VERSION,
+        "hash_algorithm": "sha256",
+        "artifact_count": len(artifacts),
+        "artifacts": artifacts,
+        "package_sha256": package_digest(artifacts),
+    }
+
+
+def _validate_package_manifest(
+    root: Path,
+    errors: list[dict[str, str]],
+) -> dict[str, Any] | None:
+    payload = _payload(
+        root,
+        PACKAGE_MANIFEST_FILE,
+        PACKAGE_MANIFEST_FORMAT,
+        errors,
+    )
+    if payload is None:
+        return None
+    artifacts = payload.get("artifacts")
+    if (
+        payload.get("hash_algorithm") != "sha256"
+        or not isinstance(artifacts, list)
+        or not all(isinstance(item, dict) for item in artifacts)
+        or payload.get("artifact_count") != len(artifacts)
+    ):
+        errors.append(
+            {"code": "package_manifest", "message": "package_manifest.json 结构无效。"}
+        )
+        return payload
+    names = [item.get("file") for item in artifacts]
+    if (
+        not all(
+            isinstance(name, str)
+            and name
+            and Path(name).name == name
+            and name != PACKAGE_MANIFEST_FILE
+            for name in names
+        )
+        or len(set(names)) != len(names)
+    ):
+        errors.append(
+            {"code": "package_artifact_name", "message": "地图包文件名缺失、重复或不安全。"}
+        )
+        return payload
+    actual_names = {
+        path.name
+        for path in root.iterdir()
+        if path.is_file() and path.name != PACKAGE_MANIFEST_FILE
+    }
+    if set(names) != actual_names:
+        errors.append(
+            {
+                "code": "package_artifact_set",
+                "message": "package_manifest.json 未精确覆盖地图包文件。",
+            }
+        )
+    for artifact in artifacts:
+        name = str(artifact["file"])
+        path = root / name
+        if not path.is_file():
+            continue
+        expected_bytes = artifact.get("bytes")
+        expected_hash = artifact.get("sha256")
+        if (
+            not isinstance(expected_bytes, int)
+            or isinstance(expected_bytes, bool)
+            or expected_bytes < 0
+            or expected_bytes != path.stat().st_size
+        ):
+            errors.append(
+                {"code": "package_artifact_bytes", "message": f"{name} 文件长度校验失败。"}
+            )
+        if (
+            not isinstance(expected_hash, str)
+            or len(expected_hash) != 64
+            or sha256_file(path) != expected_hash
+        ):
+            errors.append(
+                {"code": "package_artifact_hash", "message": f"{name} SHA-256 校验失败。"}
+            )
+        if path.suffix.lower() == ".json":
+            try:
+                child = load_json(path)
+            except PriorMapValidationError as exc:
+                errors.append({"code": "invalid_json", "message": str(exc)})
+                continue
+            if (
+                not isinstance(child, dict)
+                or artifact.get("format") != child.get("format")
+                or artifact.get("version") != child.get("version")
+            ):
+                errors.append(
+                    {
+                        "code": "package_artifact_schema",
+                        "message": f"{name} 的格式/版本与 package_manifest.json 不一致。",
+                    }
+                )
+    if payload.get("package_sha256") != package_digest(artifacts):
+        errors.append(
+            {"code": "package_hash", "message": "地图包规范化 SHA-256 校验失败。"}
+        )
+    return payload
 
 
 def load_json(path: Path) -> Any:
@@ -216,6 +374,7 @@ def validate_package(directory: Path | str) -> dict[str, Any]:
     if errors:
         return {"valid": False, "errors": errors, "warnings": warnings}
 
+    package_manifest = _validate_package_manifest(root, errors)
     manifest = _payload(root, "manifest.json", PACKAGE_FORMAT, errors)
     elements_payload = _payload(
         root, "elements.json", "MarketScannerPriorMapElements", errors
@@ -253,6 +412,7 @@ def validate_package(directory: Path | str) -> dict[str, Any]:
             spatial,
             distance_fields,
             validation_report,
+            package_manifest,
         )
     ):
         return {"valid": False, "errors": errors, "warnings": warnings}

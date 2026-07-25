@@ -28,6 +28,7 @@
       <button class="tab is-active" type="button" data-mode="single">单设备处理</button>
       <button class="tab" type="button" data-mode="multi">多设备合并</button>
       <button class="tab" type="button" data-mode="prior">导入/管理先验地图</button>
+      <button class="tab" type="button" data-mode="localized">先验地图会话优化</button>
     </nav>
 
     <section class="workbench" aria-label="地图处理工作台">
@@ -107,8 +108,42 @@
               <button class="secondary" type="button" data-pick="prior-output" data-title="选择空的先验地图输出目录">选择文件夹</button>
             </div>
           </div>
-          <div class="field-hint">转换后会显示楼层、范围、元素统计、道路连通性和所有警告。阶段一只提供初始位置与道路软约束，不声称已实现 LiDAR 自动定位。</div>
+          <div class="field-hint">转换后会显示楼层、范围、元素统计、道路连通性和所有警告。阶段二已提供实验性有界 LiDAR 结构匹配，但正式真机/超市验收尚未完成。</div>
           <button id="run-prior" class="primary full" type="button">导入并校验先验地图</button>
+        </section>
+
+        <section class="mode-panel" data-panel="localized" aria-label="先验地图会话离线优化">
+          <p class="mode-explanation">按安全顺序执行：RTAB-Map 离线重处理 → 先验地图 SE(2) 派生轨迹 → 价签重关联 → 质量门禁 → 人工复核。原始数据库始终只读。</p>
+          <div class="field-row">
+            <label for="localized-prior-map">先验地图包</label>
+            <div class="path-control">
+              <input id="localized-prior-map" class="path-input" type="text" spellcheck="false">
+              <button class="secondary" type="button" data-pick="localized-prior-map" data-title="选择先验地图包">选择文件夹</button>
+            </div>
+          </div>
+          <div class="field-row">
+            <label for="localized-session">地图辅助扫描会话</label>
+            <div class="path-control">
+              <input id="localized-session" class="path-input" type="text" spellcheck="false">
+              <button class="secondary" type="button" data-pick="localized-session" data-title="选择地图辅助扫描会话">选择文件夹</button>
+            </div>
+          </div>
+          <div class="field-row">
+            <label for="localized-edits">已有人工编辑（可选）</label>
+            <div class="path-control">
+              <input id="localized-edits" class="path-input" type="text" spellcheck="false" placeholder="重新处理时选择 manual_edits.json">
+              <button class="secondary" type="button" data-pick-file="localized-edits" data-title="选择 manual_edits.json">选择文件</button>
+            </div>
+          </div>
+          <div class="field-row">
+            <label for="localized-output">新结果目录</label>
+            <div class="path-control">
+              <input id="localized-output" class="path-input" type="text" spellcheck="false">
+              <button class="secondary" type="button" data-pick="localized-output" data-title="选择空输出目录">选择文件夹</button>
+            </div>
+          </div>
+          <div class="field-hint">自动发布门未通过时，结果只会标记“需要人工复核”，不会覆盖人工编辑或发布为权威成果。</div>
+          <button id="run-localized" class="primary full" type="button">一键优化并进入复核</button>
         </section>
 
         <details class="advanced-options" data-scan-options>
@@ -250,6 +285,53 @@
       <div class="result-section">
         <h2>成果文件</h2>
         <div id="artifacts" class="artifacts">尚无结果</div>
+      </div>
+      <div id="localized-review-editor" class="result-section localized-review-editor" hidden>
+        <h2>人工复核编辑</h2>
+        <p>每次操作都会写入带 hash 保护的 manual_edits.json 并重放；原数据库和 RTAB-Map 优化副本不改写。</p>
+        <div class="localized-review-layout">
+          <div>
+            <div class="localized-review-toolbar">
+              <label>价签状态
+                <select id="localized-tag-filter">
+                  <option value="all">全部</option>
+                  <option value="review">仅待复核</option>
+                  <option value="approved">仅已批准</option>
+                </select>
+              </label>
+              <label>货架筛选
+                <input id="localized-shelf-filter" type="search" placeholder="货架编号">
+              </label>
+              <span class="localized-trajectory-legend">在线轨迹 · RTAB‑Map · 离线轨迹</span>
+            </div>
+            <canvas id="localized-review-canvas" aria-label="先验地图、三条轨迹和价签联动复核"></canvas>
+          </div>
+          <div>
+            <h3>价签与问题列表</h3>
+            <div id="localized-review-list" class="localized-review-list">处理完成后显示</div>
+          </div>
+        </div>
+        <div class="localized-edit-grid">
+          <label>操作类型
+            <select id="localized-edit-type">
+              <option value="set_anchor">设置轨迹锚点</option>
+              <option value="disable_constraint">禁用错误约束</option>
+              <option value="assign_interval_to_aisle">区间指定通道</option>
+              <option value="edit_tag">修改价签</option>
+              <option value="approve_tag">批准价签</option>
+              <option value="batch_approve_tags">批量批准高置信价签</option>
+            </select>
+          </label>
+          <label>对象 ID<input id="localized-edit-object" type="text" placeholder="constraint/tag/interval ID"></label>
+          <label class="localized-edit-value">新值（JSON）<textarea id="localized-edit-value" rows="3" placeholder='例如 {"timestamp":12.4,"x_m":3.2,"y_m":-5.1,"yaw_rad":0}'></textarea></label>
+        </div>
+        <div id="localized-edit-help" class="field-hint"></div>
+        <div class="button-row">
+          <button id="localized-undo" class="secondary" type="button">撤销</button>
+          <button id="localized-redo" class="secondary" type="button">重做</button>
+          <button id="localized-apply-edit" class="primary" type="button">应用并重算派生结果</button>
+          <span id="localized-edit-status"></span>
+        </div>
       </div>
       <div class="result-section log-section">
         <h2>扫描与处理日志</h2>
