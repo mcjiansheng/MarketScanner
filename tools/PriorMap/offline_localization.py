@@ -1108,12 +1108,14 @@ def apply_manual_edits(
     return constraints, tags, audit
 
 
-def new_manual_edits(map_sha256: str, session_sha256: str) -> dict[str, Any]:
+def new_manual_edits(map_sha256: str, session_sha256: str, optimized_db_sha256: str = "") -> dict[str, Any]:
     return {
         "format": "MarketScannerManualEdits",
-        "version": 1,
+        "version": 2,
+        "revision": 1,
         "prior_map_sha256": map_sha256,
         "source_session_sha256": session_sha256,
+        "optimized_database_sha256": optimized_db_sha256,
         "cursor": 0,
         "events": [],
     }
@@ -1240,13 +1242,20 @@ def process_localized_session(
     source_hash_before = _sha256(source_database)
     session_hash = source_hash_before
     package_hash = str(package_manifest["package_sha256"])
+    optimized_db_hash = _sha256(optimized_database)
     if manual_edits is None:
-        manual_edits = new_manual_edits(package_hash, session_hash)
+        manual_edits = new_manual_edits(package_hash, session_hash, optimized_db_hash)
     if (
         manual_edits.get("prior_map_sha256") != package_hash
         or manual_edits.get("source_session_sha256") != session_hash
     ):
         raise OfflineLocalizationError("manual_edits.json does not match this map/session pair.")
+    stored_optimized = manual_edits.get("optimized_database_sha256")
+    if stored_optimized and stored_optimized != optimized_db_hash:
+        raise OfflineLocalizationError(
+            "manual_edits.json was created with a different optimized database; "
+            "edits cannot be safely replayed."
+        )
     edit_events = manual_edits.get("events")
     if not isinstance(edit_events, list):
         raise OfflineLocalizationError("manual_edits.json events must be an array.")
@@ -1597,7 +1606,7 @@ def process_localized_session(
         "prior_map_sha256": package_hash,
         "source_session_sha256": session_hash,
         "source_database_sha256": source_hash_before,
-        "optimized_database_sha256": _sha256(optimized_database),
+        "optimized_database_sha256": optimized_db_hash,
         "node_count": len(optimized),
         "node_coverage_ratio": round(node_coverage, 6),
         "source_node_count": source_node_count,

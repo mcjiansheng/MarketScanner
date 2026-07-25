@@ -117,6 +117,22 @@ class StudioState:
     def __init__(self) -> None:
         self.lock = threading.Lock()
         self.jobs: Dict[str, Job] = {}
+        self._edit_locks: Dict[str, threading.Lock] = {}
+
+    def acquire_edit_lock(self, job_id: str) -> threading.Lock:
+        """Return a per-job mutex for localized edit operations.
+
+        Locks are created lazily and cleaned up when a job transitions
+        away from ``complete`` status (e.g. on reprocess).
+        """
+        with self.lock:
+            if job_id not in self._edit_locks:
+                self._edit_locks[job_id] = threading.Lock()
+            return self._edit_locks[job_id]
+
+    def release_edit_lock(self, job_id: str) -> None:
+        with self.lock:
+            self._edit_locks.pop(job_id, None)
 
     def add(self, kind: str, output_dir: Path, input_keys: tuple[str, ...] = ()) -> Job:
         with self.lock:
@@ -434,6 +450,16 @@ def job_payload(job: Job) -> Dict[str, Any]:
                 "items": validation.get("malformed_rows", [])
             }
             payload["map"] = load_json(job.output_dir / "manifest.json", {})
+        elif job.kind == "localized":
+            payload["quality_report"] = load_json(
+                job.output_dir / "localization_report.json", {}
+            )
+            payload["review_items"] = load_json(
+                job.output_dir / "review_items.json", {"items": []}
+            )
+            payload["map"] = load_json(
+                job.output_dir / "localized_review.json", {}
+            )
         else:
             payload["quality_report"] = load_json(job.output_dir / "quality_report.json", {})
             payload["review_items"] = load_json(job.output_dir / "review_items.json", {"items": []})
@@ -1194,78 +1220,96 @@ def run_localized_map(
 def apply_localized_edit(job: Job, data: Dict[str, Any]) -> Dict[str, Any]:
     if job.kind != "localized" or job.status != "complete":
         raise RequestError("人工复核只适用于已完成的先验地图会话优化结果。")
-    journal = load_json(job.output_dir / "manual_edits.json", None)
-    if not isinstance(journal, dict):
-        raise RequestError("结果缺少有效的 manual_edits.json。")
-    action = str(data.get("action") or "append")
-    if action == "undo":
-        journal = localized.move_manual_edit_cursor(journal, -1)
-    elif action == "redo":
-        journal = localized.move_manual_edit_cursor(journal, 1)
-    elif action == "append":
-        event = data.get("event")
-        if not isinstance(event, dict):
-            raise RequestError("人工编辑事件必须是对象。")
-        if event.get("type") not in {
-            "set_anchor",
-            "disable_constraint",
-            "assign_interval_to_aisle",
-            "edit_tag",
-            "approve_tag",
-            "batch_approve_tags",
-        }:
-            raise RequestError("不支持的人工编辑类型。")
-        journal = localized.append_manual_edit(journal, event)
-    else:
-        raise RequestError("人工编辑 action 必须是 append、undo 或 redo。")
+    edit_lock = STATE.acquire_edit_lock(job.identifier)
+    with edit_lock:
+        journal = load_json(job.output_dir / "manual_edits.json", None)
+        if not isinstance(journal, dict):
+            raise RequestError("结果缺少有效的 manual_edits.json。")
+        expected_revision = data.get("expected_revision")
+        if expected_revision is not None and int(journal.get("revision", 1)) != int(expected_revision):
+            raise RequestError(
+                f"人工编辑冲突：当前版本为 {journal.get('revision', 1)}，"
+                f"请求版本为 {expected_revision}。请重新加载后重试。"
+            )
+        action = str(data.get("action") or "append")
+        if action == "undo":
+            journal = localized.move_manual_edit_cursor(journal, -1)
+        elif action == "redo":
+            journal = localized.move_manual_edit_cursor(journal, 1)
+        elif action == "append":
+            event = data.get("event")
+            if not isinstance(event, dict):
+                raise RequestError("人工编辑事件必须是对象。")
+            allowed_types = {
+                "set_anchor",
+                "disable_constraint",
+                "assign_interval_to_aisle",
+                "edit_tag",
+                "approve_tag",
+                "batch_approve_tags",
+            }
+            if event.get("type") not in allowed_types:
+                raise RequestError("不支持的人工编辑类型。")
+            journal = localized.append_manual_edit(journal, event)
+        else:
+            raise RequestError("人工编辑 action 必须是 append、undo 或 redo。")
 
-    source = load_json(job.output_dir / "source_manifest.json", None)
-    map_payload = load_json(job.output_dir / "map.json", {})
-    if not isinstance(source, dict):
-        raise RequestError("结果缺少 source_manifest.json，无法安全重放。")
-    prior_map = resolve_path(source.get("prior_map"), "Prior-map package")
-    session = require_session(source.get("source_session"))
-    source_database = resolve_path(source.get("source_database"), "Source database")
-    optimized_database = resolve_path(
-        source.get("optimized_database"), "Optimized database"
-    )
-    if not source_database.is_file() or not optimized_database.is_file():
-        raise RequestError("源数据库或优化数据库不存在，无法重放人工编辑。")
-    parameters = map_payload.get("parameters", {}) if isinstance(map_payload, dict) else {}
-    config = base.MapConfig(
-        float(parameters.get("resolution", 0.05)),
-        float(parameters.get("preview_resolution", 0.1)),
-        float(parameters.get("trajectory_radius", 1.25)),
-        float(parameters.get("tag_snap_distance", 1.0)),
-        float(parameters.get("occupied_inflate_radius", 0.08)),
-        float(parameters.get("free_ray_max_range", 8.0)),
-        str(parameters.get("horizontal_axes", "xz")),
-        False,
-    )
-    segments = base.discover_segments(session, config, {1: optimized_database})
-    if len(segments) != 1:
-        raise RequestError("优化轨迹无法重新读取。")
-    poses = [
-        localized.Pose(
-            node_id=pose.node_id,
-            timestamp=pose.stamp,
-            x=pose.x,
-            y=pose.y,
-            yaw=pose.yaw,
+        journal["revision"] = journal.get("revision", 1) + 1
+
+        source = load_json(job.output_dir / "source_manifest.json", None)
+        map_payload = load_json(job.output_dir / "map.json", {})
+        if not isinstance(source, dict):
+            raise RequestError("结果缺少 source_manifest.json，无法安全重放。")
+        prior_map = resolve_path(source.get("prior_map"), "Prior-map package")
+        session = require_session(source.get("source_session"))
+        source_database = resolve_path(source.get("source_database"), "Source database")
+        optimized_database = resolve_path(
+            source.get("optimized_database"), "Optimized database"
         )
-        for pose in segments[0].poses
-    ]
-    localized.process_localized_session(
-        prior_map=prior_map,
-        session=session,
-        optimized_poses=poses,
-        source_database=source_database,
-        optimized_database=optimized_database,
-        output=job.output_dir,
-        manual_edits=journal,
-    )
+        if not source_database.is_file() or not optimized_database.is_file():
+            raise RequestError("源数据库或优化数据库不存在，无法重放人工编辑。")
+        # Verify source database has not changed since last processing.
+        source_hash_now = localized._sha256(source_database)
+        if source_hash_now != source.get("source_database_sha256_before"):
+            raise RequestError(
+                "源数据库已被修改，无法基于原结果继续人工复核。请重新处理。"
+            )
+        parameters = map_payload.get("parameters", {}) if isinstance(map_payload, dict) else {}
+        config = base.MapConfig(
+            float(parameters.get("resolution", 0.05)),
+            float(parameters.get("preview_resolution", 0.1)),
+            float(parameters.get("trajectory_radius", 1.25)),
+            float(parameters.get("tag_snap_distance", 1.0)),
+            float(parameters.get("occupied_inflate_radius", 0.08)),
+            float(parameters.get("free_ray_max_range", 8.0)),
+            str(parameters.get("horizontal_axes", "xz")),
+            False,
+        )
+        segments = base.discover_segments(session, config, {1: optimized_database})
+        if len(segments) != 1:
+            raise RequestError("优化轨迹无法重新读取。")
+        poses = [
+            localized.Pose(
+                node_id=pose.node_id,
+                timestamp=pose.stamp,
+                x=pose.x,
+                y=pose.y,
+                yaw=pose.yaw,
+            )
+            for pose in segments[0].poses
+        ]
+        localized.process_localized_session(
+            prior_map=prior_map,
+            session=session,
+            optimized_poses=poses,
+            source_database=source_database,
+            optimized_database=optimized_database,
+            output=job.output_dir,
+            manual_edits=journal,
+        )
     return {
         "cursor": journal["cursor"],
+        "revision": journal["revision"],
         "event_count": len(journal["events"]),
         "job": job_payload(job),
     }
