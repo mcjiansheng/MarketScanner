@@ -97,7 +97,11 @@ def _reject_nonfinite(value: str) -> None:
 
 
 def _fsync_file(path: Path) -> None:
-    with path.open("rb") as handle:
+    # Python's Windows os.fsync() maps to the CRT _commit(), which rejects a
+    # read-only descriptor with EBADF.  Opening the already-written artifact
+    # read/write supplies the required handle without modifying its bytes.
+    mode = "r+b" if os.name == "nt" else "rb"
+    with path.open(mode) as handle:
         os.fsync(handle.fileno())
 
 
