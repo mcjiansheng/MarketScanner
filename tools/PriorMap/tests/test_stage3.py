@@ -195,6 +195,9 @@ class TagObservationBindingTests(unittest.TestCase):
                 expected_map_hashes={"a" * 64},
                 expected_floor_id="1",
             )
+        for invalid in (True, 10.5):
+            with self.assertRaisesRegex(OfflineLocalizationError, "invalid"):
+                self._bind({**self.observation, "nearest_node_id": invalid})
 
 
 class RobustSE2OptimizerTests(unittest.TestCase):
@@ -638,6 +641,10 @@ class LocalizedPipelineTests(unittest.TestCase):
         tag = json.loads((first_output / "localized_price_tags.json").read_text())[0]
         self.assertEqual(tag["online_map_position"]["x_m"], 2.0)
         self.assertEqual(tag["transform_audit"]["bound_node_id"], 11)
+        self.assertEqual(
+            tag["transform_audit"]["source_position_field"],
+            "tag.raw_map_position",
+        )
 
     def test_missing_tag_observation_never_defaults_to_node_zero(self) -> None:
         jsonl_write(self.segment / "tag_observations.jsonl", [])

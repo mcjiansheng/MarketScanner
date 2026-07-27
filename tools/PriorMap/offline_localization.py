@@ -255,6 +255,8 @@ def bind_tag_observation_to_pose(
     if not isinstance(observation, dict):
         raise OfflineLocalizationError("tag_observation_missing")
     timestamp_value = observation.get("frame_timestamp")
+    if isinstance(timestamp_value, bool):
+        raise OfflineLocalizationError("tag_observation_frame_timestamp_invalid")
     try:
         observation_timestamp = float(timestamp_value)
     except (TypeError, ValueError):
@@ -289,6 +291,26 @@ def bind_tag_observation_to_pose(
     if expected_map_hashes and actual_map_hash not in expected_map_hashes:
         raise OfflineLocalizationError("tag_observation_prior_map_sha256_mismatch")
     if isinstance(tag, dict):
+        expected_tag_identities = (
+            (
+                "tracking_session_id",
+                expected_tracking_session_id,
+                str(tag.get("tracking_session_id") or tag.get("trackingSessionId") or ""),
+            ),
+            (
+                "floor_id",
+                expected_floor_id,
+                str(tag.get("floor_id") or tag.get("floorId") or ""),
+            ),
+        )
+        for name, expected, actual in expected_tag_identities:
+            if expected and actual != expected:
+                raise OfflineLocalizationError(f"tag_{name}_mismatch")
+        tag_map_hash = str(
+            tag.get("prior_map_sha256") or tag.get("priorMapSha256") or ""
+        )
+        if expected_map_hashes and tag_map_hash not in expected_map_hashes:
+            raise OfflineLocalizationError("tag_prior_map_sha256_mismatch")
         paired_identities = (
             (
                 "tracking_session_id",
@@ -324,9 +346,12 @@ def bind_tag_observation_to_pose(
         if isinstance(explicit_node_id, bool):
             raise OfflineLocalizationError("tag_observation_node_id_invalid")
         try:
-            node_id = int(explicit_node_id)
+            node_id_number = float(explicit_node_id)
         except (TypeError, ValueError):
             raise OfflineLocalizationError("tag_observation_node_id_invalid")
+        if not math.isfinite(node_id_number) or not node_id_number.is_integer():
+            raise OfflineLocalizationError("tag_observation_node_id_invalid")
+        node_id = int(node_id_number)
         matches = [index for index, pose in enumerate(poses) if pose.node_id == node_id]
         if not matches:
             raise OfflineLocalizationError("tag_observation_node_id_not_found")
@@ -1051,8 +1076,15 @@ def enforce_tag_state_invariants(tag: dict[str, Any]) -> dict[str, Any]:
         return tag
     if tag.get("user_confirmed") is True:
         tag["approval_status"] = "approved"
-    elif tag.get("approval_status") not in {"approved", "auto_approved"}:
+    elif tag.get("approval_status") == "approved":
+        return tag
+    elif (
+        isinstance(tag.get("association_audit"), dict)
+        and tag["association_audit"].get("status") == "auto_confirmed"
+    ):
         tag["approval_status"] = "auto_approved"
+    else:
+        _mark_tag_for_review(tag, "automatic_approval_has_no_safe_association_evidence")
     return tag
 
 
@@ -1115,6 +1147,13 @@ def _associate_tag(
 
     if not candidates:
         _mark_tag_for_review(tag, "no_shelf_association_candidate")
+        tag["association_audit"] = {
+            "status": "not_associated",
+            "candidate_search_radius_m": candidate_radius,
+            "candidate_search_complete": False,
+            "candidate_count": 0,
+            "candidates": [],
+        }
         return enforce_tag_state_invariants(tag)
 
     candidates.sort(key=lambda value: (value[0], str(value[1].get("id")), value[2]))
@@ -1182,7 +1221,11 @@ def _associate_tag(
     meas_conf = float(tag.get("measurement_confidence", 0) or 0)
     manually_modified = bool(tag.get("manually_modified"))
     user_confirmed = bool(tag.get("user_confirmed"))
-    human_authoritative = manually_modified or user_confirmed
+    human_authoritative = (
+        manually_modified
+        or user_confirmed
+        or tag.get("approval_status") == "approved"
+    )
 
     can_auto_confirm = (
         has_camera
@@ -1195,6 +1238,7 @@ def _associate_tag(
         and loc_conf >= min_auto_confidence
         and meas_conf >= min_auto_confidence
         and not human_authoritative
+        and tag.get("needs_review") is not True
     )
 
     if can_auto_confirm:
@@ -1249,6 +1293,7 @@ def _associate_tag(
                 max(0.0, 1 - best_distance / candidate_radius), 6
             )
     tag["association_audit"] = {
+        "status": "auto_confirmed" if can_auto_confirm else "suggested_only",
         "candidate_search_radius_m": candidate_radius,
         "candidate_search_complete": False,
         "candidate_count": len(candidates),
@@ -1260,6 +1305,7 @@ def _associate_tag(
         "visible_side_consistent": visible_side_consistent,
         "near_endpoint": near_endpoint,
         "human_authoritative": human_authoritative,
+        "candidates_truncated": len(candidates) > 100,
         "candidates": [
             {
                 "element_id": item[1].get("id"),
@@ -1267,7 +1313,7 @@ def _associate_tag(
                 "edge_id": item[2],
                 "distance_m": round(item[0], 6),
             }
-            for item in candidates[:20]
+            for item in candidates[:100]
         ],
     }
     return enforce_tag_state_invariants(tag)
@@ -1727,8 +1773,6 @@ def process_localized_session(
             else None
         )
         original = tag.get("raw_map_position") or raw_observation_position
-        if not isinstance(original, dict) and tag.get("user_confirmed") is True:
-            original = tag.get("snapped_map_position")
         if not isinstance(original, dict):
             tag.pop("final_map_position", None)
             _mark_tag_for_review(tag, "tag_raw_map_position_missing")
@@ -1780,8 +1824,13 @@ def process_localized_session(
         tag.setdefault("approval_status", "pending" if tag.get("needs_review") else "auto_approved")
         # Audit: record the binding node and SE(2) delta so reviewers can verify
         # the rigid transform that propagated this tag from online to final.
-        tag.setdefault("transform_audit", {
+        tag["transform_audit"] = {
             "status": "applied",
+            "source_position_field": (
+                "tag.raw_map_position"
+                if isinstance(tag.get("raw_map_position"), dict)
+                else "observation.raw_map_position"
+            ),
             "source_observation_id": str(tag.get("observation_id") or ""),
             "bound_node_id": baseline_node.node_id,
             "bound_node_stamp": baseline_node.timestamp,
@@ -1801,7 +1850,7 @@ def process_localized_session(
             "delta_yaw_rad": round(
                 _normalize_angle(optimized_node.yaw - baseline_node.yaw), 6
             ),
-        })
+        }
         final_tags.append(
             _associate_tag(tag, elements, (optimized_node.x, optimized_node.y))
         )
