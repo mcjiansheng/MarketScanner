@@ -138,6 +138,19 @@ class LocalizedFileLockTests(unittest.TestCase):
 
 
 class LocalizedPlatformPersistenceTests(unittest.TestCase):
+    def test_windows_file_flush_uses_a_writable_descriptor(self) -> None:
+        artifact = Path("artifact.json")
+        handle = mock.MagicMock()
+        handle.__enter__.return_value.fileno.return_value = 73
+        with (
+            mock.patch.object(localized_store.os, "name", "nt"),
+            mock.patch.object(Path, "open", return_value=handle) as open_file,
+            mock.patch.object(localized_store.os, "fsync") as fsync,
+        ):
+            localized_store._fsync_file(artifact)
+        open_file.assert_called_once_with("r+b")
+        fsync.assert_called_once_with(73)
+
     def test_windows_replacement_uses_write_through_backend(self) -> None:
         source = Path("source.tmp")
         destination = Path("destination.json")
