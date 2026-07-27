@@ -187,6 +187,7 @@ struct ManualLocalizationEvent: Encodable {
     let nearestNodeId: Int?
     let nearestNodeStamp: TimeInterval?
     let nodeTimeDeltaSeconds: TimeInterval?
+    let nodeTimeSnapshotGeneration: UInt64
     let nodeBindingStatus: String
     let nodeBindingReason: String
     let alignmentVersion: Int
@@ -209,6 +210,7 @@ struct ManualLocalizationEvent: Encodable {
         case nearestNodeId = "nearest_node_id"
         case nearestNodeStamp = "nearest_node_stamp"
         case nodeTimeDeltaSeconds = "node_time_delta_seconds"
+        case nodeTimeSnapshotGeneration = "node_time_snapshot_generation"
         case nodeBindingStatus = "node_binding_status"
         case nodeBindingReason = "node_binding_reason"
         case alignmentVersion = "alignment_version"
@@ -247,6 +249,9 @@ struct ManualLocalizationEvent: Encodable {
         } else {
             try container.encodeNil(forKey: .nodeTimeDeltaSeconds)
         }
+        try container.encode(
+            nodeTimeSnapshotGeneration,
+            forKey: .nodeTimeSnapshotGeneration)
         try container.encode(nodeBindingStatus, forKey: .nodeBindingStatus)
         try container.encode(nodeBindingReason, forKey: .nodeBindingReason)
         try container.encode(alignmentVersion, forKey: .alignmentVersion)
@@ -1149,6 +1154,7 @@ final class SupermarketScanSession {
         nearestNodeId: Int?,
         nearestNodeStamp: TimeInterval?,
         nodeTimeDeltaSeconds: TimeInterval?,
+        nodeTimeSnapshotGeneration: UInt64,
         alignmentVersion: Int,
         expectedTrackingSessionId: String
     ) -> Bool {
@@ -1159,32 +1165,39 @@ final class SupermarketScanSession {
                 frameTimestamp + nodeTimebaseOffsetSeconds
                     - nodeTimebaseFrameTimestamp
               ) <= 0.000_001,
+              let nearestNodeId,
+              nearestNodeId > 0,
+              let nearestNodeStamp,
+              nearestNodeStamp.isFinite,
+              let nodeTimeDeltaSeconds,
+              nodeTimeDeltaSeconds.isFinite,
+              nodeTimeDeltaSeconds >= 0,
+              nodeTimeDeltaSeconds <= 1.0,
+              abs(nodeTimeDeltaSeconds - abs(
+                nodeTimebaseFrameTimestamp - nearestNodeStamp)) <= 0.000_001,
+              nodeTimeSnapshotGeneration > 0,
               alignmentVersion > 0 else {
-            print("Refused to persist an invalid manual localization v2 event")
+            print("Refused to persist an invalid manual localization v3 event")
             return false
         }
         localizationTransactionLock.lock()
         defer { localizationTransactionLock.unlock() }
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        let hasNodeEvidence = nearestNodeId != nil
-            && nearestNodeStamp?.isFinite == true
-            && nodeTimeDeltaSeconds?.isFinite == true
         let event = ManualLocalizationEvent(
             format: "MarketScannerManualLocalizationEvent",
-            version: 2,
+            version: 3,
             wallClockTimestamp: formatter.string(from: wallClock),
             wallClockTimestampUnix: wallClock.timeIntervalSince1970,
             frameTimestamp: frameTimestamp,
             nodeTimebaseFrameTimestamp: nodeTimebaseFrameTimestamp,
             nodeTimebaseOffsetSeconds: nodeTimebaseOffsetSeconds,
-            nearestNodeId: hasNodeEvidence ? nearestNodeId : nil,
-            nearestNodeStamp: hasNodeEvidence ? nearestNodeStamp : nil,
-            nodeTimeDeltaSeconds: hasNodeEvidence ? nodeTimeDeltaSeconds : nil,
-            nodeBindingStatus: hasNodeEvidence ? "matched" : "frame_timestamp_only",
-            nodeBindingReason: hasNodeEvidence
-                ? "native_latest_node_snapshot"
-                : "native_node_binding_unavailable",
+            nearestNodeId: nearestNodeId,
+            nearestNodeStamp: nearestNodeStamp,
+            nodeTimeDeltaSeconds: nodeTimeDeltaSeconds,
+            nodeTimeSnapshotGeneration: nodeTimeSnapshotGeneration,
+            nodeBindingStatus: "matched",
+            nodeBindingReason: "native_atomic_node_time_snapshot",
             alignmentVersion: alignmentVersion,
             trackingSessionId: expectedTrackingSessionId,
             priorMapId: scanConfiguration.priorMapId,

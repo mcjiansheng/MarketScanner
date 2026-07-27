@@ -284,6 +284,40 @@ class ManualLocalizationTimebaseTests(unittest.TestCase):
         with self.assertRaisesRegex(OfflineLocalizationError, "binding_status"):
             self._bind({**event, "node_binding_status": "frame_timestamp_only"})
 
+    def test_v3_requires_atomic_matched_node_snapshot_generation(self) -> None:
+        event = {
+            **self.event,
+            "version": 3,
+            "nearest_node_id": 22,
+            "nearest_node_stamp": 111.0,
+            "node_time_delta_seconds": 0.05,
+            "node_binding_status": "matched",
+            "node_binding_reason": "native_atomic_node_time_snapshot",
+            "node_time_snapshot_generation": 7,
+        }
+        binding = self._bind(event)
+        self.assertEqual(binding.binding_source, "nearest_node_id")
+        for invalid_generation in (None, 0, -1, True, 1.5):
+            with self.assertRaisesRegex(
+                OfflineLocalizationError, "snapshot_generation_invalid"
+            ):
+                self._bind(
+                    {
+                        **event,
+                        "node_time_snapshot_generation": invalid_generation,
+                    }
+                )
+        with self.assertRaisesRegex(OfflineLocalizationError, "binding_status"):
+            self._bind(
+                {
+                    **event,
+                    "nearest_node_id": None,
+                    "nearest_node_stamp": None,
+                    "node_time_delta_seconds": None,
+                    "node_binding_status": "frame_timestamp_only",
+                }
+            )
+
     def test_v2_requires_wall_clock_and_consistent_null_node_evidence(self) -> None:
         without_wall_clock = dict(self.event)
         without_wall_clock.pop("wall_clock_timestamp")
@@ -1214,6 +1248,50 @@ class LocalizedPipelineTests(unittest.TestCase):
         self.assertIn(
             "rejected_manual_localization_events_present",
             {item["code"] for item in report["review_gate"]["blockers"]},
+        )
+
+    def test_manual_v3_atomic_snapshot_is_applied(self) -> None:
+        manifest = json.loads((self.prior_map / "manifest.json").read_text())
+        jsonl_write(
+            self.segment / "manual_localization_events.jsonl",
+            [{
+                "format": "MarketScannerManualLocalizationEvent",
+                "version": 3,
+                "wall_clock_timestamp": "2027-01-15T08:00:00.000Z",
+                "wall_clock_timestamp_unix": 1_800_000_000.0,
+                "frame_timestamp": 10.0,
+                "node_timebase_frame_timestamp": self.node_timebase_offset + 10.0,
+                "node_timebase_offset_seconds": self.node_timebase_offset,
+                "nearest_node_id": 11,
+                "nearest_node_stamp": self.node_timebase_offset + 10.0,
+                "node_time_delta_seconds": 0.0,
+                "node_time_snapshot_generation": 9,
+                "node_binding_status": "matched",
+                "node_binding_reason": "native_atomic_node_time_snapshot",
+                "alignment_version": 2,
+                "tracking_session_id": "tracking-1",
+                "prior_map_sha256": manifest["source_sha256"],
+                "floor_id": "1",
+                "arkit_pose": {"x_m": 5.0, "y_m": 0.0, "yaw_rad": 0.0},
+                "confirmed_map_pose": {
+                    "x_m": 6.5,
+                    "y_m": -2.5,
+                    "yaw_rad": 0.0,
+                },
+            }],
+        )
+        output = self.root / "localized-manual-v3"
+        report = process_localized_session(
+            self.prior_map,
+            self.session,
+            self.poses,
+            self.source_database,
+            self.optimized_database,
+            output,
+        )
+        self.assertEqual(report["accepted_manual_anchor_count"], 1)
+        self.assertEqual(
+            report["manual_localization_event_audit"][0]["status"], "accepted"
         )
 
     def test_stale_or_duplicate_manual_alignment_version_is_rejected(self) -> None:

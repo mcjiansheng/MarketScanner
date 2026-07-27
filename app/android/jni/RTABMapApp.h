@@ -31,6 +31,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #ifdef __ANDROID__
 #include <jni.h>
 #endif
+#include <cstdint>
 #include <memory>
 
 #include <tango-gl/util.h>
@@ -49,6 +50,13 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <pcl/TextureMesh.h>
 
 #include "Measure.h"
+
+struct NodeTimeSnapshot {
+  std::int32_t nodeId;
+  double nodeStamp;
+  double epochOffset;
+  std::uint64_t generation;
+};
 
 // RTABMapApp handles the application lifecycle and resources.
 class RTABMapApp : public UEventsHandler {
@@ -102,7 +110,7 @@ class RTABMapApp : public UEventsHandler {
   void setPreserveCameraOrigin(bool enabled);
   bool getCameraOriginOffset(float & x, float & y, float & z, float & qx, float & qy, float & qz, float & qw);
   void setStreamingMapMode(bool enabled, int maxRenderedNodes);
-  bool getLastNode(int & nodeId, double & stamp);
+  bool getNodeTimeSnapshot(NodeTimeSnapshot & snapshot);
   bool getNodeTimeOffset(double & offset);
 
   // Set render camera's viewing angle, first person, third person or top down.
@@ -321,6 +329,7 @@ class RTABMapApp : public UEventsHandler {
 	std::list<rtabmap::Transform> poseEvents_;
 
 	rtabmap::Transform mapToOdom_;
+	std::uint64_t nodeTimeSnapshotGeneration_;
 
 	boost::mutex cameraMutex_;
 	boost::mutex rtabmapMutex_;

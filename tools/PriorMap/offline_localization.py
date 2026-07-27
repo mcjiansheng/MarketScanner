@@ -439,7 +439,7 @@ TAG_OBSERVATION_CONTRACT = JsonlContract(
 MANUAL_EVENT_CONTRACT = JsonlContract(
     "manual_localization_events",
     "MarketScannerManualLocalizationEvent",
-    frozenset({1, 2}),
+    frozenset({1, 2, 3}),
     False,
     True,
     (
@@ -1168,10 +1168,11 @@ def bind_manual_localization_event_to_pose(
     expected_floor_id: str,
     maximum_time_delta_seconds: float = 1.0,
 ) -> TagPoseBinding:
-    """Validate a v2 manual event and bind it to the RTAB-Map timebase."""
+    """Validate a current manual event and bind it to the RTAB-Map timebase."""
     if event.get("format") != "MarketScannerManualLocalizationEvent":
         raise OfflineLocalizationError("manual_event_format_invalid")
-    if event.get("version") != 2:
+    version = event.get("version")
+    if version not in {2, 3}:
         raise OfflineLocalizationError("manual_event_legacy_or_unknown_version")
     identities = (
         (
@@ -1220,6 +1221,21 @@ def bind_manual_localization_event_to_pose(
         event.get("arkit_pose")
     ):
         raise OfflineLocalizationError("manual_event_pose_invalid")
+
+    if version == 3:
+        snapshot_generation = event.get("node_time_snapshot_generation")
+        if (
+            isinstance(snapshot_generation, bool)
+            or not isinstance(snapshot_generation, int)
+            or snapshot_generation <= 0
+        ):
+            raise OfflineLocalizationError(
+                "manual_event_node_time_snapshot_generation_invalid"
+            )
+        if event.get("node_binding_status") != "matched":
+            raise OfflineLocalizationError("manual_event_node_binding_status_invalid")
+        if event.get("nearest_node_id") is None:
+            raise OfflineLocalizationError("manual_event_node_evidence_missing")
 
     node_id_value = event.get("nearest_node_id")
     binding_source = "frame_timestamp"
@@ -3158,7 +3174,7 @@ def _render_localized_version(
     for sequence, record in enumerate(manual_events, start=1):
         identifier = f"manual-{sequence:06d}"
         try:
-            if record.get("version") == 2:
+            if record.get("version") in {2, 3}:
                 alignment_version = record.get("alignment_version")
                 if (
                     isinstance(alignment_version, bool)

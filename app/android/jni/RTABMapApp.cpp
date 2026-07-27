@@ -73,19 +73,35 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <pcl/io/obj_io.h>
 #include <pcl/surface/poisson.h>
 #include <pcl/surface/vtk_smoothing/vtk_mesh_quadric_decimation.h>
+#include <boost/thread/locks.hpp>
 #include <cmath>
+#include <limits>
 
-bool RTABMapApp::getLastNode(int & nodeId, double & stamp)
+bool RTABMapApp::getNodeTimeSnapshot(NodeTimeSnapshot & snapshot)
 {
-	boost::mutex::scoped_lock lock(rtabmapMutex_);
-	if(rtabmap_ && rtabmap_->getMemory())
+	snapshot = NodeTimeSnapshot{0, 0.0, 0.0, 0};
+	boost::unique_lock<boost::mutex> cameraLock(cameraMutex_, boost::defer_lock);
+	boost::unique_lock<boost::mutex> rtabmapLock(rtabmapMutex_, boost::defer_lock);
+	// openDatabase() already contains a rtabmap->camera nested path. boost::lock
+	// uses try-lock/backoff, releasing a held lock before retrying, so this new
+	// two-source snapshot cannot introduce an inverse-order deadlock.
+	boost::lock(cameraLock, rtabmapLock);
+	if(camera_ && rtabmap_ && rtabmap_->getMemory())
 	{
+		const double epochOffset = camera_->getStampEpochOffset();
 		const rtabmap::Signature * signature =
 				rtabmap_->getMemory()->getLastWorkingSignature(false);
-		if(signature && signature->id() > 0 && std::isfinite(signature->getStamp()))
+		if(signature && signature->id() > 0 &&
+			std::isfinite(signature->getStamp()) &&
+			std::isfinite(epochOffset) && epochOffset != 0.0 &&
+			nodeTimeSnapshotGeneration_ < std::numeric_limits<std::uint64_t>::max())
 		{
-			nodeId = signature->id();
-			stamp = signature->getStamp();
+			const NodeTimeSnapshot frozen = {
+				static_cast<std::int32_t>(signature->id()),
+				signature->getStamp(),
+				epochOffset,
+				++nodeTimeSnapshotGeneration_};
+			snapshot = frozen;
 			return true;
 		}
 	}
@@ -322,7 +338,8 @@ RTABMapApp::RTABMapApp() :
 		targetPoint_(new pcl::PointCloud<pcl::PointXYZRGB>),
         quadSample_(new pcl::PointCloud<pcl::PointXYZ>),
         quadSamplePolygons_(2),
-		mapToOdom_(rtabmap::Transform::getIdentity())
+		mapToOdom_(rtabmap::Transform::getIdentity()),
+		nodeTimeSnapshotGeneration_(0)
 
 {
     pcl::PointXYZRGB ptWhite;

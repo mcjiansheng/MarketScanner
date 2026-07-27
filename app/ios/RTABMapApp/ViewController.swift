@@ -2764,11 +2764,19 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         let confirmationWallClock = Date()
         let confirmationFrameTimestamp = frame.timestamp
         let confirmationTransform = frame.camera.transform
-        let confirmationNodeBinding = rtabmap?.latestNodeBinding(
-            frameTimestamp: confirmationFrameTimestamp)
-        let confirmationNodeTimebase = confirmationNodeBinding.map {
-            ($0.nodeTimebaseFrameTimestamp, $0.nodeTimebaseOffsetSeconds)
-        } ?? rtabmap?.nodeTimebase(frameTimestamp: confirmationFrameTimestamp)
+        guard let confirmationNodeBinding = rtabmap?.latestNodeBinding(
+            frameTimestamp: confirmationFrameTimestamp) else {
+            supermarketSession?.appendScanEvent(
+                level: "warning",
+                event: "manual_localization_event_rejected",
+                message: "Manual localization was not applied because atomic node-time evidence was unavailable",
+                fields: ["reason": "native_node_time_snapshot_unavailable"])
+            showToast(
+                message: localized("RTAB-Map node evidence is not ready. The position was not changed; wait for mapping to stabilize and try again."),
+                seconds: 5,
+                replacingCurrent: true)
+            return
+        }
         priorMapQueue.async {
             let poses = localizer.confirmCurrentPosition(
                 transform: confirmationTransform,
@@ -2791,13 +2799,14 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                 confirmedMapPose: poses.1,
                 wallClock: confirmationWallClock,
                 frameTimestamp: confirmationFrameTimestamp,
-                nodeTimebaseFrameTimestamp: confirmationNodeTimebase?.0
-                    ?? .nan,
-                nodeTimebaseOffsetSeconds: confirmationNodeTimebase?.1
-                    ?? .nan,
-                nearestNodeId: confirmationNodeBinding?.nodeId,
-                nearestNodeStamp: confirmationNodeBinding?.nodeStamp,
-                nodeTimeDeltaSeconds: confirmationNodeBinding?.deltaSeconds,
+                nodeTimebaseFrameTimestamp:
+                    confirmationNodeBinding.nodeTimebaseFrameTimestamp,
+                nodeTimebaseOffsetSeconds:
+                    confirmationNodeBinding.nodeTimebaseOffsetSeconds,
+                nearestNodeId: confirmationNodeBinding.nodeId,
+                nearestNodeStamp: confirmationNodeBinding.nodeStamp,
+                nodeTimeDeltaSeconds: confirmationNodeBinding.deltaSeconds,
+                nodeTimeSnapshotGeneration: confirmationNodeBinding.generation,
                 alignmentVersion: snapshot.alignmentVersion,
                 expectedTrackingSessionId: trackingSessionId) == true
             if eventPersisted {

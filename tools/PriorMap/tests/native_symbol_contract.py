@@ -80,6 +80,55 @@ def main() -> None:
     for name in sorted(app_calls - app_definitions):
         errors.append(f"wrapper calls RTABMapApp::{name}, which is not defined")
 
+    required_snapshot_symbol = "getNodeTimeSnapshotNative"
+    if required_snapshot_symbol not in header_exports:
+        errors.append("atomic node-time snapshot C ABI is missing")
+    if "getLastNodeNative" in header_exports | source_exports | swift_calls:
+        errors.append("deprecated split getLastNodeNative ABI is still exposed or used")
+    if "getNodeTimeSnapshot" not in app_calls:
+        errors.append("NativeWrapper does not call RTABMapApp::getNodeTimeSnapshot")
+    normalized_wrapper_header = re.sub(r"\s+", " ", wrapper_header)
+    snapshot_abi = re.compile(
+        r"bool getNodeTimeSnapshotNative\(const void \*object, int32_t \* nodeId, "
+        r"double \* nodeStamp, double \* epochOffset, uint64_t \* generation\);"
+    )
+    if snapshot_abi.search(normalized_wrapper_header) is None:
+        errors.append("atomic node-time C ABI types do not match int32/double/double/uint64")
+    for field in ("nodeId", "nodeStamp", "epochOffset", "generation"):
+        if field not in app_header:
+            errors.append(f"NodeTimeSnapshot field {field} is missing")
+    for required_source_token in (
+        "boost::defer_lock",
+        "boost::lock(cameraLock, rtabmapLock)",
+        "++nodeTimeSnapshotGeneration_",
+        "std::numeric_limits<std::uint64_t>::max()",
+    ):
+        if required_source_token not in app_source:
+            errors.append(
+                f"atomic snapshot implementation is missing {required_source_token}"
+            )
+    for zero_assignment in (
+        "*nodeId = 0",
+        "*nodeStamp = 0.0",
+        "*epochOffset = 0.0",
+        "*generation = 0",
+    ):
+        if zero_assignment not in wrapper_source:
+            errors.append(f"snapshot failure output reset is missing: {zero_assignment}")
+    latest_binding_match = re.search(
+        r"func\s+latestNodeBinding\b(?P<body>.*?)\n\s*func\s+nodeTimebase\b",
+        swift_source,
+        flags=re.DOTALL,
+    )
+    if latest_binding_match is None:
+        errors.append("Swift latestNodeBinding implementation was not found")
+    else:
+        latest_binding_body = latest_binding_match.group("body")
+        if latest_binding_body.count("getNodeTimeSnapshotNative") != 1:
+            errors.append("Swift latestNodeBinding must call one atomic native snapshot")
+        if "getNodeTimeOffsetNative" in latest_binding_body:
+            errors.append("Swift latestNodeBinding still performs a split offset read")
+
     if errors:
         fail(errors)
 

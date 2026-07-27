@@ -114,23 +114,35 @@ class RTABMap {
 
     func latestNodeBinding(frameTimestamp: TimeInterval) -> (
         nodeId: Int, nodeStamp: TimeInterval, nodeTimebaseFrameTimestamp: TimeInterval,
-        nodeTimebaseOffsetSeconds: TimeInterval, deltaSeconds: TimeInterval
+        nodeTimebaseOffsetSeconds: TimeInterval, deltaSeconds: TimeInterval,
+        generation: UInt64
     )? {
         var nodeId: Int32 = 0
         var nodeStamp = 0.0
-        guard let nodeTimebase = nodeTimebase(frameTimestamp: frameTimestamp),
-              getLastNodeNative(native_rtabmap, &nodeId, &nodeStamp),
+        var epochOffset = 0.0
+        var generation: UInt64 = 0
+        guard frameTimestamp.isFinite,
+              getNodeTimeSnapshotNative(
+                native_rtabmap,
+                &nodeId,
+                &nodeStamp,
+                &epochOffset,
+                &generation),
               nodeId > 0,
-              nodeStamp.isFinite else {
+              nodeStamp.isFinite,
+              epochOffset.isFinite,
+              epochOffset != 0,
+              generation > 0 else {
             return nil
         }
-        let delta = abs(nodeTimebase.timestamp - nodeStamp)
-        guard delta <= 1.0 else {
+        let nodeTimebaseFrameTimestamp = frameTimestamp + epochOffset
+        let delta = abs(nodeTimebaseFrameTimestamp - nodeStamp)
+        guard nodeTimebaseFrameTimestamp.isFinite, delta <= 1.0 else {
             return nil
         }
         return (
-            Int(nodeId), nodeStamp, nodeTimebase.timestamp,
-            nodeTimebase.offsetSeconds, delta)
+            Int(nodeId), nodeStamp, nodeTimebaseFrameTimestamp,
+            epochOffset, delta, generation)
     }
 
     func nodeTimebase(frameTimestamp: TimeInterval) -> (

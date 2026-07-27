@@ -61,13 +61,40 @@ void destroyNativeApplication(const void *object)
     }
 }
 
-bool getLastNodeNative(const void *object, int * nodeId, double * stamp)
+bool getNodeTimeSnapshotNative(const void *object, int32_t * nodeId,
+                               double * nodeStamp, double * epochOffset,
+                               uint64_t * generation)
 {
-    if(!object || !nodeId || !stamp)
+    if(nodeId)
+    {
+        *nodeId = 0;
+    }
+    if(nodeStamp)
+    {
+        *nodeStamp = 0.0;
+    }
+    if(epochOffset)
+    {
+        *epochOffset = 0.0;
+    }
+    if(generation)
+    {
+        *generation = 0;
+    }
+    if(!object || !nodeId || !nodeStamp || !epochOffset || !generation)
     {
         return false;
     }
-    return native(object)->getLastNode(*nodeId, *stamp);
+    NodeTimeSnapshot snapshot = {0, 0.0, 0.0, 0};
+    if(!native(object)->getNodeTimeSnapshot(snapshot))
+    {
+        return false;
+    }
+    *nodeId = snapshot.nodeId;
+    *nodeStamp = snapshot.nodeStamp;
+    *epochOffset = snapshot.epochOffset;
+    *generation = snapshot.generation;
+    return true;
 }
 
 bool getNodeTimeOffsetNative(const void *object, double * offset)
