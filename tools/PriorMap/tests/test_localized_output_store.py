@@ -137,6 +137,26 @@ class LocalizedFileLockTests(unittest.TestCase):
                 store._release_lock()
 
 
+class LocalizedPlatformPersistenceTests(unittest.TestCase):
+    def test_windows_replacement_uses_write_through_backend(self) -> None:
+        source = Path("source.tmp")
+        destination = Path("destination.json")
+        with (
+            mock.patch.object(localized_store.os, "name", "nt"),
+            mock.patch.object(localized_store, "_atomic_replace_windows") as replace,
+        ):
+            localized_store._atomic_replace(source, destination)
+        replace.assert_called_once_with(source, destination)
+
+    def test_windows_does_not_attempt_unsupported_directory_flush(self) -> None:
+        with (
+            mock.patch.object(localized_store.os, "name", "nt"),
+            mock.patch.object(localized_store.os, "open") as open_directory,
+        ):
+            localized_store._fsync_directory(Path("localized"))
+        open_directory.assert_not_called()
+
+
 class LocalizedVersionStoreTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
