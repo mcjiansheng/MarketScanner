@@ -1,6 +1,6 @@
 # 已有地图辅助扫描数据格式
 
-> 文档状态：**当前有效（版本 1）**。最后核对日期：2026-07-25。
+> 文档状态：**当前有效**。最后核对日期：2026-07-27。
 
 ## 会话元数据
 
@@ -48,7 +48,14 @@
 
 ```json
 {
+  "format": "MarketScannerLocalizationTrace",
+  "version": 1,
   "timestamp": 123.4,
+  "nodeTimebaseTimestamp": 1785123456.4,
+  "nodeTimebaseOffsetSeconds": 1785123333.0,
+  "trackingSessionId": "...",
+  "priorMapSha256": "...",
+  "floorId": "1",
   "trackingState": "normal",
   "localizationState": "stable",
   "confidence": 0.86,
@@ -71,21 +78,24 @@
 
 接受和拒绝都记录原因，结构候选最多 3 个。`rawPose` 是当前 ARKit 预测投影；`estimatedPose` 才包含通过安全门控的小幅地图对齐修正。道路候选仅保留为弱先验证据。
 
+`timestamp` 保留原始 `ARFrame.timestamp`（设备单调时钟）；RTAB‑Map 的 `CameraMobile` 在写 `Node.stamp` 前会加 `stampEpochOffset`。因此所有当前定位 sidecar 同时保存 `nodeTimebaseTimestamp = timestamp + nodeTimebaseOffsetSeconds`，PC 只用换算后的 node timebase 绑定 SQLite node，并严格复算该等式。offset 由 native camera 原子读取；尚未初始化或非有限时该记录拒绝落盘，不能直接拿原始 ARFrame 时间与 epoch node stamp 比较。
+
 ## 阶段二定位审计
 
-- `localization_constraints.jsonl`：每个匹配周期的预测/估计、Top‑3、残差、唯一性、有效点数、角覆盖、耗时、接受标记和原因。
-- `localization_events.jsonl`：状态发生变化时记录 previous/state/confidence/reason。
-- `tag_observations.jsonl`：每次成功 Vision 识别的原始观测，即使用户取消最终保存也保留；除条码、框和地图点外，记录 `alignment_age_ms/alignment_version_lag/alignment_freshness`，以及 `depth_sample_count/depth_inlier_count/depth_inlier_ratio/depth_median_m/depth_mad_m/plane_residual_m/surface_normal_camera`。地图点必须使用提交 Vision 时冻结且通过时效门的对齐快照计算。
+- `localization_constraints.jsonl`：每个匹配周期的预测/估计、Top‑3、残差、唯一性、有效点数、角覆盖、耗时、接受标记和原因；同时保存 raw/node timebase/offset。
+- `localization_events.jsonl`：状态发生变化时记录 previous/state/confidence/reason 和双时间基准。
+- `tag_observations.jsonl`：每次成功 Vision 识别的原始观测，即使用户取消最终保存也保留；保存 `frame_timestamp/node_timebase_frame_timestamp/node_timebase_offset_seconds`，以及 `alignment_age_ms/alignment_version_lag/alignment_freshness` 和深度证据。地图点必须使用提交 Vision 时冻结且通过时效门的对齐快照计算。
 - `localized_price_tags.json`：用户确认后的数组；包含 shelf code、row flag、cross code、货架侧面、沿货架起点距离、相对地面高度、raw/snapped 位置、定位/测量/关联三项置信度、测量方式、`needs_review` 和 `user_confirmed`。
 
-JSONL 文件逐行独立编码和同步追加；最终价签数组用原子替换写入。写入前必须确认 tracking session ID 与活动会话一致且未进入 finalization，不允许日志接口自动创建新会话目录。价签 sidecar 与旧 `price_tags.json/.csv` 分开，后者继续只是暂停 NFC 功能的兼容空文件。
+JSONL 文件逐行独立编码和同步追加；最终价签数组用原子替换写入。写入前必须确认 tracking session ID 与活动会话一致且未进入 finalization，不允许日志接口自动创建新会话目录。PC 对每类文件使用正式 contract：严格 UTF‑8/JSON（禁止 NaN/Infinity）、format/version、会话/地图/floor 身份、有限且按契约单调的时间戳、业务必填字段、单行/记录上限和重复 ID 检查。`localization_trace`、constraints、state events 为必需；最终 metadata 必须明确 `localizedPriceTags` 文件名与准确计数，即使为 0 也必须存在；有最终价签时 observations 必需且不得为空。manual v2 存在即严格；legacy v1 仅允许进入拒绝审计和 review blocker，不能形成锚点。
 
 ## manual_localization_events.jsonl
 
-每次人工确认写 `MarketScannerManualLocalizationEvent` version 1，包含：
+当前每次人工确认写 `MarketScannerManualLocalizationEvent` version 2，包含：
 
-- ISO 时间和 Unix 时间；
-- tracking session ID；
+- 冻结且互相校验的 wall-clock ISO/Unix 时间、原始 `frame_timestamp`、`node_timebase_frame_timestamp` 和 `node_timebase_offset_seconds`；
+- 可空 node ID/stamp/delta 及明确的绑定状态；native 桥优先冻结最近已提交 RTAB‑Map node ID/stamp，证据不可用或超过 1 秒时仍保留换算后的 frame timestamp，绝不伪造 node 0；node timebase offset 本身不可用时拒绝写入；
+- alignment version、tracking session、prior-map hash 和 floor ID；
 - 原因；
 - 确认时 ARKit SE(2)；
 - 用户确认的地图 SE(2)。
@@ -98,21 +108,31 @@ JSONL 文件逐行独立编码和同步追加；最终价签数组用原子替�
 
 ## 阶段三输出
 
-`MapStudio-Localized-*` 在既有 2D/3D 成果和 `rtabmap_optimized/optimized.db` 之外新增：
+`MapStudio-Localized-*` 在既有 2D/3D 成果和 `rtabmap_optimized/optimized.db` 之外新增事务版本区：
 
 ```text
-prior_map_manifest.json        source_manifest.json
-processing_manifest.json       online_localization_trace.json
-optimized_map_trajectory.geojson
-localization_constraints.json  localization_report.json
-review_items.json              localized_review.json
-manual_edits.json
-localized_price_tags.json/.csv/.geojson
-shelf_tag_index.json           audit_log.jsonl
+localized/
+  current.json
+  published.json                 # 仅正式发布/撤销状态存在
+  local_state.json               # 本机恢复路径，不在 artifact/export allowlist
+  versions/vNNNNNN/
+    version_manifest.json
+    prior_map_manifest.json      source_manifest.json
+    processing_manifest.json     online_localization_trace.json
+    optimized_map_trajectory.geojson
+    localization_constraints.json localization_report.json
+    review_items.json            localized_review.json
+    manual_edits.json
+    localized_price_tags.json/.csv/.geojson
+    shelf_tag_index.json         audit_log.jsonl
 ```
 
-`localization_report.json` 包含地图/会话/数据库 hash、节点覆盖、在线/RTAB‑Map/离线轨迹长度、修正分布与最大值、weak/lost 次数/持续时长/区间、约束接受/拒绝、通道序列、人工锚点、价签确认/复核统计、关联置信度、warning/reason 和 `automatic_publish_allowed`。
+`localization_report.json` 包含地图/会话/数据库 hash、直接从 source/optimized SQLite `Node` 表和导出轨迹交叉计算的节点覆盖/缺失/重复/时间范围、三条轨迹长度、修正分布、仅用于诊断的绝对约束残差、局部平移/yaw 形变、weak/lost 时长、约束接受/拒绝、标签 observation coverage、review/publish blockers 和 `publish_state`。残差诊断不包含平滑项，不能表述为求解器 objective 或收敛证明。`solver.type=bounded_correction_field`、`full_factor_graph=false`、`published_capable=false` 是当前真实能力边界。
 
 `localized_review.json` 是 Map Studio 的有界联动复核视图数据，包含先验结构、三条轨迹、价签、问题列表和明确的 `view_limits`/截断标记；它是派生展示文件，不替代各权威成果文件。
 
-`manual_edits.json` version 1 绑定 `prior_map_sha256` 与 `source_session_sha256`，使用 `events + cursor` 保存 `event_id/timestamp/type/object_id/old_value/new_value`。支持锚点、禁用约束、区间指定通道、价签修改/批准和批量批准；撤销只移动 cursor，撤销后新增事件会丢弃 redo 分支。hash 不匹配时拒绝重放。
+`manual_edits.json` version 3 绑定 `prior_map_sha256/source_database_sha256/optimized_database_sha256/processing_parameter_sha256/tool_version/coordinate_contract_version`。事件保存服务端生成的 `event_id/created_at_utc/base_revision/old_value/new_value/actor/reason`；`audit_events` 单独记录 append/undo/redo 的旧/新 cursor。API 强制 `expected_version_id + expected_revision`，冲突返回 409；只有完整重放和版本校验成功后才推进 current。
+
+可导出的 `source_manifest.json` 只保存会话/数据库文件名、地图 ID 和各输入 SHA‑256，不保存用户名或绝对路径。人工复核重放所需的本机绝对路径单独写在 `localized/local_state.json`；该文件不进入不可变 version、artifact allowlist 或导出包，读取后仍必须用 version 内的 source/optimized/prior-map hash 复核目标。
+
+版本写入在 `localized/.write.lock` 的跨进程排他锁内完成父版本复核、staging 清理、版本号分配、rename 和单一指针提交。版本目录 rename 后必须先 fsync `versions/`，失败时不切指针；指针 replace 后的目录 fsync 失败会返回“durability indeterminate”，调用方必须先读取实际指针再恢复，禁止盲目重试。读取 current/published 或下载 artifact 时会重新核对 exact file set、regular-file、字节数及逐文件 SHA‑256，下载还对已打开 fd 的实际字节再次验 hash。发布创建独立 published snapshot 并只切换 `published.json`；存在 active published 时必须先撤销。正式发布还要求 store 层再次验证空 blocker、完整且可发布的相对 SE(2) 因子图，以及由服务端 actor/UTC 和当前 `localized_review.json` SHA‑256 绑定的现场验收记录；当前求解器始终不满足该门。

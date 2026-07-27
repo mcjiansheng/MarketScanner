@@ -1,6 +1,6 @@
 # 地图辅助定位实现状态
 
-> 文档状态：**当前有效**。最后核对日期：2026-07-25。
+> 文档状态：**当前有效**。最后核对日期：2026-07-27。
 
 ## 阶段一
 
@@ -24,7 +24,7 @@
 | 旧会话和自由扫描兼容 | 已实现 | storage/workflow 分字段、PC regression |
 | 完整业务首页五入口 | 部分实现 | 现有首页/菜单保留；新建扫描双模式已完成，独立“先验地图”首页入口尚未拆出 |
 | 预定路线导入 | 未实现 | 可选增强项；当前只有道路图合成遍历和回放 |
-| iOS 核心契约测试 | 已实现 | ARKit 前后左右/非零原点金标、模式门控和 SE(2) 投影 |
+| iOS 核心契约测试 | 已实现 | ARKit 前后左右/非零原点金标、模式门控、SE(2) 投影和 CameraMobile epoch node timebase 静态/PC 回归 |
 
 ## 阶段二
 
@@ -48,13 +48,18 @@
 | 能力 | 状态 | 代码/证据 |
 | --- | --- | --- |
 | RTAB-Map 重处理前置和源库只读 | 已实现 | `run_localized_map` 强制 `rtabmap-reprocess`；前后 SHA‑256 一致 |
-| 先验地图 SE(2) 派生优化 | 已实现 | robust banded correction IRLS、yaw wrap、gauge、Huber、硬门限；明确非通用因子图 |
+| 先验地图派生修正 | 部分实现 | `bounded_correction_field`、yaw wrap、Huber、硬门限、绝对约束残差诊断/局部平移与 yaw 形变报告；尚非相对 SE(2) 因子图 |
 | 在线/道路/人工约束与拒绝审计 | 已实现 | 在线结构约束、道路区域/方向低权重软约束、accepted/rejected residual、禁用约束、人工锚点 |
-| 标签离线重算和结构关联 | 已实现 | online/final 差值、稳定面 ID、JSON/CSV/GeoJSON/shelf index |
-| 质量报告和发布门 | 已实现 | `localization_report.json`、`review_items.json`、`automatic_publish_allowed` |
-| 人工编辑重放/撤销/重做 | 已实现 | hash 绑定 `manual_edits.json`、events/cursor、Map Studio API/UI |
+| 通道切换审计 | 已实现 | 最终轨迹几何投影输出进入/离开时间、候选 margin、方向、weak/lost overlap、人工 assignment 和可能静默切换 |
+| 标签离线重算和结构关联 | 已实现（保守门控） | observation→真实 node/frame time 绑定、raw 位置 SE(2) 传播、独立次候选/遮挡/侧面/边长校验；失败进入 review 或阻断 current |
+| Sidecar 输入契约 | 已实现 | 每类 required/optional、format/version、严格 UTF‑8/JSON、身份/时间/业务 schema/大小/唯一 ID；legacy manual 仅审计；tag/observation 内容交叉验证；损坏 fail closed |
+| 节点覆盖审计 | 已实现 | 只读查询 source/optimized SQLite Node，和导出 node ID 三方比较缺失、额外、重复、非单调 stamp 与首尾时间；metadata 仅交叉检查 |
+| 导出隐私与本机恢复 | 已实现 | source manifest 仅文件标识/ID/hash；绝对路径隔离在不导出的 `localized/local_state.json`，重放继续校验输入 hash |
+| 不可变成果事务 | 已实现 | 跨进程锁内 staging→完整文件/hash 校验→`versions/vNNNNNN`→单指针提交；版本/指针 fsync 故障注入；读取与已打开 fd 复核 hash；损坏状态拒绝降级 |
+| 质量报告和状态机 | 部分实现 | draft/review/published/revoked 事务框架和门禁；当前 solver 硬阻断 published |
+| 人工编辑重放/撤销/重做 | 已实现 | manual_edits v3、强制 version/revision CAS、HTTP 409、服务端 old value/UTC/ID、字段/范围/地图校验、undo/redo audit |
 | PC 非专业向导 | 已实现 | 地图+会话选择、一键处理、三轨迹/价签联动画布、状态/货架筛选、问题带入、人工编辑区和 artifact |
-| 确定性 E2E fixture | 已实现 | 源库不变、漂移降低、错误约束拒绝、重现性、编辑分支测试 |
+| 确定性 E2E fixture | 已实现 | 源库不变、漂移降低、错误约束拒绝、事务故障、双线程客户端同基准 CAS 冲突、409、发布硬门、严格 sidecar 负例 |
 | 正式现场验收 | 未执行 | 只完成 `FIELD_TEST_PLAN.md`；不能用模拟或构建替代 |
 
 操作流程、弱/丢失定位、人工复核、备份和失败恢复见 `USER_GUIDE.md`。
@@ -62,8 +67,9 @@
 ## 尚未完成的发布门槛
 
 - 支持 LiDAR 的真实 iPhone 上完成完整开始、弱纹理、行人干扰、扫码、结束落盘和外部复制干跑；
-- 由独立审查者复审本轮阶段一/二整改和阶段三实现；
+- 已完成本轮多智能体独立静态复审；发布前仍需外部/人工审查者复核；
 - 正式超市场景验收；
+- 实现并验证读取 RTAB‑Map 相对/闭环边的完整 SE(2) 因子图；在此之前不得创建有效 published 成果；
 - 地图直接拖拽锚点等可用性增强（问题带入和核心 ID/JSON 编辑已可用）。
 
 自动测试和模拟回放不替代以上现场与独立审查。

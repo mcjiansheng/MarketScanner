@@ -1,6 +1,6 @@
 # 地图辅助定位阶段一至阶段三测试计划
 
-> 文档状态：**当前有效**。最后核对日期：2026-07-25。
+> 文档状态：**当前有效**。最后核对日期：2026-07-27。
 
 ## 自动测试
 
@@ -44,6 +44,11 @@ git diff --check
 - 正方形/近正方形和反转 ring 的稳定货架 `A/B`/offset，柜台所有边 `E##`；
 - 密集深度内点、稀疏孔洞和前后景错误多数拒绝，0/100/300/800 ms 与版本滞后的快照门；
 - 阶段三源 DB hash 不变、确定性输出、离线漂移降低、错误约束拒绝、人工编辑 undo/redo/分支重放；
+- manual localization v2 使用 ARFrame time，legacy/身份/歧义/错误 node stamp 拒绝；
+- JSONL 必需/可选策略、非法 UTF‑8、NaN/Infinity、format/version、身份、时间、空文件、重复 observation/tag ID；
+- staging 失败、陈旧 staging、损坏指针、无效版本不切 current、不可变旧版本和具体 version artifact；
+- expected version/revision 缺失、两个客户端使用同一基准版本的 CAS 冲突、HTTP 409、服务端 old value/UTC/ID、字段/范围/货架边长/批准前校验、重放失败回滚；
+- draft→review 新版本、bounded solver 发布 422 硬阻断、published 指针不产生；
 - 自由扫描默认入口和旧会话处理回归。
 
 阶段三快速 E2E：
@@ -59,7 +64,7 @@ python3 tools/PriorMap/benchmark_stage3.py \
   --nodes 2000 --max-seconds 15 --max-peak-mib 64
 ```
 
-该基准只测专用 SE(2) 派生修正器，不代表 `rtabmap-reprocess`、地图生成或真实 iPhone matcher 性能。
+该基准只测 `bounded_correction_field`，不代表完整 SE(2) 因子图、`rtabmap-reprocess`、地图生成或真实 iPhone matcher 性能。
 
 ## 样例地图验收
 

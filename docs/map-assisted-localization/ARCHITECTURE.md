@@ -1,6 +1,6 @@
 # 已有地图辅助定位架构
 
-> 文档状态：**当前有效（阶段一至阶段三）**。最后核对日期：2026-07-25。
+> 文档状态：**当前有效（阶段一至阶段三草稿复核）**。最后核对日期：2026-07-27。
 
 ## 范围
 
@@ -35,12 +35,14 @@ PC prior-map localized
   原始 SQLite（只读）
     -> rtabmap-reprocess 新数据库副本
     -> RTAB-Map 全局一致相对轨迹
-    -> robust banded SE(2) correction IRLS
+    -> bounded correction field（非完整相对 SE(2) 因子图）
        （在线结构约束 + 道路软约束 + 人工锚点/通道区间 + 鲁棒拒绝）
     -> 全部价签重算/重关联
     -> 自动质量门禁
     -> manual_edits.json 可撤销重放
-    -> JSON/CSV/GeoJSON + audit_log.jsonl
+    -> localized/.staging-* 完整生成和校验
+    -> localized/versions/vNNNNNN 不可变版本
+    -> current.json 原子切换；published.json 受硬门控制
 ```
 
 ## 模块边界
@@ -54,6 +56,7 @@ PC prior-map localized
 - `PriceTagVisionScanner.swift` 只消费 ARKit 当前帧；`PriceTagLocalizationCore.swift` 负责平台无关的货架关联和安全判定。
 - `PriorMapPackageIntegrityCore.swift` 在 iOS 导入前核验包清单、逐文件摘要和跨文件关系。
 - `tools/PriorMap/offline_localization.py` 是阶段三派生 SE(2) 修正、价签重关联、质量门禁、人工编辑重放和导出实现。
+- `tools/PriorMap/localized_output_store.py` 在跨进程文件锁内管理 staging、不可变 version、成果 schema/hash 清单以及 current/published 单提交点原子指针；读取和 artifact 下载前再次复核逐文件完整性。
 - `SupermarketScanSession.swift` 只负责安全落盘和审计 sidecar；原始数据库仍是权威输入。
 
 ## 安全边界
@@ -70,7 +73,8 @@ PC prior-map localized
 - NFC 入口保持关闭。
 - Vision 不创建 `AVCaptureSession`；检测、深度和相机位姿来自同一个 `ARFrame`。对齐快照按实际时间差和版本滞后分为 fresh/aging/stale，stale 观测强制复核。
 - 原始价签观测先落盘；最终价签需要用户明确确认。weak/lost 以及低测量/低关联置信结果强制 `needs_review=true`。
-- 阶段三求解器是专用的鲁棒带状 SE(2) 修正 IRLS，不声称是通用完整因子图；RTAB-Map 重处理轨迹保持相对运动权威，人工锚点和地图观测只作用于派生结果。
-- 阶段三每次处理前后核对原数据库 SHA-256；失败或质量门未通过时只生成待复核派生结果，不发布为权威成果。
+- 阶段三求解器明确标记为 `bounded_correction_field`：x/y/yaw 带状平滑没有实现 RTAB‑Map 相对边/闭环边的耦合 SE(2) 残差，不具备正式发布资格。
+- 阶段三每次处理前后核对原数据库 SHA-256；所有必需 sidecar 严格校验 UTF‑8、JSON、format/version、身份、时间戳、大小和唯一 ID。失败不切换旧 current。
+- 人工编辑由服务端生成旧值、UUID、UTC 时间和 base revision；version/revision CAS 必填，重放成功后才提交新不可变版本。
 
 阈值、线程所有权、恢复策略和失败矩阵的权威说明见 `STAGE_2_DESIGN.md`。
