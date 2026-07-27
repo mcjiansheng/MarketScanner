@@ -345,7 +345,9 @@ class PriorMapConversionTests(unittest.TestCase):
         package = convert_workbook(self.workbook, self.root / "package")
         manifest = json.loads((package / "manifest.json").read_text())
         elements = json.loads((package / "elements.json").read_text())["elements"]
-        report = json.loads((package / "validation_report.json").read_text())
+        report = json.loads(
+            (package / "validation_report.json").read_text(encoding="utf-8")
+        )
         self.assertEqual(manifest["element_count"], 8)
         self.assertEqual(manifest["hidden_element_count"], 1)
         self.assertEqual([floor["id"] for floor in manifest["floors"]], ["1"])
