@@ -8,6 +8,7 @@ on:
   pull_request:
     paths:
       - ".github/workflows/marketscanner-repair-v2.yml"
+      - "app/android/jni/**"
       - "app/ios/RTABMapApp/**"
       - "docs/map-assisted-localization/**"
       - "tools/PriorMap/**"
@@ -19,7 +20,7 @@ concurrency:
 
 jobs:
   python-and-web:
-    name: Python, API and web contracts
+    name: Ubuntu Python, API and web contracts
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -32,6 +33,18 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
+      - name: Start Ubuntu test summary
+        shell: bash
+        run: |
+          mkdir -p ci-artifacts
+          {
+            echo "# MarketScanner Ubuntu validation"
+            echo
+            echo "- Head SHA: \`$(git rev-parse HEAD)\`"
+            echo "- Python: \`$(python3 --version)\`"
+            echo "- Node: \`$(node --version)\`"
+            echo "- Checks: Python compile, PriorMap tests, Map Studio tests, JavaScript syntax, complete branch diff"
+          } > ci-artifacts/ubuntu-summary.md
       - name: Compile Python sources
         run: python3 -m py_compile tools/PriorMap/*.py tools/SupermarketMapStudio/*.py
       - name: Run PriorMap tests
@@ -40,35 +53,234 @@ jobs:
         run: python3 -m unittest discover -s tools/SupermarketMapStudio/tests -v
       - name: Check browser JavaScript
         run: node --check tools/SupermarketMapStudio/web/app.js
-      - name: Check patch whitespace
+      - name: Check complete branch patch whitespace
+        if: always()
+        shell: bash
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          REPAIR_BASE_BRANCH: repair-v2-w0-ci-baseline
         run: |
           if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
-            git diff --check "${{ github.event.pull_request.base.sha }}...HEAD"
+            base_sha="$PR_BASE_SHA"
           else
-            git diff --check HEAD^
+            if git fetch --no-tags origin "$REPAIR_BASE_BRANCH"; then
+              base_sha="$(git merge-base HEAD "origin/$REPAIR_BASE_BRANCH")"
+            else
+              git fetch --no-tags origin "$DEFAULT_BRANCH"
+              base_sha="$(git merge-base HEAD "origin/$DEFAULT_BRANCH")"
+            fi
           fi
+          if [ -z "$base_sha" ]; then
+            echo "Unable to determine the complete branch diff base." >&2
+            exit 1
+          fi
+          echo "Checking complete branch diff: $base_sha...HEAD"
+          git diff --check "$base_sha...HEAD"
+          echo "- Diff base: \`$base_sha\`" >> ci-artifacts/ubuntu-summary.md
+      - name: Finalize Ubuntu test summary
+        if: always()
+        shell: bash
+        run: |
+          echo "- Job result: \`${{ job.status }}\`" >> ci-artifacts/ubuntu-summary.md
+          cat ci-artifacts/ubuntu-summary.md
+          cat ci-artifacts/ubuntu-summary.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload Ubuntu test summary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: marketscanner-ubuntu-summary-${{ github.run_id }}
+          path: ci-artifacts/ubuntu-summary.md
+          if-no-files-found: error
 
-  ios-source-contracts:
-    name: iOS source contracts
-    runs-on: macos-14
-    timeout-minutes: 20
+  windows-contracts:
+    name: Windows imports and Python contracts
+    runs-on: windows-latest
+    timeout-minutes: 25
+    env:
+      # Match direct server.py execution, where its own directory is present
+      # on sys.path, while retaining the repository root for tools.* imports.
+      PYTHONPATH: ${{ github.workspace }};${{ github.workspace }}\tools\SupermarketMapStudio
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: Parse MarketScanner Swift sources
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Start Windows test summary
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force ci-artifacts | Out-Null
+          $headSha = git rev-parse HEAD
+          $pythonVersion = python --version
+          @(
+            "# MarketScanner Windows validation"
+            ""
+            "- Head SHA: ``$headSha``"
+            "- Python: ``$pythonVersion``"
+            "- Checks: store/server imports, PriorMap tests, Map Studio tests"
+          ) | Out-File -FilePath ci-artifacts/windows-summary.md -Encoding utf8
+      - name: Import Windows-sensitive modules
+        run: |
+          python -c "import tools.PriorMap.localized_output_store"
+          python -c "import tools.SupermarketMapStudio.server"
+      - name: Run PriorMap tests on Windows
+        run: python -m unittest discover -s tools/PriorMap/tests -v
+      - name: Run Map Studio tests on Windows
+        run: python -m unittest discover -s tools/SupermarketMapStudio/tests -v
+      - name: Finalize Windows test summary
+        if: always()
+        shell: pwsh
+        run: |
+          "- Job result: ``${{ job.status }}``" | Out-File -FilePath ci-artifacts/windows-summary.md -Append -Encoding utf8
+          Get-Content ci-artifacts/windows-summary.md
+          Get-Content ci-artifacts/windows-summary.md | Add-Content $env:GITHUB_STEP_SUMMARY
+      - name: Upload Windows test summary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: marketscanner-windows-summary-${{ github.run_id }}
+          path: ci-artifacts/windows-summary.md
+          if-no-files-found: error
+
+  native-source-contracts:
+    name: Native ABI source contracts
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Start native test summary
+        shell: bash
+        run: |
+          mkdir -p ci-artifacts
+          {
+            echo "# MarketScanner native source validation"
+            echo
+            echo "- Head SHA: \`$(git rev-parse HEAD)\`"
+            echo "- Checks: NativeWrapper declaration/definition parity, Swift bridge calls, RTABMapApp method parity"
+          } > ci-artifacts/native-summary.md
+      - name: Check Swift, C wrapper and RTABMapApp symbols
+        run: python3 tools/PriorMap/tests/native_symbol_contract.py
+      - name: Record native source-contract scope
+        shell: bash
+        run: |
+          {
+            echo "- Static ABI symbol contract: passed"
+            echo "- Translation-unit compile: delegated to the conditional Xcode build because the generated iOS native dependency bundle is not stored in Git"
+          } >> ci-artifacts/native-summary.md
+      - name: Finalize native test summary
+        if: always()
+        shell: bash
+        run: |
+          echo "- Job result: \`${{ job.status }}\`" >> ci-artifacts/native-summary.md
+          cat ci-artifacts/native-summary.md
+          cat ci-artifacts/native-summary.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload native test summary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: marketscanner-native-summary-${{ github.run_id }}
+          path: ci-artifacts/native-summary.md
+          if-no-files-found: error
+
+  ios-source-contracts:
+    name: macOS and iOS source contracts
+    runs-on: macos-14
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Start macOS test summary
+        shell: bash
+        run: |
+          mkdir -p ci-artifacts
+          {
+            echo "# MarketScanner macOS/iOS validation"
+            echo
+            echo "- Head SHA: \`$(git rev-parse HEAD)\`"
+            echo "- Xcode: \`$(xcodebuild -version | head -1)\`"
+            echo "- Checks: Repair V2 Swift parse, Swift core contracts, Xcode metadata, conditional unsigned arm64 build"
+          } > ci-artifacts/macos-ios-summary.md
+      - name: Parse all MarketScanner Swift sources touched by Repair V2
+        id: swift_parse
         run: |
           xcrun swiftc -parse \
             app/ios/RTABMapApp/PriorMapLocalizationCore.swift \
             app/ios/RTABMapApp/PriorMapLocalization.swift \
+            app/ios/RTABMapApp/PriceTagLocalizationCore.swift \
             app/ios/RTABMapApp/SupermarketScanSession.swift \
-            app/ios/RTABMapApp/ViewController.swift
+            app/ios/RTABMapApp/ViewController.swift \
+            app/ios/RTABMapApp/RTABMap.swift
       - name: Run platform-independent iOS contract test
+        id: swift_contracts
         run: python3 -m unittest tools.PriorMap.tests.test_prior_map.IOSCoreContractTests -v
       - name: Validate Xcode project metadata
+        id: xcode_list
         run: xcodebuild -project app/ios/RTABMapApp.xcodeproj -list
-
-# A complete RTABMapApp link build requires the generated, intentionally
-# untracked app/ios/RTABMapApp/Libraries tree. Release validation therefore
-# runs the unsigned iphoneos build on the prepared macOS build host and records
-# its log separately; this workflow still prevents Swift/schema/API regressions.
+      - name: Build unsigned generic arm64 iOS app when native dependencies exist
+        id: ios_build
+        shell: bash
+        run: |
+          required_dependencies=(
+            app/ios/RTABMapApp/Libraries/include/rtabmap-0.23/rtabmap/core/Rtabmap.h
+            app/ios/RTABMapApp/Libraries/lib/librtabmap_core.a
+            app/ios/RTABMapApp/Libraries/lib/librtabmap_utilite.a
+            app/ios/RTABMapApp/Libraries/lib/libopencv_core.a
+            app/ios/RTABMapApp/Libraries/lib/libpcl_common.a
+          )
+          missing_dependencies=()
+          for dependency in "${required_dependencies[@]}"; do
+            if [ ! -f "$dependency" ]; then
+              missing_dependencies+=("$dependency")
+            fi
+          done
+          if [ "${#missing_dependencies[@]}" -ne 0 ]; then
+            echo "iOS build SKIPPED: generated native dependencies are unavailable on this runner."
+            printf 'Missing dependency: %s\n' "${missing_dependencies[@]}"
+            echo "status=skipped-missing-native-dependencies" >> "$GITHUB_OUTPUT"
+            echo "- Unsigned generic arm64 iOS build: **SKIPPED** (generated native dependencies unavailable; no build success claimed)" >> ci-artifacts/macos-ios-summary.md
+            exit 0
+          fi
+          xcodebuild \
+            -project app/ios/RTABMapApp.xcodeproj \
+            -scheme RTABMapApp \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath "$RUNNER_TEMP/MarketScannerDerivedData" \
+            ARCHS=arm64 \
+            ONLY_ACTIVE_ARCH=YES \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY='' \
+            build
+          echo "status=succeeded" >> "$GITHUB_OUTPUT"
+          echo "- Unsigned generic arm64 iOS build: **SUCCEEDED** (Swift and native translation units compiled and linked)" >> ci-artifacts/macos-ios-summary.md
+      - name: Finalize macOS test summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "- Swift parse step outcome: \`${{ steps.swift_parse.outcome }}\`"
+            echo "- Swift core contract step outcome: \`${{ steps.swift_contracts.outcome }}\`"
+            echo "- Xcode metadata step outcome: \`${{ steps.xcode_list.outcome }}\`"
+            echo "- Conditional iOS build step outcome: \`${{ steps.ios_build.outcome }}\`"
+            echo "- Conditional iOS build status: \`${{ steps.ios_build.outputs.status || 'not-run' }}\`"
+            echo "- Job result: \`${{ job.status }}\`"
+          } >> ci-artifacts/macos-ios-summary.md
+          cat ci-artifacts/macos-ios-summary.md
+          cat ci-artifacts/macos-ios-summary.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload macOS and iOS test summary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: marketscanner-macos-ios-summary-${{ github.run_id }}
+          path: ci-artifacts/macos-ios-summary.md
+          if-no-files-found: error
