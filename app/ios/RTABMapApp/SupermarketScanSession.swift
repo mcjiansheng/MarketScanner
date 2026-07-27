@@ -1008,8 +1008,13 @@ final class SupermarketScanSession {
     ) {
         localizationTransactionLock.lock()
         defer { localizationTransactionLock.unlock() }
+        var trace = update
+        trace.trackingSessionId = expectedTrackingSessionId
+        trace.priorMapId = scanConfiguration.priorMapId
+        trace.priorMapSha256 = scanConfiguration.priorMapSha256
+        trace.floorId = scanConfiguration.floorId
         appendLocalizationRecord(
-            update,
+            trace,
             fileName: "localization_trace.jsonl",
             expectedTrackingSessionId: expectedTrackingSessionId)
         let constraint = PriorMapConstraintRecord(

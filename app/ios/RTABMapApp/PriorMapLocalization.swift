@@ -309,6 +309,10 @@ struct PriorMapLocalizationUpdate: Codable {
     let matcherElapsedMs: Double
     let constraintAccepted: Bool
     let constraintReason: String
+    var trackingSessionId: String? = nil
+    var priorMapId: String? = nil
+    var priorMapSha256: String? = nil
+    var floorId: String? = nil
 }
 
 private struct PriorMapRoadSegment {

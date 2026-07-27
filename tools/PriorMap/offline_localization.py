@@ -17,7 +17,7 @@ import hashlib
 import json
 import math
 import shutil
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Iterable, Sequence
 
@@ -91,6 +91,63 @@ class TagPoseBinding:
     binding_source: str
 
 
+@dataclass(frozen=True)
+class JsonlContract:
+    name: str
+    record_format: str
+    versions: frozenset[int]
+    required: bool
+    allow_empty: bool
+    timestamp_fields: tuple[str, ...]
+    identity_required: bool = True
+    record_id_field: str | None = None
+    maximum_record_bytes: int = 1_000_000
+    maximum_records: int = 500_000
+
+
+TRACE_CONTRACT = JsonlContract(
+    "localization_trace",
+    "MarketScannerLocalizationTrace",
+    frozenset({1}),
+    True,
+    False,
+    ("timestamp",),
+)
+CONSTRAINT_CONTRACT = JsonlContract(
+    "localization_constraints",
+    "MarketScannerLocalizationConstraint",
+    frozenset({1}),
+    True,
+    True,
+    ("timestamp",),
+)
+STATE_EVENT_CONTRACT = JsonlContract(
+    "localization_events",
+    "MarketScannerLocalizationStateEvent",
+    frozenset({1}),
+    True,
+    False,
+    ("timestamp",),
+)
+TAG_OBSERVATION_CONTRACT = JsonlContract(
+    "tag_observations",
+    "MarketScannerPriceTagObservation",
+    frozenset({1}),
+    False,
+    True,
+    ("frame_timestamp", "frameTimestamp"),
+    record_id_field="observation_id",
+)
+MANUAL_EVENT_CONTRACT = JsonlContract(
+    "manual_localization_events",
+    "MarketScannerManualLocalizationEvent",
+    frozenset({1, 2}),
+    False,
+    True,
+    ("frame_timestamp", "frameTimestamp", "timestampUnix"),
+)
+
+
 def _json_write(path: Path, payload: Any, *, lines: bool = False) -> None:
     if lines:
         text = "".join(
@@ -137,111 +194,269 @@ def _field(record: dict[str, Any], snake: str, camel: str) -> Any:
     return record.get(snake) if record.get(snake) is not None else record.get(camel)
 
 
+def _reject_nonfinite_json(value: str) -> None:
+    raise ValueError(f"Non-finite JSON number is forbidden: {value}")
+
+
+def _identity_field(value: dict[str, Any], snake: str, camel: str) -> str:
+    return str(value.get(snake) or value.get(camel) or "")
+
+
 def _read_jsonl(
     path: Path,
-    maximum_record_bytes: int = 1_000_000,
-    maximum_records: int = 500_000,
+    contract: JsonlContract,
     *,
-    strict: bool = False,
-    required: bool = False,
-    session_id: str | None = None,
-    expected_map_hash: str | None = None,
-    expected_floor_id: str | None = None,
+    session_id: str,
+    expected_map_hash: str,
+    expected_floor_id: str,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """Read a JSONL sidecar with structure-preserving diagnostics.
-
-    Returns ``(records, diagnostics)``.  ``diagnostics`` always contains:
-    ``total_lines``, ``valid_records``, ``invalid_json_lines``,
-    ``non_object_lines``, ``oversized_lines``, ``version_mismatches``,
-    ``session_mismatches``, ``map_hash_mismatches``, ``floor_mismatches``,
-    ``truncated``.
-
-    When ``strict=True``, any structural corruption raises immediately.
-    When ``required=True``, a missing file also raises.
-
-    Session/map/floor identity checks are best-effort: they only flag
-    mismatches and never skip a valid record (non-fatal by default).
-    """
+    """Read one formally declared JSONL contract and fail closed on damage."""
     diagnostics: dict[str, Any] = {
         "file": str(path),
+        "contract": contract.name,
         "total_lines": 0,
         "valid_records": 0,
         "invalid_json_lines": 0,
+        "invalid_utf8_lines": 0,
+        "blank_lines": 0,
         "non_object_lines": 0,
         "oversized_lines": 0,
+        "format_mismatches": 0,
         "version_mismatches": 0,
         "session_mismatches": 0,
         "map_hash_mismatches": 0,
         "floor_mismatches": 0,
-        "truncated": False,
+        "timestamp_errors": 0,
+        "duplicate_ids": 0,
     }
     values: list[dict[str, Any]] = []
     if not path.is_file():
-        if required:
+        if contract.required:
             raise OfflineLocalizationError(
                 f"Required sidecar file is missing: {path.name}"
             )
         return values, diagnostics
-    malformed_samples: list[str] = []
-    max_malformed_samples = 5
-    with path.open("r", encoding="utf-8", errors="replace") as handle:
-        for line_no, line in enumerate(handle, start=1):
+    seen_ids: set[str] = set()
+    with path.open("rb") as handle:
+        for line_no, raw_line in enumerate(handle, start=1):
             diagnostics["total_lines"] += 1
-            stripped = line.strip()
-            if not stripped:
-                continue
-            if not stripped or len(line) > maximum_record_bytes:
+            if len(raw_line) > contract.maximum_record_bytes:
                 diagnostics["oversized_lines"] += 1
-                if strict:
-                    raise OfflineLocalizationError(
-                        f"Oversized record at {path.name}:{line_no}"
-                    )
-                continue
+                raise OfflineLocalizationError(
+                    f"Oversized record at {path.name}:{line_no}"
+                )
             try:
-                value = json.loads(line)
-            except json.JSONDecodeError as exc:
+                line = raw_line.decode("utf-8", errors="strict")
+            except UnicodeDecodeError as exc:
+                diagnostics["invalid_utf8_lines"] += 1
+                raise OfflineLocalizationError(
+                    f"Invalid UTF-8 at {path.name}:{line_no}"
+                ) from exc
+            if not line.strip():
+                diagnostics["blank_lines"] += 1
+                raise OfflineLocalizationError(
+                    f"Blank JSONL record at {path.name}:{line_no}"
+                )
+            try:
+                value = json.loads(line, parse_constant=_reject_nonfinite_json)
+            except (json.JSONDecodeError, ValueError) as exc:
                 diagnostics["invalid_json_lines"] += 1
-                if strict:
-                    raise OfflineLocalizationError(
-                        f"Invalid JSON at {path.name}:{line_no}: {exc}"
-                    ) from exc
-                if len(malformed_samples) < max_malformed_samples:
-                    malformed_samples.append(
-                        f"{path.name}:{line_no}: {str(exc)[:120]}"
-                    )
-                continue
+                raise OfflineLocalizationError(
+                    f"Invalid JSON at {path.name}:{line_no}: {exc}"
+                ) from exc
             if not isinstance(value, dict):
                 diagnostics["non_object_lines"] += 1
-                if strict:
-                    raise OfflineLocalizationError(
-                        f"Non-object record at {path.name}:{line_no}"
-                    )
-                continue
-            # Best-effort identity checks (non-fatal).
-            if session_id is not None and str(
-                value.get("tracking_session_id") or value.get("trackingSessionId") or ""
-            ) not in ("", session_id):
+                raise OfflineLocalizationError(
+                    f"Non-object record at {path.name}:{line_no}"
+                )
+            if value.get("format") != contract.record_format:
+                diagnostics["format_mismatches"] += 1
+                raise OfflineLocalizationError(
+                    f"Format mismatch at {path.name}:{line_no}"
+                )
+            version = value.get("version")
+            if (
+                isinstance(version, bool)
+                or not isinstance(version, int)
+                or version not in contract.versions
+            ):
+                diagnostics["version_mismatches"] += 1
+                raise OfflineLocalizationError(
+                    f"Version mismatch at {path.name}:{line_no}"
+                )
+            if contract.identity_required and _identity_field(
+                value, "tracking_session_id", "trackingSessionId"
+            ) != session_id:
                 diagnostics["session_mismatches"] += 1
-            if expected_map_hash is not None and str(
-                value.get("prior_map_sha256") or value.get("priorMapSha256") or ""
-            ) not in ("", expected_map_hash):
+                raise OfflineLocalizationError(
+                    f"Tracking-session mismatch at {path.name}:{line_no}"
+                )
+            if contract.identity_required and _identity_field(
+                value, "prior_map_sha256", "priorMapSha256"
+            ) != expected_map_hash:
                 diagnostics["map_hash_mismatches"] += 1
-            if expected_floor_id is not None and str(
-                value.get("floor_id") or value.get("floorId") or ""
-            ) not in ("", expected_floor_id):
+                raise OfflineLocalizationError(
+                    f"Prior-map hash mismatch at {path.name}:{line_no}"
+                )
+            if contract.identity_required and _identity_field(
+                value, "floor_id", "floorId"
+            ) != expected_floor_id:
                 diagnostics["floor_mismatches"] += 1
+                raise OfflineLocalizationError(
+                    f"Floor mismatch at {path.name}:{line_no}"
+                )
+            timestamp = next(
+                (value.get(field) for field in contract.timestamp_fields if field in value),
+                None,
+            )
+            try:
+                timestamp_valid = (
+                    timestamp is not None
+                    and not isinstance(timestamp, bool)
+                    and math.isfinite(float(timestamp))
+                )
+            except (TypeError, ValueError):
+                timestamp_valid = False
+            if not timestamp_valid:
+                diagnostics["timestamp_errors"] += 1
+                raise OfflineLocalizationError(
+                    f"Invalid timestamp at {path.name}:{line_no}"
+                )
+            if contract.record_id_field is not None:
+                record_id = str(value.get(contract.record_id_field) or "")
+                if not record_id or record_id in seen_ids:
+                    diagnostics["duplicate_ids"] += 1
+                    raise OfflineLocalizationError(
+                        f"Missing or duplicate {contract.record_id_field} at "
+                        f"{path.name}:{line_no}"
+                    )
+                seen_ids.add(record_id)
             values.append(value)
             diagnostics["valid_records"] += 1
-            if len(values) > maximum_records:
-                diagnostics["truncated"] = True
-                if strict:
-                    raise OfflineLocalizationError(
-                        f"{path.name} exceeds the bounded {maximum_records}-record safety limit."
-                    )
-                break
-    if malformed_samples:
-        diagnostics["malformed_samples"] = malformed_samples
+            if len(values) > contract.maximum_records:
+                raise OfflineLocalizationError(
+                    f"{path.name} exceeds the bounded "
+                    f"{contract.maximum_records}-record safety limit."
+                )
+    if not contract.allow_empty and not values:
+        raise OfflineLocalizationError(
+            f"Required sidecar file is empty: {path.name}"
+        )
     return values, diagnostics
+
+
+def _read_localized_price_tags(
+    path: Path,
+    *,
+    session_id: str,
+    expected_map_hash: str,
+    expected_floor_id: str,
+    maximum_bytes: int = 128 * 1024 * 1024,
+    maximum_records: int = 500_000,
+) -> list[dict[str, Any]]:
+    if not path.is_file():
+        return []
+    if path.stat().st_size > maximum_bytes:
+        raise OfflineLocalizationError("localized_price_tags.json exceeds its safety limit.")
+    try:
+        payload = json.loads(
+            path.read_bytes().decode("utf-8", errors="strict"),
+            parse_constant=_reject_nonfinite_json,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        raise OfflineLocalizationError(
+            f"localized_price_tags.json is invalid: {exc}"
+        ) from exc
+    if not isinstance(payload, list) or len(payload) > maximum_records:
+        raise OfflineLocalizationError(
+            "localized_price_tags.json must be a bounded array."
+        )
+    tags: list[dict[str, Any]] = []
+    tag_ids: set[str] = set()
+    observation_ids: set[str] = set()
+    for index, item in enumerate(payload):
+        if not isinstance(item, dict):
+            raise OfflineLocalizationError(
+                f"localized_price_tags.json item {index} is not an object."
+            )
+        version = item.get("version")
+        if (
+            item.get("format") != "MarketScannerLocalizedPriceTag"
+            or isinstance(version, bool)
+            or not isinstance(version, int)
+            or version != 1
+        ):
+            raise OfflineLocalizationError(
+                f"localized_price_tags.json item {index} has an invalid contract."
+            )
+        if (
+            _identity_field(item, "tracking_session_id", "trackingSessionId")
+            != session_id
+            or _identity_field(item, "prior_map_sha256", "priorMapSha256")
+            != expected_map_hash
+            or _identity_field(item, "floor_id", "floorId") != expected_floor_id
+        ):
+            raise OfflineLocalizationError(
+                f"localized_price_tags.json item {index} has mismatched identity."
+            )
+        tag_id = str(item.get("tag_id") or item.get("tagId") or "")
+        observation_id = str(
+            item.get("observation_id") or item.get("observationId") or ""
+        )
+        if (
+            not tag_id
+            or not observation_id
+            or tag_id in tag_ids
+            or observation_id in observation_ids
+        ):
+            raise OfflineLocalizationError(
+                f"localized_price_tags.json item {index} has missing/duplicate IDs."
+            )
+        try:
+            timestamp = float(item.get("timestamp"))
+            confidences = [
+                float(item.get(field))
+                for field in (
+                    "localization_confidence",
+                    "measurement_confidence",
+                    "association_confidence",
+                )
+            ]
+        except (TypeError, ValueError) as exc:
+            raise OfflineLocalizationError(
+                f"localized_price_tags.json item {index} has invalid numeric fields."
+            ) from exc
+        if (
+            not math.isfinite(timestamp)
+            or any(not math.isfinite(value) or not 0 <= value <= 1 for value in confidences)
+        ):
+            raise OfflineLocalizationError(
+                f"localized_price_tags.json item {index} has out-of-range numeric fields."
+            )
+        for position_field in ("raw_map_position", "snapped_map_position"):
+            position = item.get(position_field)
+            if position is None:
+                continue
+            if not isinstance(position, dict):
+                raise OfflineLocalizationError(
+                    f"localized_price_tags.json item {index} has invalid {position_field}."
+                )
+            try:
+                coordinates = [float(position["x_m"]), float(position["y_m"])]
+                if position.get("height_m") is not None:
+                    coordinates.append(float(position["height_m"]))
+            except (KeyError, TypeError, ValueError) as exc:
+                raise OfflineLocalizationError(
+                    f"localized_price_tags.json item {index} has invalid {position_field}."
+                ) from exc
+            if any(not math.isfinite(value) for value in coordinates):
+                raise OfflineLocalizationError(
+                    f"localized_price_tags.json item {index} has non-finite {position_field}."
+                )
+        tag_ids.add(tag_id)
+        observation_ids.add(observation_id)
+        tags.append(dict(item))
+    return tags
 
 
 def _nearest_pose_index(poses: Sequence[Pose], timestamp: float | None) -> int:
@@ -1909,35 +2124,66 @@ def _render_localized_version(
     if progress:
         progress(84, "先验地图轨迹优化", "正在读取在线约束并建立稳健 SE(2) 修正问题")
 
+    sidecar_session_id = str(metadata.get("trackingSessionId") or "")
+    sidecar_map_hash = str(metadata.get("priorMapSha256") or "")
+    sidecar_floor_id = str(metadata.get("floorId") or "")
+    if not sidecar_session_id or not sidecar_map_hash or not sidecar_floor_id:
+        raise OfflineLocalizationError(
+            "Localized metadata requires tracking session, prior-map hash and floor identities."
+        )
+    raw_tags = _read_localized_price_tags(
+        segment / "localized_price_tags.json",
+        session_id=sidecar_session_id,
+        expected_map_hash=sidecar_map_hash,
+        expected_floor_id=sidecar_floor_id,
+    )
     trace, trace_diag = _read_jsonl(
-        segment / "localization_trace.jsonl", required=True, strict=True
+        segment / "localization_trace.jsonl",
+        TRACE_CONTRACT,
+        session_id=sidecar_session_id,
+        expected_map_hash=sidecar_map_hash,
+        expected_floor_id=sidecar_floor_id,
     )
     raw_constraints, constraint_diag = _read_jsonl(
         segment / "localization_constraints.jsonl",
-        session_id=str(metadata.get("trackingSessionId") or ""),
+        CONSTRAINT_CONTRACT,
+        session_id=sidecar_session_id,
+        expected_map_hash=sidecar_map_hash,
+        expected_floor_id=sidecar_floor_id,
     )
     manual_events, manual_diag = _read_jsonl(
         segment / "manual_localization_events.jsonl",
-        session_id=str(metadata.get("trackingSessionId") or ""),
+        MANUAL_EVENT_CONTRACT,
+        session_id=sidecar_session_id,
+        expected_map_hash=sidecar_map_hash,
+        expected_floor_id=sidecar_floor_id,
     )
     tag_observations, obs_diag = _read_jsonl(
         segment / "tag_observations.jsonl",
-        session_id=str(metadata.get("trackingSessionId") or ""),
+        replace(
+            TAG_OBSERVATION_CONTRACT,
+            required=bool(raw_tags),
+            allow_empty=not bool(raw_tags),
+        ),
+        session_id=sidecar_session_id,
+        expected_map_hash=sidecar_map_hash,
+        expected_floor_id=sidecar_floor_id,
+    )
+    state_events, state_diag = _read_jsonl(
+        segment / "localization_events.jsonl",
+        STATE_EVENT_CONTRACT,
+        session_id=sidecar_session_id,
+        expected_map_hash=sidecar_map_hash,
+        expected_floor_id=sidecar_floor_id,
     )
     jsonl_diagnostics = {
         "localization_trace": trace_diag,
         "localization_constraints": constraint_diag,
         "manual_localization_events": manual_diag,
         "tag_observations": obs_diag,
+        "localization_events": state_diag,
     }
-    has_critical_jsonl_damage = any(
-        diag.get("invalid_json_lines", 0) > 0 or diag.get("truncated", False)
-        for diag in jsonl_diagnostics.values()
-    )
-    raw_tags_value = load_json(segment / "localized_price_tags.json") if (
-        segment / "localized_price_tags.json"
-    ).is_file() else []
-    raw_tags = [dict(item) for item in raw_tags_value if isinstance(item, dict)]
+    has_critical_jsonl_damage = False
     initial = _pose_from(metadata.get("initialMapPose"))
     if initial is None:
         first_trace = next(
@@ -2306,11 +2552,6 @@ def _render_localized_version(
     # `automatic_publish_allowed` only ever yields DRAFT; REVIEW requires
     # explicit user submission; PUBLISHED requires an explicit approval event.
     # Any critical JSONL damage or stale node binding prevents even draft.
-    state_events, state_diag = _read_jsonl(segment / "localization_events.jsonl")
-    jsonl_diagnostics["localization_events"] = state_diag
-    has_critical_jsonl_damage = has_critical_jsonl_damage or (
-        state_diag.get("invalid_json_lines", 0) > 0
-    )
     allow_draft = (
         bool(optimized)
         and not has_critical_jsonl_damage

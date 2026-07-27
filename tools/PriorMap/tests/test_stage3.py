@@ -639,7 +639,12 @@ class LocalizedPipelineTests(unittest.TestCase):
         ]
         trace = [
             {
+                "format": "MarketScannerLocalizationTrace",
+                "version": 1,
                 "timestamp": float(index),
+                "trackingSessionId": "tracking-1",
+                "priorMapSha256": manifest["source_sha256"],
+                "floorId": "1",
                 "estimated_pose": {
                     "x_m": 1.5 + 0.5 * index,
                     "y_m": -2.5,
@@ -651,13 +656,23 @@ class LocalizedPipelineTests(unittest.TestCase):
         ]
         constraints = [
             {
+                "format": "MarketScannerLocalizationConstraint",
+                "version": 1,
                 "timestamp": 19.0,
+                "tracking_session_id": "tracking-1",
+                "prior_map_sha256": manifest["source_sha256"],
+                "floor_id": "1",
                 "accepted": True,
                 "estimated_pose": {"x_m": 11.0, "y_m": -2.5, "yaw_rad": 0},
                 "uniqueness": 0.8,
             },
             {
+                "format": "MarketScannerLocalizationConstraint",
+                "version": 1,
                 "timestamp": 10.0,
+                "tracking_session_id": "tracking-1",
+                "prior_map_sha256": manifest["source_sha256"],
+                "floor_id": "1",
                 "accepted": True,
                 "estimated_pose": {"x_m": 99.0, "y_m": 99.0, "yaw_rad": 2.0},
                 "uniqueness": 0.9,
@@ -668,15 +683,29 @@ class LocalizedPipelineTests(unittest.TestCase):
         jsonl_write(
             self.segment / "localization_events.jsonl",
             [
-                {"timestamp": 0.0, "state": "usable", "reason": "initial"},
-                {"timestamp": 5.0, "state": "weak", "reason": "low_uniqueness"},
-                {"timestamp": 8.0, "state": "lost", "reason": "stale"},
-                {"timestamp": 10.0, "state": "stable", "reason": "recovered"},
+                {
+                    "format": "MarketScannerLocalizationStateEvent",
+                    "version": 1,
+                    "timestamp": timestamp,
+                    "state": state,
+                    "reason": reason,
+                    "tracking_session_id": "tracking-1",
+                    "prior_map_sha256": manifest["source_sha256"],
+                    "floor_id": "1",
+                }
+                for timestamp, state, reason in (
+                    (0.0, "usable", "initial"),
+                    (5.0, "weak", "low_uniqueness"),
+                    (8.0, "lost", "stale"),
+                    (10.0, "stable", "recovered"),
+                )
             ],
         )
         jsonl_write(
             self.segment / "tag_observations.jsonl",
             [{
+                "format": "MarketScannerPriceTagObservation",
+                "version": 1,
                 "observation_id": "obs-1",
                 "frame_timestamp": 10.0,
                 "tracking_session_id": "tracking-1",
@@ -689,9 +718,12 @@ class LocalizedPipelineTests(unittest.TestCase):
             self.segment / "localized_price_tags.json",
             [
                 {
+                    "format": "MarketScannerLocalizedPriceTag",
+                    "version": 1,
                     "tag_id": "tag-1",
                     "observation_id": "obs-1",
                     "payload": "690000000001",
+                    "timestamp": 10.0,
                     "tracking_session_id": "tracking-1",
                     "prior_map_sha256": manifest["source_sha256"],
                     "floor_id": "1",
@@ -787,25 +819,18 @@ class LocalizedPipelineTests(unittest.TestCase):
     def test_missing_tag_observation_never_defaults_to_node_zero(self) -> None:
         jsonl_write(self.segment / "tag_observations.jsonl", [])
         output = self.root / "localized-missing-observation"
-        process_localized_session(
-            self.prior_map,
-            self.session,
-            self.poses,
-            self.source_database,
-            self.optimized_database,
-            output,
-        )
-        snapshot = LocalizedVersionStore(output).current()
-        self.assertIsNotNone(snapshot)
-        assert snapshot is not None
-        tag = json.loads(
-            (snapshot.version_dir / "localized_price_tags.json").read_text()
-        )[0]
-        self.assertTrue(tag["needs_review"])
-        self.assertEqual(tag["approval_status"], "pending")
-        self.assertNotIn("final_map_position", tag)
-        self.assertEqual(tag["transform_audit"]["status"], "not_applied")
-        self.assertEqual(tag["association_audit"]["status"], "not_attempted")
+        with self.assertRaisesRegex(
+            OfflineLocalizationError, "tag_observations.jsonl"
+        ):
+            process_localized_session(
+                self.prior_map,
+                self.session,
+                self.poses,
+                self.source_database,
+                self.optimized_database,
+                output,
+            )
+        self.assertIsNone(LocalizedVersionStore(output).current())
 
     def test_legacy_manual_wall_clock_event_is_audited_not_applied(self) -> None:
         jsonl_write(
@@ -814,6 +839,11 @@ class LocalizedPipelineTests(unittest.TestCase):
                 "format": "MarketScannerManualLocalizationEvent",
                 "version": 1,
                 "timestampUnix": 1_800_000_000.0,
+                "trackingSessionId": "tracking-1",
+                "priorMapSha256": json.loads(
+                    (self.prior_map / "manifest.json").read_text()
+                )["source_sha256"],
+                "floorId": "1",
                 "confirmedMapPose": {"x_m": 50.0, "y_m": 50.0, "yaw_rad": 0.0},
             }],
         )
@@ -831,6 +861,114 @@ class LocalizedPipelineTests(unittest.TestCase):
             report["manual_localization_event_audit"][0]["reason"],
             "manual_event_legacy_or_unknown_version",
         )
+
+    def test_sidecar_invalid_utf8_and_nonfinite_numbers_fail_closed(self) -> None:
+        trace_path = self.segment / "localization_trace.jsonl"
+        trace_path.write_bytes(trace_path.read_bytes() + b"\xff\n")
+        with self.assertRaisesRegex(OfflineLocalizationError, "Invalid UTF-8"):
+            process_localized_session(
+                self.prior_map,
+                self.session,
+                self.poses,
+                self.source_database,
+                self.optimized_database,
+                self.root / "invalid-utf8",
+            )
+
+        self.setUp_sidecar_trace_after_corruption()
+        events_path = self.segment / "localization_events.jsonl"
+        event = json.loads(events_path.read_text().splitlines()[0])
+        event["timestamp"] = float("nan")
+        jsonl_write(events_path, [event])
+        with self.assertRaisesRegex(OfflineLocalizationError, "Non-finite"):
+            process_localized_session(
+                self.prior_map,
+                self.session,
+                self.poses,
+                self.source_database,
+                self.optimized_database,
+                self.root / "invalid-nan",
+            )
+
+    def setUp_sidecar_trace_after_corruption(self) -> None:
+        manifest = json.loads((self.prior_map / "manifest.json").read_text())
+        jsonl_write(
+            self.segment / "localization_trace.jsonl",
+            [
+                {
+                    "format": "MarketScannerLocalizationTrace",
+                    "version": 1,
+                    "timestamp": float(index),
+                    "trackingSessionId": "tracking-1",
+                    "priorMapSha256": manifest["source_sha256"],
+                    "floorId": "1",
+                    "estimated_pose": {
+                        "x_m": 1.5 + 0.5 * index,
+                        "y_m": -2.5,
+                        "yaw_rad": 0,
+                    },
+                }
+                for index in range(20)
+            ],
+        )
+
+    def test_sidecar_identity_and_duplicate_observation_ids_fail_closed(self) -> None:
+        constraints_path = self.segment / "localization_constraints.jsonl"
+        constraints = [
+            json.loads(line) for line in constraints_path.read_text().splitlines()
+        ]
+        constraints[0]["floor_id"] = "wrong-floor"
+        jsonl_write(constraints_path, constraints)
+        with self.assertRaisesRegex(OfflineLocalizationError, "Floor mismatch"):
+            process_localized_session(
+                self.prior_map,
+                self.session,
+                self.poses,
+                self.source_database,
+                self.optimized_database,
+                self.root / "identity-mismatch",
+            )
+
+        constraints[0]["floor_id"] = "1"
+        jsonl_write(constraints_path, constraints)
+        observations_path = self.segment / "tag_observations.jsonl"
+        observation = json.loads(observations_path.read_text().splitlines()[0])
+        jsonl_write(observations_path, [observation, observation])
+        with self.assertRaisesRegex(OfflineLocalizationError, "duplicate observation_id"):
+            process_localized_session(
+                self.prior_map,
+                self.session,
+                self.poses,
+                self.source_database,
+                self.optimized_database,
+                self.root / "duplicate-observation",
+            )
+
+    def test_localized_tag_contract_and_required_state_events_fail_closed(self) -> None:
+        tags_path = self.segment / "localized_price_tags.json"
+        tags = json.loads(tags_path.read_text())
+        json_write(tags_path, [tags[0], tags[0]])
+        with self.assertRaisesRegex(OfflineLocalizationError, "missing/duplicate IDs"):
+            process_localized_session(
+                self.prior_map,
+                self.session,
+                self.poses,
+                self.source_database,
+                self.optimized_database,
+                self.root / "duplicate-tags",
+            )
+
+        json_write(tags_path, tags)
+        (self.segment / "localization_events.jsonl").unlink()
+        with self.assertRaisesRegex(OfflineLocalizationError, "Required sidecar"):
+            process_localized_session(
+                self.prior_map,
+                self.session,
+                self.poses,
+                self.source_database,
+                self.optimized_database,
+                self.root / "missing-events",
+            )
 
 
 if __name__ == "__main__":
