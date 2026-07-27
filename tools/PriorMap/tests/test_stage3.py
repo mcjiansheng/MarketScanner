@@ -799,6 +799,15 @@ class LocalizedPipelineTests(unittest.TestCase):
             )
         self.assertEqual(first["rejected_constraint_count"], 1)
         self.assertTrue(first["allow_draft"])
+        self.assertEqual(first["solver"]["type"], "bounded_correction_field")
+        self.assertFalse(first["solver"]["published_capable"])
+        self.assertIn("objective_before", first["solver"])
+        self.assertIn("maximum_local_relative_translation_change_m", first["solver"])
+        self.assertFalse(first["publish_gate"]["passed"])
+        self.assertIn(
+            "solver_not_full_relative_se2_factor_graph",
+            {item["code"] for item in first["publish_gate"]["blockers"]},
+        )
         self.assertEqual(first["weak_lost_duration_seconds"], 5.0)
         # source_database_immutable is in source_manifest, not report
         self.assertTrue(

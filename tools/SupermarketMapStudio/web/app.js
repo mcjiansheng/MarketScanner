@@ -26,6 +26,7 @@ const localizedReview = {
   selectedTagId: null,
   versionId: null,
   revision: null,
+  publishState: null,
 };
 
 const viewer2d = {
@@ -118,6 +119,14 @@ function setBusy(busy) {
   });
   $$(".tab").forEach((button) => { button.disabled = busy; });
   if (!busy) updateSingleAlignmentState();
+  if (!busy) syncLocalizedStateButtons();
+}
+
+function syncLocalizedStateButtons() {
+  const state = localizedReview.publishState;
+  $("#localized-submit-review").disabled = state !== "draft";
+  $("#localized-publish").disabled = state !== "review";
+  $("#localized-revoke").disabled = state !== "published";
 }
 
 async function request(path, options = {}) {
@@ -703,9 +712,12 @@ async function renderJob(job) {
     localizedReview.revision = Number.isInteger(job.localized?.revision)
       ? job.localized.revision
       : null;
+    localizedReview.publishState = job.localized?.publish_state || null;
+    syncLocalizedStateButtons();
   } else {
     localizedReview.versionId = null;
     localizedReview.revision = null;
+    localizedReview.publishState = null;
   }
   const shelfLoadToken = ++shelfTuning.loadToken;
   clearShelfTuning(Boolean(job.artifacts?.["shelf_outline_evidence.json"]));
@@ -1026,6 +1038,50 @@ async function applyLocalizedEdit(action) {
     }
     status.textContent = error.message;
     setStatus(error.message, "failed");
+  } finally {
+    setBusy(false);
+  }
+}
+
+async function applyLocalizedState(action) {
+  if (!completedJobId || !localizedReview.versionId || !Number.isInteger(localizedReview.revision)) {
+    setStatus("当前结果缺少可操作的版本信息", "failed");
+    return;
+  }
+  const reason = $("#localized-edit-reason").value.trim();
+  const stateStatus = $("#localized-state-status");
+  if (!reason) {
+    stateStatus.textContent = "请先填写复核原因/审核说明";
+    setStatus(stateStatus.textContent, "failed");
+    return;
+  }
+  try {
+    setBusy(true);
+    const result = await request(`/api/jobs/${completedJobId}/localized/state`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        action,
+        reason,
+        expected_version_id: localizedReview.versionId,
+        expected_revision: localizedReview.revision,
+      }),
+    });
+    stateStatus.textContent = `状态已更新为 ${result.publish_state}（${result.version_id}）`;
+    await renderJob(result.job);
+    setStatus("本地化状态已原子更新", "complete");
+  } catch (error) {
+    if (error.status === 409 && completedJobId) {
+      const latest = await request(`/api/jobs/${completedJobId}`).catch(() => null);
+      if (latest) await renderJob(latest);
+      stateStatus.textContent = "版本冲突：已刷新最新结果";
+    } else if (error.status === 422) {
+      const codes = (error.payload?.blockers || []).map((item) => item.code).join("、");
+      stateStatus.textContent = `${error.message}${codes ? ` 阻断项：${codes}` : ""}`;
+    } else {
+      stateStatus.textContent = error.message;
+    }
+    setStatus(stateStatus.textContent, "failed");
   } finally {
     setBusy(false);
   }
@@ -2966,6 +3022,9 @@ function bindEvents() {
   $("#localized-apply-edit").addEventListener("click", () => applyLocalizedEdit("append"));
   $("#localized-undo").addEventListener("click", () => applyLocalizedEdit("undo"));
   $("#localized-redo").addEventListener("click", () => applyLocalizedEdit("redo"));
+  $("#localized-submit-review").addEventListener("click", () => applyLocalizedState("submit_review"));
+  $("#localized-publish").addEventListener("click", () => applyLocalizedState("publish"));
+  $("#localized-revoke").addEventListener("click", () => applyLocalizedState("revoke"));
   $("#localized-edit-type").addEventListener("change", updateLocalizedEditHelp);
   $("#localized-tag-filter").addEventListener("change", renderLocalizedReviewList);
   $("#localized-shelf-filter").addEventListener("input", renderLocalizedReviewList);

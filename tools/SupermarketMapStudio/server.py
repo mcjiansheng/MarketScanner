@@ -125,6 +125,18 @@ class ConflictError(RequestError):
         }
 
 
+class QualityGateError(RequestError):
+    status = HTTPStatus.UNPROCESSABLE_ENTITY
+    code = "quality_gate_blocked"
+
+    def __init__(self, message: str, blockers: List[Dict[str, Any]]):
+        super().__init__(message)
+        self.blockers = blockers
+
+    def details(self) -> Dict[str, Any]:
+        return {**super().details(), "blockers": self.blockers}
+
+
 @dataclass
 class Job:
     identifier: str
@@ -504,6 +516,13 @@ def job_payload(job: Job) -> Dict[str, Any]:
                 "revision": snapshot.revision,
                 "publish_state": snapshot.state,
             }
+            published = store.published()
+            if published is not None:
+                payload["localized"]["published"] = {
+                    "version_id": published.version_id,
+                    "revision": published.revision,
+                    "publish_state": published.state,
+                }
             payload["quality_report"] = load_json(
                 snapshot.version_dir / "localization_report.json", {}
             )
@@ -1601,6 +1620,85 @@ def apply_localized_edit(job: Job, data: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def apply_localized_state_transition(
+    job: Job, data: Dict[str, Any]
+) -> Dict[str, Any]:
+    if job.kind != "localized" or job.status != "complete":
+        raise RequestError("发布状态操作只适用于已完成的本地化任务。")
+    with STATE.acquire_edit_lock(job.identifier):
+        store = LocalizedVersionStore(job.output_dir)
+        current = store.current()
+        if current is None:
+            raise RequestError("结果缺少已验证的 current 本地化版本。")
+        expected_revision = data.get("expected_revision")
+        expected_version = data.get("expected_version_id")
+        if (
+            isinstance(expected_revision, bool)
+            or not isinstance(expected_revision, int)
+            or not isinstance(expected_version, str)
+            or not expected_version
+        ):
+            raise RequestError(
+                "状态操作必须提供整数 expected_revision 和 expected_version_id。"
+            )
+        if (
+            expected_revision != current.revision
+            or expected_version != current.version_id
+        ):
+            raise ConflictError(
+                "发布状态冲突，请刷新最新版本后重试。",
+                version_id=current.version_id,
+                revision=current.revision,
+            )
+        action = str(data.get("action") or "")
+        targets = {
+            "submit_review": "review",
+            "return_to_draft": "draft",
+            "publish": "published",
+            "revoke": "revoked",
+        }
+        if action not in targets:
+            raise RequestError("不支持的本地化状态操作。")
+        reason = data.get("reason")
+        if not isinstance(reason, str) or not reason.strip() or len(reason) > 500:
+            raise RequestError("状态操作必须提供 1 到 500 字符的审核说明。")
+        report = load_json(current.version_dir / "localization_report.json", None)
+        if not isinstance(report, dict):
+            raise RequestError("当前版本缺少有效的 localization_report.json。")
+        if action == "submit_review":
+            gate = report.get("review_gate")
+            blockers = gate.get("blockers", []) if isinstance(gate, dict) else []
+            if not isinstance(gate, dict) or gate.get("passed") is not True:
+                raise QualityGateError("结果尚未通过 review 门禁。", blockers)
+        elif action == "publish":
+            gate = report.get("publish_gate")
+            blockers = gate.get("blockers", []) if isinstance(gate, dict) else []
+            solver = report.get("solver")
+            if (
+                not isinstance(gate, dict)
+                or gate.get("passed") is not True
+                or not isinstance(solver, dict)
+                or solver.get("full_factor_graph") is not True
+            ):
+                if not blockers:
+                    blockers = [{"code": "publish_gate_not_satisfied"}]
+                raise QualityGateError(
+                    "当前有界修正场仅允许草稿/复核，不能发布。", blockers
+                )
+        try:
+            snapshot = store.transition_current(
+                targets[action], actor="local-user", reason=reason.strip()
+            )
+        except LocalizedStoreError as exc:
+            raise RequestError(str(exc)) from exc
+    return {
+        "version_id": snapshot.version_id,
+        "revision": snapshot.revision,
+        "publish_state": snapshot.state,
+        "job": job_payload(job),
+    }
+
+
 def run_multi(data: Dict[str, Any], output: Path, progress: Optional[ProgressCallback] = None) -> None:
     raw_devices = data.get("devices")
     if not isinstance(raw_devices, list) or len(raw_devices) < 2:
@@ -1923,6 +2021,16 @@ class StudioHandler(BaseHTTPRequestHandler):
                 if job is None:
                     raise RequestError("Completed localized job not found.")
                 self.send_json(HTTPStatus.OK, apply_localized_edit(job, data))
+                return
+            if path.startswith("/api/jobs/") and path.endswith("/localized/state"):
+                job_id = path.split("/")[3]
+                job = STATE.get(job_id)
+                if job is None:
+                    raise RequestError("Completed localized job not found.")
+                self.send_json(
+                    HTTPStatus.OK,
+                    apply_localized_state_transition(job, data),
+                )
                 return
             if path.startswith("/api/jobs/") and path.endswith("/open"):
                 job_id = path.split("/")[3]

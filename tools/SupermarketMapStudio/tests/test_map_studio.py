@@ -32,6 +32,7 @@ def create_localized_store(
     *,
     source_manifest: dict | None = None,
     journal: dict | None = None,
+    report: dict | None = None,
 ):
     store = server.LocalizedVersionStore(output)
     previous = store.current()
@@ -39,11 +40,13 @@ def create_localized_store(
     payloads = {
         "prior_map_manifest.json": {},
         "source_manifest.json": source_manifest or {},
-        "processing_manifest.json": {},
+        "processing_manifest.json": {
+            "publish_state": (report or {}).get("publish_state", "draft")
+        },
         "online_localization_trace.json": [],
         "optimized_map_trajectory.geojson": {"type": "FeatureCollection", "features": []},
         "localization_constraints.json": {"raw": []},
-        "localization_report.json": {"publish_state": "draft"},
+        "localization_report.json": report or {"publish_state": "draft"},
         "review_items.json": {"items": []},
         "localized_review.json": {},
         "manual_edits.json": journal or {"revision": revision, "events": [], "cursor": 0},
@@ -565,6 +568,56 @@ class MapStudioApiTests(unittest.TestCase):
         assert current is not None
         self.assertEqual(current.version_id, first.version_id)
         self.assertEqual(current.revision, first.revision)
+
+    def test_review_transition_is_versioned_and_bounded_solver_cannot_publish(self) -> None:
+        output = self.root / "localized-publish-gate"
+        draft = create_localized_store(
+            output,
+            report={
+                "publish_state": "draft",
+                "review_gate": {"passed": True, "blockers": []},
+                "publish_gate": {
+                    "passed": False,
+                    "blockers": [
+                        {"code": "solver_not_full_relative_se2_factor_graph"}
+                    ],
+                },
+                "solver": {
+                    "type": "bounded_correction_field",
+                    "full_factor_graph": False,
+                },
+            },
+        )
+        job = server.STATE.add("localized", output)
+        server.STATE.set_status(job.identifier, "complete")
+        review = self.api(
+            f"/api/jobs/{job.identifier}/localized/state",
+            {
+                "action": "submit_review",
+                "reason": "review checks complete",
+                "expected_version_id": draft.version_id,
+                "expected_revision": draft.revision,
+            },
+        )
+        self.assertEqual(review["publish_state"], "review")
+        self.assertNotEqual(review["version_id"], draft.version_id)
+        with self.assertRaises(HTTPError) as blocked:
+            self.api(
+                f"/api/jobs/{job.identifier}/localized/state",
+                {
+                    "action": "publish",
+                    "reason": "attempt explicit publication",
+                    "expected_version_id": review["version_id"],
+                    "expected_revision": review["revision"],
+                },
+            )
+        self.assertEqual(blocked.exception.code, 422)
+        self.assertEqual(blocked.exception.payload["code"], "quality_gate_blocked")
+        self.assertIn(
+            "solver_not_full_relative_se2_factor_graph",
+            {item["code"] for item in blocked.exception.payload["blockers"]},
+        )
+        self.assertIsNone(server.LocalizedVersionStore(output).published())
 
     def test_prior_map_api_converts_validates_and_serves_preview(self) -> None:
         workbook = self.root / "prior-map.xlsx"
@@ -1460,6 +1513,9 @@ class MapStudioApiTests(unittest.TestCase):
             b'id="localized-redo"',
             b'id="localized-apply-edit"',
             b'id="localized-edit-reason"',
+            b'id="localized-submit-review"',
+            b'id="localized-publish"',
+            b'id="localized-revoke"',
         ):
             self.assertIn(marker, html)
         self.assertIn(b'kind: "localized"', script)
@@ -1467,6 +1523,7 @@ class MapStudioApiTests(unittest.TestCase):
         self.assertIn(b"allow_auto_publish", script)
         self.assertIn(b"expected_revision", script)
         self.assertIn(b"expected_version_id", script)
+        self.assertIn(b"/localized/state", script)
         self.assertIn(b"drawLocalizedReview", script)
 
     def test_unsafe_optimized_pose_jump_is_rejected_before_publication(self) -> None:

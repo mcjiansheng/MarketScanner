@@ -122,6 +122,34 @@ class LocalizedVersionStoreTests(unittest.TestCase):
         with self.assertRaises(LocalizedStoreError):
             self.store.current()
 
+    def test_state_transitions_create_new_versions_and_publication_audit(self) -> None:
+        draft = self.commit_valid()
+        review = self.store.transition_current(
+            "review", actor="reviewer", reason="quality checks complete"
+        )
+        self.assertNotEqual(review.version_id, draft.version_id)
+        self.assertEqual(review.state, "review")
+        self.assertEqual(
+            json.loads(
+                (review.version_dir / "localization_report.json").read_text()
+            )["publish_state"],
+            "review",
+        )
+        published = self.store.transition_current(
+            "published", actor="publisher", reason="explicit approval"
+        )
+        self.assertEqual(published.state, "published")
+        self.assertEqual(self.store.published(), published)
+        revoked = self.store.transition_current(
+            "revoked", actor="publisher", reason="field issue"
+        )
+        self.assertEqual(revoked.state, "revoked")
+        self.assertEqual(self.store.published(), revoked)
+        self.assertIn(
+            "localized_state_transition",
+            (revoked.version_dir / "audit_log.jsonl").read_text(),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

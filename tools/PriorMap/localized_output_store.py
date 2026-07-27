@@ -32,6 +32,9 @@ REQUIRED_VERSION_FILES = (
     "shelf_tag_index.json",
     "audit_log.jsonl",
 )
+VERSION_STATES = frozenset(
+    {"invalid", "draft", "review", "published", "superseded", "revoked"}
+)
 
 
 class LocalizedStoreError(ValueError):
@@ -55,6 +58,10 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _reject_nonfinite(value: str) -> None:
+    raise ValueError(f"Non-finite JSON number is forbidden: {value}")
+
+
 def _fsync_file(path: Path) -> None:
     with path.open("rb") as handle:
         os.fsync(handle.fileno())
@@ -73,7 +80,14 @@ def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
     temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
     try:
         with temporary.open("w", encoding="utf-8") as handle:
-            json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
+            json.dump(
+                payload,
+                handle,
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+                allow_nan=False,
+            )
             handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
@@ -152,8 +166,11 @@ class LocalizedVersionStore:
                 raise LocalizedStoreError(f"Localized artifact is empty: {name}")
             if path.suffix in {".json", ".geojson"}:
                 try:
-                    parsed[name] = json.loads(path.read_text(encoding="utf-8"))
-                except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                    parsed[name] = json.loads(
+                        path.read_text(encoding="utf-8"),
+                        parse_constant=_reject_nonfinite,
+                    )
+                except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
                     raise LocalizedStoreError(f"Localized JSON is invalid: {name}: {exc}") from exc
         for name in ("optimized_map_trajectory.geojson", "localized_price_tags.geojson"):
             if parsed[name].get("type") != "FeatureCollection":
@@ -168,7 +185,7 @@ class LocalizedVersionStore:
         report = parsed["localization_report.json"]
         journal = parsed["manual_edits.json"]
         state = str(report.get("publish_state") or "invalid")
-        if state not in {"invalid", "draft", "review", "published"}:
+        if state not in VERSION_STATES:
             raise LocalizedStoreError(f"Localized publish state is invalid: {state}")
         try:
             revision = int(journal.get("revision"))
@@ -213,7 +230,14 @@ class LocalizedVersionStore:
         }
         manifest_path = staging / "version_manifest.json"
         with manifest_path.open("w", encoding="utf-8") as handle:
-            json.dump(manifest, handle, ensure_ascii=False, indent=2, sort_keys=True)
+            json.dump(
+                manifest,
+                handle,
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+                allow_nan=False,
+            )
             handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
@@ -249,6 +273,80 @@ class LocalizedVersionStore:
                 "manifest_sha256": snapshot.manifest_sha256,
             },
         )
+
+    def transition_current(
+        self,
+        target_state: str,
+        *,
+        actor: str,
+        reason: str,
+    ) -> LocalizedSnapshot:
+        current = self.current()
+        if current is None:
+            raise LocalizedStoreError("Localized current version is missing.")
+        allowed = {
+            "draft": {"review"},
+            "review": {"draft", "published"},
+            "published": {"revoked", "superseded"},
+            "revoked": set(),
+            "superseded": set(),
+            "invalid": set(),
+        }
+        if target_state not in allowed.get(current.state, set()):
+            raise LocalizedStoreError(
+                f"Localized state transition is invalid: {current.state} -> {target_state}"
+            )
+        staging = self.begin()
+        try:
+            for name in REQUIRED_VERSION_FILES:
+                shutil.copy2(current.version_dir / name, staging / name)
+            now = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+            for name in ("localization_report.json", "processing_manifest.json"):
+                path = staging / name
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                payload["publish_state"] = target_state
+                history = list(payload.get("state_history", []))
+                history.append(
+                    {
+                        "from": current.state,
+                        "to": target_state,
+                        "actor": actor,
+                        "reason": reason,
+                        "created_at_utc": now,
+                    }
+                )
+                payload["state_history"] = history
+                _atomic_json(path, payload)
+            with (staging / "audit_log.jsonl").open(
+                "a", encoding="utf-8"
+            ) as handle:
+                json.dump(
+                    {
+                        "event": "localized_state_transition",
+                        "from": current.state,
+                        "to": target_state,
+                        "actor": actor,
+                        "reason": reason,
+                        "created_at_utc": now,
+                    },
+                    handle,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                    allow_nan=False,
+                )
+                handle.write("\n")
+            manifest = self.validate_staging(
+                staging, parent_version=current.version_id
+            )
+            snapshot = self.commit(staging, manifest, update_current=True)
+            if target_state in {"published", "revoked"}:
+                self.write_pointer("published.json", snapshot)
+            return snapshot
+        except Exception:
+            if staging.exists():
+                self.abort(staging)
+            raise
 
     def resolve_pointer(self, name: str) -> LocalizedSnapshot | None:
         pointer_path = self.root / name
@@ -290,7 +388,7 @@ class LocalizedVersionStore:
             manifest.get("format") != "MarketScannerLocalizedVersionManifest"
             or manifest.get("version") != 1
             or manifest.get("version_id") != version_id
-            or state not in {"invalid", "draft", "review", "published"}
+            or state not in VERSION_STATES
             or revision < 1
         ):
             raise LocalizedStoreError(

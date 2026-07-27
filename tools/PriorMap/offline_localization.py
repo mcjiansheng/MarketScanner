@@ -151,12 +151,24 @@ MANUAL_EVENT_CONTRACT = JsonlContract(
 def _json_write(path: Path, payload: Any, *, lines: bool = False) -> None:
     if lines:
         text = "".join(
-            json.dumps(item, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+            json.dumps(
+                item,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+                allow_nan=False,
+            )
             + "\n"
             for item in payload
         )
     else:
-        text = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+        text = json.dumps(
+            payload,
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+            allow_nan=False,
+        ) + "\n"
     path.write_text(text, encoding="utf-8")
 
 
@@ -1154,6 +1166,71 @@ def optimize_trajectory(
         for item in active
     ]
     return optimized, accepted, rejected
+
+
+def bounded_correction_metrics(
+    baseline: Sequence[Pose],
+    optimized: Sequence[Pose],
+    constraints: Sequence[AbsoluteConstraint],
+) -> dict[str, Any]:
+    def objective(poses: Sequence[Pose]) -> float:
+        total = 0.0
+        for constraint in constraints:
+            pose = poses[constraint.node_index]
+            translation = math.hypot(constraint.x - pose.x, constraint.y - pose.y)
+            yaw = abs(_normalize_angle(constraint.yaw - pose.yaw))
+            translation_loss = (
+                0.5 * translation * translation
+                if translation <= HUBER_TRANSLATION_M
+                else HUBER_TRANSLATION_M
+                * (translation - 0.5 * HUBER_TRANSLATION_M)
+            )
+            yaw_loss = (
+                0.5 * yaw * yaw
+                if yaw <= HUBER_YAW_RAD
+                else HUBER_YAW_RAD * (yaw - 0.5 * HUBER_YAW_RAD)
+            )
+            total += constraint.weight * (translation_loss + yaw_loss)
+        return total
+
+    relative_translation_errors: list[float] = []
+    relative_yaw_errors: list[float] = []
+    for base_first, base_second, opt_first, opt_second in zip(
+        baseline, baseline[1:], optimized, optimized[1:]
+    ):
+        def relative(first: Pose, second: Pose) -> tuple[float, float, float]:
+            dx = second.x - first.x
+            dy = second.y - first.y
+            cosine = math.cos(first.yaw)
+            sine = math.sin(first.yaw)
+            return (
+                cosine * dx + sine * dy,
+                -sine * dx + cosine * dy,
+                _normalize_angle(second.yaw - first.yaw),
+            )
+
+        base_relative = relative(base_first, base_second)
+        opt_relative = relative(opt_first, opt_second)
+        relative_translation_errors.append(
+            math.hypot(
+                opt_relative[0] - base_relative[0],
+                opt_relative[1] - base_relative[1],
+            )
+        )
+        relative_yaw_errors.append(
+            abs(_normalize_angle(opt_relative[2] - base_relative[2]))
+        )
+    return {
+        "objective_before": round(objective(baseline), 9),
+        "objective_after": round(objective(optimized), 9),
+        "convergence_status": "fixed_iterations_no_convergence_proof",
+        "maximum_local_relative_translation_change_m": round(
+            max(relative_translation_errors, default=0.0), 9
+        ),
+        "maximum_local_relative_yaw_change_deg": round(
+            math.degrees(max(relative_yaw_errors, default=0.0)), 9
+        ),
+    }
 
 
 def _trajectory_length(poses: Sequence[Pose]) -> float:
@@ -2356,6 +2433,9 @@ def _render_localized_version(
         )
     )
     optimized, accepted, rejected = optimize_trajectory(baseline, constraints)
+    solver_metrics = bounded_correction_metrics(
+        baseline, optimized, constraints
+    )
 
     elements_payload = load_json(prior_map / "elements.json")
     elements = elements_payload.get("elements", []) if isinstance(elements_payload, dict) else []
@@ -2671,12 +2751,72 @@ def _render_localized_version(
         "warnings": [],
         "rejection_reasons": sorted({item["reason"] for item in rejected}),
         "solver": {
-            "type": "robust_banded_se2_correction_irls",
+            "type": "bounded_correction_field",
             "full_factor_graph": False,
+            "published_capable": False,
+            "limitation": (
+                "Independent x/y/yaw banded smoothing is not a relative SE(2) "
+                "factor graph and is restricted to draft/review use."
+            ),
             "huber_translation_m": HUBER_TRANSLATION_M,
             "huber_yaw_deg": math.degrees(HUBER_YAW_RAD),
             "relative_trajectory_authority": "rtabmap_reprocess_optimized_copy",
+            **solver_metrics,
         },
+    }
+    correction_p95 = report["correction_distribution_m"]["p95"]
+    tag_observation_coverage = (
+        sum(
+            isinstance(tag.get("transform_audit"), dict)
+            and tag["transform_audit"].get("status") == "applied"
+            for tag in final_tags
+        )
+        / max(1, len(final_tags))
+        if final_tags
+        else 1.0
+    )
+    review_blockers: list[dict[str, Any]] = []
+    review_checks = (
+        (node_coverage >= 0.98, "node_coverage_below_0_98", node_coverage),
+        (max_correction <= 2.0, "maximum_correction_above_2m", max_correction),
+        (correction_p95 <= 1.0, "p95_correction_above_1m", correction_p95),
+        (
+            solver_metrics["maximum_local_relative_translation_change_m"] <= 0.5,
+            "local_deformation_above_0_5m",
+            solver_metrics["maximum_local_relative_translation_change_m"],
+        ),
+        (
+            report["weak_lost_duration_seconds"] <= 30.0,
+            "weak_lost_duration_above_30s",
+            report["weak_lost_duration_seconds"],
+        ),
+        (
+            tag_observation_coverage == 1.0,
+            "tag_observation_coverage_incomplete",
+            tag_observation_coverage,
+        ),
+        (needs_review_count == 0, "pending_tag_review", needs_review_count),
+        (len(rejected) == 0, "rejected_constraints_present", len(rejected)),
+    )
+    for passed, code, value in review_checks:
+        if not passed:
+            review_blockers.append({"code": code, "value": value})
+    report["tag_observation_coverage_ratio"] = round(
+        tag_observation_coverage, 6
+    )
+    report["review_gate"] = {
+        "passed": not review_blockers,
+        "blockers": review_blockers,
+    }
+    report["publish_gate"] = {
+        "passed": False,
+        "blockers": [
+            {
+                "code": "solver_not_full_relative_se2_factor_graph",
+                "value": report["solver"]["type"],
+            },
+            *review_blockers,
+        ],
     }
     if has_critical_jsonl_damage:
         report["warnings"].append(
