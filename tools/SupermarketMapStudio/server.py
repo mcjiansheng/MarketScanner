@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timezone
 import json
+import math
 import os
 import platform
 import subprocess
@@ -99,7 +101,28 @@ ARTIFACTS = (
 
 
 class RequestError(ValueError):
-    pass
+    status = HTTPStatus.BAD_REQUEST
+    code = "bad_request"
+
+    def details(self) -> Dict[str, Any]:
+        return {"error": str(self), "code": self.code}
+
+
+class ConflictError(RequestError):
+    status = HTTPStatus.CONFLICT
+    code = "revision_conflict"
+
+    def __init__(self, message: str, *, version_id: str, revision: int):
+        super().__init__(message)
+        self.version_id = version_id
+        self.revision = revision
+
+    def details(self) -> Dict[str, Any]:
+        return {
+            **super().details(),
+            "current_version_id": self.version_id,
+            "current_revision": self.revision,
+        }
 
 
 @dataclass
@@ -1251,6 +1274,194 @@ def run_localized_map(
     attach_acceleration_report(output, acceleration_report, [offline_report])
 
 
+def _manual_edit_context(
+    current_dir: Path, prior_map: Path
+) -> tuple[list[Dict[str, Any]], list[Dict[str, Any]], list[Dict[str, Any]], Dict[str, Any]]:
+    tags = load_json(current_dir / "localized_price_tags.json", None)
+    constraints_payload = load_json(
+        current_dir / "localization_constraints.json", None
+    )
+    elements_payload = load_json(prior_map / "elements.json", None)
+    manifest = load_json(prior_map / "manifest.json", None)
+    constraints = (
+        constraints_payload.get("raw")
+        if isinstance(constraints_payload, dict)
+        else None
+    )
+    elements = (
+        elements_payload.get("elements")
+        if isinstance(elements_payload, dict)
+        else None
+    )
+    if (
+        not isinstance(tags, list)
+        or not isinstance(constraints, list)
+        or not isinstance(elements, list)
+        or not isinstance(manifest, dict)
+    ):
+        raise RequestError("本地化结果缺少完整的人工编辑校验上下文。")
+    if any(not isinstance(item, dict) for item in tags + constraints + elements):
+        raise RequestError("本地化人工编辑校验上下文包含无效记录。")
+    return tags, constraints, elements, manifest
+
+
+def _one_by_id(
+    records: List[Dict[str, Any]], field: str, identifier: str, label: str
+) -> Dict[str, Any]:
+    matches = [item for item in records if str(item.get(field) or "") == identifier]
+    if len(matches) != 1:
+        raise RequestError(f"{label} {identifier!r} 不存在或不唯一。")
+    return matches[0]
+
+
+def _validate_manual_tag_association(
+    tag: Dict[str, Any],
+    elements: List[Dict[str, Any]],
+    manifest: Dict[str, Any],
+) -> None:
+    shelf_code = str(tag.get("shelf_code") or "")
+    shelf = _one_by_id(
+        [
+            item
+            for item in elements
+            if item.get("shape_type") in {"MapShelf", "MapTable", "MapTableFeature"}
+        ],
+        "code",
+        shelf_code,
+        "货架/柜台",
+    )
+    side = str(tag.get("shelf_side") or "")
+    edges = {edge_id: (start, end) for edge_id, start, end in localized._stable_edges(shelf)}
+    if side not in edges:
+        raise RequestError(f"货架 {shelf_code!r} 不存在侧面 {side!r}。")
+    try:
+        offset_cm = float(tag.get("distance_from_shelf_start_cm"))
+    except (TypeError, ValueError) as exc:
+        raise RequestError("价签沿货架起点距离必须是有限厘米数。") from exc
+    start, end = edges[side]
+    edge_length_cm = math.hypot(end[0] - start[0], end[1] - start[1]) * 100
+    if not math.isfinite(offset_cm) or not 0 <= offset_cm <= edge_length_cm + 1.0e-6:
+        raise RequestError(
+            f"价签距离 {offset_cm!r} cm 超出货架侧面长度 {edge_length_cm:.3f} cm。"
+        )
+    position = tag.get("final_map_position")
+    if not isinstance(position, dict):
+        raise RequestError("价签缺少 final_map_position，不能批准或保存关联。")
+    try:
+        x = float(position.get("x_m"))
+        y = float(position.get("y_m"))
+        height = float(position.get("height_m", 0.0))
+    except (TypeError, ValueError) as exc:
+        raise RequestError("价签位置必须包含有限的 x_m/y_m/height_m。") from exc
+    bounds = manifest.get("bounds") if isinstance(manifest.get("bounds"), dict) else {}
+    try:
+        inside = (
+            float(bounds["min_x_m"]) <= x <= float(bounds["max_x_m"])
+            and float(bounds["min_y_m"]) <= y <= float(bounds["max_y_m"])
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RequestError("先验地图缺少有效 bounds，不能验证价签位置。") from exc
+    if not all(math.isfinite(value) for value in (x, y, height)) or not inside or not 0 <= height <= 5:
+        raise RequestError("价签位置超出先验地图或高度范围。")
+    ratio = 0.0 if edge_length_cm <= 1.0e-9 else offset_cm / edge_length_cm
+    shelf_x = start[0] + ratio * (end[0] - start[0])
+    shelf_y = start[1] + ratio * (end[1] - start[1])
+    if math.hypot(x - shelf_x, y - shelf_y) > 0.45 + 1.0e-9:
+        raise RequestError("价签位置与指定货架侧面/距离不一致（超过 0.45 m）。")
+
+
+def _authoritative_manual_event(
+    request_event: Dict[str, Any],
+    *,
+    revision: int,
+    tags: List[Dict[str, Any]],
+    constraints: List[Dict[str, Any]],
+    elements: List[Dict[str, Any]],
+    manifest: Dict[str, Any],
+) -> Dict[str, Any]:
+    kind = str(request_event.get("type") or "")
+    target = str(request_event.get("object_id") or "")
+    new_value = request_event.get("new_value")
+    provisional = {"type": kind, "object_id": target, "new_value": new_value}
+    try:
+        localized.validate_manual_edit_event(provisional)
+    except localized.OfflineLocalizationError as exc:
+        raise RequestError(str(exc)) from exc
+    old_value: Any = None
+    if kind == "edit_tag":
+        tag = _one_by_id(tags, "tag_id", target, "价签")
+        assert isinstance(new_value, dict)
+        old_value = {key: tag.get(key) for key in new_value}
+        merged = {**tag, **new_value}
+        if "height_cm" in new_value:
+            position = dict(merged.get("final_map_position") or {})
+            position["height_m"] = float(new_value["height_cm"]) / 100
+            merged["final_map_position"] = position
+        _validate_manual_tag_association(merged, elements, manifest)
+    elif kind == "approve_tag":
+        tag = _one_by_id(tags, "tag_id", target, "价签")
+        _validate_manual_tag_association(tag, elements, manifest)
+        old_value = {
+            "approval_status": tag.get("approval_status"),
+            "needs_review": tag.get("needs_review"),
+        }
+    elif kind == "batch_approve_tags":
+        assert isinstance(new_value, list)
+        old_value = {}
+        for identifier in (str(item) for item in new_value):
+            tag = _one_by_id(tags, "tag_id", identifier, "价签")
+            _validate_manual_tag_association(tag, elements, manifest)
+            old_value[identifier] = {
+                "approval_status": tag.get("approval_status"),
+                "needs_review": tag.get("needs_review"),
+            }
+    elif kind == "disable_constraint":
+        constraint = _one_by_id(constraints, "constraint_id", target, "约束")
+        old_value = bool(constraint.get("disabled_by_manual_edit", False))
+
+    reason = request_event.get("reason")
+    if reason is None:
+        reason = ""
+    if not isinstance(reason, str) or len(reason) > 500:
+        raise RequestError("人工编辑原因必须是不超过 500 个字符的文本。")
+    return {
+        "event_id": f"edit-{uuid.uuid4().hex}",
+        "created_at_utc": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+        "base_revision": revision,
+        "type": kind,
+        "object_id": target,
+        "old_value": old_value,
+        "new_value": new_value,
+        "actor": "local-user",
+        "reason": reason,
+    }
+
+
+def _append_manual_operation_audit(
+    journal: Dict[str, Any],
+    *,
+    action: str,
+    base_revision: int,
+    old_cursor: int,
+    new_cursor: int,
+    event_id: str | None = None,
+) -> None:
+    audit_events = list(journal.get("audit_events", []))
+    audit_events.append(
+        {
+            "audit_id": f"audit-{uuid.uuid4().hex}",
+            "created_at_utc": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+            "base_revision": base_revision,
+            "action": action,
+            "old_cursor": old_cursor,
+            "new_cursor": new_cursor,
+            "event_id": event_id,
+            "actor": "local-user",
+        }
+    )
+    journal["audit_events"] = audit_events
+
+
 def apply_localized_edit(job: Job, data: Dict[str, Any]) -> Dict[str, Any]:
     if job.kind != "localized" or job.status != "complete":
         raise RequestError("人工复核只适用于已完成的先验地图会话优化结果。")
@@ -1263,36 +1474,31 @@ def apply_localized_edit(job: Job, data: Dict[str, Any]) -> Dict[str, Any]:
         journal = load_json(current.version_dir / "manual_edits.json", None)
         if not isinstance(journal, dict):
             raise RequestError("结果缺少有效的 manual_edits.json。")
-        expected_revision = data.get("expected_revision")
-        if expected_revision is not None and int(journal.get("revision", 1)) != int(expected_revision):
+        if "expected_revision" not in data or "expected_version_id" not in data:
             raise RequestError(
-                f"人工编辑冲突：当前版本为 {journal.get('revision', 1)}，"
-                f"请求版本为 {expected_revision}。请重新加载后重试。"
+                "人工编辑必须提供 expected_revision 和 expected_version_id。"
             )
-        action = str(data.get("action") or "append")
-        if action == "undo":
-            journal = localized.move_manual_edit_cursor(journal, -1)
-        elif action == "redo":
-            journal = localized.move_manual_edit_cursor(journal, 1)
-        elif action == "append":
-            event = data.get("event")
-            if not isinstance(event, dict):
-                raise RequestError("人工编辑事件必须是对象。")
-            allowed_types = {
-                "set_anchor",
-                "disable_constraint",
-                "assign_interval_to_aisle",
-                "edit_tag",
-                "approve_tag",
-                "batch_approve_tags",
-            }
-            if event.get("type") not in allowed_types:
-                raise RequestError("不支持的人工编辑类型。")
-            journal = localized.append_manual_edit(journal, event)
-        else:
-            raise RequestError("人工编辑 action 必须是 append、undo 或 redo。")
-
-        journal["revision"] = journal.get("revision", 1) + 1
+        expected_revision = data["expected_revision"]
+        if isinstance(expected_revision, bool) or not isinstance(expected_revision, int):
+            raise RequestError("expected_revision 必须是整数。")
+        expected_version = data["expected_version_id"]
+        if not isinstance(expected_version, str) or not expected_version:
+            raise RequestError("expected_version_id 必须是非空字符串。")
+        try:
+            journal_revision = int(journal["revision"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RequestError("manual_edits.json revision 无效。") from exc
+        if journal_revision != current.revision:
+            raise RequestError("current 指针与 manual_edits.json revision 不一致。")
+        if expected_revision != current.revision or expected_version != current.version_id:
+            raise ConflictError(
+                (
+                    f"人工编辑冲突：当前为 {current.version_id}/r{current.revision}，"
+                    f"请求为 {expected_version}/r{expected_revision}。请重新加载后重试。"
+                ),
+                version_id=current.version_id,
+                revision=current.revision,
+            )
 
         source = load_json(current.version_dir / "source_manifest.json", None)
         map_payload = load_json(job.output_dir / "map.json", {})
@@ -1304,6 +1510,43 @@ def apply_localized_edit(job: Job, data: Dict[str, Any]) -> Dict[str, Any]:
         optimized_database = resolve_path(
             source.get("optimized_database"), "Optimized database"
         )
+        tags, constraints, elements, manifest = _manual_edit_context(
+            current.version_dir, prior_map
+        )
+
+        action = str(data.get("action") or "append")
+        old_cursor = int(journal.get("cursor", 0))
+        edited_event_id: str | None = None
+        if action == "undo":
+            journal = localized.move_manual_edit_cursor(journal, -1)
+        elif action == "redo":
+            journal = localized.move_manual_edit_cursor(journal, 1)
+        elif action == "append":
+            request_event = data.get("event")
+            if not isinstance(request_event, dict):
+                raise RequestError("人工编辑事件必须是对象。")
+            event = _authoritative_manual_event(
+                request_event,
+                revision=current.revision,
+                tags=tags,
+                constraints=constraints,
+                elements=elements,
+                manifest=manifest,
+            )
+            journal = localized.append_manual_edit(journal, event)
+            edited_event_id = event["event_id"]
+        else:
+            raise RequestError("人工编辑 action 必须是 append、undo 或 redo。")
+        _append_manual_operation_audit(
+            journal,
+            action=action,
+            base_revision=current.revision,
+            old_cursor=old_cursor,
+            new_cursor=int(journal.get("cursor", 0)),
+            event_id=edited_event_id,
+        )
+        journal["revision"] = current.revision + 1
+
         if not source_database.is_file() or not optimized_database.is_file():
             raise RequestError("源数据库或优化数据库不存在，无法重放人工编辑。")
         # Verify source database has not changed since last processing.
@@ -1691,7 +1934,7 @@ class StudioHandler(BaseHTTPRequestHandler):
                 return
             self.send_json(HTTPStatus.NOT_FOUND, {"error": "Unknown API endpoint."})
         except RequestError as exc:
-            self.send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+            self.send_json(exc.status, exc.details())
         except Exception as exc:
             self.send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
 

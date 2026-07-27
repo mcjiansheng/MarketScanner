@@ -26,6 +26,43 @@ import server  # noqa: E402
 import folder_dialog  # noqa: E402
 
 
+def create_localized_store(
+    output: Path,
+    revision: int = 1,
+    *,
+    source_manifest: dict | None = None,
+    journal: dict | None = None,
+):
+    store = server.LocalizedVersionStore(output)
+    previous = store.current()
+    staging = store.begin()
+    payloads = {
+        "prior_map_manifest.json": {},
+        "source_manifest.json": source_manifest or {},
+        "processing_manifest.json": {},
+        "online_localization_trace.json": [],
+        "optimized_map_trajectory.geojson": {"type": "FeatureCollection", "features": []},
+        "localization_constraints.json": {"raw": []},
+        "localization_report.json": {"publish_state": "draft"},
+        "review_items.json": {"items": []},
+        "localized_review.json": {},
+        "manual_edits.json": journal or {"revision": revision, "events": [], "cursor": 0},
+        "localized_price_tags.json": [],
+        "localized_price_tags.geojson": {"type": "FeatureCollection", "features": []},
+        "shelf_tag_index.json": {"shelves": {}},
+    }
+    for name, payload in payloads.items():
+        (staging / name).write_text(json.dumps(payload) + "\n", encoding="utf-8")
+    (staging / "localized_price_tags.csv").write_text(
+        "tag_id,approval_status\n", encoding="utf-8"
+    )
+    (staging / "audit_log.jsonl").write_text("{}\n", encoding="utf-8")
+    manifest = store.validate_staging(
+        staging, parent_version=previous.version_id if previous else None
+    )
+    return store.commit(staging, manifest, update_current=True)
+
+
 def transform_blob(x: float, y: float, z: float) -> bytes:
     return struct.pack("<12f", 1.0, 0.0, 0.0, x, 0.0, 1.0, 0.0, y, 0.0, 0.0, 1.0, z)
 
@@ -327,6 +364,7 @@ class MapStudioApiTests(unittest.TestCase):
             with urlopen(request, timeout=10) as response:
                 return json.loads(response.read())
         except HTTPError as exc:
+            exc.payload = json.loads(exc.read())
             exc.close()
             raise
 
@@ -357,8 +395,176 @@ class MapStudioApiTests(unittest.TestCase):
                 "/api/dialog",
                 {"mode": "directory", "title": "选择扫描会话"},
             )
-        self.assertEqual(result["path"], str(self.session_a))
-        self.assertEqual(run.call_args.args[0][2:], ["directory", "选择扫描会话"])
+            self.assertEqual(result["path"], str(self.session_a))
+            self.assertEqual(run.call_args.args[0][2:], ["directory", "选择扫描会话"])
+
+    def test_localized_edit_requires_cas_and_reports_conflict_as_409(self) -> None:
+        output = self.root / "localized-cas"
+        snapshot = create_localized_store(output)
+        job = server.STATE.add("localized", output)
+        server.STATE.set_status(job.identifier, "complete")
+
+        with self.assertRaises(HTTPError) as missing:
+            self.api(
+                f"/api/jobs/{job.identifier}/localized/edit",
+                {"action": "undo"},
+            )
+        self.assertEqual(missing.exception.code, 400)
+        missing_payload = missing.exception.payload
+        self.assertEqual(missing_payload["code"], "bad_request")
+
+        with self.assertRaises(HTTPError) as conflict:
+            self.api(
+                f"/api/jobs/{job.identifier}/localized/edit",
+                {
+                    "action": "undo",
+                    "expected_version_id": snapshot.version_id,
+                    "expected_revision": snapshot.revision + 1,
+                },
+            )
+        self.assertEqual(conflict.exception.code, 409)
+        conflict_payload = conflict.exception.payload
+        self.assertEqual(conflict_payload["code"], "revision_conflict")
+        self.assertEqual(conflict_payload["current_version_id"], snapshot.version_id)
+        self.assertEqual(conflict_payload["current_revision"], snapshot.revision)
+
+    def test_two_localized_clients_cannot_commit_the_same_base_revision(self) -> None:
+        output = self.root / "localized-two-clients"
+        source_database = self.session_a / "segment_0001" / "rtabmap_segment_0001.db"
+        prior_map = self.root / "PriorMap-placeholder"
+        prior_map.mkdir()
+        source_manifest = {
+            "prior_map": str(prior_map),
+            "source_session": str(self.session_a),
+            "source_database": str(source_database),
+            "source_database_sha256_before": server.localized._sha256(source_database),
+            "optimized_database": str(source_database),
+        }
+        journal = server.localized.new_manual_edits(
+            "a" * 64,
+            server.localized._sha256(source_database),
+            server.localized._sha256(source_database),
+        )
+        first = create_localized_store(
+            output, source_manifest=source_manifest, journal=journal
+        )
+        (output / "map.json").write_text(
+            json.dumps({"parameters": {}}), encoding="utf-8"
+        )
+        job = server.STATE.add("localized", output)
+        server.STATE.set_status(job.identifier, "complete")
+
+        def commit_replay(**kwargs):
+            next_journal = kwargs["manual_edits"]
+            snapshot = create_localized_store(
+                output,
+                source_manifest=source_manifest,
+                journal=next_journal,
+            )
+            return {
+                "version_id": snapshot.version_id,
+                "revision": snapshot.revision,
+                "current_updated": True,
+            }
+
+        segment = SimpleNamespace(
+            poses=[SimpleNamespace(node_id=1, stamp=1.0, x=0.0, y=0.0, yaw=0.0)]
+        )
+        payload = {
+            "action": "undo",
+            "expected_version_id": first.version_id,
+            "expected_revision": first.revision,
+        }
+        with (
+            mock.patch.object(
+                server,
+                "_manual_edit_context",
+                return_value=(
+                    [],
+                    [],
+                    [],
+                    {
+                        "bounds": {
+                            "min_x_m": 0,
+                            "max_x_m": 1,
+                            "min_y_m": 0,
+                            "max_y_m": 1,
+                        }
+                    },
+                ),
+            ),
+            mock.patch.object(server.base, "discover_segments", return_value=[segment]),
+            mock.patch.object(
+                server.localized,
+                "process_localized_session",
+                side_effect=commit_replay,
+            ),
+        ):
+            accepted = self.api(
+                f"/api/jobs/{job.identifier}/localized/edit", payload
+            )
+            self.assertEqual(accepted["revision"], first.revision + 1)
+            self.assertNotEqual(accepted["version_id"], first.version_id)
+            with self.assertRaises(HTTPError) as stale:
+                self.api(f"/api/jobs/{job.identifier}/localized/edit", payload)
+        self.assertEqual(stale.exception.code, 409)
+        self.assertEqual(
+            stale.exception.payload["current_revision"], first.revision + 1
+        )
+
+    def test_localized_replay_failure_keeps_revision_and_current(self) -> None:
+        output = self.root / "localized-replay-failure"
+        source_database = self.session_a / "segment_0001" / "rtabmap_segment_0001.db"
+        prior_map = self.root / "PriorMap-replay-failure"
+        prior_map.mkdir()
+        source_manifest = {
+            "prior_map": str(prior_map),
+            "source_session": str(self.session_a),
+            "source_database": str(source_database),
+            "source_database_sha256_before": server.localized._sha256(source_database),
+            "optimized_database": str(source_database),
+        }
+        journal = server.localized.new_manual_edits(
+            "a" * 64,
+            server.localized._sha256(source_database),
+            server.localized._sha256(source_database),
+        )
+        first = create_localized_store(
+            output, source_manifest=source_manifest, journal=journal
+        )
+        (output / "map.json").write_text("{}\n", encoding="utf-8")
+        job = server.STATE.add("localized", output)
+        server.STATE.set_status(job.identifier, "complete")
+        segment = SimpleNamespace(
+            poses=[SimpleNamespace(node_id=1, stamp=1.0, x=0.0, y=0.0, yaw=0.0)]
+        )
+        with (
+            mock.patch.object(
+                server,
+                "_manual_edit_context",
+                return_value=([], [], [], {"bounds": {}}),
+            ),
+            mock.patch.object(server.base, "discover_segments", return_value=[segment]),
+            mock.patch.object(
+                server.localized,
+                "process_localized_session",
+                side_effect=RuntimeError("injected replay failure"),
+            ),
+            self.assertRaises(RuntimeError),
+        ):
+            server.apply_localized_edit(
+                job,
+                {
+                    "action": "undo",
+                    "expected_version_id": first.version_id,
+                    "expected_revision": first.revision,
+                },
+            )
+        current = server.LocalizedVersionStore(output).current()
+        self.assertIsNotNone(current)
+        assert current is not None
+        self.assertEqual(current.version_id, first.version_id)
+        self.assertEqual(current.revision, first.revision)
 
     def test_prior_map_api_converts_validates_and_serves_preview(self) -> None:
         workbook = self.root / "prior-map.xlsx"
@@ -1253,11 +1459,14 @@ class MapStudioApiTests(unittest.TestCase):
             b'id="localized-undo"',
             b'id="localized-redo"',
             b'id="localized-apply-edit"',
+            b'id="localized-edit-reason"',
         ):
             self.assertIn(marker, html)
         self.assertIn(b'kind: "localized"', script)
         self.assertIn(b"/localized/edit", script)
-        self.assertIn(b"automatic_publish_allowed", script)
+        self.assertIn(b"allow_auto_publish", script)
+        self.assertIn(b"expected_revision", script)
+        self.assertIn(b"expected_version_id", script)
         self.assertIn(b"drawLocalizedReview", script)
 
     def test_unsafe_optimized_pose_jump_is_rejected_before_publication(self) -> None:

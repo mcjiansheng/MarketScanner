@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+from datetime import datetime, timezone
 import hashlib
 import json
 import os
@@ -203,7 +204,13 @@ class LocalizedVersionStore:
         version_dir = self.versions / version_id
         if version_dir.exists():
             raise LocalizedStoreError(f"Localized version already exists: {version_id}")
-        manifest = {**manifest, "version_id": version_id}
+        manifest = {
+            **manifest,
+            "version_id": version_id,
+            "created_at_utc": datetime.now(timezone.utc).isoformat(
+                timespec="milliseconds"
+            ),
+        }
         manifest_path = staging / "version_manifest.json"
         with manifest_path.open("w", encoding="utf-8") as handle:
             json.dump(manifest, handle, ensure_ascii=False, indent=2, sort_keys=True)

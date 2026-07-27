@@ -21,7 +21,12 @@ let sessionRestoreTimer = null;
 let sessionSelectionToken = 0;
 let currentSingleScanMode = null;
 let currentSingleOfflineSupported = null;
-const localizedReview = { data: null, selectedTagId: null };
+const localizedReview = {
+  data: null,
+  selectedTagId: null,
+  versionId: null,
+  revision: null,
+};
 
 const viewer2d = {
   images: { "2d-map": null, "2d-shelf": null },
@@ -118,7 +123,12 @@ function setBusy(busy) {
 async function request(path, options = {}) {
   const response = await fetch(path, options);
   const payload = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(payload.error || `Request failed (${response.status})`);
+  if (!response.ok) {
+    const error = new Error(payload.error || `Request failed (${response.status})`);
+    error.status = response.status;
+    error.payload = payload;
+    throw error;
+  }
   return payload;
 }
 
@@ -688,6 +698,15 @@ async function renderJob(job) {
   );
   $("#merge-toggle").hidden = !manualMerge.available;
   $("#localized-review-editor").hidden = job.kind !== "localized";
+  if (job.kind === "localized") {
+    localizedReview.versionId = job.localized?.version_id || null;
+    localizedReview.revision = Number.isInteger(job.localized?.revision)
+      ? job.localized.revision
+      : null;
+  } else {
+    localizedReview.versionId = null;
+    localizedReview.revision = null;
+  }
   const shelfLoadToken = ++shelfTuning.loadToken;
   clearShelfTuning(Boolean(job.artifacts?.["shelf_outline_evidence.json"]));
   renderJobProgress(job);
@@ -759,10 +778,15 @@ async function renderJob(job) {
     appendText(
       inspection,
       "div",
-      report.automatic_publish_allowed
-        ? "质量门禁：允许自动发布"
-        : "质量门禁：需要人工复核",
-      report.automatic_publish_allowed ? "complete" : "warning",
+      report.allow_auto_publish
+        ? "质量门禁：允许进入发布复核"
+        : "质量门禁：仅限草稿人工复核",
+      report.allow_auto_publish ? "complete" : "warning",
+    );
+    appendText(
+      inspection,
+      "div",
+      `成果状态 ${job.localized?.publish_state || report.publish_state || "未知"} · 版本 ${localizedReview.versionId || "缺失"} · revision ${localizedReview.revision ?? "缺失"}`,
     );
     appendText(inspection, "div", `轨迹节点 ${report.node_count || 0} · 地图约束接受率 ${Math.round(Number(report.map_constraint_acceptance_rate || 0) * 100)}% · 最大修正 ${Number(report.maximum_correction_m || 0).toFixed(2)} m`);
     appendText(inspection, "div", `价签 ${report.tag_total || 0} · 已确认 ${report.tag_confirmed || 0} · 待复核 ${report.tag_needs_review || 0}`);
@@ -958,7 +982,14 @@ async function applyLocalizedEdit(action) {
   try {
     setBusy(true);
     status.textContent = action === "undo" ? "正在撤销并重放…" : (action === "redo" ? "正在重做并重放…" : "正在应用并重放…");
-    const payload = { action };
+    if (!localizedReview.versionId || !Number.isInteger(localizedReview.revision)) {
+      throw new Error("当前结果缺少版本或 revision，请重新加载任务");
+    }
+    const payload = {
+      action,
+      expected_version_id: localizedReview.versionId,
+      expected_revision: localizedReview.revision,
+    };
     if (action === "append") {
       let newValue = null;
       const text = $("#localized-edit-value").value.trim();
@@ -969,8 +1000,8 @@ async function applyLocalizedEdit(action) {
       payload.event = {
         type: $("#localized-edit-type").value,
         object_id: $("#localized-edit-object").value.trim(),
-        old_value: null,
         new_value: newValue,
+        reason: $("#localized-edit-reason").value.trim(),
       };
     }
     const result = await request(`/api/jobs/${completedJobId}/localized/edit`, {
@@ -982,6 +1013,17 @@ async function applyLocalizedEdit(action) {
     await renderJob(result.job);
     setStatus("人工编辑已应用，派生结果已重新计算", "complete");
   } catch (error) {
+    if (error.status === 409 && completedJobId) {
+      try {
+        const latest = await request(`/api/jobs/${completedJobId}`);
+        await renderJob(latest);
+        status.textContent = "版本冲突：已刷新最新结果，请确认后重新应用编辑";
+        setStatus(status.textContent, "warning");
+        return;
+      } catch (_refreshError) {
+        // Fall through to the original conflict if refresh also fails.
+      }
+    }
     status.textContent = error.message;
     setStatus(error.message, "failed");
   } finally {

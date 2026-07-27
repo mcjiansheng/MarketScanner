@@ -26,10 +26,35 @@ from .prior_map_schema import load_json, validate_package
 
 
 FORMAT_VERSION = 1
+TOOL_VERSION = "MarketScanner-RepairV2"
+COORDINATE_CONTRACT_VERSION = 1
 HUBER_TRANSLATION_M = 0.45
 HUBER_YAW_RAD = math.radians(10)
 HARD_REJECT_TRANSLATION_M = 2.5
 HARD_REJECT_YAW_RAD = math.radians(45)
+EDITABLE_TAG_FIELDS = frozenset(
+    {
+        "shelf_code",
+        "shelf_side",
+        "distance_from_shelf_start_cm",
+        "height_cm",
+        "final_map_position",
+    }
+)
+
+
+def processing_parameter_sha256() -> str:
+    payload = {
+        "coordinate_contract_version": COORDINATE_CONTRACT_VERSION,
+        "hard_reject_translation_m": HARD_REJECT_TRANSLATION_M,
+        "hard_reject_yaw_rad": HARD_REJECT_YAW_RAD,
+        "huber_translation_m": HUBER_TRANSLATION_M,
+        "huber_yaw_rad": HUBER_YAW_RAD,
+        "solver": "bounded_correction_field_v1",
+    }
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
 
 
 class OfflineLocalizationError(ValueError):
@@ -101,7 +126,7 @@ def _pose_from(value: Any) -> tuple[float, float, float] | None:
         x = float(value.get("x_m"))
         y = float(value.get("y_m"))
         yaw = float(value.get("yaw_rad", 0))
-    except (TypeError, ValueError):
+    except (KeyError, TypeError, ValueError):
         return None
     if not all(math.isfinite(item) for item in (x, y, yaw)):
         return None
@@ -1476,6 +1501,7 @@ def apply_manual_edits(
     constraints: list[dict[str, Any]],
     tags: list[dict[str, Any]],
     edits: dict[str, Any] | None,
+    elements: Sequence[dict[str, Any]] | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
     events = edits.get("events", []) if isinstance(edits, dict) else []
     cursor = int(edits.get("cursor", len(events))) if isinstance(edits, dict) else 0
@@ -1494,19 +1520,35 @@ def apply_manual_edits(
             for tag in tags:
                 if str(tag.get("tag_id")) == target:
                     tag.update(new_value)
+                    if "height_cm" in new_value:
+                        position = dict(tag.get("final_map_position") or {})
+                        position["height_m"] = float(new_value["height_cm"]) / 100
+                        tag["final_map_position"] = position
                     tag["manually_modified"] = True
                     tag["needs_review"] = True
         elif kind == "approve_tag":
             for tag in tags:
                 if str(tag.get("tag_id")) == target:
-                    tag["approval_status"] = "approved"
-                    tag["needs_review"] = False
+                    if elements is not None and _tag_has_valid_map_association(tag, elements):
+                        tag["user_confirmed"] = True
+                        tag["approval_status"] = "approved"
+                        tag["needs_review"] = False
+                    else:
+                        _mark_tag_for_review(
+                            tag, "manual_approval_failed_map_association_validation"
+                        )
         elif kind == "batch_approve_tags" and isinstance(new_value, list):
             approved = {str(value) for value in new_value}
             for tag in tags:
                 if str(tag.get("tag_id")) in approved:
-                    tag["approval_status"] = "approved"
-                    tag["needs_review"] = False
+                    if elements is not None and _tag_has_valid_map_association(tag, elements):
+                        tag["user_confirmed"] = True
+                        tag["approval_status"] = "approved"
+                        tag["needs_review"] = False
+                    else:
+                        _mark_tag_for_review(
+                            tag, "manual_approval_failed_map_association_validation"
+                        )
         audit.append(
             {
                 "sequence": sequence,
@@ -1515,21 +1557,77 @@ def apply_manual_edits(
                 "object_id": target,
                 "old_value": event.get("old_value"),
                 "new_value": new_value,
+                "created_at_utc": event.get("created_at_utc"),
+                "base_revision": event.get("base_revision"),
+                "actor": event.get("actor"),
+                "reason": event.get("reason"),
             }
         )
     return constraints, tags, audit
 
 
-def new_manual_edits(map_sha256: str, session_sha256: str, optimized_db_sha256: str = "") -> dict[str, Any]:
+def _tag_has_valid_map_association(
+    tag: dict[str, Any], elements: Sequence[dict[str, Any]]
+) -> bool:
+    if not _tag_has_publishable_fields(tag):
+        return False
+    shelves = [
+        element
+        for element in elements
+        if element.get("shape_type") in {"MapShelf", "MapTable", "MapTableFeature"}
+        and str(element.get("code") or "") == str(tag.get("shelf_code") or "")
+    ]
+    if len(shelves) != 1:
+        return False
+    edge = next(
+        (
+            (start, end)
+            for edge_id, start, end in _stable_edges(shelves[0])
+            if edge_id == tag.get("shelf_side")
+        ),
+        None,
+    )
+    if edge is None:
+        return False
+    try:
+        offset_m = float(tag.get("distance_from_shelf_start_cm")) / 100
+        position = tag["final_map_position"]
+        x = float(position["x_m"])
+        y = float(position["y_m"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    length_m = math.hypot(edge[1][0] - edge[0][0], edge[1][1] - edge[0][1])
+    if (
+        not all(math.isfinite(value) for value in (offset_m, x, y))
+        or not 0 <= offset_m <= length_m + 1.0e-9
+        or length_m <= 1.0e-9
+    ):
+        return False
+    ratio = offset_m / length_m
+    shelf_x = edge[0][0] + ratio * (edge[1][0] - edge[0][0])
+    shelf_y = edge[0][1] + ratio * (edge[1][1] - edge[0][1])
+    return math.hypot(x - shelf_x, y - shelf_y) <= 0.45 + 1.0e-9
+
+
+def new_manual_edits(
+    map_sha256: str,
+    session_sha256: str,
+    optimized_db_sha256: str = "",
+) -> dict[str, Any]:
     return {
         "format": "MarketScannerManualEdits",
-        "version": 2,
+        "version": 3,
         "revision": 1,
         "prior_map_sha256": map_sha256,
+        "source_database_sha256": session_sha256,
         "source_session_sha256": session_sha256,
         "optimized_database_sha256": optimized_db_sha256,
+        "processing_parameter_sha256": processing_parameter_sha256(),
+        "tool_version": TOOL_VERSION,
+        "coordinate_contract_version": COORDINATE_CONTRACT_VERSION,
         "cursor": 0,
         "events": [],
+        "audit_events": [],
     }
 
 
@@ -1577,6 +1675,58 @@ def validate_manual_edit_event(event: dict[str, Any]) -> None:
             raise OfflineLocalizationError(
                 "edit_tag requires object_id and a non-empty new_value object."
             )
+        unexpected = sorted(set(value) - EDITABLE_TAG_FIELDS)
+        if unexpected:
+            raise OfflineLocalizationError(
+                f"edit_tag contains fields that are not editable: {unexpected}."
+            )
+        if "shelf_code" in value and (
+            not isinstance(value["shelf_code"], str)
+            or not value["shelf_code"].strip()
+            or len(value["shelf_code"]) > 128
+        ):
+            raise OfflineLocalizationError("edit_tag shelf_code is invalid.")
+        if "shelf_side" in value:
+            side = value["shelf_side"]
+            valid_side = side in {"A", "B"} or (
+                isinstance(side, str)
+                and len(side) == 3
+                and side.startswith("E")
+                and side[1:].isdigit()
+            )
+            if not valid_side:
+                raise OfflineLocalizationError(
+                    "edit_tag shelf_side must be A, B or a stable E## edge ID."
+                )
+        for field, lower, upper in (
+            ("distance_from_shelf_start_cm", 0.0, 100_000.0),
+            ("height_cm", 0.0, 500.0),
+        ):
+            if field in value:
+                try:
+                    number = float(value[field])
+                except (TypeError, ValueError) as exc:
+                    raise OfflineLocalizationError(
+                        f"edit_tag {field} must be finite."
+                    ) from exc
+                if isinstance(value[field], bool) or not math.isfinite(number) or not lower <= number <= upper:
+                    raise OfflineLocalizationError(
+                        f"edit_tag {field} is outside the supported range."
+                    )
+        if "final_map_position" in value:
+            position = value["final_map_position"]
+            if not isinstance(position, dict) or set(position) - {"x_m", "y_m", "height_m"}:
+                raise OfflineLocalizationError("edit_tag final_map_position is invalid.")
+            try:
+                x = float(position["x_m"])
+                y = float(position["y_m"])
+                height = float(position.get("height_m", 0.0))
+            except (KeyError, TypeError, ValueError) as exc:
+                raise OfflineLocalizationError(
+                    "edit_tag final_map_position requires finite x_m/y_m."
+                ) from exc
+            if not all(math.isfinite(item) for item in (x, y, height)) or not 0 <= height <= 5:
+                raise OfflineLocalizationError("edit_tag final_map_position is invalid.")
     elif kind == "approve_tag":
         if not target:
             raise OfflineLocalizationError("approve_tag requires object_id.")
@@ -1584,6 +1734,11 @@ def validate_manual_edit_event(event: dict[str, Any]) -> None:
         if not isinstance(value, list) or not value:
             raise OfflineLocalizationError(
                 "batch_approve_tags requires a non-empty tag ID array."
+            )
+        identifiers = [str(item) for item in value]
+        if len(identifiers) > 1_000 or any(not item for item in identifiers) or len(set(identifiers)) != len(identifiers):
+            raise OfflineLocalizationError(
+                "batch_approve_tags requires unique non-empty tag IDs (maximum 1000)."
             )
     else:
         raise OfflineLocalizationError(f"Unsupported manual edit type: {kind!r}.")
@@ -1599,11 +1754,16 @@ def append_manual_edit(
     events = events[:cursor]
     normalized = {
         "event_id": str(event.get("event_id") or f"edit-{len(events) + 1:06d}"),
-        "timestamp": str(event.get("timestamp") or ""),
+        "created_at_utc": str(
+            event.get("created_at_utc") or event.get("timestamp") or ""
+        ),
+        "base_revision": int(event.get("base_revision", journal.get("revision", 1))),
         "type": str(event.get("type") or ""),
         "object_id": str(event.get("object_id") or ""),
         "old_value": event.get("old_value"),
         "new_value": event.get("new_value"),
+        "actor": str(event.get("actor") or "local-user"),
+        "reason": str(event.get("reason") or ""),
     }
     events.append(normalized)
     return {**journal, "events": events, "cursor": len(events)}
@@ -1613,6 +1773,45 @@ def move_manual_edit_cursor(journal: dict[str, Any], delta: int) -> dict[str, An
     events = list(journal.get("events", []))
     cursor = max(0, min(len(events), int(journal.get("cursor", len(events))) + delta))
     return {**journal, "cursor": cursor}
+
+
+def upgrade_manual_edits_v2(
+    journal: dict[str, Any],
+    map_sha256: str,
+    source_database_sha256: str,
+    optimized_database_sha256: str,
+) -> dict[str, Any]:
+    """Upgrade the historical v2 journal without weakening identity binding."""
+
+    if journal.get("format") != "MarketScannerManualEdits" or journal.get("version") != 2:
+        return journal
+    if (
+        journal.get("prior_map_sha256") != map_sha256
+        or journal.get("source_session_sha256") != source_database_sha256
+        or (
+            journal.get("optimized_database_sha256")
+            and journal.get("optimized_database_sha256")
+            != optimized_database_sha256
+        )
+    ):
+        raise OfflineLocalizationError(
+            "Historical manual_edits v2 identity does not match the selected inputs."
+        )
+    upgraded = new_manual_edits(
+        map_sha256, source_database_sha256, optimized_database_sha256
+    )
+    upgraded["revision"] = journal.get("revision", 1)
+    upgraded["cursor"] = journal.get("cursor", 0)
+    upgraded["events"] = journal.get("events", [])
+    upgraded["audit_events"] = [
+        {
+            "event_id": "migration-v2-to-v3",
+            "type": "journal_migrated",
+            "actor": "system",
+            "reason": "Historical v2 journal upgraded with current immutable identities.",
+        }
+    ]
+    return upgraded
 
 
 def _render_localized_version(
@@ -1657,9 +1856,20 @@ def _render_localized_version(
     optimized_db_hash = _sha256(optimized_database)
     if manual_edits is None:
         manual_edits = new_manual_edits(package_hash, session_hash, optimized_db_hash)
+    manual_edits = upgrade_manual_edits_v2(
+        manual_edits, package_hash, session_hash, optimized_db_hash
+    )
     if (
-        manual_edits.get("prior_map_sha256") != package_hash
+        manual_edits.get("format") != "MarketScannerManualEdits"
+        or manual_edits.get("version") != 3
+        or manual_edits.get("prior_map_sha256") != package_hash
+        or manual_edits.get("source_database_sha256") != session_hash
         or manual_edits.get("source_session_sha256") != session_hash
+        or manual_edits.get("processing_parameter_sha256")
+        != processing_parameter_sha256()
+        or manual_edits.get("tool_version") != TOOL_VERSION
+        or manual_edits.get("coordinate_contract_version")
+        != COORDINATE_CONTRACT_VERSION
     ):
         raise OfflineLocalizationError("manual_edits.json does not match this map/session pair.")
     stored_optimized = manual_edits.get("optimized_database_sha256")
@@ -1667,6 +1877,16 @@ def _render_localized_version(
         raise OfflineLocalizationError(
             "manual_edits.json was created with a different optimized database; "
             "edits cannot be safely replayed."
+        )
+    try:
+        edit_revision = int(manual_edits.get("revision"))
+    except (TypeError, ValueError) as exc:
+        raise OfflineLocalizationError(
+            "manual_edits.json revision must be an integer."
+        ) from exc
+    if isinstance(manual_edits.get("revision"), bool) or edit_revision < 1:
+        raise OfflineLocalizationError(
+            "manual_edits.json revision must be a positive integer."
         )
     edit_events = manual_edits.get("events")
     if not isinstance(edit_events, list):
@@ -1679,6 +1899,13 @@ def _render_localized_version(
         raise OfflineLocalizationError("manual_edits.json cursor is out of range.")
     for event in edit_events:
         validate_manual_edit_event(event)
+    audit_events = manual_edits.get("audit_events")
+    if not isinstance(audit_events, list) or any(
+        not isinstance(item, dict) for item in audit_events
+    ):
+        raise OfflineLocalizationError(
+            "manual_edits.json audit_events must be an object array."
+        )
     if progress:
         progress(84, "先验地图轨迹优化", "正在读取在线约束并建立稳健 SE(2) 修正问题")
 
@@ -2015,7 +2242,9 @@ def _render_localized_version(
         )
     # Manual tag decisions are deliberately replayed after all automatic
     # reassociation so a reprocess never silently overwrites a human edit.
-    _, final_tags, _ = apply_manual_edits([], final_tags, manual_edits)
+    _, final_tags, _ = apply_manual_edits(
+        [], final_tags, manual_edits, elements=elements
+    )
     final_tags = [enforce_tag_state_invariants(tag) for tag in final_tags]
 
     corrections = [
@@ -2227,13 +2456,13 @@ def _render_localized_version(
         {
             "format": "MarketScannerLocalizedSourceManifest",
             "version": 1,
-            "source_session": str(session),
-            "source_database": str(source_database),
+            "source_session": str(session.resolve()),
+            "source_database": str(source_database.resolve()),
             "source_database_sha256_before": source_hash_before,
             "source_database_sha256_after": source_hash_after,
             "source_database_immutable": True,
-            "optimized_database": str(optimized_database),
-            "prior_map": str(prior_map),
+            "optimized_database": str(optimized_database.resolve()),
+            "prior_map": str(prior_map.resolve()),
             "prior_map_sha256": package_hash,
         },
     )
@@ -2254,6 +2483,28 @@ def _render_localized_version(
             "source_database_modified": False,
             "publish_state": report["publish_state"],
             "allow_draft": report["allow_draft"],
+            "source_database_sha256": source_hash_before,
+            "optimized_database_sha256": optimized_db_hash,
+            "prior_map_sha256": package_hash,
+            "tool_version": TOOL_VERSION,
+            "algorithm_version": "bounded_correction_field_v1",
+            "coordinate_contract_version": COORDINATE_CONTRACT_VERSION,
+            "processing_parameter_sha256": processing_parameter_sha256(),
+            "parameters": {
+                "huber_translation_m": HUBER_TRANSLATION_M,
+                "huber_yaw_rad": HUBER_YAW_RAD,
+                "hard_reject_translation_m": HARD_REJECT_TRANSLATION_M,
+                "hard_reject_yaw_rad": HARD_REJECT_YAW_RAD,
+            },
+            "input_sidecars": {
+                path.name: {
+                    "bytes": path.stat().st_size,
+                    "sha256": _sha256(path),
+                }
+                for path in sorted(segment.iterdir())
+                if path.is_file()
+                and path.suffix in {".json", ".jsonl", ".csv"}
+            },
         },
     )
     _json_write(output / "online_localization_trace.json", trace)
@@ -2389,6 +2640,16 @@ def _render_localized_version(
             *[
                 {"sequence": index + 3, "event": "manual_edit_applied", **item}
                 for index, item in enumerate(edit_audit)
+            ],
+            *[
+                {
+                    "sequence": index + 3 + len(edit_audit),
+                    "event": "manual_operation_audited",
+                    **item,
+                }
+                for index, item in enumerate(
+                    manual_edits.get("audit_events", []), start=1
+                )
             ],
         ],
         lines=True,

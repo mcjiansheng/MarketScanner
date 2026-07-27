@@ -551,6 +551,59 @@ class ManualEditJournalTests(unittest.TestCase):
                 },
             )
 
+    def test_tag_edit_whitelist_and_ranges_fail_closed(self) -> None:
+        journal = new_manual_edits("a" * 64, "b" * 64)
+        with self.assertRaisesRegex(ValueError, "not editable"):
+            append_manual_edit(
+                journal,
+                {
+                    "type": "edit_tag",
+                    "object_id": "tag-1",
+                    "new_value": {"approval_status": "approved"},
+                },
+            )
+        with self.assertRaisesRegex(ValueError, "outside"):
+            append_manual_edit(
+                journal,
+                {
+                    "type": "edit_tag",
+                    "object_id": "tag-1",
+                    "new_value": {"height_cm": 501},
+                },
+            )
+
+    def test_manual_approval_requires_a_real_map_edge_and_valid_offset(self) -> None:
+        shelf = {
+            "shape_type": "MapShelf",
+            "code": "S1",
+            "yaw_rad": 0.0,
+            "source": {"width": 400, "height": 50},
+            "geometry": {
+                "coordinates": [[0.0, 0.0], [4.0, 0.0], [4.0, -0.5], [0.0, -0.5]]
+            },
+        }
+        tag = {
+            "tag_id": "tag-1",
+            "final_map_position": {"x_m": 2.0, "y_m": 0.0},
+            "shelf_code": "S1",
+            "shelf_side": "A",
+            "distance_from_shelf_start_cm": 200,
+            "needs_review": True,
+            "approval_status": "pending",
+        }
+        journal = append_manual_edit(
+            new_manual_edits("a" * 64, "b" * 64),
+            {"type": "approve_tag", "object_id": "tag-1", "new_value": None},
+        )
+        _, approved, _ = apply_manual_edits([], [dict(tag)], journal, elements=[shelf])
+        self.assertEqual(approved[0]["approval_status"], "approved")
+        self.assertTrue(approved[0]["user_confirmed"])
+
+        invalid = {**tag, "distance_from_shelf_start_cm": 500}
+        _, rejected, _ = apply_manual_edits([], [invalid], journal, elements=[shelf])
+        self.assertEqual(rejected[0]["approval_status"], "pending")
+        self.assertTrue(rejected[0]["needs_review"])
+
 
 class LocalizedPipelineTests(unittest.TestCase):
     def setUp(self) -> None:
