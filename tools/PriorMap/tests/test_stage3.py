@@ -11,7 +11,9 @@ from tools.PriorMap.offline_localization import (
     Pose,
     OfflineLocalizationError,
     _associate_tag,
+    _segment_intersection,
     apply_pose_delta_to_point,
+    bind_tag_observation_to_pose,
     append_manual_edit,
     build_road_soft_constraints,
     build_manual_aisle_constraints,
@@ -122,6 +124,77 @@ class SE2TagPropagationTests(unittest.TestCase):
         opt = self._pose(float("nan"), 0.0, 0.0)
         with self.assertRaises(OfflineLocalizationError):
             apply_pose_delta_to_point(base, opt, (1.0, 0.0))
+
+
+class TagObservationBindingTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.poses = [
+            Pose(10, 100.0, 0.0, 0.0, 0.0),
+            Pose(11, 101.0, 1.0, 0.0, 0.0),
+        ]
+        self.observation = {
+            "frame_timestamp": 101.05,
+            "tracking_session_id": "tracking-1",
+            "prior_map_sha256": "a" * 64,
+            "floor_id": "1",
+        }
+
+    def _bind(self, observation: dict[str, object] | None = None):
+        return bind_tag_observation_to_pose(
+            self.poses,
+            self.observation if observation is None else observation,
+            expected_tracking_session_id="tracking-1",
+            expected_map_hashes={"a" * 64},
+            expected_floor_id="1",
+            maximum_time_delta_seconds=0.2,
+        )
+
+    def test_frame_timestamp_binds_nearest_real_node(self) -> None:
+        binding = self._bind()
+        self.assertEqual(binding.node_index, 1)
+        self.assertEqual(binding.binding_source, "frame_timestamp")
+        self.assertAlmostEqual(binding.time_delta_seconds, 0.05)
+
+    def test_explicit_node_id_is_used_and_audited(self) -> None:
+        observation = {**self.observation, "nearest_node_id": 11}
+        binding = self._bind(observation)
+        self.assertEqual(binding.node_index, 1)
+        self.assertEqual(binding.binding_source, "nearest_node_id")
+
+    def test_missing_observation_and_timestamp_fail_closed(self) -> None:
+        with self.assertRaisesRegex(OfflineLocalizationError, "missing"):
+            bind_tag_observation_to_pose(
+                self.poses,
+                None,
+                expected_tracking_session_id="tracking-1",
+                expected_map_hashes={"a" * 64},
+                expected_floor_id="1",
+            )
+        with self.assertRaisesRegex(OfflineLocalizationError, "timestamp"):
+            self._bind({key: value for key, value in self.observation.items() if key != "frame_timestamp"})
+
+    def test_identity_and_time_delta_mismatches_fail_closed(self) -> None:
+        with self.assertRaisesRegex(OfflineLocalizationError, "tracking_session"):
+            self._bind({**self.observation, "tracking_session_id": "wrong"})
+        with self.assertRaisesRegex(OfflineLocalizationError, "prior_map"):
+            self._bind({**self.observation, "prior_map_sha256": "b" * 64})
+        with self.assertRaisesRegex(OfflineLocalizationError, "floor"):
+            self._bind({**self.observation, "floor_id": "2"})
+        with self.assertRaisesRegex(OfflineLocalizationError, "time_delta"):
+            self._bind({**self.observation, "frame_timestamp": 110.0})
+
+    def test_missing_or_ambiguous_explicit_node_does_not_fallback(self) -> None:
+        with self.assertRaisesRegex(OfflineLocalizationError, "not_found"):
+            self._bind({**self.observation, "nearest_node_id": 99})
+        duplicate = [self.poses[0], Pose(10, 100.0, 2.0, 0.0, 0.0)]
+        with self.assertRaisesRegex(OfflineLocalizationError, "ambiguous"):
+            bind_tag_observation_to_pose(
+                duplicate,
+                {**self.observation, "frame_timestamp": 100.0, "nearest_node_id": 10},
+                expected_tracking_session_id="tracking-1",
+                expected_map_hashes={"a" * 64},
+                expected_floor_id="1",
+            )
 
 
 class RobustSE2OptimizerTests(unittest.TestCase):
@@ -253,10 +326,46 @@ class ShelfAssociationSafetyTests(unittest.TestCase):
     def test_near_side_auto_confirmed(self) -> None:
         # Shelf from (0,0) to (4,0) — camera at (2, 2) looking at near side.
         shelf = self._shelf_element("SHELF-01", [(0.0, 0.0), (4.0, 0.0), (4.0, -0.5), (0.0, -0.5)])
+        second = self._shelf_element("SHELF-02", [(0.0, -0.8), (4.0, -0.8), (4.0, -1.3), (0.0, -1.3)])
         tag = self._tag(2.0, 0.15)
-        result = _associate_tag(tag, [shelf], (2.0, 2.0))
+        result = _associate_tag(tag, [shelf, second], (2.0, 2.0))
         self.assertEqual(result.get("shelf_code"), "SHELF-01")
         self.assertFalse(result.get("needs_review"))
+
+    def test_no_independent_second_candidate_fails_closed(self) -> None:
+        shelf = self._shelf_element("SHELF-01", [(0.0, 0.0), (4.0, 0.0), (4.0, -0.5), (0.0, -0.5)])
+        result = _associate_tag(self._tag(2.0, 0.15), [shelf], (2.0, 2.0))
+        self.assertTrue(result.get("needs_review"))
+        self.assertEqual(result.get("approval_status"), "pending")
+        self.assertNotIn("shelf_code", result)
+
+    def test_user_confirmed_business_fields_are_not_overwritten(self) -> None:
+        shelf = self._shelf_element("AUTO", [(0.0, 0.0), (4.0, 0.0), (4.0, -0.5), (0.0, -0.5)])
+        second = self._shelf_element("SECOND", [(0.0, -0.8), (4.0, -0.8), (4.0, -1.3), (0.0, -1.3)])
+        tag = self._tag(2.0, 0.15)
+        tag.update({
+            "user_confirmed": True,
+            "shelf_code": "HUMAN",
+            "shelf_side": "A",
+            "distance_from_shelf_start_cm": 25.0,
+        })
+        result = _associate_tag(tag, [shelf, second], (2.0, 2.0))
+        self.assertEqual(result.get("shelf_code"), "HUMAN")
+        self.assertEqual(result.get("shelf_side"), "A")
+        self.assertTrue(result.get("needs_review"))
+        self.assertEqual(result.get("approval_status"), "pending")
+        self.assertEqual(
+            result.get("suggested_association", {}).get("shelf_code"), "AUTO"
+        )
+
+    def test_collinear_overlap_counts_as_an_occlusion(self) -> None:
+        hit = _segment_intersection(
+            (0.0, 0.0), (4.0, 0.0), (1.0, 0.0), (2.0, 0.0)
+        )
+        self.assertIsNotNone(hit)
+        assert hit is not None
+        self.assertAlmostEqual(hit[0], 0.25)
+        self.assertAlmostEqual(hit[2], 1.0)
 
     def test_far_side_fail_closed(self) -> None:
         # Camera at (2, 2) on the near side, tag on the far side at (2, -0.6).
@@ -380,6 +489,7 @@ class LocalizedPipelineTests(unittest.TestCase):
                 "scanMode": "continuous_streaming",
                 "finalized": True,
                 "workflowMode": "prior_map_localized",
+                "trackingSessionId": "tracking-1",
                 "priorMapId": manifest["prior_map_id"],
                 "priorMapSha256": manifest["source_sha256"],
                 "floorId": "1",
@@ -433,7 +543,14 @@ class LocalizedPipelineTests(unittest.TestCase):
         )
         jsonl_write(
             self.segment / "tag_observations.jsonl",
-            [{"observation_id": "obs-1", "frame_timestamp": 10.0}],
+            [{
+                "observation_id": "obs-1",
+                "frame_timestamp": 10.0,
+                "tracking_session_id": "tracking-1",
+                "prior_map_sha256": manifest["source_sha256"],
+                "floor_id": "1",
+                "raw_map_position": {"x_m": 2.0, "y_m": -2.0, "height_m": 1.2},
+            }],
         )
         json_write(
             self.segment / "localized_price_tags.json",
@@ -442,6 +559,14 @@ class LocalizedPipelineTests(unittest.TestCase):
                     "tag_id": "tag-1",
                     "observation_id": "obs-1",
                     "payload": "690000000001",
+                    "tracking_session_id": "tracking-1",
+                    "prior_map_sha256": manifest["source_sha256"],
+                    "floor_id": "1",
+                    "raw_map_position": {
+                        "x_m": 2.0,
+                        "y_m": -2.0,
+                        "height_m": 1.2,
+                    },
                     "snapped_map_position": {
                         "x_m": 2.1,
                         "y_m": -2.0,
@@ -510,6 +635,27 @@ class LocalizedPipelineTests(unittest.TestCase):
                 "source_database_immutable"
             ]
         )
+        tag = json.loads((first_output / "localized_price_tags.json").read_text())[0]
+        self.assertEqual(tag["online_map_position"]["x_m"], 2.0)
+        self.assertEqual(tag["transform_audit"]["bound_node_id"], 11)
+
+    def test_missing_tag_observation_never_defaults_to_node_zero(self) -> None:
+        jsonl_write(self.segment / "tag_observations.jsonl", [])
+        output = self.root / "localized-missing-observation"
+        process_localized_session(
+            self.prior_map,
+            self.session,
+            self.poses,
+            self.source_database,
+            self.optimized_database,
+            output,
+        )
+        tag = json.loads((output / "localized_price_tags.json").read_text())[0]
+        self.assertTrue(tag["needs_review"])
+        self.assertEqual(tag["approval_status"], "pending")
+        self.assertNotIn("final_map_position", tag)
+        self.assertEqual(tag["transform_audit"]["status"], "not_applied")
+        self.assertEqual(tag["association_audit"]["status"], "not_attempted")
 
 
 if __name__ == "__main__":

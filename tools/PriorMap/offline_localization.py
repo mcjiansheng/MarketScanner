@@ -56,6 +56,15 @@ class AbsoluteConstraint:
     source: dict[str, Any]
 
 
+@dataclass(frozen=True)
+class TagPoseBinding:
+    node_index: int
+    observation_timestamp: float
+    node_timestamp: float
+    time_delta_seconds: float
+    binding_source: str
+
+
 def _json_write(path: Path, payload: Any, *, lines: bool = False) -> None:
     if lines:
         text = "".join(
@@ -212,14 +221,136 @@ def _read_jsonl(
 def _nearest_pose_index(poses: Sequence[Pose], timestamp: float | None) -> int:
     if not poses:
         raise OfflineLocalizationError("The optimized RTAB-Map trajectory is empty.")
-    if timestamp is None:
-        return 0
+    if timestamp is None or not math.isfinite(float(timestamp)):
+        raise OfflineLocalizationError("A finite frame/node timestamp is required.")
     stamped = [
         (abs(float(pose.timestamp) - timestamp), index)
         for index, pose in enumerate(poses)
-        if pose.timestamp is not None
+        if pose.timestamp is not None and math.isfinite(float(pose.timestamp))
     ]
-    return min(stamped)[1] if stamped else 0
+    if not stamped:
+        raise OfflineLocalizationError(
+            "The optimized RTAB-Map trajectory has no finite node timestamps."
+        )
+    return min(stamped)[1]
+
+
+def bind_tag_observation_to_pose(
+    poses: Sequence[Pose],
+    observation: dict[str, Any] | None,
+    *,
+    tag: dict[str, Any] | None = None,
+    expected_tracking_session_id: str,
+    expected_map_hashes: set[str],
+    expected_floor_id: str,
+    maximum_time_delta_seconds: float = 1.5,
+) -> TagPoseBinding:
+    """Bind one tag observation to a real RTAB-Map node, or fail closed.
+
+    An explicit node ID is authoritative when present. Otherwise the
+    observation's ARFrame timestamp is matched against ``Node.stamp``.  Wall
+    clock timestamps are deliberately ignored. Identity fields are required
+    whenever the session declares the corresponding identity.
+    """
+    if not isinstance(observation, dict):
+        raise OfflineLocalizationError("tag_observation_missing")
+    timestamp_value = observation.get("frame_timestamp")
+    try:
+        observation_timestamp = float(timestamp_value)
+    except (TypeError, ValueError):
+        raise OfflineLocalizationError("tag_observation_frame_timestamp_missing")
+    if not math.isfinite(observation_timestamp):
+        raise OfflineLocalizationError("tag_observation_frame_timestamp_invalid")
+
+    identity_checks = (
+        (
+            "tracking_session_id",
+            expected_tracking_session_id,
+            str(
+                observation.get("tracking_session_id")
+                or observation.get("trackingSessionId")
+                or ""
+            ),
+        ),
+        (
+            "floor_id",
+            expected_floor_id,
+            str(observation.get("floor_id") or observation.get("floorId") or ""),
+        ),
+    )
+    for name, expected, actual in identity_checks:
+        if expected and actual != expected:
+            raise OfflineLocalizationError(f"tag_observation_{name}_mismatch")
+    actual_map_hash = str(
+        observation.get("prior_map_sha256")
+        or observation.get("priorMapSha256")
+        or ""
+    )
+    if expected_map_hashes and actual_map_hash not in expected_map_hashes:
+        raise OfflineLocalizationError("tag_observation_prior_map_sha256_mismatch")
+    if isinstance(tag, dict):
+        paired_identities = (
+            (
+                "tracking_session_id",
+                str(tag.get("tracking_session_id") or tag.get("trackingSessionId") or ""),
+                str(
+                    observation.get("tracking_session_id")
+                    or observation.get("trackingSessionId")
+                    or ""
+                ),
+            ),
+            (
+                "prior_map_sha256",
+                str(tag.get("prior_map_sha256") or tag.get("priorMapSha256") or ""),
+                actual_map_hash,
+            ),
+            (
+                "floor_id",
+                str(tag.get("floor_id") or tag.get("floorId") or ""),
+                str(observation.get("floor_id") or observation.get("floorId") or ""),
+            ),
+        )
+        for name, tag_value, observation_value in paired_identities:
+            if tag_value and observation_value != tag_value:
+                raise OfflineLocalizationError(
+                    f"tag_and_observation_{name}_mismatch"
+                )
+
+    explicit_node_id = observation.get("nearest_node_id")
+    if explicit_node_id is None:
+        explicit_node_id = observation.get("node_id")
+    binding_source = "frame_timestamp"
+    if explicit_node_id is not None:
+        if isinstance(explicit_node_id, bool):
+            raise OfflineLocalizationError("tag_observation_node_id_invalid")
+        try:
+            node_id = int(explicit_node_id)
+        except (TypeError, ValueError):
+            raise OfflineLocalizationError("tag_observation_node_id_invalid")
+        matches = [index for index, pose in enumerate(poses) if pose.node_id == node_id]
+        if not matches:
+            raise OfflineLocalizationError("tag_observation_node_id_not_found")
+        if len(matches) != 1:
+            raise OfflineLocalizationError("tag_observation_node_id_ambiguous")
+        index = matches[0]
+        binding_source = "nearest_node_id"
+    else:
+        index = _nearest_pose_index(poses, observation_timestamp)
+
+    node_timestamp_value = poses[index].timestamp
+    if node_timestamp_value is None or not math.isfinite(float(node_timestamp_value)):
+        raise OfflineLocalizationError("tag_observation_bound_node_stamp_invalid")
+    node_timestamp = float(node_timestamp_value)
+    time_delta = abs(observation_timestamp - node_timestamp)
+    if time_delta > maximum_time_delta_seconds:
+        raise OfflineLocalizationError("tag_observation_node_time_delta_exceeded")
+    return TagPoseBinding(
+        node_index=index,
+        observation_timestamp=observation_timestamp,
+        node_timestamp=node_timestamp,
+        time_delta_seconds=time_delta,
+        binding_source=binding_source,
+    )
 
 
 def _project_to_segment(
@@ -837,12 +968,40 @@ def _segment_intersection(
     x2, y2 = p2
     x3, y3 = p3
     x4, y4 = p4
-    denom = (x2 - x1) * (y4 - y3) - (y2 - y1) * (x4 - x3)
+    rx, ry = x2 - x1, y2 - y1
+    sx, sy = x4 - x3, y4 - y3
+    qpx, qpy = x3 - x1, y3 - y1
+    denom = rx * sy - ry * sx
     if abs(denom) < eps:
-        # Parallel or collinear — treat as non-intersecting for occlusion.
-        return None
-    t = ((x3 - x1) * (y4 - y3) - (y3 - y1) * (x4 - x3)) / denom
-    u = ((x3 - x1) * (y2 - y1) - (y3 - y1) * (x2 - x1)) / denom
+        # Parallel segments intersect only when they are collinear and their
+        # finite intervals overlap. The nearest overlap point is the occluder.
+        if abs(qpx * ry - qpy * rx) >= eps:
+            return None
+        ray_length_squared = rx * rx + ry * ry
+        if ray_length_squared <= eps:
+            return None
+        t0 = (qpx * rx + qpy * ry) / ray_length_squared
+        t1 = t0 + (sx * rx + sy * ry) / ray_length_squared
+        overlap_start = max(0.0, min(t0, t1))
+        overlap_end = min(1.0, max(t0, t1))
+        if overlap_start > overlap_end + eps:
+            return None
+        t = max(0.0, min(1.0, overlap_start))
+        hit_x = x1 + t * rx
+        hit_y = y1 + t * ry
+        edge_length_squared = sx * sx + sy * sy
+        u = (
+            ((hit_x - x3) * sx + (hit_y - y3) * sy) / edge_length_squared
+            if edge_length_squared > eps
+            else 0.0
+        )
+        return (
+            t,
+            max(0.0, min(1.0, u)),
+            math.hypot(hit_x - x1, hit_y - y1),
+        )
+    t = (qpx * sy - qpy * sx) / denom
+    u = (qpx * ry - qpy * rx) / denom
     # Allow a tiny tolerance so endpoint grazes count as occlusion.
     if t < -eps or t > 1.0 + eps or u < -eps or u > 1.0 + eps:
         return None
@@ -850,6 +1009,51 @@ def _segment_intersection(
     hit_y = y1 + t * (y2 - y1)
     dist = math.hypot(hit_x - x1, hit_y - y1)
     return (max(0.0, min(1.0, t)), max(0.0, min(1.0, u)), dist)
+
+
+def _mark_tag_for_review(tag: dict[str, Any], reason: str) -> None:
+    reasons = tag.setdefault("review_reasons", [])
+    if isinstance(reasons, list) and reason not in reasons:
+        reasons.append(reason)
+    tag["needs_review"] = True
+    if tag.get("approval_status") in {None, "approved", "auto_approved"}:
+        tag["approval_status"] = "pending"
+
+
+def _tag_has_publishable_fields(tag: dict[str, Any]) -> bool:
+    position = tag.get("final_map_position")
+    if not isinstance(position, dict):
+        return False
+    try:
+        x = float(position.get("x_m"))
+        y = float(position.get("y_m"))
+        offset = float(tag.get("distance_from_shelf_start_cm"))
+    except (TypeError, ValueError):
+        return False
+    return (
+        math.isfinite(x)
+        and math.isfinite(y)
+        and math.isfinite(offset)
+        and offset >= 0
+        and bool(tag.get("shelf_code"))
+        and bool(tag.get("shelf_side"))
+    )
+
+
+def enforce_tag_state_invariants(tag: dict[str, Any]) -> dict[str, Any]:
+    """Keep review and approval fields logically consistent."""
+    if tag.get("needs_review") is True:
+        if tag.get("approval_status") not in {"pending", "rejected"}:
+            tag["approval_status"] = "pending"
+        return tag
+    if not _tag_has_publishable_fields(tag):
+        _mark_tag_for_review(tag, "tag_missing_publishable_position_or_association")
+        return tag
+    if tag.get("user_confirmed") is True:
+        tag["approval_status"] = "approved"
+    elif tag.get("approval_status") not in {"approved", "auto_approved"}:
+        tag["approval_status"] = "auto_approved"
+    return tag
 
 
 def _associate_tag(
@@ -910,8 +1114,8 @@ def _associate_tag(
                 occlusion_edges.append((start, end))
 
     if not candidates:
-        tag["needs_review"] = True
-        return tag
+        _mark_tag_for_review(tag, "no_shelf_association_candidate")
+        return enforce_tag_state_invariants(tag)
 
     candidates.sort(key=lambda value: (value[0], str(value[1].get("id")), value[2]))
     best = candidates[0]
@@ -977,6 +1181,8 @@ def _associate_tag(
     loc_conf = float(tag.get("localization_confidence", 0) or 0)
     meas_conf = float(tag.get("measurement_confidence", 0) or 0)
     manually_modified = bool(tag.get("manually_modified"))
+    user_confirmed = bool(tag.get("user_confirmed"))
+    human_authoritative = manually_modified or user_confirmed
 
     can_auto_confirm = (
         has_camera
@@ -984,10 +1190,11 @@ def _associate_tag(
         and ray_clear
         and visible_side_consistent
         and not near_endpoint
-        and (second is None or margin >= min_margin)
+        and second is not None
+        and margin >= min_margin
         and loc_conf >= min_auto_confidence
         and meas_conf >= min_auto_confidence
-        and not manually_modified
+        and not human_authoritative
     )
 
     if can_auto_confirm:
@@ -1006,7 +1213,7 @@ def _associate_tag(
                 "association_confidence": round(max(0.0, 1 - best_distance / candidate_radius), 6),
             }
         )
-        tag["needs_review"] = bool(tag.get("needs_review")) or False
+        tag["needs_review"] = bool(tag.get("needs_review"))
     else:
         # Fail-closed: keep original position, provide suggestion only.
         tag["suggested_association"] = {
@@ -1021,12 +1228,49 @@ def _associate_tag(
                 margin, second is not None, loc_conf, meas_conf, has_camera
             ),
         }
-        tag["needs_review"] = True
+        rejection_reason = tag["suggested_association"]["reason"]
+        if human_authoritative:
+            current = (
+                tag.get("shelf_code"),
+                tag.get("shelf_side"),
+                tag.get("distance_from_shelf_start_cm"),
+            )
+            suggested = (
+                tag["suggested_association"].get("shelf_code"),
+                tag["suggested_association"].get("shelf_side"),
+                tag["suggested_association"].get("distance_from_shelf_start_cm"),
+            )
+            if current != suggested:
+                _mark_tag_for_review(tag, "human_association_conflicts_with_offline_evidence")
+        else:
+            _mark_tag_for_review(tag, rejection_reason)
         if "association_confidence" not in tag:
             tag["association_confidence"] = round(
                 max(0.0, 1 - best_distance / candidate_radius), 6
             )
-    return tag
+    tag["association_audit"] = {
+        "candidate_search_radius_m": candidate_radius,
+        "candidate_search_complete": False,
+        "candidate_count": len(candidates),
+        "independent_second_candidate_present": second is not None,
+        "best_distance_m": round(best_distance, 6),
+        "second_distance_m": round(second[0], 6) if second is not None else None,
+        "margin_m": round(margin, 6),
+        "ray_clear": ray_clear,
+        "visible_side_consistent": visible_side_consistent,
+        "near_endpoint": near_endpoint,
+        "human_authoritative": human_authoritative,
+        "candidates": [
+            {
+                "element_id": item[1].get("id"),
+                "shelf_code": item[1].get("code"),
+                "edge_id": item[2],
+                "distance_m": round(item[0], 6),
+            }
+            for item in candidates[:20]
+        ],
+    }
+    return enforce_tag_state_invariants(tag)
 
 
 def _association_reject_reason(
@@ -1053,6 +1297,8 @@ def _association_reject_reason(
         reasons.append("tag near shelf endpoint, side ambiguous")
     if has_second and margin < 0.15:
         reasons.append(f"independent second candidate margin {margin:.2f}m below 0.15m")
+    if not has_second:
+        reasons.append("independent second candidate is required for auto-confirmation")
     if loc_conf < 0.6:
         reasons.append(f"localization confidence {loc_conf:.2f} below 0.60")
     if meas_conf < 0.6:
@@ -1329,13 +1575,20 @@ def process_localized_session(
         constraint_records.append(normalized)
         if record.get("accepted") is not True or pose is None:
             continue
+        try:
+            node_index = _nearest_pose_index(
+                baseline,
+                float(record["timestamp"])
+                if record.get("timestamp") is not None
+                else None,
+            )
+        except (OfflineLocalizationError, TypeError, ValueError):
+            normalized["offline_rejected_reason"] = "constraint_timestamp_invalid"
+            continue
         constraints.append(
             AbsoluteConstraint(
                 identifier=identifier,
-                node_index=_nearest_pose_index(
-                    baseline,
-                    float(record["timestamp"]) if record.get("timestamp") is not None else None,
-                ),
+                node_index=node_index,
                 x=pose[0],
                 y=pose[1],
                 yaw=pose[2],
@@ -1433,54 +1686,108 @@ def process_localized_session(
         str(item.get("observation_id")): item for item in tag_observations
     }
     max_node_time_delta_seconds = 1.5
+    expected_tracking_session_id = str(
+        metadata.get("trackingSessionId") or metadata.get("tracking_session_id") or ""
+    )
+    expected_floor_id = str(metadata.get("floorId") or metadata.get("floor_id") or "")
+    expected_map_hashes = {str(expected_hash)} if expected_hash else set()
     for tag in raw_tags:
-        observation = observations_by_id.get(str(tag.get("observation_id")), {})
-        obs_timestamp = (
-            float(observation["frame_timestamp"])
-            if observation.get("frame_timestamp") is not None
-            else None
-        )
-        index = _nearest_pose_index(baseline, obs_timestamp)
+        observation = observations_by_id.get(str(tag.get("observation_id")))
+        try:
+            binding = bind_tag_observation_to_pose(
+                baseline,
+                observation,
+                tag=tag,
+                expected_tracking_session_id=expected_tracking_session_id,
+                expected_map_hashes=expected_map_hashes,
+                expected_floor_id=expected_floor_id,
+                maximum_time_delta_seconds=max_node_time_delta_seconds,
+            )
+        except OfflineLocalizationError as exc:
+            reason = str(exc)
+            tag.pop("final_map_position", None)
+            _mark_tag_for_review(tag, reason)
+            tag["transform_audit"] = {
+                "status": "not_applied",
+                "source_observation_id": str(tag.get("observation_id") or ""),
+                "reason": reason,
+            }
+            tag["association_audit"] = {
+                "status": "not_attempted",
+                "reason": "tag_pose_binding_failed",
+            }
+            final_tags.append(enforce_tag_state_invariants(tag))
+            continue
+        index = binding.node_index
         baseline_node = baseline[index]
         optimized_node = optimized[index]
-        original = tag.get("snapped_map_position") or tag.get("raw_map_position")
-        if isinstance(original, dict):
-            tag["online_map_position"] = dict(original)
-            try:
-                final_x, final_y = apply_pose_delta_to_point(
-                    baseline_node,
-                    optimized_node,
-                    (float(original.get("x_m", 0)), float(original.get("y_m", 0))),
-                )
-            except OfflineLocalizationError:
-                tag["needs_review"] = True
-                final_tags.append(
-                    _associate_tag(tag, elements, (optimized_node.x, optimized_node.y))
-                )
-                continue
-            tag["final_map_position"] = {
-                "x_m": round(final_x, 6),
-                "y_m": round(final_y, 6),
-                "height_m": original.get("height_m"),
+        raw_observation_position = (
+            observation.get("raw_map_position")
+            if isinstance(observation, dict)
+            else None
+        )
+        original = tag.get("raw_map_position") or raw_observation_position
+        if not isinstance(original, dict) and tag.get("user_confirmed") is True:
+            original = tag.get("snapped_map_position")
+        if not isinstance(original, dict):
+            tag.pop("final_map_position", None)
+            _mark_tag_for_review(tag, "tag_raw_map_position_missing")
+            tag["transform_audit"] = {
+                "status": "not_applied",
+                "source_observation_id": str(tag.get("observation_id") or ""),
+                "bound_node_id": baseline_node.node_id,
+                "reason": "tag_raw_map_position_missing",
             }
-            online_x = float(original.get("x_m", 0))
-            online_y = float(original.get("y_m", 0))
-            tag["online_offline_distance_cm"] = round(
-                math.hypot(final_x - online_x, final_y - online_y) * 100, 3
+            tag["association_audit"] = {
+                "status": "not_attempted",
+                "reason": "tag_raw_map_position_missing",
+            }
+            final_tags.append(enforce_tag_state_invariants(tag))
+            continue
+        tag["online_map_position"] = dict(original)
+        try:
+            final_x, final_y = apply_pose_delta_to_point(
+                baseline_node,
+                optimized_node,
+                (float(original.get("x_m")), float(original.get("y_m"))),
             )
+        except (OfflineLocalizationError, TypeError, ValueError):
+            tag.pop("final_map_position", None)
+            _mark_tag_for_review(tag, "tag_raw_map_position_invalid")
+            tag["transform_audit"] = {
+                "status": "not_applied",
+                "source_observation_id": str(tag.get("observation_id") or ""),
+                "bound_node_id": baseline_node.node_id,
+                "reason": "tag_raw_map_position_invalid",
+            }
+            tag["association_audit"] = {
+                "status": "not_attempted",
+                "reason": "tag_raw_map_position_invalid",
+            }
+            final_tags.append(enforce_tag_state_invariants(tag))
+            continue
+        tag["final_map_position"] = {
+            "x_m": round(final_x, 6),
+            "y_m": round(final_y, 6),
+            "height_m": original.get("height_m"),
+        }
+        online_x = float(original.get("x_m"))
+        online_y = float(original.get("y_m"))
+        tag["online_offline_distance_cm"] = round(
+            math.hypot(final_x - online_x, final_y - online_y) * 100, 3
+        )
         tag.setdefault("manually_modified", False)
         tag.setdefault("approval_status", "pending" if tag.get("needs_review") else "auto_approved")
         # Audit: record the binding node and SE(2) delta so reviewers can verify
         # the rigid transform that propagated this tag from online to final.
-        node_time_delta: float | None = None
-        if obs_timestamp is not None and baseline_node.timestamp is not None:
-            node_time_delta = abs(obs_timestamp - baseline_node.timestamp)
         tag.setdefault("transform_audit", {
+            "status": "applied",
             "source_observation_id": str(tag.get("observation_id") or ""),
             "bound_node_id": baseline_node.node_id,
             "bound_node_stamp": baseline_node.timestamp,
-            "observation_stamp": obs_timestamp,
-            "time_delta_seconds": node_time_delta,
+            "observation_stamp": binding.observation_timestamp,
+            "time_delta_seconds": binding.time_delta_seconds,
+            "binding_source": binding.binding_source,
             "baseline_pose": {
                 "x_m": round(baseline_node.x, 6),
                 "y_m": round(baseline_node.y, 6),
@@ -1495,14 +1802,13 @@ def process_localized_session(
                 _normalize_angle(optimized_node.yaw - baseline_node.yaw), 6
             ),
         })
-        if node_time_delta is not None and node_time_delta > max_node_time_delta_seconds:
-            tag["needs_review"] = True
         final_tags.append(
             _associate_tag(tag, elements, (optimized_node.x, optimized_node.y))
         )
     # Manual tag decisions are deliberately replayed after all automatic
     # reassociation so a reprocess never silently overwrites a human edit.
     _, final_tags, _ = apply_manual_edits([], final_tags, manual_edits)
+    final_tags = [enforce_tag_state_invariants(tag) for tag in final_tags]
 
     corrections = [
         math.hypot(after.x - before.x, after.y - before.y)
@@ -1530,6 +1836,11 @@ def process_localized_session(
             "severity": "warning",
             "message": f"价签 {tag.get('payload') or tag.get('tag_id')} 需要人工复核。",
             "object_id": tag.get("tag_id"),
+            "details": {
+                "review_reasons": tag.get("review_reasons", []),
+                "transform_audit": tag.get("transform_audit"),
+                "association_audit": tag.get("association_audit"),
+            },
         }
         for index, tag in enumerate(final_tags, start=1)
         if tag.get("needs_review") is True
