@@ -1,0 +1,74 @@
+name: MarketScanner Repair V2
+
+on:
+  push:
+    branches:
+      - feature/prior-map-localization-repair-v2
+      - "repair-v2-**"
+  pull_request:
+    paths:
+      - ".github/workflows/marketscanner-repair-v2.yml"
+      - "app/ios/RTABMapApp/**"
+      - "docs/map-assisted-localization/**"
+      - "tools/PriorMap/**"
+      - "tools/SupermarketMapStudio/**"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  python-and-web:
+    name: Python, API and web contracts
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Compile Python sources
+        run: python3 -m py_compile tools/PriorMap/*.py tools/SupermarketMapStudio/*.py
+      - name: Run PriorMap tests
+        run: python3 -m unittest discover -s tools/PriorMap/tests -v
+      - name: Run Map Studio tests
+        run: python3 -m unittest discover -s tools/SupermarketMapStudio/tests -v
+      - name: Check browser JavaScript
+        run: node --check tools/SupermarketMapStudio/web/app.js
+      - name: Check patch whitespace
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+            git diff --check "${{ github.event.pull_request.base.sha }}...HEAD"
+          else
+            git diff --check HEAD^
+          fi
+
+  ios-source-contracts:
+    name: iOS source contracts
+    runs-on: macos-14
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Parse MarketScanner Swift sources
+        run: |
+          xcrun swiftc -parse \
+            app/ios/RTABMapApp/PriorMapLocalizationCore.swift \
+            app/ios/RTABMapApp/PriorMapLocalization.swift \
+            app/ios/RTABMapApp/SupermarketScanSession.swift \
+            app/ios/RTABMapApp/ViewController.swift
+      - name: Run platform-independent iOS contract test
+        run: python3 -m unittest tools.PriorMap.tests.test_prior_map.IOSCoreContractTests -v
+      - name: Validate Xcode project metadata
+        run: xcodebuild -project app/ios/RTABMapApp.xcodeproj -list
+
+# A complete RTABMapApp link build requires the generated, intentionally
+# untracked app/ios/RTABMapApp/Libraries tree. Release validation therefore
+# runs the unsigned iphoneos build on the prepared macOS build host and records
+# its log separately; this workflow still prevents Swift/schema/API regressions.
