@@ -61,6 +61,24 @@ void destroyNativeApplication(const void *object)
     }
 }
 
+bool getLastNodeNative(const void *object, int * nodeId, double * stamp)
+{
+    if(!object || !nodeId || !stamp)
+    {
+        return false;
+    }
+    return native(object)->getLastNode(*nodeId, *stamp);
+}
+
+bool getNodeTimeOffsetNative(const void *object, double * offset)
+{
+    if(!object || !offset)
+    {
+        return false;
+    }
+    return native(object)->getNodeTimeOffset(*offset);
+}
+
 void setScreenRotationNative(const void *object, int displayRotation)
 {
     if(object)

@@ -2506,6 +2506,7 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         }
         let generation = priorMapGeneration
         let trackingSessionId = supermarketSession?.trackingSessionId ?? ""
+        let nodeTimebase = rtabmap?.nodeTimebase(frameTimestamp: frame.timestamp)
         let interfaceOrientation = view.window?.windowScene?.interfaceOrientation
             ?? .portrait
         let imageOrientation: CGImagePropertyOrientation
@@ -2537,7 +2538,9 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                     guard generation == self.priorMapGeneration else { return }
                     let result = localizer.localizePriceTag(
                         detection,
-                        trackingSessionId: trackingSessionId)
+                        trackingSessionId: trackingSessionId,
+                        nodeTimebaseOffsetSeconds:
+                            nodeTimebase?.offsetSeconds ?? .nan)
                     let observationSaved =
                         self.supermarketSession?.appendTagObservation(result.0) == true
                     DispatchQueue.main.async {
@@ -2585,7 +2588,9 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
             }
             self.supermarketSession?.appendLocalizationTrace(
                 update,
-                expectedTrackingSessionId: trackingSessionId)
+                expectedTrackingSessionId: trackingSessionId,
+                nodeTimebaseOffsetSeconds:
+                    nodeTimebase?.offsetSeconds ?? .nan)
             DispatchQueue.main.async {
                 guard generation == self.priorMapGeneration else {
                     return
@@ -2759,6 +2764,11 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         let confirmationWallClock = Date()
         let confirmationFrameTimestamp = frame.timestamp
         let confirmationTransform = frame.camera.transform
+        let confirmationNodeBinding = rtabmap?.latestNodeBinding(
+            frameTimestamp: confirmationFrameTimestamp)
+        let confirmationNodeTimebase = confirmationNodeBinding.map {
+            ($0.nodeTimebaseFrameTimestamp, $0.nodeTimebaseOffsetSeconds)
+        } ?? rtabmap?.nodeTimebase(frameTimestamp: confirmationFrameTimestamp)
         priorMapQueue.async {
             let poses = localizer.confirmCurrentPosition(
                 transform: confirmationTransform,
@@ -2775,27 +2785,45 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                 return
             }
             self.priorMapAlignmentSnapshots.publish(snapshot)
-            self.supermarketSession?.appendManualLocalizationEvent(
+            let eventPersisted = self.supermarketSession?.appendManualLocalizationEvent(
                 reason: reason,
                 arkitPose: poses.0,
                 confirmedMapPose: poses.1,
                 wallClock: confirmationWallClock,
                 frameTimestamp: confirmationFrameTimestamp,
+                nodeTimebaseFrameTimestamp: confirmationNodeTimebase?.0
+                    ?? .nan,
+                nodeTimebaseOffsetSeconds: confirmationNodeTimebase?.1
+                    ?? .nan,
+                nearestNodeId: confirmationNodeBinding?.nodeId,
+                nearestNodeStamp: confirmationNodeBinding?.nodeStamp,
+                nodeTimeDeltaSeconds: confirmationNodeBinding?.deltaSeconds,
                 alignmentVersion: snapshot.alignmentVersion,
-                expectedTrackingSessionId: trackingSessionId)
-            self.supermarketSession?.appendScanEvent(
-                event: "manual_localization_confirmed",
-                message: "User confirmed a prior-map position",
-                fields: [
-                    "reason": reason,
-                    "xM": "\(mapPose.xM)",
-                    "yM": "\(mapPose.yM)",
-                    "yawRad": "\(mapPose.yawRad)",
-                ])
+                expectedTrackingSessionId: trackingSessionId) == true
+            if eventPersisted {
+                self.supermarketSession?.appendScanEvent(
+                    event: "manual_localization_confirmed",
+                    message: "User confirmed a prior-map position",
+                    fields: [
+                        "reason": reason,
+                        "xM": "\(mapPose.xM)",
+                        "yM": "\(mapPose.yM)",
+                        "yawRad": "\(mapPose.yawRad)",
+                    ])
+            }
+            else {
+                self.supermarketSession?.appendScanEvent(
+                    level: "error",
+                    event: "manual_localization_event_write_failed",
+                    message: "Manual localization changed in memory but its audit event could not be persisted",
+                    fields: ["reason": reason])
+            }
             DispatchQueue.main.async {
                 self.showToast(
-                    message: self.localized("Position confirmed. The adjustment was added to the audit log."),
-                    seconds: 3)
+                    message: eventPersisted
+                        ? self.localized("Position confirmed. The adjustment was added to the audit log.")
+                        : self.localized("Position changed, but the audit record could not be saved. Stop and recover this scan before continuing."),
+                    seconds: eventPersisted ? 3 : 6)
             }
         }
     }

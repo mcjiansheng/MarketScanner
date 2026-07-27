@@ -313,6 +313,8 @@ struct PriorMapLocalizationUpdate: Codable {
     var priorMapId: String? = nil
     var priorMapSha256: String? = nil
     var floorId: String? = nil
+    var nodeTimebaseTimestamp: TimeInterval? = nil
+    var nodeTimebaseOffsetSeconds: TimeInterval? = nil
 }
 
 private struct PriorMapRoadSegment {
@@ -607,7 +609,8 @@ final class PriorMapStageOneLocalizer {
 
     func localizePriceTag(
         _ detection: PriceTagVisionDetection,
-        trackingSessionId: String
+        trackingSessionId: String,
+        nodeTimebaseOffsetSeconds: TimeInterval
     ) -> (PriorMapTagObservationRecord, LocalizedPriceTag) {
         let snapshot = detection.alignmentSnapshot
         let origin = snapshot.arkitOrigin
@@ -678,6 +681,9 @@ final class PriorMapStageOneLocalizer {
                 Double(bounds.height),
             ],
             frameTimestamp: detection.frame.timestamp,
+            nodeTimebaseFrameTimestamp:
+                detection.frame.timestamp + nodeTimebaseOffsetSeconds,
+            nodeTimebaseOffsetSeconds: nodeTimebaseOffsetSeconds,
             poseTimestampDeltaMs: measurement.poseTimestampDeltaMs,
             alignmentVersion: snapshot.alignmentVersion,
             alignmentSnapshotTimestamp: snapshot.frameTimestamp,

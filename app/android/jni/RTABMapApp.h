@@ -102,6 +102,8 @@ class RTABMapApp : public UEventsHandler {
   void setPreserveCameraOrigin(bool enabled);
   bool getCameraOriginOffset(float & x, float & y, float & z, float & qx, float & qy, float & qz, float & qw);
   void setStreamingMapMode(bool enabled, int maxRenderedNodes);
+  bool getLastNode(int & nodeId, double & stamp);
+  bool getNodeTimeOffset(double & offset);
 
   // Set render camera's viewing angle, first person, third person or top down.
   //

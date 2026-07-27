@@ -73,6 +73,36 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <pcl/io/obj_io.h>
 #include <pcl/surface/poisson.h>
 #include <pcl/surface/vtk_smoothing/vtk_mesh_quadric_decimation.h>
+#include <cmath>
+
+bool RTABMapApp::getLastNode(int & nodeId, double & stamp)
+{
+	boost::mutex::scoped_lock lock(rtabmapMutex_);
+	if(rtabmap_ && rtabmap_->getMemory())
+	{
+		const rtabmap::Signature * signature =
+				rtabmap_->getMemory()->getLastWorkingSignature(false);
+		if(signature && signature->id() > 0 && std::isfinite(signature->getStamp()))
+		{
+			nodeId = signature->id();
+			stamp = signature->getStamp();
+			return true;
+		}
+	}
+	return false;
+}
+
+bool RTABMapApp::getNodeTimeOffset(double & offset)
+{
+	boost::mutex::scoped_lock lock(cameraMutex_);
+	if(camera_ && std::isfinite(camera_->getStampEpochOffset()) &&
+		camera_->getStampEpochOffset() != 0.0)
+	{
+		offset = camera_->getStampEpochOffset();
+		return true;
+	}
+	return false;
+}
 
 #ifdef RTABMAP_PDAL
 #include <rtabmap/core/PDALWriter.h>

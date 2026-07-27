@@ -72,6 +72,8 @@ bool startCameraNative(const void *object);
 void stopCameraNative(const void *object);
 void setPreserveCameraOriginNative(const void *object, bool enabled);
 bool getCameraOriginOffsetNative(const void *object, float * x, float * y, float * z, float * qx, float * qy, float * qz, float * qw);
+bool getLastNodeNative(const void *object, int * nodeId, double * stamp);
+bool getNodeTimeOffsetNative(const void *object, double * offset);
 void setStreamingMapModeNative(const void *object, bool enabled, int maxRenderedNodes);
 void setCameraNative(const void *object, int type);
 void postOdometryEventNative(const void *object,

@@ -176,9 +176,11 @@ void CameraMobile::poseReceived(const Transform & pose, double deviceStamp)
 	{
 		Transform p = pose;
 		
-		if(stampEpochOffset_ == 0.0)
+		double stampEpochOffset = stampEpochOffset_.load();
+		if(stampEpochOffset == 0.0)
 		{
-			stampEpochOffset_ = UTimer::now() - deviceStamp;
+			stampEpochOffset = UTimer::now() - deviceStamp;
+			stampEpochOffset_.store(stampEpochOffset);
 		}
 
 		if(originUpdate_)
@@ -194,7 +196,7 @@ void CameraMobile::poseReceived(const Transform & pose, double deviceStamp)
 			originUpdate_ = false;
 		}
         
-		double epochStamp = stampEpochOffset_ + deviceStamp;
+		double epochStamp = stampEpochOffset + deviceStamp;
 		if(!originOffset_.isNull())
 		{
 			// Filter re-localizations from poses received
@@ -543,7 +545,7 @@ SensorData CameraMobile::captureImage(SensorCaptureInfo * info)
 	if(data.isValid())
 	{
 		data.setGroundTruth(Transform());
-		data.setStamp(stampEpochOffset_ + data.stamp());
+		data.setStamp(stampEpochOffset_.load() + data.stamp());
 
 		if(info)
 		{

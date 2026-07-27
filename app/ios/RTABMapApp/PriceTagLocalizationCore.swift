@@ -401,6 +401,8 @@ struct PriorMapTagObservationRecord: Codable {
     let symbology: String
     let normalizedBounds: [Double]
     let frameTimestamp: TimeInterval
+    let nodeTimebaseFrameTimestamp: TimeInterval
+    let nodeTimebaseOffsetSeconds: TimeInterval
     let poseTimestampDeltaMs: Double
     let alignmentVersion: Int
     let alignmentSnapshotTimestamp: TimeInterval
@@ -434,6 +436,8 @@ struct PriorMapTagObservationRecord: Codable {
         case symbology
         case normalizedBounds = "normalized_bounds"
         case frameTimestamp = "frame_timestamp"
+        case nodeTimebaseFrameTimestamp = "node_timebase_frame_timestamp"
+        case nodeTimebaseOffsetSeconds = "node_timebase_offset_seconds"
         case poseTimestampDeltaMs = "pose_timestamp_delta_ms"
         case alignmentVersion = "alignment_version"
         case alignmentSnapshotTimestamp = "alignment_snapshot_timestamp"

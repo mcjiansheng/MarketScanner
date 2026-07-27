@@ -9,6 +9,7 @@ import json
 import math
 import os
 import platform
+import re
 import subprocess
 import sys
 import tempfile
@@ -46,6 +47,7 @@ from PriorMap.prior_map_schema import validate_package as validate_prior_map_pac
 from PriorMap.xlsx_to_prior_map import convert_workbook as convert_prior_map_workbook
 from PriorMap import offline_localization as localized
 from PriorMap.localized_output_store import (
+    LocalizedSnapshot,
     LocalizedStoreError,
     LocalizedVersionStore,
     REQUIRED_VERSION_FILES,
@@ -448,14 +450,18 @@ def remove_temporary(path: Optional[Path]) -> None:
         path.unlink(missing_ok=True)
 
 
-def job_artifacts(job: Job) -> Dict[str, str]:
+def job_artifacts(
+    job: Job, localized_snapshot: LocalizedSnapshot | None = None
+) -> Dict[str, str]:
     artifacts = {
         name: f"/api/jobs/{job.identifier}/artifact/{name}"
         for name in ARTIFACTS
         if (job.output_dir / name).is_file()
     }
     if job.kind == "localized":
-        snapshot = LocalizedVersionStore(job.output_dir).current()
+        snapshot = localized_snapshot
+        if snapshot is None:
+            snapshot = LocalizedVersionStore(job.output_dir).current()
         if snapshot is not None:
             artifacts.update(
                 {
@@ -493,7 +499,14 @@ def job_payload(job: Job) -> Dict[str, Any]:
         "input_keys": list(job.input_keys),
     }
     if job.status == "complete":
-        payload["artifacts"] = job_artifacts(job)
+        localized_snapshot = None
+        if job.kind == "localized":
+            localized_snapshot = LocalizedVersionStore(job.output_dir).current()
+            if localized_snapshot is None:
+                raise LocalizedStoreError(
+                    "Completed localized job has no validated current version."
+                )
+        payload["artifacts"] = job_artifacts(job, localized_snapshot)
         if job.kind == "prior_map":
             validation = load_json(job.output_dir / "validation_report.json", {})
             payload["quality_report"] = {
@@ -506,11 +519,8 @@ def job_payload(job: Job) -> Dict[str, Any]:
             payload["map"] = load_json(job.output_dir / "manifest.json", {})
         elif job.kind == "localized":
             store = LocalizedVersionStore(job.output_dir)
-            snapshot = store.current()
-            if snapshot is None:
-                raise LocalizedStoreError(
-                    "Completed localized job has no validated current version."
-                )
+            snapshot = localized_snapshot
+            assert snapshot is not None
             payload["localized"] = {
                 "version_id": snapshot.version_id,
                 "revision": snapshot.revision,
@@ -523,15 +533,26 @@ def job_payload(job: Job) -> Dict[str, Any]:
                     "revision": published.revision,
                     "publish_state": published.state,
                 }
-            payload["quality_report"] = load_json(
-                snapshot.version_dir / "localization_report.json", {}
-            )
-            payload["review_items"] = load_json(
-                snapshot.version_dir / "review_items.json", {"items": []}
-            )
-            payload["map"] = load_json(
-                snapshot.version_dir / "localized_review.json", {}
-            )
+            try:
+                payload["quality_report"] = json.loads(
+                    store.read_verified_artifact(
+                        snapshot.version_id, "localization_report.json"
+                    )
+                )
+                payload["review_items"] = json.loads(
+                    store.read_verified_artifact(
+                        snapshot.version_id, "review_items.json"
+                    )
+                )
+                payload["map"] = json.loads(
+                    store.read_verified_artifact(
+                        snapshot.version_id, "localized_review.json"
+                    )
+                )
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise LocalizedStoreError(
+                    "Validated localized JSON changed while building the response."
+                ) from exc
         else:
             payload["quality_report"] = load_json(job.output_dir / "quality_report.json", {})
             payload["review_items"] = load_json(job.output_dir / "review_items.json", {"items": []})
@@ -933,7 +954,24 @@ def find_existing_result(session: Path) -> Optional[Job]:
         return None
     latest = max(candidates, key=lambda path: (path / "map.json").stat().st_mtime)
     metadata = load_json(latest / "map.json", {})
-    kind = "stage" if metadata.get("format") == "SupermarketStageMap2D" else "map"
+    localized_root = latest / "localized"
+    has_localized_state = any(
+        path.exists()
+        for path in (
+            localized_root / "current.json",
+            localized_root / "published.json",
+            localized_root / "versions",
+        )
+    )
+    localized_snapshot = LocalizedVersionStore(latest).current()
+    if has_localized_state and localized_snapshot is None:
+        raise LocalizedStoreError(
+            "Localized storage exists but has no validated current version."
+        )
+    if localized_snapshot is not None:
+        kind = "localized"
+    else:
+        kind = "stage" if metadata.get("format") == "SupermarketStageMap2D" else "map"
     return STATE.restore(kind, latest)
 
 
@@ -1275,6 +1313,11 @@ def run_localized_map(
         manual_edits = load_json(edits_path, None)
         if not isinstance(manual_edits, dict):
             raise RequestError("manual_edits.json 无效。")
+    # These root-level reports are part of successful job completion.  Finish
+    # them before the immutable localized pointer commit so a post-processing
+    # failure cannot leave a failed job with an advanced current pointer.
+    attach_offline_reports(output, [offline_report])
+    attach_acceleration_report(output, acceleration_report, [offline_report])
     localized_result = localized.process_localized_session(
         prior_map=prior_map,
         session=session,
@@ -1289,8 +1332,6 @@ def run_localized_map(
         raise RequestError(
             "本地化质量门禁未通过；诊断版本已保留，但不会切换为 current 结果。"
         )
-    attach_offline_reports(output, [offline_report])
-    attach_acceleration_report(output, acceleration_report, [offline_report])
 
 
 def _manual_edit_context(
@@ -1411,6 +1452,20 @@ def _authoritative_manual_event(
         tag = _one_by_id(tags, "tag_id", target, "价签")
         assert isinstance(new_value, dict)
         old_value = {key: tag.get(key) for key in new_value}
+        if "height_cm" in new_value:
+            old_position = tag.get("final_map_position")
+            old_height = (
+                old_position.get("height_m")
+                if isinstance(old_position, dict)
+                else None
+            )
+            old_value["height_cm"] = (
+                float(old_height) * 100
+                if isinstance(old_height, (int, float))
+                and not isinstance(old_height, bool)
+                and math.isfinite(float(old_height))
+                else None
+            )
         merged = {**tag, **new_value}
         if "height_cm" in new_value:
             position = dict(merged.get("final_map_position") or {})
@@ -1520,14 +1575,22 @@ def apply_localized_edit(job: Job, data: Dict[str, Any]) -> Dict[str, Any]:
             )
 
         source = load_json(current.version_dir / "source_manifest.json", None)
+        try:
+            local_state = store.local_state()
+        except LocalizedStoreError as exc:
+            raise RequestError(
+                "结果缺少有效的本机路径状态，无法安全重放。"
+            ) from exc
         map_payload = load_json(job.output_dir / "map.json", {})
         if not isinstance(source, dict):
             raise RequestError("结果缺少 source_manifest.json，无法安全重放。")
-        prior_map = resolve_path(source.get("prior_map"), "Prior-map package")
-        session = require_session(source.get("source_session"))
-        source_database = resolve_path(source.get("source_database"), "Source database")
+        prior_map = resolve_path(local_state.get("prior_map"), "Prior-map package")
+        session = require_session(local_state.get("source_session"))
+        source_database = resolve_path(
+            local_state.get("source_database"), "Source database"
+        )
         optimized_database = resolve_path(
-            source.get("optimized_database"), "Optimized database"
+            local_state.get("optimized_database"), "Optimized database"
         )
         tags, constraints, elements, manifest = _manual_edit_context(
             current.version_dir, prior_map
@@ -1598,15 +1661,27 @@ def apply_localized_edit(job: Job, data: Dict[str, Any]) -> Dict[str, Any]:
             )
             for pose in segments[0].poses
         ]
-        result = localized.process_localized_session(
-            prior_map=prior_map,
-            session=session,
-            optimized_poses=poses,
-            source_database=source_database,
-            optimized_database=optimized_database,
-            output=job.output_dir,
-            manual_edits=journal,
-        )
+        try:
+            result = localized.process_localized_session(
+                prior_map=prior_map,
+                session=session,
+                optimized_poses=poses,
+                source_database=source_database,
+                optimized_database=optimized_database,
+                output=job.output_dir,
+                manual_edits=journal,
+                expected_parent_version=current.version_id,
+            )
+        except localized.OfflineLocalizationError as exc:
+            if "current version changed during replay" in str(exc):
+                latest = LocalizedVersionStore(job.output_dir).current()
+                if latest is not None:
+                    raise ConflictError(
+                        "人工编辑冲突：处理期间 current 已更新，请刷新后重试。",
+                        version_id=latest.version_id,
+                        revision=latest.revision,
+                    ) from exc
+            raise
         if not result.get("current_updated"):
             raise RequestError(
                 "人工编辑重放未通过质量门禁；旧 current 版本保持不变。"
@@ -1627,9 +1702,19 @@ def apply_localized_state_transition(
         raise RequestError("发布状态操作只适用于已完成的本地化任务。")
     with STATE.acquire_edit_lock(job.identifier):
         store = LocalizedVersionStore(job.output_dir)
-        current = store.current()
-        if current is None:
-            raise RequestError("结果缺少已验证的 current 本地化版本。")
+        action = str(data.get("action") or "")
+        targets = {
+            "submit_review": "review",
+            "return_to_draft": "draft",
+            "publish": "published",
+            "revoke": "revoked",
+        }
+        if action not in targets:
+            raise RequestError("不支持的本地化状态操作。")
+        source_snapshot = store.published() if action == "revoke" else store.current()
+        if source_snapshot is None:
+            missing = "published" if action == "revoke" else "current"
+            raise RequestError(f"结果缺少已验证的 {missing} 本地化版本。")
         expected_revision = data.get("expected_revision")
         expected_version = data.get("expected_version_id")
         if (
@@ -1642,27 +1727,20 @@ def apply_localized_state_transition(
                 "状态操作必须提供整数 expected_revision 和 expected_version_id。"
             )
         if (
-            expected_revision != current.revision
-            or expected_version != current.version_id
+            expected_revision != source_snapshot.revision
+            or expected_version != source_snapshot.version_id
         ):
             raise ConflictError(
                 "发布状态冲突，请刷新最新版本后重试。",
-                version_id=current.version_id,
-                revision=current.revision,
+                version_id=source_snapshot.version_id,
+                revision=source_snapshot.revision,
             )
-        action = str(data.get("action") or "")
-        targets = {
-            "submit_review": "review",
-            "return_to_draft": "draft",
-            "publish": "published",
-            "revoke": "revoked",
-        }
-        if action not in targets:
-            raise RequestError("不支持的本地化状态操作。")
         reason = data.get("reason")
         if not isinstance(reason, str) or not reason.strip() or len(reason) > 500:
             raise RequestError("状态操作必须提供 1 到 500 字符的审核说明。")
-        report = load_json(current.version_dir / "localization_report.json", None)
+        report = load_json(
+            source_snapshot.version_dir / "localization_report.json", None
+        )
         if not isinstance(report, dict):
             raise RequestError("当前版本缺少有效的 localization_report.json。")
         if action == "submit_review":
@@ -1674,22 +1752,77 @@ def apply_localized_state_transition(
             gate = report.get("publish_gate")
             blockers = gate.get("blockers", []) if isinstance(gate, dict) else []
             solver = report.get("solver")
+            requested_acceptance = data.get("field_acceptance")
+            field_acceptance = {
+                "accepted": (
+                    isinstance(requested_acceptance, dict)
+                    and requested_acceptance.get("accepted") is True
+                ),
+                "actor": "local-user",
+                "accepted_at_utc": datetime.now(timezone.utc).isoformat(
+                    timespec="milliseconds"
+                ),
+                "evidence_sha256": (
+                    requested_acceptance.get("evidence_sha256")
+                    if isinstance(requested_acceptance, dict)
+                    else None
+                ),
+            }
+            acceptance_valid = (
+                field_acceptance.get("accepted") is True
+                and isinstance(field_acceptance.get("evidence_sha256"), str)
+                and re.fullmatch(
+                    r"[0-9a-f]{64}", field_acceptance.get("evidence_sha256", "")
+                )
+                is not None
+            )
             if (
                 not isinstance(gate, dict)
                 or gate.get("passed") is not True
+                or gate.get("blockers") != []
                 or not isinstance(solver, dict)
                 or solver.get("full_factor_graph") is not True
+                or solver.get("published_capable") is not True
+                or solver.get("type") != "relative_se2_factor_graph"
+                or not acceptance_valid
             ):
                 if not blockers:
                     blockers = [{"code": "publish_gate_not_satisfied"}]
+                if not acceptance_valid:
+                    blockers = [*blockers, {"code": "field_acceptance_missing"}]
                 raise QualityGateError(
                     "当前有界修正场仅允许草稿/复核，不能发布。", blockers
                 )
         try:
-            snapshot = store.transition_current(
-                targets[action], actor="local-user", reason=reason.strip()
-            )
+            if action == "publish":
+                snapshot = store.publish_current(
+                    actor="local-user",
+                    reason=reason.strip(),
+                    field_acceptance=field_acceptance,
+                    expected_version=expected_version,
+                )
+            elif action == "revoke":
+                snapshot = store.revoke_published(
+                    actor="local-user",
+                    reason=reason.strip(),
+                    expected_version=expected_version,
+                )
+            else:
+                snapshot = store.transition_current(
+                    targets[action],
+                    actor="local-user",
+                    reason=reason.strip(),
+                    expected_version=expected_version,
+                )
         except LocalizedStoreError as exc:
+            if "changed before" in str(exc):
+                latest = store.published() if action == "revoke" else store.current()
+                if latest is not None:
+                    raise ConflictError(
+                        "发布状态冲突，请刷新最新版本后重试。",
+                        version_id=latest.version_id,
+                        revision=latest.revision,
+                    ) from exc
             raise RequestError(str(exc)) from exc
     return {
         "version_id": snapshot.version_id,
@@ -2080,11 +2213,13 @@ class StudioHandler(BaseHTTPRequestHandler):
             self.send_json(HTTPStatus.NOT_FOUND, {"error": "Artifact is not available."})
             return
         try:
-            snapshot = LocalizedVersionStore(job.output_dir).resolve_version(version_id)
+            store = LocalizedVersionStore(job.output_dir)
+            snapshot = store.resolve_version(version_id)
+            content = store.read_verified_artifact(snapshot.version_id, name)
         except LocalizedStoreError:
             self.send_json(HTTPStatus.NOT_FOUND, {"error": "Localized version was not found."})
             return
-        self.serve_file(snapshot.version_dir, name)
+        self.send_content(name, content)
 
     def serve_artifact(self, job: Job, name: str) -> None:
         if name not in ARTIFACTS and not name.startswith("preview_frames/"):
@@ -2097,14 +2232,16 @@ class StudioHandler(BaseHTTPRequestHandler):
         if root.resolve() not in path.parents or not path.is_file():
             self.send_json(HTTPStatus.NOT_FOUND, {"error": "Artifact was not found."})
             return
+        self.send_content(name, path.read_bytes())
+
+    def send_content(self, name: str, content: bytes) -> None:
         content_type = {
             ".png": "image/png",
             ".jpg": "image/jpeg",
             ".jpeg": "image/jpeg",
             ".json": "application/json; charset=utf-8",
             ".geojson": "application/geo+json; charset=utf-8",
-        }.get(path.suffix, "application/octet-stream")
-        content = path.read_bytes()
+        }.get(Path(name).suffix, "application/octet-stream")
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(content)))

@@ -27,6 +27,10 @@ const localizedReview = {
   versionId: null,
   revision: null,
   publishState: null,
+  publishedVersionId: null,
+  publishedRevision: null,
+  publishedState: null,
+  reviewArtifactUrl: null,
 };
 
 const viewer2d = {
@@ -125,8 +129,10 @@ function setBusy(busy) {
 function syncLocalizedStateButtons() {
   const state = localizedReview.publishState;
   $("#localized-submit-review").disabled = state !== "draft";
-  $("#localized-publish").disabled = state !== "review";
-  $("#localized-revoke").disabled = state !== "published";
+  $("#localized-publish").disabled = (
+    state !== "review" || localizedReview.publishedState === "published"
+  );
+  $("#localized-revoke").disabled = localizedReview.publishedState !== "published";
 }
 
 async function request(path, options = {}) {
@@ -713,11 +719,21 @@ async function renderJob(job) {
       ? job.localized.revision
       : null;
     localizedReview.publishState = job.localized?.publish_state || null;
+    localizedReview.publishedVersionId = job.localized?.published?.version_id || null;
+    localizedReview.publishedRevision = Number.isInteger(job.localized?.published?.revision)
+      ? job.localized.published.revision
+      : null;
+    localizedReview.publishedState = job.localized?.published?.publish_state || null;
+    localizedReview.reviewArtifactUrl = job.artifacts?.["localized_review.json"] || null;
     syncLocalizedStateButtons();
   } else {
     localizedReview.versionId = null;
     localizedReview.revision = null;
     localizedReview.publishState = null;
+    localizedReview.publishedVersionId = null;
+    localizedReview.publishedRevision = null;
+    localizedReview.publishedState = null;
+    localizedReview.reviewArtifactUrl = null;
   }
   const shelfLoadToken = ++shelfTuning.loadToken;
   clearShelfTuning(Boolean(job.artifacts?.["shelf_outline_evidence.json"]));
@@ -790,10 +806,10 @@ async function renderJob(job) {
     appendText(
       inspection,
       "div",
-      report.allow_auto_publish
-        ? "质量门禁：允许进入发布复核"
-        : "质量门禁：仅限草稿人工复核",
-      report.allow_auto_publish ? "complete" : "warning",
+      report.publish_gate?.passed === true
+        ? "发布门禁：已通过，仍需明确现场验收"
+        : "发布门禁：未通过，仅限草稿/人工复核",
+      report.publish_gate?.passed === true ? "complete" : "warning",
     );
     appendText(
       inspection,
@@ -1044,7 +1060,13 @@ async function applyLocalizedEdit(action) {
 }
 
 async function applyLocalizedState(action) {
-  if (!completedJobId || !localizedReview.versionId || !Number.isInteger(localizedReview.revision)) {
+  const expectedVersionId = action === "revoke"
+    ? localizedReview.publishedVersionId
+    : localizedReview.versionId;
+  const expectedRevision = action === "revoke"
+    ? localizedReview.publishedRevision
+    : localizedReview.revision;
+  if (!completedJobId || !expectedVersionId || !Number.isInteger(expectedRevision)) {
     setStatus("当前结果缺少可操作的版本信息", "failed");
     return;
   }
@@ -1057,14 +1079,38 @@ async function applyLocalizedState(action) {
   }
   try {
     setBusy(true);
+    let fieldAcceptance;
+    if (action === "publish") {
+      if (!$("#localized-field-accepted").checked) {
+        throw new Error("发布前必须明确勾选现场验收确认");
+      }
+      if (!localizedReview.reviewArtifactUrl || !window.crypto?.subtle) {
+        throw new Error("无法读取并绑定当前复核证据，拒绝发布");
+      }
+      const evidenceResponse = await fetch(localizedReview.reviewArtifactUrl, {
+        cache: "no-store",
+      });
+      if (!evidenceResponse.ok) {
+        throw new Error("当前复核证据读取失败，拒绝发布");
+      }
+      const evidence = await evidenceResponse.arrayBuffer();
+      const digest = await window.crypto.subtle.digest("SHA-256", evidence);
+      fieldAcceptance = {
+        accepted: true,
+        evidence_sha256: Array.from(new Uint8Array(digest))
+          .map((value) => value.toString(16).padStart(2, "0"))
+          .join(""),
+      };
+    }
     const result = await request(`/api/jobs/${completedJobId}/localized/state`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         action,
         reason,
-        expected_version_id: localizedReview.versionId,
-        expected_revision: localizedReview.revision,
+        expected_version_id: expectedVersionId,
+        expected_revision: expectedRevision,
+        ...(fieldAcceptance ? { field_acceptance: fieldAcceptance } : {}),
       }),
     });
     stateStatus.textContent = `状态已更新为 ${result.publish_state}（${result.version_id}）`;

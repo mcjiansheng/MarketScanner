@@ -29,6 +29,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #define CAMERAMOBILE_H_
 
 #include <rtabmap/core/Camera.h>
+#include <atomic>
 #include <rtabmap/core/GeodeticCoords.h>
 #include <rtabmap/utilite/UMutex.h>
 #include <rtabmap/utilite/USemaphore.h>
@@ -104,7 +105,7 @@ public:
 	virtual bool getPose(double epochStamp, Transform & pose, cv::Mat & covariance, double maxWaitTime = 0.06); // Return pose of device in rtabmap frame (with origin offset), stamp should be epoch time
 	// original pose of device in rtabmap frame (without origin offset), stamp of the device (may be not epoch)
 	void poseReceived(const Transform & pose, double deviceStamp);
-	double getStampEpochOffset() const {return stampEpochOffset_;}
+	double getStampEpochOffset() const {return stampEpochOffset_.load();}
 
 	const CameraModel & getCameraModel() const {return model_;}
 	const Transform & getDeviceTColorCamera() const {return deviceTColorCamera_;}
@@ -140,7 +141,7 @@ protected:
 
 private:
 	bool firstFrame_;
-	double stampEpochOffset_;
+	std::atomic<double> stampEpochOffset_;
 	ScreenRotation colorCameraToDisplayRotation_;
 	GPS lastKnownGPS_;
 	EnvSensors lastEnvSensors_;

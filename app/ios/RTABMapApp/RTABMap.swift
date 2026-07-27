@@ -111,6 +111,39 @@ class RTABMap {
     deinit {
         destroyNativeApplication(native_rtabmap)
     }
+
+    func latestNodeBinding(frameTimestamp: TimeInterval) -> (
+        nodeId: Int, nodeStamp: TimeInterval, nodeTimebaseFrameTimestamp: TimeInterval,
+        nodeTimebaseOffsetSeconds: TimeInterval, deltaSeconds: TimeInterval
+    )? {
+        var nodeId: Int32 = 0
+        var nodeStamp = 0.0
+        guard let nodeTimebase = nodeTimebase(frameTimestamp: frameTimestamp),
+              getLastNodeNative(native_rtabmap, &nodeId, &nodeStamp),
+              nodeId > 0,
+              nodeStamp.isFinite else {
+            return nil
+        }
+        let delta = abs(nodeTimebase.timestamp - nodeStamp)
+        guard delta <= 1.0 else {
+            return nil
+        }
+        return (
+            Int(nodeId), nodeStamp, nodeTimebase.timestamp,
+            nodeTimebase.offsetSeconds, delta)
+    }
+
+    func nodeTimebase(frameTimestamp: TimeInterval) -> (
+        timestamp: TimeInterval, offsetSeconds: TimeInterval
+    )? {
+        var offset = 0.0
+        guard frameTimestamp.isFinite,
+              getNodeTimeOffsetNative(native_rtabmap, &offset),
+              offset.isFinite else {
+            return nil
+        }
+        return (frameTimestamp + offset, offset)
+    }
     
     func initGlContent() {
         initGlContentNative(native_rtabmap)

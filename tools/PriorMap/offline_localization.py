@@ -13,10 +13,14 @@ accepted map observations and explicit manual anchors through Huber IRLS.
 from __future__ import annotations
 
 import csv
+from collections import Counter
+from datetime import datetime, timezone
 import hashlib
 import json
 import math
+import re
 import shutil
+import sqlite3
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Iterable, Sequence
@@ -103,6 +107,7 @@ class JsonlContract:
     record_id_field: str | None = None
     maximum_record_bytes: int = 1_000_000
     maximum_records: int = 500_000
+    strictly_increasing_timestamps: bool = False
 
 
 TRACE_CONTRACT = JsonlContract(
@@ -111,7 +116,8 @@ TRACE_CONTRACT = JsonlContract(
     frozenset({1}),
     True,
     False,
-    ("timestamp",),
+    ("node_timebase_timestamp", "nodeTimebaseTimestamp"),
+    strictly_increasing_timestamps=True,
 )
 CONSTRAINT_CONTRACT = JsonlContract(
     "localization_constraints",
@@ -119,7 +125,7 @@ CONSTRAINT_CONTRACT = JsonlContract(
     frozenset({1}),
     True,
     True,
-    ("timestamp",),
+    ("node_timebase_timestamp", "nodeTimebaseTimestamp"),
 )
 STATE_EVENT_CONTRACT = JsonlContract(
     "localization_events",
@@ -127,7 +133,8 @@ STATE_EVENT_CONTRACT = JsonlContract(
     frozenset({1}),
     True,
     False,
-    ("timestamp",),
+    ("node_timebase_timestamp", "nodeTimebaseTimestamp"),
+    strictly_increasing_timestamps=True,
 )
 TAG_OBSERVATION_CONTRACT = JsonlContract(
     "tag_observations",
@@ -135,7 +142,7 @@ TAG_OBSERVATION_CONTRACT = JsonlContract(
     frozenset({1}),
     False,
     True,
-    ("frame_timestamp", "frameTimestamp"),
+    ("node_timebase_frame_timestamp", "nodeTimebaseFrameTimestamp"),
     record_id_field="observation_id",
 )
 MANUAL_EVENT_CONTRACT = JsonlContract(
@@ -144,7 +151,11 @@ MANUAL_EVENT_CONTRACT = JsonlContract(
     frozenset({1, 2}),
     False,
     True,
-    ("frame_timestamp", "frameTimestamp", "timestampUnix"),
+    (
+        "node_timebase_frame_timestamp",
+        "nodeTimebaseFrameTimestamp",
+        "timestampUnix",
+    ),
 )
 
 
@@ -180,6 +191,49 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _database_node_inventory(path: Path) -> dict[str, Any]:
+    try:
+        connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        try:
+            rows = connection.execute(
+                "SELECT id, stamp FROM Node ORDER BY id"
+            ).fetchall()
+            duplicate_rows = connection.execute(
+                "SELECT id, COUNT(*) FROM Node GROUP BY id HAVING COUNT(*) > 1"
+            ).fetchall()
+        finally:
+            connection.close()
+    except sqlite3.Error as exc:
+        raise OfflineLocalizationError(
+            f"Cannot audit RTAB-Map Node inventory in {path.name}: {exc}"
+        ) from exc
+    if not rows:
+        raise OfflineLocalizationError(f"RTAB-Map Node inventory is empty: {path.name}")
+    ids: list[int] = []
+    stamps: list[float] = []
+    for node_id, stamp in rows:
+        if isinstance(node_id, bool) or not isinstance(node_id, int):
+            raise OfflineLocalizationError(f"Invalid Node.id in {path.name}")
+        stamp_number = _strict_number(stamp)
+        if stamp_number is None:
+            raise OfflineLocalizationError(f"Invalid Node.stamp in {path.name}")
+        ids.append(node_id)
+        stamps.append(stamp_number)
+    non_monotonic = [
+        ids[index]
+        for index in range(1, len(stamps))
+        if stamps[index] <= stamps[index - 1]
+    ]
+    return {
+        "ids": ids,
+        "id_set": set(ids),
+        "duplicate_ids": [int(row[0]) for row in duplicate_rows],
+        "non_monotonic_stamp_node_ids": non_monotonic,
+        "first_stamp": stamps[0],
+        "last_stamp": stamps[-1],
+    }
+
+
 def _normalize_angle(value: float) -> float:
     while value > math.pi:
         value -= 2 * math.pi
@@ -212,6 +266,115 @@ def _reject_nonfinite_json(value: str) -> None:
 
 def _identity_field(value: dict[str, Any], snake: str, camel: str) -> str:
     return str(value.get(snake) or value.get(camel) or "")
+
+
+def _strict_number(value: Any) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    return number if math.isfinite(number) else None
+
+
+def _strict_pose(value: Any) -> bool:
+    return isinstance(value, dict) and all(
+        _strict_number(value.get(field)) is not None
+        for field in ("x_m", "y_m", "yaw_rad")
+    )
+
+
+def _strict_pose_2d_or_3d(value: Any) -> bool:
+    if not isinstance(value, dict):
+        return False
+    required = (_strict_number(value.get("x_m")), _strict_number(value.get("y_m")))
+    height = value.get("height_m")
+    return all(item is not None for item in required) and (
+        height is None or _strict_number(height) is not None
+    )
+
+
+def _node_timebase_timestamp(
+    value: dict[str, Any], *, frame: bool = False
+) -> float:
+    raw = _field(
+        value,
+        "frame_timestamp" if frame else "timestamp",
+        "frameTimestamp" if frame else "timestamp",
+    )
+    converted = _field(
+        value,
+        "node_timebase_frame_timestamp" if frame else "node_timebase_timestamp",
+        "nodeTimebaseFrameTimestamp" if frame else "nodeTimebaseTimestamp",
+    )
+    offset = _field(
+        value, "node_timebase_offset_seconds", "nodeTimebaseOffsetSeconds"
+    )
+    raw_number = _strict_number(raw)
+    converted_number = _strict_number(converted)
+    offset_number = _strict_number(offset)
+    if (
+        raw_number is None
+        or converted_number is None
+        or offset_number is None
+        or abs(raw_number + offset_number - converted_number) > 1.0e-6
+    ):
+        raise OfflineLocalizationError("node_timebase_contract_invalid")
+    return converted_number
+
+
+def _validate_jsonl_business_record(
+    contract: JsonlContract, value: dict[str, Any], line_label: str
+) -> None:
+    if contract.name in {
+        "localization_trace",
+        "localization_constraints",
+        "localization_events",
+    }:
+        _node_timebase_timestamp(value)
+    elif contract.name in {"tag_observations", "manual_localization_events"} and value.get(
+        "version"
+    ) != 1:
+        _node_timebase_timestamp(value, frame=True)
+    elif contract.name == "tag_observations":
+        _node_timebase_timestamp(value, frame=True)
+    if contract.name == "localization_trace":
+        if not _strict_pose(_field(value, "raw_pose", "rawPose")) or not _strict_pose(
+            _field(value, "estimated_pose", "estimatedPose")
+        ):
+            raise OfflineLocalizationError(f"Invalid trace pose at {line_label}")
+        for field in ("trackingState", "localizationState"):
+            snake = re.sub(r"(?<!^)(?=[A-Z])", "_", field).lower()
+            if not isinstance(_field(value, snake, field), str) or not _field(
+                value, snake, field
+            ):
+                raise OfflineLocalizationError(f"Missing trace {snake} at {line_label}")
+        confidence = _strict_number(value.get("confidence"))
+        if confidence is None or not 0 <= confidence <= 1:
+            raise OfflineLocalizationError(f"Invalid trace confidence at {line_label}")
+    elif contract.name == "localization_constraints":
+        if not isinstance(value.get("accepted"), bool):
+            raise OfflineLocalizationError(f"Invalid constraint accepted flag at {line_label}")
+        if not _strict_pose(_field(value, "predicted_pose", "predictedPose")):
+            raise OfflineLocalizationError(f"Invalid predicted constraint pose at {line_label}")
+        if value.get("accepted") is True and not _strict_pose(
+            _field(value, "estimated_pose", "estimatedPose")
+        ):
+            raise OfflineLocalizationError(f"Accepted constraint has no pose at {line_label}")
+        uniqueness = _strict_number(value.get("uniqueness"))
+        if uniqueness is None or not 0 <= uniqueness <= 1:
+            raise OfflineLocalizationError(f"Invalid constraint uniqueness at {line_label}")
+    elif contract.name == "localization_events":
+        state = value.get("state")
+        confidence = _strict_number(value.get("confidence"))
+        if not isinstance(state, str) or not state:
+            raise OfflineLocalizationError(f"Missing localization state at {line_label}")
+        if confidence is None or not 0 <= confidence <= 1:
+            raise OfflineLocalizationError(f"Invalid localization confidence at {line_label}")
+    elif contract.name == "tag_observations":
+        for field in ("observation_id", "payload", "symbology"):
+            if not isinstance(value.get(field), str) or not value.get(field):
+                raise OfflineLocalizationError(f"Missing tag observation {field} at {line_label}")
+        if not _strict_pose_2d_or_3d(value.get("raw_map_position")):
+            raise OfflineLocalizationError(f"Invalid tag observation raw position at {line_label}")
 
 
 def _read_jsonl(
@@ -249,6 +412,7 @@ def _read_jsonl(
             )
         return values, diagnostics
     seen_ids: set[str] = set()
+    previous_timestamp: float | None = None
     with path.open("rb") as handle:
         for line_no, raw_line in enumerate(handle, start=1):
             diagnostics["total_lines"] += 1
@@ -296,21 +460,22 @@ def _read_jsonl(
                 raise OfflineLocalizationError(
                     f"Version mismatch at {path.name}:{line_no}"
                 )
-            if contract.identity_required and _identity_field(
+            legacy_manual = contract.name == "manual_localization_events" and version == 1
+            if contract.identity_required and not legacy_manual and _identity_field(
                 value, "tracking_session_id", "trackingSessionId"
             ) != session_id:
                 diagnostics["session_mismatches"] += 1
                 raise OfflineLocalizationError(
                     f"Tracking-session mismatch at {path.name}:{line_no}"
                 )
-            if contract.identity_required and _identity_field(
+            if contract.identity_required and not legacy_manual and _identity_field(
                 value, "prior_map_sha256", "priorMapSha256"
             ) != expected_map_hash:
                 diagnostics["map_hash_mismatches"] += 1
                 raise OfflineLocalizationError(
                     f"Prior-map hash mismatch at {path.name}:{line_no}"
                 )
-            if contract.identity_required and _identity_field(
+            if contract.identity_required and not legacy_manual and _identity_field(
                 value, "floor_id", "floorId"
             ) != expected_floor_id:
                 diagnostics["floor_mismatches"] += 1
@@ -334,6 +499,20 @@ def _read_jsonl(
                 raise OfflineLocalizationError(
                     f"Invalid timestamp at {path.name}:{line_no}"
                 )
+            timestamp_number = float(timestamp)
+            if (
+                contract.strictly_increasing_timestamps
+                and previous_timestamp is not None
+                and timestamp_number <= previous_timestamp
+            ):
+                diagnostics["timestamp_errors"] += 1
+                raise OfflineLocalizationError(
+                    f"Duplicate or non-monotonic timestamp at {path.name}:{line_no}"
+                )
+            previous_timestamp = timestamp_number
+            _validate_jsonl_business_record(
+                contract, value, f"{path.name}:{line_no}"
+            )
             if contract.record_id_field is not None:
                 record_id = str(value.get(contract.record_id_field) or "")
                 if not record_id or record_id in seen_ids:
@@ -361,13 +540,15 @@ def _read_localized_price_tags(
     path: Path,
     *,
     session_id: str,
+    expected_map_id: str,
     expected_map_hash: str,
     expected_floor_id: str,
+    expected_count: int,
     maximum_bytes: int = 128 * 1024 * 1024,
     maximum_records: int = 500_000,
 ) -> list[dict[str, Any]]:
     if not path.is_file():
-        return []
+        raise OfflineLocalizationError("Required localized_price_tags.json is missing.")
     if path.stat().st_size > maximum_bytes:
         raise OfflineLocalizationError("localized_price_tags.json exceeds its safety limit.")
     try:
@@ -383,6 +564,18 @@ def _read_localized_price_tags(
         raise OfflineLocalizationError(
             "localized_price_tags.json must be a bounded array."
         )
+    if len(payload) != expected_count:
+        raise OfflineLocalizationError(
+            "localized_price_tags.json count does not match finalized metadata."
+        )
+    allowed_fields = {
+        "format", "version", "tag_id", "observation_id", "payload", "symbology",
+        "floor_id", "timestamp", "tracking_session_id", "prior_map_id",
+        "prior_map_sha256", "shelf_code", "row_flag", "cross_code", "shelf_side",
+        "distance_from_shelf_start_cm", "height_cm", "raw_map_position",
+        "snapped_map_position", "localization_confidence", "measurement_confidence",
+        "association_confidence", "measurement_method", "needs_review", "user_confirmed",
+    }
     tags: list[dict[str, Any]] = []
     tag_ids: set[str] = set()
     observation_ids: set[str] = set()
@@ -390,6 +583,12 @@ def _read_localized_price_tags(
         if not isinstance(item, dict):
             raise OfflineLocalizationError(
                 f"localized_price_tags.json item {index} is not an object."
+            )
+        unexpected_fields = sorted(set(item) - allowed_fields)
+        if unexpected_fields:
+            raise OfflineLocalizationError(
+                "localized_price_tags.json item "
+                f"{index} contains forbidden derived fields: {unexpected_fields}."
             )
         version = item.get("version")
         if (
@@ -411,12 +610,34 @@ def _read_localized_price_tags(
             raise OfflineLocalizationError(
                 f"localized_price_tags.json item {index} has mismatched identity."
             )
-        tag_id = str(item.get("tag_id") or item.get("tagId") or "")
-        observation_id = str(
-            item.get("observation_id") or item.get("observationId") or ""
-        )
+        prior_map_id = item.get("prior_map_id")
+        if prior_map_id != expected_map_id:
+            raise OfflineLocalizationError(
+                f"localized_price_tags.json item {index} has an invalid prior_map_id."
+            )
+        for field in ("shelf_code", "row_flag", "cross_code", "shelf_side"):
+            value = item.get(field)
+            if value is not None and (not isinstance(value, str) or len(value) > 128):
+                raise OfflineLocalizationError(
+                    f"localized_price_tags.json item {index} has an invalid {field}."
+                )
+        for field, lower, upper in (
+            ("distance_from_shelf_start_cm", 0.0, 100_000.0),
+            ("height_cm", 0.0, 500.0),
+        ):
+            value = item.get(field)
+            if value is not None and (
+                _strict_number(value) is None or not lower <= float(value) <= upper
+            ):
+                raise OfflineLocalizationError(
+                    f"localized_price_tags.json item {index} has an invalid {field}."
+                )
+        tag_id = item.get("tag_id")
+        observation_id = item.get("observation_id")
         if (
-            not tag_id
+            not isinstance(tag_id, str)
+            or not tag_id
+            or not isinstance(observation_id, str)
             or not observation_id
             or tag_id in tag_ids
             or observation_id in observation_ids
@@ -424,23 +645,29 @@ def _read_localized_price_tags(
             raise OfflineLocalizationError(
                 f"localized_price_tags.json item {index} has missing/duplicate IDs."
             )
-        try:
-            timestamp = float(item.get("timestamp"))
-            confidences = [
-                float(item.get(field))
-                for field in (
-                    "localization_confidence",
-                    "measurement_confidence",
-                    "association_confidence",
+        for field in ("payload", "symbology", "measurement_method"):
+            if not isinstance(item.get(field), str) or not item.get(field):
+                raise OfflineLocalizationError(
+                    f"localized_price_tags.json item {index} has invalid {field}."
                 )
-            ]
-        except (TypeError, ValueError) as exc:
+        if not isinstance(item.get("needs_review"), bool) or not isinstance(
+            item.get("user_confirmed"), bool
+        ):
             raise OfflineLocalizationError(
-                f"localized_price_tags.json item {index} has invalid numeric fields."
-            ) from exc
+                f"localized_price_tags.json item {index} has invalid boolean fields."
+            )
+        timestamp = _strict_number(item.get("timestamp"))
+        confidences = [
+            _strict_number(item.get(field))
+            for field in (
+                "localization_confidence",
+                "measurement_confidence",
+                "association_confidence",
+            )
+        ]
         if (
-            not math.isfinite(timestamp)
-            or any(not math.isfinite(value) or not 0 <= value <= 1 for value in confidences)
+            timestamp is None
+            or any(value is None or not 0 <= value <= 1 for value in confidences)
         ):
             raise OfflineLocalizationError(
                 f"localized_price_tags.json item {index} has out-of-range numeric fields."
@@ -453,21 +680,13 @@ def _read_localized_price_tags(
                 raise OfflineLocalizationError(
                     f"localized_price_tags.json item {index} has invalid {position_field}."
                 )
-            try:
-                coordinates = [float(position["x_m"]), float(position["y_m"])]
-                if position.get("height_m") is not None:
-                    coordinates.append(float(position["height_m"]))
-            except (KeyError, TypeError, ValueError) as exc:
+            if not _strict_pose_2d_or_3d(position):
                 raise OfflineLocalizationError(
                     f"localized_price_tags.json item {index} has invalid {position_field}."
-                ) from exc
-            if any(not math.isfinite(value) for value in coordinates):
-                raise OfflineLocalizationError(
-                    f"localized_price_tags.json item {index} has non-finite {position_field}."
                 )
         tag_ids.add(tag_id)
         observation_ids.add(observation_id)
-        tags.append(dict(item))
+        tags.append({key: item[key] for key in allowed_fields if key in item})
     return tags
 
 
@@ -507,15 +726,10 @@ def bind_tag_observation_to_pose(
     """
     if not isinstance(observation, dict):
         raise OfflineLocalizationError("tag_observation_missing")
-    timestamp_value = observation.get("frame_timestamp")
-    if isinstance(timestamp_value, bool):
-        raise OfflineLocalizationError("tag_observation_frame_timestamp_invalid")
     try:
-        observation_timestamp = float(timestamp_value)
-    except (TypeError, ValueError):
-        raise OfflineLocalizationError("tag_observation_frame_timestamp_missing")
-    if not math.isfinite(observation_timestamp):
-        raise OfflineLocalizationError("tag_observation_frame_timestamp_invalid")
+        observation_timestamp = _node_timebase_timestamp(observation, frame=True)
+    except OfflineLocalizationError as exc:
+        raise OfflineLocalizationError("tag_observation_node_timebase_invalid") from exc
 
     identity_checks = (
         (
@@ -590,6 +804,29 @@ def bind_tag_observation_to_pose(
                 raise OfflineLocalizationError(
                     f"tag_and_observation_{name}_mismatch"
                 )
+        for field in ("payload", "symbology"):
+            if tag.get(field) != observation.get(field):
+                raise OfflineLocalizationError(
+                    f"tag_and_observation_{field}_mismatch"
+                )
+        tag_position = tag.get("raw_map_position")
+        observation_position = observation.get("raw_map_position")
+        if not _strict_pose_2d_or_3d(tag_position) or not _strict_pose_2d_or_3d(
+            observation_position
+        ):
+            raise OfflineLocalizationError("tag_and_observation_raw_position_missing")
+        compared_fields = ["x_m", "y_m"]
+        if tag_position.get("height_m") is not None or observation_position.get(
+            "height_m"
+        ) is not None:
+            compared_fields.append("height_m")
+        if any(
+            tag_position.get(field) is None
+            or observation_position.get(field) is None
+            or abs(float(tag_position[field]) - float(observation_position[field])) > 0.01
+            for field in compared_fields
+        ):
+            raise OfflineLocalizationError("tag_and_observation_raw_position_mismatch")
 
     explicit_node_id = observation.get("nearest_node_id")
     if explicit_node_id is None:
@@ -665,30 +902,43 @@ def bind_manual_localization_event_to_pose(
     for name, expected, actual in identities:
         if expected and actual != expected:
             raise OfflineLocalizationError(f"manual_event_{name}_mismatch")
-    frame_value = event.get("frame_timestamp")
-    if isinstance(frame_value, bool):
-        raise OfflineLocalizationError("manual_event_frame_timestamp_invalid")
+    wall_unix = _strict_number(event.get("wall_clock_timestamp_unix"))
+    wall_iso = event.get("wall_clock_timestamp")
+    if wall_unix is None or not isinstance(wall_iso, str) or not wall_iso.strip():
+        raise OfflineLocalizationError("manual_event_wall_clock_missing")
     try:
-        frame_timestamp = float(frame_value)
-        alignment_version = int(event.get("alignment_version"))
-    except (TypeError, ValueError):
+        parsed_wall = datetime.fromisoformat(wall_iso.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise OfflineLocalizationError("manual_event_wall_clock_invalid") from exc
+    if (
+        parsed_wall.tzinfo is None
+        or abs(parsed_wall.astimezone(timezone.utc).timestamp() - wall_unix) > 0.01
+    ):
+        raise OfflineLocalizationError("manual_event_wall_clock_mismatch")
+    try:
+        frame_timestamp = _node_timebase_timestamp(event, frame=True)
+    except OfflineLocalizationError as exc:
+        raise OfflineLocalizationError("manual_event_node_timebase_invalid") from exc
+    alignment_value = event.get("alignment_version")
+    if isinstance(alignment_value, bool) or not isinstance(alignment_value, int):
         raise OfflineLocalizationError("manual_event_time_or_alignment_invalid")
+    alignment_version = alignment_value
     if not math.isfinite(frame_timestamp) or alignment_version <= 0:
         raise OfflineLocalizationError("manual_event_time_or_alignment_invalid")
+    if not _strict_pose(event.get("confirmed_map_pose")) or not _strict_pose(
+        event.get("arkit_pose")
+    ):
+        raise OfflineLocalizationError("manual_event_pose_invalid")
 
     node_id_value = event.get("nearest_node_id")
     binding_source = "frame_timestamp"
     if node_id_value is not None:
-        if isinstance(node_id_value, bool):
+        if isinstance(node_id_value, bool) or not isinstance(node_id_value, int):
             raise OfflineLocalizationError("manual_event_node_id_invalid")
-        try:
-            node_id_number = float(node_id_value)
-        except (TypeError, ValueError):
-            raise OfflineLocalizationError("manual_event_node_id_invalid")
-        if not math.isfinite(node_id_number) or not node_id_number.is_integer():
-            raise OfflineLocalizationError("manual_event_node_id_invalid")
+        if event.get("node_binding_status") != "matched":
+            raise OfflineLocalizationError("manual_event_node_binding_status_invalid")
         matches = [
-            index for index, pose in enumerate(poses) if pose.node_id == int(node_id_number)
+            index for index, pose in enumerate(poses) if pose.node_id == node_id_value
         ]
         if len(matches) != 1:
             raise OfflineLocalizationError(
@@ -698,12 +948,9 @@ def bind_manual_localization_event_to_pose(
             )
         index = matches[0]
         binding_source = "nearest_node_id"
-        event_node_stamp_value = event.get("nearest_node_stamp")
-        event_delta_value = event.get("node_time_delta_seconds")
-        try:
-            event_node_stamp = float(event_node_stamp_value)
-            event_delta = float(event_delta_value)
-        except (TypeError, ValueError):
+        event_node_stamp = _strict_number(event.get("nearest_node_stamp"))
+        event_delta = _strict_number(event.get("node_time_delta_seconds"))
+        if event_node_stamp is None or event_delta is None:
             raise OfflineLocalizationError("manual_event_node_evidence_missing")
         actual_stamp = poses[index].timestamp
         if actual_stamp is None or not all(
@@ -719,6 +966,10 @@ def bind_manual_localization_event_to_pose(
     else:
         if event.get("node_binding_status") != "frame_timestamp_only":
             raise OfflineLocalizationError("manual_event_node_binding_status_invalid")
+        if event.get("nearest_node_stamp") is not None or event.get(
+            "node_time_delta_seconds"
+        ) is not None:
+            raise OfflineLocalizationError("manual_event_node_evidence_contradictory")
         finite_candidates = [
             (abs(float(pose.timestamp) - frame_timestamp), index)
             for index, pose in enumerate(poses)
@@ -859,6 +1110,181 @@ def build_road_soft_constraints(
             )
         )
     return constraints
+
+
+def infer_aisle_switch_sequence(
+    trajectory: Sequence[Pose],
+    road_graph: dict[str, Any],
+    floor_id: str,
+    stride: int = 4,
+    weak_lost_intervals: Sequence[dict[str, Any]] = (),
+    manual_events: Sequence[dict[str, Any]] = (),
+) -> list[dict[str, Any]]:
+    """Infer an auditable, ambiguity-gated corridor sequence from final poses."""
+
+    corridors: list[
+        tuple[str, float, tuple[float, float], tuple[float, float]]
+    ] = []
+    for cross in road_graph.get("crosses", []):
+        if not isinstance(cross, dict) or str(cross.get("floor_id")) != floor_id:
+            continue
+        corridor_id = str(cross.get("id") or "")
+        points = cross.get("points_m")
+        if not corridor_id or not isinstance(points, list):
+            continue
+        width = max(0.2, float(cross.get("width_m", 1.0) or 1.0))
+        for first, second in zip(points, points[1:]):
+            if (
+                isinstance(first, list)
+                and isinstance(second, list)
+                and len(first) >= 2
+                and len(second) >= 2
+            ):
+                corridors.append(
+                    (
+                        corridor_id,
+                        width,
+                        (float(first[0]), float(first[1])),
+                        (float(second[0]), float(second[1])),
+                    )
+                )
+    samples: list[tuple[Pose, str | None, float | None, float | None]] = []
+    for pose in trajectory[:: max(1, stride)]:
+        by_corridor: dict[str, tuple[float, float]] = {}
+        for corridor_id, width, start, end in corridors:
+            projected = _project_to_segment(pose.x, pose.y, start, end)
+            if projected is None or projected[2] > width / 2 + 0.75:
+                continue
+            previous = by_corridor.get(corridor_id)
+            if previous is None or projected[2] < previous[0]:
+                by_corridor[corridor_id] = (projected[2], width)
+        ordered = sorted(
+            (distance, corridor_id, width)
+            for corridor_id, (distance, width) in by_corridor.items()
+        )
+        if not ordered:
+            samples.append((pose, None, None, None))
+            continue
+        best_distance, best_id, _width = ordered[0]
+        margin = (
+            ordered[1][0] - best_distance if len(ordered) > 1 else math.inf
+        )
+        if len(ordered) > 1 and margin < 0.35:
+            samples.append((pose, None, best_distance, margin))
+        else:
+            samples.append((pose, best_id, best_distance, margin))
+    intervals: list[dict[str, Any]] = []
+    active: dict[str, Any] | None = None
+    for pose, corridor_id, distance, margin in samples:
+        if corridor_id is None:
+            if active is not None:
+                intervals.append(active)
+                active = None
+            continue
+        if active is None or active["corridor_id"] != corridor_id:
+            if active is not None:
+                intervals.append(active)
+            active = {
+                "corridor_id": corridor_id,
+                "start_node_id": pose.node_id,
+                "end_node_id": pose.node_id,
+                "start_timestamp": pose.timestamp,
+                "end_timestamp": pose.timestamp,
+                "sample_count": 1,
+                "maximum_distance_m": round(float(distance), 6),
+                "minimum_uniqueness_margin_m": (
+                    None if margin == math.inf else round(float(margin), 6)
+                ),
+                "source": "final_trajectory_geometry",
+            }
+        else:
+            active["end_node_id"] = pose.node_id
+            active["end_timestamp"] = pose.timestamp
+            active["sample_count"] += 1
+            active["maximum_distance_m"] = round(
+                max(active["maximum_distance_m"], float(distance)), 6
+            )
+            if margin != math.inf:
+                current_margin = active["minimum_uniqueness_margin_m"]
+                active["minimum_uniqueness_margin_m"] = round(
+                    float(margin)
+                    if current_margin is None
+                    else min(float(current_margin), float(margin)),
+                    6,
+                )
+    if active is not None:
+        intervals.append(active)
+    pose_by_node = {pose.node_id: pose for pose in trajectory}
+    segments_by_corridor: dict[
+        str, list[tuple[tuple[float, float], tuple[float, float]]]
+    ] = {}
+    for corridor_id, _width, start, end in corridors:
+        segments_by_corridor.setdefault(corridor_id, []).append((start, end))
+    previous: dict[str, Any] | None = None
+    for interval in intervals:
+        start_pose = pose_by_node.get(interval["start_node_id"])
+        end_pose = pose_by_node.get(interval["end_node_id"])
+        direction = "stationary"
+        if start_pose is not None and end_pose is not None:
+            movement = (end_pose.x - start_pose.x, end_pose.y - start_pose.y)
+            movement_length = math.hypot(*movement)
+            candidates = segments_by_corridor.get(interval["corridor_id"], [])
+            if movement_length > 1.0e-6 and candidates:
+                midpoint = (
+                    (start_pose.x + end_pose.x) / 2,
+                    (start_pose.y + end_pose.y) / 2,
+                )
+                segment = min(
+                    candidates,
+                    key=lambda item: (
+                        _project_to_segment(midpoint[0], midpoint[1], item[0], item[1])
+                        or (0.0, 0.0, math.inf)
+                    )[2],
+                )
+                tangent = (
+                    segment[1][0] - segment[0][0],
+                    segment[1][1] - segment[0][1],
+                )
+                direction = (
+                    "forward"
+                    if movement[0] * tangent[0] + movement[1] * tangent[1] >= 0
+                    else "reverse"
+                )
+        interval["direction"] = direction
+        interval["weak_lost_overlap"] = any(
+            float(item.get("end_timestamp", -math.inf))
+            >= float(interval["start_timestamp"])
+            and float(item.get("start_timestamp", math.inf))
+            <= float(interval["end_timestamp"])
+            for item in weak_lost_intervals
+        )
+        interval["manual_assignment"] = any(
+            event.get("type") == "assign_interval_to_aisle"
+            and isinstance(event.get("new_value"), dict)
+            and str(
+                event["new_value"].get("aisle_id")
+                or event["new_value"].get("road_id")
+                or event.get("object_id")
+            )
+            == interval["corridor_id"]
+            and float(event["new_value"].get("end_timestamp", math.inf))
+            >= float(interval["start_timestamp"])
+            and float(event["new_value"].get("start_timestamp", -math.inf))
+            <= float(interval["end_timestamp"])
+            for event in manual_events
+        )
+        interval["transition_from_corridor_id"] = (
+            previous["corridor_id"] if previous is not None else None
+        )
+        interval["possible_silent_switch"] = bool(
+            previous is not None
+            and previous["corridor_id"] != interval["corridor_id"]
+            and not previous["weak_lost_overlap"]
+            and not interval["weak_lost_overlap"]
+            and not interval["manual_assignment"]
+        )
+        previous = interval
+    return intervals
 
 
 def build_manual_aisle_constraints(
@@ -1221,8 +1647,16 @@ def bounded_correction_metrics(
             abs(_normalize_angle(opt_relative[2] - base_relative[2]))
         )
     return {
-        "objective_before": round(objective(baseline), 9),
-        "objective_after": round(objective(optimized), 9),
+        "absolute_constraint_residual_diagnostic_before": round(
+            objective(baseline), 9
+        ),
+        "absolute_constraint_residual_diagnostic_after": round(
+            objective(optimized), 9
+        ),
+        "residual_diagnostic_scope": (
+            "absolute_constraints_only; excludes the solver smoothing term and "
+            "is not a convergence objective"
+        ),
         "convergence_status": "fixed_iterations_no_convergence_proof",
         "maximum_local_relative_translation_change_m": round(
             max(relative_translation_errors, default=0.0), 9
@@ -1247,8 +1681,8 @@ def _state_durations(
     normalized: list[tuple[float, str, dict[str, Any]]] = []
     for event in events:
         try:
-            timestamp = float(event.get("timestamp"))
-        except (TypeError, ValueError):
+            timestamp = _node_timebase_timestamp(event)
+        except OfflineLocalizationError:
             continue
         if not math.isfinite(timestamp):
             continue
@@ -1721,7 +2155,12 @@ def _associate_tag(
                 tag["suggested_association"].get("shelf_side"),
                 tag["suggested_association"].get("distance_from_shelf_start_cm"),
             )
-            if current != suggested:
+            same_business_edge = current[:2] == suggested[:2]
+            try:
+                offset_difference_cm = abs(float(current[2]) - float(suggested[2]))
+            except (TypeError, ValueError):
+                offset_difference_cm = math.inf
+            if not same_business_edge or offset_difference_cm > 1.0:
                 _mark_tag_for_review(tag, "human_association_conflicts_with_offline_evidence")
         else:
             _mark_tag_for_review(tag, rejection_reason)
@@ -1743,6 +2182,21 @@ def _associate_tag(
         "near_endpoint": near_endpoint,
         "human_authoritative": human_authoritative,
         "candidates_truncated": len(candidates) > 100,
+        "candidate_set_sha256": hashlib.sha256(
+            json.dumps(
+                [
+                    {
+                        "element_id": item[1].get("id"),
+                        "edge_id": item[2],
+                        "distance_m": round(item[0], 9),
+                    }
+                    for item in candidates
+                ],
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8")
+        ).hexdigest(),
         "candidates": [
             {
                 "element_id": item[1].get("id"),
@@ -2208,11 +2662,23 @@ def _render_localized_version(
         raise OfflineLocalizationError(
             "Localized metadata requires tracking session, prior-map hash and floor identities."
         )
+    localized_tag_count = metadata.get("localizedPriceTagCount")
+    if (
+        isinstance(localized_tag_count, bool)
+        or not isinstance(localized_tag_count, int)
+        or localized_tag_count < 0
+        or metadata.get("localizedPriceTags") != "localized_price_tags.json"
+    ):
+        raise OfflineLocalizationError(
+            "Finalized localized metadata requires an exact tag file and count contract."
+        )
     raw_tags = _read_localized_price_tags(
         segment / "localized_price_tags.json",
         session_id=sidecar_session_id,
+        expected_map_id=str(manifest.get("prior_map_id") or ""),
         expected_map_hash=sidecar_map_hash,
         expected_floor_id=sidecar_floor_id,
+        expected_count=localized_tag_count,
     )
     trace, trace_diag = _read_jsonl(
         segment / "localization_trace.jsonl",
@@ -2294,9 +2760,7 @@ def _render_localized_version(
         try:
             node_index = _nearest_pose_index(
                 baseline,
-                float(record["timestamp"])
-                if record.get("timestamp") is not None
-                else None,
+                _node_timebase_timestamp(record),
             )
         except (OfflineLocalizationError, TypeError, ValueError):
             normalized["offline_rejected_reason"] = "constraint_timestamp_invalid"
@@ -2314,9 +2778,24 @@ def _render_localized_version(
             )
         )
     manual_event_audit: list[dict[str, Any]] = []
+    last_alignment_version = 0
     for sequence, record in enumerate(manual_events, start=1):
         identifier = f"manual-{sequence:06d}"
         try:
+            if record.get("version") == 2:
+                alignment_version = record.get("alignment_version")
+                if (
+                    isinstance(alignment_version, bool)
+                    or not isinstance(alignment_version, int)
+                    or alignment_version <= last_alignment_version
+                ):
+                    raise OfflineLocalizationError(
+                        "manual_event_alignment_version_stale_or_duplicate"
+                    )
+                # Advance the observed watermark before node binding.  A newer
+                # confirmation that later fails evidence checks still proves
+                # every following lower version is stale.
+                last_alignment_version = alignment_version
             binding = bind_manual_localization_event_to_pose(
                 baseline,
                 record,
@@ -2484,7 +2963,9 @@ def _render_localized_version(
             if isinstance(observation, dict)
             else None
         )
-        original = tag.get("raw_map_position") or raw_observation_position
+        # The observation is the measurement authority.  The duplicate tag
+        # position was already checked above and must never override it.
+        original = raw_observation_position
         if not isinstance(original, dict):
             tag.pop("final_map_position", None)
             _mark_tag_for_review(tag, "tag_raw_map_position_missing")
@@ -2629,8 +3110,8 @@ def _render_localized_version(
     )
     needs_review_count = sum(tag.get("needs_review") is True for tag in final_tags)
     # Publish gate: three explicit levels — draft, review, published.
-    # `automatic_publish_allowed` only ever yields DRAFT; REVIEW requires
-    # explicit user submission; PUBLISHED requires an explicit approval event.
+    # REVIEW requires explicit user submission; PUBLISHED additionally requires
+    # the full solver gate and evidence-bound field acceptance.
     # Any critical JSONL damage or stale node binding prevents even draft.
     allow_draft = (
         bool(optimized)
@@ -2665,20 +3146,42 @@ def _render_localized_version(
         }
         for index, item in enumerate(weak_lost_intervals, start=1)
     )
-    # Node coverage: source DB node count vs. optimized vs. exported.
-    try:
-        source_node_count = int(
-            metadata.get("nodeCount") or metadata.get("node_count") or len(baseline)
-        )
-    except (TypeError, ValueError):
-        source_node_count = len(baseline)
-    optimized_node_ids = {pose.node_id for pose in optimized}
-    baseline_node_ids = {pose.node_id for pose in baseline}
-    node_coverage = (
-        len(optimized_node_ids & baseline_node_ids) / max(1, source_node_count)
-        if source_node_count > 0
-        else 0.0
-    )
+    # Coverage is audited from both immutable SQLite inputs plus the exported
+    # trajectory.  Metadata is only a cross-check and never the denominator.
+    source_inventory = _database_node_inventory(source_database)
+    optimized_inventory = _database_node_inventory(optimized_database)
+    exported_node_ids = [pose.node_id for pose in optimized]
+    exported_node_counts = Counter(exported_node_ids)
+    exported_node_set = set(exported_node_ids)
+    source_node_ids = source_inventory["id_set"]
+    optimized_node_ids = optimized_inventory["id_set"]
+    common_node_ids = source_node_ids & optimized_node_ids & exported_node_set
+    source_node_count = len(source_node_ids)
+    node_coverage = len(common_node_ids) / source_node_count
+    node_inventory_audit = {
+        "source_count": source_node_count,
+        "optimized_count": len(optimized_node_ids),
+        "exported_count": len(exported_node_ids),
+        "source_missing_from_optimized": sorted(source_node_ids - optimized_node_ids),
+        "source_missing_from_export": sorted(source_node_ids - exported_node_set),
+        "optimized_not_in_source": sorted(optimized_node_ids - source_node_ids),
+        "exported_not_in_optimized": sorted(exported_node_set - optimized_node_ids),
+        "source_duplicate_ids": source_inventory["duplicate_ids"],
+        "optimized_duplicate_ids": optimized_inventory["duplicate_ids"],
+        "exported_duplicate_ids": sorted(
+            node_id for node_id, count in exported_node_counts.items() if count > 1
+        ),
+        "source_non_monotonic_stamp_node_ids": source_inventory[
+            "non_monotonic_stamp_node_ids"
+        ],
+        "optimized_non_monotonic_stamp_node_ids": optimized_inventory[
+            "non_monotonic_stamp_node_ids"
+        ],
+        "source_first_stamp": source_inventory["first_stamp"],
+        "source_last_stamp": source_inventory["last_stamp"],
+        "optimized_first_stamp": optimized_inventory["first_stamp"],
+        "optimized_last_stamp": optimized_inventory["last_stamp"],
+    }
     report = {
         "format": "MarketScannerLocalizationReport",
         "version": FORMAT_VERSION,
@@ -2690,6 +3193,7 @@ def _render_localized_version(
         "node_count": len(optimized),
         "node_coverage_ratio": round(node_coverage, 6),
         "source_node_count": source_node_count,
+        "node_inventory_audit": node_inventory_audit,
         "online_trajectory_length_m": _trajectory_length(
             [
                 Pose(index, None, pose[0], pose[1], pose[2])
@@ -2733,9 +3237,13 @@ def _render_localized_version(
         "rejected_constraint_count": len(rejected),
         "high_residual_intervals": rejected,
         "jsonl_diagnostics": jsonl_diagnostics,
-        "aisle_switch_sequence": [
-            # Use final trajectory-based road inference, not online raw candidates.
-        ],
+        "aisle_switch_sequence": infer_aisle_switch_sequence(
+            optimized,
+            road_graph_payload,
+            str(metadata.get("floorId") or metadata.get("floor_id") or ""),
+            weak_lost_intervals=weak_lost_intervals,
+            manual_events=active_edit_events,
+        ),
         "manual_anchor_count": sum(item.kind == "manual_anchor" for item in constraints),
         "manual_localization_event_audit": manual_event_audit,
         "tag_total": len(final_tags),
@@ -2747,7 +3255,6 @@ def _render_localized_version(
         ),
         "publish_state": "draft" if allow_draft else "invalid",
         "allow_draft": allow_draft,
-        "allow_auto_publish": False,
         "warnings": [],
         "rejection_reasons": sorted({item["reason"] for item in rejected}),
         "solver": {
@@ -2778,12 +3285,35 @@ def _render_localized_version(
     review_blockers: list[dict[str, Any]] = []
     review_checks = (
         (node_coverage >= 0.98, "node_coverage_below_0_98", node_coverage),
+        (
+            not any(
+                node_inventory_audit[key]
+                for key in (
+                    "source_missing_from_optimized",
+                    "source_missing_from_export",
+                    "optimized_not_in_source",
+                    "exported_not_in_optimized",
+                    "source_duplicate_ids",
+                    "optimized_duplicate_ids",
+                    "exported_duplicate_ids",
+                    "source_non_monotonic_stamp_node_ids",
+                    "optimized_non_monotonic_stamp_node_ids",
+                )
+            ),
+            "node_inventory_integrity_failed",
+            node_inventory_audit,
+        ),
         (max_correction <= 2.0, "maximum_correction_above_2m", max_correction),
         (correction_p95 <= 1.0, "p95_correction_above_1m", correction_p95),
         (
             solver_metrics["maximum_local_relative_translation_change_m"] <= 0.5,
             "local_deformation_above_0_5m",
             solver_metrics["maximum_local_relative_translation_change_m"],
+        ),
+        (
+            solver_metrics["maximum_local_relative_yaw_change_deg"] <= 15.0,
+            "local_yaw_deformation_above_15deg",
+            solver_metrics["maximum_local_relative_yaw_change_deg"],
         ),
         (
             report["weak_lost_duration_seconds"] <= 30.0,
@@ -2797,6 +3327,11 @@ def _render_localized_version(
         ),
         (needs_review_count == 0, "pending_tag_review", needs_review_count),
         (len(rejected) == 0, "rejected_constraints_present", len(rejected)),
+        (
+            sum(item.get("status") == "rejected" for item in manual_event_audit) == 0,
+            "rejected_manual_localization_events_present",
+            sum(item.get("status") == "rejected" for item in manual_event_audit),
+        ),
     )
     for passed, code, value in review_checks:
         if not passed:
@@ -2837,13 +3372,13 @@ def _render_localized_version(
         {
             "format": "MarketScannerLocalizedSourceManifest",
             "version": 1,
-            "source_session": str(session.resolve()),
-            "source_database": str(source_database.resolve()),
+            "source_session_id": session.name,
+            "source_database_name": source_database.name,
             "source_database_sha256_before": source_hash_before,
             "source_database_sha256_after": source_hash_after,
             "source_database_immutable": True,
-            "optimized_database": str(optimized_database.resolve()),
-            "prior_map": str(prior_map.resolve()),
+            "optimized_database_name": optimized_database.name,
+            "prior_map_id": manifest.get("prior_map_id"),
             "prior_map_sha256": package_hash,
         },
     )
@@ -3053,6 +3588,7 @@ def process_localized_session(
     output: Path,
     manual_edits: dict[str, Any] | None = None,
     progress: Callable[[int, str, str], None] | None = None,
+    expected_parent_version: str | None = None,
 ) -> dict[str, Any]:
     """Render and atomically commit an immutable localized result version.
 
@@ -3064,9 +3600,17 @@ def process_localized_session(
     """
 
     store = LocalizedVersionStore(output)
-    previous = store.current()
     staging = store.begin()
     try:
+        previous = store.current()
+        if expected_parent_version is not None and (
+            previous is None or previous.version_id != expected_parent_version
+        ):
+            actual = previous.version_id if previous else "missing"
+            raise OfflineLocalizationError(
+                "Localized current version changed during replay: "
+                f"expected {expected_parent_version}, found {actual}."
+            )
         report = _render_localized_version(
             prior_map=prior_map,
             session=session,
@@ -3080,6 +3624,14 @@ def process_localized_session(
         manifest = store.validate_staging(
             staging,
             parent_version=previous.version_id if previous else None,
+        )
+        store.write_local_state(
+            {
+                "source_session": str(session.resolve()),
+                "source_database": str(source_database.resolve()),
+                "optimized_database": str(optimized_database.resolve()),
+                "prior_map": str(prior_map.resolve()),
+            }
         )
         update_current = bool(report.get("allow_draft")) and (
             report.get("publish_state") == "draft"

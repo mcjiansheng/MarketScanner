@@ -182,6 +182,8 @@ struct ManualLocalizationEvent: Encodable {
     let wallClockTimestamp: String
     let wallClockTimestampUnix: TimeInterval
     let frameTimestamp: TimeInterval
+    let nodeTimebaseFrameTimestamp: TimeInterval
+    let nodeTimebaseOffsetSeconds: TimeInterval
     let nearestNodeId: Int?
     let nearestNodeStamp: TimeInterval?
     let nodeTimeDeltaSeconds: TimeInterval?
@@ -202,6 +204,8 @@ struct ManualLocalizationEvent: Encodable {
         case wallClockTimestamp = "wall_clock_timestamp"
         case wallClockTimestampUnix = "wall_clock_timestamp_unix"
         case frameTimestamp = "frame_timestamp"
+        case nodeTimebaseFrameTimestamp = "node_timebase_frame_timestamp"
+        case nodeTimebaseOffsetSeconds = "node_timebase_offset_seconds"
         case nearestNodeId = "nearest_node_id"
         case nearestNodeStamp = "nearest_node_stamp"
         case nodeTimeDeltaSeconds = "node_time_delta_seconds"
@@ -224,6 +228,10 @@ struct ManualLocalizationEvent: Encodable {
         try container.encode(wallClockTimestamp, forKey: .wallClockTimestamp)
         try container.encode(wallClockTimestampUnix, forKey: .wallClockTimestampUnix)
         try container.encode(frameTimestamp, forKey: .frameTimestamp)
+        try container.encode(
+            nodeTimebaseFrameTimestamp, forKey: .nodeTimebaseFrameTimestamp)
+        try container.encode(
+            nodeTimebaseOffsetSeconds, forKey: .nodeTimebaseOffsetSeconds)
         if let nearestNodeId {
             try container.encode(nearestNodeId, forKey: .nearestNodeId)
         } else {
@@ -256,6 +264,8 @@ struct PriorMapConstraintRecord: Codable {
     let format: String
     let version: Int
     let timestamp: TimeInterval
+    let nodeTimebaseTimestamp: TimeInterval
+    let nodeTimebaseOffsetSeconds: TimeInterval
     let trackingSessionId: String
     let priorMapId: String?
     let priorMapSha256: String?
@@ -276,6 +286,8 @@ struct PriorMapStateEvent: Codable {
     let format: String
     let version: Int
     let timestamp: TimeInterval
+    let nodeTimebaseTimestamp: TimeInterval
+    let nodeTimebaseOffsetSeconds: TimeInterval
     let trackingSessionId: String
     let priorMapId: String?
     let priorMapSha256: String?
@@ -1004,11 +1016,18 @@ final class SupermarketScanSession {
 
     func appendLocalizationTrace(
         _ update: PriorMapLocalizationUpdate,
-        expectedTrackingSessionId: String
+        expectedTrackingSessionId: String,
+        nodeTimebaseOffsetSeconds: TimeInterval
     ) {
         localizationTransactionLock.lock()
         defer { localizationTransactionLock.unlock() }
         var trace = update
+        guard nodeTimebaseOffsetSeconds.isFinite else {
+            print("Refused localization trace without a node timebase offset")
+            return
+        }
+        trace.nodeTimebaseTimestamp = update.timestamp + nodeTimebaseOffsetSeconds
+        trace.nodeTimebaseOffsetSeconds = nodeTimebaseOffsetSeconds
         trace.trackingSessionId = expectedTrackingSessionId
         trace.priorMapId = scanConfiguration.priorMapId
         trace.priorMapSha256 = scanConfiguration.priorMapSha256
@@ -1021,6 +1040,8 @@ final class SupermarketScanSession {
             format: "MarketScannerLocalizationConstraint",
             version: 1,
             timestamp: update.timestamp,
+            nodeTimebaseTimestamp: update.timestamp + nodeTimebaseOffsetSeconds,
+            nodeTimebaseOffsetSeconds: nodeTimebaseOffsetSeconds,
             trackingSessionId: expectedTrackingSessionId,
             priorMapId: scanConfiguration.priorMapId,
             priorMapSha256: scanConfiguration.priorMapSha256,
@@ -1044,6 +1065,8 @@ final class SupermarketScanSession {
                 format: "MarketScannerLocalizationStateEvent",
                 version: 1,
                 timestamp: update.timestamp,
+                nodeTimebaseTimestamp: update.timestamp + nodeTimebaseOffsetSeconds,
+                nodeTimebaseOffsetSeconds: nodeTimebaseOffsetSeconds,
                 trackingSessionId: expectedTrackingSessionId,
                 priorMapId: scanConfiguration.priorMapId,
                 priorMapSha256: scanConfiguration.priorMapSha256,
@@ -1114,34 +1137,54 @@ final class SupermarketScanSession {
         }
     }
 
+    @discardableResult
     func appendManualLocalizationEvent(
         reason: String,
         arkitPose: PriorMapPose2D,
         confirmedMapPose: PriorMapPose2D,
         wallClock: Date,
         frameTimestamp: TimeInterval,
+        nodeTimebaseFrameTimestamp: TimeInterval,
+        nodeTimebaseOffsetSeconds: TimeInterval,
+        nearestNodeId: Int?,
+        nearestNodeStamp: TimeInterval?,
+        nodeTimeDeltaSeconds: TimeInterval?,
         alignmentVersion: Int,
         expectedTrackingSessionId: String
-    ) {
-        guard frameTimestamp.isFinite, alignmentVersion > 0 else {
+    ) -> Bool {
+        guard frameTimestamp.isFinite,
+              nodeTimebaseFrameTimestamp.isFinite,
+              nodeTimebaseOffsetSeconds.isFinite,
+              abs(
+                frameTimestamp + nodeTimebaseOffsetSeconds
+                    - nodeTimebaseFrameTimestamp
+              ) <= 0.000_001,
+              alignmentVersion > 0 else {
             print("Refused to persist an invalid manual localization v2 event")
-            return
+            return false
         }
         localizationTransactionLock.lock()
         defer { localizationTransactionLock.unlock() }
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let hasNodeEvidence = nearestNodeId != nil
+            && nearestNodeStamp?.isFinite == true
+            && nodeTimeDeltaSeconds?.isFinite == true
         let event = ManualLocalizationEvent(
             format: "MarketScannerManualLocalizationEvent",
             version: 2,
             wallClockTimestamp: formatter.string(from: wallClock),
             wallClockTimestampUnix: wallClock.timeIntervalSince1970,
             frameTimestamp: frameTimestamp,
-            nearestNodeId: nil,
-            nearestNodeStamp: nil,
-            nodeTimeDeltaSeconds: nil,
-            nodeBindingStatus: "frame_timestamp_only",
-            nodeBindingReason: "native_node_binding_unavailable",
+            nodeTimebaseFrameTimestamp: nodeTimebaseFrameTimestamp,
+            nodeTimebaseOffsetSeconds: nodeTimebaseOffsetSeconds,
+            nearestNodeId: hasNodeEvidence ? nearestNodeId : nil,
+            nearestNodeStamp: hasNodeEvidence ? nearestNodeStamp : nil,
+            nodeTimeDeltaSeconds: hasNodeEvidence ? nodeTimeDeltaSeconds : nil,
+            nodeBindingStatus: hasNodeEvidence ? "matched" : "frame_timestamp_only",
+            nodeBindingReason: hasNodeEvidence
+                ? "native_latest_node_snapshot"
+                : "native_node_binding_unavailable",
             alignmentVersion: alignmentVersion,
             trackingSessionId: expectedTrackingSessionId,
             priorMapId: scanConfiguration.priorMapId,
@@ -1150,7 +1193,7 @@ final class SupermarketScanSession {
             reason: reason,
             arkitPose: arkitPose,
             confirmedMapPose: confirmedMapPose)
-        appendLocalizationRecord(
+        return appendLocalizationRecord(
             event,
             fileName: "manual_localization_events.jsonl",
             expectedTrackingSessionId: expectedTrackingSessionId)

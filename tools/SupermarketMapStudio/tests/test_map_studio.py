@@ -37,22 +37,54 @@ def create_localized_store(
     store = server.LocalizedVersionStore(output)
     previous = store.current()
     staging = store.begin()
+    if source_manifest:
+        store.write_local_state(
+            {
+                "prior_map": str(source_manifest.get("prior_map") or output),
+                "source_session": str(source_manifest.get("source_session") or output),
+                "source_database": str(source_manifest.get("source_database") or output),
+                "optimized_database": str(source_manifest.get("optimized_database") or output),
+            }
+        )
     payloads = {
-        "prior_map_manifest.json": {},
-        "source_manifest.json": source_manifest or {},
+        "prior_map_manifest.json": {
+            "format": "MarketScannerPriorMap", "version": 1
+        },
+        "source_manifest.json": {
+            "format": "MarketScannerLocalizedSourceManifest", "version": 1,
+            **(source_manifest or {}),
+        },
         "processing_manifest.json": {
+            "format": "MarketScannerLocalizedProcessing", "version": 1,
             "publish_state": (report or {}).get("publish_state", "draft")
         },
         "online_localization_trace.json": [],
         "optimized_map_trajectory.geojson": {"type": "FeatureCollection", "features": []},
-        "localization_constraints.json": {"raw": []},
-        "localization_report.json": report or {"publish_state": "draft"},
-        "review_items.json": {"items": []},
-        "localized_review.json": {},
-        "manual_edits.json": journal or {"revision": revision, "events": [], "cursor": 0},
+        "localization_constraints.json": {
+            "format": "MarketScannerOfflineLocalizationConstraints", "version": 1,
+            "raw": [],
+        },
+        "localization_report.json": {
+            "format": "MarketScannerLocalizationReport", "version": 1,
+            **(report or {"publish_state": "draft"}),
+        },
+        "review_items.json": {
+            "format": "MarketScannerLocalizationReviewItems", "version": 1,
+            "items": [],
+        },
+        "localized_review.json": {
+            "format": "MarketScannerLocalizedReview", "version": 1,
+        },
+        "manual_edits.json": {
+            "format": "MarketScannerManualEdits", "version": 3,
+            **(journal or {"revision": revision, "events": [], "cursor": 0}),
+        },
         "localized_price_tags.json": [],
         "localized_price_tags.geojson": {"type": "FeatureCollection", "features": []},
-        "shelf_tag_index.json": {"shelves": {}},
+        "shelf_tag_index.json": {
+            "format": "MarketScannerShelfTagIndex", "version": 1,
+            "shelves": {},
+        },
     }
     for name, payload in payloads.items():
         (staging / name).write_text(json.dumps(payload) + "\n", encoding="utf-8")
@@ -503,16 +535,39 @@ class MapStudioApiTests(unittest.TestCase):
                 side_effect=commit_replay,
             ),
         ):
-            accepted = self.api(
-                f"/api/jobs/{job.identifier}/localized/edit", payload
-            )
-            self.assertEqual(accepted["revision"], first.revision + 1)
-            self.assertNotEqual(accepted["version_id"], first.version_id)
-            with self.assertRaises(HTTPError) as stale:
-                self.api(f"/api/jobs/{job.identifier}/localized/edit", payload)
-        self.assertEqual(stale.exception.code, 409)
+            barrier = threading.Barrier(3)
+            accepted_results: list[dict] = []
+            rejected_results: list[HTTPError] = []
+
+            def submit_same_revision() -> None:
+                barrier.wait()
+                try:
+                    accepted_results.append(
+                        self.api(
+                            f"/api/jobs/{job.identifier}/localized/edit", payload
+                        )
+                    )
+                except HTTPError as exc:
+                    rejected_results.append(exc)
+
+            clients = [
+                threading.Thread(target=submit_same_revision) for _ in range(2)
+            ]
+            for client in clients:
+                client.start()
+            barrier.wait()
+            for client in clients:
+                client.join(timeout=5)
+            self.assertTrue(all(not client.is_alive() for client in clients))
+        self.assertEqual(len(accepted_results), 1)
+        self.assertEqual(len(rejected_results), 1)
+        accepted = accepted_results[0]
+        self.assertEqual(accepted["revision"], first.revision + 1)
+        self.assertNotEqual(accepted["version_id"], first.version_id)
+        stale = rejected_results[0]
+        self.assertEqual(stale.code, 409)
         self.assertEqual(
-            stale.exception.payload["current_revision"], first.revision + 1
+            stale.payload["current_revision"], first.revision + 1
         )
 
     def test_localized_replay_failure_keeps_revision_and_current(self) -> None:
@@ -1520,7 +1575,7 @@ class MapStudioApiTests(unittest.TestCase):
             self.assertIn(marker, html)
         self.assertIn(b'kind: "localized"', script)
         self.assertIn(b"/localized/edit", script)
-        self.assertIn(b"allow_auto_publish", script)
+        self.assertIn(b"publish_gate", script)
         self.assertIn(b"expected_revision", script)
         self.assertIn(b"expected_version_id", script)
         self.assertIn(b"/localized/state", script)

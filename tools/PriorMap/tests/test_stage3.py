@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sqlite3
 import math
 import tempfile
 import unittest
@@ -18,6 +19,7 @@ from tools.PriorMap.offline_localization import (
     append_manual_edit,
     build_road_soft_constraints,
     build_manual_aisle_constraints,
+    infer_aisle_switch_sequence,
     apply_manual_edits,
     move_manual_edit_cursor,
     new_manual_edits,
@@ -135,7 +137,9 @@ class TagObservationBindingTests(unittest.TestCase):
             Pose(11, 101.0, 1.0, 0.0, 0.0),
         ]
         self.observation = {
-            "frame_timestamp": 101.05,
+            "frame_timestamp": 1.05,
+            "node_timebase_frame_timestamp": 101.05,
+            "node_timebase_offset_seconds": 100.0,
             "tracking_session_id": "tracking-1",
             "prior_map_sha256": "a" * 64,
             "floor_id": "1",
@@ -172,7 +176,7 @@ class TagObservationBindingTests(unittest.TestCase):
                 expected_map_hashes={"a" * 64},
                 expected_floor_id="1",
             )
-        with self.assertRaisesRegex(OfflineLocalizationError, "timestamp"):
+        with self.assertRaisesRegex(OfflineLocalizationError, "timebase"):
             self._bind(
                 {
                     key: value
@@ -189,7 +193,11 @@ class TagObservationBindingTests(unittest.TestCase):
         with self.assertRaisesRegex(OfflineLocalizationError, "floor"):
             self._bind({**self.observation, "floor_id": "2"})
         with self.assertRaisesRegex(OfflineLocalizationError, "time_delta"):
-            self._bind({**self.observation, "frame_timestamp": 110.0})
+            self._bind({
+                **self.observation,
+                "frame_timestamp": 10.0,
+                "node_timebase_frame_timestamp": 110.0,
+            })
 
     def test_missing_or_ambiguous_explicit_node_does_not_fallback(self) -> None:
         with self.assertRaisesRegex(OfflineLocalizationError, "not_found"):
@@ -198,7 +206,12 @@ class TagObservationBindingTests(unittest.TestCase):
         with self.assertRaisesRegex(OfflineLocalizationError, "ambiguous"):
             bind_tag_observation_to_pose(
                 duplicate,
-                {**self.observation, "frame_timestamp": 100.0, "nearest_node_id": 10},
+                {
+                    **self.observation,
+                    "frame_timestamp": 0.0,
+                    "node_timebase_frame_timestamp": 100.0,
+                    "nearest_node_id": 10,
+                },
                 expected_tracking_session_id="tracking-1",
                 expected_map_hashes={"a" * 64},
                 expected_floor_id="1",
@@ -211,14 +224,17 @@ class TagObservationBindingTests(unittest.TestCase):
 class ManualLocalizationTimebaseTests(unittest.TestCase):
     def setUp(self) -> None:
         self.poses = [
-            Pose(21, 10.0, 0.0, 0.0, 0.0),
-            Pose(22, 11.0, 1.0, 0.0, 0.0),
+            Pose(21, 110.0, 0.0, 0.0, 0.0),
+            Pose(22, 111.0, 1.0, 0.0, 0.0),
         ]
         self.event = {
             "format": "MarketScannerManualLocalizationEvent",
             "version": 2,
             "wall_clock_timestamp_unix": 1_800_000_000.0,
+            "wall_clock_timestamp": "2027-01-15T08:00:00.000Z",
             "frame_timestamp": 11.05,
+            "node_timebase_frame_timestamp": 111.05,
+            "node_timebase_offset_seconds": 100.0,
             "nearest_node_id": None,
             "nearest_node_stamp": None,
             "node_time_delta_seconds": None,
@@ -228,6 +244,7 @@ class ManualLocalizationTimebaseTests(unittest.TestCase):
             "prior_map_sha256": "a" * 64,
             "floor_id": "1",
             "confirmed_map_pose": {"x_m": 1.0, "y_m": 2.0, "yaw_rad": 0.1},
+            "arkit_pose": {"x_m": 0.9, "y_m": 2.0, "yaw_rad": 0.1},
         }
 
     def _bind(self, event: dict[str, object]):
@@ -248,15 +265,25 @@ class ManualLocalizationTimebaseTests(unittest.TestCase):
         event = {
             **self.event,
             "nearest_node_id": 22,
-            "nearest_node_stamp": 11.0,
+            "nearest_node_stamp": 111.0,
             "node_time_delta_seconds": 0.05,
             "node_binding_status": "matched",
         }
         self.assertEqual(self._bind(event).binding_source, "nearest_node_id")
         with self.assertRaisesRegex(OfflineLocalizationError, "stamp_mismatch"):
-            self._bind({**event, "nearest_node_stamp": 10.5})
+            self._bind({**event, "nearest_node_stamp": 110.5})
         with self.assertRaisesRegex(OfflineLocalizationError, "delta_mismatch"):
             self._bind({**event, "node_time_delta_seconds": 0.5})
+        with self.assertRaisesRegex(OfflineLocalizationError, "binding_status"):
+            self._bind({**event, "node_binding_status": "frame_timestamp_only"})
+
+    def test_v2_requires_wall_clock_and_consistent_null_node_evidence(self) -> None:
+        without_wall_clock = dict(self.event)
+        without_wall_clock.pop("wall_clock_timestamp")
+        with self.assertRaisesRegex(OfflineLocalizationError, "wall_clock"):
+            self._bind(without_wall_clock)
+        with self.assertRaisesRegex(OfflineLocalizationError, "contradictory"):
+            self._bind({**self.event, "nearest_node_stamp": 111.0})
 
     def test_legacy_wrong_identity_and_ambiguous_time_are_rejected(self) -> None:
         with self.assertRaisesRegex(OfflineLocalizationError, "legacy"):
@@ -264,13 +291,17 @@ class ManualLocalizationTimebaseTests(unittest.TestCase):
         with self.assertRaisesRegex(OfflineLocalizationError, "tracking_session"):
             self._bind({**self.event, "tracking_session_id": "wrong"})
         ambiguous = [
-            Pose(1, 10.0, 0.0, 0.0, 0.0),
-            Pose(2, 12.0, 0.0, 0.0, 0.0),
+            Pose(1, 110.0, 0.0, 0.0, 0.0),
+            Pose(2, 112.0, 0.0, 0.0, 0.0),
         ]
         with self.assertRaisesRegex(OfflineLocalizationError, "ambiguous"):
             bind_manual_localization_event_to_pose(
                 ambiguous,
-                {**self.event, "frame_timestamp": 11.0},
+                {
+                    **self.event,
+                    "frame_timestamp": 11.0,
+                    "node_timebase_frame_timestamp": 111.0,
+                },
                 expected_tracking_session_id="tracking-1",
                 expected_map_hash="a" * 64,
                 expected_floor_id="1",
@@ -338,6 +369,37 @@ class RobustSE2OptimizerTests(unittest.TestCase):
         ]
         self.assertEqual(build_road_soft_constraints(far, graph, "1"), [])
 
+    def test_aisle_sequence_uses_final_trajectory_geometry(self) -> None:
+        road_graph = {
+            "crosses": [
+                {
+                    "id": "A",
+                    "floor_id": "1",
+                    "width_m": 1.0,
+                    "points_m": [[0.0, 0.0], [4.0, 0.0]],
+                },
+                {
+                    "id": "B",
+                    "floor_id": "1",
+                    "width_m": 1.0,
+                    "points_m": [[6.0, 0.0], [10.0, 0.0]],
+                },
+            ]
+        }
+        trajectory = [
+            Pose(index + 1, float(index), float(index), 0.1, 0.0)
+            for index in range(11)
+        ]
+        sequence = infer_aisle_switch_sequence(
+            trajectory, road_graph, "1", stride=1
+        )
+        self.assertEqual([item["corridor_id"] for item in sequence], ["A", "B"])
+        self.assertTrue(
+            all(item["source"] == "final_trajectory_geometry" for item in sequence)
+        )
+        self.assertEqual([item["direction"] for item in sequence], ["forward", "forward"])
+        self.assertFalse(sequence[0]["possible_silent_switch"])
+        self.assertTrue(sequence[1]["possible_silent_switch"])
     def test_manual_aisle_assignment_creates_constraints_for_interval(self) -> None:
         baseline = [
             Pose(index + 1, float(index), float(index), 2.0, 0)
@@ -627,14 +689,47 @@ class LocalizedPipelineTests(unittest.TestCase):
                 "priorMapSha256": manifest["source_sha256"],
                 "floorId": "1",
                 "initialMapPose": {"x_m": 1.5, "y_m": -2.5, "yaw_rad": 0},
+                "localizedPriceTags": "localized_price_tags.json",
+                "localizedPriceTagCount": 1,
             },
         )
         self.source_database = self.segment / "rtabmap_segment_0001.db"
-        self.source_database.write_bytes(b"read-only-source-database-fixture")
+        self.node_timebase_offset = 1_700_000_000.0
+        connection = sqlite3.connect(self.source_database)
+        try:
+            connection.execute("CREATE TABLE Node(id INTEGER PRIMARY KEY, stamp REAL NOT NULL)")
+            connection.executemany(
+                "INSERT INTO Node(id, stamp) VALUES(?, ?)",
+                [
+                    (index + 1, self.node_timebase_offset + float(index))
+                    for index in range(20)
+                ],
+            )
+            connection.commit()
+        finally:
+            connection.close()
         self.optimized_database = self.root / "optimized.db"
-        self.optimized_database.write_bytes(b"derived-optimized-database-fixture")
+        connection = sqlite3.connect(self.optimized_database)
+        try:
+            connection.execute("CREATE TABLE Node(id INTEGER PRIMARY KEY, stamp REAL NOT NULL)")
+            connection.executemany(
+                "INSERT INTO Node(id, stamp) VALUES(?, ?)",
+                [
+                    (index + 1, self.node_timebase_offset + float(index))
+                    for index in range(20)
+                ],
+            )
+            connection.commit()
+        finally:
+            connection.close()
         self.poses = [
-            Pose(index + 1, float(index), float(index) * 0.5, 0.05 * index, 0)
+            Pose(
+                index + 1,
+                self.node_timebase_offset + float(index),
+                float(index) * 0.5,
+                0.05 * index,
+                0,
+            )
             for index in range(20)
         ]
         trace = [
@@ -642,6 +737,8 @@ class LocalizedPipelineTests(unittest.TestCase):
                 "format": "MarketScannerLocalizationTrace",
                 "version": 1,
                 "timestamp": float(index),
+                "nodeTimebaseTimestamp": self.node_timebase_offset + float(index),
+                "nodeTimebaseOffsetSeconds": self.node_timebase_offset,
                 "trackingSessionId": "tracking-1",
                 "priorMapSha256": manifest["source_sha256"],
                 "floorId": "1",
@@ -650,6 +747,14 @@ class LocalizedPipelineTests(unittest.TestCase):
                     "y_m": -2.5,
                     "yaw_rad": 0,
                 },
+                "raw_pose": {
+                    "x_m": 1.5 + 0.5 * index,
+                    "y_m": -2.5,
+                    "yaw_rad": 0,
+                },
+                "trackingState": "normal",
+                "localizationState": "stable",
+                "confidence": 0.9,
                 "road_candidates": [{"edge_id": "1:1--2", "distance_m": 0.1}],
             }
             for index in range(20)
@@ -659,10 +764,13 @@ class LocalizedPipelineTests(unittest.TestCase):
                 "format": "MarketScannerLocalizationConstraint",
                 "version": 1,
                 "timestamp": 19.0,
+                "node_timebase_timestamp": self.node_timebase_offset + 19.0,
+                "node_timebase_offset_seconds": self.node_timebase_offset,
                 "tracking_session_id": "tracking-1",
                 "prior_map_sha256": manifest["source_sha256"],
                 "floor_id": "1",
                 "accepted": True,
+                "predicted_pose": {"x_m": 11.0, "y_m": -2.5, "yaw_rad": 0},
                 "estimated_pose": {"x_m": 11.0, "y_m": -2.5, "yaw_rad": 0},
                 "uniqueness": 0.8,
             },
@@ -670,10 +778,13 @@ class LocalizedPipelineTests(unittest.TestCase):
                 "format": "MarketScannerLocalizationConstraint",
                 "version": 1,
                 "timestamp": 10.0,
+                "node_timebase_timestamp": self.node_timebase_offset + 10.0,
+                "node_timebase_offset_seconds": self.node_timebase_offset,
                 "tracking_session_id": "tracking-1",
                 "prior_map_sha256": manifest["source_sha256"],
                 "floor_id": "1",
                 "accepted": True,
+                "predicted_pose": {"x_m": 6.5, "y_m": -2.5, "yaw_rad": 0},
                 "estimated_pose": {"x_m": 99.0, "y_m": 99.0, "yaw_rad": 2.0},
                 "uniqueness": 0.9,
             },
@@ -687,8 +798,11 @@ class LocalizedPipelineTests(unittest.TestCase):
                     "format": "MarketScannerLocalizationStateEvent",
                     "version": 1,
                     "timestamp": timestamp,
+                    "node_timebase_timestamp": self.node_timebase_offset + timestamp,
+                    "node_timebase_offset_seconds": self.node_timebase_offset,
                     "state": state,
                     "reason": reason,
+                    "confidence": 0.8,
                     "tracking_session_id": "tracking-1",
                     "prior_map_sha256": manifest["source_sha256"],
                     "floor_id": "1",
@@ -708,10 +822,14 @@ class LocalizedPipelineTests(unittest.TestCase):
                 "version": 1,
                 "observation_id": "obs-1",
                 "frame_timestamp": 10.0,
+                "node_timebase_frame_timestamp": self.node_timebase_offset + 10.0,
+                "node_timebase_offset_seconds": self.node_timebase_offset,
                 "tracking_session_id": "tracking-1",
                 "prior_map_sha256": manifest["source_sha256"],
                 "floor_id": "1",
                 "raw_map_position": {"x_m": 2.0, "y_m": -2.0, "height_m": 1.2},
+                "payload": "690000000001",
+                "symbology": "EAN13",
             }],
         )
         json_write(
@@ -723,8 +841,10 @@ class LocalizedPipelineTests(unittest.TestCase):
                     "tag_id": "tag-1",
                     "observation_id": "obs-1",
                     "payload": "690000000001",
+                    "symbology": "EAN13",
                     "timestamp": 10.0,
                     "tracking_session_id": "tracking-1",
+                    "prior_map_id": manifest["prior_map_id"],
                     "prior_map_sha256": manifest["source_sha256"],
                     "floor_id": "1",
                     "raw_map_position": {
@@ -740,7 +860,9 @@ class LocalizedPipelineTests(unittest.TestCase):
                     "localization_confidence": 0.8,
                     "measurement_confidence": 0.8,
                     "association_confidence": 0.8,
+                    "measurement_method": "depth_plane",
                     "needs_review": False,
+                    "user_confirmed": False,
                 }
             ],
         )
@@ -801,7 +923,9 @@ class LocalizedPipelineTests(unittest.TestCase):
         self.assertTrue(first["allow_draft"])
         self.assertEqual(first["solver"]["type"], "bounded_correction_field")
         self.assertFalse(first["solver"]["published_capable"])
-        self.assertIn("objective_before", first["solver"])
+        self.assertIn(
+            "absolute_constraint_residual_diagnostic_before", first["solver"]
+        )
         self.assertIn("maximum_local_relative_translation_change_m", first["solver"])
         self.assertFalse(first["publish_gate"]["passed"])
         self.assertIn(
@@ -814,6 +938,14 @@ class LocalizedPipelineTests(unittest.TestCase):
             json.loads((first_version.version_dir / "source_manifest.json").read_text())[
                 "source_database_immutable"
             ]
+        )
+        source_manifest_text = (
+            first_version.version_dir / "source_manifest.json"
+        ).read_text()
+        self.assertNotIn(str(self.root), source_manifest_text)
+        local_state = LocalizedVersionStore(first_output).local_state()
+        self.assertEqual(
+            Path(local_state["source_database"]), self.source_database.resolve()
         )
         tag = json.loads(
             (first_version.version_dir / "localized_price_tags.json").read_text()
@@ -848,11 +980,6 @@ class LocalizedPipelineTests(unittest.TestCase):
                 "format": "MarketScannerManualLocalizationEvent",
                 "version": 1,
                 "timestampUnix": 1_800_000_000.0,
-                "trackingSessionId": "tracking-1",
-                "priorMapSha256": json.loads(
-                    (self.prior_map / "manifest.json").read_text()
-                )["source_sha256"],
-                "floorId": "1",
                 "confirmedMapPose": {"x_m": 50.0, "y_m": 50.0, "yaw_rad": 0.0},
             }],
         )
@@ -870,6 +997,61 @@ class LocalizedPipelineTests(unittest.TestCase):
             report["manual_localization_event_audit"][0]["reason"],
             "manual_event_legacy_or_unknown_version",
         )
+        self.assertFalse(report["review_gate"]["passed"])
+        self.assertIn(
+            "rejected_manual_localization_events_present",
+            {item["code"] for item in report["review_gate"]["blockers"]},
+        )
+
+    def test_stale_or_duplicate_manual_alignment_version_is_rejected(self) -> None:
+        manifest = json.loads((self.prior_map / "manifest.json").read_text())
+        base = {
+            "format": "MarketScannerManualLocalizationEvent",
+            "version": 2,
+            "wall_clock_timestamp": "2027-01-15T08:00:00.000Z",
+            "wall_clock_timestamp_unix": 1_800_000_000.0,
+            "nearest_node_id": None,
+            "nearest_node_stamp": None,
+            "node_time_delta_seconds": None,
+            "node_binding_status": "frame_timestamp_only",
+            "node_timebase_offset_seconds": self.node_timebase_offset,
+            "tracking_session_id": "tracking-1",
+            "prior_map_sha256": manifest["source_sha256"],
+            "floor_id": "1",
+            "arkit_pose": {"x_m": 5.0, "y_m": 0.0, "yaw_rad": 0.0},
+            "confirmed_map_pose": {"x_m": 6.5, "y_m": -2.5, "yaw_rad": 0.0},
+        }
+        jsonl_write(
+            self.segment / "manual_localization_events.jsonl",
+            [
+                {
+                    **base,
+                    "frame_timestamp": 10.0,
+                    "node_timebase_frame_timestamp": self.node_timebase_offset + 10.0,
+                    "alignment_version": 2,
+                },
+                {
+                    **base,
+                    "frame_timestamp": 11.0,
+                    "node_timebase_frame_timestamp": self.node_timebase_offset + 11.0,
+                    "alignment_version": 1,
+                },
+            ],
+        )
+        report = process_localized_session(
+            self.prior_map,
+            self.session,
+            self.poses,
+            self.source_database,
+            self.optimized_database,
+            self.root / "stale-manual-alignment",
+        )
+        self.assertEqual(report["accepted_manual_anchor_count"], 1)
+        self.assertEqual(
+            report["manual_localization_event_audit"][1]["reason"],
+            "manual_event_alignment_version_stale_or_duplicate",
+        )
+        self.assertFalse(report["review_gate"]["passed"])
 
     def test_sidecar_invalid_utf8_and_nonfinite_numbers_fail_closed(self) -> None:
         trace_path = self.segment / "localization_trace.jsonl"
@@ -908,6 +1090,8 @@ class LocalizedPipelineTests(unittest.TestCase):
                     "format": "MarketScannerLocalizationTrace",
                     "version": 1,
                     "timestamp": float(index),
+                    "nodeTimebaseTimestamp": self.node_timebase_offset + float(index),
+                    "nodeTimebaseOffsetSeconds": self.node_timebase_offset,
                     "trackingSessionId": "tracking-1",
                     "priorMapSha256": manifest["source_sha256"],
                     "floorId": "1",
@@ -916,6 +1100,14 @@ class LocalizedPipelineTests(unittest.TestCase):
                         "y_m": -2.5,
                         "yaw_rad": 0,
                     },
+                    "raw_pose": {
+                        "x_m": 1.5 + 0.5 * index,
+                        "y_m": -2.5,
+                        "yaw_rad": 0,
+                    },
+                    "trackingState": "normal",
+                    "localizationState": "stable",
+                    "confidence": 0.9,
                 }
                 for index in range(20)
             ],
@@ -957,6 +1149,10 @@ class LocalizedPipelineTests(unittest.TestCase):
         tags_path = self.segment / "localized_price_tags.json"
         tags = json.loads(tags_path.read_text())
         json_write(tags_path, [tags[0], tags[0]])
+        metadata_path = self.segment / "metadata.json"
+        metadata = json.loads(metadata_path.read_text())
+        metadata["localizedPriceTagCount"] = 2
+        json_write(metadata_path, metadata)
         with self.assertRaisesRegex(OfflineLocalizationError, "missing/duplicate IDs"):
             process_localized_session(
                 self.prior_map,
@@ -968,6 +1164,8 @@ class LocalizedPipelineTests(unittest.TestCase):
             )
 
         json_write(tags_path, tags)
+        metadata["localizedPriceTagCount"] = 1
+        json_write(metadata_path, metadata)
         (self.segment / "localization_events.jsonl").unlink()
         with self.assertRaisesRegex(OfflineLocalizationError, "Required sidecar"):
             process_localized_session(
@@ -977,6 +1175,71 @@ class LocalizedPipelineTests(unittest.TestCase):
                 self.source_database,
                 self.optimized_database,
                 self.root / "missing-events",
+            )
+
+    def test_tag_file_count_and_tag_observation_content_are_fail_closed(self) -> None:
+        tags_path = self.segment / "localized_price_tags.json"
+        original_tags = tags_path.read_text()
+        tags_path.unlink()
+        with self.assertRaisesRegex(OfflineLocalizationError, "tag.*missing"):
+            process_localized_session(
+                self.prior_map,
+                self.session,
+                self.poses,
+                self.source_database,
+                self.optimized_database,
+                self.root / "missing-tags",
+            )
+
+        tags_path.write_text(original_tags, encoding="utf-8")
+        observations_path = self.segment / "tag_observations.jsonl"
+        observation = json.loads(observations_path.read_text().splitlines()[0])
+        observation["payload"] = "different-product"
+        jsonl_write(observations_path, [observation])
+        output = self.root / "mismatched-tag-observation"
+        report = process_localized_session(
+            self.prior_map,
+            self.session,
+            self.poses,
+            self.source_database,
+            self.optimized_database,
+            output,
+        )
+        self.assertTrue(report["current_updated"])
+        self.assertFalse(report["review_gate"]["passed"])
+        self.assertIn(
+            "tag_and_observation_payload_mismatch",
+            json.loads(
+                (LocalizedVersionStore(output).resolve_version(report["version_id"])
+                 .version_dir / "localized_price_tags.json").read_text()
+            )[0]["review_reasons"],
+        )
+
+    def test_final_tag_identity_and_optional_business_types_fail_closed(self) -> None:
+        tags_path = self.segment / "localized_price_tags.json"
+        original = json.loads(tags_path.read_text())
+        wrong_map = [dict(original[0], prior_map_id="another-map")]
+        json_write(tags_path, wrong_map)
+        with self.assertRaisesRegex(OfflineLocalizationError, "prior_map_id"):
+            process_localized_session(
+                self.prior_map,
+                self.session,
+                self.poses,
+                self.source_database,
+                self.optimized_database,
+                self.root / "wrong-final-tag-map-id",
+            )
+
+        invalid_height = [dict(original[0], height_cm=True)]
+        json_write(tags_path, invalid_height)
+        with self.assertRaisesRegex(OfflineLocalizationError, "height_cm"):
+            process_localized_session(
+                self.prior_map,
+                self.session,
+                self.poses,
+                self.source_database,
+                self.optimized_database,
+                self.root / "wrong-final-tag-height",
             )
 
 
