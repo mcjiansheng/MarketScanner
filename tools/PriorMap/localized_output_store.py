@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import csv
 from datetime import datetime, timezone
-import fcntl
 import hashlib
 import json
 import os
@@ -15,6 +14,8 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
+
+from tools.PriorMap.localized_file_lock import FileLock, FileLockTimeout
 
 
 REQUIRED_VERSION_FILES = (
@@ -114,32 +115,40 @@ def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
 
 
 class LocalizedVersionStore:
-    def __init__(self, output_root: Path):
+    def __init__(
+        self,
+        output_root: Path,
+        *,
+        lock_timeout_seconds: float | None = 30.0,
+        lock_poll_interval_seconds: float = 0.05,
+    ):
         self.output_root = output_root
         self.root = output_root / "localized"
         self.versions = self.root / "versions"
-        self._lock_handle: Any | None = None
+        self.lock_timeout_seconds = lock_timeout_seconds
+        self.lock_poll_interval_seconds = lock_poll_interval_seconds
+        self._lock_handle: FileLock | None = None
 
     def _acquire_lock(self) -> None:
         if self._lock_handle is not None:
             raise LocalizedStoreError("Localized write transaction is already active.")
         self.versions.mkdir(parents=True, exist_ok=True)
-        handle = (self.root / ".write.lock").open("a+b")
+        lock = FileLock(
+            self.root / ".write.lock",
+            timeout_seconds=self.lock_timeout_seconds,
+            poll_interval_seconds=self.lock_poll_interval_seconds,
+        )
         try:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-        except Exception:
-            handle.close()
-            raise
-        self._lock_handle = handle
+            lock.acquire()
+        except FileLockTimeout as exc:
+            raise LocalizedStoreError(str(exc)) from exc
+        self._lock_handle = lock
 
     def _release_lock(self) -> None:
-        handle = self._lock_handle
+        lock = self._lock_handle
         self._lock_handle = None
-        if handle is not None:
-            try:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-            finally:
-                handle.close()
+        if lock is not None:
+            lock.release()
 
     def prepare(self) -> None:
         self._acquire_lock()

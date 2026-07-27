@@ -1,20 +1,139 @@
 from __future__ import annotations
 
+import ast
 import csv
 import hashlib
 import json
+import multiprocessing
+import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
 
+import tools.PriorMap.localized_file_lock as localized_file_lock
 import tools.PriorMap.localized_output_store as localized_store
 
+from tools.PriorMap.localized_file_lock import (
+    FileLockError,
+    PosixFileLock,
+    WindowsFileLock,
+    select_file_lock_backend,
+)
 from tools.PriorMap.localized_output_store import (
     LocalizedStoreError,
     LocalizedVersionStore,
     REQUIRED_VERSION_FILES,
 )
+
+
+def _hold_store_transaction(
+    output_path: str,
+    ready_connection: object,
+    release_event: object,
+) -> None:
+    """Spawn-safe worker that holds the store lock until the parent releases it."""
+
+    store = LocalizedVersionStore(
+        Path(output_path), lock_timeout_seconds=5.0
+    )
+    staging = store.begin()
+    ready_connection.send(staging.name)  # type: ignore[attr-defined]
+    ready_connection.close()  # type: ignore[attr-defined]
+    release_event.wait(10.0)  # type: ignore[attr-defined]
+    store.abort(staging)
+
+
+class LocalizedFileLockTests(unittest.TestCase):
+    def test_backend_selection_is_explicit_and_rejects_thread_fallback(self) -> None:
+        self.assertIs(select_file_lock_backend("posix"), PosixFileLock)
+        self.assertIs(select_file_lock_backend("nt"), WindowsFileLock)
+        with self.assertRaisesRegex(FileLockError, "Unsupported"):
+            select_file_lock_backend("java")
+
+    def test_platform_only_lock_modules_are_lazily_imported(self) -> None:
+        source = Path(localized_file_lock.__file__).read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        top_level_imports = {
+            alias.name
+            for node in tree.body
+            if isinstance(node, ast.Import)
+            for alias in node.names
+        }
+        top_level_imports.update(
+            node.module
+            for node in tree.body
+            if isinstance(node, ast.ImportFrom) and node.module is not None
+        )
+        self.assertNotIn("fcntl", top_level_imports)
+        self.assertNotIn("msvcrt", top_level_imports)
+
+    def test_same_output_root_is_excluded_across_processes_with_timeout(self) -> None:
+        context = multiprocessing.get_context("spawn")
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "output"
+            parent_connection, child_connection = context.Pipe(duplex=False)
+            release_event = context.Event()
+            holder = context.Process(
+                target=_hold_store_transaction,
+                args=(str(output), child_connection, release_event),
+            )
+            holder.start()
+            child_connection.close()
+            try:
+                self.assertTrue(parent_connection.poll(10.0))
+                staging_name = parent_connection.recv()
+                self.assertTrue(staging_name.startswith(".staging-"))
+                contender = LocalizedVersionStore(
+                    output,
+                    lock_timeout_seconds=0.25,
+                    lock_poll_interval_seconds=0.01,
+                )
+                started = time.monotonic()
+                with self.assertRaisesRegex(
+                    LocalizedStoreError,
+                    r"Timed out.*exclusive .* lock.*requesting_pid=",
+                ):
+                    contender.prepare()
+                elapsed = time.monotonic() - started
+                self.assertGreaterEqual(elapsed, 0.20)
+                self.assertLess(elapsed, 2.0)
+            finally:
+                release_event.set()
+                holder.join(10.0)
+                if holder.is_alive():
+                    holder.terminate()
+                    holder.join(5.0)
+                parent_connection.close()
+            self.assertEqual(holder.exitcode, 0)
+
+    def test_process_termination_releases_os_lock_and_recovers_staging(self) -> None:
+        context = multiprocessing.get_context("spawn")
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "output"
+            parent_connection, child_connection = context.Pipe(duplex=False)
+            release_event = context.Event()
+            holder = context.Process(
+                target=_hold_store_transaction,
+                args=(str(output), child_connection, release_event),
+            )
+            holder.start()
+            child_connection.close()
+            try:
+                self.assertTrue(parent_connection.poll(10.0))
+                staging_name = parent_connection.recv()
+            finally:
+                parent_connection.close()
+            holder.terminate()
+            holder.join(10.0)
+            self.assertFalse(holder.is_alive())
+            self.assertNotEqual(holder.exitcode, 0)
+
+            store = LocalizedVersionStore(output, lock_timeout_seconds=2.0)
+            removed = store.recover_stale_staging()
+            self.assertEqual([path.name for path in removed], [staging_name])
+            self.assertFalse((store.root / staging_name).exists())
 
 
 class LocalizedVersionStoreTests(unittest.TestCase):
