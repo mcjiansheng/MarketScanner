@@ -58,7 +58,79 @@ EDITABLE_TAG_FIELDS = frozenset(
 )
 
 
-def processing_parameter_sha256() -> str:
+DEFAULT_REPLAY_PARAMETERS: dict[str, Any] = {
+    "resolution": 0.05,
+    "preview_resolution": 0.1,
+    "trajectory_radius": 1.25,
+    "tag_snap_distance": 1.0,
+    "occupied_inflate_radius": 0.08,
+    "free_ray_max_range": 8.0,
+    "horizontal_axes": "xz",
+    "auto_align_segments": False,
+}
+
+
+def normalize_replay_parameters(
+    payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    values = dict(DEFAULT_REPLAY_PARAMETERS if payload is None else payload)
+    if set(values) != set(DEFAULT_REPLAY_PARAMETERS):
+        raise OfflineLocalizationError("Replay parameter set is invalid.")
+    normalized: dict[str, Any] = {}
+    for name in (
+        "resolution",
+        "preview_resolution",
+        "trajectory_radius",
+        "tag_snap_distance",
+        "occupied_inflate_radius",
+        "free_ray_max_range",
+    ):
+        value = values.get(name)
+        if isinstance(value, bool):
+            raise OfflineLocalizationError(f"Replay parameter {name} is invalid.")
+        try:
+            number = float(value)
+        except (TypeError, ValueError) as exc:
+            raise OfflineLocalizationError(
+                f"Replay parameter {name} is invalid."
+            ) from exc
+        if not math.isfinite(number) or number <= 0:
+            raise OfflineLocalizationError(f"Replay parameter {name} is invalid.")
+        normalized[name] = number
+    axes = values.get("horizontal_axes")
+    if axes not in {"xz", "xy"}:
+        raise OfflineLocalizationError("Replay parameter horizontal_axes is invalid.")
+    if values.get("auto_align_segments") is not False:
+        raise OfflineLocalizationError(
+            "Localized replay requires auto_align_segments=false."
+        )
+    normalized["horizontal_axes"] = axes
+    normalized["auto_align_segments"] = False
+    return normalized
+
+
+def processing_parameter_sha256(
+    replay_parameters: dict[str, Any] | None = None,
+) -> str:
+    payload = {
+        "algorithm_parameters": {
+            "coordinate_contract_version": COORDINATE_CONTRACT_VERSION,
+            "hard_reject_translation_m": HARD_REJECT_TRANSLATION_M,
+            "hard_reject_yaw_rad": HARD_REJECT_YAW_RAD,
+            "huber_translation_m": HUBER_TRANSLATION_M,
+            "huber_yaw_rad": HUBER_YAW_RAD,
+            "solver": "bounded_correction_field_v1",
+        },
+        "replay_parameters": normalize_replay_parameters(replay_parameters),
+    }
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def _legacy_processing_parameter_sha256_v3() -> str:
+    """Return the algorithm-only digest written by manual journal v3."""
+
     payload = {
         "coordinate_contract_version": COORDINATE_CONTRACT_VERSION,
         "hard_reject_translation_m": HARD_REJECT_TRANSLATION_M,
@@ -245,6 +317,7 @@ def build_local_input_record(
     prior_map: Path,
     session_input_manifest: dict[str, Any],
     prior_map_sha256: str,
+    replay_parameters: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build the private, path-bearing record referenced by one version."""
 
@@ -268,7 +341,9 @@ def build_local_input_record(
             "source_database_sha256": source_entry["sha256"],
             "optimized_database_sha256": _sha256(optimized_database),
             "prior_map_sha256": prior_map_sha256,
-            "processing_parameter_sha256": processing_parameter_sha256(),
+            "processing_parameter_sha256": processing_parameter_sha256(
+                replay_parameters
+            ),
         },
     }
     return {
@@ -2577,6 +2652,7 @@ def new_manual_edits(
     optimized_db_sha256: str = "",
     session_input_bundle_sha256: str = "",
     input_identity_id: str = "",
+    replay_parameters: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     return {
         "format": "MarketScannerManualEdits",
@@ -2587,7 +2663,9 @@ def new_manual_edits(
         "session_input_bundle_sha256": session_input_bundle_sha256,
         "input_identity_id": input_identity_id,
         "optimized_database_sha256": optimized_db_sha256,
-        "processing_parameter_sha256": processing_parameter_sha256(),
+        "processing_parameter_sha256": processing_parameter_sha256(
+            replay_parameters
+        ),
         "tool_version": TOOL_VERSION,
         "coordinate_contract_version": COORDINATE_CONTRACT_VERSION,
         "cursor": 0,
@@ -2747,6 +2825,7 @@ def upgrade_manual_edits_v2(
     optimized_database_sha256: str,
     session_input_bundle_sha256: str,
     input_identity_id: str,
+    replay_parameters: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Upgrade a historical v2/v3 journal using a verified current bundle."""
 
@@ -2775,7 +2854,7 @@ def upgrade_manual_edits_v2(
         or (
             historical_version == 3
             and journal.get("processing_parameter_sha256")
-            != processing_parameter_sha256()
+            != _legacy_processing_parameter_sha256_v3()
         )
     ):
         raise OfflineLocalizationError(
@@ -2787,6 +2866,7 @@ def upgrade_manual_edits_v2(
         optimized_database_sha256,
         session_input_bundle_sha256,
         input_identity_id,
+        replay_parameters,
     )
     upgraded["revision"] = journal.get("revision", 1)
     upgraded["cursor"] = journal.get("cursor", 0)
@@ -2821,6 +2901,7 @@ def _render_localized_version(
     session_input_manifest: dict[str, Any],
     input_identity_id: str,
     local_input_record: dict[str, Any],
+    replay_parameters: dict[str, Any],
     manual_edits: dict[str, Any] | None = None,
     progress: Callable[[int, str, str], None] | None = None,
 ) -> dict[str, Any]:
@@ -2877,7 +2958,7 @@ def _render_localized_version(
         or local_identities.get("optimized_database_sha256") != optimized_db_hash
         or local_identities.get("prior_map_sha256") != package_hash
         or local_identities.get("processing_parameter_sha256")
-        != processing_parameter_sha256()
+        != processing_parameter_sha256(replay_parameters)
     ):
         raise OfflineLocalizationError("Localized local-input identity is inconsistent.")
     if manual_edits is None:
@@ -2887,6 +2968,7 @@ def _render_localized_version(
             optimized_db_hash,
             expected_bundle_sha256,
             input_identity_id,
+            replay_parameters,
         )
     manual_edits = upgrade_manual_edits_v2(
         manual_edits,
@@ -2895,6 +2977,7 @@ def _render_localized_version(
         optimized_db_hash,
         expected_bundle_sha256,
         input_identity_id,
+        replay_parameters,
     )
     if (
         manual_edits.get("format") != "MarketScannerManualEdits"
@@ -2905,7 +2988,7 @@ def _render_localized_version(
         != expected_bundle_sha256
         or manual_edits.get("input_identity_id") != input_identity_id
         or manual_edits.get("processing_parameter_sha256")
-        != processing_parameter_sha256()
+        != processing_parameter_sha256(replay_parameters)
         or manual_edits.get("tool_version") != TOOL_VERSION
         or manual_edits.get("coordinate_contract_version")
         != COORDINATE_CONTRACT_VERSION
@@ -3713,7 +3796,10 @@ def _render_localized_version(
             "tool_version": TOOL_VERSION,
             "algorithm_version": "bounded_correction_field_v1",
             "coordinate_contract_version": COORDINATE_CONTRACT_VERSION,
-            "processing_parameter_sha256": processing_parameter_sha256(),
+            "processing_parameter_sha256": processing_parameter_sha256(
+                replay_parameters
+            ),
+            "replay_parameters": replay_parameters,
             "parameters": {
                 "huber_translation_m": HUBER_TRANSLATION_M,
                 "huber_yaw_rad": HUBER_YAW_RAD,
@@ -3888,6 +3974,7 @@ def process_localized_session(
     manual_edits: dict[str, Any] | None = None,
     progress: Callable[[int, str, str], None] | None = None,
     expected_parent_version: str | None = None,
+    replay_parameters: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Render and atomically commit an immutable localized result version.
 
@@ -3898,6 +3985,7 @@ def process_localized_session(
     current result.
     """
 
+    normalized_replay_parameters = normalize_replay_parameters(replay_parameters)
     validation = validate_package(prior_map)
     if not validation["valid"]:
         raise OfflineLocalizationError(
@@ -3922,6 +4010,7 @@ def process_localized_session(
         prior_map=prior_map,
         session_input_manifest=session_input_manifest,
         prior_map_sha256=package_manifest["package_sha256"],
+        replay_parameters=normalized_replay_parameters,
     )
     input_identity_id = local_input_record["input_identity_id"]
     session_input_manifest = {
@@ -3963,6 +4052,7 @@ def process_localized_session(
             session_input_manifest=session_input_manifest,
             input_identity_id=input_identity_id,
             local_input_record=local_input_record,
+            replay_parameters=normalized_replay_parameters,
             manual_edits=manual_edits,
             progress=progress,
         )

@@ -233,6 +233,7 @@ class LocalizedVersionStoreTests(unittest.TestCase):
                 "bundle_sha256": self.identity_hashes[
                     "session_input_bundle_sha256"
                 ],
+                "input_identity_id": self.input_identity_id,
                 "files": self.session_input_files,
             },
             "online_localization_trace.json": [],
@@ -415,6 +416,45 @@ class LocalizedVersionStoreTests(unittest.TestCase):
         report.write_text('{"publish_state":"review"}\n', encoding="utf-8")
         with self.assertRaisesRegex(LocalizedStoreError, "integrity mismatch"):
             self.store.current()
+
+    def test_verified_json_rejects_change_after_snapshot_resolution(self) -> None:
+        snapshot = self.commit_valid()
+        report = snapshot.version_dir / "localization_report.json"
+        report.write_text('{"publish_state":"review"}\n', encoding="utf-8")
+        with mock.patch.object(
+            self.store, "resolve_version", return_value=snapshot
+        ):
+            with self.assertRaisesRegex(
+                LocalizedStoreError, "changed during verified read"
+            ):
+                self.store.read_verified_json(snapshot, "localization_report.json")
+
+    def test_verified_read_parses_bytes_from_the_open_descriptor(self) -> None:
+        snapshot = self.commit_valid()
+        report = snapshot.version_dir / "localization_report.json"
+        replacement = snapshot.version_dir / ".replacement-report.json"
+        replacement.write_text('{"publish_state":"review"}\n', encoding="utf-8")
+        real_fdopen = localized_store.os.fdopen
+        opened = 0
+
+        def replace_path_after_open(descriptor: int, *args: object, **kwargs: object):
+            nonlocal opened
+            opened += 1
+            if opened == 2:
+                localized_store.os.replace(replacement, report)
+            return real_fdopen(descriptor, *args, **kwargs)
+
+        with (
+            mock.patch.object(self.store, "resolve_version", return_value=snapshot),
+            mock.patch.object(
+                localized_store.os, "fdopen", side_effect=replace_path_after_open
+            ),
+        ):
+            payload = self.store.read_verified_json(
+                snapshot, "localization_report.json"
+            )
+        self.assertEqual(payload["format"], "MarketScannerLocalizationReport")
+        self.assertEqual(json.loads(report.read_text())["publish_state"], "review")
 
     def test_local_input_tampering_fails_closed_without_changing_current(self) -> None:
         snapshot = self.commit_valid()

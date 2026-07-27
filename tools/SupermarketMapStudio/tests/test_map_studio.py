@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import math
 import shutil
 import sqlite3
@@ -37,26 +38,90 @@ def create_localized_store(
     store = server.LocalizedVersionStore(output)
     previous = store.current()
     staging = store.begin()
-    if source_manifest:
-        store.write_local_state(
-            {
-                "prior_map": str(source_manifest.get("prior_map") or output),
-                "source_session": str(source_manifest.get("source_session") or output),
-                "source_database": str(source_manifest.get("source_database") or output),
-                "optimized_database": str(source_manifest.get("optimized_database") or output),
-            }
+    source_manifest = dict(source_manifest or {})
+    replay_parameters = server.localized.normalize_replay_parameters()
+    processing_hash = server.localized.processing_parameter_sha256(replay_parameters)
+    source_hash = str(source_manifest.get("source_database_sha256_before") or "b" * 64)
+    optimized_path = Path(source_manifest.get("optimized_database") or output)
+    optimized_hash = (
+        server.localized._sha256(optimized_path)
+        if optimized_path.is_file()
+        else str(source_manifest.get("optimized_database_sha256") or "c" * 64)
+    )
+    prior_hash = str((journal or {}).get("prior_map_sha256") or "a" * 64)
+    session_files = [
+        {
+            "role": role,
+            "file": file_name,
+            "bytes": 0,
+            "sha256": source_hash if role == "source_database" else "f" * 64,
+        }
+        for role, file_name in (
+            ("metadata", "metadata.json"),
+            ("source_database", "source.db"),
+            ("localization_trace.jsonl", "localization_trace.jsonl"),
+            ("localization_constraints.jsonl", "localization_constraints.jsonl"),
+            ("localization_events.jsonl", "localization_events.jsonl"),
+            ("manual_localization_events.jsonl", "manual_localization_events.jsonl"),
+            ("tag_observations.jsonl", "tag_observations.jsonl"),
+            ("localized_price_tags.json", "localized_price_tags.json"),
         )
+    ]
+    bundle_body = {
+        "format": "MarketScannerLocalizedInputManifest",
+        "version": 1,
+        "source_database_sha256": source_hash,
+        "files": session_files,
+    }
+    bundle_hash = hashlib.sha256(
+        json.dumps(bundle_body, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    identities = {
+        "session_input_bundle_sha256": bundle_hash,
+        "source_database_sha256": source_hash,
+        "optimized_database_sha256": optimized_hash,
+        "prior_map_sha256": prior_hash,
+        "processing_parameter_sha256": processing_hash,
+    }
+    local_record = {
+        "format": "MarketScannerLocalizedLocalInputs",
+        "version": 1,
+        "paths": {
+            "prior_map": str(source_manifest.get("prior_map") or output),
+            "source_session": str(source_manifest.get("source_session") or output),
+            "source_database": str(source_manifest.get("source_database") or output),
+            "optimized_database": str(source_manifest.get("optimized_database") or output),
+        },
+        "identities": identities,
+    }
+    local_record["input_identity_id"] = hashlib.sha256(
+        json.dumps(local_record, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    input_identity_id = local_record["input_identity_id"]
     payloads = {
         "prior_map_manifest.json": {
             "format": "MarketScannerPriorMap", "version": 1
         },
         "source_manifest.json": {
-            "format": "MarketScannerLocalizedSourceManifest", "version": 1,
-            **(source_manifest or {}),
+            "format": "MarketScannerLocalizedSourceManifest", "version": 2,
+            **source_manifest,
+            "input_identity_id": input_identity_id,
+            "session_input_bundle_sha256": bundle_hash,
+            "source_database_sha256_before": source_hash,
+            "optimized_database_sha256": optimized_hash,
+            "prior_map_sha256": prior_hash,
         },
         "processing_manifest.json": {
-            "format": "MarketScannerLocalizedProcessing", "version": 1,
-            "publish_state": (report or {}).get("publish_state", "draft")
+            "format": "MarketScannerLocalizedProcessing", "version": 2,
+            "publish_state": (report or {}).get("publish_state", "draft"),
+            "input_identity_id": input_identity_id,
+            **identities,
+            "replay_parameters": replay_parameters,
+        },
+        "session_input_manifest.json": {
+            **bundle_body,
+            "bundle_sha256": bundle_hash,
+            "input_identity_id": input_identity_id,
         },
         "online_localization_trace.json": [],
         "optimized_map_trajectory.geojson": {"type": "FeatureCollection", "features": []},
@@ -76,8 +141,10 @@ def create_localized_store(
             "format": "MarketScannerLocalizedReview", "version": 1,
         },
         "manual_edits.json": {
-            "format": "MarketScannerManualEdits", "version": 3,
+            "format": "MarketScannerManualEdits", "version": 4,
             **(journal or {"revision": revision, "events": [], "cursor": 0}),
+            "input_identity_id": input_identity_id,
+            **identities,
         },
         "localized_price_tags.json": [],
         "localized_price_tags.geojson": {"type": "FeatureCollection", "features": []},
@@ -95,7 +162,12 @@ def create_localized_store(
     manifest = store.validate_staging(
         staging, parent_version=previous.version_id if previous else None
     )
-    return store.commit(staging, manifest, update_current=True)
+    return store.commit(
+        staging,
+        manifest,
+        update_current=True,
+        local_input_record=local_record,
+    )
 
 
 def transform_blob(x: float, y: float, z: float) -> bytes:
@@ -468,6 +540,9 @@ class MapStudioApiTests(unittest.TestCase):
         source_database = self.session_a / "segment_0001" / "rtabmap_segment_0001.db"
         prior_map = self.root / "PriorMap-placeholder"
         prior_map.mkdir()
+        (prior_map / "package_manifest.json").write_text(
+            json.dumps({"package_sha256": "a" * 64}), encoding="utf-8"
+        )
         source_manifest = {
             "prior_map": str(prior_map),
             "source_session": str(self.session_a),
@@ -482,6 +557,9 @@ class MapStudioApiTests(unittest.TestCase):
         )
         first = create_localized_store(
             output, source_manifest=source_manifest, journal=journal
+        )
+        session_input = server.LocalizedVersionStore(output).read_verified_json(
+            first, "session_input_manifest.json"
         )
         (output / "map.json").write_text(
             json.dumps({"parameters": {}}), encoding="utf-8"
@@ -527,6 +605,18 @@ class MapStudioApiTests(unittest.TestCase):
                         }
                     },
                 ),
+            ),
+            mock.patch.object(
+                server, "validate_prior_map_package", return_value={"valid": True}
+            ),
+            mock.patch.object(
+                server.localized,
+                "build_session_input_manifest",
+                return_value={
+                    key: value
+                    for key, value in session_input.items()
+                    if key != "input_identity_id"
+                },
             ),
             mock.patch.object(server.base, "discover_segments", return_value=[segment]),
             mock.patch.object(
@@ -575,6 +665,9 @@ class MapStudioApiTests(unittest.TestCase):
         source_database = self.session_a / "segment_0001" / "rtabmap_segment_0001.db"
         prior_map = self.root / "PriorMap-replay-failure"
         prior_map.mkdir()
+        (prior_map / "package_manifest.json").write_text(
+            json.dumps({"package_sha256": "a" * 64}), encoding="utf-8"
+        )
         source_manifest = {
             "prior_map": str(prior_map),
             "source_session": str(self.session_a),
@@ -590,6 +683,9 @@ class MapStudioApiTests(unittest.TestCase):
         first = create_localized_store(
             output, source_manifest=source_manifest, journal=journal
         )
+        session_input = server.LocalizedVersionStore(output).read_verified_json(
+            first, "session_input_manifest.json"
+        )
         (output / "map.json").write_text("{}\n", encoding="utf-8")
         job = server.STATE.add("localized", output)
         server.STATE.set_status(job.identifier, "complete")
@@ -601,6 +697,18 @@ class MapStudioApiTests(unittest.TestCase):
                 server,
                 "_manual_edit_context",
                 return_value=([], [], [], {"bounds": {}}),
+            ),
+            mock.patch.object(
+                server, "validate_prior_map_package", return_value={"valid": True}
+            ),
+            mock.patch.object(
+                server.localized,
+                "build_session_input_manifest",
+                return_value={
+                    key: value
+                    for key, value in session_input.items()
+                    if key != "input_identity_id"
+                },
             ),
             mock.patch.object(server.base, "discover_segments", return_value=[segment]),
             mock.patch.object(

@@ -1327,6 +1327,16 @@ def run_localized_map(
         output=output,
         manual_edits=manual_edits,
         progress=progress,
+        replay_parameters={
+            "resolution": config.resolution,
+            "preview_resolution": config.preview_resolution,
+            "trajectory_radius": config.trajectory_radius,
+            "tag_snap_distance": config.tag_snap_distance,
+            "occupied_inflate_radius": config.occupied_inflate_radius,
+            "free_ray_max_range": config.free_ray_max_range,
+            "horizontal_axes": config.horizontal_axes,
+            "auto_align_segments": config.auto_align_segments,
+        },
     )
     if not localized_result.get("current_updated"):
         raise RequestError(
@@ -1335,12 +1345,8 @@ def run_localized_map(
 
 
 def _manual_edit_context(
-    current_dir: Path, prior_map: Path
+    tags: Any, constraints_payload: Any, prior_map: Path
 ) -> tuple[list[Dict[str, Any]], list[Dict[str, Any]], list[Dict[str, Any]], Dict[str, Any]]:
-    tags = load_json(current_dir / "localized_price_tags.json", None)
-    constraints_payload = load_json(
-        current_dir / "localization_constraints.json", None
-    )
     elements_payload = load_json(prior_map / "elements.json", None)
     manifest = load_json(prior_map / "manifest.json", None)
     constraints = (
@@ -1545,9 +1551,38 @@ def apply_localized_edit(job: Job, data: Dict[str, Any]) -> Dict[str, Any]:
         current = store.current()
         if current is None:
             raise RequestError("结果缺少已验证的 current 本地化版本。")
-        journal = load_json(current.version_dir / "manual_edits.json", None)
-        if not isinstance(journal, dict):
-            raise RequestError("结果缺少有效的 manual_edits.json。")
+        try:
+            verified_bytes = store.read_verified_artifacts(
+                current,
+                (
+                    "manual_edits.json",
+                    "source_manifest.json",
+                    "processing_manifest.json",
+                    "session_input_manifest.json",
+                    "localized_price_tags.json",
+                    "localization_constraints.json",
+                ),
+            )
+            verified = {
+                name: json.loads(content)
+                for name, content in verified_bytes.items()
+            }
+            local_state = store.local_inputs_for(current)
+        except (LocalizedStoreError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise RequestError(
+                "当前版本或本机输入记录无法通过完整性验证，不能安全重放。"
+            ) from exc
+        journal = verified["manual_edits.json"]
+        source = verified["source_manifest.json"]
+        processing = verified["processing_manifest.json"]
+        session_input = verified["session_input_manifest.json"]
+        tags_payload = verified["localized_price_tags.json"]
+        constraints_payload = verified["localization_constraints.json"]
+        if not all(
+            isinstance(item, dict)
+            for item in (journal, source, processing, session_input)
+        ):
+            raise RequestError("当前版本缺少有效的重放身份文件。")
         if "expected_revision" not in data or "expected_version_id" not in data:
             raise RequestError(
                 "人工编辑必须提供 expected_revision 和 expected_version_id。"
@@ -1574,26 +1609,77 @@ def apply_localized_edit(job: Job, data: Dict[str, Any]) -> Dict[str, Any]:
                 revision=current.revision,
             )
 
-        source = load_json(current.version_dir / "source_manifest.json", None)
-        try:
-            local_state = store.local_state()
-        except LocalizedStoreError as exc:
-            raise RequestError(
-                "结果缺少有效的本机路径状态，无法安全重放。"
-            ) from exc
-        map_payload = load_json(job.output_dir / "map.json", {})
-        if not isinstance(source, dict):
-            raise RequestError("结果缺少 source_manifest.json，无法安全重放。")
-        prior_map = resolve_path(local_state.get("prior_map"), "Prior-map package")
-        session = require_session(local_state.get("source_session"))
+        paths = local_state.get("paths")
+        identities = local_state.get("identities")
+        if not isinstance(paths, dict) or not isinstance(identities, dict):
+            raise RequestError("本机输入记录缺少路径或身份摘要。")
+        prior_map = resolve_path(paths.get("prior_map"), "Prior-map package")
+        session = require_session(paths.get("source_session"))
         source_database = resolve_path(
-            local_state.get("source_database"), "Source database"
+            paths.get("source_database"), "Source database"
         )
         optimized_database = resolve_path(
-            local_state.get("optimized_database"), "Optimized database"
+            paths.get("optimized_database"), "Optimized database"
         )
+        if not source_database.is_file() or not optimized_database.is_file():
+            raise RequestError("源数据库或优化数据库不存在，无法重放人工编辑。")
+        validation = validate_prior_map_package(prior_map)
+        if not validation["valid"]:
+            raise RequestError("先验地图已变化或损坏，无法安全重放。")
+        package_manifest = load_json(prior_map / "package_manifest.json", None)
+        segment_dirs = sorted(
+            path for path in session.glob("segment_*") if path.is_dir()
+        )
+        if len(segment_dirs) != 1:
+            raise RequestError("重放要求唯一的连续扫描 segment。")
+        try:
+            replay_parameters = localized.normalize_replay_parameters(
+                processing.get("replay_parameters")
+            )
+            processing_hash = localized.processing_parameter_sha256(
+                replay_parameters
+            )
+            verified_bundle = localized.session_input_bundle_sha256(session_input)
+            actual_session_input = localized.build_session_input_manifest(
+                segment_dirs[0], source_database
+            )
+        except localized.OfflineLocalizationError as exc:
+            raise RequestError("重放参数或 finalized 输入清单无效。") from exc
+        actual_hashes = {
+            "session_input_bundle_sha256": actual_session_input["bundle_sha256"],
+            "source_database_sha256": localized._sha256(source_database),
+            "optimized_database_sha256": localized._sha256(optimized_database),
+            "prior_map_sha256": (
+                package_manifest.get("package_sha256")
+                if isinstance(package_manifest, dict)
+                else None
+            ),
+            "processing_parameter_sha256": processing_hash,
+        }
+        if (
+            verified_bundle != actual_session_input["bundle_sha256"]
+            or session_input.get("files") != actual_session_input["files"]
+            or any(identities.get(name) != value for name, value in actual_hashes.items())
+            or source.get("session_input_bundle_sha256") != verified_bundle
+            or processing.get("session_input_bundle_sha256") != verified_bundle
+            or journal.get("session_input_bundle_sha256") != verified_bundle
+            or source.get("input_identity_id") != current.input_identity_id
+            or processing.get("input_identity_id") != current.input_identity_id
+            or journal.get("input_identity_id") != current.input_identity_id
+            or session_input.get("input_identity_id") != current.input_identity_id
+            or source.get("source_database_sha256_before")
+            != actual_hashes["source_database_sha256"]
+            or source.get("optimized_database_sha256")
+            != actual_hashes["optimized_database_sha256"]
+            or source.get("prior_map_sha256") != actual_hashes["prior_map_sha256"]
+            or processing.get("processing_parameter_sha256") != processing_hash
+            or journal.get("processing_parameter_sha256") != processing_hash
+        ):
+            raise RequestError(
+                "重放输入、参数或版本身份已变化；旧 current 保持不变。"
+            )
         tags, constraints, elements, manifest = _manual_edit_context(
-            current.version_dir, prior_map
+            tags_payload, constraints_payload, prior_map
         )
 
         action = str(data.get("action") or "append")
@@ -1629,24 +1715,15 @@ def apply_localized_edit(job: Job, data: Dict[str, Any]) -> Dict[str, Any]:
         )
         journal["revision"] = current.revision + 1
 
-        if not source_database.is_file() or not optimized_database.is_file():
-            raise RequestError("源数据库或优化数据库不存在，无法重放人工编辑。")
-        # Verify source database has not changed since last processing.
-        source_hash_now = localized._sha256(source_database)
-        if source_hash_now != source.get("source_database_sha256_before"):
-            raise RequestError(
-                "源数据库已被修改，无法基于原结果继续人工复核。请重新处理。"
-            )
-        parameters = map_payload.get("parameters", {}) if isinstance(map_payload, dict) else {}
         config = base.MapConfig(
-            float(parameters.get("resolution", 0.05)),
-            float(parameters.get("preview_resolution", 0.1)),
-            float(parameters.get("trajectory_radius", 1.25)),
-            float(parameters.get("tag_snap_distance", 1.0)),
-            float(parameters.get("occupied_inflate_radius", 0.08)),
-            float(parameters.get("free_ray_max_range", 8.0)),
-            str(parameters.get("horizontal_axes", "xz")),
-            False,
+            replay_parameters["resolution"],
+            replay_parameters["preview_resolution"],
+            replay_parameters["trajectory_radius"],
+            replay_parameters["tag_snap_distance"],
+            replay_parameters["occupied_inflate_radius"],
+            replay_parameters["free_ray_max_range"],
+            replay_parameters["horizontal_axes"],
+            replay_parameters["auto_align_segments"],
         )
         segments = base.discover_segments(session, config, {1: optimized_database})
         if len(segments) != 1:
@@ -1671,6 +1748,7 @@ def apply_localized_edit(job: Job, data: Dict[str, Any]) -> Dict[str, Any]:
                 output=job.output_dir,
                 manual_edits=journal,
                 expected_parent_version=current.version_id,
+                replay_parameters=replay_parameters,
             )
         except localized.OfflineLocalizationError as exc:
             if "current version changed during replay" in str(exc):
@@ -1738,9 +1816,14 @@ def apply_localized_state_transition(
         reason = data.get("reason")
         if not isinstance(reason, str) or not reason.strip() or len(reason) > 500:
             raise RequestError("状态操作必须提供 1 到 500 字符的审核说明。")
-        report = load_json(
-            source_snapshot.version_dir / "localization_report.json", None
-        )
+        try:
+            report = store.read_verified_json(
+                source_snapshot, "localization_report.json"
+            )
+        except LocalizedStoreError as exc:
+            raise RequestError(
+                "当前版本的 localization_report.json 无法通过完整性验证。"
+            ) from exc
         if not isinstance(report, dict):
             raise RequestError("当前版本缺少有效的 localization_report.json。")
         if action == "submit_review":

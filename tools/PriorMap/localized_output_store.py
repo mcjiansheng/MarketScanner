@@ -605,6 +605,7 @@ class LocalizedVersionStore:
         if processing.get("publish_state") != state:
             raise LocalizedStoreError("Localized report and processing state differ.")
         identity_values = {
+            session_input.get("input_identity_id"),
             source.get("input_identity_id"),
             processing.get("input_identity_id"),
             journal.get("input_identity_id"),
@@ -852,17 +853,16 @@ class LocalizedVersionStore:
                 raise LocalizedStoreError(
                     "An active published version already exists; revoke it before publishing again."
                 )
-            report = json.loads(
-                self.read_verified_artifact(
-                    current.version_id, "localization_report.json"
-                ).decode("utf-8"),
-                parse_constant=_reject_nonfinite,
+            report = self.read_verified_json(
+                current, "localization_report.json"
             )
             if not isinstance(field_acceptance, dict):
                 raise LocalizedStoreError("Field acceptance record is invalid.")
-            expected_evidence = _sha256(
-                current.version_dir / "localized_review.json"
-            )
+            expected_evidence = hashlib.sha256(
+                self.read_verified_artifacts(
+                    current, ("localized_review.json",)
+                )["localized_review.json"]
+            ).hexdigest()
             if field_acceptance.get("evidence_sha256") != expected_evidence:
                 raise LocalizedStoreError(
                     "Field acceptance evidence does not match localized_review.json."
@@ -911,8 +911,11 @@ class LocalizedVersionStore:
         if self._lock_handle is None:
             raise LocalizedStoreError("Localized transition requires the write lock.")
         try:
-            for name in REQUIRED_VERSION_FILES:
-                shutil.copy2(source.version_dir / name, staging / name)
+            source_artifacts = self.read_verified_artifacts(
+                source, REQUIRED_VERSION_FILES
+            )
+            for name, content in source_artifacts.items():
+                (staging / name).write_bytes(content)
             now = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
             for name in ("localization_report.json", "processing_manifest.json"):
                 path = staging / name
@@ -1011,20 +1014,22 @@ class LocalizedVersionStore:
 
     def _validate_publishable_snapshot(self, snapshot: LocalizedSnapshot) -> None:
         try:
+            artifacts = self.read_verified_artifacts(
+                snapshot,
+                ("localization_report.json", "localized_review.json"),
+            )
             report = json.loads(
-                (snapshot.version_dir / "localization_report.json").read_text(
-                    encoding="utf-8"
-                ),
+                artifacts["localization_report.json"].decode("utf-8"),
                 parse_constant=_reject_nonfinite,
             )
-        except (OSError, ValueError, json.JSONDecodeError) as exc:
+        except (LocalizedStoreError, UnicodeDecodeError, ValueError, json.JSONDecodeError) as exc:
             raise LocalizedStoreError("Published localization report is invalid.") from exc
         acceptance = report.get("field_acceptance") if isinstance(report, dict) else None
         if not isinstance(report, dict) or not isinstance(acceptance, dict):
             raise LocalizedStoreError("Published output has no field acceptance record.")
-        if acceptance.get("evidence_sha256") != _sha256(
-            snapshot.version_dir / "localized_review.json"
-        ):
+        if acceptance.get("evidence_sha256") != hashlib.sha256(
+            artifacts["localized_review.json"]
+        ).hexdigest():
             raise LocalizedStoreError(
                 "Published field acceptance evidence no longer matches the review artifact."
             )
@@ -1063,29 +1068,59 @@ class LocalizedVersionStore:
             self._validate_publishable_snapshot(snapshot)
         return snapshot
 
-    def read_verified_artifact(self, version_id: str, name: str) -> bytes:
-        """Read one immutable artifact and verify the bytes from the open fd."""
-        if name not in REQUIRED_VERSION_FILES:
-            raise LocalizedStoreError(f"Localized artifact name is invalid: {name}")
-        snapshot = self.resolve_version(version_id)
+    def read_verified_artifacts(
+        self,
+        snapshot: LocalizedSnapshot,
+        names: Iterable[str],
+    ) -> dict[str, bytes]:
+        """Read a snapshot-bound artifact batch from the descriptors hashed."""
+
+        requested = tuple(names)
+        if not requested or len(set(requested)) != len(requested):
+            raise LocalizedStoreError("Localized artifact batch is invalid.")
+        if any(name not in REQUIRED_VERSION_FILES for name in requested):
+            raise LocalizedStoreError("Localized artifact name is invalid.")
+        verified = self.resolve_version(snapshot.version_id)
+        if verified != snapshot:
+            raise LocalizedStoreError("Localized snapshot changed before verified read.")
         flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
         try:
             manifest_fd = os.open(snapshot.version_dir / "version_manifest.json", flags)
             with os.fdopen(manifest_fd, "rb") as handle:
+                manifest_stat = os.fstat(handle.fileno())
                 manifest_bytes = handle.read()
+            if not stat.S_ISREG(manifest_stat.st_mode):
+                raise LocalizedStoreError(
+                    "Localized version manifest is not a regular file."
+                )
             if hashlib.sha256(manifest_bytes).hexdigest() != snapshot.manifest_sha256:
                 raise LocalizedStoreError("Localized version manifest changed during read.")
             manifest = json.loads(
                 manifest_bytes.decode("utf-8"), parse_constant=_reject_nonfinite
             )
-            entry = next(
-                item for item in manifest["files"] if item.get("file") == name
-            )
-            artifact_fd = os.open(snapshot.version_dir / name, flags)
-            with os.fdopen(artifact_fd, "rb") as handle:
-                artifact_stat = os.fstat(handle.fileno())
-                content = handle.read()
-            expected_bytes = int(entry["bytes"])
+            by_name = {
+                item["file"]: item
+                for item in manifest["files"]
+                if isinstance(item, dict) and isinstance(item.get("file"), str)
+            }
+            contents: dict[str, bytes] = {}
+            for name in requested:
+                entry = by_name[name]
+                artifact_fd = os.open(snapshot.version_dir / name, flags)
+                with os.fdopen(artifact_fd, "rb") as handle:
+                    artifact_stat = os.fstat(handle.fileno())
+                    content = handle.read()
+                expected_bytes = int(entry["bytes"])
+                if (
+                    not stat.S_ISREG(artifact_stat.st_mode)
+                    or isinstance(entry.get("bytes"), bool)
+                    or len(content) != expected_bytes
+                    or hashlib.sha256(content).hexdigest() != entry.get("sha256")
+                ):
+                    raise LocalizedStoreError(
+                        f"Localized artifact changed during verified read: {name}"
+                    )
+                contents[name] = content
         except LocalizedStoreError:
             raise
         except (
@@ -1093,23 +1128,39 @@ class LocalizedVersionStore:
             UnicodeDecodeError,
             json.JSONDecodeError,
             KeyError,
-            StopIteration,
             TypeError,
             ValueError,
         ) as exc:
-            raise LocalizedStoreError(
-                f"Localized artifact could not be read safely: {name}"
-            ) from exc
-        if (
-            not stat.S_ISREG(artifact_stat.st_mode)
-            or isinstance(entry.get("bytes"), bool)
-            or len(content) != expected_bytes
-            or hashlib.sha256(content).hexdigest() != entry.get("sha256")
-        ):
-            raise LocalizedStoreError(
-                f"Localized artifact changed during verified read: {name}"
+            raise LocalizedStoreError("Localized artifact batch could not be read safely.") from exc
+        return contents
+
+    def read_verified_artifact(self, version_id: str, name: str) -> bytes:
+        """Compatibility wrapper for one verified immutable artifact."""
+
+        snapshot = self.resolve_version(version_id)
+        return self.read_verified_artifacts(snapshot, (name,))[name]
+
+    def read_verified_json(
+        self,
+        snapshot: LocalizedSnapshot,
+        name: str,
+        *,
+        expected_type: type = dict,
+    ) -> Any:
+        content = self.read_verified_artifacts(snapshot, (name,))[name]
+        try:
+            payload = json.loads(
+                content.decode("utf-8"), parse_constant=_reject_nonfinite
             )
-        return content
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+            raise LocalizedStoreError(
+                f"Localized JSON artifact is invalid: {name}"
+            ) from exc
+        if not isinstance(payload, expected_type):
+            raise LocalizedStoreError(
+                f"Localized JSON artifact has the wrong type: {name}"
+            )
+        return payload
 
     def resolve_version(self, version_id: str) -> LocalizedSnapshot:
         if re.fullmatch(r"v[0-9]{6}", version_id) is None:

@@ -28,6 +28,7 @@ from tools.PriorMap.offline_localization import (
     new_manual_edits,
     optimize_trajectory,
     processing_parameter_sha256,
+    _legacy_processing_parameter_sha256_v3,
     process_localized_session,
     session_input_bundle_sha256,
     upgrade_manual_edits_v2,
@@ -1132,7 +1133,11 @@ class LocalizedPipelineTests(unittest.TestCase):
                     "source_session_sha256": source_sha,
                     "source_database_sha256": source_sha,
                     "optimized_database_sha256": optimized_sha,
-                    "processing_parameter_sha256": processing_parameter_sha256(),
+                    "processing_parameter_sha256": (
+                        _legacy_processing_parameter_sha256_v3()
+                        if version == 3
+                        else processing_parameter_sha256()
+                    ),
                     "cursor": 0,
                     "events": [],
                     "audit_events": [],
