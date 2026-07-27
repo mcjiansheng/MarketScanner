@@ -4,9 +4,11 @@ import hashlib
 import json
 import sqlite3
 import math
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from tools.PriorMap.offline_localization import (
     Pose,
@@ -17,6 +19,7 @@ from tools.PriorMap.offline_localization import (
     bind_tag_observation_to_pose,
     bind_manual_localization_event_to_pose,
     append_manual_edit,
+    build_session_input_manifest,
     build_road_soft_constraints,
     build_manual_aisle_constraints,
     infer_aisle_switch_sequence,
@@ -24,7 +27,10 @@ from tools.PriorMap.offline_localization import (
     move_manual_edit_cursor,
     new_manual_edits,
     optimize_trajectory,
+    processing_parameter_sha256,
     process_localized_session,
+    session_input_bundle_sha256,
+    upgrade_manual_edits_v2,
     AbsoluteConstraint,
 )
 from tools.PriorMap.localized_output_store import LocalizedVersionStore
@@ -791,6 +797,7 @@ class LocalizedPipelineTests(unittest.TestCase):
         ]
         jsonl_write(self.segment / "localization_trace.jsonl", trace)
         jsonl_write(self.segment / "localization_constraints.jsonl", constraints)
+        jsonl_write(self.segment / "manual_localization_events.jsonl", [])
         jsonl_write(
             self.segment / "localization_events.jsonl",
             [
@@ -902,6 +909,7 @@ class LocalizedPipelineTests(unittest.TestCase):
         assert first_version is not None
         assert second_version is not None
         for name in (
+            "session_input_manifest.json",
             "processing_manifest.json",
             "optimized_map_trajectory.geojson",
             "localization_report.json",
@@ -943,7 +951,41 @@ class LocalizedPipelineTests(unittest.TestCase):
             first_version.version_dir / "source_manifest.json"
         ).read_text()
         self.assertNotIn(str(self.root), source_manifest_text)
-        local_state = LocalizedVersionStore(first_output).local_state()
+        session_input = json.loads(
+            (first_version.version_dir / "session_input_manifest.json").read_text()
+        )
+        source_manifest = json.loads(source_manifest_text)
+        processing_manifest = json.loads(
+            (first_version.version_dir / "processing_manifest.json").read_text()
+        )
+        manual_edits = json.loads(
+            (first_version.version_dir / "manual_edits.json").read_text()
+        )
+        self.assertEqual(session_input_bundle_sha256(session_input), session_input["bundle_sha256"])
+        self.assertEqual(source_manifest["version"], 2)
+        self.assertEqual(processing_manifest["version"], 2)
+        self.assertEqual(manual_edits["version"], 4)
+        self.assertEqual(
+            {
+                session_input["bundle_sha256"],
+                source_manifest["session_input_bundle_sha256"],
+                processing_manifest["session_input_bundle_sha256"],
+                manual_edits["session_input_bundle_sha256"],
+            },
+            {session_input["bundle_sha256"]},
+        )
+        self.assertEqual(
+            {
+                session_input["input_identity_id"],
+                source_manifest["input_identity_id"],
+                processing_manifest["input_identity_id"],
+                manual_edits["input_identity_id"],
+            },
+            {first_version.input_identity_id},
+        )
+        local_state = LocalizedVersionStore(first_output).local_inputs_for(
+            first_version
+        )["paths"]
         self.assertEqual(
             Path(local_state["source_database"]), self.source_database.resolve()
         )
@@ -956,6 +998,172 @@ class LocalizedPipelineTests(unittest.TestCase):
             tag["transform_audit"]["source_position_field"],
             "tag.raw_map_position",
         )
+
+    def test_session_input_manifest_is_deterministic_and_binds_every_required_file(self) -> None:
+        first = build_session_input_manifest(self.segment, self.source_database)
+        second = build_session_input_manifest(self.segment, self.source_database)
+        self.assertEqual(first, second)
+        self.assertEqual(
+            [entry["role"] for entry in first["files"]],
+            [
+                "metadata",
+                "source_database",
+                "localization_trace.jsonl",
+                "localization_constraints.jsonl",
+                "localization_events.jsonl",
+                "manual_localization_events.jsonl",
+                "tag_observations.jsonl",
+                "localized_price_tags.json",
+            ],
+        )
+        self.assertEqual(first["source_database_sha256"], first["files"][1]["sha256"])
+        self.assertEqual(session_input_bundle_sha256(first), first["bundle_sha256"])
+
+        paths = [self.segment / "metadata.json", self.source_database] + [
+            self.segment / name
+            for name in (
+                "localization_trace.jsonl",
+                "localization_constraints.jsonl",
+                "localization_events.jsonl",
+                "manual_localization_events.jsonl",
+                "tag_observations.jsonl",
+                "localized_price_tags.json",
+            )
+        ]
+        for path in paths:
+            with self.subTest(path=path.name):
+                original = path.read_bytes()
+                path.write_bytes(original + b" ")
+                changed = build_session_input_manifest(self.segment, self.source_database)
+                self.assertNotEqual(changed["bundle_sha256"], first["bundle_sha256"])
+                path.write_bytes(original)
+
+    def test_session_input_manifest_rejects_symlink_and_inflight_change(self) -> None:
+        events = self.segment / "localization_events.jsonl"
+        original = events.read_bytes()
+        target = self.root / "events-target.jsonl"
+        target.write_bytes(original)
+        events.unlink()
+        events.symlink_to(target)
+        with self.assertRaisesRegex(OfflineLocalizationError, "regular file"):
+            build_session_input_manifest(self.segment, self.source_database)
+        events.unlink()
+        events.write_bytes(original)
+
+        real_builder = build_session_input_manifest
+        calls = 0
+
+        def mutate_before_final_check(segment: Path, database: Path) -> dict:
+            nonlocal calls
+            calls += 1
+            if calls == 3:
+                trace = segment / "localization_trace.jsonl"
+                trace.write_bytes(trace.read_bytes() + b"\n")
+            return real_builder(segment, database)
+
+        output = self.root / "localized-input-changed-during-render"
+        with (
+            mock.patch(
+                "tools.PriorMap.offline_localization.build_session_input_manifest",
+                side_effect=mutate_before_final_check,
+            ),
+            self.assertRaisesRegex(OfflineLocalizationError, "changed during"),
+        ):
+            process_localized_session(
+                self.prior_map,
+                self.session,
+                self.poses,
+                self.source_database,
+                self.optimized_database,
+                output,
+            )
+        self.assertIsNone(LocalizedVersionStore(output).current())
+
+    def test_output_root_rejects_a_different_session_identity(self) -> None:
+        output = self.root / "localized-bound-output"
+        process_localized_session(
+            self.prior_map,
+            self.session,
+            self.poses,
+            self.source_database,
+            self.optimized_database,
+            output,
+        )
+        store = LocalizedVersionStore(output)
+        original = store.current()
+        self.assertIsNotNone(original)
+        assert original is not None
+        original_local_inputs = store.local_inputs_for(original)
+
+        copied_session = self.root / "second-session"
+        shutil.copytree(self.session, copied_session)
+        copied_database = (
+            copied_session / "segment_0001" / self.source_database.name
+        )
+        with self.assertRaisesRegex(
+            OfflineLocalizationError, "different session input identity"
+        ):
+            process_localized_session(
+                self.prior_map,
+                copied_session,
+                self.poses,
+                copied_database,
+                self.optimized_database,
+                output,
+            )
+        self.assertEqual(store.current(), original)
+        self.assertEqual(store.local_inputs_for(original), original_local_inputs)
+
+    def test_manual_journal_v2_v3_migration_requires_verified_bundle(self) -> None:
+        session_input = build_session_input_manifest(self.segment, self.source_database)
+        package_manifest = json.loads(
+            (self.prior_map / "package_manifest.json").read_text()
+        )
+        source_sha = session_input["source_database_sha256"]
+        optimized_sha = hashlib.sha256(self.optimized_database.read_bytes()).hexdigest()
+        identity_id = "d" * 64
+        for version in (2, 3):
+            with self.subTest(version=version):
+                journal = {
+                    "format": "MarketScannerManualEdits",
+                    "version": version,
+                    "revision": 2,
+                    "prior_map_sha256": package_manifest["package_sha256"],
+                    "source_session_sha256": source_sha,
+                    "source_database_sha256": source_sha,
+                    "optimized_database_sha256": optimized_sha,
+                    "processing_parameter_sha256": processing_parameter_sha256(),
+                    "cursor": 0,
+                    "events": [],
+                    "audit_events": [],
+                }
+                with self.assertRaisesRegex(OfflineLocalizationError, "verified input bundle"):
+                    upgrade_manual_edits_v2(
+                        journal,
+                        package_manifest["package_sha256"],
+                        source_sha,
+                        optimized_sha,
+                        "",
+                        identity_id,
+                    )
+                upgraded = upgrade_manual_edits_v2(
+                    journal,
+                    package_manifest["package_sha256"],
+                    source_sha,
+                    optimized_sha,
+                    session_input["bundle_sha256"],
+                    identity_id,
+                )
+                self.assertEqual(upgraded["version"], 4)
+                self.assertEqual(
+                    upgraded["session_input_bundle_sha256"],
+                    session_input["bundle_sha256"],
+                )
+                self.assertEqual(upgraded["input_identity_id"], identity_id)
+                self.assertEqual(
+                    upgraded["audit_events"][-1]["event_id"],
+                    f"migration-v{version}-to-v4",
+                )
 
     def test_missing_tag_observation_never_defaults_to_node_zero(self) -> None:
         jsonl_write(self.segment / "tag_observations.jsonl", [])

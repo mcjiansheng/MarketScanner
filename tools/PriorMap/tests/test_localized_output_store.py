@@ -5,7 +5,6 @@ import csv
 import hashlib
 import json
 import multiprocessing
-import os
 import tempfile
 import time
 import unittest
@@ -25,24 +24,25 @@ from tools.PriorMap.localized_output_store import (
     LocalizedStoreError,
     LocalizedVersionStore,
     REQUIRED_VERSION_FILES,
+    local_input_identity_id,
 )
 
 
-def _hold_store_transaction(
+def _hold_store_lock(
     output_path: str,
     ready_connection: object,
     release_event: object,
 ) -> None:
-    """Spawn-safe worker that holds the store lock until the parent releases it."""
+    """Spawn-safe worker that holds the store's native lock until released."""
 
     store = LocalizedVersionStore(
         Path(output_path), lock_timeout_seconds=5.0
     )
-    staging = store.begin()
-    ready_connection.send(staging.name)  # type: ignore[attr-defined]
+    store._acquire_lock()
+    ready_connection.send(".write.lock")  # type: ignore[attr-defined]
     ready_connection.close()  # type: ignore[attr-defined]
     release_event.wait(10.0)  # type: ignore[attr-defined]
-    store.abort(staging)
+    store._release_lock()
 
 
 class LocalizedFileLockTests(unittest.TestCase):
@@ -76,15 +76,14 @@ class LocalizedFileLockTests(unittest.TestCase):
             parent_connection, child_connection = context.Pipe(duplex=False)
             release_event = context.Event()
             holder = context.Process(
-                target=_hold_store_transaction,
+                target=_hold_store_lock,
                 args=(str(output), child_connection, release_event),
             )
             holder.start()
             child_connection.close()
             try:
                 self.assertTrue(parent_connection.poll(10.0))
-                staging_name = parent_connection.recv()
-                self.assertTrue(staging_name.startswith(".staging-"))
+                self.assertEqual(parent_connection.recv(), ".write.lock")
                 contender = LocalizedVersionStore(
                     output,
                     lock_timeout_seconds=0.25,
@@ -108,21 +107,21 @@ class LocalizedFileLockTests(unittest.TestCase):
                 parent_connection.close()
             self.assertEqual(holder.exitcode, 0)
 
-    def test_process_termination_releases_os_lock_and_recovers_staging(self) -> None:
+    def test_process_termination_releases_os_lock(self) -> None:
         context = multiprocessing.get_context("spawn")
         with tempfile.TemporaryDirectory() as temporary:
             output = Path(temporary) / "output"
             parent_connection, child_connection = context.Pipe(duplex=False)
             release_event = context.Event()
             holder = context.Process(
-                target=_hold_store_transaction,
+                target=_hold_store_lock,
                 args=(str(output), child_connection, release_event),
             )
             holder.start()
             child_connection.close()
             try:
                 self.assertTrue(parent_connection.poll(10.0))
-                staging_name = parent_connection.recv()
+                self.assertEqual(parent_connection.recv(), ".write.lock")
             finally:
                 parent_connection.close()
             holder.terminate()
@@ -131,9 +130,11 @@ class LocalizedFileLockTests(unittest.TestCase):
             self.assertNotEqual(holder.exitcode, 0)
 
             store = LocalizedVersionStore(output, lock_timeout_seconds=2.0)
-            removed = store.recover_stale_staging()
-            self.assertEqual([path.name for path in removed], [staging_name])
-            self.assertFalse((store.root / staging_name).exists())
+            store._acquire_lock()
+            try:
+                self.assertIsNotNone(store._lock_handle)
+            finally:
+                store._release_lock()
 
 
 class LocalizedVersionStoreTests(unittest.TestCase):
@@ -141,6 +142,56 @@ class LocalizedVersionStoreTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.output = Path(self.temporary.name) / "output"
         self.store = LocalizedVersionStore(self.output)
+        self.session_input_files = [
+            {
+                "role": role,
+                "file": file_name,
+                "bytes": 0,
+                "sha256": "b" * 64 if role == "source_database" else "f" * 64,
+            }
+            for role, file_name in (
+                ("metadata", "metadata.json"),
+                ("source_database", "source.db"),
+                ("localization_trace.jsonl", "localization_trace.jsonl"),
+                ("localization_constraints.jsonl", "localization_constraints.jsonl"),
+                ("localization_events.jsonl", "localization_events.jsonl"),
+                ("manual_localization_events.jsonl", "manual_localization_events.jsonl"),
+                ("tag_observations.jsonl", "tag_observations.jsonl"),
+                ("localized_price_tags.json", "localized_price_tags.json"),
+            )
+        ]
+        session_bundle = hashlib.sha256(
+            json.dumps(
+                {
+                    "format": "MarketScannerLocalizedInputManifest",
+                    "version": 1,
+                    "source_database_sha256": "b" * 64,
+                    "files": self.session_input_files,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        self.identity_hashes = {
+            "session_input_bundle_sha256": session_bundle,
+            "source_database_sha256": "b" * 64,
+            "optimized_database_sha256": "c" * 64,
+            "prior_map_sha256": "d" * 64,
+            "processing_parameter_sha256": "e" * 64,
+        }
+        self.local_input_record = {
+            "format": "MarketScannerLocalizedLocalInputs",
+            "version": 1,
+            "paths": {
+                "source_session": "/test/session",
+                "source_database": "/test/source.db",
+                "optimized_database": "/test/optimized.db",
+                "prior_map": "/test/prior-map",
+            },
+            "identities": self.identity_hashes,
+        }
+        self.input_identity_id = local_input_identity_id(self.local_input_record)
+        self.local_input_record["input_identity_id"] = self.input_identity_id
 
     def tearDown(self) -> None:
         self.temporary.cleanup()
@@ -151,11 +202,38 @@ class LocalizedVersionStoreTests(unittest.TestCase):
         staging = self.store.begin()
         json_payloads: dict[str, object] = {
             "prior_map_manifest.json": {"format": "MarketScannerPriorMap", "version": 1},
-            "source_manifest.json": {"format": "MarketScannerLocalizedSourceManifest", "version": 1},
+            "source_manifest.json": {
+                "format": "MarketScannerLocalizedSourceManifest",
+                "version": 2,
+                "input_identity_id": self.input_identity_id,
+                "session_input_bundle_sha256": self.identity_hashes[
+                    "session_input_bundle_sha256"
+                ],
+                "source_database_sha256_before": self.identity_hashes[
+                    "source_database_sha256"
+                ],
+                "optimized_database_sha256": self.identity_hashes[
+                    "optimized_database_sha256"
+                ],
+                "prior_map_sha256": self.identity_hashes["prior_map_sha256"],
+            },
             "processing_manifest.json": {
                 "format": "MarketScannerLocalizedProcessing",
-                "version": 1,
+                "version": 2,
                 "publish_state": state,
+                "input_identity_id": self.input_identity_id,
+                **self.identity_hashes,
+            },
+            "session_input_manifest.json": {
+                "format": "MarketScannerLocalizedInputManifest",
+                "version": 1,
+                "source_database_sha256": self.identity_hashes[
+                    "source_database_sha256"
+                ],
+                "bundle_sha256": self.identity_hashes[
+                    "session_input_bundle_sha256"
+                ],
+                "files": self.session_input_files,
             },
             "online_localization_trace.json": [],
             "optimized_map_trajectory.geojson": {
@@ -184,8 +262,10 @@ class LocalizedVersionStoreTests(unittest.TestCase):
                 "format": "MarketScannerLocalizedReview", "version": 1
             },
             "manual_edits.json": {
-                "format": "MarketScannerManualEdits", "version": 3,
-                "revision": revision, "events": [], "cursor": 0
+                "format": "MarketScannerManualEdits", "version": 4,
+                "revision": revision, "events": [], "cursor": 0,
+                "input_identity_id": self.input_identity_id,
+                **self.identity_hashes,
             },
             "localized_price_tags.json": [],
             "localized_price_tags.geojson": {
@@ -219,7 +299,12 @@ class LocalizedVersionStoreTests(unittest.TestCase):
     ):
         staging = self.write_valid_staging(revision=revision, state=state)
         manifest = self.store.validate_staging(staging, parent_version=None)
-        return self.store.commit(staging, manifest, update_current=update_current)
+        return self.store.commit(
+            staging,
+            manifest,
+            update_current=update_current,
+            local_input_record=self.local_input_record,
+        )
 
     def test_failed_validation_leaves_current_unchanged(self) -> None:
         first = self.commit_valid()
@@ -331,6 +416,41 @@ class LocalizedVersionStoreTests(unittest.TestCase):
         with self.assertRaisesRegex(LocalizedStoreError, "integrity mismatch"):
             self.store.current()
 
+    def test_local_input_tampering_fails_closed_without_changing_current(self) -> None:
+        snapshot = self.commit_valid()
+        record_path = (
+            self.store.local_inputs / f"{snapshot.input_identity_id}.json"
+        )
+        payload = json.loads(record_path.read_text(encoding="utf-8"))
+        payload["paths"]["source_database"] = "/tampered/source.db"
+        record_path.write_text(json.dumps(payload), encoding="utf-8")
+        self.assertEqual(self.store.current(), snapshot)
+        with self.assertRaisesRegex(LocalizedStoreError, "identity is invalid"):
+            self.store.local_inputs_for(snapshot)
+
+    def test_local_input_fsync_failure_leaves_pointer_unset(self) -> None:
+        staging = self.write_valid_staging()
+        manifest = self.store.validate_staging(staging, parent_version=None)
+        real_fsync_directory = localized_store._fsync_directory
+
+        def fail_local_inputs(path: Path) -> None:
+            if path == self.store.local_inputs:
+                raise OSError("injected local-input fsync failure")
+            real_fsync_directory(path)
+
+        with mock.patch.object(
+            localized_store, "_fsync_directory", side_effect=fail_local_inputs
+        ):
+            with self.assertRaisesRegex(OSError, "local-input"):
+                self.store.commit(
+                    staging,
+                    manifest,
+                    update_current=True,
+                    local_input_record=self.local_input_record,
+                )
+        self.assertIsNone(self.store.current())
+        self.assertTrue((self.store.versions / "v000001").is_dir())
+
     def test_version_directory_fsync_failure_leaves_pointer_unchanged(self) -> None:
         first = self.commit_valid()
         staging = self.write_valid_staging(revision=2)
@@ -374,6 +494,12 @@ class LocalizedVersionStoreTests(unittest.TestCase):
         self.assertIsNotNone(current)
         assert current is not None
         self.assertEqual(current.version_id, "v000002")
+        self.assertTrue(
+            (
+                self.store.local_inputs
+                / f"{current.input_identity_id}.json"
+            ).is_file()
+        )
 
 
 if __name__ == "__main__":

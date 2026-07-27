@@ -18,9 +18,11 @@ from datetime import datetime, timezone
 import hashlib
 import json
 import math
+import os
 import re
 import shutil
 import sqlite3
+import stat
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Iterable, Sequence
@@ -36,6 +38,15 @@ HUBER_TRANSLATION_M = 0.45
 HUBER_YAW_RAD = math.radians(10)
 HARD_REJECT_TRANSLATION_M = 2.5
 HARD_REJECT_YAW_RAD = math.radians(45)
+SESSION_INPUT_FILE_NAMES = (
+    "metadata.json",
+    "localization_trace.jsonl",
+    "localization_constraints.jsonl",
+    "localization_events.jsonl",
+    "manual_localization_events.jsonl",
+    "tag_observations.jsonl",
+    "localized_price_tags.json",
+)
 EDITABLE_TAG_FIELDS = frozenset(
     {
         "shelf_code",
@@ -59,6 +70,211 @@ def processing_parameter_sha256() -> str:
     return hashlib.sha256(
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
+
+
+def _canonical_json_bytes(payload: dict[str, Any]) -> bytes:
+    return json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+
+
+def _regular_file_identity(path: Path, role: str) -> dict[str, Any]:
+    """Hash one regular file through the same descriptor used for its size."""
+
+    try:
+        path_before = path.lstat()
+        if not stat.S_ISREG(path_before.st_mode):
+            raise OfflineLocalizationError(
+                f"Session input {role} must be a regular file: {path.name}"
+            )
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(path, flags)
+        with os.fdopen(descriptor, "rb") as handle:
+            before = os.fstat(handle.fileno())
+            digest = hashlib.sha256()
+            byte_count = 0
+            for block in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(block)
+                byte_count += len(block)
+            after = os.fstat(handle.fileno())
+        path_after = path.lstat()
+    except OfflineLocalizationError:
+        raise
+    except FileNotFoundError as exc:
+        raise OfflineLocalizationError(
+            f"Required sidecar {path.name} is missing."
+        ) from exc
+    except OSError as exc:
+        raise OfflineLocalizationError(
+            f"Session input {role} could not be read safely: {path.name}"
+        ) from exc
+    if (
+        not stat.S_ISREG(before.st_mode)
+        or not stat.S_ISREG(path_after.st_mode)
+        or (path_before.st_dev, path_before.st_ino, path_before.st_size)
+        != (before.st_dev, before.st_ino, before.st_size)
+        or (before.st_dev, before.st_ino, before.st_size)
+        != (after.st_dev, after.st_ino, after.st_size)
+        or (after.st_dev, after.st_ino, after.st_size)
+        != (path_after.st_dev, path_after.st_ino, path_after.st_size)
+        or byte_count != before.st_size
+    ):
+        raise OfflineLocalizationError(
+            f"Session input {role} changed while it was being hashed: {path.name}"
+        )
+    return {
+        "role": role,
+        "file": path.name,
+        "bytes": byte_count,
+        "sha256": digest.hexdigest(),
+    }
+
+
+def session_input_bundle_sha256(payload: dict[str, Any]) -> str:
+    """Validate and return the canonical finalized-session bundle identity."""
+
+    if (
+        not isinstance(payload, dict)
+        or payload.get("format") != "MarketScannerLocalizedInputManifest"
+        or payload.get("version") != 1
+        or set(payload)
+        not in (
+            {
+                "format",
+                "version",
+                "source_database_sha256",
+                "files",
+                "bundle_sha256",
+            },
+            {
+                "format",
+                "version",
+                "source_database_sha256",
+                "files",
+                "bundle_sha256",
+                "input_identity_id",
+            },
+        )
+    ):
+        raise OfflineLocalizationError("Session input manifest contract is invalid.")
+    files = payload.get("files")
+    expected_roles = ("metadata", "source_database", *SESSION_INPUT_FILE_NAMES[1:])
+    if not isinstance(files, list) or len(files) != len(expected_roles):
+        raise OfflineLocalizationError("Session input manifest file set is invalid.")
+    for entry, role in zip(files, expected_roles):
+        if (
+            not isinstance(entry, dict)
+            or set(entry) != {"role", "file", "bytes", "sha256"}
+            or entry.get("role") != role
+            or not isinstance(entry.get("file"), str)
+            or not entry["file"]
+            or isinstance(entry.get("bytes"), bool)
+            or not isinstance(entry.get("bytes"), int)
+            or entry["bytes"] < 0
+            or not isinstance(entry.get("sha256"), str)
+            or re.fullmatch(r"[0-9a-f]{64}", entry["sha256"]) is None
+        ):
+            raise OfflineLocalizationError("Session input manifest entry is invalid.")
+        expected_file = "metadata.json" if role == "metadata" else role
+        if role != "source_database" and entry["file"] != expected_file:
+            raise OfflineLocalizationError("Session input manifest filename is invalid.")
+    canonical = {
+        "format": payload["format"],
+        "version": payload["version"],
+        "source_database_sha256": payload.get("source_database_sha256"),
+        "files": files,
+    }
+    if canonical["source_database_sha256"] != files[1]["sha256"]:
+        raise OfflineLocalizationError(
+            "Session input manifest source database hash is inconsistent."
+        )
+    calculated = hashlib.sha256(_canonical_json_bytes(canonical)).hexdigest()
+    if payload.get("bundle_sha256") != calculated:
+        raise OfflineLocalizationError("Session input manifest bundle hash is invalid.")
+    input_identity_id = payload.get("input_identity_id")
+    if input_identity_id is not None and (
+        not isinstance(input_identity_id, str)
+        or re.fullmatch(r"[0-9a-f]{64}", input_identity_id) is None
+    ):
+        raise OfflineLocalizationError("Session input manifest input identity is invalid.")
+    return calculated
+
+
+def build_session_input_manifest(
+    segment: Path, source_database: Path
+) -> dict[str, Any]:
+    """Build the deterministic identity of every authoritative finalized input."""
+
+    try:
+        if source_database.resolve().parent != segment.resolve():
+            raise OfflineLocalizationError(
+                "Source database must belong to the single finalized segment."
+            )
+    except OSError as exc:
+        raise OfflineLocalizationError("Session input paths could not be resolved.") from exc
+    files = [
+        _regular_file_identity(segment / "metadata.json", "metadata"),
+        _regular_file_identity(source_database, "source_database"),
+        *(
+            _regular_file_identity(segment / name, name)
+            for name in SESSION_INPUT_FILE_NAMES[1:]
+        ),
+    ]
+    manifest: dict[str, Any] = {
+        "format": "MarketScannerLocalizedInputManifest",
+        "version": 1,
+        "source_database_sha256": files[1]["sha256"],
+        "files": files,
+    }
+    manifest["bundle_sha256"] = hashlib.sha256(
+        _canonical_json_bytes(manifest)
+    ).hexdigest()
+    session_input_bundle_sha256(manifest)
+    return manifest
+
+
+def build_local_input_record(
+    *,
+    session: Path,
+    source_database: Path,
+    optimized_database: Path,
+    prior_map: Path,
+    session_input_manifest: dict[str, Any],
+    prior_map_sha256: str,
+) -> dict[str, Any]:
+    """Build the private, path-bearing record referenced by one version."""
+
+    bundle_sha256 = session_input_bundle_sha256(session_input_manifest)
+    source_entry = next(
+        entry
+        for entry in session_input_manifest["files"]
+        if entry["role"] == "source_database"
+    )
+    body = {
+        "format": "MarketScannerLocalizedLocalInputs",
+        "version": 1,
+        "paths": {
+            "source_session": str(session.resolve()),
+            "source_database": str(source_database.resolve()),
+            "optimized_database": str(optimized_database.resolve()),
+            "prior_map": str(prior_map.resolve()),
+        },
+        "identities": {
+            "session_input_bundle_sha256": bundle_sha256,
+            "source_database_sha256": source_entry["sha256"],
+            "optimized_database_sha256": _sha256(optimized_database),
+            "prior_map_sha256": prior_map_sha256,
+            "processing_parameter_sha256": processing_parameter_sha256(),
+        },
+    }
+    return {
+        **body,
+        "input_identity_id": hashlib.sha256(_canonical_json_bytes(body)).hexdigest(),
+    }
 
 
 class OfflineLocalizationError(ValueError):
@@ -2359,14 +2575,17 @@ def new_manual_edits(
     map_sha256: str,
     session_sha256: str,
     optimized_db_sha256: str = "",
+    session_input_bundle_sha256: str = "",
+    input_identity_id: str = "",
 ) -> dict[str, Any]:
     return {
         "format": "MarketScannerManualEdits",
-        "version": 3,
+        "version": 4,
         "revision": 1,
         "prior_map_sha256": map_sha256,
         "source_database_sha256": session_sha256,
-        "source_session_sha256": session_sha256,
+        "session_input_bundle_sha256": session_input_bundle_sha256,
+        "input_identity_id": input_identity_id,
         "optimized_database_sha256": optimized_db_sha256,
         "processing_parameter_sha256": processing_parameter_sha256(),
         "tool_version": TOOL_VERSION,
@@ -2526,35 +2745,67 @@ def upgrade_manual_edits_v2(
     map_sha256: str,
     source_database_sha256: str,
     optimized_database_sha256: str,
+    session_input_bundle_sha256: str,
+    input_identity_id: str,
 ) -> dict[str, Any]:
-    """Upgrade the historical v2 journal without weakening identity binding."""
+    """Upgrade a historical v2/v3 journal using a verified current bundle."""
 
-    if journal.get("format") != "MarketScannerManualEdits" or journal.get("version") != 2:
+    if journal.get("format") != "MarketScannerManualEdits" or journal.get("version") not in {2, 3}:
         return journal
     if (
+        re.fullmatch(r"[0-9a-f]{64}", session_input_bundle_sha256) is None
+        or re.fullmatch(r"[0-9a-f]{64}", input_identity_id) is None
+    ):
+        raise OfflineLocalizationError(
+            "Historical manual_edits migration requires a verified input bundle."
+        )
+    historical_version = int(journal["version"])
+    if (
         journal.get("prior_map_sha256") != map_sha256
-        or journal.get("source_session_sha256") != source_database_sha256
+        or (
+            journal.get("source_database_sha256")
+            or journal.get("source_session_sha256")
+        )
+        != source_database_sha256
         or (
             journal.get("optimized_database_sha256")
             and journal.get("optimized_database_sha256")
             != optimized_database_sha256
         )
+        or (
+            historical_version == 3
+            and journal.get("processing_parameter_sha256")
+            != processing_parameter_sha256()
+        )
     ):
         raise OfflineLocalizationError(
-            "Historical manual_edits v2 identity does not match the selected inputs."
+            "Historical manual_edits identity does not match the selected inputs."
         )
     upgraded = new_manual_edits(
-        map_sha256, source_database_sha256, optimized_database_sha256
+        map_sha256,
+        source_database_sha256,
+        optimized_database_sha256,
+        session_input_bundle_sha256,
+        input_identity_id,
     )
     upgraded["revision"] = journal.get("revision", 1)
     upgraded["cursor"] = journal.get("cursor", 0)
     upgraded["events"] = journal.get("events", [])
+    historical_audit = journal.get("audit_events", [])
+    if not isinstance(historical_audit, list) or any(
+        not isinstance(item, dict) for item in historical_audit
+    ):
+        raise OfflineLocalizationError("Historical manual_edits audit is invalid.")
     upgraded["audit_events"] = [
+        *historical_audit,
         {
-            "event_id": "migration-v2-to-v3",
+            "event_id": f"migration-v{historical_version}-to-v4",
             "type": "journal_migrated",
             "actor": "system",
-            "reason": "Historical v2 journal upgraded with current immutable identities.",
+            "reason": (
+                f"Historical v{historical_version} journal upgraded with the "
+                "verified finalized-session bundle."
+            ),
         }
     ]
     return upgraded
@@ -2567,6 +2818,9 @@ def _render_localized_version(
     source_database: Path,
     optimized_database: Path,
     output: Path,
+    session_input_manifest: dict[str, Any],
+    input_identity_id: str,
+    local_input_record: dict[str, Any],
     manual_edits: dict[str, Any] | None = None,
     progress: Callable[[int, str, str], None] | None = None,
 ) -> dict[str, Any]:
@@ -2580,11 +2834,24 @@ def _render_localized_version(
     if len(segment_dirs) != 1:
         raise OfflineLocalizationError("Localized processing requires one continuous segment.")
     segment = segment_dirs[0]
+    expected_bundle_sha256 = session_input_bundle_sha256(session_input_manifest)
+    if session_input_manifest.get("input_identity_id") != input_identity_id:
+        raise OfflineLocalizationError("Session input manifest identity is inconsistent.")
+    session_inputs_before = build_session_input_manifest(segment, source_database)
+    if (
+        session_inputs_before["bundle_sha256"] != expected_bundle_sha256
+        or session_inputs_before["files"] != session_input_manifest["files"]
+    ):
+        raise OfflineLocalizationError(
+            "Finalized session inputs changed before localized processing."
+        )
     metadata = load_json(segment / "metadata.json")
     if not isinstance(metadata, dict):
         raise OfflineLocalizationError("Session metadata is invalid.")
     if metadata.get("workflowMode") != "prior_map_localized":
         raise OfflineLocalizationError("This session is not a prior-map localized scan.")
+    if metadata.get("finalized") is not True:
+        raise OfflineLocalizationError("Localized processing requires a finalized session.")
     manifest = load_json(prior_map / "manifest.json")
     package_manifest = load_json(prior_map / "package_manifest.json")
     expected_map_id = metadata.get("priorMapId")
@@ -2600,17 +2867,43 @@ def _render_localized_version(
     session_hash = source_hash_before
     package_hash = str(package_manifest["package_sha256"])
     optimized_db_hash = _sha256(optimized_database)
+    local_identities = local_input_record.get("identities")
+    if (
+        local_input_record.get("input_identity_id") != input_identity_id
+        or not isinstance(local_identities, dict)
+        or local_identities.get("session_input_bundle_sha256")
+        != expected_bundle_sha256
+        or local_identities.get("source_database_sha256") != source_hash_before
+        or local_identities.get("optimized_database_sha256") != optimized_db_hash
+        or local_identities.get("prior_map_sha256") != package_hash
+        or local_identities.get("processing_parameter_sha256")
+        != processing_parameter_sha256()
+    ):
+        raise OfflineLocalizationError("Localized local-input identity is inconsistent.")
     if manual_edits is None:
-        manual_edits = new_manual_edits(package_hash, session_hash, optimized_db_hash)
+        manual_edits = new_manual_edits(
+            package_hash,
+            session_hash,
+            optimized_db_hash,
+            expected_bundle_sha256,
+            input_identity_id,
+        )
     manual_edits = upgrade_manual_edits_v2(
-        manual_edits, package_hash, session_hash, optimized_db_hash
+        manual_edits,
+        package_hash,
+        session_hash,
+        optimized_db_hash,
+        expected_bundle_sha256,
+        input_identity_id,
     )
     if (
         manual_edits.get("format") != "MarketScannerManualEdits"
-        or manual_edits.get("version") != 3
+        or manual_edits.get("version") != 4
         or manual_edits.get("prior_map_sha256") != package_hash
         or manual_edits.get("source_database_sha256") != session_hash
-        or manual_edits.get("source_session_sha256") != session_hash
+        or manual_edits.get("session_input_bundle_sha256")
+        != expected_bundle_sha256
+        or manual_edits.get("input_identity_id") != input_identity_id
         or manual_edits.get("processing_parameter_sha256")
         != processing_parameter_sha256()
         or manual_edits.get("tool_version") != TOOL_VERSION
@@ -3187,7 +3480,8 @@ def _render_localized_version(
         "version": FORMAT_VERSION,
         "prior_map_id": manifest.get("prior_map_id"),
         "prior_map_sha256": package_hash,
-        "source_session_sha256": session_hash,
+        "session_input_bundle_sha256": expected_bundle_sha256,
+        "input_identity_id": input_identity_id,
         "source_database_sha256": source_hash_before,
         "optimized_database_sha256": optimized_db_hash,
         "node_count": len(optimized),
@@ -3364,20 +3658,32 @@ def _render_localized_version(
     source_hash_after = _sha256(source_database)
     if source_hash_after != source_hash_before:
         raise OfflineLocalizationError("Source database changed during localized processing.")
+    session_inputs_after = build_session_input_manifest(segment, source_database)
+    if (
+        session_inputs_after["bundle_sha256"] != expected_bundle_sha256
+        or session_inputs_after["files"] != session_input_manifest["files"]
+    ):
+        raise OfflineLocalizationError(
+            "Finalized session inputs changed during localized processing."
+        )
 
     output.mkdir(parents=True, exist_ok=True)
     shutil.copy2(prior_map / "manifest.json", output / "prior_map_manifest.json")
+    _json_write(output / "session_input_manifest.json", session_input_manifest)
     _json_write(
         output / "source_manifest.json",
         {
             "format": "MarketScannerLocalizedSourceManifest",
-            "version": 1,
+            "version": 2,
+            "input_identity_id": input_identity_id,
+            "session_input_bundle_sha256": expected_bundle_sha256,
             "source_session_id": session.name,
             "source_database_name": source_database.name,
             "source_database_sha256_before": source_hash_before,
             "source_database_sha256_after": source_hash_after,
             "source_database_immutable": True,
             "optimized_database_name": optimized_database.name,
+            "optimized_database_sha256": optimized_db_hash,
             "prior_map_id": manifest.get("prior_map_id"),
             "prior_map_sha256": package_hash,
         },
@@ -3386,7 +3692,9 @@ def _render_localized_version(
         output / "processing_manifest.json",
         {
             "format": "MarketScannerLocalizedProcessing",
-            "version": 1,
+            "version": 2,
+            "input_identity_id": input_identity_id,
+            "session_input_bundle_sha256": expected_bundle_sha256,
             "pipeline": [
                 "rtabmap_reprocess",
                 "relative_trajectory_read",
@@ -3411,15 +3719,6 @@ def _render_localized_version(
                 "huber_yaw_rad": HUBER_YAW_RAD,
                 "hard_reject_translation_m": HARD_REJECT_TRANSLATION_M,
                 "hard_reject_yaw_rad": HARD_REJECT_YAW_RAD,
-            },
-            "input_sidecars": {
-                path.name: {
-                    "bytes": path.stat().st_size,
-                    "sha256": _sha256(path),
-                }
-                for path in sorted(segment.iterdir())
-                if path.is_file()
-                and path.suffix in {".json", ".jsonl", ".csv"}
             },
         },
     )
@@ -3599,6 +3898,37 @@ def process_localized_session(
     current result.
     """
 
+    validation = validate_package(prior_map)
+    if not validation["valid"]:
+        raise OfflineLocalizationError(
+            "Prior-map validation failed: "
+            + "; ".join(item["message"] for item in validation["errors"])
+        )
+    segment_dirs = sorted(path for path in session.glob("segment_*") if path.is_dir())
+    if len(segment_dirs) != 1:
+        raise OfflineLocalizationError("Localized processing requires one continuous segment.")
+    package_manifest = load_json(prior_map / "package_manifest.json")
+    if not isinstance(package_manifest, dict) or not isinstance(
+        package_manifest.get("package_sha256"), str
+    ):
+        raise OfflineLocalizationError("Prior-map package manifest is invalid.")
+    session_input_manifest = build_session_input_manifest(
+        segment_dirs[0], source_database
+    )
+    local_input_record = build_local_input_record(
+        session=session,
+        source_database=source_database,
+        optimized_database=optimized_database,
+        prior_map=prior_map,
+        session_input_manifest=session_input_manifest,
+        prior_map_sha256=package_manifest["package_sha256"],
+    )
+    input_identity_id = local_input_record["input_identity_id"]
+    session_input_manifest = {
+        **session_input_manifest,
+        "input_identity_id": input_identity_id,
+    }
+
     store = LocalizedVersionStore(output)
     staging = store.begin()
     try:
@@ -3611,6 +3941,18 @@ def process_localized_session(
                 "Localized current version changed during replay: "
                 f"expected {expected_parent_version}, found {actual}."
             )
+        if previous is not None:
+            if previous.input_identity_id is None:
+                raise OfflineLocalizationError(
+                    "Legacy localized output requires explicit migration or a new output directory."
+                )
+            if previous.input_identity_id != input_identity_id:
+                raise OfflineLocalizationError(
+                    "Localized output is already bound to a different session input identity."
+                )
+            # Fail closed if the version-bound private path record has been
+            # removed or altered before any replay work starts.
+            store.local_inputs_for(previous)
         report = _render_localized_version(
             prior_map=prior_map,
             session=session,
@@ -3618,20 +3960,15 @@ def process_localized_session(
             source_database=source_database,
             optimized_database=optimized_database,
             output=staging,
+            session_input_manifest=session_input_manifest,
+            input_identity_id=input_identity_id,
+            local_input_record=local_input_record,
             manual_edits=manual_edits,
             progress=progress,
         )
         manifest = store.validate_staging(
             staging,
             parent_version=previous.version_id if previous else None,
-        )
-        store.write_local_state(
-            {
-                "source_session": str(session.resolve()),
-                "source_database": str(source_database.resolve()),
-                "optimized_database": str(optimized_database.resolve()),
-                "prior_map": str(prior_map.resolve()),
-            }
         )
         update_current = bool(report.get("allow_draft")) and (
             report.get("publish_state") == "draft"
@@ -3640,6 +3977,7 @@ def process_localized_session(
             staging,
             manifest,
             update_current=update_current,
+            local_input_record=local_input_record,
         )
     except Exception:
         if staging.exists():

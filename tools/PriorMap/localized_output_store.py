@@ -22,6 +22,7 @@ REQUIRED_VERSION_FILES = (
     "prior_map_manifest.json",
     "source_manifest.json",
     "processing_manifest.json",
+    "session_input_manifest.json",
     "online_localization_trace.json",
     "optimized_map_trajectory.geojson",
     "localization_constraints.json",
@@ -34,6 +35,9 @@ REQUIRED_VERSION_FILES = (
     "localized_price_tags.geojson",
     "shelf_tag_index.json",
     "audit_log.jsonl",
+)
+LEGACY_REQUIRED_VERSION_FILES = tuple(
+    name for name in REQUIRED_VERSION_FILES if name != "session_input_manifest.json"
 )
 VERSION_STATES = frozenset(
     {"invalid", "draft", "review", "published", "superseded", "revoked"}
@@ -59,6 +63,8 @@ class LocalizedSnapshot:
     revision: int
     state: str
     manifest_sha256: str
+    input_identity_id: str | None = None
+    session_input_bundle_sha256: str | None = None
 
 
 def _sha256(path: Path) -> str:
@@ -67,6 +73,23 @@ def _sha256(path: Path) -> str:
         for block in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def _canonical_json_bytes(payload: dict[str, Any]) -> bytes:
+    return json.dumps(
+        payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+        allow_nan=False,
+    ).encode("utf-8")
+
+
+def local_input_identity_id(payload: dict[str, Any]) -> str:
+    """Return the content identity of a machine-local input record."""
+
+    body = {key: value for key, value in payload.items() if key != "input_identity_id"}
+    return hashlib.sha256(_canonical_json_bytes(body)).hexdigest()
 
 
 def _reject_nonfinite(value: str) -> None:
@@ -125,6 +148,7 @@ class LocalizedVersionStore:
         self.output_root = output_root
         self.root = output_root / "localized"
         self.versions = self.root / "versions"
+        self.local_inputs = self.root / "local_inputs"
         self.lock_timeout_seconds = lock_timeout_seconds
         self.lock_poll_interval_seconds = lock_poll_interval_seconds
         self._lock_handle: FileLock | None = None
@@ -215,6 +239,7 @@ class LocalizedVersionStore:
         )
 
     def local_state(self) -> dict[str, Any]:
+        """Read the legacy, unversioned path state for explicit migration only."""
         path = self.root / "local_state.json"
         try:
             if not stat.S_ISREG(path.lstat().st_mode):
@@ -239,6 +264,159 @@ class LocalizedVersionStore:
             if not isinstance(payload.get(name), str) or not payload[name]:
                 raise LocalizedStoreError("Localized local-state paths are invalid.")
         return payload
+
+    @staticmethod
+    def _validate_local_input_payload(
+        payload: Any,
+        *,
+        expected_identity_id: str | None = None,
+    ) -> dict[str, Any]:
+        if (
+            not isinstance(payload, dict)
+            or payload.get("format") != "MarketScannerLocalizedLocalInputs"
+            or payload.get("version") != 1
+        ):
+            raise LocalizedStoreError("Localized local-input contract is invalid.")
+        identity_id = payload.get("input_identity_id")
+        if (
+            not isinstance(identity_id, str)
+            or re.fullmatch(r"[0-9a-f]{64}", identity_id) is None
+            or identity_id != local_input_identity_id(payload)
+            or (expected_identity_id is not None and identity_id != expected_identity_id)
+        ):
+            raise LocalizedStoreError("Localized local-input identity is invalid.")
+        paths = payload.get("paths")
+        identities = payload.get("identities")
+        required_paths = {
+            "source_session",
+            "source_database",
+            "optimized_database",
+            "prior_map",
+        }
+        required_identities = {
+            "session_input_bundle_sha256",
+            "source_database_sha256",
+            "optimized_database_sha256",
+            "prior_map_sha256",
+            "processing_parameter_sha256",
+        }
+        if not isinstance(paths, dict) or set(paths) != required_paths or any(
+            not isinstance(paths.get(name), str) or not paths[name]
+            for name in required_paths
+        ):
+            raise LocalizedStoreError("Localized local-input paths are invalid.")
+        if not isinstance(identities, dict) or set(identities) != required_identities:
+            raise LocalizedStoreError("Localized local-input hashes are invalid.")
+        for name in required_identities:
+            value = identities.get(name)
+            if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None:
+                raise LocalizedStoreError("Localized local-input hashes are invalid.")
+        return payload
+
+    def _write_local_inputs_after_version_durable(
+        self,
+        payload: dict[str, Any],
+        *,
+        expected_identity_id: str,
+    ) -> None:
+        """Create one content-addressed local path record before pointer commit."""
+
+        if self._lock_handle is None:
+            raise LocalizedStoreError("Localized local-input write requires the write lock.")
+        normalized = self._validate_local_input_payload(
+            payload, expected_identity_id=expected_identity_id
+        )
+        created_directory = not self.local_inputs.exists()
+        self.local_inputs.mkdir(parents=True, exist_ok=True)
+        if created_directory:
+            _fsync_directory(self.root)
+        destination = self.local_inputs / f"{expected_identity_id}.json"
+        if destination.exists():
+            existing = self._read_local_input_file(destination, expected_identity_id)
+            if existing != normalized:
+                raise LocalizedStoreError(
+                    "Localized local-input identity already has different content."
+                )
+            _fsync_file(destination)
+            _fsync_directory(self.local_inputs)
+            return
+        temporary = self.local_inputs / f".{expected_identity_id}.{uuid.uuid4().hex}.tmp"
+        try:
+            with temporary.open("x", encoding="utf-8") as handle:
+                json.dump(
+                    normalized,
+                    handle,
+                    ensure_ascii=False,
+                    indent=2,
+                    sort_keys=True,
+                    allow_nan=False,
+                )
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, destination)
+            _fsync_directory(self.local_inputs)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    def _read_local_input_file(
+        self, path: Path, expected_identity_id: str
+    ) -> dict[str, Any]:
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            path_stat = path.lstat()
+            if not stat.S_ISREG(path_stat.st_mode):
+                raise LocalizedStoreError(
+                    "Localized local-input record is not a regular file."
+                )
+            descriptor = os.open(path, flags)
+            with os.fdopen(descriptor, "rb") as handle:
+                file_stat = os.fstat(handle.fileno())
+                content = handle.read()
+            path_after = path.lstat()
+            if (
+                not stat.S_ISREG(file_stat.st_mode)
+                or not stat.S_ISREG(path_after.st_mode)
+                or (path_stat.st_dev, path_stat.st_ino, path_stat.st_size)
+                != (file_stat.st_dev, file_stat.st_ino, file_stat.st_size)
+                or (file_stat.st_dev, file_stat.st_ino, file_stat.st_size)
+                != (path_after.st_dev, path_after.st_ino, path_after.st_size)
+            ):
+                raise LocalizedStoreError(
+                    "Localized local-input record is not a regular file."
+                )
+            payload = json.loads(
+                content.decode("utf-8"), parse_constant=_reject_nonfinite
+            )
+        except LocalizedStoreError:
+            raise
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+            raise LocalizedStoreError("Localized local-input record is invalid.") from exc
+        return self._validate_local_input_payload(
+            payload, expected_identity_id=expected_identity_id
+        )
+
+    def local_inputs_for(self, snapshot: LocalizedSnapshot) -> dict[str, Any]:
+        identity_id = snapshot.input_identity_id
+        if identity_id is None:
+            raise LocalizedStoreError(
+                "Legacy localized versions require explicit input migration before replay."
+            )
+        verified = self.resolve_version(snapshot.version_id)
+        if verified != snapshot:
+            raise LocalizedStoreError("Localized snapshot changed before local-input read.")
+        record = self._read_local_input_file(
+            self.local_inputs / f"{identity_id}.json", identity_id
+        )
+        identities = record["identities"]
+        if (
+            identities["session_input_bundle_sha256"]
+            != snapshot.session_input_bundle_sha256
+        ):
+            raise LocalizedStoreError(
+                "Localized local-input bundle does not match the version."
+            )
+        return record
 
     def abort(self, staging: Path) -> None:
         try:
@@ -298,13 +476,14 @@ class LocalizedVersionStore:
                 raise LocalizedStoreError(f"GeoJSON is not a FeatureCollection: {name}")
         expected_contracts = {
             "prior_map_manifest.json": ("MarketScannerPriorMap", 1),
-            "source_manifest.json": ("MarketScannerLocalizedSourceManifest", 1),
-            "processing_manifest.json": ("MarketScannerLocalizedProcessing", 1),
+            "source_manifest.json": ("MarketScannerLocalizedSourceManifest", 2),
+            "processing_manifest.json": ("MarketScannerLocalizedProcessing", 2),
+            "session_input_manifest.json": ("MarketScannerLocalizedInputManifest", 1),
             "localization_constraints.json": ("MarketScannerOfflineLocalizationConstraints", 1),
             "localization_report.json": ("MarketScannerLocalizationReport", 1),
             "review_items.json": ("MarketScannerLocalizationReviewItems", 1),
             "localized_review.json": ("MarketScannerLocalizedReview", 1),
-            "manual_edits.json": ("MarketScannerManualEdits", 3),
+            "manual_edits.json": ("MarketScannerManualEdits", 4),
             "shelf_tag_index.json": ("MarketScannerShelfTagIndex", 1),
         }
         for name, (expected_format, expected_version) in expected_contracts.items():
@@ -367,8 +546,53 @@ class LocalizedVersionStore:
         if csv_count != len(tags) or csv_ids != tag_ids:
             raise LocalizedStoreError("Localized tag CSV does not match tag JSON order.")
         report = parsed["localization_report.json"]
+        source = parsed["source_manifest.json"]
         processing = parsed["processing_manifest.json"]
+        session_input = parsed["session_input_manifest.json"]
         journal = parsed["manual_edits.json"]
+        session_files = session_input.get("files")
+        expected_session_roles = (
+            "metadata",
+            "source_database",
+            "localization_trace.jsonl",
+            "localization_constraints.jsonl",
+            "localization_events.jsonl",
+            "manual_localization_events.jsonl",
+            "tag_observations.jsonl",
+            "localized_price_tags.json",
+        )
+        if not isinstance(session_files, list) or len(session_files) != len(
+            expected_session_roles
+        ):
+            raise LocalizedStoreError("Localized session input file set is invalid.")
+        for entry, role in zip(session_files, expected_session_roles):
+            if (
+                not isinstance(entry, dict)
+                or set(entry) != {"role", "file", "bytes", "sha256"}
+                or entry.get("role") != role
+                or not isinstance(entry.get("file"), str)
+                or isinstance(entry.get("bytes"), bool)
+                or not isinstance(entry.get("bytes"), int)
+                or entry["bytes"] < 0
+                or not isinstance(entry.get("sha256"), str)
+                or re.fullmatch(r"[0-9a-f]{64}", entry["sha256"]) is None
+            ):
+                raise LocalizedStoreError("Localized session input entry is invalid.")
+        session_bundle_body = {
+            "format": session_input["format"],
+            "version": session_input["version"],
+            "source_database_sha256": session_input.get(
+                "source_database_sha256"
+            ),
+            "files": session_files,
+        }
+        if (
+            session_files[1]["sha256"]
+            != session_input.get("source_database_sha256")
+            or hashlib.sha256(_canonical_json_bytes(session_bundle_body)).hexdigest()
+            != session_input.get("bundle_sha256")
+        ):
+            raise LocalizedStoreError("Localized session input bundle is invalid.")
         state = str(report.get("publish_state") or "invalid")
         if state not in VERSION_STATES:
             raise LocalizedStoreError(f"Localized publish state is invalid: {state}")
@@ -380,6 +604,54 @@ class LocalizedVersionStore:
             raise LocalizedStoreError("Manual edit revision is invalid.")
         if processing.get("publish_state") != state:
             raise LocalizedStoreError("Localized report and processing state differ.")
+        identity_values = {
+            source.get("input_identity_id"),
+            processing.get("input_identity_id"),
+            journal.get("input_identity_id"),
+        }
+        if len(identity_values) != 1:
+            raise LocalizedStoreError("Localized input identities differ across artifacts.")
+        input_identity_id = next(iter(identity_values))
+        if (
+            not isinstance(input_identity_id, str)
+            or re.fullmatch(r"[0-9a-f]{64}", input_identity_id) is None
+        ):
+            raise LocalizedStoreError("Localized input identity is invalid.")
+        bundle_values = {
+            session_input.get("bundle_sha256"),
+            source.get("session_input_bundle_sha256"),
+            processing.get("session_input_bundle_sha256"),
+            journal.get("session_input_bundle_sha256"),
+        }
+        if len(bundle_values) != 1:
+            raise LocalizedStoreError("Localized session input bundles differ.")
+        session_input_bundle_sha256 = next(iter(bundle_values))
+        if (
+            not isinstance(session_input_bundle_sha256, str)
+            or re.fullmatch(r"[0-9a-f]{64}", session_input_bundle_sha256) is None
+        ):
+            raise LocalizedStoreError("Localized session input bundle is invalid.")
+        identity_fields = {
+            "source_database_sha256": source.get("source_database_sha256_before"),
+            "optimized_database_sha256": source.get("optimized_database_sha256"),
+            "prior_map_sha256": source.get("prior_map_sha256"),
+            "processing_parameter_sha256": processing.get(
+                "processing_parameter_sha256"
+            ),
+        }
+        for name, value in identity_fields.items():
+            if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None:
+                raise LocalizedStoreError(f"Localized identity hash is invalid: {name}")
+            if processing.get(name) != value or journal.get(name) != value:
+                raise LocalizedStoreError(
+                    f"Localized identity hash differs across artifacts: {name}"
+                )
+        if session_input.get("source_database_sha256") != identity_fields[
+            "source_database_sha256"
+        ]:
+            raise LocalizedStoreError(
+                "Localized session input database hash differs from source manifest."
+            )
         files = [
             {
                 "file": name,
@@ -390,10 +662,13 @@ class LocalizedVersionStore:
         ]
         return {
             "format": "MarketScannerLocalizedVersionManifest",
-            "version": 1,
+            "version": 2,
             "state": state,
             "revision": revision,
             "parent_version": parent_version,
+            "input_identity_id": input_identity_id,
+            "session_input_bundle_sha256": session_input_bundle_sha256,
+            **identity_fields,
             "files": files,
         }
 
@@ -404,6 +679,7 @@ class LocalizedVersionStore:
         *,
         update_current: bool,
         pointer_name: str | None = None,
+        local_input_record: dict[str, Any] | None = None,
     ) -> LocalizedSnapshot:
         if self._lock_handle is None:
             raise LocalizedStoreError("Localized commit requires the write lock.")
@@ -442,12 +718,50 @@ class LocalizedVersionStore:
             # while the previous pointer remains unchanged.
             _fsync_directory(self.versions)
             manifest_sha256 = _sha256(version_dir / "version_manifest.json")
+            input_identity_id = manifest.get("input_identity_id")
+            session_input_bundle_sha256 = manifest.get(
+                "session_input_bundle_sha256"
+            )
+            if not isinstance(input_identity_id, str):
+                raise LocalizedStoreError(
+                    "New localized versions require an input identity."
+                )
+            if local_input_record is not None:
+                record_identities = self._validate_local_input_payload(
+                    local_input_record, expected_identity_id=input_identity_id
+                )["identities"]
+                for name in (
+                    "session_input_bundle_sha256",
+                    "source_database_sha256",
+                    "optimized_database_sha256",
+                    "prior_map_sha256",
+                    "processing_parameter_sha256",
+                ):
+                    if record_identities.get(name) != manifest.get(name):
+                        raise LocalizedStoreError(
+                            f"Localized local-input identity differs from version: {name}"
+                        )
+                self._write_local_inputs_after_version_durable(
+                    local_input_record, expected_identity_id=input_identity_id
+                )
+            else:
+                existing_record = self._read_local_input_file(
+                    self.local_inputs / f"{input_identity_id}.json",
+                    input_identity_id,
+                )
+                for name, value in existing_record["identities"].items():
+                    if value != manifest.get(name):
+                        raise LocalizedStoreError(
+                            f"Localized inherited input identity differs: {name}"
+                        )
             snapshot = LocalizedSnapshot(
                 version_id=version_id,
                 version_dir=version_dir,
                 revision=int(manifest["revision"]),
                 state=str(manifest["state"]),
                 manifest_sha256=manifest_sha256,
+                input_identity_id=input_identity_id,
+                session_input_bundle_sha256=str(session_input_bundle_sha256),
             )
             if update_current and pointer_name is not None:
                 raise LocalizedStoreError("Localized commit pointer is ambiguous.")
@@ -473,11 +787,12 @@ class LocalizedVersionStore:
             self.root / name,
             {
                 "format": "MarketScannerLocalizedPointer",
-                "version": 1,
+                "version": 2,
                 "version_id": snapshot.version_id,
                 "revision": snapshot.revision,
                 "state": snapshot.state,
                 "manifest_sha256": snapshot.manifest_sha256,
+                "input_identity_id": snapshot.input_identity_id,
             },
         )
 
@@ -727,7 +1042,11 @@ class LocalizedVersionStore:
             expected_manifest = str(pointer["manifest_sha256"])
         except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
             raise LocalizedStoreError(f"Localized pointer is invalid: {name}") from exc
-        if pointer.get("format") != "MarketScannerLocalizedPointer" or pointer.get("version") != 1:
+        pointer_version = pointer.get("version")
+        if (
+            pointer.get("format") != "MarketScannerLocalizedPointer"
+            or pointer_version not in {1, 2}
+        ):
             raise LocalizedStoreError(f"Localized pointer contract is invalid: {name}")
         if re.fullmatch(r"v[0-9]{6}", version_id) is None:
             raise LocalizedStoreError(f"Localized pointer version is unsafe: {version_id}")
@@ -736,6 +1055,10 @@ class LocalizedVersionStore:
             raise LocalizedStoreError(f"Localized pointer manifest mismatch: {name}")
         if snapshot.revision != revision or snapshot.state != state:
             raise LocalizedStoreError(f"Localized pointer metadata mismatch: {name}")
+        if pointer_version == 2 and pointer.get("input_identity_id") != snapshot.input_identity_id:
+            raise LocalizedStoreError(f"Localized pointer input identity mismatch: {name}")
+        if pointer_version == 1 and snapshot.input_identity_id is not None:
+            raise LocalizedStoreError(f"Localized pointer version is stale: {name}")
         if name == "published.json" and snapshot.state == "published":
             self._validate_publishable_snapshot(snapshot)
         return snapshot
@@ -801,7 +1124,10 @@ class LocalizedVersionStore:
         try:
             if not stat.S_ISREG(manifest_path.lstat().st_mode):
                 raise LocalizedStoreError("Localized version manifest is not a regular file.")
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest = json.loads(
+                manifest_path.read_text(encoding="utf-8"),
+                parse_constant=_reject_nonfinite,
+            )
             revision = int(manifest["revision"])
             state = str(manifest["state"])
         except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
@@ -810,7 +1136,7 @@ class LocalizedVersionStore:
             ) from exc
         if (
             manifest.get("format") != "MarketScannerLocalizedVersionManifest"
-            or manifest.get("version") != 1
+            or manifest.get("version") not in {1, 2}
             or manifest.get("version_id") != version_id
             or state not in VERSION_STATES
             or revision < 1
@@ -818,8 +1144,31 @@ class LocalizedVersionStore:
             raise LocalizedStoreError(
                 f"Localized version manifest contract is invalid: {version_id}"
             )
+        manifest_version = int(manifest["version"])
+        expected_files = (
+            REQUIRED_VERSION_FILES
+            if manifest_version == 2
+            else LEGACY_REQUIRED_VERSION_FILES
+        )
+        input_identity_id: str | None = None
+        session_input_bundle_sha256: str | None = None
+        if manifest_version == 2:
+            input_identity_id = manifest.get("input_identity_id")
+            session_input_bundle_sha256 = manifest.get(
+                "session_input_bundle_sha256"
+            )
+            if (
+                not isinstance(input_identity_id, str)
+                or re.fullmatch(r"[0-9a-f]{64}", input_identity_id) is None
+                or not isinstance(session_input_bundle_sha256, str)
+                or re.fullmatch(r"[0-9a-f]{64}", session_input_bundle_sha256)
+                is None
+            ):
+                raise LocalizedStoreError(
+                    f"Localized version input identity is invalid: {version_id}"
+                )
         entries = manifest.get("files")
-        if not isinstance(entries, list) or len(entries) != len(REQUIRED_VERSION_FILES):
+        if not isinstance(entries, list) or len(entries) != len(expected_files):
             raise LocalizedStoreError(f"Localized version file manifest is invalid: {version_id}")
         by_name: dict[str, dict[str, Any]] = {}
         for entry in entries:
@@ -829,12 +1178,12 @@ class LocalizedVersionStore:
             if name in by_name:
                 raise LocalizedStoreError(f"Localized version file manifest has duplicates: {version_id}")
             by_name[name] = entry
-        if set(by_name) != set(REQUIRED_VERSION_FILES):
+        if set(by_name) != set(expected_files):
             raise LocalizedStoreError(f"Localized version file set is invalid: {version_id}")
         actual_names = {path.name for path in version_dir.iterdir()}
-        if actual_names != set(REQUIRED_VERSION_FILES) | {"version_manifest.json"}:
+        if actual_names != set(expected_files) | {"version_manifest.json"}:
             raise LocalizedStoreError(f"Localized version directory contents changed: {version_id}")
-        for name in REQUIRED_VERSION_FILES:
+        for name in expected_files:
             artifact = version_dir / name
             entry = by_name[name]
             try:
@@ -857,6 +1206,8 @@ class LocalizedVersionStore:
             revision=revision,
             state=state,
             manifest_sha256=_sha256(manifest_path),
+            input_identity_id=input_identity_id,
+            session_input_bundle_sha256=session_input_bundle_sha256,
         )
 
     def current(self) -> LocalizedSnapshot | None:
