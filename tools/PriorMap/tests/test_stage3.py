@@ -25,6 +25,7 @@ from tools.PriorMap.offline_localization import (
     process_localized_session,
     AbsoluteConstraint,
 )
+from tools.PriorMap.localized_output_store import LocalizedVersionStore
 from tools.PriorMap.tests.test_prior_map import fixture_rows, write_workbook
 from tools.PriorMap.xlsx_to_prior_map import convert_workbook
 
@@ -687,6 +688,12 @@ class LocalizedPipelineTests(unittest.TestCase):
             source_hash,
         )
         self.assertEqual(first, second)
+        first_version = LocalizedVersionStore(first_output).current()
+        second_version = LocalizedVersionStore(second_output).current()
+        self.assertIsNotNone(first_version)
+        self.assertIsNotNone(second_version)
+        assert first_version is not None
+        assert second_version is not None
         for name in (
             "processing_manifest.json",
             "optimized_map_trajectory.geojson",
@@ -701,8 +708,8 @@ class LocalizedPipelineTests(unittest.TestCase):
             "audit_log.jsonl",
         ):
             self.assertEqual(
-                (first_output / name).read_bytes(),
-                (second_output / name).read_bytes(),
+                (first_version.version_dir / name).read_bytes(),
+                (second_version.version_dir / name).read_bytes(),
                 name,
             )
         self.assertEqual(first["rejected_constraint_count"], 1)
@@ -710,11 +717,13 @@ class LocalizedPipelineTests(unittest.TestCase):
         self.assertEqual(first["weak_lost_duration_seconds"], 5.0)
         # source_database_immutable is in source_manifest, not report
         self.assertTrue(
-            json.loads((first_output / "source_manifest.json").read_text())[
+            json.loads((first_version.version_dir / "source_manifest.json").read_text())[
                 "source_database_immutable"
             ]
         )
-        tag = json.loads((first_output / "localized_price_tags.json").read_text())[0]
+        tag = json.loads(
+            (first_version.version_dir / "localized_price_tags.json").read_text()
+        )[0]
         self.assertEqual(tag["online_map_position"]["x_m"], 2.0)
         self.assertEqual(tag["transform_audit"]["bound_node_id"], 11)
         self.assertEqual(
@@ -733,7 +742,12 @@ class LocalizedPipelineTests(unittest.TestCase):
             self.optimized_database,
             output,
         )
-        tag = json.loads((output / "localized_price_tags.json").read_text())[0]
+        snapshot = LocalizedVersionStore(output).current()
+        self.assertIsNotNone(snapshot)
+        assert snapshot is not None
+        tag = json.loads(
+            (snapshot.version_dir / "localized_price_tags.json").read_text()
+        )[0]
         self.assertTrue(tag["needs_review"])
         self.assertEqual(tag["approval_status"], "pending")
         self.assertNotIn("final_map_position", tag)

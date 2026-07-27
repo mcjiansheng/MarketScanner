@@ -43,6 +43,11 @@ import merge_processing as merge
 from PriorMap.prior_map_schema import validate_package as validate_prior_map_package
 from PriorMap.xlsx_to_prior_map import convert_workbook as convert_prior_map_workbook
 from PriorMap import offline_localization as localized
+from PriorMap.localized_output_store import (
+    LocalizedStoreError,
+    LocalizedVersionStore,
+    REQUIRED_VERSION_FILES,
+)
 
 
 ARTIFACTS = (
@@ -409,11 +414,25 @@ def remove_temporary(path: Optional[Path]) -> None:
 
 
 def job_artifacts(job: Job) -> Dict[str, str]:
-    return {
+    artifacts = {
         name: f"/api/jobs/{job.identifier}/artifact/{name}"
         for name in ARTIFACTS
         if (job.output_dir / name).is_file()
     }
+    if job.kind == "localized":
+        snapshot = LocalizedVersionStore(job.output_dir).current()
+        if snapshot is not None:
+            artifacts.update(
+                {
+                    name: (
+                        f"/api/jobs/{job.identifier}/localized/versions/"
+                        f"{snapshot.version_id}/artifact/{name}"
+                    )
+                    for name in REQUIRED_VERSION_FILES
+                    if (snapshot.version_dir / name).is_file()
+                }
+            )
+    return artifacts
 
 
 def load_json(path: Path, default: Any) -> Any:
@@ -451,14 +470,25 @@ def job_payload(job: Job) -> Dict[str, Any]:
             }
             payload["map"] = load_json(job.output_dir / "manifest.json", {})
         elif job.kind == "localized":
+            store = LocalizedVersionStore(job.output_dir)
+            snapshot = store.current()
+            if snapshot is None:
+                raise LocalizedStoreError(
+                    "Completed localized job has no validated current version."
+                )
+            payload["localized"] = {
+                "version_id": snapshot.version_id,
+                "revision": snapshot.revision,
+                "publish_state": snapshot.state,
+            }
             payload["quality_report"] = load_json(
-                job.output_dir / "localization_report.json", {}
+                snapshot.version_dir / "localization_report.json", {}
             )
             payload["review_items"] = load_json(
-                job.output_dir / "review_items.json", {"items": []}
+                snapshot.version_dir / "review_items.json", {"items": []}
             )
             payload["map"] = load_json(
-                job.output_dir / "localized_review.json", {}
+                snapshot.version_dir / "localized_review.json", {}
             )
         else:
             payload["quality_report"] = load_json(job.output_dir / "quality_report.json", {})
@@ -1203,7 +1233,7 @@ def run_localized_map(
         manual_edits = load_json(edits_path, None)
         if not isinstance(manual_edits, dict):
             raise RequestError("manual_edits.json 无效。")
-    localized.process_localized_session(
+    localized_result = localized.process_localized_session(
         prior_map=prior_map,
         session=session,
         optimized_poses=poses,
@@ -1213,6 +1243,10 @@ def run_localized_map(
         manual_edits=manual_edits,
         progress=progress,
     )
+    if not localized_result.get("current_updated"):
+        raise RequestError(
+            "本地化质量门禁未通过；诊断版本已保留，但不会切换为 current 结果。"
+        )
     attach_offline_reports(output, [offline_report])
     attach_acceleration_report(output, acceleration_report, [offline_report])
 
@@ -1222,7 +1256,11 @@ def apply_localized_edit(job: Job, data: Dict[str, Any]) -> Dict[str, Any]:
         raise RequestError("人工复核只适用于已完成的先验地图会话优化结果。")
     edit_lock = STATE.acquire_edit_lock(job.identifier)
     with edit_lock:
-        journal = load_json(job.output_dir / "manual_edits.json", None)
+        store = LocalizedVersionStore(job.output_dir)
+        current = store.current()
+        if current is None:
+            raise RequestError("结果缺少已验证的 current 本地化版本。")
+        journal = load_json(current.version_dir / "manual_edits.json", None)
         if not isinstance(journal, dict):
             raise RequestError("结果缺少有效的 manual_edits.json。")
         expected_revision = data.get("expected_revision")
@@ -1256,7 +1294,7 @@ def apply_localized_edit(job: Job, data: Dict[str, Any]) -> Dict[str, Any]:
 
         journal["revision"] = journal.get("revision", 1) + 1
 
-        source = load_json(job.output_dir / "source_manifest.json", None)
+        source = load_json(current.version_dir / "source_manifest.json", None)
         map_payload = load_json(job.output_dir / "map.json", {})
         if not isinstance(source, dict):
             raise RequestError("结果缺少 source_manifest.json，无法安全重放。")
@@ -1298,7 +1336,7 @@ def apply_localized_edit(job: Job, data: Dict[str, Any]) -> Dict[str, Any]:
             )
             for pose in segments[0].poses
         ]
-        localized.process_localized_session(
+        result = localized.process_localized_session(
             prior_map=prior_map,
             session=session,
             optimized_poses=poses,
@@ -1307,10 +1345,15 @@ def apply_localized_edit(job: Job, data: Dict[str, Any]) -> Dict[str, Any]:
             output=job.output_dir,
             manual_edits=journal,
         )
+        if not result.get("current_updated"):
+            raise RequestError(
+                "人工编辑重放未通过质量门禁；旧 current 版本保持不变。"
+            )
     return {
         "cursor": journal["cursor"],
         "revision": journal["revision"],
         "event_count": len(journal["events"]),
+        "version_id": result["version_id"],
         "job": job_payload(job),
     }
 
@@ -1667,14 +1710,40 @@ class StudioHandler(BaseHTTPRequestHandler):
         if len(parts) >= 6 and parts[4] == "artifact":
             self.serve_artifact(job, "/".join(parts[5:]))
             return
+        if (
+            len(parts) >= 9
+            and parts[4] == "localized"
+            and parts[5] == "versions"
+            and parts[7] == "artifact"
+        ):
+            self.serve_localized_artifact(
+                job, parts[6], "/".join(parts[8:])
+            )
+            return
         self.send_json(HTTPStatus.NOT_FOUND, {"error": "Unknown job endpoint."})
+
+    def serve_localized_artifact(
+        self, job: Job, version_id: str, name: str
+    ) -> None:
+        if job.kind != "localized" or name not in REQUIRED_VERSION_FILES:
+            self.send_json(HTTPStatus.NOT_FOUND, {"error": "Artifact is not available."})
+            return
+        try:
+            snapshot = LocalizedVersionStore(job.output_dir).resolve_version(version_id)
+        except LocalizedStoreError:
+            self.send_json(HTTPStatus.NOT_FOUND, {"error": "Localized version was not found."})
+            return
+        self.serve_file(snapshot.version_dir, name)
 
     def serve_artifact(self, job: Job, name: str) -> None:
         if name not in ARTIFACTS and not name.startswith("preview_frames/"):
             self.send_json(HTTPStatus.NOT_FOUND, {"error": "Artifact is not available."})
             return
-        path = (job.output_dir / name).resolve()
-        if job.output_dir.resolve() not in path.parents or not path.is_file():
+        self.serve_file(job.output_dir, name)
+
+    def serve_file(self, root: Path, name: str) -> None:
+        path = (root / name).resolve()
+        if root.resolve() not in path.parents or not path.is_file():
             self.send_json(HTTPStatus.NOT_FOUND, {"error": "Artifact was not found."})
             return
         content_type = {

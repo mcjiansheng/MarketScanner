@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable, Sequence
 
+from .localized_output_store import LocalizedVersionStore
 from .prior_map_schema import load_json, validate_package
 
 
@@ -1614,7 +1615,7 @@ def move_manual_edit_cursor(journal: dict[str, Any], delta: int) -> dict[str, An
     return {**journal, "cursor": cursor}
 
 
-def process_localized_session(
+def _render_localized_version(
     prior_map: Path,
     session: Path,
     optimized_poses: Sequence[Pose],
@@ -2194,7 +2195,7 @@ def process_localized_session(
             sum(float(tag.get("association_confidence", 0)) for tag in final_tags)
             / max(1, len(final_tags))
         ),
-        "publish_state": "draft",
+        "publish_state": "draft" if allow_draft else "invalid",
         "allow_draft": allow_draft,
         "allow_auto_publish": False,
         "warnings": [],
@@ -2399,3 +2400,60 @@ def process_localized_session(
             "离线轨迹、价签结果、复核项和审计记录已生成",
         )
     return report
+
+
+def process_localized_session(
+    prior_map: Path,
+    session: Path,
+    optimized_poses: Sequence[Pose],
+    source_database: Path,
+    optimized_database: Path,
+    output: Path,
+    manual_edits: dict[str, Any] | None = None,
+    progress: Callable[[int, str, str], None] | None = None,
+) -> dict[str, Any]:
+    """Render and atomically commit an immutable localized result version.
+
+    The rendering function only receives a private staging directory. Readers
+    continue resolving the previous ``current.json`` pointer until every
+    required artifact has been validated, fsynced and renamed into ``versions``.
+    An invalid diagnostic version is retained for audit but never becomes the
+    current result.
+    """
+
+    store = LocalizedVersionStore(output)
+    previous = store.current()
+    staging = store.begin()
+    try:
+        report = _render_localized_version(
+            prior_map=prior_map,
+            session=session,
+            optimized_poses=optimized_poses,
+            source_database=source_database,
+            optimized_database=optimized_database,
+            output=staging,
+            manual_edits=manual_edits,
+            progress=progress,
+        )
+        manifest = store.validate_staging(
+            staging,
+            parent_version=previous.version_id if previous else None,
+        )
+        update_current = bool(report.get("allow_draft")) and (
+            report.get("publish_state") == "draft"
+        )
+        snapshot = store.commit(
+            staging,
+            manifest,
+            update_current=update_current,
+        )
+    except Exception:
+        if staging.exists():
+            store.abort(staging)
+        raise
+    return {
+        **report,
+        "version_id": snapshot.version_id,
+        "revision": snapshot.revision,
+        "current_updated": update_current,
+    }
