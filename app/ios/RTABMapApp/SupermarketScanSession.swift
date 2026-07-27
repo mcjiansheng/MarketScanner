@@ -176,15 +176,80 @@ struct ScanLiveCheckpoint: Codable {
     let initialMapPose: PriorMapPose2D?
 }
 
-struct ManualLocalizationEvent: Codable {
+struct ManualLocalizationEvent: Encodable {
     let format: String
     let version: Int
-    let timestamp: String
-    let timestampUnix: TimeInterval
+    let wallClockTimestamp: String
+    let wallClockTimestampUnix: TimeInterval
+    let frameTimestamp: TimeInterval
+    let nearestNodeId: Int?
+    let nearestNodeStamp: TimeInterval?
+    let nodeTimeDeltaSeconds: TimeInterval?
+    let nodeBindingStatus: String
+    let nodeBindingReason: String
+    let alignmentVersion: Int
     let trackingSessionId: String
+    let priorMapId: String?
+    let priorMapSha256: String?
+    let floorId: String?
     let reason: String
     let arkitPose: PriorMapPose2D
     let confirmedMapPose: PriorMapPose2D
+
+    enum CodingKeys: String, CodingKey {
+        case format
+        case version
+        case wallClockTimestamp = "wall_clock_timestamp"
+        case wallClockTimestampUnix = "wall_clock_timestamp_unix"
+        case frameTimestamp = "frame_timestamp"
+        case nearestNodeId = "nearest_node_id"
+        case nearestNodeStamp = "nearest_node_stamp"
+        case nodeTimeDeltaSeconds = "node_time_delta_seconds"
+        case nodeBindingStatus = "node_binding_status"
+        case nodeBindingReason = "node_binding_reason"
+        case alignmentVersion = "alignment_version"
+        case trackingSessionId = "tracking_session_id"
+        case priorMapId = "prior_map_id"
+        case priorMapSha256 = "prior_map_sha256"
+        case floorId = "floor_id"
+        case reason
+        case arkitPose = "arkit_pose"
+        case confirmedMapPose = "confirmed_map_pose"
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(format, forKey: .format)
+        try container.encode(version, forKey: .version)
+        try container.encode(wallClockTimestamp, forKey: .wallClockTimestamp)
+        try container.encode(wallClockTimestampUnix, forKey: .wallClockTimestampUnix)
+        try container.encode(frameTimestamp, forKey: .frameTimestamp)
+        if let nearestNodeId {
+            try container.encode(nearestNodeId, forKey: .nearestNodeId)
+        } else {
+            try container.encodeNil(forKey: .nearestNodeId)
+        }
+        if let nearestNodeStamp {
+            try container.encode(nearestNodeStamp, forKey: .nearestNodeStamp)
+        } else {
+            try container.encodeNil(forKey: .nearestNodeStamp)
+        }
+        if let nodeTimeDeltaSeconds {
+            try container.encode(nodeTimeDeltaSeconds, forKey: .nodeTimeDeltaSeconds)
+        } else {
+            try container.encodeNil(forKey: .nodeTimeDeltaSeconds)
+        }
+        try container.encode(nodeBindingStatus, forKey: .nodeBindingStatus)
+        try container.encode(nodeBindingReason, forKey: .nodeBindingReason)
+        try container.encode(alignmentVersion, forKey: .alignmentVersion)
+        try container.encode(trackingSessionId, forKey: .trackingSessionId)
+        try container.encodeIfPresent(priorMapId, forKey: .priorMapId)
+        try container.encodeIfPresent(priorMapSha256, forKey: .priorMapSha256)
+        try container.encodeIfPresent(floorId, forKey: .floorId)
+        try container.encode(reason, forKey: .reason)
+        try container.encode(arkitPose, forKey: .arkitPose)
+        try container.encode(confirmedMapPose, forKey: .confirmedMapPose)
+    }
 }
 
 struct PriorMapConstraintRecord: Codable {
@@ -1048,19 +1113,35 @@ final class SupermarketScanSession {
         reason: String,
         arkitPose: PriorMapPose2D,
         confirmedMapPose: PriorMapPose2D,
+        wallClock: Date,
+        frameTimestamp: TimeInterval,
+        alignmentVersion: Int,
         expectedTrackingSessionId: String
     ) {
+        guard frameTimestamp.isFinite, alignmentVersion > 0 else {
+            print("Refused to persist an invalid manual localization v2 event")
+            return
+        }
         localizationTransactionLock.lock()
         defer { localizationTransactionLock.unlock() }
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        let now = Date()
         let event = ManualLocalizationEvent(
             format: "MarketScannerManualLocalizationEvent",
-            version: 1,
-            timestamp: formatter.string(from: now),
-            timestampUnix: now.timeIntervalSince1970,
+            version: 2,
+            wallClockTimestamp: formatter.string(from: wallClock),
+            wallClockTimestampUnix: wallClock.timeIntervalSince1970,
+            frameTimestamp: frameTimestamp,
+            nearestNodeId: nil,
+            nearestNodeStamp: nil,
+            nodeTimeDeltaSeconds: nil,
+            nodeBindingStatus: "frame_timestamp_only",
+            nodeBindingReason: "native_node_binding_unavailable",
+            alignmentVersion: alignmentVersion,
             trackingSessionId: expectedTrackingSessionId,
+            priorMapId: scanConfiguration.priorMapId,
+            priorMapSha256: scanConfiguration.priorMapSha256,
+            floorId: scanConfiguration.floorId,
             reason: reason,
             arkitPose: arkitPose,
             confirmedMapPose: confirmedMapPose)

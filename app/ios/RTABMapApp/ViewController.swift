@@ -2756,21 +2756,32 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         }
         let generation = priorMapGeneration
         let trackingSessionId = supermarketSession?.trackingSessionId ?? ""
+        let confirmationWallClock = Date()
+        let confirmationFrameTimestamp = frame.timestamp
+        let confirmationTransform = frame.camera.transform
         priorMapQueue.async {
             let poses = localizer.confirmCurrentPosition(
-                transform: frame.camera.transform,
+                transform: confirmationTransform,
                 mapPose: mapPose)
             guard generation == self.priorMapGeneration else {
                 return
             }
-            if let snapshot = localizer.alignmentSnapshot(
-                frameTimestamp: frame.timestamp) {
-                self.priorMapAlignmentSnapshots.publish(snapshot)
+            guard let snapshot = localizer.alignmentSnapshot(
+                frameTimestamp: confirmationFrameTimestamp) else {
+                self.supermarketSession?.appendScanEvent(
+                    event: "manual_localization_event_rejected",
+                    message: "Manual localization alignment snapshot was unavailable",
+                    fields: ["reason": "alignment_snapshot_unavailable"])
+                return
             }
+            self.priorMapAlignmentSnapshots.publish(snapshot)
             self.supermarketSession?.appendManualLocalizationEvent(
                 reason: reason,
                 arkitPose: poses.0,
                 confirmedMapPose: poses.1,
+                wallClock: confirmationWallClock,
+                frameTimestamp: confirmationFrameTimestamp,
+                alignmentVersion: snapshot.alignmentVersion,
                 expectedTrackingSessionId: trackingSessionId)
             self.supermarketSession?.appendScanEvent(
                 event: "manual_localization_confirmed",

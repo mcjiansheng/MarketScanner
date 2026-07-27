@@ -14,6 +14,7 @@ from tools.PriorMap.offline_localization import (
     _segment_intersection,
     apply_pose_delta_to_point,
     bind_tag_observation_to_pose,
+    bind_manual_localization_event_to_pose,
     append_manual_edit,
     build_road_soft_constraints,
     build_manual_aisle_constraints,
@@ -171,7 +172,13 @@ class TagObservationBindingTests(unittest.TestCase):
                 expected_floor_id="1",
             )
         with self.assertRaisesRegex(OfflineLocalizationError, "timestamp"):
-            self._bind({key: value for key, value in self.observation.items() if key != "frame_timestamp"})
+            self._bind(
+                {
+                    key: value
+                    for key, value in self.observation.items()
+                    if key != "frame_timestamp"
+                }
+            )
 
     def test_identity_and_time_delta_mismatches_fail_closed(self) -> None:
         with self.assertRaisesRegex(OfflineLocalizationError, "tracking_session"):
@@ -198,6 +205,75 @@ class TagObservationBindingTests(unittest.TestCase):
         for invalid in (True, 10.5):
             with self.assertRaisesRegex(OfflineLocalizationError, "invalid"):
                 self._bind({**self.observation, "nearest_node_id": invalid})
+
+
+class ManualLocalizationTimebaseTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.poses = [
+            Pose(21, 10.0, 0.0, 0.0, 0.0),
+            Pose(22, 11.0, 1.0, 0.0, 0.0),
+        ]
+        self.event = {
+            "format": "MarketScannerManualLocalizationEvent",
+            "version": 2,
+            "wall_clock_timestamp_unix": 1_800_000_000.0,
+            "frame_timestamp": 11.05,
+            "nearest_node_id": None,
+            "nearest_node_stamp": None,
+            "node_time_delta_seconds": None,
+            "node_binding_status": "frame_timestamp_only",
+            "alignment_version": 2,
+            "tracking_session_id": "tracking-1",
+            "prior_map_sha256": "a" * 64,
+            "floor_id": "1",
+            "confirmed_map_pose": {"x_m": 1.0, "y_m": 2.0, "yaw_rad": 0.1},
+        }
+
+    def _bind(self, event: dict[str, object]):
+        return bind_manual_localization_event_to_pose(
+            self.poses,
+            event,
+            expected_tracking_session_id="tracking-1",
+            expected_map_hash="a" * 64,
+            expected_floor_id="1",
+        )
+
+    def test_v2_uses_frame_timestamp_not_wall_clock(self) -> None:
+        binding = self._bind(self.event)
+        self.assertEqual(binding.node_index, 1)
+        self.assertAlmostEqual(binding.time_delta_seconds, 0.05)
+
+    def test_exact_node_evidence_must_match_database_stamp_and_delta(self) -> None:
+        event = {
+            **self.event,
+            "nearest_node_id": 22,
+            "nearest_node_stamp": 11.0,
+            "node_time_delta_seconds": 0.05,
+            "node_binding_status": "matched",
+        }
+        self.assertEqual(self._bind(event).binding_source, "nearest_node_id")
+        with self.assertRaisesRegex(OfflineLocalizationError, "stamp_mismatch"):
+            self._bind({**event, "nearest_node_stamp": 10.5})
+        with self.assertRaisesRegex(OfflineLocalizationError, "delta_mismatch"):
+            self._bind({**event, "node_time_delta_seconds": 0.5})
+
+    def test_legacy_wrong_identity_and_ambiguous_time_are_rejected(self) -> None:
+        with self.assertRaisesRegex(OfflineLocalizationError, "legacy"):
+            self._bind({**self.event, "version": 1})
+        with self.assertRaisesRegex(OfflineLocalizationError, "tracking_session"):
+            self._bind({**self.event, "tracking_session_id": "wrong"})
+        ambiguous = [
+            Pose(1, 10.0, 0.0, 0.0, 0.0),
+            Pose(2, 12.0, 0.0, 0.0, 0.0),
+        ]
+        with self.assertRaisesRegex(OfflineLocalizationError, "ambiguous"):
+            bind_manual_localization_event_to_pose(
+                ambiguous,
+                {**self.event, "frame_timestamp": 11.0},
+                expected_tracking_session_id="tracking-1",
+                expected_map_hash="a" * 64,
+                expected_floor_id="1",
+            )
 
 
 class RobustSE2OptimizerTests(unittest.TestCase):
@@ -663,6 +739,31 @@ class LocalizedPipelineTests(unittest.TestCase):
         self.assertNotIn("final_map_position", tag)
         self.assertEqual(tag["transform_audit"]["status"], "not_applied")
         self.assertEqual(tag["association_audit"]["status"], "not_attempted")
+
+    def test_legacy_manual_wall_clock_event_is_audited_not_applied(self) -> None:
+        jsonl_write(
+            self.segment / "manual_localization_events.jsonl",
+            [{
+                "format": "MarketScannerManualLocalizationEvent",
+                "version": 1,
+                "timestampUnix": 1_800_000_000.0,
+                "confirmedMapPose": {"x_m": 50.0, "y_m": 50.0, "yaw_rad": 0.0},
+            }],
+        )
+        output = self.root / "localized-legacy-manual"
+        report = process_localized_session(
+            self.prior_map,
+            self.session,
+            self.poses,
+            self.source_database,
+            self.optimized_database,
+            output,
+        )
+        self.assertEqual(report["accepted_manual_anchor_count"], 0)
+        self.assertEqual(
+            report["manual_localization_event_audit"][0]["reason"],
+            "manual_event_legacy_or_unknown_version",
+        )
 
 
 if __name__ == "__main__":

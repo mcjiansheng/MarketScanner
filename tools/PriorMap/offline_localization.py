@@ -378,6 +378,125 @@ def bind_tag_observation_to_pose(
     )
 
 
+def bind_manual_localization_event_to_pose(
+    poses: Sequence[Pose],
+    event: dict[str, Any],
+    *,
+    expected_tracking_session_id: str,
+    expected_map_hash: str,
+    expected_floor_id: str,
+    maximum_time_delta_seconds: float = 1.0,
+) -> TagPoseBinding:
+    """Validate a v2 manual event and bind it to the RTAB-Map timebase."""
+    if event.get("format") != "MarketScannerManualLocalizationEvent":
+        raise OfflineLocalizationError("manual_event_format_invalid")
+    if event.get("version") != 2:
+        raise OfflineLocalizationError("manual_event_legacy_or_unknown_version")
+    identities = (
+        (
+            "tracking_session_id",
+            expected_tracking_session_id,
+            str(event.get("tracking_session_id") or ""),
+        ),
+        (
+            "prior_map_sha256",
+            expected_map_hash,
+            str(event.get("prior_map_sha256") or ""),
+        ),
+        (
+            "floor_id",
+            expected_floor_id,
+            str(event.get("floor_id") or ""),
+        ),
+    )
+    for name, expected, actual in identities:
+        if expected and actual != expected:
+            raise OfflineLocalizationError(f"manual_event_{name}_mismatch")
+    frame_value = event.get("frame_timestamp")
+    if isinstance(frame_value, bool):
+        raise OfflineLocalizationError("manual_event_frame_timestamp_invalid")
+    try:
+        frame_timestamp = float(frame_value)
+        alignment_version = int(event.get("alignment_version"))
+    except (TypeError, ValueError):
+        raise OfflineLocalizationError("manual_event_time_or_alignment_invalid")
+    if not math.isfinite(frame_timestamp) or alignment_version <= 0:
+        raise OfflineLocalizationError("manual_event_time_or_alignment_invalid")
+
+    node_id_value = event.get("nearest_node_id")
+    binding_source = "frame_timestamp"
+    if node_id_value is not None:
+        if isinstance(node_id_value, bool):
+            raise OfflineLocalizationError("manual_event_node_id_invalid")
+        try:
+            node_id_number = float(node_id_value)
+        except (TypeError, ValueError):
+            raise OfflineLocalizationError("manual_event_node_id_invalid")
+        if not math.isfinite(node_id_number) or not node_id_number.is_integer():
+            raise OfflineLocalizationError("manual_event_node_id_invalid")
+        matches = [
+            index for index, pose in enumerate(poses) if pose.node_id == int(node_id_number)
+        ]
+        if len(matches) != 1:
+            raise OfflineLocalizationError(
+                "manual_event_node_id_not_found"
+                if not matches
+                else "manual_event_node_id_ambiguous"
+            )
+        index = matches[0]
+        binding_source = "nearest_node_id"
+        event_node_stamp_value = event.get("nearest_node_stamp")
+        event_delta_value = event.get("node_time_delta_seconds")
+        try:
+            event_node_stamp = float(event_node_stamp_value)
+            event_delta = float(event_delta_value)
+        except (TypeError, ValueError):
+            raise OfflineLocalizationError("manual_event_node_evidence_missing")
+        actual_stamp = poses[index].timestamp
+        if actual_stamp is None or not all(
+            math.isfinite(value)
+            for value in (event_node_stamp, event_delta, float(actual_stamp))
+        ):
+            raise OfflineLocalizationError("manual_event_node_evidence_invalid")
+        if abs(event_node_stamp - float(actual_stamp)) > 1.0e-6:
+            raise OfflineLocalizationError("manual_event_node_stamp_mismatch")
+        recomputed_delta = abs(frame_timestamp - float(actual_stamp))
+        if abs(event_delta - recomputed_delta) > 1.0e-6:
+            raise OfflineLocalizationError("manual_event_node_delta_mismatch")
+    else:
+        if event.get("node_binding_status") != "frame_timestamp_only":
+            raise OfflineLocalizationError("manual_event_node_binding_status_invalid")
+        finite_candidates = [
+            (abs(float(pose.timestamp) - frame_timestamp), index)
+            for index, pose in enumerate(poses)
+            if pose.timestamp is not None and math.isfinite(float(pose.timestamp))
+        ]
+        if not finite_candidates:
+            raise OfflineLocalizationError("manual_event_no_node_timestamps")
+        finite_candidates.sort()
+        if (
+            len(finite_candidates) > 1
+            and abs(finite_candidates[0][0] - finite_candidates[1][0]) <= 1.0e-6
+        ):
+            raise OfflineLocalizationError("manual_event_timestamp_binding_ambiguous")
+        index = finite_candidates[0][1]
+
+    node_stamp_value = poses[index].timestamp
+    if node_stamp_value is None or not math.isfinite(float(node_stamp_value)):
+        raise OfflineLocalizationError("manual_event_bound_node_stamp_invalid")
+    node_stamp = float(node_stamp_value)
+    time_delta = abs(frame_timestamp - node_stamp)
+    if time_delta > maximum_time_delta_seconds:
+        raise OfflineLocalizationError("manual_event_node_time_delta_exceeded")
+    return TagPoseBinding(
+        node_index=index,
+        observation_timestamp=frame_timestamp,
+        node_timestamp=node_stamp,
+        time_delta_seconds=time_delta,
+        binding_source=binding_source,
+    )
+
+
 def _project_to_segment(
     x: float,
     y: float,
@@ -1643,21 +1762,48 @@ def process_localized_session(
                 source=record,
             )
         )
+    manual_event_audit: list[dict[str, Any]] = []
     for sequence, record in enumerate(manual_events, start=1):
-        pose = _pose_from(record.get("confirmedMapPose"))
+        identifier = f"manual-{sequence:06d}"
+        try:
+            binding = bind_manual_localization_event_to_pose(
+                baseline,
+                record,
+                expected_tracking_session_id=str(
+                    metadata.get("trackingSessionId")
+                    or metadata.get("tracking_session_id")
+                    or ""
+                ),
+                expected_map_hash=str(expected_hash or ""),
+                expected_floor_id=str(
+                    metadata.get("floorId") or metadata.get("floor_id") or ""
+                ),
+            )
+        except OfflineLocalizationError as exc:
+            manual_event_audit.append(
+                {
+                    "constraint_id": identifier,
+                    "status": "rejected",
+                    "reason": str(exc),
+                    "source_version": record.get("version"),
+                }
+            )
+            continue
+        pose = _pose_from(record.get("confirmed_map_pose"))
         if pose is None:
-            pose = _pose_from(record.get("confirmed_map_pose"))
-        if pose is None:
+            manual_event_audit.append(
+                {
+                    "constraint_id": identifier,
+                    "status": "rejected",
+                    "reason": "manual_event_confirmed_map_pose_invalid",
+                    "source_version": record.get("version"),
+                }
+            )
             continue
         constraints.append(
             AbsoluteConstraint(
-                identifier=f"manual-{sequence:06d}",
-                node_index=_nearest_pose_index(
-                    baseline,
-                    float(record.get("timestampUnix"))
-                    if record.get("timestampUnix") is not None
-                    else None,
-                ),
+                identifier=identifier,
+                node_index=binding.node_index,
                 x=pose[0],
                 y=pose[1],
                 yaw=pose[2],
@@ -1665,6 +1811,18 @@ def process_localized_session(
                 kind="manual_anchor",
                 source=record,
             )
+        )
+        manual_event_audit.append(
+            {
+                "constraint_id": identifier,
+                "status": "accepted",
+                "bound_node_id": baseline[binding.node_index].node_id,
+                "bound_node_stamp": binding.node_timestamp,
+                "frame_timestamp": binding.observation_timestamp,
+                "time_delta_seconds": binding.time_delta_seconds,
+                "binding_source": binding.binding_source,
+                "alignment_version": record.get("alignment_version"),
+            }
         )
     constraint_records, _, edit_audit = apply_manual_edits(
         constraint_records, [], manual_edits
@@ -1880,6 +2038,17 @@ def process_localized_session(
     ]
     review_items.extend(
         {
+            "id": f"manual-event-{index:06d}",
+            "type": "manual_localization_event",
+            "severity": "warning",
+            "message": "人工定位事件未通过同源时间和节点绑定校验。",
+            "details": item,
+        }
+        for index, item in enumerate(manual_event_audit, start=1)
+        if item.get("status") == "rejected"
+    )
+    review_items.extend(
+        {
             "id": f"tag-{tag.get('tag_id', index)}",
             "type": "price_tag",
             "severity": "warning",
@@ -2017,6 +2186,7 @@ def process_localized_session(
             # Use final trajectory-based road inference, not online raw candidates.
         ],
         "manual_anchor_count": sum(item.kind == "manual_anchor" for item in constraints),
+        "manual_localization_event_audit": manual_event_audit,
         "tag_total": len(final_tags),
         "tag_confirmed": sum(tag.get("approval_status") in {"approved", "auto_approved"} for tag in final_tags),
         "tag_needs_review": needs_review_count,
