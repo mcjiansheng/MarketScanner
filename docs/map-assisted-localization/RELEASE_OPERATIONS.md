@@ -15,7 +15,7 @@ python3 tools/SupermarketMapStudio/server.py --version
 python3 tools/SupermarketMapStudio/server.py --selfcheck
 ```
 
-生产启动器会先检查 Python >= 3.10、至少 1 GiB 状态盘空间、`rtabmap-reprocess`、完整相对 SE(2) helper 和 operator package integrity；任一关键项缺失都退出，不以有限功能模式伪装生产可用。损坏/旧格式 job journal 会 fail closed、不加载也不清理其路径，但作为可恢复告警允许服务启动，供操作者从“版本与恢复”查看并先导出诊断。
+生产启动器会先检查 Python >= 3.10、至少 1 GiB 状态盘空间、`rtabmap-reprocess`、完整相对 SE(2) helper 和 operator package integrity；两个 native 工具会实际执行 `--version` 并核对 package/source SHA，而不是只检查文件存在。任一关键项缺失都退出，不以有限功能模式伪装生产可用。损坏/旧格式 job journal 会 fail closed、不加载也不清理其路径，但作为可恢复告警允许服务启动，供操作者从“版本与恢复”查看并先导出诊断。
 
 - macOS：`tools/SupermarketMapStudio/launch_macos.command`
 - Windows PowerShell：`tools/SupermarketMapStudio/launch_windows.ps1`

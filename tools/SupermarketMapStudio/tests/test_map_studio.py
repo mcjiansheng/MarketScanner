@@ -635,15 +635,16 @@ class MapStudioApiTests(unittest.TestCase):
         server.STATE.startup_errors[:] = ["old.json: journal schema is invalid"]
         try:
             with (
-                mock.patch.object(
-                    server.offline,
-                    "find_reprocess_binary",
-                    return_value=executable,
-                ),
+                mock.patch.object(server.offline, "find_reprocess_binary", return_value=executable),
+                mock.patch.object(server, "find_factor_graph_binary", return_value=executable),
                 mock.patch.object(
                     server,
-                    "find_factor_graph_binary",
-                    return_value=executable,
+                    "native_tool_diagnostic",
+                    side_effect=lambda name, _path: {
+                        "name": name,
+                        "ok": True,
+                        "detail": "ok",
+                    },
                 ),
                 mock.patch.object(
                     server,

@@ -3317,16 +3317,8 @@ def startup_diagnostics() -> Dict[str, Any]:
     reprocess = offline.find_reprocess_binary()
     factor = find_factor_graph_binary()
     checks.extend([
-        {
-            "name": "rtabmap_reprocess",
-            "ok": reprocess is not None,
-            "detail": str(reprocess) if reprocess else "not found",
-        },
-        {
-            "name": "relative_se2_factor_helper",
-            "ok": factor is not None,
-            "detail": str(factor) if factor else "not found",
-        },
+        native_tool_diagnostic("rtabmap_reprocess", reprocess),
+        native_tool_diagnostic("relative_se2_factor_helper", factor),
         {
             "name": "job_journal",
             "ok": not STATE.startup_errors,
@@ -3347,6 +3339,31 @@ def startup_diagnostics() -> Dict[str, Any]:
             item["ok"] for item in checks if item["name"] in critical_names
         ),
         "checks": checks,
+    }
+
+
+def native_tool_diagnostic(name: str, binary: Path | None) -> Dict[str, Any]:
+    if binary is None:
+        return {"name": name, "ok": False, "detail": "not found"}
+    try:
+        completed = subprocess.run(
+            [str(binary), "--version"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return {"name": name, "ok": False, "detail": str(exc)}
+    output = ((completed.stdout or "") + (completed.stderr or "")).strip()
+    source_matches = (
+        SOURCE_GIT_SHA == "unknown"
+        or f"marketscanner_git_sha={SOURCE_GIT_SHA}" in output
+    )
+    return {
+        "name": name,
+        "ok": completed.returncode == 0 and source_matches,
+        "detail": (output.splitlines() or [str(binary)])[0][:500],
     }
 
 
