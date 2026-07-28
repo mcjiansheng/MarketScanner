@@ -14,6 +14,8 @@ on:
       - "app/ios/RTABMapApp/**"
       - "docs/map-assisted-localization/**"
       - "tools/PriorMap/**"
+      - "tools/Reprocess/CMakeLists.txt"
+      - "tools/Reprocess/prior_map_factor_graph.cpp"
       - "tools/SupermarketMapStudio/**"
 
 concurrency:
@@ -194,6 +196,8 @@ jobs:
           } > ci-artifacts/native-summary.md
       - name: Check Swift, C wrapper and RTABMapApp symbols
         run: python3 tools/PriorMap/tests/native_symbol_contract.py
+      - name: Check read-only native factor graph contract
+        run: python3 tools/PriorMap/tests/factor_graph_native_contract.py
       - name: Record native source-contract scope
         shell: bash
         run: |

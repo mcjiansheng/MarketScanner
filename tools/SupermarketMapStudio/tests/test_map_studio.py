@@ -38,6 +38,29 @@ def create_localized_store(
     report: dict | None = None,
 ):
     store = server.LocalizedVersionStore(output)
+    report_payload = {
+        "publish_state": "draft",
+        "publish_gate": {
+            "passed": False,
+            "blockers": [{"code": "solver_not_full_relative_se2_factor_graph"}],
+        },
+        "solver": {
+            "type": "bounded_correction_field",
+            "full_factor_graph": False,
+            "published_capable": False,
+        },
+        **(report or {}),
+    }
+    solver_payload = dict(report_payload.get("solver") or {})
+    report_payload["solver"] = solver_payload
+    full_factor_graph = (
+        isinstance(solver_payload, dict)
+        and solver_payload.get("type") == "relative_se2_factor_graph"
+        and solver_payload.get("full_factor_graph") is True
+        and solver_payload.get("published_capable") is True
+    )
+    if full_factor_graph:
+        solver_payload.setdefault("factor_set_sha256", "d" * 64)
     previous = store.current()
     staging = store.begin()
     source_manifest = dict(source_manifest or {})
@@ -115,7 +138,7 @@ def create_localized_store(
         },
         "processing_manifest.json": {
             "format": "MarketScannerLocalizedProcessing", "version": 2,
-            "publish_state": (report or {}).get("publish_state", "draft"),
+            "publish_state": report_payload["publish_state"],
             "input_identity_id": input_identity_id,
             **identities,
             "replay_parameters": replay_parameters,
@@ -133,7 +156,24 @@ def create_localized_store(
         },
         "localization_report.json": {
             "format": "MarketScannerLocalizationReport", "version": 1,
-            **(report or {"publish_state": "draft"}),
+            **report_payload,
+        },
+        "factor_graph_report.json": {
+            "format": "MarketScannerRelativeSE2FactorGraphReport",
+            "version": 1,
+            "solver": (
+                "rtabmap_g2o_slam2d" if full_factor_graph else "unavailable"
+            ),
+            "full_factor_graph": full_factor_graph,
+            "published_capable": full_factor_graph,
+            "converged": full_factor_graph,
+            "input_identity_id": input_identity_id,
+            "optimized_database_sha256": optimized_hash,
+            **(
+                {"factor_set_sha256": solver_payload["factor_set_sha256"]}
+                if full_factor_graph
+                else {}
+            ),
         },
         "review_items.json": {
             "format": "MarketScannerLocalizationReviewItems", "version": 1,

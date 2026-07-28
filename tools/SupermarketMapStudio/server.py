@@ -48,6 +48,7 @@ import merge_processing as merge
 from PriorMap.prior_map_schema import validate_package as validate_prior_map_package
 from PriorMap.xlsx_to_prior_map import convert_workbook as convert_prior_map_workbook
 from PriorMap import offline_localization as localized
+from PriorMap.factor_graph_runner import find_factor_graph_binary
 from PriorMap.localized_output_store import (
     LocalizedSnapshot,
     LocalizedStoreError,
@@ -95,6 +96,7 @@ ARTIFACTS = (
     "optimized_map_trajectory.geojson",
     "localization_constraints.json",
     "localization_report.json",
+    "factor_graph_report.json",
     "manual_edits.json",
     "localized_price_tags.json",
     "localized_price_tags.csv",
@@ -402,6 +404,7 @@ def map_options(data: Dict[str, Any]) -> Dict[str, Any]:
         "preview_3d_quality": preview_3d_quality,
         "offline_optimize": boolean(options.get("offline_optimize"), False),
         "reprocess_binary": str(options.get("reprocess_binary") or "").strip() or None,
+        "factor_graph_binary": str(options.get("factor_graph_binary") or "").strip() or None,
         "pc_threads": integer(
             options.get("pc_threads"),
             "PC worker count",
@@ -1766,6 +1769,7 @@ def run_localized_map(
         output=output,
         manual_edits=manual_edits,
         progress=progress,
+        factor_graph_binary=find_factor_graph_binary(options["factor_graph_binary"]),
         replay_parameters={
             "resolution": config.resolution,
             "preview_resolution": config.preview_resolution,
@@ -2188,6 +2192,7 @@ def apply_localized_edit(job: Job, data: Dict[str, Any]) -> Dict[str, Any]:
                 manual_edits=journal,
                 expected_parent_version=current.version_id,
                 replay_parameters=replay_parameters,
+                factor_graph_binary=find_factor_graph_binary(),
             )
         except localized.OfflineLocalizationError as exc:
             if "current version changed during replay" in str(exc):

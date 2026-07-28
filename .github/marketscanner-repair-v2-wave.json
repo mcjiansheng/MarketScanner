@@ -1,5 +1,5 @@
 {
-  "wave": "P0-production-baseline",
-  "base_branch": "repair-v2-w2r-safety-closeout",
-  "base_sha": "cf1b62c949f3574e1804808537e38c8ff643549c"
+  "wave": "P1-relative-se2-factor-graph",
+  "base_branch": "repair-v2-p0-production-baseline",
+  "base_sha": "b22b74b03c5d2872fedf94770710284105cb1364"
 }

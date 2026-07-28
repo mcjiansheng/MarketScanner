@@ -965,6 +965,7 @@ class LocalizedPipelineTests(unittest.TestCase):
             "processing_manifest.json",
             "optimized_map_trajectory.geojson",
             "localization_report.json",
+            "factor_graph_report.json",
             "review_items.json",
             "localized_review.json",
             "manual_edits.json",

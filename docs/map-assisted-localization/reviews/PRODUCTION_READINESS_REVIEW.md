@@ -4,7 +4,7 @@
 > 外部审查输入：`MarketScanner_RepairV2_W2R_Production_Readiness_Code_Review_and_Final_Product_Agent_Spec_2026-07-28.md`。
 > 审查基线：`repair-v2-w2r-safety-closeout@cf1b62c949f3574e1804808537e38c8ff643549c`。
 > 代码基线：`ed85c38704461429e16321089d9e4e1b05d86753`；其后的提交只更新 W2R 文档和远端证据。
-> 当前 wave：`P0-production-baseline`；实施分支：`repair-v2-p0-production-baseline`。
+> 当前 wave：`P1-relative-se2-factor-graph`；实施分支：`repair-v2-p1-relative-se2-factor-graph`。
 > P0 已验证头：`011ce479b74d10cb43106dda6ea757fb1ee2fa73`；本文件之后的证据提交不改变 P0 CI/测试树。
 
 ## 当前判定
@@ -22,7 +22,7 @@ P0 只冻结安全基线，不改变业务算法。CI 必须单独运行并报�
 
 | ID | 状态 | 关闭条件 |
 | --- | --- | --- |
-| RB-01 | **阻断** | 实现并验证读取 RTAB-Map 相对/闭环边的完整相对 SE(2) 因子图；通过发布门禁、回放、坏边拒绝和性能测试 |
+| RB-01 | **代码已关闭，待扩大资格样本** | native helper 已读取 RTAB-Map 相对/闭环 Link transform 和 information，严格验证并接入发布能力；已用 2,315-node 真实 DB 只读运行。clean runner 和更多真实样本随 P2/P5/P6 继续验证 |
 | RB-02 | **阻断** | 从干净环境可重复完成 PC 与 iOS 所需构建，依赖来源、版本、摘要和命令可审计 |
 | RB-03 | **阻断** | 在支持 LiDAR 的真实 iPhone 完成规定的开始、弱纹理、动态干扰、扫码、结束、恢复和复制矩阵 |
 | RB-04 | **阻断** | 按 `FIELD_TEST_PLAN.md` 完成正式超市场景验收并保存不可伪造的原始证据 |
@@ -35,7 +35,7 @@ P0 只冻结安全基线，不改变业务算法。CI 必须单独运行并报�
 | Wave | 目标 | P0 时点状态 |
 | --- | --- | --- |
 | P0 | 冻结 W2R 安全基线和 CI 不变量 | 本地与远端验证通过 |
-| P1 | 完整相对 SE(2) 因子图与发布门 | 未开始；必须独立分支和原子提交 |
+| P1 | 完整相对 SE(2) 因子图与发布门 | 已实现并完成本机真实 DB 只读验证；远端 CI/clean build 仍待 P1/P2 证据 |
 | P2 | 干净、可复现的 PC/iOS 构建 | 未开始；不得复用未记录的本机缓存作为证据 |
 | P3 | Map Studio 持久任务和重启恢复 | 未开始；需覆盖崩溃与路径访问控制 |
 | P4 | iOS finalization、保留和 provider hardening | 未开始；不得声称 power-loss durability |

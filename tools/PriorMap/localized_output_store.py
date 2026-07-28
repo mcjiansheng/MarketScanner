@@ -27,6 +27,7 @@ REQUIRED_VERSION_FILES = (
     "optimized_map_trajectory.geojson",
     "localization_constraints.json",
     "localization_report.json",
+    "factor_graph_report.json",
     "review_items.json",
     "localized_review.json",
     "manual_edits.json",
@@ -36,8 +37,13 @@ REQUIRED_VERSION_FILES = (
     "shelf_tag_index.json",
     "audit_log.jsonl",
 )
+VERSION_2_REQUIRED_VERSION_FILES = tuple(
+    name for name in REQUIRED_VERSION_FILES if name != "factor_graph_report.json"
+)
 LEGACY_REQUIRED_VERSION_FILES = tuple(
-    name for name in REQUIRED_VERSION_FILES if name != "session_input_manifest.json"
+    name
+    for name in VERSION_2_REQUIRED_VERSION_FILES
+    if name != "session_input_manifest.json"
 )
 VERSION_STATES = frozenset(
     {"invalid", "draft", "review", "published", "superseded", "revoked"}
@@ -526,6 +532,10 @@ class LocalizedVersionStore:
             "session_input_manifest.json": ("MarketScannerLocalizedInputManifest", 1),
             "localization_constraints.json": ("MarketScannerOfflineLocalizationConstraints", 1),
             "localization_report.json": ("MarketScannerLocalizationReport", 1),
+            "factor_graph_report.json": (
+                "MarketScannerRelativeSE2FactorGraphReport",
+                1,
+            ),
             "review_items.json": ("MarketScannerLocalizationReviewItems", 1),
             "localized_review.json": ("MarketScannerLocalizedReview", 1),
             "manual_edits.json": ("MarketScannerManualEdits", 4),
@@ -591,6 +601,7 @@ class LocalizedVersionStore:
         if csv_count != len(tags) or csv_ids != tag_ids:
             raise LocalizedStoreError("Localized tag CSV does not match tag JSON order.")
         report = parsed["localization_report.json"]
+        factor_graph = parsed["factor_graph_report.json"]
         source = parsed["source_manifest.json"]
         processing = parsed["processing_manifest.json"]
         session_input = parsed["session_input_manifest.json"]
@@ -649,6 +660,36 @@ class LocalizedVersionStore:
             raise LocalizedStoreError("Manual edit revision is invalid.")
         if processing.get("publish_state") != state:
             raise LocalizedStoreError("Localized report and processing state differ.")
+        solver = report.get("solver")
+        publish_gate = report.get("publish_gate")
+        if not isinstance(solver, dict) or not isinstance(publish_gate, dict):
+            raise LocalizedStoreError("Localized solver or publish gate is invalid.")
+        full_solver = (
+            solver.get("type") == "relative_se2_factor_graph"
+            and solver.get("full_factor_graph") is True
+            and solver.get("published_capable") is True
+        )
+        factor_graph_valid = (
+            factor_graph.get("solver") == "rtabmap_g2o_slam2d"
+            and factor_graph.get("full_factor_graph") is True
+            and factor_graph.get("published_capable") is True
+            and factor_graph.get("converged") is True
+            and isinstance(factor_graph.get("factor_set_sha256"), str)
+            and re.fullmatch(r"[0-9a-f]{64}", factor_graph["factor_set_sha256"])
+            is not None
+            and solver.get("factor_set_sha256")
+            == factor_graph.get("factor_set_sha256")
+        )
+        if full_solver != factor_graph_valid:
+            raise LocalizedStoreError(
+                "Localized solver capability differs from the native factor report."
+            )
+        if publish_gate.get("passed") is True and (
+            not full_solver or publish_gate.get("blockers") != []
+        ):
+            raise LocalizedStoreError(
+                "Localized publish gate cannot pass without a verified full factor graph."
+            )
         identity_values = {
             session_input.get("input_identity_id"),
             source.get("input_identity_id"),
@@ -698,6 +739,14 @@ class LocalizedVersionStore:
             raise LocalizedStoreError(
                 "Localized session input database hash differs from source manifest."
             )
+        if (
+            factor_graph.get("input_identity_id") != input_identity_id
+            or factor_graph.get("optimized_database_sha256")
+            != identity_fields["optimized_database_sha256"]
+        ):
+            raise LocalizedStoreError(
+                "Native factor graph report differs from localized input identity."
+            )
         files = [
             {
                 "file": name,
@@ -708,7 +757,7 @@ class LocalizedVersionStore:
         ]
         return {
             "format": "MarketScannerLocalizedVersionManifest",
-            "version": 2,
+            "version": 3,
             "state": state,
             "revision": revision,
             "parent_version": parent_version,
@@ -1232,7 +1281,7 @@ class LocalizedVersionStore:
             ) from exc
         if (
             manifest.get("format") != "MarketScannerLocalizedVersionManifest"
-            or manifest.get("version") not in {1, 2}
+            or manifest.get("version") not in {1, 2, 3}
             or manifest.get("version_id") != version_id
             or state not in VERSION_STATES
             or revision < 1
@@ -1243,12 +1292,14 @@ class LocalizedVersionStore:
         manifest_version = int(manifest["version"])
         expected_files = (
             REQUIRED_VERSION_FILES
+            if manifest_version == 3
+            else VERSION_2_REQUIRED_VERSION_FILES
             if manifest_version == 2
             else LEGACY_REQUIRED_VERSION_FILES
         )
         input_identity_id: str | None = None
         session_input_bundle_sha256: str | None = None
-        if manifest_version == 2:
+        if manifest_version in {2, 3}:
             input_identity_id = manifest.get("input_identity_id")
             session_input_bundle_sha256 = manifest.get(
                 "session_input_bundle_sha256"

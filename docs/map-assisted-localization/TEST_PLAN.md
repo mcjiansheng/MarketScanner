@@ -89,7 +89,19 @@ python3 tools/PriorMap/benchmark_stage3.py \
   --nodes 2000 --max-seconds 15 --max-peak-mib 64
 ```
 
-该基准只测 `bounded_correction_field`，不代表完整 SE(2) 因子图、`rtabmap-reprocess`、地图生成或真实 iPhone matcher 性能。
+该基准只测 `bounded_correction_field` draft fallback，不代表完整 SE(2) 因子图、`rtabmap-reprocess`、地图生成或真实 iPhone matcher 性能。
+
+## P1 相对 SE(2) 因子图
+
+```bash
+cmake --build build-pc-release \
+  --target rtabmap-prior-map-factor-graph --config Release -j2
+python3 -m unittest tools.PriorMap.tests.test_factor_graph_schema -v
+```
+
+真实 DB 资格测试必须把 `--database` 指向 `rtabmap-reprocess` 的一次性输出副本，传入真实文件 SHA-256、正确的 `--horizontal-axes xz|xy`，执行前后重新计算 DB SHA，并用 `factor_graph_schema.validate_factor_graph_result()` 复核结果。至少记录 DB version、nodes/factors、factor digest、initial/final objective、iterations、gauge mode、残差 p95 和被拒绝/降权的 factor IDs。扫描 DB 和生成报告均不得进入 Git。
+
+自动负例覆盖断连、缺 endpoint、奇异 information、非有限结果、canonical/digest 篡改、错误 gauge 和不收敛；既有 `SE2TagPropagationTests` 覆盖 ±90°/180°、平移旋转耦合和 yaw wrap。clean runner 的 native helper 构建属于 P2，不得用已有本机构建目录替代。
 
 ## 样例地图验收
 

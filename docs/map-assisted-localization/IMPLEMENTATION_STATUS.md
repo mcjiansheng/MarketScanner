@@ -6,7 +6,7 @@
 
 当前发布判定是 **NO-GO / NOT PRODUCTION READY**。`repair-v2-w2r-safety-closeout@cf1b62c949f3574e1804808537e38c8ff643549c` 是生产化冻结基线；P0 在专用 CI job 中锁定 bounded solver 禁止发布、cleanup 确认与精确 CAS、复制后本地副本保留、required evidence 失败时 finalization fail closed 四项不变量，不修改业务算法。
 
-后续必须按 P1 至 P8 独立推进：P1 完整相对 SE(2) 因子图、P2 可复现干净构建、P3 Map Studio 持久任务、P4 iOS finalization/保留/provider hardening、P5 真机矩阵、P6 现场验收、P7 打包与 selfcheck、P8 独立复核。RB-01 至 RB-05 任一未关闭时均不得发布生产成果。权威判定和证据边界见 [`reviews/PRODUCTION_READINESS_REVIEW.md`](reviews/PRODUCTION_READINESS_REVIEW.md)。
+P1 已实现并在真实 DB 上只读验证完整相对 SE(2) 因子图、canonical factor digest、严格 Python 二次校验和 fail-closed publish capability；设计见 [`FACTOR_GRAPH_DESIGN.md`](FACTOR_GRAPH_DESIGN.md)。P2 至 P8 仍需独立推进：可复现干净构建、Map Studio 持久任务、iOS streaming validator、真机矩阵、现场验收、打包与 selfcheck、最终独立复核。其余 blocker 未关闭时不得把项目称为生产成品。
 
 ## 阶段一
 
@@ -58,7 +58,7 @@
 | 能力 | 状态 | 代码/证据 |
 | --- | --- | --- |
 | RTAB-Map 重处理前置和源库只读 | 已实现 | `run_localized_map` 强制 `rtabmap-reprocess`；前后 SHA‑256 一致 |
-| 先验地图派生修正 | 部分实现 | `bounded_correction_field`、yaw wrap、Huber、硬门限、绝对约束残差诊断/局部平移与 yaw 形变报告；尚非相对 SE(2) 因子图 |
+| 先验地图派生修正 | 已实现（P1 本地验证） | native RTAB-Map/g2o 完整相对 SE(2) 因子图、Link transform/information、absolute priors、gauge、robust、canonical digest；bounded correction 仅为不可发布 draft fallback |
 | 在线/道路/人工约束与拒绝审计 | 已实现 | 在线结构约束、道路区域/方向低权重软约束、accepted/rejected residual、禁用约束、人工锚点 |
 | 通道切换审计 | 已实现 | 最终轨迹几何投影输出进入/离开时间、候选 margin、方向、weak/lost overlap、人工 assignment 和可能静默切换 |
 | 标签离线重算和结构关联 | 已实现（保守门控） | observation→真实 node/frame time 绑定、raw 位置 SE(2) 传播、独立次候选/遮挡/侧面/边长校验；失败进入 review 或阻断 current |
@@ -81,7 +81,7 @@
 - 支持 LiDAR 的真实 iPhone 上完成完整开始、弱纹理、行人干扰、扫码、结束落盘和外部复制干跑；
 - 已按 2026-07-28 外部静态审查关闭 W2 B-01 与 W2R H-01 至 H-04/M-01 至 M-05；远端多平台 CI run `30342577182` 已绑定准确提交并通过，独立人工复核仍待执行；
 - 正式超市场景验收；
-- 实现并验证读取 RTAB‑Map 相对/闭环边的完整 SE(2) 因子图；在此之前不得创建有效 published 成果；
+- 对更多真实 DB 固化相对边 residual 工程阈值，并由 clean CI 构建 helper；P1 单样本通过不替代现场 acceptance；
 - 地图直接拖拽锚点等可用性增强（问题带入和核心 ID/JSON 编辑已可用）。
 
 自动测试和模拟回放不替代以上现场与独立审查。

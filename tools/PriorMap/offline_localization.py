@@ -1,14 +1,12 @@
-"""Stage-3 derived SE(2) trajectory optimization and review/export pipeline.
+"""Stage-3 relative SE(2) trajectory optimization and review/export pipeline.
 
 The source RTAB-Map database is read-only.  This module consumes the already
 optimized database copy produced by ``rtabmap-reprocess`` and writes a separate
 prior-map coordinate trajectory plus auditable review artifacts.
 
-The solver is a component-wise bounded correction field over x, y and wrapped
-yaw. It is not a coupled relative SE(2) factor graph and does not consume
-RTAB-Map relative/loop edges as factor residuals. It preserves the optimized
-RTAB-Map trajectory as authority, adds smooth bounded corrections and robust
-absolute observations for draft/review diagnostics, and is never publishable.
+The publish-capable path invokes the read-only native RTAB-Map/g2o helper and
+strictly validates its canonical relative Link factors. The older component-wise
+bounded correction field remains available only as a draft fallback.
 """
 
 from __future__ import annotations
@@ -30,6 +28,7 @@ from typing import Any, Callable, Iterable, Sequence
 
 from .localized_output_store import LocalizedVersionStore
 from .prior_map_schema import load_json, validate_package
+from .factor_graph_runner import FactorGraphRunnerError, run_relative_se2_factor_graph
 
 
 FORMAT_VERSION = 1
@@ -2921,6 +2920,7 @@ def _render_localized_version(
     input_identity_id: str,
     local_input_record: dict[str, Any],
     replay_parameters: dict[str, Any],
+    factor_graph_binary: Path | None = None,
     manual_edits: dict[str, Any] | None = None,
     progress: Callable[[int, str, str], None] | None = None,
 ) -> dict[str, Any]:
@@ -3335,7 +3335,50 @@ def _render_localized_version(
             str(metadata.get("floorId") or metadata.get("floor_id") or ""),
         )
     )
-    optimized, accepted, rejected = optimize_trajectory(baseline, constraints)
+    factor_graph_report: dict[str, Any] = {
+        "format": "MarketScannerRelativeSE2FactorGraphReport",
+        "version": 1,
+        "solver": "unavailable",
+        "full_factor_graph": False,
+        "published_capable": False,
+        "converged": False,
+        "blockers": [{"code": "native_factor_graph_helper_unavailable"}],
+        "input_identity_id": input_identity_id,
+        "optimized_database_sha256": optimized_db_hash,
+    }
+    full_factor_graph = False
+    if factor_graph_binary is not None:
+        try:
+            optimized, accepted, rejected, factor_graph_report = (
+                run_relative_se2_factor_graph(
+                    binary=factor_graph_binary,
+                    optimized_database=optimized_database,
+                    baseline=baseline,
+                    constraints=constraints,
+                    input_identity_id=input_identity_id,
+                    horizontal_axes=str(replay_parameters["horizontal_axes"]),
+                    pose_type=Pose,
+                    hard_reject_translation_m=HARD_REJECT_TRANSLATION_M,
+                    hard_reject_yaw_rad=HARD_REJECT_YAW_RAD,
+                )
+            )
+            full_factor_graph = True
+        except FactorGraphRunnerError as exc:
+            factor_graph_report = {
+                **factor_graph_report,
+                "solver": "rtabmap_g2o_slam2d",
+                "blockers": [
+                    {
+                        "code": "native_factor_graph_failed",
+                        "message": str(exc),
+                    }
+                ],
+            }
+            optimized, accepted, rejected = optimize_trajectory(
+                baseline, constraints
+            )
+    else:
+        optimized, accepted, rejected = optimize_trajectory(baseline, constraints)
     solver_metrics = bounded_correction_metrics(
         baseline, optimized, constraints
     )
@@ -3683,13 +3726,20 @@ def _render_localized_version(
         "warnings": [],
         "rejection_reasons": sorted({item["reason"] for item in rejected}),
         "solver": {
-            "type": "bounded_correction_field",
-            "full_factor_graph": False,
-            "published_capable": False,
-            "limitation": (
-                "Independent x/y/yaw banded smoothing is not a relative SE(2) "
-                "factor graph and is restricted to draft/review use."
+            "type": (
+                "relative_se2_factor_graph"
+                if full_factor_graph
+                else "bounded_correction_field"
             ),
+            "full_factor_graph": full_factor_graph,
+            "published_capable": full_factor_graph,
+            "limitation": (
+                None
+                if full_factor_graph
+                else "The native relative SE(2) graph was unavailable or failed; bounded correction is draft/review only."
+            ),
+            "native_solver": factor_graph_report.get("solver"),
+            "factor_set_sha256": factor_graph_report.get("factor_set_sha256"),
             "huber_translation_m": HUBER_TRANSLATION_M,
             "huber_yaw_deg": math.degrees(HUBER_YAW_RAD),
             "relative_trajectory_authority": "rtabmap_reprocess_optimized_copy",
@@ -3768,15 +3818,18 @@ def _render_localized_version(
         "passed": not review_blockers,
         "blockers": review_blockers,
     }
-    report["publish_gate"] = {
-        "passed": False,
-        "blockers": [
+    publish_blockers = list(review_blockers)
+    if not full_factor_graph:
+        publish_blockers.insert(
+            0,
             {
                 "code": "solver_not_full_relative_se2_factor_graph",
                 "value": report["solver"]["type"],
             },
-            *review_blockers,
-        ],
+        )
+    report["publish_gate"] = {
+        "passed": full_factor_graph and not publish_blockers,
+        "blockers": publish_blockers,
     }
     if has_critical_jsonl_damage:
         report["warnings"].append(
@@ -3829,7 +3882,11 @@ def _render_localized_version(
             "pipeline": [
                 "rtabmap_reprocess",
                 "relative_trajectory_read",
-                "prior_map_se2_correction",
+                (
+                    "relative_se2_factor_graph"
+                    if full_factor_graph
+                    else "bounded_draft_fallback"
+                ),
                 "tag_reassociation",
                 "quality_gate",
                 "human_review",
@@ -3842,7 +3899,11 @@ def _render_localized_version(
             "optimized_database_sha256": optimized_db_hash,
             "prior_map_sha256": package_hash,
             "tool_version": TOOL_VERSION,
-            "algorithm_version": "bounded_correction_field_v1",
+            "algorithm_version": (
+                "relative_se2_factor_graph_v1"
+                if full_factor_graph
+                else "bounded_correction_field_v1"
+            ),
             "coordinate_contract_version": COORDINATE_CONTRACT_VERSION,
             "processing_parameter_sha256": processing_parameter_sha256(
                 replay_parameters
@@ -3870,6 +3931,7 @@ def _render_localized_version(
         },
     )
     _json_write(output / "localization_report.json", report)
+    _json_write(output / "factor_graph_report.json", factor_graph_report)
     _json_write(
         output / "review_items.json",
         {
@@ -4023,6 +4085,7 @@ def process_localized_session(
     progress: Callable[[int, str, str], None] | None = None,
     expected_parent_version: str | None = None,
     replay_parameters: dict[str, Any] | None = None,
+    factor_graph_binary: Path | None = None,
 ) -> dict[str, Any]:
     """Render and atomically commit an immutable localized result version.
 
@@ -4101,6 +4164,7 @@ def process_localized_session(
             input_identity_id=input_identity_id,
             local_input_record=local_input_record,
             replay_parameters=normalized_replay_parameters,
+            factor_graph_binary=factor_graph_binary,
             manual_edits=manual_edits,
             progress=progress,
         )

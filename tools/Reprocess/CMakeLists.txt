@@ -10,5 +10,15 @@ INSTALL(TARGETS reprocess
 		RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}" COMPONENT runtime
 		BUNDLE DESTINATION "${CMAKE_BUNDLE_LOCATION}" COMPONENT runtime)
 
+ADD_EXECUTABLE(prior_map_factor_graph prior_map_factor_graph.cpp)
+
+TARGET_LINK_LIBRARIES(prior_map_factor_graph rtabmap_core)
+
+SET_TARGET_PROPERTIES(prior_map_factor_graph
+	PROPERTIES OUTPUT_NAME ${PROJECT_PREFIX}-prior-map-factor-graph)
+
+INSTALL(TARGETS prior_map_factor_graph
+		RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}" COMPONENT runtime
+		BUNDLE DESTINATION "${CMAKE_BUNDLE_LOCATION}" COMPONENT runtime)
 
 

@@ -32,7 +32,7 @@ class DocumentGovernanceTests(unittest.TestCase):
             "Final_Product_Agent_Spec_2026-07-28.md",
             current,
         )
-        self.assertIn("repair-v2-p0-production-baseline", current)
+        self.assertIn("repair-v2-p1-relative-se2-factor-graph", current)
         self.assertIn("PRODUCTION_READINESS_REVIEW.md", current)
         self.assertIn("当前有效", current)
 

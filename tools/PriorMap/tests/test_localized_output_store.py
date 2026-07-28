@@ -288,7 +288,21 @@ class LocalizedVersionStoreTests(unittest.TestCase):
                     "type": "relative_se2_factor_graph",
                     "full_factor_graph": True,
                     "published_capable": True,
+                    "factor_set_sha256": "d" * 64,
                 },
+            },
+            "factor_graph_report.json": {
+                "format": "MarketScannerRelativeSE2FactorGraphReport",
+                "version": 1,
+                "solver": "rtabmap_g2o_slam2d",
+                "full_factor_graph": True,
+                "published_capable": True,
+                "converged": True,
+                "factor_set_sha256": "d" * 64,
+                "input_identity_id": self.input_identity_id,
+                "optimized_database_sha256": self.identity_hashes[
+                    "optimized_database_sha256"
+                ],
             },
             "review_items.json": {
                 "format": "MarketScannerLocalizationReviewItems", "version": 1, "items": []
