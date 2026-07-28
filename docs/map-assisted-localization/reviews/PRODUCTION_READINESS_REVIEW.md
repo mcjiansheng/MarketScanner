@@ -41,7 +41,7 @@ P0 只冻结安全基线，不改变业务算法。CI 必须单独运行并报�
 | P4 | iOS finalization、保留和 provider hardening | 代码与主机压力测试已完成：100k×3 streaming、15,040,512-byte peak RSS、descriptor identity、copy v2 隐私和未执行 durability hook；真机 smoke 未执行，不声称 power-loss durability |
 | P5 | 真实设备矩阵 | evidence collector 与完整场景门已实现；真实 LiDAR iPhone 未执行，因此仍为 NO-GO |
 | P6 | 正式现场验收 | 已实现 release/阈值预冻结、3-run、20 控制点和重复性验证；办公室/卖场未执行，因此仍为 NO-GO |
-| P7 | 安装包、升级/卸载和 selfcheck | token/Origin/CSP、About/recovery、诊断导出、selfcheck、平台 launcher 与 hash-bound ZIP 已实现；干净平台 smoke 未执行 |
+| P7 | 安装包、升级/卸载和 selfcheck | token/Origin/CSP、About/recovery、诊断导出、selfcheck、平台 launcher 与 hash-bound ZIP 已实现；`283c2b6` 同机 macOS build/package/extract/version smoke 通过，干净 macOS/Windows smoke 未执行 |
 | P8 | 独立代码、证据和发布复核 | 未执行 |
 
 P1 至 P4 可以在 P0 通过后组织，但每一 wave 必须使用独立分支、明确基线、原子提交和单独验证；不得把多个大型 wave 合并成一次不可审查的改动。P5/P6 的证据必须来自真实设备和现场，缺失时如实保持未执行。

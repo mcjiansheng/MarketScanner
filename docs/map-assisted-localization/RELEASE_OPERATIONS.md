@@ -35,7 +35,7 @@ python3 tools/SupermarketMapStudio/package_release.py \
 
 Windows 使用 `--platform windows` 和 `.exe` 二进制。打包器复核 release manifest body SHA、platform、当前 clean source HEAD、两个二进制 `--version` 中的 source SHA 及二进制大小/SHA，并为全部 Python/web/launcher/native 文件生成 `MarketScannerMapStudioOperatorPackage` manifest。目标 ZIP 已存在、source tree 有改动、manifest 被改写或二进制发生同尺寸替换时均失败；解压后 selfcheck 会逐文件重算 package manifest。
 
-本仓库已完成打包器与模拟二进制合同测试，但尚未在干净 Windows/macOS 终端执行解压、launcher、自检、处理、升级和卸载 smoke，因此 P7 仍不能声明平台安装验收通过。
+本仓库已完成打包器与模拟二进制合同测试。2026-07-28 在当前 macOS 主机为代码提交 `283c2b62672f0be4400f13848f67b50cfaea5ca7` 重新执行 150-step release build，两个 native 工具均报告该 SHA；生成并解压 operator ZIP 后，launcher 的 package integrity、native `--version` 和关键 selfcheck 通过。该临时 ZIP 为 371,688 bytes，SHA-256 `073a5771c0bfe94368e3d05438d950e20d4c8d82ca070ad5b9278a2c78d93927`。这仍是已有 Homebrew/runtime 的同机 smoke；尚未在干净 Windows/macOS 终端执行依赖隔离、实际处理、升级和卸载，因此 P7 不能声明平台安装验收完成。
 
 ## 诊断、恢复与日志
 
