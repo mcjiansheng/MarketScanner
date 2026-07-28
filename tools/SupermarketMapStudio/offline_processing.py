@@ -926,6 +926,8 @@ def run_reprocess(
     progress_callback: Optional[ReprocessProgressCallback] = None,
     profile_name: str = DISCOVERY_PROFILE,
     link_injections: Iterable[Dict[str, Any]] = (),
+    cancel_event: Optional[threading.Event] = None,
+    persistent_log_path: Optional[Path] = None,
 ) -> Dict[str, Any]:
     if online_optimization_iterations < 1:
         raise OfflineProcessingError("Online optimization iterations must be at least 1.")
@@ -1040,16 +1042,44 @@ def run_reprocess(
                 monitor_thread.start()
             with log_path.open("w", encoding="utf-8", errors="replace") as log_handle:
                 try:
-                    completed = subprocess.run(
-                        command,
-                        stdout=log_handle,
-                        stderr=subprocess.STDOUT,
-                        text=True,
-                        timeout=timeout_seconds,
-                        check=False,
-                        cwd=str(work_directory),
-                        env=_thread_environment(threads),
-                    )
+                    if cancel_event is None:
+                        completed = subprocess.run(
+                            command,
+                            stdout=log_handle,
+                            stderr=subprocess.STDOUT,
+                            text=True,
+                            timeout=timeout_seconds,
+                            check=False,
+                            cwd=str(work_directory),
+                            env=_thread_environment(threads),
+                        )
+                    else:
+                        process = subprocess.Popen(
+                            command,
+                            stdout=log_handle,
+                            stderr=subprocess.STDOUT,
+                            text=True,
+                            cwd=str(work_directory),
+                            env=_thread_environment(threads),
+                        )
+                        deadline = time.monotonic() + timeout_seconds
+                        while process.poll() is None:
+                            if cancel_event.is_set():
+                                process.terminate()
+                                try:
+                                    process.wait(timeout=5)
+                                except subprocess.TimeoutExpired:
+                                    process.kill()
+                                    process.wait(timeout=5)
+                                raise OfflineProcessingError(
+                                    "rtabmap-reprocess was cancelled by the operator."
+                                )
+                            if time.monotonic() >= deadline:
+                                process.kill()
+                                process.wait(timeout=5)
+                                raise subprocess.TimeoutExpired(command, timeout_seconds)
+                            time.sleep(0.25)
+                        completed = subprocess.CompletedProcess(command, process.returncode)
                 finally:
                     monitor_done.set()
                     if monitor_thread is not None:
@@ -1180,6 +1210,14 @@ def run_reprocess(
         }
     finally:
         publish_partial.unlink(missing_ok=True)
+        if persistent_log_path is not None and log_path is not None and log_path.is_file():
+            try:
+                persistent_log_path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(log_path, persistent_log_path)
+                with persistent_log_path.open("rb") as persistent_log:
+                    os.fsync(persistent_log.fileno())
+            except OSError:
+                pass
         if log_path is not None:
             log_path.unlink(missing_ok=True)
         if temporary is not None:
@@ -1217,6 +1255,8 @@ def run_adaptive_reprocess(
     accelerator_backend: str = "cpu",
     extra_parameters: Iterable[tuple[str, str]] = (),
     progress_callback: Optional[ReprocessProgressCallback] = None,
+    cancel_event: Optional[threading.Event] = None,
+    persistent_log_prefix: Optional[Path] = None,
 ) -> Dict[str, Any]:
     """Reuse accepted phone constraints first, then discover loops only if needed.
 
@@ -1248,8 +1288,16 @@ def run_adaptive_reprocess(
             extra_parameters=base_parameters + FAST_REUSE_PARAMETERS,
             progress_callback=fast_progress,
             profile_name=FAST_REUSE_PROFILE,
+            cancel_event=cancel_event,
+            persistent_log_path=(
+                persistent_log_prefix.with_name(persistent_log_prefix.name + "-fast.log")
+                if persistent_log_prefix is not None
+                else None
+            ),
         )
     except OfflineProcessingError as exc:
+        if cancel_event is not None and cancel_event.is_set():
+            raise
         fast_error = str(exc)
 
     if fast_report is not None:
@@ -1319,6 +1367,12 @@ def run_adaptive_reprocess(
             extra_parameters=base_parameters,
             progress_callback=discovery_progress,
             profile_name=DISCOVERY_PROFILE,
+            cancel_event=cancel_event,
+            persistent_log_path=(
+                persistent_log_prefix.with_name(persistent_log_prefix.name + "-discovery.log")
+                if persistent_log_prefix is not None
+                else None
+            ),
         )
         passes.append(_adaptive_pass_summary(selected_report))
         selected_pass = DISCOVERY_PROFILE

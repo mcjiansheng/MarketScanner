@@ -85,6 +85,9 @@ function renderJobProgress(job) {
   progressBar.textContent = `${progress}%`;
   progressStage.textContent = job?.stage || "正在处理";
   progressPercent.textContent = `${progress}%`;
+  const cancellable = ["queued", "running", "cancelling"].includes(job?.status);
+  $("#cancel-job").hidden = !cancellable;
+  $("#cancel-job").disabled = job?.status === "cancelling";
 }
 
 function renderJobLogs(logs = []) {
@@ -120,7 +123,7 @@ function renderScanLogs(scanLogs = {}) {
 function setBusy(busy) {
   $$(".primary").forEach((button) => { button.disabled = busy; });
   $$(".secondary").forEach((button) => {
-    button.disabled = busy && !["reset-view", "preview-fullscreen"].includes(button.id);
+    button.disabled = busy && !["reset-view", "preview-fullscreen", "cancel-job"].includes(button.id);
   });
   $$(".tab").forEach((button) => { button.disabled = busy; });
   if (!busy) updateSingleAlignmentState();
@@ -721,16 +724,17 @@ async function pollJob() {
     const job = await request(`/api/jobs/${activeJobId}`);
     renderJobProgress(job);
     renderJobLogs(job.logs || []);
-    if (job.status === "queued" || job.status === "running") {
+    if (["queued", "running", "cancelling"].includes(job.status)) {
       setStatus(`${job.stage || "正在处理"} · ${job.progress || 0}%`, "running");
       window.setTimeout(pollJob, 650);
       return;
     }
     activeJobId = null;
     setBusy(false);
-    if (job.status === "failed") {
+    if (["failed", "cancelled", "interrupted"].includes(job.status)) {
       activeJobKey = null;
-      setStatus(job.error || "任务失败", "failed");
+      const label = job.status === "cancelled" ? "任务已取消" : (job.status === "interrupted" ? "任务因服务重启而中断" : "任务失败");
+      setStatus(job.error || label, "failed");
       return;
     }
     completedJobId = job.id;
@@ -749,6 +753,36 @@ async function pollJob() {
     activeJobKey = null;
     setBusy(false);
     setStatus(error.message, "failed");
+  }
+}
+
+async function restoreLatestJob() {
+  try {
+    const payload = await request("/api/jobs");
+    const latest = (payload.jobs || [])[0];
+    if (!latest) return;
+    renderJobProgress(latest);
+    renderJobLogs(latest.logs || []);
+    if (["queued", "running", "cancelling"].includes(latest.status)) {
+      activeJobId = latest.id;
+      setBusy(true);
+      setStatus(`已恢复任务连接 · ${latest.stage || "正在处理"}`, "running");
+      pollJob();
+      return;
+    }
+    if (latest.status === "complete") {
+      const complete = await request(`/api/jobs/${latest.id}`);
+      completedJobId = complete.id;
+      $("#open-output").disabled = false;
+      setStatus("已恢复上次完成任务", "complete");
+      await renderJob(complete);
+      return;
+    }
+    if (latest.status === "interrupted") {
+      setStatus(latest.error || "上次任务因服务重启而中断；旧成果指针保持不变", "failed");
+    }
+  } catch (error) {
+    setStatus(`任务历史恢复失败：${error.message}`, "failed");
   }
 }
 
@@ -3207,6 +3241,20 @@ function bindEvents() {
     try { await request(`/api/jobs/${completedJobId}/open`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({}) }); }
     catch (error) { setStatus(error.message, "failed"); }
   });
+  $("#cancel-job").addEventListener("click", async () => {
+    if (!activeJobId) return;
+    try {
+      const job = await request(`/api/jobs/${activeJobId}/cancel`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({}),
+      });
+      renderJobProgress(job);
+      setStatus("正在安全停止子进程并保留旧成果", "running");
+    } catch (error) {
+      setStatus(error.message, "failed");
+    }
+  });
   connect2DControls(); connect3DControls();
   new ResizeObserver(() => { if (isPlanPreview()) draw2D(); else drawScene(); }).observe($(".canvas-wrap"));
 }
@@ -3217,3 +3265,4 @@ set3DDragMode("rotate");
 addDevice();
 addDevice();
 setStatus("就绪");
+restoreLatestJob();

@@ -104,6 +104,29 @@ ARTIFACTS = (
     "shelf_tag_index.json",
     "audit_log.jsonl",
 )
+JOB_RUNTIME_TOOL_VERSION = "MarketScannerMapStudioJobRuntime/1"
+
+
+def source_git_sha() -> str:
+    override = os.environ.get("MARKETSCANNER_GIT_SHA", "").strip().lower()
+    if re.fullmatch(r"[0-9a-f]{40}", override):
+        return override
+    try:
+        completed = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(APP_DIR),
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=3,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return "unknown"
+    candidate = completed.stdout.strip().lower()
+    return candidate if re.fullmatch(r"[0-9a-f]{40}", candidate) else "unknown"
+
+
+SOURCE_GIT_SHA = source_git_sha()
 
 
 class RequestError(ValueError):
@@ -148,6 +171,10 @@ class QualityGateError(RequestError):
         return {**super().details(), "blockers": self.blockers}
 
 
+class JobCancelled(RuntimeError):
+    pass
+
+
 @dataclass
 class Job:
     identifier: str
@@ -162,13 +189,207 @@ class Job:
     updated_at: float = field(default_factory=time.time)
     logs: List[Dict[str, Any]] = field(default_factory=list)
     input_keys: tuple[str, ...] = field(default_factory=tuple)
+    input_identities: tuple[Dict[str, Any], ...] = field(default_factory=tuple)
+    tool_version: str = JOB_RUNTIME_TOOL_VERSION
+    git_sha: str = SOURCE_GIT_SHA
+    cancel_requested: bool = False
+    cancel_event: threading.Event = field(default_factory=threading.Event, repr=False)
 
 
 class StudioState:
-    def __init__(self) -> None:
+    JOURNAL_FORMAT = "MarketScannerMapStudioJob"
+    JOURNAL_VERSION = 1
+    TERMINAL_STATUSES = frozenset({"complete", "failed", "cancelled", "interrupted"})
+    ACTIVE_STATUSES = frozenset({"queued", "running", "cancelling"})
+
+    def __init__(self, state_dir: Path | None = None, retention: int = 200) -> None:
         self.lock = threading.Lock()
         self.jobs: Dict[str, Job] = {}
         self._edit_locks: Dict[str, threading.Lock] = {}
+        self.state_dir = state_dir.resolve() if state_dir is not None else None
+        self.retention = max(20, min(1000, int(retention)))
+        self.startup_errors: list[str] = []
+        if self.state_dir is not None:
+            self.state_dir.mkdir(parents=True, exist_ok=True)
+            self._load_journals()
+
+    @staticmethod
+    def _input_identity(path_text: str) -> Dict[str, Any]:
+        path = Path(path_text).resolve()
+        try:
+            info = path.lstat()
+            kind = "symlink" if stat.S_ISLNK(info.st_mode) else "directory" if stat.S_ISDIR(info.st_mode) else "file" if stat.S_ISREG(info.st_mode) else "other"
+            body: Dict[str, Any] = {
+                "path": str(path),
+                "kind": kind,
+                "device": int(info.st_dev),
+                "inode": int(info.st_ino),
+                "bytes": int(info.st_size),
+                "mtime_ns": int(info.st_mtime_ns),
+            }
+        except OSError:
+            body = {"path": str(path), "kind": "missing"}
+        encoded = json.dumps(body, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        return {**body, "identity_sha256": hashlib.sha256(encoded).hexdigest()}
+
+    @staticmethod
+    def _valid_input_identity(value: Any) -> bool:
+        if not isinstance(value, dict) or not isinstance(value.get("path"), str):
+            return False
+        digest = value.get("identity_sha256")
+        if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+            return False
+        body = {key: item for key, item in value.items() if key != "identity_sha256"}
+        encoded = json.dumps(body, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest() == digest
+
+    @staticmethod
+    def _payload(job: Job) -> dict[str, Any]:
+        return {
+            "format": StudioState.JOURNAL_FORMAT,
+            "version": StudioState.JOURNAL_VERSION,
+            "id": job.identifier,
+            "kind": job.kind,
+            "output_dir": str(job.output_dir),
+            "created_at": job.created_at,
+            "status": job.status,
+            "error": job.error,
+            "finished_at": job.finished_at,
+            "progress": job.progress,
+            "stage": job.stage,
+            "updated_at": job.updated_at,
+            "logs": list(job.logs),
+            "input_keys": list(job.input_keys),
+            "input_identities": list(job.input_identities),
+            "tool_version": job.tool_version,
+            "git_sha": job.git_sha,
+            "cancel_requested": job.cancel_requested,
+        }
+
+    def _journal_path(self, identifier: str) -> Path:
+        assert self.state_dir is not None
+        if re.fullmatch(r"[0-9a-f]{12}", identifier) is None:
+            raise ValueError("Job identifier is unsafe for journal storage.")
+        return self.state_dir / f"{identifier}.json"
+
+    def _persist_locked(self, job: Job) -> None:
+        if self.state_dir is None:
+            return
+        destination = self._journal_path(job.identifier)
+        temporary = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.tmp")
+        encoded = json.dumps(
+            self._payload(job), ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8") + b"\n"
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            with os.fdopen(descriptor, "wb") as handle:
+                handle.write(encoded)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, destination)
+            if os.name != "nt":
+                directory_descriptor = os.open(self.state_dir, os.O_RDONLY)
+                try:
+                    os.fsync(directory_descriptor)
+                finally:
+                    os.close(directory_descriptor)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    def _load_journals(self) -> None:
+        assert self.state_dir is not None
+        for path in sorted(self.state_dir.glob("*.json")):
+            try:
+                if path.is_symlink() or not path.is_file():
+                    raise ValueError("journal is not a regular file")
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                identifier = path.stem
+                if (
+                    not isinstance(payload, dict)
+                    or payload.get("format") != self.JOURNAL_FORMAT
+                    or payload.get("version") != self.JOURNAL_VERSION
+                    or payload.get("id") != identifier
+                    or re.fullmatch(r"[0-9a-f]{12}", identifier) is None
+                    or payload.get("status")
+                    not in (self.ACTIVE_STATUSES | self.TERMINAL_STATUSES)
+                    or not isinstance(payload.get("kind"), str)
+                    or not payload["kind"]
+                    or not isinstance(payload.get("output_dir"), str)
+                    or not Path(payload["output_dir"]).is_absolute()
+                    or not isinstance(payload.get("logs"), list)
+                    or not isinstance(payload.get("input_keys"), list)
+                    or not isinstance(payload.get("input_identities"), list)
+                    or len(payload["input_identities"]) != len(payload["input_keys"])
+                    or not all(
+                        self._valid_input_identity(item)
+                        for item in payload["input_identities"]
+                    )
+                    or not isinstance(payload.get("tool_version"), str)
+                    or not isinstance(payload.get("git_sha"), str)
+                    or (
+                        payload["git_sha"] != "unknown"
+                        and re.fullmatch(r"[0-9a-f]{40}", payload["git_sha"]) is None
+                    )
+                ):
+                    raise ValueError("journal schema is invalid")
+                created_at = float(payload.get("created_at"))
+                updated_at = float(payload.get("updated_at"))
+                finished_at = (
+                    float(payload["finished_at"])
+                    if payload.get("finished_at") is not None
+                    else None
+                )
+                if not all(
+                    math.isfinite(value)
+                    for value in (created_at, updated_at)
+                ) or (finished_at is not None and not math.isfinite(finished_at)):
+                    raise ValueError("journal timestamps are invalid")
+                job = Job(
+                    identifier=identifier,
+                    kind=str(payload.get("kind") or "unknown"),
+                    output_dir=Path(payload["output_dir"]).resolve(),
+                    created_at=created_at,
+                    status=str(payload["status"]),
+                    error=payload.get("error") if isinstance(payload.get("error"), str) else None,
+                    finished_at=finished_at,
+                    progress=max(0, min(100, int(payload.get("progress", 0)))),
+                    stage=str(payload.get("stage") or "未知阶段"),
+                    updated_at=updated_at,
+                    logs=[item for item in payload["logs"][-500:] if isinstance(item, dict)],
+                    input_keys=tuple(str(Path(item).resolve()) for item in payload["input_keys"] if isinstance(item, str)),
+                    input_identities=tuple(dict(item) for item in payload["input_identities"]),
+                    tool_version=payload["tool_version"],
+                    git_sha=payload["git_sha"],
+                    cancel_requested=bool(payload.get("cancel_requested")),
+                )
+                if job.status in self.ACTIVE_STATUSES:
+                    job.status = "interrupted"
+                    job.error = "Map Studio restarted while this task was active; output staging was not published."
+                    job.stage = "服务重启后已中断"
+                    job.finished_at = time.time()
+                    job.updated_at = job.finished_at
+                    self._persist_locked(job)
+                self.jobs[job.identifier] = job
+            except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+                self.startup_errors.append(f"{path.name}: {exc}")
+        self._prune_locked()
+
+    def _prune_locked(self) -> None:
+        if self.state_dir is None:
+            return
+        terminal = sorted(
+            (job for job in self.jobs.values() if job.status in self.TERMINAL_STATUSES),
+            key=lambda job: job.updated_at,
+            reverse=True,
+        )
+        for job in terminal[self.retention :]:
+            self.jobs.pop(job.identifier, None)
+            self._journal_path(job.identifier).unlink(missing_ok=True)
+            for log_path in self.state_dir.glob(
+                f"{job.identifier}-rtabmap-reprocess-*.log"
+            ):
+                if log_path.is_file() and not log_path.is_symlink():
+                    log_path.unlink(missing_ok=True)
 
     def acquire_edit_lock(self, job_id: str) -> threading.Lock:
         """Return a per-job mutex for localized edit operations.
@@ -190,7 +411,7 @@ class StudioState:
             resolved = output_dir.resolve()
             normalized_inputs = tuple(sorted({str(Path(key).resolve()) for key in input_keys}))
             if any(
-                existing.output_dir.resolve() == resolved and existing.status in {"queued", "running"}
+                existing.output_dir.resolve() == resolved and existing.status in self.ACTIVE_STATUSES
                 for existing in self.jobs.values()
             ):
                 raise RequestError("This output directory is already reserved by a Map Studio task.")
@@ -199,7 +420,7 @@ class StudioState:
                 (
                     existing
                     for existing in self.jobs.values()
-                    if existing.status in {"queued", "running"}
+                    if existing.status in self.ACTIVE_STATUSES
                     and input_set.intersection(existing.input_keys)
                 ),
                 None,
@@ -214,13 +435,48 @@ class StudioState:
                 kind=kind,
                 output_dir=output_dir,
                 input_keys=normalized_inputs,
+                input_identities=tuple(
+                    self._input_identity(path) for path in normalized_inputs
+                ),
             )
             self.jobs[job.identifier] = job
+            self._persist_locked(job)
+            self._prune_locked()
         return job
 
     def get(self, job_id: str) -> Optional[Job]:
         with self.lock:
             return self.jobs.get(job_id)
+
+    def begin(self, job_id: str) -> bool:
+        """Atomically claim a queued job unless cancellation won the race."""
+        with self.lock:
+            job = self.jobs[job_id]
+            if job.cancel_requested or job.status != "queued":
+                return False
+            job.status = "running"
+            job.updated_at = time.time()
+            self._persist_locked(job)
+            return True
+
+    def list(self) -> list[Job]:
+        with self.lock:
+            return sorted(self.jobs.values(), key=lambda job: job.created_at, reverse=True)
+
+    def cancel(self, job_id: str) -> Job:
+        with self.lock:
+            job = self.jobs.get(job_id)
+            if job is None:
+                raise RequestError("Task not found.")
+            if job.status not in self.ACTIVE_STATUSES:
+                raise RequestError("Only an active task can be cancelled.")
+            job.cancel_requested = True
+            job.cancel_event.set()
+            job.status = "cancelling"
+            job.stage = "正在取消"
+            job.updated_at = time.time()
+            self._persist_locked(job)
+            return job
 
     def active_for_input(self, input_key: str) -> Optional[Job]:
         normalized = str(Path(input_key).resolve())
@@ -229,7 +485,7 @@ class StudioState:
                 (
                     job
                     for job in self.jobs.values()
-                    if job.status in {"queued", "running"} and normalized in job.input_keys
+                    if job.status in self.ACTIVE_STATUSES and normalized in job.input_keys
                 ),
                 None,
             )
@@ -240,13 +496,19 @@ class StudioState:
             job.status = status
             job.error = error
             job.updated_at = time.time()
-            if status in {"complete", "failed"}:
+            if status in self.TERMINAL_STATUSES:
                 job.finished_at = time.time()
             if status == "complete":
                 job.progress = 100
                 job.stage = "处理完成"
             elif status == "failed":
                 job.stage = "处理失败"
+            elif status == "cancelled":
+                job.stage = "已取消"
+            elif status == "interrupted":
+                job.stage = "服务重启后已中断"
+            self._persist_locked(job)
+            self._prune_locked()
 
     def update_progress(self, job_id: str, progress: int, stage: str, message: str = "") -> None:
         with self.lock:
@@ -263,6 +525,7 @@ class StudioState:
                 })
                 if len(job.logs) > 500:
                     del job.logs[:-500]
+            self._persist_locked(job)
 
     def restore(self, kind: str, output_dir: Path) -> Job:
         with self.lock:
@@ -283,10 +546,20 @@ class StudioState:
                 updated_at=timestamp,
             )
             self.jobs[job.identifier] = job
+            self._persist_locked(job)
             return job
 
 
-STATE = StudioState()
+def default_job_state_dir() -> Path:
+    override = os.environ.get("MARKETSCANNER_JOB_STATE_DIR")
+    if override:
+        return Path(override).expanduser().resolve()
+    owner = hashlib.sha256(str(Path.home()).encode("utf-8")).hexdigest()[:12]
+    return Path(tempfile.gettempdir()) / f"marketscanner-mapstudio-{owner}" / "jobs"
+
+
+STATE = StudioState(default_job_state_dir())
+JOB_RUNTIME_CONTEXT = threading.local()
 FINALIZED_CHECKPOINT_CLEANUP_LOCK = threading.Lock()
 ProgressCallback = Callable[[int, str, str], None]
 
@@ -494,8 +767,19 @@ def load_json(path: Path, default: Any) -> Any:
         return default
 
 
-def job_payload(job: Job) -> Dict[str, Any]:
-    payload: Dict[str, Any] = {
+def job_summary_payload(job: Job) -> Dict[str, Any]:
+    runtime_logs: list[dict[str, Any]] = []
+    if STATE.state_dir is not None:
+        for path in sorted(STATE.state_dir.glob(f"{job.identifier}-rtabmap-reprocess-*.log")):
+            if path.is_file() and not path.is_symlink():
+                runtime_logs.append(
+                    {
+                        "name": path.name,
+                        "bytes": path.stat().st_size,
+                        "url": f"/api/jobs/{job.identifier}/runtime-log/{path.name}",
+                    }
+                )
+    return {
         "id": job.identifier,
         "kind": job.kind,
         "status": job.status,
@@ -508,7 +792,23 @@ def job_payload(job: Job) -> Dict[str, Any]:
         "updated_at": job.updated_at,
         "logs": list(job.logs),
         "input_keys": list(job.input_keys),
+        "input_identities": list(job.input_identities),
+        "tool_version": job.tool_version,
+        "git_sha": job.git_sha,
+        "cancel_requested": job.cancel_requested,
+        "recoverability": (
+            "restart_required"
+            if job.status == "interrupted"
+            else "terminal"
+            if job.status in StudioState.TERMINAL_STATUSES
+            else "active"
+        ),
+        "runtime_logs": runtime_logs,
     }
+
+
+def job_payload(job: Job) -> Dict[str, Any]:
+    payload: Dict[str, Any] = job_summary_payload(job)
     if job.status == "complete":
         localized_snapshot = None
         if job.kind == "localized":
@@ -1236,16 +1536,25 @@ def reprocess_single_session(
         mapped = start + round(max(0.0, min(1.0, fraction)) * (end - start))
         report_progress(progress, mapped, stage, message)
 
-    report = offline.run_adaptive_reprocess(
-        segments[0].database_path,
-        optimized_database,
-        explicit_binary=explicit_binary,
-        thread_count=thread_count,
-        use_local_staging=use_local_staging,
-        accelerator_backend=acceleration.effective,
-        extra_parameters=acceleration.rtabmap_parameters,
-        progress_callback=reprocess_progress,
-    )
+    cancel_event = getattr(JOB_RUNTIME_CONTEXT, "cancel_event", None)
+    log_prefix = getattr(JOB_RUNTIME_CONTEXT, "log_prefix", None)
+    try:
+        report = offline.run_adaptive_reprocess(
+            segments[0].database_path,
+            optimized_database,
+            explicit_binary=explicit_binary,
+            thread_count=thread_count,
+            use_local_staging=use_local_staging,
+            accelerator_backend=acceleration.effective,
+            extra_parameters=acceleration.rtabmap_parameters,
+            progress_callback=reprocess_progress,
+            cancel_event=cancel_event,
+            persistent_log_prefix=log_prefix,
+        )
+    except offline.OfflineProcessingError as exc:
+        if cancel_event is not None and cancel_event.is_set():
+            raise JobCancelled(str(exc)) from exc
+        raise
     report["session"] = str(session)
     report["scan_mode"] = summary["scan_mode"]
     assessment = report.get("error_optimization", {})
@@ -1571,20 +1880,35 @@ def start_manual_merge(base_job: Job, data: Dict[str, Any]) -> Job:
     job = STATE.add("merge", output, (str(session),))
 
     def worker() -> None:
-        STATE.set_status(job.identifier, "running")
-        progress = lambda value, stage, message="": STATE.update_progress(
-            job.identifier, value, stage, message
-        )
-        progress(1, "任务已启动", f"基于 {base_job.output_dir.name} 创建人工修复版本")
+        def progress(value: int, stage: str, message: str = "") -> None:
+            if job.cancel_event.is_set():
+                raise JobCancelled("Task cancellation was requested.")
+            STATE.update_progress(job.identifier, value, stage, message)
         try:
+            if not STATE.begin(job.identifier):
+                raise JobCancelled("Task cancellation was requested before startup.")
+            JOB_RUNTIME_CONTEXT.cancel_event = job.cancel_event
+            JOB_RUNTIME_CONTEXT.log_prefix = (
+                STATE.state_dir / f"{job.identifier}-rtabmap-reprocess"
+                if STATE.state_dir is not None
+                else None
+            )
+            progress(1, "任务已启动", f"基于 {base_job.output_dir.name} 创建人工修复版本")
             run_manual_merge(base_job, data, output, progress)
+            if job.cancel_event.is_set():
+                raise JobCancelled("Task cancellation was requested.")
+        except JobCancelled as exc:
+            STATE.update_progress(job.identifier, 99, "已取消", str(exc))
+            STATE.set_status(job.identifier, "cancelled", str(exc))
         except Exception as exc:
-            progress(99, "处理失败", str(exc))
+            STATE.update_progress(job.identifier, 99, "处理失败", str(exc))
             STATE.set_status(job.identifier, "failed", str(exc))
             print(traceback.format_exc(), file=sys.stderr, flush=True)
         else:
-            progress(99, "完成校验", "人工修复版本已通过生成流程校验")
+            STATE.update_progress(job.identifier, 99, "完成校验", "人工修复版本已通过生成流程校验")
             STATE.set_status(job.identifier, "complete")
+        finally:
+            JOB_RUNTIME_CONTEXT.__dict__.clear()
 
     threading.Thread(
         target=worker,
@@ -2459,10 +2783,20 @@ def start_job(data: Dict[str, Any]) -> Job:
     job = STATE.add(kind, output, input_keys)
 
     def worker() -> None:
-        STATE.set_status(job.identifier, "running")
-        progress = lambda value, stage, message="": STATE.update_progress(job.identifier, value, stage, message)
-        progress(1, "任务已启动", "Map Studio 后台任务已启动")
+        def progress(value: int, stage: str, message: str = "") -> None:
+            if job.cancel_event.is_set():
+                raise JobCancelled("Task cancellation was requested.")
+            STATE.update_progress(job.identifier, value, stage, message)
         try:
+            if not STATE.begin(job.identifier):
+                raise JobCancelled("Task cancellation was requested before startup.")
+            JOB_RUNTIME_CONTEXT.cancel_event = job.cancel_event
+            JOB_RUNTIME_CONTEXT.log_prefix = (
+                STATE.state_dir / f"{job.identifier}-rtabmap-reprocess"
+                if STATE.state_dir is not None
+                else None
+            )
+            progress(1, "任务已启动", "Map Studio 后台任务已启动")
             if kind == "map":
                 run_basic_map(data, output, progress)
             elif kind == "stage":
@@ -2471,13 +2805,20 @@ def start_job(data: Dict[str, Any]) -> Job:
                 run_localized_map(data, output, progress)
             else:
                 run_multi(data, output, progress)
+            if job.cancel_event.is_set():
+                raise JobCancelled("Task cancellation was requested.")
+        except JobCancelled as exc:
+            STATE.update_progress(job.identifier, 99, "已取消", str(exc))
+            STATE.set_status(job.identifier, "cancelled", str(exc))
         except Exception as exc:
-            progress(99, "处理失败", str(exc))
+            STATE.update_progress(job.identifier, 99, "处理失败", str(exc))
             STATE.set_status(job.identifier, "failed", str(exc))
             print(traceback.format_exc(), file=sys.stderr, flush=True)
         else:
-            progress(99, "完成校验", "所有地图成果已通过生成流程校验")
+            STATE.update_progress(job.identifier, 99, "完成校验", "所有地图成果已通过生成流程校验")
             STATE.set_status(job.identifier, "complete")
+        finally:
+            JOB_RUNTIME_CONTEXT.__dict__.clear()
 
     threading.Thread(target=worker, name=f"map-studio-{job.identifier}", daemon=True).start()
     return job
@@ -2495,14 +2836,15 @@ def start_prior_map_job(data: Dict[str, Any]) -> Job:
     job = STATE.add("prior_map", output, (str(source),))
 
     def worker() -> None:
-        STATE.set_status(job.identifier, "running")
-        STATE.update_progress(
-            job.identifier,
-            5,
-            "读取先验地图",
-            "正在读取 Element Info；源 Excel 保持只读。",
-        )
         try:
+            if not STATE.begin(job.identifier):
+                raise JobCancelled("Task cancellation was requested before startup.")
+            STATE.update_progress(
+                job.identifier,
+                5,
+                "读取先验地图",
+                "正在读取 Element Info；源 Excel 保持只读。",
+            )
             STATE.update_progress(
                 job.identifier,
                 25,
@@ -2532,6 +2874,11 @@ def start_prior_map_job(data: Dict[str, Any]) -> Job:
                 "生成预览",
                 "地图包和可缩放预览已生成；可安全用于手机导入。",
             )
+            if job.cancel_event.is_set():
+                raise JobCancelled("Task cancellation was requested.")
+        except JobCancelled as exc:
+            STATE.update_progress(job.identifier, 99, "已取消", str(exc))
+            STATE.set_status(job.identifier, "cancelled", str(exc))
         except Exception as exc:
             STATE.update_progress(
                 job.identifier,
@@ -2613,7 +2960,24 @@ class StudioHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = unquote(parsed.path)
         if path == "/api/health":
-            self.send_json(HTTPStatus.OK, {"ok": True, "python": sys.version.split()[0]})
+            self.send_json(
+                HTTPStatus.OK,
+                {
+                    "ok": not STATE.startup_errors,
+                    "python": sys.version.split()[0],
+                    "job_runtime": {
+                        "state_dir": str(STATE.state_dir) if STATE.state_dir else None,
+                        "restored_job_count": len(STATE.list()),
+                        "startup_errors": list(STATE.startup_errors),
+                    },
+                },
+            )
+            return
+        if path == "/api/jobs":
+            self.send_json(
+                HTTPStatus.OK,
+                {"jobs": [job_summary_payload(job) for job in STATE.list()]},
+            )
             return
         if path == "/api/gpu/capabilities":
             self.send_json(HTTPStatus.OK, gpu.capabilities())
@@ -2681,6 +3045,11 @@ class StudioHandler(BaseHTTPRequestHandler):
                 job = start_job(data)
                 self.send_json(HTTPStatus.ACCEPTED, job_payload(job))
                 return
+            if path.startswith("/api/jobs/") and path.endswith("/cancel"):
+                job_id = path.split("/")[3]
+                job = STATE.cancel(job_id)
+                self.send_json(HTTPStatus.ACCEPTED, job_payload(job))
+                return
             if path.startswith("/api/jobs/") and path.endswith("/merge/preview"):
                 job_id = path.split("/")[3]
                 job = STATE.get(job_id)
@@ -2742,6 +3111,9 @@ class StudioHandler(BaseHTTPRequestHandler):
         if len(parts) >= 6 and parts[4] == "artifact":
             self.serve_artifact(job, "/".join(parts[5:]))
             return
+        if len(parts) == 6 and parts[4] == "runtime-log":
+            self.serve_runtime_log(job, parts[5])
+            return
         if (
             len(parts) >= 9
             and parts[4] == "localized"
@@ -2753,6 +3125,19 @@ class StudioHandler(BaseHTTPRequestHandler):
             )
             return
         self.send_json(HTTPStatus.NOT_FOUND, {"error": "Unknown job endpoint."})
+
+    def serve_runtime_log(self, job: Job, name: str) -> None:
+        if (
+            STATE.state_dir is None
+            or re.fullmatch(
+                re.escape(job.identifier) + r"-rtabmap-reprocess-(?:fast|discovery)\.log",
+                name,
+            )
+            is None
+        ):
+            self.send_json(HTTPStatus.NOT_FOUND, {"error": "Runtime log is not available."})
+            return
+        self.serve_file(STATE.state_dir, name)
 
     def serve_localized_artifact(
         self, job: Job, version_id: str, name: str

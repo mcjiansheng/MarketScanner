@@ -29,6 +29,33 @@ import server  # noqa: E402
 import folder_dialog  # noqa: E402
 
 
+def immediate_popen(callback):
+    """Adapt an existing completed-process fixture to the cancellable Popen path."""
+    class ImmediatePopen:
+        def __init__(self, command: list[str], **kwargs: object) -> None:
+            result = callback(command, **kwargs)
+            self.returncode = int(result.returncode)
+            output = kwargs.get("stdout")
+            if output is not None and result.stdout:
+                output.write(result.stdout)
+                output.flush()
+
+        def poll(self) -> int:
+            return self.returncode
+
+        def terminate(self) -> None:
+            self.returncode = -15
+
+        def kill(self) -> None:
+            self.returncode = -9
+
+        def wait(self, timeout: float | None = None) -> int:
+            del timeout
+            return self.returncode
+
+    return ImmediatePopen
+
+
 def create_localized_store(
     output: Path,
     revision: int = 1,
@@ -1698,7 +1725,9 @@ class MapStudioApiTests(unittest.TestCase):
             )
 
         output = self.root / "pc-output"
-        with mock.patch.object(server.offline.subprocess, "run", side_effect=fake_run):
+        with mock.patch.object(
+            server.offline.subprocess, "Popen", immediate_popen(fake_run)
+        ):
             job = self.api(
                 "/api/jobs",
                 {
@@ -2284,7 +2313,9 @@ class MapStudioApiTests(unittest.TestCase):
             )
 
         output = self.root / "multi-pc-output"
-        with mock.patch.object(server.offline.subprocess, "run", side_effect=fake_run):
+        with mock.patch.object(
+            server.offline.subprocess, "Popen", immediate_popen(fake_run)
+        ):
             job = self.api(
                 "/api/jobs",
                 {
@@ -2815,6 +2846,139 @@ class MapStudioApiTests(unittest.TestCase):
         state.set_status(first.identifier, "complete")
         second = state.add("map", self.root / "second-output", (str(self.session_a),))
         self.assertNotEqual(first.identifier, second.identifier)
+
+
+class PersistentJobRuntimeTests(unittest.TestCase):
+    def test_cancellation_stops_reprocess_child_and_preserves_runtime_log(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            session = create_session(
+                root,
+                "SupermarketSession-Cancel",
+                0.0,
+                "continuous_streaming",
+            )
+            add_rgbd_frame(session)
+            database = session / "segment_0001" / "rtabmap_segment_0001.db"
+            original = database.read_bytes()
+            executable = root / "rtabmap-reprocess"
+            executable.write_text(
+                "#!/usr/bin/env python3\n"
+                "from pathlib import Path\n"
+                "import time\n"
+                "Path('child.pid').write_text('started', encoding='utf-8')\n"
+                "print('synthetic child started', flush=True)\n"
+                "time.sleep(60)\n",
+                encoding="utf-8",
+            )
+            executable.chmod(0o755)
+            cancellation = threading.Event()
+            runtime_log = root / "runtime.log"
+            failures: list[BaseException] = []
+
+            def invoke() -> None:
+                try:
+                    server.offline.run_reprocess(
+                        database,
+                        root / "optimized.db",
+                        explicit_binary=str(executable),
+                        use_local_staging=False,
+                        cancel_event=cancellation,
+                        persistent_log_path=runtime_log,
+                    )
+                except BaseException as exc:  # captured for the test thread
+                    failures.append(exc)
+
+            worker = threading.Thread(target=invoke)
+            worker.start()
+            deadline = time.time() + 5
+            while time.time() < deadline and not (root / "child.pid").is_file():
+                time.sleep(0.02)
+            self.assertTrue((root / "child.pid").is_file())
+            cancellation.set()
+            worker.join(timeout=8)
+
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(len(failures), 1)
+            self.assertIsInstance(failures[0], server.offline.OfflineProcessingError)
+            self.assertIn("cancelled", str(failures[0]))
+            self.assertIn("synthetic child started", runtime_log.read_text(encoding="utf-8"))
+            self.assertFalse((root / "optimized.db").exists())
+            self.assertEqual(database.read_bytes(), original)
+
+    def test_restart_marks_active_job_interrupted_and_preserves_history(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            output = root / "output"
+            first = server.StudioState(root / "journals")
+            job = first.add("map", output, (str(root / "input.db"),))
+            first.set_status(job.identifier, "running")
+            first.update_progress(job.identifier, 42, "优化中", "subprocess active")
+
+            restarted = server.StudioState(root / "journals")
+            restored = restarted.get(job.identifier)
+            self.assertIsNotNone(restored)
+            assert restored is not None
+            self.assertEqual(restored.status, "interrupted")
+            self.assertEqual(restored.progress, 42)
+            self.assertIn("restarted", restored.error or "")
+            self.assertEqual(restored.tool_version, server.JOB_RUNTIME_TOOL_VERSION)
+            self.assertEqual(len(restored.input_identities), 1)
+            self.assertRegex(
+                restored.input_identities[0]["identity_sha256"], r"^[0-9a-f]{64}$"
+            )
+            self.assertFalse(output.exists())
+
+    def test_completed_job_remains_visible_after_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state = server.StudioState(root / "journals")
+            job = state.add("map", root / "output")
+            state.set_status(job.identifier, "running")
+            state.set_status(job.identifier, "complete")
+
+            restarted = server.StudioState(root / "journals")
+            restored = restarted.get(job.identifier)
+            self.assertIsNotNone(restored)
+            assert restored is not None
+            self.assertEqual(restored.status, "complete")
+            self.assertEqual(restored.progress, 100)
+
+    def test_cancel_is_persisted_and_signals_worker(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state = server.StudioState(Path(temporary) / "journals")
+            job = state.add("map", Path(temporary) / "output")
+            state.set_status(job.identifier, "running")
+            cancelled = state.cancel(job.identifier)
+            self.assertTrue(cancelled.cancel_event.is_set())
+            self.assertEqual(cancelled.status, "cancelling")
+            restarted = server.StudioState(Path(temporary) / "journals")
+            self.assertEqual(restarted.get(job.identifier).status, "interrupted")
+
+    def test_cancel_before_worker_start_wins_atomic_begin_race(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state = server.StudioState(Path(temporary) / "journals")
+            job = state.add("map", Path(temporary) / "output")
+            state.cancel(job.identifier)
+            self.assertFalse(state.begin(job.identifier))
+            self.assertEqual(state.get(job.identifier).status, "cancelling")
+
+    def test_corrupt_journal_fails_closed_without_path_cleanup(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            journals = root / "journals"
+            journals.mkdir()
+            protected = root / "must-remain"
+            protected.mkdir()
+            (protected / "data").write_text("safe", encoding="utf-8")
+            (journals / "bad.json").write_text(
+                json.dumps({"output_dir": str(protected), "status": "running"}),
+                encoding="utf-8",
+            )
+            state = server.StudioState(journals)
+            self.assertTrue(state.startup_errors)
+            self.assertTrue((protected / "data").is_file())
+            self.assertEqual(state.list(), [])
 
 
 if __name__ == "__main__":

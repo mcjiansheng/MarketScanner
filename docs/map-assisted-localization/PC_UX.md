@@ -23,7 +23,7 @@ Map Studio 保留单设备、多设备和“导入/管理先验地图”入口�
 3. 对原 SQLite 计算 SHA‑256 并保持只读；
 4. `rtabmap-reprocess` 写入 `rtabmap_optimized/optimized.db`；
 5. 从优化副本读取全局一致相对轨迹；
-6. 运行有界轨迹修正场（非完整相对 SE(2) 因子图）；
+6. 运行 native 完整相对 SE(2) 因子图，并对 helper 报告、factor digest、连通性、gauge、收敛和 node coverage 做严格二次校验；仅在 helper 不可用时生成不可发布的 bounded draft；
 7. 重算价签位置和结构关联；
 8. 运行质量门禁并进入轨迹/价签复核；
 9. 导出 JSON/CSV/GeoJSON 和审计日志。
@@ -61,15 +61,22 @@ POST /api/prior-map/convert
 POST /api/prior-map/inspect
 POST /api/jobs
   kind=localized, prior_map, session, output, manual_edits?
+POST /api/jobs/<id>/cancel
 POST /api/jobs/<id>/localized/edit
   action=append|undo|redo, expected_version_id, expected_revision
 POST /api/jobs/<id>/localized/state
   action=submit_review|return_to_draft|publish|revoke
 GET  /api/jobs/<id>
+GET  /api/jobs
+GET  /api/jobs/<id>/runtime-log/<exact-log-name>
 GET  /api/jobs/<id>/artifact/<allowlisted-name>
 GET  /api/jobs/<id>/localized/versions/<version>/artifact/<allowlisted-name>
 ```
 
 ## 发布含义
 
-当前结果从 `draft` 可在 review gate 通过后生成新的 `review` 版本。由于求解器仍是 `bounded_correction_field`，`publish_gate` 固定包含 `solver_not_full_relative_se2_factor_graph`，即使人工点击批准也返回 422，不会生成 `published` 指针。当前也不向外部业务系统上传。
+当前结果从 `draft` 可在 review gate 通过后生成新的 `review` 版本。只有严格验证通过的 `full_relative_se2_factor_graph` 才具备进入 `published` 状态的 solver capability；bounded fallback 仍固定包含 `solver_not_full_relative_se2_factor_graph` 并返回 422。真实设备与现场资格门在 P5/P6 完成前，产品整体仍为 NO-GO，当前也不向外部业务系统上传。
+
+## 任务恢复与取消
+
+Map Studio 启动时恢复最近任务历史。浏览器刷新会重新连接活动任务；服务进程重启会把无法证明仍安全执行的任务标记为 `interrupted`，保留进度和原生日志但不自动发布或清理 staging。操作者可以取消活动任务，原生重处理子进程会被终止并回收；新任务仍须选择空输出目录。协议和保留边界见 [`PERSISTENT_JOBS.md`](PERSISTENT_JOBS.md)。

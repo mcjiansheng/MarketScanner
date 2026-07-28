@@ -1,5 +1,5 @@
 {
-  "wave": "P2-reproducible-release-build",
-  "base_branch": "repair-v2-p1-relative-se2-factor-graph",
-  "base_sha": "c999d6cce2711bdade3ef8ee079cbad8ebfd9c1e"
+  "wave": "P3-persistent-mapstudio-jobs",
+  "base_branch": "repair-v2-p2-reproducible-release-build",
+  "base_sha": "4f2b8af99604a8f089a6d7fb4f357dc311cba143"
 }

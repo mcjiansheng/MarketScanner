@@ -6,7 +6,7 @@
 
 当前发布判定是 **NO-GO / NOT PRODUCTION READY**。`repair-v2-w2r-safety-closeout@cf1b62c949f3574e1804808537e38c8ff643549c` 是生产化冻结基线；P0 在专用 CI job 中锁定 bounded solver 禁止发布、cleanup 确认与精确 CAS、复制后本地副本保留、required evidence 失败时 finalization fail closed 四项不变量，不修改业务算法。
 
-P1 已实现并在真实 DB 上只读验证完整相对 SE(2) 因子图、canonical factor digest、严格 Python 二次校验和 fail-closed publish capability；设计见 [`FACTOR_GRAPH_DESIGN.md`](FACTOR_GRAPH_DESIGN.md)。P2 已加入 PC release presets、依赖 capability 门、source-bound `--version`、release/iOS dependency manifests，以及不允许依赖缺失静默 skip 的 hosted build 流程；本机 macOS 空目录构建通过，跨平台远端结果仍须单独核验，见 [`REPRODUCIBLE_BUILD.md`](REPRODUCIBLE_BUILD.md)。P3 至 P8 仍需推进。
+P1 已实现并在真实 DB 上只读验证完整相对 SE(2) 因子图、canonical factor digest、严格 Python 二次校验和 fail-closed publish capability；设计见 [`FACTOR_GRAPH_DESIGN.md`](FACTOR_GRAPH_DESIGN.md)。P2 已加入 PC release presets、依赖 capability 门、source-bound `--version`、release/iOS dependency manifests，以及不允许依赖缺失静默 skip 的 hosted build 流程；本机 macOS 空目录构建通过，跨平台远端结果仍须单独核验，见 [`REPRODUCIBLE_BUILD.md`](REPRODUCIBLE_BUILD.md)。P3 已完成 Map Studio 持久 journal、重启中断判定、子进程取消、运行日志留存和浏览器任务重连，见 [`PERSISTENT_JOBS.md`](PERSISTENT_JOBS.md)。P4 至 P8 仍需推进。
 
 ## 阶段一
 
@@ -66,7 +66,7 @@ P1 已实现并在真实 DB 上只读验证完整相对 SE(2) 因子图、canoni
 | 节点覆盖审计 | 已实现 | 只读查询 source/optimized SQLite Node，和导出 node ID 三方比较缺失、额外、重复、非单调 stamp 与首尾时间；metadata 仅交叉检查 |
 | 导出隐私与本机恢复 | 已实现 | version 内 `session_input_manifest.json`/input identity 绑定全部输入字节；绝对路径按 identity 隔离在不导出的 `localized/local_inputs/`，重放前验证 version、身份和当前输入 hash |
 | 不可变成果事务 | 已实现 | POSIX/Windows 跨进程锁内 staging→完整文件/hash 校验→`versions/vNNNNNN`→单指针提交；Windows write-through move、版本/指针 durability 故障注入；读取与已打开 fd 复核 hash；损坏状态拒绝降级 |
-| 质量报告和状态机 | 部分实现 | draft/review/published/revoked 事务框架和门禁；当前 solver 硬阻断 published |
+| 质量报告和状态机 | 已实现（仍受现场发布门约束） | draft/review/published/revoked 事务框架和门禁；完整相对 SE(2) helper 报告通过严格能力校验后才允许进入发布判断 |
 | 人工编辑重放/撤销/重做 | 已实现 | manual_edits v4 与 input identity、强制 version/revision CAS、HTTP 409、服务端 old value/UTC/ID、字段/范围/地图校验、undo/redo audit |
 | PC 非专业向导 | 已实现 | 地图+会话选择、一键处理、三轨迹/价签联动画布、状态/货架筛选、问题带入、人工编辑区和 artifact |
 | 确定性 E2E fixture | 已实现 | 源库不变、漂移降低、错误约束拒绝、事务/输入变更故障、双线程客户端同基准 CAS 冲突、409、发布硬门、严格 sidecar/capture-health 负例 |
@@ -74,10 +74,21 @@ P1 已实现并在真实 DB 上只读验证完整相对 SE(2) 因子图、canoni
 
 操作流程、弱/丢失定位、人工复核、备份和失败恢复见 `USER_GUIDE.md`。
 
+## P3 持久任务
+
+| 能力 | 状态 | 代码/证据 |
+| --- | --- | --- |
+| 原子任务 journal | 已实现 | `StudioState` 的 versioned JSON、文件和目录同步、有限时间戳/路径/状态校验 |
+| 浏览器刷新恢复 | 已实现 | `GET /api/jobs` 恢复最近活动或完成任务 |
+| 服务重启判定 | 已实现 | 活动态 fail closed 转换为 `interrupted`，不猜测继续、不发布 staging |
+| 操作者取消 | 已实现 | 持久取消意图；原生子进程 terminate→有界 wait→kill；partial 清理 |
+| 原生运行日志 | 已实现 | fast/discovery 独立日志、严格文件名和任务归属下载 |
+| 损坏 journal/保留策略 | 已实现 | health 报告 startup error；不按不可信路径清理；默认保留 200 个终态任务 |
+| 自动回归 | 已实现 | 工作台测试目录 76 项通过，其中持久任务测试 6 项、release manifest 测试 4 项 |
+
 ## 尚未完成的发布门槛
 
-- Map Studio 任务持久化、崩溃/重启后的安全恢复或中断判定；
-- 干净环境下可重复的 PC/iOS 构建、依赖锁定和产物溯源；
+- P2 hosted Ubuntu/iOS 构建和 Windows native clean build 的最终远端证据仍须核验；
 - 支持 LiDAR 的真实 iPhone 上完成完整开始、弱纹理、行人干扰、扫码、结束落盘和外部复制干跑；
 - 已按 2026-07-28 外部静态审查关闭 W2 B-01 与 W2R H-01 至 H-04/M-01 至 M-05；远端多平台 CI run `30342577182` 已绑定准确提交并通过，独立人工复核仍待执行；
 - 正式超市场景验收；
