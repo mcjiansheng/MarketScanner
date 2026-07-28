@@ -535,7 +535,16 @@ class MapStudioApiTests(unittest.TestCase):
         if payload is None:
             with urlopen(url, timeout=10) as response:
                 return json.loads(response.read())
-        request = Request(url, data=json.dumps(payload).encode("utf-8"), headers={"Content-Type": "application/json"}, method="POST")
+        request = Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "Origin": f"http://127.0.0.1:{self.port}",
+                "X-MarketScanner-Session-Token": self.httpd.session_token,
+            },
+            method="POST",
+        )
         try:
             with urlopen(request, timeout=10) as response:
                 return json.loads(response.read())
@@ -556,6 +565,101 @@ class MapStudioApiTests(unittest.TestCase):
                 return job
             time.sleep(0.05)
         self.fail("Timed out waiting for map job")
+
+    def test_post_requires_session_token_and_expected_origin(self) -> None:
+        url = f"http://127.0.0.1:{self.port}/api/session/inspect"
+        body = json.dumps({"session": str(self.session_a)}).encode("utf-8")
+        for headers in (
+            {"Content-Type": "application/json"},
+            {
+                "Content-Type": "application/json",
+                "Origin": f"http://127.0.0.1:{self.port}",
+                "X-MarketScanner-Session-Token": "invalid",
+            },
+            {
+                "Content-Type": "application/json",
+                "Origin": "https://attacker.example",
+                "X-MarketScanner-Session-Token": self.httpd.session_token,
+            },
+        ):
+            request = Request(url, data=body, headers=headers, method="POST")
+            with self.assertRaises(HTTPError) as context:
+                urlopen(request, timeout=10)
+            self.assertEqual(context.exception.code, 403)
+            payload = json.loads(context.exception.read())
+            context.exception.close()
+            self.assertEqual(payload["code"], "request_forbidden")
+
+        controlled = Request(
+            url,
+            data=body,
+            headers={
+                "Content-Type": "application/json",
+                "X-MarketScanner-Session-Token": self.httpd.session_token,
+            },
+            method="POST",
+        )
+        with urlopen(controlled, timeout=10) as response:
+            self.assertEqual(response.status, 200)
+
+    def test_server_refuses_non_loopback_bind_and_reports_about(self) -> None:
+        with self.assertRaisesRegex(ValueError, "loopback"):
+            server.create_server(0, host="0.0.0.0")
+        with urlopen(
+            f"http://127.0.0.1:{self.port}/api/about", timeout=10
+        ) as response:
+            payload = json.loads(response.read())
+            self.assertEqual(response.headers["X-Frame-Options"], "DENY")
+            self.assertEqual(response.headers["Referrer-Policy"], "no-referrer")
+        self.assertEqual(payload["product"], "Supermarket Map Studio")
+        self.assertEqual(payload["version"], server.MAP_STUDIO_VERSION)
+        self.assertNotIn("session_token", json.dumps(payload))
+
+    def test_operator_diagnostics_bundle_excludes_session_token(self) -> None:
+        result = self.api(
+            "/api/diagnostics/export",
+            {"output_directory": str(self.root)},
+        )
+        archive = Path(result["path"])
+        self.assertTrue(archive.is_file())
+        self.assertRegex(result["sha256"], r"^[0-9a-f]{64}$")
+        self.assertFalse(result["token_persisted"])
+        with zipfile.ZipFile(archive) as bundle:
+            self.assertIn("diagnostics.json", bundle.namelist())
+            contents = b"".join(bundle.read(name) for name in bundle.namelist())
+        self.assertNotIn(self.httpd.session_token.encode("utf-8"), contents)
+
+    def test_recoverable_journal_error_does_not_hide_recovery_ui(self) -> None:
+        executable = Path(sys.executable)
+        original_errors = list(server.STATE.startup_errors)
+        server.STATE.startup_errors[:] = ["old.json: journal schema is invalid"]
+        try:
+            with (
+                mock.patch.object(
+                    server.offline,
+                    "find_reprocess_binary",
+                    return_value=executable,
+                ),
+                mock.patch.object(
+                    server,
+                    "find_factor_graph_binary",
+                    return_value=executable,
+                ),
+                mock.patch.object(
+                    server,
+                    "operator_package_diagnostic",
+                    return_value={
+                        "name": "operator_package_integrity",
+                        "ok": True,
+                        "detail": "ok",
+                    },
+                ),
+            ):
+                diagnostics = server.startup_diagnostics()
+        finally:
+            server.STATE.startup_errors[:] = original_errors
+        self.assertFalse(diagnostics["ok"])
+        self.assertTrue(diagnostics["can_start"])
 
     def test_dialog_api_returns_selected_directory(self) -> None:
         with mock.patch.object(

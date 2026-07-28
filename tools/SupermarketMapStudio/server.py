@@ -11,6 +11,8 @@ import math
 import os
 import platform
 import re
+import secrets
+import shutil
 import subprocess
 import stat
 import sys
@@ -20,6 +22,7 @@ import time
 import traceback
 import uuid
 import webbrowser
+import zipfile
 from collections import deque
 from dataclasses import dataclass, field
 from http import HTTPStatus
@@ -38,6 +41,8 @@ if str(MAPPER_DIR) not in sys.path:
     sys.path.insert(0, str(MAPPER_DIR))
 if str(APP_DIR.parent) not in sys.path:
     sys.path.insert(0, str(APP_DIR.parent))
+if str(APP_DIR.parent.parent) not in sys.path:
+    sys.path.insert(0, str(APP_DIR.parent.parent))
 
 import supermarket_2d_map as base
 import supermarket_multi_device_map as multi
@@ -105,12 +110,26 @@ ARTIFACTS = (
     "audit_log.jsonl",
 )
 JOB_RUNTIME_TOOL_VERSION = "MarketScannerMapStudioJobRuntime/1"
+MAP_STUDIO_VERSION = "MarketScannerMapStudio/2"
 
 
 def source_git_sha() -> str:
     override = os.environ.get("MARKETSCANNER_GIT_SHA", "").strip().lower()
     if re.fullmatch(r"[0-9a-f]{40}", override):
         return override
+    package_manifest = APP_DIR.parent.parent / "package-manifest.json"
+    try:
+        package_value = json.loads(package_manifest.read_text(encoding="utf-8"))
+        package_sha = str(package_value.get("gitSha", "")).lower()
+        if (
+            package_value.get("format")
+            == "MarketScannerMapStudioOperatorPackage"
+            and package_value.get("version") == 1
+            and re.fullmatch(r"[0-9a-f]{40}", package_sha)
+        ):
+            return package_sha
+    except (OSError, json.JSONDecodeError, AttributeError):
+        pass
     try:
         completed = subprocess.run(
             ["git", "rev-parse", "HEAD"],
@@ -135,6 +154,11 @@ class RequestError(ValueError):
 
     def details(self) -> Dict[str, Any]:
         return {"error": str(self), "code": self.code}
+
+
+class RequestForbidden(RequestError):
+    status = HTTPStatus.FORBIDDEN
+    code = "request_forbidden"
 
 
 class ConflictError(RequestError):
@@ -2930,7 +2954,7 @@ def reveal_directory(path: Path) -> None:
 
 
 class StudioHandler(BaseHTTPRequestHandler):
-    server_version = "SupermarketMapStudio/1.0"
+    server_version = "SupermarketMapStudio/2.0"
 
     def log_message(self, _format: str, *_args: Any) -> None:
         return
@@ -2941,8 +2965,36 @@ class StudioHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        self.send_security_headers()
         self.end_headers()
         self.wfile.write(body)
+
+    def send_security_headers(self) -> None:
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header(
+            "Content-Security-Policy",
+            "default-src 'self'; connect-src 'self'; img-src 'self' data: blob:; "
+            "script-src 'self'; style-src 'self'; object-src 'none'; base-uri 'none'; "
+            "frame-ancestors 'none'",
+        )
+
+    def authorize_post(self) -> None:
+        expected_token = getattr(self.server, "session_token", "")
+        supplied_token = self.headers.get("X-MarketScanner-Session-Token", "")
+        if (
+            not isinstance(expected_token, str)
+            or not expected_token
+            or not secrets.compare_digest(supplied_token, expected_token)
+        ):
+            raise RequestForbidden("Missing or invalid local session token.")
+        origin = self.headers.get("Origin")
+        if origin is None:
+            return
+        allowed_origins = getattr(self.server, "allowed_origins", frozenset())
+        if origin not in allowed_origins:
+            raise RequestForbidden("Unexpected request Origin.")
 
     def read_json(self) -> Dict[str, Any]:
         length = int(self.headers.get("Content-Length", "0"))
@@ -2973,6 +3025,39 @@ class StudioHandler(BaseHTTPRequestHandler):
                 },
             )
             return
+        if path == "/api/about":
+            self.send_json(
+                HTTPStatus.OK,
+                {
+                    "product": "Supermarket Map Studio",
+                    "version": MAP_STUDIO_VERSION,
+                    "git_sha": SOURCE_GIT_SHA,
+                    "python": sys.version.split()[0],
+                    "platform": platform.platform(),
+                    "startup_diagnostics": startup_diagnostics(),
+                },
+            )
+            return
+        if path == "/api/recovery":
+            interrupted = [
+                job_summary_payload(job)
+                for job in STATE.list()
+                if job.status == "interrupted"
+            ]
+            self.send_json(
+                HTTPStatus.OK,
+                {
+                    "startup_errors": list(STATE.startup_errors),
+                    "interrupted_jobs": interrupted,
+                    "actions": [
+                        "Inspect the original immutable input before retrying.",
+                        "Use a new output/staging directory for a retry.",
+                        "Keep the previous current/published version unchanged.",
+                        "Export diagnostics before clearing retained staging.",
+                    ],
+                },
+            )
+            return
         if path == "/api/jobs":
             self.send_json(
                 HTTPStatus.OK,
@@ -2989,11 +3074,23 @@ class StudioHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802
         try:
+            self.authorize_post()
             data = self.read_json()
             path = urlparse(self.path).path
             if path == "/api/dialog":
                 selected = choose_path(str(data.get("mode", "directory")), str(data.get("title", "Select folder")))
                 self.send_json(HTTPStatus.OK, {"path": selected})
+                return
+            if path == "/api/diagnostics/export":
+                self.send_json(
+                    HTTPStatus.OK,
+                    export_operator_diagnostics(
+                        resolve_path(
+                            data.get("output_directory"),
+                            "Diagnostics output directory",
+                        )
+                    ),
+                )
                 return
             if path == "/api/session/inspect":
                 self.send_json(HTTPStatus.OK, inspect_session(require_session(data.get("session"))))
@@ -3179,6 +3276,7 @@ class StudioHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(content)))
         self.send_header("Cache-Control", "no-store")
+        self.send_security_headers()
         self.end_headers()
         self.wfile.write(content)
 
@@ -3194,24 +3292,247 @@ class StudioHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(content)))
         self.send_header("Cache-Control", "no-store")
+        self.send_security_headers()
         self.end_headers()
         self.wfile.write(content)
 
 
-def create_server(port: int = 8765) -> ThreadingHTTPServer:
-    return ThreadingHTTPServer(("127.0.0.1", port), StudioHandler)
+def startup_diagnostics() -> Dict[str, Any]:
+    state_directory = STATE.state_dir or Path(tempfile.gettempdir())
+    checks: list[Dict[str, Any]] = []
+    checks.append({
+        "name": "python_3_10_or_newer",
+        "ok": sys.version_info >= (3, 10),
+        "detail": sys.version.split()[0],
+    })
+    try:
+        usage = shutil.disk_usage(state_directory)
+        checks.append({
+            "name": "state_disk_free_1_gib",
+            "ok": usage.free >= 1024 * 1024 * 1024,
+            "detail": str(usage.free),
+        })
+    except OSError as exc:
+        checks.append({"name": "state_disk_free_1_gib", "ok": False, "detail": str(exc)})
+    reprocess = offline.find_reprocess_binary()
+    factor = find_factor_graph_binary()
+    checks.extend([
+        {
+            "name": "rtabmap_reprocess",
+            "ok": reprocess is not None,
+            "detail": str(reprocess) if reprocess else "not found",
+        },
+        {
+            "name": "relative_se2_factor_helper",
+            "ok": factor is not None,
+            "detail": str(factor) if factor else "not found",
+        },
+        {
+            "name": "job_journal",
+            "ok": not STATE.startup_errors,
+            "detail": "; ".join(STATE.startup_errors) or "ok",
+        },
+        operator_package_diagnostic(),
+    ])
+    critical_names = {
+        "python_3_10_or_newer",
+        "state_disk_free_1_gib",
+        "rtabmap_reprocess",
+        "relative_se2_factor_helper",
+        "operator_package_integrity",
+    }
+    return {
+        "ok": all(item["ok"] for item in checks),
+        "can_start": all(
+            item["ok"] for item in checks if item["name"] in critical_names
+        ),
+        "checks": checks,
+    }
+
+
+def _stable_file_digest(path: Path) -> tuple[str, int]:
+    before = path.lstat()
+    if path.is_symlink() or not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+        raise ValueError(f"file is not a single-link regular file: {path.name}")
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+        opened = os.fstat(stream.fileno())
+    after = path.lstat()
+    identity = (before.st_dev, before.st_ino, before.st_size)
+    if identity != (opened.st_dev, opened.st_ino, opened.st_size) or identity != (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+    ):
+        raise ValueError(f"file changed while hashing: {path.name}")
+    return digest.hexdigest(), int(before.st_size)
+
+
+def operator_package_diagnostic(package_root: Path | None = None) -> Dict[str, Any]:
+    package_root = (package_root or APP_DIR.parent.parent).resolve()
+    manifest_path = package_root / "package-manifest.json"
+    if not manifest_path.exists():
+        return {
+            "name": "operator_package_integrity",
+            "ok": True,
+            "detail": "source checkout (no operator package manifest)",
+        }
+    try:
+        if manifest_path.is_symlink() or manifest_path.stat().st_size > 16 * 1024 * 1024:
+            raise ValueError("manifest is linked or oversized")
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        files = manifest.get("files")
+        if (
+            manifest.get("format") != "MarketScannerMapStudioOperatorPackage"
+            or manifest.get("version") != 1
+            or not isinstance(files, list)
+            or not files
+        ):
+            raise ValueError("manifest contract is invalid")
+        content_sha = hashlib.sha256(
+            json.dumps(files, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        if content_sha != manifest.get("packageContentSha256"):
+            raise ValueError("manifest content digest differs")
+        for item in files:
+            if not isinstance(item, dict):
+                raise ValueError("file record is invalid")
+            relative = item.get("relativePath")
+            if (
+                not isinstance(relative, str)
+                or not relative
+                or relative.startswith("/")
+                or ".." in Path(relative).parts
+                or "\\" in relative
+            ):
+                raise ValueError("file path is unsafe")
+            candidate = package_root
+            for component in Path(relative).parts:
+                candidate = candidate / component
+                if candidate.is_symlink():
+                    raise ValueError(f"file path contains a symlink: {relative}")
+            path = candidate.resolve()
+            if package_root not in path.parents or not path.is_file():
+                raise ValueError(f"file is missing or linked: {relative}")
+            digest, size = _stable_file_digest(path)
+            if size != item.get("bytes") or digest != item.get("sha256"):
+                raise ValueError(f"file digest differs: {relative}")
+        release_manifest = package_root / "release-manifest.json"
+        release_digest, _ = _stable_file_digest(release_manifest)
+        if release_digest != manifest.get("releaseManifestSha256"):
+            raise ValueError("release manifest digest differs")
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        return {
+            "name": "operator_package_integrity",
+            "ok": False,
+            "detail": str(exc),
+        }
+    return {
+        "name": "operator_package_integrity",
+        "ok": True,
+        "detail": str(manifest.get("packageContentSha256")),
+    }
+
+
+def export_operator_diagnostics(output_directory: Path) -> Dict[str, Any]:
+    output_directory = output_directory.resolve()
+    try:
+        info = output_directory.lstat()
+    except OSError as exc:
+        raise RequestError("Diagnostics output directory is unavailable.") from exc
+    if not stat.S_ISDIR(info.st_mode) or output_directory.is_symlink():
+        raise RequestError("Diagnostics output must be a real directory.")
+    archive = output_directory / (
+        f"marketscanner-diagnostics-{int(time.time())}-{uuid.uuid4().hex[:8]}.zip"
+    )
+    summary = {
+        "format": "MarketScannerMapStudioDiagnostics",
+        "version": 1,
+        "created_at_unix": time.time(),
+        "product_version": MAP_STUDIO_VERSION,
+        "git_sha": SOURCE_GIT_SHA,
+        "python": sys.version.split()[0],
+        "platform": platform.platform(),
+        "startup_diagnostics": startup_diagnostics(),
+        "startup_errors": list(STATE.startup_errors),
+        "jobs": [job_summary_payload(job) for job in STATE.list()],
+    }
+    total_bytes = 0
+    with zipfile.ZipFile(
+        archive,
+        mode="x",
+        compression=zipfile.ZIP_DEFLATED,
+        compresslevel=6,
+    ) as bundle:
+        bundle.writestr(
+            "diagnostics.json",
+            json.dumps(summary, indent=2, sort_keys=True).encode("utf-8") + b"\n",
+        )
+        if STATE.state_dir is not None:
+            for path in sorted(STATE.state_dir.iterdir()):
+                try:
+                    path_info = path.lstat()
+                except OSError:
+                    continue
+                if (
+                    path.is_symlink()
+                    or not stat.S_ISREG(path_info.st_mode)
+                    or path.suffix not in {".json", ".log"}
+                    or path_info.st_size > 16 * 1024 * 1024
+                    or total_bytes + path_info.st_size > 128 * 1024 * 1024
+                ):
+                    continue
+                bundle.write(path, f"job-runtime/{path.name}")
+                total_bytes += path_info.st_size
+    digest = hashlib.sha256()
+    with archive.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return {
+        "path": str(archive),
+        "bytes": archive.stat().st_size,
+        "sha256": digest.hexdigest(),
+        "token_persisted": False,
+    }
+
+
+def create_server(
+    port: int = 8765,
+    host: str = "127.0.0.1",
+    session_token: str | None = None,
+) -> ThreadingHTTPServer:
+    if host != "127.0.0.1":
+        raise ValueError("Supermarket Map Studio may bind only to a loopback address.")
+    server = ThreadingHTTPServer((host, port), StudioHandler)
+    server.session_token = session_token or secrets.token_urlsafe(32)  # type: ignore[attr-defined]
+    server.allowed_origins = frozenset({  # type: ignore[attr-defined]
+        f"http://{host}:{server.server_port}",
+    })
+    return server
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Start Supermarket Map Studio.")
+    parser.add_argument("--version", action="store_true")
+    parser.add_argument("--selfcheck", action="store_true")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--no-browser", action="store_true")
     args = parser.parse_args()
+    if args.version:
+        print(f"{MAP_STUDIO_VERSION} git_sha={SOURCE_GIT_SHA}")
+        return 0
+    if args.selfcheck:
+        diagnostics = startup_diagnostics()
+        print(json.dumps(diagnostics, indent=2, sort_keys=True))
+        return 0 if diagnostics["can_start"] else 1
     server = create_server(args.port)
     url = f"http://127.0.0.1:{server.server_port}/"
     print(f"Supermarket Map Studio: {url}", flush=True)
     if not args.no_browser:
-        threading.Timer(0.25, lambda: webbrowser.open(url)).start()
+        launch_url = f"{url}#token={server.session_token}"  # type: ignore[attr-defined]
+        threading.Timer(0.25, lambda: webbrowser.open(launch_url)).start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:

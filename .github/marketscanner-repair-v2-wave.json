@@ -1,6 +1,6 @@
 {
-  "wave": "P5-P6-device-field-qualification-infrastructure",
-  "branch": "repair-v2-p5-device-field-qualification",
-  "base_branch": "repair-v2-p4-ios-streaming-validator",
-  "base_sha": "06fa8839b11c9e8fb9ba9ecbf503e827169e7328"
+  "wave": "P7-release-packaging-security",
+  "branch": "repair-v2-p7-release-security",
+  "base_branch": "repair-v2-p5-device-field-qualification",
+  "base_sha": "be0407468337f304658ed3f8ba44390afda43694"
 }

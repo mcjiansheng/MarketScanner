@@ -10,6 +10,8 @@ P1 已实现并在真实 DB 上只读验证完整相对 SE(2) 因子图、canoni
 
 P5/P6 的真实执行尚未发生；仓库已提供失败关闭的设备/现场 evidence collector，完整矩阵、真实设备身份、App/native/prior/session/package hash、冻结阈值、至少 3 次扫描与独立标签控制点缺一项即 FAIL，见 [`FIELD_TEST_PLAN.md`](FIELD_TEST_PLAN.md) 和 [`tools/Qualification/README.md`](../../tools/Qualification/README.md)。这不构成真机或现场通过证据。
 
+P7 已实现 loopback-only server、每次启动随机且不落盘的 token、POST token/Origin 门、CSP、安全 About/恢复信息、bounded 诊断包、启动 selfcheck、macOS/Windows launcher 和 hash-bound operator archive，见 [`RELEASE_OPERATIONS.md`](RELEASE_OPERATIONS.md)。干净 Windows/macOS 安装、升级、卸载 smoke 尚未执行，不能视为平台发布验收完成。
+
 ## 阶段一
 
 | 能力 | 状态 | 代码/证据 |

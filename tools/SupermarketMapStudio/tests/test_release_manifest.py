@@ -3,11 +3,21 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+import sys
 import tempfile
 import unittest
+import zipfile
+from unittest import mock
 
 from tools.SupermarketMapStudio.release_manifest import generate
 from tools.SupermarketMapStudio.ios_dependency_manifest import generate as generate_ios, verify as verify_ios
+from tools.SupermarketMapStudio.package_release import (
+    PackagingError,
+    create_package,
+)
+STUDIO_DIR = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(STUDIO_DIR))
+from tools.SupermarketMapStudio.server import operator_package_diagnostic  # noqa: E402
 
 
 class ReleaseManifestTests(unittest.TestCase):
@@ -74,6 +84,86 @@ class ReleaseManifestTests(unittest.TestCase):
             changed.write_bytes(b"wxyz")
             with self.assertRaisesRegex(ValueError, "differs"):
                 verify_ios(root, manifest)
+
+    def test_operator_package_is_hash_bound_and_no_overwrite(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            reprocess = root / "rtabmap-reprocess"
+            factor = root / "rtabmap-prior-map-factor-graph"
+            version_line = f"#!/bin/sh\necho marketscanner_git_sha={'d' * 40}\n"
+            reprocess.write_text(version_line, encoding="utf-8")
+            factor.write_text(version_line, encoding="utf-8")
+            reprocess.chmod(0o755)
+            factor.chmod(0o755)
+            policy = root / "policy.json"
+            policy.write_text(
+                json.dumps({"format": "MarketScannerDependencyPolicy", "version": 1}),
+                encoding="utf-8",
+            )
+            release_path = root / "release.json"
+            generate(
+                output=release_path,
+                git_sha="d" * 40,
+                target_platform="macos",
+                artifacts=[reprocess, factor],
+                dependency_policy=policy,
+                build_time_utc="2026-07-28T00:00:00+00:00",
+            )
+            archive = root / "MapStudio-macos.zip"
+            with (
+                mock.patch(
+                    "tools.SupermarketMapStudio.package_release.current_source_git_sha",
+                    return_value="d" * 40,
+                ),
+                mock.patch(
+                    "tools.SupermarketMapStudio.package_release.source_tree_is_clean",
+                    return_value=True,
+                ),
+            ):
+                package = create_package(
+                    platform_name="macos",
+                    output=archive,
+                    release_manifest=release_path,
+                    reprocess_binary=reprocess,
+                    factor_binary=factor,
+                )
+            self.assertEqual(package["gitSha"], "d" * 40)
+            self.assertRegex(package["archiveSha256"], r"^[0-9a-f]{64}$")
+            extracted = root / "extracted"
+            with zipfile.ZipFile(archive) as bundle:
+                bundle.extractall(extracted)
+            self.assertTrue(operator_package_diagnostic(extracted)["ok"])
+            installed_server = extracted / "tools/SupermarketMapStudio/server.py"
+            contents = installed_server.read_bytes()
+            installed_server.write_bytes(bytes([contents[0] ^ 0x01]) + contents[1:])
+            self.assertFalse(operator_package_diagnostic(extracted)["ok"])
+            with (
+                mock.patch(
+                    "tools.SupermarketMapStudio.package_release.current_source_git_sha",
+                    return_value="d" * 40,
+                ),
+                mock.patch(
+                    "tools.SupermarketMapStudio.package_release.source_tree_is_clean",
+                    return_value=True,
+                ),
+            ):
+                with self.assertRaisesRegex(PackagingError, "already exists"):
+                    create_package(
+                        platform_name="macos",
+                        output=archive,
+                        release_manifest=release_path,
+                        reprocess_binary=reprocess,
+                        factor_binary=factor,
+                    )
+                reprocess.write_text(version_line.replace("echo", "Echo"), encoding="utf-8")
+                with self.assertRaisesRegex(PackagingError, "hash-bound"):
+                    create_package(
+                        platform_name="macos",
+                        output=root / "tampered.zip",
+                        release_manifest=release_path,
+                        reprocess_binary=reprocess,
+                        factor_binary=factor,
+                    )
 
 
 if __name__ == "__main__":

@@ -1,5 +1,13 @@
 "use strict";
 
+const launchParameters = new URLSearchParams(window.location.hash.slice(1));
+const launchToken = launchParameters.get("token") || "";
+if (launchToken) {
+  window.sessionStorage.setItem("marketscanner-session-token", launchToken);
+  window.history.replaceState(null, "", `${window.location.pathname}${window.location.search}`);
+}
+const sessionToken = launchToken || window.sessionStorage.getItem("marketscanner-session-token") || "";
+
 const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => [...document.querySelectorAll(selector)];
 const statusNode = $("#job-status");
@@ -140,7 +148,14 @@ function syncLocalizedStateButtons() {
 }
 
 async function request(path, options = {}) {
-  const response = await fetch(path, options);
+  const requestOptions = { ...options };
+  if ((requestOptions.method || "GET").toUpperCase() === "POST") {
+    if (!sessionToken) throw new Error("本地安全会话已失效，请从启动器重新打开 Map Studio。");
+    const headers = new Headers(requestOptions.headers || {});
+    headers.set("X-MarketScanner-Session-Token", sessionToken);
+    requestOptions.headers = headers;
+  }
+  const response = await fetch(path, requestOptions);
   const payload = await response.json().catch(() => ({}));
   if (!response.ok) {
     const error = new Error(payload.error || `Request failed (${response.status})`);
@@ -176,6 +191,48 @@ async function choosePath(inputId, title, mode = "directory") {
   } catch (error) {
     setStatus(error.message, "failed");
     return "";
+  }
+}
+
+async function showAboutAndRecovery() {
+  try {
+    const [about, recovery] = await Promise.all([
+      request("/api/about"),
+      request("/api/recovery"),
+    ]);
+    const failedChecks = (about.startup_diagnostics?.checks || [])
+      .filter((item) => !item.ok)
+      .map((item) => `${item.name}: ${item.detail}`);
+    const interrupted = recovery.interrupted_jobs || [];
+    window.alert([
+      `${about.product} ${about.version}`,
+      `Git SHA: ${about.git_sha}`,
+      `Python: ${about.python}`,
+      failedChecks.length ? `启动检查未通过:\n${failedChecks.join("\n")}` : "启动检查：通过",
+      interrupted.length ? `中断任务：${interrupted.length}（原输入和旧 current 均保留）` : "中断任务：0",
+      ...(recovery.actions || []),
+    ].join("\n\n"));
+  } catch (error) {
+    setStatus(error.message, "failed");
+  }
+}
+
+async function exportDiagnostics() {
+  try {
+    const selected = await request("/api/dialog", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ mode: "directory", title: "选择诊断包保存目录" }),
+    });
+    if (!selected.path) return;
+    const result = await request("/api/diagnostics/export", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ output_directory: selected.path }),
+    });
+    setStatus(`诊断包已生成：${result.path}（SHA-256 ${result.sha256}）`, "complete");
+  } catch (error) {
+    setStatus(error.message, "failed");
   }
 }
 
@@ -3139,6 +3196,8 @@ function switchMode(mode) {
 }
 
 function bindEvents() {
+  $("#show-about").addEventListener("click", showAboutAndRecovery);
+  $("#export-diagnostics").addEventListener("click", exportDiagnostics);
   $$(".tab").forEach((button) => button.addEventListener("click", () => switchMode(button.dataset.mode)));
   $$(".preview-tab").forEach((button) => button.addEventListener("click", () => updatePreview(button.dataset.preview)));
   $$('[data-pick]').forEach((button) => button.addEventListener("click", () => choosePath(button.dataset.pick, button.dataset.title)));
@@ -3264,5 +3323,8 @@ loadGpuCapabilities();
 set3DDragMode("rotate");
 addDevice();
 addDevice();
-setStatus("就绪");
+setStatus(
+  sessionToken ? "就绪" : "本地安全会话无效，请从启动器重新打开",
+  sessionToken ? "" : "failed",
+);
 restoreLatestJob();
