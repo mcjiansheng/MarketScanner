@@ -5,6 +5,7 @@ import csv
 import hashlib
 import json
 import multiprocessing
+import os
 import tempfile
 import time
 import unittest
@@ -469,12 +470,21 @@ class LocalizedVersionStoreTests(unittest.TestCase):
         replacement.write_text('{"publish_state":"review"}\n', encoding="utf-8")
         real_fdopen = localized_store.os.fdopen
         opened = 0
+        replacement_blocked_by_platform = False
 
         def replace_path_after_open(descriptor: int, *args: object, **kwargs: object):
-            nonlocal opened
+            nonlocal opened, replacement_blocked_by_platform
             opened += 1
             if opened == 2:
-                localized_store.os.replace(replacement, report)
+                try:
+                    localized_store.os.replace(replacement, report)
+                except PermissionError:
+                    if os.name != "nt":
+                        raise
+                    # Windows denies replacing an open file unless the opener
+                    # explicitly granted delete sharing. That OS-level block
+                    # closes this TOCTOU attempt before verified parsing.
+                    replacement_blocked_by_platform = True
             return real_fdopen(descriptor, *args, **kwargs)
 
         with (
@@ -487,7 +497,16 @@ class LocalizedVersionStoreTests(unittest.TestCase):
                 snapshot, "localization_report.json"
             )
         self.assertEqual(payload["format"], "MarketScannerLocalizationReport")
-        self.assertEqual(json.loads(report.read_text())["publish_state"], "review")
+        if os.name == "nt":
+            self.assertTrue(replacement_blocked_by_platform)
+            self.assertTrue(replacement.is_file())
+            self.assertEqual(
+                json.loads(report.read_text())["format"],
+                "MarketScannerLocalizationReport",
+            )
+        else:
+            self.assertFalse(replacement_blocked_by_platform)
+            self.assertEqual(json.loads(report.read_text())["publish_state"], "review")
 
     def test_local_input_tampering_fails_closed_without_changing_current(self) -> None:
         snapshot = self.commit_valid()

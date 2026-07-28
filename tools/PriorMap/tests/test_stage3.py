@@ -514,6 +514,12 @@ class ShelfAssociationSafetyTests(unittest.TestCase):
         result = _associate_tag(tag, [shelf, second], (2.0, 2.0))
         self.assertEqual(result.get("shelf_code"), "SHELF-01")
         self.assertFalse(result.get("needs_review"))
+        self.assertEqual(result["association_audit"]["status"], "auto_confirmed")
+        self.assertTrue(result["association_audit"]["candidate_search_complete"])
+        self.assertEqual(
+            result["association_audit"]["candidate_search_scope"],
+            "all_stable_edges_within_radius",
+        )
 
     def test_no_independent_second_candidate_fails_closed(self) -> None:
         shelf = self._shelf_element("SHELF-01", [(0.0, 0.0), (4.0, 0.0), (4.0, -0.5), (0.0, -0.5)])

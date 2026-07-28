@@ -842,6 +842,88 @@ class MapStudioApiTests(unittest.TestCase):
         self.assertEqual(inspected["workflow_mode"], "prior_map_localized")
         self.assertEqual(inspected["prior_map_ids"], ["fixture-map"])
 
+    def test_explicit_checkpoint_cleanup_requires_matching_older_evidence(self) -> None:
+        session = create_session(
+            self.root,
+            "SupermarketSession-FinalizedCleanup",
+            0.0,
+            "continuous_streaming",
+        )
+        segment = session / "segment_0001"
+        metadata_path = segment / "metadata.json"
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        metadata.update(
+            {
+                "trackingSessionId": "tracking-cleanup",
+                "finalizedAtUnix": 20.0,
+            }
+        )
+        metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+        checkpoint_path = segment / "live_checkpoint.json"
+        checkpoint_path.write_text(
+            json.dumps(
+                {
+                    "trackingSessionId": "tracking-cleanup",
+                    "updatedAtUnix": 10.0,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        result = self.api(
+            "/api/session/cleanup-finalized-checkpoint",
+            {"session": str(session)},
+        )
+        self.assertTrue(result["cleaned"])
+        self.assertFalse(checkpoint_path.exists())
+        events = (segment / "scan_events.jsonl").read_text(encoding="utf-8")
+        self.assertIn("finalization_checkpoint_cleanup_authorized", events)
+        self.assertIn("finalization_checkpoint_cleanup_completed", events)
+
+    def test_checkpoint_cleanup_rejects_mismatch_and_newer_checkpoint(self) -> None:
+        for name, checkpoint_identity, checkpoint_time, error_text in (
+            ("Mismatch", "other", 10.0, "identity"),
+            ("Newer", "tracking-cleanup", 21.0, "newer"),
+        ):
+            with self.subTest(name=name):
+                session = create_session(
+                    self.root,
+                    f"SupermarketSession-FinalizedCleanup{name}",
+                    0.0,
+                    "continuous_streaming",
+                )
+                segment = session / "segment_0001"
+                metadata_path = segment / "metadata.json"
+                metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+                metadata.update(
+                    {
+                        "trackingSessionId": "tracking-cleanup",
+                        "finalizedAtUnix": 20.0,
+                    }
+                )
+                metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+                checkpoint_path = segment / "live_checkpoint.json"
+                checkpoint_path.write_text(
+                    json.dumps(
+                        {
+                            "trackingSessionId": checkpoint_identity,
+                            "updatedAtUnix": checkpoint_time,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                with self.assertRaises(HTTPError) as rejected:
+                    self.api(
+                        "/api/session/cleanup-finalized-checkpoint",
+                        {"session": str(session)},
+                    )
+                self.assertEqual(rejected.exception.code, 400)
+                self.assertIn(
+                    error_text,
+                    rejected.exception.payload["error"].lower(),
+                )
+                self.assertTrue(checkpoint_path.exists())
+
     def test_manual_merge_preview_maps_regions_to_user_closures(self) -> None:
         _session, _database, output = create_manual_merge_result(self.root)
         job = server.STATE.add("map", output)

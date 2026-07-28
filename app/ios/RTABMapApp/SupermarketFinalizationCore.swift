@@ -1,0 +1,366 @@
+//
+//  SupermarketFinalizationCore.swift
+//  RTABMapApp
+//
+//  Foundation-only finalization transaction primitives. Keeping this state
+//  machine outside the view controller makes pre/post-commit failures
+//  executable with injected writers instead of source-text assertions.
+//
+
+import Foundation
+import CryptoKit
+
+struct CaptureFileDigest: Equatable {
+    let relativePath: String
+    let byteCount: UInt64
+    let sha256: String
+}
+
+enum CaptureDirectoryIntegrity {
+    static func manifest(
+        for directory: URL,
+        fileManager: FileManager = .default
+    ) throws -> [CaptureFileDigest] {
+        let directoryValues = try directory.resourceValues(
+            forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+        guard directoryValues.isDirectory == true,
+              directoryValues.isSymbolicLink != true else {
+            throw NSError(
+                domain: "CaptureDirectoryIntegrity",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "Capture directory is missing or is a symbolic link."])
+        }
+        let rootPath = directory.standardizedFileURL.path + "/"
+        guard let enumerator = fileManager.enumerator(
+            at: directory,
+            includingPropertiesForKeys: [
+                .isRegularFileKey,
+                .isSymbolicLinkKey,
+                .fileSizeKey,
+            ],
+            options: []) else {
+            throw NSError(
+                domain: "CaptureDirectoryIntegrity",
+                code: 2,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "Unable to enumerate capture directory."])
+        }
+        var result: [CaptureFileDigest] = []
+        for case let fileURL as URL in enumerator {
+            let values = try fileURL.resourceValues(forKeys: [
+                .isRegularFileKey,
+                .isSymbolicLinkKey,
+                .fileSizeKey,
+            ])
+            if values.isSymbolicLink == true {
+                throw NSError(
+                    domain: "CaptureDirectoryIntegrity",
+                    code: 3,
+                    userInfo: [NSLocalizedDescriptionKey:
+                        "Capture directory contains a symbolic link."])
+            }
+            guard values.isRegularFile == true else {
+                continue
+            }
+            let path = fileURL.standardizedFileURL.path
+            guard path.hasPrefix(rootPath) else {
+                throw NSError(
+                    domain: "CaptureDirectoryIntegrity",
+                    code: 4,
+                    userInfo: [NSLocalizedDescriptionKey:
+                        "Capture file escaped the expected directory."])
+            }
+            result.append(CaptureFileDigest(
+                relativePath: String(path.dropFirst(rootPath.count)),
+                byteCount: UInt64(values.fileSize ?? 0),
+                sha256: try sha256(fileURL)))
+        }
+        return result.sorted { $0.relativePath < $1.relativePath }
+    }
+
+    private static func sha256(_ fileURL: URL) throws -> String {
+        let handle = try FileHandle(forReadingFrom: fileURL)
+        defer { try? handle.close() }
+        var digest = SHA256()
+        while let chunk = try handle.read(upToCount: 1024 * 1024),
+              !chunk.isEmpty {
+            digest.update(data: chunk)
+        }
+        return digest.finalize().map { String(format: "%02x", $0) }.joined()
+    }
+}
+
+enum SidecarFinalizationPhase: String, Codable {
+    case preparing
+    case artifactsWritten
+    case metadataCommitted
+    case checkpointCleaned
+    case finalizedNeedsCleanup
+}
+
+struct SidecarCommitResult {
+    let phase: SidecarFinalizationPhase
+    let metadataCommitted: Bool
+    let finalizedMetadataCommitted: Bool
+    let checkpointCleanupSucceeded: Bool
+    let cleanupError: String?
+
+    var requiresTerminalCleanup: Bool {
+        return finalizedMetadataCommitted && !checkpointCleanupSucceeded
+    }
+}
+
+struct LocalizationWriteResult {
+    let traceWritten: Bool
+    let constraintWritten: Bool
+    let stateWriteRequired: Bool
+    let stateWritten: Bool
+    let failureReasons: [String: String]
+
+    var succeeded: Bool {
+        return traceWritten
+            && constraintWritten
+            && (!stateWriteRequired || stateWritten)
+    }
+
+    var failedRequiredFiles: [String] {
+        return failureReasons.keys.sorted()
+    }
+}
+
+struct EncodedLocalizationSidecarRecord {
+    let fileName: String
+    let data: Data
+    let url: URL
+}
+
+enum LocalizationEvidenceWriteCoordinator {
+    static func write(
+        trace: EncodedLocalizationSidecarRecord,
+        constraint: EncodedLocalizationSidecarRecord,
+        state: EncodedLocalizationSidecarRecord?,
+        writer: ScanSidecarFileWriting
+    ) -> LocalizationWriteResult {
+        let traceError = append(trace, writer: writer)
+        let constraintError = append(constraint, writer: writer)
+        let stateError = state.flatMap { append($0, writer: writer) }
+        var failures: [String: String] = [:]
+        if let traceError {
+            failures[trace.fileName] = traceError
+        }
+        if let constraintError {
+            failures[constraint.fileName] = constraintError
+        }
+        if let state, let stateError {
+            failures[state.fileName] = stateError
+        }
+        return LocalizationWriteResult(
+            traceWritten: traceError == nil,
+            constraintWritten: constraintError == nil,
+            stateWriteRequired: state != nil,
+            stateWritten: stateError == nil,
+            failureReasons: failures)
+    }
+
+    private static func append(
+        _ record: EncodedLocalizationSidecarRecord,
+        writer: ScanSidecarFileWriting
+    ) -> String? {
+        do {
+            try writer.append(record.data, to: record.url)
+            return nil
+        }
+        catch {
+            return error.localizedDescription
+        }
+    }
+}
+
+enum ScanFinalizationDisposition: Equatable {
+    case resumeRecording
+    case terminalFinalized
+    case terminalFinalizedNeedsCleanup
+    case terminalIneligibleEvidence
+}
+
+protocol ScanSidecarFileWriting {
+    func fileExists(at url: URL) -> Bool
+    func append(_ data: Data, to url: URL) throws
+    func writeAtomic(_ data: Data, to url: URL) throws
+    func removeItem(at url: URL) throws
+}
+
+struct FoundationScanSidecarWriter: ScanSidecarFileWriting {
+    private let fileManager: FileManager
+
+    init(fileManager: FileManager = .default) {
+        self.fileManager = fileManager
+    }
+
+    func fileExists(at url: URL) -> Bool {
+        return fileManager.fileExists(atPath: url.path)
+    }
+
+    func append(_ data: Data, to url: URL) throws {
+        if !fileExists(at: url) {
+            try writeAtomic(data, to: url)
+            return
+        }
+        let handle = try FileHandle(forWritingTo: url)
+        defer { try? handle.close() }
+        try handle.seekToEnd()
+        try handle.write(contentsOf: data)
+        try handle.synchronize()
+    }
+
+    func writeAtomic(_ data: Data, to url: URL) throws {
+        try data.write(to: url, options: .atomic)
+    }
+
+    func removeItem(at url: URL) throws {
+        try fileManager.removeItem(at: url)
+    }
+}
+
+enum SidecarFinalizationCoordinator {
+    static func commitMetadata(
+        _ metadataData: Data,
+        metadataURL: URL,
+        finalized: Bool,
+        checkpointURL: URL,
+        writer: ScanSidecarFileWriting
+    ) throws -> SidecarCommitResult {
+        // Any error here is pre-commit: callers may resume recording because
+        // finalized metadata never became visible.
+        try writer.writeAtomic(metadataData, to: metadataURL)
+
+        guard finalized else {
+            return SidecarCommitResult(
+                phase: .metadataCommitted,
+                metadataCommitted: true,
+                finalizedMetadataCommitted: false,
+                checkpointCleanupSucceeded: false,
+                cleanupError: nil)
+        }
+        guard writer.fileExists(at: checkpointURL) else {
+            return SidecarCommitResult(
+                phase: .checkpointCleaned,
+                metadataCommitted: true,
+                finalizedMetadataCommitted: true,
+                checkpointCleanupSucceeded: true,
+                cleanupError: nil)
+        }
+        do {
+            try writer.removeItem(at: checkpointURL)
+            return SidecarCommitResult(
+                phase: .checkpointCleaned,
+                metadataCommitted: true,
+                finalizedMetadataCommitted: true,
+                checkpointCleanupSucceeded: true,
+                cleanupError: nil)
+        }
+        catch {
+            // Metadata is already the durable commit marker. Cleanup failure
+            // is terminal and must never be translated back to recording.
+            return SidecarCommitResult(
+                phase: .finalizedNeedsCleanup,
+                metadataCommitted: true,
+                finalizedMetadataCommitted: true,
+                checkpointCleanupSucceeded: false,
+                cleanupError: error.localizedDescription)
+        }
+    }
+
+    static func disposition(
+        saveSucceeded: Bool,
+        expectedFinalizedMetadata: Bool,
+        commitResult: SidecarCommitResult?,
+        preCommitError: String?,
+        eligibilityError: String?
+    ) -> ScanFinalizationDisposition {
+        if expectedFinalizedMetadata,
+           let commitResult,
+           commitResult.finalizedMetadataCommitted {
+            return commitResult.requiresTerminalCleanup
+                ? .terminalFinalizedNeedsCleanup
+                : .terminalFinalized
+        }
+        if saveSucceeded,
+           expectedFinalizedMetadata == false,
+           let commitResult,
+           commitResult.metadataCommitted,
+           eligibilityError != nil,
+           preCommitError == nil {
+            // Required evidence is permanently ineligible, but the database
+            // and finalized=false metadata were saved successfully. Stop the
+            // session and preserve/export its recovery package; do not resume
+            // a workflow that can never become eligible.
+            return .terminalIneligibleEvidence
+        }
+        if !saveSucceeded || preCommitError != nil || eligibilityError != nil {
+            return .resumeRecording
+        }
+        return .resumeRecording
+    }
+}
+
+struct FinalizedCheckpointCleanupMetadata: Decodable {
+    let finalized: Bool?
+    let trackingSessionId: String?
+    let finalizedAtUnix: TimeInterval?
+}
+
+struct FinalizedCheckpointCleanupRecord: Decodable {
+    let trackingSessionId: String
+    let updatedAtUnix: TimeInterval?
+}
+
+enum FinalizedCheckpointCleanupValidationError: Error, LocalizedError {
+    case metadataNotFinalized
+    case missingIdentityOrTime
+    case identityMismatch
+    case checkpointNewerThanCommit
+
+    var errorDescription: String? {
+        switch self {
+        case .metadataNotFinalized:
+            return "Metadata is not a committed finalized scan."
+        case .missingIdentityOrTime:
+            return "Finalization cleanup evidence is incomplete."
+        case .identityMismatch:
+            return "Checkpoint tracking identity does not match metadata."
+        case .checkpointNewerThanCommit:
+            return "Checkpoint is newer than the finalized metadata commit."
+        }
+    }
+}
+
+enum FinalizedCheckpointCleanupValidator {
+    static func validate(metadataData: Data, checkpointData: Data) throws {
+        let decoder = JSONDecoder()
+        let metadata = try decoder.decode(
+            FinalizedCheckpointCleanupMetadata.self,
+            from: metadataData)
+        let checkpoint = try decoder.decode(
+            FinalizedCheckpointCleanupRecord.self,
+            from: checkpointData)
+        guard metadata.finalized == true else {
+            throw FinalizedCheckpointCleanupValidationError.metadataNotFinalized
+        }
+        guard let metadataSession = metadata.trackingSessionId,
+              !metadataSession.isEmpty,
+              let finalizedAtUnix = metadata.finalizedAtUnix,
+              finalizedAtUnix.isFinite,
+              let checkpointUpdatedAtUnix = checkpoint.updatedAtUnix,
+              checkpointUpdatedAtUnix.isFinite else {
+            throw FinalizedCheckpointCleanupValidationError.missingIdentityOrTime
+        }
+        guard metadataSession == checkpoint.trackingSessionId else {
+            throw FinalizedCheckpointCleanupValidationError.identityMismatch
+        }
+        guard checkpointUpdatedAtUnix <= finalizedAtUnix else {
+            throw FinalizedCheckpointCleanupValidationError.checkpointNewerThanCommit
+        }
+    }
+}

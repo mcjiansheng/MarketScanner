@@ -1,6 +1,34 @@
 import Foundation
 import CryptoKit
 
+final class InjectedSidecarWriter: ScanSidecarFileWriting {
+    var storage: [URL: Data] = [:]
+    var writeError: Error?
+    var appendError: Error?
+    var appendErrors: [URL: Error] = [:]
+    var removeError: Error?
+
+    func fileExists(at url: URL) -> Bool {
+        return storage[url] != nil
+    }
+
+    func append(_ data: Data, to url: URL) throws {
+        if let error = appendErrors[url] { throw error }
+        if let appendError { throw appendError }
+        storage[url, default: Data()].append(data)
+    }
+
+    func writeAtomic(_ data: Data, to url: URL) throws {
+        if let writeError { throw writeError }
+        storage[url] = data
+    }
+
+    func removeItem(at url: URL) throws {
+        if let removeError { throw removeError }
+        storage.removeValue(forKey: url)
+    }
+}
+
 func require(_ condition: @autoclosure () -> Bool, _ message: String) {
     if !condition() {
         FileHandle.standardError.write(Data("FAILED: \(message)\n".utf8))
@@ -11,6 +39,210 @@ func require(_ condition: @autoclosure () -> Bool, _ message: String) {
 func close(_ first: Double, _ second: Double, tolerance: Double = 1.0e-9) -> Bool {
     return abs(first - second) <= tolerance
 }
+
+let injectedFailure = NSError(
+    domain: "MarketScannerFinalizationTests",
+    code: 1,
+    userInfo: [NSLocalizedDescriptionKey: "injected failure"])
+let metadataURL = URL(fileURLWithPath: "/tmp/metadata.json")
+let checkpointURL = URL(fileURLWithPath: "/tmp/live_checkpoint.json")
+let metadataData = Data("{\"finalized\":true}".utf8)
+
+let metadataFailureWriter = InjectedSidecarWriter()
+metadataFailureWriter.storage[checkpointURL] = Data("checkpoint".utf8)
+metadataFailureWriter.writeError = injectedFailure
+var metadataFailureObserved = false
+do {
+    _ = try SidecarFinalizationCoordinator.commitMetadata(
+        metadataData,
+        metadataURL: metadataURL,
+        finalized: true,
+        checkpointURL: checkpointURL,
+        writer: metadataFailureWriter)
+}
+catch {
+    metadataFailureObserved = true
+}
+require(metadataFailureObserved, "metadata write failure must remain pre-commit")
+require(
+    !metadataFailureWriter.fileExists(at: metadataURL),
+    "failed metadata must not become visible")
+require(
+    SidecarFinalizationCoordinator.disposition(
+        saveSucceeded: true,
+        expectedFinalizedMetadata: true,
+        commitResult: nil,
+        preCommitError: "injected",
+        eligibilityError: nil) == .resumeRecording,
+    "pre-commit metadata failure may resume recording")
+
+let cleanupFailureWriter = InjectedSidecarWriter()
+cleanupFailureWriter.storage[checkpointURL] = Data("checkpoint".utf8)
+cleanupFailureWriter.removeError = injectedFailure
+let cleanupFailure = try SidecarFinalizationCoordinator.commitMetadata(
+    metadataData,
+    metadataURL: metadataURL,
+    finalized: true,
+    checkpointURL: checkpointURL,
+    writer: cleanupFailureWriter)
+require(cleanupFailure.metadataCommitted, "metadata must be committed before cleanup")
+require(
+    cleanupFailure.phase == .finalizedNeedsCleanup,
+    "cleanup failure must enter terminal needs-cleanup")
+require(
+    cleanupFailureWriter.fileExists(at: checkpointURL),
+    "failed cleanup must preserve checkpoint")
+require(
+    SidecarFinalizationCoordinator.disposition(
+        saveSucceeded: true,
+        expectedFinalizedMetadata: true,
+        commitResult: cleanupFailure,
+        preCommitError: nil,
+        eligibilityError: nil) == .terminalFinalizedNeedsCleanup,
+    "post-commit cleanup failure must never resume recording")
+
+let successfulWriter = InjectedSidecarWriter()
+successfulWriter.storage[checkpointURL] = Data("checkpoint".utf8)
+let committed = try SidecarFinalizationCoordinator.commitMetadata(
+    metadataData,
+    metadataURL: metadataURL,
+    finalized: true,
+    checkpointURL: checkpointURL,
+    writer: successfulWriter)
+require(committed.phase == .checkpointCleaned, "successful cleanup phase")
+require(
+    !successfulWriter.fileExists(at: checkpointURL),
+    "successful commit must remove the old checkpoint")
+require(
+    SidecarFinalizationCoordinator.disposition(
+        saveSucceeded: true,
+        expectedFinalizedMetadata: true,
+        commitResult: committed,
+        preCommitError: nil,
+        eligibilityError: nil) == .terminalFinalized,
+    "successful finalized metadata must end recording")
+
+let invalidEvidenceWriter = InjectedSidecarWriter()
+invalidEvidenceWriter.storage[checkpointURL] = Data("checkpoint".utf8)
+let invalidMetadataCommit = try SidecarFinalizationCoordinator.commitMetadata(
+    Data("{\"finalized\":false}".utf8),
+    metadataURL: metadataURL,
+    finalized: false,
+    checkpointURL: checkpointURL,
+    writer: invalidEvidenceWriter)
+require(
+    SidecarFinalizationCoordinator.disposition(
+        saveSucceeded: true,
+        expectedFinalizedMetadata: false,
+        commitResult: invalidMetadataCommit,
+        preCommitError: nil,
+        eligibilityError: "required evidence failed")
+        == .terminalIneligibleEvidence,
+    "saved ineligible evidence must stop as a recovery package, not resume")
+require(
+    invalidEvidenceWriter.fileExists(at: checkpointURL),
+    "ineligible recovery package must retain its checkpoint")
+
+let traceURL = URL(fileURLWithPath: "/tmp/localization_trace.jsonl")
+let constraintURL = URL(fileURLWithPath: "/tmp/localization_constraints.jsonl")
+let stateURL = URL(fileURLWithPath: "/tmp/localization_events.jsonl")
+let traceRecord = EncodedLocalizationSidecarRecord(
+    fileName: "localization_trace.jsonl",
+    data: Data("trace\n".utf8),
+    url: traceURL)
+let constraintRecord = EncodedLocalizationSidecarRecord(
+    fileName: "localization_constraints.jsonl",
+    data: Data("constraint\n".utf8),
+    url: constraintURL)
+let stateRecord = EncodedLocalizationSidecarRecord(
+    fileName: "localization_events.jsonl",
+    data: Data("state\n".utf8),
+    url: stateURL)
+for failedURL in [traceURL, constraintURL, stateURL] {
+    let partialWriter = InjectedSidecarWriter()
+    partialWriter.appendErrors[failedURL] = injectedFailure
+    let result = LocalizationEvidenceWriteCoordinator.write(
+        trace: traceRecord,
+        constraint: constraintRecord,
+        state: stateRecord,
+        writer: partialWriter)
+    require(!result.succeeded, "each required sidecar failure must be visible")
+    require(
+        result.failedRequiredFiles.count == 1,
+        "partial success must identify exactly the failed required file")
+    if failedURL == stateURL {
+        require(!result.stateWritten, "failed state event must not be durable")
+    }
+}
+let noStateWriter = InjectedSidecarWriter()
+let noStateResult = LocalizationEvidenceWriteCoordinator.write(
+    trace: traceRecord,
+    constraint: constraintRecord,
+    state: nil,
+    writer: noStateWriter)
+require(noStateResult.succeeded, "unchanged state must not require a state event")
+require(!noStateResult.stateWriteRequired, "state write requirement must be explicit")
+
+let cleanupMetadata = Data(
+    "{\"finalized\":true,\"trackingSessionId\":\"session-a\",\"finalizedAtUnix\":20}".utf8)
+let olderCheckpoint = Data(
+    "{\"trackingSessionId\":\"session-a\",\"updatedAtUnix\":10}".utf8)
+try FinalizedCheckpointCleanupValidator.validate(
+    metadataData: cleanupMetadata,
+    checkpointData: olderCheckpoint)
+var newerCheckpointRejected = false
+do {
+    try FinalizedCheckpointCleanupValidator.validate(
+        metadataData: cleanupMetadata,
+        checkpointData: Data(
+            "{\"trackingSessionId\":\"session-a\",\"updatedAtUnix\":21}".utf8))
+}
+catch FinalizedCheckpointCleanupValidationError.checkpointNewerThanCommit {
+    newerCheckpointRejected = true
+}
+require(newerCheckpointRejected, "newer checkpoint cleanup must fail closed")
+
+let finalizationTemp = FileManager.default.temporaryDirectory.appendingPathComponent(
+    "MarketScannerFinalization-\(UUID().uuidString)",
+    isDirectory: true)
+try FileManager.default.createDirectory(
+    at: finalizationTemp,
+    withIntermediateDirectories: true)
+defer { try? FileManager.default.removeItem(at: finalizationTemp) }
+let foundationWriter = FoundationScanSidecarWriter()
+let appendURL = finalizationTemp.appendingPathComponent("events.jsonl")
+try foundationWriter.writeAtomic(Data("first\n".utf8), to: appendURL)
+try foundationWriter.append(Data("second\n".utf8), to: appendURL)
+let appendedContents = try String(contentsOf: appendURL, encoding: .utf8)
+require(
+    appendedContents == "first\nsecond\n",
+    "Foundation writer must durably append complete records")
+
+let captureSource = finalizationTemp.appendingPathComponent(
+    "capture-source",
+    isDirectory: true)
+let captureCopy = finalizationTemp.appendingPathComponent(
+    "capture-copy",
+    isDirectory: true)
+try FileManager.default.createDirectory(
+    at: captureSource,
+    withIntermediateDirectories: true)
+try Data("database-a".utf8).write(
+    to: captureSource.appendingPathComponent("rtabmap_segment_0001.db"))
+try Data("metadata-a".utf8).write(
+    to: captureSource.appendingPathComponent("metadata.json"))
+let sourceManifestBefore = try CaptureDirectoryIntegrity.manifest(for: captureSource)
+try FileManager.default.copyItem(at: captureSource, to: captureCopy)
+let copiedManifest = try CaptureDirectoryIntegrity.manifest(for: captureCopy)
+require(
+    sourceManifestBefore == copiedManifest,
+    "per-file SHA-256 manifests must verify an unchanged capture copy")
+try Data("database-b".utf8).write(
+    to: captureSource.appendingPathComponent("rtabmap_segment_0001.db"))
+let sourceManifestAfter = try CaptureDirectoryIntegrity.manifest(for: captureSource)
+require(
+    sourceManifestBefore != sourceManifestAfter,
+    "same-size source mutation must be detected by per-file SHA-256")
 
 require(PriorMapScanConfiguration.freeMapping.isReadyToStart, "free mapping must remain startable")
 require(

@@ -36,6 +36,7 @@ struct ScanSegmentMetadata: Codable {
     /// re-extracts features and performs the authoritative global optimization.
     let processingProfile: String?
     let exportedAt: String
+    let finalizedAtUnix: TimeInterval?
     let knownAreaM2: Double
     let nodeCount: Int
     let databaseMemoryMB: Int
@@ -132,24 +133,6 @@ struct ScanProcessingEligibility: Codable {
     let blockers: [String]
 }
 
-struct LocalizationWriteResult {
-    let traceWritten: Bool
-    let constraintWritten: Bool
-    let stateWriteRequired: Bool
-    let stateWritten: Bool
-    let failureReasons: [String: String]
-
-    var succeeded: Bool {
-        return traceWritten
-            && constraintWritten
-            && (!stateWriteRequired || stateWritten)
-    }
-
-    var failedRequiredFiles: [String] {
-        return failureReasons.keys.sorted()
-    }
-}
-
 private struct LocalizationRecordWriteResult {
     let succeeded: Bool
     let errorReason: String?
@@ -192,6 +175,7 @@ struct ScanLiveCheckpoint: Codable {
     let format: String
     let version: Int
     let updatedAt: String
+    let updatedAtUnix: TimeInterval?
     let scanMode: String
     let finalized: Bool
     let trackingSessionId: String
@@ -435,6 +419,7 @@ final class FloorAreaEstimator {
 
 final class SupermarketScanSession {
     private let fileManager = FileManager.default
+    private let sidecarWriter: ScanSidecarFileWriting
     private let documentsDirectory: URL
     private let areaEstimator = FloorAreaEstimator()
     private let captureLock = NSRecursiveLock()
@@ -501,8 +486,12 @@ final class SupermarketScanSession {
         }
     }
 
-    init(documentsDirectory: URL) {
+    init(
+        documentsDirectory: URL,
+        sidecarWriter: ScanSidecarFileWriting = FoundationScanSidecarWriter()
+    ) {
         self.documentsDirectory = documentsDirectory
+        self.sidecarWriter = sidecarWriter
     }
 
     var baseDirectory: URL {
@@ -656,18 +645,26 @@ final class SupermarketScanSession {
         // `segment_0001` remains an on-disk schema compatibility name. A
         // continuous capture never rolls over to a second directory.
         let exportCapture = exportRoot.appendingPathComponent(localCaptureDirectory.lastPathComponent, isDirectory: true)
-        let localSummary = try directoryFileSummary(localCaptureDirectory)
+        let localManifestBeforeCopy = try CaptureDirectoryIntegrity.manifest(
+            for: localCaptureDirectory,
+            fileManager: fileManager)
         try fileManager.createDirectory(at: exportRoot, withIntermediateDirectories: true)
         if fileManager.fileExists(atPath: exportCapture.path) {
             try fileManager.removeItem(at: exportCapture)
         }
         try fileManager.copyItem(at: localCaptureDirectory, to: exportCapture)
-        let exportSummary = try directoryFileSummary(exportCapture)
-        guard localSummary == exportSummary else {
+        let exportManifest = try CaptureDirectoryIntegrity.manifest(
+            for: exportCapture,
+            fileManager: fileManager)
+        let localManifestAfterCopy = try CaptureDirectoryIntegrity.manifest(
+            for: localCaptureDirectory,
+            fileManager: fileManager)
+        guard localManifestBeforeCopy == exportManifest,
+              localManifestBeforeCopy == localManifestAfterCopy else {
             throw NSError(
                 domain: "SupermarketScanSession",
                 code: 1,
-                userInfo: [NSLocalizedDescriptionKey: NSLocalizedString("External copy verification failed. The local scan was kept.", comment: "Scan copy verification error")])
+                userInfo: [NSLocalizedDescriptionKey: NSLocalizedString("External copy SHA-256 verification failed or the source changed during copying. The local scan was kept.", comment: "Scan copy verification error")])
         }
         return exportCapture
     }
@@ -684,27 +681,133 @@ final class SupermarketScanSession {
         }
     }
 
-    private func directoryFileSummary(_ directory: URL) throws -> (files: Int, bytes: UInt64) {
-        guard let enumerator = fileManager.enumerator(
-            at: directory,
-            includingPropertiesForKeys: [.isRegularFileKey, .fileSizeKey],
+    /// Returns only sessions whose finalized metadata and older checkpoint
+    /// share one tracking identity. Older schemas without Unix commit times
+    /// are intentionally not offered for automatic cleanup.
+    func finalizedSegmentsNeedingCheckpointCleanup() -> [URL] {
+        guard let sessions = try? fileManager.contentsOfDirectory(
+            at: documentsDirectory,
+            includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey],
             options: [.skipsHiddenFiles]) else {
+            return []
+        }
+        return sessions.compactMap { sessionDirectory -> URL? in
+            guard sessionDirectory.lastPathComponent.hasPrefix(
+                "SupermarketSession-"),
+                  (try? sessionDirectory.resourceValues(
+                    forKeys: [.isDirectoryKey, .isSymbolicLinkKey]))
+                    .map({ $0.isDirectory == true && $0.isSymbolicLink != true })
+                    == true else {
+                return nil
+            }
+            let segment = sessionDirectory.appendingPathComponent(
+                "segment_0001",
+                isDirectory: true)
+            let metadata = segment.appendingPathComponent("metadata.json")
+            let checkpoint = segment.appendingPathComponent(
+                "live_checkpoint.json")
+            guard (try? segment.resourceValues(
+                    forKeys: [.isDirectoryKey, .isSymbolicLinkKey]))
+                    .map({ $0.isDirectory == true && $0.isSymbolicLink != true })
+                    == true,
+                  sidecarWriter.fileExists(at: metadata),
+                  sidecarWriter.fileExists(at: checkpoint),
+                  let metadataData = try? Data(contentsOf: metadata),
+                  let checkpointData = try? Data(contentsOf: checkpoint),
+                  (try? FinalizedCheckpointCleanupValidator.validate(
+                    metadataData: metadataData,
+                    checkpointData: checkpointData)) != nil else {
+                return nil
+            }
+            return segment
+        }.sorted { $0.path < $1.path }
+    }
+
+    func cleanupFinalizedCheckpoint(in segmentDirectory: URL) throws {
+        let resolvedDocuments = documentsDirectory.resolvingSymlinksInPath().path
+        let resolvedSegment = segmentDirectory.resolvingSymlinksInPath().path
+        let segmentValues = try segmentDirectory.resourceValues(
+            forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+        guard resolvedSegment.hasPrefix(resolvedDocuments + "/"),
+              segmentDirectory.lastPathComponent == "segment_0001",
+              segmentValues.isDirectory == true,
+              segmentValues.isSymbolicLink != true else {
             throw NSError(
                 domain: "SupermarketScanSession",
-                code: 3,
-                userInfo: [NSLocalizedDescriptionKey: NSLocalizedString("Unable to read the scan directory contents.", comment: "Scan directory read error")])
+                code: 30,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "Refused checkpoint cleanup outside a local scan segment."])
         }
+        let metadataURL = segmentDirectory.appendingPathComponent("metadata.json")
+        let checkpointURL = segmentDirectory.appendingPathComponent(
+            "live_checkpoint.json")
+        let metadataData = try Data(contentsOf: metadataURL)
+        let checkpointData = try Data(contentsOf: checkpointURL)
+        try FinalizedCheckpointCleanupValidator.validate(
+            metadataData: metadataData,
+            checkpointData: checkpointData)
+        let metadata = try JSONDecoder().decode(
+            FinalizedCheckpointCleanupMetadata.self,
+            from: metadataData)
+        guard let trackingSessionId = metadata.trackingSessionId else {
+            throw FinalizedCheckpointCleanupValidationError.missingIdentityOrTime
+        }
+        try appendRecoveryAuditEvent(
+            to: segmentDirectory,
+            trackingSessionId: trackingSessionId,
+            event: "finalization_checkpoint_cleanup_authorized",
+            message: "User authorized cleanup of an older checkpoint after finalized metadata commit")
+        // Re-read after the pre-delete audit append so a concurrently changed
+        // checkpoint can never be removed under stale validation evidence.
+        let currentCheckpointData = try Data(contentsOf: checkpointURL)
+        guard currentCheckpointData == checkpointData else {
+            throw FinalizedCheckpointCleanupValidationError.checkpointNewerThanCommit
+        }
+        try FinalizedCheckpointCleanupValidator.validate(
+            metadataData: metadataData,
+            checkpointData: currentCheckpointData)
+        try sidecarWriter.removeItem(at: checkpointURL)
+        do {
+            try appendRecoveryAuditEvent(
+                to: segmentDirectory,
+                trackingSessionId: trackingSessionId,
+                event: "finalization_checkpoint_cleanup_completed",
+                message: "Finalized checkpoint cleanup completed")
+        }
+        catch {
+            // Cleanup is already complete and PC eligibility has changed. Do
+            // not report a failed cleanup (or encourage an unsafe retry) only
+            // because the post-delete audit append failed.
+            print("Finalized checkpoint cleanup audit append failed: \(error)")
+        }
+    }
 
-        var fileCount = 0
-        var totalBytes: UInt64 = 0
-        for case let fileURL as URL in enumerator {
-            let values = try fileURL.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey])
-            if values.isRegularFile == true {
-                fileCount += 1
-                totalBytes += UInt64(values.fileSize ?? 0)
-            }
-        }
-        return (fileCount, totalBytes)
+    private func appendRecoveryAuditEvent(
+        to segmentDirectory: URL,
+        trackingSessionId: String,
+        event: String,
+        message: String
+    ) throws {
+        let now = Date()
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let record = ScanEventRecord(
+            format: "SupermarketScanEvent",
+            version: 1,
+            timestamp: formatter.string(from: now),
+            timestampUnix: now.timeIntervalSince1970,
+            level: "warning",
+            event: event,
+            message: message,
+            trackingSessionId: trackingSessionId,
+            fields: ["cleanup_policy": "finalized_same_identity_older_checkpoint_v1"])
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        var data = try encoder.encode(record)
+        data.append(0x0A)
+        try sidecarWriter.append(
+            data,
+            to: segmentDirectory.appendingPathComponent("scan_events.jsonl"))
     }
 
     func updateArea(timestamp: TimeInterval, nodeCount: Int, x: Float, y: Float, z: Float, roll: Float, pitch: Float, yaw: Float) -> Double {
@@ -893,10 +996,12 @@ final class SupermarketScanSession {
     ) -> ScanLiveCheckpoint {
         captureLock.lock()
         defer { captureLock.unlock() }
+        let now = Date()
         return ScanLiveCheckpoint(
             format: "SupermarketLiveCheckpoint",
-            version: 1,
-            updatedAt: Date().getFormattedDate(format: "yyyy-MM-dd HH:mm:ss"),
+            version: 2,
+            updatedAt: now.getFormattedDate(format: "yyyy-MM-dd HH:mm:ss"),
+            updatedAtUnix: now.timeIntervalSince1970,
             scanMode: "continuous_streaming",
             finalized: false,
             trackingSessionId: trackingSessionId,
@@ -959,41 +1064,48 @@ final class SupermarketScanSession {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         let data = try encoder.encode(checkpoint)
-        try data.write(
-            to: segmentDirectory.appendingPathComponent("live_checkpoint.json"),
-            options: .atomic)
+        try sidecarWriter.writeAtomic(
+            data,
+            to: segmentDirectory.appendingPathComponent("live_checkpoint.json"))
     }
 
-    func writeSidecarFiles(to segmentDirectory: URL, snapshot: ScanSegmentSidecarSnapshot) throws {
+    func writeSidecarFiles(
+        to segmentDirectory: URL,
+        snapshot: ScanSegmentSidecarSnapshot
+    ) throws -> SidecarCommitResult {
         sidecarWriteLock.lock()
         defer { sidecarWriteLock.unlock() }
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
 
         let tagsData = try encoder.encode(snapshot.priceTags)
-        try tagsData.write(to: segmentDirectory.appendingPathComponent("price_tags.json"), options: .atomic)
+        try sidecarWriter.writeAtomic(
+            tagsData,
+            to: segmentDirectory.appendingPathComponent("price_tags.json"))
 
-        try priceTagsCSV(snapshot.priceTags).write(
-            to: segmentDirectory.appendingPathComponent("price_tags.csv"),
-            atomically: true,
-            encoding: .utf8)
+        try sidecarWriter.writeAtomic(
+            Data(priceTagsCSV(snapshot.priceTags).utf8),
+            to: segmentDirectory.appendingPathComponent("price_tags.csv"))
 
         let areaCellsData = try encoder.encode(snapshot.areaCells)
-        try areaCellsData.write(to: segmentDirectory.appendingPathComponent("scan_area_cells.json"), options: .atomic)
+        try sidecarWriter.writeAtomic(
+            areaCellsData,
+            to: segmentDirectory.appendingPathComponent("scan_area_cells.json"))
 
         let poseSamplesData = try encoder.encode(snapshot.poseSamples)
-        try poseSamplesData.write(to: segmentDirectory.appendingPathComponent("trajectory_samples.json"), options: .atomic)
+        try sidecarWriter.writeAtomic(
+            poseSamplesData,
+            to: segmentDirectory.appendingPathComponent("trajectory_samples.json"))
 
-        try trajectorySamplesCSV(snapshot.poseSamples).write(
-            to: segmentDirectory.appendingPathComponent("trajectory_samples.csv"),
-            atomically: true,
-            encoding: .utf8)
+        try sidecarWriter.writeAtomic(
+            Data(trajectorySamplesCSV(snapshot.poseSamples).utf8),
+            to: segmentDirectory.appendingPathComponent("trajectory_samples.csv"))
 
         if let structureCoverage = snapshot.structureCoverage {
             let structureCoverageData = try encoder.encode(structureCoverage)
-            try structureCoverageData.write(
-                to: segmentDirectory.appendingPathComponent("structure_coverage_cells.json"),
-                options: .atomic)
+            try sidecarWriter.writeAtomic(
+                structureCoverageData,
+                to: segmentDirectory.appendingPathComponent("structure_coverage_cells.json"))
         }
 
         if scanConfiguration.workflowMode == .priorMapLocalized {
@@ -1005,31 +1117,26 @@ final class SupermarketScanSession {
                 "tag_observations.jsonl",
             ] {
                 let url = segmentDirectory.appendingPathComponent(fileName)
-                if !fileManager.fileExists(atPath: url.path) {
-                    try Data().write(to: url, options: .atomic)
+                if !sidecarWriter.fileExists(at: url) {
+                    try sidecarWriter.writeAtomic(Data(), to: url)
                 }
             }
             let localizedTagsData = try encoder.encode(snapshot.localizedPriceTags)
-            try localizedTagsData.write(
-                to: segmentDirectory.appendingPathComponent("localized_price_tags.json"),
-                options: .atomic)
+            try sidecarWriter.writeAtomic(
+                localizedTagsData,
+                to: segmentDirectory.appendingPathComponent("localized_price_tags.json"))
         }
 
         // metadata.json is the commit marker for a completed sidecar bundle.
         // Write it only after every referenced artifact has succeeded.
         let metadataData = try encoder.encode(snapshot.metadata)
-        try metadataData.write(
-            to: segmentDirectory.appendingPathComponent("metadata.json"),
-            options: .atomic)
-
-        if snapshot.metadata.finalized == true {
-            // A final metadata.json supersedes the crash-recovery heartbeat.
-            let checkpoint = segmentDirectory.appendingPathComponent(
-                "live_checkpoint.json")
-            if fileManager.fileExists(atPath: checkpoint.path) {
-                try fileManager.removeItem(at: checkpoint)
-            }
-        }
+        return try SidecarFinalizationCoordinator.commitMetadata(
+            metadataData,
+            metadataURL: segmentDirectory.appendingPathComponent("metadata.json"),
+            finalized: snapshot.metadata.finalized == true,
+            checkpointURL: segmentDirectory.appendingPathComponent(
+                "live_checkpoint.json"),
+            writer: sidecarWriter)
     }
 
     func appendScanEvent(
@@ -1069,16 +1176,7 @@ final class SupermarketScanSession {
             var data = try encoder.encode(record)
             data.append(0x0A)
             let logURL = directory.appendingPathComponent("scan_events.jsonl")
-            if !fileManager.fileExists(atPath: logURL.path) {
-                try data.write(to: logURL, options: .atomic)
-            }
-            else {
-                let handle = try FileHandle(forWritingTo: logURL)
-                handle.seekToEndOfFile()
-                handle.write(data)
-                handle.synchronizeFile()
-                handle.closeFile()
-            }
+            try sidecarWriter.append(data, to: logURL)
         }
         catch {
             print("Could not append scan event log: \(error)")
@@ -1092,6 +1190,16 @@ final class SupermarketScanSession {
     ) -> LocalizationWriteResult {
         localizationTransactionLock.lock()
         defer { localizationTransactionLock.unlock() }
+        if hasLocalizationRequiredWriteFailure() {
+            return LocalizationWriteResult(
+                traceWritten: false,
+                constraintWritten: false,
+                stateWriteRequired: false,
+                stateWritten: false,
+                failureReasons: [
+                    "localization_session": "required_write_health_already_failed"
+                ])
+        }
         let stateWriteRequired = lastLocalizationState != update.localizationState
         var trace = update
         guard nodeTimebaseOffsetSeconds.isFinite else {
@@ -1126,10 +1234,6 @@ final class SupermarketScanSession {
         trace.priorMapId = scanConfiguration.priorMapId
         trace.priorMapSha256 = scanConfiguration.priorMapSha256
         trace.floorId = scanConfiguration.floorId
-        let traceResult = appendLocalizationRecord(
-            trace,
-            fileName: "localization_trace.jsonl",
-            expectedTrackingSessionId: expectedTrackingSessionId)
         let constraint = PriorMapConstraintRecord(
             format: "MarketScannerLocalizationConstraint",
             version: 1,
@@ -1150,15 +1254,9 @@ final class SupermarketScanSession {
             effectivePointCount: update.structurePointCount,
             coverageAngleRad: update.structureCoverageAngleRad,
             matcherElapsedMs: update.matcherElapsedMs)
-        let constraintResult = appendLocalizationRecord(
-            constraint,
-            fileName: "localization_constraints.jsonl",
-            expectedTrackingSessionId: expectedTrackingSessionId)
-        var stateResult = LocalizationRecordWriteResult(
-            succeeded: true,
-            errorReason: nil)
+        var stateEvent: PriorMapStateEvent?
         if stateWriteRequired {
-            let stateEvent = PriorMapStateEvent(
+            stateEvent = PriorMapStateEvent(
                 format: "MarketScannerLocalizationStateEvent",
                 version: 1,
                 timestamp: update.timestamp,
@@ -1172,41 +1270,57 @@ final class SupermarketScanSession {
                 state: update.localizationState,
                 confidence: update.confidence,
                 reason: update.constraintReason)
-            stateResult = appendLocalizationRecord(
-                stateEvent,
-                fileName: "localization_events.jsonl",
+        }
+        let result: LocalizationWriteResult
+        do {
+            let directory = try activeLocalizationDirectory(
                 expectedTrackingSessionId: expectedTrackingSessionId)
-            if stateResult.succeeded {
-                // The state watermark represents durable evidence, not merely
-                // the in-memory localization state.
-                lastLocalizationState = update.localizationState
+            let traceRecord = try encodedLocalizationRecord(
+                trace,
+                fileName: "localization_trace.jsonl",
+                directory: directory)
+            let constraintRecord = try encodedLocalizationRecord(
+                constraint,
+                fileName: "localization_constraints.jsonl",
+                directory: directory)
+            let stateRecord = try stateEvent.map {
+                try encodedLocalizationRecord(
+                    $0,
+                    fileName: "localization_events.jsonl",
+                    directory: directory)
             }
+            result = LocalizationEvidenceWriteCoordinator.write(
+                trace: traceRecord,
+                constraint: constraintRecord,
+                state: stateRecord,
+                writer: sidecarWriter)
         }
-        var failures: [String: String] = [:]
-        if !traceResult.succeeded {
-            failures["localization_trace.jsonl"] =
-                traceResult.errorReason ?? "write_failed"
+        catch {
+            var failures = [
+                "localization_trace.jsonl": error.localizedDescription,
+                "localization_constraints.jsonl": error.localizedDescription,
+            ]
+            if stateWriteRequired {
+                failures["localization_events.jsonl"] = error.localizedDescription
+            }
+            result = LocalizationWriteResult(
+                traceWritten: false,
+                constraintWritten: false,
+                stateWriteRequired: stateWriteRequired,
+                stateWritten: !stateWriteRequired,
+                failureReasons: failures)
         }
-        if !constraintResult.succeeded {
-            failures["localization_constraints.jsonl"] =
-                constraintResult.errorReason ?? "write_failed"
+        if stateWriteRequired && result.stateWritten {
+            // The state watermark represents durable evidence, not merely the
+            // in-memory localization state.
+            lastLocalizationState = update.localizationState
         }
-        if stateWriteRequired && !stateResult.succeeded {
-            failures["localization_events.jsonl"] =
-                stateResult.errorReason ?? "write_failed"
-        }
-        let result = LocalizationWriteResult(
-            traceWritten: traceResult.succeeded,
-            constraintWritten: constraintResult.succeeded,
-            stateWriteRequired: stateWriteRequired,
-            stateWritten: stateResult.succeeded,
-            failureReasons: failures)
         recordLocalizationEvidenceSuccesses(
-            traceWritten: traceResult.succeeded,
-            constraintWritten: constraintResult.succeeded,
-            stateWritten: stateWriteRequired && stateResult.succeeded)
+            traceWritten: result.traceWritten,
+            constraintWritten: result.constraintWritten,
+            stateWritten: stateWriteRequired && result.stateWritten)
         if !result.succeeded {
-            recordLocalizationEvidenceFailures(failures)
+            recordLocalizationEvidenceFailures(result.failureReasons)
             appendScanEvent(
                 level: "error",
                 event: "localization_sidecar_write_failed",
@@ -1214,7 +1328,7 @@ final class SupermarketScanSession {
                 fields: [
                     "failed_files": result.failedRequiredFiles.joined(separator: ","),
                     "first_error": result.failedRequiredFiles.first.flatMap {
-                        failures[$0]
+                        result.failureReasons[$0]
                     } ?? "write_failed",
                 ])
         }
@@ -1225,10 +1339,25 @@ final class SupermarketScanSession {
     func appendTagObservation(_ observation: PriorMapTagObservationRecord) -> Bool {
         localizationTransactionLock.lock()
         defer { localizationTransactionLock.unlock() }
-        return appendLocalizationRecord(
+        guard !hasLocalizationRequiredWriteFailure() else {
+            return false
+        }
+        let result = appendLocalizationRecord(
             observation,
             fileName: "tag_observations.jsonl",
-            expectedTrackingSessionId: observation.trackingSessionId).succeeded
+            expectedTrackingSessionId: observation.trackingSessionId)
+        if !result.succeeded {
+            let failures = [
+                "tag_observations.jsonl": result.errorReason ?? "write_failed"
+            ]
+            recordLocalizationEvidenceFailures(failures)
+            appendScanEvent(
+                level: "error",
+                event: "tag_observation_write_failed",
+                message: "Required price-tag observation evidence was not persisted",
+                fields: ["reason": failures["tag_observations.jsonl"]!])
+        }
+        return result.succeeded
     }
 
     @discardableResult
@@ -1237,6 +1366,7 @@ final class SupermarketScanSession {
         defer { localizationTransactionLock.unlock() }
         captureLock.lock()
         guard !finalizingScan,
+              localizationRequiredWriteFailureCount == 0,
               tag.trackingSessionId == trackingSessionId,
               let root = rootDirectory,
               segmentIndex == 1 else {
@@ -1261,15 +1391,23 @@ final class SupermarketScanSession {
             let data = try encoder.encode(snapshot)
             sidecarWriteLock.lock()
             defer { sidecarWriteLock.unlock() }
-            try data.write(
-                to: directory.appendingPathComponent("localized_price_tags.json"),
-                options: .atomic)
+            try sidecarWriter.writeAtomic(
+                data,
+                to: directory.appendingPathComponent("localized_price_tags.json"))
             return true
         }
         catch {
             captureLock.lock()
             localizedPriceTags.removeAll { $0.tagId == tag.tagId }
             captureLock.unlock()
+            recordLocalizationEvidenceFailures([
+                "localized_price_tags.json": error.localizedDescription
+            ])
+            appendScanEvent(
+                level: "error",
+                event: "localized_price_tag_write_failed",
+                message: "Required confirmed price-tag state was not persisted",
+                fields: ["reason": error.localizedDescription])
             print("Could not persist localized price tag: \(error)")
             return false
         }
@@ -1368,44 +1506,24 @@ final class SupermarketScanSession {
         fileName: String,
         expectedTrackingSessionId: String
     ) -> LocalizationRecordWriteResult {
-        captureLock.lock()
-        guard !finalizingScan,
-              expectedTrackingSessionId == trackingSessionId,
-              let root = rootDirectory,
-              segmentIndex == 1 else {
-            captureLock.unlock()
-            return LocalizationRecordWriteResult(
-                succeeded: false,
-                errorReason: "session_not_writable_or_identity_mismatch")
+        let directory: URL
+        do {
+            directory = try activeLocalizationDirectory(
+                expectedTrackingSessionId: expectedTrackingSessionId)
         }
-        let directory = root.appendingPathComponent(
-            "segment_0001",
-            isDirectory: true)
-        captureLock.unlock()
-        guard fileManager.fileExists(atPath: directory.path) else {
-            print("Could not append localization record: active directory is unavailable")
+        catch {
             return LocalizationRecordWriteResult(
                 succeeded: false,
-                errorReason: "active_directory_unavailable")
+                errorReason: error.localizedDescription)
         }
         localizationLogLock.lock()
         defer { localizationLogLock.unlock() }
         do {
-            let encoder = JSONEncoder()
-            encoder.outputFormatting = [.sortedKeys]
-            var data = try encoder.encode(record)
-            data.append(0x0A)
-            let url = directory.appendingPathComponent(fileName)
-            if !fileManager.fileExists(atPath: url.path) {
-                try data.write(to: url, options: .atomic)
-            }
-            else {
-                let handle = try FileHandle(forWritingTo: url)
-                defer { try? handle.close() }
-                try handle.seekToEnd()
-                try handle.write(contentsOf: data)
-                try handle.synchronize()
-            }
+            let encoded = try encodedLocalizationRecord(
+                record,
+                fileName: fileName,
+                directory: directory)
+            try sidecarWriter.append(encoded.data, to: encoded.url)
             return LocalizationRecordWriteResult(
                 succeeded: true,
                 errorReason: nil)
@@ -1416,6 +1534,50 @@ final class SupermarketScanSession {
                 succeeded: false,
                 errorReason: error.localizedDescription)
         }
+    }
+
+    private func activeLocalizationDirectory(
+        expectedTrackingSessionId: String
+    ) throws -> URL {
+        captureLock.lock()
+        guard !finalizingScan,
+              expectedTrackingSessionId == trackingSessionId,
+              let root = rootDirectory,
+              segmentIndex == 1 else {
+            captureLock.unlock()
+            throw NSError(
+                domain: "SupermarketScanSession",
+                code: 21,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "session_not_writable_or_identity_mismatch"])
+        }
+        let directory = root.appendingPathComponent(
+            "segment_0001",
+            isDirectory: true)
+        captureLock.unlock()
+        guard fileManager.fileExists(atPath: directory.path) else {
+            print("Could not append localization record: active directory is unavailable")
+            throw NSError(
+                domain: "SupermarketScanSession",
+                code: 22,
+                userInfo: [NSLocalizedDescriptionKey: "active_directory_unavailable"])
+        }
+        return directory
+    }
+
+    private func encodedLocalizationRecord<T: Encodable>(
+        _ record: T,
+        fileName: String,
+        directory: URL
+    ) throws -> EncodedLocalizationSidecarRecord {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        var data = try encoder.encode(record)
+        data.append(0x0A)
+        return EncodedLocalizationSidecarRecord(
+            fileName: fileName,
+            data: data,
+            url: directory.appendingPathComponent(fileName))
     }
 
     private func recordLocalizationEvidenceFailures(
@@ -1433,6 +1595,13 @@ final class SupermarketScanSession {
             firstLocalizationRequiredWriteError =
                 "\(firstFile): \(failures[firstFile] ?? "write_failed")"
         }
+    }
+
+    func hasLocalizationRequiredWriteFailure() -> Bool {
+        captureLock.lock()
+        defer { captureLock.unlock() }
+        return scanConfiguration.workflowMode == .priorMapLocalized
+            && localizationRequiredWriteFailureCount > 0
     }
 
     private func recordLocalizationEvidenceSuccesses(

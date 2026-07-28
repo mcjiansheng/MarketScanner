@@ -214,6 +214,7 @@ class IOSCoreContractTests(unittest.TestCase):
         repository = Path(__file__).resolve().parents[3]
         swift_sources = [
             repository / "app/ios/RTABMapApp/PriorMapLocalizationCore.swift",
+            repository / "app/ios/RTABMapApp/SupermarketFinalizationCore.swift",
             repository / "app/ios/RTABMapApp/PriorMapScanMatcher.swift",
             repository / "app/ios/RTABMapApp/PriceTagLocalizationCore.swift",
             repository / "app/ios/RTABMapApp/PriorMapPackageIntegrityCore.swift",

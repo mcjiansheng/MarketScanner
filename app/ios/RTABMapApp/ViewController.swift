@@ -33,6 +33,7 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
     private var priorMapOverlay: PriorMapLiveMapView?
     private var priorMapLatestUpdate: PriorMapLocalizationUpdate?
     private var priorMapEvidenceWriteWarningShown = false
+    private var finalizedCleanupPromptShown = false
     private let priorMapUpdateGate = PriorMapUpdateGate(minimumInterval: 0.5)
     private var priorMapGeneration = UUID()
     private let priorMapQueue = DispatchQueue(
@@ -413,6 +414,52 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         }
 
         updateDisplayFromDefaults()
+        presentFinalizedCheckpointCleanupIfNeeded()
+    }
+
+    private func presentFinalizedCheckpointCleanupIfNeeded() {
+        guard !finalizedCleanupPromptShown,
+              let scanSession = supermarketSession else {
+            return
+        }
+        let segments = scanSession.finalizedSegmentsNeedingCheckpointCleanup()
+        guard !segments.isEmpty else {
+            return
+        }
+        finalizedCleanupPromptShown = true
+        let alert = UIAlertController(
+            title: localized("Scan saved; cleanup required"),
+            message: String(
+                format: localized("%d finalized scan(s) still contain an older live checkpoint. Their databases are closed. Clean only checkpoints whose tracking identity and time are verified?"),
+                segments.count),
+            preferredStyle: .alert)
+        alert.addAction(UIAlertAction(
+            title: localized("Keep for diagnosis"),
+            style: .cancel))
+        alert.addAction(UIAlertAction(
+            title: localized("Verify and clean"),
+            style: .default,
+            handler: { _ in
+                var failures: [String] = []
+                for segment in segments {
+                    do {
+                        try scanSession.cleanupFinalizedCheckpoint(in: segment)
+                    }
+                    catch {
+                        failures.append(
+                            "\(segment.deletingLastPathComponent().lastPathComponent): \(error.localizedDescription)")
+                    }
+                }
+                self.showToast(
+                    message: failures.isEmpty
+                        ? self.localized("Finalized checkpoint cleanup completed. The saved scans are now eligible for PC inspection.")
+                        : String(
+                            format: self.localized("Some finalized checkpoints were not cleaned: %@"),
+                            failures.joined(separator: "; ")),
+                    seconds: failures.isEmpty ? 4 : 8,
+                    replacingCurrent: true)
+            }))
+        present(alert, animated: true)
     }
 
     func progressStatusUpdate() {
@@ -2520,7 +2567,8 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         trackingState: String
     ) {
         guard activeScanConfiguration.workflowMode == .priorMapLocalized,
-              let localizer = priorMapLocalizer else {
+              let localizer = priorMapLocalizer,
+              supermarketSession?.hasLocalizationRequiredWriteFailure() != true else {
             return
         }
         let generation = priorMapGeneration
@@ -2601,10 +2649,8 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
             guard generation == self.priorMapGeneration else {
                 return
             }
-            if let snapshot = localizer.alignmentSnapshot(
-                frameTimestamp: frame.timestamp) {
-                self.priorMapAlignmentSnapshots.publish(snapshot)
-            }
+            let alignmentSnapshot = localizer.alignmentSnapshot(
+                frameTimestamp: frame.timestamp)
             let writeResult = self.supermarketSession?.appendLocalizationTrace(
                 update,
                 expectedTrackingSessionId: trackingSessionId,
@@ -2615,8 +2661,14 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                     return
                 }
                 if let writeResult, !writeResult.succeeded {
+                    self.priceTagVisionScanner.reset()
+                    self.priorMapAlignmentSnapshots.reset()
                     self.presentLocalizationEvidenceWriteFailure(
                         writeResult.failedRequiredFiles)
+                    return
+                }
+                if let alignmentSnapshot {
+                    self.priorMapAlignmentSnapshots.publish(alignmentSnapshot)
                 }
                 self.priorMapLatestUpdate = update
                 self.priorMapOverlay?.update(update)
@@ -2628,9 +2680,10 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
     {
         guard activeScanConfiguration.workflowMode == .priorMapLocalized,
               priorMapLocalizer != nil,
-              session.currentFrame != nil else {
+              session.currentFrame != nil,
+              supermarketSession?.hasLocalizationRequiredWriteFailure() != true else {
             showToast(
-                message: localized("ARKit or prior-map localization is not ready."),
+                message: localized("ARKit or prior-map localization is not ready, or required localization evidence has already failed."),
                 seconds: 3)
             return
         }
@@ -2687,6 +2740,13 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
             title: localized("确认并保存"),
             style: .default,
             handler: { _ in
+                guard self.supermarketSession?.hasLocalizationRequiredWriteFailure()
+                        != true else {
+                    self.showToast(
+                        message: self.localized("Required localization evidence has failed. This tag cannot be finalized; raw RTAB-Map recording continues."),
+                        seconds: 6)
+                    return
+                }
                 let confirmed = tag.confirmedByUser()
                 guard self.supermarketSession?.recordLocalizedPriceTag(confirmed) == true else {
                     self.showToast(
@@ -2775,6 +2835,13 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         _ mapPose: PriorMapPose2D,
         reason: String
     ) {
+        guard supermarketSession?.hasLocalizationRequiredWriteFailure() != true else {
+            showToast(
+                message: localized("Required localization evidence has failed. New prior-map corrections are disabled; raw RTAB-Map recording continues."),
+                seconds: 6,
+                replacingCurrent: true)
+            return
+        }
         guard let frame = session.currentFrame,
               let localizer = priorMapLocalizer else {
             showToast(
@@ -3699,7 +3766,9 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         let finalDatabaseMemoryMB = mLatestDatabaseMemoryMB
         let finalKnownAreaM2 = scanSession.currentAreaM2
         let finalPriceTagCount = scanSession.priceTags.count
-        let finalizedAt = Date().getFormattedDate(format: "yyyy-MM-dd HH:mm:ss")
+        let finalizationDate = Date()
+        let finalizedAt = finalizationDate.getFormattedDate(
+            format: "yyyy-MM-dd HH:mm:ss")
         let availableBytesAtFinalization = availableDiskBytes(at: segmentDirectory)
         let thermalStateAtFinalization = currentThermalStateText()
 
@@ -3713,6 +3782,7 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         var saveSucceeded = false
         var sidecarError: String?
         var processingEligibilityError: String?
+        var sidecarCommitResult: SidecarCommitResult?
         var saveSeconds = 0.0
         var sidecarSeconds = 0.0
         var finalDatabaseBytes: UInt64 = 0
@@ -3765,6 +3835,9 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                         finalized: metadataFinalized,
                         processingProfile: "iphone_continuous_pc_offline_software_error_v2_no_fiducials",
                         exportedAt: finalizedAt,
+                        finalizedAtUnix: metadataFinalized
+                            ? Date().timeIntervalSince1970
+                            : nil,
                         knownAreaM2: finalKnownAreaM2,
                         nodeCount: finalNodeCount,
                         databaseMemoryMB: finalDatabaseMemoryMB,
@@ -3815,7 +3888,9 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                             : nil)
                     let finalSnapshot = scanSession.makeSidecarSnapshot(metadata: metadata)
                     snapshot = finalSnapshot
-                    try scanSession.writeSidecarFiles(to: segmentDirectory, snapshot: finalSnapshot)
+                    sidecarCommitResult = try scanSession.writeSidecarFiles(
+                        to: segmentDirectory,
+                        snapshot: finalSnapshot)
                 }
                 catch {
                     sidecarError = error.localizedDescription
@@ -3823,11 +3898,15 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                 sidecarSeconds = Date().timeIntervalSince(sidecarStartedAt)
             }
         }, completion: {
-            guard saveSucceeded,
-                  sidecarError == nil,
-                  processingEligibilityError == nil,
-                  let snapshot = snapshot,
-                  snapshot.metadata.finalized == true else {
+            let disposition = SidecarFinalizationCoordinator.disposition(
+                saveSucceeded: saveSucceeded,
+                expectedFinalizedMetadata: snapshot?.metadata.finalized == true,
+                commitResult: sidecarCommitResult,
+                preCommitError: sidecarError,
+                eligibilityError: processingEligibilityError)
+            guard disposition != .resumeRecording,
+                  let snapshot,
+                  let sidecarCommitResult else {
                 if didStartSecurityScope {
                     exportBaseDirectory?.stopAccessingSecurityScopedResource()
                 }
@@ -3856,9 +3935,25 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                 return
             }
 
+            let needsCheckpointCleanup =
+                disposition == .terminalFinalizedNeedsCleanup
+            let stoppedWithIneligibleEvidence =
+                disposition == .terminalIneligibleEvidence
+
             scanSession.appendScanEvent(
-                event: "scan_finalized",
-                message: "Continuous streaming database finalized",
+                level: needsCheckpointCleanup || stoppedWithIneligibleEvidence
+                    ? "warning"
+                    : "info",
+                event: needsCheckpointCleanup
+                    ? "scan_finalized_needs_checkpoint_cleanup"
+                    : stoppedWithIneligibleEvidence
+                        ? "scan_stopped_ineligible_evidence"
+                        : "scan_finalized",
+                message: needsCheckpointCleanup
+                    ? "Database and metadata were finalized, but the older checkpoint could not be removed"
+                    : stoppedWithIneligibleEvidence
+                        ? "Raw database was saved and closed, but required prior-map evidence is ineligible"
+                        : "Continuous streaming database finalized",
                 fields: [
                     "nodeCount": "\(snapshot.metadata.nodeCount)",
                     "databaseBytes": "\(finalDatabaseBytes)",
@@ -3867,7 +3962,10 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                     "mapCorrectionTranslationM": String(format: "%.4f", finalMapCorrectionTranslationM),
                     "mapCorrectionRotationDeg": String(format: "%.3f", finalMapCorrectionRotationDeg),
                     "saveSeconds": String(format: "%.3f", saveSeconds),
-                    "sidecarSeconds": String(format: "%.3f", sidecarSeconds)
+                    "sidecarSeconds": String(format: "%.3f", sidecarSeconds),
+                    "finalizationPhase": sidecarCommitResult.phase.rawValue,
+                    "checkpointCleanupError":
+                        sidecarCommitResult.cleanupError ?? ""
                 ])
             let finalScanStorageBytes = self.captureDirectoryStorageBytes(at: segmentDirectory)
 
@@ -3889,10 +3987,24 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
             scanSession.isFinalizingScan = false
             self.activeScanConfiguration = .freeMapping
             self.clearPriorMapLocalization()
-            self.showToast(message: self.localized("Continuous streaming scan finalized as one database."), seconds: 3)
+            self.showToast(
+                message: needsCheckpointCleanup
+                    ? self.localized("The scan database was finalized and remains closed, but checkpoint cleanup failed. Keep the local scan and use Verify and clean after restarting; do not resume recording or copy it to the PC yet.")
+                    : stoppedWithIneligibleEvidence
+                        ? self.localized("Required localization evidence failed. The raw RTAB-Map database was saved and closed as a recovery package, but this session is not eligible for prior-map processing. Start a new scan to continue prior-map work.")
+                    : self.localized("Continuous streaming scan finalized as one database."),
+                seconds: needsCheckpointCleanup || stoppedWithIneligibleEvidence
+                    ? 9
+                    : 3,
+                replacingCurrent: true)
             completion?(true)
 
-            if let exportBaseDirectory = exportBaseDirectory {
+            if needsCheckpointCleanup {
+                if didStartSecurityScope {
+                    exportBaseDirectory?.stopAccessingSecurityScopedResource()
+                }
+            }
+            else if let exportBaseDirectory = exportBaseDirectory {
                 self.copyCaptureInBackground(
                     scanSession: scanSession,
                     captureDir: segmentDirectory,

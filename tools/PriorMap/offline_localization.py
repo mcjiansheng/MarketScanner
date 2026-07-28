@@ -4,10 +4,11 @@ The source RTAB-Map database is read-only.  This module consumes the already
 optimized database copy produced by ``rtabmap-reprocess`` and writes a separate
 prior-map coordinate trajectory plus auditable review artifacts.
 
-The solver is deliberately described as a robust banded SE(2) correction
-optimizer, not a general factor-graph implementation.  It preserves the
-RTAB-Map relative trajectory with smooth correction terms while applying
-accepted map observations and explicit manual anchors through Huber IRLS.
+The solver is a component-wise bounded correction field over x, y and wrapped
+yaw. It is not a coupled relative SE(2) factor graph and does not consume
+RTAB-Map relative/loop edges as factor residuals. It preserves the optimized
+RTAB-Map trajectory as authority, adds smooth bounded corrections and robust
+absolute observations for draft/review diagnostics, and is never publishable.
 """
 
 from __future__ import annotations
@@ -2328,7 +2329,8 @@ def _associate_tag(
         tag["association_audit"] = {
             "status": "not_associated",
             "candidate_search_radius_m": candidate_radius,
-            "candidate_search_complete": False,
+            "candidate_search_complete": True,
+            "candidate_search_scope": "all_stable_edges_within_radius",
             "candidate_count": 0,
             "candidates": [],
         }
@@ -2478,7 +2480,8 @@ def _associate_tag(
     tag["association_audit"] = {
         "status": "auto_confirmed" if can_auto_confirm else "suggested_only",
         "candidate_search_radius_m": candidate_radius,
-        "candidate_search_complete": False,
+        "candidate_search_complete": True,
+        "candidate_search_scope": "all_stable_edges_within_radius",
         "candidate_count": len(candidates),
         "independent_second_candidate_present": second is not None,
         "best_distance_m": round(best_distance, 6),

@@ -278,6 +278,7 @@ class StudioState:
 
 
 STATE = StudioState()
+FINALIZED_CHECKPOINT_CLEANUP_LOCK = threading.Lock()
 ProgressCallback = Callable[[int, str, str], None]
 
 
@@ -751,6 +752,167 @@ def inspect_session(session: Path) -> Dict[str, Any]:
         "scan_logs": scan_event_logs(session),
         "active_job": job_payload(active_job) if active_job else None,
     }
+
+
+def _required_finite_unix_time(value: Any, field_name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise RequestError(f"{field_name} must be a finite Unix timestamp.")
+    result = float(value)
+    if not math.isfinite(result):
+        raise RequestError(f"{field_name} must be a finite Unix timestamp.")
+    return result
+
+
+def _append_finalization_cleanup_audit(
+    events_path: Path,
+    *,
+    tracking_session_id: str,
+    event: str,
+    message: str,
+) -> None:
+    if events_path.is_symlink():
+        raise RequestError("Refused to write a checkpoint cleanup audit through a symlink.")
+    timestamp = datetime.now(timezone.utc)
+    record = {
+        "event": event,
+        "fields": {
+            "cleanup_policy": "finalized_same_identity_older_checkpoint_v1",
+            "operator": "map_studio_explicit_api",
+        },
+        "format": "SupermarketScanEvent",
+        "level": "warning",
+        "message": message,
+        "timestamp": timestamp.isoformat().replace("+00:00", "Z"),
+        "timestampUnix": timestamp.timestamp(),
+        "trackingSessionId": tracking_session_id,
+        "version": 1,
+    }
+    payload = (
+        json.dumps(record, ensure_ascii=False, sort_keys=True, allow_nan=False)
+        + "\n"
+    ).encode("utf-8")
+    try:
+        descriptor = os.open(
+            events_path,
+            os.O_APPEND | os.O_CREAT | os.O_WRONLY,
+            0o600,
+        )
+        try:
+            written = 0
+            while written < len(payload):
+                count = os.write(descriptor, payload[written:])
+                if count <= 0:
+                    raise OSError("short write while persisting cleanup audit")
+                written += count
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    except OSError as exc:
+        raise RequestError(f"Unable to persist checkpoint cleanup audit: {exc}") from exc
+
+
+def cleanup_finalized_checkpoint(session: Path) -> Dict[str, Any]:
+    """Explicitly remove one stale checkpoint after strict commit validation.
+
+    Normal inspection and processing never invoke this recovery path. The
+    checkpoint is preserved unless finalized metadata proves the same tracking
+    identity and has a commit time at least as new as the checkpoint.
+    """
+    with FINALIZED_CHECKPOINT_CLEANUP_LOCK:
+        segment_directories = sorted(
+            path for path in session.glob("segment_*") if path.is_dir()
+        )
+        if (
+            len(segment_directories) != 1
+            or segment_directories[0].name != "segment_0001"
+        ):
+            raise RequestError(
+                "Checkpoint cleanup requires exactly one continuous segment_0001."
+            )
+        segment = segment_directories[0]
+        metadata_path = segment / "metadata.json"
+        checkpoint_path = segment / "live_checkpoint.json"
+        events_path = segment / "scan_events.jsonl"
+        if metadata_path.is_symlink() or checkpoint_path.is_symlink():
+            raise RequestError("Refused checkpoint cleanup through a symlink.")
+        if not metadata_path.is_file() or not checkpoint_path.is_file():
+            raise RequestError(
+                "Both metadata.json and live_checkpoint.json are required for cleanup."
+            )
+        try:
+            metadata_bytes = metadata_path.read_bytes()
+            checkpoint_bytes = checkpoint_path.read_bytes()
+            metadata = json.loads(metadata_bytes.decode("utf-8"))
+            checkpoint = json.loads(checkpoint_bytes.decode("utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise RequestError(f"Finalization cleanup evidence is unreadable: {exc}") from exc
+        if not isinstance(metadata, dict) or not isinstance(checkpoint, dict):
+            raise RequestError("Finalization cleanup evidence must be JSON objects.")
+        if metadata.get("finalized") is not True:
+            raise RequestError("metadata.json is not a committed finalized scan.")
+        metadata_identity = metadata.get("trackingSessionId")
+        checkpoint_identity = checkpoint.get("trackingSessionId")
+        if (
+            not isinstance(metadata_identity, str)
+            or not metadata_identity
+            or metadata_identity != checkpoint_identity
+        ):
+            raise RequestError(
+                "Checkpoint tracking identity does not match finalized metadata."
+            )
+        finalized_at = _required_finite_unix_time(
+            metadata.get("finalizedAtUnix"), "metadata.finalizedAtUnix"
+        )
+        checkpoint_updated_at = _required_finite_unix_time(
+            checkpoint.get("updatedAtUnix"), "checkpoint.updatedAtUnix"
+        )
+        if checkpoint_updated_at > finalized_at:
+            raise RequestError(
+                "Checkpoint is newer than the finalized metadata commit."
+            )
+
+        checkpoint_stat = checkpoint_path.stat()
+        _append_finalization_cleanup_audit(
+            events_path,
+            tracking_session_id=metadata_identity,
+            event="finalization_checkpoint_cleanup_authorized",
+            message="Operator explicitly authorized stale finalized checkpoint cleanup",
+        )
+        try:
+            current_stat = checkpoint_path.stat()
+            if (
+                (current_stat.st_dev, current_stat.st_ino, current_stat.st_size)
+                != (checkpoint_stat.st_dev, checkpoint_stat.st_ino, checkpoint_stat.st_size)
+                or checkpoint_path.read_bytes() != checkpoint_bytes
+            ):
+                raise RequestError(
+                    "Checkpoint changed during validation; cleanup was cancelled."
+                )
+            checkpoint_path.unlink()
+        except FileNotFoundError as exc:
+            raise RequestError("Checkpoint changed during cleanup; operation cancelled.") from exc
+        except OSError as exc:
+            raise RequestError(f"Unable to remove the validated checkpoint: {exc}") from exc
+
+        warning = None
+        try:
+            _append_finalization_cleanup_audit(
+                events_path,
+                tracking_session_id=metadata_identity,
+                event="finalization_checkpoint_cleanup_completed",
+                message="Validated finalized checkpoint cleanup completed",
+            )
+        except RequestError as exc:
+            # The eligibility-changing deletion already succeeded. Report the
+            # audit warning without turning it into a misleading cleanup error.
+            warning = str(exc)
+        return {
+            "cleaned": True,
+            "session": str(session),
+            "segment": str(segment),
+            "tracking_session_id": metadata_identity,
+            "audit_warning": warning,
+        }
 
 
 def reprocess_single_session(
@@ -2224,6 +2386,14 @@ class StudioHandler(BaseHTTPRequestHandler):
                 return
             if path == "/api/session/inspect":
                 self.send_json(HTTPStatus.OK, inspect_session(require_session(data.get("session"))))
+                return
+            if path == "/api/session/cleanup-finalized-checkpoint":
+                self.send_json(
+                    HTTPStatus.OK,
+                    cleanup_finalized_checkpoint(
+                        require_session(data.get("session"))
+                    ),
+                )
                 return
             if path == "/api/session/result":
                 job = find_existing_result(require_session(data.get("session")))
