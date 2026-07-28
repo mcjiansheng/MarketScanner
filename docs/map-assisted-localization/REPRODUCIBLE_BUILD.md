@@ -27,6 +27,8 @@ hosted macOS CI 的 cache key 同时绑定 runner architecture、`install_deps.s
 
 首次 hosted cold-cache run `30361769032` 验证了 Ubuntu clean native build，但在 iOS GTSAM 编译时暴露 Boost 1.88 需要 C++14 以后标准库别名、而生成工程仍使用旧标准的问题。依赖脚本现对 GTSAM 同时固定 `CMAKE_CXX_STANDARD=17` 与 `GTSAM_CXX_STANDARD=17`，要求标准且关闭 compiler extensions；该失败 run 是修复依据，不能记作成功证据，后续 run 必须重新完成 dependency manifest 和 App 全量链接。
 
+第二次 cold-cache run `30362995994` 已通过 GTSAM 并继续验证 Ubuntu clean native build，但在 g2o `string_tools.cpp` 暴露 iOS target macros 未进入 translation unit，导致错误选择 `wordexp/wordfree` 分支。g2o iOS configure 现强制预包含 Apple SDK 的 `TargetConditionals.h`，让 upstream 条件编译使用 SDK 定义；该 run 仍是失败证据，完整 iOS dependency manifest/App link 必须由下一次 run 证明。
+
 该流程提供可追溯 build/cache 合同；首次 hosted 构建是否能在 runner 时间和上游可用性范围内完成，必须以 GitHub Actions 结果为准。任何 cache/build/link 失败都保持 P2 阻断，不能降级为 skipped success。
 
 ## 已执行证据
