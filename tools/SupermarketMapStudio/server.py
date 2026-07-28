@@ -942,9 +942,13 @@ def _cleanup_evidence(session: Path) -> Dict[str, Any]:
             raise RequestError(
                 "Checkpoint cleanup audit target must be a regular local file."
             )
-    metadata_descriptor = _open_regular_no_follow(metadata_path, os.O_RDONLY)
-    checkpoint_descriptor = _open_regular_no_follow(checkpoint_path, os.O_RDONLY)
+    metadata_descriptor: Optional[int] = None
+    checkpoint_descriptor: Optional[int] = None
     try:
+        metadata_descriptor = _open_regular_no_follow(metadata_path, os.O_RDONLY)
+        checkpoint_descriptor = _open_regular_no_follow(
+            checkpoint_path, os.O_RDONLY
+        )
         metadata_bytes = _read_descriptor(metadata_descriptor)
         checkpoint_bytes = _read_descriptor(checkpoint_descriptor)
         metadata = json.loads(metadata_bytes.decode("utf-8"))
@@ -991,8 +995,10 @@ def _cleanup_evidence(session: Path) -> Dict[str, Any]:
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise RequestError(f"Finalization cleanup evidence is unreadable: {exc}") from exc
     finally:
-        os.close(metadata_descriptor)
-        os.close(checkpoint_descriptor)
+        if checkpoint_descriptor is not None:
+            os.close(checkpoint_descriptor)
+        if metadata_descriptor is not None:
+            os.close(metadata_descriptor)
 
 
 def checkpoint_cleanup_evidence(session: Path) -> Dict[str, Any]:

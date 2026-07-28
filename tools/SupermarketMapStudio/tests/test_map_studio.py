@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import hashlib
 import math
+import os
 import shutil
 import sqlite3
 import stat
@@ -1056,6 +1057,35 @@ class MapStudioApiTests(unittest.TestCase):
         self.assertTrue(
             server._is_link_or_reparse(Path("segment_0001"), synthetic)
         )
+
+    def test_cleanup_evidence_closes_metadata_when_checkpoint_open_fails(
+        self,
+    ) -> None:
+        session = create_session(
+            self.root,
+            "SupermarketSession-CleanupMissingCheckpoint",
+            0.0,
+            "continuous_streaming",
+        )
+        opened_descriptors: list[int] = []
+        open_regular = server._open_regular_no_follow
+
+        def tracked_open(path: Path, flags: int) -> int:
+            descriptor = open_regular(path, flags)
+            opened_descriptors.append(descriptor)
+            return descriptor
+
+        with mock.patch.object(
+            server,
+            "_open_regular_no_follow",
+            side_effect=tracked_open,
+        ):
+            evidence = server.checkpoint_cleanup_evidence(session)
+
+        self.assertFalse(evidence["available"])
+        self.assertEqual(len(opened_descriptors), 1)
+        with self.assertRaises(OSError):
+            os.fstat(opened_descriptors[0])
 
     def test_manual_merge_preview_maps_regions_to_user_closures(self) -> None:
         _session, _database, output = create_manual_merge_result(self.root)
