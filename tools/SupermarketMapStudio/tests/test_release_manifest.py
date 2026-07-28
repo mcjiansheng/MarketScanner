@@ -11,6 +11,18 @@ from tools.SupermarketMapStudio.ios_dependency_manifest import generate as gener
 
 
 class ReleaseManifestTests(unittest.TestCase):
+    def test_ios_gtsam_build_uses_cxx17_for_current_boost_headers(self) -> None:
+        install_script = (
+            Path(__file__).resolve().parents[3]
+            / "app"
+            / "ios"
+            / "RTABMapApp"
+            / "install_deps.sh"
+        ).read_text(encoding="utf-8")
+        self.assertIn("-DCMAKE_CXX_STANDARD=17", install_script)
+        self.assertIn("-DGTSAM_CXX_STANDARD=17", install_script)
+        self.assertIn("-DCMAKE_CXX_STANDARD_REQUIRED=ON", install_script)
+
     def test_manifest_hashes_artifacts_and_is_reproducible_for_fixed_inputs(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

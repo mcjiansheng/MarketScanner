@@ -25,6 +25,8 @@ macOS 使用 `tools/SupermarketMapStudio/configure_pc_macos.sh` 安装/发现 Ho
 
 hosted macOS CI 的 cache key 同时绑定 runner architecture、`install_deps.sh` 和 dependency policy。cache miss 必须实际运行 native dependency build；不再把依赖缺失记为成功 skip。`ios_dependency_manifest.py` 对生成的全部 `Libraries/include` 与 `Libraries/lib` regular files记录 bytes/SHA-256，并记录仍保留在 build tree 中的第三方 Git HEAD/patch 状态。cache restore 后先逐文件验证该 manifest，再执行 unsigned generic arm64 app compile/link。
 
+首次 hosted cold-cache run `30361769032` 验证了 Ubuntu clean native build，但在 iOS GTSAM 编译时暴露 Boost 1.88 需要 C++14 以后标准库别名、而生成工程仍使用旧标准的问题。依赖脚本现对 GTSAM 同时固定 `CMAKE_CXX_STANDARD=17` 与 `GTSAM_CXX_STANDARD=17`，要求标准且关闭 compiler extensions；该失败 run 是修复依据，不能记作成功证据，后续 run 必须重新完成 dependency manifest 和 App 全量链接。
+
 该流程提供可追溯 build/cache 合同；首次 hosted 构建是否能在 runner 时间和上游可用性范围内完成，必须以 GitHub Actions 结果为准。任何 cache/build/link 失败都保持 P2 阻断，不能降级为 skipped success。
 
 ## 已执行证据
