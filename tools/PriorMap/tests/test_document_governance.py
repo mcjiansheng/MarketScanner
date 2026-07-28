@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 import unittest
 
@@ -32,7 +33,14 @@ class DocumentGovernanceTests(unittest.TestCase):
             "Final_Product_Agent_Spec_2026-07-28.md",
             current,
         )
-        self.assertIn("repair-v2-p2-reproducible-release-build", current)
+        wave = json.loads(
+            (ROOT / ".github/marketscanner-repair-v2-wave.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertIn(wave["branch"], current)
+        self.assertRegex(wave["base_sha"], r"^[0-9a-f]{40}$")
+        self.assertRegex(wave["base_branch"], r"^repair-v2-p[0-9]+-")
         self.assertIn("PRODUCTION_READINESS_REVIEW.md", current)
         self.assertIn("当前有效", current)
 

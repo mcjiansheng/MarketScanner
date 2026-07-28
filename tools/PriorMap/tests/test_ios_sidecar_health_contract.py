@@ -131,6 +131,33 @@ class IOSLocalizationSidecarHealthContractTests(unittest.TestCase):
         self.assertIn("LocalizationEvidenceBundleValidator.blockers", session)
         self.assertIn("committedMetadata.finalized = false", session)
 
+    def test_finalization_validator_is_streaming_bounded_and_schema_strict(self) -> None:
+        finalization = source(FINALIZATION_CORE_SOURCE)
+        validator = finalization.split(
+            "enum LocalizationEvidenceBundleValidator", 1
+        )[1].split("struct SafeRegularFileSnapshot", 1)[0]
+        jsonl_validator = validator.split(
+            "private static func validateLocalizedTags", 1
+        )[0]
+        for token in (
+            "streamRegularFile",
+            "maximumRecordBytes = 1_000_000",
+            "maximumRecords = 500_000",
+            "autoreleasepool",
+            "node_timebase_contract_invalid",
+            "trace_business_schema_invalid",
+            "constraint_business_schema_invalid",
+            "state_business_schema_invalid",
+            "tag_business_schema_invalid",
+        ):
+            self.assertIn(token, validator)
+        self.assertNotIn("Data(contentsOf:", jsonl_validator)
+        self.assertNotIn("readToEnd", jsonl_validator)
+        self.assertNotIn("[[String: Any]]", jsonl_validator)
+        safe_path = finalization.split("enum SafeSessionPath", 1)[1]
+        self.assertIn("finalPathInfo.st_ino == openedInfo.st_ino", safe_path)
+        self.assertIn("file_identity_changed_during_read", safe_path)
+
     def test_checkpoint_cleanup_uses_no_follow_file_identity(self) -> None:
         session = source(SESSION_SOURCE)
         finalization = source(FINALIZATION_CORE_SOURCE)
@@ -171,6 +198,24 @@ class IOSLocalizationSidecarHealthContractTests(unittest.TestCase):
         )
         self.assertIsNotNone(copy_function)
         self.assertNotIn("removeLocalCaptureDirectory", copy_function.group("body"))
+
+    def test_copy_receipt_is_path_private_and_has_qualification_hook(self) -> None:
+        session = source(SESSION_SOURCE)
+        finalization = source(FINALIZATION_CORE_SOURCE)
+        self.assertNotIn("sourceDirectory", finalization)
+        self.assertNotIn("destinationDirectory", finalization)
+        for token in (
+            "packageContentSha256",
+            "providerDisplayName",
+            "sourceRelativePath",
+            "destinationRelativePath",
+            "ExternalCopyPackageManifest",
+            "ExternalCopyDurabilityQualificationEvidence",
+        ):
+            self.assertIn(token, finalization)
+        self.assertIn("recordExternalCopyDurabilityQualification", session)
+        self.assertIn("durabilityQualificationStatus: \"not_executed\"", session)
+        self.assertIn("localCopyRetained: true", session)
 
     def test_finalization_effects_connect_explicit_dispositions_to_ui(self) -> None:
         finalization = source(FINALIZATION_CORE_SOURCE)

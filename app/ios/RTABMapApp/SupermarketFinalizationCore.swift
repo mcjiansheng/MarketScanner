@@ -10,6 +10,7 @@
 import Foundation
 import CryptoKit
 import Darwin
+import CoreFoundation
 
 struct CaptureFileDigest: Codable, Equatable {
     let relativePath: String
@@ -20,12 +21,42 @@ struct CaptureFileDigest: Codable, Equatable {
 struct ExternalCopyVerificationReceipt: Codable {
     let format: String
     let version: Int
+    let packageId: String
+    let sessionId: String
     let verifiedAtUnix: TimeInterval
-    let sourceDirectory: String
-    let destinationDirectory: String
+    let providerDisplayName: String
+    let sourceRelativePath: String
+    let destinationRelativePath: String
     let files: [CaptureFileDigest]
+    let packageContentSha256: String
     let localCopyRetained: Bool
     let durabilityBoundary: String
+}
+
+struct ExternalCopyPackageManifest: Codable {
+    let format: String
+    let version: Int
+    let packageId: String
+    let sessionId: String
+    let providerDisplayName: String
+    let packageContentSha256: String
+    let files: [CaptureFileDigest]
+    let localCopyRetained: Bool
+    let durabilityQualificationStatus: String
+    let durabilityExperimentHook: String
+}
+
+struct ExternalCopyDurabilityQualificationEvidence: Codable {
+    let format: String
+    let version: Int
+    let packageId: String
+    let sessionId: String
+    let providerDisplayName: String
+    let experiment: String
+    let verifiedAtUnix: TimeInterval
+    let packageContentSha256: String
+    let localCopyRetained: Bool
+    let result: String
 }
 
 struct LocalizationEvidenceBundleExpectation {
@@ -41,12 +72,27 @@ struct LocalizationEvidenceBundleExpectation {
 }
 
 enum LocalizationEvidenceBundleValidator {
+    private static let maximumRecordBytes = 1_000_000
+    private static let maximumRecords = 500_000
+    private static let maximumOptionalJSONLBytes = 128 * 1024 * 1024
+    private static let maximumRequiredJSONLBytes = 512 * 1024 * 1024
+    private static let maximumLocalizedTagsBytes = 128 * 1024 * 1024
+
     private struct JSONLContract {
         let fileName: String
         let format: String
         let version: Int
         let expectedCount: Int?
         let requiredNonEmpty: Bool
+        let strictlyIncreasingTimestamps: Bool
+        let recordIdField: String?
+    }
+
+    private struct JSONLValidationSummary {
+        var count = 0
+        var lastState: String?
+        var previousTimestamp: Double?
+        var seenRecordIds = Set<String>()
     }
 
     static func blockers(
@@ -59,19 +105,25 @@ enum LocalizationEvidenceBundleValidator {
                 format: "MarketScannerLocalizationTrace",
                 version: 1,
                 expectedCount: expectation.traceRecordCount,
-                requiredNonEmpty: true),
+                requiredNonEmpty: true,
+                strictlyIncreasingTimestamps: true,
+                recordIdField: nil),
             JSONLContract(
                 fileName: "localization_constraints.jsonl",
                 format: "MarketScannerLocalizationConstraint",
                 version: 1,
                 expectedCount: expectation.constraintRecordCount,
-                requiredNonEmpty: true),
+                requiredNonEmpty: false,
+                strictlyIncreasingTimestamps: false,
+                recordIdField: nil),
             JSONLContract(
                 fileName: "localization_events.jsonl",
                 format: "MarketScannerLocalizationStateEvent",
                 version: 1,
                 expectedCount: expectation.stateEventCount,
-                requiredNonEmpty: true),
+                requiredNonEmpty: true,
+                strictlyIncreasingTimestamps: true,
+                recordIdField: nil),
         ]
         let optional = [
             JSONLContract(
@@ -79,21 +131,26 @@ enum LocalizationEvidenceBundleValidator {
                 format: "MarketScannerManualLocalizationEvent",
                 version: 3,
                 expectedCount: nil,
-                requiredNonEmpty: false),
+                requiredNonEmpty: false,
+                strictlyIncreasingTimestamps: false,
+                recordIdField: nil),
             JSONLContract(
                 fileName: "tag_observations.jsonl",
                 format: "MarketScannerPriceTagObservation",
                 version: 1,
                 expectedCount: nil,
-                requiredNonEmpty: false),
+                requiredNonEmpty: false,
+                strictlyIncreasingTimestamps: false,
+                recordIdField: "observation_id"),
         ]
         var blockers: [String] = []
-        var decodedRecords: [String: [[String: Any]]] = [:]
+        var summaries: [String: JSONLValidationSummary] = [:]
         for contract in required + optional {
             let url = segmentDirectory.appendingPathComponent(contract.fileName)
             do {
-                decodedRecords[contract.fileName] = try validateJSONL(
+                summaries[contract.fileName] = try validateJSONL(
                     at: url,
+                    within: segmentDirectory.deletingLastPathComponent(),
                     contract: contract,
                     expectation: expectation)
             }
@@ -118,8 +175,8 @@ enum LocalizationEvidenceBundleValidator {
                 "evidence_bundle_localized_price_tags_\(stableReason(error))")
         }
 
-        if let states = decodedRecords["localization_events.jsonl"],
-           let lastState = states.last?["state"] as? String,
+        if let states = summaries["localization_events.jsonl"],
+           let lastState = states.lastState,
            lastState != expectation.lastDurableState {
             blockers.append("evidence_bundle_localization_events_watermark_mismatch")
         }
@@ -128,61 +185,186 @@ enum LocalizationEvidenceBundleValidator {
 
     private static func validateJSONL(
         at url: URL,
+        within root: URL,
         contract: JSONLContract,
         expectation: LocalizationEvidenceBundleExpectation
-    ) throws -> [[String: Any]] {
-        let data = try readRegularFile(url)
-        if data.isEmpty {
-            if contract.requiredNonEmpty {
-                throw validationError("empty")
-            }
-            return []
+    ) throws -> JSONLValidationSummary {
+        if let expectedCount = contract.expectedCount,
+           !(0...maximumRecords).contains(expectedCount) {
+            throw validationError("expected_count_out_of_range")
         }
-        guard data.last == 0x0A,
-              let text = String(data: data, encoding: .utf8) else {
+        let fileLimit: Int64
+        if let expectedCount = contract.expectedCount {
+            fileLimit = Int64(min(
+                maximumRequiredJSONLBytes,
+                max(1024 * 1024, expectedCount * 64 * 1024 + 1024 * 1024)))
+        }
+        else {
+            fileLimit = Int64(maximumOptionalJSONLBytes)
+        }
+        var summary = JSONLValidationSummary()
+        var pending = Data()
+        try SafeSessionPath.streamRegularFile(
+            url,
+            within: root,
+            maximumBytes: fileLimit,
+            chunkBytes: 64 * 1024
+        ) { chunk in
+            pending.append(chunk)
+            while let newline = pending.firstIndex(of: 0x0A) {
+                let line = pending.subdata(in: pending.startIndex..<newline)
+                pending.removeSubrange(pending.startIndex...newline)
+                try autoreleasepool {
+                    try validateJSONLRecord(
+                        line,
+                        contract: contract,
+                        expectation: expectation,
+                        summary: &summary)
+                }
+            }
+            if pending.count > maximumRecordBytes {
+                throw validationError("record_too_large")
+            }
+        }
+        guard pending.isEmpty else {
             throw validationError("invalid_utf8_or_partial_line")
         }
-        var records: [[String: Any]] = []
-        for line in text.split(separator: "\n", omittingEmptySubsequences: false).dropLast() {
-            guard !line.isEmpty,
-                  let lineData = String(line).data(using: .utf8),
-                  let object = try? JSONSerialization.jsonObject(
-                    with: lineData),
-                  let object = object as? [String: Any] else {
-                throw validationError("invalid_json_object")
-            }
-            guard object["format"] as? String == contract.format,
-                  object["version"] as? Int == contract.version else {
-                throw validationError("format_or_version_mismatch")
-            }
-            try validateIdentity(object, expectation: expectation)
-            records.append(object)
-        }
-        if contract.requiredNonEmpty && records.isEmpty {
+        if contract.requiredNonEmpty && summary.count == 0 {
             throw validationError("empty")
         }
         if let expectedCount = contract.expectedCount,
-           records.count != expectedCount {
+           summary.count != expectedCount {
             throw validationError("count_mismatch")
         }
-        return records
+        return summary
+    }
+
+    private static func validateJSONLRecord(
+        _ line: Data,
+        contract: JSONLContract,
+        expectation: LocalizationEvidenceBundleExpectation,
+        summary: inout JSONLValidationSummary
+    ) throws {
+        guard !line.isEmpty else {
+            throw validationError("blank_record")
+        }
+        guard line.count <= maximumRecordBytes else {
+            throw validationError("record_too_large")
+        }
+        guard String(data: line, encoding: .utf8) != nil else {
+            throw validationError("invalid_utf8_or_partial_line")
+        }
+        let decoded: Any
+        do {
+            decoded = try JSONSerialization.jsonObject(with: line)
+        }
+        catch {
+            throw validationError("invalid_json_object")
+        }
+        guard let object = decoded as? [String: Any] else {
+            throw validationError("invalid_json_object")
+        }
+        guard object["format"] as? String == contract.format,
+              strictInteger(object["version"]) == contract.version else {
+            throw validationError("format_or_version_mismatch")
+        }
+        try validateIdentity(object, expectation: expectation)
+        let timestamp = try validateBusinessRecord(
+            object,
+            fileName: contract.fileName)
+        if contract.strictlyIncreasingTimestamps,
+           let previous = summary.previousTimestamp,
+           timestamp <= previous {
+            throw validationError("non_monotonic_timestamp")
+        }
+        summary.previousTimestamp = timestamp
+        if let field = contract.recordIdField {
+            guard let identifier = object[field] as? String,
+                  !identifier.isEmpty,
+                  summary.seenRecordIds.insert(identifier).inserted else {
+                throw validationError("missing_or_duplicate_record_id")
+            }
+        }
+        summary.lastState = object["state"] as? String ?? summary.lastState
+        summary.count += 1
+        if summary.count > maximumRecords {
+            throw validationError("record_count_limit")
+        }
     }
 
     private static func validateLocalizedTags(
         at url: URL,
         expectation: LocalizationEvidenceBundleExpectation
     ) throws -> [[String: Any]] {
-        let data = try readRegularFile(url)
+        let data = try SafeSessionPath.readRegularFile(
+            url,
+            within: url.deletingLastPathComponent().deletingLastPathComponent(),
+            maximumBytes: Int64(maximumLocalizedTagsBytes)).data
         guard let object = try? JSONSerialization.jsonObject(with: data),
-              let values = object as? [[String: Any]] else {
+              let values = object as? [[String: Any]],
+              values.count <= maximumRecords else {
             throw validationError("invalid_json_array")
         }
+        let allowedFields = Set([
+            "format", "version", "tag_id", "observation_id", "payload",
+            "symbology", "floor_id", "timestamp", "tracking_session_id",
+            "prior_map_id", "prior_map_sha256", "shelf_code", "row_flag",
+            "cross_code", "shelf_side", "distance_from_shelf_start_cm",
+            "height_cm", "raw_map_position", "snapped_map_position",
+            "localization_confidence", "measurement_confidence",
+            "association_confidence", "measurement_method", "needs_review",
+            "user_confirmed",
+        ])
+        var tagIds = Set<String>()
+        var observationIds = Set<String>()
         for value in values {
-            guard value["format"] as? String == "MarketScannerLocalizedPriceTag",
-                  value["version"] as? Int == 1 else {
-                throw validationError("format_or_version_mismatch")
+            guard Set(value.keys).isSubset(of: allowedFields),
+                  value["format"] as? String == "MarketScannerLocalizedPriceTag",
+                  strictInteger(value["version"]) == 1 else {
+                throw validationError("tag_contract_mismatch")
             }
             try validateIdentity(value, expectation: expectation)
+            guard value["prior_map_id"] as? String == expectation.priorMapId,
+                  let tagId = value["tag_id"] as? String,
+                  !tagId.isEmpty,
+                  tagIds.insert(tagId).inserted,
+                  let observationId = value["observation_id"] as? String,
+                  !observationId.isEmpty,
+                  observationIds.insert(observationId).inserted,
+                  nonEmptyString(value["payload"]),
+                  nonEmptyString(value["symbology"]),
+                  nonEmptyString(value["measurement_method"]),
+                  strictNumber(value["timestamp"]) != nil,
+                  validUnitInterval(value["localization_confidence"]),
+                  validUnitInterval(value["measurement_confidence"]),
+                  validUnitInterval(value["association_confidence"]),
+                  value["needs_review"] is Bool,
+                  value["user_confirmed"] is Bool else {
+                throw validationError("tag_business_schema_invalid")
+            }
+            for fieldName in ["shelf_code", "row_flag", "cross_code", "shelf_side"] {
+                if let string = value[fieldName] as? String {
+                    guard string.count <= 128 else {
+                        throw validationError("tag_business_schema_invalid")
+                    }
+                }
+                else if value[fieldName] != nil && !(value[fieldName] is NSNull) {
+                    throw validationError("tag_business_schema_invalid")
+                }
+            }
+            if let distance = value["distance_from_shelf_start_cm"],
+               !(distance is NSNull) {
+                guard let number = strictNumber(distance),
+                      (0.0...100_000.0).contains(number) else {
+                    throw validationError("tag_business_schema_invalid")
+                }
+            }
+            if let height = value["height_cm"], !(height is NSNull) {
+                guard let number = strictNumber(height),
+                      (0.0...500.0).contains(number) else {
+                    throw validationError("tag_business_schema_invalid")
+                }
+            }
         }
         return values
     }
@@ -204,27 +386,110 @@ enum LocalizationEvidenceBundleValidator {
         }
     }
 
-    private static func readRegularFile(_ url: URL) throws -> Data {
-        let values: URLResourceValues
-        do {
-            values = try url.resourceValues(forKeys: [
-                .isRegularFileKey,
-                .isSymbolicLinkKey,
-            ])
+    private static func validateBusinessRecord(
+        _ object: [String: Any],
+        fileName: String
+    ) throws -> Double {
+        let frameTimestamp = fileName == "tag_observations.jsonl"
+            || fileName == "manual_localization_events.jsonl"
+        let rawKey = frameTimestamp ? "frameTimestamp" : "timestamp"
+        let rawSnake = frameTimestamp ? "frame_timestamp" : "timestamp"
+        let convertedKey = frameTimestamp
+            ? "nodeTimebaseFrameTimestamp" : "nodeTimebaseTimestamp"
+        let convertedSnake = frameTimestamp
+            ? "node_timebase_frame_timestamp" : "node_timebase_timestamp"
+        guard let raw = strictNumber(field(object, rawSnake, rawKey)),
+              let converted = strictNumber(field(object, convertedSnake, convertedKey)),
+              let offset = strictNumber(field(
+                object,
+                "node_timebase_offset_seconds",
+                "nodeTimebaseOffsetSeconds")),
+              abs(raw + offset - converted) <= 1.0e-6 else {
+            throw validationError("node_timebase_contract_invalid")
         }
-        catch {
-            throw validationError("missing_or_unreadable")
+        switch fileName {
+        case "localization_trace.jsonl":
+            guard validPose(field(object, "raw_pose", "rawPose")),
+                  validPose(field(object, "estimated_pose", "estimatedPose")),
+                  nonEmptyString(field(object, "tracking_state", "trackingState")),
+                  nonEmptyString(field(object, "localization_state", "localizationState")),
+                  validUnitInterval(object["confidence"]) else {
+                throw validationError("trace_business_schema_invalid")
+            }
+        case "localization_constraints.jsonl":
+            guard let accepted = object["accepted"] as? Bool,
+                  validPose(field(object, "predicted_pose", "predictedPose")),
+                  (!accepted || validPose(field(object, "estimated_pose", "estimatedPose"))),
+                  validUnitInterval(object["uniqueness"]) else {
+                throw validationError("constraint_business_schema_invalid")
+            }
+        case "localization_events.jsonl":
+            guard nonEmptyString(object["state"]),
+                  validUnitInterval(object["confidence"]) else {
+                throw validationError("state_business_schema_invalid")
+            }
+        case "tag_observations.jsonl":
+            guard nonEmptyString(object["observation_id"]),
+                  nonEmptyString(object["payload"]),
+                  nonEmptyString(object["symbology"]),
+                  validPosition(object["raw_map_position"]) else {
+                throw validationError("tag_business_schema_invalid")
+            }
+        default:
+            break
         }
-        guard values.isRegularFile == true,
-              values.isSymbolicLink != true else {
-            throw validationError("missing_or_linked")
+        return converted
+    }
+
+    private static func field(
+        _ object: [String: Any],
+        _ snake: String,
+        _ camel: String
+    ) -> Any? {
+        return object[snake] ?? object[camel]
+    }
+
+    private static func strictInteger(_ value: Any?) -> Int? {
+        guard let number = value as? NSNumber,
+              CFGetTypeID(number) != CFBooleanGetTypeID() else {
+            return nil
         }
-        do {
-            return try Data(contentsOf: url, options: [.mappedIfSafe])
+        let double = number.doubleValue
+        guard double.isFinite, double.rounded() == double else { return nil }
+        return Int(exactly: double)
+    }
+
+    private static func strictNumber(_ value: Any?) -> Double? {
+        guard let number = value as? NSNumber,
+              CFGetTypeID(number) != CFBooleanGetTypeID() else {
+            return nil
         }
-        catch {
-            throw validationError("unreadable")
-        }
+        let result = number.doubleValue
+        return result.isFinite ? result : nil
+    }
+
+    private static func nonEmptyString(_ value: Any?) -> Bool {
+        return (value as? String)?.isEmpty == false
+    }
+
+    private static func validUnitInterval(_ value: Any?) -> Bool {
+        guard let number = strictNumber(value) else { return false }
+        return (0.0...1.0).contains(number)
+    }
+
+    private static func validPose(_ value: Any?) -> Bool {
+        guard let pose = value as? [String: Any] else { return false }
+        return strictNumber(pose["x_m"]) != nil
+            && strictNumber(pose["y_m"]) != nil
+            && strictNumber(pose["yaw_rad"]) != nil
+    }
+
+    private static func validPosition(_ value: Any?) -> Bool {
+        guard let position = value as? [String: Any] else { return false }
+        return strictNumber(position["x_m"]) != nil
+            && strictNumber(position["y_m"]) != nil
+            && (position["height_m"] == nil
+                || strictNumber(position["height_m"]) != nil)
     }
 
     private static func validationError(_ reason: String) -> NSError {
@@ -303,8 +568,12 @@ enum SafeSessionPath {
 
     static func readRegularFile(
         _ url: URL,
-        within root: URL
+        within root: URL,
+        maximumBytes: Int64? = nil
     ) throws -> SafeRegularFileSnapshot {
+        if let maximumBytes, maximumBytes < 0 {
+            throw error("file_size_limit_invalid")
+        }
         guard isStrictlyContained(url, in: root) else {
             throw error("file_outside_session")
         }
@@ -335,25 +604,131 @@ enum SafeSessionPath {
         guard fstat(descriptor, &openedInfo) == 0,
               (openedInfo.st_mode & S_IFMT) == S_IFREG,
               openedInfo.st_dev == linkInfo.st_dev,
-              openedInfo.st_ino == linkInfo.st_ino else {
+              openedInfo.st_ino == linkInfo.st_ino,
+              openedInfo.st_nlink == 1,
+              maximumBytes.map({ openedInfo.st_size <= $0 }) ?? true else {
             try? handle.close()
-            throw error("file_identity_changed_during_open")
+            throw error("file_identity_changed_or_size_limit")
         }
         let data: Data
         do {
             data = try handle.readToEnd() ?? Data()
-            try handle.close()
         }
         catch {
             try? handle.close()
             throw Self.error("file_read_failed")
         }
+        var finalOpenedInfo = stat()
+        var finalPathInfo = stat()
+        guard fstat(descriptor, &finalOpenedInfo) == 0,
+              fstatat(
+                parentDescriptor,
+                url.lastPathComponent,
+                &finalPathInfo,
+                AT_SYMLINK_NOFOLLOW) == 0,
+              finalOpenedInfo.st_dev == openedInfo.st_dev,
+              finalOpenedInfo.st_ino == openedInfo.st_ino,
+              finalOpenedInfo.st_size == openedInfo.st_size,
+              finalPathInfo.st_dev == openedInfo.st_dev,
+              finalPathInfo.st_ino == openedInfo.st_ino,
+              finalPathInfo.st_size == openedInfo.st_size,
+              Int64(data.count) == Int64(openedInfo.st_size) else {
+            try? handle.close()
+            throw error("file_identity_changed_during_read")
+        }
+        try handle.close()
         return SafeRegularFileSnapshot(
             data: data,
             device: UInt64(openedInfo.st_dev),
             inode: UInt64(openedInfo.st_ino),
             byteCount: Int64(openedInfo.st_size),
             sha256: sha256(data))
+    }
+
+    @discardableResult
+    static func streamRegularFile(
+        _ url: URL,
+        within root: URL,
+        maximumBytes: Int64,
+        chunkBytes: Int,
+        consume: (Data) throws -> Void
+    ) throws -> Int64 {
+        guard maximumBytes >= 0, chunkBytes > 0,
+              isStrictlyContained(url, in: root) else {
+            throw error("stream_arguments_or_containment_invalid")
+        }
+        let parentDescriptor = try openValidatedDirectory(
+            url.deletingLastPathComponent(),
+            within: root)
+        defer { Darwin.close(parentDescriptor) }
+        var linkInfo = stat()
+        guard fstatat(
+            parentDescriptor,
+            url.lastPathComponent,
+            &linkInfo,
+            AT_SYMLINK_NOFOLLOW) == 0,
+              (linkInfo.st_mode & S_IFMT) == S_IFREG,
+              linkInfo.st_nlink == 1,
+              linkInfo.st_size >= 0,
+              linkInfo.st_size <= maximumBytes else {
+            throw error("stream_file_missing_linked_or_size_limit")
+        }
+        let descriptor = Darwin.openat(
+            parentDescriptor,
+            url.lastPathComponent,
+            O_RDONLY | O_NOFOLLOW)
+        guard descriptor >= 0 else {
+            throw error("stream_file_open_no_follow_failed")
+        }
+        defer { Darwin.close(descriptor) }
+        var openedInfo = stat()
+        guard fstat(descriptor, &openedInfo) == 0,
+              (openedInfo.st_mode & S_IFMT) == S_IFREG,
+              openedInfo.st_dev == linkInfo.st_dev,
+              openedInfo.st_ino == linkInfo.st_ino,
+              openedInfo.st_nlink == 1,
+              openedInfo.st_size == linkInfo.st_size else {
+            throw error("stream_file_identity_changed_during_open")
+        }
+        var totalBytes: Int64 = 0
+        var buffer = [UInt8](repeating: 0, count: chunkBytes)
+        while true {
+            let count = buffer.withUnsafeMutableBytes { rawBuffer -> Int in
+                return Darwin.read(
+                    descriptor,
+                    rawBuffer.baseAddress,
+                    rawBuffer.count)
+            }
+            if count < 0 {
+                if errno == EINTR { continue }
+                throw error("stream_file_read_failed")
+            }
+            if count == 0 { break }
+            totalBytes += Int64(count)
+            guard totalBytes <= maximumBytes,
+                  totalBytes <= openedInfo.st_size else {
+                throw error("stream_file_size_changed_or_limit")
+            }
+            try consume(Data(buffer[0..<count]))
+        }
+        var finalOpenedInfo = stat()
+        var finalPathInfo = stat()
+        guard fstat(descriptor, &finalOpenedInfo) == 0,
+              fstatat(
+                parentDescriptor,
+                url.lastPathComponent,
+                &finalPathInfo,
+                AT_SYMLINK_NOFOLLOW) == 0,
+              finalOpenedInfo.st_dev == openedInfo.st_dev,
+              finalOpenedInfo.st_ino == openedInfo.st_ino,
+              finalOpenedInfo.st_size == openedInfo.st_size,
+              finalPathInfo.st_dev == openedInfo.st_dev,
+              finalPathInfo.st_ino == openedInfo.st_ino,
+              finalPathInfo.st_size == openedInfo.st_size,
+              totalBytes == openedInfo.st_size else {
+            throw error("stream_file_identity_changed_during_read")
+        }
+        return totalBytes
     }
 
     static func append(
@@ -456,6 +831,14 @@ enum SafeSessionPath {
 }
 
 enum CaptureDirectoryIntegrity {
+    static func manifestSHA256(_ files: [CaptureFileDigest]) throws -> String {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        return SHA256.hash(data: try encoder.encode(files))
+            .map { String(format: "%02x", $0) }
+            .joined()
+    }
+
     static func manifest(
         for directory: URL,
         fileManager: FileManager = .default

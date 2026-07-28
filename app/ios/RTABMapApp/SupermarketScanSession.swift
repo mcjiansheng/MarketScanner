@@ -667,13 +667,21 @@ final class SupermarketScanSession {
                 code: 1,
                 userInfo: [NSLocalizedDescriptionKey: NSLocalizedString("External copy SHA-256 verification failed or the source changed during copying. The local scan was kept.", comment: "Scan copy verification error")])
         }
+        let packageId = UUID().uuidString.lowercased()
+        let packageContentSha256 = try CaptureDirectoryIntegrity.manifestSHA256(
+            exportManifest)
         let receipt = ExternalCopyVerificationReceipt(
             format: "MarketScannerExternalCopyVerification",
-            version: 1,
+            version: 2,
+            packageId: packageId,
+            sessionId: trackingSessionId,
             verifiedAtUnix: Date().timeIntervalSince1970,
-            sourceDirectory: localCaptureDirectory.path,
-            destinationDirectory: exportCapture.path,
+            providerDisplayName: exportBaseDirectory.lastPathComponent,
+            sourceRelativePath: localCaptureDirectory.lastPathComponent,
+            destinationRelativePath:
+                "\(sessionDirectoryName)/\(exportCapture.lastPathComponent)",
             files: exportManifest,
+            packageContentSha256: packageContentSha256,
             localCopyRetained: true,
             durabilityBoundary:
                 "provider_copy_closed_and_reread_no_power_loss_guarantee")
@@ -683,7 +691,101 @@ final class SupermarketScanSession {
             try encoder.encode(receipt),
             to: exportRoot.appendingPathComponent(
                 "copy_verification.json"))
+        let receiptAndCaptureManifest = try CaptureDirectoryIntegrity.manifest(
+            for: exportRoot,
+            fileManager: fileManager)
+        let packageManifest = ExternalCopyPackageManifest(
+            format: "MarketScannerExternalCopyPackageManifest",
+            version: 1,
+            packageId: packageId,
+            sessionId: trackingSessionId,
+            providerDisplayName: exportBaseDirectory.lastPathComponent,
+            packageContentSha256: try CaptureDirectoryIntegrity.manifestSHA256(
+                receiptAndCaptureManifest),
+            files: receiptAndCaptureManifest,
+            localCopyRetained: true,
+            durabilityQualificationStatus: "not_executed",
+            durabilityExperimentHook:
+                "reconnect_or_power_cycle_provider_then_rehash_manifest_on_real_device")
+        try sidecarWriter.writeAtomic(
+            try encoder.encode(packageManifest),
+            to: exportRoot.appendingPathComponent(
+                "copy_package_manifest.json"))
         return exportCapture
+    }
+
+    /// Device-qualification hook. Call only after the named real provider
+    /// reconnect or power-cycle experiment has actually occurred. This does
+    /// not upgrade the initial copy receipt into a power-loss guarantee.
+    @discardableResult
+    func recordExternalCopyDurabilityQualification(
+        at exportRoot: URL,
+        experiment: String
+    ) throws -> URL {
+        let allowedExperiments = Set([
+            "provider_reconnect",
+            "provider_disconnect_reconnect",
+            "device_power_cycle",
+        ])
+        guard allowedExperiments.contains(experiment) else {
+            throw NSError(
+                domain: "SupermarketScanSession",
+                code: 40,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "External-copy durability experiment name is not allowed."])
+        }
+        let packageManifestURL = exportRoot.appendingPathComponent(
+            "copy_package_manifest.json")
+        let packageManifestSnapshot = try SafeSessionPath.readRegularFile(
+            packageManifestURL,
+            within: exportRoot.deletingLastPathComponent(),
+            maximumBytes: 32 * 1024 * 1024)
+        let packageManifest = try JSONDecoder().decode(
+            ExternalCopyPackageManifest.self,
+            from: packageManifestSnapshot.data)
+        guard packageManifest.format
+                == "MarketScannerExternalCopyPackageManifest",
+              packageManifest.version == 1,
+              packageManifest.sessionId == trackingSessionId,
+              packageManifest.localCopyRetained else {
+            throw NSError(
+                domain: "SupermarketScanSession",
+                code: 42,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "External-copy package identity is invalid."])
+        }
+        let currentFiles = try CaptureDirectoryIntegrity.manifest(
+            for: exportRoot,
+            fileManager: fileManager).filter {
+                $0.relativePath != "copy_package_manifest.json"
+                    && $0.relativePath != "copy_durability_qualification.json"
+            }
+        guard currentFiles == packageManifest.files,
+              try CaptureDirectoryIntegrity.manifestSHA256(currentFiles)
+                == packageManifest.packageContentSha256 else {
+            throw NSError(
+                domain: "SupermarketScanSession",
+                code: 43,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "External-copy package changed during durability qualification."])
+        }
+        let evidence = ExternalCopyDurabilityQualificationEvidence(
+            format: "MarketScannerExternalCopyDurabilityQualification",
+            version: 1,
+            packageId: packageManifest.packageId,
+            sessionId: packageManifest.sessionId,
+            providerDisplayName: packageManifest.providerDisplayName,
+            experiment: experiment,
+            verifiedAtUnix: Date().timeIntervalSince1970,
+            packageContentSha256: packageManifest.packageContentSha256,
+            localCopyRetained: true,
+            result: "verified_after_declared_real_device_experiment")
+        let evidenceURL = exportRoot.appendingPathComponent(
+            "copy_durability_qualification.json")
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        try sidecarWriter.writeAtomic(try encoder.encode(evidence), to: evidenceURL)
+        return evidenceURL
     }
 
     func removeLocalCaptureDirectory(_ localCaptureDirectory: URL) throws {

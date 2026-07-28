@@ -1,5 +1,6 @@
 {
-  "wave": "P3-persistent-mapstudio-jobs",
-  "base_branch": "repair-v2-p2-reproducible-release-build",
-  "base_sha": "4f2b8af99604a8f089a6d7fb4f357dc311cba143"
+  "wave": "P4-ios-streaming-validator",
+  "branch": "repair-v2-p4-ios-streaming-validator",
+  "base_branch": "repair-v2-p3-persistent-mapstudio-jobs",
+  "base_sha": "c9b048cb697ba13c36eb79a1c70d3378d30dca55"
 }

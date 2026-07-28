@@ -1,5 +1,6 @@
 import Foundation
 import CryptoKit
+import Darwin
 
 final class InjectedSidecarWriter: ScanSidecarFileWriting {
     var storage: [URL: Data] = [:]
@@ -295,7 +296,27 @@ func evidenceRecord(format: String, state: String? = nil) throws -> Data {
         "priorMapSha256": String(repeating: "a", count: 64),
         "floorId": "1",
     ]
-    if let state { value["state"] = state }
+    value["timestamp"] = 1.0
+    value["nodeTimebaseTimestamp"] = 1.0
+    value["nodeTimebaseOffsetSeconds"] = 0.0
+    let pose: [String: Any] = ["x_m": 0.0, "y_m": 0.0, "yaw_rad": 0.0]
+    switch format {
+    case "MarketScannerLocalizationTrace":
+        value["rawPose"] = pose
+        value["estimatedPose"] = pose
+        value["trackingState"] = "normal"
+        value["localizationState"] = "stable"
+        value["confidence"] = 1.0
+    case "MarketScannerLocalizationConstraint":
+        value["accepted"] = false
+        value["predictedPose"] = pose
+        value["uniqueness"] = 0.9
+    case "MarketScannerLocalizationStateEvent":
+        value["state"] = state ?? "stable"
+        value["confidence"] = 1.0
+    default:
+        if let state { value["state"] = state }
+    }
     var data = try JSONSerialization.data(withJSONObject: value)
     data.append(0x0A)
     return data
@@ -329,11 +350,12 @@ try Data().write(to: evidenceDirectory.appendingPathComponent(
     "tag_observations.jsonl"))
 try Data("[]".utf8).write(to: evidenceDirectory.appendingPathComponent(
     "localized_price_tags.json"))
+let initialEvidenceBlockers = LocalizationEvidenceBundleValidator.blockers(
+    in: evidenceDirectory,
+    expectation: evidenceExpectation)
 require(
-    LocalizationEvidenceBundleValidator.blockers(
-        in: evidenceDirectory,
-        expectation: evidenceExpectation).isEmpty,
-    "a complete persisted evidence bundle must validate")
+    initialEvidenceBlockers.isEmpty,
+    "a complete persisted evidence bundle must validate: \(initialEvidenceBlockers)")
 
 let originalTrace = try Data(contentsOf: traceEvidenceURL)
 try FileManager.default.removeItem(at: traceEvidenceURL)
@@ -394,6 +416,143 @@ require(
     "a linked required sidecar must block finalization")
 try FileManager.default.removeItem(at: traceEvidenceURL)
 try FileManager.default.moveItem(at: linkedTrace, to: traceEvidenceURL)
+
+try Data([0xFF, 0x0A]).write(to: traceEvidenceURL)
+require(
+    LocalizationEvidenceBundleValidator.blockers(
+        in: evidenceDirectory,
+        expectation: evidenceExpectation).contains {
+            $0.contains("invalid_utf8_or_partial_line")
+        },
+    "invalid UTF-8 must block finalization")
+try originalTrace.write(to: traceEvidenceURL)
+var oversizedRecord = Data(repeating: 0x61, count: 1_000_001)
+oversizedRecord.append(0x0A)
+try oversizedRecord.write(to: traceEvidenceURL)
+require(
+    LocalizationEvidenceBundleValidator.blockers(
+        in: evidenceDirectory,
+        expectation: evidenceExpectation).contains {
+            $0.contains("record_too_large")
+        },
+    "a record over 1 MB must block finalization")
+try originalTrace.write(to: traceEvidenceURL)
+
+let replacementDirectory = finalizationTemp.appendingPathComponent(
+    "descriptor-replacement",
+    isDirectory: true)
+try FileManager.default.createDirectory(
+    at: replacementDirectory,
+    withIntermediateDirectories: true)
+let replacementTarget = replacementDirectory.appendingPathComponent("target.jsonl")
+let replacementCandidate = replacementDirectory.appendingPathComponent("new.jsonl")
+try Data(repeating: 0x31, count: 128 * 1024).write(to: replacementTarget)
+try Data("replacement\n".utf8).write(to: replacementCandidate)
+var replacementRejected = false
+var replaced = false
+do {
+    try SafeSessionPath.streamRegularFile(
+        replacementTarget,
+        within: finalizationTemp,
+        maximumBytes: 1024 * 1024,
+        chunkBytes: 4096
+    ) { _ in
+        if !replaced {
+            replaced = true
+            try FileManager.default.removeItem(at: replacementTarget)
+            try FileManager.default.moveItem(
+                at: replacementCandidate,
+                to: replacementTarget)
+        }
+    }
+}
+catch {
+    replacementRejected = true
+}
+require(replacementRejected, "a path inode replacement during streaming must fail closed")
+
+let longEvidenceDirectory = finalizationTemp.appendingPathComponent(
+    "evidence-100k",
+    isDirectory: true)
+try FileManager.default.createDirectory(
+    at: longEvidenceDirectory,
+    withIntermediateDirectories: true)
+let longRecordCount = 100_000
+let longMapHash = String(repeating: "b", count: 64)
+func writeLongEvidence(
+    _ fileName: String,
+    format: String,
+    recordBody: (Int) -> String
+) throws {
+    let url = longEvidenceDirectory.appendingPathComponent(fileName)
+    FileManager.default.createFile(atPath: url.path, contents: nil)
+    let handle = try FileHandle(forWritingTo: url)
+    defer { try? handle.close() }
+    var batch = Data()
+    batch.reserveCapacity(1024 * 1024)
+    for index in 1...longRecordCount {
+        let identity = "\"format\":\"\(format)\",\"version\":1,"
+            + "\"trackingSessionId\":\"session-long\","
+            + "\"priorMapId\":\"map-long\","
+            + "\"priorMapSha256\":\"\(longMapHash)\","
+            + "\"floorId\":\"1\","
+        batch.append(contentsOf: ("{" + identity + recordBody(index) + "}\n").utf8)
+        if batch.count >= 1024 * 1024 {
+            try handle.write(contentsOf: batch)
+            batch.removeAll(keepingCapacity: true)
+        }
+    }
+    if !batch.isEmpty { try handle.write(contentsOf: batch) }
+    try handle.synchronize()
+}
+let poseJSON = "{\"x_m\":0,\"y_m\":0,\"yaw_rad\":0}"
+try writeLongEvidence(
+    "localization_trace.jsonl",
+    format: "MarketScannerLocalizationTrace"
+) { index in
+    return "\"timestamp\":\(index),\"nodeTimebaseTimestamp\":\(index),"
+        + "\"nodeTimebaseOffsetSeconds\":0,\"rawPose\":\(poseJSON),"
+        + "\"estimatedPose\":\(poseJSON),\"trackingState\":\"normal\","
+        + "\"localizationState\":\"stable\",\"confidence\":1"
+}
+try writeLongEvidence(
+    "localization_constraints.jsonl",
+    format: "MarketScannerLocalizationConstraint"
+) { index in
+    return "\"timestamp\":\(index),\"nodeTimebaseTimestamp\":\(index),"
+        + "\"nodeTimebaseOffsetSeconds\":0,\"accepted\":false,"
+        + "\"predictedPose\":\(poseJSON),\"uniqueness\":0.9"
+}
+try writeLongEvidence(
+    "localization_events.jsonl",
+    format: "MarketScannerLocalizationStateEvent"
+) { index in
+    return "\"timestamp\":\(index),\"nodeTimebaseTimestamp\":\(index),"
+        + "\"nodeTimebaseOffsetSeconds\":0,\"state\":\"stable\","
+        + "\"confidence\":1"
+}
+try Data().write(to: longEvidenceDirectory.appendingPathComponent(
+    "manual_localization_events.jsonl"))
+try Data().write(to: longEvidenceDirectory.appendingPathComponent(
+    "tag_observations.jsonl"))
+try Data("[]".utf8).write(to: longEvidenceDirectory.appendingPathComponent(
+    "localized_price_tags.json"))
+let longExpectation = LocalizationEvidenceBundleExpectation(
+    trackingSessionId: "session-long",
+    priorMapId: "map-long",
+    priorMapSha256: longMapHash,
+    floorId: "1",
+    traceRecordCount: longRecordCount,
+    constraintRecordCount: longRecordCount,
+    stateEventCount: longRecordCount,
+    lastDurableState: "stable",
+    localizedPriceTagCount: 0)
+let longEvidenceBlockers = LocalizationEvidenceBundleValidator.blockers(
+    in: longEvidenceDirectory,
+    expectation: longExpectation)
+require(
+    longEvidenceBlockers.isEmpty,
+    "100k trace/constraint/state records must validate: \(longEvidenceBlockers)")
 
 let cleanupRoot = finalizationTemp.appendingPathComponent(
     "SupermarketSession-Cleanup",
@@ -1117,4 +1276,8 @@ if CommandLine.arguments.count == 2 {
     }
 }
 
+var finalizationResourceUsage = rusage()
+if getrusage(RUSAGE_SELF, &finalizationResourceUsage) == 0 {
+    print("Finalization test peak RSS bytes: \(finalizationResourceUsage.ru_maxrss)")
+}
 print("PriorMapLocalizationCore Swift tests passed")

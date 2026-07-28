@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -248,6 +249,17 @@ class IOSCoreContractTests(unittest.TestCase):
             )
             self.assertEqual(run_result.returncode, 0, run_result.stderr)
             self.assertIn("Swift tests passed", run_result.stdout)
+            match = re.search(
+                r"(?m)^Finalization test peak RSS bytes: (\d+)$",
+                run_result.stdout,
+            )
+            self.assertIsNotNone(match, run_result.stdout)
+            peak_rss_bytes = int(match.group(1))
+            self.assertLess(
+                peak_rss_bytes,
+                256 * 1024 * 1024,
+                f"100k-record finalization peak RSS was {peak_rss_bytes} bytes",
+            )
             workbook = Path(temporary) / "integrity.xlsx"
             write_workbook(workbook, fixture_rows())
             package = convert_workbook(workbook, Path(temporary) / "package")
