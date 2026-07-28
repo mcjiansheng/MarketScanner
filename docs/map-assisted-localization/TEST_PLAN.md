@@ -56,6 +56,7 @@ xcodebuild -quiet -project app/ios/RTABMapApp.xcodeproj \
 - staging 失败、陈旧 staging、损坏指针、无效版本不切 current、不可变旧版本和具体 version artifact；
 - POSIX/Windows 并发锁、Windows write-through 原子移动、输入 identity、处理中输入变化、旧版本 local-input 隔离和已打开文件字节复核；
 - iOS 必需 sidecar 结构化写结果、state watermark 仅在成功后推进、粘性 capture health；可注入 Swift writer 实际覆盖每个必需文件部分失败、metadata 提交前失败、checkpoint 提交后删除失败、成功终态和同字节数复制篡改；
+- iOS 原子 writer 对 temp write、flush、rename 分别注入失败，确认旧字节保持且无临时文件泄漏；合同仅承诺原子可见和进程恢复，不把 hosted/模拟测试写成设备断电持久化；
 - finalized metadata 提交前对真实 sidecar 字节执行 bundle 复核；删除、空文件、非法/半行 JSON、identity/count/state watermark 不符和 symlink 均降级为 `finalized=false`，optional 空文件保持合法；
 - finalized checkpoint 手机/PC 显式清理只接受同 tracking identity、有限 Unix 时间且 checkpoint 不晚于 metadata commit；session/segment/metadata/checkpoint/events symlink、Windows reparse、相邻前缀、TOCTOU 替换全部拒绝；PC 必须 `confirmed=true` 并绑定 expected identity/time/双 SHA，冲突和重复请求返回 409；authorized/completed/failed 审计覆盖终态；
 - expected version/revision 缺失、两个客户端使用同一基准版本的 CAS 冲突、HTTP 409、服务端 old value/UTC/ID、字段/范围/货架边长/批准前校验、重放失败回滚；
@@ -107,5 +108,6 @@ python3 tools/PriorMap/replay_localization.py "$out" \
 6. 正常结束，确认 metadata 地图身份、`finalized=true`、capture health 完整、eligibility blockers 为空、无 checkpoint、NFC 不可见。
 7. 在测试构建中注入一次必需 sidecar 写失败，确认红色告警持续、停止新的先验地图修正/价签确认、原数据库继续增长、结束后 `finalized=false` 且 checkpoint 保留，PC 明确拒绝；不得在真实扫描目录上用权限破坏方式注入。
 8. 单独注入 metadata 已成功但 checkpoint 删除失败，确认数据库关闭、相机/映射不恢复、metadata 保持 `finalized=true`，启动后只显示严格校验的人工清理提示。
+9. 对实际业务文件提供者完成复制，核对 `copy_verification.json` 与源/目标复读清单；确认应用默认保留本地副本。分别记录普通完成、应用强退和设备重启后的可读性，不把前两者替代断电测试。
 
 正式超市验收只按 `FIELD_TEST_PLAN.md` 执行；尚未执行时不得声称生产通过。

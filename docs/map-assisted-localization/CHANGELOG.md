@@ -4,6 +4,9 @@
 
 ## 2026-07-28 — RepairV2 W2 审查闭环
 
+- W2R 提交前复核真实 required evidence bundle；丢失、空、半行、链接、身份/数量/state 水位不符都提交为 `finalized=false/invalid`，不再创建空 required 文件掩盖丢失。
+- checkpoint cleanup 增加 no-follow、regular-file/文件身份、path-component containment、expected evidence CAS、HTTP 409 和 authorized/completed/failed 审计；Map Studio 必须检查后显式确认。
+- sidecar 原子 writer 改为同目录 temp/write/synchronize/rename 并覆盖三阶段故障；合同明确只保证原子可见和进程恢复，不宣称未验证的断电持久化。外部复制生成验证 receipt 并默认保留本地副本。
 - 将 `metadata.json(finalized=true)` 明确为不可逆提交点：metadata 写入失败仍属提交前，可恢复录制；提交后 checkpoint 删除失败进入 `finalizedNeedsCleanup` 终态，关闭数据库且绝不恢复相机/映射。
 - 新增 Foundation-only `SupermarketFinalizationCore.swift` 和可注入 writer 运行时测试，实际执行 metadata/checkpoint/trace/constraint/state 故障与部分成功路径，不再只依赖源码字符串契约。
 - 手机启动时只对 finalized、同 tracking identity 且 checkpoint 时间不晚于提交时间的会话提供人工清理；Map Studio 增加同等严格、默认不自动调用的显式恢复 API，并在删除前写授权审计。

@@ -11,10 +11,21 @@ import Foundation
 import CryptoKit
 import Darwin
 
-struct CaptureFileDigest: Equatable {
+struct CaptureFileDigest: Codable, Equatable {
     let relativePath: String
     let byteCount: UInt64
     let sha256: String
+}
+
+struct ExternalCopyVerificationReceipt: Codable {
+    let format: String
+    let version: Int
+    let verifiedAtUnix: TimeInterval
+    let sourceDirectory: String
+    let destinationDirectory: String
+    let files: [CaptureFileDigest]
+    let localCopyRetained: Bool
+    let durabilityBoundary: String
 }
 
 struct LocalizationEvidenceBundleExpectation {
@@ -394,7 +405,8 @@ enum CaptureDirectoryIntegrity {
                 userInfo: [NSLocalizedDescriptionKey:
                     "Capture directory is missing or is a symbolic link."])
         }
-        let rootPath = directory.standardizedFileURL.path + "/"
+        let root = directory.standardizedFileURL
+        let rootComponents = root.pathComponents
         guard let enumerator = fileManager.enumerator(
             at: directory,
             includingPropertiesForKeys: [
@@ -426,18 +438,23 @@ enum CaptureDirectoryIntegrity {
             guard values.isRegularFile == true else {
                 continue
             }
-            let path = fileURL.standardizedFileURL.path
-            guard path.hasPrefix(rootPath) else {
+            let standardized = fileURL.standardizedFileURL
+            guard SafeSessionPath.isStrictlyContained(
+                    standardized,
+                    in: root) else {
                 throw NSError(
                     domain: "CaptureDirectoryIntegrity",
                     code: 4,
                     userInfo: [NSLocalizedDescriptionKey:
                         "Capture file escaped the expected directory."])
             }
+            let relativePath = standardized.pathComponents
+                .dropFirst(rootComponents.count)
+                .joined(separator: "/")
             result.append(CaptureFileDigest(
-                relativePath: String(path.dropFirst(rootPath.count)),
+                relativePath: relativePath,
                 byteCount: UInt64(values.fileSize ?? 0),
-                sha256: try sha256(fileURL)))
+                sha256: try sha256(standardized)))
         }
         return result.sorted { $0.relativePath < $1.relativePath }
     }
@@ -573,9 +590,14 @@ protocol ScanSidecarFileWriting {
 
 struct FoundationScanSidecarWriter: ScanSidecarFileWriting {
     private let fileManager: FileManager
+    private let atomicWriteFault: ((AtomicWriteStage, URL) throws -> Void)?
 
-    init(fileManager: FileManager = .default) {
+    init(
+        fileManager: FileManager = .default,
+        atomicWriteFault: ((AtomicWriteStage, URL) throws -> Void)? = nil
+    ) {
         self.fileManager = fileManager
+        self.atomicWriteFault = atomicWriteFault
     }
 
     func fileExists(at url: URL) -> Bool {
@@ -595,12 +617,59 @@ struct FoundationScanSidecarWriter: ScanSidecarFileWriting {
     }
 
     func writeAtomic(_ data: Data, to url: URL) throws {
-        try data.write(to: url, options: .atomic)
+        let temporaryURL = url.deletingLastPathComponent()
+            .appendingPathComponent(
+                ".\(url.lastPathComponent).\(UUID().uuidString).tmp")
+        let descriptor = Darwin.open(
+            temporaryURL.path,
+            O_CREAT | O_EXCL | O_WRONLY | O_NOFOLLOW,
+            S_IRUSR | S_IWUSR)
+        guard descriptor >= 0 else {
+            throw atomicError("temporary_open_failed")
+        }
+        let handle = FileHandle(
+            fileDescriptor: descriptor,
+            closeOnDealloc: true)
+        var renamed = false
+        defer {
+            try? handle.close()
+            if !renamed {
+                try? fileManager.removeItem(at: temporaryURL)
+            }
+        }
+        do {
+            try atomicWriteFault?(.write, url)
+            try handle.write(contentsOf: data)
+            try atomicWriteFault?(.flush, url)
+            try handle.synchronize()
+            try handle.close()
+            try atomicWriteFault?(.rename, url)
+            guard Darwin.rename(temporaryURL.path, url.path) == 0 else {
+                throw atomicError("atomic_rename_failed")
+            }
+            renamed = true
+        }
+        catch {
+            throw error
+        }
     }
 
     func removeItem(at url: URL) throws {
         try fileManager.removeItem(at: url)
     }
+
+    private func atomicError(_ reason: String) -> NSError {
+        return NSError(
+            domain: "FoundationScanSidecarWriter",
+            code: 1,
+            userInfo: [NSLocalizedDescriptionKey: reason])
+    }
+}
+
+enum AtomicWriteStage: String {
+    case write
+    case flush
+    case rename
 }
 
 enum SidecarFinalizationCoordinator {
@@ -645,8 +714,8 @@ enum SidecarFinalizationCoordinator {
                 evidenceValidationBlockers: evidenceValidationBlockers)
         }
         catch {
-            // Metadata is already the durable commit marker. Cleanup failure
-            // is terminal and must never be translated back to recording.
+            // Metadata is already the atomically visible commit marker.
+            // Cleanup failure is terminal and must never resume recording.
             return SidecarCommitResult(
                 phase: .finalizedNeedsCleanup,
                 metadataCommitted: true,

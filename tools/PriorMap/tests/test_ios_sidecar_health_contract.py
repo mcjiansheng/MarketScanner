@@ -146,6 +146,29 @@ class IOSLocalizationSidecarHealthContractTests(unittest.TestCase):
         self.assertIn("SafeSessionPath.removeRegularFile", session)
         self.assertIn("finalization_checkpoint_cleanup_failed", session)
 
+    def test_atomic_visibility_and_copy_retention_contracts_are_explicit(self) -> None:
+        session = source(SESSION_SOURCE)
+        finalization = source(FINALIZATION_CORE_SOURCE)
+        view = source(VIEW_SOURCE)
+        for token in (
+            "enum AtomicWriteStage",
+            "O_EXCL",
+            "handle.synchronize()",
+            "Darwin.rename",
+            "ExternalCopyVerificationReceipt",
+            "no_power_loss_guarantee",
+        ):
+            self.assertIn(token, finalization + session)
+        self.assertIn("localCopyRetained: true", session)
+        copy_function = re.search(
+            r"private func copyCaptureInBackground\((?P<body>.*?)\n    }\n\n"
+            r"    func save\(",
+            view,
+            flags=re.DOTALL,
+        )
+        self.assertIsNotNone(copy_function)
+        self.assertNotIn("removeLocalCaptureDirectory", copy_function.group("body"))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -4050,8 +4050,6 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
     {
         var copiedCapturePath: String?
         var copyErrorMessage: String?
-        var cleanupErrorMessage: String?
-        var localCaptureRemoved = false
         var copySeconds = 0.0
         DispatchQueue.background(background: {
             let copyStartedAt = Date()
@@ -4060,14 +4058,6 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                     from: captureDir,
                     destinationBaseDirectory: exportBaseDirectory) {
                     copiedCapturePath = copiedCapture.path
-                    do {
-                        try scanSession.removeLocalCaptureDirectory(captureDir)
-                        localCaptureRemoved = true
-                    }
-                    catch {
-                        cleanupErrorMessage = error.localizedDescription
-                        print("Could not remove local scan after external copy: \(error)")
-                    }
                 }
             }
             catch {
@@ -4084,14 +4074,8 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
             if let copyErrorMessage = copyErrorMessage {
                 self.showToast(message: String(format: self.localized("The scan was saved locally, but copying to the selected location failed: %@"), copyErrorMessage), seconds: 5)
             }
-            else if copiedCapturePath != nil, let cleanupErrorMessage = cleanupErrorMessage {
-                self.showToast(message: String(format: self.localized("The scan was copied to the selected location, but local cleanup failed: %@"), cleanupErrorMessage), seconds: 5)
-            }
-            else if copiedCapturePath != nil && localCaptureRemoved {
-                self.showToast(message: String(format: self.localized("The scan was copied in background and the local copy was removed. Copy: %.1fs."), copySeconds), seconds: 3)
-            }
             else if copiedCapturePath != nil {
-                self.showToast(message: String(format: self.localized("The scan was copied to the selected location in background. Copy: %.1fs."), copySeconds), seconds: 3)
+                self.showToast(message: String(format: self.localized("The scan was copied and verified in background; the local copy was retained. Copy: %.1fs."), copySeconds), seconds: 4)
             }
             completion?()
         })

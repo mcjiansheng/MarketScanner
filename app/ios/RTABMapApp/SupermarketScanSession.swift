@@ -667,15 +667,67 @@ final class SupermarketScanSession {
                 code: 1,
                 userInfo: [NSLocalizedDescriptionKey: NSLocalizedString("External copy SHA-256 verification failed or the source changed during copying. The local scan was kept.", comment: "Scan copy verification error")])
         }
+        let receipt = ExternalCopyVerificationReceipt(
+            format: "MarketScannerExternalCopyVerification",
+            version: 1,
+            verifiedAtUnix: Date().timeIntervalSince1970,
+            sourceDirectory: localCaptureDirectory.path,
+            destinationDirectory: exportCapture.path,
+            files: exportManifest,
+            localCopyRetained: true,
+            durabilityBoundary:
+                "provider_copy_closed_and_reread_no_power_loss_guarantee")
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        try sidecarWriter.writeAtomic(
+            try encoder.encode(receipt),
+            to: exportRoot.appendingPathComponent(
+                "copy_verification.json"))
         return exportCapture
     }
 
     func removeLocalCaptureDirectory(_ localCaptureDirectory: URL) throws {
-        guard localCaptureDirectory.path.hasPrefix(documentsDirectory.path) else {
+        let sessionDirectory = localCaptureDirectory.deletingLastPathComponent()
+        guard localCaptureDirectory.lastPathComponent == "segment_0001",
+              sessionDirectory.lastPathComponent.hasPrefix(
+                "SupermarketSession-") else {
             throw NSError(
                 domain: "SupermarketScanSession",
                 code: 2,
                 userInfo: [NSLocalizedDescriptionKey: NSLocalizedString("Refused to delete a scan outside the local app sandbox.", comment: "Scan cleanup safety error")])
+        }
+        try SafeSessionPath.validateDirectory(
+            sessionDirectory,
+            within: documentsDirectory)
+        try SafeSessionPath.validateDirectory(
+            localCaptureDirectory,
+            within: sessionDirectory)
+        let segmentNames = try fileManager.contentsOfDirectory(
+            at: sessionDirectory,
+            includingPropertiesForKeys: nil)
+            .filter { $0.lastPathComponent.hasPrefix("segment_") }
+            .map(\.lastPathComponent)
+            .sorted()
+        guard segmentNames == ["segment_0001"] else {
+            throw NSError(
+                domain: "SupermarketScanSession",
+                code: 3,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "Refused to delete a scan with an ambiguous segment layout."])
+        }
+        let metadata = try SafeSessionPath.readRegularFile(
+            localCaptureDirectory.appendingPathComponent("metadata.json"),
+            within: sessionDirectory)
+        let cleanupMetadata = try JSONDecoder().decode(
+            FinalizedCheckpointCleanupMetadata.self,
+            from: metadata.data)
+        guard cleanupMetadata.finalized == true,
+              cleanupMetadata.trackingSessionId?.isEmpty == false else {
+            throw NSError(
+                domain: "SupermarketScanSession",
+                code: 4,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "Refused to delete a scan without finalized identity evidence."])
         }
         if fileManager.fileExists(atPath: localCaptureDirectory.path) {
             try fileManager.removeItem(at: localCaptureDirectory)
@@ -1412,8 +1464,8 @@ final class SupermarketScanSession {
                 failureReasons: failures)
         }
         if stateWriteRequired && result.stateWritten {
-            // The state watermark represents durable evidence, not merely the
-            // in-memory localization state.
+            // The state watermark represents synchronized file evidence, not
+            // merely the in-memory localization state.
             lastLocalizationState = update.localizationState
         }
         recordLocalizationEvidenceSuccesses(

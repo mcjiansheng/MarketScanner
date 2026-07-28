@@ -101,6 +101,7 @@
 "The scan was copied to the selected location, but local cleanup failed: %@" = "扫描已复制到所选位置，但清理本地副本失败：%@";
 "The scan was copied in background and the local copy was removed. Copy: %.1fs." = "扫描已在后台复制并清理本地副本。复制耗时：%.1f 秒。";
 "The scan was copied to the selected location in background. Copy: %.1fs." = "扫描已在后台复制到所选位置。复制耗时：%.1f 秒。";
+"The scan was copied and verified in background; the local copy was retained. Copy: %.1fs." = "扫描已在后台复制并校验；本地副本已保留。复制耗时：%.1f 秒。";
 
 "Do you want to do standard graph optimization and make a nice assembled mesh now? This can also be done later using the Optimize and Assemble menus." = "是否现在执行标准轨迹图优化，并生成一个组装后的网格模型？也可以稍后在“优化”和“组装”菜单中执行。";
 "Do you want to do standard graph optimization now? This can also be done later using the Optimize menu." = "是否现在执行标准轨迹图优化？也可以稍后在“优化”菜单中执行。";

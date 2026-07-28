@@ -217,6 +217,38 @@ let appendedContents = try String(contentsOf: appendURL, encoding: .utf8)
 require(
     appendedContents == "first\nsecond\n",
     "Foundation writer must append complete records")
+for failedStage in [
+    AtomicWriteStage.write,
+    AtomicWriteStage.flush,
+    AtomicWriteStage.rename,
+] {
+    let stagedURL = finalizationTemp.appendingPathComponent(
+        "atomic-\(failedStage.rawValue).json")
+    try Data("old".utf8).write(to: stagedURL)
+    let failingWriter = FoundationScanSidecarWriter(
+        atomicWriteFault: { stage, _ in
+            if stage == failedStage { throw injectedFailure }
+        })
+    var failureObserved = false
+    do {
+        try failingWriter.writeAtomic(Data("new".utf8), to: stagedURL)
+    }
+    catch {
+        failureObserved = true
+    }
+    require(failureObserved, "each atomic write stage must be injectable")
+    let retainedBytes = try Data(contentsOf: stagedURL)
+    require(
+        retainedBytes == Data("old".utf8),
+        "pre-rename write/flush/rename failures must preserve old bytes")
+    let temporaryFiles = try FileManager.default.contentsOfDirectory(
+        at: finalizationTemp,
+        includingPropertiesForKeys: nil).filter {
+            $0.lastPathComponent.contains("atomic-\(failedStage.rawValue).json.")
+                && $0.pathExtension == "tmp"
+        }
+    require(temporaryFiles.isEmpty, "failed atomic writes must clean temp files")
+}
 
 let evidenceDirectory = finalizationTemp.appendingPathComponent(
     "evidence",

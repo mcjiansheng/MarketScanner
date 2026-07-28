@@ -100,7 +100,9 @@ checkpoint cleanup 是显式破坏性恢复事务。iOS 与 PC 都按 path compo
 - `tag_observations.jsonl`：每次成功 Vision 识别的原始观测，即使用户取消最终保存也保留；保存 `frame_timestamp/node_timebase_frame_timestamp/node_timebase_offset_seconds`，以及 `alignment_age_ms/alignment_version_lag/alignment_freshness` 和深度证据。地图点必须使用提交 Vision 时冻结且通过时效门的对齐快照计算。
 - `localized_price_tags.json`：用户确认后的数组；包含 shelf code、row flag、cross code、货架侧面、沿货架起点距离、相对地面高度、raw/snapped 位置、定位/测量/关联三项置信度、测量方式、`needs_review` 和 `user_confirmed`。
 
-JSONL 文件逐行独立编码和同步追加；最终价签数组用原子替换写入。必需定位追加使用 throwing `FileHandle` I/O 并返回结构化的 trace/constraint/state 成败；任一失败都是本会话不可清除的 capture-health 失败。写入前必须确认 tracking session ID 与活动会话一致且未进入 finalization，不允许日志接口自动创建新会话目录。PC 对每类文件使用正式 contract：严格 UTF‑8/JSON（禁止 NaN/Infinity）、format/version、会话/地图/floor 身份、有限且按契约单调的时间戳、业务必填字段、单行/记录上限和重复 ID 检查。`localization_trace`、constraints、state events 为必需；最终 metadata 必须明确 `localizedPriceTags` 文件名与准确计数，即使为 0 也必须存在；有最终价签时 observations 必需且不得为空。manual v3 是当前格式，v2 仅作严格兼容；legacy v1 只允许进入拒绝审计和 review blocker，不能形成锚点。
+JSONL 文件逐行独立编码和同步追加；最终价签数组用同目录唯一 temp、完整写入、`synchronize()` 和原子 rename 替换。write/flush/rename 三个提交前阶段可故障注入，失败保留旧文件并清理 temp。该合同保证应用进程观察到旧文件或完整新文件，并为进程崩溃恢复提供 checkpoint；iOS 没有在此路径声明父目录 fsync/设备断电持久化保证，因此类型和文档只称“原子可见提交”，不能把它写成 power-loss durable。必需定位追加使用 throwing `FileHandle` I/O 并返回结构化的 trace/constraint/state 成败；任一失败都是本会话不可清除的 capture-health 失败。写入前必须确认 tracking session ID 与活动会话一致且未进入 finalization，不允许日志接口自动创建新会话目录。PC 对每类文件使用正式 contract：严格 UTF‑8/JSON（禁止 NaN/Infinity）、format/version、会话/地图/floor 身份、有限且按契约单调的时间戳、业务必填字段、单行/记录上限和重复 ID 检查。`localization_trace`、constraints、state events 为必需；最终 metadata 必须明确 `localizedPriceTags` 文件名与准确计数，即使为 0 也必须存在；有最终价签时 observations 必需且不得为空。manual v3 是当前格式，v2 仅作严格兼容；legacy v1 只允许进入拒绝审计和 review blocker，不能形成锚点。
+
+外部复制的 `segment_0001` 必须满足复制前源清单 = 关闭句柄后目标复读清单 = 复制后源清单，每项包含 POSIX 相对路径、字节数和 SHA-256。验证成功后在目标 session 根写 `copy_verification.json`（format `MarketScannerExternalCopyVerification` version 1），记录清单、源/目标路径、验证时间、`localCopyRetained=true` 和 provider durability 边界。默认始终保留本地会话；provider 复制完成和复读一致不能证明云盘/外接介质已承受设备断电，真机 provider 策略验收前不提供自动删除。
 
 ## manual_localization_events.jsonl
 
