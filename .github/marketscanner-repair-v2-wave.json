@@ -1,5 +1,5 @@
 {
-  "wave": "W2R-safety-closeout",
-  "base_branch": "repair-v2-w2-review-followup",
-  "base_sha": "8200b81f76afaf2fae465ad38f2243c711b05e66"
+  "wave": "P0-production-baseline",
+  "base_branch": "repair-v2-w2r-safety-closeout",
+  "base_sha": "cf1b62c949f3574e1804808537e38c8ff643549c"
 }

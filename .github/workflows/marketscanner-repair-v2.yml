@@ -21,6 +21,37 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  production-safety-invariants:
+    name: P0 production safety invariants
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Run fail-closed production safety contracts
+        run: |
+          python3 -m unittest -v \
+            tools.SupermarketMapStudio.tests.test_map_studio.MapStudioApiTests.test_review_transition_is_versioned_and_bounded_solver_cannot_publish \
+            tools.SupermarketMapStudio.tests.test_map_studio.MapStudioApiTests.test_checkpoint_cleanup_requires_confirmation_and_exact_evidence \
+            tools.PriorMap.tests.test_ios_sidecar_health_contract.IOSLocalizationSidecarHealthContractTests.test_atomic_visibility_and_copy_retention_contracts_are_explicit \
+            tools.PriorMap.tests.test_ios_sidecar_health_contract.IOSLocalizationSidecarHealthContractTests.test_finalized_metadata_is_bound_to_persisted_evidence_bytes
+      - name: Record P0 invariant scope
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "# P0 production safety invariants"
+            echo
+            echo "- Head SHA: \`$(git rev-parse HEAD)\`"
+            echo "- Bounded correction solver cannot publish"
+            echo "- Checkpoint cleanup requires confirmation and exact CAS evidence"
+            echo "- Verified provider copy never auto-deletes the local capture"
+            echo "- Required persisted evidence failures block finalized metadata"
+            echo "- Job result: \`${{ job.status }}\`"
+          } | tee "$GITHUB_STEP_SUMMARY"
+
   python-and-web:
     name: Ubuntu Python, API and web contracts
     runs-on: ubuntu-latest

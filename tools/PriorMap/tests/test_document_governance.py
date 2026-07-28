@@ -26,8 +26,23 @@ class DocumentGovernanceTests(unittest.TestCase):
         current = (
             ROOT / "docs/map-assisted-localization/reviews/CURRENT_REVIEW.md"
         ).read_text(encoding="utf-8")
-        self.assertIn("12715d4fd005dcd46cae015ab31882b732c8e570", current)
+        self.assertIn("cf1b62c949f3574e1804808537e38c8ff643549c", current)
+        self.assertIn(
+            "MarketScanner_RepairV2_W2R_Production_Readiness_Code_Review_and_"
+            "Final_Product_Agent_Spec_2026-07-28.md",
+            current,
+        )
+        self.assertIn("repair-v2-p0-production-baseline", current)
+        self.assertIn("PRODUCTION_READINESS_REVIEW.md", current)
         self.assertIn("当前有效", current)
+
+        production = (
+            ROOT
+            / "docs/map-assisted-localization/reviews/PRODUCTION_READINESS_REVIEW.md"
+        ).read_text(encoding="utf-8")
+        for blocker in ("RB-01", "RB-02", "RB-03", "RB-04", "RB-05"):
+            self.assertIn(blocker, production)
+        self.assertIn("NO-GO / NOT PRODUCTION READY", production)
 
 
 if __name__ == "__main__":
