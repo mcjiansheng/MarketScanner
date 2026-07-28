@@ -7,6 +7,7 @@ import sys
 import tempfile
 import unittest
 import zipfile
+from types import SimpleNamespace
 from unittest import mock
 
 from tools.SupermarketMapStudio.release_manifest import generate
@@ -119,6 +120,14 @@ class ReleaseManifestTests(unittest.TestCase):
                     "tools.SupermarketMapStudio.package_release.source_tree_is_clean",
                     return_value=True,
                 ),
+                mock.patch(
+                    "tools.SupermarketMapStudio.package_release.subprocess.run",
+                    return_value=SimpleNamespace(
+                        returncode=0,
+                        stdout=f"marketscanner_git_sha={'d' * 40}\n",
+                        stderr="",
+                    ),
+                ),
             ):
                 package = create_package(
                     platform_name="macos",
@@ -145,6 +154,14 @@ class ReleaseManifestTests(unittest.TestCase):
                 mock.patch(
                     "tools.SupermarketMapStudio.package_release.source_tree_is_clean",
                     return_value=True,
+                ),
+                mock.patch(
+                    "tools.SupermarketMapStudio.package_release.subprocess.run",
+                    return_value=SimpleNamespace(
+                        returncode=0,
+                        stdout=f"marketscanner_git_sha={'d' * 40}\n",
+                        stderr="",
+                    ),
                 ),
             ):
                 with self.assertRaisesRegex(PackagingError, "already exists"):
