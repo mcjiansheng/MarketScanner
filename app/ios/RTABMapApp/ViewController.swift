@@ -3673,12 +3673,14 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         priceTagNFCReader?.begin()
     }
 
-    private func finalizeStreamingScan(completion: ((Bool) -> Void)? = nil)
+    private func finalizeStreamingScan(
+        completion: ((ScanFinalizationDisposition) -> Void)? = nil
+    )
     {
         guard let scanSession = supermarketSession,
               !scanSession.isFinalizingScan,
               mMapNodes > 0 else {
-            completion?(false)
+            completion?(.resumeRecording)
             return
         }
 
@@ -3690,7 +3692,7 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         }
         catch {
             showToast(message: String(format: localized("Could not finalize streaming scan: %@"), error.localizedDescription), seconds: 4)
-            completion?(false)
+            completion?(.resumeRecording)
             return
         }
 
@@ -3710,7 +3712,7 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         let continueFinalization: (Bool) -> Void = { [weak self] priorMapDrained in
         guard let self else {
             scanSession.isFinalizingScan = false
-            completion?(false)
+            completion?(.resumeRecording)
             return
         }
         scanSession.appendScanEvent(
@@ -3912,7 +3914,9 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                 commitResult: sidecarCommitResult,
                 preCommitError: sidecarError,
                 eligibilityError: processingEligibilityError)
-            guard disposition != .resumeRecording,
+            let effects = ScanFinalizationEffectPlanner.effects(
+                for: disposition)
+            guard effects.closesSession,
                   let snapshot,
                   let sidecarCommitResult else {
                 if didStartSecurityScope {
@@ -3939,14 +3943,16 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                 self.startCamera(resetTracking: false)
                 self.rtabmap?.setPausedMapping(paused: false)
                 self.updateState(state: .STATE_MAPPING)
-                completion?(false)
+                completion?(.resumeRecording)
                 return
             }
 
             let needsCheckpointCleanup =
-                disposition == .terminalFinalizedNeedsCleanup
+                effects.preservesCheckpoint
+                    && disposition == .terminalFinalizedNeedsCleanup
             let stoppedWithIneligibleEvidence =
-                disposition == .terminalIneligibleEvidence
+                effects.preservesCheckpoint
+                    && disposition == .terminalIneligibleEvidence
 
             scanSession.appendScanEvent(
                 level: needsCheckpointCleanup || stoppedWithIneligibleEvidence
@@ -4005,9 +4011,9 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                     ? 9
                     : 3,
                 replacingCurrent: true)
-            completion?(true)
+            completion?(disposition)
 
-            if needsCheckpointCleanup {
+            if !effects.allowsExternalCopy {
                 if didStartSecurityScope {
                     exportBaseDirectory?.stopAccessingSecurityScopedResource()
                 }

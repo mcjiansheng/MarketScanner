@@ -581,6 +581,51 @@ enum ScanFinalizationDisposition: Equatable {
     case terminalIneligibleEvidence
 }
 
+struct ScanFinalizationEffects: Equatable {
+    let resumesCameraAndMapping: Bool
+    let closesSession: Bool
+    let allowsExternalCopy: Bool
+    let preservesCheckpoint: Bool
+    let processingEligible: Bool
+}
+
+enum ScanFinalizationEffectPlanner {
+    static func effects(
+        for disposition: ScanFinalizationDisposition
+    ) -> ScanFinalizationEffects {
+        switch disposition {
+        case .resumeRecording:
+            return ScanFinalizationEffects(
+                resumesCameraAndMapping: true,
+                closesSession: false,
+                allowsExternalCopy: false,
+                preservesCheckpoint: true,
+                processingEligible: false)
+        case .terminalFinalized:
+            return ScanFinalizationEffects(
+                resumesCameraAndMapping: false,
+                closesSession: true,
+                allowsExternalCopy: true,
+                preservesCheckpoint: false,
+                processingEligible: true)
+        case .terminalFinalizedNeedsCleanup:
+            return ScanFinalizationEffects(
+                resumesCameraAndMapping: false,
+                closesSession: true,
+                allowsExternalCopy: false,
+                preservesCheckpoint: true,
+                processingEligible: false)
+        case .terminalIneligibleEvidence:
+            return ScanFinalizationEffects(
+                resumesCameraAndMapping: false,
+                closesSession: true,
+                allowsExternalCopy: true,
+                preservesCheckpoint: true,
+                processingEligible: false)
+        }
+    }
+}
+
 protocol ScanSidecarFileWriting {
     func fileExists(at url: URL) -> Bool
     func append(_ data: Data, to url: URL) throws

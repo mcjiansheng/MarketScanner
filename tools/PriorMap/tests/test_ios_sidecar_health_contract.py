@@ -104,7 +104,7 @@ class IOSLocalizationSidecarHealthContractTests(unittest.TestCase):
         self.assertIn("case finalizedNeedsCleanup", finalization)
         self.assertIn("return try SidecarFinalizationCoordinator.commitMetadata", session)
         self.assertIn("terminalFinalizedNeedsCleanup", view)
-        self.assertIn("if needsCheckpointCleanup", view)
+        self.assertIn("if !effects.allowsExternalCopy", view)
         self.assertNotIn("try fileManager.removeItem(at: checkpoint)", session)
 
     def test_append_uses_throwing_filehandle_io(self) -> None:
@@ -168,6 +168,26 @@ class IOSLocalizationSidecarHealthContractTests(unittest.TestCase):
         )
         self.assertIsNotNone(copy_function)
         self.assertNotIn("removeLocalCaptureDirectory", copy_function.group("body"))
+
+    def test_finalization_effects_connect_explicit_dispositions_to_ui(self) -> None:
+        finalization = source(FINALIZATION_CORE_SOURCE)
+        view = source(VIEW_SOURCE)
+        self.assertIn("struct ScanFinalizationEffects", finalization)
+        self.assertIn("enum ScanFinalizationEffectPlanner", finalization)
+        for token in (
+            "resumesCameraAndMapping",
+            "closesSession",
+            "allowsExternalCopy",
+            "preservesCheckpoint",
+            "processingEligible",
+        ):
+            self.assertIn(token, finalization)
+        self.assertIn(
+            "completion: ((ScanFinalizationDisposition) -> Void)?", view
+        )
+        self.assertNotIn("completion: ((Bool) -> Void)?", view)
+        self.assertIn("ScanFinalizationEffectPlanner.effects", view)
+        self.assertIn("if !effects.allowsExternalCopy", view)
 
 
 if __name__ == "__main__":

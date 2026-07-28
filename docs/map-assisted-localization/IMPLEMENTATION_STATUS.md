@@ -41,6 +41,7 @@
 | 阶段二回放与指标 | 已实现 | iOS 同款校正门控/gain/锚点/状态；周期结构、动态干扰、错误初始位姿、tracking 恢复、yaw/通道/跳变和 matcher p50/p95 |
 | 结束并发与提交一致性 | 已实现（自动测试） | finalization 先失效 generation 并有界 drain；metadata 提交前复核实际 required evidence 文件、严格 JSONL/身份/数量/state 水位；失败写 `finalized=false`，成功提交后即为终态；checkpoint 删除失败绝不恢复写库 |
 | Sidecar 故障与终端恢复 | 已实现（自动测试） | Foundation-only 可注入 writer 运行时覆盖 trace/constraint/state 部分失败、metadata 失败、checkpoint 删除失败；首个必需写失败后停止新修正/价签确认但保留原始 DB；手机/PC 清理使用 no-follow、文件身份复核、单 segment/path-component containment、失败审计；PC 要求 confirmed 与 expected evidence CAS，冲突返回 409 |
+| Finalization 副作用接线 | 已实现（Foundation 集成测试） | completion 使用 `ScanFinalizationDisposition`；effect planner 覆盖恢复、正常终态、待清理终态和 ineligible recovery，只有提交前失败恢复 camera/mapping，needs-cleanup 禁止外部复制 |
 | 原子可见 sidecar 写入 | 已实现（自动测试） | 同目录唯一 temp→write→synchronize→rename；write/flush/rename 故障保留旧字节；明确不承诺未经真机验证的 power-loss durability |
 | 外部复制完整性 | 已实现（自动测试），provider 待真机 | 关闭句柄后复读目标，逐文件相对路径、字节数、SHA-256，并复核源目录未变化；生成 copy receipt，默认保留本地唯一副本 |
 

@@ -143,6 +143,36 @@ require(
     invalidEvidenceWriter.fileExists(at: checkpointURL),
     "ineligible recovery package must retain its checkpoint")
 
+let resumeEffects = ScanFinalizationEffectPlanner.effects(
+    for: .resumeRecording)
+require(
+    resumeEffects.resumesCameraAndMapping && !resumeEffects.closesSession,
+    "only pre-commit failure may resume camera and mapping")
+let finalizedEffects = ScanFinalizationEffectPlanner.effects(
+    for: .terminalFinalized)
+require(
+    finalizedEffects.closesSession
+        && finalizedEffects.allowsExternalCopy
+        && !finalizedEffects.preservesCheckpoint
+        && finalizedEffects.processingEligible,
+    "normal finalization must close, clean and allow verified copy")
+let cleanupEffects = ScanFinalizationEffectPlanner.effects(
+    for: .terminalFinalizedNeedsCleanup)
+require(
+    cleanupEffects.closesSession
+        && !cleanupEffects.resumesCameraAndMapping
+        && !cleanupEffects.allowsExternalCopy
+        && cleanupEffects.preservesCheckpoint,
+    "post-commit cleanup failure must stay closed and local")
+let ineligibleEffects = ScanFinalizationEffectPlanner.effects(
+    for: .terminalIneligibleEvidence)
+require(
+    ineligibleEffects.closesSession
+        && !ineligibleEffects.resumesCameraAndMapping
+        && ineligibleEffects.preservesCheckpoint
+        && !ineligibleEffects.processingEligible,
+    "ineligible recovery package must close and retain checkpoint")
+
 let traceURL = URL(fileURLWithPath: "/tmp/localization_trace.jsonl")
 let constraintURL = URL(fileURLWithPath: "/tmp/localization_constraints.jsonl")
 let stateURL = URL(fileURLWithPath: "/tmp/localization_events.jsonl")
