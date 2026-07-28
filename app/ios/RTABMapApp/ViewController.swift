@@ -3891,6 +3891,13 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                     sidecarCommitResult = try scanSession.writeSidecarFiles(
                         to: segmentDirectory,
                         snapshot: finalSnapshot)
+                    if let blockers = sidecarCommitResult?
+                        .evidenceValidationBlockers,
+                       !blockers.isEmpty {
+                        processingEligibilityError =
+                            "Persisted prior-map evidence bundle is invalid: "
+                            + blockers.joined(separator: ", ")
+                    }
                 }
                 catch {
                     sidecarError = error.localizedDescription
@@ -3900,7 +3907,8 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         }, completion: {
             let disposition = SidecarFinalizationCoordinator.disposition(
                 saveSucceeded: saveSucceeded,
-                expectedFinalizedMetadata: snapshot?.metadata.finalized == true,
+                expectedFinalizedMetadata:
+                    sidecarCommitResult?.finalizedMetadataCommitted == true,
                 commitResult: sidecarCommitResult,
                 preCommitError: sidecarError,
                 eligibilityError: processingEligibilityError)

@@ -216,7 +216,122 @@ try foundationWriter.append(Data("second\n".utf8), to: appendURL)
 let appendedContents = try String(contentsOf: appendURL, encoding: .utf8)
 require(
     appendedContents == "first\nsecond\n",
-    "Foundation writer must durably append complete records")
+    "Foundation writer must append complete records")
+
+let evidenceDirectory = finalizationTemp.appendingPathComponent(
+    "evidence",
+    isDirectory: true)
+try FileManager.default.createDirectory(
+    at: evidenceDirectory,
+    withIntermediateDirectories: true)
+func evidenceRecord(format: String, state: String? = nil) throws -> Data {
+    var value: [String: Any] = [
+        "format": format,
+        "version": 1,
+        "trackingSessionId": "session-a",
+        "priorMapId": "map-a",
+        "priorMapSha256": String(repeating: "a", count: 64),
+        "floorId": "1",
+    ]
+    if let state { value["state"] = state }
+    var data = try JSONSerialization.data(withJSONObject: value)
+    data.append(0x0A)
+    return data
+}
+let evidenceExpectation = LocalizationEvidenceBundleExpectation(
+    trackingSessionId: "session-a",
+    priorMapId: "map-a",
+    priorMapSha256: String(repeating: "a", count: 64),
+    floorId: "1",
+    traceRecordCount: 1,
+    constraintRecordCount: 1,
+    stateEventCount: 1,
+    lastDurableState: "stable",
+    localizedPriceTagCount: 0)
+let traceEvidenceURL = evidenceDirectory.appendingPathComponent(
+    "localization_trace.jsonl")
+let constraintEvidenceURL = evidenceDirectory.appendingPathComponent(
+    "localization_constraints.jsonl")
+let stateEvidenceURL = evidenceDirectory.appendingPathComponent(
+    "localization_events.jsonl")
+try evidenceRecord(format: "MarketScannerLocalizationTrace")
+    .write(to: traceEvidenceURL)
+try evidenceRecord(format: "MarketScannerLocalizationConstraint")
+    .write(to: constraintEvidenceURL)
+try evidenceRecord(
+    format: "MarketScannerLocalizationStateEvent",
+    state: "stable").write(to: stateEvidenceURL)
+try Data().write(to: evidenceDirectory.appendingPathComponent(
+    "manual_localization_events.jsonl"))
+try Data().write(to: evidenceDirectory.appendingPathComponent(
+    "tag_observations.jsonl"))
+try Data("[]".utf8).write(to: evidenceDirectory.appendingPathComponent(
+    "localized_price_tags.json"))
+require(
+    LocalizationEvidenceBundleValidator.blockers(
+        in: evidenceDirectory,
+        expectation: evidenceExpectation).isEmpty,
+    "a complete persisted evidence bundle must validate")
+
+let originalTrace = try Data(contentsOf: traceEvidenceURL)
+try FileManager.default.removeItem(at: traceEvidenceURL)
+require(
+    LocalizationEvidenceBundleValidator.blockers(
+        in: evidenceDirectory,
+        expectation: evidenceExpectation).contains {
+            $0.contains("localization_trace.jsonl")
+        },
+    "a deleted required trace must block finalization")
+try originalTrace.write(to: traceEvidenceURL)
+try Data("{\"format\":".utf8).write(to: constraintEvidenceURL)
+require(
+    LocalizationEvidenceBundleValidator.blockers(
+        in: evidenceDirectory,
+        expectation: evidenceExpectation).contains {
+            $0.contains("localization_constraints.jsonl")
+        },
+    "a truncated required constraint must block finalization")
+try evidenceRecord(format: "MarketScannerLocalizationConstraint")
+    .write(to: constraintEvidenceURL)
+try Data().write(to: stateEvidenceURL)
+require(
+    LocalizationEvidenceBundleValidator.blockers(
+        in: evidenceDirectory,
+        expectation: evidenceExpectation).contains {
+            $0.contains("localization_events.jsonl")
+        },
+    "an empty required state file must block finalization")
+try evidenceRecord(
+    format: "MarketScannerLocalizationStateEvent",
+    state: "stable").write(to: stateEvidenceURL)
+var wrongIdentity = try JSONSerialization.jsonObject(
+    with: originalTrace) as! [String: Any]
+wrongIdentity["trackingSessionId"] = "other-session"
+var wrongIdentityData = try JSONSerialization.data(withJSONObject: wrongIdentity)
+wrongIdentityData.append(0x0A)
+try wrongIdentityData.write(to: traceEvidenceURL)
+require(
+    LocalizationEvidenceBundleValidator.blockers(
+        in: evidenceDirectory,
+        expectation: evidenceExpectation).contains {
+            $0.contains("identity_mismatch")
+        },
+    "identity mismatch must block finalization")
+try originalTrace.write(to: traceEvidenceURL)
+let linkedTrace = evidenceDirectory.appendingPathComponent("linked-trace")
+try FileManager.default.moveItem(at: traceEvidenceURL, to: linkedTrace)
+try FileManager.default.createSymbolicLink(
+    at: traceEvidenceURL,
+    withDestinationURL: linkedTrace)
+require(
+    LocalizationEvidenceBundleValidator.blockers(
+        in: evidenceDirectory,
+        expectation: evidenceExpectation).contains {
+            $0.contains("localization_trace.jsonl")
+        },
+    "a linked required sidecar must block finalization")
+try FileManager.default.removeItem(at: traceEvidenceURL)
+try FileManager.default.moveItem(at: linkedTrace, to: traceEvidenceURL)
 
 let captureSource = finalizationTemp.appendingPathComponent(
     "capture-source",

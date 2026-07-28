@@ -39,7 +39,7 @@
 | 阶段二 sidecar 和移动 UI | 已实现 | constraint/state/tag observation JSONL、localized tags JSON、结构指标 HUD、确认 UI 和必需证据写失败的持久红色告警 |
 | PC 会话检查 | 已实现 | `/api/session/inspect` 有界汇总约束、状态、观测、最终价签和 malformed 计数 |
 | 阶段二回放与指标 | 已实现 | iOS 同款校正门控/gain/锚点/状态；周期结构、动态干扰、错误初始位姿、tracking 恢复、yaw/通道/跳变和 matcher p50/p95 |
-| 结束并发与提交一致性 | 已实现（自动测试） | finalization 先失效 generation 并有界 drain；metadata 写入前失败可恢复录制，`finalized=true` 提交后即为终态；checkpoint 删除失败进入显式待清理状态，绝不恢复写库 |
+| 结束并发与提交一致性 | 已实现（自动测试） | finalization 先失效 generation 并有界 drain；metadata 提交前复核实际 required evidence 文件、严格 JSONL/身份/数量/state 水位；失败写 `finalized=false`，成功提交后即为终态；checkpoint 删除失败绝不恢复写库 |
 | Sidecar 故障与终端恢复 | 已实现（自动测试） | Foundation-only 可注入 writer 运行时覆盖 trace/constraint/state 部分失败、metadata 失败、checkpoint 删除失败；首个必需写失败后停止新修正/价签确认但保留原始 DB；手机/PC 显式清理严格核对身份与时间 |
 | 外部复制完整性 | 已实现（自动测试） | 逐文件相对路径、字节数、SHA-256，并在复制后复核源目录未变化；同字节数篡改可检出 |
 

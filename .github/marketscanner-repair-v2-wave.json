@@ -1,5 +1,5 @@
 {
-  "wave": "W2-review-followup",
-  "base_branch": "repair-v2-w2-sidecar-write-health",
-  "base_sha": "12715d4fd005dcd46cae015ab31882b732c8e570"
+  "wave": "W2R-safety-closeout",
+  "base_branch": "repair-v2-w2-review-followup",
+  "base_sha": "8200b81f76afaf2fae465ad38f2243c711b05e66"
 }

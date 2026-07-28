@@ -16,6 +16,224 @@ struct CaptureFileDigest: Equatable {
     let sha256: String
 }
 
+struct LocalizationEvidenceBundleExpectation {
+    let trackingSessionId: String
+    let priorMapId: String
+    let priorMapSha256: String
+    let floorId: String
+    let traceRecordCount: Int
+    let constraintRecordCount: Int
+    let stateEventCount: Int
+    let lastDurableState: String
+    let localizedPriceTagCount: Int
+}
+
+enum LocalizationEvidenceBundleValidator {
+    private struct JSONLContract {
+        let fileName: String
+        let format: String
+        let version: Int
+        let expectedCount: Int?
+        let requiredNonEmpty: Bool
+    }
+
+    static func blockers(
+        in segmentDirectory: URL,
+        expectation: LocalizationEvidenceBundleExpectation
+    ) -> [String] {
+        let required = [
+            JSONLContract(
+                fileName: "localization_trace.jsonl",
+                format: "MarketScannerLocalizationTrace",
+                version: 1,
+                expectedCount: expectation.traceRecordCount,
+                requiredNonEmpty: true),
+            JSONLContract(
+                fileName: "localization_constraints.jsonl",
+                format: "MarketScannerLocalizationConstraint",
+                version: 1,
+                expectedCount: expectation.constraintRecordCount,
+                requiredNonEmpty: true),
+            JSONLContract(
+                fileName: "localization_events.jsonl",
+                format: "MarketScannerLocalizationStateEvent",
+                version: 1,
+                expectedCount: expectation.stateEventCount,
+                requiredNonEmpty: true),
+        ]
+        let optional = [
+            JSONLContract(
+                fileName: "manual_localization_events.jsonl",
+                format: "MarketScannerManualLocalizationEvent",
+                version: 3,
+                expectedCount: nil,
+                requiredNonEmpty: false),
+            JSONLContract(
+                fileName: "tag_observations.jsonl",
+                format: "MarketScannerPriceTagObservation",
+                version: 1,
+                expectedCount: nil,
+                requiredNonEmpty: false),
+        ]
+        var blockers: [String] = []
+        var decodedRecords: [String: [[String: Any]]] = [:]
+        for contract in required + optional {
+            let url = segmentDirectory.appendingPathComponent(contract.fileName)
+            do {
+                decodedRecords[contract.fileName] = try validateJSONL(
+                    at: url,
+                    contract: contract,
+                    expectation: expectation)
+            }
+            catch {
+                blockers.append(
+                    "evidence_bundle_\(contract.fileName)_\(stableReason(error))")
+            }
+        }
+
+        let tagsURL = segmentDirectory.appendingPathComponent(
+            "localized_price_tags.json")
+        do {
+            let tags = try validateLocalizedTags(
+                at: tagsURL,
+                expectation: expectation)
+            if tags.count != expectation.localizedPriceTagCount {
+                blockers.append("evidence_bundle_localized_price_tags_count_mismatch")
+            }
+        }
+        catch {
+            blockers.append(
+                "evidence_bundle_localized_price_tags_\(stableReason(error))")
+        }
+
+        if let states = decodedRecords["localization_events.jsonl"],
+           let lastState = states.last?["state"] as? String,
+           lastState != expectation.lastDurableState {
+            blockers.append("evidence_bundle_localization_events_watermark_mismatch")
+        }
+        return Array(Set(blockers)).sorted()
+    }
+
+    private static func validateJSONL(
+        at url: URL,
+        contract: JSONLContract,
+        expectation: LocalizationEvidenceBundleExpectation
+    ) throws -> [[String: Any]] {
+        let data = try readRegularFile(url)
+        if data.isEmpty {
+            if contract.requiredNonEmpty {
+                throw validationError("empty")
+            }
+            return []
+        }
+        guard data.last == 0x0A,
+              let text = String(data: data, encoding: .utf8) else {
+            throw validationError("invalid_utf8_or_partial_line")
+        }
+        var records: [[String: Any]] = []
+        for line in text.split(separator: "\n", omittingEmptySubsequences: false).dropLast() {
+            guard !line.isEmpty,
+                  let lineData = String(line).data(using: .utf8),
+                  let object = try? JSONSerialization.jsonObject(
+                    with: lineData),
+                  let object = object as? [String: Any] else {
+                throw validationError("invalid_json_object")
+            }
+            guard object["format"] as? String == contract.format,
+                  object["version"] as? Int == contract.version else {
+                throw validationError("format_or_version_mismatch")
+            }
+            try validateIdentity(object, expectation: expectation)
+            records.append(object)
+        }
+        if contract.requiredNonEmpty && records.isEmpty {
+            throw validationError("empty")
+        }
+        if let expectedCount = contract.expectedCount,
+           records.count != expectedCount {
+            throw validationError("count_mismatch")
+        }
+        return records
+    }
+
+    private static func validateLocalizedTags(
+        at url: URL,
+        expectation: LocalizationEvidenceBundleExpectation
+    ) throws -> [[String: Any]] {
+        let data = try readRegularFile(url)
+        guard let object = try? JSONSerialization.jsonObject(with: data),
+              let values = object as? [[String: Any]] else {
+            throw validationError("invalid_json_array")
+        }
+        for value in values {
+            guard value["format"] as? String == "MarketScannerLocalizedPriceTag",
+                  value["version"] as? Int == 1 else {
+                throw validationError("format_or_version_mismatch")
+            }
+            try validateIdentity(value, expectation: expectation)
+        }
+        return values
+    }
+
+    private static func validateIdentity(
+        _ object: [String: Any],
+        expectation: LocalizationEvidenceBundleExpectation
+    ) throws {
+        func string(_ camel: String, _ snake: String) -> String? {
+            return (object[camel] ?? object[snake]) as? String
+        }
+        guard string("trackingSessionId", "tracking_session_id")
+                == expectation.trackingSessionId,
+              string("priorMapId", "prior_map_id") == expectation.priorMapId,
+              string("priorMapSha256", "prior_map_sha256")
+                == expectation.priorMapSha256,
+              string("floorId", "floor_id") == expectation.floorId else {
+            throw validationError("identity_mismatch")
+        }
+    }
+
+    private static func readRegularFile(_ url: URL) throws -> Data {
+        let values: URLResourceValues
+        do {
+            values = try url.resourceValues(forKeys: [
+                .isRegularFileKey,
+                .isSymbolicLinkKey,
+            ])
+        }
+        catch {
+            throw validationError("missing_or_unreadable")
+        }
+        guard values.isRegularFile == true,
+              values.isSymbolicLink != true else {
+            throw validationError("missing_or_linked")
+        }
+        do {
+            return try Data(contentsOf: url, options: [.mappedIfSafe])
+        }
+        catch {
+            throw validationError("unreadable")
+        }
+    }
+
+    private static func validationError(_ reason: String) -> NSError {
+        return NSError(
+            domain: "LocalizationEvidenceBundleValidator",
+            code: 1,
+            userInfo: [NSLocalizedDescriptionKey: reason])
+    }
+
+    private static func stableReason(_ error: Error) -> String {
+        let value = (error as NSError).localizedDescription
+            .lowercased()
+            .replacingOccurrences(
+                of: "[^a-z0-9]+",
+                with: "_",
+                options: .regularExpression)
+            .trimmingCharacters(in: CharacterSet(charactersIn: "_"))
+        return value.isEmpty ? "invalid" : value
+    }
+}
+
 enum CaptureDirectoryIntegrity {
     static func manifest(
         for directory: URL,
@@ -105,6 +323,23 @@ struct SidecarCommitResult {
     let finalizedMetadataCommitted: Bool
     let checkpointCleanupSucceeded: Bool
     let cleanupError: String?
+    let evidenceValidationBlockers: [String]
+
+    init(
+        phase: SidecarFinalizationPhase,
+        metadataCommitted: Bool,
+        finalizedMetadataCommitted: Bool,
+        checkpointCleanupSucceeded: Bool,
+        cleanupError: String?,
+        evidenceValidationBlockers: [String] = []
+    ) {
+        self.phase = phase
+        self.metadataCommitted = metadataCommitted
+        self.finalizedMetadataCommitted = finalizedMetadataCommitted
+        self.checkpointCleanupSucceeded = checkpointCleanupSucceeded
+        self.cleanupError = cleanupError
+        self.evidenceValidationBlockers = evidenceValidationBlockers
+    }
 
     var requiresTerminalCleanup: Bool {
         return finalizedMetadataCommitted && !checkpointCleanupSucceeded
@@ -229,7 +464,8 @@ enum SidecarFinalizationCoordinator {
         metadataURL: URL,
         finalized: Bool,
         checkpointURL: URL,
-        writer: ScanSidecarFileWriting
+        writer: ScanSidecarFileWriting,
+        evidenceValidationBlockers: [String] = []
     ) throws -> SidecarCommitResult {
         // Any error here is pre-commit: callers may resume recording because
         // finalized metadata never became visible.
@@ -241,7 +477,8 @@ enum SidecarFinalizationCoordinator {
                 metadataCommitted: true,
                 finalizedMetadataCommitted: false,
                 checkpointCleanupSucceeded: false,
-                cleanupError: nil)
+                cleanupError: nil,
+                evidenceValidationBlockers: evidenceValidationBlockers)
         }
         guard writer.fileExists(at: checkpointURL) else {
             return SidecarCommitResult(
@@ -249,7 +486,8 @@ enum SidecarFinalizationCoordinator {
                 metadataCommitted: true,
                 finalizedMetadataCommitted: true,
                 checkpointCleanupSucceeded: true,
-                cleanupError: nil)
+                cleanupError: nil,
+                evidenceValidationBlockers: evidenceValidationBlockers)
         }
         do {
             try writer.removeItem(at: checkpointURL)
@@ -258,7 +496,8 @@ enum SidecarFinalizationCoordinator {
                 metadataCommitted: true,
                 finalizedMetadataCommitted: true,
                 checkpointCleanupSucceeded: true,
-                cleanupError: nil)
+                cleanupError: nil,
+                evidenceValidationBlockers: evidenceValidationBlockers)
         }
         catch {
             // Metadata is already the durable commit marker. Cleanup failure
@@ -268,7 +507,8 @@ enum SidecarFinalizationCoordinator {
                 metadataCommitted: true,
                 finalizedMetadataCommitted: true,
                 checkpointCleanupSucceeded: false,
-                cleanupError: error.localizedDescription)
+                cleanupError: error.localizedDescription,
+                evidenceValidationBlockers: evidenceValidationBlockers)
         }
     }
 

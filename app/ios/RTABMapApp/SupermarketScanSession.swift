@@ -31,12 +31,12 @@ struct ScanSegmentMetadata: Codable {
     /// tools use this marker to avoid applying segment-boundary alignment to a
     /// continuous graph.
     let scanMode: String?
-    let finalized: Bool?
+    var finalized: Bool?
     /// Phone capture keeps a bounded online graph for feedback, while the PC
     /// re-extracts features and performs the authoritative global optimization.
     let processingProfile: String?
     let exportedAt: String
-    let finalizedAtUnix: TimeInterval?
+    var finalizedAtUnix: TimeInterval?
     let knownAreaM2: Double
     let nodeCount: Int
     let databaseMemoryMB: Int
@@ -59,7 +59,7 @@ struct ScanSegmentMetadata: Codable {
     let availableDiskBytes: Int64?
     let thermalState: String?
     let captureHealth: ScanCaptureHealth?
-    let processingEligibility: ScanProcessingEligibility?
+    var processingEligibility: ScanProcessingEligibility?
     /// Lightweight phone-side coverage guidance statistics. This is not a
     /// semantic shelf map; the authoritative geometry remains in the RGB-D
     /// database and is reconstructed on the PC.
@@ -160,6 +160,7 @@ struct ScanCaptureHealth: Codable {
     let localizationTraceRecordCount: Int
     let localizationConstraintRecordCount: Int
     let localizationStateEventCount: Int
+    let localizationLastDurableState: String?
     let localizationEvidenceComplete: Bool
 }
 
@@ -1047,6 +1048,7 @@ final class SupermarketScanSession {
             localizationConstraintRecordCount:
                 localizationConstraintRecordCount,
             localizationStateEventCount: localizationStateEventCount,
+            localizationLastDurableState: lastLocalizationState,
             localizationEvidenceComplete:
                 scanConfiguration.workflowMode != .priorMapLocalized
                     || (localizationRequiredWriteFailureCount == 0
@@ -1110,10 +1112,7 @@ final class SupermarketScanSession {
 
         if scanConfiguration.workflowMode == .priorMapLocalized {
             for fileName in [
-                "localization_trace.jsonl",
                 "manual_localization_events.jsonl",
-                "localization_constraints.jsonl",
-                "localization_events.jsonl",
                 "tag_observations.jsonl",
             ] {
                 let url = segmentDirectory.appendingPathComponent(fileName)
@@ -1127,16 +1126,62 @@ final class SupermarketScanSession {
                 to: segmentDirectory.appendingPathComponent("localized_price_tags.json"))
         }
 
+        var committedMetadata = snapshot.metadata
+        var evidenceValidationBlockers: [String] = []
+        if scanConfiguration.workflowMode == .priorMapLocalized,
+           committedMetadata.finalized == true {
+            if let trackingSessionId = committedMetadata.trackingSessionId,
+               let priorMapId = committedMetadata.priorMapId,
+               let priorMapSha256 = committedMetadata.priorMapSha256,
+               let floorId = committedMetadata.floorId,
+               let captureHealth = committedMetadata.captureHealth,
+               let lastDurableState =
+                captureHealth.localizationLastDurableState {
+                evidenceValidationBlockers =
+                    LocalizationEvidenceBundleValidator.blockers(
+                        in: segmentDirectory,
+                        expectation: LocalizationEvidenceBundleExpectation(
+                            trackingSessionId: trackingSessionId,
+                            priorMapId: priorMapId,
+                            priorMapSha256: priorMapSha256,
+                            floorId: floorId,
+                            traceRecordCount:
+                                captureHealth.localizationTraceRecordCount,
+                            constraintRecordCount:
+                                captureHealth.localizationConstraintRecordCount,
+                            stateEventCount:
+                                captureHealth.localizationStateEventCount,
+                            lastDurableState: lastDurableState,
+                            localizedPriceTagCount:
+                                committedMetadata.localizedPriceTagCount ?? 0))
+            }
+            else {
+                evidenceValidationBlockers = [
+                    "evidence_bundle_identity_or_watermark_missing"
+                ]
+            }
+            if !evidenceValidationBlockers.isEmpty {
+                let existing = committedMetadata.processingEligibility?.blockers ?? []
+                committedMetadata.finalized = false
+                committedMetadata.finalizedAtUnix = nil
+                committedMetadata.processingEligibility = ScanProcessingEligibility(
+                    status: "invalid",
+                    blockers: Array(Set(
+                        existing + evidenceValidationBlockers)).sorted())
+            }
+        }
+
         // metadata.json is the commit marker for a completed sidecar bundle.
         // Write it only after every referenced artifact has succeeded.
-        let metadataData = try encoder.encode(snapshot.metadata)
+        let metadataData = try encoder.encode(committedMetadata)
         return try SidecarFinalizationCoordinator.commitMetadata(
             metadataData,
             metadataURL: segmentDirectory.appendingPathComponent("metadata.json"),
-            finalized: snapshot.metadata.finalized == true,
+            finalized: committedMetadata.finalized == true,
             checkpointURL: segmentDirectory.appendingPathComponent(
                 "live_checkpoint.json"),
-            writer: sidecarWriter)
+            writer: sidecarWriter,
+            evidenceValidationBlockers: evidenceValidationBlockers)
     }
 
     func appendScanEvent(

@@ -115,6 +115,22 @@ class IOSLocalizationSidecarHealthContractTests(unittest.TestCase):
         self.assertIn("try handle.synchronize()", finalization)
         self.assertNotIn("handle.write(data)", finalization)
 
+    def test_finalized_metadata_is_bound_to_persisted_evidence_bytes(self) -> None:
+        session = source(SESSION_SOURCE)
+        finalization = source(FINALIZATION_CORE_SOURCE)
+        self.assertIn("enum LocalizationEvidenceBundleValidator", finalization)
+        for token in (
+            "requiredNonEmpty",
+            "invalid_utf8_or_partial_line",
+            "count_mismatch",
+            "identity_mismatch",
+            "watermark_mismatch",
+            "isSymbolicLinkKey",
+        ):
+            self.assertIn(token, finalization)
+        self.assertIn("LocalizationEvidenceBundleValidator.blockers", session)
+        self.assertIn("committedMetadata.finalized = false", session)
+
 
 if __name__ == "__main__":
     unittest.main()
