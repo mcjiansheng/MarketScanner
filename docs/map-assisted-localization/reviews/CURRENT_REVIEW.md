@@ -5,7 +5,7 @@
 > W2R 执行基线：`repair-v2-w2-review-followup@8200b81f76afaf2fae465ad38f2243c711b05e66`。
 > 上一轮直接基线：`repair-v2-w2-sidecar-write-health@12715d4fd005dcd46cae015ab31882b732c8e570`。
 > 实现分支：`repair-v2-w2r-safety-closeout`。
-> 当前代码头：`afca049e526c9a1a72676da1c03517ab36254a3a`；本文件之后的文档/CI 证据提交不改变该代码树。
+> 当前代码头：`ed85c38`；本文件之后的文档/CI 证据提交不改变该代码树。
 
 ## 当前判定
 
@@ -41,15 +41,16 @@ W2R-A 至 W2R-D 已完成代码、合同、自动测试和当前文档闭环。�
 | `793d74426b4ac4d96299c64cfc9330d55d5699bd` | W2R-C 原子可见 writer、复制复读/收据和本地保留策略 |
 | `5038f353bc09417a436634f9a8462bb44ee5c2a5` | W2R-D typed disposition/effect 集成运行测试 |
 | `afca049e526c9a1a72676da1c03517ab36254a3a` | cleanup 目录 fd、`openat`/`unlinkat` 与 inode 竞态收口 |
+| `ed85c38` | 关闭 Windows 上 checkpoint 缺失/拒绝时的 metadata fd 泄漏，并增加 closed-fd 回归测试 |
 
 ## 本地独立运行证据
 
-以下验证在 2026-07-28、代码头 `afca049e...` 上实际执行：
+以下验证在 2026-07-28、代码头 `ed85c38` 上实际执行；iOS 源码未在 `afca049e...` 后改变：
 
 | 验证 | 结果 |
 | --- | --- |
 | `python3 -m unittest discover -s tools/PriorMap/tests -v` | **103 项通过**；包含真实 Swift 可执行 core 测试 |
-| `python3 -m unittest discover -s tools/SupermarketMapStudio/tests -v` | **65 项通过**；包含 cleanup 成功、重复/旧证据 409、confirmation、symlink 和 Windows reparse 负例 |
+| `python3 -m unittest discover -s tools/SupermarketMapStudio/tests -v` | **66 项通过**；包含 cleanup 成功、重复/旧证据 409、confirmation、symlink、Windows reparse 和失败打开不泄漏 fd 的负例 |
 | Python `py_compile`、Web `node --check` | 通过 |
 | native symbol contract | 通过：73 C exports、72 Swift calls、71 RTABMapApp calls |
 | RepairV2 Swift `swiftc -parse` | 通过 |
@@ -69,7 +70,9 @@ W2R-A 至 W2R-D 已完成代码、合同、自动测试和当前文档闭环。�
 
 ## 远端运行证据
 
-W2R 分支尚待本轮 push 和 GitHub Actions 完成。本节只在取得准确 run/job ID 后更新；在此之前不得把上一轮 W2 run 写成 W2R 独立运行证据。
+代码头 `afca049e...` 的 run [30340428172](https://github.com/mcjiansheng/MarketScanner/actions/runs/30340428172) 已完成：Ubuntu、Native ABI、macOS/iOS source contracts 通过；Windows Map Studio 因 `_cleanup_evidence()` 在第二个文件打开失败时泄漏先打开的 metadata fd 而失败。该 Windows 日志直接形成 `ed85c38` 修复和 closed-fd 回归测试，不能把此 run 写成全绿。
+
+代码头 `ed85c38` 尚待 push 后的 GitHub Actions 完成；只有新的 Windows、Ubuntu、Native 和 macOS/iOS job 全部通过后，才可记录为 W2R 远端成功证据。
 
 上一轮代码提交 `2e180e06de1a8db7c90f3342aa08c405c9a430f8` 的 run [30331393098](https://github.com/mcjiansheng/MarketScanner/actions/runs/30331393098) 仍是 W2 基线证据，不覆盖本 wave。
 
