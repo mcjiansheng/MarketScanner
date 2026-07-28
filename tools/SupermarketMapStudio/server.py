@@ -784,8 +784,43 @@ def reprocess_single_session(
             "This session still contains live_checkpoint.json and may have been copied while scanning. "
             "Finalize the scan on the iPhone before PC optimization."
         )
-    if summary["finalized"] is False:
-        raise RequestError("The phone database is still marked as unfinalized; finalize/copy it before PC processing.")
+    if summary["finalized"] is not True:
+        raise RequestError(
+            "The phone database is not explicitly marked finalized=true; "
+            "finalize/copy it before PC processing."
+        )
+    metadata = segments[0].metadata
+    workflow_mode = metadata.get("workflowMode") or metadata.get("workflow_mode")
+    if workflow_mode == "prior_map_localized":
+        capture_health = metadata.get("captureHealth") or metadata.get("capture_health")
+        eligibility = metadata.get("processingEligibility") or metadata.get(
+            "processing_eligibility"
+        )
+        failure_count = (
+            capture_health.get("localizationRequiredWriteFailureCount")
+            if isinstance(capture_health, dict)
+            else None
+        )
+        evidence_complete = (
+            capture_health.get("localizationEvidenceComplete")
+            if isinstance(capture_health, dict)
+            else None
+        )
+        blockers = eligibility.get("blockers") if isinstance(eligibility, dict) else None
+        if (
+            not isinstance(capture_health, dict)
+            or isinstance(failure_count, bool)
+            or failure_count != 0
+            or evidence_complete is not True
+            or not isinstance(eligibility, dict)
+            or eligibility.get("status") != "eligible"
+            or blockers != []
+        ):
+            raise RequestError(
+                "Prior-map localization evidence is incomplete or ineligible; "
+                "PC optimization requires zero required sidecar write failures, "
+                "localizationEvidenceComplete=true, and an empty eligibility blocker list."
+            )
     optimized_dir = output / "rtabmap_optimized"
     optimized_database = optimized_dir / output_name
 

@@ -9,6 +9,7 @@
 - 阶段一 review 通过；
 - 阶段二实时匹配、置信度、Vision 扫码和价签测量 review 通过；
 - 办公室回放、热状态、磁盘和中断恢复干跑通过；
+- 必需 localization sidecar 故障注入已验证持续告警、原数据库继续记录、`finalized=false`、checkpoint 保留和 PC fail-closed；
 - 先验地图版本、现场楼层和入口控制点核对完成。
 - 完整相对 SE(2) 因子图及其数值门完成；当前 `bounded_correction_field` 只能用于 draft/review pilot，不能作为正式 published 验收对象。
 
@@ -21,7 +22,7 @@
 - tracking 中断和人工恢复；
 - 已知货架位置与测量控制点；
 - 标签位置真值、手机位置和估计标签位置；
-- 原始数据库 hash、全部 sidecar、PC 参数、current version/revision、review/publish blockers 和结果 hash；
+- 原始数据库 hash、全部 sidecar、capture health/processing eligibility、input identity、PC 参数、current version/revision、review/publish blockers 和结果 hash；
 - 自由扫描对照组。
 
 验收至少布置 20 个有人工真值的标签，覆盖重复货架、长直通道、转弯、一次 tracking 中断和一次人工重定位。最终报告必须列出定位/标签误差分布、失败样本、数据库与结果 hash；通过标准由现场负责人和独立审查者在执行前冻结。

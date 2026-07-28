@@ -5,13 +5,14 @@
 ## 2026-07-27 — RepairV2 安全闭环
 
 - 价签 observation 严格绑定真实 node/frame time 和地图身份；缺失/歧义证据不再回退 node 0，PC 使用 raw map position 做 SE(2) 传播。
-- 人工重定位事件升级为 v2，分离 wall clock 与 ARFrame time；native 优先冻结最近 RTAB‑Map node ID/stamp，证据不可用时明确写 null 和 frame timestamp fallback；写入失败不再向用户误报成功。
-- 本地化输出改为跨进程锁保护的 staging、不可变 version、逐次复核的文件 hash 清单和单提交点 current/published 原子指针；发布/撤销只推进 published，失败、篡改或无效诊断版本不会覆盖旧 current。
-- `manual_edits.json` 升级 v3；强制 version/revision CAS、HTTP 409、服务端 old value/UTC/UUID、字段/范围/物理关联校验和 undo/redo audit。
+- 人工重定位事件升级为 v3，分离 wall clock 与 ARFrame time；native 在同一锁域原子冻结 node ID/stamp、timebase offset 和 generation。缺少、过期或不一致快照会拒绝事件，不再使用 nullable node 或 frame timestamp fallback；PC 仍兼容严格 v2 输入并拒绝 legacy v1。
+- 定位 trace/constraint/state/manual 写入改为 throwing I/O 和结构化结果；失败计数粘性进入 `captureHealth`，HUD 持续红色告警。`metadata.json` 最后写入，证据不完整时保留 checkpoint、写 `finalized=false`/eligibility blockers，PC fail closed。
+- 本地化输出改为 POSIX/Windows 跨进程锁保护的 staging、不可变 version、逐次复核的文件 hash 清单和单提交点 current/published 原子指针；输入身份由 `session_input_manifest.json` 绑定，绝对路径按 identity 隔离到 `localized/local_inputs/`。发布/撤销只推进 published，失败、篡改或无效诊断版本不会覆盖旧 current。
+- `manual_edits.json` 升级 v4；强制 version/revision CAS、HTTP 409、服务端 old value/UTC/UUID、字段/范围/物理关联校验和 undo/redo audit。
 - 为五类 JSONL 和最终价签定义严格输入契约，拒绝非法 UTF‑8、非有限数字、错误身份/版本/时间、业务字段缺失、超限和重复 ID；legacy 人工事件仅审计并阻断 review，最终价签与 observation 交叉核对商品、码制和原始位置。
 - 节点覆盖改为 source/optimized SQLite Node 与导出轨迹三方审计；当前求解器降级命名为 `bounded_correction_field`，新增残差诊断、局部平移/yaw 形变和 review/publish blockers；完整相对 SE(2) 因子图与现场验收完成前硬阻断 published。
 - 修正 `ARFrame.timestamp` 与 `CameraMobile` epoch `Node.stamp` 的基准差，并将 offset 改为原子读写；trace/constraint/state/tag/manual 均保存可复算的 raw/node timebase/offset。
-- 增加 MarketScanner CI、版本/指针 fsync 故障注入、双线程客户端同基准 CAS 冲突、409、发布门和 Swift timebase 回归测试。正式真机/现场验收仍未执行。
+- 增加 Linux/macOS/Windows MarketScanner CI、Windows durable move、版本/指针 fsync 故障注入、双线程客户端同基准 CAS 冲突、409、发布门、native ABI 与 generic iOS arm64 构建回归。正式真机/现场验收仍未执行。
 
 ## 2026-07-25 — 综合审查整改与阶段三
 

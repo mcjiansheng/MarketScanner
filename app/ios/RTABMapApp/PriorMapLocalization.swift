@@ -1207,6 +1207,7 @@ final class PriorMapLiveMapView: UIView {
     let scanPriceTagButton = UIButton(type: .system)
     private let previewView = UIImageView()
     private let statusLabel = UILabel()
+    private let evidenceWarningLabel = UILabel()
     private let roadLabel = UILabel()
     private let diagnosticsButton = UIButton(type: .system)
     private let diagnosticsLabel = UILabel()
@@ -1250,6 +1251,10 @@ final class PriorMapLiveMapView: UIView {
         previewView.layer.addSublayer(arrow)
         arrow.fillColor = UIColor.systemRed.cgColor
         statusLabel.font = .preferredFont(forTextStyle: .headline)
+        evidenceWarningLabel.font = .preferredFont(forTextStyle: .caption1)
+        evidenceWarningLabel.textColor = .systemRed
+        evidenceWarningLabel.numberOfLines = 0
+        evidenceWarningLabel.isHidden = true
         roadLabel.font = .preferredFont(forTextStyle: .caption1)
         roadLabel.textColor = .secondaryLabel
         roadLabel.numberOfLines = 2
@@ -1272,6 +1277,7 @@ final class PriorMapLiveMapView: UIView {
         let stack = UIStackView(
             arrangedSubviews: [
                 statusLabel,
+                evidenceWarningLabel,
                 roadLabel,
                 diagnosticsButton,
                 diagnosticsLabel,
@@ -1294,6 +1300,11 @@ final class PriorMapLiveMapView: UIView {
 
     required init?(coder: NSCoder) {
         fatalError("init(coder:) has not been implemented")
+    }
+
+    func showEvidenceWriteFailure(_ message: String) {
+        evidenceWarningLabel.text = message
+        evidenceWarningLabel.isHidden = false
     }
 
     @objc private func toggleDiagnostics() {

@@ -1922,6 +1922,44 @@ class MapStudioApiTests(unittest.TestCase):
         self.assertEqual(result["status"], "failed")
         self.assertIn("live_checkpoint.json", result["error"])
 
+    def test_pc_reprocess_rejects_incomplete_prior_map_write_health(self) -> None:
+        session = create_session(
+            self.root,
+            "SupermarketSession-PriorMapEvidenceFailure",
+            0.0,
+            "continuous_streaming",
+        )
+        add_rgbd_frame(session)
+        metadata_path = session / "segment_0001" / "metadata.json"
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        metadata.update(
+            {
+                "workflowMode": "prior_map_localized",
+                "captureHealth": {
+                    "localizationRequiredWriteFailureCount": 1,
+                    "localizationEvidenceComplete": False,
+                },
+                "processingEligibility": {
+                    "status": "invalid",
+                    "blockers": ["localization_required_sidecar_write_failed"],
+                },
+            }
+        )
+        metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+        output = self.root / "prior-map-evidence-failure-output"
+        job = self.api(
+            "/api/jobs",
+            {
+                "kind": "map",
+                "session": str(session),
+                "output": str(output),
+                "options": {"offline_optimize": True},
+            },
+        )
+        result = self.wait_for_job(job["id"])
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("localization evidence is incomplete", result["error"])
+
     def test_multi_device_pc_reprocess_optimizes_each_phone_database(self) -> None:
         for session in (self.session_a, self.session_b):
             metadata_path = session / "segment_0001" / "metadata.json"

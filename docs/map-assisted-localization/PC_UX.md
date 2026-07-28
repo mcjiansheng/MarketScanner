@@ -19,7 +19,7 @@ Map Studio 保留单设备、多设备和“导入/管理先验地图”入口�
 “先验地图会话优化”固定执行：
 
 1. 选择并完整校验先验地图包；
-2. 选择已正常结束、地图 ID/hash 一致的连续单库会话；
+2. 选择已正常结束、地图 ID/hash 一致的连续单库会话；服务端要求显式 `finalized=true`、零必需 sidecar 写失败、`localizationEvidenceComplete=true`、`processingEligibility.status=eligible` 且 blockers 为空，缺字段或存在 checkpoint 都拒绝；
 3. 对原 SQLite 计算 SHA‑256 并保持只读；
 4. `rtabmap-reprocess` 写入 `rtabmap_optimized/optimized.db`；
 5. 从优化副本读取全局一致相对轨迹；
@@ -52,7 +52,7 @@ Map Studio 保留单设备、多设备和“导入/管理先验地图”入口�
 
 人工编辑支持修改价签字段、批准单个价签和批量批准显式 ID 列表。人工值不会被静默覆盖；重新处理先校验 `manual_edits.json` 的地图/会话 hash，再按 cursor 重放。
 
-成果中的 `source_manifest.json` 不包含本机绝对路径。重放所需路径只保存在 Map Studio 本机输出根下的 `localized/local_state.json`，不通过 artifact API 提供；移动成果到另一台电脑后应重新选择原会话/地图建立本机状态，不能把旧机器路径当作可移植元数据。
+成果中的 `source_manifest.json` 不包含本机绝对路径。每个不可变版本的 `session_input_manifest.json` 绑定原数据库、metadata 和全部必需 sidecar 的名称、大小、SHA‑256 与 `input_identity_id`。重放所需路径按该 identity 保存在 Map Studio 本机输出根下的 `localized/local_inputs/<input_identity_id>.json`，不通过 artifact API 提供；旧版本不会读取当前版本的可变路径状态。移动成果到另一台电脑后应重新选择完全相同字节的原会话/地图建立本机状态，不能把旧机器路径当作可移植元数据。
 
 ## API
 

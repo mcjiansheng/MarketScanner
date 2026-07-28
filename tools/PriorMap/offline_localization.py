@@ -2949,6 +2949,35 @@ def _render_localized_version(
         raise OfflineLocalizationError("This session is not a prior-map localized scan.")
     if metadata.get("finalized") is not True:
         raise OfflineLocalizationError("Localized processing requires a finalized session.")
+    capture_health = metadata.get("captureHealth")
+    processing_eligibility = metadata.get("processingEligibility")
+    failure_count = (
+        capture_health.get("localizationRequiredWriteFailureCount")
+        if isinstance(capture_health, dict)
+        else None
+    )
+    evidence_complete = (
+        capture_health.get("localizationEvidenceComplete")
+        if isinstance(capture_health, dict)
+        else None
+    )
+    blockers = (
+        processing_eligibility.get("blockers")
+        if isinstance(processing_eligibility, dict)
+        else None
+    )
+    if (
+        not isinstance(capture_health, dict)
+        or isinstance(failure_count, bool)
+        or failure_count != 0
+        or evidence_complete is not True
+        or not isinstance(processing_eligibility, dict)
+        or processing_eligibility.get("status") != "eligible"
+        or blockers != []
+    ):
+        raise OfflineLocalizationError(
+            "Localized processing requires complete prior-map sidecar write evidence."
+        )
     manifest = load_json(prior_map / "manifest.json")
     package_manifest = load_json(prior_map / "package_manifest.json")
     expected_map_id = metadata.get("priorMapId")

@@ -732,6 +732,17 @@ class LocalizedPipelineTests(unittest.TestCase):
                 "initialMapPose": {"x_m": 1.5, "y_m": -2.5, "yaw_rad": 0},
                 "localizedPriceTags": "localized_price_tags.json",
                 "localizedPriceTagCount": 1,
+                "captureHealth": {
+                    "localizationRequiredWriteFailureCount": 0,
+                    "localizationTraceRecordCount": 20,
+                    "localizationConstraintRecordCount": 2,
+                    "localizationStateEventCount": 3,
+                    "localizationEvidenceComplete": True,
+                },
+                "processingEligibility": {
+                    "status": "eligible",
+                    "blockers": [],
+                },
             },
         )
         self.source_database = self.segment / "rtabmap_segment_0001.db"
@@ -1467,6 +1478,39 @@ class LocalizedPipelineTests(unittest.TestCase):
                 self.optimized_database,
                 self.root / "missing-events",
             )
+
+    def test_prior_map_processing_requires_complete_capture_write_health(self) -> None:
+        metadata_path = self.segment / "metadata.json"
+        original = json.loads(metadata_path.read_text(encoding="utf-8"))
+        cases = {
+            "missing-health": lambda value: value.pop("captureHealth"),
+            "recorded-failure": lambda value: value["captureHealth"].update(
+                {
+                    "localizationRequiredWriteFailureCount": 1,
+                    "localizationEvidenceComplete": False,
+                }
+            ),
+            "ineligible": lambda value: value["processingEligibility"].update(
+                {"status": "invalid", "blockers": ["sidecar_write_failed"]}
+            ),
+        }
+        for name, mutate in cases.items():
+            with self.subTest(name=name):
+                metadata = json.loads(json.dumps(original))
+                mutate(metadata)
+                json_write(metadata_path, metadata)
+                with self.assertRaisesRegex(
+                    OfflineLocalizationError, "complete prior-map sidecar"
+                ):
+                    process_localized_session(
+                        self.prior_map,
+                        self.session,
+                        self.poses,
+                        self.source_database,
+                        self.optimized_database,
+                        self.root / f"incomplete-write-health-{name}",
+                    )
+        json_write(metadata_path, original)
 
     def test_tag_file_count_and_tag_observation_content_are_fail_closed(self) -> None:
         tags_path = self.segment / "localized_price_tags.json"

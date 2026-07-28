@@ -19,7 +19,7 @@
 | T_map_from_arkit 与 2D HUD | 已实现 | `PriorMapStageOneLocalizer`/`PriorMapLiveMapView` |
 | 单楼层定位边界 | 已实现 | 开始前绑定一层；无跨层切换；忽略二维高度但保留原始 3D |
 | 道路软约束、歧义拒绝 | 已实现 | 2 Hz、有界道路索引、in-flight 丢帧门控、0.15 gain、0.25 m cap、Top-3 |
-| 人工确认和审计 | 已实现 | manual JSONL + scan event |
+| 人工确认和审计 | 已实现 | manual v3 JSONL；native 原子 node/timebase/generation 快照；无一致 node 证据即拒绝 |
 | synthetic/trajectory replay | 已实现 | 平移/旋转 drift、XY/yaw 误差、tracking loss、道路分配 |
 | 旧会话和自由扫描兼容 | 已实现 | storage/workflow 分字段、PC regression |
 | 完整业务首页五入口 | 部分实现 | 现有首页/菜单保留；新建扫描双模式已完成，独立“先验地图”首页入口尚未拆出 |
@@ -36,10 +36,10 @@
 | 状态和置信度滞回 | 已实现 | initializing/stable/usable/weak/lost/manualCorrection；连续可信和 stale 门限集中管理 |
 | Vision QR/条形码识别 | 已实现 | 用户触发；复用 `ARFrame.capturedImage`；捕获时对齐快照与版本；四方向 ROI；QR/EAN/Code128/UPCE/PDF417 |
 | 标签三维测量与结构关联 | 已实现 | 同帧 depth；楼面法向/残差/时序置信度；货架/柜台；跨结构遮挡；侧面、offset、高度和歧义门控 |
-| 阶段二 sidecar 和移动 UI | 已实现 | constraint/state/tag observation JSONL、localized tags JSON、结构指标 HUD 和确认 UI |
+| 阶段二 sidecar 和移动 UI | 已实现 | constraint/state/tag observation JSONL、localized tags JSON、结构指标 HUD、确认 UI 和必需证据写失败的持久红色告警 |
 | PC 会话检查 | 已实现 | `/api/session/inspect` 有界汇总约束、状态、观测、最终价签和 malformed 计数 |
 | 阶段二回放与指标 | 已实现 | iOS 同款校正门控/gain/锚点/状态；周期结构、动态干扰、错误初始位姿、tracking 恢复、yaw/通道/跳变和 matcher p50/p95 |
-| 结束并发一致性 | 已实现 | finalization 先失效 generation 并有界 drain；sidecar 写入校验 tracking session 和 finalizing，禁止隐式新会话 |
+| 结束并发一致性 | 已实现 | finalization 先失效 generation 并有界 drain；sidecar 写入校验 tracking session/finalizing，失败粘性进入 capture health；metadata 最后提交，证据不完整则 `finalized=false`、保留 checkpoint |
 
 2026-07-25 综合审查整改：地图包新增全文件清单并由 iOS 做摘要/跨文件校验；货架面语义对正方形/环方向稳定，柜台支持全部边；价签改为密集 ROI 深度证据和快照时效门；拒绝候选不再预热校正门；HUD 增加有界轨迹/价签层并折叠诊断；finalization 不再在主线程等待。
 
@@ -54,12 +54,12 @@
 | 标签离线重算和结构关联 | 已实现（保守门控） | observation→真实 node/frame time 绑定、raw 位置 SE(2) 传播、独立次候选/遮挡/侧面/边长校验；失败进入 review 或阻断 current |
 | Sidecar 输入契约 | 已实现 | 每类 required/optional、format/version、严格 UTF‑8/JSON、身份/时间/业务 schema/大小/唯一 ID；legacy manual 仅审计；tag/observation 内容交叉验证；损坏 fail closed |
 | 节点覆盖审计 | 已实现 | 只读查询 source/optimized SQLite Node，和导出 node ID 三方比较缺失、额外、重复、非单调 stamp 与首尾时间；metadata 仅交叉检查 |
-| 导出隐私与本机恢复 | 已实现 | source manifest 仅文件标识/ID/hash；绝对路径隔离在不导出的 `localized/local_state.json`，重放继续校验输入 hash |
-| 不可变成果事务 | 已实现 | 跨进程锁内 staging→完整文件/hash 校验→`versions/vNNNNNN`→单指针提交；版本/指针 fsync 故障注入；读取与已打开 fd 复核 hash；损坏状态拒绝降级 |
+| 导出隐私与本机恢复 | 已实现 | version 内 `session_input_manifest.json`/input identity 绑定全部输入字节；绝对路径按 identity 隔离在不导出的 `localized/local_inputs/`，重放前验证 version、身份和当前输入 hash |
+| 不可变成果事务 | 已实现 | POSIX/Windows 跨进程锁内 staging→完整文件/hash 校验→`versions/vNNNNNN`→单指针提交；Windows write-through move、版本/指针 durability 故障注入；读取与已打开 fd 复核 hash；损坏状态拒绝降级 |
 | 质量报告和状态机 | 部分实现 | draft/review/published/revoked 事务框架和门禁；当前 solver 硬阻断 published |
-| 人工编辑重放/撤销/重做 | 已实现 | manual_edits v3、强制 version/revision CAS、HTTP 409、服务端 old value/UTC/ID、字段/范围/地图校验、undo/redo audit |
+| 人工编辑重放/撤销/重做 | 已实现 | manual_edits v4 与 input identity、强制 version/revision CAS、HTTP 409、服务端 old value/UTC/ID、字段/范围/地图校验、undo/redo audit |
 | PC 非专业向导 | 已实现 | 地图+会话选择、一键处理、三轨迹/价签联动画布、状态/货架筛选、问题带入、人工编辑区和 artifact |
-| 确定性 E2E fixture | 已实现 | 源库不变、漂移降低、错误约束拒绝、事务故障、双线程客户端同基准 CAS 冲突、409、发布硬门、严格 sidecar 负例 |
+| 确定性 E2E fixture | 已实现 | 源库不变、漂移降低、错误约束拒绝、事务/输入变更故障、双线程客户端同基准 CAS 冲突、409、发布硬门、严格 sidecar/capture-health 负例 |
 | 正式现场验收 | 未执行 | 只完成 `FIELD_TEST_PLAN.md`；不能用模拟或构建替代 |
 
 操作流程、弱/丢失定位、人工复核、备份和失败恢复见 `USER_GUIDE.md`。

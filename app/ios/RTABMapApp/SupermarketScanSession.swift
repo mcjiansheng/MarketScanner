@@ -58,6 +58,7 @@ struct ScanSegmentMetadata: Codable {
     let availableDiskBytes: Int64?
     let thermalState: String?
     let captureHealth: ScanCaptureHealth?
+    let processingEligibility: ScanProcessingEligibility?
     /// Lightweight phone-side coverage guidance statistics. This is not a
     /// semantic shelf map; the authoritative geometry remains in the RGB-D
     /// database and is reconstructed on the PC.
@@ -126,6 +127,34 @@ struct ScanSegmentSidecarSnapshot {
     let localizedPriceTags: [LocalizedPriceTag]
 }
 
+struct ScanProcessingEligibility: Codable {
+    let status: String
+    let blockers: [String]
+}
+
+struct LocalizationWriteResult {
+    let traceWritten: Bool
+    let constraintWritten: Bool
+    let stateWriteRequired: Bool
+    let stateWritten: Bool
+    let failureReasons: [String: String]
+
+    var succeeded: Bool {
+        return traceWritten
+            && constraintWritten
+            && (!stateWriteRequired || stateWritten)
+    }
+
+    var failedRequiredFiles: [String] {
+        return failureReasons.keys.sorted()
+    }
+}
+
+private struct LocalizationRecordWriteResult {
+    let succeeded: Bool
+    let errorReason: String?
+}
+
 struct ScanCaptureHealth: Codable {
     let sensorPoseCount: Int
     let normalTrackingPoseCount: Int
@@ -143,6 +172,12 @@ struct ScanCaptureHealth: Codable {
     let lowVisualFeatureFrameCount: Int
     let maximumObservedLinearSpeedMps: Double
     let maximumObservedAngularSpeedDegPerSecond: Double
+    let localizationRequiredWriteFailureCount: Int
+    let firstLocalizationRequiredWriteError: String?
+    let localizationTraceRecordCount: Int
+    let localizationConstraintRecordCount: Int
+    let localizationStateEventCount: Int
+    let localizationEvidenceComplete: Bool
 }
 
 struct ScanBoundarySnapshot {
@@ -434,6 +469,11 @@ final class SupermarketScanSession {
     private var lowVisualFeatureFrameCount = 0
     private var maximumObservedLinearSpeedMps = 0.0
     private var maximumObservedAngularSpeedDegPerSecond = 0.0
+    private var localizationRequiredWriteFailureCount = 0
+    private var firstLocalizationRequiredWriteError: String?
+    private var localizationTraceRecordCount = 0
+    private var localizationConstraintRecordCount = 0
+    private var localizationStateEventCount = 0
     private var latestStructureCoverageSnapshot: ScanStructureCoverageSnapshot?
     private var latestStructureCoverageSummary: ScanStructureCoverageSummary?
     private let maximumTrajectorySamples = 50_000
@@ -579,6 +619,11 @@ final class SupermarketScanSession {
         lowVisualFeatureFrameCount = 0
         maximumObservedLinearSpeedMps = 0
         maximumObservedAngularSpeedDegPerSecond = 0
+        localizationRequiredWriteFailureCount = 0
+        firstLocalizationRequiredWriteError = nil
+        localizationTraceRecordCount = 0
+        localizationConstraintRecordCount = 0
+        localizationStateEventCount = 0
         latestStructureCoverageSnapshot = nil
         latestStructureCoverageSummary = nil
     }
@@ -888,7 +933,21 @@ final class SupermarketScanSession {
             poseDiscontinuityCompensationCount: poseDiscontinuityCompensationCount,
             lowVisualFeatureFrameCount: lowVisualFeatureFrameCount,
             maximumObservedLinearSpeedMps: maximumObservedLinearSpeedMps,
-            maximumObservedAngularSpeedDegPerSecond: maximumObservedAngularSpeedDegPerSecond)
+            maximumObservedAngularSpeedDegPerSecond: maximumObservedAngularSpeedDegPerSecond,
+            localizationRequiredWriteFailureCount:
+                localizationRequiredWriteFailureCount,
+            firstLocalizationRequiredWriteError:
+                firstLocalizationRequiredWriteError,
+            localizationTraceRecordCount: localizationTraceRecordCount,
+            localizationConstraintRecordCount:
+                localizationConstraintRecordCount,
+            localizationStateEventCount: localizationStateEventCount,
+            localizationEvidenceComplete:
+                scanConfiguration.workflowMode != .priorMapLocalized
+                    || (localizationRequiredWriteFailureCount == 0
+                        && localizationTraceRecordCount > 0
+                        && localizationConstraintRecordCount > 0
+                        && localizationStateEventCount > 0))
     }
 
     func writeLiveCheckpoint(to segmentDirectory: URL, checkpoint: ScanLiveCheckpoint) throws {
@@ -910,9 +969,6 @@ final class SupermarketScanSession {
         defer { sidecarWriteLock.unlock() }
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-
-        let metadataData = try encoder.encode(snapshot.metadata)
-        try metadataData.write(to: segmentDirectory.appendingPathComponent("metadata.json"), options: .atomic)
 
         let tagsData = try encoder.encode(snapshot.priceTags)
         try tagsData.write(to: segmentDirectory.appendingPathComponent("price_tags.json"), options: .atomic)
@@ -959,10 +1015,20 @@ final class SupermarketScanSession {
                 options: .atomic)
         }
 
+        // metadata.json is the commit marker for a completed sidecar bundle.
+        // Write it only after every referenced artifact has succeeded.
+        let metadataData = try encoder.encode(snapshot.metadata)
+        try metadataData.write(
+            to: segmentDirectory.appendingPathComponent("metadata.json"),
+            options: .atomic)
+
         if snapshot.metadata.finalized == true {
             // A final metadata.json supersedes the crash-recovery heartbeat.
-            try? fileManager.removeItem(
-                at: segmentDirectory.appendingPathComponent("live_checkpoint.json"))
+            let checkpoint = segmentDirectory.appendingPathComponent(
+                "live_checkpoint.json")
+            if fileManager.fileExists(atPath: checkpoint.path) {
+                try fileManager.removeItem(at: checkpoint)
+            }
         }
     }
 
@@ -1023,13 +1089,36 @@ final class SupermarketScanSession {
         _ update: PriorMapLocalizationUpdate,
         expectedTrackingSessionId: String,
         nodeTimebaseOffsetSeconds: TimeInterval
-    ) {
+    ) -> LocalizationWriteResult {
         localizationTransactionLock.lock()
         defer { localizationTransactionLock.unlock() }
+        let stateWriteRequired = lastLocalizationState != update.localizationState
         var trace = update
         guard nodeTimebaseOffsetSeconds.isFinite else {
-            print("Refused localization trace without a node timebase offset")
-            return
+            let failures = [
+                "localization_trace.jsonl": "node_timebase_offset_invalid",
+                "localization_constraints.jsonl": "node_timebase_offset_invalid",
+                "localization_events.jsonl": "node_timebase_offset_invalid",
+            ]
+            var requiredFailures = failures
+            if !stateWriteRequired {
+                requiredFailures.removeValue(forKey: "localization_events.jsonl")
+            }
+            recordLocalizationEvidenceFailures(requiredFailures)
+            appendScanEvent(
+                level: "error",
+                event: "localization_sidecar_write_failed",
+                message: "Required localization evidence was not persisted",
+                fields: [
+                    "failed_files": requiredFailures.keys.sorted().joined(separator: ","),
+                    "reason": "node_timebase_offset_invalid",
+                ])
+            return LocalizationWriteResult(
+                traceWritten: false,
+                constraintWritten: false,
+                stateWriteRequired: stateWriteRequired,
+                stateWritten: !stateWriteRequired,
+                failureReasons: requiredFailures)
         }
         trace.nodeTimebaseTimestamp = update.timestamp + nodeTimebaseOffsetSeconds
         trace.nodeTimebaseOffsetSeconds = nodeTimebaseOffsetSeconds
@@ -1037,7 +1126,7 @@ final class SupermarketScanSession {
         trace.priorMapId = scanConfiguration.priorMapId
         trace.priorMapSha256 = scanConfiguration.priorMapSha256
         trace.floorId = scanConfiguration.floorId
-        appendLocalizationRecord(
+        let traceResult = appendLocalizationRecord(
             trace,
             fileName: "localization_trace.jsonl",
             expectedTrackingSessionId: expectedTrackingSessionId)
@@ -1061,11 +1150,14 @@ final class SupermarketScanSession {
             effectivePointCount: update.structurePointCount,
             coverageAngleRad: update.structureCoverageAngleRad,
             matcherElapsedMs: update.matcherElapsedMs)
-        appendLocalizationRecord(
+        let constraintResult = appendLocalizationRecord(
             constraint,
             fileName: "localization_constraints.jsonl",
             expectedTrackingSessionId: expectedTrackingSessionId)
-        if lastLocalizationState != update.localizationState {
+        var stateResult = LocalizationRecordWriteResult(
+            succeeded: true,
+            errorReason: nil)
+        if stateWriteRequired {
             let stateEvent = PriorMapStateEvent(
                 format: "MarketScannerLocalizationStateEvent",
                 version: 1,
@@ -1080,12 +1172,53 @@ final class SupermarketScanSession {
                 state: update.localizationState,
                 confidence: update.confidence,
                 reason: update.constraintReason)
-            appendLocalizationRecord(
+            stateResult = appendLocalizationRecord(
                 stateEvent,
                 fileName: "localization_events.jsonl",
                 expectedTrackingSessionId: expectedTrackingSessionId)
-            lastLocalizationState = update.localizationState
+            if stateResult.succeeded {
+                // The state watermark represents durable evidence, not merely
+                // the in-memory localization state.
+                lastLocalizationState = update.localizationState
+            }
         }
+        var failures: [String: String] = [:]
+        if !traceResult.succeeded {
+            failures["localization_trace.jsonl"] =
+                traceResult.errorReason ?? "write_failed"
+        }
+        if !constraintResult.succeeded {
+            failures["localization_constraints.jsonl"] =
+                constraintResult.errorReason ?? "write_failed"
+        }
+        if stateWriteRequired && !stateResult.succeeded {
+            failures["localization_events.jsonl"] =
+                stateResult.errorReason ?? "write_failed"
+        }
+        let result = LocalizationWriteResult(
+            traceWritten: traceResult.succeeded,
+            constraintWritten: constraintResult.succeeded,
+            stateWriteRequired: stateWriteRequired,
+            stateWritten: stateResult.succeeded,
+            failureReasons: failures)
+        recordLocalizationEvidenceSuccesses(
+            traceWritten: traceResult.succeeded,
+            constraintWritten: constraintResult.succeeded,
+            stateWritten: stateWriteRequired && stateResult.succeeded)
+        if !result.succeeded {
+            recordLocalizationEvidenceFailures(failures)
+            appendScanEvent(
+                level: "error",
+                event: "localization_sidecar_write_failed",
+                message: "Required localization evidence was not persisted",
+                fields: [
+                    "failed_files": result.failedRequiredFiles.joined(separator: ","),
+                    "first_error": result.failedRequiredFiles.first.flatMap {
+                        failures[$0]
+                    } ?? "write_failed",
+                ])
+        }
+        return result
     }
 
     @discardableResult
@@ -1095,7 +1228,7 @@ final class SupermarketScanSession {
         return appendLocalizationRecord(
             observation,
             fileName: "tag_observations.jsonl",
-            expectedTrackingSessionId: observation.trackingSessionId)
+            expectedTrackingSessionId: observation.trackingSessionId).succeeded
     }
 
     @discardableResult
@@ -1158,6 +1291,8 @@ final class SupermarketScanSession {
         alignmentVersion: Int,
         expectedTrackingSessionId: String
     ) -> Bool {
+        localizationTransactionLock.lock()
+        defer { localizationTransactionLock.unlock() }
         guard frameTimestamp.isFinite,
               nodeTimebaseFrameTimestamp.isFinite,
               nodeTimebaseOffsetSeconds.isFinite,
@@ -1178,10 +1313,17 @@ final class SupermarketScanSession {
               nodeTimeSnapshotGeneration > 0,
               alignmentVersion > 0 else {
             print("Refused to persist an invalid manual localization v3 event")
+            let failures = [
+                "manual_localization_events.jsonl": "manual_event_validation_failed"
+            ]
+            recordLocalizationEvidenceFailures(failures)
+            appendScanEvent(
+                level: "error",
+                event: "manual_localization_event_write_failed",
+                message: "Manual localization evidence failed validation",
+                fields: ["reason": "manual_event_validation_failed"])
             return false
         }
-        localizationTransactionLock.lock()
-        defer { localizationTransactionLock.unlock() }
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         let event = ManualLocalizationEvent(
@@ -1206,10 +1348,18 @@ final class SupermarketScanSession {
             reason: reason,
             arkitPose: arkitPose,
             confirmedMapPose: confirmedMapPose)
-        return appendLocalizationRecord(
+        let result = appendLocalizationRecord(
             event,
             fileName: "manual_localization_events.jsonl",
             expectedTrackingSessionId: expectedTrackingSessionId)
+        if !result.succeeded {
+            let failures = [
+                "manual_localization_events.jsonl":
+                    result.errorReason ?? "write_failed"
+            ]
+            recordLocalizationEvidenceFailures(failures)
+        }
+        return result.succeeded
     }
 
     @discardableResult
@@ -1217,14 +1367,16 @@ final class SupermarketScanSession {
         _ record: T,
         fileName: String,
         expectedTrackingSessionId: String
-    ) -> Bool {
+    ) -> LocalizationRecordWriteResult {
         captureLock.lock()
         guard !finalizingScan,
               expectedTrackingSessionId == trackingSessionId,
               let root = rootDirectory,
               segmentIndex == 1 else {
             captureLock.unlock()
-            return false
+            return LocalizationRecordWriteResult(
+                succeeded: false,
+                errorReason: "session_not_writable_or_identity_mismatch")
         }
         let directory = root.appendingPathComponent(
             "segment_0001",
@@ -1232,7 +1384,9 @@ final class SupermarketScanSession {
         captureLock.unlock()
         guard fileManager.fileExists(atPath: directory.path) else {
             print("Could not append localization record: active directory is unavailable")
-            return false
+            return LocalizationRecordWriteResult(
+                succeeded: false,
+                errorReason: "active_directory_unavailable")
         }
         localizationLogLock.lock()
         defer { localizationLogLock.unlock() }
@@ -1247,16 +1401,55 @@ final class SupermarketScanSession {
             }
             else {
                 let handle = try FileHandle(forWritingTo: url)
-                handle.seekToEndOfFile()
-                handle.write(data)
-                handle.synchronizeFile()
-                handle.closeFile()
+                defer { try? handle.close() }
+                try handle.seekToEnd()
+                try handle.write(contentsOf: data)
+                try handle.synchronize()
             }
-            return true
+            return LocalizationRecordWriteResult(
+                succeeded: true,
+                errorReason: nil)
         }
         catch {
             print("Could not append localization record: \(error)")
-            return false
+            return LocalizationRecordWriteResult(
+                succeeded: false,
+                errorReason: error.localizedDescription)
+        }
+    }
+
+    private func recordLocalizationEvidenceFailures(
+        _ failures: [String: String]
+    ) {
+        guard !failures.isEmpty else { return }
+        captureLock.lock()
+        defer { captureLock.unlock() }
+        guard scanConfiguration.workflowMode == .priorMapLocalized else {
+            return
+        }
+        localizationRequiredWriteFailureCount += failures.count
+        if firstLocalizationRequiredWriteError == nil,
+           let firstFile = failures.keys.sorted().first {
+            firstLocalizationRequiredWriteError =
+                "\(firstFile): \(failures[firstFile] ?? "write_failed")"
+        }
+    }
+
+    private func recordLocalizationEvidenceSuccesses(
+        traceWritten: Bool,
+        constraintWritten: Bool,
+        stateWritten: Bool
+    ) {
+        captureLock.lock()
+        defer { captureLock.unlock() }
+        if traceWritten {
+            localizationTraceRecordCount += 1
+        }
+        if constraintWritten {
+            localizationConstraintRecordCount += 1
+        }
+        if stateWritten {
+            localizationStateEventCount += 1
         }
     }
 

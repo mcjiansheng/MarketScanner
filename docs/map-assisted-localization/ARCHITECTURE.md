@@ -53,10 +53,11 @@ PC prior-map localized
 - `tools/PriorMap/distance_field.py` 生成并验证逐层 RLE 距离场；`replay_stage2.py` 是确定性结构匹配回放。
 - `tools/PriorMap/stage1_localizer.py` 是回放使用的阶段一定位器。
 - `PriorMapScanMatcher.swift`、`PriorMapDepthSampler.swift` 和 `PriorMapLocalization.swift` 分别负责距离场匹配、深度证据与串行状态/地图对齐。
+- `RTABMap.swift`/`NativeWrapper.mm` 以一次原子快照返回最近 node ID、node stamp、CameraMobile timebase offset 和 generation；Swift 人工定位事件不得把分次 getter 拼成跨时刻证据。
 - `PriceTagVisionScanner.swift` 只消费 ARKit 当前帧；`PriceTagLocalizationCore.swift` 负责平台无关的货架关联和安全判定。
 - `PriorMapPackageIntegrityCore.swift` 在 iOS 导入前核验包清单、逐文件摘要和跨文件关系。
 - `tools/PriorMap/offline_localization.py` 是阶段三派生 SE(2) 修正、价签重关联、质量门禁、人工编辑重放和导出实现。
-- `tools/PriorMap/localized_output_store.py` 在跨进程文件锁内管理 staging、不可变 version、成果 schema/hash 清单以及 current/published 单提交点原子指针；读取和 artifact 下载前再次复核逐文件完整性。
+- `tools/PriorMap/localized_output_store.py` 在 POSIX/Windows 跨进程文件锁内管理 staging、不可变 version、成果 schema/hash 清单、输入身份和 current/published 单提交点原子指针；Windows 使用 write-through 原子移动，读取和 artifact 下载按 version 内清单及已打开文件字节再次复核完整性。
 - `SupermarketScanSession.swift` 只负责安全落盘和审计 sidecar；原始数据库仍是权威输入。
 
 ## 安全边界
@@ -75,6 +76,8 @@ PC prior-map localized
 - 原始价签观测先落盘；最终价签需要用户明确确认。weak/lost 以及低测量/低关联置信结果强制 `needs_review=true`。
 - 阶段三求解器明确标记为 `bounded_correction_field`：x/y/yaw 带状平滑没有实现 RTAB‑Map 相对边/闭环边的耦合 SE(2) 残差，不具备正式发布资格。
 - 阶段三每次处理前后核对原数据库 SHA-256；所有必需 sidecar 严格校验 UTF‑8、JSON、format/version、身份、时间戳、大小和唯一 ID。失败不切换旧 current。
+- iOS 必需定位 sidecar 的每次追加都返回结构化结果；失败会粘性写入 `captureHealth` 并持续显示红色告警。`metadata.json` 是 sidecar bundle 的最后提交标记；只有定位队列排空、零必需写失败且 trace/constraint/state 均有证据时，已有地图会话才可写 `finalized=true`、`processingEligibility.status=eligible` 并删除 checkpoint。
+- PC 对已有地图会话同时要求显式 `finalized=true`、`localizationEvidenceComplete=true`、零必需写失败和空 blocker 列表，缺失旧字段也按不可处理拒绝。
 - 人工编辑由服务端生成旧值、UUID、UTC 时间和 base revision；version/revision CAS 必填，重放成功后才提交新不可变版本。
 
 阈值、线程所有权、恢复策略和失败矩阵的权威说明见 `STAGE_2_DESIGN.md`。

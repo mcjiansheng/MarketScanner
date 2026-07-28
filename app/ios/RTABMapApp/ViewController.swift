@@ -32,6 +32,7 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
     private var priorMapLocalizer: PriorMapStageOneLocalizer?
     private var priorMapOverlay: PriorMapLiveMapView?
     private var priorMapLatestUpdate: PriorMapLocalizationUpdate?
+    private var priorMapEvidenceWriteWarningShown = false
     private let priorMapUpdateGate = PriorMapUpdateGate(minimumInterval: 0.5)
     private var priorMapGeneration = UUID()
     private let priorMapQueue = DispatchQueue(
@@ -2459,6 +2460,7 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                 overlay.widthAnchor.constraint(equalToConstant: 330),
             ])
             priorMapOverlay = overlay
+            priorMapEvidenceWriteWarningShown = false
             priorMapGeneration = UUID()
             priorMapUpdateGate.reset()
             return true
@@ -2481,6 +2483,7 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         priorMapGeneration = UUID()
         priorMapLocalizer = nil
         priorMapLatestUpdate = nil
+        priorMapEvidenceWriteWarningShown = false
         priorMapUpdateGate.reset()
         priceTagVisionScanner.reset()
         priorMapAlignmentSnapshots.reset()
@@ -2493,6 +2496,22 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
             DispatchQueue.main.async {
                 overlay?.removeFromSuperview()
             }
+        }
+    }
+
+    private func presentLocalizationEvidenceWriteFailure(_ failedFiles: [String]) {
+        let fileList = failedFiles.isEmpty
+            ? localized("required localization sidecars")
+            : failedFiles.joined(separator: ", ")
+        priorMapOverlay?.showEvidenceWriteFailure(
+            localized("辅助定位证据写入失败；本次扫描不能标记为可处理完成。")
+                + " \(fileList)")
+        if !priorMapEvidenceWriteWarningShown {
+            priorMapEvidenceWriteWarningShown = true
+            showToast(
+                message: localized("Localization evidence could not be saved. Raw RTAB-Map recording continues, but this scan cannot be finalized for prior-map processing."),
+                seconds: 7,
+                replacingCurrent: true)
         }
     }
 
@@ -2586,7 +2605,7 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                 frameTimestamp: frame.timestamp) {
                 self.priorMapAlignmentSnapshots.publish(snapshot)
             }
-            self.supermarketSession?.appendLocalizationTrace(
+            let writeResult = self.supermarketSession?.appendLocalizationTrace(
                 update,
                 expectedTrackingSessionId: trackingSessionId,
                 nodeTimebaseOffsetSeconds:
@@ -2594,6 +2613,10 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
             DispatchQueue.main.async {
                 guard generation == self.priorMapGeneration else {
                     return
+                }
+                if let writeResult, !writeResult.succeeded {
+                    self.presentLocalizationEvidenceWriteFailure(
+                        writeResult.failedRequiredFiles)
                 }
                 self.priorMapLatestUpdate = update
                 self.priorMapOverlay?.update(update)
@@ -2828,6 +2851,10 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                     fields: ["reason": reason])
             }
             DispatchQueue.main.async {
+                if !eventPersisted {
+                    self.presentLocalizationEvidenceWriteFailure(
+                        ["manual_localization_events.jsonl"])
+                }
                 self.showToast(
                     message: eventPersisted
                         ? self.localized("Position confirmed. The adjustment was added to the audit log.")
@@ -3685,6 +3712,7 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
 
         var saveSucceeded = false
         var sidecarError: String?
+        var processingEligibilityError: String?
         var saveSeconds = 0.0
         var sidecarSeconds = 0.0
         var finalDatabaseBytes: UInt64 = 0
@@ -3699,10 +3727,42 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                     // SQLite may flush WAL pages during save, so measure the
                     // database only after RTAB-Map has completed finalization.
                     finalDatabaseBytes = self.databaseStorageBytes(at: databaseURL)
+                    let isPriorMapScan =
+                        scanSession.scanConfiguration.workflowMode == .priorMapLocalized
+                    var processingBlockers: [String] = []
+                    if isPriorMapScan {
+                        if !priorMapDrained {
+                            processingBlockers.append("prior_map_queue_not_drained")
+                        }
+                        if boundary.captureHealth.localizationRequiredWriteFailureCount > 0 {
+                            processingBlockers.append(
+                                "localization_required_sidecar_write_failed")
+                        }
+                        if boundary.captureHealth.localizationTraceRecordCount == 0 {
+                            processingBlockers.append("localization_trace_missing")
+                        }
+                        if boundary.captureHealth.localizationConstraintRecordCount == 0 {
+                            processingBlockers.append("localization_constraints_missing")
+                        }
+                        if boundary.captureHealth.localizationStateEventCount == 0 {
+                            processingBlockers.append("localization_state_events_missing")
+                        }
+                    }
+                    let metadataFinalized = !isPriorMapScan || processingBlockers.isEmpty
+                    let processingEligibility = isPriorMapScan
+                        ? ScanProcessingEligibility(
+                            status: metadataFinalized ? "eligible" : "invalid",
+                            blockers: processingBlockers)
+                        : nil
+                    if !processingBlockers.isEmpty {
+                        processingEligibilityError =
+                            "Prior-map localization evidence is incomplete: "
+                            + processingBlockers.joined(separator: ", ")
+                    }
                     let metadata = ScanSegmentMetadata(
                         segmentIndex: 1,
                         scanMode: "continuous_streaming",
-                        finalized: true,
+                        finalized: metadataFinalized,
                         processingProfile: "iphone_continuous_pc_offline_software_error_v2_no_fiducials",
                         exportedAt: finalizedAt,
                         knownAreaM2: finalKnownAreaM2,
@@ -3724,8 +3784,9 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                         availableDiskBytes: availableBytesAtFinalization,
                         thermalState: thermalStateAtFinalization,
                         captureHealth: boundary.captureHealth,
+                        processingEligibility: processingEligibility,
                         structureCoverage: scanSession.structureCoverageSummary(),
-                        formatVersion: 1,
+                        formatVersion: 2,
                         workflowMode: scanSession.scanConfiguration.workflowMode.rawValue,
                         priorMapId: scanSession.scanConfiguration.priorMapId,
                         priorMapSha256: scanSession.scanConfiguration.priorMapSha256,
@@ -3762,7 +3823,11 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                 sidecarSeconds = Date().timeIntervalSince(sidecarStartedAt)
             }
         }, completion: {
-            guard saveSucceeded, sidecarError == nil, let snapshot = snapshot else {
+            guard saveSucceeded,
+                  sidecarError == nil,
+                  processingEligibilityError == nil,
+                  let snapshot = snapshot,
+                  snapshot.metadata.finalized == true else {
                 if didStartSecurityScope {
                     exportBaseDirectory?.stopAccessingSecurityScopedResource()
                 }
@@ -3770,8 +3835,19 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                 scanSession.appendScanEvent(
                     level: "error",
                     event: "scan_finalization_failed",
-                    message: sidecarError ?? "Streaming database save failed")
-                self.showToast(message: sidecarError.map { String(format: self.localized("Streaming database was saved, but metadata failed: %@"), $0) } ?? self.localized("Streaming database save failed."), seconds: 5)
+                    message: sidecarError
+                        ?? processingEligibilityError
+                        ?? "Streaming database save failed")
+                let failureMessage = sidecarError.map {
+                    String(
+                        format: self.localized("Streaming database was saved, but metadata failed: %@"),
+                        $0)
+                } ?? processingEligibilityError.map {
+                    String(
+                        format: self.localized("The database was saved, but required prior-map evidence is incomplete: %@"),
+                        $0)
+                } ?? self.localized("Streaming database save failed.")
+                self.showToast(message: failureMessage, seconds: 7)
                 self.setGLCamera(type: 0)
                 self.startCamera(resetTracking: false)
                 self.rtabmap?.setPausedMapping(paused: false)
