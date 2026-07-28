@@ -22,6 +22,7 @@ class ReleaseManifestTests(unittest.TestCase):
         self.assertIn("-DCMAKE_CXX_STANDARD=17", install_script)
         self.assertIn("-DGTSAM_CXX_STANDARD=17", install_script)
         self.assertIn("-DCMAKE_CXX_STANDARD_REQUIRED=ON", install_script)
+        self.assertIn('"-DCMAKE_CXX_FLAGS=-include TargetConditionals.h"', install_script)
 
     def test_manifest_hashes_artifacts_and_is_reproducible_for_fixed_inputs(self):
         with tempfile.TemporaryDirectory() as temporary:
