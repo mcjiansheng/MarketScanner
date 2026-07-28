@@ -5,6 +5,7 @@
 > 审查基线：`repair-v2-w2r-safety-closeout@cf1b62c949f3574e1804808537e38c8ff643549c`。
 > 代码基线：`ed85c38704461429e16321089d9e4e1b05d86753`；其后的提交只更新 W2R 文档和远端证据。
 > 当前 wave：`P0-production-baseline`；实施分支：`repair-v2-p0-production-baseline`。
+> P0 已验证头：`011ce479b74d10cb43106dda6ea757fb1ee2fa73`；本文件之后的证据提交不改变 P0 CI/测试树。
 
 ## 当前判定
 
@@ -33,7 +34,7 @@ P0 只冻结安全基线，不改变业务算法。CI 必须单独运行并报�
 
 | Wave | 目标 | P0 时点状态 |
 | --- | --- | --- |
-| P0 | 冻结 W2R 安全基线和 CI 不变量 | 本地验证通过；远端待验证 |
+| P0 | 冻结 W2R 安全基线和 CI 不变量 | 本地与远端验证通过 |
 | P1 | 完整相对 SE(2) 因子图与发布门 | 未开始；必须独立分支和原子提交 |
 | P2 | 干净、可复现的 PC/iOS 构建 | 未开始；不得复用未记录的本机缓存作为证据 |
 | P3 | Map Studio 持久任务和重启恢复 | 未开始；需覆盖崩溃与路径访问控制 |
@@ -61,6 +62,18 @@ P1 至 P4 可以在 P0 通过后组织，但每一 wave 必须使用独立分支
 
 P0 变更后的本地验证结果：生产安全快速契约 4 项、PriorMap 103 项、Map Studio 66 项、文档治理 3 项全部通过；workflow YAML、Python 编译、Web JavaScript、native symbol contract、Swift parse 和 `git diff --check` 通过；无签名 Release arm64 iOS app 完成编译与链接；既有 `build-pc-release` 的 `rtabmap-reprocess` 目标通过。第一笔原子提交为 `612ea6b`（CI、wave 基线与治理契约）。这些结果仍不替代干净环境构建、真机或现场证据。
 
+P0 已验证头的 GitHub Actions run [30355893697](https://github.com/mcjiansheng/MarketScanner/actions/runs/30355893697) 结论为 **success**：
+
+| Job | Job ID | 结果与边界 |
+| --- | --- | --- |
+| P0 production safety invariants | `90263893473` | 四项失败关闭契约通过 |
+| Windows imports and Python contracts | `90263893525` | Windows 导入、PriorMap 和 Map Studio 全套测试通过 |
+| Ubuntu Python, API and web contracts | `90263893540` | Python 编译、两套全量测试、Web syntax 和完整 P0 wave diff 通过 |
+| Native ABI source contracts | `90263893478` | 静态 native/Swift 接口契约通过，不替代 translation-unit 构建 |
+| macOS and iOS source contracts | `90263893712` | Swift parse、Swift 可执行 core、Xcode metadata 通过；hosted runner 缺少 Git 未保存的 native dependency bundle，因此条件式 app build 按合同跳过 |
+
+Actions 对 `actions/checkout@v4`、`actions/setup-python@v5` 和 `actions/upload-artifact@v4` 的 Node.js 20 runtime 弃用提示仍存在；这是待后续独立处理的 CI 维护项，不影响本 run 的断言结论。
+
 ## 兼容、数据和回滚约束
 
 - 自由扫描和 prior-map 扫描继续写连续单 SQLite 数据库；`scanMode=continuous_streaming` 的存储语义不变。
@@ -69,4 +82,4 @@ P0 变更后的本地验证结果：生产安全快速契约 4 项、PriorMap 10
 - `AGENTS.md`、`doc/.local/`、扫描数据库、构建目录、真实扫描数据和输出地图不得提交。
 - P0 仅添加 CI/文档保护，可按其原子提交整体回滚；不得只删除某一失败保护后仍声称安全基线有效。
 
-P0 的远端最终验证结果应在推送后追加到本文件；在远端 job 全部成功前，P0 只能标记为远端待验证。
+P0 已完成冻结、自动化验证和证据同步；它只允许开始组织后续独立 wave，不改变当前产品 **NO-GO** 判定。
