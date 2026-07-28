@@ -36,6 +36,20 @@ REQUIRED_DEVICE_SCENARIOS = {
     "thermal_serious",
     "checkpoint_cleanup",
 }
+DEVICE_SCENARIO_ASSERTIONS = {
+    "normal_long_scan": {"raw_database_retained", "continuous_database_observed"},
+    "weak_texture": {"weak_lost_audited", "no_hard_snap_during_weak_lost"},
+    "dynamic_occlusion": {"dynamic_interference_audited", "no_false_auto_confirm"},
+    "tag_scan": {"three_tag_scans_completed", "endpoint_tag_sent_to_review"},
+    "manual_correction": {"manual_correction_bound_to_node_time"},
+    "stop_finalization": {"no_writes_after_metadata_commit", "required_evidence_fail_closed"},
+    "provider_copy": {"local_copy_retained", "provider_copy_reread_completed"},
+    "kill_relaunch": {"kill_relaunch_state_audited", "raw_database_survived_kill"},
+    "provider_failure": {"provider_failure_visible", "local_copy_survived_provider_failure"},
+    "low_disk": {"low_disk_policy_visible", "low_disk_state_audited"},
+    "thermal_serious": {"thermal_serious_observed", "thermal_policy_visible"},
+    "checkpoint_cleanup": {"cleanup_exact_cas_confirmed", "cleanup_audit_persisted"},
+}
 REQUIRED_SIDECARS = {
     "localization_trace.jsonl",
     "localization_constraints.jsonl",
@@ -351,8 +365,19 @@ def collect_device(plan_path: Path, output_path: Path) -> dict[str, Any]:
             covers = []
         all_scenarios.update(covers)
         assertions = run.get("operatorAssertions")
-        if not isinstance(assertions, dict) or not assertions or any(value is not True for value in assertions.values()):
-            blockers.append("operator_assertion_missing_or_failed")
+        if not isinstance(assertions, dict):
+            assertions = {}
+        required_assertions = set().union(
+            *(DEVICE_SCENARIO_ASSERTIONS[scenario] for scenario in covers)
+        ) if covers else set()
+        failed_assertions = sorted(
+            key for key in required_assertions if assertions.get(key) is not True
+        )
+        if failed_assertions:
+            blockers.append(
+                "operator_assertion_missing_or_failed:"
+                + ",".join(failed_assertions)
+            )
         segment = Path(_required_string(run.get("segmentDirectory"), f"{label}_segment"))
         session_blockers, identity = _session_checks(
             segment, str(run.get("expectedSessionOutcome", "")))
@@ -500,6 +525,10 @@ def evaluate_field(plan_path: Path, output_path: Path) -> dict[str, Any]:
     shelf_digests: set[str] = set()
     source_session_digests: set[str] = set()
     seen_run_ids: set[str] = set()
+    _required_string(plan.get("groundTruthMethod"), "ground_truth_method")
+    _required_string(plan.get("independentSurveyor"), "independent_surveyor")
+    if plan.get("siteType") not in {"office", "supermarket"}:
+        raise QualificationError("site_type_invalid")
     for index, run in enumerate(runs):
         if not isinstance(run, dict):
             overall_blockers.append(f"run_{index + 1}:not_object")
@@ -511,9 +540,27 @@ def evaluate_field(plan_path: Path, output_path: Path) -> dict[str, Any]:
         blockers: list[str] = []
         if _finite_number(run.get("executedAtUnix"), "executed_at") <= frozen_at:
             blockers.append("run_not_after_threshold_freeze")
-        metrics = _load_json(Path(_required_string(run.get("trajectoryMetrics"), "trajectory_metrics")))
+        metrics_path = Path(_required_string(run.get("trajectoryMetrics"), "trajectory_metrics"))
+        tags_path = Path(_required_string(run.get("tagMeasurements"), "tag_measurements"))
+        device_evidence_path = Path(_required_string(run.get("deviceEvidence"), "device_evidence"))
+        metrics_sha, metrics_size = _sha256(metrics_path)
+        tags_sha, tags_size = _sha256(tags_path)
+        device_sha, device_size = _sha256(device_evidence_path)
+        metrics = _load_json(metrics_path)
+        device_evidence = _load_json(device_evidence_path)
         if not isinstance(metrics, dict):
             raise QualificationError("trajectory_metrics_not_object")
+        if not isinstance(device_evidence, dict):
+            raise QualificationError("device_evidence_not_object")
+        device_evidence_body = dict(device_evidence)
+        device_evidence_digest = device_evidence_body.pop("evidenceSha256", None)
+        if (
+            device_evidence.get("format") != FORMAT_DEVICE_EVIDENCE
+            or device_evidence.get("version") != 1
+            or device_evidence.get("result") != "PASS"
+            or _canonical_sha(device_evidence_body) != device_evidence_digest
+        ):
+            raise QualificationError("device_evidence_contract_invalid")
         for key, destination in (
             ("topologyDigest", topology_digests),
             ("shelfAssociationDigest", shelf_digests),
@@ -524,7 +571,9 @@ def evaluate_field(plan_path: Path, output_path: Path) -> dict[str, Any]:
                 blockers.append(f"required_digest_invalid:{key}")
             else:
                 destination.add(value)
-        measured = _read_tag_measurements(Path(_required_string(run.get("tagMeasurements"), "tag_measurements")))
+        if metrics.get("sourceSessionSha256") != device_sha:
+            blockers.append("device_evidence_sha_mismatch")
+        measured = _read_tag_measurements(tags_path)
         numeric_limits = {
             "nodeCoverage": (">=", "nodeCoverageMin"),
             "correctionP95M": ("<=", "correctionP95MaxM"),
@@ -555,6 +604,11 @@ def evaluate_field(plan_path: Path, output_path: Path) -> dict[str, Any]:
             "runId": run_id,
             "trajectoryMetrics": metrics,
             "independentTagMetrics": measured,
+            "inputFiles": [
+                {"role": "trajectory_metrics", "name": metrics_path.name, "bytes": metrics_size, "sha256": metrics_sha},
+                {"role": "tag_measurements", "name": tags_path.name, "bytes": tags_size, "sha256": tags_sha},
+                {"role": "device_evidence", "name": device_evidence_path.name, "bytes": device_size, "sha256": device_sha},
+            ],
             "blockers": blockers,
             "result": "PASS" if not blockers else "FAIL",
         })
@@ -572,6 +626,9 @@ def evaluate_field(plan_path: Path, output_path: Path) -> dict[str, Any]:
         "releaseManifest": {"name": release_manifest.name, "bytes": release_size, "sha256": release_sha},
         "thresholdsFrozenAtUnix": frozen_at,
         "thresholds": thresholds,
+        "siteType": plan["siteType"],
+        "groundTruthMethod": plan["groundTruthMethod"],
+        "independentSurveyor": plan["independentSurveyor"],
         "runs": output_runs,
         "blockers": overall_blockers,
         "result": "PASS" if not overall_blockers else "FAIL",

@@ -9,6 +9,7 @@ import tempfile
 import unittest
 
 from tools.Qualification.qualification import (
+    DEVICE_SCENARIO_ASSERTIONS,
     REQUIRED_DEVICE_SCENARIOS,
     QualificationError,
     _canonical_sha,
@@ -116,8 +117,8 @@ class QualificationTests(unittest.TestCase):
                 "executedAtUnix": 2_000_000_000,
                 "covers": sorted(REQUIRED_DEVICE_SCENARIOS),
                 "operatorAssertions": {
-                    "ui_states_auditable": True,
-                    "raw_database_retained": True,
+                    assertion: True
+                    for assertion in set().union(*DEVICE_SCENARIO_ASSERTIONS.values())
                 },
                 "segmentDirectory": str(segment),
                 "expectedSessionOutcome": "finalized_eligible",
@@ -183,6 +184,20 @@ class QualificationTests(unittest.TestCase):
                 evidence["blockers"],
             )
 
+    def test_device_evidence_requires_scenario_specific_assertions(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            plan = self.make_device_fixture(root)
+            value = json.loads(plan.read_text(encoding="utf-8"))
+            del value["runs"][0]["operatorAssertions"]["no_hard_snap_during_weak_lost"]
+            write_json(plan, value)
+            evidence = collect_device(plan, root / "evidence.json")
+            self.assertEqual(evidence["result"], "FAIL")
+            self.assertTrue(any(
+                "no_hard_snap_during_weak_lost" in blocker
+                for blocker in evidence["blockers"]
+            ))
+
     def test_field_evidence_requires_three_repeatable_runs(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -192,6 +207,18 @@ class QualificationTests(unittest.TestCase):
             shelf = "c" * 64
             runs = []
             for index in range(3):
+                device_evidence = root / f"device-evidence-{index}.json"
+                device_evidence_value = {
+                    "format": "MarketScannerDeviceQualificationEvidence",
+                    "version": 1,
+                    "run": index,
+                    "result": "PASS",
+                }
+                device_evidence_value["evidenceSha256"] = _canonical_sha(
+                    device_evidence_value
+                )
+                write_json(device_evidence, device_evidence_value)
+                device_evidence_sha = sha256(device_evidence)
                 metrics = root / f"metrics-{index}.json"
                 write_json(metrics, {
                     "nodeCoverage": 0.99,
@@ -208,7 +235,7 @@ class QualificationTests(unittest.TestCase):
                     "automaticConfirmDuringWeakLost": 0,
                     "topologyDigest": topology,
                     "shelfAssociationDigest": shelf,
-                    "sourceSessionSha256": f"{index + 1:064x}",
+                    "sourceSessionSha256": device_evidence_sha,
                 })
                 measurements = root / f"tags-{index}.csv"
                 with measurements.open("w", newline="", encoding="utf-8") as stream:
@@ -224,6 +251,7 @@ class QualificationTests(unittest.TestCase):
                     "executedAtUnix": 200,
                     "trajectoryMetrics": str(metrics),
                     "tagMeasurements": str(measurements),
+                    "deviceEvidence": str(device_evidence),
                 })
             plan = root / "field-plan.json"
             write_json(plan, {
@@ -233,6 +261,9 @@ class QualificationTests(unittest.TestCase):
                 "thresholdsFrozenAtUnix": 100,
                 "releaseManifest": str(release),
                 "releaseManifestSha256": sha256(release),
+                "siteType": "supermarket",
+                "groundTruthMethod": "independent total station controls",
+                "independentSurveyor": "test surveyor",
                 "thresholds": {
                     "nodeCoverageMin": 0.98,
                     "correctionP95MaxM": 1.0,
