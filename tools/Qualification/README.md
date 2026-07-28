@@ -20,4 +20,4 @@ python3 tools/Qualification/qualification.py field \
   --output /path/to/new/field_acceptance.json
 ```
 
-输出使用排他创建：同一路径已存在时拒绝覆盖。PASS 仍不替代独立审查；原始 session、失败 run、控制点和所有输出必须连同 evidence 一起保留。
+输出使用排他创建：同一路径已存在时拒绝覆盖。文件内容在发布前刷新到存储；POSIX 平台随后刷新父目录，Windows 因不支持目录句柄 `fsync` 而保留系统可提供的文件刷新与排他硬链接发布语义。PASS 仍不替代独立审查；原始 session、失败 run、控制点和所有输出必须连同 evidence 一起保留。

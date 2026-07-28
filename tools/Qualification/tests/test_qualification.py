@@ -7,6 +7,9 @@ from pathlib import Path
 import shutil
 import tempfile
 import unittest
+from unittest import mock
+
+import tools.Qualification.qualification as qualification
 
 from tools.Qualification.qualification import (
     DEVICE_SCENARIO_ASSERTIONS,
@@ -28,6 +31,23 @@ def sha256(path: Path) -> str:
 
 
 class QualificationTests(unittest.TestCase):
+    def test_windows_evidence_write_skips_unsupported_directory_fsync(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "evidence.json"
+            with (
+                mock.patch.object(qualification.os, "name", "nt"),
+                mock.patch.object(
+                    qualification.os,
+                    "open",
+                    side_effect=AssertionError("Windows must not open a directory"),
+                ),
+            ):
+                qualification._write_json(output, {"result": "PASS"})
+            self.assertEqual(
+                json.loads(output.read_text(encoding="utf-8")),
+                {"result": "PASS"},
+            )
+
     def make_device_fixture(self, root: Path) -> Path:
         prior = root / "prior-map.zip"
         prior.write_bytes(b"prior-map")

@@ -652,6 +652,12 @@ def _write_json(path: Path, value: Any) -> None:
         raise QualificationError("evidence_output_already_exists") from exc
     finally:
         temporary.unlink(missing_ok=True)
+    # Windows does not support opening a directory through os.open(), so there
+    # is no portable directory fsync equivalent. The evidence bytes themselves
+    # have already been flushed above and os.link() still provides exclusive,
+    # no-overwrite publication on that platform.
+    if os.name == "nt":
+        return
     directory_descriptor = os.open(path.parent, os.O_RDONLY)
     try:
         os.fsync(directory_descriptor)
