@@ -137,8 +137,11 @@ class IOSLocalizationSidecarHealthContractTests(unittest.TestCase):
         for token in (
             "enum SafeSessionPath",
             "O_NOFOLLOW",
+            "openat",
             "fstat",
+            "unlinkat",
             "file_changed_before_delete",
+            "directory_identity_changed_during_open",
             "isStrictlyContained",
         ):
             self.assertIn(token, finalization)

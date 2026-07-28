@@ -892,6 +892,7 @@ def _append_finalization_cleanup_audit(
     no_follow = getattr(os, "O_NOFOLLOW", 0)
     binary = getattr(os, "O_BINARY", 0)
     try:
+        event_stat = None
         if events_path.exists() or events_path.is_symlink():
             event_stat = os.lstat(events_path)
             if _is_link_or_reparse(events_path, event_stat):
@@ -904,8 +905,16 @@ def _append_finalization_cleanup_audit(
             0o600,
         )
         try:
-            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            opened_stat = os.fstat(descriptor)
+            if not stat.S_ISREG(opened_stat.st_mode):
                 raise OSError("cleanup audit target is not a regular file")
+            if event_stat is not None and (
+                event_stat.st_dev,
+                event_stat.st_ino,
+            ) != (opened_stat.st_dev, opened_stat.st_ino):
+                raise CheckpointCleanupConflict(
+                    "Cleanup audit target changed while opening."
+                )
             written = 0
             while written < len(payload):
                 count = os.write(descriptor, payload[written:])
@@ -1071,7 +1080,27 @@ def cleanup_finalized_checkpoint(
                 raise CheckpointCleanupConflict(
                     "Checkpoint changed during validation; cleanup was cancelled."
                 )
-            os.unlink(checkpoint_path)
+            if os.name == "nt":
+                os.unlink(checkpoint_path)
+            else:
+                directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+                directory_flags |= getattr(os, "O_NOFOLLOW", 0)
+                segment_descriptor = os.open(segment, directory_flags)
+                try:
+                    opened_segment = os.fstat(segment_descriptor)
+                    expected_segment = os.lstat(segment)
+                    if (
+                        not stat.S_ISDIR(opened_segment.st_mode)
+                        or _is_link_or_reparse(segment, expected_segment)
+                        or (opened_segment.st_dev, opened_segment.st_ino)
+                        != (expected_segment.st_dev, expected_segment.st_ino)
+                    ):
+                        raise CheckpointCleanupConflict(
+                            "Cleanup segment changed before checkpoint deletion."
+                        )
+                    os.unlink(checkpoint_path.name, dir_fd=segment_descriptor)
+                finally:
+                    os.close(segment_descriptor)
         except FileNotFoundError as exc:
             failure = CheckpointCleanupConflict(
                 "Checkpoint changed during cleanup; operation cancelled."

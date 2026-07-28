@@ -268,18 +268,37 @@ enum SafeSessionPath {
     }
 
     static func validateDirectory(_ directory: URL, within root: URL) throws {
+        let descriptor = try openValidatedDirectory(directory, within: root)
+        Darwin.close(descriptor)
+    }
+
+    private static func openValidatedDirectory(
+        _ directory: URL,
+        within root: URL
+    ) throws -> Int32 {
         guard isStrictlyContained(directory, in: root) else {
             throw error("directory_outside_session")
         }
         var linkInfo = stat()
-        var targetInfo = stat()
         guard lstat(directory.path, &linkInfo) == 0,
-              (linkInfo.st_mode & S_IFMT) == S_IFDIR,
-              stat(directory.path, &targetInfo) == 0,
-              linkInfo.st_dev == targetInfo.st_dev,
-              linkInfo.st_ino == targetInfo.st_ino else {
+              (linkInfo.st_mode & S_IFMT) == S_IFDIR else {
             throw error("directory_missing_linked_or_replaced")
         }
+        let descriptor = Darwin.open(
+            directory.path,
+            O_RDONLY | O_DIRECTORY | O_NOFOLLOW)
+        guard descriptor >= 0 else {
+            throw error("directory_open_no_follow_failed")
+        }
+        var openedInfo = stat()
+        guard fstat(descriptor, &openedInfo) == 0,
+              (openedInfo.st_mode & S_IFMT) == S_IFDIR,
+              openedInfo.st_dev == linkInfo.st_dev,
+              openedInfo.st_ino == linkInfo.st_ino else {
+            Darwin.close(descriptor)
+            throw error("directory_identity_changed_during_open")
+        }
+        return descriptor
     }
 
     static func readRegularFile(
@@ -289,12 +308,23 @@ enum SafeSessionPath {
         guard isStrictlyContained(url, in: root) else {
             throw error("file_outside_session")
         }
+        let parentDescriptor = try openValidatedDirectory(
+            url.deletingLastPathComponent(),
+            within: root)
+        defer { Darwin.close(parentDescriptor) }
         var linkInfo = stat()
-        guard lstat(url.path, &linkInfo) == 0,
+        guard fstatat(
+            parentDescriptor,
+            url.lastPathComponent,
+            &linkInfo,
+            AT_SYMLINK_NOFOLLOW) == 0,
               (linkInfo.st_mode & S_IFMT) == S_IFREG else {
             throw error("file_missing_linked_or_not_regular")
         }
-        let descriptor = Darwin.open(url.path, O_RDONLY | O_NOFOLLOW)
+        let descriptor = Darwin.openat(
+            parentDescriptor,
+            url.lastPathComponent,
+            O_RDONLY | O_NOFOLLOW)
         guard descriptor >= 0 else {
             throw error("file_open_no_follow_failed")
         }
@@ -331,12 +361,13 @@ enum SafeSessionPath {
         to url: URL,
         within root: URL
     ) throws {
-        try validateDirectory(url.deletingLastPathComponent(), within: root)
-        if FileManager.default.fileExists(atPath: url.path) {
-            _ = try readRegularFile(url, within: root)
-        }
-        let descriptor = Darwin.open(
-            url.path,
+        let parentDescriptor = try openValidatedDirectory(
+            url.deletingLastPathComponent(),
+            within: root)
+        defer { Darwin.close(parentDescriptor) }
+        let descriptor = Darwin.openat(
+            parentDescriptor,
+            url.lastPathComponent,
             O_APPEND | O_CREAT | O_WRONLY | O_NOFOLLOW,
             S_IRUSR | S_IWUSR)
         guard descriptor >= 0 else {
@@ -347,7 +378,8 @@ enum SafeSessionPath {
             closeOnDealloc: true)
         var openedInfo = stat()
         guard fstat(descriptor, &openedInfo) == 0,
-              (openedInfo.st_mode & S_IFMT) == S_IFREG else {
+              (openedInfo.st_mode & S_IFMT) == S_IFREG,
+              openedInfo.st_nlink == 1 else {
             try? handle.close()
             throw error("audit_target_not_regular")
         }
@@ -367,11 +399,44 @@ enum SafeSessionPath {
         within root: URL,
         expected: SafeRegularFileSnapshot
     ) throws {
-        let current = try readRegularFile(url, within: root)
+        let parent = url.deletingLastPathComponent()
+        let parentDescriptor = try openValidatedDirectory(parent, within: root)
+        defer { Darwin.close(parentDescriptor) }
+        let descriptor = Darwin.openat(
+            parentDescriptor,
+            url.lastPathComponent,
+            O_RDONLY | O_NOFOLLOW)
+        guard descriptor >= 0 else {
+            throw error("file_open_no_follow_failed")
+        }
+        let handle = FileHandle(
+            fileDescriptor: descriptor,
+            closeOnDealloc: true)
+        var openedInfo = stat()
+        guard fstat(descriptor, &openedInfo) == 0,
+              (openedInfo.st_mode & S_IFMT) == S_IFREG else {
+            try? handle.close()
+            throw error("delete_target_not_regular")
+        }
+        let data: Data
+        do {
+            data = try handle.readToEnd() ?? Data()
+            try handle.close()
+        }
+        catch {
+            try? handle.close()
+            throw Self.error("delete_target_read_failed")
+        }
+        let current = SafeRegularFileSnapshot(
+            data: data,
+            device: UInt64(openedInfo.st_dev),
+            inode: UInt64(openedInfo.st_ino),
+            byteCount: Int64(openedInfo.st_size),
+            sha256: sha256(data))
         guard current == expected else {
             throw error("file_changed_before_delete")
         }
-        guard Darwin.unlink(url.path) == 0 else {
+        guard Darwin.unlinkat(parentDescriptor, url.lastPathComponent, 0) == 0 else {
             throw error("file_delete_failed")
         }
     }
