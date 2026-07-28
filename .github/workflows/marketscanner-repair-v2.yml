@@ -16,6 +16,7 @@ on:
       - "app/ios/RTABMapApp/**"
       - "docs/map-assisted-localization/**"
       - "tools/PriorMap/**"
+      - "tools/Qualification/**"
       - "tools/Reprocess/CMakeLists.txt"
       - "tools/Reprocess/main.cpp"
       - "tools/Reprocess/prior_map_factor_graph.cpp"
@@ -84,9 +85,11 @@ jobs:
             echo "- Checks: Python compile, PriorMap tests, Map Studio tests, JavaScript syntax, complete branch diff"
           } > ci-artifacts/ubuntu-summary.md
       - name: Compile Python sources
-        run: python3 -m py_compile tools/PriorMap/*.py tools/SupermarketMapStudio/*.py
+        run: python3 -m py_compile tools/PriorMap/*.py tools/Qualification/*.py tools/SupermarketMapStudio/*.py
       - name: Run PriorMap tests
         run: python3 -m unittest discover -s tools/PriorMap/tests -v
+      - name: Run qualification evidence tests
+        run: python3 -m unittest discover -s tools/Qualification/tests -v
       - name: Run Map Studio tests
         run: python3 -m unittest discover -s tools/SupermarketMapStudio/tests -v
       - name: Check browser JavaScript
@@ -159,6 +162,8 @@ jobs:
           python -c "import tools.SupermarketMapStudio.server"
       - name: Run PriorMap tests on Windows
         run: python -m unittest discover -s tools/PriorMap/tests -v
+      - name: Run qualification evidence tests on Windows
+        run: python -m unittest discover -s tools/Qualification/tests -v
       - name: Run Map Studio tests on Windows
         run: python -m unittest discover -s tools/SupermarketMapStudio/tests -v
       - name: Finalize Windows test summary

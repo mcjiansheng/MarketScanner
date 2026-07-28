@@ -1,6 +1,6 @@
 # 正式现场测试计划
 
-> 文档状态：**阶段三正式验收预案，尚未执行**。最后核对日期：2026-07-27。
+> 文档状态：**当前有效的正式验收预案，尚未执行**。最后核对日期：2026-07-28。
 
 阶段一/二整改、阶段三自动测试和独立复审通过前，不安排正式超市场景，避免用现场时间替代可重复测试。本仓库没有可用的真实超市、真值控制点或 LiDAR iPhone，本次开发不生成虚构现场结果。
 
@@ -28,3 +28,11 @@
 验收至少布置 20 个有人工真值的标签，覆盖重复货架、长直通道、转弯、一次 tracking 中断和一次人工重定位。最终报告必须列出定位/标签误差分布、失败样本、数据库与结果 hash；通过标准由现场负责人和独立审查者在执行前冻结。
 
 阶段一禁止用“办公室预览看起来正确”替代现场绝对精度结论。
+
+## 不可变证据与执行工具
+
+真实设备按 [`DEVICE_QUALIFICATION_CHECKLIST.md`](DEVICE_QUALIFICATION_CHECKLIST.md) 执行，并使用 [`tools/Qualification/qualification.py`](../../tools/Qualification/qualification.py) 收集。设备矩阵必须完整覆盖正常长扫、弱纹理、动态遮挡、扫码、人工纠偏、stop/finalization、provider copy、kill/relaunch、provider failure、low disk、thermal serious 和 checkpoint cleanup；缺一项即 FAIL。工具自动绑定 App Git SHA/build ID、native 静态库 hash、prior-map ID/SHA、session identity、全部 session 文件 hash、复制 package identity 和人工日志 hash。
+
+办公室与真实卖场的阈值必须在 run 的执行时间之前冻结并绑定 release manifest SHA。每个场地至少 3 次独立扫描，每次至少 20 个独立真值标签；工具计算平面/高度误差，并要求 node inventory、full factor graph、弱/丢失期间自动确认、拓扑和货架关联重复性全部通过。输出文件不得覆盖，失败 scan 也必须保留。
+
+本次代码工作只完成执行器和自动验证合同；仓库仍没有真实 LiDAR iPhone、办公室/卖场测量或人工签名，所以 P5/P6 状态保持 **NOT EXECUTED / NO-GO**。

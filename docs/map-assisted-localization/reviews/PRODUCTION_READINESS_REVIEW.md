@@ -4,7 +4,7 @@
 > 外部审查输入：`MarketScanner_RepairV2_W2R_Production_Readiness_Code_Review_and_Final_Product_Agent_Spec_2026-07-28.md`。
 > 审查基线：`repair-v2-w2r-safety-closeout@cf1b62c949f3574e1804808537e38c8ff643549c`。
 > 代码基线：`ed85c38704461429e16321089d9e4e1b05d86753`；其后的提交只更新 W2R 文档和远端证据。
-> 当前 wave：`P4-ios-streaming-validator`；实施分支：`repair-v2-p4-ios-streaming-validator`。
+> 当前 wave：`P5-P6-device-field-qualification-infrastructure`；实施分支：`repair-v2-p5-device-field-qualification`。
 > P0 已验证头：`011ce479b74d10cb43106dda6ea757fb1ee2fa73`；本文件之后的证据提交不改变 P0 CI/测试树。
 
 ## 当前判定
@@ -39,8 +39,8 @@ P0 只冻结安全基线，不改变业务算法。CI 必须单独运行并报�
 | P2 | 干净、可复现的 PC/iOS 构建 | 已实现本机 macOS clean build、presets、manifest 和 fail-closed hosted CI 合同；远端/Windows 结果继续核验 |
 | P3 | Map Studio 持久任务和重启恢复 | 已实现并通过工作台测试目录 76 项回归；服务重启不猜测续跑，不按不可信 journal 路径清理 |
 | P4 | iOS finalization、保留和 provider hardening | 代码与主机压力测试已完成：100k×3 streaming、15,040,512-byte peak RSS、descriptor identity、copy v2 隐私和未执行 durability hook；真机 smoke 未执行，不声称 power-loss durability |
-| P5 | 真实设备矩阵 | 未执行 |
-| P6 | 正式现场验收 | 未执行 |
+| P5 | 真实设备矩阵 | evidence collector 与完整场景门已实现；真实 LiDAR iPhone 未执行，因此仍为 NO-GO |
+| P6 | 正式现场验收 | 已实现 release/阈值预冻结、3-run、20 控制点和重复性验证；办公室/卖场未执行，因此仍为 NO-GO |
 | P7 | 安装包、升级/卸载和 selfcheck | 未开始 |
 | P8 | 独立代码、证据和发布复核 | 未执行 |
 

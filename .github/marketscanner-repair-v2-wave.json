@@ -1,6 +1,6 @@
 {
-  "wave": "P4-ios-streaming-validator",
-  "branch": "repair-v2-p4-ios-streaming-validator",
-  "base_branch": "repair-v2-p3-persistent-mapstudio-jobs",
-  "base_sha": "c9b048cb697ba13c36eb79a1c70d3378d30dca55"
+  "wave": "P5-P6-device-field-qualification-infrastructure",
+  "branch": "repair-v2-p5-device-field-qualification",
+  "base_branch": "repair-v2-p4-ios-streaming-validator",
+  "base_sha": "06fa8839b11c9e8fb9ba9ecbf503e827169e7328"
 }
