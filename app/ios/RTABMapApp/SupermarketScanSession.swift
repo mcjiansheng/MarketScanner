@@ -694,11 +694,7 @@ final class SupermarketScanSession {
         }
         return sessions.compactMap { sessionDirectory -> URL? in
             guard sessionDirectory.lastPathComponent.hasPrefix(
-                "SupermarketSession-"),
-                  (try? sessionDirectory.resourceValues(
-                    forKeys: [.isDirectoryKey, .isSymbolicLinkKey]))
-                    .map({ $0.isDirectory == true && $0.isSymbolicLink != true })
-                    == true else {
+                "SupermarketSession-") else {
                 return nil
             }
             let segment = sessionDirectory.appendingPathComponent(
@@ -707,17 +703,32 @@ final class SupermarketScanSession {
             let metadata = segment.appendingPathComponent("metadata.json")
             let checkpoint = segment.appendingPathComponent(
                 "live_checkpoint.json")
-            guard (try? segment.resourceValues(
-                    forKeys: [.isDirectoryKey, .isSymbolicLinkKey]))
-                    .map({ $0.isDirectory == true && $0.isSymbolicLink != true })
-                    == true,
-                  sidecarWriter.fileExists(at: metadata),
-                  sidecarWriter.fileExists(at: checkpoint),
-                  let metadataData = try? Data(contentsOf: metadata),
-                  let checkpointData = try? Data(contentsOf: checkpoint),
+            let events = segment.appendingPathComponent("scan_events.jsonl")
+            guard (try? SafeSessionPath.validateDirectory(
+                    sessionDirectory,
+                    within: documentsDirectory)) != nil,
+                  (try? SafeSessionPath.validateDirectory(
+                    segment,
+                    within: sessionDirectory)) != nil,
+                  let segmentEntries = try? fileManager.contentsOfDirectory(
+                    at: sessionDirectory,
+                    includingPropertiesForKeys: nil),
+                  segmentEntries.filter({
+                    $0.lastPathComponent.hasPrefix("segment_")
+                  }).map(\.lastPathComponent).sorted() == ["segment_0001"],
+                  let metadataSnapshot = try? SafeSessionPath.readRegularFile(
+                    metadata,
+                    within: sessionDirectory),
+                  let checkpointSnapshot = try? SafeSessionPath.readRegularFile(
+                    checkpoint,
+                    within: sessionDirectory),
+                  (!fileManager.fileExists(atPath: events.path)
+                    || (try? SafeSessionPath.readRegularFile(
+                        events,
+                        within: sessionDirectory)) != nil),
                   (try? FinalizedCheckpointCleanupValidator.validate(
-                    metadataData: metadataData,
-                    checkpointData: checkpointData)) != nil else {
+                    metadataData: metadataSnapshot.data,
+                    checkpointData: checkpointSnapshot.data)) != nil else {
                 return nil
             }
             return segment
@@ -725,25 +736,44 @@ final class SupermarketScanSession {
     }
 
     func cleanupFinalizedCheckpoint(in segmentDirectory: URL) throws {
-        let resolvedDocuments = documentsDirectory.resolvingSymlinksInPath().path
-        let resolvedSegment = segmentDirectory.resolvingSymlinksInPath().path
-        let segmentValues = try segmentDirectory.resourceValues(
-            forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
-        guard resolvedSegment.hasPrefix(resolvedDocuments + "/"),
-              segmentDirectory.lastPathComponent == "segment_0001",
-              segmentValues.isDirectory == true,
-              segmentValues.isSymbolicLink != true else {
+        let sessionDirectory = segmentDirectory.deletingLastPathComponent()
+        guard segmentDirectory.lastPathComponent == "segment_0001" else {
             throw NSError(
                 domain: "SupermarketScanSession",
                 code: 30,
                 userInfo: [NSLocalizedDescriptionKey:
                     "Refused checkpoint cleanup outside a local scan segment."])
         }
+        try SafeSessionPath.validateDirectory(
+            sessionDirectory,
+            within: documentsDirectory)
+        try SafeSessionPath.validateDirectory(
+            segmentDirectory,
+            within: sessionDirectory)
+        let segmentNames = try fileManager.contentsOfDirectory(
+            at: sessionDirectory,
+            includingPropertiesForKeys: nil)
+            .filter { $0.lastPathComponent.hasPrefix("segment_") }
+            .map(\.lastPathComponent)
+            .sorted()
+        guard segmentNames == ["segment_0001"] else {
+            throw NSError(
+                domain: "SupermarketScanSession",
+                code: 31,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "Checkpoint cleanup requires exactly one segment_0001."])
+        }
         let metadataURL = segmentDirectory.appendingPathComponent("metadata.json")
         let checkpointURL = segmentDirectory.appendingPathComponent(
             "live_checkpoint.json")
-        let metadataData = try Data(contentsOf: metadataURL)
-        let checkpointData = try Data(contentsOf: checkpointURL)
+        let metadataSnapshot = try SafeSessionPath.readRegularFile(
+            metadataURL,
+            within: sessionDirectory)
+        let checkpointSnapshot = try SafeSessionPath.readRegularFile(
+            checkpointURL,
+            within: sessionDirectory)
+        let metadataData = metadataSnapshot.data
+        let checkpointData = checkpointSnapshot.data
         try FinalizedCheckpointCleanupValidator.validate(
             metadataData: metadataData,
             checkpointData: checkpointData)
@@ -758,16 +788,41 @@ final class SupermarketScanSession {
             trackingSessionId: trackingSessionId,
             event: "finalization_checkpoint_cleanup_authorized",
             message: "User authorized cleanup of an older checkpoint after finalized metadata commit")
-        // Re-read after the pre-delete audit append so a concurrently changed
-        // checkpoint can never be removed under stale validation evidence.
-        let currentCheckpointData = try Data(contentsOf: checkpointURL)
-        guard currentCheckpointData == checkpointData else {
-            throw FinalizedCheckpointCleanupValidationError.checkpointNewerThanCommit
+        do {
+            // Re-read after the pre-delete audit append so a concurrently
+            // changed file can never be removed under stale evidence.
+            let currentMetadata = try SafeSessionPath.readRegularFile(
+                metadataURL,
+                within: sessionDirectory)
+            let currentCheckpoint = try SafeSessionPath.readRegularFile(
+                checkpointURL,
+                within: sessionDirectory)
+            guard currentMetadata == metadataSnapshot,
+                  currentCheckpoint == checkpointSnapshot else {
+                throw FinalizedCheckpointCleanupValidationError
+                    .checkpointNewerThanCommit
+            }
+            try FinalizedCheckpointCleanupValidator.validate(
+                metadataData: currentMetadata.data,
+                checkpointData: currentCheckpoint.data)
+            try SafeSessionPath.removeRegularFile(
+                checkpointURL,
+                within: sessionDirectory,
+                expected: currentCheckpoint)
         }
-        try FinalizedCheckpointCleanupValidator.validate(
-            metadataData: metadataData,
-            checkpointData: currentCheckpointData)
-        try sidecarWriter.removeItem(at: checkpointURL)
+        catch {
+            do {
+                try appendRecoveryAuditEvent(
+                    to: segmentDirectory,
+                    trackingSessionId: trackingSessionId,
+                    event: "finalization_checkpoint_cleanup_failed",
+                    message: "Finalized checkpoint cleanup failed: \(error.localizedDescription)")
+            }
+            catch {
+                print("Finalized checkpoint cleanup failure audit degraded: \(error)")
+            }
+            throw error
+        }
         do {
             try appendRecoveryAuditEvent(
                 to: segmentDirectory,
@@ -806,9 +861,10 @@ final class SupermarketScanSession {
         encoder.outputFormatting = [.sortedKeys]
         var data = try encoder.encode(record)
         data.append(0x0A)
-        try sidecarWriter.append(
+        try SafeSessionPath.append(
             data,
-            to: segmentDirectory.appendingPathComponent("scan_events.jsonl"))
+            to: segmentDirectory.appendingPathComponent("scan_events.jsonl"),
+            within: segmentDirectory.deletingLastPathComponent())
     }
 
     func updateArea(timestamp: TimeInterval, nodeCount: Int, x: Float, y: Float, z: Float, roll: Float, pitch: Float, yaw: Float) -> Double {

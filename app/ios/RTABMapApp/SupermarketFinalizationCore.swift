@@ -9,6 +9,7 @@
 
 import Foundation
 import CryptoKit
+import Darwin
 
 struct CaptureFileDigest: Equatable {
     let relativePath: String
@@ -231,6 +232,150 @@ enum LocalizationEvidenceBundleValidator {
                 options: .regularExpression)
             .trimmingCharacters(in: CharacterSet(charactersIn: "_"))
         return value.isEmpty ? "invalid" : value
+    }
+}
+
+struct SafeRegularFileSnapshot: Equatable {
+    let data: Data
+    let device: UInt64
+    let inode: UInt64
+    let byteCount: Int64
+    let sha256: String
+}
+
+enum SafeSessionPath {
+    static func isStrictlyContained(_ candidate: URL, in root: URL) -> Bool {
+        let rootComponents = root.standardizedFileURL
+            .resolvingSymlinksInPath().pathComponents
+        let candidateComponents = candidate.standardizedFileURL
+            .resolvingSymlinksInPath().pathComponents
+        guard candidateComponents.count > rootComponents.count else {
+            return false
+        }
+        return Array(candidateComponents.prefix(rootComponents.count))
+            == rootComponents
+    }
+
+    static func validateDirectory(_ directory: URL, within root: URL) throws {
+        guard isStrictlyContained(directory, in: root) else {
+            throw error("directory_outside_session")
+        }
+        var linkInfo = stat()
+        var targetInfo = stat()
+        guard lstat(directory.path, &linkInfo) == 0,
+              (linkInfo.st_mode & S_IFMT) == S_IFDIR,
+              stat(directory.path, &targetInfo) == 0,
+              linkInfo.st_dev == targetInfo.st_dev,
+              linkInfo.st_ino == targetInfo.st_ino else {
+            throw error("directory_missing_linked_or_replaced")
+        }
+    }
+
+    static func readRegularFile(
+        _ url: URL,
+        within root: URL
+    ) throws -> SafeRegularFileSnapshot {
+        guard isStrictlyContained(url, in: root) else {
+            throw error("file_outside_session")
+        }
+        var linkInfo = stat()
+        guard lstat(url.path, &linkInfo) == 0,
+              (linkInfo.st_mode & S_IFMT) == S_IFREG else {
+            throw error("file_missing_linked_or_not_regular")
+        }
+        let descriptor = Darwin.open(url.path, O_RDONLY | O_NOFOLLOW)
+        guard descriptor >= 0 else {
+            throw error("file_open_no_follow_failed")
+        }
+        let handle = FileHandle(
+            fileDescriptor: descriptor,
+            closeOnDealloc: true)
+        var openedInfo = stat()
+        guard fstat(descriptor, &openedInfo) == 0,
+              (openedInfo.st_mode & S_IFMT) == S_IFREG,
+              openedInfo.st_dev == linkInfo.st_dev,
+              openedInfo.st_ino == linkInfo.st_ino else {
+            try? handle.close()
+            throw error("file_identity_changed_during_open")
+        }
+        let data: Data
+        do {
+            data = try handle.readToEnd() ?? Data()
+            try handle.close()
+        }
+        catch {
+            try? handle.close()
+            throw Self.error("file_read_failed")
+        }
+        return SafeRegularFileSnapshot(
+            data: data,
+            device: UInt64(openedInfo.st_dev),
+            inode: UInt64(openedInfo.st_ino),
+            byteCount: Int64(openedInfo.st_size),
+            sha256: sha256(data))
+    }
+
+    static func append(
+        _ data: Data,
+        to url: URL,
+        within root: URL
+    ) throws {
+        try validateDirectory(url.deletingLastPathComponent(), within: root)
+        if FileManager.default.fileExists(atPath: url.path) {
+            _ = try readRegularFile(url, within: root)
+        }
+        let descriptor = Darwin.open(
+            url.path,
+            O_APPEND | O_CREAT | O_WRONLY | O_NOFOLLOW,
+            S_IRUSR | S_IWUSR)
+        guard descriptor >= 0 else {
+            throw error("audit_open_no_follow_failed")
+        }
+        let handle = FileHandle(
+            fileDescriptor: descriptor,
+            closeOnDealloc: true)
+        var openedInfo = stat()
+        guard fstat(descriptor, &openedInfo) == 0,
+              (openedInfo.st_mode & S_IFMT) == S_IFREG else {
+            try? handle.close()
+            throw error("audit_target_not_regular")
+        }
+        do {
+            try handle.write(contentsOf: data)
+            try handle.synchronize()
+            try handle.close()
+        }
+        catch {
+            try? handle.close()
+            throw Self.error("audit_write_failed")
+        }
+    }
+
+    static func removeRegularFile(
+        _ url: URL,
+        within root: URL,
+        expected: SafeRegularFileSnapshot
+    ) throws {
+        let current = try readRegularFile(url, within: root)
+        guard current == expected else {
+            throw error("file_changed_before_delete")
+        }
+        guard Darwin.unlink(url.path) == 0 else {
+            throw error("file_delete_failed")
+        }
+    }
+
+    private static func sha256(_ data: Data) -> String {
+        return SHA256.hash(data: data)
+            .map { String(format: "%02x", $0) }
+            .joined()
+    }
+
+    private static func error(_ reason: String) -> NSError {
+        return NSError(
+            domain: "SafeSessionPath",
+            code: 1,
+            userInfo: [NSLocalizedDescriptionKey: reason])
     }
 }
 

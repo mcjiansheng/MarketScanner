@@ -21,6 +21,7 @@ let sessionRestoreTimer = null;
 let sessionSelectionToken = 0;
 let currentSingleScanMode = null;
 let currentSingleOfflineSupported = null;
+let currentCheckpointCleanupEvidence = null;
 const localizedReview = {
   data: null,
   selectedTagId: null,
@@ -208,6 +209,8 @@ async function selectSingleSession(session) {
   output.dataset.restored = "false";
   currentSingleScanMode = null;
   currentSingleOfflineSupported = null;
+  currentCheckpointCleanupEvidence = null;
+  $("#cleanup-finalized-checkpoint").hidden = true;
   renderJobLogs([]);
   $("#option-offline-optimize").checked = true;
   updateSingleAlignmentState();
@@ -322,6 +325,18 @@ function renderInspection(data) {
       "complete",
     );
   }
+  const cleanup = data.checkpoint_cleanup || {};
+  currentCheckpointCleanupEvidence = cleanup.available ? cleanup : null;
+  const cleanupButton = $("#cleanup-finalized-checkpoint");
+  cleanupButton.hidden = !currentCheckpointCleanupEvidence;
+  if (currentCheckpointCleanupEvidence) {
+    appendText(
+      target,
+      "div",
+      `发现已完成会话的旧 checkpoint：identity ${cleanup.tracking_session_id}，提交时间 ${cleanup.finalized_at_unix}。清理只删除旧 checkpoint，不修复扫描数据。`,
+      "warning",
+    );
+  }
   const coverage = data.structure_coverage || {};
   const coverageSummary = coverage.summary || null;
   if (coverage.available && coverageSummary) {
@@ -392,6 +407,40 @@ async function inspectSession(inputId) {
     renderInspection(inspection);
     if (inputId === "single-session") applyInspectionCapabilities(inspection);
     setStatus("会话检查完成", "complete");
+  } catch (error) {
+    setStatus(error.message, "failed");
+  }
+}
+
+async function cleanupFinalizedCheckpoint() {
+  const session = $("#single-session").value.trim();
+  const evidence = currentCheckpointCleanupEvidence;
+  if (!session || !evidence) {
+    setStatus("请先检查并确认存在可清理的 finalized checkpoint", "failed");
+    return;
+  }
+  const confirmed = window.confirm(
+    `只删除会话 ${evidence.tracking_session_id} 的旧 checkpoint。此操作不会修复扫描数据，证据变化时服务端会拒绝。是否继续？`,
+  );
+  if (!confirmed) return;
+  try {
+    setStatus("正在验证并清理旧 checkpoint", "running");
+    await request("/api/session/cleanup-finalized-checkpoint", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        session,
+        confirmed: true,
+        expected_tracking_session_id: evidence.tracking_session_id,
+        expected_finalized_at_unix: evidence.finalized_at_unix,
+        expected_metadata_sha256: evidence.metadata_sha256,
+        expected_checkpoint_sha256: evidence.checkpoint_sha256,
+      }),
+    });
+    currentCheckpointCleanupEvidence = null;
+    $("#cleanup-finalized-checkpoint").hidden = true;
+    setStatus("旧 checkpoint 已清理；正在重新检查会话", "complete");
+    await inspectSession("single-session");
   } catch (error) {
     setStatus(error.message, "failed");
   }
@@ -3061,6 +3110,7 @@ function bindEvents() {
   $$('[data-pick]').forEach((button) => button.addEventListener("click", () => choosePath(button.dataset.pick, button.dataset.title)));
   $$('[data-pick-file]').forEach((button) => button.addEventListener("click", () => choosePath(button.dataset.pickFile, button.dataset.title, "file")));
   $("#inspect-single-session").addEventListener("click", () => inspectSession("single-session"));
+  $("#cleanup-finalized-checkpoint").addEventListener("click", cleanupFinalizedCheckpoint);
   $("#run-single").addEventListener("click", runActiveJob);
   $("#run-multi").addEventListener("click", runActiveJob);
   $("#run-prior").addEventListener("click", runActiveJob);

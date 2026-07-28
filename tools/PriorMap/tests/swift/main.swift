@@ -333,6 +333,61 @@ require(
 try FileManager.default.removeItem(at: traceEvidenceURL)
 try FileManager.default.moveItem(at: linkedTrace, to: traceEvidenceURL)
 
+let cleanupRoot = finalizationTemp.appendingPathComponent(
+    "SupermarketSession-Cleanup",
+    isDirectory: true)
+let cleanupSegment = cleanupRoot.appendingPathComponent(
+    "segment_0001",
+    isDirectory: true)
+try FileManager.default.createDirectory(
+    at: cleanupSegment,
+    withIntermediateDirectories: true)
+try SafeSessionPath.validateDirectory(cleanupSegment, within: cleanupRoot)
+require(
+    !SafeSessionPath.isStrictlyContained(
+        finalizationTemp.appendingPathComponent("SupermarketSession-Cleanup-Other"),
+        in: cleanupRoot),
+    "path-component containment must reject adjacent prefixes")
+let safeCheckpointURL = cleanupSegment.appendingPathComponent(
+    "live_checkpoint.json")
+try olderCheckpoint.write(to: safeCheckpointURL)
+let safeCheckpoint = try SafeSessionPath.readRegularFile(
+    safeCheckpointURL,
+    within: cleanupRoot)
+try SafeSessionPath.append(
+    Data("audit\n".utf8),
+    to: cleanupSegment.appendingPathComponent("scan_events.jsonl"),
+    within: cleanupRoot)
+let outsideCheckpoint = finalizationTemp.appendingPathComponent(
+    "outside-checkpoint.json")
+try olderCheckpoint.write(to: outsideCheckpoint)
+try FileManager.default.removeItem(at: safeCheckpointURL)
+try FileManager.default.createSymbolicLink(
+    at: safeCheckpointURL,
+    withDestinationURL: outsideCheckpoint)
+var linkedCheckpointRejected = false
+do {
+    _ = try SafeSessionPath.readRegularFile(
+        safeCheckpointURL,
+        within: cleanupRoot)
+}
+catch {
+    linkedCheckpointRejected = true
+}
+require(linkedCheckpointRejected, "checkpoint no-follow must reject symlinks")
+try FileManager.default.removeItem(at: safeCheckpointURL)
+try safeCheckpoint.data.write(to: safeCheckpointURL)
+let restoredCheckpoint = try SafeSessionPath.readRegularFile(
+    safeCheckpointURL,
+    within: cleanupRoot)
+try SafeSessionPath.removeRegularFile(
+    safeCheckpointURL,
+    within: cleanupRoot,
+    expected: restoredCheckpoint)
+require(
+    !FileManager.default.fileExists(atPath: safeCheckpointURL.path),
+    "descriptor-validated checkpoint removal must delete the expected file")
+
 let captureSource = finalizationTemp.appendingPathComponent(
     "capture-source",
     isDirectory: true)

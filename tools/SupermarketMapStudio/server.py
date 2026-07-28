@@ -5,12 +5,14 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime, timezone
+import hashlib
 import json
 import math
 import os
 import platform
 import re
 import subprocess
+import stat
 import sys
 import tempfile
 import threading
@@ -125,6 +127,11 @@ class ConflictError(RequestError):
             "current_version_id": self.version_id,
             "current_revision": self.revision,
         }
+
+
+class CheckpointCleanupConflict(RequestError):
+    status = HTTPStatus.CONFLICT
+    code = "checkpoint_cleanup_conflict"
 
 
 class QualityGateError(RequestError):
@@ -750,6 +757,7 @@ def inspect_session(session: Path) -> Dict[str, Any]:
         "structure_coverage": structure_coverage_summary(session),
         "prior_map_localization": prior_map_localization_summary(session),
         "scan_logs": scan_event_logs(session),
+        "checkpoint_cleanup": checkpoint_cleanup_evidence(session),
         "active_job": job_payload(active_job) if active_job else None,
     }
 
@@ -763,6 +771,98 @@ def _required_finite_unix_time(value: Any, field_name: str) -> float:
     return result
 
 
+_FILE_ATTRIBUTE_REPARSE_POINT = 0x0400
+
+
+def _is_link_or_reparse(path: Path, value: os.stat_result) -> bool:
+    return stat.S_ISLNK(value.st_mode) or bool(
+        getattr(value, "st_file_attributes", 0)
+        & _FILE_ATTRIBUTE_REPARSE_POINT
+    )
+
+
+def _validated_cleanup_paths(session: Path) -> tuple[Path, Path, Path, Path]:
+    try:
+        session_stat = os.lstat(session)
+    except OSError as exc:
+        raise RequestError(f"Cleanup session is unavailable: {exc}") from exc
+    if _is_link_or_reparse(session, session_stat) or not stat.S_ISDIR(
+        session_stat.st_mode
+    ):
+        raise RequestError("Cleanup session must be a local directory, not a link.")
+    try:
+        entries = [
+            entry
+            for entry in os.scandir(session)
+            if entry.name.startswith("segment_")
+        ]
+    except OSError as exc:
+        raise RequestError(f"Unable to enumerate cleanup session: {exc}") from exc
+    if len(entries) != 1 or entries[0].name != "segment_0001":
+        raise RequestError(
+            "Checkpoint cleanup requires exactly one continuous segment_0001."
+        )
+    segment = Path(entries[0].path)
+    segment_stat = entries[0].stat(follow_symlinks=False)
+    if _is_link_or_reparse(segment, segment_stat) or not stat.S_ISDIR(
+        segment_stat.st_mode
+    ):
+        raise RequestError("Refused checkpoint cleanup through a linked segment.")
+    try:
+        if segment.resolve(strict=True).parent != session.resolve(strict=True):
+            raise RequestError("Cleanup segment escaped the selected session.")
+    except OSError as exc:
+        raise RequestError(f"Cleanup path resolution failed: {exc}") from exc
+    return (
+        segment,
+        segment / "metadata.json",
+        segment / "live_checkpoint.json",
+        segment / "scan_events.jsonl",
+    )
+
+
+def _open_regular_no_follow(path: Path, flags: int) -> int:
+    no_follow = getattr(os, "O_NOFOLLOW", 0)
+    binary = getattr(os, "O_BINARY", 0)
+    try:
+        before = os.lstat(path)
+        if _is_link_or_reparse(path, before):
+            raise RequestError(f"Refused linked cleanup file: {path.name}.")
+        descriptor = os.open(path, flags | no_follow | binary)
+    except FileNotFoundError as exc:
+        if path.name == "live_checkpoint.json":
+            raise CheckpointCleanupConflict(
+                "Checkpoint no longer exists; inspect the session again."
+            ) from exc
+        raise RequestError(f"Cleanup file is missing: {path.name}.") from exc
+    except RequestError:
+        raise
+    except OSError as exc:
+        raise RequestError(f"Unable to open cleanup file {path.name}: {exc}") from exc
+    try:
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode):
+            raise RequestError(f"Cleanup file is not regular: {path.name}.")
+        if (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino):
+            raise CheckpointCleanupConflict(
+                f"Cleanup file changed while opening: {path.name}."
+            )
+        return descriptor
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+def _read_descriptor(descriptor: int) -> bytes:
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    chunks: List[bytes] = []
+    while True:
+        chunk = os.read(descriptor, 1024 * 1024)
+        if not chunk:
+            return b"".join(chunks)
+        chunks.append(chunk)
+
+
 def _append_finalization_cleanup_audit(
     events_path: Path,
     *,
@@ -770,8 +870,6 @@ def _append_finalization_cleanup_audit(
     event: str,
     message: str,
 ) -> None:
-    if events_path.is_symlink():
-        raise RequestError("Refused to write a checkpoint cleanup audit through a symlink.")
     timestamp = datetime.now(timezone.utc)
     record = {
         "event": event,
@@ -791,13 +889,23 @@ def _append_finalization_cleanup_audit(
         json.dumps(record, ensure_ascii=False, sort_keys=True, allow_nan=False)
         + "\n"
     ).encode("utf-8")
+    no_follow = getattr(os, "O_NOFOLLOW", 0)
+    binary = getattr(os, "O_BINARY", 0)
     try:
+        if events_path.exists() or events_path.is_symlink():
+            event_stat = os.lstat(events_path)
+            if _is_link_or_reparse(events_path, event_stat):
+                raise RequestError(
+                    "Refused to write a checkpoint cleanup audit through a link."
+                )
         descriptor = os.open(
             events_path,
-            os.O_APPEND | os.O_CREAT | os.O_WRONLY,
+            os.O_APPEND | os.O_CREAT | os.O_WRONLY | no_follow | binary,
             0o600,
         )
         try:
+            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                raise OSError("cleanup audit target is not a regular file")
             written = 0
             while written < len(payload):
                 count = os.write(descriptor, payload[written:])
@@ -807,45 +915,31 @@ def _append_finalization_cleanup_audit(
             os.fsync(descriptor)
         finally:
             os.close(descriptor)
+    except RequestError:
+        raise
     except OSError as exc:
         raise RequestError(f"Unable to persist checkpoint cleanup audit: {exc}") from exc
 
 
-def cleanup_finalized_checkpoint(session: Path) -> Dict[str, Any]:
-    """Explicitly remove one stale checkpoint after strict commit validation.
-
-    Normal inspection and processing never invoke this recovery path. The
-    checkpoint is preserved unless finalized metadata proves the same tracking
-    identity and has a commit time at least as new as the checkpoint.
-    """
-    with FINALIZED_CHECKPOINT_CLEANUP_LOCK:
-        segment_directories = sorted(
-            path for path in session.glob("segment_*") if path.is_dir()
-        )
-        if (
-            len(segment_directories) != 1
-            or segment_directories[0].name != "segment_0001"
+def _cleanup_evidence(session: Path) -> Dict[str, Any]:
+    segment, metadata_path, checkpoint_path, events_path = _validated_cleanup_paths(
+        session
+    )
+    if events_path.exists() or events_path.is_symlink():
+        events_stat = os.lstat(events_path)
+        if _is_link_or_reparse(events_path, events_stat) or not stat.S_ISREG(
+            events_stat.st_mode
         ):
             raise RequestError(
-                "Checkpoint cleanup requires exactly one continuous segment_0001."
+                "Checkpoint cleanup audit target must be a regular local file."
             )
-        segment = segment_directories[0]
-        metadata_path = segment / "metadata.json"
-        checkpoint_path = segment / "live_checkpoint.json"
-        events_path = segment / "scan_events.jsonl"
-        if metadata_path.is_symlink() or checkpoint_path.is_symlink():
-            raise RequestError("Refused checkpoint cleanup through a symlink.")
-        if not metadata_path.is_file() or not checkpoint_path.is_file():
-            raise RequestError(
-                "Both metadata.json and live_checkpoint.json are required for cleanup."
-            )
-        try:
-            metadata_bytes = metadata_path.read_bytes()
-            checkpoint_bytes = checkpoint_path.read_bytes()
-            metadata = json.loads(metadata_bytes.decode("utf-8"))
-            checkpoint = json.loads(checkpoint_bytes.decode("utf-8"))
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise RequestError(f"Finalization cleanup evidence is unreadable: {exc}") from exc
+    metadata_descriptor = _open_regular_no_follow(metadata_path, os.O_RDONLY)
+    checkpoint_descriptor = _open_regular_no_follow(checkpoint_path, os.O_RDONLY)
+    try:
+        metadata_bytes = _read_descriptor(metadata_descriptor)
+        checkpoint_bytes = _read_descriptor(checkpoint_descriptor)
+        metadata = json.loads(metadata_bytes.decode("utf-8"))
+        checkpoint = json.loads(checkpoint_bytes.decode("utf-8"))
         if not isinstance(metadata, dict) or not isinstance(checkpoint, dict):
             raise RequestError("Finalization cleanup evidence must be JSON objects.")
         if metadata.get("finalized") is not True:
@@ -870,8 +964,86 @@ def cleanup_finalized_checkpoint(session: Path) -> Dict[str, Any]:
             raise RequestError(
                 "Checkpoint is newer than the finalized metadata commit."
             )
+        return {
+            "segment": segment,
+            "metadata_path": metadata_path,
+            "checkpoint_path": checkpoint_path,
+            "events_path": events_path,
+            "metadata_bytes": metadata_bytes,
+            "checkpoint_bytes": checkpoint_bytes,
+            "metadata_stat": os.fstat(metadata_descriptor),
+            "checkpoint_stat": os.fstat(checkpoint_descriptor),
+            "tracking_session_id": metadata_identity,
+            "finalized_at_unix": finalized_at,
+            "checkpoint_updated_at_unix": checkpoint_updated_at,
+            "metadata_sha256": hashlib.sha256(metadata_bytes).hexdigest(),
+            "checkpoint_sha256": hashlib.sha256(checkpoint_bytes).hexdigest(),
+        }
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RequestError(f"Finalization cleanup evidence is unreadable: {exc}") from exc
+    finally:
+        os.close(metadata_descriptor)
+        os.close(checkpoint_descriptor)
 
-        checkpoint_stat = checkpoint_path.stat()
+
+def checkpoint_cleanup_evidence(session: Path) -> Dict[str, Any]:
+    try:
+        evidence = _cleanup_evidence(session)
+    except RequestError as exc:
+        return {"available": False, "reason": str(exc)}
+    return {
+        "available": True,
+        "tracking_session_id": evidence["tracking_session_id"],
+        "finalized_at_unix": evidence["finalized_at_unix"],
+        "checkpoint_updated_at_unix": evidence["checkpoint_updated_at_unix"],
+        "metadata_sha256": evidence["metadata_sha256"],
+        "checkpoint_sha256": evidence["checkpoint_sha256"],
+        "warning": "This only deletes an older checkpoint; it does not repair scan data.",
+    }
+
+
+def cleanup_finalized_checkpoint(
+    session: Path,
+    *,
+    confirmed: Any,
+    expected_tracking_session_id: Any,
+    expected_finalized_at_unix: Any,
+    expected_metadata_sha256: Any,
+    expected_checkpoint_sha256: Any,
+) -> Dict[str, Any]:
+    """Explicitly remove one stale checkpoint after strict commit validation.
+
+    Normal inspection and processing never invoke this recovery path. The
+    checkpoint is preserved unless finalized metadata proves the same tracking
+    identity and has a commit time at least as new as the checkpoint.
+    """
+    with FINALIZED_CHECKPOINT_CLEANUP_LOCK:
+        if confirmed is not True:
+            raise RequestError("Checkpoint cleanup requires confirmed=true.")
+        evidence = _cleanup_evidence(session)
+        expected_time = _required_finite_unix_time(
+            expected_finalized_at_unix, "expected_finalized_at_unix"
+        )
+        expected_values = (
+            expected_tracking_session_id,
+            expected_time,
+            expected_metadata_sha256,
+            expected_checkpoint_sha256,
+        )
+        actual_values = (
+            evidence["tracking_session_id"],
+            evidence["finalized_at_unix"],
+            evidence["metadata_sha256"],
+            evidence["checkpoint_sha256"],
+        )
+        if expected_values != actual_values:
+            raise CheckpointCleanupConflict(
+                "Checkpoint cleanup evidence changed; inspect again before retrying."
+            )
+        segment = evidence["segment"]
+        checkpoint_path = evidence["checkpoint_path"]
+        events_path = evidence["events_path"]
+        metadata_identity = evidence["tracking_session_id"]
         _append_finalization_cleanup_audit(
             events_path,
             tracking_session_id=metadata_identity,
@@ -879,19 +1051,53 @@ def cleanup_finalized_checkpoint(session: Path) -> Dict[str, Any]:
             message="Operator explicitly authorized stale finalized checkpoint cleanup",
         )
         try:
-            current_stat = checkpoint_path.stat()
+            current_descriptor = _open_regular_no_follow(
+                checkpoint_path, os.O_RDONLY
+            )
+            try:
+                current_stat = os.fstat(current_descriptor)
+                current_bytes = _read_descriptor(current_descriptor)
+            finally:
+                os.close(current_descriptor)
             if (
                 (current_stat.st_dev, current_stat.st_ino, current_stat.st_size)
-                != (checkpoint_stat.st_dev, checkpoint_stat.st_ino, checkpoint_stat.st_size)
-                or checkpoint_path.read_bytes() != checkpoint_bytes
+                != (
+                    evidence["checkpoint_stat"].st_dev,
+                    evidence["checkpoint_stat"].st_ino,
+                    evidence["checkpoint_stat"].st_size,
+                )
+                or current_bytes != evidence["checkpoint_bytes"]
             ):
-                raise RequestError(
+                raise CheckpointCleanupConflict(
                     "Checkpoint changed during validation; cleanup was cancelled."
                 )
-            checkpoint_path.unlink()
+            os.unlink(checkpoint_path)
         except FileNotFoundError as exc:
-            raise RequestError("Checkpoint changed during cleanup; operation cancelled.") from exc
-        except OSError as exc:
+            failure = CheckpointCleanupConflict(
+                "Checkpoint changed during cleanup; operation cancelled."
+            )
+            try:
+                _append_finalization_cleanup_audit(
+                    events_path,
+                    tracking_session_id=metadata_identity,
+                    event="finalization_checkpoint_cleanup_failed",
+                    message=str(failure),
+                )
+            except RequestError as audit_exc:
+                print(f"Cleanup failure audit degraded: {audit_exc}", file=sys.stderr)
+            raise failure from exc
+        except (OSError, RequestError) as exc:
+            try:
+                _append_finalization_cleanup_audit(
+                    events_path,
+                    tracking_session_id=metadata_identity,
+                    event="finalization_checkpoint_cleanup_failed",
+                    message=str(exc),
+                )
+            except RequestError as audit_exc:
+                print(f"Cleanup failure audit degraded: {audit_exc}", file=sys.stderr)
+            if isinstance(exc, RequestError):
+                raise
             raise RequestError(f"Unable to remove the validated checkpoint: {exc}") from exc
 
         warning = None
@@ -911,6 +1117,7 @@ def cleanup_finalized_checkpoint(session: Path) -> Dict[str, Any]:
             "session": str(session),
             "segment": str(segment),
             "tracking_session_id": metadata_identity,
+            "deleted_checkpoint_sha256": evidence["checkpoint_sha256"],
             "audit_warning": warning,
         }
 
@@ -2391,7 +2598,20 @@ class StudioHandler(BaseHTTPRequestHandler):
                 self.send_json(
                     HTTPStatus.OK,
                     cleanup_finalized_checkpoint(
-                        require_session(data.get("session"))
+                        require_session(data.get("session")),
+                        confirmed=data.get("confirmed"),
+                        expected_tracking_session_id=data.get(
+                            "expected_tracking_session_id"
+                        ),
+                        expected_finalized_at_unix=data.get(
+                            "expected_finalized_at_unix"
+                        ),
+                        expected_metadata_sha256=data.get(
+                            "expected_metadata_sha256"
+                        ),
+                        expected_checkpoint_sha256=data.get(
+                            "expected_checkpoint_sha256"
+                        ),
                     ),
                 )
                 return

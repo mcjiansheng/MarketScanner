@@ -131,6 +131,21 @@ class IOSLocalizationSidecarHealthContractTests(unittest.TestCase):
         self.assertIn("LocalizationEvidenceBundleValidator.blockers", session)
         self.assertIn("committedMetadata.finalized = false", session)
 
+    def test_checkpoint_cleanup_uses_no_follow_file_identity(self) -> None:
+        session = source(SESSION_SOURCE)
+        finalization = source(FINALIZATION_CORE_SOURCE)
+        for token in (
+            "enum SafeSessionPath",
+            "O_NOFOLLOW",
+            "fstat",
+            "file_changed_before_delete",
+            "isStrictlyContained",
+        ):
+            self.assertIn(token, finalization)
+        self.assertIn("SafeSessionPath.readRegularFile", session)
+        self.assertIn("SafeSessionPath.removeRegularFile", session)
+        self.assertIn("finalization_checkpoint_cleanup_failed", session)
+
 
 if __name__ == "__main__":
     unittest.main()

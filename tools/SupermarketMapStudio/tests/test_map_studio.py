@@ -5,6 +5,7 @@ import hashlib
 import math
 import shutil
 import sqlite3
+import stat
 import struct
 import sys
 import tempfile
@@ -870,15 +871,39 @@ class MapStudioApiTests(unittest.TestCase):
             encoding="utf-8",
         )
 
+        evidence = self.api(
+            "/api/session/inspect",
+            {"session": str(session)},
+        )["checkpoint_cleanup"]
+        self.assertTrue(evidence["available"])
+        request = {
+            "session": str(session),
+            "confirmed": True,
+            "expected_tracking_session_id": evidence["tracking_session_id"],
+            "expected_finalized_at_unix": evidence["finalized_at_unix"],
+            "expected_metadata_sha256": evidence["metadata_sha256"],
+            "expected_checkpoint_sha256": evidence["checkpoint_sha256"],
+        }
         result = self.api(
             "/api/session/cleanup-finalized-checkpoint",
-            {"session": str(session)},
+            request,
         )
         self.assertTrue(result["cleaned"])
         self.assertFalse(checkpoint_path.exists())
         events = (segment / "scan_events.jsonl").read_text(encoding="utf-8")
         self.assertIn("finalization_checkpoint_cleanup_authorized", events)
         self.assertIn("finalization_checkpoint_cleanup_completed", events)
+        self.assertEqual(
+            result["deleted_checkpoint_sha256"],
+            evidence["checkpoint_sha256"],
+        )
+        with self.assertRaises(HTTPError) as repeated:
+            self.api("/api/session/cleanup-finalized-checkpoint", request)
+        self.assertEqual(repeated.exception.code, 409)
+        self.assertEqual(
+            repeated.exception.payload["code"],
+            "checkpoint_cleanup_conflict",
+        )
 
     def test_checkpoint_cleanup_rejects_mismatch_and_newer_checkpoint(self) -> None:
         for name, checkpoint_identity, checkpoint_time, error_text in (
@@ -915,7 +940,14 @@ class MapStudioApiTests(unittest.TestCase):
                 with self.assertRaises(HTTPError) as rejected:
                     self.api(
                         "/api/session/cleanup-finalized-checkpoint",
-                        {"session": str(session)},
+                        {
+                            "session": str(session),
+                            "confirmed": True,
+                            "expected_tracking_session_id": "tracking-cleanup",
+                            "expected_finalized_at_unix": 20.0,
+                            "expected_metadata_sha256": "0" * 64,
+                            "expected_checkpoint_sha256": "0" * 64,
+                        },
                     )
                 self.assertEqual(rejected.exception.code, 400)
                 self.assertIn(
@@ -923,6 +955,107 @@ class MapStudioApiTests(unittest.TestCase):
                     rejected.exception.payload["error"].lower(),
                 )
                 self.assertTrue(checkpoint_path.exists())
+
+    def test_checkpoint_cleanup_requires_confirmation_and_exact_evidence(self) -> None:
+        session = create_session(
+            self.root,
+            "SupermarketSession-CleanupCAS",
+            0.0,
+            "continuous_streaming",
+        )
+        segment = session / "segment_0001"
+        metadata_path = segment / "metadata.json"
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        metadata.update(
+            {"trackingSessionId": "cleanup-cas", "finalizedAtUnix": 20.0}
+        )
+        metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+        checkpoint = segment / "live_checkpoint.json"
+        checkpoint.write_text(
+            json.dumps(
+                {"trackingSessionId": "cleanup-cas", "updatedAtUnix": 10.0}
+            ),
+            encoding="utf-8",
+        )
+        evidence = self.api(
+            "/api/session/inspect", {"session": str(session)}
+        )["checkpoint_cleanup"]
+        with self.assertRaises(HTTPError) as unconfirmed:
+            self.api(
+                "/api/session/cleanup-finalized-checkpoint",
+                {"session": str(session)},
+            )
+        self.assertEqual(unconfirmed.exception.code, 400)
+        stale = {
+            "session": str(session),
+            "confirmed": True,
+            "expected_tracking_session_id": evidence["tracking_session_id"],
+            "expected_finalized_at_unix": evidence["finalized_at_unix"],
+            "expected_metadata_sha256": evidence["metadata_sha256"],
+            "expected_checkpoint_sha256": "f" * 64,
+        }
+        with self.assertRaises(HTTPError) as conflict:
+            self.api("/api/session/cleanup-finalized-checkpoint", stale)
+        self.assertEqual(conflict.exception.code, 409)
+        self.assertEqual(
+            conflict.exception.payload["code"],
+            "checkpoint_cleanup_conflict",
+        )
+        self.assertTrue(checkpoint.exists())
+
+    def test_checkpoint_cleanup_rejects_linked_segment_and_files(self) -> None:
+        outside = self.root / "outside-cleanup"
+        outside.mkdir()
+        for linked_name in ("segment", "metadata", "checkpoint", "events"):
+            with self.subTest(linked_name=linked_name):
+                session = create_session(
+                    self.root,
+                    f"SupermarketSession-Linked-{linked_name}",
+                    0.0,
+                    "continuous_streaming",
+                )
+                segment = session / "segment_0001"
+                metadata_path = segment / "metadata.json"
+                metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+                metadata.update(
+                    {"trackingSessionId": "linked", "finalizedAtUnix": 20.0}
+                )
+                metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+                checkpoint = segment / "live_checkpoint.json"
+                checkpoint.write_text(
+                    json.dumps(
+                        {"trackingSessionId": "linked", "updatedAtUnix": 10.0}
+                    ),
+                    encoding="utf-8",
+                )
+                target = outside / linked_name
+                if linked_name == "segment":
+                    segment.rename(target)
+                    segment.symlink_to(target, target_is_directory=True)
+                else:
+                    path = {
+                        "metadata": metadata_path,
+                        "checkpoint": checkpoint,
+                        "events": segment / "scan_events.jsonl",
+                    }[linked_name]
+                    if path.exists():
+                        path.rename(target)
+                    else:
+                        target.write_text("", encoding="utf-8")
+                    path.symlink_to(target)
+                inspected = self.api(
+                    "/api/session/inspect", {"session": str(session)}
+                )
+                self.assertFalse(inspected["checkpoint_cleanup"]["available"])
+
+    def test_checkpoint_cleanup_rejects_windows_reparse_attributes(self) -> None:
+        synthetic = SimpleNamespace(
+            st_mode=stat.S_IFDIR,
+            st_file_attributes=0x0400,
+        )
+        self.assertTrue(
+            server._is_link_or_reparse(Path("segment_0001"), synthetic)
+        )
 
     def test_manual_merge_preview_maps_regions_to_user_closures(self) -> None:
         _session, _database, output = create_manual_merge_result(self.root)
