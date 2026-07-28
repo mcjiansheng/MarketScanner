@@ -4,7 +4,8 @@
 > 外部审查输入：`MarketScanner_RepairV2_W2_Sidecar_Write_Health_Code_Review_and_Agent_Spec_2026-07-28.md`。
 > 审查基线：`repair-v2-w2-sidecar-write-health@12715d4fd005dcd46cae015ab31882b732c8e570`。
 > 实现分支：`repair-v2-w2-review-followup`。
-> 代码与测试提交：`a9819ff46a917c3f24969bc81757c5669c9d0fbd`。
+> 核心代码与测试提交：`a9819ff46a917c3f24969bc81757c5669c9d0fbd`。
+> Windows 契约修复提交：`2e180e06de1a8db7c90f3342aa08c405c9a430f8`。
 
 ## 当前判定
 
@@ -22,7 +23,18 @@ W2 sidecar write health 的 B-01 已在本分支关闭：finalized metadata 提�
 
 ## 证据边界
 
-本文件只记录已由源码和本地自动测试支持的结论。远端 CI run ID、job 结果和 artifact 必须在准确提交推送并完成 Actions 后补记；条件式 hosted iOS build 若因生成的 native 库缺失而跳过，必须明确记为 skipped，不能写成远端构建成功。本机已完成 native/iOS 链接，但真实 iPhone 和超市现场验收仍未完成。
+本文件只记录已由源码、本地自动测试和下述远端 CI 支持的结论。条件式 hosted iOS build 因仓库不包含生成的 native 库而跳过，不能写成远端 iOS 构建成功。本机已完成 native/iOS 链接，但真实 iPhone 和超市现场验收仍未完成。
+
+## 远端运行证据
+
+实现提交 `2e180e06de1a8db7c90f3342aa08c405c9a430f8` 的 GitHub Actions run [30331393098](https://github.com/mcjiansheng/MarketScanner/actions/runs/30331393098) 已完成且结论为 `success`：
+
+| Job | Job ID | 结果与边界 |
+| --- | --- | --- |
+| Windows imports and Python contracts | `90187126278` | 通过；包含 PriorMap 与 Map Studio 全套测试 |
+| Ubuntu Python, API and web contracts | `90187126282` | 通过；包含 Python、Web 和完整分支 patch whitespace 检查 |
+| Native ABI source contracts | `90187126288` | 通过；这是源码/ABI 契约验证，不替代 native 构建 |
+| macOS and iOS source contracts | `90187126314` | Job 通过；Swift parse、平台无关 finalization core 测试和 Xcode metadata 通过；hosted iOS build 因 native 依赖缺失为 `skipped-missing-native-dependencies` |
 
 ## 本地运行证据
 
