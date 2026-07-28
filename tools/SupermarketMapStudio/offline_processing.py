@@ -447,7 +447,10 @@ def _staging_directory() -> Path:
 
 def _copy_and_sync(source: Path, destination: Path) -> None:
     shutil.copy2(source, destination)
-    with destination.open("rb") as handle:
+    # Windows rejects fsync() on a read-only CRT descriptor with EBADF. Open
+    # the copied staging file writable so both POSIX and Windows flush the
+    # actual destination bytes before reprocess starts.
+    with destination.open("r+b") as handle:
         os.fsync(handle.fileno())
 
 

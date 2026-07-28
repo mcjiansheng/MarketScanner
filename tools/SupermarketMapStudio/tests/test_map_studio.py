@@ -1656,12 +1656,23 @@ class MapStudioApiTests(unittest.TestCase):
 
     def test_gpu_probe_rejects_helper_for_the_wrong_backend(self) -> None:
         helper = self.root / "wrong-gpu-helper"
-        helper.write_text(
-            "#!/bin/sh\nprintf '%s\\n' '{\"available\":true,\"backend\":\"apple_metal\",\"protocol\":1}'\n",
-            encoding="utf-8",
-        )
-        helper.chmod(0o755)
-        result = server.gpu.probe_backend("nvidia_cuda", str(helper))
+        helper.write_bytes(b"protocol fixture")
+        with (
+            mock.patch.object(server.gpu, "find_helper", return_value=helper),
+            mock.patch.object(
+                server.gpu.subprocess,
+                "run",
+                return_value=SimpleNamespace(
+                    returncode=0,
+                    stdout=(
+                        '{"available":true,"backend":"apple_metal",'
+                        '"protocol":1}'
+                    ),
+                    stderr="",
+                ),
+            ),
+        ):
+            result = server.gpu.probe_backend("nvidia_cuda", str(helper))
         self.assertFalse(result["available"])
         self.assertIn("does not match", result["reason"])
 

@@ -587,13 +587,13 @@ def scan_event_logs(session: Path, limit: int = 1000) -> Dict[str, Any]:
                     # disk and the compatibility parser is retained.
                     if event.get("event") == "price_tag_recorded":
                         continue
-                    event["source"] = str(path.relative_to(session))
+                    event["source"] = path.relative_to(session).as_posix()
                     event_count += 1
                     recent_events.append(event)
     events = sorted(recent_events, key=lambda item: float(item.get("timestampUnix", 0) or 0))
     return {
         "available": bool(files),
-        "files": [str(path.relative_to(session)) for path in files],
+        "files": [path.relative_to(session).as_posix() for path in files],
         "event_count": event_count,
         "malformed_lines": malformed_lines,
         "events": events,
@@ -610,11 +610,11 @@ def structure_coverage_summary(session: Path) -> Dict[str, Any]:
         payload = load_json(path, {})
         summary = payload.get("summary") if isinstance(payload, dict) else None
         if not isinstance(summary, dict):
-            malformed_files.append(str(path.relative_to(session)))
+            malformed_files.append(path.relative_to(session).as_posix())
             continue
         summaries.append(
             {
-                "source": str(path.relative_to(session)),
+                "source": path.relative_to(session).as_posix(),
                 "cell_size_m": payload.get("cellSizeM"),
                 "floor_height_m": payload.get("floorHeightM"),
                 **summary,
@@ -622,7 +622,7 @@ def structure_coverage_summary(session: Path) -> Dict[str, Any]:
         )
     return {
         "available": bool(summaries),
-        "files": [str(path.relative_to(session)) for path in files],
+        "files": [path.relative_to(session).as_posix() for path in files],
         "malformed_files": malformed_files,
         # A production continuous scan has one segment. Keep the per-segment
         # list so legacy inputs never have unrelated grids silently merged.
@@ -652,7 +652,7 @@ def prior_map_localization_summary(session: Path) -> Dict[str, Any]:
     }
     for category, filename in names.items():
         for path in sorted(session.glob(f"segment_*/{filename}")):
-            result["files"].append(str(path.relative_to(session)))
+            result["files"].append(path.relative_to(session).as_posix())
             result["available"] = True
             try:
                 handle = path.open("r", encoding="utf-8", errors="replace")
@@ -691,7 +691,7 @@ def prior_map_localization_summary(session: Path) -> Dict[str, Any]:
                             record.get("needs_review") is True
                         )
     for path in sorted(session.glob("segment_*/localized_price_tags.json")):
-        result["files"].append(str(path.relative_to(session)))
+        result["files"].append(path.relative_to(session).as_posix())
         result["available"] = True
         try:
             if path.stat().st_size > 20 * 1024 * 1024:
