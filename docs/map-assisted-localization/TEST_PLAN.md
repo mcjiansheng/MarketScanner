@@ -4,6 +4,18 @@
 
 ## 自动测试
 
+P0 生产安全不变量（CI 使用相同选择器，任一失败即失败关闭）：
+
+```bash
+python3 -m unittest -v \
+  tools.SupermarketMapStudio.tests.test_map_studio.MapStudioApiTests.test_review_transition_is_versioned_and_bounded_solver_cannot_publish \
+  tools.SupermarketMapStudio.tests.test_map_studio.MapStudioApiTests.test_checkpoint_cleanup_requires_confirmation_and_exact_evidence \
+  tools.PriorMap.tests.test_ios_sidecar_health_contract.IOSLocalizationSidecarHealthContractTests.test_atomic_visibility_and_copy_retention_contracts_are_explicit \
+  tools.PriorMap.tests.test_ios_sidecar_health_contract.IOSLocalizationSidecarHealthContractTests.test_finalized_metadata_is_bound_to_persisted_evidence_bytes
+```
+
+该快速组锁定四项既有行为：bounded solver 禁止发布、checkpoint cleanup 的人工确认与精确 CAS、外部复制不自动删除本地副本、required evidence 异常阻断 finalized metadata。它不能替代下面的全量测试、macOS 上的 Swift 可执行 core 测试、真机矩阵或现场验收。
+
 ```bash
 python3 -m unittest discover -s tools/PriorMap/tests -v
 python3 -m unittest discover -s tools/SupermarketMapStudio/tests -v

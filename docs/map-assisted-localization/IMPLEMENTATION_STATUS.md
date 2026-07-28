@@ -2,6 +2,12 @@
 
 > 文档状态：**当前有效**。最后核对日期：2026-07-28。
 
+## 生产化总状态
+
+当前发布判定是 **NO-GO / NOT PRODUCTION READY**。`repair-v2-w2r-safety-closeout@cf1b62c949f3574e1804808537e38c8ff643549c` 是生产化冻结基线；P0 在专用 CI job 中锁定 bounded solver 禁止发布、cleanup 确认与精确 CAS、复制后本地副本保留、required evidence 失败时 finalization fail closed 四项不变量，不修改业务算法。
+
+后续必须按 P1 至 P8 独立推进：P1 完整相对 SE(2) 因子图、P2 可复现干净构建、P3 Map Studio 持久任务、P4 iOS finalization/保留/provider hardening、P5 真机矩阵、P6 现场验收、P7 打包与 selfcheck、P8 独立复核。RB-01 至 RB-05 任一未关闭时均不得发布生产成果。权威判定和证据边界见 [`reviews/PRODUCTION_READINESS_REVIEW.md`](reviews/PRODUCTION_READINESS_REVIEW.md)。
+
 ## 阶段一
 
 | 能力 | 状态 | 代码/证据 |
@@ -70,6 +76,8 @@
 
 ## 尚未完成的发布门槛
 
+- Map Studio 任务持久化、崩溃/重启后的安全恢复或中断判定；
+- 干净环境下可重复的 PC/iOS 构建、依赖锁定和产物溯源；
 - 支持 LiDAR 的真实 iPhone 上完成完整开始、弱纹理、行人干扰、扫码、结束落盘和外部复制干跑；
 - 已按 2026-07-28 外部静态审查关闭 W2 B-01 与 W2R H-01 至 H-04/M-01 至 M-05；远端多平台 CI run `30342577182` 已绑定准确提交并通过，独立人工复核仍待执行；
 - 正式超市场景验收；

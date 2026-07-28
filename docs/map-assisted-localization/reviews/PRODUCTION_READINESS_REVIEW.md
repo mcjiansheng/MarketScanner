@@ -1,0 +1,72 @@
+# MarketScanner RepairV2 生产就绪当前代码审查
+
+> 文档状态：**当前有效**。最后核对日期：2026-07-28。
+> 外部审查输入：`MarketScanner_RepairV2_W2R_Production_Readiness_Code_Review_and_Final_Product_Agent_Spec_2026-07-28.md`。
+> 审查基线：`repair-v2-w2r-safety-closeout@cf1b62c949f3574e1804808537e38c8ff643549c`。
+> 代码基线：`ed85c38704461429e16321089d9e4e1b05d86753`；其后的提交只更新 W2R 文档和远端证据。
+> 当前 wave：`P0-production-baseline`；实施分支：`repair-v2-p0-production-baseline`。
+
+## 当前判定
+
+当前结论为 **NO-GO / NOT PRODUCTION READY**。W2R 的 evidence bundle、checkpoint cleanup、原子可见写入、复制后本地保留及 typed finalization disposition 已有自动化保护；这些能力是生产化工作的安全起点，不代表最终产品验收完成。
+
+P0 只冻结安全基线，不改变业务算法。CI 必须单独运行并报告以下不可退化契约：
+
+1. `bounded_correction_field` 不能生成有效 `published` 成果；
+2. finalized checkpoint cleanup 必须由操作者显式确认，并绑定 tracking identity、finalized time、metadata SHA-256 和 checkpoint SHA-256 的精确 CAS 证据；
+3. 外部 provider 复制即使校验成功，也不得自动删除手机本地采集副本；
+4. required localization evidence 缺失、为空、损坏或身份/数量/水位不一致时，metadata 必须 fail closed 为 `finalized=false`。
+
+## 发布阻断项
+
+| ID | 状态 | 关闭条件 |
+| --- | --- | --- |
+| RB-01 | **阻断** | 实现并验证读取 RTAB-Map 相对/闭环边的完整相对 SE(2) 因子图；通过发布门禁、回放、坏边拒绝和性能测试 |
+| RB-02 | **阻断** | 从干净环境可重复完成 PC 与 iOS 所需构建，依赖来源、版本、摘要和命令可审计 |
+| RB-03 | **阻断** | 在支持 LiDAR 的真实 iPhone 完成规定的开始、弱纹理、动态干扰、扫码、结束、恢复和复制矩阵 |
+| RB-04 | **阻断** | 按 `FIELD_TEST_PLAN.md` 完成正式超市场景验收并保存不可伪造的原始证据 |
+| RB-05 | **阻断** | Map Studio 任务状态持久化，进程重启后能安全恢复/判定中断，并保持输入输出访问边界 |
+
+生产化附加项 H-01 至 H-07（流式 finalization validator、包与保留语义、Windows handle 删除边界、崩溃/断电/provider 矩阵、性能上限、打包/selfcheck、本地 HTTP token/origin）仍应按各自 wave 实现和复核，不能在 P0 中标记关闭。
+
+## Wave 顺序与边界
+
+| Wave | 目标 | P0 时点状态 |
+| --- | --- | --- |
+| P0 | 冻结 W2R 安全基线和 CI 不变量 | 本地验证通过；远端待验证 |
+| P1 | 完整相对 SE(2) 因子图与发布门 | 未开始；必须独立分支和原子提交 |
+| P2 | 干净、可复现的 PC/iOS 构建 | 未开始；不得复用未记录的本机缓存作为证据 |
+| P3 | Map Studio 持久任务和重启恢复 | 未开始；需覆盖崩溃与路径访问控制 |
+| P4 | iOS finalization、保留和 provider hardening | 未开始；不得声称 power-loss durability |
+| P5 | 真实设备矩阵 | 未执行 |
+| P6 | 正式现场验收 | 未执行 |
+| P7 | 安装包、升级/卸载和 selfcheck | 未开始 |
+| P8 | 独立代码、证据和发布复核 | 未执行 |
+
+P1 至 P4 可以在 P0 通过后组织，但每一 wave 必须使用独立分支、明确基线、原子提交和单独验证；不得把多个大型 wave 合并成一次不可审查的改动。P5/P6 的证据必须来自真实设备和现场，缺失时如实保持未执行。
+
+## P0 已核验基线
+
+在创建 P0 分支前，对 `cf1b62c...` 实际执行：
+
+| 验证 | 结果 |
+| --- | --- |
+| PriorMap 单元测试 | 103 项通过 |
+| Map Studio 单元测试 | 66 项通过 |
+| Python 编译、Web JavaScript syntax、native symbol contract | 通过；73 C exports、72 Swift calls、71 RTABMapApp calls |
+| Stage 3 确定性基准 | 2,000 节点、20 约束通过；3.456 秒、Python 峰值 0.563 MiB，低于现有 15 秒/64 MiB 门限 |
+| W2R 远端多平台 CI | GitHub Actions run `30342577182` 四个既有 job 通过 |
+
+上述基准只证明冻结点没有已知自动化回归。它不关闭 RB-01 至 RB-05，也不证明真机、断电、外部 provider 或现场条件。
+
+P0 变更后的本地验证结果：生产安全快速契约 4 项、PriorMap 103 项、Map Studio 66 项、文档治理 3 项全部通过；workflow YAML、Python 编译、Web JavaScript、native symbol contract、Swift parse 和 `git diff --check` 通过；无签名 Release arm64 iOS app 完成编译与链接；既有 `build-pc-release` 的 `rtabmap-reprocess` 目标通过。第一笔原子提交为 `612ea6b`（CI、wave 基线与治理契约）。这些结果仍不替代干净环境构建、真机或现场证据。
+
+## 兼容、数据和回滚约束
+
+- 自由扫描和 prior-map 扫描继续写连续单 SQLite 数据库；`scanMode=continuous_streaming` 的存储语义不变。
+- 原始扫描数据库只读，PC 处理写入新目录；带 `live_checkpoint.json` 的输入继续拒绝自动处理。
+- NFC 入口保持关闭，旧 `price_tags.*` 仅用于兼容历史输入。
+- `AGENTS.md`、`doc/.local/`、扫描数据库、构建目录、真实扫描数据和输出地图不得提交。
+- P0 仅添加 CI/文档保护，可按其原子提交整体回滚；不得只删除某一失败保护后仍声称安全基线有效。
+
+P0 的远端最终验证结果应在推送后追加到本文件；在远端 job 全部成功前，P0 只能标记为远端待验证。
