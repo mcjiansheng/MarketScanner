@@ -1,6 +1,6 @@
 # 已有地图辅助定位架构
 
-> 文档状态：**当前有效（阶段一至阶段三草稿复核）**。最后核对日期：2026-07-27。
+> 文档状态：**当前有效（阶段一至阶段三草稿复核）**。最后核对日期：2026-07-28。
 
 ## 范围
 
@@ -76,7 +76,7 @@ PC prior-map localized
 - 原始价签观测先落盘；最终价签需要用户明确确认。weak/lost 以及低测量/低关联置信结果强制 `needs_review=true`。
 - 阶段三求解器明确标记为 `bounded_correction_field`：x/y/yaw 带状平滑没有实现 RTAB‑Map 相对边/闭环边的耦合 SE(2) 残差，不具备正式发布资格。
 - 阶段三每次处理前后核对原数据库 SHA-256；所有必需 sidecar 严格校验 UTF‑8、JSON、format/version、身份、时间戳、大小和唯一 ID。失败不切换旧 current。
-- iOS 必需定位 sidecar 的每次追加都返回结构化结果；失败会粘性写入 `captureHealth` 并持续显示红色告警。`metadata.json` 是 sidecar bundle 的最后提交标记；只有定位队列排空、零必需写失败且 trace/constraint/state 均有证据时，已有地图会话才可写 `finalized=true`、`processingEligibility.status=eligible` 并删除 checkpoint。
+- iOS 必需定位 sidecar 的每次追加都返回结构化结果；失败会粘性写入 `captureHealth` 并持续显示红色告警，同时停止新的地图修正、人工校正和价签确认，原始 DB 继续录制到用户结束。`metadata.json` 是 sidecar bundle 的最后提交标记：提交前失败可恢复录制；`finalized=true` 提交后 checkpoint 清理失败只能进入关闭数据库的待清理终态；证据不完整则提交 `finalized=false` 恢复包并终止会话，不能恢复 prior-map 录制。
 - PC 对已有地图会话同时要求显式 `finalized=true`、`localizationEvidenceComplete=true`、零必需写失败和空 blocker 列表，缺失旧字段也按不可处理拒绝。
 - 人工编辑由服务端生成旧值、UUID、UTC 时间和 base revision；version/revision CAS 必填，重放成功后才提交新不可变版本。
 

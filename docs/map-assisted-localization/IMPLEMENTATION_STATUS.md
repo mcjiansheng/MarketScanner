@@ -1,6 +1,6 @@
 # 地图辅助定位实现状态
 
-> 文档状态：**当前有效**。最后核对日期：2026-07-27。
+> 文档状态：**当前有效**。最后核对日期：2026-07-28。
 
 ## 阶段一
 
@@ -39,7 +39,9 @@
 | 阶段二 sidecar 和移动 UI | 已实现 | constraint/state/tag observation JSONL、localized tags JSON、结构指标 HUD、确认 UI 和必需证据写失败的持久红色告警 |
 | PC 会话检查 | 已实现 | `/api/session/inspect` 有界汇总约束、状态、观测、最终价签和 malformed 计数 |
 | 阶段二回放与指标 | 已实现 | iOS 同款校正门控/gain/锚点/状态；周期结构、动态干扰、错误初始位姿、tracking 恢复、yaw/通道/跳变和 matcher p50/p95 |
-| 结束并发一致性 | 已实现 | finalization 先失效 generation 并有界 drain；sidecar 写入校验 tracking session/finalizing，失败粘性进入 capture health；metadata 最后提交，证据不完整则 `finalized=false`、保留 checkpoint |
+| 结束并发与提交一致性 | 已实现（自动测试） | finalization 先失效 generation 并有界 drain；metadata 写入前失败可恢复录制，`finalized=true` 提交后即为终态；checkpoint 删除失败进入显式待清理状态，绝不恢复写库 |
+| Sidecar 故障与终端恢复 | 已实现（自动测试） | Foundation-only 可注入 writer 运行时覆盖 trace/constraint/state 部分失败、metadata 失败、checkpoint 删除失败；首个必需写失败后停止新修正/价签确认但保留原始 DB；手机/PC 显式清理严格核对身份与时间 |
+| 外部复制完整性 | 已实现（自动测试） | 逐文件相对路径、字节数、SHA-256，并在复制后复核源目录未变化；同字节数篡改可检出 |
 
 2026-07-25 综合审查整改：地图包新增全文件清单并由 iOS 做摘要/跨文件校验；货架面语义对正方形/环方向稳定，柜台支持全部边；价签改为密集 ROI 深度证据和快照时效门；拒绝候选不再预热校正门；HUD 增加有界轨迹/价签层并折叠诊断；finalization 不再在主线程等待。
 
@@ -67,7 +69,7 @@
 ## 尚未完成的发布门槛
 
 - 支持 LiDAR 的真实 iPhone 上完成完整开始、弱纹理、行人干扰、扫码、结束落盘和外部复制干跑；
-- 已完成本轮多智能体独立静态复审；发布前仍需外部/人工审查者复核；
+- 已按 2026-07-28 外部静态审查关闭 W2 B-01 并补充运行时测试；新的远端 CI 和人工复核证据仍须绑定准确提交 SHA；
 - 正式超市场景验收；
 - 实现并验证读取 RTAB‑Map 相对/闭环边的完整 SE(2) 因子图；在此之前不得创建有效 published 成果；
 - 地图直接拖拽锚点等可用性增强（问题带入和核心 ID/JSON 编辑已可用）。

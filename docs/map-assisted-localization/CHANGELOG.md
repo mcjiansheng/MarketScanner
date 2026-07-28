@@ -1,6 +1,16 @@
 # 地图辅助定位变更记录
 
-> 文档状态：**当前有效**。最后核对日期：2026-07-27。
+> 文档状态：**当前有效**。最后核对日期：2026-07-28。
+
+## 2026-07-28 — RepairV2 W2 审查闭环
+
+- 将 `metadata.json(finalized=true)` 明确为不可逆提交点：metadata 写入失败仍属提交前，可恢复录制；提交后 checkpoint 删除失败进入 `finalizedNeedsCleanup` 终态，关闭数据库且绝不恢复相机/映射。
+- 新增 Foundation-only `SupermarketFinalizationCore.swift` 和可注入 writer 运行时测试，实际执行 metadata/checkpoint/trace/constraint/state 故障与部分成功路径，不再只依赖源码字符串契约。
+- 手机启动时只对 finalized、同 tracking identity 且 checkpoint 时间不晚于提交时间的会话提供人工清理；Map Studio 增加同等严格、默认不自动调用的显式恢复 API，并在删除前写授权审计。
+- 首个必需定位证据写失败后停止新的先验地图修正、人工校正和价签最终确认，结束前持续保留原始 RTAB-Map 录制；用户结束时保存 `finalized=false` 恢复包并进入终态，不会回到永远无法恢复资格的 prior-map 录制。
+- 外部复制验证升级为逐文件相对路径、大小和 SHA-256，复制后再次复核源目录，检测同大小内容变化后保留本地副本。
+- 价签关联审计明确完整搜索范围；`auto_confirmed` 必须同时记录范围内候选搜索完成。求解器统一描述为 component-wise `bounded_correction_field`，不再称 banded SE(2) optimizer。
+- 旧根目录审查/Agent Prompt 移入历史归档并声明基线；当前审查入口改为 `reviews/CURRENT_REVIEW.md`。
 
 ## 2026-07-27 — RepairV2 安全闭环
 

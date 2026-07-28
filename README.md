@@ -1,6 +1,6 @@
 # RTAB-Map 大型超市扫描与地图工作台
 
-> 文档状态：**当前有效**。最后一次与源码交叉核对日期：2026-07-27。
+> 文档状态：**当前有效**。最后一次与源码交叉核对日期：2026-07-28。
 
 本项目是在开源 **RTAB-Map** 基础上进行的业务化改造，面向大型超市、仓储卖场等室内场景，形成从 iPhone Pro 连续采集，到 PC 端离线优化，再到二维地图、彩色俯视图和三维预览的一套本地工作流。
 
@@ -64,7 +64,7 @@ Android 目录中的部分 C++ 原生实现也因共享移动渲染和数据库�
 
 已有地图模式提供用户触发的 Vision 二维码/条形码识别，直接使用当前 `ARFrame.capturedImage`，不启动第二路相机。价签优先用同帧 scene depth 测量，深度不足时才退化为货架平面射线；结果显示货架、侧面、沿货架距离、高度和分项置信度。原始观测始终审计落盘，最终价签需要用户确认，弱定位或丢失状态绝不会自动确认。定位失败不会停止 RTAB-Map 原始数据库记录。
 
-阶段一/二整改和阶段三草稿复核链路已有自动测试；真实 LiDAR iPhone 完整干跑和正式超市现场验收仍是发布前门槛。本文不把模拟指标表述为现场精度或生产批准。完整架构、格式、UI、测试和当前状态见 [docs/map-assisted-localization/](docs/map-assisted-localization/)，双模式操作、复核、备份和失败恢复见 [用户操作手册](docs/map-assisted-localization/USER_GUIDE.md)。
+阶段一/二整改和阶段三草稿复核链路已有自动测试；真实 LiDAR iPhone 完整干跑和正式超市现场验收仍是发布前门槛。本文不把模拟指标表述为现场精度或生产批准。完整架构、格式、UI、测试和当前状态见 [docs/map-assisted-localization/](docs/map-assisted-localization/)，双模式操作、复核、备份和失败恢复见 [用户操作手册](docs/map-assisted-localization/USER_GUIDE.md)，本轮 RepairV2 审查闭环见 [当前审查记录](docs/map-assisted-localization/reviews/CURRENT_REVIEW.md)。
 
 ### 连续流式单数据库
 
@@ -103,8 +103,9 @@ Android 目录中的部分 C++ 原生实现也因共享移动渲染和数据库�
 - 内存压力只缩小在线工作图和实时预览，不主动切换数据库。
 - 设备进入 `fair` 热状态即先降低实时绘制并限制自适应采样；`serious` 时进一步缩小在线窗口。
 - 可用空间低于安全线或热状态达到 `critical` 时完成并关闭当前数据库，避免继续写入造成损坏。
-- 扫描期间周期写入 `live_checkpoint.json`；只有数据库保存、全部必需 sidecar 写入和最终元数据提交都成功后才删除 checkpoint。已有地图模式的定位证据若有任一必需写入失败，会保留红色告警、`finalized=false`、失败计数和 checkpoint，PC 端拒绝处理；原始 RTAB-Map 数据库仍继续安全记录。
-- 选择外部保存目录时，应用在数据库关闭后后台复制整个会话，核对文件数量与字节数成功后才删除本地副本。
+- 扫描期间周期写入 `live_checkpoint.json`；只有数据库保存、全部必需 sidecar 写入和最终元数据提交都成功后才删除 checkpoint。已有地图模式的定位证据若有任一必需写入失败，会保留红色告警、`finalized=false`、失败计数和 checkpoint，停止新的先验地图修正/价签确认，但原始 RTAB-Map 数据库仍继续安全记录。
+- `metadata.json(finalized=true)` 是不可逆提交点。若其后仅 checkpoint 删除失败，应用进入“已完成、待清理”终态，绝不恢复相机或继续写库；手机启动恢复提示和 Map Studio 显式 API 只会在同一 tracking identity、checkpoint 时间不晚于提交时间时清理，并写审计事件。若 metadata 以 `finalized=false` 成功保存粘性证据失败，会话同样停止并作为不可处理的原始数据库恢复包导出，而不是回到永远无法恢复资格的 prior-map 录制。
+- 选择外部保存目录时，应用在数据库关闭后后台复制整个会话，逐文件核对相对路径、字节数和 SHA-256，并再次确认源目录未变化；全部一致后才允许删除本地副本。
 
 ## 扫描会话数据
 

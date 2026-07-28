@@ -1,4 +1,8 @@
-# MarketScanner 地图辅助定位：独立测试与审查 Prompt 集
+# MarketScanner 地图辅助定位：独立测试与审查 Prompt 集（历史归档）
+
+> 文档状态：**历史归档**。最后核对日期：2026-07-28。
+> 适用基线：阶段一至阶段三最初审查流程，不是当前 RepairV2 审查结论。
+> 当前实现状态：[`../../IMPLEMENTATION_STATUS.md`](../../IMPLEMENTATION_STATUS.md)。
 
 > 建议由与实现 Agent 不同的会话或不同 Agent 执行。审查者应先做只读审计，再决定是否进行范围受控的修复。
 

@@ -1,6 +1,6 @@
 # 阶段二实时定位与价签测量设计
 
-> 文档状态：**当前有效（已实现设计）**。最后核对日期：2026-07-27。
+> 文档状态：**当前有效（已实现设计）**。最后核对日期：2026-07-28。
 > 2026-07-25 综合审查问题已整改，仍待独立复审与真机干跑；本文不把任何阶段描述为已获独立批准。
 
 ## 范围与边界
@@ -145,7 +145,7 @@ JSONL 每次写一条完整记录；标签集合写临时文件并原子替换�
 - tracking 中断：停止接受地图校正，恢复后等待连续可信帧。
 - 队列忙/任务过期：丢弃并记录，不积压。
 - 标签定位 weak/lost：保存待复核，不自动确认。
-- 必需 sidecar 写入失败：使用 throwing I/O 返回结构化失败，记录粘性 capture-health 计数并持续向用户显示红色告警；不修改或回滚原始数据库。结束时 metadata 最后写入，失败会保留 checkpoint、标记 `finalized=false` 和 processing blocker，PC 必须 fail closed。
+- 必需 sidecar 写入失败：使用 throwing I/O 返回结构化失败，记录粘性 capture-health 计数并持续向用户显示红色告警；停止新的先验地图修正、人工校正和价签确认，不修改或回滚原始数据库。用户结束时 metadata 最后提交 `finalized=false` 与 processing blocker，保留 checkpoint 并关闭数据库，导出为恢复包而不恢复 prior-map 录制；PC 必须 fail closed。若 `finalized=true` 已提交而 checkpoint 删除失败，则进入关闭数据库的待清理终态，只允许经身份/时间校验的显式清理。
 
 ## 验证
 

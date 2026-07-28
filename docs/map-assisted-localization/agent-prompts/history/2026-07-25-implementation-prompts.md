@@ -1,4 +1,8 @@
-# MarketScanner 地图辅助定位与价签定位：Agent 实现 Prompt 集
+# MarketScanner 地图辅助定位与价签定位：Agent 实现 Prompt 集（历史归档）
+
+> 文档状态：**历史归档**。最后核对日期：2026-07-28。
+> 适用基线：阶段一至阶段三最初实现，不是当前 RepairV2 执行入口。
+> 当前实现状态：[`../../IMPLEMENTATION_STATUS.md`](../../IMPLEMENTATION_STATUS.md)。
 
 > 适用对象：Codex、Claude Code、OpenAI Codex CLI 或其他能够读取仓库、修改代码、运行测试和操作 Git 的工程 Agent。
 >

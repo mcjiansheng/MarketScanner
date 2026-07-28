@@ -1,6 +1,6 @@
 # 已有地图辅助扫描数据格式
 
-> 文档状态：**当前有效**。最后核对日期：2026-07-27。
+> 文档状态：**当前有效**。最后核对日期：2026-07-28。
 
 ## 会话元数据
 
@@ -49,7 +49,7 @@
 
 `floorId` 在会话开始时固定，当前版本没有扫描中楼层切换事件。二维 `rawPose/estimatedPose` 只表达所选楼层内的 `x/y/yaw`：ARKit `+x` 对应地图 `+x`，ARKit `-z` 对应地图 `+y`，地图 yaw 0 指向 `+y` 且逆时针为正。ARKit 竖直 `y` 不写入二维定位 sidecar，但仍由原始 ARKit/RTAB-Map 三维链路保存。
 
-实时 `live_checkpoint.json` 同步记录业务模式、地图身份和 capture health。`metadata.json` 是最终 sidecar bundle 的最后提交标记；只有必需定位写入零失败、trace/constraint/state 均有记录、定位队列已排空且 metadata 成功写入时，已有地图会话才标记 `finalized=true`、`processingEligibility.status=eligible` 并删除 checkpoint。否则写 `finalized=false` 和稳定 blocker code，保留 checkpoint 供恢复/审计，PC 必须拒绝处理。自由扫描仍按既有完成条件结束。
+实时 `live_checkpoint.json` 同步记录业务模式、地图身份、`updatedAtUnix` 和 capture health。`metadata.json` 是最终 sidecar bundle 的最后提交标记，并在最终提交时记录 `finalizedAtUnix`。metadata 写入失败属于提交前失败，可恢复录制；一旦 `finalized=true` 成功写入即进入不可逆终态。其后的 checkpoint 删除失败只能标记“已完成、待清理”，不得恢复相机或继续写数据库。手机和 PC 的显式清理都要求 finalized、同 tracking identity、两个有限 Unix 时间且 `checkpoint.updatedAtUnix <= metadata.finalizedAtUnix`，并在删除前写审计；正常 PC 优化仍无条件拒绝任何残留 checkpoint。必需定位证据不完整时写 `finalized=false` 和稳定 blocker，保留 checkpoint。自由扫描仍按既有完成条件结束。
 
 ## localization_trace.jsonl
 

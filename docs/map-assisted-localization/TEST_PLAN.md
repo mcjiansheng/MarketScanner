@@ -1,6 +1,6 @@
 # 地图辅助定位阶段一至阶段三测试计划
 
-> 文档状态：**当前有效**。最后核对日期：2026-07-27。
+> 文档状态：**当前有效**。最后核对日期：2026-07-28。
 
 ## 自动测试
 
@@ -15,6 +15,7 @@ python3 -m py_compile \
   tools/SupermarketMapStudio/offline_processing.py
 
 xcrun swiftc -parse \
+  app/ios/RTABMapApp/SupermarketFinalizationCore.swift \
   app/ios/RTABMapApp/PriorMapLocalizationCore.swift \
   app/ios/RTABMapApp/PriorMapLocalization.swift \
   app/ios/RTABMapApp/SupermarketScanSession.swift \
@@ -54,7 +55,8 @@ xcodebuild -quiet -project app/ios/RTABMapApp.xcodeproj \
 - JSONL 必需/可选策略、非法 UTF‑8、NaN/Infinity、format/version、身份、时间、空文件、重复 observation/tag ID；
 - staging 失败、陈旧 staging、损坏指针、无效版本不切 current、不可变旧版本和具体 version artifact；
 - POSIX/Windows 并发锁、Windows write-through 原子移动、输入 identity、处理中输入变化、旧版本 local-input 隔离和已打开文件字节复核；
-- iOS 必需 sidecar 结构化写结果、state watermark 仅在成功后推进、粘性 capture health、metadata 最后提交、checkpoint 保留和 PC eligibility fail-closed；
+- iOS 必需 sidecar 结构化写结果、state watermark 仅在成功后推进、粘性 capture health；可注入 Swift writer 实际覆盖每个必需文件部分失败、metadata 提交前失败、checkpoint 提交后删除失败、成功终态和同字节数复制篡改；
+- finalized checkpoint 手机/PC 显式清理只接受同 tracking identity、有限 Unix 时间且 checkpoint 不晚于 metadata commit；身份不符、较新 checkpoint、缺字段和自动清理全部 fail closed；
 - expected version/revision 缺失、两个客户端使用同一基准版本的 CAS 冲突、HTTP 409、服务端 old value/UTC/ID、字段/范围/货架边长/批准前校验、重放失败回滚；
 - draft→review 新版本、bounded solver 发布 422 硬阻断、published 指针不产生；
 - 自由扫描默认入口和旧会话处理回归。
@@ -102,6 +104,7 @@ python3 tools/PriorMap/replay_localization.py "$out" \
 4. 在办公室步行，确认 HUD 轨迹连续；遮挡相机后变 weak/lost，但数据库继续增长。
 5. 人工确认/重新选择位置，检查两个 JSONL。
 6. 正常结束，确认 metadata 地图身份、`finalized=true`、capture health 完整、eligibility blockers 为空、无 checkpoint、NFC 不可见。
-7. 在测试构建中注入一次必需 sidecar 写失败，确认红色告警持续、原数据库继续增长、结束后 `finalized=false` 且 checkpoint 保留，PC 明确拒绝；不得在真实扫描目录上用权限破坏方式注入。
+7. 在测试构建中注入一次必需 sidecar 写失败，确认红色告警持续、停止新的先验地图修正/价签确认、原数据库继续增长、结束后 `finalized=false` 且 checkpoint 保留，PC 明确拒绝；不得在真实扫描目录上用权限破坏方式注入。
+8. 单独注入 metadata 已成功但 checkpoint 删除失败，确认数据库关闭、相机/映射不恢复、metadata 保持 `finalized=true`，启动后只显示严格校验的人工清理提示。
 
 正式超市验收只按 `FIELD_TEST_PLAN.md` 执行；尚未执行时不得声称生产通过。

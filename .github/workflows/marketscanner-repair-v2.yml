@@ -8,6 +8,8 @@ on:
   pull_request:
     paths:
       - ".github/workflows/marketscanner-repair-v2.yml"
+      - ".github/marketscanner-repair-v2-wave.json"
+      - "README.md"
       - "app/android/jni/**"
       - "app/ios/RTABMapApp/**"
       - "docs/map-assisted-localization/**"
@@ -59,19 +61,13 @@ jobs:
         env:
           PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
-          REPAIR_BASE_BRANCH: repair-v2-w0-ci-baseline
         run: |
           if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
             base_sha="$PR_BASE_SHA"
           else
-            if git fetch --no-tags origin "$REPAIR_BASE_BRANCH"; then
-              base_sha="$(git merge-base HEAD "origin/$REPAIR_BASE_BRANCH")"
-            else
-              git fetch --no-tags origin "$DEFAULT_BRANCH"
-              base_sha="$(git merge-base HEAD "origin/$DEFAULT_BRANCH")"
-            fi
+            base_sha="$(python3 -c 'import json; print(json.load(open(".github/marketscanner-repair-v2-wave.json", encoding="utf-8"))["base_sha"])')"
           fi
-          if [ -z "$base_sha" ]; then
+          if [ -z "$base_sha" ] || ! git cat-file -e "$base_sha^{commit}"; then
             echo "Unable to determine the complete branch diff base." >&2
             exit 1
           fi
@@ -212,6 +208,7 @@ jobs:
         id: swift_parse
         run: |
           xcrun swiftc -parse \
+            app/ios/RTABMapApp/SupermarketFinalizationCore.swift \
             app/ios/RTABMapApp/PriorMapLocalizationCore.swift \
             app/ios/RTABMapApp/PriorMapLocalization.swift \
             app/ios/RTABMapApp/PriceTagLocalizationCore.swift \

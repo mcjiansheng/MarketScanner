@@ -1,4 +1,9 @@
-# MarketScanner 第一、二、三阶段最终综合代码审查与需求验收报告
+# MarketScanner 第一、二、三阶段综合代码审查与需求验收报告（历史归档）
+
+> 文档状态：**历史归档**。最后核对日期：2026-07-28。
+> 审查基线：`feature/prior-map-localization@d3eefcf8e8e54b9fb517f00fb189aab737b161ff`。
+> 当前状态入口：[`../../IMPLEMENTATION_STATUS.md`](../../IMPLEMENTATION_STATUS.md)。
+> 本报告不得作为当前分支的测试通过、发布资格或独立复审证据。
 
 **审查日期：** 2026-07-25  
 **仓库：** `https://github.com/mcjiansheng/MarketScanner`  
