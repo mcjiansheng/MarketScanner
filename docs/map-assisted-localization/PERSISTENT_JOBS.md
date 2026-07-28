@@ -50,6 +50,7 @@ POST /api/jobs/<id>/cancel
 ## 自动验证
 
 - 活动任务重启后变为 `interrupted`，进度和历史保留；
+- 独立运行时进程在任务进入 `running` 后被操作系统强制终止，下一进程从落盘 journal 恢复为 `interrupted`；
 - 取消意图落盘并唤醒 worker；
 - 实际长运行子进程被终止，原始 DB 字节不变，partial 输出不存在，原始日志留存；
 - 损坏 journal 失败关闭，伪造输出路径中的文件不被删除；

@@ -8,6 +8,7 @@ import shutil
 import sqlite3
 import stat
 import struct
+import subprocess
 import sys
 import tempfile
 import threading
@@ -2954,6 +2955,55 @@ class MapStudioApiTests(unittest.TestCase):
 
 
 class PersistentJobRuntimeTests(unittest.TestCase):
+    def test_killed_runtime_process_recovers_job_as_interrupted(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            journals = root / "journals"
+            marker = root / "running-job-id.txt"
+            child_script = "\n".join((
+                "import sys, time",
+                "from pathlib import Path",
+                "sys.path.insert(0, sys.argv[1])",
+                "import server",
+                "state = server.StudioState(Path(sys.argv[2]))",
+                "job = state.add('map', Path(sys.argv[3]), (sys.argv[4],))",
+                "state.set_status(job.identifier, 'running')",
+                "Path(sys.argv[5]).write_text(job.identifier, encoding='utf-8')",
+                "time.sleep(60)",
+            ))
+            process = subprocess.Popen([
+                sys.executable,
+                "-c",
+                child_script,
+                str(STUDIO_DIR),
+                str(journals),
+                str(root / "output"),
+                str(root / "input.db"),
+                str(marker),
+            ])
+            try:
+                deadline = time.time() + 10
+                while time.time() < deadline and not marker.is_file():
+                    if process.poll() is not None:
+                        self.fail(f"runtime fixture exited early: {process.returncode}")
+                    time.sleep(0.02)
+                self.assertTrue(marker.is_file())
+                job_id = marker.read_text(encoding="utf-8")
+                process.kill()
+                process.wait(timeout=10)
+
+                restarted = server.StudioState(journals)
+                restored = restarted.get(job_id)
+                self.assertIsNotNone(restored)
+                assert restored is not None
+                self.assertEqual(restored.status, "interrupted")
+                self.assertIn("restarted", restored.error or "")
+                self.assertFalse((root / "output").exists())
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    process.wait(timeout=10)
+
     def test_cancellation_stops_reprocess_child_and_preserves_runtime_log(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
