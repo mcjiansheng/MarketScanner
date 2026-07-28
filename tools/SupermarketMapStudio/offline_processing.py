@@ -131,6 +131,14 @@ def find_reprocess_binary(explicit: Optional[str] = None, prefer_cuda: bool = Fa
     # binary, while still letting an explicit path or environment override win.
     if prefer_cuda:
         candidates.append(repository / "build-pc-cuda/bin/rtabmap-reprocess")
+    candidates.extend(
+        repository / relative
+        for relative in (
+            "build/marketscanner-macos-release/bin/rtabmap-reprocess",
+            "build/marketscanner-linux-release/bin/rtabmap-reprocess",
+            "build/marketscanner-windows-release/bin/rtabmap-reprocess.exe",
+        )
+    )
     candidates.append(repository / "build-pc-release/bin/rtabmap-reprocess")
     discovered = shutil.which("rtabmap-reprocess")
     if discovered:

@@ -1,0 +1,25 @@
+{
+  "format": "MarketScannerDependencyPolicy",
+  "version": 1,
+  "last_reviewed": "2026-07-28",
+  "pc": [
+    {"name": "OpenCV", "supported_major": [4, 5], "required": true, "license_note": "Apache-2.0/BSD; inspect enabled nonfree modules in the resolved build"},
+    {"name": "PCL", "minimum": "1.7", "required": true, "license_note": "BSD-3-Clause"},
+    {"name": "g2o", "required": true, "license_note": "BSD"},
+    {"name": "Eigen", "required": true, "license_note": "MPL-2.0"},
+    {"name": "SQLite", "required": true, "license_note": "Public Domain"},
+    {"name": "Boost", "required": true, "license_note": "BSL-1.0"}
+  ],
+  "ios": {
+    "build_script": "app/ios/RTABMapApp/install_deps.sh",
+    "output": "app/ios/RTABMapApp/Libraries",
+    "cache_contract": "The cache key includes this policy, install_deps.sh, Xcode version and architecture; a build manifest hashes every produced header/library before app link.",
+    "required_artifacts": [
+      "include/rtabmap-0.23/rtabmap/core/Rtabmap.h",
+      "lib/librtabmap_core.a",
+      "lib/librtabmap_utilite.a",
+      "lib/libopencv_core.a",
+      "lib/libpcl_common.a"
+    ]
+  }
+}

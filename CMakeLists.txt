@@ -235,12 +235,20 @@ option(PCL_OMP            "With PCL OMP implementations"         OFF)
 ELSE()
 option(PCL_OMP            "With PCL OMP implementations"         ON)
 ENDIF()
+option(MARKETSCANNER_RELEASE_BUILD "Enable fail-closed MarketScanner release dependency checks" OFF)
 option(BUILD_WITH_RPATH_NOT_RUNPATH "Explicitly disable usage of RUNPATH for the build tree on linux systems by adding --disable-new-dtags to linker (using old RPATH behavior instead)"    OFF)
 
 set(RTABMAP_QT_VERSION AUTO CACHE STRING "Force a specific Qt version.")
 set_property(CACHE RTABMAP_QT_VERSION PROPERTY STRINGS AUTO 4 5 6)
 
 FIND_PACKAGE(OpenCV REQUIRED QUIET COMPONENTS core calib3d imgproc highgui stitching photo video videoio OPTIONAL_COMPONENTS aruco objdetect xfeatures2d nonfree gpu cudafeatures2d cudaoptflow cudaimgproc)
+
+IF(MARKETSCANNER_RELEASE_BUILD)
+  IF(NOT OpenCV_VERSION_MAJOR EQUAL 4 AND NOT OpenCV_VERSION_MAJOR EQUAL 5)
+    MESSAGE(FATAL_ERROR "MarketScanner release builds support OpenCV major 4 or 5; found ${OpenCV_VERSION}.")
+  ENDIF()
+  MESSAGE(STATUS "MarketScanner OpenCV capability contract: major=${OpenCV_VERSION_MAJOR}, version=${OpenCV_VERSION}")
+ENDIF()
 
 IF(WITH_QT)
 FIND_PACKAGE(PCL 1.7 REQUIRED QUIET COMPONENTS common io kdtree search surface filters registration sample_consensus segmentation visualization)
@@ -533,6 +541,28 @@ IF(WITH_G2O)
         ENDIF(G2O_FOUND)
     ENDIF()
 ENDIF(WITH_G2O)
+
+IF(MARKETSCANNER_RELEASE_BUILD)
+  IF(NOT G2O_FOUND)
+    MESSAGE(FATAL_ERROR "MarketScanner release build requires g2o.")
+  ENDIF()
+  IF(NOT EIGEN_INCLUDE_DIRS AND NOT Eigen3_INCLUDE_DIRS AND NOT TARGET Eigen3::Eigen)
+    MESSAGE(FATAL_ERROR "MarketScanner release build requires discoverable Eigen headers or Eigen3::Eigen.")
+  ENDIF()
+  IF(NOT DEFINED MARKETSCANNER_GIT_SHA OR MARKETSCANNER_GIT_SHA STREQUAL "")
+    EXECUTE_PROCESS(
+      COMMAND git rev-parse HEAD
+      WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+      OUTPUT_VARIABLE MARKETSCANNER_GIT_SHA
+      OUTPUT_STRIP_TRAILING_WHITESPACE
+      ERROR_QUIET)
+  ENDIF()
+  STRING(LENGTH "${MARKETSCANNER_GIT_SHA}" MARKETSCANNER_GIT_SHA_LENGTH)
+  IF(NOT MARKETSCANNER_GIT_SHA MATCHES "^[0-9a-f]+$" OR NOT MARKETSCANNER_GIT_SHA_LENGTH EQUAL 40)
+    MESSAGE(FATAL_ERROR "MarketScanner release build requires a 40-character MARKETSCANNER_GIT_SHA.")
+  ENDIF()
+  MESSAGE(STATUS "MarketScanner release source SHA: ${MARKETSCANNER_GIT_SHA}")
+ENDIF()
 
 IF(WITH_GTSAM)
     # Force config mode to ignore PCL's findGTSAM.cmake file

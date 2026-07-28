@@ -117,7 +117,7 @@ if [ ! -e $prefix/include/gtsam ]
 then
 if [ ! -e gtsam ]
 then
-  git clone https://github.com/borglab/gtsam.git -b 4.2
+  git clone --branch 4.2 --depth 1 https://github.com/borglab/gtsam.git
 fi
 cd gtsam
 # patch
@@ -180,9 +180,8 @@ if [ ! -e $prefix/lib/vtk.framework ]
 then
 if [ ! -e VTK ]
 then
-  git clone https://github.com/Kitware/VTK.git
+  git clone --branch v9.5.0.rc1 --depth 1 https://github.com/Kitware/VTK.git
   cd VTK
-  git checkout tags/v9.5.0.rc1
 else
   cd VTK
 fi
@@ -202,9 +201,8 @@ if [ ! -e $prefix/include/pcl-1.15 ]
 then
 if [ ! -e pcl ]
 then
-  git clone https://github.com/PointCloudLibrary/pcl.git
+  git clone --branch pcl-1.15.0 --depth 1 https://github.com/PointCloudLibrary/pcl.git
   cd pcl
-  git checkout tags/pcl-1.15.0
 else
   cd pcl
 fi
@@ -269,7 +267,7 @@ if [ ! -e $prefix/include/liblas ]
 then
 if [ ! -e libLAS ]
 then
-  git clone https://github.com/libLAS/libLAS.git
+  git clone --branch 1.8.1 --depth 1 https://github.com/libLAS/libLAS.git
 fi
 cd libLAS
 sed -i '' 's/cmake_minimum_required(VERSION 2.8.11)/cmake_minimum_required(VERSION 3.5)/g' CMakeLists.txt

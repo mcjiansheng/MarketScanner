@@ -26,6 +26,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 */
 
 #include <rtabmap/core/Rtabmap.h>
+#include <rtabmap/core/Version.h>
 #include <rtabmap/core/DBDriver.h>
 #include <rtabmap/core/DBReader.h>
 #ifdef RTABMAP_OCTOMAP
@@ -235,6 +236,15 @@ void showLocalizationStats(const std::string & outputDatabasePath)
 
 int main(int argc, char * argv[])
 {
+	if(argc == 2 && strcmp(argv[1], "--version") == 0)
+	{
+#ifdef MARKETSCANNER_GIT_SHA
+		printf("rtabmap-reprocess %s marketscanner_git_sha=%s\n", RTABMAP_VERSION, MARKETSCANNER_GIT_SHA);
+#else
+		printf("rtabmap-reprocess %s marketscanner_git_sha=untracked-build\n", RTABMAP_VERSION);
+#endif
+		return 0;
+	}
 	signal(SIGABRT, &sighandler);
 	signal(SIGTERM, &sighandler);
 	signal(SIGINT, &sighandler);

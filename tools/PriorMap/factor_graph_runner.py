@@ -47,6 +47,9 @@ def find_factor_graph_binary(explicit: str | Path | None = None) -> Path | None:
     candidates.extend(
         repository / relative
         for relative in (
+            "build/marketscanner-macos-release/bin/rtabmap-prior-map-factor-graph",
+            "build/marketscanner-linux-release/bin/rtabmap-prior-map-factor-graph",
+            "build/marketscanner-windows-release/bin/rtabmap-prior-map-factor-graph.exe",
             "build-pc-release/bin/rtabmap-prior-map-factor-graph",
             "build/bin/rtabmap-prior-map-factor-graph",
             "build/tools/Reprocess/rtabmap-prior-map-factor-graph",

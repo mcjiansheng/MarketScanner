@@ -1,0 +1,56 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": {"major": 3, "minor": 25, "patch": 0},
+  "configurePresets": [
+    {
+      "name": "marketscanner-release-base",
+      "hidden": true,
+      "generator": "Ninja",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "BUILD_APP": "OFF",
+        "BUILD_TOOLS": "ON",
+        "BUILD_EXAMPLES": "OFF",
+        "WITH_QT": "OFF",
+        "WITH_G2O": "ON",
+        "WITH_GTSAM": "OFF",
+        "WITH_CERES": "OFF",
+        "WITH_MRPT": "OFF",
+        "WITH_PDAL": "OFF",
+        "WITH_FREENECT": "OFF",
+        "WITH_FREENECT2": "OFF",
+        "WITH_K4A": "OFF",
+        "WITH_OPENNI": "OFF",
+        "WITH_OPENNI2": "OFF",
+        "WITH_DC1394": "OFF",
+        "WITH_REALSENSE": "OFF",
+        "WITH_REALSENSE2": "OFF",
+        "WITH_ZED": "OFF",
+        "WITH_ZEDOC": "OFF",
+        "WITH_OCTOMAP": "OFF",
+        "WITH_OPENGV": "OFF",
+        "MARKETSCANNER_RELEASE_BUILD": "ON"
+      }
+    },
+    {
+      "name": "marketscanner-linux-release",
+      "inherits": "marketscanner-release-base",
+      "binaryDir": "${sourceDir}/build/marketscanner-linux-release"
+    },
+    {
+      "name": "marketscanner-macos-release",
+      "inherits": "marketscanner-release-base",
+      "binaryDir": "${sourceDir}/build/marketscanner-macos-release"
+    },
+    {
+      "name": "marketscanner-windows-release",
+      "inherits": "marketscanner-release-base",
+      "binaryDir": "${sourceDir}/build/marketscanner-windows-release"
+    }
+  ],
+  "buildPresets": [
+    {"name": "marketscanner-linux-release", "configurePreset": "marketscanner-linux-release", "targets": ["reprocess", "prior_map_factor_graph"]},
+    {"name": "marketscanner-macos-release", "configurePreset": "marketscanner-macos-release", "targets": ["reprocess", "prior_map_factor_graph"]},
+    {"name": "marketscanner-windows-release", "configurePreset": "marketscanner-windows-release", "targets": ["reprocess", "prior_map_factor_graph"]}
+  ]
+}

@@ -10,11 +10,14 @@ on:
       - ".github/workflows/marketscanner-repair-v2.yml"
       - ".github/marketscanner-repair-v2-wave.json"
       - "README.md"
+      - "CMakeLists.txt"
+      - "CMakePresets.json"
       - "app/android/jni/**"
       - "app/ios/RTABMapApp/**"
       - "docs/map-assisted-localization/**"
       - "tools/PriorMap/**"
       - "tools/Reprocess/CMakeLists.txt"
+      - "tools/Reprocess/main.cpp"
       - "tools/Reprocess/prior_map_factor_graph.cpp"
       - "tools/SupermarketMapStudio/**"
 
@@ -173,6 +176,50 @@ jobs:
           path: ci-artifacts/windows-summary.md
           if-no-files-found: error
 
+  ubuntu-native-clean-build:
+    name: Ubuntu clean native release build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install declared native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build pkg-config libboost-all-dev libeigen3-dev \
+            libg2o-dev libopencv-dev libpcl-dev libsqlite3-dev zlib1g-dev
+      - name: Fresh configure from the release preset
+        run: cmake --fresh --preset marketscanner-linux-release
+      - name: Build reprocess and factor helper from the empty build tree
+        run: cmake --build --preset marketscanner-linux-release -j2
+      - name: Verify source-bound binary versions
+        shell: bash
+        run: |
+          expected="$(git rev-parse HEAD)"
+          build/marketscanner-linux-release/bin/rtabmap-reprocess --version | tee reprocess-version.txt
+          build/marketscanner-linux-release/bin/rtabmap-prior-map-factor-graph --version | tee factor-version.txt
+          grep -F "marketscanner_git_sha=$expected" reprocess-version.txt
+          grep -F "marketscanner_git_sha=$expected" factor-version.txt
+      - name: Generate release/dependency manifest
+        run: |
+          python3 tools/SupermarketMapStudio/release_manifest.py \
+            --output marketscanner-linux-release-manifest.json \
+            --git-sha "$(git rev-parse HEAD)" \
+            --platform linux \
+            --dependency-policy tools/SupermarketMapStudio/release_dependencies.json \
+            --artifact build/marketscanner-linux-release/bin/rtabmap-reprocess \
+            --artifact build/marketscanner-linux-release/bin/rtabmap-prior-map-factor-graph
+      - uses: actions/upload-artifact@v4
+        with:
+          name: marketscanner-linux-native-${{ github.sha }}
+          path: |
+            marketscanner-linux-release-manifest.json
+            build/marketscanner-linux-release/bin/rtabmap-reprocess
+            build/marketscanner-linux-release/bin/rtabmap-prior-map-factor-graph
+          if-no-files-found: error
+
   native-source-contracts:
     name: Native ABI source contracts
     runs-on: ubuntu-latest
@@ -223,7 +270,7 @@ jobs:
   ios-source-contracts:
     name: macOS and iOS source contracts
     runs-on: macos-14
-    timeout-minutes: 45
+    timeout-minutes: 240
     steps:
       - uses: actions/checkout@v4
         with:
@@ -256,7 +303,34 @@ jobs:
       - name: Validate Xcode project metadata
         id: xcode_list
         run: xcodebuild -project app/ios/RTABMapApp.xcodeproj -list
-      - name: Build unsigned generic arm64 iOS app when native dependencies exist
+      - name: Restore traceable iOS native dependency cache
+        id: ios_native_cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            app/ios/RTABMapApp/Libraries/include
+            app/ios/RTABMapApp/Libraries/lib
+            app/ios/RTABMapApp/Libraries/ios-dependency-manifest.json
+          key: marketscanner-ios-native-${{ runner.arch }}-${{ hashFiles('app/ios/RTABMapApp/install_deps.sh', 'tools/SupermarketMapStudio/release_dependencies.json') }}
+      - name: Build iOS native dependencies on cache miss
+        if: steps.ios_native_cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          cd app/ios/RTABMapApp
+          bash install_deps.sh
+          cd ../../..
+          python3 tools/SupermarketMapStudio/ios_dependency_manifest.py \
+            --libraries app/ios/RTABMapApp/Libraries \
+            --output app/ios/RTABMapApp/Libraries/ios-dependency-manifest.json \
+            --git-sha "$(git rev-parse HEAD)"
+      - name: Verify cached or freshly built iOS dependencies
+        run: |
+          python3 tools/SupermarketMapStudio/ios_dependency_manifest.py \
+            --verify \
+            --libraries app/ios/RTABMapApp/Libraries \
+            --output app/ios/RTABMapApp/Libraries/ios-dependency-manifest.json \
+            --git-sha "$(git rev-parse HEAD)"
+      - name: Build unsigned generic arm64 iOS app
         id: ios_build
         shell: bash
         run: |
@@ -267,19 +341,12 @@ jobs:
             app/ios/RTABMapApp/Libraries/lib/libopencv_core.a
             app/ios/RTABMapApp/Libraries/lib/libpcl_common.a
           )
-          missing_dependencies=()
           for dependency in "${required_dependencies[@]}"; do
             if [ ! -f "$dependency" ]; then
-              missing_dependencies+=("$dependency")
+              echo "Missing required generated dependency: $dependency" >&2
+              exit 1
             fi
           done
-          if [ "${#missing_dependencies[@]}" -ne 0 ]; then
-            echo "iOS build SKIPPED: generated native dependencies are unavailable on this runner."
-            printf 'Missing dependency: %s\n' "${missing_dependencies[@]}"
-            echo "status=skipped-missing-native-dependencies" >> "$GITHUB_OUTPUT"
-            echo "- Unsigned generic arm64 iOS build: **SKIPPED** (generated native dependencies unavailable; no build success claimed)" >> ci-artifacts/macos-ios-summary.md
-            exit 0
-          fi
           xcodebuild \
             -project app/ios/RTABMapApp.xcodeproj \
             -scheme RTABMapApp \
@@ -303,8 +370,9 @@ jobs:
             echo "- Swift parse step outcome: \`${{ steps.swift_parse.outcome }}\`"
             echo "- Swift core contract step outcome: \`${{ steps.swift_contracts.outcome }}\`"
             echo "- Xcode metadata step outcome: \`${{ steps.xcode_list.outcome }}\`"
-            echo "- Conditional iOS build step outcome: \`${{ steps.ios_build.outcome }}\`"
-            echo "- Conditional iOS build status: \`${{ steps.ios_build.outputs.status || 'not-run' }}\`"
+            echo "- iOS dependency cache hit: \`${{ steps.ios_native_cache.outputs.cache-hit || 'false' }}\`"
+            echo "- Unsigned iOS build step outcome: \`${{ steps.ios_build.outcome }}\`"
+            echo "- Unsigned iOS build status: \`${{ steps.ios_build.outputs.status || 'not-run' }}\`"
             echo "- Job result: \`${{ job.status }}\`"
           } >> ci-artifacts/macos-ios-summary.md
           cat ci-artifacts/macos-ios-summary.md

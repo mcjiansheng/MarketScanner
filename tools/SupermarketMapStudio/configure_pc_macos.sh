@@ -3,7 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="${0:A:h}"
 REPOSITORY="${SCRIPT_DIR:h:h}"
-BUILD_DIR="${REPOSITORY}/build-pc-release"
+BUILD_DIR="${REPOSITORY}/build/marketscanner-macos-release"
 BREW="/opt/homebrew/bin/brew"
 
 if [[ ! -x "${BREW}" ]]; then
@@ -29,8 +29,8 @@ BREW_PREFIX="$(${BREW} --prefix)"
 LIBOMP_PREFIX="$(${BREW} --prefix libomp)"
 OPENMP_FLAGS="-Xpreprocessor -fopenmp -I${LIBOMP_PREFIX}/include"
 
-cmake -S "${REPOSITORY}" -B "${BUILD_DIR}" -G Ninja \
-  -DCMAKE_BUILD_TYPE=Release \
+cd "${REPOSITORY}"
+cmake --fresh --preset marketscanner-macos-release \
   -DOpenCV_DIR="${BREW_PREFIX}/opt/opencv@4/lib/cmake/opencv4" \
   -DEigen3_DIR="${BREW_PREFIX}/opt/eigen/share/eigen3/cmake" \
   -DEIGEN3_INCLUDE_DIR="${BREW_PREFIX}/include/eigen3" \
@@ -39,21 +39,6 @@ cmake -S "${REPOSITORY}" -B "${BUILD_DIR}" -G Ninja \
   -DOpenMP_C_LIB_NAMES=omp \
   -DOpenMP_CXX_LIB_NAMES=omp \
   -DOpenMP_omp_LIBRARY="${LIBOMP_PREFIX}/lib/libomp.dylib" \
-  -DBUILD_APP=OFF \
-  -DBUILD_TOOLS=ON \
-  -DBUILD_EXAMPLES=OFF \
-  -DWITH_QT=OFF \
-  -DWITH_PDAL=OFF \
-  -DWITH_FREENECT=OFF \
-  -DWITH_FREENECT2=OFF \
-  -DWITH_K4A=OFF \
-  -DWITH_OPENNI=OFF \
-  -DWITH_OPENNI2=OFF \
-  -DWITH_DC1394=OFF \
-  -DWITH_G2O=ON \
-  -DWITH_GTSAM=OFF \
-  -DWITH_CERES=OFF \
-  -DWITH_MRPT=OFF \
   -DWITH_POINTMATCHER=OFF \
   -DWITH_FLYCAPTURE2=OFF \
   -DWITH_ZED=OFF \
@@ -68,7 +53,7 @@ cmake -S "${REPOSITORY}" -B "${BUILD_DIR}" -G Ninja \
   -DWITH_VERTIGO=ON
 
 JOBS="$(sysctl -n hw.logicalcpu 2>/dev/null || print 4)"
-cmake --build "${BUILD_DIR}" --target reprocess -j "${JOBS}"
+cmake --build --preset marketscanner-macos-release -j "${JOBS}"
 
 BINARY="${BUILD_DIR}/bin/rtabmap-reprocess"
 if [[ ! -x "${BINARY}" ]]; then
@@ -78,5 +63,6 @@ fi
 
 print "PC reprocessing environment is ready:"
 print "  ${BINARY}"
+print "  ${BUILD_DIR}/bin/rtabmap-prior-map-factor-graph"
 print "  Release/O3 + OpenMP (${JOBS} build jobs)"
 print "Supermarket Map Studio will discover this path automatically."

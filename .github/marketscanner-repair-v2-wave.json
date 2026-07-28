@@ -1,5 +1,5 @@
 {
-  "wave": "P1-relative-se2-factor-graph",
-  "base_branch": "repair-v2-p0-production-baseline",
-  "base_sha": "b22b74b03c5d2872fedf94770710284105cb1364"
+  "wave": "P2-reproducible-release-build",
+  "base_branch": "repair-v2-p1-relative-se2-factor-graph",
+  "base_sha": "c999d6cce2711bdade3ef8ee079cbad8ebfd9c1e"
 }

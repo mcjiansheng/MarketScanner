@@ -11,6 +11,7 @@
 #include <rtabmap/core/Optimizer.h>
 #include <rtabmap/core/Parameters.h>
 #include <rtabmap/core/Transform.h>
+#include <rtabmap/core/Version.h>
 #include <rtabmap/utilite/ULogger.h>
 
 #include <opencv2/core/core.hpp>
@@ -591,6 +592,15 @@ int main(int argc, char ** argv)
 {
 	try
 	{
+		if(argc == 2 && std::string(argv[1]) == "--version")
+		{
+#ifdef MARKETSCANNER_GIT_SHA
+			std::cout << "rtabmap-prior-map-factor-graph " << RTABMAP_VERSION << " marketscanner_git_sha=" << MARKETSCANNER_GIT_SHA << std::endl;
+#else
+			std::cout << "rtabmap-prior-map-factor-graph " << RTABMAP_VERSION << " marketscanner_git_sha=untracked-build" << std::endl;
+#endif
+			return 0;
+		}
 		ULogger::setType(ULogger::kTypeConsole);
 		ULogger::setLevel(ULogger::kWarning);
 		Options options = parseOptions(argc, argv);
