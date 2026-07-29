@@ -22,6 +22,24 @@ from tools.SupermarketMapStudio.server import operator_package_diagnostic  # noq
 
 
 class ReleaseManifestTests(unittest.TestCase):
+    def test_windows_native_ci_pins_dependency_archive_and_builds_release_tools(self) -> None:
+        repository = Path(__file__).resolve().parents[3]
+        dependency_action = (repository / ".github/actions/install-windows-deps/action.yml").read_text(
+            encoding="utf-8"
+        )
+        workflow = (repository / ".github/workflows/marketscanner-repair-v2.yml").read_text(
+            encoding="utf-8"
+        )
+        expected_sha256 = "8093a0fe6eb424594514eac166a6ede65b798500031093eaff01fd5e2ee8bf50"
+        self.assertIn(f'$expectedSha256 = "{expected_sha256}"', dependency_action)
+        self.assertIn("Get-FileHash -LiteralPath $archivePath -Algorithm SHA256", dependency_action)
+        self.assertIn("for ($attempt = 1; $attempt -le 3; $attempt++)", dependency_action)
+        self.assertIn("windows-native-clean-build:", workflow)
+        self.assertIn("cmake --fresh --preset marketscanner-windows-release", workflow)
+        self.assertIn("cmake --build --preset marketscanner-windows-release --parallel 2", workflow)
+        self.assertIn("marketscanner-windows-release-manifest.json", workflow)
+        self.assertIn("rtabmap-prior-map-factor-graph.exe", workflow)
+
     def test_ios_gtsam_build_uses_cxx17_for_current_boost_headers(self) -> None:
         install_script = (
             Path(__file__).resolve().parents[3]

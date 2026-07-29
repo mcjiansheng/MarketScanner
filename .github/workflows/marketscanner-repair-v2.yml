@@ -181,6 +181,59 @@ jobs:
           path: ci-artifacts/windows-summary.md
           if-no-files-found: error
 
+  windows-native-clean-build:
+    name: Windows clean native release build
+    runs-on: windows-2022
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install hash-pinned Windows native dependencies
+        uses: ./.github/actions/install-windows-deps
+      - name: Fresh configure from the Windows release preset
+        shell: pwsh
+        run: |
+          cmake --fresh --preset marketscanner-windows-release `
+            -DVCPKG_MANIFEST_INSTALL=OFF `
+            -DVCPKG_TARGET_TRIPLET=x64-windows-release `
+            -DVCPKG_INSTALLED_DIR="$env:VCPKG_EXPORT_PATH/installed" `
+            -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_EXPORT_PATH/scripts/buildsystems/vcpkg.cmake"
+      - name: Build reprocess and factor helper from the empty build tree
+        run: cmake --build --preset marketscanner-windows-release --parallel 2
+      - name: Verify source-bound binary versions
+        shell: pwsh
+        run: |
+          $expected = git rev-parse HEAD
+          $reprocess = "build/marketscanner-windows-release/bin/rtabmap-reprocess.exe"
+          $factor = "build/marketscanner-windows-release/bin/rtabmap-prior-map-factor-graph.exe"
+          & $reprocess --version | Tee-Object -FilePath reprocess-version.txt
+          & $factor --version | Tee-Object -FilePath factor-version.txt
+          if (-not (Select-String -Path reprocess-version.txt -SimpleMatch "marketscanner_git_sha=$expected")) {
+            throw "rtabmap-reprocess does not report the checked-out source SHA."
+          }
+          if (-not (Select-String -Path factor-version.txt -SimpleMatch "marketscanner_git_sha=$expected")) {
+            throw "rtabmap-prior-map-factor-graph does not report the checked-out source SHA."
+          }
+      - name: Generate release/dependency manifest
+        shell: pwsh
+        run: |
+          python tools/SupermarketMapStudio/release_manifest.py `
+            --output marketscanner-windows-release-manifest.json `
+            --git-sha "$(git rev-parse HEAD)" `
+            --platform windows `
+            --dependency-policy tools/SupermarketMapStudio/release_dependencies.json `
+            --artifact build/marketscanner-windows-release/bin/rtabmap-reprocess.exe `
+            --artifact build/marketscanner-windows-release/bin/rtabmap-prior-map-factor-graph.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: marketscanner-windows-native-${{ github.sha }}
+          path: |
+            marketscanner-windows-release-manifest.json
+            build/marketscanner-windows-release/bin/rtabmap-reprocess.exe
+            build/marketscanner-windows-release/bin/rtabmap-prior-map-factor-graph.exe
+          if-no-files-found: error
+
   ubuntu-native-clean-build:
     name: Ubuntu clean native release build
     runs-on: ubuntu-24.04

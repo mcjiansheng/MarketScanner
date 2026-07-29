@@ -13,7 +13,7 @@ runs:
       uses: actions/cache@v4
       with:
         path: ${{ runner.workspace }}/vcpkg_installed
-        key: ${{ runner.os }}-vcpkg-export-66c0373d-x64-vs2022-v4
+        key: ${{ runner.os }}-vcpkg-export-66c0373d-x64-vs2022-sha256-8093a0fe6eb42459
 
     - name: Download and Install vcpkg
       if: steps.cache-vcpkg.outputs.cache-hit != 'true'
@@ -24,9 +24,28 @@ runs:
 
         # The file has been built locally with bundle-windows-deps.bat
         $url = "https://github.com/introlab/rtabmap/releases/download/0.23.1/vcpkg-export-66c0373d-x64-vs2022.7z"
+        $expectedSha256 = "8093a0fe6eb424594514eac166a6ede65b798500031093eaff01fd5e2ee8bf50"
 
-        Invoke-WebRequest -Uri $url -OutFile $archivePath
+        $downloaded = $false
+        for ($attempt = 1; $attempt -le 3; $attempt++) {
+          try {
+            Invoke-WebRequest -Uri $url -OutFile $archivePath
+            $downloaded = $true
+            break
+          } catch {
+            Remove-Item -LiteralPath $archivePath -Force -ErrorAction SilentlyContinue
+            if ($attempt -eq 3) { throw }
+            Start-Sleep -Seconds (5 * $attempt)
+          }
+        }
+        if (-not $downloaded) { throw "Windows dependency archive download did not complete." }
+        $actualSha256 = (Get-FileHash -LiteralPath $archivePath -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($actualSha256 -ne $expectedSha256) {
+          Remove-Item -LiteralPath $archivePath -Force
+          throw "Windows dependency archive SHA-256 mismatch: $actualSha256"
+        }
         & 7z x $archivePath "-o$install_dir" -y
+        if ($LASTEXITCODE -ne 0) { throw "Windows dependency archive extraction failed." }
 
     - name: Add vcpkg to PATH and env variable
       shell: pwsh
