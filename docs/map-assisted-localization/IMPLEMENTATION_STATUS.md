@@ -88,7 +88,7 @@ P7 已实现 loopback-only server、每次启动随机且不落盘的 token、PO
 | 操作者取消 | 已实现 | 持久取消意图；原生子进程 terminate→有界 wait→kill；partial 清理 |
 | 原生运行日志 | 已实现 | fast/discovery 独立日志、严格文件名和任务归属下载 |
 | 损坏 journal/保留策略 | 已实现 | health 报告 startup error；不按不可信路径清理；默认保留 200 个终态任务 |
-| 自动回归 | 已实现 | 工作台测试目录 76 项通过，其中持久任务测试 6 项、release manifest 测试 4 项 |
+| 自动回归 | 已实现 | 工作台测试目录 82 项通过，其中持久任务测试 7 项（包含独立运行时进程强杀/重启恢复）、release manifest 测试 5 项；资格证据测试 6 项通过并覆盖 Windows 目录同步差异 |
 
 ## 尚未完成的发布门槛
 

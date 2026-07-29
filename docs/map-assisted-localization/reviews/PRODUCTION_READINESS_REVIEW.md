@@ -37,7 +37,7 @@ P0 只冻结安全基线，不改变业务算法。CI 必须单独运行并报�
 | P0 | 冻结 W2R 安全基线和 CI 不变量 | 本地与远端验证通过 |
 | P1 | 完整相对 SE(2) 因子图与发布门 | 已实现并完成本机真实 DB 只读验证；P1 GitHub Actions run `30360809785` 五个 job 全部成功；native clean build 属 P2 |
 | P2 | 干净、可复现的 PC/iOS 构建 | 已实现本机 macOS clean build、presets、manifest 和 fail-closed hosted CI 合同；远端/Windows 结果继续核验 |
-| P3 | Map Studio 持久任务和重启恢复 | 已实现并通过工作台测试目录 76 项回归；服务重启不猜测续跑，不按不可信 journal 路径清理 |
+| P3 | Map Studio 持久任务和重启恢复 | 已实现并通过工作台测试目录 82 项回归；独立运行时进程强杀后由新进程恢复为 `interrupted`，服务重启不猜测续跑，不按不可信 journal 路径清理 |
 | P4 | iOS finalization、保留和 provider hardening | 代码与主机压力测试已完成：100k×3 streaming、15,040,512-byte peak RSS、descriptor identity、copy v2 隐私和未执行 durability hook；真机 smoke 未执行，不声称 power-loss durability |
 | P5 | 真实设备矩阵 | evidence collector 与完整场景门已实现；真实 LiDAR iPhone 未执行，因此仍为 NO-GO |
 | P6 | 正式现场验收 | 已实现 release/阈值预冻结、3-run、20 控制点和重复性验证；办公室/卖场未执行，因此仍为 NO-GO |
