@@ -11,6 +11,45 @@ prefix=$pwd
 sysroot=iphoneos
 #sysroot=iphonesimulator
 
+clone_with_retry()
+{
+  local destination=$1
+  shift
+  if [ -z "$destination" ] || [[ "$destination" == .* ]] || [[ "$destination" == */* ]]
+  then
+    echo "Unsafe dependency clone destination: $destination" >&2
+    return 2
+  fi
+  local attempt temporary
+  for attempt in 1 2 3
+  do
+    temporary=$(mktemp -d "$pwd/.clone-${destination}.XXXXXX")
+    if git clone "$@" "$temporary/repository"
+    then
+      mv "$temporary/repository" "$destination"
+      rmdir "$temporary"
+      return 0
+    fi
+    rm -rf "$temporary"
+    if [ "$attempt" -lt 3 ]
+    then
+      sleep $((attempt * 5))
+    fi
+  done
+  echo "Failed to clone $destination after 3 attempts" >&2
+  return 1
+}
+
+download_with_retry()
+{
+  local url=$1
+  local output=$2
+  local temporary="${output}.partial"
+  curl --fail --location --retry 3 --retry-all-errors --retry-delay 5 \
+    "$url" -o "$temporary"
+  mv -f "$temporary" "$output"
+}
+
 # openmp
 # based on https://github.com/Homebrew/homebrew-core/blob/HEAD/Formula/libomp.rb
 #curl -L https://github.com/llvm/llvm-project/releases/download/llvmorg-11.1.0/openmp-11.1.0.src.tar.xz -o openmp-11.1.0.src.tar.xz
@@ -31,7 +70,7 @@ then
 if [ ! -e boost-1.88.0 ]
 then
   echo "wget boost..."
-  curl -L https://github.com/boostorg/boost/releases/download/boost-1.88.0/boost-1.88.0-cmake.tar.gz -o boost-1.88.0-cmake.tar.gz
+  download_with_retry https://github.com/boostorg/boost/releases/download/boost-1.88.0/boost-1.88.0-cmake.tar.gz boost-1.88.0-cmake.tar.gz
   tar -xzf boost-1.88.0-cmake.tar.gz
 fi
 cd boost-1.88.0
@@ -50,7 +89,7 @@ then
 if [ ! -e eigen-3.4.0 ]
 then
   echo "wget eigen..."
-  curl -L https://gitlab.com/libeigen/eigen/-/archive/3.4.0/eigen-3.4.0.tar.gz -o 3.4.0.tar.gz
+  download_with_retry https://gitlab.com/libeigen/eigen/-/archive/3.4.0/eigen-3.4.0.tar.gz 3.4.0.tar.gz
   tar -xzf 3.4.0.tar.gz
 fi
 cd eigen-3.4.0
@@ -69,16 +108,16 @@ then
 if [ ! -e lz4 ]
 then
   echo "wget lz4..."
-  git clone https://github.com/lz4/lz4.git -b v1.10.0
+  clone_with_retry lz4 --branch v1.10.0 https://github.com/lz4/lz4.git
 fi
 cd lz4
 if [ ! -e LZ4Config.cmake.in ]
 then
-  curl -L https://gist.githubusercontent.com/matlabbe/abd0242305c29495bbba26065269daf2/raw/ad0b1865c02e61449f58358fdc4ddbed3cb5fb87/LZ4Config.cmake.in -o LZ4Config.cmake.in
+  download_with_retry https://gist.githubusercontent.com/matlabbe/abd0242305c29495bbba26065269daf2/raw/ad0b1865c02e61449f58358fdc4ddbed3cb5fb87/LZ4Config.cmake.in LZ4Config.cmake.in
 fi
 if [ ! -e CMakeLists.txt ]
 then
-  curl -L https://gist.githubusercontent.com/matlabbe/abd0242305c29495bbba26065269daf2/raw/ad0b1865c02e61449f58358fdc4ddbed3cb5fb87/CMakeLists.txt -o CMakeLists.txt
+  download_with_retry https://gist.githubusercontent.com/matlabbe/abd0242305c29495bbba26065269daf2/raw/ad0b1865c02e61449f58358fdc4ddbed3cb5fb87/CMakeLists.txt CMakeLists.txt
 fi
 mkdir -p build
 cd build
@@ -95,12 +134,12 @@ then
 if [ ! -e flann ]
 then
   echo "wget flann..."
-  git clone https://github.com/flann-lib/flann.git -b 1.9.2
+  clone_with_retry flann --branch 1.9.2 https://github.com/flann-lib/flann.git
 fi
 cd flann
 if [ ! -e flann_ios_lz4.patch ]
 then
-  curl -L https://gist.githubusercontent.com/matlabbe/c858ba36fb85d5e44d8667dfb3543e12/raw/2586a356dec2b11440ec3c1bb113e709e1266d97/flann_ios_lz4.patch  -o flann_ios_lz4.patch
+  download_with_retry https://gist.githubusercontent.com/matlabbe/c858ba36fb85d5e44d8667dfb3543e12/raw/2586a356dec2b11440ec3c1bb113e709e1266d97/flann_ios_lz4.patch flann_ios_lz4.patch
   git apply flann_ios_lz4.patch
 fi
 mkdir -p build
@@ -117,13 +156,13 @@ if [ ! -e $prefix/include/gtsam ]
 then
 if [ ! -e gtsam ]
 then
-  git clone --branch 4.2 --depth 1 https://github.com/borglab/gtsam.git
+  clone_with_retry gtsam --branch 4.2 --depth 1 https://github.com/borglab/gtsam.git
 fi
 cd gtsam
 # patch
 if [ ! -e gtsam_4_2_ios.patch ]
 then
-  curl -L https://gist.githubusercontent.com/matlabbe/76d658dddb841b3355ae3a6e32850cd8/raw/e7355348c2d536ec50f41effa775ed251ae4e045/gtsam_4_2_ios.patch -o gtsam_4_2_ios.patch
+  download_with_retry https://gist.githubusercontent.com/matlabbe/76d658dddb841b3355ae3a6e32850cd8/raw/e7355348c2d536ec50f41effa775ed251ae4e045/gtsam_4_2_ios.patch gtsam_4_2_ios.patch
   git apply gtsam_4_2_ios.patch
 fi
 mkdir -p build
@@ -140,7 +179,7 @@ if [ ! -e $prefix/include/suitesparse/SuiteSparse_config.h ]
 then
 if [ ! -e SuiteSparse ]
 then
-  git clone https://github.com/DrTimothyAldenDavis/SuiteSparse.git -b v7.6.1
+  clone_with_retry SuiteSparse --branch v7.6.1 https://github.com/DrTimothyAldenDavis/SuiteSparse.git
 fi
 cd SuiteSparse
 mkdir -p build
@@ -156,14 +195,14 @@ if [ ! -e $prefix/include/g2o ]
 then
 if [ ! -e g2o ]
 then
-  git clone https://github.com/RainerKuemmerle/g2o.git -b 20241228_git
+  clone_with_retry g2o --branch 20241228_git https://github.com/RainerKuemmerle/g2o.git
 fi
 cd g2o
 # patch
 if [ ! -e g2o_20241228_ios.patch ]
 then
 ls
-  curl -L https://gist.githubusercontent.com/matlabbe/b9ccfeae8f0744b275cab23510872680/raw/6fe2ffe5ba8fba59171adbd2f38f9c3999c61f75/g2o_20241228_ios.patch -o g2o_20241228_ios.patch
+  download_with_retry https://gist.githubusercontent.com/matlabbe/b9ccfeae8f0744b275cab23510872680/raw/6fe2ffe5ba8fba59171adbd2f38f9c3999c61f75/g2o_20241228_ios.patch g2o_20241228_ios.patch
   git apply g2o_20241228_ios.patch
 fi
 mkdir -p build
@@ -180,7 +219,7 @@ if [ ! -e $prefix/lib/vtk.framework ]
 then
 if [ ! -e VTK ]
 then
-  git clone --branch v9.5.0.rc1 --depth 1 https://github.com/Kitware/VTK.git
+  clone_with_retry VTK --branch v9.5.0.rc1 --depth 1 https://github.com/Kitware/VTK.git
   cd VTK
 else
   cd VTK
@@ -201,7 +240,7 @@ if [ ! -e $prefix/include/pcl-1.15 ]
 then
 if [ ! -e pcl ]
 then
-  git clone --branch pcl-1.15.0 --depth 1 https://github.com/PointCloudLibrary/pcl.git
+  clone_with_retry pcl --branch pcl-1.15.0 --depth 1 https://github.com/PointCloudLibrary/pcl.git
   cd pcl
 else
   cd pcl
@@ -209,7 +248,7 @@ fi
 # patch
 if [ ! -e pcl_1_15_0_ios.patch ]
 then
-  curl -L https://gist.githubusercontent.com/matlabbe/f3ba9366eb91e1b855dadd2ddce5746d/raw/7231688d7fb9e86df72ca7c5f355d6b9727205d5/pcl_1_15_0_ios.patch -o pcl_1_15_0_ios.patch
+  download_with_retry https://gist.githubusercontent.com/matlabbe/f3ba9366eb91e1b855dadd2ddce5746d/raw/7231688d7fb9e86df72ca7c5f355d6b9727205d5/pcl_1_15_0_ios.patch pcl_1_15_0_ios.patch
   git apply pcl_1_15_0_ios.patch
 fi
 mkdir -p build
@@ -226,12 +265,12 @@ if [ ! -e $prefix/include/opencv4 ]
 then
 if [ ! -e opencv_contrib ]
 then
-  git clone https://github.com/opencv/opencv_contrib.git -b 4.11.0
+  clone_with_retry opencv_contrib --branch 4.11.0 https://github.com/opencv/opencv_contrib.git
 fi
 cd $pwd
 if [ ! -e opencv ]
 then
-  git clone https://github.com/opencv/opencv.git -b 4.11.0
+  clone_with_retry opencv --branch 4.11.0 https://github.com/opencv/opencv.git
 fi
 cd opencv
 mkdir -p build
@@ -249,7 +288,7 @@ if [ ! -e $prefix/include/laszip ]
 then
 if [ ! -e LASzip ]
 then
-  git clone https://github.com/LASzip/LASzip.git -b 2.0.1
+  clone_with_retry LASzip --branch 2.0.1 https://github.com/LASzip/LASzip.git
 fi
 cd LASzip
 sed -i '' 's/cmake_minimum_required(VERSION 2.6.0)/cmake_minimum_required(VERSION 3.5)/g' CMakeLists.txt
@@ -267,10 +306,8 @@ if [ ! -e $prefix/include/liblas ]
 then
 if [ ! -e libLAS ]
 then
-  git init libLAS
-  git -C libLAS remote add origin https://github.com/libLAS/libLAS.git
-  git -C libLAS fetch --depth 1 origin 33097f17e27b853ac7b9651025a70354ffb10cfc
-  git -C libLAS checkout --detach FETCH_HEAD
+  clone_with_retry libLAS --filter=blob:none --no-checkout https://github.com/libLAS/libLAS.git
+  git -C libLAS checkout --detach 33097f17e27b853ac7b9651025a70354ffb10cfc
 fi
 cd libLAS
 sed -i '' 's/cmake_minimum_required(VERSION 2.8.11)/cmake_minimum_required(VERSION 3.5)/g' CMakeLists.txt

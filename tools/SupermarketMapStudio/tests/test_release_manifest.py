@@ -49,6 +49,27 @@ class ReleaseManifestTests(unittest.TestCase):
         self.assertIn("-DWITH_GEOTIFF=OFF", liblas_block)
         self.assertNotIn("--branch 1.8.1", liblas_block)
 
+    def test_ios_dependency_network_fetches_are_bounded_and_atomic(self) -> None:
+        install_script = (
+            Path(__file__).resolve().parents[3]
+            / "app"
+            / "ios"
+            / "RTABMapApp"
+            / "install_deps.sh"
+        ).read_text(encoding="utf-8")
+        active_lines = [
+            line.strip()
+            for line in install_script.splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        ]
+        self.assertIn("clone_with_retry()", active_lines)
+        self.assertIn("download_with_retry()", active_lines)
+        self.assertEqual([line for line in active_lines if "git clone" in line], ['if git clone "$@" "$temporary/repository"'])
+        self.assertEqual([line for line in active_lines if line.startswith("curl ")], ["curl --fail --location --retry 3 --retry-all-errors --retry-delay 5 \\"])
+        self.assertIn('temporary=$(mktemp -d "$pwd/.clone-${destination}.XXXXXX")', active_lines)
+        self.assertIn('local temporary="${output}.partial"', active_lines)
+        self.assertEqual(sum(line.startswith("clone_with_retry ") for line in active_lines), 11)
+
     def test_manifest_hashes_artifacts_and_is_reproducible_for_fixed_inputs(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
