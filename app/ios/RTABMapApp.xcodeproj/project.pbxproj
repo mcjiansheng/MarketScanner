@@ -84,6 +84,7 @@
 		4E3525642DE4C71C00F39D8F /* libsuitesparseconfig.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 4E3525622DE4C71C00F39D8F /* libsuitesparseconfig.a */; };
 		4E3525652DE4C71C00F39D8F /* libspqr.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 4E3525632DE4C71C00F39D8F /* libspqr.a */; };
 		4E3525672DE4C72D00F39D8F /* libamd.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 4E3525662DE4C72D00F39D8F /* libamd.a */; };
+		4E3525682DE4C73E00F39D8F /* Accelerate.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 4E3525692DE4C73E00F39D8F /* Accelerate.framework */; };
 		4E8B155426273A580037FC53 /* Zip in Frameworks */ = {isa = PBXBuildFile; productRef = 4E8B155326273A580037FC53 /* Zip */; };
 		4EA100012F00000100100001 /* SupermarketScanSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA100012F00000100100002 /* SupermarketScanSession.swift */; };
 		4EA400012F30000100100001 /* PriorMapLocalization.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA400012F30000100100002 /* PriorMapLocalization.swift */; };
@@ -197,6 +198,7 @@
 		4E3525622DE4C71C00F39D8F /* libsuitesparseconfig.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libsuitesparseconfig.a; path = RTABMapApp/Libraries/lib/libsuitesparseconfig.a; sourceTree = "<group>"; };
 		4E3525632DE4C71C00F39D8F /* libspqr.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libspqr.a; path = RTABMapApp/Libraries/lib/libspqr.a; sourceTree = "<group>"; };
 		4E3525662DE4C72D00F39D8F /* libamd.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libamd.a; path = RTABMapApp/Libraries/lib/libamd.a; sourceTree = "<group>"; };
+		4E3525692DE4C73E00F39D8F /* Accelerate.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Accelerate.framework; path = System/Library/Frameworks/Accelerate.framework; sourceTree = SDKROOT; };
 		4E401BE825CC92C100240A56 /* ProgressionStatus.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; name = ProgressionStatus.h; path = ../android/jni/ProgressionStatus.h; sourceTree = "<group>"; };
 		4EA100012F00000100100002 /* SupermarketScanSession.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = SupermarketScanSession.swift; path = RTABMapApp/SupermarketScanSession.swift; sourceTree = "<group>"; };
 		4EA100012F00000100100004 /* PriceTagNFCReader.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = PriceTagNFCReader.swift; path = RTABMapApp/PriceTagNFCReader.swift; sourceTree = "<group>"; };
@@ -398,6 +400,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				4E8B155426273A580037FC53 /* Zip in Frameworks */,
+				4E3525682DE4C73E00F39D8F /* Accelerate.framework in Frameworks */,
 				4EA100012F00000100100005 /* CoreNFC.framework in Frameworks */,
 				4EFD0F36259D5C7300575D88 /* vtk.framework in Frameworks */,
 				4EFD0EAB259D581800575D88 /* OpenGLES.framework in Frameworks */,
@@ -533,6 +536,7 @@
 			isa = PBXGroup;
 			children = (
 				4E3525662DE4C72D00F39D8F /* libamd.a */,
+				4E3525692DE4C73E00F39D8F /* Accelerate.framework */,
 				4EA100012F00000100100006 /* CoreNFC.framework */,
 				4E3525632DE4C71C00F39D8F /* libspqr.a */,
 				4E3525622DE4C71C00F39D8F /* libsuitesparseconfig.a */,

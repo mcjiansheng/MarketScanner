@@ -363,7 +363,7 @@ jobs:
         run: xcodebuild -project app/ios/RTABMapApp.xcodeproj -list
       - name: Restore traceable iOS native dependency cache
         id: ios_native_cache
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: |
             app/ios/RTABMapApp/Libraries/include
@@ -388,6 +388,15 @@ jobs:
             --libraries app/ios/RTABMapApp/Libraries \
             --output app/ios/RTABMapApp/Libraries/ios-dependency-manifest.json \
             --git-sha "$(git rev-parse HEAD)"
+      - name: Save verified iOS native dependency cache before App link
+        if: steps.ios_native_cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            app/ios/RTABMapApp/Libraries/include
+            app/ios/RTABMapApp/Libraries/lib
+            app/ios/RTABMapApp/Libraries/ios-dependency-manifest.json
+          key: marketscanner-ios-native-${{ runner.arch }}-${{ hashFiles('app/ios/RTABMapApp/install_deps.sh', 'tools/SupermarketMapStudio/release_dependencies.json') }}
       - name: Build unsigned generic arm64 iOS app
         id: ios_build
         shell: bash

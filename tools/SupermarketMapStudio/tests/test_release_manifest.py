@@ -88,6 +88,26 @@ class ReleaseManifestTests(unittest.TestCase):
         self.assertIn('local temporary="${output}.partial"', active_lines)
         self.assertEqual(sum(line.startswith("clone_with_retry ") for line in active_lines), 11)
 
+    def test_ios_full_link_declares_blas_provider_and_preserves_verified_cache(self) -> None:
+        repository = Path(__file__).resolve().parents[3]
+        project = (repository / "app/ios/RTABMapApp.xcodeproj/project.pbxproj").read_text(
+            encoding="utf-8"
+        )
+        install_script = (repository / "app/ios/RTABMapApp/install_deps.sh").read_text(
+            encoding="utf-8"
+        )
+        workflow = (repository / ".github/workflows/marketscanner-repair-v2.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("Accelerate.framework in Frameworks", project)
+        self.assertIn("System/Library/Frameworks/Accelerate.framework", project)
+        vtk_block = install_script.split("# VTK", 1)[1].split("# PCL", 1)[0]
+        self.assertIn("-DIOS_DEPLOYMENT_TARGET=12.0", vtk_block)
+        self.assertIn("uses: actions/cache/restore@v4", workflow)
+        save_position = workflow.index("uses: actions/cache/save@v4")
+        link_position = workflow.index("- name: Build unsigned generic arm64 iOS app")
+        self.assertLess(save_position, link_position)
+
     def test_manifest_hashes_artifacts_and_is_reproducible_for_fixed_inputs(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
