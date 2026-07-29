@@ -267,7 +267,10 @@ if [ ! -e $prefix/include/liblas ]
 then
 if [ ! -e libLAS ]
 then
-  git clone --branch 1.8.1 --depth 1 https://github.com/libLAS/libLAS.git
+  git init libLAS
+  git -C libLAS remote add origin https://github.com/libLAS/libLAS.git
+  git -C libLAS fetch --depth 1 origin 33097f17e27b853ac7b9651025a70354ffb10cfc
+  git -C libLAS checkout --detach FETCH_HEAD
 fi
 cd libLAS
 sed -i '' 's/cmake_minimum_required(VERSION 2.8.11)/cmake_minimum_required(VERSION 3.5)/g' CMakeLists.txt

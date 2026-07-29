@@ -3016,9 +3016,8 @@ class PersistentJobRuntimeTests(unittest.TestCase):
             add_rgbd_frame(session)
             database = session / "segment_0001" / "rtabmap_segment_0001.db"
             original = database.read_bytes()
-            executable = root / "rtabmap-reprocess"
-            executable.write_text(
-                "#!/usr/bin/env python3\n"
+            fixture_script = root / "synthetic_reprocess.py"
+            fixture_script.write_text(
                 "from pathlib import Path\n"
                 "import time\n"
                 "Path('child.pid').write_text('started', encoding='utf-8')\n"
@@ -3026,7 +3025,6 @@ class PersistentJobRuntimeTests(unittest.TestCase):
                 "time.sleep(60)\n",
                 encoding="utf-8",
             )
-            executable.chmod(0o755)
             cancellation = threading.Event()
             runtime_log = root / "runtime.log"
             failures: list[BaseException] = []
@@ -3036,7 +3034,7 @@ class PersistentJobRuntimeTests(unittest.TestCase):
                     server.offline.run_reprocess(
                         database,
                         root / "optimized.db",
-                        explicit_binary=str(executable),
+                        explicit_binary=sys.executable,
                         use_local_staging=False,
                         cancel_event=cancellation,
                         persistent_log_path=runtime_log,
@@ -3044,14 +3042,21 @@ class PersistentJobRuntimeTests(unittest.TestCase):
                 except BaseException as exc:  # captured for the test thread
                     failures.append(exc)
 
-            worker = threading.Thread(target=invoke)
-            worker.start()
-            deadline = time.time() + 5
-            while time.time() < deadline and not (root / "child.pid").is_file():
-                time.sleep(0.02)
-            self.assertTrue((root / "child.pid").is_file())
-            cancellation.set()
-            worker.join(timeout=8)
+            with mock.patch.object(
+                server.offline,
+                "_command",
+                return_value=[sys.executable, str(fixture_script)],
+            ):
+                worker = threading.Thread(target=invoke)
+                worker.start()
+                try:
+                    deadline = time.time() + 5
+                    while time.time() < deadline and not (root / "child.pid").is_file():
+                        time.sleep(0.02)
+                    self.assertTrue((root / "child.pid").is_file())
+                finally:
+                    cancellation.set()
+                    worker.join(timeout=8)
 
             self.assertFalse(worker.is_alive())
             self.assertEqual(len(failures), 1)
