@@ -1,12 +1,12 @@
 # 地图辅助定位实现状态
 
-> 文档状态：**当前有效**。最后核对日期：2026-07-29。
+> 文档状态：**当前有效**。最后核对日期：2026-07-30。
 
 ## 生产化总状态
 
 当前发布判定是 **NO-GO / NOT PRODUCTION READY**。`repair-v2-w2r-safety-closeout@cf1b62c949f3574e1804808537e38c8ff643549c` 是生产化冻结基线；P0 在专用 CI job 中锁定 bounded solver 禁止发布、cleanup 确认与精确 CAS、复制后本地副本保留、required evidence 失败时 finalization fail closed 四项不变量，不修改业务算法。
 
-P1 已实现并在真实 DB 上只读验证完整相对 SE(2) 因子图、canonical factor digest、严格 Python 二次校验和 fail-closed publish capability；设计见 [`FACTOR_GRAPH_DESIGN.md`](FACTOR_GRAPH_DESIGN.md)。P2 已加入 PC release presets、依赖 capability 门、source-bound `--version`、release/iOS dependency manifests，以及不允许依赖缺失静默 skip 的 hosted build 流程；本机 macOS 空目录构建和 hosted Ubuntu 空目录构建通过，Windows 累计回归通过；iOS 已完成固定 libLAS revision 的本机 arm64 静态库验证，并为 cold runner 的第三方 clone/download 增加有界原子重试，累计 SHA 的 hosted full App link 仍须核验，见 [`REPRODUCIBLE_BUILD.md`](REPRODUCIBLE_BUILD.md)。P3 已完成 Map Studio 持久 journal、重启中断判定、子进程取消、运行日志留存和浏览器任务重连，见 [`PERSISTENT_JOBS.md`](PERSISTENT_JOBS.md)。P4 代码和主机压力测试已完成流式 finalization、descriptor-bound 读取、schema/大小门、copy receipt 隐私和 durability hook；真机 smoke 仍归 P5，见 [`IOS_FINALIZATION_HARDENING.md`](IOS_FINALIZATION_HARDENING.md)。
+P1 已实现并在真实 DB 上只读验证完整相对 SE(2) 因子图、canonical factor digest、严格 Python 二次校验和 fail-closed publish capability；设计见 [`FACTOR_GRAPH_DESIGN.md`](FACTOR_GRAPH_DESIGN.md)。P2 已加入 PC release presets、依赖 capability 门、source-bound `--version`、release/iOS dependency manifests，以及不允许依赖缺失静默 skip 的 hosted build 流程；本机 macOS 空目录构建与累计 SHA 的 hosted Ubuntu/Windows native clean build、Windows 全套回归、iOS cold-cache dependency manifest/cache 和 unsigned arm64 full App link 均已通过，见 [`REPRODUCIBLE_BUILD.md`](REPRODUCIBLE_BUILD.md)。P3 已完成 Map Studio 持久 journal、重启中断判定、子进程取消、运行日志留存和浏览器任务重连，见 [`PERSISTENT_JOBS.md`](PERSISTENT_JOBS.md)。P4 代码和主机压力测试已完成流式 finalization、descriptor-bound 读取、schema/大小门、copy receipt 隐私和 durability hook；真机 smoke 仍归 P5，见 [`IOS_FINALIZATION_HARDENING.md`](IOS_FINALIZATION_HARDENING.md)。
 
 P5/P6 的真实执行尚未发生；仓库已提供失败关闭的设备/现场 evidence collector，完整矩阵、真实设备身份、App/native/prior/session/package hash、冻结阈值、至少 3 次扫描与独立标签控制点缺一项即 FAIL，见 [`FIELD_TEST_PLAN.md`](FIELD_TEST_PLAN.md) 和 [`tools/Qualification/README.md`](../../tools/Qualification/README.md)。这不构成真机或现场通过证据。
 
@@ -88,11 +88,11 @@ P7 已实现 loopback-only server、每次启动随机且不落盘的 token、PO
 | 操作者取消 | 已实现 | 持久取消意图；原生子进程 terminate→有界 wait→kill；partial 清理 |
 | 原生运行日志 | 已实现 | fast/discovery 独立日志、严格文件名和任务归属下载 |
 | 损坏 journal/保留策略 | 已实现 | health 报告 startup error；不按不可信路径清理；默认保留 200 个终态任务 |
-| 自动回归 | 已实现 | 工作台测试目录 83 项通过，其中持久任务测试 7 项（包含独立运行时进程强杀/重启恢复）、release manifest 测试 7 项；资格证据测试 6 项通过并覆盖 Windows 目录同步差异 |
+| 自动回归 | 已实现 | 工作台测试目录 86 项通过，其中持久任务测试 7 项（包含独立运行时进程强杀/重启恢复）、release/build manifest 测试 9 项；资格证据测试 6 项通过并覆盖 Windows 目录同步差异 |
 
 ## 尚未完成的发布门槛
 
-- P2 hosted Ubuntu clean native build 与 Windows Python 回归已通过；当前累计 SHA 的 hosted iOS full App link 和 Windows native clean build 最终证据仍须核验；
+- P2 自动化 clean-build 出口已由累计 SHA 的 Ubuntu/Windows native build 与 hosted iOS cold-cache full link关闭；P7 的干净 Windows/macOS 安装、升级和卸载 smoke 仍未执行；
 - 支持 LiDAR 的真实 iPhone 上完成完整开始、弱纹理、行人干扰、扫码、结束落盘和外部复制干跑；
 - 已按 2026-07-28 外部静态审查关闭 W2 B-01 与 W2R H-01 至 H-04/M-01 至 M-05；远端多平台 CI run `30342577182` 已绑定准确提交并通过，独立人工复核仍待执行；
 - 正式超市场景验收；
