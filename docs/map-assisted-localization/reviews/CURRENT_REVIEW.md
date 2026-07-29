@@ -4,7 +4,7 @@
 > 外部审查输入：`MarketScanner_RepairV2_W2R_Production_Readiness_Code_Review_and_Final_Product_Agent_Spec_2026-07-28.md`。
 > 冻结基线：`repair-v2-w2r-safety-closeout@cf1b62c949f3574e1804808537e38c8ff643549c`。
 > 当前实施分支：`repair-v2-p7-release-security`。
-> 当前累计代码基线：`089d0894d8d90a7a30cf476967088b1a67fa4c96`。
+> 当前累计代码基线：`6be21b07c32cdb5f1dd4fe3f0cd7eae54e2ef8c8`。
 
 当前权威审查为 [Production Readiness Review](PRODUCTION_READINESS_REVIEW.md)。
 

@@ -3,7 +3,7 @@
 > 文档状态：**当前有效**。最后核对日期：2026-07-29。
 > 外部审查输入：`MarketScanner_RepairV2_W2R_Production_Readiness_Code_Review_and_Final_Product_Agent_Spec_2026-07-28.md`。
 > 审查基线：`repair-v2-w2r-safety-closeout@cf1b62c949f3574e1804808537e38c8ff643549c`。
-> 当前累计代码基线：`089d0894d8d90a7a30cf476967088b1a67fa4c96`；其后的提交只更新当前文档和远端证据。
+> 当前累计代码基线：`6be21b07c32cdb5f1dd4fe3f0cd7eae54e2ef8c8`；其后的提交只更新当前文档和远端证据。
 > 当前 wave：`P7-release-packaging-security`；实施分支：`repair-v2-p7-release-security`。
 > P0 已验证头：`011ce479b74d10cb43106dda6ea757fb1ee2fa73`；本文件之后的证据提交不改变 P0 CI/测试树。
 
@@ -23,7 +23,7 @@ P0 只冻结安全基线，不改变业务算法。CI 必须单独运行并报�
 | ID | 状态 | 关闭条件 |
 | --- | --- | --- |
 | RB-01 | **代码已关闭，待扩大资格样本** | native helper 已读取 RTAB-Map 相对/闭环 Link transform 和 information，严格验证并接入发布能力；已用 2,315-node 真实 DB 只读运行。clean runner 和更多真实样本随 P2/P5/P6 继续验证 |
-| RB-02 | **部分关闭** | macOS PC 空目录与 Ubuntu hosted clean native build 已实际链接；iOS libLAS 已固定到支持关闭 GeoTIFF 的精确 revision 并在本机 arm64 实际编译，hosted dependency manifest/full App link待累计 SHA 复核；Windows Python fixture 已修复但待远端复核，Windows native clean build仍缺成功证据 |
+| RB-02 | **部分关闭** | macOS PC 空目录、Ubuntu hosted clean native build 和 Windows Python 回归已通过；iOS libLAS 已固定到支持关闭 GeoTIFF 的精确 revision 并在本机 arm64 实际编译，cold runner transient DNS 后已加入统一有界重试，hosted dependency manifest/full App link 待累计 SHA 复核；Windows native clean build 仍缺成功证据 |
 | RB-03 | **阻断** | 在支持 LiDAR 的真实 iPhone 完成规定的开始、弱纹理、动态干扰、扫码、结束、恢复和复制矩阵 |
 | RB-04 | **阻断** | 按 `FIELD_TEST_PLAN.md` 完成正式超市场景验收并保存不可伪造的原始证据 |
 | RB-05 | **代码与自动测试已关闭** | 原子 journal、重启 `interrupted` 判定、浏览器重连、实际子进程取消、日志留存和损坏 journal fail-closed 已实现；安装包/断电矩阵仍由后续 wave 验证 |
@@ -36,7 +36,7 @@ P0 只冻结安全基线，不改变业务算法。CI 必须单独运行并报�
 | --- | --- | --- |
 | P0 | 冻结 W2R 安全基线和 CI 不变量 | 本地与远端验证通过 |
 | P1 | 完整相对 SE(2) 因子图与发布门 | 已实现并完成本机真实 DB 只读验证；P1 GitHub Actions run `30360809785` 五个 job 全部成功；native clean build 属 P2 |
-| P2 | 干净、可复现的 PC/iOS 构建 | macOS 本机与 Ubuntu hosted clean native build 已通过；iOS 三次 cold-cache failure 均保留为修复证据，固定 libLAS revision 已通过本机 arm64 静态库编译并待远端 full link；Windows Python fixture 已跨平台化并待远端回归，Windows native clean build仍未验证 |
+| P2 | 干净、可复现的 PC/iOS 构建 | macOS 本机、Ubuntu hosted clean native build 和 Windows Python 回归已通过；iOS 历次 cold-cache failure 均保留为修复证据，固定 libLAS revision 已通过本机 arm64 静态库编译，第三方网络 fetch 已有界重试并待远端 full link；Windows native clean build仍未验证 |
 | P3 | Map Studio 持久任务和重启恢复 | 已实现并通过工作台测试目录 83 项回归；独立运行时进程强杀后由新进程恢复为 `interrupted`，服务重启不猜测续跑，不按不可信 journal 路径清理 |
 | P4 | iOS finalization、保留和 provider hardening | 代码与主机压力测试已完成：100k×3 streaming、15,040,512-byte peak RSS、descriptor identity、copy v2 隐私和未执行 durability hook；真机 smoke 未执行，不声称 power-loss durability |
 | P5 | 真实设备矩阵 | evidence collector 与完整场景门已实现；真实 LiDAR iPhone 未执行，因此仍为 NO-GO |

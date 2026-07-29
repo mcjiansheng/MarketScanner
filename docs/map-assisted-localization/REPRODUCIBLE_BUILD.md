@@ -33,9 +33,11 @@ hosted macOS CI 的 cache key 同时绑定 runner architecture、`install_deps.s
 
 累计代码提交 `089d0894d8d90a7a30cf476967088b1a67fa4c96` 将 libLAS 固定到精确提交 `33097f17e27b853ac7b9651025a70354ffb10cfc`；该版本明确支持关闭非生产必需的 GeoTIFF，同时保留 iOS LAS/LAZ 导出所需的 libLAS/LASzip。2026-07-29 已在隔离目录以 Xcode 26.5、iPhoneOS 26.5 SDK、arm64/iOS 12 target 实际完成 configure，并成功生成 `liblas.a` 与 `liblas_c.a`；合同测试同时锁定 revision、policy floor 和 GeoTIFF-off 选项。该本机依赖级验证不替代 hosted dependency manifest 与完整 App link，P2 iOS 门在后续 Actions run 成功前继续保持未关闭。
 
-累计分支 run `30455290658` 已再次完成 Ubuntu 空目录 native release build；其 Windows job 暴露取消测试 fixture 依赖 POSIX shebang，`089d089...` 已改为由当前 Python 解释器启动同一实际子进程，保留取消、日志和源库不变断言。该 run 的 iOS job仍在执行旧 checkout，Windows 失败也不能记作累计 SHA 通过；必须由包含 `089d089...` 的后续 run 同时复核。
+累计分支 run `30455290658` 已再次完成 Ubuntu 空目录 native release build；其 Windows job 暴露取消测试 fixture 依赖 POSIX shebang，`089d089...` 已改为由当前 Python 解释器启动同一实际子进程，保留取消、日志和源库不变断言。该旧 run 随后被取消，以让累计 SHA 取得 runner。
 
-任何后续验证必须报告实际 checkout SHA；不得把前述失败 run、仍在执行的 run、仅通过 Python 合同测试或依赖级静态库编译视为 hosted native full App link 证据。
+累计 SHA run `30456477770` 的 P0、Native ABI、Ubuntu Python/API/Web、Windows 全套回归和 Ubuntu clean native release build 均成功；Windows fixture 修复已获得远端证明。iOS cold build 从空 cache 完成 VTK 后，在首次 clone PCL 时遇到 runner 的瞬时 DNS 失败（`Could not resolve host: github.com`），因此 dependency manifest 与 App link 正确保持 skipped，不能算 P2 通过。代码提交 `6be21b07c32cdb5f1dd4fe3f0cd7eae54e2ef8c8` 为全部 11 个第三方 Git clone 加入最多 3 次的有界重试，并在唯一临时目录中 clone 后才原子移动到正式依赖目录；所有 curl 下载同样使用有界 retry、fail-on-HTTP-error 和 `.partial` 临时文件。合同测试禁止以后绕过统一 fetch helper。该修复仍须由下一次 cold-cache run 完整验证，且 `30456477770` 没有到达 PCL 构建后的 libLAS/RTAB-Map/App link，不能用于证明这些阶段。
+
+任何后续验证必须报告实际 checkout SHA；不得把前述失败 run、仅通过 Python 合同测试或依赖级静态库编译视为 hosted native full App link 证据。
 
 该流程提供可追溯 build/cache 合同；首次 hosted 构建是否能在 runner 时间和上游可用性范围内完成，必须以 GitHub Actions 结果为准。任何 cache/build/link 失败都保持 P2 阻断，不能降级为 skipped success。
 
