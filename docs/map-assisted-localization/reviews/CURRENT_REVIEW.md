@@ -1,9 +1,10 @@
 # MarketScanner 当前代码审查入口
 
-> 文档状态：**当前有效**。最后核对日期：2026-07-28。
+> 文档状态：**当前有效**。最后核对日期：2026-07-29。
 > 外部审查输入：`MarketScanner_RepairV2_W2R_Production_Readiness_Code_Review_and_Final_Product_Agent_Spec_2026-07-28.md`。
 > 冻结基线：`repair-v2-w2r-safety-closeout@cf1b62c949f3574e1804808537e38c8ff643549c`。
 > 当前实施分支：`repair-v2-p7-release-security`。
+> 当前累计代码基线：`277793c8d5e82610062e56c0723eccd93dfd9c50`。
 
 当前权威审查为 [Production Readiness Review](PRODUCTION_READINESS_REVIEW.md)。
 
