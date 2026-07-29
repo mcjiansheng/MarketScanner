@@ -29,9 +29,13 @@ hosted macOS CI 的 cache key 同时绑定 runner architecture、`install_deps.s
 
 第二次 cold-cache run `30362995994` 已通过 GTSAM 并继续验证 Ubuntu clean native build，但在 g2o `string_tools.cpp` 暴露 iOS target macros 未进入 translation unit，导致错误选择 `wordexp/wordfree` 分支。g2o iOS configure 现强制预包含 Apple SDK 的 `TargetConditionals.h`，让 upstream 条件编译使用 SDK 定义；该 run 仍是失败证据，完整 iOS dependency manifest/App link 必须由下一次 run 证明。
 
-第三次 P2 cold-cache run `30364782777` 与累计分支 run `30369695922` 均继续通过 GTSAM、g2o 和 LASzip，随后在 libLAS 1.8.1 的第二处旧 CMake policy 声明处被 CMake 4 拒绝。libLAS configure 现显式传入 `CMAKE_POLICY_VERSION_MINIMUM=3.5`，保留上游源码并统一其嵌套 policy floor；新增合同测试防止该参数丢失。这两个失败 run 仍不能算 hosted iOS full link 成功，必须由后续 cold-cache run 完整生成 dependency manifest 并链接 App 后才能关闭。
+第三次 P2 cold-cache run `30364782777` 与累计分支 run `30369695922` 均继续通过 GTSAM、g2o 和 LASzip，随后在 libLAS 1.8.1 的旧 CMake policy 处被 CMake 4 拒绝。第一次修复提交 `277793c8d5e82610062e56c0723eccd93dfd9c50` 只加入 policy floor；对精确 `1.8.1` 源码复核后确认原脚本的 minimum-version `sed` 不匹配该标签，且该标签无条件要求 GeoTIFF，因而 `WITH_GEOTIFF=OFF` 实际无效。该提交不能作为完整修复或 full-link 证据。
 
-上述 libLAS 修复绑定累计代码提交 `277793c8d5e82610062e56c0723eccd93dfd9c50`。任何后续验证必须报告实际 checkout SHA；不得把前述失败 run 或仅通过 Python 合同测试视为 native full link 证据。
+累计代码提交 `089d0894d8d90a7a30cf476967088b1a67fa4c96` 将 libLAS 固定到精确提交 `33097f17e27b853ac7b9651025a70354ffb10cfc`；该版本明确支持关闭非生产必需的 GeoTIFF，同时保留 iOS LAS/LAZ 导出所需的 libLAS/LASzip。2026-07-29 已在隔离目录以 Xcode 26.5、iPhoneOS 26.5 SDK、arm64/iOS 12 target 实际完成 configure，并成功生成 `liblas.a` 与 `liblas_c.a`；合同测试同时锁定 revision、policy floor 和 GeoTIFF-off 选项。该本机依赖级验证不替代 hosted dependency manifest 与完整 App link，P2 iOS 门在后续 Actions run 成功前继续保持未关闭。
+
+累计分支 run `30455290658` 已再次完成 Ubuntu 空目录 native release build；其 Windows job 暴露取消测试 fixture 依赖 POSIX shebang，`089d089...` 已改为由当前 Python 解释器启动同一实际子进程，保留取消、日志和源库不变断言。该 run 的 iOS job仍在执行旧 checkout，Windows 失败也不能记作累计 SHA 通过；必须由包含 `089d089...` 的后续 run 同时复核。
+
+任何后续验证必须报告实际 checkout SHA；不得把前述失败 run、仍在执行的 run、仅通过 Python 合同测试或依赖级静态库编译视为 hosted native full App link 证据。
 
 该流程提供可追溯 build/cache 合同；首次 hosted 构建是否能在 runner 时间和上游可用性范围内完成，必须以 GitHub Actions 结果为准。任何 cache/build/link 失败都保持 P2 阻断，不能降级为 skipped success。
 
