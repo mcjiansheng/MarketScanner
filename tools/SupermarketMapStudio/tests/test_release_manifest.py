@@ -35,6 +35,17 @@ class ReleaseManifestTests(unittest.TestCase):
         self.assertIn("-DCMAKE_CXX_STANDARD_REQUIRED=ON", install_script)
         self.assertIn('"-DCMAKE_CXX_FLAGS=-include TargetConditionals.h"', install_script)
 
+    def test_ios_liblas_build_declares_current_cmake_policy_floor(self) -> None:
+        install_script = (
+            Path(__file__).resolve().parents[3]
+            / "app"
+            / "ios"
+            / "RTABMapApp"
+            / "install_deps.sh"
+        ).read_text(encoding="utf-8")
+        liblas_block = install_script.split("# LAS\nif [ ! -e $prefix/include/liblas ]", 1)[1]
+        self.assertIn("-DCMAKE_POLICY_VERSION_MINIMUM=3.5", liblas_block)
+
     def test_manifest_hashes_artifacts_and_is_reproducible_for_fixed_inputs(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
