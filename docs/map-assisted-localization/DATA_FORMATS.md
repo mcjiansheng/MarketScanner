@@ -142,11 +142,13 @@ localized/
     manual_edits.json
     localized_price_tags.json/.csv/.geojson
     shelf_tag_index.json         audit_log.jsonl
+    field_evidence.json          # 仅 published/revoked v4
+    qualification_manifest.json # 仅 published/revoked v4
 ```
 
 `localization_report.json` 包含地图/会话/数据库 hash、直接从 source/optimized SQLite `Node` 表和导出轨迹交叉计算的节点覆盖/缺失/重复/时间范围、三条轨迹长度、修正分布、绝对约束和相对边残差、weak/lost 时长、约束接受/拒绝、标签 observation coverage、review/publish blockers 和 `publish_state`。`factor_graph_report.json` version 1 保存 native solver/DB 版本、input identity、optimized DB SHA-256、canonical factor digest、Node/Factor inventory、gauge/连通性、objective/iterations、残差分位数、拒绝/降权诊断及最终 poses。完整报告必须通过 Python 和 version store 两层复核。
 
-helper 可用且所有门通过时 `solver.type=relative_se2_factor_graph`、`full_factor_graph=true`；helper 缺失或失败时仍写报告，但回退为 `bounded_correction_field` draft，`published_capable=false`。旧 version manifest v1/v2 可继续只读解析；新增 factor report 的新版本使用 version manifest v3。
+helper 可用且所有门通过时 `solver.type=relative_se2_factor_graph`、`full_factor_graph=true`；helper 缺失或失败时仍写报告，但回退为 `bounded_correction_field` draft，`published_capable=false`。旧 version manifest v1/v2 可继续只读解析；含 factor report 的普通 draft/review 使用 version manifest v3；正式 publication 把 exact Field Evidence v3 和 qualification manifest 纳入逐文件 hash tree，使用 version manifest v4。v4 resolve 不允许回退到外部绝对 evidence 路径。
 
 `localized_review.json` 是 Map Studio 的有界联动复核视图数据，包含先验结构、三条轨迹、价签、问题列表和明确的 `view_limits`/截断标记；它是派生展示文件，不替代各权威成果文件。
 
@@ -154,4 +156,4 @@ helper 可用且所有门通过时 `solver.type=relative_se2_factor_graph`、`fu
 
 可导出的 `source_manifest.json` 只保存会话/数据库文件名、地图 ID 和各输入 SHA‑256，不保存用户名或绝对路径。不可变 version 内的 `session_input_manifest.json` 按规范顺序绑定数据库、metadata 和全部必需 sidecar 的文件身份、大小及 SHA‑256，并生成 `input_identity_id`。人工复核重放所需的本机绝对路径按该身份单独写在 `localized/local_inputs/<input_identity_id>.json`；它不进入不可变 version、artifact allowlist 或导出包。读取时先验证 version 本身，再验证 local-input identity 和当前输入字节；不能用可变全局路径状态重放旧版本。
 
-版本写入在 `localized/.write.lock` 的跨进程排他锁内完成父版本复核、staging 清理、版本号分配、rename 和单一指针提交。版本目录 rename 后必须先 fsync `versions/`，失败时不切指针；指针 replace 后的目录 fsync 失败会返回“durability indeterminate”，调用方必须先读取实际指针再恢复，禁止盲目重试。读取 current/published 或下载 artifact 时会重新核对 exact file set、regular-file、字节数及逐文件 SHA‑256，下载还对已打开 fd 的实际字节再次验 hash。发布创建独立 published snapshot 并只切换 `published.json`；存在 active published 时必须先撤销。正式发布还要求 store 层再次验证空 blocker、完整且可发布的相对 SE(2) 因子图，以及由服务端 actor/UTC 和当前 `localized_review.json` SHA‑256 绑定的现场验收记录。没有匹配的现场证据时仍不能正式发布。
+版本写入在 `localized/.write.lock` 的跨进程排他锁内完成父版本复核、staging 清理、版本号分配、rename 和单一指针提交。版本目录 rename 后必须先 fsync `versions/`，失败时不切指针；指针 replace 后的目录 fsync 失败会返回“durability indeterminate”，调用方必须先读取实际指针再恢复，禁止盲目重试。读取 current/published 或下载 artifact 时会重新核对 exact file set、regular-file、字节数及逐文件 SHA‑256，下载还对已打开 fd 的实际字节再次验 hash。发布创建独立 published snapshot 并只切换 `published.json`；存在 active published 时必须先撤销。正式发布还要求 production-only server 即时 selfcheck、store 层空 blocker/完整因子图门，以及由 actor/UTC、`localized_review.json` SHA、exact Field Evidence bytes 和 candidate manifest SHA 共同绑定的现场验收记录。没有匹配的自包含现场证据时仍不能正式发布。

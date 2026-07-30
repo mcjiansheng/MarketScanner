@@ -28,11 +28,8 @@ class DocumentGovernanceTests(unittest.TestCase):
             ROOT / "docs/map-assisted-localization/reviews/CURRENT_REVIEW.md"
         ).read_text(encoding="utf-8")
         self.assertIn("cf1b62c949f3574e1804808537e38c8ff643549c", current)
-        self.assertIn(
-            "MarketScanner_RepairV2_P7_Independent_Production_Code_Review_and_"
-            "AI_Execution_Spec_2026-07-30.md",
-            current,
-        )
+        self.assertIn("MarketScanner_P7R1_Agent_Repair_Prompts.md", current)
+        self.assertIn("79c86b120fc47c28bd350e86abc9b0354d7e838d", current)
         wave = json.loads(
             (ROOT / ".github/marketscanner-repair-v2-wave.json").read_text(
                 encoding="utf-8"
@@ -40,7 +37,9 @@ class DocumentGovernanceTests(unittest.TestCase):
         )
         self.assertIn(wave["branch"], current)
         self.assertRegex(wave["base_sha"], r"^[0-9a-f]{40}$")
-        self.assertRegex(wave["base_branch"], r"^repair-v2-p[0-9]+-")
+        self.assertRegex(
+            wave["base_branch"], r"^repair-v2-p[0-9]+(?:r[0-9]+)?-"
+        )
         self.assertIn("PRODUCTION_READINESS_REVIEW.md", current)
         self.assertIn("当前有效", current)
 

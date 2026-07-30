@@ -1,13 +1,16 @@
 # MarketScanner 当前代码审查入口
 
 > 文档状态：**当前有效**。最后核对日期：2026-07-30。
-> 外部审查输入：`MarketScanner_RepairV2_P7_Independent_Production_Code_Review_and_AI_Execution_Spec_2026-07-30.md`。
+> 外部审查输入：`MarketScanner_P7R1_Agent_Repair_Prompts.md`。
 > 冻结基线：`repair-v2-w2r-safety-closeout@cf1b62c949f3574e1804808537e38c8ff643549c`。
-> 当前实施分支：`repair-v2-p7r0-independent-baseline`。
-> 当前累计代码基线：`02c44caa65456bce33109d0ce45af7dd67a6df2f`。
+> P7R1 审查基线：`repair-v2-p7r0-independent-baseline@79c86b120fc47c28bd350e86abc9b0354d7e838d`。
+> 当前实施分支：`repair-v2-p7r1-evidence-publication-closeout`。
+> P7R1 累计代码提交：`9255d4678a98728959d8c3559bd94463fe9a1a13`；其后仅允许治理文档/wave 绑定提交。
 
 当前权威审查为 [Production Readiness Review](PRODUCTION_READINESS_REVIEW.md)。
 
-当前结论仍是 **NO-GO / NOT PRODUCTION READY**。P7R0 代码关闭了真实 Field Evidence 发布绑定、raw session identity、duplicate run/link、显式 prior uncertainty、因子图数值质量门、敏感 GET session、严格 production mode、平台 app-data journal、残差审计命名和 localized tags V1 内存上限。仓库质量策略有意保持 `candidate`，生产模式/发布会失败关闭；必须由真实 P5/P6 数据分布和 P8 人工审查冻结。剩余工作均为人工/外部环境：真实 LiDAR iPhone 矩阵、办公室与超市各三次现场资格、干净 macOS/Windows 交付 smoke/签名策略和最终独立发布审计。
+当前结论仍是 **NO-GO / NOT PRODUCTION READY**。P7R1 已在代码和自动测试层关闭 production publication/evidence integrity finding：development API/CLI 无条件禁止 publish；production 在调用 store 前重跑真实 selfcheck；Device App SHA 精确绑定 release SHA；Field v3 不再接受自由 trajectory JSON，而从 exact immutable version 生成 typed evidence；JSON/CSV 和 package diagnostics 使用同一 descriptor 的 exact bytes 完成解析与 SHA；published manifest v4 自包含 accepted Field Evidence 和 qualification manifest；About 使用真实 runtime mode。`evidenceSha256` 明确只是完整性校验，V1 依赖实际操作者 attestation 与独立 reviewer 原始包复核，不宣称具有数字签名能力。
+
+状态必须分开记录：上述为 **IMPLEMENTED / AUTOMATED TESTED**；只有本分支最终精确 40 位 SHA 的七组 Repair V2 Actions 全绿后才是 **CI VERIFIED / READY FOR HUMAN QUALIFICATION**。当前没有 **HUMAN REVIEWED / REAL DEVICE PASS / FIELD PASS / PRODUCTION QUALIFIED**。仓库质量策略仍有意保持 `candidate`，必须由真实 P5/P6 数据分布和 P8 人工审查冻结。剩余真实工作仍是 LiDAR iPhone 矩阵、办公室与超市各三次现场资格、干净 macOS/Windows 交付 smoke/签名策略和最终独立发布审计。
 
 历史审查见 [`history/`](history/)，只适用于各自声明的旧 SHA。

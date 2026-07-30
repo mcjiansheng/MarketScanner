@@ -8,6 +8,7 @@
 
 - 记录操作者、日期、iPhone 型号、iOS build、LiDAR availability；
 - 记录 App 40 位 Git SHA、build ID，并提供所有 native 静态库文件给 collector 重算 SHA-256；
+- App Git SHA 必须精确等于本轮正式 release manifest 的 `git_sha`；当前 V1 使用同仓库同 SHA 合同，PC/iOS 若确需不同 SHA，必须先引入版本化 release-bundle identity，禁止现场静默豁免；
 - 记录 prior-map ID，并提供导入的原始 prior-map package 给 collector 重算 SHA-256；
 - 记录测试区域尺寸、Files provider、初始可用空间、电量和热状态；
 - 保证每个 run 使用唯一 run ID，失败 run 不删除、不重命名成成功。
@@ -45,4 +46,4 @@ python3 tools/Qualification/qualification.py device \
 
 ## 人工签收
 
-PASS 证据包至少包含执行计划、collector 输出、原始 session、prior package、App/native build manifest、外部复制包和全部日志。独立审查者从这些输入重算 hash 并抽查 UI/审计语义后才能关闭 P5。
+PASS 证据包至少包含执行计划、collector 输出、原始 session、prior package、App/native build manifest、对应 exact-SHA release manifest、外部复制包和全部日志。独立审查者从这些输入重算 hash、核对 App/release SHA 并抽查 UI/审计语义后才能关闭 P5。`evidenceSha256` 不是数字签名；执行声明由真实操作者负责，恶意声明风险由独立 reviewer 检查原始包控制。

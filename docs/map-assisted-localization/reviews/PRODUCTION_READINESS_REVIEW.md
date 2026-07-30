@@ -1,15 +1,16 @@
 # MarketScanner RepairV2 生产就绪当前代码审查
 
 > 文档状态：**当前有效**。最后核对日期：2026-07-30。
-> 外部审查输入：`MarketScanner_RepairV2_W2R_Production_Readiness_Code_Review_and_Final_Product_Agent_Spec_2026-07-28.md`。
-> 审查基线：`repair-v2-w2r-safety-closeout@cf1b62c949f3574e1804808537e38c8ff643549c`。
-> 当前累计代码基线：`8b3d06e0807752f515ca9ab6704152891338abde`；其后的提交只更新当前文档和远端证据。
-> 当前 wave：`P7-release-packaging-security`；实施分支：`repair-v2-p7-release-security`。
+> 当前增量审查输入：`MarketScanner_P7R1_Agent_Repair_Prompts.md`；完整入口见 [`CURRENT_REVIEW.md`](CURRENT_REVIEW.md)。
+> P7R1 审查基线：`repair-v2-p7r0-independent-baseline@79c86b120fc47c28bd350e86abc9b0354d7e838d`。
+> 当前 wave：`P7R1-evidence-publication-closeout`；实施分支：`repair-v2-p7r1-evidence-publication-closeout`。
 > P0 已验证头：`011ce479b74d10cb43106dda6ea757fb1ee2fa73`；本文件之后的证据提交不改变 P0 CI/测试树。
 
 ## 当前判定
 
 当前结论为 **NO-GO / NOT PRODUCTION READY**。W2R 的 evidence bundle、checkpoint cleanup、原子可见写入、复制后本地保留及 typed finalization disposition 已有自动化保护；这些能力是生产化工作的安全起点，不代表最终产品验收完成。
+
+P7R1 增量已实现 production-only publish、publish 前即时 production selfcheck、Device App SHA 与 release SHA 精确绑定、从 immutable version 自动生成的 typed trajectory evidence、Field Evidence v3、descriptor-bound JSON/CSV 读取、published manifest v4 自包含 evidence、package stable-read 和真实 About runtime mode。上述只能标记 **IMPLEMENTED / AUTOMATED TESTED**；最终精确 SHA 全矩阵成功后才是 **CI VERIFIED / READY FOR HUMAN QUALIFICATION**。真实 P5/P6/P7/P8 未执行，禁止标记 **HUMAN REVIEWED / REAL DEVICE PASS / FIELD PASS / PRODUCTION QUALIFIED**。
 
 P0 只冻结安全基线，不改变业务算法。CI 必须单独运行并报告以下不可退化契约：
 
@@ -25,7 +26,7 @@ P0 只冻结安全基线，不改变业务算法。CI 必须单独运行并报�
 | RB-01 | **代码已关闭，待扩大资格样本** | native helper 已读取 RTAB-Map 相对/闭环 Link transform 和 information，严格验证并接入发布能力；已用 2,315-node 真实 DB 只读运行。clean runner 和更多真实样本随 P2/P5/P6 继续验证 |
 | RB-02 | **代码与 clean CI 已关闭** | macOS 本机 PC 空目录构建及累计 SHA 的 Ubuntu/Windows hosted native clean build、source-bound version、release manifest、iOS cold-cache dependency manifest 和 unsigned arm64 full App link 均已通过；干净终端安装/升级/卸载 smoke 仍属于 P7 操作验收，不能由 build Job 代替 |
 | RB-03 | **阻断** | 在支持 LiDAR 的真实 iPhone 完成规定的开始、弱纹理、动态干扰、扫码、结束、恢复和复制矩阵 |
-| RB-04 | **阻断** | 按 `FIELD_TEST_PLAN.md` 完成正式超市场景验收并保存不可伪造的原始证据 |
+| RB-04 | **阻断** | 按 `FIELD_TEST_PLAN.md` 完成正式超市场景验收并保存 hash-bound 原始证据包；V1 由操作者 attestation 与独立 reviewer 复核，不宣称自校验 SHA 是数字签名 |
 | RB-05 | **代码与自动测试已关闭** | 原子 journal、重启 `interrupted` 判定、浏览器重连、实际子进程取消、日志留存和损坏 journal fail-closed 已实现；安装包/断电矩阵仍由后续 wave 验证 |
 
 生产化附加项 H-01/H-02/H-05/H-06/H-07 已完成代码和自动测试；H-03 已有 POSIX descriptor-bound 与 Windows reparse/handle 防护；H-04 的真机断电、崩溃和 provider 掉线矩阵仍须由 P5 执行。代码关闭不等价于真实设备或运营安装验收。
@@ -39,9 +40,9 @@ P0 只冻结安全基线，不改变业务算法。CI 必须单独运行并报�
 | P2 | 干净、可复现的 PC/iOS 构建 | 自动化出口已关闭：macOS 本机 clean build、Ubuntu/Windows hosted native clean build、Windows Python、iOS cold-cache manifest/cache 与 unsigned arm64 full App link 全部通过；干净终端安装 smoke 归 P7 |
 | P3 | Map Studio 持久任务和重启恢复 | 已实现并通过工作台测试目录 86 项回归；独立运行时进程强杀后由新进程恢复为 `interrupted`，服务重启不猜测续跑，不按不可信 journal 路径清理 |
 | P4 | iOS finalization、保留和 provider hardening | 代码与主机压力测试已完成：100k×3 streaming、15,040,512-byte peak RSS、descriptor identity、copy v2 隐私和未执行 durability hook；真机 smoke 未执行，不声称 power-loss durability |
-| P5 | 真实设备矩阵 | evidence collector 与完整场景门已实现；真实 LiDAR iPhone 未执行，因此仍为 NO-GO |
-| P6 | 正式现场验收 | 已实现 release/阈值预冻结、3-run、20 控制点和重复性验证；办公室/卖场未执行，因此仍为 NO-GO |
-| P7 | 安装包、升级/卸载和 selfcheck | token/Origin/CSP、About/recovery、诊断导出、selfcheck、平台 launcher 与 hash-bound ZIP 已实现；`283c2b6` 同机 macOS build/package/extract/version smoke 通过，干净 macOS/Windows smoke 未执行 |
+| P5 | 真实设备矩阵 | Device Evidence v2 与 App/release exact SHA 门已实现；真实 LiDAR iPhone 未执行，因此仍为 NO-GO |
+| P6 | 正式现场验收 | Field v3、typed immutable trajectory evidence、3-run、20 descriptor-bound 控制点和重复性验证已实现；办公室/卖场未执行，因此仍为 NO-GO |
+| P7 | 安装包、升级/卸载和 selfcheck | production-only publish、即时 selfcheck、evidence 自包含、真实 About mode、package stable-read 已实现；既有同机 smoke 不替代干净 macOS/Windows 安装/升级/卸载测试 |
 | P8 | 独立代码、证据和发布复核 | 未执行 |
 
 P1 至 P4 可以在 P0 通过后组织，但每一 wave 必须使用独立分支、明确基线、原子提交和单独验证；不得把多个大型 wave 合并成一次不可审查的改动。P5/P6 的证据必须来自真实设备和现场，缺失时如实保持未执行。

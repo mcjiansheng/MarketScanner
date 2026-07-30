@@ -1,7 +1,7 @@
 {
-  "wave": "P7R0-independent-production-code-closeout",
-  "branch": "repair-v2-p7r0-independent-baseline",
-  "base_branch": "repair-v2-p7-release-security",
-  "base_sha": "5f2bb0822fef207c9a46b02b0dd5b427c6be1bdf",
-  "implementation_sha": "02c44caa65456bce33109d0ce45af7dd67a6df2f"
+  "wave": "P7R1-evidence-publication-closeout",
+  "branch": "repair-v2-p7r1-evidence-publication-closeout",
+  "base_branch": "repair-v2-p7r0-independent-baseline",
+  "base_sha": "79c86b120fc47c28bd350e86abc9b0354d7e838d",
+  "implementation_sha": "9255d4678a98728959d8c3559bd94463fe9a1a13"
 }

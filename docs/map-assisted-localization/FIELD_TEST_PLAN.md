@@ -15,7 +15,7 @@
 
 阶段三现场记录至少包括：
 
-- 设备型号、iOS、地图 SHA-256、应用 commit；
+- 设备型号、iOS、地图 SHA-256、App 40 位 Git SHA/build ID；App SHA 必须与正式 release manifest `git_sha` 完全相同；
 - 起点/方向控制点；
 - 预先定义的现场遍历路线、交叉口、柱子和重复平行通道；
 - 单次测试固定一个楼层，不经过楼梯或电梯；另记录同层坡道/地面起伏造成的少量竖直位移；
@@ -33,6 +33,8 @@
 
 真实设备按 [`DEVICE_QUALIFICATION_CHECKLIST.md`](DEVICE_QUALIFICATION_CHECKLIST.md) 执行，并使用 [`tools/Qualification/qualification.py`](../../tools/Qualification/qualification.py) 收集。设备矩阵必须完整覆盖正常长扫、弱纹理、动态遮挡、扫码、人工纠偏、stop/finalization、provider copy、kill/relaunch、provider failure、low disk、thermal serious 和 checkpoint cleanup；缺一项即 FAIL。工具自动绑定 App Git SHA/build ID、native 静态库 hash、prior-map ID/SHA、session identity、全部 session 文件 hash、复制 package identity 和人工日志 hash。
 
-办公室与真实卖场的阈值和因子图质量策略必须在 run 的执行时间之前冻结并绑定 release manifest SHA。Device/Field Evidence v2 同时绑定 raw session bundle、raw DB、tracking session、prior map、release 和 quality policy identity。每个场地至少 3 次独立扫描，每次至少 20 个独立真值标签；工具计算平面/高度误差，并要求 node inventory、full factor graph、弱/丢失期间自动确认、拓扑和货架关联重复性全部通过。输出文件不得覆盖，失败 scan 也必须保留。
+办公室与真实卖场的阈值和因子图质量策略必须在 run 的执行时间之前冻结并绑定 release manifest SHA。Device Evidence v2、Trajectory Qualification Evidence v1 和 Field Evidence v3 同时绑定 raw session bundle、raw DB、tracking session、prior map、release、localized version manifest 和 quality policy identity。run 只引用 `localizedOutput + localizedVersionId + localizedVersionManifestSha256`，不接受操作者手写 `trajectoryMetrics`；collector 从 verified immutable artifacts 自动读取数值和门禁。每个场地至少 3 次独立扫描，每次至少 20 个独立真值标签；控制点 CSV 使用同一 descriptor 的字节完成 SHA 与误差计算，并要求 node inventory、full factor graph、弱/丢失期间自动确认、拓扑和货架关联重复性全部通过。输出文件不得覆盖，失败 scan 也必须保留。
+
+Field Evidence 的 `evidenceSha256` 仅用于完整性检查，不是操作者数字签名。本版本采用“执行者对 execution attestation 负责、独立 reviewer 审核原始 evidence package”的信任合同；没有 PKI，不得把自校验 hash 描述成防恶意伪造。正式 publication 会把 exact accepted Field Evidence bytes 和 qualification manifest 纳入 published version manifest v4；外部源文件不是唯一审计依据。
 
 本次代码工作只完成执行器和自动验证合同；仓库仍没有真实 LiDAR iPhone、办公室/卖场测量或人工签名，所以 P5/P6 状态保持 **NOT EXECUTED / NO-GO**。
