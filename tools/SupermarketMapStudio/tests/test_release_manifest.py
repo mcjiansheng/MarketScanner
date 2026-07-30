@@ -23,6 +23,57 @@ from tools.SupermarketMapStudio.server import operator_package_diagnostic  # noq
 
 
 class ReleaseManifestTests(unittest.TestCase):
+    def test_production_release_identity_ignores_external_override(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+
+            def release_value(product_version: str) -> dict[str, object]:
+                value: dict[str, object] = {
+                    "format": "MarketScannerReleaseManifest",
+                    "version": 2,
+                    "git_sha": "d" * 40,
+                    "product_version": product_version,
+                    "factor_graph_quality_policy_sha256": "e" * 64,
+                }
+                value["manifest_body_sha256"] = hashlib.sha256(
+                    json.dumps(
+                        value, sort_keys=True, separators=(",", ":")
+                    ).encode("utf-8")
+                ).hexdigest()
+                return value
+
+            packaged_release = root / "release-manifest.json"
+            packaged_release.write_text(
+                json.dumps(release_value("package-A")), encoding="utf-8"
+            )
+            packaged_sha = hashlib.sha256(packaged_release.read_bytes()).hexdigest()
+            (root / "package-manifest.json").write_text(
+                json.dumps(
+                    {
+                        "format": "MarketScannerMapStudioOperatorPackage",
+                        "version": 1,
+                        "gitSha": "d" * 40,
+                        "releaseManifestSha256": packaged_sha,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            override = root / "external-release.json"
+            override.write_text(
+                json.dumps(release_value("external-B")), encoding="utf-8"
+            )
+            app_dir = root / "tools" / "SupermarketMapStudio"
+            with (
+                mock.patch.object(server_module, "APP_DIR", app_dir),
+                mock.patch.dict(
+                    server_module.os.environ,
+                    {"MARKETSCANNER_RELEASE_MANIFEST": str(override)},
+                ),
+            ):
+                identity = server_module.runtime_release_identity("production")
+            self.assertEqual(identity["product_version"], "package-A")
+            self.assertEqual(identity["release_manifest_sha256"], packaged_sha)
+
     def test_package_json_stable_read_rejects_symlink_and_same_size_swap(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

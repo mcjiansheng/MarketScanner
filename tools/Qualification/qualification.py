@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import csv
+from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
 import io
@@ -23,6 +25,7 @@ FORMAT_DEVICE_EVIDENCE = "MarketScannerDeviceQualificationEvidence"
 FORMAT_FIELD_PLAN = "MarketScannerFieldQualificationPlan"
 FORMAT_FIELD_EVIDENCE = "MarketScannerFieldQualificationEvidence"
 FORMAT_TRAJECTORY_EVIDENCE = "MarketScannerTrajectoryQualificationEvidence"
+FORMAT_TRAJECTORY_SOURCE_BUNDLE = "MarketScannerTrajectorySourceBundle"
 FORMAT_RELEASE_MANIFEST = "MarketScannerReleaseManifest"
 FORMAT_QUALITY_POLICY = "MarketScannerFactorGraphQualityPolicy"
 SHA_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -62,10 +65,25 @@ REQUIRED_SIDECARS = {
     "localized_price_tags.json",
     "metadata.json",
 }
+TRAJECTORY_SOURCE_FILES = (
+    "source_manifest.json",
+    "processing_manifest.json",
+    "localization_report.json",
+    "factor_graph_report.json",
+    "localized_price_tags.json",
+)
 
 
 class QualificationError(ValueError):
     pass
+
+
+@dataclass(frozen=True)
+class _TrajectoryVersionIdentity:
+    version_id: str
+    manifest_sha256: str
+    input_identity_id: str
+    session_input_bundle_sha256: str
 
 
 def _read_stable_bytes(
@@ -219,9 +237,10 @@ def _validated_canonical_evidence_bytes(
     *,
     expected_format: str,
     expected_version: int,
+    maximum_bytes: int = 16 * 1024 * 1024,
 ) -> tuple[dict[str, Any], str, int, bytes]:
     data, digest, size, _identity = _read_stable_bytes(
-        path, maximum_bytes=16 * 1024 * 1024, label="evidence"
+        path, maximum_bytes=maximum_bytes, label="evidence"
     )
     try:
         value = json.loads(
@@ -627,79 +646,47 @@ def collect_device(plan_path: Path, output_path: Path) -> dict[str, Any]:
     return evidence
 
 
-def _trajectory_evidence_from_version(
-    localized_output: Path,
-    version_id: str,
-    *,
-    expected_version_manifest_sha256: str,
-    release: dict[str, Any],
-    release_sha256: str,
-) -> dict[str, Any]:
-    """Derive qualification metrics only from a verified immutable version."""
-
-    if re.fullmatch(r"v[0-9]{6}", version_id) is None:
-        raise QualificationError("localized_version_id_invalid")
+def _trajectory_json(artifacts: dict[str, bytes], name: str) -> Any:
     try:
-        from tools.PriorMap.localized_output_store import (  # Local import avoids a cycle.
-            LocalizedStoreError,
-            LocalizedVersionStore,
-        )
-
-        store = LocalizedVersionStore(localized_output)
-        snapshot = store.resolve_version(version_id)
-        if (
-            not SHA_RE.fullmatch(expected_version_manifest_sha256)
-            or snapshot.manifest_sha256 != expected_version_manifest_sha256
-        ):
-            raise QualificationError("localized_version_manifest_sha_mismatch")
-        artifacts = store.read_verified_artifacts(
-            snapshot,
-            (
-                "source_manifest.json",
-                "processing_manifest.json",
-                "localization_report.json",
-                "factor_graph_report.json",
-                "localized_price_tags.json",
-                "optimized_map_trajectory.geojson",
-            ),
-        )
-    except (OSError, LocalizedStoreError) as exc:
-        raise QualificationError("localized_version_verification_failed") from exc
-
-    def parsed_object(name: str) -> dict[str, Any]:
-        try:
-            value = json.loads(
-                artifacts[name].decode("utf-8", errors="strict"),
-                parse_constant=lambda token: (_ for _ in ()).throw(ValueError(token)),
-            )
-        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
-            raise QualificationError(f"localized_artifact_invalid:{name}") from exc
-        if not isinstance(value, dict):
-            raise QualificationError(f"localized_artifact_not_object:{name}")
-        return value
-
-    source = parsed_object("source_manifest.json")
-    processing = parsed_object("processing_manifest.json")
-    report = parsed_object("localization_report.json")
-    factor = parsed_object("factor_graph_report.json")
-    try:
-        tags = json.loads(
-            artifacts["localized_price_tags.json"].decode("utf-8", errors="strict"),
+        return json.loads(
+            artifacts[name].decode("utf-8", errors="strict"),
             parse_constant=lambda token: (_ for _ in ()).throw(ValueError(token)),
         )
-    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
-        raise QualificationError("localized_tags_invalid") from exc
+    except (KeyError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        raise QualificationError(f"localized_artifact_invalid:{name}") from exc
+
+
+def _derive_trajectory_evidence(
+    identity: _TrajectoryVersionIdentity,
+    artifacts: dict[str, bytes],
+    optimized_trajectory_sha256: str,
+    *,
+    release: dict[str, Any],
+    release_sha256: str,
+    generated_at_utc: str,
+) -> dict[str, Any]:
+    """Derive the typed evidence solely from manifest-bound artifact bytes."""
+
+    source = _trajectory_json(artifacts, "source_manifest.json")
+    processing = _trajectory_json(artifacts, "processing_manifest.json")
+    report = _trajectory_json(artifacts, "localization_report.json")
+    factor = _trajectory_json(artifacts, "factor_graph_report.json")
+    tags = _trajectory_json(artifacts, "localized_price_tags.json")
+    if any(not isinstance(value, dict) for value in (source, processing, report, factor)):
+        raise QualificationError("localized_artifact_not_object")
     if not isinstance(tags, list) or not tags or any(not isinstance(tag, dict) for tag in tags):
         raise QualificationError("localized_tags_missing_or_invalid")
+    if not SHA_RE.fullmatch(optimized_trajectory_sha256):
+        raise QualificationError("optimized_trajectory_identity_invalid")
 
     quality = factor.get("quality_policy")
     if (
-        source.get("input_identity_id") != snapshot.input_identity_id
+        source.get("input_identity_id") != identity.input_identity_id
         or source.get("session_input_bundle_sha256")
-        != snapshot.session_input_bundle_sha256
-        or processing.get("input_identity_id") != snapshot.input_identity_id
-        or report.get("input_identity_id") != snapshot.input_identity_id
-        or factor.get("input_identity_id") != snapshot.input_identity_id
+        != identity.session_input_bundle_sha256
+        or processing.get("input_identity_id") != identity.input_identity_id
+        or report.get("input_identity_id") != identity.input_identity_id
+        or factor.get("input_identity_id") != identity.input_identity_id
         or not isinstance(quality, dict)
         or quality.get("policy_sha256")
         != release.get("factor_graph_quality_policy_sha256")
@@ -793,23 +780,23 @@ def _trajectory_evidence_from_version(
         {
             "nodeInventoryAudit": inventory,
             "aisleSwitchSequence": report.get("aisle_switch_sequence"),
-            "optimizedTrajectorySha256": hashlib.sha256(
-                artifacts["optimized_map_trajectory.geojson"]
-            ).hexdigest(),
+            "optimizedTrajectorySha256": optimized_trajectory_sha256,
         }
     )
     shelf_digest = _canonical_sha(sorted(association_rows, key=lambda item: item["tag_id"]))
     evidence: dict[str, Any] = {
         "format": FORMAT_TRAJECTORY_EVIDENCE,
         "version": 1,
-        "generated_at_utc": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+        "generated_at_utc": _required_string(
+            generated_at_utc, "trajectory_generated_at_utc"
+        ),
         "release_git_sha": release["git_sha"],
         "release_manifest_sha256": release_sha256,
         "product_version": release["product_version"],
-        "localized_version_id": snapshot.version_id,
-        "localized_version_manifest_sha256": snapshot.manifest_sha256,
-        "input_identity_id": snapshot.input_identity_id,
-        "session_input_bundle_sha256": snapshot.session_input_bundle_sha256,
+        "localized_version_id": identity.version_id,
+        "localized_version_manifest_sha256": identity.manifest_sha256,
+        "input_identity_id": identity.input_identity_id,
+        "session_input_bundle_sha256": identity.session_input_bundle_sha256,
         "raw_database_sha256": source.get("source_database_sha256_before"),
         "tracking_session_id": next(iter(tracking_ids)),
         "prior_map_id": source.get("prior_map_id"),
@@ -867,6 +854,257 @@ def _trajectory_evidence_from_version(
     for name in ("product_version", "tracking_session_id", "prior_map_id", "quality_policy_version"):
         _required_string(evidence.get(name), name)
     evidence["evidenceSha256"] = _canonical_sha(evidence)
+    return evidence
+
+
+def _trajectory_bundle_from_verified_bytes(
+    manifest_bytes: bytes, artifacts: dict[str, bytes]
+) -> dict[str, Any]:
+    return {
+        "format": FORMAT_TRAJECTORY_SOURCE_BUNDLE,
+        "version": 1,
+        "versionManifestBase64": base64.b64encode(manifest_bytes).decode("ascii"),
+        "artifactsBase64": {
+            name: base64.b64encode(artifacts[name]).decode("ascii")
+            for name in TRAJECTORY_SOURCE_FILES
+        },
+    }
+
+
+def _trajectory_source_from_bundle(
+    bundle: Any,
+    *,
+    expected_manifest_sha256: str,
+) -> tuple[_TrajectoryVersionIdentity, dict[str, bytes], str]:
+    """Validate the self-contained source package used to derive trajectory metrics."""
+
+    if (
+        not isinstance(bundle, dict)
+        or bundle.get("format") != FORMAT_TRAJECTORY_SOURCE_BUNDLE
+        or bundle.get("version") != 1
+        or set(bundle) != {
+            "format",
+            "version",
+            "versionManifestBase64",
+            "artifactsBase64",
+        }
+    ):
+        raise QualificationError("trajectory_source_bundle_invalid")
+    encoded_manifest = bundle.get("versionManifestBase64")
+    encoded_artifacts = bundle.get("artifactsBase64")
+    if not isinstance(encoded_manifest, str) or not isinstance(encoded_artifacts, dict):
+        raise QualificationError("trajectory_source_bundle_invalid")
+    if set(encoded_artifacts) != set(TRAJECTORY_SOURCE_FILES):
+        raise QualificationError("trajectory_source_bundle_files_invalid")
+    try:
+        manifest_bytes = base64.b64decode(encoded_manifest, validate=True)
+        artifacts = {
+            name: base64.b64decode(encoded_artifacts[name], validate=True)
+            for name in TRAJECTORY_SOURCE_FILES
+            if isinstance(encoded_artifacts.get(name), str)
+        }
+    except (ValueError, TypeError) as exc:
+        raise QualificationError("trajectory_source_bundle_base64_invalid") from exc
+    if (
+        len(artifacts) != len(TRAJECTORY_SOURCE_FILES)
+        or len(manifest_bytes) > 4 * 1024 * 1024
+        or sum(len(value) for value in artifacts.values()) > 12 * 1024 * 1024
+        or hashlib.sha256(manifest_bytes).hexdigest() != expected_manifest_sha256
+    ):
+        raise QualificationError("trajectory_source_bundle_size_or_manifest_invalid")
+    try:
+        manifest = json.loads(
+            manifest_bytes.decode("utf-8", errors="strict"),
+            parse_constant=lambda token: (_ for _ in ()).throw(ValueError(token)),
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        raise QualificationError("trajectory_source_manifest_invalid") from exc
+    if (
+        not isinstance(manifest, dict)
+        or manifest.get("format") != "MarketScannerLocalizedVersionManifest"
+        or manifest.get("version") not in {3, 4}
+        or re.fullmatch(r"v[0-9]{6}", str(manifest.get("version_id", ""))) is None
+        or not SHA_RE.fullmatch(str(manifest.get("input_identity_id", "")))
+        or not SHA_RE.fullmatch(
+            str(manifest.get("session_input_bundle_sha256", ""))
+        )
+        or not isinstance(manifest.get("files"), list)
+    ):
+        raise QualificationError("trajectory_source_manifest_contract_invalid")
+    by_name: dict[str, dict[str, Any]] = {}
+    for entry in manifest["files"]:
+        if (
+            not isinstance(entry, dict)
+            or not isinstance(entry.get("file"), str)
+            or entry["file"] in by_name
+        ):
+            raise QualificationError("trajectory_source_manifest_files_invalid")
+        by_name[entry["file"]] = entry
+    try:
+        from tools.PriorMap.localized_output_store import (
+            PUBLISHED_VERSION_FILES,
+            REQUIRED_VERSION_FILES,
+        )
+
+        expected_files = (
+            PUBLISHED_VERSION_FILES
+            if manifest.get("version") == 4
+            else REQUIRED_VERSION_FILES
+        )
+    except ImportError as exc:
+        raise QualificationError("trajectory_source_manifest_contract_unavailable") from exc
+    if set(by_name) != set(expected_files):
+        raise QualificationError("trajectory_source_manifest_file_set_invalid")
+    for name, entry in by_name.items():
+        if (
+            isinstance(entry.get("bytes"), bool)
+            or not isinstance(entry.get("bytes"), int)
+            or entry["bytes"] < 0
+            or not SHA_RE.fullmatch(str(entry.get("sha256", "")))
+        ):
+            raise QualificationError(
+                f"trajectory_source_manifest_entry_invalid:{name}"
+            )
+    for name, content in artifacts.items():
+        entry = by_name.get(name)
+        if (
+            not isinstance(entry, dict)
+            or isinstance(entry.get("bytes"), bool)
+            or entry.get("bytes") != len(content)
+            or entry.get("sha256") != hashlib.sha256(content).hexdigest()
+        ):
+            raise QualificationError(
+                f"trajectory_source_artifact_identity_invalid:{name}"
+            )
+    optimized_entry = by_name.get("optimized_map_trajectory.geojson")
+    if (
+        not isinstance(optimized_entry, dict)
+        or not SHA_RE.fullmatch(str(optimized_entry.get("sha256", "")))
+        or isinstance(optimized_entry.get("bytes"), bool)
+        or not isinstance(optimized_entry.get("bytes"), int)
+        or optimized_entry["bytes"] < 0
+    ):
+        raise QualificationError("optimized_trajectory_manifest_identity_invalid")
+    return (
+        _TrajectoryVersionIdentity(
+            version_id=manifest["version_id"],
+            manifest_sha256=expected_manifest_sha256,
+            input_identity_id=manifest["input_identity_id"],
+            session_input_bundle_sha256=manifest[
+                "session_input_bundle_sha256"
+            ],
+        ),
+        artifacts,
+        optimized_entry["sha256"],
+    )
+
+
+def _trajectory_evidence_from_bundle(
+    bundle: Any,
+    trajectory: dict[str, Any],
+    *,
+    release: dict[str, Any],
+    release_sha256: str,
+) -> dict[str, Any]:
+    identity, artifacts, optimized_sha = _trajectory_source_from_bundle(
+        bundle,
+        expected_manifest_sha256=str(
+            trajectory.get("localized_version_manifest_sha256", "")
+        ),
+    )
+    return _derive_trajectory_evidence(
+        identity,
+        artifacts,
+        optimized_sha,
+        release=release,
+        release_sha256=release_sha256,
+        generated_at_utc=str(trajectory.get("generated_at_utc", "")),
+    )
+
+
+def _trajectory_evidence_and_bundle_from_version(
+    localized_output: Path,
+    version_id: str,
+    *,
+    expected_version_manifest_sha256: str,
+    release: dict[str, Any],
+    release_sha256: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Read one verified immutable version and preserve its derivation package."""
+
+    if re.fullmatch(r"v[0-9]{6}", version_id) is None:
+        raise QualificationError("localized_version_id_invalid")
+    try:
+        from tools.PriorMap.localized_output_store import (  # Local import avoids a cycle.
+            LocalizedStoreError,
+            LocalizedVersionStore,
+        )
+
+        store = LocalizedVersionStore(localized_output)
+        snapshot = store.resolve_version(version_id)
+        if (
+            not SHA_RE.fullmatch(expected_version_manifest_sha256)
+            or snapshot.manifest_sha256 != expected_version_manifest_sha256
+        ):
+            raise QualificationError("localized_version_manifest_sha_mismatch")
+        manifest_bytes, artifacts = store.read_verified_manifest_and_artifacts(
+            snapshot, TRAJECTORY_SOURCE_FILES
+        )
+        manifest = json.loads(manifest_bytes.decode("utf-8", errors="strict"))
+        optimized_entry = next(
+            entry
+            for entry in manifest["files"]
+            if entry.get("file") == "optimized_map_trajectory.geojson"
+        )
+        identity = _TrajectoryVersionIdentity(
+            version_id=snapshot.version_id,
+            manifest_sha256=snapshot.manifest_sha256,
+            input_identity_id=str(snapshot.input_identity_id),
+            session_input_bundle_sha256=str(snapshot.session_input_bundle_sha256),
+        )
+        evidence = _derive_trajectory_evidence(
+            identity,
+            artifacts,
+            str(optimized_entry["sha256"]),
+            release=release,
+            release_sha256=release_sha256,
+            generated_at_utc=datetime.now(timezone.utc).isoformat(
+                timespec="milliseconds"
+            ),
+        )
+    except QualificationError:
+        raise
+    except (
+        OSError,
+        LocalizedStoreError,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        KeyError,
+        StopIteration,
+        TypeError,
+        ValueError,
+    ) as exc:
+        raise QualificationError("localized_version_verification_failed") from exc
+    return evidence, _trajectory_bundle_from_verified_bytes(
+        manifest_bytes, artifacts
+    )
+
+
+def _trajectory_evidence_from_version(
+    localized_output: Path,
+    version_id: str,
+    *,
+    expected_version_manifest_sha256: str,
+    release: dict[str, Any],
+    release_sha256: str,
+) -> dict[str, Any]:
+    evidence, _bundle = _trajectory_evidence_and_bundle_from_version(
+        localized_output,
+        version_id,
+        expected_version_manifest_sha256=expected_version_manifest_sha256,
+        release=release,
+        release_sha256=release_sha256,
+    )
     return evidence
 
 
@@ -1009,7 +1247,7 @@ def evaluate_field(plan_path: Path, output_path: Path) -> dict[str, Any]:
         )
         tags_path = Path(_required_string(run.get("tagMeasurements"), "tag_measurements"))
         device_evidence_path = Path(_required_string(run.get("deviceEvidence"), "device_evidence"))
-        metrics = _trajectory_evidence_from_version(
+        metrics, trajectory_source_bundle = _trajectory_evidence_and_bundle_from_version(
             localized_output,
             localized_version_id,
             expected_version_manifest_sha256=localized_version_manifest_sha256,
@@ -1142,6 +1380,7 @@ def evaluate_field(plan_path: Path, output_path: Path) -> dict[str, Any]:
                 "trackingSessionId": tracking_session_id,
             },
             "trajectoryEvidence": metrics,
+            "trajectorySourceBundle": trajectory_source_bundle,
             "independentTagMetrics": measured,
             "releaseGitSha": release["git_sha"],
             "deviceAppGitSha": app_identity["gitSha"],
@@ -1230,6 +1469,7 @@ def inspect_field_evidence_with_bytes(
         path,
         expected_format=FORMAT_FIELD_EVIDENCE,
         expected_version=3,
+        maximum_bytes=32 * 1024 * 1024,
     )
     if evidence.get("result") != "PASS" or evidence.get("blockers") != []:
         raise QualificationError("field_evidence_not_pass")
@@ -1239,6 +1479,9 @@ def inspect_field_evidence_with_bytes(
     _required_string(evidence.get("groundTruthMethod"), "ground_truth_method")
     _required_string(evidence.get("independentSurveyor"), "independent_surveyor")
     _finite_number(evidence.get("thresholdsFrozenAtUnix"), "thresholds_frozen_at")
+    thresholds = evidence.get("thresholds")
+    if not isinstance(thresholds, dict):
+        raise QualificationError("field_thresholds_invalid")
     release = evidence.get("releaseManifest")
     policy = evidence.get("qualityPolicy")
     prior = evidence.get("priorMapIdentity")
@@ -1264,6 +1507,8 @@ def inspect_field_evidence_with_bytes(
         raise QualificationError("field_evidence_three_runs_missing")
     run_ids: set[str] = set()
     session_identities: set[tuple[str, str]] = set()
+    topology_digests: set[str] = set()
+    shelf_digests: set[str] = set()
     tag_count = 0
     for run in runs:
         if (
@@ -1346,6 +1591,61 @@ def inspect_field_evidence_with_bytes(
             or not run["deviceAppBuildId"].strip()
         ):
             raise QualificationError("field_run_release_or_session_identity_invalid")
+        try:
+            derived_trajectory = _trajectory_evidence_from_bundle(
+                run.get("trajectorySourceBundle"),
+                trajectory,
+                release={
+                    "git_sha": release["gitSha"],
+                    "product_version": release["productVersion"],
+                    "factor_graph_quality_policy_sha256": policy["sha256"],
+                },
+                release_sha256=release["sha256"],
+            )
+        except QualificationError as exc:
+            raise QualificationError("trajectory_source_rederivation_failed") from exc
+        if derived_trajectory != trajectory:
+            raise QualificationError("trajectory_evidence_differs_from_source_bundle")
+        for name, destination in (
+            ("topologyDigest", topology_digests),
+            ("shelfAssociationDigest", shelf_digests),
+        ):
+            digest = trajectory.get(name)
+            if not SHA_RE.fullmatch(str(digest or "")):
+                raise QualificationError(f"trajectory_digest_invalid:{name}")
+            destination.add(str(digest))
+        numeric_limits = {
+            "nodeCoverage": (">=", "nodeCoverageMin"),
+            "correctionP95M": ("<=", "correctionP95MaxM"),
+            "correctionMaxM": ("<=", "correctionMaxM"),
+            "relativeTranslationResidualP95M": (
+                "<=",
+                "relativeTranslationResidualP95MaxM",
+            ),
+            "relativeYawResidualP95Rad": (
+                "<=",
+                "relativeYawResidualP95MaxRad",
+            ),
+            "weakLostDurationRatio": ("<=", "weakLostDurationRatioMax"),
+        }
+        for metric, (operator, threshold_name) in numeric_limits.items():
+            actual = _finite_number(trajectory.get(metric), metric)
+            limit = _finite_number(thresholds.get(threshold_name), threshold_name)
+            if (operator == ">=" and actual < limit) or (
+                operator == "<=" and actual > limit
+            ):
+                raise QualificationError(f"field_threshold_failed:{metric}")
+        tag_limits = {
+            "planarP95M": "tagPlanarP95MaxM",
+            "planarMaxM": "tagPlanarMaxM",
+            "heightP95M": "tagHeightP95MaxM",
+        }
+        for metric, threshold_name in tag_limits.items():
+            measured_value = _finite_number(tag_metrics.get(metric), metric)
+            if measured_value > _finite_number(
+                thresholds.get(threshold_name), threshold_name
+            ):
+                raise QualificationError(f"field_threshold_failed:{metric}")
         for name in (
             "inventoriesMatch",
             "factorGraphConverged",
@@ -1370,6 +1670,10 @@ def inspect_field_evidence_with_bytes(
             raise QualificationError("trajectory_tag_inventory_invalid")
     if len(session_identities) < 3:
         raise QualificationError("fewer_than_three_distinct_source_sessions")
+    if len(topology_digests) != 1:
+        raise QualificationError("topology_not_repeatable_across_runs")
+    if len(shelf_digests) != 1:
+        raise QualificationError("shelf_association_not_repeatable_across_runs")
     return {
         "qualification_id": f"sha256:{file_sha}",
         "file_sha256": file_sha,

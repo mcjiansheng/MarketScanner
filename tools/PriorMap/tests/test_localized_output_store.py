@@ -14,6 +14,7 @@ from unittest import mock
 
 import tools.PriorMap.localized_file_lock as localized_file_lock
 import tools.PriorMap.localized_output_store as localized_store
+import tools.Qualification.qualification as qualification
 
 from tools.PriorMap.localized_file_lock import (
     FileLockError,
@@ -39,6 +40,143 @@ def _canonical_sha(value: object) -> str:
     ).hexdigest()
 
 
+def _synthetic_trajectory_package(
+    index: int,
+    *,
+    release_manifest_sha256: str,
+    release_git_sha: str,
+    product_version: str,
+    prior_map_sha256: str,
+    quality_policy_sha256: str,
+) -> tuple[dict[str, object], dict[str, object]]:
+    version_id = f"v{index + 1:06d}"
+    input_id = format(index + 20, "064x")
+    session_sha = format(index + 30, "064x")
+    tracking_id = f"tracking-{index}"
+    inventory = {
+        "source_count": 20,
+        "optimized_count": 20,
+        "exported_count": 20,
+        "source_missing_from_optimized": [],
+        "source_missing_from_export": [],
+        "optimized_not_in_source": [],
+        "exported_not_in_optimized": [],
+        "source_duplicate_ids": [],
+        "optimized_duplicate_ids": [],
+        "exported_duplicate_ids": [],
+        "source_non_monotonic_stamp_node_ids": [],
+        "optimized_non_monotonic_stamp_node_ids": [],
+    }
+    payloads: dict[str, object] = {
+        "source_manifest.json": {
+            "input_identity_id": input_id,
+            "session_input_bundle_sha256": session_sha,
+            "source_database_sha256_before": format(index + 40, "064x"),
+            "prior_map_id": "prior-test",
+            "prior_map_sha256": prior_map_sha256,
+        },
+        "processing_manifest.json": {"input_identity_id": input_id},
+        "localization_report.json": {
+            "input_identity_id": input_id,
+            "weak_lost_intervals": [],
+            "node_inventory_audit": inventory,
+            "localization_state_duration_seconds": {"normal": 100.0},
+            "weak_lost_duration_seconds": 0.0,
+            "correction_distribution_m": {"p95": 0.1, "maximum": 0.2},
+            "node_coverage_ratio": 1.0,
+            "aisle_switch_sequence": ["A", "B"],
+        },
+        "factor_graph_report.json": {
+            "input_identity_id": input_id,
+            "quality_policy": {
+                "policy_sha256": quality_policy_sha256,
+                "policy_version": "test-frozen-1",
+            },
+            "p95_relative_edge_translation_residual_m": 0.01,
+            "p95_relative_edge_yaw_residual_deg": 0.5729577951308232,
+            "converged": True,
+            "solver_converged": True,
+            "graph_quality_passed": True,
+            "graph_connected": True,
+        },
+        "localized_price_tags.json": [
+            {
+                "tag_id": f"tag-{tag}",
+                "tracking_session_id": tracking_id,
+                "transform_audit": {"status": "applied"},
+                "user_confirmed": False,
+                "approval_status": "approved",
+                "needs_review": False,
+                "association_audit": {"status": "confirmed"},
+                "shelf_code": "shelf-A",
+                "shelf_side": "left",
+                "distance_from_shelf_start_cm": tag * 10,
+                "timestamp": float(tag),
+            }
+            for tag in range(20)
+        ],
+    }
+    artifacts = {
+        name: json.dumps(value, sort_keys=True).encode("utf-8")
+        for name, value in payloads.items()
+    }
+    files = [
+        {"file": name, "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}
+        for name, data in artifacts.items()
+    ]
+    files.append(
+        {
+            "file": "optimized_map_trajectory.geojson",
+            "bytes": 1,
+            "sha256": "f" * 64,
+        }
+    )
+    represented = {entry["file"] for entry in files}
+    files.extend(
+        {
+            "file": name,
+            "bytes": 0,
+            "sha256": hashlib.sha256(b"").hexdigest(),
+        }
+        for name in REQUIRED_VERSION_FILES
+        if name not in represented
+    )
+    manifest = {
+        "format": "MarketScannerLocalizedVersionManifest",
+        "version": 3,
+        "version_id": version_id,
+        "state": "review",
+        "revision": 1,
+        "input_identity_id": input_id,
+        "session_input_bundle_sha256": session_sha,
+        "files": files,
+    }
+    manifest_bytes = json.dumps(manifest, sort_keys=True).encode("utf-8")
+    manifest_sha = hashlib.sha256(manifest_bytes).hexdigest()
+    identity = qualification._TrajectoryVersionIdentity(
+        version_id=version_id,
+        manifest_sha256=manifest_sha,
+        input_identity_id=input_id,
+        session_input_bundle_sha256=session_sha,
+    )
+    trajectory = qualification._derive_trajectory_evidence(
+        identity,
+        artifacts,
+        "f" * 64,
+        release={
+            "git_sha": release_git_sha,
+            "product_version": product_version,
+            "factor_graph_quality_policy_sha256": quality_policy_sha256,
+        },
+        release_sha256=release_manifest_sha256,
+        generated_at_utc="2026-07-30T00:00:00+00:00",
+    )
+    bundle = qualification._trajectory_bundle_from_verified_bytes(
+        manifest_bytes, artifacts
+    )
+    return trajectory, bundle
+
+
 def write_valid_field_evidence(
     path: Path,
     *,
@@ -50,43 +188,14 @@ def write_valid_field_evidence(
 ) -> tuple[str, dict[str, object]]:
     runs: list[dict[str, object]] = []
     for index in range(3):
-        tag_ids = [f"tag-{index}-{tag}" for tag in range(20)]
-        trajectory: dict[str, object] = {
-            "format": "MarketScannerTrajectoryQualificationEvidence",
-            "version": 1,
-            "generated_at_utc": "2026-07-30T00:00:00+00:00",
-            "release_git_sha": release_git_sha,
-            "release_manifest_sha256": release_manifest_sha256,
-            "product_version": product_version,
-            "localized_version_id": f"v{index + 1:06d}",
-            "localized_version_manifest_sha256": format(index + 10, "064x"),
-            "input_identity_id": format(index + 20, "064x"),
-            "session_input_bundle_sha256": format(index + 30, "064x"),
-            "raw_database_sha256": format(index + 40, "064x"),
-            "tracking_session_id": f"tracking-{index}",
-            "prior_map_id": "prior-test",
-            "prior_map_sha256": prior_map_sha256,
-            "quality_policy_sha256": quality_policy_sha256,
-            "quality_policy_version": "test-frozen-1",
-            "nodeCoverage": 1.0,
-            "correctionP95M": 0.1,
-            "correctionMaxM": 0.2,
-            "relativeTranslationResidualP95M": 0.01,
-            "relativeYawResidualP95Rad": 0.01,
-            "weakLostDurationRatio": 0.0,
-            "inventoriesMatch": True,
-            "factorGraphConverged": True,
-            "factorGraphQualityPassed": True,
-            "singleConnectedComponent": True,
-            "allGroundTruthTagsObserved": True,
-            "userConfirmedTagsPreserved": True,
-            "automaticConfirmDuringWeakLost": 0,
-            "topologyDigest": "a" * 64,
-            "shelfAssociationDigest": "b" * 64,
-            "localizedTagIds": tag_ids,
-            "localizedTagIdsSha256": _canonical_sha(sorted(tag_ids)),
-        }
-        trajectory["evidenceSha256"] = _canonical_sha(trajectory)
+        trajectory, trajectory_source_bundle = _synthetic_trajectory_package(
+            index,
+            release_manifest_sha256=release_manifest_sha256,
+            release_git_sha=release_git_sha,
+            product_version=product_version,
+            prior_map_sha256=prior_map_sha256,
+            quality_policy_sha256=quality_policy_sha256,
+        )
         runs.append(
             {
                 "runId": f"run-{index}",
@@ -99,6 +208,7 @@ def write_valid_field_evidence(
                     "trackingSessionId": trajectory["tracking_session_id"],
                 },
                 "trajectoryEvidence": trajectory,
+                "trajectorySourceBundle": trajectory_source_bundle,
                 "independentTagMetrics": {
                     "count": 20,
                     "planarP50M": 0.01,
@@ -148,7 +258,17 @@ def write_valid_field_evidence(
             "priorMapSha256": prior_map_sha256,
         },
         "thresholdsFrozenAtUnix": 100,
-        "thresholds": {},
+        "thresholds": {
+            "nodeCoverageMin": 0.98,
+            "correctionP95MaxM": 1.0,
+            "correctionMaxM": 2.0,
+            "relativeTranslationResidualP95MaxM": 0.2,
+            "relativeYawResidualP95MaxRad": 0.1,
+            "weakLostDurationRatioMax": 0.1,
+            "tagPlanarP95MaxM": 0.2,
+            "tagPlanarMaxM": 0.3,
+            "tagHeightP95MaxM": 0.1,
+        },
         "siteId": "store-test",
         "siteType": "supermarket",
         "groundTruthMethod": "independent controls",
@@ -793,6 +913,48 @@ class LocalizedVersionStoreTests(unittest.TestCase):
             "localized_state_transition",
             (revoked.version_dir / "audit_log.jsonl").read_text(),
         )
+
+    def test_publication_rejects_rehashed_forged_trajectory_metrics(self) -> None:
+        self.commit_valid()
+        review = self.store.transition_current(
+            "review", actor="reviewer", reason="quality checks complete"
+        )
+        evidence_path = self.output / "forged-field-evidence.json"
+        _evidence_sha, evidence = write_valid_field_evidence(
+            evidence_path,
+            release_manifest_sha256="2" * 64,
+            release_git_sha="3" * 40,
+            product_version="test",
+            prior_map_sha256=self.identity_hashes["prior_map_sha256"],
+            quality_policy_sha256="e" * 64,
+        )
+        trajectory = evidence["runs"][0]["trajectoryEvidence"]
+        assert isinstance(trajectory, dict)
+        trajectory["correctionMaxM"] = 999999.0
+        trajectory.pop("evidenceSha256")
+        trajectory["evidenceSha256"] = _canonical_sha(trajectory)
+        evidence.pop("evidenceSha256")
+        evidence["evidenceSha256"] = _canonical_sha(evidence)
+        data = json.dumps(evidence, indent=2, sort_keys=True).encode("utf-8") + b"\n"
+        evidence_path.write_bytes(data)
+        with self.assertRaisesRegex(
+            LocalizedStoreError, "Field qualification evidence is invalid"
+        ):
+            self.store.publish_current(
+                actor="publisher",
+                reason="forged metrics",
+                qualification_evidence_path=evidence_path,
+                expected_field_evidence_sha256=hashlib.sha256(data).hexdigest(),
+                expected_release_identity={
+                    "release_manifest_sha256": "2" * 64,
+                    "git_sha": "3" * 40,
+                    "product_version": "test",
+                    "quality_policy_sha256": "e" * 64,
+                },
+                expected_version=review.version_id,
+            )
+        self.assertEqual(self.store.current(), review)
+        self.assertIsNone(self.store.published())
 
     def test_committed_artifact_tampering_fails_closed(self) -> None:
         snapshot = self.commit_valid()

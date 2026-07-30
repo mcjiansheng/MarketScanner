@@ -10,6 +10,7 @@ import unittest
 from unittest import mock
 
 import tools.Qualification.qualification as qualification
+from tools.PriorMap.localized_output_store import REQUIRED_VERSION_FILES
 
 from tools.Qualification.qualification import (
     DEVICE_SCENARIO_ASSERTIONS,
@@ -29,6 +30,140 @@ def write_json(path: Path, value: object) -> None:
 
 def sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def synthetic_trajectory_package(
+    index: int,
+    *,
+    release_sha256: str,
+    quality_policy_sha256: str,
+) -> tuple[dict[str, object], dict[str, object], str]:
+    version_id = f"v{index + 1:06d}"
+    input_id = format(index + 301, "064x")
+    session_sha = format(index + 1, "064x")
+    tracking_id = f"tracking-{index}"
+    inventory = {
+        "source_count": 20,
+        "optimized_count": 20,
+        "exported_count": 20,
+        "source_missing_from_optimized": [],
+        "source_missing_from_export": [],
+        "optimized_not_in_source": [],
+        "exported_not_in_optimized": [],
+        "source_duplicate_ids": [],
+        "optimized_duplicate_ids": [],
+        "exported_duplicate_ids": [],
+        "source_non_monotonic_stamp_node_ids": [],
+        "optimized_non_monotonic_stamp_node_ids": [],
+    }
+    payloads: dict[str, object] = {
+        "source_manifest.json": {
+            "input_identity_id": input_id,
+            "session_input_bundle_sha256": session_sha,
+            "source_database_sha256_before": format(index + 101, "064x"),
+            "prior_map_id": "prior-test",
+            "prior_map_sha256": "d" * 64,
+        },
+        "processing_manifest.json": {"input_identity_id": input_id},
+        "localization_report.json": {
+            "input_identity_id": input_id,
+            "weak_lost_intervals": [],
+            "node_inventory_audit": inventory,
+            "localization_state_duration_seconds": {"normal": 99.0, "weak": 1.0},
+            "weak_lost_duration_seconds": 1.0,
+            "correction_distribution_m": {"p95": 0.5, "maximum": 1.0},
+            "node_coverage_ratio": 0.99,
+            "aisle_switch_sequence": ["A", "B"],
+        },
+        "factor_graph_report.json": {
+            "input_identity_id": input_id,
+            "quality_policy": {
+                "policy_sha256": quality_policy_sha256,
+                "policy_version": "test-frozen-1",
+            },
+            "p95_relative_edge_translation_residual_m": 0.1,
+            "p95_relative_edge_yaw_residual_deg": 2.864788975654116,
+            "converged": True,
+            "solver_converged": True,
+            "graph_quality_passed": True,
+            "graph_connected": True,
+        },
+        "localized_price_tags.json": [
+            {
+                "tag_id": str(tag),
+                "tracking_session_id": tracking_id,
+                "transform_audit": {"status": "applied"},
+                "user_confirmed": False,
+                "approval_status": "approved",
+                "needs_review": False,
+                "association_audit": {"status": "confirmed"},
+                "shelf_code": "shelf-A",
+                "shelf_side": "left",
+                "distance_from_shelf_start_cm": tag * 10,
+                "timestamp": float(tag),
+            }
+            for tag in range(20)
+        ],
+    }
+    artifacts = {
+        name: json.dumps(value, sort_keys=True).encode("utf-8")
+        for name, value in payloads.items()
+    }
+    files = [
+        {"file": name, "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}
+        for name, data in artifacts.items()
+    ]
+    files.append(
+        {
+            "file": "optimized_map_trajectory.geojson",
+            "bytes": 1,
+            "sha256": "f" * 64,
+        }
+    )
+    represented = {entry["file"] for entry in files}
+    files.extend(
+        {
+            "file": name,
+            "bytes": 0,
+            "sha256": hashlib.sha256(b"").hexdigest(),
+        }
+        for name in REQUIRED_VERSION_FILES
+        if name not in represented
+    )
+    manifest = {
+        "format": "MarketScannerLocalizedVersionManifest",
+        "version": 3,
+        "version_id": version_id,
+        "state": "review",
+        "revision": 1,
+        "input_identity_id": input_id,
+        "session_input_bundle_sha256": session_sha,
+        "files": files,
+    }
+    manifest_bytes = json.dumps(manifest, sort_keys=True).encode("utf-8")
+    manifest_sha = hashlib.sha256(manifest_bytes).hexdigest()
+    identity = qualification._TrajectoryVersionIdentity(
+        version_id=version_id,
+        manifest_sha256=manifest_sha,
+        input_identity_id=input_id,
+        session_input_bundle_sha256=session_sha,
+    )
+    evidence = qualification._derive_trajectory_evidence(
+        identity,
+        artifacts,
+        "f" * 64,
+        release={
+            "git_sha": "a" * 40,
+            "product_version": "test",
+            "factor_graph_quality_policy_sha256": quality_policy_sha256,
+        },
+        release_sha256=release_sha256,
+        generated_at_utc="2026-07-30T00:00:00+00:00",
+    )
+    bundle = qualification._trajectory_bundle_from_verified_bytes(
+        manifest_bytes, artifacts
+    )
+    return evidence, bundle, manifest_sha
 
 
 class QualificationTests(unittest.TestCase):
@@ -300,8 +435,15 @@ class QualificationTests(unittest.TestCase):
             }
             release_value["manifest_body_sha256"] = _canonical_sha(release_value)
             write_json(release, release_value)
-            topology = "b" * 64
-            shelf = "c" * 64
+            release_sha = sha256(release)
+            trajectory_packages = [
+                synthetic_trajectory_package(
+                    index,
+                    release_sha256=release_sha,
+                    quality_policy_sha256=policy_sha,
+                )
+                for index in range(3)
+            ]
             runs = []
             for index in range(3):
                 device_evidence = root / f"device-evidence-{index}.json"
@@ -340,9 +482,7 @@ class QualificationTests(unittest.TestCase):
                     "executedAtUnix": 200,
                     "localizedOutput": str(root / f"localized-{index}"),
                     "localizedVersionId": f"v{index + 1:06d}",
-                    "localizedVersionManifestSha256": format(
-                        index + 201, "064x"
-                    ),
+                    "localizedVersionManifestSha256": trajectory_packages[index][2],
                     "tagMeasurements": str(measurements),
                     "deviceEvidence": str(device_evidence),
                 })
@@ -375,59 +515,27 @@ class QualificationTests(unittest.TestCase):
                 },
                 "runs": runs,
             })
-            def trajectory_evidence(
+            def trajectory_evidence_and_bundle(
                 _output: Path,
                 version_id: str,
                 *,
                 expected_version_manifest_sha256: str,
                 release: dict,
                 release_sha256: str,
-            ) -> dict:
+            ) -> tuple[dict[str, object], dict[str, object]]:
                 index = int(version_id[1:]) - 1
-                value = {
-                    "format": "MarketScannerTrajectoryQualificationEvidence",
-                    "version": 1,
-                    "generated_at_utc": "2026-07-30T00:00:00+00:00",
-                    "release_git_sha": release["git_sha"],
-                    "release_manifest_sha256": release_sha256,
-                    "product_version": release["product_version"],
-                    "localized_version_id": version_id,
-                    "localized_version_manifest_sha256": expected_version_manifest_sha256,
-                    "input_identity_id": format(index + 301, "064x"),
-                    "session_input_bundle_sha256": format(index + 1, "064x"),
-                    "raw_database_sha256": format(index + 101, "064x"),
-                    "tracking_session_id": f"tracking-{index}",
-                    "prior_map_id": "prior-test",
-                    "prior_map_sha256": "d" * 64,
-                    "quality_policy_sha256": policy_sha,
-                    "quality_policy_version": "test-frozen-1",
-                    "nodeCoverage": 0.99,
-                    "correctionP95M": 0.5,
-                    "correctionMaxM": 1.0,
-                    "relativeTranslationResidualP95M": 0.1,
-                    "relativeYawResidualP95Rad": 0.05,
-                    "weakLostDurationRatio": 0.01,
-                    "inventoriesMatch": True,
-                    "factorGraphConverged": True,
-                    "factorGraphQualityPassed": True,
-                    "singleConnectedComponent": True,
-                    "allGroundTruthTagsObserved": True,
-                    "userConfirmedTagsPreserved": True,
-                    "automaticConfirmDuringWeakLost": 0,
-                    "topologyDigest": topology,
-                    "shelfAssociationDigest": shelf,
-                    "localizedTagIds": [str(tag) for tag in range(20)],
-                    "localizedTagIdsSha256": _canonical_sha(
-                        sorted(str(tag) for tag in range(20))
-                    ),
-                }
-                value["evidenceSha256"] = _canonical_sha(value)
-                return value
+                self.assertEqual(release["git_sha"], "a" * 40)
+                self.assertEqual(release_sha256, release_sha)
+                self.assertEqual(
+                    expected_version_manifest_sha256,
+                    trajectory_packages[index][2],
+                )
+                return trajectory_packages[index][0], trajectory_packages[index][1]
 
             with mock.patch.object(
                 qualification,
-                "_trajectory_evidence_from_version",
-                side_effect=trajectory_evidence,
+                "_trajectory_evidence_and_bundle_from_version",
+                side_effect=trajectory_evidence_and_bundle,
             ):
                 evidence = evaluate_field(plan, root / "field-evidence.json")
             self.assertEqual(evidence["result"], "PASS")
@@ -440,8 +548,8 @@ class QualificationTests(unittest.TestCase):
             write_json(plan, duplicate_plan)
             with mock.patch.object(
                 qualification,
-                "_trajectory_evidence_from_version",
-                side_effect=trajectory_evidence,
+                "_trajectory_evidence_and_bundle_from_version",
+                side_effect=trajectory_evidence_and_bundle,
             ):
                 duplicate = evaluate_field(plan, root / "duplicate-field-evidence.json")
             self.assertEqual(duplicate["result"], "FAIL")
@@ -458,8 +566,8 @@ class QualificationTests(unittest.TestCase):
             write_json(plan, one_old_app_plan)
             with mock.patch.object(
                 qualification,
-                "_trajectory_evidence_from_version",
-                side_effect=trajectory_evidence,
+                "_trajectory_evidence_and_bundle_from_version",
+                side_effect=trajectory_evidence_and_bundle,
             ):
                 old_app = evaluate_field(plan, root / "old-app-field-evidence.json")
             self.assertEqual(old_app["result"], "FAIL")
@@ -473,8 +581,8 @@ class QualificationTests(unittest.TestCase):
             write_json(old_device_path, old_device)
             with mock.patch.object(
                 qualification,
-                "_trajectory_evidence_from_version",
-                side_effect=trajectory_evidence,
+                "_trajectory_evidence_and_bundle_from_version",
+                side_effect=trajectory_evidence_and_bundle,
             ), self.assertRaisesRegex(QualificationError, "device_app_identity_invalid"):
                 evaluate_field(plan, root / "malformed-app-field-evidence.json")
 
@@ -491,6 +599,27 @@ class QualificationTests(unittest.TestCase):
             write_json(root / "tampered-field-evidence.json", tampered)
             with self.assertRaisesRegex(QualificationError, "evidence_contract_invalid"):
                 inspect_field_evidence(root / "tampered-field-evidence.json")
+
+            for name, forged_value in (
+                ("nodeCoverage", -999.0),
+                ("factorGraphQualityPassed", False),
+            ):
+                forged = json.loads(
+                    (root / "field-evidence.json").read_text(encoding="utf-8")
+                )
+                trajectory = forged["runs"][0]["trajectoryEvidence"]
+                trajectory[name] = forged_value
+                trajectory.pop("evidenceSha256")
+                trajectory["evidenceSha256"] = _canonical_sha(trajectory)
+                forged.pop("evidenceSha256")
+                forged["evidenceSha256"] = _canonical_sha(forged)
+                forged_path = root / f"forged-{name}.json"
+                write_json(forged_path, forged)
+                with self.assertRaisesRegex(
+                    QualificationError,
+                    "trajectory_evidence_differs_from_source_bundle",
+                ):
+                    inspect_field_evidence(forged_path)
 
 
 if __name__ == "__main__":

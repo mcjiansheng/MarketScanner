@@ -150,10 +150,14 @@ def source_git_sha() -> str:
     return candidate if re.fullmatch(r"[0-9a-f]{40}", candidate) else "unknown"
 
 
-def runtime_release_identity() -> dict[str, str]:
+def runtime_release_identity(runtime_mode: str = "development") -> dict[str, str]:
     """Load the immutable release identity; source checkouts are not publishable."""
     configured = os.environ.get("MARKETSCANNER_RELEASE_MANIFEST", "").strip()
-    path = Path(configured) if configured else APP_DIR.parent.parent / "release-manifest.json"
+    package_root = APP_DIR.parent.parent
+    if runtime_mode == "production":
+        path = package_root / "release-manifest.json"
+    else:
+        path = Path(configured) if configured else package_root / "release-manifest.json"
     try:
         value, manifest_sha, _ = _stable_json_file(path)
         body = dict(value)
@@ -170,6 +174,20 @@ def runtime_release_identity() -> dict[str, str]:
             or declared != calculated
         ):
             raise ValueError("release manifest contract is invalid")
+        if runtime_mode == "production":
+            package, _package_sha, _package_size = _stable_json_file(
+                package_root / "package-manifest.json"
+            )
+            if (
+                package.get("format")
+                != "MarketScannerMapStudioOperatorPackage"
+                or package.get("version") != 1
+                or package.get("releaseManifestSha256") != manifest_sha
+                or package.get("gitSha") != value.get("git_sha")
+            ):
+                raise ValueError(
+                    "production release identity differs from package manifest"
+                )
     except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
         raise RequestError("当前运行环境没有有效的 release-manifest.json，禁止发布。") from exc
     return {
@@ -2733,7 +2751,7 @@ def apply_localized_state_transition(
                         evidence_path_value, "Field qualification evidence"
                     ),
                     expected_field_evidence_sha256=evidence_sha,
-                    expected_release_identity=runtime_release_identity(),
+                    expected_release_identity=runtime_release_identity("production"),
                     expected_version=expected_version,
                 )
             elif action == "revoke":

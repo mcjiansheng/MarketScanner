@@ -1461,6 +1461,38 @@ class LocalizedVersionStore:
             raise LocalizedStoreError("Localized artifact batch could not be read safely.") from exc
         return contents
 
+    def read_verified_manifest_and_artifacts(
+        self,
+        snapshot: LocalizedSnapshot,
+        names: Iterable[str],
+    ) -> tuple[bytes, dict[str, bytes]]:
+        """Return exact manifest bytes with a snapshot-bound artifact batch."""
+
+        contents = self.read_verified_artifacts(snapshot, names)
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            descriptor = os.open(
+                snapshot.version_dir / "version_manifest.json", flags
+            )
+            with os.fdopen(descriptor, "rb") as handle:
+                opened = os.fstat(handle.fileno())
+                manifest_bytes = handle.read()
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or hashlib.sha256(manifest_bytes).hexdigest()
+                != snapshot.manifest_sha256
+            ):
+                raise LocalizedStoreError(
+                    "Localized version manifest changed during evidence read."
+                )
+        except LocalizedStoreError:
+            raise
+        except OSError as exc:
+            raise LocalizedStoreError(
+                "Localized version manifest could not be read safely."
+            ) from exc
+        return manifest_bytes, contents
+
     def read_verified_artifact(self, version_id: str, name: str) -> bytes:
         """Compatibility wrapper for one verified immutable artifact."""
 
