@@ -27,6 +27,140 @@ from tools.PriorMap.localized_output_store import (
     REQUIRED_VERSION_FILES,
     local_input_identity_id,
 )
+from tools.Qualification.qualification import (
+    QualificationError,
+    build_trajectory_qualification_evidence,
+)
+
+
+def _canonical_sha(value: object) -> str:
+    return hashlib.sha256(
+        json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def write_valid_field_evidence(
+    path: Path,
+    *,
+    release_manifest_sha256: str,
+    release_git_sha: str,
+    product_version: str,
+    prior_map_sha256: str,
+    quality_policy_sha256: str,
+) -> tuple[str, dict[str, object]]:
+    runs: list[dict[str, object]] = []
+    for index in range(3):
+        tag_ids = [f"tag-{index}-{tag}" for tag in range(20)]
+        trajectory: dict[str, object] = {
+            "format": "MarketScannerTrajectoryQualificationEvidence",
+            "version": 1,
+            "generated_at_utc": "2026-07-30T00:00:00+00:00",
+            "release_git_sha": release_git_sha,
+            "release_manifest_sha256": release_manifest_sha256,
+            "product_version": product_version,
+            "localized_version_id": f"v{index + 1:06d}",
+            "localized_version_manifest_sha256": format(index + 10, "064x"),
+            "input_identity_id": format(index + 20, "064x"),
+            "session_input_bundle_sha256": format(index + 30, "064x"),
+            "raw_database_sha256": format(index + 40, "064x"),
+            "tracking_session_id": f"tracking-{index}",
+            "prior_map_id": "prior-test",
+            "prior_map_sha256": prior_map_sha256,
+            "quality_policy_sha256": quality_policy_sha256,
+            "quality_policy_version": "test-frozen-1",
+            "nodeCoverage": 1.0,
+            "correctionP95M": 0.1,
+            "correctionMaxM": 0.2,
+            "relativeTranslationResidualP95M": 0.01,
+            "relativeYawResidualP95Rad": 0.01,
+            "weakLostDurationRatio": 0.0,
+            "inventoriesMatch": True,
+            "factorGraphConverged": True,
+            "factorGraphQualityPassed": True,
+            "singleConnectedComponent": True,
+            "allGroundTruthTagsObserved": True,
+            "userConfirmedTagsPreserved": True,
+            "automaticConfirmDuringWeakLost": 0,
+            "topologyDigest": "a" * 64,
+            "shelfAssociationDigest": "b" * 64,
+            "localizedTagIds": tag_ids,
+            "localizedTagIdsSha256": _canonical_sha(sorted(tag_ids)),
+        }
+        trajectory["evidenceSha256"] = _canonical_sha(trajectory)
+        runs.append(
+            {
+                "runId": f"run-{index}",
+                "executedAtUnix": 200 + index,
+                "sourceSessionIdentity": {
+                    "rawSessionBundleSha256": trajectory[
+                        "session_input_bundle_sha256"
+                    ],
+                    "rawDatabaseSha256": trajectory["raw_database_sha256"],
+                    "trackingSessionId": trajectory["tracking_session_id"],
+                },
+                "trajectoryEvidence": trajectory,
+                "independentTagMetrics": {
+                    "count": 20,
+                    "planarP50M": 0.01,
+                    "planarP95M": 0.02,
+                    "planarMaxM": 0.03,
+                    "heightP95M": 0.02,
+                    "heightMaxM": 0.03,
+                },
+                "releaseGitSha": release_git_sha,
+                "deviceAppGitSha": release_git_sha,
+                "deviceAppBuildId": "test-build",
+                "deviceEvidenceIdentity": {
+                    "format": "MarketScannerDeviceQualificationEvidence",
+                    "version": 2,
+                    "result": "PASS",
+                    "appGitSha": release_git_sha,
+                    "appBuildId": "test-build",
+                    "evidenceBodySha256": "c" * 64,
+                    "fileSha256": "d" * 64,
+                },
+                "inputFiles": [],
+                "blockers": [],
+                "result": "PASS",
+            }
+        )
+    evidence: dict[str, object] = {
+        "format": "MarketScannerFieldQualificationEvidence",
+        "version": 3,
+        "sourcePlanSha256": "9" * 64,
+        "releaseManifest": {
+            "name": "release-manifest.json",
+            "bytes": 1,
+            "sha256": release_manifest_sha256,
+            "gitSha": release_git_sha,
+            "productVersion": product_version,
+            "manifestBodySha256": "8" * 64,
+        },
+        "qualityPolicy": {
+            "name": "quality-policy.json",
+            "bytes": 1,
+            "sha256": quality_policy_sha256,
+            "policyVersion": "test-frozen-1",
+            "status": "frozen",
+        },
+        "priorMapIdentity": {
+            "priorMapId": "prior-test",
+            "priorMapSha256": prior_map_sha256,
+        },
+        "thresholdsFrozenAtUnix": 100,
+        "thresholds": {},
+        "siteId": "store-test",
+        "siteType": "supermarket",
+        "groundTruthMethod": "independent controls",
+        "independentSurveyor": "test surveyor",
+        "runs": runs,
+        "blockers": [],
+        "result": "PASS",
+    }
+    evidence["evidenceSha256"] = _canonical_sha(evidence)
+    data = json.dumps(evidence, indent=2, sort_keys=True).encode("utf-8") + b"\n"
+    path.write_bytes(data)
+    return hashlib.sha256(data).hexdigest(), evidence
 
 
 def _hold_store_lock(
@@ -369,6 +503,112 @@ class LocalizedVersionStoreTests(unittest.TestCase):
             local_input_record=self.local_input_record,
         )
 
+    def commit_qualification_version(self, *, quality_sha: str = "e" * 64):
+        staging = self.write_valid_staging(state="review")
+        report_path = staging / "localization_report.json"
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+        report.update(
+            {
+                "input_identity_id": self.input_identity_id,
+                "node_coverage_ratio": 1.0,
+                "node_inventory_audit": {
+                    "source_count": 20,
+                    "optimized_count": 20,
+                    "exported_count": 20,
+                    "source_missing_from_optimized": [],
+                    "source_missing_from_export": [],
+                    "optimized_not_in_source": [],
+                    "exported_not_in_optimized": [],
+                    "source_duplicate_ids": [],
+                    "optimized_duplicate_ids": [],
+                    "exported_duplicate_ids": [],
+                    "source_non_monotonic_stamp_node_ids": [],
+                    "optimized_non_monotonic_stamp_node_ids": [],
+                },
+                "correction_distribution_m": {
+                    "p95": 0.1,
+                    "maximum": 0.2,
+                },
+                "localization_state_duration_seconds": {
+                    "normal": 100.0,
+                    "weak": 0.0,
+                    "lost": 0.0,
+                },
+                "weak_lost_duration_seconds": 0.0,
+                "weak_lost_intervals": [],
+                "aisle_switch_sequence": [],
+            }
+        )
+        report_path.write_text(json.dumps(report) + "\n", encoding="utf-8")
+        factor_path = staging / "factor_graph_report.json"
+        factor = json.loads(factor_path.read_text(encoding="utf-8"))
+        factor.update(
+            {
+                "graph_connected": True,
+                "p95_relative_edge_translation_residual_m": 0.01,
+                "p95_relative_edge_yaw_residual_deg": 0.5,
+            }
+        )
+        factor["quality_policy"]["policy_sha256"] = quality_sha
+        factor_path.write_text(json.dumps(factor) + "\n", encoding="utf-8")
+        processing_path = staging / "processing_manifest.json"
+        processing = json.loads(processing_path.read_text(encoding="utf-8"))
+        processing["factor_graph_quality_policy_sha256"] = quality_sha
+        processing_path.write_text(json.dumps(processing) + "\n", encoding="utf-8")
+        tags = []
+        features = []
+        for index in range(20):
+            tag_id = f"tag-{index}"
+            tags.append(
+                {
+                    "tag_id": tag_id,
+                    "tracking_session_id": "tracking-test",
+                    "timestamp": float(index),
+                    "user_confirmed": True,
+                    "approval_status": "approved",
+                    "needs_review": False,
+                    "shelf_code": "shelf-a",
+                    "shelf_side": "edge-a",
+                    "distance_from_shelf_start_cm": float(index),
+                    "final_map_position": {"x_m": float(index), "y_m": 0.0},
+                    "transform_audit": {"status": "applied"},
+                    "association_audit": {"status": "human_confirmed"},
+                }
+            )
+            features.append(
+                {
+                    "type": "Feature",
+                    "geometry": {
+                        "type": "Point",
+                        "coordinates": [float(index), 0.0],
+                    },
+                    "properties": {"tag_id": tag_id},
+                }
+            )
+        (staging / "localized_price_tags.json").write_text(
+            json.dumps(tags) + "\n", encoding="utf-8"
+        )
+        (staging / "localized_price_tags.geojson").write_text(
+            json.dumps({"type": "FeatureCollection", "features": features}) + "\n",
+            encoding="utf-8",
+        )
+        with (staging / "localized_price_tags.csv").open(
+            "w", encoding="utf-8", newline=""
+        ) as handle:
+            writer = csv.DictWriter(handle, fieldnames=["tag_id", "approval_status"])
+            writer.writeheader()
+            for tag in tags:
+                writer.writerow(
+                    {"tag_id": tag["tag_id"], "approval_status": "approved"}
+                )
+        manifest = self.store.validate_staging(staging, parent_version=None)
+        return self.store.commit(
+            staging,
+            manifest,
+            update_current=True,
+            local_input_record=self.local_input_record,
+        )
+
     def test_failed_validation_leaves_current_unchanged(self) -> None:
         first = self.commit_valid()
         staging = self.write_valid_staging(revision=2)
@@ -381,6 +621,74 @@ class LocalizedVersionStoreTests(unittest.TestCase):
         assert current is not None
         self.assertEqual(current.version_id, first.version_id)
         self.assertTrue(first.version_dir.is_dir())
+
+    def test_trajectory_evidence_is_derived_from_verified_version(self) -> None:
+        snapshot = self.commit_qualification_version()
+        release_path = self.output / "release-manifest.json"
+        release: dict[str, object] = {
+            "format": "MarketScannerReleaseManifest",
+            "version": 2,
+            "git_sha": "a" * 40,
+            "product_version": "test",
+            "factor_graph_quality_policy_sha256": "e" * 64,
+        }
+        release["manifest_body_sha256"] = _canonical_sha(release)
+        release_path.write_text(json.dumps(release), encoding="utf-8")
+        output = self.output / "trajectory-evidence.json"
+        evidence = build_trajectory_qualification_evidence(
+            self.output,
+            snapshot.version_id,
+            snapshot.manifest_sha256,
+            release_path,
+            output,
+        )
+        self.assertEqual(
+            evidence["format"],
+            "MarketScannerTrajectoryQualificationEvidence",
+        )
+        self.assertEqual(evidence["localized_version_id"], snapshot.version_id)
+        self.assertEqual(
+            evidence["localized_version_manifest_sha256"],
+            snapshot.manifest_sha256,
+        )
+        self.assertTrue(evidence["factorGraphQualityPassed"])
+        self.assertEqual(evidence["automaticConfirmDuringWeakLost"], 0)
+
+        manifest_path = snapshot.version_dir / "version_manifest.json"
+        manifest_path.write_bytes(manifest_path.read_bytes() + b" ")
+        with self.assertRaisesRegex(
+            QualificationError, "localized_version_manifest_sha_mismatch"
+        ):
+            build_trajectory_qualification_evidence(
+                self.output,
+                snapshot.version_id,
+                snapshot.manifest_sha256,
+                release_path,
+                self.output / "tampered-trajectory-evidence.json",
+            )
+
+    def test_trajectory_evidence_rejects_release_quality_identity_mismatch(self) -> None:
+        snapshot = self.commit_qualification_version(quality_sha="f" * 64)
+        release_path = self.output / "release-manifest.json"
+        release: dict[str, object] = {
+            "format": "MarketScannerReleaseManifest",
+            "version": 2,
+            "git_sha": "a" * 40,
+            "product_version": "test",
+            "factor_graph_quality_policy_sha256": "e" * 64,
+        }
+        release["manifest_body_sha256"] = _canonical_sha(release)
+        release_path.write_text(json.dumps(release), encoding="utf-8")
+        with self.assertRaisesRegex(
+            QualificationError, "trajectory_evidence_identity_mismatch"
+        ):
+            build_trajectory_qualification_evidence(
+                self.output,
+                snapshot.version_id,
+                snapshot.manifest_sha256,
+                release_path,
+                self.output / "trajectory-evidence.json",
+            )
 
     def test_new_version_is_immutable_and_pointer_switch_is_atomic(self) -> None:
         first = self.commit_valid()
@@ -435,45 +743,45 @@ class LocalizedVersionStoreTests(unittest.TestCase):
             "review",
         )
         evidence_path = self.output / "field-evidence.json"
-        evidence_path.write_text("{}", encoding="utf-8")
-        qualification = {
-            "file_sha256": "f" * 64,
-            "evidence_sha256": "1" * 64,
-            "release_manifest_sha256": "2" * 64,
-            "release_git_sha": "3" * 40,
-            "product_version": "test",
-            "prior_map_id": "prior-test",
-            "prior_map_sha256": self.identity_hashes["prior_map_sha256"],
-            "quality_policy_sha256": "e" * 64,
-            "quality_policy_version": "test-frozen-1",
-            "site_id": "store-test",
-            "site_type": "supermarket",
-            "run_count": 3,
-            "tag_control_count": 60,
-        }
+        evidence_sha, _evidence = write_valid_field_evidence(
+            evidence_path,
+            release_manifest_sha256="2" * 64,
+            release_git_sha="3" * 40,
+            product_version="test",
+            prior_map_sha256=self.identity_hashes["prior_map_sha256"],
+            quality_policy_sha256="e" * 64,
+        )
         release_identity = {
             "release_manifest_sha256": "2" * 64,
             "git_sha": "3" * 40,
             "product_version": "test",
             "quality_policy_sha256": "e" * 64,
         }
-        with mock.patch.object(localized_store, "inspect_field_evidence", return_value=qualification):
-            published = self.store.publish_current(
-                actor="publisher",
-                reason="explicit approval",
-                qualification_evidence_path=evidence_path,
-                expected_field_evidence_sha256="f" * 64,
-                expected_release_identity=release_identity,
-            )
+        published = self.store.publish_current(
+            actor="publisher",
+            reason="explicit approval",
+            qualification_evidence_path=evidence_path,
+            expected_field_evidence_sha256=evidence_sha,
+            expected_release_identity=release_identity,
+        )
         self.assertEqual(published.state, "published")
         self.assertEqual(self.store.published(), published)
         self.assertEqual(self.store.current(), review)
+        embedded = published.version_dir / "field_evidence.json"
+        self.assertEqual(embedded.read_bytes(), evidence_path.read_bytes())
+        self.assertTrue(
+            (published.version_dir / "qualification_manifest.json").is_file()
+        )
+        evidence_path.unlink()
+        self.assertEqual(self.store.published(), published)
+        evidence_path.write_text('{"external":"changed"}\n', encoding="utf-8")
+        self.assertEqual(self.store.published(), published)
         with self.assertRaisesRegex(LocalizedStoreError, "already exists"):
             self.store.publish_current(
                 actor="publisher",
                 reason="duplicate publication must fail",
                 qualification_evidence_path=evidence_path,
-                expected_field_evidence_sha256="f" * 64,
+                expected_field_evidence_sha256=evidence_sha,
                 expected_release_identity=release_identity,
             )
         revoked = self.store.revoke_published(

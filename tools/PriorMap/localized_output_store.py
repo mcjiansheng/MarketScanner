@@ -16,7 +16,11 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from tools.PriorMap.localized_file_lock import FileLock, FileLockTimeout
-from tools.Qualification.qualification import QualificationError, inspect_field_evidence
+from tools.Qualification.qualification import (
+    QualificationError,
+    inspect_field_evidence,
+    inspect_field_evidence_with_bytes,
+)
 
 
 REQUIRED_VERSION_FILES = (
@@ -38,6 +42,11 @@ REQUIRED_VERSION_FILES = (
     "shelf_tag_index.json",
     "audit_log.jsonl",
 )
+PUBLICATION_EVIDENCE_FILES = (
+    "field_evidence.json",
+    "qualification_manifest.json",
+)
+PUBLISHED_VERSION_FILES = REQUIRED_VERSION_FILES + PUBLICATION_EVIDENCE_FILES
 VERSION_2_REQUIRED_VERSION_FILES = tuple(
     name for name in REQUIRED_VERSION_FILES if name != "factor_graph_report.json"
 )
@@ -500,14 +509,22 @@ class LocalizedVersionStore:
         actual_files = sorted(
             path.name for path in staging.iterdir() if path.is_file()
         )
-        missing = sorted(set(REQUIRED_VERSION_FILES) - set(actual_files))
-        unexpected = sorted(set(actual_files) - set(REQUIRED_VERSION_FILES))
+        publication_files_present = bool(
+            set(actual_files) & set(PUBLICATION_EVIDENCE_FILES)
+        )
+        version_files = (
+            PUBLISHED_VERSION_FILES
+            if publication_files_present
+            else REQUIRED_VERSION_FILES
+        )
+        missing = sorted(set(version_files) - set(actual_files))
+        unexpected = sorted(set(actual_files) - set(version_files))
         if missing or unexpected:
             raise LocalizedStoreError(
                 f"Localized version file set mismatch: missing={missing}, unexpected={unexpected}"
             )
         parsed: dict[str, Any] = {}
-        for name in REQUIRED_VERSION_FILES:
+        for name in version_files:
             path = staging / name
             if not stat.S_ISREG(path.lstat().st_mode):
                 raise LocalizedStoreError(
@@ -542,6 +559,19 @@ class LocalizedVersionStore:
             "manual_edits.json": ("MarketScannerManualEdits", 4),
             "shelf_tag_index.json": ("MarketScannerShelfTagIndex", 1),
         }
+        if publication_files_present:
+            expected_contracts.update(
+                {
+                    "field_evidence.json": (
+                        "MarketScannerFieldQualificationEvidence",
+                        3,
+                    ),
+                    "qualification_manifest.json": (
+                        "MarketScannerPublishedQualificationManifest",
+                        1,
+                    ),
+                }
+            )
         for name, (expected_format, expected_version) in expected_contracts.items():
             payload = parsed[name]
             if (
@@ -607,6 +637,14 @@ class LocalizedVersionStore:
         processing = parsed["processing_manifest.json"]
         session_input = parsed["session_input_manifest.json"]
         journal = parsed["manual_edits.json"]
+        if publication_files_present and report.get("publish_state") not in {
+            "published",
+            "revoked",
+            "superseded",
+        }:
+            raise LocalizedStoreError(
+                "Qualification evidence is allowed only in publication states."
+            )
         session_files = session_input.get("files")
         expected_session_roles = (
             "metadata",
@@ -770,11 +808,11 @@ class LocalizedVersionStore:
                 "bytes": (staging / name).stat().st_size,
                 "sha256": _sha256(staging / name),
             }
-            for name in REQUIRED_VERSION_FILES
+            for name in version_files
         ]
         return {
             "format": "MarketScannerLocalizedVersionManifest",
-            "version": 3,
+            "version": 4 if publication_files_present else 3,
             "state": state,
             "revision": revision,
             "parent_version": parent_version,
@@ -975,7 +1013,7 @@ class LocalizedVersionStore:
                 )["localized_review.json"]
             ).hexdigest()
             try:
-                qualification = inspect_field_evidence(
+                qualification, field_evidence_bytes = inspect_field_evidence_with_bytes(
                     qualification_evidence_path,
                     required_site_type="supermarket",
                 )
@@ -1025,6 +1063,8 @@ class LocalizedVersionStore:
                 "site_type": qualification["site_type"],
                 "run_count": qualification["run_count"],
                 "tag_control_count": qualification["tag_control_count"],
+                "field_evidence_file": "field_evidence.json",
+                "qualification_manifest_file": "qualification_manifest.json",
                 "reason": reason,
             }
             self._validate_publication_gate(report, field_acceptance)
@@ -1032,6 +1072,7 @@ class LocalizedVersionStore:
                 staging, current, "published", actor=actor, reason=reason,
                 pointer_name="published.json",
                 field_acceptance=field_acceptance,
+                field_evidence_bytes=field_evidence_bytes,
             )
         except Exception:
             if staging.exists():
@@ -1067,15 +1108,71 @@ class LocalizedVersionStore:
         reason: str,
         pointer_name: str,
         field_acceptance: dict[str, Any] | None = None,
+        field_evidence_bytes: bytes | None = None,
     ) -> LocalizedSnapshot:
         if self._lock_handle is None:
             raise LocalizedStoreError("Localized transition requires the write lock.")
         try:
+            source_has_publication_evidence = all(
+                (source.version_dir / name).is_file()
+                for name in PUBLICATION_EVIDENCE_FILES
+            )
             source_artifacts = self.read_verified_artifacts(
-                source, REQUIRED_VERSION_FILES
+                source,
+                (
+                    PUBLISHED_VERSION_FILES
+                    if source_has_publication_evidence
+                    else REQUIRED_VERSION_FILES
+                ),
             )
             for name, content in source_artifacts.items():
                 (staging / name).write_bytes(content)
+            if field_evidence_bytes is not None:
+                if field_acceptance is None or target_state != "published":
+                    raise LocalizedStoreError(
+                        "Published qualification evidence has no acceptance record."
+                    )
+                if hashlib.sha256(field_evidence_bytes).hexdigest() != field_acceptance.get(
+                    "field_evidence_sha256"
+                ):
+                    raise LocalizedStoreError(
+                        "Accepted field evidence bytes differ before publication commit."
+                    )
+                (staging / "field_evidence.json").write_bytes(field_evidence_bytes)
+                _atomic_json(
+                    staging / "qualification_manifest.json",
+                    {
+                        "format": "MarketScannerPublishedQualificationManifest",
+                        "version": 1,
+                        "candidate_version_id": source.version_id,
+                        "candidate_revision": source.revision,
+                        "candidate_version_manifest_sha256": source.manifest_sha256,
+                        "field_evidence_file": "field_evidence.json",
+                        "field_evidence_sha256": field_acceptance[
+                            "field_evidence_sha256"
+                        ],
+                        "field_evidence_body_sha256": field_acceptance[
+                            "field_evidence_body_sha256"
+                        ],
+                        "release_manifest_sha256": field_acceptance[
+                            "release_manifest_sha256"
+                        ],
+                        "release_git_sha": field_acceptance["release_git_sha"],
+                        "product_version": field_acceptance["product_version"],
+                        "prior_map_id": field_acceptance["prior_map_id"],
+                        "prior_map_sha256": field_acceptance[
+                            "prior_map_sha256"
+                        ],
+                        "quality_policy_sha256": field_acceptance[
+                            "quality_policy_sha256"
+                        ],
+                        "quality_policy_version": field_acceptance[
+                            "quality_policy_version"
+                        ],
+                        "accepted_at_utc": field_acceptance["accepted_at_utc"],
+                        "actor": field_acceptance["actor"],
+                    },
+                )
             now = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
             for name in ("localization_report.json", "processing_manifest.json"):
                 path = staging / name
@@ -1147,6 +1244,9 @@ class LocalizedVersionStore:
                 r"[0-9a-f]{64}", field_acceptance.get("field_evidence_sha256", "")
             )
             is not None
+            and field_acceptance.get("field_evidence_file") == "field_evidence.json"
+            and field_acceptance.get("qualification_manifest_file")
+            == "qualification_manifest.json"
             and isinstance(field_acceptance.get("review_evidence_sha256"), str)
             and re.fullmatch(
                 r"[0-9a-f]{64}", field_acceptance.get("review_evidence_sha256", "")
@@ -1183,13 +1283,32 @@ class LocalizedVersionStore:
         try:
             artifacts = self.read_verified_artifacts(
                 snapshot,
-                ("localization_report.json", "localized_review.json"),
+                (
+                    "localization_report.json",
+                    "localized_review.json",
+                    "field_evidence.json",
+                    "qualification_manifest.json",
+                ),
             )
             report = json.loads(
                 artifacts["localization_report.json"].decode("utf-8"),
                 parse_constant=_reject_nonfinite,
             )
-        except (LocalizedStoreError, UnicodeDecodeError, ValueError, json.JSONDecodeError) as exc:
+            qualification_manifest = json.loads(
+                artifacts["qualification_manifest.json"].decode("utf-8"),
+                parse_constant=_reject_nonfinite,
+            )
+            embedded_qualification = inspect_field_evidence(
+                snapshot.version_dir / "field_evidence.json",
+                required_site_type="supermarket",
+            )
+        except (
+            LocalizedStoreError,
+            QualificationError,
+            UnicodeDecodeError,
+            ValueError,
+            json.JSONDecodeError,
+        ) as exc:
             raise LocalizedStoreError("Published localization report is invalid.") from exc
         acceptance = report.get("field_acceptance") if isinstance(report, dict) else None
         if not isinstance(report, dict) or not isinstance(acceptance, dict):
@@ -1199,6 +1318,47 @@ class LocalizedVersionStore:
         ).hexdigest():
             raise LocalizedStoreError(
                 "Published field acceptance evidence no longer matches the review artifact."
+            )
+        if (
+            not isinstance(qualification_manifest, dict)
+            or qualification_manifest.get("format")
+            != "MarketScannerPublishedQualificationManifest"
+            or qualification_manifest.get("version") != 1
+            or qualification_manifest.get("field_evidence_file")
+            != "field_evidence.json"
+            or acceptance.get("field_evidence_file") != "field_evidence.json"
+            or acceptance.get("qualification_manifest_file")
+            != "qualification_manifest.json"
+            or hashlib.sha256(artifacts["field_evidence.json"]).hexdigest()
+            != acceptance.get("field_evidence_sha256")
+            or embedded_qualification.get("file_sha256")
+            != acceptance.get("field_evidence_sha256")
+            or embedded_qualification.get("evidence_sha256")
+            != acceptance.get("field_evidence_body_sha256")
+        ):
+            raise LocalizedStoreError(
+                "Published qualification evidence no longer matches its acceptance record."
+            )
+        qualification_fields = {
+            "field_evidence_sha256": "field_evidence_sha256",
+            "field_evidence_body_sha256": "field_evidence_body_sha256",
+            "release_manifest_sha256": "release_manifest_sha256",
+            "release_git_sha": "release_git_sha",
+            "product_version": "product_version",
+            "prior_map_id": "prior_map_id",
+            "prior_map_sha256": "prior_map_sha256",
+            "quality_policy_sha256": "quality_policy_sha256",
+            "quality_policy_version": "quality_policy_version",
+            "accepted_at_utc": "accepted_at_utc",
+            "actor": "actor",
+        }
+        if any(
+            qualification_manifest.get(manifest_name)
+            != acceptance.get(acceptance_name)
+            for manifest_name, acceptance_name in qualification_fields.items()
+        ):
+            raise LocalizedStoreError(
+                "Published qualification manifest identity differs from acceptance."
             )
         self._validate_publication_gate(report, acceptance)
 
@@ -1245,7 +1405,7 @@ class LocalizedVersionStore:
         requested = tuple(names)
         if not requested or len(set(requested)) != len(requested):
             raise LocalizedStoreError("Localized artifact batch is invalid.")
-        if any(name not in REQUIRED_VERSION_FILES for name in requested):
+        if any(name not in PUBLISHED_VERSION_FILES for name in requested):
             raise LocalizedStoreError("Localized artifact name is invalid.")
         verified = self.resolve_version(snapshot.version_id)
         if verified != snapshot:
@@ -1354,7 +1514,7 @@ class LocalizedVersionStore:
             ) from exc
         if (
             manifest.get("format") != "MarketScannerLocalizedVersionManifest"
-            or manifest.get("version") not in {1, 2, 3}
+            or manifest.get("version") not in {1, 2, 3, 4}
             or manifest.get("version_id") != version_id
             or state not in VERSION_STATES
             or revision < 1
@@ -1364,7 +1524,9 @@ class LocalizedVersionStore:
             )
         manifest_version = int(manifest["version"])
         expected_files = (
-            REQUIRED_VERSION_FILES
+            PUBLISHED_VERSION_FILES
+            if manifest_version == 4
+            else REQUIRED_VERSION_FILES
             if manifest_version == 3
             else VERSION_2_REQUIRED_VERSION_FILES
             if manifest_version == 2
@@ -1372,7 +1534,7 @@ class LocalizedVersionStore:
         )
         input_identity_id: str | None = None
         session_input_bundle_sha256: str | None = None
-        if manifest_version in {2, 3}:
+        if manifest_version in {2, 3, 4}:
             input_identity_id = manifest.get("input_identity_id")
             session_input_bundle_sha256 = manifest.get(
                 "session_input_bundle_sha256"

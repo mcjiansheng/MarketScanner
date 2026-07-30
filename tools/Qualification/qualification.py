@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import argparse
 import csv
+from datetime import datetime, timezone
 import hashlib
+import io
 import json
 import math
 import os
@@ -20,6 +22,7 @@ FORMAT_DEVICE_PLAN = "MarketScannerDeviceQualificationPlan"
 FORMAT_DEVICE_EVIDENCE = "MarketScannerDeviceQualificationEvidence"
 FORMAT_FIELD_PLAN = "MarketScannerFieldQualificationPlan"
 FORMAT_FIELD_EVIDENCE = "MarketScannerFieldQualificationEvidence"
+FORMAT_TRAJECTORY_EVIDENCE = "MarketScannerTrajectoryQualificationEvidence"
 FORMAT_RELEASE_MANIFEST = "MarketScannerReleaseManifest"
 FORMAT_QUALITY_POLICY = "MarketScannerFactorGraphQualityPolicy"
 SHA_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -65,30 +68,97 @@ class QualificationError(ValueError):
     pass
 
 
+def _read_stable_bytes(
+    path: Path,
+    *,
+    maximum_bytes: int,
+    label: str,
+) -> tuple[bytes, str, int, tuple[int, int]]:
+    """Read the exact bytes later parsed/hashed from one verified descriptor."""
+
+    before = path.lstat()
+    if (
+        path.is_symlink()
+        or not path.is_file()
+        or before.st_nlink != 1
+        or before.st_size > maximum_bytes
+    ):
+        raise QualificationError(f"unsafe_or_oversized_{label}:{path.name}")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    try:
+        opened = os.fstat(descriptor)
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            chunk = os.read(descriptor, min(1024 * 1024, maximum_bytes + 1 - total))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+            if total > maximum_bytes:
+                raise QualificationError(f"{label}_size_limit:{path.name}")
+    finally:
+        os.close(descriptor)
+    after = path.lstat()
+    identity = (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_nlink,
+        before.st_mtime_ns,
+        before.st_ctime_ns,
+    )
+    if (
+        identity
+        != (
+            opened.st_dev,
+            opened.st_ino,
+            opened.st_size,
+            opened.st_nlink,
+            opened.st_mtime_ns,
+            opened.st_ctime_ns,
+        )
+        or identity
+        != (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_nlink,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        )
+        or before.st_nlink != 1
+    ):
+        raise QualificationError(f"{label}_changed_during_read:{path.name}")
+    data = b"".join(chunks)
+    if len(data) != before.st_size:
+        raise QualificationError(f"{label}_partial_read:{path.name}")
+    return data, hashlib.sha256(data).hexdigest(), len(data), (
+        int(before.st_dev),
+        int(before.st_ino),
+    )
+
+
 def _load_json_with_identity(
     path: Path, maximum_bytes: int = 16 * 1024 * 1024
 ) -> tuple[Any, str, int]:
-    info = path.lstat()
-    if not path.is_file() or path.is_symlink() or info.st_nlink != 1:
-        raise QualificationError(f"unsafe_regular_file:{path.name}")
-    if info.st_size > maximum_bytes:
-        raise QualificationError(f"json_size_limit:{path.name}")
-    with path.open("rb") as stream:
-        data = stream.read(maximum_bytes + 1)
-        after = os.fstat(stream.fileno())
-    current = path.lstat()
-    if (
-        len(data) > maximum_bytes
-        or (info.st_dev, info.st_ino, info.st_size)
-        != (after.st_dev, after.st_ino, after.st_size)
-        or (info.st_dev, info.st_ino, info.st_size)
-        != (current.st_dev, current.st_ino, current.st_size)
-    ):
-        raise QualificationError(f"json_changed_during_read:{path.name}")
+    data, digest, size, _ = _read_stable_bytes(
+        path, maximum_bytes=maximum_bytes, label="json"
+    )
     try:
-        return json.loads(data), hashlib.sha256(data).hexdigest(), len(data)
+        return (
+            json.loads(
+                data.decode("utf-8", errors="strict"),
+                parse_constant=lambda token: (_ for _ in ()).throw(ValueError(token)),
+            ),
+            digest,
+            size,
+        )
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise QualificationError(f"invalid_json:{path.name}") from exc
+    except ValueError as exc:
+        raise QualificationError(f"nonfinite_json:{path.name}") from exc
 
 
 def _load_json(path: Path, maximum_bytes: int = 16 * 1024 * 1024) -> Any:
@@ -96,23 +166,10 @@ def _load_json(path: Path, maximum_bytes: int = 16 * 1024 * 1024) -> Any:
 
 
 def _sha256(path: Path) -> tuple[str, int]:
-    before = path.lstat()
-    if not path.is_file() or path.is_symlink() or before.st_nlink != 1:
-        raise QualificationError(f"unsafe_artifact:{path.name}")
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        while chunk := stream.read(1024 * 1024):
-            digest.update(chunk)
-        opened = os.fstat(stream.fileno())
-    after = path.lstat()
-    identity = (before.st_dev, before.st_ino, before.st_size)
-    if identity != (opened.st_dev, opened.st_ino, opened.st_size) or identity != (
-        after.st_dev,
-        after.st_ino,
-        after.st_size,
-    ):
-        raise QualificationError(f"artifact_changed_during_hash:{path.name}")
-    return digest.hexdigest(), before.st_size
+    _data, digest, size, _identity = _read_stable_bytes(
+        path, maximum_bytes=2 * 1024 * 1024 * 1024, label="artifact"
+    )
+    return digest, size
 
 
 def _tree_manifest(root: Path) -> list[dict[str, Any]]:
@@ -149,7 +206,30 @@ def _validated_canonical_evidence(
     expected_format: str,
     expected_version: int,
 ) -> tuple[dict[str, Any], str, int]:
-    value, digest, size = _load_json_with_identity(path)
+    value, digest, size, _data = _validated_canonical_evidence_bytes(
+        path,
+        expected_format=expected_format,
+        expected_version=expected_version,
+    )
+    return value, digest, size
+
+
+def _validated_canonical_evidence_bytes(
+    path: Path,
+    *,
+    expected_format: str,
+    expected_version: int,
+) -> tuple[dict[str, Any], str, int, bytes]:
+    data, digest, size, _identity = _read_stable_bytes(
+        path, maximum_bytes=16 * 1024 * 1024, label="evidence"
+    )
+    try:
+        value = json.loads(
+            data.decode("utf-8", errors="strict"),
+            parse_constant=lambda token: (_ for _ in ()).throw(ValueError(token)),
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        raise QualificationError("evidence_json_invalid") from exc
     if not isinstance(value, dict):
         raise QualificationError("evidence_not_object")
     body = dict(value)
@@ -161,7 +241,7 @@ def _validated_canonical_evidence(
         or _canonical_sha(body) != declared
     ):
         raise QualificationError("evidence_contract_invalid")
-    return value, digest, size
+    return value, digest, size, data
 
 
 def _validate_release_manifest(path: Path) -> tuple[dict[str, Any], str, int]:
@@ -547,20 +627,298 @@ def collect_device(plan_path: Path, output_path: Path) -> dict[str, Any]:
     return evidence
 
 
-def _read_tag_measurements(path: Path) -> dict[str, float]:
+def _trajectory_evidence_from_version(
+    localized_output: Path,
+    version_id: str,
+    *,
+    expected_version_manifest_sha256: str,
+    release: dict[str, Any],
+    release_sha256: str,
+) -> dict[str, Any]:
+    """Derive qualification metrics only from a verified immutable version."""
+
+    if re.fullmatch(r"v[0-9]{6}", version_id) is None:
+        raise QualificationError("localized_version_id_invalid")
+    try:
+        from tools.PriorMap.localized_output_store import (  # Local import avoids a cycle.
+            LocalizedStoreError,
+            LocalizedVersionStore,
+        )
+
+        store = LocalizedVersionStore(localized_output)
+        snapshot = store.resolve_version(version_id)
+        if (
+            not SHA_RE.fullmatch(expected_version_manifest_sha256)
+            or snapshot.manifest_sha256 != expected_version_manifest_sha256
+        ):
+            raise QualificationError("localized_version_manifest_sha_mismatch")
+        artifacts = store.read_verified_artifacts(
+            snapshot,
+            (
+                "source_manifest.json",
+                "processing_manifest.json",
+                "localization_report.json",
+                "factor_graph_report.json",
+                "localized_price_tags.json",
+                "optimized_map_trajectory.geojson",
+            ),
+        )
+    except (OSError, LocalizedStoreError) as exc:
+        raise QualificationError("localized_version_verification_failed") from exc
+
+    def parsed_object(name: str) -> dict[str, Any]:
+        try:
+            value = json.loads(
+                artifacts[name].decode("utf-8", errors="strict"),
+                parse_constant=lambda token: (_ for _ in ()).throw(ValueError(token)),
+            )
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+            raise QualificationError(f"localized_artifact_invalid:{name}") from exc
+        if not isinstance(value, dict):
+            raise QualificationError(f"localized_artifact_not_object:{name}")
+        return value
+
+    source = parsed_object("source_manifest.json")
+    processing = parsed_object("processing_manifest.json")
+    report = parsed_object("localization_report.json")
+    factor = parsed_object("factor_graph_report.json")
+    try:
+        tags = json.loads(
+            artifacts["localized_price_tags.json"].decode("utf-8", errors="strict"),
+            parse_constant=lambda token: (_ for _ in ()).throw(ValueError(token)),
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        raise QualificationError("localized_tags_invalid") from exc
+    if not isinstance(tags, list) or not tags or any(not isinstance(tag, dict) for tag in tags):
+        raise QualificationError("localized_tags_missing_or_invalid")
+
+    quality = factor.get("quality_policy")
+    if (
+        source.get("input_identity_id") != snapshot.input_identity_id
+        or source.get("session_input_bundle_sha256")
+        != snapshot.session_input_bundle_sha256
+        or processing.get("input_identity_id") != snapshot.input_identity_id
+        or report.get("input_identity_id") != snapshot.input_identity_id
+        or factor.get("input_identity_id") != snapshot.input_identity_id
+        or not isinstance(quality, dict)
+        or quality.get("policy_sha256")
+        != release.get("factor_graph_quality_policy_sha256")
+    ):
+        raise QualificationError("trajectory_evidence_identity_mismatch")
+
+    tag_ids: list[str] = []
+    tracking_ids: set[str] = set()
+    observed_complete = True
+    user_confirmed_preserved = True
+    automatic_confirm_during_weak_lost = 0
+    weak_lost_intervals = report.get("weak_lost_intervals")
+    if not isinstance(weak_lost_intervals, list):
+        raise QualificationError("weak_lost_intervals_invalid")
+    association_rows: list[dict[str, Any]] = []
+    for tag in tags:
+        tag_id = tag.get("tag_id")
+        tracking_id = tag.get("tracking_session_id")
+        if not isinstance(tag_id, str) or not tag_id or tag_id in tag_ids:
+            raise QualificationError("localized_tag_id_invalid")
+        if not isinstance(tracking_id, str) or not tracking_id:
+            raise QualificationError("tracking_session_id_invalid")
+        tag_ids.append(tag_id)
+        tracking_ids.add(tracking_id)
+        transform = tag.get("transform_audit")
+        if not isinstance(transform, dict) or transform.get("status") != "applied":
+            observed_complete = False
+        if tag.get("user_confirmed") is True and (
+            tag.get("approval_status") != "approved"
+            or tag.get("needs_review") is True
+        ):
+            user_confirmed_preserved = False
+        association = tag.get("association_audit")
+        if isinstance(association, dict) and association.get("status") == "auto_confirmed":
+            timestamp = _finite_number(tag.get("timestamp"), "tag_timestamp")
+            if any(
+                isinstance(interval, dict)
+                and _finite_number(interval.get("start_timestamp"), "weak_start")
+                <= timestamp
+                <= _finite_number(interval.get("end_timestamp"), "weak_end")
+                for interval in weak_lost_intervals
+            ):
+                automatic_confirm_during_weak_lost += 1
+        association_rows.append(
+            {
+                "tag_id": tag_id,
+                "shelf_code": tag.get("shelf_code"),
+                "shelf_side": tag.get("shelf_side"),
+                "distance_from_shelf_start_cm": tag.get(
+                    "distance_from_shelf_start_cm"
+                ),
+                "approval_status": tag.get("approval_status"),
+            }
+        )
+    if len(tracking_ids) != 1:
+        raise QualificationError("multiple_tracking_sessions_in_version")
+
+    inventory = report.get("node_inventory_audit")
+    if not isinstance(inventory, dict):
+        raise QualificationError("node_inventory_audit_invalid")
+    mismatch_fields = (
+        "source_missing_from_optimized",
+        "source_missing_from_export",
+        "optimized_not_in_source",
+        "exported_not_in_optimized",
+        "source_duplicate_ids",
+        "optimized_duplicate_ids",
+        "exported_duplicate_ids",
+        "source_non_monotonic_stamp_node_ids",
+        "optimized_non_monotonic_stamp_node_ids",
+    )
+    inventories_match = (
+        all(inventory.get(name) == [] for name in mismatch_fields)
+        and inventory.get("source_count") == inventory.get("optimized_count")
+        and inventory.get("source_count") == inventory.get("exported_count")
+    )
+    durations = report.get("localization_state_duration_seconds")
+    if not isinstance(durations, dict):
+        raise QualificationError("localization_state_durations_invalid")
+    correction_distribution = report.get("correction_distribution_m")
+    if not isinstance(correction_distribution, dict):
+        raise QualificationError("correction_distribution_invalid")
+    total_duration = sum(
+        _finite_number(value, f"duration_{name}") for name, value in durations.items()
+    )
+    weak_lost_duration = _finite_number(
+        report.get("weak_lost_duration_seconds"), "weak_lost_duration"
+    )
+    weak_lost_ratio = weak_lost_duration / total_duration if total_duration > 0.0 else 0.0
+    topology_digest = _canonical_sha(
+        {
+            "nodeInventoryAudit": inventory,
+            "aisleSwitchSequence": report.get("aisle_switch_sequence"),
+            "optimizedTrajectorySha256": hashlib.sha256(
+                artifacts["optimized_map_trajectory.geojson"]
+            ).hexdigest(),
+        }
+    )
+    shelf_digest = _canonical_sha(sorted(association_rows, key=lambda item: item["tag_id"]))
+    evidence: dict[str, Any] = {
+        "format": FORMAT_TRAJECTORY_EVIDENCE,
+        "version": 1,
+        "generated_at_utc": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+        "release_git_sha": release["git_sha"],
+        "release_manifest_sha256": release_sha256,
+        "product_version": release["product_version"],
+        "localized_version_id": snapshot.version_id,
+        "localized_version_manifest_sha256": snapshot.manifest_sha256,
+        "input_identity_id": snapshot.input_identity_id,
+        "session_input_bundle_sha256": snapshot.session_input_bundle_sha256,
+        "raw_database_sha256": source.get("source_database_sha256_before"),
+        "tracking_session_id": next(iter(tracking_ids)),
+        "prior_map_id": source.get("prior_map_id"),
+        "prior_map_sha256": source.get("prior_map_sha256"),
+        "quality_policy_sha256": quality.get("policy_sha256"),
+        "quality_policy_version": quality.get("policy_version"),
+        "nodeCoverage": _finite_number(report.get("node_coverage_ratio"), "nodeCoverage"),
+        "correctionP95M": _finite_number(
+            correction_distribution.get("p95"),
+            "correctionP95M",
+        ),
+        "correctionMaxM": _finite_number(
+            correction_distribution.get("maximum"),
+            "correctionMaxM",
+        ),
+        "relativeTranslationResidualP95M": _finite_number(
+            factor.get("p95_relative_edge_translation_residual_m"),
+            "relativeTranslationResidualP95M",
+        ),
+        "relativeYawResidualP95Rad": math.radians(
+            _finite_number(
+                factor.get("p95_relative_edge_yaw_residual_deg"),
+                "relativeYawResidualP95Deg",
+            )
+        ),
+        "weakLostDurationRatio": weak_lost_ratio,
+        "inventoriesMatch": inventories_match,
+        "factorGraphConverged": (
+            factor.get("converged") is True
+            and factor.get("solver_converged") is True
+        ),
+        "factorGraphQualityPassed": factor.get("graph_quality_passed") is True,
+        "singleConnectedComponent": factor.get("graph_connected") is True,
+        "allGroundTruthTagsObserved": observed_complete,
+        "userConfirmedTagsPreserved": user_confirmed_preserved,
+        "automaticConfirmDuringWeakLost": automatic_confirm_during_weak_lost,
+        "topologyDigest": topology_digest,
+        "shelfAssociationDigest": shelf_digest,
+        "localizedTagIds": sorted(tag_ids),
+        "localizedTagIdsSha256": _canonical_sha(sorted(tag_ids)),
+    }
+    for name in (
+        "input_identity_id",
+        "session_input_bundle_sha256",
+        "raw_database_sha256",
+        "prior_map_sha256",
+        "quality_policy_sha256",
+        "localized_version_manifest_sha256",
+    ):
+        if not SHA_RE.fullmatch(str(evidence.get(name, ""))):
+            raise QualificationError(f"trajectory_identity_invalid:{name}")
+    for name in ("release_git_sha",):
+        if not GIT_SHA_RE.fullmatch(str(evidence.get(name, ""))):
+            raise QualificationError(f"trajectory_identity_invalid:{name}")
+    for name in ("product_version", "tracking_session_id", "prior_map_id", "quality_policy_version"):
+        _required_string(evidence.get(name), name)
+    evidence["evidenceSha256"] = _canonical_sha(evidence)
+    return evidence
+
+
+def build_trajectory_qualification_evidence(
+    localized_output: Path,
+    version_id: str,
+    expected_version_manifest_sha256: str,
+    release_manifest: Path,
+    output_path: Path,
+) -> dict[str, Any]:
+    release, release_sha, _release_size = _validate_release_manifest(release_manifest)
+    evidence = _trajectory_evidence_from_version(
+        localized_output,
+        version_id,
+        expected_version_manifest_sha256=expected_version_manifest_sha256,
+        release=release,
+        release_sha256=release_sha,
+    )
+    _write_json(output_path, evidence)
+    return evidence
+
+
+def _read_tag_measurements_with_identity(
+    path: Path,
+    *,
+    maximum_bytes: int = 16 * 1024 * 1024,
+    maximum_rows: int = 50_000,
+) -> tuple[dict[str, float], str, int, list[str]]:
     planar: list[float] = []
     height: list[float] = []
-    with path.open(newline="", encoding="utf-8") as stream:
+    data, digest, size, _identity = _read_stable_bytes(
+        path, maximum_bytes=maximum_bytes, label="tag_measurements"
+    )
+    try:
+        text = data.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as exc:
+        raise QualificationError("tag_measurements_invalid_utf8") from exc
+    tag_ids: list[str] = []
+    with io.StringIO(text, newline="") as stream:
         reader = csv.DictReader(stream)
         required = {"tag_id", "truth_x_m", "truth_y_m", "truth_height_m", "estimated_x_m", "estimated_y_m", "estimated_height_m"}
         if reader.fieldnames is None or not required.issubset(reader.fieldnames):
             raise QualificationError("tag_measurement_columns_missing")
         seen: set[str] = set()
-        for row in reader:
+        for row_index, row in enumerate(reader, start=1):
+            if row_index > maximum_rows:
+                raise QualificationError("tag_measurement_row_limit")
             tag_id = _required_string(row.get("tag_id"), "tag_id")
             if tag_id in seen:
                 raise QualificationError("duplicate_tag_measurement")
             seen.add(tag_id)
+            tag_ids.append(tag_id)
             tx, ty, th, ex, ey, eh = (
                 _csv_number(row[name], name) for name in (
                     "truth_x_m", "truth_y_m", "truth_height_m",
@@ -571,19 +929,24 @@ def _read_tag_measurements(path: Path) -> dict[str, float]:
             height.append(abs(eh - th))
     if len(planar) < 20:
         raise QualificationError("fewer_than_20_independent_tag_controls")
-    return {
-        "count": len(planar),
-        "planarP50M": statistics.median(planar),
-        "planarP95M": _percentile(planar, 0.95),
-        "planarMaxM": max(planar),
-        "heightP95M": _percentile(height, 0.95),
-        "heightMaxM": max(height),
-    }
+    return (
+        {
+            "count": len(planar),
+            "planarP50M": statistics.median(planar),
+            "planarP95M": _percentile(planar, 0.95),
+            "planarMaxM": max(planar),
+            "heightP95M": _percentile(height, 0.95),
+            "heightMaxM": max(height),
+        },
+        digest,
+        size,
+        tag_ids,
+    )
 
 
 def evaluate_field(plan_path: Path, output_path: Path) -> dict[str, Any]:
-    plan = _load_json(plan_path)
-    if not isinstance(plan, dict) or plan.get("format") != FORMAT_FIELD_PLAN or plan.get("version") != 2:
+    plan, plan_sha, _plan_size = _load_json_with_identity(plan_path)
+    if not isinstance(plan, dict) or plan.get("format") != FORMAT_FIELD_PLAN or plan.get("version") != 3:
         raise QualificationError("field_plan_contract_invalid")
     if plan.get("executionStatus") != "executed_with_independent_ground_truth":
         raise QualificationError("field_execution_not_attested")
@@ -632,12 +995,30 @@ def evaluate_field(plan_path: Path, output_path: Path) -> dict[str, Any]:
         seen_run_ids.add(run_id)
         if _finite_number(run.get("executedAtUnix"), "executed_at") <= frozen_at:
             blockers.append("run_not_after_threshold_freeze")
-        metrics_path = Path(_required_string(run.get("trajectoryMetrics"), "trajectory_metrics"))
+        if "trajectoryMetrics" in run:
+            raise QualificationError("free_form_trajectory_metrics_forbidden")
+        localized_output = Path(
+            _required_string(run.get("localizedOutput"), "localized_output")
+        )
+        localized_version_id = _required_string(
+            run.get("localizedVersionId"), "localized_version_id"
+        )
+        localized_version_manifest_sha256 = _required_string(
+            run.get("localizedVersionManifestSha256"),
+            "localized_version_manifest_sha256",
+        )
         tags_path = Path(_required_string(run.get("tagMeasurements"), "tag_measurements"))
         device_evidence_path = Path(_required_string(run.get("deviceEvidence"), "device_evidence"))
-        metrics_sha, metrics_size = _sha256(metrics_path)
-        tags_sha, tags_size = _sha256(tags_path)
-        metrics = _load_json(metrics_path)
+        metrics = _trajectory_evidence_from_version(
+            localized_output,
+            localized_version_id,
+            expected_version_manifest_sha256=localized_version_manifest_sha256,
+            release=release,
+            release_sha256=release_sha,
+        )
+        measured, tags_sha, tags_size, measured_tag_ids = (
+            _read_tag_measurements_with_identity(tags_path)
+        )
         device_evidence, device_sha, device_size = _validated_canonical_evidence(
             device_evidence_path,
             expected_format=FORMAT_DEVICE_EVIDENCE,
@@ -649,6 +1030,16 @@ def evaluate_field(plan_path: Path, output_path: Path) -> dict[str, Any]:
             raise QualificationError("device_evidence_not_object")
         if device_evidence.get("result") != "PASS" or device_evidence.get("blockers") != []:
             raise QualificationError("device_evidence_contract_invalid")
+        app_identity = device_evidence.get("app")
+        if (
+            not isinstance(app_identity, dict)
+            or not GIT_SHA_RE.fullmatch(str(app_identity.get("gitSha", "")))
+            or not isinstance(app_identity.get("buildId"), str)
+            or not app_identity["buildId"].strip()
+        ):
+            raise QualificationError("device_app_identity_invalid")
+        if app_identity["gitSha"] != release["git_sha"]:
+            blockers.append("device_app_release_sha_mismatch")
         for key, destination in (
             ("topologyDigest", topology_digests),
             ("shelfAssociationDigest", shelf_digests),
@@ -658,9 +1049,9 @@ def evaluate_field(plan_path: Path, output_path: Path) -> dict[str, Any]:
                 blockers.append(f"required_digest_invalid:{key}")
             else:
                 destination.add(value)
-        source_bundle_sha = str(metrics.get("sourceSessionBundleSha256", ""))
-        tracking_session_id = str(metrics.get("trackingSessionId", ""))
-        raw_database_sha = str(metrics.get("rawDatabaseSha256", ""))
+        source_bundle_sha = str(metrics.get("session_input_bundle_sha256", ""))
+        tracking_session_id = str(metrics.get("tracking_session_id", ""))
+        raw_database_sha = str(metrics.get("raw_database_sha256", ""))
         if (
             not SHA_RE.fullmatch(source_bundle_sha)
             or not tracking_session_id
@@ -689,9 +1080,26 @@ def evaluate_field(plan_path: Path, output_path: Path) -> dict[str, Any]:
                 or session_identity.get("priorMapSha256") != prior_map_sha
             ):
                 blockers.append("device_prior_map_identity_mismatch")
-        if metrics.get("qualityPolicySha256") != policy_sha:
+        if metrics.get("quality_policy_sha256") != policy_sha:
             blockers.append("trajectory_quality_policy_sha_mismatch")
-        measured = _read_tag_measurements(tags_path)
+        if (
+            metrics.get("release_git_sha") != release.get("git_sha")
+            or metrics.get("release_manifest_sha256") != release_sha
+            or metrics.get("product_version") != release.get("product_version")
+        ):
+            blockers.append("trajectory_release_identity_mismatch")
+        if (
+            metrics.get("prior_map_id") != prior_map_id
+            or metrics.get("prior_map_sha256") != prior_map_sha
+        ):
+            blockers.append("trajectory_prior_map_identity_mismatch")
+        localized_tag_ids = metrics.get("localizedTagIds")
+        if (
+            not isinstance(localized_tag_ids, list)
+            or any(not isinstance(tag_id, str) for tag_id in localized_tag_ids)
+            or not set(measured_tag_ids).issubset(set(localized_tag_ids))
+        ):
+            blockers.append("ground_truth_tag_not_bound_to_localized_version")
         numeric_limits = {
             "nodeCoverage": (">=", "nodeCoverageMin"),
             "correctionP95M": ("<=", "correctionP95MaxM"),
@@ -733,17 +1141,21 @@ def evaluate_field(plan_path: Path, output_path: Path) -> dict[str, Any]:
                 "rawDatabaseSha256": raw_database_sha,
                 "trackingSessionId": tracking_session_id,
             },
-            "trajectoryMetrics": metrics,
+            "trajectoryEvidence": metrics,
             "independentTagMetrics": measured,
+            "releaseGitSha": release["git_sha"],
+            "deviceAppGitSha": app_identity["gitSha"],
+            "deviceAppBuildId": app_identity["buildId"],
             "deviceEvidenceIdentity": {
                 "format": device_evidence.get("format"),
                 "version": device_evidence.get("version"),
                 "result": device_evidence.get("result"),
+                "appGitSha": app_identity["gitSha"],
+                "appBuildId": app_identity["buildId"],
                 "evidenceBodySha256": device_evidence.get("evidenceSha256"),
                 "fileSha256": device_sha,
             },
             "inputFiles": [
-                {"role": "trajectory_metrics", "name": metrics_path.name, "bytes": metrics_size, "sha256": metrics_sha},
                 {"role": "tag_measurements", "name": tags_path.name, "bytes": tags_size, "sha256": tags_sha},
                 {"role": "device_evidence", "name": device_evidence_path.name, "bytes": device_size, "sha256": device_sha},
             ],
@@ -759,8 +1171,8 @@ def evaluate_field(plan_path: Path, output_path: Path) -> dict[str, Any]:
         overall_blockers.append("fewer_than_three_distinct_source_sessions")
     evidence = {
         "format": FORMAT_FIELD_EVIDENCE,
-        "version": 2,
-        "sourcePlanSha256": _sha256(plan_path)[0],
+        "version": 3,
+        "sourcePlanSha256": plan_sha,
         "releaseManifest": {
             "name": release_manifest.name,
             "bytes": release_size,
@@ -801,10 +1213,23 @@ def inspect_field_evidence(
     required_site_type: str = "supermarket",
 ) -> dict[str, Any]:
     """Validate immutable field evidence without trusting client-supplied claims."""
-    evidence, file_sha, file_size = _validated_canonical_evidence(
+    summary, _data = inspect_field_evidence_with_bytes(
+        path, required_site_type=required_site_type
+    )
+    return summary
+
+
+def inspect_field_evidence_with_bytes(
+    path: Path,
+    *,
+    required_site_type: str = "supermarket",
+) -> tuple[dict[str, Any], bytes]:
+    """Return validation summary and the exact accepted descriptor bytes."""
+
+    evidence, file_sha, file_size, data = _validated_canonical_evidence_bytes(
         path,
         expected_format=FORMAT_FIELD_EVIDENCE,
-        expected_version=2,
+        expected_version=3,
     )
     if evidence.get("result") != "PASS" or evidence.get("blockers") != []:
         raise QualificationError("field_evidence_not_pass")
@@ -875,10 +1300,74 @@ def inspect_field_evidence(
             or device_identity.get("format") != FORMAT_DEVICE_EVIDENCE
             or device_identity.get("version") != 2
             or device_identity.get("result") != "PASS"
+            or device_identity.get("appGitSha") != release["gitSha"]
+            or device_identity.get("appBuildId") != run.get("deviceAppBuildId")
             or not SHA_RE.fullmatch(str(device_identity.get("evidenceBodySha256", "")))
             or not SHA_RE.fullmatch(str(device_identity.get("fileSha256", "")))
         ):
             raise QualificationError("nested_device_evidence_identity_invalid")
+        trajectory = run.get("trajectoryEvidence")
+        if not isinstance(trajectory, dict):
+            raise QualificationError("trajectory_evidence_missing")
+        trajectory_body = dict(trajectory)
+        trajectory_sha = trajectory_body.pop("evidenceSha256", None)
+        if (
+            trajectory.get("format") != FORMAT_TRAJECTORY_EVIDENCE
+            or trajectory.get("version") != 1
+            or not SHA_RE.fullmatch(str(trajectory_sha or ""))
+            or _canonical_sha(trajectory_body) != trajectory_sha
+            or trajectory.get("release_git_sha") != release["gitSha"]
+            or trajectory.get("release_manifest_sha256") != release["sha256"]
+            or trajectory.get("product_version") != release["productVersion"]
+            or trajectory.get("prior_map_id") != prior["priorMapId"]
+            or trajectory.get("prior_map_sha256") != prior["priorMapSha256"]
+            or trajectory.get("quality_policy_sha256") != policy["sha256"]
+            or not re.fullmatch(
+                r"v[0-9]{6}", str(trajectory.get("localized_version_id", ""))
+            )
+        ):
+            raise QualificationError("trajectory_evidence_contract_invalid")
+        for name in (
+            "localized_version_manifest_sha256",
+            "input_identity_id",
+            "session_input_bundle_sha256",
+            "raw_database_sha256",
+            "quality_policy_sha256",
+        ):
+            if not SHA_RE.fullmatch(str(trajectory.get(name, ""))):
+                raise QualificationError("trajectory_evidence_identity_invalid")
+        if (
+            trajectory.get("session_input_bundle_sha256") != bundle_sha
+            or trajectory.get("raw_database_sha256") != database_sha
+            or trajectory.get("tracking_session_id") != tracking_id
+            or run.get("releaseGitSha") != release["gitSha"]
+            or run.get("deviceAppGitSha") != release["gitSha"]
+            or not isinstance(run.get("deviceAppBuildId"), str)
+            or not run["deviceAppBuildId"].strip()
+        ):
+            raise QualificationError("field_run_release_or_session_identity_invalid")
+        for name in (
+            "inventoriesMatch",
+            "factorGraphConverged",
+            "factorGraphQualityPassed",
+            "singleConnectedComponent",
+            "allGroundTruthTagsObserved",
+            "userConfirmedTagsPreserved",
+        ):
+            if trajectory.get(name) is not True:
+                raise QualificationError("trajectory_required_invariant_failed")
+        if trajectory.get("automaticConfirmDuringWeakLost") != 0:
+            raise QualificationError("trajectory_weak_lost_auto_confirm_invalid")
+        localized_tag_ids = trajectory.get("localizedTagIds")
+        if (
+            not isinstance(localized_tag_ids, list)
+            or len(localized_tag_ids) < count
+            or len(set(localized_tag_ids)) != len(localized_tag_ids)
+            or any(not isinstance(tag_id, str) or not tag_id for tag_id in localized_tag_ids)
+            or _canonical_sha(sorted(localized_tag_ids))
+            != trajectory.get("localizedTagIdsSha256")
+        ):
+            raise QualificationError("trajectory_tag_inventory_invalid")
     if len(session_identities) < 3:
         raise QualificationError("fewer_than_three_distinct_source_sessions")
     return {
@@ -898,7 +1387,7 @@ def inspect_field_evidence(
         "run_count": len(runs),
         "tag_control_count": tag_count,
         "result": "PASS",
-    }
+    }, data
 
 
 def _write_json(path: Path, value: Any) -> None:
@@ -935,18 +1424,32 @@ def main(argv: Iterable[str] | None = None) -> int:
         command = subparsers.add_parser(name)
         command.add_argument("--plan", type=Path, required=True)
         command.add_argument("--output", type=Path, required=True)
+    trajectory = subparsers.add_parser("trajectory")
+    trajectory.add_argument("--localized-output", type=Path, required=True)
+    trajectory.add_argument("--version-id", required=True)
+    trajectory.add_argument("--version-manifest-sha256", required=True)
+    trajectory.add_argument("--release-manifest", type=Path, required=True)
+    trajectory.add_argument("--output", type=Path, required=True)
     arguments = parser.parse_args(argv)
     try:
-        result = (
-            collect_device(arguments.plan, arguments.output)
-            if arguments.command == "device"
-            else evaluate_field(arguments.plan, arguments.output)
-        )
+        if arguments.command == "device":
+            result = collect_device(arguments.plan, arguments.output)
+        elif arguments.command == "field":
+            result = evaluate_field(arguments.plan, arguments.output)
+        else:
+            result = build_trajectory_qualification_evidence(
+                arguments.localized_output,
+                arguments.version_id,
+                arguments.version_manifest_sha256,
+                arguments.release_manifest,
+                arguments.output,
+            )
     except (OSError, QualificationError) as exc:
         print(f"qualification error: {exc}", file=sys.stderr)
         return 2
-    print(json.dumps({"result": result["result"], "output": str(arguments.output)}))
-    return 0 if result["result"] == "PASS" else 1
+    result_value = result.get("result", "GENERATED")
+    print(json.dumps({"result": result_value, "output": str(arguments.output)}))
+    return 0 if result_value in {"PASS", "GENERATED"} else 1
 
 
 if __name__ == "__main__":

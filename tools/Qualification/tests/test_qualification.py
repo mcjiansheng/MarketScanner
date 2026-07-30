@@ -32,6 +32,65 @@ def sha256(path: Path) -> str:
 
 
 class QualificationTests(unittest.TestCase):
+    @staticmethod
+    def write_tag_measurements(path: Path, count: int = 20) -> None:
+        with path.open("w", newline="", encoding="utf-8") as stream:
+            writer = csv.writer(stream)
+            writer.writerow([
+                "tag_id", "truth_x_m", "truth_y_m", "truth_height_m",
+                "estimated_x_m", "estimated_y_m", "estimated_height_m",
+            ])
+            for tag in range(count):
+                writer.writerow([tag, tag, 0, 1, tag + 0.05, 0, 1.02])
+
+    def test_tag_measurements_stable_read_rejects_unsafe_inputs(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            valid = root / "tags.csv"
+            self.write_tag_measurements(valid)
+
+            link = root / "tags-link.csv"
+            link.symlink_to(valid)
+            with self.assertRaisesRegex(QualificationError, "unsafe_or_oversized"):
+                qualification._read_tag_measurements_with_identity(link)
+
+            with self.assertRaisesRegex(QualificationError, "unsafe_or_oversized"):
+                qualification._read_tag_measurements_with_identity(
+                    valid, maximum_bytes=10
+                )
+
+            invalid = root / "invalid.csv"
+            invalid.write_bytes(b"tag_id,truth_x_m\n\xff")
+            with self.assertRaisesRegex(QualificationError, "invalid_utf8"):
+                qualification._read_tag_measurements_with_identity(invalid)
+
+    def test_tag_measurements_rejects_partial_and_same_size_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            path = root / "tags.csv"
+            self.write_tag_measurements(path)
+            real_read = qualification.os.read
+            with mock.patch.object(qualification.os, "read", return_value=b""):
+                with self.assertRaisesRegex(QualificationError, "partial_read"):
+                    qualification._read_tag_measurements_with_identity(path)
+
+            replacement = root / "replacement.csv"
+            replacement.write_bytes(b"x" * path.stat().st_size)
+            replaced = False
+
+            def replace_after_open(descriptor: int, count: int) -> bytes:
+                nonlocal replaced
+                if not replaced:
+                    replaced = True
+                    replacement.replace(path)
+                return real_read(descriptor, count)
+
+            with mock.patch.object(
+                qualification.os, "read", side_effect=replace_after_open
+            ):
+                with self.assertRaisesRegex(QualificationError, "changed_during_read"):
+                    qualification._read_tag_measurements_with_identity(path)
+
     def test_windows_evidence_write_skips_unsupported_directory_fsync(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             output = Path(temporary) / "evidence.json"
@@ -252,6 +311,7 @@ class QualificationTests(unittest.TestCase):
                     "run": index,
                     "result": "PASS",
                     "blockers": [],
+                    "app": {"gitSha": "a" * 40, "buildId": "test-build"},
                     "runs": [{
                         "rawSessionBundleSha256": format(index + 1, "064x"),
                         "rawDatabaseSha256": format(index + 101, "064x"),
@@ -266,29 +326,6 @@ class QualificationTests(unittest.TestCase):
                     device_evidence_value
                 )
                 write_json(device_evidence, device_evidence_value)
-                device_evidence_sha = sha256(device_evidence)
-                metrics = root / f"metrics-{index}.json"
-                write_json(metrics, {
-                    "nodeCoverage": 0.99,
-                    "correctionP95M": 0.5,
-                    "correctionMaxM": 1.0,
-                    "relativeTranslationResidualP95M": 0.1,
-                    "relativeYawResidualP95Rad": 0.05,
-                    "weakLostDurationRatio": 0.01,
-                    "inventoriesMatch": True,
-                    "factorGraphConverged": True,
-                    "singleConnectedComponent": True,
-                    "allGroundTruthTagsObserved": True,
-                    "userConfirmedTagsPreserved": True,
-                    "automaticConfirmDuringWeakLost": 0,
-                    "topologyDigest": topology,
-                    "shelfAssociationDigest": shelf,
-                    "sourceSessionBundleSha256": format(index + 1, "064x"),
-                    "rawDatabaseSha256": format(index + 101, "064x"),
-                    "trackingSessionId": f"tracking-{index}",
-                    "qualityPolicySha256": policy_sha,
-                    "factorGraphQualityPassed": True,
-                })
                 measurements = root / f"tags-{index}.csv"
                 with measurements.open("w", newline="", encoding="utf-8") as stream:
                     writer = csv.writer(stream)
@@ -301,14 +338,18 @@ class QualificationTests(unittest.TestCase):
                 runs.append({
                     "runId": f"field-{index}",
                     "executedAtUnix": 200,
-                    "trajectoryMetrics": str(metrics),
+                    "localizedOutput": str(root / f"localized-{index}"),
+                    "localizedVersionId": f"v{index + 1:06d}",
+                    "localizedVersionManifestSha256": format(
+                        index + 201, "064x"
+                    ),
                     "tagMeasurements": str(measurements),
                     "deviceEvidence": str(device_evidence),
                 })
             plan = root / "field-plan.json"
             write_json(plan, {
                 "format": "MarketScannerFieldQualificationPlan",
-                "version": 2,
+                "version": 3,
                 "executionStatus": "executed_with_independent_ground_truth",
                 "thresholdsFrozenAtUnix": 100,
                 "releaseManifest": str(release),
@@ -334,7 +375,61 @@ class QualificationTests(unittest.TestCase):
                 },
                 "runs": runs,
             })
-            evidence = evaluate_field(plan, root / "field-evidence.json")
+            def trajectory_evidence(
+                _output: Path,
+                version_id: str,
+                *,
+                expected_version_manifest_sha256: str,
+                release: dict,
+                release_sha256: str,
+            ) -> dict:
+                index = int(version_id[1:]) - 1
+                value = {
+                    "format": "MarketScannerTrajectoryQualificationEvidence",
+                    "version": 1,
+                    "generated_at_utc": "2026-07-30T00:00:00+00:00",
+                    "release_git_sha": release["git_sha"],
+                    "release_manifest_sha256": release_sha256,
+                    "product_version": release["product_version"],
+                    "localized_version_id": version_id,
+                    "localized_version_manifest_sha256": expected_version_manifest_sha256,
+                    "input_identity_id": format(index + 301, "064x"),
+                    "session_input_bundle_sha256": format(index + 1, "064x"),
+                    "raw_database_sha256": format(index + 101, "064x"),
+                    "tracking_session_id": f"tracking-{index}",
+                    "prior_map_id": "prior-test",
+                    "prior_map_sha256": "d" * 64,
+                    "quality_policy_sha256": policy_sha,
+                    "quality_policy_version": "test-frozen-1",
+                    "nodeCoverage": 0.99,
+                    "correctionP95M": 0.5,
+                    "correctionMaxM": 1.0,
+                    "relativeTranslationResidualP95M": 0.1,
+                    "relativeYawResidualP95Rad": 0.05,
+                    "weakLostDurationRatio": 0.01,
+                    "inventoriesMatch": True,
+                    "factorGraphConverged": True,
+                    "factorGraphQualityPassed": True,
+                    "singleConnectedComponent": True,
+                    "allGroundTruthTagsObserved": True,
+                    "userConfirmedTagsPreserved": True,
+                    "automaticConfirmDuringWeakLost": 0,
+                    "topologyDigest": topology,
+                    "shelfAssociationDigest": shelf,
+                    "localizedTagIds": [str(tag) for tag in range(20)],
+                    "localizedTagIdsSha256": _canonical_sha(
+                        sorted(str(tag) for tag in range(20))
+                    ),
+                }
+                value["evidenceSha256"] = _canonical_sha(value)
+                return value
+
+            with mock.patch.object(
+                qualification,
+                "_trajectory_evidence_from_version",
+                side_effect=trajectory_evidence,
+            ):
+                evidence = evaluate_field(plan, root / "field-evidence.json")
             self.assertEqual(evidence["result"], "PASS")
             self.assertEqual(len(evidence["runs"]), 3)
             inspected = inspect_field_evidence(root / "field-evidence.json")
@@ -343,9 +438,53 @@ class QualificationTests(unittest.TestCase):
             duplicate_plan = json.loads(plan.read_text(encoding="utf-8"))
             duplicate_plan["runs"][1]["runId"] = duplicate_plan["runs"][0]["runId"]
             write_json(plan, duplicate_plan)
-            duplicate = evaluate_field(plan, root / "duplicate-field-evidence.json")
+            with mock.patch.object(
+                qualification,
+                "_trajectory_evidence_from_version",
+                side_effect=trajectory_evidence,
+            ):
+                duplicate = evaluate_field(plan, root / "duplicate-field-evidence.json")
             self.assertEqual(duplicate["result"], "FAIL")
             self.assertIn("duplicate_run_id", ":".join(duplicate["blockers"]))
+
+            one_old_app_plan = json.loads(plan.read_text(encoding="utf-8"))
+            one_old_app_plan["runs"][1]["runId"] = "field-1"
+            old_device_path = Path(one_old_app_plan["runs"][1]["deviceEvidence"])
+            old_device = json.loads(old_device_path.read_text(encoding="utf-8"))
+            old_device["app"]["gitSha"] = "b" * 40
+            old_device.pop("evidenceSha256")
+            old_device["evidenceSha256"] = _canonical_sha(old_device)
+            write_json(old_device_path, old_device)
+            write_json(plan, one_old_app_plan)
+            with mock.patch.object(
+                qualification,
+                "_trajectory_evidence_from_version",
+                side_effect=trajectory_evidence,
+            ):
+                old_app = evaluate_field(plan, root / "old-app-field-evidence.json")
+            self.assertEqual(old_app["result"], "FAIL")
+            self.assertIn(
+                "device_app_release_sha_mismatch", ":".join(old_app["blockers"])
+            )
+
+            old_device["app"]["gitSha"] = "not-a-git-sha"
+            old_device.pop("evidenceSha256")
+            old_device["evidenceSha256"] = _canonical_sha(old_device)
+            write_json(old_device_path, old_device)
+            with mock.patch.object(
+                qualification,
+                "_trajectory_evidence_from_version",
+                side_effect=trajectory_evidence,
+            ), self.assertRaisesRegex(QualificationError, "device_app_identity_invalid"):
+                evaluate_field(plan, root / "malformed-app-field-evidence.json")
+
+            free_form = json.loads(plan.read_text(encoding="utf-8"))
+            free_form["runs"][0]["trajectoryMetrics"] = "operator-metrics.json"
+            write_json(plan, free_form)
+            with self.assertRaisesRegex(
+                QualificationError, "free_form_trajectory_metrics_forbidden"
+            ):
+                evaluate_field(plan, root / "free-form-field-evidence.json")
 
             tampered = json.loads((root / "field-evidence.json").read_text(encoding="utf-8"))
             tampered["result"] = "FAIL"
