@@ -89,6 +89,7 @@ def create_localized_store(
     )
     if full_factor_graph:
         solver_payload.setdefault("factor_set_sha256", "d" * 64)
+        solver_payload.setdefault("graph_quality_passed", True)
     previous = store.current()
     staging = store.begin()
     source_manifest = dict(source_manifest or {})
@@ -163,12 +164,15 @@ def create_localized_store(
             "source_database_sha256_before": source_hash,
             "optimized_database_sha256": optimized_hash,
             "prior_map_sha256": prior_hash,
+            "prior_map_id": "prior-test",
         },
         "processing_manifest.json": {
             "format": "MarketScannerLocalizedProcessing", "version": 2,
             "publish_state": report_payload["publish_state"],
             "input_identity_id": input_identity_id,
             **identities,
+            "factor_graph_quality_policy_sha256": "e" * 64,
+            "factor_graph_quality_policy_version": "test-frozen-1",
             "replay_parameters": replay_parameters,
         },
         "session_input_manifest.json": {
@@ -188,13 +192,23 @@ def create_localized_store(
         },
         "factor_graph_report.json": {
             "format": "MarketScannerRelativeSE2FactorGraphReport",
-            "version": 1,
+            "version": 2,
             "solver": (
                 "rtabmap_g2o_slam2d" if full_factor_graph else "unavailable"
             ),
             "full_factor_graph": full_factor_graph,
             "published_capable": full_factor_graph,
             "converged": full_factor_graph,
+            "solver_converged": full_factor_graph,
+            "graph_integrity_passed": full_factor_graph,
+            "graph_quality_passed": full_factor_graph,
+            "quality_policy": ({
+                "policy_sha256": "e" * 64,
+                "policy_version": "test-frozen-1",
+                "policy_status": "frozen",
+                "passed": True,
+                "blockers": [],
+            } if full_factor_graph else None),
             "input_identity_id": input_identity_id,
             "optimized_database_sha256": optimized_hash,
             **(
@@ -534,7 +548,10 @@ class MapStudioApiTests(unittest.TestCase):
     def api(self, path: str, payload: dict | None = None) -> dict:
         url = f"http://127.0.0.1:{self.port}{path}"
         if payload is None:
-            with urlopen(url, timeout=10) as response:
+            request = Request(url, headers={
+                "X-MarketScanner-Session-Token": self.httpd.session_token,
+            })
+            with urlopen(request, timeout=10) as response:
                 return json.loads(response.read())
         request = Request(
             url,
@@ -555,7 +572,11 @@ class MapStudioApiTests(unittest.TestCase):
             raise
 
     def fetch(self, path: str) -> tuple[bytes, str]:
-        with urlopen(f"http://127.0.0.1:{self.port}{path}", timeout=10) as response:
+        request = Request(
+            f"http://127.0.0.1:{self.port}{path}",
+            headers={"X-MarketScanner-Session-Token": self.httpd.session_token},
+        )
+        with urlopen(request, timeout=10) as response:
             return response.read(), response.headers.get_content_type()
 
     def wait_for_job(self, identifier: str) -> dict:
@@ -606,15 +627,43 @@ class MapStudioApiTests(unittest.TestCase):
     def test_server_refuses_non_loopback_bind_and_reports_about(self) -> None:
         with self.assertRaisesRegex(ValueError, "loopback"):
             server.create_server(0, host="0.0.0.0")
-        with urlopen(
-            f"http://127.0.0.1:{self.port}/api/about", timeout=10
-        ) as response:
+        request = Request(
+            f"http://127.0.0.1:{self.port}/api/about",
+            headers={"X-MarketScanner-Session-Token": self.httpd.session_token},
+        )
+        with urlopen(request, timeout=10) as response:
             payload = json.loads(response.read())
             self.assertEqual(response.headers["X-Frame-Options"], "DENY")
             self.assertEqual(response.headers["Referrer-Policy"], "no-referrer")
         self.assertEqual(payload["product"], "Supermarket Map Studio")
         self.assertEqual(payload["version"], server.MAP_STUDIO_VERSION)
         self.assertNotIn("session_token", json.dumps(payload))
+
+    def test_sensitive_get_requires_auth_and_bootstrap_sets_http_only_cookie(self) -> None:
+        with self.assertRaises(HTTPError) as unauthorized:
+            urlopen(f"http://127.0.0.1:{self.port}/api/jobs", timeout=10)
+        self.assertEqual(unauthorized.exception.code, 403)
+        unauthorized.exception.close()
+        bootstrap = Request(
+            f"http://127.0.0.1:{self.port}/api/session/bootstrap",
+            data=b"{}",
+            headers={
+                "Content-Type": "application/json",
+                "Origin": f"http://127.0.0.1:{self.port}",
+                "X-MarketScanner-Session-Token": self.httpd.session_token,
+            },
+            method="POST",
+        )
+        with urlopen(bootstrap, timeout=10) as response:
+            cookie = response.headers.get("Set-Cookie", "")
+        self.assertIn("HttpOnly", cookie)
+        self.assertIn("SameSite=Strict", cookie)
+        authenticated = Request(
+            f"http://127.0.0.1:{self.port}/api/jobs",
+            headers={"Cookie": cookie.split(";", 1)[0]},
+        )
+        with urlopen(authenticated, timeout=10) as response:
+            self.assertEqual(response.status, 200)
 
     def test_operator_diagnostics_bundle_excludes_session_token(self) -> None:
         result = self.api(

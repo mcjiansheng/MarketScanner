@@ -3,10 +3,9 @@
 const launchParameters = new URLSearchParams(window.location.hash.slice(1));
 const launchToken = launchParameters.get("token") || "";
 if (launchToken) {
-  window.sessionStorage.setItem("marketscanner-session-token", launchToken);
   window.history.replaceState(null, "", `${window.location.pathname}${window.location.search}`);
 }
-const sessionToken = launchToken || window.sessionStorage.getItem("marketscanner-session-token") || "";
+let sessionToken = launchToken;
 
 const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => [...document.querySelectorAll(selector)];
@@ -40,6 +39,8 @@ const localizedReview = {
   publishedRevision: null,
   publishedState: null,
   reviewArtifactUrl: null,
+  fieldQualification: null,
+  fieldQualificationPath: null,
 };
 
 const viewer2d = {
@@ -143,6 +144,7 @@ function syncLocalizedStateButtons() {
   $("#localized-submit-review").disabled = state !== "draft";
   $("#localized-publish").disabled = (
     state !== "review" || localizedReview.publishedState === "published"
+    || !localizedReview.fieldQualification
   );
   $("#localized-revoke").disabled = localizedReview.publishedState !== "published";
 }
@@ -150,9 +152,8 @@ function syncLocalizedStateButtons() {
 async function request(path, options = {}) {
   const requestOptions = { ...options };
   if ((requestOptions.method || "GET").toUpperCase() === "POST") {
-    if (!sessionToken) throw new Error("本地安全会话已失效，请从启动器重新打开 Map Studio。");
     const headers = new Headers(requestOptions.headers || {});
-    headers.set("X-MarketScanner-Session-Token", sessionToken);
+    if (sessionToken) headers.set("X-MarketScanner-Session-Token", sessionToken);
     requestOptions.headers = headers;
   }
   const response = await fetch(path, requestOptions);
@@ -164,6 +165,53 @@ async function request(path, options = {}) {
     throw error;
   }
   return payload;
+}
+
+async function bootstrapSession() {
+  if (!sessionToken) return;
+  const response = await fetch("/api/session/bootstrap", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-MarketScanner-Session-Token": sessionToken,
+    },
+    body: JSON.stringify({}),
+  });
+  if (!response.ok) throw new Error("本地安全会话初始化失败，请从启动器重新打开 Map Studio。");
+  sessionToken = "";
+}
+
+async function renderRuntimeMode() {
+  const about = await request("/api/about");
+  const production = about.runtime_mode === "production";
+  $("#runtime-mode-banner").textContent = production
+    ? "PRODUCTION MODE"
+    : "DEVELOPMENT / NOT QUALIFIED FOR PRODUCTION";
+}
+
+async function inspectFieldQualification() {
+  const status = $("#localized-field-evidence-status");
+  try {
+    const selected = await request("/api/dialog", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ mode: "file", title: "选择现场验收证据 JSON" }),
+    });
+    if (!selected.path) return;
+    const evidence = await request("/api/qualification/field/inspect", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path: selected.path }),
+    });
+    localizedReview.fieldQualification = evidence;
+    localizedReview.fieldQualificationPath = selected.path;
+    status.textContent = `VERIFIED/PASS · ${evidence.site_id} · ${evidence.run_count} runs · ${evidence.tag_control_count} tags · release ${evidence.release_git_sha.slice(0, 12)} · prior ${evidence.prior_map_sha256.slice(0, 12)}`;
+  } catch (error) {
+    localizedReview.fieldQualification = null;
+    localizedReview.fieldQualificationPath = null;
+    status.textContent = error.message;
+  }
+  syncLocalizedStateButtons();
 }
 
 async function choosePath(inputId, title, mode = "directory") {
@@ -1219,28 +1267,13 @@ async function applyLocalizedState(action) {
   }
   try {
     setBusy(true);
-    let fieldAcceptance;
     if (action === "publish") {
       if (!$("#localized-field-accepted").checked) {
         throw new Error("发布前必须明确勾选现场验收确认");
       }
-      if (!localizedReview.reviewArtifactUrl || !window.crypto?.subtle) {
-        throw new Error("无法读取并绑定当前复核证据，拒绝发布");
+      if (!localizedReview.fieldQualification || !localizedReview.fieldQualificationPath) {
+        throw new Error("必须先选择并通过服务端验证现场验收证据");
       }
-      const evidenceResponse = await fetch(localizedReview.reviewArtifactUrl, {
-        cache: "no-store",
-      });
-      if (!evidenceResponse.ok) {
-        throw new Error("当前复核证据读取失败，拒绝发布");
-      }
-      const evidence = await evidenceResponse.arrayBuffer();
-      const digest = await window.crypto.subtle.digest("SHA-256", evidence);
-      fieldAcceptance = {
-        accepted: true,
-        evidence_sha256: Array.from(new Uint8Array(digest))
-          .map((value) => value.toString(16).padStart(2, "0"))
-          .join(""),
-      };
     }
     const result = await request(`/api/jobs/${completedJobId}/localized/state`, {
       method: "POST",
@@ -1250,7 +1283,11 @@ async function applyLocalizedState(action) {
         reason,
         expected_version_id: expectedVersionId,
         expected_revision: expectedRevision,
-        ...(fieldAcceptance ? { field_acceptance: fieldAcceptance } : {}),
+        ...(action === "publish" ? {
+          operator_confirmed: true,
+          qualification_evidence_path: localizedReview.fieldQualificationPath,
+          qualification_evidence_sha256: localizedReview.fieldQualification.file_sha256,
+        } : {}),
       }),
     });
     stateStatus.textContent = `状态已更新为 ${result.publish_state}（${result.version_id}）`;
@@ -3213,6 +3250,7 @@ function bindEvents() {
   $("#localized-redo").addEventListener("click", () => applyLocalizedEdit("redo"));
   $("#localized-submit-review").addEventListener("click", () => applyLocalizedState("submit_review"));
   $("#localized-publish").addEventListener("click", () => applyLocalizedState("publish"));
+  $("#localized-field-evidence").addEventListener("click", inspectFieldQualification);
   $("#localized-revoke").addEventListener("click", () => applyLocalizedState("revoke"));
   $("#localized-edit-type").addEventListener("change", updateLocalizedEditHelp);
   $("#localized-tag-filter").addEventListener("change", renderLocalizedReviewList);
@@ -3318,13 +3356,20 @@ function bindEvents() {
   new ResizeObserver(() => { if (isPlanPreview()) draw2D(); else drawScene(); }).observe($(".canvas-wrap"));
 }
 
-bindEvents();
-loadGpuCapabilities();
-set3DDragMode("rotate");
-addDevice();
-addDevice();
-setStatus(
-  sessionToken ? "就绪" : "本地安全会话无效，请从启动器重新打开",
-  sessionToken ? "" : "failed",
-);
-restoreLatestJob();
+async function initializeApplication() {
+  bindEvents();
+  try {
+    await bootstrapSession();
+    await renderRuntimeMode();
+    setStatus("就绪", "");
+    loadGpuCapabilities();
+    restoreLatestJob();
+  } catch (error) {
+    setStatus(error.message, "failed");
+  }
+  set3DDragMode("rotate");
+  addDevice();
+  addDevice();
+}
+
+initializeApplication();

@@ -143,6 +143,8 @@ class IOSLocalizationSidecarHealthContractTests(unittest.TestCase):
             "streamRegularFile",
             "maximumRecordBytes = 1_000_000",
             "maximumRecords = 500_000",
+            "maximumLocalizedTagRecords = 50_000",
+            "maximumLocalizedTagsBytes = 16 * 1024 * 1024",
             "autoreleasepool",
             "node_timebase_contract_invalid",
             "trace_business_schema_invalid",

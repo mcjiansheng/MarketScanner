@@ -37,7 +37,9 @@ def command_version(command: list[str]) -> str:
 
 def generate(
     *, output: Path, git_sha: str, target_platform: str, artifacts: list[Path],
-    dependency_policy: Path, build_time_utc: str | None = None,
+    dependency_policy: Path,
+    quality_policy: Path = Path(__file__).resolve().parents[1] / "PriorMap/factor_graph_quality_policy.json",
+    build_time_utc: str | None = None, product_version: str = "0.23.5-marketscanner",
 ) -> dict[str, Any]:
     if SHA_RE.fullmatch(git_sha) is None:
         raise ValueError("git SHA must be exactly 40 lowercase hexadecimal characters")
@@ -49,6 +51,15 @@ def generate(
     policy = json.loads(policy_bytes)
     if policy.get("format") != "MarketScannerDependencyPolicy" or policy.get("version") != 1:
         raise ValueError("dependency policy format/version is invalid")
+    quality_policy_bytes = quality_policy.read_bytes()
+    quality = json.loads(quality_policy_bytes)
+    if (
+        quality.get("format") != "MarketScannerFactorGraphQualityPolicy"
+        or quality.get("version") != 1
+        or quality.get("status") not in {"candidate", "frozen"}
+        or not isinstance(quality.get("policy_version"), str)
+    ):
+        raise ValueError("factor graph quality policy format/version is invalid")
     resolved = []
     for artifact in sorted((item.resolve() for item in artifacts), key=lambda item: item.name):
         if not artifact.is_file():
@@ -61,7 +72,8 @@ def generate(
     compiler = command_version([compiler_command, "--version"]) if compiler_command else "unavailable"
     manifest = {
         "format": "MarketScannerReleaseManifest",
-        "version": 1,
+        "version": 2,
+        "product_version": product_version,
         "git_sha": git_sha,
         "build_time_utc": timestamp,
         "platform": target_platform,
@@ -71,6 +83,13 @@ def generate(
         "cmake": command_version(["cmake", "--version"]),
         "dependency_policy_sha256": hashlib.sha256(policy_bytes).hexdigest(),
         "dependency_policy": policy,
+        "factor_graph_quality_policy_sha256": hashlib.sha256(quality_policy_bytes).hexdigest(),
+        "factor_graph_quality_policy": {
+            "format": quality["format"],
+            "version": quality["version"],
+            "policy_version": quality["policy_version"],
+            "status": quality["status"],
+        },
         "artifacts": resolved,
     }
     encoded = json.dumps(manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
@@ -86,6 +105,8 @@ def main() -> None:
     parser.add_argument("--git-sha", required=True)
     parser.add_argument("--platform", required=True)
     parser.add_argument("--dependency-policy", type=Path, required=True)
+    parser.add_argument("--quality-policy", type=Path, required=True)
+    parser.add_argument("--product-version", default="0.23.5-marketscanner")
     parser.add_argument("--artifact", type=Path, action="append", required=True)
     parser.add_argument("--build-time-utc")
     args = parser.parse_args()
@@ -96,6 +117,8 @@ def main() -> None:
             target_platform=args.platform,
             artifacts=args.artifact,
             dependency_policy=args.dependency_policy,
+            quality_policy=args.quality_policy,
+            product_version=args.product_version,
             build_time_utc=args.build_time_utc,
         )
     except (OSError, ValueError, json.JSONDecodeError, subprocess.SubprocessError) as exc:

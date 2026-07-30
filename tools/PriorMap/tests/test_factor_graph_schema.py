@@ -14,6 +14,30 @@ from tools.PriorMap.factor_graph_schema import (
 
 IDENTITY = "a" * 64
 DATABASE = "b" * 64
+POLICY_SHA = "c" * 64
+POLICY = {
+    "format": "MarketScannerFactorGraphQualityPolicy",
+    "version": 1,
+    "status": "frozen",
+    "policy_version": "test-1",
+    "limits": {
+        "relative_translation_p95_max_m": 0.2,
+        "relative_translation_max_m": 1.0,
+        "relative_yaw_p95_max_deg": 5.0,
+        "relative_yaw_max_deg": 20.0,
+        "loop_translation_p95_max_m": 0.5,
+        "loop_translation_max_m": 1.0,
+        "loop_yaw_p95_max_deg": 10.0,
+        "loop_yaw_max_deg": 20.0,
+        "high_residual_loop_translation_m": 1.0,
+        "high_residual_loop_yaw_deg": 20.0,
+        "high_residual_loop_ratio_max": 0.05,
+        "maximum_pose_update_m": 2.0,
+        "maximum_pose_update_yaw_deg": 30.0,
+        "minimum_relative_factor_to_node_ratio": 0.5,
+        "minimum_objective_improvement_ratio": 0.0,
+    },
+}
 
 
 def factor(identifier: str, from_id: int, to_id: int, measurement=None, information=None):
@@ -41,7 +65,7 @@ def valid_report():
     ).hexdigest()
     return {
         "format": "MarketScannerRelativeSE2FactorGraphReport",
-        "version": 1,
+        "version": 2,
         "solver": "rtabmap_g2o_slam2d",
         "database_version": "0.23.5",
         "input_identity_id": IDENTITY,
@@ -67,11 +91,20 @@ def valid_report():
         "p95_relative_edge_translation_residual_m": 0.01,
         "maximum_relative_edge_yaw_residual_deg": 0.1,
         "p95_relative_edge_yaw_residual_deg": 0.1,
+        "maximum_loop_edge_translation_residual_m": 0.0,
+        "p95_loop_edge_translation_residual_m": 0.0,
+        "maximum_loop_edge_yaw_residual_deg": 0.0,
+        "p95_loop_edge_yaw_residual_deg": 0.0,
+        "factor_counts_by_type": {"relative_neighbor": 2},
+        "loop_factor_residuals": [],
+        "duplicate_reciprocal_collapsed": 0,
         "iterations_done": 5,
         "converged": True,
+        "solver_converged": True,
+        "graph_integrity_passed": True,
+        "graph_quality_passed": False,
         "full_factor_graph": True,
-        "published_capable": True,
-        "downweighted_factor_ids": [],
+        "published_capable": False,
         "rejected_factor_ids": [],
     }
 
@@ -83,6 +116,8 @@ class FactorGraphSchemaTests(unittest.TestCase):
             expected_input_identity_id=IDENTITY,
             expected_database_sha256=DATABASE,
             expected_node_ids=(1, 2, 3),
+            quality_policy=POLICY,
+            quality_policy_sha256=POLICY_SHA,
         )
 
     def test_valid_connected_graph_and_canonical_digest(self):
@@ -90,6 +125,28 @@ class FactorGraphSchemaTests(unittest.TestCase):
         second = valid_report()
         self.assertEqual(first["factor_set_sha256"], second["factor_set_sha256"])
         self.assertEqual(self.validate(first)["root_node_id"], 1)
+
+    def test_candidate_or_failed_numeric_quality_is_never_publishable(self):
+        candidate = copy.deepcopy(POLICY)
+        candidate["status"] = "candidate"
+        result = validate_factor_graph_result(
+            valid_report(),
+            expected_input_identity_id=IDENTITY,
+            expected_database_sha256=DATABASE,
+            expected_node_ids=(1, 2, 3),
+            quality_policy=candidate,
+            quality_policy_sha256=POLICY_SHA,
+        )
+        self.assertFalse(result["graph_quality_passed"])
+        self.assertFalse(result["published_capable"])
+        payload = valid_report()
+        payload["p95_relative_edge_translation_residual_m"] = 0.21
+        result = self.validate(payload)
+        self.assertFalse(result["graph_quality_passed"])
+        self.assertIn(
+            "relative_translation_p95_exceeded",
+            {item["code"] for item in result["quality_policy"]["blockers"]},
+        )
 
     def test_ninety_degree_measurement_is_preserved_in_canonical_factor(self):
         item = valid_report()["factors"][1]
@@ -101,6 +158,7 @@ class FactorGraphSchemaTests(unittest.TestCase):
         payload = valid_report()
         payload["factors"] = [factor("link:1:2:0", 1, 2)]
         payload["factor_count"] = 1
+        payload["factor_counts_by_type"] = {"relative_neighbor": 1}
         payload["factor_set_sha256"] = hashlib.sha256(
             payload["factors"][0]["canonical"].encode()
         ).hexdigest()
@@ -141,7 +199,7 @@ class FactorGraphSchemaTests(unittest.TestCase):
         for field, value, message in (
             ("root_node_id", 2, "root gauge"),
             ("converged", False, "convergence gates"),
-            ("published_capable", False, "convergence gates"),
+            ("solver_converged", False, "convergence gates"),
         ):
             with self.subTest(field=field):
                 payload = copy.deepcopy(valid_report())

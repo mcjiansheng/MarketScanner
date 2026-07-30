@@ -11,6 +11,7 @@
     <div>
       <p class="eyebrow">RTAB-Map Offline Workflow</p>
       <h1>Supermarket Map Studio</h1>
+      <strong id="runtime-mode-banner">DEVELOPMENT / NOT QUALIFIED FOR PRODUCTION</strong>
     </div>
     <div class="header-actions">
       <div id="job-status" class="status" role="status">就绪</div>
@@ -340,7 +341,9 @@
           <span id="localized-edit-status"></span>
         </div>
         <div class="button-row">
-          <label><input id="localized-field-accepted" type="checkbox"> 已完成现场验收，并确认当前复核成果可发布</label>
+          <button id="localized-field-evidence" class="secondary" type="button">选择并验证现场验收证据</button>
+          <span id="localized-field-evidence-status">尚未导入 MarketScannerFieldQualificationEvidence</span>
+          <label><input id="localized-field-accepted" type="checkbox"> 操作者确认发布当前已验证成果</label>
           <button id="localized-submit-review" class="secondary" type="button">提交复核</button>
           <button id="localized-publish" class="secondary" type="button">人工批准发布</button>
           <button id="localized-revoke" class="secondary" type="button">撤销发布</button>

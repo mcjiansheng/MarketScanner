@@ -42,7 +42,7 @@ using namespace rtabmap;
 namespace {
 
 const char * kFormat = "MarketScannerRelativeSE2FactorGraphReport";
-const int kVersion = 1;
+const int kVersion = 2;
 
 struct Sha256
 {
@@ -174,7 +174,8 @@ struct Prior
 	double x;
 	double y;
 	double yaw;
-	double weight;
+	double translationSigma;
+	double yawSigma;
 };
 
 double normalizeAngle(double angle)
@@ -301,16 +302,19 @@ std::vector<Prior> loadPriors(const Options & options)
 	std::ifstream input(options.priors.c_str(), std::ios::binary);
 	if(!input) throw std::runtime_error("Cannot open absolute-prior input.");
 	std::string line;
-	if(!std::getline(input, line) || line != "MarketScannerAbsoluteSE2Priors\t1\t" + options.inputIdentity)
+	if(!std::getline(input, line))
 	{
 		throw std::runtime_error("Absolute-prior header or input identity is invalid.");
 	}
+	const bool legacyV1 = line == "MarketScannerAbsoluteSE2Priors\t1\t" + options.inputIdentity;
+	const bool uncertaintyV2 = line == "MarketScannerAbsoluteSE2Priors\t2\t" + options.inputIdentity;
+	if(!legacyV1 && !uncertaintyV2) throw std::runtime_error("Absolute-prior header or input identity is invalid.");
 	std::set<std::string> ids;
 	while(std::getline(input, line))
 	{
 		if(line.empty()) continue;
 		std::vector<std::string> fields = splitTabs(line);
-		if(fields.size() != 7) throw std::runtime_error("Absolute-prior record must have seven fields.");
+		if(fields.size() != (legacyV1?7U:8U)) throw std::runtime_error("Absolute-prior record has the wrong field count.");
 		if(fields[0].empty() || fields[1].empty() || !ids.insert(fields[0]).second)
 		{
 			throw std::runtime_error("Absolute-prior identifiers must be non-empty and unique.");
@@ -322,8 +326,21 @@ std::vector<Prior> loadPriors(const Options & options)
 		prior.x = parseFinite(fields[3], "prior x");
 		prior.y = parseFinite(fields[4], "prior y");
 		prior.yaw = parseFinite(fields[5], "prior yaw");
-		prior.weight = parseFinite(fields[6], "prior weight");
-		if(prior.weight <= 0.0 || prior.weight > 1000000.0) throw std::runtime_error("Absolute-prior weight is outside the safe range.");
+		if(legacyV1)
+		{
+			double weight = parseFinite(fields[6], "legacy prior weight");
+			if(weight <= 0.0 || weight > 1000000.0) throw std::runtime_error("Legacy absolute-prior weight is outside the safe range.");
+			prior.translationSigma = 1.0/std::sqrt(weight);
+			prior.yawSigma = 1.0/std::sqrt(weight);
+		}
+		else
+		{
+			prior.translationSigma = parseFinite(fields[6], "prior translation sigma");
+			prior.yawSigma = parseFinite(fields[7], "prior yaw sigma");
+			if(prior.translationSigma < 1.0e-4 || prior.translationSigma > 1000.0 ||
+				prior.yawSigma < 1.0e-5 || prior.yawSigma > M_PI)
+				throw std::runtime_error("Absolute-prior uncertainty is outside the safe range.");
+		}
 		priors.push_back(prior);
 	}
 	return priors;
@@ -407,6 +424,57 @@ std::array<double, 9> planarInformation(
 	return result;
 }
 
+std::array<double, 9> inverseMeasurementInformation(
+	const Transform & measurement,
+	const std::array<double, 9> & information)
+{
+	cv::Mat sourceInformation(3,3,CV_64FC1);
+	for(int row=0;row<3;++row) for(int column=0;column<3;++column)
+		sourceInformation.at<double>(row,column)=information[row*3+column];
+	cv::Mat covariance;
+	if(!cv::invert(sourceInformation,covariance,cv::DECOMP_SVD))
+		throw std::runtime_error("Canonical duplicate information cannot be inverted.");
+	const double step=1.0e-6;
+	Transform base=measurement.inverse();
+	cv::Mat jacobian=cv::Mat::zeros(3,3,CV_64FC1);
+	for(int axis=0;axis<3;++axis)
+	{
+		double x=measurement.x(), y=measurement.y(), yaw=measurement.theta();
+		if(axis==0) x+=step; else if(axis==1) y+=step; else yaw+=step;
+		Transform shifted(static_cast<float>(x),static_cast<float>(y),static_cast<float>(yaw));
+		shifted=shifted.inverse();
+		jacobian.at<double>(0,axis)=(shifted.x()-base.x())/step;
+		jacobian.at<double>(1,axis)=(shifted.y()-base.y())/step;
+		jacobian.at<double>(2,axis)=normalizeAngle(shifted.theta()-base.theta())/step;
+	}
+	cv::Mat canonicalCovariance=jacobian*covariance*jacobian.t();
+	canonicalCovariance=(canonicalCovariance+canonicalCovariance.t())*0.5;
+	cv::Mat canonicalInformation;
+	if(!cv::invert(canonicalCovariance,canonicalInformation,cv::DECOMP_SVD))
+		throw std::runtime_error("Canonical duplicate covariance cannot be inverted.");
+	canonicalInformation=(canonicalInformation+canonicalInformation.t())*0.5;
+	std::array<double, 9> result;
+	for(int row=0;row<3;++row) for(int column=0;column<3;++column)
+		result[row*3+column]=canonicalInformation.at<double>(row,column);
+	return result;
+}
+
+bool approximatelyEqual(double left, double right, double absoluteTolerance, double relativeTolerance)
+{
+	return std::fabs(left-right) <= absoluteTolerance + relativeTolerance*std::max(std::fabs(left),std::fabs(right));
+}
+
+bool equivalentFactor(const Factor & left, const Factor & right)
+{
+	if(left.kind!=right.kind || left.link.from()!=right.link.from() || left.link.to()!=right.link.to()) return false;
+	if(!approximatelyEqual(left.link.transform().x(),right.link.transform().x(),1.0e-5,1.0e-6) ||
+		!approximatelyEqual(left.link.transform().y(),right.link.transform().y(),1.0e-5,1.0e-6) ||
+		std::fabs(normalizeAngle(left.link.transform().theta()-right.link.transform().theta()))>1.0e-5) return false;
+	for(size_t i=0;i<left.planarInformation.size();++i)
+		if(!approximatelyEqual(left.planarInformation[i],right.planarInformation[i],1.0e-6,1.0e-5)) return false;
+	return true;
+}
+
 std::string canonicalFactor(const std::string & id, const std::string & kind, const Link & link, const std::array<double,9> & information)
 {
 	std::ostringstream out;
@@ -462,9 +530,11 @@ std::string factorKind(Link::Type type)
 	return "relative_loop";
 }
 
-std::array<double,9> diagonalInformation(double weight)
+std::array<double,9> priorInformation(double translationSigma, double yawSigma)
 {
-	return {{weight,0.0,0.0,0.0,weight,0.0,0.0,0.0,weight}};
+	const double translationInformation = 1.0/(translationSigma*translationSigma);
+	const double yawInformation = 1.0/(yawSigma*yawSigma);
+	return {{translationInformation,0.0,0.0,0.0,translationInformation,0.0,0.0,0.0,yawInformation}};
 }
 
 cv::Mat sixInformation(const std::array<double,9> & planar)
@@ -490,11 +560,14 @@ void writeResult(
 	double nativeFinalError,
 	int iterationsDone,
 	bool converged,
-	bool hasAbsolutePriors)
+	bool hasAbsolutePriors,
+	int duplicateReciprocalCollapsed)
 {
 	std::vector<double> translationResiduals;
 	std::vector<double> yawResiduals;
-	std::vector<std::string> downweighted;
+	std::vector<double> loopTranslationResiduals;
+	std::vector<double> loopYawResiduals;
+	std::vector<std::tuple<std::string,double,double> > loopResidualRecords;
 	double maximumUpdate = 0.0;
 	double maximumYawUpdate = 0.0;
 	std::map<std::string,int> counts;
@@ -507,7 +580,12 @@ void writeResult(
 		double yaw = std::fabs(e[2]);
 		translationResiduals.push_back(translation);
 		yawResiduals.push_back(yaw);
-		if(factors[i].kind == "relative_loop" && (translation > 1.0 || yaw > 0.35)) downweighted.push_back(factors[i].id);
+			if(factors[i].kind == "relative_loop")
+			{
+				loopTranslationResiduals.push_back(translation);
+				loopYawResiduals.push_back(yaw);
+				loopResidualRecords.push_back(std::make_tuple(factors[i].id,translation,yaw*180.0/M_PI));
+			}
 	}
 	for(std::map<int,Transform>::const_iterator iter=optimized.begin(); iter!=optimized.end(); ++iter)
 	{
@@ -517,10 +595,17 @@ void writeResult(
 	}
 	std::sort(translationResiduals.begin(), translationResiduals.end());
 	std::sort(yawResiduals.begin(), yawResiduals.end());
+	std::sort(loopTranslationResiduals.begin(), loopTranslationResiduals.end());
+	std::sort(loopYawResiduals.begin(), loopYawResiduals.end());
+	std::sort(loopResidualRecords.begin(), loopResidualRecords.end());
 	double maxTranslation = translationResiduals.empty()?0.0:translationResiduals.back();
 	double p95Translation = translationResiduals.empty()?0.0:translationResiduals[static_cast<size_t>(std::ceil(0.95*translationResiduals.size()))-1];
 	double maxYaw = yawResiduals.empty()?0.0:yawResiduals.back();
 	double p95Yaw = yawResiduals.empty()?0.0:yawResiduals[static_cast<size_t>(std::ceil(0.95*yawResiduals.size()))-1];
+	double maxLoopTranslation = loopTranslationResiduals.empty()?0.0:loopTranslationResiduals.back();
+	double p95LoopTranslation = loopTranslationResiduals.empty()?0.0:loopTranslationResiduals[static_cast<size_t>(std::ceil(0.95*loopTranslationResiduals.size()))-1];
+	double maxLoopYaw = loopYawResiduals.empty()?0.0:loopYawResiduals.back();
+	double p95LoopYaw = loopYawResiduals.empty()?0.0:loopYawResiduals[static_cast<size_t>(std::ceil(0.95*loopYawResiduals.size()))-1];
 
 	std::vector<Factor> sortedFactors = factors;
 	std::sort(sortedFactors.begin(), sortedFactors.end(), [](const Factor & a, const Factor & b){return a.id < b.id;});
@@ -532,8 +617,11 @@ void writeResult(
 	if(!out) throw std::runtime_error("Cannot create factor-graph result.");
 	out << std::setprecision(17);
 	out << "{\n  \"format\":\"" << kFormat << "\",\n  \"version\":" << kVersion
-		<< ",\n  \"solver\":\"rtabmap_g2o_slam2d\",\n  \"full_factor_graph\":" << (converged?"true":"false")
-		<< ",\n  \"published_capable\":" << (converged?"true":"false")
+			<< ",\n  \"solver\":\"rtabmap_g2o_slam2d\",\n  \"solver_converged\":" << (converged?"true":"false")
+			<< ",\n  \"graph_integrity_passed\":true"
+			<< ",\n  \"graph_quality_passed\":false"
+			<< ",\n  \"full_factor_graph\":" << (converged?"true":"false")
+			<< ",\n  \"published_capable\":false"
 		<< ",\n  \"input_identity_id\":\"" << jsonEscape(options.inputIdentity) << "\""
 		<< ",\n  \"optimized_database_sha256\":\"" << jsonEscape(options.databaseSha256) << "\""
 		<< ",\n  \"database_version\":\"" << jsonEscape(databaseVersion) << "\""
@@ -552,7 +640,12 @@ void writeResult(
 		<< ",\n  \"maximum_relative_edge_translation_residual_m\":" << maxTranslation
 		<< ",\n  \"p95_relative_edge_translation_residual_m\":" << p95Translation
 		<< ",\n  \"maximum_relative_edge_yaw_residual_deg\":" << maxYaw*180.0/M_PI
-		<< ",\n  \"p95_relative_edge_yaw_residual_deg\":" << p95Yaw*180.0/M_PI;
+			<< ",\n  \"p95_relative_edge_yaw_residual_deg\":" << p95Yaw*180.0/M_PI;
+		out << ",\n  \"maximum_loop_edge_translation_residual_m\":" << maxLoopTranslation
+			<< ",\n  \"p95_loop_edge_translation_residual_m\":" << p95LoopTranslation
+			<< ",\n  \"maximum_loop_edge_yaw_residual_deg\":" << maxLoopYaw*180.0/M_PI
+			<< ",\n  \"p95_loop_edge_yaw_residual_deg\":" << p95LoopYaw*180.0/M_PI
+			<< ",\n  \"duplicate_reciprocal_collapsed\":" << duplicateReciprocalCollapsed;
 	out << ",\n  \"factor_counts_by_type\":{";
 	bool first = true;
 	for(std::map<std::string,int>::const_iterator iter=counts.begin(); iter!=counts.end(); ++iter)
@@ -560,9 +653,15 @@ void writeResult(
 		if(!first) out << ','; first=false;
 		out << "\"" << jsonEscape(iter->first) << "\":" << iter->second;
 	}
-	out << "},\n  \"downweighted_factor_ids\":[";
-	for(size_t i=0;i<downweighted.size();++i){if(i)out<<',';out<<"\""<<jsonEscape(downweighted[i])<<"\"";}
-	out << "],\n  \"rejected_factor_ids\":[";
+		out << "},\n  \"loop_factor_residuals\":[";
+		for(size_t i=0;i<loopResidualRecords.size();++i)
+		{
+			if(i)out<<',';
+			out<<"{\"factor_id\":\""<<jsonEscape(std::get<0>(loopResidualRecords[i]))
+				<<"\",\"translation_m\":"<<std::get<1>(loopResidualRecords[i])
+				<<",\"yaw_deg\":"<<std::get<2>(loopResidualRecords[i])<<"}";
+		}
+		out << "],\n  \"rejected_factor_ids\":[";
 	for(size_t i=0;i<rejected.size();++i){if(i)out<<',';out<<"\""<<jsonEscape(rejected[i])<<"\"";}
 	out << "],\n  \"factors\":[\n";
 	for(size_t i=0;i<sortedFactors.size();++i)
@@ -640,7 +739,8 @@ int main(int argc, char ** argv)
 		std::vector<Factor> factors;
 		std::vector<std::string> rejected;
 		std::multimap<int,Link> optimizerLinks;
-		std::set<std::tuple<int,int,int> > duplicates;
+			std::map<std::tuple<int,int,int>, size_t> canonicalRelativeFactors;
+			int duplicateReciprocalCollapsed = 0;
 		std::map<int,std::set<int> > adjacency;
 		for(std::multimap<int,Link>::const_iterator iter=databaseLinks.begin();iter!=databaseLinks.end();++iter)
 		{
@@ -653,20 +753,35 @@ int main(int argc, char ** argv)
 			if(link.from()<=0 || link.to()<=0 || link.from()==link.to() || poses.find(link.from())==poses.end() || poses.find(link.to())==poses.end())
 				throw std::runtime_error("A required relative Link has invalid endpoints.");
 			if(!finiteTransform(link.transform())) throw std::runtime_error("A required relative Link transform is non-finite or singular.");
-			std::tuple<int,int,int> key(std::min(link.from(),link.to()),std::max(link.from(),link.to()),static_cast<int>(link.type()));
-			if(!duplicates.insert(key).second) continue;
-			std::array<double,9> information = planarInformation(link.infMatrix(), nativePoses.at(link.from()), link.transform(), options.horizontalAxes);
-			Transform measurement=projectedMeasurement(nativePoses.at(link.from()),link.transform(),options.horizontalAxes);
-			Link projectedLink(link.from(), link.to(), link.type(), measurement, sixInformation(information));
-			Factor factor;
-			factor.id="db:"+Link::typeName(link.type())+":"+std::to_string(link.from())+":"+std::to_string(link.to());
-			factor.kind=factorKind(link.type());
-			factor.link=projectedLink;
-			factor.planarInformation=information;
-			factor.canonical=canonicalFactor(factor.id,factor.kind,factor.link,factor.planarInformation);
-			factors.push_back(factor);
-			optimizerLinks.insert(std::make_pair(projectedLink.from(),projectedLink));
-			adjacency[link.from()].insert(link.to()); adjacency[link.to()].insert(link.from());
+				std::array<double,9> information = planarInformation(link.infMatrix(), nativePoses.at(link.from()), link.transform(), options.horizontalAxes);
+				Transform measurement=projectedMeasurement(nativePoses.at(link.from()),link.transform(),options.horizontalAxes);
+				const int canonicalFrom=std::min(link.from(),link.to());
+				const int canonicalTo=std::max(link.from(),link.to());
+				if(link.from()!=canonicalFrom)
+				{
+					information=inverseMeasurementInformation(measurement,information);
+					measurement=measurement.inverse();
+				}
+				Link projectedLink(canonicalFrom, canonicalTo, link.type(), measurement, sixInformation(information));
+				Factor factor;
+				factor.id="db:"+Link::typeName(link.type())+":"+std::to_string(canonicalFrom)+":"+std::to_string(canonicalTo);
+				factor.kind=factorKind(link.type());
+				factor.link=projectedLink;
+				factor.planarInformation=information;
+				factor.canonical=canonicalFactor(factor.id,factor.kind,factor.link,factor.planarInformation);
+				std::tuple<int,int,int> key(canonicalFrom,canonicalTo,static_cast<int>(link.type()));
+				std::map<std::tuple<int,int,int>,size_t>::const_iterator existing=canonicalRelativeFactors.find(key);
+				if(existing!=canonicalRelativeFactors.end())
+				{
+					if(!equivalentFactor(factors[existing->second],factor))
+						throw std::runtime_error("Contradictory duplicate relative Link detected.");
+					++duplicateReciprocalCollapsed;
+					continue;
+				}
+				canonicalRelativeFactors.insert(std::make_pair(key,factors.size()));
+				factors.push_back(factor);
+				optimizerLinks.insert(std::make_pair(projectedLink.from(),projectedLink));
+				adjacency[canonicalFrom].insert(canonicalTo); adjacency[canonicalTo].insert(canonicalFrom);
 		}
 		if(factors.empty()) throw std::runtime_error("The graph contains no accepted relative factors.");
 		std::set<int> visited; std::queue<int> pending; pending.push(rootId); visited.insert(rootId);
@@ -682,7 +797,7 @@ int main(int argc, char ** argv)
 		{
 			const Prior & prior=priors[i];
 			if(poses.find(prior.nodeId)==poses.end()) throw std::runtime_error("Absolute prior references a missing node.");
-			std::array<double,9> information=diagonalInformation(prior.weight);
+				std::array<double,9> information=priorInformation(prior.translationSigma,prior.yawSigma);
 			cv::Mat full=sixInformation(information);
 			Link link(prior.nodeId,prior.nodeId,Link::kPosePrior,Transform(static_cast<float>(prior.x),static_cast<float>(prior.y),static_cast<float>(prior.yaw)),full);
 			Factor factor; factor.id="prior:"+prior.id; factor.kind=prior.kind; factor.link=link; factor.planarInformation=information;
@@ -710,7 +825,7 @@ int main(int argc, char ** argv)
 		for(std::map<int,Transform>::const_iterator iter=optimized.begin();iter!=optimized.end();++iter) if(!finiteTransform(iter->second)) throw std::runtime_error("Native optimizer returned a non-finite pose.");
 		double finalObjective=objective(optimized,factors);
 		bool converged=iterationsDone>0 && std::isfinite(nativeFinalError) && std::isfinite(finalObjective) && finalObjective<=initialObjective+std::max(1.0e-8,std::fabs(initialObjective)*1.0e-7);
-		writeResult(options,databaseVersion,initial,optimized,factors,rejected,rootId,initialObjective,finalObjective,nativeFinalError,iterationsDone,converged,hasAbsolutePriors);
+			writeResult(options,databaseVersion,initial,optimized,factors,rejected,rootId,initialObjective,finalObjective,nativeFinalError,iterationsDone,converged,hasAbsolutePriors,duplicateReciprocalCollapsed);
 		return converged?0:3;
 	}
 	catch(const std::exception & error)

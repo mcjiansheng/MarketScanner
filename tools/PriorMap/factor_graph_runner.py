@@ -17,6 +17,7 @@ from tools.PriorMap.factor_graph_schema import (
     FactorGraphValidationError,
     validate_factor_graph_result,
 )
+from tools.PriorMap.factor_graph_quality import DEFAULT_POLICY_PATH, load_quality_policy
 
 
 FACTOR_GRAPH_ENV = "MARKETSCANNER_FACTOR_GRAPH_BIN"
@@ -108,7 +109,7 @@ def _select_absolute_priors(
 
 
 def _write_priors(path: Path, input_identity_id: str, baseline: Sequence[Any], constraints: Sequence[Any]) -> None:
-    lines = [f"MarketScannerAbsoluteSE2Priors\t1\t{input_identity_id}\n"]
+    lines = [f"MarketScannerAbsoluteSE2Priors\t2\t{input_identity_id}\n"]
     identifiers: set[str] = set()
     for constraint in constraints:
         identifier = str(constraint.identifier)
@@ -121,6 +122,26 @@ def _write_priors(path: Path, input_identity_id: str, baseline: Sequence[Any], c
             raise FactorGraphRunnerError("Absolute constraint id/kind is invalid or duplicated.")
         identifiers.add(identifier)
         pose = baseline[constraint.node_index]
+        explicit_translation = getattr(constraint, "translation_sigma_m", None)
+        explicit_yaw = getattr(constraint, "yaw_sigma_rad", None)
+        if explicit_translation is None and explicit_yaw is None:
+            weight = float(constraint.weight)
+            if not math.isfinite(weight) or weight <= 0.0:
+                raise FactorGraphRunnerError("Absolute constraint legacy weight is invalid.")
+            translation_sigma_m = 1.0 / math.sqrt(weight)
+            yaw_sigma_rad = 1.0 / math.sqrt(weight)
+        elif explicit_translation is not None and explicit_yaw is not None:
+            translation_sigma_m = float(explicit_translation)
+            yaw_sigma_rad = float(explicit_yaw)
+        else:
+            raise FactorGraphRunnerError("Both translation and yaw uncertainty are required.")
+        if (
+            not math.isfinite(translation_sigma_m)
+            or not 1.0e-4 <= translation_sigma_m <= 1000.0
+            or not math.isfinite(yaw_sigma_rad)
+            or not 1.0e-5 <= yaw_sigma_rad <= math.pi
+        ):
+            raise FactorGraphRunnerError("Absolute constraint uncertainty is out of range.")
         values = (
             identifier,
             kind,
@@ -128,7 +149,8 @@ def _write_priors(path: Path, input_identity_id: str, baseline: Sequence[Any], c
             format(float(constraint.x), ".17g"),
             format(float(constraint.y), ".17g"),
             format(float(constraint.yaw), ".17g"),
-            format(float(constraint.weight), ".17g"),
+            format(translation_sigma_m, ".17g"),
+            format(yaw_sigma_rad, ".17g"),
         )
         if any(not math.isfinite(float(value)) for value in values[3:]):
             raise FactorGraphRunnerError("Absolute constraint contains non-finite values.")
@@ -147,6 +169,7 @@ def run_relative_se2_factor_graph(
     pose_type: type,
     hard_reject_translation_m: float,
     hard_reject_yaw_rad: float,
+    quality_policy_path: Path = DEFAULT_POLICY_PATH,
     timeout_seconds: int = 30 * 60,
 ) -> tuple[list[Any], list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
     if horizontal_axes not in {"xy", "xz"}:
@@ -165,6 +188,10 @@ def run_relative_se2_factor_graph(
         or hard_reject_yaw_rad <= 0.0
     ):
         raise FactorGraphRunnerError("Factor graph robust hard gates are invalid.")
+    try:
+        quality_policy, quality_policy_sha256 = load_quality_policy(quality_policy_path)
+    except ValueError as exc:
+        raise FactorGraphRunnerError(str(exc)) from exc
     selected, rejected = _select_absolute_priors(
         baseline,
         constraints,
@@ -222,6 +249,8 @@ def run_relative_se2_factor_graph(
             expected_input_identity_id=input_identity_id,
             expected_database_sha256=database_hash,
             expected_node_ids=(pose.node_id for pose in baseline),
+            quality_policy=quality_policy,
+            quality_policy_sha256=quality_policy_sha256,
         )
     except FactorGraphValidationError as exc:
         raise FactorGraphRunnerError(str(exc)) from exc
@@ -242,6 +271,21 @@ def run_relative_se2_factor_graph(
             "kind": constraint.kind,
             "node_id": baseline[constraint.node_index].node_id,
             "weight": constraint.weight,
+            "translation_sigma_m": (
+                float(constraint.translation_sigma_m)
+                if getattr(constraint, "translation_sigma_m", None) is not None
+                else 1.0 / math.sqrt(float(constraint.weight))
+            ),
+            "yaw_sigma_rad": (
+                float(constraint.yaw_sigma_rad)
+                if getattr(constraint, "yaw_sigma_rad", None) is not None
+                else 1.0 / math.sqrt(float(constraint.weight))
+            ),
+            "uncertainty_source": (
+                "explicit_v2"
+                if getattr(constraint, "translation_sigma_m", None) is not None
+                else "legacy_scalar_weight_migration"
+            ),
             "translation_residual_m": math.hypot(
                 constraint.x - optimized[constraint.node_index].x,
                 constraint.y - optimized[constraint.node_index].y,
@@ -256,5 +300,6 @@ def run_relative_se2_factor_graph(
         **report,
         "absolute_constraint_count": len(selected),
         "absolute_constraint_rejected_count": len(rejected),
+        "absolute_prior_uncertainty_schema": "translation_sigma_m_and_yaw_sigma_rad_v2",
     }
     return optimized, accepted, rejected, report

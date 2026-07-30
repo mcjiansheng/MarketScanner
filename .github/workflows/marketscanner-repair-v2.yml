@@ -223,6 +223,7 @@ jobs:
             --git-sha "$(git rev-parse HEAD)" `
             --platform windows `
             --dependency-policy tools/SupermarketMapStudio/release_dependencies.json `
+            --quality-policy tools/PriorMap/factor_graph_quality_policy.json `
             --artifact build/marketscanner-windows-release/bin/rtabmap-reprocess.exe `
             --artifact build/marketscanner-windows-release/bin/rtabmap-prior-map-factor-graph.exe
       - uses: actions/upload-artifact@v4
@@ -267,6 +268,7 @@ jobs:
             --git-sha "$(git rev-parse HEAD)" \
             --platform linux \
             --dependency-policy tools/SupermarketMapStudio/release_dependencies.json \
+            --quality-policy tools/PriorMap/factor_graph_quality_policy.json \
             --artifact build/marketscanner-linux-release/bin/rtabmap-reprocess \
             --artifact build/marketscanner-linux-release/bin/rtabmap-prior-map-factor-graph
       - uses: actions/upload-artifact@v4

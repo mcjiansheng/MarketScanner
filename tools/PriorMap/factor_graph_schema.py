@@ -7,9 +7,14 @@ import math
 import re
 from typing import Any, Iterable
 
+from tools.PriorMap.factor_graph_quality import (
+    FactorGraphQualityError,
+    evaluate_graph_quality,
+)
+
 
 RESULT_FORMAT = "MarketScannerRelativeSE2FactorGraphReport"
-RESULT_VERSION = 1
+RESULT_VERSION = 2
 SOLVER_NAME = "rtabmap_g2o_slam2d"
 SHA256_RE = re.compile(r"[0-9a-f]{64}")
 
@@ -96,6 +101,8 @@ def validate_factor_graph_result(
     expected_input_identity_id: str,
     expected_database_sha256: str,
     expected_node_ids: Iterable[int],
+    quality_policy: dict[str, Any],
+    quality_policy_sha256: str,
 ) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise FactorGraphValidationError("Factor graph result must be an object.")
@@ -138,6 +145,7 @@ def validate_factor_graph_result(
     if payload.get("node_count") != len(node_ids):
         raise FactorGraphValidationError("Factor graph node count differs from payload.")
     factor_ids: set[str] = set()
+    actual_factor_counts: dict[str, int] = {}
     relative_adjacency = {node_id: set() for node_id in node_ids}
     canonical_lines: list[tuple[str, str]] = []
     for factor in factors:
@@ -147,6 +155,8 @@ def validate_factor_graph_result(
         if not isinstance(identifier, str) or identifier in factor_ids:
             raise FactorGraphValidationError("Factor IDs must be unique strings.")
         factor_ids.add(identifier)
+        kind = factor.get("kind")
+        actual_factor_counts[str(kind)] = actual_factor_counts.get(str(kind), 0) + 1
         line = canonical_factor_line(factor)
         if factor.get("canonical") != line:
             raise FactorGraphValidationError("Factor canonical bytes differ from fields.")
@@ -166,6 +176,8 @@ def validate_factor_graph_result(
     ).hexdigest()
     if digest != payload["factor_set_sha256"]:
         raise FactorGraphValidationError("Factor set digest does not match canonical factors.")
+    if payload.get("factor_counts_by_type") != actual_factor_counts:
+        raise FactorGraphValidationError("Factor type counts differ from canonical factors.")
 
     visited = {node_ids[0]}
     pending = [node_ids[0]]
@@ -188,13 +200,20 @@ def validate_factor_graph_result(
         "p95_relative_edge_translation_residual_m",
         "maximum_relative_edge_yaw_residual_deg",
         "p95_relative_edge_yaw_residual_deg",
+        "maximum_loop_edge_translation_residual_m",
+        "p95_loop_edge_translation_residual_m",
+        "maximum_loop_edge_yaw_residual_deg",
+        "p95_loop_edge_yaw_residual_deg",
     ):
         if _finite(payload.get(field), field) < 0.0:
             raise FactorGraphValidationError(f"{field} cannot be negative.")
     if (
         payload.get("converged") is not True
+        or payload.get("solver_converged") is not True
+        or payload.get("graph_integrity_passed") is not True
         or payload.get("full_factor_graph") is not True
-        or payload.get("published_capable") is not True
+        or payload.get("graph_quality_passed") is not False
+        or payload.get("published_capable") is not False
         or payload["final_objective"] > payload["initial_objective"] * (1.0 + 1.0e-7)
         or not isinstance(payload.get("iterations_done"), int)
         or payload["iterations_done"] <= 0
@@ -207,8 +226,66 @@ def validate_factor_graph_result(
     gauge_mode = payload.get("gauge_mode")
     if gauge_mode not in {"fixed_root", "absolute_priors"}:
         raise FactorGraphValidationError("Factor graph gauge mode is invalid.")
-    for field in ("downweighted_factor_ids", "rejected_factor_ids"):
+    for field in ("rejected_factor_ids",):
         values = payload.get(field)
         if not isinstance(values, list) or any(not isinstance(value, str) for value in values):
             raise FactorGraphValidationError(f"{field} must be a string array.")
-    return payload
+    collapsed = payload.get("duplicate_reciprocal_collapsed")
+    if isinstance(collapsed, bool) or not isinstance(collapsed, int) or collapsed < 0:
+        raise FactorGraphValidationError("Duplicate reciprocal count is invalid.")
+    residuals = payload.get("loop_factor_residuals")
+    if not isinstance(residuals, list):
+        raise FactorGraphValidationError("Loop residual inventory is invalid.")
+    loop_ids = {factor["id"] for factor in factors if factor.get("kind") == "relative_loop"}
+    seen_residual_ids: set[str] = set()
+    for residual in residuals:
+        if not isinstance(residual, dict) or not isinstance(residual.get("factor_id"), str):
+            raise FactorGraphValidationError("Loop residual record is invalid.")
+        identifier = residual["factor_id"]
+        if identifier in seen_residual_ids or identifier not in loop_ids:
+            raise FactorGraphValidationError("Loop residual factor identity is invalid.")
+        seen_residual_ids.add(identifier)
+        for field in ("translation_m", "yaw_deg"):
+            if _finite(residual.get(field), f"loop residual {field}") < 0.0:
+                raise FactorGraphValidationError("Loop residual cannot be negative.")
+    if seen_residual_ids != loop_ids:
+        raise FactorGraphValidationError("Loop residual inventory is incomplete.")
+    loop_translation = sorted(float(item["translation_m"]) for item in residuals)
+    loop_yaw = sorted(float(item["yaw_deg"]) for item in residuals)
+    def percentile95(values: list[float]) -> float:
+        return values[max(0, math.ceil(0.95 * len(values)) - 1)] if values else 0.0
+    expected_loop_metrics = {
+        "maximum_loop_edge_translation_residual_m": max(loop_translation, default=0.0),
+        "p95_loop_edge_translation_residual_m": percentile95(loop_translation),
+        "maximum_loop_edge_yaw_residual_deg": max(loop_yaw, default=0.0),
+        "p95_loop_edge_yaw_residual_deg": percentile95(loop_yaw),
+    }
+    if any(
+        not math.isclose(float(payload[name]), value, rel_tol=1.0e-7, abs_tol=1.0e-9)
+        for name, value in expected_loop_metrics.items()
+    ):
+        raise FactorGraphValidationError("Loop residual aggregates differ from factor residuals.")
+    limits = quality_policy.get("limits") if isinstance(quality_policy, dict) else None
+    if not isinstance(limits, dict):
+        raise FactorGraphValidationError("Factor graph quality policy is invalid.")
+    high_residual_ids = sorted(
+        item["factor_id"]
+        for item in residuals
+        if item["translation_m"] > float(limits["high_residual_loop_translation_m"])
+        or item["yaw_deg"] > float(limits["high_residual_loop_yaw_deg"])
+    )
+    enriched = {**payload, "high_residual_loop_factor_ids": high_residual_ids}
+    try:
+        quality = evaluate_graph_quality(enriched, quality_policy, quality_policy_sha256)
+    except (FactorGraphQualityError, KeyError, TypeError, ValueError) as exc:
+        raise FactorGraphValidationError(str(exc)) from exc
+    return {
+        **enriched,
+        "quality_policy": quality,
+        "graph_quality_passed": quality["passed"],
+        "published_capable": (
+            payload["solver_converged"] is True
+            and payload["graph_integrity_passed"] is True
+            and quality["passed"] is True
+        ),
+    }

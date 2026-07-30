@@ -18,6 +18,7 @@ from tools.Qualification.qualification import (
     _canonical_sha,
     collect_device,
     evaluate_field,
+    inspect_field_evidence,
 )
 
 
@@ -222,7 +223,24 @@ class QualificationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             release = root / "release-manifest.json"
-            release.write_text("{}", encoding="utf-8")
+            quality_policy = root / "factor-graph-quality-policy.json"
+            write_json(quality_policy, {
+                "format": "MarketScannerFactorGraphQualityPolicy",
+                "version": 1,
+                "status": "frozen",
+                "policy_version": "test-frozen-1",
+                "limits": {},
+            })
+            policy_sha = sha256(quality_policy)
+            release_value = {
+                "format": "MarketScannerReleaseManifest",
+                "version": 2,
+                "git_sha": "a" * 40,
+                "product_version": "test",
+                "factor_graph_quality_policy_sha256": policy_sha,
+            }
+            release_value["manifest_body_sha256"] = _canonical_sha(release_value)
+            write_json(release, release_value)
             topology = "b" * 64
             shelf = "c" * 64
             runs = []
@@ -230,9 +248,19 @@ class QualificationTests(unittest.TestCase):
                 device_evidence = root / f"device-evidence-{index}.json"
                 device_evidence_value = {
                     "format": "MarketScannerDeviceQualificationEvidence",
-                    "version": 1,
+                    "version": 2,
                     "run": index,
                     "result": "PASS",
+                    "blockers": [],
+                    "runs": [{
+                        "rawSessionBundleSha256": format(index + 1, "064x"),
+                        "rawDatabaseSha256": format(index + 101, "064x"),
+                        "trackingSessionId": f"tracking-{index}",
+                        "sessionIdentity": {
+                            "priorMapId": "prior-test",
+                            "priorMapSha256": "d" * 64,
+                        },
+                    }],
                 }
                 device_evidence_value["evidenceSha256"] = _canonical_sha(
                     device_evidence_value
@@ -255,7 +283,11 @@ class QualificationTests(unittest.TestCase):
                     "automaticConfirmDuringWeakLost": 0,
                     "topologyDigest": topology,
                     "shelfAssociationDigest": shelf,
-                    "sourceSessionSha256": device_evidence_sha,
+                    "sourceSessionBundleSha256": format(index + 1, "064x"),
+                    "rawDatabaseSha256": format(index + 101, "064x"),
+                    "trackingSessionId": f"tracking-{index}",
+                    "qualityPolicySha256": policy_sha,
+                    "factorGraphQualityPassed": True,
                 })
                 measurements = root / f"tags-{index}.csv"
                 with measurements.open("w", newline="", encoding="utf-8") as stream:
@@ -276,11 +308,16 @@ class QualificationTests(unittest.TestCase):
             plan = root / "field-plan.json"
             write_json(plan, {
                 "format": "MarketScannerFieldQualificationPlan",
-                "version": 1,
+                "version": 2,
                 "executionStatus": "executed_with_independent_ground_truth",
                 "thresholdsFrozenAtUnix": 100,
                 "releaseManifest": str(release),
                 "releaseManifestSha256": sha256(release),
+                "qualityPolicy": str(quality_policy),
+                "qualityPolicySha256": policy_sha,
+                "priorMapId": "prior-test",
+                "priorMapSha256": "d" * 64,
+                "siteId": "test-supermarket",
                 "siteType": "supermarket",
                 "groundTruthMethod": "independent total station controls",
                 "independentSurveyor": "test surveyor",
@@ -300,6 +337,21 @@ class QualificationTests(unittest.TestCase):
             evidence = evaluate_field(plan, root / "field-evidence.json")
             self.assertEqual(evidence["result"], "PASS")
             self.assertEqual(len(evidence["runs"]), 3)
+            inspected = inspect_field_evidence(root / "field-evidence.json")
+            self.assertEqual(inspected["run_count"], 3)
+
+            duplicate_plan = json.loads(plan.read_text(encoding="utf-8"))
+            duplicate_plan["runs"][1]["runId"] = duplicate_plan["runs"][0]["runId"]
+            write_json(plan, duplicate_plan)
+            duplicate = evaluate_field(plan, root / "duplicate-field-evidence.json")
+            self.assertEqual(duplicate["result"], "FAIL")
+            self.assertIn("duplicate_run_id", ":".join(duplicate["blockers"]))
+
+            tampered = json.loads((root / "field-evidence.json").read_text(encoding="utf-8"))
+            tampered["result"] = "FAIL"
+            write_json(root / "tampered-field-evidence.json", tampered)
+            with self.assertRaisesRegex(QualificationError, "evidence_contract_invalid"):
+                inspect_field_evidence(root / "tampered-field-evidence.json")
 
 
 if __name__ == "__main__":

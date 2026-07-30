@@ -26,6 +26,7 @@ import zipfile
 from collections import deque
 from dataclasses import dataclass, field
 from http import HTTPStatus
+from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
@@ -60,6 +61,7 @@ from PriorMap.localized_output_store import (
     LocalizedVersionStore,
     REQUIRED_VERSION_FILES,
 )
+from Qualification.qualification import QualificationError, inspect_field_evidence
 
 
 ARTIFACTS = (
@@ -145,6 +147,34 @@ def source_git_sha() -> str:
     return candidate if re.fullmatch(r"[0-9a-f]{40}", candidate) else "unknown"
 
 
+def runtime_release_identity() -> dict[str, str]:
+    """Load the immutable release identity; source checkouts are not publishable."""
+    configured = os.environ.get("MARKETSCANNER_RELEASE_MANIFEST", "").strip()
+    path = Path(configured) if configured else APP_DIR.parent.parent / "release-manifest.json"
+    try:
+        value, manifest_sha, _ = _stable_json_file(path)
+        body = dict(value)
+        declared = body.pop("manifest_body_sha256", None)
+        calculated = hashlib.sha256(
+            json.dumps(body, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        if (
+            value.get("format") != "MarketScannerReleaseManifest"
+            or value.get("version") != 2
+            or re.fullmatch(r"[0-9a-f]{40}", str(value.get("git_sha", ""))) is None
+            or not isinstance(value.get("product_version"), str)
+            or not value["product_version"].strip()
+            or declared != calculated
+        ):
+            raise ValueError("release manifest contract is invalid")
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        raise RequestError("当前运行环境没有有效的 release-manifest.json，禁止发布。") from exc
+    return {
+        "release_manifest_sha256": manifest_sha,
+        "git_sha": value["git_sha"],
+        "product_version": value["product_version"],
+        "quality_policy_sha256": str(value.get("factor_graph_quality_policy_sha256", "")),
+    }
 SOURCE_GIT_SHA = source_git_sha()
 
 
@@ -272,6 +302,7 @@ class StudioState:
         return {
             "format": StudioState.JOURNAL_FORMAT,
             "version": StudioState.JOURNAL_VERSION,
+            "storage_version": 2,
             "id": job.identifier,
             "kind": job.kind,
             "output_dir": str(job.output_dir),
@@ -578,11 +609,30 @@ def default_job_state_dir() -> Path:
     override = os.environ.get("MARKETSCANNER_JOB_STATE_DIR")
     if override:
         return Path(override).expanduser().resolve()
+    if sys.platform == "darwin":
+        return Path.home() / "Library/Application Support/MarketScanner/MapStudio/jobs"
+    if os.name == "nt":
+        base = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData/Local"))
+        return base / "MarketScanner/MapStudio/jobs"
+    base = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state"))
+    return base / "marketscanner/mapstudio/jobs"
+
+
+def legacy_job_state_dir() -> Path:
     owner = hashlib.sha256(str(Path.home()).encode("utf-8")).hexdigest()[:12]
     return Path(tempfile.gettempdir()) / f"marketscanner-mapstudio-{owner}" / "jobs"
 
 
-STATE = StudioState(default_job_state_dir())
+try:
+    STATE = StudioState(default_job_state_dir())
+except OSError as exc:
+    # Import remains usable for diagnostics/tests, but production startup fails closed.
+    STATE = StudioState(None)
+    STATE.startup_errors.append(f"app_data_job_state_unavailable:{exc}")
+if legacy_job_state_dir().is_dir() and legacy_job_state_dir() != STATE.state_dir:
+    STATE.startup_errors.append(
+        f"legacy_job_state_available_for_read_only_migration:{legacy_job_state_dir()}"
+    )
 JOB_RUNTIME_CONTEXT = threading.local()
 FINALIZED_CHECKPOINT_CLEANUP_LOCK = threading.Lock()
 ProgressCallback = Callable[[int, str, str], None]
@@ -2627,29 +2677,14 @@ def apply_localized_state_transition(
             gate = report.get("publish_gate")
             blockers = gate.get("blockers", []) if isinstance(gate, dict) else []
             solver = report.get("solver")
-            requested_acceptance = data.get("field_acceptance")
-            field_acceptance = {
-                "accepted": (
-                    isinstance(requested_acceptance, dict)
-                    and requested_acceptance.get("accepted") is True
-                ),
-                "actor": "local-user",
-                "accepted_at_utc": datetime.now(timezone.utc).isoformat(
-                    timespec="milliseconds"
-                ),
-                "evidence_sha256": (
-                    requested_acceptance.get("evidence_sha256")
-                    if isinstance(requested_acceptance, dict)
-                    else None
-                ),
-            }
+            evidence_path_value = data.get("qualification_evidence_path")
+            evidence_sha = data.get("qualification_evidence_sha256")
             acceptance_valid = (
-                field_acceptance.get("accepted") is True
-                and isinstance(field_acceptance.get("evidence_sha256"), str)
-                and re.fullmatch(
-                    r"[0-9a-f]{64}", field_acceptance.get("evidence_sha256", "")
-                )
-                is not None
+                data.get("operator_confirmed") is True
+                and isinstance(evidence_path_value, str)
+                and bool(evidence_path_value.strip())
+                and isinstance(evidence_sha, str)
+                and re.fullmatch(r"[0-9a-f]{64}", evidence_sha) is not None
             )
             if (
                 not isinstance(gate, dict)
@@ -2673,7 +2708,11 @@ def apply_localized_state_transition(
                 snapshot = store.publish_current(
                     actor="local-user",
                     reason=reason.strip(),
-                    field_acceptance=field_acceptance,
+                    qualification_evidence_path=resolve_path(
+                        evidence_path_value, "Field qualification evidence"
+                    ),
+                    expected_field_evidence_sha256=evidence_sha,
+                    expected_release_identity=runtime_release_identity(),
                     expected_version=expected_version,
                 )
             elif action == "revoke":
@@ -2980,10 +3019,10 @@ class StudioHandler(BaseHTTPRequestHandler):
             "frame-ancestors 'none'",
         )
 
-    def authorize_post(self) -> None:
+    def authorize_post(self, *, require_token: bool = False) -> None:
         expected_token = getattr(self.server, "session_token", "")
         supplied_token = self.headers.get("X-MarketScanner-Session-Token", "")
-        if (
+        if require_token and (
             not isinstance(expected_token, str)
             or not expected_token
             or not secrets.compare_digest(supplied_token, expected_token)
@@ -2995,6 +3034,26 @@ class StudioHandler(BaseHTTPRequestHandler):
         allowed_origins = getattr(self.server, "allowed_origins", frozenset())
         if origin not in allowed_origins:
             raise RequestForbidden("Unexpected request Origin.")
+
+    def authorize_session(self) -> None:
+        """Require a short-lived HttpOnly session (token header remains CLI-only auth)."""
+        supplied_token = self.headers.get("X-MarketScanner-Session-Token", "")
+        expected_token = getattr(self.server, "session_token", "")
+        if supplied_token and expected_token and secrets.compare_digest(supplied_token, expected_token):
+            return
+        cookie = SimpleCookie()
+        try:
+            cookie.load(self.headers.get("Cookie", ""))
+        except Exception as exc:
+            raise RequestForbidden("Invalid local session cookie.") from exc
+        morsel = cookie.get("marketscanner_session")
+        session_id = morsel.value if morsel is not None else ""
+        sessions = getattr(self.server, "authenticated_sessions", {})
+        expires_at = sessions.get(session_id) if isinstance(sessions, dict) else None
+        if not isinstance(expires_at, (int, float)) or expires_at <= time.time():
+            if isinstance(sessions, dict) and session_id:
+                sessions.pop(session_id, None)
+            raise RequestForbidden("Missing or expired local session.")
 
     def read_json(self) -> Dict[str, Any]:
         length = int(self.headers.get("Content-Length", "0"))
@@ -3016,21 +3075,24 @@ class StudioHandler(BaseHTTPRequestHandler):
                 HTTPStatus.OK,
                 {
                     "ok": not STATE.startup_errors,
-                    "python": sys.version.split()[0],
-                    "job_runtime": {
-                        "state_dir": str(STATE.state_dir) if STATE.state_dir else None,
-                        "restored_job_count": len(STATE.list()),
-                        "startup_errors": list(STATE.startup_errors),
-                    },
+                    "service": "MarketScannerMapStudio",
+                    "authentication_required": True,
                 },
             )
             return
+        if path.startswith("/api/"):
+            try:
+                self.authorize_session()
+            except RequestError as exc:
+                self.send_json(exc.status, exc.details())
+                return
         if path == "/api/about":
             self.send_json(
                 HTTPStatus.OK,
                 {
                     "product": "Supermarket Map Studio",
                     "version": MAP_STUDIO_VERSION,
+                    "runtime_mode": getattr(self.server, "runtime_mode", "development"),
                     "git_sha": SOURCE_GIT_SHA,
                     "python": sys.version.split()[0],
                     "platform": platform.platform(),
@@ -3074,9 +3136,41 @@ class StudioHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802
         try:
+            path = urlparse(self.path).path
+            if path == "/api/session/bootstrap":
+                self.authorize_post(require_token=True)
+                data = self.read_json()
+                session_id = secrets.token_urlsafe(32)
+                sessions = getattr(self.server, "authenticated_sessions", None)
+                if not isinstance(sessions, dict):
+                    raise RequestForbidden("Session service is unavailable.")
+                sessions[session_id] = time.time() + 30 * 60
+                body = json.dumps({"authenticated": True, "expires_in_seconds": 1800}).encode("utf-8")
+                self.send_response(HTTPStatus.OK)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "no-store")
+                self.send_header(
+                    "Set-Cookie",
+                    f"marketscanner_session={session_id}; HttpOnly; SameSite=Strict; Path=/; Max-Age=1800",
+                )
+                self.send_security_headers()
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            self.authorize_session()
             self.authorize_post()
             data = self.read_json()
-            path = urlparse(self.path).path
+            if path == "/api/qualification/field/inspect":
+                try:
+                    evidence = inspect_field_evidence(
+                        resolve_path(data.get("path"), "Field qualification evidence"),
+                        required_site_type="supermarket",
+                    )
+                except (OSError, QualificationError) as exc:
+                    raise RequestError(f"现场验收证据无效：{exc}") from exc
+                self.send_json(HTTPStatus.OK, evidence)
+                return
             if path == "/api/dialog":
                 selected = choose_path(str(data.get("mode", "directory")), str(data.get("title", "Select folder")))
                 self.send_json(HTTPStatus.OK, {"path": selected})
@@ -3297,13 +3391,24 @@ class StudioHandler(BaseHTTPRequestHandler):
         self.wfile.write(content)
 
 
-def startup_diagnostics() -> Dict[str, Any]:
+def startup_diagnostics(mode: str = "development") -> Dict[str, Any]:
     state_directory = STATE.state_dir or Path(tempfile.gettempdir())
     checks: list[Dict[str, Any]] = []
     checks.append({
         "name": "python_3_10_or_newer",
         "ok": sys.version_info >= (3, 10),
         "detail": sys.version.split()[0],
+    })
+    try:
+        state_resolved = state_directory.resolve()
+        temporary_root = Path(tempfile.gettempdir()).resolve()
+        state_is_temporary = state_resolved == temporary_root or temporary_root in state_resolved.parents
+    except OSError:
+        state_is_temporary = True
+    checks.append({
+        "name": "job_state_not_os_temp",
+        "ok": mode != "production" or (STATE.state_dir is not None and not state_is_temporary),
+        "detail": "platform app-data" if not state_is_temporary else "OS temporary directory",
     })
     try:
         usage = shutil.disk_usage(state_directory)
@@ -3316,15 +3421,25 @@ def startup_diagnostics() -> Dict[str, Any]:
         checks.append({"name": "state_disk_free_1_gib", "ok": False, "detail": str(exc)})
     reprocess = offline.find_reprocess_binary()
     factor = find_factor_graph_binary()
+    native_checks = (
+        [
+            native_tool_diagnostic("rtabmap_reprocess", reprocess, strict=True),
+            native_tool_diagnostic("relative_se2_factor_helper", factor, strict=True),
+        ]
+        if mode == "production"
+        else [
+            native_tool_diagnostic("rtabmap_reprocess", reprocess),
+            native_tool_diagnostic("relative_se2_factor_helper", factor),
+        ]
+    )
     checks.extend([
-        native_tool_diagnostic("rtabmap_reprocess", reprocess),
-        native_tool_diagnostic("relative_se2_factor_helper", factor),
+        *native_checks,
         {
             "name": "job_journal",
             "ok": not STATE.startup_errors,
             "detail": "; ".join(STATE.startup_errors) or "ok",
         },
-        operator_package_diagnostic(),
+        operator_package_diagnostic(require_package=mode == "production"),
     ])
     critical_names = {
         "python_3_10_or_newer",
@@ -3333,7 +3448,11 @@ def startup_diagnostics() -> Dict[str, Any]:
         "relative_se2_factor_helper",
         "operator_package_integrity",
     }
+    if mode == "production":
+        critical_names.update({"job_journal", "job_state_not_os_temp"})
     return {
+        "mode": mode,
+        "production_qualified": mode == "production" and all(item["ok"] for item in checks),
         "ok": all(item["ok"] for item in checks),
         "can_start": all(
             item["ok"] for item in checks if item["name"] in critical_names
@@ -3342,7 +3461,7 @@ def startup_diagnostics() -> Dict[str, Any]:
     }
 
 
-def native_tool_diagnostic(name: str, binary: Path | None) -> Dict[str, Any]:
+def native_tool_diagnostic(name: str, binary: Path | None, *, strict: bool = False) -> Dict[str, Any]:
     if binary is None:
         return {"name": name, "ok": False, "detail": "not found"}
     try:
@@ -3357,7 +3476,7 @@ def native_tool_diagnostic(name: str, binary: Path | None) -> Dict[str, Any]:
         return {"name": name, "ok": False, "detail": str(exc)}
     output = ((completed.stdout or "") + (completed.stderr or "")).strip()
     source_matches = (
-        SOURCE_GIT_SHA == "unknown"
+        (not strict and SOURCE_GIT_SHA == "unknown")
         or f"marketscanner_git_sha={SOURCE_GIT_SHA}" in output
     )
     return {
@@ -3387,14 +3506,42 @@ def _stable_file_digest(path: Path) -> tuple[str, int]:
     return digest.hexdigest(), int(before.st_size)
 
 
-def operator_package_diagnostic(package_root: Path | None = None) -> Dict[str, Any]:
+def _stable_json_file(path: Path, maximum_bytes: int = 16 * 1024 * 1024) -> tuple[dict[str, Any], str, int]:
+    before = path.lstat()
+    if (
+        path.is_symlink()
+        or not stat.S_ISREG(before.st_mode)
+        or before.st_nlink != 1
+        or before.st_size > maximum_bytes
+    ):
+        raise ValueError(f"JSON file is unsafe or oversized: {path.name}")
+    with path.open("rb") as stream:
+        data = stream.read(maximum_bytes + 1)
+        opened = os.fstat(stream.fileno())
+    after = path.lstat()
+    identity = (before.st_dev, before.st_ino, before.st_size)
+    if (
+        len(data) > maximum_bytes
+        or identity != (opened.st_dev, opened.st_ino, opened.st_size)
+        or identity != (after.st_dev, after.st_ino, after.st_size)
+    ):
+        raise ValueError(f"JSON file changed during read: {path.name}")
+    value = json.loads(data, parse_constant=lambda token: (_ for _ in ()).throw(ValueError(token)))
+    if not isinstance(value, dict):
+        raise ValueError(f"JSON file is not an object: {path.name}")
+    return value, hashlib.sha256(data).hexdigest(), len(data)
+
+
+def operator_package_diagnostic(
+    package_root: Path | None = None, *, require_package: bool = False
+) -> Dict[str, Any]:
     package_root = (package_root or APP_DIR.parent.parent).resolve()
     manifest_path = package_root / "package-manifest.json"
     if not manifest_path.exists():
         return {
             "name": "operator_package_integrity",
-            "ok": True,
-            "detail": "source checkout (no operator package manifest)",
+            "ok": not require_package,
+            "detail": "source checkout (DEVELOPMENT / NOT QUALIFIED FOR PRODUCTION)",
         }
     try:
         if manifest_path.is_symlink() or manifest_path.stat().st_size > 16 * 1024 * 1024:
@@ -3440,6 +3587,21 @@ def operator_package_diagnostic(package_root: Path | None = None) -> Dict[str, A
         release_digest, _ = _stable_file_digest(release_manifest)
         if release_digest != manifest.get("releaseManifestSha256"):
             raise ValueError("release manifest digest differs")
+        release = json.loads(release_manifest.read_text(encoding="utf-8"))
+        quality_path = package_root / "factor-graph-quality-policy.json"
+        quality_digest, _ = _stable_file_digest(quality_path)
+        quality = json.loads(quality_path.read_text(encoding="utf-8"))
+        if (
+            release.get("format") != "MarketScannerReleaseManifest"
+            or release.get("version") != 2
+            or release.get("git_sha") != manifest.get("gitSha")
+            or (require_package and release.get("git_sha") != SOURCE_GIT_SHA)
+            or release.get("factor_graph_quality_policy_sha256") != quality_digest
+            or quality.get("format") != "MarketScannerFactorGraphQualityPolicy"
+            or quality.get("version") != 1
+            or (require_package and quality.get("status") != "frozen")
+        ):
+            raise ValueError("release or quality policy identity differs")
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         return {
             "name": "operator_package_integrity",
@@ -3519,11 +3681,14 @@ def create_server(
     port: int = 8765,
     host: str = "127.0.0.1",
     session_token: str | None = None,
+    mode: str = "development",
 ) -> ThreadingHTTPServer:
     if host != "127.0.0.1":
         raise ValueError("Supermarket Map Studio may bind only to a loopback address.")
     server = ThreadingHTTPServer((host, port), StudioHandler)
     server.session_token = session_token or secrets.token_urlsafe(32)  # type: ignore[attr-defined]
+    server.authenticated_sessions = {}  # type: ignore[attr-defined]
+    server.runtime_mode = mode  # type: ignore[attr-defined]
     server.allowed_origins = frozenset({  # type: ignore[attr-defined]
         f"http://{host}:{server.server_port}",
     })
@@ -3536,15 +3701,20 @@ def main() -> int:
     parser.add_argument("--selfcheck", action="store_true")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--no-browser", action="store_true")
+    parser.add_argument("--mode", choices=("development", "production"), default="development")
     args = parser.parse_args()
     if args.version:
         print(f"{MAP_STUDIO_VERSION} git_sha={SOURCE_GIT_SHA}")
         return 0
     if args.selfcheck:
-        diagnostics = startup_diagnostics()
+        diagnostics = startup_diagnostics(args.mode)
         print(json.dumps(diagnostics, indent=2, sort_keys=True))
         return 0 if diagnostics["can_start"] else 1
-    server = create_server(args.port)
+    diagnostics = startup_diagnostics(args.mode)
+    if args.mode == "production" and not diagnostics["can_start"]:
+        print(json.dumps(diagnostics, indent=2, sort_keys=True), file=sys.stderr)
+        return 1
+    server = create_server(args.port, mode=args.mode)
     url = f"http://127.0.0.1:{server.server_port}/"
     print(f"Supermarket Map Studio: {url}", flush=True)
     if not args.no_browser:

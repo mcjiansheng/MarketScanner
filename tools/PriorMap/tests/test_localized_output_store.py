@@ -250,12 +250,15 @@ class LocalizedVersionStoreTests(unittest.TestCase):
                     "optimized_database_sha256"
                 ],
                 "prior_map_sha256": self.identity_hashes["prior_map_sha256"],
+                "prior_map_id": "prior-test",
             },
             "processing_manifest.json": {
                 "format": "MarketScannerLocalizedProcessing",
                 "version": 2,
                 "publish_state": state,
                 "input_identity_id": self.input_identity_id,
+                "factor_graph_quality_policy_sha256": "e" * 64,
+                "factor_graph_quality_policy_version": "test-frozen-1",
                 **self.identity_hashes,
             },
             "session_input_manifest.json": {
@@ -288,16 +291,27 @@ class LocalizedVersionStoreTests(unittest.TestCase):
                     "type": "relative_se2_factor_graph",
                     "full_factor_graph": True,
                     "published_capable": True,
+                    "graph_quality_passed": True,
                     "factor_set_sha256": "d" * 64,
                 },
             },
             "factor_graph_report.json": {
                 "format": "MarketScannerRelativeSE2FactorGraphReport",
-                "version": 1,
+                "version": 2,
                 "solver": "rtabmap_g2o_slam2d",
                 "full_factor_graph": True,
                 "published_capable": True,
                 "converged": True,
+                "solver_converged": True,
+                "graph_integrity_passed": True,
+                "graph_quality_passed": True,
+                "quality_policy": {
+                    "policy_sha256": "e" * 64,
+                    "policy_version": "test-frozen-1",
+                    "policy_status": "frozen",
+                    "passed": True,
+                    "blockers": [],
+                },
                 "factor_set_sha256": "d" * 64,
                 "input_identity_id": self.input_identity_id,
                 "optimized_database_sha256": self.identity_hashes[
@@ -420,18 +434,37 @@ class LocalizedVersionStoreTests(unittest.TestCase):
             )["publish_state"],
             "review",
         )
-        published = self.store.publish_current(
-            actor="publisher",
-            reason="explicit approval",
-            field_acceptance={
-                "accepted": True,
-                "actor": "field-reviewer",
-                "accepted_at_utc": "2026-07-27T00:00:00.000Z",
-                "evidence_sha256": hashlib.sha256(
-                    (review.version_dir / "localized_review.json").read_bytes()
-                ).hexdigest(),
-            },
-        )
+        evidence_path = self.output / "field-evidence.json"
+        evidence_path.write_text("{}", encoding="utf-8")
+        qualification = {
+            "file_sha256": "f" * 64,
+            "evidence_sha256": "1" * 64,
+            "release_manifest_sha256": "2" * 64,
+            "release_git_sha": "3" * 40,
+            "product_version": "test",
+            "prior_map_id": "prior-test",
+            "prior_map_sha256": self.identity_hashes["prior_map_sha256"],
+            "quality_policy_sha256": "e" * 64,
+            "quality_policy_version": "test-frozen-1",
+            "site_id": "store-test",
+            "site_type": "supermarket",
+            "run_count": 3,
+            "tag_control_count": 60,
+        }
+        release_identity = {
+            "release_manifest_sha256": "2" * 64,
+            "git_sha": "3" * 40,
+            "product_version": "test",
+            "quality_policy_sha256": "e" * 64,
+        }
+        with mock.patch.object(localized_store, "inspect_field_evidence", return_value=qualification):
+            published = self.store.publish_current(
+                actor="publisher",
+                reason="explicit approval",
+                qualification_evidence_path=evidence_path,
+                expected_field_evidence_sha256="f" * 64,
+                expected_release_identity=release_identity,
+            )
         self.assertEqual(published.state, "published")
         self.assertEqual(self.store.published(), published)
         self.assertEqual(self.store.current(), review)
@@ -439,14 +472,9 @@ class LocalizedVersionStoreTests(unittest.TestCase):
             self.store.publish_current(
                 actor="publisher",
                 reason="duplicate publication must fail",
-                field_acceptance={
-                    "accepted": True,
-                    "actor": "field-reviewer",
-                    "accepted_at_utc": "2026-07-27T00:00:01.000Z",
-                    "evidence_sha256": hashlib.sha256(
-                        (review.version_dir / "localized_review.json").read_bytes()
-                    ).hexdigest(),
-                },
+                qualification_evidence_path=evidence_path,
+                expected_field_evidence_sha256="f" * 64,
+                expected_release_identity=release_identity,
             )
         revoked = self.store.revoke_published(
             actor="publisher", reason="field issue"

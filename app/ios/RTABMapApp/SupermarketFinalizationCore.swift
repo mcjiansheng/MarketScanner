@@ -74,9 +74,12 @@ struct LocalizationEvidenceBundleExpectation {
 enum LocalizationEvidenceBundleValidator {
     private static let maximumRecordBytes = 1_000_000
     private static let maximumRecords = 500_000
+    // V1 production scope is one store. Keep the only whole-array decode below
+    // a measured mobile-memory budget; larger catalogs must be split by store.
+    private static let maximumLocalizedTagRecords = 50_000
     private static let maximumOptionalJSONLBytes = 128 * 1024 * 1024
     private static let maximumRequiredJSONLBytes = 512 * 1024 * 1024
-    private static let maximumLocalizedTagsBytes = 128 * 1024 * 1024
+    private static let maximumLocalizedTagsBytes = 16 * 1024 * 1024
 
     private struct JSONLContract {
         let fileName: String
@@ -302,7 +305,7 @@ enum LocalizationEvidenceBundleValidator {
             maximumBytes: Int64(maximumLocalizedTagsBytes)).data
         guard let object = try? JSONSerialization.jsonObject(with: data),
               let values = object as? [[String: Any]],
-              values.count <= maximumRecords else {
+              values.count <= maximumLocalizedTagRecords else {
             throw validationError("invalid_json_array")
         }
         let allowedFields = Set([

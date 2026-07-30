@@ -1,0 +1,24 @@
+{
+  "format": "MarketScannerFactorGraphQualityPolicy",
+  "version": 1,
+  "policy_version": "2026-07-30-rc-candidate-1",
+  "status": "candidate",
+  "evidence_requirement": "Freeze only after multiple real databases and P5/P6 distributions are independently reviewed.",
+  "limits": {
+    "relative_translation_p95_max_m": 0.2,
+    "relative_translation_max_m": 1.0,
+    "relative_yaw_p95_max_deg": 5.729577951308233,
+    "relative_yaw_max_deg": 20.0,
+    "loop_translation_p95_max_m": 0.5,
+    "loop_translation_max_m": 1.0,
+    "loop_yaw_p95_max_deg": 10.0,
+    "loop_yaw_max_deg": 20.0,
+    "high_residual_loop_translation_m": 1.0,
+    "high_residual_loop_yaw_deg": 20.0,
+    "high_residual_loop_ratio_max": 0.05,
+    "maximum_pose_update_m": 2.0,
+    "maximum_pose_update_yaw_deg": 30.0,
+    "minimum_relative_factor_to_node_ratio": 0.95,
+    "minimum_objective_improvement_ratio": 0.0
+  }
+}

@@ -357,6 +357,18 @@ require(
     initialEvidenceBlockers.isEmpty,
     "a complete persisted evidence bundle must validate: \(initialEvidenceBlockers)")
 
+let localizedTagsURL = evidenceDirectory.appendingPathComponent(
+    "localized_price_tags.json")
+try Data(repeating: 0x20, count: 16 * 1024 * 1024 + 1).write(to: localizedTagsURL)
+require(
+    LocalizationEvidenceBundleValidator.blockers(
+        in: evidenceDirectory,
+        expectation: evidenceExpectation).contains {
+            $0.contains("localized_price_tags")
+        },
+    "the V1 production localized-tag memory budget must fail closed")
+try Data("[]".utf8).write(to: localizedTagsURL)
+
 let originalTrace = try Data(contentsOf: traceEvidenceURL)
 try FileManager.default.removeItem(at: traceEvidenceURL)
 require(

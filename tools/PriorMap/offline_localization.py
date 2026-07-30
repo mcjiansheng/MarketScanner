@@ -375,6 +375,8 @@ class AbsoluteConstraint:
     weight: float
     kind: str
     source: dict[str, Any]
+    translation_sigma_m: float | None = None
+    yaw_sigma_rad: float | None = None
 
 
 @dataclass(frozen=True)
@@ -3337,7 +3339,7 @@ def _render_localized_version(
     )
     factor_graph_report: dict[str, Any] = {
         "format": "MarketScannerRelativeSE2FactorGraphReport",
-        "version": 1,
+        "version": 2,
         "solver": "unavailable",
         "full_factor_graph": False,
         "published_capable": False,
@@ -3362,7 +3364,7 @@ def _render_localized_version(
                     hard_reject_yaw_rad=HARD_REJECT_YAW_RAD,
                 )
             )
-            full_factor_graph = True
+            full_factor_graph = factor_graph_report.get("full_factor_graph") is True
         except FactorGraphRunnerError as exc:
             factor_graph_report = {
                 **factor_graph_report,
@@ -3381,6 +3383,12 @@ def _render_localized_version(
         optimized, accepted, rejected = optimize_trajectory(baseline, constraints)
     solver_metrics = bounded_correction_metrics(
         baseline, optimized, constraints
+    )
+    graph_quality_passed = factor_graph_report.get("graph_quality_passed") is True
+    factor_graph_published_capable = (
+        full_factor_graph
+        and graph_quality_passed
+        and factor_graph_report.get("published_capable") is True
     )
 
     elements_payload = load_json(prior_map / "elements.json")
@@ -3732,7 +3740,10 @@ def _render_localized_version(
                 else "bounded_correction_field"
             ),
             "full_factor_graph": full_factor_graph,
-            "published_capable": full_factor_graph,
+            "graph_integrity_passed": factor_graph_report.get("graph_integrity_passed") is True,
+            "graph_quality_passed": graph_quality_passed,
+            "quality_policy": factor_graph_report.get("quality_policy"),
+            "published_capable": factor_graph_published_capable,
             "limitation": (
                 None
                 if full_factor_graph
@@ -3827,8 +3838,18 @@ def _render_localized_version(
                 "value": report["solver"]["type"],
             },
         )
+    elif not graph_quality_passed:
+        quality = factor_graph_report.get("quality_policy")
+        quality_blockers = quality.get("blockers") if isinstance(quality, dict) else None
+        publish_blockers.insert(
+            0,
+            {
+                "code": "factor_graph_quality_not_passed",
+                "value": quality_blockers if isinstance(quality_blockers, list) else [],
+            },
+        )
     report["publish_gate"] = {
-        "passed": full_factor_graph and not publish_blockers,
+        "passed": factor_graph_published_capable and not publish_blockers,
         "blockers": publish_blockers,
     }
     if has_critical_jsonl_damage:
@@ -3898,9 +3919,15 @@ def _render_localized_version(
             "source_database_sha256": source_hash_before,
             "optimized_database_sha256": optimized_db_hash,
             "prior_map_sha256": package_hash,
+            "factor_graph_quality_policy_sha256": (
+                factor_graph_report.get("quality_policy") or {}
+            ).get("policy_sha256"),
+            "factor_graph_quality_policy_version": (
+                factor_graph_report.get("quality_policy") or {}
+            ).get("policy_version"),
             "tool_version": TOOL_VERSION,
             "algorithm_version": (
-                "relative_se2_factor_graph_v1"
+                "relative_se2_factor_graph_v2"
                 if full_factor_graph
                 else "bounded_correction_field_v1"
             ),

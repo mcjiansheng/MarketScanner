@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from tools.PriorMap.localized_file_lock import FileLock, FileLockTimeout
+from tools.Qualification.qualification import QualificationError, inspect_field_evidence
 
 
 REQUIRED_VERSION_FILES = (
@@ -534,7 +535,7 @@ class LocalizedVersionStore:
             "localization_report.json": ("MarketScannerLocalizationReport", 1),
             "factor_graph_report.json": (
                 "MarketScannerRelativeSE2FactorGraphReport",
-                1,
+                2,
             ),
             "review_items.json": ("MarketScannerLocalizationReviewItems", 1),
             "localized_review.json": ("MarketScannerLocalizedReview", 1),
@@ -668,12 +669,17 @@ class LocalizedVersionStore:
             solver.get("type") == "relative_se2_factor_graph"
             and solver.get("full_factor_graph") is True
             and solver.get("published_capable") is True
+            and solver.get("graph_quality_passed") is True
         )
         factor_graph_valid = (
             factor_graph.get("solver") == "rtabmap_g2o_slam2d"
             and factor_graph.get("full_factor_graph") is True
             and factor_graph.get("published_capable") is True
             and factor_graph.get("converged") is True
+            and factor_graph.get("solver_converged") is True
+            and factor_graph.get("graph_integrity_passed") is True
+            and factor_graph.get("graph_quality_passed") is True
+            and isinstance(factor_graph.get("quality_policy"), dict)
             and isinstance(factor_graph.get("factor_set_sha256"), str)
             and re.fullmatch(r"[0-9a-f]{64}", factor_graph["factor_set_sha256"])
             is not None
@@ -746,6 +752,17 @@ class LocalizedVersionStore:
         ):
             raise LocalizedStoreError(
                 "Native factor graph report differs from localized input identity."
+            )
+        quality_policy = factor_graph.get("quality_policy")
+        if full_solver and (
+            not isinstance(quality_policy, dict)
+            or processing.get("factor_graph_quality_policy_sha256")
+            != quality_policy.get("policy_sha256")
+            or processing.get("factor_graph_quality_policy_version")
+            != quality_policy.get("policy_version")
+        ):
+            raise LocalizedStoreError(
+                "Localized processing manifest differs from factor graph quality policy."
             )
         files = [
             {
@@ -932,7 +949,9 @@ class LocalizedVersionStore:
         *,
         actor: str,
         reason: str,
-        field_acceptance: dict[str, Any],
+        qualification_evidence_path: Path,
+        expected_field_evidence_sha256: str,
+        expected_release_identity: dict[str, str],
         expected_version: str | None = None,
     ) -> LocalizedSnapshot:
         staging = self.begin()
@@ -950,17 +969,64 @@ class LocalizedVersionStore:
             report = self.read_verified_json(
                 current, "localization_report.json"
             )
-            if not isinstance(field_acceptance, dict):
-                raise LocalizedStoreError("Field acceptance record is invalid.")
-            expected_evidence = hashlib.sha256(
+            review_evidence_sha256 = hashlib.sha256(
                 self.read_verified_artifacts(
                     current, ("localized_review.json",)
                 )["localized_review.json"]
             ).hexdigest()
-            if field_acceptance.get("evidence_sha256") != expected_evidence:
-                raise LocalizedStoreError(
-                    "Field acceptance evidence does not match localized_review.json."
+            try:
+                qualification = inspect_field_evidence(
+                    qualification_evidence_path,
+                    required_site_type="supermarket",
                 )
+            except (OSError, QualificationError) as exc:
+                raise LocalizedStoreError("Field qualification evidence is invalid.") from exc
+            if qualification["file_sha256"] != expected_field_evidence_sha256:
+                raise LocalizedStoreError(
+                    "Field qualification evidence changed after inspection."
+                )
+            source = self.read_verified_json(current, "source_manifest.json")
+            factor_graph = self.read_verified_json(current, "factor_graph_report.json")
+            quality = factor_graph.get("quality_policy") if isinstance(factor_graph, dict) else None
+            if (
+                not isinstance(source, dict)
+                or qualification["prior_map_id"] != source.get("prior_map_id")
+                or qualification["prior_map_sha256"] != source.get("prior_map_sha256")
+                or not isinstance(quality, dict)
+                or qualification["quality_policy_sha256"] != quality.get("policy_sha256")
+                or qualification["quality_policy_version"] != quality.get("policy_version")
+                or qualification["quality_policy_sha256"]
+                != expected_release_identity.get("quality_policy_sha256")
+                or qualification["release_manifest_sha256"]
+                != expected_release_identity.get("release_manifest_sha256")
+                or qualification["release_git_sha"] != expected_release_identity.get("git_sha")
+                or qualification["product_version"] != expected_release_identity.get("product_version")
+            ):
+                raise LocalizedStoreError(
+                    "Field qualification identity does not match the candidate or runtime release."
+                )
+            field_acceptance = {
+                "accepted": True,
+                "actor": actor,
+                "accepted_at_utc": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+                "candidate_version": current.version_id,
+                "candidate_revision": current.revision,
+                "review_evidence_sha256": review_evidence_sha256,
+                "field_evidence_sha256": qualification["file_sha256"],
+                "field_evidence_body_sha256": qualification["evidence_sha256"],
+                "release_manifest_sha256": qualification["release_manifest_sha256"],
+                "release_git_sha": qualification["release_git_sha"],
+                "product_version": qualification["product_version"],
+                "prior_map_id": qualification["prior_map_id"],
+                "prior_map_sha256": qualification["prior_map_sha256"],
+                "quality_policy_sha256": qualification["quality_policy_sha256"],
+                "quality_policy_version": qualification["quality_policy_version"],
+                "site_id": qualification["site_id"],
+                "site_type": qualification["site_type"],
+                "run_count": qualification["run_count"],
+                "tag_control_count": qualification["tag_control_count"],
+                "reason": reason,
+            }
             self._validate_publication_gate(report, field_acceptance)
             return self._commit_transition(
                 staging, current, "published", actor=actor, reason=reason,
@@ -1076,11 +1142,18 @@ class LocalizedVersionStore:
             and bool(field_acceptance.get("actor", "").strip())
             and isinstance(field_acceptance.get("accepted_at_utc"), str)
             and bool(field_acceptance.get("accepted_at_utc", "").strip())
-            and isinstance(field_acceptance.get("evidence_sha256"), str)
+            and isinstance(field_acceptance.get("field_evidence_sha256"), str)
             and re.fullmatch(
-                r"[0-9a-f]{64}", field_acceptance.get("evidence_sha256", "")
+                r"[0-9a-f]{64}", field_acceptance.get("field_evidence_sha256", "")
             )
             is not None
+            and isinstance(field_acceptance.get("review_evidence_sha256"), str)
+            and re.fullmatch(
+                r"[0-9a-f]{64}", field_acceptance.get("review_evidence_sha256", "")
+            ) is not None
+            and field_acceptance.get("site_type") == "supermarket"
+            and isinstance(field_acceptance.get("run_count"), int)
+            and field_acceptance.get("run_count", 0) >= 3
         )
         if valid_acceptance:
             try:
@@ -1121,7 +1194,7 @@ class LocalizedVersionStore:
         acceptance = report.get("field_acceptance") if isinstance(report, dict) else None
         if not isinstance(report, dict) or not isinstance(acceptance, dict):
             raise LocalizedStoreError("Published output has no field acceptance record.")
-        if acceptance.get("evidence_sha256") != hashlib.sha256(
+        if acceptance.get("review_evidence_sha256") != hashlib.sha256(
             artifacts["localized_review.json"]
         ).hexdigest():
             raise LocalizedStoreError(

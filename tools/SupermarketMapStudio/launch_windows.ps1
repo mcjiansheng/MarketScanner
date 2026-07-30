@@ -13,10 +13,10 @@ if ($null -ne $Python) {
 }
 
 $Server = Join-Path $LaunchDir "tools\SupermarketMapStudio\server.py"
-& $PythonExe @PythonArgs $Server --selfcheck
+& $PythonExe @PythonArgs $Server --selfcheck --mode production
 if ($LASTEXITCODE -ne 0) {
     Write-Error "Supermarket Map Studio startup self-check failed. Keep this output for support."
     exit $LASTEXITCODE
 }
-& $PythonExe @PythonArgs $Server @args
+& $PythonExe @PythonArgs $Server --mode production @args
 exit $LASTEXITCODE

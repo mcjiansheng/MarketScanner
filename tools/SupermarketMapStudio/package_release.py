@@ -67,7 +67,7 @@ def validate_release_manifest(
     if (
         not isinstance(value, dict)
         or value.get("format") != "MarketScannerReleaseManifest"
-        or value.get("version") != 1
+        or value.get("version") != 2
         or value.get("platform") != platform_name
         or not GIT_SHA_RE.fullmatch(str(value.get("git_sha", "")))
     ):
@@ -82,6 +82,12 @@ def validate_release_manifest(
     ).encode("utf-8")
     if hashlib.sha256(encoded).hexdigest() != expected_body_sha:
         raise PackagingError("release manifest body digest is invalid")
+    quality_path = ROOT / "tools/PriorMap/factor_graph_quality_policy.json"
+    if (
+        not quality_path.is_file()
+        or value.get("factor_graph_quality_policy_sha256") != sha256(quality_path)
+    ):
+        raise PackagingError("release manifest quality policy binding is invalid")
     artifacts = value.get("artifacts")
     if not isinstance(artifacts, list):
         raise PackagingError("release manifest artifact list is invalid")
@@ -189,6 +195,7 @@ def create_package(
         (launcher, launcher_name),
         (release_manifest, "release-manifest.json"),
         (ROOT / "tools/SupermarketMapStudio/release_dependencies.json", "release-dependencies.json"),
+        (ROOT / "tools/PriorMap/factor_graph_quality_policy.json", "factor-graph-quality-policy.json"),
         (binaries[0], f"bin/{binaries[0].name}"),
         (binaries[1], f"bin/{binaries[1].name}"),
     ])

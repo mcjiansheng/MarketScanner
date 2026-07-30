@@ -29,8 +29,8 @@ class DocumentGovernanceTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertIn("cf1b62c949f3574e1804808537e38c8ff643549c", current)
         self.assertIn(
-            "MarketScanner_RepairV2_W2R_Production_Readiness_Code_Review_and_"
-            "Final_Product_Agent_Spec_2026-07-28.md",
+            "MarketScanner_RepairV2_P7_Independent_Production_Code_Review_and_"
+            "AI_Execution_Spec_2026-07-30.md",
             current,
         )
         wave = json.loads(
