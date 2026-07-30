@@ -59,6 +59,7 @@ from PriorMap.localized_output_store import (
     LocalizedSnapshot,
     LocalizedStoreError,
     LocalizedVersionStore,
+    PUBLISHED_VERSION_FILES,
     REQUIRED_VERSION_FILES,
 )
 from Qualification.qualification import QualificationError, inspect_field_evidence
@@ -110,6 +111,8 @@ ARTIFACTS = (
     "localized_price_tags.geojson",
     "shelf_tag_index.json",
     "audit_log.jsonl",
+    "field_evidence.json",
+    "qualification_manifest.json",
 )
 JOB_RUNTIME_TOOL_VERSION = "MarketScannerMapStudioJobRuntime/1"
 MAP_STUDIO_VERSION = "MarketScannerMapStudio/2"
@@ -827,7 +830,7 @@ def job_artifacts(
                         f"/api/jobs/{job.identifier}/localized/versions/"
                         f"{snapshot.version_id}/artifact/{name}"
                     )
-                    for name in REQUIRED_VERSION_FILES
+                    for name in PUBLISHED_VERSION_FILES
                     if (snapshot.version_dir / name).is_file()
                 }
             )
@@ -2616,7 +2619,7 @@ def apply_localized_edit(job: Job, data: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def apply_localized_state_transition(
-    job: Job, data: Dict[str, Any]
+    job: Job, data: Dict[str, Any], *, runtime_mode: str = "development"
 ) -> Dict[str, Any]:
     if job.kind != "localized" or job.status != "complete":
         raise RequestError("发布状态操作只适用于已完成的本地化任务。")
@@ -2631,6 +2634,10 @@ def apply_localized_state_transition(
         }
         if action not in targets:
             raise RequestError("不支持的本地化状态操作。")
+        if action == "publish" and runtime_mode != "production":
+            raise RequestForbidden(
+                "Development runtime is not permitted to publish localized versions."
+            )
         source_snapshot = store.published() if action == "revoke" else store.current()
         if source_snapshot is None:
             missing = "published" if action == "revoke" else "current"
@@ -2705,6 +2712,20 @@ def apply_localized_state_transition(
                 )
         try:
             if action == "publish":
+                production_diagnostics = startup_diagnostics("production")
+                if (
+                    production_diagnostics.get("production_qualified") is not True
+                    or production_diagnostics.get("can_start") is not True
+                ):
+                    raise QualityGateError(
+                        "Production selfcheck failed immediately before publication.",
+                        [
+                            {
+                                "code": "production_selfcheck_failed",
+                                "checks": production_diagnostics.get("checks", []),
+                            }
+                        ],
+                    )
                 snapshot = store.publish_current(
                     actor="local-user",
                     reason=reason.strip(),
@@ -3087,16 +3108,17 @@ class StudioHandler(BaseHTTPRequestHandler):
                 self.send_json(exc.status, exc.details())
                 return
         if path == "/api/about":
+            runtime_mode = getattr(self.server, "runtime_mode", "development")
             self.send_json(
                 HTTPStatus.OK,
                 {
                     "product": "Supermarket Map Studio",
                     "version": MAP_STUDIO_VERSION,
-                    "runtime_mode": getattr(self.server, "runtime_mode", "development"),
+                    "runtime_mode": runtime_mode,
                     "git_sha": SOURCE_GIT_SHA,
                     "python": sys.version.split()[0],
                     "platform": platform.platform(),
-                    "startup_diagnostics": startup_diagnostics(),
+                    "startup_diagnostics": startup_diagnostics(runtime_mode),
                 },
             )
             return
@@ -3270,7 +3292,13 @@ class StudioHandler(BaseHTTPRequestHandler):
                     raise RequestError("Completed localized job not found.")
                 self.send_json(
                     HTTPStatus.OK,
-                    apply_localized_state_transition(job, data),
+                    apply_localized_state_transition(
+                        job,
+                        data,
+                        runtime_mode=getattr(
+                            self.server, "runtime_mode", "development"
+                        ),
+                    ),
                 )
                 return
             if path.startswith("/api/jobs/") and path.endswith("/open"):
@@ -3333,7 +3361,7 @@ class StudioHandler(BaseHTTPRequestHandler):
     def serve_localized_artifact(
         self, job: Job, version_id: str, name: str
     ) -> None:
-        if job.kind != "localized" or name not in REQUIRED_VERSION_FILES:
+        if job.kind != "localized" or name not in PUBLISHED_VERSION_FILES:
             self.send_json(HTTPStatus.NOT_FOUND, {"error": "Artifact is not available."})
             return
         try:
@@ -3515,18 +3543,61 @@ def _stable_json_file(path: Path, maximum_bytes: int = 16 * 1024 * 1024) -> tupl
         or before.st_size > maximum_bytes
     ):
         raise ValueError(f"JSON file is unsafe or oversized: {path.name}")
-    with path.open("rb") as stream:
-        data = stream.read(maximum_bytes + 1)
-        opened = os.fstat(stream.fileno())
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    try:
+        opened = os.fstat(descriptor)
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            chunk = os.read(
+                descriptor, min(1024 * 1024, maximum_bytes + 1 - total)
+            )
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+            if total > maximum_bytes:
+                raise ValueError(f"JSON file is oversized: {path.name}")
+    finally:
+        os.close(descriptor)
+    data = b"".join(chunks)
     after = path.lstat()
-    identity = (before.st_dev, before.st_ino, before.st_size)
+    identity = (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_nlink,
+        before.st_mtime_ns,
+        before.st_ctime_ns,
+    )
     if (
         len(data) > maximum_bytes
-        or identity != (opened.st_dev, opened.st_ino, opened.st_size)
-        or identity != (after.st_dev, after.st_ino, after.st_size)
+        or len(data) != before.st_size
+        or identity
+        != (
+            opened.st_dev,
+            opened.st_ino,
+            opened.st_size,
+            opened.st_nlink,
+            opened.st_mtime_ns,
+            opened.st_ctime_ns,
+        )
+        or identity
+        != (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_nlink,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        )
     ):
         raise ValueError(f"JSON file changed during read: {path.name}")
-    value = json.loads(data, parse_constant=lambda token: (_ for _ in ()).throw(ValueError(token)))
+    value = json.loads(
+        data.decode("utf-8", errors="strict"),
+        parse_constant=lambda token: (_ for _ in ()).throw(ValueError(token)),
+    )
     if not isinstance(value, dict):
         raise ValueError(f"JSON file is not an object: {path.name}")
     return value, hashlib.sha256(data).hexdigest(), len(data)
@@ -3544,9 +3615,9 @@ def operator_package_diagnostic(
             "detail": "source checkout (DEVELOPMENT / NOT QUALIFIED FOR PRODUCTION)",
         }
     try:
-        if manifest_path.is_symlink() or manifest_path.stat().st_size > 16 * 1024 * 1024:
-            raise ValueError("manifest is linked or oversized")
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest, _manifest_digest, _manifest_size = _stable_json_file(
+            manifest_path
+        )
         files = manifest.get("files")
         if (
             manifest.get("format") != "MarketScannerMapStudioOperatorPackage"
@@ -3584,13 +3655,16 @@ def operator_package_diagnostic(
             if size != item.get("bytes") or digest != item.get("sha256"):
                 raise ValueError(f"file digest differs: {relative}")
         release_manifest = package_root / "release-manifest.json"
-        release_digest, _ = _stable_file_digest(release_manifest)
+        release, release_digest, _release_size = _stable_json_file(
+            release_manifest
+        )
         if release_digest != manifest.get("releaseManifestSha256"):
             raise ValueError("release manifest digest differs")
-        release = json.loads(release_manifest.read_text(encoding="utf-8"))
         quality_path = package_root / "factor-graph-quality-policy.json"
-        quality_digest, _ = _stable_file_digest(quality_path)
-        quality = json.loads(quality_path.read_text(encoding="utf-8"))
+        quality, quality_digest, _quality_size = _stable_json_file(
+            quality_path,
+            maximum_bytes=1024 * 1024,
+        )
         if (
             release.get("format") != "MarketScannerReleaseManifest"
             or release.get("version") != 2

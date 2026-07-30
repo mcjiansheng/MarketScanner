@@ -637,6 +637,8 @@ class MapStudioApiTests(unittest.TestCase):
             self.assertEqual(response.headers["Referrer-Policy"], "no-referrer")
         self.assertEqual(payload["product"], "Supermarket Map Studio")
         self.assertEqual(payload["version"], server.MAP_STUDIO_VERSION)
+        self.assertEqual(payload["runtime_mode"], "development")
+        self.assertEqual(payload["startup_diagnostics"]["mode"], "development")
         self.assertNotIn("session_token", json.dumps(payload))
 
     def test_sensitive_get_requires_auth_and_bootstrap_sets_http_only_cookie(self) -> None:
@@ -998,13 +1000,181 @@ class MapStudioApiTests(unittest.TestCase):
                     "expected_revision": review["revision"],
                 },
             )
-        self.assertEqual(blocked.exception.code, 422)
-        self.assertEqual(blocked.exception.payload["code"], "quality_gate_blocked")
-        self.assertIn(
-            "solver_not_full_relative_se2_factor_graph",
-            {item["code"] for item in blocked.exception.payload["blockers"]},
+        self.assertEqual(blocked.exception.code, 403)
+        self.assertEqual(blocked.exception.payload["code"], "request_forbidden")
+        self.assertIsNone(server.LocalizedVersionStore(output).published())
+
+    def test_production_publish_rechecks_selfcheck_and_preserves_pointers_on_failure(self) -> None:
+        output = self.root / "localized-production-selfcheck"
+        review = create_localized_store(
+            output,
+            report={
+                "publish_state": "review",
+                "review_gate": {"passed": True, "blockers": []},
+                "publish_gate": {"passed": True, "blockers": []},
+                "solver": {
+                    "type": "relative_se2_factor_graph",
+                    "full_factor_graph": True,
+                    "published_capable": True,
+                },
+            },
+        )
+        job = server.STATE.add("localized", output)
+        server.STATE.set_status(job.identifier, "complete")
+        evidence = self.root / "field-evidence.json"
+        evidence.write_text("{}\n", encoding="utf-8")
+        before_current = server.LocalizedVersionStore(output).current()
+        original_mode = self.httpd.runtime_mode
+        self.httpd.runtime_mode = "production"
+        try:
+            with mock.patch.object(
+                server,
+                "startup_diagnostics",
+                return_value={
+                    "mode": "production",
+                    "production_qualified": False,
+                    "can_start": False,
+                    "checks": [{"name": "injected", "ok": False}],
+                },
+            ) as diagnostics:
+                with self.assertRaises(HTTPError) as blocked:
+                    self.api(
+                        f"/api/jobs/{job.identifier}/localized/state",
+                        {
+                            "action": "publish",
+                            "reason": "must fail selfcheck",
+                            "expected_version_id": review.version_id,
+                            "expected_revision": review.revision,
+                            "operator_confirmed": True,
+                            "qualification_evidence_path": str(evidence),
+                            "qualification_evidence_sha256": "f" * 64,
+                        },
+                    )
+            self.assertEqual(blocked.exception.code, 422)
+            self.assertEqual(
+                blocked.exception.payload["blockers"][0]["code"],
+                "production_selfcheck_failed",
+            )
+            diagnostics.assert_called_once_with("production")
+        finally:
+            self.httpd.runtime_mode = original_mode
+        store = server.LocalizedVersionStore(output)
+        self.assertEqual(store.current(), before_current)
+        self.assertIsNone(store.published())
+
+    def test_production_publish_passes_only_after_fresh_selfcheck(self) -> None:
+        output = self.root / "localized-production-pass"
+        review = create_localized_store(
+            output,
+            report={
+                "publish_state": "review",
+                "review_gate": {"passed": True, "blockers": []},
+                "publish_gate": {"passed": True, "blockers": []},
+                "solver": {
+                    "type": "relative_se2_factor_graph",
+                    "full_factor_graph": True,
+                    "published_capable": True,
+                },
+            },
+        )
+        job = server.STATE.add("localized", output)
+        server.STATE.set_status(job.identifier, "complete")
+        evidence = self.root / "field-evidence.json"
+        evidence.write_text("{}\n", encoding="utf-8")
+        with self.assertRaises(HTTPError) as development_blocked:
+            self.api(
+                f"/api/jobs/{job.identifier}/localized/state",
+                {
+                    "action": "publish",
+                    "reason": "development must never publish",
+                    "expected_version_id": review.version_id,
+                    "expected_revision": review.revision,
+                    "operator_confirmed": True,
+                    "qualification_evidence_path": str(evidence),
+                    "qualification_evidence_sha256": "f" * 64,
+                },
+            )
+        self.assertEqual(development_blocked.exception.code, 403)
+        self.assertEqual(
+            server.LocalizedVersionStore(output).current(), review
         )
         self.assertIsNone(server.LocalizedVersionStore(output).published())
+        published = SimpleNamespace(
+            version_id="v999999",
+            revision=review.revision,
+            state="published",
+        )
+        original_mode = self.httpd.runtime_mode
+        self.httpd.runtime_mode = "production"
+        try:
+            with (
+                mock.patch.object(
+                    server,
+                    "startup_diagnostics",
+                    return_value={
+                        "mode": "production",
+                        "production_qualified": True,
+                        "can_start": True,
+                        "checks": [],
+                    },
+                ) as diagnostics,
+                mock.patch.object(
+                    server.LocalizedVersionStore,
+                    "publish_current",
+                    return_value=published,
+                ) as publish_current,
+                mock.patch.object(
+                    server,
+                    "runtime_release_identity",
+                    return_value={
+                        "release_manifest_sha256": "a" * 64,
+                        "git_sha": "b" * 40,
+                        "product_version": "test",
+                        "quality_policy_sha256": "c" * 64,
+                    },
+                ),
+            ):
+                result = self.api(
+                    f"/api/jobs/{job.identifier}/localized/state",
+                    {
+                        "action": "publish",
+                        "reason": "qualified publication",
+                        "expected_version_id": review.version_id,
+                        "expected_revision": review.revision,
+                        "operator_confirmed": True,
+                        "qualification_evidence_path": str(evidence),
+                        "qualification_evidence_sha256": "f" * 64,
+                    },
+                )
+            self.assertEqual(result["publish_state"], "published")
+            diagnostics.assert_called_once_with("production")
+            publish_current.assert_called_once()
+        finally:
+            self.httpd.runtime_mode = original_mode
+
+    def test_about_uses_server_runtime_mode_for_diagnostics(self) -> None:
+        original_mode = self.httpd.runtime_mode
+        self.httpd.runtime_mode = "production"
+        try:
+            with mock.patch.object(
+                server,
+                "startup_diagnostics",
+                side_effect=lambda mode: {
+                    "mode": mode,
+                    "production_qualified": mode == "production",
+                    "can_start": True,
+                    "checks": [],
+                },
+            ) as diagnostics:
+                payload = self.api("/api/about")
+            self.assertEqual(payload["runtime_mode"], "production")
+            self.assertEqual(payload["startup_diagnostics"]["mode"], "production")
+            self.assertTrue(
+                payload["startup_diagnostics"]["production_qualified"]
+            )
+            diagnostics.assert_called_once_with("production")
+        finally:
+            self.httpd.runtime_mode = original_mode
 
     def test_prior_map_api_converts_validates_and_serves_preview(self) -> None:
         workbook = self.root / "prior-map.xlsx"

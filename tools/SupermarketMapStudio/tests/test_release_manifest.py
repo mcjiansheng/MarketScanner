@@ -18,10 +18,40 @@ from tools.SupermarketMapStudio.package_release import (
 )
 STUDIO_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(STUDIO_DIR))
+import tools.SupermarketMapStudio.server as server_module  # noqa: E402
 from tools.SupermarketMapStudio.server import operator_package_diagnostic  # noqa: E402
 
 
 class ReleaseManifestTests(unittest.TestCase):
+    def test_package_json_stable_read_rejects_symlink_and_same_size_swap(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            path = root / "release-manifest.json"
+            path.write_text('{"value":"aaaa"}', encoding="utf-8")
+            link = root / "release-link.json"
+            link.symlink_to(path)
+            with self.assertRaisesRegex(ValueError, "unsafe or oversized"):
+                server_module._stable_json_file(link)
+
+            replacement = root / "replacement.json"
+            replacement.write_text('{"value":"bbbb"}', encoding="utf-8")
+            self.assertEqual(path.stat().st_size, replacement.stat().st_size)
+            real_read = server_module.os.read
+            replaced = False
+
+            def replace_after_open(descriptor: int, count: int) -> bytes:
+                nonlocal replaced
+                if not replaced:
+                    replaced = True
+                    replacement.replace(path)
+                return real_read(descriptor, count)
+
+            with mock.patch.object(
+                server_module.os, "read", side_effect=replace_after_open
+            ):
+                with self.assertRaisesRegex(ValueError, "changed during read"):
+                    server_module._stable_json_file(path)
+
     def test_windows_native_ci_pins_dependency_archive_and_builds_release_tools(self) -> None:
         repository = Path(__file__).resolve().parents[3]
         dependency_action = (repository / ".github/actions/install-windows-deps/action.yml").read_text(
