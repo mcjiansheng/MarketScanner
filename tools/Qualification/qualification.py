@@ -162,6 +162,15 @@ def _read_stable_bytes(
 def _load_json_with_identity(
     path: Path, maximum_bytes: int = 16 * 1024 * 1024
 ) -> tuple[Any, str, int]:
+    value, digest, size, _data = _load_json_with_identity_bytes(
+        path, maximum_bytes
+    )
+    return value, digest, size
+
+
+def _load_json_with_identity_bytes(
+    path: Path, maximum_bytes: int = 16 * 1024 * 1024
+) -> tuple[Any, str, int, bytes]:
     data, digest, size, _ = _read_stable_bytes(
         path, maximum_bytes=maximum_bytes, label="json"
     )
@@ -173,6 +182,7 @@ def _load_json_with_identity(
             ),
             digest,
             size,
+            data,
         )
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise QualificationError(f"invalid_json:{path.name}") from exc
@@ -278,8 +288,15 @@ def _validated_canonical_evidence_data(
     return value
 
 
-def _validate_release_manifest(path: Path) -> tuple[dict[str, Any], str, int]:
-    value, digest, size = _load_json_with_identity(path)
+def _validate_release_manifest(
+    path: Path,
+) -> tuple[dict[str, Any], str, int, bytes]:
+    value, digest, size, data = _load_json_with_identity_bytes(path)
+    _validate_release_manifest_value(value)
+    return value, digest, size, data
+
+
+def _validate_release_manifest_value(value: Any) -> None:
     if not isinstance(value, dict):
         raise QualificationError("release_manifest_not_object")
     body = dict(value)
@@ -293,11 +310,19 @@ def _validate_release_manifest(path: Path) -> tuple[dict[str, Any], str, int]:
         or _canonical_sha(body) != declared
     ):
         raise QualificationError("release_manifest_contract_invalid")
-    return value, digest, size
 
 
-def _validate_quality_policy(path: Path) -> tuple[dict[str, Any], str, int]:
-    value, digest, size = _load_json_with_identity(path, maximum_bytes=1024 * 1024)
+def _validate_quality_policy(
+    path: Path,
+) -> tuple[dict[str, Any], str, int, bytes]:
+    value, digest, size, data = _load_json_with_identity_bytes(
+        path, maximum_bytes=1024 * 1024
+    )
+    _validate_quality_policy_value(value)
+    return value, digest, size, data
+
+
+def _validate_quality_policy_value(value: Any) -> None:
     if (
         not isinstance(value, dict)
         or value.get("format") != FORMAT_QUALITY_POLICY
@@ -307,7 +332,6 @@ def _validate_quality_policy(path: Path) -> tuple[dict[str, Any], str, int]:
         or not value["policy_version"].strip()
     ):
         raise QualificationError("quality_policy_not_frozen_or_invalid")
-    return value, digest, size
 
 
 def _required_string(value: Any, label: str) -> str:
@@ -1130,7 +1154,9 @@ def build_trajectory_qualification_evidence(
     release_manifest: Path,
     output_path: Path,
 ) -> dict[str, Any]:
-    release, release_sha, _release_size = _validate_release_manifest(release_manifest)
+    release, release_sha, _release_size, _release_data = (
+        _validate_release_manifest(release_manifest)
+    )
     evidence = _trajectory_evidence_from_version(
         localized_output,
         version_id,
@@ -1229,6 +1255,83 @@ def _field_run_input_bundle(
     }
 
 
+def _qualification_source_bundle(
+    *,
+    plan_name: str,
+    plan_data: bytes,
+    release_name: str,
+    release_data: bytes,
+    policy_name: str,
+    policy_data: bytes,
+) -> dict[str, Any]:
+    def entry(name: str, data: bytes) -> dict[str, Any]:
+        return {
+            "name": name,
+            "bytes": len(data),
+            "sha256": hashlib.sha256(data).hexdigest(),
+            "contentBase64": base64.b64encode(data).decode("ascii"),
+        }
+
+    return {
+        "format": "MarketScannerQualificationSourceBundle",
+        "version": 1,
+        "fieldPlan": entry(plan_name, plan_data),
+        "releaseManifest": entry(release_name, release_data),
+        "qualityPolicy": entry(policy_name, policy_data),
+    }
+
+
+def _qualification_source_bytes(
+    bundle: Any,
+) -> tuple[bytes, bytes, bytes]:
+    if (
+        not isinstance(bundle, dict)
+        or bundle.get("format") != "MarketScannerQualificationSourceBundle"
+        or bundle.get("version") != 1
+        or set(bundle)
+        != {
+            "format",
+            "version",
+            "fieldPlan",
+            "releaseManifest",
+            "qualityPolicy",
+        }
+    ):
+        raise QualificationError("qualification_source_bundle_invalid")
+    values: list[bytes] = []
+    for key, maximum in (
+        ("fieldPlan", 16 * 1024 * 1024),
+        ("releaseManifest", 16 * 1024 * 1024),
+        ("qualityPolicy", 1024 * 1024),
+    ):
+        entry = bundle.get(key)
+        if (
+            not isinstance(entry, dict)
+            or set(entry) != {"name", "bytes", "sha256", "contentBase64"}
+            or not isinstance(entry.get("name"), str)
+            or not entry["name"]
+            or Path(entry["name"]).name != entry["name"]
+            or isinstance(entry.get("bytes"), bool)
+            or not isinstance(entry.get("bytes"), int)
+            or entry["bytes"] < 0
+            or entry["bytes"] > maximum
+            or not SHA_RE.fullmatch(str(entry.get("sha256", "")))
+            or not isinstance(entry.get("contentBase64"), str)
+        ):
+            raise QualificationError("qualification_source_entry_invalid")
+        try:
+            data = base64.b64decode(entry["contentBase64"], validate=True)
+        except (ValueError, TypeError) as exc:
+            raise QualificationError("qualification_source_base64_invalid") from exc
+        if (
+            len(data) != entry["bytes"]
+            or hashlib.sha256(data).hexdigest() != entry["sha256"]
+        ):
+            raise QualificationError("qualification_source_identity_invalid")
+        values.append(data)
+    return values[0], values[1], values[2]
+
+
 def _field_run_input_bytes(
     bundle: Any,
 ) -> tuple[bytes, bytes, list[dict[str, Any]]]:
@@ -1283,7 +1386,9 @@ def _field_run_input_bytes(
 
 
 def evaluate_field(plan_path: Path, output_path: Path) -> dict[str, Any]:
-    plan, plan_sha, _plan_size = _load_json_with_identity(plan_path)
+    plan, plan_sha, _plan_size, plan_data = _load_json_with_identity_bytes(
+        plan_path
+    )
     if not isinstance(plan, dict) or plan.get("format") != FORMAT_FIELD_PLAN or plan.get("version") != 3:
         raise QualificationError("field_plan_contract_invalid")
     if plan.get("executionStatus") != "executed_with_independent_ground_truth":
@@ -1294,13 +1399,15 @@ def evaluate_field(plan_path: Path, output_path: Path) -> dict[str, Any]:
         raise QualificationError("field_thresholds_or_three_runs_missing")
     frozen_at = _finite_number(plan.get("thresholdsFrozenAtUnix"), "thresholds_frozen_at")
     release_manifest = Path(_required_string(plan.get("releaseManifest"), "release_manifest"))
-    release, release_sha, release_size = _validate_release_manifest(release_manifest)
+    release, release_sha, release_size, release_data = (
+        _validate_release_manifest(release_manifest)
+    )
     if release_sha != plan.get("releaseManifestSha256"):
         raise QualificationError("release_manifest_sha_mismatch")
     quality_policy_path = Path(
         _required_string(plan.get("qualityPolicy"), "quality_policy")
     )
-    quality_policy, policy_sha, policy_size = _validate_quality_policy(
+    quality_policy, policy_sha, policy_size, quality_policy_data = _validate_quality_policy(
         quality_policy_path
     )
     if policy_sha != plan.get("qualityPolicySha256"):
@@ -1520,6 +1627,14 @@ def evaluate_field(plan_path: Path, output_path: Path) -> dict[str, Any]:
         "format": FORMAT_FIELD_EVIDENCE,
         "version": 3,
         "sourcePlanSha256": plan_sha,
+        "qualificationSourceBundle": _qualification_source_bundle(
+            plan_name=plan_path.name,
+            plan_data=plan_data,
+            release_name=release_manifest.name,
+            release_data=release_data,
+            policy_name=quality_policy_path.name,
+            policy_data=quality_policy_data,
+        ),
         "releaseManifest": {
             "name": release_manifest.name,
             "bytes": release_size,
@@ -1579,6 +1694,41 @@ def inspect_field_evidence_with_bytes(
         expected_version=3,
         maximum_bytes=128 * 1024 * 1024,
     )
+    try:
+        plan_data, release_data, policy_data = _qualification_source_bytes(
+            evidence.get("qualificationSourceBundle")
+        )
+        plan = json.loads(
+            plan_data.decode("utf-8", errors="strict"),
+            parse_constant=lambda token: (_ for _ in ()).throw(ValueError(token)),
+        )
+        source_release = json.loads(
+            release_data.decode("utf-8", errors="strict"),
+            parse_constant=lambda token: (_ for _ in ()).throw(ValueError(token)),
+        )
+        source_policy = json.loads(
+            policy_data.decode("utf-8", errors="strict"),
+            parse_constant=lambda token: (_ for _ in ()).throw(ValueError(token)),
+        )
+        _validate_release_manifest_value(source_release)
+        _validate_quality_policy_value(source_policy)
+    except (
+        QualificationError,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        ValueError,
+    ) as exc:
+        raise QualificationError("qualification_source_rederivation_failed") from exc
+    if (
+        not isinstance(plan, dict)
+        or plan.get("format") != FORMAT_FIELD_PLAN
+        or plan.get("version") != 3
+        or plan.get("executionStatus")
+        != "executed_with_independent_ground_truth"
+        or evidence.get("sourcePlanSha256")
+        != hashlib.sha256(plan_data).hexdigest()
+    ):
+        raise QualificationError("qualification_source_plan_invalid")
     if evidence.get("result") != "PASS" or evidence.get("blockers") != []:
         raise QualificationError("field_evidence_not_pass")
     if evidence.get("siteType") != required_site_type:
@@ -1610,9 +1760,59 @@ def inspect_field_evidence_with_bytes(
         or not SHA_RE.fullmatch(str(prior.get("priorMapSha256", "")))
     ):
         raise QualificationError("field_publication_identity_invalid")
+    source_bundle = evidence["qualificationSourceBundle"]
+    plan_entry = source_bundle["fieldPlan"]
+    release_entry = source_bundle["releaseManifest"]
+    policy_entry = source_bundle["qualityPolicy"]
+    if (
+        release.get("name") != release_entry["name"]
+        or release.get("bytes") != release_entry["bytes"]
+        or release.get("sha256") != release_entry["sha256"]
+        or release.get("gitSha") != source_release.get("git_sha")
+        or release.get("productVersion")
+        != source_release.get("product_version")
+        or release.get("manifestBodySha256")
+        != source_release.get("manifest_body_sha256")
+        or policy.get("name") != policy_entry["name"]
+        or policy.get("bytes") != policy_entry["bytes"]
+        or policy.get("sha256") != policy_entry["sha256"]
+        or policy.get("policyVersion") != source_policy.get("policy_version")
+        or policy.get("status") != source_policy.get("status")
+        or plan.get("releaseManifestSha256") != release_entry["sha256"]
+        or plan.get("qualityPolicySha256") != policy_entry["sha256"]
+        or source_release.get("factor_graph_quality_policy_sha256")
+        != policy_entry["sha256"]
+        or plan.get("thresholds") != thresholds
+        or plan.get("thresholdsFrozenAtUnix")
+        != evidence.get("thresholdsFrozenAtUnix")
+        or plan.get("siteId") != evidence.get("siteId")
+        or plan.get("siteType") != evidence.get("siteType")
+        or plan.get("groundTruthMethod") != evidence.get("groundTruthMethod")
+        or plan.get("independentSurveyor")
+        != evidence.get("independentSurveyor")
+        or plan.get("priorMapId") != prior.get("priorMapId")
+        or plan.get("priorMapSha256") != prior.get("priorMapSha256")
+        or plan_entry["bytes"] != len(plan_data)
+        or plan_entry["sha256"] != hashlib.sha256(plan_data).hexdigest()
+    ):
+        raise QualificationError("qualification_sources_differ_from_field_evidence")
     runs = evidence.get("runs")
-    if not isinstance(runs, list) or len(runs) < 3:
+    plan_runs = plan.get("runs")
+    if (
+        not isinstance(runs, list)
+        or len(runs) < 3
+        or not isinstance(plan_runs, list)
+        or len(plan_runs) != len(runs)
+    ):
         raise QualificationError("field_evidence_three_runs_missing")
+    plan_runs_by_id = {
+        candidate.get("runId"): candidate
+        for candidate in plan_runs
+        if isinstance(candidate, dict)
+        and isinstance(candidate.get("runId"), str)
+    }
+    if len(plan_runs_by_id) != len(plan_runs):
+        raise QualificationError("qualification_source_runs_invalid")
     run_ids: set[str] = set()
     session_identities: set[tuple[str, str]] = set()
     topology_digests: set[str] = set()
@@ -1629,6 +1829,12 @@ def inspect_field_evidence_with_bytes(
         if run_id in run_ids:
             raise QualificationError("duplicate_run_id")
         run_ids.add(run_id)
+        plan_run = plan_runs_by_id.get(run_id)
+        if (
+            not isinstance(plan_run, dict)
+            or plan_run.get("executedAtUnix") != run.get("executedAtUnix")
+        ):
+            raise QualificationError("field_run_differs_from_source_plan")
         identity = run.get("sourceSessionIdentity")
         if not isinstance(identity, dict):
             raise QualificationError("source_session_identity_invalid")
@@ -1732,6 +1938,13 @@ def inspect_field_evidence_with_bytes(
             )
         ):
             raise QualificationError("trajectory_evidence_contract_invalid")
+        if (
+            plan_run.get("localizedVersionId")
+            != trajectory.get("localized_version_id")
+            or plan_run.get("localizedVersionManifestSha256")
+            != trajectory.get("localized_version_manifest_sha256")
+        ):
+            raise QualificationError("trajectory_differs_from_source_plan")
         for name in (
             "localized_version_manifest_sha256",
             "input_identity_id",

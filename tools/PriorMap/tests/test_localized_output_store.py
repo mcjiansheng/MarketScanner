@@ -41,6 +41,19 @@ def _canonical_sha(value: object) -> str:
     ).hexdigest()
 
 
+TEST_QUALITY_POLICY: dict[str, object] = {
+    "format": "MarketScannerFactorGraphQualityPolicy",
+    "version": 1,
+    "status": "frozen",
+    "policy_version": "test-frozen-1",
+    "limits": {},
+}
+TEST_QUALITY_POLICY_DATA = json.dumps(
+    TEST_QUALITY_POLICY, sort_keys=True
+).encode("utf-8")
+TEST_QUALITY_POLICY_SHA = hashlib.sha256(TEST_QUALITY_POLICY_DATA).hexdigest()
+
+
 def _synthetic_trajectory_package(
     index: int,
     *,
@@ -181,12 +194,31 @@ def _synthetic_trajectory_package(
 def write_valid_field_evidence(
     path: Path,
     *,
-    release_manifest_sha256: str,
     release_git_sha: str,
     product_version: str,
     prior_map_sha256: str,
-    quality_policy_sha256: str,
 ) -> tuple[str, dict[str, object]]:
+    release_value: dict[str, object] = {
+        "format": "MarketScannerReleaseManifest",
+        "version": 2,
+        "git_sha": release_git_sha,
+        "product_version": product_version,
+        "factor_graph_quality_policy_sha256": TEST_QUALITY_POLICY_SHA,
+    }
+    release_value["manifest_body_sha256"] = _canonical_sha(release_value)
+    release_data = json.dumps(release_value, sort_keys=True).encode("utf-8")
+    release_manifest_sha256 = hashlib.sha256(release_data).hexdigest()
+    thresholds = {
+        "nodeCoverageMin": 0.98,
+        "correctionP95MaxM": 1.0,
+        "correctionMaxM": 2.0,
+        "relativeTranslationResidualP95MaxM": 0.2,
+        "relativeYawResidualP95MaxRad": 0.1,
+        "weakLostDurationRatioMax": 0.1,
+        "tagPlanarP95MaxM": 0.2,
+        "tagPlanarMaxM": 0.3,
+        "tagHeightP95MaxM": 0.1,
+    }
     runs: list[dict[str, object]] = []
     for index in range(3):
         trajectory, trajectory_source_bundle = _synthetic_trajectory_package(
@@ -195,7 +227,7 @@ def write_valid_field_evidence(
             release_git_sha=release_git_sha,
             product_version=product_version,
             prior_map_sha256=prior_map_sha256,
-            quality_policy_sha256=quality_policy_sha256,
+            quality_policy_sha256=TEST_QUALITY_POLICY_SHA,
         )
         tag_stream = io.StringIO(newline="")
         tag_writer = csv.writer(tag_stream)
@@ -292,22 +324,66 @@ def write_valid_field_evidence(
                 "result": "PASS",
             }
         )
+    plan_runs = [
+        {
+            "runId": run["runId"],
+            "executedAtUnix": run["executedAtUnix"],
+            "localizedOutput": f"localized-{index}",
+            "localizedVersionId": run["trajectoryEvidence"][
+                "localized_version_id"
+            ],
+            "localizedVersionManifestSha256": run["trajectoryEvidence"][
+                "localized_version_manifest_sha256"
+            ],
+            "tagMeasurements": f"tags-{index}.csv",
+            "deviceEvidence": f"device-{index}.json",
+        }
+        for index, run in enumerate(runs)
+    ]
+    plan: dict[str, object] = {
+        "format": "MarketScannerFieldQualificationPlan",
+        "version": 3,
+        "executionStatus": "executed_with_independent_ground_truth",
+        "thresholdsFrozenAtUnix": 100,
+        "releaseManifest": "release-manifest.json",
+        "releaseManifestSha256": release_manifest_sha256,
+        "qualityPolicy": "quality-policy.json",
+        "qualityPolicySha256": TEST_QUALITY_POLICY_SHA,
+        "priorMapId": "prior-test",
+        "priorMapSha256": prior_map_sha256,
+        "siteId": "store-test",
+        "siteType": "supermarket",
+        "groundTruthMethod": "independent controls",
+        "independentSurveyor": "test surveyor",
+        "thresholds": thresholds,
+        "runs": plan_runs,
+    }
+    plan_data = json.dumps(plan, sort_keys=True).encode("utf-8")
+    source_bundle = qualification._qualification_source_bundle(
+        plan_name="field-plan.json",
+        plan_data=plan_data,
+        release_name="release-manifest.json",
+        release_data=release_data,
+        policy_name="quality-policy.json",
+        policy_data=TEST_QUALITY_POLICY_DATA,
+    )
     evidence: dict[str, object] = {
         "format": "MarketScannerFieldQualificationEvidence",
         "version": 3,
-        "sourcePlanSha256": "9" * 64,
+        "sourcePlanSha256": hashlib.sha256(plan_data).hexdigest(),
+        "qualificationSourceBundle": source_bundle,
         "releaseManifest": {
             "name": "release-manifest.json",
-            "bytes": 1,
+            "bytes": len(release_data),
             "sha256": release_manifest_sha256,
             "gitSha": release_git_sha,
             "productVersion": product_version,
-            "manifestBodySha256": "8" * 64,
+            "manifestBodySha256": release_value["manifest_body_sha256"],
         },
         "qualityPolicy": {
             "name": "quality-policy.json",
-            "bytes": 1,
-            "sha256": quality_policy_sha256,
+            "bytes": len(TEST_QUALITY_POLICY_DATA),
+            "sha256": TEST_QUALITY_POLICY_SHA,
             "policyVersion": "test-frozen-1",
             "status": "frozen",
         },
@@ -316,17 +392,7 @@ def write_valid_field_evidence(
             "priorMapSha256": prior_map_sha256,
         },
         "thresholdsFrozenAtUnix": 100,
-        "thresholds": {
-            "nodeCoverageMin": 0.98,
-            "correctionP95MaxM": 1.0,
-            "correctionMaxM": 2.0,
-            "relativeTranslationResidualP95MaxM": 0.2,
-            "relativeYawResidualP95MaxRad": 0.1,
-            "weakLostDurationRatioMax": 0.1,
-            "tagPlanarP95MaxM": 0.2,
-            "tagPlanarMaxM": 0.3,
-            "tagHeightP95MaxM": 0.1,
-        },
+        "thresholds": thresholds,
         "siteId": "store-test",
         "siteType": "supermarket",
         "groundTruthMethod": "independent controls",
@@ -569,7 +635,7 @@ class LocalizedVersionStoreTests(unittest.TestCase):
                 "version": 2,
                 "publish_state": state,
                 "input_identity_id": self.input_identity_id,
-                "factor_graph_quality_policy_sha256": "e" * 64,
+                "factor_graph_quality_policy_sha256": TEST_QUALITY_POLICY_SHA,
                 "factor_graph_quality_policy_version": "test-frozen-1",
                 **self.identity_hashes,
             },
@@ -618,7 +684,7 @@ class LocalizedVersionStoreTests(unittest.TestCase):
                 "graph_integrity_passed": True,
                 "graph_quality_passed": True,
                 "quality_policy": {
-                    "policy_sha256": "e" * 64,
+                    "policy_sha256": TEST_QUALITY_POLICY_SHA,
                     "policy_version": "test-frozen-1",
                     "policy_status": "frozen",
                     "passed": True,
@@ -681,7 +747,9 @@ class LocalizedVersionStoreTests(unittest.TestCase):
             local_input_record=self.local_input_record,
         )
 
-    def commit_qualification_version(self, *, quality_sha: str = "e" * 64):
+    def commit_qualification_version(
+        self, *, quality_sha: str = TEST_QUALITY_POLICY_SHA
+    ):
         staging = self.write_valid_staging(state="review")
         report_path = staging / "localization_report.json"
         report = json.loads(report_path.read_text(encoding="utf-8"))
@@ -808,7 +876,7 @@ class LocalizedVersionStoreTests(unittest.TestCase):
             "version": 2,
             "git_sha": "a" * 40,
             "product_version": "test",
-            "factor_graph_quality_policy_sha256": "e" * 64,
+            "factor_graph_quality_policy_sha256": TEST_QUALITY_POLICY_SHA,
         }
         release["manifest_body_sha256"] = _canonical_sha(release)
         release_path.write_text(json.dumps(release), encoding="utf-8")
@@ -921,19 +989,17 @@ class LocalizedVersionStoreTests(unittest.TestCase):
             "review",
         )
         evidence_path = self.output / "field-evidence.json"
-        evidence_sha, _evidence = write_valid_field_evidence(
+        evidence_sha, evidence = write_valid_field_evidence(
             evidence_path,
-            release_manifest_sha256="2" * 64,
             release_git_sha="3" * 40,
             product_version="test",
             prior_map_sha256=self.identity_hashes["prior_map_sha256"],
-            quality_policy_sha256="e" * 64,
         )
         release_identity = {
-            "release_manifest_sha256": "2" * 64,
+            "release_manifest_sha256": evidence["releaseManifest"]["sha256"],
             "git_sha": "3" * 40,
             "product_version": "test",
-            "quality_policy_sha256": "e" * 64,
+            "quality_policy_sha256": TEST_QUALITY_POLICY_SHA,
         }
         published = self.store.publish_current(
             actor="publisher",
@@ -980,11 +1046,9 @@ class LocalizedVersionStoreTests(unittest.TestCase):
         evidence_path = self.output / "forged-field-evidence.json"
         _evidence_sha, evidence = write_valid_field_evidence(
             evidence_path,
-            release_manifest_sha256="2" * 64,
             release_git_sha="3" * 40,
             product_version="test",
             prior_map_sha256=self.identity_hashes["prior_map_sha256"],
-            quality_policy_sha256="e" * 64,
         )
         trajectory = evidence["runs"][0]["trajectoryEvidence"]
         assert isinstance(trajectory, dict)
@@ -1004,10 +1068,12 @@ class LocalizedVersionStoreTests(unittest.TestCase):
                 qualification_evidence_path=evidence_path,
                 expected_field_evidence_sha256=hashlib.sha256(data).hexdigest(),
                 expected_release_identity={
-                    "release_manifest_sha256": "2" * 64,
+                    "release_manifest_sha256": evidence["releaseManifest"][
+                        "sha256"
+                    ],
                     "git_sha": "3" * 40,
                     "product_version": "test",
-                    "quality_policy_sha256": "e" * 64,
+                    "quality_policy_sha256": TEST_QUALITY_POLICY_SHA,
                 },
                 expected_version=review.version_id,
             )

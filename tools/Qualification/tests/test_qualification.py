@@ -643,6 +643,22 @@ class QualificationTests(unittest.TestCase):
             ):
                 inspect_field_evidence(forged_tags_path)
 
+            forged_thresholds = json.loads(
+                (root / "field-evidence.json").read_text(encoding="utf-8")
+            )
+            forged_thresholds["thresholds"]["nodeCoverageMin"] = -999.0
+            forged_thresholds.pop("evidenceSha256")
+            forged_thresholds["evidenceSha256"] = _canonical_sha(
+                forged_thresholds
+            )
+            forged_thresholds_path = root / "forged-thresholds.json"
+            write_json(forged_thresholds_path, forged_thresholds)
+            with self.assertRaisesRegex(
+                QualificationError,
+                "qualification_sources_differ_from_field_evidence",
+            ):
+                inspect_field_evidence(forged_thresholds_path)
+
 
 if __name__ == "__main__":
     unittest.main()
