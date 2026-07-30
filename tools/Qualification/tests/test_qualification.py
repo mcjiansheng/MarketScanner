@@ -621,6 +621,28 @@ class QualificationTests(unittest.TestCase):
                 ):
                     inspect_field_evidence(forged_path)
 
+            forged_tags = json.loads(
+                (root / "field-evidence.json").read_text(encoding="utf-8")
+            )
+            metrics = forged_tags["runs"][0]["independentTagMetrics"]
+            for name in (
+                "planarP50M",
+                "planarP95M",
+                "planarMaxM",
+                "heightP95M",
+                "heightMaxM",
+            ):
+                metrics[name] = 0.0
+            forged_tags.pop("evidenceSha256")
+            forged_tags["evidenceSha256"] = _canonical_sha(forged_tags)
+            forged_tags_path = root / "forged-tag-metrics.json"
+            write_json(forged_tags_path, forged_tags)
+            with self.assertRaisesRegex(
+                QualificationError,
+                "field_run_inputs_differ_from_summaries",
+            ):
+                inspect_field_evidence(forged_tags_path)
+
 
 if __name__ == "__main__":
     unittest.main()

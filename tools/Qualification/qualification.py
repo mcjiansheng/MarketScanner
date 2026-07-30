@@ -26,6 +26,7 @@ FORMAT_FIELD_PLAN = "MarketScannerFieldQualificationPlan"
 FORMAT_FIELD_EVIDENCE = "MarketScannerFieldQualificationEvidence"
 FORMAT_TRAJECTORY_EVIDENCE = "MarketScannerTrajectoryQualificationEvidence"
 FORMAT_TRAJECTORY_SOURCE_BUNDLE = "MarketScannerTrajectorySourceBundle"
+FORMAT_FIELD_RUN_INPUT_BUNDLE = "MarketScannerFieldRunInputBundle"
 FORMAT_RELEASE_MANIFEST = "MarketScannerReleaseManifest"
 FORMAT_QUALITY_POLICY = "MarketScannerFactorGraphQualityPolicy"
 SHA_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -242,6 +243,20 @@ def _validated_canonical_evidence_bytes(
     data, digest, size, _identity = _read_stable_bytes(
         path, maximum_bytes=maximum_bytes, label="evidence"
     )
+    value = _validated_canonical_evidence_data(
+        data,
+        expected_format=expected_format,
+        expected_version=expected_version,
+    )
+    return value, digest, size, data
+
+
+def _validated_canonical_evidence_data(
+    data: bytes,
+    *,
+    expected_format: str,
+    expected_version: int,
+) -> dict[str, Any]:
     try:
         value = json.loads(
             data.decode("utf-8", errors="strict"),
@@ -260,7 +275,7 @@ def _validated_canonical_evidence_bytes(
         or _canonical_sha(body) != declared
     ):
         raise QualificationError("evidence_contract_invalid")
-    return value, digest, size, data
+    return value
 
 
 def _validate_release_manifest(path: Path) -> tuple[dict[str, Any], str, int]:
@@ -1132,12 +1147,23 @@ def _read_tag_measurements_with_identity(
     *,
     maximum_bytes: int = 16 * 1024 * 1024,
     maximum_rows: int = 50_000,
-) -> tuple[dict[str, float], str, int, list[str]]:
-    planar: list[float] = []
-    height: list[float] = []
+) -> tuple[dict[str, float], str, int, list[str], bytes]:
     data, digest, size, _identity = _read_stable_bytes(
         path, maximum_bytes=maximum_bytes, label="tag_measurements"
     )
+    metrics, tag_ids = _parse_tag_measurements_bytes(
+        data, maximum_rows=maximum_rows
+    )
+    return metrics, digest, size, tag_ids, data
+
+
+def _parse_tag_measurements_bytes(
+    data: bytes,
+    *,
+    maximum_rows: int = 50_000,
+) -> tuple[dict[str, float], list[str]]:
+    planar: list[float] = []
+    height: list[float] = []
     try:
         text = data.decode("utf-8", errors="strict")
     except UnicodeDecodeError as exc:
@@ -1176,10 +1202,84 @@ def _read_tag_measurements_with_identity(
             "heightP95M": _percentile(height, 0.95),
             "heightMaxM": max(height),
         },
-        digest,
-        size,
         tag_ids,
     )
+
+
+def _field_run_input_bundle(
+    *,
+    tag_name: str,
+    tag_data: bytes,
+    device_name: str,
+    device_data: bytes,
+) -> dict[str, Any]:
+    def entry(name: str, data: bytes) -> dict[str, Any]:
+        return {
+            "name": name,
+            "bytes": len(data),
+            "sha256": hashlib.sha256(data).hexdigest(),
+            "contentBase64": base64.b64encode(data).decode("ascii"),
+        }
+
+    return {
+        "format": FORMAT_FIELD_RUN_INPUT_BUNDLE,
+        "version": 1,
+        "tagMeasurements": entry(tag_name, tag_data),
+        "deviceEvidence": entry(device_name, device_data),
+    }
+
+
+def _field_run_input_bytes(
+    bundle: Any,
+) -> tuple[bytes, bytes, list[dict[str, Any]]]:
+    if (
+        not isinstance(bundle, dict)
+        or bundle.get("format") != FORMAT_FIELD_RUN_INPUT_BUNDLE
+        or bundle.get("version") != 1
+        or set(bundle)
+        != {"format", "version", "tagMeasurements", "deviceEvidence"}
+    ):
+        raise QualificationError("field_run_input_bundle_invalid")
+    decoded: dict[str, bytes] = {}
+    input_files: list[dict[str, Any]] = []
+    for key, role in (
+        ("tagMeasurements", "tag_measurements"),
+        ("deviceEvidence", "device_evidence"),
+    ):
+        entry = bundle.get(key)
+        if (
+            not isinstance(entry, dict)
+            or set(entry) != {"name", "bytes", "sha256", "contentBase64"}
+            or not isinstance(entry.get("name"), str)
+            or not entry["name"]
+            or Path(entry["name"]).name != entry["name"]
+            or isinstance(entry.get("bytes"), bool)
+            or not isinstance(entry.get("bytes"), int)
+            or entry["bytes"] < 0
+            or entry["bytes"] > 16 * 1024 * 1024
+            or not SHA_RE.fullmatch(str(entry.get("sha256", "")))
+            or not isinstance(entry.get("contentBase64"), str)
+        ):
+            raise QualificationError("field_run_input_entry_invalid")
+        try:
+            data = base64.b64decode(entry["contentBase64"], validate=True)
+        except (ValueError, TypeError) as exc:
+            raise QualificationError("field_run_input_base64_invalid") from exc
+        if (
+            len(data) != entry["bytes"]
+            or hashlib.sha256(data).hexdigest() != entry["sha256"]
+        ):
+            raise QualificationError("field_run_input_identity_invalid")
+        decoded[key] = data
+        input_files.append(
+            {
+                "role": role,
+                "name": entry["name"],
+                "bytes": entry["bytes"],
+                "sha256": entry["sha256"],
+            }
+        )
+    return decoded["tagMeasurements"], decoded["deviceEvidence"], input_files
 
 
 def evaluate_field(plan_path: Path, output_path: Path) -> dict[str, Any]:
@@ -1254,13 +1354,15 @@ def evaluate_field(plan_path: Path, output_path: Path) -> dict[str, Any]:
             release=release,
             release_sha256=release_sha,
         )
-        measured, tags_sha, tags_size, measured_tag_ids = (
+        measured, tags_sha, tags_size, measured_tag_ids, tags_data = (
             _read_tag_measurements_with_identity(tags_path)
         )
-        device_evidence, device_sha, device_size = _validated_canonical_evidence(
-            device_evidence_path,
-            expected_format=FORMAT_DEVICE_EVIDENCE,
-            expected_version=2,
+        device_evidence, device_sha, device_size, device_data = (
+            _validated_canonical_evidence_bytes(
+                device_evidence_path,
+                expected_format=FORMAT_DEVICE_EVIDENCE,
+                expected_version=2,
+            )
         )
         if not isinstance(metrics, dict):
             raise QualificationError("trajectory_metrics_not_object")
@@ -1381,6 +1483,12 @@ def evaluate_field(plan_path: Path, output_path: Path) -> dict[str, Any]:
             },
             "trajectoryEvidence": metrics,
             "trajectorySourceBundle": trajectory_source_bundle,
+            "fieldRunInputBundle": _field_run_input_bundle(
+                tag_name=tags_path.name,
+                tag_data=tags_data,
+                device_name=device_evidence_path.name,
+                device_data=device_data,
+            ),
             "independentTagMetrics": measured,
             "releaseGitSha": release["git_sha"],
             "deviceAppGitSha": app_identity["gitSha"],
@@ -1469,7 +1577,7 @@ def inspect_field_evidence_with_bytes(
         path,
         expected_format=FORMAT_FIELD_EVIDENCE,
         expected_version=3,
-        maximum_bytes=32 * 1024 * 1024,
+        maximum_bytes=128 * 1024 * 1024,
     )
     if evidence.get("result") != "PASS" or evidence.get("blockers") != []:
         raise QualificationError("field_evidence_not_pass")
@@ -1538,8 +1646,33 @@ def inspect_field_evidence_with_bytes(
         count = tag_metrics.get("count") if isinstance(tag_metrics, dict) else None
         if not isinstance(count, int) or isinstance(count, bool) or count < 20:
             raise QualificationError("field_run_tag_controls_invalid")
+        try:
+            tag_data, device_data, bundled_input_files = _field_run_input_bytes(
+                run.get("fieldRunInputBundle")
+            )
+            rederived_tag_metrics, measured_tag_ids = (
+                _parse_tag_measurements_bytes(tag_data)
+            )
+            device_evidence = _validated_canonical_evidence_data(
+                device_data,
+                expected_format=FORMAT_DEVICE_EVIDENCE,
+                expected_version=2,
+            )
+        except QualificationError as exc:
+            raise QualificationError("field_run_input_rederivation_failed") from exc
+        if (
+            rederived_tag_metrics != tag_metrics
+            or run.get("inputFiles") != bundled_input_files
+        ):
+            raise QualificationError("field_run_inputs_differ_from_summaries")
         tag_count += count
         device_identity = run.get("deviceEvidenceIdentity")
+        device_app = (
+            device_evidence.get("app")
+            if isinstance(device_evidence, dict)
+            else None
+        )
+        device_file_sha = hashlib.sha256(device_data).hexdigest()
         if (
             not isinstance(device_identity, dict)
             or device_identity.get("format") != FORMAT_DEVICE_EVIDENCE
@@ -1549,8 +1682,35 @@ def inspect_field_evidence_with_bytes(
             or device_identity.get("appBuildId") != run.get("deviceAppBuildId")
             or not SHA_RE.fullmatch(str(device_identity.get("evidenceBodySha256", "")))
             or not SHA_RE.fullmatch(str(device_identity.get("fileSha256", "")))
+            or not isinstance(device_evidence, dict)
+            or device_evidence.get("result") != "PASS"
+            or device_evidence.get("blockers") != []
+            or not isinstance(device_app, dict)
+            or device_app.get("gitSha") != release["gitSha"]
+            or device_app.get("buildId") != run.get("deviceAppBuildId")
+            or device_identity.get("evidenceBodySha256")
+            != device_evidence.get("evidenceSha256")
+            or device_identity.get("fileSha256") != device_file_sha
         ):
             raise QualificationError("nested_device_evidence_identity_invalid")
+        matching_device_runs = [
+            candidate
+            for candidate in device_evidence.get("runs", [])
+            if isinstance(candidate, dict)
+            and candidate.get("rawSessionBundleSha256") == bundle_sha
+            and candidate.get("rawDatabaseSha256") == database_sha
+            and candidate.get("trackingSessionId") == tracking_id
+        ]
+        if len(matching_device_runs) != 1:
+            raise QualificationError("source_session_not_bound_to_device_evidence")
+        device_session_identity = matching_device_runs[0].get("sessionIdentity")
+        if (
+            not isinstance(device_session_identity, dict)
+            or device_session_identity.get("priorMapId") != prior["priorMapId"]
+            or device_session_identity.get("priorMapSha256")
+            != prior["priorMapSha256"]
+        ):
+            raise QualificationError("device_prior_map_identity_invalid")
         trajectory = run.get("trajectoryEvidence")
         if not isinstance(trajectory, dict):
             raise QualificationError("trajectory_evidence_missing")
@@ -1664,6 +1824,7 @@ def inspect_field_evidence_with_bytes(
             or len(localized_tag_ids) < count
             or len(set(localized_tag_ids)) != len(localized_tag_ids)
             or any(not isinstance(tag_id, str) or not tag_id for tag_id in localized_tag_ids)
+            or not set(measured_tag_ids).issubset(set(localized_tag_ids))
             or _canonical_sha(sorted(localized_tag_ids))
             != trajectory.get("localizedTagIdsSha256")
         ):

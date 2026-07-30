@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import csv
 import hashlib
+import io
 import json
 import multiprocessing
 import os
@@ -196,6 +197,69 @@ def write_valid_field_evidence(
             prior_map_sha256=prior_map_sha256,
             quality_policy_sha256=quality_policy_sha256,
         )
+        tag_stream = io.StringIO(newline="")
+        tag_writer = csv.writer(tag_stream)
+        tag_writer.writerow(
+            [
+                "tag_id",
+                "truth_x_m",
+                "truth_y_m",
+                "truth_height_m",
+                "estimated_x_m",
+                "estimated_y_m",
+                "estimated_height_m",
+            ]
+        )
+        for tag in range(20):
+            tag_writer.writerow(
+                [f"tag-{tag}", tag, 0, 1, tag + 0.01, 0, 1.01]
+            )
+        tag_data = tag_stream.getvalue().encode("utf-8")
+        tag_metrics, _tag_ids = qualification._parse_tag_measurements_bytes(
+            tag_data
+        )
+        device_evidence: dict[str, object] = {
+            "format": "MarketScannerDeviceQualificationEvidence",
+            "version": 2,
+            "result": "PASS",
+            "blockers": [],
+            "app": {"gitSha": release_git_sha, "buildId": "test-build"},
+            "runs": [
+                {
+                    "rawSessionBundleSha256": trajectory[
+                        "session_input_bundle_sha256"
+                    ],
+                    "rawDatabaseSha256": trajectory["raw_database_sha256"],
+                    "trackingSessionId": trajectory["tracking_session_id"],
+                    "sessionIdentity": {
+                        "priorMapId": "prior-test",
+                        "priorMapSha256": prior_map_sha256,
+                    },
+                }
+            ],
+        }
+        device_evidence["evidenceSha256"] = _canonical_sha(device_evidence)
+        device_data = json.dumps(device_evidence, sort_keys=True).encode("utf-8")
+        field_run_input_bundle = qualification._field_run_input_bundle(
+            tag_name=f"tags-{index}.csv",
+            tag_data=tag_data,
+            device_name=f"device-{index}.json",
+            device_data=device_data,
+        )
+        input_files = [
+            {
+                "role": "tag_measurements",
+                "name": f"tags-{index}.csv",
+                "bytes": len(tag_data),
+                "sha256": hashlib.sha256(tag_data).hexdigest(),
+            },
+            {
+                "role": "device_evidence",
+                "name": f"device-{index}.json",
+                "bytes": len(device_data),
+                "sha256": hashlib.sha256(device_data).hexdigest(),
+            },
+        ]
         runs.append(
             {
                 "runId": f"run-{index}",
@@ -209,14 +273,8 @@ def write_valid_field_evidence(
                 },
                 "trajectoryEvidence": trajectory,
                 "trajectorySourceBundle": trajectory_source_bundle,
-                "independentTagMetrics": {
-                    "count": 20,
-                    "planarP50M": 0.01,
-                    "planarP95M": 0.02,
-                    "planarMaxM": 0.03,
-                    "heightP95M": 0.02,
-                    "heightMaxM": 0.03,
-                },
+                "fieldRunInputBundle": field_run_input_bundle,
+                "independentTagMetrics": tag_metrics,
                 "releaseGitSha": release_git_sha,
                 "deviceAppGitSha": release_git_sha,
                 "deviceAppBuildId": "test-build",
@@ -226,10 +284,10 @@ def write_valid_field_evidence(
                     "result": "PASS",
                     "appGitSha": release_git_sha,
                     "appBuildId": "test-build",
-                    "evidenceBodySha256": "c" * 64,
-                    "fileSha256": "d" * 64,
+                    "evidenceBodySha256": device_evidence["evidenceSha256"],
+                    "fileSha256": hashlib.sha256(device_data).hexdigest(),
                 },
-                "inputFiles": [],
+                "inputFiles": input_files,
                 "blockers": [],
                 "result": "PASS",
             }
