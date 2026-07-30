@@ -1,10 +1,10 @@
 # Map Studio 发布、启动、恢复与数据生命周期
 
-> 文档状态：**当前有效**。最后核对日期：2026-07-28。
+> 文档状态：**当前有效**。最后核对日期：2026-07-30。
 
 ## 安全启动边界
 
-Map Studio 只允许绑定 `127.0.0.1`。每次进程启动生成新的 256-bit 级随机 session token，token 只放在浏览器启动 URL fragment 中；页面读取后立即从地址栏移除并保存到当前 tab 的 `sessionStorage`，服务端不写 journal、诊断包或日志。所有 POST（包括路径选择和只读 inspect）都要求 `X-MarketScanner-Session-Token`；有 `Origin` 时必须精确匹配当前 `http://127.0.0.1:<port>`，无 Origin 只用于持有 token 的受控 launcher/CLI。静态资源和 API 返回 CSP、frame deny、no-referrer、nosniff。
+Map Studio 只允许绑定 `127.0.0.1`。每次进程启动生成新的 256-bit 级随机 session token，token 只放在浏览器启动 URL fragment 中；页面读取并立即移除 fragment，再通过 `POST /api/session/bootstrap` 换取 30 分钟 `HttpOnly; SameSite=Strict` cookie。除匿名静态文件和不含路径/版本的最小 health 外，敏感 GET、artifact/runtime log 与 POST 都要求有效 cookie（受控 CLI 可直接提供 token header）。所有有 `Origin` 的 POST 必须精确匹配当前 `http://127.0.0.1:<port>`。服务端不把 token 写入 journal、诊断包或日志；响应继续包含 CSP、frame deny、no-referrer、nosniff。
 
 `GET /api/about` 显示产品版本、source Git SHA、Python/platform 和启动检查；`GET /api/recovery` 列出 interrupted jobs 与安全恢复步骤。浏览器“版本与恢复”直接显示这些信息。
 
@@ -13,9 +13,13 @@ Map Studio 只允许绑定 `127.0.0.1`。每次进程启动生成新的 256-bit 
 ```bash
 python3 tools/SupermarketMapStudio/server.py --version
 python3 tools/SupermarketMapStudio/server.py --selfcheck
+python3 tools/SupermarketMapStudio/server.py --selfcheck --mode production
+python3 tools/SupermarketMapStudio/server.py --mode production
 ```
 
-生产启动器会先检查 Python >= 3.10、至少 1 GiB 状态盘空间、`rtabmap-reprocess`、完整相对 SE(2) helper 和 operator package integrity；两个 native 工具会实际执行 `--version` 并核对 package/source SHA，而不是只检查文件存在。任一关键项缺失都退出，不以有限功能模式伪装生产可用。损坏/旧格式 job journal 会 fail closed、不加载也不清理其路径，但作为可恢复告警允许服务启动，供操作者从“版本与恢复”查看并先导出诊断。
+严格 production mode 会检查 Python >= 3.10、至少 1 GiB 状态盘空间、`rtabmap-reprocess`、完整相对 SE(2) helper、package/release manifest、合法 source SHA、native SHA 一致、依赖/质量 policy 绑定且质量策略为 frozen、平台 app-data state 目录可用；两个 native 工具会实际执行 `--version`。任一关键项缺失都退出，不以有限功能模式伪装生产可用。development source checkout 会明确显示 `DEVELOPMENT / NOT QUALIFIED FOR PRODUCTION`。损坏/旧格式 job journal 会 fail closed、不加载也不清理其路径，但作为可恢复告警允许服务启动，供操作者从“版本与恢复”查看并先导出诊断。
+
+发布动作必须先由服务端导入 `MarketScannerFieldQualificationEvidence` v2；UI checkbox 只表示操作者确认。store 在写锁内复读 evidence 防 TOCTOU，并将 `review_evidence_sha256`、`field_evidence_sha256`、release/prior-map/quality-policy identity、candidate version/revision、actor/reason/UTC 分开写入不可变发布记录。
 
 - macOS：`tools/SupermarketMapStudio/launch_macos.command`
 - Windows PowerShell：`tools/SupermarketMapStudio/launch_windows.ps1`

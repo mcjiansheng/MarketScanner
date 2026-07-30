@@ -17,7 +17,7 @@ macOS 使用 `tools/SupermarketMapStudio/configure_pc_macos.sh` 安装/发现 Ho
 
 ## Release manifest
 
-`tools/SupermarketMapStudio/release_manifest.py` 为实际二进制生成 `MarketScannerReleaseManifest` version 1，记录平台、UTC 构建时间、Git SHA、工具链、依赖 policy SHA、许可证提示以及每个产物的字节数/SHA-256。固定输入和时间产生相同 canonical body hash。发布或 field acceptance 必须引用 manifest SHA，不能只写“最新版”。
+`tools/SupermarketMapStudio/release_manifest.py` 为实际二进制生成 `MarketScannerReleaseManifest` version 2，记录产品版本、平台、UTC 构建时间、Git SHA、工具链、依赖 policy SHA、因子图质量 policy SHA/状态以及每个产物的字节数/SHA-256。固定输入和时间产生相同 canonical body hash。发布或 field acceptance 必须引用 manifest SHA，不能只写“最新版”。
 
 依赖能力和许可证入口为 `tools/SupermarketMapStudio/release_dependencies.json`。它是 policy，不伪装成某台机器的 resolved lock；实际版本和产物身份由 configure summary、binary `--version` 和 release manifest 共同绑定。
 

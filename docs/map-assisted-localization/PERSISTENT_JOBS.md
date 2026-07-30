@@ -1,6 +1,6 @@
 # Map Studio 持久任务与中断恢复
 
-> 文档状态：**当前有效**。最后核对日期：2026-07-28。
+> 文档状态：**当前有效**。最后核对日期：2026-07-30。
 
 ## 目标与边界
 
@@ -10,9 +10,10 @@ P3 不实现跨进程“继续执行”。服务重启时，先前处于 `queued
 
 ## 存储协议
 
-- 默认目录：系统临时目录下按本机用户 home 摘要隔离的 `marketscanner-mapstudio-*/jobs`。
+- 默认目录：macOS 为 `~/Library/Application Support/MarketScanner/MapStudio/jobs`，Windows 为 `%LOCALAPPDATA%\MarketScanner\MapStudio\jobs`，Linux 为 `$XDG_STATE_HOME/marketscanner/mapstudio/jobs`（未设置时使用 `~/.local/state`）。
 - 可用 `MARKETSCANNER_JOB_STATE_DIR` 指定受控持久目录。
 - 每个任务一个 `0600` JSON journal，格式为 `MarketScannerMapStudioJob` version 1。
+- journal 记录 `storage_version=2`。旧 OS temp 目录只读探测并提示人工迁移，不自动移动或删除。
 - 更新流程是同目录唯一临时文件、写入、flush、文件 `fsync`、原子 replace；POSIX 平台随后同步目录。
 - journal 只接受 12 位十六进制任务 ID、绝对输出路径、有限时间戳、已知状态和有界进度。损坏或未知 schema 会在 `/api/health` 的 `startup_errors` 中失败关闭，不根据其中的路径删除任何文件。
 - 默认保留最近 200 个终态任务，可配置范围为 20–1000。超出保留数时同时删除该任务 journal 和严格按任务 ID 命名的原生运行日志。
@@ -38,7 +39,8 @@ queued/running/cancelling + service restart -> interrupted
 ## API 与浏览器恢复
 
 ```text
-GET  /api/health
+GET  /api/health                         # 匿名、最小、无路径
+POST /api/session/bootstrap              # fragment token -> HttpOnly cookie
 GET  /api/jobs
 GET  /api/jobs/<id>
 GET  /api/jobs/<id>/runtime-log/<exact-log-name>

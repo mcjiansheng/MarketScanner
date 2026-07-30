@@ -1,6 +1,6 @@
 # 相对 SE(2) 因子图设计与验证合同
 
-> 文档状态：**当前有效**。最后核对日期：2026-07-28。
+> 文档状态：**当前有效**。最后核对日期：2026-07-30。
 
 ## 生产路径
 
@@ -21,7 +21,11 @@ Python 仅通过版本化 TSV 传递绝对先验，并对 native JSON 做第二�
 - factor endpoint、相对图连通性、3×3 information、gauge、finite、convergence 和 objective 全部复核；
 - native helper 缺失或失败时，仅允许 `bounded_correction_field` 作为 `draft_fallback`，并写 `native_factor_graph_helper_unavailable` 或 `native_factor_graph_failed` blocker。
 
-完整求解结果写入不可变版本的 `factor_graph_report.json`。`localization_report.solver.factor_set_sha256` 必须与它一致；store 层还复核 input identity 和 optimized DB hash。只有完整 native graph 且其他 review blocker 为空时，report 的 publish capability 才可通过；正式 `published` 状态仍额外需要与当前 version/review SHA 绑定的 field acceptance。
+绝对先验 TSV v2 分别传递米制 `translation_sigma_m` 和弧度制 `yaw_sigma_rad`；读取 v1 scalar weight 时显式按 `sigma=1/sqrt(weight)` 迁移。unordered endpoint/type 相同的 reciprocal Link 先转换为同一方向并变换 covariance/information；一致项折叠计数，measurement 或 information 冲突立即失败。原先误导性的 `downweighted_factor_ids` 已替换为逐 loop 的 `loop_factor_residuals` 和由策略阈值派生的 `high_residual_loop_factor_ids`。
+
+`FactorGraphQualityPolicy` v1 将 solver convergence、graph integrity 与 product quality 分离，检查 relative/loop translation+yaw 的 p95/max、loop 高残差比例、最大 pose update、relative factor coverage 和 objective improvement。policy SHA 写入 factor report、release manifest 和现场证据。仓库内策略当前状态为 `candidate`，因此 `graph_quality_passed/published_capable` 必为 false；只有真实 P5/P6 分布经人工/P8 审核后将同一版本化策略明确冻结，生产发布门才可能通过。
+
+完整求解结果写入不可变版本的 `factor_graph_report.json`。`localization_report.solver.factor_set_sha256` 必须与它一致；store 层还复核 input identity 和 optimized DB hash。只有完整 native graph、图完整性和冻结质量策略全部通过时，report 的 publish capability 才可通过；正式 `published` 状态还必须在 store 写锁内复读真实 `MarketScannerFieldQualificationEvidence` v2，并分别保存 review SHA 与 field evidence SHA。
 
 ## 已执行验证
 

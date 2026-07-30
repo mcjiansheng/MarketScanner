@@ -1,6 +1,6 @@
 # iOS 长会话结束与外部复制加固
 
-> 文档状态：**当前有效**。最后核对日期：2026-07-28。
+> 文档状态：**当前有效**。最后核对日期：2026-07-30。
 
 ## 流式 evidence 校验
 
@@ -12,7 +12,7 @@
 - 每个文件最多 500,000 records；
 - required JSONL 上限按 metadata 期望数量推导，最低 1 MiB、最高 512 MiB；
 - optional JSONL 最大 128 MiB；
-- `localized_price_tags.json` 最大 128 MiB、500,000 条；
+- `localized_price_tags.json` 是唯一仍整数组解码的 sidecar，V1 单店上限收紧为 16 MiB、50,000 条；超限 fail closed，业务上要求拆店/分包；
 - 空行、partial final line、非法 UTF-8、非 object、非有限数值、错误 format/version/identity、数量或 state watermark 不一致全部 fail closed；
 - trace/state 时间戳必须严格递增；node timebase、pose、confidence、constraint accepted/uniqueness、tag observation 和 localized tag 关键业务字段与 PC versioned contract 对齐。
 
@@ -28,6 +28,7 @@ Foundation Swift 可执行测试分别生成并验证 100,000 条 trace、100,00
 - symlink；
 - 打开后路径 inode 被替换；
 - count、identity、last state 不一致。
+- 16 MiB localized tags 上限越界拒绝。
 
 本机 macOS 主机测试的进程 peak RSS 为 15,040,512 bytes，低于固定 256 MiB 门槛。该数值是 Foundation 主机压力基准，不是假冒 iPhone 热状态/内存压力或后台执行证据；真机 smoke 仍属于 P5。
 

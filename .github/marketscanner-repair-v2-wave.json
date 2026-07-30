@@ -1,6 +1,7 @@
 {
-  "wave": "P7-release-packaging-security",
-  "branch": "repair-v2-p7-release-security",
-  "base_branch": "repair-v2-p5-device-field-qualification",
-  "base_sha": "be0407468337f304658ed3f8ba44390afda43694"
+  "wave": "P7R0-independent-production-code-closeout",
+  "branch": "repair-v2-p7r0-independent-baseline",
+  "base_branch": "repair-v2-p7-release-security",
+  "base_sha": "5f2bb0822fef207c9a46b02b0dd5b427c6be1bdf",
+  "implementation_sha": "02c44caa65456bce33109d0ce45af7dd67a6df2f"
 }
