@@ -262,12 +262,16 @@ class QualificationTests(unittest.TestCase):
             path = Path(temporary) / "evidence.json"
             path.write_bytes(b'{"line":"one\r\ntwo"}\r\n')
             real_open = qualification.os.open
-            binary_flag = 1 << 29
+            native_binary_flag = getattr(qualification.os, "O_BINARY", 0)
+            binary_flag = native_binary_flag or (1 << 29)
             observed_flags: list[int] = []
 
             def binary_aware_open(target: object, flags: int) -> int:
                 observed_flags.append(flags)
-                return real_open(target, flags & ~binary_flag)
+                effective_flags = (
+                    flags if native_binary_flag else flags & ~binary_flag
+                )
+                return real_open(target, effective_flags)
 
             with (
                 mock.patch.object(
