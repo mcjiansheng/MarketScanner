@@ -96,7 +96,11 @@ def _read_stable_bytes(
 ) -> tuple[bytes, str, int, tuple[int, int]]:
     """Read the exact bytes later parsed/hashed from one verified descriptor."""
 
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_BINARY", 0)
+    )
     try:
         descriptor = os.open(path, flags)
     except OSError as exc:

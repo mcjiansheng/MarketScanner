@@ -257,6 +257,36 @@ class QualificationTests(unittest.TestCase):
             self.assertEqual(digest, hashlib.sha256(data).hexdigest())
             self.assertEqual(size, len(data))
 
+    def test_stable_read_requests_binary_descriptors_when_available(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "evidence.json"
+            path.write_bytes(b'{"line":"one\r\ntwo"}\r\n')
+            real_open = qualification.os.open
+            binary_flag = 1 << 29
+            observed_flags: list[int] = []
+
+            def binary_aware_open(target: object, flags: int) -> int:
+                observed_flags.append(flags)
+                return real_open(target, flags & ~binary_flag)
+
+            with (
+                mock.patch.object(
+                    qualification.os, "O_BINARY", binary_flag, create=True
+                ),
+                mock.patch.object(
+                    qualification.os, "open", side_effect=binary_aware_open
+                ),
+            ):
+                data, _digest, _size, _identity = qualification._read_stable_bytes(
+                    path,
+                    maximum_bytes=1024,
+                    label="evidence",
+                )
+
+            self.assertEqual(data, path.read_bytes())
+            self.assertGreaterEqual(len(observed_flags), 3)
+            self.assertTrue(all(flags & binary_flag for flags in observed_flags))
+
     def test_stable_read_rejects_transient_same_size_swap_and_restore(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
