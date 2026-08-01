@@ -257,6 +257,57 @@ class QualificationTests(unittest.TestCase):
             self.assertEqual(digest, hashlib.sha256(data).hexdigest())
             self.assertEqual(size, len(data))
 
+    def test_stable_read_rejects_transient_same_size_swap_and_restore(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            path = root / "evidence.json"
+            original = b'{"result":"PASS","source":"trusted"}\n'
+            replacement = b'{"result":"PASS","source":"forged!"}\n'
+            self.assertEqual(len(original), len(replacement))
+            path.write_bytes(original)
+            forged = root / "forged.json"
+            forged.write_bytes(replacement)
+            parked = root / "parked.json"
+            real_open = qualification.os.open
+            real_read = qualification.os.read
+            first_open = True
+            restored = False
+
+            def swap_before_read_open(target: object, flags: int) -> int:
+                nonlocal first_open
+                if first_open and Path(target) == path:
+                    first_open = False
+                    path.replace(parked)
+                    forged.replace(path)
+                return real_open(target, flags)
+
+            def restore_original(descriptor: int, count: int) -> bytes:
+                nonlocal restored
+                if not restored:
+                    restored = True
+                    path.replace(forged)
+                    parked.replace(path)
+                return real_read(descriptor, count)
+
+            with (
+                mock.patch.object(
+                    qualification.os, "open", side_effect=swap_before_read_open
+                ),
+                mock.patch.object(
+                    qualification.os, "read", side_effect=restore_original
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    QualificationError, "changed_during_read"
+                ):
+                    qualification._read_stable_bytes(
+                        path,
+                        maximum_bytes=1024,
+                        label="evidence",
+                    )
+
+            self.assertEqual(path.read_bytes(), original)
+
     def test_windows_evidence_write_skips_unsupported_directory_fsync(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             output = Path(temporary) / "evidence.json"

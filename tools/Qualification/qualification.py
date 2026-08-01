@@ -96,37 +96,68 @@ def _read_stable_bytes(
 ) -> tuple[bytes, str, int, tuple[int, int]]:
     """Read the exact bytes later parsed/hashed from one verified descriptor."""
 
-    before = path.lstat()
-    if (
-        path.is_symlink()
-        or not path.is_file()
-        or before.st_nlink != 1
-        or before.st_size > maximum_bytes
-    ):
-        raise QualificationError(f"unsafe_or_oversized_{label}:{path.name}")
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-    descriptor = os.open(path, flags)
     try:
-        opened = os.fstat(descriptor)
-        chunks: list[bytes] = []
-        total = 0
-        while True:
-            chunk = os.read(descriptor, min(1024 * 1024, maximum_bytes + 1 - total))
-            if not chunk:
-                break
-            chunks.append(chunk)
-            total += len(chunk)
-            if total > maximum_bytes:
-                raise QualificationError(f"{label}_size_limit:{path.name}")
-        opened_after = os.fstat(descriptor)
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise QualificationError(
+            f"unsafe_or_oversized_{label}:{path.name}"
+        ) from exc
+    try:
+        try:
+            opened = os.fstat(descriptor)
+            before = path.lstat()
+            binding_before_descriptor = os.open(path, flags)
+            try:
+                binding_before = os.fstat(binding_before_descriptor)
+            finally:
+                os.close(binding_before_descriptor)
+            if (
+                not stat.S_ISREG(before.st_mode)
+                or not stat.S_ISREG(opened.st_mode)
+                or not stat.S_ISREG(binding_before.st_mode)
+                or before.st_nlink != 1
+                or opened.st_nlink != 1
+                or binding_before.st_nlink != 1
+                or before.st_size > maximum_bytes
+                or opened.st_size > maximum_bytes
+            ):
+                raise QualificationError(
+                    f"unsafe_or_oversized_{label}:{path.name}"
+                )
+            chunks: list[bytes] = []
+            total = 0
+            while True:
+                chunk = os.read(
+                    descriptor, min(1024 * 1024, maximum_bytes + 1 - total)
+                )
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                total += len(chunk)
+                if total > maximum_bytes:
+                    raise QualificationError(f"{label}_size_limit:{path.name}")
+            opened_after = os.fstat(descriptor)
+            after = path.lstat()
+            binding_after_descriptor = os.open(path, flags)
+            try:
+                binding_after = os.fstat(binding_after_descriptor)
+            finally:
+                os.close(binding_after_descriptor)
+        except QualificationError:
+            raise
+        except OSError as exc:
+            raise QualificationError(
+                f"{label}_changed_during_read:{path.name}"
+            ) from exc
     finally:
         os.close(descriptor)
-    after = path.lstat()
 
     # On Windows, path-based stat and handle-based fstat may expose different
     # device/inode or timestamp representations for the same unchanged file.
-    # Compare each API surface with itself while the descriptor is held open;
-    # crossing the two surfaces would reject valid evidence on hosted runners.
+    # Compare each API surface with itself. Separate path descriptors bind the
+    # named file to the still-open read descriptor before and after the read;
+    # this also rejects a same-size swap that restores the original path.
     path_identity = (
         before.st_dev,
         before.st_ino,
@@ -143,14 +174,23 @@ def _read_stable_bytes(
         opened.st_mtime_ns,
         opened.st_ctime_ns,
     )
+    binding_before_identity = (
+        binding_before.st_dev,
+        binding_before.st_ino,
+        binding_before.st_size,
+        binding_before.st_nlink,
+        binding_before.st_mtime_ns,
+        binding_before.st_ctime_ns,
+    )
     if (
         not stat.S_ISREG(opened.st_mode)
         or not stat.S_ISREG(opened_after.st_mode)
         or not stat.S_ISREG(after.st_mode)
-        or before.st_size != opened.st_size
+        or not stat.S_ISREG(binding_after.st_mode)
         or opened.st_nlink != 1
         or opened_after.st_nlink != 1
         or after.st_nlink != 1
+        or binding_after.st_nlink != 1
         or path_identity
         != (
             after.st_dev,
@@ -160,6 +200,7 @@ def _read_stable_bytes(
             after.st_mtime_ns,
             after.st_ctime_ns,
         )
+        or descriptor_identity != binding_before_identity
         or descriptor_identity
         != (
             opened_after.st_dev,
@@ -168,6 +209,15 @@ def _read_stable_bytes(
             opened_after.st_nlink,
             opened_after.st_mtime_ns,
             opened_after.st_ctime_ns,
+        )
+        or descriptor_identity
+        != (
+            binding_after.st_dev,
+            binding_after.st_ino,
+            binding_after.st_size,
+            binding_after.st_nlink,
+            binding_after.st_mtime_ns,
+            binding_after.st_ctime_ns,
         )
     ):
         raise QualificationError(f"{label}_changed_during_read:{path.name}")
