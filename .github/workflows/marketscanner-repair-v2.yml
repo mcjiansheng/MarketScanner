@@ -185,7 +185,7 @@ jobs:
           python -m unittest discover -s tools/SupermarketMapStudio/tests -v 2>&1 | Tee-Object -FilePath $logPath
           $testExit = $LASTEXITCODE
           if ($testExit -ne 0) {
-            $tail = (Get-Content $logPath -Tail 120) -join "`n"
+            $tail = (Get-Content $logPath -Tail 40) -join "`n"
             $escaped = $tail.Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
             Write-Output "::error title=Windows Map Studio Failure::$escaped"
             exit $testExit
