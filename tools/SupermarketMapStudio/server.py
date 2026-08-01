@@ -3533,55 +3533,37 @@ def native_tool_diagnostic(name: str, binary: Path | None, *, strict: bool = Fal
 
 
 def _stable_file_digest(path: Path) -> tuple[str, int]:
-    before = path.lstat()
-    if path.is_symlink() or not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
-        raise ValueError(f"file is not a single-link regular file: {path.name}")
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(chunk)
-        opened = os.fstat(stream.fileno())
-    after = path.lstat()
-    identity = (before.st_dev, before.st_ino, before.st_size)
-    if identity != (opened.st_dev, opened.st_ino, opened.st_size) or identity != (
-        after.st_dev,
-        after.st_ino,
-        after.st_size,
-    ):
-        raise ValueError(f"file changed while hashing: {path.name}")
-    return digest.hexdigest(), int(before.st_size)
-
-
-def _stable_json_file(path: Path, maximum_bytes: int = 16 * 1024 * 1024) -> tuple[dict[str, Any], str, int]:
-    before = path.lstat()
-    if (
-        path.is_symlink()
-        or not stat.S_ISREG(before.st_mode)
-        or before.st_nlink != 1
-        or before.st_size > maximum_bytes
-    ):
-        raise ValueError(f"JSON file is unsafe or oversized: {path.name}")
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-    descriptor = os.open(path, flags)
     try:
-        opened = os.fstat(descriptor)
-        chunks: list[bytes] = []
-        total = 0
-        while True:
-            chunk = os.read(
-                descriptor, min(1024 * 1024, maximum_bytes + 1 - total)
-            )
-            if not chunk:
-                break
-            chunks.append(chunk)
-            total += len(chunk)
-            if total > maximum_bytes:
-                raise ValueError(f"JSON file is oversized: {path.name}")
-    finally:
-        os.close(descriptor)
-    data = b"".join(chunks)
-    after = path.lstat()
-    identity = (
+        with path.open("rb") as stream:
+            opened = os.fstat(stream.fileno())
+            before = path.lstat()
+            with path.open("rb") as binding_before_stream:
+                binding_before = os.fstat(binding_before_stream.fileno())
+            if (
+                not stat.S_ISREG(before.st_mode)
+                or not stat.S_ISREG(opened.st_mode)
+                or not stat.S_ISREG(binding_before.st_mode)
+                or before.st_nlink != 1
+                or opened.st_nlink != 1
+                or binding_before.st_nlink != 1
+            ):
+                raise ValueError(
+                    f"file is not a single-link regular file: {path.name}"
+                )
+            digest = hashlib.sha256()
+            byte_count = 0
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+                byte_count += len(chunk)
+            opened_after = os.fstat(stream.fileno())
+            after = path.lstat()
+            with path.open("rb") as binding_after_stream:
+                binding_after = os.fstat(binding_after_stream.fileno())
+    except ValueError:
+        raise
+    except OSError as exc:
+        raise ValueError(f"file changed while hashing: {path.name}") from exc
+    path_identity = (
         before.st_dev,
         before.st_ino,
         before.st_size,
@@ -3589,19 +3571,23 @@ def _stable_json_file(path: Path, maximum_bytes: int = 16 * 1024 * 1024) -> tupl
         before.st_mtime_ns,
         before.st_ctime_ns,
     )
+    descriptor_identity = (
+        opened.st_dev,
+        opened.st_ino,
+        opened.st_size,
+        opened.st_nlink,
+        opened.st_mtime_ns,
+        opened.st_ctime_ns,
+    )
     if (
-        len(data) > maximum_bytes
-        or len(data) != before.st_size
-        or identity
-        != (
-            opened.st_dev,
-            opened.st_ino,
-            opened.st_size,
-            opened.st_nlink,
-            opened.st_mtime_ns,
-            opened.st_ctime_ns,
-        )
-        or identity
+        not stat.S_ISREG(opened_after.st_mode)
+        or not stat.S_ISREG(after.st_mode)
+        or not stat.S_ISREG(binding_after.st_mode)
+        or opened_after.st_nlink != 1
+        or after.st_nlink != 1
+        or binding_after.st_nlink != 1
+        or byte_count != opened.st_size
+        or path_identity
         != (
             after.st_dev,
             after.st_ino,
@@ -3609,6 +3595,156 @@ def _stable_json_file(path: Path, maximum_bytes: int = 16 * 1024 * 1024) -> tupl
             after.st_nlink,
             after.st_mtime_ns,
             after.st_ctime_ns,
+        )
+        or descriptor_identity
+        != (
+            binding_before.st_dev,
+            binding_before.st_ino,
+            binding_before.st_size,
+            binding_before.st_nlink,
+            binding_before.st_mtime_ns,
+            binding_before.st_ctime_ns,
+        )
+        or descriptor_identity
+        != (
+            opened_after.st_dev,
+            opened_after.st_ino,
+            opened_after.st_size,
+            opened_after.st_nlink,
+            opened_after.st_mtime_ns,
+            opened_after.st_ctime_ns,
+        )
+        or descriptor_identity
+        != (
+            binding_after.st_dev,
+            binding_after.st_ino,
+            binding_after.st_size,
+            binding_after.st_nlink,
+            binding_after.st_mtime_ns,
+            binding_after.st_ctime_ns,
+        )
+    ):
+        raise ValueError(f"file changed while hashing: {path.name}")
+    return digest.hexdigest(), byte_count
+
+
+def _stable_json_file(path: Path, maximum_bytes: int = 16 * 1024 * 1024) -> tuple[dict[str, Any], str, int]:
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_BINARY", 0)
+    )
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise ValueError(f"JSON file is unsafe or oversized: {path.name}") from exc
+    try:
+        try:
+            opened = os.fstat(descriptor)
+            before = path.lstat()
+            binding_before_descriptor = os.open(path, flags)
+            try:
+                binding_before = os.fstat(binding_before_descriptor)
+            finally:
+                os.close(binding_before_descriptor)
+            if (
+                not stat.S_ISREG(before.st_mode)
+                or not stat.S_ISREG(opened.st_mode)
+                or not stat.S_ISREG(binding_before.st_mode)
+                or before.st_nlink != 1
+                or opened.st_nlink != 1
+                or binding_before.st_nlink != 1
+                or before.st_size > maximum_bytes
+                or opened.st_size > maximum_bytes
+            ):
+                raise ValueError(f"JSON file is unsafe or oversized: {path.name}")
+            chunks: list[bytes] = []
+            total = 0
+            while True:
+                chunk = os.read(
+                    descriptor, min(1024 * 1024, maximum_bytes + 1 - total)
+                )
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                total += len(chunk)
+                if total > maximum_bytes:
+                    raise ValueError(f"JSON file is oversized: {path.name}")
+            opened_after = os.fstat(descriptor)
+            after = path.lstat()
+            binding_after_descriptor = os.open(path, flags)
+            try:
+                binding_after = os.fstat(binding_after_descriptor)
+            finally:
+                os.close(binding_after_descriptor)
+        except ValueError:
+            raise
+        except OSError as exc:
+            raise ValueError(f"JSON file changed during read: {path.name}") from exc
+    finally:
+        os.close(descriptor)
+    data = b"".join(chunks)
+    path_identity = (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_nlink,
+        before.st_mtime_ns,
+        before.st_ctime_ns,
+    )
+    descriptor_identity = (
+        opened.st_dev,
+        opened.st_ino,
+        opened.st_size,
+        opened.st_nlink,
+        opened.st_mtime_ns,
+        opened.st_ctime_ns,
+    )
+    if (
+        len(data) > maximum_bytes
+        or len(data) != before.st_size
+        or len(data) != opened.st_size
+        or not stat.S_ISREG(opened_after.st_mode)
+        or not stat.S_ISREG(after.st_mode)
+        or not stat.S_ISREG(binding_after.st_mode)
+        or opened_after.st_nlink != 1
+        or after.st_nlink != 1
+        or binding_after.st_nlink != 1
+        or path_identity
+        != (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_nlink,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        )
+        or descriptor_identity
+        != (
+            binding_before.st_dev,
+            binding_before.st_ino,
+            binding_before.st_size,
+            binding_before.st_nlink,
+            binding_before.st_mtime_ns,
+            binding_before.st_ctime_ns,
+        )
+        or descriptor_identity
+        != (
+            opened_after.st_dev,
+            opened_after.st_ino,
+            opened_after.st_size,
+            opened_after.st_nlink,
+            opened_after.st_mtime_ns,
+            opened_after.st_ctime_ns,
+        )
+        or descriptor_identity
+        != (
+            binding_after.st_dev,
+            binding_after.st_ino,
+            binding_after.st_size,
+            binding_after.st_nlink,
+            binding_after.st_mtime_ns,
+            binding_after.st_ctime_ns,
         )
     ):
         raise ValueError(f"JSON file changed during read: {path.name}")
