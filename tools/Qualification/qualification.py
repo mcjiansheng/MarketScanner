@@ -15,6 +15,7 @@ import math
 import os
 from pathlib import Path
 import re
+import stat
 import statistics
 import sys
 from typing import Any, Iterable
@@ -117,10 +118,16 @@ def _read_stable_bytes(
             total += len(chunk)
             if total > maximum_bytes:
                 raise QualificationError(f"{label}_size_limit:{path.name}")
+        opened_after = os.fstat(descriptor)
     finally:
         os.close(descriptor)
     after = path.lstat()
-    identity = (
+
+    # On Windows, path-based stat and handle-based fstat may expose different
+    # device/inode or timestamp representations for the same unchanged file.
+    # Compare each API surface with itself while the descriptor is held open;
+    # crossing the two surfaces would reject valid evidence on hosted runners.
+    path_identity = (
         before.st_dev,
         before.st_ino,
         before.st_size,
@@ -128,17 +135,23 @@ def _read_stable_bytes(
         before.st_mtime_ns,
         before.st_ctime_ns,
     )
+    descriptor_identity = (
+        opened.st_dev,
+        opened.st_ino,
+        opened.st_size,
+        opened.st_nlink,
+        opened.st_mtime_ns,
+        opened.st_ctime_ns,
+    )
     if (
-        identity
-        != (
-            opened.st_dev,
-            opened.st_ino,
-            opened.st_size,
-            opened.st_nlink,
-            opened.st_mtime_ns,
-            opened.st_ctime_ns,
-        )
-        or identity
+        not stat.S_ISREG(opened.st_mode)
+        or not stat.S_ISREG(opened_after.st_mode)
+        or not stat.S_ISREG(after.st_mode)
+        or before.st_size != opened.st_size
+        or opened.st_nlink != 1
+        or opened_after.st_nlink != 1
+        or after.st_nlink != 1
+        or path_identity
         != (
             after.st_dev,
             after.st_ino,
@@ -147,11 +160,19 @@ def _read_stable_bytes(
             after.st_mtime_ns,
             after.st_ctime_ns,
         )
-        or before.st_nlink != 1
+        or descriptor_identity
+        != (
+            opened_after.st_dev,
+            opened_after.st_ino,
+            opened_after.st_size,
+            opened_after.st_nlink,
+            opened_after.st_mtime_ns,
+            opened_after.st_ctime_ns,
+        )
     ):
         raise QualificationError(f"{label}_changed_during_read:{path.name}")
     data = b"".join(chunks)
-    if len(data) != before.st_size:
+    if len(data) != before.st_size or len(data) != opened.st_size:
         raise QualificationError(f"{label}_partial_read:{path.name}")
     return data, hashlib.sha256(data).hexdigest(), len(data), (
         int(before.st_dev),

@@ -226,6 +226,37 @@ class QualificationTests(unittest.TestCase):
                 with self.assertRaisesRegex(QualificationError, "changed_during_read"):
                     qualification._read_tag_measurements_with_identity(path)
 
+    def test_stable_read_accepts_windows_path_handle_stat_representation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "evidence.json"
+            path.write_bytes(b'{"result":"PASS"}\n')
+            real_fstat = qualification.os.fstat
+
+            def windows_fstat(descriptor: int) -> mock.Mock:
+                actual = real_fstat(descriptor)
+                represented = mock.Mock()
+                represented.st_mode = actual.st_mode
+                represented.st_size = actual.st_size
+                represented.st_nlink = actual.st_nlink
+                represented.st_dev = actual.st_dev + 1
+                represented.st_ino = actual.st_ino + 1
+                represented.st_ctime_ns = actual.st_ctime_ns + 100
+                represented.st_mtime_ns = actual.st_mtime_ns + 100
+                return represented
+
+            with mock.patch.object(
+                qualification.os, "fstat", side_effect=windows_fstat
+            ):
+                data, digest, size, _identity = qualification._read_stable_bytes(
+                    path,
+                    maximum_bytes=1024,
+                    label="evidence",
+                )
+
+            self.assertEqual(data, path.read_bytes())
+            self.assertEqual(digest, hashlib.sha256(data).hexdigest())
+            self.assertEqual(size, len(data))
+
     def test_windows_evidence_write_skips_unsupported_directory_fsync(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             output = Path(temporary) / "evidence.json"
