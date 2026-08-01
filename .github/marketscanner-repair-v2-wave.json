@@ -3,5 +3,5 @@
   "branch": "repair-v2-p7r1-evidence-publication-closeout",
   "base_branch": "repair-v2-p7r0-independent-baseline",
   "base_sha": "79c86b120fc47c28bd350e86abc9b0354d7e838d",
-  "implementation_sha": "fbf276d30e02eccc7676b41c5f1a34e34ba8f0c6"
+  "implementation_sha": "1567e48e192016369966878f91dfbd53bc0e6fd8"
 }
