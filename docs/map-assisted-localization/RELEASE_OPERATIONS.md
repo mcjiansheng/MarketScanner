@@ -21,6 +21,8 @@ python3 tools/SupermarketMapStudio/server.py --mode production
 
 发布动作只能由 `runtime_mode=production` 的 server 执行；development runtime 即使 release、Field Evidence、full factor graph 和 frozen policy 全部有效也固定返回 403，CLI/API 不能绕过。服务端在调用 `store.publish_current()` 前必须重新执行 `startup_diagnostics("production")`，只有 `production_qualified=true` 且 `can_start=true` 才继续；随后只从安装包根目录稳定读取 release manifest，并核对 package manifest 的 exact release SHA/Git SHA。production 忽略 `MARKETSCANNER_RELEASE_MANIFEST` 外部覆盖，失败路径不改变 current/published pointer。
 
+operator package 的 manifest/release/quality JSON 和逐文件 hash 都通过保持打开的主 descriptor 读取；读取前后用同类 path descriptor 绑定文件身份，路径元数据只与路径元数据比较。Windows 使用 binary descriptor 保留 CRLF 等磁盘原始字节；打开句柄阻止替换、同尺寸替换、临时替换后恢复、部分读取或身份变化均失败关闭。
+
 发布动作必须导入 `MarketScannerFieldQualificationEvidence` v3；UI checkbox 只表示操作者确认。evidence 自包含 exact Field Plan、release/quality contract、每次 run 的 manifest-bound trajectory source、控制点 CSV 和 Device Evidence；inspect/store 从这些字节重新派生全部质量数值、阈值和身份。store 在写锁内稳定复读 evidence 并核对操作者选择时的 SHA，将 exact accepted bytes 复制为 published version 的 `field_evidence.json`，同时生成 `qualification_manifest.json`。两个文件进入 `MarketScannerLocalizedVersionManifest` v4 的逐文件 hash tree，published/revoked resolve 会重新验证；外部 evidence 后续删除或修改不影响审计。发布记录继续分别保存 `review_evidence_sha256`、field body/file SHA、release/prior-map/quality-policy identity、candidate version/revision、actor/reason/UTC。
 
 - macOS：`tools/SupermarketMapStudio/launch_macos.command`
