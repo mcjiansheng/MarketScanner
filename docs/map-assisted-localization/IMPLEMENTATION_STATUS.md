@@ -8,9 +8,9 @@
 
 P1 已实现并在真实 DB 上只读验证完整相对 SE(2) 因子图、canonical factor digest、严格 Python 二次校验和 fail-closed publish capability；设计见 [`FACTOR_GRAPH_DESIGN.md`](FACTOR_GRAPH_DESIGN.md)。P2 已加入 PC release presets、依赖 capability 门、source-bound `--version`、release/iOS dependency manifests，以及不允许依赖缺失静默 skip 的 hosted build 流程；本机 macOS 空目录构建与累计 SHA 的 hosted Ubuntu/Windows native clean build、Windows 全套回归、iOS cold-cache dependency manifest/cache 和 unsigned arm64 full App link 均已通过，见 [`REPRODUCIBLE_BUILD.md`](REPRODUCIBLE_BUILD.md)。P3 已完成 Map Studio 持久 journal、重启中断判定、子进程取消、运行日志留存和浏览器任务重连，见 [`PERSISTENT_JOBS.md`](PERSISTENT_JOBS.md)。P4 代码和主机压力测试已完成流式 finalization、descriptor-bound 读取、schema/大小门、copy receipt 隐私和 durability hook；真机 smoke 仍归 P5，见 [`IOS_FINALIZATION_HARDENING.md`](IOS_FINALIZATION_HARDENING.md)。
 
-P5/P6 的真实执行尚未发生；仓库已提供失败关闭的设备/现场 evidence collector。P7R1 将 Field Plan/Evidence 升级到 v3：禁止自由 trajectory metrics，改由 immutable localized version 自动生成 typed trajectory evidence；每个 Device App SHA 精确绑定 release SHA，控制点 CSV 使用单次 descriptor-bound 读取。完整矩阵、真实设备身份、App/native/prior/session/package hash、冻结阈值、至少 3 次扫描与独立标签控制点缺一项即 FAIL，见 [`FIELD_TEST_PLAN.md`](FIELD_TEST_PLAN.md) 和 [`tools/Qualification/README.md`](../../tools/Qualification/README.md)。这只属于 **IMPLEMENTED / AUTOMATED TESTED**，不构成 **REAL DEVICE PASS / FIELD PASS**。
+P5/P6 的真实执行尚未发生；仓库已提供失败关闭的设备/现场 evidence collector。P7R1 将 Field Plan/Evidence 升级到 v3：禁止自由 trajectory metrics，改由 immutable localized version 自动生成 typed trajectory evidence；每个 Device App SHA 精确绑定 release SHA，控制点 CSV 使用单次 descriptor-bound 读取。最终 evidence 以 `MarketScannerQualificationSourceBundle`、`MarketScannerTrajectorySourceBundle` 和 `MarketScannerFieldRunInputBundle` 三个 v1 合同自包含 exact plan/release/policy、trajectory source artifacts、控制点 CSV 和 Device Evidence bytes；Field v3 bounded stable-read 上限为 128 MiB，inspect/发布会重新派生指标、阈值和身份，摘要篡改并重算 SHA 仍失败。完整矩阵、真实设备身份、App/native/prior/session/package hash、冻结阈值、至少 3 次扫描与独立标签控制点缺一项即 FAIL，见 [`FIELD_TEST_PLAN.md`](FIELD_TEST_PLAN.md) 和 [`tools/Qualification/README.md`](../../tools/Qualification/README.md)。这只属于 **IMPLEMENTED / AUTOMATED TESTED**，不构成 **REAL DEVICE PASS / FIELD PASS**。
 
-P7 已实现 loopback-only server、每次启动随机且不落盘的 token、POST token/Origin 门、CSP、安全 About/恢复信息、bounded 诊断包、启动 selfcheck、macOS/Windows launcher 和 hash-bound operator archive。P7R1 进一步让 development runtime 无条件禁止 publish，production 在事务前重新 selfcheck；accepted Field Evidence exact bytes 进入 published manifest v4，package release/quality JSON 稳定单读，About 使用真实 runtime mode，见 [`RELEASE_OPERATIONS.md`](RELEASE_OPERATIONS.md)。这些属于 **IMPLEMENTED / AUTOMATED TESTED**；只有最终精确 SHA 的全矩阵 run 才可标 **CI VERIFIED**。干净 Windows/macOS 安装、升级、卸载 smoke 尚未执行，不能视为 **HUMAN REVIEWED / PRODUCTION QUALIFIED**。
+P7 已实现 loopback-only server、每次启动随机且不落盘的 token、POST token/Origin 门、CSP、安全 About/恢复信息、bounded 诊断包、启动 selfcheck、macOS/Windows launcher 和 hash-bound operator archive。P7R1 进一步让 development runtime 无条件禁止 publish，production 在事务前重新 selfcheck并只接受安装包内、与 package manifest 精确绑定的 release identity，忽略外部 release override；accepted Field Evidence exact bytes 进入 published manifest v4，package release/quality JSON 稳定单读，About 使用真实 runtime mode，见 [`RELEASE_OPERATIONS.md`](RELEASE_OPERATIONS.md)。这些属于 **IMPLEMENTED / AUTOMATED TESTED**；只有最终精确 SHA 的全矩阵 run 才可标 **CI VERIFIED**。干净 Windows/macOS 安装、升级、卸载 smoke 尚未执行，不能视为 **HUMAN REVIEWED / PRODUCTION QUALIFIED**。
 
 ## 阶段一
 
@@ -88,7 +88,7 @@ P7 已实现 loopback-only server、每次启动随机且不落盘的 token、PO
 | 操作者取消 | 已实现 | 持久取消意图；原生子进程 terminate→有界 wait→kill；partial 清理 |
 | 原生运行日志 | 已实现 | fast/discovery 独立日志、严格文件名和任务归属下载 |
 | 损坏 journal/保留策略 | 已实现 | health 报告 startup error；不按不可信路径清理；默认保留 200 个终态任务 |
-| 自动回归 | 已实现 | P7R1 本地完整回归：PriorMap 115 项、工作台 91 项、资格证据 8 项；包含持久任务进程恢复、production publish fail-closed、immutable evidence、package stable-read、CSV race/同尺寸替换/非法 UTF-8，以及 Windows 目录同步差异。该数字是 AUTOMATED TESTED，不替代最终 exact-SHA CI 或人工验收 |
+| 自动回归 | 已实现 | P7R1 本地完整回归：PriorMap 116 项、工作台 92 项、资格证据 8 项；包含持久任务进程恢复、production publish fail-closed、immutable evidence 重派生、package-bound release、package stable-read、CSV race/同尺寸替换/非法 UTF-8，以及 Windows 目录同步差异。该数字是 AUTOMATED TESTED，不替代最终 exact-SHA CI 或人工验收 |
 
 ## 尚未完成的发布门槛
 

@@ -25,7 +25,7 @@ Python 仅通过版本化 TSV 传递绝对先验，并对 native JSON 做第二�
 
 `FactorGraphQualityPolicy` v1 将 solver convergence、graph integrity 与 product quality 分离，检查 relative/loop translation+yaw 的 p95/max、loop 高残差比例、最大 pose update、relative factor coverage 和 objective improvement。policy SHA 写入 factor report、release manifest 和现场证据。仓库内策略当前状态为 `candidate`，因此 `graph_quality_passed/published_capable` 必为 false；只有真实 P5/P6 分布经人工/P8 审核后将同一版本化策略明确冻结，生产发布门才可能通过。
 
-完整求解结果写入不可变版本的 `factor_graph_report.json`。`localization_report.solver.factor_set_sha256` 必须与它一致；store 层还复核 input identity 和 optimized DB hash。只有完整 native graph、图完整性和冻结质量策略全部通过时，report 的 publish capability 才可通过。Field Qualification v3 不接受客户端声明 `factorGraphQualityPassed=true` 的自由 JSON，而是从 exact version manifest 绑定的 `factor_graph_report.json` 自动生成 `MarketScannerTrajectoryQualificationEvidence` v1。正式 `published` 状态还必须在 production runtime 的即时 selfcheck 通过后，由 store 写锁内复读 Field Evidence v3，并把 exact bytes 纳入 published manifest v4。
+完整求解结果写入不可变版本的 `factor_graph_report.json`。`localization_report.solver.factor_set_sha256` 必须与它一致；store 层还复核 input identity 和 optimized DB hash。只有完整 native graph、图完整性和冻结质量策略全部通过时，report 的 publish capability 才可通过。Field Qualification v3 不接受客户端声明 `factorGraphQualityPassed=true` 的自由 JSON，而是从 exact version manifest 绑定的 artifact 自动生成 `MarketScannerTrajectoryQualificationEvidence` v1，并保存可重新派生的 source bundle；修改指标或 flag 后重算内外层 SHA 仍会被拒绝。正式 `published` 状态还必须在 production runtime 的即时 selfcheck 通过后，由 store 写锁内复读 Field Evidence v3，并把 exact bytes 纳入 published manifest v4。
 
 ## 已执行验证
 

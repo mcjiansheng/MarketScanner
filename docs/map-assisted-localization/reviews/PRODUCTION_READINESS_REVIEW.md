@@ -10,7 +10,7 @@
 
 当前结论为 **NO-GO / NOT PRODUCTION READY**。W2R 的 evidence bundle、checkpoint cleanup、原子可见写入、复制后本地保留及 typed finalization disposition 已有自动化保护；这些能力是生产化工作的安全起点，不代表最终产品验收完成。
 
-P7R1 增量已实现 production-only publish、publish 前即时 production selfcheck、Device App SHA 与 release SHA 精确绑定、从 immutable version 自动生成的 typed trajectory evidence、Field Evidence v3、descriptor-bound JSON/CSV 读取、published manifest v4 自包含 evidence、package stable-read 和真实 About runtime mode。上述只能标记 **IMPLEMENTED / AUTOMATED TESTED**；最终精确 SHA 全矩阵成功后才是 **CI VERIFIED / READY FOR HUMAN QUALIFICATION**。真实 P5/P6/P7/P8 未执行，禁止标记 **HUMAN REVIEWED / REAL DEVICE PASS / FIELD PASS / PRODUCTION QUALIFIED**。
+P7R1 增量已实现 production-only publish、publish 前即时 production selfcheck、package-bound release identity、Device App SHA 与 release SHA 精确绑定、从 immutable version 自动生成且可由 self-contained source bundle 重新派生的 typed trajectory evidence、Field Evidence v3、descriptor-bound JSON/CSV 读取、exact plan/release/policy/CSV/Device Evidence publication package、published manifest v4 自包含 evidence、package stable-read 和真实 About runtime mode。上述只能标记 **IMPLEMENTED / AUTOMATED TESTED**；最终精确 SHA 全矩阵成功后才是 **CI VERIFIED / READY FOR HUMAN QUALIFICATION**。真实 P5/P6/P7/P8 未执行，禁止标记 **HUMAN REVIEWED / REAL DEVICE PASS / FIELD PASS / PRODUCTION QUALIFIED**。
 
 P0 只冻结安全基线，不改变业务算法。CI 必须单独运行并报告以下不可退化契约：
 
@@ -41,8 +41,8 @@ P0 只冻结安全基线，不改变业务算法。CI 必须单独运行并报�
 | P3 | Map Studio 持久任务和重启恢复 | 已实现并通过工作台测试目录 86 项回归；独立运行时进程强杀后由新进程恢复为 `interrupted`，服务重启不猜测续跑，不按不可信 journal 路径清理 |
 | P4 | iOS finalization、保留和 provider hardening | 代码与主机压力测试已完成：100k×3 streaming、15,040,512-byte peak RSS、descriptor identity、copy v2 隐私和未执行 durability hook；真机 smoke 未执行，不声称 power-loss durability |
 | P5 | 真实设备矩阵 | Device Evidence v2 与 App/release exact SHA 门已实现；真实 LiDAR iPhone 未执行，因此仍为 NO-GO |
-| P6 | 正式现场验收 | Field v3、typed immutable trajectory evidence、3-run、20 descriptor-bound 控制点和重复性验证已实现；办公室/卖场未执行，因此仍为 NO-GO |
-| P7 | 安装包、升级/卸载和 selfcheck | production-only publish、即时 selfcheck、evidence 自包含、真实 About mode、package stable-read 已实现；既有同机 smoke 不替代干净 macOS/Windows 安装/升级/卸载测试 |
+| P6 | 正式现场验收 | Field v3、可重新派生的 immutable trajectory/source evidence、exact CSV/Device bytes、3-run、20 控制点和重复性验证已实现；办公室/卖场未执行，因此仍为 NO-GO |
+| P7 | 安装包、升级/卸载和 selfcheck | production-only publish、即时 selfcheck、package-bound release、evidence 自包含、真实 About mode、package stable-read 已实现；既有同机 smoke 不替代干净 macOS/Windows 安装/升级/卸载测试 |
 | P8 | 独立代码、证据和发布复核 | 未执行 |
 
 P1 至 P4 可以在 P0 通过后组织，但每一 wave 必须使用独立分支、明确基线、原子提交和单独验证；不得把多个大型 wave 合并成一次不可审查的改动。P5/P6 的证据必须来自真实设备和现场，缺失时如实保持未执行。
