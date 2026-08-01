@@ -306,6 +306,11 @@ class QualificationTests(unittest.TestCase):
                         label="evidence",
                     )
 
+            # Windows denies replacing an open file before the identity checks;
+            # restore the adversarial fixture after the main descriptor closes.
+            if parked.exists():
+                path.replace(forged)
+                parked.replace(path)
             self.assertEqual(path.read_bytes(), original)
 
     def test_windows_evidence_write_skips_unsupported_directory_fsync(self) -> None:
