@@ -162,6 +162,10 @@ jobs:
           python -c "import tools.SupermarketMapStudio.server"
       - name: Run PriorMap tests on Windows
         run: python -m unittest discover -s tools/PriorMap/tests -v
+      - name: Run Windows stable-read metadata representation contract
+        run: python -m unittest tools.Qualification.tests.test_qualification.QualificationTests.test_stable_read_accepts_windows_path_handle_stat_representation -v
+      - name: Run Windows transient swap-and-restore contract
+        run: python -m unittest tools.Qualification.tests.test_qualification.QualificationTests.test_stable_read_rejects_transient_same_size_swap_and_restore -v
       - name: Run qualification evidence tests on Windows
         run: python -m unittest discover -s tools/Qualification/tests -v
       - name: Run Map Studio tests on Windows
