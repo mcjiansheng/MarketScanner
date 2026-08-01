@@ -167,7 +167,17 @@ jobs:
       - name: Run Windows transient swap-and-restore contract
         run: python -m unittest tools.Qualification.tests.test_qualification.QualificationTests.test_stable_read_rejects_transient_same_size_swap_and_restore -v
       - name: Run qualification evidence tests on Windows
-        run: python -m unittest discover -s tools/Qualification/tests -v
+        shell: pwsh
+        run: |
+          $logPath = "ci-artifacts/windows-qualification.log"
+          python -m unittest discover -s tools/Qualification/tests -v 2>&1 | Tee-Object -FilePath $logPath
+          $testExit = $LASTEXITCODE
+          if ($testExit -ne 0) {
+            $tail = (Get-Content $logPath -Tail 100) -join "`n"
+            $escaped = $tail.Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
+            Write-Output "::error title=Windows Qualification Failure::$escaped"
+            exit $testExit
+          }
       - name: Run Map Studio tests on Windows
         run: python -m unittest discover -s tools/SupermarketMapStudio/tests -v
       - name: Finalize Windows test summary
@@ -182,7 +192,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: marketscanner-windows-summary-${{ github.run_id }}
-          path: ci-artifacts/windows-summary.md
+          path: ci-artifacts/
           if-no-files-found: error
 
   windows-native-clean-build:
