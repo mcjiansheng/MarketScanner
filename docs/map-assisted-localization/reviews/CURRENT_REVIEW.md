@@ -5,7 +5,7 @@
 > 冻结基线：`repair-v2-w2r-safety-closeout@cf1b62c949f3574e1804808537e38c8ff643549c`。
 > P7R1 审查基线：`repair-v2-p7r0-independent-baseline@79c86b120fc47c28bd350e86abc9b0354d7e838d`。
 > 当前实施分支：`repair-v2-p7r1-evidence-publication-closeout`。
-> P7R1 累计代码提交：`e9940996f13627fb25329eb78c921c7b3f4eadfc`；其后仅允许治理文档/wave 绑定提交。
+> P7R1 累计代码提交：`623f737ff65e504c3ec6c437b73edafeb8a145bd`；其后仅允许治理文档/wave 绑定提交。
 
 当前权威审查为 [Production Readiness Review](PRODUCTION_READINESS_REVIEW.md)。
 
