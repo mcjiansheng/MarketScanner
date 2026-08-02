@@ -38,6 +38,8 @@ HUBER_TRANSLATION_M = 0.45
 HUBER_YAW_RAD = math.radians(10)
 HARD_REJECT_TRANSLATION_M = 2.5
 HARD_REJECT_YAW_RAD = math.radians(45)
+MANUAL_ANCHOR_MAX_TRANSLATION_M = 5.0
+MANUAL_ANCHOR_MAX_YAW_RAD = math.radians(30.0)
 SESSION_INPUT_FILE_NAMES = (
     "metadata.json",
     "localization_trace.jsonl",
@@ -99,7 +101,7 @@ def normalize_replay_parameters(
             raise OfflineLocalizationError(f"Replay parameter {name} is invalid.")
         normalized[name] = number
     axes = values.get("horizontal_axes")
-    if axes not in {"xz", "xy"}:
+    if axes not in {"xz", "xy", "ios_prior"}:
         raise OfflineLocalizationError("Replay parameter horizontal_axes is invalid.")
     if values.get("auto_align_segments") is not False:
         raise OfflineLocalizationError(
@@ -1852,21 +1854,32 @@ def optimize_trajectory(
             )
             residual_xy = math.hypot(constraint.x - current[0], constraint.y - current[1])
             residual_yaw = abs(_normalize_angle(constraint.yaw - current[2]))
-            if (
-                constraint.kind
-                not in {"manual_anchor", "manual_aisle_assignment", "road_soft"}
-                and (
+            is_manual_anchor = constraint.kind == "manual_anchor"
+            if is_manual_anchor:
+                exceeds_gate = (
+                    residual_xy > MANUAL_ANCHOR_MAX_TRANSLATION_M
+                    or residual_yaw > MANUAL_ANCHOR_MAX_YAW_RAD
+                )
+            else:
+                exceeds_gate = constraint.kind not in {
+                    "manual_aisle_assignment",
+                    "road_soft",
+                } and (
                     residual_xy > HARD_REJECT_TRANSLATION_M
                     or residual_yaw > HARD_REJECT_YAW_RAD
                 )
-            ):
+            if exceeds_gate:
                 rejected.append(
                     {
                         "constraint_id": constraint.identifier,
                         "kind": constraint.kind,
                         "translation_residual_m": residual_xy,
                         "yaw_residual_deg": math.degrees(residual_yaw),
-                        "reason": "robust_hard_gate",
+                        "reason": (
+                            "manual_anchor_safety_gate"
+                            if is_manual_anchor
+                            else "robust_hard_gate"
+                        ),
                     }
                 )
                 continue
@@ -2050,7 +2063,11 @@ def _trajectory_geojson(
     features = [
         {
             "type": "Feature",
-            "properties": {"layer": "rtabmap_optimized"},
+            "properties": {
+                "layer": "rtabmap_optimized",
+                "timestamps": [pose.timestamp for pose in baseline],
+                "node_ids": [pose.node_id for pose in baseline],
+            },
             "geometry": {
                 "type": "LineString",
                 "coordinates": [[pose.x, pose.y] for pose in baseline],
@@ -2058,7 +2075,11 @@ def _trajectory_geojson(
         },
         {
             "type": "Feature",
-            "properties": {"layer": "prior_map_offline_optimized"},
+            "properties": {
+                "layer": "prior_map_offline_optimized",
+                "timestamps": [pose.timestamp for pose in optimized],
+                "node_ids": [pose.node_id for pose in optimized],
+            },
             "geometry": {
                 "type": "LineString",
                 "coordinates": [[pose.x, pose.y] for pose in optimized],
@@ -2070,7 +2091,15 @@ def _trajectory_geojson(
             0,
             {
                 "type": "Feature",
-                "properties": {"layer": "online_localization"},
+                "properties": {
+                    "layer": "online_localization",
+                    "timestamps": [
+                        _field(record, "timestamp", "timestamp")
+                        for record in online
+                        if _pose_from(_field(record, "estimated_pose", "estimatedPose"))
+                        is not None
+                    ],
+                },
                 "geometry": {
                     "type": "LineString",
                     "coordinates": [[pose[0], pose[1]] for pose in online_points],
@@ -2090,9 +2119,18 @@ def _bounded_review_trajectory(
         sampled = coordinates[::stride]
         if coordinates and sampled[-1:] != coordinates[-1:]:
             sampled.append(coordinates[-1])
+        properties = dict(feature.get("properties", {}))
+        for key in ("timestamps", "node_ids"):
+            values = properties.get(key)
+            if isinstance(values, list) and len(values) == len(coordinates):
+                sampled_values = values[::stride]
+                if values and len(sampled_values) < len(sampled):
+                    sampled_values.append(values[-1])
+                properties[key] = sampled_values
         features.append(
             {
                 **feature,
+                "properties": properties,
                 "geometry": {**feature.get("geometry", {}), "coordinates": sampled},
             }
         )

@@ -2384,6 +2384,8 @@ class MapStudioApiTests(unittest.TestCase):
             b'id="run-localized"',
             b'id="localized-review-editor"',
             b'id="localized-review-canvas"',
+            b'id="localized-map-anchor-controls"',
+            b'id="localized-map-anchor-yaw"',
             b'id="localized-tag-filter"',
             b'id="localized-shelf-filter"',
             b'id="localized-undo"',
@@ -2402,6 +2404,9 @@ class MapStudioApiTests(unittest.TestCase):
         self.assertIn(b"expected_version_id", script)
         self.assertIn(b"/localized/state", script)
         self.assertIn(b"drawLocalizedReview", script)
+        self.assertIn(b"beginLocalizedAnchor", script)
+        self.assertIn(b"anchorDraft", script)
+        self.assertIn(b"prior_map_offline_optimized", script)
 
     def test_unsafe_optimized_pose_jump_is_rejected_before_publication(self) -> None:
         session = create_session(self.root, "SupermarketSession-UnsafeOptimization", 0.0, "continuous_streaming")
@@ -2784,6 +2789,16 @@ class MapStudioApiTests(unittest.TestCase):
     def test_database_pose_is_converted_to_ios_xz_frame(self) -> None:
         parsed = server.base.parse_rtabmap_transform_3d(transform_blob(2.0, 1.5, 1.0), "xz")
         self.assertEqual(parsed, (-1.5, -2.0, 1.0, 0.0))
+
+    def test_database_pose_is_converted_to_exact_ios_prior_frame(self) -> None:
+        parsed = server.base.parse_rtabmap_transform_3d(
+            transform_yaw_blob(2.0, -1.5, 1.0, 25.0), "ios_prior"
+        )
+        assert parsed is not None
+        self.assertAlmostEqual(parsed[0], 1.5)
+        self.assertAlmostEqual(parsed[1], 2.0)
+        self.assertAlmostEqual(parsed[2], 1.0)
+        self.assertAlmostEqual(math.degrees(parsed[3]), 25.0, places=5)
 
     def test_local_grid_columns_require_an_actual_nonempty_blob(self) -> None:
         database = self.session_a / "segment_0001" / "rtabmap_segment_0001.db"

@@ -24,6 +24,8 @@ FACTOR_GRAPH_ENV = "MARKETSCANNER_FACTOR_GRAPH_BIN"
 DEFAULT_ITERATIONS = 100
 DEFAULT_EPSILON = 1.0e-6
 SAFE_TEXT_RE = re.compile(r"[^\t\r\n]{1,500}")
+MANUAL_ANCHOR_MAX_TRANSLATION_M = 5.0
+MANUAL_ANCHOR_MAX_YAW_RAD = math.radians(30.0)
 
 
 class FactorGraphRunnerError(ValueError):
@@ -91,16 +93,32 @@ def _select_absolute_priors(
         current = baseline[index]
         translation = math.hypot(constraint.x - current.x, constraint.y - current.y)
         yaw = abs(_normalize_angle(constraint.yaw - current.yaw))
-        if constraint.kind not in {"manual_anchor", "manual_aisle_assignment", "road_soft"} and (
-            translation > hard_reject_translation_m or yaw > hard_reject_yaw_rad
-        ):
+        is_manual_anchor = constraint.kind == "manual_anchor"
+        if is_manual_anchor:
+            exceeds_gate = (
+                translation > MANUAL_ANCHOR_MAX_TRANSLATION_M
+                or yaw > MANUAL_ANCHOR_MAX_YAW_RAD
+            )
+        else:
+            exceeds_gate = constraint.kind not in {
+                "manual_aisle_assignment",
+                "road_soft",
+            } and (
+                translation > hard_reject_translation_m
+                or yaw > hard_reject_yaw_rad
+            )
+        if exceeds_gate:
             rejected.append(
                 {
                     "constraint_id": constraint.identifier,
                     "kind": constraint.kind,
                     "translation_residual_m": translation,
                     "yaw_residual_deg": math.degrees(yaw),
-                    "reason": "factor_graph_robust_hard_gate",
+                    "reason": (
+                        "manual_anchor_safety_gate"
+                        if is_manual_anchor
+                        else "factor_graph_robust_hard_gate"
+                    ),
                 }
             )
             continue
@@ -172,8 +190,10 @@ def run_relative_se2_factor_graph(
     quality_policy_path: Path = DEFAULT_POLICY_PATH,
     timeout_seconds: int = 30 * 60,
 ) -> tuple[list[Any], list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
-    if horizontal_axes not in {"xy", "xz"}:
-        raise FactorGraphRunnerError("Factor graph horizontal axes must be xy or xz.")
+    if horizontal_axes not in {"xy", "xz", "ios_prior"}:
+        raise FactorGraphRunnerError(
+            "Factor graph horizontal axes must be xy, xz or ios_prior."
+        )
     if not baseline:
         raise FactorGraphRunnerError("Factor graph requires a non-empty trajectory.")
     database = optimized_database.resolve()

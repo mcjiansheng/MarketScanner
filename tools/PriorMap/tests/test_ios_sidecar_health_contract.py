@@ -9,6 +9,8 @@ REPOSITORY = Path(__file__).resolve().parents[3]
 SESSION_SOURCE = REPOSITORY / "app/ios/RTABMapApp/SupermarketScanSession.swift"
 VIEW_SOURCE = REPOSITORY / "app/ios/RTABMapApp/ViewController.swift"
 OVERLAY_SOURCE = REPOSITORY / "app/ios/RTABMapApp/PriorMapLocalization.swift"
+MATCHER_SOURCE = REPOSITORY / "app/ios/RTABMapApp/PriorMapScanMatcher.swift"
+DEPTH_SOURCE = REPOSITORY / "app/ios/RTABMapApp/PriorMapDepthSampler.swift"
 FINALIZATION_CORE_SOURCE = (
     REPOSITORY / "app/ios/RTABMapApp/SupermarketFinalizationCore.swift"
 )
@@ -19,6 +21,29 @@ def source(path: Path) -> str:
 
 
 class IOSLocalizationSidecarHealthContractTests(unittest.TestCase):
+    def test_sam_recovery_and_dynamic_filtering_contracts_are_wired(self) -> None:
+        view = source(VIEW_SOURCE)
+        overlay = source(OVERLAY_SOURCE)
+        matcher = source(MATCHER_SOURCE)
+        depth = source(DEPTH_SOURCE)
+        for token in (
+            "PriorMapHypothesisTracker",
+            "activeTracks",
+            "recoverySearch ? 5.0 : 1.2",
+            "recoverySearch ? 30 : 12",
+        ):
+            self.assertIn(token, matcher)
+        for token in (
+            'requestRecovery(reason: "reliable_rtabmap_loop")',
+            "mPendingAdaptiveDetectionRateSince",
+            "dwellSeconds",
+            "priorMapLastNodeBinding",
+        ):
+            self.assertIn(token, view)
+        self.assertIn("recoveryFramesRemaining = max(recoveryFramesRemaining, 20)", overlay)
+        self.assertIn("translation <= 0.5", overlay)
+        self.assertIn("guard hits >= 4, frameIndex - firstFrame >= 3", depth)
+
     def test_trace_constraint_and_state_return_one_structured_result(self) -> None:
         session = source(SESSION_SOURCE)
         finalization = source(FINALIZATION_CORE_SOURCE)

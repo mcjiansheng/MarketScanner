@@ -383,6 +383,41 @@ class RobustSE2OptimizerTests(unittest.TestCase):
         self.assertEqual([item["constraint_id"] for item in rejected], ["wrong-basin"])
         self.assertEqual([item["constraint_id"] for item in accepted], ["good-end"])
 
+    def test_manual_anchor_is_tolerant_but_never_unbounded(self) -> None:
+        baseline = [Pose(1, 0.0, 0.0, 0.0, 0.0)]
+        constraints = [
+            AbsoluteConstraint(
+                identifier="within-test-tolerance",
+                node_index=0,
+                x=4.8,
+                y=0.0,
+                yaw=math.radians(29.0),
+                weight=10.0,
+                kind="manual_anchor",
+                source={},
+            ),
+            AbsoluteConstraint(
+                identifier="conflicting-phone-anchor",
+                node_index=0,
+                x=8.0,
+                y=0.0,
+                yaw=0.0,
+                weight=100.0,
+                kind="manual_anchor",
+                source={},
+            ),
+        ]
+        _optimized, accepted, rejected = optimize_trajectory(baseline, constraints)
+        self.assertEqual(
+            [item["constraint_id"] for item in accepted],
+            ["within-test-tolerance"],
+        )
+        self.assertEqual(
+            [item["constraint_id"] for item in rejected],
+            ["conflicting-phone-anchor"],
+        )
+        self.assertEqual(rejected[0]["reason"], "manual_anchor_safety_gate")
+
     def test_road_soft_constraints_are_local_bounded_and_direction_aware(self) -> None:
         baseline = [
             Pose(index + 1, float(index), float(index), 0.2, 0.1)
@@ -1329,7 +1364,7 @@ class LocalizedPipelineTests(unittest.TestCase):
             report["manual_localization_event_audit"][0]["status"], "accepted"
         )
 
-    def test_diagnostic_mode_keeps_unsafe_draft_and_phone_conflict_audit(self) -> None:
+    def test_diagnostic_mode_ignores_unsafe_manual_anchor_and_phone_conflicts(self) -> None:
         manifest = json.loads((self.prior_map / "manifest.json").read_text())
         jsonl_write(
             self.segment / "manual_localization_events.jsonl",
@@ -1368,10 +1403,14 @@ class LocalizedPipelineTests(unittest.TestCase):
             self.optimized_database,
             strict_output,
         )
-        self.assertGreater(strict["maximum_correction_m"], 2.0)
-        self.assertFalse(strict["allow_draft"])
-        self.assertFalse(strict["current_updated"])
-        self.assertIsNone(LocalizedVersionStore(strict_output).current())
+        self.assertLess(strict["maximum_correction_m"], 2.0)
+        self.assertIn(
+            "manual_anchor_safety_gate",
+            {item["reason"] for item in strict["high_residual_intervals"]},
+        )
+        self.assertTrue(strict["allow_draft"])
+        self.assertTrue(strict["current_updated"])
+        self.assertIsNotNone(LocalizedVersionStore(strict_output).current())
 
         diagnostic_output = self.root / "localized-unsafe-diagnostic"
         diagnostic = process_localized_session(
@@ -1392,7 +1431,7 @@ class LocalizedPipelineTests(unittest.TestCase):
         self.assertTrue(diagnostic["current_updated"])
         self.assertEqual(diagnostic["publish_state"], "draft")
         self.assertEqual(
-            diagnostic["ignored_conflicting_source_constraint_count"], 2
+            diagnostic["ignored_conflicting_source_constraint_count"], 1
         )
         self.assertFalse(diagnostic["publish_gate"]["passed"])
         self.assertIn(

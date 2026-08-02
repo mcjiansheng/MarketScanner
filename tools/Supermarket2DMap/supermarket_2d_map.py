@@ -374,6 +374,11 @@ def parse_rtabmap_transform_3d(blob: bytes, axes: str) -> Optional[Tuple[float, 
         # supermarket trajectory sidecars: ios(x,y,z)=(-native_y,native_z,-native_x).
         yaw_xz = math.atan2(-values[9], values[5])
         return -ty, -tx, tz, yaw_xz
+    if axes == "ios_prior":
+        # RTABMapApp stores N = R * ARKit * inverse(R), whose translation is
+        # (-arkit_z, -arkit_x, arkit_y). Recover the exact x/-z and yaw contract
+        # used by PriorMapStageOneMath on the phone.
+        return -ty, tx, tz, yaw_xy
     raise ValueError(f"Unsupported horizontal axes: {axes}")
 
 
@@ -670,6 +675,8 @@ def project_xy(x: float, y: float, z: float, axes: str) -> Tuple[float, float]:
         return x, y
     if axes == "xz":
         return x, z
+    if axes == "ios_prior":
+        return -y, x
     raise ValueError(f"Unsupported horizontal axes: {axes}")
 
 
@@ -1630,6 +1637,8 @@ def extract_depth_point_cloud(
                         native_world = transform_xyz(projection_matrix, local_point)
                         if horizontal_axes == "xz":
                             point_x, point_y, point_height = -native_world[1], -native_world[0], native_world[2]
+                        elif horizontal_axes == "ios_prior":
+                            point_x, point_y, point_height = -native_world[1], native_world[0], native_world[2]
                         else:
                             point_x, point_y, point_height = native_world
                         point_x, point_y = transform_point(

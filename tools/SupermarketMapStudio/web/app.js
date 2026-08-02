@@ -43,6 +43,9 @@ const localizedReview = {
   reviewArtifactUrl: null,
   fieldQualification: null,
   fieldQualificationPath: null,
+  anchorDraft: null,
+  anchorDragging: false,
+  canvasProjection: null,
 };
 
 const viewer2d = {
@@ -1118,6 +1121,14 @@ function drawLocalizedReview() {
     padding + (Number(point[0]) - minX) * scale,
     height - padding - (Number(point[1]) - minY) * scale,
   ];
+  localizedReview.canvasProjection = {
+    ratio,
+    project,
+    unproject: (point) => [
+      minX + (Number(point[0]) - padding) / scale,
+      minY + (height - padding - Number(point[1])) / scale,
+    ],
+  };
   context.lineJoin = "round";
   (data.elements || []).forEach((element) => {
     const points = element.geometry?.coordinates || [];
@@ -1167,6 +1178,124 @@ function drawLocalizedReview() {
       context.stroke();
     }
   });
+  const anchor = localizedReview.anchorDraft;
+  if (anchor) {
+    const source = project([anchor.source_x_m, anchor.source_y_m]);
+    const target = project([anchor.x_m, anchor.y_m]);
+    context.save();
+    context.strokeStyle = "#e04f3f";
+    context.fillStyle = "#e04f3f";
+    context.lineWidth = 2 * ratio;
+    context.setLineDash([5 * ratio, 4 * ratio]);
+    context.beginPath();
+    context.moveTo(source[0], source[1]);
+    context.lineTo(target[0], target[1]);
+    context.stroke();
+    context.setLineDash([]);
+    context.translate(target[0], target[1]);
+    context.rotate(-anchor.yaw_rad);
+    context.beginPath();
+    context.moveTo(0, -10 * ratio);
+    context.lineTo(6 * ratio, 7 * ratio);
+    context.lineTo(0, 4 * ratio);
+    context.lineTo(-6 * ratio, 7 * ratio);
+    context.closePath();
+    context.fill();
+    context.restore();
+  }
+}
+
+function localizedCanvasPoint(event) {
+  const canvas = $("#localized-review-canvas");
+  const rect = canvas.getBoundingClientRect();
+  return [
+    (event.clientX - rect.left) * canvas.width / Math.max(1, rect.width),
+    (event.clientY - rect.top) * canvas.height / Math.max(1, rect.height),
+  ];
+}
+
+function updateLocalizedAnchorSummary() {
+  const anchor = localizedReview.anchorDraft;
+  $("#localized-map-anchor-summary").textContent = anchor
+    ? `节点 ${anchor.node_id ?? "—"} · 时间 ${Number(anchor.timestamp).toFixed(2)} s · 目标 ${anchor.x_m.toFixed(2)}, ${anchor.y_m.toFixed(2)} m`
+    : "尚未选择轨迹点";
+  if (anchor) {
+    const degrees = Math.round(anchor.yaw_rad * 180 / Math.PI);
+    $("#localized-map-anchor-yaw").value = String(degrees);
+    $("#localized-map-anchor-yaw-value").value = `${degrees}°`;
+  }
+}
+
+function beginLocalizedAnchor(event) {
+  if ($("#localized-edit-type").value !== "set_anchor" || !localizedReview.data) return;
+  const projection = localizedReview.canvasProjection;
+  if (!projection) return;
+  const point = localizedCanvasPoint(event);
+  const feature = (localizedReview.data.trajectory?.features || []).find(
+    (item) => item.properties?.layer === "prior_map_offline_optimized",
+  );
+  const coordinates = feature?.geometry?.coordinates || [];
+  const timestamps = feature?.properties?.timestamps || [];
+  const nodeIds = feature?.properties?.node_ids || [];
+  if (!coordinates.length || timestamps.length !== coordinates.length) {
+    $("#localized-edit-status").textContent = "当前结果缺少轨迹时间索引，请用修复后的版本重新处理";
+    return;
+  }
+  let bestIndex = -1;
+  let bestDistance = Infinity;
+  coordinates.forEach((coordinate, index) => {
+    const projected = projection.project(coordinate);
+    const distance = Math.hypot(projected[0] - point[0], projected[1] - point[1]);
+    if (distance < bestDistance) {
+      bestDistance = distance;
+      bestIndex = index;
+    }
+  });
+  if (bestIndex < 0 || bestDistance > 32 * projection.ratio) {
+    $("#localized-edit-status").textContent = "请先点击绿色离线轨迹附近的节点";
+    return;
+  }
+  const nextIndex = Math.min(coordinates.length - 1, bestIndex + 1);
+  const previousIndex = Math.max(0, bestIndex - 1);
+  const directionStart = coordinates[previousIndex];
+  const directionEnd = coordinates[nextIndex];
+  const yaw = Math.atan2(
+    Number(directionEnd[1]) - Number(directionStart[1]),
+    Number(directionEnd[0]) - Number(directionStart[0]),
+  );
+  localizedReview.anchorDraft = {
+    timestamp: Number(timestamps[bestIndex]),
+    node_id: nodeIds[bestIndex] ?? null,
+    source_x_m: Number(coordinates[bestIndex][0]),
+    source_y_m: Number(coordinates[bestIndex][1]),
+    x_m: Number(coordinates[bestIndex][0]),
+    y_m: Number(coordinates[bestIndex][1]),
+    yaw_rad: yaw,
+  };
+  localizedReview.anchorDragging = true;
+  event.currentTarget.setPointerCapture?.(event.pointerId);
+  updateLocalizedAnchorSummary();
+  drawLocalizedReview();
+  event.preventDefault();
+}
+
+function dragLocalizedAnchor(event) {
+  if (!localizedReview.anchorDragging || !localizedReview.anchorDraft) return;
+  const point = localizedCanvasPoint(event);
+  const mapPoint = localizedReview.canvasProjection?.unproject(point);
+  if (!mapPoint) return;
+  localizedReview.anchorDraft.x_m = mapPoint[0];
+  localizedReview.anchorDraft.y_m = mapPoint[1];
+  updateLocalizedAnchorSummary();
+  drawLocalizedReview();
+  event.preventDefault();
+}
+
+function endLocalizedAnchor(event) {
+  if (!localizedReview.anchorDragging) return;
+  localizedReview.anchorDragging = false;
+  event.currentTarget.releasePointerCapture?.(event.pointerId);
+  event.preventDefault();
 }
 
 function renderLocalizedReviewList() {
@@ -1194,6 +1323,7 @@ function renderLocalizedReviewList() {
       localizedReview.selectedTagId = String(tag.tag_id);
       $("#localized-edit-object").value = String(tag.tag_id);
       $("#localized-edit-type").value = tag.needs_review ? "edit_tag" : "approve_tag";
+      updateLocalizedEditHelp();
       renderLocalizedReviewList();
       drawLocalizedReview();
     });
@@ -1210,6 +1340,7 @@ function renderLocalizedReviewList() {
       $("#localized-edit-type").value = item.type === "rejected_constraint"
         ? "disable_constraint"
         : "set_anchor";
+      updateLocalizedEditHelp();
     });
     target.appendChild(button);
   });
@@ -1219,6 +1350,9 @@ function renderLocalizedReviewList() {
 async function loadLocalizedReview(url) {
   localizedReview.data = url ? await request(url) : null;
   localizedReview.selectedTagId = null;
+  localizedReview.anchorDraft = null;
+  localizedReview.anchorDragging = false;
+  updateLocalizedAnchorSummary();
   renderLocalizedReviewList();
   drawLocalizedReview();
 }
@@ -1237,6 +1371,15 @@ function updateLocalizedEditHelp() {
   $("#localized-edit-object").placeholder = objectHelp;
   $("#localized-edit-value").placeholder = valueExample || "该操作不需要新值";
   $("#localized-edit-help").textContent = `当前操作：${objectHelp}${valueExample ? `；新值示例 ${valueExample}` : "；无需填写新值"}`;
+  const mapAnchor = type === "set_anchor";
+  $("#localized-map-anchor-controls").hidden = !mapAnchor;
+  $("#localized-map-anchor-help").hidden = !mapAnchor;
+  $("#localized-edit-object-field").hidden = mapAnchor;
+  $("#localized-edit-value-field").hidden = mapAnchor;
+  $("#localized-review-canvas").classList.toggle("anchor-mode", mapAnchor);
+  if (mapAnchor) {
+    $("#localized-edit-help").textContent = "在画布点击绿色离线轨迹节点，按住拖到正确地图位置；用滑块调整朝向。对象 ID 和 JSON 将自动生成。";
+  }
 }
 
 async function applyLocalizedEdit(action) {
@@ -1258,14 +1401,29 @@ async function applyLocalizedEdit(action) {
     };
     if (action === "append") {
       let newValue = null;
-      const text = $("#localized-edit-value").value.trim();
-      if (text) {
-        try { newValue = JSON.parse(text); }
-        catch (_error) { throw new Error("新值必须是有效 JSON"); }
+      const type = $("#localized-edit-type").value;
+      if (type === "set_anchor") {
+        if (!localizedReview.anchorDraft) {
+          throw new Error("请先在轨迹画布点击一个节点并拖到正确位置");
+        }
+        newValue = {
+          timestamp: localizedReview.anchorDraft.timestamp,
+          x_m: localizedReview.anchorDraft.x_m,
+          y_m: localizedReview.anchorDraft.y_m,
+          yaw_rad: localizedReview.anchorDraft.yaw_rad,
+        };
+      } else {
+        const text = $("#localized-edit-value").value.trim();
+        if (text) {
+          try { newValue = JSON.parse(text); }
+          catch (_error) { throw new Error("新值必须是有效 JSON"); }
+        }
       }
       payload.event = {
-        type: $("#localized-edit-type").value,
-        object_id: $("#localized-edit-object").value.trim(),
+        type,
+        object_id: type === "set_anchor"
+          ? `map-anchor-${localizedReview.anchorDraft.node_id ?? localizedReview.anchorDraft.timestamp}`
+          : $("#localized-edit-object").value.trim(),
         new_value: newValue,
         reason: $("#localized-edit-reason").value.trim(),
       };
@@ -3303,6 +3461,18 @@ function bindEvents() {
   $("#localized-field-evidence").addEventListener("click", inspectFieldQualification);
   $("#localized-revoke").addEventListener("click", () => applyLocalizedState("revoke"));
   $("#localized-edit-type").addEventListener("change", updateLocalizedEditHelp);
+  $("#localized-review-canvas").addEventListener("pointerdown", beginLocalizedAnchor);
+  $("#localized-review-canvas").addEventListener("pointermove", dragLocalizedAnchor);
+  $("#localized-review-canvas").addEventListener("pointerup", endLocalizedAnchor);
+  $("#localized-review-canvas").addEventListener("pointercancel", endLocalizedAnchor);
+  $("#localized-map-anchor-yaw").addEventListener("input", (event) => {
+    const degrees = Number(event.target.value);
+    $("#localized-map-anchor-yaw-value").value = `${degrees}°`;
+    if (localizedReview.anchorDraft) {
+      localizedReview.anchorDraft.yaw_rad = degrees * Math.PI / 180;
+      drawLocalizedReview();
+    }
+  });
   $("#localized-tag-filter").addEventListener("change", renderLocalizedReviewList);
   $("#localized-shelf-filter").addEventListener("input", renderLocalizedReviewList);
   window.addEventListener("resize", drawLocalizedReview);

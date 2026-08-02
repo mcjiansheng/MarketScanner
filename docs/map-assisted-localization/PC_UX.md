@@ -28,7 +28,9 @@ Map Studio 保留单设备、多设备和“导入/管理先验地图”入口�
 8. 运行质量门禁并进入轨迹/价签复核；
 9. 导出 JSON/CSV/GeoJSON 和审计日志。
 
-测试阶段默认显示“测试诊断模式”。该模式只放宽“是否保留并加载工作草稿”，不放宽 review/publish gate：稳健硬门拒绝的手机 `online_structure` 约束不会参与求解，但仍完整写入 `localization_constraints.json`、`review_items.json` 和接受率/残差统计；累计修正超过 2 m 时仍生成可视化 `draft`。报告固定写入 `diagnostic_mode=true`、`diagnostic_only=true`、忽略冲突约束数量和 `diagnostic_mode_enabled` 发布 blocker，因而不能提交为生产成果。关闭该选项时恢复严格行为，超限结果只保留不可见于 current 的 `invalid` 诊断版本。
+测试阶段默认显示“测试诊断模式”。该模式只放宽“是否保留并加载工作草稿”，不放宽 review/publish gate：稳健硬门拒绝的手机约束不会参与求解，但仍完整写入 `localization_constraints.json`、`review_items.json` 和接受率/残差统计；人工锚点允许 5 m/30°，超限即以 `manual_anchor_safety_gate` 忽略。累计修正超过严格草稿阈值时仍生成可视化 `draft`。报告固定写入 `diagnostic_mode=true`、`diagnostic_only=true` 和 `diagnostic_mode_enabled` 发布 blocker，因而不能提交为生产成果。关闭该选项时恢复严格行为，超限结果只保留不可见于 current 的 `invalid` 诊断版本。
+
+数据库轨迹用于先验地图定位时固定采用 `ios_prior` 坐标契约：从 native `R × ARKit × R⁻¹` 恢复手机 `(x,-z)` 和 yaw；地图成果渲染仍保留原选项以兼容既有输出。native 因子图对 RTAB‑Map reciprocal loop 做 canonical 确定性折叠，不因正反向独立细化的小差异整体中止。
 
 默认按钮使用安全参数。GPU、线程、分辨率等仍位于折叠高级参数。源数据库处理前后 hash 不同会立即失败。
 
@@ -46,7 +48,7 @@ Map Studio 保留单设备、多设备和“导入/管理先验地图”入口�
 - 撤销/重做；
 - 保存并按相同地图/会话 hash 重放。
 
-联动复核画布同时显示先验结构、在线轨迹、RTAB‑Map 轨迹、离线轨迹与价签，并可按待复核/批准状态和货架筛选价签；点击价签或问题会自动带入编辑对象。对象 ID 和 JSON 值仍用于精确、可审计编辑；地图上直接拖拽锚点仍是后续可用性增强。
+联动复核画布同时显示先验结构、在线轨迹、RTAB‑Map 轨迹、离线轨迹与价签，并可按待复核/批准状态和货架筛选价签。选择“设置轨迹锚点”后直接点击绿色离线轨迹节点并拖到正确地图位置，再用朝向滑块调整；时间、node、对象 ID 和 JSON 由界面自动生成。其他高级编辑仍保留严格 ID/JSON 入口。
 
 编辑器会按操作类型显示 JSON 示例并在服务端做字段白名单、有限值、地图范围、货架/侧面、边长、offset、位置一致性和批准前校验。服务端生成真实旧值、UUID、UTC 时间和审计事件；无效编辑不会写入新版本。
 

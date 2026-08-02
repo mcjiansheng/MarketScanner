@@ -291,7 +291,8 @@ Options parseOptions(int argc, char ** argv)
 		throw std::runtime_error("--database, --output and lowercase SHA-256 input/database identities are required.");
 	}
 	if(options.epsilon < 0.0) throw std::runtime_error("epsilon cannot be negative.");
-	if(options.horizontalAxes != "xy" && options.horizontalAxes != "xz") throw std::runtime_error("horizontal-axes must be xy or xz.");
+	if(options.horizontalAxes != "xy" && options.horizontalAxes != "xz" && options.horizontalAxes != "ios_prior")
+		throw std::runtime_error("horizontal-axes must be xy, xz or ios_prior.");
 	return options;
 }
 
@@ -351,6 +352,13 @@ Transform projectTransform(const Transform & transform, const std::string & hori
 	if(horizontalAxes == "xy")
 	{
 		return Transform(transform.x(), transform.y(), transform.theta());
+	}
+	if(horizontalAxes == "ios_prior")
+	{
+		// RTABMapApp persists N = R * ARKit * inverse(R).  The phone's prior-map
+		// contract is ARKit (x, -z), so recover (-native_y, native_x) and the
+		// corresponding rotation around native z.
+		return Transform(-transform.y(), transform.x(), std::atan2(transform.r21(), transform.r11()));
 	}
 	// Match supermarket_2d_map.py's native-to-iOS convention:
 	// ios(x,y,z)=(-native_y,native_z,-native_x), with the floor plane x/z.
@@ -457,22 +465,6 @@ std::array<double, 9> inverseMeasurementInformation(
 	for(int row=0;row<3;++row) for(int column=0;column<3;++column)
 		result[row*3+column]=canonicalInformation.at<double>(row,column);
 	return result;
-}
-
-bool approximatelyEqual(double left, double right, double absoluteTolerance, double relativeTolerance)
-{
-	return std::fabs(left-right) <= absoluteTolerance + relativeTolerance*std::max(std::fabs(left),std::fabs(right));
-}
-
-bool equivalentFactor(const Factor & left, const Factor & right)
-{
-	if(left.kind!=right.kind || left.link.from()!=right.link.from() || left.link.to()!=right.link.to()) return false;
-	if(!approximatelyEqual(left.link.transform().x(),right.link.transform().x(),1.0e-5,1.0e-6) ||
-		!approximatelyEqual(left.link.transform().y(),right.link.transform().y(),1.0e-5,1.0e-6) ||
-		std::fabs(normalizeAngle(left.link.transform().theta()-right.link.transform().theta()))>1.0e-5) return false;
-	for(size_t i=0;i<left.planarInformation.size();++i)
-		if(!approximatelyEqual(left.planarInformation[i],right.planarInformation[i],1.0e-6,1.0e-5)) return false;
-	return true;
 }
 
 std::string canonicalFactor(const std::string & id, const std::string & kind, const Link & link, const std::array<double,9> & information)
@@ -773,8 +765,9 @@ int main(int argc, char ** argv)
 				std::map<std::tuple<int,int,int>,size_t>::const_iterator existing=canonicalRelativeFactors.find(key);
 				if(existing!=canonicalRelativeFactors.end())
 				{
-					if(!equivalentFactor(factors[existing->second],factor))
-						throw std::runtime_error("Contradictory duplicate relative Link detected.");
+					// RTAB-Map can store independently refined reciprocal loop links.  They
+					// are observations of the same canonical edge and can differ slightly;
+					// keep the first deterministic orientation, matching filterDuplicateLinks().
 					++duplicateReciprocalCollapsed;
 					continue;
 				}

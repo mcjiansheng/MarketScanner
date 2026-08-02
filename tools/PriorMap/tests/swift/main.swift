@@ -817,6 +817,76 @@ require(
         rawPose: PriorMapPose2D(xM: 0, yM: 1, yawRad: .pi / 2),
         candidatePose: PriorMapPose2D(xM: 0, yM: 1.2, yawRad: .pi / 2 + 0.02)),
     "turning motion must be removed before comparing correction transforms")
+
+let hypothesisTracker = PriorMapHypothesisTracker()
+var trackedDecision = PriorMapHypothesisDecision(
+    candidate: nil,
+    supportFrames: 0,
+    scoreMargin: 0,
+    trusted: false,
+    reason: "test")
+for frame in 0..<3 {
+    let raw = PriorMapPose2D(xM: Double(frame), yM: 0, yawRad: 0)
+    trackedDecision = hypothesisTracker.observe(
+        rawPose: raw,
+        candidates: [
+            PriorMapScanMatchCandidate(
+                pose: PriorMapPose2D(xM: Double(frame) + 0.4, yM: 0.1, yawRad: 0.02),
+                cost: 0.02,
+                score: 0.9),
+            PriorMapScanMatchCandidate(
+                pose: PriorMapPose2D(xM: Double(frame) + 0.4, yM: 1.0, yawRad: 0.02),
+                cost: 0.05,
+                score: 0.55),
+        ],
+        uniqueness: 0.02,
+        recoverySearch: false)
+}
+require(trackedDecision.trusted, "a separated motion-consistent lane must become trusted")
+require(trackedDecision.supportFrames >= 3, "trusted lane must have temporal support")
+
+hypothesisTracker.reset()
+var ambiguousDecision = trackedDecision
+for frame in 0..<4 {
+    let raw = PriorMapPose2D(xM: Double(frame), yM: 0, yawRad: 0)
+    ambiguousDecision = hypothesisTracker.observe(
+        rawPose: raw,
+        candidates: [
+            PriorMapScanMatchCandidate(
+                pose: PriorMapPose2D(xM: Double(frame) + 0.3, yM: -0.6, yawRad: 0),
+                cost: 0.02,
+                score: 0.9),
+            PriorMapScanMatchCandidate(
+                pose: PriorMapPose2D(xM: Double(frame) + 0.3, yM: 0.6, yawRad: 0),
+                cost: 0.02,
+                score: 0.9),
+        ],
+        uniqueness: 0,
+        recoverySearch: false)
+}
+require(!ambiguousDecision.trusted, "equal parallel aisles must never silently switch")
+
+hypothesisTracker.reset()
+var recoveryDecision = ambiguousDecision
+for frame in 0..<4 {
+    let raw = PriorMapPose2D(xM: Double(frame), yM: 0, yawRad: 0)
+    recoveryDecision = hypothesisTracker.observe(
+        rawPose: raw,
+        candidates: [
+            PriorMapScanMatchCandidate(
+                pose: PriorMapPose2D(
+                    xM: Double(frame) + 4.8,
+                    yM: 0,
+                    yawRad: 29.0 * .pi / 180.0),
+                cost: 0.02,
+                score: 0.95),
+        ],
+        uniqueness: 0.8,
+        recoverySearch: true)
+}
+require(
+    recoveryDecision.trusted && recoveryDecision.supportFrames >= 4,
+    "a unique motion-consistent recovery hypothesis within 5 m / 30 deg must pass")
 temporalGate.reset()
 _ = temporalGate.observe(
     rawPose: PriorMapPose2D(xM: 0, yM: 0, yawRad: 0),

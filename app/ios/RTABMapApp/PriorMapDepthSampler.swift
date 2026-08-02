@@ -20,7 +20,9 @@ final class PriorMapDepthSampler {
     private let maximumOutputPoints = 1_200
     private let maximumHistoryVoxels = 8_000
     private var frameIndex = 0
-    private var voxelHistory: [PriorMapWorldVoxel: (hits: Int, lastFrame: Int)] = [:]
+    private var voxelHistory: [
+        PriorMapWorldVoxel: (hits: Int, firstFrame: Int, lastFrame: Int)
+    ] = [:]
     private let floorEstimator = PriorMapFloorPlaneEstimator()
 
     func reset() {
@@ -166,13 +168,22 @@ final class PriorMapDepthSampler {
                 let prior = voxelHistory[voxel]
                 // Multiple depth pixels may land in one voxel in the same
                 // frame. Count frame-to-frame persistence, not pixel density.
+                let continuesRecentTrack = prior.map {
+                    frameIndex - $0.lastFrame <= 2
+                } ?? false
                 let hits = prior?.lastFrame == frameIndex
                     ? prior!.hits
-                    : min(4, (prior?.hits ?? 0) + 1)
-                voxelHistory[voxel] = (hits, frameIndex)
-                // Two-frame evidence suppresses most walking people and depth
-                // speckles without requiring semantic classification.
-                guard hits >= 2 else { continue }
+                    : continuesRecentTrack
+                        ? min(6, (prior?.hits ?? 0) + 1)
+                        : 1
+                let firstFrame = continuesRecentTrack
+                    ? (prior?.firstFrame ?? frameIndex)
+                    : frameIndex
+                voxelHistory[voxel] = (hits, firstFrame, frameIndex)
+                // Require three recent frames and a non-zero time span. A cart
+                // moving through a voxel must restart its evidence instead of
+                // accumulating stale hits whenever it revisits that cell.
+                guard hits >= 4, frameIndex - firstFrame >= 3 else { continue }
                 guard emittedVoxels.insert(voxel).inserted else { continue }
                 let horizontalWorld = SIMD2<Double>(
                     Double(world.x - cameraPosition.x),

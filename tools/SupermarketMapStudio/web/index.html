@@ -312,7 +312,8 @@
               </label>
               <span class="localized-trajectory-legend">在线轨迹 · RTAB‑Map · 离线轨迹</span>
             </div>
-            <canvas id="localized-review-canvas" aria-label="先验地图、三条轨迹和价签联动复核"></canvas>
+            <canvas id="localized-review-canvas" aria-label="先验地图、三条轨迹和价签联动复核；设置锚点时可直接点击和拖动"></canvas>
+            <div id="localized-map-anchor-help" class="field-hint">选择“设置轨迹锚点”后，直接点击离线轨迹并拖到正确地图位置。</div>
           </div>
           <div>
             <h3>价签与问题列表</h3>
@@ -330,9 +331,13 @@
               <option value="batch_approve_tags">批量批准高置信价签</option>
             </select>
           </label>
-          <label>对象 ID<input id="localized-edit-object" type="text" placeholder="constraint/tag/interval ID"></label>
-          <label class="localized-edit-value">新值（JSON）<textarea id="localized-edit-value" rows="3" placeholder='例如 {"timestamp":12.4,"x_m":3.2,"y_m":-5.1,"yaw_rad":0}'></textarea></label>
+          <label id="localized-edit-object-field">对象 ID<input id="localized-edit-object" type="text" placeholder="constraint/tag/interval ID"></label>
+          <label id="localized-edit-value-field" class="localized-edit-value">高级新值（JSON）<textarea id="localized-edit-value" rows="3" placeholder='例如 {"timestamp":12.4,"x_m":3.2,"y_m":-5.1,"yaw_rad":0}'></textarea></label>
           <label>复核原因（可选）<input id="localized-edit-reason" type="text" maxlength="500" placeholder="说明人工修改或批准依据"></label>
+        </div>
+        <div id="localized-map-anchor-controls" class="localized-map-anchor-controls">
+          <span id="localized-map-anchor-summary">尚未选择轨迹点</span>
+          <label>朝向修正 <input id="localized-map-anchor-yaw" type="range" min="-180" max="180" step="1" value="0"> <output id="localized-map-anchor-yaw-value">0°</output></label>
         </div>
         <div id="localized-edit-help" class="field-hint"></div>
         <div class="button-row">

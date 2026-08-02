@@ -2153,9 +2153,24 @@ def run_localized_map(
         args.depth_projector = projector
         base.generate(args)
         acceleration_report = projector.report()
+    # Map rendering keeps the selected legacy axes for compatibility, while
+    # prior-map localization must use the exact iOS ARKit x/-z contract.  The
+    # native database stores R * ARKit * R^-1, so treating it as the historical
+    # xz sidecar convention rotates/mirrors the trajectory and manufactures
+    # tens of metres of apparent anchor error.
+    localization_config = base.MapConfig(
+        resolution=config.resolution,
+        preview_resolution=config.preview_resolution,
+        trajectory_radius=config.trajectory_radius,
+        tag_snap_distance=config.tag_snap_distance,
+        occupied_inflate_radius=config.occupied_inflate_radius,
+        free_ray_max_range=config.free_ray_max_range,
+        horizontal_axes="ios_prior",
+        auto_align_segments=False,
+    )
     optimized_segments = base.discover_segments(
         session,
-        config,
+        localization_config,
         {key: Path(value) for key, value in database_overrides.items()},
     )
     poses = [
@@ -2197,7 +2212,7 @@ def run_localized_map(
             "tag_snap_distance": config.tag_snap_distance,
             "occupied_inflate_radius": config.occupied_inflate_radius,
             "free_ray_max_range": config.free_ray_max_range,
-            "horizontal_axes": config.horizontal_axes,
+            "horizontal_axes": localization_config.horizontal_axes,
             "auto_align_segments": config.auto_align_segments,
             "diagnostic_mode": data.get("diagnostic_mode") is True,
         },

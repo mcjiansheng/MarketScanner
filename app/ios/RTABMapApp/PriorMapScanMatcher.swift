@@ -222,6 +222,134 @@ struct PriorMapScanMatchResult {
     let elapsedMs: Double
 }
 
+struct PriorMapHypothesisDecision {
+    let candidate: PriorMapScanMatchCandidate?
+    let supportFrames: Int
+    let scoreMargin: Double
+    let trusted: Bool
+    let reason: String
+}
+
+/// Tracks map-alignment corrections instead of selecting a fresh best aisle on
+/// every frame. Periodic shelves can produce several equally good basins; only
+/// a basin that remains motion-consistent and separates from its competitors is
+/// allowed to move the map/ARKit alignment.
+final class PriorMapHypothesisTracker {
+    private struct Track {
+        var correction: PriorMapPose2D
+        var candidate: PriorMapScanMatchCandidate
+        var supportFrames: Int
+        var missedFrames: Int
+        var meanScore: Double
+    }
+
+    private var tracks: [Track] = []
+
+    func reset() {
+        tracks.removeAll()
+    }
+
+    func observe(
+        rawPose: PriorMapPose2D,
+        candidates: [PriorMapScanMatchCandidate],
+        uniqueness: Double,
+        recoverySearch: Bool
+    ) -> PriorMapHypothesisDecision {
+        var updated = Set<Int>()
+        for candidate in candidates.prefix(5) {
+            let correction = PriorMapCorrectionMath.correction(
+                rawPose: rawPose,
+                candidatePose: candidate.pose)
+            var matchIndex: Int?
+            var matchDistance = Double.infinity
+            for index in tracks.indices where !updated.contains(index) {
+                let translation = hypot(
+                    correction.xM - tracks[index].correction.xM,
+                    correction.yM - tracks[index].correction.yM)
+                let yaw = abs(PriorMapStageOneMath.normalizeAngle(
+                    correction.yawRad - tracks[index].correction.yawRad))
+                let combined = translation + yaw
+                if translation <= 0.75,
+                   yaw <= 12.0 * .pi / 180.0,
+                   combined < matchDistance {
+                    matchIndex = index
+                    matchDistance = combined
+                }
+            }
+            if let index = matchIndex {
+                let gain = 0.35
+                tracks[index].correction = PriorMapPose2D(
+                    xM: tracks[index].correction.xM * (1 - gain) + correction.xM * gain,
+                    yM: tracks[index].correction.yM * (1 - gain) + correction.yM * gain,
+                    yawRad: PriorMapStageOneMath.normalizeAngle(
+                        tracks[index].correction.yawRad
+                            + PriorMapStageOneMath.normalizeAngle(
+                                correction.yawRad - tracks[index].correction.yawRad) * gain))
+                tracks[index].candidate = candidate
+                tracks[index].supportFrames += 1
+                tracks[index].missedFrames = 0
+                tracks[index].meanScore = tracks[index].meanScore * 0.7
+                    + candidate.score * 0.3
+                updated.insert(index)
+            }
+            else {
+                tracks.append(
+                    Track(
+                        correction: correction,
+                        candidate: candidate,
+                        supportFrames: 1,
+                        missedFrames: 0,
+                        meanScore: candidate.score))
+                updated.insert(tracks.count - 1)
+            }
+        }
+        for index in tracks.indices where !updated.contains(index) {
+            tracks[index].missedFrames += 1
+        }
+        tracks = tracks.filter { $0.missedFrames <= 3 }
+            .sorted { first, second in
+                if first.supportFrames != second.supportFrames {
+                    return first.supportFrames > second.supportFrames
+                }
+                if first.meanScore != second.meanScore {
+                    return first.meanScore > second.meanScore
+                }
+                return first.candidate.cost < second.candidate.cost
+            }
+        if tracks.count > 8 {
+            tracks.removeLast(tracks.count - 8)
+        }
+        let activeTracks = tracks.filter { $0.missedFrames == 0 }
+        guard let best = activeTracks.first else {
+            return PriorMapHypothesisDecision(
+                candidate: nil,
+                supportFrames: 0,
+                scoreMargin: 0,
+                trusted: false,
+                reason: "no_hypothesis")
+        }
+        let second = activeTracks.dropFirst().first
+        let supportMargin = second.map {
+            Double(best.supportFrames - $0.supportFrames) * 0.05
+        } ?? 0
+        let scoreMargin = max(
+            0,
+            min(1, best.meanScore - (second?.meanScore ?? best.meanScore) + supportMargin))
+        let requiredFrames = recoverySearch ? 4 : 3
+        let trusted = best.supportFrames >= requiredFrames
+            && best.meanScore >= 0.25
+            && (uniqueness >= 0.10 || scoreMargin >= 0.12)
+        return PriorMapHypothesisDecision(
+            candidate: best.candidate,
+            supportFrames: best.supportFrames,
+            scoreMargin: scoreMargin,
+            trusted: trusted,
+            reason: trusted
+                ? (recoverySearch ? "trusted_recovery_hypothesis" : "trusted_local_hypothesis")
+                : "awaiting_unique_temporal_hypothesis")
+    }
+}
+
 enum PriorMapCorrectionMath {
     static func correction(
         rawPose: PriorMapPose2D,
@@ -457,7 +585,8 @@ final class PriorMapScanMatcher {
 
     func match(
         predictedPose: PriorMapPose2D,
-        observation: PriorMapStructureObservation
+        observation: PriorMapStructureObservation,
+        recoverySearch: Bool = false
     ) -> PriorMapScanMatchResult {
         let started = ProcessInfo.processInfo.systemUptime
         let strideValue = max(1, observation.points.count / maximumPoints)
@@ -477,10 +606,12 @@ final class PriorMapScanMatcher {
             around: predictedPose,
             points: points,
             level: levels[0],
-            translationRadius: 1.2,
-            translationStep: max(0.4, levels[0].resolutionM),
-            yawRadiusDegrees: 12,
-            yawStepDegrees: 4)
+            translationRadius: recoverySearch ? 5.0 : 1.2,
+            translationStep: recoverySearch
+                ? 0.8
+                : max(0.4, levels[0].resolutionM),
+            yawRadiusDegrees: recoverySearch ? 30 : 12,
+            yawStepDegrees: recoverySearch ? 10 : 4)
         // Preserve spatially independent basins at every level. Selecting only
         // the best coarse basin makes periodic aisles appear falsely unique.
         let coarseHypotheses = separatedCandidates(
@@ -492,9 +623,9 @@ final class PriorMapScanMatcher {
             fallback: predictedPose,
             points: points,
             level: levels[min(1, levels.count - 1)],
-            translationRadius: 0.4,
+            translationRadius: recoverySearch ? 0.5 : 0.4,
             translationStep: 0.2,
-            yawRadiusDegrees: 4,
+            yawRadiusDegrees: recoverySearch ? 6 : 4,
             yawStepDegrees: 2,
             hypothesisLimit: 8)
         let fine = refine(
@@ -507,7 +638,7 @@ final class PriorMapScanMatcher {
             yawRadiusDegrees: 2,
             yawStepDegrees: 1,
             hypothesisLimit: 8)
-        let top = Array(fine.prefix(3))
+        let top = Array(fine.prefix(5))
         let bestCost = top.first?.cost ?? Double.infinity
         let secondCost = top.dropFirst().first?.cost
         // A missing second independent minimum is absence of evidence, not

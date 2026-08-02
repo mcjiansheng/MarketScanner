@@ -29,6 +29,8 @@ def main() -> None:
         "graph_connected",
         "fixed_root",
         "absolute_priors",
+        "horizontalAxes == \"ios_prior\"",
+        "keep the first deterministic orientation",
     )
     missing = [token for token in required if token not in source]
     if "prior-map-factor-graph" not in cmake:
@@ -39,6 +41,9 @@ def main() -> None:
         raise SystemExit(1)
     if "openConnection(options.database, true" in source:
         print("factor graph helper opens the optimized DB writable", file=sys.stderr)
+        raise SystemExit(1)
+    if "Contradictory duplicate relative Link detected" in source:
+        print("factor graph helper still rejects reciprocal loop observations", file=sys.stderr)
         raise SystemExit(1)
     print("factor graph native source contract passed")
 

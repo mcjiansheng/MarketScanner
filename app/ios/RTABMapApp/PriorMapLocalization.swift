@@ -309,6 +309,11 @@ struct PriorMapLocalizationUpdate: Codable {
     let matcherElapsedMs: Double
     let constraintAccepted: Bool
     let constraintReason: String
+    var hypothesisSupportFrames: Int = 0
+    var hypothesisScoreMargin: Double = 0
+    var recoverySearch: Bool = false
+    var correctionTranslationM: Double = 0
+    var correctionYawDeg: Double = 0
     var trackingSessionId: String? = nil
     var priorMapId: String? = nil
     var priorMapSha256: String? = nil
@@ -343,7 +348,7 @@ final class PriorMapStageOneLocalizer {
     private let depthSampler = PriorMapDepthSampler()
     private let matcher: PriorMapScanMatcher
     private let confidenceManager = PriorMapConfidenceManager()
-    private let temporalCorrectionGate = PriorMapTemporalCorrectionGate()
+    private let hypothesisTracker = PriorMapHypothesisTracker()
     private let priorMapId: String
     private let priorMapSha256: String
     private let shelves: [PriorMapShelf]
@@ -353,6 +358,9 @@ final class PriorMapStageOneLocalizer {
     private(set) var latestConfidence = 0.0
     private(set) var latestPhase: PriorMapLocalizationPhase = .uninitialized
     private var alignmentVersion = 0
+    private var recoveryFramesRemaining = 0
+    private var consecutiveUntrustedFrames = 0
+    private var recoveryReason = "none"
 
     init(
         package: PriorMapPackage,
@@ -410,6 +418,14 @@ final class PriorMapStageOneLocalizer {
             }
         }
         return identifiers.sorted().compactMap { segmentsById[$0] }
+    }
+
+    /// Called after a reliable RTAB-Map loop closure. The loop does not inject
+    /// a pose prior by itself; it authorizes a bounded wider search whose result
+    /// must still survive four-frame hypothesis tracking before any correction.
+    func requestRecovery(reason: String) {
+        recoveryFramesRemaining = max(recoveryFramesRemaining, 20)
+        recoveryReason = reason
     }
 
     func update(frame: ARFrame, trackingState: String) -> PriorMapLocalizationUpdate {
@@ -470,62 +486,95 @@ final class PriorMapStageOneLocalizer {
         let observation = trackingState == "normal"
             ? depthSampler.sample(frame: frame)
             : nil
+        if recoveryFramesRemaining == 0,
+           consecutiveUntrustedFrames == 6
+            || (consecutiveUntrustedFrames > 6
+                && consecutiveUntrustedFrames % 20 == 0) {
+            recoveryFramesRemaining = 20
+            recoveryReason = "persistent_weak_or_lost"
+        }
+        let recoverySearch = recoveryFramesRemaining > 0
+        let activeRecoveryReason = recoverySearch ? recoveryReason : "none"
+        if recoveryFramesRemaining > 0 {
+            recoveryFramesRemaining -= 1
+        }
         let match = observation.map {
-            matcher.match(predictedPose: rawPose, observation: $0)
+            matcher.match(
+                predictedPose: rawPose,
+                observation: $0,
+                recoverySearch: recoverySearch)
         }
         if let floorEstimate = observation?.floorEstimate {
             latestFloorEstimate = floorEstimate
         }
-        if let best = match?.candidates.first {
+        let hypothesis = hypothesisTracker.observe(
+            rawPose: rawPose,
+            candidates: match?.candidates ?? [],
+            uniqueness: match?.uniqueness ?? 0,
+            recoverySearch: recoverySearch)
+        var correctionTranslationM = 0.0
+        var correctionYawDeg = 0.0
+        if let best = hypothesis.candidate {
             let translation = hypot(
                 best.pose.xM - rawPose.xM,
                 best.pose.yM - rawPose.yM)
             let yawDelta = abs(PriorMapStageOneMath.normalizeAngle(
                 best.pose.yawRad - rawPose.yawRad))
-            let geometryAndSafetyAccepted = match?.acceptedByGeometry == true
-                && translation <= 0.35
-                && yawDelta <= 8.0 * .pi / 180.0
-            let temporallyTrusted: Bool
-            if geometryAndSafetyAccepted {
-                temporallyTrusted = temporalCorrectionGate.observe(
-                    rawPose: rawPose,
-                    candidatePose: best.pose)
-            }
-            else {
-                // Rejected, mismatched and unsafe candidates must never
-                // preheat the two-frame correction cluster.
-                temporalCorrectionGate.reset()
-                temporallyTrusted = false
-            }
-            if geometryAndSafetyAccepted, temporallyTrusted {
+            correctionTranslationM = translation
+            correctionYawDeg = yawDelta * 180.0 / .pi
+            let geometryCandidate = best.cost <= 0.10
+                && (match?.effectivePointCount ?? 0) >= 45
+                && (observation?.coverageAngleRad ?? 0) >= 0.35
+            let translationGate = recoverySearch ? 5.0 : 0.35
+            let yawGate = (recoverySearch ? 30.0 : 8.0) * .pi / 180.0
+            let geometryAndSafetyAccepted = geometryCandidate
+                && translation <= translationGate
+                && yawDelta <= yawGate
+            if geometryAndSafetyAccepted, hypothesis.trusted {
                 let gain = 0.35
+                let deltaX = (best.pose.xM - rawPose.xM) * gain
+                let deltaY = (best.pose.yM - rawPose.yM) * gain
+                let deltaLength = hypot(deltaX, deltaY)
+                let stepScale = deltaLength > 0.35 ? 0.35 / deltaLength : 1.0
+                let yawStep = max(
+                    -8.0 * .pi / 180.0,
+                    min(
+                        8.0 * .pi / 180.0,
+                        PriorMapStageOneMath.normalizeAngle(
+                            best.pose.yawRad - rawPose.yawRad) * gain))
                 estimatedPose = PriorMapPose2D(
-                    xM: rawPose.xM + (best.pose.xM - rawPose.xM) * gain,
-                    yM: rawPose.yM + (best.pose.yM - rawPose.yM) * gain,
+                    xM: rawPose.xM + deltaX * stepScale,
+                    yM: rawPose.yM + deltaY * stepScale,
                     yawRad: PriorMapStageOneMath.normalizeAngle(
-                        rawPose.yawRad
-                            + PriorMapStageOneMath.normalizeAngle(
-                                best.pose.yawRad - rawPose.yawRad) * gain))
+                        rawPose.yawRad + yawStep))
                 // Move only the map/ARKit alignment anchor. ARKit world
                 // tracking and the scan database are never reset.
                 arkitOrigin = arkitPose
                 initialMapPose = estimatedPose
                 alignmentVersion += 1
                 accepted = true
-                reason = "trusted_structure_correction"
+                consecutiveUntrustedFrames = 0
+                reason = recoverySearch
+                    ? "trusted_loop_or_lost_recovery_correction:\(activeRecoveryReason)"
+                    : "trusted_structure_correction"
+                if recoverySearch,
+                   translation <= 0.5,
+                   yawDelta <= 10.0 * .pi / 180.0 {
+                    recoveryFramesRemaining = 0
+                    recoveryReason = "none"
+                }
             }
-            else if match?.acceptedByGeometry != true {
+            else if !geometryCandidate {
                 reason = match?.rejectionReason ?? "structure_rejected"
             }
-            else if translation > 0.35 || yawDelta > 8.0 * .pi / 180.0 {
+            else if translation > translationGate || yawDelta > yawGate {
                 reason = "correction_exceeds_safety_gate"
             }
             else {
-                reason = "awaiting_temporal_consistency"
+                reason = hypothesis.reason
             }
         }
         else {
-            temporalCorrectionGate.reset()
             if observation != nil {
                 reason = match?.rejectionReason ?? "no_structure_candidate"
             }
@@ -540,6 +589,9 @@ final class PriorMapStageOneLocalizer {
                 reason = "road_prior_display_only"
             }
         }
+        if !accepted {
+            consecutiveUntrustedFrames += 1
+        }
         let residualCost = match?.candidates.first?.cost ?? 0.15
         let confidence = confidenceManager.update(
             timestamp: timestamp,
@@ -553,7 +605,7 @@ final class PriorMapStageOneLocalizer {
         latestEstimatedPose = estimatedPose
         latestConfidence = confidence.confidence
         latestPhase = confidence.phase
-        return PriorMapLocalizationUpdate(
+        var update = PriorMapLocalizationUpdate(
             format: "MarketScannerLocalizationTrace",
             version: 1,
             timestamp: timestamp,
@@ -576,6 +628,12 @@ final class PriorMapStageOneLocalizer {
             matcherElapsedMs: match?.elapsedMs ?? 0,
             constraintAccepted: accepted,
             constraintReason: reason)
+        update.hypothesisSupportFrames = hypothesis.supportFrames
+        update.hypothesisScoreMargin = hypothesis.scoreMargin
+        update.recoverySearch = recoverySearch
+        update.correctionTranslationM = correctionTranslationM
+        update.correctionYawDeg = correctionYawDeg
+        return update
     }
 
     func alignmentSnapshot(frameTimestamp: TimeInterval) -> PriorMapAlignmentSnapshot? {
@@ -603,7 +661,10 @@ final class PriorMapStageOneLocalizer {
         latestPhase = .manualCorrection
         latestConfidence = 0.35
         depthSampler.reset()
-        temporalCorrectionGate.reset()
+        hypothesisTracker.reset()
+        recoveryFramesRemaining = 0
+        consecutiveUntrustedFrames = 0
+        recoveryReason = "manual"
         return (arkitPose, mapPose)
     }
 
@@ -729,6 +790,7 @@ final class PriorMapPosePickerView: UIView {
     private let arrow = CAShapeLayer()
     private(set) var pose: PriorMapPose2D
     private let boundsM: PriorMapBounds
+    private var markerDragging = false
 
     init(image: UIImage, bounds: PriorMapBounds, pose: PriorMapPose2D) {
         self.pose = pose
@@ -747,6 +809,16 @@ final class PriorMapPosePickerView: UIView {
         let pan = UIPanGestureRecognizer(target: self, action: #selector(panned(_:)))
         pan.minimumNumberOfTouches = 2
         imageView.addGestureRecognizer(pan)
+        let markerPan = UIPanGestureRecognizer(
+            target: self,
+            action: #selector(markerPanned(_:)))
+        markerPan.minimumNumberOfTouches = 1
+        markerPan.maximumNumberOfTouches = 1
+        imageView.addGestureRecognizer(markerPan)
+        let rotation = UIRotationGestureRecognizer(
+            target: self,
+            action: #selector(rotated(_:)))
+        imageView.addGestureRecognizer(rotation)
         backgroundColor = .secondarySystemBackground
         layer.cornerRadius = 10
         clipsToBounds = true
@@ -795,6 +867,10 @@ final class PriorMapPosePickerView: UIView {
 
     @objc private func tapped(_ gesture: UITapGestureRecognizer) {
         let point = gesture.location(in: imageView)
+        setPose(at: point)
+    }
+
+    private func setPose(at point: CGPoint) {
         let imageRect = displayedImageRect()
         guard imageRect.width > 0,
               imageRect.height > 0,
@@ -809,6 +885,28 @@ final class PriorMapPosePickerView: UIView {
             max(0.0, Double((point.y - imageRect.minY) / imageRect.height)))
         pose.xM = boundsM.minXM + xRatio * (boundsM.maxXM - boundsM.minXM)
         pose.yM = boundsM.maxYM - yRatio * (boundsM.maxYM - boundsM.minYM)
+        updateArrow()
+    }
+
+    @objc private func markerPanned(_ gesture: UIPanGestureRecognizer) {
+        let point = gesture.location(in: imageView)
+        if gesture.state == .began {
+            markerDragging = hypot(
+                point.x - arrow.position.x,
+                point.y - arrow.position.y) <= 36
+        }
+        if markerDragging && (gesture.state == .began || gesture.state == .changed) {
+            setPose(at: point)
+        }
+        if gesture.state == .ended || gesture.state == .cancelled {
+            markerDragging = false
+        }
+    }
+
+    @objc private func rotated(_ gesture: UIRotationGestureRecognizer) {
+        pose.yawRad = PriorMapStageOneMath.normalizeAngle(
+            pose.yawRad - Double(gesture.rotation))
+        gesture.rotation = 0
         updateArrow()
     }
 
@@ -834,14 +932,83 @@ final class PriorMapPosePickerView: UIView {
         let y = imageRect.minY
             + CGFloat((boundsM.maxYM - pose.yM) / height) * imageRect.height
         let path = UIBezierPath()
-        path.move(to: CGPoint(x: 0, y: -14))
-        path.addLine(to: CGPoint(x: 8, y: 10))
-        path.addLine(to: CGPoint(x: 0, y: 6))
-        path.addLine(to: CGPoint(x: -8, y: 10))
+        path.move(to: CGPoint(x: 0, y: -10))
+        path.addLine(to: CGPoint(x: 6, y: 7))
+        path.addLine(to: CGPoint(x: 0, y: 4))
+        path.addLine(to: CGPoint(x: -6, y: 7))
         path.close()
         arrow.path = path.cgPath
         arrow.position = CGPoint(x: x, y: y)
         arrow.setAffineTransform(CGAffineTransform(rotationAngle: CGFloat(-pose.yawRad)))
+    }
+}
+
+final class PriorMapPoseSelectionViewController: UIViewController {
+    private let picker: PriorMapPosePickerView
+    private let completion: (PriorMapPose2D) -> Void
+
+    init(
+        package: PriorMapPackage,
+        floorId: String,
+        pose: PriorMapPose2D,
+        completion: @escaping (PriorMapPose2D) -> Void
+    ) {
+        let floor = package.manifest.floors.first { $0.id == floorId }!
+        picker = PriorMapPosePickerView(
+            image: package.preview(floorId: floorId),
+            bounds: floor.bounds,
+            pose: pose)
+        self.completion = completion
+        super.init(nibName: nil, bundle: nil)
+        modalPresentationStyle = .formSheet
+        preferredContentSize = CGSize(width: 600, height: 640)
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        view.backgroundColor = .systemBackground
+        let title = UILabel()
+        title.font = .preferredFont(forTextStyle: .title2)
+        title.text = "在地图上重新定位"
+        let instructions = UILabel()
+        instructions.numberOfLines = 0
+        instructions.textColor = .secondaryLabel
+        instructions.text = "点击地图设置位置；拖动红色箭头微调；双指平移、捏合缩放、双指旋转朝向。允许测试初值存在 3–5 m 和 20–30°误差，后续结构匹配会平滑收敛。"
+        let cancel = UIButton(type: .system)
+        cancel.setTitle("取消", for: .normal)
+        cancel.addTarget(self, action: #selector(cancelled), for: .touchUpInside)
+        let confirm = UIButton(type: .system)
+        confirm.setTitle("确认位置", for: .normal)
+        confirm.addTarget(self, action: #selector(confirmed), for: .touchUpInside)
+        let buttons = UIStackView(arrangedSubviews: [cancel, UIView(), confirm])
+        buttons.axis = .horizontal
+        let stack = UIStackView(arrangedSubviews: [title, instructions, picker, buttons])
+        stack.axis = .vertical
+        stack.spacing = 12
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 16),
+            stack.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -16),
+            stack.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 16),
+            stack.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -16),
+            picker.heightAnchor.constraint(greaterThanOrEqualToConstant: 360),
+        ])
+    }
+
+    @objc private func cancelled() {
+        dismiss(animated: true)
+    }
+
+    @objc private func confirmed() {
+        let value = picker.pose
+        dismiss(animated: true) {
+            self.completion(value)
+        }
     }
 }
 
@@ -1229,10 +1396,10 @@ final class PriorMapLiveMapView: UIView {
         previewView.image = package.preview(floorId: floorId)
         previewView.contentMode = .scaleAspectFit
         let arrowPath = UIBezierPath()
-        arrowPath.move(to: CGPoint(x: 0, y: -11))
-        arrowPath.addLine(to: CGPoint(x: 7, y: 8))
-        arrowPath.addLine(to: CGPoint(x: 0, y: 5))
-        arrowPath.addLine(to: CGPoint(x: -7, y: 8))
+        arrowPath.move(to: CGPoint(x: 0, y: -8))
+        arrowPath.addLine(to: CGPoint(x: 5, y: 6))
+        arrowPath.addLine(to: CGPoint(x: 0, y: 3))
+        arrowPath.addLine(to: CGPoint(x: -5, y: 6))
         arrowPath.close()
         arrow.path = arrowPath.cgPath
         routeLayer.strokeColor = UIColor.systemTeal.withAlphaComponent(0.65).cgColor
@@ -1294,7 +1461,7 @@ final class PriorMapLiveMapView: UIView {
             stack.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
             stack.topAnchor.constraint(equalTo: topAnchor, constant: 10),
             stack.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -10),
-            previewView.heightAnchor.constraint(equalToConstant: 180),
+            previewView.heightAnchor.constraint(equalToConstant: 150),
         ])
     }
 
@@ -1359,9 +1526,11 @@ final class PriorMapLiveMapView: UIView {
         }
         if let candidate = value.matchCandidates.first {
             diagnosticsLabel.text = String(
-                format: "结构匹配 %.2f · 唯一性 %.2f · %d 点 · %.1f ms",
+                format: "结构 %.2f · 唯一性 %.2f · 轨道 %d 帧/%.2f · %d 点 · %.1f ms",
                 candidate.score,
                 value.matchUniqueness,
+                value.hypothesisSupportFrames,
+                value.hypothesisScoreMargin,
                 value.structurePointCount,
                 value.matcherElapsedMs)
         }

@@ -1,6 +1,8 @@
 # 地图辅助定位实现状态
 
-> 文档状态：**当前有效**。最后核对日期：2026-07-30。
+> 文档状态：**当前有效**。最后核对日期：2026-08-02。
+
+2026-08-02 的 Sam 真实扫描暴露了数据库位姿与 iOS prior-map 坐标契约不一致、reciprocal loop 被过严判为矛盾边、在线定位长期歧义和交互困难。现场证据、指标、根因、代码整改和同一优化数据库的只读回归结果见 [`SAM_SCAN_REPORT_2026-08-02.md`](SAM_SCAN_REPORT_2026-08-02.md)。修复后完整因子图已覆盖 4,442 个节点并收敛，测试草稿可查看；修复后的 iPhone 真机重扫和现场控制点验收仍未执行，不能据此标记生产通过。
 
 ## 生产化总状态
 
@@ -26,7 +28,7 @@ P7 已实现 loopback-only server、每次启动随机且不落盘的 token、PO
 | iOS 五步向导 | 已实现 | 地图、楼层、起点/方向、设备检查、开始 |
 | iOS 道路锚点快捷起点 | 已实现 | 起点步骤可从当前楼层道路节点选择锚点 |
 | prior-map 仍写连续 RTAB-Map DB | 已实现 | 复用 `newScan`/`streamingDatabaseURL` |
-| T_map_from_arkit 与 2D HUD | 已实现 | `PriorMapStageOneLocalizer`/`PriorMapLiveMapView` |
+| T_map_from_arkit 与 2D HUD | 已实现并完成 Sam 代码整改 | Top‑5 跨帧 hypothesis；weak/lost/可靠闭环 5 m/30°有界恢复；0.35 m/8°单步门；修复后真机重扫待执行 |
 | 单楼层定位边界 | 已实现 | 开始前绑定一层；无跨层切换；忽略二维高度但保留原始 3D |
 | 道路软约束、歧义拒绝 | 已实现 | 2 Hz、有界道路索引、in-flight 丢帧门控、0.15 gain、0.25 m cap、Top-3 |
 | 人工确认和审计 | 已实现 | manual v3 JSONL；native 原子 node/timebase/generation 快照；无一致 node 证据即拒绝 |
@@ -42,7 +44,7 @@ P7 已实现 loopback-only server、每次启动随机且不落盘的 token、PO
 | --- | --- | --- |
 | 线程、状态、距离场与失败策略 | 已实现 | `STAGE_2_DESIGN.md`、`PriorMapScanMatcher.swift`、in-flight gate |
 | 多分辨率确定性距离场 | 已实现 | 0.40/0.20/0.10 m、2 m 截断、RLE、逐层 SHA-256、schema 负向测试 |
-| 深度结构提取和扫描匹配 | 已实现 | scene depth、跨帧 voxel 证据、600 点上限、粗中细多盆地传播、全窗真实次佳 Top‑3、周期结构保守拒绝 |
+| 深度结构提取和扫描匹配 | 已实现 | scene depth、4 帧近期 world-voxel 静态证据、600 点上限、粗中细 Top‑5 多盆地、平行通道跨帧消歧、周期结构保守拒绝 |
 | 状态和置信度滞回 | 已实现 | initializing/stable/usable/weak/lost/manualCorrection；连续可信和 stale 门限集中管理 |
 | Vision QR/条形码识别 | 已实现 | 用户触发；复用 `ARFrame.capturedImage`；捕获时对齐快照与版本；四方向 ROI；QR/EAN/Code128/UPCE/PDF417 |
 | 标签三维测量与结构关联 | 已实现 | 同帧 depth；楼面法向/残差/时序置信度；货架/柜台；跨结构遮挡；侧面、offset、高度和歧义门控 |
@@ -62,7 +64,7 @@ P7 已实现 loopback-only server、每次启动随机且不落盘的 token、PO
 | 能力 | 状态 | 代码/证据 |
 | --- | --- | --- |
 | RTAB-Map 重处理前置和源库只读 | 已实现 | `run_localized_map` 强制 `rtabmap-reprocess`；前后 SHA‑256 一致 |
-| 先验地图派生修正 | 已实现（P1 本地验证） | native RTAB-Map/g2o 完整相对 SE(2) 因子图、Link transform/information、absolute priors、gauge、robust、canonical digest；bounded correction 仅为不可发布 draft fallback |
+| 先验地图派生修正 | 已修复并完成 Sam 只读回归 | 精确 `ios_prior` 契约；reciprocal canonical 折叠；native RTAB-Map/g2o 完整相对 SE(2) 因子图 4,442 节点收敛，最大修正 2.9638 m；仍是诊断 draft |
 | 在线/道路/人工约束与拒绝审计 | 已实现 | 在线结构约束、道路区域/方向低权重软约束、accepted/rejected residual、禁用约束、人工锚点 |
 | 通道切换审计 | 已实现 | 最终轨迹几何投影输出进入/离开时间、候选 margin、方向、weak/lost overlap、人工 assignment 和可能静默切换 |
 | 标签离线重算和结构关联 | 已实现（保守门控） | observation→真实 node/frame time 绑定、raw 位置 SE(2) 传播、独立次候选/遮挡/侧面/边长校验；失败进入 review 或阻断 current |
@@ -72,7 +74,7 @@ P7 已实现 loopback-only server、每次启动随机且不落盘的 token、PO
 | 不可变成果事务 | 已实现 | POSIX/Windows 跨进程锁内 staging→完整文件/hash 校验→`versions/vNNNNNN`→单指针提交；Windows write-through move、版本/指针 durability 故障注入；读取与已打开 fd 复核 hash；损坏状态拒绝降级 |
 | 质量报告和状态机 | 已实现（仍受现场发布门约束） | draft/review/published/revoked 事务框架和门禁；完整相对 SE(2) helper 报告通过严格能力校验后才允许进入发布判断 |
 | 人工编辑重放/撤销/重做 | 已实现 | manual_edits v4 与 input identity、强制 version/revision CAS、HTTP 409、服务端 old value/UTC/ID、字段/范围/地图校验、undo/redo audit |
-| PC 非专业向导 | 已实现 | 地图+会话选择、一键处理、三轨迹/价签联动画布、状态/货架筛选、问题带入、人工编辑区和 artifact |
+| PC 非专业向导 | 已实现 | 地图+会话选择、一键处理、三轨迹/价签联动画布、状态/货架筛选；轨迹锚点可直接点选/拖动并自动生成 node/time/JSON |
 | 确定性 E2E fixture | 已实现 | 源库不变、漂移降低、错误约束拒绝、事务/输入变更故障、双线程客户端同基准 CAS 冲突、409、发布硬门、严格 sidecar/capture-health 负例 |
 | 正式现场验收 | 未执行 | 只完成 `FIELD_TEST_PLAN.md`；不能用模拟或构建替代 |
 
@@ -88,7 +90,7 @@ P7 已实现 loopback-only server、每次启动随机且不落盘的 token、PO
 | 操作者取消 | 已实现 | 持久取消意图；原生子进程 terminate→有界 wait→kill；partial 清理 |
 | 原生运行日志 | 已实现 | fast/discovery 独立日志、严格文件名和任务归属下载 |
 | 损坏 journal/保留策略 | 已实现 | health 报告 startup error；不按不可信路径清理；默认保留 200 个终态任务 |
-| 自动回归 | 已实现 | P7R1 本地完整回归：PriorMap 116 项、工作台 92 项、资格证据 11 项；包含持久任务进程恢复、production publish fail-closed、immutable evidence 重派生、package-bound release、package stable-read、CSV race/同尺寸替换/非法 UTF-8、Windows binary exact bytes，以及 Windows 目录同步差异。该数字是 AUTOMATED TESTED，不替代最终 exact-SHA CI 或人工验收 |
+| 自动回归 | 已实现 | 2026-08-02 本地完整回归：PriorMap 121 项、工作台 94 项；另有既有资格证据 11 项。新增覆盖 `ios_prior`、人工安全门、平行通道、5 m/30°恢复、非规则货架/立柱、动态结构和 PC 地图锚点。该数字是 AUTOMATED TESTED，不替代最终 exact-SHA CI 或人工验收 |
 
 ## 尚未完成的发布门槛
 
@@ -97,7 +99,7 @@ P7 已实现 loopback-only server、每次启动随机且不落盘的 token、PO
 - 已按 2026-07-28 外部静态审查关闭 W2 B-01 与 W2R H-01 至 H-04/M-01 至 M-05；远端多平台 CI run `30342577182` 已绑定准确提交并通过，独立人工复核仍待执行；
 - 正式超市场景验收；
 - 对更多真实 DB 固化相对边 residual 工程阈值，并由 clean CI 构建 helper；P1 单样本通过不替代现场 acceptance；
-- 地图直接拖拽锚点等可用性增强（问题带入和核心 ID/JSON 编辑已可用）。
+- 修复后的 iPhone 真机重扫，确认多候选恢复、动态购物车过滤、热状态与自适应检测率在 Sam 场景中的实际效果。
 
 自动测试和模拟回放不替代以上现场与独立审查。
 

@@ -30,9 +30,17 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
     private var supermarketSession: SupermarketScanSession?
     private var activeScanConfiguration = PriorMapScanConfiguration.freeMapping
     private var priorMapLocalizer: PriorMapStageOneLocalizer?
+    private var activePriorMapPackage: PriorMapPackage?
     private var priorMapOverlay: PriorMapLiveMapView?
     private var priorMapLatestUpdate: PriorMapLocalizationUpdate?
     private var priorMapEvidenceWriteWarningShown = false
+    private var priorMapLastNodeBinding: (
+        nodeId: Int,
+        nodeStamp: TimeInterval,
+        nodeTimebaseOffsetSeconds: TimeInterval,
+        generation: UInt64,
+        sampledFrameTimestamp: TimeInterval
+    )?
     private var finalizedCleanupPromptShown = false
     private let priorMapUpdateGate = PriorMapUpdateGate(minimumInterval: 0.5)
     private var priorMapGeneration = UUID()
@@ -164,6 +172,8 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
     private var mLastStructureCoverageSummaryAt: TimeInterval = 0
     private var mLastAdaptiveDetectionRateUpdateAt: TimeInterval = 0
     private var mAdaptiveDetectionRateHz = 1.0
+    private var mPendingAdaptiveDetectionRateHz: Double?
+    private var mPendingAdaptiveDetectionRateSince: TimeInterval = 0
     private var mConsecutiveRejectedLoopClosures = 0
     private let mReliableLoopMinimumNodeSpan = 50
     private var mReliableLoopClosures = 0
@@ -790,6 +800,15 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                             loopClosureType: loopClosureType,
                             currentNodeId: loopClosureCurrentId,
                             targetNodeId: loopClosureTargetId)
+                    }
+                    if reliableLoopClosure,
+                       self.activeScanConfiguration.workflowMode == .priorMapLocalized,
+                       let localizer = self.priorMapLocalizer {
+                        let generation = self.priorMapGeneration
+                        self.priorMapQueue.async {
+                            guard generation == self.priorMapGeneration else { return }
+                            localizer.requestRecovery(reason: "reliable_rtabmap_loop")
+                        }
                     }
                 }
                 else if(rejected > 0)
@@ -1595,6 +1614,8 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         mLastStructureCoverageSummaryAt = 0
         mLastAdaptiveDetectionRateUpdateAt = 0
         mAdaptiveDetectionRateHz = 1.0
+        mPendingAdaptiveDetectionRateHz = nil
+        mPendingAdaptiveDetectionRateSince = 0
         mStructureCoverageAdvisor.setCurrentDetectionRateHz(mAdaptiveDetectionRateHz)
         mConsecutiveRejectedLoopClosures = 0
         mTotalLoopClosures = 0
@@ -1626,11 +1647,28 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                 mStructureCoverageAdvisor.summary())
         }
         let proposedRate = feedback.recommendedDetectionRateHz
-        if abs(proposedRate - mAdaptiveDetectionRateHz) >= 0.20 &&
-           (mLastAdaptiveDetectionRateUpdateAt == 0 ||
-            frameTimestamp - mLastAdaptiveDetectionRateUpdateAt >= 4.0) {
+        if abs(proposedRate - mAdaptiveDetectionRateHz) < 0.20 {
+            mPendingAdaptiveDetectionRateHz = nil
+            mPendingAdaptiveDetectionRateSince = 0
+        }
+        else if mPendingAdaptiveDetectionRateHz == nil
+            || abs((mPendingAdaptiveDetectionRateHz ?? proposedRate) - proposedRate) >= 0.20 {
+            mPendingAdaptiveDetectionRateHz = proposedRate
+            mPendingAdaptiveDetectionRateSince = frameTimestamp
+        }
+        let dwellSeconds = proposedRate > mAdaptiveDetectionRateHz ? 8.0 : 12.0
+        let pendingRateMatches = mPendingAdaptiveDetectionRateHz.map {
+            abs($0 - proposedRate) < 0.20
+        } ?? false
+        if abs(proposedRate - mAdaptiveDetectionRateHz) >= 0.20,
+           pendingRateMatches,
+           frameTimestamp - mPendingAdaptiveDetectionRateSince >= dwellSeconds,
+           (mLastAdaptiveDetectionRateUpdateAt == 0
+            || frameTimestamp - mLastAdaptiveDetectionRateUpdateAt >= dwellSeconds) {
             mAdaptiveDetectionRateHz = proposedRate
             mLastAdaptiveDetectionRateUpdateAt = frameTimestamp
+            mPendingAdaptiveDetectionRateHz = nil
+            mPendingAdaptiveDetectionRateSince = 0
             mStructureCoverageAdvisor.setCurrentDetectionRateHz(proposedRate)
             rtabmap?.setMappingParameter(
                 key: "Rtabmap/DetectionRate",
@@ -1796,9 +1834,14 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                 // continuous pose and rebase subsequent raw poses into that
                 // coordinate system. PC loop closures can then correct drift
                 // without inheriting a false neighbor edge.
-                let translationLimit = max(0.45, min(elapsed, 2.0) * 3.0)
-                let rotationLimit = max(35.0, min(elapsed, 2.0) * 180.0)
-                if distance > translationLimit || rotation > rotationLimit {
+                let translationLimit = max(0.08, min(elapsed, 2.0) * 3.0)
+                let rotationLimit = max(12.0, min(elapsed, 2.0) * 180.0)
+                let impossibleLinearSpeed = (linearSpeed ?? 0) > 3.0 && distance > 0.08
+                let impossibleAngularSpeed = (angularSpeed ?? 0) > 180.0 && rotation > 12.0
+                if distance > translationLimit
+                    || rotation > rotationLimit
+                    || impossibleLinearSpeed
+                    || impossibleAngularSpeed {
                     mARPoseCorrection = simd_mul(previousPose, simd_inverse(rawPose))
                     supermarketSession?.recordMappingFrameQuality(
                         accepted: false,
@@ -2482,6 +2525,7 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                 package: package,
                 floorId: floorId,
                 initialMapPose: initialPose)
+            activePriorMapPackage = package
             let overlay = PriorMapLiveMapView(package: package, floorId: floorId)
             overlay.translatesAutoresizingMaskIntoConstraints = false
             overlay.confirmButton.addTarget(
@@ -2504,7 +2548,7 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                 overlay.topAnchor.constraint(
                     equalTo: view.safeAreaLayoutGuide.topAnchor,
                     constant: 12),
-                overlay.widthAnchor.constraint(equalToConstant: 330),
+                overlay.widthAnchor.constraint(equalToConstant: 290),
             ])
             priorMapOverlay = overlay
             priorMapEvidenceWriteWarningShown = false
@@ -2529,8 +2573,10 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
     {
         priorMapGeneration = UUID()
         priorMapLocalizer = nil
+        activePriorMapPackage = nil
         priorMapLatestUpdate = nil
         priorMapEvidenceWriteWarningShown = false
+        priorMapLastNodeBinding = nil
         priorMapUpdateGate.reset()
         priceTagVisionScanner.reset()
         priorMapAlignmentSnapshots.reset()
@@ -2574,6 +2620,14 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         let generation = priorMapGeneration
         let trackingSessionId = supermarketSession?.trackingSessionId ?? ""
         let nodeTimebase = rtabmap?.nodeTimebase(frameTimestamp: frame.timestamp)
+        if let binding = rtabmap?.latestNodeBinding(frameTimestamp: frame.timestamp) {
+            priorMapLastNodeBinding = (
+                binding.nodeId,
+                binding.nodeStamp,
+                binding.nodeTimebaseOffsetSeconds,
+                binding.generation,
+                frame.timestamp)
+        }
         let interfaceOrientation = view.window?.windowScene?.interfaceOrientation
             ?? .portrait
         let imageOrientation: CGImagePropertyOrientation
@@ -2791,44 +2845,21 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         let initial = priorMapLatestUpdate?.estimatedPose
             ?? activeScanConfiguration.initialMapPose
             ?? PriorMapPose2D(xM: 0, yM: 0, yawRad: 0)
-        let alert = UIAlertController(
-            title: localized("在地图上确认当前位置"),
-            message: localized("输入地图坐标和方向。大幅修正只在您明确确认后应用，并会写入审计日志。"),
-            preferredStyle: .alert)
-        for (placeholder, value) in [
-            ("X (m)", String(format: "%.3f", initial.xM)),
-            ("Y (m)", String(format: "%.3f", initial.yM)),
-            ("方向 (°)", String(format: "%.1f", initial.yawRad * 180.0 / .pi)),
-        ] {
-            alert.addTextField { field in
-                field.placeholder = placeholder
-                field.text = value
-                field.keyboardType = .numbersAndPunctuation
-            }
+        guard let package = activePriorMapPackage,
+              let floorId = activeScanConfiguration.floorId else {
+            showToast(message: localized("The prior map is no longer available."), seconds: 3)
+            return
         }
-        alert.addAction(UIAlertAction(title: localized("Cancel"), style: .cancel))
-        alert.addAction(UIAlertAction(
-            title: localized("确认位置"),
-            style: .default,
-            handler: { _ in
-                guard let fields = alert.textFields,
-                      fields.count == 3,
-                      let x = Double(fields[0].text ?? ""),
-                      let y = Double(fields[1].text ?? ""),
-                      let degrees = Double(fields[2].text ?? "") else {
-                    self.showToast(
-                        message: self.localized("The position was not changed because one or more values were invalid."),
-                        seconds: 4)
-                    return
-                }
-                self.applyManualPriorMapPose(
-                    PriorMapPose2D(
-                        xM: x,
-                        yM: y,
-                        yawRad: degrees * .pi / 180.0),
-                    reason: "user_reselected_map_pose")
-            }))
-        present(alert, animated: true)
+        let picker = PriorMapPoseSelectionViewController(
+            package: package,
+            floorId: floorId,
+            pose: initial
+        ) { [weak self] pose in
+            self?.applyManualPriorMapPose(
+                pose,
+                reason: "user_reselected_map_pose_on_map")
+        }
+        present(picker, animated: true)
     }
 
     private func applyManualPriorMapPose(
@@ -2854,8 +2885,32 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         let confirmationWallClock = Date()
         let confirmationFrameTimestamp = frame.timestamp
         let confirmationTransform = frame.camera.transform
-        guard let confirmationNodeBinding = rtabmap?.latestNodeBinding(
-            frameTimestamp: confirmationFrameTimestamp) else {
+        let liveBinding = rtabmap?.latestNodeBinding(
+            frameTimestamp: confirmationFrameTimestamp)
+        let cachedBinding = priorMapLastNodeBinding.flatMap { cached -> (
+            nodeId: Int,
+            nodeStamp: TimeInterval,
+            nodeTimebaseFrameTimestamp: TimeInterval,
+            nodeTimebaseOffsetSeconds: TimeInterval,
+            deltaSeconds: TimeInterval,
+            generation: UInt64
+        )? in
+            let nodeTimebaseFrameTimestamp = confirmationFrameTimestamp
+                + cached.nodeTimebaseOffsetSeconds
+            let delta = abs(nodeTimebaseFrameTimestamp - cached.nodeStamp)
+            guard abs(confirmationFrameTimestamp - cached.sampledFrameTimestamp) <= 1.0,
+                  delta <= 1.0 else {
+                return nil
+            }
+            return (
+                cached.nodeId,
+                cached.nodeStamp,
+                nodeTimebaseFrameTimestamp,
+                cached.nodeTimebaseOffsetSeconds,
+                delta,
+                cached.generation)
+        }
+        guard let confirmationNodeBinding = liveBinding ?? cachedBinding else {
             supermarketSession?.appendScanEvent(
                 level: "warning",
                 event: "manual_localization_event_rejected",

@@ -16,7 +16,7 @@ from tools.PriorMap.coordinate_system import (
     source_rectangle_polygon,
     source_rotation_to_yaw,
 )
-from tools.PriorMap.distance_field import decode_level
+from tools.PriorMap.distance_field import build_distance_fields, decode_level
 from tools.PriorMap.prior_map_schema import build_package_manifest, validate_package
 from tools.PriorMap.replay_localization import replay
 from tools.PriorMap.replay_stage2 import (
@@ -444,6 +444,65 @@ class PriorMapConversionTests(unittest.TestCase):
             ),
         )
         self.assertFalse(validate_package(corrupted)["valid"])
+
+    def test_distance_field_preserves_irregular_shelves_and_pillars(self) -> None:
+        elements = [
+            {
+                "shape_type": "MapShelf",
+                "floor_id": "1",
+                "visible": True,
+                "geometry": {
+                    "type": "Polygon",
+                    "coordinates": [
+                        [0.5, 0.5],
+                        [3.5, 0.5],
+                        [3.5, 1.5],
+                        [1.5, 1.5],
+                        [1.5, 3.5],
+                        [0.5, 3.5],
+                    ],
+                },
+            },
+            {
+                "shape_type": "MapPillar",
+                "floor_id": "1",
+                "visible": True,
+                "geometry": {
+                    "type": "Polygon",
+                    "coordinates": [
+                        [4.2, 2.0],
+                        [4.8, 2.0],
+                        [4.8, 2.6],
+                        [4.2, 2.6],
+                    ],
+                },
+            },
+        ]
+        payload = build_distance_fields(
+            elements,
+            [{
+                "id": "1",
+                "bounds": {
+                    "min_x_m": 0.0,
+                    "min_y_m": 0.0,
+                    "max_x_m": 6.0,
+                    "max_y_m": 5.0,
+                },
+            }],
+            resolutions_m=(0.1,),
+        )
+        level = payload["floors"]["1"]["levels"][0]
+        values = decode_level(level)
+
+        def value_at(x_m: float, y_m: float) -> int:
+            origin_x, origin_y = level["origin_m"]
+            cell_x = int(math.floor((x_m - origin_x) / level["resolution_m"]))
+            cell_y = int(math.floor((y_m - origin_y) / level["resolution_m"]))
+            return values[cell_y * level["width"] + cell_x]
+
+        self.assertLessEqual(value_at(1.5, 2.5), 10)
+        self.assertLessEqual(value_at(4.5, 2.0), 10)
+        self.assertGreater(value_at(2.5, 2.5), 50)
 
     def test_road_graph_normalizes_numeric_ids_and_spatial_query_is_bounded(self) -> None:
         package = convert_workbook(self.workbook, self.root / "package")
