@@ -163,7 +163,7 @@ diagnostic draft 不能自动冒充 production `published`；只有完整因子�
 - PC 已使用独立 `ios_prior` 数据库位姿契约，Map Studio 地图渲染的旧坐标选项不受影响；
 - reciprocal relative Link 已改为 canonical 确定性折叠；
 - 人工锚点使用 5 m/30°安全门，超限约束写入 rejected/audit 并从求解中忽略；
-- 手机 matcher 保留 Top‑5 独立盆地，按修正变换跨帧跟踪；局部候选需 3 帧，恢复候选需 4 帧；持续 weak/lost 或可靠闭环会打开最多 5 m/30°的 20 帧恢复期，每次实际修正仍限制为 0.35 m/8°；
+- 手机 matcher 保留 Top‑5 独立盆地。P7R2 复核发现旧 tracker 使用的局部平移会随手机朝向旋转，现已改为跟踪固定的全局 `T_map_from_arkit = T_candidate_map × inverse(T_arkit)`，并用平滑后的全局变换重建目标；局部候选需 3 帧，恢复候选需 4 帧；持续 weak/lost 或可靠闭环只会打开最多 5 m/30°的 20 帧恢复期，每次实际修正仍限制为 0.35 m/8°；
 - 手机重定位已改为地图点击/拖动/平移/缩放/旋转，PC 锚点改为绿色轨迹点直接拖动并自动生成 node/time/JSON；
 - 深度结构需至少 4 个近期帧的同一世界 voxel 证据，自适应检测率使用 8/12 秒升降驻留时间；原始位姿异常同时检查 3 m/s 和 180°/s；
 - 非规则折线货架和立柱距离场、平行通道不跳转、4.8 m/29°恢复候选、冲突人工锚点、网页锚点入口均有自动回归。
@@ -186,6 +186,6 @@ diagnostic draft 不能自动冒充 production `published`；只有完整因子�
 
 被拒绝的两个人工锚点分别为 2.99 m/31.21° 和 3.34 m/34.81°，原因均为 `manual_anchor_safety_gate`；其余 3 个安全人工锚点、2 个在线结构约束和 330 个道路软约束参与求解。该结果作为 `diagnostic draft` 成功切换到测试 current，可查看轨迹、累计修正和残差。
 
-它仍不能发布为生产成果：本次是在诊断模式下生成，质量策略仍是 candidate，最大 pose update 约 2.96 m，且旧手机 sidecar 中 weak/lost 时长约 3,758 秒。后者是修复前 App 采集的在线结果，只有用修复后的 iPhone App 重扫才能验证多候选恢复是否改善。剩余工作因此仅是修复后真机重扫、现场准确率/累计误差控制点测试和人工复核，不再是本报告所列代码缺口。
+它仍不能发布为生产成果：本次是在诊断模式下生成，质量策略仍是 candidate，最大 pose update 约 2.96 m，且旧手机 sidecar 中 weak/lost 时长约 3,758 秒。后者是修复前 App 采集的在线结果，只有用 P7R2 修复后的 iPhone App 重扫才能验证全局 hypothesis、转弯保持和多候选恢复是否改善。剩余工作包括最终 exact-SHA CI、修复版真机重扫、现场准确率/累计误差控制点测试和独立人工复核。
 
-自动回归结果：PriorMap 121 项通过，Supermarket Map Studio 94 项通过；Swift 核心可执行测试、Python 编译、JavaScript 语法和 native factor-graph helper 构建均通过；iOS 工程在 `generic/platform=iOS`、禁用签名的 Debug 配置下完整构建成功。
+P7R2 本地回归已确认 PriorMap 122 项通过，其中 Swift 核心可执行测试覆盖 T1—T11：identity、纯平移、0/90/180°、组合转动平移、±π、转弯中错误高分通道、等分平行通道、5 m/30°边界、5.01 m/30.1°拒绝，以及 100 组确定性随机 `apply(derive(A,C),A)=C` 重建；场景覆盖蛇形转弯、短时动态遮挡、四帧恢复、loop-only authorization 和 corrected HUD。此前同一累计基线的 Supermarket Map Studio 94 项、资格证据 11 项和 iOS unsigned arm64 build 已通过；P7R2 最终治理 HEAD 的完整套件、iOS build 与七组 hosted CI 仍需在本轮提交后重新执行，不能沿用旧 SHA 结果。

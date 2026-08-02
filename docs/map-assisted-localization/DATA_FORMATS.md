@@ -84,12 +84,23 @@ checkpoint cleanup 是显式破坏性恢复事务。iOS 与 PC 都按 path compo
   "matchUniqueness": 0.31,
   "matchResidualCost": 0.02,
   "matcherElapsedMs": 18.4,
+  "mapFromArkitX": 4.2,
+  "mapFromArkitY": -1.3,
+  "mapFromArkitYawDeg": 18.0,
+  "selectedHypothesisId": 7,
+  "activeHypothesisTrackCount": 2,
+  "hypothesisBestCost": 0.02,
+  "hypothesisSecondCost": 0.05,
+  "hypothesisReason": "trusted_local_hypothesis",
+  "hypothesisTrackerElapsedMs": 0.08,
   "constraintAccepted": true,
   "constraintReason": "trusted_structure_correction"
 }
 ```
 
-接受和拒绝都记录原因，结构候选最多 3 个。`rawPose` 是当前 ARKit 预测投影；`estimatedPose` 才包含通过安全门控的小幅地图对齐修正。道路候选仅保留为弱先验证据。
+接受和拒绝都记录原因，结构匹配保留最多 5 个独立盆地。`rawPose` 是现有对齐下的 ARKit 预测投影；`estimatedPose` 才包含通过安全门控的小幅地图对齐修正。道路候选仅保留为弱先验证据。
+
+P7R2 的 hypothesis 统一跟踪全局 `T_map_from_arkit`，而不是手机自身坐标下的局部平移。对 ARKit 水平位姿 `A=(R_a,t_a)` 与候选地图位姿 `C=(R_c,t_c)`，记录的变换满足 `M=C×inverse(A)`：`theta=normalize(yaw_c-yaw_a)`、`t_m=t_c-R(theta)t_a`，且 `apply(M,A)` 必须重建 `C`。`mapFromArkitX/Y/YawDeg` 是所选 track 的平滑全局变换；`selectedHypothesisId` 只在本次 tracker 生命周期内稳定；active count 上限 8；best/second cost 对应当前排名前两条活动 track；reason 与 tracker elapsed 用于解释歧义和性能。无活动 hypothesis 时可选字段省略。以上是 version 1 的向后兼容附加诊断字段，不改变现有必填业务 schema；旧 reader 可忽略，最终证据校验仍要求原有身份、时间和 pose 字段。
 
 `timestamp` 保留原始 `ARFrame.timestamp`（设备单调时钟）；RTAB‑Map 的 `CameraMobile` 在写 `Node.stamp` 前会加 `stampEpochOffset`。因此所有当前定位 sidecar 同时保存 `nodeTimebaseTimestamp = timestamp + nodeTimebaseOffsetSeconds`，PC 只用换算后的 node timebase 绑定 SQLite node，并严格复算该等式。offset 由 native camera 原子读取；尚未初始化或非有限时该记录拒绝落盘，不能直接拿原始 ARFrame 时间与 epoch node stamp 比较。
 

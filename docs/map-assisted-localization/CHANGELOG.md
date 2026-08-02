@@ -2,6 +2,13 @@
 
 > 文档状态：**当前有效**。最后核对日期：2026-08-02。
 
+## 2026-08-02 — P7R2 Sam 全局对齐修复
+
+- 在线多候选 tracker 改为跟踪固定的 `T_map_from_arkit = T_candidate_map × inverse(T_arkit)`，修复手机转弯时 body-local translation 旋转并错误拆分 hypothesis 的问题。
+- 平滑后的全局变换用于重新投影当前 ARKit 位姿；局部/恢复安全门和单步限幅集中到纯函数合同。可靠闭环只开启恢复窗口，人工确认清空 tracker，原始 ARKit/RTAB-Map 数据不改写。
+- 删除旧 `PriorMapCorrectionMath` 和未接线 `PriorMapTemporalCorrectionGate`；trace v1 增加可选全局对齐、track、cost、reason 和 tracker 耗时字段。
+- Swift executable 新增 T1—T11、蛇形转弯、相邻通道、遮挡与恢复边界回归；最终 exact-SHA CI、修复版 Sam 真机重扫和人工控制点验收仍待执行。
+
 ## 2026-08-02 — 外置盘先验地图导入兼容
 
 - PC 地图包清单生成与验证、iOS 地图包完整性验证统一忽略 macOS 外置盘生成的 `._*` AppleDouble 旁车和 `.DS_Store`；其余非清单普通文件仍保持 fail closed，避免二进制 Finder 元数据被误读为 UTF-8 JSON。

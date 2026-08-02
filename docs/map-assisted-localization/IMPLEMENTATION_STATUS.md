@@ -4,6 +4,8 @@
 
 2026-08-02 的 Sam 真实扫描暴露了数据库位姿与 iOS prior-map 坐标契约不一致、reciprocal loop 被过严判为矛盾边、在线定位长期歧义和交互困难。现场证据、指标、根因、代码整改和同一优化数据库的只读回归结果见 [`SAM_SCAN_REPORT_2026-08-02.md`](SAM_SCAN_REPORT_2026-08-02.md)。修复后完整因子图已覆盖 4,442 个节点并收敛，测试草稿可查看；修复后的 iPhone 真机重扫和现场控制点验收仍未执行，不能据此标记生产通过。
 
+P7R2 后续审查确认在线 hypothesis 的旧“修正变换”实际是 body-local translation，设备转弯时不保持不变。代码提交 `0a2a3ec50a851d52f96120a8f3d1669a7797e34e` 已改为显式全局 `T_map_from_arkit`，按候选地图位姿与原始 ARKit 水平位姿求逆组合、在地图坐标平滑，并由该变换重建安全修正目标；旧局部数学和未接线 temporal gate 已删除。该结论目前为 **IMPLEMENTED / AUTOMATED TESTED**，最终 exact-SHA CI 与 Sam 真机重扫待执行。
+
 ## 生产化总状态
 
 当前发布判定是 **NO-GO / NOT PRODUCTION READY**。`repair-v2-w2r-safety-closeout@cf1b62c949f3574e1804808537e38c8ff643549c` 是生产化冻结基线；P0 在专用 CI job 中锁定 bounded solver 禁止发布、cleanup 确认与精确 CAS、复制后本地副本保留、required evidence 失败时 finalization fail closed 四项不变量，不修改业务算法。
@@ -28,7 +30,7 @@ P7 已实现 loopback-only server、每次启动随机且不落盘的 token、PO
 | iOS 五步向导 | 已实现 | 地图、楼层、起点/方向、设备检查、开始 |
 | iOS 道路锚点快捷起点 | 已实现 | 起点步骤可从当前楼层道路节点选择锚点 |
 | prior-map 仍写连续 RTAB-Map DB | 已实现 | 复用 `newScan`/`streamingDatabaseURL` |
-| T_map_from_arkit 与 2D HUD | 已实现并完成 Sam 代码整改 | Top‑5 跨帧 hypothesis；weak/lost/可靠闭环 5 m/30°有界恢复；0.35 m/8°单步门；修复后真机重扫待执行 |
+| T_map_from_arkit 与 2D HUD | P7R2 已修复并自动测试 | Top‑5 跟踪固定的全局 `T_map_from_arkit`；候选可由该变换以 `1e-9` 重建；weak/lost/可靠闭环只授权 5 m/30°有界恢复；0.35 m/8°单步门；HUD 使用 corrected `estimatedPose`；修复后真机重扫待执行 |
 | 单楼层定位边界 | 已实现 | 开始前绑定一层；无跨层切换；忽略二维高度但保留原始 3D |
 | 道路软约束、歧义拒绝 | 已实现 | 2 Hz、有界道路索引、in-flight 丢帧门控、0.15 gain、0.25 m cap、Top-3 |
 | 人工确认和审计 | 已实现 | manual v3 JSONL；native 原子 node/timebase/generation 快照；无一致 node 证据即拒绝 |
@@ -90,7 +92,7 @@ P7 已实现 loopback-only server、每次启动随机且不落盘的 token、PO
 | 操作者取消 | 已实现 | 持久取消意图；原生子进程 terminate→有界 wait→kill；partial 清理 |
 | 原生运行日志 | 已实现 | fast/discovery 独立日志、严格文件名和任务归属下载 |
 | 损坏 journal/保留策略 | 已实现 | health 报告 startup error；不按不可信路径清理；默认保留 200 个终态任务 |
-| 自动回归 | 已实现 | 2026-08-02 本地完整回归：PriorMap 121 项、工作台 94 项；另有既有资格证据 11 项。新增覆盖 `ios_prior`、人工安全门、平行通道、5 m/30°恢复、非规则货架/立柱、动态结构和 PC 地图锚点。该数字是 AUTOMATED TESTED，不替代最终 exact-SHA CI 或人工验收 |
+| 自动回归 | 已实现 | P7R2 本地 PriorMap 122 项通过；新增 Swift executable 覆盖 T1—T11 与 S1/S2/S4，源码合同覆盖 S3 loop-only authorization、S5 corrected HUD。此前同基线工作台 94 项、资格证据 11 项；本轮完整套件与最终 exact-SHA CI 结果在提交前继续复核。该数字是 AUTOMATED TESTED，不替代人工验收 |
 
 ## 尚未完成的发布门槛
 
