@@ -24,6 +24,119 @@ struct PriorMapPose2D: Codable, Equatable {
     }
 }
 
+/// A global SE(2) transform from the persistent ARKit world frame into the
+/// prior-map frame. Unlike a body-local translation correction, this value is
+/// invariant while the device turns or moves under one valid alignment.
+struct PriorMapAlignmentTransform: Equatable {
+    var translationXM: Double
+    var translationYM: Double
+    var yawRad: Double
+}
+
+enum PriorMapAlignmentMath {
+    static func mapFromArkit(
+        arkitPose: PriorMapPose2D,
+        candidateMapPose: PriorMapPose2D
+    ) -> PriorMapAlignmentTransform {
+        let yaw = PriorMapStageOneMath.normalizeAngle(
+            candidateMapPose.yawRad - arkitPose.yawRad)
+        let cosine = cos(yaw)
+        let sine = sin(yaw)
+        return PriorMapAlignmentTransform(
+            translationXM: candidateMapPose.xM
+                - (cosine * arkitPose.xM - sine * arkitPose.yM),
+            translationYM: candidateMapPose.yM
+                - (sine * arkitPose.xM + cosine * arkitPose.yM),
+            yawRad: yaw)
+    }
+
+    static func apply(
+        mapFromArkit: PriorMapAlignmentTransform,
+        arkitPose: PriorMapPose2D
+    ) -> PriorMapPose2D {
+        let cosine = cos(mapFromArkit.yawRad)
+        let sine = sin(mapFromArkit.yawRad)
+        return PriorMapPose2D(
+            xM: mapFromArkit.translationXM
+                + cosine * arkitPose.xM - sine * arkitPose.yM,
+            yM: mapFromArkit.translationYM
+                + sine * arkitPose.xM + cosine * arkitPose.yM,
+            yawRad: PriorMapStageOneMath.normalizeAngle(
+                arkitPose.yawRad + mapFromArkit.yawRad))
+    }
+
+    static func interpolate(
+        from current: PriorMapAlignmentTransform,
+        to observed: PriorMapAlignmentTransform,
+        gain: Double
+    ) -> PriorMapAlignmentTransform {
+        let boundedGain = min(1, max(0, gain))
+        return PriorMapAlignmentTransform(
+            translationXM: current.translationXM * (1 - boundedGain)
+                + observed.translationXM * boundedGain,
+            translationYM: current.translationYM * (1 - boundedGain)
+                + observed.translationYM * boundedGain,
+            yawRad: PriorMapStageOneMath.normalizeAngle(
+                current.yawRad
+                    + PriorMapStageOneMath.normalizeAngle(
+                        observed.yawRad - current.yawRad) * boundedGain))
+    }
+}
+
+enum PriorMapCorrectionSafety {
+    static let localTranslationLimitM = 0.35
+    static let localYawLimitRad = 8.0 * Double.pi / 180.0
+    static let recoveryTranslationLimitM = 5.0
+    static let recoveryYawLimitRad = 30.0 * Double.pi / 180.0
+    static let stepGain = 0.35
+    static let maximumStepTranslationM = 0.35
+    static let maximumStepYawRad = 8.0 * Double.pi / 180.0
+
+    static func difference(
+        from current: PriorMapPose2D,
+        to target: PriorMapPose2D
+    ) -> (translationM: Double, yawRad: Double) {
+        return (
+            hypot(target.xM - current.xM, target.yM - current.yM),
+            abs(PriorMapStageOneMath.normalizeAngle(
+                target.yawRad - current.yawRad)))
+    }
+
+    static func isWithinGate(
+        current: PriorMapPose2D,
+        target: PriorMapPose2D,
+        recoverySearch: Bool
+    ) -> Bool {
+        let delta = difference(from: current, to: target)
+        let translationLimit = recoverySearch
+            ? recoveryTranslationLimitM : localTranslationLimitM
+        let yawLimit = recoverySearch ? recoveryYawLimitRad : localYawLimitRad
+        return delta.translationM <= translationLimit && delta.yawRad <= yawLimit
+    }
+
+    static func boundedStep(
+        current: PriorMapPose2D,
+        target: PriorMapPose2D
+    ) -> PriorMapPose2D {
+        let deltaX = (target.xM - current.xM) * stepGain
+        let deltaY = (target.yM - current.yM) * stepGain
+        let deltaLength = hypot(deltaX, deltaY)
+        let scale = deltaLength > maximumStepTranslationM
+            ? maximumStepTranslationM / deltaLength : 1.0
+        let yawStep = max(
+            -maximumStepYawRad,
+            min(
+                maximumStepYawRad,
+                PriorMapStageOneMath.normalizeAngle(
+                    target.yawRad - current.yawRad) * stepGain))
+        return PriorMapPose2D(
+            xM: current.xM + deltaX * scale,
+            yM: current.yM + deltaY * scale,
+            yawRad: PriorMapStageOneMath.normalizeAngle(
+                current.yawRad + yawStep))
+    }
+}
+
 struct PriorMapScanConfiguration: Codable {
     let formatVersion: Int
     let workflowMode: ScanWorkflowMode

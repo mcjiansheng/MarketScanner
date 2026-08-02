@@ -10,6 +10,7 @@ SESSION_SOURCE = REPOSITORY / "app/ios/RTABMapApp/SupermarketScanSession.swift"
 VIEW_SOURCE = REPOSITORY / "app/ios/RTABMapApp/ViewController.swift"
 OVERLAY_SOURCE = REPOSITORY / "app/ios/RTABMapApp/PriorMapLocalization.swift"
 MATCHER_SOURCE = REPOSITORY / "app/ios/RTABMapApp/PriorMapScanMatcher.swift"
+CORE_SOURCE = REPOSITORY / "app/ios/RTABMapApp/PriorMapLocalizationCore.swift"
 DEPTH_SOURCE = REPOSITORY / "app/ios/RTABMapApp/PriorMapDepthSampler.swift"
 FINALIZATION_CORE_SOURCE = (
     REPOSITORY / "app/ios/RTABMapApp/SupermarketFinalizationCore.swift"
@@ -25,6 +26,7 @@ class IOSLocalizationSidecarHealthContractTests(unittest.TestCase):
         view = source(VIEW_SOURCE)
         overlay = source(OVERLAY_SOURCE)
         matcher = source(MATCHER_SOURCE)
+        core = source(CORE_SOURCE)
         depth = source(DEPTH_SOURCE)
         for token in (
             "PriorMapHypothesisTracker",
@@ -41,8 +43,32 @@ class IOSLocalizationSidecarHealthContractTests(unittest.TestCase):
         ):
             self.assertIn(token, view)
         self.assertIn("recoveryFramesRemaining = max(recoveryFramesRemaining, 20)", overlay)
-        self.assertIn("translation <= 0.5", overlay)
+        self.assertIn("correction.translationM <= 0.5", overlay)
         self.assertIn("guard hits >= 4, frameIndex - firstFrame >= 3", depth)
+        for token in (
+            "PriorMapAlignmentTransform",
+            "PriorMapAlignmentMath.mapFromArkit",
+            "PriorMapAlignmentMath.apply",
+            "PriorMapCorrectionSafety.isWithinGate",
+            "PriorMapCorrectionSafety.boundedStep",
+        ):
+            self.assertIn(token, core + matcher + overlay)
+        self.assertNotIn("PriorMapCorrectionMath", matcher)
+        self.assertNotIn("PriorMapTemporalCorrectionGate", matcher)
+
+    def test_loop_recovery_and_corrected_hud_are_fail_closed(self) -> None:
+        overlay = source(OVERLAY_SOURCE)
+        recovery = overlay.split("func requestRecovery(reason: String)", 1)[1].split(
+            "func update(frame:", 1
+        )[0]
+        self.assertIn("recoveryFramesRemaining", recovery)
+        self.assertNotIn("arkitOrigin =", recovery)
+        self.assertNotIn("initialMapPose =", recovery)
+        self.assertNotIn("latestEstimatedPose =", recovery)
+        self.assertIn("recentTrajectory.append(value.estimatedPose)", overlay)
+        self.assertIn("xM: value.estimatedPose.xM", overlay)
+        self.assertIn("yM: value.estimatedPose.yM", overlay)
+        self.assertIn("value.estimatedPose.yawRad", overlay)
 
     def test_trace_constraint_and_state_return_one_structured_result(self) -> None:
         session = source(SESSION_SOURCE)

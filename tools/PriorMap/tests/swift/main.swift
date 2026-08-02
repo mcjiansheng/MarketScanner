@@ -797,113 +797,255 @@ let weak = confidenceManager.update(
     mapMismatch: false)
 require(weak.phase == .weak, "limited tracking must degrade to weak")
 
-let temporalGate = PriorMapTemporalCorrectionGate()
-let firstMovingCandidate = temporalGate.observe(
-    rawPose: PriorMapPose2D(xM: 0, yM: 0, yawRad: 0),
-    candidatePose: PriorMapPose2D(xM: 0.2, yM: 0.05, yawRad: 0.02))
-let secondMovingCandidate = temporalGate.observe(
-    rawPose: PriorMapPose2D(xM: 1.2, yM: 0, yawRad: 0),
-    candidatePose: PriorMapPose2D(xM: 1.4, yM: 0.05, yawRad: 0.02))
-require(!firstMovingCandidate, "one correction must not pass the temporal gate")
-require(
-    secondMovingCandidate,
-    "normal walking with a stable correction transform must pass")
-temporalGate.reset()
-_ = temporalGate.observe(
-    rawPose: PriorMapPose2D(xM: 0, yM: 0, yawRad: .pi / 2),
-    candidatePose: PriorMapPose2D(xM: 0, yM: 0.2, yawRad: .pi / 2 + 0.02))
-require(
-    temporalGate.observe(
-        rawPose: PriorMapPose2D(xM: 0, yM: 1, yawRad: .pi / 2),
-        candidatePose: PriorMapPose2D(xM: 0, yM: 1.2, yawRad: .pi / 2 + 0.02)),
-    "turning motion must be removed before comparing correction transforms")
+func requirePoseClose(
+    _ actual: PriorMapPose2D,
+    _ expected: PriorMapPose2D,
+    _ message: String
+) {
+    require(close(actual.xM, expected.xM), "\(message) x")
+    require(close(actual.yM, expected.yM), "\(message) y")
+    require(
+        close(
+            PriorMapStageOneMath.normalizeAngle(actual.yawRad - expected.yawRad),
+            0),
+        "\(message) yaw")
+}
 
+func requireAlignmentReconstruction(
+    arkitPose: PriorMapPose2D,
+    expectedMapFromArkit: PriorMapAlignmentTransform,
+    _ message: String
+) {
+    let candidate = PriorMapAlignmentMath.apply(
+        mapFromArkit: expectedMapFromArkit,
+        arkitPose: arkitPose)
+    let derived = PriorMapAlignmentMath.mapFromArkit(
+        arkitPose: arkitPose,
+        candidateMapPose: candidate)
+    let reconstructed = PriorMapAlignmentMath.apply(
+        mapFromArkit: derived,
+        arkitPose: arkitPose)
+    requirePoseClose(reconstructed, candidate, message)
+    require(close(derived.translationXM, expectedMapFromArkit.translationXM), "\(message) tx")
+    require(close(derived.translationYM, expectedMapFromArkit.translationYM), "\(message) ty")
+    require(
+        close(
+            PriorMapStageOneMath.normalizeAngle(
+                derived.yawRad - expectedMapFromArkit.yawRad),
+            0),
+        "\(message) alignment yaw")
+}
+
+// P7R2 T1-T6: exact SE(2) reconstruction across identity, translation,
+// quarter-turn, combined motion, half-turn and the +/-pi wrap boundary.
+requireAlignmentReconstruction(
+    arkitPose: PriorMapPose2D(xM: 0, yM: 0, yawRad: 0),
+    expectedMapFromArkit: PriorMapAlignmentTransform(
+        translationXM: 0, translationYM: 0, yawRad: 0),
+    "T1 identity")
+requireAlignmentReconstruction(
+    arkitPose: PriorMapPose2D(xM: 2, yM: -3, yawRad: 0),
+    expectedMapFromArkit: PriorMapAlignmentTransform(
+        translationXM: 4, translationYM: 1, yawRad: 0),
+    "T2 translation at zero yaw")
+requireAlignmentReconstruction(
+    arkitPose: PriorMapPose2D(xM: 2, yM: -3, yawRad: .pi / 2),
+    expectedMapFromArkit: PriorMapAlignmentTransform(
+        translationXM: 4, translationYM: 1, yawRad: 0),
+    "T2 translation at ninety degrees")
+requireAlignmentReconstruction(
+    arkitPose: PriorMapPose2D(xM: 3, yM: 2, yawRad: 0),
+    expectedMapFromArkit: PriorMapAlignmentTransform(
+        translationXM: 8, translationYM: -2, yawRad: .pi / 2),
+    "T3 zero to ninety degree alignment")
+requireAlignmentReconstruction(
+    arkitPose: PriorMapPose2D(xM: -2.5, yM: 7.25, yawRad: -.pi / 3),
+    expectedMapFromArkit: PriorMapAlignmentTransform(
+        translationXM: 12.5, translationYM: -8.75, yawRad: .pi / 4),
+    "T4 turn and translation")
+requireAlignmentReconstruction(
+    arkitPose: PriorMapPose2D(xM: 5, yM: 9, yawRad: .pi),
+    expectedMapFromArkit: PriorMapAlignmentTransform(
+        translationXM: -4, translationYM: 6, yawRad: .pi),
+    "T5 one hundred eighty degrees")
+requireAlignmentReconstruction(
+    arkitPose: PriorMapPose2D(xM: 1, yM: 1, yawRad: .pi - 1.0e-10),
+    expectedMapFromArkit: PriorMapAlignmentTransform(
+        translationXM: 2, translationYM: 3, yawRad: -.pi + 2.0e-10),
+    "T6 angle wrap")
+
+let fixedAlignment = PriorMapAlignmentTransform(
+    translationXM: 2.4,
+    translationYM: -1.3,
+    yawRad: 18.0 * .pi / 180.0)
+let wrongAisleAlignment = PriorMapAlignmentTransform(
+    translationXM: 2.4,
+    translationYM: 1.7,
+    yawRad: 18.0 * .pi / 180.0)
 let hypothesisTracker = PriorMapHypothesisTracker()
-var trackedDecision = PriorMapHypothesisDecision(
-    candidate: nil,
-    supportFrames: 0,
-    scoreMargin: 0,
-    trusted: false,
-    reason: "test")
-for frame in 0..<3 {
-    let raw = PriorMapPose2D(xM: Double(frame), yM: 0, yawRad: 0)
+var trackedDecision: PriorMapHypothesisDecision?
+let serpentineArkitPoses = [
+    PriorMapPose2D(xM: 0, yM: 0, yawRad: 0),
+    PriorMapPose2D(xM: 1, yM: 0, yawRad: 0),
+    PriorMapPose2D(xM: 2, yM: 0.5, yawRad: .pi / 4),
+    PriorMapPose2D(xM: 2, yM: 1.5, yawRad: .pi / 2),
+    PriorMapPose2D(xM: 1.5, yM: 2.5, yawRad: 3 * .pi / 4),
+]
+for (frame, arkitPose) in serpentineArkitPoses.enumerated() {
+    let correct = PriorMapAlignmentMath.apply(
+        mapFromArkit: fixedAlignment,
+        arkitPose: arkitPose)
+    let wrong = PriorMapAlignmentMath.apply(
+        mapFromArkit: wrongAisleAlignment,
+        arkitPose: arkitPose)
+    // T8: during the turn, a fresh wrong aisle may have the higher frame
+    // score, but it must not steal the established global-alignment track.
+    let wrongScore = frame == 2 ? 0.99 : 0.50
     trackedDecision = hypothesisTracker.observe(
-        rawPose: raw,
+        arkitPose: arkitPose,
         candidates: [
-            PriorMapScanMatchCandidate(
-                pose: PriorMapPose2D(xM: Double(frame) + 0.4, yM: 0.1, yawRad: 0.02),
-                cost: 0.02,
-                score: 0.9),
-            PriorMapScanMatchCandidate(
-                pose: PriorMapPose2D(xM: Double(frame) + 0.4, yM: 1.0, yawRad: 0.02),
-                cost: 0.05,
-                score: 0.55),
+            PriorMapScanMatchCandidate(pose: wrong, cost: 0.01, score: wrongScore),
+            PriorMapScanMatchCandidate(pose: correct, cost: 0.02, score: 0.90),
         ],
-        uniqueness: 0.02,
+        uniqueness: 0.25,
         recoverySearch: false)
 }
-require(trackedDecision.trusted, "a separated motion-consistent lane must become trusted")
-require(trackedDecision.supportFrames >= 3, "trusted lane must have temporal support")
+guard let serpentineDecision = trackedDecision,
+      let trackedAlignment = serpentineDecision.mapFromArkit else {
+    require(false, "S1 must retain a global-alignment hypothesis")
+    exit(1)
+}
+require(serpentineDecision.trusted, "S1 serpentine alignment must become trusted")
+require(serpentineDecision.supportFrames == serpentineArkitPoses.count,
+        "S1 turns must not split the correct track")
+require(close(trackedAlignment.translationXM, fixedAlignment.translationXM),
+        "T8 wrong high-score aisle must not replace tx")
+require(close(trackedAlignment.translationYM, fixedAlignment.translationYM),
+        "T8 wrong high-score aisle must not replace ty")
 
+// S4: short dynamic occlusion produces no candidates; the bounded tracker may
+// retain history but cannot authorize a correction until evidence returns.
+let occludedOne = hypothesisTracker.observe(
+    arkitPose: serpentineArkitPoses.last!,
+    candidates: [], uniqueness: 0, recoverySearch: false)
+let occludedTwo = hypothesisTracker.observe(
+    arkitPose: serpentineArkitPoses.last!,
+    candidates: [], uniqueness: 0, recoverySearch: false)
+require(!occludedOne.trusted && !occludedTwo.trusted,
+        "S4 occlusion must fail closed")
+let returnedPose = PriorMapPose2D(xM: 1, yM: 3, yawRad: .pi)
+let returnedCandidate = PriorMapAlignmentMath.apply(
+    mapFromArkit: fixedAlignment,
+    arkitPose: returnedPose)
+let afterOcclusion = hypothesisTracker.observe(
+    arkitPose: returnedPose,
+    candidates: [PriorMapScanMatchCandidate(
+        pose: returnedCandidate, cost: 0.02, score: 0.9)],
+    uniqueness: 0.3,
+    recoverySearch: false)
+require(afterOcclusion.trusted, "S4 stable evidence may resume the retained track")
+
+// T9: equal parallel hypotheses remain ambiguous regardless of support.
 hypothesisTracker.reset()
-var ambiguousDecision = trackedDecision
+var ambiguousDecision: PriorMapHypothesisDecision?
+let parallelA = PriorMapAlignmentTransform(
+    translationXM: 0.3, translationYM: -0.6, yawRad: 0)
+let parallelB = PriorMapAlignmentTransform(
+    translationXM: 0.3, translationYM: 0.6, yawRad: 0)
 for frame in 0..<4 {
-    let raw = PriorMapPose2D(xM: Double(frame), yM: 0, yawRad: 0)
+    let arkitPose = PriorMapPose2D(xM: Double(frame), yM: 0, yawRad: 0)
     ambiguousDecision = hypothesisTracker.observe(
-        rawPose: raw,
-        candidates: [
+        arkitPose: arkitPose,
+        candidates: [parallelA, parallelB].map {
             PriorMapScanMatchCandidate(
-                pose: PriorMapPose2D(xM: Double(frame) + 0.3, yM: -0.6, yawRad: 0),
+                pose: PriorMapAlignmentMath.apply(
+                    mapFromArkit: $0, arkitPose: arkitPose),
                 cost: 0.02,
-                score: 0.9),
-            PriorMapScanMatchCandidate(
-                pose: PriorMapPose2D(xM: Double(frame) + 0.3, yM: 0.6, yawRad: 0),
-                cost: 0.02,
-                score: 0.9),
-        ],
+                score: 0.9)
+        },
         uniqueness: 0,
         recoverySearch: false)
 }
-require(!ambiguousDecision.trusted, "equal parallel aisles must never silently switch")
+require(ambiguousDecision?.trusted == false,
+        "T9 equal parallel aisles must never silently switch")
+require(ambiguousDecision?.activeTrackCount == 2,
+        "T9 both ambiguous tracks must remain visible in diagnostics")
 
+// T10/S2: unique recovery needs four frames; 5 m/30 degrees is inclusive,
+// while either 5.01 m or 30.1 degrees is rejected by the safety contract.
 hypothesisTracker.reset()
-var recoveryDecision = ambiguousDecision
+let recoveryAlignment = PriorMapAlignmentTransform(
+    translationXM: 4.8,
+    translationYM: 0,
+    yawRad: 29.0 * .pi / 180.0)
+var recoveryDecision: PriorMapHypothesisDecision?
 for frame in 0..<4 {
-    let raw = PriorMapPose2D(xM: Double(frame), yM: 0, yawRad: 0)
+    let arkitPose = PriorMapPose2D(xM: Double(frame), yM: 0, yawRad: 0)
     recoveryDecision = hypothesisTracker.observe(
-        rawPose: raw,
-        candidates: [
-            PriorMapScanMatchCandidate(
-                pose: PriorMapPose2D(
-                    xM: Double(frame) + 4.8,
-                    yM: 0,
-                    yawRad: 29.0 * .pi / 180.0),
-                cost: 0.02,
-                score: 0.95),
-        ],
+        arkitPose: arkitPose,
+        candidates: [PriorMapScanMatchCandidate(
+            pose: PriorMapAlignmentMath.apply(
+                mapFromArkit: recoveryAlignment, arkitPose: arkitPose),
+            cost: 0.02,
+            score: 0.95)],
         uniqueness: 0.8,
         recoverySearch: true)
 }
-require(
-    recoveryDecision.trusted && recoveryDecision.supportFrames >= 4,
-    "a unique motion-consistent recovery hypothesis within 5 m / 30 deg must pass")
-temporalGate.reset()
-_ = temporalGate.observe(
-    rawPose: PriorMapPose2D(xM: 0, yM: 0, yawRad: 0),
-    candidatePose: PriorMapPose2D(xM: 0.2, yM: 0, yawRad: 0))
-// Simulate an ambiguous/mismatch/unsafe frame. Production calls reset before
-// observing any rejected geometry.
-temporalGate.reset()
-require(
-    !temporalGate.observe(
-        rawPose: PriorMapPose2D(xM: 1, yM: 0, yawRad: 0),
-        candidatePose: PriorMapPose2D(xM: 1.2, yM: 0, yawRad: 0)),
-    "a rejected frame must not preheat the next accepted correction")
-require(
-    temporalGate.observe(
-        rawPose: PriorMapPose2D(xM: 2, yM: 0, yawRad: 0),
-        candidatePose: PriorMapPose2D(xM: 2.2, yM: 0, yawRad: 0)),
-    "two post-reset consistent frames are required")
+require(recoveryDecision?.trusted == true && recoveryDecision?.supportFrames == 4,
+        "S2 unique recovery must require and pass four consistent frames")
+let safetyOrigin = PriorMapPose2D(xM: 0, yM: 0, yawRad: 0)
+require(PriorMapCorrectionSafety.isWithinGate(
+    current: safetyOrigin,
+    target: PriorMapPose2D(xM: 5, yM: 0, yawRad: 30 * .pi / 180),
+    recoverySearch: true), "T10 inclusive recovery boundary")
+require(!PriorMapCorrectionSafety.isWithinGate(
+    current: safetyOrigin,
+    target: PriorMapPose2D(xM: 5.01, yM: 0, yawRad: 0),
+    recoverySearch: true), "T10 reject 5.01 m")
+require(!PriorMapCorrectionSafety.isWithinGate(
+    current: safetyOrigin,
+    target: PriorMapPose2D(xM: 5, yM: 0, yawRad: 30.1 * .pi / 180),
+    recoverySearch: true), "T10 reject 30.1 degrees")
+let boundedRecoveryStep = PriorMapCorrectionSafety.boundedStep(
+    current: safetyOrigin,
+    target: PriorMapPose2D(xM: 4.8, yM: 0, yawRad: 29 * .pi / 180))
+require(close(boundedRecoveryStep.xM, 0.35), "S2 recovery step translation cap")
+require(close(boundedRecoveryStep.yawRad, 8 * .pi / 180),
+        "S2 recovery step yaw cap")
+
+// Reset (the same operation used by manual confirmation) clears track history.
+hypothesisTracker.reset()
+let postReset = hypothesisTracker.observe(
+    arkitPose: safetyOrigin,
+    candidates: [PriorMapScanMatchCandidate(
+        pose: PriorMapPose2D(xM: 0.2, yM: 0, yawRad: 0),
+        cost: 0.02,
+        score: 0.9)],
+    uniqueness: 0.5,
+    recoverySearch: false)
+require(!postReset.trusted && postReset.supportFrames == 1,
+        "manual reset must require fresh temporal support")
+
+// T11: deterministic randomized reconstruction, including arbitrary turns.
+var randomState: UInt64 = 0x5eed5eed
+func deterministicUnit() -> Double {
+    randomState = randomState &* 6364136223846793005 &+ 1442695040888963407
+    return Double(randomState >> 11) / Double(UInt64.max >> 11)
+}
+for index in 0..<100 {
+    let arkitPose = PriorMapPose2D(
+        xM: deterministicUnit() * 200 - 100,
+        yM: deterministicUnit() * 200 - 100,
+        yawRad: deterministicUnit() * 2 * .pi - .pi)
+    let alignment = PriorMapAlignmentTransform(
+        translationXM: deterministicUnit() * 200 - 100,
+        translationYM: deterministicUnit() * 200 - 100,
+        yawRad: deterministicUnit() * 2 * .pi - .pi)
+    requireAlignmentReconstruction(
+        arkitPose: arkitPose,
+        expectedMapFromArkit: alignment,
+        "T11 randomized case \(index)")
+}
 
 let orientedBounds = CGRect(x: 0.1, y: 0.2, width: 0.3, height: 0.4)
 let rightBounds = PriorMapImageGeometry.nativeSensorBounds(

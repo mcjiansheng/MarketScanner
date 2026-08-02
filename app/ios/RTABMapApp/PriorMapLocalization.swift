@@ -314,6 +314,15 @@ struct PriorMapLocalizationUpdate: Codable {
     var recoverySearch: Bool = false
     var correctionTranslationM: Double = 0
     var correctionYawDeg: Double = 0
+    var mapFromArkitX: Double? = nil
+    var mapFromArkitY: Double? = nil
+    var mapFromArkitYawDeg: Double? = nil
+    var selectedHypothesisId: Int? = nil
+    var activeHypothesisTrackCount: Int = 0
+    var hypothesisBestCost: Double? = nil
+    var hypothesisSecondCost: Double? = nil
+    var hypothesisReason: String = "no_hypothesis"
+    var hypothesisTrackerElapsedMs: Double = 0
     var trackingSessionId: String? = nil
     var priorMapId: String? = nil
     var priorMapSha256: String? = nil
@@ -508,45 +517,37 @@ final class PriorMapStageOneLocalizer {
             latestFloorEstimate = floorEstimate
         }
         let hypothesis = hypothesisTracker.observe(
-            rawPose: rawPose,
+            arkitPose: arkitPose,
             candidates: match?.candidates ?? [],
             uniqueness: match?.uniqueness ?? 0,
             recoverySearch: recoverySearch)
         var correctionTranslationM = 0.0
         var correctionYawDeg = 0.0
-        if let best = hypothesis.candidate {
-            let translation = hypot(
-                best.pose.xM - rawPose.xM,
-                best.pose.yM - rawPose.yM)
-            let yawDelta = abs(PriorMapStageOneMath.normalizeAngle(
-                best.pose.yawRad - rawPose.yawRad))
-            correctionTranslationM = translation
-            correctionYawDeg = yawDelta * 180.0 / .pi
+        if let best = hypothesis.candidate,
+           let mapFromArkit = hypothesis.mapFromArkit {
+            // Reconstruct the target from the smoothed global alignment. The
+            // latest scan-match candidate supplies geometry quality only; it
+            // must not bypass temporal smoothing or turn invariance.
+            let targetPose = PriorMapAlignmentMath.apply(
+                mapFromArkit: mapFromArkit,
+                arkitPose: arkitPose)
+            let correction = PriorMapCorrectionSafety.difference(
+                from: rawPose,
+                to: targetPose)
+            correctionTranslationM = correction.translationM
+            correctionYawDeg = correction.yawRad * 180.0 / .pi
             let geometryCandidate = best.cost <= 0.10
                 && (match?.effectivePointCount ?? 0) >= 45
                 && (observation?.coverageAngleRad ?? 0) >= 0.35
-            let translationGate = recoverySearch ? 5.0 : 0.35
-            let yawGate = (recoverySearch ? 30.0 : 8.0) * .pi / 180.0
             let geometryAndSafetyAccepted = geometryCandidate
-                && translation <= translationGate
-                && yawDelta <= yawGate
+                && PriorMapCorrectionSafety.isWithinGate(
+                    current: rawPose,
+                    target: targetPose,
+                    recoverySearch: recoverySearch)
             if geometryAndSafetyAccepted, hypothesis.trusted {
-                let gain = 0.35
-                let deltaX = (best.pose.xM - rawPose.xM) * gain
-                let deltaY = (best.pose.yM - rawPose.yM) * gain
-                let deltaLength = hypot(deltaX, deltaY)
-                let stepScale = deltaLength > 0.35 ? 0.35 / deltaLength : 1.0
-                let yawStep = max(
-                    -8.0 * .pi / 180.0,
-                    min(
-                        8.0 * .pi / 180.0,
-                        PriorMapStageOneMath.normalizeAngle(
-                            best.pose.yawRad - rawPose.yawRad) * gain))
-                estimatedPose = PriorMapPose2D(
-                    xM: rawPose.xM + deltaX * stepScale,
-                    yM: rawPose.yM + deltaY * stepScale,
-                    yawRad: PriorMapStageOneMath.normalizeAngle(
-                        rawPose.yawRad + yawStep))
+                estimatedPose = PriorMapCorrectionSafety.boundedStep(
+                    current: rawPose,
+                    target: targetPose)
                 // Move only the map/ARKit alignment anchor. ARKit world
                 // tracking and the scan database are never reset.
                 arkitOrigin = arkitPose
@@ -558,8 +559,8 @@ final class PriorMapStageOneLocalizer {
                     ? "trusted_loop_or_lost_recovery_correction:\(activeRecoveryReason)"
                     : "trusted_structure_correction"
                 if recoverySearch,
-                   translation <= 0.5,
-                   yawDelta <= 10.0 * .pi / 180.0 {
+                   correction.translationM <= 0.5,
+                   correction.yawRad <= 10.0 * .pi / 180.0 {
                     recoveryFramesRemaining = 0
                     recoveryReason = "none"
                 }
@@ -567,7 +568,10 @@ final class PriorMapStageOneLocalizer {
             else if !geometryCandidate {
                 reason = match?.rejectionReason ?? "structure_rejected"
             }
-            else if translation > translationGate || yawDelta > yawGate {
+            else if !PriorMapCorrectionSafety.isWithinGate(
+                current: rawPose,
+                target: targetPose,
+                recoverySearch: recoverySearch) {
                 reason = "correction_exceeds_safety_gate"
             }
             else {
@@ -633,6 +637,17 @@ final class PriorMapStageOneLocalizer {
         update.recoverySearch = recoverySearch
         update.correctionTranslationM = correctionTranslationM
         update.correctionYawDeg = correctionYawDeg
+        update.mapFromArkitX = hypothesis.mapFromArkit?.translationXM
+        update.mapFromArkitY = hypothesis.mapFromArkit?.translationYM
+        update.mapFromArkitYawDeg = hypothesis.mapFromArkit.map {
+            $0.yawRad * 180.0 / .pi
+        }
+        update.selectedHypothesisId = hypothesis.selectedHypothesisId
+        update.activeHypothesisTrackCount = hypothesis.activeTrackCount
+        update.hypothesisBestCost = hypothesis.bestCost
+        update.hypothesisSecondCost = hypothesis.secondCost
+        update.hypothesisReason = hypothesis.reason
+        update.hypothesisTrackerElapsedMs = hypothesis.trackerElapsedMs
         return update
     }
 

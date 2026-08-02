@@ -224,6 +224,12 @@ struct PriorMapScanMatchResult {
 
 struct PriorMapHypothesisDecision {
     let candidate: PriorMapScanMatchCandidate?
+    let mapFromArkit: PriorMapAlignmentTransform?
+    let selectedHypothesisId: Int?
+    let activeTrackCount: Int
+    let bestCost: Double?
+    let secondCost: Double?
+    let trackerElapsedMs: Double
     let supportFrames: Int
     let scoreMargin: Double
     let trusted: Bool
@@ -235,8 +241,23 @@ struct PriorMapHypothesisDecision {
 /// a basin that remains motion-consistent and separates from its competitors is
 /// allowed to move the map/ARKit alignment.
 final class PriorMapHypothesisTracker {
+    private enum Limits {
+        static let candidateCount = 5
+        static let trackCount = 8
+        static let maximumMissedFrames = 3
+        static let associationTranslationM = 0.75
+        static let associationYawRad = 12.0 * Double.pi / 180.0
+        static let smoothingGain = 0.35
+        static let localRequiredFrames = 3
+        static let recoveryRequiredFrames = 4
+        static let minimumMeanScore = 0.25
+        static let minimumUniqueness = 0.10
+        static let minimumScoreMargin = 0.12
+    }
+
     private struct Track {
-        var correction: PriorMapPose2D
+        let id: Int
+        var mapFromArkit: PriorMapAlignmentTransform
         var candidate: PriorMapScanMatchCandidate
         var supportFrames: Int
         var missedFrames: Int
@@ -244,47 +265,49 @@ final class PriorMapHypothesisTracker {
     }
 
     private var tracks: [Track] = []
+    private var nextTrackId = 1
 
     func reset() {
         tracks.removeAll()
+        nextTrackId = 1
     }
 
     func observe(
-        rawPose: PriorMapPose2D,
+        arkitPose: PriorMapPose2D,
         candidates: [PriorMapScanMatchCandidate],
         uniqueness: Double,
         recoverySearch: Bool
     ) -> PriorMapHypothesisDecision {
+        let start = ProcessInfo.processInfo.systemUptime
         var updated = Set<Int>()
-        for candidate in candidates.prefix(5) {
-            let correction = PriorMapCorrectionMath.correction(
-                rawPose: rawPose,
-                candidatePose: candidate.pose)
+        for candidate in candidates.prefix(Limits.candidateCount) {
+            let mapFromArkit = PriorMapAlignmentMath.mapFromArkit(
+                arkitPose: arkitPose,
+                candidateMapPose: candidate.pose)
             var matchIndex: Int?
             var matchDistance = Double.infinity
             for index in tracks.indices where !updated.contains(index) {
                 let translation = hypot(
-                    correction.xM - tracks[index].correction.xM,
-                    correction.yM - tracks[index].correction.yM)
+                    mapFromArkit.translationXM
+                        - tracks[index].mapFromArkit.translationXM,
+                    mapFromArkit.translationYM
+                        - tracks[index].mapFromArkit.translationYM)
                 let yaw = abs(PriorMapStageOneMath.normalizeAngle(
-                    correction.yawRad - tracks[index].correction.yawRad))
+                    mapFromArkit.yawRad
+                        - tracks[index].mapFromArkit.yawRad))
                 let combined = translation + yaw
-                if translation <= 0.75,
-                   yaw <= 12.0 * .pi / 180.0,
+                if translation <= Limits.associationTranslationM,
+                   yaw <= Limits.associationYawRad,
                    combined < matchDistance {
                     matchIndex = index
                     matchDistance = combined
                 }
             }
             if let index = matchIndex {
-                let gain = 0.35
-                tracks[index].correction = PriorMapPose2D(
-                    xM: tracks[index].correction.xM * (1 - gain) + correction.xM * gain,
-                    yM: tracks[index].correction.yM * (1 - gain) + correction.yM * gain,
-                    yawRad: PriorMapStageOneMath.normalizeAngle(
-                        tracks[index].correction.yawRad
-                            + PriorMapStageOneMath.normalizeAngle(
-                                correction.yawRad - tracks[index].correction.yawRad) * gain))
+                tracks[index].mapFromArkit = PriorMapAlignmentMath.interpolate(
+                    from: tracks[index].mapFromArkit,
+                    to: mapFromArkit,
+                    gain: Limits.smoothingGain)
                 tracks[index].candidate = candidate
                 tracks[index].supportFrames += 1
                 tracks[index].missedFrames = 0
@@ -295,18 +318,22 @@ final class PriorMapHypothesisTracker {
             else {
                 tracks.append(
                     Track(
-                        correction: correction,
+                        id: nextTrackId,
+                        mapFromArkit: mapFromArkit,
                         candidate: candidate,
                         supportFrames: 1,
                         missedFrames: 0,
                         meanScore: candidate.score))
+                nextTrackId += 1
                 updated.insert(tracks.count - 1)
             }
         }
         for index in tracks.indices where !updated.contains(index) {
             tracks[index].missedFrames += 1
         }
-        tracks = tracks.filter { $0.missedFrames <= 3 }
+        tracks = tracks.filter {
+            $0.missedFrames <= Limits.maximumMissedFrames
+        }
             .sorted { first, second in
                 if first.supportFrames != second.supportFrames {
                     return first.supportFrames > second.supportFrames
@@ -314,15 +341,25 @@ final class PriorMapHypothesisTracker {
                 if first.meanScore != second.meanScore {
                     return first.meanScore > second.meanScore
                 }
-                return first.candidate.cost < second.candidate.cost
+                if first.candidate.cost != second.candidate.cost {
+                    return first.candidate.cost < second.candidate.cost
+                }
+                return first.id < second.id
             }
-        if tracks.count > 8 {
-            tracks.removeLast(tracks.count - 8)
+        if tracks.count > Limits.trackCount {
+            tracks.removeLast(tracks.count - Limits.trackCount)
         }
         let activeTracks = tracks.filter { $0.missedFrames == 0 }
         guard let best = activeTracks.first else {
             return PriorMapHypothesisDecision(
                 candidate: nil,
+                mapFromArkit: nil,
+                selectedHypothesisId: nil,
+                activeTrackCount: 0,
+                bestCost: nil,
+                secondCost: nil,
+                trackerElapsedMs:
+                    (ProcessInfo.processInfo.systemUptime - start) * 1000,
                 supportFrames: 0,
                 scoreMargin: 0,
                 trusted: false,
@@ -335,69 +372,27 @@ final class PriorMapHypothesisTracker {
         let scoreMargin = max(
             0,
             min(1, best.meanScore - (second?.meanScore ?? best.meanScore) + supportMargin))
-        let requiredFrames = recoverySearch ? 4 : 3
+        let requiredFrames = recoverySearch
+            ? Limits.recoveryRequiredFrames : Limits.localRequiredFrames
         let trusted = best.supportFrames >= requiredFrames
-            && best.meanScore >= 0.25
-            && (uniqueness >= 0.10 || scoreMargin >= 0.12)
+            && best.meanScore >= Limits.minimumMeanScore
+            && (uniqueness >= Limits.minimumUniqueness
+                || scoreMargin >= Limits.minimumScoreMargin)
         return PriorMapHypothesisDecision(
             candidate: best.candidate,
+            mapFromArkit: best.mapFromArkit,
+            selectedHypothesisId: best.id,
+            activeTrackCount: activeTracks.count,
+            bestCost: best.candidate.cost,
+            secondCost: second?.candidate.cost,
+            trackerElapsedMs:
+                (ProcessInfo.processInfo.systemUptime - start) * 1000,
             supportFrames: best.supportFrames,
             scoreMargin: scoreMargin,
             trusted: trusted,
             reason: trusted
                 ? (recoverySearch ? "trusted_recovery_hypothesis" : "trusted_local_hypothesis")
                 : "awaiting_unique_temporal_hypothesis")
-    }
-}
-
-enum PriorMapCorrectionMath {
-    static func correction(
-        rawPose: PriorMapPose2D,
-        candidatePose: PriorMapPose2D
-    ) -> PriorMapPose2D {
-        let cosine = cos(-rawPose.yawRad)
-        let sine = sin(-rawPose.yawRad)
-        let deltaX = candidatePose.xM - rawPose.xM
-        let deltaY = candidatePose.yM - rawPose.yM
-        return PriorMapPose2D(
-            xM: cosine * deltaX - sine * deltaY,
-            yM: sine * deltaX + cosine * deltaY,
-            yawRad: PriorMapStageOneMath.normalizeAngle(
-                candidatePose.yawRad - rawPose.yawRad))
-    }
-}
-
-final class PriorMapTemporalCorrectionGate {
-    private var lastCorrection: PriorMapPose2D?
-    private(set) var consecutiveConsistent = 0
-
-    func reset() {
-        lastCorrection = nil
-        consecutiveConsistent = 0
-    }
-
-    func observe(
-        rawPose: PriorMapPose2D,
-        candidatePose: PriorMapPose2D
-    ) -> Bool {
-        let correction = PriorMapCorrectionMath.correction(
-            rawPose: rawPose,
-            candidatePose: candidatePose)
-        let consistent: Bool
-        if let previous = lastCorrection {
-            consistent = hypot(
-                correction.xM - previous.xM,
-                correction.yM - previous.yM) <= 0.12
-                && abs(PriorMapStageOneMath.normalizeAngle(
-                    correction.yawRad - previous.yawRad))
-                    <= 3.0 * .pi / 180.0
-        }
-        else {
-            consistent = false
-        }
-        consecutiveConsistent = consistent ? consecutiveConsistent + 1 : 1
-        lastCorrection = correction
-        return consecutiveConsistent >= 2
     }
 }
 
