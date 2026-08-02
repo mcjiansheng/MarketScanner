@@ -1,6 +1,6 @@
 # 已有地图辅助扫描数据格式
 
-> 文档状态：**当前有效**。最后核对日期：2026-07-28。
+> 文档状态：**当前有效**。最后核对日期：2026-08-02。
 
 ## 会话元数据
 
@@ -146,7 +146,7 @@ localized/
     qualification_manifest.json # 仅 published/revoked v4
 ```
 
-`localization_report.json` 包含地图/会话/数据库 hash、直接从 source/optimized SQLite `Node` 表和导出轨迹交叉计算的节点覆盖/缺失/重复/时间范围、三条轨迹长度、修正分布、绝对约束和相对边残差、weak/lost 时长、约束接受/拒绝、标签 observation coverage、review/publish blockers 和 `publish_state`。`factor_graph_report.json` version 1 保存 native solver/DB 版本、input identity、optimized DB SHA-256、canonical factor digest、Node/Factor inventory、gauge/连通性、objective/iterations、残差分位数、拒绝/降权诊断及最终 poses。完整报告必须通过 Python 和 version store 两层复核。
+`localization_report.json` 包含地图/会话/数据库 hash、直接从 source/optimized SQLite `Node` 表和导出轨迹交叉计算的节点覆盖/缺失/重复/时间范围、三条轨迹长度、修正分布、绝对约束和相对边残差、weak/lost 时长、约束接受/拒绝、标签 observation coverage、review/publish blockers 和 `publish_state`。测试诊断结果还固定记录 `diagnostic_mode`、`diagnostic_only` 和 `ignored_conflicting_source_constraint_count`；它可以推进工作用 `draft/current` 以便加载复核，但 `publish_gate` 必含 `diagnostic_mode_enabled` blocker。`factor_graph_report.json` version 1 保存 native solver/DB 版本、input identity、optimized DB SHA-256、canonical factor digest、Node/Factor inventory、gauge/连通性、objective/iterations、残差分位数、拒绝/降权诊断及最终 poses。完整报告必须通过 Python 和 version store 两层复核。
 
 helper 可用且所有门通过时 `solver.type=relative_se2_factor_graph`、`full_factor_graph=true`；helper 缺失或失败时仍写报告，但回退为 `bounded_correction_field` draft，`published_capable=false`。旧 version manifest v1/v2 可继续只读解析；含 factor report 的普通 draft/review 使用 version manifest v3；正式 publication 把 exact Field Evidence v3 和 qualification manifest 纳入逐文件 hash tree，使用 version manifest v4。Field Evidence v3 的 `MarketScannerQualificationSourceBundle` v1 保存 exact plan/release/policy，`MarketScannerTrajectorySourceBundle` v1 保存 version manifest 与选定 source artifact bytes，`MarketScannerFieldRunInputBundle` v1 保存 exact 控制点 CSV 与 Device Evidence bytes；发布检查从这些 bytes 重新派生摘要。Field v3 stable-read 上限 128 MiB，单个 CSV/Device Evidence 各 16 MiB；Windows descriptor 使用 `O_BINARY` 保留包括 CRLF 在内的磁盘原始字节；路径元数据和已打开 descriptor/Windows handle 元数据只在各自 API 内做读取前后比较，避免跨 API 表示差异误拒绝；主 descriptor 在读取前后的同类 path descriptor 身份绑定完成前保持打开，因此路径替换、临时替换后恢复、descriptor 内容变化和部分读取继续失败关闭；v4 resolve 不允许回退到外部绝对 evidence 路径。
 

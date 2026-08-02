@@ -250,7 +250,7 @@ tools\SupermarketMapStudio\start.bat
 
 浏览器将打开 `http://127.0.0.1:8765/`。页面保持打开时会自动续期本机 HttpOnly 会话，长时间操作后文件/文件夹选择器仍可使用；服务重启后请使用启动器自动打开的新页面建立新会话。选择完整的 `SupermarketSession-*`、确认新的输出目录，然后执行单设备处理或多设备合并。
 
-工作台“导入/管理先验地图”页签可把已有货架 Excel 转换为手机/PC 共用地图包；输出到 macOS 外置盘时，系统生成的 `._*` AppleDouble 旁车和 `.DS_Store` 会在 PC/iOS 完整性检查中一致忽略，不会作为地图 JSON 读取。“先验地图会话优化”页签执行 RTAB‑Map 重处理、派生轨迹优化、质量门禁、人工复核和最终导出。也可直接运行：
+工作台“导入/管理先验地图”页签可把已有货架 Excel 转换为手机/PC 共用地图包；输出到 macOS 外置盘时，系统生成的 `._*` AppleDouble 旁车和 `.DS_Store` 会在 PC/iOS 完整性检查中一致忽略，不会作为地图 JSON 读取。“先验地图会话优化”页签执行 RTAB‑Map 重处理、派生轨迹优化、质量门禁、人工复核和最终导出。测试阶段可启用“测试诊断模式”：冲突手机定位约束由稳健门剔除但继续进入审计，即使累计修正超限也加载不可发布草稿，并显示在线/RTAB‑Map/离线轨迹长度、修正中位/P95/最大值和 weak/lost 时长；该模式不会绕过 review/publish gate。也可直接运行：
 
 ```bash
 python3 tools/PriorMap/xlsx_to_prior_map.py /path/to/map.xlsx \

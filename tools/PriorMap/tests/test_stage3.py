@@ -11,6 +11,7 @@ from pathlib import Path
 from unittest import mock
 
 from tools.PriorMap.offline_localization import (
+    DEFAULT_REPLAY_PARAMETERS,
     Pose,
     OfflineLocalizationError,
     _associate_tag,
@@ -404,6 +405,22 @@ class RobustSE2OptimizerTests(unittest.TestCase):
         self.assertTrue(all(item.kind == "road_soft" for item in constraints))
         self.assertTrue(all(abs(item.y) < 1.0e-9 for item in constraints))
         self.assertTrue(all(0 < item.weight <= 0.35 for item in constraints))
+        self.assertTrue(
+            all(item.translation_sigma_m is not None for item in constraints)
+        )
+        self.assertTrue(
+            all(
+                item.yaw_sigma_rad is not None
+                and 0 < item.yaw_sigma_rad <= math.pi
+                for item in constraints
+            )
+        )
+        weak = build_road_soft_constraints(
+            [Pose(1, 0.0, 2.0, 1.7, 0.0)], graph, "1", stride=1
+        )
+        self.assertEqual(len(weak), 1)
+        self.assertGreater(weak[0].translation_sigma_m, math.pi)
+        self.assertEqual(weak[0].yaw_sigma_rad, math.pi)
         far = [
             Pose(index + 1, float(index), float(index), 5.0, 0)
             for index in range(10)
@@ -1311,6 +1328,78 @@ class LocalizedPipelineTests(unittest.TestCase):
         self.assertEqual(
             report["manual_localization_event_audit"][0]["status"], "accepted"
         )
+
+    def test_diagnostic_mode_keeps_unsafe_draft_and_phone_conflict_audit(self) -> None:
+        manifest = json.loads((self.prior_map / "manifest.json").read_text())
+        jsonl_write(
+            self.segment / "manual_localization_events.jsonl",
+            [{
+                "format": "MarketScannerManualLocalizationEvent",
+                "version": 3,
+                "wall_clock_timestamp": "2027-01-15T08:00:00.000Z",
+                "wall_clock_timestamp_unix": 1_800_000_000.0,
+                "frame_timestamp": 10.0,
+                "node_timebase_frame_timestamp": self.node_timebase_offset + 10.0,
+                "node_timebase_offset_seconds": self.node_timebase_offset,
+                "nearest_node_id": 11,
+                "nearest_node_stamp": self.node_timebase_offset + 10.0,
+                "node_time_delta_seconds": 0.0,
+                "node_time_snapshot_generation": 9,
+                "node_binding_status": "matched",
+                "node_binding_reason": "native_atomic_node_time_snapshot",
+                "alignment_version": 2,
+                "tracking_session_id": "tracking-1",
+                "prior_map_sha256": manifest["source_sha256"],
+                "floor_id": "1",
+                "arkit_pose": {"x_m": 5.0, "y_m": 0.0, "yaw_rad": 0.0},
+                "confirmed_map_pose": {
+                    "x_m": 100.0,
+                    "y_m": 100.0,
+                    "yaw_rad": 0.0,
+                },
+            }],
+        )
+        strict_output = self.root / "localized-unsafe-strict"
+        strict = process_localized_session(
+            self.prior_map,
+            self.session,
+            self.poses,
+            self.source_database,
+            self.optimized_database,
+            strict_output,
+        )
+        self.assertGreater(strict["maximum_correction_m"], 2.0)
+        self.assertFalse(strict["allow_draft"])
+        self.assertFalse(strict["current_updated"])
+        self.assertIsNone(LocalizedVersionStore(strict_output).current())
+
+        diagnostic_output = self.root / "localized-unsafe-diagnostic"
+        diagnostic = process_localized_session(
+            self.prior_map,
+            self.session,
+            self.poses,
+            self.source_database,
+            self.optimized_database,
+            diagnostic_output,
+            replay_parameters={
+                **DEFAULT_REPLAY_PARAMETERS,
+                "diagnostic_mode": True,
+            },
+        )
+        self.assertTrue(diagnostic["diagnostic_mode"])
+        self.assertTrue(diagnostic["diagnostic_only"])
+        self.assertTrue(diagnostic["allow_draft"])
+        self.assertTrue(diagnostic["current_updated"])
+        self.assertEqual(diagnostic["publish_state"], "draft")
+        self.assertEqual(
+            diagnostic["ignored_conflicting_source_constraint_count"], 2
+        )
+        self.assertFalse(diagnostic["publish_gate"]["passed"])
+        self.assertIn(
+            "diagnostic_mode_enabled",
+            {item["code"] for item in diagnostic["publish_gate"]["blockers"]},
+        )
+        self.assertIsNotNone(LocalizedVersionStore(diagnostic_output).current())
 
     def test_stale_or_duplicate_manual_alignment_version_is_rejected(self) -> None:
         manifest = json.loads((self.prior_map / "manifest.json").read_text())

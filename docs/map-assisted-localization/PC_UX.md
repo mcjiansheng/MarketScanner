@@ -1,6 +1,6 @@
 # PC 先验地图工作台交互
 
-> 文档状态：**当前有效（阶段三草稿复核）**。最后核对日期：2026-07-27。
+> 文档状态：**当前有效（阶段三草稿复核）**。最后核对日期：2026-08-02。
 
 Map Studio 保留单设备、多设备和“导入/管理先验地图”入口，并新增“先验地图会话优化”。自由扫描不要求地图，也不显示无意义的价签复核步骤。
 
@@ -28,11 +28,15 @@ Map Studio 保留单设备、多设备和“导入/管理先验地图”入口�
 8. 运行质量门禁并进入轨迹/价签复核；
 9. 导出 JSON/CSV/GeoJSON 和审计日志。
 
+测试阶段默认显示“测试诊断模式”。该模式只放宽“是否保留并加载工作草稿”，不放宽 review/publish gate：稳健硬门拒绝的手机 `online_structure` 约束不会参与求解，但仍完整写入 `localization_constraints.json`、`review_items.json` 和接受率/残差统计；累计修正超过 2 m 时仍生成可视化 `draft`。报告固定写入 `diagnostic_mode=true`、`diagnostic_only=true`、忽略冲突约束数量和 `diagnostic_mode_enabled` 发布 blocker，因而不能提交为生产成果。关闭该选项时恢复严格行为，超限结果只保留不可见于 current 的 `invalid` 诊断版本。
+
 默认按钮使用安全参数。GPU、线程、分辨率等仍位于折叠高级参数。源数据库处理前后 hash 不同会立即失败。
 
 ## 轨迹复核
 
 `optimized_map_trajectory.geojson` 同时提供在线定位、RTAB‑Map 重处理和先验地图离线优化层；既有 Map Studio 预览继续显示 prior map/2D/3D 成果。`review_items.json` 列出被拒绝约束、高残差和待复核价签。
+
+质量摘要同时显示在线/RTAB‑Map/离线轨迹长度、累计平移修正中位/P95/最大值、weak/lost 总时长、地图约束接受率和实际求解器类型，用于测试阶段判断累计误差。没有外部测量真值时，这些是内部一致性诊断，不等同于绝对定位准确率。
 
 人工编辑区支持：
 
@@ -60,7 +64,7 @@ Map Studio 保留单设备、多设备和“导入/管理先验地图”入口�
 POST /api/prior-map/convert
 POST /api/prior-map/inspect
 POST /api/jobs
-  kind=localized, prior_map, session, output, manual_edits?
+  kind=localized, prior_map, session, output, manual_edits?, diagnostic_mode?
 POST /api/jobs/<id>/cancel
 POST /api/jobs/<id>/localized/edit
   action=append|undo|redo, expected_version_id, expected_revision

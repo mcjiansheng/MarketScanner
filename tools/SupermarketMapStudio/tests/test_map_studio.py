@@ -719,6 +719,18 @@ class MapStudioApiTests(unittest.TestCase):
         self.assertIn(b"SESSION_REFRESH_INTERVAL_MS", script)
         self.assertIn(b'addEventListener("visibilitychange"', script)
 
+    def test_localized_diagnostic_mode_is_explicit_in_frontend(self) -> None:
+        page, _ = self.fetch("/")
+        script, _ = self.fetch("/app.js")
+        self.assertIn(b'id="localized-diagnostic-mode"', page)
+        self.assertIn(b"diagnostic_mode", script)
+        self.assertIn(b"ignored_conflicting_source_constraint_count", script)
+        self.assertIn(b"diagnostic_only", script)
+        self.assertIn(
+            b"diagnostic_mode_enabled",
+            Path(server.localized.__file__).read_bytes(),
+        )
+
     def test_operator_diagnostics_bundle_excludes_session_token(self) -> None:
         result = self.api(
             "/api/diagnostics/export",

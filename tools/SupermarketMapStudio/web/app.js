@@ -794,6 +794,7 @@ function activeRequest() {
       session: $("#localized-session").value.trim(),
       manual_edits: $("#localized-edits").value.trim(),
       output: $("#localized-output").value.trim(),
+      diagnostic_mode: $("#localized-diagnostic-mode").checked,
       options: { ...mapOptions(), offline_optimize: true },
     };
   }
@@ -1021,6 +1022,14 @@ async function renderJob(job) {
     const report = await request(job.artifacts["localization_report.json"]);
     const inspection = $("#inspection");
     clearNode(inspection);
+    if (report.diagnostic_only === true) {
+      appendText(
+        inspection,
+        "div",
+        `测试诊断草稿：已忽略 ${Number(report.ignored_conflicting_source_constraint_count || 0)} 条冲突手机定位约束；仅用于准确率、累计误差和人工复核，禁止发布。`,
+        "warning",
+      );
+    }
     appendText(
       inspection,
       "div",
@@ -1035,6 +1044,17 @@ async function renderJob(job) {
       `成果状态 ${job.localized?.publish_state || report.publish_state || "未知"} · 版本 ${localizedReview.versionId || "缺失"} · revision ${localizedReview.revision ?? "缺失"}`,
     );
     appendText(inspection, "div", `轨迹节点 ${report.node_count || 0} · 地图约束接受率 ${Math.round(Number(report.map_constraint_acceptance_rate || 0) * 100)}% · 最大修正 ${Number(report.maximum_correction_m || 0).toFixed(2)} m`);
+    const correction = report.correction_distribution_m || {};
+    appendText(
+      inspection,
+      "div",
+      `累计修正 中位 ${Number(correction.median || 0).toFixed(3)} m · P95 ${Number(correction.p95 || 0).toFixed(3)} m · 最大 ${Number(correction.maximum || 0).toFixed(3)} m · weak/lost ${Number(report.weak_lost_duration_seconds || 0).toFixed(1)} s`,
+    );
+    appendText(
+      inspection,
+      "div",
+      `轨迹长度 在线 ${Number(report.online_trajectory_length_m || 0).toFixed(2)} m · RTAB-Map ${Number(report.rtabmap_trajectory_length_m || 0).toFixed(2)} m · 离线 ${Number(report.offline_trajectory_length_m || 0).toFixed(2)} m · 求解器 ${report.solver?.type || "未知"}`,
+    );
     appendText(inspection, "div", `价签 ${report.tag_total || 0} · 已确认 ${report.tag_confirmed || 0} · 待复核 ${report.tag_needs_review || 0}`);
     appendText(inspection, "div", "人工锚点、禁用约束和价签修改保存在 manual_edits.json；重新处理会校验地图/会话 hash 后重放。");
     await loadLocalizedReview(job.artifacts?.["localized_review.json"]);

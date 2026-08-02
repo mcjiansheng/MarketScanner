@@ -149,7 +149,8 @@
               <button class="secondary" type="button" data-pick="localized-output" data-title="选择空输出目录">选择文件夹</button>
             </div>
           </div>
-          <div class="field-hint">自动发布门未通过时，结果只会标记“需要人工复核”，不会覆盖人工编辑或发布为权威成果。</div>
+          <label class="check-row"><input id="localized-diagnostic-mode" type="checkbox" checked>测试诊断模式：忽略冲突手机定位约束并保留误差结果</label>
+          <div class="field-hint">测试诊断模式会生成可视化草稿、累计修正和门禁报告，即使定位约束冲突或修正超限；所有失败指标仍保留，结果强制禁止发布。关闭后恢复严格草稿门禁。</div>
           <button id="run-localized" class="primary full" type="button">一键优化并进入复核</button>
         </section>
 

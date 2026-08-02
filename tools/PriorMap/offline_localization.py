@@ -67,6 +67,7 @@ DEFAULT_REPLAY_PARAMETERS: dict[str, Any] = {
     "free_ray_max_range": 8.0,
     "horizontal_axes": "xz",
     "auto_align_segments": False,
+    "diagnostic_mode": False,
 }
 
 
@@ -104,8 +105,14 @@ def normalize_replay_parameters(
         raise OfflineLocalizationError(
             "Localized replay requires auto_align_segments=false."
         )
+    diagnostic_mode = values.get("diagnostic_mode")
+    if not isinstance(diagnostic_mode, bool):
+        raise OfflineLocalizationError(
+            "Replay parameter diagnostic_mode is invalid."
+        )
     normalized["horizontal_axes"] = axes
     normalized["auto_align_segments"] = False
+    normalized["diagnostic_mode"] = diagnostic_mode
     return normalized
 
 
@@ -1402,6 +1409,8 @@ def build_road_soft_constraints(
         # Weak enough to preserve the RTAB-Map trajectory, but useful across a
         # long aisle. Confidence tapers to zero outside the declared corridor.
         proximity = max(0.1, 1.0 - distance / (width / 2 + 0.75))
+        weight = 0.35 * proximity
+        legacy_sigma = 1.0 / math.sqrt(weight)
         constraints.append(
             AbsoluteConstraint(
                 identifier=f"road-{corridor_id}-{pose.node_id}",
@@ -1409,13 +1418,20 @@ def build_road_soft_constraints(
                 x=x,
                 y=y,
                 yaw=yaw,
-                weight=0.35 * proximity,
+                weight=weight,
                 kind="road_soft",
                 source={
                     "corridor_id": corridor_id,
                     "distance_m": distance,
                     "width_m": width,
                 },
+                # The old scalar-weight migration used the same sigma for
+                # metres and radians. Very weak road priors could therefore
+                # derive yaw sigma > pi and abort the complete factor graph.
+                # Preserve the translation strength while making the yaw
+                # prior explicitly bounded and effectively non-directional.
+                translation_sigma_m=legacy_sigma,
+                yaw_sigma_rad=min(math.pi, legacy_sigma),
             )
         )
     return constraints
@@ -3588,10 +3604,15 @@ def _render_localized_version(
     # REVIEW requires explicit user submission; PUBLISHED additionally requires
     # the full solver gate and evidence-bound field acceptance.
     # Any critical JSONL damage or stale node binding prevents even draft.
+    # Explicit diagnostic mode is development/test-only product semantics: it
+    # keeps an unsafe working draft inspectable without relaxing review or
+    # publication gates. Conflicting phone constraints remain in the audit and
+    # are excluded by the robust hard gate above.
+    diagnostic_mode = bool(replay_parameters["diagnostic_mode"])
     allow_draft = (
         bool(optimized)
         and not has_critical_jsonl_damage
-        and max_correction <= 2.0
+        and (max_correction <= 2.0 or diagnostic_mode)
     )
     state_counts: dict[str, int] = {}
     for event in state_events:
@@ -3731,6 +3752,11 @@ def _render_localized_version(
         ),
         "publish_state": "draft" if allow_draft else "invalid",
         "allow_draft": allow_draft,
+        "diagnostic_mode": diagnostic_mode,
+        "diagnostic_only": diagnostic_mode,
+        "ignored_conflicting_source_constraint_count": sum(
+            item.get("kind") == "online_structure" for item in rejected
+        ),
         "warnings": [],
         "rejection_reasons": sorted({item["reason"] for item in rejected}),
         "solver": {
@@ -3830,6 +3856,14 @@ def _render_localized_version(
         "blockers": review_blockers,
     }
     publish_blockers = list(review_blockers)
+    if diagnostic_mode:
+        publish_blockers.insert(
+            0,
+            {
+                "code": "diagnostic_mode_enabled",
+                "value": True,
+            },
+        )
     if not full_factor_graph:
         publish_blockers.insert(
             0,
@@ -3855,6 +3889,12 @@ def _render_localized_version(
     if has_critical_jsonl_damage:
         report["warnings"].append(
             "检测到 sidecar 文件损坏，结果可能不完整。不得自动发布。"
+        )
+    if diagnostic_mode:
+        ignored_count = report["ignored_conflicting_source_constraint_count"]
+        report["warnings"].append(
+            "测试诊断模式已启用：冲突手机定位约束不会阻止生成可视化草稿，"
+            f"本次忽略 {ignored_count} 条；全部门禁和误差指标仍保留，且结果禁止发布。"
         )
     if not allow_draft:
         report["warnings"].append(
@@ -3916,6 +3956,7 @@ def _render_localized_version(
             "source_database_modified": False,
             "publish_state": report["publish_state"],
             "allow_draft": report["allow_draft"],
+            "diagnostic_mode": report["diagnostic_mode"],
             "source_database_sha256": source_hash_before,
             "optimized_database_sha256": optimized_db_hash,
             "prior_map_sha256": package_hash,

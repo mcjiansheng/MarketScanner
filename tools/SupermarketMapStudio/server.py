@@ -2199,11 +2199,13 @@ def run_localized_map(
             "free_ray_max_range": config.free_ray_max_range,
             "horizontal_axes": config.horizontal_axes,
             "auto_align_segments": config.auto_align_segments,
+            "diagnostic_mode": data.get("diagnostic_mode") is True,
         },
     )
     if not localized_result.get("current_updated"):
         raise RequestError(
             "本地化质量门禁未通过；诊断版本已保留，但不会切换为 current 结果。"
+            "测试阶段可启用“测试诊断模式”以加载不可发布草稿和误差报告。"
         )
 
 
