@@ -6,6 +6,8 @@ if (launchToken) {
   window.history.replaceState(null, "", `${window.location.pathname}${window.location.search}`);
 }
 let sessionToken = launchToken;
+const SESSION_REFRESH_INTERVAL_MS = 5 * 60 * 1000;
+let sessionRefreshTimer = null;
 
 const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => [...document.querySelectorAll(selector)];
@@ -179,6 +181,34 @@ async function bootstrapSession() {
   });
   if (!response.ok) throw new Error("本地安全会话初始化失败，请从启动器重新打开 Map Studio。");
   sessionToken = "";
+}
+
+async function refreshSession(reportFailure = false) {
+  try {
+    await request("/api/session/refresh", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    return true;
+  } catch (error) {
+    if (reportFailure) {
+      setStatus("本地安全会话已到期，请从启动器重新打开 Map Studio。", "failed");
+    }
+    return false;
+  }
+}
+
+function startSessionRefresh() {
+  if (sessionRefreshTimer !== null) return;
+  sessionRefreshTimer = window.setInterval(
+    () => refreshSession(document.visibilityState === "visible"),
+    SESSION_REFRESH_INTERVAL_MS,
+  );
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible") refreshSession(true);
+  });
+  window.addEventListener("focus", () => refreshSession(true));
 }
 
 async function renderRuntimeMode() {
@@ -3361,6 +3391,7 @@ async function initializeApplication() {
   try {
     await bootstrapSession();
     await renderRuntimeMode();
+    startSessionRefresh();
     setStatus("就绪", "");
     loadGpuCapabilities();
     restoreLatestJob();

@@ -116,6 +116,7 @@ ARTIFACTS = (
 )
 JOB_RUNTIME_TOOL_VERSION = "MarketScannerMapStudioJobRuntime/1"
 MAP_STUDIO_VERSION = "MarketScannerMapStudio/2"
+SESSION_TTL_SECONDS = 30 * 60
 
 
 def source_git_sha() -> str:
@@ -3074,25 +3075,52 @@ class StudioHandler(BaseHTTPRequestHandler):
         if origin not in allowed_origins:
             raise RequestForbidden("Unexpected request Origin.")
 
-    def authorize_session(self) -> None:
-        """Require a short-lived HttpOnly session (token header remains CLI-only auth)."""
-        supplied_token = self.headers.get("X-MarketScanner-Session-Token", "")
-        expected_token = getattr(self.server, "session_token", "")
-        if supplied_token and expected_token and secrets.compare_digest(supplied_token, expected_token):
-            return
+    def session_cookie_id(self) -> str:
+        """Return the opaque HttpOnly session id supplied by the browser."""
         cookie = SimpleCookie()
         try:
             cookie.load(self.headers.get("Cookie", ""))
         except Exception as exc:
             raise RequestForbidden("Invalid local session cookie.") from exc
         morsel = cookie.get("marketscanner_session")
-        session_id = morsel.value if morsel is not None else ""
+        return morsel.value if morsel is not None else ""
+
+    def authorize_session(self) -> str | None:
+        """Require a short-lived HttpOnly session (token header remains CLI-only auth)."""
+        supplied_token = self.headers.get("X-MarketScanner-Session-Token", "")
+        expected_token = getattr(self.server, "session_token", "")
+        if supplied_token and expected_token and secrets.compare_digest(supplied_token, expected_token):
+            return None
+        session_id = self.session_cookie_id()
         sessions = getattr(self.server, "authenticated_sessions", {})
         expires_at = sessions.get(session_id) if isinstance(sessions, dict) else None
         if not isinstance(expires_at, (int, float)) or expires_at <= time.time():
             if isinstance(sessions, dict) and session_id:
                 sessions.pop(session_id, None)
             raise RequestForbidden("Missing or expired local session.")
+        return session_id
+
+    def send_session_response(self, session_id: str, *, refreshed: bool = False) -> None:
+        body = json.dumps(
+            {
+                "authenticated": True,
+                "refreshed": refreshed,
+                "expires_in_seconds": SESSION_TTL_SECONDS,
+            }
+        ).encode("utf-8")
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header(
+            "Set-Cookie",
+            "marketscanner_session="
+            f"{session_id}; HttpOnly; SameSite=Strict; Path=/; "
+            f"Max-Age={SESSION_TTL_SECONDS}",
+        )
+        self.send_security_headers()
+        self.end_headers()
+        self.wfile.write(body)
 
     def read_json(self) -> Dict[str, Any]:
         length = int(self.headers.get("Content-Length", "0"))
@@ -3184,23 +3212,23 @@ class StudioHandler(BaseHTTPRequestHandler):
                 sessions = getattr(self.server, "authenticated_sessions", None)
                 if not isinstance(sessions, dict):
                     raise RequestForbidden("Session service is unavailable.")
-                sessions[session_id] = time.time() + 30 * 60
-                body = json.dumps({"authenticated": True, "expires_in_seconds": 1800}).encode("utf-8")
-                self.send_response(HTTPStatus.OK)
-                self.send_header("Content-Type", "application/json; charset=utf-8")
-                self.send_header("Content-Length", str(len(body)))
-                self.send_header("Cache-Control", "no-store")
-                self.send_header(
-                    "Set-Cookie",
-                    f"marketscanner_session={session_id}; HttpOnly; SameSite=Strict; Path=/; Max-Age=1800",
-                )
-                self.send_security_headers()
-                self.end_headers()
-                self.wfile.write(body)
+                sessions[session_id] = time.time() + SESSION_TTL_SECONDS
+                self.send_session_response(session_id)
                 return
-            self.authorize_session()
+            session_id = self.authorize_session()
             self.authorize_post()
             data = self.read_json()
+            if path == "/api/session/refresh":
+                if not session_id:
+                    raise RequestForbidden(
+                        "Session refresh requires an authenticated browser cookie."
+                    )
+                sessions = getattr(self.server, "authenticated_sessions", None)
+                if not isinstance(sessions, dict):
+                    raise RequestForbidden("Session service is unavailable.")
+                sessions[session_id] = time.time() + SESSION_TTL_SECONDS
+                self.send_session_response(session_id, refreshed=True)
+                return
             if path == "/api/qualification/field/inspect":
                 try:
                     evidence = inspect_field_evidence(

@@ -1,10 +1,10 @@
 # Map Studio 发布、启动、恢复与数据生命周期
 
-> 文档状态：**当前有效**。最后核对日期：2026-07-30。
+> 文档状态：**当前有效**。最后核对日期：2026-08-02。
 
 ## 安全启动边界
 
-Map Studio 只允许绑定 `127.0.0.1`。每次进程启动生成新的 256-bit 级随机 session token，token 只放在浏览器启动 URL fragment 中；页面读取并立即移除 fragment，再通过 `POST /api/session/bootstrap` 换取 30 分钟 `HttpOnly; SameSite=Strict` cookie。除匿名静态文件和不含路径/版本的最小 health 外，敏感 GET、artifact/runtime log 与 POST 都要求有效 cookie（受控 CLI 可直接提供 token header）。所有有 `Origin` 的 POST 必须精确匹配当前 `http://127.0.0.1:<port>`。服务端不把 token 写入 journal、诊断包或日志；响应继续包含 CSP、frame deny、no-referrer、nosniff。
+Map Studio 只允许绑定 `127.0.0.1`。每次进程启动生成新的 256-bit 级随机 session token，token 只放在浏览器启动 URL fragment 中；页面读取并立即移除 fragment，再通过 `POST /api/session/bootstrap` 换取 30 分钟 `HttpOnly; SameSite=Strict` cookie。页面保持打开时每 5 分钟通过同源、已有 cookie 认证的 `POST /api/session/refresh` 续期，并在页面重新可见或获得焦点时补充续期；refresh 不能使用匿名请求或 token-header CLI 通道创建浏览器会话，前端也不持久化启动 token。服务进程重启后旧 cookie 仍会失效，启动器必须用新 URL fragment 打开页面。除匿名静态文件和不含路径/版本的最小 health 外，敏感 GET、artifact/runtime log 与 POST 都要求有效 cookie（受控 CLI 可直接提供 token header）。所有有 `Origin` 的 POST 必须精确匹配当前 `http://127.0.0.1:<port>`。服务端不把 token 写入 journal、诊断包或日志；响应继续包含 CSP、frame deny、no-referrer、nosniff。
 
 `GET /api/about` 显示产品版本、source Git SHA、Python/platform 和启动检查；诊断必须使用 server 的真实 `runtime_mode`，production UI 不得展示 development 默认检查。`GET /api/recovery` 列出 interrupted jobs 与安全恢复步骤。浏览器“版本与恢复”直接显示这些信息。
 

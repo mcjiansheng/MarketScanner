@@ -667,6 +667,58 @@ class MapStudioApiTests(unittest.TestCase):
         with urlopen(authenticated, timeout=10) as response:
             self.assertEqual(response.status, 200)
 
+        session_cookie = cookie.split(";", 1)[0]
+        session_id = session_cookie.split("=", 1)[1]
+        self.httpd.authenticated_sessions[session_id] = time.time() + 1
+        refresh = Request(
+            f"http://127.0.0.1:{self.port}/api/session/refresh",
+            data=b"{}",
+            headers={
+                "Content-Type": "application/json",
+                "Cookie": session_cookie,
+                "Origin": f"http://127.0.0.1:{self.port}",
+            },
+            method="POST",
+        )
+        with urlopen(refresh, timeout=10) as response:
+            refresh_payload = json.loads(response.read())
+            refreshed_cookie = response.headers.get("Set-Cookie", "")
+        self.assertTrue(refresh_payload["refreshed"])
+        self.assertEqual(
+            refresh_payload["expires_in_seconds"], server.SESSION_TTL_SECONDS
+        )
+        self.assertIn(f"Max-Age={server.SESSION_TTL_SECONDS}", refreshed_cookie)
+        self.assertGreater(
+            self.httpd.authenticated_sessions[session_id],
+            time.time() + server.SESSION_TTL_SECONDS - 10,
+        )
+
+        token_only_refresh = Request(
+            f"http://127.0.0.1:{self.port}/api/session/refresh",
+            data=b"{}",
+            headers={
+                "Content-Type": "application/json",
+                "Origin": f"http://127.0.0.1:{self.port}",
+                "X-MarketScanner-Session-Token": self.httpd.session_token,
+            },
+            method="POST",
+        )
+        with self.assertRaises(HTTPError) as token_only:
+            urlopen(token_only_refresh, timeout=10)
+        self.assertEqual(token_only.exception.code, 403)
+        token_only.exception.close()
+
+        self.httpd.authenticated_sessions[session_id] = time.time() - 1
+        with self.assertRaises(HTTPError) as expired:
+            urlopen(refresh, timeout=10)
+        self.assertEqual(expired.exception.code, 403)
+        expired.exception.close()
+
+        script, _ = self.fetch("/app.js")
+        self.assertIn(b'"/api/session/refresh"', script)
+        self.assertIn(b"SESSION_REFRESH_INTERVAL_MS", script)
+        self.assertIn(b'addEventListener("visibilitychange"', script)
+
     def test_operator_diagnostics_bundle_excludes_session_token(self) -> None:
         result = self.api(
             "/api/diagnostics/export",
