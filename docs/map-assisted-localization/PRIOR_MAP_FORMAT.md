@@ -78,7 +78,7 @@ PriorMap-<id>/
 
 `prior_map_id` 为安全文件名化的源文件 stem 加源 SHA-256 前 12 位。所有 JSON 使用 UTF-8 和排序 key；距离场为控制手机包体采用稳定紧凑 JSON，其余文件采用稳定缩进。不写入当前时间，因此相同输入和参数产生逐字节相同输出。
 
-`package_manifest.json` 是手机和 PC 共用的规范完整性入口，精确列出包内每个权威文件的文件名、字节数、SHA‑256、媒体类型以及 JSON 格式/版本，并记录规范化 `package_sha256`。清单不自哈希；包 hash 按清单顺序对 `file/bytes/sha256/format/version` 计算。iOS 在显示“完整性通过”前必须完成全部摘要和下述跨文件关系校验。
+`package_manifest.json` 是手机和 PC 共用的规范完整性入口，精确列出包内每个权威文件的文件名、字节数、SHA‑256、媒体类型以及 JSON 格式/版本，并记录规范化 `package_sha256`。清单不自哈希；包 hash 按清单顺序对 `file/bytes/sha256/format/version` 计算。macOS 在外置盘上生成的 `._*` AppleDouble 旁车和 `.DS_Store` 不属于地图包权威内容，PC 生成/验证和 iOS 导入会一致忽略；其他额外普通文件仍会触发文件集合不一致。iOS 在显示“完整性通过”前必须完成全部摘要和下述跨文件关系校验。
 
 `manifest.json` 记录：
 

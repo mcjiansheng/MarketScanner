@@ -50,6 +50,8 @@ enum PriorMapPackageIntegrity {
                 .filter {
                     (try? $0.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true
                         && $0.lastPathComponent != packageManifestName
+                        && $0.lastPathComponent != ".DS_Store"
+                        && !$0.lastPathComponent.hasPrefix("._")
                 }
                 .map(\.lastPathComponent))
         try require(expectedNames == actualNames, "地图包文件集合与完整性清单不一致。")

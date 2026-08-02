@@ -17,7 +17,7 @@ from tools.PriorMap.coordinate_system import (
     source_rotation_to_yaw,
 )
 from tools.PriorMap.distance_field import decode_level
-from tools.PriorMap.prior_map_schema import validate_package
+from tools.PriorMap.prior_map_schema import build_package_manifest, validate_package
 from tools.PriorMap.replay_localization import replay
 from tools.PriorMap.replay_stage2 import (
     Pose as Stage2Pose,
@@ -271,6 +271,29 @@ class IOSCoreContractTests(unittest.TestCase):
             )
             self.assertEqual(valid_result.returncode, 0, valid_result.stderr)
 
+            (package / "._manifest.json").write_bytes(
+                b"\x00\x05\x16\x07AppleDouble metadata\xb0"
+            )
+            (package / ".DS_Store").write_bytes(b"Finder metadata")
+            metadata_result = subprocess.run(
+                [str(executable), str(package)],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(metadata_result.returncode, 0, metadata_result.stderr)
+
+            unexpected = package / "unexpected.json"
+            unexpected.write_text("{}\n", encoding="utf-8")
+            unexpected_result = subprocess.run(
+                [str(executable), str(package)],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(unexpected_result.returncode, 0)
+            unexpected.unlink()
+
             mutations = {
                 "swapped-shelves": lambda root: (
                     (root / "shelves.json").write_bytes(
@@ -377,6 +400,27 @@ class PriorMapConversionTests(unittest.TestCase):
         self.assertIn("missing_cross", warning_codes)
         self.assertTrue(validate_package(package)["valid"])
         self.assertTrue((package / "preview.png").read_bytes().startswith(b"\x89PNG\r\n\x1a\n"))
+
+    def test_package_integrity_ignores_macos_filesystem_metadata(self) -> None:
+        package = convert_workbook(self.workbook, self.root / "package")
+        expected_manifest = json.loads(
+            (package / "package_manifest.json").read_text(encoding="utf-8")
+        )
+        (package / "._manifest.json").write_bytes(
+            b"\x00\x05\x16\x07AppleDouble metadata\xb0"
+        )
+        (package / ".DS_Store").write_bytes(b"Finder metadata")
+
+        self.assertEqual(build_package_manifest(package), expected_manifest)
+        self.assertTrue(validate_package(package)["valid"])
+
+        (package / "unexpected.json").write_text("{}\n", encoding="utf-8")
+        validation = validate_package(package)
+        self.assertFalse(validation["valid"])
+        self.assertIn(
+            "package_artifact_set",
+            {item["code"] for item in validation["errors"]},
+        )
 
     def test_distance_fields_are_decodable_bounded_and_integrity_checked(self) -> None:
         package = convert_workbook(self.workbook, self.root / "package")

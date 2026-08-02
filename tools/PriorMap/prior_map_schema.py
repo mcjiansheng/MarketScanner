@@ -37,10 +37,16 @@ PACKAGE_FILES = {
     "preview.png",
     "validation_report.json",
 }
+IGNORABLE_FILESYSTEM_METADATA = frozenset({".DS_Store"})
 
 
 class PriorMapValidationError(ValueError):
     pass
+
+
+def _is_ignorable_filesystem_metadata(path: Path) -> bool:
+    """Return whether *path* is a non-authoritative macOS metadata sidecar."""
+    return path.name in IGNORABLE_FILESYSTEM_METADATA or path.name.startswith("._")
 
 
 def sha256_file(path: Path) -> str:
@@ -74,7 +80,9 @@ def build_package_manifest(root: Path) -> dict[str, Any]:
     for path in sorted(
         item
         for item in root.iterdir()
-        if item.is_file() and item.name != PACKAGE_MANIFEST_FILE
+        if item.is_file()
+        and item.name != PACKAGE_MANIFEST_FILE
+        and not _is_ignorable_filesystem_metadata(item)
     ):
         record: dict[str, Any] = {
             "file": path.name,
@@ -140,7 +148,9 @@ def _validate_package_manifest(
     actual_names = {
         path.name
         for path in root.iterdir()
-        if path.is_file() and path.name != PACKAGE_MANIFEST_FILE
+        if path.is_file()
+        and path.name != PACKAGE_MANIFEST_FILE
+        and not _is_ignorable_filesystem_metadata(path)
     }
     if set(names) != actual_names:
         errors.append(
@@ -200,7 +210,7 @@ def _validate_package_manifest(
 def load_json(path: Path) -> Any:
     try:
         return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise PriorMapValidationError(f"Cannot read valid JSON from {path.name}: {exc}") from exc
 
 
