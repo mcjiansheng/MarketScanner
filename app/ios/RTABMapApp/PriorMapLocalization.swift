@@ -323,6 +323,14 @@ struct PriorMapLocalizationUpdate: Codable {
     var hypothesisSecondCost: Double? = nil
     var hypothesisReason: String = "no_hypothesis"
     var hypothesisTrackerElapsedMs: Double = 0
+    var recoveryEpisodeId: Int? = nil
+    var recoveryReason: String? = nil
+    var recoveryOutcome: String? = nil
+    var recoveryValidAttemptCount: Int? = nil
+    var recoveryRemainingValidAttempts: Int? = nil
+    var recoveryElapsedMs: Double? = nil
+    var recoveryFreshSupportFrames: Int? = nil
+    var recoveryTriggerCount: Int? = nil
     var trackingSessionId: String? = nil
     var priorMapId: String? = nil
     var priorMapSha256: String? = nil
@@ -358,6 +366,7 @@ final class PriorMapStageOneLocalizer {
     private let matcher: PriorMapScanMatcher
     private let confidenceManager = PriorMapConfidenceManager()
     private let hypothesisTracker = PriorMapHypothesisTracker()
+    private let recoveryController = PriorMapRecoveryController()
     private let priorMapId: String
     private let priorMapSha256: String
     private let shelves: [PriorMapShelf]
@@ -367,9 +376,8 @@ final class PriorMapStageOneLocalizer {
     private(set) var latestConfidence = 0.0
     private(set) var latestPhase: PriorMapLocalizationPhase = .uninitialized
     private var alignmentVersion = 0
-    private var recoveryFramesRemaining = 0
     private var consecutiveUntrustedFrames = 0
-    private var recoveryReason = "none"
+    private var pendingRecoveryCompletion: PriorMapRecoveryCompletion?
 
     init(
         package: PriorMapPackage,
@@ -432,9 +440,32 @@ final class PriorMapStageOneLocalizer {
     /// Called after a reliable RTAB-Map loop closure. The loop does not inject
     /// a pose prior by itself; it authorizes a bounded wider search whose result
     /// must still survive four-frame hypothesis tracking before any correction.
+    private func beginRecovery(reason: String, now: TimeInterval) {
+        if recoveryController.request(reason: reason, now: now),
+           let episode = recoveryController.activeEpisode {
+            hypothesisTracker.beginRecoveryEpisode(id: episode.id)
+        }
+    }
+
+    @discardableResult
+    private func finishRecovery(
+        outcome: PriorMapRecoveryOutcome
+    ) -> PriorMapRecoveryCompletion? {
+        guard let episode = recoveryController.activeEpisode else { return nil }
+        hypothesisTracker.endRecoveryEpisode(id: episode.id, outcome: outcome)
+        let completion = recoveryController.finish(outcome)
+        pendingRecoveryCompletion = completion
+        return completion
+    }
+
     func requestRecovery(reason: String) {
-        recoveryFramesRemaining = max(recoveryFramesRemaining, 20)
-        recoveryReason = reason
+        beginRecovery(
+            reason: reason,
+            now: ProcessInfo.processInfo.systemUptime)
+    }
+
+    func cancelRecovery() {
+        _ = finishRecovery(outcome: .cancelled)
     }
 
     func update(frame: ARFrame, trackingState: String) -> PriorMapLocalizationUpdate {
@@ -495,23 +526,35 @@ final class PriorMapStageOneLocalizer {
         let observation = trackingState == "normal"
             ? depthSampler.sample(frame: frame)
             : nil
-        if recoveryFramesRemaining == 0,
+        let updateUptime = ProcessInfo.processInfo.systemUptime
+        if recoveryController.isExpired(now: updateUptime) {
+            _ = finishRecovery(outcome: .timedOut)
+        }
+        var recoveryCompletionForUpdate = pendingRecoveryCompletion
+        pendingRecoveryCompletion = nil
+        if recoveryController.activeEpisode == nil,
+           recoveryCompletionForUpdate == nil,
            consecutiveUntrustedFrames == 6
             || (consecutiveUntrustedFrames > 6
                 && consecutiveUntrustedFrames % 20 == 0) {
-            recoveryFramesRemaining = 20
-            recoveryReason = "persistent_weak_or_lost"
+            beginRecovery(
+                reason: "persistent_weak_or_lost",
+                now: updateUptime)
         }
-        let recoverySearch = recoveryFramesRemaining > 0
-        let activeRecoveryReason = recoverySearch ? recoveryReason : "none"
-        if recoveryFramesRemaining > 0 {
-            recoveryFramesRemaining -= 1
-        }
+        let recoverySearch = recoveryController.activeEpisode != nil
+        let activeRecoveryReason = recoveryController.activeEpisode?.reason ?? "none"
         let match = observation.map {
             matcher.match(
                 predictedPose: rawPose,
                 observation: $0,
                 recoverySearch: recoverySearch)
+        }
+        if recoverySearch,
+           let match,
+           match.effectivePointCount >= 30 {
+            // Ambiguous/mismatch searches still consume one valid attempt, but
+            // nil and undersized observations never do.
+            recoveryController.recordValidMatcherAttempt()
         }
         if let floorEstimate = observation?.floorEstimate {
             latestFloorEstimate = floorEstimate
@@ -554,6 +597,9 @@ final class PriorMapStageOneLocalizer {
                 initialMapPose = estimatedPose
                 alignmentVersion += 1
                 accepted = true
+                if recoverySearch {
+                    recoveryController.recordAcceptedCorrection()
+                }
                 consecutiveUntrustedFrames = 0
                 reason = recoverySearch
                     ? "trusted_loop_or_lost_recovery_correction:\(activeRecoveryReason)"
@@ -561,8 +607,9 @@ final class PriorMapStageOneLocalizer {
                 if recoverySearch,
                    correction.translationM <= 0.5,
                    correction.yawRad <= 10.0 * .pi / 180.0 {
-                    recoveryFramesRemaining = 0
-                    recoveryReason = "none"
+                    recoveryCompletionForUpdate = finishRecovery(
+                        outcome: .converged)
+                    pendingRecoveryCompletion = nil
                 }
             }
             else if !geometryCandidate {
@@ -595,6 +642,13 @@ final class PriorMapStageOneLocalizer {
         }
         if !accepted {
             consecutiveUntrustedFrames += 1
+        }
+        if recoveryController.isExpired(now: updateUptime) {
+            recoveryCompletionForUpdate = finishRecovery(outcome: .timedOut)
+            pendingRecoveryCompletion = nil
+            if !accepted {
+                reason = "recovery_timed_out"
+            }
         }
         let residualCost = match?.candidates.first?.cost ?? 0.15
         let confidence = confidenceManager.update(
@@ -648,6 +702,20 @@ final class PriorMapStageOneLocalizer {
         update.hypothesisSecondCost = hypothesis.secondCost
         update.hypothesisReason = hypothesis.reason
         update.hypothesisTrackerElapsedMs = hypothesis.trackerElapsedMs
+        let diagnosticEpisode = recoveryCompletionForUpdate?.episode
+            ?? recoveryController.activeEpisode
+        update.recoveryEpisodeId = diagnosticEpisode?.id
+        update.recoveryReason = diagnosticEpisode?.reason
+        update.recoveryOutcome = recoveryCompletionForUpdate?.outcome.rawValue
+            ?? (recoveryController.activeEpisode == nil ? nil : "active")
+        update.recoveryValidAttemptCount = diagnosticEpisode?.validMatcherAttempts
+        update.recoveryRemainingValidAttempts = diagnosticEpisode?.remainingValidAttempts
+        update.recoveryElapsedMs = diagnosticEpisode.map {
+            max(0, updateUptime - $0.startedAtUptime) * 1000
+        }
+        update.recoveryFreshSupportFrames = recoverySearch
+            ? hypothesis.supportFrames : nil
+        update.recoveryTriggerCount = diagnosticEpisode?.triggerCount
         return update
     }
 
@@ -676,10 +744,13 @@ final class PriorMapStageOneLocalizer {
         latestPhase = .manualCorrection
         latestConfidence = 0.35
         depthSampler.reset()
-        hypothesisTracker.reset()
-        recoveryFramesRemaining = 0
+        if recoveryController.activeEpisode != nil {
+            _ = finishRecovery(outcome: .manualReset)
+        }
+        else {
+            hypothesisTracker.reset()
+        }
         consecutiveUntrustedFrames = 0
-        recoveryReason = "manual"
         return (arkitPose, mapPose)
     }
 

@@ -2571,6 +2571,7 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
 
     private func clearPriorMapLocalization()
     {
+        let localizerToCancel = priorMapLocalizer
         priorMapGeneration = UUID()
         priorMapLocalizer = nil
         activePriorMapPackage = nil
@@ -2578,6 +2579,11 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         priorMapEvidenceWriteWarningShown = false
         priorMapLastNodeBinding = nil
         priorMapUpdateGate.reset()
+        if let localizerToCancel {
+            priorMapQueue.async {
+                localizerToCancel.cancelRecovery()
+            }
+        }
         priceTagVisionScanner.reset()
         priorMapAlignmentSnapshots.reset()
         let overlay = priorMapOverlay

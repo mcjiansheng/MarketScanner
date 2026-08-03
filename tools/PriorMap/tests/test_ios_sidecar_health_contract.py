@@ -37,12 +37,17 @@ class IOSLocalizationSidecarHealthContractTests(unittest.TestCase):
             self.assertIn(token, matcher)
         for token in (
             'requestRecovery(reason: "reliable_rtabmap_loop")',
+            "localizerToCancel.cancelRecovery()",
             "mPendingAdaptiveDetectionRateSince",
             "dwellSeconds",
             "priorMapLastNodeBinding",
         ):
             self.assertIn(token, view)
-        self.assertIn("recoveryFramesRemaining = max(recoveryFramesRemaining, 20)", overlay)
+        self.assertIn("PriorMapRecoveryController", core + overlay)
+        self.assertIn("beginRecoveryEpisode(id: episode.id)", overlay)
+        self.assertIn("match.effectivePointCount >= 30", overlay)
+        self.assertIn("recoveryController.recordValidMatcherAttempt()", overlay)
+        self.assertNotIn("recoveryFramesRemaining", overlay)
         self.assertIn("correction.translationM <= 0.5", overlay)
         self.assertIn("guard hits >= 4, frameIndex - firstFrame >= 3", depth)
         for token in (
@@ -61,7 +66,7 @@ class IOSLocalizationSidecarHealthContractTests(unittest.TestCase):
         recovery = overlay.split("func requestRecovery(reason: String)", 1)[1].split(
             "func update(frame:", 1
         )[0]
-        self.assertIn("recoveryFramesRemaining", recovery)
+        self.assertIn("beginRecovery(", recovery)
         self.assertNotIn("arkitOrigin =", recovery)
         self.assertNotIn("initialMapPose =", recovery)
         self.assertNotIn("latestEstimatedPose =", recovery)
@@ -69,6 +74,33 @@ class IOSLocalizationSidecarHealthContractTests(unittest.TestCase):
         self.assertIn("xM: value.estimatedPose.xM", overlay)
         self.assertIn("yM: value.estimatedPose.yM", overlay)
         self.assertIn("value.estimatedPose.yawRad", overlay)
+
+    def test_recovery_episode_budget_and_cleanup_are_explicit(self) -> None:
+        overlay = source(OVERLAY_SOURCE)
+        matcher = source(MATCHER_SOURCE)
+        core = source(CORE_SOURCE)
+        for token in (
+            "struct PriorMapRecoveryEpisode",
+            "maximumValidAttempts: Int = 40",
+            "maximumWallClockSeconds: TimeInterval = 30",
+            "episode.remainingValidAttempts == 0",
+            "episode.triggerCount + 1",
+        ):
+            self.assertIn(token, core)
+        for token in (
+            "func beginRecoveryEpisode(id: Int)",
+            "func endRecoveryEpisode(id: Int, outcome _:",
+            "Limits.supportFrameCap",
+        ):
+            self.assertIn(token, matcher)
+        for token in (
+            "finishRecovery(outcome: .timedOut)",
+            "outcome: .converged",
+            "finishRecovery(outcome: .manualReset)",
+            "recoveryValidAttemptCount",
+            "recoveryFreshSupportFrames",
+        ):
+            self.assertIn(token, overlay)
 
     def test_trace_constraint_and_state_return_one_structured_result(self) -> None:
         session = source(SESSION_SOURCE)

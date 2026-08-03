@@ -883,6 +883,9 @@ let wrongAisleAlignment = PriorMapAlignmentTransform(
     translationYM: 1.7,
     yawRad: 18.0 * .pi / 180.0)
 let hypothesisTracker = PriorMapHypothesisTracker()
+func productionMatcherScore(_ cost: Double) -> Double {
+    exp(-cost / 0.08)
+}
 var trackedDecision: PriorMapHypothesisDecision?
 let serpentineArkitPoses = [
     PriorMapPose2D(xM: 0, yM: 0, yawRad: 0),
@@ -900,12 +903,19 @@ for (frame, arkitPose) in serpentineArkitPoses.enumerated() {
         arkitPose: arkitPose)
     // T8: during the turn, a fresh wrong aisle may have the higher frame
     // score, but it must not steal the established global-alignment track.
-    let wrongScore = frame == 2 ? 0.99 : 0.50
+    let wrongCost = frame == 2 ? 0.005 : 0.055
+    let correctCost = 0.02
     trackedDecision = hypothesisTracker.observe(
         arkitPose: arkitPose,
         candidates: [
-            PriorMapScanMatchCandidate(pose: wrong, cost: 0.01, score: wrongScore),
-            PriorMapScanMatchCandidate(pose: correct, cost: 0.02, score: 0.90),
+            PriorMapScanMatchCandidate(
+                pose: wrong,
+                cost: wrongCost,
+                score: productionMatcherScore(wrongCost)),
+            PriorMapScanMatchCandidate(
+                pose: correct,
+                cost: correctCost,
+                score: productionMatcherScore(correctCost)),
         ],
         uniqueness: 0.25,
         recoverySearch: false)
@@ -940,7 +950,9 @@ let returnedCandidate = PriorMapAlignmentMath.apply(
 let afterOcclusion = hypothesisTracker.observe(
     arkitPose: returnedPose,
     candidates: [PriorMapScanMatchCandidate(
-        pose: returnedCandidate, cost: 0.02, score: 0.9)],
+        pose: returnedCandidate,
+        cost: 0.02,
+        score: productionMatcherScore(0.02))],
     uniqueness: 0.3,
     recoverySearch: false)
 require(afterOcclusion.trusted, "S4 stable evidence may resume the retained track")
@@ -961,7 +973,7 @@ for frame in 0..<4 {
                 pose: PriorMapAlignmentMath.apply(
                     mapFromArkit: $0, arkitPose: arkitPose),
                 cost: 0.02,
-                score: 0.9)
+                score: productionMatcherScore(0.02))
         },
         uniqueness: 0,
         recoverySearch: false)
@@ -974,6 +986,7 @@ require(ambiguousDecision?.activeTrackCount == 2,
 // T10/S2: unique recovery needs four frames; 5 m/30 degrees is inclusive,
 // while either 5.01 m or 30.1 degrees is rejected by the safety contract.
 hypothesisTracker.reset()
+hypothesisTracker.beginRecoveryEpisode(id: 1)
 let recoveryAlignment = PriorMapAlignmentTransform(
     translationXM: 4.8,
     translationYM: 0,
@@ -987,12 +1000,13 @@ for frame in 0..<4 {
             pose: PriorMapAlignmentMath.apply(
                 mapFromArkit: recoveryAlignment, arkitPose: arkitPose),
             cost: 0.02,
-            score: 0.95)],
+            score: productionMatcherScore(0.02))],
         uniqueness: 0.8,
         recoverySearch: true)
 }
 require(recoveryDecision?.trusted == true && recoveryDecision?.supportFrames == 4,
         "S2 unique recovery must require and pass four consistent frames")
+hypothesisTracker.endRecoveryEpisode(id: 1, outcome: .converged)
 let safetyOrigin = PriorMapPose2D(xM: 0, yM: 0, yawRad: 0)
 require(PriorMapCorrectionSafety.isWithinGate(
     current: safetyOrigin,
@@ -1020,11 +1034,192 @@ let postReset = hypothesisTracker.observe(
     candidates: [PriorMapScanMatchCandidate(
         pose: PriorMapPose2D(xM: 0.2, yM: 0, yawRad: 0),
         cost: 0.02,
-        score: 0.9)],
+        score: productionMatcherScore(0.02))],
     uniqueness: 0.5,
     recoverySearch: false)
 require(!postReset.trusted && postReset.supportFrames == 1,
         "manual reset must require fresh temporal support")
+
+// P7R3 R1: lifetime local support is discarded at episode start. The same
+// alignment must earn four new observations before Recovery can trust it.
+let staleAlignment = PriorMapAlignmentTransform(
+    translationXM: 1.5, translationYM: -2.0, yawRad: 0.1)
+hypothesisTracker.reset()
+for frame in 0..<100 {
+    let arkitPose = PriorMapPose2D(xM: Double(frame) * 0.05, yM: 0, yawRad: 0)
+    let candidate = PriorMapAlignmentMath.apply(
+        mapFromArkit: staleAlignment, arkitPose: arkitPose)
+    _ = hypothesisTracker.observe(
+        arkitPose: arkitPose,
+        candidates: [PriorMapScanMatchCandidate(
+            pose: candidate,
+            cost: 0.02,
+            score: productionMatcherScore(0.02))],
+        uniqueness: 0.5,
+        recoverySearch: false)
+}
+hypothesisTracker.beginRecoveryEpisode(id: 41)
+var freshRecoveryDecision: PriorMapHypothesisDecision?
+for frame in 1...4 {
+    let arkitPose = PriorMapPose2D(xM: Double(frame), yM: 0, yawRad: 0)
+    let candidate = PriorMapAlignmentMath.apply(
+        mapFromArkit: staleAlignment, arkitPose: arkitPose)
+    freshRecoveryDecision = hypothesisTracker.observe(
+        arkitPose: arkitPose,
+        candidates: [PriorMapScanMatchCandidate(
+            pose: candidate,
+            cost: 0.02,
+            score: productionMatcherScore(0.02))],
+        uniqueness: 0.5,
+        recoverySearch: true)
+    require(
+        freshRecoveryDecision?.trusted == (frame == 4),
+        "R1 Recovery trust must use exactly four fresh episode observations")
+    require(
+        freshRecoveryDecision?.supportFrames == frame,
+        "R1 historical local support must not enter Recovery diagnostics")
+}
+
+// P7R3 R2: after local A has saturated support, a new episode ranks only its
+// fresh evidence. Better B wins on the fourth Recovery observation.
+hypothesisTracker.endRecoveryEpisode(id: 41, outcome: .cancelled)
+let wrongHistoricalAlignment = PriorMapAlignmentTransform(
+    translationXM: 0, translationYM: 3, yawRad: 0)
+let correctRecoveryAlignment = PriorMapAlignmentTransform(
+    translationXM: 0.2, translationYM: 0.1, yawRad: 0)
+for frame in 0..<100 {
+    let arkitPose = PriorMapPose2D(xM: Double(frame) * 0.02, yM: 0, yawRad: 0)
+    let candidate = PriorMapAlignmentMath.apply(
+        mapFromArkit: wrongHistoricalAlignment, arkitPose: arkitPose)
+    _ = hypothesisTracker.observe(
+        arkitPose: arkitPose,
+        candidates: [PriorMapScanMatchCandidate(
+            pose: candidate,
+            cost: 0.04,
+            score: productionMatcherScore(0.04))],
+        uniqueness: 0.4,
+        recoverySearch: false)
+}
+hypothesisTracker.beginRecoveryEpisode(id: 42)
+var replacementDecision: PriorMapHypothesisDecision?
+for frame in 0..<4 {
+    let arkitPose = PriorMapPose2D(xM: Double(frame), yM: 0, yawRad: 0)
+    replacementDecision = hypothesisTracker.observe(
+        arkitPose: arkitPose,
+        candidates: [
+            PriorMapScanMatchCandidate(
+                pose: PriorMapAlignmentMath.apply(
+                    mapFromArkit: wrongHistoricalAlignment,
+                    arkitPose: arkitPose),
+                cost: 0.05,
+                score: productionMatcherScore(0.05)),
+            PriorMapScanMatchCandidate(
+                pose: PriorMapAlignmentMath.apply(
+                    mapFromArkit: correctRecoveryAlignment,
+                    arkitPose: arkitPose),
+                cost: 0.01,
+                score: productionMatcherScore(0.01)),
+        ],
+        uniqueness: 0.5,
+        recoverySearch: true)
+}
+require(replacementDecision?.trusted == true,
+        "R2 the replacement hypothesis must become trusted on fresh frame four")
+requirePoseClose(
+    replacementDecision!.candidate!.pose,
+    PriorMapAlignmentMath.apply(
+        mapFromArkit: correctRecoveryAlignment,
+        arkitPose: PriorMapPose2D(xM: 3, yM: 0, yawRad: 0)),
+    "R2 stale historical A must not suppress better Recovery B")
+
+// P7R3 R3-R5: only real matcher searches consume the bounded attempt budget,
+// and a repeated trigger preserves identity, deadline, attempts, and support.
+let recoveryController = PriorMapRecoveryController(
+    maximumValidAttempts: 40,
+    maximumWallClockSeconds: 30)
+require(recoveryController.request(reason: "loop", now: 100),
+        "R3 first request must start an episode")
+let initialRecoveryEpisode = recoveryController.activeEpisode!
+for _ in 0..<20 {
+    // limited/no-depth/nil-observation frames make no controller call.
+}
+require(recoveryController.activeEpisode?.validMatcherAttempts == 0,
+        "R3 invalid frames must not consume attempts")
+recoveryController.recordValidMatcherAttempt()
+recoveryController.recordValidMatcherAttempt()
+require(!recoveryController.request(reason: "another_loop", now: 110),
+        "R5 repeated request must not create an episode")
+require(recoveryController.activeEpisode?.id == initialRecoveryEpisode.id,
+        "R5 repeated request must preserve episode ID")
+require(recoveryController.activeEpisode?.deadlineUptime
+        == initialRecoveryEpisode.deadlineUptime,
+        "R5 repeated request must not extend the deadline")
+require(recoveryController.activeEpisode?.validMatcherAttempts == 2,
+        "R4/R5 valid attempt progress must survive a repeated trigger")
+require(recoveryController.activeEpisode?.triggerCount == 2,
+        "R5 repeated trigger must be bounded diagnostic evidence")
+
+// P7R3 R6/R7/R10: every exit clears wide-search tracks. The selected map
+// alignment is retained by the localizer anchor, never by a temporary track.
+hypothesisTracker.endRecoveryEpisode(id: 42, outcome: .timedOut)
+let localAfterTimeout = hypothesisTracker.observe(
+    arkitPose: safetyOrigin,
+    candidates: [PriorMapScanMatchCandidate(
+        pose: PriorMapAlignmentMath.apply(
+            mapFromArkit: correctRecoveryAlignment,
+            arkitPose: safetyOrigin),
+        cost: 0.01,
+        score: productionMatcherScore(0.01))],
+    uniqueness: 0.5,
+    recoverySearch: false)
+require(!localAfterTimeout.trusted && localAfterTimeout.supportFrames == 1,
+        "R6 local mode must not inherit a timed-out wide-search track")
+_ = recoveryController.finish(.manualReset)
+require(recoveryController.activeEpisode == nil,
+        "R10 manual reset must terminate the active episode")
+
+// P7R3 R8: the inclusive 5 m/30 degree boundary converges within the 40 valid
+// attempt budget, while inserted nil-observation frames consume nothing.
+let worstPathController = PriorMapRecoveryController(
+    maximumValidAttempts: 40,
+    maximumWallClockSeconds: 30)
+_ = worstPathController.request(reason: "worst_path", now: 200)
+var boundedPose = PriorMapPose2D(xM: 0, yM: 0, yawRad: 0)
+let worstTarget = PriorMapPose2D(
+    xM: 5, yM: 0, yawRad: 30 * .pi / 180)
+var maximumStepTranslation = 0.0
+var maximumStepYaw = 0.0
+for validAttempt in 1...40 {
+    if validAttempt % 3 == 0 {
+        // An intervening invalid frame intentionally records no attempt.
+    }
+    worstPathController.recordValidMatcherAttempt()
+    if validAttempt >= 4 {
+        let next = PriorMapCorrectionSafety.boundedStep(
+            current: boundedPose, target: worstTarget)
+        let step = PriorMapCorrectionSafety.difference(
+            from: boundedPose, to: next)
+        maximumStepTranslation = max(maximumStepTranslation, step.translationM)
+        maximumStepYaw = max(maximumStepYaw, step.yawRad)
+        boundedPose = next
+        let residual = PriorMapCorrectionSafety.difference(
+            from: boundedPose, to: worstTarget)
+        if residual.translationM <= 0.5,
+           residual.yawRad <= 10 * .pi / 180 {
+            worstPathController.recordAcceptedCorrection()
+            _ = worstPathController.finish(.converged)
+            break
+        }
+    }
+}
+require(worstPathController.lastCompletion?.outcome == .converged,
+        "R8 worst-path Recovery must converge within the valid-attempt budget")
+require((worstPathController.lastCompletion?.episode.validMatcherAttempts ?? 41) <= 40,
+        "R8 convergence must remain inside the configured budget")
+require(maximumStepTranslation <= 0.35 + 1.0e-9,
+        "R8 no Recovery translation step may exceed 0.35 m")
+require(maximumStepYaw <= 8 * .pi / 180 + 1.0e-9,
+        "R8 no Recovery yaw step may exceed 8 degrees")
 
 // T11: deterministic randomized reconstruction, including arbitrary turns.
 var randomState: UInt64 = 0x5eed5eed

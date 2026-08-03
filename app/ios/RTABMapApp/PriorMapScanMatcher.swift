@@ -253,6 +253,7 @@ final class PriorMapHypothesisTracker {
         static let minimumMeanScore = 0.25
         static let minimumUniqueness = 0.10
         static let minimumScoreMargin = 0.12
+        static let supportFrameCap = 120
     }
 
     private struct Track {
@@ -266,10 +267,32 @@ final class PriorMapHypothesisTracker {
 
     private var tracks: [Track] = []
     private var nextTrackId = 1
+    private var activeRecoveryEpisodeId: Int?
 
-    func reset() {
+    private func clearTracks() {
         tracks.removeAll()
         nextTrackId = 1
+    }
+
+    func reset() {
+        clearTracks()
+        activeRecoveryEpisodeId = nil
+    }
+
+    /// Recovery V1 intentionally discards lifetime local support. The currently
+    /// applied map/ARKit anchor lives in the localizer, so clearing hypotheses
+    /// cannot move the HUD; it only requires four fresh observations to move it.
+    func beginRecoveryEpisode(id: Int) {
+        clearTracks()
+        activeRecoveryEpisodeId = id
+    }
+
+    /// All wide-search hypotheses are temporary. The selected alignment has
+    /// already been applied to the localizer anchor before a converged exit.
+    func endRecoveryEpisode(id: Int, outcome _: PriorMapRecoveryOutcome) {
+        guard activeRecoveryEpisodeId == id else { return }
+        clearTracks()
+        activeRecoveryEpisodeId = nil
     }
 
     func observe(
@@ -309,7 +332,9 @@ final class PriorMapHypothesisTracker {
                     to: mapFromArkit,
                     gain: Limits.smoothingGain)
                 tracks[index].candidate = candidate
-                tracks[index].supportFrames += 1
+                tracks[index].supportFrames = min(
+                    Limits.supportFrameCap,
+                    tracks[index].supportFrames + 1)
                 tracks[index].missedFrames = 0
                 tracks[index].meanScore = tracks[index].meanScore * 0.7
                     + candidate.score * 0.3
@@ -374,7 +399,10 @@ final class PriorMapHypothesisTracker {
             min(1, best.meanScore - (second?.meanScore ?? best.meanScore) + supportMargin))
         let requiredFrames = recoverySearch
             ? Limits.recoveryRequiredFrames : Limits.localRequiredFrames
-        let trusted = best.supportFrames >= requiredFrames
+        let recoveryEpisodeIsActive = !recoverySearch
+            || activeRecoveryEpisodeId != nil
+        let trusted = recoveryEpisodeIsActive
+            && best.supportFrames >= requiredFrames
             && best.meanScore >= Limits.minimumMeanScore
             && (uniqueness >= Limits.minimumUniqueness
                 || scoreMargin >= Limits.minimumScoreMargin)
@@ -392,7 +420,9 @@ final class PriorMapHypothesisTracker {
             trusted: trusted,
             reason: trusted
                 ? (recoverySearch ? "trusted_recovery_hypothesis" : "trusted_local_hypothesis")
-                : "awaiting_unique_temporal_hypothesis")
+                : recoverySearch && activeRecoveryEpisodeId == nil
+                    ? "recovery_episode_not_started"
+                    : "awaiting_unique_temporal_hypothesis")
     }
 }
 

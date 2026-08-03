@@ -243,6 +243,117 @@ enum PriorMapUpdateDecision: Equatable {
     case busy(droppedCount: Int)
 }
 
+enum PriorMapRecoveryOutcome: String, Equatable {
+    case converged
+    case timedOut = "timed_out"
+    case cancelled
+    case manualReset = "manual_reset"
+}
+
+struct PriorMapRecoveryEpisode: Equatable {
+    let id: Int
+    let reason: String
+    let startedAtUptime: TimeInterval
+    let deadlineUptime: TimeInterval
+    let maximumValidAttempts: Int
+    var validMatcherAttempts: Int
+    var acceptedCorrections: Int
+    var triggerCount: Int
+
+    var remainingValidAttempts: Int {
+        max(0, maximumValidAttempts - validMatcherAttempts)
+    }
+}
+
+struct PriorMapRecoveryCompletion: Equatable {
+    let episode: PriorMapRecoveryEpisode
+    let outcome: PriorMapRecoveryOutcome
+}
+
+/// Owns the bounded lifetime of one Recovery search. Frame availability is
+/// deliberately outside this type: callers record an attempt only after the
+/// matcher received its minimum valid input and actually searched the map.
+final class PriorMapRecoveryController {
+    private let maximumValidAttempts: Int
+    private let maximumWallClockSeconds: TimeInterval
+    private let maximumTriggerCount: Int
+    private var nextEpisodeId = 1
+
+    private(set) var activeEpisode: PriorMapRecoveryEpisode?
+    private(set) var lastCompletion: PriorMapRecoveryCompletion?
+
+    init(
+        maximumValidAttempts: Int = 40,
+        maximumWallClockSeconds: TimeInterval = 30,
+        maximumTriggerCount: Int = 100
+    ) {
+        self.maximumValidAttempts = max(32, maximumValidAttempts)
+        self.maximumWallClockSeconds = max(1, maximumWallClockSeconds)
+        self.maximumTriggerCount = max(1, maximumTriggerCount)
+    }
+
+    /// Returns true only for the inactive -> active transition. Repeated loop
+    /// closures retain the episode ID, deadline, attempts, and fresh support.
+    @discardableResult
+    func request(reason: String, now: TimeInterval) -> Bool {
+        if var episode = activeEpisode {
+            episode.triggerCount = min(
+                maximumTriggerCount,
+                episode.triggerCount + 1)
+            activeEpisode = episode
+            return false
+        }
+        activeEpisode = PriorMapRecoveryEpisode(
+            id: nextEpisodeId,
+            reason: reason,
+            startedAtUptime: now,
+            deadlineUptime: now + maximumWallClockSeconds,
+            maximumValidAttempts: maximumValidAttempts,
+            validMatcherAttempts: 0,
+            acceptedCorrections: 0,
+            triggerCount: 1)
+        nextEpisodeId += 1
+        lastCompletion = nil
+        return true
+    }
+
+    /// Records one real search, including ambiguous and mismatch results. The
+    /// caller must not invoke this for nil/undersized observations.
+    @discardableResult
+    func recordValidMatcherAttempt() -> Bool {
+        guard var episode = activeEpisode,
+              episode.remainingValidAttempts > 0 else {
+            return false
+        }
+        episode.validMatcherAttempts += 1
+        activeEpisode = episode
+        return true
+    }
+
+    func recordAcceptedCorrection() {
+        guard var episode = activeEpisode else { return }
+        episode.acceptedCorrections += 1
+        activeEpisode = episode
+    }
+
+    func isExpired(now: TimeInterval) -> Bool {
+        guard let episode = activeEpisode else { return false }
+        return now >= episode.deadlineUptime
+            || episode.remainingValidAttempts == 0
+    }
+
+    @discardableResult
+    func finish(_ outcome: PriorMapRecoveryOutcome) -> PriorMapRecoveryCompletion? {
+        guard let episode = activeEpisode else { return nil }
+        let completion = PriorMapRecoveryCompletion(
+            episode: episode,
+            outcome: outcome)
+        activeEpisode = nil
+        lastCompletion = completion
+        return completion
+    }
+}
+
 /// Thread-safe latest-frame gate. At most one update may execute at a time;
 /// stale completions from a previous/reset generation cannot release a newer
 /// update.
