@@ -1155,8 +1155,20 @@ let recoveryController = PriorMapRecoveryController(
 require(recoveryController.request(reason: "loop", now: 100),
         "R3 first request must start an episode")
 let initialRecoveryEpisode = recoveryController.activeEpisode!
-for _ in 0..<20 {
-    // limited/no-depth/nil-observation frames make no controller call.
+let invalidRecoveryDispositions: [PriorMapRecoveryFrameDisposition] = [
+    .trackingLimited,
+    .noDepth,
+    .observationUnavailable,
+    .insufficientPoints,
+    .busy,
+    .throttled,
+]
+for frame in 0..<20 {
+    require(
+        !recoveryController.recordFrameDisposition(
+            invalidRecoveryDispositions[
+                frame % invalidRecoveryDispositions.count]),
+        "R3 invalid/dropped frames must not be recorded as searches")
 }
 require(recoveryController.activeEpisode?.validMatcherAttempts == 0,
         "R3 invalid frames must not consume attempts")
@@ -1206,9 +1218,12 @@ var maximumStepTranslation = 0.0
 var maximumStepYaw = 0.0
 for validAttempt in 1...40 {
     if validAttempt % 3 == 0 {
-        // An intervening invalid frame intentionally records no attempt.
+        require(
+            !worstPathController.recordFrameDisposition(
+                .observationUnavailable),
+            "R8 an intervening nil observation must not consume an attempt")
     }
-    worstPathController.recordValidMatcherAttempt()
+    worstPathController.recordFrameDisposition(.searched)
     if validAttempt >= 4 {
         let next = PriorMapCorrectionSafety.boundedStep(
             current: boundedPose, target: worstTarget)
@@ -1366,6 +1381,14 @@ require(finalAttemptCompletion?.outcome == .timedOut
         "P7R4 T5 timeout must not reinterpret a provisional step as success")
 require(finalAttemptCompletion?.selectedHypothesisId == 77,
         "P7R4 T10 completion must bind the episode hypothesis")
+let completionIsolation = PriorMapHypothesisTraceBinder.bind(
+    completion: finalAttemptCompletion,
+    currentSelectedHypothesisId: 901)
+require(!completionIsolation.currentHypothesisVisible
+        && completionIsolation.currentSelectedHypothesisId == nil,
+        "P7R4 T10 a new Local candidate cannot enter flat fields on an old completion frame")
+require(completionIsolation.recoverySelectedHypothesisId == 77,
+        "P7R4 T10 completion diagnostics must retain the old episode hypothesis")
 
 final class FakeMonotonicClock: PriorMapMonotonicClock {
     var now: TimeInterval
@@ -1400,6 +1423,42 @@ require(!expiredDecision.correctionStepApplied,
 require(deadlineController.isWallClockExpired(now: 30),
         "P7R4 T7 now equal to deadline must be expired")
 
+// P7R4 T12: every production frame disposition goes through the same attempt
+// reducer. Invalid/dropped frames advance the FakeClock but never the attempt
+// counter, and wall-clock expiry remains fail-closed.
+let dispositionClock = FakeMonotonicClock(0)
+let dispositionController = PriorMapRecoveryController(
+    maximumValidAttempts: 40,
+    maximumWallClockSeconds: 30)
+_ = dispositionController.request(
+    reason: "invalid_frame_timeout", now: dispositionClock.now)
+let dispositionGate = PriorMapUpdateGate(minimumInterval: 0.5)
+let acceptedGateDecision = dispositionGate.begin(timestamp: 1.0)
+guard case .accepted(let dispositionTicket) = acceptedGateDecision else {
+    fatalError("P7R4 T12 first gate update must be accepted")
+}
+let busyGateDecision = dispositionGate.begin(timestamp: 2.0)
+require(busyGateDecision.recoveryFrameDisposition == .busy,
+        "P7R4 T12 a busy gate must expose the production busy disposition")
+dispositionGate.finish(ticket: dispositionTicket)
+let throttledGateDecision = dispositionGate.begin(timestamp: 1.1)
+require(throttledGateDecision.recoveryFrameDisposition == .throttled,
+        "P7R4 T12 a throttled gate must expose the production throttled disposition")
+for (index, disposition) in invalidRecoveryDispositions.enumerated() {
+    dispositionClock.now = Double(index + 1) * 4.9
+    require(!dispositionController.recordFrameDisposition(disposition),
+            "P7R4 T12 \(disposition.rawValue) must not consume an attempt")
+}
+require(dispositionController.activeEpisode?.validMatcherAttempts == 0,
+        "P7R4 T12 all invalid/dropped paths must leave attempts at zero")
+dispositionClock.now = 30
+require(dispositionController.isExpired(now: dispositionClock.now),
+        "P7R4 T12 invalid frames still consume wall time and reach timeout")
+require(dispositionController.recordFrameDisposition(.searched),
+        "P7R4 T12 only matcher-owned searched may consume an attempt")
+require(dispositionController.activeEpisode?.validMatcherAttempts == 1,
+        "P7R4 T12 searched must be the sole attempt-counting disposition")
+
 // P7R4 T8/T9: automatic timeout creates a bounded cooldown. A reliable loop
 // may bypass it, while a repeated trigger only merges into the active episode.
 let cooldownController = PriorMapRecoveryController()
@@ -1421,7 +1480,111 @@ require(cooldownController.activeEpisode?.id == bypassEpisode.id
             == bypassEpisode.deadlineUptime,
         "P7R4 T9 merged trigger must not reset identity or deadline")
 
-// T11: deterministic randomized reconstruction, including arbitrary turns.
+// P7R4 T11: exercise the production localizer anchor with competing Recovery
+// hypotheses. B wins fresh evidence, advances through multiple bounded steps,
+// survives tracker cleanup, and remains the basis of the next ordinary Local
+// frame; historical A has neither support nor authority to move the anchor.
+let retainedAnchor = PriorMapLocalizationAnchor(
+    initialMapPose: PriorMapPose2D(xM: 0, yM: 0, yawRad: 0))
+let anchorTracker = PriorMapHypothesisTracker()
+anchorTracker.beginRecoveryEpisode(id: 700)
+let historicalA = PriorMapAlignmentTransform(
+    translationXM: -2, translationYM: 0, yawRad: 0)
+let selectedB = PriorMapAlignmentTransform(
+    translationXM: 2, translationYM: 0.4, yawRad: 6 * .pi / 180)
+var retainedStepCount = 0
+var retainedRecoveryConverged = false
+var lastAnchorArkitPose = PriorMapPose2D(xM: 0, yM: 0, yawRad: 0)
+for attempt in 0..<20 {
+    let arkitPose = PriorMapPose2D(
+        xM: Double(attempt) * 0.1,
+        yM: Double(attempt) * 0.02,
+        yawRad: Double(attempt) * 0.002)
+    lastAnchorArkitPose = arkitPose
+    let rawAnchorPose = retainedAnchor.project(arkitPose: arkitPose)
+    let anchorDecision = anchorTracker.observe(
+        arkitPose: arkitPose,
+        candidates: [
+            PriorMapScanMatchCandidate(
+                pose: PriorMapAlignmentMath.apply(
+                    mapFromArkit: historicalA,
+                    arkitPose: arkitPose),
+                cost: 0.08,
+                score: productionMatcherScore(0.08)),
+            PriorMapScanMatchCandidate(
+                pose: PriorMapAlignmentMath.apply(
+                    mapFromArkit: selectedB,
+                    arkitPose: arkitPose),
+                cost: 0.01,
+                score: productionMatcherScore(0.01)),
+        ],
+        uniqueness: 0.5,
+        recoverySearch: true)
+    guard anchorDecision.trusted,
+          let trustedB = anchorDecision.mapFromArkit else {
+        continue
+    }
+    require(trustedB.translationXM > 1.5,
+            "P7R4 T11 fresh Recovery evidence must select B rather than historical A")
+    let targetB = PriorMapAlignmentMath.apply(
+        mapFromArkit: trustedB,
+        arkitPose: arkitPose)
+    let residual = PriorMapCorrectionSafety.difference(
+        from: rawAnchorPose,
+        to: targetB)
+    let boundedAnchorPose = PriorMapCorrectionSafety.boundedStep(
+        current: rawAnchorPose,
+        target: targetB)
+    retainedAnchor.retainAppliedCorrection(
+        arkitPose: arkitPose,
+        estimatedMapPose: boundedAnchorPose)
+    retainedStepCount += 1
+    if residual.translationM
+            <= PriorMapRecoveryDecisionEngine.convergenceTranslationM,
+       residual.yawRad <= PriorMapRecoveryDecisionEngine.convergenceYawRad {
+        retainedRecoveryConverged = true
+        break
+    }
+}
+require(retainedRecoveryConverged && retainedStepCount > 1,
+        "P7R4 T11 B must converge through multiple bounded anchor steps")
+anchorTracker.endRecoveryEpisode(id: 700, outcome: .converged)
+let nextAnchorArkitPose = PriorMapPose2D(
+    xM: lastAnchorArkitPose.xM + 0.2,
+    yM: lastAnchorArkitPose.yM + 0.04,
+    yawRad: lastAnchorArkitPose.yawRad + 0.004)
+let projectedFromRetainedB = retainedAnchor.project(
+    arkitPose: nextAnchorArkitPose)
+let expectedFromB = PriorMapAlignmentMath.apply(
+    mapFromArkit: selectedB,
+    arkitPose: nextAnchorArkitPose)
+let expectedFromA = PriorMapAlignmentMath.apply(
+    mapFromArkit: historicalA,
+    arkitPose: nextAnchorArkitPose)
+let distanceToB = PriorMapCorrectionSafety.difference(
+    from: projectedFromRetainedB,
+    to: expectedFromB).translationM
+let distanceToA = PriorMapCorrectionSafety.difference(
+    from: projectedFromRetainedB,
+    to: expectedFromA).translationM
+require(distanceToB <= 0.5 && distanceToA > 3.0,
+        "P7R4 T11 next Local frame must continue from retained B without jumping to A")
+let freshLocalB = anchorTracker.observe(
+    arkitPose: nextAnchorArkitPose,
+    candidates: [PriorMapScanMatchCandidate(
+        pose: expectedFromB,
+        cost: 0.01,
+        score: productionMatcherScore(0.01))],
+    uniqueness: 0.5,
+    recoverySearch: false)
+require(!freshLocalB.trusted && freshLocalB.supportFrames == 1,
+        "P7R4 T11 tracker cleanup must require fresh Local support")
+requirePoseClose(
+    retainedAnchor.project(arkitPose: nextAnchorArkitPose),
+    projectedFromRetainedB,
+    "P7R4 T11 untrusted fresh Local evidence cannot move retained B anchor")
+
+// Legacy coordinate reconstruction coverage, including arbitrary turns.
 var randomState: UInt64 = 0x5eed5eed
 func deterministicUnit() -> Double {
     randomState = randomState &* 6364136223846793005 &+ 1442695040888963407
@@ -1543,6 +1706,44 @@ let justConvergedUsableTag = ShelfAssociation.localizedTag(
     userConfirmed: false)
 require(justConvergedUsableTag.needsReview,
         "P7R4 T14 usable/just-converged tags cannot auto-confirm")
+
+func tagForLocalizationState(
+    observationId: String,
+    state: String
+) -> LocalizedPriceTag {
+    ShelfAssociation.localizedTag(
+        observationId: observationId,
+        payload: "6900000000099",
+        symbology: "EAN13",
+        floorId: "1",
+        rawPosition: PriorMapTagPoint3D(
+            xM: 2, yM: -0.1, heightM: 1.4),
+        cameraPosition: SIMD2<Double>(2, -2),
+        shelves: [shelf],
+        localizationState: state,
+        localizationConfidence: 0.95,
+        measurementConfidence: 0.95,
+        measurementMethod: "scene_depth",
+        userConfirmed: false)
+}
+let tagConfidenceMatrix: [
+    (label: String, state: String, mustNeedReview: Bool)
+] = [
+    ("recovery_active", "recovering", true),
+    ("recovery_timed_out", "weak", true),
+    ("just_converged", "usable", true),
+    ("usable", "usable", true),
+    ("stable", "stable", false),
+]
+for matrixCase in tagConfidenceMatrix {
+    let result = tagForLocalizationState(
+        observationId: matrixCase.label,
+        state: matrixCase.state)
+    require(result.needsReview == matrixCase.mustNeedReview,
+            "P7R4 T14 \(matrixCase.label) auto-confirm safety matrix")
+}
+require(!localized.needsReview,
+        "P7R4 T14 a fully qualified stable tag must retain the positive auto-confirm path")
 
 let oppositeSide = ShelfAssociation.localizedTag(
     observationId: "opposite",
