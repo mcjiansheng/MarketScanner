@@ -7,7 +7,7 @@
 > P7R1 review baseline: `repair-v2-p7r0-independent-baseline@79c86b120fc47c28bd350e86abc9b0354d7e838d`.
 > P7R3 cloud base at task start: `repair-v2-p7r3-recovery-episode-closeout@998c175e40562fffd85fe45579a358c485a65b30`.
 > Current implementation branch: `repair-v2-p7r4-recovery-confidence-closeout`.
-> P7R4 production implementation: `412015be87fc944241c0e43a2ab510830a561ded`; later test/governance commits must not silently modify production code.
+> P7R4 production implementation: `14f2b45fb23b9485e1065d1faf572de51dfae909`; later test/governance commits must not silently modify production code.
 
 The authoritative release judgment remains [Production Readiness Review](PRODUCTION_READINESS_REVIEW.md): **NO-GO / NOT PRODUCTION READY**.
 
@@ -15,6 +15,6 @@ P7R4 separates measurement acceptance, hypothesis trust, bounded correction appl
 
 The 30-second monotonic deadline is checked before and after matching. A matcher result that crosses the deadline may count as a real attempt but cannot mutate the alignment. Attempt 40 may retain a safe bounded anchor step, but its constraint remains provisional and the outcome remains `timed_out` when residual convergence was not reached. Automatic weak/lost Recovery has a centralized 20-second cooldown; reliable RTAB-Map loop closure may bypass only that cooldown and still cannot reset or duplicate an active episode.
 
-Completion diagnostics are bound to the completed episode and kept separate from current Local hypotheses. `PriorMapScanMatchResult.searchPerformed` is the single source for valid-attempt accounting, with `PriorMapScanMatcher.minimumSearchPointCount = 30`. The PC reader rejects any provisional disposition marked formally accepted.
+Completion diagnostics are bound to the completed episode and kept separate from current Local hypotheses. `PriorMapScanMatchResult.searchPerformed` is the single source for valid-attempt accounting, with `PriorMapScanMatcher.minimumSearchPointCount = 30`. The production-shared frame-disposition reducer proves limited/no-depth/nil/undersized/busy/throttled frames consume wall time but not attempts. The localizer's production anchor is exercised through competing A/B Recovery, bounded B convergence, track cleanup, and the next ordinary Local frame. The PC reader rejects any provisional disposition marked formally accepted.
 
 Current status: **IMPLEMENTED / focused AUTOMATED TESTED**. Windows cannot establish Xcode, UIKit, ARKit, LiDAR, or real-device PASS. Exact-final-SHA CI and the independent read-only review are still required before `READY FOR HUMAN SAM RE-TEST` may be declared. Historical reviews remain under [`history/`](history/).

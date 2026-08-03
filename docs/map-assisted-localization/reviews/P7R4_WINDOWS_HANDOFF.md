@@ -1,6 +1,6 @@
 # P7R4 Windows-to-macOS handoff
 
-> Production implementation SHA: `412015be87fc944241c0e43a2ab510830a561ded`
+> Production implementation SHA: `14f2b45fb23b9485e1065d1faf572de51dfae909`
 > Branch: `repair-v2-p7r4-recovery-confidence-closeout`
 > Cloud base: `repair-v2-p7r3-recovery-episode-closeout@998c175e40562fffd85fe45579a358c485a65b30`
 > Windows decision: **IMPLEMENTED / FOCUSED AUTOMATED TESTED — DEFERRED_MACOS_EXECUTION**
@@ -16,6 +16,7 @@
 - Make matcher `searchPerformed`/attempt disposition authoritative and centralize the 30-point threshold.
 - Persist backward-compatible trace/constraint fields and reject contradictory provisional/accepted records in the PC reader.
 - Require `stable` (not `usable`) for automatic price-tag confirmation.
+- Route the real Stage One alignment through a production-shared anchor, frame-disposition attempt reducer, and completion/current-hypothesis binder so T10/T11/T12 exercise the same code as the localizer.
 
 ## Windows validation evidence
 
@@ -28,6 +29,10 @@
 | Full Qualification suite | 11 total: 10 PASS, 1 ERROR before assertion (`WinError 1314` symlink fixture), 0 SKIP |
 | Full Map Studio suite outside sandbox | 94 total: 89 PASS, 5 ERROR before assertion (`WinError 1314` symlink fixtures), 0 SKIP |
 | Swift host executable | `DEFERRED_MACOS_EXECUTION` (`xcrun` unavailable) |
+| Post-review source contracts | PASS, 15/15 |
+| Post-review Stage3 executable assertions | 54 PASS; 1 ERROR before assertion (`WinError 1314` symlink fixture) |
+
+The first independent read-only review rejected the earlier test-only evidence because T10/T11/T12/T14 did not exercise the required integration boundaries. Production implementation `14f2b45fb23b9485e1065d1faf572de51dfae909` and test commit `e6c2959f7eae3b0b9feb81b35ce5364effbcaca1` close those specific gaps. A new exact-final-SHA CI run and independent re-review are mandatory; the earlier green run cannot qualify this newer SHA.
 
 ## Required Apple/CI validation
 
