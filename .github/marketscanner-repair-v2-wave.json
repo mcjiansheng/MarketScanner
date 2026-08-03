@@ -1,7 +1,7 @@
 {
-  "wave": "P7R2-sam-global-alignment-fix",
-  "branch": "repair-v2-p7r2-sam-global-alignment-fix",
-  "base_branch": "repair-v2-p7r1-evidence-publication-closeout",
-  "base_sha": "b7f75ee81656a5104dcebe75720486db72f05109",
-  "implementation_sha": "0a2a3ec50a851d52f96120a8f3d1669a7797e34e"
+  "wave": "P7R3-recovery-episode-closeout",
+  "branch": "repair-v2-p7r3-recovery-episode-closeout",
+  "base_branch": "repair-v2-p7r2-sam-global-alignment-fix",
+  "base_sha": "c3401759aadf2015873ae15e826b6a9a1f3c4ba0",
+  "implementation_sha": "0e2ce5133c8fb261fc1756111a5173c71d15b380"
 }

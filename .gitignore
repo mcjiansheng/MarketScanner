@@ -28,3 +28,5 @@ build_*
 __pycache__/
 *.pyc
 *.bak
+.venv/
+/artifacts/
