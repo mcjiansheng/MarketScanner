@@ -213,6 +213,11 @@ struct PriorMapScanMatchCandidate: Codable, Equatable {
     let score: Double
 }
 
+enum PriorMapScanAttemptDisposition: String, Codable, Equatable {
+    case notSearchedInsufficientPoints = "not_searched_insufficient_points"
+    case searched
+}
+
 struct PriorMapScanMatchResult {
     let candidates: [PriorMapScanMatchCandidate]
     let uniqueness: Double
@@ -220,6 +225,11 @@ struct PriorMapScanMatchResult {
     let acceptedByGeometry: Bool
     let rejectionReason: String
     let elapsedMs: Double
+    let attemptDisposition: PriorMapScanAttemptDisposition
+
+    var searchPerformed: Bool {
+        attemptDisposition == .searched
+    }
 }
 
 struct PriorMapHypothesisDecision {
@@ -445,6 +455,8 @@ private struct DecodedDistanceLevel {
 }
 
 final class PriorMapScanMatcher {
+    static let minimumSearchPointCount = 30
+
     private let levels: [DecodedDistanceLevel]
     private let maximumPoints = 600
 
@@ -618,14 +630,15 @@ final class PriorMapScanMatcher {
         let points = observation.points.enumerated().compactMap {
             $0.offset % strideValue == 0 ? $0.element : nil
         }
-        guard points.count >= 30 else {
+        guard points.count >= Self.minimumSearchPointCount else {
             return PriorMapScanMatchResult(
                 candidates: [],
                 uniqueness: 0,
                 effectivePointCount: points.count,
                 acceptedByGeometry: false,
                 rejectionReason: "insufficient_structure_points",
-                elapsedMs: (ProcessInfo.processInfo.systemUptime - started) * 1000.0)
+                elapsedMs: (ProcessInfo.processInfo.systemUptime - started) * 1000.0,
+                attemptDisposition: .notSearchedInsufficientPoints)
         }
         let coarse = search(
             around: predictedPose,
@@ -695,7 +708,8 @@ final class PriorMapScanMatcher {
             effectivePointCount: points.count,
             acceptedByGeometry: accepted,
             rejectionReason: reason,
-            elapsedMs: (ProcessInfo.processInfo.systemUptime - started) * 1000.0)
+            elapsedMs: (ProcessInfo.processInfo.systemUptime - started) * 1000.0,
+            attemptDisposition: .searched)
     }
 }
 
@@ -704,6 +718,7 @@ enum PriorMapLocalizationPhase: String, Codable {
     case initializing
     case stable
     case usable
+    case recovering
     case weak
     case lost
     case manualCorrection
@@ -714,42 +729,103 @@ struct PriorMapConfidenceResult {
     let confidence: Double
 }
 
+struct PriorMapConfidenceObservation {
+    let trackingState: String
+    let measurementAccepted: Bool
+    let correctionStepApplied: Bool
+    let recoveryActive: Bool
+    let recoveryConvergedThisUpdate: Bool
+    let recoveryFailedThisUpdate: Bool
+    let validPointCount: Int
+    let coverageAngleRad: Double
+    let uniqueness: Double
+    let residualCost: Double
+    let mapMismatch: Bool
+}
+
 final class PriorMapConfidenceManager {
     private(set) var phase: PriorMapLocalizationPhase = .uninitialized
     private var consecutiveTrusted = 0
     private var consecutiveRejected = 0
     private var lastAcceptedTimestamp: TimeInterval?
+    private(set) var postRecoveryTrustedLocalFrames = 0
+    private var requiresPostRecoveryLocalTrust = false
 
     func reset(manual: Bool = false) {
         phase = manual ? .manualCorrection : .initializing
         consecutiveTrusted = 0
         consecutiveRejected = 0
         lastAcceptedTimestamp = nil
+        postRecoveryTrustedLocalFrames = 0
+        requiresPostRecoveryLocalTrust = false
     }
 
     func update(
         timestamp: TimeInterval,
-        trackingState: String,
-        accepted: Bool,
-        validPointCount: Int,
-        coverageAngleRad: Double,
-        uniqueness: Double,
-        residualCost: Double,
-        mapMismatch: Bool
+        observation: PriorMapConfidenceObservation
     ) -> PriorMapConfidenceResult {
-        if trackingState == "notAvailable" {
+        if observation.trackingState == "notAvailable" {
             phase = .lost
             consecutiveTrusted = 0
+            postRecoveryTrustedLocalFrames = 0
             return PriorMapConfidenceResult(phase: phase, confidence: 0)
         }
-        if accepted {
+        if observation.recoveryFailedThisUpdate {
+            phase = .weak
+            consecutiveTrusted = 0
+            consecutiveRejected += 1
+            postRecoveryTrustedLocalFrames = 0
+            return PriorMapConfidenceResult(
+                phase: phase,
+                confidence: min(
+                    0.55,
+                    confidenceScore(
+                        timestamp: timestamp,
+                        observation: observation)))
+        }
+        if observation.recoveryActive
+            && !observation.recoveryConvergedThisUpdate {
+            consecutiveTrusted = 0
+            consecutiveRejected += 1
+            postRecoveryTrustedLocalFrames = 0
+            phase = .recovering
+            return PriorMapConfidenceResult(
+                phase: phase,
+                confidence: min(
+                    0.55,
+                    confidenceScore(
+                        timestamp: timestamp,
+                        observation: observation)))
+        }
+        if observation.recoveryConvergedThisUpdate {
+            requiresPostRecoveryLocalTrust = true
+            postRecoveryTrustedLocalFrames = 0
+            consecutiveTrusted = 0
+            consecutiveRejected = 0
+            lastAcceptedTimestamp = timestamp
+            phase = .usable
+            return PriorMapConfidenceResult(
+                phase: phase,
+                confidence: min(
+                    0.79,
+                    confidenceScore(
+                        timestamp: timestamp,
+                        observation: observation)))
+        }
+        if observation.measurementAccepted {
             consecutiveTrusted += 1
             consecutiveRejected = 0
             lastAcceptedTimestamp = timestamp
+            if requiresPostRecoveryLocalTrust {
+                postRecoveryTrustedLocalFrames += 1
+            }
         }
         else {
             consecutiveRejected += 1
             consecutiveTrusted = 0
+            if requiresPostRecoveryLocalTrust {
+                postRecoveryTrustedLocalFrames = 0
+            }
         }
         let staleSeconds = lastAcceptedTimestamp.map { max(0, timestamp - $0) }
             ?? Double.infinity
@@ -759,29 +835,44 @@ final class PriorMapConfidenceManager {
         else if staleSeconds > 10 {
             phase = .lost
         }
-        else if trackingState != "normal"
+        else if observation.trackingState != "normal"
             || staleSeconds > 4
             || consecutiveRejected >= 3
-            || mapMismatch {
+            || observation.mapMismatch {
             phase = .weak
         }
-        else if accepted
+        else if observation.measurementAccepted
             && consecutiveTrusted >= 3
-            && validPointCount >= 80
-            && uniqueness >= 0.22 {
+            && observation.validPointCount >= 80
+            && observation.uniqueness >= 0.22
+            && (!requiresPostRecoveryLocalTrust
+                || postRecoveryTrustedLocalFrames >= 3) {
             phase = .stable
+            requiresPostRecoveryLocalTrust = false
         }
-        else if accepted || staleSeconds <= 4 {
+        else if observation.measurementAccepted || staleSeconds <= 4 {
             phase = .usable
         }
         else {
             phase = .initializing
         }
-        let trackingScore = trackingState == "normal" ? 1.0 : 0.35
-        let pointScore = min(1, Double(validPointCount) / 120.0)
-        let coverageScore = min(1, coverageAngleRad / 1.4)
-        let uniquenessScore = min(1, uniqueness / 0.35)
-        let residualScore = max(0, 1 - residualCost / 0.15)
+        let confidence = confidenceScore(
+            timestamp: timestamp,
+            observation: observation)
+        return PriorMapConfidenceResult(phase: phase, confidence: confidence)
+    }
+
+    private func confidenceScore(
+        timestamp: TimeInterval,
+        observation: PriorMapConfidenceObservation
+    ) -> Double {
+        let staleSeconds = lastAcceptedTimestamp.map { max(0, timestamp - $0) }
+            ?? Double.infinity
+        let trackingScore = observation.trackingState == "normal" ? 1.0 : 0.35
+        let pointScore = min(1, Double(observation.validPointCount) / 120.0)
+        let coverageScore = min(1, observation.coverageAngleRad / 1.4)
+        let uniquenessScore = min(1, observation.uniqueness / 0.35)
+        let residualScore = max(0, 1 - observation.residualCost / 0.15)
         let freshnessScore = staleSeconds.isFinite
             ? max(0, 1 - staleSeconds / 10.0)
             : 0
@@ -795,6 +886,6 @@ final class PriorMapConfidenceManager {
                     + 0.22 * uniquenessScore
                     + 0.18 * residualScore
                     + 0.10 * freshnessScore))
-        return PriorMapConfidenceResult(phase: phase, confidence: confidence)
+        return confidence
     }
 }

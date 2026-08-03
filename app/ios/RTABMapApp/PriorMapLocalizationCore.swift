@@ -250,6 +250,86 @@ enum PriorMapRecoveryOutcome: String, Equatable {
     case manualReset = "manual_reset"
 }
 
+protocol PriorMapMonotonicClock {
+    var now: TimeInterval { get }
+}
+
+struct PriorMapSystemMonotonicClock: PriorMapMonotonicClock {
+    var now: TimeInterval {
+        ProcessInfo.processInfo.systemUptime
+    }
+}
+
+enum PriorMapConstraintDisposition: String, Codable, Equatable {
+    case rejected
+    case provisionalRecoveryStep = "provisional_recovery_step"
+    case acceptedLocal = "accepted_local"
+    case acceptedRecoveryConvergence = "accepted_recovery_convergence"
+}
+
+struct PriorMapRecoveryDecisionInput: Equatable {
+    let recoveryActive: Bool
+    let hypothesisTrusted: Bool
+    let geometryAndSafetyAccepted: Bool
+    let residualTranslationM: Double
+    let residualYawRad: Double
+    let wallClockExpired: Bool
+}
+
+struct PriorMapRecoveryDecision: Equatable {
+    let measurementAccepted: Bool
+    let hypothesisTrusted: Bool
+    let correctionStepApplied: Bool
+    let recoveryConvergedThisUpdate: Bool
+    let confidenceAccepted: Bool
+    let constraintDisposition: PriorMapConstraintDisposition
+}
+
+/// The single production/test decision point that separates accepting a scan
+/// measurement, applying one bounded anchor step, and accepting localization
+/// as confidence-bearing evidence.
+enum PriorMapRecoveryDecisionEngine {
+    static let convergenceTranslationM = 0.5
+    static let convergenceYawRad = 10.0 * Double.pi / 180.0
+
+    static func evaluate(
+        _ input: PriorMapRecoveryDecisionInput
+    ) -> PriorMapRecoveryDecision {
+        let accepted = input.hypothesisTrusted
+            && input.geometryAndSafetyAccepted
+            && !input.wallClockExpired
+        guard accepted else {
+            return PriorMapRecoveryDecision(
+                measurementAccepted: false,
+                hypothesisTrusted: input.hypothesisTrusted,
+                correctionStepApplied: false,
+                recoveryConvergedThisUpdate: false,
+                confidenceAccepted: false,
+                constraintDisposition: .rejected)
+        }
+        guard input.recoveryActive else {
+            return PriorMapRecoveryDecision(
+                measurementAccepted: true,
+                hypothesisTrusted: true,
+                correctionStepApplied: true,
+                recoveryConvergedThisUpdate: false,
+                confidenceAccepted: true,
+                constraintDisposition: .acceptedLocal)
+        }
+        let converged = input.residualTranslationM <= convergenceTranslationM
+            && input.residualYawRad <= convergenceYawRad
+        return PriorMapRecoveryDecision(
+            measurementAccepted: true,
+            hypothesisTrusted: true,
+            correctionStepApplied: true,
+            recoveryConvergedThisUpdate: converged,
+            confidenceAccepted: converged,
+            constraintDisposition: converged
+                ? .acceptedRecoveryConvergence
+                : .provisionalRecoveryStep)
+    }
+}
+
 struct PriorMapRecoveryEpisode: Equatable {
     let id: Int
     let reason: String
@@ -259,6 +339,7 @@ struct PriorMapRecoveryEpisode: Equatable {
     var validMatcherAttempts: Int
     var acceptedCorrections: Int
     var triggerCount: Int
+    let automatic: Bool
 
     var remainingValidAttempts: Int {
         max(0, maximumValidAttempts - validMatcherAttempts)
@@ -268,12 +349,20 @@ struct PriorMapRecoveryEpisode: Equatable {
 struct PriorMapRecoveryCompletion: Equatable {
     let episode: PriorMapRecoveryEpisode
     let outcome: PriorMapRecoveryOutcome
+    let finishedAtUptime: TimeInterval
+    let selectedHypothesisId: Int?
+    let finalFreshSupportFrames: Int
+    let finalResidualTranslationM: Double?
+    let finalResidualYawRad: Double?
+    let correctionStepAppliedOnCompletionFrame: Bool
 }
 
 /// Owns the bounded lifetime of one Recovery search. Frame availability is
 /// deliberately outside this type: callers record an attempt only after the
 /// matcher received its minimum valid input and actually searched the map.
 final class PriorMapRecoveryController {
+    static let automaticRecoveryCooldownSeconds: TimeInterval = 20
+
     private let maximumValidAttempts: Int
     private let maximumWallClockSeconds: TimeInterval
     private let maximumTriggerCount: Int
@@ -281,6 +370,7 @@ final class PriorMapRecoveryController {
 
     private(set) var activeEpisode: PriorMapRecoveryEpisode?
     private(set) var lastCompletion: PriorMapRecoveryCompletion?
+    private(set) var nextAutomaticRecoveryAllowedAt: TimeInterval = 0
 
     init(
         maximumValidAttempts: Int = 40,
@@ -295,12 +385,19 @@ final class PriorMapRecoveryController {
     /// Returns true only for the inactive -> active transition. Repeated loop
     /// closures retain the episode ID, deadline, attempts, and fresh support.
     @discardableResult
-    func request(reason: String, now: TimeInterval) -> Bool {
+    func request(
+        reason: String,
+        now: TimeInterval,
+        automatic: Bool = false
+    ) -> Bool {
         if var episode = activeEpisode {
             episode.triggerCount = min(
                 maximumTriggerCount,
                 episode.triggerCount + 1)
             activeEpisode = episode
+            return false
+        }
+        if automatic && now < nextAutomaticRecoveryAllowedAt {
             return false
         }
         activeEpisode = PriorMapRecoveryEpisode(
@@ -311,7 +408,8 @@ final class PriorMapRecoveryController {
             maximumValidAttempts: maximumValidAttempts,
             validMatcherAttempts: 0,
             acceptedCorrections: 0,
-            triggerCount: 1)
+            triggerCount: 1,
+            automatic: automatic)
         nextEpisodeId += 1
         lastCompletion = nil
         return true
@@ -342,14 +440,54 @@ final class PriorMapRecoveryController {
             || episode.remainingValidAttempts == 0
     }
 
+    func isWallClockExpired(now: TimeInterval) -> Bool {
+        guard let episode = activeEpisode else { return false }
+        return now >= episode.deadlineUptime
+    }
+
+    func isAutomaticTriggerSuppressed(now: TimeInterval) -> Bool {
+        activeEpisode == nil && now < nextAutomaticRecoveryAllowedAt
+    }
+
+    func automaticCooldownRemaining(now: TimeInterval) -> TimeInterval {
+        max(0, nextAutomaticRecoveryAllowedAt - now)
+    }
+
+    func resetAutomaticCooldownAfterManualCorrection() {
+        nextAutomaticRecoveryAllowedAt = 0
+    }
+
     @discardableResult
-    func finish(_ outcome: PriorMapRecoveryOutcome) -> PriorMapRecoveryCompletion? {
+    func finish(
+        _ outcome: PriorMapRecoveryOutcome,
+        now: TimeInterval,
+        selectedHypothesisId: Int? = nil,
+        finalFreshSupportFrames: Int = 0,
+        finalResidualTranslationM: Double? = nil,
+        finalResidualYawRad: Double? = nil,
+        correctionStepAppliedOnCompletionFrame: Bool = false
+    ) -> PriorMapRecoveryCompletion? {
         guard let episode = activeEpisode else { return nil }
         let completion = PriorMapRecoveryCompletion(
             episode: episode,
-            outcome: outcome)
+            outcome: outcome,
+            finishedAtUptime: now,
+            selectedHypothesisId: selectedHypothesisId,
+            finalFreshSupportFrames: finalFreshSupportFrames,
+            finalResidualTranslationM: finalResidualTranslationM,
+            finalResidualYawRad: finalResidualYawRad,
+            correctionStepAppliedOnCompletionFrame:
+                correctionStepAppliedOnCompletionFrame)
         activeEpisode = nil
         lastCompletion = completion
+        if episode.automatic && (outcome == .timedOut || outcome == .cancelled) {
+            nextAutomaticRecoveryAllowedAt = max(
+                nextAutomaticRecoveryAllowedAt,
+                now + Self.automaticRecoveryCooldownSeconds)
+        }
+        if outcome == .manualReset {
+            nextAutomaticRecoveryAllowedAt = 0
+        }
         return completion
     }
 }

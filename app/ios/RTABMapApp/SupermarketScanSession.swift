@@ -296,6 +296,10 @@ struct PriorMapConstraintRecord: Codable {
     let priorMapSha256: String?
     let floorId: String?
     let accepted: Bool
+    let measurementAccepted: Bool
+    let correctionStepApplied: Bool
+    let confidenceAccepted: Bool
+    let disposition: PriorMapConstraintDisposition
     let reason: String
     let predictedPose: PriorMapPose2D
     let estimatedPose: PriorMapPose2D
@@ -1500,6 +1504,10 @@ final class SupermarketScanSession {
             priorMapSha256: scanConfiguration.priorMapSha256,
             floorId: scanConfiguration.floorId,
             accepted: update.constraintAccepted,
+            measurementAccepted: update.measurementAccepted,
+            correctionStepApplied: update.correctionStepApplied,
+            confidenceAccepted: update.confidenceAccepted,
+            disposition: update.constraintDisposition,
             reason: update.constraintReason,
             predictedPose: update.rawPose,
             estimatedPose: update.estimatedPose,

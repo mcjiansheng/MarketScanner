@@ -309,6 +309,14 @@ struct PriorMapLocalizationUpdate: Codable {
     let matcherElapsedMs: Double
     let constraintAccepted: Bool
     let constraintReason: String
+    var measurementAccepted: Bool = false
+    var hypothesisTrusted: Bool = false
+    var correctionStepApplied: Bool = false
+    var recoveryConvergedThisUpdate: Bool = false
+    var confidenceAccepted: Bool = false
+    var constraintDisposition: PriorMapConstraintDisposition = .rejected
+    var postRecoveryTrustedLocalFrames: Int = 0
+    var scanSearchPerformed: Bool = false
     var hypothesisSupportFrames: Int = 0
     var hypothesisScoreMargin: Double = 0
     var recoverySearch: Bool = false
@@ -331,6 +339,14 @@ struct PriorMapLocalizationUpdate: Codable {
     var recoveryElapsedMs: Double? = nil
     var recoveryFreshSupportFrames: Int? = nil
     var recoveryTriggerCount: Int? = nil
+    var recoveryFinishedAtUptime: TimeInterval? = nil
+    var recoverySelectedHypothesisId: Int? = nil
+    var recoveryFinalResidualTranslationM: Double? = nil
+    var recoveryFinalResidualYawDeg: Double? = nil
+    var recoveryCorrectionStepAppliedOnCompletionFrame: Bool? = nil
+    var recoveryCooldownRemainingMs: Double = 0
+    var recoveryAutomaticTriggerSuppressed: Bool = false
+    var recoveryAutomaticTriggerReason: String? = nil
     var trackingSessionId: String? = nil
     var priorMapId: String? = nil
     var priorMapSha256: String? = nil
@@ -364,6 +380,7 @@ final class PriorMapStageOneLocalizer {
     private let candidateRadiusM = 3.0
     private let depthSampler = PriorMapDepthSampler()
     private let matcher: PriorMapScanMatcher
+    private let monotonicClock: PriorMapMonotonicClock
     private let confidenceManager = PriorMapConfidenceManager()
     private let hypothesisTracker = PriorMapHypothesisTracker()
     private let recoveryController = PriorMapRecoveryController()
@@ -382,10 +399,12 @@ final class PriorMapStageOneLocalizer {
     init(
         package: PriorMapPackage,
         floorId: String,
-        initialMapPose: PriorMapPose2D
+        initialMapPose: PriorMapPose2D,
+        monotonicClock: PriorMapMonotonicClock = PriorMapSystemMonotonicClock()
     ) throws {
         self.floorId = floorId
         self.initialMapPose = initialMapPose
+        self.monotonicClock = monotonicClock
         self.latestEstimatedPose = initialMapPose
         self.priorMapId = package.manifest.priorMapId
         self.priorMapSha256 = package.packageSha256
@@ -440,8 +459,15 @@ final class PriorMapStageOneLocalizer {
     /// Called after a reliable RTAB-Map loop closure. The loop does not inject
     /// a pose prior by itself; it authorizes a bounded wider search whose result
     /// must still survive four-frame hypothesis tracking before any correction.
-    private func beginRecovery(reason: String, now: TimeInterval) {
-        if recoveryController.request(reason: reason, now: now),
+    private func beginRecovery(
+        reason: String,
+        now: TimeInterval,
+        automatic: Bool = false
+    ) {
+        if recoveryController.request(
+            reason: reason,
+            now: now,
+            automatic: automatic),
            let episode = recoveryController.activeEpisode {
             hypothesisTracker.beginRecoveryEpisode(id: episode.id)
         }
@@ -449,11 +475,25 @@ final class PriorMapStageOneLocalizer {
 
     @discardableResult
     private func finishRecovery(
-        outcome: PriorMapRecoveryOutcome
+        outcome: PriorMapRecoveryOutcome,
+        now: TimeInterval,
+        selectedHypothesisId: Int? = nil,
+        finalFreshSupportFrames: Int = 0,
+        finalResidualTranslationM: Double? = nil,
+        finalResidualYawRad: Double? = nil,
+        correctionStepAppliedOnCompletionFrame: Bool = false
     ) -> PriorMapRecoveryCompletion? {
         guard let episode = recoveryController.activeEpisode else { return nil }
         hypothesisTracker.endRecoveryEpisode(id: episode.id, outcome: outcome)
-        let completion = recoveryController.finish(outcome)
+        let completion = recoveryController.finish(
+            outcome,
+            now: now,
+            selectedHypothesisId: selectedHypothesisId,
+            finalFreshSupportFrames: finalFreshSupportFrames,
+            finalResidualTranslationM: finalResidualTranslationM,
+            finalResidualYawRad: finalResidualYawRad,
+            correctionStepAppliedOnCompletionFrame:
+                correctionStepAppliedOnCompletionFrame)
         pendingRecoveryCompletion = completion
         return completion
     }
@@ -461,11 +501,11 @@ final class PriorMapStageOneLocalizer {
     func requestRecovery(reason: String) {
         beginRecovery(
             reason: reason,
-            now: ProcessInfo.processInfo.systemUptime)
+            now: monotonicClock.now)
     }
 
     func cancelRecovery() {
-        _ = finishRecovery(outcome: .cancelled)
+        _ = finishRecovery(outcome: .cancelled, now: monotonicClock.now)
     }
 
     func update(frame: ARFrame, trackingState: String) -> PriorMapLocalizationUpdate {
@@ -519,55 +559,87 @@ final class PriorMapStageOneLocalizer {
                 && topCandidates[1].distanceM - topCandidates[0].distanceM
                     >= ambiguityMarginM)
         var estimatedPose = rawPose
-        var accepted = false
+        var decision = PriorMapRecoveryDecision(
+            measurementAccepted: false,
+            hypothesisTrusted: false,
+            correctionStepApplied: false,
+            recoveryConvergedThisUpdate: false,
+            confidenceAccepted: false,
+            constraintDisposition: .rejected)
         var reason = trackingState == "normal"
             ? "structure_depth_unavailable"
             : "tracking_not_normal"
         let observation = trackingState == "normal"
             ? depthSampler.sample(frame: frame)
             : nil
-        let updateUptime = ProcessInfo.processInfo.systemUptime
-        if recoveryController.isExpired(now: updateUptime) {
-            _ = finishRecovery(outcome: .timedOut)
-        }
+        let preMatchNow = monotonicClock.now
+        let recoveryWasActiveAtUpdateStart = recoveryController.activeEpisode != nil
         var recoveryCompletionForUpdate = pendingRecoveryCompletion
         pendingRecoveryCompletion = nil
+        if recoveryController.isWallClockExpired(now: preMatchNow) {
+            recoveryCompletionForUpdate = finishRecovery(
+                outcome: .timedOut,
+                now: preMatchNow)
+            pendingRecoveryCompletion = nil
+            reason = "recovery_timed_out_before_match"
+        }
+        var automaticTriggerSuppressed = false
+        var automaticTriggerReason: String?
         if recoveryController.activeEpisode == nil,
            recoveryCompletionForUpdate == nil,
            consecutiveUntrustedFrames == 6
             || (consecutiveUntrustedFrames > 6
                 && consecutiveUntrustedFrames % 20 == 0) {
-            beginRecovery(
-                reason: "persistent_weak_or_lost",
-                now: updateUptime)
+            if recoveryController.isAutomaticTriggerSuppressed(now: preMatchNow) {
+                automaticTriggerSuppressed = true
+                automaticTriggerReason = "automatic_recovery_cooldown"
+            }
+            else {
+                beginRecovery(
+                    reason: "persistent_weak_or_lost",
+                    now: preMatchNow,
+                    automatic: true)
+            }
         }
         let recoverySearch = recoveryController.activeEpisode != nil
         let activeRecoveryReason = recoveryController.activeEpisode?.reason ?? "none"
-        let match = observation.map {
+        let match = recoveryCompletionForUpdate == nil ? observation.map {
             matcher.match(
                 predictedPose: rawPose,
                 observation: $0,
                 recoverySearch: recoverySearch)
-        }
+        } : nil
+        let postMatchNow = monotonicClock.now
         if recoverySearch,
            let match,
-           match.effectivePointCount >= 30 {
+           match.searchPerformed {
             // Ambiguous/mismatch searches still consume one valid attempt, but
             // nil and undersized observations never do.
             recoveryController.recordValidMatcherAttempt()
         }
+        let recoveryWallClockExpiredAfterMatch = recoverySearch
+            && recoveryController.isWallClockExpired(now: postMatchNow)
+        if recoveryWallClockExpiredAfterMatch {
+            recoveryCompletionForUpdate = finishRecovery(
+                outcome: .timedOut,
+                now: postMatchNow)
+            pendingRecoveryCompletion = nil
+            reason = "recovery_timed_out_after_match_deadline"
+        }
         if let floorEstimate = observation?.floorEstimate {
             latestFloorEstimate = floorEstimate
         }
-        let hypothesis = hypothesisTracker.observe(
-            arkitPose: arkitPose,
-            candidates: match?.candidates ?? [],
-            uniqueness: match?.uniqueness ?? 0,
-            recoverySearch: recoverySearch)
+        let hypothesis = recoveryCompletionForUpdate == nil
+            ? hypothesisTracker.observe(
+                arkitPose: arkitPose,
+                candidates: match?.candidates ?? [],
+                uniqueness: match?.uniqueness ?? 0,
+                recoverySearch: recoverySearch)
+            : nil
         var correctionTranslationM = 0.0
         var correctionYawDeg = 0.0
-        if let best = hypothesis.candidate,
-           let mapFromArkit = hypothesis.mapFromArkit {
+        if let best = hypothesis?.candidate,
+           let mapFromArkit = hypothesis?.mapFromArkit {
             // Reconstruct the target from the smoothed global alignment. The
             // latest scan-match candidate supplies geometry quality only; it
             // must not bypass temporal smoothing or turn invariance.
@@ -587,7 +659,15 @@ final class PriorMapStageOneLocalizer {
                     current: rawPose,
                     target: targetPose,
                     recoverySearch: recoverySearch)
-            if geometryAndSafetyAccepted, hypothesis.trusted {
+            decision = PriorMapRecoveryDecisionEngine.evaluate(
+                PriorMapRecoveryDecisionInput(
+                    recoveryActive: recoverySearch,
+                    hypothesisTrusted: hypothesis?.trusted ?? false,
+                    geometryAndSafetyAccepted: geometryAndSafetyAccepted,
+                    residualTranslationM: correction.translationM,
+                    residualYawRad: correction.yawRad,
+                    wallClockExpired: recoveryWallClockExpiredAfterMatch))
+            if decision.correctionStepApplied {
                 estimatedPose = PriorMapCorrectionSafety.boundedStep(
                     current: rawPose,
                     target: targetPose)
@@ -596,19 +676,23 @@ final class PriorMapStageOneLocalizer {
                 arkitOrigin = arkitPose
                 initialMapPose = estimatedPose
                 alignmentVersion += 1
-                accepted = true
                 if recoverySearch {
                     recoveryController.recordAcceptedCorrection()
                 }
-                consecutiveUntrustedFrames = 0
                 reason = recoverySearch
-                    ? "trusted_loop_or_lost_recovery_correction:\(activeRecoveryReason)"
+                    ? (decision.recoveryConvergedThisUpdate
+                        ? "recovery_converged:\(activeRecoveryReason)"
+                        : "provisional_recovery_step:\(activeRecoveryReason)")
                     : "trusted_structure_correction"
-                if recoverySearch,
-                   correction.translationM <= 0.5,
-                   correction.yawRad <= 10.0 * .pi / 180.0 {
+                if decision.recoveryConvergedThisUpdate {
                     recoveryCompletionForUpdate = finishRecovery(
-                        outcome: .converged)
+                        outcome: .converged,
+                        now: postMatchNow,
+                        selectedHypothesisId: hypothesis?.selectedHypothesisId,
+                        finalFreshSupportFrames: hypothesis?.supportFrames ?? 0,
+                        finalResidualTranslationM: correction.translationM,
+                        finalResidualYawRad: correction.yawRad,
+                        correctionStepAppliedOnCompletionFrame: true)
                     pendingRecoveryCompletion = nil
                 }
             }
@@ -622,7 +706,7 @@ final class PriorMapStageOneLocalizer {
                 reason = "correction_exceeds_safety_gate"
             }
             else {
-                reason = hypothesis.reason
+                reason = hypothesis?.reason ?? "no_hypothesis"
             }
         }
         else {
@@ -640,26 +724,57 @@ final class PriorMapStageOneLocalizer {
                 reason = "road_prior_display_only"
             }
         }
-        if !accepted {
-            consecutiveUntrustedFrames += 1
-        }
-        if recoveryController.isExpired(now: updateUptime) {
-            recoveryCompletionForUpdate = finishRecovery(outcome: .timedOut)
+        let attemptBudgetExhausted = recoverySearch
+            && recoveryController.activeEpisode?.remainingValidAttempts == 0
+        if attemptBudgetExhausted {
+            recoveryCompletionForUpdate = finishRecovery(
+                outcome: .timedOut,
+                now: postMatchNow,
+                selectedHypothesisId: hypothesis?.selectedHypothesisId,
+                finalFreshSupportFrames: hypothesis?.supportFrames ?? 0,
+                finalResidualTranslationM: correctionTranslationM,
+                finalResidualYawRad: correctionYawDeg * .pi / 180.0,
+                correctionStepAppliedOnCompletionFrame:
+                    decision.correctionStepApplied)
             pendingRecoveryCompletion = nil
-            if !accepted {
-                reason = "recovery_timed_out"
-            }
+            decision = PriorMapRecoveryDecision(
+                measurementAccepted: decision.measurementAccepted,
+                hypothesisTrusted: decision.hypothesisTrusted,
+                correctionStepApplied: decision.correctionStepApplied,
+                recoveryConvergedThisUpdate: false,
+                confidenceAccepted: false,
+                constraintDisposition: decision.correctionStepApplied
+                    ? .provisionalRecoveryStep : .rejected)
+            reason = decision.correctionStepApplied
+                ? "recovery_timed_out_after_bounded_step"
+                : "recovery_timed_out_attempt_budget"
+        }
+        if decision.confidenceAccepted {
+            consecutiveUntrustedFrames = 0
+        }
+        else {
+            consecutiveUntrustedFrames += 1
         }
         let residualCost = match?.candidates.first?.cost ?? 0.15
         let confidence = confidenceManager.update(
             timestamp: timestamp,
-            trackingState: trackingState,
-            accepted: accepted,
-            validPointCount: observation?.validPointCount ?? 0,
-            coverageAngleRad: observation?.coverageAngleRad ?? 0,
-            uniqueness: match?.uniqueness ?? 0,
-            residualCost: residualCost,
-            mapMismatch: match?.rejectionReason == "map_mismatch")
+            observation: PriorMapConfidenceObservation(
+                trackingState: trackingState,
+                measurementAccepted: decision.measurementAccepted,
+                correctionStepApplied: decision.correctionStepApplied,
+                recoveryActive: (recoverySearch
+                    || recoveryWasActiveAtUpdateStart)
+                    && !decision.recoveryConvergedThisUpdate,
+                recoveryConvergedThisUpdate:
+                    decision.recoveryConvergedThisUpdate,
+                recoveryFailedThisUpdate: recoveryCompletionForUpdate.map {
+                    $0.outcome != .converged
+                } ?? false,
+                validPointCount: observation?.validPointCount ?? 0,
+                coverageAngleRad: observation?.coverageAngleRad ?? 0,
+                uniqueness: match?.uniqueness ?? 0,
+                residualCost: residualCost,
+                mapMismatch: match?.rejectionReason == "map_mismatch"))
         latestEstimatedPose = estimatedPose
         latestConfidence = confidence.confidence
         latestPhase = confidence.phase
@@ -684,24 +799,37 @@ final class PriorMapStageOneLocalizer {
             matchUniqueness: match?.uniqueness ?? 0,
             matchResidualCost: match?.candidates.first?.cost,
             matcherElapsedMs: match?.elapsedMs ?? 0,
-            constraintAccepted: accepted,
+            constraintAccepted: decision.constraintDisposition == .acceptedLocal
+                || decision.constraintDisposition == .acceptedRecoveryConvergence,
             constraintReason: reason)
-        update.hypothesisSupportFrames = hypothesis.supportFrames
-        update.hypothesisScoreMargin = hypothesis.scoreMargin
+        update.measurementAccepted = decision.measurementAccepted
+        update.hypothesisTrusted = decision.hypothesisTrusted
+        update.correctionStepApplied = decision.correctionStepApplied
+        update.recoveryConvergedThisUpdate =
+            decision.recoveryConvergedThisUpdate
+        update.confidenceAccepted = decision.confidenceAccepted
+        update.constraintDisposition = decision.constraintDisposition
+        update.postRecoveryTrustedLocalFrames =
+            confidenceManager.postRecoveryTrustedLocalFrames
+        update.scanSearchPerformed = match?.searchPerformed ?? false
+        update.hypothesisSupportFrames = hypothesis?.supportFrames ?? 0
+        update.hypothesisScoreMargin = hypothesis?.scoreMargin ?? 0
         update.recoverySearch = recoverySearch
         update.correctionTranslationM = correctionTranslationM
         update.correctionYawDeg = correctionYawDeg
-        update.mapFromArkitX = hypothesis.mapFromArkit?.translationXM
-        update.mapFromArkitY = hypothesis.mapFromArkit?.translationYM
-        update.mapFromArkitYawDeg = hypothesis.mapFromArkit.map {
+        update.mapFromArkitX = hypothesis?.mapFromArkit?.translationXM
+        update.mapFromArkitY = hypothesis?.mapFromArkit?.translationYM
+        update.mapFromArkitYawDeg = hypothesis?.mapFromArkit.map {
             $0.yawRad * 180.0 / .pi
         }
-        update.selectedHypothesisId = hypothesis.selectedHypothesisId
-        update.activeHypothesisTrackCount = hypothesis.activeTrackCount
-        update.hypothesisBestCost = hypothesis.bestCost
-        update.hypothesisSecondCost = hypothesis.secondCost
-        update.hypothesisReason = hypothesis.reason
-        update.hypothesisTrackerElapsedMs = hypothesis.trackerElapsedMs
+        if recoveryCompletionForUpdate == nil {
+            update.selectedHypothesisId = hypothesis?.selectedHypothesisId
+            update.activeHypothesisTrackCount = hypothesis?.activeTrackCount ?? 0
+            update.hypothesisBestCost = hypothesis?.bestCost
+            update.hypothesisSecondCost = hypothesis?.secondCost
+            update.hypothesisReason = hypothesis?.reason ?? "no_hypothesis"
+            update.hypothesisTrackerElapsedMs = hypothesis?.trackerElapsedMs ?? 0
+        }
         let diagnosticEpisode = recoveryCompletionForUpdate?.episode
             ?? recoveryController.activeEpisode
         update.recoveryEpisodeId = diagnosticEpisode?.id
@@ -711,11 +839,27 @@ final class PriorMapStageOneLocalizer {
         update.recoveryValidAttemptCount = diagnosticEpisode?.validMatcherAttempts
         update.recoveryRemainingValidAttempts = diagnosticEpisode?.remainingValidAttempts
         update.recoveryElapsedMs = diagnosticEpisode.map {
-            max(0, updateUptime - $0.startedAtUptime) * 1000
+            max(0, postMatchNow - $0.startedAtUptime) * 1000
         }
-        update.recoveryFreshSupportFrames = recoverySearch
-            ? hypothesis.supportFrames : nil
+        update.recoveryFreshSupportFrames = recoveryCompletionForUpdate?
+            .finalFreshSupportFrames
+            ?? (recoverySearch ? hypothesis?.supportFrames : nil)
         update.recoveryTriggerCount = diagnosticEpisode?.triggerCount
+        update.recoveryFinishedAtUptime = recoveryCompletionForUpdate?
+            .finishedAtUptime
+        update.recoverySelectedHypothesisId = recoveryCompletionForUpdate?
+            .selectedHypothesisId
+        update.recoveryFinalResidualTranslationM = recoveryCompletionForUpdate?
+            .finalResidualTranslationM
+        update.recoveryFinalResidualYawDeg = recoveryCompletionForUpdate?
+            .finalResidualYawRad.map { $0 * 180.0 / .pi }
+        update.recoveryCorrectionStepAppliedOnCompletionFrame =
+            recoveryCompletionForUpdate?
+                .correctionStepAppliedOnCompletionFrame
+        update.recoveryCooldownRemainingMs = recoveryController
+            .automaticCooldownRemaining(now: postMatchNow) * 1000
+        update.recoveryAutomaticTriggerSuppressed = automaticTriggerSuppressed
+        update.recoveryAutomaticTriggerReason = automaticTriggerReason
         return update
     }
 
@@ -745,10 +889,13 @@ final class PriorMapStageOneLocalizer {
         latestConfidence = 0.35
         depthSampler.reset()
         if recoveryController.activeEpisode != nil {
-            _ = finishRecovery(outcome: .manualReset)
+            _ = finishRecovery(
+                outcome: .manualReset,
+                now: monotonicClock.now)
         }
         else {
             hypothesisTracker.reset()
+            recoveryController.resetAutomaticCooldownAfterManualCorrection()
         }
         consecutiveUntrustedFrames = 0
         return (arkitPose, mapPose)
@@ -1594,6 +1741,7 @@ final class PriorMapLiveMapView: UIView {
             "initializing": ("定位初始化中", UIColor.systemOrange),
             "stable": ("定位稳定", UIColor.systemGreen),
             "usable": ("定位可用", UIColor.systemBlue),
+            "recovering": ("正在恢复定位 Recovering", UIColor.systemOrange),
             "weak": ("定位较弱", UIColor.systemOrange),
             "lost": ("定位已丢失", UIColor.systemRed),
             "manualCorrection": ("人工修正后验证中", UIColor.systemOrange),

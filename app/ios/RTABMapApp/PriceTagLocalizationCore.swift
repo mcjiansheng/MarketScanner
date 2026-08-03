@@ -908,8 +908,10 @@ enum ShelfAssociation {
             let length = simd_length($0.end - $0.start)
             return $0.offsetM <= 0.05 || $0.offsetM >= max(0, length - 0.05)
         } ?? true
+        // Only ordinary Local evidence that has reached stable may authorize
+        // automatic confirmation. Recovery-active, just-converged/usable, and
+        // timed-out evidence always remains review-only.
         let stateAllowsAutomatic = localizationState == "stable"
-            || localizationState == "usable"
         let needsReview = !stateAllowsAutomatic
             || rawPosition == nil
             || rawPosition?.heightM == nil

@@ -652,6 +652,23 @@ def _validate_jsonl_business_record(
         confidence = _strict_number(value.get("confidence"))
         if confidence is None or not 0 <= confidence <= 1:
             raise OfflineLocalizationError(f"Invalid trace confidence at {line_label}")
+        disposition = _field(value, "constraint_disposition", "constraintDisposition")
+        accepted = _field(value, "constraint_accepted", "constraintAccepted")
+        if disposition is not None:
+            allowed = {
+                "rejected",
+                "provisional_recovery_step",
+                "accepted_local",
+                "accepted_recovery_convergence",
+            }
+            if disposition not in allowed:
+                raise OfflineLocalizationError(
+                    f"Invalid constraint disposition at {line_label}"
+                )
+            if disposition == "provisional_recovery_step" and accepted is not False:
+                raise OfflineLocalizationError(
+                    f"Provisional recovery step marked accepted at {line_label}"
+                )
     elif contract.name == "localization_constraints":
         if not isinstance(value.get("accepted"), bool):
             raise OfflineLocalizationError(f"Invalid constraint accepted flag at {line_label}")
@@ -664,6 +681,22 @@ def _validate_jsonl_business_record(
         uniqueness = _strict_number(value.get("uniqueness"))
         if uniqueness is None or not 0 <= uniqueness <= 1:
             raise OfflineLocalizationError(f"Invalid constraint uniqueness at {line_label}")
+        disposition = value.get("disposition")
+        if disposition is not None:
+            allowed = {
+                "rejected",
+                "provisional_recovery_step",
+                "accepted_local",
+                "accepted_recovery_convergence",
+            }
+            if disposition not in allowed:
+                raise OfflineLocalizationError(
+                    f"Invalid constraint disposition at {line_label}"
+                )
+            if disposition == "provisional_recovery_step" and value.get("accepted"):
+                raise OfflineLocalizationError(
+                    f"Provisional recovery step marked accepted at {line_label}"
+                )
     elif contract.name == "localization_events":
         state = value.get("state")
         confidence = _strict_number(value.get("confidence"))
