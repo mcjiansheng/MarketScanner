@@ -237,10 +237,67 @@ enum PriorMapStageOneMath {
     }
 }
 
+/// Owns the only mutable map/ARKit alignment anchor used by Stage One.
+/// Recovery hypothesis tracks may be cleared at any episode boundary without
+/// moving this anchor or reverting to a historical hypothesis.
+final class PriorMapLocalizationAnchor {
+    private(set) var arkitOrigin: PriorMapPose2D?
+    private(set) var initialMapPose: PriorMapPose2D
+
+    init(initialMapPose: PriorMapPose2D) {
+        self.initialMapPose = initialMapPose
+    }
+
+    func project(arkitPose: PriorMapPose2D) -> PriorMapPose2D {
+        if arkitOrigin == nil {
+            arkitOrigin = arkitPose
+        }
+        return PriorMapStageOneMath.project(
+            arkitPose: arkitPose,
+            arkitOrigin: arkitOrigin!,
+            initialMapPose: initialMapPose)
+    }
+
+    func retainAppliedCorrection(
+        arkitPose: PriorMapPose2D,
+        estimatedMapPose: PriorMapPose2D
+    ) {
+        arkitOrigin = arkitPose
+        initialMapPose = estimatedMapPose
+    }
+}
+
 enum PriorMapUpdateDecision: Equatable {
     case accepted(ticket: Int)
     case throttled
     case busy(droppedCount: Int)
+}
+
+enum PriorMapRecoveryFrameDisposition: String, Equatable {
+    case trackingLimited = "tracking_limited"
+    case noDepth = "no_depth"
+    case observationUnavailable = "observation_unavailable"
+    case insufficientPoints = "insufficient_points"
+    case busy
+    case throttled
+    case searched
+
+    var searchPerformed: Bool {
+        self == .searched
+    }
+}
+
+extension PriorMapUpdateDecision {
+    var recoveryFrameDisposition: PriorMapRecoveryFrameDisposition? {
+        switch self {
+        case .accepted:
+            return nil
+        case .throttled:
+            return .throttled
+        case .busy:
+            return .busy
+        }
+    }
 }
 
 enum PriorMapRecoveryOutcome: String, Equatable {
@@ -357,6 +414,33 @@ struct PriorMapRecoveryCompletion: Equatable {
     let correctionStepAppliedOnCompletionFrame: Bool
 }
 
+struct PriorMapHypothesisTraceBinding: Equatable {
+    let currentHypothesisVisible: Bool
+    let currentSelectedHypothesisId: Int?
+    let recoverySelectedHypothesisId: Int?
+}
+
+/// Keeps immutable Recovery completion evidence separate from any Local
+/// candidate observed on the same frame. A completion frame never exposes the
+/// new candidate through the flat/current hypothesis fields.
+enum PriorMapHypothesisTraceBinder {
+    static func bind(
+        completion: PriorMapRecoveryCompletion?,
+        currentSelectedHypothesisId: Int?
+    ) -> PriorMapHypothesisTraceBinding {
+        guard let completion else {
+            return PriorMapHypothesisTraceBinding(
+                currentHypothesisVisible: true,
+                currentSelectedHypothesisId: currentSelectedHypothesisId,
+                recoverySelectedHypothesisId: nil)
+        }
+        return PriorMapHypothesisTraceBinding(
+            currentHypothesisVisible: false,
+            currentSelectedHypothesisId: nil,
+            recoverySelectedHypothesisId: completion.selectedHypothesisId)
+    }
+}
+
 /// Owns the bounded lifetime of one Recovery search. Frame availability is
 /// deliberately outside this type: callers record an attempt only after the
 /// matcher received its minimum valid input and actually searched the map.
@@ -426,6 +510,17 @@ final class PriorMapRecoveryController {
         episode.validMatcherAttempts += 1
         activeEpisode = episode
         return true
+    }
+
+    /// The single attempt-accounting reducer shared by production and tests.
+    /// Only a matcher-owned `searched` disposition consumes the bounded budget;
+    /// all unavailable, dropped, or undersized frames consume wall time only.
+    @discardableResult
+    func recordFrameDisposition(
+        _ disposition: PriorMapRecoveryFrameDisposition
+    ) -> Bool {
+        guard disposition.searchPerformed else { return false }
+        return recordValidMatcherAttempt()
     }
 
     func recordAcceptedCorrection() {

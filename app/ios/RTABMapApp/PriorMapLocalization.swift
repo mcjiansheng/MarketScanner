@@ -369,11 +369,10 @@ private struct PriorMapProjectedCandidate {
 
 final class PriorMapStageOneLocalizer {
     private let floorId: String
-    private var initialMapPose: PriorMapPose2D
+    private let alignmentAnchor: PriorMapLocalizationAnchor
     private let segmentsById: [String: PriorMapRoadSegment]
     private let roadCells: [String: [String]]
     private let cellSizeM: Double
-    private var arkitOrigin: PriorMapPose2D?
     private let softGain = 0.15
     private let maximumCorrectionM = 0.25
     private let ambiguityMarginM = 0.35
@@ -403,7 +402,8 @@ final class PriorMapStageOneLocalizer {
         monotonicClock: PriorMapMonotonicClock = PriorMapSystemMonotonicClock()
     ) throws {
         self.floorId = floorId
-        self.initialMapPose = initialMapPose
+        self.alignmentAnchor = PriorMapLocalizationAnchor(
+            initialMapPose: initialMapPose)
         self.monotonicClock = monotonicClock
         self.latestEstimatedPose = initialMapPose
         self.priorMapId = package.manifest.priorMapId
@@ -512,14 +512,7 @@ final class PriorMapStageOneLocalizer {
         let transform = frame.camera.transform
         let timestamp = frame.timestamp
         let arkitPose = Self.pose(from: transform)
-        if arkitOrigin == nil {
-            arkitOrigin = arkitPose
-        }
-        let origin = arkitOrigin!
-        let rawPose = PriorMapStageOneMath.project(
-            arkitPose: arkitPose,
-            arkitOrigin: origin,
-            initialMapPose: initialMapPose)
+        let rawPose = alignmentAnchor.project(arkitPose: arkitPose)
         let projected = SIMD2<Double>(rawPose.xM, rawPose.yM)
         var candidates: [PriorMapProjectedCandidate] = []
         for segment in nearbySegments(projected) {
@@ -569,9 +562,15 @@ final class PriorMapStageOneLocalizer {
         var reason = trackingState == "normal"
             ? "structure_depth_unavailable"
             : "tracking_not_normal"
-        let observation = trackingState == "normal"
-            ? depthSampler.sample(frame: frame)
+        let depthSample = trackingState == "normal"
+            ? depthSampler.sampleResult(frame: frame)
             : nil
+        let observation = depthSample?.structureObservation
+        var recoveryFrameDisposition: PriorMapRecoveryFrameDisposition =
+            trackingState == "normal"
+                ? (depthSample?.recoveryFrameDisposition
+                    ?? .observationUnavailable)
+                : .trackingLimited
         let preMatchNow = monotonicClock.now
         let recoveryWasActiveAtUpdateStart = recoveryController.activeEpisode != nil
         var recoveryCompletionForUpdate = pendingRecoveryCompletion
@@ -609,13 +608,16 @@ final class PriorMapStageOneLocalizer {
                 observation: $0,
                 recoverySearch: recoverySearch)
         } : nil
+        if let match {
+            recoveryFrameDisposition = match.searchPerformed
+                ? .searched : .insufficientPoints
+        }
         let postMatchNow = monotonicClock.now
-        if recoverySearch,
-           let match,
-           match.searchPerformed {
+        if recoverySearch {
             // Ambiguous/mismatch searches still consume one valid attempt, but
-            // nil and undersized observations never do.
-            recoveryController.recordValidMatcherAttempt()
+            // unavailable, dropped, and undersized frames consume wall time only.
+            recoveryController.recordFrameDisposition(
+                recoveryFrameDisposition)
         }
         let recoveryWallClockExpiredAfterMatch = recoverySearch
             && recoveryController.isWallClockExpired(now: postMatchNow)
@@ -673,8 +675,9 @@ final class PriorMapStageOneLocalizer {
                     target: targetPose)
                 // Move only the map/ARKit alignment anchor. ARKit world
                 // tracking and the scan database are never reset.
-                arkitOrigin = arkitPose
-                initialMapPose = estimatedPose
+                alignmentAnchor.retainAppliedCorrection(
+                    arkitPose: arkitPose,
+                    estimatedMapPose: estimatedPose)
                 alignmentVersion += 1
                 if recoverySearch {
                     recoveryController.recordAcceptedCorrection()
@@ -822,8 +825,12 @@ final class PriorMapStageOneLocalizer {
         update.mapFromArkitYawDeg = hypothesis?.mapFromArkit.map {
             $0.yawRad * 180.0 / .pi
         }
-        if recoveryCompletionForUpdate == nil {
-            update.selectedHypothesisId = hypothesis?.selectedHypothesisId
+        let hypothesisTraceBinding = PriorMapHypothesisTraceBinder.bind(
+            completion: recoveryCompletionForUpdate,
+            currentSelectedHypothesisId: hypothesis?.selectedHypothesisId)
+        if hypothesisTraceBinding.currentHypothesisVisible {
+            update.selectedHypothesisId =
+                hypothesisTraceBinding.currentSelectedHypothesisId
             update.activeHypothesisTrackCount = hypothesis?.activeTrackCount ?? 0
             update.hypothesisBestCost = hypothesis?.bestCost
             update.hypothesisSecondCost = hypothesis?.secondCost
@@ -847,8 +854,8 @@ final class PriorMapStageOneLocalizer {
         update.recoveryTriggerCount = diagnosticEpisode?.triggerCount
         update.recoveryFinishedAtUptime = recoveryCompletionForUpdate?
             .finishedAtUptime
-        update.recoverySelectedHypothesisId = recoveryCompletionForUpdate?
-            .selectedHypothesisId
+        update.recoverySelectedHypothesisId = hypothesisTraceBinding
+            .recoverySelectedHypothesisId
         update.recoveryFinalResidualTranslationM = recoveryCompletionForUpdate?
             .finalResidualTranslationM
         update.recoveryFinalResidualYawDeg = recoveryCompletionForUpdate?
@@ -864,10 +871,10 @@ final class PriorMapStageOneLocalizer {
     }
 
     func alignmentSnapshot(frameTimestamp: TimeInterval) -> PriorMapAlignmentSnapshot? {
-        guard let arkitOrigin else { return nil }
+        guard let arkitOrigin = alignmentAnchor.arkitOrigin else { return nil }
         return PriorMapAlignmentSnapshot(
             arkitOrigin: arkitOrigin,
-            initialMapPose: initialMapPose,
+            initialMapPose: alignmentAnchor.initialMapPose,
             floorEstimate: latestFloorEstimate,
             localizationState: latestPhase.rawValue,
             localizationConfidence: latestConfidence,
@@ -880,8 +887,9 @@ final class PriorMapStageOneLocalizer {
         mapPose: PriorMapPose2D
     ) -> (PriorMapPose2D, PriorMapPose2D) {
         let arkitPose = Self.pose(from: transform)
-        arkitOrigin = arkitPose
-        initialMapPose = mapPose
+        alignmentAnchor.retainAppliedCorrection(
+            arkitPose: arkitPose,
+            estimatedMapPose: mapPose)
         alignmentVersion += 1
         latestEstimatedPose = mapPose
         confidenceManager.reset(manual: true)

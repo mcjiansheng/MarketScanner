@@ -16,6 +16,26 @@ private struct PriorMapWorldVoxel: Hashable {
     let z: Int
 }
 
+enum PriorMapDepthSampleResult {
+    case noDepth
+    case observationUnavailable
+    case observation(PriorMapStructureObservation)
+
+    var structureObservation: PriorMapStructureObservation? {
+        guard case .observation(let value) = self else { return nil }
+        return value
+    }
+
+    var recoveryFrameDisposition: PriorMapRecoveryFrameDisposition {
+        switch self {
+        case .noDepth:
+            return .noDepth
+        case .observationUnavailable, .observation:
+            return .observationUnavailable
+        }
+    }
+}
+
 final class PriorMapDepthSampler {
     private let maximumOutputPoints = 1_200
     private let maximumHistoryVoxels = 8_000
@@ -32,15 +52,19 @@ final class PriorMapDepthSampler {
     }
 
     func sample(frame: ARFrame) -> PriorMapStructureObservation? {
+        sampleResult(frame: frame).structureObservation
+    }
+
+    func sampleResult(frame: ARFrame) -> PriorMapDepthSampleResult {
         let usesSmoothedDepth = frame.smoothedSceneDepth != nil
         guard let sceneDepth = frame.smoothedSceneDepth ?? frame.sceneDepth else {
-            return nil
+            return .noDepth
         }
         let depthMap = sceneDepth.depthMap
         let confidenceMap = sceneDepth.confidenceMap
         let width = CVPixelBufferGetWidth(depthMap)
         let height = CVPixelBufferGetHeight(depthMap)
-        guard width > 1, height > 1 else { return nil }
+        guard width > 1, height > 1 else { return .observationUnavailable }
         CVPixelBufferLockBaseAddress(depthMap, .readOnly)
         if let confidenceMap = confidenceMap {
             CVPixelBufferLockBaseAddress(confidenceMap, .readOnly)
@@ -52,7 +76,7 @@ final class PriorMapDepthSampler {
             CVPixelBufferUnlockBaseAddress(depthMap, .readOnly)
         }
         guard let depthBase = CVPixelBufferGetBaseAddress(depthMap) else {
-            return nil
+            return .observationUnavailable
         }
         let depthStride = CVPixelBufferGetBytesPerRow(depthMap) / MemoryLayout<Float32>.stride
         let confidenceStride = confidenceMap.map {
@@ -67,7 +91,7 @@ final class PriorMapDepthSampler {
         let fy = intrinsics[1, 1] * scaleY
         let cx = intrinsics[2, 0] * scaleX
         let cy = intrinsics[2, 1] * scaleY
-        guard fx > 0, fy > 0 else { return nil }
+        guard fx > 0, fy > 0 else { return .observationUnavailable }
 
         frameIndex += 1
         let step = max(1, Int(sqrt(Double(width * height) / 3_600.0)))
@@ -206,20 +230,20 @@ final class PriorMapDepthSampler {
                     uniqueKeysWithValues: newest.map { ($0.key, $0.value) })
             }
         }
-        guard !candidates.isEmpty else { return nil }
+        guard !candidates.isEmpty else { return .observationUnavailable }
         let outputStride = max(1, candidates.count / maximumOutputPoints)
         let output = candidates.enumerated().compactMap {
             $0.offset % outputStride == 0 ? $0.element : nil
         }
         let angles = output.map(\.angle)
         let floorEstimate = floorEstimator.update(samples: floorCandidates)
-        return PriorMapStructureObservation(
+        return .observation(PriorMapStructureObservation(
             points: output.map(\.point),
             validPointCount: output.count,
             coverageAngleRad: max(0, (angles.max() ?? 0) - (angles.min() ?? 0)),
             floorEstimate: floorEstimate,
             source: usesSmoothedDepth
                 ? "smoothed_scene_depth"
-                : "scene_depth")
+                : "scene_depth"))
     }
 }
