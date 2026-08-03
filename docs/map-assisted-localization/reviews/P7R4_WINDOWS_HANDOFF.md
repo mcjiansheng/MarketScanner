@@ -1,6 +1,6 @@
 # P7R4 Windows-to-macOS handoff
 
-> Production implementation SHA: `14f2b45fb23b9485e1065d1faf572de51dfae909`
+> Production implementation SHA: `218f3ef69a5b68e3e317a4300ed76dd606cb531e`
 > Branch: `repair-v2-p7r4-recovery-confidence-closeout`
 > Cloud base: `repair-v2-p7r3-recovery-episode-closeout@998c175e40562fffd85fe45579a358c485a65b30`
 > Windows decision: **IMPLEMENTED / FOCUSED AUTOMATED TESTED — DEFERRED_MACOS_EXECUTION**
@@ -32,7 +32,7 @@
 | Post-review source contracts | PASS, 15/15 |
 | Post-review Stage3 executable assertions | 54 PASS; 1 ERROR before assertion (`WinError 1314` symlink fixture) |
 
-The first independent read-only review rejected the earlier test-only evidence because T10/T11/T12/T14 did not exercise the required integration boundaries. Production implementation `14f2b45fb23b9485e1065d1faf572de51dfae909` and test commit `e6c2959f7eae3b0b9feb81b35ce5364effbcaca1` close those specific gaps. A new exact-final-SHA CI run and independent re-review are mandatory; the earlier green run cannot qualify this newer SHA.
+The first independent read-only review rejected the earlier test-only evidence because T10/T11/T12/T14 did not exercise the required integration boundaries. Production implementation `14f2b45fb23b9485e1065d1faf572de51dfae909` and test commit `e6c2959f7eae3b0b9feb81b35ce5364effbcaca1` closed those gaps. The second review then rejected missing end-to-end timeout/weak/cooldown state paths. Final production implementation `218f3ef69a5b68e3e317a4300ed76dd606cb531e` and test commit `90d0b5c48cec25d06d3cc7a48979ee2eb2b0e0e9` route T5/T6/T8/T12 through the same update reducer as `update(frame:)`. A new exact-final-SHA CI run and independent re-review are mandatory; earlier green runs cannot qualify this newer SHA.
 
 ## Required Apple/CI validation
 
