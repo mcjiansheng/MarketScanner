@@ -736,7 +736,7 @@ struct PriorMapConfidenceObservation {
     let recoveryActive: Bool
     let recoveryConvergedThisUpdate: Bool
     let recoveryFailedThisUpdate: Bool
-    let recoveryCooldownActive: Bool = false
+    let recoveryCooldownActive: Bool
     let validPointCount: Int
     let coverageAngleRad: Double
     let uniqueness: Double
