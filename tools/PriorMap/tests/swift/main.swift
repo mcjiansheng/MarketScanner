@@ -765,36 +765,51 @@ let confidenceManager = PriorMapConfidenceManager()
 confidenceManager.reset()
 let initializing = confidenceManager.update(
     timestamp: 1,
-    trackingState: "normal",
-    accepted: false,
-    validPointCount: 0,
-    coverageAngleRad: 0,
-    uniqueness: 0,
-    residualCost: 0.15,
-    mapMismatch: false)
+    observation: PriorMapConfidenceObservation(
+        trackingState: "normal",
+        measurementAccepted: false,
+        correctionStepApplied: false,
+        recoveryActive: false,
+        recoveryConvergedThisUpdate: false,
+        recoveryFailedThisUpdate: false,
+        validPointCount: 0,
+        coverageAngleRad: 0,
+        uniqueness: 0,
+        residualCost: 0.15,
+        mapMismatch: false))
 require(initializing.phase == .initializing, "first unmatched frame must stay initializing")
 confidenceManager.reset()
 for timestamp in 1...3 {
     _ = confidenceManager.update(
         timestamp: Double(timestamp),
-        trackingState: "normal",
-        accepted: true,
-        validPointCount: 100,
-        coverageAngleRad: 1.2,
-        uniqueness: 0.3,
-        residualCost: 0.02,
-        mapMismatch: false)
+        observation: PriorMapConfidenceObservation(
+            trackingState: "normal",
+            measurementAccepted: true,
+            correctionStepApplied: true,
+            recoveryActive: false,
+            recoveryConvergedThisUpdate: false,
+            recoveryFailedThisUpdate: false,
+            validPointCount: 100,
+            coverageAngleRad: 1.2,
+            uniqueness: 0.3,
+            residualCost: 0.02,
+            mapMismatch: false))
 }
 require(confidenceManager.phase == .stable, "three trusted observations must enter stable")
 let weak = confidenceManager.update(
     timestamp: 4,
-    trackingState: "limited",
-    accepted: false,
-    validPointCount: 40,
-    coverageAngleRad: 0.2,
-    uniqueness: 0,
-    residualCost: 0.15,
-    mapMismatch: false)
+    observation: PriorMapConfidenceObservation(
+        trackingState: "limited",
+        measurementAccepted: false,
+        correctionStepApplied: false,
+        recoveryActive: false,
+        recoveryConvergedThisUpdate: false,
+        recoveryFailedThisUpdate: false,
+        validPointCount: 40,
+        coverageAngleRad: 0.2,
+        uniqueness: 0,
+        residualCost: 0.15,
+        mapMismatch: false))
 require(weak.phase == .weak, "limited tracking must degrade to weak")
 
 func requirePoseClose(
@@ -1174,7 +1189,7 @@ let localAfterTimeout = hypothesisTracker.observe(
     recoverySearch: false)
 require(!localAfterTimeout.trusted && localAfterTimeout.supportFrames == 1,
         "R6 local mode must not inherit a timed-out wide-search track")
-_ = recoveryController.finish(.manualReset)
+_ = recoveryController.finish(.manualReset, now: 112)
 require(recoveryController.activeEpisode == nil,
         "R10 manual reset must terminate the active episode")
 
@@ -1207,7 +1222,7 @@ for validAttempt in 1...40 {
         if residual.translationM <= 0.5,
            residual.yawRad <= 10 * .pi / 180 {
             worstPathController.recordAcceptedCorrection()
-            _ = worstPathController.finish(.converged)
+            _ = worstPathController.finish(.converged, now: 220)
             break
         }
     }
@@ -1220,6 +1235,191 @@ require(maximumStepTranslation <= 0.35 + 1.0e-9,
         "R8 no Recovery translation step may exceed 0.35 m")
 require(maximumStepYaw <= 8 * .pi / 180 + 1.0e-9,
         "R8 no Recovery yaw step may exceed 8 degrees")
+
+// P7R4 T1/T2: accepting a 5 m Recovery hypothesis applies only a bounded,
+// provisional step. It cannot become confidence-bearing or formally accepted.
+let intermediateRecovery = PriorMapRecoveryDecisionEngine.evaluate(
+    PriorMapRecoveryDecisionInput(
+        recoveryActive: true,
+        hypothesisTrusted: true,
+        geometryAndSafetyAccepted: true,
+        residualTranslationM: 5,
+        residualYawRad: 30 * .pi / 180,
+        wallClockExpired: false))
+require(intermediateRecovery.measurementAccepted,
+        "P7R4 T1 trusted Recovery measurement must remain observable")
+require(intermediateRecovery.correctionStepApplied,
+        "P7R4 T1 one bounded Recovery step may be applied")
+require(!intermediateRecovery.recoveryConvergedThisUpdate,
+        "P7R4 T1 a 5 m residual cannot be converged")
+require(!intermediateRecovery.confidenceAccepted,
+        "P7R4 T1 an intermediate Recovery step cannot raise confidence")
+require(intermediateRecovery.constraintDisposition == .provisionalRecoveryStep,
+        "P7R4 T1 an intermediate step must be provisional")
+
+let recoveryConfidence = PriorMapConfidenceManager()
+recoveryConfidence.reset()
+for timestamp in 1...10 {
+    let result = recoveryConfidence.update(
+        timestamp: Double(timestamp),
+        observation: PriorMapConfidenceObservation(
+            trackingState: "normal",
+            measurementAccepted: true,
+            correctionStepApplied: true,
+            recoveryActive: true,
+            recoveryConvergedThisUpdate: false,
+            recoveryFailedThisUpdate: false,
+            validPointCount: 120,
+            coverageAngleRad: 1.4,
+            uniqueness: 0.5,
+            residualCost: 0.01,
+            mapMismatch: false))
+    require(result.phase == .recovering,
+            "P7R4 T2 every intermediate step must remain recovering")
+    require(result.confidence <= 0.55,
+            "P7R4 T2 Recovery confidence must stay capped")
+}
+
+// P7R4 T3/T4: convergence is at most usable, followed by three ordinary
+// trusted Local observations; any rejection resets that post-Recovery gate.
+let convergedRecovery = PriorMapRecoveryDecisionEngine.evaluate(
+    PriorMapRecoveryDecisionInput(
+        recoveryActive: true,
+        hypothesisTrusted: true,
+        geometryAndSafetyAccepted: true,
+        residualTranslationM: 0.5,
+        residualYawRad: 10 * .pi / 180,
+        wallClockExpired: false))
+require(convergedRecovery.recoveryConvergedThisUpdate,
+        "P7R4 T3 inclusive convergence thresholds must converge")
+let convergenceConfidence = recoveryConfidence.update(
+    timestamp: 11,
+    observation: PriorMapConfidenceObservation(
+        trackingState: "normal",
+        measurementAccepted: true,
+        correctionStepApplied: true,
+        recoveryActive: false,
+        recoveryConvergedThisUpdate: true,
+        recoveryFailedThisUpdate: false,
+        validPointCount: 120,
+        coverageAngleRad: 1.4,
+        uniqueness: 0.5,
+        residualCost: 0.01,
+        mapMismatch: false))
+require(convergenceConfidence.phase == .usable,
+        "P7R4 T3 convergence frame must not be stable")
+
+func trustedLocalObservation(_ accepted: Bool = true) -> PriorMapConfidenceObservation {
+    PriorMapConfidenceObservation(
+        trackingState: "normal",
+        measurementAccepted: accepted,
+        correctionStepApplied: accepted,
+        recoveryActive: false,
+        recoveryConvergedThisUpdate: false,
+        recoveryFailedThisUpdate: false,
+        validPointCount: accepted ? 120 : 0,
+        coverageAngleRad: accepted ? 1.4 : 0,
+        uniqueness: accepted ? 0.5 : 0,
+        residualCost: accepted ? 0.01 : 0.15,
+        mapMismatch: false)
+}
+_ = recoveryConfidence.update(
+    timestamp: 12, observation: trustedLocalObservation())
+_ = recoveryConfidence.update(
+    timestamp: 13, observation: trustedLocalObservation())
+let rejectedPostRecovery = recoveryConfidence.update(
+    timestamp: 14, observation: trustedLocalObservation(false))
+require(rejectedPostRecovery.phase != .stable
+        && recoveryConfidence.postRecoveryTrustedLocalFrames == 0,
+        "P7R4 T4 rejection must reset post-Recovery Local trust")
+for timestamp in 15...16 {
+    let result = recoveryConfidence.update(
+        timestamp: Double(timestamp), observation: trustedLocalObservation())
+    require(result.phase != .stable,
+            "P7R4 T4 fewer than three fresh Local frames cannot be stable")
+}
+let stableAfterRecovery = recoveryConfidence.update(
+    timestamp: 17, observation: trustedLocalObservation())
+require(stableAfterRecovery.phase == .stable,
+        "P7R4 T4 three consecutive ordinary Local frames may restore stable")
+
+// P7R4 T5: a safe final-attempt step remains provisional when the episode
+// times out; immutable completion evidence preserves the episode hypothesis.
+let finalAttemptController = PriorMapRecoveryController(
+    maximumValidAttempts: 40,
+    maximumWallClockSeconds: 30)
+_ = finalAttemptController.request(reason: "persistent_weak_or_lost", now: 0,
+                                   automatic: true)
+for _ in 0..<40 { finalAttemptController.recordValidMatcherAttempt() }
+require(finalAttemptController.isExpired(now: 10),
+        "P7R4 T5 attempt 40/40 must expire the episode")
+let finalAttemptCompletion = finalAttemptController.finish(
+    .timedOut,
+    now: 10,
+    selectedHypothesisId: 77,
+    finalFreshSupportFrames: 4,
+    finalResidualTranslationM: 4.2,
+    finalResidualYawRad: 0.2,
+    correctionStepAppliedOnCompletionFrame: true)
+require(finalAttemptCompletion?.outcome == .timedOut
+        && finalAttemptCompletion?.correctionStepAppliedOnCompletionFrame == true,
+        "P7R4 T5 timeout must not reinterpret a provisional step as success")
+require(finalAttemptCompletion?.selectedHypothesisId == 77,
+        "P7R4 T10 completion must bind the episode hypothesis")
+
+final class FakeMonotonicClock: PriorMapMonotonicClock {
+    var now: TimeInterval
+    init(_ now: TimeInterval) { self.now = now }
+}
+
+// P7R4 T6/T7: a matcher crossing the deadline records a real attempt but the
+// post-match decision cannot mutate the alignment. Equality is expired too.
+let fakeClock = FakeMonotonicClock(0)
+let deadlineController = PriorMapRecoveryController(
+    maximumValidAttempts: 40,
+    maximumWallClockSeconds: 30)
+_ = deadlineController.request(reason: "deadline", now: fakeClock.now)
+fakeClock.now = 29.8
+require(!deadlineController.isWallClockExpired(now: fakeClock.now),
+        "P7R4 T6 matcher may start before deadline")
+fakeClock.now = 31.3
+deadlineController.recordValidMatcherAttempt()
+let expiredDecision = PriorMapRecoveryDecisionEngine.evaluate(
+    PriorMapRecoveryDecisionInput(
+        recoveryActive: true,
+        hypothesisTrusted: true,
+        geometryAndSafetyAccepted: true,
+        residualTranslationM: 1,
+        residualYawRad: 0,
+        wallClockExpired: deadlineController.isWallClockExpired(
+            now: fakeClock.now)))
+require(deadlineController.activeEpisode?.validMatcherAttempts == 1,
+        "P7R4 T6 a deadline-crossing real search still counts")
+require(!expiredDecision.correctionStepApplied,
+        "P7R4 T6 no post-deadline Recovery correction may be applied")
+require(deadlineController.isWallClockExpired(now: 30),
+        "P7R4 T7 now equal to deadline must be expired")
+
+// P7R4 T8/T9: automatic timeout creates a bounded cooldown. A reliable loop
+// may bypass it, while a repeated trigger only merges into the active episode.
+let cooldownController = PriorMapRecoveryController()
+_ = cooldownController.request(
+    reason: "persistent_weak_or_lost", now: 100, automatic: true)
+_ = cooldownController.finish(.timedOut, now: 130)
+require(!cooldownController.request(
+    reason: "persistent_weak_or_lost", now: 149, automatic: true),
+    "P7R4 T8 automatic Recovery must be suppressed during cooldown")
+require(cooldownController.isAutomaticTriggerSuppressed(now: 149),
+        "P7R4 T8 cooldown suppression must be diagnostic")
+require(cooldownController.request(reason: "reliable_rtabmap_loop", now: 149),
+        "P7R4 T9 reliable loop may bypass automatic cooldown")
+let bypassEpisode = cooldownController.activeEpisode!
+require(!cooldownController.request(reason: "reliable_rtabmap_loop", now: 150),
+        "P7R4 T9 an active loop trigger must merge")
+require(cooldownController.activeEpisode?.id == bypassEpisode.id
+        && cooldownController.activeEpisode?.deadlineUptime
+            == bypassEpisode.deadlineUptime,
+        "P7R4 T9 merged trigger must not reset identity or deadline")
 
 // T11: deterministic randomized reconstruction, including arbitrary turns.
 var randomState: UInt64 = 0x5eed5eed
@@ -1328,6 +1528,21 @@ let localized = ShelfAssociation.localizedTag(
 require(localized.shelfCode == "S1", "tag must associate with the expected shelf")
 require(localized.distanceFromShelfStartCm != nil, "tag must retain along-shelf offset")
 require(localized.heightCm == 140, "tag height must be expressed in centimetres")
+let justConvergedUsableTag = ShelfAssociation.localizedTag(
+    observationId: "just-converged",
+    payload: "6900000000001",
+    symbology: "EAN13",
+    floorId: "1",
+    rawPosition: PriorMapTagPoint3D(xM: 2, yM: -0.1, heightM: 1.4),
+    cameraPosition: SIMD2<Double>(2, -2),
+    shelves: [shelf],
+    localizationState: "usable",
+    localizationConfidence: 0.79,
+    measurementConfidence: 0.9,
+    measurementMethod: "scene_depth",
+    userConfirmed: false)
+require(justConvergedUsableTag.needsReview,
+        "P7R4 T14 usable/just-converged tags cannot auto-confirm")
 
 let oppositeSide = ShelfAssociation.localizedTag(
     observationId: "opposite",
@@ -1597,6 +1812,30 @@ do {
     require(
         periodic.uniqueness < 0.10,
         "uniqueness must compare independent global basins")
+    let points29 = PriorMapStructureObservation(
+        points: Array(observation.points.prefix(29)),
+        validPointCount: 29,
+        coverageAngleRad: 1.2,
+        floorEstimate: nil,
+        source: "test")
+    let points30 = PriorMapStructureObservation(
+        points: Array(observation.points.prefix(30)),
+        validPointCount: 30,
+        coverageAngleRad: 1.2,
+        floorEstimate: nil,
+        source: "test")
+    let notSearched = periodicMatcher.match(
+        predictedPose: PriorMapPose2D(xM: 0.3, yM: 0, yawRad: 0),
+        observation: points29)
+    let searched = periodicMatcher.match(
+        predictedPose: PriorMapPose2D(xM: 0.3, yM: 0, yawRad: 0),
+        observation: points30)
+    require(!notSearched.searchPerformed
+        && notSearched.attemptDisposition == .notSearchedInsufficientPoints,
+        "P7R4 T13 29 points must not report a real search")
+    require(searched.searchPerformed
+        && searched.attemptDisposition == .searched,
+        "P7R4 T13 30 points must use the matcher-owned threshold")
 }
 catch {
     require(false, "periodic matcher fixture must load: \(error)")

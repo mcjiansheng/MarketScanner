@@ -45,10 +45,12 @@ class IOSLocalizationSidecarHealthContractTests(unittest.TestCase):
             self.assertIn(token, view)
         self.assertIn("PriorMapRecoveryController", core + overlay)
         self.assertIn("beginRecoveryEpisode(id: episode.id)", overlay)
-        self.assertIn("match.effectivePointCount >= 30", overlay)
+        self.assertIn("match.searchPerformed", overlay)
+        self.assertIn("minimumSearchPointCount = 30", matcher)
         self.assertIn("recoveryController.recordValidMatcherAttempt()", overlay)
         self.assertNotIn("recoveryFramesRemaining", overlay)
-        self.assertIn("correction.translationM <= 0.5", overlay)
+        self.assertIn("PriorMapRecoveryDecisionEngine.evaluate", overlay)
+        self.assertIn("convergenceTranslationM = 0.5", core)
         self.assertIn("guard hits >= 4, frameIndex - firstFrame >= 3", depth)
         for token in (
             "PriorMapAlignmentTransform",
@@ -94,11 +96,13 @@ class IOSLocalizationSidecarHealthContractTests(unittest.TestCase):
         ):
             self.assertIn(token, matcher)
         for token in (
-            "finishRecovery(outcome: .timedOut)",
+            "outcome: .timedOut",
             "outcome: .converged",
-            "finishRecovery(outcome: .manualReset)",
+            "outcome: .manualReset",
             "recoveryValidAttemptCount",
             "recoveryFreshSupportFrames",
+            "recoveryFinishedAtUptime",
+            "recoverySelectedHypothesisId",
         ):
             self.assertIn(token, overlay)
 

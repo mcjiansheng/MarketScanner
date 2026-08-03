@@ -11,9 +11,11 @@ from pathlib import Path
 from unittest import mock
 
 from tools.PriorMap.offline_localization import (
+    CONSTRAINT_CONTRACT,
     DEFAULT_REPLAY_PARAMETERS,
     Pose,
     OfflineLocalizationError,
+    _validate_jsonl_business_record,
     _associate_tag,
     _segment_intersection,
     apply_pose_delta_to_point,
@@ -52,6 +54,28 @@ def jsonl_write(path: Path, values: list[dict[str, object]]) -> None:
         "".join(json.dumps(value, sort_keys=True) + "\n" for value in values),
         encoding="utf-8",
     )
+
+
+class RecoveryConstraintDispositionTests(unittest.TestCase):
+    def test_pc_reader_rejects_provisional_step_marked_formally_accepted(self) -> None:
+        record = {
+            "timestamp": 1.0,
+            "nodeTimebaseTimestamp": 1.0,
+            "nodeTimebaseOffsetSeconds": 0.0,
+            "accepted": True,
+            "disposition": "provisional_recovery_step",
+            "predictedPose": {"x_m": 0.0, "y_m": 0.0, "yaw_rad": 0.0},
+            "estimatedPose": {"x_m": 0.35, "y_m": 0.0, "yaw_rad": 0.0},
+            "uniqueness": 0.5,
+        }
+        with self.assertRaisesRegex(
+            OfflineLocalizationError, "Provisional recovery step marked accepted"
+        ):
+            _validate_jsonl_business_record(
+                CONSTRAINT_CONTRACT, record, "constraint:1"
+            )
+        record["accepted"] = False
+        _validate_jsonl_business_record(CONSTRAINT_CONTRACT, record, "constraint:1")
 
 
 class SE2TagPropagationTests(unittest.TestCase):
