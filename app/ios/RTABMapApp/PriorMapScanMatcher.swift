@@ -736,6 +736,7 @@ struct PriorMapConfidenceObservation {
     let recoveryActive: Bool
     let recoveryConvergedThisUpdate: Bool
     let recoveryFailedThisUpdate: Bool
+    let recoveryCooldownActive: Bool = false
     let validPointCount: Int
     let coverageAngleRad: Double
     let uniqueness: Double
@@ -771,6 +772,19 @@ final class PriorMapConfidenceManager {
             return PriorMapConfidenceResult(phase: phase, confidence: 0)
         }
         if observation.recoveryFailedThisUpdate {
+            phase = .weak
+            consecutiveTrusted = 0
+            consecutiveRejected += 1
+            postRecoveryTrustedLocalFrames = 0
+            return PriorMapConfidenceResult(
+                phase: phase,
+                confidence: min(
+                    0.55,
+                    confidenceScore(
+                        timestamp: timestamp,
+                        observation: observation)))
+        }
+        if observation.recoveryCooldownActive {
             phase = .weak
             consecutiveTrusted = 0
             consecutiveRejected += 1

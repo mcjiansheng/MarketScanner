@@ -387,6 +387,132 @@ enum PriorMapRecoveryDecisionEngine {
     }
 }
 
+enum PriorMapRecoveryUpdateAction: String, Equatable {
+    case none
+    case converged
+    case timedOut = "timed_out"
+}
+
+struct PriorMapRecoveryUpdateInput {
+    let timestamp: TimeInterval
+    let preMatchNow: TimeInterval
+    let postMatchNow: TimeInterval
+    let recoveryWasActiveAtUpdateStart: Bool
+    let recoveryActiveForMatch: Bool
+    let pendingCompletionOutcome: PriorMapRecoveryOutcome?
+    let frameDisposition: PriorMapRecoveryFrameDisposition
+    let hypothesisTrusted: Bool
+    let geometryAndSafetyAccepted: Bool
+    let residualTranslationM: Double
+    let residualYawRad: Double
+    let trackingState: String
+    let validPointCount: Int
+    let coverageAngleRad: Double
+    let uniqueness: Double
+    let residualCost: Double
+    let mapMismatch: Bool
+}
+
+struct PriorMapRecoveryUpdateOutput {
+    let decision: PriorMapRecoveryDecision
+    let action: PriorMapRecoveryUpdateAction
+    let nextConfidence: PriorMapConfidenceResult
+    let reason: String
+    let searchedAttemptRecorded: Bool
+    let recoveryFailedThisUpdate: Bool
+
+    var finalConstraintAccepted: Bool {
+        decision.constraintDisposition == .acceptedLocal
+            || decision.constraintDisposition == .acceptedRecoveryConvergence
+    }
+}
+
+/// Production-shared Recovery/Local update reducer. It is the only place that
+/// joins frame disposition, monotonic expiry, attempt exhaustion, correction
+/// acceptance, Recovery action, next confidence phase, and audit reason.
+enum PriorMapRecoveryUpdateReducer {
+    static func reduce(
+        _ input: PriorMapRecoveryUpdateInput,
+        recoveryController: PriorMapRecoveryController,
+        confidenceManager: PriorMapConfidenceManager
+    ) -> PriorMapRecoveryUpdateOutput {
+        let expiredBeforeMatch = input.recoveryActiveForMatch
+            && recoveryController.isWallClockExpired(now: input.preMatchNow)
+        let attemptRecorded = input.recoveryActiveForMatch
+            && !expiredBeforeMatch
+            && recoveryController.recordFrameDisposition(input.frameDisposition)
+        let expiredAfterMatch = input.recoveryActiveForMatch
+            && recoveryController.isWallClockExpired(now: input.postMatchNow)
+        var decision = PriorMapRecoveryDecisionEngine.evaluate(
+            PriorMapRecoveryDecisionInput(
+                recoveryActive: input.recoveryActiveForMatch,
+                hypothesisTrusted: input.hypothesisTrusted,
+                geometryAndSafetyAccepted: input.geometryAndSafetyAccepted,
+                residualTranslationM: input.residualTranslationM,
+                residualYawRad: input.residualYawRad,
+                wallClockExpired: expiredBeforeMatch || expiredAfterMatch))
+        var action: PriorMapRecoveryUpdateAction = .none
+        var reason = decision.constraintDisposition.rawValue
+        if expiredBeforeMatch {
+            action = .timedOut
+            reason = "recovery_timed_out_before_match"
+        }
+        else if expiredAfterMatch {
+            action = .timedOut
+            reason = "recovery_timed_out_after_match_deadline"
+        }
+        else if decision.recoveryConvergedThisUpdate {
+            action = .converged
+            reason = "recovery_converged"
+        }
+        else if input.recoveryActiveForMatch,
+                recoveryController.activeEpisode?.remainingValidAttempts == 0 {
+            action = .timedOut
+            decision = PriorMapRecoveryDecision(
+                measurementAccepted: decision.measurementAccepted,
+                hypothesisTrusted: decision.hypothesisTrusted,
+                correctionStepApplied: decision.correctionStepApplied,
+                recoveryConvergedThisUpdate: false,
+                confidenceAccepted: false,
+                constraintDisposition: decision.correctionStepApplied
+                    ? .provisionalRecoveryStep : .rejected)
+            reason = decision.correctionStepApplied
+                ? "recovery_timed_out_after_bounded_step"
+                : "recovery_timed_out_attempt_budget"
+        }
+        let recoveryFailed = action == .timedOut
+            || input.pendingCompletionOutcome.map { $0 != .converged } == true
+        let recoveryConverged = decision.recoveryConvergedThisUpdate
+            || input.pendingCompletionOutcome == .converged
+        let confidence = confidenceManager.update(
+            timestamp: input.timestamp,
+            observation: PriorMapConfidenceObservation(
+                trackingState: input.trackingState,
+                measurementAccepted: decision.measurementAccepted,
+                correctionStepApplied: decision.correctionStepApplied,
+                recoveryActive: (input.recoveryActiveForMatch
+                    || input.recoveryWasActiveAtUpdateStart)
+                    && action == .none
+                    && !recoveryConverged,
+                recoveryConvergedThisUpdate: recoveryConverged,
+                recoveryFailedThisUpdate: recoveryFailed,
+                recoveryCooldownActive: recoveryController
+                    .isAutomaticTriggerSuppressed(now: input.postMatchNow),
+                validPointCount: input.validPointCount,
+                coverageAngleRad: input.coverageAngleRad,
+                uniqueness: input.uniqueness,
+                residualCost: input.residualCost,
+                mapMismatch: input.mapMismatch))
+        return PriorMapRecoveryUpdateOutput(
+            decision: decision,
+            action: action,
+            nextConfidence: confidence,
+            reason: reason,
+            searchedAttemptRecorded: attemptRecorded,
+            recoveryFailedThisUpdate: recoveryFailed)
+    }
+}
+
 struct PriorMapRecoveryEpisode: Equatable {
     let id: Int
     let reason: String
