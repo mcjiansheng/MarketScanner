@@ -191,3 +191,7 @@ diagnostic draft 不能自动冒充 production `published`；只有完整因子�
 P7R2 本地回归已确认 PriorMap 122 项通过，其中 Swift 核心可执行测试覆盖 T1—T11：identity、纯平移、0/90/180°、组合转动平移、±π、转弯中错误高分通道、等分平行通道、5 m/30°边界、5.01 m/30.1°拒绝，以及 100 组确定性随机 `apply(derive(A,C),A)=C` 重建；场景覆盖蛇形转弯、短时动态遮挡、四帧恢复、loop-only authorization 和 corrected HUD。此前同一累计基线的 Supermarket Map Studio 94 项、资格证据 11 项和 iOS unsigned arm64 build 已通过；P7R2 最终治理 HEAD 的完整套件、iOS build 与七组 hosted CI 仍需在本轮提交后重新执行，不能沿用旧 SHA 结果。
 
 P7R3 在 Windows 已通过 15 项 iOS source/sidecar 合同和 20 项 PriorMap Python 可执行测试；Swift host 测试因本机没有 `xcrun`/Apple SDK 延期，新增的 R1—R12 Swift executable 尚未在本机执行。此处的 Python/source PASS 不等于生产 Swift 已执行；必须以 P7R3 final exact-SHA 的 macOS/iOS CI 和之后的 Xcode/真机结果为准。
+
+# P7R4 Recovery confidence closeout note (2026-08-03)
+
+The Sam evidence remains historical input and has not been rerun. P7R4 implementation `412015be87fc944241c0e43a2ab510830a561ded` prevents a bounded intermediate Recovery step from making localization stable or auto-confirming a price tag, enforces pre/post-match wall-clock expiry, adds a 20-second automatic cooldown, and preserves completion diagnostics under the correct episode. This is implementation evidence only; Xcode, LiDAR iPhone, same-route Recovery/occlusion runs, and Sam re-test remain deferred. Do not interpret this note as `SAM FIELD PASS`, `FIELD QUALIFICATION PASS`, or `PRODUCTION READY`.

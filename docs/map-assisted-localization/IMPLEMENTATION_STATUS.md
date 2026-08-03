@@ -111,3 +111,9 @@ P7 已实现 loopback-only server、每次启动随机且不落盘的 token、PO
 ## 兼容说明
 
 实施 Prompt 建议把业务模式直接写入 `scanMode`，但当前生产协议用 `scanMode=continuous_streaming` 判定单库安全处理。阶段一因此新增 `workflowMode` 承载 `free_mapping/prior_map_localized`，保留原 storage marker。这是为了满足“不破坏自由扫描和旧 PC 流程”的更高优先级约束。
+
+# P7R4 Recovery confidence closeout update
+
+P7R4 production implementation `412015be87fc944241c0e43a2ab510830a561ded`, based on cloud P7R3 `998c175e40562fffd85fe45579a358c485a65b30`, is **IMPLEMENTED / focused AUTOMATED TESTED**. It closes intermediate-step confidence promotion, timeout/final-step ambiguity, strict post-match deadline enforcement, automatic Recovery cooldown, episode-bound completion diagnostics, matcher search disposition, post-Recovery Local trust, and automatic tag-confirm safety. P7R2 global alignment and P7R3 episode freshness/budget/cleanup invariants remain unchanged.
+
+Swift host execution, Xcode/UIKit/ARKit, LiDAR, exact-final-SHA seven-group CI, independent review, and Sam field re-test are not yet complete and must not be reported as PASS. Current release status remains **NO-GO / NOT PRODUCTION READY**; the maximum pre-field decision after CI and independent review is `READY FOR HUMAN SAM RE-TEST`.

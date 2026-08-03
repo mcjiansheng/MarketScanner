@@ -1,7 +1,7 @@
 {
-  "wave": "P7R3-recovery-episode-closeout",
-  "branch": "repair-v2-p7r3-recovery-episode-closeout",
-  "base_branch": "repair-v2-p7r2-sam-global-alignment-fix",
-  "base_sha": "c3401759aadf2015873ae15e826b6a9a1f3c4ba0",
-  "implementation_sha": "0e2ce5133c8fb261fc1756111a5173c71d15b380"
+  "wave": "P7R4-recovery-confidence-closeout",
+  "branch": "repair-v2-p7r4-recovery-confidence-closeout",
+  "base_branch": "repair-v2-p7r3-recovery-episode-closeout",
+  "base_sha": "998c175e40562fffd85fe45579a358c485a65b30",
+  "implementation_sha": "412015be87fc944241c0e43a2ab510830a561ded"
 }
