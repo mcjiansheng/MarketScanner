@@ -1358,6 +1358,43 @@ let stableAfterRecovery = recoveryConfidence.update(
 require(stableAfterRecovery.phase == .stable,
         "P7R4 T4 three consecutive ordinary Local frames may restore stable")
 
+final class FakeMonotonicClock: PriorMapMonotonicClock {
+    var now: TimeInterval
+    init(_ now: TimeInterval) { self.now = now }
+}
+
+func recoveryUpdateInput(
+    timestamp: TimeInterval,
+    preMatchNow: TimeInterval,
+    postMatchNow: TimeInterval,
+    recoveryActive: Bool,
+    disposition: PriorMapRecoveryFrameDisposition,
+    trusted: Bool = false,
+    geometryAccepted: Bool = false,
+    residualTranslationM: Double = 0,
+    residualYawRad: Double = 0,
+    pendingCompletion: PriorMapRecoveryOutcome? = nil
+) -> PriorMapRecoveryUpdateInput {
+    PriorMapRecoveryUpdateInput(
+        timestamp: timestamp,
+        preMatchNow: preMatchNow,
+        postMatchNow: postMatchNow,
+        recoveryWasActiveAtUpdateStart: recoveryActive,
+        recoveryActiveForMatch: recoveryActive,
+        pendingCompletionOutcome: pendingCompletion,
+        frameDisposition: disposition,
+        hypothesisTrusted: trusted,
+        geometryAndSafetyAccepted: geometryAccepted,
+        residualTranslationM: residualTranslationM,
+        residualYawRad: residualYawRad,
+        trackingState: "normal",
+        validPointCount: trusted ? 120 : 0,
+        coverageAngleRad: trusted ? 1.4 : 0,
+        uniqueness: trusted ? 0.5 : 0,
+        residualCost: trusted ? 0.01 : 0.15,
+        mapMismatch: false)
+}
+
 // P7R4 T5: a safe final-attempt step remains provisional when the episode
 // times out; immutable completion evidence preserves the episode hypothesis.
 let finalAttemptController = PriorMapRecoveryController(
@@ -1365,9 +1402,35 @@ let finalAttemptController = PriorMapRecoveryController(
     maximumWallClockSeconds: 30)
 _ = finalAttemptController.request(reason: "persistent_weak_or_lost", now: 0,
                                    automatic: true)
-for _ in 0..<40 { finalAttemptController.recordValidMatcherAttempt() }
-require(finalAttemptController.isExpired(now: 10),
-        "P7R4 T5 attempt 40/40 must expire the episode")
+for _ in 0..<39 { finalAttemptController.recordFrameDisposition(.searched) }
+let finalAttemptConfidence = PriorMapConfidenceManager()
+finalAttemptConfidence.reset()
+let finalAttemptUpdate = PriorMapRecoveryUpdateReducer.reduce(
+    recoveryUpdateInput(
+        timestamp: 10,
+        preMatchNow: 10,
+        postMatchNow: 10,
+        recoveryActive: true,
+        disposition: .searched,
+        trusted: true,
+        geometryAccepted: true,
+        residualTranslationM: 4.2,
+        residualYawRad: 0.2),
+    recoveryController: finalAttemptController,
+    confidenceManager: finalAttemptConfidence)
+require(finalAttemptController.activeEpisode?.validMatcherAttempts == 40,
+        "P7R4 T5 the production reducer must record attempt 40/40")
+require(finalAttemptUpdate.action == .timedOut
+        && finalAttemptUpdate.decision.correctionStepApplied,
+        "P7R4 T5 attempt 40 may retain one safe step but must time out")
+require(!finalAttemptUpdate.decision.confidenceAccepted
+        && !finalAttemptUpdate.finalConstraintAccepted
+        && finalAttemptUpdate.decision.constraintDisposition
+            == .provisionalRecoveryStep,
+        "P7R4 T5 the final step must remain provisional and non-confidence-bearing")
+require(finalAttemptUpdate.nextConfidence.phase == .weak
+        && finalAttemptUpdate.reason.contains("timed_out"),
+        "P7R4 T5 timeout must emit weak phase and explicit timed_out diagnostics")
 let finalAttemptCompletion = finalAttemptController.finish(
     .timedOut,
     now: 10,
@@ -1375,7 +1438,8 @@ let finalAttemptCompletion = finalAttemptController.finish(
     finalFreshSupportFrames: 4,
     finalResidualTranslationM: 4.2,
     finalResidualYawRad: 0.2,
-    correctionStepAppliedOnCompletionFrame: true)
+    correctionStepAppliedOnCompletionFrame:
+        finalAttemptUpdate.decision.correctionStepApplied)
 require(finalAttemptCompletion?.outcome == .timedOut
         && finalAttemptCompletion?.correctionStepAppliedOnCompletionFrame == true,
         "P7R4 T5 timeout must not reinterpret a provisional step as success")
@@ -1390,11 +1454,6 @@ require(!completionIsolation.currentHypothesisVisible
 require(completionIsolation.recoverySelectedHypothesisId == 77,
         "P7R4 T10 completion diagnostics must retain the old episode hypothesis")
 
-final class FakeMonotonicClock: PriorMapMonotonicClock {
-    var now: TimeInterval
-    init(_ now: TimeInterval) { self.now = now }
-}
-
 // P7R4 T6/T7: a matcher crossing the deadline records a real attempt but the
 // post-match decision cannot mutate the alignment. Equality is expired too.
 let fakeClock = FakeMonotonicClock(0)
@@ -1402,26 +1461,65 @@ let deadlineController = PriorMapRecoveryController(
     maximumValidAttempts: 40,
     maximumWallClockSeconds: 30)
 _ = deadlineController.request(reason: "deadline", now: fakeClock.now)
+let deadlineConfidence = PriorMapConfidenceManager()
+deadlineConfidence.reset()
+let deadlineAnchor = PriorMapLocalizationAnchor(
+    initialMapPose: PriorMapPose2D(xM: 4, yM: 5, yawRad: 0.1))
+let deadlineArkitPose = PriorMapPose2D(xM: 1, yM: 2, yawRad: 0.2)
+let anchorBeforeExpiredMatch = deadlineAnchor.project(
+    arkitPose: deadlineArkitPose)
 fakeClock.now = 29.8
 require(!deadlineController.isWallClockExpired(now: fakeClock.now),
         "P7R4 T6 matcher may start before deadline")
 fakeClock.now = 31.3
-deadlineController.recordValidMatcherAttempt()
-let expiredDecision = PriorMapRecoveryDecisionEngine.evaluate(
-    PriorMapRecoveryDecisionInput(
+let expiredUpdate = PriorMapRecoveryUpdateReducer.reduce(
+    recoveryUpdateInput(
+        timestamp: fakeClock.now,
+        preMatchNow: 29.8,
+        postMatchNow: fakeClock.now,
         recoveryActive: true,
-        hypothesisTrusted: true,
-        geometryAndSafetyAccepted: true,
-        residualTranslationM: 1,
-        residualYawRad: 0,
-        wallClockExpired: deadlineController.isWallClockExpired(
-            now: fakeClock.now)))
+        disposition: .searched,
+        trusted: true,
+        geometryAccepted: true,
+        residualTranslationM: 1),
+    recoveryController: deadlineController,
+    confidenceManager: deadlineConfidence)
 require(deadlineController.activeEpisode?.validMatcherAttempts == 1,
         "P7R4 T6 a deadline-crossing real search still counts")
-require(!expiredDecision.correctionStepApplied,
+require(expiredUpdate.action == .timedOut
+        && !expiredUpdate.decision.correctionStepApplied,
         "P7R4 T6 no post-deadline Recovery correction may be applied")
-require(deadlineController.isWallClockExpired(now: 30),
-        "P7R4 T7 now equal to deadline must be expired")
+let deadlineCompletion = deadlineController.finish(
+    .timedOut,
+    now: fakeClock.now,
+    correctionStepAppliedOnCompletionFrame:
+        expiredUpdate.decision.correctionStepApplied)
+require(deadlineCompletion?.outcome == .timedOut
+        && expiredUpdate.nextConfidence.phase == .weak,
+        "P7R4 T6 deadline crossing must finish timed_out and enter weak")
+requirePoseClose(
+    deadlineAnchor.project(arkitPose: deadlineArkitPose),
+    anchorBeforeExpiredMatch,
+    "P7R4 T6 an expired matcher result cannot mutate the localizer anchor")
+require(!deadlineController.isWallClockExpired(now: 30),
+        "P7R4 T7 completed controller no longer has an active deadline")
+
+let exactDeadlineController = PriorMapRecoveryController()
+_ = exactDeadlineController.request(reason: "exact_deadline", now: 0)
+let exactDeadlineConfidence = PriorMapConfidenceManager()
+exactDeadlineConfidence.reset()
+let exactDeadlineUpdate = PriorMapRecoveryUpdateReducer.reduce(
+    recoveryUpdateInput(
+        timestamp: 30,
+        preMatchNow: 30,
+        postMatchNow: 30,
+        recoveryActive: true,
+        disposition: .observationUnavailable),
+    recoveryController: exactDeadlineController,
+    confidenceManager: exactDeadlineConfidence)
+require(exactDeadlineUpdate.action == .timedOut
+        && !exactDeadlineUpdate.searchedAttemptRecorded,
+        "P7R4 T7 now equal to deadline expires before search/correction")
 
 // P7R4 T12: every production frame disposition goes through the same attempt
 // reducer. Invalid/dropped frames advance the FakeClock but never the attempt
@@ -1431,7 +1529,10 @@ let dispositionController = PriorMapRecoveryController(
     maximumValidAttempts: 40,
     maximumWallClockSeconds: 30)
 _ = dispositionController.request(
-    reason: "invalid_frame_timeout", now: dispositionClock.now)
+    reason: "invalid_frame_timeout", now: dispositionClock.now,
+    automatic: true)
+let dispositionConfidence = PriorMapConfidenceManager()
+dispositionConfidence.reset()
 let dispositionGate = PriorMapUpdateGate(minimumInterval: 0.5)
 let acceptedGateDecision = dispositionGate.begin(timestamp: 1.0)
 guard case .accepted(let dispositionTicket) = acceptedGateDecision else {
@@ -1446,18 +1547,55 @@ require(throttledGateDecision.recoveryFrameDisposition == .throttled,
         "P7R4 T12 a throttled gate must expose the production throttled disposition")
 for (index, disposition) in invalidRecoveryDispositions.enumerated() {
     dispositionClock.now = Double(index + 1) * 4.9
-    require(!dispositionController.recordFrameDisposition(disposition),
-            "P7R4 T12 \(disposition.rawValue) must not consume an attempt")
+    let invalidUpdate = PriorMapRecoveryUpdateReducer.reduce(
+        recoveryUpdateInput(
+            timestamp: dispositionClock.now,
+            preMatchNow: dispositionClock.now,
+            postMatchNow: dispositionClock.now,
+            recoveryActive: true,
+            disposition: disposition),
+        recoveryController: dispositionController,
+        confidenceManager: dispositionConfidence)
+    require(!invalidUpdate.searchedAttemptRecorded
+            && invalidUpdate.action == .none,
+            "P7R4 T12 \(disposition.rawValue) must consume wall time but not an attempt")
 }
 require(dispositionController.activeEpisode?.validMatcherAttempts == 0,
         "P7R4 T12 all invalid/dropped paths must leave attempts at zero")
 dispositionClock.now = 30
-require(dispositionController.isExpired(now: dispositionClock.now),
-        "P7R4 T12 invalid frames still consume wall time and reach timeout")
-require(dispositionController.recordFrameDisposition(.searched),
-        "P7R4 T12 only matcher-owned searched may consume an attempt")
-require(dispositionController.activeEpisode?.validMatcherAttempts == 1,
-        "P7R4 T12 searched must be the sole attempt-counting disposition")
+let invalidTimeoutUpdate = PriorMapRecoveryUpdateReducer.reduce(
+    recoveryUpdateInput(
+        timestamp: dispositionClock.now,
+        preMatchNow: dispositionClock.now,
+        postMatchNow: dispositionClock.now,
+        recoveryActive: true,
+        disposition: .observationUnavailable),
+    recoveryController: dispositionController,
+    confidenceManager: dispositionConfidence)
+require(invalidTimeoutUpdate.action == .timedOut
+        && !invalidTimeoutUpdate.searchedAttemptRecorded
+        && invalidTimeoutUpdate.recoveryFailedThisUpdate
+        && invalidTimeoutUpdate.nextConfidence.phase == .weak,
+        "P7R4 T12 invalid frames must reach timed_out/weak without a searched attempt")
+_ = dispositionController.finish(.timedOut, now: dispositionClock.now)
+for weakTimestamp in [30.1, 35.0, 49.9] {
+    let cooldownWeakUpdate = PriorMapRecoveryUpdateReducer.reduce(
+        recoveryUpdateInput(
+            timestamp: weakTimestamp,
+            preMatchNow: weakTimestamp,
+            postMatchNow: weakTimestamp,
+            recoveryActive: false,
+            disposition: .observationUnavailable),
+        recoveryController: dispositionController,
+        confidenceManager: dispositionConfidence)
+    require(cooldownWeakUpdate.nextConfidence.phase == .weak,
+            "P7R4 T12 timeout must remain weak throughout automatic cooldown")
+    require(!dispositionController.request(
+        reason: "persistent_weak_or_lost",
+        now: weakTimestamp,
+        automatic: true),
+        "P7R4 T12 continuous weak frames cannot start Recovery during cooldown")
+}
 
 // P7R4 T8/T9: automatic timeout creates a bounded cooldown. A reliable loop
 // may bypass it, while a repeated trigger only merges into the active episode.
@@ -1479,6 +1617,10 @@ require(cooldownController.activeEpisode?.id == bypassEpisode.id
         && cooldownController.activeEpisode?.deadlineUptime
             == bypassEpisode.deadlineUptime,
         "P7R4 T9 merged trigger must not reset identity or deadline")
+_ = cooldownController.finish(.cancelled, now: 150)
+require(cooldownController.request(
+    reason: "persistent_weak_or_lost", now: 150, automatic: true),
+    "P7R4 T8 a new automatic episode must be allowed exactly when cooldown expires")
 
 // P7R4 T11: exercise the production localizer anchor with competing Recovery
 // hypotheses. B wins fresh evidence, advances through multiple bounded steps,
