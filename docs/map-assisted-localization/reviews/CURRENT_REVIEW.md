@@ -7,7 +7,7 @@
 > P7R1 review baseline: `repair-v2-p7r0-independent-baseline@79c86b120fc47c28bd350e86abc9b0354d7e838d`.
 > P7R3 cloud base at task start: `repair-v2-p7r3-recovery-episode-closeout@998c175e40562fffd85fe45579a358c485a65b30`.
 > Current implementation branch: `repair-v2-p7r4-recovery-confidence-closeout`.
-> P7R4 production implementation: `218f3ef69a5b68e3e317a4300ed76dd606cb531e`; later test/governance commits must not silently modify production code.
+> P7R4 production implementation: `38831fab26b66ce31f7d86e29ea600d47a19b934`; later test/governance commits must not silently modify production code.
 
 The authoritative release judgment remains [Production Readiness Review](PRODUCTION_READINESS_REVIEW.md): **NO-GO / NOT PRODUCTION READY**.
 
