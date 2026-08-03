@@ -102,6 +102,10 @@ checkpoint cleanup 是显式破坏性恢复事务。iOS 与 PC 都按 path compo
 
 P7R2 的 hypothesis 统一跟踪全局 `T_map_from_arkit`，而不是手机自身坐标下的局部平移。对 ARKit 水平位姿 `A=(R_a,t_a)` 与候选地图位姿 `C=(R_c,t_c)`，记录的变换满足 `M=C×inverse(A)`：`theta=normalize(yaw_c-yaw_a)`、`t_m=t_c-R(theta)t_a`，且 `apply(M,A)` 必须重建 `C`。`mapFromArkitX/Y/YawDeg` 是所选 track 的平滑全局变换；`selectedHypothesisId` 只在本次 tracker 生命周期内稳定；active count 上限 8；best/second cost 对应当前排名前两条活动 track；reason 与 tracker elapsed 用于解释歧义和性能。无活动 hypothesis 时可选字段省略。以上是 version 1 的向后兼容附加诊断字段，不改变现有必填业务 schema；旧 reader 可忽略，最终证据校验仍要求原有身份、时间和 pose 字段。
 
+P7R3 把宽搜索改为显式 Recovery episode。`inactive -> active -> converged | timed_out | cancelled | manual_reset`；新 episode 开始时清空 hypothesis track，但保留已应用的 `T_map_from_arkit` anchor，因此 HUD 不会因触发 Recovery 瞬移。Recovery trust 的 `hypothesisSupportFrames`/`recoveryFreshSupportFrames` 只包含本 episode 的新观测，至少 4 帧；local lifetime support 不得参与。预算为最多 40 次有效 matcher search 和 30 秒 wall clock，只有 tracking normal、observation 非空且 matcher 有至少 30 个 effective points 时才增加 attempt；throttle、busy、limited/no-depth/nil/undersized observation 不消耗 attempt。所有 outcome 都清除宽搜索 tracks，已安全应用的 0.35 m/8° bounded anchor 保留。
+
+`localization_trace` v1 继续用向后兼容可选字段记录 `recoveryEpisodeId/recoveryReason/recoveryOutcome/recoveryValidAttemptCount/recoveryRemainingValidAttempts/recoveryElapsedMs/recoveryFreshSupportFrames/recoveryTriggerCount`。active 记录使用 `recoveryOutcome=active`；结束该 episode 的记录使用终态字符串。数值均为有限小标量，不保存结构点；旧 reader 可忽略这些字段。
+
 `timestamp` 保留原始 `ARFrame.timestamp`（设备单调时钟）；RTAB‑Map 的 `CameraMobile` 在写 `Node.stamp` 前会加 `stampEpochOffset`。因此所有当前定位 sidecar 同时保存 `nodeTimebaseTimestamp = timestamp + nodeTimebaseOffsetSeconds`，PC 只用换算后的 node timebase 绑定 SQLite node，并严格复算该等式。offset 由 native camera 原子读取；尚未初始化或非有限时该记录拒绝落盘，不能直接拿原始 ARFrame 时间与 epoch node stamp 比较。
 
 ## 阶段二定位审计

@@ -1,10 +1,12 @@
 # 地图辅助定位实现状态
 
-> 文档状态：**当前有效**。最后核对日期：2026-08-02。
+> 文档状态：**当前有效**。最后核对日期：2026-08-03。
 
 2026-08-02 的 Sam 真实扫描暴露了数据库位姿与 iOS prior-map 坐标契约不一致、reciprocal loop 被过严判为矛盾边、在线定位长期歧义和交互困难。现场证据、指标、根因、代码整改和同一优化数据库的只读回归结果见 [`SAM_SCAN_REPORT_2026-08-02.md`](SAM_SCAN_REPORT_2026-08-02.md)。修复后完整因子图已覆盖 4,442 个节点并收敛，测试草稿可查看；修复后的 iPhone 真机重扫和现场控制点验收仍未执行，不能据此标记生产通过。
 
 P7R2 后续审查确认在线 hypothesis 的旧“修正变换”实际是 body-local translation，设备转弯时不保持不变。代码提交 `0a2a3ec50a851d52f96120a8f3d1669a7797e34e` 已改为显式全局 `T_map_from_arkit`，按候选地图位姿与原始 ARKit 水平位姿求逆组合、在地图坐标平滑，并由该变换重建安全修正目标；旧局部数学和未接线 temporal gate 已删除。该结论目前为 **IMPLEMENTED / AUTOMATED TESTED**，最终 exact-SHA CI 与 Sam 真机重扫待执行。
+
+P7R3 代码提交 `0e2ce5133c8fb261fc1756111a5173c71d15b380` 已关闭 Recovery 生命周期缺口：新 episode 清空历史 local tracks、4 帧 trust 只用当前 episode 新证据、support 饱和为 120、40 次有效 matcher attempt 与 30 秒 wall-clock 双上限、repeated trigger 不重置 ID/support/budget/deadline，且 converged/timed-out/cancelled/manual-reset 统一清除 wide-search tracks。有效 attempt 只在 matcher 至少取得 30 个 effective points 后增加，ambiguous/mismatch 算一次实际搜索，nil/limited/no-depth/undersized observation 不计。P7R2 全局变换、5 m/30°总门与 0.35 m/8°单步门未改变。Windows 源码合同与 Python 回归通过；Swift host、iOS full build、exact-SHA CI 和真机仍待执行。
 
 ## 生产化总状态
 
@@ -30,7 +32,7 @@ P7 已实现 loopback-only server、每次启动随机且不落盘的 token、PO
 | iOS 五步向导 | 已实现 | 地图、楼层、起点/方向、设备检查、开始 |
 | iOS 道路锚点快捷起点 | 已实现 | 起点步骤可从当前楼层道路节点选择锚点 |
 | prior-map 仍写连续 RTAB-Map DB | 已实现 | 复用 `newScan`/`streamingDatabaseURL` |
-| T_map_from_arkit 与 2D HUD | P7R2 已修复并自动测试 | Top‑5 跟踪固定的全局 `T_map_from_arkit`；候选可由该变换以 `1e-9` 重建；weak/lost/可靠闭环只授权 5 m/30°有界恢复；0.35 m/8°单步门；HUD 使用 corrected `estimatedPose`；修复后真机重扫待执行 |
+| T_map_from_arkit、Recovery episode 与 2D HUD | P7R3 已实现，macOS/真机待验证 | P7R2 全局 `T_map_from_arkit` 保持；Recovery 需 4 个 episode-fresh observations，40 valid attempts/30 s，重复 trigger 不重置，所有 exit 清 track；5 m/30°总门、0.35 m/8°单步门与 corrected HUD 保持 |
 | 单楼层定位边界 | 已实现 | 开始前绑定一层；无跨层切换；忽略二维高度但保留原始 3D |
 | 道路软约束、歧义拒绝 | 已实现 | 2 Hz、有界道路索引、in-flight 丢帧门控、0.15 gain、0.25 m cap、Top-3 |
 | 人工确认和审计 | 已实现 | manual v3 JSONL；native 原子 node/timebase/generation 快照；无一致 node 证据即拒绝 |
@@ -92,7 +94,7 @@ P7 已实现 loopback-only server、每次启动随机且不落盘的 token、PO
 | 操作者取消 | 已实现 | 持久取消意图；原生子进程 terminate→有界 wait→kill；partial 清理 |
 | 原生运行日志 | 已实现 | fast/discovery 独立日志、严格文件名和任务归属下载 |
 | 损坏 journal/保留策略 | 已实现 | health 报告 startup error；不按不可信路径清理；默认保留 200 个终态任务 |
-| 自动回归 | 已实现 | P7R2 本地 PriorMap 122 项通过；新增 Swift executable 覆盖 T1—T11 与 S1/S2/S4，源码合同覆盖 S3 loop-only authorization、S5 corrected HUD。此前同基线工作台 94 项、资格证据 11 项；本轮完整套件与最终 exact-SHA CI 结果在提交前继续复核。该数字是 AUTOMATED TESTED，不替代人工验收 |
+| 自动回归 | P7R3 Windows 可执行部分通过 | 源码/sidecar 合同 15/15；PriorMap Python 20/20，Swift host 1 项因无 xcrun 按预期延期；Swift executable 已新增 R1—R12（fresh support、stale A/new B、valid budget、repeat、exit cleanup、5 m/30°、score formula），必须由 macOS CI 实际执行。完整 Windows 套件的 symlink/CMake 环境项与 exact-SHA CI 单独记录，不替代人工验收 |
 
 ## 尚未完成的发布门槛
 
@@ -102,6 +104,7 @@ P7 已实现 loopback-only server、每次启动随机且不落盘的 token、PO
 - 正式超市场景验收；
 - 对更多真实 DB 固化相对边 residual 工程阈值，并由 clean CI 构建 helper；P1 单样本通过不替代现场 acceptance；
 - 修复后的 iPhone 真机重扫，确认多候选恢复、动态购物车过滤、热状态与自适应检测率在 Sam 场景中的实际效果。
+- P7R3 最终治理 HEAD 的七组 exact-SHA CI 与独立只读代码审查。
 
 自动测试和模拟回放不替代以上现场与独立审查。
 
