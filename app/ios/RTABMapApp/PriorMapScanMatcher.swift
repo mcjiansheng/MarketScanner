@@ -742,6 +742,34 @@ struct PriorMapConfidenceObservation {
     let uniqueness: Double
     let residualCost: Double
     let mapMismatch: Bool
+
+    init(
+        trackingState: String,
+        measurementAccepted: Bool,
+        correctionStepApplied: Bool,
+        recoveryActive: Bool,
+        recoveryConvergedThisUpdate: Bool,
+        recoveryFailedThisUpdate: Bool,
+        recoveryCooldownActive: Bool = false,
+        validPointCount: Int,
+        coverageAngleRad: Double,
+        uniqueness: Double,
+        residualCost: Double,
+        mapMismatch: Bool
+    ) {
+        self.trackingState = trackingState
+        self.measurementAccepted = measurementAccepted
+        self.correctionStepApplied = correctionStepApplied
+        self.recoveryActive = recoveryActive
+        self.recoveryConvergedThisUpdate = recoveryConvergedThisUpdate
+        self.recoveryFailedThisUpdate = recoveryFailedThisUpdate
+        self.recoveryCooldownActive = recoveryCooldownActive
+        self.validPointCount = validPointCount
+        self.coverageAngleRad = coverageAngleRad
+        self.uniqueness = uniqueness
+        self.residualCost = residualCost
+        self.mapMismatch = mapMismatch
+    }
 }
 
 final class PriorMapConfidenceManager {
