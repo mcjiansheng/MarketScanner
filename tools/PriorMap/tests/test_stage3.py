@@ -13,6 +13,8 @@ from unittest import mock
 from tools.PriorMap.offline_localization import (
     CONSTRAINT_CONTRACT,
     DEFAULT_REPLAY_PARAMETERS,
+    RECOVERY_EVIDENCE_UNBOUND_LEGACY,
+    SESSION_INPUT_FILE_NAMES_V2,
     Pose,
     OfflineLocalizationError,
     _validate_jsonl_business_record,
@@ -1207,6 +1209,181 @@ class LocalizedPipelineTests(unittest.TestCase):
                 output,
             )
         self.assertIsNone(LocalizedVersionStore(output).current())
+
+    def _upgrade_fixture_to_recovery_manifest_v2(self) -> Path:
+        """Bind the fixture session to P7R6 recovery evidence (manifest v2).
+
+        Adds the capture watermark and writes one valid terminal lifecycle
+        record that reconciles with it.
+        """
+
+        metadata_path = self.segment / "metadata.json"
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        metadata["captureHealth"].update(
+            {
+                "localizationRecoveryEventCount": 1,
+                "localizationLastRecoveryEpisodeId": 1,
+                "localizationLastRecoveryFinishedAtUptime": 14.5,
+            }
+        )
+        json_write(metadata_path, metadata)
+        manifest = json.loads((self.prior_map / "manifest.json").read_text())
+        recovery_path = self.segment / "localization_recovery_events.jsonl"
+        jsonl_write(
+            recovery_path,
+            [
+                {
+                    "format": "MarketScannerRecoveryLifecycleEvent",
+                    "version": 2,
+                    "tracking_session_id": "tracking-1",
+                    "prior_map_id": manifest["prior_map_id"],
+                    "prior_map_sha256": manifest["source_sha256"],
+                    "floor_id": "1",
+                    "episode_id": 1,
+                    "reason": "reliable_rtabmap_loop",
+                    "outcome": "converged",
+                    "episode_automatic": False,
+                    "started_at_uptime": 10.0,
+                    "deadline_uptime": 40.0,
+                    "finished_at_uptime": 14.5,
+                    "elapsed_ms": 4500.0,
+                    "maximum_valid_attempts": 40,
+                    "valid_matcher_attempts": 7,
+                    "accepted_corrections": 2,
+                    "trigger_count": 1,
+                    "automatic_trigger_count": 0,
+                    "reliable_loop_trigger_count": 1,
+                    "last_trigger_reason": "reliable_rtabmap_loop",
+                    "last_trigger_at_uptime": 10.0,
+                    "trigger_records": [
+                        {
+                            "reason": "reliable_rtabmap_loop",
+                            "automatic": False,
+                            "at_uptime": 10.0,
+                        }
+                    ],
+                    "fresh_support_frames": 4,
+                    "completion_frame_step_applied": False,
+                }
+            ],
+        )
+        return recovery_path
+
+    def test_p1_p3_recovery_file_bytes_bind_the_v2_bundle_sha(self) -> None:
+        recovery_path = self._upgrade_fixture_to_recovery_manifest_v2()
+        baseline = build_session_input_manifest(self.segment, self.source_database)
+        self.assertEqual(baseline["version"], 2)
+        self.assertNotIn("recovery_evidence_binding", baseline)
+        self.assertIn(
+            "localization_recovery_events.jsonl",
+            [entry["file"] for entry in baseline["files"]],
+        )
+        # P1: any byte change in the recovery sidecar moves the bundle SHA.
+        original = recovery_path.read_bytes()
+        recovery_path.write_bytes(original[:-1] + b"\x00" + original[-1:])
+        mutated = build_session_input_manifest(self.segment, self.source_database)
+        self.assertNotEqual(mutated["bundle_sha256"], baseline["bundle_sha256"])
+        recovery_path.write_bytes(original)
+        # P3: even a same-length replacement must move the bundle SHA.
+        same_length = b"x" * len(original)
+        self.assertEqual(len(same_length), len(original))
+        recovery_path.write_bytes(same_length)
+        swapped = build_session_input_manifest(self.segment, self.source_database)
+        self.assertNotEqual(swapped["bundle_sha256"], baseline["bundle_sha256"])
+        recovery_path.write_bytes(original)
+        restored = build_session_input_manifest(self.segment, self.source_database)
+        self.assertEqual(restored["bundle_sha256"], baseline["bundle_sha256"])
+
+    def test_p2_missing_recovery_file_fails_the_v2_manifest_build(self) -> None:
+        recovery_path = self._upgrade_fixture_to_recovery_manifest_v2()
+        recovery_path.unlink()
+        with self.assertRaisesRegex(
+            OfflineLocalizationError,
+            "localization_recovery_events.jsonl is missing",
+        ):
+            build_session_input_manifest(self.segment, self.source_database)
+
+    def test_p4_duplicate_recovery_episode_fails_processing(self) -> None:
+        recovery_path = self._upgrade_fixture_to_recovery_manifest_v2()
+        duplicated = recovery_path.read_bytes()
+        recovery_path.write_bytes(duplicated + duplicated)
+        output = self.root / "localized-duplicate-recovery-episode"
+        with self.assertRaisesRegex(OfflineLocalizationError, "recovery"):
+            process_localized_session(
+                self.prior_map,
+                self.session,
+                self.poses,
+                self.source_database,
+                self.optimized_database,
+                output,
+            )
+        self.assertIsNone(LocalizedVersionStore(output).current())
+
+    def test_p5_p6_legacy_sessions_stay_v1_and_unbound(self) -> None:
+        # P5: a legacy session without the watermark builds manifest v1 with
+        # the explicit unbound marker and stays readable.
+        legacy = build_session_input_manifest(self.segment, self.source_database)
+        self.assertEqual(legacy["version"], 1)
+        self.assertEqual(
+            legacy["recovery_evidence_binding"],
+            RECOVERY_EVIDENCE_UNBOUND_LEGACY,
+        )
+        self.assertNotIn(
+            "localization_recovery_events.jsonl",
+            [entry["file"] for entry in legacy["files"]],
+        )
+        self.assertEqual(session_input_bundle_sha256(legacy), legacy["bundle_sha256"])
+        # P6: a stray recovery sidecar must never upgrade a legacy session to
+        # v2; the watermark key decides the manifest version.
+        jsonl_write(
+            self.segment / "localization_recovery_events.jsonl",
+            [{"format": "MarketScannerRecoveryLifecycleEvent", "version": 2}],
+        )
+        still_legacy = build_session_input_manifest(
+            self.segment, self.source_database
+        )
+        self.assertEqual(still_legacy["version"], 1)
+        self.assertEqual(
+            still_legacy["recovery_evidence_binding"],
+            RECOVERY_EVIDENCE_UNBOUND_LEGACY,
+        )
+        self.assertNotIn(
+            "localization_recovery_events.jsonl",
+            [entry["file"] for entry in still_legacy["files"]],
+        )
+        self.assertEqual(still_legacy["bundle_sha256"], legacy["bundle_sha256"])
+
+    def test_p7_p8_v2_manifest_is_ordered_and_platform_stable(self) -> None:
+        self._upgrade_fixture_to_recovery_manifest_v2()
+        # P7: deterministic file order and canonical encoding.
+        first = build_session_input_manifest(self.segment, self.source_database)
+        second = build_session_input_manifest(self.segment, self.source_database)
+        self.assertEqual(first, second)
+        self.assertEqual(
+            [entry["role"] for entry in first["files"]],
+            ["metadata", "source_database", *SESSION_INPUT_FILE_NAMES_V2[1:]],
+        )
+        self.assertEqual(
+            first["files"][5]["file"],
+            "localization_recovery_events.jsonl",
+        )
+        self.assertEqual(session_input_bundle_sha256(first), first["bundle_sha256"])
+        # P8: the canonical bundle SHA depends only on the canonical payload
+        # (bare file names, sorted keys), never on OS paths, so a Windows
+        # reader hashing the same payload reproduces the identical digest.
+        for entry in first["files"]:
+            self.assertNotIn("/", entry["file"])
+            self.assertNotIn("\\", entry["file"])
+        transported = json.loads(json.dumps(first))
+        self.assertEqual(
+            session_input_bundle_sha256(transported), first["bundle_sha256"]
+        )
+        transported_with_audit = dict(transported)
+        transported_with_audit["input_identity_id"] = "e" * 64
+        self.assertEqual(
+            session_input_bundle_sha256(transported_with_audit),
+            first["bundle_sha256"],
+        )
 
     def test_output_root_rejects_a_different_session_identity(self) -> None:
         output = self.root / "localized-bound-output"
