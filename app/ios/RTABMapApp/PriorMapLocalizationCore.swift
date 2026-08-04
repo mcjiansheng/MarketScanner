@@ -585,6 +585,112 @@ struct PriorMapRecoveryCompletion: Equatable {
     }
 }
 
+/// Terminal Recovery lifecycle evidence. One record per finished episode is
+/// persisted to `localization_recovery_events.jsonl` so post-processing can
+/// distinguish convergence, timeout, manual reset, and cancellation, including
+/// scan-stop or map-unload teardowns that never see another update frame.
+struct PriorMapRecoveryLifecycleRecord: Codable, Equatable {
+    static let formatName = "MarketScannerRecoveryLifecycleEvent"
+    static let formatVersion = 1
+    static let fileName = "localization_recovery_events.jsonl"
+
+    let format: String
+    let version: Int
+    let trackingSessionId: String
+    let priorMapId: String
+    let priorMapSha256: String
+    let floorId: String
+    let episodeId: Int
+    let reason: String
+    let outcome: String
+    let cancellationReason: String?
+    let episodeAutomatic: Bool
+    let startedAtUptime: TimeInterval
+    let finishedAtUptime: TimeInterval
+    let elapsedMs: Double
+    let validMatcherAttempts: Int
+    let acceptedCorrections: Int
+    let triggerCount: Int
+    let automaticTriggerCount: Int
+    let reliableLoopTriggerCount: Int
+    let lastTriggerReason: String
+    let lastTriggerAtUptime: TimeInterval
+    let selectedHypothesisId: Int?
+    let freshSupportFrames: Int
+    let finalResidualTranslationM: Double?
+    let finalResidualYawRad: Double?
+    let completionFrameStepApplied: Bool
+
+    private enum CodingKeys: String, CodingKey {
+        case format
+        case version
+        case trackingSessionId = "tracking_session_id"
+        case priorMapId = "prior_map_id"
+        case priorMapSha256 = "prior_map_sha256"
+        case floorId = "floor_id"
+        case episodeId = "episode_id"
+        case reason
+        case outcome
+        case cancellationReason = "cancellation_reason"
+        case episodeAutomatic = "episode_automatic"
+        case startedAtUptime = "started_at_uptime"
+        case finishedAtUptime = "finished_at_uptime"
+        case elapsedMs = "elapsed_ms"
+        case validMatcherAttempts = "valid_matcher_attempts"
+        case acceptedCorrections = "accepted_corrections"
+        case triggerCount = "trigger_count"
+        case automaticTriggerCount = "automatic_trigger_count"
+        case reliableLoopTriggerCount = "reliable_loop_trigger_count"
+        case lastTriggerReason = "last_trigger_reason"
+        case lastTriggerAtUptime = "last_trigger_at_uptime"
+        case selectedHypothesisId = "selected_hypothesis_id"
+        case freshSupportFrames = "fresh_support_frames"
+        case finalResidualTranslationM = "final_residual_translation_m"
+        case finalResidualYawRad = "final_residual_yaw_rad"
+        case completionFrameStepApplied = "completion_frame_step_applied"
+    }
+
+    init(
+        trackingSessionId: String,
+        priorMapId: String,
+        priorMapSha256: String,
+        floorId: String,
+        completion: PriorMapRecoveryCompletion
+    ) {
+        self.format = Self.formatName
+        self.version = Self.formatVersion
+        self.trackingSessionId = trackingSessionId
+        self.priorMapId = priorMapId
+        self.priorMapSha256 = priorMapSha256
+        self.floorId = floorId
+        self.episodeId = completion.episode.id
+        self.reason = completion.episode.reason
+        self.outcome = completion.outcome.rawValue
+        self.cancellationReason = completion.cancellationReason?.rawValue
+        self.episodeAutomatic = completion.episode.automatic
+        self.startedAtUptime = completion.episode.startedAtUptime
+        self.finishedAtUptime = completion.finishedAtUptime
+        self.elapsedMs = PriorMapRecoveryDiagnostics.elapsedMs(
+            episode: completion.episode,
+            completion: completion,
+            now: completion.finishedAtUptime)
+        self.validMatcherAttempts = completion.episode.validMatcherAttempts
+        self.acceptedCorrections = completion.episode.acceptedCorrections
+        self.triggerCount = completion.episode.triggerCount
+        self.automaticTriggerCount = completion.episode.automaticTriggerCount
+        self.reliableLoopTriggerCount =
+            completion.episode.reliableLoopTriggerCount
+        self.lastTriggerReason = completion.episode.lastTriggerReason
+        self.lastTriggerAtUptime = completion.episode.lastTriggerAtUptime
+        self.selectedHypothesisId = completion.selectedHypothesisId
+        self.freshSupportFrames = completion.finalFreshSupportFrames
+        self.finalResidualTranslationM = completion.finalResidualTranslationM
+        self.finalResidualYawRad = completion.finalResidualYawRad
+        self.completionFrameStepApplied =
+            completion.correctionStepAppliedOnCompletionFrame
+    }
+}
+
 struct PriorMapHypothesisTraceBinding: Equatable {
     let currentHypothesisVisible: Bool
     let currentSelectedHypothesisId: Int?

@@ -145,6 +145,17 @@ enum LocalizationEvidenceBundleValidator {
                 requiredNonEmpty: false,
                 strictlyIncreasingTimestamps: false,
                 recordIdField: "observation_id"),
+            // Terminal Recovery lifecycle evidence (P7R5). Timestamps are
+            // monotonic uptimes, not node-timebase stamps, so this contract
+            // is validated through the recovery-specific business branch.
+            JSONLContract(
+                fileName: "localization_recovery_events.jsonl",
+                format: "MarketScannerRecoveryLifecycleEvent",
+                version: 1,
+                expectedCount: nil,
+                requiredNonEmpty: false,
+                strictlyIncreasingTimestamps: false,
+                recordIdField: nil),
         ]
         var blockers: [String] = []
         var summaries: [String: JSONLValidationSummary] = [:]
@@ -393,6 +404,28 @@ enum LocalizationEvidenceBundleValidator {
         _ object: [String: Any],
         fileName: String
     ) throws -> Double {
+        if fileName == "localization_recovery_events.jsonl" {
+            // Recovery lifecycle records carry monotonic uptimes instead of
+            // the node-timebase contract: episodes may terminate during scan
+            // teardown when no frame binding exists.
+            guard let started = strictNumber(field(
+                    object, "started_at_uptime", "startedAtUptime")),
+                  let finished = strictNumber(field(
+                    object, "finished_at_uptime", "finishedAtUptime")),
+                  finished >= started,
+                  strictInteger(field(object, "episode_id", "episodeId")) != nil,
+                  strictInteger(field(
+                    object,
+                    "valid_matcher_attempts",
+                    "validMatcherAttempts")) != nil,
+                  strictInteger(field(
+                    object, "trigger_count", "triggerCount")) != nil,
+                  nonEmptyString(object["reason"]),
+                  nonEmptyString(object["outcome"]) else {
+                throw validationError("recovery_business_schema_invalid")
+            }
+            return finished
+        }
         let frameTimestamp = fileName == "tag_observations.jsonl"
             || fileName == "manual_localization_events.jsonl"
         let rawKey = frameTimestamp ? "frameTimestamp" : "timestamp"

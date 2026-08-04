@@ -76,6 +76,7 @@ struct ScanSegmentMetadata: Codable {
     let manualLocalizationEvents: String?
     let localizationConstraints: String?
     let localizationEvents: String?
+    let localizationRecoveryEvents: String?
     let tagObservations: String?
     let localizedPriceTags: String?
     let localizedPriceTagCount: Int?
@@ -1328,6 +1329,7 @@ final class SupermarketScanSession {
             for fileName in [
                 "manual_localization_events.jsonl",
                 "tag_observations.jsonl",
+                PriorMapRecoveryLifecycleRecord.fileName,
             ] {
                 let url = segmentDirectory.appendingPathComponent(fileName)
                 if !sidecarWriter.fileExists(at: url) {
@@ -1763,16 +1765,82 @@ final class SupermarketScanSession {
         return result.succeeded
     }
 
+    /// Persists one terminal Recovery lifecycle record (F-02). Required
+    /// evidence: a write failure marks the session processing-ineligible
+    /// while the raw database stays saved. Allowed during finalization
+    /// because scan-stop teardown must commit the terminal state before the
+    /// sidecar snapshot, and identity guards still reject stale generations.
+    @discardableResult
+    func appendRecoveryLifecycleEvent(
+        _ completion: PriorMapRecoveryCompletion,
+        expectedTrackingSessionId: String
+    ) -> Bool {
+        localizationTransactionLock.lock()
+        defer { localizationTransactionLock.unlock() }
+        guard let priorMapId = scanConfiguration.priorMapId,
+              let priorMapSha256 = scanConfiguration.priorMapSha256,
+              let floorId = scanConfiguration.floorId,
+              completion.episode.startedAtUptime.isFinite,
+              completion.finishedAtUptime.isFinite,
+              completion.finishedAtUptime
+                  >= completion.episode.startedAtUptime,
+              !completion.episode.reason.isEmpty,
+              !completion.episode.lastTriggerReason.isEmpty,
+              completion.episode.triggerCount >= 1 else {
+            print("Refused to persist an invalid recovery lifecycle event")
+            let failures = [
+                PriorMapRecoveryLifecycleRecord.fileName:
+                    "recovery_event_validation_failed"
+            ]
+            recordLocalizationEvidenceFailures(failures)
+            appendScanEvent(
+                level: "error",
+                event: "recovery_lifecycle_event_write_failed",
+                message: "Recovery lifecycle evidence failed validation",
+                fields: ["reason": "recovery_event_validation_failed"])
+            return false
+        }
+        let record = PriorMapRecoveryLifecycleRecord(
+            trackingSessionId: expectedTrackingSessionId,
+            priorMapId: priorMapId,
+            priorMapSha256: priorMapSha256,
+            floorId: floorId,
+            completion: completion)
+        let result = appendLocalizationRecord(
+            record,
+            fileName: PriorMapRecoveryLifecycleRecord.fileName,
+            expectedTrackingSessionId: expectedTrackingSessionId,
+            allowDuringFinalization: true)
+        if !result.succeeded {
+            let failures = [
+                PriorMapRecoveryLifecycleRecord.fileName:
+                    result.errorReason ?? "write_failed"
+            ]
+            recordLocalizationEvidenceFailures(failures)
+            appendScanEvent(
+                level: "error",
+                event: "recovery_lifecycle_event_write_failed",
+                message: "Required recovery lifecycle evidence was not persisted",
+                fields: [
+                    "reason":
+                        failures[PriorMapRecoveryLifecycleRecord.fileName]!,
+                ])
+        }
+        return result.succeeded
+    }
+
     @discardableResult
     private func appendLocalizationRecord<T: Encodable>(
         _ record: T,
         fileName: String,
-        expectedTrackingSessionId: String
+        expectedTrackingSessionId: String,
+        allowDuringFinalization: Bool = false
     ) -> LocalizationRecordWriteResult {
         let directory: URL
         do {
             directory = try activeLocalizationDirectory(
-                expectedTrackingSessionId: expectedTrackingSessionId)
+                expectedTrackingSessionId: expectedTrackingSessionId,
+                allowDuringFinalization: allowDuringFinalization)
         }
         catch {
             return LocalizationRecordWriteResult(
@@ -1800,10 +1868,11 @@ final class SupermarketScanSession {
     }
 
     private func activeLocalizationDirectory(
-        expectedTrackingSessionId: String
+        expectedTrackingSessionId: String,
+        allowDuringFinalization: Bool = false
     ) throws -> URL {
         captureLock.lock()
-        guard !finalizingScan,
+        guard (allowDuringFinalization || !finalizingScan),
               expectedTrackingSessionId == trackingSessionId,
               let root = rootDirectory,
               segmentIndex == 1 else {

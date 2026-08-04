@@ -394,6 +394,8 @@ final class PriorMapStageOneLocalizer {
     private var alignmentVersion = 0
     private var consecutiveUntrustedFrames = 0
     private var pendingRecoveryCompletion: PriorMapRecoveryCompletion?
+    private var terminalRecoveryCompletionsAwaitingEvidence:
+        [PriorMapRecoveryCompletion] = []
 
     init(
         package: PriorMapPackage,
@@ -481,7 +483,8 @@ final class PriorMapStageOneLocalizer {
         finalFreshSupportFrames: Int = 0,
         finalResidualTranslationM: Double? = nil,
         finalResidualYawRad: Double? = nil,
-        correctionStepAppliedOnCompletionFrame: Bool = false
+        correctionStepAppliedOnCompletionFrame: Bool = false,
+        cancellationReason: PriorMapRecoveryCancellationReason? = nil
     ) -> PriorMapRecoveryCompletion? {
         guard let episode = recoveryController.activeEpisode else { return nil }
         hypothesisTracker.endRecoveryEpisode(id: episode.id, outcome: outcome)
@@ -493,8 +496,12 @@ final class PriorMapStageOneLocalizer {
             finalResidualTranslationM: finalResidualTranslationM,
             finalResidualYawRad: finalResidualYawRad,
             correctionStepAppliedOnCompletionFrame:
-                correctionStepAppliedOnCompletionFrame)
+                correctionStepAppliedOnCompletionFrame,
+            cancellationReason: cancellationReason)
         pendingRecoveryCompletion = completion
+        if let completion {
+            terminalRecoveryCompletionsAwaitingEvidence.append(completion)
+        }
         return completion
     }
 
@@ -504,8 +511,26 @@ final class PriorMapStageOneLocalizer {
             now: monotonicClock.now)
     }
 
-    func cancelRecovery() {
-        _ = finishRecovery(outcome: .cancelled, now: monotonicClock.now)
+    /// Cancels the active Recovery episode and returns the terminal completion
+    /// (F-02). Callers must persist the lifecycle evidence before unbinding
+    /// the localizer; a teardown must never be fire-and-forget.
+    @discardableResult
+    func cancelRecovery(
+        reason: PriorMapRecoveryCancellationReason,
+        now: TimeInterval
+    ) -> PriorMapRecoveryCompletion? {
+        return finishRecovery(
+            outcome: .cancelled,
+            now: now,
+            cancellationReason: reason)
+    }
+
+    /// Returns and clears every terminal completion not yet persisted as
+    /// lifecycle evidence. Ordering preserves episode finish order.
+    func drainTerminalRecoveryCompletions() -> [PriorMapRecoveryCompletion] {
+        let completions = terminalRecoveryCompletionsAwaitingEvidence
+        terminalRecoveryCompletionsAwaitingEvidence.removeAll()
+        return completions
     }
 
     func update(frame: ARFrame, trackingState: String) -> PriorMapLocalizationUpdate {

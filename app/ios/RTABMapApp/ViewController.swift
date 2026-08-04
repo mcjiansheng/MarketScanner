@@ -2571,6 +2571,15 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
 
     private func clearPriorMapLocalization()
     {
+        // F-02: persist the terminal Recovery completion before unbinding.
+        // Teardown must never be a fire-and-forget cancel: the lifecycle
+        // record is written first, confirmed, and only then is the localizer
+        // released.
+        if let session = supermarketSession {
+            persistTerminalRecoveryEvidence(
+                reason: .mapUnloaded,
+                scanSession: session)
+        }
         let localizerToCancel = priorMapLocalizer
         priorMapGeneration = UUID()
         priorMapLocalizer = nil
@@ -2581,7 +2590,12 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         priorMapUpdateGate.reset()
         if let localizerToCancel {
             priorMapQueue.async {
-                localizerToCancel.cancelRecovery()
+                // Defensive: the episode was already cancelled and drained by
+                // persistTerminalRecoveryEvidence, so this returns nil unless
+                // a never-persisted episode somehow outlived the teardown.
+                _ = localizerToCancel.cancelRecovery(
+                    reason: .mapUnloaded,
+                    now: ProcessInfo.processInfo.systemUptime)
             }
         }
         priceTagVisionScanner.reset()
@@ -2596,6 +2610,39 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                 overlay?.removeFromSuperview()
             }
         }
+    }
+
+    /// F-02: persists every terminal Recovery completion as lifecycle
+    /// evidence before the localizer is unbound. Ordering inside the serial
+    /// queue is strict: finish Recovery, build the record, write required
+    /// evidence, confirm, and only then may callers clean up the localizer.
+    /// Returns false when any required write failed (fail closed).
+    @discardableResult
+    private func persistTerminalRecoveryEvidence(
+        reason: PriorMapRecoveryCancellationReason?,
+        scanSession: SupermarketScanSession
+    ) -> Bool {
+        guard scanSession.scanConfiguration.workflowMode
+                == .priorMapLocalized else {
+            return true
+        }
+        let trackingSessionId = scanSession.trackingSessionId
+        var allSucceeded = true
+        priorMapQueue.sync {
+            guard let localizer = self.priorMapLocalizer else { return }
+            if let reason {
+                _ = localizer.cancelRecovery(
+                    reason: reason,
+                    now: ProcessInfo.processInfo.systemUptime)
+            }
+            for completion in localizer.drainTerminalRecoveryCompletions() {
+                let saved = scanSession.appendRecoveryLifecycleEvent(
+                    completion,
+                    expectedTrackingSessionId: trackingSessionId)
+                allSucceeded = allSucceeded && saved
+            }
+        }
+        return allSucceeded
     }
 
     private func presentLocalizationEvidenceWriteFailure(_ failedFiles: [String]) {
@@ -2716,6 +2763,18 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                 expectedTrackingSessionId: trackingSessionId,
                 nodeTimebaseOffsetSeconds:
                     nodeTimebase?.offsetSeconds ?? .nan)
+            // F-02: every terminal episode completion must leave the device as
+            // persisted lifecycle evidence, including converged, timed out,
+            // and manual-reset outcomes consumed on this frame.
+            var recoveryEvidenceSucceeded = true
+            for completion in localizer.drainTerminalRecoveryCompletions() {
+                let saved = self.supermarketSession?
+                    .appendRecoveryLifecycleEvent(
+                        completion,
+                        expectedTrackingSessionId: trackingSessionId) ?? false
+                recoveryEvidenceSucceeded =
+                    recoveryEvidenceSucceeded && saved
+            }
             DispatchQueue.main.async {
                 guard generation == self.priorMapGeneration else {
                     return
@@ -2725,6 +2784,13 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                     self.priorMapAlignmentSnapshots.reset()
                     self.presentLocalizationEvidenceWriteFailure(
                         writeResult.failedRequiredFiles)
+                    return
+                }
+                if !recoveryEvidenceSucceeded {
+                    self.priceTagVisionScanner.reset()
+                    self.priorMapAlignmentSnapshots.reset()
+                    self.presentLocalizationEvidenceWriteFailure(
+                        [PriorMapRecoveryLifecycleRecord.fileName])
                     return
                 }
                 if let alignmentSnapshot {
@@ -3784,6 +3850,14 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                 "scanStorageBytes": "\(mLatestScanStorageBytes)",
                 "priorMapQueueDrained": priorMapDrained ? "true" : "false",
             ])
+        // F-02: commit the terminal Recovery lifecycle evidence before any
+        // sidecar snapshot. A failed write increments the required evidence
+        // failure counter read by the eligibility check below (fail closed).
+        if scanSession.scanConfiguration.workflowMode == .priorMapLocalized {
+            _ = persistTerminalRecoveryEvidence(
+                reason: .scanStopped,
+                scanSession: scanSession)
+        }
         let exportBaseDirectory = scanSession.customBaseDirectorySnapshot()
         let didStartSecurityScope = exportBaseDirectory?.startAccessingSecurityScopedResource() ?? false
         let originValues = rtabmap?.cameraOriginOffset()
@@ -3939,6 +4013,9 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                             : nil,
                         localizationEvents: scanSession.scanConfiguration.workflowMode == .priorMapLocalized
                             ? "localization_events.jsonl"
+                            : nil,
+                        localizationRecoveryEvents: scanSession.scanConfiguration.workflowMode == .priorMapLocalized
+                            ? "localization_recovery_events.jsonl"
                             : nil,
                         tagObservations: scanSession.scanConfiguration.workflowMode == .priorMapLocalized
                             ? "tag_observations.jsonl"
