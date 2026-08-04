@@ -1,6 +1,6 @@
 # 已有地图辅助扫描数据格式
 
-> 文档状态：**当前有效**。最后核对日期：2026-08-02。
+> 文档状态：**当前有效**。最后核对日期：2026-08-04。
 
 ## 会话元数据
 
@@ -32,6 +32,7 @@
   "manualLocalizationEvents": "manual_localization_events.jsonl",
   "localizationConstraints": "localization_constraints.jsonl",
   "localizationEvents": "localization_events.jsonl",
+  "localizationRecoveryEvents": "localization_recovery_events.jsonl",
   "tagObservations": "tag_observations.jsonl",
   "localizedPriceTags": "localized_price_tags.json",
   "localizedPriceTagCount": 12,
@@ -51,7 +52,7 @@
 
 实时 `live_checkpoint.json` 同步记录业务模式、地图身份、`updatedAtUnix` 和 capture health。`metadata.json` 是最终 sidecar bundle 的最后提交标记，并在最终提交时记录 `finalizedAtUnix`。metadata 写入失败属于提交前失败，可恢复录制；一旦 `finalized=true` 成功写入即进入不可逆终态。其后的 checkpoint 删除失败只能标记“已完成、待清理”，不得恢复相机或继续写数据库。手机和 PC 的显式清理都要求 finalized、同 tracking identity、两个有限 Unix 时间且 `checkpoint.updatedAtUnix <= metadata.finalizedAtUnix`，并在删除前写审计；正常 PC 优化仍无条件拒绝任何残留 checkpoint。
 
-prior-map 会话提交 metadata 前，在 sidecar 写锁内重新读取实际文件字节。`localization_trace.jsonl`、`localization_constraints.jsonl`、`localization_events.jsonl` 必须是非符号链接的非空 regular file，严格 UTF-8、每行完整 JSON object、format/version/会话/地图/floor 身份一致，记录数必须与 capture health 一致，最后 state 必须与 `localizationLastDurableState` 水位一致。`localized_price_tags.json` 必须是合法数组且数量、身份一致；manual/tag observation 可以为空，但非空时同样必须通过格式和身份校验。任何 required 文件丢失、空、半行、损坏、链接、数量或身份不符，手机都把 metadata 降级为 `finalized=false/invalid`，写入稳定的 `evidence_bundle_*` blocker 并保留 checkpoint；不得创建空 required 文件掩盖丢失。自由扫描仍按既有完成条件结束。
+prior-map 会话提交 metadata 前，在 sidecar 写锁内重新读取实际文件字节。`localization_trace.jsonl`、`localization_constraints.jsonl`、`localization_events.jsonl` 必须是非符号链接的非空 regular file，严格 UTF-8、每行完整 JSON object、format/version/会话/地图/floor 身份一致，记录数必须与 capture health 一致，最后 state 必须与 `localizationLastDurableState` 水位一致。`localized_price_tags.json` 必须是合法数组且数量、身份一致；manual/tag observation 与 `localization_recovery_events.jsonl`（P7R5 终态 Recovery 生命周期证据，uptime 时间戳而非 node-timebase）可以为空，但非空时同样必须通过格式和身份校验。任何 required 文件丢失、空、半行、损坏、链接、数量或身份不符，手机都把 metadata 降级为 `finalized=false/invalid`，写入稳定的 `evidence_bundle_*` blocker 并保留 checkpoint；不得创建空 required 文件掩盖丢失。自由扫描仍按既有完成条件结束。
 
 checkpoint cleanup 是显式破坏性恢复事务。iOS 与 PC 都按 path component 验证 session/唯一 `segment_0001`，拒绝 symlink；Windows 额外拒绝 junction/reparse point。metadata、checkpoint 和既有 audit 文件以 no-follow descriptor 打开，`fstat` 证明 regular file 和设备/文件身份，授权审计后重新打开并比较身份、长度和字节，再删除同一 checkpoint；删除失败追加 `finalization_checkpoint_cleanup_failed`，审计自身失败会明确记录 degraded。Map Studio inspect 返回客户端看到的 tracking identity、finalized time 及 metadata/checkpoint SHA-256；POST 必须携带严格 `confirmed=true` 和全部 expected evidence，任何变化返回 HTTP 409 `checkpoint_cleanup_conflict`。普通 inspect/reprocess 从不自动删除。
 
@@ -180,3 +181,9 @@ helper 可用且所有门通过时 `solver.type=relative_se2_factor_graph`、`fu
 `localization_constraints.jsonl` keeps version 1 and adds `measurementAccepted`, `correctionStepApplied`, `confidenceAccepted`, and `disposition`. `accepted=true` means a formal high-confidence constraint only. `provisional_recovery_step` must always have `accepted=false` and `confidenceAccepted=false`; the PC reader fails closed on a contradictory record. Allowed dispositions are `rejected`, `provisional_recovery_step`, `accepted_local`, and `accepted_recovery_convergence`. All numeric diagnostics must be finite.
 
 Recovery completion fields belong to the completed episode. On a completion frame the flat current-hypothesis fields are left empty rather than associating a new Local candidate with the old Recovery outcome. A just-converged frame is at most `usable`; only later ordinary Local evidence may reach `stable`, and only `stable` may authorize automatic price-tag confirmation.
+
+# P7R5 terminal Recovery lifecycle evidence
+
+`localization_recovery_events.jsonl` carries one `MarketScannerRecoveryLifecycleEvent` version 1 record per finished Recovery episode, including teardowns (scan stop, map unload) that never see another update frame. Fields: `format`, `version`, `tracking_session_id`, `prior_map_id`, `prior_map_sha256`, `floor_id`, `episode_id`, `reason`, `outcome` (`converged`/`timed_out`/`cancelled`/`manual_reset`), nullable `cancellation_reason` (`scan_stopped`/`map_unloaded`/`app_interrupted`/`session_generation_changed`/`operator_cancelled`), `episode_automatic`, `started_at_uptime`, `finished_at_uptime`, `elapsed_ms` (bound to `finished_at_uptime` when a completion exists, never to a later consuming frame), `valid_matcher_attempts`, `accepted_corrections`, `trigger_count`, `automatic_trigger_count`, `reliable_loop_trigger_count`, `last_trigger_reason`, `last_trigger_at_uptime`, nullable `selected_hypothesis_id`, `fresh_support_frames`, nullable `final_residual_translation_m`/`final_residual_yaw_rad`, and `completion_frame_step_applied`.
+
+Timestamps are monotonic uptimes, not node-timebase stamps; the evidence bundle validator checks identity and format through a recovery-specific branch with non-strict timestamp ordering. The file is an optional contract in `LocalizationEvidenceBundleValidator` and is created empty for every `prior_map_localized` session. Writing a terminal record is required evidence: any append failure increments the localization required-write failure counter and makes the session processing-ineligible (fail closed). Cancellation outcomes are reconciled with the automatic cooldown: convergence/manual reset clears it, timeouts extend it regardless of trigger source, and cancellations follow their explicit reason (`scan_stopped`/`app_interrupted` suppress automatic retry). Each episode retains a bounded trigger summary: at most eight trigger records plus automatic/reliable-loop counters and the last trigger reason/uptime.

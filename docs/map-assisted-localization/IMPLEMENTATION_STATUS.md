@@ -1,6 +1,6 @@
 # 地图辅助定位实现状态
 
-> 文档状态：**当前有效**。最后核对日期：2026-08-03。
+> 文档状态：**当前有效**。最后核对日期：2026-08-04。
 
 2026-08-02 的 Sam 真实扫描暴露了数据库位姿与 iOS prior-map 坐标契约不一致、reciprocal loop 被过严判为矛盾边、在线定位长期歧义和交互困难。现场证据、指标、根因、代码整改和同一优化数据库的只读回归结果见 [`SAM_SCAN_REPORT_2026-08-02.md`](SAM_SCAN_REPORT_2026-08-02.md)。修复后完整因子图已覆盖 4,442 个节点并收敛，测试草稿可查看；修复后的 iPhone 真机重扫和现场控制点验收仍未执行，不能据此标记生产通过。
 
@@ -117,3 +117,7 @@ P7 已实现 loopback-only server、每次启动随机且不落盘的 token、PO
 P7R4 production implementation `981ff4e208f74c8d4dd451d32df88233089e3201`, based on cloud P7R3 `998c175e40562fffd85fe45579a358c485a65b30`, is **IMPLEMENTED / focused AUTOMATED TESTED**. It closes intermediate-step confidence promotion, timeout/final-step ambiguity, strict post-match deadline enforcement, automatic Recovery cooldown, episode-bound completion diagnostics, matcher search disposition, post-Recovery Local trust, automatic tag-confirm safety, and exposes the real localizer anchor/frame-disposition/completion-binding boundaries to production-shared integration tests. The shared update reducer produces correction, confidence, constraint, Recovery action, next phase, and diagnostics for both production `update(frame:)` and T5/T6/T8/T12. P7R2 global alignment and P7R3 episode freshness/budget/cleanup invariants remain unchanged.
 
 Swift host execution, Xcode/UIKit/ARKit, LiDAR, exact-final-SHA seven-group CI, independent review, and Sam field re-test are not yet complete and must not be reported as PASS. Current release status remains **NO-GO / NOT PRODUCTION READY**; the maximum pre-field decision after CI and independent review is `READY FOR HUMAN SAM RE-TEST`.
+
+# P7R5 Recovery terminal closeout update
+
+P7R5, based on P7R4 HEAD `e2b1cf4142b5a3bc353909af77158199bbf09e5f` (implementation `981ff4e208f74c8d4dd451d32df88233089e3201`), is **IMPLEMENTED / focused AUTOMATED TESTED** on branch `repair-v2-p7r5-recovery-terminal-closeout`; its exact implementation SHA is bound in `.github/marketscanner-repair-v2-wave.json`. It closes F-01 (the automatic cooldown is now reconciled against the terminal outcome: convergence and manual reset clear stale cooldown, timeouts extend it regardless of trigger source, cancellations follow their explicit reason), F-02 (every terminal Recovery completion, including scan-stop and map-unload cancellations, is persisted as `MarketScannerRecoveryLifecycleEvent` v1 evidence in `localization_recovery_events.jsonl` before localizer teardown; append failures fail closed and make the session processing-ineligible), F-03 (pending-completion elapsed time is bound to the completion finish time through one shared diagnostics reducer), and F-04 (repeated triggers retain a bounded source summary: automatic/reliable-loop counters, last reason/uptime, and at most eight trigger records). P7R2 global alignment, P7R3 episode budget/freshness, and P7R4 confidence/provisional/deadline invariants remain unchanged.
