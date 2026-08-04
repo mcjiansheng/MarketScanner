@@ -2878,6 +2878,1026 @@ if let p7r6FirstCompletion, let p7r6SecondCompletion {
             "P7R6 invalidated sessions must discard queued completions")
 }
 
+// P7R6 W1-W11 / I1-I15: executable teardown-to-finalization transactions.
+// The Swift host cannot link the UIKit session types, so these tests run the
+// exact production persistence chain on a real file system: controller ->
+// peek/ack coordinator -> durable sidecar writer -> finalization validator.
+func p7r6FreshDirectory(_ label: String) throws -> URL {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(
+            "p7r6-\(label)-\(UUID().uuidString)",
+            isDirectory: true)
+    try FileManager.default.createDirectory(
+        at: directory,
+        withIntermediateDirectories: true)
+    return directory
+}
+
+func p7r6WriteBaseBundle(
+    in directory: URL,
+    createRecoveryFile: Bool = true
+) throws -> URL {
+    try evidenceRecord(format: "MarketScannerLocalizationTrace")
+        .write(to: directory.appendingPathComponent("localization_trace.jsonl"))
+    try evidenceRecord(format: "MarketScannerLocalizationConstraint")
+        .write(to: directory.appendingPathComponent(
+            "localization_constraints.jsonl"))
+    try evidenceRecord(
+        format: "MarketScannerLocalizationStateEvent",
+        state: "stable")
+        .write(to: directory.appendingPathComponent("localization_events.jsonl"))
+    try Data().write(to: directory.appendingPathComponent(
+        "manual_localization_events.jsonl"))
+    try Data().write(to: directory.appendingPathComponent(
+        "tag_observations.jsonl"))
+    try Data("[]".utf8).write(to: directory.appendingPathComponent(
+        "localized_price_tags.json"))
+    let recoveryURL = directory.appendingPathComponent(
+        PriorMapRecoveryLifecycleRecord.fileName)
+    if createRecoveryFile {
+        try Data().write(to: recoveryURL)
+    }
+    return recoveryURL
+}
+
+func p7r6BundleExpectation(
+    recoveryCount: Int,
+    lastEpisodeId: Int? = nil,
+    lastFinishedAtUptime: TimeInterval? = nil
+) -> LocalizationEvidenceBundleExpectation {
+    return LocalizationEvidenceBundleExpectation(
+        trackingSessionId: "session-a",
+        priorMapId: "map-a",
+        priorMapSha256: String(repeating: "a", count: 64),
+        floorId: "1",
+        traceRecordCount: 1,
+        constraintRecordCount: 1,
+        stateEventCount: 1,
+        lastDurableState: "stable",
+        localizedPriceTagCount: 0,
+        recoveryEventCount: recoveryCount,
+        lastRecoveryEpisodeId: lastEpisodeId,
+        lastRecoveryFinishedAtUptime: lastFinishedAtUptime)
+}
+
+func p7r6EncodedLifecycleLine(
+    _ record: PriorMapRecoveryLifecycleRecord
+) throws -> Data {
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = .sortedKeys
+    var line = try encoder.encode(record)
+    line.append(0x0A)
+    return line
+}
+
+func p7r6PersistedEvidenceLines(in directory: URL) throws -> [Data] {
+    let url = directory.appendingPathComponent(
+        PriorMapRecoveryLifecycleRecord.fileName)
+    // Mirrors the session snapshot: a missing sidecar is an empty evidence
+    // snapshot, not a read failure.
+    guard FileManager.default.fileExists(atPath: url.path) else {
+        return []
+    }
+    return try Data(contentsOf: url).split(separator: 0x0A).map { Data($0) }
+}
+
+func p7r6LifecycleObjects(in directory: URL) throws -> [[String: Any]] {
+    return try p7r6PersistedEvidenceLines(in: directory).map { line in
+        guard let object = try JSONSerialization.jsonObject(with: line)
+            as? [String: Any] else {
+            throw NSError(domain: "P7R6Tests", code: 1)
+        }
+        return object
+    }
+}
+
+/// Durable Recovery lifecycle writer mirroring SupermarketScanSession:
+/// session identity gate -> strict record validation -> sortedKeys JSONL
+/// append -> watermark advance only after the durable write, otherwise a
+/// counted required-write failure.
+final class P7R6DurableRecoveryWriter: RecoveryLifecycleWriting {
+    let directory: URL
+    let trackingSessionId: String
+    private let sidecarWriter: FoundationScanSidecarWriter
+    private(set) var localizationRecoveryEventCount = 0
+    private(set) var lastRecoveryEpisodeId: Int?
+    private(set) var lastRecoveryFinishedAtUptime: TimeInterval?
+    private(set) var requiredWriteFailureCount = 0
+
+    init(
+        directory: URL,
+        trackingSessionId: String,
+        sidecarWriter: FoundationScanSidecarWriter
+    ) {
+        self.directory = directory
+        self.trackingSessionId = trackingSessionId
+        self.sidecarWriter = sidecarWriter
+    }
+
+    var recoveryURL: URL {
+        return directory.appendingPathComponent(
+            PriorMapRecoveryLifecycleRecord.fileName)
+    }
+
+    func appendRecoveryLifecycleEvent(
+        _ completion: PriorMapRecoveryCompletion,
+        expectedTrackingSessionId: String
+    ) -> Bool {
+        guard expectedTrackingSessionId == trackingSessionId,
+              completion.episode.startedAtUptime.isFinite,
+              completion.finishedAtUptime.isFinite,
+              completion.finishedAtUptime
+                  >= completion.episode.startedAtUptime,
+              !completion.episode.reason.isEmpty,
+              !completion.episode.lastTriggerReason.isEmpty,
+              completion.episode.triggerCount >= 1 else {
+            requiredWriteFailureCount += 1
+            return false
+        }
+        let record = PriorMapRecoveryLifecycleRecord(
+            trackingSessionId: trackingSessionId,
+            priorMapId: "map-a",
+            priorMapSha256: String(repeating: "a", count: 64),
+            floorId: "1",
+            completion: completion)
+        do {
+            try sidecarWriter.append(
+                try p7r6EncodedLifecycleLine(record),
+                to: recoveryURL)
+        }
+        catch {
+            requiredWriteFailureCount += 1
+            return false
+        }
+        localizationRecoveryEventCount += 1
+        lastRecoveryEpisodeId = completion.episode.id
+        lastRecoveryFinishedAtUptime = completion.finishedAtUptime
+        return true
+    }
+
+    /// Mirrors the session's manual-localization append on reset.
+    func appendManualLocalizationLine(_ data: Data) throws {
+        try sidecarWriter.append(
+            data,
+            to: directory.appendingPathComponent(
+                "manual_localization_events.jsonl"))
+    }
+}
+
+/// Peek/ack source mirroring the localizer: teardown cancellation finishes
+/// the active episode into the queue; completions stay queued until acked.
+final class P7R6BundleSource: RecoveryCompletionDraining {
+    let controller: PriorMapRecoveryController
+    var pending: [PriorMapRecoveryCompletion] = []
+
+    init(controller: PriorMapRecoveryController) {
+        self.controller = controller
+    }
+
+    func cancelRecovery(
+        reason: PriorMapRecoveryCancellationReason,
+        now: TimeInterval
+    ) -> PriorMapRecoveryCompletion? {
+        guard let completion = controller.finish(
+            .cancelled,
+            now: now,
+            cancellationReason: reason) else {
+            return nil
+        }
+        pending.append(completion)
+        return completion
+    }
+
+    func pendingTerminalRecoveryCompletions()
+        -> [PriorMapRecoveryCompletion] {
+        return pending
+    }
+
+    func acknowledgeTerminalRecoveryCompletion(episodeId: Int) {
+        pending.removeAll { $0.episode.id == episodeId }
+    }
+
+    func discardTerminalRecoveryCompletionsForInvalidatedSession() {
+        pending.removeAll()
+    }
+}
+
+func p7r6Coordinator(
+    source: RecoveryCompletionDraining,
+    writer: RecoveryLifecycleWriting,
+    trackingSessionId: String = "session-a",
+    persistedEvidenceLines: @escaping () throws -> [Data]
+) -> RecoveryLifecyclePersistenceCoordinator {
+    return RecoveryLifecyclePersistenceCoordinator(
+        source: source,
+        writer: writer,
+        trackingSessionId: trackingSessionId,
+        priorMapId: "map-a",
+        priorMapSha256: String(repeating: "a", count: 64),
+        floorId: "1",
+        persistedEvidenceLines: persistedEvidenceLines)
+}
+
+// W1: expected watermark 0 with an empty sidecar validates.
+do {
+    let directory = try p7r6FreshDirectory("w1")
+    _ = try p7r6WriteBaseBundle(in: directory)
+    require(
+        LocalizationEvidenceBundleValidator.blockers(
+            in: directory,
+            expectation: p7r6BundleExpectation(recoveryCount: 0)).isEmpty,
+        "W1 expected 0 + empty file must validate")
+}
+
+// W2: expected watermark 1 with one valid record validates.
+do {
+    let directory = try p7r6FreshDirectory("w2")
+    let recoveryURL = try p7r6WriteBaseBundle(in: directory)
+    try recoveryLifecycleData.write(to: recoveryURL)
+    require(
+        LocalizationEvidenceBundleValidator.blockers(
+            in: directory,
+            expectation: p7r6BundleExpectation(
+                recoveryCount: 1,
+                lastEpisodeId: 1,
+                lastFinishedAtUptime: 14.5)).isEmpty,
+        "W2 expected 1 + one valid record must validate")
+}
+
+// W3/W4: exact-count watermark mismatches fail closed.
+do {
+    let directory = try p7r6FreshDirectory("w3")
+    let recoveryURL = try p7r6WriteBaseBundle(in: directory)
+    require(
+        LocalizationEvidenceBundleValidator.blockers(
+            in: directory,
+            expectation: p7r6BundleExpectation(
+                recoveryCount: 1,
+                lastEpisodeId: 1,
+                lastFinishedAtUptime: 14.5)).contains {
+                    $0.contains("localization_recovery_events.jsonl_empty")
+                },
+        "W3 expected 1 + empty file must fail closed")
+    try recoveryLifecycleData.write(to: recoveryURL)
+    require(
+        LocalizationEvidenceBundleValidator.blockers(
+            in: directory,
+            expectation: p7r6BundleExpectation(
+                recoveryCount: 2,
+                lastEpisodeId: 1,
+                lastFinishedAtUptime: 14.5)).contains {
+                    $0.contains("localization_recovery_events.jsonl_count_mismatch")
+                },
+        "W4 expected 2 + one record must fail count_mismatch")
+}
+
+// W5: a deleted sidecar fails closed and is never rebuilt silently.
+do {
+    let directory = try p7r6FreshDirectory("w5")
+    let recoveryURL = try p7r6WriteBaseBundle(in: directory)
+    try FileManager.default.removeItem(at: recoveryURL)
+    require(
+        LocalizationEvidenceBundleValidator.blockers(
+            in: directory,
+            expectation: p7r6BundleExpectation(
+                recoveryCount: 1,
+                lastEpisodeId: 1,
+                lastFinishedAtUptime: 14.5)).contains {
+                    $0.contains("localization_recovery_events.jsonl")
+                },
+        "W5 a deleted recovery sidecar must fail validation")
+}
+
+// W6: finalization must not mask a lost watermark by rebuilding an empty
+// file. The session policy only creates the sidecar while zero episodes are
+// expected; otherwise the missing file stays a blocker.
+do {
+    let directory = try p7r6FreshDirectory("w6")
+    let recoveryURL = try p7r6WriteBaseBundle(
+        in: directory,
+        createRecoveryFile: false)
+    let expectedRecoveryEventCount = 1
+    var finalizationBlockers: [String] = []
+    if !FileManager.default.fileExists(atPath: recoveryURL.path) {
+        if expectedRecoveryEventCount == 0 {
+            try Data().write(to: recoveryURL)
+        }
+        else {
+            finalizationBlockers.append(
+                "evidence_bundle_recovery_file_missing_blocker")
+        }
+    }
+    finalizationBlockers += LocalizationEvidenceBundleValidator.blockers(
+        in: directory,
+        expectation: p7r6BundleExpectation(
+            recoveryCount: expectedRecoveryEventCount,
+            lastEpisodeId: 1,
+            lastFinishedAtUptime: 14.5))
+    require(
+        finalizationBlockers.contains(
+            "evidence_bundle_recovery_file_missing_blocker")
+            && finalizationBlockers.contains {
+                $0.contains("localization_recovery_events.jsonl")
+            },
+        "W6 rebuilding lost recovery evidence as an empty file must stay"
+            + " blocked: \(finalizationBlockers)")
+}
+
+// W7: a partial final line fails closed.
+do {
+    let directory = try p7r6FreshDirectory("w7")
+    let recoveryURL = try p7r6WriteBaseBundle(in: directory)
+    var partial = recoveryLifecycleData
+    partial.append(contentsOf: Data("{\"format\":\"MarketSc".utf8))
+    try partial.write(to: recoveryURL)
+    require(
+        LocalizationEvidenceBundleValidator.blockers(
+            in: directory,
+            expectation: p7r6BundleExpectation(
+                recoveryCount: 1,
+                lastEpisodeId: 1,
+                lastFinishedAtUptime: 14.5)).contains {
+                    $0.contains("invalid_utf8_or_partial_line")
+                },
+        "W7 a partial final line must fail closed")
+}
+
+// W8: a symlinked sidecar fails the stable-read check.
+do {
+    let directory = try p7r6FreshDirectory("w8")
+    let recoveryURL = try p7r6WriteBaseBundle(in: directory)
+    let outside = directory.deletingLastPathComponent()
+        .appendingPathComponent("p7r6-w8-target-\(UUID().uuidString).jsonl")
+    try recoveryLifecycleData.write(to: outside)
+    try FileManager.default.removeItem(at: recoveryURL)
+    try FileManager.default.createSymbolicLink(
+        at: recoveryURL,
+        withDestinationURL: outside)
+    require(
+        LocalizationEvidenceBundleValidator.blockers(
+            in: directory,
+            expectation: p7r6BundleExpectation(
+                recoveryCount: 1,
+                lastEpisodeId: 1,
+                lastFinishedAtUptime: 14.5)).contains {
+                    $0.contains("localization_recovery_events.jsonl")
+                },
+        "W8 a symlinked recovery sidecar must fail closed")
+    try? FileManager.default.removeItem(at: outside)
+}
+
+// W9: a file swapped during the stable read fails closed.
+do {
+    let directory = try p7r6FreshDirectory("w9")
+    let recoveryURL = try p7r6WriteBaseBundle(in: directory)
+    try recoveryLifecycleData.write(to: recoveryURL)
+    var swapped = false
+    var swapObserved = false
+    do {
+        _ = try SafeSessionPath.streamRegularFile(
+            recoveryURL,
+            within: directory.deletingLastPathComponent(),
+            maximumBytes: 1024 * 1024,
+            chunkBytes: 64 * 1024
+        ) { _ in
+            guard !swapped else { return }
+            swapped = true
+            try Data("{}".utf8).write(to: recoveryURL)
+        }
+    }
+    catch {
+        swapObserved = (error as NSError).localizedDescription
+            .contains("stream_file_identity_changed_during_read")
+    }
+    require(
+        swapObserved,
+        "W9 a recovery sidecar swapped during read must fail closed")
+}
+
+// W10: a successful durable append increments the watermark exactly once
+// and the resulting bundle validates against finalization.
+do {
+    let directory = try p7r6FreshDirectory("w10")
+    _ = try p7r6WriteBaseBundle(in: directory)
+    let controller = PriorMapRecoveryController()
+    _ = controller.request(reason: "reliable_rtabmap_loop", now: 10)
+    let writer = P7R6DurableRecoveryWriter(
+        directory: directory,
+        trackingSessionId: "session-a",
+        sidecarWriter: FoundationScanSidecarWriter())
+    let source = P7R6BundleSource(controller: controller)
+    let coordinator = p7r6Coordinator(
+        source: source,
+        writer: writer,
+        persistedEvidenceLines: {
+            try p7r6PersistedEvidenceLines(in: directory)
+        })
+    _ = controller.finish(.converged, now: 12)
+    if let completion = controller.lastCompletion {
+        source.pending.append(completion)
+    }
+    let result = coordinator.persistTerminalEvidence(
+        cancellationReason: nil, now: 13)
+    require(
+        result.allPersisted
+            && writer.localizationRecoveryEventCount == 1
+            && writer.requiredWriteFailureCount == 0,
+        "W10 a successful append must increment the count exactly once")
+    require(
+        LocalizationEvidenceBundleValidator.blockers(
+            in: directory,
+            expectation: p7r6BundleExpectation(
+                recoveryCount: writer.localizationRecoveryEventCount,
+                lastEpisodeId: writer.lastRecoveryEpisodeId,
+                lastFinishedAtUptime: writer.lastRecoveryFinishedAtUptime))
+            .isEmpty,
+        "W10 the appended lifecycle record must validate")
+}
+
+// W11: a failed durable append leaves the watermark unchanged and counts a
+// required-write failure.
+do {
+    let directory = try p7r6FreshDirectory("w11")
+    // No pre-created sidecar: the first durable append must take the atomic
+    // create path so the injected rename fault really fires.
+    _ = try p7r6WriteBaseBundle(in: directory, createRecoveryFile: false)
+    let controller = PriorMapRecoveryController()
+    _ = controller.request(reason: "reliable_rtabmap_loop", now: 10)
+    let writer = P7R6DurableRecoveryWriter(
+        directory: directory,
+        trackingSessionId: "session-a",
+        sidecarWriter: FoundationScanSidecarWriter(atomicWriteFault: {
+            stage, _ in
+            if stage == .rename {
+                throw injectedFailure
+            }
+        }))
+    let source = P7R6BundleSource(controller: controller)
+    let coordinator = p7r6Coordinator(
+        source: source,
+        writer: writer,
+        persistedEvidenceLines: {
+            try p7r6PersistedEvidenceLines(in: directory)
+        })
+    _ = controller.finish(.converged, now: 12)
+    if let completion = controller.lastCompletion {
+        source.pending.append(completion)
+    }
+    let result = coordinator.persistTerminalEvidence(
+        cancellationReason: nil, now: 13)
+    require(
+        !result.allPersisted
+            && result.failureReason == "durable_append_failed"
+            && writer.localizationRecoveryEventCount == 0
+            && writer.requiredWriteFailureCount == 1
+            && source.pending.count == 1,
+        "W11 a failed append must keep the count and the completion")
+}
+
+// I1: scan-stop teardown persists exactly one cancelled record and the
+// finalized bundle validates.
+do {
+    let directory = try p7r6FreshDirectory("i1")
+    _ = try p7r6WriteBaseBundle(in: directory)
+    let controller = PriorMapRecoveryController()
+    _ = controller.request(reason: "persistent_weak_or_lost", now: 10, automatic: true)
+    let writer = P7R6DurableRecoveryWriter(
+        directory: directory,
+        trackingSessionId: "session-a",
+        sidecarWriter: FoundationScanSidecarWriter())
+    let source = P7R6BundleSource(controller: controller)
+    let coordinator = p7r6Coordinator(
+        source: source,
+        writer: writer,
+        persistedEvidenceLines: {
+            try p7r6PersistedEvidenceLines(in: directory)
+        })
+    let result = coordinator.persistTerminalEvidence(
+        cancellationReason: .scanStopped, now: 20)
+    let records = try p7r6LifecycleObjects(in: directory)
+    require(
+        result.allPersisted
+            && records.count == 1
+            && (records[0]["outcome"] as? String) == "cancelled"
+            && (records[0]["cancellation_reason"] as? String) == "scan_stopped"
+            && writer.localizationRecoveryEventCount == 1
+            && source.pending.isEmpty,
+        "I1 scan stop must persist one cancelled record: \(records)")
+    require(
+        LocalizationEvidenceBundleValidator.blockers(
+            in: directory,
+            expectation: p7r6BundleExpectation(
+                recoveryCount: 1,
+                lastEpisodeId: writer.lastRecoveryEpisodeId,
+                lastFinishedAtUptime: writer.lastRecoveryFinishedAtUptime))
+            .isEmpty,
+        "I1 the finalized bundle must validate after scan stop")
+}
+
+// I2: map-unload teardown persists one cancelled record.
+do {
+    let directory = try p7r6FreshDirectory("i2")
+    _ = try p7r6WriteBaseBundle(in: directory)
+    let controller = PriorMapRecoveryController()
+    _ = controller.request(reason: "persistent_weak_or_lost", now: 10, automatic: true)
+    let writer = P7R6DurableRecoveryWriter(
+        directory: directory,
+        trackingSessionId: "session-a",
+        sidecarWriter: FoundationScanSidecarWriter())
+    let source = P7R6BundleSource(controller: controller)
+    let coordinator = p7r6Coordinator(
+        source: source,
+        writer: writer,
+        persistedEvidenceLines: {
+            try p7r6PersistedEvidenceLines(in: directory)
+        })
+    let result = coordinator.persistTerminalEvidence(
+        cancellationReason: .mapUnloaded, now: 20)
+    let records = try p7r6LifecycleObjects(in: directory)
+    require(
+        result.allPersisted
+            && records.count == 1
+            && (records[0]["cancellation_reason"] as? String) == "map_unloaded"
+            && writer.localizationRecoveryEventCount == 1,
+        "I2 map unload must persist one cancelled record: \(records)")
+}
+
+// I3: a converged episode persists exactly once with bounded diagnostics.
+do {
+    let directory = try p7r6FreshDirectory("i3")
+    _ = try p7r6WriteBaseBundle(in: directory)
+    let controller = PriorMapRecoveryController()
+    _ = controller.request(reason: "reliable_rtabmap_loop", now: 10)
+    let writer = P7R6DurableRecoveryWriter(
+        directory: directory,
+        trackingSessionId: "session-a",
+        sidecarWriter: FoundationScanSidecarWriter())
+    let source = P7R6BundleSource(controller: controller)
+    let coordinator = p7r6Coordinator(
+        source: source,
+        writer: writer,
+        persistedEvidenceLines: {
+            try p7r6PersistedEvidenceLines(in: directory)
+        })
+    _ = controller.finish(.converged, now: 15)
+    if let completion = controller.lastCompletion {
+        source.pending.append(completion)
+    }
+    let result = coordinator.persistTerminalEvidence(
+        cancellationReason: nil, now: 16)
+    let records = try p7r6LifecycleObjects(in: directory)
+    require(
+        result.allPersisted && records.count == 1,
+        "I3 a converged episode must persist exactly one record")
+    require(
+        (records[0]["outcome"] as? String) == "converged"
+            && close(records[0]["elapsed_ms"] as? Double ?? -1, 5000),
+        "I3 completion diagnostics must bind to the finish time: \(records)")
+    // A repeated transaction must not duplicate the record (strategy A).
+    source.pending = controller.lastCompletion.map { [$0] } ?? []
+    let repeated = coordinator.persistTerminalEvidence(
+        cancellationReason: nil, now: 17)
+    let replayedRecords = try p7r6LifecycleObjects(in: directory)
+    require(
+        repeated.allPersisted
+            && replayedRecords.count == 1
+            && source.pending.isEmpty,
+        "I3 a replayed converged episode must not duplicate the record")
+}
+
+// I4: a timed-out episode persists the timed_out outcome and the cooldown
+// summary suppresses the next automatic trigger.
+do {
+    let directory = try p7r6FreshDirectory("i4")
+    _ = try p7r6WriteBaseBundle(in: directory)
+    let controller = PriorMapRecoveryController()
+    _ = controller.request(reason: "reliable_rtabmap_loop", now: 10)
+    let writer = P7R6DurableRecoveryWriter(
+        directory: directory,
+        trackingSessionId: "session-a",
+        sidecarWriter: FoundationScanSidecarWriter())
+    let source = P7R6BundleSource(controller: controller)
+    let coordinator = p7r6Coordinator(
+        source: source,
+        writer: writer,
+        persistedEvidenceLines: {
+            try p7r6PersistedEvidenceLines(in: directory)
+        })
+    _ = controller.finish(.timedOut, now: 45)
+    if let completion = controller.lastCompletion {
+        source.pending.append(completion)
+    }
+    let result = coordinator.persistTerminalEvidence(
+        cancellationReason: nil, now: 46)
+    let records = try p7r6LifecycleObjects(in: directory)
+    require(
+        result.allPersisted
+            && records.count == 1
+            && (records[0]["outcome"] as? String) == "timed_out",
+        "I4 a timed-out episode must persist the timed_out outcome")
+    require(
+        controller.isAutomaticTriggerSuppressed(now: 50)
+            && !controller.request(
+                reason: "persistent_weak_or_lost", now: 50, automatic: true),
+        "I4 the cooldown summary must suppress the next automatic trigger")
+}
+
+// I5: a manual reset persists the lifecycle event and both the manual event
+// and the lifecycle record carry the matching session identity.
+do {
+    let directory = try p7r6FreshDirectory("i5")
+    _ = try p7r6WriteBaseBundle(in: directory)
+    let controller = PriorMapRecoveryController()
+    _ = controller.request(reason: "persistent_weak_or_lost", now: 10, automatic: true)
+    let writer = P7R6DurableRecoveryWriter(
+        directory: directory,
+        trackingSessionId: "session-a",
+        sidecarWriter: FoundationScanSidecarWriter())
+    let source = P7R6BundleSource(controller: controller)
+    let coordinator = p7r6Coordinator(
+        source: source,
+        writer: writer,
+        persistedEvidenceLines: {
+            try p7r6PersistedEvidenceLines(in: directory)
+        })
+    _ = controller.finish(.manualReset, now: 18)
+    if let completion = controller.lastCompletion {
+        source.pending.append(completion)
+    }
+    let result = coordinator.persistTerminalEvidence(
+        cancellationReason: nil, now: 19)
+    // The session also appends the manual localization event on reset.
+    var manualLine = try JSONSerialization.data(withJSONObject: [
+        "format": "MarketScannerManualLocalizationEvent",
+        "version": 3,
+        "tracking_session_id": "session-a",
+        "episode_id": 1,
+        "outcome": "manual_reset",
+    ])
+    manualLine.append(0x0A)
+    try writer.appendManualLocalizationLine(manualLine)
+    let lifecycleRecords = try p7r6LifecycleObjects(in: directory)
+    let manualRecords = try Data(contentsOf: directory.appendingPathComponent(
+        "manual_localization_events.jsonl"))
+        .split(separator: 0x0A)
+        .compactMap { try? JSONSerialization.jsonObject(with: Data($0))
+            as? [String: Any] }
+    require(
+        result.allPersisted
+            && lifecycleRecords.count == 1
+            && (lifecycleRecords[0]["outcome"] as? String) == "manual_reset"
+            && manualRecords.count == 1,
+        "I5 a manual reset must persist the lifecycle event")
+    require(
+        (lifecycleRecords[0]["tracking_session_id"] as? String)
+            == (manualRecords[0]["tracking_session_id"] as? String)
+            && (lifecycleRecords[0]["episode_id"] as? Int)
+                == (manualRecords[0]["episode_id"] as? Int),
+        "I5 the manual event and lifecycle record identities must match")
+}
+
+// I6: an injected durable-append fault leaves the queue unacknowledged,
+// keeps the watermark, counts a required-write failure, and leaves the
+// bundle invalid for finalization.
+do {
+    let directory = try p7r6FreshDirectory("i6")
+    _ = try p7r6WriteBaseBundle(in: directory, createRecoveryFile: false)
+    let controller = PriorMapRecoveryController()
+    _ = controller.request(reason: "persistent_weak_or_lost", now: 10, automatic: true)
+    let writer = P7R6DurableRecoveryWriter(
+        directory: directory,
+        trackingSessionId: "session-a",
+        sidecarWriter: FoundationScanSidecarWriter(atomicWriteFault: {
+            stage, _ in
+            if stage == .rename {
+                throw injectedFailure
+            }
+        }))
+    let source = P7R6BundleSource(controller: controller)
+    let coordinator = p7r6Coordinator(
+        source: source,
+        writer: writer,
+        persistedEvidenceLines: {
+            try p7r6PersistedEvidenceLines(in: directory)
+        })
+    _ = controller.finish(.converged, now: 12)
+    if let completion = controller.lastCompletion {
+        source.pending.append(completion)
+    }
+    let result = coordinator.persistTerminalEvidence(
+        cancellationReason: nil, now: 13)
+    require(
+        !result.allPersisted
+            && result.failureReason == "durable_append_failed"
+            && source.pending.count == 1
+            && writer.localizationRecoveryEventCount == 0
+            && writer.requiredWriteFailureCount == 1,
+        "I6 an append fault must keep the queue and the watermark")
+    require(
+        LocalizationEvidenceBundleValidator.blockers(
+            in: directory,
+            expectation: p7r6BundleExpectation(
+                recoveryCount: 1,
+                lastEpisodeId: 1,
+                lastFinishedAtUptime: 12)).contains {
+                    $0.contains("localization_recovery_events.jsonl")
+                },
+        "I6 a failed append must leave finalization invalid")
+
+    // I7: the retry persists the same episode exactly once.
+    let retryWriter = P7R6DurableRecoveryWriter(
+        directory: directory,
+        trackingSessionId: "session-a",
+        sidecarWriter: FoundationScanSidecarWriter())
+    let retryCoordinator = p7r6Coordinator(
+        source: source,
+        writer: retryWriter,
+        persistedEvidenceLines: {
+            try p7r6PersistedEvidenceLines(in: directory)
+        })
+    let retry = retryCoordinator.persistTerminalEvidence(
+        cancellationReason: nil, now: 14)
+    let records = try p7r6LifecycleObjects(in: directory)
+    require(
+        retry.allPersisted
+            && records.count == 1
+            && retryWriter.localizationRecoveryEventCount == 1
+            && source.pending.isEmpty,
+        "I7 the retry must persist the same episode exactly once")
+}
+
+// I8: a stale tracking session identity rejects the write without counting.
+do {
+    let directory = try p7r6FreshDirectory("i8")
+    _ = try p7r6WriteBaseBundle(in: directory)
+    let controller = PriorMapRecoveryController()
+    _ = controller.request(reason: "persistent_weak_or_lost", now: 10, automatic: true)
+    let writer = P7R6DurableRecoveryWriter(
+        directory: directory,
+        trackingSessionId: "session-b",
+        sidecarWriter: FoundationScanSidecarWriter())
+    let source = P7R6BundleSource(controller: controller)
+    let coordinator = p7r6Coordinator(
+        source: source,
+        writer: writer,
+        persistedEvidenceLines: {
+            try p7r6PersistedEvidenceLines(in: directory)
+        })
+    _ = controller.finish(.converged, now: 12)
+    if let completion = controller.lastCompletion {
+        source.pending.append(completion)
+    }
+    let result = coordinator.persistTerminalEvidence(
+        cancellationReason: nil, now: 13)
+    let staleFileData = try Data(contentsOf: writer.recoveryURL)
+    require(
+        !result.allPersisted
+            && result.failureReason == "durable_append_failed"
+            && writer.localizationRecoveryEventCount == 0
+            && writer.requiredWriteFailureCount == 1
+            && source.pending.count == 1
+            && staleFileData.isEmpty,
+        "I8 a stale session identity must reject the write")
+}
+
+// I9: a generation change discards old completions before they can enter the
+// new session.
+do {
+    let directory = try p7r6FreshDirectory("i9")
+    _ = try p7r6WriteBaseBundle(in: directory)
+    let controller = PriorMapRecoveryController()
+    _ = controller.request(reason: "persistent_weak_or_lost", now: 10, automatic: true)
+    let writer = P7R6DurableRecoveryWriter(
+        directory: directory,
+        trackingSessionId: "session-a",
+        sidecarWriter: FoundationScanSidecarWriter())
+    let source = P7R6BundleSource(controller: controller)
+    _ = controller.finish(.converged, now: 12)
+    if let completion = controller.lastCompletion {
+        source.pending.append(completion)
+    }
+    // The session generation changed: queued completions are discarded.
+    source.discardTerminalRecoveryCompletionsForInvalidatedSession()
+    let coordinator = p7r6Coordinator(
+        source: source,
+        writer: writer,
+        persistedEvidenceLines: {
+            try p7r6PersistedEvidenceLines(in: directory)
+        })
+    let result = coordinator.persistTerminalEvidence(
+        cancellationReason: nil, now: 13)
+    let generationFileData = try Data(contentsOf: writer.recoveryURL)
+    require(
+        result.allPersisted
+            && result.attemptedEpisodeIds.isEmpty
+            && writer.localizationRecoveryEventCount == 0
+            && generationFileData.isEmpty,
+        "I9 a generation change must keep old completions out")
+}
+
+// I10: deleting the lifecycle file after the watermark advanced blocks
+// finalization.
+do {
+    let directory = try p7r6FreshDirectory("i10")
+    _ = try p7r6WriteBaseBundle(in: directory)
+    let controller = PriorMapRecoveryController()
+    _ = controller.request(reason: "reliable_rtabmap_loop", now: 10)
+    let writer = P7R6DurableRecoveryWriter(
+        directory: directory,
+        trackingSessionId: "session-a",
+        sidecarWriter: FoundationScanSidecarWriter())
+    let source = P7R6BundleSource(controller: controller)
+    let coordinator = p7r6Coordinator(
+        source: source,
+        writer: writer,
+        persistedEvidenceLines: {
+            try p7r6PersistedEvidenceLines(in: directory)
+        })
+    _ = controller.finish(.converged, now: 12)
+    if let completion = controller.lastCompletion {
+        source.pending.append(completion)
+    }
+    _ = coordinator.persistTerminalEvidence(cancellationReason: nil, now: 13)
+    require(writer.localizationRecoveryEventCount == 1,
+            "I10 requires one persisted episode")
+    try FileManager.default.removeItem(at: writer.recoveryURL)
+    require(
+        LocalizationEvidenceBundleValidator.blockers(
+            in: directory,
+            expectation: p7r6BundleExpectation(
+                recoveryCount: 1,
+                lastEpisodeId: writer.lastRecoveryEpisodeId,
+                lastFinishedAtUptime: writer.lastRecoveryFinishedAtUptime))
+            .contains {
+                $0.contains("localization_recovery_events.jsonl")
+            },
+        "I10 deleting the lifecycle file must block finalization")
+}
+
+// I11: truncating the final line blocks finalization.
+do {
+    let directory = try p7r6FreshDirectory("i11")
+    let recoveryURL = try p7r6WriteBaseBundle(in: directory)
+    try recoveryLifecycleData.write(to: recoveryURL)
+    var truncated = recoveryLifecycleData
+    truncated.removeLast()
+    try truncated.write(to: recoveryURL)
+    require(
+        LocalizationEvidenceBundleValidator.blockers(
+            in: directory,
+            expectation: p7r6BundleExpectation(
+                recoveryCount: 1,
+                lastEpisodeId: 1,
+                lastFinishedAtUptime: 14.5)).contains {
+                    $0.contains("localization_recovery_events.jsonl")
+                },
+        "I11 truncating the final line must block finalization")
+}
+
+// I12: a duplicated episode line blocks finalization.
+do {
+    let directory = try p7r6FreshDirectory("i12")
+    let recoveryURL = try p7r6WriteBaseBundle(in: directory)
+    var duplicated = recoveryLifecycleData
+    duplicated.append(recoveryLifecycleData)
+    try duplicated.write(to: recoveryURL)
+    require(
+        !LocalizationEvidenceBundleValidator.blockers(
+            in: directory,
+            expectation: p7r6BundleExpectation(
+                recoveryCount: 1,
+                lastEpisodeId: 1,
+                lastFinishedAtUptime: 14.5)).isEmpty,
+        "I12 a duplicated episode line must block finalization")
+}
+
+// I13: no episodes validate with an empty file and watermark zero.
+do {
+    let directory = try p7r6FreshDirectory("i13")
+    _ = try p7r6WriteBaseBundle(in: directory)
+    let controller = PriorMapRecoveryController()
+    let writer = P7R6DurableRecoveryWriter(
+        directory: directory,
+        trackingSessionId: "session-a",
+        sidecarWriter: FoundationScanSidecarWriter())
+    let source = P7R6BundleSource(controller: controller)
+    let coordinator = p7r6Coordinator(
+        source: source,
+        writer: writer,
+        persistedEvidenceLines: {
+            try p7r6PersistedEvidenceLines(in: directory)
+        })
+    let result = coordinator.persistTerminalEvidence(
+        cancellationReason: .scanStopped, now: 20)
+    require(
+        result.allPersisted
+            && result.attemptedEpisodeIds.isEmpty
+            && writer.localizationRecoveryEventCount == 0,
+        "I13 a teardown without episodes must persist nothing")
+    require(
+        LocalizationEvidenceBundleValidator.blockers(
+            in: directory,
+            expectation: p7r6BundleExpectation(recoveryCount: 0)).isEmpty,
+        "I13 no episodes must validate with expected count 0")
+}
+
+// I14: pending completions persist on the prior-map queue in strict
+// serialized order and none is lost.
+do {
+    let directory = try p7r6FreshDirectory("i14")
+    _ = try p7r6WriteBaseBundle(in: directory)
+    let controller = PriorMapRecoveryController()
+    let writer = P7R6DurableRecoveryWriter(
+        directory: directory,
+        trackingSessionId: "session-a",
+        sidecarWriter: FoundationScanSidecarWriter())
+    let source = P7R6BundleSource(controller: controller)
+    _ = controller.request(reason: "reliable_rtabmap_loop", now: 10)
+    _ = controller.finish(.converged, now: 11)
+    if let completion = controller.lastCompletion {
+        source.pending.append(completion)
+    }
+    _ = controller.request(reason: "reliable_rtabmap_loop", now: 12)
+    _ = controller.finish(.timedOut, now: 13)
+    if let completion = controller.lastCompletion {
+        source.pending.append(completion)
+    }
+    source.pending.reverse()
+    let coordinator = p7r6Coordinator(
+        source: source,
+        writer: writer,
+        persistedEvidenceLines: {
+            try p7r6PersistedEvidenceLines(in: directory)
+        })
+    let queue = DispatchQueue(label: "p7r6.i14.prior-map")
+    let group = DispatchGroup()
+    queue.async(group: group) {
+        _ = coordinator.persistTerminalEvidence(
+            cancellationReason: nil, now: 20)
+    }
+    queue.async(group: group) {
+        _ = coordinator.persistTerminalEvidence(
+            cancellationReason: nil, now: 21)
+    }
+    require(
+        group.wait(timeout: .now() + 10) == .success,
+        "I14 serialized persistence must complete")
+    let serializedRecords = try p7r6LifecycleObjects(in: directory)
+    require(
+        writer.localizationRecoveryEventCount == 2
+            && serializedRecords
+                .compactMap { $0["episode_id"] as? Int } == [1, 2]
+            && source.pending.isEmpty,
+        "I14 strict serialized order must persist every completion once")
+}
+
+// I15: invoking the teardown coordinator from a wrong queue must not
+// deadlock; the coordinator holds no locks so the caller's dispatch policy
+// decides ordering.
+do {
+    let directory = try p7r6FreshDirectory("i15")
+    _ = try p7r6WriteBaseBundle(in: directory)
+    let controller = PriorMapRecoveryController()
+    let writer = P7R6DurableRecoveryWriter(
+        directory: directory,
+        trackingSessionId: "session-a",
+        sidecarWriter: FoundationScanSidecarWriter())
+    let source = P7R6BundleSource(controller: controller)
+    _ = controller.request(reason: "reliable_rtabmap_loop", now: 10)
+    _ = controller.finish(.converged, now: 11)
+    if let completion = controller.lastCompletion {
+        source.pending.append(completion)
+    }
+    let coordinator = p7r6Coordinator(
+        source: source,
+        writer: writer,
+        persistedEvidenceLines: {
+            try p7r6PersistedEvidenceLines(in: directory)
+        })
+    let priorMapQueue = DispatchQueue(label: "p7r6.i15.prior-map")
+    let wrongQueue = DispatchQueue(label: "p7r6.i15.wrong")
+    let done = DispatchSemaphore(value: 0)
+    wrongQueue.async {
+        _ = coordinator.persistTerminalEvidence(
+            cancellationReason: nil, now: 20)
+        done.signal()
+    }
+    require(
+        done.wait(timeout: .now() + 10) == .success,
+        "I15 a wrong-queue teardown invocation must not deadlock")
+    let second = DispatchSemaphore(value: 0)
+    priorMapQueue.async {
+        _ = coordinator.persistTerminalEvidence(
+            cancellationReason: nil, now: 21)
+        second.signal()
+    }
+    require(
+        second.wait(timeout: .now() + 10) == .success
+            && writer.localizationRecoveryEventCount == 1
+            && source.pending.isEmpty,
+        "I15 the prior-map queue transaction must still persist exactly once")
+}
+
 if CommandLine.arguments.count == 2 {
     do {
         let digest = try PriorMapPackageIntegrity.validate(
