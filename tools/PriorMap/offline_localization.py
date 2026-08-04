@@ -40,7 +40,7 @@ HARD_REJECT_TRANSLATION_M = 2.5
 HARD_REJECT_YAW_RAD = math.radians(45)
 MANUAL_ANCHOR_MAX_TRANSLATION_M = 5.0
 MANUAL_ANCHOR_MAX_YAW_RAD = math.radians(30.0)
-SESSION_INPUT_FILE_NAMES = (
+SESSION_INPUT_FILE_NAMES_V1 = (
     "metadata.json",
     "localization_trace.jsonl",
     "localization_constraints.jsonl",
@@ -49,6 +49,23 @@ SESSION_INPUT_FILE_NAMES = (
     "tag_observations.jsonl",
     "localized_price_tags.json",
 )
+# P7R6: manifest version 2 binds the terminal Recovery lifecycle sidecar into
+# the immutable input identity. The file is inserted at a fixed position so
+# historical v1 manifests keep their canonical bundle hash untouched.
+SESSION_INPUT_FILE_NAMES_V2 = (
+    "metadata.json",
+    "localization_trace.jsonl",
+    "localization_constraints.jsonl",
+    "localization_events.jsonl",
+    "localization_recovery_events.jsonl",
+    "manual_localization_events.jsonl",
+    "tag_observations.jsonl",
+    "localized_price_tags.json",
+)
+# Historical alias: v1 stays the legacy contract and never carries Recovery
+# evidence binding.
+SESSION_INPUT_FILE_NAMES = SESSION_INPUT_FILE_NAMES_V1
+RECOVERY_EVIDENCE_UNBOUND_LEGACY = "recovery_lifecycle_evidence_unbound_legacy"
 EDITABLE_TAG_FIELDS = frozenset(
     {
         "shelf_code",
@@ -221,29 +238,40 @@ def session_input_bundle_sha256(payload: dict[str, Any]) -> str:
     if (
         not isinstance(payload, dict)
         or payload.get("format") != "MarketScannerLocalizedInputManifest"
-        or payload.get("version") != 1
-        or set(payload)
-        not in (
-            {
-                "format",
-                "version",
-                "source_database_sha256",
-                "files",
-                "bundle_sha256",
-            },
-            {
-                "format",
-                "version",
-                "source_database_sha256",
-                "files",
-                "bundle_sha256",
-                "input_identity_id",
-            },
-        )
+    ):
+        raise OfflineLocalizationError("Session input manifest contract is invalid.")
+    version = payload.get("version")
+    if version == 1:
+        file_names = SESSION_INPUT_FILE_NAMES_V1
+    elif version == 2:
+        file_names = SESSION_INPUT_FILE_NAMES_V2
+    else:
+        raise OfflineLocalizationError("Session input manifest contract is invalid.")
+    base_keys = {
+        "format",
+        "version",
+        "source_database_sha256",
+        "files",
+        "bundle_sha256",
+    }
+    if set(payload) not in (
+        base_keys,
+        base_keys | {"input_identity_id"},
+        base_keys | {"recovery_evidence_binding"},
+        base_keys | {"input_identity_id", "recovery_evidence_binding"},
+    ):
+        raise OfflineLocalizationError("Session input manifest contract is invalid.")
+    # v1 historical sessions must never pretend to carry P7R6 recovery
+    # evidence; v2 sessions are bound by construction and forbid the marker.
+    recovery_binding = payload.get("recovery_evidence_binding")
+    if recovery_binding is not None and (
+        not isinstance(recovery_binding, str)
+        or recovery_binding != RECOVERY_EVIDENCE_UNBOUND_LEGACY
+        or version != 1
     ):
         raise OfflineLocalizationError("Session input manifest contract is invalid.")
     files = payload.get("files")
-    expected_roles = ("metadata", "source_database", *SESSION_INPUT_FILE_NAMES[1:])
+    expected_roles = ("metadata", "source_database", *file_names[1:])
     if not isinstance(files, list) or len(files) != len(expected_roles):
         raise OfflineLocalizationError("Session input manifest file set is invalid.")
     for entry, role in zip(files, expected_roles):
@@ -288,7 +316,14 @@ def session_input_bundle_sha256(payload: dict[str, Any]) -> str:
 def build_session_input_manifest(
     segment: Path, source_database: Path
 ) -> dict[str, Any]:
-    """Build the deterministic identity of every authoritative finalized input."""
+    """Build the deterministic identity of every authoritative finalized input.
+
+    Sessions carrying the P7R6 capture watermark (``captureHealth.
+    localizationRecoveryEventCount``) build manifest version 2 and bind the
+    Recovery lifecycle sidecar: a missing or tampered file fails the build.
+    Older sessions keep manifest version 1 and are explicitly marked as
+    ``recovery_lifecycle_evidence_unbound_legacy``.
+    """
 
     try:
         if source_database.resolve().parent != segment.resolve():
@@ -297,22 +332,48 @@ def build_session_input_manifest(
             )
     except OSError as exc:
         raise OfflineLocalizationError("Session input paths could not be resolved.") from exc
+    metadata = load_json(segment / "metadata.json")
+    capture_health = (
+        metadata.get("captureHealth") if isinstance(metadata, dict) else None
+    )
+    recovery_bound = (
+        isinstance(capture_health, dict)
+        and "localizationRecoveryEventCount" in capture_health
+    )
+    if recovery_bound:
+        manifest_version = 2
+        file_names = SESSION_INPUT_FILE_NAMES_V2
+    else:
+        manifest_version = 1
+        file_names = SESSION_INPUT_FILE_NAMES_V1
     files = [
         _regular_file_identity(segment / "metadata.json", "metadata"),
         _regular_file_identity(source_database, "source_database"),
         *(
             _regular_file_identity(segment / name, name)
-            for name in SESSION_INPUT_FILE_NAMES[1:]
+            for name in file_names[1:]
         ),
     ]
     manifest: dict[str, Any] = {
         "format": "MarketScannerLocalizedInputManifest",
-        "version": 1,
+        "version": manifest_version,
         "source_database_sha256": files[1]["sha256"],
         "files": files,
     }
+    if manifest_version == 1:
+        manifest["recovery_evidence_binding"] = (
+            RECOVERY_EVIDENCE_UNBOUND_LEGACY
+        )
+    # The bundle hash only binds the canonical identity payload; audit markers
+    # stay outside so historical v1 digests remain reproducible.
+    canonical_manifest = {
+        "format": manifest["format"],
+        "version": manifest["version"],
+        "source_database_sha256": manifest["source_database_sha256"],
+        "files": manifest["files"],
+    }
     manifest["bundle_sha256"] = hashlib.sha256(
-        _canonical_json_bytes(manifest)
+        _canonical_json_bytes(canonical_manifest)
     ).hexdigest()
     session_input_bundle_sha256(manifest)
     return manifest
@@ -459,6 +520,19 @@ MANUAL_EVENT_CONTRACT = JsonlContract(
         "timestampUnix",
     ),
 )
+# P7R6: terminal Recovery lifecycle evidence. Timestamps are monotonic
+# uptimes, not node-timebase stamps; ``allow_empty`` only means a session
+# without any Recovery episode may carry an empty file, and the record count
+# must still match the finalized capture watermark exactly.
+RECOVERY_EVENT_CONTRACT = JsonlContract(
+    "localization_recovery_events",
+    "MarketScannerRecoveryLifecycleEvent",
+    frozenset({1, 2}),
+    True,
+    True,
+    ("finished_at_uptime",),
+    record_id_field="episode_id",
+)
 
 
 def _json_write(path: Path, payload: Any, *, lines: bool = False) -> None:
@@ -575,6 +649,224 @@ def _strict_number(value: Any) -> float | None:
         return None
     number = float(value)
     return number if math.isfinite(number) else None
+
+
+def _strict_integer(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and math.isfinite(value) and value.is_integer():
+        return int(value)
+    return None
+
+
+RECOVERY_OUTCOMES = frozenset(
+    {"converged", "timed_out", "cancelled", "manual_reset"}
+)
+RECOVERY_CANCELLATION_REASONS = frozenset(
+    {
+        "scan_stopped",
+        "map_unloaded",
+        "app_interrupted",
+        "session_generation_changed",
+        "operator_cancelled",
+    }
+)
+RECOVERY_EVENT_BASE_FIELDS = frozenset(
+    {
+        "format", "version", "tracking_session_id", "prior_map_id",
+        "prior_map_sha256", "floor_id", "episode_id", "reason",
+        "outcome", "cancellation_reason", "episode_automatic",
+        "started_at_uptime", "finished_at_uptime", "elapsed_ms",
+        "valid_matcher_attempts", "accepted_corrections",
+        "trigger_count", "automatic_trigger_count",
+        "reliable_loop_trigger_count", "last_trigger_reason",
+        "last_trigger_at_uptime", "selected_hypothesis_id",
+        "fresh_support_frames", "final_residual_translation_m",
+        "final_residual_yaw_rad", "completion_frame_step_applied",
+    }
+)
+# v2 additionally persists the deadline, the attempts budget and the bounded
+# trigger source sequence.
+RECOVERY_EVENT_V2_FIELDS = RECOVERY_EVENT_BASE_FIELDS | frozenset(
+    {"deadline_uptime", "maximum_valid_attempts", "trigger_records"}
+)
+
+
+def _validate_recovery_trigger_records(
+    value: dict[str, Any],
+    started_at_uptime: float,
+    finished_at_uptime: float,
+    last_trigger_at_uptime: float,
+    line_label: str,
+) -> None:
+    records = value.get("trigger_records")
+    if not isinstance(records, list) or not records or len(records) > 8:
+        raise OfflineLocalizationError(
+            f"recovery_trigger_records_invalid at {line_label}"
+        )
+    previous_uptime: float | None = None
+    for record in records:
+        uptime = _strict_number(record.get("at_uptime") if isinstance(record, dict) else None)
+        if (
+            not isinstance(record, dict)
+            or set(record) - {"reason", "automatic", "at_uptime"}
+            or not isinstance(record.get("reason"), str)
+            or not record.get("reason")
+            or not isinstance(record.get("automatic"), bool)
+            or uptime is None
+            or uptime < started_at_uptime
+            or uptime > finished_at_uptime
+        ):
+            raise OfflineLocalizationError(
+                f"recovery_trigger_records_invalid at {line_label}"
+            )
+        if previous_uptime is not None and uptime < previous_uptime:
+            raise OfflineLocalizationError(
+                f"recovery_trigger_records_invalid at {line_label}"
+            )
+        previous_uptime = uptime
+    # Bounded eviction may drop early records, but the newest retained record
+    # must always agree with the persisted trigger summary.
+    newest = records[-1]
+    newest_uptime = _strict_number(newest.get("at_uptime"))
+    if (
+        newest.get("reason") != value.get("last_trigger_reason")
+        or newest_uptime is None
+        or abs(newest_uptime - last_trigger_at_uptime) > 1.0e-9
+    ):
+        raise OfflineLocalizationError(
+            f"recovery_trigger_records_invalid at {line_label}"
+        )
+
+
+def _validate_recovery_event_record(value: dict[str, Any], line_label: str) -> None:
+    """Mirror the on-device R6-03 strict lifecycle schema, fail closed."""
+
+    version = value.get("version")
+    allowed_fields = (
+        RECOVERY_EVENT_V2_FIELDS if version == 2 else RECOVERY_EVENT_BASE_FIELDS
+    )
+    if set(value) - allowed_fields:
+        raise OfflineLocalizationError(f"recovery_unknown_field at {line_label}")
+    outcome = value.get("outcome")
+    if outcome not in RECOVERY_OUTCOMES:
+        raise OfflineLocalizationError(f"recovery_outcome_invalid at {line_label}")
+    cancellation = value.get("cancellation_reason")
+    if outcome == "cancelled":
+        if cancellation not in RECOVERY_CANCELLATION_REASONS:
+            raise OfflineLocalizationError(
+                f"recovery_cancellation_reason_invalid at {line_label}"
+            )
+    elif cancellation is not None:
+        raise OfflineLocalizationError(
+            f"recovery_cancellation_reason_invalid at {line_label}"
+        )
+    started = _strict_number(value.get("started_at_uptime"))
+    finished = _strict_number(value.get("finished_at_uptime"))
+    elapsed_ms = _strict_number(value.get("elapsed_ms"))
+    episode_id = _strict_integer(value.get("episode_id"))
+    valid_attempts = _strict_integer(value.get("valid_matcher_attempts"))
+    accepted_corrections = _strict_integer(value.get("accepted_corrections"))
+    trigger_count = _strict_integer(value.get("trigger_count"))
+    automatic_count = _strict_integer(value.get("automatic_trigger_count"))
+    reliable_count = _strict_integer(value.get("reliable_loop_trigger_count"))
+    last_trigger_reason = value.get("last_trigger_reason")
+    last_trigger_at = _strict_number(value.get("last_trigger_at_uptime"))
+    fresh_frames = _strict_integer(value.get("fresh_support_frames"))
+    if (
+        started is None
+        or started < 0
+        or finished is None
+        or finished < started
+        or elapsed_ms is None
+        or elapsed_ms < 0
+        or abs(elapsed_ms - (finished - started) * 1000.0) > 1.0
+        or episode_id is None
+        or episode_id <= 0
+        or valid_attempts is None
+        or valid_attempts < 0
+        or accepted_corrections is None
+        or not 0 <= accepted_corrections <= valid_attempts
+        or trigger_count is None
+        or trigger_count < 1
+        or automatic_count is None
+        or automatic_count < 0
+        or reliable_count is None
+        or reliable_count < 0
+        or automatic_count + reliable_count != trigger_count
+        or not isinstance(last_trigger_reason, str)
+        or not last_trigger_reason
+        or last_trigger_at is None
+        or last_trigger_at < started
+        or last_trigger_at > finished
+        or fresh_frames is None
+        or fresh_frames < 0
+        or not isinstance(value.get("episode_automatic"), bool)
+        or not isinstance(value.get("completion_frame_step_applied"), bool)
+        or not isinstance(value.get("reason"), str)
+        or not value.get("reason")
+    ):
+        raise OfflineLocalizationError(
+            f"recovery_business_schema_invalid at {line_label}"
+        )
+    if version == 2:
+        deadline = _strict_number(value.get("deadline_uptime"))
+        maximum_attempts = _strict_integer(value.get("maximum_valid_attempts"))
+        if (
+            deadline is None
+            or deadline < started
+            or maximum_attempts is None
+            or maximum_attempts < 1
+            or valid_attempts > maximum_attempts
+        ):
+            raise OfflineLocalizationError(
+                f"recovery_business_schema_invalid at {line_label}"
+            )
+        _validate_recovery_trigger_records(
+            value,
+            started,
+            finished,
+            last_trigger_at,
+            line_label,
+        )
+    hypothesis = value.get("selected_hypothesis_id")
+    if hypothesis is not None:
+        hypothesis_id = _strict_integer(hypothesis)
+        if hypothesis_id is None or hypothesis_id <= 0:
+            raise OfflineLocalizationError(
+                f"recovery_business_schema_invalid at {line_label}"
+            )
+    for field_name in ("final_residual_translation_m", "final_residual_yaw_rad"):
+        residual = value.get(field_name)
+        if residual is not None:
+            residual_number = _strict_number(residual)
+            if residual_number is None or residual_number < 0:
+                raise OfflineLocalizationError(
+                    f"recovery_business_schema_invalid at {line_label}"
+                )
+
+
+def _validate_recovery_event_sequence(values: Sequence[dict[str, Any]]) -> None:
+    """Episode set contract: IDs strictly increase and terminal finish uptimes
+    never move backwards."""
+
+    previous_episode_id: int | None = None
+    previous_finished: float | None = None
+    for value in values:
+        episode_id = _strict_integer(value.get("episode_id"))
+        finished = _strict_number(value.get("finished_at_uptime"))
+        if episode_id is None or finished is None:
+            raise OfflineLocalizationError(
+                "recovery_business_schema_invalid at episode sequence"
+            )
+        if previous_episode_id is not None and episode_id <= previous_episode_id:
+            raise OfflineLocalizationError("recovery_episode_order_invalid")
+        if previous_finished is not None and finished < previous_finished:
+            raise OfflineLocalizationError("recovery_finish_order_invalid")
+        previous_episode_id = episode_id
+        previous_finished = finished
 
 
 def _strict_pose(value: Any) -> bool:
@@ -704,6 +996,8 @@ def _validate_jsonl_business_record(
             raise OfflineLocalizationError(f"Missing localization state at {line_label}")
         if confidence is None or not 0 <= confidence <= 1:
             raise OfflineLocalizationError(f"Invalid localization confidence at {line_label}")
+    elif contract.name == "localization_recovery_events":
+        _validate_recovery_event_record(value, line_label)
     elif contract.name == "tag_observations":
         for field in ("observation_id", "payload", "symbology"):
             if not isinstance(value.get(field), str) or not value.get(field):
@@ -3232,12 +3526,77 @@ def _render_localized_version(
         expected_map_hash=sidecar_map_hash,
         expected_floor_id=sidecar_floor_id,
     )
+    # P7R6: terminal Recovery lifecycle evidence. Manifest v2 binds the
+    # sidecar into the immutable input identity and reconciles the record
+    # set against the finalized capture watermark; v1 legacy sessions are
+    # read when the file exists but stay explicitly unbound.
+    input_manifest_version = session_input_manifest.get("version")
+    recovery_watermark = (
+        capture_health.get("localizationRecoveryEventCount")
+        if isinstance(capture_health, dict)
+        else None
+    )
+    if input_manifest_version == 2:
+        if (
+            isinstance(recovery_watermark, bool)
+            or not isinstance(recovery_watermark, int)
+            or recovery_watermark < 0
+        ):
+            raise OfflineLocalizationError(
+                "Input manifest v2 requires the recovery lifecycle watermark."
+            )
+        recovery_events, recovery_diag = _read_jsonl(
+            segment / "localization_recovery_events.jsonl",
+            RECOVERY_EVENT_CONTRACT,
+            session_id=sidecar_session_id,
+            expected_map_hash=sidecar_map_hash,
+            expected_floor_id=sidecar_floor_id,
+        )
+        _validate_recovery_event_sequence(recovery_events)
+        if len(recovery_events) != recovery_watermark:
+            raise OfflineLocalizationError(
+                "Recovery lifecycle evidence count does not match the "
+                "finalized capture watermark."
+            )
+        if recovery_watermark > 0:
+            expected_last_episode = capture_health.get(
+                "localizationLastRecoveryEpisodeId"
+            )
+            expected_last_finished = _strict_number(
+                capture_health.get("localizationLastRecoveryFinishedAtUptime")
+            )
+            last_event = recovery_events[-1]
+            observed_finished = _strict_number(
+                last_event.get("finished_at_uptime")
+            )
+            if (
+                last_event.get("episode_id") != expected_last_episode
+                or expected_last_finished is None
+                or observed_finished is None
+                or abs(observed_finished - expected_last_finished) > 1.0e-9
+            ):
+                raise OfflineLocalizationError(
+                    "Recovery lifecycle watermark does not reconcile with "
+                    "the last persisted episode."
+                )
+        recovery_evidence_binding = "recovery_lifecycle_evidence_bound_v2"
+    else:
+        recovery_events, recovery_diag = _read_jsonl(
+            segment / "localization_recovery_events.jsonl",
+            replace(RECOVERY_EVENT_CONTRACT, required=False),
+            session_id=sidecar_session_id,
+            expected_map_hash=sidecar_map_hash,
+            expected_floor_id=sidecar_floor_id,
+        )
+        _validate_recovery_event_sequence(recovery_events)
+        recovery_evidence_binding = RECOVERY_EVIDENCE_UNBOUND_LEGACY
     jsonl_diagnostics = {
         "localization_trace": trace_diag,
         "localization_constraints": constraint_diag,
         "manual_localization_events": manual_diag,
         "tag_observations": obs_diag,
         "localization_events": state_diag,
+        "localization_recovery_events": recovery_diag,
     }
     has_critical_jsonl_damage = False
     initial = _pose_from(metadata.get("initialMapPose"))
@@ -3755,6 +4114,8 @@ def _render_localized_version(
         "prior_map_id": manifest.get("prior_map_id"),
         "prior_map_sha256": package_hash,
         "session_input_bundle_sha256": expected_bundle_sha256,
+        "session_input_manifest_version": input_manifest_version,
+        "recovery_evidence_binding": recovery_evidence_binding,
         "input_identity_id": input_identity_id,
         "source_database_sha256": source_hash_before,
         "optimized_database_sha256": optimized_db_hash,
@@ -4011,6 +4372,8 @@ def _render_localized_version(
             "version": 2,
             "input_identity_id": input_identity_id,
             "session_input_bundle_sha256": expected_bundle_sha256,
+            "session_input_manifest_version": input_manifest_version,
+            "recovery_evidence_binding": recovery_evidence_binding,
             "pipeline": [
                 "rtabmap_reprocess",
                 "relative_trajectory_read",
