@@ -69,6 +69,40 @@ struct LocalizationEvidenceBundleExpectation {
     let stateEventCount: Int
     let lastDurableState: String
     let localizedPriceTagCount: Int
+    /// P7R6 recovery lifecycle watermark. The sidecar must contain exactly
+    /// one record per durably appended terminal episode; an empty file is
+    /// only legal when no episode was recorded.
+    let recoveryEventCount: Int
+    let lastRecoveryEpisodeId: Int?
+    let lastRecoveryFinishedAtUptime: TimeInterval?
+
+    init(
+        trackingSessionId: String,
+        priorMapId: String,
+        priorMapSha256: String,
+        floorId: String,
+        traceRecordCount: Int,
+        constraintRecordCount: Int,
+        stateEventCount: Int,
+        lastDurableState: String,
+        localizedPriceTagCount: Int,
+        recoveryEventCount: Int = 0,
+        lastRecoveryEpisodeId: Int? = nil,
+        lastRecoveryFinishedAtUptime: TimeInterval? = nil
+    ) {
+        self.trackingSessionId = trackingSessionId
+        self.priorMapId = priorMapId
+        self.priorMapSha256 = priorMapSha256
+        self.floorId = floorId
+        self.traceRecordCount = traceRecordCount
+        self.constraintRecordCount = constraintRecordCount
+        self.stateEventCount = stateEventCount
+        self.lastDurableState = lastDurableState
+        self.localizedPriceTagCount = localizedPriceTagCount
+        self.recoveryEventCount = recoveryEventCount
+        self.lastRecoveryEpisodeId = lastRecoveryEpisodeId
+        self.lastRecoveryFinishedAtUptime = lastRecoveryFinishedAtUptime
+    }
 }
 
 enum LocalizationEvidenceBundleValidator {
@@ -96,6 +130,7 @@ enum LocalizationEvidenceBundleValidator {
         var lastState: String?
         var previousTimestamp: Double?
         var seenRecordIds = Set<String>()
+        var lastRecoveryEpisodeId: Int?
     }
 
     static func blockers(
@@ -145,15 +180,18 @@ enum LocalizationEvidenceBundleValidator {
                 requiredNonEmpty: false,
                 strictlyIncreasingTimestamps: false,
                 recordIdField: "observation_id"),
-            // Terminal Recovery lifecycle evidence (P7R5). Timestamps are
-            // monotonic uptimes, not node-timebase stamps, so this contract
-            // is validated through the recovery-specific business branch.
+            // Terminal Recovery lifecycle evidence (P7R5, P7R6 exact-count).
+            // Timestamps are monotonic uptimes, not node-timebase stamps, so
+            // this contract is validated through the recovery-specific
+            // business branch. The record count is bound to the capture
+            // watermark and the file may only be empty when zero episodes
+            // were recorded.
             JSONLContract(
                 fileName: "localization_recovery_events.jsonl",
                 format: "MarketScannerRecoveryLifecycleEvent",
                 version: 1,
-                expectedCount: nil,
-                requiredNonEmpty: false,
+                expectedCount: expectation.recoveryEventCount,
+                requiredNonEmpty: expectation.recoveryEventCount > 0,
                 strictlyIncreasingTimestamps: false,
                 recordIdField: nil),
         ]
@@ -193,6 +231,28 @@ enum LocalizationEvidenceBundleValidator {
            let lastState = states.lastState,
            lastState != expectation.lastDurableState {
             blockers.append("evidence_bundle_localization_events_watermark_mismatch")
+        }
+        // The recovery watermark must reconcile with the last persisted
+        // episode: same episode ID and same terminal finish uptime.
+        if expectation.recoveryEventCount > 0,
+           let recovery = summaries["localization_recovery_events.jsonl"] {
+            if expectation.lastRecoveryEpisodeId == nil
+                || recovery.lastRecoveryEpisodeId
+                    != expectation.lastRecoveryEpisodeId {
+                blockers.append(
+                    "evidence_bundle_recovery_watermark_mismatch")
+            }
+            if let expectedFinished =
+                expectation.lastRecoveryFinishedAtUptime,
+               let observedFinished = recovery.previousTimestamp,
+               abs(observedFinished - expectedFinished) > 1.0e-9 {
+                blockers.append(
+                    "evidence_bundle_recovery_watermark_mismatch")
+            }
+            else if expectation.lastRecoveryFinishedAtUptime == nil {
+                blockers.append(
+                    "evidence_bundle_recovery_watermark_mismatch")
+            }
         }
         return Array(Set(blockers)).sorted()
     }
@@ -285,7 +345,8 @@ enum LocalizationEvidenceBundleValidator {
         try validateIdentity(object, expectation: expectation)
         let timestamp = try validateBusinessRecord(
             object,
-            fileName: contract.fileName)
+            fileName: contract.fileName,
+            summary: &summary)
         if contract.strictlyIncreasingTimestamps,
            let previous = summary.previousTimestamp,
            timestamp <= previous {
@@ -402,7 +463,8 @@ enum LocalizationEvidenceBundleValidator {
 
     private static func validateBusinessRecord(
         _ object: [String: Any],
-        fileName: String
+        fileName: String,
+        summary: inout JSONLValidationSummary
     ) throws -> Double {
         if fileName == "localization_recovery_events.jsonl" {
             // Recovery lifecycle records carry monotonic uptimes instead of
@@ -413,7 +475,9 @@ enum LocalizationEvidenceBundleValidator {
                   let finished = strictNumber(field(
                     object, "finished_at_uptime", "finishedAtUptime")),
                   finished >= started,
-                  strictInteger(field(object, "episode_id", "episodeId")) != nil,
+                  let episodeId = strictInteger(field(
+                    object, "episode_id", "episodeId")),
+                  episodeId > 0,
                   strictInteger(field(
                     object,
                     "valid_matcher_attempts",
@@ -423,6 +487,22 @@ enum LocalizationEvidenceBundleValidator {
                   nonEmptyString(object["reason"]),
                   nonEmptyString(object["outcome"]) else {
                 throw validationError("recovery_business_schema_invalid")
+            }
+            // Episode set contract: IDs are unique and strictly increasing,
+            // terminal finish uptimes never move backwards, and every record
+            // stays bound to its session watermark.
+            if summary.seenRecordIds.contains("episode_\(episodeId)") {
+                throw validationError("recovery_duplicate_episode")
+            }
+            summary.seenRecordIds.insert("episode_\(episodeId)")
+            if let previousEpisodeId = summary.lastRecoveryEpisodeId,
+               episodeId <= previousEpisodeId {
+                throw validationError("recovery_episode_order_invalid")
+            }
+            summary.lastRecoveryEpisodeId = episodeId
+            if let previousFinished = summary.previousTimestamp,
+               finished < previousFinished {
+                throw validationError("recovery_finish_order_invalid")
             }
             return finished
         }

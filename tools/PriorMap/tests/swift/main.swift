@@ -359,8 +359,10 @@ require(
     initialEvidenceBlockers.isEmpty,
     "a complete persisted evidence bundle must validate: \(initialEvidenceBlockers)")
 
-// P7R5: a valid terminal Recovery lifecycle record validates through the
-// uptime-based branch; an identity mismatch fails closed.
+// P7R6: recovery lifecycle records are reconciled against an exact
+// expected-count watermark. A valid terminal record validates only when the
+// expectation carries the matching watermark; an identity mismatch still
+// fails closed.
 let recoveryEvidenceURL = evidenceDirectory.appendingPathComponent(
     "localization_recovery_events.jsonl")
 let recoveryLifecycleRecord: [String: Any] = [
@@ -392,11 +394,50 @@ var recoveryLifecycleData = try JSONSerialization.data(
     withJSONObject: recoveryLifecycleRecord)
 recoveryLifecycleData.append(0x0A)
 try recoveryLifecycleData.write(to: recoveryEvidenceURL)
+let recoveryExpectation = LocalizationEvidenceBundleExpectation(
+    trackingSessionId: "session-a",
+    priorMapId: "map-a",
+    priorMapSha256: String(repeating: "a", count: 64),
+    floorId: "1",
+    traceRecordCount: 1,
+    constraintRecordCount: 1,
+    stateEventCount: 1,
+    lastDurableState: "stable",
+    localizedPriceTagCount: 0,
+    recoveryEventCount: 1,
+    lastRecoveryEpisodeId: 1,
+    lastRecoveryFinishedAtUptime: 14.5)
 require(
     LocalizationEvidenceBundleValidator.blockers(
         in: evidenceDirectory,
-        expectation: evidenceExpectation).isEmpty,
+        expectation: recoveryExpectation).isEmpty,
     "a valid recovery lifecycle record must validate")
+require(
+    LocalizationEvidenceBundleValidator.blockers(
+        in: evidenceDirectory,
+        expectation: evidenceExpectation).contains {
+            $0.contains("localization_recovery_events.jsonl_count_mismatch")
+        },
+    "a recovery record without watermark expectation must fail closed")
+let watermarkedMismatchExpectation = LocalizationEvidenceBundleExpectation(
+    trackingSessionId: "session-a",
+    priorMapId: "map-a",
+    priorMapSha256: String(repeating: "a", count: 64),
+    floorId: "1",
+    traceRecordCount: 1,
+    constraintRecordCount: 1,
+    stateEventCount: 1,
+    lastDurableState: "stable",
+    localizedPriceTagCount: 0,
+    recoveryEventCount: 1,
+    lastRecoveryEpisodeId: 2,
+    lastRecoveryFinishedAtUptime: 14.5)
+require(
+    LocalizationEvidenceBundleValidator.blockers(
+        in: evidenceDirectory,
+        expectation: watermarkedMismatchExpectation).contains(
+            "evidence_bundle_recovery_watermark_mismatch"),
+    "a wrong recovery episode watermark must fail closed")
 var corruptedRecoveryRecord = recoveryLifecycleRecord
 corruptedRecoveryRecord["tracking_session_id"] = "session-other"
 var corruptedRecoveryData = try JSONSerialization.data(
@@ -406,10 +447,17 @@ try corruptedRecoveryData.write(to: recoveryEvidenceURL)
 require(
     LocalizationEvidenceBundleValidator.blockers(
         in: evidenceDirectory,
-        expectation: evidenceExpectation).contains(
+        expectation: recoveryExpectation).contains(
             "evidence_bundle_localization_recovery_events.jsonl_identity_mismatch"),
     "a recovery lifecycle identity mismatch must fail closed")
 try Data().write(to: recoveryEvidenceURL)
+require(
+    LocalizationEvidenceBundleValidator.blockers(
+        in: evidenceDirectory,
+        expectation: recoveryExpectation).contains {
+            $0.contains("localization_recovery_events.jsonl_empty")
+        },
+    "an emptied recovery sidecar must not mask the watermark")
 
 let localizedTagsURL = evidenceDirectory.appendingPathComponent(
     "localized_price_tags.json")

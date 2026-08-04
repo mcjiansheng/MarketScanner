@@ -163,6 +163,15 @@ struct ScanCaptureHealth: Codable {
     let localizationStateEventCount: Int
     let localizationLastDurableState: String?
     let localizationEvidenceComplete: Bool
+    /// P7R6 recovery lifecycle watermark. Exactly one durable record must
+    /// exist per finished Recovery episode; finalization validates the
+    /// sidecar against these counts instead of trusting an optional file.
+    /// Decoded optional so pre-P7R6 metadata keeps the legacy schema, while
+    /// new sessions always write non-nil values.
+    let localizationRecoveryEventCount: Int?
+    let localizationLastRecoveryEpisodeId: Int?
+    let localizationLastRecoveryFinishedAtUptime: TimeInterval?
+    let localizationRecoveryEvidenceComplete: Bool?
 }
 
 struct ScanBoundarySnapshot {
@@ -465,6 +474,9 @@ final class SupermarketScanSession {
     private var localizationTraceRecordCount = 0
     private var localizationConstraintRecordCount = 0
     private var localizationStateEventCount = 0
+    private var localizationRecoveryEventCount = 0
+    private var localizationLastRecoveryEpisodeId: Int?
+    private var localizationLastRecoveryFinishedAtUptime: TimeInterval?
     private var latestStructureCoverageSnapshot: ScanStructureCoverageSnapshot?
     private var latestStructureCoverageSummary: ScanStructureCoverageSummary?
     private let maximumTrajectorySamples = 50_000
@@ -619,6 +631,9 @@ final class SupermarketScanSession {
         localizationTraceRecordCount = 0
         localizationConstraintRecordCount = 0
         localizationStateEventCount = 0
+        localizationRecoveryEventCount = 0
+        localizationLastRecoveryEpisodeId = nil
+        localizationLastRecoveryFinishedAtUptime = nil
         latestStructureCoverageSnapshot = nil
         latestStructureCoverageSummary = nil
     }
@@ -1269,7 +1284,15 @@ final class SupermarketScanSession {
                     || (localizationRequiredWriteFailureCount == 0
                         && localizationTraceRecordCount > 0
                         && localizationConstraintRecordCount > 0
-                        && localizationStateEventCount > 0))
+                        && localizationStateEventCount > 0),
+            localizationRecoveryEventCount: localizationRecoveryEventCount,
+            localizationLastRecoveryEpisodeId:
+                localizationLastRecoveryEpisodeId,
+            localizationLastRecoveryFinishedAtUptime:
+                localizationLastRecoveryFinishedAtUptime,
+            localizationRecoveryEvidenceComplete:
+                scanConfiguration.workflowMode != .priorMapLocalized
+                    || localizationRequiredWriteFailureCount == 0)
     }
 
     func writeLiveCheckpoint(to segmentDirectory: URL, checkpoint: ScanLiveCheckpoint) throws {
@@ -1325,15 +1348,30 @@ final class SupermarketScanSession {
                 to: segmentDirectory.appendingPathComponent("structure_coverage_cells.json"))
         }
 
+        // Expected recovery watermark for this finalization. A legacy
+        // checkpoint without the P7R6 watermark fields decodes nil and falls
+        // back to the legacy zero expectation.
+        let expectedRecoveryEventCount =
+            snapshot.metadata.captureHealth?.localizationRecoveryEventCount ?? 0
         if scanConfiguration.workflowMode == .priorMapLocalized {
             for fileName in [
                 "manual_localization_events.jsonl",
                 "tag_observations.jsonl",
-                PriorMapRecoveryLifecycleRecord.fileName,
             ] {
                 let url = segmentDirectory.appendingPathComponent(fileName)
                 if !sidecarWriter.fileExists(at: url) {
                     try sidecarWriter.writeAtomic(Data(), to: url)
+                }
+            }
+            // Finalization must never rebuild lost recovery evidence as an
+            // empty file: creating the sidecar is only allowed while no
+            // episode is expected. A missing file with a positive watermark
+            // is a blocker and stays missing for the validator.
+            let recoveryURL = segmentDirectory.appendingPathComponent(
+                PriorMapRecoveryLifecycleRecord.fileName)
+            if !sidecarWriter.fileExists(at: recoveryURL) {
+                if expectedRecoveryEventCount == 0 {
+                    try sidecarWriter.writeAtomic(Data(), to: recoveryURL)
                 }
             }
             let localizedTagsData = try encoder.encode(snapshot.localizedPriceTags)
@@ -1353,7 +1391,14 @@ final class SupermarketScanSession {
                let captureHealth = committedMetadata.captureHealth,
                let lastDurableState =
                 captureHealth.localizationLastDurableState {
-                evidenceValidationBlockers =
+                if expectedRecoveryEventCount > 0,
+                   !sidecarWriter.fileExists(at: segmentDirectory
+                    .appendingPathComponent(
+                        PriorMapRecoveryLifecycleRecord.fileName)) {
+                    evidenceValidationBlockers.append(
+                        "evidence_bundle_recovery_file_missing_blocker")
+                }
+                evidenceValidationBlockers +=
                     LocalizationEvidenceBundleValidator.blockers(
                         in: segmentDirectory,
                         expectation: LocalizationEvidenceBundleExpectation(
@@ -1369,7 +1414,16 @@ final class SupermarketScanSession {
                                 captureHealth.localizationStateEventCount,
                             lastDurableState: lastDurableState,
                             localizedPriceTagCount:
-                                committedMetadata.localizedPriceTagCount ?? 0))
+                                committedMetadata.localizedPriceTagCount ?? 0,
+                            recoveryEventCount:
+                                captureHealth.localizationRecoveryEventCount
+                                    ?? 0,
+                            lastRecoveryEpisodeId:
+                                captureHealth
+                                    .localizationLastRecoveryEpisodeId,
+                            lastRecoveryFinishedAtUptime:
+                                captureHealth
+                                    .localizationLastRecoveryFinishedAtUptime))
             }
             else {
                 evidenceValidationBlockers = [
@@ -1811,6 +1865,16 @@ final class SupermarketScanSession {
             fileName: PriorMapRecoveryLifecycleRecord.fileName,
             expectedTrackingSessionId: expectedTrackingSessionId,
             allowDuringFinalization: true)
+        if result.succeeded {
+            // Advance the capture watermark only after the durable append is
+            // confirmed; finalization validates the sidecar against it.
+            captureLock.lock()
+            localizationRecoveryEventCount += 1
+            localizationLastRecoveryEpisodeId = completion.episode.id
+            localizationLastRecoveryFinishedAtUptime =
+                completion.finishedAtUptime
+            captureLock.unlock()
+        }
         if !result.succeeded {
             let failures = [
                 PriorMapRecoveryLifecycleRecord.fileName:
