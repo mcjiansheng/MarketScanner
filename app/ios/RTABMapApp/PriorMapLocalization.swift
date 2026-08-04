@@ -846,7 +846,10 @@ final class PriorMapStageOneLocalizer {
         update.recoveryValidAttemptCount = diagnosticEpisode?.validMatcherAttempts
         update.recoveryRemainingValidAttempts = diagnosticEpisode?.remainingValidAttempts
         update.recoveryElapsedMs = diagnosticEpisode.map {
-            max(0, postMatchNow - $0.startedAtUptime) * 1000
+            PriorMapRecoveryDiagnostics.elapsedMs(
+                episode: $0,
+                completion: recoveryCompletionForUpdate,
+                now: postMatchNow)
         }
         update.recoveryFreshSupportFrames = recoveryCompletionForUpdate?
             .finalFreshSupportFrames

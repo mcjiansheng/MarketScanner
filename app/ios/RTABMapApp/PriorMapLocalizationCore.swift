@@ -585,6 +585,21 @@ struct PriorMapRecoveryCompletion: Equatable {
     }
 }
 
+/// Bounded episode diagnostics. Every episode elapsed value exposed to traces
+/// or lifecycle evidence must come from this single reducer so a completion
+/// consumed on a later frame is bound to its finish time, never to the
+/// consuming frame clock.
+enum PriorMapRecoveryDiagnostics {
+    static func elapsedMs(
+        episode: PriorMapRecoveryEpisode,
+        completion: PriorMapRecoveryCompletion?,
+        now: TimeInterval
+    ) -> Double {
+        let elapsedEnd = completion?.finishedAtUptime ?? now
+        return max(0, elapsedEnd - episode.startedAtUptime) * 1000
+    }
+}
+
 /// Terminal Recovery lifecycle evidence. One record per finished episode is
 /// persisted to `localization_recovery_events.jsonl` so post-processing can
 /// distinguish convergence, timeout, manual reset, and cancellation, including
