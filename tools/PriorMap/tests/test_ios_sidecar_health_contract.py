@@ -15,6 +15,9 @@ DEPTH_SOURCE = REPOSITORY / "app/ios/RTABMapApp/PriorMapDepthSampler.swift"
 FINALIZATION_CORE_SOURCE = (
     REPOSITORY / "app/ios/RTABMapApp/SupermarketFinalizationCore.swift"
 )
+PERSISTENCE_COORDINATOR_SOURCE = (
+    REPOSITORY / "app/ios/RTABMapApp/RecoveryLifecyclePersistenceCore.swift"
+)
 
 
 def source(path: Path) -> str:
@@ -30,6 +33,7 @@ class IOSLocalizationSidecarHealthContractTests(unittest.TestCase):
         depth = source(DEPTH_SOURCE)
         session = source(SESSION_SOURCE)
         finalization = source(FINALIZATION_CORE_SOURCE)
+        coordinator = source(PERSISTENCE_COORDINATOR_SOURCE)
         for token in (
             "PriorMapHypothesisTracker",
             "activeTracks",
@@ -48,8 +52,32 @@ class IOSLocalizationSidecarHealthContractTests(unittest.TestCase):
         ):
             self.assertIn(token, view)
         self.assertIn("PriorMapRecoveryController", core + overlay)
-        self.assertIn("drainTerminalRecoveryCompletions", overlay)
+        # P7R6: peek/ack replaced drain-before-ack; completions stay queued
+        # until the durable append is confirmed.
+        for token in (
+            "pendingTerminalRecoveryCompletions",
+            "acknowledgeTerminalRecoveryCompletion",
+            "discardTerminalRecoveryCompletionsForInvalidatedSession",
+        ):
+            self.assertIn(token, overlay)
+        self.assertNotIn("drainTerminalRecoveryCompletions", overlay + view)
         self.assertIn("cancelRecovery(", overlay)
+        for token in (
+            "RecoveryLifecyclePersistenceCoordinator(",
+            "runRecoveryLifecyclePersistence(",
+            "dispatchPrecondition",
+        ):
+            self.assertIn(token, view)
+        for token in (
+            "RecoveryCompletionDraining",
+            "RecoveryLifecycleWriting",
+            "RecoveryLifecyclePersistenceResult",
+            "persisted_episode_bytes_conflict",
+            "durable_append_failed",
+        ):
+            self.assertIn(token, coordinator)
+        self.assertIn("persistedRecoveryLifecycleLines", session)
+        self.assertIn("recordRecoveryPersistenceFailure", session + view)
         self.assertIn("appendRecoveryLifecycleEvent", session)
         self.assertIn("MarketScannerRecoveryLifecycleEvent", core)
         self.assertIn("localization_recovery_events.jsonl", finalization)

@@ -2712,6 +2712,172 @@ if let p7r5F03Completion {
             "P7R5 F-03 an active episode still uses the frame clock")
 }
 
+// MARK: - P7R6: peek/ack persistence coordinator transactions.
+
+final class P7R6FakeRecoverySource: RecoveryCompletionDraining {
+    var pending: [PriorMapRecoveryCompletion] = []
+    var cancelledReasons: [PriorMapRecoveryCancellationReason] = []
+
+    func cancelRecovery(
+        reason: PriorMapRecoveryCancellationReason,
+        now: TimeInterval
+    ) -> PriorMapRecoveryCompletion? {
+        cancelledReasons.append(reason)
+        return nil
+    }
+
+    func pendingTerminalRecoveryCompletions()
+        -> [PriorMapRecoveryCompletion] {
+        return pending
+    }
+
+    func acknowledgeTerminalRecoveryCompletion(episodeId: Int) {
+        pending.removeAll { $0.episode.id == episodeId }
+    }
+
+    func discardTerminalRecoveryCompletionsForInvalidatedSession() {
+        pending.removeAll()
+    }
+}
+
+final class P7R6FakeRecoveryWriter: RecoveryLifecycleWriting {
+    var appendedEpisodeIds: [Int] = []
+    var failingEpisodeIds: Set<Int> = []
+
+    func appendRecoveryLifecycleEvent(
+        _ completion: PriorMapRecoveryCompletion,
+        expectedTrackingSessionId: String
+    ) -> Bool {
+        guard !failingEpisodeIds.contains(completion.episode.id) else {
+            return false
+        }
+        appendedEpisodeIds.append(completion.episode.id)
+        return true
+    }
+}
+
+let p7r6Controller = PriorMapRecoveryController()
+_ = p7r6Controller.request(
+    reason: "persistent_weak_or_lost", now: 0, automatic: true)
+let p7r6FirstCompletion = p7r6Controller.finish(.converged, now: 1)
+_ = p7r6Controller.request(reason: "reliable_rtabmap_loop", now: 30)
+let p7r6SecondCompletion = p7r6Controller.finish(.timedOut, now: 31)
+require(p7r6FirstCompletion?.episode.id == 1
+        && p7r6SecondCompletion?.episode.id == 2,
+        "P7R6 coordinator tests require two sequential episodes")
+if let p7r6FirstCompletion, let p7r6SecondCompletion {
+    let source = P7R6FakeRecoverySource()
+    // Deliberately out of order: the coordinator must restore episode order.
+    source.pending = [p7r6SecondCompletion, p7r6FirstCompletion]
+    let writer = P7R6FakeRecoveryWriter()
+    let coordinator = RecoveryLifecyclePersistenceCoordinator(
+        source: source,
+        writer: writer,
+        trackingSessionId: "session-1",
+        priorMapId: "map-1",
+        priorMapSha256: "sha-1",
+        floorId: "1",
+        persistedEvidenceLines: { [] })
+    let success = coordinator.persistTerminalEvidence(
+        cancellationReason: nil, now: 40)
+    require(success.allPersisted
+            && success.attemptedEpisodeIds == [1, 2]
+            && success.persistedEpisodeIds == [1, 2]
+            && writer.appendedEpisodeIds == [1, 2],
+            "P7R6 the coordinator must persist episodes in ID order")
+    require(source.pending.isEmpty,
+            "P7R6 every persisted episode must be acknowledged")
+
+    // Cancellation pass-through.
+    _ = coordinator.persistTerminalEvidence(
+        cancellationReason: .scanStopped, now: 41)
+    require(source.cancelledReasons == [.scanStopped],
+            "P7R6 teardown cancellation must run before peeking")
+
+    // A failed append stops the transaction and keeps state retryable.
+    source.pending = [p7r6FirstCompletion, p7r6SecondCompletion]
+    writer.failingEpisodeIds = [2]
+    let failure = coordinator.persistTerminalEvidence(
+        cancellationReason: nil, now: 50)
+    require(!failure.allPersisted
+            && failure.failedEpisodeId == 2
+            && failure.failureReason == "durable_append_failed"
+            && failure.persistedEpisodeIds == [1],
+            "P7R6 the coordinator must stop at the first failed episode")
+    require(source.pending.map { $0.episode.id } == [2],
+            "P7R6 a failed episode must stay queued for retry")
+
+    // Retry persists the failed episode exactly once.
+    writer.failingEpisodeIds = []
+    let appendedBeforeRetry = writer.appendedEpisodeIds.count
+    let retry = coordinator.persistTerminalEvidence(
+        cancellationReason: nil, now: 60)
+    require(retry.allPersisted
+            && writer.appendedEpisodeIds.count == appendedBeforeRetry + 1
+            && writer.appendedEpisodeIds.last == 2
+            && source.pending.isEmpty,
+            "P7R6 retry must persist the failed episode exactly once")
+
+    // Idempotence strategy A: identical persisted bytes count as success
+    // without rewriting; conflicting bytes fail closed.
+    let persistedRecord = PriorMapRecoveryLifecycleRecord(
+        trackingSessionId: "session-1",
+        priorMapId: "map-1",
+        priorMapSha256: "sha-1",
+        floorId: "1",
+        completion: p7r6FirstCompletion)
+    let persistedLine = try JSONEncoder().encode(persistedRecord)
+    let idempotentSource = P7R6FakeRecoverySource()
+    idempotentSource.pending = [p7r6FirstCompletion]
+    let idempotentWriter = P7R6FakeRecoveryWriter()
+    let idempotentCoordinator = RecoveryLifecyclePersistenceCoordinator(
+        source: idempotentSource,
+        writer: idempotentWriter,
+        trackingSessionId: "session-1",
+        priorMapId: "map-1",
+        priorMapSha256: "sha-1",
+        floorId: "1",
+        persistedEvidenceLines: { [persistedLine] })
+    let idempotent = idempotentCoordinator.persistTerminalEvidence(
+        cancellationReason: nil, now: 70)
+    require(idempotent.allPersisted
+            && idempotentWriter.appendedEpisodeIds.isEmpty
+            && idempotentSource.pending.isEmpty,
+            "P7R6 identical persisted bytes must ack without rewriting")
+    let conflictingRecord = PriorMapRecoveryLifecycleRecord(
+        trackingSessionId: "session-1",
+        priorMapId: "map-1",
+        priorMapSha256: "sha-1",
+        floorId: "2",
+        completion: p7r6FirstCompletion)
+    let conflictingLine = try JSONEncoder().encode(conflictingRecord)
+    let conflictSource = P7R6FakeRecoverySource()
+    conflictSource.pending = [p7r6FirstCompletion]
+    let conflictWriter = P7R6FakeRecoveryWriter()
+    let conflictCoordinator = RecoveryLifecyclePersistenceCoordinator(
+        source: conflictSource,
+        writer: conflictWriter,
+        trackingSessionId: "session-1",
+        priorMapId: "map-1",
+        priorMapSha256: "sha-1",
+        floorId: "1",
+        persistedEvidenceLines: { [conflictingLine] })
+    let conflict = conflictCoordinator.persistTerminalEvidence(
+        cancellationReason: nil, now: 80)
+    require(!conflict.allPersisted
+            && conflict.failureReason == "persisted_episode_bytes_conflict"
+            && conflictWriter.appendedEpisodeIds.isEmpty
+            && conflictSource.pending.map { $0.episode.id } == [1],
+            "P7R6 conflicting persisted bytes must fail closed")
+
+    // Invalidated sessions drop queued completions.
+    let discardSource = P7R6FakeRecoverySource()
+    discardSource.pending = [p7r6FirstCompletion, p7r6SecondCompletion]
+    discardSource.discardTerminalRecoveryCompletionsForInvalidatedSession()
+    require(discardSource.pending.isEmpty,
+            "P7R6 invalidated sessions must discard queued completions")
+}
+
 if CommandLine.arguments.count == 2 {
     do {
         let digest = try PriorMapPackageIntegrity.validate(

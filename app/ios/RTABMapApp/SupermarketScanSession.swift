@@ -1893,6 +1893,38 @@ final class SupermarketScanSession {
         return result.succeeded
     }
 
+    /// P7R6 idempotence strategy A: stable read of the already-persisted
+    /// lifecycle lines, taken before any append so a crash between durable
+    /// write and acknowledgement can be detected instead of duplicating the
+    /// episode. A missing file means nothing has been persisted yet; a
+    /// truncated tail line is returned as-is so the coordinator fails closed.
+    func persistedRecoveryLifecycleLines(
+        expectedTrackingSessionId: String
+    ) throws -> [Data] {
+        let directory = try activeLocalizationDirectory(
+            expectedTrackingSessionId: expectedTrackingSessionId,
+            allowDuringFinalization: true)
+        let url = directory.appendingPathComponent(
+            PriorMapRecoveryLifecycleRecord.fileName)
+        guard fileManager.fileExists(atPath: url.path) else {
+            return []
+        }
+        let snapshot = try SafeSessionPath.readRegularFile(
+            url,
+            within: directory,
+            maximumBytes: 16 * 1024 * 1024)
+        var lines: [Data] = []
+        var pending = snapshot.data
+        while let newline = pending.firstIndex(of: 0x0A) {
+            lines.append(pending.subdata(in: pending.startIndex..<newline))
+            pending.removeSubrange(pending.startIndex...newline)
+        }
+        if !pending.isEmpty {
+            lines.append(pending)
+        }
+        return lines
+    }
+
     @discardableResult
     private func appendLocalizationRecord<T: Encodable>(
         _ record: T,
@@ -1998,6 +2030,20 @@ final class SupermarketScanSession {
         defer { captureLock.unlock() }
         return scanConfiguration.workflowMode == .priorMapLocalized
             && localizationRequiredWriteFailureCount > 0
+    }
+
+    /// P7R6: coordinator-level Recovery persistence failures (unreadable
+    /// evidence snapshot, duplicated persisted episodes, byte conflicts,
+    /// missing prior-map identity) never reach the writer path, but they
+    /// must still mark the session processing-ineligible fail-closed.
+    func recordRecoveryPersistenceFailure(_ reason: String) {
+        recordLocalizationEvidenceFailures(
+            [PriorMapRecoveryLifecycleRecord.fileName: reason])
+        appendScanEvent(
+            level: "error",
+            event: "recovery_lifecycle_event_write_failed",
+            message: "Recovery lifecycle persistence transaction failed",
+            fields: ["reason": reason])
     }
 
     private func recordLocalizationEvidenceSuccesses(

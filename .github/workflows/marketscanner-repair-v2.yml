@@ -375,6 +375,7 @@ jobs:
         run: |
           xcrun swiftc -parse \
             app/ios/RTABMapApp/SupermarketFinalizationCore.swift \
+            app/ios/RTABMapApp/RecoveryLifecyclePersistenceCore.swift \
             app/ios/RTABMapApp/PriorMapLocalizationCore.swift \
             app/ios/RTABMapApp/PriorMapLocalization.swift \
             app/ios/RTABMapApp/PriceTagLocalizationCore.swift \

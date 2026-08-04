@@ -18,6 +18,11 @@ extension Array {
     }
 }
 
+// P7R6: the scan session is the durable writer consumed by
+// RecoveryLifecyclePersistenceCoordinator.
+extension SupermarketScanSession: RecoveryLifecycleWriting {
+}
+
 class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIPickerViewDataSource, UIPickerViewDelegate, CLLocationManagerDelegate, UIDocumentPickerDelegate {
     
     private let session = ARSession()
@@ -2626,23 +2631,72 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                 == .priorMapLocalized else {
             return true
         }
+        // P7R6: the transaction runs inside priorMapQueue.sync below; a
+        // re-entrant call from the queue itself would deadlock, so
+        // wrong-queue teardown calls fail closed instead of hanging.
+        dispatchPrecondition(condition: .notOnQueue(priorMapQueue))
         let trackingSessionId = scanSession.trackingSessionId
-        var allSucceeded = true
+        var result = RecoveryLifecyclePersistenceResult(
+            attemptedEpisodeIds: [],
+            persistedEpisodeIds: [],
+            failedEpisodeId: nil,
+            failureReason: nil,
+            allPersisted: true)
         priorMapQueue.sync {
             guard let localizer = self.priorMapLocalizer else { return }
-            if let reason {
-                _ = localizer.cancelRecovery(
-                    reason: reason,
-                    now: ProcessInfo.processInfo.systemUptime)
-            }
-            for completion in localizer.drainTerminalRecoveryCompletions() {
-                let saved = scanSession.appendRecoveryLifecycleEvent(
-                    completion,
-                    expectedTrackingSessionId: trackingSessionId)
-                allSucceeded = allSucceeded && saved
-            }
+            result = self.runRecoveryLifecyclePersistence(
+                localizer: localizer,
+                scanSession: scanSession,
+                trackingSessionId: trackingSessionId,
+                cancellationReason: reason,
+                now: ProcessInfo.processInfo.systemUptime)
         }
-        return allSucceeded
+        reportCoordinatorLevelRecoveryFailure(result, scanSession: scanSession)
+        return result.allPersisted
+    }
+
+    /// P7R6: runs one teardown-to-disk Recovery evidence transaction through
+    /// the Foundation-only peek/ack coordinator. Must already be executing on
+    /// `priorMapQueue`; the coordinator itself holds no locks.
+    private func runRecoveryLifecyclePersistence(
+        localizer: PriorMapStageOneLocalizer,
+        scanSession: SupermarketScanSession,
+        trackingSessionId: String,
+        cancellationReason: PriorMapRecoveryCancellationReason?,
+        now: TimeInterval
+    ) -> RecoveryLifecyclePersistenceResult {
+        dispatchPrecondition(condition: .onQueue(priorMapQueue))
+        let coordinator = RecoveryLifecyclePersistenceCoordinator(
+            source: localizer,
+            writer: scanSession,
+            trackingSessionId: trackingSessionId,
+            priorMapId: scanSession.scanConfiguration.priorMapId,
+            priorMapSha256: scanSession.scanConfiguration.priorMapSha256,
+            floorId: scanSession.scanConfiguration.floorId,
+            persistedEvidenceLines: {
+                try scanSession.persistedRecoveryLifecycleLines(
+                    expectedTrackingSessionId: trackingSessionId)
+            })
+        return coordinator.persistTerminalEvidence(
+            cancellationReason: cancellationReason,
+            now: now)
+    }
+
+    /// Coordinator-level failures (evidence snapshot unreadable, duplicated
+    /// persisted episodes, byte conflicts, missing identity) are not seen by
+    /// the session writer, so they must still mark the session ineligible.
+    /// `durable_append_failed` is excluded because the writer already
+    /// recorded that failure with its own reason.
+    private func reportCoordinatorLevelRecoveryFailure(
+        _ result: RecoveryLifecyclePersistenceResult,
+        scanSession: SupermarketScanSession
+    ) {
+        guard !result.allPersisted,
+              let failureReason = result.failureReason,
+              failureReason != "durable_append_failed" else {
+            return
+        }
+        scanSession.recordRecoveryPersistenceFailure(failureReason)
     }
 
     private func presentLocalizationEvidenceWriteFailure(_ failedFiles: [String]) {
@@ -2763,17 +2817,25 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                 expectedTrackingSessionId: trackingSessionId,
                 nodeTimebaseOffsetSeconds:
                     nodeTimebase?.offsetSeconds ?? .nan)
-            // F-02: every terminal episode completion must leave the device as
-            // persisted lifecycle evidence, including converged, timed out,
-            // and manual-reset outcomes consumed on this frame.
+            // F-02/P7R6: every terminal episode completion must leave the
+            // device as persisted lifecycle evidence through the peek/ack
+            // coordinator, including converged, timed out, and manual-reset
+            // outcomes consumed on this frame.
             var recoveryEvidenceSucceeded = true
-            for completion in localizer.drainTerminalRecoveryCompletions() {
-                let saved = self.supermarketSession?
-                    .appendRecoveryLifecycleEvent(
-                        completion,
-                        expectedTrackingSessionId: trackingSessionId) ?? false
-                recoveryEvidenceSucceeded =
-                    recoveryEvidenceSucceeded && saved
+            if let scanSession = self.supermarketSession {
+                let recoveryResult = self.runRecoveryLifecyclePersistence(
+                    localizer: localizer,
+                    scanSession: scanSession,
+                    trackingSessionId: trackingSessionId,
+                    cancellationReason: nil,
+                    now: ProcessInfo.processInfo.systemUptime)
+                recoveryEvidenceSucceeded = recoveryResult.allPersisted
+                self.reportCoordinatorLevelRecoveryFailure(
+                    recoveryResult,
+                    scanSession: scanSession)
+            }
+            else {
+                recoveryEvidenceSucceeded = false
             }
             DispatchQueue.main.async {
                 guard generation == self.priorMapGeneration else {

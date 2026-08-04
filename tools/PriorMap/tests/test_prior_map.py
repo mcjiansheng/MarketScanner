@@ -216,9 +216,12 @@ class IOSCoreContractTests(unittest.TestCase):
         swift_sources = [
             repository / "app/ios/RTABMapApp/PriorMapLocalizationCore.swift",
             repository / "app/ios/RTABMapApp/SupermarketFinalizationCore.swift",
+            repository
+            / "app/ios/RTABMapApp/RecoveryLifecyclePersistenceCore.swift",
             repository / "app/ios/RTABMapApp/PriorMapScanMatcher.swift",
             repository / "app/ios/RTABMapApp/PriceTagLocalizationCore.swift",
-            repository / "app/ios/RTABMapApp/PriorMapPackageIntegrityCore.swift",
+            repository
+            / "app/ios/RTABMapApp/PriorMapPackageIntegrityCore.swift",
         ]
         swift_test = Path(__file__).with_name("swift") / "main.swift"
         with tempfile.TemporaryDirectory() as temporary:

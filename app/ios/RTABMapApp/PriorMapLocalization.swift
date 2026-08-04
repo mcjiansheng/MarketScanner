@@ -525,12 +525,31 @@ final class PriorMapStageOneLocalizer {
             cancellationReason: reason)
     }
 
-    /// Returns and clears every terminal completion not yet persisted as
-    /// lifecycle evidence. Ordering preserves episode finish order.
-    func drainTerminalRecoveryCompletions() -> [PriorMapRecoveryCompletion] {
-        let completions = terminalRecoveryCompletionsAwaitingEvidence
+    /// P7R6 peek: returns every terminal completion not yet persisted as
+    /// lifecycle evidence without removing it. Ordering preserves episode
+    /// finish order; acknowledgements remove entries one by one so a failed
+    /// write keeps the retryable state visible.
+    func pendingTerminalRecoveryCompletions()
+        -> [PriorMapRecoveryCompletion] {
+        return terminalRecoveryCompletionsAwaitingEvidence
+    }
+
+    /// P7R6 ack: removes one completion after its durable append has been
+    /// confirmed. Unknown episode IDs are ignored so a repeated ack after a
+    /// crash-restart cannot corrupt the queue.
+    func acknowledgeTerminalRecoveryCompletion(episodeId: Int) {
+        guard let index = terminalRecoveryCompletionsAwaitingEvidence
+            .firstIndex(where: { $0.episode.id == episodeId }) else {
+            return
+        }
+        terminalRecoveryCompletionsAwaitingEvidence.remove(at: index)
+    }
+
+    /// P7R6: drops queued completions when the session identity is
+    /// invalidated (generation change). Old completions must never enter a
+    /// new session; the write side's identity guard remains the final check.
+    func discardTerminalRecoveryCompletionsForInvalidatedSession() {
         terminalRecoveryCompletionsAwaitingEvidence.removeAll()
-        return completions
     }
 
     func update(frame: ARFrame, trackingState: String) -> PriorMapLocalizationUpdate {
@@ -1837,4 +1856,9 @@ final class PriorMapLiveMapView: UIView {
             x: imageRect.minX + CGFloat(normalizedX) * imageRect.width,
             y: imageRect.minY + CGFloat(normalizedY) * imageRect.height)
     }
+}
+
+// P7R6: the stage-one localizer is the peek/ack source consumed by
+// RecoveryLifecyclePersistenceCoordinator.
+extension PriorMapStageOneLocalizer: RecoveryCompletionDraining {
 }
