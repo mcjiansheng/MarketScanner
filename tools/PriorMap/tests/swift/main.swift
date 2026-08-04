@@ -367,7 +367,7 @@ let recoveryEvidenceURL = evidenceDirectory.appendingPathComponent(
     "localization_recovery_events.jsonl")
 let recoveryLifecycleRecord: [String: Any] = [
     "format": "MarketScannerRecoveryLifecycleEvent",
-    "version": 1,
+    "version": 2,
     "tracking_session_id": "session-a",
     "prior_map_id": "map-a",
     "prior_map_sha256": String(repeating: "a", count: 64),
@@ -378,8 +378,10 @@ let recoveryLifecycleRecord: [String: Any] = [
     "cancellation_reason": "scan_stopped",
     "episode_automatic": false,
     "started_at_uptime": 10.0,
+    "deadline_uptime": 70.0,
     "finished_at_uptime": 14.5,
     "elapsed_ms": 4500.0,
+    "maximum_valid_attempts": 40,
     "valid_matcher_attempts": 7,
     "accepted_corrections": 2,
     "trigger_count": 1,
@@ -387,6 +389,13 @@ let recoveryLifecycleRecord: [String: Any] = [
     "reliable_loop_trigger_count": 1,
     "last_trigger_reason": "reliable_rtabmap_loop",
     "last_trigger_at_uptime": 10.0,
+    "trigger_records": [
+        [
+            "reason": "reliable_rtabmap_loop",
+            "automatic": false,
+            "at_uptime": 10.0,
+        ],
+    ],
     "fresh_support_frames": 4,
     "completion_frame_step_applied": false,
 ]
@@ -450,6 +459,98 @@ require(
         expectation: recoveryExpectation).contains(
             "evidence_bundle_localization_recovery_events.jsonl_identity_mismatch"),
     "a recovery lifecycle identity mismatch must fail closed")
+
+// P7R6: the strict lifecycle schema rejects illegal evidence fail-closed,
+// while legacy v1 records remain readable.
+func recoverySchemaBlockers(mutating: (inout [String: Any]) -> Void) throws
+    -> [String] {
+    var record = recoveryLifecycleRecord
+    mutating(&record)
+    var data = try JSONSerialization.data(withJSONObject: record)
+    data.append(0x0A)
+    try data.write(to: recoveryEvidenceURL)
+    return LocalizationEvidenceBundleValidator.blockers(
+        in: evidenceDirectory,
+        expectation: recoveryExpectation)
+}
+func requireRecoveryRejected(
+    _ mutating: (inout [String: Any]) -> Void,
+    reason: String,
+    _ message: String
+) throws {
+    let blockers = try recoverySchemaBlockers(mutating: mutating)
+    require(
+        blockers.contains(
+            "evidence_bundle_localization_recovery_events.jsonl_\(reason)"),
+        "\(message): \(blockers)")
+}
+try requireRecoveryRejected(
+    { $0["outcome"] = "banana" },
+    reason: "recovery_outcome_invalid",
+    "an unknown outcome must fail closed")
+try requireRecoveryRejected(
+    {
+        $0["outcome"] = "converged"
+    },
+    reason: "recovery_cancellation_reason_invalid",
+    "a converged episode must not carry a cancellation reason")
+try requireRecoveryRejected(
+    { $0["cancellation_reason"] = NSNull() },
+    reason: "recovery_cancellation_reason_invalid",
+    "a cancelled episode must carry an explicit cancellation reason")
+try requireRecoveryRejected(
+    { $0["elapsed_ms"] = -999.0 },
+    reason: "recovery_business_schema_invalid",
+    "a negative elapsed time must fail closed")
+try requireRecoveryRejected(
+    { $0["valid_matcher_attempts"] = -4 },
+    reason: "recovery_business_schema_invalid",
+    "a negative attempts counter must fail closed")
+try requireRecoveryRejected(
+    { $0["accepted_corrections"] = 999999 },
+    reason: "recovery_business_schema_invalid",
+    "corrections above the attempts budget must fail closed")
+try requireRecoveryRejected(
+    { $0["trigger_count"] = -1 },
+    reason: "recovery_business_schema_invalid",
+    "a negative trigger count must fail closed")
+try requireRecoveryRejected(
+    { $0["automatic_trigger_count"] = 1 },
+    reason: "recovery_business_schema_invalid",
+    "trigger classification sums must reconcile")
+try requireRecoveryRejected(
+    { $0["injected_unknown_field"] = true },
+    reason: "recovery_unknown_field",
+    "unknown lifecycle fields must fail closed")
+try requireRecoveryRejected(
+    { $0["version"] = 3 },
+    reason: "format_or_version_mismatch",
+    "an unsupported lifecycle version must fail closed")
+try requireRecoveryRejected(
+    { $0["trigger_records"] = [] },
+    reason: "recovery_trigger_records_invalid",
+    "empty trigger records must fail closed for v2")
+try requireRecoveryRejected(
+    { $0["trigger_records"] = [
+        ["reason": "other", "automatic": false, "at_uptime": 10.0],
+    ] },
+    reason: "recovery_trigger_records_invalid",
+    "trigger records must reconcile with the trigger summary")
+var legacyRecoveryRecord = recoveryLifecycleRecord
+legacyRecoveryRecord["version"] = 1
+legacyRecoveryRecord["deadline_uptime"] = nil
+legacyRecoveryRecord["maximum_valid_attempts"] = nil
+legacyRecoveryRecord["trigger_records"] = nil
+var legacyRecoveryData = try JSONSerialization.data(
+    withJSONObject: legacyRecoveryRecord)
+legacyRecoveryData.append(0x0A)
+try legacyRecoveryData.write(to: recoveryEvidenceURL)
+require(
+    LocalizationEvidenceBundleValidator.blockers(
+        in: evidenceDirectory,
+        expectation: recoveryExpectation).isEmpty,
+    "a legacy v1 recovery lifecycle record must remain readable")
+try recoveryLifecycleData.write(to: recoveryEvidenceURL)
 try Data().write(to: recoveryEvidenceURL)
 require(
     LocalizationEvidenceBundleValidator.blockers(
@@ -2569,7 +2670,7 @@ if let p7r5E1Completion {
                 == PriorMapRecoveryLifecycleRecord.formatName
             && p7r5LifecycleRecord.version
                 == PriorMapRecoveryLifecycleRecord.formatVersion,
-            "P7R5 lifecycle record must carry the v1 contract identity")
+            "P7R5 lifecycle record must carry the current contract identity")
     require(p7r5LifecycleRecord.outcome == "cancelled"
             && p7r5LifecycleRecord.cancellationReason == "scan_stopped",
             "P7R5 lifecycle record must expose terminal outcome and reason")

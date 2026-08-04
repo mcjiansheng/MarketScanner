@@ -536,10 +536,16 @@ enum PriorMapRecoveryUpdateReducer {
 
 /// One bounded trigger record retained per episode. At most eight records are
 /// kept so a hostile or chatty trigger source cannot grow episode memory.
-struct PriorMapRecoveryTriggerRecord: Equatable {
+struct PriorMapRecoveryTriggerRecord: Codable, Equatable {
     let reason: String
     let automatic: Bool
     let atUptime: TimeInterval
+
+    private enum CodingKeys: String, CodingKey {
+        case reason
+        case automatic
+        case atUptime = "at_uptime"
+    }
 }
 
 struct PriorMapRecoveryEpisode: Equatable {
@@ -651,7 +657,10 @@ enum PriorMapRecoveryDiagnostics {
 /// scan-stop or map-unload teardowns that never see another update frame.
 struct PriorMapRecoveryLifecycleRecord: Codable, Equatable {
     static let formatName = "MarketScannerRecoveryLifecycleEvent"
-    static let formatVersion = 1
+    /// P7R6: v2 persists the deadline, the attempts budget, and the bounded
+    /// trigger source sequence so post-processing can audit the full episode
+    /// without trusting summary counters alone. v1 records remain readable.
+    static let formatVersion = 2
     static let fileName = "localization_recovery_events.jsonl"
 
     let format: String
@@ -666,8 +675,10 @@ struct PriorMapRecoveryLifecycleRecord: Codable, Equatable {
     let cancellationReason: String?
     let episodeAutomatic: Bool
     let startedAtUptime: TimeInterval
+    let deadlineUptime: TimeInterval
     let finishedAtUptime: TimeInterval
     let elapsedMs: Double
+    let maximumValidAttempts: Int
     let validMatcherAttempts: Int
     let acceptedCorrections: Int
     let triggerCount: Int
@@ -675,6 +686,7 @@ struct PriorMapRecoveryLifecycleRecord: Codable, Equatable {
     let reliableLoopTriggerCount: Int
     let lastTriggerReason: String
     let lastTriggerAtUptime: TimeInterval
+    let triggerRecords: [PriorMapRecoveryTriggerRecord]
     let selectedHypothesisId: Int?
     let freshSupportFrames: Int
     let finalResidualTranslationM: Double?
@@ -694,8 +706,10 @@ struct PriorMapRecoveryLifecycleRecord: Codable, Equatable {
         case cancellationReason = "cancellation_reason"
         case episodeAutomatic = "episode_automatic"
         case startedAtUptime = "started_at_uptime"
+        case deadlineUptime = "deadline_uptime"
         case finishedAtUptime = "finished_at_uptime"
         case elapsedMs = "elapsed_ms"
+        case maximumValidAttempts = "maximum_valid_attempts"
         case validMatcherAttempts = "valid_matcher_attempts"
         case acceptedCorrections = "accepted_corrections"
         case triggerCount = "trigger_count"
@@ -703,6 +717,7 @@ struct PriorMapRecoveryLifecycleRecord: Codable, Equatable {
         case reliableLoopTriggerCount = "reliable_loop_trigger_count"
         case lastTriggerReason = "last_trigger_reason"
         case lastTriggerAtUptime = "last_trigger_at_uptime"
+        case triggerRecords = "trigger_records"
         case selectedHypothesisId = "selected_hypothesis_id"
         case freshSupportFrames = "fresh_support_frames"
         case finalResidualTranslationM = "final_residual_translation_m"
@@ -729,11 +744,13 @@ struct PriorMapRecoveryLifecycleRecord: Codable, Equatable {
         self.cancellationReason = completion.cancellationReason?.rawValue
         self.episodeAutomatic = completion.episode.automatic
         self.startedAtUptime = completion.episode.startedAtUptime
+        self.deadlineUptime = completion.episode.deadlineUptime
         self.finishedAtUptime = completion.finishedAtUptime
         self.elapsedMs = PriorMapRecoveryDiagnostics.elapsedMs(
             episode: completion.episode,
             completion: completion,
             now: completion.finishedAtUptime)
+        self.maximumValidAttempts = completion.episode.maximumValidAttempts
         self.validMatcherAttempts = completion.episode.validMatcherAttempts
         self.acceptedCorrections = completion.episode.acceptedCorrections
         self.triggerCount = completion.episode.triggerCount
@@ -742,6 +759,7 @@ struct PriorMapRecoveryLifecycleRecord: Codable, Equatable {
             completion.episode.reliableLoopTriggerCount
         self.lastTriggerReason = completion.episode.lastTriggerReason
         self.lastTriggerAtUptime = completion.episode.lastTriggerAtUptime
+        self.triggerRecords = completion.episode.triggerRecords
         self.selectedHypothesisId = completion.selectedHypothesisId
         self.freshSupportFrames = completion.finalFreshSupportFrames
         self.finalResidualTranslationM = completion.finalResidualTranslationM

@@ -123,6 +123,10 @@ enum LocalizationEvidenceBundleValidator {
         let requiredNonEmpty: Bool
         let strictlyIncreasingTimestamps: Bool
         let recordIdField: String?
+        /// P7R6: sidecar formats that kept their readers across a schema
+        /// upgrade accept every listed version; others stay pinned to
+        /// `version`.
+        var allowedVersions: Set<Int>? = nil
     }
 
     private struct JSONLValidationSummary {
@@ -189,11 +193,12 @@ enum LocalizationEvidenceBundleValidator {
             JSONLContract(
                 fileName: "localization_recovery_events.jsonl",
                 format: "MarketScannerRecoveryLifecycleEvent",
-                version: 1,
+                version: 2,
                 expectedCount: expectation.recoveryEventCount,
                 requiredNonEmpty: expectation.recoveryEventCount > 0,
                 strictlyIncreasingTimestamps: false,
-                recordIdField: nil),
+                recordIdField: nil,
+                allowedVersions: [1, 2]),
         ]
         var blockers: [String] = []
         var summaries: [String: JSONLValidationSummary] = [:]
@@ -338,8 +343,16 @@ enum LocalizationEvidenceBundleValidator {
         guard let object = decoded as? [String: Any] else {
             throw validationError("invalid_json_object")
         }
-        guard object["format"] as? String == contract.format,
-              strictInteger(object["version"]) == contract.version else {
+        guard object["format"] as? String == contract.format else {
+            throw validationError("format_or_version_mismatch")
+        }
+        let version = strictInteger(object["version"])
+        if let allowedVersions = contract.allowedVersions {
+            guard let version, allowedVersions.contains(version) else {
+                throw validationError("format_or_version_mismatch")
+            }
+        }
+        else if version != contract.version {
             throw validationError("format_or_version_mismatch")
         }
         try validateIdentity(object, expectation: expectation)
@@ -470,24 +483,143 @@ enum LocalizationEvidenceBundleValidator {
             // Recovery lifecycle records carry monotonic uptimes instead of
             // the node-timebase contract: episodes may terminate during scan
             // teardown when no frame binding exists.
+            let version = strictInteger(object["version"])
+            var allowedFields: Set<String> = [
+                "format", "version", "tracking_session_id", "prior_map_id",
+                "prior_map_sha256", "floor_id", "episode_id", "reason",
+                "outcome", "cancellation_reason", "episode_automatic",
+                "started_at_uptime", "finished_at_uptime", "elapsed_ms",
+                "valid_matcher_attempts", "accepted_corrections",
+                "trigger_count", "automatic_trigger_count",
+                "reliable_loop_trigger_count", "last_trigger_reason",
+                "last_trigger_at_uptime", "selected_hypothesis_id",
+                "fresh_support_frames", "final_residual_translation_m",
+                "final_residual_yaw_rad", "completion_frame_step_applied",
+            ]
+            if version == 2 {
+                allowedFields.formUnion([
+                    "deadline_uptime",
+                    "maximum_valid_attempts",
+                    "trigger_records",
+                ])
+            }
+            guard Set(object.keys).isSubset(of: allowedFields) else {
+                throw validationError("recovery_unknown_field")
+            }
+            guard let outcome = object["outcome"] as? String,
+                  ["converged", "timed_out", "cancelled", "manual_reset"]
+                      .contains(outcome) else {
+                throw validationError("recovery_outcome_invalid")
+            }
+            let cancellationValue = object["cancellation_reason"]
+            let cancellationPresent = cancellationValue != nil
+                && !(cancellationValue is NSNull)
+            if outcome == "cancelled" {
+                guard let reason = cancellationValue as? String,
+                      [
+                          "scan_stopped", "map_unloaded", "app_interrupted",
+                          "session_generation_changed", "operator_cancelled",
+                      ].contains(reason) else {
+                    throw validationError("recovery_cancellation_reason_invalid")
+                }
+            }
+            else if cancellationPresent {
+                throw validationError("recovery_cancellation_reason_invalid")
+            }
             guard let started = strictNumber(field(
                     object, "started_at_uptime", "startedAtUptime")),
+                  started >= 0,
                   let finished = strictNumber(field(
                     object, "finished_at_uptime", "finishedAtUptime")),
                   finished >= started,
+                  let elapsedMs = strictNumber(field(
+                    object, "elapsed_ms", "elapsedMs")),
+                  elapsedMs >= 0,
+                  abs(elapsedMs - (finished - started) * 1000) <= 1.0,
                   let episodeId = strictInteger(field(
                     object, "episode_id", "episodeId")),
                   episodeId > 0,
-                  strictInteger(field(
+                  let validMatcherAttempts = strictInteger(field(
                     object,
                     "valid_matcher_attempts",
-                    "validMatcherAttempts")) != nil,
-                  strictInteger(field(
-                    object, "trigger_count", "triggerCount")) != nil,
-                  nonEmptyString(object["reason"]),
-                  nonEmptyString(object["outcome"]) else {
+                    "validMatcherAttempts")),
+                  validMatcherAttempts >= 0,
+                  let acceptedCorrections = strictInteger(field(
+                    object,
+                    "accepted_corrections",
+                    "acceptedCorrections")),
+                  (0...validMatcherAttempts).contains(acceptedCorrections),
+                  let triggerCount = strictInteger(field(
+                    object, "trigger_count", "triggerCount")),
+                  triggerCount >= 1,
+                  let automaticTriggerCount = strictInteger(field(
+                    object,
+                    "automatic_trigger_count",
+                    "automaticTriggerCount")),
+                  automaticTriggerCount >= 0,
+                  let reliableLoopTriggerCount = strictInteger(field(
+                    object,
+                    "reliable_loop_trigger_count",
+                    "reliableLoopTriggerCount")),
+                  reliableLoopTriggerCount >= 0,
+                  automaticTriggerCount + reliableLoopTriggerCount
+                    == triggerCount,
+                  nonEmptyString(object["last_trigger_reason"]),
+                  let lastTriggerAtUptime = strictNumber(field(
+                    object,
+                    "last_trigger_at_uptime",
+                    "lastTriggerAtUptime")),
+                  lastTriggerAtUptime >= started,
+                  lastTriggerAtUptime <= finished,
+                  let freshSupportFrames = strictInteger(field(
+                    object,
+                    "fresh_support_frames",
+                    "freshSupportFrames")),
+                  freshSupportFrames >= 0,
+                  object["episode_automatic"] is Bool,
+                  object["completion_frame_step_applied"] is Bool,
+                  nonEmptyString(object["reason"]) else {
                 throw validationError("recovery_business_schema_invalid")
             }
+            if version == 2 {
+                guard let deadline = strictNumber(field(
+                        object, "deadline_uptime", "deadlineUptime")),
+                      deadline >= started,
+                      let maximumValidAttempts = strictInteger(field(
+                        object,
+                        "maximum_valid_attempts",
+                        "maximumValidAttempts")),
+                      maximumValidAttempts >= 1,
+                      validMatcherAttempts <= maximumValidAttempts else {
+                    throw validationError("recovery_business_schema_invalid")
+                }
+                try validateRecoveryTriggerRecords(
+                    object,
+                    startedAtUptime: started,
+                    finishedAtUptime: finished,
+                    lastTriggerReason: object["last_trigger_reason"] as? String,
+                    lastTriggerAtUptime: lastTriggerAtUptime)
+            }
+            func optionalNonNegative(_ snake: String, _ camel: String) throws {
+                let value = field(object, snake, camel)
+                guard value != nil && !(value is NSNull) else { return }
+                guard let number = strictNumber(value), number >= 0 else {
+                    throw validationError("recovery_business_schema_invalid")
+                }
+            }
+            let hypothesis = field(
+                object, "selected_hypothesis_id", "selectedHypothesisId")
+            if hypothesis != nil && !(hypothesis is NSNull) {
+                guard let hypothesisId = strictInteger(hypothesis),
+                      hypothesisId > 0 else {
+                    throw validationError("recovery_business_schema_invalid")
+                }
+            }
+            try optionalNonNegative(
+                "final_residual_translation_m",
+                "finalResidualTranslationM")
+            try optionalNonNegative(
+                "final_residual_yaw_rad", "finalResidualYawRad")
             // Episode set contract: IDs are unique and strictly increasing,
             // terminal finish uptimes never move backwards, and every record
             // stays bound to its session watermark.
@@ -555,6 +687,44 @@ enum LocalizationEvidenceBundleValidator {
             break
         }
         return converted
+    }
+
+    private static func validateRecoveryTriggerRecords(
+        _ object: [String: Any],
+        startedAtUptime: Double,
+        finishedAtUptime: Double,
+        lastTriggerReason: String?,
+        lastTriggerAtUptime: Double
+    ) throws {
+        guard let records = object["trigger_records"] as? [[String: Any]],
+              !records.isEmpty,
+              records.count <= 8 else {
+            throw validationError("recovery_trigger_records_invalid")
+        }
+        var previousUptime: Double?
+        for record in records {
+            guard Set(record.keys).isSubset(
+                    of: ["reason", "automatic", "at_uptime"]),
+                  nonEmptyString(record["reason"]),
+                  record["automatic"] is Bool,
+                  let uptime = strictNumber(record["at_uptime"]),
+                  uptime >= startedAtUptime,
+                  uptime <= finishedAtUptime else {
+                throw validationError("recovery_trigger_records_invalid")
+            }
+            if let previous = previousUptime, uptime < previous {
+                throw validationError("recovery_trigger_records_invalid")
+            }
+            previousUptime = uptime
+        }
+        // Bounded eviction may drop early records, but the newest retained
+        // record must always agree with the persisted trigger summary.
+        guard let newest = records.last,
+              newest["reason"] as? String == lastTriggerReason,
+              let newestUptime = strictNumber(newest["at_uptime"]),
+              abs(newestUptime - lastTriggerAtUptime) <= 1.0e-9 else {
+            throw validationError("recovery_trigger_records_invalid")
+        }
     }
 
     private static func field(
