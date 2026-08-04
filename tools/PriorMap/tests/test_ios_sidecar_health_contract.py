@@ -28,6 +28,8 @@ class IOSLocalizationSidecarHealthContractTests(unittest.TestCase):
         matcher = source(MATCHER_SOURCE)
         core = source(CORE_SOURCE)
         depth = source(DEPTH_SOURCE)
+        session = source(SESSION_SOURCE)
+        finalization = source(FINALIZATION_CORE_SOURCE)
         for token in (
             "PriorMapHypothesisTracker",
             "activeTracks",
@@ -37,13 +39,20 @@ class IOSLocalizationSidecarHealthContractTests(unittest.TestCase):
             self.assertIn(token, matcher)
         for token in (
             'requestRecovery(reason: "reliable_rtabmap_loop")',
-            "localizerToCancel.cancelRecovery()",
+            "persistTerminalRecoveryEvidence(",
+            "localizerToCancel.cancelRecovery(",
+            "reason: .scanStopped",
             "mPendingAdaptiveDetectionRateSince",
             "dwellSeconds",
             "priorMapLastNodeBinding",
         ):
             self.assertIn(token, view)
         self.assertIn("PriorMapRecoveryController", core + overlay)
+        self.assertIn("drainTerminalRecoveryCompletions", overlay)
+        self.assertIn("cancelRecovery(", overlay)
+        self.assertIn("appendRecoveryLifecycleEvent", session)
+        self.assertIn("MarketScannerRecoveryLifecycleEvent", core)
+        self.assertIn("localization_recovery_events.jsonl", finalization)
         self.assertIn("beginRecoveryEpisode(id: episode.id)", overlay)
         self.assertIn("match.searchPerformed", overlay)
         self.assertIn("minimumSearchPointCount = 30", matcher)
@@ -90,7 +99,8 @@ class IOSLocalizationSidecarHealthContractTests(unittest.TestCase):
             "maximumValidAttempts: Int = 40",
             "maximumWallClockSeconds: TimeInterval = 30",
             "episode.remainingValidAttempts == 0",
-            "episode.triggerCount + 1",
+            "triggerCount + 1",
+            "maximumRetainedTriggerRecords = 8",
         ):
             self.assertIn(token, core)
         for token in (

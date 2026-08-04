@@ -348,6 +348,8 @@ try Data().write(to: evidenceDirectory.appendingPathComponent(
     "manual_localization_events.jsonl"))
 try Data().write(to: evidenceDirectory.appendingPathComponent(
     "tag_observations.jsonl"))
+try Data().write(to: evidenceDirectory.appendingPathComponent(
+    "localization_recovery_events.jsonl"))
 try Data("[]".utf8).write(to: evidenceDirectory.appendingPathComponent(
     "localized_price_tags.json"))
 let initialEvidenceBlockers = LocalizationEvidenceBundleValidator.blockers(
@@ -356,6 +358,58 @@ let initialEvidenceBlockers = LocalizationEvidenceBundleValidator.blockers(
 require(
     initialEvidenceBlockers.isEmpty,
     "a complete persisted evidence bundle must validate: \(initialEvidenceBlockers)")
+
+// P7R5: a valid terminal Recovery lifecycle record validates through the
+// uptime-based branch; an identity mismatch fails closed.
+let recoveryEvidenceURL = evidenceDirectory.appendingPathComponent(
+    "localization_recovery_events.jsonl")
+let recoveryLifecycleRecord: [String: Any] = [
+    "format": "MarketScannerRecoveryLifecycleEvent",
+    "version": 1,
+    "tracking_session_id": "session-a",
+    "prior_map_id": "map-a",
+    "prior_map_sha256": String(repeating: "a", count: 64),
+    "floor_id": "1",
+    "episode_id": 1,
+    "reason": "reliable_rtabmap_loop",
+    "outcome": "cancelled",
+    "cancellation_reason": "scan_stopped",
+    "episode_automatic": false,
+    "started_at_uptime": 10.0,
+    "finished_at_uptime": 14.5,
+    "elapsed_ms": 4500.0,
+    "valid_matcher_attempts": 7,
+    "accepted_corrections": 2,
+    "trigger_count": 1,
+    "automatic_trigger_count": 0,
+    "reliable_loop_trigger_count": 1,
+    "last_trigger_reason": "reliable_rtabmap_loop",
+    "last_trigger_at_uptime": 10.0,
+    "fresh_support_frames": 4,
+    "completion_frame_step_applied": false,
+]
+var recoveryLifecycleData = try JSONSerialization.data(
+    withJSONObject: recoveryLifecycleRecord)
+recoveryLifecycleData.append(0x0A)
+try recoveryLifecycleData.write(to: recoveryEvidenceURL)
+require(
+    LocalizationEvidenceBundleValidator.blockers(
+        in: evidenceDirectory,
+        expectation: evidenceExpectation).isEmpty,
+    "a valid recovery lifecycle record must validate")
+var corruptedRecoveryRecord = recoveryLifecycleRecord
+corruptedRecoveryRecord["tracking_session_id"] = "session-other"
+var corruptedRecoveryData = try JSONSerialization.data(
+    withJSONObject: corruptedRecoveryRecord)
+corruptedRecoveryData.append(0x0A)
+try corruptedRecoveryData.write(to: recoveryEvidenceURL)
+require(
+    LocalizationEvidenceBundleValidator.blockers(
+        in: evidenceDirectory,
+        expectation: evidenceExpectation).contains(
+            "evidence_bundle_localization_recovery_events.jsonl_identity_mismatch"),
+    "a recovery lifecycle identity mismatch must fail closed")
+try Data().write(to: recoveryEvidenceURL)
 
 let localizedTagsURL = evidenceDirectory.appendingPathComponent(
     "localized_price_tags.json")
@@ -547,6 +601,8 @@ try Data().write(to: longEvidenceDirectory.appendingPathComponent(
     "manual_localization_events.jsonl"))
 try Data().write(to: longEvidenceDirectory.appendingPathComponent(
     "tag_observations.jsonl"))
+try Data().write(to: longEvidenceDirectory.appendingPathComponent(
+    "localization_recovery_events.jsonl"))
 try Data("[]".utf8).write(to: longEvidenceDirectory.appendingPathComponent(
     "localized_price_tags.json"))
 let longExpectation = LocalizationEvidenceBundleExpectation(
@@ -2264,6 +2320,248 @@ require(
         squareForward.distanceFromShelfStartCm ?? -1,
         squareReversed.distanceFromShelfStartCm ?? -2),
     "square offset start must be stable under reversed ring order")
+
+// MARK: - P7R5 F-01: cooldown reconciles against the terminal outcome.
+
+// C1: automatic timeout starts a cooldown, a reliable loop bypasses it and
+// converges before expiry; the stale cooldown is cleared exactly at
+// convergence so the next Local frames are never forced weak.
+let p7r5C1Controller = PriorMapRecoveryController(
+    maximumValidAttempts: 40,
+    maximumWallClockSeconds: 30)
+_ = p7r5C1Controller.request(
+    reason: "persistent_weak_or_lost", now: 0, automatic: true)
+_ = p7r5C1Controller.finish(.timedOut, now: 5)
+require(p7r5C1Controller.isAutomaticTriggerSuppressed(now: 6),
+        "P7R5 C1 automatic timeout must suppress automatic triggers")
+require(!p7r5C1Controller.request(
+    reason: "persistent_weak_or_lost", now: 6, automatic: true),
+        "P7R5 C1 automatic retry stays suppressed during cooldown")
+require(p7r5C1Controller.request(
+    reason: "reliable_rtabmap_loop", now: 6),
+        "P7R5 C1 a reliable loop must bypass the automatic cooldown")
+let p7r5C1Completion = p7r5C1Controller.finish(
+    .converged, now: 8, selectedHypothesisId: 5, finalFreshSupportFrames: 4)
+require(p7r5C1Completion?.outcome == .converged
+        && p7r5C1Completion?.cancellationReason == nil,
+        "P7R5 C1 convergence carries no cancellation reason")
+require(p7r5C1Controller.nextAutomaticRecoveryAllowedAt == 0,
+        "P7R5 C1 convergence must clear the stale cooldown exactly")
+require(p7r5C1Controller.request(
+    reason: "persistent_weak_or_lost", now: 9, automatic: true),
+        "P7R5 C1 automatic triggers are allowed immediately after convergence")
+_ = p7r5C1Controller.finish(.cancelled, now: 9)
+let p7r5C1Confidence = PriorMapConfidenceManager()
+p7r5C1Confidence.reset()
+let p7r5C1Converged = p7r5C1Confidence.update(
+    timestamp: 20,
+    observation: PriorMapConfidenceObservation(
+        trackingState: "normal",
+        measurementAccepted: true,
+        correctionStepApplied: true,
+        recoveryActive: false,
+        recoveryConvergedThisUpdate: true,
+        recoveryFailedThisUpdate: false,
+        validPointCount: 120,
+        coverageAngleRad: 1.4,
+        uniqueness: 0.5,
+        residualCost: 0.01,
+        mapMismatch: false))
+require(p7r5C1Converged.phase == .usable,
+        "P7R5 C1 a cleared-cooldown convergence stays usable")
+for timestamp in 21...22 {
+    let result = p7r5C1Confidence.update(
+        timestamp: Double(timestamp), observation: trustedLocalObservation())
+    require(result.phase != .weak,
+            "P7R5 C1 a cleared cooldown must not force Local frames weak")
+}
+let p7r5C1Stable = p7r5C1Confidence.update(
+    timestamp: 23, observation: trustedLocalObservation())
+require(p7r5C1Stable.phase == .stable,
+        "P7R5 C1 three Local frames restore stable after the cooldown clear")
+
+// C2: a reliable-loop timeout also extends the cooldown, measured from the
+// second failure, regardless of how the episode was triggered.
+let p7r5C2Controller = PriorMapRecoveryController(
+    maximumValidAttempts: 40,
+    maximumWallClockSeconds: 30)
+_ = p7r5C2Controller.request(
+    reason: "persistent_weak_or_lost", now: 100, automatic: true)
+_ = p7r5C2Controller.finish(.timedOut, now: 105)
+require(!p7r5C2Controller.request(
+    reason: "persistent_weak_or_lost", now: 110, automatic: true),
+        "P7R5 C2 first timeout suppresses automatic retries")
+require(p7r5C2Controller.request(reason: "reliable_rtabmap_loop", now: 110),
+        "P7R5 C2 reliable loop bypasses the first cooldown")
+_ = p7r5C2Controller.finish(.timedOut, now: 112)
+require(p7r5C2Controller.nextAutomaticRecoveryAllowedAt == 132,
+        "P7R5 C2 a reliable-loop timeout extends cooldown from its own finish")
+require(!p7r5C2Controller.request(
+    reason: "persistent_weak_or_lost", now: 131, automatic: true),
+        "P7R5 C2 automatic retry stays suppressed before the second expiry")
+require(p7r5C2Controller.request(
+    reason: "persistent_weak_or_lost", now: 132, automatic: true),
+        "P7R5 C2 automatic retry allowed exactly at the second expiry")
+_ = p7r5C2Controller.finish(.cancelled, now: 132)
+
+// C3: a successful Recovery clears the cooldown exactly at convergence.
+let p7r5C3Controller = PriorMapRecoveryController()
+_ = p7r5C3Controller.request(
+    reason: "persistent_weak_or_lost", now: 0, automatic: true)
+_ = p7r5C3Controller.finish(.timedOut, now: 10)
+require(p7r5C3Controller.nextAutomaticRecoveryAllowedAt == 30,
+        "P7R5 C3 timeout must set the 20 second cooldown")
+_ = p7r5C3Controller.request(reason: "reliable_rtabmap_loop", now: 11)
+_ = p7r5C3Controller.finish(.converged, now: 12)
+require(p7r5C3Controller.nextAutomaticRecoveryAllowedAt == 0,
+        "P7R5 C3 convergence clears the cooldown exactly at completion")
+
+// C4: a manual correction clears the cooldown.
+let p7r5C4Controller = PriorMapRecoveryController()
+_ = p7r5C4Controller.request(
+    reason: "persistent_weak_or_lost", now: 0, automatic: true)
+_ = p7r5C4Controller.finish(.timedOut, now: 10)
+_ = p7r5C4Controller.request(reason: "reliable_rtabmap_loop", now: 11)
+_ = p7r5C4Controller.finish(.manualReset, now: 12)
+require(p7r5C4Controller.nextAutomaticRecoveryAllowedAt == 0,
+        "P7R5 C4 manual reset clears the cooldown")
+require(p7r5C4Controller.request(
+    reason: "persistent_weak_or_lost", now: 12, automatic: true),
+        "P7R5 C4 automatic triggers allowed immediately after manual reset")
+
+// C5 + F-04: a reliable loop bypasses cooldown but never duplicates the
+// active episode; repeated triggers retain a bounded source summary.
+let p7r5C5Controller = PriorMapRecoveryController()
+_ = p7r5C5Controller.request(
+    reason: "persistent_weak_or_lost", now: 0, automatic: true)
+_ = p7r5C5Controller.finish(.timedOut, now: 5)
+require(p7r5C5Controller.request(reason: "reliable_rtabmap_loop", now: 6),
+        "P7R5 C5 reliable loop bypasses cooldown")
+let p7r5C5EpisodeId = p7r5C5Controller.activeEpisode?.id
+require(!p7r5C5Controller.request(reason: "reliable_rtabmap_loop", now: 7),
+        "P7R5 C5 repeated triggers must not duplicate the active episode")
+require(p7r5C5Controller.activeEpisode?.id == p7r5C5EpisodeId
+        && p7r5C5Controller.activeEpisode?.deadlineUptime == 36,
+        "P7R5 C5 episode identity and deadline survive repeated triggers")
+if let p7r5C5Episode = p7r5C5Controller.activeEpisode {
+    require(p7r5C5Episode.triggerCount == 2
+            && p7r5C5Episode.automaticTriggerCount == 0
+            && p7r5C5Episode.reliableLoopTriggerCount == 2,
+            "P7R5 F-04 trigger source counts must be auditable")
+    require(p7r5C5Episode.lastTriggerReason == "reliable_rtabmap_loop"
+            && p7r5C5Episode.lastTriggerAtUptime == 7,
+            "P7R5 F-04 last trigger reason and time must be retained")
+    require(p7r5C5Episode.triggerRecords.count == 2
+            && p7r5C5Episode.triggerRecords.first?.atUptime == 6
+            && p7r5C5Episode.triggerRecords.last?.automatic == false,
+            "P7R5 F-04 trigger records must keep ordered source evidence")
+}
+for index in 0..<12 {
+    _ = p7r5C5Controller.request(
+        reason: "reliable_rtabmap_loop_\(index)",
+        now: 8 + Double(index))
+}
+if let p7r5C5CappedEpisode = p7r5C5Controller.activeEpisode {
+    require(p7r5C5CappedEpisode.triggerRecords.count
+                == PriorMapRecoveryEpisode.maximumRetainedTriggerRecords,
+            "P7R5 F-04 trigger records must be capped at eight")
+    require(p7r5C5CappedEpisode.triggerRecords.last?.reason
+                == "reliable_rtabmap_loop_11",
+            "P7R5 F-04 the newest trigger must survive record eviction")
+    require(p7r5C5CappedEpisode.triggerCount == 14,
+            "P7R5 F-04 triggerCount keeps counting beyond the record cap")
+}
+let p7r5TriggerBoundController = PriorMapRecoveryController(
+    maximumTriggerCount: 3)
+_ = p7r5TriggerBoundController.request(reason: "initial", now: 0)
+for _ in 0..<10 {
+    _ = p7r5TriggerBoundController.request(reason: "repeat", now: 1)
+}
+require(p7r5TriggerBoundController.activeEpisode?.triggerCount == 3,
+        "P7R5 F-04 triggerCount must stay bounded by maximumTriggerCount")
+
+// MARK: - P7R5 F-02: cancellations persist terminal evidence and reconcile.
+
+// E1: scan-stop cancellation persists its reason and suppresses automatic
+// retry; E2: map unload persists its reason without throttling retries.
+let p7r5E1Controller = PriorMapRecoveryController()
+_ = p7r5E1Controller.request(
+    reason: "persistent_weak_or_lost", now: 0, automatic: true)
+let p7r5E1Completion = p7r5E1Controller.finish(
+    .cancelled, now: 4, cancellationReason: .scanStopped)
+require(p7r5E1Completion?.outcome == .cancelled
+        && p7r5E1Completion?.cancellationReason == .scanStopped,
+        "P7R5 E1 scan-stop cancellation must persist the terminal reason")
+require(p7r5E1Controller.nextAutomaticRecoveryAllowedAt == 24,
+        "P7R5 E1 scan-stopped cancellation suppresses automatic retry")
+let p7r5E2Controller = PriorMapRecoveryController()
+_ = p7r5E2Controller.request(reason: "reliable_rtabmap_loop", now: 0)
+let p7r5E2Completion = p7r5E2Controller.finish(
+    .cancelled, now: 4, cancellationReason: .mapUnloaded)
+require(p7r5E2Completion?.cancellationReason == .mapUnloaded,
+        "P7R5 E2 map-unload cancellation must persist the terminal reason")
+require(p7r5E2Controller.nextAutomaticRecoveryAllowedAt == 0,
+        "P7R5 E2 map unload must not throttle future automatic triggers")
+
+// E4: no active episode means no fake completion.
+let p7r5E4Controller = PriorMapRecoveryController()
+require(p7r5E4Controller.finish(
+    .cancelled, now: 0, cancellationReason: .scanStopped) == nil,
+        "P7R5 E4 cancellation without an active episode returns nil")
+
+// Lifecycle record builder: snake_case contract fields and bounded elapsed.
+if let p7r5E1Completion {
+    let p7r5LifecycleRecord = PriorMapRecoveryLifecycleRecord(
+        trackingSessionId: "session-1",
+        priorMapId: "map-1",
+        priorMapSha256: "sha-1",
+        floorId: "1",
+        completion: p7r5E1Completion)
+    require(p7r5LifecycleRecord.format
+                == PriorMapRecoveryLifecycleRecord.formatName
+            && p7r5LifecycleRecord.version
+                == PriorMapRecoveryLifecycleRecord.formatVersion,
+            "P7R5 lifecycle record must carry the v1 contract identity")
+    require(p7r5LifecycleRecord.outcome == "cancelled"
+            && p7r5LifecycleRecord.cancellationReason == "scan_stopped",
+            "P7R5 lifecycle record must expose terminal outcome and reason")
+    require(p7r5LifecycleRecord.elapsedMs == 4000
+            && p7r5LifecycleRecord.finishedAtUptime == 4,
+            "P7R5 lifecycle elapsed must be bound to the finish time")
+    require(p7r5LifecycleRecord.episodeAutomatic
+            && p7r5LifecycleRecord.triggerCount == 1
+            && p7r5LifecycleRecord.lastTriggerReason
+                == "persistent_weak_or_lost",
+            "P7R5 lifecycle record must retain the trigger summary")
+    if let encoded = try? JSONEncoder().encode(p7r5LifecycleRecord),
+       let json = (try? JSONSerialization.jsonObject(with: encoded))
+            as? [String: Any] {
+        require(json["cancellation_reason"] as? String == "scan_stopped"
+                && json["finished_at_uptime"] != nil
+                && json["episode_automatic"] as? Bool == true,
+                "P7R5 lifecycle record must encode snake_case contract keys")
+    }
+    else {
+        require(false, "P7R5 lifecycle record must encode as JSON")
+    }
+}
+
+// MARK: - P7R5 F-03: pending completion elapsed binds to finishedAt.
+let p7r5F03Controller = PriorMapRecoveryController()
+_ = p7r5F03Controller.request(reason: "deadline", now: 100)
+let p7r5F03Completion = p7r5F03Controller.finish(.manualReset, now: 110)
+if let p7r5F03Completion {
+    require(PriorMapRecoveryDiagnostics.elapsedMs(
+        episode: p7r5F03Completion.episode,
+        completion: p7r5F03Completion,
+        now: 200) == 10000,
+            "P7R5 F-03 a consumed completion must not extend elapsed time")
+    require(PriorMapRecoveryDiagnostics.elapsedMs(
+        episode: p7r5F03Completion.episode,
+        completion: nil,
+        now: 130) == 30000,
+            "P7R5 F-03 an active episode still uses the frame clock")
+}
 
 if CommandLine.arguments.count == 2 {
     do {
