@@ -307,6 +307,27 @@ enum PriorMapRecoveryOutcome: String, Equatable {
     case manualReset = "manual_reset"
 }
 
+/// Why an active Recovery episode was cancelled. The reason is persisted in
+/// the terminal lifecycle evidence and decides whether the automatic trigger
+/// is suppressed afterwards; a successful convergence or manual reset always
+/// clears the cooldown instead.
+enum PriorMapRecoveryCancellationReason: String, Codable, Equatable {
+    case scanStopped = "scan_stopped"
+    case mapUnloaded = "map_unloaded"
+    case appInterrupted = "app_interrupted"
+    case sessionGenerationChanged = "session_generation_changed"
+    case operatorCancelled = "operator_cancelled"
+
+    var suppressesAutomaticRetry: Bool {
+        switch self {
+        case .scanStopped, .appInterrupted:
+            return true
+        case .mapUnloaded, .sessionGenerationChanged, .operatorCancelled:
+            return false
+        }
+    }
+}
+
 protocol PriorMapMonotonicClock {
     var now: TimeInterval { get }
 }
@@ -538,6 +559,30 @@ struct PriorMapRecoveryCompletion: Equatable {
     let finalResidualTranslationM: Double?
     let finalResidualYawRad: Double?
     let correctionStepAppliedOnCompletionFrame: Bool
+    let cancellationReason: PriorMapRecoveryCancellationReason?
+
+    init(
+        episode: PriorMapRecoveryEpisode,
+        outcome: PriorMapRecoveryOutcome,
+        finishedAtUptime: TimeInterval,
+        selectedHypothesisId: Int? = nil,
+        finalFreshSupportFrames: Int = 0,
+        finalResidualTranslationM: Double? = nil,
+        finalResidualYawRad: Double? = nil,
+        correctionStepAppliedOnCompletionFrame: Bool = false,
+        cancellationReason: PriorMapRecoveryCancellationReason? = nil
+    ) {
+        self.episode = episode
+        self.outcome = outcome
+        self.finishedAtUptime = finishedAtUptime
+        self.selectedHypothesisId = selectedHypothesisId
+        self.finalFreshSupportFrames = finalFreshSupportFrames
+        self.finalResidualTranslationM = finalResidualTranslationM
+        self.finalResidualYawRad = finalResidualYawRad
+        self.correctionStepAppliedOnCompletionFrame =
+            correctionStepAppliedOnCompletionFrame
+        self.cancellationReason = cancellationReason
+    }
 }
 
 struct PriorMapHypothesisTraceBinding: Equatable {
@@ -678,6 +723,11 @@ final class PriorMapRecoveryController {
         nextAutomaticRecoveryAllowedAt = 0
     }
 
+    /// Finishes the active episode and reconciles the automatic cooldown
+    /// against the terminal outcome (F-01). Cooldown only throttles automatic
+    /// weak/lost triggers: any convergence clears stale cooldown, any timeout
+    /// extends it regardless of how the episode started, and cancellations
+    /// follow their explicit reason.
     @discardableResult
     func finish(
         _ outcome: PriorMapRecoveryOutcome,
@@ -686,7 +736,8 @@ final class PriorMapRecoveryController {
         finalFreshSupportFrames: Int = 0,
         finalResidualTranslationM: Double? = nil,
         finalResidualYawRad: Double? = nil,
-        correctionStepAppliedOnCompletionFrame: Bool = false
+        correctionStepAppliedOnCompletionFrame: Bool = false,
+        cancellationReason: PriorMapRecoveryCancellationReason? = nil
     ) -> PriorMapRecoveryCompletion? {
         guard let episode = activeEpisode else { return nil }
         let completion = PriorMapRecoveryCompletion(
@@ -698,15 +749,27 @@ final class PriorMapRecoveryController {
             finalResidualTranslationM: finalResidualTranslationM,
             finalResidualYawRad: finalResidualYawRad,
             correctionStepAppliedOnCompletionFrame:
-                correctionStepAppliedOnCompletionFrame)
+                correctionStepAppliedOnCompletionFrame,
+            cancellationReason: cancellationReason)
         activeEpisode = nil
         lastCompletion = completion
-        if episode.automatic && (outcome == .timedOut || outcome == .cancelled) {
+        switch outcome {
+        case .converged:
+            nextAutomaticRecoveryAllowedAt = 0
+
+        case .timedOut:
             nextAutomaticRecoveryAllowedAt = max(
                 nextAutomaticRecoveryAllowedAt,
                 now + Self.automaticRecoveryCooldownSeconds)
-        }
-        if outcome == .manualReset {
+
+        case .cancelled:
+            if cancellationReason?.suppressesAutomaticRetry == true {
+                nextAutomaticRecoveryAllowedAt = max(
+                    nextAutomaticRecoveryAllowedAt,
+                    now + Self.automaticRecoveryCooldownSeconds)
+            }
+
+        case .manualReset:
             nextAutomaticRecoveryAllowedAt = 0
         }
         return completion
