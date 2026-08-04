@@ -4059,6 +4059,55 @@ def _render_localized_version(
     state_durations, weak_lost_intervals = _state_durations(
         state_events, final_state_timestamp
     )
+    # P7R6: Recovery lifecycle evidence must be used, not only hashed. The
+    # summary reports terminal outcomes; provisional recovery steps stay
+    # auditable but can never count as accepted constraints (already
+    # enforced by the disposition contract). Count and schema violations
+    # fail closed earlier; the remaining session-level rules become gate
+    # blockers below.
+    recovery_outcome_counts: dict[str, int] = {}
+    for event in recovery_events:
+        outcome_name = str(event.get("outcome") or "")
+        recovery_outcome_counts[outcome_name] = (
+            recovery_outcome_counts.get(outcome_name, 0) + 1
+        )
+    last_recovery_outcome = (
+        str(recovery_events[-1].get("outcome")) if recovery_events else None
+    )
+    provisional_completion_step_count = sum(
+        record.get("disposition") == "provisional_recovery_step"
+        for record in raw_constraints
+    )
+    recovery_summary = {
+        "episode_count": len(recovery_events),
+        "converged_count": recovery_outcome_counts.get("converged", 0),
+        "timed_out_count": recovery_outcome_counts.get("timed_out", 0),
+        "cancelled_count": recovery_outcome_counts.get("cancelled", 0),
+        "manual_reset_count": recovery_outcome_counts.get("manual_reset", 0),
+        "last_outcome": last_recovery_outcome,
+        "provisional_completion_step_count": provisional_completion_step_count,
+    }
+    recovery_gate_blockers: list[dict[str, Any]] = []
+    recovery_state_seen = any(
+        str(event.get("state")) == "recovering" for event in state_events
+    )
+    last_state_event = (
+        str(state_events[-1].get("state")) if state_events else None
+    )
+    if recovery_state_seen and not recovery_events:
+        recovery_gate_blockers.append(
+            {"code": "recovery_terminal_missing", "value": None}
+        )
+    if (
+        last_state_event == "recovering"
+        and last_recovery_outcome != "cancelled"
+    ):
+        recovery_gate_blockers.append(
+            {
+                "code": "recovery_active_without_cancelled_terminal",
+                "value": last_recovery_outcome,
+            }
+        )
     review_items.extend(
         {
             "id": f"state-{index:06d}",
@@ -4151,6 +4200,11 @@ def _render_localized_version(
             6,
         ),
         "weak_lost_intervals": weak_lost_intervals,
+        "recovery_summary": recovery_summary,
+        "recovery_gate": {
+            "passed": not recovery_gate_blockers,
+            "blockers": recovery_gate_blockers,
+        },
         "map_constraint_acceptance_rate": round(acceptance_rate, 6),
         "accepted_constraint_count": accepted_count,
         "accepted_source_constraint_count": accepted_source_count,
@@ -4280,6 +4334,10 @@ def _render_localized_version(
     for passed, code, value in review_checks:
         if not passed:
             review_blockers.append({"code": code, "value": value})
+    # Recovery lifecycle gates bind both review and publication: a session
+    # that stopped inside an uncancelled Recovery episode must never be
+    # declared trustworthy by convergence counters alone.
+    review_blockers.extend(recovery_gate_blockers)
     report["tag_observation_coverage_ratio"] = round(
         tag_observation_coverage, 6
     )
