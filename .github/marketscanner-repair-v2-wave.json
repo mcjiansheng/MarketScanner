@@ -1,7 +1,8 @@
 {
-  "wave": "P7R4-recovery-confidence-closeout",
-  "branch": "repair-v2-p7r4-recovery-confidence-closeout",
-  "base_branch": "repair-v2-p7r3-recovery-episode-closeout",
-  "base_sha": "998c175e40562fffd85fe45579a358c485a65b30",
-  "implementation_sha": "981ff4e208f74c8d4dd451d32df88233089e3201"
+  "wave": "P7R5-recovery-terminal-closeout",
+  "branch": "repair-v2-p7r5-recovery-terminal-closeout",
+  "base_branch": "repair-v2-p7r4-recovery-confidence-closeout",
+  "base_sha": "e2b1cf4142b5a3bc353909af77158199bbf09e5f",
+  "p7r4_implementation_sha": "981ff4e208f74c8d4dd451d32df88233089e3201",
+  "implementation_sha": "fc5618c84280cb02cfda4a8ead03f71401d4b55c"
 }
