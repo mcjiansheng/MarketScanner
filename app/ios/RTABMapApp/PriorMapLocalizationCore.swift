@@ -534,7 +534,17 @@ enum PriorMapRecoveryUpdateReducer {
     }
 }
 
+/// One bounded trigger record retained per episode. At most eight records are
+/// kept so a hostile or chatty trigger source cannot grow episode memory.
+struct PriorMapRecoveryTriggerRecord: Equatable {
+    let reason: String
+    let automatic: Bool
+    let atUptime: TimeInterval
+}
+
 struct PriorMapRecoveryEpisode: Equatable {
+    static let maximumRetainedTriggerRecords = 8
+
     let id: Int
     let reason: String
     let startedAtUptime: TimeInterval
@@ -544,9 +554,44 @@ struct PriorMapRecoveryEpisode: Equatable {
     var acceptedCorrections: Int
     var triggerCount: Int
     let automatic: Bool
+    var automaticTriggerCount: Int
+    var reliableLoopTriggerCount: Int
+    var lastTriggerReason: String
+    var lastTriggerAtUptime: TimeInterval
+    var triggerRecords: [PriorMapRecoveryTriggerRecord]
 
     var remainingValidAttempts: Int {
         max(0, maximumValidAttempts - validMatcherAttempts)
+    }
+
+    /// Appends one bounded trigger source record. Returns false once the
+    /// episode already reached its trigger budget.
+    mutating func recordTrigger(
+        reason: String,
+        automatic: Bool,
+        now: TimeInterval,
+        maximumTriggerCount: Int
+    ) -> Bool {
+        guard triggerCount < maximumTriggerCount else { return false }
+        triggerCount = min(maximumTriggerCount, triggerCount + 1)
+        if automatic {
+            automaticTriggerCount += 1
+        }
+        else {
+            reliableLoopTriggerCount += 1
+        }
+        lastTriggerReason = reason
+        lastTriggerAtUptime = now
+        triggerRecords.append(
+            PriorMapRecoveryTriggerRecord(
+                reason: reason,
+                automatic: automatic,
+                atUptime: now))
+        if triggerRecords.count > Self.maximumRetainedTriggerRecords {
+            triggerRecords.removeFirst(
+                triggerRecords.count - Self.maximumRetainedTriggerRecords)
+        }
+        return true
     }
 }
 
@@ -759,7 +804,8 @@ final class PriorMapRecoveryController {
     }
 
     /// Returns true only for the inactive -> active transition. Repeated loop
-    /// closures retain the episode ID, deadline, attempts, and fresh support.
+    /// closures retain the episode ID, deadline, attempts, and fresh support
+    /// but append a bounded trigger-source summary (F-04).
     @discardableResult
     func request(
         reason: String,
@@ -767,9 +813,11 @@ final class PriorMapRecoveryController {
         automatic: Bool = false
     ) -> Bool {
         if var episode = activeEpisode {
-            episode.triggerCount = min(
-                maximumTriggerCount,
-                episode.triggerCount + 1)
+            _ = episode.recordTrigger(
+                reason: reason,
+                automatic: automatic,
+                now: now,
+                maximumTriggerCount: maximumTriggerCount)
             activeEpisode = episode
             return false
         }
@@ -785,7 +833,17 @@ final class PriorMapRecoveryController {
             validMatcherAttempts: 0,
             acceptedCorrections: 0,
             triggerCount: 1,
-            automatic: automatic)
+            automatic: automatic,
+            automaticTriggerCount: automatic ? 1 : 0,
+            reliableLoopTriggerCount: automatic ? 0 : 1,
+            lastTriggerReason: reason,
+            lastTriggerAtUptime: now,
+            triggerRecords: [
+                PriorMapRecoveryTriggerRecord(
+                    reason: reason,
+                    automatic: automatic,
+                    atUptime: now),
+            ])
         nextEpisodeId += 1
         lastCompletion = nil
         return true
