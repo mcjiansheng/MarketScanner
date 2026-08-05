@@ -153,3 +153,17 @@ P7R6C, based on the P7R6B governance HEAD `fd3fb4a84bd8da3770a81d455c2cc428f7479
 - C6 Exact-SHA CI: the CI `swiftc -parse` list, the Swift host compile list and the Xcode project register the two new Swift files; the platform-independent contract job runs the Swift host and C4 snapshot suites.
 
 Executable evidence: C1/C2 U1-U10/TJ9/TJ10 and L1-L6 Swift host tests, the C3 integrity-suite cases, the C4 S1-S12 PC snapshot tests, the C5 N1-N9 strict-schema tests, plus the shared Swift/PC fixture alignment. The seven-group exact-final-SHA CI on the P7R6C HEAD, the clean Apple build, the independent read-only review, and the human Sam re-test remain NOT RUN / PENDING and must not be reported as PASS; the release judgment stays **NO-GO / NOT PRODUCTION READY**, and `REAL DEVICE PASS` / `SAM FIELD PASS` / `PRODUCTION READY` remain forbidden until LiDAR real-device and on-site Sam testing complete.
+
+# Mobile-Only V1 end-to-end implementation status
+
+Based on the P7R6C governance HEAD `04cdfe9a4c533908d1eb175ba84e3e39d2ca2654`, the
+`mobile-only-v1-end-to-end-integration` branch implements the Mobile-Only V1
+track: on-device map import (XLSX/CSV/JSON), on-device prior-map compilation,
+session snapshot transaction + Fast Path SE(2) factor graph, 1 Hz final
+trajectory with local time, tag finalization and the four-sheet XLSX workbook.
+
+Status words per module: IMPLEMENTED / UNIT TESTED / INTEGRATION TESTED (Swift
+host suites I/C/P/T/G/X plus the three-format `--import-suite`); NOT CI
+VERIFIED, NOT DEVICE SMOKE PASS, NOT SAM FIELD PASS, NOT PRODUCTION QUALIFIED.
+Deep Path (native RTAB-Map reprocess bridge) remains DESIGNED. Full details in
+`docs/mobile-only/`.

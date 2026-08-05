@@ -11,7 +11,8 @@
 > P7R6 governance HEAD used as the P7R6A base: `repair-v2-p7r6-recovery-evidence-integrity-closeout@4bce394bdfb7f6c7c2373f314814a3e3260356fe` (P7R6 implementation SHA `a315ff6e5c0ca639f12c639aaf81be6738195e2f`).
 > P7R6A governance HEAD used as the P7R6B base: `repair-v2-p7r6a-recovery-persisted-parser-closeout@f4524d958913e927a33a7295f45ccf7b3a98d42a` (P7R6A implementation SHA `01a42a40e9671c709c4e0f9e1f85839a48dd4a83`).
 > P7R6B governance HEAD used as the P7R6C base: `repair-v2-p7r6b-strict-json-pending-queue-closeout@fd3fb4a84bd8da3770a81d455c2cc428f7479567` (P7R6B implementation SHA `fd3fb4a84bd8da3770a81d455c2cc428f7479567`).
-> Current implementation branch: `repair-v2-p7r6c-stable-input-total-json-closeout`; its exact P7R6C implementation SHA is bound in `.github/marketscanner-repair-v2-wave.json`; later test/governance commits must not silently modify production code.
+> Current implementation branch: `mobile-only-v1-end-to-end-integration` (based on the P7R6C governance HEAD `04cdfe9a4c533908d1eb175ba84e3e39d2ca2654`); the Mobile-Only V1 implementation SHA will be bound in `.github/marketscanner-repair-v2-wave.json` after the integration commits; later test/governance commits must not silently modify production code.
+> Mobile-Only V1 modules: docs/mobile-only/.
 
 The authoritative release judgment remains [Production Readiness Review](PRODUCTION_READINESS_REVIEW.md): **NO-GO / NOT PRODUCTION READY**.
 
