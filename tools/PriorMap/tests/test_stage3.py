@@ -14,10 +14,13 @@ from tools.PriorMap.offline_localization import (
     CONSTRAINT_CONTRACT,
     DEFAULT_REPLAY_PARAMETERS,
     RECOVERY_EVIDENCE_UNBOUND_LEGACY,
+    RECOVERY_EVENT_CONTRACT,
     SESSION_INPUT_FILE_NAMES_V2,
     Pose,
     OfflineLocalizationError,
+    _read_jsonl,
     _validate_jsonl_business_record,
+    _validate_recovery_event_sequence,
     _associate_tag,
     _segment_intersection,
     apply_pose_delta_to_point,
@@ -1911,6 +1914,93 @@ class LocalizedPipelineTests(unittest.TestCase):
                 self.source_database,
                 self.optimized_database,
                 self.root / "wrong-final-tag-height",
+            )
+
+
+# P7R6A: shared recovery lifecycle fixtures. The device-side strict parser
+# and the PC reader must classify every fixture into the same stable
+# category, so one file is accepted by both or rejected by both.
+RECOVERY_FIXTURES_DIR = (
+    Path(__file__).with_name("fixtures") / "recovery_lifecycle"
+)
+
+EXPECTED_RECOVERY_FIXTURE_CATEGORIES = {
+    "valid_v1.jsonl": "PASS",
+    "valid_v2.jsonl": "PASS",
+    "valid_mixed_v1_v2.jsonl": "PASS",
+    "missing_final_newline.jsonl": "missing_final_newline",
+    "blank_line.jsonl": "blank_record",
+    "duplicate_episode.jsonl": "duplicate_episode",
+    "out_of_order_episode.jsonl": "episode_order_invalid",
+    "finish_time_regression.jsonl": "finish_order_invalid",
+    "unknown_field.jsonl": "unknown_field",
+    "identity_mismatch.jsonl": "identity_mismatch",
+}
+
+_PYTHON_RECOVERY_ERROR_PATTERNS = (
+    ("Missing final newline", "missing_final_newline"),
+    ("Blank JSONL record", "blank_record"),
+    ("Oversized record", "record_too_large"),
+    ("Invalid UTF-8", "invalid_utf8"),
+    ("Invalid JSON", "invalid_json"),
+    ("Non-object record", "non_object"),
+    ("Format mismatch", "format_mismatch"),
+    ("Version mismatch", "version_mismatch"),
+    ("Tracking-session mismatch", "identity_mismatch"),
+    ("Prior-map hash mismatch", "identity_mismatch"),
+    ("Floor mismatch", "identity_mismatch"),
+    ("recovery_unknown_field", "unknown_field"),
+    ("recovery_outcome_invalid", "outcome_invalid"),
+    ("recovery_cancellation_reason_invalid", "cancellation_reason_invalid"),
+    ("recovery_trigger_records_invalid", "trigger_records_invalid"),
+    ("recovery_business_schema_invalid", "business_schema_invalid"),
+    ("recovery_episode_order_invalid", "episode_order_invalid"),
+    ("recovery_finish_order_invalid", "finish_order_invalid"),
+    ("duplicate episode_id", "duplicate_episode"),
+    ("Invalid timestamp", "business_schema_invalid"),
+)
+
+
+def classify_python_recovery_error(message: str) -> str:
+    for pattern, category in _PYTHON_RECOVERY_ERROR_PATTERNS:
+        if pattern in message:
+            return category
+    return "unknown_error"
+
+
+def python_recovery_fixture_category(path: Path) -> str:
+    """Runs the PC reader over one fixture and returns the stable category
+    shared with the device-side parser."""
+
+    try:
+        values, _ = _read_jsonl(
+            path,
+            RECOVERY_EVENT_CONTRACT,
+            session_id="session-a",
+            expected_map_hash="a" * 64,
+            expected_floor_id="1",
+        )
+        _validate_recovery_event_sequence(values)
+    except OfflineLocalizationError as exc:
+        return classify_python_recovery_error(str(exc))
+    return "PASS"
+
+
+class RecoveryLifecycleFixtureContractTests(unittest.TestCase):
+    def test_pc_reader_fixture_categories_are_stable(self) -> None:
+        self.assertEqual(
+            sorted(path.name for path in RECOVERY_FIXTURES_DIR.glob("*.jsonl")),
+            sorted(EXPECTED_RECOVERY_FIXTURE_CATEGORIES),
+            "the shared recovery fixture set must stay complete",
+        )
+        for name in sorted(EXPECTED_RECOVERY_FIXTURE_CATEGORIES):
+            category = python_recovery_fixture_category(
+                RECOVERY_FIXTURES_DIR / name
+            )
+            self.assertEqual(
+                category,
+                EXPECTED_RECOVERY_FIXTURE_CATEGORIES[name],
+                name,
             )
 
 

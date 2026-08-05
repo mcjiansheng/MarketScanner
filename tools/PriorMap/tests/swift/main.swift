@@ -4681,6 +4681,48 @@ do {
         "P-A20 v1 records must keep their missing v2 facts un-fabricated")
 }
 
+// P7R6A fixture alignment mode: classifies every shared recovery fixture
+// through the device-side strict parser and prints "<name> <category>" so
+// the Python test can assert the Swift parser and the PC reader agree.
+if CommandLine.arguments.count >= 3,
+   CommandLine.arguments[1] == "--recovery-fixtures" {
+    do {
+        let fixtureDirectory = URL(
+            fileURLWithPath: CommandLine.arguments[2],
+            isDirectory: true)
+        let names = try FileManager.default.contentsOfDirectory(
+            atPath: fixtureDirectory.path).filter {
+                $0.hasSuffix(".jsonl")
+            }.sorted()
+        guard !names.isEmpty else {
+            FileHandle.standardError.write(
+                Data("No recovery lifecycle fixtures found\n".utf8))
+            exit(3)
+        }
+        for name in names {
+            let data = try Data(
+                contentsOf: fixtureDirectory.appendingPathComponent(name))
+            let category: String
+            do {
+                _ = try RecoveryLifecyclePersistedEvidenceParser.parse(
+                    snapshot: data,
+                    expectation: p7r6aParseExpectation())
+                category = "PASS"
+            }
+            catch let error as RecoveryLifecycleEvidenceParseError {
+                category = error.stableCode
+            }
+            print("\(name) \(category)")
+        }
+        exit(0)
+    }
+    catch {
+        FileHandle.standardError.write(
+            Data("Recovery fixture alignment failed: \(error)\n".utf8))
+        exit(4)
+    }
+}
+
 if CommandLine.arguments.count == 2 {
     do {
         let digest = try PriorMapPackageIntegrity.validate(

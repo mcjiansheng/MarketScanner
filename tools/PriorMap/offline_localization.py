@@ -1045,6 +1045,14 @@ def _read_jsonl(
     with path.open("rb") as handle:
         for line_no, raw_line in enumerate(handle, start=1):
             diagnostics["total_lines"] += 1
+            if not raw_line.endswith(b"\n"):
+                # P7R6A: the formal JSONL contract always ends every
+                # record with a newline, matching the device-side strict
+                # parser. A complete JSON object without its final newline
+                # is partial evidence and fails closed.
+                raise OfflineLocalizationError(
+                    f"Missing final newline at {path.name}:{line_no}"
+                )
             if len(raw_line) > contract.maximum_record_bytes:
                 diagnostics["oversized_lines"] += 1
                 raise OfflineLocalizationError(

@@ -265,6 +265,49 @@ class IOSCoreContractTests(unittest.TestCase):
                 256 * 1024 * 1024,
                 f"100k-record finalization peak RSS was {peak_rss_bytes} bytes",
             )
+            # P7R6A: the device-side strict parser and the PC reader must
+            # classify every shared recovery fixture identically.
+            from tools.PriorMap.tests.test_stage3 import (
+                EXPECTED_RECOVERY_FIXTURE_CATEGORIES,
+                RECOVERY_FIXTURES_DIR,
+                python_recovery_fixture_category,
+            )
+
+            fixture_result = subprocess.run(
+                [
+                    str(executable),
+                    "--recovery-fixtures",
+                    str(RECOVERY_FIXTURES_DIR),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(fixture_result.returncode, 0, fixture_result.stderr)
+            swift_categories = {}
+            for line in fixture_result.stdout.splitlines():
+                name, _, category = line.partition(" ")
+                if name.endswith(".jsonl"):
+                    swift_categories[name] = category
+            self.assertEqual(
+                sorted(swift_categories),
+                sorted(EXPECTED_RECOVERY_FIXTURE_CATEGORIES),
+                fixture_result.stdout,
+            )
+            for name, swift_category in sorted(swift_categories.items()):
+                python_category = python_recovery_fixture_category(
+                    RECOVERY_FIXTURES_DIR / name
+                )
+                self.assertEqual(
+                    swift_category,
+                    python_category,
+                    f"Swift parser and PC reader disagree on {name}",
+                )
+                self.assertEqual(
+                    swift_category,
+                    EXPECTED_RECOVERY_FIXTURE_CATEGORIES[name],
+                    name,
+                )
             workbook = Path(temporary) / "integrity.xlsx"
             write_workbook(workbook, fixture_rows())
             package = convert_workbook(workbook, Path(temporary) / "package")
