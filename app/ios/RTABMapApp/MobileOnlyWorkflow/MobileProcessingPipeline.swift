@@ -545,6 +545,9 @@ enum MobileProcessingPipeline {
     }
 
     /// Shelf segments from the compiled prior-map package (`shelves.json`).
+    /// Each shelf element carries `bounds` (min/max in metres) plus an
+    /// optional polygon geometry; the shelf line is the long axis of the
+    /// bounds (the compiled contract stores bounds at the element level).
     static func readShelves(from map: MobileMapLibrary.MapEntry) throws -> [ShelfAssociationEngine.ShelfSegment] {
         let url = map.packageDirectory.appendingPathComponent("shelves.json")
         let data = try Data(contentsOf: url)
@@ -556,35 +559,41 @@ enum MobileProcessingPipeline {
         var shelves: [ShelfAssociationEngine.ShelfSegment] = []
         for raw in rawShelves {
             guard let shelfCode = raw["code"] as? String,
-                  let floorID = raw["floor_id"] as? String,
-                  let geometry = raw["geometry"] as? [String: Any]
+                  let floorID = raw["floor_id"] as? String
             else { continue }
-            // Accept either two points or bounds-derived endpoints.
-            if let startX = geometry["x1_m"] as? Double,
-               let startY = geometry["y1_m"] as? Double,
-               let endX = geometry["x2_m"] as? Double,
-               let endY = geometry["y2_m"] as? Double {
-                shelves.append(ShelfAssociationEngine.ShelfSegment(
-                    shelfCode: shelfCode, floorID: floorID,
-                    startM: (startX, startY), endM: (endX, endY),
-                    side: "front"))
-            } else if let minX = geometry["min_x_m"] as? Double,
-                      let minY = geometry["min_y_m"] as? Double,
-                      let maxX = geometry["max_x_m"] as? Double,
-                      let maxY = geometry["max_y_m"] as? Double {
-                // Bounds fallback: use the longer axis as the shelf line.
+            // Element-level bounds are authoritative.
+            if let bounds = raw["bounds"] as? [String: Double],
+               let minX = bounds["min_x_m"], let minY = bounds["min_y_m"],
+               let maxX = bounds["max_x_m"], let maxY = bounds["max_y_m"],
+               maxX >= minX, maxY >= minY {
                 let horizontal = (maxX - minX) >= (maxY - minY)
                 if horizontal {
                     shelves.append(ShelfAssociationEngine.ShelfSegment(
                         shelfCode: shelfCode, floorID: floorID,
-                        startM: (minX, minY), endM: (maxX, minY),
+                        startM: (minX, (minY + maxY) / 2.0),
+                        endM: (maxX, (minY + maxY) / 2.0),
                         side: "front"))
                 } else {
                     shelves.append(ShelfAssociationEngine.ShelfSegment(
                         shelfCode: shelfCode, floorID: floorID,
-                        startM: (minX, minY), endM: (minX, maxY),
+                        startM: ((minX + maxX) / 2.0, minY),
+                        endM: ((minX + maxX) / 2.0, maxY),
                         side: "front"))
                 }
+                continue
+            }
+            // Geometry-only fallback: polygon coordinates.
+            if let geometry = raw["geometry"] as? [String: Any],
+               let coordinates = geometry["coordinates"] as? [[Double]],
+               coordinates.count >= 2 {
+                let startX = coordinates[0][0]
+                let startY = coordinates[0][1]
+                let endX = coordinates[coordinates.count - 1][0]
+                let endY = coordinates[coordinates.count - 1][1]
+                shelves.append(ShelfAssociationEngine.ShelfSegment(
+                    shelfCode: shelfCode, floorID: floorID,
+                    startM: (startX, startY), endM: (endX, endY),
+                    side: "front"))
             }
         }
         return shelves
@@ -753,7 +762,7 @@ enum MobileProcessingPipeline {
             "prior_map_id": request.priorMap.priorMapID,
             "prior_map_sha256": request.priorMap.packageSHA256,
             "canonical_source_sha256": request.priorMap.canonicalSourceSHA256,
-            "source_format": metadata["formatVersion"] as? String ?? "xlsx",
+            "source_format": String(describing: metadata["formatVersion"] ?? "xlsx"),
             "tracking_session_id": request.trackingSessionID,
             "local_start": devicePositions.first?.localTimestamp ?? "",
             "local_end": devicePositions.last?.localTimestamp ?? "",
