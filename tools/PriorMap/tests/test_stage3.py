@@ -1939,6 +1939,10 @@ EXPECTED_RECOVERY_FIXTURE_CATEGORIES = {
     "numeric_episode_automatic.jsonl": "business_schema_invalid",
     "numeric_completion_step.jsonl": "business_schema_invalid",
     "numeric_trigger_automatic.jsonl": "trigger_records_invalid",
+    # P7R6B duplicate-key fixtures: rejected before last-key-wins parsing.
+    "duplicate_top_level_key.jsonl": "duplicate_json_key",
+    "duplicate_nested_trigger_key.jsonl": "duplicate_json_key",
+    "duplicate_escaped_equivalent_key.jsonl": "duplicate_json_key",
 }
 
 _PYTHON_RECOVERY_ERROR_PATTERNS = (
@@ -1946,6 +1950,9 @@ _PYTHON_RECOVERY_ERROR_PATTERNS = (
     ("Blank JSONL record", "blank_record"),
     ("Oversized record", "record_too_large"),
     ("Invalid UTF-8", "invalid_utf8"),
+    # Duplicate-key must be classified before the generic "Invalid JSON"
+    # pattern: json.loads reports it inside the invalid-JSON wrapper.
+    ("Duplicate JSON key", "duplicate_json_key"),
     ("Invalid JSON", "invalid_json"),
     ("Non-object record", "non_object"),
     ("Format mismatch", "format_mismatch"),
@@ -2007,6 +2014,44 @@ class RecoveryLifecycleFixtureContractTests(unittest.TestCase):
                 name,
             )
 
+
+    def test_object_pairs_hook_rejects_duplicate_keys(self) -> None:
+        """P7R6B: the PC reader must refuse duplicate keys instead of
+        silently applying last-key-wins."""
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "recovery.jsonl"
+            path.write_text(
+                '{"episode_id":999,"episode_id":1,"format":"'
+                'MarketScannerRecoveryLifecycleEvent","version":2}\n',
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                OfflineLocalizationError, "Duplicate JSON key"
+            ):
+                _read_jsonl(
+                    path,
+                    RECOVERY_EVENT_CONTRACT,
+                    session_id="session-a",
+                    expected_map_hash="a" * 64,
+                    expected_floor_id="1",
+                )
+            nested = path.with_name("nested.jsonl")
+            nested.write_text(
+                '{"format":"MarketScannerRecoveryLifecycleEvent","version":2,'
+                '"trigger_records":[{"reason":"a","reason":"b"}],'
+                '"episode_id":1,"finished_at_uptime":1.0}\n',
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                OfflineLocalizationError, "Duplicate JSON key"
+            ):
+                _read_jsonl(
+                    nested,
+                    RECOVERY_EVENT_CONTRACT,
+                    session_id="session-a",
+                    expected_map_hash="a" * 64,
+                    expected_floor_id="1",
+                )
 
     def test_strict_bool_parity_rejects_numeric_booleans(self) -> None:
         """P7R6B: numeric 0/1 in a boolean field is rejected exactly like

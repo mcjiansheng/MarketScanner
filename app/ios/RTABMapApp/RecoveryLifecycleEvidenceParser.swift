@@ -140,6 +140,7 @@ enum RecoveryLifecycleEvidenceParseError: Error, Equatable {
     case expectedCountMismatch
     case lastEpisodeWatermarkMismatch
     case lastFinishedWatermarkMismatch
+    case duplicateJSONKey(line: Int)
 
     var stableCode: String {
         switch self {
@@ -166,6 +167,7 @@ enum RecoveryLifecycleEvidenceParseError: Error, Equatable {
             return "last_episode_watermark_mismatch"
         case .lastFinishedWatermarkMismatch:
             return "last_finished_watermark_mismatch"
+        case .duplicateJSONKey: return "duplicate_json_key"
         }
     }
 }
@@ -265,6 +267,21 @@ enum RecoveryLifecyclePersistedEvidenceParser {
             }
             guard String(data: line, encoding: .utf8) != nil else {
                 throw RecoveryLifecycleEvidenceParseError.invalidUTF8(
+                    line: lineNumber)
+            }
+            // P7R6B: reject duplicate object keys on the raw bytes before
+            // JSONSerialization can silently apply last-key-wins.
+            do {
+                try StrictJSONKeyUniquenessValidator.validate(
+                    line, line: lineNumber)
+            }
+            catch StrictJSONKeyError.duplicateKey(_, _) {
+                throw RecoveryLifecycleEvidenceParseError.duplicateJSONKey(
+                    line: lineNumber)
+            }
+            catch StrictJSONKeyError.nestingTooDeep,
+                  StrictJSONKeyError.tokenLimitExceeded {
+                throw RecoveryLifecycleEvidenceParseError.invalidJSON(
                     line: lineNumber)
             }
             let decoded: Any

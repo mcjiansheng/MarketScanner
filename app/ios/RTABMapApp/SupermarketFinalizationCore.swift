@@ -397,6 +397,8 @@ enum LocalizationEvidenceBundleValidator {
             return "count_mismatch"
         case .lastEpisodeWatermarkMismatch, .lastFinishedWatermarkMismatch:
             return "recovery_watermark_mismatch"
+        case .duplicateJSONKey:
+            return "duplicate_json_key"
         }
     }
 
@@ -414,6 +416,18 @@ enum LocalizationEvidenceBundleValidator {
         }
         guard String(data: line, encoding: .utf8) != nil else {
             throw validationError("invalid_utf8_or_partial_line")
+        }
+        // P7R6B: reject duplicate object keys on the raw bytes before
+        // JSONSerialization can silently apply last-key-wins.
+        do {
+            try StrictJSONKeyUniquenessValidator.validate(line)
+        }
+        catch StrictJSONKeyError.duplicateKey {
+            throw validationError("duplicate_json_key")
+        }
+        catch StrictJSONKeyError.nestingTooDeep,
+              StrictJSONKeyError.tokenLimitExceeded {
+            throw validationError("invalid_json_object")
         }
         let decoded: Any
         do {
@@ -465,6 +479,18 @@ enum LocalizationEvidenceBundleValidator {
             url,
             within: url.deletingLastPathComponent().deletingLastPathComponent(),
             maximumBytes: Int64(maximumLocalizedTagsBytes)).data
+        // P7R6B: duplicate keys anywhere in the whole-array document are
+        // rejected before JSONSerialization can lose the ambiguity.
+        do {
+            try StrictJSONKeyUniquenessValidator.validate(data)
+        }
+        catch StrictJSONKeyError.duplicateKey {
+            throw validationError("duplicate_json_key")
+        }
+        catch StrictJSONKeyError.nestingTooDeep,
+              StrictJSONKeyError.tokenLimitExceeded {
+            throw validationError("invalid_json_array")
+        }
         guard let object = try? JSONSerialization.jsonObject(with: data),
               let values = object as? [[String: Any]],
               values.count <= maximumLocalizedTagRecords else {

@@ -93,6 +93,7 @@
 		4EA700012F60000200100001 /* RecoveryLifecyclePersistenceCore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60000200100002 /* RecoveryLifecyclePersistenceCore.swift */; };
 		4EA700012F60000300100001 /* RecoveryLifecycleEvidenceParser.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60000300100002 /* RecoveryLifecycleEvidenceParser.swift */; };
 		4EA700012F60000400100001 /* StrictJSONScalar.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60000400100002 /* StrictJSONScalar.swift */; };
+		4EA700012F60000500100001 /* StrictJSONKeyUniquenessValidator.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60000500100002 /* StrictJSONKeyUniquenessValidator.swift */; };
 		4EA500012F40000100100001 /* PriorMapScanMatcher.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA500012F40000100100002 /* PriorMapScanMatcher.swift */; };
 		4EA500012F40000100100003 /* PriorMapDepthSampler.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA500012F40000100100004 /* PriorMapDepthSampler.swift */; };
 		4EA500012F40000100100005 /* PriceTagLocalizationCore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA500012F40000100100006 /* PriceTagLocalizationCore.swift */; };
@@ -211,6 +212,7 @@
 		4EA700012F60000200100002 /* RecoveryLifecyclePersistenceCore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = RecoveryLifecyclePersistenceCore.swift; path = RTABMapApp/RecoveryLifecyclePersistenceCore.swift; sourceTree = "<group>"; };
 		4EA700012F60000300100002 /* RecoveryLifecycleEvidenceParser.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = RecoveryLifecycleEvidenceParser.swift; path = RTABMapApp/RecoveryLifecycleEvidenceParser.swift; sourceTree = "<group>"; };
 		4EA700012F60000400100002 /* StrictJSONScalar.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = StrictJSONScalar.swift; path = RTABMapApp/StrictJSONScalar.swift; sourceTree = "<group>"; };
+		4EA700012F60000500100002 /* StrictJSONKeyUniquenessValidator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = StrictJSONKeyUniquenessValidator.swift; path = RTABMapApp/StrictJSONKeyUniquenessValidator.swift; sourceTree = "<group>"; };
 		4EA500012F40000100100002 /* PriorMapScanMatcher.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = PriorMapScanMatcher.swift; path = RTABMapApp/PriorMapScanMatcher.swift; sourceTree = "<group>"; };
 		4EA500012F40000100100004 /* PriorMapDepthSampler.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = PriorMapDepthSampler.swift; path = RTABMapApp/PriorMapDepthSampler.swift; sourceTree = "<group>"; };
 		4EA500012F40000100100006 /* PriceTagLocalizationCore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = PriceTagLocalizationCore.swift; path = RTABMapApp/PriceTagLocalizationCore.swift; sourceTree = "<group>"; };
@@ -522,6 +524,7 @@
 				4EA700012F60000200100002 /* RecoveryLifecyclePersistenceCore.swift */,
 				4EA700012F60000300100002 /* RecoveryLifecycleEvidenceParser.swift */,
 				4EA700012F60000400100002 /* StrictJSONScalar.swift */,
+				4EA700012F60000500100002 /* StrictJSONKeyUniquenessValidator.swift */,
 				4EA500012F40000100100002 /* PriorMapScanMatcher.swift */,
 				4EA500012F40000100100004 /* PriorMapDepthSampler.swift */,
 				4EA500012F40000100100006 /* PriceTagLocalizationCore.swift */,
@@ -917,6 +920,7 @@
 				4EA700012F60000200100001 /* RecoveryLifecyclePersistenceCore.swift in Sources */,
 				4EA700012F60000300100001 /* RecoveryLifecycleEvidenceParser.swift in Sources */,
 				4EA700012F60000400100001 /* StrictJSONScalar.swift in Sources */,
+				4EA700012F60000500100001 /* StrictJSONKeyUniquenessValidator.swift in Sources */,
 				4EA500012F40000100100001 /* PriorMapScanMatcher.swift in Sources */,
 				4EA500012F40000100100003 /* PriorMapDepthSampler.swift in Sources */,
 				4EA500012F40000100100005 /* PriceTagLocalizationCore.swift in Sources */,

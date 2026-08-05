@@ -640,6 +640,49 @@ def _reject_nonfinite_json(value: str) -> None:
     raise ValueError(f"Non-finite JSON number is forbidden: {value}")
 
 
+class DuplicateJSONKeyError(ValueError):
+    """Raised by the object_pairs_hook when one JSON object repeats a key.
+
+    ``json.loads`` would otherwise apply last-key-wins and silently drop the
+    first value; a fail-closed evidence contract must reject the ambiguity
+    before any schema decision is made on the surviving value.
+    """
+
+    def __init__(self, key: str) -> None:
+        super().__init__(f"Duplicate JSON key: {key}")
+        self.key = key
+
+
+def _reject_duplicate_object_pairs(
+    pairs: list[tuple[str, Any]],
+) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise DuplicateJSONKeyError(key)
+        result[key] = value
+    return result
+
+
+def _json_nesting_depth(value: Any) -> int:
+    """Iterative maximum nesting depth of a decoded JSON value. Never
+    recurses, so a deeply nested document cannot overflow the Python
+    stack while being measured."""
+    max_depth = 0
+    stack: list[tuple[Any, int]] = [(value, 1)]
+    while stack:
+        node, depth = stack.pop()
+        if isinstance(node, dict):
+            max_depth = max(max_depth, depth)
+            for child in node.values():
+                stack.append((child, depth + 1))
+        elif isinstance(node, list):
+            max_depth = max(max_depth, depth)
+            for child in node:
+                stack.append((child, depth + 1))
+    return max_depth
+
+
 def _identity_field(value: dict[str, Any], snake: str, camel: str) -> str:
     return str(value.get(snake) or value.get(camel) or "")
 
@@ -1071,7 +1114,11 @@ def _read_jsonl(
                     f"Blank JSONL record at {path.name}:{line_no}"
                 )
             try:
-                value = json.loads(line, parse_constant=_reject_nonfinite_json)
+                value = json.loads(
+                    line,
+                    parse_constant=_reject_nonfinite_json,
+                    object_pairs_hook=_reject_duplicate_object_pairs,
+                )
             except (json.JSONDecodeError, ValueError) as exc:
                 diagnostics["invalid_json_lines"] += 1
                 raise OfflineLocalizationError(
@@ -1192,6 +1239,7 @@ def _read_localized_price_tags(
         payload = json.loads(
             path.read_bytes().decode("utf-8", errors="strict"),
             parse_constant=_reject_nonfinite_json,
+            object_pairs_hook=_reject_duplicate_object_pairs,
         )
     except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
         raise OfflineLocalizationError(
