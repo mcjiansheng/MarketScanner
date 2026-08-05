@@ -5,6 +5,7 @@ on:
     branches:
       - feature/prior-map-localization-repair-v2
       - "repair-v2-**"
+      - "mobile-only-**"
   pull_request:
     paths:
       - ".github/workflows/marketscanner-repair-v2.yml"
