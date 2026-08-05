@@ -7,6 +7,21 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		4EA7C1000000000000100001 /* MobileOnlyWorkflowState.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA7C1000000000000100002 /* MobileOnlyWorkflowState.swift */; };
+		4EA7C1000000000100100001 /* MobileOnlyWorkflowError.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA7C1000000000100100002 /* MobileOnlyWorkflowError.swift */; };
+		4EA7C1000000000200100001 /* MobileMapLibrary.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA7C1000000000200100002 /* MobileMapLibrary.swift */; };
+		4EA7C1000000000300100001 /* MobileProcessingTaskStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA7C1000000000300100002 /* MobileProcessingTaskStore.swift */; };
+		4EA7C1000000000400100001 /* MobileResultLibrary.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA7C1000000000400100002 /* MobileResultLibrary.swift */; };
+		4EA7C1000000000500100001 /* MobileOnlyWorkflowCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA7C1000000000500100002 /* MobileOnlyWorkflowCoordinator.swift */; };
+		4EA7C1000000000600100001 /* MobileProcessingPipeline.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA7C1000000000600100002 /* MobileProcessingPipeline.swift */; };
+		4EA7C1000000000700100001 /* MobileOnlyHomeViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA7C1000000000700100002 /* MobileOnlyHomeViewController.swift */; };
+		4EA7C1000000000800100001 /* MobileMapLibraryViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA7C1000000000800100002 /* MobileMapLibraryViewController.swift */; };
+		4EA7C1000000000900100001 /* MobileMapImportViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA7C1000000000900100002 /* MobileMapImportViewController.swift */; };
+		4EA7C1000000000A00100001 /* MobileMapCompileProgressViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA7C1000000000A00100002 /* MobileMapCompileProgressViewController.swift */; };
+		4EA7C1000000000B00100001 /* MobileScanSetupViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA7C1000000000B00100002 /* MobileScanSetupViewController.swift */; };
+		4EA7C1000000000C00100001 /* MobileProcessingViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA7C1000000000C00100002 /* MobileProcessingViewController.swift */; };
+		4EA7C1000000000D00100001 /* MobileResultViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA7C1000000000D00100002 /* MobileResultViewController.swift */; };
+		4EA7C1000000000E00100001 /* MobileRescanTasksViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA7C1000000000E00100002 /* MobileRescanTasksViewController.swift */; };
 		4E0D83832621F52C00C879AC /* Settings.bundle in Resources */ = {isa = PBXBuildFile; fileRef = 4E0D83822621F52C00C879AC /* Settings.bundle */; };
 		4E10D89C2DE409870015926D /* librtabmap_core.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 4EFD0EB0259D5BE500575D88 /* librtabmap_core.a */; };
 		4E10D89D2DE409870015926D /* librtabmap_utilite.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 4EFD0EAF259D5BE500575D88 /* librtabmap_utilite.a */; };
@@ -178,6 +193,21 @@
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
+		4EA7C1000000000000100002 /* MobileOnlyWorkflowState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = MobileOnlyWorkflowState.swift; path = RTABMapApp/MobileOnlyWorkflow/MobileOnlyWorkflowState.swift; sourceTree = "<group>"; };
+		4EA7C1000000000100100002 /* MobileOnlyWorkflowError.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = MobileOnlyWorkflowError.swift; path = RTABMapApp/MobileOnlyWorkflow/MobileOnlyWorkflowError.swift; sourceTree = "<group>"; };
+		4EA7C1000000000200100002 /* MobileMapLibrary.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = MobileMapLibrary.swift; path = RTABMapApp/MobileOnlyWorkflow/MobileMapLibrary.swift; sourceTree = "<group>"; };
+		4EA7C1000000000300100002 /* MobileProcessingTaskStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = MobileProcessingTaskStore.swift; path = RTABMapApp/MobileOnlyWorkflow/MobileProcessingTaskStore.swift; sourceTree = "<group>"; };
+		4EA7C1000000000400100002 /* MobileResultLibrary.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = MobileResultLibrary.swift; path = RTABMapApp/MobileOnlyWorkflow/MobileResultLibrary.swift; sourceTree = "<group>"; };
+		4EA7C1000000000500100002 /* MobileOnlyWorkflowCoordinator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = MobileOnlyWorkflowCoordinator.swift; path = RTABMapApp/MobileOnlyWorkflow/MobileOnlyWorkflowCoordinator.swift; sourceTree = "<group>"; };
+		4EA7C1000000000600100002 /* MobileProcessingPipeline.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = MobileProcessingPipeline.swift; path = RTABMapApp/MobileOnlyWorkflow/MobileProcessingPipeline.swift; sourceTree = "<group>"; };
+		4EA7C1000000000700100002 /* MobileOnlyHomeViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = MobileOnlyHomeViewController.swift; path = RTABMapApp/MobileOnlyWorkflow/UI/MobileOnlyHomeViewController.swift; sourceTree = "<group>"; };
+		4EA7C1000000000800100002 /* MobileMapLibraryViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = MobileMapLibraryViewController.swift; path = RTABMapApp/MobileOnlyWorkflow/UI/MobileMapLibraryViewController.swift; sourceTree = "<group>"; };
+		4EA7C1000000000900100002 /* MobileMapImportViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = MobileMapImportViewController.swift; path = RTABMapApp/MobileOnlyWorkflow/UI/MobileMapImportViewController.swift; sourceTree = "<group>"; };
+		4EA7C1000000000A00100002 /* MobileMapCompileProgressViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = MobileMapCompileProgressViewController.swift; path = RTABMapApp/MobileOnlyWorkflow/UI/MobileMapCompileProgressViewController.swift; sourceTree = "<group>"; };
+		4EA7C1000000000B00100002 /* MobileScanSetupViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = MobileScanSetupViewController.swift; path = RTABMapApp/MobileOnlyWorkflow/UI/MobileScanSetupViewController.swift; sourceTree = "<group>"; };
+		4EA7C1000000000C00100002 /* MobileProcessingViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = MobileProcessingViewController.swift; path = RTABMapApp/MobileOnlyWorkflow/UI/MobileProcessingViewController.swift; sourceTree = "<group>"; };
+		4EA7C1000000000D00100002 /* MobileResultViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = MobileResultViewController.swift; path = RTABMapApp/MobileOnlyWorkflow/UI/MobileResultViewController.swift; sourceTree = "<group>"; };
+		4EA7C1000000000E00100002 /* MobileRescanTasksViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = MobileRescanTasksViewController.swift; path = RTABMapApp/MobileOnlyWorkflow/UI/MobileRescanTasksViewController.swift; sourceTree = "<group>"; };
 		44D4681D2D538A4100B094BA /* RTABMapApp.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; name = RTABMapApp.entitlements; path = RTABMapApp/RTABMapApp.entitlements; sourceTree = "<group>"; };
 		4E0D83822621F52C00C879AC /* Settings.bundle */ = {isa = PBXFileReference; lastKnownFileType = "wrapper.plug-in"; path = Settings.bundle; sourceTree = "<group>"; };
 		4E10D8602DE408EE0015926D /* libboost_stacktrace_noop.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libboost_stacktrace_noop.a; path = RTABMapApp/Libraries/lib/libboost_stacktrace_noop.a; sourceTree = "<group>"; };
@@ -639,6 +669,7 @@
 				4EB1A66525A0D90B0043C7BF /* RTABMap.swift */,
 				4E2C516525A63119005CEDBD /* DatabaseView.swift */,
 				4E2C516625A63119005CEDBD /* VerticalScrollerView.swift */,
+				4EA7C1000000000000100002 /* MobileOnlyWorkflowState.swift */,				4EA7C1000000000100100002 /* MobileOnlyWorkflowError.swift */,				4EA7C1000000000200100002 /* MobileMapLibrary.swift */,				4EA7C1000000000300100002 /* MobileProcessingTaskStore.swift */,				4EA7C1000000000400100002 /* MobileResultLibrary.swift */,				4EA7C1000000000500100002 /* MobileOnlyWorkflowCoordinator.swift */,				4EA7C1000000000600100002 /* MobileProcessingPipeline.swift */,				4EA7C1000000000700100002 /* MobileOnlyHomeViewController.swift */,				4EA7C1000000000800100002 /* MobileMapLibraryViewController.swift */,				4EA7C1000000000900100002 /* MobileMapImportViewController.swift */,				4EA7C1000000000A00100002 /* MobileMapCompileProgressViewController.swift */,				4EA7C1000000000B00100002 /* MobileScanSetupViewController.swift */,				4EA7C1000000000C00100002 /* MobileProcessingViewController.swift */,				4EA7C1000000000D00100002 /* MobileResultViewController.swift */,				4EA7C1000000000E00100002 /* MobileRescanTasksViewController.swift */,
 			);
 			name = RTABMapApp;
 			sourceTree = "<group>";
@@ -1092,6 +1123,21 @@
 				4EFD0BA5259D501E00575D88 /* frustum.cpp in Sources */,
 				4EFD0B98259D501E00575D88 /* util.cpp in Sources */,
 				4EFD0BA1259D501E00575D88 /* trace.cpp in Sources */,
+				4EA7C1000000000000100001 /* MobileOnlyWorkflowState.swift in Sources */,
+				4EA7C1000000000100100001 /* MobileOnlyWorkflowError.swift in Sources */,
+				4EA7C1000000000200100001 /* MobileMapLibrary.swift in Sources */,
+				4EA7C1000000000300100001 /* MobileProcessingTaskStore.swift in Sources */,
+				4EA7C1000000000400100001 /* MobileResultLibrary.swift in Sources */,
+				4EA7C1000000000500100001 /* MobileOnlyWorkflowCoordinator.swift in Sources */,
+				4EA7C1000000000600100001 /* MobileProcessingPipeline.swift in Sources */,
+				4EA7C1000000000700100001 /* MobileOnlyHomeViewController.swift in Sources */,
+				4EA7C1000000000800100001 /* MobileMapLibraryViewController.swift in Sources */,
+				4EA7C1000000000900100001 /* MobileMapImportViewController.swift in Sources */,
+				4EA7C1000000000A00100001 /* MobileMapCompileProgressViewController.swift in Sources */,
+				4EA7C1000000000B00100001 /* MobileScanSetupViewController.swift in Sources */,
+				4EA7C1000000000C00100001 /* MobileProcessingViewController.swift in Sources */,
+				4EA7C1000000000D00100001 /* MobileResultViewController.swift in Sources */,
+				4EA7C1000000000E00100001 /* MobileRescanTasksViewController.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

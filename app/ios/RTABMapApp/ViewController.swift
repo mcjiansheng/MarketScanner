@@ -364,6 +364,7 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         
         supermarketSession = SupermarketScanSession(documentsDirectory: getDocumentDirectory())
         applySupermarketSettings()
+        setupMobileOnlyWorkflow()
         
         context = EAGLContext(api: .openGLES2)
         EAGLContext.setCurrent(context)
@@ -411,6 +412,47 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
             self.updateState(state: self.mState)
         }
+    }
+
+    // MARK: - Mobile-Only workflow entry (V1R1 Gate A)
+
+    private func presentMobileFlow(_ root: UIViewController) {
+        let navigation = UINavigationController(rootViewController: root)
+        navigation.modalPresentationStyle = .fullScreen
+        present(navigation, animated: true)
+    }
+
+    private func setupMobileOnlyWorkflow() {
+        let coordinator = MobileOnlyWorkflowCoordinator.shared
+        coordinator.appGitSHA = "unknown" // bound by the CI build step
+        coordinator.appVersion =
+            Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.22.0"
+        coordinator.deviceModel = UIDevice.current.model
+        coordinator.osVersion = UIDevice.current.systemVersion
+        // Scan start: persist the committed configuration; the real ARKit
+        // scan start consumes it (Gate D wiring).
+        coordinator.onStartScan = { [weak self] configuration in
+            self?.persistScanConfiguration(configuration)
+        }
+    }
+
+    private func persistScanConfiguration(_ configuration: MobileScanConfiguration) {
+        let payload: [String: Any] = [
+            "prior_map_id": configuration.priorMap.priorMapID,
+            "prior_map_sha256": configuration.priorMap.packageSHA256,
+            "map_name": configuration.priorMap.name,
+            "floor_id": configuration.floorID,
+            "start_x_m": configuration.startXM,
+            "start_y_m": configuration.startYM,
+            "start_yaw_rad": configuration.startYawRad,
+            "store_id": configuration.storeID,
+            "committed_at_utc": Date().timeIntervalSince1970,
+        ]
+        UserDefaults.standard.set(payload, forKey: "MarketScannerScanConfiguration")
+        let message = String(
+            format: "扫描配置已提交：%@（%@）", configuration.priorMap.name,
+            configuration.priorMap.priorMapID)
+        showToast(message)
     }
 
     private func finishStartup() {
@@ -1412,6 +1454,24 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         }
         fileMenuChildren.append(advancedMenu)
         
+        // Mobile-Only product entries (V1R1 Gate A §5.3): 门店地图 /
+        // 开始门店扫描 / 处理历史扫描 / 历史结果. Every action opens the
+        // corresponding mobile-only screen from the app menu.
+        let mobileOnlyMenu = UIMenu(title: localized("MarketScanner"), image: UIImage(systemName: "storefront"), children: [
+            UIAction(title: localized("门店地图"), image: UIImage(systemName: "map"), handler: { _ in
+                self.presentMobileFlow(MobileMapLibraryViewController())
+            }),
+            UIAction(title: localized("开始门店扫描"), image: UIImage(systemName: "camera.viewfinder"), handler: { _ in
+                self.presentMobileFlow(MobileScanSetupViewController())
+            }),
+            UIAction(title: localized("处理历史扫描"), image: UIImage(systemName: "wand.and.stars"), handler: { _ in
+                self.presentMobileFlow(MobileProcessingViewController())
+            }),
+            UIAction(title: localized("历史结果"), image: UIImage(systemName: "doc.text"), handler: { _ in
+                self.presentMobileFlow(MobileResultViewController())
+            })
+        ])
+        
         // File menu
         let fileMenu = UIMenu(title: localized("File"), options: .displayInline, children: fileMenuChildren)
         
@@ -1478,7 +1538,7 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
              })
         ])
 
-        menuButton.menu = UIMenu(title: "", children: [fileMenu, settingsMenu])
+        menuButton.menu = UIMenu(title: "", children: [mobileOnlyMenu, fileMenu, settingsMenu])
         menuButton.addTarget(self, action: #selector(ViewController.menuOpened(_:)), for: .menuActionTriggered)
         
         // Camera menu
