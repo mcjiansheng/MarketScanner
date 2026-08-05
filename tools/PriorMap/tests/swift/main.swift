@@ -2765,6 +2765,7 @@ let p7r6SecondCompletion = p7r6Controller.finish(.timedOut, now: 31)
 require(p7r6FirstCompletion?.episode.id == 1
         && p7r6SecondCompletion?.episode.id == 2,
         "P7R6 coordinator tests require two sequential episodes")
+let p7r6FakeSha256 = String(repeating: "b", count: 64)
 if let p7r6FirstCompletion, let p7r6SecondCompletion {
     let source = P7R6FakeRecoverySource()
     // Deliberately out of order: the coordinator must restore episode order.
@@ -2775,9 +2776,9 @@ if let p7r6FirstCompletion, let p7r6SecondCompletion {
         writer: writer,
         trackingSessionId: "session-1",
         priorMapId: "map-1",
-        priorMapSha256: "sha-1",
+        priorMapSha256: p7r6FakeSha256,
         floorId: "1",
-        persistedEvidenceLines: { [] })
+        persistedEvidenceSnapshot: { Data() })
     let success = coordinator.persistTerminalEvidence(
         cancellationReason: nil, now: 40)
     require(success.allPersisted
@@ -2818,15 +2819,19 @@ if let p7r6FirstCompletion, let p7r6SecondCompletion {
             && source.pending.isEmpty,
             "P7R6 retry must persist the failed episode exactly once")
 
-    // Idempotence strategy A: identical persisted bytes count as success
-    // without rewriting; conflicting bytes fail closed.
+    // Idempotence strategy A: identical persisted canonical bytes count as
+    // success without rewriting; conflicting bytes fail closed.
     let persistedRecord = PriorMapRecoveryLifecycleRecord(
         trackingSessionId: "session-1",
         priorMapId: "map-1",
-        priorMapSha256: "sha-1",
+        priorMapSha256: p7r6FakeSha256,
         floorId: "1",
         completion: p7r6FirstCompletion)
-    let persistedLine = try JSONEncoder().encode(persistedRecord)
+    let persistedEncoder = JSONEncoder()
+    persistedEncoder.outputFormatting = [.sortedKeys]
+    let persistedRecordData = try persistedEncoder.encode(persistedRecord)
+    var persistedLine = persistedRecordData
+    persistedLine.append(0x0A)
     let idempotentSource = P7R6FakeRecoverySource()
     idempotentSource.pending = [p7r6FirstCompletion]
     let idempotentWriter = P7R6FakeRecoveryWriter()
@@ -2835,22 +2840,23 @@ if let p7r6FirstCompletion, let p7r6SecondCompletion {
         writer: idempotentWriter,
         trackingSessionId: "session-1",
         priorMapId: "map-1",
-        priorMapSha256: "sha-1",
+        priorMapSha256: p7r6FakeSha256,
         floorId: "1",
-        persistedEvidenceLines: { [persistedLine] })
+        persistedEvidenceSnapshot: { persistedLine })
     let idempotent = idempotentCoordinator.persistTerminalEvidence(
         cancellationReason: nil, now: 70)
     require(idempotent.allPersisted
             && idempotentWriter.appendedEpisodeIds.isEmpty
             && idempotentSource.pending.isEmpty,
             "P7R6 identical persisted bytes must ack without rewriting")
-    let conflictingRecord = PriorMapRecoveryLifecycleRecord(
-        trackingSessionId: "session-1",
-        priorMapId: "map-1",
-        priorMapSha256: "sha-1",
-        floorId: "2",
-        completion: p7r6FirstCompletion)
-    let conflictingLine = try JSONEncoder().encode(conflictingRecord)
+    // Same episode identity but different terminal content: the canonical
+    // bytes disagree, so the transaction must fail closed.
+    var conflictingObject = try JSONSerialization.jsonObject(
+        with: persistedRecordData) as! [String: Any]
+    conflictingObject["outcome"] = "timed_out"
+    var conflictingLine = try JSONSerialization.data(
+        withJSONObject: conflictingObject)
+    conflictingLine.append(0x0A)
     let conflictSource = P7R6FakeRecoverySource()
     conflictSource.pending = [p7r6FirstCompletion]
     let conflictWriter = P7R6FakeRecoveryWriter()
@@ -2859,9 +2865,9 @@ if let p7r6FirstCompletion, let p7r6SecondCompletion {
         writer: conflictWriter,
         trackingSessionId: "session-1",
         priorMapId: "map-1",
-        priorMapSha256: "sha-1",
+        priorMapSha256: p7r6FakeSha256,
         floorId: "1",
-        persistedEvidenceLines: { [conflictingLine] })
+        persistedEvidenceSnapshot: { conflictingLine })
     let conflict = conflictCoordinator.persistTerminalEvidence(
         cancellationReason: nil, now: 80)
     require(!conflict.allPersisted
@@ -2959,6 +2965,18 @@ func p7r6PersistedEvidenceLines(in directory: URL) throws -> [Data] {
         return []
     }
     return try Data(contentsOf: url).split(separator: 0x0A).map { Data($0) }
+}
+
+/// P7R6A: mirrors SupermarketScanSession.persistedRecoveryLifecycleSnapshot.
+/// One stable read of the whole file; a missing sidecar is an empty
+/// snapshot. Line splitting and JSONL semantics belong to the parser.
+func p7r6PersistedEvidenceSnapshot(in directory: URL) throws -> Data {
+    let url = directory.appendingPathComponent(
+        PriorMapRecoveryLifecycleRecord.fileName)
+    guard FileManager.default.fileExists(atPath: url.path) else {
+        return Data()
+    }
+    return try Data(contentsOf: url)
 }
 
 func p7r6LifecycleObjects(in directory: URL) throws -> [[String: Any]] {
@@ -3086,7 +3104,7 @@ func p7r6Coordinator(
     source: RecoveryCompletionDraining,
     writer: RecoveryLifecycleWriting,
     trackingSessionId: String = "session-a",
-    persistedEvidenceLines: @escaping () throws -> [Data]
+    persistedEvidenceSnapshot: @escaping () throws -> Data
 ) -> RecoveryLifecyclePersistenceCoordinator {
     return RecoveryLifecyclePersistenceCoordinator(
         source: source,
@@ -3095,7 +3113,7 @@ func p7r6Coordinator(
         priorMapId: "map-a",
         priorMapSha256: String(repeating: "a", count: 64),
         floorId: "1",
-        persistedEvidenceLines: persistedEvidenceLines)
+        persistedEvidenceSnapshot: persistedEvidenceSnapshot)
 }
 
 // W1: expected watermark 0 with an empty sidecar validates.
@@ -3289,8 +3307,8 @@ do {
     let coordinator = p7r6Coordinator(
         source: source,
         writer: writer,
-        persistedEvidenceLines: {
-            try p7r6PersistedEvidenceLines(in: directory)
+        persistedEvidenceSnapshot: {
+            try p7r6PersistedEvidenceSnapshot(in: directory)
         })
     _ = controller.finish(.converged, now: 12)
     if let completion = controller.lastCompletion {
@@ -3336,8 +3354,8 @@ do {
     let coordinator = p7r6Coordinator(
         source: source,
         writer: writer,
-        persistedEvidenceLines: {
-            try p7r6PersistedEvidenceLines(in: directory)
+        persistedEvidenceSnapshot: {
+            try p7r6PersistedEvidenceSnapshot(in: directory)
         })
     _ = controller.finish(.converged, now: 12)
     if let completion = controller.lastCompletion {
@@ -3369,8 +3387,8 @@ do {
     let coordinator = p7r6Coordinator(
         source: source,
         writer: writer,
-        persistedEvidenceLines: {
-            try p7r6PersistedEvidenceLines(in: directory)
+        persistedEvidenceSnapshot: {
+            try p7r6PersistedEvidenceSnapshot(in: directory)
         })
     let result = coordinator.persistTerminalEvidence(
         cancellationReason: .scanStopped, now: 20)
@@ -3408,8 +3426,8 @@ do {
     let coordinator = p7r6Coordinator(
         source: source,
         writer: writer,
-        persistedEvidenceLines: {
-            try p7r6PersistedEvidenceLines(in: directory)
+        persistedEvidenceSnapshot: {
+            try p7r6PersistedEvidenceSnapshot(in: directory)
         })
     let result = coordinator.persistTerminalEvidence(
         cancellationReason: .mapUnloaded, now: 20)
@@ -3436,8 +3454,8 @@ do {
     let coordinator = p7r6Coordinator(
         source: source,
         writer: writer,
-        persistedEvidenceLines: {
-            try p7r6PersistedEvidenceLines(in: directory)
+        persistedEvidenceSnapshot: {
+            try p7r6PersistedEvidenceSnapshot(in: directory)
         })
     _ = controller.finish(.converged, now: 15)
     if let completion = controller.lastCompletion {
@@ -3480,8 +3498,8 @@ do {
     let coordinator = p7r6Coordinator(
         source: source,
         writer: writer,
-        persistedEvidenceLines: {
-            try p7r6PersistedEvidenceLines(in: directory)
+        persistedEvidenceSnapshot: {
+            try p7r6PersistedEvidenceSnapshot(in: directory)
         })
     _ = controller.finish(.timedOut, now: 45)
     if let completion = controller.lastCompletion {
@@ -3517,8 +3535,8 @@ do {
     let coordinator = p7r6Coordinator(
         source: source,
         writer: writer,
-        persistedEvidenceLines: {
-            try p7r6PersistedEvidenceLines(in: directory)
+        persistedEvidenceSnapshot: {
+            try p7r6PersistedEvidenceSnapshot(in: directory)
         })
     _ = controller.finish(.manualReset, now: 18)
     if let completion = controller.lastCompletion {
@@ -3577,8 +3595,8 @@ do {
     let coordinator = p7r6Coordinator(
         source: source,
         writer: writer,
-        persistedEvidenceLines: {
-            try p7r6PersistedEvidenceLines(in: directory)
+        persistedEvidenceSnapshot: {
+            try p7r6PersistedEvidenceSnapshot(in: directory)
         })
     _ = controller.finish(.converged, now: 12)
     if let completion = controller.lastCompletion {
@@ -3612,8 +3630,8 @@ do {
     let retryCoordinator = p7r6Coordinator(
         source: source,
         writer: retryWriter,
-        persistedEvidenceLines: {
-            try p7r6PersistedEvidenceLines(in: directory)
+        persistedEvidenceSnapshot: {
+            try p7r6PersistedEvidenceSnapshot(in: directory)
         })
     let retry = retryCoordinator.persistTerminalEvidence(
         cancellationReason: nil, now: 14)
@@ -3640,8 +3658,8 @@ do {
     let coordinator = p7r6Coordinator(
         source: source,
         writer: writer,
-        persistedEvidenceLines: {
-            try p7r6PersistedEvidenceLines(in: directory)
+        persistedEvidenceSnapshot: {
+            try p7r6PersistedEvidenceSnapshot(in: directory)
         })
     _ = controller.finish(.converged, now: 12)
     if let completion = controller.lastCompletion {
@@ -3681,8 +3699,8 @@ do {
     let coordinator = p7r6Coordinator(
         source: source,
         writer: writer,
-        persistedEvidenceLines: {
-            try p7r6PersistedEvidenceLines(in: directory)
+        persistedEvidenceSnapshot: {
+            try p7r6PersistedEvidenceSnapshot(in: directory)
         })
     let result = coordinator.persistTerminalEvidence(
         cancellationReason: nil, now: 13)
@@ -3710,8 +3728,8 @@ do {
     let coordinator = p7r6Coordinator(
         source: source,
         writer: writer,
-        persistedEvidenceLines: {
-            try p7r6PersistedEvidenceLines(in: directory)
+        persistedEvidenceSnapshot: {
+            try p7r6PersistedEvidenceSnapshot(in: directory)
         })
     _ = controller.finish(.converged, now: 12)
     if let completion = controller.lastCompletion {
@@ -3784,8 +3802,8 @@ do {
     let coordinator = p7r6Coordinator(
         source: source,
         writer: writer,
-        persistedEvidenceLines: {
-            try p7r6PersistedEvidenceLines(in: directory)
+        persistedEvidenceSnapshot: {
+            try p7r6PersistedEvidenceSnapshot(in: directory)
         })
     let result = coordinator.persistTerminalEvidence(
         cancellationReason: .scanStopped, now: 20)
@@ -3826,8 +3844,8 @@ do {
     let coordinator = p7r6Coordinator(
         source: source,
         writer: writer,
-        persistedEvidenceLines: {
-            try p7r6PersistedEvidenceLines(in: directory)
+        persistedEvidenceSnapshot: {
+            try p7r6PersistedEvidenceSnapshot(in: directory)
         })
     let queue = DispatchQueue(label: "p7r6.i14.prior-map")
     let group = DispatchGroup()
@@ -3871,8 +3889,8 @@ do {
     let coordinator = p7r6Coordinator(
         source: source,
         writer: writer,
-        persistedEvidenceLines: {
-            try p7r6PersistedEvidenceLines(in: directory)
+        persistedEvidenceSnapshot: {
+            try p7r6PersistedEvidenceSnapshot(in: directory)
         })
     let priorMapQueue = DispatchQueue(label: "p7r6.i15.prior-map")
     let wrongQueue = DispatchQueue(label: "p7r6.i15.wrong")

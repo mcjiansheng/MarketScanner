@@ -842,8 +842,8 @@ private struct PersistedRecoveryLifecycleRecordV1DTO: Encodable {
         try container.encode(episodeId, forKey: .episodeId)
         try container.encode(reason, forKey: .reason)
         try container.encode(outcomeRaw, forKey: .outcome)
-        try container.encode(
-            cancellationReasonRaw as String?, forKey: .cancellationReason)
+        try container.encodeIfPresent(
+            cancellationReasonRaw, forKey: .cancellationReason)
         try container.encode(episodeAutomatic, forKey: .episodeAutomatic)
         try container.encode(startedAtUptime, forKey: .startedAtUptime)
         try container.encode(finishedAtUptime, forKey: .finishedAtUptime)
@@ -859,14 +859,14 @@ private struct PersistedRecoveryLifecycleRecordV1DTO: Encodable {
         try container.encode(lastTriggerReason, forKey: .lastTriggerReason)
         try container.encode(
             lastTriggerAtUptime, forKey: .lastTriggerAtUptime)
-        try container.encode(
-            selectedHypothesisId as Int?, forKey: .selectedHypothesisId)
+        try container.encodeIfPresent(
+            selectedHypothesisId, forKey: .selectedHypothesisId)
         try container.encode(freshSupportFrames, forKey: .freshSupportFrames)
-        try container.encode(
-            finalResidualTranslationM as Double?,
+        try container.encodeIfPresent(
+            finalResidualTranslationM,
             forKey: .finalResidualTranslationM)
-        try container.encode(
-            finalResidualYawRad as Double?, forKey: .finalResidualYawRad)
+        try container.encodeIfPresent(
+            finalResidualYawRad, forKey: .finalResidualYawRad)
         try container.encode(
             completionFrameStepApplied, forKey: .completionFrameStepApplied)
     }
@@ -1007,8 +1007,8 @@ private struct PersistedRecoveryLifecycleRecordV2DTO: Encodable {
         try container.encode(episodeId, forKey: .episodeId)
         try container.encode(reason, forKey: .reason)
         try container.encode(outcomeRaw, forKey: .outcome)
-        try container.encode(
-            cancellationReasonRaw as String?, forKey: .cancellationReason)
+        try container.encodeIfPresent(
+            cancellationReasonRaw, forKey: .cancellationReason)
         try container.encode(episodeAutomatic, forKey: .episodeAutomatic)
         try container.encode(startedAtUptime, forKey: .startedAtUptime)
         try container.encode(deadlineUptime, forKey: .deadlineUptime)
@@ -1028,14 +1028,14 @@ private struct PersistedRecoveryLifecycleRecordV2DTO: Encodable {
         try container.encode(
             lastTriggerAtUptime, forKey: .lastTriggerAtUptime)
         try container.encode(triggerRecords, forKey: .triggerRecords)
-        try container.encode(
-            selectedHypothesisId as Int?, forKey: .selectedHypothesisId)
+        try container.encodeIfPresent(
+            selectedHypothesisId, forKey: .selectedHypothesisId)
         try container.encode(freshSupportFrames, forKey: .freshSupportFrames)
-        try container.encode(
-            finalResidualTranslationM as Double?,
+        try container.encodeIfPresent(
+            finalResidualTranslationM,
             forKey: .finalResidualTranslationM)
-        try container.encode(
-            finalResidualYawRad as Double?, forKey: .finalResidualYawRad)
+        try container.encodeIfPresent(
+            finalResidualYawRad, forKey: .finalResidualYawRad)
         try container.encode(
             completionFrameStepApplied, forKey: .completionFrameStepApplied)
     }

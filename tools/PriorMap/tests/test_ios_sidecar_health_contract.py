@@ -18,6 +18,9 @@ FINALIZATION_CORE_SOURCE = (
 PERSISTENCE_COORDINATOR_SOURCE = (
     REPOSITORY / "app/ios/RTABMapApp/RecoveryLifecyclePersistenceCore.swift"
 )
+RECOVERY_EVIDENCE_PARSER_SOURCE = (
+    REPOSITORY / "app/ios/RTABMapApp/RecoveryLifecycleEvidenceParser.swift"
+)
 
 
 def source(path: Path) -> str:
@@ -34,6 +37,7 @@ class IOSLocalizationSidecarHealthContractTests(unittest.TestCase):
         session = source(SESSION_SOURCE)
         finalization = source(FINALIZATION_CORE_SOURCE)
         coordinator = source(PERSISTENCE_COORDINATOR_SOURCE)
+        parser = source(RECOVERY_EVIDENCE_PARSER_SOURCE)
         for token in (
             "PriorMapHypothesisTracker",
             "activeTracks",
@@ -73,10 +77,28 @@ class IOSLocalizationSidecarHealthContractTests(unittest.TestCase):
             "RecoveryLifecycleWriting",
             "RecoveryLifecyclePersistenceResult",
             "persisted_episode_bytes_conflict",
+            "persisted_episode_version_conflict",
             "durable_append_failed",
+            # P7R6A: the coordinator must validate the complete snapshot
+            # through the shared strict parser before any acknowledgement.
+            "RecoveryLifecyclePersistedEvidenceParser.parse(",
+            "canonicalPendingRecordBytes(",
         ):
             self.assertIn(token, coordinator)
-        self.assertIn("persistedRecoveryLifecycleLines", session)
+        # P7R6A: the coordinator must not auto-decode persisted records
+        # with a plain JSONDecoder; only the strict parser decides.
+        self.assertNotIn("JSONDecoder", coordinator)
+        self.assertIn("persistedRecoveryLifecycleSnapshot", session)
+        self.assertNotIn("persistedRecoveryLifecycleLines", session)
+        for token in (
+            "RecoveryLifecycleEvidenceExpectation",
+            "PersistedRecoveryLifecycleRecord",
+            "ParsedRecoveryLifecycleEvidence",
+            "RecoveryLifecycleEvidenceParseError",
+            "missingFinalNewline",
+            "canonicalRecordBytes",
+        ):
+            self.assertIn(token, parser)
         self.assertIn("recordRecoveryPersistenceFailure", session + view)
         self.assertIn("appendRecoveryLifecycleEvent", session)
         self.assertIn("MarketScannerRecoveryLifecycleEvent", core)

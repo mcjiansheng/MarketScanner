@@ -2673,8 +2673,8 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
             priorMapId: scanSession.scanConfiguration.priorMapId,
             priorMapSha256: scanSession.scanConfiguration.priorMapSha256,
             floorId: scanSession.scanConfiguration.floorId,
-            persistedEvidenceLines: {
-                try scanSession.persistedRecoveryLifecycleLines(
+            persistedEvidenceSnapshot: {
+                try scanSession.persistedRecoveryLifecycleSnapshot(
                     expectedTrackingSessionId: trackingSessionId)
             })
         return coordinator.persistTerminalEvidence(

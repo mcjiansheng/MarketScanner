@@ -40,6 +40,12 @@ protocol RecoveryLifecycleWriting {
 /// Structured transaction outcome. A bare Bool is forbidden: audit paths must
 /// be able to distinguish "nothing pending", "partially persisted", and the
 /// exact episode where the transaction stopped.
+///
+/// `attemptedEpisodeIds` lists only episodes the transaction actually
+/// entered. Pre-transaction failures (missing identity, unreadable or
+/// unparsable existing snapshot) happen before any pending episode is
+/// attempted, so they report an empty list; a read or parse failure must
+/// never be disguised as an attempt on the first pending episode.
 struct RecoveryLifecyclePersistenceResult {
     let attemptedEpisodeIds: [Int]
     let persistedEpisodeIds: [Int]
@@ -51,14 +57,22 @@ struct RecoveryLifecyclePersistenceResult {
 /// Runs one teardown-to-disk transaction:
 ///
 /// ```text
-/// optional cancel -> peek pending -> append in episode ID order
-///   -> durable success -> ack -> next
-///   -> failure -> stop, keep the completion and everything after it
+/// optional cancel -> peek pending
+///   -> stable read the entire existing snapshot
+///   -> strict parse the entire snapshot through the shared parser
+///   -> only then: append in episode ID order
+///       -> durable success -> ack -> next
+///       -> identical persisted v2 record -> ack without rewrite
+///       -> failure/conflict -> stop, keep the completion and everything
+///          after it
 /// ```
 ///
-/// Idempotence strategy A: before appending, the coordinator takes a stable
-/// snapshot of the persisted evidence. A repeated episode whose persisted
-/// record equals the record about to be written counts as already persisted;
+/// Idempotence strategy A (P7R6A): the coordinator validates the complete
+/// persisted snapshot with the same strict parser finalization uses before
+/// acknowledging anything, so a file the coordinator would accept can never
+/// be rejected later by finalization. A repeated episode whose persisted
+/// canonical v2 bytes equal the pending canonical bytes counts as already
+/// persisted; a v1 record can never be merged with a pending v2 episode and
 /// different bytes for the same episode ID fail closed.
 final class RecoveryLifecyclePersistenceCoordinator {
     private let source: RecoveryCompletionDraining
@@ -67,7 +81,7 @@ final class RecoveryLifecyclePersistenceCoordinator {
     private let priorMapId: String?
     private let priorMapSha256: String?
     private let floorId: String?
-    private let persistedEvidenceLines: () throws -> [Data]
+    private let persistedEvidenceSnapshot: () throws -> Data
 
     init(
         source: RecoveryCompletionDraining,
@@ -76,7 +90,7 @@ final class RecoveryLifecyclePersistenceCoordinator {
         priorMapId: String?,
         priorMapSha256: String?,
         floorId: String?,
-        persistedEvidenceLines: @escaping () throws -> [Data]
+        persistedEvidenceSnapshot: @escaping () throws -> Data
     ) {
         self.source = source
         self.writer = writer
@@ -84,7 +98,7 @@ final class RecoveryLifecyclePersistenceCoordinator {
         self.priorMapId = priorMapId
         self.priorMapSha256 = priorMapSha256
         self.floorId = floorId
-        self.persistedEvidenceLines = persistedEvidenceLines
+        self.persistedEvidenceSnapshot = persistedEvidenceSnapshot
     }
 
     @discardableResult
@@ -105,56 +119,97 @@ final class RecoveryLifecyclePersistenceCoordinator {
                 failureReason: nil,
                 allPersisted: true)
         }
-        let attemptedIds = pending.map { $0.episode.id }
+        let firstPendingEpisodeId = pending[0].episode.id
         guard let priorMapId, let priorMapSha256, let floorId else {
             return RecoveryLifecyclePersistenceResult(
-                attemptedEpisodeIds: attemptedIds,
+                attemptedEpisodeIds: [],
                 persistedEpisodeIds: [],
-                failedEpisodeId: attemptedIds.first,
+                failedEpisodeId: firstPendingEpisodeId,
                 failureReason: "missing_prior_map_identity",
                 allPersisted: false)
         }
         // Stable pre-append snapshot for idempotence strategy A. A read
         // failure must not be masked by blind rewrites.
-        let persistedByEpisode: [Int: PriorMapRecoveryLifecycleRecord]
+        let snapshot: Data
         do {
-            var observed: [Int: PriorMapRecoveryLifecycleRecord] = [:]
-            for line in try persistedEvidenceLines() where !line.isEmpty {
-                let record = try JSONDecoder().decode(
-                    PriorMapRecoveryLifecycleRecord.self,
-                    from: line)
-                guard observed[record.episodeId] == nil else {
-                    return RecoveryLifecyclePersistenceResult(
-                        attemptedEpisodeIds: attemptedIds,
-                        persistedEpisodeIds: [],
-                        failedEpisodeId: attemptedIds.first,
-                        failureReason:
-                            "existing_evidence_duplicate_episode",
-                        allPersisted: false)
-                }
-                observed[record.episodeId] = record
-            }
-            persistedByEpisode = observed
+            snapshot = try persistedEvidenceSnapshot()
         }
         catch {
             return RecoveryLifecyclePersistenceResult(
-                attemptedEpisodeIds: attemptedIds,
+                attemptedEpisodeIds: [],
                 persistedEpisodeIds: [],
-                failedEpisodeId: attemptedIds.first,
+                failedEpisodeId: firstPendingEpisodeId,
                 failureReason: "existing_evidence_read_failed",
                 allPersisted: false)
         }
+        // The whole snapshot must pass the same strict parser finalization
+        // uses before any pending completion may be appended or
+        // acknowledged.
+        let parsed: ParsedRecoveryLifecycleEvidence
+        do {
+            parsed = try RecoveryLifecyclePersistedEvidenceParser.parse(
+                snapshot: snapshot,
+                expectation: RecoveryLifecycleEvidenceExpectation(
+                    trackingSessionId: trackingSessionId,
+                    priorMapId: priorMapId,
+                    priorMapSha256: priorMapSha256,
+                    floorId: floorId))
+        }
+        catch let error as RecoveryLifecycleEvidenceParseError {
+            return RecoveryLifecyclePersistenceResult(
+                attemptedEpisodeIds: [],
+                persistedEpisodeIds: [],
+                failedEpisodeId: firstPendingEpisodeId,
+                failureReason:
+                    "existing_evidence_\(error.stableCode)",
+                allPersisted: false)
+        }
+        catch {
+            return RecoveryLifecyclePersistenceResult(
+                attemptedEpisodeIds: [],
+                persistedEpisodeIds: [],
+                failedEpisodeId: firstPendingEpisodeId,
+                failureReason: "existing_evidence_read_failed",
+                allPersisted: false)
+        }
+        var attemptedIds: [Int] = []
         var persistedIds: [Int] = []
         for completion in pending {
             let episodeId = completion.episode.id
+            attemptedIds.append(episodeId)
             let record = PriorMapRecoveryLifecycleRecord(
                 trackingSessionId: trackingSessionId,
                 priorMapId: priorMapId,
                 priorMapSha256: priorMapSha256,
                 floorId: floorId,
                 completion: completion)
-            if let existing = persistedByEpisode[episodeId] {
-                if existing == record {
+            let pendingCanonicalBytes: Data
+            do {
+                pendingCanonicalBytes =
+                    try RecoveryLifecyclePersistedEvidenceParser
+                        .canonicalPendingRecordBytes(record)
+            }
+            catch {
+                return RecoveryLifecyclePersistenceResult(
+                    attemptedEpisodeIds: attemptedIds,
+                    persistedEpisodeIds: persistedIds,
+                    failedEpisodeId: episodeId,
+                    failureReason: "pending_record_encoding_failed",
+                    allPersisted: false)
+            }
+            if let existing = parsed.recordsByEpisodeId[episodeId] {
+                // A historical v1 record and a pending v2 record for the
+                // same episode are never the same fact: no fabricated v2
+                // upgrade, no idempotent merge.
+                guard existing.version == 2 else {
+                    return RecoveryLifecyclePersistenceResult(
+                        attemptedEpisodeIds: attemptedIds,
+                        persistedEpisodeIds: persistedIds,
+                        failedEpisodeId: episodeId,
+                        failureReason: "persisted_episode_version_conflict",
+                        allPersisted: false)
+                }
+                if existing.canonicalRecordBytes == pendingCanonicalBytes {
                     // Crash between durable append and ack: the evidence is
                     // already on disk with identical content. Acknowledge
                     // without rewriting so the watermark stays exact.

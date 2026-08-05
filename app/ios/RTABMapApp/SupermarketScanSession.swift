@@ -1893,36 +1893,31 @@ final class SupermarketScanSession {
         return result.succeeded
     }
 
-    /// P7R6 idempotence strategy A: stable read of the already-persisted
-    /// lifecycle lines, taken before any append so a crash between durable
-    /// write and acknowledgement can be detected instead of duplicating the
-    /// episode. A missing file means nothing has been persisted yet; a
-    /// truncated tail line is returned as-is so the coordinator fails closed.
-    func persistedRecoveryLifecycleLines(
+    /// P7R6/P7R6A idempotence strategy A: one stable read of the
+    /// already-persisted lifecycle evidence, taken before any append so a
+    /// crash between durable write and acknowledgement can be detected
+    /// instead of duplicating the episode. The reader only reads: it never
+    /// splits lines or parses JSON, and it never swallows a truncated tail.
+    /// A missing file means nothing has been persisted yet (empty Data).
+    /// The shared strict parser owns every JSONL decision on the returned
+    /// snapshot.
+    func persistedRecoveryLifecycleSnapshot(
         expectedTrackingSessionId: String
-    ) throws -> [Data] {
+    ) throws -> Data {
         let directory = try activeLocalizationDirectory(
             expectedTrackingSessionId: expectedTrackingSessionId,
             allowDuringFinalization: true)
         let url = directory.appendingPathComponent(
             PriorMapRecoveryLifecycleRecord.fileName)
         guard fileManager.fileExists(atPath: url.path) else {
-            return []
+            return Data()
         }
         let snapshot = try SafeSessionPath.readRegularFile(
             url,
             within: directory,
-            maximumBytes: 16 * 1024 * 1024)
-        var lines: [Data] = []
-        var pending = snapshot.data
-        while let newline = pending.firstIndex(of: 0x0A) {
-            lines.append(pending.subdata(in: pending.startIndex..<newline))
-            pending.removeSubrange(pending.startIndex...newline)
-        }
-        if !pending.isEmpty {
-            lines.append(pending)
-        }
-        return lines
+            maximumBytes: Int64(
+                RecoveryLifecyclePersistedEvidenceParser.maximumFileBytes))
+        return snapshot.data
     }
 
     @discardableResult
