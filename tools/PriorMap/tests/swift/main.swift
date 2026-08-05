@@ -6003,8 +6003,11 @@ do {
         data: entries.first { $0.name == "xl/worksheets/sheet1.xml" }!.data,
         encoding: .utf8) ?? ""
     require(
-        sheet1.contains("&apos;=HYPERLINK") || sheet1.contains("'=HYPERLINK"),
-        "X8 formula-like barcode must be neutralized")
+        sheet1.contains("=HYPERLINK"),
+        "X8 formula-like barcode must keep its exact value (inline string)")
+    require(
+        !sheet1.contains("&apos;=HYPERLINK") && !sheet1.contains("'=HYPERLINK"),
+        "X8 no apostrophe prefix may alter the barcode (V1R1 14.7)")
     require(
         !sheet1.contains("<f>"),
         "X8 the workbook must never contain formula elements")

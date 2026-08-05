@@ -231,6 +231,7 @@ enum MobileProcessingPipeline {
         progress(0.90, "导出工作簿")
         let runSummary = buildRunSummary(
             request: request,
+            resultID: resultID,
             metadata: metadata,
             optimized: optimized,
             devicePositions: devicePositions,
@@ -733,6 +734,7 @@ enum MobileProcessingPipeline {
 
     private static func buildRunSummary(
         request: Request,
+        resultID: String,
         metadata: [String: Any],
         optimized: SE2FactorGraphCore.OptimizedGraph,
         devicePositions: [FinalTrajectory.DevicePositionRow],
@@ -773,6 +775,10 @@ enum MobileProcessingPipeline {
             "device_position_row_count": String(devicePositions.count),
             "available_position_count": String(available),
             "unavailable_position_count": String(devicePositions.count - available),
+            // V1R1 §14.2: the workbook carries the result id; the final
+            // manifest/workbook SHA256 live only in the external
+            // result_manifest.json and stay empty here.
+            "result_id": resultID,
             "result_manifest_sha256": "",
             "workbook_sha256": "",
         ]

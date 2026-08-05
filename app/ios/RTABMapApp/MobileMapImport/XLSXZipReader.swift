@@ -37,7 +37,17 @@ enum XLSXZipReader {
     private static let zip64EndOfCentralDirectoryLocatorSignature: UInt32 = 0x07064B50
     private static let maximumEOCDSearchBytes = 65_557
 
-    static func readEntries(data: Data) throws -> [Entry] {
+    /// Reads and verifies every entry. The limits default to the frozen
+    /// *import* policy; a caller validating its own output (e.g. the
+    /// workbook export reopen check) may pass larger limits — the
+    /// structural/CRC checks are identical either way.
+    static func readEntries(
+        data: Data,
+        maximumEntries: Int = maximumEntries,
+        maximumEntryBytes: Int64 = maximumEntryBytes,
+        maximumTotalBytes: Int64 = maximumTotalBytes,
+        maximumRatio: Int64 = maximumRatio
+    ) throws -> [Entry] {
         guard data.count >= 22 else {
             throw MapSourceImportError.zipCorrupt(reason: "文件过小。")
         }
@@ -121,6 +131,9 @@ enum XLSXZipReader {
                 compressedSize: Int64(compressedSize),
                 uncompressedSize: Int64(uncompressedSize),
                 localHeaderOffset: Int(localHeaderOffset),
+                maximumEntryBytes: maximumEntryBytes,
+                maximumTotalBytes: maximumTotalBytes,
+                maximumRatio: maximumRatio,
                 totalBytes: &totalBytes
             )
             entries.append(Entry(name: name, data: payload))
@@ -239,6 +252,9 @@ enum XLSXZipReader {
         compressedSize: Int64,
         uncompressedSize: Int64,
         localHeaderOffset: Int,
+        maximumEntryBytes: Int64,
+        maximumTotalBytes: Int64,
+        maximumRatio: Int64,
         totalBytes: inout Int64
     ) throws -> Data {
         guard method == 0 || method == 8 else {

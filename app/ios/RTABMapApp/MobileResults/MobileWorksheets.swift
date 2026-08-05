@@ -35,7 +35,7 @@ enum MobileWorksheets {
         "graph_quality_status", "accepted_tag_count",
         "rescan_tag_count", "device_position_row_count",
         "available_position_count", "unavailable_position_count",
-        "result_manifest_sha256", "workbook_sha256",
+        "result_id", "result_manifest_sha256", "workbook_sha256",
     ]
 
     static let rescanRequiredHeaders = [

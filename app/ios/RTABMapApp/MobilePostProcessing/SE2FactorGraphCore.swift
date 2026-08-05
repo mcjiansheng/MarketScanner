@@ -34,6 +34,8 @@ enum SE2FactorGraphCore {
 
     enum FactorGraphError: Error {
         case noFreeNodes
+        case duplicateNode(Int64)
+        case noAnchor
         case unknownNode(Int64)
         case nonFiniteState
         case solverDiverged
@@ -44,6 +46,20 @@ enum SE2FactorGraphCore {
     static let maximumCGSolverIterations = 120
 
     static func optimize(nodes: [Node], edges: [Edge]) throws -> OptimizedGraph {
+        // Duplicate node IDs are a typed error (V1R1 §10.2) — never a
+        // Dictionary trap.
+        var seenIDs: Set<Int64> = []
+        for node in nodes {
+            guard seenIDs.insert(node.id).inserted else {
+                throw FactorGraphError.duplicateNode(node.id)
+            }
+        }
+        // At least one anchor is required (V1R1 §10.2): without a fixed
+        // reference the whole graph is gauge-free and the solve is
+        // meaningless.
+        guard nodes.contains(where: { $0.isAnchor }) else {
+            throw FactorGraphError.noAnchor
+        }
         let byID = Dictionary(uniqueKeysWithValues: nodes.map { ($0.id, $0) })
         let freeIDs = nodes.filter { !$0.isAnchor }.map { $0.id }.sorted()
         guard !freeIDs.isEmpty else {
