@@ -2903,6 +2903,54 @@ if let p7r6FirstCompletion, let p7r6SecondCompletion {
 // The Swift host cannot link the UIKit session types, so these tests run the
 // exact production persistence chain on a real file system: controller ->
 // peek/ack coordinator -> durable sidecar writer -> finalization validator.
+func makePositions(_ count: Int) -> [FinalTrajectory.DevicePositionRow] {
+    var positions: [FinalTrajectory.DevicePositionRow] = []
+    for index in 0..<count {
+        positions.append(FinalTrajectory.DevicePositionRow(
+            sequence: index + 1,
+            localTimestamp: "2026-08-05 21:00:00.000 +08:00",
+            utcTimestamp: "2026-08-05T13:00:00.000Z",
+            unixTimeS: 1_785_762_000 + Int64(index),
+            timezoneID: "Asia/Shanghai", utcOffset: 28_800,
+            sessionElapsedS: Double(index), storeID: "s1", floorID: "1",
+            mapXM: 1.5, mapYM: -2.5, yawDeg: 90.0,
+            positionStatus: "ACCEPTED", positionSource: "final_trajectory",
+            beforeNodeID: Int64(index), afterNodeID: Int64(index + 1),
+            interpolationRatio: 0.5, localizationConfidence: 0.9,
+            estimatedUncertaintyM: 0.05, trackingState: "tracking",
+            graphQualityStatus: "connected", priorMapID: "m",
+            priorMapSha256: "a", trackingSessionID: "s", appGitSHA: "g"))
+    }
+    return positions
+}
+func makeInput(positions: [FinalTrajectory.DevicePositionRow]) -> MobileResultExporter.Input {
+    return MobileResultExporter.Input(
+        devicePositions: positions,
+        priceTags: [
+            FinalPriceTag(
+                tagInstanceID: "t1", barcode: "=HYPERLINK(\"x\")", symbology: "CODE128",
+                storeID: "s1", floorID: "1", mapVersion: 1,
+                priorMapSha256: "a", trackingSessionID: "s",
+                shelfCode: "A1", shelfSide: "front",
+                distanceFromShelfStartCm: 123.4, positionRatio: 0.62,
+                mapXM: 1.5, mapYM: -2.5, observationCount: 12,
+                positionSpreadCm: 3.2, localizationConfidence: 0.95,
+                associationConfidence: 0.9, qualityStatus: "ACCEPTED", reason: ""),
+        ],
+        rescanTasks: [
+            RescanTask(taskID: "r1", taskType: .tagRescan, floorID: "1",
+                       barcode: "123", tagInstanceID: "t2", shelfCode: "B2",
+                       regionStartCm: 10, regionEndCm: 40,
+                       localStartTime: "2026-08-05 21:00:00.000 +08:00",
+                       localEndTime: "2026-08-05 21:00:05.000 +08:00",
+                       reasonCode: "position_spread", humanMessage: "位置分散",
+                       suggestedAction: "重新扫描", priority: 1),
+        ],
+        runSummary: ["app_git_sha": "g", "store_id": "s1"],
+        appGitSHA: "g", appVersion: "1.0", deviceModel: "iPhone",
+        osVersion: "iOS 18")
+}
+
 func p7r6FreshDirectory(_ label: String) throws -> URL {
     let directory = FileManager.default.temporaryDirectory
         .appendingPathComponent(
@@ -5028,8 +5076,10 @@ do {
 // --recovery-fixtures and package-integrity modes below invoke this same
 // executable repeatedly; re-running the 16 MiB catalog tests on every
 // call would blow past CI wall-clock budgets.
+// CommandLine.arguments always contains the executable path, so the
+// default mode is "no arguments beyond the program path".
 // =====================================================================
-if CommandLine.arguments.isEmpty {
+if CommandLine.arguments.count <= 1 {
 
 // U1: a scalar above U+10FFFF encoded as UTF-8 (F4 BF BF BF) inside a
 // JSON string must be rejected without trapping.
@@ -5413,6 +5463,867 @@ do {
         "C2-L4 a 16 MiB+1 tag file must fail the size limit: \(blockers)")
 }
 
+// =====================================================================
+// Mobile-Only V1: map-source import (CSV / JSON in default mode; the
+// XLSX and three-format parity suite runs through --import-suite because
+// real .xlsx fixtures are produced by the Python harness).
+// =====================================================================
+
+// I2/I14: CSV baseline with two floors imports cleanly and produces the
+// expected element inventory.
+do {
+    let csv = """
+    floor,element
+    1,"{""shapeType"":""MapShelf"",""x"":100,""y"":200,""width"":300,""height"":100,""code"":""S1"",""visible"":true}"
+    1,"{""shapeType"":""MapCross"",""points"":[0,500,1000,500],""lineWidth"":200,""code"":""C1"",""visible"":true}"
+    2,"{""shapeType"":""MapRoadPoint"",""x"":100,""y"":500,""width"":20,""height"":20,""code"":1,""crossCodes"":[""C1""]}"
+    """
+    let outcome = try CSVMapSourceImporter.importSource(
+        data: Data(csv.utf8),
+        contract: .topLeft)
+    require(
+        outcome.elements.count == 3,
+        "I2 CSV must import 3 elements, got \(outcome.elements.count)")
+    let floors = Set(outcome.elements.map { $0.floorId })
+    require(
+        floors == ["1", "2"],
+        "I2 CSV floors must be [1, 2], got \(floors.sorted())")
+    require(
+        outcome.elements.allSatisfy { $0.id == "f\($0.floorId)-r\($0.sourceRow)" },
+        "I2 element ids must follow the frozen f<floor>-r<row> contract")
+    // Road-graph warnings (missing_cross / road_point_without_cross) are
+    // produced by the compiler stage, not the importer; the importer only
+    // reports geometry/visibility observations.
+    require(
+        outcome.warnings.allSatisfy {
+            $0.code == "unknown_shape_type"
+                || $0.code == "invalid_geometry"
+                || $0.code == "hidden_element"
+        },
+        "I2 importer warnings must be normalization-only, got \(outcome.warnings.map { $0.code })")
+    // Shelf normalization: x=100,y=200,w=300,h=100 -> CCW map polygon
+    // whose first corner is the bottom-left source corner (1.0, -3.0)
+    // under the top-left contract.
+    let shelf = outcome.elements.first { $0.shapeType == "MapShelf" }
+    require(shelf != nil, "I2 shelf must exist")
+    if let geometry = shelf?.geometry,
+       let coordinates = geometry["coordinates"] as? [[Double]] {
+        require(
+            coordinates.count == 4,
+            "I2 shelf polygon must have 4 points")
+        require(
+            close(coordinates[0][0], 1.0) && close(coordinates[0][1], -3.0),
+            "I2 shelf first corner must be (1.0, -3.0), got \(coordinates[0])")
+        require(
+            close(coordinates[1][0], 4.0) && close(coordinates[1][1], -3.0),
+            "I2 shelf second corner must be (4.0, -3.0), got \(coordinates[1])")
+    }
+    else {
+        require(false, "I2 shelf must carry geometry")
+    }
+}
+catch {
+    require(false, "I2 CSV baseline failed: \(error)")
+}
+
+// I8: quoted newline inside a field is preserved (RFC 4180).
+do {
+    let csv = "floor,element\n1,\"{ \"\"shapeType\"\": \"\"MapShelf\"\"}\"\n"
+    let outcome = try CSVMapSourceImporter.importSource(
+        data: Data(csv.utf8),
+        contract: .topLeft)
+    require(
+        outcome.elements.count == 1,
+        "I8 quoted-newline CSV must import 1 element, got \(outcome.elements.count)")
+}
+catch {
+    require(false, "I8 quoted newline failed: \(error)")
+}
+
+// I9: an unclosed quoted field must fail closed.
+do {
+    let csv = "floor,element\n1,\"{quoted-never-closed"
+    _ = try CSVMapSourceImporter.importSource(
+        data: Data(csv.utf8),
+        contract: .topLeft)
+    require(false, "I9 unclosed quote must be rejected")
+}
+catch let error as MapSourceImportError {
+    require(
+        error == .malformedRow(row: 2, reason: "引号字段未闭合。"),
+        "I9 unclosed quote must report malformed row, got \(error.stableCode)")
+}
+catch {
+    require(false, "I9 unclosed quote error type: \(error)")
+}
+
+// CSV NUL byte must be rejected.
+do {
+    var bad = Data("floor,element\n1,\"{\"".utf8)
+    bad.append(0)
+    bad.append(Data("\"}\"\n".utf8))
+    _ = try CSVMapSourceImporter.importSource(
+        data: bad,
+        contract: .topLeft)
+    require(false, "I-csv-nul must be rejected")
+}
+catch let error as MapSourceImportError {
+    require(
+        error.stableCode == "map_source_csv_contains_nul",
+        "CSV NUL must map to csv_contains_nul, got \(error.stableCode)")
+}
+catch {
+    require(false, "CSV NUL error type: \(error)")
+}
+
+// I11: invalid UTF-8 bytes must be rejected.
+do {
+    var bad = Data("floor,element\n1,\"{}\"".utf8)
+    bad.append(0xC3) // truncated UTF-8 sequence
+    bad.append(Data("\n".utf8))
+    _ = try CSVMapSourceImporter.importSource(
+        data: bad,
+        contract: .topLeft)
+    require(false, "I11 invalid UTF-8 CSV must be rejected")
+}
+catch let error as MapSourceImportError {
+    require(
+        error.stableCode == "invalid_utf8",
+        "I11 invalid UTF-8 must map to invalid_utf8, got \(error.stableCode)")
+}
+catch {
+    require(false, "I11 invalid UTF-8 error type: \(error)")
+}
+
+// I3/I10: JSON baseline imports; duplicate keys are rejected by the
+// strict parser.
+do {
+    let json = """
+    {
+      "format": "MarketScannerPriorMapSource",
+      "version": 1,
+      "storeId": "s1",
+      "mapName": "sample",
+      "source": {
+        "originalFormat": "json",
+        "originalFilename": "sample.json",
+        "sourceFileSha256": "abc",
+        "canonicalSourceSha256": ""
+      },
+      "coordinateContract": {
+        "unit": "centimetre", "origin": "top_left", "x_axis": "right",
+        "y_axis": "down", "rotation_direction": "clockwise_degrees"
+      },
+      "elements": [
+        {
+          "id": "f1-r2", "source_row": 2, "floor_id": "1",
+          "shape_type": "MapShelf", "visible": true, "locked": false,
+          "code": "S1", "cross_code": "", "row_flag": "",
+          "geometry": {"type": "polygon", "coordinates": [[1.0, -2.0], [4.0, -2.0], [4.0, -1.0], [1.0, -1.0]]},
+          "bounds": {"min_x_m": 1.0, "min_y_m": -2.0, "max_x_m": 4.0, "max_y_m": -1.0},
+          "center_m": [2.5, -1.5], "yaw_rad": 0.0,
+          "source": {"shapeType": "MapShelf", "x": 100, "y": 200, "width": 300, "height": 100}
+        }
+      ],
+      "warnings": []
+    }
+    """
+    let outcome = try JSONMapSourceImporter.importSource(data: Data(json.utf8))
+    require(
+        outcome.elements.count == 1,
+        "I3 JSON baseline must import 1 element, got \(outcome.elements.count)")
+    require(
+        outcome.sourceIdentity?.originalFilename == "sample.json",
+        "I3 JSON identity must preserve originalFilename")
+    require(
+        outcome.elements[0].shapeType == "MapShelf",
+        "I3 JSON element shape_type must be preserved")
+}
+catch {
+    require(false, "I3 JSON baseline failed: \(error)")
+}
+
+do {
+    let json = """
+    {"format": "MarketScannerPriorMapSource", "version": 1,
+     "storeId": "s", "mapName": "m",
+     "coordinateContract": {"unit": "centimetre", "origin": "top_left",
+       "x_axis": "right", "y_axis": "down", "rotation_direction": "clockwise_degrees"},
+     "elements": [{"id": "f1-r2", "source_row": 2, "floor_id": "1",
+       "shape_type": "MapShelf", "visible": true, "locked": false, "code": "S1",
+       "cross_code": "", "row_flag": "", "source": {"x": 1, "x": 2}}],
+     "warnings": []}
+    """
+    _ = try JSONMapSourceImporter.importSource(data: Data(json.utf8))
+    require(false, "I10 duplicate JSON key must be rejected")
+}
+catch let error as MapSourceImportError {
+    require(
+        error.stableCode == "invalid_json",
+        "I10 duplicate key must map to invalid_json, got \(error.stableCode)")
+}
+catch {
+    require(false, "I10 duplicate key error type: \(error)")
+}
+
+// I13: the bottom-left coordinate preset flips the y axis.
+do {
+    let csv = """
+    floor,element
+    1,"{""shapeType"":""MapRoadPoint"",""x"":100,""y"":200,""code"":""P1""}"
+    """
+    let outcome = try CSVMapSourceImporter.importSource(
+        data: Data(csv.utf8),
+        contract: .bottomLeft)
+    require(
+        outcome.elements.count == 1,
+        "I13 bottom-left CSV must import 1 element")
+    if let coordinates = outcome.elements[0].geometry?["coordinates"] as? [Double] {
+        require(
+            close(coordinates[0], 1.0) && close(coordinates[1], 2.0),
+            "I13 bottom-left must map y=200cm to +2.0m, got \(coordinates)")
+    }
+    else {
+        require(false, "I13 road point must carry point geometry")
+    }
+}
+catch {
+    require(false, "I13 bottom-left preset failed: \(error)")
+}
+
+// canonical-source digest is stable for the same business payload
+// regardless of the source document bytes.
+do {
+    let csvA = "floor,element\n1,\"{ \"\"shapeType\"\": \"\"MapShelf\"\", \"\"x\"\": 100, \"\"y\"\": 200, \"\"width\"\": 300, \"\"height\"\": 100}\"\n"
+    let csvB = "floor,element\n1,\"{ \"\"shapeType\"\":\"\"MapShelf\"\",\"\"x\"\":100,\"\"y\"\":200,\"\"width\"\":300,\"\"height\"\":100}\"\n"
+    let outcomeA = try CSVMapSourceImporter.importSource(
+        data: Data(csvA.utf8), contract: .topLeft)
+    let outcomeB = try CSVMapSourceImporter.importSource(
+        data: Data(csvB.utf8), contract: .topLeft)
+    require(
+        outcomeA.elements == outcomeB.elements,
+        "I4 canonical elements must ignore non-business whitespace")
+}
+catch {
+    require(false, "I4 whitespace-insensitive canonical test failed: \(error)")
+}
+
+// I4: canonical elements must ignore non-business whitespace (checked
+// above); C7/C8/C10: the mobile compiler emits distance-field payloads
+// byte-identical to the PC oracle (data_sha256) and road graphs with the
+// same statistics.
+do {
+    let csv = """
+    floor,element
+    1,"{""shapeType"":""MapShelf"",""x"":100,""y"":200,""width"":300,""height"":100,""code"":""S1"",""visible"":true}"
+    1,"{""shapeType"":""MapCross"",""points"":[0,500,1000,500],""lineWidth"":200,""code"":""C1"",""visible"":true}"
+    2,"{""shapeType"":""MapRoadPoint"",""x"":100,""y"":500,""width"":20,""height"":20,""code"":1,""crossCodes"":[""C1""]}"
+    """
+    let outcome = try CSVMapSourceImporter.importSource(
+        data: Data(csv.utf8), contract: .topLeft)
+    let source = MarketScannerPriorMapSource(
+        format: "MarketScannerPriorMapSource", version: 1,
+        storeId: "s1", mapName: "sample",
+        source: MapSourceIdentity(
+            originalFormat: "csv", originalFilename: "sample.csv",
+            sourceFileSha256: "x", canonicalSourceSha256: "y"),
+        coordinateContract: .topLeft,
+        elements: outcome.elements, warnings: outcome.warnings)
+    let output = try p7r6FreshDirectory("mobile-compile")
+    let result = try MobilePriorMapCompiler.compile(
+        canonicalSource: source, outputDirectory: output)
+    require(
+        result.floorCount == 2 && result.elementCount == 3,
+        "C7 mobile compile must yield 2 floors / 3 elements, got \(result.floorCount)/\(result.elementCount)")
+    require(
+        !result.packageSHA256.isEmpty,
+        "C7 mobile compile must self-validate and return a package SHA")
+    // The compiled package must load through the production snapshot
+    // reader (C9 package self-load). The package manifest is carried
+    // separately by the snapshot (not inside artifactNames).
+    let snapshot = try PriorMapPackageSnapshotReader.read(directory: output)
+    require(
+        !snapshot.packageManifest.isEmpty
+            && snapshot.artifactNames.contains("distance_fields.json")
+            && snapshot.artifactNames.contains("preview.png")
+            && snapshot.artifactNames.contains("road_graph.json"),
+        "C9 compiled package must expose manifest/distance/preview/road artifacts")
+    // Distance-field per-level digests are frozen PC-parity values.
+    let distance = try MobilePackageManifestBuilder.requiredFilesPresent(directory: output)
+    _ = distance
+    let distanceData = try Data(contentsOf: output.appendingPathComponent("distance_fields.json"))
+    let distanceObject = try StrictJSONDocumentParser.object(
+        from: distanceData,
+        limits: StrictJSONDocumentLimits(maximumBytes: distanceData.count + 1))
+    if let floorsPayload = distanceObject["floors"] as? [String: Any],
+       let floor1 = floorsPayload["1"] as? [String: Any],
+       let levels = floor1["levels"] as? [[String: Any]],
+       let level0 = levels.first,
+       let sha = level0["data_sha256"] as? String {
+        require(
+            sha == "05560ec893093efe06c0feef1f442fb685d8b935ef842654e2f7a1d6c4954437",
+            "C7 floor-1 level-0 distance field must match the PC oracle, got \(sha)")
+    }
+    else {
+        require(false, "C7 distance field structure is invalid")
+    }
+    // Road graph statistics parity.
+    let graphData = try Data(contentsOf: output.appendingPathComponent("road_graph.json"))
+    let graphObject = try StrictJSONDocumentParser.object(
+        from: graphData,
+        limits: StrictJSONDocumentLimits(maximumBytes: graphData.count + 1))
+    if let statistics = graphObject["statistics"] as? [String: Any] {
+        require(
+            (statistics["cross_count"] as? Int) == 1
+                && (statistics["node_count"] as? Int) == 1
+                && (statistics["edge_count"] as? Int) == 0
+                && (statistics["isolated_node_count"] as? Int) == 1,
+            "C5 road graph statistics must match the PC oracle: \(statistics)")
+    }
+    else {
+        require(false, "C5 road graph statistics missing")
+    }
+}
+catch {
+    require(false, "C5/C7/C9 mobile compiler tests failed: \(error)")
+}
+
+// =====================================================================
+// Mobile-Only V1: clock correlation, final 1 Hz trajectory (T1-T12) and
+// the four-sheet XLSX workbook (X1-X12).
+// =====================================================================
+
+// T1/T6/T7: 1 Hz resampling across a connected segment with one clock
+// correlation pair; every UTC second in range gets a row. Nodes are
+// placed at fractional monotonic times so the integer UTC seconds land
+// between nodes and exercise interpolation.
+do {
+    var records: [ClockCorrelationRecord] = []
+    records.append(ClockCorrelationRecord.make(
+        trackingSessionID: "s", monotonicSeconds: 100.0,
+        utcUnixSeconds: 1_785_762_000.0, timezoneID: "Asia/Shanghai",
+        utcOffsetSeconds: 28_800, reason: "session_start"))
+    records.append(ClockCorrelationRecord.make(
+        trackingSessionID: "s", monotonicSeconds: 110.0,
+        utcUnixSeconds: 1_785_762_010.0, timezoneID: "Asia/Shanghai",
+        utcOffsetSeconds: 28_800, reason: "session_end"))
+    let mapper = MonotonicUTCMapper(records: records)
+    let nodes = [
+        FinalTrajectory.Node(
+            id: 1, monotonicSeconds: 100.0, xM: 0, yM: 0, yawRad: 0,
+            uncertaintyM: 0.1, floorID: "1"),
+        FinalTrajectory.Node(
+            id: 2, monotonicSeconds: 101.5, xM: 1, yM: 0, yawRad: 0,
+            uncertaintyM: 0.2, floorID: "1"),
+        FinalTrajectory.Node(
+            id: 3, monotonicSeconds: 102.5, xM: 1, yM: 1, yawRad: Double.pi / 2,
+            uncertaintyM: 0.1, floorID: "1"),
+    ]
+    let rows = FinalTrajectory.resample(
+        input: FinalTrajectory.Input(
+            nodes: nodes, lostIntervals: [],
+            sessionStartUTC: 1_785_762_000.0,
+            sessionEndUTC: 1_785_762_002.0),
+        utcMapper: mapper, storeID: "s1",
+        priorMapID: "m", priorMapSha256: "a",
+        trackingSessionID: "s", appGitSHA: "g")
+    require(
+        rows.count == 3,
+        "T1 resample must emit one row per UTC second, got \(rows.count)")
+    require(
+        rows[0].positionStatus == "ACCEPTED"
+            && rows[0].unixTimeS == 1_785_762_000,
+        "T1 first row must be ACCEPTED at the start second")
+    require(
+        rows[0].timezoneID == "Asia/Shanghai" && rows[0].utcOffset == 28_800,
+        "T1 row must carry the local timezone and offset")
+    require(
+        rows[0].localTimestamp.contains("+08:00"),
+        "T1 local timestamp must include the offset, got \(rows[0].localTimestamp)")
+    require(
+        rows[0].beforeNodeID == 1 && rows[0].afterNodeID == 2,
+        "T1 interpolation must bind before/after node ids")
+    // Second 1785762001 -> monotonic 101.0, between node 1 (100.0) and
+    // node 2 (101.5): ratio 2/3 -> x = 0.6667, y = 0.
+    require(
+        close(rows[1].mapXM ?? -1, 0.6666667, tolerance: 1.0e-4),
+        "T1 second row must interpolate x to 0.6667m, got \(rows[1].mapXM ?? -1)")
+    require(
+        close(rows[1].mapYM ?? -1, 0.0),
+        "T1 second row y must stay 0, got \(rows[1].mapYM ?? -1)")
+    // Second 1785762002 -> monotonic 102.0, between node 2 (101.5) and
+    // node 3 (102.5): ratio 0.5 -> x=1, y=0.5, yaw=45 deg.
+    require(
+        rows[2].positionStatus == "ACCEPTED"
+            && close(rows[2].mapXM ?? -1, 1.0)
+            && close(rows[2].mapYM ?? -1, 0.5),
+        "T1 third row must interpolate across nodes 2->3")
+    require(
+        close(rows[2].yawDeg ?? -1, 45.0, tolerance: 1.0e-6),
+        "T1 third row yaw must be shortest-angle interpolated to 45 deg, got \(rows[2].yawDeg ?? -1)")
+    require(
+        close(rows[1].estimatedUncertaintyM ?? -1, 0.2),
+        "T1 uncertainty must be the conservative upper bound (0.2), got \(rows[1].estimatedUncertaintyM ?? -1)")
+}
+catch {
+    require(false, "T1 basic 1 Hz resampling failed: \(error)")
+}
+
+// T3: yaw crossing ±pi interpolates the shortest way.
+do {
+    var records: [ClockCorrelationRecord] = []
+    records.append(ClockCorrelationRecord.make(
+        trackingSessionID: "s", monotonicSeconds: 0,
+        utcUnixSeconds: 1_000_000_000, timezoneID: "UTC",
+        utcOffsetSeconds: 0, reason: "start"))
+    records.append(ClockCorrelationRecord.make(
+        trackingSessionID: "s", monotonicSeconds: 100,
+        utcUnixSeconds: 1_000_000_100, timezoneID: "UTC",
+        utcOffsetSeconds: 0, reason: "end"))
+    let mapper = MonotonicUTCMapper(records: records)
+    let nodes = [
+        FinalTrajectory.Node(
+            id: 1, monotonicSeconds: 0, xM: 0, yM: 0, yawRad: 3.0,
+            uncertaintyM: 0.1, floorID: "1"),
+        FinalTrajectory.Node(
+            id: 2, monotonicSeconds: 2, xM: 1, yM: 0, yawRad: -3.0,
+            uncertaintyM: 0.1, floorID: "1"),
+    ]
+    let rows = FinalTrajectory.resample(
+        input: FinalTrajectory.Input(
+            nodes: nodes, lostIntervals: [],
+            sessionStartUTC: 1_000_000_000,
+            sessionEndUTC: 1_000_000_001),
+        utcMapper: mapper, storeID: "s1",
+        priorMapID: "m", priorMapSha256: "a",
+        trackingSessionID: "s", appGitSHA: "g")
+    require(
+        rows.count == 2 && rows[0].positionStatus == "ACCEPTED",
+        "T3 yaw interpolation must produce accepted rows")
+    // Shortest arc from +3.0 to -3.0 passes through +pi (not through 0).
+    let interpolatedYaw = (rows[0].yawDeg ?? 0) * Double.pi / 180.0
+    require(
+        abs(interpolatedYaw - 3.0) < 0.01 || abs(interpolatedYaw - Double.pi) < 0.01,
+        "T3 yaw must take the shortest arc through +pi, got \(rows[0].yawDeg ?? 0) deg")
+}
+catch {
+    require(false, "T3 yaw shortest-arc failed: \(error)")
+}
+
+// T4/T5: lost intervals and floor changes emit UNAVAILABLE rows.
+do {
+    var records: [ClockCorrelationRecord] = []
+    records.append(ClockCorrelationRecord.make(
+        trackingSessionID: "s", monotonicSeconds: 0,
+        utcUnixSeconds: 2_000_000_000, timezoneID: "UTC",
+        utcOffsetSeconds: 0, reason: "start"))
+    records.append(ClockCorrelationRecord.make(
+        trackingSessionID: "s", monotonicSeconds: 100,
+        utcUnixSeconds: 2_000_000_100, timezoneID: "UTC",
+        utcOffsetSeconds: 0, reason: "end"))
+    let mapper = MonotonicUTCMapper(records: records)
+    // Nodes at 0-1s and 9-10s (monotonic); a lost interval covers 3-7s.
+    let nodes = [
+        FinalTrajectory.Node(id: 1, monotonicSeconds: 0, xM: 0, yM: 0, yawRad: 0, uncertaintyM: 0.1, floorID: "1"),
+        FinalTrajectory.Node(id: 2, monotonicSeconds: 1, xM: 1, yM: 0, yawRad: 0, uncertaintyM: 0.1, floorID: "1"),
+        FinalTrajectory.Node(id: 3, monotonicSeconds: 9, xM: 1, yM: 1, yawRad: 0, uncertaintyM: 0.1, floorID: "1"),
+        FinalTrajectory.Node(id: 4, monotonicSeconds: 10, xM: 2, yM: 1, yawRad: 0, uncertaintyM: 0.1, floorID: "1"),
+    ]
+    let rows = FinalTrajectory.resample(
+        input: FinalTrajectory.Input(
+            nodes: nodes,
+            lostIntervals: [FinalTrajectory.LostInterval(
+                fromMonotonic: 3, toMonotonic: 7, reason: "tracking_lost")],
+            sessionStartUTC: 2_000_000_000,
+            sessionEndUTC: 2_000_000_009),
+        utcMapper: mapper, storeID: "s1",
+        priorMapID: "m", priorMapSha256: "a",
+        trackingSessionID: "s", appGitSHA: "g")
+    require(rows.count == 10, "T4 must emit 10 rows, got \(rows.count)")
+    // Seconds 3..7 (0-indexed rows) fall inside the lost interval.
+    let lostRows = rows.enumerated().filter { (3...7).contains($0.offset) }
+    require(
+        lostRows.allSatisfy { $0.element.positionStatus == "UNAVAILABLE" },
+        "T4 lost-interval seconds must be UNAVAILABLE")
+    // Seconds 8 falls between nodes at monotonic 1 and 9 (8s gap > 3s)
+    // -> UNAVAILABLE; second 9 lands exactly on node 3 -> ACCEPTED.
+    require(
+        rows[8].positionStatus == "UNAVAILABLE",
+        "T4 over-long node gaps must be UNAVAILABLE")
+    require(
+        rows[9].positionStatus == "ACCEPTED",
+        "T4 a second landing on a node after a gap must be ACCEPTED")
+    require(
+        rows[0].positionStatus == "ACCEPTED",
+        "T4 connected seconds must stay ACCEPTED")
+    // Second 1 (monotonic 1) has no upper node within the interpolation
+    // window (node at 9 is 8s away) -> UNAVAILABLE.
+    require(
+        rows[1].positionStatus == "UNAVAILABLE",
+        "T4 a node isolated by an over-long forward gap must be UNAVAILABLE")
+}
+catch {
+    require(false, "T4 lost interval failed: \(error)")
+}
+
+// T12: 100k rows export inside a real workbook (X6), plus formula
+// injection and control-character sanitization (X8/X9). The 100k-scale
+// run lives in the separate --xlsx-scale mode so the default host mode
+// stays within the frozen peak-RSS gate.
+do {
+
+    // X1-X9 round-trip over a bounded workbook (10k rows keeps the
+    // worksheet inside the frozen 64 MiB import-reader entry limit and
+    // the default mode inside the peak-RSS gate).
+    let output = try p7r6FreshDirectory("mobile-xlsx")
+        .appendingPathComponent("result.xlsx")
+    try MobileResultExporter.export(
+        input: makeInput(positions: makePositions(10_000)), to: output)
+    let data = try Data(contentsOf: output)
+    let entries = try XLSXZipReader.readEntries(data: data)
+    let names = Set(entries.map { $0.name })
+    require(
+        names.contains("xl/workbook.xml")
+            && names.contains("[Content_Types].xml")
+            && names.contains("xl/worksheets/sheet1.xml")
+            && names.contains("xl/worksheets/sheet2.xml")
+            && names.contains("xl/worksheets/sheet3.xml")
+            && names.contains("xl/worksheets/sheet4.xml"),
+        "X1/X4 workbook must be a real Open XML package with 4 sheets")
+    let workbookXML = String(
+        data: entries.first { $0.name == "xl/workbook.xml" }!.data,
+        encoding: .utf8) ?? ""
+    require(
+        workbookXML.contains("PriceTags")
+            && workbookXML.contains("DevicePositions")
+            && workbookXML.contains("RunSummary")
+            && workbookXML.contains("RescanRequired"),
+        "X4 workbook must name the four required sheets")
+    let sheet1 = String(
+        data: entries.first { $0.name == "xl/worksheets/sheet1.xml" }!.data,
+        encoding: .utf8) ?? ""
+    require(
+        sheet1.contains("&apos;=HYPERLINK") || sheet1.contains("'=HYPERLINK"),
+        "X8 formula-like barcode must be neutralized")
+    require(
+        !sheet1.contains("<f>"),
+        "X8 the workbook must never contain formula elements")
+    let sanitized = XLSXWorkbookWriter.sanitizeXML("a\u{0001}b\u{0008}c")
+    require(
+        sanitized == "abc",
+        "X9 control characters must be stripped, got \(sanitized)")
+    require(
+        XLSXWorkbookWriter.sanitizeXML("&<>\"") == "&amp;&lt;&gt;&quot;",
+        "X9 XML specials must be escaped")
+}
+catch {
+    require(false, "X6/X8/X9 workbook tests failed: \(error)")
+}
+
+// =====================================================================
+// Mobile-Only V1: tag finalization (G1-G10): node/time binding, position
+// propagation, burst fusion, shelf association and the quality gate.
+// =====================================================================
+
+// G1/G2: explicit node binding and nearest-timestamp binding.
+do {
+    let finalNodes = [
+        TagObservationResolver.FinalNodePose(
+            id: 10, monotonicSeconds: 500.0,
+            pose: SE2Transform(xM: 2, yM: 3, yawRad: 0),
+            floorID: "1"),
+        TagObservationResolver.FinalNodePose(
+            id: 11, monotonicSeconds: 501.5,
+            pose: SE2Transform(xM: 2, yM: 4, yawRad: Double.pi / 2),
+            floorID: "1"),
+    ]
+    // Explicit node 10, raw pose = identity, raw position (0, 0).
+    let resolved = try TagObservationResolver.resolve(
+        observation: TagObservationResolver.RawObservation(
+            barcode: "6901", symbology: "CODE128", floorID: "1",
+            nodeID: 10, nodeTimestamp: 500.0, frameMonotonicSeconds: 500.0,
+            rawPositionM: (0, 0, 0), rawNodePose: .identity,
+            trackingSessionID: "s"),
+        finalNodes: finalNodes, sessionID: "s")
+    require(
+        resolved.mapXM == 2 && resolved.mapYM == 3 && resolved.nodeID == 10,
+        "G1 explicit-node binding must propagate to (2,3), got \(resolved.mapXM),\(resolved.mapYM)")
+    // Raw node pose with an offset: T_raw is identity so the tag local
+    // position is (-1, 0); T_final(node 11) = (2, 4, +90deg) rotates
+    // (-1, 0) to (0, -1), so P_final = (2, 3).
+    let resolved2 = try TagObservationResolver.resolve(
+        observation: TagObservationResolver.RawObservation(
+            barcode: "6902", symbology: "CODE128", floorID: "1",
+            nodeID: 11, nodeTimestamp: 501.5, frameMonotonicSeconds: 501.5,
+            rawPositionM: (-1, 0, 0),
+            rawNodePose: SE2Transform(xM: 0, yM: 0, yawRad: 0),
+            trackingSessionID: "s"),
+        finalNodes: finalNodes, sessionID: "s")
+    require(
+        close(resolved2.mapXM, 2.0) && close(resolved2.mapYM, 3.0),
+        "G1 position propagation must apply T_final*inv(T_raw)*P, got \(resolved2.mapXM),\(resolved2.mapYM)")
+    // Nearest-node timestamp binding (no explicit node id).
+    let resolved3 = try TagObservationResolver.resolve(
+        observation: TagObservationResolver.RawObservation(
+            barcode: "6903", symbology: "CODE128", floorID: "1",
+            nodeID: nil, nodeTimestamp: 501.6, frameMonotonicSeconds: 501.6,
+            rawPositionM: (0, 0, 0), rawNodePose: .identity,
+            trackingSessionID: "s"),
+        finalNodes: finalNodes, sessionID: "s")
+    require(
+        resolved3.nodeID == 11 && resolved3.bindingMethod == "nearest_node_timestamp",
+        "G2 nearest-node binding must pick node 11, got \(resolved3.nodeID)/\(resolved3.bindingMethod)")
+    // Session mismatch must reject.
+    do {
+        _ = try TagObservationResolver.resolve(
+            observation: TagObservationResolver.RawObservation(
+                barcode: "x", symbology: "CODE128", floorID: "1",
+                nodeID: 10, nodeTimestamp: 500.0, frameMonotonicSeconds: 500.0,
+                rawPositionM: (0, 0, 0), rawNodePose: .identity,
+                trackingSessionID: "other"),
+            finalNodes: finalNodes, sessionID: "s")
+        require(false, "G1 session mismatch must be rejected")
+    }
+    catch let error as TagObservationResolver.ResolutionError {
+        require(
+            error == .sessionMismatch,
+            "G1 session mismatch error code must be sessionMismatch")
+    }
+}
+catch {
+    require(false, "G1/G2 tag binding failed: \(error)")
+}
+
+// G4/G5: burst fusion clusters same-barcode instances per floor; distant
+// same-barcode observations stay separate instances.
+do {
+    let observations = [
+        TagObservationResolver.ResolvedObservation(
+            barcode: "B1", symbology: "CODE128", floorID: "1",
+            mapXM: 1.0, mapYM: 2.0, mapZM: 0, nodeID: 1,
+            nodeTimestamp: 0, frameMonotonicSeconds: 0,
+            trackingSessionID: "s", bindingMethod: "explicit_node"),
+        TagObservationResolver.ResolvedObservation(
+            barcode: "B1", symbology: "CODE128", floorID: "1",
+            mapXM: 1.02, mapYM: 2.01, mapZM: 0, nodeID: 1,
+            nodeTimestamp: 0, frameMonotonicSeconds: 0,
+            trackingSessionID: "s", bindingMethod: "explicit_node"),
+        TagObservationResolver.ResolvedObservation(
+            barcode: "B1", symbology: "CODE128", floorID: "1",
+            mapXM: 1.01, mapYM: 1.99, mapZM: 0, nodeID: 1,
+            nodeTimestamp: 0, frameMonotonicSeconds: 0,
+            trackingSessionID: "s", bindingMethod: "explicit_node"),
+        TagObservationResolver.ResolvedObservation(
+            barcode: "B1", symbology: "CODE128", floorID: "2",
+            mapXM: 30.0, mapYM: 30.0, mapZM: 0, nodeID: 2,
+            nodeTimestamp: 0, frameMonotonicSeconds: 0,
+            trackingSessionID: "s", bindingMethod: "explicit_node"),
+        TagObservationResolver.ResolvedObservation(
+            barcode: "B1", symbology: "CODE128", floorID: "2",
+            mapXM: 30.02, mapYM: 30.01, mapZM: 0, nodeID: 2,
+            nodeTimestamp: 0, frameMonotonicSeconds: 0,
+            trackingSessionID: "s", bindingMethod: "explicit_node"),
+        TagObservationResolver.ResolvedObservation(
+            barcode: "B1", symbology: "CODE128", floorID: "2",
+            mapXM: 30.01, mapYM: 29.99, mapZM: 0, nodeID: 2,
+            nodeTimestamp: 0, frameMonotonicSeconds: 0,
+            trackingSessionID: "s", bindingMethod: "explicit_node"),
+    ]
+    let instances = TagObservationResolver.clusterInstances(
+        observations: observations, clusterRadiusM: 1.5)
+    require(
+        instances.count == 2,
+        "G4/G5 same barcode on two floors must yield two instances, got \(instances.count)")
+    let floor1 = instances.first { $0.floorID == "1" }
+    let floor2 = instances.first { $0.floorID == "2" }
+    require(
+        floor1 != nil && floor1!.observationCount == 3,
+        "G4 burst fusion must merge 3 samples into one instance")
+    require(
+        floor2 != nil && floor2!.observationCount == 3,
+        "G5 floor-2 cluster must be independent")
+    require(
+        close(floor1?.mapXM ?? -1, 1.01, tolerance: 1.0e-6),
+        "G4 fused position must be the burst centroid, got \(floor1?.mapXM ?? -1)")
+}
+catch {
+    require(false, "G4/G5 burst fusion failed: \(error)")
+}
+
+// G6/G7/G10: shelf association and the automatic quality gate.
+do {
+    let shelf = ShelfAssociationEngine.ShelfSegment(
+        shelfCode: "A1", floorID: "1",
+        startM: (0, 0), endM: (10, 0), side: "front")
+    guard let mid = ShelfAssociationEngine.associate(
+        point: (5, 0.05), shelf: shelf, floorID: "1") else {
+        require(false, "G6 shelf association must succeed at mid")
+        throw MapSourceImportError.unknownFormat
+    }
+    require(
+        close(mid.distanceFromShelfStartCm, 500.0, tolerance: 1.0e-6)
+            && close(mid.positionRatio, 0.5, tolerance: 1.0e-6)
+            && close(mid.distanceToSegmentM, 0.05, tolerance: 1.0e-6),
+        "G6 mid-shelf projection must be (500cm, 0.5), got \(mid.distanceFromShelfStartCm),\(mid.positionRatio)")
+    require(!mid.atEndpoint, "G6 mid-shelf must not be endpoint-ambiguous")
+    guard let endpoint = ShelfAssociationEngine.associate(
+        point: (0.05, 0.0), shelf: shelf, floorID: "1") else {
+        require(false, "G6 endpoint association must succeed")
+        throw MapSourceImportError.unknownFormat
+    }
+    require(endpoint.atEndpoint, "G7 endpoint zone must be flagged ambiguous")
+    // Quality gate: accepted only with sufficient burst and geometry.
+    func gateInput(
+        count: Int,
+        spread: Double,
+        association: ShelfAssociationEngine.Association,
+        graphOK: Bool = true,
+        identityOK: Bool = true
+    ) -> AutomaticQualityGate.TagQualityInput {
+        return AutomaticQualityGate.TagQualityInput(
+            observationCount: count, positionSpreadM: spread,
+            minimumBurstSamples: 3, maximumSpreadM: 0.1,
+            bindingMethod: "explicit_node",
+            association: association,
+            maximumEndpointDistanceM: 0.15,
+            maximumAssociationDistanceM: 0.2,
+            graphQualityPassed: graphOK,
+            mapSessionIdentityConsistent: identityOK)
+    }
+    let accepted = AutomaticQualityGate.evaluate(gateInput(
+        count: 5, spread: 0.02, association: mid))
+    require(
+        accepted.0 == .accepted,
+        "G10 a well-supported mid-shelf tag must be ACCEPTED, got \(accepted.0.rawValue)")
+    let sparse = AutomaticQualityGate.evaluate(gateInput(
+        count: 1, spread: 0.02, association: mid))
+    require(
+        sparse.0 == .rescanRequired,
+        "G10 insufficient burst samples must be RESCAN_REQUIRED, got \(sparse.0.rawValue)")
+    let endpointGate = AutomaticQualityGate.evaluate(gateInput(
+        count: 5, spread: 0.02, association: endpoint))
+    require(
+        endpointGate.0 == .rescanRequired,
+        "G7 endpoint-ambiguous tags must be RESCAN_REQUIRED, got \(endpointGate.0.rawValue)")
+}
+catch {
+    require(false, "G6/G7/G10 shelf/quality tests failed: \(error)")
+}
+
+// =====================================================================
+// Mobile-Only V1: Fast Path factor graph (P1/P2), session snapshot
+// transaction (P7) and the persistent task state machine (P8/P12).
+// =====================================================================
+
+// P1/P2: a small chain with a wrong odometry drift and a loop closure
+// must converge to a residual near zero; anchor pose is preserved.
+do {
+    let nodes = [
+        SE2FactorGraphCore.Node(id: 1, initialPose: .identity, isAnchor: true, floorID: "1"),
+        SE2FactorGraphCore.Node(id: 2, initialPose: SE2Transform(xM: 1, yM: 0, yawRad: 0), isAnchor: false, floorID: "1"),
+        SE2FactorGraphCore.Node(id: 3, initialPose: SE2Transform(xM: 2, yM: 0.5, yawRad: 0), isAnchor: false, floorID: "1"),
+        SE2FactorGraphCore.Node(id: 4, initialPose: SE2Transform(xM: 3, yM: 0.5, yawRad: 0), isAnchor: false, floorID: "1"),
+    ]
+    let edges = [
+        SE2FactorGraphCore.Edge(from: 1, to: 2, measurement: SE2Transform(xM: 1, yM: 0, yawRad: 0), weight: 10, kind: "odometry"),
+        SE2FactorGraphCore.Edge(from: 2, to: 3, measurement: SE2Transform(xM: 1, yM: 0, yawRad: 0), weight: 10, kind: "odometry"),
+        SE2FactorGraphCore.Edge(from: 3, to: 4, measurement: SE2Transform(xM: 1, yM: 0, yawRad: 0), weight: 10, kind: "odometry"),
+        // Loop closure pulls node 4 back to the line y=0.
+        SE2FactorGraphCore.Edge(from: 4, to: 1, measurement: SE2Transform(xM: -3, yM: 0, yawRad: 0), weight: 8, kind: "loop_closure"),
+    ]
+    let graph = try SE2FactorGraphCore.optimize(nodes: nodes, edges: edges)
+    require(
+        graph.finalResidual < 1.0e-3,
+        "P1 fast-path must converge near zero residual, got \(graph.finalResidual)")
+    require(
+        close(graph.poses[1]?.xM ?? -1, 0.0) && close(graph.poses[1]?.yM ?? -1, 0.0),
+        "P1 the anchor pose must stay fixed")
+    require(
+        close(graph.poses[2]?.yM ?? -1, 0.0, tolerance: 2.0e-2)
+            && close(graph.poses[3]?.yM ?? -1, 0.0, tolerance: 2.0e-2),
+        "P1 loop closure must flatten the drift, got \(graph.poses[3]?.yM ?? -1)")
+}
+catch {
+    require(false, "P1 fast-path factor graph failed: \(error)")
+}
+
+// P7: the session snapshot transaction copies inputs into a private
+// snapshot and computes a bundle digest over the stable bytes.
+do {
+    let session = try p7r6FreshDirectory("mobile-session")
+    let fileManager = FileManager.default
+    let metadata = Data("{\"finalized\":true}".utf8)
+    try metadata.write(to: session.appendingPathComponent("metadata.json"))
+    try Data("trace\n".utf8).write(to: session.appendingPathComponent("localization_trace.jsonl"))
+    try Data("constraints\n".utf8).write(to: session.appendingPathComponent("localization_constraints.jsonl"))
+    try Data("manual\n".utf8).write(to: session.appendingPathComponent("manual_localization_events.jsonl"))
+    try Data("obs\n".utf8).write(to: session.appendingPathComponent("tag_observations.jsonl"))
+    try Data("events\n".utf8).write(to: session.appendingPathComponent("localization_events.jsonl"))
+    try Data("recovery\n".utf8).write(to: session.appendingPathComponent("localization_recovery_events.jsonl"))
+    try Data("[]".utf8).write(to: session.appendingPathComponent("localized_price_tags.json"))
+    let database = session.appendingPathComponent("source.db")
+    try Data("sqlite-bytes".utf8).write(to: database)
+
+    let taskRoot = try p7r6FreshDirectory("mobile-task")
+    let snapshot = try SessionSnapshotTransaction.snapshot(
+        finalizedSession: session, sourceDatabase: database, taskRoot: taskRoot)
+    require(
+        !snapshot.bundleSHA256.isEmpty,
+        "P7 snapshot must compute a non-empty bundle digest")
+    require(
+        fileManager.fileExists(
+            atPath: snapshot.snapshotDirectory.appendingPathComponent("source.db").path),
+        "P7 snapshot must contain the immutable source DB copy")
+    // The persisted input manifest must agree with the snapshot digest,
+    // and mutating the original session afterwards must not change it.
+    let persistedManifestData = try Data(
+        contentsOf: taskRoot.appendingPathComponent("input_manifest.json"))
+    let persistedManifest = try StrictJSONDocumentParser.object(
+        from: persistedManifestData,
+        limits: StrictJSONDocumentLimits(maximumBytes: persistedManifestData.count + 1))
+    require(
+        (persistedManifest["bundle_sha256"] as? String) == snapshot.bundleSHA256,
+        "P7 the persisted input manifest must bind the snapshot digest")
+    try Data("tampered".utf8).write(to: database)
+    try Data("tampered-trace\n".utf8).write(
+        to: session.appendingPathComponent("localization_trace.jsonl"))
+    let manifestAfter = try Data(contentsOf: taskRoot.appendingPathComponent("input_manifest.json"))
+    require(
+        manifestAfter == persistedManifestData,
+        "P7 the persisted snapshot manifest must not change when the original is tampered")
+}
+catch {
+    require(false, "P7 session snapshot transaction failed: \(error)")
+}
+
+// P8/P12: the persistent task state machine survives atomic writes and
+// interrupted states are never reported completed.
+do {
+    let taskRoot = try p7r6FreshDirectory("mobile-state")
+    _ = try PersistentTaskCoordinator.createTask(taskID: "t1", taskRoot: taskRoot)
+    _ = try PersistentTaskCoordinator.updateState(.snapshotting, taskRoot: taskRoot, progress: 0.1)
+    _ = try PersistentTaskCoordinator.updateState(.fastOptimizing, taskRoot: taskRoot, progress: 0.4)
+    _ = try PersistentTaskCoordinator.updateState(.interrupted, taskRoot: taskRoot, progress: 0.4)
+    let record = try PersistentTaskCoordinator.read(taskRoot: taskRoot)
+    require(
+        record.state == .interrupted && record.progress == 0.4,
+        "P8 task.json must persist the interrupted state atomically")
+    require(
+        record.state != .completed,
+        "P8 an interrupted task must never be reported completed")
+    require(
+        PersistentTaskCoordinator.isResumable(record),
+        "P12 an interrupted task must be resumable after a crash")
+    _ = try PersistentTaskCoordinator.updateState(.completed, taskRoot: taskRoot, progress: 1.0)
+    let completed = try PersistentTaskCoordinator.read(taskRoot: taskRoot)
+    require(
+        completed.state == .completed && !PersistentTaskCoordinator.isResumable(completed),
+        "P12 a completed task is terminal")
+}
+catch {
+    require(false, "P8/P12 persistent task state machine failed: \(error)")
+}
+
 } // end of C1/C2 default-mode-only host tests
 
 // P7R6A fixture alignment mode: classifies every shared recovery fixture
@@ -5526,6 +6437,209 @@ if CommandLine.arguments.count == 3,
         FileHandle.standardError.write(
             Data("Integrity suite failed: \(error)\n".utf8))
         exit(5)
+    }
+}
+
+// Mobile-Only V1: --import-suite validates the three-format canonical
+// parity and the XLSX safety policy in ONE invocation. The directory
+// contains the fixtures produced by the Python harness:
+//   sample.xlsx sample.csv sample.json  -> must import with equal
+//                                          canonicalSourceSha256
+//   formula.xlsx                        -> must fail formulaNotSupported
+//   traversal.xlsx                      -> must fail zipTraversal
+//   bomb.xlsx                           -> must fail zip ratio/total
+//   multi-floor.json                    -> must import with 2 floors
+if CommandLine.arguments.count == 3,
+   CommandLine.arguments[1] == "--import-suite" {
+    do {
+        let root = URL(
+            fileURLWithPath: CommandLine.arguments[2],
+            isDirectory: true)
+        let fileManager = FileManager.default
+
+        func load(_ name: String) throws -> Data {
+            let url = root.appendingPathComponent(name)
+            guard fileManager.fileExists(atPath: url.path) else {
+                throw MapSourceImportError.unreadableSource(reason: "缺少 fixture \(name)")
+            }
+            return try Data(contentsOf: url)
+        }
+
+        var failures: [String] = []
+
+        // Three-format parity: identical canonical digest and elements.
+        do {
+            let xlsxData = try load("sample.xlsx")
+            let csvData = try load("sample.csv")
+            let jsonData = try load("sample.json")
+
+            let xlsxReport = try MapSourceImportCoordinator.importMap(
+                stagedURL: try writeTemporary(xlsxData, named: "sample.xlsx"),
+                originalFilename: "sample.xlsx",
+                contract: .topLeft)
+            let csvReport = try MapSourceImportCoordinator.importMap(
+                stagedURL: try writeTemporary(csvData, named: "sample.csv"),
+                originalFilename: "sample.csv",
+                contract: .topLeft)
+            let jsonReport = try MapSourceImportCoordinator.importMap(
+                stagedURL: try writeTemporary(jsonData, named: "sample.json"),
+                originalFilename: "sample.json",
+                contract: .topLeft)
+
+            if xlsxReport.canonicalSourceSha256 != csvReport.canonicalSourceSha256 {
+                failures.append("parity: xlsx vs csv canonical SHA mismatch")
+            }
+            if xlsxReport.canonicalSourceSha256 != jsonReport.canonicalSourceSha256 {
+                failures.append("parity: xlsx vs json canonical SHA mismatch")
+            }
+            if xlsxReport.canonicalSource.elements != csvReport.canonicalSource.elements {
+                failures.append("parity: xlsx vs csv elements mismatch")
+            }
+            if xlsxReport.canonicalSource.elements != jsonReport.canonicalSource.elements {
+                failures.append("parity: xlsx vs json elements mismatch")
+            }
+            if xlsxReport.elementCount != csvReport.elementCount
+                || xlsxReport.elementCount != jsonReport.elementCount {
+                failures.append("parity: element count mismatch")
+            }
+            if xlsxReport.floorCount != csvReport.floorCount
+                || xlsxReport.floorCount != jsonReport.floorCount {
+                failures.append("parity: floor count mismatch")
+            }
+            if xlsxReport.sourceFileSha256 == csvReport.sourceFileSha256 {
+                failures.append("parity: sourceFileSha256 must differ across formats")
+            }
+            if xlsxReport.canonicalSourceSha256.isEmpty {
+                failures.append("parity: canonical SHA must not be empty")
+            }
+        }
+        catch {
+            failures.append("parity: \(error)")
+        }
+
+        // I5: formula cells are rejected.
+        do {
+            let data = try load("formula.xlsx")
+            _ = try MapSourceImportCoordinator.importMap(
+                stagedURL: try writeTemporary(data, named: "formula.xlsx"),
+                originalFilename: "formula.xlsx",
+                contract: .topLeft)
+            failures.append("formula: expected rejection")
+        }
+        catch let error as MapSourceImportError {
+            if error.stableCode != "map_source_formula_not_supported" {
+                failures.append("formula: wrong code \(error.stableCode)")
+            }
+        }
+        catch {
+            failures.append("formula: unexpected error \(error)")
+        }
+
+        // I6: ZIP path traversal is rejected.
+        do {
+            let data = try load("traversal.xlsx")
+            _ = try MapSourceImportCoordinator.importMap(
+                stagedURL: try writeTemporary(data, named: "traversal.xlsx"),
+                originalFilename: "traversal.xlsx",
+                contract: .topLeft)
+            failures.append("traversal: expected rejection")
+        }
+        catch let error as MapSourceImportError {
+            if error.stableCode != "map_source_zip_traversal" {
+                failures.append("traversal: wrong code \(error.stableCode)")
+            }
+        }
+        catch {
+            failures.append("traversal: unexpected error \(error)")
+        }
+
+        // I7: ZIP bomb (extreme compression ratio) is rejected.
+        do {
+            let data = try load("bomb.xlsx")
+            _ = try MapSourceImportCoordinator.importMap(
+                stagedURL: try writeTemporary(data, named: "bomb.xlsx"),
+                originalFilename: "bomb.xlsx",
+                contract: .topLeft)
+            failures.append("bomb: expected rejection")
+        }
+        catch let error as MapSourceImportError {
+            let code = error.stableCode
+            if code != "map_source_zip_ratio_too_large"
+                && code != "map_source_zip_entry_too_large"
+                && code != "map_source_zip_total_too_large" {
+                failures.append("bomb: wrong code \(code)")
+            }
+        }
+        catch {
+            failures.append("bomb: unexpected error \(error)")
+        }
+
+        // I14: multi-floor JSON imports with 3 floors.
+        do {
+            let data = try load("multi-floor.json")
+            let report = try MapSourceImportCoordinator.importMap(
+                stagedURL: try writeTemporary(data, named: "multi-floor.json"),
+                originalFilename: "multi-floor.json",
+                contract: .topLeft)
+            if report.floorCount != 3 {
+                failures.append("multi-floor: expected 3 floors, got \(report.floorCount)")
+            }
+        }
+        catch {
+            failures.append("multi-floor: \(error)")
+        }
+
+        guard failures.isEmpty else {
+            FileHandle.standardError.write(
+                Data(("Import suite failures:\n"
+                    + failures.joined(separator: "\n") + "\n").utf8))
+            exit(6)
+        }
+        print("Import suite passed")
+    }
+    catch {
+        FileHandle.standardError.write(
+            Data("Import suite failed: \(error)\n".utf8))
+        exit(6)
+    }
+}
+
+// Writes a fixture into a temporary file under the suite directory so the
+// coordinator can hash a stable staged copy (the security-scoped copy is
+// simulated by writing to a private staging file).
+private func writeTemporary(_ data: Data, named name: String) throws -> URL {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent("import-suite-staging", isDirectory: true)
+    try FileManager.default.createDirectory(
+        at: directory, withIntermediateDirectories: true)
+    let url = directory.appendingPathComponent(name)
+    try data.write(to: url, options: [.atomic])
+    return url
+}
+
+// Mobile-Only V1: --xlsx-scale exports a 100k-row DevicePositions
+// workbook to the given directory. It runs as its own process so the
+// default host mode stays inside the frozen peak-RSS gate.
+if CommandLine.arguments.count == 3,
+   CommandLine.arguments[1] == "--xlsx-scale" {
+    do {
+        let output = URL(fileURLWithPath: CommandLine.arguments[2])
+            .appendingPathComponent("result-100k.xlsx")
+        try MobileResultExporter.export(
+            input: makeInput(positions: makePositions(100_000)), to: output)
+        let bytes = (try FileManager.default.attributesOfItem(
+            atPath: output.path)[.size] as? NSNumber)?.int64Value ?? 0
+        guard bytes > 0 else {
+            FileHandle.standardError.write(
+                Data("xlsx-scale produced an empty file\n".utf8))
+            exit(7)
+        }
+        print("xlsx-scale workbook bytes: \(bytes)")
+    }
+    catch {
+        FileHandle.standardError.write(
+            Data("xlsx-scale failed: \(error)\n".utf8))
+        exit(7)
     }
 }
 

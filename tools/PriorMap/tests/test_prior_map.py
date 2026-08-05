@@ -87,6 +87,126 @@ def write_workbook(path: Path, rows: list[tuple[str, str]]) -> None:
         )
 
 
+def _canonical_json_elements(business_elements: list) -> list[dict]:
+    """Builds normalized elements for a canonical JSON fixture, matching
+    the on-device normalizer (and the PC coordinate_system oracle) so the
+    three-format parity holds. Geometry fields are computed with the same
+    source-to-map contract used by XLSX/CSV import (top-left origin)."""
+    from tools.PriorMap.coordinate_system import (
+        polygon_bounds,
+        source_point_to_map,
+        source_rectangle_polygon,
+    )
+
+    elements: list[dict] = []
+    for index, (floor, value) in enumerate(business_elements):
+        shape_type = value["shapeType"]
+        row = index + 2
+        geometry: dict | None = None
+        bounds: dict | None = None
+        center: list | None = None
+        yaw: float | None = None
+        if shape_type in {"MapShelf", "MapTable", "MapPillar", "MapTableFeature"}:
+            polygon = source_rectangle_polygon(
+                value["x"], value["y"], value["width"], value["height"],
+                float(value.get("rotation", 0)),
+            )
+            geometry = {"type": "polygon", "coordinates": polygon}
+            bounds = polygon_bounds(polygon).as_dict()
+            center = list(source_point_to_map(
+                value["x"] + value["width"] / 2.0,
+                value["y"] + value["height"] / 2.0,
+            ))
+            yaw = round(-float(value.get("rotation", 0)) * math.pi / 180.0, 9)
+        elif shape_type == "MapCross":
+            points = value["points"]
+            coordinates = [
+                list(source_point_to_map(float(points[i]), float(points[i + 1])))
+                for i in range(0, len(points), 2)
+            ]
+            geometry = {"type": "line_string", "coordinates": coordinates}
+            bounds = polygon_bounds(coordinates).as_dict()
+        elif shape_type == "MapRoadPoint":
+            point = list(source_point_to_map(value["x"], value["y"]))
+            geometry = {"type": "point", "coordinates": point}
+            bounds = {
+                "min_x_m": point[0], "min_y_m": point[1],
+                "max_x_m": point[0], "max_y_m": point[1],
+                "width_m": 0.0, "height_m": 0.0,
+            }
+            center = point
+        element: dict = {
+            "id": f"f{floor}-r{row}",
+            "source_row": row,
+            "floor_id": str(floor),
+            "shape_type": shape_type,
+            "visible": value.get("visible", True),
+            "locked": False,
+            "code": str(value.get("code", "")),
+            "cross_code": str(value.get("crossCode", "")),
+            "row_flag": str(value.get("rowFlag", "")),
+            "subsection": value.get("subsection"),
+            "source": value,
+        }
+        if geometry is not None:
+            element["geometry"] = geometry
+        if bounds is not None:
+            element["bounds"] = bounds
+        if center is not None:
+            element["center_m"] = center
+        if yaw is not None:
+            element["yaw_rad"] = yaw
+        elements.append(element)
+    return elements
+
+
+def _write_formula_xlsx(path: Path) -> None:
+    """Writes an Element Info workbook whose floor cell is a formula —
+    the mobile importer must reject it with map_source_formula_not_supported."""
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr(
+            "[Content_Types].xml",
+            '<?xml version="1.0"?>'
+            '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+            '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+            '<Default Extension="xml" ContentType="application/xml"/>'
+            '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
+            '<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+            "</Types>",
+        )
+        archive.writestr(
+            "_rels/.rels",
+            '<?xml version="1.0"?>'
+            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+            '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>'
+            "</Relationships>",
+        )
+        archive.writestr(
+            "xl/workbook.xml",
+            '<?xml version="1.0"?>'
+            '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+            'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+            '<sheets><sheet name="Element Info" sheetId="1" r:id="rId1"/></sheets></workbook>',
+        )
+        archive.writestr(
+            "xl/_rels/workbook.xml.rels",
+            '<?xml version="1.0"?>'
+            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+            '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>'
+            "</Relationships>",
+        )
+        archive.writestr(
+            "xl/worksheets/sheet1.xml",
+            '<?xml version="1.0"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+            '<sheetData>'
+            '<row r="1"><c r="A1" t="inlineStr"><is><t>floor</t></is></c>'
+            '<c r="B1" t="inlineStr"><is><t>element</t></is></c></row>'
+            '<row r="2"><c r="A2"><f>=1+1</f><v>2</v></c>'
+            '<c r="B2" t="inlineStr"><is><t>{"shapeType":"MapShelf"}</t></is></c></row>'
+            "</sheetData></worksheet>",
+        )
+
+
 def fixture_rows() -> list[tuple[str, str]]:
     values = [
         (
@@ -229,6 +349,70 @@ class IOSCoreContractTests(unittest.TestCase):
             repository / "app/ios/RTABMapApp/PriceTagLocalizationCore.swift",
             repository
             / "app/ios/RTABMapApp/PriorMapPackageIntegrityCore.swift",
+            # Mobile-Only V1: map-source import pipeline (pure logic; the
+            # UIKit document picker lives in the app target only).
+            repository
+            / "app/ios/RTABMapApp/MobileMapImport/MapSourceImportError.swift",
+            repository
+            / "app/ios/RTABMapApp/MobileMapImport/CanonicalPriorMapSource.swift",
+            repository
+            / "app/ios/RTABMapApp/MobileMapImport/CanonicalJSONEncoder.swift",
+            repository
+            / "app/ios/RTABMapApp/MobileMapImport/SourceGeometry.swift",
+            repository
+            / "app/ios/RTABMapApp/MobileMapImport/ElementNormalizer.swift",
+            repository
+            / "app/ios/RTABMapApp/MobileMapImport/RFC4180CSVReader.swift",
+            repository
+            / "app/ios/RTABMapApp/MobileMapImport/CSVMapSourceImporter.swift",
+            repository
+            / "app/ios/RTABMapApp/MobileMapImport/XLSXZipReader.swift",
+            repository
+            / "app/ios/RTABMapApp/MobileMapImport/XLSXWorkbookReader.swift",
+            repository
+            / "app/ios/RTABMapApp/MobileMapImport/XLSXWorksheetReader.swift",
+            repository
+            / "app/ios/RTABMapApp/MobileMapImport/XLSXMapSourceImporter.swift",
+            repository
+            / "app/ios/RTABMapApp/MobileMapImport/JSONMapSourceImporter.swift",
+            repository
+            / "app/ios/RTABMapApp/MobileMapImport/MapSourceImportReport.swift",
+            repository
+            / "app/ios/RTABMapApp/MobileMapImport/MapSourceImportCoordinator.swift",
+            # Mobile-Only V1: prior-map compiler (pure logic + CoreGraphics
+            # preview rendering, available on the macOS host).
+            repository
+            / "app/ios/RTABMapApp/MobilePriorMapCompiler/MobileDistanceFieldBuilder.swift",
+            repository
+            / "app/ios/RTABMapApp/MobilePriorMapCompiler/MobileRoadGraphBuilder.swift",
+            repository
+            / "app/ios/RTABMapApp/MobilePriorMapCompiler/MobilePackageManifestBuilder.swift",
+            repository
+            / "app/ios/RTABMapApp/MobilePriorMapCompiler/MobilePreviewRenderer.swift",
+            repository
+            / "app/ios/RTABMapApp/MobilePriorMapCompiler/MobilePriorMapCompiler.swift",
+            # Mobile-Only V1: clock correlation, final trajectory and the
+            # four-sheet XLSX workbook (all host-testable pure logic).
+            repository
+            / "app/ios/RTABMapApp/MobilePostProcessing/ClockCorrelationRecorder.swift",
+            repository
+            / "app/ios/RTABMapApp/MobilePostProcessing/FinalTrajectory.swift",
+            repository
+            / "app/ios/RTABMapApp/MobilePostProcessing/SE2Transform.swift",
+            repository
+            / "app/ios/RTABMapApp/MobilePostProcessing/TagObservationResolver.swift",
+            repository
+            / "app/ios/RTABMapApp/MobilePostProcessing/ShelfAssociationEngine.swift",
+            repository
+            / "app/ios/RTABMapApp/MobilePostProcessing/SE2FactorGraphCore.swift",
+            repository
+            / "app/ios/RTABMapApp/MobilePostProcessing/SessionSnapshotTransaction.swift",
+            repository
+            / "app/ios/RTABMapApp/MobileResults/MobileWorksheets.swift",
+            repository
+            / "app/ios/RTABMapApp/MobileResults/MobileResultExporter.swift",
+            repository
+            / "app/ios/RTABMapApp/MobileResults/XLSXWorkbookWriter.swift",
         ]
         swift_test = Path(__file__).with_name("swift") / "main.swift"
         with tempfile.TemporaryDirectory() as temporary:
@@ -468,6 +652,129 @@ class IOSCoreContractTests(unittest.TestCase):
                 0,
                 suite_result.stderr + "\n" + suite_result.stdout,
             )
+
+            # Mobile-Only V1: three-format canonical parity and XLSX
+            # safety policy (I1-I14) run inside ONE --import-suite
+            # invocation. The fixtures below are generated here so the
+            # Swift harness only performs import logic.
+            import_suite_root = Path(temporary) / "import-suite"
+            import_suite_root.mkdir()
+
+            business_elements = [
+                (1, {"shapeType": "MapShelf", "x": 100, "y": 200,
+                     "width": 300, "height": 100, "code": "S1", "visible": True}),
+                (1, {"shapeType": "MapCross", "points": [0, 500, 1000, 500],
+                     "lineWidth": 200, "code": "C1", "visible": True}),
+                (2, {"shapeType": "MapRoadPoint", "x": 100, "y": 500,
+                     "width": 20, "height": 20, "code": 1,
+                     "crossCodes": ["C1"], "visible": True}),
+            ]
+
+            # sample.xlsx (self-contained minimal XLSX writer).
+            write_workbook(
+                import_suite_root / "sample.xlsx",
+                [
+                    (str(floor), json.dumps(value, ensure_ascii=False))
+                    for floor, value in business_elements
+                ],
+            )
+
+            # sample.csv
+            (import_suite_root / "sample.csv").write_text(
+                "floor,element\n"
+                + "\n".join(
+                    f"{floor},\"{json.dumps(value, ensure_ascii=False).replace(chr(34), chr(34) * 2)}\""
+                    for floor, value in business_elements
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            # sample.json (MarketScannerPriorMapSource v1) with normalized
+            # elements matching the on-device XLSX/CSV importer output.
+            sample_json = {
+                "format": "MarketScannerPriorMapSource",
+                "version": 1,
+                "storeId": "s1",
+                "mapName": "sample",
+                "source": {
+                    "originalFormat": "json",
+                    "originalFilename": "sample.json",
+                    "sourceFileSha256": "unused",
+                    "canonicalSourceSha256": "",
+                },
+                "coordinateContract": {
+                    "unit": "centimetre",
+                    "origin": "top_left",
+                    "x_axis": "right",
+                    "y_axis": "down",
+                    "rotation_direction": "clockwise_degrees",
+                },
+                "elements": _canonical_json_elements(business_elements),
+                "warnings": [],
+            }
+            (import_suite_root / "sample.json").write_text(
+                json.dumps(sample_json, ensure_ascii=False, sort_keys=True),
+                encoding="utf-8",
+            )
+
+            # I5: formula cells in the business columns are rejected.
+            _write_formula_xlsx(import_suite_root / "formula.xlsx")
+
+            # I6: ZIP path traversal entry is rejected.
+            with zipfile.ZipFile(
+                import_suite_root / "traversal.xlsx", "w"
+            ) as archive:
+                archive.writestr("../evil.xml", "<x/>")
+                archive.writestr("[Content_Types].xml", "<Types/>")
+
+            # I7: ZIP bomb — a deflated entry whose ratio exceeds 200:1.
+            with zipfile.ZipFile(
+                import_suite_root / "bomb.xlsx", "w", zipfile.ZIP_DEFLATED
+            ) as archive:
+                archive.writestr("xl/workbook.xml", b"\x00" * (10 * 1024 * 1024))
+                archive.writestr("xl/sharedStrings.xml", b"")
+
+            # I14: multi-floor JSON.
+            multi_floor = dict(sample_json)
+            multi_floor["elements"] = sample_json["elements"] + _canonical_json_elements(
+                [(3, {"shapeType": "MapTable", "x": 50, "y": 50,
+                      "width": 100, "height": 100, "visible": True})]
+            )
+            (import_suite_root / "multi-floor.json").write_text(
+                json.dumps(multi_floor, ensure_ascii=False, sort_keys=True),
+                encoding="utf-8",
+            )
+
+            import_result = subprocess.run(
+                [str(executable), "--import-suite", str(import_suite_root)],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                import_result.returncode,
+                0,
+                import_result.stderr + "\n" + import_result.stdout,
+            )
+
+            # T12/X6: a 100k-row DevicePositions workbook exports in its
+            # own process (kept out of the default-mode peak-RSS gate).
+            scale_root = Path(temporary) / "xlsx-scale"
+            scale_root.mkdir()
+            scale_result = subprocess.run(
+                [str(executable), "--xlsx-scale", str(scale_root)],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                scale_result.returncode,
+                0,
+                scale_result.stderr + "\n" + scale_result.stdout,
+            )
+            scale_bytes = (scale_root / "result-100k.xlsx").stat().st_size
+            self.assertGreater(scale_bytes, 0)
 
     @staticmethod
     def _rewrite_integrity_json(path: Path, mutate: object) -> None:
