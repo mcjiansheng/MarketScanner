@@ -2944,7 +2944,8 @@ func p7r6WriteBaseBundle(
 func p7r6BundleExpectation(
     recoveryCount: Int,
     lastEpisodeId: Int? = nil,
-    lastFinishedAtUptime: TimeInterval? = nil
+    lastFinishedAtUptime: TimeInterval? = nil,
+    localizedPriceTagCount: Int = 0
 ) -> LocalizationEvidenceBundleExpectation {
     return LocalizationEvidenceBundleExpectation(
         trackingSessionId: "session-a",
@@ -2955,7 +2956,7 @@ func p7r6BundleExpectation(
         constraintRecordCount: 1,
         stateEventCount: 1,
         lastDurableState: "stable",
-        localizedPriceTagCount: 0,
+        localizedPriceTagCount: localizedPriceTagCount,
         recoveryEventCount: recoveryCount,
         lastRecoveryEpisodeId: lastEpisodeId,
         lastRecoveryFinishedAtUptime: lastFinishedAtUptime)
@@ -5018,6 +5019,402 @@ do {
         "P-B15 depth 33 must fail the nesting gate (B4)")
 }
 
+// =====================================================================
+// P7R6C-C1: the strict JSON validator is a total function. Any Data input
+// either validates or throws a typed error; it must never crash, never
+// force-unwrap, never read out of bounds.
+//
+// C1/C2 run only in the default host-test mode (no arguments). The
+// --recovery-fixtures and package-integrity modes below invoke this same
+// executable repeatedly; re-running the 16 MiB catalog tests on every
+// call would blow past CI wall-clock budgets.
+// =====================================================================
+if CommandLine.arguments.isEmpty {
+
+// U1: a scalar above U+10FFFF encoded as UTF-8 (F4 BF BF BF) inside a
+// JSON string must be rejected without trapping.
+do {
+    var u1 = Data("{\"value\":\"".utf8)
+    u1.append(contentsOf: [0xF4, 0xBF, 0xBF, 0xBF])
+    u1.append(Data("\"}".utf8))
+    do {
+        try StrictJSONKeyUniquenessValidator.validate(u1)
+        require(false, "C1-U1 scalar above U+10FFFF must be rejected")
+    }
+    catch let error as StrictJSONValidationError {
+        switch error {
+        case .invalidUTF8, .scalarOutOfRange:
+            break
+        default:
+            require(false, "C1-U1 unexpected error code: \(error)")
+        }
+    }
+}
+
+// U2: a UTF-16 surrogate encoded as UTF-8 (ED A0 80) must be rejected.
+do {
+    var u2 = Data("{\"value\":\"".utf8)
+    u2.append(contentsOf: [0xED, 0xA0, 0x80])
+    u2.append(Data("\"}".utf8))
+    do {
+        try StrictJSONKeyUniquenessValidator.validate(u2)
+        require(false, "C1-U2 surrogate UTF-8 must be rejected")
+    }
+    catch let error as StrictJSONValidationError {
+        switch error {
+        case .invalidUTF8, .scalarOutOfRange:
+            break
+        default:
+            require(false, "C1-U2 unexpected error code: \(error)")
+        }
+    }
+}
+
+// U3: overlong encodings (C0 AF and E0 80 AF) must be rejected.
+do {
+    for bytes in [[0xC0, 0xAF] as [UInt8], [0xE0, 0x80, 0xAF] as [UInt8]] {
+        var u3 = Data("{\"value\":\"".utf8)
+        u3.append(contentsOf: bytes)
+        u3.append(Data("\"}".utf8))
+        do {
+            try StrictJSONKeyUniquenessValidator.validate(u3)
+            require(false, "C1-U3 overlong encoding must be rejected")
+        }
+        catch let error as StrictJSONValidationError {
+            switch error {
+            case .invalidUTF8, .scalarOutOfRange:
+                break
+            default:
+                require(false, "C1-U3 unexpected error code: \(error)")
+            }
+        }
+    }
+}
+
+// U4: a bad continuation byte (E2 28 A1) must be rejected.
+do {
+    var u4 = Data("{\"value\":\"".utf8)
+    u4.append(contentsOf: [0xE2, 0x28, 0xA1])
+    u4.append(Data("\"}".utf8))
+    do {
+        try StrictJSONKeyUniquenessValidator.validate(u4)
+        require(false, "C1-U4 bad continuation must be rejected")
+    }
+    catch let error as StrictJSONValidationError {
+        switch error {
+        case .invalidUTF8:
+            break
+        default:
+            require(false, "C1-U4 unexpected error code: \(error)")
+        }
+    }
+}
+
+// U5: truncated 2/3/4-byte sequences must be rejected.
+do {
+    for bytes in [[0xC2] as [UInt8], [0xE2, 0x82] as [UInt8],
+                  [0xF0, 0x9F, 0x92] as [UInt8]] {
+        var u5 = Data("{\"value\":\"".utf8)
+        u5.append(contentsOf: bytes)
+        u5.append(Data("\"}".utf8))
+        do {
+            try StrictJSONKeyUniquenessValidator.validate(u5)
+            require(false, "C1-U5 truncated sequence must be rejected")
+        }
+        catch let error as StrictJSONValidationError {
+            switch error {
+            case .invalidUTF8:
+                break
+            default:
+                require(false, "C1-U5 unexpected error code: \(error)")
+            }
+        }
+    }
+}
+
+// U6: an unpaired high surrogate escape must not crash the scanner.
+do {
+    let u6 = Data("{\"value\":\"\\uD800\"}".utf8)
+    do {
+        try StrictJSONKeyUniquenessValidator.validate(u6)
+    }
+    catch let error as StrictJSONValidationError {
+        switch error {
+        case .unpairedHighSurrogate, .invalidUnicodeEscape, .invalidUTF8:
+            break
+        default:
+            require(false, "C1-U6 unexpected error code: \(error)")
+        }
+    }
+}
+
+// U7: an unpaired low surrogate escape must not crash the scanner.
+do {
+    let u7 = Data("{\"value\":\"\\uDC00\"}".utf8)
+    do {
+        try StrictJSONKeyUniquenessValidator.validate(u7)
+    }
+    catch let error as StrictJSONValidationError {
+        switch error {
+        case .unpairedLowSurrogate, .invalidUnicodeEscape, .invalidUTF8:
+            break
+        default:
+            require(false, "C1-U7 unexpected error code: \(error)")
+        }
+    }
+}
+
+// U8: a legal surrogate pair passes the duplicate-key scanner.
+do {
+    let u8 = Data("{\"value\":\"\\uD83D\\uDE00\"}".utf8)
+    try StrictJSONKeyUniquenessValidator.validate(u8)
+}
+
+// U10/TJ9: deterministic fuzz. 10,000 random byte arrays of length 0..4096
+// must only ever return or throw; the process must never crash.
+do {
+    var state: UInt64 = 0x9E3779B97F4A7C15
+    func nextRandom() -> UInt64 {
+        state ^= state << 13
+        state ^= state >> 7
+        state ^= state << 17
+        return state
+    }
+    for _ in 0..<10_000 {
+        let length = Int(nextRandom() % 4097)
+        var data = Data(capacity: length)
+        for _ in 0..<length {
+            data.append(UInt8(truncatingIfNeeded: nextRandom()))
+        }
+        do {
+            try StrictJSONKeyUniquenessValidator.validate(data)
+        }
+        catch {
+            // Any typed error is acceptable; a crash is not.
+        }
+    }
+}
+
+// U9/TJ10: an invalid UTF-8 localized_price_tags.json must become a stable
+// finalization blocker, never a process crash, and finalization must fail
+// closed.
+do {
+    let directory = try p7r6FreshDirectory("c1-u9")
+    _ = try p7r6WriteBaseBundle(in: directory)
+    var invalidTags = Data("[\"value\":\"".utf8)
+    invalidTags.append(contentsOf: [0xF4, 0xBF, 0xBF, 0xBF])
+    invalidTags.append(Data("\"]".utf8))
+    try invalidTags.write(
+        to: directory.appendingPathComponent("localized_price_tags.json"))
+    let blockers = LocalizationEvidenceBundleValidator.blockers(
+        in: directory,
+        expectation: p7r6BundleExpectation(recoveryCount: 0))
+    require(
+        blockers.contains {
+            $0.contains("localized_price_tags")
+                && $0.contains("invalid_json_array")
+        },
+        "C1-U9 invalid UTF-8 tag file must become a stable blocker: "
+            + "\(blockers)")
+}
+
+// =====================================================================
+// P7R6C-C2: the strict scanner must not reject a large legal tag array.
+// The old fixed 1,000,000-token cap wrongly rejected legal catalogs; the
+// new progress bound is derived from the byte count.
+// =====================================================================
+
+/// Writes a valid localized_price_tags.json array with the given tag
+/// count and returns the finalization blockers for that bundle.
+func p7r6TagsBlockers(tagCount: Int, mutateLast: (inout String) -> Void = { _ in })
+    throws -> [String] {
+    let directory = try p7r6FreshDirectory("c2-tags")
+    _ = try p7r6WriteBaseBundle(in: directory)
+    var lines: [String] = []
+    lines.reserveCapacity(tagCount)
+    for index in 0..<tagCount {
+        var tag = "{\"format\":\"MarketScannerLocalizedPriceTag\","
+            + "\"version\":1,"
+            + "\"tracking_session_id\":\"session-a\","
+            + "\"prior_map_id\":\"map-a\","
+            + "\"prior_map_sha256\":\"\(p7r6aIdentitySha())\","
+            + "\"floor_id\":\"1\","
+            + "\"tag_id\":\"t\(index)\",\"observation_id\":\"o\(index)\","
+            + "\"payload\":\"p\",\"symbology\":\"CODE128\","
+            + "\"timestamp\":\(1.0 + Double(index)),"
+            + "\"localization_confidence\":0.9,"
+            + "\"measurement_confidence\":0.9,"
+            + "\"association_confidence\":0.9,"
+            + "\"measurement_method\":\"manual\","
+            + "\"needs_review\":false,\"user_confirmed\":true}"
+        if index == tagCount - 1 {
+            mutateLast(&tag)
+        }
+        lines.append(tag)
+    }
+    let payload = Data(("[" + lines.joined(separator: ",") + "]").utf8)
+    try payload.write(
+        to: directory.appendingPathComponent("localized_price_tags.json"))
+    return LocalizationEvidenceBundleValidator.blockers(
+        in: directory,
+        expectation: p7r6BundleExpectation(
+            recoveryCount: 0,
+            localizedPriceTagCount: tagCount))
+}
+
+// L1: 10,000 tags must finalize cleanly (no token-cap rejection).
+do {
+    let blockers = try p7r6TagsBlockers(tagCount: 10_000)
+    require(
+        blockers.isEmpty,
+        "C2-L1 10,000 tags must finalize cleanly: \(blockers)")
+}
+
+// L2: 30,000 tags must finalize cleanly.
+do {
+    let blockers = try p7r6TagsBlockers(tagCount: 30_000)
+    require(
+        blockers.isEmpty,
+        "C2-L2 30,000 tags must finalize cleanly: \(blockers)")
+}
+
+// L3: the largest legal tag catalog that fits inside the frozen 16 MiB
+// file limit must not be rejected by any scanner token cap. A per-byte
+// progress bound replaced the old fixed 1,000,000-token cap.
+do {
+    let directory = try p7r6FreshDirectory("c2-l3")
+    _ = try p7r6WriteBaseBundle(in: directory)
+    func minimalTag(_ index: Int) -> String {
+        return "{\"format\":\"MarketScannerLocalizedPriceTag\","
+            + "\"version\":1,"
+            + "\"tracking_session_id\":\"session-a\","
+            + "\"prior_map_id\":\"map-a\","
+            + "\"prior_map_sha256\":\"\(p7r6aIdentitySha())\","
+            + "\"floor_id\":\"1\","
+            + "\"tag_id\":\"t\(index)\",\"observation_id\":\"o\(index)\","
+            + "\"payload\":\"p\",\"symbology\":\"CODE128\","
+            + "\"timestamp\":\(1.0 + Double(index)),"
+            + "\"localization_confidence\":0.9,"
+            + "\"measurement_confidence\":0.9,"
+            + "\"association_confidence\":0.9,"
+            + "\"measurement_method\":\"manual\","
+            + "\"needs_review\":false,\"user_confirmed\":true}"
+    }
+    // Accumulate records until the next one would exceed 16 MiB: the
+    // largest count that still fits the frozen file limit, accounting for
+    // the array brackets and inter-record commas.
+    var payload = Data("[".utf8)
+    var fittingCount = 0
+    while payload.count < RecoveryLifecycleEvidenceLimits.maximumFileBytes {
+        let candidate = minimalTag(fittingCount)
+        let candidateCount = payload.count
+            + candidate.utf8.count
+            + (fittingCount == 0 ? 1 : 2) // "[" or "," before the record
+        if candidateCount >= RecoveryLifecycleEvidenceLimits.maximumFileBytes {
+            break
+        }
+        if fittingCount > 0 {
+            payload.append(Data(",".utf8))
+        }
+        payload.append(Data(candidate.utf8))
+        fittingCount += 1
+    }
+    payload.append(Data("]".utf8))
+    try payload.write(
+        to: directory.appendingPathComponent("localized_price_tags.json"))
+    require(
+        fittingCount >= 30_000,
+        "C2-L3 the 16 MiB budget must hold at least 30,000 minimal tags "
+            + "(fits \(fittingCount))")
+    let blockers = LocalizationEvidenceBundleValidator.blockers(
+        in: directory,
+        expectation: p7r6BundleExpectation(
+            recoveryCount: 0,
+            localizedPriceTagCount: fittingCount))
+    require(
+        blockers.isEmpty,
+        "C2-L3 \(fittingCount) tags within the 16 MiB limit "
+            + "must finalize cleanly: \(blockers)")
+}
+
+// L5: a duplicate key in the LAST tag must still be detected; the scanner
+// must never stop scanning early just because the file is large.
+do {
+    let blockers = try p7r6TagsBlockers(tagCount: 10_000) { tag in
+        tag = "{\"format\":\"MarketScannerLocalizedPriceTag\","
+            + "\"format\":\"MarketScannerLocalizedPriceTag\","
+            + "\"version\":1,"
+            + "\"tracking_session_id\":\"session-a\","
+            + "\"prior_map_id\":\"map-a\","
+            + "\"prior_map_sha256\":\"\(p7r6aIdentitySha())\","
+            + "\"floor_id\":\"1\","
+            + "\"tag_id\":\"t-last\",\"observation_id\":\"o-last\","
+            + "\"payload\":\"p\",\"symbology\":\"CODE128\","
+            + "\"timestamp\":1.0,\"localization_confidence\":0.9,"
+            + "\"measurement_confidence\":0.9,"
+            + "\"association_confidence\":0.9,"
+            + "\"measurement_method\":\"manual\","
+            + "\"needs_review\":false,\"user_confirmed\":true}"
+    }
+    require(
+        blockers.contains {
+            $0.contains("localized_price_tags")
+                && $0.contains("duplicate_json_key")
+        },
+        "C2-L5 duplicate key in the last tag must be detected: \(blockers)")
+}
+
+// L6: a numeric boolean in the LAST tag must be rejected.
+do {
+    let blockers = try p7r6TagsBlockers(tagCount: 10_000) { tag in
+        tag = "{\"format\":\"MarketScannerLocalizedPriceTag\","
+            + "\"version\":1,"
+            + "\"tracking_session_id\":\"session-a\","
+            + "\"prior_map_id\":\"map-a\","
+            + "\"prior_map_sha256\":\"\(p7r6aIdentitySha())\","
+            + "\"floor_id\":\"1\","
+            + "\"tag_id\":\"t-last\",\"observation_id\":\"o-last\","
+            + "\"payload\":\"p\",\"symbology\":\"CODE128\","
+            + "\"timestamp\":1.0,\"localization_confidence\":0.9,"
+            + "\"measurement_confidence\":0.9,"
+            + "\"association_confidence\":0.9,"
+            + "\"measurement_method\":\"manual\","
+            + "\"needs_review\":1,\"user_confirmed\":true}"
+    }
+    require(
+        blockers.contains {
+            $0.contains("localized_price_tags")
+                && $0.contains("tag_business_schema_invalid")
+        },
+        "C2-L6 numeric boolean in the last tag must be rejected: \(blockers)")
+}
+
+// L4: a 16 MiB + 1 byte tag file must fail the frozen file-size limit
+// instead of being scanned or parsed.
+do {
+    let directory = try p7r6FreshDirectory("c2-l4")
+    _ = try p7r6WriteBaseBundle(in: directory)
+    var oversized = Data(
+        repeating: 0x20,
+        count: RecoveryLifecycleEvidenceLimits.maximumFileBytes + 1)
+    oversized.append(Data("[0]".utf8))
+    try oversized.write(
+        to: directory.appendingPathComponent("localized_price_tags.json"))
+    let blockers = LocalizationEvidenceBundleValidator.blockers(
+        in: directory,
+        expectation: p7r6BundleExpectation(recoveryCount: 0))
+    require(
+        blockers.contains {
+            $0.contains("localized_price_tags")
+                && ($0.contains("file_identity_changed_or_size_limit")
+                    || $0.contains("file_size_limit")
+                    || $0.contains("invalid_json_array"))
+        },
+        "C2-L4 a 16 MiB+1 tag file must fail the size limit: \(blockers)")
+}
+
+} // end of C1/C2 default-mode-only host tests
+
 // P7R6A fixture alignment mode: classifies every shared recovery fixture
 // through the device-side strict parser and prints "<name> <category>" so
 // the Python test can assert the Swift parser and the PC reader agree.
@@ -5069,6 +5466,66 @@ if CommandLine.arguments.count == 2 {
     catch {
         FileHandle.standardError.write(Data("Package integrity failed: \(error)\n".utf8))
         exit(2)
+    }
+}
+
+// P7R6C-C3: integrity-suite mode validates a batch of package directories
+// in ONE executable invocation. The root contains subdirectories named
+// "<case>.<expected>" where expected is "pass" or "fail"; the harness
+// verifies every case against the snapshot validator without re-launching
+// the process (CI wall-clock budgets otherwise get blown by repeated
+// process starts).
+if CommandLine.arguments.count == 3,
+   CommandLine.arguments[1] == "--integrity-suite" {
+    do {
+        let root = URL(
+            fileURLWithPath: CommandLine.arguments[2],
+            isDirectory: true)
+        let entries = try FileManager.default.contentsOfDirectory(
+            at: root,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: [])
+        var failed: [String] = []
+        for entry in entries.sorted(by: { $0.lastPathComponent < $1.lastPathComponent }) {
+            guard (try? entry.resourceValues(
+                forKeys: [.isDirectoryKey]).isDirectory) == true else {
+                continue
+            }
+            let name = entry.lastPathComponent
+            let expected: Bool
+            if name.hasSuffix(".pass") {
+                expected = true
+            }
+            else if name.hasSuffix(".fail") {
+                expected = false
+            }
+            else {
+                continue
+            }
+            do {
+                _ = try PriorMapPackageIntegrity.validate(directory: entry)
+                if !expected {
+                    failed.append("\(name): expected fail but passed")
+                }
+            }
+            catch {
+                if expected {
+                    failed.append("\(name): expected pass but failed: \(error)")
+                }
+            }
+        }
+        guard failed.isEmpty else {
+            FileHandle.standardError.write(
+                Data(("Integrity suite failures:\n"
+                    + failed.joined(separator: "\n") + "\n").utf8))
+            exit(5)
+        }
+        print("Integrity suite passed")
+    }
+    catch {
+        FileHandle.standardError.write(
+            Data("Integrity suite failed: \(error)\n".utf8))
+        exit(5)
     }
 }
 
