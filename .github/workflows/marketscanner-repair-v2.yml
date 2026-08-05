@@ -379,6 +379,8 @@ jobs:
             app/ios/RTABMapApp/RecoveryLifecycleEvidenceParser.swift \
             app/ios/RTABMapApp/StrictJSONScalar.swift \
             app/ios/RTABMapApp/StrictJSONKeyUniquenessValidator.swift \
+            app/ios/RTABMapApp/StrictJSONDocumentParser.swift \
+            app/ios/RTABMapApp/PriorMapPackageSnapshotCore.swift \
             app/ios/RTABMapApp/PriorMapLocalizationCore.swift \
             app/ios/RTABMapApp/PriorMapLocalization.swift \
             app/ios/RTABMapApp/PriceTagLocalizationCore.swift \
@@ -387,7 +389,7 @@ jobs:
             app/ios/RTABMapApp/RTABMap.swift
       - name: Run platform-independent iOS contract test
         id: swift_contracts
-        run: python3 -m unittest tools.PriorMap.tests.test_prior_map.IOSCoreContractTests -v
+        run: python3 -m unittest tools.PriorMap.tests.test_prior_map.IOSCoreContractTests tools.PriorMap.tests.test_c4_session_input_snapshot -v
       - name: Validate Xcode project metadata
         id: xcode_list
         run: xcodebuild -project app/ios/RTABMapApp.xcodeproj -list
