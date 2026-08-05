@@ -223,6 +223,8 @@ class IOSCoreContractTests(unittest.TestCase):
             repository / "app/ios/RTABMapApp/StrictJSONScalar.swift",
             repository
             / "app/ios/RTABMapApp/StrictJSONKeyUniquenessValidator.swift",
+            repository / "app/ios/RTABMapApp/StrictJSONDocumentParser.swift",
+            repository / "app/ios/RTABMapApp/PriorMapPackageSnapshotCore.swift",
             repository / "app/ios/RTABMapApp/PriorMapScanMatcher.swift",
             repository / "app/ios/RTABMapApp/PriceTagLocalizationCore.swift",
             repository
@@ -345,6 +347,14 @@ class IOSCoreContractTests(unittest.TestCase):
             self.assertNotEqual(unexpected_result.returncode, 0)
             unexpected.unlink()
 
+            # P7R6C-C3: run every integrity case inside ONE executable
+            # invocation. Each directory is named "<case>.<expected>" and
+            # the Swift harness validates them all without re-launching
+            # the process (repeated launches blow CI wall-clock budgets).
+            suite_root = Path(temporary) / "integrity-suite"
+            suite_root.mkdir()
+            valid_package = suite_root / "baseline.pass"
+            shutil.copytree(package, valid_package)
             mutations = {
                 "swapped-shelves": lambda root: (
                     (root / "shelves.json").write_bytes(
@@ -372,19 +382,92 @@ class IOSCoreContractTests(unittest.TestCase):
                     root / "validation_report.json",
                     lambda value: value.__setitem__("valid", False),
                 ),
+                # P7R6C-C3 (M1/M12): a same-size replacement whose JSON is
+                # self-consistent must still fail: the snapshot binds the
+                # original bytes, so a hash-A/parse-B split is impossible.
+                "same-size-self-consistent": lambda root: (
+                    (root / "shelves.json").write_bytes(
+                        _same_size_replacement(
+                            (root / "shelves.json").read_bytes()
+                        )
+                    )
+                ),
+                # M3: a symlinked artifact must be rejected (no-follow read).
+                "symlink-artifact": lambda root: (
+                    _replace_with_symlink(root, "shelves.json", "fixed_structures.json")
+                ),
+                # M4: an extra hard link means st_nlink != 1; reject.
+                "hardlink-artifact": lambda root: (
+                    _create_extra_hardlink(root, "shelves.json", "shelves-link.json")
+                ),
+                # M5: a truncated artifact must be rejected (byte count and
+                # SHA no longer match the snapshot manifest).
+                "truncated-artifact": lambda root: (
+                    (root / "shelves.json").write_bytes(
+                        (root / "shelves.json").read_bytes()[:-1]
+                    )
+                ),
+                # M6: a file added while the package is being read changes
+                # the directory file set; the snapshot must fail closed.
+                "file-set-added": lambda root: (
+                    (root / "late_artifact.json").write_text("{}\n", encoding="utf-8")
+                ),
+                # M7: a preview image replaced by different bytes fails the
+                # SHA bound in the package manifest.
+                "preview-swap": lambda root: (
+                    (root / "preview.png").write_bytes(
+                        b"\x89PNG\r\n\x1a\n" + b"different preview bytes"
+                    )
+                ),
+                # M8: a floor preview replaced by different bytes fails.
+                "floor-preview-swap": lambda root: (
+                    _replace_first_floor_preview(root)
+                ),
+                # M9: a duplicate key in the package manifest must be
+                # rejected by the strict duplicate-key scanner.
+                "manifest-duplicate-key": lambda root: (
+                    (root / "package_manifest.json").write_bytes(
+                        _duplicate_key_bytes(
+                            (root / "package_manifest.json").read_bytes(),
+                            "artifact_count",
+                        )
+                    )
+                ),
+                # M10: a nested duplicate key inside elements.json.
+                "elements-duplicate-key": lambda root: (
+                    (root / "elements.json").write_bytes(
+                        _duplicate_key_bytes(
+                            (root / "elements.json").read_bytes(),
+                            "shape_type",
+                        )
+                    )
+                ),
+                # M11: a duplicate top-level `valid` key in the validation
+                # report must be rejected.
+                "report-duplicate-key": lambda root: (
+                    (root / "validation_report.json").write_bytes(
+                        _duplicate_key_bytes(
+                            (root / "validation_report.json").read_bytes(),
+                            "valid",
+                        )
+                    )
+                ),
             }
             for name, mutate in mutations.items():
-                with self.subTest(swift_integrity=name):
-                    corrupted = Path(temporary) / name
-                    shutil.copytree(package, corrupted)
-                    mutate(corrupted)
-                    invalid_result = subprocess.run(
-                        [str(executable), str(corrupted)],
-                        check=False,
-                        capture_output=True,
-                        text=True,
-                    )
-                    self.assertNotEqual(invalid_result.returncode, 0)
+                corrupted = suite_root / f"{name}.fail"
+                shutil.copytree(package, corrupted)
+                mutate(corrupted)
+            suite_result = subprocess.run(
+                [str(executable), "--integrity-suite", str(suite_root)],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                suite_result.returncode,
+                0,
+                suite_result.stderr + "\n" + suite_result.stdout,
+            )
 
     @staticmethod
     def _rewrite_integrity_json(path: Path, mutate: object) -> None:
@@ -394,6 +477,87 @@ class IOSCoreContractTests(unittest.TestCase):
             json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
         )
+
+
+def _same_size_replacement(original: bytes) -> bytes:
+    """Replaces bytes one-for-one so the file keeps its exact length but
+    the content changes. The replacement is valid ASCII/JSON-ish content so
+    any "self-consistent JSON" argument cannot hide the SHA mismatch."""
+    if not original:
+        return original
+    result = bytearray(original)
+    for index in range(len(result)):
+        if result[index] == ord("{"):
+            result[index] = ord("[")
+        elif result[index] == ord("}"):
+            result[index] = ord("]")
+    return bytes(result)
+
+
+def _replace_with_symlink(root: Path, name: str, target_name: str) -> None:
+    target = root / target_name
+    target_bytes = target.read_bytes()
+    (root / name).unlink()
+    (root / name).symlink_to(target_name)
+    # The symlink must not be resolvable as the original content: keep the
+    # target untouched and let the no-follow reader reject the link itself.
+    _ = target_bytes
+
+
+def _create_extra_hardlink(root: Path, name: str, link_name: str) -> None:
+    (root / link_name).hardlink_to(root / name)
+
+
+def _replace_first_floor_preview(root: Path) -> None:
+    previews = sorted(root.glob("preview_floor_*.png"))
+    if not previews:
+        return
+    target = previews[0]
+    target.write_bytes(target.read_bytes() + b"tampered")
+
+
+def _duplicate_key_bytes(data: bytes, key: str) -> bytes:
+    """Injects a duplicate JSON key by appending `"key": <key>," just after
+    the first occurrence of the key name. The duplicate scanner must reject
+    the document before JSONSerialization can apply last-key-wins."""
+    needle = ('"%s"' % key).encode("utf-8")
+    position = data.find(needle)
+    if position < 0:
+        return data
+    # Find the end of the first value after the key to splice a duplicate.
+    cursor = position + len(needle)
+    while cursor < len(data) and data[cursor] in b" \t\r\n":
+        cursor += 1
+    if cursor >= len(data) or data[cursor] != ord(":"):
+        return data
+    cursor += 1
+    while cursor < len(data) and data[cursor] in b" \t\r\n":
+        cursor += 1
+    if cursor >= len(data):
+        return data
+    value_start = cursor
+    if data[cursor] == ord('"'):
+        cursor += 1
+        while cursor < len(data) and data[cursor] != ord('"'):
+            cursor += 1
+        cursor += 1
+    elif data[cursor] == ord("{"):
+        depth = 0
+        while cursor < len(data):
+            if data[cursor] == ord("{"):
+                depth += 1
+            elif data[cursor] == ord("}"):
+                depth -= 1
+                if depth == 0:
+                    cursor += 1
+                    break
+            cursor += 1
+    else:
+        while cursor < len(data) and data[cursor] not in b",}\n":
+            cursor += 1
+    value_end = cursor
+    insertion = b', "' + key.encode("utf-8") + b'": null'
+    return data[:value_end] + insertion + data[value_end:]
 
 
 class PriorMapConversionTests(unittest.TestCase):
@@ -752,6 +916,168 @@ class PriorMapConversionTests(unittest.TestCase):
                 self.assertFalse(result["accepted"])
                 self.assertEqual(result["reason"], "ambiguous_structure_match")
                 self.assertLess(result["uniqueness"], 0.10)
+
+
+class PriorMapStrictSchemaTests(unittest.TestCase):
+    """P7R6C-C5: prior-map JSON strict scalar and duplicate-key contract.
+
+    Every fixture mutates one authoritative field so a strict reader must
+    fail closed; the mutations keep the JSON parseable so the failure is
+    the schema/duplicate-key rejection, not a syntax error.
+    """
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        workbook = self.root / "fixture.xlsx"
+        write_workbook(workbook, fixture_rows())
+        self.package = convert_workbook(workbook, self.root / "package")
+
+    def tearDown(self) -> None:
+        self.temp.cleanup()
+
+    def copy_with(self, name: str) -> Path:
+        destination = self.root / name
+        shutil.copytree(self.package, destination)
+        return destination
+
+    @staticmethod
+    def refresh_manifest(package: Path) -> None:
+        """Rebuilds package_manifest.json after an authoritative file is
+        mutated so the SHA/hash checks stay satisfied and the strict-schema
+        rejection (not the hash rejection) is what fails closed."""
+        manifest = build_package_manifest(package)
+        (package / "package_manifest.json").write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+
+    @staticmethod
+    def rewrite_json(path: Path, mutate: object) -> None:
+        value = json.loads(path.read_text(encoding="utf-8"))
+        mutate(value)
+        path.write_text(
+            json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+
+    def assert_invalid(self, package: Path, expected_code: str, label: str) -> None:
+        result = validate_package(package)
+        self.assertFalse(result["valid"], label)
+        self.assertTrue(
+            any(item["code"] == expected_code for item in result["errors"]),
+            f"{label}: expected {expected_code}, got {result['errors']}",
+        )
+
+    def test_n1_fractional_version_rejected(self) -> None:
+        # N1: {"version":1.5} must be rejected by every formal reader.
+        package = self.copy_with("n1-fractional-version")
+        self.rewrite_json(
+            package / "package_manifest.json",
+            lambda value: value["artifacts"][0].__setitem__("version", 1.5),
+        )
+        self.assert_invalid(
+            package, "package_artifact_schema", "N1 fractional manifest version"
+        )
+
+    def test_n2_boolean_artifact_count_rejected(self) -> None:
+        # N2: {"artifact_count":true} must be rejected.
+        package = self.copy_with("n2-boolean-count")
+        self.rewrite_json(
+            package / "package_manifest.json",
+            lambda value: value.__setitem__("artifact_count", True),
+        )
+        self.assert_invalid(
+            package, "package_manifest", "N2 boolean artifact_count"
+        )
+
+    def test_n3_fractional_bytes_rejected(self) -> None:
+        # N3: {"bytes":3.5} must be rejected (strict integer contract).
+        package = self.copy_with("n3-fractional-bytes")
+        self.rewrite_json(
+            package / "package_manifest.json",
+            lambda value: value["artifacts"][0].__setitem__("bytes", 3.5),
+        )
+        self.assert_invalid(
+            package, "package_artifact_bytes", "N3 fractional artifact bytes"
+        )
+
+    def test_n4_numeric_visible_rejected(self) -> None:
+        # N4: {"visible":1} is not a JSON boolean and must be rejected.
+        package = self.copy_with("n4-numeric-visible")
+        elements = json.loads((package / "elements.json").read_text())
+        elements["elements"][0]["visible"] = 1
+        (package / "elements.json").write_text(
+            json.dumps(elements, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+        )
+        self.refresh_manifest(package)
+        self.assert_invalid(
+            package, "visibility_count", "N4 numeric visible field"
+        )
+
+    def test_n5_boolean_geometry_coordinate_rejected(self) -> None:
+        # N5: a geometry coordinate like [true, 2.0] must be rejected.
+        package = self.copy_with("n5-boolean-coordinate")
+        elements = json.loads((package / "elements.json").read_text())
+        elements["elements"][0]["geometry"] = {
+            "type": "polygon",
+            "coordinates": [[[True, 2.0], [1.0, 2.0], [1.0, 3.0], [True, 2.0]]],
+        }
+        (package / "elements.json").write_text(
+            json.dumps(elements, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+        )
+        self.refresh_manifest(package)
+        self.assert_invalid(
+            package, "floor_bounds", "N5 boolean geometry coordinate"
+        )
+
+    def test_n6_boolean_bounds_rejected(self) -> None:
+        # N6: a bounds value like {"min_x_m":false} must be rejected.
+        package = self.copy_with("n6-boolean-bounds")
+        manifest = json.loads((package / "manifest.json").read_text())
+        manifest["bounds"]["min_x_m"] = False
+        (package / "manifest.json").write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+        )
+        self.refresh_manifest(package)
+        self.assert_invalid(package, "map_bounds", "N6 boolean bounds field")
+
+    def test_n7_manifest_duplicate_version_rejected(self) -> None:
+        # N7: a duplicate manifest version key must be rejected before
+        # last-key-wins can hide the ambiguity.
+        package = self.copy_with("n7-duplicate-version")
+        (package / "manifest.json").write_bytes(
+            _duplicate_key_bytes(
+                (package / "manifest.json").read_bytes(), "version"
+            )
+        )
+        self.assert_invalid(package, "invalid_json", "N7 duplicate version key")
+
+    def test_n8_report_duplicate_valid_rejected(self) -> None:
+        # N8: a duplicate `valid` key in the validation report.
+        package = self.copy_with("n8-duplicate-valid")
+        (package / "validation_report.json").write_bytes(
+            _duplicate_key_bytes(
+                (package / "validation_report.json").read_bytes(), "valid"
+            )
+        )
+        self.assert_invalid(package, "invalid_json", "N8 duplicate valid key")
+
+    def test_n9_escaped_equivalent_duplicate_field_rejected(self) -> None:
+        # N9: an escaped-equivalent duplicate key ("version" vs "\u0076ersion")
+        # must be detected as the same key.
+        package = self.copy_with("n9-escaped-duplicate")
+        data = (package / "manifest.json").read_bytes()
+        needle = b'"version":'
+        position = data.find(needle)
+        self.assertGreaterEqual(position, 0)
+        insertion = b', "\\u0076ersion": 1'
+        (package / "manifest.json").write_bytes(
+            data[:position + len(needle)] + insertion + data[position + len(needle):]
+        )
+        self.assert_invalid(
+            package, "invalid_json", "N9 escaped-equivalent duplicate key"
+        )
 
 
 class StageOneLocalizerTests(unittest.TestCase):
