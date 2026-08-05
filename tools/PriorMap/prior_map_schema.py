@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+
+from .strict_json import StrictJSONError, load_strict_json_bytes
 import hashlib
 import math
 import struct
@@ -208,9 +210,13 @@ def _validate_package_manifest(
 
 
 def load_json(path: Path) -> Any:
+    """Read one formal prior-map JSON document with the shared strict
+    contract (P7R6C): strict UTF-8, no NaN/Infinity, duplicate keys
+    rejected before last-key-wins parsing."""
+
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        return load_strict_json_bytes(path.read_bytes(), name=path.name)
+    except (OSError, StrictJSONError) as exc:
         raise PriorMapValidationError(f"Cannot read valid JSON from {path.name}: {exc}") from exc
 
 

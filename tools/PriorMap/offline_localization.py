@@ -22,10 +22,18 @@ import re
 import shutil
 import sqlite3
 import stat
+import tempfile
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Iterable, Sequence
 
+from .strict_json import (
+    DuplicateJSONKeyError,
+    json_nesting_depth,
+    load_strict_json_bytes,
+    reject_duplicate_object_pairs,
+    reject_nonfinite_json,
+)
 from .localized_output_store import LocalizedVersionStore
 from .prior_map_schema import load_json, validate_package
 from .factor_graph_runner import FactorGraphRunnerError, run_relative_se2_factor_graph
@@ -239,6 +247,69 @@ def _regular_file_identity(path: Path, role: str) -> dict[str, Any]:
     }
 
 
+def _stable_read_bytes(
+    path: Path, role: str, *, maximum_bytes: int | None = None
+) -> tuple[bytes, dict[str, Any]]:
+    """Read one formal input exactly once through a no-follow descriptor.
+
+    P7R6C: the bytes returned here are the bytes that are hashed and the
+    bytes that are parsed. The descriptor identity is checked before and
+    after the read (regular file, no symlink, single hard link, size
+    bound), so a mid-read replacement, truncation or link attack fails
+    closed instead of producing hash-A/parse-B evidence.
+    """
+
+    try:
+        path_before = path.lstat()
+        if not stat.S_ISREG(path_before.st_mode):
+            raise OfflineLocalizationError(
+                f"Session input {role} must be a regular file: {path.name}"
+            )
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(path, flags)
+        with os.fdopen(descriptor, "rb") as handle:
+            before = os.fstat(handle.fileno())
+            if maximum_bytes is not None and before.st_size > maximum_bytes:
+                raise OfflineLocalizationError(
+                    f"Session input {role} exceeds its safety limit: {path.name}"
+                )
+            data = handle.read()
+            digest = hashlib.sha256(data)
+            after = os.fstat(handle.fileno())
+        path_after = path.lstat()
+    except OfflineLocalizationError:
+        raise
+    except FileNotFoundError as exc:
+        raise OfflineLocalizationError(
+            f"Required sidecar {path.name} is missing."
+        ) from exc
+    except OSError as exc:
+        raise OfflineLocalizationError(
+            f"Session input {role} could not be read safely: {path.name}"
+        ) from exc
+    if (
+        not stat.S_ISREG(before.st_mode)
+        or not stat.S_ISREG(path_after.st_mode)
+        or before.st_nlink != 1
+        or (path_before.st_dev, path_before.st_ino, path_before.st_size)
+        != (before.st_dev, before.st_ino, before.st_size)
+        or (before.st_dev, before.st_ino, before.st_size)
+        != (after.st_dev, after.st_ino, after.st_size)
+        or (after.st_dev, after.st_ino, after.st_size)
+        != (path_after.st_dev, path_after.st_ino, path_after.st_size)
+        or len(data) != before.st_size
+    ):
+        raise OfflineLocalizationError(
+            f"Session input {role} changed while it was being read: {path.name}"
+        )
+    return data, {
+        "role": role,
+        "file": path.name,
+        "bytes": len(data),
+        "sha256": digest.hexdigest(),
+    }
+
+
 def session_input_bundle_sha256(payload: dict[str, Any]) -> str:
     """Validate and return the canonical finalized-session bundle identity."""
 
@@ -339,7 +410,10 @@ def build_session_input_manifest(
             )
     except OSError as exc:
         raise OfflineLocalizationError("Session input paths could not be resolved.") from exc
-    metadata = load_json(segment / "metadata.json")
+    # P7R6C: the manifest version decision and the metadata hash come from
+    # one descriptor-stable read of the same bytes.
+    metadata_bytes, _ = _stable_read_bytes(segment / "metadata.json", "metadata")
+    metadata = load_strict_json_bytes(metadata_bytes, name="metadata.json")
     capture_health = (
         metadata.get("captureHealth") if isinstance(metadata, dict) else None
     )
@@ -361,6 +435,14 @@ def build_session_input_manifest(
             for name in file_names[1:]
         ),
     ]
+    return _session_input_manifest_from_identities(
+        files, manifest_version
+    )
+
+
+def _session_input_manifest_from_identities(
+    files: list[dict[str, Any]], manifest_version: int
+) -> dict[str, Any]:
     manifest: dict[str, Any] = {
         "format": "MarketScannerLocalizedInputManifest",
         "version": manifest_version,
@@ -384,6 +466,225 @@ def build_session_input_manifest(
     ).hexdigest()
     session_input_bundle_sha256(manifest)
     return manifest
+
+
+@dataclass(frozen=True)
+class FinalizedSessionInputSnapshot:
+    """P7R6C: parse-and-hash-once view of a finalized session.
+
+    Every artifact is read exactly once through the stable descriptor
+    path; the parsed content below comes from the exact bytes that
+    produced the manifest identities, so the bundle SHA always describes
+    what localization actually consumed.
+    """
+
+    metadata: dict[str, Any]
+    metadata_bytes: bytes
+    source_database_sha256: str
+    jsonl_values: dict[str, list[dict[str, Any]]]
+    jsonl_diagnostics: dict[str, dict[str, Any]]
+    localized_tags_bytes: bytes
+    localized_tag_count: int
+    manifest: dict[str, Any]
+
+
+def read_finalized_session_input_snapshot(
+    segment: Path, source_database: Path
+) -> FinalizedSessionInputSnapshot:
+    """Read every authoritative finalized-session input exactly once:
+    stable descriptor read, hash and parse of the same bytes, manifest
+    built from the same identities."""
+
+    try:
+        if source_database.resolve().parent != segment.resolve():
+            raise OfflineLocalizationError(
+                "Source database must belong to the single finalized segment."
+            )
+    except OSError as exc:
+        raise OfflineLocalizationError("Session input paths could not be resolved.") from exc
+    metadata_bytes, metadata_identity = _stable_read_bytes(
+        segment / "metadata.json", "metadata"
+    )
+    metadata = load_strict_json_bytes(metadata_bytes, name="metadata.json")
+    if not isinstance(metadata, dict):
+        raise OfflineLocalizationError("Session metadata is invalid.")
+    capture_health = metadata.get("captureHealth")
+    recovery_bound = (
+        isinstance(capture_health, dict)
+        and "localizationRecoveryEventCount" in capture_health
+    )
+    manifest_version = 2 if recovery_bound else 1
+    file_names = (
+        SESSION_INPUT_FILE_NAMES_V2 if recovery_bound else SESSION_INPUT_FILE_NAMES_V1
+    )
+    session_id = str(metadata.get("trackingSessionId") or "")
+    map_hash = str(metadata.get("priorMapSha256") or "")
+    floor_id = str(metadata.get("floorId") or "")
+    database_identity = _regular_file_identity(source_database, "source_database")
+    files = [metadata_identity, database_identity]
+    jsonl_values: dict[str, list[dict[str, Any]]] = {}
+    jsonl_diagnostics: dict[str, dict[str, Any]] = {}
+    contracts = {
+        "localization_trace.jsonl": TRACE_CONTRACT,
+        "localization_constraints.jsonl": CONSTRAINT_CONTRACT,
+        "localization_events.jsonl": STATE_EVENT_CONTRACT,
+        "manual_localization_events.jsonl": MANUAL_EVENT_CONTRACT,
+    }
+    # localized_price_tags.json drives the tag-observation requirement;
+    # read its bytes first so the observation contract matches the real
+    # finalized content.
+    tags_bytes, tags_identity = _stable_read_bytes(
+        segment / "localized_price_tags.json",
+        "localized_price_tags.json",
+        maximum_bytes=128 * 1024 * 1024,
+    )
+    raw_tags = load_strict_json_bytes(
+        tags_bytes, name="localized_price_tags.json"
+    )
+    if not isinstance(raw_tags, list):
+        raise OfflineLocalizationError(
+            "localized_price_tags.json must be a bounded array."
+        )
+    jsonl_names = [name for name in file_names[1:] if name != "localized_price_tags.json"]
+    for name in jsonl_names:
+        if name == "localization_recovery_events.jsonl":
+            contract = (
+                RECOVERY_EVENT_CONTRACT
+                if recovery_bound
+                else replace(RECOVERY_EVENT_CONTRACT, required=False)
+            )
+        elif name == "tag_observations.jsonl":
+            contract = replace(
+                TAG_OBSERVATION_CONTRACT,
+                required=bool(raw_tags),
+                allow_empty=not bool(raw_tags),
+            )
+        else:
+            contract = contracts[name]
+        values, diagnostics, identity = _read_jsonl_stable(
+            segment / name,
+            contract,
+            session_id=session_id,
+            expected_map_hash=map_hash,
+            expected_floor_id=floor_id,
+        )
+        jsonl_values[name] = values
+        jsonl_diagnostics[name] = diagnostics
+        if identity:
+            # P7R6C: the manifest identity binds the exact bytes that were
+            # parsed; the role must be the canonical filename so the bundle
+            # SHA matches the manifest contract.
+            files.append(
+                {
+                    "role": name,
+                    "file": name,
+                    "bytes": identity["bytes"],
+                    "sha256": identity["sha256"],
+                }
+            )
+    if not recovery_bound:
+        # P7R6: legacy v1 sessions read the Recovery sidecar when it exists
+        # but never bind it into the manifest identity. The snapshot still
+        # parses it from stable bytes so the render consumes the same view.
+        recovery_path = segment / "localization_recovery_events.jsonl"
+        legacy_name = "localization_recovery_events.jsonl"
+        if recovery_path.is_file():
+            legacy_values, legacy_diagnostics, _legacy_identity = (
+                _read_jsonl_stable(
+                    recovery_path,
+                    replace(RECOVERY_EVENT_CONTRACT, required=False),
+                    session_id=session_id,
+                    expected_map_hash=map_hash,
+                    expected_floor_id=floor_id,
+                )
+            )
+        else:
+            legacy_values = []
+            legacy_diagnostics = {
+                "file": str(recovery_path),
+                "contract": RECOVERY_EVENT_CONTRACT.name,
+                "total_lines": 0,
+                "valid_records": 0,
+                "invalid_json_lines": 0,
+                "invalid_utf8_lines": 0,
+                "blank_lines": 0,
+                "non_object_lines": 0,
+                "oversized_lines": 0,
+                "format_mismatches": 0,
+                "version_mismatches": 0,
+                "session_mismatches": 0,
+                "map_hash_mismatches": 0,
+                "floor_mismatches": 0,
+                "timestamp_errors": 0,
+                "duplicate_ids": 0,
+            }
+        jsonl_values[legacy_name] = legacy_values
+        jsonl_diagnostics[legacy_name] = legacy_diagnostics
+    files.append(tags_identity)
+    manifest = _session_input_manifest_from_identities(files, manifest_version)
+    return FinalizedSessionInputSnapshot(
+        metadata=metadata,
+        metadata_bytes=metadata_bytes,
+        source_database_sha256=database_identity["sha256"],
+        jsonl_values=jsonl_values,
+        jsonl_diagnostics=jsonl_diagnostics,
+        localized_tags_bytes=tags_bytes,
+        localized_tag_count=len(raw_tags),
+        manifest=manifest,
+    )
+
+
+def _verified_source_database_copy(
+    source: Path, work_directory: Path, expected_sha256: str
+) -> Path:
+    """P7R6C 方案 A: copy the source database into a private work input
+    while hashing the same descriptor-stable bytes, verify the copy
+    matches the snapshot identity, and hand SQLite only the verified
+    immutable copy. The original database stays read-only."""
+
+    work_directory.mkdir(parents=True, exist_ok=True)
+    destination = work_directory / source.name
+    try:
+        path_before = source.lstat()
+        if not stat.S_ISREG(path_before.st_mode):
+            raise OfflineLocalizationError(
+                f"Source database must be a regular file: {source.name}"
+            )
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(source, flags)
+        digest = hashlib.sha256()
+        with os.fdopen(descriptor, "rb") as reader:
+            before = os.fstat(reader.fileno())
+            with destination.open("wb") as writer:
+                for chunk in iter(lambda: reader.read(1024 * 1024), b""):
+                    writer.write(chunk)
+                    digest.update(chunk)
+            after = os.fstat(reader.fileno())
+        path_after = source.lstat()
+    except OfflineLocalizationError:
+        raise
+    except OSError as exc:
+        raise OfflineLocalizationError(
+            f"Source database could not be copied safely: {source.name}"
+        ) from exc
+    if (
+        not stat.S_ISREG(before.st_mode)
+        or not stat.S_ISREG(path_after.st_mode)
+        or (path_before.st_dev, path_before.st_ino, path_before.st_size)
+        != (before.st_dev, before.st_ino, before.st_size)
+        or (before.st_dev, before.st_ino, before.st_size)
+        != (after.st_dev, after.st_ino, after.st_size)
+        or (after.st_dev, after.st_ino, after.st_size)
+        != (path_after.st_dev, path_after.st_ino, path_after.st_size)
+    ):
+        raise OfflineLocalizationError(
+            f"Source database changed while it was being copied: {source.name}"
+        )
+    if digest.hexdigest() != expected_sha256:
+        raise OfflineLocalizationError(
+            "Source database no longer matches the finalized input snapshot."
+        )
+    return destination
 
 
 def build_local_input_record(
@@ -647,53 +948,6 @@ def _pose_from(value: Any) -> tuple[float, float, float] | None:
 
 def _field(record: dict[str, Any], snake: str, camel: str) -> Any:
     return record.get(snake) if record.get(snake) is not None else record.get(camel)
-
-
-def _reject_nonfinite_json(value: str) -> None:
-    raise ValueError(f"Non-finite JSON number is forbidden: {value}")
-
-
-class DuplicateJSONKeyError(ValueError):
-    """Raised by the object_pairs_hook when one JSON object repeats a key.
-
-    ``json.loads`` would otherwise apply last-key-wins and silently drop the
-    first value; a fail-closed evidence contract must reject the ambiguity
-    before any schema decision is made on the surviving value.
-    """
-
-    def __init__(self, key: str) -> None:
-        super().__init__(f"Duplicate JSON key: {key}")
-        self.key = key
-
-
-def _reject_duplicate_object_pairs(
-    pairs: list[tuple[str, Any]],
-) -> dict[str, Any]:
-    result: dict[str, Any] = {}
-    for key, value in pairs:
-        if key in result:
-            raise DuplicateJSONKeyError(key)
-        result[key] = value
-    return result
-
-
-def _json_nesting_depth(value: Any) -> int:
-    """Iterative maximum nesting depth of a decoded JSON value. Never
-    recurses, so a deeply nested document cannot overflow the Python
-    stack while being measured."""
-    max_depth = 0
-    stack: list[tuple[Any, int]] = [(value, 1)]
-    while stack:
-        node, depth = stack.pop()
-        if isinstance(node, dict):
-            max_depth = max(max_depth, depth)
-            for child in node.values():
-                stack.append((child, depth + 1))
-        elif isinstance(node, list):
-            max_depth = max(max_depth, depth)
-            for child in node:
-                stack.append((child, depth + 1))
-    return max_depth
 
 
 def _identity_field(value: dict[str, Any], snake: str, camel: str) -> str:
@@ -1062,17 +1316,23 @@ def _validate_jsonl_business_record(
             raise OfflineLocalizationError(f"Invalid tag observation raw position at {line_label}")
 
 
-def _read_jsonl(
-    path: Path,
+def _read_jsonl_bytes(
+    data: bytes,
     contract: JsonlContract,
     *,
+    path_label: str,
     session_id: str,
     expected_map_hash: str,
     expected_floor_id: str,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """Read one formally declared JSONL contract and fail closed on damage."""
+    """Validate one formal JSONL contract from already-stable bytes.
+
+    P7R6C: callers hand in the exact bytes that were hashed, so the
+    parsed records and the manifest identity can never describe
+    different content. The validation contract is unchanged.
+    """
     diagnostics: dict[str, Any] = {
-        "file": str(path),
+        "file": path_label,
         "contract": contract.name,
         "total_lines": 0,
         "valid_records": 0,
@@ -1090,164 +1350,229 @@ def _read_jsonl(
         "duplicate_ids": 0,
     }
     values: list[dict[str, Any]] = []
+    if contract.maximum_file_bytes is not None and len(data) > contract.maximum_file_bytes:
+        raise OfflineLocalizationError(
+            f"{path_label} exceeds the bounded file-size safety limit."
+        )
+    parts = data.split(b"\n")
+    if parts[-1] != b"":
+        # P7R6A: the formal JSONL contract always ends every record with
+        # a newline. A complete JSON object without its final newline is
+        # partial evidence and fails closed.
+        raise OfflineLocalizationError(
+            f"Missing final newline at {path_label}:{len(parts)}"
+        )
+    parts.pop()
+    seen_ids: set[str] = set()
+    previous_timestamp: float | None = None
+    for line_no, part in enumerate(parts, start=1):
+        raw_line = part + b"\n"
+        diagnostics["total_lines"] += 1
+        if len(raw_line) > contract.maximum_record_bytes:
+            diagnostics["oversized_lines"] += 1
+            raise OfflineLocalizationError(
+                f"Oversized record at {path_label}:{line_no}"
+            )
+        try:
+            line = raw_line.decode("utf-8", errors="strict")
+        except UnicodeDecodeError as exc:
+            diagnostics["invalid_utf8_lines"] += 1
+            raise OfflineLocalizationError(
+                f"Invalid UTF-8 at {path_label}:{line_no}"
+            ) from exc
+        if not line.strip():
+            diagnostics["blank_lines"] += 1
+            raise OfflineLocalizationError(
+                f"Blank JSONL record at {path_label}:{line_no}"
+            )
+        try:
+            value = json.loads(
+                line,
+                parse_constant=reject_nonfinite_json,
+                object_pairs_hook=reject_duplicate_object_pairs,
+            )
+        except (json.JSONDecodeError, ValueError, RecursionError) as exc:
+            diagnostics["invalid_json_lines"] += 1
+            raise OfflineLocalizationError(
+                f"Invalid JSON at {path_label}:{line_no}: {exc}"
+            ) from exc
+        if not isinstance(value, dict):
+            diagnostics["non_object_lines"] += 1
+            raise OfflineLocalizationError(
+                f"Non-object record at {path_label}:{line_no}"
+            )
+        if (
+            contract.maximum_nesting_depth is not None
+            and json_nesting_depth(value) > contract.maximum_nesting_depth
+        ):
+            diagnostics["invalid_json_lines"] += 1
+            raise OfflineLocalizationError(
+                f"{path_label}:{line_no} exceeds the bounded "
+                f"nesting-depth safety limit."
+            )
+        if value.get("format") != contract.record_format:
+            diagnostics["format_mismatches"] += 1
+            raise OfflineLocalizationError(
+                f"Format mismatch at {path_label}:{line_no}"
+            )
+        version = value.get("version")
+        if (
+            isinstance(version, bool)
+            or not isinstance(version, int)
+            or version not in contract.versions
+        ):
+            diagnostics["version_mismatches"] += 1
+            raise OfflineLocalizationError(
+                f"Version mismatch at {path_label}:{line_no}"
+            )
+        legacy_manual = contract.name == "manual_localization_events" and version == 1
+        if contract.identity_required and not legacy_manual and _identity_field(
+            value, "tracking_session_id", "trackingSessionId"
+        ) != session_id:
+            diagnostics["session_mismatches"] += 1
+            raise OfflineLocalizationError(
+                f"Tracking-session mismatch at {path_label}:{line_no}"
+            )
+        if contract.identity_required and not legacy_manual and _identity_field(
+            value, "prior_map_sha256", "priorMapSha256"
+        ) != expected_map_hash:
+            diagnostics["map_hash_mismatches"] += 1
+            raise OfflineLocalizationError(
+                f"Prior-map hash mismatch at {path_label}:{line_no}"
+            )
+        if contract.identity_required and not legacy_manual and _identity_field(
+            value, "floor_id", "floorId"
+        ) != expected_floor_id:
+            diagnostics["floor_mismatches"] += 1
+            raise OfflineLocalizationError(
+                f"Floor mismatch at {path_label}:{line_no}"
+            )
+        timestamp = next(
+            (value.get(field) for field in contract.timestamp_fields if field in value),
+            None,
+        )
+        try:
+            timestamp_valid = (
+                timestamp is not None
+                and not isinstance(timestamp, bool)
+                and math.isfinite(float(timestamp))
+            )
+        except (TypeError, ValueError):
+            timestamp_valid = False
+        if not timestamp_valid:
+            diagnostics["timestamp_errors"] += 1
+            raise OfflineLocalizationError(
+                f"Invalid timestamp at {path_label}:{line_no}"
+            )
+        timestamp_number = float(timestamp)
+        if (
+            contract.strictly_increasing_timestamps
+            and previous_timestamp is not None
+            and timestamp_number <= previous_timestamp
+        ):
+            diagnostics["timestamp_errors"] += 1
+            raise OfflineLocalizationError(
+                f"Duplicate or non-monotonic timestamp at {path_label}:{line_no}"
+            )
+        previous_timestamp = timestamp_number
+        _validate_jsonl_business_record(
+            contract, value, f"{path_label}:{line_no}"
+        )
+        if contract.record_id_field is not None:
+            record_id = str(value.get(contract.record_id_field) or "")
+            if not record_id or record_id in seen_ids:
+                diagnostics["duplicate_ids"] += 1
+                raise OfflineLocalizationError(
+                    f"Missing or duplicate {contract.record_id_field} at "
+                    f"{path_label}:{line_no}"
+                )
+            seen_ids.add(record_id)
+        values.append(value)
+        diagnostics["valid_records"] += 1
+        if len(values) > contract.maximum_records:
+            raise OfflineLocalizationError(
+                f"{path_label} exceeds the bounded "
+                f"{contract.maximum_records}-record safety limit."
+            )
+    if not contract.allow_empty and not values:
+        raise OfflineLocalizationError(
+            f"Required sidecar file is empty: {path_label}"
+        )
+    return values, diagnostics
+
+
+def _read_jsonl_stable(
+    path: Path,
+    contract: JsonlContract,
+    *,
+    session_id: str,
+    expected_map_hash: str,
+    expected_floor_id: str,
+) -> tuple[list[dict[str, Any]], dict[str, Any], dict[str, Any]]:
+    """P7R6C: one descriptor-stable read that is hashed and parsed from
+    the same bytes. Returns the validated records, diagnostics and the
+    manifest identity of those exact bytes."""
+    values: list[dict[str, Any]] = []
+    empty_diagnostics: dict[str, Any] = {
+        "file": str(path),
+        "contract": contract.name,
+        "total_lines": 0,
+        "valid_records": 0,
+        "invalid_json_lines": 0,
+        "invalid_utf8_lines": 0,
+        "blank_lines": 0,
+        "non_object_lines": 0,
+        "oversized_lines": 0,
+        "format_mismatches": 0,
+        "version_mismatches": 0,
+        "session_mismatches": 0,
+        "map_hash_mismatches": 0,
+        "floor_mismatches": 0,
+        "timestamp_errors": 0,
+        "duplicate_ids": 0,
+    }
     if not path.is_file():
         if contract.required:
             raise OfflineLocalizationError(
                 f"Required sidecar file is missing: {path.name}"
             )
-        return values, diagnostics
-    if contract.maximum_file_bytes is not None and path.stat().st_size > contract.maximum_file_bytes:
-        raise OfflineLocalizationError(
-            f"{path.name} exceeds the bounded file-size safety limit."
-        )
-    seen_ids: set[str] = set()
-    previous_timestamp: float | None = None
-    with path.open("rb") as handle:
-        for line_no, raw_line in enumerate(handle, start=1):
-            diagnostics["total_lines"] += 1
-            if not raw_line.endswith(b"\n"):
-                # P7R6A: the formal JSONL contract always ends every
-                # record with a newline, matching the device-side strict
-                # parser. A complete JSON object without its final newline
-                # is partial evidence and fails closed.
-                raise OfflineLocalizationError(
-                    f"Missing final newline at {path.name}:{line_no}"
-                )
-            if len(raw_line) > contract.maximum_record_bytes:
-                diagnostics["oversized_lines"] += 1
-                raise OfflineLocalizationError(
-                    f"Oversized record at {path.name}:{line_no}"
-                )
-            try:
-                line = raw_line.decode("utf-8", errors="strict")
-            except UnicodeDecodeError as exc:
-                diagnostics["invalid_utf8_lines"] += 1
-                raise OfflineLocalizationError(
-                    f"Invalid UTF-8 at {path.name}:{line_no}"
-                ) from exc
-            if not line.strip():
-                diagnostics["blank_lines"] += 1
-                raise OfflineLocalizationError(
-                    f"Blank JSONL record at {path.name}:{line_no}"
-                )
-            try:
-                value = json.loads(
-                    line,
-                    parse_constant=_reject_nonfinite_json,
-                    object_pairs_hook=_reject_duplicate_object_pairs,
-                )
-            except (json.JSONDecodeError, ValueError, RecursionError) as exc:
-                diagnostics["invalid_json_lines"] += 1
-                raise OfflineLocalizationError(
-                    f"Invalid JSON at {path.name}:{line_no}: {exc}"
-                ) from exc
-            if not isinstance(value, dict):
-                diagnostics["non_object_lines"] += 1
-                raise OfflineLocalizationError(
-                    f"Non-object record at {path.name}:{line_no}"
-                )
-            if (
-                contract.maximum_nesting_depth is not None
-                and _json_nesting_depth(value) > contract.maximum_nesting_depth
-            ):
-                diagnostics["invalid_json_lines"] += 1
-                raise OfflineLocalizationError(
-                    f"{path.name}:{line_no} exceeds the bounded "
-                    f"nesting-depth safety limit."
-                )
-            if value.get("format") != contract.record_format:
-                diagnostics["format_mismatches"] += 1
-                raise OfflineLocalizationError(
-                    f"Format mismatch at {path.name}:{line_no}"
-                )
-            version = value.get("version")
-            if (
-                isinstance(version, bool)
-                or not isinstance(version, int)
-                or version not in contract.versions
-            ):
-                diagnostics["version_mismatches"] += 1
-                raise OfflineLocalizationError(
-                    f"Version mismatch at {path.name}:{line_no}"
-                )
-            legacy_manual = contract.name == "manual_localization_events" and version == 1
-            if contract.identity_required and not legacy_manual and _identity_field(
-                value, "tracking_session_id", "trackingSessionId"
-            ) != session_id:
-                diagnostics["session_mismatches"] += 1
-                raise OfflineLocalizationError(
-                    f"Tracking-session mismatch at {path.name}:{line_no}"
-                )
-            if contract.identity_required and not legacy_manual and _identity_field(
-                value, "prior_map_sha256", "priorMapSha256"
-            ) != expected_map_hash:
-                diagnostics["map_hash_mismatches"] += 1
-                raise OfflineLocalizationError(
-                    f"Prior-map hash mismatch at {path.name}:{line_no}"
-                )
-            if contract.identity_required and not legacy_manual and _identity_field(
-                value, "floor_id", "floorId"
-            ) != expected_floor_id:
-                diagnostics["floor_mismatches"] += 1
-                raise OfflineLocalizationError(
-                    f"Floor mismatch at {path.name}:{line_no}"
-                )
-            timestamp = next(
-                (value.get(field) for field in contract.timestamp_fields if field in value),
-                None,
-            )
-            try:
-                timestamp_valid = (
-                    timestamp is not None
-                    and not isinstance(timestamp, bool)
-                    and math.isfinite(float(timestamp))
-                )
-            except (TypeError, ValueError):
-                timestamp_valid = False
-            if not timestamp_valid:
-                diagnostics["timestamp_errors"] += 1
-                raise OfflineLocalizationError(
-                    f"Invalid timestamp at {path.name}:{line_no}"
-                )
-            timestamp_number = float(timestamp)
-            if (
-                contract.strictly_increasing_timestamps
-                and previous_timestamp is not None
-                and timestamp_number <= previous_timestamp
-            ):
-                diagnostics["timestamp_errors"] += 1
-                raise OfflineLocalizationError(
-                    f"Duplicate or non-monotonic timestamp at {path.name}:{line_no}"
-                )
-            previous_timestamp = timestamp_number
-            _validate_jsonl_business_record(
-                contract, value, f"{path.name}:{line_no}"
-            )
-            if contract.record_id_field is not None:
-                record_id = str(value.get(contract.record_id_field) or "")
-                if not record_id or record_id in seen_ids:
-                    diagnostics["duplicate_ids"] += 1
-                    raise OfflineLocalizationError(
-                        f"Missing or duplicate {contract.record_id_field} at "
-                        f"{path.name}:{line_no}"
-                    )
-                seen_ids.add(record_id)
-            values.append(value)
-            diagnostics["valid_records"] += 1
-            if len(values) > contract.maximum_records:
-                raise OfflineLocalizationError(
-                    f"{path.name} exceeds the bounded "
-                    f"{contract.maximum_records}-record safety limit."
-                )
-    if not contract.allow_empty and not values:
-        raise OfflineLocalizationError(
-            f"Required sidecar file is empty: {path.name}"
-        )
+        return values, empty_diagnostics, {}
+    data, identity = _stable_read_bytes(path, contract.name)
+    values, diagnostics = _read_jsonl_bytes(
+        data,
+        contract,
+        path_label=path.name,
+        session_id=session_id,
+        expected_map_hash=expected_map_hash,
+        expected_floor_id=expected_floor_id,
+    )
+    diagnostics["file"] = str(path)
+    return values, diagnostics, identity
+
+
+def _read_jsonl(
+    path: Path,
+    contract: JsonlContract,
+    *,
+    session_id: str,
+    expected_map_hash: str,
+    expected_floor_id: str,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Read one formally declared JSONL contract and fail closed on
+    damage. The file is read exactly once through the stable descriptor
+    path and validated from those same bytes."""
+    values, diagnostics, _ = _read_jsonl_stable(
+        path,
+        contract,
+        session_id=session_id,
+        expected_map_hash=expected_map_hash,
+        expected_floor_id=expected_floor_id,
+    )
     return values, diagnostics
 
 
-def _read_localized_price_tags(
-    path: Path,
+def _read_localized_price_tags_bytes(
+    data: bytes,
     *,
     session_id: str,
     expected_map_id: str,
@@ -1257,17 +1582,13 @@ def _read_localized_price_tags(
     maximum_bytes: int = 128 * 1024 * 1024,
     maximum_records: int = 500_000,
 ) -> list[dict[str, Any]]:
-    if not path.is_file():
-        raise OfflineLocalizationError("Required localized_price_tags.json is missing.")
-    if path.stat().st_size > maximum_bytes:
+    """Validate localized_price_tags.json from already-stable bytes
+    (P7R6C): the bytes that were hashed are the bytes that are parsed."""
+    if len(data) > maximum_bytes:
         raise OfflineLocalizationError("localized_price_tags.json exceeds its safety limit.")
     try:
-        payload = json.loads(
-            path.read_bytes().decode("utf-8", errors="strict"),
-            parse_constant=_reject_nonfinite_json,
-            object_pairs_hook=_reject_duplicate_object_pairs,
-        )
-    except (UnicodeDecodeError, json.JSONDecodeError, ValueError, RecursionError) as exc:
+        payload = load_strict_json_bytes(data, name="localized_price_tags.json")
+    except ValueError as exc:
         raise OfflineLocalizationError(
             f"localized_price_tags.json is invalid: {exc}"
         ) from exc
@@ -1399,6 +1720,59 @@ def _read_localized_price_tags(
         observation_ids.add(observation_id)
         tags.append({key: item[key] for key in allowed_fields if key in item})
     return tags
+
+
+def _read_localized_price_tags_stable(
+    path: Path,
+    *,
+    session_id: str,
+    expected_map_id: str,
+    expected_map_hash: str,
+    expected_floor_id: str,
+    expected_count: int,
+) -> tuple[list[dict[str, Any]], dict[str, Any], bytes]:
+    """P7R6C: one descriptor-stable read; returns validated tags, the
+    manifest identity of the exact bytes, and the bytes themselves."""
+    data, identity = _stable_read_bytes(path, "localized_price_tags.json")
+    tags = _read_localized_price_tags_bytes(
+        data,
+        session_id=session_id,
+        expected_map_id=expected_map_id,
+        expected_map_hash=expected_map_hash,
+        expected_floor_id=expected_floor_id,
+        expected_count=expected_count,
+    )
+    return tags, identity, data
+
+
+def _read_localized_price_tags(
+    path: Path,
+    *,
+    session_id: str,
+    expected_map_id: str,
+    expected_map_hash: str,
+    expected_floor_id: str,
+    expected_count: int,
+    maximum_bytes: int = 128 * 1024 * 1024,
+    maximum_records: int = 500_000,
+) -> list[dict[str, Any]]:
+    """Read localized_price_tags.json exactly once through the stable
+    descriptor path and validate from those same bytes."""
+    if not path.is_file():
+        raise OfflineLocalizationError("Required localized_price_tags.json is missing.")
+    data, _identity = _stable_read_bytes(
+        path, "localized_price_tags.json", maximum_bytes=maximum_bytes
+    )
+    return _read_localized_price_tags_bytes(
+        data,
+        session_id=session_id,
+        expected_map_id=expected_map_id,
+        expected_map_hash=expected_map_hash,
+        expected_floor_id=expected_floor_id,
+        expected_count=expected_count,
+        maximum_bytes=maximum_bytes,
+        maximum_records=maximum_records,
+    )
 
 
 def _nearest_pose_index(poses: Sequence[Pose], timestamp: float | None) -> int:
@@ -3385,6 +3759,7 @@ def _render_localized_version(
     input_identity_id: str,
     local_input_record: dict[str, Any],
     replay_parameters: dict[str, Any],
+    input_snapshot: FinalizedSessionInputSnapshot,
     factor_graph_binary: Path | None = None,
     manual_edits: dict[str, Any] | None = None,
     progress: Callable[[int, str, str], None] | None = None,
@@ -3410,7 +3785,19 @@ def _render_localized_version(
         raise OfflineLocalizationError(
             "Finalized session inputs changed before localized processing."
         )
-    metadata = load_json(segment / "metadata.json")
+    # P7R6C: the parse-and-hash-once snapshot must describe exactly the
+    # bytes the manifest binds; otherwise a concurrent replacement slipped
+    # between the manifest build and the snapshot read.
+    if (
+        input_snapshot.manifest.get("bundle_sha256") != expected_bundle_sha256
+        or input_snapshot.manifest.get("files") != session_input_manifest["files"]
+        or input_snapshot.source_database_sha256
+        != session_input_manifest["source_database_sha256"]
+    ):
+        raise OfflineLocalizationError(
+            "Finalized session inputs changed before localized processing."
+        )
+    metadata = input_snapshot.metadata
     if not isinstance(metadata, dict):
         raise OfflineLocalizationError("Session metadata is invalid.")
     if metadata.get("workflowMode") != "prior_map_localized":
@@ -3457,7 +3844,10 @@ def _render_localized_version(
         package_manifest.get("package_sha256"),
     }:
         raise OfflineLocalizationError("Session prior-map hash does not match the selected map.")
-    source_hash_before = _sha256(source_database)
+    # P7R6C: the snapshot identity is the byte-exact source database hash;
+    # every downstream binding (local inputs, manual edits, manifests) uses
+    # it instead of a second path-based hash pass.
+    source_hash_before = input_snapshot.source_database_sha256
     session_hash = source_hash_before
     package_hash = str(package_manifest["package_sha256"])
     optimized_db_hash = _sha256(optimized_database)
@@ -3561,53 +3951,36 @@ def _render_localized_version(
         raise OfflineLocalizationError(
             "Finalized localized metadata requires an exact tag file and count contract."
         )
-    raw_tags = _read_localized_price_tags(
-        segment / "localized_price_tags.json",
+    # P7R6C: every formal input is consumed from the parse-and-hash-once
+    # snapshot. The tag bytes and the JSONL records below are the exact
+    # bytes that produced the manifest identities, so the bundle SHA always
+    # describes what localization actually parsed.
+    raw_tags = _read_localized_price_tags_bytes(
+        input_snapshot.localized_tags_bytes,
         session_id=sidecar_session_id,
         expected_map_id=str(manifest.get("prior_map_id") or ""),
         expected_map_hash=sidecar_map_hash,
         expected_floor_id=sidecar_floor_id,
         expected_count=localized_tag_count,
     )
-    trace, trace_diag = _read_jsonl(
-        segment / "localization_trace.jsonl",
-        TRACE_CONTRACT,
-        session_id=sidecar_session_id,
-        expected_map_hash=sidecar_map_hash,
-        expected_floor_id=sidecar_floor_id,
-    )
-    raw_constraints, constraint_diag = _read_jsonl(
-        segment / "localization_constraints.jsonl",
-        CONSTRAINT_CONTRACT,
-        session_id=sidecar_session_id,
-        expected_map_hash=sidecar_map_hash,
-        expected_floor_id=sidecar_floor_id,
-    )
-    manual_events, manual_diag = _read_jsonl(
-        segment / "manual_localization_events.jsonl",
-        MANUAL_EVENT_CONTRACT,
-        session_id=sidecar_session_id,
-        expected_map_hash=sidecar_map_hash,
-        expected_floor_id=sidecar_floor_id,
-    )
-    tag_observations, obs_diag = _read_jsonl(
-        segment / "tag_observations.jsonl",
-        replace(
-            TAG_OBSERVATION_CONTRACT,
-            required=bool(raw_tags),
-            allow_empty=not bool(raw_tags),
-        ),
-        session_id=sidecar_session_id,
-        expected_map_hash=sidecar_map_hash,
-        expected_floor_id=sidecar_floor_id,
-    )
-    state_events, state_diag = _read_jsonl(
-        segment / "localization_events.jsonl",
-        STATE_EVENT_CONTRACT,
-        session_id=sidecar_session_id,
-        expected_map_hash=sidecar_map_hash,
-        expected_floor_id=sidecar_floor_id,
-    )
+    trace = input_snapshot.jsonl_values["localization_trace.jsonl"]
+    trace_diag = input_snapshot.jsonl_diagnostics["localization_trace.jsonl"]
+    raw_constraints = input_snapshot.jsonl_values[
+        "localization_constraints.jsonl"
+    ]
+    constraint_diag = input_snapshot.jsonl_diagnostics[
+        "localization_constraints.jsonl"
+    ]
+    manual_events = input_snapshot.jsonl_values[
+        "manual_localization_events.jsonl"
+    ]
+    manual_diag = input_snapshot.jsonl_diagnostics[
+        "manual_localization_events.jsonl"
+    ]
+    tag_observations = input_snapshot.jsonl_values["tag_observations.jsonl"]
+    obs_diag = input_snapshot.jsonl_diagnostics["tag_observations.jsonl"]
+    state_events = input_snapshot.jsonl_values["localization_events.jsonl"]
+    state_diag = input_snapshot.jsonl_diagnostics["localization_events.jsonl"]
     # P7R6: terminal Recovery lifecycle evidence. Manifest v2 binds the
     # sidecar into the immutable input identity and reconciles the record
     # set against the finalized capture watermark; v1 legacy sessions are
@@ -3627,13 +4000,12 @@ def _render_localized_version(
             raise OfflineLocalizationError(
                 "Input manifest v2 requires the recovery lifecycle watermark."
             )
-        recovery_events, recovery_diag = _read_jsonl(
-            segment / "localization_recovery_events.jsonl",
-            RECOVERY_EVENT_CONTRACT,
-            session_id=sidecar_session_id,
-            expected_map_hash=sidecar_map_hash,
-            expected_floor_id=sidecar_floor_id,
-        )
+        recovery_events = input_snapshot.jsonl_values[
+            "localization_recovery_events.jsonl"
+        ]
+        recovery_diag = input_snapshot.jsonl_diagnostics[
+            "localization_recovery_events.jsonl"
+        ]
         _validate_recovery_event_sequence(recovery_events)
         if len(recovery_events) != recovery_watermark:
             raise OfflineLocalizationError(
@@ -3663,13 +4035,12 @@ def _render_localized_version(
                 )
         recovery_evidence_binding = "recovery_lifecycle_evidence_bound_v2"
     else:
-        recovery_events, recovery_diag = _read_jsonl(
-            segment / "localization_recovery_events.jsonl",
-            replace(RECOVERY_EVENT_CONTRACT, required=False),
-            session_id=sidecar_session_id,
-            expected_map_hash=sidecar_map_hash,
-            expected_floor_id=sidecar_floor_id,
-        )
+        recovery_events = input_snapshot.jsonl_values[
+            "localization_recovery_events.jsonl"
+        ]
+        recovery_diag = input_snapshot.jsonl_diagnostics[
+            "localization_recovery_events.jsonl"
+        ]
         _validate_recovery_event_sequence(recovery_events)
         recovery_evidence_binding = RECOVERY_EVIDENCE_UNBOUND_LEGACY
     jsonl_diagnostics = {
@@ -4205,7 +4576,16 @@ def _render_localized_version(
     )
     # Coverage is audited from both immutable SQLite inputs plus the exported
     # trajectory.  Metadata is only a cross-check and never the denominator.
-    source_inventory = _database_node_inventory(source_database)
+    # P7R6C 方案 A: SQLite only ever opens a descriptor-verified immutable
+    # copy of the source database; the original stays read-only. The copy
+    # must match the snapshot identity or processing fails closed.
+    with tempfile.TemporaryDirectory(
+        prefix="marketscanner-localized-source-"
+    ) as source_work_root:
+        verified_source_database = _verified_source_database_copy(
+            source_database, Path(source_work_root), source_hash_before
+        )
+        source_inventory = _database_node_inventory(verified_source_database)
     optimized_inventory = _database_node_inventory(optimized_database)
     exported_node_ids = [pose.node_id for pose in optimized]
     exported_node_counts = Counter(exported_node_ids)
@@ -4472,7 +4852,9 @@ def _render_localized_version(
         report["warnings"].append(
             "处理未能生成有效草稿；检查输入文件和优化器状态。"
         )
-    source_hash_after = _sha256(source_database)
+    source_hash_after = _regular_file_identity(source_database, "source_database")[
+        "sha256"
+    ]
     if source_hash_after != source_hash_before:
         raise OfflineLocalizationError("Source database changed during localized processing.")
     session_inputs_after = build_session_input_manifest(segment, source_database)
@@ -4753,9 +5135,28 @@ def process_localized_session(
         package_manifest.get("package_sha256"), str
     ):
         raise OfflineLocalizationError("Prior-map package manifest is invalid.")
+    # P7R6C: parse-and-hash-once snapshot. The manifest builder call stays
+    # so external callers and the render re-verification keep one code path,
+    # but the snapshot is the authoritative view: every byte below is read
+    # exactly once through a stable descriptor and the manifest identities
+    # describe those very bytes. Any drift between the two reads fails
+    # closed before any processing work starts.
     session_input_manifest = build_session_input_manifest(
         segment_dirs[0], source_database
     )
+    input_snapshot = read_finalized_session_input_snapshot(
+        segment_dirs[0], source_database
+    )
+    if (
+        input_snapshot.manifest.get("bundle_sha256")
+        != session_input_manifest.get("bundle_sha256")
+        or input_snapshot.manifest.get("files")
+        != session_input_manifest.get("files")
+    ):
+        raise OfflineLocalizationError(
+            "Finalized session inputs changed before localized processing."
+        )
+    session_input_manifest = input_snapshot.manifest
     local_input_record = build_local_input_record(
         session=session,
         source_database=source_database,
@@ -4806,6 +5207,7 @@ def process_localized_session(
             input_identity_id=input_identity_id,
             local_input_record=local_input_record,
             replay_parameters=normalized_replay_parameters,
+            input_snapshot=input_snapshot,
             factor_graph_binary=factor_graph_binary,
             manual_edits=manual_edits,
             progress=progress,
