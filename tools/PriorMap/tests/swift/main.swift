@@ -4034,6 +4034,653 @@ do {
         "P7R6A a missing identity must attempt no episode")
 }
 
+// MARK: - P7R6A P-A1..P-A20: strict parser and acknowledgement contracts.
+
+func p7r6aIdentitySha() -> String {
+    return String(repeating: "a", count: 64)
+}
+
+/// Builds one canonical lifecycle line. v1 records carry no deadline,
+/// attempts budget, or trigger sequence; the builder never fabricates them.
+func p7r6aLifecycleRecordData(
+    version: Int,
+    episode: Int,
+    started: Double = 10,
+    finished: Double = 14.5,
+    outcome: String = "converged",
+    cancellationReason: String? = nil,
+    validAttempts: Int = 7,
+    accepted: Int = 2,
+    trailingNewline: Bool = true,
+    identity: [String: String]? = nil,
+    extra: [String: Any] = [:]
+) throws -> Data {
+    var object: [String: Any] = [
+        "format": "MarketScannerRecoveryLifecycleEvent",
+        "version": version,
+        "tracking_session_id": "session-a",
+        "prior_map_id": "map-a",
+        "prior_map_sha256": p7r6aIdentitySha(),
+        "floor_id": "1",
+        "episode_id": episode,
+        "reason": "reliable_rtabmap_loop",
+        "outcome": outcome,
+        "episode_automatic": false,
+        "started_at_uptime": started,
+        "finished_at_uptime": finished,
+        "elapsed_ms": (finished - started) * 1000,
+        "valid_matcher_attempts": validAttempts,
+        "accepted_corrections": accepted,
+        "trigger_count": 1,
+        "automatic_trigger_count": 0,
+        "reliable_loop_trigger_count": 1,
+        "last_trigger_reason": "reliable_rtabmap_loop",
+        "last_trigger_at_uptime": started,
+        "fresh_support_frames": 4,
+        "completion_frame_step_applied": false,
+    ]
+    if version == 2 {
+        object["deadline_uptime"] = started + 60
+        object["maximum_valid_attempts"] = 40
+        object["trigger_records"] = [[
+            "reason": "reliable_rtabmap_loop",
+            "automatic": false,
+            "at_uptime": started,
+        ]]
+    }
+    if let cancellationReason {
+        object["cancellation_reason"] = cancellationReason
+    }
+    if let identity {
+        for (key, value) in identity {
+            object[key] = value
+        }
+    }
+    for (key, value) in extra {
+        object[key] = value
+    }
+    var data = try JSONSerialization.data(withJSONObject: object)
+    if trailingNewline {
+        data.append(0x0A)
+    }
+    return data
+}
+
+func p7r6aParseExpectation(
+    expectedRecordCount: Int? = nil,
+    expectedLastEpisodeId: Int? = nil,
+    expectedLastFinishedAtUptime: TimeInterval? = nil
+) -> RecoveryLifecycleEvidenceExpectation {
+    return RecoveryLifecycleEvidenceExpectation(
+        trackingSessionId: "session-a",
+        priorMapId: "map-a",
+        priorMapSha256: p7r6aIdentitySha(),
+        floorId: "1",
+        expectedRecordCount: expectedRecordCount,
+        expectedLastEpisodeId: expectedLastEpisodeId,
+        expectedLastFinishedAtUptime: expectedLastFinishedAtUptime)
+}
+
+func p7r6aParseFailureCode(_ snapshot: Data) throws -> String {
+    do {
+        _ = try RecoveryLifecyclePersistedEvidenceParser.parse(
+            snapshot: snapshot,
+            expectation: p7r6aParseExpectation())
+        return "PASS"
+    }
+    catch let error as RecoveryLifecycleEvidenceParseError {
+        return error.stableCode
+    }
+}
+
+func p7r6aCoordinatorWithPending(
+    in directory: URL,
+    episodes: [(reason: String, start: Double, finish: Double)],
+    writer: P7R6DurableRecoveryWriter
+) throws -> (RecoveryLifecyclePersistenceCoordinator, P7R6BundleSource) {
+    let controller = PriorMapRecoveryController()
+    let source = P7R6BundleSource(controller: controller)
+    for episode in episodes {
+        _ = controller.request(reason: episode.reason, now: episode.start)
+        _ = controller.finish(.converged, now: episode.finish)
+        if let completion = controller.lastCompletion {
+            source.pending.append(completion)
+        }
+    }
+    let coordinator = p7r6Coordinator(
+        source: source,
+        writer: writer,
+        persistedEvidenceSnapshot: {
+            try p7r6PersistedEvidenceSnapshot(in: directory)
+        })
+    return (coordinator, source)
+}
+
+// P-A1: a legal historical v1 episode plus a fresh pending v2 episode form a
+// mixed file that the coordinator appends once and finalization accepts.
+do {
+    let directory = try p7r6FreshDirectory("pa1")
+    let recoveryURL = try p7r6WriteBaseBundle(
+        in: directory, createRecoveryFile: false)
+    try p7r6aLifecycleRecordData(version: 1, episode: 1)
+        .write(to: recoveryURL)
+    let writer = P7R6DurableRecoveryWriter(
+        directory: directory,
+        trackingSessionId: "session-a",
+        sidecarWriter: FoundationScanSidecarWriter())
+    // Burn episode 1 in the controller so the pending completion is 2.
+    let (coordinator, source) = try p7r6aCoordinatorWithPending(
+        in: directory,
+        episodes: [
+            (reason: "initial_warmup", start: 0, finish: 1),
+            (reason: "reliable_rtabmap_loop", start: 20, finish: 22),
+        ],
+        writer: writer)
+    source.pending.removeFirst()
+    let result = coordinator.persistTerminalEvidence(
+        cancellationReason: nil, now: 23)
+    let objects = try p7r6LifecycleObjects(in: directory)
+    require(
+        result.allPersisted
+            && result.attemptedEpisodeIds == [2]
+            && result.persistedEpisodeIds == [2]
+            && writer.localizationRecoveryEventCount == 1
+            && objects.count == 2
+            && (objects[0]["version"] as? Int) == 1
+            && (objects[1]["version"] as? Int) == 2,
+        "P-A1 a legal v1 record plus a new v2 episode must append once")
+    require(
+        LocalizationEvidenceBundleValidator.blockers(
+            in: directory,
+            expectation: p7r6BundleExpectation(
+                recoveryCount: 2,
+                lastEpisodeId: 2,
+                lastFinishedAtUptime:
+                    writer.lastRecoveryFinishedAtUptime)).isEmpty,
+        "P-A1 mixed v1/v2 evidence must pass finalization")
+}
+
+// P-A2: the same episode as v1 on disk and v2 pending is never one fact.
+do {
+    let directory = try p7r6FreshDirectory("pa2")
+    let recoveryURL = try p7r6WriteBaseBundle(
+        in: directory, createRecoveryFile: false)
+    try p7r6aLifecycleRecordData(version: 1, episode: 1)
+        .write(to: recoveryURL)
+    let writer = P7R6DurableRecoveryWriter(
+        directory: directory,
+        trackingSessionId: "session-a",
+        sidecarWriter: FoundationScanSidecarWriter())
+    let (coordinator, source) = try p7r6aCoordinatorWithPending(
+        in: directory,
+        episodes: [(reason: "reliable_rtabmap_loop", start: 20, finish: 22)],
+        writer: writer)
+    let result = coordinator.persistTerminalEvidence(
+        cancellationReason: nil, now: 23)
+    let remainingObjects = try p7r6LifecycleObjects(in: directory)
+    require(
+        !result.allPersisted
+            && result.attemptedEpisodeIds == [1]
+            && result.persistedEpisodeIds.isEmpty
+            && result.failedEpisodeId == 1
+            && result.failureReason == "persisted_episode_version_conflict"
+            && writer.localizationRecoveryEventCount == 0
+            && source.pending.count == 1
+            && remainingObjects.count == 1,
+        "P-A2 a v1/v2 same-episode pair must conflict without appending")
+}
+
+// P-A3..P-A9: file-level and ordering contracts refuse acknowledgement.
+do {
+    func coordinatorOverSnapshot(
+        _ snapshot: Data
+    ) throws -> (RecoveryLifecyclePersistenceResult, P7R6FakeRecoverySource,
+        P7R6FakeRecoveryWriter) {
+        let controller = PriorMapRecoveryController()
+        let source = P7R6FakeRecoverySource()
+        _ = controller.request(reason: "reliable_rtabmap_loop", now: 20)
+        if let completion = controller.finish(.converged, now: 22) {
+            source.pending = [completion]
+        }
+        let writer = P7R6FakeRecoveryWriter()
+        let coordinator = RecoveryLifecyclePersistenceCoordinator(
+            source: source,
+            writer: writer,
+            trackingSessionId: "session-a",
+            priorMapId: "map-a",
+            priorMapSha256: p7r6aIdentitySha(),
+            floorId: "1",
+            persistedEvidenceSnapshot: { snapshot })
+        return (coordinator.persistTerminalEvidence(
+            cancellationReason: nil, now: 23), source, writer)
+    }
+    func expectNoAck(
+        _ snapshot: Data,
+        reasonSuffix: String,
+        _ message: String
+    ) throws {
+        let (result, source, writer) = try coordinatorOverSnapshot(snapshot)
+        require(
+            !result.allPersisted
+                && result.attemptedEpisodeIds.isEmpty
+                && result.persistedEpisodeIds.isEmpty
+                && result.failedEpisodeId == 1
+                && result.failureReason == reasonSuffix
+                && writer.appendedEpisodeIds.isEmpty
+                && source.pending.count == 1,
+            "\(message): \(result.failureReason ?? "nil")")
+    }
+
+    // P-A3: a complete JSON record without its final newline.
+    try expectNoAck(
+        p7r6aLifecycleRecordData(
+            version: 2, episode: 1, trailingNewline: false),
+        reasonSuffix: "existing_evidence_missing_final_newline",
+        "P-A3 a missing final newline must refuse acknowledgement")
+
+    // P-A4: blank lines are never records.
+    var blankLineSnapshot = try p7r6aLifecycleRecordData(
+        version: 2, episode: 1)
+    blankLineSnapshot.append(0x0A)
+    blankLineSnapshot.append(
+        try p7r6aLifecycleRecordData(version: 2, episode: 2))
+    try expectNoAck(
+        blankLineSnapshot,
+        reasonSuffix: "existing_evidence_blank_record",
+        "P-A4 a blank line must refuse acknowledgement")
+
+    // P-A5: a partial JSON tail.
+    var partialTailSnapshot = try p7r6aLifecycleRecordData(
+        version: 2, episode: 1)
+    partialTailSnapshot.append(Data("{\"format\":".utf8))
+    try expectNoAck(
+        partialTailSnapshot,
+        reasonSuffix: "existing_evidence_missing_final_newline",
+        "P-A5 a partial tail must refuse acknowledgement")
+
+    // P-A6: unknown fields.
+    try expectNoAck(
+        try p7r6aLifecycleRecordData(
+            version: 2, episode: 1, extra: ["unexpected": true]),
+        reasonSuffix: "existing_evidence_unknown_field",
+        "P-A6 an unknown field must refuse acknowledgement")
+
+    // P-A7: duplicated episodes.
+    var duplicateSnapshot = try p7r6aLifecycleRecordData(
+        version: 2, episode: 1)
+    duplicateSnapshot.append(
+        try p7r6aLifecycleRecordData(version: 2, episode: 1))
+    try expectNoAck(
+        duplicateSnapshot,
+        reasonSuffix: "existing_evidence_duplicate_episode",
+        "P-A7 a duplicate episode must refuse acknowledgement")
+
+    // P-A8: episode IDs must strictly increase.
+    var orderSnapshot = try p7r6aLifecycleRecordData(
+        version: 2, episode: 2)
+    orderSnapshot.append(
+        try p7r6aLifecycleRecordData(version: 2, episode: 1))
+    try expectNoAck(
+        orderSnapshot,
+        reasonSuffix: "existing_evidence_episode_order_invalid",
+        "P-A8 out-of-order episodes must refuse acknowledgement")
+
+    // P-A9: terminal finish uptimes never move backwards.
+    var finishSnapshot = try p7r6aLifecycleRecordData(
+        version: 2, episode: 1, started: 10, finished: 20)
+    finishSnapshot.append(
+        try p7r6aLifecycleRecordData(
+            version: 2, episode: 2, started: 10, finished: 19))
+    try expectNoAck(
+        finishSnapshot,
+        reasonSuffix: "existing_evidence_finish_order_invalid",
+        "P-A9 finish-time regression must refuse acknowledgement")
+}
+
+// P-A10: every identity field must match exactly.
+do {
+    for (key, value) in [
+        ("tracking_session_id", "session-other"),
+        ("prior_map_id", "map-other"),
+        ("prior_map_sha256", String(repeating: "b", count: 64)),
+        ("floor_id", "2"),
+    ] {
+        let code = try p7r6aParseFailureCode(
+            p7r6aLifecycleRecordData(
+                version: 2, episode: 1, identity: [key: value]))
+        require(
+            code == "identity_mismatch",
+            "P-A10 identity field \(key) must reject: \(code)")
+    }
+}
+
+// P-A11: exact same v2 canonical record acknowledges without rewriting.
+do {
+    let directory = try p7r6FreshDirectory("pa11")
+    let recoveryURL = try p7r6WriteBaseBundle(
+        in: directory, createRecoveryFile: false)
+    let writer = P7R6DurableRecoveryWriter(
+        directory: directory,
+        trackingSessionId: "session-a",
+        sidecarWriter: FoundationScanSidecarWriter())
+    let (coordinator, source) = try p7r6aCoordinatorWithPending(
+        in: directory,
+        episodes: [(reason: "reliable_rtabmap_loop", start: 20, finish: 22)],
+        writer: writer)
+    // Persist the exact pending record first (production canonical bytes).
+    guard let completion = source.pending.first else {
+        require(false, "P-A11 requires one pending completion")
+        fatalError()
+    }
+    require(
+        writer.appendRecoveryLifecycleEvent(
+            completion, expectedTrackingSessionId: "session-a"),
+        "P-A11 setup must persist the pending record")
+    let watermarkAfterSetup = writer.localizationRecoveryEventCount
+    let result = coordinator.persistTerminalEvidence(
+        cancellationReason: nil, now: 23)
+    let idempotentObjects = try p7r6LifecycleObjects(in: directory)
+    require(
+        result.allPersisted
+            && result.attemptedEpisodeIds == [1]
+            && result.persistedEpisodeIds == [1]
+            && writer.localizationRecoveryEventCount == watermarkAfterSetup
+            && source.pending.isEmpty
+            && idempotentObjects.count == 1,
+        "P-A11 identical v2 canonical bytes must ack without rewriting")
+    _ = recoveryURL
+}
+
+// P-A12: same episode with any differing business bytes conflicts.
+do {
+    let variants: [(String, (Double, Double, String, Int))] = [
+        ("outcome", (20, 22, "timed_out", 2)),
+        ("finished time", (20, 23, "converged", 2)),
+        ("accepted corrections", (20, 22, "converged", 1)),
+    ]
+    for (label, variant) in variants {
+        let directory = try p7r6FreshDirectory("pa12")
+        let recoveryURL = try p7r6WriteBaseBundle(
+            in: directory, createRecoveryFile: false)
+        try p7r6aLifecycleRecordData(
+            version: 2,
+            episode: 1,
+            started: variant.0,
+            finished: variant.1,
+            outcome: variant.2,
+            accepted: variant.3).write(to: recoveryURL)
+        let writer = P7R6DurableRecoveryWriter(
+            directory: directory,
+            trackingSessionId: "session-a",
+            sidecarWriter: FoundationScanSidecarWriter())
+        // Pending episode 1 with the canonical production timeline.
+        let controller = PriorMapRecoveryController()
+        let source = P7R6BundleSource(controller: controller)
+        _ = controller.request(
+            reason: "reliable_rtabmap_loop", now: variant.0)
+        if let completion = controller.finish(
+            .converged, now: variant.1) {
+            source.pending.append(completion)
+        }
+        let coordinator = p7r6Coordinator(
+            source: source,
+            writer: writer,
+            persistedEvidenceSnapshot: {
+                try p7r6PersistedEvidenceSnapshot(in: directory)
+            })
+        let result = coordinator.persistTerminalEvidence(
+            cancellationReason: nil, now: variant.1 + 1)
+        // Every mutated variant differs from the pending canonical bytes, so
+        // the transaction must conflict without appending or acknowledging.
+        let conflictObjects = try p7r6LifecycleObjects(in: directory)
+        require(
+            !result.allPersisted
+                && result.failedEpisodeId == 1
+                && result.failureReason
+                    == "persisted_episode_bytes_conflict"
+                && writer.localizationRecoveryEventCount == 0
+                && source.pending.count == 1
+                && conflictObjects.count == 1,
+            "P-A12 a \(label) mutation must conflict without appending")
+    }
+}
+
+// P-A13/P-A14: attempted IDs stop exactly at the failing episode.
+do {
+    func threePending() -> (P7R6FakeRecoverySource) {
+        let controller = PriorMapRecoveryController()
+        let source = P7R6FakeRecoverySource()
+        for index in 0..<3 {
+            _ = controller.request(
+                reason: "persistent_weak_or_lost",
+                now: TimeInterval(index * 10),
+                automatic: true)
+            if let completion = controller.finish(
+                .converged, now: TimeInterval(index * 10 + 1)) {
+                source.pending.append(completion)
+            }
+        }
+        return source
+    }
+    let firstWriter = P7R6FakeRecoveryWriter()
+    firstWriter.failingEpisodeIds = [1]
+    let firstCoordinator = RecoveryLifecyclePersistenceCoordinator(
+        source: threePending(),
+        writer: firstWriter,
+        trackingSessionId: "session-a",
+        priorMapId: "map-a",
+        priorMapSha256: p7r6aIdentitySha(),
+        floorId: "1",
+        persistedEvidenceSnapshot: { Data() })
+    let first = firstCoordinator.persistTerminalEvidence(
+        cancellationReason: nil, now: 40)
+    require(
+        first.attemptedEpisodeIds == [1]
+            && first.persistedEpisodeIds.isEmpty
+            && first.failedEpisodeId == 1,
+        "P-A13 a first-episode failure must attempt only episode 1")
+    let secondSource = threePending()
+    let secondWriter = P7R6FakeRecoveryWriter()
+    secondWriter.failingEpisodeIds = [2]
+    let secondCoordinator = RecoveryLifecyclePersistenceCoordinator(
+        source: secondSource,
+        writer: secondWriter,
+        trackingSessionId: "session-a",
+        priorMapId: "map-a",
+        priorMapSha256: p7r6aIdentitySha(),
+        floorId: "1",
+        persistedEvidenceSnapshot: { Data() })
+    let second = secondCoordinator.persistTerminalEvidence(
+        cancellationReason: nil, now: 50)
+    require(
+        second.attemptedEpisodeIds == [1, 2]
+            && second.persistedEpisodeIds == [1]
+            && second.failedEpisodeId == 2
+            && secondSource.pending.map { $0.episode.id } == [2, 3],
+        "P-A14 a second-episode failure must keep episodes 2 and 3 queued")
+}
+
+// P-A15: an invalid existing snapshot attempts no pending episode.
+do {
+    let controller = PriorMapRecoveryController()
+    let source = P7R6FakeRecoverySource()
+    for index in 0..<2 {
+        _ = controller.request(
+            reason: "persistent_weak_or_lost",
+            now: TimeInterval(index * 10),
+            automatic: true)
+        if let completion = controller.finish(
+            .converged, now: TimeInterval(index * 10 + 1)) {
+            source.pending.append(completion)
+        }
+    }
+    let writer = P7R6FakeRecoveryWriter()
+    let coordinator = RecoveryLifecyclePersistenceCoordinator(
+        source: source,
+        writer: writer,
+        trackingSessionId: "session-a",
+        priorMapId: "map-a",
+        priorMapSha256: p7r6aIdentitySha(),
+        floorId: "1",
+        persistedEvidenceSnapshot: { Data("{\"format\":".utf8) })
+    let result = coordinator.persistTerminalEvidence(
+        cancellationReason: nil, now: 30)
+    require(
+        !result.allPersisted
+            && result.attemptedEpisodeIds.isEmpty
+            && result.persistedEpisodeIds.isEmpty
+            && result.failedEpisodeId == 1
+            && writer.appendedEpisodeIds.isEmpty
+            && source.pending.map { $0.episode.id } == [1, 2],
+        "P-A15 snapshot parse failure must keep every completion queued")
+}
+
+// P-A16/P-A17/P-A18: watermark expectations on an empty snapshot.
+do {
+    let empty = Data()
+    let pass = try RecoveryLifecyclePersistedEvidenceParser.parse(
+        snapshot: empty,
+        expectation: p7r6aParseExpectation(expectedRecordCount: 0))
+    require(pass.recordCount == 0,
+            "P-A16 zero episodes with an empty snapshot must pass")
+    do {
+        _ = try RecoveryLifecyclePersistedEvidenceParser.parse(
+            snapshot: empty,
+            expectation: p7r6aParseExpectation(expectedRecordCount: 1))
+        require(false, "P-A17 must fail closed")
+    }
+    catch let error as RecoveryLifecycleEvidenceParseError {
+        require(error == .expectedCountMismatch,
+                "P-A17 a positive watermark with an empty snapshot must fail")
+    }
+    do {
+        _ = try RecoveryLifecyclePersistedEvidenceParser.parse(
+            snapshot: empty,
+            expectation: p7r6aParseExpectation(
+                expectedRecordCount: 0,
+                expectedLastEpisodeId: 1))
+        require(false, "P-A18 must fail closed")
+    }
+    catch let error as RecoveryLifecycleEvidenceParseError {
+        require(error == .lastEpisodeWatermarkMismatch,
+                "P-A18 a zero watermark with a tail ID must fail")
+    }
+}
+
+// P-A19: stable-read contracts fail closed under swap/truncate/link attacks.
+do {
+    let directory = try p7r6FreshDirectory("pa19")
+    let target = directory.appendingPathComponent("recovery.jsonl")
+    let candidate = directory.appendingPathComponent("replacement.jsonl")
+    try Data("aaaaa\n".utf8).write(to: target)
+    try Data("bbbbb\n".utf8).write(to: candidate)
+    var swapped = false
+    var swapFailed = false
+    do {
+        try SafeSessionPath.streamRegularFile(
+            target,
+            within: directory,
+            maximumBytes: 1024,
+            chunkBytes: 2
+        ) { _ in
+            if !swapped {
+                swapped = true
+                try FileManager.default.removeItem(at: target)
+                try FileManager.default.moveItem(
+                    at: candidate, to: target)
+            }
+        }
+    }
+    catch {
+        swapFailed = true
+    }
+    require(swapFailed, "P-A19 a same-size swap must fail closed")
+    try Data("aaaaa\nbbbbb\n".utf8).write(to: target)
+    var truncated = false
+    var truncateFailed = false
+    do {
+        try SafeSessionPath.streamRegularFile(
+            target,
+            within: directory,
+            maximumBytes: 1024,
+            chunkBytes: 2
+        ) { _ in
+            if !truncated {
+                truncated = true
+                try Data("a\n".utf8).write(to: target)
+            }
+        }
+    }
+    catch {
+        truncateFailed = true
+    }
+    require(truncateFailed, "P-A19 a mid-read truncate must fail closed")
+    try FileManager.default.removeItem(at: target)
+    let linkedSource = directory.appendingPathComponent("source.jsonl")
+    try Data("ccccc\n".utf8).write(to: linkedSource)
+    try FileManager.default.createSymbolicLink(
+        at: target, withDestinationURL: linkedSource)
+    var symlinkFailed = false
+    do {
+        _ = try SafeSessionPath.readRegularFile(
+            target, within: directory, maximumBytes: 1024)
+    }
+    catch {
+        symlinkFailed = true
+    }
+    require(symlinkFailed, "P-A19 a symlink replacement must fail closed")
+    try FileManager.default.removeItem(at: target)
+    try Data("ddddd\n".utf8).write(to: target)
+    let linkURL = directory.appendingPathComponent("alias.jsonl")
+    try FileManager.default.linkItem(at: target, to: linkURL)
+    var hardLinkFailed = false
+    do {
+        _ = try SafeSessionPath.readRegularFile(
+            target, within: directory, maximumBytes: 1024)
+    }
+    catch {
+        hardLinkFailed = true
+    }
+    require(hardLinkFailed,
+            "P-A19 a hard-linked replacement must fail closed")
+}
+
+// P-A20: a mixed v1/v2 file validates under the exact watermark.
+do {
+    let directory = try p7r6FreshDirectory("pa20")
+    let recoveryURL = try p7r6WriteBaseBundle(
+        in: directory, createRecoveryFile: false)
+    var mixed = try p7r6aLifecycleRecordData(
+        version: 1, episode: 1, started: 5, finished: 8)
+    mixed.append(
+        try p7r6aLifecycleRecordData(
+            version: 2, episode: 2, started: 10, finished: 14.5))
+    try mixed.write(to: recoveryURL)
+    require(
+        LocalizationEvidenceBundleValidator.blockers(
+            in: directory,
+            expectation: p7r6BundleExpectation(
+                recoveryCount: 2,
+                lastEpisodeId: 2,
+                lastFinishedAtUptime: 14.5)).isEmpty,
+        "P-A20 mixed v1/v2 evidence must validate under the exact watermark")
+    let parsed = try RecoveryLifecyclePersistedEvidenceParser.parse(
+        snapshot: mixed,
+        expectation: p7r6aParseExpectation(
+            expectedRecordCount: 2,
+            expectedLastEpisodeId: 2,
+            expectedLastFinishedAtUptime: 14.5))
+    require(
+        parsed.recordCount == 2
+            && parsed.records[0].isVersionOne
+            && !parsed.records[1].isVersionOne
+            && parsed.records[0].deadlineUptime == nil
+            && parsed.records[0].maximumValidAttempts == nil
+            && parsed.records[0].triggerRecords == nil
+            && parsed.records[1].deadlineUptime != nil,
+        "P-A20 v1 records must keep their missing v2 facts un-fabricated")
+}
+
 if CommandLine.arguments.count == 2 {
     do {
         let digest = try PriorMapPackageIntegrity.validate(
