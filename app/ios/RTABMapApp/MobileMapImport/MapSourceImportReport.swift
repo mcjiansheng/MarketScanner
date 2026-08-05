@@ -16,4 +16,7 @@ struct MapSourceImportReport: Equatable {
     var coordinateContractOrigin: String
 
     var canonicalSource: MarketScannerPriorMapSource
+    /// V2 audit record (source rows, warnings, raw fields) kept separate
+    /// from the business payload (V1R1 §6.7).
+    var audit: MapImportAudit?
 }

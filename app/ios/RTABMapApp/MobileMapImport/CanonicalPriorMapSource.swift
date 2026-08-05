@@ -22,19 +22,17 @@ struct MarketScannerPriorMapSource: Equatable {
     var warnings: [MapSourceWarning]
 
     /// The canonical payload whose deterministic encoding feeds
-    /// `canonicalSourceSha256`. Excludes `source` identity so that the
-    /// same store map imported from XLSX, CSV and JSON produces the same
-    /// digest.
+    /// `canonicalSourceSha256`. V2 business payload (see
+    /// `CanonicalPriorMapBusinessSourceV2`) excludes source identity,
+    /// source rows, warnings and raw fields so that the same store map
+    /// imported from XLSX, CSV and JSON produces the same digest.
     var canonicalPayload: [String: Any] {
-        return [
-            "format": format,
-            "version": version,
-            "storeId": storeId,
-            "mapName": mapName,
-            "coordinateContract": coordinateContract.canonicalPayload,
-            "elements": elements.map { $0.canonicalPayload },
-            "warnings": warnings.map { $0.canonicalPayload },
-        ]
+        return CanonicalPriorMapBusinessSourceV2(
+            storeID: storeId,
+            mapName: mapName,
+            coordinateContract: coordinateContract,
+            elements: elements
+        ).payload
     }
 
     static func == (lhs: MarketScannerPriorMapSource, rhs: MarketScannerPriorMapSource) -> Bool {
@@ -51,6 +49,168 @@ struct MarketScannerPriorMapSource: Equatable {
             return false
         }
         return true
+    }
+}
+
+/// V2 canonical business payload (V1R1 §6.7).
+///
+/// Contract: the business payload contains ONLY business fields that are
+/// invariant across formats. It never contains:
+/// - original filename
+/// - source file SHA
+/// - source row numbers
+/// - localized warning messages
+/// - format-specific raw representations
+///
+/// Element identity priority: the official source id when present,
+/// otherwise a canonical hash of geometry + business identity. Row
+/// numbers are never part of an element id.
+struct CanonicalPriorMapBusinessSourceV2 {
+    static let formatValue = "MarketScannerPriorMapSource"
+    static let versionValue = 2
+
+    var storeID: String
+    var mapName: String
+    var coordinateContract: CoordinateContract
+    var elements: [PriorMapSourceElement]
+
+    var payload: [String: Any] {
+        return [
+            "format": Self.formatValue,
+            "version": Self.versionValue,
+            "store_id": storeID,
+            "map_name": mapName,
+            "coordinate_contract": coordinateContract.canonicalPayload,
+            "elements": elements.map { element in
+                CanonicalPriorMapBusinessSourceV2.elementPayload(
+                    element, storeID: storeID, mapName: mapName)
+            },
+        ]
+    }
+
+    /// Business payload of one element; unknown raw fields and audit-only
+    /// fields (source rows, raw representation) are excluded.
+    static func elementPayload(
+        _ element: PriorMapSourceElement,
+        storeID: String,
+        mapName: String
+    ) -> [String: Any] {
+        var payload: [String: Any] = [
+            "id": stableElementID(for: element, storeID: storeID, mapName: mapName),
+            "floor_id": element.floorId,
+            "shape_type": element.shapeType,
+            "visible": element.visible,
+            "locked": element.locked,
+            "code": element.code,
+            "cross_code": element.crossCode,
+            "row_flag": element.rowFlag,
+        ]
+        if let subsection = element.subsection {
+            payload["subsection"] = subsection
+        } else {
+            payload["subsection"] = NSNull()
+        }
+        if let geometry = element.geometry {
+            payload["geometry"] = geometry
+        }
+        if let bounds = element.bounds {
+            payload["bounds"] = bounds
+        }
+        if let centerM = element.centerM {
+            payload["center_m"] = centerM
+        }
+        if let yawRad = element.yawRad {
+            payload["yaw_rad"] = yawRad
+        }
+        return payload
+    }
+
+    /// Stable, row-independent element id: the official source id when
+    /// present and unique, otherwise a canonical hash over the business
+    /// identity (shape type, floor, code, geometry).
+    static func stableElementID(
+        for element: PriorMapSourceElement,
+        storeID: String,
+        mapName: String
+    ) -> String {
+        if let official = officialSourceID(of: element),
+           !official.isEmpty {
+            return official
+        }
+        var identity: [String: Any] = [
+            "shape_type": element.shapeType,
+            "floor_id": element.floorId,
+            "code": element.code,
+            "cross_code": element.crossCode,
+        ]
+        if let geometry = element.geometry {
+            identity["geometry"] = geometry
+        }
+        if let bounds = element.bounds {
+            identity["bounds"] = bounds
+        }
+        if let centerM = element.centerM {
+            identity["center_m"] = centerM
+        }
+        if let yawRad = element.yawRad {
+            identity["yaw_rad"] = yawRad
+        }
+        let context: [String: Any] = [
+            "store_id": storeID,
+            "map_name": mapName,
+            "identity": identity,
+        ]
+        let data = (try? CanonicalJSONEncoder.encode(context)) ?? Data()
+        return "e-" + CanonicalSourceHasher.sha256(data).prefix(20)
+    }
+
+    /// Official source id: the `sourceId` / `source_id` / `id` raw field
+    /// when the source document declares one.
+    private static func officialSourceID(of element: PriorMapSourceElement) -> String? {
+        if let value = element.source["sourceId"] as? String, !value.isEmpty {
+            return value
+        }
+        if let value = element.source["source_id"] as? String, !value.isEmpty {
+            return value
+        }
+        if let value = element.source["id"] as? String, !value.isEmpty {
+            return value
+        }
+        if let value = element.source["id"] as? Int {
+            return String(value)
+        }
+        return nil
+    }
+}
+
+/// Audit record of one import run (V1R1 §6.7). Separate from the
+/// business payload: keeps source rows, warnings and the original raw
+/// fields without polluting the format-independent digest.
+struct MapImportAudit: Equatable {
+    var format: String
+    var sourceRows: [Int]
+    var warnings: [MapSourceWarning]
+    var rawFields: [[String: Any]]
+
+    var payload: [String: Any] {
+        return [
+            "format": "MarketScannerMapImportAudit",
+            "version": 1,
+            "source_format": format,
+            "source_rows": sourceRows,
+            "warning_count": warnings.count,
+            "warnings": warnings.map { $0.canonicalPayload },
+            "raw_field_count": rawFields.count,
+            "raw_fields": rawFields,
+        ]
+    }
+
+    static func == (lhs: MapImportAudit, rhs: MapImportAudit) -> Bool {
+        guard lhs.format == rhs.format, lhs.sourceRows == rhs.sourceRows,
+              lhs.warnings == rhs.warnings,
+              lhs.rawFields.count == rhs.rawFields.count
+        else { return false }
+        return JSONValueComparer.equal(lhs.rawFields, rhs.rawFields)
     }
 }
 

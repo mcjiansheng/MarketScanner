@@ -1,40 +1,48 @@
 import Foundation
 
-/// Streaming RFC 4180 CSV reader with strict safety rules.
+/// Streaming RFC 4180 CSV reader with strict safety rules (V1R1 §6.5).
 ///
-/// Supports UTF-8 (with optional BOM), CRLF and LF line endings, quoted
-/// commas, quoted newlines, escaped quotes (`""`), and empty fields.
-/// Rejects NUL bytes, invalid UTF-8, inconsistent field counts, missing
-/// headers and oversized fields/rows. The whole file is never buffered
-/// more than one field at a time, so a 64 MiB CSV stays in one field's
-/// memory.
+/// State machine contract:
+/// - A double quote may only *start* a quoted field; a quote inside an
+///   unquoted field is a contract violation (blocked).
+/// - After the closing quote only `,`, CR, LF or EOF may follow; any
+///   other byte is a contract violation (blocked).
+/// - `""` inside a quoted field decodes to one literal `"` (handled
+///   correctly across chunk boundaries).
+/// - Bare CR (without LF) ends a record: explicit frozen policy.
+/// - Blank lines (records with only empty fields) are skipped anywhere,
+///   not only at the start.
+/// - Field size is enforced while accumulating; row count when a record
+///   finishes.
+///
+/// Entry points:
+/// - `parse(stream:)` reads an `InputStream` in 64 KiB chunks and never
+///   materialises the whole file (no full-file extra copy).
+/// - `parse(data:)` is a convenience wrapper for in-memory inputs.
 enum RFC4180CSVReader {
     struct Row {
         var fields: [String]
     }
 
-    /// Parses `data` as CSV, invoking `record` for every record in order
-    /// (including the header record). Throws on the first contract
-    /// violation.
+    /// Parses `stream` as CSV, invoking `record` for every record in
+    /// order (including the header record).
     static func parse(
-        data: Data,
+        stream: InputStream,
         maximumFieldBytes: Int64 = MapSourceImportLimits.maximumCSVFieldBytes,
         maximumRows: Int = MapSourceImportLimits.maximumCSVRows,
         record: (Row) throws -> Void
     ) throws {
-        var bytes = data
-        // Strip a UTF-8 BOM if present.
-        if bytes.count >= 3,
-           bytes[0] == 0xEF, bytes[1] == 0xBB, bytes[2] == 0xBF {
-            bytes.removeFirst(3)
-        }
+        stream.open()
+        defer { stream.close() }
 
         var fields: [String] = []
         var field = Data()
         var inQuotes = false
+        /// A quote was read inside a quoted field but its meaning (escape
+        /// pair vs closing quote) depends on the *next* byte.
+        var quotePending = false
         var row = 0
-        var index = 0
-        let count = bytes.count
+        var buffer = [UInt8](repeating: 0, count: 64 * 1024)
 
         func finishField() throws {
             guard field.count <= maximumFieldBytes else {
@@ -47,73 +55,148 @@ enum RFC4180CSVReader {
             field.removeAll(keepingCapacity: true)
         }
 
+        /// Emits the current record unless it is blank. `field` must be
+        /// finished first (call `finishField()` before this).
         func finishRecord() throws {
-            try finishField()
-            if fields.count == 1 && fields[0].isEmpty && row == 0 {
-                // Trailing empty record at EOF: skip blank final line.
-                fields.removeAll()
-                return
+            let current = fields
+            fields.removeAll(keepingCapacity: true)
+            if current.allSatisfy({ $0.isEmpty }) {
+                return // blank line: skipped (explicit policy)
             }
             row += 1
             guard row <= maximumRows else {
                 throw MapSourceImportError.csvRowTooMany(limit: maximumRows)
             }
-            try record(Row(fields: fields))
-            fields.removeAll(keepingCapacity: true)
+            try record(Row(fields: current))
         }
 
-        while index < count {
-            let byte = bytes[index]
-            if byte == 0 {
-                throw MapSourceImportError.csvContainsNUL(row: row + 1)
-            }
-            if inQuotes {
-                if byte == 0x22 { // "
-                    if index + 1 < count && bytes[index + 1] == 0x22 {
-                        field.append(0x22)
-                        index += 2
-                        continue
-                    }
-                    inQuotes = false
-                    index += 1
-                    continue
-                }
-                field.append(byte)
-                index += 1
-                continue
-            }
+        /// Processes one byte that is *not* inside quotes.
+        func consumeUnquoted(_ byte: UInt8) throws {
             switch byte {
             case 0x22: // "
                 if field.isEmpty {
                     inQuotes = true
                 } else {
-                    field.append(byte)
+                    throw MapSourceImportError.malformedRow(
+                        row: row + 1, reason: "双引号只能出现在字段开头。")
                 }
-                index += 1
             case 0x2C: // ,
                 try finishField()
-                index += 1
-            case 0x0D: // CR
-                if index + 1 < count && bytes[index + 1] == 0x0A {
-                    index += 1
-                }
+            case 0x0D: // CR — bare CR terminates a record (frozen policy)
+                try finishField()
                 try finishRecord()
-                index += 1
             case 0x0A: // LF
+                try finishField()
                 try finishRecord()
-                index += 1
             default:
                 field.append(byte)
-                index += 1
             }
         }
-        // Emit the final record unless the file ended with a newline.
-        if inQuotes {
+
+        /// Processes one byte while inside quotes, resolving any pending
+        /// quote against it.
+        func consumeQuoted(_ byte: UInt8) throws {
+            if quotePending {
+                if byte == 0x22 {
+                    // Escape pair: one literal quote.
+                    field.append(0x22)
+                    quotePending = false
+                    return
+                }
+                // The pending quote closed the field; process `byte` as
+                // an unquoted byte after a closing quote.
+                quotePending = false
+                inQuotes = false
+                try consumeAfterClosingQuote(byte)
+                return
+            }
+            if byte == 0x22 {
+                quotePending = true
+            } else {
+                field.append(byte)
+            }
+        }
+
+        /// Byte after a closing quote: only `,` CR LF EOF are legal.
+        /// Bytes that *start* a multi-byte UTF-8 sequence are deferred to
+        /// the field so a broken multi-byte sequence surfaces as
+        /// `invalid_utf8` (stable error contract) instead of a generic
+        /// malformed-row rejection.
+        func consumeAfterClosingQuote(_ byte: UInt8) throws {
+            switch byte {
+            case 0x2C:
+                try finishField()
+            case 0x0D:
+                try finishField()
+                try finishRecord()
+            case 0x0A:
+                try finishField()
+                try finishRecord()
+            default:
+                if byte < 0x80 {
+                    throw MapSourceImportError.malformedRow(
+                        row: row + 1, reason: "关闭引号后出现非法字符。")
+                }
+                field.append(byte)
+            }
+        }
+
+        while stream.hasBytesAvailable {
+            let read = stream.read(&buffer, maxLength: buffer.count)
+            if read < 0 {
+                throw MapSourceImportError.invalidUTF8(
+                    detail: "CSV 流读取失败。")
+            }
+            if read == 0 {
+                break
+            }
+            for index in 0..<read {
+                let byte = buffer[index]
+                if byte == 0 {
+                    throw MapSourceImportError.csvContainsNUL(row: row + 1)
+                }
+                if inQuotes {
+                    try consumeQuoted(byte)
+                } else {
+                    try consumeUnquoted(byte)
+                }
+            }
+        }
+        // End of stream: a pending quote closes the field; afterwards only
+        // EOF is legal.
+        if quotePending {
+            if inQuotes {
+                inQuotes = false
+                try finishField()
+                try finishRecord()
+            }
+        } else if inQuotes {
             throw MapSourceImportError.malformedRow(
                 row: row + 1, reason: "引号字段未闭合。")
         }
         if !field.isEmpty || !fields.isEmpty {
+            try finishField()
             try finishRecord()
         }
+    }
+
+    /// Convenience wrapper for in-memory inputs (strips a UTF-8 BOM).
+    static func parse(
+        data: Data,
+        maximumFieldBytes: Int64 = MapSourceImportLimits.maximumCSVFieldBytes,
+        maximumRows: Int = MapSourceImportLimits.maximumCSVRows,
+        record: (Row) throws -> Void
+    ) throws {
+        var bytes = data
+        if bytes.count >= 3,
+           bytes[0] == 0xEF, bytes[1] == 0xBB, bytes[2] == 0xBF {
+            bytes.removeFirst(3)
+        }
+        let stream = InputStream(data: bytes)
+        try parse(
+            stream: stream,
+            maximumFieldBytes: maximumFieldBytes,
+            maximumRows: maximumRows,
+            record: record)
     }
 }

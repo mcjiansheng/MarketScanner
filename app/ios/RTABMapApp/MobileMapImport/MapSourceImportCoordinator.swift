@@ -117,8 +117,12 @@ enum MapSourceImportCoordinator {
             warningCount: warnings.count,
             malformedRowCount: outcome.malformedRows.count,
             coordinateContractOrigin: contract.origin.rawValue,
-            canonicalSource: finalSource
-        )
+            canonicalSource: finalSource,
+            audit: MapImportAudit(
+                format: format,
+                sourceRows: outcome.elements.map { $0.sourceRow },
+                warnings: outcome.warnings,
+                rawFields: outcome.elements.map { $0.source }))
     }
 
     static func detectFormat(filename: String, data: Data) throws -> String {
