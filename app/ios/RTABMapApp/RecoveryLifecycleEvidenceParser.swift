@@ -294,12 +294,11 @@ enum RecoveryLifecyclePersistedEvidenceParser {
                 try StrictJSONKeyUniquenessValidator.validate(
                     line, line: lineNumber)
             }
-            catch StrictJSONKeyError.duplicateKey(_, _) {
+            catch StrictJSONValidationError.duplicateKey(_, _) {
                 throw RecoveryLifecycleEvidenceParseError.duplicateJSONKey(
                     line: lineNumber)
             }
-            catch StrictJSONKeyError.nestingTooDeep,
-                  StrictJSONKeyError.tokenLimitExceeded {
+            catch is StrictJSONValidationError {
                 throw RecoveryLifecycleEvidenceParseError.invalidJSON(
                     line: lineNumber)
             }

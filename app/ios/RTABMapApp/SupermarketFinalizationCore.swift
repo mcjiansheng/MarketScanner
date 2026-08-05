@@ -422,11 +422,10 @@ enum LocalizationEvidenceBundleValidator {
         do {
             try StrictJSONKeyUniquenessValidator.validate(line)
         }
-        catch StrictJSONKeyError.duplicateKey {
+        catch StrictJSONValidationError.duplicateKey {
             throw validationError("duplicate_json_key")
         }
-        catch StrictJSONKeyError.nestingTooDeep,
-              StrictJSONKeyError.tokenLimitExceeded {
+        catch is StrictJSONValidationError {
             throw validationError("invalid_json_object")
         }
         let decoded: Any
@@ -479,20 +478,23 @@ enum LocalizationEvidenceBundleValidator {
             url,
             within: url.deletingLastPathComponent().deletingLastPathComponent(),
             maximumBytes: Int64(maximumLocalizedTagsBytes)).data
-        // P7R6B: duplicate keys anywhere in the whole-array document are
-        // rejected before JSONSerialization can lose the ambiguity.
+        // P7R6B/P7R6C: duplicate keys anywhere in the whole-array document
+        // are rejected before JSONSerialization can lose the ambiguity, and
+        // the whole document goes through the one strict parser.
+        let array: [Any]
         do {
-            try StrictJSONKeyUniquenessValidator.validate(data)
+            array = try StrictJSONDocumentParser.array(
+                from: data,
+                limits: StrictJSONDocumentLimits(
+                    maximumBytes: maximumLocalizedTagsBytes))
         }
-        catch StrictJSONKeyError.duplicateKey {
+        catch StrictJSONDocumentParseError.duplicateJSONKey {
             throw validationError("duplicate_json_key")
         }
-        catch StrictJSONKeyError.nestingTooDeep,
-              StrictJSONKeyError.tokenLimitExceeded {
+        catch is StrictJSONDocumentParseError {
             throw validationError("invalid_json_array")
         }
-        guard let object = try? JSONSerialization.jsonObject(with: data),
-              let values = object as? [[String: Any]],
+        guard let values = array as? [[String: Any]],
               values.count <= maximumLocalizedTagRecords else {
             throw validationError("invalid_json_array")
         }
@@ -725,6 +727,21 @@ enum SafeSessionPath {
             == rootComponents
     }
 
+    /// Directory-level containment: the candidate directory may be the root
+    /// itself (a package directory whose manifest is a direct child) or any
+    /// descendant. File-level reads still require strict containment.
+    static func isContainedOrEqual(_ candidate: URL, in root: URL) -> Bool {
+        let rootComponents = root.standardizedFileURL
+            .resolvingSymlinksInPath().pathComponents
+        let candidateComponents = candidate.standardizedFileURL
+            .resolvingSymlinksInPath().pathComponents
+        guard candidateComponents.count >= rootComponents.count else {
+            return false
+        }
+        return Array(candidateComponents.prefix(rootComponents.count))
+            == rootComponents
+    }
+
     static func validateDirectory(_ directory: URL, within root: URL) throws {
         let descriptor = try openValidatedDirectory(directory, within: root)
         Darwin.close(descriptor)
@@ -734,7 +751,7 @@ enum SafeSessionPath {
         _ directory: URL,
         within root: URL
     ) throws -> Int32 {
-        guard isStrictlyContained(directory, in: root) else {
+        guard isContainedOrEqual(directory, in: root) else {
             throw error("directory_outside_session")
         }
         var linkInfo = stat()

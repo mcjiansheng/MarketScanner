@@ -1,59 +1,202 @@
 // P7R6B: duplicate-object-key rejection performed on the raw UTF-8 bytes
-// BEFORE JSONSerialization parses the line.
+// BEFORE JSONSerialization parses the document.
 //
-// JSONSerialization (and Python json.loads without an object_pairs_hook)
-// silently applies last-key-wins: {"episode_id":999,"episode_id":1}
-// decodes as episode_id == 1, and the original ambiguity is gone by the
-// time schema validation runs. The coordinator could then canonical-encode
-// the surviving value and acknowledge a record whose raw bytes carried two
-// conflicting keys, which a fail-closed evidence contract must reject.
+// P7R6C: the scanner is now a TOTAL FUNCTION. For every possible Data
+// input it either returns normally or throws a typed
+// StrictJSONValidationError — it never traps, never force unwraps, never
+// reads out of bounds, and never relies on a later JSONSerialization call
+// to stay memory safe. The validation runs in two explicit layers:
 //
-// This scanner is deliberately byte-level and iterative:
-//   - strings are skipped correctly (escapes, \uXXXX, surrogate pairs),
-//   - object/array structure is tracked with an explicit stack,
-//   - only object keys are collected, per object,
-//   - escaped keys are decoded to Swift String before comparison so
-//     {"episode_id":1,"\u0065pisode_id":2} is a duplicate,
-//   - depth and token counts are bounded, and no recursion is used, so a
-//     hostile deeply-nested document cannot overflow the stack.
+//   Layer 1: strict UTF-8 validation over the complete document
+//            (rejects overlong encodings, UTF-8-encoded surrogates,
+//            scalars above U+10FFFF, bad continuations and truncation).
+//   Layer 2: an iterative byte-level structure scan that tracks
+//            object/array containers on an explicit stack (no recursion,
+//            bounded depth), skips string contents correctly (escapes,
+//            \uXXXX, surrogate pairs), and collects decoded keys per
+//            object so escaped equivalents such as
+//            {"episode_id":1,"\u0065pisode_id":2} are duplicates.
 //
-// The scanner only needs to stay structurally correct for documents that
-// JSONSerialization will accept; every other syntax error is reported by
-// the full parser afterwards.
+// Duplicate keys are ambiguous evidence: JSONSerialization (and Python
+// json.loads without an object_pairs_hook) silently applies
+// last-key-wins, so the surviving value could pass canonical idempotence
+// for bytes that never had one meaning.
+//
+// There is deliberately NO fixed business token cap: a fixed
+// 1,000,000-token ceiling would mis-reject legitimate large catalogs
+// (a 16 MiB localized_price_tags.json with 50,000 tags). Safety comes
+// from the caller's byte limits, the bounded nesting depth, and an
+// iteration ceiling derived from the input size whose only job is to
+// detect scanner bugs (it is far above any legitimate iteration count).
 
 import Foundation
 
-enum StrictJSONKeyError: Error, Equatable {
+enum StrictJSONValidationError: Error, Equatable {
+    case invalidUTF8(offset: Int)
+    case invalidStringEscape(offset: Int)
+    case invalidUnicodeEscape(offset: Int)
+    case unpairedHighSurrogate(offset: Int)
+    case unpairedLowSurrogate(offset: Int)
+    case scalarOutOfRange(offset: Int)
     case duplicateKey(line: Int, key: String)
     case nestingTooDeep
-    case tokenLimitExceeded
+    case malformedStructure
 }
 
 enum StrictJSONKeyUniquenessValidator {
-    /// Bounded scan over one complete JSON document (one JSONL line).
-    /// The caller supplies the 1-based line number for stable errors.
-    static func validate(_ data: Data, line: Int = 1) throws {
-        let bytes = Array(data)
+    /// Bounded scan over one complete JSON document (a JSONL line or a
+    /// whole JSON document). The caller supplies the 1-based line number
+    /// for stable errors. Never crashes on arbitrary bytes.
+    static func validate(
+        _ data: Data,
+        line: Int = 1,
+        maximumNestingDepth: Int = RecoveryLifecycleEvidenceLimits
+            .maximumJSONNestingDepth
+    ) throws {
+        // Layer 1: the whole document must be strict UTF-8 before any
+        // structural decision is made on it.
+        try validateStrictUTF8(data)
+        // Layer 2: structure scan directly over the document bytes;
+        // no whole-file copy is made (withUnsafeBytes instead of
+        // Array(data)).
+        guard !data.isEmpty else { return }
+        try data.withUnsafeBytes { rawBuffer in
+            guard let baseAddress = rawBuffer.baseAddress else { return }
+            try scan(
+                baseAddress.assumingMemoryBound(to: UInt8.self),
+                count: rawBuffer.count,
+                line: line,
+                maximumNestingDepth: maximumNestingDepth)
+        }
+    }
+
+    static var maximumNestingDepth: Int {
+        return RecoveryLifecycleEvidenceLimits.maximumJSONNestingDepth
+    }
+
+    // MARK: - Layer 1: strict UTF-8
+
+    /// RFC 3629-strict UTF-8 validation: rejects overlong encodings,
+    /// UTF-8-encoded UTF-16 surrogates, scalars above U+10FFFF, invalid
+    /// continuation bytes and truncated sequences. Total for all bytes.
+    static func validateStrictUTF8(_ data: Data) throws {
+        try data.withUnsafeBytes { rawBuffer in
+            guard let base = rawBuffer.baseAddress else { return }
+            let bytes = base.assumingMemoryBound(to: UInt8.self)
+            let count = rawBuffer.count
+            var index = 0
+            while index < count {
+                let lead = bytes[index]
+                if lead < 0x80 {
+                    index += 1
+                    continue
+                }
+                var length = 0
+                var minimum: UInt32 = 0
+                var scalar: UInt32 = 0
+                if lead >= 0xC2 && lead <= 0xDF {
+                    length = 2
+                    minimum = 0x80
+                    scalar = UInt32(lead & 0x1F)
+                }
+                else if lead >= 0xE0 && lead <= 0xEF {
+                    length = 3
+                    minimum = 0x800
+                    scalar = UInt32(lead & 0x0F)
+                }
+                else if lead >= 0xF0 && lead <= 0xF4 {
+                    length = 4
+                    minimum = 0x10000
+                    scalar = UInt32(lead & 0x07)
+                }
+                else {
+                    throw StrictJSONValidationError.invalidUTF8(
+                        offset: index)
+                }
+                guard index + length <= count else {
+                    throw StrictJSONValidationError.invalidUTF8(
+                        offset: index)
+                }
+                for continuation in 1..<length {
+                    let continuationByte = bytes[index + continuation]
+                    guard continuationByte >= 0x80
+                            && continuationByte <= 0xBF else {
+                        throw StrictJSONValidationError.invalidUTF8(
+                            offset: index + continuation)
+                    }
+                    scalar = (scalar << 6)
+                        | UInt32(continuationByte & 0x3F)
+                }
+                guard scalar >= minimum else {
+                    throw StrictJSONValidationError.invalidUTF8(
+                        offset: index)
+                }
+                guard scalar <= 0x10FFFF else {
+                    throw StrictJSONValidationError.scalarOutOfRange(
+                        offset: index)
+                }
+                guard scalar < 0xD800 || scalar > 0xDFFF else {
+                    throw StrictJSONValidationError.invalidUTF8(
+                        offset: index)
+                }
+                index += length
+            }
+        }
+    }
+
+    // MARK: - Layer 2: structure scan with duplicate-key detection
+
+    private enum Phase {
+        case awaitingKeyOrClose
+        case awaitingColon
+        case awaitingValue
+        case awaitingValueOrClose
+    }
+
+    private enum Frame {
+        case value
+        case object(keys: Set<String>, phase: Phase)
+        case array(phase: Phase)
+    }
+
+    private static func scan(
+        _ bytes: UnsafePointer<UInt8>,
+        count: Int,
+        line: Int,
+        maximumNestingDepth: Int
+    ) throws {
         var stack: [Frame] = [.value]
         var depth = 0
-        var tokens = 0
         var index = 0
-        while index < bytes.count {
+        // Anti-bug progress bound only. Every legitimate iteration either
+        // advances the index or performs at most one transient push, so a
+        // real document never needs more than ~3 iterations per byte;
+        // the * 4 ceiling exists solely to detect a scanner bug without
+        // capping any legal business document.
+        let maximumIterations = count * 4 + 1024
+        var iterations = 0
+        while index < count {
+            iterations += 1
+            guard iterations <= maximumIterations else {
+                throw StrictJSONValidationError.malformedStructure
+            }
             let byte = bytes[index]
             if isWhitespace(byte) {
                 index += 1
                 continue
             }
-            tokens += 1
-            guard tokens <= maximumTokenCount else {
-                throw StrictJSONKeyError.tokenLimitExceeded
+            guard let top = stack.last else {
+                // The top-level value completed; any remaining bytes are
+                // trailing garbage that JSONSerialization rejects. The
+                // scanner must stay total: never index an empty stack.
+                return
             }
-            switch stack.last! {
+            switch top {
             case .value:
                 switch byte {
                 case 0x7B: // {
                     guard depth < maximumNestingDepth else {
-                        throw StrictJSONKeyError.nestingTooDeep
+                        throw StrictJSONValidationError.nestingTooDeep
                     }
                     depth += 1
                     stack[stack.count - 1] = .object(
@@ -61,24 +204,25 @@ enum StrictJSONKeyUniquenessValidator {
                     index += 1
                 case 0x5B: // [
                     guard depth < maximumNestingDepth else {
-                        throw StrictJSONKeyError.nestingTooDeep
+                        throw StrictJSONValidationError.nestingTooDeep
                     }
                     depth += 1
-                    stack[stack.count - 1] = .array(phase: .awaitingValueOrClose)
+                    stack[stack.count - 1] = .array(
+                        phase: .awaitingValueOrClose)
                     index += 1
                 case 0x22: // "
-                    let (_, next) = scanString(bytes, from: index)
+                    let (_, next) = try scanString(bytes, count, from: index)
                     index = next
                     stack.removeLast()
-                    try consumeDelimiter(bytes, &index, &stack, &depth)
+                    try consumeDelimiter(bytes, count, &index, &stack, &depth)
                 case 0x74, 0x66, 0x6E: // true / false / null
-                    index = skipLiteral(bytes, from: index)
+                    index = skipLiteral(bytes, count, from: index)
                     stack.removeLast()
-                    try consumeDelimiter(bytes, &index, &stack, &depth)
+                    try consumeDelimiter(bytes, count, &index, &stack, &depth)
                 case 0x2D, 0x30...0x39: // number
-                    index = scanNumber(bytes, from: index)
+                    index = scanNumber(bytes, count, from: index)
                     stack.removeLast()
-                    try consumeDelimiter(bytes, &index, &stack, &depth)
+                    try consumeDelimiter(bytes, count, &index, &stack, &depth)
                 default:
                     // Invalid JSON: let JSONSerialization report it exactly.
                     index += 1
@@ -90,13 +234,15 @@ enum StrictJSONKeyUniquenessValidator {
                         stack.removeLast()
                         depth -= 1
                         index += 1
-                        try consumeDelimiter(bytes, &index, &stack, &depth)
+                        try consumeDelimiter(
+                            bytes, count, &index, &stack, &depth)
                     }
                     else if byte == 0x22 { // key string
-                        let (key, next) = scanString(bytes, from: index)
+                        let (key, next) = try scanString(
+                            bytes, count, from: index)
                         var merged = keys
                         guard merged.insert(key).inserted else {
-                            throw StrictJSONKeyError.duplicateKey(
+                            throw StrictJSONValidationError.duplicateKey(
                                 line: line, key: key)
                         }
                         stack[stack.count - 1] = .object(
@@ -129,7 +275,8 @@ enum StrictJSONKeyUniquenessValidator {
                         stack.removeLast()
                         depth -= 1
                         index += 1
-                        try consumeDelimiter(bytes, &index, &stack, &depth)
+                        try consumeDelimiter(
+                            bytes, count, &index, &stack, &depth)
                     }
                     else {
                         stack.append(.value)
@@ -141,28 +288,9 @@ enum StrictJSONKeyUniquenessValidator {
                 }
             }
         }
-        // Strict JSON validity (unterminated strings, trailing commas,
-        // trailing garbage) is enforced by JSONSerialization afterwards;
-        // this scanner only guarantees duplicate-key detection.
-    }
-
-    static var maximumNestingDepth: Int {
-        return RecoveryLifecycleEvidenceLimits.maximumJSONNestingDepth
-    }
-
-    private static let maximumTokenCount = 1_000_000
-
-    private enum Phase {
-        case awaitingKeyOrClose
-        case awaitingColon
-        case awaitingValue
-        case awaitingValueOrClose
-    }
-
-    private enum Frame {
-        case value
-        case object(keys: Set<String>, phase: Phase)
-        case array(phase: Phase)
+        // Strict JSON validity (trailing commas, trailing garbage) is
+        // enforced by JSONSerialization afterwards; this scanner
+        // guarantees duplicate-key detection and memory safety only.
     }
 
     private static func isWhitespace(_ byte: UInt8) -> Bool {
@@ -173,12 +301,13 @@ enum StrictJSONKeyUniquenessValidator {
     /// container close, or end-of-document. Closes bubble up so nested
     /// containers need no recursive calls.
     private static func consumeDelimiter(
-        _ bytes: [UInt8],
+        _ bytes: UnsafePointer<UInt8>,
+        _ count: Int,
         _ index: inout Int,
         _ stack: inout [Frame],
         _ depth: inout Int
     ) throws {
-        while index < bytes.count {
+        while index < count {
             let byte = bytes[index]
             if isWhitespace(byte) {
                 index += 1
@@ -206,7 +335,8 @@ enum StrictJSONKeyUniquenessValidator {
                 return
             case .array:
                 if byte == 0x2C { // ,
-                    stack[stack.count - 1] = .array(phase: .awaitingValueOrClose)
+                    stack[stack.count - 1] = .array(
+                        phase: .awaitingValueOrClose)
                     index += 1
                     return
                 }
@@ -224,22 +354,27 @@ enum StrictJSONKeyUniquenessValidator {
         }
     }
 
-    /// Decodes one JSON string starting at the opening quote. Returns the
-    /// decoded Swift String and the index just past the closing quote.
-    /// Malformed escapes are skipped (JSONSerialization rejects them), but
-    /// every escape valid JSON defines is decoded correctly, including
-    /// surrogate pairs, so escaped keys compare equal to their raw bytes.
-    private static func scanString(_ bytes: [UInt8], from start: Int) -> (String, Int) {
+    /// Decodes one JSON string starting at the opening quote. The layer-1
+    /// UTF-8 pass guarantees valid multibyte sequences; escape sequences
+    /// are still validated here because they are ASCII-level JSON grammar,
+    /// not UTF-8. Throws a typed error instead of ever force unwrapping.
+    private static func scanString(
+        _ bytes: UnsafePointer<UInt8>,
+        _ count: Int,
+        from start: Int
+    ) throws -> (String, Int) {
         var index = start + 1
         var result = ""
-        while index < bytes.count {
+        while index < count {
             let byte = bytes[index]
             if byte == 0x22 { // closing quote
                 return (result, index + 1)
             }
             if byte == 0x5C { // backslash escape
                 index += 1
-                guard index < bytes.count else { break }
+                guard index < count else {
+                    throw StrictJSONValidationError.malformedStructure
+                }
                 let escape = bytes[index]
                 switch escape {
                 case 0x22: result.append("\""); index += 1
@@ -252,92 +387,123 @@ enum StrictJSONKeyUniquenessValidator {
                 case 0x74: result.append("\t"); index += 1
                 case 0x75: // \uXXXX
                     index += 1
-                    let (scalar, next) = scanUnicodeEscape(bytes, from: index)
-                    result.append(Character(UnicodeScalar(scalar)!))
+                    let (scalar, next) = try scanUnicodeEscape(
+                        bytes, count, from: index)
+                    guard let unicodeScalar = UnicodeScalar(scalar) else {
+                        throw StrictJSONValidationError.scalarOutOfRange(
+                            offset: index)
+                    }
+                    result.append(Character(unicodeScalar))
                     index = next
                 default:
-                    index += 1 // invalid escape; JSONSerialization rejects
+                    throw StrictJSONValidationError.invalidStringEscape(
+                        offset: index)
                 }
                 continue
             }
             if byte < 0x80 {
                 result.append(Character(UnicodeScalar(byte)))
                 index += 1
+                continue
             }
-            else if byte >= 0xC2 && byte <= 0xDF {
-                guard index + 1 < bytes.count else { break }
-                let scalar = (UInt32(byte & 0x1F) << 6)
-                    | UInt32(bytes[index + 1] & 0x3F)
-                result.append(Character(UnicodeScalar(scalar)!))
+            // Layer 1 proved the whole document is strict UTF-8, so the
+            // multibyte decode below can only meet valid sequences; the
+            // guards stay as cheap defense in depth, never force unwraps.
+            if byte >= 0xC2 && byte <= 0xDF {
+                guard index + 1 < count,
+                      let scalar = UnicodeScalar(
+                          (UInt32(byte & 0x1F) << 6)
+                              | UInt32(bytes[index + 1] & 0x3F)) else {
+                    throw StrictJSONValidationError.invalidUTF8(
+                        offset: index)
+                }
+                result.append(Character(scalar))
                 index += 2
             }
             else if byte >= 0xE0 && byte <= 0xEF {
-                guard index + 2 < bytes.count else { break }
-                let scalar = (UInt32(byte & 0x0F) << 12)
-                    | (UInt32(bytes[index + 1] & 0x3F) << 6)
-                    | UInt32(bytes[index + 2] & 0x3F)
-                result.append(Character(UnicodeScalar(scalar)!))
+                guard index + 2 < count,
+                      let scalar = UnicodeScalar(
+                          (UInt32(byte & 0x0F) << 12)
+                              | (UInt32(bytes[index + 1] & 0x3F) << 6)
+                              | UInt32(bytes[index + 2] & 0x3F)) else {
+                    throw StrictJSONValidationError.invalidUTF8(
+                        offset: index)
+                }
+                result.append(Character(scalar))
                 index += 3
             }
             else if byte >= 0xF0 && byte <= 0xF4 {
-                guard index + 3 < bytes.count else { break }
-                let scalar = (UInt32(byte & 0x07) << 18)
-                    | (UInt32(bytes[index + 1] & 0x3F) << 12)
-                    | (UInt32(bytes[index + 2] & 0x3F) << 6)
-                    | UInt32(bytes[index + 3] & 0x3F)
-                result.append(Character(UnicodeScalar(scalar)!))
+                guard index + 3 < count,
+                      let scalar = UnicodeScalar(
+                          (UInt32(byte & 0x07) << 18)
+                              | (UInt32(bytes[index + 1] & 0x3F) << 12)
+                              | (UInt32(bytes[index + 2] & 0x3F) << 6)
+                              | UInt32(bytes[index + 3] & 0x3F)) else {
+                    throw StrictJSONValidationError.invalidUTF8(
+                        offset: index)
+                }
+                result.append(Character(scalar))
                 index += 4
             }
             else {
-                index += 1 // invalid UTF-8; JSONSerialization rejects
+                // Unreachable after layer 1 (invalid lead byte), but never
+                // assume: keep the function total on every byte.
+                throw StrictJSONValidationError.invalidUTF8(offset: index)
             }
         }
-        return (result, index)
+        throw StrictJSONValidationError.malformedStructure
     }
 
     /// Decodes one \uXXXX escape (with surrogate-pair continuation when
-    /// present). Invalid sequences map to U+FFFD; JSONSerialization reports
-    /// the exact syntax error for the line.
+    /// present). Unpaired surrogates are typed errors, never a trap.
     private static func scanUnicodeEscape(
-        _ bytes: [UInt8],
+        _ bytes: UnsafePointer<UInt8>,
+        _ count: Int,
         from index: Int
-    ) -> (UInt32, Int) {
+    ) throws -> (UInt32, Int) {
         var value: UInt32 = 0
         var cursor = index
         for _ in 0..<4 {
-            guard cursor < bytes.count,
+            guard cursor < count,
                   let digit = hexDigit(bytes[cursor]) else {
-                return (0xFFFD, cursor)
+                throw StrictJSONValidationError.invalidUnicodeEscape(
+                    offset: index)
             }
             value = value * 16 + digit
             cursor += 1
         }
         if value >= 0xD800 && value <= 0xDBFF {
-            if cursor + 1 < bytes.count + 1,
-               bytes[cursor] == 0x5C,
-               cursor + 1 < bytes.count,
-               bytes[cursor + 1] == 0x75 {
-                var low: UInt32 = 0
-                var lowCursor = cursor + 2
-                for _ in 0..<4 {
-                    guard lowCursor < bytes.count,
-                          let digit = hexDigit(bytes[lowCursor]) else {
-                        return (0xFFFD, cursor)
-                    }
-                    low = low * 16 + digit
-                    lowCursor += 1
-                }
-                if low >= 0xDC00 && low <= 0xDFFF {
-                    let combined = 0x10000
-                        + ((value - 0xD800) << 10)
-                        + (low - 0xDC00)
-                    return (combined, lowCursor)
-                }
+            // A high surrogate must be followed by \uDC00-\uDFFF.
+            guard cursor + 5 < count + 1,
+                  bytes[cursor] == 0x5C,
+                  cursor + 1 < count,
+                  bytes[cursor + 1] == 0x75 else {
+                throw StrictJSONValidationError.unpairedHighSurrogate(
+                    offset: index)
             }
-            return (0xFFFD, cursor)
+            var low: UInt32 = 0
+            var lowCursor = cursor + 2
+            for _ in 0..<4 {
+                guard lowCursor < count,
+                      let digit = hexDigit(bytes[lowCursor]) else {
+                    throw StrictJSONValidationError.invalidUnicodeEscape(
+                        offset: cursor)
+                }
+                low = low * 16 + digit
+                lowCursor += 1
+            }
+            guard low >= 0xDC00 && low <= 0xDFFF else {
+                throw StrictJSONValidationError.unpairedHighSurrogate(
+                    offset: index)
+            }
+            let combined = 0x10000
+                + ((value - 0xD800) << 10)
+                + (low - 0xDC00)
+            return (combined, lowCursor)
         }
-        if value >= 0xDC00 && value <= 0xDFFF {
-            return (0xFFFD, cursor)
+        guard value < 0xDC00 || value > 0xDFFF else {
+            throw StrictJSONValidationError.unpairedLowSurrogate(
+                offset: index)
         }
         return (value, cursor)
     }
@@ -354,7 +520,11 @@ enum StrictJSONKeyUniquenessValidator {
     /// Skips one JSON literal (`true`/`false`/`null`) entirely. Skipping a
     /// single byte would desynchronize the delimiter scan and could report
     /// a false duplicate key on a valid document.
-    private static func skipLiteral(_ bytes: [UInt8], from start: Int) -> Int {
+    private static func skipLiteral(
+        _ bytes: UnsafePointer<UInt8>,
+        _ count: Int,
+        from start: Int
+    ) -> Int {
         let literal: [UInt8]
         switch bytes[start] {
         case 0x74: literal = Array("true".utf8)
@@ -362,21 +532,33 @@ enum StrictJSONKeyUniquenessValidator {
         case 0x6E: literal = Array("null".utf8)
         default: return start + 1
         }
-        if start + literal.count <= bytes.count,
-           Array(bytes[start..<(start + literal.count)]) == literal {
-            return start + literal.count
+        if start + literal.count <= count {
+            var matched = true
+            for offset in 0..<literal.count {
+                if bytes[start + offset] != literal[offset] {
+                    matched = false
+                    break
+                }
+            }
+            if matched {
+                return start + literal.count
+            }
         }
         return start + 1 // invalid literal; JSONSerialization rejects it
     }
 
     /// Skips one JSON number token and returns the index after it.
     /// JSONSerialization validates the exact grammar afterwards.
-    private static func scanNumber(_ bytes: [UInt8], from start: Int) -> Int {
+    private static func scanNumber(
+        _ bytes: UnsafePointer<UInt8>,
+        _ count: Int,
+        from start: Int
+    ) -> Int {
         var index = start
-        if index < bytes.count && bytes[index] == 0x2D {
+        if index < count && bytes[index] == 0x2D {
             index += 1
         }
-        while index < bytes.count,
+        while index < count,
               isNumberByte(bytes[index]) {
             index += 1
         }
