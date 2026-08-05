@@ -123,10 +123,6 @@ enum LocalizationEvidenceBundleValidator {
         let requiredNonEmpty: Bool
         let strictlyIncreasingTimestamps: Bool
         let recordIdField: String?
-        /// P7R6: sidecar formats that kept their readers across a schema
-        /// upgrade accept every listed version; others stay pinned to
-        /// `version`.
-        var allowedVersions: Set<Int>? = nil
     }
 
     private struct JSONLValidationSummary {
@@ -184,12 +180,13 @@ enum LocalizationEvidenceBundleValidator {
                 requiredNonEmpty: false,
                 strictlyIncreasingTimestamps: false,
                 recordIdField: "observation_id"),
-            // Terminal Recovery lifecycle evidence (P7R5, P7R6 exact-count).
-            // Timestamps are monotonic uptimes, not node-timebase stamps, so
-            // this contract is validated through the recovery-specific
-            // business branch. The record count is bound to the capture
-            // watermark and the file may only be empty when zero episodes
-            // were recorded.
+            // Terminal Recovery lifecycle evidence (P7R5, P7R6 exact-count,
+            // P7R6A shared parser). Timestamps are monotonic uptimes, not
+            // node-timebase stamps, so this contract is validated through
+            // RecoveryLifecyclePersistedEvidenceParser, the same strict
+            // parser the persistence coordinator uses. The record count is
+            // bound to the capture watermark and the file may only be empty
+            // when zero episodes were recorded.
             JSONLContract(
                 fileName: "localization_recovery_events.jsonl",
                 format: "MarketScannerRecoveryLifecycleEvent",
@@ -197,23 +194,39 @@ enum LocalizationEvidenceBundleValidator {
                 expectedCount: expectation.recoveryEventCount,
                 requiredNonEmpty: expectation.recoveryEventCount > 0,
                 strictlyIncreasingTimestamps: false,
-                recordIdField: nil,
-                allowedVersions: [1, 2]),
+                recordIdField: nil),
         ]
         var blockers: [String] = []
         var summaries: [String: JSONLValidationSummary] = [:]
         for contract in required + optional {
             let url = segmentDirectory.appendingPathComponent(contract.fileName)
             do {
-                summaries[contract.fileName] = try validateJSONL(
-                    at: url,
-                    within: segmentDirectory.deletingLastPathComponent(),
-                    contract: contract,
-                    expectation: expectation)
+                if contract.fileName == "localization_recovery_events.jsonl" {
+                    summaries[contract.fileName] =
+                        try validateRecoveryLifecycleEvidence(
+                            at: url,
+                            within:
+                                segmentDirectory.deletingLastPathComponent(),
+                            expectation: expectation)
+                }
+                else {
+                    summaries[contract.fileName] = try validateJSONL(
+                        at: url,
+                        within: segmentDirectory.deletingLastPathComponent(),
+                        contract: contract,
+                        expectation: expectation)
+                }
             }
             catch {
-                blockers.append(
-                    "evidence_bundle_\(contract.fileName)_\(stableReason(error))")
+                // The recovery watermark blocker keeps its historical name
+                // without the file-name infix.
+                if stableReason(error) == "recovery_watermark_mismatch" {
+                    blockers.append("evidence_bundle_recovery_watermark_mismatch")
+                }
+                else {
+                    blockers.append(
+                        "evidence_bundle_\(contract.fileName)_\(stableReason(error))")
+                }
             }
         }
 
@@ -236,28 +249,6 @@ enum LocalizationEvidenceBundleValidator {
            let lastState = states.lastState,
            lastState != expectation.lastDurableState {
             blockers.append("evidence_bundle_localization_events_watermark_mismatch")
-        }
-        // The recovery watermark must reconcile with the last persisted
-        // episode: same episode ID and same terminal finish uptime.
-        if expectation.recoveryEventCount > 0,
-           let recovery = summaries["localization_recovery_events.jsonl"] {
-            if expectation.lastRecoveryEpisodeId == nil
-                || recovery.lastRecoveryEpisodeId
-                    != expectation.lastRecoveryEpisodeId {
-                blockers.append(
-                    "evidence_bundle_recovery_watermark_mismatch")
-            }
-            if let expectedFinished =
-                expectation.lastRecoveryFinishedAtUptime,
-               let observedFinished = recovery.previousTimestamp,
-               abs(observedFinished - expectedFinished) > 1.0e-9 {
-                blockers.append(
-                    "evidence_bundle_recovery_watermark_mismatch")
-            }
-            else if expectation.lastRecoveryFinishedAtUptime == nil {
-                blockers.append(
-                    "evidence_bundle_recovery_watermark_mismatch")
-            }
         }
         return Array(Set(blockers)).sorted()
     }
@@ -318,6 +309,97 @@ enum LocalizationEvidenceBundleValidator {
         return summary
     }
 
+    /// P7R6A: recovery lifecycle finalization delegates every JSONL
+    /// decision (syntax, schema, ordering, identity, watermark) to the
+    /// same strict parser the persistence coordinator uses, so one file is
+    /// accepted by both or rejected by both. Legacy blocker reasons are
+    /// preserved through `legacyRecoveryReason`.
+    private static func validateRecoveryLifecycleEvidence(
+        at url: URL,
+        within root: URL,
+        expectation: LocalizationEvidenceBundleExpectation
+    ) throws -> JSONLValidationSummary {
+        guard (0...maximumRecords).contains(expectation.recoveryEventCount)
+        else {
+            throw validationError("expected_count_out_of_range")
+        }
+        let fileLimit = Int64(min(
+            maximumRequiredJSONLBytes,
+            max(
+                1024 * 1024,
+                expectation.recoveryEventCount * 64 * 1024 + 1024 * 1024)))
+        // One stable read; the parser only ever consumes this snapshot.
+        let snapshot = try SafeSessionPath.readRegularFile(
+            url,
+            within: root,
+            maximumBytes: fileLimit).data
+        if snapshot.isEmpty, expectation.recoveryEventCount > 0 {
+            // An emptied sidecar must not mask a positive watermark; keep
+            // the legacy "empty" blocker instead of the count reason.
+            throw validationError("empty")
+        }
+        var summary = JSONLValidationSummary()
+        do {
+            let parsed = try RecoveryLifecyclePersistedEvidenceParser.parse(
+                snapshot: snapshot,
+                expectation: RecoveryLifecycleEvidenceExpectation(
+                    trackingSessionId: expectation.trackingSessionId,
+                    priorMapId: expectation.priorMapId,
+                    priorMapSha256: expectation.priorMapSha256,
+                    floorId: expectation.floorId,
+                    expectedRecordCount: expectation.recoveryEventCount,
+                    expectedLastEpisodeId: expectation.lastRecoveryEpisodeId,
+                    expectedLastFinishedAtUptime:
+                        expectation.lastRecoveryFinishedAtUptime))
+            summary.count = parsed.recordCount
+            summary.lastRecoveryEpisodeId = parsed.lastEpisodeId
+            summary.previousTimestamp = parsed.lastFinishedAtUptime
+        }
+        catch let error as RecoveryLifecycleEvidenceParseError {
+            throw validationError(legacyRecoveryReason(for: error))
+        }
+        return summary
+    }
+
+    private static func legacyRecoveryReason(
+        for error: RecoveryLifecycleEvidenceParseError
+    ) -> String {
+        switch error {
+        case .fileTooLarge, .recordTooLarge:
+            return "record_too_large"
+        case .missingFinalNewline, .invalidUTF8:
+            return "invalid_utf8_or_partial_line"
+        case .blankRecord:
+            return "blank_record"
+        case .invalidJSON, .nonObject:
+            return "invalid_json_object"
+        case .unknownField:
+            return "recovery_unknown_field"
+        case .formatMismatch, .versionMismatch:
+            return "format_or_version_mismatch"
+        case .identityMismatch:
+            return "identity_mismatch"
+        case .outcomeInvalid:
+            return "recovery_outcome_invalid"
+        case .cancellationReasonInvalid:
+            return "recovery_cancellation_reason_invalid"
+        case .businessSchemaInvalid:
+            return "recovery_business_schema_invalid"
+        case .triggerRecordsInvalid:
+            return "recovery_trigger_records_invalid"
+        case .duplicateEpisode:
+            return "recovery_duplicate_episode"
+        case .episodeOrderInvalid:
+            return "recovery_episode_order_invalid"
+        case .finishOrderInvalid:
+            return "recovery_finish_order_invalid"
+        case .expectedCountMismatch:
+            return "count_mismatch"
+        case .lastEpisodeWatermarkMismatch, .lastFinishedWatermarkMismatch:
+            return "recovery_watermark_mismatch"
+        }
+    }
+
     private static func validateJSONLRecord(
         _ line: Data,
         contract: JSONLContract,
@@ -347,12 +429,7 @@ enum LocalizationEvidenceBundleValidator {
             throw validationError("format_or_version_mismatch")
         }
         let version = strictInteger(object["version"])
-        if let allowedVersions = contract.allowedVersions {
-            guard let version, allowedVersions.contains(version) else {
-                throw validationError("format_or_version_mismatch")
-            }
-        }
-        else if version != contract.version {
+        if version != contract.version {
             throw validationError("format_or_version_mismatch")
         }
         try validateIdentity(object, expectation: expectation)
@@ -479,165 +556,6 @@ enum LocalizationEvidenceBundleValidator {
         fileName: String,
         summary: inout JSONLValidationSummary
     ) throws -> Double {
-        if fileName == "localization_recovery_events.jsonl" {
-            // Recovery lifecycle records carry monotonic uptimes instead of
-            // the node-timebase contract: episodes may terminate during scan
-            // teardown when no frame binding exists.
-            let version = strictInteger(object["version"])
-            var allowedFields: Set<String> = [
-                "format", "version", "tracking_session_id", "prior_map_id",
-                "prior_map_sha256", "floor_id", "episode_id", "reason",
-                "outcome", "cancellation_reason", "episode_automatic",
-                "started_at_uptime", "finished_at_uptime", "elapsed_ms",
-                "valid_matcher_attempts", "accepted_corrections",
-                "trigger_count", "automatic_trigger_count",
-                "reliable_loop_trigger_count", "last_trigger_reason",
-                "last_trigger_at_uptime", "selected_hypothesis_id",
-                "fresh_support_frames", "final_residual_translation_m",
-                "final_residual_yaw_rad", "completion_frame_step_applied",
-            ]
-            if version == 2 {
-                allowedFields.formUnion([
-                    "deadline_uptime",
-                    "maximum_valid_attempts",
-                    "trigger_records",
-                ])
-            }
-            guard Set(object.keys).isSubset(of: allowedFields) else {
-                throw validationError("recovery_unknown_field")
-            }
-            guard let outcome = object["outcome"] as? String,
-                  ["converged", "timed_out", "cancelled", "manual_reset"]
-                      .contains(outcome) else {
-                throw validationError("recovery_outcome_invalid")
-            }
-            let cancellationValue = object["cancellation_reason"]
-            let cancellationPresent = cancellationValue != nil
-                && !(cancellationValue is NSNull)
-            if outcome == "cancelled" {
-                guard let reason = cancellationValue as? String,
-                      [
-                          "scan_stopped", "map_unloaded", "app_interrupted",
-                          "session_generation_changed", "operator_cancelled",
-                      ].contains(reason) else {
-                    throw validationError("recovery_cancellation_reason_invalid")
-                }
-            }
-            else if cancellationPresent {
-                throw validationError("recovery_cancellation_reason_invalid")
-            }
-            guard let started = strictNumber(field(
-                    object, "started_at_uptime", "startedAtUptime")),
-                  started >= 0,
-                  let finished = strictNumber(field(
-                    object, "finished_at_uptime", "finishedAtUptime")),
-                  finished >= started,
-                  let elapsedMs = strictNumber(field(
-                    object, "elapsed_ms", "elapsedMs")),
-                  elapsedMs >= 0,
-                  abs(elapsedMs - (finished - started) * 1000) <= 1.0,
-                  let episodeId = strictInteger(field(
-                    object, "episode_id", "episodeId")),
-                  episodeId > 0,
-                  let validMatcherAttempts = strictInteger(field(
-                    object,
-                    "valid_matcher_attempts",
-                    "validMatcherAttempts")),
-                  validMatcherAttempts >= 0,
-                  let acceptedCorrections = strictInteger(field(
-                    object,
-                    "accepted_corrections",
-                    "acceptedCorrections")),
-                  (0...validMatcherAttempts).contains(acceptedCorrections),
-                  let triggerCount = strictInteger(field(
-                    object, "trigger_count", "triggerCount")),
-                  triggerCount >= 1,
-                  let automaticTriggerCount = strictInteger(field(
-                    object,
-                    "automatic_trigger_count",
-                    "automaticTriggerCount")),
-                  automaticTriggerCount >= 0,
-                  let reliableLoopTriggerCount = strictInteger(field(
-                    object,
-                    "reliable_loop_trigger_count",
-                    "reliableLoopTriggerCount")),
-                  reliableLoopTriggerCount >= 0,
-                  automaticTriggerCount + reliableLoopTriggerCount
-                    == triggerCount,
-                  nonEmptyString(object["last_trigger_reason"]),
-                  let lastTriggerAtUptime = strictNumber(field(
-                    object,
-                    "last_trigger_at_uptime",
-                    "lastTriggerAtUptime")),
-                  lastTriggerAtUptime >= started,
-                  lastTriggerAtUptime <= finished,
-                  let freshSupportFrames = strictInteger(field(
-                    object,
-                    "fresh_support_frames",
-                    "freshSupportFrames")),
-                  freshSupportFrames >= 0,
-                  object["episode_automatic"] is Bool,
-                  object["completion_frame_step_applied"] is Bool,
-                  nonEmptyString(object["reason"]) else {
-                throw validationError("recovery_business_schema_invalid")
-            }
-            if version == 2 {
-                guard let deadline = strictNumber(field(
-                        object, "deadline_uptime", "deadlineUptime")),
-                      deadline >= started,
-                      let maximumValidAttempts = strictInteger(field(
-                        object,
-                        "maximum_valid_attempts",
-                        "maximumValidAttempts")),
-                      maximumValidAttempts >= 1,
-                      validMatcherAttempts <= maximumValidAttempts else {
-                    throw validationError("recovery_business_schema_invalid")
-                }
-                try validateRecoveryTriggerRecords(
-                    object,
-                    startedAtUptime: started,
-                    finishedAtUptime: finished,
-                    lastTriggerReason: object["last_trigger_reason"] as? String,
-                    lastTriggerAtUptime: lastTriggerAtUptime)
-            }
-            func optionalNonNegative(_ snake: String, _ camel: String) throws {
-                let value = field(object, snake, camel)
-                guard value != nil && !(value is NSNull) else { return }
-                guard let number = strictNumber(value), number >= 0 else {
-                    throw validationError("recovery_business_schema_invalid")
-                }
-            }
-            let hypothesis = field(
-                object, "selected_hypothesis_id", "selectedHypothesisId")
-            if hypothesis != nil && !(hypothesis is NSNull) {
-                guard let hypothesisId = strictInteger(hypothesis),
-                      hypothesisId > 0 else {
-                    throw validationError("recovery_business_schema_invalid")
-                }
-            }
-            try optionalNonNegative(
-                "final_residual_translation_m",
-                "finalResidualTranslationM")
-            try optionalNonNegative(
-                "final_residual_yaw_rad", "finalResidualYawRad")
-            // Episode set contract: IDs are unique and strictly increasing,
-            // terminal finish uptimes never move backwards, and every record
-            // stays bound to its session watermark.
-            if summary.seenRecordIds.contains("episode_\(episodeId)") {
-                throw validationError("recovery_duplicate_episode")
-            }
-            summary.seenRecordIds.insert("episode_\(episodeId)")
-            if let previousEpisodeId = summary.lastRecoveryEpisodeId,
-               episodeId <= previousEpisodeId {
-                throw validationError("recovery_episode_order_invalid")
-            }
-            summary.lastRecoveryEpisodeId = episodeId
-            if let previousFinished = summary.previousTimestamp,
-               finished < previousFinished {
-                throw validationError("recovery_finish_order_invalid")
-            }
-            return finished
-        }
         let frameTimestamp = fileName == "tag_observations.jsonl"
             || fileName == "manual_localization_events.jsonl"
         let rawKey = frameTimestamp ? "frameTimestamp" : "timestamp"
@@ -687,44 +605,6 @@ enum LocalizationEvidenceBundleValidator {
             break
         }
         return converted
-    }
-
-    private static func validateRecoveryTriggerRecords(
-        _ object: [String: Any],
-        startedAtUptime: Double,
-        finishedAtUptime: Double,
-        lastTriggerReason: String?,
-        lastTriggerAtUptime: Double
-    ) throws {
-        guard let records = object["trigger_records"] as? [[String: Any]],
-              !records.isEmpty,
-              records.count <= 8 else {
-            throw validationError("recovery_trigger_records_invalid")
-        }
-        var previousUptime: Double?
-        for record in records {
-            guard Set(record.keys).isSubset(
-                    of: ["reason", "automatic", "at_uptime"]),
-                  nonEmptyString(record["reason"]),
-                  record["automatic"] is Bool,
-                  let uptime = strictNumber(record["at_uptime"]),
-                  uptime >= startedAtUptime,
-                  uptime <= finishedAtUptime else {
-                throw validationError("recovery_trigger_records_invalid")
-            }
-            if let previous = previousUptime, uptime < previous {
-                throw validationError("recovery_trigger_records_invalid")
-            }
-            previousUptime = uptime
-        }
-        // Bounded eviction may drop early records, but the newest retained
-        // record must always agree with the persisted trigger summary.
-        guard let newest = records.last,
-              newest["reason"] as? String == lastTriggerReason,
-              let newestUptime = strictNumber(newest["at_uptime"]),
-              abs(newestUptime - lastTriggerAtUptime) <= 1.0e-9 else {
-            throw validationError("recovery_trigger_records_invalid")
-        }
     }
 
     private static func field(
