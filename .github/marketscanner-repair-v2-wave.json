@@ -1,8 +1,8 @@
 {
-  "wave": "P7R6A-recovery-persisted-parser-closeout",
-  "branch": "repair-v2-p7r6a-recovery-persisted-parser-closeout",
-  "base_branch": "repair-v2-p7r6-recovery-evidence-integrity-closeout",
-  "base_sha": "4bce394bdfb7f6c7c2373f314814a3e3260356fe",
-  "p7r6_implementation_sha": "a315ff6e5c0ca639f12c639aaf81be6738195e2f",
-  "implementation_sha": "01a42a40e9671c709c4e0f9e1f85839a48dd4a83"
+  "wave": "P7R6B-strict-json-pending-queue-closeout",
+  "branch": "repair-v2-p7r6b-strict-json-pending-queue-closeout",
+  "base_branch": "repair-v2-p7r6a-recovery-persisted-parser-closeout",
+  "base_sha": "f4524d958913e927a33a7295f45ccf7b3a98d42a",
+  "p7r6a_implementation_sha": "01a42a40e9671c709c4e0f9e1f85839a48dd4a83",
+  "implementation_sha": "ff8ad8f1e1fba64f3ab2c2a6a95e0fd4d95e2a27c"
 }
