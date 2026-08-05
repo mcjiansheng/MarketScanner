@@ -30,3 +30,9 @@ __pycache__/
 *.bak
 .venv/
 /artifacts/
+
+# AI assistant workspace artifacts
+.qoder/
+.workbuddy-ai/
+.workbuddy/
+docs.zip

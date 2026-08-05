@@ -258,3 +258,52 @@ The PC reader checks the file size before reading and the record/nesting depth p
 ## Status words
 
 IMPLEMENTED, UNIT TESTED, INTEGRATION TESTED (P-B1..P-B15 Swift host; shared Swift/PC fixtures). Exact-final-SHA CI on the P7R6B HEAD, the clean Apple build and the independent read-only review remain NOT RUN; human Sam re-test and real-device field runs are NOT RUN and must never be reported as PASS.
+
+# P7R6C stable-input snapshot and total JSON validator contracts
+
+Last reconciled: 2026-08-05. This wave closes the total-function, token-cap, iOS package TOCTOU, PC session-input hash/parse decoupling and strict prior-map schema findings of the P7R6B review.
+
+## Total strict JSON validator (C1)
+
+`StrictJSONKeyUniquenessValidator.validate(_:line:maximumNestingDepth:)` is a **total function**: for any `Data` input it returns or throws a typed `StrictJSONValidationError` and never crashes, never reads out of bounds and never force-unwraps. Two layers run before any structural decision:
+
+1. `validateStrictUTF8`: strict RFC 3629 over the whole document — rejects overlong encodings, UTF-8-encoded UTF-16 surrogates, scalars above U+10FFFF, invalid continuation bytes and truncated 2/3/4-byte sequences.
+2. The structural scan iterates the raw bytes (`data.withUnsafeBytes`, no whole-file copy) with an explicit stack, decodes `\uXXXX` escapes with high/low surrogate pairing, and compares decoded keys per object so `{"a":1,"\u0061":2}` is a duplicate. It never indexes an empty stack: after the top-level value completes, trailing bytes are left for `JSONSerialization` to reject.
+
+Stable errors carry byte offsets: `invalidUTF8`, `invalidStringEscape`, `invalidUnicodeEscape`, `unpairedHighSurrogate`, `unpairedLowSurrogate`, `scalarOutOfRange`, `duplicateKey(line:key:)`, `nestingTooDeep`, `malformedStructure`. The deterministic fuzz (10,000 random byte arrays, length 0–4096, U10/TJ9) may only observe return-or-throw.
+
+## Byte-derived progress bound, no token cap (C2)
+
+The old fixed 1,000,000-token cap is gone. The scanner enforces a **progress bound derived from the byte count**:
+
+```text
+maximumIterations = data.count * 4 + 1024
+```
+
+Every legal document advances the index or performs at most one transient push per iteration, so the bound is provably above any legal input and exists only to detect scanner bugs. `StrictJSONDocumentLimits.maximumBytes`/`maximumNestingDepth` drive the strict document parser; the whole-array tag file (16 MiB, 50,000 tags) is scanned and parsed without copying the `Data` (extra memory is `O(depth + key set)`, not `O(file size)`). The largest legal catalog that fits below 16 MiB finalizes cleanly; a 16 MiB + 1 byte file fails the frozen size limit; duplicate keys and numeric booleans are still detected in the last tag.
+
+## Prior-map package immutable snapshot (C3)
+
+A prior-map package is read exactly once into `PriorMapPackageSnapshot`; integrity validation, format checks, model decoding and previews all consume that same snapshot. Per artifact the descriptor-bound read (`SafeSessionPath.readRegularFile`: no-follow, regular file, `st_nlink == 1`, size bounded, pre/post identity) returns bytes that are simultaneously hashed and (for JSON) strictly parsed, so the returned package SHA can never describe bytes the loader never parsed.
+
+```text
+package_manifest.json <= 2 MiB
+individual JSON       <= 64 MiB
+preview image         <= 64 MiB
+total package         <= 512 MiB
+artifact count        <= 128
+```
+
+Directory identity is captured before and after the reads; symlinked/hard-linked artifacts, truncation, file-set changes, preview swaps, same-size self-consistent replacements and duplicate keys in the manifest/elements/validation report all fail closed.
+
+## PC finalized-session input snapshot (C4)
+
+`read_finalized_session_input_snapshot` reads metadata, the source database, all JSONL sidecars and `localized_price_tags.json` exactly once through descriptor-stable reads (`_stable_read_bytes`/`_read_jsonl_stable`), parses the same bytes, and derives the manifest identities from them. The bytes bound by `session_input_bundle_sha256` are therefore exactly the bytes localization/review/export consume; `build_session_input_manifest` stays as a re-verification path and the render before/after checks remain tamper gates. The source database is never opened by SQLite directly: a descriptor-verified immutable copy (Plan A) is created and verified against the snapshot identity, and SQLite only opens that copy. Metadata identity and the v1/v2 version decision come from one stable read.
+
+## Prior-map strict JSON schema (C5)
+
+All formal prior-map JSON documents go through the shared strict helpers (strict UTF-8, NaN rejection, `object_pairs_hook` duplicate rejection, iterative nesting depth). Integers, numbers, booleans, geometry coordinates and bounds are read with `StrictJSONScalar` on device, so fractional versions, boolean counts/bytes/visibility, boolean coordinates/bounds and duplicate or escaped-equivalent keys are rejected identically on both readers.
+
+## Status words
+
+IMPLEMENTED, UNIT TESTED, INTEGRATION TESTED (C1/C2 U1-U10/TJ9/TJ10 and L1-L6 Swift host; C3 integrity-suite; C4 S1-S12 PC snapshot; C5 N1-N9 strict schema; shared Swift/PC fixtures). Exact-final-SHA CI on the P7R6C HEAD, the clean Apple build and the independent read-only review remain NOT RUN; human Sam re-test and real-device field runs are NOT RUN and must never be reported as PASS.
