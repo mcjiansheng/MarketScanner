@@ -23,6 +23,7 @@ SOURCE_DIRECTORIES = (
     Path("tools/SupermarketMapStudio"),
     Path("tools/Supermarket2DMap"),
     Path("tools/PriorMap"),
+    Path("tools/Qualification"),
 )
 EXCLUDED_PARTS = {"__pycache__", "tests", ".pytest_cache"}
 EXCLUDED_NAMES = {
