@@ -413,6 +413,22 @@ class IOSCoreContractTests(unittest.TestCase):
             / "app/ios/RTABMapApp/MobileResults/MobileResultExporter.swift",
             repository
             / "app/ios/RTABMapApp/MobileResults/XLSXWorkbookWriter.swift",
+            # Mobile-Only V1R1: workflow state machine, durable map/task/
+            # result stores and the end-to-end processing pipeline (all
+            # Foundation-only; the UIKit coordinator/UI live in the app
+            # target and are validated by the Xcode build instead).
+            repository
+            / "app/ios/RTABMapApp/MobileOnlyWorkflow/MobileOnlyWorkflowState.swift",
+            repository
+            / "app/ios/RTABMapApp/MobileOnlyWorkflow/MobileOnlyWorkflowError.swift",
+            repository
+            / "app/ios/RTABMapApp/MobileOnlyWorkflow/MobileMapLibrary.swift",
+            repository
+            / "app/ios/RTABMapApp/MobileOnlyWorkflow/MobileProcessingTaskStore.swift",
+            repository
+            / "app/ios/RTABMapApp/MobileOnlyWorkflow/MobileResultLibrary.swift",
+            repository
+            / "app/ios/RTABMapApp/MobileOnlyWorkflow/MobileProcessingPipeline.swift",
         ]
         swift_test = Path(__file__).with_name("swift") / "main.swift"
         with tempfile.TemporaryDirectory() as temporary:

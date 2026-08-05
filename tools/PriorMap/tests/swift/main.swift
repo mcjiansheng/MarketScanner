@@ -6643,6 +6643,174 @@ if CommandLine.arguments.count == 3,
     }
 }
 
+// === Mobile-Only V1R1: Replay E2E (raw map source -> phone compile ->
+// finalized session -> snapshot -> Fast Path -> trajectory -> tags ->
+// result package -> streaming XLSX -> reopen validation) ===
+// Runs through the production importer/compiler/pipeline only; no direct
+// construction of FinalTrajectory.Node or FinalPriceTag (V1R1 §15).
+do {
+    let temporary = FileManager.default.temporaryDirectory
+        .appendingPathComponent("ms-replay-e2e-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(
+        at: temporary, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: temporary) }
+
+    // 1) Raw map source (CSV) -> production importer -> canonical v2.
+    let csv = """
+    floor,element
+    1,"{""shapeType"":""MapShelf"",""x"":100,""y"":100,""width"":300,""height"":80,""code"":""S1""}"
+    1,"{""shapeType"":""MapTable"",""x"":500,""y"":100,""width"":200,""height"":100,""code"":""T1""}"
+    1,"{""shapeType"":""MapRoadPoint"",""x"":10,""y"":10,""code"":""P1""}"
+    """
+    let mapRoot = temporary.appendingPathComponent("Maps")
+    MobileMapLibrary.rootOverride = mapRoot
+    let stagedMap = try writeTemporary(Data(csv.utf8), named: "e2e-map.csv")
+    let report = try MapSourceImportCoordinator.importMap(
+        stagedURL: stagedMap,
+        originalFilename: "e2e-map.csv",
+        contract: .topLeft)
+    require(report.elementCount == 3, "E2E import must yield 3 elements, got \(report.elementCount)")
+    require(!report.canonicalSourceSha256.isEmpty, "E2E canonical SHA must be non-empty")
+    require(report.audit != nil, "E2E import must carry a v2 audit record")
+    require(report.audit!.sourceRows.count == 3, "E2E audit must keep source rows")
+
+    // 2) Production compiler -> durable map library registration.
+    let compileDir = try MobileMapLibrary.stagingDirectory(for: "e2e-compile")
+    let compileResult = try MobilePriorMapCompiler.compile(
+        canonicalSource: report.canonicalSource,
+        outputDirectory: compileDir)
+    let target = try MobileMapLibrary.packageDirectory(
+        priorMapID: compileResult.priorMapID,
+        packageSHA: compileResult.packageSHA256)
+    try FileManager.default.createDirectory(
+        at: target.deletingLastPathComponent(), withIntermediateDirectories: true)
+    try FileManager.default.moveItem(at: compileDir, to: target)
+    _ = try MobileMapLibrary.register(
+        priorMapID: compileResult.priorMapID,
+        name: report.mapName,
+        packageSHA256: compileResult.packageSHA256,
+        packageURL: target,
+        floorCount: compileResult.floorCount,
+        elementCount: compileResult.elementCount,
+        compilerVersion: "swift-v1",
+        canonicalSourceSHA256: report.canonicalSourceSha256)
+    let maps = try MobileMapLibrary.listMaps()
+    if maps.isEmpty {
+        let registryURL = try MobileMapLibrary.registryURL()
+        print("E2E debug: registry=\(registryURL.path)")
+        if let raw = try? String(contentsOf: registryURL, encoding: .utf8) {
+            print("E2E debug: registry content=\(raw.prefix(600))")
+        }
+        let packages = try FileManager.default.contentsOfDirectory(
+            atPath: MobileMapLibrary.packagesRoot().path)
+        print("E2E debug: packages=\(packages)")
+    }
+    require(maps.count == 1, "E2E map library must list 1 map, got \(maps.count)")
+    require(
+        maps[0].packageSHA256 == compileResult.packageSHA256,
+        "E2E registry must bind the package SHA")
+
+    // 3) Finalized real-style session fixture (sidecars + source DB).
+    let session = temporary.appendingPathComponent("session", isDirectory: true)
+    try FileManager.default.createDirectory(at: session, withIntermediateDirectories: true)
+    let now = Date().timeIntervalSince1970
+    let metadata: [String: Any] = [
+        "formatVersion": 2,
+        "finalized": true,
+        "scanMode": "continuous_streaming",
+        "finalizedAtUnix": now + 30.0,
+        "floorId": "1",
+        "trackingSessionId": "E2E-SESSION",
+        "storeId": "s1",
+    ]
+    let metadataData = try CanonicalJSONEncoder.encode(metadata)
+    try metadataData.write(to: session.appendingPathComponent("metadata.json"))
+    var traces = ""
+    for index in 0..<6 {
+        let record: [String: Any] = [
+            "format": "MarketScannerLocalizationTrace",
+            "version": 1,
+            "timestamp": 100.0 + Double(index) * 0.5,
+            "estimatedPose": [
+                "x_m": Double(index) * 1.0, "y_m": 0.0, "yaw_rad": 0.0,
+            ],
+            "localizationState": "normal",
+            "trackingState": "normal",
+            "floorId": "1",
+            "nodeTimebaseOffsetSeconds": now - 100.0,
+            "nodeTimebaseTimestamp": now + Double(index) * 8.0,
+            "confidence": 1.0,
+        ]
+        let recordData = try CanonicalJSONEncoder.encode(record)
+        traces += String(data: recordData, encoding: .utf8)! + "\n"
+    }
+    try traces.data(using: .utf8)!.write(
+        to: session.appendingPathComponent("localization_trace.jsonl"))
+    for name in ["localization_constraints.jsonl", "localization_events.jsonl",
+                 "manual_localization_events.jsonl", "tag_observations.jsonl",
+                 "localization_recovery_events.jsonl"] {
+        try Data().write(to: session.appendingPathComponent(name))
+    }
+    try Data("[]".utf8).write(
+        to: session.appendingPathComponent("localized_price_tags.json"))
+    try Data("e2e-fake-db".utf8).write(
+        to: session.appendingPathComponent("rtabmap_segment_0001.db"))
+
+    // 4) Production pipeline: snapshot -> Fast Path -> trajectory -> tags
+    //    -> result package -> streaming XLSX -> external manifest.
+    MobileProcessingTaskStore.rootOverride = temporary.appendingPathComponent("Tasks")
+    MobileResultLibrary.rootOverride = temporary.appendingPathComponent("Results")
+    let taskRoot = try MobileProcessingTaskStore.createTask(taskID: "e2e-task")
+    let outcome = try MobileProcessingPipeline.run(
+        request: MobileProcessingPipeline.Request(
+            finalizedSession: session,
+            sourceDatabase: session.appendingPathComponent("rtabmap_segment_0001.db"),
+            taskRoot: taskRoot,
+            priorMap: maps[0],
+            storeID: "s1",
+            trackingSessionID: "E2E-SESSION",
+            appGitSHA: "e2e",
+            appVersion: "1.0",
+            deviceModel: "host",
+            osVersion: "macos"),
+        progress: { _, _ in },
+        isCancelled: { false })
+    require(
+        outcome.devicePositionCount > 0,
+        "E2E must emit device positions, got \(outcome.devicePositionCount)")
+    require(
+        !outcome.resultEntry.workbookSHA256.isEmpty,
+        "E2E workbook SHA must be recorded externally")
+
+    // 5) Reopen validation: the exported workbook must re-read through
+    //    the production ZIP reader with the required parts.
+    let workbookData = try Data(contentsOf: outcome.resultEntry.workbookURL)
+    let entries = try XLSXZipReader.readEntries(data: workbookData)
+    let names = Set(entries.map { $0.name })
+    require(
+        names.contains("xl/workbook.xml"),
+        "E2E workbook must contain xl/workbook.xml")
+    require(
+        names.contains("xl/worksheets/sheet1.xml"),
+        "E2E workbook must contain xl/worksheets/sheet1.xml")
+
+    // 6) Result library lists the committed immutable result.
+    let results = MobileResultLibrary.listResults()
+    require(results.count == 1, "E2E result library must list 1 result, got \(results.count)")
+    require(
+        results[0].workbookSHA256 == outcome.resultEntry.workbookSHA256,
+        "E2E result SHA must persist in the library")
+    print(
+        "E2E replay passed: maps=\(maps.count) positions=\(outcome.devicePositionCount) "
+            + "tags=\(outcome.tagCount) rescan=\(outcome.rescanCount) "
+            + "sha=\(outcome.resultEntry.workbookSHA256.prefix(16))")
+}
+catch {
+    FileHandle.standardError.write(
+        Data("E2E replay failed: \(error)\n".utf8))
+    exit(9)
+}
+
 var finalizationResourceUsage = rusage()
 if getrusage(RUSAGE_SELF, &finalizationResourceUsage) == 0 {
     print("Finalization test peak RSS bytes: \(finalizationResourceUsage.ru_maxrss)")
