@@ -69,8 +69,7 @@ enum MobileGraphReader {
                     id: raw.id,
                     stamp: raw.stamp,
                     mapID: raw.map_id,
-                    poseRowMajor3x4: Array(UnsafeBufferPointer(
-                        start: raw.pose, count: 12))))
+                    poseRowMajor3x4: tupleToArray(raw.pose)))
             }
         }
 
@@ -83,16 +82,22 @@ enum MobileGraphReader {
                     from: raw.from,
                     to: raw.to,
                     type: raw.type,
-                    transformRowMajor3x4: Array(UnsafeBufferPointer(
-                        start: raw.transform, count: 12)),
-                    information6x6: Array(UnsafeBufferPointer(
-                        start: raw.information, count: 36))))
+                    transformRowMajor3x4: tupleToArray(raw.transform),
+                    information6x6: tupleToArray(raw.information)))
             }
         }
         return MobileGraphReadout(
             nodes: nodes,
             links: links,
             projectionPolicyVersion: Int(result.projection_policy_version))
+    }
+
+    /// Converts a C fixed-size array (imported into Swift as a tuple) to
+    /// a `[Double]`. The C layout is a contiguous run of doubles.
+    private static func tupleToArray<T>(_ tuple: T) -> [Double] {
+        return withUnsafeBytes(of: tuple) { buffer in
+            Array(buffer.bindMemory(to: Double.self))
+        }
     }
 
     /// Projects a raw 3x4 pose to SE(2): keeps the x/y translation and
