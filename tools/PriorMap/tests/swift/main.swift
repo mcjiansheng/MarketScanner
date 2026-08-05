@@ -3916,6 +3916,124 @@ do {
         "I15 the prior-map queue transaction must still persist exactly once")
 }
 
+// P7R6A: attemptedEpisodeIds must list only the episodes the transaction
+// actually entered. Pre-transaction failures (identity, snapshot read,
+// snapshot parse) happen before any pending episode is attempted and must
+// report an empty list instead of disguising the failure as an attempt on
+// the first episode.
+do {
+    func threeEpisodeSource() -> (P7R6FakeRecoverySource,
+        [PriorMapRecoveryCompletion]) {
+        let controller = PriorMapRecoveryController()
+        var completions: [PriorMapRecoveryCompletion] = []
+        for index in 0..<3 {
+            _ = controller.request(
+                reason: "persistent_weak_or_lost",
+                now: TimeInterval(index * 10),
+                automatic: true)
+            if let completion = controller.finish(
+                .converged, now: TimeInterval(index * 10 + 1)) {
+                completions.append(completion)
+            }
+        }
+        let source = P7R6FakeRecoverySource()
+        source.pending = completions
+        return (source, completions)
+    }
+
+    // First episode fails: only episode 1 was attempted.
+    let (firstFailureSource, _) = threeEpisodeSource()
+    let firstFailureWriter = P7R6FakeRecoveryWriter()
+    firstFailureWriter.failingEpisodeIds = [1]
+    let firstFailureCoordinator = RecoveryLifecyclePersistenceCoordinator(
+        source: firstFailureSource,
+        writer: firstFailureWriter,
+        trackingSessionId: "session-a",
+        priorMapId: "map-a",
+        priorMapSha256: String(repeating: "a", count: 64),
+        floorId: "1",
+        persistedEvidenceSnapshot: { Data() })
+    let firstFailure = firstFailureCoordinator.persistTerminalEvidence(
+        cancellationReason: nil, now: 40)
+    require(
+        !firstFailure.allPersisted
+            && firstFailure.attemptedEpisodeIds == [1]
+            && firstFailure.persistedEpisodeIds.isEmpty
+            && firstFailure.failedEpisodeId == 1
+            && firstFailure.failureReason == "durable_append_failed"
+            && firstFailureSource.pending.map { $0.episode.id } == [1, 2, 3],
+        "P7R6A attempted IDs must stop at the first failed episode")
+
+    // Second episode fails: episodes 1 and 2 were attempted, 1 persisted.
+    let (secondFailureSource, _) = threeEpisodeSource()
+    let secondFailureWriter = P7R6FakeRecoveryWriter()
+    secondFailureWriter.failingEpisodeIds = [2]
+    let secondFailureCoordinator = RecoveryLifecyclePersistenceCoordinator(
+        source: secondFailureSource,
+        writer: secondFailureWriter,
+        trackingSessionId: "session-a",
+        priorMapId: "map-a",
+        priorMapSha256: String(repeating: "a", count: 64),
+        floorId: "1",
+        persistedEvidenceSnapshot: { Data() })
+    let secondFailure = secondFailureCoordinator.persistTerminalEvidence(
+        cancellationReason: nil, now: 50)
+    require(
+        !secondFailure.allPersisted
+            && secondFailure.attemptedEpisodeIds == [1, 2]
+            && secondFailure.persistedEpisodeIds == [1]
+            && secondFailure.failedEpisodeId == 2
+            && secondFailureSource.pending.map { $0.episode.id } == [2, 3],
+        "P7R6A attempted IDs must cover exactly the processed episodes")
+
+    // Unparsable snapshot: no pending episode was attempted at all.
+    let (parseFailureSource, _) = threeEpisodeSource()
+    let parseFailureWriter = P7R6FakeRecoveryWriter()
+    let parseFailureCoordinator = RecoveryLifecyclePersistenceCoordinator(
+        source: parseFailureSource,
+        writer: parseFailureWriter,
+        trackingSessionId: "session-a",
+        priorMapId: "map-a",
+        priorMapSha256: String(repeating: "a", count: 64),
+        floorId: "1",
+        persistedEvidenceSnapshot: { Data("{\"format\":".utf8) })
+    let parseFailure = parseFailureCoordinator.persistTerminalEvidence(
+        cancellationReason: nil, now: 60)
+    require(
+        !parseFailure.allPersisted
+            && parseFailure.attemptedEpisodeIds.isEmpty
+            && parseFailure.persistedEpisodeIds.isEmpty
+            && parseFailure.failedEpisodeId == 1
+            && (parseFailure.failureReason?.hasPrefix("existing_evidence_")
+                == true)
+            && parseFailureWriter.appendedEpisodeIds.isEmpty
+            && parseFailureSource.pending.map { $0.episode.id } == [1, 2, 3],
+        "P7R6A a snapshot parse failure must attempt no episode")
+
+    // Missing identity: also a pre-transaction failure, attempted stays
+    // empty and nothing is acknowledged.
+    let (identitySource, _) = threeEpisodeSource()
+    let identityWriter = P7R6FakeRecoveryWriter()
+    let identityCoordinator = RecoveryLifecyclePersistenceCoordinator(
+        source: identitySource,
+        writer: identityWriter,
+        trackingSessionId: "session-a",
+        priorMapId: nil,
+        priorMapSha256: nil,
+        floorId: nil,
+        persistedEvidenceSnapshot: { Data() })
+    let identityFailure = identityCoordinator.persistTerminalEvidence(
+        cancellationReason: nil, now: 70)
+    require(
+        !identityFailure.allPersisted
+            && identityFailure.attemptedEpisodeIds.isEmpty
+            && identityFailure.failedEpisodeId == 1
+            && identityFailure.failureReason == "missing_prior_map_identity"
+            && identityWriter.appendedEpisodeIds.isEmpty
+            && identitySource.pending.map { $0.episode.id } == [1, 2, 3],
+        "P7R6A a missing identity must attempt no episode")
+}
+
 if CommandLine.arguments.count == 2 {
     do {
         let digest = try PriorMapPackageIntegrity.validate(
