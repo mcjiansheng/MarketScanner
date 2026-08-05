@@ -4,3 +4,4 @@
 
 #include "NativeWrapper.hpp"
 #import <sqlite3.h>
+#include "MSRTABMapGraphReaderBridge.h"
