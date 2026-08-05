@@ -4,6 +4,9 @@
 //
 //  Platform-neutral, fail-closed prior-map package integrity validation.
 //
+//  P7R6C: the validator consumes one immutable package snapshot. The
+//  bytes that were hashed are exactly the bytes that were parsed; the
+//  relationship checks below never re-open any file.
 
 import CryptoKit
 import Foundation
@@ -22,15 +25,28 @@ enum PriorMapPackageIntegrityError: LocalizedError {
 enum PriorMapPackageIntegrity {
     private static let packageManifestName = "package_manifest.json"
 
+    /// Reads the package once and validates the resulting snapshot.
     static func validate(directory: URL) throws -> String {
-        let package = try object(directory.appendingPathComponent(packageManifestName))
+        let snapshot = try PriorMapPackageSnapshotReader.read(
+            directory: directory)
+        return try validate(snapshot: snapshot)
+    }
+
+    /// Validates an already-read immutable package snapshot. Callers that
+    /// also load the package model (PriorMapPackage.load) must pass the
+    /// same snapshot so hash and parse can never diverge.
+    static func validate(
+        snapshot: PriorMapPackageSnapshot
+    ) throws -> String {
+        let package = snapshot.packageManifest
         try require(
             package["format"] as? String == "MarketScannerPriorMapPackageManifest"
-                && integer(package["version"]) == 1
+                && StrictJSONScalar.integer(package["version"]) == 1
                 && package["hash_algorithm"] as? String == "sha256",
             "地图包完整性清单格式无效。")
         guard let artifacts = package["artifacts"] as? [[String: Any]],
-              integer(package["artifact_count"]) == artifacts.count else {
+              StrictJSONScalar.integer(package["artifact_count"])
+                  == artifacts.count else {
             throw PriorMapPackageIntegrityError.invalid("地图包完整性清单缺少文件记录。")
         }
         let expectedNames = Set(artifacts.compactMap { $0["file"] as? String })
@@ -42,43 +58,42 @@ enum PriorMapPackageIntegrity {
                         && $0 != packageManifestName
                 },
             "地图包完整性清单包含重复或不安全的文件名。")
-        let actualNames = Set(
-            try FileManager.default.contentsOfDirectory(
-                at: directory,
-                includingPropertiesForKeys: [.isRegularFileKey],
-                options: [])
-                .filter {
-                    (try? $0.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true
-                        && $0.lastPathComponent != packageManifestName
-                        && $0.lastPathComponent != ".DS_Store"
-                        && !$0.lastPathComponent.hasPrefix("._")
-                }
-                .map(\.lastPathComponent))
-        try require(expectedNames == actualNames, "地图包文件集合与完整性清单不一致。")
+        try require(
+            expectedNames == snapshot.artifactNames,
+            "地图包文件集合与完整性清单不一致。")
 
         var digestInput = ""
         for artifact in artifacts {
             guard let name = artifact["file"] as? String,
                   let expectedHash = artifact["sha256"] as? String,
-                  let expectedBytes = integer(artifact["bytes"]) else {
+                  let expectedBytes =
+                      StrictJSONScalar.integer(artifact["bytes"]) else {
                 throw PriorMapPackageIntegrityError.invalid("地图包文件记录无效。")
             }
-            let url = directory.appendingPathComponent(name)
-            let data = try Data(contentsOf: url, options: [.mappedIfSafe])
-            try require(data.count == expectedBytes, "\(name) 文件长度校验失败。")
-            let actualHash = SHA256.hash(data: data)
-                .map { String(format: "%02x", $0) }
-                .joined()
-            try require(actualHash == expectedHash, "\(name) SHA-256 校验失败。")
-            if url.pathExtension.lowercased() == "json" {
-                let child = try object(url)
+            guard let artifactSnapshot = snapshot.artifactsByName[name] else {
+                throw PriorMapPackageIntegrityError.invalid(
+                    "\(name) 缺失于地图包快照。")
+            }
+            try require(
+                artifactSnapshot.byteCount == Int64(expectedBytes),
+                "\(name) 文件长度校验失败。")
+            try require(
+                artifactSnapshot.sha256 == expectedHash,
+                "\(name) SHA-256 校验失败。")
+            if name.lowercased().hasSuffix(".json") {
+                guard let child = artifactSnapshot.parsedJSON else {
+                    throw PriorMapPackageIntegrityError.invalid(
+                        "\(name) 无法解析为 JSON 对象。")
+                }
                 try require(
                     child["format"] as? String == artifact["format"] as? String
-                        && integer(child["version"]) == integer(artifact["version"]),
+                        && StrictJSONScalar.integer(child["version"])
+                            == StrictJSONScalar.integer(artifact["version"]),
                     "\(name) 的格式或版本与完整性清单不一致。")
             }
             let format = artifact["format"] as? String ?? ""
-            let version = integer(artifact["version"]).map(String.init) ?? ""
+            let version = StrictJSONScalar.integer(artifact["version"])
+                .map(String.init) ?? ""
             digestInput += "\(name)\0\(expectedBytes)\0\(expectedHash)\0\(format)\0\(version)\n"
         }
         let packageHash = SHA256.hash(data: Data(digestInput.utf8))
@@ -87,19 +102,21 @@ enum PriorMapPackageIntegrity {
         try require(
             package["package_sha256"] as? String == packageHash,
             "地图包规范化 SHA-256 校验失败。")
-        try validateRelationships(directory: directory)
+        try validateRelationships(snapshot: snapshot)
         return packageHash
     }
 
-    private static func validateRelationships(directory: URL) throws {
-        let manifest = try object(directory.appendingPathComponent("manifest.json"))
-        let elementsPayload = try object(directory.appendingPathComponent("elements.json"))
-        let shelvesPayload = try object(directory.appendingPathComponent("shelves.json"))
-        let structuresPayload = try object(directory.appendingPathComponent("fixed_structures.json"))
-        let graph = try object(directory.appendingPathComponent("road_graph.json"))
-        let spatial = try object(directory.appendingPathComponent("spatial_index.json"))
-        let distance = try object(directory.appendingPathComponent("distance_fields.json"))
-        let validation = try object(directory.appendingPathComponent("validation_report.json"))
+    private static func validateRelationships(
+        snapshot: PriorMapPackageSnapshot
+    ) throws {
+        let manifest = try object(snapshot, "manifest.json")
+        let elementsPayload = try object(snapshot, "elements.json")
+        let shelvesPayload = try object(snapshot, "shelves.json")
+        let structuresPayload = try object(snapshot, "fixed_structures.json")
+        let graph = try object(snapshot, "road_graph.json")
+        let spatial = try object(snapshot, "spatial_index.json")
+        let distance = try object(snapshot, "distance_fields.json")
+        let validation = try object(snapshot, "validation_report.json")
 
         guard let floors = manifest["floors"] as? [[String: Any]],
               let elements = elementsPayload["elements"] as? [[String: Any]],
@@ -128,7 +145,8 @@ enum PriorMapPackageIntegrity {
         }
         try require(
             byId.count == elements.count
-                && integer(manifest["element_count"]) == elements.count,
+                && StrictJSONScalar.integer(manifest["element_count"])
+                    == elements.count,
             "地图包元素 ID 或数量不一致。")
         try validateSubset(
             shelves,
@@ -233,10 +251,15 @@ enum PriorMapPackageIntegrity {
         }
     }
 
-    private static func object(_ url: URL) throws -> [String: Any] {
-        let value = try JSONSerialization.jsonObject(with: Data(contentsOf: url))
-        guard let object = value as? [String: Any] else {
-            throw PriorMapPackageIntegrityError.invalid("\(url.lastPathComponent) 顶层必须是对象。")
+    /// One parsed artifact from the immutable snapshot. Missing or
+    /// non-object content fails closed; nothing is re-opened here.
+    private static func object(
+        _ snapshot: PriorMapPackageSnapshot,
+        _ name: String
+    ) throws -> [String: Any] {
+        guard let object = snapshot.artifactsByName[name]?.parsedJSON else {
+            throw PriorMapPackageIntegrityError.invalid(
+                "\(name) 缺失或顶层必须是对象。")
         }
         return object
     }
@@ -245,17 +268,14 @@ enum PriorMapPackageIntegrity {
         return try JSONSerialization.data(withJSONObject: value, options: [.sortedKeys])
     }
 
-    private static func integer(_ value: Any?) -> Int? {
-        guard let number = value as? NSNumber,
-              CFGetTypeID(number) != CFBooleanGetTypeID() else {
-            return nil
-        }
-        return number.intValue
-    }
-
     private static func string(_ value: Any?) -> String? {
         if let value = value as? String { return value }
-        if let value = value as? NSNumber { return value.stringValue }
+        if let value = value as? NSNumber {
+            guard CFGetTypeID(value) != CFBooleanGetTypeID() else {
+                return nil
+            }
+            return value.stringValue
+        }
         return nil
     }
 
@@ -268,6 +288,8 @@ enum PriorMapPackageIntegrity {
         }
     }
 
+    /// P7R6C: geometry coordinates are strict JSON numbers; a boolean
+    /// bridged through NSNumber can no longer read as 1.0.
     private static func geometryPoints(_ value: Any?) -> [(Double, Double)] {
         guard let geometry = value as? [String: Any] else { return [] }
         var coordinates = geometry["coordinates"]
@@ -277,9 +299,8 @@ enum PriorMapPackageIntegrity {
         guard let rawPoints = coordinates as? [[Any]] else { return [] }
         return rawPoints.compactMap {
             guard $0.count >= 2,
-                  let x = ($0[0] as? NSNumber)?.doubleValue,
-                  let y = ($0[1] as? NSNumber)?.doubleValue,
-                  x.isFinite, y.isFinite else {
+                  let x = StrictJSONScalar.number($0[0]),
+                  let y = StrictJSONScalar.number($0[1]) else {
                 return nil
             }
             return (x, y)
@@ -298,10 +319,10 @@ enum PriorMapPackageIntegrity {
             "max_y_m": points.map(\.1).max()!,
         ]
         return expected.allSatisfy {
-            guard let actual = (bounds[$0.key] as? NSNumber)?.doubleValue else {
+            guard let actual = StrictJSONScalar.number(bounds[$0.key]) else {
                 return false
             }
-            return actual.isFinite && abs(actual - $0.value) <= 1.0e-5
+            return abs(actual - $0.value) <= 1.0e-5
         }
     }
 

@@ -153,7 +153,14 @@ struct PriorMapPackage {
     }
 
     static func load(directory: URL) throws -> PriorMapPackage {
-        let packageSha256 = try PriorMapPackageIntegrity.validate(directory: directory)
+        // P7R6C: the package is read exactly once into an immutable
+        // snapshot; integrity validation, format checks, model decoding
+        // and previews all consume those same bytes, so the package SHA
+        // can never describe content the loader never parsed.
+        let snapshot = try PriorMapPackageSnapshotReader.read(
+            directory: directory)
+        let packageSha256 = try PriorMapPackageIntegrity.validate(
+            snapshot: snapshot)
         let decoder = JSONDecoder()
         let requiredJSONFormats = [
             "manifest.json": "MarketScannerPriorMap",
@@ -166,27 +173,27 @@ struct PriorMapPackage {
             "validation_report.json": "MarketScannerPriorMapValidation",
         ]
         for (name, expectedFormat) in requiredJSONFormats {
-            let data = try Data(
-                contentsOf: directory.appendingPathComponent(name))
-            guard let payload = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+            guard let payload = snapshot.artifactsByName[name]?.parsedJSON,
                   payload["format"] as? String == expectedFormat,
-                  payload["version"] as? Int == 1 else {
+                  StrictJSONScalar.integer(payload["version"]) == 1 else {
                 throw NSError(
                     domain: "PriorMap",
                     code: 5,
                     userInfo: [NSLocalizedDescriptionKey: "\(name) 无法通过地图包格式校验。"])
             }
         }
-        let manifestURL = directory.appendingPathComponent("manifest.json")
-        let graphURL = directory.appendingPathComponent("road_graph.json")
-        let spatialURL = directory.appendingPathComponent("spatial_index.json")
-        let distanceURL = directory.appendingPathComponent("distance_fields.json")
-        let shelvesURL = directory.appendingPathComponent("shelves.json")
-        let structuresURL = directory.appendingPathComponent("fixed_structures.json")
-        let previewURL = directory.appendingPathComponent("preview.png")
+        func artifactBytes(_ name: String) throws -> Data {
+            guard let bytes = snapshot.artifactsByName[name]?.bytes else {
+                throw NSError(
+                    domain: "PriorMap",
+                    code: 5,
+                    userInfo: [NSLocalizedDescriptionKey: "\(name) 缺失于地图包快照。"])
+            }
+            return bytes
+        }
         let manifest = try decoder.decode(
             PriorMapManifest.self,
-            from: Data(contentsOf: manifestURL))
+            from: try artifactBytes("manifest.json"))
         guard manifest.format == "MarketScannerPriorMap", manifest.version == 1 else {
             throw NSError(
                 domain: "PriorMap",
@@ -210,19 +217,19 @@ struct PriorMapPackage {
         }
         let graph = try decoder.decode(
             PriorMapRoadGraph.self,
-            from: Data(contentsOf: graphURL))
+            from: try artifactBytes("road_graph.json"))
         let spatial = try decoder.decode(
             PriorMapSpatialIndexPayload.self,
-            from: Data(contentsOf: spatialURL))
+            from: try artifactBytes("spatial_index.json"))
         let distanceFields = try decoder.decode(
             PriorMapDistanceFieldFile.self,
-            from: Data(contentsOf: distanceURL))
+            from: try artifactBytes("distance_fields.json"))
         let shelvesPayload = try decoder.decode(
             PriorMapShelvesPayload.self,
-            from: Data(contentsOf: shelvesURL))
+            from: try artifactBytes("shelves.json"))
         let structuresPayload = try decoder.decode(
             PriorMapStructuresPayload.self,
-            from: Data(contentsOf: structuresURL))
+            from: try artifactBytes("fixed_structures.json"))
         guard spatial.format == "MarketScannerSpatialIndex",
               spatial.version == 1,
               spatial.cellSizeM > 0 else {
@@ -252,7 +259,8 @@ struct PriorMapPackage {
                 _ = try level.decodedValues()
             }
         }
-        guard let preview = UIImage(contentsOfFile: previewURL.path) else {
+        guard let previewBytes = snapshot.artifactsByName["preview.png"]?.bytes,
+              let preview = UIImage(data: previewBytes) else {
             throw NSError(
                 domain: "PriorMap",
                 code: 3,
@@ -262,8 +270,9 @@ struct PriorMapPackage {
         for floor in manifest.floors {
             guard let filename = floor.previewFile,
                   URL(fileURLWithPath: filename).lastPathComponent == filename,
-                  let floorPreview = UIImage(
-                    contentsOfFile: directory.appendingPathComponent(filename).path) else {
+                  let floorPreviewBytes =
+                      snapshot.artifactsByName[filename]?.bytes,
+                  let floorPreview = UIImage(data: floorPreviewBytes) else {
                 throw NSError(
                     domain: "PriorMap",
                     code: 7,
