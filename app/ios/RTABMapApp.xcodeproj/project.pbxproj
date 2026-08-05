@@ -91,6 +91,7 @@
 		4EA400012F30000100100003 /* PriorMapLocalizationCore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA400012F30000100100004 /* PriorMapLocalizationCore.swift */; };
 		4EA700012F60000100100001 /* SupermarketFinalizationCore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60000100100002 /* SupermarketFinalizationCore.swift */; };
 		4EA700012F60000200100001 /* RecoveryLifecyclePersistenceCore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60000200100002 /* RecoveryLifecyclePersistenceCore.swift */; };
+		4EA700012F60000300100001 /* RecoveryLifecycleEvidenceParser.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60000300100002 /* RecoveryLifecycleEvidenceParser.swift */; };
 		4EA500012F40000100100001 /* PriorMapScanMatcher.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA500012F40000100100002 /* PriorMapScanMatcher.swift */; };
 		4EA500012F40000100100003 /* PriorMapDepthSampler.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA500012F40000100100004 /* PriorMapDepthSampler.swift */; };
 		4EA500012F40000100100005 /* PriceTagLocalizationCore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA500012F40000100100006 /* PriceTagLocalizationCore.swift */; };
@@ -207,6 +208,7 @@
 		4EA400012F30000100100004 /* PriorMapLocalizationCore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = PriorMapLocalizationCore.swift; path = RTABMapApp/PriorMapLocalizationCore.swift; sourceTree = "<group>"; };
 		4EA700012F60000100100002 /* SupermarketFinalizationCore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = SupermarketFinalizationCore.swift; path = RTABMapApp/SupermarketFinalizationCore.swift; sourceTree = "<group>"; };
 		4EA700012F60000200100002 /* RecoveryLifecyclePersistenceCore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = RecoveryLifecyclePersistenceCore.swift; path = RTABMapApp/RecoveryLifecyclePersistenceCore.swift; sourceTree = "<group>"; };
+		4EA700012F60000300100002 /* RecoveryLifecycleEvidenceParser.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = RecoveryLifecycleEvidenceParser.swift; path = RTABMapApp/RecoveryLifecycleEvidenceParser.swift; sourceTree = "<group>"; };
 		4EA500012F40000100100002 /* PriorMapScanMatcher.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = PriorMapScanMatcher.swift; path = RTABMapApp/PriorMapScanMatcher.swift; sourceTree = "<group>"; };
 		4EA500012F40000100100004 /* PriorMapDepthSampler.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = PriorMapDepthSampler.swift; path = RTABMapApp/PriorMapDepthSampler.swift; sourceTree = "<group>"; };
 		4EA500012F40000100100006 /* PriceTagLocalizationCore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = PriceTagLocalizationCore.swift; path = RTABMapApp/PriceTagLocalizationCore.swift; sourceTree = "<group>"; };
@@ -516,6 +518,7 @@
 				4EA400012F30000100100004 /* PriorMapLocalizationCore.swift */,
 				4EA700012F60000100100002 /* SupermarketFinalizationCore.swift */,
 				4EA700012F60000200100002 /* RecoveryLifecyclePersistenceCore.swift */,
+				4EA700012F60000300100002 /* RecoveryLifecycleEvidenceParser.swift */,
 				4EA500012F40000100100002 /* PriorMapScanMatcher.swift */,
 				4EA500012F40000100100004 /* PriorMapDepthSampler.swift */,
 				4EA500012F40000100100006 /* PriceTagLocalizationCore.swift */,
@@ -909,6 +912,7 @@
 				4EA400012F30000100100003 /* PriorMapLocalizationCore.swift in Sources */,
 				4EA700012F60000100100001 /* SupermarketFinalizationCore.swift in Sources */,
 				4EA700012F60000200100001 /* RecoveryLifecyclePersistenceCore.swift in Sources */,
+				4EA700012F60000300100001 /* RecoveryLifecycleEvidenceParser.swift in Sources */,
 				4EA500012F40000100100001 /* PriorMapScanMatcher.swift in Sources */,
 				4EA500012F40000100100003 /* PriorMapDepthSampler.swift in Sources */,
 				4EA500012F40000100100005 /* PriceTagLocalizationCore.swift in Sources */,
