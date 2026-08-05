@@ -42,16 +42,46 @@ protocol RecoveryLifecycleWriting {
 /// exact episode where the transaction stopped.
 ///
 /// `attemptedEpisodeIds` lists only episodes the transaction actually
-/// entered. Pre-transaction failures (missing identity, unreadable or
-/// unparsable existing snapshot) happen before any pending episode is
-/// attempted, so they report an empty list; a read or parse failure must
-/// never be disguised as an attempt on the first pending episode.
+/// entered. Pre-transaction failures (invalid pending queue, missing
+/// identity, unreadable or unparsable existing snapshot) happen before any
+/// pending episode is attempted, so they report an empty list; a read or
+/// parse failure must never be disguised as an attempt on the first pending
+/// episode.
 struct RecoveryLifecyclePersistenceResult {
     let attemptedEpisodeIds: [Int]
     let persistedEpisodeIds: [Int]
     let failedEpisodeId: Int?
     let failureReason: String?
     let allPersisted: Bool
+}
+
+/// P7R6B: the pending queue carries finish order. The coordinator never
+/// sorts it; a queue whose episode IDs or finish uptimes violate the strict
+/// order/uniqueness contract is rejected before any snapshot read, append
+/// or acknowledgement so a corrupted source can never drain into a file
+/// that finalization would reject.
+enum PendingRecoveryQueueValidationError: Equatable {
+    case duplicateEpisode
+    case episodeOrderInvalid
+    case finishOrderInvalid
+
+    var stableCode: String {
+        switch self {
+        case .duplicateEpisode: return "pending_episode_duplicate"
+        case .episodeOrderInvalid: return "pending_episode_order_invalid"
+        case .finishOrderInvalid: return "pending_finish_order_invalid"
+        }
+    }
+}
+
+/// Effective persisted-state record used inside one transaction. Parsed
+/// snapshot records are copied in, appended records are added as they
+/// become durable, so a future source-contract regression can never make
+/// the transaction depend on a stale pre-append snapshot and write a
+/// duplicate episode.
+private struct EffectiveRecoveryRecord {
+    let version: Int
+    let canonicalRecordBytes: Data
 }
 
 /// Runs one teardown-to-disk transaction:
@@ -110,7 +140,6 @@ final class RecoveryLifecyclePersistenceCoordinator {
             _ = source.cancelRecovery(reason: cancellationReason, now: now)
         }
         let pending = source.pendingTerminalRecoveryCompletions()
-            .sorted { $0.episode.id < $1.episode.id }
         guard !pending.isEmpty else {
             return RecoveryLifecyclePersistenceResult(
                 attemptedEpisodeIds: [],
@@ -118,6 +147,19 @@ final class RecoveryLifecyclePersistenceCoordinator {
                 failedEpisodeId: nil,
                 failureReason: nil,
                 allPersisted: true)
+        }
+        // P7R6B: the pending queue carries finish order; never sort it.
+        // Validate strict order, uniqueness and the time contract before
+        // any snapshot read, append or acknowledgement, so a duplicate or
+        // reordered pending queue fails closed with nothing attempted,
+        // nothing appended and nothing acknowledged.
+        if let queueViolation = Self.pendingQueueViolation(pending) {
+            return RecoveryLifecyclePersistenceResult(
+                attemptedEpisodeIds: [],
+                persistedEpisodeIds: [],
+                failedEpisodeId: queueViolation.episodeId,
+                failureReason: queueViolation.error.stableCode,
+                allPersisted: false)
         }
         let firstPendingEpisodeId = pending[0].episode.id
         guard let priorMapId, let priorMapSha256, let floorId else {
@@ -174,9 +216,19 @@ final class RecoveryLifecyclePersistenceCoordinator {
         }
         var attemptedIds: [Int] = []
         var persistedIds: [Int] = []
-        let existingMaximumEpisodeId = parsed.records.reduce(Int.min) {
-            max($0, $1.episodeId)
-        }
+        // P7R6B: effective state grows with the transaction. Parsed
+        // snapshot records seed it; every durable append joins it, so the
+        // idempotence lookup never falls back to a stale pre-append
+        // snapshot that could hide a duplicate episode.
+        var effectiveRecordsByEpisodeId: [Int: EffectiveRecoveryRecord] =
+            Dictionary(
+                uniqueKeysWithValues: parsed.recordsByEpisodeId.map {
+                    episodeId, record in
+                    (episodeId, EffectiveRecoveryRecord(
+                        version: record.version,
+                        canonicalRecordBytes: record.canonicalRecordBytes))
+                })
+        var effectiveMaximumEpisodeId = parsed.lastEpisodeId ?? 0
         for completion in pending {
             let episodeId = completion.episode.id
             attemptedIds.append(episodeId)
@@ -185,7 +237,7 @@ final class RecoveryLifecyclePersistenceCoordinator {
             // strictly increasing ID contract is a conflict, because the
             // coordinator accepting it would guarantee a finalization
             // rejection.
-            if episodeId < existingMaximumEpisodeId {
+            if episodeId < effectiveMaximumEpisodeId {
                 return RecoveryLifecyclePersistenceResult(
                     attemptedEpisodeIds: attemptedIds,
                     persistedEpisodeIds: persistedIds,
@@ -213,7 +265,7 @@ final class RecoveryLifecyclePersistenceCoordinator {
                     failureReason: "pending_record_encoding_failed",
                     allPersisted: false)
             }
-            if let existing = parsed.recordsByEpisodeId[episodeId] {
+            if let existing = effectiveRecordsByEpisodeId[episodeId] {
                 // A historical v1 record and a pending v2 record for the
                 // same episode are never the same fact: no fabricated v2
                 // upgrade, no idempotent merge.
@@ -254,6 +306,11 @@ final class RecoveryLifecyclePersistenceCoordinator {
                     allPersisted: false)
             }
             persistedIds.append(episodeId)
+            effectiveRecordsByEpisodeId[episodeId] = EffectiveRecoveryRecord(
+                version: 2,
+                canonicalRecordBytes: pendingCanonicalBytes)
+            effectiveMaximumEpisodeId = max(
+                effectiveMaximumEpisodeId, episodeId)
             source.acknowledgeTerminalRecoveryCompletion(
                 episodeId: episodeId)
         }
@@ -263,5 +320,40 @@ final class RecoveryLifecyclePersistenceCoordinator {
             failedEpisodeId: nil,
             failureReason: nil,
             allPersisted: true)
+    }
+
+    /// P7R6B: strict pending-queue contract. Episodes must carry a positive
+    /// unique ID in strictly increasing order, and their time contract must
+    /// hold (finite started/finished, finished >= started, finish uptimes
+    /// never regress). Returns the first offending episode or nil.
+    private static func pendingQueueViolation(
+        _ pending: [PriorMapRecoveryCompletion]
+    ) -> (error: PendingRecoveryQueueValidationError, episodeId: Int)? {
+        var seen = Set<Int>()
+        var previousEpisodeId: Int?
+        var previousFinishedAtUptime: TimeInterval?
+        for completion in pending {
+            let episodeId = completion.episode.id
+            let startedAtUptime = completion.episode.startedAtUptime
+            let finishedAtUptime = completion.finishedAtUptime
+            if !seen.insert(episodeId).inserted {
+                return (.duplicateEpisode, episodeId)
+            }
+            if episodeId <= 0
+                || (previousEpisodeId != nil
+                    && episodeId <= previousEpisodeId!) {
+                return (.episodeOrderInvalid, episodeId)
+            }
+            if !startedAtUptime.isFinite
+                || !finishedAtUptime.isFinite
+                || finishedAtUptime < startedAtUptime
+                || (previousFinishedAtUptime != nil
+                    && finishedAtUptime < previousFinishedAtUptime!) {
+                return (.finishOrderInvalid, episodeId)
+            }
+            previousEpisodeId = episodeId
+            previousFinishedAtUptime = finishedAtUptime
+        }
+        return nil
     }
 }

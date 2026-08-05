@@ -2767,8 +2767,10 @@ require(p7r6FirstCompletion?.episode.id == 1
         "P7R6 coordinator tests require two sequential episodes")
 let p7r6FakeSha256 = String(repeating: "b", count: 64)
 if let p7r6FirstCompletion, let p7r6SecondCompletion {
+    // P7R6B B3: the pending queue carries finish order and is never
+    // sorted. A deliberately reversed queue must fail closed with nothing
+    // attempted, appended or acknowledged.
     let source = P7R6FakeRecoverySource()
-    // Deliberately out of order: the coordinator must restore episode order.
     source.pending = [p7r6SecondCompletion, p7r6FirstCompletion]
     let writer = P7R6FakeRecoveryWriter()
     let coordinator = RecoveryLifecyclePersistenceCoordinator(
@@ -2779,19 +2781,32 @@ if let p7r6FirstCompletion, let p7r6SecondCompletion {
         priorMapSha256: p7r6FakeSha256,
         floorId: "1",
         persistedEvidenceSnapshot: { Data() })
-    let success = coordinator.persistTerminalEvidence(
+    let reversed = coordinator.persistTerminalEvidence(
         cancellationReason: nil, now: 40)
+    require(!reversed.allPersisted
+            && reversed.attemptedEpisodeIds.isEmpty
+            && reversed.persistedEpisodeIds.isEmpty
+            && reversed.failedEpisodeId == 1
+            && reversed.failureReason == "pending_episode_order_invalid"
+            && writer.appendedEpisodeIds.isEmpty
+            && source.pending.map { $0.episode.id } == [2, 1],
+            "P7R6B a reversed pending queue must fail closed without sorting")
+
+    // A correctly ordered queue persists in finish order.
+    source.pending = [p7r6FirstCompletion, p7r6SecondCompletion]
+    let success = coordinator.persistTerminalEvidence(
+        cancellationReason: nil, now: 41)
     require(success.allPersisted
             && success.attemptedEpisodeIds == [1, 2]
             && success.persistedEpisodeIds == [1, 2]
             && writer.appendedEpisodeIds == [1, 2],
-            "P7R6 the coordinator must persist episodes in ID order")
+            "P7R6 the coordinator must persist episodes in finish order")
     require(source.pending.isEmpty,
             "P7R6 every persisted episode must be acknowledged")
 
     // Cancellation pass-through.
     _ = coordinator.persistTerminalEvidence(
-        cancellationReason: .scanStopped, now: 41)
+        cancellationReason: .scanStopped, now: 42)
     require(source.cancelledReasons == [.scanStopped],
             "P7R6 teardown cancellation must run before peeking")
 
@@ -3840,7 +3855,9 @@ do {
     if let completion = controller.lastCompletion {
         source.pending.append(completion)
     }
-    source.pending.reverse()
+    // P7R6B: the queue already carries finish order; the coordinator never
+    // sorts it, so two serialized transactions on one in-order queue must
+    // persist every completion exactly once in that order.
     let coordinator = p7r6Coordinator(
         source: source,
         writer: writer,
@@ -4679,6 +4696,326 @@ do {
             && parsed.records[0].triggerRecords == nil
             && parsed.records[1].deadlineUptime != nil,
         "P-A20 v1 records must keep their missing v2 facts un-fabricated")
+}
+
+// MARK: - P7R6B P-B1..P-B15: strict JSON scalars, duplicate keys, pending
+// queue order and unified limits.
+
+/// Builds sequential Recovery completions from one controller, mirroring
+/// the canonical v2 record shape used by the shared fixtures
+/// (60 s deadline window, 7 valid attempts, 2 accepted corrections).
+func p7r6bCompletions(
+    _ episodes: [(start: Double, finish: Double)]
+) -> [PriorMapRecoveryCompletion] {
+    let controller = PriorMapRecoveryController(maximumWallClockSeconds: 60)
+    var completions: [PriorMapRecoveryCompletion] = []
+    for episode in episodes {
+        _ = controller.request(
+            reason: "reliable_rtabmap_loop", now: episode.start)
+        for _ in 0..<7 {
+            _ = controller.recordValidMatcherAttempt()
+        }
+        for _ in 0..<2 {
+            controller.recordAcceptedCorrection()
+        }
+        if let completion = controller.finish(
+            .converged,
+            now: episode.finish,
+            finalFreshSupportFrames: 4) {
+            completions.append(completion)
+        }
+    }
+    return completions
+}
+
+func p7r6bCoordinator(
+    source: P7R6FakeRecoverySource,
+    writer: P7R6FakeRecoveryWriter,
+    snapshot: @escaping () -> Data
+) -> RecoveryLifecyclePersistenceCoordinator {
+    return RecoveryLifecyclePersistenceCoordinator(
+        source: source,
+        writer: writer,
+        trackingSessionId: "session-a",
+        priorMapId: "map-a",
+        priorMapSha256: p7r6aIdentitySha(),
+        floorId: "1",
+        persistedEvidenceSnapshot: snapshot)
+}
+
+// P-B1: a numeric episode_automatic is not a JSON boolean.
+do {
+    let snapshot = try p7r6aLifecycleRecordData(
+        version: 2, episode: 1, extra: ["episode_automatic": 1])
+    let failureCode = try p7r6aParseFailureCode(snapshot)
+
+    require(
+
+        failureCode == "business_schema_invalid",
+
+        "P-B1 numeric episode_automatic must be rejected (SB1)")
+}
+
+// P-B2: a numeric completion_frame_step_applied is not a JSON boolean.
+do {
+    let snapshot = try p7r6aLifecycleRecordData(
+        version: 2, episode: 1, extra: ["completion_frame_step_applied": 0])
+    let failureCode = try p7r6aParseFailureCode(snapshot)
+
+    require(
+
+        failureCode == "business_schema_invalid",
+
+        "P-B2 numeric completion_frame_step_applied must be rejected (SB2)")
+}
+
+// P-B3: a numeric trigger-record automatic is not a JSON boolean.
+do {
+    let snapshot = try p7r6aLifecycleRecordData(
+        version: 2,
+        episode: 1,
+        extra: ["trigger_records": [
+            ["reason": "loop", "automatic": 1, "at_uptime": 10.0],
+        ]])
+    let failureCode = try p7r6aParseFailureCode(snapshot)
+
+    require(
+
+        failureCode == "trigger_records_invalid",
+
+        "P-B3 numeric trigger automatic must be rejected (SB3)")
+}
+
+// P-B4: duplicate top-level object key.
+do {
+    let snapshot = Data("{\"episode_id\":999,\"episode_id\":1}\n".utf8)
+    let failureCode = try p7r6aParseFailureCode(snapshot)
+
+    require(
+
+        failureCode == "duplicate_json_key",
+
+        "P-B4 a duplicate top-level key must be rejected (DK1)")
+}
+
+// P-B5: duplicate nested object key inside trigger_records.
+do {
+    let snapshot = Data((
+        "{\"trigger_records\":[{\"reason\":\"a\",\"reason\":\"b\","
+            + "\"automatic\":true,\"at_uptime\":10.0}]}\n").utf8)
+    let failureCode = try p7r6aParseFailureCode(snapshot)
+
+    require(
+
+        failureCode == "duplicate_json_key",
+
+        "P-B5 a duplicate nested key must be rejected (DK2)")
+}
+
+// P-B6: an escaped-equivalent duplicate key is still a duplicate.
+do {
+    let snapshot = Data("{\"episode_id\":1,\"\\u0065pisode_id\":2}\n".utf8)
+    let failureCode = try p7r6aParseFailureCode(snapshot)
+
+    require(
+
+        failureCode == "duplicate_json_key",
+
+        "P-B6 an escaped-equivalent duplicate key must be rejected (DK3)")
+}
+
+// P-B7 (PQ1/PQ7): duplicate pending episodes are rejected before any
+// append or acknowledgement; the coordinator never writes a duplicate.
+do {
+    let completions = p7r6bCompletions([(10, 14.5)])
+    let source = P7R6FakeRecoverySource()
+    source.pending = [completions[0], completions[0]]
+    let writer = P7R6FakeRecoveryWriter()
+    let result = p7r6bCoordinator(
+        source: source, writer: writer, snapshot: { Data() })
+        .persistTerminalEvidence(cancellationReason: nil, now: 30)
+    require(
+        !result.allPersisted
+            && result.attemptedEpisodeIds.isEmpty
+            && result.persistedEpisodeIds.isEmpty
+            && result.failedEpisodeId == 1
+            && result.failureReason == "pending_episode_duplicate"
+            && writer.appendedEpisodeIds.isEmpty
+            && source.pending.count == 2,
+        "P-B7 a duplicate pending episode must fail before append/ack (PQ1)")
+}
+
+// P-B8 (PQ2): a reversed pending queue is rejected, never sorted.
+do {
+    let completions = p7r6bCompletions([(10, 14.5), (20, 24.5)])
+    let source = P7R6FakeRecoverySource()
+    source.pending = [completions[1], completions[0]]
+    let writer = P7R6FakeRecoveryWriter()
+    let result = p7r6bCoordinator(
+        source: source, writer: writer, snapshot: { Data() })
+        .persistTerminalEvidence(cancellationReason: nil, now: 30)
+    require(
+        !result.allPersisted
+            && result.attemptedEpisodeIds.isEmpty
+            && result.failedEpisodeId == 1
+            && result.failureReason == "pending_episode_order_invalid"
+            && writer.appendedEpisodeIds.isEmpty
+            && source.pending.map { $0.episode.id } == [2, 1],
+        "P-B8 a reversed pending queue must fail closed (PQ2)")
+}
+
+// P-B9 (PQ3): finish uptimes in the pending queue never regress.
+do {
+    let completions = p7r6bCompletions([(0, 20), (18, 19)])
+    let source = P7R6FakeRecoverySource()
+    source.pending = completions
+    let writer = P7R6FakeRecoveryWriter()
+    let result = p7r6bCoordinator(
+        source: source, writer: writer, snapshot: { Data() })
+        .persistTerminalEvidence(cancellationReason: nil, now: 30)
+    require(
+        !result.allPersisted
+            && result.attemptedEpisodeIds.isEmpty
+            && result.failedEpisodeId == 2
+            && result.failureReason == "pending_finish_order_invalid"
+            && writer.appendedEpisodeIds.isEmpty,
+        "P-B9 a finish-time regression in the pending queue must fail (PQ3)")
+}
+
+// P-B10 (PQ5): an identical persisted episode acks without rewriting and a
+// later episode appends once, using the same transaction.
+do {
+    let completions = p7r6bCompletions([(10, 14.5), (20, 24.5)])
+    let existingSnapshot = try p7r6aLifecycleRecordData(version: 2, episode: 1)
+    let source = P7R6FakeRecoverySource()
+    source.pending = completions
+    let writer = P7R6FakeRecoveryWriter()
+    let result = p7r6bCoordinator(
+        source: source, writer: writer, snapshot: { existingSnapshot })
+        .persistTerminalEvidence(cancellationReason: nil, now: 30)
+    require(
+        result.allPersisted
+            && result.attemptedEpisodeIds == [1, 2]
+            && result.persistedEpisodeIds == [1, 2]
+            && writer.appendedEpisodeIds == [2]
+            && source.pending.isEmpty,
+        "P-B10 an identical existing episode acks and the next appends once (PQ5)")
+}
+
+// P-B11 (SB4): finalization rejects a numeric constraint `accepted`.
+do {
+    let directory = try p7r6FreshDirectory("pb11")
+    _ = try p7r6WriteBaseBundle(in: directory)
+    let constraintsURL = directory.appendingPathComponent(
+        "localization_constraints.jsonl")
+    let identity = "\"trackingSessionId\":\"session-a\","
+        + "\"priorMapId\":\"map-a\","
+        + "\"priorMapSha256\":\"\(p7r6aIdentitySha())\","
+        + "\"floorId\":\"1\","
+    let pose = "{\"x_m\":0,\"y_m\":0,\"yaw_rad\":0}"
+    let line = "{\"format\":\"MarketScannerLocalizationConstraint\","
+        + "\"version\":1," + identity
+        + "\"timestamp\":1,\"nodeTimebaseTimestamp\":1,"
+        + "\"nodeTimebaseOffsetSeconds\":0,\"accepted\":1,"
+        + "\"predictedPose\":\(pose),\"uniqueness\":0.9}\n"
+    try Data(line.utf8).write(to: constraintsURL)
+    let blockers = LocalizationEvidenceBundleValidator.blockers(
+        in: directory,
+        expectation: p7r6BundleExpectation(recoveryCount: 0))
+    require(
+        blockers.contains(
+            "evidence_bundle_localization_constraints.jsonl_"
+                + "constraint_business_schema_invalid"),
+        "P-B11 numeric constraint accepted must block finalization (SB4): "
+            + "\(blockers)")
+}
+
+// P-B12 (SB5): finalization rejects numeric localized-tag booleans.
+do {
+    let directory = try p7r6FreshDirectory("pb12")
+    _ = try p7r6WriteBaseBundle(in: directory)
+    let identity = "\"tracking_session_id\":\"session-a\","
+        + "\"prior_map_id\":\"map-a\","
+        + "\"prior_map_sha256\":\"\(p7r6aIdentitySha())\","
+        + "\"floor_id\":\"1\","
+    let tag = "[{\"format\":\"MarketScannerLocalizedPriceTag\","
+        + "\"version\":1," + identity
+        + "\"tag_id\":\"t1\",\"observation_id\":\"o1\","
+        + "\"payload\":\"p\",\"symbology\":\"CODE128\","
+        + "\"timestamp\":1.0,\"localization_confidence\":0.9,"
+        + "\"measurement_confidence\":0.9,\"association_confidence\":0.9,"
+        + "\"measurement_method\":\"manual\","
+        + "\"needs_review\":0,\"user_confirmed\":1}]\n"
+    try Data(tag.utf8).write(to: directory.appendingPathComponent(
+        "localized_price_tags.json"))
+    let blockers = LocalizationEvidenceBundleValidator.blockers(
+        in: directory,
+        expectation: p7r6BundleExpectation(recoveryCount: 0))
+    require(
+        blockers.contains(
+            "evidence_bundle_localized_price_tags_"
+                + "tag_business_schema_invalid"),
+        "P-B12 numeric tag booleans must block finalization (SB5): "
+            + "\(blockers)")
+}
+
+// P-B13/P-B14: the frozen 16 MB file limit is exact on both sides of the
+// boundary, mirroring the Python reader's pre-read size check.
+do {
+    let exact = Data(
+        repeating: 0x61,
+        count: RecoveryLifecycleEvidenceLimits.maximumFileBytes)
+    let exactCode = try p7r6aParseFailureCode(exact)
+    require(
+        exactCode == "missing_final_newline",
+        "P-B13 an exact-limit snapshot passes the size gate (B4)")
+    let over = Data(
+        repeating: 0x61,
+        count: RecoveryLifecycleEvidenceLimits.maximumFileBytes + 1)
+    let overCode = try p7r6aParseFailureCode(over)
+    require(
+        overCode == "file_too_large",
+        "P-B14 a file one byte over the limit fails closed (B4)")
+}
+
+// P-B15: record-byte and nesting-depth boundaries use the shared limits.
+do {
+    var exactRecord = Data(
+        repeating: 0x61,
+        count: RecoveryLifecycleEvidenceLimits.maximumRecordBytes)
+    exactRecord.append(0x0A)
+    let exactRecordCode = try p7r6aParseFailureCode(exactRecord)
+    require(
+        exactRecordCode == "invalid_json",
+        "P-B15 an exact-limit record passes the size gate (B4)")
+    var overRecord = Data(
+        repeating: 0x61,
+        count: RecoveryLifecycleEvidenceLimits.maximumRecordBytes + 1)
+    overRecord.append(0x0A)
+    let overRecordCode = try p7r6aParseFailureCode(overRecord)
+    require(
+        overRecordCode == "record_too_large",
+        "P-B15 a record one byte over the limit fails closed (B4)")
+    let allowedDepth = String(repeating: "{\"a\":", count: 32)
+        + "null" + String(repeating: "}", count: 32) + "\n"
+    let allowedDepthCode = try p7r6aParseFailureCode(
+        Data(allowedDepth.utf8))
+    require(
+        allowedDepthCode == "format_mismatch",
+        "P-B15 depth 32 passes the nesting gate (B4)")
+    let overDepth = String(
+        repeating: "{\"a\":",
+        count: RecoveryLifecycleEvidenceLimits.maximumJSONNestingDepth + 1)
+        + "null"
+        + String(
+            repeating: "}",
+            count: RecoveryLifecycleEvidenceLimits.maximumJSONNestingDepth + 1)
+        + "\n"
+    let overDepthCode = try p7r6aParseFailureCode(
+        Data(overDepth.utf8))
+    require(
+        overDepthCode == "invalid_json",
+        "P-B15 depth 33 must fail the nesting gate (B4)")
 }
 
 // P7R6A fixture alignment mode: classifies every shared recovery fixture
