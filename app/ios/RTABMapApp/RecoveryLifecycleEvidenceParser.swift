@@ -413,8 +413,8 @@ enum RecoveryLifecyclePersistedEvidenceParser {
         guard let episodeId = strictInteger(object["episode_id"]),
               episodeId > 0,
               nonEmptyString(object["reason"]),
-              object["episode_automatic"] is Bool,
-              let episodeAutomatic = object["episode_automatic"] as? Bool,
+              let episodeAutomatic =
+                  StrictJSONScalar.boolean(object["episode_automatic"]),
               let startedAtUptime = strictNumber(object["started_at_uptime"]),
               startedAtUptime >= 0,
               let finishedAtUptime = strictNumber(object["finished_at_uptime"]),
@@ -447,9 +447,9 @@ enum RecoveryLifecyclePersistedEvidenceParser {
               let freshSupportFrames =
                   strictInteger(object["fresh_support_frames"]),
               freshSupportFrames >= 0,
-              object["completion_frame_step_applied"] is Bool,
               let completionFrameStepApplied =
-                  object["completion_frame_step_applied"] as? Bool else {
+                  StrictJSONScalar.boolean(
+                      object["completion_frame_step_applied"]) else {
             throw RecoveryLifecycleEvidenceParseError.businessSchemaInvalid(
                 line: lineNumber)
         }
@@ -572,8 +572,8 @@ enum RecoveryLifecyclePersistedEvidenceParser {
             guard Set(record.keys).isSubset(
                     of: ["reason", "automatic", "at_uptime"]),
                   nonEmptyString(record["reason"]),
-                  record["automatic"] is Bool,
-                  let automatic = record["automatic"] as? Bool,
+                  let automatic =
+                      StrictJSONScalar.boolean(record["automatic"]),
                   let uptime = strictNumber(record["at_uptime"]),
                   uptime >= startedAtUptime,
                   uptime <= finishedAtUptime else {

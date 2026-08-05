@@ -220,6 +220,7 @@ class IOSCoreContractTests(unittest.TestCase):
             / "app/ios/RTABMapApp/RecoveryLifecyclePersistenceCore.swift",
             repository
             / "app/ios/RTABMapApp/RecoveryLifecycleEvidenceParser.swift",
+            repository / "app/ios/RTABMapApp/StrictJSONScalar.swift",
             repository / "app/ios/RTABMapApp/PriorMapScanMatcher.swift",
             repository / "app/ios/RTABMapApp/PriceTagLocalizationCore.swift",
             repository

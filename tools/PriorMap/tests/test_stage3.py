@@ -1935,6 +1935,10 @@ EXPECTED_RECOVERY_FIXTURE_CATEGORIES = {
     "finish_time_regression.jsonl": "finish_order_invalid",
     "unknown_field.jsonl": "unknown_field",
     "identity_mismatch.jsonl": "identity_mismatch",
+    # P7R6B strict scalar fixtures: numeric 0/1 is not a JSON boolean.
+    "numeric_episode_automatic.jsonl": "business_schema_invalid",
+    "numeric_completion_step.jsonl": "business_schema_invalid",
+    "numeric_trigger_automatic.jsonl": "trigger_records_invalid",
 }
 
 _PYTHON_RECOVERY_ERROR_PATTERNS = (
@@ -2002,6 +2006,74 @@ class RecoveryLifecycleFixtureContractTests(unittest.TestCase):
                 EXPECTED_RECOVERY_FIXTURE_CATEGORIES[name],
                 name,
             )
+
+
+    def test_strict_bool_parity_rejects_numeric_booleans(self) -> None:
+        """P7R6B: numeric 0/1 in a boolean field is rejected exactly like
+        the device-side StrictJSONScalar rejects it. The shared fixtures
+        carry full valid records so only the boolean type can fail."""
+        with self.assertRaisesRegex(
+            OfflineLocalizationError, "recovery_business_schema_invalid"
+        ):
+            _read_jsonl(
+                RECOVERY_FIXTURES_DIR / "numeric_episode_automatic.jsonl",
+                RECOVERY_EVENT_CONTRACT,
+                session_id="session-a",
+                expected_map_hash="a" * 64,
+                expected_floor_id="1",
+            )
+        with self.assertRaisesRegex(
+            OfflineLocalizationError, "recovery_business_schema_invalid"
+        ):
+            _read_jsonl(
+                RECOVERY_FIXTURES_DIR / "numeric_completion_step.jsonl",
+                RECOVERY_EVENT_CONTRACT,
+                session_id="session-a",
+                expected_map_hash="a" * 64,
+                expected_floor_id="1",
+            )
+        with self.assertRaisesRegex(
+            OfflineLocalizationError, "recovery_trigger_records_invalid"
+        ):
+            _read_jsonl(
+                RECOVERY_FIXTURES_DIR / "numeric_trigger_automatic.jsonl",
+                RECOVERY_EVENT_CONTRACT,
+                session_id="session-a",
+                expected_map_hash="a" * 64,
+                expected_floor_id="1",
+            )
+        # A genuine JSON boolean still passes.
+        with tempfile.TemporaryDirectory() as temporary:
+            valid = Path(temporary) / "valid.jsonl"
+            valid.write_text(
+                '{"format":"MarketScannerRecoveryLifecycleEvent","version":2,'
+                '"tracking_session_id":"session-a",'
+                '"prior_map_id":"map-a",'
+                '"prior_map_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+                'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",'
+                '"floor_id":"1","episode_automatic":false,"episode_id":1,'
+                '"finished_at_uptime":1.0,"started_at_uptime":0.0,'
+                '"elapsed_ms":1000.0,"reason":"r","outcome":"converged",'
+                '"valid_matcher_attempts":1,"accepted_corrections":0,'
+                '"trigger_count":1,"automatic_trigger_count":0,'
+                '"reliable_loop_trigger_count":1,"last_trigger_reason":"r",'
+                '"last_trigger_at_uptime":0.0,"fresh_support_frames":0,'
+                '"completion_frame_step_applied":false,'
+                '"deadline_uptime":10.0,"maximum_valid_attempts":2,'
+                '"trigger_records":[{"reason":"r","automatic":false,'
+                '"at_uptime":0.0}]}\n',
+                encoding="utf-8",
+            )
+            values, _ = _read_jsonl(
+                valid,
+                RECOVERY_EVENT_CONTRACT,
+                session_id="session-a",
+                expected_map_hash="a" * 64,
+                expected_floor_id="1",
+            )
+            self.assertEqual(len(values), 1)
+
+
 
 
 if __name__ == "__main__":

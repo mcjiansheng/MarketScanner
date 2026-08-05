@@ -503,8 +503,8 @@ enum LocalizationEvidenceBundleValidator {
                   validUnitInterval(value["localization_confidence"]),
                   validUnitInterval(value["measurement_confidence"]),
                   validUnitInterval(value["association_confidence"]),
-                  value["needs_review"] is Bool,
-                  value["user_confirmed"] is Bool else {
+                  StrictJSONScalar.boolean(value["needs_review"]) != nil,
+                  StrictJSONScalar.boolean(value["user_confirmed"]) != nil else {
                 throw validationError("tag_business_schema_invalid")
             }
             for fieldName in ["shelf_code", "row_flag", "cross_code", "shelf_side"] {
@@ -583,7 +583,8 @@ enum LocalizationEvidenceBundleValidator {
                 throw validationError("trace_business_schema_invalid")
             }
         case "localization_constraints.jsonl":
-            guard let accepted = object["accepted"] as? Bool,
+            guard let accepted =
+                    StrictJSONScalar.boolean(object["accepted"]),
                   validPose(field(object, "predicted_pose", "predictedPose")),
                   (!accepted || validPose(field(object, "estimated_pose", "estimatedPose"))),
                   validUnitInterval(object["uniqueness"]) else {

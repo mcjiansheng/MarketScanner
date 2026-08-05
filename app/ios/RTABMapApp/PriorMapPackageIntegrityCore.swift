@@ -193,7 +193,7 @@ enum PriorMapPackageIntegrity {
         }
         let expectedStructures = Set(
             elements.compactMap { element -> String? in
-                guard element["visible"] as? Bool == true,
+                guard StrictJSONScalar.boolean(element["visible"]) == true,
                       ["MapShelf", "MapTable", "MapPillar", "MapTableFeature"]
                         .contains(element["shape_type"] as? String ?? "") else {
                     return nil
@@ -203,7 +203,9 @@ enum PriorMapPackageIntegrity {
         try require(
             indexedStructures == expectedStructures && indexedRoads == edgeIds,
             "空间索引引用或覆盖范围与结构/道路不一致。")
-        try require(validation["valid"] as? Bool == true, "PC 验证报告未标记为有效。")
+        try require(
+            StrictJSONScalar.boolean(validation["valid"]) == true,
+            "PC 验证报告未标记为有效。")
     }
 
     private static func validateSubset(
