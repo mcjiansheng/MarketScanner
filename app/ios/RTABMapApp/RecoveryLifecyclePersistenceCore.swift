@@ -174,9 +174,25 @@ final class RecoveryLifecyclePersistenceCoordinator {
         }
         var attemptedIds: [Int] = []
         var persistedIds: [Int] = []
+        let existingMaximumEpisodeId = parsed.records.reduce(Int.min) {
+            max($0, $1.episodeId)
+        }
         for completion in pending {
             let episodeId = completion.episode.id
             attemptedIds.append(episodeId)
+            // Historical evidence (including v1 records) keeps its episode
+            // order forever: appending an episode that would break the
+            // strictly increasing ID contract is a conflict, because the
+            // coordinator accepting it would guarantee a finalization
+            // rejection.
+            if episodeId < existingMaximumEpisodeId {
+                return RecoveryLifecyclePersistenceResult(
+                    attemptedEpisodeIds: attemptedIds,
+                    persistedEpisodeIds: persistedIds,
+                    failedEpisodeId: episodeId,
+                    failureReason: "persisted_episode_order_conflict",
+                    allPersisted: false)
+            }
             let record = PriorMapRecoveryLifecycleRecord(
                 trackingSessionId: trackingSessionId,
                 priorMapId: priorMapId,

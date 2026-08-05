@@ -48,7 +48,21 @@ struct RecoveryLifecycleEvidenceExpectation {
 /// One version-aware persisted lifecycle record. Historical v1 records keep
 /// their missing v2 facts as nil; the parser never fabricates a deadline,
 /// attempts budget, or trigger sequence for them.
+///
+/// P7R6A v1 compatibility contract:
+///
+/// ```text
+/// v1: deadlineUptime/maximumValidAttempts/triggerRecords are nil; a v1
+///     record carrying any of those fields is rejected as an unknown field.
+/// v2: all three facts must be present and valid.
+/// A persisted v1 record is never rewritten or upgraded to v2, and a v1
+/// record can never be merged idempotently with a pending v2 episode.
+/// ```
 struct PersistedRecoveryLifecycleRecord: Equatable {
+    var isVersionOne: Bool {
+        return version == 1
+    }
+
     let format: String
     let version: Int
 
