@@ -1,0 +1,34 @@
+# P7R6B Strict JSON and pending-queue closeout review record
+
+> Document status: **当前有效 / current and authoritative**. Last reconciled: 2026-08-05.
+> Input prompt: `MarketScanner_P7R6A_Code_Review_and_P7R6B_Fix_Prompt.md`.
+> Base: `repair-v2-p7r6a-recovery-persisted-parser-closeout@f4524d958913e927a33a7295f45ccf7b3a98d42a` (P7R6A implementation `01a42a40e9671c709c4e0f9e1f85839a48dd4a83`).
+> Implementation branch: `repair-v2-p7r6b-strict-json-pending-queue-closeout`; the exact P7R6B implementation SHA is bound in `.github/marketscanner-repair-v2-wave.json`.
+
+## Review decision (recorded at implementation time)
+
+**FIXES REQUIRED BEFORE READY FOR HUMAN SAM RE-TEST** — the four code findings (B1..B4) are closed in this wave; B5 (exact-SHA seven-group CI, clean Apple build, independent read-only review) remains NOT RUN and gates the `READY FOR HUMAN SAM RE-TEST` declaration.
+
+## Findings closed this round
+
+- **B1 Strict JSON booleans**: Foundation bridges `NSNumber` through `is Bool` / `as? Bool`, so a numeric 0/1 previously passed the device boolean checks while the PC reader's `isinstance(value, bool)` rejected it. Closed: new Foundation-only `StrictJSONScalar` (`app/ios/RTABMapApp/StrictJSONScalar.swift`) with `boolean` (a `CFBooleanGetTypeID` check), `integer` and `number`; every formal evidence schema now reads booleans through it — Recovery `episode_automatic`, `completion_frame_step_applied`, trigger-record `automatic`, constraint `accepted`, localized-tag `needs_review`/`user_confirmed`, prior-map `visible` and validation-report `valid`. The Python reader keeps `isinstance(value, bool)`; new fixtures `numeric_episode_automatic.jsonl`, `numeric_completion_step.jsonl`, `numeric_trigger_automatic.jsonl` are rejected on both readers (SB1..SB3, SB6, P-B1..P-B3, P-B11..P-B12).
+- **B2 Duplicate JSON keys**: `JSONSerialization` and `json.loads` silently apply last-key-wins. Closed: new `StrictJSONKeyUniquenessValidator` (`app/ios/RTABMapApp/StrictJSONKeyUniquenessValidator.swift`) scans the raw UTF-8 bytes before decoding — iterative with an explicit container stack (bounded depth 32, bounded tokens, no recursion), correct string/escape/`\uXXXX`/surrogate handling, escaped keys decoded to Swift String before comparison so `{"episode_id":1,"\u0065pisode_id":2}` is a duplicate. The Python reader passes `object_pairs_hook=_reject_duplicate_object_pairs` on every formal JSON/JSONL read. New fixtures `duplicate_top_level_key.jsonl`, `duplicate_nested_trigger_key.jsonl`, `duplicate_escaped_equivalent_key.jsonl` (DK1..DK3, P-B4..P-B6) are rejected on both readers. Stable categories: Swift/PC/fixture `duplicate_json_key`; coordinator `existing_evidence_duplicate_json_key`; finalization blocker `evidence_bundle_<file>_duplicate_json_key`.
+- **B3 Pending queue order and uniqueness**: the coordinator sorted `pendingTerminalRecoveryCompletions()` by episode ID, hiding a corrupted finish order, and a duplicated pending episode could be appended twice against a stale empty snapshot. Closed: the coordinator never sorts; before any snapshot read/append/ack it validates positive unique strictly-increasing episode IDs, finite started/finished uptimes, `finished >= started`, and non-decreasing finish uptimes. Violations report `attemptedEpisodeIds=[]`, `persistedEpisodeIds=[]`, the first offending episode, zero appends/acks, and `pending_episode_duplicate` / `pending_episode_order_invalid` / `pending_finish_order_invalid`. Effective persisted state (`effectiveRecordsByEpisodeId`, `effectiveMaximumEpisodeId`) advances inside the transaction so the idempotence lookup never falls back to a stale pre-append snapshot and the coordinator cannot write a duplicate episode even under a future source-contract regression. Covered by P-B7..P-B10 (PQ1..PQ7); the old P7R6 "restore episode order" behavior was replaced by the fail-closed contract.
+- **B4 Unified evidence limits**: the parser (16 MiB/1 MiB/500k), finalization (up to 512 MiB by expected count) and the PC reader each kept independent limits. Closed: one frozen contract `RecoveryLifecycleEvidenceLimits` (16 MiB file / 1 MiB record / 100,000 records / 8 trigger records / depth 32) is referenced by the parser, the finalization bundle validator (recovery path), the session stable-read snapshot and the Swift host; Python defines the same `RECOVERY_MAXIMUM_*` constants, checks file size before reading and enforces the nesting depth per line. Boundary tests cover exact-limit PASS and limit+1 FAIL for file bytes, record bytes and depth (P-B13..P-B15).
+
+## Stable failure vocabulary added this wave
+
+Parser/fixture: `duplicate_json_key`. Coordinator: `pending_episode_duplicate`, `pending_episode_order_invalid`, `pending_finish_order_invalid`, `existing_evidence_duplicate_json_key`. Finalization blocker: `evidence_bundle_<file>_duplicate_json_key` (for the recovery file via `legacyRecoveryReason`). PC: `recovery_duplicate_json_key` category `duplicate_json_key`. All P7R2..P7R6A stable codes are unchanged.
+
+## Executable evidence
+
+- Swift host P-B1..P-B15: SB1-SB6 strict scalar parity, DK1-DK3 duplicate keys (top-level/nested/escaped-equivalent), PQ1-PQ7 pending-queue duplicate/order/finish-regression/idempotence-injection, strict constraint `accepted`, strict tag booleans, unified file/record/depth boundaries. P-A1..P-A20 and all earlier P7R2..P7R6A tests still pass; the P7R6 pending-order test was updated to the fail-closed contract.
+- Shared fixtures `tools/PriorMap/tests/fixtures/recovery_lifecycle/`: 16 fixtures (10 inherited + 6 new) classified identically by the Swift parser (`--recovery-fixtures`) and the Python reader against the frozen category table.
+- Python: `RecoveryLifecycleFixtureContractTests` adds object_pairs_hook rejection, strict-bool parity, file-size and nesting-depth limit enforcement; the full PriorMap suite passes.
+- Xcode: `StrictJSONScalar.swift` and `StrictJSONKeyUniquenessValidator.swift` are registered in `project.pbxproj` (PBXFileReference / PBXBuildFile / group / Sources phase); CI `swiftc -parse` and the Swift host compile list include both files.
+
+## Status declarations
+
+- IMPLEMENTED / UNIT TESTED / INTEGRATION TESTED: strict scalars, duplicate-key rejection, pending-queue contract, unified limits, fixtures, Swift host P-B tests, Python parity tests.
+- NOT RUN / PENDING at documentation time: exact-final-SHA seven-group CI on the P7R6B HEAD, clean Apple build, independent read-only review, human Sam re-test. Without those, `AUTOMATED CLOSEOUT PASS`, `APPLE BUILD VERIFIED`, `INDEPENDENT REVIEWED`, and `READY FOR HUMAN SAM RE-TEST` must not be declared.
+- Forbidden at all times this round: `REAL DEVICE PASS`, `SAM FIELD PASS`, `PRODUCTION READY`. Release judgment stays **NO-GO / NOT PRODUCTION READY** until LiDAR real-device, same-route Sam, and on-site control-point tests complete.

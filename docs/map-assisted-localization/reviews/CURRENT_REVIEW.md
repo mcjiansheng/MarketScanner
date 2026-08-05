@@ -1,15 +1,16 @@
 # MarketScanner current code-review entry point
 
-> Document status: **当前有效 / current and authoritative**. Last reconciled: 2026-08-04.
-> External review input: `MarketScanner_P7R4_Review_P7R5_and_Mobile_Only_Master_Prompt.md`.
-> Historical predecessor input: `MarketScanner_P7R1_Agent_Repair_Prompts.md`.
+> Document status: **当前有效 / current and authoritative**. Last reconciled: 2026-08-05.
+> External review input: `MarketScanner_P7R6A_Code_Review_and_P7R6B_Fix_Prompt.md`.
+> Historical predecessor input: `MarketScanner_P7R4_Review_P7R5_and_Mobile_Only_Master_Prompt.md` and `MarketScanner_P7R1_Agent_Repair_Prompts.md`.
 > Production-readiness frozen baseline: `repair-v2-w2r-safety-closeout@cf1b62c949f3574e1804808537e38c8ff643549c`.
 > P7R1 review baseline: `repair-v2-p7r0-independent-baseline@79c86b120fc47c28bd350e86abc9b0354d7e838d`.
 > P7R3 cloud base at task start: `repair-v2-p7r3-recovery-episode-closeout@998c175e40562fffd85fe45579a358c485a65b30`.
 > P7R5 base branch: `repair-v2-p7r4-recovery-confidence-closeout@e2b1cf4142b5a3bc353909af77158199bbf09e5f` (P7R4 production implementation `981ff4e208f74c8d4dd451d32df88233089e3201`).
 > P7R5 governance HEAD used as the P7R6 base: `repair-v2-p7r5-recovery-terminal-closeout@970d03fbf18f8c9274f6dfb7ee0b8a79ee193c3f` (P7R5 implementation SHA `fc5618c84280cb02cfda4a8ead03f71401d4b55c`).
 > P7R6 governance HEAD used as the P7R6A base: `repair-v2-p7r6-recovery-evidence-integrity-closeout@4bce394bdfb7f6c7c2373f314814a3e3260356fe` (P7R6 implementation SHA `a315ff6e5c0ca639f12c639aaf81be6738195e2f`).
-> Current implementation branch: `repair-v2-p7r6a-recovery-persisted-parser-closeout`; its exact P7R6A implementation SHA is bound in `.github/marketscanner-repair-v2-wave.json`; later test/governance commits must not silently modify production code.
+> P7R6A governance HEAD used as the P7R6B base: `repair-v2-p7r6a-recovery-persisted-parser-closeout@f4524d958913e927a33a7295f45ccf7b3a98d42a` (P7R6A implementation SHA `01a42a40e9671c709c4e0f9e1f85839a48dd4a83`).
+> Current implementation branch: `repair-v2-p7r6b-strict-json-pending-queue-closeout`; its exact P7R6B implementation SHA is bound in `.github/marketscanner-repair-v2-wave.json`; later test/governance commits must not silently modify production code.
 
 The authoritative release judgment remains [Production Readiness Review](PRODUCTION_READINESS_REVIEW.md): **NO-GO / NOT PRODUCTION READY**.
 
@@ -19,7 +20,7 @@ The 30-second monotonic deadline is checked before and after matching. A matcher
 
 Completion diagnostics are bound to the completed episode and kept separate from current Local hypotheses. `PriorMapScanMatchResult.searchPerformed` is the single source for valid-attempt accounting, with `PriorMapScanMatcher.minimumSearchPointCount = 30`. The production-shared update reducer joins frame disposition, monotonic expiry, attempt exhaustion, correction/constraint acceptance, Recovery action, next confidence phase, and diagnostics; limited/no-depth/nil/undersized/busy/throttled frames consume wall time but not attempts, timeout enters and remains weak through cooldown, and exact cooldown expiry permits a new automatic episode. The localizer's production anchor is exercised through competing A/B Recovery, bounded B convergence, track cleanup, and the next ordinary Local frame. The PC reader rejects any provisional disposition marked formally accepted.
 
-Current status: **IMPLEMENTED / focused AUTOMATED TESTED / INTEGRATION TESTED**. Windows cannot establish Xcode, UIKit, ARKit, LiDAR, or real-device PASS. Exact-final-SHA CI on the P7R6A HEAD, a clean Apple build, and the independent read-only review are still NOT RUN; they remain required before `READY FOR HUMAN SAM RE-TEST` may be declared. Historical reviews remain under [`history/`](history/).
+Current status: **IMPLEMENTED / focused AUTOMATED TESTED / INTEGRATION TESTED**. Windows cannot establish Xcode, UIKit, ARKit, LiDAR, or real-device PASS. Exact-final-SHA CI on the P7R6B HEAD, a clean Apple build, and the independent read-only review are still NOT RUN; they remain required before `READY FOR HUMAN SAM RE-TEST` may be declared. Historical reviews remain under [`history/`](history/). The current wave review entry point is [`P7R6B_REVIEW.md`](P7R6B_REVIEW.md).
 
 P7R5 closes the four findings of the independent P7R4 review without touching P7R2/P7R3/P7R4 contracts. F-01: `PriorMapRecoveryController.finish` reconciles the automatic cooldown against the terminal outcome — convergence and manual reset clear stale cooldown (so a successful reliable-loop Recovery no longer forces subsequent frames weak), timeouts extend it regardless of trigger source, and cancellations follow their explicit reason. F-02: teardowns are no longer fire-and-forget; `cancelRecovery(reason:now:)` returns the terminal completion, and every terminal completion (converged/timed out/manual reset/cancelled) is persisted as `MarketScannerRecoveryLifecycleEvent` v1 in `localization_recovery_events.jsonl` before the localizer is unbound, in strict order (finish, build record, write evidence, confirm, then cleanup); append failures increment the required-write failure counter and make the session processing-ineligible (fail closed). F-03: episode elapsed time exposed on completion frames is bound to the completion finish time through one shared diagnostics reducer, never to a later consuming frame clock. F-04: repeated triggers on an active episode retain a bounded source summary (automatic/reliable-loop counters, last reason/uptime, at most eight trigger records).
 

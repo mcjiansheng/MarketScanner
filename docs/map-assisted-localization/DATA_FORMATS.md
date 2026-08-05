@@ -212,3 +212,49 @@ The persisted Recovery lifecycle evidence now has one strict, Foundation-only pa
 7. `attemptedEpisodeIds` lists exactly the episodes the transaction entered: pending [1,2,3] with a failure on episode 2 reports attempted [1,2], persisted [1], failed 2, and keeps [2,3] queued.
 8. `prior_map_sha256` must equal the expectation and be a 64-character lowercase hex digest; identities are compared strictly, never only for non-emptiness.
 9. The PC reader shares the contract: it rejects a missing final newline and classifies the shared fixtures (`tools/PriorMap/tests/fixtures/recovery_lifecycle/`) into the same stable categories as the device parser (PASS, `missing_final_newline`, `blank_record`, `duplicate_episode`, `episode_order_invalid`, `finish_order_invalid`, `unknown_field`, `identity_mismatch`).
+
+# P7R6B strict JSON and pending-queue contracts
+
+Last reconciled: 2026-08-05. This wave closes the strict-type, duplicate-key, pending-queue and unified-limit findings of the P7R6A review.
+
+## Strict JSON scalars
+
+A JSON numeric `0`/`1` is **not** a boolean. Swift Foundation bridges `NSNumber` through `is Bool`/`as? Bool`, so the device previously accepted a numeric boolean that the Python PC reader (`isinstance(value, bool)`) rejected. All formal evidence schemas now read booleans through `StrictJSONScalar.boolean` (a CoreFoundation `CFBooleanGetTypeID` check) and integers/numbers through `StrictJSONScalar.integer`/`.number`:
+
+| Contract | Field | Swift rule | Python rule |
+|---|---|---|---|
+| Recovery record | `episode_automatic` | `StrictJSONScalar.boolean` | `isinstance(value, bool)` |
+| Recovery record | `completion_frame_step_applied` | `StrictJSONScalar.boolean` | `isinstance(value, bool)` |
+| Recovery trigger record | `automatic` | `StrictJSONScalar.boolean` | `isinstance(value, bool)` |
+| Constraint | `accepted` | `StrictJSONScalar.boolean` | `isinstance(value, bool)` |
+| Localized price tag | `needs_review` / `user_confirmed` | `StrictJSONScalar.boolean` | `isinstance(value, bool)` |
+| Prior-map element | `visible` | `StrictJSONScalar.boolean` | PC producer writes real booleans |
+| Prior-map validation report | `valid` | `StrictJSONScalar.boolean` | PC producer writes real booleans |
+
+Stable categories: Swift `business_schema_invalid` / `trigger_records_invalid`; PC `recovery_business_schema_invalid` / `recovery_trigger_records_invalid`; shared fixture category `business_schema_invalid` / `trigger_records_invalid`. Genuine `true`/`false` still pass on both readers.
+
+## Duplicate JSON object keys
+
+Duplicate keys are ambiguous evidence and are rejected **before** `JSONSerialization`/`json.loads` can silently apply last-key-wins. The on-device scanner (`StrictJSONKeyUniquenessValidator`) is byte-level and iterative (bounded depth 32, bounded tokens, no recursion), decodes JSON escapes including surrogate pairs, and compares decoded keys per object, so `{"episode_id":1,"\u0065pisode_id":2}` is a duplicate. Python uses an `object_pairs_hook` on every formal JSON/JSONL read. Stable categories: Swift `duplicate_json_key`; coordinator `existing_evidence_duplicate_json_key`; finalization blocker `evidence_bundle_localization_recovery_events.jsonl_duplicate_json_key` (other files follow the same `duplicate_json_key` reason); PC `recovery_duplicate_json_key`; shared fixture category `duplicate_json_key`.
+
+## Pending completion queue contract
+
+`RecoveryLifecyclePersistenceCoordinator` never sorts the pending queue; it carries finish order. Before any snapshot read, append or acknowledgement it validates: positive unique episode IDs in strictly increasing order, finite started/finished uptimes, `finished >= started`, and non-decreasing finish uptimes. Violations report `attemptedEpisodeIds=[]`, `persistedEpisodeIds=[]`, the first offending episode, and a stable reason (`pending_episode_duplicate` / `pending_episode_order_invalid` / `pending_finish_order_invalid`) with zero appends and zero acknowledgements. Effective persisted state (records and maximum episode ID) advances inside the transaction, so the idempotence lookup never falls back to a stale pre-append snapshot and the coordinator cannot write a duplicate episode even if the source contract regresses.
+
+## Unified Recovery evidence limits
+
+The device parser, the finalization bundle validator, the session stable-read snapshot and the PC reader share one frozen contract (`RecoveryLifecycleEvidenceLimits` on device; `RECOVERY_MAXIMUM_*` in `offline_localization.py`):
+
+```text
+maximumFileBytes                16 MiB
+maximumRecordBytes              1 MiB
+maximumRecords                  100,000
+maximumTriggerRecordsPerEpisode 8
+maximumJSONNestingDepth         32
+```
+
+The PC reader checks the file size before reading and the record/nesting depth per line. Boundary tests cover exact-limit PASS and limit+1 FAIL for file bytes, record bytes and nesting depth. Recovery records are small; the historical 512 MiB expected-count ceiling is gone.
+
+## Status words
+
+IMPLEMENTED, UNIT TESTED, INTEGRATION TESTED (P-B1..P-B15 Swift host; shared Swift/PC fixtures). Exact-final-SHA CI on the P7R6B HEAD, the clean Apple build and the independent read-only review remain NOT RUN; human Sam re-test and real-device field runs are NOT RUN and must never be reported as PASS.
