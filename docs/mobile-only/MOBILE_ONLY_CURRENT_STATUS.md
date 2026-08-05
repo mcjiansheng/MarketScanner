@@ -31,3 +31,10 @@
 
 本阶段结论：**DESIGNED / IMPLEMENTED / UNIT TESTED / INTEGRATION TESTED（Swift host）**；
 NOT CI VERIFIED / NOT DEVICE SMOKE PASS / NOT SAM FIELD PASS / NOT PRODUCTION QUALIFIED。
+
+## V1R1 收口（见 MOBILE_ONLY_V1R1_PRODUCT_INTEGRATION.md）
+
+分支 `mobile-only-v1r1-product-integration-closeout` 新增：
+真实 App UI 与总协调器（Gate A）、严格导入/canonical v2（Gate B）、
+in-process RTAB-Map 图读取 bridge（Gate E）、流式原子 XLSX（Gate J）、
+Replay E2E、CI 分支匹配。当前状态与未执行项见 V1R1 文档。
