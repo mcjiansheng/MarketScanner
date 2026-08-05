@@ -95,6 +95,37 @@
 		4EA700012F60000400100001 /* StrictJSONScalar.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60000400100002 /* StrictJSONScalar.swift */; };
 		4EA700012F60000500100001 /* StrictJSONKeyUniquenessValidator.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60000500100002 /* StrictJSONKeyUniquenessValidator.swift */; };
 		4EA700012F60000700100001 /* PriorMapPackageSnapshotCore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60000700100002 /* PriorMapPackageSnapshotCore.swift */; };
+		4EA700012F60002600100001 /* XLSXWorkbookWriter.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60002600100002 /* XLSXWorkbookWriter.swift */; };
+		4EA700012F60002500100001 /* ResultShareController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60002500100002 /* ResultShareController.swift */; };
+		4EA700012F60002400100001 /* MobileWorksheets.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60002400100002 /* MobileWorksheets.swift */; };
+		4EA700012F60002300100001 /* MobileResultExporter.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60002300100002 /* MobileResultExporter.swift */; };
+		4EA700012F60002200100001 /* TagObservationResolver.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60002200100002 /* TagObservationResolver.swift */; };
+		4EA700012F60002100100001 /* ShelfAssociationEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60002100100002 /* ShelfAssociationEngine.swift */; };
+		4EA700012F60002000100001 /* SessionSnapshotTransaction.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60002000100002 /* SessionSnapshotTransaction.swift */; };
+		4EA700012F60001F00100001 /* SE2Transform.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60001F00100002 /* SE2Transform.swift */; };
+		4EA700012F60001E00100001 /* SE2FactorGraphCore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60001E00100002 /* SE2FactorGraphCore.swift */; };
+		4EA700012F60001D00100001 /* FinalTrajectory.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60001D00100002 /* FinalTrajectory.swift */; };
+		4EA700012F60001C00100001 /* ClockCorrelationRecorder.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60001C00100002 /* ClockCorrelationRecorder.swift */; };
+		4EA700012F60001B00100001 /* MobileRoadGraphBuilder.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60001B00100002 /* MobileRoadGraphBuilder.swift */; };
+		4EA700012F60001A00100001 /* MobilePriorMapCompiler.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60001A00100002 /* MobilePriorMapCompiler.swift */; };
+		4EA700012F60001900100001 /* MobilePreviewRenderer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60001900100002 /* MobilePreviewRenderer.swift */; };
+		4EA700012F60001800100001 /* MobilePackageManifestBuilder.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60001800100002 /* MobilePackageManifestBuilder.swift */; };
+		4EA700012F60001700100001 /* MobileDistanceFieldBuilder.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60001700100002 /* MobileDistanceFieldBuilder.swift */; };
+		4EA700012F60001600100001 /* XLSXZipReader.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60001600100002 /* XLSXZipReader.swift */; };
+		4EA700012F60001500100001 /* XLSXWorksheetReader.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60001500100002 /* XLSXWorksheetReader.swift */; };
+		4EA700012F60001400100001 /* XLSXWorkbookReader.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60001400100002 /* XLSXWorkbookReader.swift */; };
+		4EA700012F60001300100001 /* XLSXMapSourceImporter.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60001300100002 /* XLSXMapSourceImporter.swift */; };
+		4EA700012F60001200100001 /* SourceGeometry.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60001200100002 /* SourceGeometry.swift */; };
+		4EA700012F60001100100001 /* RFC4180CSVReader.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60001100100002 /* RFC4180CSVReader.swift */; };
+		4EA700012F60001000100001 /* MapSourceImportReport.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60001000100002 /* MapSourceImportReport.swift */; };
+		4EA700012F60000F00100001 /* MapSourceImportError.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60000F00100002 /* MapSourceImportError.swift */; };
+		4EA700012F60000E00100001 /* MapSourceImportCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60000E00100002 /* MapSourceImportCoordinator.swift */; };
+		4EA700012F60000D00100001 /* MapSourceDocumentPicker.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60000D00100002 /* MapSourceDocumentPicker.swift */; };
+		4EA700012F60000C00100001 /* JSONMapSourceImporter.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60000C00100002 /* JSONMapSourceImporter.swift */; };
+		4EA700012F60000B00100001 /* ElementNormalizer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60000B00100002 /* ElementNormalizer.swift */; };
+		4EA700012F60000A00100001 /* CanonicalPriorMapSource.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60000A00100002 /* CanonicalPriorMapSource.swift */; };
+		4EA700012F60000900100001 /* CanonicalJSONEncoder.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60000900100002 /* CanonicalJSONEncoder.swift */; };
+		4EA700012F60000800100001 /* CSVMapSourceImporter.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60000800100002 /* CSVMapSourceImporter.swift */; };
 		4EA700012F60000600100001 /* StrictJSONDocumentParser.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60000600100002 /* StrictJSONDocumentParser.swift */; };
 		4EA500012F40000100100001 /* PriorMapScanMatcher.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA500012F40000100100002 /* PriorMapScanMatcher.swift */; };
 		4EA500012F40000100100003 /* PriorMapDepthSampler.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA500012F40000100100004 /* PriorMapDepthSampler.swift */; };
@@ -216,6 +247,37 @@
 		4EA700012F60000400100002 /* StrictJSONScalar.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = StrictJSONScalar.swift; path = RTABMapApp/StrictJSONScalar.swift; sourceTree = "<group>"; };
 		4EA700012F60000500100002 /* StrictJSONKeyUniquenessValidator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = StrictJSONKeyUniquenessValidator.swift; path = RTABMapApp/StrictJSONKeyUniquenessValidator.swift; sourceTree = "<group>"; };
 		4EA700012F60000700100002 /* PriorMapPackageSnapshotCore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = PriorMapPackageSnapshotCore.swift; path = RTABMapApp/PriorMapPackageSnapshotCore.swift; sourceTree = "<group>"; };
+		4EA700012F60002600100002 /* XLSXWorkbookWriter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = XLSXWorkbookWriter.swift; path = RTABMapApp/MobileResults/XLSXWorkbookWriter.swift; sourceTree = "<group>"; };
+		4EA700012F60002500100002 /* ResultShareController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = ResultShareController.swift; path = RTABMapApp/MobileResults/ResultShareController.swift; sourceTree = "<group>"; };
+		4EA700012F60002400100002 /* MobileWorksheets.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = MobileWorksheets.swift; path = RTABMapApp/MobileResults/MobileWorksheets.swift; sourceTree = "<group>"; };
+		4EA700012F60002300100002 /* MobileResultExporter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = MobileResultExporter.swift; path = RTABMapApp/MobileResults/MobileResultExporter.swift; sourceTree = "<group>"; };
+		4EA700012F60002200100002 /* TagObservationResolver.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = TagObservationResolver.swift; path = RTABMapApp/MobilePostProcessing/TagObservationResolver.swift; sourceTree = "<group>"; };
+		4EA700012F60002100100002 /* ShelfAssociationEngine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = ShelfAssociationEngine.swift; path = RTABMapApp/MobilePostProcessing/ShelfAssociationEngine.swift; sourceTree = "<group>"; };
+		4EA700012F60002000100002 /* SessionSnapshotTransaction.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = SessionSnapshotTransaction.swift; path = RTABMapApp/MobilePostProcessing/SessionSnapshotTransaction.swift; sourceTree = "<group>"; };
+		4EA700012F60001F00100002 /* SE2Transform.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = SE2Transform.swift; path = RTABMapApp/MobilePostProcessing/SE2Transform.swift; sourceTree = "<group>"; };
+		4EA700012F60001E00100002 /* SE2FactorGraphCore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = SE2FactorGraphCore.swift; path = RTABMapApp/MobilePostProcessing/SE2FactorGraphCore.swift; sourceTree = "<group>"; };
+		4EA700012F60001D00100002 /* FinalTrajectory.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = FinalTrajectory.swift; path = RTABMapApp/MobilePostProcessing/FinalTrajectory.swift; sourceTree = "<group>"; };
+		4EA700012F60001C00100002 /* ClockCorrelationRecorder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = ClockCorrelationRecorder.swift; path = RTABMapApp/MobilePostProcessing/ClockCorrelationRecorder.swift; sourceTree = "<group>"; };
+		4EA700012F60001B00100002 /* MobileRoadGraphBuilder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = MobileRoadGraphBuilder.swift; path = RTABMapApp/MobilePriorMapCompiler/MobileRoadGraphBuilder.swift; sourceTree = "<group>"; };
+		4EA700012F60001A00100002 /* MobilePriorMapCompiler.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = MobilePriorMapCompiler.swift; path = RTABMapApp/MobilePriorMapCompiler/MobilePriorMapCompiler.swift; sourceTree = "<group>"; };
+		4EA700012F60001900100002 /* MobilePreviewRenderer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = MobilePreviewRenderer.swift; path = RTABMapApp/MobilePriorMapCompiler/MobilePreviewRenderer.swift; sourceTree = "<group>"; };
+		4EA700012F60001800100002 /* MobilePackageManifestBuilder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = MobilePackageManifestBuilder.swift; path = RTABMapApp/MobilePriorMapCompiler/MobilePackageManifestBuilder.swift; sourceTree = "<group>"; };
+		4EA700012F60001700100002 /* MobileDistanceFieldBuilder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = MobileDistanceFieldBuilder.swift; path = RTABMapApp/MobilePriorMapCompiler/MobileDistanceFieldBuilder.swift; sourceTree = "<group>"; };
+		4EA700012F60001600100002 /* XLSXZipReader.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = XLSXZipReader.swift; path = RTABMapApp/MobileMapImport/XLSXZipReader.swift; sourceTree = "<group>"; };
+		4EA700012F60001500100002 /* XLSXWorksheetReader.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = XLSXWorksheetReader.swift; path = RTABMapApp/MobileMapImport/XLSXWorksheetReader.swift; sourceTree = "<group>"; };
+		4EA700012F60001400100002 /* XLSXWorkbookReader.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = XLSXWorkbookReader.swift; path = RTABMapApp/MobileMapImport/XLSXWorkbookReader.swift; sourceTree = "<group>"; };
+		4EA700012F60001300100002 /* XLSXMapSourceImporter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = XLSXMapSourceImporter.swift; path = RTABMapApp/MobileMapImport/XLSXMapSourceImporter.swift; sourceTree = "<group>"; };
+		4EA700012F60001200100002 /* SourceGeometry.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = SourceGeometry.swift; path = RTABMapApp/MobileMapImport/SourceGeometry.swift; sourceTree = "<group>"; };
+		4EA700012F60001100100002 /* RFC4180CSVReader.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = RFC4180CSVReader.swift; path = RTABMapApp/MobileMapImport/RFC4180CSVReader.swift; sourceTree = "<group>"; };
+		4EA700012F60001000100002 /* MapSourceImportReport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = MapSourceImportReport.swift; path = RTABMapApp/MobileMapImport/MapSourceImportReport.swift; sourceTree = "<group>"; };
+		4EA700012F60000F00100002 /* MapSourceImportError.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = MapSourceImportError.swift; path = RTABMapApp/MobileMapImport/MapSourceImportError.swift; sourceTree = "<group>"; };
+		4EA700012F60000E00100002 /* MapSourceImportCoordinator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = MapSourceImportCoordinator.swift; path = RTABMapApp/MobileMapImport/MapSourceImportCoordinator.swift; sourceTree = "<group>"; };
+		4EA700012F60000D00100002 /* MapSourceDocumentPicker.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = MapSourceDocumentPicker.swift; path = RTABMapApp/MobileMapImport/MapSourceDocumentPicker.swift; sourceTree = "<group>"; };
+		4EA700012F60000C00100002 /* JSONMapSourceImporter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = JSONMapSourceImporter.swift; path = RTABMapApp/MobileMapImport/JSONMapSourceImporter.swift; sourceTree = "<group>"; };
+		4EA700012F60000B00100002 /* ElementNormalizer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = ElementNormalizer.swift; path = RTABMapApp/MobileMapImport/ElementNormalizer.swift; sourceTree = "<group>"; };
+		4EA700012F60000A00100002 /* CanonicalPriorMapSource.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = CanonicalPriorMapSource.swift; path = RTABMapApp/MobileMapImport/CanonicalPriorMapSource.swift; sourceTree = "<group>"; };
+		4EA700012F60000900100002 /* CanonicalJSONEncoder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = CanonicalJSONEncoder.swift; path = RTABMapApp/MobileMapImport/CanonicalJSONEncoder.swift; sourceTree = "<group>"; };
+		4EA700012F60000800100002 /* CSVMapSourceImporter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = CSVMapSourceImporter.swift; path = RTABMapApp/MobileMapImport/CSVMapSourceImporter.swift; sourceTree = "<group>"; };
 		4EA700012F60000600100002 /* StrictJSONDocumentParser.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = StrictJSONDocumentParser.swift; path = RTABMapApp/StrictJSONDocumentParser.swift; sourceTree = "<group>"; };
 		4EA500012F40000100100002 /* PriorMapScanMatcher.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = PriorMapScanMatcher.swift; path = RTABMapApp/PriorMapScanMatcher.swift; sourceTree = "<group>"; };
 		4EA500012F40000100100004 /* PriorMapDepthSampler.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = PriorMapDepthSampler.swift; path = RTABMapApp/PriorMapDepthSampler.swift; sourceTree = "<group>"; };
@@ -530,6 +592,37 @@
 				4EA700012F60000400100002 /* StrictJSONScalar.swift */,
 				4EA700012F60000500100002 /* StrictJSONKeyUniquenessValidator.swift */,
 				4EA700012F60000700100002 /* PriorMapPackageSnapshotCore.swift */,
+				4EA700012F60002600100002 /* XLSXWorkbookWriter.swift */,
+				4EA700012F60002500100002 /* ResultShareController.swift */,
+				4EA700012F60002400100002 /* MobileWorksheets.swift */,
+				4EA700012F60002300100002 /* MobileResultExporter.swift */,
+				4EA700012F60002200100002 /* TagObservationResolver.swift */,
+				4EA700012F60002100100002 /* ShelfAssociationEngine.swift */,
+				4EA700012F60002000100002 /* SessionSnapshotTransaction.swift */,
+				4EA700012F60001F00100002 /* SE2Transform.swift */,
+				4EA700012F60001E00100002 /* SE2FactorGraphCore.swift */,
+				4EA700012F60001D00100002 /* FinalTrajectory.swift */,
+				4EA700012F60001C00100002 /* ClockCorrelationRecorder.swift */,
+				4EA700012F60001B00100002 /* MobileRoadGraphBuilder.swift */,
+				4EA700012F60001A00100002 /* MobilePriorMapCompiler.swift */,
+				4EA700012F60001900100002 /* MobilePreviewRenderer.swift */,
+				4EA700012F60001800100002 /* MobilePackageManifestBuilder.swift */,
+				4EA700012F60001700100002 /* MobileDistanceFieldBuilder.swift */,
+				4EA700012F60001600100002 /* XLSXZipReader.swift */,
+				4EA700012F60001500100002 /* XLSXWorksheetReader.swift */,
+				4EA700012F60001400100002 /* XLSXWorkbookReader.swift */,
+				4EA700012F60001300100002 /* XLSXMapSourceImporter.swift */,
+				4EA700012F60001200100002 /* SourceGeometry.swift */,
+				4EA700012F60001100100002 /* RFC4180CSVReader.swift */,
+				4EA700012F60001000100002 /* MapSourceImportReport.swift */,
+				4EA700012F60000F00100002 /* MapSourceImportError.swift */,
+				4EA700012F60000E00100002 /* MapSourceImportCoordinator.swift */,
+				4EA700012F60000D00100002 /* MapSourceDocumentPicker.swift */,
+				4EA700012F60000C00100002 /* JSONMapSourceImporter.swift */,
+				4EA700012F60000B00100002 /* ElementNormalizer.swift */,
+				4EA700012F60000A00100002 /* CanonicalPriorMapSource.swift */,
+				4EA700012F60000900100002 /* CanonicalJSONEncoder.swift */,
+				4EA700012F60000800100002 /* CSVMapSourceImporter.swift */,
 				4EA700012F60000600100002 /* StrictJSONDocumentParser.swift */,
 				4EA500012F40000100100002 /* PriorMapScanMatcher.swift */,
 				4EA500012F40000100100004 /* PriorMapDepthSampler.swift */,
@@ -928,6 +1021,37 @@
 				4EA700012F60000400100001 /* StrictJSONScalar.swift in Sources */,
 				4EA700012F60000500100001 /* StrictJSONKeyUniquenessValidator.swift in Sources */,
 				4EA700012F60000700100001 /* PriorMapPackageSnapshotCore.swift in Sources */,
+				4EA700012F60002600100001 /* XLSXWorkbookWriter.swift in Sources */,
+				4EA700012F60002500100001 /* ResultShareController.swift in Sources */,
+				4EA700012F60002400100001 /* MobileWorksheets.swift in Sources */,
+				4EA700012F60002300100001 /* MobileResultExporter.swift in Sources */,
+				4EA700012F60002200100001 /* TagObservationResolver.swift in Sources */,
+				4EA700012F60002100100001 /* ShelfAssociationEngine.swift in Sources */,
+				4EA700012F60002000100001 /* SessionSnapshotTransaction.swift in Sources */,
+				4EA700012F60001F00100001 /* SE2Transform.swift in Sources */,
+				4EA700012F60001E00100001 /* SE2FactorGraphCore.swift in Sources */,
+				4EA700012F60001D00100001 /* FinalTrajectory.swift in Sources */,
+				4EA700012F60001C00100001 /* ClockCorrelationRecorder.swift in Sources */,
+				4EA700012F60001B00100001 /* MobileRoadGraphBuilder.swift in Sources */,
+				4EA700012F60001A00100001 /* MobilePriorMapCompiler.swift in Sources */,
+				4EA700012F60001900100001 /* MobilePreviewRenderer.swift in Sources */,
+				4EA700012F60001800100001 /* MobilePackageManifestBuilder.swift in Sources */,
+				4EA700012F60001700100001 /* MobileDistanceFieldBuilder.swift in Sources */,
+				4EA700012F60001600100001 /* XLSXZipReader.swift in Sources */,
+				4EA700012F60001500100001 /* XLSXWorksheetReader.swift in Sources */,
+				4EA700012F60001400100001 /* XLSXWorkbookReader.swift in Sources */,
+				4EA700012F60001300100001 /* XLSXMapSourceImporter.swift in Sources */,
+				4EA700012F60001200100001 /* SourceGeometry.swift in Sources */,
+				4EA700012F60001100100001 /* RFC4180CSVReader.swift in Sources */,
+				4EA700012F60001000100001 /* MapSourceImportReport.swift in Sources */,
+				4EA700012F60000F00100001 /* MapSourceImportError.swift in Sources */,
+				4EA700012F60000E00100001 /* MapSourceImportCoordinator.swift in Sources */,
+				4EA700012F60000D00100001 /* MapSourceDocumentPicker.swift in Sources */,
+				4EA700012F60000C00100001 /* JSONMapSourceImporter.swift in Sources */,
+				4EA700012F60000B00100001 /* ElementNormalizer.swift in Sources */,
+				4EA700012F60000A00100001 /* CanonicalPriorMapSource.swift in Sources */,
+				4EA700012F60000900100001 /* CanonicalJSONEncoder.swift in Sources */,
+				4EA700012F60000800100001 /* CSVMapSourceImporter.swift in Sources */,
 				4EA700012F60000600100001 /* StrictJSONDocumentParser.swift in Sources */,
 				4EA500012F40000100100001 /* PriorMapScanMatcher.swift in Sources */,
 				4EA500012F40000100100003 /* PriorMapDepthSampler.swift in Sources */,

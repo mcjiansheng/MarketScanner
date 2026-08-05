@@ -387,6 +387,35 @@ jobs:
             app/ios/RTABMapApp/SupermarketScanSession.swift \
             app/ios/RTABMapApp/ViewController.swift \
             app/ios/RTABMapApp/RTABMap.swift
+            app/ios/RTABMapApp/MobileMapImport/CSVMapSourceImporter.swift \
+            app/ios/RTABMapApp/MobileMapImport/CanonicalJSONEncoder.swift \
+            app/ios/RTABMapApp/MobileMapImport/CanonicalPriorMapSource.swift \
+            app/ios/RTABMapApp/MobileMapImport/ElementNormalizer.swift \
+            app/ios/RTABMapApp/MobileMapImport/JSONMapSourceImporter.swift \
+            app/ios/RTABMapApp/MobileMapImport/MapSourceImportCoordinator.swift \
+            app/ios/RTABMapApp/MobileMapImport/MapSourceImportError.swift \
+            app/ios/RTABMapApp/MobileMapImport/MapSourceImportReport.swift \
+            app/ios/RTABMapApp/MobileMapImport/RFC4180CSVReader.swift \
+            app/ios/RTABMapApp/MobileMapImport/SourceGeometry.swift \
+            app/ios/RTABMapApp/MobileMapImport/XLSXMapSourceImporter.swift \
+            app/ios/RTABMapApp/MobileMapImport/XLSXWorkbookReader.swift \
+            app/ios/RTABMapApp/MobileMapImport/XLSXWorksheetReader.swift \
+            app/ios/RTABMapApp/MobileMapImport/XLSXZipReader.swift \
+            app/ios/RTABMapApp/MobilePriorMapCompiler/MobileDistanceFieldBuilder.swift \
+            app/ios/RTABMapApp/MobilePriorMapCompiler/MobilePackageManifestBuilder.swift \
+            app/ios/RTABMapApp/MobilePriorMapCompiler/MobilePreviewRenderer.swift \
+            app/ios/RTABMapApp/MobilePriorMapCompiler/MobilePriorMapCompiler.swift \
+            app/ios/RTABMapApp/MobilePriorMapCompiler/MobileRoadGraphBuilder.swift \
+            app/ios/RTABMapApp/MobilePostProcessing/ClockCorrelationRecorder.swift \
+            app/ios/RTABMapApp/MobilePostProcessing/FinalTrajectory.swift \
+            app/ios/RTABMapApp/MobilePostProcessing/SE2FactorGraphCore.swift \
+            app/ios/RTABMapApp/MobilePostProcessing/SE2Transform.swift \
+            app/ios/RTABMapApp/MobilePostProcessing/SessionSnapshotTransaction.swift \
+            app/ios/RTABMapApp/MobilePostProcessing/ShelfAssociationEngine.swift \
+            app/ios/RTABMapApp/MobilePostProcessing/TagObservationResolver.swift \
+            app/ios/RTABMapApp/MobileResults/MobileResultExporter.swift \
+            app/ios/RTABMapApp/MobileResults/MobileWorksheets.swift \
+            app/ios/RTABMapApp/MobileResults/XLSXWorkbookWriter.swift \
       - name: Run platform-independent iOS contract test
         id: swift_contracts
         run: python3 -m unittest tools.PriorMap.tests.test_prior_map.IOSCoreContractTests tools.PriorMap.tests.test_c4_session_input_snapshot -v
