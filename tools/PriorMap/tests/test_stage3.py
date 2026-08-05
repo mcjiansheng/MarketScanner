@@ -1949,11 +1949,13 @@ _PYTHON_RECOVERY_ERROR_PATTERNS = (
     ("Missing final newline", "missing_final_newline"),
     ("Blank JSONL record", "blank_record"),
     ("Oversized record", "record_too_large"),
+    ("file-size safety limit", "file_too_large"),
     ("Invalid UTF-8", "invalid_utf8"),
     # Duplicate-key must be classified before the generic "Invalid JSON"
     # pattern: json.loads reports it inside the invalid-JSON wrapper.
     ("Duplicate JSON key", "duplicate_json_key"),
     ("Invalid JSON", "invalid_json"),
+    ("nesting-depth safety limit", "invalid_json"),
     ("Non-object record", "non_object"),
     ("Format mismatch", "format_mismatch"),
     ("Version mismatch", "version_mismatch"),
@@ -2014,7 +2016,6 @@ class RecoveryLifecycleFixtureContractTests(unittest.TestCase):
                 name,
             )
 
-
     def test_object_pairs_hook_rejects_duplicate_keys(self) -> None:
         """P7R6B: the PC reader must refuse duplicate keys instead of
         silently applying last-key-wins."""
@@ -2035,6 +2036,7 @@ class RecoveryLifecycleFixtureContractTests(unittest.TestCase):
                     expected_map_hash="a" * 64,
                     expected_floor_id="1",
                 )
+            # Nested duplicate keys are rejected the same way.
             nested = path.with_name("nested.jsonl")
             nested.write_text(
                 '{"format":"MarketScannerRecoveryLifecycleEvent","version":2,'
@@ -2118,7 +2120,41 @@ class RecoveryLifecycleFixtureContractTests(unittest.TestCase):
             )
             self.assertEqual(len(values), 1)
 
+    def test_recovery_nesting_depth_limit_is_enforced(self) -> None:
+        """P7R6B: the frozen 32-level nesting contract is enforced by the
+        PC reader before the record is accepted."""
+        from tools.PriorMap.offline_localization import (
+            RECOVERY_MAXIMUM_NESTING_DEPTH,
+        )
 
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "recovery.jsonl"
+            allowed = '{"a":' * 32 + "null" + "}" * 32 + "\n"
+            path.write_text(allowed, encoding="utf-8")
+            # Depth 32 passes the nesting gate and reaches the schema
+            # check, which then rejects the non-contract object.
+            self.assertEqual(
+                python_recovery_fixture_category(path), "format_mismatch"
+            )
+            too_deep = '{"a":' * (RECOVERY_MAXIMUM_NESTING_DEPTH + 1) \
+                + "null" + "}" * (RECOVERY_MAXIMUM_NESTING_DEPTH + 1) + "\n"
+            path.write_text(too_deep, encoding="utf-8")
+            self.assertEqual(
+                python_recovery_fixture_category(path), "invalid_json"
+            )
+
+    def test_recovery_file_size_limit_is_enforced(self) -> None:
+        """P7R6B: the frozen 16 MB file limit is checked before the file is
+        read, matching the device parser."""
+        from tools.PriorMap.offline_localization import (
+            RECOVERY_MAXIMUM_FILE_BYTES,
+        )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "recovery.jsonl"
+            path.write_bytes(b"x" * (RECOVERY_MAXIMUM_FILE_BYTES + 1))
+            category = python_recovery_fixture_category(path)
+            self.assertEqual(category, "file_too_large")
 
 
 if __name__ == "__main__":

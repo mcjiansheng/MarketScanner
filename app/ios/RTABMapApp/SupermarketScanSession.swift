@@ -1916,7 +1916,7 @@ final class SupermarketScanSession {
             url,
             within: directory,
             maximumBytes: Int64(
-                RecoveryLifecyclePersistedEvidenceParser.maximumFileBytes))
+                RecoveryLifecycleEvidenceLimits.maximumFileBytes))
         return snapshot.data
     }
 

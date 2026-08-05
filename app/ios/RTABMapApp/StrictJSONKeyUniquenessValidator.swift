@@ -146,10 +146,9 @@ enum StrictJSONKeyUniquenessValidator {
         // this scanner only guarantees duplicate-key detection.
     }
 
-    // P7R6B B4: unified limits land in RecoveryLifecycleEvidenceLimits;
-    // until then the scanner keeps its own bounded depth so the duplicate-
-    // key path never depends on a not-yet-unified constant.
-    private static let maximumNestingDepth = 32
+    static var maximumNestingDepth: Int {
+        return RecoveryLifecycleEvidenceLimits.maximumJSONNestingDepth
+    }
 
     private static let maximumTokenCount = 1_000_000
 

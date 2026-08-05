@@ -66,6 +66,13 @@ SESSION_INPUT_FILE_NAMES_V2 = (
 # evidence binding.
 SESSION_INPUT_FILE_NAMES = SESSION_INPUT_FILE_NAMES_V1
 RECOVERY_EVIDENCE_UNBOUND_LEGACY = "recovery_lifecycle_evidence_unbound_legacy"
+# P7R6B: the PC reader shares the frozen Recovery evidence limits with the
+# device parser, the finalization bundle validator and the session
+# stable-read snapshot. One file never carries two different size policies.
+RECOVERY_MAXIMUM_FILE_BYTES = 16 * 1024 * 1024
+RECOVERY_MAXIMUM_RECORD_BYTES = 1_000_000
+RECOVERY_MAXIMUM_RECORDS = 100_000
+RECOVERY_MAXIMUM_NESTING_DEPTH = 32
 EDITABLE_TAG_FIELDS = frozenset(
     {
         "shelf_code",
@@ -470,6 +477,8 @@ class JsonlContract:
     record_id_field: str | None = None
     maximum_record_bytes: int = 1_000_000
     maximum_records: int = 500_000
+    maximum_file_bytes: int | None = None
+    maximum_nesting_depth: int | None = None
     strictly_increasing_timestamps: bool = False
 
 
@@ -532,6 +541,10 @@ RECOVERY_EVENT_CONTRACT = JsonlContract(
     True,
     ("finished_at_uptime",),
     record_id_field="episode_id",
+    maximum_record_bytes=RECOVERY_MAXIMUM_RECORD_BYTES,
+    maximum_records=RECOVERY_MAXIMUM_RECORDS,
+    maximum_file_bytes=RECOVERY_MAXIMUM_FILE_BYTES,
+    maximum_nesting_depth=RECOVERY_MAXIMUM_NESTING_DEPTH,
 )
 
 
@@ -1083,6 +1096,10 @@ def _read_jsonl(
                 f"Required sidecar file is missing: {path.name}"
             )
         return values, diagnostics
+    if contract.maximum_file_bytes is not None and path.stat().st_size > contract.maximum_file_bytes:
+        raise OfflineLocalizationError(
+            f"{path.name} exceeds the bounded file-size safety limit."
+        )
     seen_ids: set[str] = set()
     previous_timestamp: float | None = None
     with path.open("rb") as handle:
@@ -1119,7 +1136,7 @@ def _read_jsonl(
                     parse_constant=_reject_nonfinite_json,
                     object_pairs_hook=_reject_duplicate_object_pairs,
                 )
-            except (json.JSONDecodeError, ValueError) as exc:
+            except (json.JSONDecodeError, ValueError, RecursionError) as exc:
                 diagnostics["invalid_json_lines"] += 1
                 raise OfflineLocalizationError(
                     f"Invalid JSON at {path.name}:{line_no}: {exc}"
@@ -1128,6 +1145,15 @@ def _read_jsonl(
                 diagnostics["non_object_lines"] += 1
                 raise OfflineLocalizationError(
                     f"Non-object record at {path.name}:{line_no}"
+                )
+            if (
+                contract.maximum_nesting_depth is not None
+                and _json_nesting_depth(value) > contract.maximum_nesting_depth
+            ):
+                diagnostics["invalid_json_lines"] += 1
+                raise OfflineLocalizationError(
+                    f"{path.name}:{line_no} exceeds the bounded "
+                    f"nesting-depth safety limit."
                 )
             if value.get("format") != contract.record_format:
                 diagnostics["format_mismatches"] += 1
@@ -1241,7 +1267,7 @@ def _read_localized_price_tags(
             parse_constant=_reject_nonfinite_json,
             object_pairs_hook=_reject_duplicate_object_pairs,
         )
-    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError, RecursionError) as exc:
         raise OfflineLocalizationError(
             f"localized_price_tags.json is invalid: {exc}"
         ) from exc

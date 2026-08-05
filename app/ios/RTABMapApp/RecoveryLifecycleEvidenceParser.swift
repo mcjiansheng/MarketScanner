@@ -10,6 +10,20 @@
 import Foundation
 import CoreFoundation
 
+/// P7R6B: one frozen size/record/depth contract for persisted Recovery
+/// lifecycle evidence. The device parser, the finalization bundle
+/// validator, the session stable-read snapshot and the PC reader
+/// (`tools/PriorMap/offline_localization.py`) all reference the same
+/// values, so one file never carries two different size policies. The
+/// nesting bound also feeds the duplicate-key scanner.
+enum RecoveryLifecycleEvidenceLimits {
+    static let maximumFileBytes = 16 * 1024 * 1024
+    static let maximumRecordBytes = 1_000_000
+    static let maximumRecords = 100_000
+    static let maximumTriggerRecordsPerEpisode = 8
+    static let maximumJSONNestingDepth = 32
+}
+
 /// What the caller expects the persisted recovery evidence to contain.
 ///
 /// `expectedRecordCount == nil` marks the coordinator pre-append check:
@@ -174,11 +188,16 @@ enum RecoveryLifecycleEvidenceParseError: Error, Equatable {
 
 enum RecoveryLifecyclePersistedEvidenceParser {
     static let formatName = "MarketScannerRecoveryLifecycleEvent"
-    /// Limits are aligned with the finalization bundle contract so one file
-    /// never carries two different size policies.
-    static let maximumFileBytes = 16 * 1024 * 1024
-    static let maximumRecordBytes = 1_000_000
-    static let maximumRecords = 500_000
+    /// P7R6B: the parser, the finalization validator and the session
+    /// stable-read snapshot share one frozen contract
+    /// (`RecoveryLifecycleEvidenceLimits`); these aliases keep existing
+    /// call sites compiling while binding them to the shared constants.
+    static let maximumFileBytes =
+        RecoveryLifecycleEvidenceLimits.maximumFileBytes
+    static let maximumRecordBytes =
+        RecoveryLifecycleEvidenceLimits.maximumRecordBytes
+    static let maximumRecords =
+        RecoveryLifecycleEvidenceLimits.maximumRecords
 
     private static let baseFields: Set<String> = [
         "format", "version", "tracking_session_id", "prior_map_id",
@@ -579,7 +598,9 @@ enum RecoveryLifecyclePersistedEvidenceParser {
     ) throws -> [PriorMapRecoveryTriggerRecord] {
         guard let rawRecords = object["trigger_records"] as? [[String: Any]],
               !rawRecords.isEmpty,
-              rawRecords.count <= 8 else {
+              rawRecords.count
+                  <= RecoveryLifecycleEvidenceLimits
+                      .maximumTriggerRecordsPerEpisode else {
             throw RecoveryLifecycleEvidenceParseError.triggerRecordsInvalid(
                 line: lineNumber)
         }

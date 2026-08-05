@@ -319,15 +319,15 @@ enum LocalizationEvidenceBundleValidator {
         within root: URL,
         expectation: LocalizationEvidenceBundleExpectation
     ) throws -> JSONLValidationSummary {
-        guard (0...maximumRecords).contains(expectation.recoveryEventCount)
+        guard (0...RecoveryLifecycleEvidenceLimits.maximumRecords)
+            .contains(expectation.recoveryEventCount)
         else {
             throw validationError("expected_count_out_of_range")
         }
-        let fileLimit = Int64(min(
-            maximumRequiredJSONLBytes,
-            max(
-                1024 * 1024,
-                expectation.recoveryEventCount * 64 * 1024 + 1024 * 1024)))
+        // P7R6B: the recovery evidence file shares the frozen 16 MB
+        // contract with the parser and the session stable-read snapshot;
+        // the expected-count-derived 512 MB ceiling is gone.
+        let fileLimit = Int64(RecoveryLifecycleEvidenceLimits.maximumFileBytes)
         // One stable read; the parser only ever consumes this snapshot.
         let snapshot = try SafeSessionPath.readRegularFile(
             url,
