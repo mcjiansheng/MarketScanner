@@ -1,14 +1,22 @@
 import UIKit
 
-/// Scan setup screen (V1R2 Gate D §8.1/§8.2): the scan wizard selects a
+/// Scan setup screen (V1R3 Gate B §5): the scan wizard selects a
 /// phone-compiled map from the on-device library (never a bundled
 /// fixture), shows the REAL floor preview, lets the operator tap the
 /// starting position and rotate the heading arrow, and commits the
 /// configuration through `coordinator.commitScanConfiguration(_:)`.
 ///
-/// No hard-coded 0/0/1/default start pose (§8.1): the floor list comes
-/// from the compiled package manifest and the start pose must be chosen
-/// on the preview before the start button enables.
+/// Yaw convention (§5.1, frozen): yaw = 0 points along map +X, positive
+/// is counter-clockwise. Golden directions: 0° → right, 90° → up,
+/// 180° → left, -90° → down. The heading arrow is drawn pointing along
+/// +X at yaw = 0 (the V1R2 arrow pointed up and silently carried a 90°
+/// bias).
+///
+/// Traversability (§5.3): the tapped point must lie inside the floor
+/// bounds, outside every obstacle polygon (shelves + fixed structures)
+/// and keep a minimum clearance; illegal points show the reason and keep
+/// the start button disabled. Store/floor identity gaps block the start
+/// (§5.4).
 final class MobileScanSetupViewController: UIViewController {
 
     /// Set by the map library when navigating in with a chosen map.
@@ -19,6 +27,32 @@ final class MobileScanSetupViewController: UIViewController {
         let bounds: [String: Double]
         let previewFile: String
     }
+
+    /// Obstacle polygon in map metres for the selected floor.
+    private struct Obstacle {
+        let points: [(Double, Double)]
+        let bounds: (minX: Double, minY: Double, maxX: Double, maxY: Double)
+    }
+
+    private enum TraversabilityFailure {
+        case outsideFloorBounds
+        case insideObstacle
+        case insufficientClearance(Double)
+
+        var reason: String {
+            switch self {
+            case .outsideFloorBounds:
+                return "起点必须在楼层边界内"
+            case .insideObstacle:
+                return "起点不能落在货架/固定结构内"
+            case .insufficientClearance(let distance):
+                return String(format: "起点距离障碍物过近（%.2f m < %.2f m）",
+                              distance, MobileScanSetupViewController.minimumClearanceM)
+            }
+        }
+    }
+
+    static let minimumClearanceM = 0.30
 
     private let coordinator = MobileOnlyWorkflowCoordinator.shared
     private let mapPicker = UIPickerView()
@@ -32,11 +66,13 @@ final class MobileScanSetupViewController: UIViewController {
 
     private var maps: [MobileMapLibrary.MapEntry] = []
     private var floors: [FloorInfo] = []
+    private var obstacles: [Obstacle] = []
     private var storeID: String = ""
     private var currentFloor: FloorInfo?
     private var startXM: Double?
     private var startYM: Double?
     private var startYawRad: Double = 0
+    private var traversabilityFailure: TraversabilityFailure?
 
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -62,30 +98,20 @@ final class MobileScanSetupViewController: UIViewController {
         previewImageView.translatesAutoresizingMaskIntoConstraints = false
         previewContainer.addSubview(previewImageView)
 
-        // Start position marker with heading arrow.
+        // Start position marker (§5.2): explicit frame, managed without
+        // AutoLayout so the rotation transform never changes the tap
+        // coordinate. The arrow points along +X (right) at yaw = 0.
         startMarker.isHidden = true
-        let markerDot = UIView()
+        startMarker.translatesAutoresizingMaskIntoConstraints = false
+        startMarker.frame = CGRect(x: 0, y: 0, width: 44, height: 44)
+        let markerDot = UIView(frame: CGRect(x: 16, y: 16, width: 12, height: 12))
         markerDot.backgroundColor = .systemRed
         markerDot.layer.cornerRadius = 6
-        markerDot.translatesAutoresizingMaskIntoConstraints = false
-        let arrow = UIView()
+        let arrow = UIView(frame: CGRect(x: 21, y: 2, width: 2, height: 14))
         arrow.backgroundColor = .systemRed
-        arrow.translatesAutoresizingMaskIntoConstraints = false
-        arrow.tag = 99
         startMarker.addSubview(arrow)
         startMarker.addSubview(markerDot)
-        startMarker.translatesAutoresizingMaskIntoConstraints = false
         previewContainer.addSubview(startMarker)
-        NSLayoutConstraint.activate([
-            markerDot.widthAnchor.constraint(equalToConstant: 12),
-            markerDot.heightAnchor.constraint(equalToConstant: 12),
-            markerDot.centerXAnchor.constraint(equalTo: startMarker.centerXAnchor),
-            markerDot.centerYAnchor.constraint(equalTo: startMarker.centerYAnchor),
-            arrow.widthAnchor.constraint(equalToConstant: 2),
-            arrow.heightAnchor.constraint(equalToConstant: 22),
-            arrow.centerXAnchor.constraint(equalTo: startMarker.centerXAnchor),
-            arrow.bottomAnchor.constraint(equalTo: markerDot.topAnchor, constant: 4),
-        ])
 
         let tap = UITapGestureRecognizer(target: self, action: #selector(previewTapped(_:)))
         previewContainer.addGestureRecognizer(tap)
@@ -146,13 +172,11 @@ final class MobileScanSetupViewController: UIViewController {
 
     /// Reads the compiled package manifest: floors (with bounds and the
     /// per-floor preview file) and the real store id. Never defaults to
-    /// 0/0/1 (§8.1).
+    /// 0/0/1 (§5.4).
     private func loadSelectedMap() {
         floors = []
         storeID = ""
-        startXM = nil
-        startYM = nil
-        startMarker.isHidden = true
+        resetStartPose()
         guard let map = currentMap() else {
             floorControl.removeAllSegments()
             updateSummary()
@@ -191,13 +215,124 @@ final class MobileScanSetupViewController: UIViewController {
 
     private func selectFloor(_ floor: FloorInfo) {
         currentFloor = floor
-        startXM = nil
-        startYM = nil
-        startMarker.isHidden = true
+        resetStartPose()
+        loadObstacles(for: floor.id)
         guard let map = currentMap() else { return }
         let previewURL = map.packageDirectory.appendingPathComponent(floor.previewFile)
         previewImageView.image = UIImage(contentsOfFile: previewURL.path)
         updateSummary()
+    }
+
+    private func resetStartPose() {
+        startXM = nil
+        startYM = nil
+        traversabilityFailure = nil
+        startMarker.isHidden = true
+    }
+
+    /// Loads obstacle polygons (shelves + fixed structures) for the
+    /// selected floor from the compiled package (§5.3).
+    private func loadObstacles(for floorID: String) {
+        obstacles = []
+        guard let map = currentMap() else { return }
+        for file in ["shelves.json", "fixed_structures.json"] {
+            let url = map.packageDirectory.appendingPathComponent(file)
+            guard let data = try? Data(contentsOf: url),
+                  let object = try? StrictJSONDocumentParser.object(
+                      from: data,
+                      limits: StrictJSONDocumentLimits(maximumBytes: data.count + 1)) as? [String: Any]
+            else { continue }
+            let key = file == "shelves.json" ? "shelves" : "structures"
+            guard let elements = object[key] as? [[String: Any]] else { continue }
+            for element in elements {
+                guard element["floor_id"] as? String == floorID else { continue }
+                guard let geometry = element["geometry"] as? [String: Any],
+                      let coordinates = geometry["coordinates"] as? [[Double]]
+                else { continue }
+                var points: [(Double, Double)] = []
+                for pair in coordinates where pair.count >= 2 {
+                    points.append((pair[0], pair[1]))
+                }
+                // Closed polygon handling: drop the duplicated last point.
+                if points.count >= 2,
+                   abs(points.first!.0 - points.last!.0) < 1e-9,
+                   abs(points.first!.1 - points.last!.1) < 1e-9 {
+                    points.removeLast()
+                }
+                guard points.count >= 3 else { continue }
+                var minX = Double.greatestFiniteMagnitude
+                var minY = Double.greatestFiniteMagnitude
+                var maxX = -Double.greatestFiniteMagnitude
+                var maxY = -Double.greatestFiniteMagnitude
+                for p in points {
+                    minX = min(minX, p.0); minY = min(minY, p.1)
+                    maxX = max(maxX, p.0); maxY = max(maxY, p.1)
+                }
+                obstacles.append(Obstacle(points: points, bounds: (minX, minY, maxX, maxY)))
+            }
+        }
+    }
+
+    // MARK: - Traversability (§5.3)
+
+    private func traversability(at xM: Double, _ yM: Double) -> TraversabilityFailure? {
+        guard let floor = currentFloor,
+              let minX = floor.bounds["min_x_m"], let minY = floor.bounds["min_y_m"],
+              let maxX = floor.bounds["max_x_m"], let maxY = floor.bounds["max_y_m"]
+        else { return .outsideFloorBounds }
+        guard xM >= minX, xM <= maxX, yM >= minY, yM <= maxY else {
+            return .outsideFloorBounds
+        }
+        var nearestDistance = Double.greatestFiniteMagnitude
+        for obstacle in obstacles {
+            // Envelope pre-check.
+            guard xM >= obstacle.bounds.minX - Self.minimumClearanceM,
+                  xM <= obstacle.bounds.maxX + Self.minimumClearanceM,
+                  yM >= obstacle.bounds.minY - Self.minimumClearanceM,
+                  yM <= obstacle.bounds.maxY + Self.minimumClearanceM
+            else { continue }
+            if pointInPolygon(xM, yM, obstacle.points) {
+                return .insideObstacle
+            }
+            nearestDistance = min(
+                nearestDistance, distanceToPolygon(xM, yM, obstacle.points))
+        }
+        if nearestDistance < Self.minimumClearanceM {
+            return .insufficientClearance(nearestDistance)
+        }
+        return nil
+    }
+
+    private func pointInPolygon(_ x: Double, _ y: Double, _ polygon: [(Double, Double)]) -> Bool {
+        var inside = false
+        var j = polygon.count - 1
+        for i in 0..<polygon.count {
+            let xi = polygon[i].0, yi = polygon[i].1
+            let xj = polygon[j].0, yj = polygon[j].1
+            if (yi > y) != (yj > y),
+               x < (xj - xi) * (y - yi) / (yj - yi) + xi {
+                inside = !inside
+            }
+            j = i
+        }
+        return inside
+    }
+
+    private func distanceToPolygon(_ x: Double, _ y: Double, _ polygon: [(Double, Double)]) -> Double {
+        var best = Double.greatestFiniteMagnitude
+        for i in 0..<polygon.count {
+            let a = polygon[i]
+            let b = polygon[(i + 1) % polygon.count]
+            let abx = b.0 - a.0, aby = b.1 - a.1
+            let length2 = abx * abx + aby * aby
+            var t = 0.0
+            if length2 > 1e-12 {
+                t = max(0.0, min(1.0, ((x - a.0) * abx + (y - a.1) * aby) / length2))
+            }
+            let px = a.0 + t * abx, py = a.1 + t * aby
+            best = min(best, hypot(x - px, y - py))
+        }
+        return best
     }
 
     // MARK: - Start pose geometry
@@ -244,8 +379,11 @@ final class MobileScanSetupViewController: UIViewController {
         guard let mapped = mapPoint(from: point) else { return }
         startXM = mapped.0
         startYM = mapped.1
+        traversabilityFailure = traversability(at: mapped.0, mapped.1)
         startMarker.isHidden = false
-        startMarker.center = point
+        var frame = startMarker.frame
+        frame.origin = CGPoint(x: point.x - frame.width / 2, y: point.y - frame.height / 2)
+        startMarker.frame = frame
         rotateMarker()
         updateSummary()
     }
@@ -257,8 +395,10 @@ final class MobileScanSetupViewController: UIViewController {
     }
 
     private func rotateMarker() {
-        // Map yaw is counter-clockwise from +y (preview renderer
-        // contract); UIKit rotation is clockwise, hence the negation.
+        // Frozen yaw contract (§5.1): yaw = 0 along map +X (right in the
+        // preview), positive counter-clockwise. The arrow artwork points
+        // along +X, so only the map->image chirality flip (negation) is
+        // applied — no residual 90° bias.
         startMarker.transform = CGAffineTransform(rotationAngle: CGFloat(-startYawRad))
     }
 
@@ -274,15 +414,30 @@ final class MobileScanSetupViewController: UIViewController {
             startButton.isEnabled = false
             return
         }
-        if let x = startXM, let y = startYM, let floor = currentFloor {
-            summaryLabel.text = String(
-                format: "「%@」 楼层 %@ · 起点 (%.2f, %.2f) m · 朝向 %.2f rad",
-                map.name, floor.id, x, y, startYawRad)
-            startButton.isEnabled = true
-        } else {
+        guard !storeID.isEmpty else {
+            summaryLabel.text = "地图包缺少 store_id（manifest 与预览不一致），请重新编译地图。"
+            startButton.isEnabled = false
+            return
+        }
+        guard let floor = currentFloor else {
+            summaryLabel.text = "地图包没有可用楼层（manifest 与预览不一致）。"
+            startButton.isEnabled = false
+            return
+        }
+        guard let x = startXM, let y = startYM else {
             summaryLabel.text = "已选「\(map.name)」，请在预览图上点选扫描起点。"
             startButton.isEnabled = false
+            return
         }
+        if let failure = traversabilityFailure {
+            summaryLabel.text = "起点不可用：\(failure.reason)"
+            startButton.isEnabled = false
+            return
+        }
+        summaryLabel.text = String(
+            format: "「%@」 楼层 %@ · 起点 (%.2f, %.2f) m · 朝向 %.2f rad",
+            map.name, floor.id, x, y, startYawRad)
+        startButton.isEnabled = true
     }
 
     // MARK: - Commit (§8.2)
@@ -293,6 +448,14 @@ final class MobileScanSetupViewController: UIViewController {
             presentNotice("请先选择地图、楼层并点选起点。")
             return
         }
+        guard traversabilityFailure == nil else {
+            presentNotice("起点不可用：\(traversabilityFailure!.reason)")
+            return
+        }
+        guard !storeID.isEmpty else {
+            presentNotice("地图包缺少 store_id，无法开始扫描。")
+            return
+        }
         let configuration = MobileScanConfiguration(
             priorMap: map,
             floorID: floor.id,
@@ -300,11 +463,15 @@ final class MobileScanSetupViewController: UIViewController {
             startYM: y,
             startYawRad: startYawRad,
             storeID: storeID)
-        // The page only commits; the coordinator validates the identity
-        // and hands the configuration to the scanner host (§8.2).
+        // The page only commits; the coordinator validates the identity,
+        // runs the transactional host start and reports failures (§4.3).
         coordinator.beginScanSetup(map: map)
         coordinator.commitScanConfiguration(configuration)
-        dismiss(animated: true)
+        if coordinator.state == .scanning {
+            dismiss(animated: true)
+        } else {
+            presentNotice(coordinator.lastError?.errorDescription ?? "扫描启动失败")
+        }
     }
 
     private func presentNotice(_ message: String) {

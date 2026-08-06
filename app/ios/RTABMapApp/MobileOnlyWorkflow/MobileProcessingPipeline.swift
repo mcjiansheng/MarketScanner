@@ -30,6 +30,9 @@ enum MobileProcessingPipeline {
         var appVersion: String
         var deviceModel: String
         var osVersion: String
+        /// Exact source SHA of the shared native factor-graph core used
+        /// for this run (§14.4 binding). Empty on legacy callers.
+        var nativeCoreSHA256: String = ""
     }
 
     struct Outcome {
@@ -80,7 +83,13 @@ enum MobileProcessingPipeline {
         let snapshot = try SessionSnapshotTransaction.snapshot(
             finalizedSession: request.finalizedSession,
             sourceDatabase: request.sourceDatabase,
-            taskRoot: request.taskRoot)
+            taskRoot: request.taskRoot,
+            eligibility: SessionSnapshotTransaction.Eligibility(
+                priorMapID: request.priorMap.priorMapID,
+                priorMapSHA256: request.priorMap.packageSHA256,
+                storeID: request.storeID,
+                floorID: nil,
+                appGitSHA: request.appGitSHA))
         guard !isCancelled() else { throw MobileOnlyWorkflowError.cancelled }
         let snapshotDatabase = snapshot.snapshotDirectory
             .appendingPathComponent(request.sourceDatabase.lastPathComponent)
@@ -236,10 +245,14 @@ enum MobileProcessingPipeline {
             graphQualityPassed: graphQualityPassed)
         guard !isCancelled() else { throw MobileOnlyWorkflowError.cancelled }
 
-        // --- Result package ---------------------------------------------
+        // --- Result package (staged, then atomically committed, §20) ---
         progress(0.80, "生成结果包")
         let resultID = "result-\(UUID().uuidString.lowercased())"
-        let resultDirectory = try MobileResultLibrary.resultDirectory(resultID: resultID)
+        // All artifacts are written into the staging directory first;
+        // the immutable library entry appears only after the atomic
+        // commit (§20.1/§20.4).
+        let resultDirectory = try MobileResultLibrary.stagingDirectory(
+            taskID: request.taskRoot.lastPathComponent, resultID: resultID)
         try FileManager.default.createDirectory(
             at: resultDirectory, withIntermediateDirectories: true)
 
@@ -341,11 +354,12 @@ enum MobileProcessingPipeline {
             throw PipelineError.cannotBuildWorkbook("\(error)")
         }
 
-        // --- External manifest commit (workbook SHA is external only) ---
+        // --- Atomic commit (validate + per-file SHA + rename, §20.4) ---
         progress(0.98, "提交结果清单")
         let entry = try MobileResultLibrary.commit(
             resultID: resultID,
             taskID: request.taskRoot.lastPathComponent,
+            stagingDirectory: resultDirectory,
             packageFiles: [
                 "final_trajectory.jsonl",
                 "final_tags.json",
@@ -361,6 +375,9 @@ enum MobileProcessingPipeline {
                 "prior_map_sha256": request.priorMap.packageSHA256,
                 "tracking_session_id": request.trackingSessionID,
                 "source_database": request.sourceDatabase.lastPathComponent,
+                "input_bundle_sha256": snapshot.bundleSHA256,
+                "native_core_sha256": request.nativeCoreSHA256,
+                "processing_path": processingPath,
             ])
         progress(1.0, "完成")
         return Outcome(

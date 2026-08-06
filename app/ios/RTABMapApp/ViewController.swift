@@ -33,6 +33,11 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
     private var context: EAGLContext?
     private var rtabmap: RTABMap?
     private var supermarketSession: SupermarketScanSession?
+    // V1R3 §7.1: clock correlation evidence recorded during the scan and
+    // flushed to clock_correlations.jsonl on finalization.
+    private var clockRecorder: ClockCorrelationRecorder?
+    private var clockTimer: Timer?
+    private var clockSidecarURL: URL?
     private var activeScanConfiguration = PriorMapScanConfiguration.freeMapping
     private var priorMapLocalizer: PriorMapStageOneLocalizer?
     private var activePriorMapPackage: PriorMapPackage?
@@ -449,21 +454,10 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         // configuration with the committed initial map pose, then the
         // ARSession + RTAB-Map recording + session metadata via newScan.
         coordinator.onStartScan = { [weak self] configuration in
-            guard let self = self else { return }
-            do {
-                try self.startMobileOnlyScan(configuration)
-                self.persistScanConfiguration(configuration)
+            guard let self = self else {
+                throw MobileOnlyWorkflowError.invalidState("scan host released")
             }
-            catch {
-                // Report the failure so the workflow never stays stuck in
-                // `.scanning` (V1R2 review fix).
-                MobileOnlyWorkflowCoordinator.shared.scanStartFailed(with: error)
-                self.showToast(
-                    message: String(
-                        format: self.localized("Could not start the store scan: %@"),
-                        error.localizedDescription),
-                    seconds: 6)
-            }
+            return try self.startMobileOnlyScan(configuration)
         }
     }
 
@@ -484,6 +478,63 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
             format: "扫描配置已提交：%@（%@）", configuration.priorMap.name,
             configuration.priorMap.priorMapID)
         showToast(message)
+    }
+
+    // MARK: - Clock correlation evidence (V1R3 §7.1)
+
+    /// Begins recording monotonic↔UTC correlations for the active scan.
+    /// The sidecar is written into the segment directory and flushed on
+    /// finalization; a periodic timer samples every 30 s while scanning.
+    private func startClockCorrelationRecording(
+        segmentDirectory: URL,
+        trackingSessionID: String
+    ) {
+        stopClockCorrelationRecording(flush: false)
+        let recorder = ClockCorrelationRecorder(trackingSessionID: trackingSessionID)
+        let url = segmentDirectory.appendingPathComponent("clock_correlations.jsonl")
+        recorder.record(
+            reason: .sessionStart,
+            monotonicSeconds: ProcessInfo.processInfo.systemUptime,
+            utcUnixSeconds: Date().timeIntervalSince1970,
+            timezoneID: TimeZone.current.identifier,
+            utcOffsetSeconds: TimeZone.current.secondsFromGMT())
+        clockRecorder = recorder
+        clockSidecarURL = url
+        clockTimer = Timer.scheduledTimer(
+            withTimeInterval: ClockCorrelationRecorder.periodicIntervalSeconds,
+            repeats: true) { [weak self] _ in
+            guard let self = self, let recorder = self.clockRecorder else { return }
+            recorder.maybeRecordPeriodic(
+                monotonicSeconds: ProcessInfo.processInfo.systemUptime,
+                utcUnixSeconds: Date().timeIntervalSince1970,
+                timezoneID: TimeZone.current.identifier,
+                utcOffsetSeconds: TimeZone.current.secondsFromGMT())
+        }
+    }
+
+    /// Stops the periodic timer and, when flushing, appends the
+    /// session_end record and writes the sidecar durably.
+    private func stopClockCorrelationRecording(flush: Bool) {
+        clockTimer?.invalidate()
+        clockTimer = nil
+        guard let recorder = clockRecorder else {
+            clockRecorder = nil
+            clockSidecarURL = nil
+            return
+        }
+        if flush {
+            recorder.record(
+                reason: .sessionEnd,
+                monotonicSeconds: ProcessInfo.processInfo.systemUptime,
+                utcUnixSeconds: Date().timeIntervalSince1970,
+                timezoneID: TimeZone.current.identifier,
+                utcOffsetSeconds: TimeZone.current.secondsFromGMT())
+            if let url = clockSidecarURL {
+                try? recorder.write(to: url)
+            }
+        }
+        clockRecorder = nil
+        clockSidecarURL = nil
     }
 
     private func finishStartup() {
@@ -3211,23 +3262,27 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         }
     }
     
+    /// Returns true only when the scan actually started (V1R3 §4.2):
+    /// every failure path returns false instead of a silent return so
+    /// callers can never mistake a refused start for a success.
+    @discardableResult
     func newScan(
         dataRecordingMode: Bool = false,
         configuration: PriorMapScanConfiguration = .freeMapping
-    )
+    ) -> Bool
     {
         guard mState != .STATE_MAPPING else {
             showToast(
                 message: localized("A scan is in progress. Use the Stop button before starting another scan."),
                 seconds: 4)
-            return
+            return false
         }
         if dataRecordingMode {
             _ = preparePriorMapLocalization(configuration: .freeMapping)
         }
         else {
             guard preparePriorMapLocalization(configuration: configuration) else {
-                return
+                return false
             }
         }
 
@@ -3366,7 +3421,7 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                 if didStartSecurityScope {
                     supermarketSession?.stopAccessingBaseDirectorySecurityScope()
                 }
-                return
+                return false
             }
             if didStartSecurityScope {
                 supermarketSession?.stopAccessingBaseDirectorySecurityScope()
@@ -3384,7 +3439,7 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                 }
                 catch {
                     showToast(message: String(format: localized("Could not create streaming database: %@"), error.localizedDescription), seconds: 4)
-                    return
+                    return false
                 }
             }
             let inMemory = dataRecordingMode ? UserDefaults.standard.bool(forKey: "DatabaseInMemory") : false
@@ -3439,9 +3494,14 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                 }
                 
                 self.setGLCamera(type: 0);
-                self.startCamera();
+                return self.startCamera();
             }
+            return true
         }
+        // The unsaved-session recovery alert path starts asynchronously
+        // after user confirmation; it cannot produce a synchronous
+        // start receipt, so report it as not started (V1R3 §4.2).
+        return false
     }
 
     private func supermarketIntDefault(_ key: String, fallback: Int) -> Int
@@ -3963,6 +4023,9 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
             completion?(.resumeRecording)
             return
         }
+        // V1R3 §7.1: flush the clock correlation sidecar before the scan
+        // is finalized so the evidence is bound into the session.
+        stopClockCorrelationRecording(flush: true)
 
         let segmentDirectory: URL
         let databaseURL: URL
@@ -5410,11 +5473,18 @@ extension SKStoreReviewController {
 /// drives the ARSession, the RTAB-Map recording and the session metadata.
 extension ViewController: MobileOnlyScanStarting {
 
-    func startMobileOnlyScan(_ configuration: MobileScanConfiguration) throws {
+    func startMobileOnlyScan(
+        _ configuration: MobileScanConfiguration
+    ) throws -> MobileScanStartReceipt {
         // Never start a second scan on top of an active one (newScan would
-        // silently refuse and the workflow would report a phantom success).
+        // refuse and the workflow would report a phantom success).
         guard mState != .STATE_MAPPING else {
             throw MobileOnlyWorkflowError.invalidState("a scan is already in progress")
+        }
+        // The embedded build identity must be usable (§4.4).
+        let identity = MobileBuildIdentity.loadFromBundle()
+        guard identity.isUsable else {
+            throw MobileOnlyWorkflowError.invalidState("app build identity unknown")
         }
         // 1. Production package load from the durable on-device library
         //    (containment + registration verified by the library).
@@ -5448,8 +5518,57 @@ extension ViewController: MobileOnlyScanStarting {
         }
 
         // 4. Real scan start: ARSession + RTAB-Map recording + session
-        //    metadata (newScan -> preparePriorMapLocalization ->
-        //    supermarketSession.configureScan).
-        newScan(dataRecordingMode: false, configuration: scanConfiguration)
+        //    metadata. newScan reports false on every refused path
+        //    (V1R3 §4.2) — a refused start always throws here.
+        let started = newScan(dataRecordingMode: false, configuration: scanConfiguration)
+        guard started else {
+            throw MobileOnlyWorkflowError.invalidState(
+                "ARSession/RTAB-Map scan start was refused")
+        }
+
+        // 5. Receipt postconditions: the session, segment directory,
+        //    streaming database and sidecar writers must actually exist.
+        guard let session = supermarketSession else {
+            throw MobileOnlyWorkflowError.invalidState("scan session unavailable after start")
+        }
+        let segmentDirectory = try session.currentSegmentDirectory()
+        guard FileManager.default.fileExists(atPath: segmentDirectory.path) else {
+            throw MobileOnlyWorkflowError.invalidState("segment directory missing after start")
+        }
+        let databaseURL = try session.streamingDatabaseURL()
+        guard FileManager.default.fileExists(atPath: databaseURL.path) else {
+            throw MobileOnlyWorkflowError.invalidState("streaming database missing after start")
+        }
+        // Sidecar writer readiness probe: the segment directory must be
+        // writable for the required evidence sidecars.
+        let probe = segmentDirectory.appendingPathComponent(
+            ".ms_sidecar_probe_\(UUID().uuidString)")
+        let writable = FileManager.default.createFile(
+            atPath: probe.path, contents: Data(), attributes: nil)
+        try? FileManager.default.removeItem(at: probe)
+        guard writable else {
+            throw MobileOnlyWorkflowError.invalidState("sidecar writers not ready (segment not writable)")
+        }
+
+        self.persistScanConfiguration(configuration)
+        // V1R3 §7.1: begin recording clock correlation evidence for the
+        // scan; it is flushed to the segment sidecar on finalization.
+        startClockCorrelationRecording(
+            segmentDirectory: segmentDirectory,
+            trackingSessionID: session.trackingSessionId)
+        return MobileScanStartReceipt(
+            trackingSessionID: session.trackingSessionId,
+            segmentDirectory: segmentDirectory,
+            databaseURL: databaseURL,
+            priorMapID: entry.priorMapID,
+            priorMapSHA256: entry.packageSHA256,
+            floorID: configuration.floorID,
+            storeID: configuration.storeID,
+            arSessionStarted: mState == .STATE_CAMERA || mState == .STATE_MAPPING,
+            rtabMapRecordingStarted: rtabmap != nil,
+            requiredSidecarWritersReady: true,
+            startedAtMonotonic: ProcessInfo.processInfo.systemUptime,
+            startedAtUTC: Date().timeIntervalSince1970,
+            appGitSHA: identity.appGitSHA)
     }
 }

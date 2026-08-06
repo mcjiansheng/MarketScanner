@@ -131,8 +131,12 @@ final class MobileOnlyWorkflowCoordinator {
     private(set) var activeMap: MobileMapLibrary.MapEntry?
 
     /// Single scanner delegate slot (registered once by ViewController).
-    /// This is not a page observer: exactly one scanner exists.
-    var onStartScan: ((MobileScanConfiguration) -> Void)?
+    /// The host must start the real scan and return a receipt; throwing
+    /// or an incomplete receipt keeps the workflow out of `.scanning`.
+    var onStartScan: ((MobileScanConfiguration) throws -> MobileScanStartReceipt)?
+
+    /// Last validated scan start receipt (§4.1), durably persisted.
+    private(set) var lastScanReceipt: MobileScanStartReceipt?
 
     // MARK: - App identity (populated by the host app)
 
@@ -442,12 +446,83 @@ final class MobileOnlyWorkflowCoordinator {
     }
 
     func commitScanConfiguration(_ configuration: MobileScanConfiguration) {
+        // Transactional start (§4.3): validate -> require host ->
+        // host.start -> validate receipt -> persist receipt -> scanning.
+        // Any failure goes configuringScan -> failed; the workflow never
+        // enters `.scanning` before the receipt is validated.
+        guard state == .configuringScan else {
+            fail(with: .invalidState(
+                "scan commit requires configuringScan, got \(state.rawValue)"))
+            return
+        }
         guard configuration.priorMap.packageSHA256 == activeMap?.packageSHA256 else {
             fail(with: .invalidState("map identity mismatch"))
             return
         }
+        guard !configuration.storeID.isEmpty,
+              !configuration.floorID.isEmpty else {
+            fail(with: .invalidState("store/floor identity missing"))
+            return
+        }
+        guard appGitSHA != "unknown", !appGitSHA.isEmpty else {
+            fail(with: .invalidState("app build identity unknown"))
+            return
+        }
+        guard let host = onStartScan else {
+            fail(with: .invalidState("scan host not registered"))
+            return
+        }
+        let receipt: MobileScanStartReceipt
+        do {
+            receipt = try host(configuration)
+        } catch {
+            fail(with: .invalidState("scan start failed: \(error.localizedDescription)"))
+            return
+        }
+        guard receipt.isComplete,
+              receipt.priorMapSHA256 == configuration.priorMap.packageSHA256,
+              receipt.floorID == configuration.floorID,
+              receipt.storeID == configuration.storeID else {
+            fail(with: .invalidState("scan start receipt incomplete or inconsistent"))
+            return
+        }
+        do {
+            try persistScanReceipt(receipt)
+        } catch {
+            fail(with: .invalidState("scan receipt persistence failed: \(error.localizedDescription)"))
+            return
+        }
+        lastScanReceipt = receipt
         transition(to: .scanning)
-        onStartScan?(configuration)
+    }
+
+    /// Durably stores the validated receipt (§4.1) so a crash after host
+    /// start but before workflow commit is recoverable/auditable.
+    private func persistScanReceipt(_ receipt: MobileScanStartReceipt) throws {
+        let directory = stateFileURL.deletingLastPathComponent()
+            .appendingPathComponent("scan_receipts", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: directory, withIntermediateDirectories: true)
+        let data = try CanonicalJSONEncoder.encode([
+            "format": "MarketScannerScanStartReceipt",
+            "version": 1,
+            "tracking_session_id": receipt.trackingSessionID,
+            "segment_directory": receipt.segmentDirectory.path,
+            "database_url": receipt.databaseURL.path,
+            "prior_map_id": receipt.priorMapID,
+            "prior_map_sha256": receipt.priorMapSHA256,
+            "floor_id": receipt.floorID,
+            "store_id": receipt.storeID,
+            "ar_session_started": receipt.arSessionStarted,
+            "rtabmap_recording_started": receipt.rtabMapRecordingStarted,
+            "required_sidecar_writers_ready": receipt.requiredSidecarWritersReady,
+            "started_at_monotonic": receipt.startedAtMonotonic,
+            "started_at_utc": receipt.startedAtUTC,
+            "app_git_sha": receipt.appGitSHA,
+        ])
+        let file = directory.appendingPathComponent(
+            "\(receipt.trackingSessionID).json")
+        try data.write(to: file, options: [.atomic])
     }
 
     func scanFinalized() {
@@ -521,7 +596,8 @@ final class MobileOnlyWorkflowCoordinator {
             appGitSHA: appGitSHA,
             appVersion: appVersion,
             deviceModel: deviceModel,
-            osVersion: osVersion)
+            osVersion: osVersion,
+            nativeCoreSHA256: nativeCoreSHA256)
 
         let operation = BlockOperation { [weak self] in
             self?.executeProcessing(request: request)
@@ -829,12 +905,50 @@ struct MobileScanConfiguration {
     var storeID: String
 }
 
-/// Host scan-starting service (V1R2 Gate D §8.3). The scanner host
+/// Receipt proving the real scan actually started (V1R3 §4.1). Produced
+/// by the host; validated and durably persisted by the coordinator
+/// BEFORE the workflow may enter `.scanning`.
+struct MobileScanStartReceipt: Codable, Equatable {
+    let trackingSessionID: String
+    let segmentDirectory: URL
+    let databaseURL: URL
+    let priorMapID: String
+    let priorMapSHA256: String
+    let floorID: String
+    let storeID: String
+    let arSessionStarted: Bool
+    let rtabMapRecordingStarted: Bool
+    let requiredSidecarWritersReady: Bool
+    let startedAtMonotonic: Double
+    let startedAtUTC: Double
+    let appGitSHA: String
+
+    /// Every subsystem must actually be up; a partial start is a failure.
+    var isComplete: Bool {
+        return !trackingSessionID.isEmpty
+            && !segmentDirectory.path.isEmpty
+            && !databaseURL.path.isEmpty
+            && !priorMapID.isEmpty
+            && !priorMapSHA256.isEmpty
+            && !floorID.isEmpty
+            && !storeID.isEmpty
+            && arSessionStarted
+            && rtabMapRecordingStarted
+            && requiredSidecarWritersReady
+            && !appGitSHA.isEmpty
+            && appGitSHA != "unknown"
+    }
+}
+
+/// Host scan-starting service (V1R3 §4). The scanner host
 /// (`ViewController`) implements this and performs the REAL production
 /// steps: load the compiled package, verify its SHA, build the PriorMap
 /// scan configuration with the committed initial map pose, then start
-/// the ARSession + RTAB-Map recording + session metadata. Persisting the
-/// configuration alone is not a valid implementation.
-protocol MobileOnlyScanStarting {
-    func startMobileOnlyScan(_ configuration: MobileScanConfiguration) throws
+/// the ARSession + RTAB-Map recording + session metadata, returning a
+/// receipt. Any failed substep must throw; persisting the configuration
+/// alone is not a valid implementation.
+protocol MobileOnlyScanStarting: AnyObject {
+    func startMobileOnlyScan(
+        _ configuration: MobileScanConfiguration
+    ) throws -> MobileScanStartReceipt
 }

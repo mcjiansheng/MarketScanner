@@ -176,17 +176,17 @@ enum MobileNativeFactorGraph {
                     throw MobileNativeFactorGraphError.invalidOutcome(
                         "trajectory node id out of int range: \(row.id)")
                 }
-                guard row.stamp.isFinite, row.xM.isFinite,
-                      row.yM.isFinite, row.yawRad.isFinite else {
+                guard row.stamp.isFinite, row.x.isFinite,
+                      row.y.isFinite, row.yaw.isFinite else {
                     throw MobileNativeFactorGraphError.invalidOutcome(
                         "non-finite trajectory row at id \(row.id)")
                 }
                 trajectory.append(MobileNativeTrajectoryRow(
                     id: row.id,
                     stamp: row.stamp,
-                    xM: row.xM,
-                    yM: row.yM,
-                    yawRad: row.yawRad,
+                    xM: row.x,
+                    yM: row.y,
+                    yawRad: row.yaw,
                     mapID: row.map_id,
                     componentID: row.component_id,
                     publishEligible: row.publish_eligible != 0,

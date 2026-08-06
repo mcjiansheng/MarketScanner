@@ -1,6 +1,7 @@
 import Foundation
 import CryptoKit
 import Darwin
+import SQLite3
 
 final class InjectedSidecarWriter: ScanSidecarFileWriting {
     var storage: [URL: Data] = [:]
@@ -6255,7 +6256,9 @@ catch {
 do {
     let session = try p7r6FreshDirectory("mobile-session")
     let fileManager = FileManager.default
-    let metadata = Data("{\"finalized\":true}".utf8)
+    let metadata = Data((
+        "{\"finalized\":true,\"scanMode\":\"continuous_streaming\","
+        + "\"trackingSessionId\":\"P7-SESSION\"}").utf8)
     try metadata.write(to: session.appendingPathComponent("metadata.json"))
     try Data("trace\n".utf8).write(to: session.appendingPathComponent("localization_trace.jsonl"))
     try Data("constraints\n".utf8).write(to: session.appendingPathComponent("localization_constraints.jsonl"))
@@ -6265,7 +6268,25 @@ do {
     try Data("recovery\n".utf8).write(to: session.appendingPathComponent("localization_recovery_events.jsonl"))
     try Data("[]".utf8).write(to: session.appendingPathComponent("localized_price_tags.json"))
     let database = session.appendingPathComponent("source.db")
-    try Data("sqlite-bytes".utf8).write(to: database)
+    // V1R3: the snapshot validates the DB (quick_check + Node/Link
+    // inventory), so the fixture must be a real SQLite database.
+    do {
+        var db: OpaquePointer?
+        guard sqlite3_open_v2(
+            database.path, &db,
+            SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nil) == SQLITE_OK,
+            let databaseHandle = db else {
+            fatalError("P7 cannot create fixture sqlite DB")
+        }
+        defer { sqlite3_close(databaseHandle) }
+        let schema = """
+        CREATE TABLE Node (id INTEGER PRIMARY KEY, map_id INTEGER, weight INTEGER, stamp REAL, pose BLOB);
+        CREATE TABLE Link (from_id INTEGER, to_id INTEGER, type INTEGER, transform BLOB, information_matrix BLOB);
+        """
+        guard sqlite3_exec(databaseHandle, schema, nil, nil, nil) == SQLITE_OK else {
+            fatalError("P7 cannot create fixture sqlite schema")
+        }
+    }
 
     let taskRoot = try p7r6FreshDirectory("mobile-task")
     let snapshot = try SessionSnapshotTransaction.snapshot(
@@ -6725,6 +6746,8 @@ do {
         "floorId": "1",
         "trackingSessionId": "E2E-SESSION",
         "storeId": "s1",
+        "priorMapId": maps[0].priorMapID,
+        "priorMapSha256": maps[0].packageSHA256,
     ]
     let metadataData = try CanonicalJSONEncoder.encode(metadata)
     try metadataData.write(to: session.appendingPathComponent("metadata.json"))
@@ -6778,8 +6801,55 @@ do {
         to: session.appendingPathComponent("localization_constraints.jsonl"))
     try Data("[]".utf8).write(
         to: session.appendingPathComponent("localized_price_tags.json"))
-    try Data("e2e-fake-db".utf8).write(
-        to: session.appendingPathComponent("rtabmap_segment_0001.db"))
+    // Minimal REAL SQLite source DB: the V1R3 snapshot validates the DB
+    // (quick_check + Node/Link inventory), so a fake byte blob is no
+    // longer accepted.
+    do {
+        let dbURL = session.appendingPathComponent("rtabmap_segment_0001.db")
+        var db: OpaquePointer?
+        guard sqlite3_open_v2(
+            dbURL.path, &db,
+            SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nil) == SQLITE_OK,
+            let database = db else {
+            fatalError("E2E cannot create fixture sqlite DB")
+        }
+        defer { sqlite3_close(database) }
+        let schema = """
+        CREATE TABLE Node (id INTEGER PRIMARY KEY, map_id INTEGER, weight INTEGER, stamp REAL, pose BLOB);
+        CREATE TABLE Link (from_id INTEGER, to_id INTEGER, type INTEGER, transform BLOB, information_matrix BLOB);
+        """
+        guard sqlite3_exec(database, schema, nil, nil, nil) == SQLITE_OK else {
+            fatalError("E2E cannot create fixture sqlite schema")
+        }
+        // Identity transform pose (12 floats) + 6x6 information (36
+        // doubles) matching the exact-BLOB contract (§10.1).
+        func poseBlob() -> Data {
+            var values: [Float] = [1, 0, 0, 0,  0, 1, 0, 0,  0, 0, 1, 0]
+            return Data(bytes: &values, count: 12 * MemoryLayout<Float>.size)
+        }
+        func infoBlob() -> Data {
+            var values = [Double](repeating: 0, count: 36)
+            values[0] = 10; values[7] = 10; values[35] = 10
+            return Data(bytes: &values, count: 36 * MemoryLayout<Double>.size)
+        }
+        for index in 1...6 {
+            var insert: OpaquePointer?
+            sqlite3_prepare_v2(
+                database, "INSERT INTO Node VALUES (?,?,?,?,?)", -1, &insert, nil)
+            if let stmt = insert {
+                sqlite3_bind_int64(stmt, 1, Int64(index))
+                sqlite3_bind_int(stmt, 2, 0)
+                sqlite3_bind_int(stmt, 3, 1)
+                sqlite3_bind_double(stmt, 4, now + Double(index) * 0.5)
+                let pose = poseBlob()
+                let sqliteTransient = unsafeBitCast(
+                    -1, to: sqlite3_destructor_type.self)
+                sqlite3_bind_blob(stmt, 5, (pose as NSData).bytes, Int32(pose.count), sqliteTransient)
+                sqlite3_step(stmt)
+                sqlite3_finalize(stmt)
+            }
+        }
+    }
 
     // 4) Production pipeline: snapshot -> Fast Path -> trajectory -> tags
     //    -> result package -> streaming XLSX -> external manifest.
