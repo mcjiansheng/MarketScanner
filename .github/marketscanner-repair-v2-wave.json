@@ -4,6 +4,6 @@
   "base_branch": "mobile-only-v1r2-production-pipeline-and-device-readiness-closeout",
   "base_sha": "9de2908b4ea8f3169989ce37ddf25f671a511e03",
   "v1r2_head_sha": "9de2908b4ea8f3169989ce37ddf25f671a511e03",
-  "implementation_sha": "<FINAL_CODE_TEST_BUILD_SHA>",
+  "implementation_sha": "6de0a4fbc65fd824e24f560fd379669c8b532d56",
   "validation_sha": "<FINAL_DOCS_GOVERNANCE_SHA>"
 }

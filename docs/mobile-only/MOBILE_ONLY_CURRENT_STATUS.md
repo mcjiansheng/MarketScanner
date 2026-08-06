@@ -49,3 +49,14 @@ Gate 0 编译/导入死锁修复、Gate A 正式工作流（后台执行/完整
 `core/MarketScannerFactorGraph`（iOS 与 PC oracle 同源，真实 DB 图
 → 自适应骨架 → g2o robust Fast/一次受控 Deep → §11.5 质量门 →
 完整轨迹重建）、Gate L 资源治理。当前状态与未执行项见 V1R2 文档。
+
+## V1R3 收口（见 MOBILE_ONLY_V1R3_EVIDENCE_NATIVE_DEVICE_QUALIFICATION.md）
+
+分支 `mobile-only-v1r3-evidence-integrity-native-correctness-and-device-qualification-closeout`
+（基线 `9de2908`）关闭 V1R2 审查 REJECTED 的证据完整性与 native 正确性
+缺口：扫描启动事务化 + receipt、yaw 合同与可通行性门、prior-map 全局
+约束（LOCAL_FRAME_ONLY fail-closed）、P7R6D 级流式 immutable snapshot、
+Swift/C ABI 指针安全 + outcome 校验、严格 BLOB/损坏 fail-closed、
+逆信息/SPD/聚合协方差数学修复（可执行测试验证）、可中断优化、
+质量门真实性、轨迹 component/uncertainty、result package 原子事务、
+时钟侧车记录。当前状态与未执行项见 V1R3 文档。
