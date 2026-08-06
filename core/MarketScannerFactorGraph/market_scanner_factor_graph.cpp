@@ -37,6 +37,7 @@
 #include <cstring>
 #include <functional>
 #include <new>
+#include <random>
 #include <map>
 #include <memory>
 #include <set>
@@ -1718,6 +1719,274 @@ bool buildSkeletonFactors(
     return true;
 }
 
+// MARK: - Robust map-frame gauge estimation (§8.4 / V1R5 H-18) ----------------
+
+/// Per-component gauge diagnostics surfaced in the quality report
+/// (V1R5 §8.4/§10.3). The V1R4 information-weighted mean was flagged by
+/// the independent review (B-15): a single high-information wrong prior
+/// could drag the gauge, there was no cross-node robust outlier
+/// estimation, and an equal-size bimodal cluster passed without any
+/// ambiguity gate. The V1R5 estimator RANSACs the prior candidates in
+/// SE(2) and gates on consensus margin (H-18) + trajectory span before
+/// a component is allowed to anchor.
+struct GaugeDiagnostics
+{
+    int64_t componentId = 0;
+    int64_t candidateCount = 0;
+    int64_t inlierCount = 0;
+    int64_t outlierCount = 0;
+    /// Best RANSAC consensus / total candidates.
+    double consensusRatio = 0.0;
+    /// Second-best consensus / total candidates (0 when unique).
+    double secondClusterRatio = 0.0;
+    /// Max raw-node distance spanned by the prior candidates (m) — the
+    /// §8.4 trajectory-span gate input.
+    double translationSpreadM = 0.0;
+    /// Max pairwise yaw spread of the candidates (rad), diagnostic.
+    double yawSpreadRad = 0.0;
+    bool anchored = false;
+    /// Valid when anchored: T_map_local robust gauge.
+    SE2 mapFromLocal;
+    /// Machine-readable reason when not anchored ("no_priors",
+    /// "insufficient_candidates", "trajectory_span_too_small",
+    /// "insufficient_consensus", "ambiguous_clusters",
+    /// "low_consensus_ratio", "non_finite_candidates",
+    /// "non_finite_gauge"). Carried verbatim into the quality report.
+    std::string rejectReason;
+};
+
+/// One prior candidate for the map-frame gauge: candidate = T_map ×
+/// inv(T_raw) plus the raw node pose (for the trajectory-span gate).
+struct GaugeCandidate
+{
+    SE2 gauge;
+    SE2 rawPose;
+    /// Information-derived weight used by the IRLS initializer only;
+    /// RANSAC inlier counting is weight-free so one high-information
+    /// wrong prior cannot dominate the consensus (B-15).
+    double weight = 1.0;
+};
+
+// V1R5 §8.4 gate constants (candidate policy until the Replay Pareto
+// freezes production values — same status as MS_QUALITY_POLICY_VERSION).
+const int kGaugeRansacIterations = 64;
+const int kGaugeRansacSampleCount = 2;
+const int kGaugeMinimumCandidateCount = 3;
+const double kGaugeMinimumTrajectorySpanM = 2.0;
+/// Normalization scales for the joint residual (raw-drift audit scales
+/// carried over from the V1R4 gauge bounds).
+const double kGaugeSigmaTranslationM = 0.5;
+const double kGaugeSigmaYawRad = 0.2;
+/// Inlier threshold in normalized joint-residual units ("1.0 or 2.0"
+/// per §8.4; 2.0 is chosen so 1.0 m or 0.4 rad alone still passes).
+const double kGaugeInlierThreshold = 2.0;
+const int kGaugeMinimumInlierCount = 3;
+const double kGaugeMinimumConsensusRatio = 0.5;
+/// H-18: the second cluster must trail the winner by at least this
+/// fraction of all candidates, or the split is ambiguous.
+const double kGaugeConsensusMargin = 0.15;
+const int kGaugeIrisIterations = 4;
+const double kGaugeIrisHuberDelta = 2.0;
+
+/// Normalized SE(2) joint residual of one candidate against a model:
+/// translation error / sigma_xy + yaw error / sigma_yaw (§8.4).
+double gaugeJointResidual(const SE2 & model, const SE2 & candidate)
+{
+    const double translationError =
+        std::hypot(candidate.x - model.x, candidate.y - model.y);
+    const double yawError =
+        std::fabs(normalizeAngle(candidate.yaw - model.yaw));
+    return translationError / kGaugeSigmaTranslationM +
+           yawError / kGaugeSigmaYawRad;
+}
+
+/// SE(2) model from a candidate pair (§8.4): translation is the pair
+/// mean, yaw the atan2 average of the two unit vectors.
+SE2 gaugeModelFromPair(const GaugeCandidate & a, const GaugeCandidate & b)
+{
+    SE2 model;
+    model.x = 0.5 * (a.gauge.x + b.gauge.x);
+    model.y = 0.5 * (a.gauge.y + b.gauge.y);
+    model.yaw = std::atan2(
+        std::sin(a.gauge.yaw) + std::sin(b.gauge.yaw),
+        std::cos(a.gauge.yaw) + std::cos(b.gauge.yaw));
+    return model;
+}
+
+/// Huber IRLS refinement of the RANSAC consensus set (§8.4). The
+/// initializer is the information-weighted circular mean; each of the
+/// few iterations re-weights every inlier by the Huber penalty of its
+/// normalized joint residual, so no single high-information candidate
+/// can dominate the final gauge (B-15).
+SE2 refineGaugeIRLS(const std::vector<GaugeCandidate> & inliers)
+{
+    SE2 mean;
+    if(inliers.empty()) return mean;
+    double wSum = 0.0;
+    for(size_t i = 0; i < inliers.size(); ++i)
+    {
+        mean.x += inliers[i].weight * inliers[i].gauge.x;
+        mean.y += inliers[i].weight * inliers[i].gauge.y;
+        wSum += inliers[i].weight;
+    }
+    if(wSum <= 0.0) return mean;
+    mean.x /= wSum;
+    mean.y /= wSum;
+    double yawSin = 0.0, yawCos = 0.0;
+    for(size_t i = 0; i < inliers.size(); ++i)
+    {
+        yawSin += inliers[i].weight * std::sin(inliers[i].gauge.yaw);
+        yawCos += inliers[i].weight * std::cos(inliers[i].gauge.yaw);
+    }
+    mean.yaw = std::atan2(yawSin, yawCos);
+    for(int it = 0; it < kGaugeIrisIterations; ++it)
+    {
+        double sx = 0.0, sy = 0.0, sSin = 0.0, sCos = 0.0, sw = 0.0;
+        for(size_t i = 0; i < inliers.size(); ++i)
+        {
+            const double joint = gaugeJointResidual(mean, inliers[i].gauge);
+            const double huber = joint <= kGaugeIrisHuberDelta
+                ? 1.0 : kGaugeIrisHuberDelta / joint;
+            const double w = inliers[i].weight * huber;
+            sx += w * inliers[i].gauge.x;
+            sy += w * inliers[i].gauge.y;
+            sSin += w * std::sin(inliers[i].gauge.yaw);
+            sCos += w * std::cos(inliers[i].gauge.yaw);
+            sw += w;
+        }
+        if(sw <= 0.0) break;
+        mean.x = sx / sw;
+        mean.y = sy / sw;
+        mean.yaw = std::atan2(sSin, sCos);
+    }
+    return mean;
+}
+
+/// Robust SE(2) map-frame gauge (§8.4, H-18). FAIL-CLOSED: when the
+/// RANSAC consensus, the H-18 margin or the §8.4 span/ratio gates are
+/// not met the component is NOT anchored and `anchored` stays false —
+/// there is never a fallback to the V1R4 information-weighted mean.
+void estimateRobustGauge(
+    const std::vector<GaugeCandidate> & candidates,
+    GaugeDiagnostics & out)
+{
+    out.candidateCount = static_cast<int64_t>(candidates.size());
+    if(candidates.size() < static_cast<size_t>(kGaugeRansacSampleCount))
+    {
+        out.rejectReason = "insufficient_candidates";
+        return;
+    }
+    // §8.4 trajectory-span gate: priors that all sit at the same raw
+    // location cannot constrain an SE(2) gauge (geometrically
+    // degenerate). The gate passes when the prior nodes span more than
+    // kGaugeMinimumTrajectorySpanM OR when at least
+    // kGaugeMinimumCandidateCount candidates exist.
+    double minX = candidates[0].rawPose.x, maxX = minX;
+    double minY = candidates[0].rawPose.y, maxY = minY;
+    for(size_t i = 1; i < candidates.size(); ++i)
+    {
+        minX = std::min(minX, candidates[i].rawPose.x);
+        maxX = std::max(maxX, candidates[i].rawPose.x);
+        minY = std::min(minY, candidates[i].rawPose.y);
+        maxY = std::max(maxY, candidates[i].rawPose.y);
+    }
+    out.translationSpreadM = std::hypot(maxX - minX, maxY - minY);
+    for(size_t i = 0; i < candidates.size(); ++i)
+    {
+        for(size_t j = i + 1; j < candidates.size(); ++j)
+        {
+            out.yawSpreadRad = std::max(out.yawSpreadRad,
+                std::fabs(normalizeAngle(candidates[i].gauge.yaw -
+                                         candidates[j].gauge.yaw)));
+        }
+    }
+    if(candidates.size() < static_cast<size_t>(kGaugeMinimumCandidateCount) &&
+       out.translationSpreadM <= kGaugeMinimumTrajectorySpanM)
+    {
+        out.rejectReason = "trajectory_span_too_small";
+        return;
+    }
+    // RANSAC: sample candidate pairs, fit the pair-mean SE(2) model,
+    // count inliers by normalized joint residual. Deterministic seed
+    // so the estimate is reproducible across runs.
+    std::mt19937 rng(0x5EEDC0DEu);
+    std::uniform_int_distribution<size_t> dist(0, candidates.size() - 1);
+    std::vector<bool> bestMask;
+    size_t bestCount = 0;
+    size_t secondCount = 0;
+    for(int iter = 0; iter < kGaugeRansacIterations; ++iter)
+    {
+        const size_t i0 = dist(rng);
+        size_t i1 = dist(rng);
+        if(i0 == i1) continue;
+        const SE2 model = gaugeModelFromPair(candidates[i0], candidates[i1]);
+        std::vector<bool> mask(candidates.size(), false);
+        size_t count = 0;
+        for(size_t i = 0; i < candidates.size(); ++i)
+        {
+            if(gaugeJointResidual(model, candidates[i].gauge) < kGaugeInlierThreshold)
+            {
+                mask[i] = true;
+                ++count;
+            }
+        }
+        if(bestMask.empty() || (count > bestCount && mask != bestMask))
+        {
+            if(!bestMask.empty())
+            {
+                // The previous winner becomes the runner-up so the H-18
+                // margin always compares against the strongest rival.
+                secondCount = bestCount;
+            }
+            bestMask = mask;
+            bestCount = count;
+        }
+        else if(count > secondCount && mask != bestMask)
+        {
+            secondCount = count;
+        }
+    }
+    out.inlierCount = static_cast<int64_t>(bestCount);
+    out.outlierCount = static_cast<int64_t>(candidates.size()) - out.inlierCount;
+    out.consensusRatio = static_cast<double>(bestCount) /
+        static_cast<double>(candidates.size());
+    out.secondClusterRatio = static_cast<double>(secondCount) /
+        static_cast<double>(candidates.size());
+    // H-18 gate: the winning cluster must be large enough and the
+    // second cluster (if any) far enough behind — an equal-size
+    // bimodal split is ambiguous and must not anchor.
+    if(out.inlierCount < kGaugeMinimumInlierCount)
+    {
+        out.rejectReason = "insufficient_consensus";
+        return;
+    }
+    if(secondCount > 0 &&
+       (out.consensusRatio - out.secondClusterRatio) < kGaugeConsensusMargin)
+    {
+        out.rejectReason = "ambiguous_clusters";
+        return;
+    }
+    if(out.consensusRatio < kGaugeMinimumConsensusRatio)
+    {
+        out.rejectReason = "low_consensus_ratio";
+        return;
+    }
+    // Collect the consensus set and refine it with Huber IRLS (§8.4).
+    std::vector<GaugeCandidate> inliers;
+    inliers.reserve(bestCount);
+    for(size_t i = 0; i < candidates.size(); ++i)
+    {
+        if(bestMask[i]) inliers.push_back(candidates[i]);
+    }
+    out.mapFromLocal = refineGaugeIRLS(inliers);
+    if(!se2Finite(out.mapFromLocal))
+    {
+        out.rejectReason = "non_finite_gauge";
+        return;
+    }
+    out.anchored = true;
+}
+
 // MARK: - RobustSE2Optimizer (§11.4/§12) ----------------------------------------
 
 struct OptimizerDiagnostics
@@ -1730,6 +1999,16 @@ struct OptimizerDiagnostics
     bool cancelled = false;
     bool budgetExhausted = false;
     int64_t chunks = 0;
+    // V1R5 H-17: convergence provenance for the quality report. The
+    // g2o error is only returned per chunk, so the chunk loop also
+    // tracks the max vertex delta as the improvement proxy.
+    bool converged = false;
+    std::string stoppedReason = "iteration_budget_exhausted";
+    double initialError = std::numeric_limits<double>::quiet_NaN();
+    double relativeImprovement = std::numeric_limits<double>::quiet_NaN();
+    /// Max per-vertex pose delta of the LAST chunk (m); NaN when no
+    /// chunk finished yet.
+    double lastChunkMaxVertexDelta = std::numeric_limits<double>::quiet_NaN();
 };
 
 struct OptimizedGraph
@@ -1747,19 +2026,22 @@ struct OptimizedGraph
 ///   never become vertices, so the Fast path is O(S + F), never O(N²);
 /// - each prior-anchored component closes the map-frame gauge: a
 ///   consistent `T_map_local` is estimated from the applied priors
-///   (candidate_i = T_map_i × inv(T_raw_i), information-weighted fusion),
-///   the whole component's initial poses are rigidly transformed into the
-///   map frame, and only then is the anchor fixed. The component may
-///   still translate/rotate as a rigid body under the solver; a raw local
-///   root is NEVER frozen while expecting priors to do the alignment.
-/// - V1R4 fix: the information-weighted gauge is applied whenever the
-///   candidates are finite — raw-frame drift (a random walk of
-///   0.004 m/step accumulates 0.5 m over ~15k nodes) must never block
-///   anchoring, so the frozen consistency bounds no longer gate the
-///   component. Genuinely contradicting priors are caught earlier by the
-///   factor-set conflicts audit (§6.3) and after optimization by the
-///   prior residual / yaw gates (§11.1); `gaugeFailedPriorNodes` stays in
-///   the ABI as a diagnostic sink but is not populated by this path.
+///   (candidate_i = T_map_i × inv(T_raw_i)), the whole component's
+///   initial poses are rigidly transformed into the map frame, and only
+///   then is the anchor fixed. The component may still translate/rotate
+///   as a rigid body under the solver; a raw local root is NEVER frozen
+///   while expecting priors to do the alignment.
+/// V1R5 (B-15 / §8.4 / §8.5 / H-17 / H-18):
+/// - the gauge is now estimated with SE(2) RANSAC + Huber IRLS and gated
+///   on consensus margin (H-18), trajectory span and inlier ratio (§8.4)
+///   instead of the V1R4 information-weighted mean; a rejected gauge
+///   FAILS CLOSED (the component is not anchored, its prior nodes land in
+///   `gaugeFailedPriorNodes`) — there is never a fallback to the mean;
+/// - per-component gauge diagnostics are emitted through
+///   `gaugeDiagnostics` for the quality report (§10.3);
+/// - the chunk loop now records convergence provenance (converged /
+///   stopped reason / initial-final error / relative improvement) on
+///   `out.diagnostics` for the quality report (H-17).
 bool optimizeSkeleton(
     const GraphModel & model,
     const std::vector<FactorRecord> & factors,
@@ -1770,6 +2052,7 @@ bool optimizeSkeleton(
     OptimizedGraph & out,
     std::set<int64_t> & gaugeFailedPriorNodes,
     std::map<int64_t, SE2> & componentGauge,
+    std::vector<GaugeDiagnostics> & gaugeDiagnostics,
     std::string & error)
 {
     if(factors.empty())
@@ -1837,7 +2120,6 @@ bool optimizeSkeleton(
     const double kGaugeYawRad = 0.2;
     (void)kGaugeTranslationM;
     (void)kGaugeYawRad;
-    (void)gaugeFailedPriorNodes;
     for(std::map<int64_t, std::vector<int64_t> >::const_iterator it = componentNodes.begin();
         it != componentNodes.end(); ++it)
     {
@@ -1858,7 +2140,7 @@ bool optimizeSkeleton(
         const std::vector<int64_t> & nodes = it->second;
         const std::vector<const FactorRecord *> & compFactors = componentFactors[it->first];
 
-        // --- Map-frame gauge estimation from applied priors (§6.4) -----
+        // --- Map-frame gauge estimation from applied priors (§6.4/§8.4) -
         std::vector<const FactorRecord *> priorsApplied;
         std::vector<const FactorRecord *> relativeFactors;
         for(size_t f = 0; f < compFactors.size(); ++f)
@@ -1871,14 +2153,18 @@ bool optimizeSkeleton(
         bool gaugeAnchored = false;
         SE2 mapFromLocal;
         mapFromLocal.x = mapFromLocal.y = mapFromLocal.yaw = 0.0;
+        GaugeDiagnostics gaugeDiag;
+        gaugeDiag.componentId = it->first;
         if(!priorsApplied.empty())
         {
-            // candidate_i = T_map_i × inv(T_raw_i), information-weighted.
-            double wSum = 0.0;
-            SE2 fused;
-            fused.x = fused.y = fused.yaw = 0.0;
-            double yawSin = 0.0, yawCos = 0.0;
-            std::vector<SE2> candidates;
+            // V1R5 §8.4: robust SE(2) gauge. candidate_i = T_map_i ×
+            // inv(T_raw_i); RANSAC + Huber IRLS replace the V1R4
+            // information-weighted mean (B-15: a single high-information
+            // wrong prior could drag the gauge, there was no cross-node
+            // outlier rejection, and equal bimodal clusters passed
+            // without an ambiguity gate). Fail-closed: a rejected gauge
+            // un-anchors the component instead of falling back.
+            std::vector<GaugeCandidate> candidates;
             bool finite = true;
             for(size_t p = 0; p < priorsApplied.size(); ++p)
             {
@@ -1887,35 +2173,44 @@ bool optimizeSkeleton(
                 if(raw == vertexPose.end()) { finite = false; break; }
                 const SE2 candidate = se2Compose(prior.measurement, se2Inverse(raw->second));
                 if(!se2Finite(candidate)) { finite = false; break; }
-                candidates.push_back(candidate);
-                const double w = std::max(1.0e-9,
+                GaugeCandidate c;
+                c.gauge = candidate;
+                c.rawPose = raw->second;
+                c.weight = std::max(1.0e-9,
                     0.5 * (prior.information[0] + prior.information[4]));
-                fused.x += w * candidate.x;
-                fused.y += w * candidate.y;
-                yawSin += w * std::sin(candidate.yaw);
-                yawCos += w * std::cos(candidate.yaw);
-                wSum += w;
+                candidates.push_back(c);
             }
-            // V1R4 fix (§6.4): the weighted gauge is ALWAYS applied when
-            // finite. The frozen bounds (kGaugeTranslationM/kGaugeYawRad)
-            // are drift-dominated on long scans — a 0.004 m/step random
-            // walk crosses 0.5 m after ~15k nodes — so they must not gate
-            // anchoring; contradiction is caught by the factor-set
-            // conflicts audit (§6.3) and the optimized prior residual
-            // gates (§11.1). gaugeFailedPriorNodes is intentionally not
-            // populated here: it must never un-anchor a component.
-            bool anchored = finite && wSum > 0.0;
-            if(anchored)
+            if(!finite || candidates.empty())
             {
-                fused.x /= wSum;
-                fused.y /= wSum;
-                fused.yaw = std::atan2(yawSin, yawCos);
-                gaugeAnchored = true;
-                mapFromLocal = fused;
-                componentGauge[it->first] = fused;
+                gaugeDiag.rejectReason = "non_finite_candidates";
             }
-            (void)candidates;
+            else
+            {
+                estimateRobustGauge(candidates, gaugeDiag);
+                if(gaugeDiag.anchored)
+                {
+                    gaugeAnchored = true;
+                    mapFromLocal = gaugeDiag.mapFromLocal;
+                    componentGauge[it->first] = gaugeDiag.mapFromLocal;
+                }
+            }
+            if(!gaugeAnchored)
+            {
+                // V1R5 fail-closed (§8.4/H-18): a component whose robust
+                // gauge failed its gates must not anchor. Populating
+                // gaugeFailedPriorNodes keeps it out of the anchored
+                // set, so its rows are never publish eligible.
+                for(size_t p = 0; p < priorsApplied.size(); ++p)
+                {
+                    gaugeFailedPriorNodes.insert(priorsApplied[p]->from);
+                }
+            }
         }
+        else
+        {
+            gaugeDiag.rejectReason = "no_priors";
+        }
+        gaugeDiagnostics.push_back(gaugeDiag);
 
         // --- Build the optimizer problem for this component ------------
         std::map<int, rtabmap::Transform> subPoses;
@@ -1991,11 +2286,14 @@ bool optimizeSkeleton(
         std::map<int, rtabmap::Transform> current = subPoses;
         int remaining = totalIterations;
         bool converged = false;
+        bool numericalStagnation = false;
+        double prevError = std::numeric_limits<double>::quiet_NaN();
         while(remaining > 0)
         {
             if(cancel && cancel(cancelUser))
             {
                 out.diagnostics.cancelled = true;
+                out.diagnostics.stoppedReason = "cancelled";
                 error = "cancelled";
                 return false;
             }
@@ -2004,6 +2302,7 @@ bool optimizeSkeleton(
             if(maxWallSeconds > 0.0 && now > maxWallSeconds)
             {
                 out.diagnostics.budgetExhausted = true;
+                out.diagnostics.stoppedReason = "wall_time";
                 error = "optimizer wall-time budget exhausted";
                 return false;
             }
@@ -2011,6 +2310,7 @@ bool optimizeSkeleton(
             optimizer->setIterations(chunk);
             double chunkError = std::numeric_limits<double>::quiet_NaN();
             int chunkDone = 0;
+            std::map<int, rtabmap::Transform> prevPoses = current;
             std::map<int, rtabmap::Transform> optimized =
                 optimizer->optimize(anchor, current, subLinks, 0, &chunkError, &chunkDone);
             if(optimized.size() != subPoses.size())
@@ -2018,18 +2318,68 @@ bool optimizeSkeleton(
                 error = "optimizer returned an incomplete node inventory";
                 return false;
             }
+            // V1R5 H-17: the g2o error is only returned per chunk, so
+            // the max per-vertex pose delta of the chunk is the
+            // improvement proxy used for numerical-stagnation detection.
+            double maxVertexDelta = 0.0;
+            for(std::map<int, rtabmap::Transform>::const_iterator p = optimized.begin();
+                p != optimized.end(); ++p)
+            {
+                std::map<int, rtabmap::Transform>::const_iterator q = prevPoses.find(p->first);
+                if(q == prevPoses.end()) continue;
+                maxVertexDelta = std::max(maxVertexDelta, static_cast<double>(std::hypot(
+                    p->second.x() - q->second.x(), p->second.y() - q->second.y())));
+            }
             current = optimized;
             remaining -= chunk;
             out.diagnostics.iterations += chunkDone;
             out.diagnostics.chunks += 1;
-            if(std::isfinite(chunkError)) out.diagnostics.finalError = chunkError;
+            out.diagnostics.lastChunkMaxVertexDelta = maxVertexDelta;
+            if(std::isfinite(chunkError))
+            {
+                if(!std::isfinite(out.diagnostics.initialError))
+                    out.diagnostics.initialError = chunkError;
+                out.diagnostics.finalError = chunkError;
+            }
             if(chunkDone < chunk)
             {
+                // The optimizer reports it needs no more iterations.
                 converged = true;
                 break;
             }
+            // Numerical stagnation (H-17): a full chunk that moved
+            // nothing while the error barely changed means the solver is
+            // stuck; stop instead of burning the iteration budget.
+            if(std::isfinite(prevError) && std::isfinite(chunkError) &&
+               maxVertexDelta < 1.0e-4 &&
+               prevError - chunkError < 1.0e-6 * std::max(1.0, prevError))
+            {
+                numericalStagnation = true;
+                break;
+            }
+            prevError = chunkError;
         }
-        (void)converged;
+        if(converged)
+        {
+            out.diagnostics.converged = true;
+            out.diagnostics.stoppedReason = "converged";
+        }
+        else if(numericalStagnation)
+        {
+            out.diagnostics.stoppedReason = "numerical_stagnation";
+        }
+        else
+        {
+            out.diagnostics.stoppedReason = "iteration_budget_exhausted";
+        }
+        if(std::isfinite(out.diagnostics.initialError) &&
+           std::isfinite(out.diagnostics.finalError) &&
+           out.diagnostics.initialError > 0.0)
+        {
+            out.diagnostics.relativeImprovement =
+                (out.diagnostics.initialError - out.diagnostics.finalError) /
+                out.diagnostics.initialError;
+        }
         for(std::map<int, rtabmap::Transform>::const_iterator p = current.begin();
             p != current.end(); ++p)
         {
@@ -2114,6 +2464,10 @@ struct QualityMetrics
     std::string optimizerError;
     OptimizerDiagnostics solver;
     double wallSeconds = 0.0;
+    /// V1R5 §8.4/§10.3: per-component robust gauge diagnostics, one
+    /// entry per skeleton component (including non-anchored ones, with
+    /// the exact reject reason).
+    std::vector<GaugeDiagnostics> gaugeDiagnostics;
 };
 
 double percentile(std::vector<double> values, double q)
@@ -2149,7 +2503,8 @@ QualityMetrics evaluateQuality(
     const FactorSetAudit & factorAudit,
     double runWallSeconds,
     double coverage,
-    const std::map<int64_t, SE2> & nodeGauge)
+    const std::map<int64_t, SE2> & nodeGauge,
+    const std::vector<GaugeDiagnostics> & gaugeDiagnostics)
 {
     QualityMetrics metrics;
     metrics.health = health;
@@ -2159,6 +2514,7 @@ QualityMetrics evaluateQuality(
     metrics.solver = optimized.diagnostics;
     metrics.wallSeconds = runWallSeconds;
     metrics.coverage = coverage;
+    metrics.gaugeDiagnostics = gaugeDiagnostics;
     metrics.anchoredRatio = model.nodes.empty() ? 0.0
         : static_cast<double>(health.largestComponent) / static_cast<double>(model.nodes.size());
 
@@ -2428,6 +2784,18 @@ std::string jsonEscape(const std::string & text)
     return out;
 }
 
+/// NaN / ±inf cannot be emitted as bare JSON numbers; serialize them
+/// as null (V1R5 H-17: initial_error / relative_improvement are NaN
+/// until the first chunk reports).
+std::string jsonNum(double value)
+{
+    if(!std::isfinite(value)) return "null";
+    std::ostringstream os;
+    os.precision(9);
+    os << value;
+    return os.str();
+}
+
 std::string residualTriple(const std::vector<double> & values)
 {
     std::ostringstream os;
@@ -2518,11 +2886,35 @@ std::string qualityJSON(
        << "\"optimizer_error\": \"" << jsonEscape(m.optimizerError) << "\", "
        << "\"solver\": {\"strategy\": \"g2o_robust\", \"iterations\": " << m.solver.iterations
        << ", \"final_error\": " << m.solver.finalError
+       // V1R5 H-17: convergence provenance.
+       << ", \"converged\": " << (m.solver.converged ? "true" : "false")
+       << ", \"stopped_reason\": \"" << jsonEscape(m.solver.stoppedReason) << "\""
+       << ", \"initial_error\": " << jsonNum(m.solver.initialError)
+       << ", \"relative_improvement\": " << jsonNum(m.solver.relativeImprovement)
        << ", \"wall_seconds\": " << m.wallSeconds
        << ", \"chunks\": " << m.solver.chunks
        << ", \"skeleton_nodes\": " << m.skeletonNodes
        << ", \"factor_count\": " << m.skeletonFactors
        << ", \"available\": " << (m.solver.available ? "true" : "false") << "}, "
+       // V1R5 §8.4/§10.3: one gauge diagnostic per component.
+       << "\"gauge_by_component\": [";
+    for(size_t gi = 0; gi < m.gaugeDiagnostics.size(); ++gi)
+    {
+        if(gi > 0) os << ", ";
+        const GaugeDiagnostics & g = m.gaugeDiagnostics[gi];
+        os << "{\"component_id\": " << g.componentId
+           << ", \"gauge_candidate_count\": " << g.candidateCount
+           << ", \"gauge_inlier_count\": " << g.inlierCount
+           << ", \"gauge_outlier_count\": " << g.outlierCount
+           << ", \"gauge_consensus_ratio\": " << g.consensusRatio
+           << ", \"gauge_second_cluster_ratio\": " << g.secondClusterRatio
+           << ", \"gauge_translation_spread_m\": " << g.translationSpreadM
+           << ", \"gauge_yaw_spread_rad\": " << g.yawSpreadRad
+           << ", \"gauge_anchored\": " << (g.anchored ? "true" : "false")
+           << ", \"gauge_reject_reason\": \"" << jsonEscape(g.rejectReason) << "\"}";
+    }
+    os << "]";
+    os << ", "
        << "\"health\": {\"node_count\": " << m.health.nodeCount
        << ", \"link_count\": " << m.health.linkCount
        << ", \"malformed_links\": " << m.health.malformedLinks
@@ -2841,13 +3233,15 @@ MSFactorGraphOutcomeC runPipeline(const MSFactorGraphRequestC * request, const R
     std::string optimizeError;
     std::set<int64_t> gaugeFailedPriorNodes;
     std::map<int64_t, SE2> componentGauge;
+    // V1R5 §8.4/§10.3: per-component robust gauge diagnostics.
+    std::vector<GaugeDiagnostics> gaugeDiagnostics;
     const int iterations = options.fullGraph
         ? (request->deep_iterations > 0 ? request->deep_iterations : options.fullGraphIterations)
         : (request->fast_iterations > 0 ? request->fast_iterations : options.fastIterations);
     optimizeSkeleton(
         model, factors, iterations, maxWall,
         request->cancel, request->cancel_user,
-        optimized, gaugeFailedPriorNodes, componentGauge, optimizeError);
+        optimized, gaugeFailedPriorNodes, componentGauge, gaugeDiagnostics, optimizeError);
     if(request->progress) request->progress(0.7, request->progress_user);
 
     // Node -> component mapping (§15.2). Union-find over the skeleton
@@ -2923,10 +3317,11 @@ MSFactorGraphOutcomeC runPipeline(const MSFactorGraphRequestC * request, const R
             }
         }
         // Anchored components: those containing an applied prior node
-        // whose map-frame gauge was ESTIMATED (§6.4). The gauge is always
-        // applied when finite (V1R4 fix), so gaugeFailedPriorNodes never
-        // un-anchors a component; contradiction is reported through the
-        // factor-set conflicts audit and the optimized residual gates.
+        // whose map-frame gauge was ESTIMATED (§6.4). V1R5 fail-closed
+        // (§8.4/H-18): a component whose robust gauge failed its gates
+        // (or whose candidates were non-finite) lands in
+        // gaugeFailedPriorNodes and is NOT anchored here, so its rows
+        // are never publish eligible.
         std::map<int64_t, int64_t> priorComponentOfNode;
         for(size_t s = 0; s < skeleton.size(); ++s)
         {
@@ -2962,7 +3357,7 @@ MSFactorGraphOutcomeC runPipeline(const MSFactorGraphRequestC * request, const R
         std::chrono::steady_clock::now() - runStart).count();
     QualityMetrics metrics = evaluateQuality(
         model, factors, optimized, skeleton, health, factorAudit, runWall, 0.0,
-        nodeGauge);
+        nodeGauge, gaugeDiagnostics);
     metrics.optimizerError = optimizeError;
 
     ReconstructedTrajectory trajectory;
