@@ -30,6 +30,11 @@ enum ShelfAssociationEngine {
         /// Closed polygon vertices (metres) when the compiled package
         /// carries rotated geometry; nil when only bounds are available.
         var polygonM: [(Double, Double)]?
+        /// V1R5 §12.2: "element_yaw" when the front normal came from the
+        /// compiler's business semantics, "geometry" when derived from
+        /// geometry, "unavailable" when the source carried no business
+        /// orientation (side must then be SIDE_UNAVAILABLE).
+        var orientationProvenance: String
 
         var lengthM: Double {
             return hypot(endM.0 - startM.0, endM.1 - startM.1)
@@ -45,7 +50,8 @@ enum ShelfAssociationEngine {
             frontNormalM: (Double, Double),
             boundsMinM: (Double, Double),
             boundsMaxM: (Double, Double),
-            polygonM: [(Double, Double)]?
+            polygonM: [(Double, Double)]?,
+            orientationProvenance: String = "geometry"
         ) {
             self.shelfCode = shelfCode
             self.floorID = floorID
@@ -56,6 +62,7 @@ enum ShelfAssociationEngine {
             self.boundsMinM = boundsMinM
             self.boundsMaxM = boundsMaxM
             self.polygonM = polygonM
+            self.orientationProvenance = orientationProvenance
         }
 
         /// Lateral offset (metres) of a point relative to the face
@@ -88,7 +95,9 @@ enum ShelfAssociationEngine {
         polygonM: [(Double, Double)]?,
         boundsMinM: (Double, Double)?,
         boundsMaxM: (Double, Double)?,
-        yawRad: Double?
+        yawRad: Double?,
+        compiledFrontNormal: (Double, Double)? = nil,
+        orientationProvenance: String = "geometry"
     ) -> ShelfSegment? {
         var axis: (Double, Double)?
         var start: (Double, Double)?
@@ -183,8 +192,19 @@ enum ShelfAssociationEngine {
               hypot(end.0 - start.0, end.1 - start.1) > 1.0e-9 else {
             return nil
         }
-        // Front normal = axis rotated clockwise 90 degrees.
-        let normal = (axis.1, -axis.0)
+        // V1R5 §12.2: the front normal is AUTHORITATIVE when the
+        // compiler emitted business semantics (element_yaw). The axis
+        // follows from the normal (axis = (-normal.y, normal.x) since
+        // normal = (axis.y, -axis.x)); geometry only supplies the
+        // longitudinal endpoints. With no business orientation the side
+        // stays SIDE_UNAVAILABLE (never guessed).
+        let normal: (Double, Double)
+        if let compiled = compiledFrontNormal {
+            normal = compiled
+        } else {
+            // Front normal = axis rotated clockwise 90 degrees.
+            normal = (axis.1, -axis.0)
+        }
         return ShelfSegment(
             shelfCode: shelfCode,
             floorID: floorID,
@@ -194,7 +214,8 @@ enum ShelfAssociationEngine {
             frontNormalM: normal,
             boundsMinM: envelopeMin,
             boundsMaxM: envelopeMax,
-            polygonM: polygonM)
+            polygonM: polygonM,
+            orientationProvenance: orientationProvenance)
     }
 
     // MARK: - Spatial index (V1R4 §13.3: shelf grid)
@@ -272,6 +293,8 @@ enum ShelfAssociationEngine {
         /// True when a fixed structure lies between the tag and the
         /// shelf (occlusion check, §13.4/§13.6).
         var occludedByStructure: Bool
+        /// V1R5 §12.2: business-side provenance of the associated shelf.
+        var orientationProvenance: String
     }
 
     /// Projects point P onto segment A-B and classifies the side:
@@ -308,7 +331,8 @@ enum ShelfAssociationEngine {
             atEndpoint: atEndpoint,
             secondCandidateDistanceM: nil,
             marginM: nil,
-            occludedByStructure: occludedByStructure
+            occludedByStructure: occludedByStructure,
+            orientationProvenance: shelf.orientationProvenance
         )
     }
 
@@ -488,6 +512,12 @@ enum AutomaticQualityGate {
         }
         guard input.association.shelfSide == "front" || input.association.shelfSide == "back" else {
             return (.rescanRequired, "shelf_side_ambiguous")
+        }
+        // V1R5 §12.2 (review B-14): a side derived WITHOUT business
+        // semantics (source carried no orientation) can never be
+        // ACCEPTED — the consumer must not guess front/back.
+        guard input.association.orientationProvenance != "unavailable" else {
+            return (.rescanRequired, "shelf_side_unavailable")
         }
         guard !input.association.occludedByStructure else {
             return (.rescanRequired, "shelf_occluded_by_structure")

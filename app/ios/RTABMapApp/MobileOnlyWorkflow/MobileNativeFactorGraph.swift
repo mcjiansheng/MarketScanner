@@ -17,9 +17,17 @@ import Foundation
 ///   surfaces `.cancelled`, not a generic failure.
 enum MobileNativeFactorGraph {
 
-    /// Outcome validation policy (§9.2).
-    static let maximumTrajectoryRows: Int64 = 5_000_000
-    static let maximumSkeletonNodes: Int64 = 5_000_000
+    /// Outcome validation policy (§9.2 / V1R5 §10.1 review H-16): the
+    /// bounds are PRODUCT-DERIVED — the largest qualified store is
+    /// ≈60k raw nodes, and the trajectory reconstruction emits at most
+    /// one row per raw node. The V1R4 generic 5,000,000 ceiling would
+    /// let an anomalous native outcome allocate tens of GiB before the
+    /// resource governor could react.
+    static let maximumTrajectoryRows: Int64 = 200_000
+    static let maximumSkeletonNodes: Int64 = 200_000
+    static let maximumRawNodes: Int64 = 200_000
+    static let maximumFactors: Int64 = 400_000
+    static let maximumPriors: Int64 = 100_000
 
     static func wireIntoGateway() {
         MobileNativeFactorGraphGateway.runFastImplementation = { request, isCancelled in
@@ -83,6 +91,14 @@ enum MobileNativeFactorGraph {
 
         // Map the Swift priors into the C struct layout. The array
         // buffer pointer is only used inside the nested C call below.
+        // V1R5 §10.1 (review H-16): product-derived bounds — an
+        // oversized input must fail before any native allocation.
+        guard Int64(request.absolutePriors.count) <= maximumPriors,
+              Int64(request.tagNodeIDs.count) <= maximumRawNodes else {
+            throw MobileNativeFactorGraphError.invalidOutcome(
+                "input limits exceeded: priors=\(request.absolutePriors.count) "
+                + "tagNodes=\(request.tagNodeIDs.count)")
+        }
         var cPriors: [MSAbsolutePriorC] = request.absolutePriors.map { prior in
             var c = MSAbsolutePriorC(
                 node_id: prior.nodeID,

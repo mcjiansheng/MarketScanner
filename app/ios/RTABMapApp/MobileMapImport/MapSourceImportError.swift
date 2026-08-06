@@ -43,6 +43,10 @@ enum MapSourceImportError: Error, Equatable {
     case unknownShapeTypePolicy(shapeType: String)
     case invalidGeometry(shapeType: String, reason: String)
     case duplicateElementIdentity(duplicateID: String)
+    /// V1R5 §13.5 (review H-13): XLSX/CSV imports REQUIRE an explicit,
+    /// user-confirmed store ID — a defaulted "default" can collide
+    /// across stores and sessions.
+    case storeIDRequired
     case cancelled
 
     /// Frozen machine-readable code. UI and tests must not parse the
@@ -85,6 +89,7 @@ enum MapSourceImportError: Error, Equatable {
         case .unknownShapeTypePolicy: return "map_source_unknown_shape_type"
         case .invalidGeometry: return "map_source_invalid_geometry"
         case .duplicateElementIdentity: return "map_source_duplicate_element_identity"
+        case .storeIDRequired: return "map_source_store_id_required"
         case .cancelled: return "map_source_cancelled"
         }
     }
@@ -163,6 +168,8 @@ enum MapSourceImportError: Error, Equatable {
             return "元素 \(shapeType) 几何无效：\(reason)"
         case .duplicateElementIdentity(let duplicateID):
             return "地图包含重复的元素身份：\(duplicateID)"
+        case .storeIDRequired:
+            return "导入要求用户确认的 store ID（不允许默认值）。"
         case .cancelled:
             return "导入已取消。"
         }

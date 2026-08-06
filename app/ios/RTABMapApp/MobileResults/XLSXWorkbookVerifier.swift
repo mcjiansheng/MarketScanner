@@ -267,7 +267,15 @@ enum XLSXWorkbookVerifier {
                         }
                     }
                 }
-                if inHeaderRow && !headerClosed {
+                index += 1
+            }
+            // V1R5 §13.2 (review H-04): the header buffer only ever
+            // receives the CURRENT chunk's new bytes; `tail` exists
+            // solely for pattern matching across chunk boundaries. The
+            // V1R4 code appended the whole window (tail + bytes), which
+            // duplicated the previous chunk's tail into the header row.
+            if inHeaderRow && !headerClosed {
+                for byte in bytes {
                     headerBuffer.append(byte)
                     if headerBuffer.count > 1_048_576 {
                         throw VerifyError.sheetXMLInvalid("header row too large")
@@ -275,9 +283,9 @@ enum XLSXWorkbookVerifier {
                     if byte == 0x3E && headerBuffer.count >= 6,
                        Array(headerBuffer.suffix(6)) == rowCloseBytes {
                         headerClosed = true
+                        break
                     }
                 }
-                index += 1
             }
             tail = Array(bytes.suffix(7))
         }

@@ -342,6 +342,16 @@ enum PersistentTaskCheckpoint {
             isDirectory.boolValue else {
             throw CheckpointError.referenceMissing("input_snapshot")
         }
+        // V1R5 §13.6 (review H-14): resume re-validates the FULL
+        // snapshot — manifest, every artifact's exact bytes + SHA-256,
+        // the DB quick-check and the WAL/journal contract. "The file
+        // exists" is never enough to resume from a checkpoint.
+        do {
+            try SessionSnapshotTransaction.revalidateSnapshot(snapshotDirectory)
+        } catch let error as SessionSnapshotTransaction.SessionError {
+            throw CheckpointError.referenceMissing(
+                "input_snapshot re-validation failed: \(error.localizedDescription)")
+        }
         let manifestURL = snapshotDirectory.appendingPathComponent("input_manifest.json")
         guard fileManager.fileExists(atPath: manifestURL.path) else {
             throw CheckpointError.referenceMissing(

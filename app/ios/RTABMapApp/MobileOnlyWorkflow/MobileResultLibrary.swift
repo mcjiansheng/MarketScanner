@@ -190,9 +190,11 @@ enum MobileResultLibrary {
         let stagedManifestURL = stagingDirectory.appendingPathComponent(manifestFileName)
         try manifestData.write(to: stagedManifestURL, options: [.atomic])
 
-        // 3. fsync every staged file and the staging directory.
+        // 3. fsync every staged file and the staging directory (V1R5
+        //    §13.1 / review H-01: any open/fsync failure blocks the
+        //    commit — durability is never best-effort).
         for name in packageFiles + [workbookFilename, manifestFileName] {
-            syncFile(stagingDirectory.appendingPathComponent(name))
+            try syncFile(stagingDirectory.appendingPathComponent(name))
         }
         try MobileMapLibrary.syncDirectory(stagingDirectory)
 
@@ -209,6 +211,12 @@ enum MobileResultLibrary {
         }
         try MobileMapLibrary.syncDirectory(try root())
 
+        // V1R5 §13.1 / review H-02: a committed result is IMMUTABLE —
+        // recursive read-only (files 0444, directories 0555) before the
+        // registry entry may report success. A chmod failure blocks the
+        // commit (no success is reported for a mutable artifact).
+        try freezeImmutably(finalDirectory)
+
         return ResultEntry(
             resultID: resultID,
             taskID: taskID,
@@ -217,6 +225,37 @@ enum MobileResultLibrary {
             workbookSHA256: workbookSHA,
             directory: finalDirectory,
             manifest: manifest)
+    }
+
+    /// Recursively makes a committed result read-only: files 0444,
+    /// directories 0555, then the directory itself (V1R5 §13.1). Any
+    /// failure throws — the result must not be reported as committed
+    /// while mutable.
+    private static func freezeImmutably(_ directory: URL) throws {
+        let fileManager = FileManager.default
+        guard let enumerator = fileManager.enumerator(
+            at: directory,
+            includingPropertiesForKeys: [.isDirectoryKey, .isRegularFileKey],
+            options: [.skipsHiddenFiles]) else {
+            throw ResultError.commitFailed(
+                "cannot enumerate result for immutability")
+        }
+        for case let fileURL as URL in enumerator {
+            let values = try fileURL.resourceValues(
+                forKeys: [.isDirectoryKey, .isRegularFileKey])
+            if values.isRegularFile == true {
+                try fileManager.setAttributes(
+                    [.posixPermissions: 0o444],
+                    ofItemAtPath: fileURL.path)
+            } else if values.isDirectory == true {
+                try fileManager.setAttributes(
+                    [.posixPermissions: 0o555],
+                    ofItemAtPath: fileURL.path)
+            }
+        }
+        try fileManager.setAttributes(
+            [.posixPermissions: 0o555],
+            ofItemAtPath: directory.path)
     }
 
     /// Lists committed results, re-validating each manifest and the
@@ -363,10 +402,18 @@ enum MobileResultLibrary {
         return !name.contains("/") && !name.contains("\\")
     }
 
-    private static func syncFile(_ url: URL) {
+    /// V1R5 §13.1 (review H-01): durability is never best-effort — any
+    /// open/fsync failure THROWS and blocks the commit.
+    private static func syncFile(_ url: URL) throws {
         let fd = open(url.path, O_RDONLY)
-        guard fd >= 0 else { return }
+        guard fd >= 0 else {
+            throw ResultError.commitFailed(
+                "cannot open for fsync: \(url.lastPathComponent)")
+        }
         defer { close(fd) }
-        fsync(fd)
+        guard fsync(fd) == 0 else {
+            throw ResultError.commitFailed(
+                "fsync failed: \(url.lastPathComponent)")
+        }
     }
 }

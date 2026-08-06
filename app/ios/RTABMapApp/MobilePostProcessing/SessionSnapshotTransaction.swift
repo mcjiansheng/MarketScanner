@@ -79,6 +79,13 @@ enum SessionSnapshotTransaction {
         "localized_price_tags.json",
     ]
     static let databaseFileName = "rtabmap_segment_0001.db"
+    /// V1R5 §9.4: a non-empty WAL/journal beside the main DB means the
+    /// writer never checkpointed — copying only the main DB would silently
+    /// drop committed data. Any of these files must be absent or EMPTY at
+    /// snapshot time (fail closed).
+    static let walJournalNames = [
+        "-wal", "-journal", "-shm",
+    ]
 
     /// Metadata sidecar declarations: metadata key -> artifact file name.
     /// A non-empty declaration makes the artifact REQUIRED (B-08).
@@ -134,6 +141,25 @@ enum SessionSnapshotTransaction {
                 throw SessionError.missingRequired(name)
             }
             filesToCopy.append((name, source, true))
+        }
+        // V1R5 §9.4: the SQLite contract is single-file finalized. A
+        // non-empty WAL/journal beside the main DB is a blocker — the
+        // writer never checkpointed, so a main-DB-only copy would be
+        // silently incomplete.
+        let databaseName = sourceDatabase.lastPathComponent
+        for suffix in walJournalNames {
+            let sideURL = finalizedSession
+                .appendingPathComponent(databaseName + suffix)
+            if fileManager.fileExists(atPath: sideURL.path) {
+                let attributes = try fileManager
+                    .attributesOfItem(atPath: sideURL.path)
+                let bytes = (attributes[.size] as? NSNumber)?.int64Value ?? 0
+                guard bytes == 0 else {
+                    throw SessionError.notEligible(
+                        "non-empty \(databaseName + suffix) present; "
+                        + "the session DB was never checkpointed")
+                }
+            }
         }
         // Sidecars the metadata explicitly declares by file name: when
         // declared they are REQUIRED — losing them is evidence tampering.
@@ -286,13 +312,38 @@ enum SessionSnapshotTransaction {
             try fsyncURL(stagingManifest)
             try fsyncDirectory(stagingDirectory)
 
-            // B-08: only now is the previously committed snapshot
-            // replaced — a failure above keeps the old valid snapshot.
+            // V1R5 §9.5: atomic replacement with a backup — the previous
+            // valid snapshot is NEVER deleted before the new one is
+            // durable. Order: new staging verified -> old snapshot moved
+            // to backup -> staging renamed to final -> fsync -> backup
+            // deleted only after the new snapshot is durable.
+            let backupDirectory = taskRoot
+                .appendingPathComponent("input_snapshot.backup")
             if fileManager.fileExists(atPath: snapshotDirectory.path) {
-                try fileManager.removeItem(at: snapshotDirectory)
+                if fileManager.fileExists(atPath: backupDirectory.path) {
+                    try fileManager.removeItem(at: backupDirectory)
+                }
+                try fileManager.moveItem(
+                    at: snapshotDirectory, to: backupDirectory)
             }
-            try fileManager.moveItem(at: stagingDirectory, to: snapshotDirectory)
-            try fsyncDirectory(taskRoot)
+            do {
+                try fileManager.moveItem(
+                    at: stagingDirectory, to: snapshotDirectory)
+                try fsyncDirectory(taskRoot)
+                // The new snapshot is durable: only now delete the backup.
+                if fileManager.fileExists(atPath: backupDirectory.path) {
+                    try fileManager.removeItem(at: backupDirectory)
+                }
+            } catch {
+                // Restore the backup: the old snapshot must never be lost.
+                if fileManager.fileExists(atPath: backupDirectory.path),
+                   !fileManager.fileExists(atPath: snapshotDirectory.path) {
+                    try? fileManager.moveItem(
+                        at: backupDirectory, to: snapshotDirectory)
+                    try? fsyncDirectory(taskRoot)
+                }
+                throw error
+            }
             // The committed manifest lives in the task root as before.
             try manifestData.write(
                 to: taskRoot.appendingPathComponent("input_manifest.json"),
@@ -317,6 +368,71 @@ enum SessionSnapshotTransaction {
             .first(where: { $0.name == fileName })?.key ?? ""
     }
 
+    /// V1R5 §13.6 (review H-14): full re-validation of a committed
+    /// snapshot before a task resume — the manifest, every artifact's
+    /// exact bytes + SHA-256, the DB quick-check and the WAL/journal
+    /// contract are re-verified. Resume never trusts "the file exists".
+    static func revalidateSnapshot(_ directory: URL) throws {
+        let fileManager = FileManager.default
+        let manifestURL = directory.appendingPathComponent("input_manifest.json")
+        guard fileManager.fileExists(atPath: manifestURL.path) else {
+            throw SessionError.missingRequired("input_manifest.json")
+        }
+        let manifestData = try Data(contentsOf: manifestURL)
+        guard let manifest = try? StrictJSONDocumentParser.object(
+            from: manifestData,
+            limits: StrictJSONDocumentLimits(maximumBytes: manifestData.count + 1))
+                as? [String: Any],
+              let artifacts = manifest["artifacts"] as? [[String: Any]],
+              !artifacts.isEmpty else {
+            throw SessionError.notEligible(
+                "input_manifest.json invalid for resume")
+        }
+        for artifact in artifacts {
+            guard let name = artifact["file"] as? String,
+                  let expectedSHA = artifact["sha256"] as? String,
+                  let expectedBytes = (artifact["bytes"] as? NSNumber)?.int64Value
+            else {
+                throw SessionError.notEligible(
+                    "input_manifest.json artifact record invalid")
+            }
+            let url = directory.appendingPathComponent(name)
+            let attributes = try fileManager.attributesOfItem(atPath: url.path)
+            let actualBytes = (attributes[.size] as? NSNumber)?.int64Value ?? -1
+            guard actualBytes == expectedBytes else {
+                throw SessionError.copyFailed(
+                    "resume bytes mismatch: \(name) \(actualBytes) != \(expectedBytes)")
+            }
+            let actualSHA = try CanonicalSourceHasher.sha256File(url)
+            guard actualSHA == expectedSHA else {
+                throw SessionError.copyFailed(
+                    "resume sha mismatch: \(name)")
+            }
+        }
+        // DB quick-check + WAL contract on the snapshot copy.
+        let databaseName = artifacts.compactMap {
+            ($0["file"] as? String)?.hasSuffix(".db") == true
+                ? $0["file"] as? String : nil
+        }.first
+        guard let databaseName else {
+            throw SessionError.emptyInput
+        }
+        for suffix in walJournalNames {
+            let sideURL = directory.appendingPathComponent(databaseName + suffix)
+            if fileManager.fileExists(atPath: sideURL.path) {
+                let attributes = try fileManager
+                    .attributesOfItem(atPath: sideURL.path)
+                let bytes = (attributes[.size] as? NSNumber)?.int64Value ?? 0
+                guard bytes == 0 else {
+                    throw SessionError.notEligible(
+                        "resume: non-empty \(databaseName + suffix) present")
+                }
+            }
+        }
+        try validateSnapshotDatabase(
+            directory.appendingPathComponent(databaseName))
+    }
+
     // MARK: - Eligibility (§8.1)
 
     private static func readMetadata(_ url: URL) throws -> [String: Any] {
@@ -334,7 +450,9 @@ enum SessionSnapshotTransaction {
         _ metadata: [String: Any],
         eligibility: Eligibility?
     ) throws {
-        guard let finalized = metadata["finalized"] as? Bool, finalized else {
+        // V1R5 §9.1: strict JSON Bool — a numeric 0/1 must never pass
+        // as `finalized` (review B-08).
+        guard StrictJSONScalar.boolean(metadata["finalized"]) == true else {
             throw SessionError.notFinalized
         }
         let scanMode = metadata["scanMode"] as? String ?? ""
@@ -350,8 +468,9 @@ enum SessionSnapshotTransaction {
         if writeFailures > 0 {
             throw SessionError.notEligible("required write failures = \(writeFailures)")
         }
-        // A live checkpoint means the scan never finalized cleanly.
-        if let checkpoint = metadata["liveCheckpoint"] as? Bool, checkpoint {
+        // A live checkpoint means the scan never finalized cleanly
+        // (strict Bool, V1R5 §9.1).
+        if StrictJSONScalar.boolean(metadata["liveCheckpoint"]) == true {
             throw SessionError.notEligible("live checkpoint present")
         }
         guard let eligibility = eligibility else { return }
@@ -423,10 +542,16 @@ enum SessionSnapshotTransaction {
         guard fstat(sourceFD, &preStat) == 0 else {
             throw SessionError.copyFailed("cannot fstat source \(source.lastPathComponent)")
         }
-        // Regular file policy; hard links (nlink > 1) are allowed but the
-        // post-copy identity check still guards against swaps.
+        // Regular file policy (V1R5 §9.2): symlinks are already blocked
+        // by O_NOFOLLOW; hard links (nlink > 1) are now REJECTED too —
+        // an external writer can mutate the shared inode and change the
+        // snapshot's file identity after the copy.
         guard (preStat.st_mode & S_IFMT) == S_IFREG else {
             throw SessionError.copyFailed("source is not a regular file: \(source.lastPathComponent)")
+        }
+        guard preStat.st_nlink <= 1 else {
+            throw SessionError.copyFailed(
+                "source has \(preStat.st_nlink) hard links: \(source.lastPathComponent)")
         }
 
         let destFD = open(
@@ -474,14 +599,20 @@ enum SessionSnapshotTransaction {
             throw copyError
         }
 
-        // Post-copy: the source identity must be unchanged.
+        // Post-copy: the source identity must be unchanged (V1R5 §9.2
+        // full identity: dev/ino/size/nlink/mtime_ns/ctime_ns).
         var postStat = stat()
         guard fstat(sourceFD, &postStat) == 0 else {
             throw SessionError.copyFailed("cannot re-fstat source \(source.lastPathComponent)")
         }
-        guard postStat.st_ino == preStat.st_ino,
+        guard postStat.st_dev == preStat.st_dev,
+              postStat.st_ino == preStat.st_ino,
+              postStat.st_nlink == preStat.st_nlink,
               postStat.st_size == preStat.st_size,
-              postStat.st_mtimespec.tv_sec == preStat.st_mtimespec.tv_sec
+              postStat.st_mtimespec.tv_sec == preStat.st_mtimespec.tv_sec,
+              postStat.st_mtimespec.tv_nsec == preStat.st_mtimespec.tv_nsec,
+              postStat.st_ctimespec.tv_sec == preStat.st_ctimespec.tv_sec,
+              postStat.st_ctimespec.tv_nsec == preStat.st_ctimespec.tv_nsec
         else {
             try? FileManager.default.removeItem(at: destination)
             throw SessionError.copyFailed("source mutated during copy: \(source.lastPathComponent)")

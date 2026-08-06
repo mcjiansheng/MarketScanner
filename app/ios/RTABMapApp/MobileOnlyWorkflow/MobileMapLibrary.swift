@@ -192,6 +192,16 @@ enum MobileMapLibrary {
             throw LibraryError.unsafeIdentifier(packageSHA256)
         }
 
+        // V1R5 §13.4 (review H-08): the registered package URL must be
+        // EXACTLY `packages/<priorMapID>/<packageSHA256>` — a package
+        // stored anywhere else (even inside the root) would make the
+        // registry point at a directory the identity does not imply.
+        guard packageURL.lastPathComponent == packageSHA256,
+              packageURL.deletingLastPathComponent().lastPathComponent
+                == priorMapID else {
+            throw LibraryError.packageNotContained(packageURL.path)
+        }
+
         // §14.2: register re-verifies the package manifest and digest;
         // a corrupt package must never enter the library.
         _ = try verifyPackage(
@@ -376,14 +386,14 @@ enum MobileMapLibrary {
         let generation = StrictJSONScalar.integer(object["generation"]) ?? 0
         let packagesRoot = try packagesRoot()
         var result: [MapEntry] = []
-        for raw in entries {
+        for (index, raw) in entries.enumerated() {
             guard let priorMapID = raw["prior_map_id"] as? String,
                   isSafeIdentifier(priorMapID),
                   let packageSHA256 = raw["package_sha256"] as? String,
                   isSHA256(packageSHA256),
                   let packageDirName = raw["package_directory"] as? String,
                   // §14.2: the stored path must be exactly `<id>/<sha>`;
-                  // anything else (escape, mismatch) is dropped.
+                  // anything else (escape, mismatch) corrupts the index.
                   packageDirName == "\(priorMapID)/\(packageSHA256)",
                   let name = raw["name"] as? String,
                   let floorCount = StrictJSONScalar.integer(raw["floor_count"]),
@@ -391,7 +401,13 @@ enum MobileMapLibrary {
                   let compiledAtUTC = raw["compiled_at_utc"] as? Double,
                   let compilerVersion = raw["compiler_version"] as? String,
                   let canonicalSHA = raw["canonical_source_sha256"] as? String
-            else { continue }
+            else {
+                // V1R5 §13.4 (review H-10): a persistent identity index
+                // never drops entries silently — one corrupt entry marks
+                // the whole registry corrupt and asks for a rebuild.
+                throw LibraryError.registryCorrupt(
+                    "\(url.path): entry \(index) invalid")
+            }
             // Rebuild the URL from the validated identity instead of
             // trusting the stored relative path.
             result.append(MapEntry(
@@ -582,6 +598,28 @@ enum MobileMapLibrary {
         let urlPath = url.resolvingSymlinksInPath().standardizedFileURL.path
         guard urlPath.hasPrefix(rootPath + "/") else {
             throw LibraryError.packageNotContained(url.path)
+        }
+        // V1R5 §13.4 (review H-09): the V1R4 check walked the RESOLVED
+        // path, so an original symlink component had already vanished and
+        // could never be detected. Walk the ORIGINAL path components with
+        // `attributesOfItem` (lstat semantics — a symlink reports
+        // `.typeSymbolicLink`, never the target's directory type) and
+        // reject ANY symlink component before the containment check.
+        var rawProbe = URL(fileURLWithPath: root.resolvingSymlinksInPath()
+            .standardizedFileURL.path)
+        for component in url.standardizedFileURL.path
+            .dropFirst(rootPath.count + 1).split(separator: "/") {
+            rawProbe.appendPathComponent(String(component))
+            let attributes = try? FileManager.default
+                .attributesOfItem(atPath: rawProbe.path)
+            guard let type = attributes?[.type] as? FileAttributeType else {
+                throw LibraryError.packageNotContained(url.path)
+            }
+            guard type == .typeDirectory else {
+                // A symlink (or non-directory) component anywhere on the
+                // path is an escape/swap vector: reject fail-closed.
+                throw LibraryError.packageNotContained(url.path)
+            }
         }
         var probe = URL(fileURLWithPath: rootPath)
         for component in urlPath.dropFirst(rootPath.count + 1).split(separator: "/") {

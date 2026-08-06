@@ -146,7 +146,17 @@ enum MobilePriorMapCompiler {
             }
 
             try writeJSON(["format": "MarketScannerPriorMapElements", "version": 1, "elements": elements.map { $0.canonicalPayload }], to: staging, name: "elements.json")
-            try writeJSON(["format": "MarketScannerPriorMapShelves", "version": 1, "shelves": shelves.map { $0.canonicalPayload }], to: staging, name: "shelves.json")
+            // V1R5 §12.2 (review B-14): the compiler emits EXPLICIT shelf
+            // side semantics (front/back normals, longitudinal axis,
+            // orientation provenance) so consumers never guess the
+            // business side from geometry PCA. Version 2 keeps the legacy
+            // `shelves` array for backward-compatible readers.
+            try writeJSON([
+                "format": "MarketScannerPriorMapShelves",
+                "version": 2,
+                "shelves": shelves.map { $0.canonicalPayload },
+                "shelf_segments": compiledShelfSegments(shelves),
+            ], to: staging, name: "shelves.json")
             try writeJSON(["format": "MarketScannerPriorMapStructures", "version": 1, "structures": fixed.map { $0.canonicalPayload }], to: staging, name: "fixed_structures.json")
             try writeJSON(manifest, to: staging, name: "manifest.json")
             try writeJSON(graph, to: staging, name: "road_graph.json")
@@ -207,6 +217,43 @@ enum MobilePriorMapCompiler {
     private static func writeJSON(_ payload: [String: Any], to directory: URL, name: String) throws {
         let data = try CanonicalJSONEncoder.encode(payload)
         try data.write(to: directory.appendingPathComponent(name))
+    }
+
+    /// V1R5 §12.2 (review B-14): explicit business side semantics per
+    /// shelf segment. The longitudinal axis and the front/back normals
+    /// come from the ELEMENT's business yaw (`yaw_rad`) when present —
+    /// never from a consumer-side geometry guess. `orientation_provenance`
+    /// records where the semantics came from so a consumer can decide
+    /// SIDE_UNAVAILABLE when no business orientation exists.
+    static func compiledShelfSegments(
+        _ shelves: [PriorMapSourceElement]
+    ) -> [[String: Any]] {
+        var segments: [[String: Any]] = []
+        for element in shelves {
+            var segment: [String: Any] = [
+                "shelf_segment_id": element.id,
+                "shelf_code": element.code,
+                "floor_id": element.floorId,
+                "side_semantics_version": 1,
+            ]
+            if let yaw = element.yawRad, yaw.isFinite {
+                // Axis = (cos yaw, sin yaw); the front normal is the axis
+                // rotated clockwise 90° (identical to the consumer's
+                // makeSegment convention, but now authoritative).
+                let axisX = cos(yaw)
+                let axisY = sin(yaw)
+                segment["longitudinal_axis"] = [axisX, axisY]
+                segment["front_normal"] = [axisY, -axisX]
+                segment["back_normal"] = [-axisY, axisX]
+                segment["orientation_provenance"] = "element_yaw"
+            } else {
+                // No business orientation in the source: the consumer
+                // must treat the side as UNAVAILABLE (never PCA-guess).
+                segment["orientation_provenance"] = "unavailable"
+            }
+            segments.append(segment)
+        }
+        return segments
     }
 
     private static func boundsFromDictionary(_ value: [String: Double]) -> SourceGeometry.Bounds? {

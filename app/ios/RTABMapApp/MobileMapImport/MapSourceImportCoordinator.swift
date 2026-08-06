@@ -31,6 +31,13 @@ enum MapSourceImportCoordinator {
         let sourceFileSha256 = CanonicalSourceHasher.sha256(data)
         let format = try detectFormat(filename: originalFilename, data: data)
 
+        // V1R5 §13.5 (review H-13): the store ID is business identity —
+        // a defaulted "default" can collide across stores and sessions.
+        // XLSX/CSV imports REQUIRE an explicit, user-confirmed store ID;
+        // canonical JSON carries its own identity and overrides below.
+        guard format == "json" || (storeId.map({ !$0.isEmpty }) ?? false) else {
+            throw MapSourceImportError.storeIDRequired
+        }
         let resolvedStoreId = storeId ?? "default"
         let resolvedMapName = mapName
             ?? (originalFilename as NSString).deletingPathExtension
