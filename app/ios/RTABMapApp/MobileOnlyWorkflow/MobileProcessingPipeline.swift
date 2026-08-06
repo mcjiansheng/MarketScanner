@@ -760,9 +760,14 @@ enum MobileProcessingPipeline {
                       let utc = object["utc_unix_seconds"] as? Double,
                       utc.isFinite
                 else { continue }
-                // Monotonic axis is the node-stamp axis; the correlation
-                // records it directly when available.
-                let monotonic = (object["monotonic_seconds"] as? Double) ?? (utc - sessionStartStamp)
+                // The trajectory's monotonic axis is the node-stamp axis:
+                // node stamps are UTC epoch seconds, so a clock record's
+                // session-relative monotonic value is utc - sessionStart.
+                // The recorder's raw monotonic_seconds is device uptime
+                // (a DIFFERENT axis) and must never be mixed in, or the
+                // resampled positions all fall off the node axis and
+                // degrade to UNAVAILABLE (V1R3 review fix).
+                let monotonic = utc - sessionStartStamp
                 guard monotonic.isFinite else { continue }
                 records.append(ClockCorrelationRecord.make(
                     trackingSessionID: object["tracking_session_id"] as? String ?? "",

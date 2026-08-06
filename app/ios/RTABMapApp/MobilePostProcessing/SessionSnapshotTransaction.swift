@@ -294,7 +294,9 @@ enum SessionSnapshotTransaction {
         let values = try url.resourceValues(
             forKeys: [.volumeAvailableCapacityForImportantUsageKey])
         guard let available = values.volumeAvailableCapacityForImportantUsage else {
-            return // Cannot determine: fail open is NOT allowed below.
+            // Cannot determine capacity: fail closed (§8.6 never allows a
+            // silent fail-open that could exhaust the device disk).
+            throw SessionError.insufficientDisk("cannot determine available capacity")
         }
         let required = neededBytes + safetyReserveBytes
         if available < required {
@@ -403,7 +405,14 @@ enum SessionSnapshotTransaction {
 
     private static func validateSnapshotDatabase(_ url: URL) throws {
         var db: OpaquePointer?
-        let uri = "file:\(url.path)?mode=ro&immutable=1"
+        // Percent-encode the path so '%', '#', '?' in file names cannot
+        // inject URI parameters/fragments (mirrors the C++ core's
+        // uriEncodePath hardening).
+        var allowed = CharacterSet.alphanumerics
+        allowed.insert(charactersIn: "-._~/")
+        let encodedPath = url.path.addingPercentEncoding(withAllowedCharacters: allowed)
+            ?? url.path
+        let uri = "file:\(encodedPath)?mode=ro&immutable=1"
         guard sqlite3_open_v2(uri, &db, SQLITE_OPEN_READONLY | SQLITE_OPEN_URI, nil) == SQLITE_OK,
               let database = db
         else {

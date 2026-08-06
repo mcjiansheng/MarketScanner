@@ -6799,6 +6799,28 @@ do {
     }
     try constraints.data(using: .utf8)!.write(
         to: session.appendingPathComponent("localization_constraints.jsonl"))
+    // Clock correlation sidecar (§7.1): recorder-style records written on
+    // the DEVICE-UPTIME monotonic axis. The pipeline must align them to
+    // the node-stamp (UTC) axis; a regression that mixes the uptime axis
+    // in would degrade every resampled position to UNAVAILABLE (V1R3
+    // review regression test).
+    var clock = ""
+    for index in 0..<6 {
+        let record: [String: Any] = [
+            "format": "MarketScannerClockCorrelation",
+            "version": 1,
+            "tracking_session_id": "E2E-SESSION",
+            "monotonic_seconds": 50000.0 + Double(index) * 30.0,
+            "utc_unix_seconds": now + Double(index) * 8.0,
+            "timezone_id": "UTC",
+            "utc_offset_seconds": 0,
+            "reason": index == 0 ? "session_start" : "periodic",
+        ]
+        let recordData = try CanonicalJSONEncoder.encode(record)
+        clock += String(data: recordData, encoding: .utf8)! + "\n"
+    }
+    try clock.data(using: .utf8)!.write(
+        to: session.appendingPathComponent("clock_correlations.jsonl"))
     try Data("[]".utf8).write(
         to: session.appendingPathComponent("localized_price_tags.json"))
     // Minimal REAL SQLite source DB: the V1R3 snapshot validates the DB
@@ -6919,6 +6941,12 @@ do {
     require(
         outcome.devicePositionCount > 0,
         "E2E must emit device positions, got \(outcome.devicePositionCount)")
+    // With the clock sidecar present the resampled positions must still
+    // be AVAILABLE (guards the monotonic/uptime axis regression).
+    require(
+        outcome.availablePositionCount > 0,
+        "E2E must emit AVAILABLE positions even with a clock sidecar, "
+        + "got \(outcome.availablePositionCount)/\(outcome.devicePositionCount)")
     require(
         !outcome.resultEntry.workbookSHA256.isEmpty,
         "E2E workbook SHA must be recorded externally")

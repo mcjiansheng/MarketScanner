@@ -2223,9 +2223,16 @@ ReconstructedTrajectory reconstructTrajectory(
         {
             row.pose = se2Compose(correction, raw.pose);
             // Uncertainty: residual scale grows with distance from the
-            // nearest anchor (§15.3 heuristic, documented).
+            // nearest anchor (§15.3 heuristic, documented). Nodes and
+            // anchors are both in topology order, so the geometrically
+            // nearest anchor lies within a small index window around the
+            // correction anchor `a`; search only that window to keep the
+            // reconstruction O(N) instead of O(N*S) on full graphs.
             double anchorDist = std::numeric_limits<double>::infinity();
-            for(size_t s = 0; s < anchors.size(); ++s)
+            const size_t kWindow = 2;
+            const size_t lo = a > kWindow ? a - kWindow : 0;
+            const size_t hi = std::min(anchors.size() - 1, a + kWindow);
+            for(size_t s = lo; s <= hi; ++s)
             {
                 const RawNode & an = model.nodes[anchors[s].first];
                 anchorDist = std::min(anchorDist,
