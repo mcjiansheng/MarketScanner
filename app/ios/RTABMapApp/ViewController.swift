@@ -255,6 +255,12 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
             execute: dismissWorkItem)
     }
 
+    /// Explicit overload for callers that do not need a custom duration
+    /// (V1R2 Gate 0 §4.3). The default 2 s matches the feedback toasts.
+    func showToast(_ message: String, seconds: Double = 2.0) {
+        showToast(message: message, seconds: seconds)
+    }
+
     private func showLoopClosureFeedback(
         reliable: Bool,
         loopClosureType: Int,
@@ -424,15 +430,32 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
 
     private func setupMobileOnlyWorkflow() {
         let coordinator = MobileOnlyWorkflowCoordinator.shared
+        // Wire the shared native factor-graph core into the processing
+        // gateway (V1R2 Gate G): production Fast/Deep runs never use the
+        // Swift reference solver.
+        MobileNativeFactorGraph.wireIntoGateway()
         coordinator.appGitSHA = "unknown" // bound by the CI build step
         coordinator.appVersion =
             Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.22.0"
         coordinator.deviceModel = UIDevice.current.model
         coordinator.osVersion = UIDevice.current.systemVersion
-        // Scan start: persist the committed configuration; the real ARKit
-        // scan start consumes it (Gate D wiring).
+        // Scan start (V1R2 Gate D §8.3): the host performs the REAL
+        // production steps — package load, SHA verification, PriorMap
+        // configuration with the committed initial map pose, then the
+        // ARSession + RTAB-Map recording + session metadata via newScan.
         coordinator.onStartScan = { [weak self] configuration in
-            self?.persistScanConfiguration(configuration)
+            guard let self = self else { return }
+            do {
+                try self.startMobileOnlyScan(configuration)
+                self.persistScanConfiguration(configuration)
+            }
+            catch {
+                self.showToast(
+                    message: String(
+                        format: self.localized("Could not start the store scan: %@"),
+                        error.localizedDescription),
+                    seconds: 6)
+            }
         }
     }
 
@@ -5366,5 +5389,54 @@ extension SKStoreReviewController {
         if let scene = UIApplication.shared.connectedScenes.first(where: { $0.activationState == .foregroundActive }) as? UIWindowScene {
             requestReview(in: scene)
         }
+    }
+}
+
+/// V1R2 Gate D §8.3: real MarketScanner scan start.
+///
+/// The implementation must not stop at persisting the configuration. It
+/// loads the phone-compiled package from the durable library, verifies
+/// the package integrity SHA against the registered identity, builds the
+/// `.priorMapLocalized` scan configuration with the committed initial
+/// map pose, and starts the real ARKit/RTAB-Map scan (`newScan`) which
+/// drives the ARSession, the RTAB-Map recording and the session metadata.
+extension ViewController: MobileOnlyScanStarting {
+
+    func startMobileOnlyScan(_ configuration: MobileScanConfiguration) throws {
+        // 1. Production package load from the durable on-device library
+        //    (containment + registration verified by the library).
+        let entry = try MobileMapLibrary.map(
+            priorMapID: configuration.priorMap.priorMapID,
+            packageSHA256: configuration.priorMap.packageSHA256)
+
+        // 2. Integrity SHA verification before any scan state changes.
+        let verifiedSHA = try PriorMapPackageIntegrity.validate(
+            directory: entry.packageDirectory)
+        guard verifiedSHA == entry.packageSHA256 else {
+            throw MobileOnlyWorkflowError.invalidState(
+                "package integrity SHA mismatch: \(verifiedSHA) != \(entry.packageSHA256)")
+        }
+
+        // 3. PriorMap scan configuration with the committed initial pose.
+        let scanConfiguration = PriorMapScanConfiguration(
+            formatVersion: 1,
+            workflowMode: .priorMapLocalized,
+            packageDirectory: entry.packageDirectory,
+            priorMapId: entry.priorMapID,
+            priorMapSha256: entry.packageSHA256,
+            floorId: configuration.floorID,
+            initialMapPose: PriorMapPose2D(
+                xM: configuration.startXM,
+                yM: configuration.startYM,
+                yawRad: configuration.startYawRad))
+        guard scanConfiguration.isReadyToStart else {
+            throw MobileOnlyWorkflowError.invalidState(
+                "prior-map scan configuration incomplete")
+        }
+
+        // 4. Real scan start: ARSession + RTAB-Map recording + session
+        //    metadata (newScan -> preparePriorMapLocalization ->
+        //    supermarketSession.configureScan).
+        newScan(dataRecordingMode: false, configuration: scanConfiguration)
     }
 }

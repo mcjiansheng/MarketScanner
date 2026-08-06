@@ -99,6 +99,7 @@ enum MobilePriorMapCompiler {
                 "version": 1,
                 "prior_map_id": priorMapID,
                 "name": canonicalSource.mapName,
+                "store_id": canonicalSource.storeId,
                 "source_file": canonicalSource.source.originalFilename,
                 "source_sha256": canonicalSource.source.sourceFileSha256,
                 "canonical_source_sha256": canonicalSource.source.canonicalSourceSha256,
