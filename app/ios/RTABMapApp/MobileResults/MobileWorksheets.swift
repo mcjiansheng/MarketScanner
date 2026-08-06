@@ -30,12 +30,16 @@ enum MobileWorksheets {
         "tracking_session_id", "local_start", "local_end", "utc_start",
         "utc_end", "timezone_ids", "duration_seconds",
         "rtabmap_node_count", "factor_count", "loop_closure_count",
+        "recovery_count", "prior_count",
         "processing_path", "processing_duration_seconds",
         "peak_memory_mb", "thermal_interruptions",
+        "cancel_latency_seconds",
         "graph_quality_status", "accepted_tag_count",
         "rescan_tag_count", "device_position_row_count",
         "available_position_count", "unavailable_position_count",
-        "result_id", "result_manifest_sha256", "workbook_sha256",
+        "result_id", "graph_input_sha256", "factor_set_sha256",
+        "native_core_sha256", "policy_sha",
+        "result_manifest_sha256", "workbook_sha256",
     ]
 
     static let rescanRequiredHeaders = [

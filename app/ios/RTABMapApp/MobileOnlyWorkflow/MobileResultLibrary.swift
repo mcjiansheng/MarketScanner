@@ -53,6 +53,21 @@ enum MobileResultLibrary {
 
     static let manifestFileName = "result_manifest.json"
 
+    /// V1R4 §16.3: the exact set of top-level manifest fields the reader
+    /// accepts. Unknown fields (including unversioned extensions) are
+    /// rejected on read AND on write — a new field must be added to this
+    /// whitelist in the same change that writes it.
+    static let allowedManifestKeys: Set<String> = [
+        "format", "version", "result_id", "task_id", "created_at_utc",
+        "workbook", "workbook_sha256", "workbook_bytes",
+        "package_files", "artifacts",
+        "store_id", "prior_map_id", "prior_map_sha256",
+        "tracking_session_id", "source_database", "input_bundle_sha256",
+        "native_core_sha256", "processing_path",
+        "policy_sha", "projection_policy_version",
+        "trajectory_sha256", "graph_quality_sha256",
+    ]
+
     /// Test/embedding hook; see `MobileMapLibrary.rootOverride`.
     static var rootOverride: URL?
 
@@ -91,6 +106,24 @@ enum MobileResultLibrary {
         try FileManager.default.createDirectory(
             at: directory, withIntermediateDirectories: true)
         return directory
+    }
+
+    /// V1R4 §16.4/§15: removes every UNCOMMITTED staging directory of a
+    /// task (crash leftovers). Committed results live outside `staging/`
+    /// and are never touched.
+    static func cleanupStaging(taskID: String) {
+        let fileManager = FileManager.default
+        guard let root = try? root() else { return }
+        let stagingRoot = root
+            .appendingPathComponent("staging", isDirectory: true)
+            .appendingPathComponent(taskID, isDirectory: true)
+        guard let names = try? fileManager.contentsOfDirectory(atPath: stagingRoot.path) else {
+            return
+        }
+        for name in names {
+            try? fileManager.removeItem(
+                at: stagingRoot.appendingPathComponent(name))
+        }
     }
 
     /// Atomically commits a fully staged result package (§20.4):
@@ -146,6 +179,11 @@ enum MobileResultLibrary {
             "artifacts": artifacts,
         ]
         for (key, value) in manifestExtras {
+            // V1R4 §16.3: unknown fields are rejected on write too, so
+            // the whitelist can never drift from what is emitted.
+            guard allowedManifestKeys.contains(key) else {
+                throw ResultError.invalidManifest("unknown manifest extra: \(key)")
+            }
             manifest[key] = value
         }
         let manifestData = try CanonicalJSONEncoder.encode(manifest)
@@ -212,37 +250,93 @@ enum MobileResultLibrary {
         guard let manifest = try? StrictJSONDocumentParser.object(
             from: data,
             limits: StrictJSONDocumentLimits(maximumBytes: data.count + 1)) as? [String: Any],
+              let format = manifest["format"] as? String,
+              format == "MarketScannerResultManifest",
+              let version = StrictJSONScalar.integer(manifest["version"]),
+              version == 2,
               let resultID = manifest["result_id"] as? String,
               let taskID = manifest["task_id"] as? String,
               let createdAt = manifest["created_at_utc"] as? Double,
               let workbookName = manifest["workbook"] as? String,
-              let workbookSHA = manifest["workbook_sha256"] as? String
+              let workbookSHA = manifest["workbook_sha256"] as? String,
+              let workbookBytes = StrictJSONScalar.integer(manifest["workbook_bytes"]),
+              let packageFiles = manifest["package_files"] as? [String],
+              let artifacts = manifest["artifacts"] as? [[String: Any]]
         else {
             throw ResultError.invalidManifest(manifestURL.path)
+        }
+        // V1R4 §16.3: unknown top-level fields are rejected — versioned
+        // extensions must be whitelisted in the same change that writes
+        // them.
+        for key in manifest.keys where !allowedManifestKeys.contains(key) {
+            throw ResultError.invalidManifest("unknown manifest field: \(key)")
+        }
+        // Exact artifact contract: unique safe basenames, exact count and
+        // an artifact file set that equals package_files exactly.
+        guard !packageFiles.isEmpty else {
+            throw ResultError.invalidManifest("package_files is empty")
+        }
+        guard Set(packageFiles).count == packageFiles.count else {
+            throw ResultError.invalidManifest("package_files contains duplicates")
+        }
+        for name in packageFiles where !isSafeBasename(name) {
+            throw ResultError.invalidManifest("unsafe package file name: \(name)")
+        }
+        guard artifacts.count == packageFiles.count + 1 else {
+            throw ResultError.invalidManifest(
+                "artifact count \(artifacts.count) != package_files \(packageFiles.count) + workbook")
+        }
+        var artifactFiles = Set<String>()
+        for artifact in artifacts {
+            guard let name = artifact["file"] as? String,
+                  let sha = artifact["sha256"] as? String,
+                  let bytes = StrictJSONScalar.integer(artifact["bytes"]),
+                  StrictJSONScalar.boolean(artifact["required"]) == true,
+                  artifactFiles.insert(name).inserted
+            else {
+                throw ResultError.invalidManifest("invalid artifact record")
+            }
+            _ = (sha, bytes)
+        }
+        guard artifactFiles == Set(packageFiles).union([workbookName]) else {
+            throw ResultError.invalidManifest("artifact file set != package_files + workbook")
         }
         let workbookURL = directory.appendingPathComponent(workbookName)
         guard FileManager.default.fileExists(atPath: workbookURL.path) else {
             throw ResultError.workbookMissing(workbookURL.path)
         }
-        // Re-verify the workbook hash; a corrupted result is isolated.
+        // Exact workbook bytes + hash; a corrupted result is isolated.
+        let actualWorkbookBytes = fileBytes(workbookURL)
+        guard actualWorkbookBytes == Int64(workbookBytes) else {
+            throw ResultError.artifactCorrupt(
+                "workbook bytes mismatch: \(actualWorkbookBytes) != \(workbookBytes)")
+        }
         let actualSHA = try CanonicalSourceHasher.sha256File(workbookURL)
         guard actualSHA == workbookSHA else {
             throw ResultError.artifactCorrupt(
                 "workbook sha mismatch: \(actualSHA.prefix(12)) != \(workbookSHA.prefix(12))")
         }
-        // Re-verify the per-file artifact hashes when present (v2).
-        if let artifacts = manifest["artifacts"] as? [[String: Any]] {
-            for artifact in artifacts {
-                guard let name = artifact["file"] as? String,
-                      let sha = artifact["sha256"] as? String else { continue }
-                let url = directory.appendingPathComponent(name)
-                guard FileManager.default.fileExists(atPath: url.path) else {
-                    throw ResultError.artifactMissing(name)
-                }
-                let actual = try CanonicalSourceHasher.sha256File(url)
-                guard actual == sha else {
-                    throw ResultError.artifactCorrupt(name)
-                }
+        // Re-verify every per-file artifact: exact bytes + exact SHA
+        // (V1R4 §16.3 — reads re-validate everything).
+        for artifact in artifacts {
+            guard let name = artifact["file"] as? String,
+                  let sha = artifact["sha256"] as? String,
+                  let bytes = StrictJSONScalar.integer(artifact["bytes"])
+            else {
+                throw ResultError.invalidManifest("invalid artifact record")
+            }
+            let url = directory.appendingPathComponent(name)
+            guard FileManager.default.fileExists(atPath: url.path) else {
+                throw ResultError.artifactMissing(name)
+            }
+            let actualBytes = fileBytes(url)
+            guard actualBytes == Int64(bytes) else {
+                throw ResultError.artifactCorrupt(
+                    "\(name) bytes mismatch: \(actualBytes) != \(bytes)")
+            }
+            let actual = try CanonicalSourceHasher.sha256File(url)
+            guard actual == sha else {
+                throw ResultError.artifactCorrupt(name)
             }
         }
         return ResultEntry(
@@ -253,6 +347,20 @@ enum MobileResultLibrary {
             workbookSHA256: workbookSHA,
             directory: directory,
             manifest: manifest)
+    }
+
+    /// File size in bytes, or -1 when the file cannot be read.
+    private static func fileBytes(_ url: URL) -> Int64 {
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
+              let size = attributes[.size] as? NSNumber else { return -1 }
+        return size.int64Value
+    }
+
+    /// A package file name must be a safe basename: non-empty, never a
+    /// path separator, never an absolute or parent traversal.
+    private static func isSafeBasename(_ name: String) -> Bool {
+        guard !name.isEmpty, name != ".", name != ".." else { return false }
+        return !name.contains("/") && !name.contains("\\")
     }
 
     private static func syncFile(_ url: URL) {

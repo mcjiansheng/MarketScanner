@@ -220,7 +220,12 @@ class IOSLocalizationSidecarHealthContractTests(unittest.TestCase):
             "localizationEvidenceComplete",
         ):
             self.assertIn(token, session)
-        self.assertIn("status: metadataFinalized ? \"eligible\" : \"invalid\"", view)
+        # V1R4 §7.2/§13.1: the finalization gate is driven by the
+        # processing blockers (clock sidecar, prior-map evidence,
+        # tag burst flush) and maps to eligible/invalid eligibility.
+        self.assertIn("let metadataFinalized = processingBlockers.isEmpty", view)
+        self.assertIn("status: \"eligible\", blockers: []", view)
+        self.assertIn("status: \"invalid\", blockers: processingBlockers", view)
         self.assertIn("formatVersion: 2", view)
         self.assertIn("eligibilityError: processingEligibilityError", view)
         self.assertIn("showEvidenceWriteFailure", overlay)

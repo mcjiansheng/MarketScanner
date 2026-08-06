@@ -30,6 +30,7 @@ struct Options
     std::string database;
     std::string mode = "fast";
     std::string priorsJson;
+    std::string rowsOut;
     std::vector<int64_t> tagNodes;
     int64_t maxNodes = 0;
     double maxWallSeconds = 0.0;
@@ -65,6 +66,7 @@ Options parseOptions(int argc, char ** argv)
         else if(arg == "--db" && i + 1 < argc) options.database = argv[++i];
         else if(arg == "--mode" && i + 1 < argc) options.mode = argv[++i];
         else if(arg == "--priors" && i + 1 < argc) options.priorsJson = argv[++i];
+        else if(arg == "--rows-out" && i + 1 < argc) options.rowsOut = argv[++i];
         else if(arg == "--tag-node" && i + 1 < argc) options.tagNodes.push_back(std::atoll(argv[++i]));
         else if(arg == "--max-nodes" && i + 1 < argc) options.maxNodes = std::atoll(argv[++i]);
         else if(arg == "--max-wall-seconds" && i + 1 < argc) options.maxWallSeconds = std::atof(argv[++i]);
@@ -223,6 +225,21 @@ int main(int argc, char ** argv)
     if(outcome.quality_json)
     {
         std::cout << outcome.quality_json << std::endl;
+    }
+    if(!options.rowsOut.empty())
+    {
+        // Golden assertions (§6.6) need the reconstructed map-frame rows.
+        std::ofstream out(options.rowsOut.c_str());
+        out.precision(12);
+        for(int64_t i = 0; i < outcome.count; ++i)
+        {
+            const MSTrajectoryRowC & r = outcome.rows[i];
+            out << "{\"id\": " << r.id
+                << ", \"x\": " << r.x << ", \"y\": " << r.y
+                << ", \"yaw\": " << r.yaw
+                << ", \"publish\": " << (int)r.publish_eligible
+                << ", \"component\": " << r.component_id << "}\n";
+        }
     }
     std::fprintf(stderr, "[summary] trajectory_rows=%lld skeleton_nodes=%lld disposition=%d\n",
                  (long long)outcome.count, (long long)outcome.skeleton_count, outcome.disposition);

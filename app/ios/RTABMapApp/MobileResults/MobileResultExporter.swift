@@ -32,11 +32,12 @@ enum MobileResultExporter {
     }
 
     static func priceTagsSheet(_ input: Input) -> XLSXWorkbookWriter.SheetSpec {
+        // V1R4 §16.2: rows are produced lazily one at a time; the tags
+        // array is never mapped into a full `[[CellValue]]`.
         return XLSXWorkbookWriter.SheetSpec(
             name: "PriceTags",
-            headers: MobileWorksheets.priceTagsHeaders
-        ) {
-            input.priceTags.map { tag in
+            headers: MobileWorksheets.priceTagsHeaders,
+            rows: XLSXWorkbookWriter.XLSXRowMapSequence(source: input.priceTags) { tag in
                 [
                     .text(tag.tagInstanceID),
                     .text(tag.barcode),
@@ -60,15 +61,15 @@ enum MobileResultExporter {
                     .text(tag.reason),
                 ]
             }
-        }
+        )
     }
 
     static func devicePositionsSheet(_ input: Input) -> XLSXWorkbookWriter.SheetSpec {
+        // V1R4 §16.2: 100k+ rows stream row-by-row; never materialised.
         return XLSXWorkbookWriter.SheetSpec(
             name: "DevicePositions",
-            headers: MobileWorksheets.devicePositionsHeaders
-        ) {
-            input.devicePositions.map { row in
+            headers: MobileWorksheets.devicePositionsHeaders,
+            rows: XLSXWorkbookWriter.XLSXRowMapSequence(source: input.devicePositions) { row in
                 [
                     .integer(Int64(row.sequence)),
                     .text(row.localTimestamp),
@@ -97,7 +98,7 @@ enum MobileResultExporter {
                     .text(row.appGitSHA),
                 ]
             }
-        }
+        )
     }
 
     static func runSummarySheet(_ input: Input) -> XLSXWorkbookWriter.SheetSpec {
@@ -115,11 +116,11 @@ enum MobileResultExporter {
     }
 
     static func rescanSheet(_ input: Input) -> XLSXWorkbookWriter.SheetSpec {
+        // V1R4 §16.2: rescan tasks stream lazily, never materialised.
         return XLSXWorkbookWriter.SheetSpec(
             name: "RescanRequired",
-            headers: MobileWorksheets.rescanRequiredHeaders
-        ) {
-            input.rescanTasks.map { task in
+            headers: MobileWorksheets.rescanRequiredHeaders,
+            rows: XLSXWorkbookWriter.XLSXRowMapSequence(source: input.rescanTasks) { task in
                 [
                     .text(task.taskID),
                     .text(task.taskType.rawValue),
@@ -137,7 +138,7 @@ enum MobileResultExporter {
                     .integer(Int64(task.priority)),
                 ]
             }
-        }
+        )
     }
 
     private static func numberOrEmpty(_ value: Double?) -> XLSXWorkbookWriter.CellValue {

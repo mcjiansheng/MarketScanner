@@ -103,7 +103,9 @@ enum MobileOnlyWorkflowState: String, Codable, Equatable, CaseIterable {
         case .finalizingScan: return "结束扫描"
         case .snapshotting: return "生成会话快照"
         case .fastProcessing: return "快速处理"
-        case .deepProcessing: return "深度处理"
+        // V1R4 §17 Gate N freeze: V1 has no true sensor Deep on device;
+        // the deep stage is a controlled full-graph recovery only.
+        case .deepProcessing: return "全图优化"
         case .buildingTrajectory: return "构建轨迹"
         case .resolvingTags: return "解析价签"
         case .exporting: return "导出结果"

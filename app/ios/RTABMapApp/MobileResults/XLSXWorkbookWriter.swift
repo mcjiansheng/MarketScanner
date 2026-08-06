@@ -33,6 +33,20 @@ enum XLSXWorkbookWriter {
         }
     }
 
+    /// Lazy adapter over an indexable collection: rows are produced one
+    /// at a time and the source is never copied into a `[[CellValue]]`
+    /// array (V1R4 §16.2 — large sheets must not `.map`).
+    struct XLSXRowMapSequence<Source: Sequence>: XLSXRowSequence {
+        let source: Source
+        let transform: (Source.Element) throws -> [CellValue]
+
+        func forEachRow(_ body: ([CellValue]) throws -> Void) throws {
+            for element in source {
+                try body(try transform(element))
+            }
+        }
+    }
+
     enum CellValue {
         case text(String)
         case number(Double)
@@ -75,6 +89,9 @@ enum XLSXWorkbookWriter {
         case invalidCellValue(String)
         case nonFiniteNumber
         case reopenValidationFailed(String)
+        case outputStalled
+        case fsyncFailed(String)
+        case entryTooLarge(String)
     }
 
     // MARK: - Entry point
@@ -101,24 +118,21 @@ enum XLSXWorkbookWriter {
         try writePackage(sheets: sheets, coreProperties: coreProperties, to: staging)
         try syncFile(staging)
 
-        // Reopen validation with the production reader: CRC + required
-        // parts + parse (V1R1 §14.8). This validates our own output, so
-        // the limits are raised beyond the frozen *import* policy (a 100k
-        // DevicePositions sheet exceeds the 64 MiB import entry cap).
+        // Reopen validation with the production streaming verifier:
+        // central directory + required parts + per-sheet header/row/
+        // no-formula, streamed — never materialised (V1R4 §16.2).
         do {
-            let entries = try XLSXZipReader.readEntries(
-                data: Data(contentsOf: staging, options: .mappedIfSafe),
-                maximumEntries: 64,
-                maximumEntryBytes: 512 * 1024 * 1024,
-                maximumTotalBytes: 2 * 1024 * 1024 * 1024,
-                maximumRatio: 10_000)
-            let names = Set(entries.map { $0.name })
-            guard names.contains("xl/workbook.xml"),
-                  names.contains("[Content_Types].xml") else {
-                throw XLSXWriteError.reopenValidationFailed("required parts missing")
-            }
-        } catch let error as XLSXWriteError {
-            throw error
+            _ = try XLSXWorkbookVerifier.verify(
+                workbookURL: staging,
+                expectedSheets: sheets.enumerated().map { index, sheet in
+                    XLSXWorkbookVerifier.SheetExpectation(
+                        partName: "xl/worksheets/sheet\(index + 1).xml",
+                        sheetName: sheet.name,
+                        headers: sheet.headers)
+                },
+                maximumEntryBytes: 512 * 1024 * 1024)
+        } catch let error as XLSXWorkbookVerifier.VerifyError {
+            throw XLSXWriteError.reopenValidationFailed("\(error)")
         } catch {
             throw XLSXWriteError.reopenValidationFailed("\(error)")
         }
@@ -428,6 +442,12 @@ enum XLSXWorkbookWriter {
             // Stream the deflated payload and compute CRC/sizes.
             let (crc, compressedSize, uncompressedSize) = try streamDeflate(
                 source: source, to: output)
+            // Explicit ZIP32 safety cap (V1R4 §16.2): the streaming
+            // writer never emits entries beyond the classic ZIP size
+            // limits — either ZIP64 or a hard ceiling.
+            guard compressedSize <= Int32.max, uncompressedSize <= Int32.max else {
+                throw XLSXWriteError.entryTooLarge(name)
+            }
 
             // Data descriptor (signature + crc + sizes).
             var descriptor = Data()
@@ -581,6 +601,11 @@ enum XLSXWorkbookWriter {
             if result < 0 {
                 throw XLSXWriteError.zipFailed("output write failed")
             }
+            // V1R4 §16.2: a zero-byte write with bytes still pending is a
+            // stalled stream — block instead of looping forever.
+            if result == 0 {
+                throw XLSXWriteError.outputStalled
+            }
             written += result
         }
     }
@@ -589,16 +614,25 @@ enum XLSXWorkbookWriter {
 
     static func syncFile(_ url: URL) throws {
         let descriptor = open(url.path, O_RDONLY)
-        guard descriptor >= 0 else { return }
+        // V1R4 §16.2: a failed open/fsync must surface, never be silent.
+        guard descriptor >= 0 else {
+            throw XLSXWriteError.fsyncFailed("cannot open \(url.lastPathComponent)")
+        }
         defer { close(descriptor) }
-        fsync(descriptor)
+        guard fsync(descriptor) == 0 else {
+            throw XLSXWriteError.fsyncFailed("fsync failed for \(url.lastPathComponent)")
+        }
     }
 
     static func syncDirectory(_ directory: URL) throws {
         let descriptor = open(directory.path, O_RDONLY)
-        guard descriptor >= 0 else { return }
+        guard descriptor >= 0 else {
+            throw XLSXWriteError.fsyncFailed("cannot open directory \(directory.path)")
+        }
         defer { close(descriptor) }
-        fsync(descriptor)
+        guard fsync(descriptor) == 0 else {
+            throw XLSXWriteError.fsyncFailed("fsync failed for \(directory.path)")
+        }
     }
 }
 

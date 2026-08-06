@@ -15,10 +15,17 @@ enum TagObservationResolver {
         var barcode: String
         var symbology: String
         var floorID: String
-        var nodeID: Int64?
-        var nodeTimestamp: Double?
+        /// Snapshot-DB node id produced by the strict parser's
+        /// node-timebase binding (V1R4 §13.2); never nil for resolved
+        /// observations.
+        var nodeID: Int64
+        /// Node-timebase timestamp of the observation frame (the axis
+        /// used for the strict binding); always present.
+        var nodeTimestamp: Double
         var frameMonotonicSeconds: Double
-        var rawPositionM: (Double, Double, Double) // x, y, z
+        /// Raw map position in the snapshot (pre-optimization) frame;
+        /// nil = unlocalized evidence that never reaches resolution.
+        var rawPositionM: (Double, Double, Double)? // x, y, z
         var rawNodePose: SE2Transform
         var trackingSessionID: String
     }
@@ -50,6 +57,7 @@ enum TagObservationResolver {
         case timeDeltaTooLarge
         case ambiguousNearbyNodes
         case staleAlignment
+        case unlocalized
     }
 
     static let maximumTimeDeltaSeconds = 5.0
@@ -64,65 +72,38 @@ enum TagObservationResolver {
         guard observation.trackingSessionID == sessionID else {
             throw ResolutionError.sessionMismatch
         }
-        let candidate: FinalNodePose
-        let method: String
-        if let nodeID = observation.nodeID {
-            guard let node = finalNodes.first(where: { $0.id == nodeID }) else {
-                throw ResolutionError.nodeMissing
-            }
-            if let nodeTimestamp = observation.nodeTimestamp {
-                let delta = abs(node.monotonicSeconds - nodeTimestamp)
-                guard delta <= maximumTimeDeltaSeconds else {
-                    throw ResolutionError.timeDeltaTooLarge
-                }
-            }
-            candidate = node
-            method = "explicit_node"
-        } else if let nodeTimestamp = observation.nodeTimestamp {
-            let nearby = finalNodes
-                .filter { abs($0.monotonicSeconds - nodeTimestamp) <= maximumTimeDeltaSeconds }
-                .sorted { abs($0.monotonicSeconds - nodeTimestamp) < abs($1.monotonicSeconds - nodeTimestamp) }
-            guard let nearest = nearby.first else {
-                throw ResolutionError.nodeMissing
-            }
-            if nearby.count >= 2 {
-                let secondDelta = abs(nearby[1].monotonicSeconds - nodeTimestamp)
-                let firstDelta = abs(nearby[0].monotonicSeconds - nodeTimestamp)
-                if secondDelta - firstDelta <= maximumNodeAmbiguityDeltaSeconds {
-                    throw ResolutionError.ambiguousNearbyNodes
-                }
-            }
-            candidate = nearest
-            method = "nearest_node_timestamp"
-        } else {
-            let nearby = finalNodes
-                .filter { abs($0.monotonicSeconds - observation.frameMonotonicSeconds) <= maximumTimeDeltaSeconds }
-                .sorted { abs($0.monotonicSeconds - observation.frameMonotonicSeconds) < abs($1.monotonicSeconds - observation.frameMonotonicSeconds) }
-            guard let nearest = nearby.first else {
-                throw ResolutionError.nodeMissing
-            }
-            candidate = nearest
-            method = "frame_monotonic_timestamp"
+        // The strict parser bound the observation to an exact snapshot
+        // node (V1R4 §13.2); the same node id must exist in the final
+        // optimized reconstruction.
+        guard let position = observation.rawPositionM else {
+            throw ResolutionError.unlocalized
         }
-        guard candidate.floorID == observation.floorID else {
+        guard let node = finalNodes.first(where: { $0.id == observation.nodeID }) else {
+            throw ResolutionError.nodeMissing
+        }
+        let delta = abs(node.monotonicSeconds - observation.nodeTimestamp)
+        guard delta <= maximumTimeDeltaSeconds else {
+            throw ResolutionError.timeDeltaTooLarge
+        }
+        guard node.floorID == observation.floorID else {
             throw ResolutionError.staleAlignment
         }
         // P_final = T_final_node * inverse(T_raw_node) * P_raw
         let local = observation.rawNodePose.inverse.applied(
-            to: observation.rawPositionM.0, observation.rawPositionM.1)
-        let final = candidate.pose.applied(to: local.0, local.1)
+            to: position.0, position.1)
+        let final = node.pose.applied(to: local.0, local.1)
         return ResolvedObservation(
             barcode: observation.barcode,
             symbology: observation.symbology,
             floorID: observation.floorID,
             mapXM: final.0,
             mapYM: final.1,
-            mapZM: observation.rawPositionM.2,
-            nodeID: candidate.id,
-            nodeTimestamp: candidate.monotonicSeconds,
+            mapZM: position.2,
+            nodeID: node.id,
+            nodeTimestamp: node.monotonicSeconds,
             frameMonotonicSeconds: observation.frameMonotonicSeconds,
             trackingSessionID: sessionID,
-            bindingMethod: method
+            bindingMethod: "explicit_node"
         )
     }
 
@@ -165,15 +146,22 @@ enum TagObservationResolver {
             observationCount: count,
             positionSpreadM: SourceGeometry.rounded(maxSpread),
             localizationConfidence: min(1.0, Double(count) / Double(max(minimumBurstSamples, 1))),
-            associationConfidence: 1.0,
+            // Association confidence reflects the internal spread headroom:
+            // zero spread is fully confident, a spread at the gate's
+            // maximum is borderline (V1R4 §13.2: never a fixed 1.0).
+            associationConfidence: max(0.0, min(1.0,
+                1.0 - maxSpread / max(maximumSpreadM, 1.0e-9))),
             nodeIDs: observations.map { $0.nodeID },
             trackingSessionID: observations[0].trackingSessionID
         )
     }
 
-    /// Clusters resolved observations into physical instances: same
-    /// barcode, same floor and spatial proximity form one instance;
-    /// distant same-barcode groups stay separate instances.
+    /// Clusters resolved observations into physical instances with a
+    /// bounded diameter (V1R4 §13.2): same barcode + same floor form one
+    /// instance only when every observation lies within `clusterRadiusM`
+    /// of the seed. Chained expansion across gaps is NOT allowed — a
+    /// distant same-barcode group (e.g. on the next shelf) starts its own
+    /// instance and is quality-gated independently.
     static func clusterInstances(
         observations: [ResolvedObservation],
         clusterRadiusM: Double = 1.5
@@ -183,25 +171,18 @@ enum TagObservationResolver {
         while !remaining.isEmpty {
             let seed = remaining.removeFirst()
             var cluster = [seed]
-            var changed = true
-            while changed {
-                changed = false
-                var kept: [ResolvedObservation] = []
-                for observation in remaining {
-                    let near = cluster.contains {
-                        $0.barcode == observation.barcode
-                            && $0.floorID == observation.floorID
-                            && hypot($0.mapXM - observation.mapXM, $0.mapYM - observation.mapYM) <= clusterRadiusM
-                    }
-                    if near {
-                        cluster.append(observation)
-                        changed = true
-                    } else {
-                        kept.append(observation)
-                    }
+            var kept: [ResolvedObservation] = []
+            for observation in remaining {
+                if observation.barcode == seed.barcode
+                    && observation.floorID == seed.floorID
+                    && hypot(observation.mapXM - seed.mapXM,
+                             observation.mapYM - seed.mapYM) <= clusterRadiusM {
+                    cluster.append(observation)
+                } else {
+                    kept.append(observation)
                 }
-                remaining = kept
             }
+            remaining = kept
             if let instance = fuse(observations: cluster) {
                 instances.append(instance)
             }

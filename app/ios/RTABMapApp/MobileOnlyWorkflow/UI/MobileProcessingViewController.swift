@@ -28,6 +28,13 @@ final class MobileProcessingViewController: UIViewController, UITableViewDataSou
             return metadata["storeId"] as? String ?? ""
         }
 
+        /// B-08: floor identity recorded when the scan was configured;
+        /// flows into the processing request so the snapshot eligibility
+        /// chain validates it fail-closed.
+        var floorID: String {
+            return metadata["floorId"] as? String ?? ""
+        }
+
         /// Prior-map identity recorded when the scan was configured.
         var boundPriorMapID: String? {
             return metadata["priorMapId"] as? String
@@ -233,6 +240,7 @@ final class MobileProcessingViewController: UIViewController, UITableViewDataSou
             sourceDatabase: candidate.databaseURL,
             priorMap: map,
             storeID: candidate.storeID,
+            floorID: candidate.floorID,
             trackingSessionID: candidate.trackingSessionID)
     }
 

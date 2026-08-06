@@ -137,3 +137,256 @@ enum MobileProcessingTaskStore {
         }
     }
 }
+
+/// V1R4 §15 Gate L: per-stage durable checkpoints bound to the full run
+/// identity.
+///
+/// Every pipeline stage transition writes `task.json` with the
+/// checkpoint below (task ID, input bundle SHA, snapshot path,
+/// map/app/native/policy identity, processing path, durable outputs,
+/// retry count). On launch the app validates `task.json` and every
+/// durable reference and resumes from the last verified snapshot
+/// instead of re-reading the mutable source database.
+enum PersistentTaskCheckpoint {
+
+    enum Recovery {
+        /// No durable snapshot yet: the run starts from scratch (the
+        /// snapshot never completed, so there is nothing to re-use).
+        case fresh
+        /// The verified immutable snapshot exists and matches the
+        /// checkpoint: resume without touching the source session.
+        case resumeSnapshot(directory: URL, bundleSHA256: String)
+    }
+
+    enum CheckpointError: Error, LocalizedError {
+        case invalidRecord(String)
+        case identityMismatch(String)
+        case referenceMissing(String)
+        case notResumable(String)
+
+        var errorDescription: String? {
+            switch self {
+            case .invalidRecord(let d): return "任务检查点无效：\(d)"
+            case .identityMismatch(let d): return "任务身份与当前请求不匹配：\(d)"
+            case .referenceMissing(let d): return "任务引用缺失：\(d)"
+            case .notResumable(let d): return "任务不可恢复：\(d)"
+            }
+        }
+    }
+
+    /// Checkpoint binding keys (write and read sides share this set so
+    /// they cannot drift; unknown fields fail the validation).
+    static let boundKeys: Set<String> = [
+        "task_id",
+        "input_bundle_sha256",
+        "snapshot_path",
+        "map_identity",
+        "app_identity",
+        "native_identity",
+        "policy_identity",
+        "processing_path",
+        "durable_outputs",
+        "retry_count",
+    ]
+
+    static func mapIdentity(request: MobileProcessingPipeline.Request) -> [String: Any] {
+        return [
+            "prior_map_id": request.priorMap.priorMapID,
+            "prior_map_sha256": request.priorMap.packageSHA256,
+            "canonical_source_sha256": request.priorMap.canonicalSourceSHA256,
+        ]
+    }
+
+    static func appIdentity(request: MobileProcessingPipeline.Request) -> [String: Any] {
+        return ["app_git_sha": request.appGitSHA]
+    }
+
+    static func nativeIdentity(request: MobileProcessingPipeline.Request) -> [String: Any] {
+        return ["native_core_sha256": request.nativeCoreSHA256]
+    }
+
+    static func policyIdentity(request: MobileProcessingPipeline.Request) -> [String: Any] {
+        return [
+            "policy_sha": request.policySHA,
+            "projection_policy_version": 1,
+        ]
+    }
+
+    /// Checkpoint written BEFORE the snapshot completes: binds the task
+    /// ID and the full run identity; no snapshot reference yet.
+    static func baseCheckpoint(
+        request: MobileProcessingPipeline.Request,
+        retryCount: Int
+    ) -> [String: Any] {
+        return [
+            "task_id": request.taskRoot.lastPathComponent,
+            "map_identity": mapIdentity(request: request),
+            "app_identity": appIdentity(request: request),
+            "native_identity": nativeIdentity(request: request),
+            "policy_identity": policyIdentity(request: request),
+            "processing_path": "",
+            "durable_outputs": [],
+            "retry_count": retryCount,
+        ]
+    }
+
+    /// Full checkpoint after the immutable snapshot exists: binds the
+    /// input bundle SHA, the snapshot path and the durable outputs
+    /// (absolute paths — the result artifacts live outside the task
+    /// root, under the result library staging).
+    static func snapshotCheckpoint(
+        request: MobileProcessingPipeline.Request,
+        snapshot: SessionSnapshotTransaction.SessionSnapshot,
+        retryCount: Int,
+        processingPath: String = "",
+        durableOutputs: [String]? = nil
+    ) -> [String: Any] {
+        var checkpoint = baseCheckpoint(request: request, retryCount: retryCount)
+        checkpoint["input_bundle_sha256"] = snapshot.bundleSHA256
+        checkpoint["snapshot_path"] = snapshot.snapshotDirectory.path
+        checkpoint["processing_path"] = processingPath
+        checkpoint["durable_outputs"] = durableOutputs ?? [
+            request.taskRoot.appendingPathComponent("input_snapshot").path,
+            request.taskRoot.appendingPathComponent("input_manifest.json").path,
+        ]
+        return checkpoint
+    }
+
+    /// Returns `checkpoint` with an updated processing path.
+    static func withProcessingPath(_ path: String, in checkpoint: [String: Any]) -> [String: Any] {
+        var updated = checkpoint
+        updated["processing_path"] = path
+        return updated
+    }
+
+    /// Returns `checkpoint` with updated durable outputs.
+    static func withDurableOutputs(_ outputs: [String], in checkpoint: [String: Any]) -> [String: Any] {
+        var updated = checkpoint
+        updated["durable_outputs"] = outputs
+        return updated
+    }
+
+    /// Validates every binding of a persisted checkpoint against the
+    /// current request. Any mismatch is fail-closed: a run never
+    /// continues under a different identity.
+    static func validate(
+        _ checkpoint: [String: Any],
+        taskRoot: URL,
+        request: MobileProcessingPipeline.Request
+    ) throws {
+        for key in checkpoint.keys where !boundKeys.contains(key) {
+            throw CheckpointError.invalidRecord("unknown checkpoint field: \(key)")
+        }
+        guard let taskID = checkpoint["task_id"] as? String,
+              taskID == taskRoot.lastPathComponent else {
+            throw CheckpointError.invalidRecord("task_id mismatch")
+        }
+        try validateSubIdentity(
+            "map", expected: mapIdentity(request: request),
+            actual: checkpoint["map_identity"] as? [String: Any])
+        try validateSubIdentity(
+            "app", expected: appIdentity(request: request),
+            actual: checkpoint["app_identity"] as? [String: Any])
+        try validateSubIdentity(
+            "native", expected: nativeIdentity(request: request),
+            actual: checkpoint["native_identity"] as? [String: Any])
+        try validateSubIdentity(
+            "policy", expected: policyIdentity(request: request),
+            actual: checkpoint["policy_identity"] as? [String: Any])
+    }
+
+    /// V1R4 §15 launch recovery:
+    /// - validates `task.json` and every durable reference;
+    /// - resumes from the last durable snapshot checkpoint (never
+    ///   re-reads the mutable source database);
+    /// - refuses to start over in-place for terminal states
+    ///   (completed/cancelled/failed) — a new task is never created to
+    ///   impersonate a resume.
+    static func recover(
+        taskRoot: URL,
+        request: MobileProcessingPipeline.Request
+    ) throws -> Recovery {
+        let fileManager = FileManager.default
+        let record: PersistentTaskCoordinator.TaskRecord
+        do {
+            record = try PersistentTaskCoordinator.read(taskRoot: taskRoot)
+        } catch {
+            throw CheckpointError.invalidRecord("task.json unreadable: \(error)")
+        }
+        guard PersistentTaskCoordinator.isResumable(record) else {
+            throw CheckpointError.notResumable(
+                "task is \(record.state.rawValue); refusing to start over in-place")
+        }
+        guard let checkpoint = record.checkpoint else {
+            // No durable checkpoint: the snapshot never completed.
+            return .fresh
+        }
+        try validate(checkpoint, taskRoot: taskRoot, request: request)
+        // Verify every declared durable reference still exists.
+        if let outputs = checkpoint["durable_outputs"] as? [String] {
+            for path in outputs {
+                guard fileManager.fileExists(atPath: path) else {
+                    throw CheckpointError.referenceMissing(path)
+                }
+            }
+        }
+        guard let bundleSHA = checkpoint["input_bundle_sha256"] as? String,
+              let snapshotPath = checkpoint["snapshot_path"] as? String else {
+            // The snapshot never completed durably: restart from scratch.
+            return .fresh
+        }
+        let snapshotDirectory = URL(fileURLWithPath: snapshotPath)
+        var isDirectory: ObjCBool = false
+        guard fileManager.fileExists(
+            atPath: snapshotDirectory.path, isDirectory: &isDirectory),
+            isDirectory.boolValue else {
+            throw CheckpointError.referenceMissing("input_snapshot")
+        }
+        let manifestURL = snapshotDirectory.appendingPathComponent("input_manifest.json")
+        guard fileManager.fileExists(atPath: manifestURL.path) else {
+            throw CheckpointError.referenceMissing(
+                "input_snapshot/input_manifest.json")
+        }
+        // The manifest's bundle SHA must match the checkpoint binding.
+        let manifest: [String: Any]
+        do {
+            manifest = try readInputManifest(manifestURL)
+        } catch {
+            throw CheckpointError.referenceMissing(
+                "input_snapshot/input_manifest.json unreadable")
+        }
+        guard let recorded = manifest["bundle_sha256"] as? String,
+              recorded == bundleSHA else {
+            throw CheckpointError.referenceMissing(
+                "input_manifest bundle_sha256 mismatch with checkpoint")
+        }
+        return .resumeSnapshot(directory: snapshotDirectory, bundleSHA256: bundleSHA)
+    }
+
+    /// Reads the task-level `input_manifest.json` (the same bytes are
+    /// committed inside the snapshot directory).
+    static func readInputManifest(_ url: URL) throws -> [String: Any] {
+        let data = try Data(contentsOf: url)
+        guard let object = try? StrictJSONDocumentParser.object(
+            from: data,
+            limits: StrictJSONDocumentLimits(maximumBytes: data.count + 1)) as? [String: Any]
+        else {
+            throw CheckpointError.invalidRecord("input_manifest.json unreadable")
+        }
+        return object
+    }
+
+    private static func validateSubIdentity(
+        _ name: String,
+        expected: [String: Any],
+        actual: [String: Any]?
+    ) throws {
+        guard let actual = actual,
+              actual.count == expected.count,
+              expected.allSatisfy({ key, value in
+                  (actual[key] as? String) == (value as? String)
+              }) else {
+            throw CheckpointError.identityMismatch("\(name) identity")
+        }
+    }
+}

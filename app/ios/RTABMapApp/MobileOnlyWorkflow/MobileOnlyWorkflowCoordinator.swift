@@ -135,6 +135,11 @@ final class MobileOnlyWorkflowCoordinator {
     /// or an incomplete receipt keeps the workflow out of `.scanning`.
     var onStartScan: ((MobileScanConfiguration) throws -> MobileScanStartReceipt)?
 
+    /// B-09: called when a validated host start cannot be committed
+    /// (receipt invalid or persistence failed). The host must stop the
+    /// already-running scan so it cannot outlive a failed workflow.
+    var onRollbackScan: ((MobileScanStartReceipt) -> Void)?
+
     /// Last validated scan start receipt (§4.1), durably persisted.
     private(set) var lastScanReceipt: MobileScanStartReceipt?
 
@@ -241,7 +246,7 @@ final class MobileOnlyWorkflowCoordinator {
         coordinatorLock.unlock()
 
         guard transition(to: .pickingMap) else {
-            coordinatorLock.lock(); importBusy = false; coordinatorLock.unlock()
+            releaseImport()
             return
         }
         contextLock.lock()
@@ -270,6 +275,11 @@ final class MobileOnlyWorkflowCoordinator {
                 let error = MobileOnlyWorkflowError.pickerCopyFailed(reason.message)
                 self.fail(with: error)
                 self.notifyImport(.failure(error))
+                // H-11: the failed path must release the import gate too,
+                // otherwise `importBusy` and the strong picker reference
+                // stay forever and every later import is rejected as a
+                // duplicate.
+                self.releaseImport()
             case .cancelled:
                 self.releaseImport()
                 self.transition(to: .idle)
@@ -280,8 +290,12 @@ final class MobileOnlyWorkflowCoordinator {
     }
 
     func cancelImport() {
+        // H-11: cancel only marks the running/queued operation. The busy
+        // gate is released by the operation's completion block once the
+        // background chain has REALLY stopped — releasing it here would
+        // let a new import start while the old operation still compiles
+        // and registers (the pre-H-11 race).
         importOperation?.cancel()
-        releaseImport()
         transition(to: .cancelled)
         transition(to: .idle)
     }
@@ -314,6 +328,19 @@ final class MobileOnlyWorkflowCoordinator {
                 contract: contract,
                 storeID: storeID,
                 mapName: mapName)
+        }
+        // H-11: the gate releases when THIS operation has truly finished
+        // (cancelled-while-queued operations also run their completion
+        // block). The identity check keeps a stale operation's completion
+        // from clearing the gate of a newer import.
+        operation.completionBlock = { [weak self, weak operation] in
+            guard let self = self, let operation = operation else { return }
+            self.coordinatorLock.lock()
+            let stillCurrent = self.importOperation === operation
+            self.coordinatorLock.unlock()
+            if stillCurrent {
+                self.releaseImport()
+            }
         }
         importOperation = operation
         workQueue.addOperation(operation)
@@ -394,6 +421,16 @@ final class MobileOnlyWorkflowCoordinator {
                 packageSHA: compileResult.packageSHA256)
             let fileManager = FileManager.default
             if fileManager.fileExists(atPath: target.path) {
+                // V1R4 §14.2: an existing content-addressed target is
+                // reused only after re-verification (full manifest +
+                // digest + identity); a corrupt package fails closed
+                // instead of being silently overwritten.
+                _ = try MobileMapLibrary.verifyPackage(
+                    at: target,
+                    priorMapID: compileResult.priorMapID,
+                    packageSHA256: compileResult.packageSHA256,
+                    expectedFloorCount: compileResult.floorCount,
+                    expectedElementCount: compileResult.elementCount)
                 try? fileManager.removeItem(at: staging)
             } else {
                 try fileManager.createDirectory(
@@ -483,12 +520,18 @@ final class MobileOnlyWorkflowCoordinator {
               receipt.priorMapSHA256 == configuration.priorMap.packageSHA256,
               receipt.floorID == configuration.floorID,
               receipt.storeID == configuration.storeID else {
+            // B-09: the host reported a started scan; stop it before the
+            // workflow fails, otherwise the live capture outlives the
+            // failed workflow.
+            onRollbackScan?(receipt)
             fail(with: .invalidState("scan start receipt incomplete or inconsistent"))
             return
         }
         do {
             try persistScanReceipt(receipt)
         } catch {
+            // B-09: same rollback requirement on persistence failure.
+            onRollbackScan?(receipt)
             fail(with: .invalidState("scan receipt persistence failed: \(error.localizedDescription)"))
             return
         }
@@ -523,6 +566,40 @@ final class MobileOnlyWorkflowCoordinator {
         let file = directory.appendingPathComponent(
             "\(receipt.trackingSessionID).json")
         try data.write(to: file, options: [.atomic])
+        // B-09: durability is proven by fsync, not assumed — the receipt
+        // must survive a crash right after the workflow commits.
+        try Self.fsyncURL(file)
+        try Self.fsyncDirectory(directory)
+    }
+
+    /// B-09: fsync a file (fail-closed; the receipt is not durable until
+    /// both the file and its parent directory are flushed).
+    private static func fsyncURL(_ url: URL) throws {
+        let fd = open(url.path, O_RDONLY)
+        guard fd >= 0 else {
+            throw MobileOnlyWorkflowError.invalidState(
+                "receipt fsync open failed: \(url.lastPathComponent)")
+        }
+        defer { close(fd) }
+        guard fsync(fd) == 0 else {
+            throw MobileOnlyWorkflowError.invalidState(
+                "receipt fsync failed: \(url.lastPathComponent)")
+        }
+    }
+
+    /// B-09: fsync a directory so the rename that created the receipt
+    /// file is durable.
+    private static func fsyncDirectory(_ directory: URL) throws {
+        let fd = open(directory.path, O_RDONLY)
+        guard fd >= 0 else {
+            throw MobileOnlyWorkflowError.invalidState(
+                "receipt directory fsync open failed: \(directory.lastPathComponent)")
+        }
+        defer { close(fd) }
+        guard fsync(fd) == 0 else {
+            throw MobileOnlyWorkflowError.invalidState(
+                "receipt directory fsync failed: \(directory.lastPathComponent)")
+        }
     }
 
     func scanFinalized() {
@@ -550,7 +627,9 @@ final class MobileOnlyWorkflowCoordinator {
         sourceDatabase: URL,
         priorMap: MobileMapLibrary.MapEntry,
         storeID: String,
-        trackingSessionID: String
+        floorID: String,
+        trackingSessionID: String,
+        taskID: String? = nil
     ) {
         coordinatorLock.lock()
         guard !processingBusy else {
@@ -567,7 +646,11 @@ final class MobileOnlyWorkflowCoordinator {
             coordinatorLock.lock(); processingBusy = false; coordinatorLock.unlock()
             return
         }
-        let taskID = "task-\(UUID().uuidString)"
+        // V1R4 §15: a resumed run re-uses the persisted task ID — a new
+        // task is never created to impersonate a resume. The pipeline
+        // validates task.json and resumes from the last durable
+        // checkpoint inside the same task directory.
+        let taskID = taskID ?? "task-\(UUID().uuidString)"
         guard let taskRoot = try? MobileProcessingTaskStore.createTask(taskID: taskID) else {
             coordinatorLock.lock(); processingBusy = false; coordinatorLock.unlock()
             fail(with: .snapshotFailed("cannot create task directory"))
@@ -592,12 +675,14 @@ final class MobileOnlyWorkflowCoordinator {
             taskRoot: taskRoot,
             priorMap: priorMap,
             storeID: storeID,
+            floorID: floorID,
             trackingSessionID: trackingSessionID,
             appGitSHA: appGitSHA,
             appVersion: appVersion,
             deviceModel: deviceModel,
             osVersion: osVersion,
-            nativeCoreSHA256: nativeCoreSHA256)
+            nativeCoreSHA256: nativeCoreSHA256,
+            policySHA: policySHA)
 
         let operation = BlockOperation { [weak self] in
             self?.executeProcessing(request: request)
@@ -858,7 +943,13 @@ final class MobileOnlyWorkflowCoordinator {
         let mapSHA = context.mapSHA
         let storeID = context.storeID
         let sessionID = context.sessionID
+        let taskID = context.taskID
         contextLock.unlock()
+        // B-08: the resumed run re-derives the floor identity from the
+        // session metadata. An unreadable/missing floor flows as empty
+        // and fails the snapshot eligibility check fail-closed instead
+        // of silently defaulting.
+        let floorID = Self.floorIDFromMetadata(segmentDirectory: segmentDirectory)
         switch checkpoint {
         case _ where !segmentDirectory.isEmpty && !sourceDatabase.isEmpty:
             guard let map = activeMap ?? (try? MobileMapLibrary.map(
@@ -872,12 +963,29 @@ final class MobileOnlyWorkflowCoordinator {
                 sourceDatabase: URL(fileURLWithPath: sourceDatabase),
                 priorMap: map,
                 storeID: storeID,
-                trackingSessionID: sessionID)
+                floorID: floorID,
+                trackingSessionID: sessionID,
+                taskID: taskID.isEmpty ? nil : taskID)
             return true
         default:
             transition(to: .idle)
             return false
         }
+    }
+
+    /// B-08: reads the floor identity recorded in the session metadata
+    /// (resume path). Returns "" when unreadable so the snapshot
+    /// eligibility chain fails closed.
+    private static func floorIDFromMetadata(segmentDirectory: String) -> String {
+        let url = URL(fileURLWithPath: segmentDirectory)
+            .appendingPathComponent("metadata.json")
+        guard let data = try? Data(contentsOf: url),
+              let object = try? JSONSerialization.jsonObject(
+                  with: data, options: []) as? [String: Any],
+              let floorID = object["floorId"] as? String else {
+            return ""
+        }
+        return floorID
     }
 }
 

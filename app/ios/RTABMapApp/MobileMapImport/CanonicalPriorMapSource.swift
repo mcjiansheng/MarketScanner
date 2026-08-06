@@ -10,7 +10,10 @@ import Foundation
 /// payload (they live in `MapSourceIdentity` only).
 struct MarketScannerPriorMapSource: Equatable {
     static let formatValue = "MarketScannerPriorMapSource"
-    static let versionValue = 1
+    /// V1R4 §14.1: the primary type is version 2 with a snake_case JSON
+    /// document contract; legacy version 1 documents keep a separate
+    /// decoder (`LegacyV1JSONMapSourceDecoder`).
+    static let versionValue = 2
 
     var format: String
     var version: Int
@@ -75,15 +78,38 @@ struct CanonicalPriorMapBusinessSourceV2 {
     var elements: [PriorMapSourceElement]
 
     var payload: [String: Any] {
+        // V1R4 §14.1: elements are emitted in stable business order (by
+        // stable element id) so the payload digest is row-order
+        // independent and identical across XLSX/CSV/JSON imports.
+        let keyed: [(id: String, element: PriorMapSourceElement)] = elements.map { element in
+            (CanonicalPriorMapBusinessSourceV2.stableElementID(
+                for: element, storeID: storeID, mapName: mapName), element)
+        }
+        let ordered = keyed.sorted { lhs, rhs in
+            if lhs.id != rhs.id {
+                return lhs.id < rhs.id
+            }
+            // Tie-break on the canonical element encoding so the order is
+            // total even for distinct elements sharing an id (blocked
+            // upstream by the duplicate-identity check; deterministic
+            // anyway).
+            let lhsString = (try? CanonicalJSONEncoder.encodeString(
+                CanonicalPriorMapBusinessSourceV2.elementPayload(
+                    lhs.element, storeID: storeID, mapName: mapName))) ?? ""
+            let rhsString = (try? CanonicalJSONEncoder.encodeString(
+                CanonicalPriorMapBusinessSourceV2.elementPayload(
+                    rhs.element, storeID: storeID, mapName: mapName))) ?? ""
+            return lhsString < rhsString
+        }
         return [
             "format": Self.formatValue,
             "version": Self.versionValue,
             "store_id": storeID,
             "map_name": mapName,
             "coordinate_contract": coordinateContract.canonicalPayload,
-            "elements": elements.map { element in
+            "elements": ordered.map { element in
                 CanonicalPriorMapBusinessSourceV2.elementPayload(
-                    element, storeID: storeID, mapName: mapName)
+                    element.element, storeID: storeID, mapName: mapName)
             },
         ]
     }

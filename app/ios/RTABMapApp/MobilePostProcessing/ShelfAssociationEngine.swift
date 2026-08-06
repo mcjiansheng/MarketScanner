@@ -3,14 +3,257 @@ import Foundation
 /// Associates a finalized tag position with the nearest shelf segment
 /// and the automatic quality gate that decides ACCEPTED vs
 /// RESCAN_REQUIRED.
+///
+/// Shelf geometry follows V1R4 §13.5: the longitudinal axis, start/end,
+/// front/back normals, closed polygon and side regions are computed from
+/// the rotated polygon / axis; the AABB is only an index envelope and
+/// can never replace the rotated geometry.
 enum ShelfAssociationEngine {
+
+    // MARK: - Geometry
+
     struct ShelfSegment {
         var shelfCode: String
         var floorID: String
+        /// Longitudinal axis start/end (metres, map frame).
         var startM: (Double, Double)
         var endM: (Double, Double)
-        var side: String // "front" | "back"
+        /// Unit longitudinal axis (start → end).
+        var axisM: (Double, Double)
+        /// Unit face normal; a tag with a positive lateral offset
+        /// (dot(point - start, normal) > 0) is on the "front" side,
+        /// otherwise on the "back" side (§13.5 side regions).
+        var frontNormalM: (Double, Double)
+        /// AABB used ONLY as an index envelope (§13.5).
+        var boundsMinM: (Double, Double)
+        var boundsMaxM: (Double, Double)
+        /// Closed polygon vertices (metres) when the compiled package
+        /// carries rotated geometry; nil when only bounds are available.
+        var polygonM: [(Double, Double)]?
+
+        var lengthM: Double {
+            return hypot(endM.0 - startM.0, endM.1 - startM.1)
+        }
+
+        /// Convenience initializer for the compiled element fields.
+        init(
+            shelfCode: String,
+            floorID: String,
+            startM: (Double, Double),
+            endM: (Double, Double),
+            axisM: (Double, Double),
+            frontNormalM: (Double, Double),
+            boundsMinM: (Double, Double),
+            boundsMaxM: (Double, Double),
+            polygonM: [(Double, Double)]?
+        ) {
+            self.shelfCode = shelfCode
+            self.floorID = floorID
+            self.startM = startM
+            self.endM = endM
+            self.axisM = axisM
+            self.frontNormalM = frontNormalM
+            self.boundsMinM = boundsMinM
+            self.boundsMaxM = boundsMaxM
+            self.polygonM = polygonM
+        }
+
+        /// Lateral offset (metres) of a point relative to the face
+        /// normal: positive = front side, negative = back side.
+        func lateralOffsetM(point: (Double, Double)) -> Double {
+            return (point.0 - startM.0) * frontNormalM.0
+                + (point.1 - startM.1) * frontNormalM.1
+        }
+
+        func side(for point: (Double, Double)) -> String {
+            return lateralOffsetM(point: point) >= 0 ? "front" : "back"
+        }
+
+        func boundsContains(x: Double, y: Double) -> Bool {
+            return x >= boundsMinM.0 && x <= boundsMaxM.0
+                && y >= boundsMinM.1 && y <= boundsMaxM.1
+        }
     }
+
+    /// Computes the shelf geometry from the compiled element fields
+    /// (V1R4 §13.5). The rotated polygon, when present, defines the
+    /// longitudinal axis (PCA of the vertex set); the AABB is only an
+    /// index envelope. The front normal is the axis rotated -90 degrees
+    /// (clockwise), giving a deterministic front/back split; a `yawRad`
+    /// (when present) fixes the axis sign so the front side is
+    /// reproducible across sessions.
+    static func makeSegment(
+        shelfCode: String,
+        floorID: String,
+        polygonM: [(Double, Double)]?,
+        boundsMinM: (Double, Double)?,
+        boundsMaxM: (Double, Double)?,
+        yawRad: Double?
+    ) -> ShelfSegment? {
+        var axis: (Double, Double)?
+        var start: (Double, Double)?
+        var end: (Double, Double)?
+        var envelopeMin = boundsMinM
+        var envelopeMax = boundsMaxM
+        if let polygon = polygonM, polygon.count >= 4 {
+            // Closed rotated polygon: PCA main axis (longest dimension).
+            var centroidX = 0.0
+            var centroidY = 0.0
+            for vertex in polygon {
+                centroidX += vertex.0
+                centroidY += vertex.1
+            }
+            centroidX /= Double(polygon.count)
+            centroidY /= Double(polygon.count)
+            var sxx = 0.0
+            var syy = 0.0
+            var sxy = 0.0
+            for vertex in polygon {
+                let dx = vertex.0 - centroidX
+                let dy = vertex.1 - centroidY
+                sxx += dx * dx
+                syy += dy * dy
+                sxy += dx * dy
+            }
+            let theta = 0.5 * atan2(2.0 * sxy, sxx - syy)
+            var computedAxis = (cos(theta), sin(theta))
+            // Sign alignment with the optional yaw so the front side is
+            // reproducible.
+            if let yaw = yawRad, yaw.isFinite {
+                let yawAxis = (cos(yaw), sin(yaw))
+                if computedAxis.0 * yawAxis.0 + computedAxis.1 * yawAxis.1 < 0 {
+                    computedAxis = (-computedAxis.0, -computedAxis.1)
+                }
+            }
+            axis = computedAxis
+            // start/end = the extreme projections on the main axis. The
+            // axis passes through the centroid, so the endpoints are
+            // centroid + t * axis; using vertex coordinates directly
+            // would skew the segment direction off the axis (§13.5).
+            var minProjection = Double.infinity
+            var maxProjection = -Double.infinity
+            for vertex in polygon {
+                let projection =
+                    (vertex.0 - centroidX) * computedAxis.0
+                    + (vertex.1 - centroidY) * computedAxis.1
+                minProjection = min(minProjection, projection)
+                maxProjection = max(maxProjection, projection)
+            }
+            start = (
+                centroidX + minProjection * computedAxis.0,
+                centroidY + minProjection * computedAxis.1)
+            end = (
+                centroidX + maxProjection * computedAxis.0,
+                centroidY + maxProjection * computedAxis.1)
+            // Envelope from the polygon when bounds are missing.
+            if envelopeMin == nil || envelopeMax == nil {
+                var minX = Double.infinity
+                var minY = Double.infinity
+                var maxX = -Double.infinity
+                var maxY = -Double.infinity
+                for vertex in polygon {
+                    minX = min(minX, vertex.0)
+                    minY = min(minY, vertex.1)
+                    maxX = max(maxX, vertex.0)
+                    maxY = max(maxY, vertex.1)
+                }
+                envelopeMin = (minX, minY)
+                envelopeMax = (maxX, maxY)
+            }
+        } else if let minBound = boundsMinM, let maxBound = boundsMaxM {
+            // AABB-only fallback: the long side is the axis (the AABB is
+            // still only an envelope; a rotated shelf without geometry is
+            // degraded but resolvable).
+            let horizontal = (maxBound.0 - minBound.0) >= (maxBound.1 - minBound.1)
+            if horizontal {
+                axis = (1.0, 0.0)
+                start = (minBound.0, (minBound.1 + maxBound.1) / 2.0)
+                end = (maxBound.0, (minBound.1 + maxBound.1) / 2.0)
+            } else {
+                axis = (0.0, 1.0)
+                start = ((minBound.0 + maxBound.0) / 2.0, minBound.1)
+                end = ((minBound.0 + maxBound.0) / 2.0, maxBound.1)
+            }
+            envelopeMin = minBound
+            envelopeMax = maxBound
+        }
+        guard let axis = axis, let start = start, let end = end,
+              let envelopeMin = envelopeMin, let envelopeMax = envelopeMax,
+              envelopeMax.0 >= envelopeMin.0, envelopeMax.1 >= envelopeMin.1,
+              hypot(end.0 - start.0, end.1 - start.1) > 1.0e-9 else {
+            return nil
+        }
+        // Front normal = axis rotated clockwise 90 degrees.
+        let normal = (axis.1, -axis.0)
+        return ShelfSegment(
+            shelfCode: shelfCode,
+            floorID: floorID,
+            startM: start,
+            endM: end,
+            axisM: axis,
+            frontNormalM: normal,
+            boundsMinM: envelopeMin,
+            boundsMaxM: envelopeMax,
+            polygonM: polygonM)
+    }
+
+    // MARK: - Spatial index (V1R4 §13.3: shelf grid)
+
+    /// Lightweight uniform grid over the shelf AABBs (per floor). Query
+    /// is O(1) average: the point's cell plus its 3x3 neighbourhood;
+    /// shelves are inserted into every cell their envelope covers.
+    struct ShelfSpatialIndex {
+        static let cellSizeM = 8.0
+
+        private var cells: [String: [ShelfSegment]] = [:]
+
+        init(shelves: [ShelfSegment]) {
+            for shelf in shelves {
+                let minCellX = Self.cellIndex(shelf.boundsMinM.0)
+                let maxCellX = Self.cellIndex(shelf.boundsMaxM.0)
+                let minCellY = Self.cellIndex(shelf.boundsMinM.1)
+                let maxCellY = Self.cellIndex(shelf.boundsMaxM.1)
+                for cellX in minCellX...maxCellX {
+                    for cellY in minCellY...maxCellY {
+                        let key = Self.key(floorID: shelf.floorID, cellX: cellX, cellY: cellY)
+                        cells[key, default: []].append(shelf)
+                    }
+                }
+            }
+        }
+
+        private static func cellIndex(_ coordinate: Double) -> Int {
+            // Floor towards negative infinity so negative coordinates
+            // land in the correct cells.
+            return Int(floor(coordinate / cellSizeM))
+        }
+
+        private static func key(floorID: String, cellX: Int, cellY: Int) -> String {
+            return "\(floorID):\(cellX):\(cellY)"
+        }
+
+        /// Candidate shelves whose envelope intersects the query cell
+        /// neighbourhood (the tag may sit just outside a shelf's AABB).
+        func candidates(point: (Double, Double), floorID: String) -> [ShelfSegment] {
+            let centerX = Self.cellIndex(point.0)
+            let centerY = Self.cellIndex(point.1)
+            var result: [ShelfSegment] = []
+            var seen = Set<String>()
+            for cellX in (centerX - 1)...(centerX + 1) {
+                for cellY in (centerY - 1)...(centerY + 1) {
+                    guard let bucket = cells[Self.key(floorID: floorID, cellX: cellX, cellY: cellY)] else {
+                        continue
+                    }
+                    for shelf in bucket where seen.insert(shelf.shelfCode).inserted {
+                        result.append(shelf)
+                    }
+                }
+            }
+            return result
+        }
+    }
+
+    // MARK: - Association
 
     struct Association {
         var shelfCode: String
@@ -21,15 +264,25 @@ enum ShelfAssociationEngine {
         var distanceFromStartM: Double
         var segmentLengthM: Double
         var atEndpoint: Bool
+        /// Distance to the second-closest candidate (parallel aisle
+        /// ambiguity), nil when fewer than two candidates exist.
+        var secondCandidateDistanceM: Double?
+        /// second - first distance margin; small margins are ambiguous.
+        var marginM: Double?
+        /// True when a fixed structure lies between the tag and the
+        /// shelf (occlusion check, §13.4/§13.6).
+        var occludedByStructure: Bool
     }
 
-    /// Projects point P onto segment A-B:
-    /// s = dot(P-A, d)/|d|, u = s/|d|, distance_from_shelf_start_cm = s*100.
+    /// Projects point P onto segment A-B and classifies the side:
+    /// s = dot(P-A, d)/|d|, u = s/|d|, distance_from_shelf_start_cm =
+    /// s*100; shelfSide is derived from the face normal (front/back).
     static func associate(
         point: (Double, Double),
         shelf: ShelfSegment,
         floorID: String,
-        endpointMarginM: Double = 0.15
+        endpointMarginM: Double = 0.15,
+        occludedByStructure: Bool = false
     ) -> Association? {
         guard shelf.floorID == floorID else { return nil }
         let dx = shelf.endM.0 - shelf.startM.0
@@ -46,35 +299,136 @@ enum ShelfAssociationEngine {
         let atEndpoint = s < endpointMarginM || s > length - endpointMarginM
         return Association(
             shelfCode: shelf.shelfCode,
-            shelfSide: shelf.side,
+            shelfSide: shelf.side(for: point),
             distanceFromShelfStartCm: SourceGeometry.rounded(s * 100.0),
             positionRatio: SourceGeometry.rounded(ratio),
             distanceToSegmentM: SourceGeometry.rounded(distanceToSegment),
             distanceFromStartM: SourceGeometry.rounded(s),
             segmentLengthM: SourceGeometry.rounded(length),
-            atEndpoint: atEndpoint
+            atEndpoint: atEndpoint,
+            secondCandidateDistanceM: nil,
+            marginM: nil,
+            occludedByStructure: occludedByStructure
         )
     }
 
-    /// Chooses the best (closest) shelf for a tag point across the
-    /// candidate segments of the floor.
+    /// Chooses the best (closest) shelf for a tag point via the spatial
+    /// index; the second-closest candidate distance and the margin
+    /// (second - first) are reported for the ambiguity gate (§13.4).
     static func bestAssociation(
         point: (Double, Double),
         shelves: [ShelfSegment],
-        floorID: String
+        index: ShelfSpatialIndex?,
+        floorID: String,
+        occludedByStructure: (ShelfSegment) -> Bool
     ) -> Association? {
-        var best: Association?
-        var bestDistance = Double.infinity
-        for shelf in shelves {
-            guard let association = associate(point: point, shelf: shelf, floorID: floorID) else {
+        let candidates = index?.candidates(point: point, floorID: floorID)
+            ?? shelves.filter { $0.floorID == floorID }
+        var first: (Association, Double)?
+        var secondDistance = Double.infinity
+        for shelf in candidates {
+            guard let association = associate(
+                point: point,
+                shelf: shelf,
+                floorID: floorID,
+                occludedByStructure: occludedByStructure(shelf)) else {
                 continue
             }
-            if association.distanceToSegmentM < bestDistance {
-                bestDistance = association.distanceToSegmentM
-                best = association
+            let distance = association.distanceToSegmentM
+            if let current = first {
+                if distance < current.1 {
+                    secondDistance = current.1
+                    first = (association, distance)
+                } else if distance < secondDistance {
+                    secondDistance = distance
+                }
+            } else {
+                first = (association, distance)
             }
         }
-        return best
+        guard var best = first else { return nil }
+        if secondDistance.isFinite {
+            best.0.secondCandidateDistanceM = secondDistance
+            best.0.marginM = secondDistance - best.1
+        }
+        return best.0
+    }
+
+    // MARK: - Occlusion
+
+    /// Fixed structures from `fixed_structures.json` (polygon or AABB
+    /// envelope) used for the occlusion check.
+    struct FixedStructure {
+        var structureCode: String
+        var floorID: String
+        var polygonM: [(Double, Double)]?
+        var boundsMinM: (Double, Double)
+        var boundsMaxM: (Double, Double)
+
+        func boundsContains(x: Double, y: Double) -> Bool {
+            return x >= boundsMinM.0 && x <= boundsMaxM.0
+                && y >= boundsMinM.1 && y <= boundsMaxM.1
+        }
+    }
+
+    /// Ray-casting point-in-polygon for a closed polygon.
+    static func pointInPolygon(point: (Double, Double), polygon: [(Double, Double)]) -> Bool {
+        guard polygon.count >= 3 else { return false }
+        var inside = false
+        var previous = polygon[polygon.count - 1]
+        for vertex in polygon {
+            let crosses = (vertex.1 > point.1) != (previous.1 > point.1)
+                && point.0 < (previous.0 - vertex.0) * (point.1 - vertex.1)
+                    / (previous.1 - vertex.1) + vertex.0
+            if crosses { inside.toggle() }
+            previous = vertex
+        }
+        return inside
+    }
+
+    /// Occlusion: the midpoint between the tag and its closest point on
+    /// the shelf axis lies inside a fixed structure of the same floor
+    /// (a pillar/table between scanner and shelf blocks the sight line,
+    /// §13.4 occlusion check). The structure must be within
+    /// `maximumDistanceM` of the shelf to avoid far-away false hits.
+    static func isOccluded(
+        tagPoint: (Double, Double),
+        shelf: ShelfSegment,
+        structures: [FixedStructure],
+        maximumDistanceM: Double = 2.0
+    ) -> Bool {
+        let dx = shelf.endM.0 - shelf.startM.0
+        let dy = shelf.endM.1 - shelf.startM.1
+        let lengthSquared = dx * dx + dy * dy
+        guard lengthSquared > 1.0e-9 else { return false }
+        let px = tagPoint.0 - shelf.startM.0
+        let py = tagPoint.1 - shelf.startM.1
+        let ratio = max(0.0, min(1.0, (px * dx + py * dy) / lengthSquared))
+        let projection = (
+            shelf.startM.0 + ratio * dx,
+            shelf.startM.1 + ratio * dy)
+        let midpoint = (
+            (tagPoint.0 + projection.0) / 2.0,
+            (tagPoint.1 + projection.1) / 2.0)
+        for structure in structures where structure.floorID == shelf.floorID {
+            guard structure.boundsContains(x: midpoint.0, y: midpoint.1) else {
+                continue
+            }
+            if let polygon = structure.polygonM {
+                if pointInPolygon(point: midpoint, polygon: polygon) {
+                    // The structure must sit near the shelf line.
+                    let structureDistance = hypot(
+                        midpoint.0 - projection.0,
+                        midpoint.1 - projection.1)
+                    if structureDistance <= maximumDistanceM {
+                        return true
+                    }
+                }
+            } else {
+                return true
+            }
+        }
+        return false
     }
 }
 
@@ -90,6 +444,9 @@ enum AutomaticQualityGate {
         var association: ShelfAssociationEngine.Association
         var maximumEndpointDistanceM: Double
         var maximumAssociationDistanceM: Double
+        /// First/second candidate margin below this is ambiguous
+        /// (parallel aisle, §13.6).
+        var minimumAssociationMarginM: Double
         var graphQualityPassed: Bool
         var mapSessionIdentityConsistent: Bool
     }
@@ -118,11 +475,22 @@ enum AutomaticQualityGate {
         guard input.association.distanceToSegmentM <= input.maximumAssociationDistanceM else {
             return (.rescanRequired, "shelf_association_distance_exceeded")
         }
+        // Parallel-aisle ambiguity: the second-closest shelf is nearly as
+        // close as the first.
+        if let second = input.association.secondCandidateDistanceM,
+           let margin = input.association.marginM,
+           second.isFinite,
+           margin < input.minimumAssociationMarginM {
+            return (.rescanRequired, "shelf_association_margin_insufficient")
+        }
         guard !input.association.atEndpoint else {
             return (.rescanRequired, "shelf_endpoint_ambiguity")
         }
         guard input.association.shelfSide == "front" || input.association.shelfSide == "back" else {
             return (.rescanRequired, "shelf_side_ambiguous")
+        }
+        guard !input.association.occludedByStructure else {
+            return (.rescanRequired, "shelf_occluded_by_structure")
         }
         return (.accepted, "")
     }

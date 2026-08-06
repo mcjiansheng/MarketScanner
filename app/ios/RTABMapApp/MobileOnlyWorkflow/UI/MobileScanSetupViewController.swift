@@ -38,6 +38,7 @@ final class MobileScanSetupViewController: UIViewController {
         case outsideFloorBounds
         case insideObstacle
         case insufficientClearance(Double)
+        case evidenceCorrupt
 
         var reason: String {
             switch self {
@@ -48,6 +49,8 @@ final class MobileScanSetupViewController: UIViewController {
             case .insufficientClearance(let distance):
                 return String(format: "起点距离障碍物过近（%.2f m < %.2f m）",
                               distance, MobileScanSetupViewController.minimumClearanceM)
+            case .evidenceCorrupt:
+                return "地图障碍证据损坏，无法验证可通行性（请重新编译地图）"
             }
         }
     }
@@ -73,6 +76,10 @@ final class MobileScanSetupViewController: UIViewController {
     private var startYM: Double?
     private var startYawRad: Double = 0
     private var traversabilityFailure: TraversabilityFailure?
+    /// H-10: set when any obstacle evidence artifact is missing,
+    /// unparseable or malformed — fail closed, never treat the whole
+    /// floor as traversable.
+    private var obstacleEvidenceFailed = false
 
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -100,14 +107,17 @@ final class MobileScanSetupViewController: UIViewController {
 
         // Start position marker (§5.2): explicit frame, managed without
         // AutoLayout so the rotation transform never changes the tap
-        // coordinate. The arrow points along +X (right) at yaw = 0.
+        // coordinate. The arrow artwork points along +X (right) at
+        // yaw = 0 (H-09): a horizontal bar on the marker's right side,
+        // so `rotateMarker`'s negation-only chirality flip renders the
+        // frozen yaw contract without any 90° bias.
         startMarker.isHidden = true
         startMarker.translatesAutoresizingMaskIntoConstraints = false
         startMarker.frame = CGRect(x: 0, y: 0, width: 44, height: 44)
         let markerDot = UIView(frame: CGRect(x: 16, y: 16, width: 12, height: 12))
         markerDot.backgroundColor = .systemRed
         markerDot.layer.cornerRadius = 6
-        let arrow = UIView(frame: CGRect(x: 21, y: 2, width: 2, height: 14))
+        let arrow = UIView(frame: CGRect(x: 29, y: 21, width: 14, height: 2))
         arrow.backgroundColor = .systemRed
         startMarker.addSubview(arrow)
         startMarker.addSubview(markerDot)
@@ -232,8 +242,14 @@ final class MobileScanSetupViewController: UIViewController {
 
     /// Loads obstacle polygons (shelves + fixed structures) for the
     /// selected floor from the compiled package (§5.3).
+    ///
+    /// H-10: evidence is fail-closed — a missing/unparseable artifact,
+    /// a missing element array, or a malformed geometry for THIS floor
+    /// marks the evidence corrupt and blocks scan start instead of
+    /// silently treating the floor as fully traversable.
     private func loadObstacles(for floorID: String) {
         obstacles = []
+        obstacleEvidenceFailed = false
         guard let map = currentMap() else { return }
         for file in ["shelves.json", "fixed_structures.json"] {
             let url = map.packageDirectory.appendingPathComponent(file)
@@ -241,14 +257,26 @@ final class MobileScanSetupViewController: UIViewController {
                   let object = try? StrictJSONDocumentParser.object(
                       from: data,
                       limits: StrictJSONDocumentLimits(maximumBytes: data.count + 1)) as? [String: Any]
-            else { continue }
+            else {
+                obstacleEvidenceFailed = true
+                continue
+            }
             let key = file == "shelves.json" ? "shelves" : "structures"
-            guard let elements = object[key] as? [[String: Any]] else { continue }
+            guard let elements = object[key] as? [[String: Any]] else {
+                obstacleEvidenceFailed = true
+                continue
+            }
             for element in elements {
                 guard element["floor_id"] as? String == floorID else { continue }
                 guard let geometry = element["geometry"] as? [String: Any],
-                      let coordinates = geometry["coordinates"] as? [[Double]]
-                else { continue }
+                      let coordinates = geometry["coordinates"] as? [[Double]],
+                      coordinates.allSatisfy({
+                          $0.count >= 2 && $0[0].isFinite && $0[1].isFinite
+                      })
+                else {
+                    obstacleEvidenceFailed = true
+                    continue
+                }
                 var points: [(Double, Double)] = []
                 for pair in coordinates where pair.count >= 2 {
                     points.append((pair[0], pair[1]))
@@ -259,7 +287,10 @@ final class MobileScanSetupViewController: UIViewController {
                    abs(points.first!.1 - points.last!.1) < 1e-9 {
                     points.removeLast()
                 }
-                guard points.count >= 3 else { continue }
+                guard points.count >= 3 else {
+                    obstacleEvidenceFailed = true
+                    continue
+                }
                 var minX = Double.greatestFiniteMagnitude
                 var minY = Double.greatestFiniteMagnitude
                 var maxX = -Double.greatestFiniteMagnitude
@@ -276,6 +307,11 @@ final class MobileScanSetupViewController: UIViewController {
     // MARK: - Traversability (§5.3)
 
     private func traversability(at xM: Double, _ yM: Double) -> TraversabilityFailure? {
+        // H-10: corrupt evidence fails closed — no point is considered
+        // traversable until the artifacts parse cleanly.
+        if obstacleEvidenceFailed {
+            return .evidenceCorrupt
+        }
         guard let floor = currentFloor,
               let minX = floor.bounds["min_x_m"], let minY = floor.bounds["min_y_m"],
               let maxX = floor.bounds["max_x_m"], let maxY = floor.bounds["max_y_m"]
@@ -424,6 +460,12 @@ final class MobileScanSetupViewController: UIViewController {
             startButton.isEnabled = false
             return
         }
+        // H-10: corrupt obstacle evidence blocks scan start.
+        if obstacleEvidenceFailed {
+            summaryLabel.text = "地图障碍证据损坏（shelves/fixed_structures），已阻止扫描启动，请重新编译地图。"
+            startButton.isEnabled = false
+            return
+        }
         guard let x = startXM, let y = startYM else {
             summaryLabel.text = "已选「\(map.name)」，请在预览图上点选扫描起点。"
             startButton.isEnabled = false
@@ -450,6 +492,11 @@ final class MobileScanSetupViewController: UIViewController {
         }
         guard traversabilityFailure == nil else {
             presentNotice("起点不可用：\(traversabilityFailure!.reason)")
+            return
+        }
+        // H-10: defense in depth — never start with corrupt evidence.
+        guard !obstacleEvidenceFailed else {
+            presentNotice("地图障碍证据损坏，无法开始扫描，请重新编译地图。")
             return
         }
         guard !storeID.isEmpty else {

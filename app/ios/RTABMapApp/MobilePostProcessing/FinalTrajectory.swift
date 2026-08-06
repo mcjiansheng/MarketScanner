@@ -213,13 +213,19 @@ enum FinalTrajectory {
 
     /// Inverts the monotonic -> UTC mapping by walking segments; returns
     /// the monotonic time whose mapped UTC equals (or is closest within
-    /// one millisecond of) the target.
+    /// one millisecond of) the target. Never inverts across a clock
+    /// discontinuity edge (V1R4 §7.3); a bounded outer-edge
+    /// extrapolation of at most the mapper's maximum is allowed.
     private static func inverseMap(utcMapper: MonotonicUTCMapper, utc: Double) -> Double? {
         let samples = utcMapper.samples
         guard samples.count >= 2 else { return nil }
         // The mapping is monotonic in utc when the clock is continuous;
-        // walk adjacent samples and solve the linear segment.
+        // walk adjacent samples and solve the linear segment. Discontinuity
+        // edges (clock jumps / timezone changes) are never inverted across.
         for index in 0..<(samples.count - 1) {
+            guard !utcMapper.discontinuityEdges.contains(index) else {
+                continue
+            }
             let a = samples[index]
             let b = samples[index + 1]
             let aUTC = a.utcUnixSeconds
@@ -229,6 +235,36 @@ enum FinalTrajectory {
                 guard abs(spanUTC) > 1.0e-9 else { continue }
                 let ratio = (utc - aUTC) / spanUTC
                 return a.monotonicSeconds + (b.monotonicSeconds - a.monotonicSeconds) * ratio
+            }
+        }
+        // Bounded outer-edge extrapolation (only when the adjacent edge is
+        // continuous), so the first/last session seconds can still map.
+        if let first = samples.first,
+           !utcMapper.discontinuityEdges.contains(0),
+           utc < first.utcUnixSeconds,
+           samples.count >= 2,
+           first.utcUnixSeconds - utc
+            <= MonotonicUTCMapper.maximumOuterExtrapolationSeconds {
+            let b = samples[1]
+            let spanUTC = b.utcUnixSeconds - first.utcUnixSeconds
+            if abs(spanUTC) > 1.0e-9 {
+                let ratio = (utc - first.utcUnixSeconds) / spanUTC
+                return first.monotonicSeconds
+                    + (b.monotonicSeconds - first.monotonicSeconds) * ratio
+            }
+        }
+        if let last = samples.last,
+           !utcMapper.discontinuityEdges.contains(samples.count - 2),
+           utc > last.utcUnixSeconds,
+           samples.count >= 2,
+           utc - last.utcUnixSeconds
+            <= MonotonicUTCMapper.maximumOuterExtrapolationSeconds {
+            let a = samples[samples.count - 2]
+            let spanUTC = last.utcUnixSeconds - a.utcUnixSeconds
+            if abs(spanUTC) > 1.0e-9 {
+                let ratio = (utc - a.utcUnixSeconds) / spanUTC
+                return a.monotonicSeconds
+                    + (last.monotonicSeconds - a.monotonicSeconds) * ratio
             }
         }
         // Slight tolerance at the edges.

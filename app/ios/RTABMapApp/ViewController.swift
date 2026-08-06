@@ -38,6 +38,16 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
     private var clockRecorder: ClockCorrelationRecorder?
     private var clockTimer: Timer?
     private var clockSidecarURL: URL?
+    // V1R4 §7.2/§7.4: system clock / timezone change observers; the
+    // recorder appends an explicit segment-start correlation on each.
+    private var clockChangeObservers: [NSObjectProtocol] = []
+    // V1R4 §7.2: a failed durable sidecar write blocks processing
+    // eligibility (fail closed; the write is never `try?`-swallowed).
+    private var clockSidecarWriteFailure: String?
+    private var clockSidecarWriteResult: ClockSidecarWriteResult?
+    // V1R4 §7.1: last node id bound into the clock sidecar, so a new
+    // binding is recorded only when RTAB-Map creates a new node.
+    private var lastClockBoundNodeID = 0
     private var activeScanConfiguration = PriorMapScanConfiguration.freeMapping
     private var priorMapLocalizer: PriorMapStageOneLocalizer?
     private var activePriorMapPackage: PriorMapPackage?
@@ -459,6 +469,12 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
             }
             return try self.startMobileOnlyScan(configuration)
         }
+        // B-09: when the workflow cannot commit a validated host start
+        // (receipt invalid or persistence failed), the host must stop the
+        // already-running scan so it cannot outlive a failed workflow.
+        coordinator.onRollbackScan = { [weak self] _ in
+            self?.stopMapping(ignoreSaving: true)
+        }
     }
 
     private func persistScanConfiguration(_ configuration: MobileScanConfiguration) {
@@ -484,7 +500,9 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
 
     /// Begins recording monotonic↔UTC correlations for the active scan.
     /// The sidecar is written into the segment directory and flushed on
-    /// finalization; a periodic timer samples every 30 s while scanning.
+    /// finalization; a periodic timer samples every 30 s while scanning
+    /// and system clock / timezone changes append explicit segment
+    /// starts (V1R4 §7.4).
     private func startClockCorrelationRecording(
         segmentDirectory: URL,
         trackingSessionID: String
@@ -500,6 +518,25 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
             utcOffsetSeconds: TimeZone.current.secondsFromGMT())
         clockRecorder = recorder
         clockSidecarURL = url
+        clockSidecarWriteFailure = nil
+        clockSidecarWriteResult = nil
+        lastClockBoundNodeID = 0
+        // V1R4 §7.4: an explicit correlation at every system clock change
+        // and timezone change; each becomes a discontinuity segment edge
+        // so post-processing never interpolates across it.
+        let center = NotificationCenter.default
+        clockChangeObservers = [
+            center.addObserver(
+                forName: NSNotification.Name.NSSystemClockDidChange,
+                object: nil, queue: .main) { [weak self] _ in
+                self?.recordClockCorrelation(reason: .systemClockChange)
+            },
+            center.addObserver(
+                forName: NSNotification.Name.NSSystemTimeZoneDidChange,
+                object: nil, queue: .main) { [weak self] _ in
+                self?.recordClockCorrelation(reason: .timezoneChange)
+            },
+        ]
         clockTimer = Timer.scheduledTimer(
             withTimeInterval: ClockCorrelationRecorder.periodicIntervalSeconds,
             repeats: true) { [weak self] _ in
@@ -512,16 +549,39 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         }
     }
 
-    /// Stops the periodic timer and, when flushing, appends the
-    /// session_end record and writes the sidecar durably.
-    private func stopClockCorrelationRecording(flush: Bool) {
+    /// Appends a correlation record for the given reason (clock change /
+    /// timezone change / app lifecycle events, V1R4 §7.4).
+    private func recordClockCorrelation(reason: ClockCorrelationRecorder.Reason) {
+        guard let recorder = clockRecorder else { return }
+        recorder.record(
+            reason: reason,
+            monotonicSeconds: ProcessInfo.processInfo.systemUptime,
+            utcUnixSeconds: Date().timeIntervalSince1970,
+            timezoneID: TimeZone.current.identifier,
+            utcOffsetSeconds: TimeZone.current.secondsFromGMT())
+    }
+
+    /// Stops the periodic timer and observers and, when flushing, appends
+    /// the session_end record and writes the sidecar durably (V1R4 §7.2).
+    /// A failed write is never swallowed: it is captured in
+    /// `clockSidecarWriteFailure` and blocks processing eligibility.
+    /// Returns the write watermark when the flush succeeded.
+    @discardableResult
+    private func stopClockCorrelationRecording(
+        flush: Bool
+    ) -> ClockSidecarWriteResult? {
         clockTimer?.invalidate()
         clockTimer = nil
+        for observer in clockChangeObservers {
+            NotificationCenter.default.removeObserver(observer)
+        }
+        clockChangeObservers = []
         guard let recorder = clockRecorder else {
             clockRecorder = nil
             clockSidecarURL = nil
-            return
+            return nil
         }
+        var result: ClockSidecarWriteResult?
         if flush {
             recorder.record(
                 reason: .sessionEnd,
@@ -530,11 +590,24 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                 timezoneID: TimeZone.current.identifier,
                 utcOffsetSeconds: TimeZone.current.secondsFromGMT())
             if let url = clockSidecarURL {
-                try? recorder.write(to: url)
+                do {
+                    let writeResult = try recorder.write(to: url)
+                    clockSidecarWriteResult = writeResult
+                    clockSidecarWriteFailure = nil
+                    result = writeResult
+                } catch {
+                    clockSidecarWriteResult = nil
+                    clockSidecarWriteFailure =
+                        "clock_sidecar_write_failed: \(error.localizedDescription)"
+                }
+            } else {
+                clockSidecarWriteResult = nil
+                clockSidecarWriteFailure = "clock_sidecar_write_failed: sidecar URL unavailable"
             }
         }
         clockRecorder = nil
         clockSidecarURL = nil
+        return result
     }
 
     private func finishStartup() {
@@ -1004,6 +1077,9 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
     
     @objc func appMovedToBackground() {
         print("appMovedToBackground()")
+        // V1R4 §7.4: capture the clock correlation at the interruption
+        // boundary so processing sees the background gap explicitly.
+        recordClockCorrelation(reason: .willResignActive)
         if mState == .STATE_MAPPING || mState == .STATE_CAMERA {
             suspendCaptureForSystemInterruption(reason: "application resigned active")
         }
@@ -1109,6 +1185,9 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
     
     @objc func appMovedToForeground() {
         print("appMovedToForeground()")
+        // V1R4 §7.4: capture the clock correlation when the app returns
+        // so the interruption gap is a bounded, explicit segment.
+        recordClockCorrelation(reason: .didBecomeActive)
         updateDisplayFromDefaults()
         if !resumeCaptureAfterSystemInterruption() {
             updateState(state: mState)
@@ -2119,6 +2198,25 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
             else if accept {
                 rtabmap?.postOdometryEvent(frame: frame, orientation: rotation, viewport: self.view.frame.size)
             }
+        }
+
+        // V1R4 §7.1: bind every newly created RTAB-Map node to the ARKit
+        // frame timestamp, device uptime and UTC so post-processing can
+        // map DB node stamps to UTC without assuming they are UTC.
+        if mState == .STATE_MAPPING,
+           let recorder = clockRecorder,
+           let binding = rtabmap?.latestNodeBinding(
+               frameTimestamp: frame.timestamp),
+           binding.nodeId != lastClockBoundNodeID {
+            lastClockBoundNodeID = binding.nodeId
+            recorder.recordNodeBinding(
+                nodeID: binding.nodeId,
+                nodeStamp: binding.nodeStamp,
+                sampledFrameTimestamp: binding.nodeTimebaseFrameTimestamp,
+                systemUptime: ProcessInfo.processInfo.systemUptime,
+                utcUnixSeconds: Date().timeIntervalSince1970,
+                timezoneID: TimeZone.current.identifier,
+                utcOffsetSeconds: TimeZone.current.secondsFromGMT())
         }
         
         if !status.isEmpty {
@@ -4023,9 +4121,11 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
             completion?(.resumeRecording)
             return
         }
-        // V1R3 §7.1: flush the clock correlation sidecar before the scan
-        // is finalized so the evidence is bound into the session.
-        stopClockCorrelationRecording(flush: true)
+        // V1R3 §7.1 / V1R4 §7.2: flush the clock correlation sidecar
+        // before the scan is finalized so the evidence is bound into the
+        // session. A failed write is captured (never `try?`-swallowed)
+        // and blocks processing eligibility below.
+        let clockSidecarResult = stopClockCorrelationRecording(flush: true)
 
         let segmentDirectory: URL
         let databaseURL: URL
@@ -4152,7 +4252,12 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                     finalDatabaseBytes = self.databaseStorageBytes(at: databaseURL)
                     let isPriorMapScan =
                         scanSession.scanConfiguration.workflowMode == .priorMapLocalized
+                    // V1R4 §7.2: a failed clock sidecar write blocks
+                    // processing in every scan mode (fail closed).
                     var processingBlockers: [String] = []
+                    if self.clockSidecarWriteFailure != nil {
+                        processingBlockers.append("clock_sidecar_write_failed")
+                    }
                     if isPriorMapScan {
                         if !priorMapDrained {
                             processingBlockers.append("prior_map_queue_not_drained")
@@ -4171,15 +4276,34 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                             processingBlockers.append("localization_state_events_missing")
                         }
                     }
-                    let metadataFinalized = !isPriorMapScan || processingBlockers.isEmpty
-                    let processingEligibility = isPriorMapScan
-                        ? ScanProcessingEligibility(
-                            status: metadataFinalized ? "eligible" : "invalid",
-                            blockers: processingBlockers)
-                        : nil
+                    // V1R4 §13.1: flush the tag burst sidecar before the
+                    // metadata snapshot so the watermark reflects every
+                    // observation ingested during the scan. A failed burst
+                    // write blocks processing fail-closed (the sidecar is
+                    // required and its count/last-ID/complete watermarks are
+                    // validated by the PC side).
+                    let burstFlushResult =
+                        scanSession.flushTagObservationBursts()
+                    if !burstFlushResult.complete {
+                        processingBlockers.append(
+                            "tag_observation_burst_write_failed")
+                    }
+                    // Clock evidence applies to every mode; prior-map
+                    // evidence only to prior-map scans.
+                    let metadataFinalized = processingBlockers.isEmpty
+                    let processingEligibility: ScanProcessingEligibility?
+                    if processingBlockers.isEmpty {
+                        processingEligibility = isPriorMapScan
+                            ? ScanProcessingEligibility(
+                                status: "eligible", blockers: [])
+                            : nil
+                    } else {
+                        processingEligibility = ScanProcessingEligibility(
+                            status: "invalid", blockers: processingBlockers)
+                    }
                     if !processingBlockers.isEmpty {
                         processingEligibilityError =
-                            "Prior-map localization evidence is incomplete: "
+                            "Required scan evidence is incomplete: "
                             + processingBlockers.joined(separator: ", ")
                     }
                     let metadata = ScanSegmentMetadata(
@@ -4217,6 +4341,10 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                         priorMapId: scanSession.scanConfiguration.priorMapId,
                         priorMapSha256: scanSession.scanConfiguration.priorMapSha256,
                         floorId: scanSession.scanConfiguration.floorId,
+                        // B-08: the session records its store identity at
+                        // finalization; the snapshot eligibility chain
+                        // validates it fail-closed against the request.
+                        storeId: scanSession.scanConfiguration.storeID,
                         initialMapPose: scanSession.scanConfiguration.initialMapPose,
                         localizationTrace: scanSession.scanConfiguration.workflowMode == .priorMapLocalized
                             ? "localization_trace.jsonl"
@@ -4241,7 +4369,18 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                             : nil,
                         localizedPriceTagCount: scanSession.scanConfiguration.workflowMode == .priorMapLocalized
                             ? scanSession.confirmedLocalizedPriceTagCount()
-                            : nil)
+                            : nil,
+                        clockCorrelationCount: clockSidecarResult?.correlationCount,
+                        clockNodeBindingCount: clockSidecarResult?.nodeBindingCount,
+                        clockLastMonotonic: clockSidecarResult?.lastMonotonicSeconds,
+                        clockLastUTC: clockSidecarResult?.lastUTCSeconds,
+                        clockEvidenceComplete: clockSidecarResult?.evidenceComplete,
+                        // V1R4 §13.1: exact tag burst watermarks from the
+                        // durable sidecar write so processing can validate
+                        // count/last-ID/complete fail-closed.
+                        tagObservationBurstCount: burstFlushResult.count,
+                        tagObservationBurstLastID: burstFlushResult.lastBurstID,
+                        tagObservationBurstComplete: burstFlushResult.complete)
                     let finalSnapshot = scanSession.makeSidecarSnapshot(metadata: metadata)
                     snapshot = finalSnapshot
                     sidecarCommitResult = try scanSession.writeSidecarFiles(
@@ -5528,26 +5667,43 @@ extension ViewController: MobileOnlyScanStarting {
 
         // 5. Receipt postconditions: the session, segment directory,
         //    streaming database and sidecar writers must actually exist.
-        guard let session = supermarketSession else {
-            throw MobileOnlyWorkflowError.invalidState("scan session unavailable after start")
-        }
-        let segmentDirectory = try session.currentSegmentDirectory()
-        guard FileManager.default.fileExists(atPath: segmentDirectory.path) else {
-            throw MobileOnlyWorkflowError.invalidState("segment directory missing after start")
-        }
-        let databaseURL = try session.streamingDatabaseURL()
-        guard FileManager.default.fileExists(atPath: databaseURL.path) else {
-            throw MobileOnlyWorkflowError.invalidState("streaming database missing after start")
-        }
-        // Sidecar writer readiness probe: the segment directory must be
-        // writable for the required evidence sidecars.
-        let probe = segmentDirectory.appendingPathComponent(
-            ".ms_sidecar_probe_\(UUID().uuidString)")
-        let writable = FileManager.default.createFile(
-            atPath: probe.path, contents: Data(), attributes: nil)
-        try? FileManager.default.removeItem(at: probe)
-        guard writable else {
-            throw MobileOnlyWorkflowError.invalidState("sidecar writers not ready (segment not writable)")
+        //    B-09: any failure AFTER the host started the scan must roll
+        //    the scan back — a live capture must never outlive a failed
+        //    start.
+        let session: SupermarketScanSession
+        let segmentDirectory: URL
+        let databaseURL: URL
+        let sidecarWritersReady: Bool
+        do {
+            guard let startedSession = supermarketSession else {
+                throw MobileOnlyWorkflowError.invalidState("scan session unavailable after start")
+            }
+            session = startedSession
+            segmentDirectory = try session.currentSegmentDirectory()
+            guard FileManager.default.fileExists(atPath: segmentDirectory.path) else {
+                throw MobileOnlyWorkflowError.invalidState("segment directory missing after start")
+            }
+            databaseURL = try session.streamingDatabaseURL()
+            guard FileManager.default.fileExists(atPath: databaseURL.path) else {
+                throw MobileOnlyWorkflowError.invalidState("streaming database missing after start")
+            }
+            // Sidecar writer readiness probe: the segment directory must be
+            // writable for the required evidence sidecars (B-09: the
+            // receipt records the REAL probe result, never a constant).
+            let probe = segmentDirectory.appendingPathComponent(
+                ".ms_sidecar_probe_\(UUID().uuidString)")
+            let writable = FileManager.default.createFile(
+                atPath: probe.path, contents: Data(), attributes: nil)
+            try? FileManager.default.removeItem(at: probe)
+            guard writable else {
+                throw MobileOnlyWorkflowError.invalidState("sidecar writers not ready (segment not writable)")
+            }
+            sidecarWritersReady = writable
+        } catch {
+            // B-09: roll the already-started scan back so a workflow
+            // failure cannot leave a live capture running underneath.
+            stopMapping(ignoreSaving: true)
+            throw error
         }
 
         self.persistScanConfiguration(configuration)
@@ -5556,6 +5712,15 @@ extension ViewController: MobileOnlyScanStarting {
         startClockCorrelationRecording(
             segmentDirectory: segmentDirectory,
             trackingSessionID: session.trackingSessionId)
+        // B-09: "recording started" must be proven, not assumed: the
+        // camera pipeline must be live AND the streaming database must
+        // exist with a real header on disk.
+        let cameraActive = mState == .STATE_CAMERA || mState == .STATE_MAPPING
+        let databaseSize = (try? FileManager.default
+            .attributesOfItem(atPath: databaseURL.path)[.size] as? NSNumber)?.intValue ?? 0
+        let rtabMapRecordingStarted = rtabmap != nil
+            && cameraActive
+            && databaseSize > 0
         return MobileScanStartReceipt(
             trackingSessionID: session.trackingSessionId,
             segmentDirectory: segmentDirectory,
@@ -5564,9 +5729,9 @@ extension ViewController: MobileOnlyScanStarting {
             priorMapSHA256: entry.packageSHA256,
             floorID: configuration.floorID,
             storeID: configuration.storeID,
-            arSessionStarted: mState == .STATE_CAMERA || mState == .STATE_MAPPING,
-            rtabMapRecordingStarted: rtabmap != nil,
-            requiredSidecarWritersReady: true,
+            arSessionStarted: cameraActive,
+            rtabMapRecordingStarted: rtabMapRecordingStarted,
+            requiredSidecarWritersReady: sidecarWritersReady,
             startedAtMonotonic: ProcessInfo.processInfo.systemUptime,
             startedAtUTC: Date().timeIntervalSince1970,
             appGitSHA: identity.appGitSHA)

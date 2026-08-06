@@ -124,6 +124,8 @@
 		4EA700012F60002200100001 /* TagObservationResolver.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60002200100002 /* TagObservationResolver.swift */; };
 		4EA700012F60002100100001 /* ShelfAssociationEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60002100100002 /* ShelfAssociationEngine.swift */; };
 		4EA700012F60002000100001 /* SessionSnapshotTransaction.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60002000100002 /* SessionSnapshotTransaction.swift */; };
+		4EA700012F60003000100001 /* AbsolutePriorEvidenceParser.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60003000100002 /* AbsolutePriorEvidenceParser.swift */; };
+		4EA700012F60003100100001 /* StrictClockEvidenceParser.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60003100100002 /* StrictClockEvidenceParser.swift */; };
 		4EA700012F60001F00100001 /* SE2Transform.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60001F00100002 /* SE2Transform.swift */; };
 		4EA700012F60001E00100001 /* SE2FactorGraphCore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60001E00100002 /* SE2FactorGraphCore.swift */; };
 		4EA700012F60001D00100001 /* FinalTrajectory.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60001D00100002 /* FinalTrajectory.swift */; };
@@ -301,6 +303,8 @@
 		4EA700012F60002200100002 /* TagObservationResolver.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = TagObservationResolver.swift; path = RTABMapApp/MobilePostProcessing/TagObservationResolver.swift; sourceTree = "<group>"; };
 		4EA700012F60002100100002 /* ShelfAssociationEngine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = ShelfAssociationEngine.swift; path = RTABMapApp/MobilePostProcessing/ShelfAssociationEngine.swift; sourceTree = "<group>"; };
 		4EA700012F60002000100002 /* SessionSnapshotTransaction.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = SessionSnapshotTransaction.swift; path = RTABMapApp/MobilePostProcessing/SessionSnapshotTransaction.swift; sourceTree = "<group>"; };
+		4EA700012F60003000100002 /* AbsolutePriorEvidenceParser.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = AbsolutePriorEvidenceParser.swift; path = RTABMapApp/MobilePostProcessing/AbsolutePriorEvidenceParser.swift; sourceTree = "<group>"; };
+		4EA700012F60003100100002 /* StrictClockEvidenceParser.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = StrictClockEvidenceParser.swift; path = RTABMapApp/MobilePostProcessing/StrictClockEvidenceParser.swift; sourceTree = "<group>"; };
 		4EA700012F60001F00100002 /* SE2Transform.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = SE2Transform.swift; path = RTABMapApp/MobilePostProcessing/SE2Transform.swift; sourceTree = "<group>"; };
 		4EA700012F60001E00100002 /* SE2FactorGraphCore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = SE2FactorGraphCore.swift; path = RTABMapApp/MobilePostProcessing/SE2FactorGraphCore.swift; sourceTree = "<group>"; };
 		4EA700012F60001D00100002 /* FinalTrajectory.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = FinalTrajectory.swift; path = RTABMapApp/MobilePostProcessing/FinalTrajectory.swift; sourceTree = "<group>"; };
@@ -646,6 +650,8 @@
 				4EA700012F60002200100002 /* TagObservationResolver.swift */,
 				4EA700012F60002100100002 /* ShelfAssociationEngine.swift */,
 				4EA700012F60002000100002 /* SessionSnapshotTransaction.swift */,
+				4EA700012F60003000100002 /* AbsolutePriorEvidenceParser.swift */,
+				4EA700012F60003100100002 /* StrictClockEvidenceParser.swift */,
 				4EA700012F60001F00100002 /* SE2Transform.swift */,
 				4EA700012F60001E00100002 /* SE2FactorGraphCore.swift */,
 				4EA700012F60001D00100002 /* FinalTrajectory.swift */,
@@ -1066,7 +1072,7 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;
-			shellScript = "# V1R3: embed the exact git SHA, wave and native core SHA into the\n# app bundle; 'unknown' must never reach an eligible session.\nset -e\nREPO_ROOT=\"$SRCROOT/../..\"\nAPP_SHA=$(cd \"$REPO_ROOT\" && git rev-parse HEAD 2>/dev/null || echo unknown)\nWAVE=$(cd \"$REPO_ROOT\" && python3 -c \"import json;print(json.load(open('.github/marketscanner-repair-v2-wave.json')).get('wave','unknown'))\" 2>/dev/null || echo unknown)\nCORE_SHA=$(cd \"$REPO_ROOT\" && cat core/MarketScannerFactorGraph/market_scanner_factor_graph.cpp core/MarketScannerFactorGraph/market_scanner_factor_graph.h | shasum -a 256 | cut -d\" \" -f1 || echo unknown)\nOUT=\"$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH/MarketScannerBuildIdentity.json\"\nprintf '{\n  \"format\": \"MarketScannerBuildIdentity\",\n  \"version\": 1,\n  \"app_git_sha\": \"%s\",\n  \"wave\": \"%s\",\n  \"native_core_sha256\": \"%s\"\n}\n' \"$APP_SHA\" \"$WAVE\" \"$CORE_SHA\" > \"$OUT\"\n";
+			shellScript = "# V1R4 §3.3: the ONE unified build-identity contract. The digest\n# algorithm, dirty-tree refusal and field validation all live in\n# tools/Qualification/market_scanner_build_identity.py; CI uses the\n# exact same script. Fails the build on dirty tree / unknown SHA.\nset -e\nREPO_ROOT=\"$SRCROOT/../..\"\nOUT=\"$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH/MarketScannerBuildIdentity.json\"\nmkdir -p \"$(dirname \"$OUT\")\"\npython3 \"$REPO_ROOT/tools/Qualification/market_scanner_build_identity.py\" emit --repo \"$REPO_ROOT\" --out \"$OUT\"\npython3 \"$REPO_ROOT/tools/Qualification/market_scanner_build_identity.py\" verify --repo \"$REPO_ROOT\" --identity \"$OUT\"\n";
 		};
 /* End PBXShellScriptBuildPhase section */
 
@@ -1097,6 +1103,8 @@
 				4EA700012F60002200100001 /* TagObservationResolver.swift in Sources */,
 				4EA700012F60002100100001 /* ShelfAssociationEngine.swift in Sources */,
 				4EA700012F60002000100001 /* SessionSnapshotTransaction.swift in Sources */,
+				4EA700012F60003000100001 /* AbsolutePriorEvidenceParser.swift in Sources */,
+				4EA700012F60003100100001 /* StrictClockEvidenceParser.swift in Sources */,
 				4EA700012F60001F00100001 /* SE2Transform.swift in Sources */,
 				4EA700012F60001E00100001 /* SE2FactorGraphCore.swift in Sources */,
 				4EA700012F60001D00100001 /* FinalTrajectory.swift in Sources */,

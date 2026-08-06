@@ -350,6 +350,8 @@ try Data().write(to: evidenceDirectory.appendingPathComponent(
 try Data().write(to: evidenceDirectory.appendingPathComponent(
     "tag_observations.jsonl"))
 try Data().write(to: evidenceDirectory.appendingPathComponent(
+    "tag_observation_bursts.jsonl"))
+try Data().write(to: evidenceDirectory.appendingPathComponent(
     "localization_recovery_events.jsonl"))
 try Data("[]".utf8).write(to: evidenceDirectory.appendingPathComponent(
     "localized_price_tags.json"))
@@ -751,6 +753,8 @@ try Data().write(to: longEvidenceDirectory.appendingPathComponent(
     "manual_localization_events.jsonl"))
 try Data().write(to: longEvidenceDirectory.appendingPathComponent(
     "tag_observations.jsonl"))
+try Data().write(to: longEvidenceDirectory.appendingPathComponent(
+    "tag_observation_bursts.jsonl"))
 try Data().write(to: longEvidenceDirectory.appendingPathComponent(
     "localization_recovery_events.jsonl"))
 try Data("[]".utf8).write(to: longEvidenceDirectory.appendingPathComponent(
@@ -2980,6 +2984,8 @@ func p7r6WriteBaseBundle(
         "manual_localization_events.jsonl"))
     try Data().write(to: directory.appendingPathComponent(
         "tag_observations.jsonl"))
+    try Data().write(to: directory.appendingPathComponent(
+        "tag_observation_bursts.jsonl"))
     try Data("[]".utf8).write(to: directory.appendingPathComponent(
         "localized_price_tags.json"))
     let recoveryURL = directory.appendingPathComponent(
@@ -5692,6 +5698,130 @@ catch {
     require(false, "I13 bottom-left preset failed: \(error)")
 }
 
+// V1R4 §14.1: canonical v2 self round trip — the canonical payload is a
+// valid v2 document that re-imports to the same business payload,
+// document identity and digest; elements are emitted in stable business
+// order; duplicate official identity fails closed.
+do {
+    func businessEqual(_ lhs: PriorMapSourceElement, _ rhs: PriorMapSourceElement) -> Bool {
+        guard lhs.floorId == rhs.floorId, lhs.shapeType == rhs.shapeType,
+              lhs.visible == rhs.visible, lhs.locked == rhs.locked,
+              lhs.code == rhs.code, lhs.crossCode == rhs.crossCode,
+              lhs.rowFlag == rhs.rowFlag, lhs.subsection == rhs.subsection,
+              lhs.bounds == rhs.bounds, lhs.centerM == rhs.centerM,
+              lhs.yawRad == rhs.yawRad else { return false }
+        return JSONValueComparer.equal(lhs.geometry, rhs.geometry)
+    }
+
+    let csv = """
+    floor,element
+    1,"{ ""shapeType"": ""MapShelf"", ""x"": 100, ""y"": 200, ""width"": 300, ""height"": 100, ""code"": ""S1"", ""visible"": true}"
+    2,"{ ""shapeType"": ""MapRoadPoint"", ""x"": 100, ""y"": 500, ""width"": 20, ""height"": 20, ""code"": 1}"
+    """
+    let imported = try CSVMapSourceImporter.importSource(
+        data: Data(csv.utf8), contract: .topLeft)
+    let source = MarketScannerPriorMapSource(
+        format: MarketScannerPriorMapSource.formatValue,
+        version: MarketScannerPriorMapSource.versionValue,
+        storeId: "round-trip-store", mapName: "round-trip-map",
+        source: MapSourceIdentity(
+            originalFormat: "csv", originalFilename: "round-trip.csv",
+            sourceFileSha256: "a", canonicalSourceSha256: ""),
+        coordinateContract: .topLeft,
+        elements: imported.elements, warnings: imported.warnings)
+    let payload = source.canonicalPayload
+    let payloadData = try CanonicalJSONEncoder.encode(payload)
+    let originalDigest = CanonicalSourceHasher.sha256(payloadData)
+
+    // Stable business order: payload element ids are sorted.
+    if let payloadElements = payload["elements"] as? [[String: Any]] {
+        let ids = payloadElements.compactMap { $0["id"] as? String }
+        require(ids == ids.sorted(),
+                "canonical elements must be in stable business order: \(ids)")
+    }
+    else {
+        require(false, "canonical payload must carry an elements array")
+    }
+
+    // Self round trip through the strict v2 decoder.
+    let roundTrip = try JSONMapSourceImporter.importSource(data: payloadData)
+    require(roundTrip.documentVersion == 2, "canonical payload must decode as v2")
+    require(roundTrip.storeId == "round-trip-store"
+            && roundTrip.mapName == "round-trip-map",
+            "canonical v2 must recover document store/map identity")
+    require(roundTrip.coordinateContract == .topLeft,
+            "canonical v2 must recover the coordinate contract")
+    require(roundTrip.elements.count == 2,
+            "canonical v2 round trip must keep element count")
+    let originalByID = Dictionary(uniqueKeysWithValues: imported.elements.map {
+        (CanonicalPriorMapBusinessSourceV2.stableElementID(
+            for: $0, storeID: "round-trip-store", mapName: "round-trip-map"), $0)
+    })
+    var matched = 0
+    for element in roundTrip.elements {
+        let stableID = CanonicalPriorMapBusinessSourceV2.stableElementID(
+            for: element, storeID: "round-trip-store", mapName: "round-trip-map")
+        require(stableID == element.id,
+                "round trip must keep stable identity, got \(stableID) != \(element.id)")
+        if let original = originalByID[stableID] {
+            require(businessEqual(element, original),
+                    "round trip must preserve business fields for \(stableID)")
+            matched += 1
+        }
+    }
+    require(matched == 2, "round trip must preserve every element, matched \(matched)")
+
+    // Full coordinator round trip: the v2 document is a first-class
+    // input whose own contract wins over the wizard parameters and whose
+    // canonical digest is byte-identical.
+    let staged = try writeTemporary(payloadData, named: "round-trip.json")
+    let report = try MapSourceImportCoordinator.importMap(
+        stagedURL: staged,
+        originalFilename: "round-trip.json",
+        contract: .bottomLeft)
+    require(report.mapName == "round-trip-map" && report.storeId == "round-trip-store",
+            "canonical v2 must override wizard identity")
+    require(report.coordinateContractOrigin == CoordinateContract.Origin.topLeft.rawValue,
+            "canonical v2 must override the wizard contract")
+    require(report.canonicalSourceSha256 == originalDigest,
+            "canonical v2 coordinator round trip must be byte-identical")
+    require(report.elementCount == 2,
+            "canonical v2 coordinator round trip must keep element count")
+}
+catch {
+    require(false, "V1R4 canonical v2 round trip failed: \(error)")
+}
+
+// V1R4 §14.1: duplicate official identity fails closed.
+do {
+    let json = """
+    {"format": "MarketScannerPriorMapSource", "version": 2,
+     "store_id": "s", "map_name": "m",
+     "coordinate_contract": {"unit": "centimetre", "origin": "top_left",
+       "x_axis": "right", "y_axis": "down", "rotation_direction": "clockwise_degrees"},
+     "elements": [
+       {"id": "shelf-1", "floor_id": "1", "shape_type": "MapShelf",
+        "visible": true, "locked": false, "code": "S1",
+        "source": {"sourceId": "dup"}},
+       {"id": "shelf-2", "floor_id": "1", "shape_type": "MapShelf",
+        "visible": true, "locked": false, "code": "S2",
+        "source": {"sourceId": "dup"}}],
+     "warnings": []}
+    """
+    _ = try MapSourceImportCoordinator.importMap(
+        stagedURL: try writeTemporary(Data(json.utf8), named: "duplicate.json"),
+        originalFilename: "duplicate.json",
+        contract: .topLeft)
+    require(false, "duplicate official identity must fail closed")
+}
+catch let error as MapSourceImportError {
+    require(error.stableCode == "map_source_duplicate_element_identity",
+            "duplicate identity must map to its frozen code, got \(error.stableCode)")
+}
+catch {
+    require(false, "duplicate identity error type: \(error)")
+}
+
 // canonical-source digest is stable for the same business payload
 // regardless of the source document bytes.
 do {
@@ -6019,6 +6149,35 @@ do {
     require(
         XLSXWorkbookWriter.sanitizeXML("&<>\"") == "&amp;&lt;&gt;&quot;",
         "X9 XML specials must be escaped")
+    // V1R4 §16.2: the production reopen verifier streams the package
+    // (central directory + required parts + per-sheet header/row/
+    // no-formula) without materialising the sheets.
+    let verification = try XLSXWorkbookVerifier.verify(
+        workbookURL: output,
+        expectedSheets: [
+            XLSXWorkbookVerifier.SheetExpectation(
+                partName: "xl/worksheets/sheet1.xml",
+                sheetName: "PriceTags",
+                headers: MobileWorksheets.priceTagsHeaders),
+            XLSXWorkbookVerifier.SheetExpectation(
+                partName: "xl/worksheets/sheet2.xml",
+                sheetName: "DevicePositions",
+                headers: MobileWorksheets.devicePositionsHeaders),
+            XLSXWorkbookVerifier.SheetExpectation(
+                partName: "xl/worksheets/sheet3.xml",
+                sheetName: "RunSummary",
+                headers: MobileWorksheets.runSummaryHeaders),
+            XLSXWorkbookVerifier.SheetExpectation(
+                partName: "xl/worksheets/sheet4.xml",
+                sheetName: "RescanRequired",
+                headers: MobileWorksheets.rescanRequiredHeaders),
+        ])
+    require(
+        verification.sheetRowCounts["xl/worksheets/sheet2.xml"] == 10_000,
+        "X1 verifier must count 10k DevicePositions rows")
+    require(
+        verification.sheetRowCounts["xl/worksheets/sheet1.xml"] == 1,
+        "X1 verifier must count the price-tag row")
 }
 catch {
     require(false, "X6/X8/X9 workbook tests failed: \(error)")
@@ -6029,7 +6188,9 @@ catch {
 // propagation, burst fusion, shelf association and the quality gate.
 // =====================================================================
 
-// G1/G2: explicit node binding and nearest-timestamp binding.
+// G1/G2: explicit snapshot-node binding, propagation and the strict
+// time-delta / unlocalized gates (V1R4 §13.2: the parser binds the
+// node; resolution only verifies the final reconstruction).
 do {
     let finalNodes = [
         TagObservationResolver.FinalNodePose(
@@ -6050,7 +6211,8 @@ do {
             trackingSessionID: "s"),
         finalNodes: finalNodes, sessionID: "s")
     require(
-        resolved.mapXM == 2 && resolved.mapYM == 3 && resolved.nodeID == 10,
+        resolved.mapXM == 2 && resolved.mapYM == 3 && resolved.nodeID == 10
+            && resolved.bindingMethod == "explicit_node",
         "G1 explicit-node binding must propagate to (2,3), got \(resolved.mapXM),\(resolved.mapYM)")
     // Raw node pose with an offset: T_raw is identity so the tag local
     // position is (-1, 0); T_final(node 11) = (2, 4, +90deg) rotates
@@ -6066,17 +6228,39 @@ do {
     require(
         close(resolved2.mapXM, 2.0) && close(resolved2.mapYM, 3.0),
         "G1 position propagation must apply T_final*inv(T_raw)*P, got \(resolved2.mapXM),\(resolved2.mapYM)")
-    // Nearest-node timestamp binding (no explicit node id).
-    let resolved3 = try TagObservationResolver.resolve(
-        observation: TagObservationResolver.RawObservation(
-            barcode: "6903", symbology: "CODE128", floorID: "1",
-            nodeID: nil, nodeTimestamp: 501.6, frameMonotonicSeconds: 501.6,
-            rawPositionM: (0, 0, 0), rawNodePose: .identity,
-            trackingSessionID: "s"),
-        finalNodes: finalNodes, sessionID: "s")
-    require(
-        resolved3.nodeID == 11 && resolved3.bindingMethod == "nearest_node_timestamp",
-        "G2 nearest-node binding must pick node 11, got \(resolved3.nodeID)/\(resolved3.bindingMethod)")
+    // Time-delta gate: the bound node's timestamp must be within the
+    // 5.0 s window of the observation's node-timebase timestamp.
+    do {
+        _ = try TagObservationResolver.resolve(
+            observation: TagObservationResolver.RawObservation(
+                barcode: "6903", symbology: "CODE128", floorID: "1",
+                nodeID: 10, nodeTimestamp: 506.0, frameMonotonicSeconds: 506.0,
+                rawPositionM: (0, 0, 0), rawNodePose: .identity,
+                trackingSessionID: "s"),
+            finalNodes: finalNodes, sessionID: "s")
+        require(false, "G2 time-delta gate must reject a stale binding")
+    }
+    catch let error as TagObservationResolver.ResolutionError {
+        require(
+            error == .timeDeltaTooLarge,
+            "G2 time-delta error code must be timeDeltaTooLarge")
+    }
+    // Unlocalized evidence (no raw position) never reaches resolution.
+    do {
+        _ = try TagObservationResolver.resolve(
+            observation: TagObservationResolver.RawObservation(
+                barcode: "6904", symbology: "CODE128", floorID: "1",
+                nodeID: 10, nodeTimestamp: 500.0, frameMonotonicSeconds: 500.0,
+                rawPositionM: nil, rawNodePose: .identity,
+                trackingSessionID: "s"),
+            finalNodes: finalNodes, sessionID: "s")
+        require(false, "G2 unlocalized observations must be rejected")
+    }
+    catch let error as TagObservationResolver.ResolutionError {
+        require(
+            error == .unlocalized,
+            "G2 unlocalized error code must be unlocalized")
+    }
     // Session mismatch must reject.
     do {
         _ = try TagObservationResolver.resolve(
@@ -6158,7 +6342,10 @@ catch {
 do {
     let shelf = ShelfAssociationEngine.ShelfSegment(
         shelfCode: "A1", floorID: "1",
-        startM: (0, 0), endM: (10, 0), side: "front")
+        startM: (0, 0), endM: (10, 0),
+        axisM: (1, 0), frontNormalM: (0, -1),
+        boundsMinM: (0, -0.5), boundsMaxM: (10, 0.5),
+        polygonM: nil)
     guard let mid = ShelfAssociationEngine.associate(
         point: (5, 0.05), shelf: shelf, floorID: "1") else {
         require(false, "G6 shelf association must succeed at mid")
@@ -6167,9 +6354,18 @@ do {
     require(
         close(mid.distanceFromShelfStartCm, 500.0, tolerance: 1.0e-6)
             && close(mid.positionRatio, 0.5, tolerance: 1.0e-6)
-            && close(mid.distanceToSegmentM, 0.05, tolerance: 1.0e-6),
-        "G6 mid-shelf projection must be (500cm, 0.5), got \(mid.distanceFromShelfStartCm),\(mid.positionRatio)")
+            && close(mid.distanceToSegmentM, 0.05, tolerance: 1.0e-6)
+            && mid.shelfSide == "back",
+        "G6 mid-shelf projection must be (500cm, 0.5) on the back side, got \(mid.distanceFromShelfStartCm),\(mid.positionRatio),\(mid.shelfSide)")
     require(!mid.atEndpoint, "G6 mid-shelf must not be endpoint-ambiguous")
+    guard let front = ShelfAssociationEngine.associate(
+        point: (5, -0.05), shelf: shelf, floorID: "1") else {
+        require(false, "G6 front-side association must succeed")
+        throw MapSourceImportError.unknownFormat
+    }
+    require(
+        front.shelfSide == "front",
+        "G6 negative-normal side must be front, got \(front.shelfSide)")
     guard let endpoint = ShelfAssociationEngine.associate(
         point: (0.05, 0.0), shelf: shelf, floorID: "1") else {
         require(false, "G6 endpoint association must succeed")
@@ -6191,6 +6387,7 @@ do {
             association: association,
             maximumEndpointDistanceM: 0.15,
             maximumAssociationDistanceM: 0.2,
+            minimumAssociationMarginM: 0.5,
             graphQualityPassed: graphOK,
             mapSessionIdentityConsistent: identityOK)
     }
@@ -6209,6 +6406,74 @@ do {
     require(
         endpointGate.0 == .rescanRequired,
         "G7 endpoint-ambiguous tags must be RESCAN_REQUIRED, got \(endpointGate.0.rawValue)")
+    // Parallel-aisle ambiguity: a second shelf nearly as close collapses
+    // the margin and must be RESCAN_REQUIRED.
+    let aisle = ShelfAssociationEngine.ShelfSegment(
+        shelfCode: "A2", floorID: "1",
+        startM: (0, 0.5), endM: (10, 0.5),
+        axisM: (1, 0), frontNormalM: (0, -1),
+        boundsMinM: (0, 0.25), boundsMaxM: (10, 0.75),
+        polygonM: nil)
+    let index = ShelfAssociationEngine.ShelfSpatialIndex(
+        shelves: [shelf, aisle])
+    guard let between = ShelfAssociationEngine.bestAssociation(
+        point: (5, 0.15), shelves: [shelf, aisle], index: index,
+        floorID: "1", occludedByStructure: { _ in false }) else {
+        require(false, "G7 parallel-aisle association must succeed")
+        throw MapSourceImportError.unknownFormat
+    }
+    require(
+        between.shelfCode == "A1"
+            && between.marginM != nil
+            && between.marginM! < 0.5,
+        "G7 second candidate must be reported with a small margin")
+    let aisleGate = AutomaticQualityGate.evaluate(gateInput(
+        count: 5, spread: 0.02, association: between))
+    require(
+        aisleGate.0 == .rescanRequired
+            && aisleGate.1 == "shelf_association_margin_insufficient",
+        "G7 parallel-aisle tags must be RESCAN_REQUIRED on margin, got \(aisleGate.0.rawValue)/\(aisleGate.1)")
+    // Occlusion: a fixed structure between the tag and the shelf blocks
+    // the sight line and must be RESCAN_REQUIRED.
+    let structure = ShelfAssociationEngine.FixedStructure(
+        structureCode: "P1", floorID: "1",
+        polygonM: [(4, -0.4), (4, 0.4), (6, 0.4), (6, -0.4)],
+        boundsMinM: (4, -0.4), boundsMaxM: (6, 0.4))
+    let occluded = ShelfAssociationEngine.isOccluded(
+        tagPoint: (5, 0.5), shelf: shelf, structures: [structure])
+    require(
+        occluded,
+        "G7 a structure between tag and shelf must occlude the sight line")
+    var occludedAssociation = mid
+    occludedAssociation.occludedByStructure = occluded
+    let occlusionGate = AutomaticQualityGate.evaluate(gateInput(
+        count: 5, spread: 0.02, association: occludedAssociation))
+    require(
+        occlusionGate.0 == .rescanRequired
+            && occlusionGate.1 == "shelf_occluded_by_structure",
+        "G7 occluded tags must be RESCAN_REQUIRED, got \(occlusionGate.0.rawValue)/\(occlusionGate.1)")
+    // Rotated shelf geometry: the polygon axis drives the association.
+    if let rotated = ShelfAssociationEngine.makeSegment(
+        shelfCode: "A3", floorID: "1",
+        polygonM: [(1, 1), (1, 2), (4, 2), (4, 1)],
+        boundsMinM: (1, 1), boundsMaxM: (4, 2),
+        yawRad: 0) {
+        require(
+            close(rotated.axisM.0, 1.0, tolerance: 1.0e-6)
+                && close(rotated.axisM.1, 0.0, tolerance: 1.0e-6),
+            "G7 rotated shelf axis must follow the polygon main axis, got \(rotated.axisM)")
+        guard let rotatedAssociation = ShelfAssociationEngine.associate(
+            point: (2.5, 1.4), shelf: rotated, floorID: "1") else {
+            require(false, "G7 rotated shelf association must succeed")
+            throw MapSourceImportError.unknownFormat
+        }
+        require(
+            close(rotatedAssociation.distanceFromShelfStartCm, 150.0, tolerance: 1.0e-6)
+                && rotatedAssociation.shelfSide == "front",
+            "G7 rotated shelf must project along its axis, got \(rotatedAssociation.distanceFromShelfStartCm),\(rotatedAssociation.shelfSide)")
+    } else {
+        require(false, "G7 rotated shelf geometry must build")
+    }
 }
 catch {
     require(false, "G6/G7/G10 shelf/quality tests failed: \(error)")
@@ -6541,6 +6806,38 @@ if CommandLine.arguments.count == 3,
             failures.append("parity: \(error)")
         }
 
+        // V1R4 §14.1: a canonical v2 document round-trips to the same
+        // digest and elements (document contract/identity win over the
+        // wizard parameters).
+        do {
+            let v2Data = try load("sample-v2.json")
+            let v2Report = try MapSourceImportCoordinator.importMap(
+                stagedURL: try writeTemporary(v2Data, named: "sample-v2.json"),
+                originalFilename: "sample-v2.json",
+                contract: .bottomLeft)
+            let xlsxReference = try MapSourceImportCoordinator.importMap(
+                stagedURL: try writeTemporary(try load("sample.xlsx"), named: "sample.xlsx"),
+                originalFilename: "sample.xlsx",
+                contract: .topLeft,
+                storeId: "s1",
+                mapName: "sample")
+            if v2Report.canonicalSourceSha256 != xlsxReference.canonicalSourceSha256 {
+                failures.append("v2 parity: canonical v2 digest must match xlsx")
+            }
+            if v2Report.canonicalSource.elements.count != xlsxReference.canonicalSource.elements.count {
+                failures.append("v2 parity: element count mismatch")
+            }
+            if v2Report.coordinateContractOrigin != "top_left" {
+                failures.append("v2 parity: document contract must win over wizard")
+            }
+            if v2Report.storeId != "s1" || v2Report.mapName != "sample" {
+                failures.append("v2 parity: document identity must win over wizard")
+            }
+        }
+        catch {
+            failures.append("v2 parity: \(error)")
+        }
+
         // I5: formula cells are rejected.
         do {
             let data = try load("formula.xlsx")
@@ -6641,6 +6938,20 @@ private func writeTemporary(_ data: Data, named name: String) throws -> URL {
     return url
 }
 
+// V1R4 §14.2: registered packages are frozen immutable (555/444);
+// restore write bits below a temporary directory so the suite can remove
+// it after the run.
+private func restoreMutablePermissions(_ root: URL) {
+    if let enumerator = FileManager.default.enumerator(
+        at: root, includingPropertiesForKeys: [.isDirectoryKey], options: []) {
+        for case let url as URL in enumerator {
+            let values = try? url.resourceValues(forKeys: [.isDirectoryKey])
+            _ = chmod(url.path, (values?.isDirectory ?? false) ? 0o755 : 0o644)
+        }
+    }
+    _ = chmod(root.path, 0o755)
+}
+
 // Mobile-Only V1: --xlsx-scale exports a 100k-row DevicePositions
 // workbook to the given directory. It runs as its own process so the
 // default host mode stays inside the frozen peak-RSS gate.
@@ -6677,7 +6988,10 @@ do {
         .appendingPathComponent("ms-replay-e2e-\(UUID().uuidString)", isDirectory: true)
     try FileManager.default.createDirectory(
         at: temporary, withIntermediateDirectories: true)
-    defer { try? FileManager.default.removeItem(at: temporary) }
+    defer {
+        restoreMutablePermissions(temporary)
+        try? FileManager.default.removeItem(at: temporary)
+    }
 
     // 1) Raw map source (CSV) -> production importer -> canonical v2.
     let csv = """
@@ -6748,6 +7062,12 @@ do {
         "storeId": "s1",
         "priorMapId": maps[0].priorMapID,
         "priorMapSha256": maps[0].packageSHA256,
+        // V1R4 §7.2 watermark: exact counts of the sidecar below.
+        "clockCorrelationCount": 6,
+        "clockNodeBindingCount": 6,
+        "clockLastMonotonic": 50150.0,
+        "clockLastUTC": now + 150.0,
+        "clockEvidenceComplete": true,
     ]
     let metadataData = try CanonicalJSONEncoder.encode(metadata)
     try metadataData.write(to: session.appendingPathComponent("metadata.json"))
@@ -6779,45 +7099,84 @@ do {
     }
     // Accepted prior-map absolute constraints (§6.2): the E2E must carry
     // identity-bound evidence, otherwise the quality gate is allowed to
-    // return LOCAL_FRAME_ONLY only.
+    // return LOCAL_FRAME_ONLY only. Records use the REAL write-side
+    // schema (PriorMapConstraintRecord: camelCase, nodeTimebaseTimestamp
+    // binding, uniqueness-derived sigma; no nodeId/mapPose/sigma fields).
     var constraints = ""
     for index in 0..<6 {
         let record: [String: Any] = [
             "format": "MarketScannerLocalizationConstraint",
             "version": 1,
+            "timestamp": 100.0 + Double(index) * 0.5,
+            "nodeTimebaseTimestamp": now + Double(index + 1) * 0.5,
+            "nodeTimebaseOffsetSeconds": now - 100.0,
+            "trackingSessionId": "E2E-SESSION",
+            "priorMapId": maps[0].priorMapID,
+            "priorMapSha256": maps[0].packageSHA256,
+            "floorId": "1",
             "accepted": true,
-            "nodeId": index + 1,
-            "mapPose": [
+            "measurementAccepted": true,
+            "correctionStepApplied": true,
+            "confidenceAccepted": true,
+            "disposition": "accepted_local",
+            "reason": "E2E accepted matcher result",
+            "predictedPose": [
                 "x_m": Double(index) * 1.0, "y_m": 0.0, "yaw_rad": 0.0,
             ],
-            "translationSigmaM": 0.05,
-            "yawSigmaRad": 0.03,
-            "trackingSessionId": "E2E-SESSION",
+            "estimatedPose": [
+                "x_m": Double(index) * 1.0, "y_m": 0.0, "yaw_rad": 0.0,
+            ],
+            "candidates": [],
+            "uniqueness": 0.9,
+            "residualCost": 0.05,
+            "effectivePointCount": 60,
+            "coverageAngleRad": 2.8,
+            "matcherElapsedMs": 4.0,
         ]
         let recordData = try CanonicalJSONEncoder.encode(record)
         constraints += String(data: recordData, encoding: .utf8)! + "\n"
     }
     try constraints.data(using: .utf8)!.write(
         to: session.appendingPathComponent("localization_constraints.jsonl"))
-    // Clock correlation sidecar (§7.1): recorder-style records written on
-    // the DEVICE-UPTIME monotonic axis. The pipeline must align them to
-    // the node-stamp (UTC) axis; a regression that mixes the uptime axis
-    // in would degrade every resampled position to UNAVAILABLE (V1R3
-    // review regression test).
+    // Clock correlation sidecar (§7.1, schema v2): recorder-style
+    // correlation records on the DEVICE-UPTIME axis (1:1 with UTC) plus
+    // node-timebase bindings that freeze the RTAB-Map node-stamp axis.
+    // The pipeline must map node stamps through the bindings; a
+    // regression that mixes the uptime axis in or assumes stamps are UTC
+    // would degrade every resampled position to UNAVAILABLE (V1R4 §7.3
+    // regression test).
     var clock = ""
     for index in 0..<6 {
         let record: [String: Any] = [
             "format": "MarketScannerClockCorrelation",
-            "version": 1,
+            "version": 2,
+            "record_kind": "correlation",
             "tracking_session_id": "E2E-SESSION",
             "monotonic_seconds": 50000.0 + Double(index) * 30.0,
-            "utc_unix_seconds": now + Double(index) * 8.0,
+            "utc_unix_seconds": now + Double(index) * 30.0,
             "timezone_id": "UTC",
             "utc_offset_seconds": 0,
-            "reason": index == 0 ? "session_start" : "periodic",
+            "reason": index == 0 ? "session_start"
+                : (index == 5 ? "session_end" : "periodic"),
         ]
         let recordData = try CanonicalJSONEncoder.encode(record)
         clock += String(data: recordData, encoding: .utf8)! + "\n"
+        let binding: [String: Any] = [
+            "format": "MarketScannerClockCorrelation",
+            "version": 2,
+            "record_kind": "node_binding",
+            "tracking_session_id": "E2E-SESSION",
+            "node_id": index + 1,
+            "node_stamp": now + Double(index + 1) * 0.5,
+            "sampled_frame_timestamp": 50000.0 + Double(index + 1) * 0.5,
+            "system_uptime": 50000.0 + Double(index + 1) * 0.5,
+            "utc_unix_seconds": now + Double(index + 1) * 0.5,
+            "timezone_id": "UTC",
+            "utc_offset_seconds": 0,
+            "reason": "node_bound",
+        ]
+        let bindingData = try CanonicalJSONEncoder.encode(binding)
+        clock += String(data: bindingData, encoding: .utf8)! + "\n"
     }
     try clock.data(using: .utf8)!.write(
         to: session.appendingPathComponent("clock_correlations.jsonl"))
@@ -6921,6 +7280,30 @@ do {
     MobileNativeFactorGraphGateway.runFastImplementation = referenceImplementation
     MobileNativeFactorGraphGateway.runFullGraphImplementation = referenceImplementation
 
+    // Strict absolute-prior parsing (§6.1) needs the snapshot-DB node
+    // inventory; the host suite reads the fixture Node table directly
+    // (the real app wires MobileGraphReader in wireIntoGateway()).
+    MobileProcessingPipeline.absolutePriorNodeInventoryProvider = { dbURL in
+        var inventory: [AbsolutePriorEvidenceNode] = []
+        var db: OpaquePointer?
+        guard sqlite3_open_v2(
+            dbURL.path, &db, SQLITE_OPEN_READONLY, nil) == SQLITE_OK,
+            let database = db else { return [] }
+        defer { sqlite3_close(database) }
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(
+            database, "SELECT id, stamp FROM Node ORDER BY id",
+            -1, &statement, nil) == SQLITE_OK,
+            let stmt = statement else { return [] }
+        defer { sqlite3_finalize(stmt) }
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            inventory.append(AbsolutePriorEvidenceNode(
+                nodeID: sqlite3_column_int64(stmt, 0),
+                stamp: sqlite3_column_double(stmt, 1)))
+        }
+        return inventory
+    }
+
     MobileProcessingTaskStore.rootOverride = temporary.appendingPathComponent("Tasks")
     MobileResultLibrary.rootOverride = temporary.appendingPathComponent("Results")
     let taskRoot = try MobileProcessingTaskStore.createTask(taskID: "e2e-task")
@@ -6931,11 +7314,14 @@ do {
             taskRoot: taskRoot,
             priorMap: maps[0],
             storeID: "s1",
+            floorID: "1",
             trackingSessionID: "E2E-SESSION",
             appGitSHA: "e2e",
             appVersion: "1.0",
             deviceModel: "host",
-            osVersion: "macos"),
+            osVersion: "macos",
+            nativeCoreSHA256: "",
+            policySHA: "host-policy-v1"),
         progress: { _, _ in },
         isCancelled: { false })
     require(
@@ -6969,6 +7355,545 @@ do {
     require(
         results[0].workbookSHA256 == outcome.resultEntry.workbookSHA256,
         "E2E result SHA must persist in the library")
+
+    // V1R4 §16.3 manifest strictness: the reader re-validates exact
+    // bytes and the top-level field whitelist; a tampered result is
+    // isolated with a typed diagnostic, never silently listed.
+    let tamperStaging = try MobileResultLibrary.stagingDirectory(
+        taskID: "tamper-task", resultID: "result-tamper")
+    try Data("{}".utf8).write(to: tamperStaging.appendingPathComponent("a.json"))
+    try Data("{}".utf8).write(to: tamperStaging.appendingPathComponent("b.json"))
+    let tamperName = "result-tamper.xlsx"
+    try Data("x".utf8).write(to: tamperStaging.appendingPathComponent(tamperName))
+    _ = try MobileResultLibrary.commit(
+        resultID: "result-tamper",
+        taskID: "tamper-task",
+        stagingDirectory: tamperStaging,
+        packageFiles: ["a.json", "b.json"],
+        workbookFilename: tamperName,
+        manifestExtras: [:])
+    let tamperDirectory = try MobileResultLibrary.resultDirectory(resultID: "result-tamper")
+    // Exact bytes: appending to an artifact must fail the read.
+    let tamperA = tamperDirectory.appendingPathComponent("a.json")
+    try Data("{}drift".utf8).write(to: tamperA)
+    do {
+        _ = try MobileResultLibrary.readResult(resultID: "result-tamper")
+        require(false, "X-strict exact byte drift must be rejected")
+    } catch let error as MobileResultLibrary.ResultError {
+        if case .artifactCorrupt = error {} else {
+            require(false, "X-strict byte drift must be artifactCorrupt, got \(error)")
+        }
+    }
+    // Restore the artifact, then add an unknown top-level field.
+    try Data("{}".utf8).write(to: tamperA)
+    let tamperManifestURL = tamperDirectory
+        .appendingPathComponent(MobileResultLibrary.manifestFileName)
+    var tampered = try JSONSerialization.jsonObject(
+        with: Data(contentsOf: tamperManifestURL)) as! [String: Any]
+    tampered["sneaky_extension"] = 1
+    try JSONSerialization.data(withJSONObject: tampered)
+        .write(to: tamperManifestURL)
+    do {
+        _ = try MobileResultLibrary.readResult(resultID: "result-tamper")
+        require(false, "X-strict unknown manifest field must be rejected")
+    } catch let error as MobileResultLibrary.ResultError {
+        if case .invalidManifest = error {} else {
+            require(false, "X-strict unknown field must be invalidManifest, got \(error)")
+        }
+    }
+    // The tampered result is never listed.
+    require(
+        MobileResultLibrary.listResults().count == 1,
+        "X-strict tampered result must be isolated from listResults")
+
+    // =================================================================
+    // V1R4 §17 Gate N freeze: V1 has no true sensor Deep on device.
+    // A graph that still fails after the controlled full-graph recovery
+    // turns into an EXPLICIT session-level RESCAN task (never a silent
+    // drop) and publish stays blocked (qualityGateRejected). Runs BEFORE
+    // the §15 crash block because that block deletes the source session.
+    // =================================================================
+    do {
+        let gateNTaskRoot = try MobileProcessingTaskStore.createTask(
+            taskID: "gate-n-graph-fail")
+        let savedFast = MobileNativeFactorGraphGateway.runFastImplementation
+        let savedFull = MobileNativeFactorGraphGateway.runFullGraphImplementation
+        let failingGraph: MobileNativeFactorGraphGateway.RunImplementation = { _, _ in
+            return MobileNativeGraphOutcome(
+                disposition: .recoverableFail,
+                qualityJSON: "{\"format\": \"MarketScannerGraphQuality\", "
+                    + "\"version\": 2, \"path\": \"host-gate-n\", "
+                    + "\"disposition\": \"RECOVERABLE_FAIL\"}",
+                trajectory: [MobileNativeTrajectoryRow(
+                    id: 1,
+                    stamp: now + 1.0,
+                    xM: 1.0,
+                    yM: 2.0,
+                    yawRad: 0.5,
+                    mapID: 0,
+                    componentID: 0,
+                    publishEligible: true,
+                    uncertaintyM: 0.05)],
+                skeletonIDs: [1])
+        }
+        MobileNativeFactorGraphGateway.runFastImplementation = failingGraph
+        MobileNativeFactorGraphGateway.runFullGraphImplementation = failingGraph
+        var gateNRequest = MobileProcessingPipeline.Request(
+            finalizedSession: session,
+            sourceDatabase: session.appendingPathComponent("rtabmap_segment_0001.db"),
+            taskRoot: gateNTaskRoot,
+            priorMap: maps[0],
+            storeID: "s1",
+            floorID: "1",
+            trackingSessionID: "E2E-SESSION",
+            appGitSHA: "e2e",
+            appVersion: "1.0",
+            deviceModel: "host",
+            osVersion: "macos",
+            nativeCoreSHA256: "",
+            policySHA: "host-policy-v1")
+        var blockedByGate = false
+        do {
+            _ = try MobileProcessingPipeline.run(
+                request: gateNRequest, progress: { _, _ in }, isCancelled: { false })
+        } catch let error as MobileProcessingPipeline.PipelineError {
+            if case .qualityGateRejected = error { blockedByGate = true } else {
+                require(false, "§17 gate failure must be qualityGateRejected, got \(error)")
+            }
+        }
+        require(blockedByGate, "§17 failing graph must block publish")
+        MobileNativeFactorGraphGateway.runFastImplementation = savedFast
+        MobileNativeFactorGraphGateway.runFullGraphImplementation = savedFull
+        let gateNRescanURL = gateNTaskRoot.appendingPathComponent("rescan_tasks.json")
+        let gateNRescanData = try Data(contentsOf: gateNRescanURL)
+        let gateNRescan = try JSONSerialization.jsonObject(
+            with: gateNRescanData) as! [String: Any]
+        require(
+            (gateNRescan["count"] as? Int) == 1,
+            "§17 graph-level RESCAN must be counted exactly once")
+        let gateNTasks = gateNRescan["tasks"] as! [[String: Any]]
+        require(
+            (gateNTasks[0]["reason_code"] as? String) == "graph_quality_failed",
+            "§17 RESCAN reason must be graph_quality_failed")
+        require(
+            (gateNTasks[0]["task_type"] as? String) == "INSUFFICIENT_LOOP",
+            "§17 RESCAN type must be INSUFFICIENT_LOOP")
+        require(
+            (gateNTasks[0]["suggested_action"] as? String) == "RESCAN_SESSION",
+            "§17 RESCAN action must be RESCAN_SESSION")
+        print(
+            "§17 gate-n freeze passed: graph-fail -> explicit RESCAN, publish blocked")
+    } catch {
+        require(false, "§17 gate-n failed: \(error)")
+    }
+
+    // =================================================================
+    // V1R4 §15 Gate L: per-stage durable checkpoints + crash injection.
+    // Every stage below leaves task.json at that stage with a full
+    // identity-bound checkpoint, deletes the source session, and
+    // verifies the run resumes from the verified immutable snapshot —
+    // never re-reading the mutable source database.
+    // =================================================================
+    let crashTasksRoot = temporary.appendingPathComponent("TasksCrash")
+    let crashResultsRoot = temporary.appendingPathComponent("ResultsCrash")
+    MobileProcessingTaskStore.rootOverride = crashTasksRoot
+    MobileResultLibrary.rootOverride = crashResultsRoot
+    do {
+        // Seed: one full run produces the durable snapshot + a
+        // completed task whose checkpoint binds the full identity.
+        let seedRoot = try MobileProcessingTaskStore.createTask(taskID: "crash-seed")
+        let seedRequest = MobileProcessingPipeline.Request(
+            finalizedSession: session,
+            sourceDatabase: session.appendingPathComponent("rtabmap_segment_0001.db"),
+            taskRoot: seedRoot,
+            priorMap: maps[0],
+            storeID: "s1",
+            floorID: "1",
+            trackingSessionID: "E2E-SESSION",
+            appGitSHA: "e2e",
+            appVersion: "1.0",
+            deviceModel: "host",
+            osVersion: "macos",
+            nativeCoreSHA256: "",
+            policySHA: "host-policy-v1")
+        _ = try MobileProcessingPipeline.run(
+            request: seedRequest, progress: { _, _ in }, isCancelled: { false })
+        var seedRecord = try PersistentTaskCoordinator.read(taskRoot: seedRoot)
+        require(
+            seedRecord.state == .completed,
+            "§15 seed run must end completed, got \(seedRecord.state.rawValue)")
+        require(
+            seedRecord.checkpoint?["task_id"] as? String == "crash-seed"
+                && (seedRecord.checkpoint?["retry_count"] as? Int ?? -1) == 0,
+            "§15 completed checkpoint must bind task_id and retry_count")
+        let seedManifestData = try Data(
+            contentsOf: seedRoot.appendingPathComponent("input_manifest.json"))
+        let seedManifest = try JSONSerialization.jsonObject(
+            with: seedManifestData) as! [String: Any]
+        let seedBundleSHA = seedManifest["bundle_sha256"] as! String
+
+        // Every durable stage of the pipeline (spec §15 stage list),
+        // snapshotting included (snapshot completed, crash before the
+        // first optimization stage).
+        let stages: [PersistentTaskCoordinator.TaskState] = [
+            .snapshotting, .fastOptimizing, .fastQualityCheck,
+            .deepReprocessing, .deepOptimizing,
+            .buildingTrajectory, .resolvingTags,
+            .buildingWorkbook, .validatingResult, .committingResult,
+        ]
+        var crashRequests: [MobileProcessingPipeline.Request] = []
+        for stage in stages {
+            let taskID = "crash-\(stage.rawValue)"
+            let taskRoot = try MobileProcessingTaskStore.createTask(taskID: taskID)
+            try FileManager.default.copyItem(
+                at: seedRoot.appendingPathComponent("input_snapshot"),
+                to: taskRoot.appendingPathComponent("input_snapshot"))
+            try FileManager.default.copyItem(
+                at: seedRoot.appendingPathComponent("input_manifest.json"),
+                to: taskRoot.appendingPathComponent("input_manifest.json"))
+            var request = seedRequest
+            request.taskRoot = taskRoot
+            let snapshot = SessionSnapshotTransaction.SessionSnapshot(
+                taskID: taskID,
+                snapshotDirectory: taskRoot.appendingPathComponent("input_snapshot"),
+                inputManifest: seedManifest,
+                bundleSHA256: seedBundleSHA)
+            var checkpoint = PersistentTaskCheckpoint.snapshotCheckpoint(
+                request: request, snapshot: snapshot, retryCount: 1)
+            checkpoint = PersistentTaskCheckpoint.withProcessingPath(
+                "fast", in: checkpoint)
+            // The result-stage checkpoints bind the staged result
+            // artifacts too (they are durable at that point).
+            if stage == .validatingResult || stage == .committingResult {
+                checkpoint = PersistentTaskCheckpoint.withDurableOutputs(
+                    [taskRoot.appendingPathComponent("input_snapshot").path,
+                     taskRoot.appendingPathComponent("input_manifest.json").path,
+                     crashResultsRoot
+                        .appendingPathComponent("staging", isDirectory: true)
+                        .appendingPathComponent(taskID, isDirectory: true)
+                        .appendingPathComponent("result-crash.xlsx").path],
+                    in: checkpoint)
+                // The staged workbook must exist: the checkpoint claims
+                // the result artifacts are durable.
+                let stagedWorkbook = crashResultsRoot
+                    .appendingPathComponent("staging", isDirectory: true)
+                    .appendingPathComponent(taskID, isDirectory: true)
+                try FileManager.default.createDirectory(
+                    at: stagedWorkbook, withIntermediateDirectories: true)
+                try Data("crash-stage".utf8).write(
+                    to: stagedWorkbook.appendingPathComponent("result-crash.xlsx"))
+            }
+            try PersistentTaskCoordinator.updateState(
+                stage, taskRoot: taskRoot, progress: 0.5,
+                checkpoint: checkpoint)
+            crashRequests.append(request)
+        }
+
+        // snapshotting WITHOUT a durable snapshot (created record, no
+        // checkpoint) restarts from scratch: the session is still there.
+        let freshRoot = try MobileProcessingTaskStore.createTask(taskID: "crash-fresh")
+        var freshRequest = seedRequest
+        freshRequest.taskRoot = freshRoot
+        _ = try MobileProcessingPipeline.run(
+            request: freshRequest, progress: { _, _ in }, isCancelled: { false })
+        let freshRecord = try PersistentTaskCoordinator.read(taskRoot: freshRoot)
+        require(
+            freshRecord.state == .completed,
+            "§15 a created task without checkpoint must run from scratch")
+
+        // Delete the source session: every resume below must succeed
+        // WITHOUT re-reading the mutable source database.
+        try FileManager.default.removeItem(at: session)
+        require(
+            !FileManager.default.fileExists(atPath: session.path),
+            "§15 crash fixture must remove the source session")
+
+        for request in crashRequests {
+            let stage = request.taskRoot.lastPathComponent
+            let outcome = try MobileProcessingPipeline.run(
+                request: request, progress: { _, _ in }, isCancelled: { false })
+            let record = try PersistentTaskCoordinator.read(taskRoot: request.taskRoot)
+            require(
+                record.state == .completed,
+                "§15 resume from \(stage) must complete, got \(record.state.rawValue)")
+            require(
+                (record.checkpoint?["retry_count"] as? Int ?? -1) >= 1,
+                "§15 resumed checkpoint must carry retry_count >= 1")
+            require(
+                !outcome.resultEntry.resultID.isEmpty,
+                "§15 resumed run must commit a result")
+        }
+
+        // Terminal states never restart in-place (no new task
+        // impersonating a resume): completed / failed / cancelled.
+        do {
+            _ = try MobileProcessingPipeline.run(
+                request: seedRequest, progress: { _, _ in }, isCancelled: { false })
+            require(false, "§15 completed task must refuse an in-place restart")
+        } catch let error as PersistentTaskCheckpoint.CheckpointError {
+            if case .notResumable = error {} else {
+                require(false, "§15 completed restart must be notResumable, got \(error)")
+            }
+        }
+        seedRecord = try PersistentTaskCoordinator.read(taskRoot: seedRoot)
+        require(
+            seedRecord.state == .completed,
+            "§15 refused restart must NOT overwrite the completed state")
+
+        // Identity mismatch is fail-closed: the checkpoint binds the
+        // map/app/native/policy identity of the original run.
+        let mismatchRoot = try MobileProcessingTaskStore.createTask(taskID: "crash-identity")
+        try FileManager.default.copyItem(
+            at: seedRoot.appendingPathComponent("input_snapshot"),
+            to: mismatchRoot.appendingPathComponent("input_snapshot"))
+        try FileManager.default.copyItem(
+            at: seedRoot.appendingPathComponent("input_manifest.json"),
+            to: mismatchRoot.appendingPathComponent("input_manifest.json"))
+        let mismatchSnapshot = SessionSnapshotTransaction.SessionSnapshot(
+            taskID: "crash-identity",
+            snapshotDirectory: mismatchRoot.appendingPathComponent("input_snapshot"),
+            inputManifest: seedManifest,
+            bundleSHA256: seedBundleSHA)
+        var mismatchRequest = seedRequest
+        mismatchRequest.taskRoot = mismatchRoot
+        var mismatchCheckpoint = PersistentTaskCheckpoint.snapshotCheckpoint(
+            request: mismatchRequest, snapshot: mismatchSnapshot, retryCount: 1)
+        mismatchCheckpoint["map_identity"] = [
+            "prior_map_id": "other-map",
+            "prior_map_sha256": "deadbeef",
+            "canonical_source_sha256": "cafe",
+        ]
+        try PersistentTaskCoordinator.updateState(
+            .fastOptimizing, taskRoot: mismatchRoot,
+            checkpoint: mismatchCheckpoint)
+        do {
+            _ = try MobileProcessingPipeline.run(
+                request: mismatchRequest, progress: { _, _ in }, isCancelled: { false })
+            require(false, "§15 identity mismatch must be fail-closed")
+        } catch let error as PersistentTaskCheckpoint.CheckpointError {
+            if case .identityMismatch = error {} else {
+                require(false, "§15 identity mismatch must be identityMismatch, got \(error)")
+            }
+        }
+
+        // A missing durable reference fails recovery (fail closed).
+        let refRoot = try MobileProcessingTaskStore.createTask(taskID: "crash-ref-missing")
+        try FileManager.default.copyItem(
+            at: seedRoot.appendingPathComponent("input_snapshot"),
+            to: refRoot.appendingPathComponent("input_snapshot"))
+        try FileManager.default.copyItem(
+            at: seedRoot.appendingPathComponent("input_manifest.json"),
+            to: refRoot.appendingPathComponent("input_manifest.json"))
+        let refSnapshot = SessionSnapshotTransaction.SessionSnapshot(
+            taskID: "crash-ref-missing",
+            snapshotDirectory: refRoot.appendingPathComponent("input_snapshot"),
+            inputManifest: seedManifest,
+            bundleSHA256: seedBundleSHA)
+        var refRequest = seedRequest
+        refRequest.taskRoot = refRoot
+        var refCheckpoint = PersistentTaskCheckpoint.snapshotCheckpoint(
+            request: refRequest, snapshot: refSnapshot, retryCount: 1)
+        refCheckpoint["snapshot_path"] = refRoot
+            .appendingPathComponent("input_snapshot_does_not_exist").path
+        try PersistentTaskCoordinator.updateState(
+            .fastOptimizing, taskRoot: refRoot, checkpoint: refCheckpoint)
+        do {
+            _ = try MobileProcessingPipeline.run(
+                request: refRequest, progress: { _, _ in }, isCancelled: { false })
+            require(false, "§15 missing durable reference must be fail-closed")
+        } catch let error as PersistentTaskCheckpoint.CheckpointError {
+            if case .referenceMissing = error {} else {
+                require(false, "§15 missing reference must be referenceMissing, got \(error)")
+            }
+        }
+
+        // Persist failure must block stage progress: with the task
+        // directory read-only, the resume's updateState cannot write
+        // task.json and the run must stop.
+        let persistRoot = try MobileProcessingTaskStore.createTask(taskID: "crash-persist")
+        try FileManager.default.copyItem(
+            at: seedRoot.appendingPathComponent("input_snapshot"),
+            to: persistRoot.appendingPathComponent("input_snapshot"))
+        try FileManager.default.copyItem(
+            at: seedRoot.appendingPathComponent("input_manifest.json"),
+            to: persistRoot.appendingPathComponent("input_manifest.json"))
+        let persistSnapshot = SessionSnapshotTransaction.SessionSnapshot(
+            taskID: "crash-persist",
+            snapshotDirectory: persistRoot.appendingPathComponent("input_snapshot"),
+            inputManifest: seedManifest,
+            bundleSHA256: seedBundleSHA)
+        var persistRequest = seedRequest
+        persistRequest.taskRoot = persistRoot
+        try PersistentTaskCoordinator.updateState(
+            .fastOptimizing, taskRoot: persistRoot,
+            checkpoint: PersistentTaskCheckpoint.snapshotCheckpoint(
+                request: persistRequest, snapshot: persistSnapshot, retryCount: 1))
+        require(chmod(persistRoot.path, 0o555) == 0, "§15 cannot make task root read-only")
+        defer { _ = chmod(persistRoot.path, 0o755) }
+        do {
+            _ = try MobileProcessingPipeline.run(
+                request: persistRequest, progress: { _, _ in }, isCancelled: { false })
+            require(false, "§15 persist failure must block stage progress")
+        } catch {
+            // updateState cannot write task.json: the run is blocked.
+        }
+        _ = chmod(persistRoot.path, 0o755)
+        let persistRecord = try PersistentTaskCoordinator.read(taskRoot: persistRoot)
+        require(
+            persistRecord.state == .fastOptimizing,
+            "§15 blocked persist must leave the stage untouched, got \(persistRecord.state.rawValue)")
+
+        // Restore the shared roots for the tests that follow.
+        MobileProcessingTaskStore.rootOverride = temporary.appendingPathComponent("Tasks")
+        MobileResultLibrary.rootOverride = temporary.appendingPathComponent("Results")
+        print(
+            "§15 crash-injection passed: stages=\(stages.count) resume-all source-db-deleted")
+    } catch {
+        MobileProcessingTaskStore.rootOverride = temporary.appendingPathComponent("Tasks")
+        MobileResultLibrary.rootOverride = temporary.appendingPathComponent("Results")
+        require(false, "§15 crash-injection failed: \(error)")
+    }
+
+    // =================================================================
+    // V1R4 §18 Gate O: dynamic resource governor budget.
+    // The task estimate carries every §18 component (snapshot bytes, raw
+    // nodes/links, skeleton/factors, native outcome + Swift copy, tag
+    // observations/bursts, trajectory rows, XLSX temp, result staging,
+    // safety reserve); each stage checks its CURRENT total against
+    // device-class RSS headroom, available memory, free disk, thermal
+    // and battery. Rejections are fail-closed resourceRequired and the
+    // run-scoped sampler keeps REAL peak RSS / thermal counters.
+    // =================================================================
+    do {
+        // 1) Estimate arithmetic: total sums every component and the
+        //    safety reserve is always included.
+        var estimate = ProcessingResourceGovernor.TaskEstimate()
+        require(estimate.totalBytes == estimate.safetyReserveBytes,
+            "§18 empty estimate must still carry the safety reserve")
+        estimate.snapshotBytes = 1000
+        estimate.rawGraphBytes = 2000
+        estimate.skeletonFactorBytes = 3000
+        estimate.nativeOutcomeBytes = 4000
+        estimate.tagEvidenceBytes = 5000
+        estimate.trajectoryBytes = 6000
+        estimate.xlsxTempBytes = 7000
+        estimate.resultStagingBytes = 8000
+        estimate.safetyReserveBytes = 9000
+        require(estimate.totalBytes == 45000,
+            "§18 estimate total must sum all components, got \(estimate.totalBytes)")
+
+        // 2) Device class follows physical memory.
+        ProcessingResourceGovernor.physicalMemoryOverrideBytes = 3 * 1024 * 1024 * 1024
+        require(ProcessingResourceGovernor.deviceClass() == .low,
+            "§18 3 GB physical must classify as low")
+        ProcessingResourceGovernor.physicalMemoryOverrideBytes = 5 * 1024 * 1024 * 1024
+        require(ProcessingResourceGovernor.deviceClass() == .mid,
+            "§18 5 GB physical must classify as mid")
+        ProcessingResourceGovernor.physicalMemoryOverrideBytes = 8 * 1024 * 1024 * 1024
+        require(ProcessingResourceGovernor.deviceClass() == .high,
+            "§18 8 GB physical must classify as high")
+        ProcessingResourceGovernor.resetOverrides()
+        require(ProcessingResourceGovernor.deviceClass() == .high,
+            "§18 host physical memory must classify as high")
+
+        // 3) Every §18 stage passes on a healthy host with a small
+        //    estimate (real measurements, no overrides).
+        ProcessingResourceGovernor.beginRun()
+        var stageEstimate = ProcessingResourceGovernor.TaskEstimate()
+        stageEstimate.snapshotBytes = 20 * 1024 * 1024
+        stageEstimate.rawGraphBytes = 4 * 1024 * 1024
+        stageEstimate.safetyReserveBytes = 16 * 1024 * 1024
+        for stage in ["snapshot", "fast", "deep", "trajectory",
+                      "tags", "xlsx", "result_commit"] {
+            try ProcessingResourceGovernor.checkBudget(
+                stage: stage, estimate: stageEstimate)
+        }
+
+        // 4) Thermal serious/critical never starts heavy work.
+        ProcessingResourceGovernor.thermalStateOverride = .critical
+        do {
+            try ProcessingResourceGovernor.checkBudget(
+                stage: "fast", estimate: stageEstimate)
+            require(false, "§18 critical thermal must fail closed")
+        } catch let error as MobileOnlyWorkflowError {
+            if case .resourceRequired = error {} else {
+                require(false, "§18 thermal rejection must be resourceRequired, got \(error)")
+            }
+        }
+        ProcessingResourceGovernor.resetOverrides()
+
+        // 5) Free disk below estimate + baseline fails closed.
+        ProcessingResourceGovernor.freeDiskOverrideBytes = 0
+        do {
+            try ProcessingResourceGovernor.checkBudget(
+                stage: "snapshot", estimate: stageEstimate)
+            require(false, "§18 exhausted disk must fail closed")
+        } catch let error as MobileOnlyWorkflowError {
+            if case .resourceRequired = error {} else {
+                require(false, "§18 disk rejection must be resourceRequired, got \(error)")
+            }
+        }
+        ProcessingResourceGovernor.resetOverrides()
+
+        // 6) Available memory below estimate + baseline fails closed.
+        ProcessingResourceGovernor.availableMemoryOverrideBytes = 0
+        do {
+            try ProcessingResourceGovernor.checkBudget(
+                stage: "trajectory", estimate: stageEstimate)
+            require(false, "§18 exhausted available memory must fail closed")
+        } catch let error as MobileOnlyWorkflowError {
+            if case .resourceRequired = error {} else {
+                require(false, "§18 memory rejection must be resourceRequired, got \(error)")
+            }
+        }
+        ProcessingResourceGovernor.resetOverrides()
+
+        // 7) RSS headroom: current footprint + task estimate must fit
+        //    the device-class ceiling. A 512 MB low-class device cannot
+        //    take a 1 GB estimate.
+        ProcessingResourceGovernor.physicalMemoryOverrideBytes = 512 * 1024 * 1024
+        var hugeEstimate = ProcessingResourceGovernor.TaskEstimate()
+        hugeEstimate.snapshotBytes = 1024 * 1024 * 1024
+        do {
+            try ProcessingResourceGovernor.checkBudget(
+                stage: "deep", estimate: hugeEstimate)
+            require(false, "§18 over-budget RSS headroom must fail closed")
+        } catch let error as MobileOnlyWorkflowError {
+            if case .resourceRequired = error {} else {
+                require(false, "§18 headroom rejection must be resourceRequired, got \(error)")
+            }
+        }
+        ProcessingResourceGovernor.resetOverrides()
+
+        // 8) Continuous sampling: serious thermal samples are counted
+        //    against the run, beginRun resets them, and the peak RSS
+        //    counter stays monotonic within the run.
+        ProcessingResourceGovernor.beginRun()
+        ProcessingResourceGovernor.thermalStateOverride = .serious
+        ProcessingResourceGovernor.sampleRunDiagnostics()
+        ProcessingResourceGovernor.sampleRunDiagnostics()
+        require(
+            ProcessingResourceGovernor.runSeriousOrCriticalThermalSampleCount() == 2,
+            "§18 serious thermal samples must be counted per run")
+        let peakAfterThermal = ProcessingResourceGovernor.runPeakMemoryFootprintMB()
+        require(peakAfterThermal > 0,
+            "§18 run peak RSS must be sampled, got \(peakAfterThermal)")
+        ProcessingResourceGovernor.resetOverrides()
+        ProcessingResourceGovernor.beginRun()
+        require(
+            ProcessingResourceGovernor.runSeriousOrCriticalThermalSampleCount() == 0,
+            "§18 beginRun must reset thermal counters")
+        require(
+            ProcessingResourceGovernor.runPeakMemoryFootprintMB() == 0,
+            "§18 beginRun must reset peak RSS")
+
+        print(
+            "§18 resource-governor passed: stages=7 rejections=4 thermal-samples=2")
+    } catch {
+        ProcessingResourceGovernor.resetOverrides()
+        require(false, "§18 resource-governor failed: \(error)")
+    }
+
     print(
         "E2E replay passed: maps=\(maps.count) positions=\(outcome.devicePositionCount) "
             + "tags=\(outcome.tagCount) rescan=\(outcome.rescanCount) "
@@ -6978,6 +7903,1004 @@ catch {
     FileHandle.standardError.write(
         Data("E2E replay failed: \(error)\n".utf8))
     exit(9)
+}
+
+// V1R4 §14.2 Map Library CAS: the library must serialize registry
+// mutations, CAS the generation, re-verify packages on register/list/
+// map, reject unsafe identities and path escapes, freeze packages
+// immutable after registration, and derive floor counts from the REAL
+// manifest floors on rebuild. Runs as its own process so the default
+// host mode stays inside the frozen peak-RSS gate (same pattern as
+// --xlsx-scale).
+if CommandLine.arguments.count == 3,
+   CommandLine.arguments[1] == "--map-library-cas" {
+    do {
+        let temporary = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ms-map-library-cas-\(UUID().uuidString)",
+                isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: temporary, withIntermediateDirectories: true)
+        defer {
+            restoreMutablePermissions(temporary)
+            try? FileManager.default.removeItem(at: temporary)
+        }
+
+        // Fixture through the production importer + compiler only.
+        let csv = """
+        floor,element
+        1,"{""shapeType"":""MapShelf"",""x"":100,""y"":100,""width"":300,""height"":80,""code"":""S1""}"
+        1,"{""shapeType"":""MapTable"",""x"":500,""y"":100,""width"":200,""height"":100,""code"":""T1""}"
+        1,"{""shapeType"":""MapRoadPoint"",""x"":10,""y"":10,""code"":""P1""}"
+        """
+        MobileMapLibrary.rootOverride = temporary.appendingPathComponent("Maps")
+        let stagedMap = try writeTemporary(Data(csv.utf8), named: "cas-map.csv")
+        let report = try MapSourceImportCoordinator.importMap(
+            stagedURL: stagedMap,
+            originalFilename: "cas-map.csv",
+            contract: .topLeft)
+        require(report.elementCount == 3, "CAS import must yield 3 elements")
+        let compileDir = try MobileMapLibrary.stagingDirectory(for: "cas-compile")
+        let compileResult = try MobilePriorMapCompiler.compile(
+            canonicalSource: report.canonicalSource,
+            outputDirectory: compileDir)
+        let target = try MobileMapLibrary.packageDirectory(
+            priorMapID: compileResult.priorMapID,
+            packageSHA: compileResult.packageSHA256)
+        try FileManager.default.createDirectory(
+            at: target.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try FileManager.default.moveItem(at: compileDir, to: target)
+        func casRegister() throws {
+            _ = try MobileMapLibrary.register(
+                priorMapID: compileResult.priorMapID,
+                name: report.mapName,
+                packageSHA256: compileResult.packageSHA256,
+                packageURL: target,
+                floorCount: compileResult.floorCount,
+                elementCount: compileResult.elementCount,
+                compilerVersion: "swift-v1",
+                canonicalSourceSHA256: report.canonicalSourceSha256)
+        }
+
+        // 1) First registration creates the registry by rename at
+        //    generation 1; a duplicate registration stays idempotent and
+        //    advances the generation (serialized writes).
+        try casRegister()
+        var registryObject = try JSONSerialization.jsonObject(
+            with: Data(contentsOf: try MobileMapLibrary.registryURL()))
+            as? [String: Any]
+        require(
+            registryObject?["generation"] as? Int == 1
+                && (registryObject?["maps"] as? [[String: Any]])?.count == 1,
+            "CAS: first registration must create a generation-1 registry")
+        try casRegister()
+        registryObject = try JSONSerialization.jsonObject(
+            with: Data(contentsOf: try MobileMapLibrary.registryURL()))
+            as? [String: Any]
+        require(
+            registryObject?["generation"] as? Int == 2
+                && (registryObject?["maps"] as? [[String: Any]])?.count == 1,
+            "CAS: duplicate registration must stay idempotent and advance the generation")
+        let listedAfterReregister = try MobileMapLibrary.listMaps()
+        require(
+            listedAfterReregister.count == 1,
+            "CAS: re-registration must still list exactly one map")
+
+        // 2) Unsafe identities are rejected before any filesystem mutation.
+        var unsafeRejected = false
+        do {
+            _ = try MobileMapLibrary.register(
+                priorMapID: "../escape",
+                name: "x",
+                packageSHA256: compileResult.packageSHA256,
+                packageURL: target,
+                floorCount: compileResult.floorCount,
+                elementCount: compileResult.elementCount,
+                compilerVersion: "swift-v1",
+                canonicalSourceSHA256: report.canonicalSourceSha256)
+        } catch let error as MobileMapLibrary.LibraryError {
+            if case .unsafeIdentifier = error { unsafeRejected = true }
+        }
+        require(unsafeRejected, "CAS: unsafe priorMapID must be rejected")
+        var shaRejected = false
+        do {
+            _ = try MobileMapLibrary.register(
+                priorMapID: compileResult.priorMapID,
+                name: "x",
+                packageSHA256: "not-a-sha",
+                packageURL: target,
+                floorCount: compileResult.floorCount,
+                elementCount: compileResult.elementCount,
+                compilerVersion: "swift-v1",
+                canonicalSourceSHA256: report.canonicalSourceSha256)
+        } catch let error as MobileMapLibrary.LibraryError {
+            if case .unsafeIdentifier = error { shaRejected = true }
+        }
+        require(shaRejected, "CAS: non-SHA packageSHA256 must be rejected")
+
+        // 3) The registered package is immutable (files 444, dirs 555).
+        let fileAttributes = try FileManager.default.attributesOfItem(
+            atPath: target.appendingPathComponent("manifest.json").path)
+        let fileMode = (fileAttributes[.posixPermissions] as? NSNumber)?.intValue ?? 0
+        require(
+            fileMode & 0o444 == 0o444,
+            "CAS: package files must be read-only, got \(String(format: "%o", fileMode))")
+        let dirAttributes = try FileManager.default.attributesOfItem(atPath: target.path)
+        let dirMode = (dirAttributes[.posixPermissions] as? NSNumber)?.intValue ?? 0
+        require(
+            dirMode & 0o555 == 0o555,
+            "CAS: package directories must be 555, got \(String(format: "%o", dirMode))")
+
+        // 4) list/map re-verify; a path-escape registry record is dropped
+        //    and map() fails closed (it never resolves a path that leaves
+        //    the packages root).
+        let listedBeforeEscape = try MobileMapLibrary.listMaps()
+        require(listedBeforeEscape.count == 1, "CAS: list must return the verified map")
+        _ = try MobileMapLibrary.map(
+            priorMapID: compileResult.priorMapID,
+            packageSHA256: compileResult.packageSHA256)
+        var registry = try JSONSerialization.jsonObject(
+            with: Data(contentsOf: try MobileMapLibrary.registryURL())) as? [String: Any]
+        var corrupt = registry ?? [:]
+        var corruptMaps: [[String: Any]] = []
+        for var record in ((registry?["maps"] as? [[String: Any]]) ?? []) {
+            if record["package_directory"] as? String
+                == "\(compileResult.priorMapID)/\(compileResult.packageSHA256)" {
+                record["package_directory"] =
+                    "../outside/\(compileResult.priorMapID)/\(compileResult.packageSHA256)"
+            }
+            corruptMaps.append(record)
+        }
+        corrupt["maps"] = corruptMaps
+        try (try CanonicalJSONEncoder.encode(corrupt)).write(
+            to: try MobileMapLibrary.registryURL())
+        let afterEscape = try MobileMapLibrary.listMaps()
+        require(afterEscape.isEmpty, "CAS: escaped package_directory must be dropped")
+        var escapeRejected = false
+        do {
+            _ = try MobileMapLibrary.map(
+                priorMapID: compileResult.priorMapID,
+                packageSHA256: compileResult.packageSHA256)
+        } catch let error as MobileMapLibrary.LibraryError {
+            if case .notRegistered = error { escapeRejected = true }
+        }
+        require(escapeRejected, "CAS: escaped registry record must make map fail closed")
+
+        // 5) Registrations serialize under the library lock: two
+        //    back-to-back writes must both survive and advance the
+        //    generation exactly twice (a lost-write regression would only
+        //    advance it once). They run on the main thread so the frozen
+        //    peak-RSS gate is not disturbed by extra dispatch worker
+        //    stacks.
+        for _ in 0..<2 {
+            try casRegister()
+        }
+        registry = try JSONSerialization.jsonObject(
+            with: Data(contentsOf: try MobileMapLibrary.registryURL())) as? [String: Any]
+        let generationAfterWrites = registry?["generation"] as? Int ?? 0
+        require(
+            generationAfterWrites == 4
+                && (registry?["maps"] as? [[String: Any]])?.count == 1,
+            "CAS: serialized registrations must advance the generation twice "
+                + "(generation \(generationAfterWrites), expected 4)")
+        let listedAfterWrites = try MobileMapLibrary.listMaps()
+        require(
+            listedAfterWrites.count == 1,
+            "CAS: post-registration list must still return the map")
+
+        // 6) rebuildRegistry derives floorCount from the REAL manifest
+        //    floors and restores a corrupt index.
+        try MobileMapLibrary.rebuildRegistry()
+        let rebuilt = try MobileMapLibrary.listMaps()
+        require(rebuilt.count == 1, "CAS: rebuild must recover exactly one map")
+        require(
+            rebuilt[0].floorCount == compileResult.floorCount
+                && rebuilt[0].elementCount == compileResult.elementCount,
+            "CAS: rebuild must derive floor/element counts from the manifest")
+        print(
+            "map library CAS passed: generation CAS, immutable packages, "
+                + "safe identity, containment, re-verification, serialized writes")
+    }
+    catch {
+        FileHandle.standardError.write(
+            Data("map library CAS failed: \(error)\n".utf8))
+        exit(14)
+    }
+}
+
+// === Mobile-Only V1R4: strict absolute-prior parser (§6.1) ===
+// The parser must classify records against the REAL write-side schema:
+// constraints carry nodeTimebaseTimestamp/estimatedPose/uniqueness (no
+// nodeId/mapPose/sigma); manual v3 carries snake_case
+// nearest_node_id/confirmed_map_pose/node_binding_status; recovery
+// events are audited and never produce priors. Every rejection must be
+// fail-closed with a stable audit code.
+do {
+    let temporary = FileManager.default.temporaryDirectory
+        .appendingPathComponent("ms-prior-parser-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(
+        at: temporary, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: temporary) }
+
+    // Node inventory: ids 1...6 at stamps 1001...1006.
+    let nodes = (1...6).map {
+        AbsolutePriorEvidenceNode(nodeID: Int64($0), stamp: 1000.0 + Double($0))
+    }
+    let mapID = "MAP-1"
+    let sha = "SHA-1"
+    let session = "S-1"
+    let floor = "1"
+
+    func jsonLine(_ object: [String: Any]) throws -> String {
+        let data = try CanonicalJSONEncoder.encode(object)
+        return String(data: data, encoding: .utf8)! + "\n"
+    }
+    func writeSidecar(_ name: String, lines: [String]) throws {
+        try lines.joined().data(using: .utf8)!.write(
+            to: temporary.appendingPathComponent(name))
+    }
+
+    // 1) Localization constraints: 3 valid + 9 rejected categories.
+    var constraintLines: [String] = []
+    let validConstraint: [String: Any] = [
+        "format": "MarketScannerLocalizationConstraint",
+        "version": 1,
+        "timestamp": 990.0,
+        "nodeTimebaseTimestamp": 1002.0,
+        "nodeTimebaseOffsetSeconds": 10.0,
+        "trackingSessionId": session,
+        "priorMapId": mapID,
+        "priorMapSha256": sha,
+        "floorId": floor,
+        "accepted": true,
+        "measurementAccepted": true,
+        "correctionStepApplied": true,
+        "confidenceAccepted": true,
+        "disposition": "accepted_local",
+        "reason": "host",
+        "predictedPose": ["x_m": 1.0, "y_m": 0.0, "yaw_rad": 0.0],
+        "estimatedPose": ["x_m": 2.0, "y_m": 0.0, "yaw_rad": 0.0],
+        "candidates": [],
+        "uniqueness": 0.9,
+        "residualCost": 0.05,
+        "effectivePointCount": 60,
+        "coverageAngleRad": 2.8,
+        "matcherElapsedMs": 4.0,
+    ]
+    for index in 0..<3 {
+        var record = validConstraint
+        record["nodeTimebaseTimestamp"] = 1002.0 + Double(index)
+        record["estimatedPose"] = [
+            "x_m": Double(index + 1), "y_m": 0.0, "yaw_rad": 0.0,
+        ]
+        constraintLines.append(try jsonLine(record))
+    }
+    func constraint(_ edits: [String: Any]) throws -> String {
+        var record = validConstraint
+        for (key, value) in edits { record[key] = value }
+        return try jsonLine(record)
+    }
+    constraintLines.append(try constraint(["priorMapId": "OTHER"]))
+    constraintLines.append(try constraint(["accepted": false]))
+    constraintLines.append(try constraint(["uniqueness": 1.5]))
+    constraintLines.append(try constraint(["disposition": "rejected"]))
+    constraintLines.append(try constraint([
+        "priorMapId": NSNull(),
+    ]))
+    constraintLines.append(try constraint([
+        "estimatedPose": NSNull(),
+    ]))
+    constraintLines.append(try constraint([
+        "nodeTimebaseTimestamp": NSNull(),
+    ]))
+    constraintLines.append(try constraint(["uniqueness": "abc"]))
+    constraintLines.append(try constraint(["nodeTimebaseTimestamp": "nope"]))
+    try writeSidecar("localization_constraints.jsonl", lines: constraintLines)
+
+    // 2) Manual v3: 1 valid + 5 rejected categories.
+    let validManual: [String: Any] = [
+        "format": "MarketScannerManualLocalizationEvent",
+        "version": 3,
+        "wall_clock_timestamp": "2026-08-06T10:00:00+00:00",
+        "wall_clock_timestamp_unix": 1775000000.0,
+        "frame_timestamp": 990.0,
+        "node_timebase_frame_timestamp": 1001.0,
+        "node_timebase_offset_seconds": 10.0,
+        "nearest_node_id": 1,
+        "nearest_node_stamp": 1001.0,
+        "node_time_delta_seconds": 0.0,
+        "node_time_snapshot_generation": 5,
+        "node_binding_status": "matched",
+        "node_binding_reason": "nearest",
+        "alignment_version": 3,
+        "tracking_session_id": session,
+        "prior_map_id": mapID,
+        "prior_map_sha256": sha,
+        "floor_id": floor,
+        "reason": "host",
+        "arkit_pose": ["x_m": 0.0, "y_m": 0.0, "yaw_rad": 0.0],
+        "confirmed_map_pose": ["x_m": 5.0, "y_m": 2.0, "yaw_rad": 0.1],
+    ]
+    func manual(_ edits: [String: Any]) throws -> String {
+        var record = validManual
+        for (key, value) in edits { record[key] = value }
+        return try jsonLine(record)
+    }
+    var manualLines: [String] = []
+    manualLines.append(try jsonLine(validManual))
+    // Stale alignment watermark (same version again).
+    manualLines.append(try manual([
+        "nearest_node_id": 2, "nearest_node_stamp": 1002.0,
+        "node_timebase_frame_timestamp": 1002.0,
+    ]))
+    // Unmatched binding status.
+    manualLines.append(try manual([
+        "alignment_version": 4, "node_binding_status": "unmatched",
+        "nearest_node_id": 1, "nearest_node_stamp": 1001.0,
+    ]))
+    // Node id not present in the inventory.
+    manualLines.append(try manual([
+        "alignment_version": 5, "nearest_node_id": 99,
+        "nearest_node_stamp": 1099.0, "node_timebase_frame_timestamp": 1099.0,
+        "node_time_delta_seconds": 0.0,
+    ]))
+    // Node stamp mismatch.
+    manualLines.append(try manual([
+        "alignment_version": 6, "nearest_node_id": 2,
+        "nearest_node_stamp": 9999.0, "node_timebase_frame_timestamp": 1002.0,
+        "node_time_delta_seconds": 0.0,
+    ]))
+    // Missing wall clock.
+    manualLines.append(try manual([
+        "alignment_version": 7, "wall_clock_timestamp": NSNull(),
+        "wall_clock_timestamp_unix": NSNull(),
+    ]))
+    try writeSidecar("manual_localization_events.jsonl", lines: manualLines)
+
+    // 3) Recovery events: audited only; must never produce priors.
+    var recoveryLines: [String] = []
+    recoveryLines.append(try jsonLine([
+        "format": "MarketScannerRecoveryLifecycleEvent",
+        "version": 2, "outcome": "converged",
+    ]))
+    recoveryLines.append(try jsonLine([
+        "format": "MarketScannerRecoveryLifecycleEvent",
+        "version": 2, "outcome": "cancelled",
+    ]))
+    try writeSidecar("localization_recovery_events.jsonl", lines: recoveryLines)
+
+    let parseResult = try AbsolutePriorEvidenceParser.parse(
+        snapshotDirectory: temporary,
+        nodes: nodes,
+        priorMapID: mapID,
+        priorMapSHA256: sha,
+        trackingSessionID: session,
+        floorID: floor)
+    let audit = parseResult.audit
+    require(
+        audit.constraintTotal == 12 && audit.constraintAccepted == 3,
+        "strict parser constraint counts wrong: \(audit.constraintTotal)/\(audit.constraintAccepted)")
+    require(
+        audit.constraintIdentityRejected == 2,
+        "constraint identity rejections wrong: \(audit.constraintIdentityRejected)")
+    require(
+        audit.constraintNotAcceptedRejected == 1
+            && audit.constraintDispositionRejected == 1
+            && audit.constraintPoseRejected == 1
+            && audit.constraintUniquenessRejected == 2
+            && audit.constraintTimestampRejected == 2,
+        "constraint rejection breakdown wrong")
+    require(
+        audit.manualTotal == 6 && audit.manualAccepted == 1,
+        "strict parser manual counts wrong: \(audit.manualTotal)/\(audit.manualAccepted)")
+    require(
+        audit.manualAlignmentRejected == 1
+            && audit.manualBindingRejected == 3
+            && audit.manualWallClockRejected == 1,
+        "manual rejection breakdown wrong")
+    require(
+        audit.recoveryRecordCount == 2,
+        "recovery audit count wrong: \(audit.recoveryRecordCount)")
+    require(
+        parseResult.priors.count == 4,
+        "strict parser prior count wrong: \(parseResult.priors.count)")
+    require(
+        audit.acceptedPriorCount == 4,
+        "accepted prior count wrong: \(audit.acceptedPriorCount)")
+    // Uniqueness 0.9 -> weight = max(1.0, 6.0*0.9) = 5.4; the derived
+    // information must equal the weight (sigma = 1/sqrt(weight)).
+    let expectedWeight = AbsolutePriorEvidenceLimits.weightForUniqueness(0.9)
+    require(abs(expectedWeight - 5.4) < 1.0e-9, "weight policy drifted")
+    if let first = parseResult.priors.first {
+        // Constraint nodeTimebaseTimestamp 1002.0 binds to node 2
+        // (stamp 1002.0) — the nearest inventory node.
+        require(first.nodeID == 2, "first prior must bind node 2")
+        require(
+            abs(first.information3x3[0] - expectedWeight) < 1.0e-9,
+            "derived information must equal the uniqueness weight")
+        require(first.kind == 0, "constraint prior kind must be localization")
+    } else {
+        require(false, "missing expected constraint prior")
+    }
+    // Manual prior uses the fixed policy sigma (0.10 m).
+    let manualPrior = parseResult.priors.first { $0.kind == 2 }
+    require(manualPrior != nil, "missing expected manual prior")
+    require(
+        abs(manualPrior!.information3x3[0] - 1.0 / (0.10 * 0.10)) < 1.0e-9,
+        "manual prior must use the fixed policy sigma")
+    // Rejected details are recorded with stable codes (9 constraint +
+    // 5 manual rejections).
+    require(
+        audit.rejectedDetails.count == 14,
+        "rejected detail count wrong: \(audit.rejectedDetails.count)")
+    let reasons = Set(audit.rejectedDetails.map { $0.reason })
+    require(
+        reasons.contains("constraint_identity_missing_or_mismatch")
+            && reasons.contains("constraint_not_accepted")
+            && reasons.contains("constraint_uniqueness_invalid")
+            && reasons.contains("manual_event_node_id_not_found")
+            && reasons.contains("manual_event_node_stamp_mismatch")
+            && reasons.contains("manual_event_wall_clock_missing_or_invalid")
+            && reasons.contains("manual_event_time_or_alignment_invalid"),
+        "rejected stable codes incomplete: \(reasons.sorted())")
+    // Report payload round-trips through CanonicalJSONEncoder.
+    let report = audit.reportPayload(priors: parseResult.priors)
+    let reportData = try CanonicalJSONEncoder.encode(report)
+    require(!reportData.isEmpty, "prior evidence report must serialize")
+    print(
+        "strict prior parser passed: constraints=\(audit.constraintAccepted)/\(audit.constraintTotal) "
+            + "manual=\(audit.manualAccepted)/\(audit.manualTotal) "
+            + "recovery=\(audit.recoveryRecordCount) priors=\(parseResult.priors.count)")
+}
+catch {
+    FileHandle.standardError.write(
+        Data("strict prior parser failed: \(error)\n".utf8))
+    exit(10)
+}
+
+// === Mobile-Only V1R4: strict tag-observation evidence parser (§13.2) ===
+// The parser must classify records against the REAL write-side schema
+// (PriorMapTagObservationRecord snake_case): identity exact, finite-only,
+// known-field whitelist, duplicate observation_id rejection, raw-pose
+// sanity and node-timebase binding with a 1.0 s gate. Every rejection is
+// fail-closed with a stable audit code; unlocalized records are counted.
+do {
+    let temporary = FileManager.default.temporaryDirectory
+        .appendingPathComponent("ms-tag-parser-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(
+        at: temporary, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: temporary) }
+
+    // Node inventory: ids 1...6 at stamps 1001...1006.
+    let nodes = (1...6).map {
+        AbsolutePriorEvidenceNode(nodeID: Int64($0), stamp: 1000.0 + Double($0))
+    }
+    let mapID = "MAP-1"
+    let sha = "SHA-1"
+    let session = "S-1"
+    let floor = "1"
+
+    func jsonLine(_ object: [String: Any]) throws -> String {
+        let data = try CanonicalJSONEncoder.encode(object)
+        return String(data: data, encoding: .utf8)! + "\n"
+    }
+
+    let validRecord: [String: Any] = [
+        "format": "MarketScannerPriceTagObservation",
+        "version": 1,
+        "observation_id": "OBS-1",
+        "timestamp": 100.0,
+        "payload": "6901234567890",
+        "symbology": "EAN13",
+        "normalized_bounds": [0.1, 0.2, 0.3, 0.4],
+        "frame_timestamp": 1000.0,
+        "node_timebase_frame_timestamp": 1001.0,
+        "node_timebase_offset_seconds": 1.0,
+        "pose_timestamp_delta_ms": 12.0,
+        "alignment_version": 3,
+        "alignment_snapshot_timestamp": 998.0,
+        "alignment_age_ms": 2.0,
+        "alignment_version_lag": 0,
+        "alignment_freshness": "fresh",
+        "raw_map_position": ["x_m": 1.0, "y_m": 2.0, "height_m": 1.5],
+        "measurement_method": "center_bearing",
+        "measurement_confidence": 0.9,
+        "depth_sample_count": 40,
+        "depth_inlier_count": 38,
+        "depth_inlier_ratio": 0.95,
+        "depth_median_m": 1.2,
+        "depth_mad_m": 0.1,
+        "plane_residual_m": 0.02,
+        "surface_normal_camera": [0.0, 0.0, -1.0],
+        "localization_state": "localized",
+        "localization_confidence": 0.9,
+        "prior_map_id": mapID,
+        "prior_map_sha256": sha,
+        "floor_id": floor,
+        "tracking_session_id": session,
+        "needs_review": false,
+    ]
+    func observation(_ edits: [String: Any]) throws -> String {
+        var record = validRecord
+        for (key, value) in edits { record[key] = value }
+        return try jsonLine(record)
+    }
+    var lines: [String] = []
+    // 2 valid localized records bound to node 1 and node 2.
+    lines.append(try observation([
+        "observation_id": "OBS-1",
+        "node_timebase_frame_timestamp": 1001.0,
+        "raw_map_position": ["x_m": 1.0, "y_m": 2.0, "height_m": 1.5],
+    ]))
+    lines.append(try observation([
+        "observation_id": "OBS-2",
+        "node_timebase_frame_timestamp": 1002.0,
+        "raw_map_position": ["x_m": 1.1, "y_m": 2.1, "height_m": 1.5],
+    ]))
+    // 1 valid unlocalized record bound to node 3 (no raw position).
+    lines.append(try observation([
+        "observation_id": "OBS-3",
+        "node_timebase_frame_timestamp": 1003.0,
+        "raw_map_position": NSNull(),
+    ]))
+    // Rejections: format / version / unknown field / identity / schema /
+    // duplicate / raw pose / node binding.
+    lines.append(try observation(["format": "Wrong"]))
+    lines.append(try observation(["version": 2]))
+    lines.append(try observation(["unknown_drift_field": 1]))
+    lines.append(try observation(["prior_map_id": "OTHER"]))
+    lines.append(try observation(["measurement_confidence": 1.5]))
+    lines.append(try observation([
+        "observation_id": "OBS-1",
+        "node_timebase_frame_timestamp": 1004.0,
+    ]))
+    lines.append(try observation([
+        "observation_id": "OBS-RAW",
+        "raw_map_position": ["x_m": 99999.0, "y_m": 2.0, "height_m": 1.5],
+    ]))
+    lines.append(try observation([
+        "node_timebase_frame_timestamp": 2000.0,
+        "observation_id": "OBS-BIND",
+    ]))
+    try lines.joined().data(using: .utf8)!.write(
+        to: temporary.appendingPathComponent("tag_observations.jsonl"))
+
+    let result = try TagObservationEvidenceParser.parse(
+        snapshotDirectory: temporary,
+        nodes: nodes,
+        priorMapID: mapID,
+        priorMapSHA256: sha,
+        trackingSessionID: session,
+        floorID: floor)
+    let audit = result.audit
+    require(
+        audit.recordTotal == 11,
+        "tag parser record total wrong: \(audit.recordTotal)")
+    require(
+        audit.recordAccepted == 3
+            && audit.recordUnlocalizedSkipped == 1,
+        "tag parser accepted/unlocalized wrong: \(audit.recordAccepted)/\(audit.recordUnlocalizedSkipped)")
+    require(
+        audit.recordFormatRejected == 1
+            && audit.recordVersionRejected == 1
+            && audit.recordSchemaRejected == 2
+            && audit.recordIdentityRejected == 1
+            && audit.recordDuplicateRejected == 1
+            && audit.recordPoseRejected == 1
+            && audit.recordNodeBindingRejected == 1,
+        "tag parser rejection breakdown wrong: format=\(audit.recordFormatRejected) version=\(audit.recordVersionRejected) schema=\(audit.recordSchemaRejected) identity=\(audit.recordIdentityRejected) duplicate=\(audit.recordDuplicateRejected) pose=\(audit.recordPoseRejected) binding=\(audit.recordNodeBindingRejected)")
+    require(
+        audit.totalRejected == 8,
+        "tag parser total rejected wrong: \(audit.totalRejected)")
+    require(
+        audit.rejectedDetails.count == 8,
+        "tag parser rejected details must count every rejection: \(audit.rejectedDetails.count)")
+    let reasons = Set(audit.rejectedDetails.map { $0.reason })
+    require(
+        reasons.contains("format_invalid")
+            && reasons.contains("version_unsupported")
+            && reasons.contains("unknown_field_unknown_drift_field")
+            && reasons.contains("identity_missing_or_mismatch")
+            && reasons.contains("schema_or_finite_invalid")
+            && reasons.contains("duplicate_observation_id")
+            && reasons.contains("raw_pose_invalid")
+            && reasons.contains("node_time_delta_exceeded"),
+        "tag parser stable codes incomplete: \(reasons.sorted())")
+    require(
+        result.boundNodeIDs == [1, 2, 3],
+        "tag parser bound node ids wrong: \(result.boundNodeIDs)")
+    require(
+        result.observations.count == 3,
+        "tag parser observation count wrong: \(result.observations.count)")
+    let localized = result.observations[0]
+    require(
+        localized.boundNodeID == 1
+            && localized.barcode == "6901234567890"
+            && localized.rawPositionM != nil,
+        "tag parser first observation must bind node 1 with a position")
+    let unlocalized = result.observations[2]
+    require(
+        unlocalized.boundNodeID == 3 && unlocalized.rawPositionM == nil,
+        "tag parser unlocalized observation must bind node 3 without a position")
+    // Report payload round-trips through CanonicalJSONEncoder.
+    let report = audit.reportPayload()
+    let reportData = try CanonicalJSONEncoder.encode(report)
+    require(!reportData.isEmpty, "tag evidence report must serialize")
+    print(
+        "strict tag parser passed: accepted=\(audit.recordAccepted)/\(audit.recordTotal) "
+            + "rejected=\(audit.totalRejected) unlocalized=\(audit.recordUnlocalizedSkipped)")
+}
+catch {
+    FileHandle.standardError.write(
+        Data("strict tag parser failed: \(error)\n".utf8))
+    exit(11)
+}
+
+// V1R4 §12.4: RunSummary real metrics — the native quality JSON must
+// parse into the actual factor/loop/prior/recovery counts and the
+// graph/factor SHAs; absent fields stay nil/empty, never fabricated.
+do {
+    let full = MobileProcessingPipeline.NativeQualityMetrics.parse(
+        qualityJSON: """
+        {"format":"MarketScannerGraphQuality","version":2,
+         "policy_version":"candidate-1","path":"oracle",
+         "graph_input_sha256":"\(String(repeating: "a", count: 64))",
+         "factor_set_sha256":"\(String(repeating: "b", count: 64))",
+         "solver":{"factor_count":42},
+         "health":{"loop_links":3,"prior_links":2,"recovery_links":1}}
+        """)
+    require(
+        full.factorCount == 42 && full.loopLinks == 3
+            && full.priorLinks == 2 && full.recoveryLinks == 1,
+        "H-18 native metrics must parse real counts, got \(full.factorCount ?? -1)/\(full.loopLinks ?? -1)")
+    require(
+        full.graphInputSHA256 == String(repeating: "a", count: 64)
+            && full.factorSetSHA256 == String(repeating: "b", count: 64)
+            && full.policyVersion == "candidate-1",
+        "H-18 native metrics must parse the graph/factor SHAs and policy")
+    let minimal = MobileProcessingPipeline.NativeQualityMetrics.parse(
+        qualityJSON: "{\"format\":\"MarketScannerGraphQuality\",\"version\":2,\"path\":\"host-reference\"}")
+    require(
+        minimal.factorCount == nil && minimal.loopLinks == nil
+            && minimal.priorLinks == nil && minimal.recoveryLinks == nil
+            && minimal.graphInputSHA256.isEmpty
+            && minimal.factorSetSHA256.isEmpty,
+        "H-18 absent native fields must stay nil/empty, never 0")
+    let garbage = MobileProcessingPipeline.NativeQualityMetrics.parse(
+        qualityJSON: "not-json")
+    require(
+        garbage.factorCount == nil && garbage.graphInputSHA256.isEmpty,
+        "H-18 malformed quality JSON must parse safely")
+    print("H-18 RunSummary real metrics parsing passed")
+}
+catch {
+    FileHandle.standardError.write(
+        Data("H-18 native metrics parsing failed: \(error)\n".utf8))
+    exit(12)
+}
+
+// === Mobile-Only V1R4: strict clock evidence parser (§7.3) ===
+// The parser must fail closed on identity/schema/count/order/duplicate
+// violations, detect discontinuity segments (clock jumps, timezone
+// changes) and never interpolate across them; node stamps are never
+// assumed to be UTC.
+do {
+    let sessionID = "CLOCK-SESSION"
+    let now = Date().timeIntervalSince1970
+
+    func clockLine(_ object: [String: Any]) throws -> String {
+        let data = try CanonicalJSONEncoder.encode(object)
+        return String(data: data, encoding: .utf8)! + "\n"
+    }
+    func correlation(
+        _ uptime: Double, utc: Double, timezone: String = "UTC",
+        offset: Int = 0, reason: String = "periodic"
+    ) -> [String: Any] {
+        return [
+            "format": "MarketScannerClockCorrelation",
+            "version": 2,
+            "record_kind": "correlation",
+            "tracking_session_id": sessionID,
+            "monotonic_seconds": uptime,
+            "utc_unix_seconds": utc,
+            "timezone_id": timezone,
+            "utc_offset_seconds": offset,
+            "reason": reason,
+        ]
+    }
+    func binding(
+        _ nodeID: Int, nodeStamp: Double, uptime: Double, utc: Double,
+        timezone: String = "UTC", offset: Int = 0
+    ) -> [String: Any] {
+        return [
+            "format": "MarketScannerClockCorrelation",
+            "version": 2,
+            "record_kind": "node_binding",
+            "tracking_session_id": sessionID,
+            "node_id": nodeID,
+            "node_stamp": nodeStamp,
+            "sampled_frame_timestamp": uptime,
+            "system_uptime": uptime,
+            "utc_unix_seconds": utc,
+            "timezone_id": timezone,
+            "utc_offset_seconds": offset,
+            "reason": "node_bound",
+        ]
+    }
+    func parseLines(
+        _ lines: [String],
+        expectedCorrelation: Int? = nil,
+        expectedBinding: Int? = nil
+    ) throws -> StrictClockEvidenceParser.ParsedEvidence {
+        return try StrictClockEvidenceParser.parse(
+            content: lines.joined(),
+            expectedTrackingSessionID: sessionID,
+            expectedCorrelationCount: expectedCorrelation,
+            expectedBindingCount: expectedBinding)
+    }
+    func expectRejection(
+        _ message: String,
+        _ matches: (StrictClockEvidenceParser.ParseError) -> Bool,
+        _ body: () throws -> StrictClockEvidenceParser.ParsedEvidence
+    ) {
+        do {
+            _ = try body()
+            require(false, "\(message): expected rejection")
+        } catch let error as StrictClockEvidenceParser.ParseError {
+            require(matches(error), "\(message): wrong error \(error)")
+        } catch {
+            require(false, "\(message): wrong error type \(error)")
+        }
+    }
+
+    // T1: node stamps carry a NON-UTC offset (+300 s); the mapper must
+    // recover the real UTC through the bindings, never the raw stamp.
+    var t1Lines: [String] = []
+    for index in 0..<4 {
+        t1Lines.append(try clockLine(correlation(
+            1000.0 + Double(index) * 30.0,
+            utc: now + Double(index) * 30.0,
+            reason: index == 0 ? "session_start" : "periodic")))
+        t1Lines.append(try clockLine(binding(
+            index + 1,
+            nodeStamp: now + 300.0 + Double(index) * 0.5,
+            uptime: 1000.0 + Double(index) * 0.5,
+            utc: now + Double(index) * 0.5)))
+    }
+    let t1Evidence = try parseLines(
+        t1Lines, expectedCorrelation: 4, expectedBinding: 4)
+    require(
+        StrictClockEvidenceParser.isEvidenceSufficient(t1Evidence),
+        "T1 evidence must be sufficient")
+    let t1Mapper = StrictClockEvidenceParser.buildMapper(
+        evidence: t1Evidence, sessionStartStamp: now + 300.0)
+    let t1Start = t1Mapper.utcSeconds(forMonotonic: 0) ?? -1
+    let t1Mid = t1Mapper.utcSeconds(forMonotonic: 1.0) ?? -1
+    require(t1Start >= 0 && t1Mid >= 0, "T1 mapper must cover the session span")
+    require(
+        abs(t1Start - now) < 1.0e-6,
+        "T1 non-UTC stamp offset must recover the real UTC")
+    require(
+        abs(t1Mid - (now + 1.0)) < 1.0e-6,
+        "T1 mid-span mapping must be linear")
+
+    // T2: non-1:1 clock scale (UTC advances 2x uptime); the mapper must
+    // still recover absolute UTC.
+    var t2Lines: [String] = []
+    for index in 0..<4 {
+        t2Lines.append(try clockLine(correlation(
+            1000.0 + Double(index) * 30.0,
+            utc: now + Double(index) * 60.0,
+            reason: index == 0 ? "session_start" : "periodic")))
+        t2Lines.append(try clockLine(binding(
+            index + 1,
+            nodeStamp: now + Double(index) * 0.5,
+            uptime: 1000.0 + Double(index) * 0.5,
+            utc: now + Double(index) * 1.0)))
+    }
+    let t2Evidence = try parseLines(
+        t2Lines, expectedCorrelation: 4, expectedBinding: 4)
+    let t2Mapper = StrictClockEvidenceParser.buildMapper(
+        evidence: t2Evidence, sessionStartStamp: now)
+    let t2Mid = t2Mapper.utcSeconds(forMonotonic: 1.0) ?? -1
+    require(t2Mid >= 0, "T2 mapper must cover the scaled session")
+    require(
+        abs(t2Mid - (now + 2.0)) < 1.0e-6,
+        "T2 scaled clock must map to absolute UTC")
+
+    // T3: manual clock jump +300 s mid-session -> explicit discontinuity
+    // segment; interpolation across it is forbidden (UNAVAILABLE).
+    var t3Lines: [String] = []
+    let t3Correlations: [(Double, Double, String)] = [
+        (1000.0, now, "session_start"),
+        (1015.0, now + 315.0, "system_clock_change"),
+        (1030.0, now + 330.0, "periodic"),
+        (1060.0, now + 360.0, "session_end"),
+    ]
+    for (uptime, utc, reason) in t3Correlations {
+        t3Lines.append(try clockLine(correlation(uptime, utc: utc, reason: reason)))
+    }
+    let t3Bindings: [(Int, Double, Double)] = [
+        (1, 1000.5, now + 0.5), (2, 1001.0, now + 1.0),
+        (3, 1015.5, now + 315.5), (4, 1016.0, now + 316.0),
+    ]
+    for (nodeID, uptime, utc) in t3Bindings {
+        t3Lines.append(try clockLine(binding(
+            nodeID, nodeStamp: uptime, uptime: uptime, utc: utc)))
+    }
+    let t3Evidence = try parseLines(
+        t3Lines, expectedCorrelation: 4, expectedBinding: 4)
+    let t3Mapper = StrictClockEvidenceParser.buildMapper(
+        evidence: t3Evidence, sessionStartStamp: 1000.5)
+    require(
+        abs((t3Mapper.utcSeconds(forMonotonic: 0) ?? -1) - (now + 0.5)) < 1.0e-6,
+        "T3 pre-jump mapping must be exact")
+    require(
+        t3Mapper.utcSeconds(forMonotonic: 1.0) == nil,
+        "T3 must not interpolate across the clock jump")
+    require(
+        abs((t3Mapper.utcSeconds(forMonotonic: 15.5) ?? -1) - (now + 316.0)) < 1.0e-6,
+        "T3 post-jump mapping must be exact")
+
+    // T4: DST transition (same timezone id, offset -18000 -> -14400);
+    // absolute UTC stays continuous so no discontinuity edge, and the
+    // local offset context switches at the transition.
+    var t4Lines: [String] = []
+    let tz = "America/Toronto"
+    t4Lines.append(try clockLine(correlation(
+        1000.0, utc: now, timezone: tz, offset: -18000, reason: "session_start")))
+    t4Lines.append(try clockLine(correlation(
+        1030.0, utc: now + 30.0, timezone: tz, offset: -14400)))
+    t4Lines.append(try clockLine(correlation(
+        1060.0, utc: now + 60.0, timezone: tz, offset: -14400, reason: "session_end")))
+    t4Lines.append(try clockLine(binding(
+        1, nodeStamp: 1000.5, uptime: 1000.5, utc: now + 0.5,
+        timezone: tz, offset: -18000)))
+    t4Lines.append(try clockLine(binding(
+        2, nodeStamp: 1030.5, uptime: 1030.5, utc: now + 30.5,
+        timezone: tz, offset: -14400)))
+    let t4Evidence = try parseLines(
+        t4Lines, expectedCorrelation: 3, expectedBinding: 2)
+    let t4Mapper = StrictClockEvidenceParser.buildMapper(
+        evidence: t4Evidence, sessionStartStamp: 1000.5)
+    require(
+        abs((t4Mapper.utcSeconds(forMonotonic: 15.0) ?? -1) - (now + 15.5)) < 1.0e-6,
+        "T4 DST must keep absolute UTC continuous")
+    require(
+        t4Mapper.context(forMonotonic: 5.0).utcOffsetSeconds == -18000
+            && t4Mapper.context(forMonotonic: 40.0).utcOffsetSeconds == -14400,
+        "T4 DST local offset context must switch")
+
+    // T5: timezone change (UTC -> Asia/Shanghai) is an explicit
+    // discontinuity; interpolation across it is forbidden.
+    var t5Lines: [String] = []
+    t5Lines.append(try clockLine(correlation(
+        1000.0, utc: now, reason: "session_start")))
+    t5Lines.append(try clockLine(correlation(
+        1030.0, utc: now + 30.0, timezone: "Asia/Shanghai", offset: 28800,
+        reason: "timezone_change")))
+    t5Lines.append(try clockLine(correlation(
+        1060.0, utc: now + 60.0, timezone: "Asia/Shanghai", offset: 28800,
+        reason: "session_end")))
+    t5Lines.append(try clockLine(binding(
+        1, nodeStamp: 1000.5, uptime: 1000.5, utc: now + 0.5)))
+    t5Lines.append(try clockLine(binding(
+        2, nodeStamp: 1001.0, uptime: 1001.0, utc: now + 1.0)))
+    t5Lines.append(try clockLine(binding(
+        3, nodeStamp: 1030.5, uptime: 1030.5, utc: now + 30.5,
+        timezone: "Asia/Shanghai", offset: 28800)))
+    t5Lines.append(try clockLine(binding(
+        4, nodeStamp: 1031.0, uptime: 1031.0, utc: now + 31.0,
+        timezone: "Asia/Shanghai", offset: 28800)))
+    let t5Evidence = try parseLines(
+        t5Lines, expectedCorrelation: 3, expectedBinding: 4)
+    let t5Mapper = StrictClockEvidenceParser.buildMapper(
+        evidence: t5Evidence, sessionStartStamp: 1000.5)
+    require(
+        t5Mapper.utcSeconds(forMonotonic: 15.0) == nil,
+        "T5 must not interpolate across the timezone change")
+    require(
+        abs((t5Mapper.utcSeconds(forMonotonic: 30.0) ?? -1) - (now + 30.5)) < 1.0e-6,
+        "T5 post-change mapping must be exact")
+
+    // T6: metadata watermark count mismatch.
+    expectRejection("T6 count mismatch", { if case .countMismatch = $0 { return true }; return false }) {
+        try parseLines(t1Lines, expectedCorrelation: 5)
+    }
+    // T7: truncated tail (missing final newline).
+    expectRejection("T7 truncated tail", { if case .noFinalNewline = $0 { return true }; return false }) {
+        _ = try parseLines(t1Lines)
+        return try StrictClockEvidenceParser.parse(
+            content: String(t1Lines.joined().dropLast()),
+            expectedTrackingSessionID: sessionID,
+            expectedCorrelationCount: nil,
+            expectedBindingCount: nil)
+    }
+    // T8: duplicate monotonic sample.
+    expectRejection("T8 duplicate sample", { if case .duplicateSample = $0 { return true }; return false }) {
+        try parseLines([
+            try clockLine(correlation(1000.0, utc: now, reason: "session_start")),
+            try clockLine(correlation(1000.0, utc: now + 1.0)),
+        ])
+    }
+    // T9: wrong tracking session identity.
+    expectRejection("T9 session mismatch", { if case .sessionIdentityMismatch = $0 { return true }; return false }) {
+        var wrong = correlation(1000.0, utc: now, reason: "session_start")
+        wrong["tracking_session_id"] = "OTHER-SESSION"
+        return try parseLines([try clockLine(wrong)])
+    }
+    // T10: duplicate node_id binding.
+    expectRejection("T10 duplicate node id", { if case .duplicateNodeBinding = $0 { return true }; return false }) {
+        try parseLines([
+            try clockLine(correlation(1000.0, utc: now, reason: "session_start")),
+            try clockLine(correlation(1030.0, utc: now + 30.0)),
+            try clockLine(binding(1, nodeStamp: now, uptime: 1000.5, utc: now + 0.5)),
+            try clockLine(binding(1, nodeStamp: now + 0.5, uptime: 1001.0, utc: now + 1.0)),
+        ])
+    }
+    // T11: blank line.
+    expectRejection("T11 blank line", { if case .blankLine = $0 { return true }; return false }) {
+        try parseLines([
+            try clockLine(correlation(1000.0, utc: now, reason: "session_start")),
+            "\n",
+        ])
+    }
+    // T12: legacy v1 schema is not authoritative.
+    expectRejection("T12 legacy version", { if case .versionUnsupportedLegacy = $0 { return true }; return false }) {
+        var legacy = correlation(1000.0, utc: now, reason: "session_start")
+        legacy["version"] = 1
+        return try parseLines([try clockLine(legacy)])
+    }
+    // T13: unknown field.
+    expectRejection("T13 unknown field", { if case .unknownField = $0 { return true }; return false }) {
+        var extra = correlation(1000.0, utc: now, reason: "session_start")
+        extra["surprise"] = 1
+        return try parseLines([try clockLine(extra)])
+    }
+    // T14: JSON bool must never pass as a strict integer.
+    expectRejection("T14 bool int", { if case .invalidInteger = $0 { return true }; return false }) {
+        var boolOffset = correlation(1000.0, utc: now, reason: "session_start")
+        boolOffset["utc_offset_seconds"] = true
+        return try parseLines([try clockLine(boolOffset)])
+    }
+    // T15: binding UTC inconsistent with the correlation mapping.
+    expectRejection("T15 binding mismatch", { if case .bindingUTCMismatch = $0 { return true }; return false }) {
+        try parseLines([
+            try clockLine(correlation(1000.0, utc: now, reason: "session_start")),
+            try clockLine(correlation(1030.0, utc: now + 30.0)),
+            try clockLine(binding(1, nodeStamp: now, uptime: 1005.0, utc: now + 15.0)),
+        ])
+    }
+    // T16: insufficient evidence (only one binding).
+    let t16Evidence = try parseLines([
+        try clockLine(correlation(1000.0, utc: now, reason: "session_start")),
+        try clockLine(correlation(1030.0, utc: now + 30.0)),
+        try clockLine(binding(1, nodeStamp: now, uptime: 1000.5, utc: now + 0.5)),
+    ])
+    require(
+        !StrictClockEvidenceParser.isEvidenceSufficient(t16Evidence),
+        "T16 one binding must be insufficient evidence")
+    // T17: reordered (non-increasing) monotonic sample.
+    expectRejection("T17 reordered", { if case .nonIncreasingMonotonic = $0 { return true }; return false }) {
+        try parseLines([
+            try clockLine(correlation(1000.0, utc: now, reason: "session_start")),
+            try clockLine(correlation(990.0, utc: now + 1.0)),
+        ])
+    }
+    // T18: backward clock.
+    expectRejection("T18 backward clock", { if case .backwardClock = $0 { return true }; return false }) {
+        try parseLines([
+            try clockLine(correlation(1000.0, utc: now, reason: "session_start")),
+            try clockLine(correlation(1030.0, utc: now - 10.0)),
+        ])
+    }
+    print(
+        "strict clock parser passed: offset/scale/jump/DST/tz mapped, "
+            + "count/truncate/duplicate/session/legacy/unknown/bool rejected")
+}
+catch {
+    FileHandle.standardError.write(
+        Data("strict clock parser failed: \(error)\n".utf8))
+    exit(11)
 }
 
 var finalizationResourceUsage = rusage()

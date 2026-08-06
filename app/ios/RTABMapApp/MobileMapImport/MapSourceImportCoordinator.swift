@@ -41,6 +41,9 @@ enum MapSourceImportCoordinator {
             let imported = try XLSXMapSourceImporter.importSource(
                 data: data, contract: contract, strict: strict)
             outcome = MapSourceImportOutcome(
+                storeId: nil,
+                mapName: nil,
+                coordinateContract: nil,
                 elements: imported.elements,
                 warnings: imported.warnings,
                 malformedRows: imported.malformedRows,
@@ -50,6 +53,9 @@ enum MapSourceImportCoordinator {
             let imported = try CSVMapSourceImporter.importSource(
                 data: data, contract: contract, strict: strict)
             outcome = MapSourceImportOutcome(
+                storeId: nil,
+                mapName: nil,
+                coordinateContract: nil,
                 elements: imported.elements,
                 warnings: imported.warnings,
                 malformedRows: imported.malformedRows,
@@ -58,6 +64,9 @@ enum MapSourceImportCoordinator {
         case "json":
             let imported = try JSONMapSourceImporter.importSource(data: data)
             outcome = MapSourceImportOutcome(
+                storeId: imported.storeId,
+                mapName: imported.mapName,
+                coordinateContract: imported.coordinateContract,
                 elements: imported.elements,
                 warnings: imported.warnings,
                 malformedRows: [],
@@ -67,20 +76,40 @@ enum MapSourceImportCoordinator {
             throw MapSourceImportError.unknownFormat
         }
 
+        // V1R4 §14.1: canonical v2 documents carry their own identity
+        // (store/map/contract) and override the wizard parameters so the
+        // canonical self round trip is byte-identical. Legacy v1 and
+        // XLSX/CSV documents keep the caller-provided values.
+        let finalStoreID = outcome.storeId ?? resolvedStoreId
+        let finalMapName = outcome.mapName ?? resolvedMapName
+        let finalContract = outcome.coordinateContract ?? contract
+
+        // V1R4 §14.1: official element ids must be globally unique in the
+        // store/map context; a duplicate identity is a blocker, never a
+        // merge.
+        var seenStableIDs: Set<String> = []
+        for element in outcome.elements {
+            let stableID = CanonicalPriorMapBusinessSourceV2.stableElementID(
+                for: element, storeID: finalStoreID, mapName: finalMapName)
+            guard seenStableIDs.insert(stableID).inserted else {
+                throw MapSourceImportError.duplicateElementIdentity(duplicateID: stableID)
+            }
+        }
+
         var warnings = outcome.warnings
         let floors = Set(outcome.elements.map { $0.floorId }).sorted()
         let canonicalSource = MarketScannerPriorMapSource(
             format: MarketScannerPriorMapSource.formatValue,
             version: MarketScannerPriorMapSource.versionValue,
-            storeId: resolvedStoreId,
-            mapName: resolvedMapName,
+            storeId: finalStoreID,
+            mapName: finalMapName,
             source: MapSourceIdentity(
                 originalFormat: format,
                 originalFilename: originalFilename,
                 sourceFileSha256: sourceFileSha256,
                 canonicalSourceSha256: ""
             ),
-            coordinateContract: contract,
+            coordinateContract: finalContract,
             elements: outcome.elements,
             warnings: warnings
         )
@@ -92,15 +121,15 @@ enum MapSourceImportCoordinator {
         let finalSource = MarketScannerPriorMapSource(
             format: canonicalSource.format,
             version: canonicalSource.version,
-            storeId: resolvedStoreId,
-            mapName: resolvedMapName,
+            storeId: finalStoreID,
+            mapName: finalMapName,
             source: MapSourceIdentity(
                 originalFormat: format,
                 originalFilename: originalFilename,
                 sourceFileSha256: sourceFileSha256,
                 canonicalSourceSha256: canonicalSha256
             ),
-            coordinateContract: contract,
+            coordinateContract: finalContract,
             elements: outcome.elements,
             warnings: warnings
         )
@@ -108,15 +137,15 @@ enum MapSourceImportCoordinator {
         return MapSourceImportReport(
             format: format,
             fileSizeBytes: fileSize,
-            mapName: resolvedMapName,
-            storeId: resolvedStoreId,
+            mapName: finalMapName,
+            storeId: finalStoreID,
             floorCount: floors.count,
             elementCount: outcome.elements.count,
             sourceFileSha256: sourceFileSha256,
             canonicalSourceSha256: canonicalSha256,
             warningCount: warnings.count,
             malformedRowCount: outcome.malformedRows.count,
-            coordinateContractOrigin: contract.origin.rawValue,
+            coordinateContractOrigin: finalContract.origin.rawValue,
             canonicalSource: finalSource,
             audit: MapImportAudit(
                 format: format,
@@ -150,6 +179,11 @@ enum MapSourceImportCoordinator {
 }
 
 private struct MapSourceImportOutcome {
+    /// Document-level identity for canonical v2 JSON documents; nil for
+    /// legacy v1 and XLSX/CSV (caller-provided parameters win).
+    var storeId: String?
+    var mapName: String?
+    var coordinateContract: CoordinateContract?
     var elements: [PriorMapSourceElement]
     var warnings: [MapSourceWarning]
     var malformedRows: [[String: Any]]

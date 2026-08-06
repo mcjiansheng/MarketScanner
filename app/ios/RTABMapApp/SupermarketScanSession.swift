@@ -71,6 +71,9 @@ struct ScanSegmentMetadata: Codable {
     let priorMapId: String?
     let priorMapSha256: String?
     let floorId: String?
+    /// Store identity of the scan (B-08): the snapshot eligibility
+    /// chain validates it fail-closed against the processing request.
+    let storeId: String?
     let initialMapPose: PriorMapPose2D?
     let localizationTrace: String?
     let manualLocalizationEvents: String?
@@ -80,6 +83,85 @@ struct ScanSegmentMetadata: Codable {
     let tagObservations: String?
     let localizedPriceTags: String?
     let localizedPriceTagCount: Int?
+    /// Clock evidence watermark (V1R4 §7.2): exact counts/watermarks from
+    /// the durable `clock_correlations.jsonl` write so processing can
+    /// validate the sidecar against the metadata without trusting a
+    /// partial write. `clockEvidenceComplete` is true only when the
+    /// sidecar holds at least two correlations and two node bindings.
+    let clockCorrelationCount: Int?
+    let clockNodeBindingCount: Int?
+    let clockLastMonotonic: Double?
+    let clockLastUTC: Double?
+    let clockEvidenceComplete: Bool?
+    /// Tag burst evidence watermark (V1R4 §13.1): exact count/last burst ID
+    /// from the durable `tag_observation_bursts.jsonl` write so processing
+    /// can validate the sidecar against the metadata without trusting a
+    /// partial write. `tagObservationBurstComplete` is true only when every
+    /// observation ingested before finalization was flushed to a burst
+    /// without a write failure; a failure leaves the count short and the
+    /// flag false so the PC side blocks processing fail-closed.
+    let tagObservationBurstCount: Int?
+    let tagObservationBurstLastID: String?
+    let tagObservationBurstComplete: Bool?
+}
+
+/// A durable burst of price-tag observations (V1R4 §13.1): consecutive
+/// observations of the same barcode within a bounded time window, written to
+/// `tag_observation_bursts.jsonl` as one JSON object per line. Node IDs are
+/// not known on the phone (the observation schema binds through the node
+/// timebase); the PC parser resolves node bindings from
+/// `nodeTimebaseMin`/`nodeTimebaseMax` and validates the sidecar against the
+/// metadata watermarks fail-closed.
+struct TagObservationBurstRecord: Codable {
+    let format: String
+    let version: Int
+    let burstId: String
+    let sequence: Int
+    let barcode: String
+    let symbology: String
+    let floorId: String
+    let frameCount: Int
+    let firstFrameTimestamp: TimeInterval
+    let lastFrameTimestamp: TimeInterval
+    let nodeTimebaseMin: TimeInterval
+    let nodeTimebaseMax: TimeInterval
+    let depthQuality: Double
+    let viewAngle: String
+    let trackingQuality: String
+    let localizationConfidenceMean: Double
+    let rawSamples: [PriorMapTagPoint3D]
+    let trackingSessionId: String
+    let complete: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case format
+        case version
+        case burstId = "burst_id"
+        case sequence
+        case barcode
+        case symbology
+        case floorId = "floor_id"
+        case frameCount = "frame_count"
+        case firstFrameTimestamp = "first_frame_timestamp"
+        case lastFrameTimestamp = "last_frame_timestamp"
+        case nodeTimebaseMin = "node_timebase_min"
+        case nodeTimebaseMax = "node_timebase_max"
+        case depthQuality = "depth_quality"
+        case viewAngle = "view_angle"
+        case trackingQuality = "tracking_quality"
+        case localizationConfidenceMean = "localization_confidence_mean"
+        case rawSamples = "raw_3d_samples"
+        case trackingSessionId = "tracking_session_id"
+        case complete
+    }
+}
+
+/// Flush result returned by `flushTagObservationBursts()`: the durable
+/// sidecar watermarks and whether the flush completed without write failure.
+struct TagObservationBurstFlushResult {
+    let count: Int
+    let lastBurstID: String?
+    let complete: Bool
 }
 
 struct ScanAreaCells: Codable {
@@ -137,6 +219,143 @@ struct ScanProcessingEligibility: Codable {
 private struct LocalizationRecordWriteResult {
     let succeeded: Bool
     let errorReason: String?
+}
+
+/// V1R4 §13.1: in-flight aggregation state for one tag observation burst.
+/// Mutable and only touched under `localizationTransactionLock`.
+private struct PendingTagBurst {
+    let burstId: String
+    let sequence: Int
+    let barcode: String
+    let symbology: String
+    let floorId: String
+    let trackingSessionId: String
+    var firstFrameTimestamp: TimeInterval
+    var lastFrameTimestamp: TimeInterval
+    var frameCount: Int
+    var nodeTimebaseMin: TimeInterval
+    var nodeTimebaseMax: TimeInterval
+    var depthInlierRatioSum: Double
+    var depthSampleCount: Int
+    var localizationConfidenceSum: Double
+    var localizationStateVotes: [String: Int]
+    var viewVotes: (front: Int, back: Int, unknown: Int)
+    var rawSamples: [PriorMapTagPoint3D]
+    let maxRawSamples: Int
+
+    init(
+        burstId: String,
+        sequence: Int,
+        observation: PriorMapTagObservationRecord,
+        maxRawSamples: Int
+    ) {
+        self.burstId = burstId
+        self.sequence = sequence
+        self.barcode = observation.payload
+        self.symbology = observation.symbology
+        self.floorId = observation.floorId
+        self.trackingSessionId = observation.trackingSessionId
+        self.firstFrameTimestamp = observation.frameTimestamp
+        self.lastFrameTimestamp = observation.frameTimestamp
+        self.frameCount = 1
+        self.nodeTimebaseMin = observation.nodeTimebaseFrameTimestamp
+        self.nodeTimebaseMax = observation.nodeTimebaseFrameTimestamp
+        self.depthInlierRatioSum = 0
+        self.depthSampleCount = 0
+        self.localizationConfidenceSum = 0
+        self.localizationStateVotes = [:]
+        self.viewVotes = (front: 0, back: 0, unknown: 0)
+        self.rawSamples = []
+        self.maxRawSamples = maxRawSamples
+        ingest(observation)
+    }
+
+    mutating func ingest(_ observation: PriorMapTagObservationRecord) {
+        frameCount += 1
+        lastFrameTimestamp = observation.frameTimestamp
+        nodeTimebaseMin = min(nodeTimebaseMin, observation.nodeTimebaseFrameTimestamp)
+        nodeTimebaseMax = max(nodeTimebaseMax, observation.nodeTimebaseFrameTimestamp)
+        if observation.depthSampleCount > 0, observation.depthInlierRatio.isFinite {
+            depthInlierRatioSum += observation.depthInlierRatio
+            depthSampleCount += 1
+        }
+        if observation.localizationConfidence.isFinite {
+            localizationConfidenceSum += observation.localizationConfidence
+        }
+        localizationStateVotes[observation.localizationState, default: 0] += 1
+        if let normal = observation.surfaceNormalCamera, normal.count >= 3 {
+            if normal[2] < 0 {
+                viewVotes.front += 1
+            }
+            else if normal[2] > 0 {
+                viewVotes.back += 1
+            }
+            else {
+                viewVotes.unknown += 1
+            }
+        }
+        else {
+            viewVotes.unknown += 1
+        }
+        if let position = observation.rawMapPosition {
+            rawSamples.append(position)
+            if rawSamples.count > maxRawSamples {
+                rawSamples.removeFirst(rawSamples.count - maxRawSamples)
+            }
+        }
+    }
+
+    func depthQuality() -> Double {
+        guard depthSampleCount > 0 else { return 0 }
+        return min(1, max(0, depthInlierRatioSum / Double(depthSampleCount)))
+    }
+
+    func dominantLocalizationState() -> String {
+        guard let best = localizationStateVotes.max(by: {
+            $0.value == $1.value ? $0.key > $1.key : $0.value < $1.value
+        }) else {
+            return "unknown"
+        }
+        return best.key
+    }
+
+    func dominantViewAngle() -> String {
+        let votes = [viewVotes.front, viewVotes.back, viewVotes.unknown]
+        guard votes.max() != nil, votes.max()! > 0 else {
+            return "unknown"
+        }
+        if viewVotes.front >= viewVotes.back, viewVotes.front >= viewVotes.unknown {
+            return "front"
+        }
+        if viewVotes.back >= viewVotes.unknown {
+            return "back"
+        }
+        return "unknown"
+    }
+
+    func record(complete: Bool) -> TagObservationBurstRecord {
+        let sampleCount = max(1, frameCount)
+        return TagObservationBurstRecord(
+            format: "MarketScannerPriceTagBurst",
+            version: 1,
+            burstId: burstId,
+            sequence: sequence,
+            barcode: barcode,
+            symbology: symbology,
+            floorId: floorId,
+            frameCount: frameCount,
+            firstFrameTimestamp: firstFrameTimestamp,
+            lastFrameTimestamp: lastFrameTimestamp,
+            nodeTimebaseMin: nodeTimebaseMin,
+            nodeTimebaseMax: nodeTimebaseMax,
+            depthQuality: depthQuality(),
+            viewAngle: dominantViewAngle(),
+            trackingQuality: dominantLocalizationState(),
+            localizationConfidenceMean: min(1, max(0, localizationConfidenceSum / Double(sampleCount))),
+            rawSamples: rawSamples,
+            trackingSessionId: trackingSessionId,
+            complete: complete)
+    }
 }
 
 struct ScanCaptureHealth: Codable {
@@ -483,6 +702,22 @@ final class SupermarketScanSession {
     private var nextTagId: Int = 1
     private var lastLocalizationState: String?
     private(set) var scanConfiguration = PriorMapScanConfiguration.freeMapping
+
+    // V1R4 §13.1: in-memory aggregation of consecutive same-barcode
+    // observations into durable bursts. All access happens under
+    // `localizationTransactionLock` (the same lock guarding
+    // `appendTagObservation`), so no separate lock is needed.
+    private var pendingTagBurst: PendingTagBurst?
+    private var tagBurstSequence = 0
+    private(set) var tagObservationBurstCount = 0
+    private var lastTagObservationBurstID: String?
+    private var tagBurstWriteFailureCount = 0
+    /// Max wall-clock gap (frame timestamps) between observations that still
+    /// merge into one burst (V1R4 §13.1 bounded window).
+    private let tagBurstMaxGapSeconds: TimeInterval = 3.0
+    /// Upper bound on raw 3D samples retained per burst; the newest samples
+    /// are kept.
+    private let tagBurstMaxRawSamples = 32
 
     private var finalizingScan = false
     var isFinalizingScan: Bool {
@@ -1363,6 +1598,19 @@ final class SupermarketScanSession {
                     try sidecarWriter.writeAtomic(Data(), to: url)
                 }
             }
+            // V1R4 §13.1: a burst sidecar is required for processing. An
+            // empty file is only created when no burst is expected; a
+            // missing file with a positive watermark is a blocker and stays
+            // missing for the validator.
+            let expectedBurstCount =
+                snapshot.metadata.tagObservationBurstCount ?? 0
+            let burstsURL = segmentDirectory.appendingPathComponent(
+                "tag_observation_bursts.jsonl")
+            if !sidecarWriter.fileExists(at: burstsURL) {
+                if expectedBurstCount == 0 {
+                    try sidecarWriter.writeAtomic(Data(), to: burstsURL)
+                }
+            }
             // Finalization must never rebuild lost recovery evidence as an
             // empty file: creating the sidecar is only allowed while no
             // episode is expected. A missing file with a positive watermark
@@ -1423,7 +1671,16 @@ final class SupermarketScanSession {
                                     .localizationLastRecoveryEpisodeId,
                             lastRecoveryFinishedAtUptime:
                                 captureHealth
-                                    .localizationLastRecoveryFinishedAtUptime))
+                                    .localizationLastRecoveryFinishedAtUptime,
+                            // V1R4 §13.1: exact tag burst watermarks; a
+                            // short count, a mismatched last ID, or a failed
+                            // flush blocks finalization fail-closed.
+                            tagBurstCount:
+                                committedMetadata.tagObservationBurstCount ?? 0,
+                            tagBurstLastID:
+                                committedMetadata.tagObservationBurstLastID,
+                            tagBurstComplete:
+                                committedMetadata.tagObservationBurstComplete ?? false))
             }
             else {
                 evidenceValidationBlockers = [
@@ -1675,8 +1932,101 @@ final class SupermarketScanSession {
                 event: "tag_observation_write_failed",
                 message: "Required price-tag observation evidence was not persisted",
                 fields: ["reason": failures["tag_observations.jsonl"]!])
+            return false
         }
-        return result.succeeded
+        // V1R4 §13.1: only observations durably persisted to the main
+        // sidecar may enter burst aggregation. A burst flush failure marks
+        // the session processing-ineligible fail-closed (watermark count
+        // stays short and the finalization flag flips false).
+        ingestTagObservationBurst(observation)
+        return true
+    }
+
+    // MARK: - Tag burst aggregation (V1R4 §13.1)
+
+    private func ingestTagObservationBurst(
+        _ observation: PriorMapTagObservationRecord
+    ) {
+        guard scanConfiguration.workflowMode == .priorMapLocalized,
+              observation.frameTimestamp.isFinite,
+              observation.nodeTimebaseFrameTimestamp.isFinite else {
+            return
+        }
+        if var pending = pendingTagBurst {
+            let sameBarcode = pending.barcode == observation.payload
+                && pending.symbology == observation.symbology
+            let withinGap = observation.frameTimestamp
+                - pending.lastFrameTimestamp <= tagBurstMaxGapSeconds
+            if sameBarcode, withinGap {
+                pending.ingest(observation)
+                pendingTagBurst = pending
+                return
+            }
+            flushPendingTagBurstLocked()
+        }
+        tagBurstSequence += 1
+        pendingTagBurst = PendingTagBurst(
+            burstId: UUID().uuidString,
+            sequence: tagBurstSequence,
+            observation: observation,
+            maxRawSamples: tagBurstMaxRawSamples)
+    }
+
+    /// Flushes the in-flight burst (if any) as a complete durable record.
+    /// On write failure the burst is dropped (it can never be made complete
+    /// in memory), the failure is recorded fail-closed, and the watermark
+    /// count stays short so the PC side blocks processing.
+    private func flushPendingTagBurstLocked() {
+        guard let pending = pendingTagBurst else { return }
+        pendingTagBurst = nil
+        let directory = rootDirectory?.appendingPathComponent(
+            "segment_0001", isDirectory: true)
+        guard let directory,
+              fileManager.fileExists(atPath: directory.path) else {
+            recordTagBurstWriteFailure("active_directory_unavailable")
+            return
+        }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        do {
+            var data = try encoder.encode(pending.record(complete: true))
+            data.append(0x0A)
+            sidecarWriteLock.lock()
+            defer { sidecarWriteLock.unlock() }
+            try sidecarWriter.append(
+                data,
+                to: directory.appendingPathComponent("tag_observation_bursts.jsonl"))
+            tagObservationBurstCount += 1
+            lastTagObservationBurstID = pending.burstId
+        }
+        catch {
+            recordTagBurstWriteFailure(error.localizedDescription)
+        }
+    }
+
+    private func recordTagBurstWriteFailure(_ reason: String) {
+        tagBurstWriteFailureCount += 1
+        recordLocalizationEvidenceFailures([
+            "tag_observation_bursts.jsonl": reason
+        ])
+        appendScanEvent(
+            level: "error",
+            event: "tag_observation_burst_write_failed",
+            message: "Required tag burst evidence was not persisted",
+            fields: ["reason": reason])
+    }
+
+    /// Finalization entry point: flushes the last in-flight burst and
+    /// returns the durable sidecar watermarks for metadata commit. Called
+    /// exactly once per finalization, before the metadata snapshot is built.
+    func flushTagObservationBursts() -> TagObservationBurstFlushResult {
+        localizationTransactionLock.lock()
+        defer { localizationTransactionLock.unlock() }
+        flushPendingTagBurstLocked()
+        return TagObservationBurstFlushResult(
+            count: tagObservationBurstCount,
+            lastBurstID: lastTagObservationBurstID,
+            complete: tagBurstWriteFailureCount == 0)
     }
 
     @discardableResult

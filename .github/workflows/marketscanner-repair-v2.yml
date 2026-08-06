@@ -79,7 +79,7 @@ jobs:
         shell: bash
         run: |
           echo "head_sha=$(git rev-parse HEAD)" | tee -a "$GITHUB_STEP_SUMMARY"
-          echo "native_core_sha256=$(sha256sum core/MarketScannerFactorGraph/market_scanner_factor_graph.cpp core/MarketScannerFactorGraph/market_scanner_factor_graph.h | sha256sum | cut -d' ' -f1)" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "native_core_sha256=$(python3 tools/Qualification/market_scanner_build_identity.py native-digest --repo .)" | tee -a "$GITHUB_STEP_SUMMARY"
           python3 - <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
           import json
           wave = json.load(open(".github/marketscanner-repair-v2-wave.json", encoding="utf-8"))
@@ -563,10 +563,10 @@ jobs:
           identity="$RUNNER_TEMP/MarketScannerDerivedData/Build/Products/Release-iphoneos/RTABMapApp.app/MarketScannerBuildIdentity.json"
           test -f "$identity" || { echo "::error::MarketScannerBuildIdentity.json missing from the app bundle"; exit 1; }
           cat "$identity" >> ci-artifacts/macos-ios-summary.md
-          grep -F "\"app_git_sha\": \"$(git rev-parse HEAD)\"" "$identity" \
-            || { echo "::error::embedded app SHA does not match the exact HEAD"; exit 1; }
-          grep -F "\"native_core_sha256\": \"$(sha256sum core/MarketScannerFactorGraph/market_scanner_factor_graph.cpp core/MarketScannerFactorGraph/market_scanner_factor_graph.h | sha256sum | cut -d' ' -f1)\"" "$identity" \
-            || { echo "::error::embedded native core SHA does not match the source tree"; exit 1; }
+          # V1R4 §3.3: the SAME unified contract script verifies app SHA,
+          # wave name and native core digest against the checked-out tree.
+          python3 tools/Qualification/market_scanner_build_identity.py verify --repo . --identity "$identity" \
+            || { echo "::error::embedded build identity does not match the exact HEAD"; exit 1; }
       - name: Finalize macOS test summary
         if: always()
         shell: bash

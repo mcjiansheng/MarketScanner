@@ -42,6 +42,7 @@ enum MapSourceImportError: Error, Equatable {
     case coordinateContractMissing
     case unknownShapeTypePolicy(shapeType: String)
     case invalidGeometry(shapeType: String, reason: String)
+    case duplicateElementIdentity(duplicateID: String)
     case cancelled
 
     /// Frozen machine-readable code. UI and tests must not parse the
@@ -83,6 +84,7 @@ enum MapSourceImportError: Error, Equatable {
         case .coordinateContractMissing: return "map_source_coordinate_contract_missing"
         case .unknownShapeTypePolicy: return "map_source_unknown_shape_type"
         case .invalidGeometry: return "map_source_invalid_geometry"
+        case .duplicateElementIdentity: return "map_source_duplicate_element_identity"
         case .cancelled: return "map_source_cancelled"
         }
     }
@@ -159,6 +161,8 @@ enum MapSourceImportError: Error, Equatable {
             return "未知元素类型：\(shapeType)"
         case .invalidGeometry(let shapeType, let reason):
             return "元素 \(shapeType) 几何无效：\(reason)"
+        case .duplicateElementIdentity(let duplicateID):
+            return "地图包含重复的元素身份：\(duplicateID)"
         case .cancelled:
             return "导入已取消。"
         }

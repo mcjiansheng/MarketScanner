@@ -80,6 +80,18 @@ enum SessionSnapshotTransaction {
     ]
     static let databaseFileName = "rtabmap_segment_0001.db"
 
+    /// Metadata sidecar declarations: metadata key -> artifact file name.
+    /// A non-empty declaration makes the artifact REQUIRED (B-08).
+    static let declaredSidecarPairs: [(key: String, name: String)] = [
+        ("localizationTrace", "localization_trace.jsonl"),
+        ("manualLocalizationEvents", "manual_localization_events.jsonl"),
+        ("localizationConstraints", "localization_constraints.jsonl"),
+        ("localizationEvents", "localization_events.jsonl"),
+        ("localizationRecoveryEvents", "localization_recovery_events.jsonl"),
+        ("tagObservations", "tag_observations.jsonl"),
+        ("localizedPriceTags", "localized_price_tags.json"),
+    ]
+
     static let copyChunkBytes = 4 * 1024 * 1024
     static let safetyReserveBytes: Int64 = 256 * 1024 * 1024
 
@@ -95,6 +107,15 @@ enum SessionSnapshotTransaction {
         let fileManager = FileManager.default
         let taskID = taskRoot.lastPathComponent
 
+        // B-08: the source database must be PROVEN to live inside the
+        // finalized session (receipt/segment) directory; a database
+        // referenced from anywhere else is not session evidence.
+        let sessionPath = finalizedSession.standardizedFileURL.path
+        let dbPath = sourceDatabase.standardizedFileURL.path
+        guard dbPath.hasPrefix(sessionPath + "/") else {
+            throw SessionError.sessionMissing
+        }
+
         // 1. Eligibility on the STABLE source metadata (§8.1).
         let metadataURL = finalizedSession.appendingPathComponent("metadata.json")
         guard fileManager.fileExists(atPath: metadataURL.path) else {
@@ -103,7 +124,9 @@ enum SessionSnapshotTransaction {
         let metadata = try readMetadata(metadataURL)
         try checkEligibility(metadata, eligibility: eligibility)
 
-        // 2. Build the file set: required + present optional/watermark.
+        // 2. Build the file set: required + metadata-DECLARED + present
+        //    optional/watermark. Declarations drive requiredness instead
+        //    of directory presence (B-08).
         var filesToCopy: [(name: String, source: URL, required: Bool)] = []
         for name in requiredFileNames {
             let source = finalizedSession.appendingPathComponent(name)
@@ -111,6 +134,22 @@ enum SessionSnapshotTransaction {
                 throw SessionError.missingRequired(name)
             }
             filesToCopy.append((name, source, true))
+        }
+        // Sidecars the metadata explicitly declares by file name: when
+        // declared they are REQUIRED — losing them is evidence tampering.
+        for (key, name) in Self.declaredSidecarPairs {
+            let declared = metadata[key] as? String ?? ""
+            guard declared.isEmpty || declared == name else {
+                throw SessionError.notEligible(
+                    "metadata declares unexpected \(key): \(declared)")
+            }
+            if !declared.isEmpty {
+                let source = finalizedSession.appendingPathComponent(name)
+                guard fileManager.fileExists(atPath: source.path) else {
+                    throw SessionError.missingRequired(name)
+                }
+                filesToCopy.append((name, source, true))
+            }
         }
         // Watermark sidecars: required when the metadata watermark says
         // the scan recorded them; their absence is evidence tampering.
@@ -128,6 +167,9 @@ enum SessionSnapshotTransaction {
             }
         }
         for name in optionalFileNames {
+            // B-08: never duplicate an artifact already covered by a
+            // metadata declaration.
+            if filesToCopy.contains(where: { $0.name == name }) { continue }
             let source = finalizedSession.appendingPathComponent(name)
             if fileManager.fileExists(atPath: source.path) {
                 filesToCopy.append((name, source, false))
@@ -151,12 +193,12 @@ enum SessionSnapshotTransaction {
         // 4. Streaming stable copies into staging (§8.3/§8.7).
         let snapshotDirectory = taskRoot.appendingPathComponent("input_snapshot")
         let stagingDirectory = taskRoot.appendingPathComponent("input_snapshot.staging")
-        // Idempotence: rebuild from the source on retry.
+        // Idempotence: rebuild the staging tree from the source on
+        // retry. The committed snapshot is NOT deleted here — B-08 keeps
+        // the previous valid snapshot until the new one is complete and
+        // verified (see step 7).
         if fileManager.fileExists(atPath: stagingDirectory.path) {
             try fileManager.removeItem(at: stagingDirectory)
-        }
-        if fileManager.fileExists(atPath: snapshotDirectory.path) {
-            try fileManager.removeItem(at: snapshotDirectory)
         }
         try fileManager.createDirectory(
             at: stagingDirectory, withIntermediateDirectories: true)
@@ -184,39 +226,95 @@ enum SessionSnapshotTransaction {
             throw SessionError.emptyInput
         }
 
-        // 5. DB validation on the stable copy (§8.5).
-        try validateSnapshotDatabase(
-            stagingDirectory.appendingPathComponent(sourceDatabase.lastPathComponent))
+        // Steps 5-7 run in a cleanup scope: any failure removes the
+        // staging tree; the previously committed snapshot (if any) is
+        // only replaced AFTER the new one is complete and verified
+        // (B-08 retry safety).
+        do {
+            // 5. DB validation on the stable copy (§8.5).
+            try validateSnapshotDatabase(
+                stagingDirectory.appendingPathComponent(sourceDatabase.lastPathComponent))
 
-        // 6. Input manifest + atomic commit (§8.7).
-        let bundleSHA = MobilePackageManifestBuilder.packageDigest(artifacts)
-        let manifest: [String: Any] = [
-            "format": "MarketScannerSessionInputManifest",
-            "version": 2,
-            "task_id": taskID,
-            "bundle_sha256": bundleSHA,
-            "artifact_count": artifacts.count,
-            "artifacts": artifacts,
-        ]
-        let manifestData = try CanonicalJSONEncoder.encode(manifest)
-        let stagingManifest = stagingDirectory.appendingPathComponent("input_manifest.json")
-        try manifestData.write(to: stagingManifest, options: [.atomic])
-        fsyncURL(stagingManifest)
-        fsyncDirectory(stagingDirectory)
+            // 6. B-08: re-validate the COPIED metadata. Eligibility must
+            //    hold on the exact bytes the snapshot contains, and the
+            //    copy must be byte-identical to the source metadata that
+            //    was checked in step 1 (TOCTOU detection — the source
+            //    cannot swap between eligibility and copy).
+            let stagedMetadataURL = stagingDirectory.appendingPathComponent("metadata.json")
+            let stagedMetadata = try readMetadata(stagedMetadataURL)
+            try checkEligibility(stagedMetadata, eligibility: eligibility)
+            let sourceDigest = try CanonicalSourceHasher.sha256File(metadataURL)
+            let stagedDigest = try CanonicalSourceHasher.sha256File(stagedMetadataURL)
+            guard sourceDigest == stagedDigest else {
+                throw SessionError.copyFailed(
+                    "metadata changed during snapshot (TOCTOU)")
+            }
+            // Watermark re-check on the copied metadata: counts the
+            // snapshot actually carries must be backed by the copied
+            // artifacts.
+            let stagedClock = (stagedMetadata["clockCorrelationCount"] as? NSNumber)?.int64Value ?? 0
+            let stagedBurst = (stagedMetadata["tagObservationBurstCount"] as? NSNumber)?.int64Value ?? 0
+            if stagedClock > 0 && !fileManager.fileExists(
+                atPath: stagingDirectory.appendingPathComponent("clock_correlations.jsonl").path) {
+                throw SessionError.missingRequired("clock_correlations.jsonl")
+            }
+            if stagedBurst > 0 && !fileManager.fileExists(
+                atPath: stagingDirectory.appendingPathComponent("tag_observation_bursts.jsonl").path) {
+                throw SessionError.missingRequired("tag_observation_bursts.jsonl")
+            }
+            for (_, name) in Self.declaredSidecarPairs {
+                let declared = stagedMetadata[Self.nameKey(for: name)] as? String ?? ""
+                if !declared.isEmpty && !fileManager.fileExists(
+                    atPath: stagingDirectory.appendingPathComponent(name).path) {
+                    throw SessionError.missingRequired(name)
+                }
+            }
 
-        try fileManager.moveItem(at: stagingDirectory, to: snapshotDirectory)
-        fsyncDirectory(taskRoot)
-        // The committed manifest lives in the task root as before.
-        try manifestData.write(
-            to: taskRoot.appendingPathComponent("input_manifest.json"),
-            options: [.atomic])
-        fsyncURL(taskRoot.appendingPathComponent("input_manifest.json"))
+            // 7. Input manifest + atomic commit (§8.7).
+            let bundleSHA = MobilePackageManifestBuilder.packageDigest(artifacts)
+            let manifest: [String: Any] = [
+                "format": "MarketScannerSessionInputManifest",
+                "version": 2,
+                "task_id": taskID,
+                "bundle_sha256": bundleSHA,
+                "artifact_count": artifacts.count,
+                "artifacts": artifacts,
+            ]
+            let manifestData = try CanonicalJSONEncoder.encode(manifest)
+            let stagingManifest = stagingDirectory.appendingPathComponent("input_manifest.json")
+            try manifestData.write(to: stagingManifest, options: [.atomic])
+            try fsyncURL(stagingManifest)
+            try fsyncDirectory(stagingDirectory)
 
-        return SessionSnapshot(
-            taskID: taskID,
-            snapshotDirectory: snapshotDirectory,
-            inputManifest: manifest,
-            bundleSHA256: bundleSHA)
+            // B-08: only now is the previously committed snapshot
+            // replaced — a failure above keeps the old valid snapshot.
+            if fileManager.fileExists(atPath: snapshotDirectory.path) {
+                try fileManager.removeItem(at: snapshotDirectory)
+            }
+            try fileManager.moveItem(at: stagingDirectory, to: snapshotDirectory)
+            try fsyncDirectory(taskRoot)
+            // The committed manifest lives in the task root as before.
+            try manifestData.write(
+                to: taskRoot.appendingPathComponent("input_manifest.json"),
+                options: [.atomic])
+            try fsyncURL(taskRoot.appendingPathComponent("input_manifest.json"))
+
+            return SessionSnapshot(
+                taskID: taskID,
+                snapshotDirectory: snapshotDirectory,
+                inputManifest: manifest,
+                bundleSHA256: bundleSHA)
+        } catch {
+            try? fileManager.removeItem(at: stagingDirectory)
+            throw error
+        }
+    }
+
+    /// Maps a metadata sidecar-declaration key back to its artifact
+    /// file name (used for the post-copy watermark re-check).
+    private static func nameKey(for fileName: String) -> String {
+        return Self.declaredSidecarPairs
+            .first(where: { $0.name == fileName })?.key ?? ""
     }
 
     // MARK: - Eligibility (§8.1)
@@ -276,14 +374,19 @@ enum SessionSnapshotTransaction {
         }
         if let storeID = eligibility.storeID, !storeID.isEmpty {
             let sessionStore = metadata["storeId"] as? String ?? ""
-            if !sessionStore.isEmpty && sessionStore != storeID {
-                throw SessionError.notEligible("storeId mismatch")
+            // B-08: an empty session store is fail-closed — the
+            // production session MUST record the store it belongs to.
+            guard sessionStore == storeID else {
+                throw SessionError.notEligible(
+                    "storeId mismatch: '\(sessionStore)' != '\(storeID)'")
             }
         }
         if let floorID = eligibility.floorID, !floorID.isEmpty {
             let sessionFloor = metadata["floorId"] as? String ?? ""
-            if !sessionFloor.isEmpty && sessionFloor != floorID {
-                throw SessionError.notEligible("floorId mismatch")
+            // B-08: same fail-closed policy for the floor.
+            guard sessionFloor == floorID else {
+                throw SessionError.notEligible(
+                    "floorId mismatch: '\(sessionFloor)' != '\(floorID)'")
             }
         }
     }
@@ -473,18 +576,30 @@ enum SessionSnapshotTransaction {
 
     // MARK: - Durability helpers
 
-    private static func fsyncURL(_ url: URL) {
+    private static func fsyncURL(_ url: URL) throws {
         let fd = open(url.path, O_RDONLY)
-        guard fd >= 0 else { return }
+        guard fd >= 0 else {
+            throw SessionError.copyFailed(
+                "cannot open for fsync: \(url.lastPathComponent)")
+        }
         defer { close(fd) }
-        fsync(fd)
+        guard fsync(fd) == 0 else {
+            throw SessionError.copyFailed(
+                "fsync failed: \(url.lastPathComponent)")
+        }
     }
 
-    private static func fsyncDirectory(_ directory: URL) {
+    private static func fsyncDirectory(_ directory: URL) throws {
         let fd = open(directory.path, O_RDONLY)
-        guard fd >= 0 else { return }
+        guard fd >= 0 else {
+            throw SessionError.copyFailed(
+                "cannot open directory for fsync: \(directory.lastPathComponent)")
+        }
         defer { close(fd) }
-        fsync(fd)
+        guard fsync(fd) == 0 else {
+            throw SessionError.copyFailed(
+                "directory fsync failed: \(directory.lastPathComponent)")
+        }
     }
 }
 
@@ -544,6 +659,7 @@ enum PersistentTaskCoordinator {
         return record
     }
 
+    @discardableResult
     static func updateState(
         _ state: TaskState,
         taskRoot: URL,

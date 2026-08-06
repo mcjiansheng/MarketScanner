@@ -407,12 +407,23 @@ class IOSCoreContractTests(unittest.TestCase):
             / "app/ios/RTABMapApp/MobilePostProcessing/SE2FactorGraphCore.swift",
             repository
             / "app/ios/RTABMapApp/MobilePostProcessing/SessionSnapshotTransaction.swift",
+            # Mobile-Only V1R4: strict absolute prior-map evidence parser
+            # (§6.1): real write-side schema, identity fail-closed,
+            # node-timebase binding, uniqueness-derived sigma, audit codes.
+            repository
+            / "app/ios/RTABMapApp/MobilePostProcessing/AbsolutePriorEvidenceParser.swift",
+            repository
+            / "app/ios/RTABMapApp/MobilePostProcessing/TagObservationEvidenceParser.swift",
+            repository
+            / "app/ios/RTABMapApp/MobilePostProcessing/StrictClockEvidenceParser.swift",
             repository
             / "app/ios/RTABMapApp/MobileResults/MobileWorksheets.swift",
             repository
             / "app/ios/RTABMapApp/MobileResults/MobileResultExporter.swift",
             repository
             / "app/ios/RTABMapApp/MobileResults/XLSXWorkbookWriter.swift",
+            repository
+            / "app/ios/RTABMapApp/MobileResults/XLSXWorkbookVerifier.swift",
             # Mobile-Only V1R1: workflow state machine, durable map/task/
             # result stores and the end-to-end processing pipeline (all
             # Foundation-only; the UIKit coordinator/UI live in the app
@@ -476,6 +487,17 @@ class IOSCoreContractTests(unittest.TestCase):
                 256 * 1024 * 1024,
                 f"100k-record finalization peak RSS was {peak_rss_bytes} bytes",
             )
+            # V1R4 §14.2: the Map Library generation-CAS scenario runs as
+            # its own process (same pattern as --xlsx-scale) so the default
+            # host mode stays inside the frozen peak-RSS gate.
+            cas_result = subprocess.run(
+                [str(executable), "--map-library-cas", str(temporary)],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(cas_result.returncode, 0, cas_result.stderr)
+            self.assertIn("map library CAS passed", cas_result.stdout)
             # P7R6A: the device-side strict parser and the PC reader must
             # classify every shared recovery fixture identically.
             from tools.PriorMap.tests.test_stage3 import (
@@ -737,6 +759,30 @@ class IOSCoreContractTests(unittest.TestCase):
             }
             (import_suite_root / "sample.json").write_text(
                 json.dumps(sample_json, ensure_ascii=False, sort_keys=True),
+                encoding="utf-8",
+            )
+
+            # sample-v2.json (canonical v2 snake_case): the canonical
+            # payload of the same business map. Its document identity and
+            # contract must win over the wizard parameters and its digest
+            # must be byte-identical to the XLSX/CSV import.
+            sample_v2 = {
+                "format": "MarketScannerPriorMapSource",
+                "version": 2,
+                "store_id": "s1",
+                "map_name": "sample",
+                "coordinate_contract": {
+                    "unit": "centimetre",
+                    "origin": "top_left",
+                    "x_axis": "right",
+                    "y_axis": "down",
+                    "rotation_direction": "clockwise_degrees",
+                },
+                "elements": _canonical_json_elements(business_elements),
+                "warnings": [],
+            }
+            (import_suite_root / "sample-v2.json").write_text(
+                json.dumps(sample_v2, ensure_ascii=False, sort_keys=True),
                 encoding="utf-8",
             )
 

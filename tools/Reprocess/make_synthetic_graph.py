@@ -12,10 +12,21 @@ Usage:
       [--loop-noise 0.02] [--prior-every 20] [--scenario clean|wrong_loops|no_priors]
 
 Scenarios:
-    clean        -> expected PASS
-    wrong_loops  -> 10% of loops grossly wrong -> robust kernel must
-                    downweight them; still PASS when priors dominate
-    no_priors    -> expected LOCAL_FRAME_ONLY
+    clean          -> expected PASS
+    wrong_loops    -> 10% of loops grossly wrong -> robust kernel must
+                      downweight them; still PASS when priors dominate
+    no_priors      -> expected LOCAL_FRAME_ONLY
+    offset_map     -> V1R4 §6.6 golden: the raw graph lives in a local
+                      frame that is the map frame transformed by a
+                      NON-identity rigid transform (+20 m / +25 m /
+                      +90 deg); priors are given in the map frame; the
+                      optimizer must rigidly align the whole component,
+                      expected PASS with truth-level control error
+    conflict_priors-> one node carries two contradicting priors ->
+                      expected RECOVERABLE_FAIL (never first-wins)
+    partial_priors -> 3 input priors but only 1 is in-graph/valid ->
+                      the applied-count gate must refuse PASS
+                      (expected LOCAL_FRAME_ONLY)
 """
 
 import argparse
@@ -87,7 +98,8 @@ def main():
     parser.add_argument("--loop-noise", type=float, default=0.02)
     parser.add_argument("--prior-every", type=int, default=20)
     parser.add_argument("--scenario", default="clean",
-                        choices=["clean", "wrong_loops", "no_priors"])
+                        choices=["clean", "wrong_loops", "no_priors",
+                                 "offset_map", "conflict_priors", "partial_priors"])
     parser.add_argument("--seed", type=int, default=7)
     args = parser.parse_args()
 
@@ -95,19 +107,35 @@ def main():
     os.makedirs(args.out_dir, exist_ok=True)
     db_path = os.path.join(args.out_dir, "synthetic.db")
     priors_path = os.path.join(args.out_dir, "priors.json")
+    truth_path = os.path.join(args.out_dir, "truth_map.json")
     if os.path.exists(db_path):
         os.remove(db_path)
 
     poses = build_route(args.nodes)
-    # Raw node poses = truth + small drift (what an online scanner would
-    # have stored before optimization).
+
+    # §6.6: the non-identity map-from-local rigid transform. Raw node
+    # poses are stored in the LOCAL frame; priors are in the MAP frame.
+    if args.scenario == "offset_map":
+        tx, ty, tyaw = 20.0, 25.0, math.pi / 2
+    else:
+        tx, ty, tyaw = 0.0, 0.0, 0.0
+    c0, s0 = math.cos(tyaw), math.sin(tyaw)
+
+    def local_from_map(x, y, yaw):
+        # inv(T_map_local): map -> local
+        dx, dy = x - tx, y - ty
+        return (c0 * dx + s0 * dy, -s0 * dx + c0 * dy, yaw - tyaw)
+
+    # Raw node poses = truth mapped into the local frame + small drift
+    # (what an online scanner would have stored before optimization).
     drift = 0.0
     raw = []
     for i, (x, y, yaw) in enumerate(poses):
         drift += random.gauss(0.0, 0.004)
-        raw.append((x + random.gauss(0.0, 0.01) + drift,
-                    y + random.gauss(0.0, 0.01),
-                    yaw + random.gauss(0.0, 0.005)))
+        lx, ly, lyaw = local_from_map(x, y, yaw)
+        raw.append((lx + random.gauss(0.0, 0.01) + drift,
+                    ly + random.gauss(0.0, 0.01),
+                    lyaw + random.gauss(0.0, 0.005)))
 
     db = sqlite3.connect(db_path)
     db.execute("CREATE TABLE Node (id INTEGER PRIMARY KEY, map_id INTEGER,"
@@ -131,11 +159,12 @@ def main():
                     info_blob(50.0, 50.0, 80.0)))
 
     # Loop closures: link the first node to the last, and a mid cross
-    # link; measurements from TRUTH with gaussian noise.
+    # link; RELATIVE measurements are frame-invariant, so truth-local
+    # relatives are identical in any rigid frame.
     loop_pairs = [(0, args.nodes - 1), (args.nodes // 4, args.nodes - 1 - args.nodes // 4)]
     for k, (a, b) in enumerate(loop_pairs):
-        x1, y1, yaw1 = poses[a]
-        x2, y2, yaw2 = poses[b]
+        x1, y1, yaw1 = raw[a]
+        x2, y2, yaw2 = raw[b]
         rx, ry, ryaw = relative(x1, y1, yaw1, x2, y2, yaw2)
         noise = 4.0 if (args.scenario == "wrong_loops" and k == 1) else args.loop_noise
         rx += random.gauss(0.0, noise)
@@ -147,9 +176,9 @@ def main():
     db.commit()
     db.close()
 
-    # Absolute priors in the prior-map frame (here map == truth frame).
+    # Absolute priors in the prior-map frame (map frame = truth frame).
     priors = []
-    if args.scenario != "no_priors":
+    if args.scenario not in ("no_priors",):
         for i in range(0, args.nodes, args.prior_every):
             x, y, yaw = poses[i]
             priors.append({
@@ -163,8 +192,35 @@ def main():
                 "kind": 0,
                 "episode_id": i + 1,
             })
+    if args.scenario == "conflict_priors":
+        # A second prior on node 1, 5 m away: contradicting cluster.
+        priors.append({
+            "node_id": 1,
+            "map_x": poses[0][0] + 5.0,
+            "map_y": poses[0][1] + 5.0,
+            "map_yaw": poses[0][2],
+            "information_3x3": [20.0, 0.0, 0.0,
+                                 0.0, 20.0, 0.0,
+                                 0.0, 0.0, 15.0],
+            "kind": 0,
+            "episode_id": 90001,
+        })
+    if args.scenario == "partial_priors":
+        # Keep exactly ONE in-graph prior; the other two reference nodes
+        # that do not exist -> applied count must stay below the gate.
+        priors = [priors[0],
+                  dict(priors[1], node_id=999901),
+                  dict(priors[2], node_id=999902)]
     with open(priors_path, "w", encoding="utf-8") as f:
         f.write("{\"priors\": " + repr(priors).replace("'", "\"").replace("True", "true").replace("False", "false") + "}")
+
+    # Map-frame truth for control-point golden assertions (§6.6).
+    truth = {"t_map_local": {"x": tx, "y": ty, "yaw": tyaw},
+             "nodes": [{"id": i + 1, "map_x": x, "map_y": y, "map_yaw": yaw}
+                       for i, (x, y, yaw) in enumerate(poses)]}
+    with open(truth_path, "w", encoding="utf-8") as f:
+        import json as _json
+        f.write(_json.dumps(truth))
     print(db_path)
     print(priors_path)
 

@@ -75,6 +75,14 @@ struct LocalizationEvidenceBundleExpectation {
     let recoveryEventCount: Int
     let lastRecoveryEpisodeId: Int?
     let lastRecoveryFinishedAtUptime: TimeInterval?
+    /// V1R4 §13.1 tag burst watermark: exact count/last burst ID and the
+    /// write-complete flag from the metadata. The sidecar must contain
+    /// exactly that many bursts ending with that ID, and a scan whose
+    /// burst write failed (complete == false) is processing-ineligible
+    /// regardless of file contents.
+    let tagBurstCount: Int
+    let tagBurstLastID: String?
+    let tagBurstComplete: Bool
 
     init(
         trackingSessionId: String,
@@ -88,7 +96,10 @@ struct LocalizationEvidenceBundleExpectation {
         localizedPriceTagCount: Int,
         recoveryEventCount: Int = 0,
         lastRecoveryEpisodeId: Int? = nil,
-        lastRecoveryFinishedAtUptime: TimeInterval? = nil
+        lastRecoveryFinishedAtUptime: TimeInterval? = nil,
+        tagBurstCount: Int = 0,
+        tagBurstLastID: String? = nil,
+        tagBurstComplete: Bool = true
     ) {
         self.trackingSessionId = trackingSessionId
         self.priorMapId = priorMapId
@@ -102,6 +113,9 @@ struct LocalizationEvidenceBundleExpectation {
         self.recoveryEventCount = recoveryEventCount
         self.lastRecoveryEpisodeId = lastRecoveryEpisodeId
         self.lastRecoveryFinishedAtUptime = lastRecoveryFinishedAtUptime
+        self.tagBurstCount = tagBurstCount
+        self.tagBurstLastID = tagBurstLastID
+        self.tagBurstComplete = tagBurstComplete
     }
 }
 
@@ -131,6 +145,7 @@ enum LocalizationEvidenceBundleValidator {
         var previousTimestamp: Double?
         var seenRecordIds = Set<String>()
         var lastRecoveryEpisodeId: Int?
+        var lastRecordId: String?
     }
 
     static func blockers(
@@ -195,6 +210,16 @@ enum LocalizationEvidenceBundleValidator {
                 requiredNonEmpty: expectation.recoveryEventCount > 0,
                 strictlyIncreasingTimestamps: false,
                 recordIdField: nil),
+            // V1R4 §13.1 tag burst evidence: every durably written burst is
+            // required; the count and last burst ID are exact watermarks.
+            JSONLContract(
+                fileName: "tag_observation_bursts.jsonl",
+                format: "MarketScannerPriceTagBurst",
+                version: 1,
+                expectedCount: expectation.tagBurstCount,
+                requiredNonEmpty: expectation.tagBurstCount > 0,
+                strictlyIncreasingTimestamps: false,
+                recordIdField: "burst_id"),
         ]
         var blockers: [String] = []
         var summaries: [String: JSONLValidationSummary] = [:]
@@ -249,6 +274,17 @@ enum LocalizationEvidenceBundleValidator {
            let lastState = states.lastState,
            lastState != expectation.lastDurableState {
             blockers.append("evidence_bundle_localization_events_watermark_mismatch")
+        }
+        // V1R4 §13.1: a scan whose burst write failed is ineligible even if
+        // the file happens to contain records, and the last burst ID must
+        // match the metadata watermark exactly.
+        if !expectation.tagBurstComplete {
+            blockers.append("evidence_bundle_tag_observation_bursts_incomplete")
+        }
+        if expectation.tagBurstCount > 0,
+           summaries["tag_observation_bursts.jsonl"]?.lastRecordId
+                != expectation.tagBurstLastID {
+            blockers.append("evidence_bundle_tag_observation_bursts_last_id_mismatch")
         }
         return Array(Set(blockers)).sorted()
     }
@@ -462,6 +498,7 @@ enum LocalizationEvidenceBundleValidator {
                   summary.seenRecordIds.insert(identifier).inserted else {
                 throw validationError("missing_or_duplicate_record_id")
             }
+            summary.lastRecordId = identifier
         }
         summary.lastState = object["state"] as? String ?? summary.lastState
         summary.count += 1

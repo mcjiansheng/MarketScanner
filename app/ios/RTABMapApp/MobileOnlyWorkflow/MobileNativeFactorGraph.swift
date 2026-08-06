@@ -28,6 +28,35 @@ enum MobileNativeFactorGraph {
         MobileNativeFactorGraphGateway.runFullGraphImplementation = { request, isCancelled in
             return try run(request: request, fullGraph: true, isCancelled: isCancelled)
         }
+        // Wire the snapshot-DB node inventory into the strict absolute
+        // prior parser (§6.1): evidence binds to real RTAB-Map node ids
+        // via the node-stamp (UTC) axis; without this wiring every
+        // constraint/manual record is rejected by the audit (fail
+        // closed, never applied with a default).
+        MobileProcessingPipeline.absolutePriorNodeInventoryProvider = { databaseURL in
+            guard let readout = try? MobileGraphReader.readGraph(databaseURL: databaseURL) else {
+                return []
+            }
+            return readout.nodes.map {
+                AbsolutePriorEvidenceNode(nodeID: $0.id, stamp: $0.stamp)
+            }
+        }
+        // Wire the raw snapshot-DB node poses into the tag propagation
+        // chain (§13.2): P_final = T_final_node * inverse(T_raw_node) *
+        // P_raw needs T_raw_node per bound node id; without this wiring
+        // every observation fails resolution with an explicit RESCAN
+        // task (fail closed, never a default pose).
+        MobileProcessingPipeline.rawNodePoseProvider = { databaseURL in
+            guard let readout = try? MobileGraphReader.readGraph(databaseURL: databaseURL) else {
+                return [:]
+            }
+            var poses: [Int64: SE2Transform] = [:]
+            for node in readout.nodes {
+                poses[node.id] = MobileGraphReader.projectToSE2(
+                    poseRowMajor3x4: node.poseRowMajor3x4)
+            }
+            return poses
+        }
     }
 
     // MARK: - C ABI bridge
@@ -113,8 +142,9 @@ enum MobileNativeFactorGraph {
         return outcome
     }
 
-    /// Validates and converts the C outcome (§9.2). Any violation raises
-    /// `invalidOutcome` — unvalidated native memory is never trusted.
+    /// Validates and converts the C outcome (§9.2 / §10.4). Any violation
+    /// raises `invalidOutcome` — unvalidated native memory is never
+    /// trusted; unknown ABI values are errors, never silent downgrades.
     private static func convert(
         _ cOutcome: MSFactorGraphOutcomeC,
         context: RunContext
@@ -124,6 +154,13 @@ enum MobileNativeFactorGraph {
         }
         if let error = cOutcome.error {
             throw MobileNativeFactorGraphError.nativeFailed(String(cString: error))
+        }
+
+        // §10.4: an unknown disposition is an ABI error, never a silent
+        // downgrade to a generic failure.
+        guard let disposition = MobileGraphDisposition(rawValue: cOutcome.disposition) else {
+            throw MobileNativeFactorGraphError.invalidOutcome(
+                "unknown ABI disposition \(cOutcome.disposition)")
         }
 
         let count = cOutcome.count
@@ -150,7 +187,7 @@ enum MobileNativeFactorGraph {
         let qualityJSON: String
         if let json = cOutcome.quality_json {
             let candidate = String(cString: json)
-            // The quality report must be valid UTF-8 JSON (§9.2).
+            // The quality report must be valid UTF-8 JSON (§9.2 / §10.4).
             guard let data = candidate.data(using: .utf8),
                   let parsed = try? JSONSerialization.jsonObject(with: data),
                   parsed is [String: Any] else {
@@ -158,13 +195,22 @@ enum MobileNativeFactorGraph {
                     "quality JSON is not a well-formed object")
             }
             qualityJSON = candidate
-        } else {
+        } else if disposition == .resourceRequired {
+            // H-06 native OOM path: the core cannot materialize the
+            // diagnostics when allocation itself failed — the
+            // disposition is the signal, and it is preserved.
             qualityJSON = ""
+        } else {
+            // §10.4: the quality JSON must exist.
+            throw MobileNativeFactorGraphError.invalidOutcome(
+                "quality JSON is missing")
         }
 
         var trajectory: [MobileNativeTrajectoryRow] = []
         trajectory.reserveCapacity(Int(count))
         var seenIDs = Set<Int64>()
+        // §10.4: stamps must be monotonic within each component.
+        var lastStampByComponent: [Int64: Double] = [:]
         if count > 0, let rows = cOutcome.rows {
             for index in 0..<Int(count) {
                 let row = rows[index]
@@ -176,11 +222,36 @@ enum MobileNativeFactorGraph {
                     throw MobileNativeFactorGraphError.invalidOutcome(
                         "trajectory node id out of int range: \(row.id)")
                 }
+                guard row.map_id >= -1, row.map_id <= Int64(Int32.max) else {
+                    throw MobileNativeFactorGraphError.invalidOutcome(
+                        "trajectory node id \(row.id) map_id out of range: \(row.map_id)")
+                }
+                guard row.component_id >= -1, row.component_id <= Int64(Int32.max) else {
+                    throw MobileNativeFactorGraphError.invalidOutcome(
+                        "trajectory node id \(row.id) component_id out of range: \(row.component_id)")
+                }
                 guard row.stamp.isFinite, row.x.isFinite,
                       row.y.isFinite, row.yaw.isFinite else {
                     throw MobileNativeFactorGraphError.invalidOutcome(
                         "non-finite trajectory row at id \(row.id)")
                 }
+                // §10.4: the publish bool is strictly 0/1.
+                guard row.publish_eligible == 0 || row.publish_eligible == 1 else {
+                    throw MobileNativeFactorGraphError.invalidOutcome(
+                        "publish_eligible is not 0/1 at id \(row.id): \(row.publish_eligible)")
+                }
+                // §10.4: uncertainty is nil (NaN) or finite non-negative.
+                guard row.uncertainty_m.isNaN ||
+                      (row.uncertainty_m.isFinite && row.uncertainty_m >= 0.0) else {
+                    throw MobileNativeFactorGraphError.invalidOutcome(
+                        "uncertainty invalid at id \(row.id): \(row.uncertainty_m)")
+                }
+                if let previous = lastStampByComponent[row.component_id],
+                   row.stamp < previous {
+                    throw MobileNativeFactorGraphError.invalidOutcome(
+                        "non-monotonic stamp at id \(row.id) in component \(row.component_id)")
+                }
+                lastStampByComponent[row.component_id] = row.stamp
                 trajectory.append(MobileNativeTrajectoryRow(
                     id: row.id,
                     stamp: row.stamp,
@@ -189,22 +260,41 @@ enum MobileNativeFactorGraph {
                     yawRad: row.yaw,
                     mapID: row.map_id,
                     componentID: row.component_id,
-                    publishEligible: row.publish_eligible != 0,
-                    uncertaintyM: row.uncertainty_m.isFinite ? row.uncertainty_m : nil))
+                    publishEligible: row.publish_eligible == 1,
+                    uncertaintyM: row.uncertainty_m.isNaN ? nil : row.uncertainty_m))
             }
         }
 
+        // §10.4: skeleton IDs are unique, a subset of the trajectory,
+        // and carry finite poses.
         var skeletonIDs: [Int64] = []
-        if skeletonCount > 0, let ids = cOutcome.skeleton_ids {
+        if skeletonCount > 0, let ids = cOutcome.skeleton_ids,
+           let xPtr = cOutcome.skeleton_x,
+           let yPtr = cOutcome.skeleton_y,
+           let yawPtr = cOutcome.skeleton_yaw {
             skeletonIDs.reserveCapacity(Int(skeletonCount))
+            var seenSkeleton = Set<Int64>()
             for index in 0..<Int(skeletonCount) {
-                skeletonIDs.append(ids[index])
+                let id = ids[index]
+                guard seenSkeleton.insert(id).inserted else {
+                    throw MobileNativeFactorGraphError.invalidOutcome(
+                        "duplicate skeleton node id \(id)")
+                }
+                guard seenIDs.contains(id) else {
+                    throw MobileNativeFactorGraphError.invalidOutcome(
+                        "skeleton node id \(id) is not a trajectory row")
+                }
+                guard xPtr[index].isFinite, yPtr[index].isFinite,
+                      yawPtr[index].isFinite else {
+                    throw MobileNativeFactorGraphError.invalidOutcome(
+                        "non-finite skeleton pose at id \(id)")
+                }
+                skeletonIDs.append(id)
             }
         }
 
         return MobileNativeGraphOutcome(
-            disposition: MobileGraphDisposition(rawValue: cOutcome.disposition)
-                ?? .nonRecoverableFail,
+            disposition: disposition,
             qualityJSON: qualityJSON,
             trajectory: trajectory,
             skeletonIDs: skeletonIDs)
