@@ -6761,6 +6761,48 @@ do {
 
     // 4) Production pipeline: snapshot -> Fast Path -> trajectory -> tags
     //    -> result package -> streaming XLSX -> external manifest.
+    // V1R2: the host suite wires the deterministic reference
+    // implementation of the factor-graph gateway; the real app wires the
+    // shared native core (`MobileNativeFactorGraph.wireIntoGateway()`).
+    let referenceImplementation: MobileNativeFactorGraphGateway.RunImplementation = { databaseURL, _, _, _ in
+        let snapshotDirectory = databaseURL.deletingLastPathComponent()
+        let traceURL = snapshotDirectory.appendingPathComponent("localization_trace.jsonl")
+        var rows: [MobileNativeTrajectoryRow] = []
+        if let content = try? String(contentsOf: traceURL, encoding: .utf8) {
+            var id: Int64 = 0
+            for line in content.split(separator: "\n") {
+                guard let data = line.data(using: .utf8),
+                      let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                      let timestamp = object["timestamp"] as? Double,
+                      let pose = object["estimatedPose"] as? [String: Any]
+                else { continue }
+                id += 1
+                // Real DB node stamps are UTC seconds; the reference
+                // implementation must emit the same axis (trace monotonic
+                // timestamp + node-timebase offset), otherwise the 1 Hz
+                // resample range is inconsistent with finalizedAtUnix.
+                let offset = object["nodeTimebaseOffsetSeconds"] as? Double ?? 0
+                rows.append(MobileNativeTrajectoryRow(
+                    id: id,
+                    stamp: timestamp + offset,
+                    xM: pose["x_m"] as? Double ?? 0,
+                    yM: pose["y_m"] as? Double ?? 0,
+                    yawRad: pose["yaw_rad"] as? Double ?? 0))
+            }
+        }
+        guard !rows.isEmpty else {
+            throw MobileNativeFactorGraphError.nativeFailed("reference graph is empty")
+        }
+        return MobileNativeGraphOutcome(
+            disposition: .pass,
+            qualityJSON: "{\"format\": \"MarketScannerGraphQuality\", \"version\": 1, "
+                + "\"path\": \"host-reference\", \"disposition\": \"PASS\"}",
+            trajectory: rows,
+            skeletonIDs: rows.map { $0.id })
+    }
+    MobileNativeFactorGraphGateway.runFastImplementation = referenceImplementation
+    MobileNativeFactorGraphGateway.runDeepImplementation = referenceImplementation
+
     MobileProcessingTaskStore.rootOverride = temporary.appendingPathComponent("Tasks")
     MobileResultLibrary.rootOverride = temporary.appendingPathComponent("Results")
     let taskRoot = try MobileProcessingTaskStore.createTask(taskID: "e2e-task")

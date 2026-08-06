@@ -5,3 +5,4 @@
 #include "NativeWrapper.hpp"
 #import <sqlite3.h>
 #include "MSRTABMapGraphReaderBridge.h"
+#include "market_scanner_factor_graph.h"

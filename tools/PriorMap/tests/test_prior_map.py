@@ -428,6 +428,10 @@ class IOSCoreContractTests(unittest.TestCase):
             repository
             / "app/ios/RTABMapApp/MobileOnlyWorkflow/MobileResultLibrary.swift",
             repository
+            / "app/ios/RTABMapApp/MobileOnlyWorkflow/MobileNativeGraphTypes.swift",
+            repository
+            / "app/ios/RTABMapApp/MobileOnlyWorkflow/ProcessingResourceGovernor.swift",
+            repository
             / "app/ios/RTABMapApp/MobileOnlyWorkflow/MobileProcessingPipeline.swift",
         ]
         swift_test = Path(__file__).with_name("swift") / "main.swift"

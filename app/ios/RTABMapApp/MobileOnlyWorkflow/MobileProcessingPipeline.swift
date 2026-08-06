@@ -44,6 +44,8 @@ enum MobileProcessingPipeline {
         case missingMetadata
         case emptyTrace
         case noOptimizedNodes
+        case emptyGraph
+        case qualityGateRejected(String)
         case cannotBuildWorkbook(String)
         case invalidPriorMap(String)
 
@@ -52,6 +54,8 @@ enum MobileProcessingPipeline {
             case .missingMetadata: return "会话元数据缺失"
             case .emptyTrace: return "本地化轨迹为空，无法处理"
             case .noOptimizedNodes: return "优化后没有可用节点"
+            case .emptyGraph: return "会话数据库中没有可读取的 RTAB-Map 图"
+            case .qualityGateRejected(let detail): return "质量门拒绝发布：\(detail)"
             case .cannotBuildWorkbook(let d): return "工作簿生成失败：\(d)"
             case .invalidPriorMap(let d): return "先验地图无效：\(d)"
             }
@@ -63,14 +67,17 @@ enum MobileProcessingPipeline {
     static func run(
         request: Request,
         progress: (Double, String) -> Void,
-        isCancelled: () -> Bool
+        isCancelled: @escaping () -> Bool
     ) throws -> Outcome {
         progress(0.05, "生成会话快照")
+        try ProcessingResourceGovernor.checkBudget(stage: "snapshot")
         let snapshot = try SessionSnapshotTransaction.snapshot(
             finalizedSession: request.finalizedSession,
             sourceDatabase: request.sourceDatabase,
             taskRoot: request.taskRoot)
         guard !isCancelled() else { throw MobileOnlyWorkflowError.cancelled }
+        let snapshotDatabase = snapshot.snapshotDirectory
+            .appendingPathComponent(request.sourceDatabase.lastPathComponent)
 
         progress(0.15, "读取会话元数据")
         let metadata = try readMetadata(in: snapshot.snapshotDirectory)
@@ -79,55 +86,109 @@ enum MobileProcessingPipeline {
             ?? metadata["finalized_at_unix"] as? Double
             ?? Date().timeIntervalSince1970
 
-        progress(0.20, "读取本地化轨迹")
-        let traces = try readTrace(in: snapshot.snapshotDirectory)
-        guard !traces.isEmpty else { throw PipelineError.emptyTrace }
+        // Tag observations are read before optimization: their node ids
+        // pin the adaptive skeleton (§11.3) and every tag-bound node must
+        // survive reconstruction (§13).
+        let tagObservations = try readTagObservations(in: snapshot.snapshotDirectory)
+        let tagNodeIDs = Array(Set(tagObservations.compactMap { $0.nodeID })).sorted()
 
-        // --- Fast Path: SE(2) relative factor graph ---------------------
+        // --- Fast Path: shared native factor-graph core (§2 / §11) -----
+        // Real RTAB-Map nodes/links from the immutable snapshot DB drive
+        // the run; the Swift solver is a host-test reference only.
         progress(0.30, "快速路径优化")
-        let sampledNodes = buildGraphNodes(from: traces)
-        let graphNodes = sampledNodes.map { $0.node }
-        let graphEdges = buildOdometryEdges(from: graphNodes)
-        let optimized: SE2FactorGraphCore.OptimizedGraph
+        let startRun = Date()
+        var nativeOutcome: MobileNativeGraphOutcome
+        var processingPath = "fast"
         do {
-            optimized = try SE2FactorGraphCore.optimize(
-                nodes: graphNodes, edges: graphEdges)
-        } catch {
-            throw MobileOnlyWorkflowError.processingFailed("Fast Path 求解失败：\(error)")
+            nativeOutcome = try MobileNativeFactorGraphGateway.runFast(
+                databaseURL: snapshotDatabase,
+                tagNodeIDs: tagNodeIDs,
+                isCancelled: isCancelled)
+        } catch let error as MobileNativeFactorGraphError {
+            throw MobileOnlyWorkflowError.processingFailed("Fast Path 求解失败：\(error.localizedDescription)")
         }
-        guard !optimized.poses.isEmpty else { throw PipelineError.noOptimizedNodes }
+        guard !nativeOutcome.trajectory.isEmpty else { throw PipelineError.emptyGraph }
+
+        // One controlled Deep run after a Fast RECOVERABLE_FAIL (§12).
+        if nativeOutcome.disposition == .recoverableFail {
+            guard !isCancelled() else { throw MobileOnlyWorkflowError.cancelled }
+            try ProcessingResourceGovernor.checkBudget(stage: "deep")
+            do {
+                let deepOutcome = try MobileNativeFactorGraphGateway.runDeep(
+                    databaseURL: snapshotDatabase,
+                    tagNodeIDs: tagNodeIDs,
+                    isCancelled: isCancelled)
+                nativeOutcome = deepOutcome
+                processingPath = "deep"
+            } catch let error as MobileNativeFactorGraphError {
+                throw MobileOnlyWorkflowError.processingFailed("Deep Path 求解失败：\(error.localizedDescription)")
+            }
+        }
+
+        // Strict quality gate: only PASS publishes (§2 / §11.5).
+        guard nativeOutcome.disposition == .pass else {
+            throw PipelineError.qualityGateRejected(
+                "\(processingPath) disposition=\(nativeOutcome.disposition.reportValue)")
+        }
+        let graphQualityPassed = true
         guard !isCancelled() else { throw MobileOnlyWorkflowError.cancelled }
 
-        // --- UTC mapping (clock correlations, segment-gated) ------------
+        // --- Clock mapping on the native UTC stamp axis (§13) ----------
+        // DB node stamps ARE UTC seconds, so the reconstructed trajectory
+        // carries its own exact clock axis: utc(m) = startStamp + m. The
+        // trace sidecars still supply the lost intervals (mapped onto the
+        // same axis through their node-timebase UTC values).
         progress(0.40, "构建时钟映射")
-        let utcMapper = try buildUTCMapper(
-            snapshotDirectory: snapshot.snapshotDirectory,
-            traces: traces,
-            finalizedAtUnix: finalizedAtUnix)
+        let traces = try readTrace(in: snapshot.snapshotDirectory)
 
-        // --- Final trajectory (1 Hz) ------------------------------------
+        // --- Final trajectory (1 Hz) from the native reconstruction -----
         progress(0.50, "构建最终轨迹")
-        let finalNodes = optimized.poses.sorted { $0.key < $1.key }.compactMap {
-            pair -> FinalTrajectory.Node? in
-            guard let sampled = sampledNodes.first(where: { $0.id == pair.key }) else {
-                return nil
-            }
-            return FinalTrajectory.Node(
-                id: pair.key,
-                monotonicSeconds: sampled.monotonicSeconds,
-                xM: pair.value.xM,
-                yM: pair.value.yM,
-                yawRad: pair.value.yawRad,
-                uncertaintyM: 0.0,
-                floorID: sampled.floorID)
+        let sessionStartStamp = nativeOutcome.trajectory.first?.stamp ?? finalizedAtUnix - 1
+        let sessionEndStamp = max(
+            nativeOutcome.trajectory.last?.stamp ?? sessionStartStamp,
+            sessionStartStamp + 1)
+        // Fail closed on a pathological time span (never emit billions of
+        // rows from an inconsistent clock basis).
+        let sessionSpan = max(finalizedAtUnix, sessionEndStamp) - sessionStartStamp
+        guard sessionSpan >= 0, sessionSpan <= 48 * 3600 else {
+            throw MobileOnlyWorkflowError.invalidState(
+                "session time span inconsistent: \(sessionSpan) seconds")
         }
-        let lostIntervals = buildLostIntervals(from: traces)
+        let timezoneID = TimeZone.current.identifier
+        let timezoneOffset = TimeZone.current.secondsFromGMT()
+        let utcMapper = MonotonicUTCMapper(records: [
+            ClockCorrelationRecord.make(
+                trackingSessionID: request.trackingSessionID,
+                monotonicSeconds: 0,
+                utcUnixSeconds: sessionStartStamp,
+                timezoneID: timezoneID,
+                utcOffsetSeconds: timezoneOffset,
+                reason: "native_stamp_axis_start"),
+            ClockCorrelationRecord.make(
+                trackingSessionID: request.trackingSessionID,
+                monotonicSeconds: sessionEndStamp - sessionStartStamp,
+                utcUnixSeconds: sessionEndStamp,
+                timezoneID: timezoneID,
+                utcOffsetSeconds: timezoneOffset,
+                reason: "native_stamp_axis_end"),
+        ])
+        let finalNodes = nativeOutcome.trajectory.map {
+            FinalTrajectory.Node(
+                id: $0.id,
+                monotonicSeconds: $0.stamp - sessionStartStamp,
+                xM: $0.xM,
+                yM: $0.yM,
+                yawRad: $0.yawRad,
+                uncertaintyM: 0.0,
+                floorID: floorID)
+        }
+        let lostIntervals = buildLostIntervals(
+            from: traces, sessionStartStamp: sessionStartStamp)
         let trajectoryInput = FinalTrajectory.Input(
             nodes: finalNodes,
             lostIntervals: lostIntervals,
-            sessionStartUTC: (traces.first.map { firstTraceUTC($0, utcMapper: utcMapper) })
-                ?? finalizedAtUnix - 1,
-            sessionEndUTC: finalizedAtUnix)
+            sessionStartUTC: sessionStartStamp,
+            sessionEndUTC: max(finalizedAtUnix, sessionEndStamp))
         let devicePositions = FinalTrajectory.resample(
             input: trajectoryInput,
             utcMapper: utcMapper,
@@ -140,7 +201,6 @@ enum MobileProcessingPipeline {
 
         // --- Tags -------------------------------------------------------
         progress(0.65, "解析价签")
-        let tagObservations = try readTagObservations(in: snapshot.snapshotDirectory)
         let shelves = try readShelves(from: request.priorMap)
         let (priceTags, rescanTasks) = try finalizeTags(
             observations: tagObservations,
@@ -156,7 +216,7 @@ enum MobileProcessingPipeline {
             storeID: request.storeID,
             priorMap: request.priorMap,
             floorID: floorID,
-            graphQualityPassed: optimized.converged)
+            graphQualityPassed: graphQualityPassed)
         guard !isCancelled() else { throw MobileOnlyWorkflowError.cancelled }
 
         // --- Result package ---------------------------------------------
@@ -198,13 +258,15 @@ enum MobileProcessingPipeline {
             to: resultDirectory.appendingPathComponent("rescan_tasks.json"))
         let qualityReport: [String: Any] = [
             "format": "MarketScannerQualityReport",
-            "version": 1,
+            "version": 2,
+            "processing_path": processingPath,
+            "graph_quality_disposition": nativeOutcome.disposition.reportValue,
             "graph": [
-                "node_count": graphNodes.count,
-                "edge_count": graphEdges.count,
-                "final_residual": optimized.finalResidual,
-                "iterations": optimized.iterationsUsed,
-                "converged": optimized.converged,
+                "node_count": nativeOutcome.trajectory.count,
+                "skeleton_node_count": nativeOutcome.skeletonIDs.count,
+                // Verbatim §11.5 native metrics (components, residuals,
+                // corrections, solver diagnostics).
+                "native_quality": nativeOutcome.qualityJSON,
             ],
             "trajectory": [
                 "device_position_count": devicePositions.count,
@@ -219,6 +281,10 @@ enum MobileProcessingPipeline {
         ]
         try CanonicalJSONEncoder.encode(qualityReport).write(
             to: resultDirectory.appendingPathComponent("quality_report.json"))
+        // Verbatim native quality JSON for audit/replay parity with the
+        // PC diagnostic CLI.
+        try nativeOutcome.qualityJSON.data(using: .utf8)!.write(
+            to: resultDirectory.appendingPathComponent("graph_quality.json"))
         // input_manifest.json copy from the snapshot transaction.
         let inputManifestURL = request.taskRoot.appendingPathComponent("input_manifest.json")
         if FileManager.default.fileExists(atPath: inputManifestURL.path) {
@@ -229,15 +295,17 @@ enum MobileProcessingPipeline {
 
         // --- Streaming four-sheet XLSX ----------------------------------
         progress(0.90, "导出工作簿")
+        try ProcessingResourceGovernor.checkBudget(stage: "export")
         let runSummary = buildRunSummary(
             request: request,
             resultID: resultID,
             metadata: metadata,
-            optimized: optimized,
+            nativeOutcome: nativeOutcome,
+            processingPath: processingPath,
+            runDurationSeconds: Date().timeIntervalSince(startRun),
             devicePositions: devicePositions,
             priceTags: priceTags,
-            rescanTasks: rescanTasks,
-            processingPath: "fast")
+            rescanTasks: rescanTasks)
         let workbookName = "\(resultID).xlsx"
         let workbookURL = resultDirectory.appendingPathComponent(workbookName)
         do {
@@ -265,6 +333,7 @@ enum MobileProcessingPipeline {
                 "final_trajectory.jsonl",
                 "final_tags.json",
                 "quality_report.json",
+                "graph_quality.json",
                 "rescan_tasks.json",
                 "input_manifest.json",
             ],
@@ -457,8 +526,19 @@ enum MobileProcessingPipeline {
             ?? trace.nodeTimebaseTimestamp
     }
 
-    /// Lost intervals from the real localization/tracking states.
-    static func buildLostIntervals(from traces: [TraceRecord]) -> [FinalTrajectory.LostInterval] {
+    /// Lost intervals from the real localization/tracking states, mapped
+    /// onto the native UTC stamp axis (monotonic = utc - sessionStart).
+    static func buildLostIntervals(
+        from traces: [TraceRecord], sessionStartStamp: Double
+    ) -> [FinalTrajectory.LostInterval] {
+        /// Trace monotonic axis -> stamp axis conversion: prefer the
+        /// recorded node-timebase UTC, fall back to the raw timestamp.
+        func axisTime(_ trace: TraceRecord) -> Double {
+            if trace.nodeTimebaseTimestamp > 0 {
+                return trace.nodeTimebaseTimestamp - sessionStartStamp
+            }
+            return trace.timestamp
+        }
         var intervals: [FinalTrajectory.LostInterval] = []
         var currentStart: Double?
         var currentReason = ""
@@ -468,13 +548,13 @@ enum MobileProcessingPipeline {
                 || trace.trackingState == "unavailable"
             if lost {
                 if currentStart == nil {
-                    currentStart = trace.timestamp
+                    currentStart = axisTime(trace)
                     currentReason = trace.localizationState == "initializing"
                         ? "localization_initializing" : "tracking_lost"
                 }
             } else if let start = currentStart {
                 intervals.append(FinalTrajectory.LostInterval(
-                    fromMonotonic: start, toMonotonic: trace.timestamp,
+                    fromMonotonic: start, toMonotonic: axisTime(trace),
                     reason: currentReason))
                 currentStart = nil
             }
@@ -482,7 +562,7 @@ enum MobileProcessingPipeline {
         if let start = currentStart {
             intervals.append(FinalTrajectory.LostInterval(
                 fromMonotonic: start,
-                toMonotonic: traces.last?.timestamp ?? start,
+                toMonotonic: traces.last.map { axisTime($0) } ?? start,
                 reason: currentReason))
         }
         return intervals
@@ -745,11 +825,12 @@ enum MobileProcessingPipeline {
         request: Request,
         resultID: String,
         metadata: [String: Any],
-        optimized: SE2FactorGraphCore.OptimizedGraph,
+        nativeOutcome: MobileNativeGraphOutcome,
+        processingPath: String,
+        runDurationSeconds: Double,
         devicePositions: [FinalTrajectory.DevicePositionRow],
         priceTags: [FinalPriceTag],
-        rescanTasks: [RescanTask],
-        processingPath: String
+        rescanTasks: [RescanTask]
     ) -> [String: String] {
         let available = devicePositions.filter { $0.positionStatus == "AVAILABLE" }.count
         return [
@@ -771,14 +852,15 @@ enum MobileProcessingPipeline {
             "timezone_ids": devicePositions.first?.timezoneID ?? "",
             "duration_seconds": String(format: "%.1f",
                 (devicePositions.last?.sessionElapsedS ?? 0) - (devicePositions.first?.sessionElapsedS ?? 0)),
-            "rtabmap_node_count": String(optimized.poses.count),
-            "factor_count": String(optimized.poses.count > 0 ? optimized.poses.count - 1 : 0),
+            "rtabmap_node_count": String(nativeOutcome.trajectory.count),
+            "skeleton_node_count": String(nativeOutcome.skeletonIDs.count),
+            "factor_count": String(max(nativeOutcome.skeletonIDs.count - 1, 0)),
             "loop_closure_count": "0",
             "processing_path": processingPath,
-            "processing_duration_seconds": "0.0",
-            "peak_memory_mb": "0",
+            "processing_duration_seconds": String(format: "%.1f", runDurationSeconds),
+            "peak_memory_mb": String(ProcessingResourceGovernor.currentMemoryFootprintMB()),
             "thermal_interruptions": "0",
-            "graph_quality_status": optimized.converged ? "CONVERGED" : "DIVERGED",
+            "graph_quality_status": nativeOutcome.disposition.reportValue,
             "accepted_tag_count": String(priceTags.filter { $0.qualityStatus == "ACCEPTED" }.count),
             "rescan_tag_count": String(rescanTasks.count),
             "device_position_row_count": String(devicePositions.count),
