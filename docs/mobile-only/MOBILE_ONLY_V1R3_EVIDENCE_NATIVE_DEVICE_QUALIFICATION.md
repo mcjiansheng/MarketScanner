@@ -15,7 +15,7 @@
   "base_sha": "9de2908b4ea8f3169989ce37ddf25f671a511e03",
   "v1r2_head_sha": "9de2908b4ea8f3169989ce37ddf25f671a511e03",
   "implementation_sha": "6de0a4fbc65fd824e24f560fd379669c8b532d56",
-  "validation_sha": "<FINAL_DOCS_GOVERNANCE_SHA>"
+  "validation_sha": "96e4f5022333131774ca5bc1958b25f75deef063"
 }
 ```
 
