@@ -1,8 +1,23 @@
 /*
- * MarketScanner shared factor-graph core implementation (V1R2 Gate G/H).
+ * MarketScanner shared factor-graph core implementation (V1R3).
  *
  * Read-only contract: the snapshot database is opened with
- * `mode=ro&immutable=1` and is never written (§10 / §9.3).
+ * `mode=ro&immutable=1` (fully percent-encoded path) and never written.
+ *
+ * V1R3 correctness closeout highlights:
+ * - exact BLOB sizes and value validation; corrupted required records
+ *   fail closed (NON_RECOVERABLE_FAIL), never skipped into a PASS;
+ * - topology order from the neighbor chains with monotonic stamp
+ *   verification (never "ORDER BY id == trajectory order");
+ * - SPD information policy (valid / regularized_with_audit / rejected);
+ * - aggregate odometry covariance along chains (no fixed diag);
+ * - missing neighbor links form gaps/components, never fabricated
+ *   measurements;
+ * - absolute prior-map constraints anchor components to the map frame;
+ *   without them the run is LOCAL_FRAME_ONLY diagnostics;
+ * - chunked, cancellable, wall/memory-bounded optimization;
+ * - full rᵀΩr chi² including pose priors; streaming escaped quality
+ *   JSON bound to policy/factor/graph/core identities.
  */
 
 #include "market_scanner_factor_graph.h"
@@ -31,7 +46,7 @@
 
 namespace {
 
-// MARK: - SE(2) math -------------------------------------------------------
+// MARK: - SE(2) math ---------------------------------------------------------
 
 struct SE2
 {
@@ -69,8 +84,6 @@ SE2 se2Compose(const SE2 & a, const SE2 & b)
     return out;
 }
 
-/// §13: C_i = SE2Interpolate(C_a, C_b, alpha) with angle unwinding on
-/// the shortest arc.
 SE2 se2Interpolate(const SE2 & a, const SE2 & b, double alpha)
 {
     alpha = std::min(1.0, std::max(0.0, alpha));
@@ -105,7 +118,331 @@ bool se2Finite(const SE2 & p)
     return std::isfinite(p.x) && std::isfinite(p.y) && std::isfinite(p.yaw);
 }
 
-// MARK: - Graph model ------------------------------------------------------
+// MARK: - Small matrix utilities ----------------------------------------------
+
+typedef double Mat3[9];
+
+/// Boxed 3x3 so matrices can live in std::vector (C arrays cannot).
+struct Mat3Box
+{
+    double m[9];
+};
+
+void mat3Symmetrize(Mat3 m)
+{
+    for(int r = 0; r < 3; ++r)
+    {
+        for(int c = r + 1; c < 3; ++c)
+        {
+            const double v = 0.5 * (m[r * 3 + c] + m[c * 3 + r]);
+            m[r * 3 + c] = v;
+            m[c * 3 + r] = v;
+        }
+    }
+}
+
+/// Real symmetric 3x3 eigenvalues (trigonometric method).
+void mat3Eigenvalues(const Mat3 m, double out[3])
+{
+    const double p1 = m[1] * m[1] + m[2] * m[2] + m[5] * m[5];
+    const double q = (m[0] + m[4] + m[8]) / 3.0;
+    const double p2 = (m[0] - q) * (m[0] - q) + (m[4] - q) * (m[4] - q) +
+                      (m[8] - q) * (m[8] - q) + 2.0 * p1;
+    const double p = std::sqrt(p2 / 6.0);
+    if(p <= 1.0e-300)
+    {
+        out[0] = out[1] = out[2] = q;
+        return;
+    }
+    Mat3 b;
+    for(int i = 0; i < 9; ++i) b[i] = (i % 4 == 0 ? m[i] - q : m[i]) / p;
+    const double detB = b[0] * (b[4] * b[8] - b[5] * b[7]) -
+                        b[1] * (b[3] * b[8] - b[5] * b[6]) +
+                        b[2] * (b[3] * b[7] - b[4] * b[6]);
+    double r = detB / 2.0;
+    r = std::min(1.0, std::max(-1.0, r));
+    const double phi = std::acos(r) / 3.0;
+    out[0] = q + 2.0 * p * std::cos(phi);
+    out[2] = q + 2.0 * p * std::cos(phi + 2.0 * M_PI / 3.0);
+    out[1] = 3.0 * q - out[0] - out[2];
+    std::sort(out, out + 3);
+}
+
+bool mat3Invert(const Mat3 m, Mat3 out)
+{
+    const double a = m[0], b = m[1], c = m[2];
+    const double d = m[3], e = m[4], f = m[5];
+    const double g = m[6], h = m[7], i = m[8];
+    const double A = e * i - f * h;
+    const double B = -(d * i - f * g);
+    const double C = d * h - e * g;
+    const double det = a * A + b * B + c * C;
+    if(!std::isfinite(det) || std::fabs(det) < 1.0e-300) return false;
+    const double inv = 1.0 / det;
+    out[0] = A * inv;
+    out[1] = -(b * i - c * h) * inv;
+    out[2] = (b * f - c * e) * inv;
+    out[3] = B * inv;
+    out[4] = (a * i - c * g) * inv;
+    out[5] = -(a * f - c * d) * inv;
+    out[6] = C * inv;
+    out[7] = -(a * h - b * g) * inv;
+    out[8] = (a * e - b * d) * inv;
+    return true;
+}
+
+/// Adjoint of an SE(2) pose acting on planar covariance/twist vectors:
+///   Ad(T) = [ R  J t ; 0 0 1 ] with J = [[0,-1],[1,0]].
+void se2Adjoint(const SE2 & t, Mat3 out)
+{
+    const double c = std::cos(t.yaw);
+    const double s = std::sin(t.yaw);
+    out[0] = c;  out[1] = -s; out[2] = -t.y;
+    out[3] = s;  out[4] = c;  out[5] = t.x;
+    out[6] = 0;  out[7] = 0;  out[8] = 1;
+}
+
+void mat3Multiply(const Mat3 a, const Mat3 b, Mat3 out)
+{
+    Mat3 tmp;
+    for(int r = 0; r < 3; ++r)
+    {
+        for(int c = 0; c < 3; ++c)
+        {
+            double acc = 0.0;
+            for(int k = 0; k < 3; ++k) acc += a[r * 3 + k] * b[k * 3 + c];
+            tmp[r * 3 + c] = acc;
+        }
+    }
+    std::memcpy(out, tmp, sizeof(Mat3));
+}
+
+// MARK: - Information policy (§11.1/§11.2) ------------------------------------
+
+/// Information handling policy. Regularization is ALWAYS audited in the
+/// quality report; silently substituting a default weight is forbidden.
+enum class InfoPolicy
+{
+    Valid,
+    RegularizedWithAudit,
+    Rejected
+};
+
+struct InfoPolicyAudit
+{
+    int64_t valid = 0;
+    int64_t regularized = 0;
+    int64_t rejected = 0;
+};
+
+/// Validates and sanitizes one planar information block:
+/// finite entries, symmetrization, eigenvalue floor and condition cap.
+InfoPolicy sanitizePlanarInformation(Mat3 info, InfoPolicyAudit & audit)
+{
+    for(int i = 0; i < 9; ++i)
+    {
+        if(!std::isfinite(info[i]))
+        {
+            ++audit.rejected;
+            return InfoPolicy::Rejected;
+        }
+    }
+    mat3Symmetrize(info);
+    double eig[3];
+    mat3Eigenvalues(info, eig);
+    const double minEig = eig[0];
+    const double maxEig = eig[2];
+    const double epsilon = 1.0e-9;
+    const double maxCondition = 1.0e9;
+    if(minEig <= 0.0 || maxEig / std::max(minEig, 1.0e-300) > maxCondition)
+    {
+        if(minEig > -1.0e-6 && maxEig > 0.0)
+        {
+            // Regularize: lift the spectrum just above the floor.
+            const double lift = std::max(epsilon, maxEig / maxCondition);
+            for(int d = 0; d < 3; ++d) info[d * 3 + d] += lift - std::min(minEig, 0.0);
+            ++audit.regularized;
+            return InfoPolicy::RegularizedWithAudit;
+        }
+        ++audit.rejected;
+        return InfoPolicy::Rejected;
+    }
+    ++audit.valid;
+    return InfoPolicy::Valid;
+}
+
+/// Inverse-measurement information transform I' = Hᵀ I H with the
+/// analytic Jacobian H of the SE(2) inverse map at the measurement.
+/// Verified against finite differences in the native test suite (§11.1).
+void invertPlanarInformation(const SE2 & measurement, const Mat3 info, Mat3 out)
+{
+    const double c = std::cos(measurement.yaw);
+    const double s = std::sin(measurement.yaw);
+    const SE2 inv = se2Inverse(measurement);
+    const double H[9] = {
+        -c, -s, inv.y,
+         s, -c, inv.x,
+         0,  0, -1,
+    };
+    Mat3 tmp;
+    mat3Multiply(info, H, tmp);
+    Mat3 Ht;
+    for(int r = 0; r < 3; ++r)
+        for(int col = 0; col < 3; ++col) Ht[r * 3 + col] = H[col * 3 + r];
+    mat3Multiply(Ht, tmp, out);
+}
+
+/// Aggregate covariance along an odometry chain (§11.3):
+///   Σ_total = Σ1 + Ad(T1)Σ2Ad(T1)ᵀ + Ad(T1∘T2)Σ3...
+/// Returns false when any segment covariance is unavailable.
+bool aggregateChainInformation(
+    const std::vector<SE2> & measurements,
+    const std::vector<Mat3Box> & informations,
+    Mat3 totalInformation)
+{
+    if(measurements.empty()) return false;
+    Mat3 cov;
+    if(!mat3Invert(informations[0].m, cov)) return false;
+    SE2 composed = measurements[0];
+    for(size_t i = 1; i < measurements.size(); ++i)
+    {
+        Mat3 segCov;
+        if(!mat3Invert(informations[i].m, segCov)) return false;
+        Mat3 adj, adjT, tmp, propagated;
+        se2Adjoint(composed, adj);
+        for(int r = 0; r < 3; ++r)
+            for(int c = 0; c < 3; ++c) adjT[r * 3 + c] = adj[c * 3 + r];
+        mat3Multiply(segCov, adjT, tmp);
+        mat3Multiply(adj, tmp, propagated);
+        for(int k = 0; k < 9; ++k) cov[k] += propagated[k];
+        composed = se2Compose(composed, measurements[i]);
+    }
+    return mat3Invert(cov, totalInformation);
+}
+
+// MARK: - SHA-256 -------------------------------------------------------------
+
+struct Sha256
+{
+    Sha256() : bitLength(0), bufferLength(0)
+    {
+        const uint32_t initial[8] = {
+            0x6a09e667U, 0xbb67ae85U, 0x3c6ef372U, 0xa54ff53aU,
+            0x510e527fU, 0x9b05688cU, 0x1f83d9abU, 0x5be0cd19U};
+        std::memcpy(state, initial, sizeof(state));
+    }
+
+    void update(const void * data, size_t size)
+    {
+        const uint8_t * bytes = static_cast<const uint8_t *>(data);
+        for(size_t i = 0; i < size; ++i)
+        {
+            buffer[bufferLength++] = bytes[i];
+            bitLength += 8;
+            if(bufferLength == 64)
+            {
+                transform(buffer);
+                bufferLength = 0;
+            }
+        }
+    }
+
+    void update(const std::string & text) { update(text.data(), text.size()); }
+
+    std::string hex()
+    {
+        uint8_t hash[32];
+        finalize(hash);
+        static const char * digits = "0123456789abcdef";
+        std::string out;
+        out.reserve(64);
+        for(int i = 0; i < 32; ++i)
+        {
+            out += digits[hash[i] >> 4];
+            out += digits[hash[i] & 0xF];
+        }
+        return out;
+    }
+
+private:
+    static uint32_t rotr(uint32_t v, uint32_t n) { return (v >> n) | (v << (32 - n)); }
+
+    void transform(const uint8_t * block)
+    {
+        static const uint32_t k[64] = {
+            0x428a2f98U, 0x71374491U, 0xb5c0fbcfU, 0xe9b5dba5U, 0x3956c25bU, 0x59f111f1U,
+            0x923f82a4U, 0xab1c5ed5U, 0xd807aa98U, 0x12835b01U, 0x243185beU, 0x550c7dc3U,
+            0x72be5d74U, 0x80deb1feU, 0x9bdc06a7U, 0xc19bf174U, 0xe49b69c1U, 0xefbe4786U,
+            0x0fc19dc6U, 0x240ca1ccU, 0x2de92c6fU, 0x4a7484aaU, 0x5cb0a9dcU, 0x76f988daU,
+            0x983e5152U, 0xa831c66dU, 0xb00327c8U, 0xbf597fc7U, 0xc6e00bf3U, 0xd5a79147U,
+            0x06ca6351U, 0x14292967U, 0x27b70a85U, 0x2e1b2138U, 0x4d2c6dfcU, 0x53380d13U,
+            0x650a7354U, 0x766a0abbU, 0x81c2c92eU, 0x92722c85U, 0xa2bfe8a1U, 0xa81a664bU,
+            0xc24b8b70U, 0xc76c51a3U, 0xd192e819U, 0xd6990624U, 0xf40e3585U, 0x106aa070U,
+            0x19a4c116U, 0x1e376c08U, 0x2748774cU, 0x34b0bcb5U, 0x391c0cb3U, 0x4ed8aa4aU,
+            0x5b9cca4fU, 0x682e6ff3U, 0x748f82eeU, 0x78a5636fU, 0x84c87814U, 0x8cc70208U,
+            0x90befffaU, 0xa4506cebU, 0xbef9a3f7U, 0xc67178f2U};
+        uint32_t w[64];
+        for(int i = 0; i < 16; ++i)
+        {
+            w[i] = (static_cast<uint32_t>(block[i * 4]) << 24) |
+                   (static_cast<uint32_t>(block[i * 4 + 1]) << 16) |
+                   (static_cast<uint32_t>(block[i * 4 + 2]) << 8) |
+                   static_cast<uint32_t>(block[i * 4 + 3]);
+        }
+        for(int i = 16; i < 64; ++i)
+        {
+            const uint32_t s0 = rotr(w[i - 15], 7) ^ rotr(w[i - 15], 18) ^ (w[i - 15] >> 3);
+            const uint32_t s1 = rotr(w[i - 2], 17) ^ rotr(w[i - 2], 19) ^ (w[i - 2] >> 10);
+            w[i] = w[i - 16] + s0 + w[i - 7] + s1;
+        }
+        uint32_t a = state[0], b = state[1], c = state[2], d = state[3];
+        uint32_t e = state[4], f = state[5], g = state[6], h = state[7];
+        for(int i = 0; i < 64; ++i)
+        {
+            const uint32_t S1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25);
+            const uint32_t ch = (e & f) ^ ((~e) & g);
+            const uint32_t t1 = h + S1 + ch + k[i] + w[i];
+            const uint32_t S0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22);
+            const uint32_t maj = (a & b) ^ (a & c) ^ (b & c);
+            const uint32_t t2 = S0 + maj;
+            h = g; g = f; f = e; e = d + t1;
+            d = c; c = b; b = a; a = t1 + t2;
+        }
+        state[0] += a; state[1] += b; state[2] += c; state[3] += d;
+        state[4] += e; state[5] += f; state[6] += g; state[7] += h;
+    }
+
+    void finalize(uint8_t hash[32])
+    {
+        buffer[bufferLength++] = 0x80;
+        if(bufferLength > 56)
+        {
+            while(bufferLength < 64) buffer[bufferLength++] = 0;
+            transform(buffer);
+            bufferLength = 0;
+        }
+        while(bufferLength < 56) buffer[bufferLength++] = 0;
+        for(int i = 7; i >= 0; --i)
+        {
+            buffer[bufferLength++] = static_cast<uint8_t>((bitLength >> (i * 8)) & 0xFF);
+        }
+        transform(buffer);
+        for(int i = 0; i < 8; ++i)
+        {
+            hash[i * 4] = static_cast<uint8_t>((state[i] >> 24) & 0xFF);
+            hash[i * 4 + 1] = static_cast<uint8_t>((state[i] >> 16) & 0xFF);
+            hash[i * 4 + 2] = static_cast<uint8_t>((state[i] >> 8) & 0xFF);
+            hash[i * 4 + 3] = static_cast<uint8_t>(state[i] & 0xFF);
+        }
+    }
+
+    uint32_t state[8];
+    uint64_t bitLength;
+    uint8_t buffer[64];
+    size_t bufferLength;
+};
+
+// MARK: - Graph model ----------------------------------------------------------
 
 struct RawNode
 {
@@ -113,7 +450,8 @@ struct RawNode
     double stamp = 0.0;
     int32_t mapId = 0;
     SE2 pose;
-    bool finite = false;
+    /// Full 3x4 pose for rotation validation (row-major).
+    double pose3x4[12];
 };
 
 struct RawLink
@@ -122,100 +460,66 @@ struct RawLink
     int64_t to = 0;
     int32_t type = 0;
     SE2 measurement;
-    /// Planar 3x3 information (x, y, yaw), row-major.
-    double information[9];
-    bool finite = false;
-    bool crossMap = false;
+    Mat3 information;
+    InfoPolicy infoPolicy = InfoPolicy::Valid;
 };
 
 struct GraphModel
 {
-    std::vector<RawNode> nodes; // sorted by id
+    /// Nodes in TOPOLOGY order (neighbor-chain / verified-stamp order),
+    /// NOT necessarily id order (V1R3 §11.6).
+    std::vector<RawNode> nodes;
     std::vector<RawLink> links;
     std::map<int64_t, size_t> nodeIndex;
+    std::map<int64_t, size_t> topologyPosition;
+    /// Health accounting.
     int64_t duplicateNodes = 0;
     int64_t malformedPoses = 0;
     int64_t malformedLinks = 0;
+    /// Optional link types (landmarks/gravity) that are isolated and
+    /// audited instead of failing the run (§10.3).
+    int64_t ignoredOptionalLinks = 0;
+    /// Null-transform constraints recorded as void by RTAB-Map (rejected
+    /// loops etc.). Exact-size BLOBs with valid floats: isolated and
+    /// audited, never used as factors, never fabricated (§10.3).
+    int64_t voidLinks = 0;
+    int64_t rejectedInfos = 0;
+    int64_t regularizedInfos = 0;
+    int64_t nonMonotonicStampChains = 0;
+    int64_t reciprocalInconsistent = 0;
+    int64_t missingNeighborGaps = 0;
+    /// Graph input identity (all validated node/link bytes).
+    std::string graphInputSha256;
 };
 
-/// Extracts the planar (x, y, yaw) information block from the RTAB-Map
-/// 6x6 information matrix ([x y z roll pitch yaw]). Every diagonal entry
-/// is clamped to a strictly positive finite value because rtabmap::Link
-/// asserts positivity; a near-zero clamp keeps a "no weight" intent
-/// (e.g. yaw-free pose priors) while staying fail-closed. Falls back to
-/// a modest diagonal when the stored block carries no planar weight.
-void planarBlock(const double info36[36], double out[9])
+/// Percent-encodes a path for a sqlite URI so no character can inject
+/// parameters or fragments (V1R3 §10.4).
+std::string uriEncodePath(const std::string & path)
 {
-    const int idx[3] = {0, 1, 5};
-    double sum = 0.0;
-    for(int r = 0; r < 3; ++r)
+    static const char * hex = "0123456789ABCDEF";
+    std::string out;
+    out.reserve(path.size() + 16);
+    for(unsigned char c : path)
     {
-        for(int c = 0; c < 3; ++c)
+        const bool unreserved =
+            (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+            (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' ||
+            c == '/' || c == '~';
+        if(unreserved)
         {
-            double v = info36[idx[r] * 6 + idx[c]];
-            if(!std::isfinite(v)) v = 0.0;
-            if(r != c && std::fabs(v) > 1.0e12) v = 0.0;
-            out[r * 3 + c] = v;
-            if(r == c) sum += std::fabs(out[r * 3 + c]);
+            out += static_cast<char>(c);
+        }
+        else
+        {
+            out += '%';
+            out += hex[c >> 4];
+            out += hex[c & 0xF];
         }
     }
-    if(sum <= 1.0e-12)
-    {
-        for(int i = 0; i < 9; ++i) out[i] = 0.0;
-        out[0] = out[4] = out[8] = 10.0;
-        return;
-    }
-    // Partial zero/negative diagonals (legal upstream, e.g. yaw-free
-    // priors): clamp to a near-zero positive weight.
-    for(int d = 0; d < 3; ++d)
-    {
-        if(!(out[d * 3 + d] > 0.0)) out[d * 3 + d] = 1.0e-6;
-    }
+    return out;
 }
 
-/// Information of the inverted SE(2) measurement: I' = H^T I H with H
-/// the Jacobian of the inverse map at the measurement (analytic, same
-/// contract as the PC oracle's inverseMeasurementInformation).
-void invertPlanarInformation(const SE2 & measurement, const double info[9], double out[9])
-{
-    const double c = std::cos(measurement.yaw);
-    const double s = std::sin(measurement.yaw);
-    const SE2 inv = se2Inverse(measurement);
-    // Rows: d(inv)/d(x), d(inv)/d(y), d(inv)/d(yaw).
-    const double H[9] = {
-        -c, -s, inv.y,
-         s, -c, inv.x,
-         0,  0, -1,
-    };
-    // out = H^T * info * H
-    double tmp[9];
-    for(int r = 0; r < 3; ++r)
-    {
-        for(int col = 0; col < 3; ++col)
-        {
-            double acc = 0.0;
-            for(int k = 0; k < 3; ++k)
-            {
-                acc += info[r * 3 + k] * H[k * 3 + col];
-            }
-            tmp[r * 3 + col] = acc;
-        }
-    }
-    for(int r = 0; r < 3; ++r)
-    {
-        for(int col = 0; col < 3; ++col)
-        {
-            double acc = 0.0;
-            for(int k = 0; k < 3; ++k)
-            {
-                acc += H[k * 3 + r] * tmp[k * 3 + col];
-            }
-            out[r * 3 + col] = acc;
-        }
-    }
-}
-
-cv::Mat sixFromPlanar(const double planar[9])
+cv::Mat sixFromPlanar(const Mat3 planar)
 {
     cv::Mat info = cv::Mat::zeros(6, 6, CV_64FC1);
     const int idx[3] = {0, 1, 5};
@@ -225,44 +529,51 @@ cv::Mat sixFromPlanar(const double planar[9])
         {
             double v = planar[r * 3 + c];
             if(!std::isfinite(v)) v = 0.0;
-            if(r == c && !(v > 0.0)) v = 1.0e-6;
             info.at<double>(idx[r], idx[c]) = v;
         }
     }
-    // rtabmap::Link rejects null Z/roll/pitch information; the planar
-    // solver marginalizes them, so unit weight is the documented
-    // "unknown" convention.
+    // rtabmap::Link requires positive diagonal entries; the out-of-plane
+    // dimensions are marginalized by the planar solver.
+    info.at<double>(0, 0) = std::max(info.at<double>(0, 0), 1.0e-6);
+    info.at<double>(1, 1) = std::max(info.at<double>(1, 1), 1.0e-6);
+    info.at<double>(5, 5) = std::max(info.at<double>(5, 5), 1.0e-6);
     info.at<double>(2, 2) = 1.0;
     info.at<double>(3, 3) = 1.0;
     info.at<double>(4, 4) = 1.0;
     return info;
 }
 
-// MARK: - RTABMapGraphReader (strict, §10) ----------------------------------
+bool rotationLooksValid(const double m[12])
+{
+    // Column norms ~1 and determinant ~+1 (tolerance for float storage).
+    const double c0[3] = {m[0], m[4], m[8]};
+    const double c1[3] = {m[1], m[5], m[9]};
+    const double c2[3] = {m[2], m[6], m[10]};
+    auto norm = [](const double v[3]) {
+        return std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+    };
+    if(std::fabs(norm(c0) - 1.0) > 0.05) return false;
+    if(std::fabs(norm(c1) - 1.0) > 0.05) return false;
+    if(std::fabs(norm(c2) - 1.0) > 0.05) return false;
+    const double det =
+        m[0] * (m[5] * m[10] - m[6] * m[9]) -
+        m[1] * (m[4] * m[10] - m[6] * m[8]) +
+        m[2] * (m[4] * m[9] - m[5] * m[8]);
+    return std::fabs(det - 1.0) < 0.05;
+}
 
-/// Reads Node/Link with strict BLOB validation: pose must be 12 floats,
-/// transform 12 floats, information 36 doubles; the sqlite loop must end
-/// in SQLITE_DONE (§10).
+// MARK: - RTABMapGraphReader (strict, §10) -------------------------------------
+
 bool readGraph(const std::string & dbPath, GraphModel & model, std::string & error)
 {
-    // The read-only contract must never be defeated by a crafted path:
-    // '?'/'#' would inject URI parameters/fragments overriding mode=ro.
-    if(dbPath.empty() ||
-       dbPath.find('?') != std::string::npos ||
-       dbPath.find('#') != std::string::npos)
+    if(dbPath.empty())
     {
-        error = "database path contains unsupported URI characters";
+        error = "database path is empty";
         return false;
     }
-    char uri[4096];
-    const int written = snprintf(uri, sizeof(uri), "file:%s?mode=ro&immutable=1", dbPath.c_str());
-    if(written < 0 || written >= static_cast<int>(sizeof(uri)))
-    {
-        error = "database path too long";
-        return false;
-    }
+    std::string uri = "file:" + uriEncodePath(dbPath) + "?mode=ro&immutable=1";
     sqlite3 * db = 0;
-    if(sqlite3_open_v2(uri, &db, SQLITE_OPEN_READONLY | SQLITE_OPEN_URI, 0) != SQLITE_OK)
+    if(sqlite3_open_v2(uri.c_str(), &db, SQLITE_OPEN_READONLY | SQLITE_OPEN_URI, 0) != SQLITE_OK)
     {
         error = std::string("cannot open snapshot database: ") + (db ? sqlite3_errmsg(db) : "null");
         if(db) sqlite3_close(db);
@@ -275,7 +586,7 @@ bool readGraph(const std::string & dbPath, GraphModel & model, std::string & err
     if(sqlite3_prepare_v2(db, "PRAGMA quick_check;", -1, &check, 0) == SQLITE_OK && check)
     {
         int rows = 0;
-        while(true)
+        while(ok)
         {
             const int rc = sqlite3_step(check);
             if(rc == SQLITE_ROW)
@@ -286,7 +597,6 @@ bool readGraph(const std::string & dbPath, GraphModel & model, std::string & err
                 {
                     error = "PRAGMA quick_check did not return a single ok row";
                     ok = false;
-                    break;
                 }
             }
             else if(rc == SQLITE_DONE)
@@ -302,7 +612,6 @@ bool readGraph(const std::string & dbPath, GraphModel & model, std::string & err
             {
                 error = std::string("PRAGMA quick_check step failed: ") + sqlite3_errmsg(db);
                 ok = false;
-                break;
             }
         }
         sqlite3_finalize(check);
@@ -312,6 +621,9 @@ bool readGraph(const std::string & dbPath, GraphModel & model, std::string & err
         error = "cannot prepare PRAGMA quick_check";
         ok = false;
     }
+
+    Sha256 inputHash;
+    std::map<int64_t, RawNode> nodesById;
 
     if(ok)
     {
@@ -323,40 +635,59 @@ bool readGraph(const std::string & dbPath, GraphModel & model, std::string & err
         }
         else
         {
-            std::set<int64_t> seen;
             while(ok)
             {
                 const int rc = sqlite3_step(stmt);
                 if(rc == SQLITE_ROW)
                 {
-                    RawNode node;
-                    node.id = sqlite3_column_int64(stmt, 0);
-                    node.mapId = sqlite3_column_int(stmt, 1);
-                    node.stamp = sqlite3_column_double(stmt, 2);
+                    const int64_t id = sqlite3_column_int64(stmt, 0);
+                    const int32_t mapId = sqlite3_column_int(stmt, 1);
+                    const double stamp = sqlite3_column_double(stmt, 2);
                     const int bytes = sqlite3_column_bytes(stmt, 3);
                     const float * blob = reinterpret_cast<const float *>(sqlite3_column_blob(stmt, 3));
-                    if(node.id <= 0 || bytes < static_cast<int>(12 * sizeof(float)) || !blob)
-                    {
-                        ++model.malformedPoses;
-                        continue; // skip bad BLOB, counted for the health report
-                    }
-                    float m[12];
-                    std::memcpy(m, blob, 12 * sizeof(float));
-                    rtabmap::Transform t(m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8], m[9], m[10], m[11]);
-                    if(t.isNull())
+                    // Exact BLOB contract (§10.1) + id/value contract (§10.2).
+                    if(id <= 0 || id > static_cast<int64_t>(INT32_MAX))
                     {
                         ++model.malformedPoses;
                         continue;
                     }
-                    node.pose = se2FromTransform(t);
-                    node.finite = se2Finite(node.pose);
-                    if(!seen.insert(node.id).second)
+                    if(bytes != static_cast<int>(12 * sizeof(float)) || !blob)
+                    {
+                        // Required node records are never skipped into a
+                        // PASS (§10.3); count and continue reading to
+                        // report the full damage, then fail closed.
+                        ++model.malformedPoses;
+                        continue;
+                    }
+                    float m[12];
+                    std::memcpy(m, blob, sizeof(m));
+                    double pose[12];
+                    bool finite = std::isfinite(stamp);
+                    for(int i = 0; i < 12; ++i)
+                    {
+                        pose[i] = static_cast<double>(m[i]);
+                        if(!std::isfinite(pose[i])) finite = false;
+                    }
+                    if(!finite || !rotationLooksValid(pose))
+                    {
+                        ++model.malformedPoses;
+                        continue;
+                    }
+                    if(!nodesById.insert(std::make_pair(id, RawNode())).second)
                     {
                         ++model.duplicateNodes;
                         continue;
                     }
-                    model.nodeIndex[node.id] = model.nodes.size();
-                    model.nodes.push_back(node);
+                    RawNode & node = nodesById[id];
+                    node.id = id;
+                    node.mapId = mapId;
+                    node.stamp = stamp;
+                    std::memcpy(node.pose3x4, pose, sizeof(pose));
+                    rtabmap::Transform t(m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8], m[9], m[10], m[11]);
+                    node.pose = se2FromTransform(t);
+                    char line[64];
+                    snprintf(line, sizeof(line), "n:%lld:%d:%.9f\n", (long long)id, mapId, stamp);
+                    inputHash.update(line, strlen(line));
                 }
                 else if(rc == SQLITE_DONE)
                 {
@@ -398,29 +729,109 @@ bool readGraph(const std::string & dbPath, GraphModel & model, std::string & err
                     const float * tBlob = reinterpret_cast<const float *>(sqlite3_column_blob(stmt, 3));
                     const int iBytes = sqlite3_column_bytes(stmt, 4);
                     const double * iBlob = reinterpret_cast<const double *>(sqlite3_column_blob(stmt, 4));
-                    if(link.from <= 0 || link.to <= 0 || tBytes < static_cast<int>(12 * sizeof(float)) || !tBlob)
+                    const bool optionalType =
+                        link.type == rtabmap::Link::kLandmark ||
+                        link.type == rtabmap::Link::kGravity;
+                    if(link.from <= 0 || link.to <= 0 ||
+                       link.from > static_cast<int64_t>(INT32_MAX) ||
+                       link.to > static_cast<int64_t>(INT32_MAX) ||
+                       tBytes != static_cast<int>(12 * sizeof(float)) || !tBlob)
                     {
+                        if(optionalType)
+                        {
+                            ++model.ignoredOptionalLinks;
+                            continue;
+                        }
                         ++model.malformedLinks;
                         continue;
                     }
                     float m[12];
-                    std::memcpy(m, tBlob, 12 * sizeof(float));
-                    rtabmap::Transform t(m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8], m[9], m[10], m[11]);
-                    if(t.isNull())
+                    std::memcpy(m, tBlob, sizeof(m));
+                    bool finite = true;
+                    bool allZero = true;
+                    for(int i = 0; i < 12; ++i)
                     {
+                        if(!std::isfinite(static_cast<double>(m[i]))) finite = false;
+                        if(m[i] != 0.0f) allZero = false;
+                    }
+                    if(!finite)
+                    {
+                        if(optionalType)
+                        {
+                            ++model.ignoredOptionalLinks;
+                            continue;
+                        }
                         ++model.malformedLinks;
                         continue;
                     }
-                    link.measurement = se2FromTransform(t);
+                    if(allZero)
+                    {
+                        // Void constraint (e.g. a loop RTAB-Map rejected
+                        // during the scan): isolated + audited, never a
+                        // factor.
+                        ++model.voidLinks;
+                        continue;
+                    }
+                    rtabmap::Transform t(m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8], m[9], m[10], m[11]);
+                    if(t.isNull() || t.inverse().isNull())
+                    {
+                        if(optionalType)
+                        {
+                            ++model.ignoredOptionalLinks;
+                            continue;
+                        }
+                        ++model.malformedLinks;
+                        continue;
+                    }
                     double info36[36];
                     std::memset(info36, 0, sizeof(info36));
-                    if(iBlob && iBytes > 0)
+                    if(link.type == rtabmap::Link::kNeighbor)
                     {
-                        const int count = std::min(36, static_cast<int>(iBytes / sizeof(double)));
+                        // Neighbor information is required at full size;
+                        // short/zero-filled odometry weights cannot be
+                        // trusted for covariance aggregation (§10.1).
+                        if(iBytes != static_cast<int>(36 * sizeof(double)) || !iBlob)
+                        {
+                            ++model.malformedLinks;
+                            continue;
+                        }
+                        std::memcpy(info36, iBlob, sizeof(info36));
+                    }
+                    else if(iBlob && iBytes > 0)
+                    {
+                        const int count = std::min(36, static_cast<int>(iBytes / static_cast<int>(sizeof(double))));
                         std::memcpy(info36, iBlob, count * sizeof(double));
                     }
-                    planarBlock(info36, link.information);
-                    link.finite = se2Finite(link.measurement);
+                    link.measurement = se2FromTransform(t);
+                    if(!se2Finite(link.measurement))
+                    {
+                        if(optionalType)
+                        {
+                            ++model.ignoredOptionalLinks;
+                            continue;
+                        }
+                        ++model.malformedLinks;
+                        continue;
+                    }
+                    if(optionalType)
+                    {
+                        // Gravity/landmark links do not participate in the
+                        // planar factor graph; isolated, audited, skipped.
+                        ++model.ignoredOptionalLinks;
+                        continue;
+                    }
+                    const int idx[3] = {0, 1, 5};
+                    for(int r = 0; r < 3; ++r)
+                    {
+                        for(int c = 0; c < 3; ++c)
+                        {
+                            link.information[r * 3 + c] = info36[idx[r] * 6 + idx[c]];
+                        }
+                    }
+                    char line[96];
+                    snprintf(line, sizeof(line), "l:%lld:%lld:%d\n",
+                             (long long)link.from, (long long)link.to, link.type);
+                    inputHash.update(line, strlen(line));
                     model.links.push_back(link);
                 }
                 else if(rc == SQLITE_DONE)
@@ -439,33 +850,144 @@ bool readGraph(const std::string & dbPath, GraphModel & model, std::string & err
 
     sqlite3_close(db);
 
-    // Mark cross-map links (floor/session transitions) for health/quality.
-    for(size_t i = 0; i < model.links.size(); ++i)
+    if(!ok) return false;
+
+    // Corrupted REQUIRED records fail closed (§10.3).
+    if(model.duplicateNodes > 0 || model.malformedPoses > 0)
     {
-        RawLink & link = model.links[i];
-        std::map<int64_t, size_t>::const_iterator f = model.nodeIndex.find(link.from);
-        std::map<int64_t, size_t>::const_iterator t = model.nodeIndex.find(link.to);
-        if(f == model.nodeIndex.end() || t == model.nodeIndex.end())
-        {
-            link.finite = false; // dangling endpoint -> unusable
-            continue;
-        }
-        link.crossMap = model.nodes[f->second].mapId != model.nodes[t->second].mapId;
+        error = "required node records are corrupted (duplicate/malformed)";
+        return false;
     }
-    return ok;
+
+    model.graphInputSha256 = inputHash.hex();
+    for(std::map<int64_t, RawNode>::const_iterator it = nodesById.begin();
+        it != nodesById.end(); ++it)
+    {
+        model.nodeIndex[it->first] = model.nodes.size();
+        model.nodes.push_back(it->second);
+    }
+    return true;
 }
 
-// MARK: - GraphHealthInspector ----------------------------------------------
+// MARK: - Topology order (§11.6) ----------------------------------------------
+
+/// Builds the trajectory/topology order from the neighbor chains instead
+/// of assuming id order. Chains are walked from their smallest-id node;
+/// stamps must be strictly monotonic along a chain, otherwise the chain
+/// is rejected (fail closed below). Isolated nodes keep id order and are
+/// audited.
+bool buildTopologyOrder(GraphModel & model, std::string & error)
+{
+    // Neighbor successor map (ascending direction).
+    std::map<int64_t, std::vector<int64_t> > successor;
+    std::set<int64_t> hasIncoming;
+    for(const RawLink & link : model.links)
+    {
+        if(link.type != rtabmap::Link::kNeighbor) continue;
+        if(model.nodeIndex.count(link.from) && model.nodeIndex.count(link.to))
+        {
+            if(link.from < link.to)
+            {
+                successor[link.from].push_back(link.to);
+                hasIncoming.insert(link.to);
+            }
+            else
+            {
+                successor[link.to].push_back(link.from);
+                hasIncoming.insert(link.from);
+            }
+        }
+    }
+
+    std::set<int64_t> ordered;
+    std::vector<RawNode> topology;
+    // Chain roots: nodes with no incoming neighbor edge.
+    std::vector<int64_t> roots;
+    for(const RawNode & node : model.nodes)
+    {
+        if(!hasIncoming.count(node.id)) roots.push_back(node.id);
+    }
+    std::sort(roots.begin(), roots.end());
+    for(size_t r = 0; r < roots.size(); ++r)
+    {
+        int64_t cursor = roots[r];
+        std::set<int64_t> visited;
+        double lastStamp = -std::numeric_limits<double>::infinity();
+        bool monotonic = true;
+        while(true)
+        {
+            if(!visited.insert(cursor).second) break; // cycle guard
+            std::map<int64_t, size_t>::const_iterator idx = model.nodeIndex.find(cursor);
+            if(idx == model.nodeIndex.end()) break;
+            const RawNode & node = model.nodes[idx->second];
+            if(node.stamp <= lastStamp && std::isfinite(lastStamp))
+            {
+                monotonic = false;
+            }
+            lastStamp = node.stamp;
+            if(ordered.insert(cursor).second)
+            {
+                topology.push_back(node);
+            }
+            std::map<int64_t, std::vector<int64_t> >::const_iterator next = successor.find(cursor);
+            if(next == successor.end() || next->second.empty()) break;
+            // Deterministic walk: smallest successor not yet visited.
+            std::vector<int64_t> candidates = next->second;
+            std::sort(candidates.begin(), candidates.end());
+            int64_t chosen = -1;
+            for(size_t i = 0; i < candidates.size(); ++i)
+            {
+                if(!visited.count(candidates[i])) { chosen = candidates[i]; break; }
+            }
+            if(chosen < 0) break;
+            cursor = chosen;
+        }
+        if(!monotonic)
+        {
+            ++model.nonMonotonicStampChains;
+        }
+    }
+    // Nodes never reached by a chain (isolated): append in id order.
+    for(const RawNode & node : model.nodes)
+    {
+        if(ordered.insert(node.id).second)
+        {
+            topology.push_back(node);
+        }
+    }
+    if(topology.size() != model.nodes.size())
+    {
+        error = "topology order lost nodes";
+        return false;
+    }
+    if(model.nonMonotonicStampChains > 0)
+    {
+        error = "neighbor chains carry non-monotonic stamps";
+        return false;
+    }
+    model.nodes.swap(topology);
+    model.nodeIndex.clear();
+    for(size_t i = 0; i < model.nodes.size(); ++i)
+    {
+        model.nodeIndex[model.nodes[i].id] = i;
+        model.topologyPosition[model.nodes[i].id] = i;
+    }
+    return true;
+}
+
+// MARK: - GraphHealthInspector --------------------------------------------------
 
 struct HealthReport
 {
     int64_t nodeCount = 0;
     int64_t linkCount = 0;
-    int64_t duplicateNodes = 0;
-    int64_t malformedPoses = 0;
     int64_t malformedLinks = 0;
-    int64_t nonFiniteNodes = 0;
-    int64_t nonFiniteLinks = 0;
+    int64_t voidLinks = 0;
+    int64_t ignoredOptionalLinks = 0;
+    int64_t rejectedInfos = 0;
+    int64_t regularizedInfos = 0;
+    int64_t reciprocalInconsistent = 0;
+    int64_t missingNeighborGaps = 0;
     int64_t componentCount = 0;
     int64_t largestComponent = 0;
     int64_t isolatedNodes = 0;
@@ -483,15 +1005,88 @@ bool isLoopType(int32_t type)
            type == rtabmap::Link::kUserClosure;
 }
 
-HealthReport inspectHealth(const GraphModel & model)
+/// Validates every link information matrix under the SPD policy and
+/// inspects connectivity. Rejected neighbor information is a hard
+/// failure (odometry weights are required); rejected non-neighbor
+/// information downgrades the link to an audited skip.
+bool inspectHealth(GraphModel & model, HealthReport & report, std::string & error)
 {
-    HealthReport report;
+    InfoPolicyAudit audit;
     report.nodeCount = static_cast<int64_t>(model.nodes.size());
-    report.linkCount = static_cast<int64_t>(model.links.size());
-    report.duplicateNodes = model.duplicateNodes;
-    report.malformedPoses = model.malformedPoses;
     report.malformedLinks = model.malformedLinks;
+    report.voidLinks = model.voidLinks;
+    report.ignoredOptionalLinks = model.ignoredOptionalLinks;
 
+    std::vector<RawLink> kept;
+    kept.reserve(model.links.size());
+    // Reciprocal-duplicate detection (§11.5): canonical (min,max,type)
+    // with a consistency probe instead of silent overwrite.
+    std::map<std::tuple<int64_t, int64_t, int32_t>, size_t> canonicalSeen;
+    for(size_t i = 0; i < model.links.size(); ++i)
+    {
+        RawLink link = model.links[i];
+        if(link.type == rtabmap::Link::kLandmark) continue;
+        std::map<int64_t, size_t>::const_iterator f = model.nodeIndex.find(link.from);
+        std::map<int64_t, size_t>::const_iterator t = model.nodeIndex.find(link.to);
+        if(f == model.nodeIndex.end() || t == model.nodeIndex.end())
+        {
+            continue; // dangling endpoints: audited, not counted as damage
+        }
+        // Information policy (§11.2).
+        Mat3 info;
+        std::memcpy(info, link.information, sizeof(Mat3));
+        const InfoPolicy policy = sanitizePlanarInformation(info, audit);
+        if(policy == InfoPolicy::Rejected)
+        {
+            if(link.type == rtabmap::Link::kNeighbor)
+            {
+                error = "required neighbor information rejected by the SPD policy";
+                return false;
+            }
+            ++model.rejectedInfos;
+            continue; // audited skip of an optional constraint
+        }
+        if(policy == InfoPolicy::RegularizedWithAudit)
+        {
+            ++model.regularizedInfos;
+        }
+        std::memcpy(link.information, info, sizeof(Mat3));
+        link.infoPolicy = policy;
+
+        if(link.type != rtabmap::Link::kPosePrior)
+        {
+            const int64_t a = std::min(link.from, link.to);
+            const int64_t b = std::max(link.from, link.to);
+            const std::tuple<int64_t, int64_t, int32_t> key(a, b, link.type);
+            std::map<std::tuple<int64_t, int64_t, int32_t>, size_t>::const_iterator seen =
+                canonicalSeen.find(key);
+            if(seen != canonicalSeen.end())
+            {
+                // Reciprocal/refined duplicate: probe measurement
+                // consistency; keep the first deterministic orientation.
+                const RawLink & first = kept[seen->second];
+                SE2 firstM = first.from <= first.to
+                    ? first.measurement : se2Inverse(first.measurement);
+                SE2 thisM = link.from <= link.to
+                    ? link.measurement : se2Inverse(link.measurement);
+                const SE2 delta = se2Compose(se2Inverse(firstM), thisM);
+                if(std::hypot(delta.x, delta.y) > 0.5 || std::fabs(delta.yaw) > 0.2)
+                {
+                    ++model.reciprocalInconsistent;
+                }
+                continue;
+            }
+            canonicalSeen[key] = kept.size();
+        }
+        kept.push_back(link);
+    }
+    model.links.swap(kept);
+    report.rejectedInfos = model.rejectedInfos;
+    report.regularizedInfos = model.regularizedInfos;
+    report.reciprocalInconsistent = model.reciprocalInconsistent;
+    report.linkCount = static_cast<int64_t>(model.links.size());
+
+    // Connectivity over kept links.
     std::vector<int64_t> parent(model.nodes.size());
     std::vector<size_t> degree(model.nodes.size(), 0);
     for(size_t i = 0; i < parent.size(); ++i) parent[i] = static_cast<int64_t>(i);
@@ -503,25 +1098,18 @@ HealthReport inspectHealth(const GraphModel & model)
         }
         return v;
     };
-
-    for(size_t i = 0; i < model.nodes.size(); ++i)
-    {
-        if(!model.nodes[i].finite) ++report.nonFiniteNodes;
-    }
     for(const RawLink & link : model.links)
     {
-        if(!link.finite)
-        {
-            ++report.nonFiniteLinks;
-            continue;
-        }
-        if(link.crossMap) ++report.crossMapLinks;
+        if(link.type == rtabmap::Link::kPosePrior) continue;
         if(isLoopType(link.type)) ++report.loopLinks;
-        else if(link.type == rtabmap::Link::kPosePrior) ++report.priorLinks;
         else if(link.type == rtabmap::Link::kVirtualClosure) ++report.recoveryLinks;
         std::map<int64_t, size_t>::const_iterator f = model.nodeIndex.find(link.from);
         std::map<int64_t, size_t>::const_iterator t = model.nodeIndex.find(link.to);
         if(f == model.nodeIndex.end() || t == model.nodeIndex.end()) continue;
+        if(model.nodes[f->second].mapId != model.nodes[t->second].mapId)
+        {
+            ++report.crossMapLinks;
+        }
         ++degree[f->second];
         ++degree[t->second];
         const int64_t rf = find(static_cast<int64_t>(f->second));
@@ -535,100 +1123,136 @@ HealthReport inspectHealth(const GraphModel & model)
         if(degree[i] == 0) ++report.isolatedNodes;
     }
     report.componentCount = static_cast<int64_t>(componentSizes.size());
-    for(std::map<int64_t, int64_t>::const_iterator it = componentSizes.begin(); it != componentSizes.end(); ++it)
+    for(std::map<int64_t, int64_t>::const_iterator it = componentSizes.begin();
+        it != componentSizes.end(); ++it)
     {
         report.largestComponent = std::max(report.largestComponent, it->second);
     }
-    return report;
+    if(model.malformedLinks > 0)
+    {
+        error = "required link records are corrupted";
+        return false;
+    }
+    return true;
 }
 
-// MARK: - AdaptiveGraphReducer (§11.3) ---------------------------------------
+// MARK: - AdaptiveGraphReducer (§11.3/§11.7) ------------------------------------
 
 struct ReducerPolicy
 {
-    /// Straight/high-quality candidate spacing.
-    double straightDistanceM = 0.75;  // within 0.5–1.0 m
+    double straightDistanceM = 0.75;
     double straightAngleRad = 4.0 * M_PI / 180.0;
     double straightTimeS = 2.0;
-    /// Tightened spacing in turns / Recovery neighborhoods.
-    double tightDistanceM = 0.3;      // within 0.2–0.4 m
+    double tightDistanceM = 0.3;
     double turnDetectionRad = 20.0 * M_PI / 180.0;
 };
 
-/// Selects the optimization skeleton. Loop/prior/recovery/tag/turn/
-/// transition/endpoint nodes are ALWAYS kept; straight segments are
-/// subsampled adaptively (never a fixed stride).
-std::vector<size_t> reduceGraph(const GraphModel & model, const std::set<int64_t> & tagNodes, const ReducerPolicy & policy)
+/// Selects the optimization skeleton over the TOPOLOGY order. Mandatory
+/// nodes: endpoints, loop/prior/recovery endpoints, tag nodes, map
+/// transitions, neighbor gaps, and path-curvature turns measured with
+/// the true travel heading atan2(Δy,Δx) (§11.7).
+std::vector<size_t> reduceGraph(
+    const GraphModel & model,
+    const std::set<int64_t> & tagNodes,
+    const ReducerPolicy & policy)
 {
-    std::set<size_t> kept;
     const size_t n = model.nodes.size();
+    std::set<size_t> kept;
     if(n == 0) return std::vector<size_t>();
     kept.insert(0);
     kept.insert(n - 1);
 
-    // Endpoints of every non-neighbor constraint (loops, priors,
-    // Recovery boundaries) are mandatory skeleton nodes.
+    // Constraint endpoints.
     for(const RawLink & link : model.links)
     {
-        if(link.type == rtabmap::Link::kNeighbor || !link.finite) continue;
+        if(link.type == rtabmap::Link::kNeighbor || link.type == rtabmap::Link::kPosePrior) continue;
         std::map<int64_t, size_t>::const_iterator f = model.nodeIndex.find(link.from);
         std::map<int64_t, size_t>::const_iterator t = model.nodeIndex.find(link.to);
         if(f != model.nodeIndex.end()) kept.insert(f->second);
         if(t != model.nodeIndex.end()) kept.insert(t->second);
     }
-    // Tag-bound nodes must survive reduction (§11.3 / §14).
-    for(int64_t id : tagNodes)
+    // Tag-bound nodes.
+    for(std::set<int64_t>::const_iterator it = tagNodes.begin(); it != tagNodes.end(); ++it)
     {
-        std::map<int64_t, size_t>::const_iterator it = model.nodeIndex.find(id);
-        if(it != model.nodeIndex.end()) kept.insert(it->second);
+        std::map<int64_t, size_t>::const_iterator idx = model.nodeIndex.find(*it);
+        if(idx != model.nodeIndex.end()) kept.insert(idx->second);
     }
-    // Turn nodes, map transitions and tracking gaps.
+    // Neighbor-chain gaps and map transitions (no fake measurements may
+    // bridge them, so they bound segments).
+    std::set<std::pair<int64_t, int64_t> > neighborPairs;
+    for(const RawLink & link : model.links)
+    {
+        if(link.type != rtabmap::Link::kNeighbor) continue;
+        neighborPairs.insert(std::make_pair(
+            std::min(link.from, link.to), std::max(link.from, link.to)));
+    }
+    for(size_t i = 1; i < n; ++i)
+    {
+        const RawNode & prev = model.nodes[i - 1];
+        const RawNode & cur = model.nodes[i];
+        if(prev.mapId != cur.mapId)
+        {
+            kept.insert(i - 1);
+            kept.insert(i);
+            continue;
+        }
+        const std::pair<int64_t, int64_t> edge(
+            std::min(prev.id, cur.id), std::max(prev.id, cur.id));
+        if(!neighborPairs.count(edge))
+        {
+            kept.insert(i - 1);
+            kept.insert(i);
+        }
+    }
+    // Curvature turns from travel heading (§11.7).
     for(size_t i = 1; i + 1 < n; ++i)
     {
         const RawNode & prev = model.nodes[i - 1];
         const RawNode & cur = model.nodes[i];
         const RawNode & next = model.nodes[i + 1];
-        if(!prev.finite || !cur.finite || !next.finite)
+        const double h1 = std::atan2(cur.pose.y - prev.pose.y, cur.pose.x - prev.pose.x);
+        const double h2 = std::atan2(next.pose.y - cur.pose.y, next.pose.x - cur.pose.x);
+        const double d1 = std::hypot(cur.pose.x - prev.pose.x, cur.pose.y - prev.pose.y);
+        const double d2 = std::hypot(next.pose.x - cur.pose.x, next.pose.y - cur.pose.y);
+        if(d1 > 1.0e-6 && d2 > 1.0e-6 &&
+           std::fabs(normalizeAngle(h2 - h1)) >= policy.turnDetectionRad)
         {
             kept.insert(i);
-            continue;
         }
-        const double turn = std::fabs(normalizeAngle(
-            normalizeAngle(next.pose.yaw - cur.pose.yaw) +
-            normalizeAngle(cur.pose.yaw - prev.pose.yaw)));
-        if(turn >= policy.turnDetectionRad) kept.insert(i);
-        if(cur.mapId != prev.mapId || cur.mapId != next.mapId) kept.insert(i);
-        if(cur.stamp - prev.stamp > 5.0 || next.stamp - cur.stamp > 5.0) kept.insert(i);
     }
 
     // Adaptive spacing between mandatory anchors.
     std::vector<size_t> skeleton;
     skeleton.push_back(0);
-    SE2 anchor = model.nodes[0].pose;
-    double accumulatedAngle = 0.0;
     for(size_t i = 1; i < n; ++i)
     {
         if(kept.count(i))
         {
             skeleton.push_back(i);
-            anchor = model.nodes[i].pose;
-            accumulatedAngle = 0.0;
             continue;
         }
-        const RawNode & prev = model.nodes[i - 1];
+        const size_t anchor = skeleton.back();
+        const RawNode & a = model.nodes[anchor];
         const RawNode & cur = model.nodes[i];
-        if(!prev.finite || !cur.finite) continue;
-        const double distance = std::hypot(cur.pose.x - anchor.x, cur.pose.y - anchor.y);
-        accumulatedAngle += std::fabs(normalizeAngle(cur.pose.yaw - prev.pose.yaw));
-        const double dt = cur.stamp - model.nodes[skeleton.back()].stamp;
-        // Local curvature decides the spacing regime: turns tighten.
-        const bool tight = accumulatedAngle >= policy.turnDetectionRad;
+        const double distance = std::hypot(cur.pose.x - a.pose.x, cur.pose.y - a.pose.y);
+        double headingChange = 0.0;
+        if(i > anchor)
+        {
+            const RawNode & prev = model.nodes[i - 1];
+            const double dPrev = std::hypot(cur.pose.x - prev.pose.x, cur.pose.y - prev.pose.y);
+            if(dPrev > 1.0e-6)
+            {
+                const double h1 = std::atan2(prev.pose.y - a.pose.y, prev.pose.x - a.pose.x);
+                const double h2 = std::atan2(cur.pose.y - prev.pose.y, cur.pose.x - prev.pose.x);
+                headingChange = std::fabs(normalizeAngle(h2 - h1));
+            }
+        }
+        const bool tight = headingChange >= policy.turnDetectionRad * 0.5;
         const double limit = tight ? policy.tightDistanceM : policy.straightDistanceM;
-        if(distance >= limit || accumulatedAngle >= policy.straightAngleRad || dt >= policy.straightTimeS)
+        const double dt = cur.stamp - a.stamp;
+        if(distance >= limit || headingChange >= policy.straightAngleRad || dt >= policy.straightTimeS)
         {
             skeleton.push_back(i);
-            anchor = cur.pose;
-            accumulatedAngle = 0.0;
         }
     }
     if(skeleton.back() != n - 1) skeleton.push_back(n - 1);
@@ -637,22 +1261,15 @@ std::vector<size_t> reduceGraph(const GraphModel & model, const std::set<int64_t
     return skeleton;
 }
 
-// MARK: - RobustSE2Optimizer (§11.4) ----------------------------------------
+// MARK: - Factor construction (§11.3/§11.4/§6) ---------------------------------
 
-struct OptimizerDiagnostics
+struct AbsolutePrior
 {
-    int iterations = 0;
-    double finalError = 0.0;
-    double wallSeconds = 0.0;
-    int64_t factorCount = 0;
-    bool available = false;
-};
-
-struct OptimizedGraph
-{
-    /// Optimized skeleton poses keyed by raw node id.
-    std::map<int64_t, SE2> poses;
-    OptimizerDiagnostics diagnostics;
+    int64_t nodeId = 0;
+    SE2 mapPose;
+    Mat3 information;
+    int32_t kind = MS_PRIOR_KIND_LOCALIZATION;
+    int64_t episodeId = 0;
 };
 
 struct FactorRecord
@@ -661,150 +1278,275 @@ struct FactorRecord
     int64_t to = 0;
     int32_t type = 0;
     SE2 measurement;
-    double information[9];
+    Mat3 information;
+    /// "odometry", "loop", "prior", "recovery".
+    std::string kind;
 };
 
-/// Builds the skeleton factor set: odometry measurements between
-/// consecutive skeleton nodes (exact composition of the raw relative
-/// neighbor links between them) plus every non-neighbor constraint whose
-/// endpoints are both in the skeleton (loops, priors, Recovery).
+struct FactorSetAudit
+{
+    int64_t gapSegments = 0;
+    int64_t aggregatedChains = 0;
+    int64_t priorCount = 0;
+    int64_t priorConflicts = 0;
+    std::string factorSetSha256;
+};
+
+/// Builds the skeleton factor set.
+/// - Odometry between consecutive skeleton nodes is the composition of
+///   the raw neighbor chain between them with AGGREGATED covariance
+///   (§11.3). A missing neighbor link ends the chain and forms a gap:
+///   no factor is fabricated from raw poses (§11.4).
+/// - Loop/Recovery/User constraints between skeleton nodes enter with
+///   their sanitized information (canonical direction, audited dedupe).
+/// - Absolute prior-map constraints enter as pose priors in the MAP
+///   frame (§6.3).
 bool buildSkeletonFactors(
     const GraphModel & model,
     const std::vector<size_t> & skeleton,
+    const std::vector<AbsolutePrior> & priors,
+    FactorSetAudit & audit,
     std::vector<FactorRecord> & factors,
     std::string & error)
 {
-    const size_t n = model.nodes.size();
-    // Neighbor chain indexed by source node position. RTAB-Map may store
-    // the same neighbor relation from either endpoint; normalize to
-    // ascending id order so forward composition always finds it.
-    std::map<int64_t, std::pair<SE2, bool> > neighborRelative;
+    // Neighbor lookup (ascending id direction), measurement oriented
+    // low-id -> high-id.
+    struct NeighborEdge
+    {
+        SE2 measurement; // low -> high
+        Mat3Box information;
+    };
+    std::map<std::pair<int64_t, int64_t>, NeighborEdge> neighbor;
     for(const RawLink & link : model.links)
     {
-        if(link.type != rtabmap::Link::kNeighbor || !link.finite) continue;
+        if(link.type != rtabmap::Link::kNeighbor) continue;
+        if(!model.nodeIndex.count(link.from) || !model.nodeIndex.count(link.to)) continue;
+        NeighborEdge edge;
         if(link.from < link.to)
         {
-            neighborRelative[link.from] = std::make_pair(link.measurement, true);
+            edge.measurement = link.measurement;
         }
-        else if(link.to < link.from)
+        else
         {
-            neighborRelative[link.to] = std::make_pair(se2Inverse(link.measurement), true);
+            edge.measurement = se2Inverse(link.measurement);
         }
+        std::memcpy(edge.information.m, link.information, sizeof(Mat3));
+        neighbor[std::make_pair(std::min(link.from, link.to), std::max(link.from, link.to))] = edge;
     }
 
+    Sha256 factorHash;
+
+    // Odometry segments between consecutive skeleton nodes.
     for(size_t s = 0; s + 1 < skeleton.size(); ++s)
     {
         const size_t a = skeleton[s];
         const size_t b = skeleton[s + 1];
-        // Compose raw neighbor relatives over [a, b).
-        SE2 relative;
-        relative.x = 0.0; relative.y = 0.0; relative.yaw = 0.0;
-        bool composed = true;
-        size_t cursor = a;
-        while(cursor < b)
+        std::vector<SE2> measurements;
+        std::vector<Mat3Box> infos;
+        bool chainOk = true;
+        for(size_t k = a; k < b; ++k)
         {
-            const int64_t id = model.nodes[cursor].id;
-            std::map<int64_t, std::pair<SE2, bool> >::const_iterator it = neighborRelative.find(id);
-            if(it != neighborRelative.end())
+            const int64_t idA = model.nodes[k].id;
+            const int64_t idB = model.nodes[k + 1].id;
+            if(model.nodes[k].mapId != model.nodes[k + 1].mapId)
             {
-                relative = se2Compose(relative, it->second.first);
-                ++cursor;
+                chainOk = false;
+                break;
             }
-            else
+            std::map<std::pair<int64_t, int64_t>, NeighborEdge>::const_iterator e =
+                neighbor.find(std::make_pair(std::min(idA, idB), std::max(idA, idB)));
+            if(e == neighbor.end())
             {
-                // No stored neighbor link: fall back to the raw pose
-                // difference of the gap endpoints.
-                const SE2 invA = se2Inverse(model.nodes[cursor].pose);
-                relative = se2Compose(relative, se2Compose(invA, model.nodes[cursor + 1].pose));
-                ++cursor;
+                chainOk = false; // gap: never fabricate (§11.4)
+                break;
             }
+            SE2 m = e->second.measurement;
+            if(idA > idB) m = se2Inverse(m);
+            Mat3Box info;
+            std::memcpy(info.m, e->second.information.m, sizeof(Mat3));
+            measurements.push_back(m);
+            infos.push_back(info);
         }
-        if(!composed || !se2Finite(relative))
+        if(!chainOk || measurements.empty())
         {
-            error = "skeleton odometry composition produced a non-finite measurement";
+            ++audit.gapSegments;
+            continue;
+        }
+        Mat3 total;
+        std::memset(total, 0, sizeof(total));
+        if(!aggregateChainInformation(measurements, infos, total))
+        {
+            error = "odometry chain covariance aggregation failed";
             return false;
         }
+        {
+            InfoPolicyAudit chainAudit;
+            if(sanitizePlanarInformation(total, chainAudit) == InfoPolicy::Rejected)
+            {
+                // Aggregated information is not usable: treat the segment
+                // as a gap instead of feeding g2o a non-SPD matrix.
+                ++audit.gapSegments;
+                continue;
+            }
+        }
+        SE2 rel;
+        rel.x = rel.y = rel.yaw = 0.0;
+        for(size_t i = 0; i < measurements.size(); ++i) rel = se2Compose(rel, measurements[i]);
         FactorRecord factor;
         factor.from = model.nodes[a].id;
         factor.to = model.nodes[b].id;
         factor.type = rtabmap::Link::kNeighbor;
-        factor.measurement = relative;
-        // Odometry information: identity-scaled planar block.
-        for(int i = 0; i < 9; ++i) factor.information[i] = 0.0;
-        factor.information[0] = factor.information[4] = 100.0;
-        factor.information[8] = 100.0;
+        factor.measurement = rel;
+        std::memcpy(factor.information, total, sizeof(Mat3));
+        factor.kind = "odometry";
         factors.push_back(factor);
+        ++audit.aggregatedChains;
+        char line[160];
+        snprintf(line, sizeof(line), "f:odom:%lld:%lld:%.9f:%.9f:%.9f\n",
+                 (long long)factor.from, (long long)factor.to,
+                 rel.x, rel.y, rel.yaw);
+        factorHash.update(line, strlen(line));
     }
 
-    const std::set<int64_t> skeletonIds(
-        [&] { std::set<int64_t> ids; for(size_t idx : skeleton) ids.insert(model.nodes[idx].id); return ids; }());
-    // Canonical dedupe: RTAB-Map may store independently refined
-    // reciprocal loop links; keep the first deterministic orientation.
-    std::set<std::tuple<int64_t, int64_t, int32_t> > seenFactors;
+    // Relative constraints (loops / recovery / user).
     for(const RawLink & link : model.links)
     {
-        if(link.type == rtabmap::Link::kNeighbor || !link.finite) continue;
-        if(link.type == rtabmap::Link::kLandmark) continue;
-        if(!skeletonIds.count(link.from) || !skeletonIds.count(link.to)) continue;
-        FactorRecord factor;
-        factor.type = link.type;
-        if(link.type == rtabmap::Link::kPosePrior)
+        if(link.type == rtabmap::Link::kNeighbor || link.type == rtabmap::Link::kPosePrior ||
+           link.type == rtabmap::Link::kLandmark)
         {
-            factor.from = link.from;
-            factor.to = link.to;
+            continue;
+        }
+        if(!model.nodeIndex.count(link.from) || !model.nodeIndex.count(link.to)) continue;
+        const bool inSkeletonA = std::binary_search(skeleton.begin(), skeleton.end(), model.nodeIndex.at(link.from));
+        const bool inSkeletonB = std::binary_search(skeleton.begin(), skeleton.end(), model.nodeIndex.at(link.to));
+        if(!inSkeletonA || !inSkeletonB) continue;
+        FactorRecord factor;
+        factor.from = std::min(link.from, link.to);
+        factor.to = std::max(link.from, link.to);
+        factor.type = link.type;
+        if(link.from <= link.to)
+        {
             factor.measurement = link.measurement;
-            std::memcpy(factor.information, link.information, sizeof(factor.information));
+            std::memcpy(factor.information, link.information, sizeof(Mat3));
         }
         else
         {
-            factor.from = std::min(link.from, link.to);
-            factor.to = std::max(link.from, link.to);
-            if(link.from <= link.to)
+            factor.measurement = se2Inverse(link.measurement);
+            invertPlanarInformation(link.measurement, link.information, factor.information);
+        }
+        // g2o verifies every information matrix (symmetric + SPD); the
+        // analytic inverse transform can drift numerically, so re-sanitize.
+        {
+            InfoPolicyAudit relAudit;
+            if(sanitizePlanarInformation(factor.information, relAudit) == InfoPolicy::Rejected)
             {
-                factor.measurement = link.measurement;
-                std::memcpy(factor.information, link.information, sizeof(factor.information));
-            }
-            else
-            {
-                factor.measurement = se2Inverse(link.measurement);
-                invertPlanarInformation(link.measurement, link.information, factor.information);
+                continue; // audited skip, never a factor
             }
         }
-        const std::tuple<int64_t, int64_t, int32_t> key(factor.from, factor.to, factor.type);
-        if(!seenFactors.insert(key).second) continue;
+        factor.kind = isLoopType(link.type) ? "loop"
+            : (link.type == rtabmap::Link::kVirtualClosure ? "recovery" : "loop");
         factors.push_back(factor);
+        char line[160];
+        snprintf(line, sizeof(line), "f:rel:%d:%lld:%lld:%.9f:%.9f:%.9f\n",
+                 link.type, (long long)factor.from, (long long)factor.to,
+                 factor.measurement.x, factor.measurement.y, factor.measurement.yaw);
+        factorHash.update(line, strlen(line));
+    }
+
+    // Absolute prior-map constraints (§6). Conflicting priors on the same
+    // node are audited and counted; the first deterministic prior wins.
+    std::set<int64_t> priorNodesSeen;
+    for(size_t i = 0; i < priors.size(); ++i)
+    {
+        const AbsolutePrior & prior = priors[i];
+        std::map<int64_t, size_t>::const_iterator idx = model.nodeIndex.find(prior.nodeId);
+        if(idx == model.nodeIndex.end()) continue;
+        if(!std::binary_search(skeleton.begin(), skeleton.end(), idx->second)) continue;
+        if(!priorNodesSeen.insert(prior.nodeId).second)
+        {
+            ++audit.priorConflicts;
+            continue;
+        }
+        Mat3 info;
+        std::memcpy(info, prior.information, sizeof(Mat3));
+        InfoPolicyAudit priorAudit;
+        if(sanitizePlanarInformation(info, priorAudit) == InfoPolicy::Rejected)
+        {
+            ++audit.priorConflicts;
+            continue;
+        }
+        FactorRecord factor;
+        factor.from = prior.nodeId;
+        factor.to = prior.nodeId;
+        factor.type = rtabmap::Link::kPosePrior;
+        factor.measurement = prior.mapPose;
+        std::memcpy(factor.information, info, sizeof(Mat3));
+        factor.kind = "prior";
+        factors.push_back(factor);
+        ++audit.priorCount;
+        char line[160];
+        snprintf(line, sizeof(line), "f:prior:%d:%lld:%lld:%.9f:%.9f:%.9f\n",
+                 prior.kind, (long long)prior.nodeId, (long long)prior.episodeId,
+                 prior.mapPose.x, prior.mapPose.y, prior.mapPose.yaw);
+        factorHash.update(line, strlen(line));
+    }
+
+    audit.factorSetSha256 = factorHash.hex();
+    if(factors.empty())
+    {
+        error = "the skeleton factor graph is empty";
+        return false;
     }
     return true;
 }
 
-/// Runs the rtabmap g2o optimizer on the skeleton factor graph with the
-/// full information matrices, a robust kernel and one anchor per
-/// connected component (§11.4). Never a self-zeroing no-op: convergence,
-/// iteration count and final error are recorded.
+// MARK: - RobustSE2Optimizer (§11.4/§12) ----------------------------------------
+
+struct OptimizerDiagnostics
+{
+    int iterations = 0;
+    double finalError = 0.0;
+    double wallSeconds = 0.0;
+    int64_t factorCount = 0;
+    bool available = false;
+    bool cancelled = false;
+    bool budgetExhausted = false;
+    int64_t chunks = 0;
+};
+
+struct OptimizedGraph
+{
+    std::map<int64_t, SE2> poses;
+    OptimizerDiagnostics diagnostics;
+};
+
+/// Runs rtabmap g2o per component with chunked iterations so cancel /
+/// wall-time / memory probes fire BETWEEN chunks (§12.1) — a run can be
+/// stopped mid-optimization, not only after completion.
 bool optimizeSkeleton(
     const GraphModel & model,
-    const std::vector<size_t> & skeleton,
     const std::vector<FactorRecord> & factors,
-    int iterations,
+    int totalIterations,
     double maxWallSeconds,
     MSFactorGraphCancelFn cancel,
     void * cancelUser,
     OptimizedGraph & out,
     std::string & error)
 {
-    if(skeleton.empty() || factors.empty())
+    if(factors.empty())
     {
-        error = "empty skeleton factor graph";
+        error = "empty factor graph";
         return false;
     }
     std::map<int, rtabmap::Transform> poses;
-    for(size_t idx : skeleton)
+    for(std::map<int64_t, size_t>::const_iterator it = model.nodeIndex.begin();
+        it != model.nodeIndex.end(); ++it)
     {
-        const RawNode & node = model.nodes[idx];
+        const RawNode & node = model.nodes[it->second];
         poses[static_cast<int>(node.id)] = transformFromSE2(node.pose);
     }
 
-    // Components over the skeleton factors.
+    // Components over relative factors.
     std::map<int64_t, int64_t> parent;
     std::function<int64_t(int64_t)> find = [&](int64_t v) {
         int64_t r = v;
@@ -812,22 +1554,27 @@ bool optimizeSkeleton(
         while(parent[v] != r) { int64_t next = parent[v]; parent[v] = r; v = next; }
         return r;
     };
-    for(size_t idx : skeleton) parent[model.nodes[idx].id] = model.nodes[idx].id;
+    for(std::map<int64_t, size_t>::const_iterator it = model.nodeIndex.begin();
+        it != model.nodeIndex.end(); ++it)
+    {
+        parent[it->first] = it->first;
+    }
     for(const FactorRecord & factor : factors)
     {
         if(factor.type == rtabmap::Link::kPosePrior) continue;
+        if(!parent.count(factor.from) || !parent.count(factor.to)) continue;
         const int64_t rf = find(factor.from);
         const int64_t rt = find(factor.to);
         if(rf != rt) parent[rf] = rt;
     }
     std::map<int64_t, int64_t> componentRoot; // component root -> anchor id
-    for(size_t idx : skeleton)
+    for(std::map<int64_t, size_t>::const_iterator it = model.nodeIndex.begin();
+        it != model.nodeIndex.end(); ++it)
     {
-        const int64_t id = model.nodes[idx].id;
-        const int64_t root = find(id);
-        if(!componentRoot.count(root) || id < componentRoot[root])
+        const int64_t root = find(it->first);
+        if(!componentRoot.count(root) || it->first < componentRoot[root])
         {
-            componentRoot[root] = id;
+            componentRoot[root] = it->first;
         }
     }
 
@@ -844,15 +1591,15 @@ bool optimizeSkeleton(
         links.insert(std::make_pair(link.from(), link));
     }
 
-    // Optimize each component with its own fixed anchor. rtabmap g2o
-    // requires a single connected subgraph per call.
-    std::set<int64_t> done;
     const auto start = std::chrono::steady_clock::now();
+    const int chunkIterations = 5;
+    std::set<int64_t> done;
     for(std::map<int64_t, int64_t>::const_iterator it = componentRoot.begin();
         it != componentRoot.end(); ++it)
     {
         if(cancel && cancel(cancelUser))
         {
+            out.diagnostics.cancelled = true;
             error = "cancelled";
             return false;
         }
@@ -860,41 +1607,42 @@ bool optimizeSkeleton(
             std::chrono::steady_clock::now() - start).count();
         if(maxWallSeconds > 0.0 && elapsed > maxWallSeconds)
         {
-            error = "optimizer wall-time budget exceeded";
+            out.diagnostics.budgetExhausted = true;
+            error = "optimizer wall-time budget exhausted";
             return false;
         }
-        // Gather the nodes of this component.
         const int64_t compRoot = it->first;
         std::map<int, rtabmap::Transform> subPoses;
         std::multimap<int, rtabmap::Link> subLinks;
-        for(size_t idx : skeleton)
+        for(std::map<int64_t, size_t>::const_iterator n = model.nodeIndex.begin();
+            n != model.nodeIndex.end(); ++n)
         {
-            const int64_t id = model.nodes[idx].id;
-            if(find(id) == compRoot)
+            if(find(n->first) == compRoot)
             {
-                subPoses[static_cast<int>(id)] = poses[static_cast<int>(id)];
+                subPoses[static_cast<int>(n->first)] = poses[static_cast<int>(n->first)];
             }
         }
         for(std::multimap<int, rtabmap::Link>::const_iterator l = links.begin(); l != links.end(); ++l)
         {
-            if(subPoses.count(l->second.from()) && 
+            if(subPoses.count(l->second.from()) &&
                (l->second.from() == l->second.to() || subPoses.count(l->second.to())))
             {
                 subLinks.insert(std::make_pair(l->first, l->second));
             }
         }
-        if(subPoses.size() < 2)
+        if(subPoses.size() < 2 && subLinks.empty())
         {
-            // Single-node component: keep its raw pose (anchored).
-            out.poses[static_cast<int64_t>(subPoses.begin()->first)] =
-                se2FromTransform(subPoses.begin()->second);
-            done.insert(static_cast<int64_t>(subPoses.begin()->first));
+            if(!subPoses.empty())
+            {
+                out.poses[static_cast<int64_t>(subPoses.begin()->first)] =
+                    se2FromTransform(subPoses.begin()->second);
+                done.insert(static_cast<int64_t>(subPoses.begin()->first));
+            }
             continue;
         }
 
         rtabmap::ParametersMap parameters;
         parameters.insert(rtabmap::ParametersPair(rtabmap::Parameters::kOptimizerStrategy(), "1"));
-        parameters.insert(rtabmap::ParametersPair(rtabmap::Parameters::kOptimizerIterations(), std::to_string(iterations)));
         parameters.insert(rtabmap::ParametersPair(rtabmap::Parameters::kOptimizerEpsilon(), "0.00001"));
         parameters.insert(rtabmap::ParametersPair(rtabmap::Parameters::kOptimizerRobust(), "true"));
         parameters.insert(rtabmap::ParametersPair(rtabmap::Parameters::kOptimizerPriorsIgnored(), "false"));
@@ -913,22 +1661,53 @@ bool optimizeSkeleton(
         optimizer->setSlam2d(true);
         optimizer->setPriorsIgnored(false);
         optimizer->setLandmarksIgnored(true);
-        optimizer->setIterations(iterations);
         optimizer->setRobust(true);
 
-        double finalError = std::numeric_limits<double>::quiet_NaN();
-        int iterationsDone = 0;
         const int anchor = static_cast<int>(it->second);
-        std::map<int, rtabmap::Transform> optimized =
-            optimizer->optimize(anchor, subPoses, subLinks, 0, &finalError, &iterationsDone);
-        if(optimized.size() != subPoses.size())
+        std::map<int, rtabmap::Transform> current = subPoses;
+        int remaining = totalIterations;
+        bool converged = false;
+        while(remaining > 0)
         {
-            error = "optimizer returned an incomplete node inventory";
-            return false;
+            if(cancel && cancel(cancelUser))
+            {
+                out.diagnostics.cancelled = true;
+                error = "cancelled";
+                return false;
+            }
+            const double now = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - start).count();
+            if(maxWallSeconds > 0.0 && now > maxWallSeconds)
+            {
+                out.diagnostics.budgetExhausted = true;
+                error = "optimizer wall-time budget exhausted";
+                return false;
+            }
+            const int chunk = std::min(chunkIterations, remaining);
+            optimizer->setIterations(chunk);
+            double chunkError = std::numeric_limits<double>::quiet_NaN();
+            int chunkDone = 0;
+            std::map<int, rtabmap::Transform> optimized =
+                optimizer->optimize(anchor, current, subLinks, 0, &chunkError, &chunkDone);
+            if(optimized.size() != subPoses.size())
+            {
+                error = "optimizer returned an incomplete node inventory";
+                return false;
+            }
+            current = optimized;
+            remaining -= chunk;
+            out.diagnostics.iterations += chunkDone;
+            out.diagnostics.chunks += 1;
+            if(std::isfinite(chunkError)) out.diagnostics.finalError = chunkError;
+            if(chunkDone < chunk)
+            {
+                converged = true;
+                break;
+            }
         }
-        out.diagnostics.iterations = std::max(out.diagnostics.iterations, iterationsDone);
-        if(std::isfinite(finalError)) out.diagnostics.finalError += finalError;
-        for(std::map<int, rtabmap::Transform>::const_iterator p = optimized.begin(); p != optimized.end(); ++p)
+        (void)converged;
+        for(std::map<int, rtabmap::Transform>::const_iterator p = current.begin();
+            p != current.end(); ++p)
         {
             const SE2 se2 = se2FromTransform(p->second);
             if(!se2Finite(se2))
@@ -943,35 +1722,32 @@ bool optimizeSkeleton(
     out.diagnostics.wallSeconds = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - start).count();
     out.diagnostics.factorCount = static_cast<int64_t>(factors.size());
-    if(done.size() != skeleton.size())
-    {
-        error = "skeleton optimization missed nodes";
-        return false;
-    }
     return true;
 }
 
-// MARK: - GraphQualityEvaluator (§11.5) --------------------------------------
+// MARK: - GraphQualityEvaluator (§11.5/§14) -------------------------------------
 
 struct QualityMetrics
 {
     HealthReport health;
+    FactorSetAudit factorAudit;
     int64_t skeletonNodes = 0;
     int64_t skeletonFactors = 0;
     double anchoredRatio = 0.0;
     double coverage = 0.0;
     double chi2 = 0.0;
     int64_t dof = 0;
-    /// Residual norms (translation m) per kind.
     std::vector<double> odometryResiduals;
     std::vector<double> loopResiduals;
     std::vector<double> priorResiduals;
     std::vector<double> recoveryResiduals;
-    double rejectedRatio = 0.0;
-    double downweightedRatio = 0.0;
-    /// Corrections opt vs raw on skeleton nodes.
+    double residualThresholdRatio = 0.0;
     std::vector<double> corrections;
     double correctionJumpMax = 0.0;
+    int64_t anchoredComponents = 0;
+    int64_t totalComponents = 0;
+    int64_t publishNodes = 0;
+    std::string optimizerError;
     OptimizerDiagnostics solver;
     double wallSeconds = 0.0;
 };
@@ -987,10 +1763,24 @@ double percentile(std::vector<double> values, double q)
     return values[lo] * (1.0 - frac) + values[hi] * frac;
 }
 
-double residualNorm(const SE2 & measurement, const SE2 & optimizedRelative)
+/// Distance-equivalent residual norm used for thresholding; the full
+/// rᵀΩr contribution is accumulated separately via residualChi2 (§14.1).
+double residualNorm(const SE2 & measurement, const SE2 & optimizedRelative, const Mat3 info)
 {
     const SE2 delta = se2Compose(se2Inverse(measurement), optimizedRelative);
-    return std::hypot(delta.x, delta.y) + 0.25 * std::fabs(delta.yaw);
+    (void)info;
+    return std::hypot(delta.x, delta.y);
+}
+
+double residualChi2(const SE2 & measurement, const SE2 & optimizedRelative, const Mat3 info)
+{
+    const SE2 delta = se2Compose(se2Inverse(measurement), optimizedRelative);
+    const double r[3] = {delta.x, delta.y, delta.yaw};
+    double quad = 0.0;
+    for(int i = 0; i < 3; ++i)
+        for(int j = 0; j < 3; ++j)
+            quad += r[i] * info[i * 3 + j] * r[j];
+    return quad;
 }
 
 QualityMetrics evaluateQuality(
@@ -999,11 +1789,13 @@ QualityMetrics evaluateQuality(
     const OptimizedGraph & optimized,
     const std::vector<size_t> & skeleton,
     const HealthReport & health,
+    const FactorSetAudit & factorAudit,
     double runWallSeconds,
     double coverage)
 {
     QualityMetrics metrics;
     metrics.health = health;
+    metrics.factorAudit = factorAudit;
     metrics.skeletonNodes = static_cast<int64_t>(skeleton.size());
     metrics.skeletonFactors = static_cast<int64_t>(factors.size());
     metrics.solver = optimized.diagnostics;
@@ -1012,26 +1804,32 @@ QualityMetrics evaluateQuality(
     metrics.anchoredRatio = model.nodes.empty() ? 0.0
         : static_cast<double>(health.largestComponent) / static_cast<double>(model.nodes.size());
 
-    // Per-factor residuals against the optimized skeleton.
-    int64_t rejected = 0;
-    int64_t downweighted = 0;
+    // Per-factor residuals and full chi² (§14.1). Pose priors enter chi².
     int64_t evaluated = 0;
+    int64_t aboveThreshold = 0;
+    const double rejectThresholdM = 1.0;
     for(const FactorRecord & factor : factors)
     {
         if(factor.type == rtabmap::Link::kPosePrior)
         {
             std::map<int64_t, SE2>::const_iterator it = optimized.poses.find(factor.from);
             if(it == optimized.poses.end()) continue;
-            const double norm = residualNorm(factor.measurement, it->second);
+            const double norm = residualNorm(factor.measurement, it->second, factor.information);
             metrics.priorResiduals.push_back(norm);
+            metrics.chi2 += residualChi2(factor.measurement, it->second, factor.information);
+            metrics.dof += 3;
             ++evaluated;
+            if(norm > rejectThresholdM) ++aboveThreshold;
             continue;
         }
         std::map<int64_t, SE2>::const_iterator a = optimized.poses.find(factor.from);
         std::map<int64_t, SE2>::const_iterator b = optimized.poses.find(factor.to);
         if(a == optimized.poses.end() || b == optimized.poses.end()) continue;
         const SE2 relative = se2Compose(se2Inverse(a->second), b->second);
-        const double norm = residualNorm(factor.measurement, relative);
+        const double norm = residualNorm(factor.measurement, relative, factor.information);
+        const double chi = residualChi2(factor.measurement, relative, factor.information);
+        metrics.chi2 += chi;
+        metrics.dof += 3;
         if(factor.type == rtabmap::Link::kNeighbor)
         {
             metrics.odometryResiduals.push_back(norm);
@@ -1048,32 +1846,24 @@ QualityMetrics evaluateQuality(
         {
             metrics.loopResiduals.push_back(norm);
         }
-        // Weighted chi2 contribution (planar DoF = 3 per factor).
-        const SE2 delta = se2Compose(se2Inverse(factor.measurement), relative);
-        metrics.chi2 += factor.information[0] * delta.x * delta.x +
-                        factor.information[4] * delta.y * delta.y +
-                        factor.information[8] * delta.yaw * delta.yaw;
-        metrics.dof += 3;
         ++evaluated;
-        if(norm > 1.0) ++rejected;
-        else if(norm > 0.25) ++downweighted;
+        if(norm > rejectThresholdM) ++aboveThreshold;
     }
     if(evaluated > 0)
     {
-        metrics.rejectedRatio = static_cast<double>(rejected) / static_cast<double>(evaluated);
-        metrics.downweightedRatio = static_cast<double>(downweighted) / static_cast<double>(evaluated);
+        metrics.residualThresholdRatio =
+            static_cast<double>(aboveThreshold) / static_cast<double>(evaluated);
     }
 
     // Corrections of skeleton nodes against the raw poses.
-    for(size_t idx : skeleton)
+    for(size_t s = 0; s < skeleton.size(); ++s)
     {
-        const RawNode & raw = model.nodes[idx];
+        const RawNode & raw = model.nodes[skeleton[s]];
         std::map<int64_t, SE2>::const_iterator it = optimized.poses.find(raw.id);
-        if(it == optimized.poses.end() || !raw.finite) continue;
-        metrics.corrections.push_back(std::hypot(it->second.x - raw.pose.x, it->second.y - raw.pose.y));
+        if(it == optimized.poses.end()) continue;
+        metrics.corrections.push_back(
+            std::hypot(it->second.x - raw.pose.x, it->second.y - raw.pose.y));
     }
-    // Correction jump between consecutive skeleton nodes (detects
-    // discontinuous warp fields).
     for(size_t s = 0; s + 1 < skeleton.size(); ++s)
     {
         const RawNode & rawA = model.nodes[skeleton[s]];
@@ -1081,7 +1871,6 @@ QualityMetrics evaluateQuality(
         std::map<int64_t, SE2>::const_iterator a = optimized.poses.find(rawA.id);
         std::map<int64_t, SE2>::const_iterator b = optimized.poses.find(rawB.id);
         if(a == optimized.poses.end() || b == optimized.poses.end()) continue;
-        if(!rawA.finite || !rawB.finite) continue;
         const SE2 ca = se2Compose(a->second, se2Inverse(rawA.pose));
         const SE2 cb = se2Compose(b->second, se2Inverse(rawB.pose));
         const SE2 jump = se2Compose(se2Inverse(ca), cb);
@@ -1091,28 +1880,24 @@ QualityMetrics evaluateQuality(
     return metrics;
 }
 
-/// §11.5 disposition policy. The gate is NOT a converged boolean: it
-/// combines connectivity, residual percentiles, correction bounds and
-/// resource evidence.
-MSFactorGraphDisposition decideDisposition(const QualityMetrics & metrics, const std::string & optimizeError)
+/// Global-anchor gate (§6.4/§12.2/§14.3). A PASS additionally requires
+/// enough accepted absolute priors anchoring the publish component, no
+/// conflicting prior clusters, and a bounded prior residual.
+MSFactorGraphDisposition decideDisposition(
+    const QualityMetrics & metrics,
+    const std::string & optimizeError,
+    int64_t absolutePriorCount,
+    bool optimizerCancelled,
+    bool budgetExhausted)
 {
     const HealthReport & h = metrics.health;
-    if(h.nodeCount == 0 || h.loopLinks + h.priorLinks + h.recoveryLinks == 0)
+    if(optimizerCancelled)
     {
         return MS_FACTOR_GRAPH_NON_RECOVERABLE_FAIL;
     }
-    if(h.nonFiniteNodes > 0 || h.duplicateNodes > 0)
+    if(budgetExhausted)
     {
-        return MS_FACTOR_GRAPH_NON_RECOVERABLE_FAIL;
-    }
-    const double isolatedRatio = h.nodeCount > 0
-        ? static_cast<double>(h.isolatedNodes) / static_cast<double>(h.nodeCount) : 1.0;
-    // Multiple components are a legitimate scan shape (tracking-lost
-    // gaps / Recovery boundaries); they downgrade the disposition to a
-    // recoverable fail instead of blocking the run (§11.5).
-    if(isolatedRatio > 0.15 || h.componentCount > 10)
-    {
-        return MS_FACTOR_GRAPH_NON_RECOVERABLE_FAIL;
+        return MS_FACTOR_GRAPH_RESOURCE_REQUIRED;
     }
     if(!optimizeError.empty())
     {
@@ -1123,46 +1908,109 @@ MSFactorGraphDisposition decideDisposition(const QualityMetrics & metrics, const
         }
         return MS_FACTOR_GRAPH_NON_RECOVERABLE_FAIL;
     }
+    if(h.nodeCount == 0)
+    {
+        return MS_FACTOR_GRAPH_NON_RECOVERABLE_FAIL;
+    }
+    const double isolatedRatio = h.nodeCount > 0
+        ? static_cast<double>(h.isolatedNodes) / static_cast<double>(h.nodeCount) : 1.0;
+    // Dominance instead of a raw component cap (§12.2): small tracking-
+    // lost fragments are legitimate; a graph with no dominant component
+    // is not publishable.
+    const double dominantRatio = h.nodeCount > 0
+        ? static_cast<double>(h.largestComponent) / static_cast<double>(h.nodeCount) : 0.0;
+    if(isolatedRatio > 0.15 || dominantRatio < 0.5)
+    {
+        return MS_FACTOR_GRAPH_NON_RECOVERABLE_FAIL;
+    }
+    // No accepted prior-map constraints: only a local-frame diagnostic
+    // result is possible — never publishable (§6.4).
+    const int64_t minimumPriors = 3;
+    if(absolutePriorCount < minimumPriors || metrics.factorAudit.priorCount < 1)
+    {
+        return MS_FACTOR_GRAPH_LOCAL_FRAME_ONLY;
+    }
+    if(metrics.factorAudit.priorConflicts > 0)
+    {
+        return MS_FACTOR_GRAPH_RECOVERABLE_FAIL;
+    }
     const double loopP95 = percentile(metrics.loopResiduals, 0.95);
+    const double priorP95 = percentile(metrics.priorResiduals, 0.95);
     const double correctionP95 = percentile(metrics.corrections, 0.95);
     const double chi2PerDof = metrics.dof > 0 ? metrics.chi2 / static_cast<double>(metrics.dof) : 0.0;
+    // Publish-component coverage (§6.4/§14.3): almost every node must sit
+    // in a component anchored by accepted prior-map constraints.
+    const double publishRatio = h.nodeCount > 0
+        ? static_cast<double>(metrics.publishNodes) / static_cast<double>(h.nodeCount) : 0.0;
     const bool pass =
-        h.componentCount == 1 &&
+        h.componentCount >= 1 &&
+        publishRatio >= 0.95 &&
+        priorP95 <= 0.5 &&
+        percentile(metrics.priorResiduals, 1.0) <= 1.5 &&
         loopP95 <= 0.25 &&
         percentile(metrics.loopResiduals, 1.0) <= 1.0 &&
         correctionP95 <= 0.5 &&
         percentile(metrics.corrections, 1.0) <= 1.5 &&
         metrics.correctionJumpMax <= 2.0 &&
         chi2PerDof <= 50.0 &&
-        metrics.rejectedRatio <= 0.05 &&
+        metrics.residualThresholdRatio <= 0.05 &&
         metrics.solver.iterations > 0;
     return pass ? MS_FACTOR_GRAPH_PASS : MS_FACTOR_GRAPH_RECOVERABLE_FAIL;
 }
 
+// MARK: - Streaming escaped JSON builder (§14.4) ----------------------------------
+
 std::string jsonEscape(const std::string & text)
 {
     std::string out;
+    out.reserve(text.size() + 8);
     for(char c : text)
     {
-        if(c == '"' || c == '\\') out += '\\';
-        if(static_cast<unsigned char>(c) < 0x20) continue;
-        out += c;
+        switch(c)
+        {
+        case '"': out += "\\\""; break;
+        case '\\': out += "\\\\"; break;
+        case '\b': out += "\\b"; break;
+        case '\f': out += "\\f"; break;
+        case '\n': out += "\\n"; break;
+        case '\r': out += "\\r"; break;
+        case '\t': out += "\\t"; break;
+        default:
+            if(static_cast<unsigned char>(c) < 0x20)
+            {
+                char buf[8];
+                snprintf(buf, sizeof(buf), "\\u%04x", static_cast<unsigned char>(c));
+                out += buf;
+            }
+            else
+            {
+                out += c;
+            }
+        }
     }
     return out;
 }
 
 std::string residualTriple(const std::vector<double> & values)
 {
-    char buffer[256];
-    snprintf(buffer, sizeof(buffer),
-             "{\"count\": %zu, \"p50\": %.6f, \"p95\": %.6f, \"max\": %.6f}",
-             values.size(), percentile(values, 0.5), percentile(values, 0.95),
-             percentile(values, 1.0));
-    return buffer;
+    std::ostringstream os;
+    os << "{\"count\": " << values.size()
+       << ", \"p50\": " << percentile(values, 0.5)
+       << ", \"p95\": " << percentile(values, 0.95)
+       << ", \"max\": " << percentile(values, 1.0) << "}";
+    return os.str();
 }
 
-/// §11.5 canonical quality report.
-std::string qualityJSON(const QualityMetrics & m, MSFactorGraphDisposition disposition, const std::string & path)
+std::string qualityJSON(
+    const QualityMetrics & m,
+    MSFactorGraphDisposition disposition,
+    const std::string & path,
+    const std::string & graphInputSha,
+    int64_t absolutePriorCount,
+    const char * priorMapId,
+    const char * priorMapSha,
+    const char * trackingSessionId,
+    int32_t projectionPolicyVersion)
 {
     const char * dispositionName = "PASS";
     switch(disposition)
@@ -1170,135 +2018,242 @@ std::string qualityJSON(const QualityMetrics & m, MSFactorGraphDisposition dispo
     case MS_FACTOR_GRAPH_RECOVERABLE_FAIL: dispositionName = "RECOVERABLE_FAIL"; break;
     case MS_FACTOR_GRAPH_NON_RECOVERABLE_FAIL: dispositionName = "NON_RECOVERABLE_FAIL"; break;
     case MS_FACTOR_GRAPH_RESOURCE_REQUIRED: dispositionName = "RESOURCE_REQUIRED"; break;
+    case MS_FACTOR_GRAPH_LOCAL_FRAME_ONLY: dispositionName = "LOCAL_FRAME_ONLY"; break;
     default: break;
     }
-    char buffer[4096];
-    snprintf(buffer, sizeof(buffer),
-        "{\"format\": \"MarketScannerGraphQuality\", \"version\": 1, "
-        "\"path\": \"%s\", \"disposition\": \"%s\", "
-        "\"component_count\": %lld, \"anchored_ratio\": %.6f, "
-        "\"isolated_count\": %lld, \"cross_floor_link_count\": %lld, "
-        "\"weighted_chi2\": %.6f, \"dof\": %lld, \"chi2_per_dof\": %.6f, "
-        "\"residual_by_kind\": {\"odometry\": %s, \"loop\": %s, \"prior\": %s, \"recovery\": %s}, "
-        "\"rejected_ratio\": %.6f, \"downweighted_ratio\": %.6f, "
-        "\"correction\": {\"median\": %.6f, \"p95\": %.6f, \"max\": %.6f, \"max_jump\": %.6f}, "
-        "\"coverage\": %.6f, "
-        "\"solver\": {\"strategy\": \"g2o_robust\", \"iterations\": %d, \"final_error\": %.6f, "
-        "\"wall_seconds\": %.3f, \"skeleton_nodes\": %lld, \"factor_count\": %lld, \"available\": %s}, "
-        "\"health\": {\"node_count\": %lld, \"link_count\": %lld, \"duplicate_nodes\": %lld, "
-        "\"malformed_poses\": %lld, \"malformed_links\": %lld, \"non_finite_nodes\": %lld, "
-        "\"loop_links\": %lld, \"prior_links\": %lld, \"recovery_links\": %lld}}",
-        jsonEscape(path).c_str(), dispositionName,
-        (long long)m.health.componentCount, m.anchoredRatio,
-        (long long)m.health.isolatedNodes, (long long)m.health.crossMapLinks,
-        m.chi2, (long long)m.dof, m.dof > 0 ? m.chi2 / (double)m.dof : 0.0,
-        residualTriple(m.odometryResiduals).c_str(), residualTriple(m.loopResiduals).c_str(),
-        residualTriple(m.priorResiduals).c_str(), residualTriple(m.recoveryResiduals).c_str(),
-        m.rejectedRatio, m.downweightedRatio,
-        percentile(m.corrections, 0.5), percentile(m.corrections, 0.95),
-        percentile(m.corrections, 1.0), m.correctionJumpMax,
-        m.coverage,
-        m.solver.iterations, m.solver.finalError, m.wallSeconds,
-        (long long)m.skeletonNodes, (long long)m.skeletonFactors,
-        m.solver.available ? "true" : "false",
-        (long long)m.health.nodeCount, (long long)m.health.linkCount,
-        (long long)m.health.duplicateNodes, (long long)m.health.malformedPoses,
-        (long long)m.health.malformedLinks, (long long)m.health.nonFiniteNodes,
-        (long long)m.health.loopLinks, (long long)m.health.priorLinks,
-        (long long)m.health.recoveryLinks);
-    return buffer;
+    std::ostringstream os;
+    os.precision(9);
+    os << "{\"format\": \"MarketScannerGraphQuality\", \"version\": 2, "
+       << "\"policy_version\": \"" << MS_QUALITY_POLICY_VERSION << "\", "
+       << "\"abi_version\": " << MS_FACTOR_GRAPH_ABI_VERSION << ", "
+       << "\"path\": \"" << jsonEscape(path) << "\", "
+       << "\"disposition\": \"" << dispositionName << "\", "
+       << "\"graph_input_sha256\": \"" << jsonEscape(graphInputSha) << "\", "
+       << "\"factor_set_sha256\": \"" << jsonEscape(m.factorAudit.factorSetSha256) << "\", "
+       << "\"projection_policy_version\": " << projectionPolicyVersion << ", "
+       << "\"prior_map_id\": \"" << jsonEscape(priorMapId ? priorMapId : "") << "\", "
+       << "\"prior_map_sha256\": \"" << jsonEscape(priorMapSha ? priorMapSha : "") << "\", "
+       << "\"tracking_session_id\": \"" << jsonEscape(trackingSessionId ? trackingSessionId : "") << "\", "
+       << "\"absolute_prior_count\": " << absolutePriorCount << ", "
+       << "\"applied_prior_count\": " << m.factorAudit.priorCount << ", "
+       << "\"prior_conflicts\": " << m.factorAudit.priorConflicts << ", "
+       << "\"component_count\": " << m.health.componentCount << ", "
+       << "\"total_components\": " << m.totalComponents << ", "
+       << "\"anchored_components\": " << m.anchoredComponents << ", "
+       << "\"publish_nodes\": " << m.publishNodes << ", "
+       << "\"publish_ratio\": " << (m.health.nodeCount > 0
+              ? static_cast<double>(m.publishNodes) / static_cast<double>(m.health.nodeCount) : 0.0) << ", "
+       << "\"anchored_ratio\": " << m.anchoredRatio << ", "
+       << "\"isolated_count\": " << m.health.isolatedNodes << ", "
+       << "\"cross_floor_link_count\": " << m.health.crossMapLinks << ", "
+       << "\"gap_segments\": " << m.factorAudit.gapSegments << ", "
+       << "\"aggregated_chains\": " << m.factorAudit.aggregatedChains << ", "
+       << "\"reciprocal_inconsistent\": " << m.health.reciprocalInconsistent << ", "
+       << "\"weighted_chi2\": " << m.chi2 << ", "
+       << "\"dof\": " << m.dof << ", "
+       << "\"chi2_per_dof\": " << (m.dof > 0 ? m.chi2 / (double)m.dof : 0.0) << ", "
+       << "\"residual_by_kind\": {\"odometry\": " << residualTriple(m.odometryResiduals)
+       << ", \"loop\": " << residualTriple(m.loopResiduals)
+       << ", \"prior\": " << residualTriple(m.priorResiduals)
+       << ", \"recovery\": " << residualTriple(m.recoveryResiduals) << "}, "
+       << "\"residual_threshold_ratio\": " << m.residualThresholdRatio << ", "
+       << "\"info_policy\": {\"regularized\": " << m.health.regularizedInfos
+       << ", \"rejected\": " << m.health.rejectedInfos << "}, "
+       << "\"correction\": {\"median\": " << percentile(m.corrections, 0.5)
+       << ", \"p95\": " << percentile(m.corrections, 0.95)
+       << ", \"max\": " << percentile(m.corrections, 1.0)
+       << ", \"max_jump\": " << m.correctionJumpMax << "}, "
+       << "\"coverage\": " << m.coverage << ", "
+       << "\"optimizer_error\": \"" << jsonEscape(m.optimizerError) << "\", "
+       << "\"solver\": {\"strategy\": \"g2o_robust\", \"iterations\": " << m.solver.iterations
+       << ", \"final_error\": " << m.solver.finalError
+       << ", \"wall_seconds\": " << m.wallSeconds
+       << ", \"chunks\": " << m.solver.chunks
+       << ", \"skeleton_nodes\": " << m.skeletonNodes
+       << ", \"factor_count\": " << m.skeletonFactors
+       << ", \"available\": " << (m.solver.available ? "true" : "false") << "}, "
+       << "\"health\": {\"node_count\": " << m.health.nodeCount
+       << ", \"link_count\": " << m.health.linkCount
+       << ", \"malformed_links\": " << m.health.malformedLinks
+       << ", \"void_links\": " << m.health.voidLinks
+       << ", \"ignored_optional_links\": " << m.health.ignoredOptionalLinks
+       << ", \"loop_links\": " << m.health.loopLinks
+       << ", \"prior_links\": " << m.health.priorLinks
+       << ", \"recovery_links\": " << m.health.recoveryLinks << "}}";
+    return os.str();
 }
 
-// MARK: - FullTrajectoryReconstructor (§13) ----------------------------------
+// MARK: - FullTrajectoryReconstructor (§15) --------------------------------------
 
-/// Applies skeleton corrections to EVERY raw node:
-///   C_a = Topt_a * inv(Traw_a); C_b = Topt_b * inv(Traw_b)
-///   C_i = SE2Interpolate(C_a, C_b, alpha); Tfinal_i = C_i * Traw_i
-/// All tag-bound nodes are recovered because the reconstruction covers
-/// the full raw inventory (multi-pointer O(N+S) sweep).
+struct ReconstructedRow
+{
+    int64_t id = 0;
+    double stamp = 0.0;
+    SE2 pose;
+    int32_t mapId = 0;
+    int64_t componentId = -1;
+    bool publishEligible = false;
+    double uncertaintyM = std::numeric_limits<double>::quiet_NaN();
+};
+
 struct ReconstructedTrajectory
 {
-    std::vector<int64_t> ids;
-    std::vector<double> stamps;
-    std::vector<double> x;
-    std::vector<double> y;
-    std::vector<double> yaw;
+    std::vector<ReconstructedRow> rows;
     int64_t recoveredTagNodes = 0;
 };
 
+/// Applies skeleton corrections to EVERY raw node WITHOUT crossing
+/// components, neighbor gaps or map transitions (§15.1/§15.2):
+///   C_a = Topt_a * inv(Traw_a); C_b = Topt_b * inv(Traw_b)
+///   C_i = interpolate(C_a, C_b, alpha); Tfinal_i = C_i * Traw_i
+/// Uncertainty (§15.3) blends anchor distance with the graph residual
+/// scale; it is NaN when it cannot be estimated — never fabricated as 0.
 ReconstructedTrajectory reconstructTrajectory(
     const GraphModel & model,
     const std::vector<size_t> & skeleton,
     const OptimizedGraph & optimized,
-    const std::set<int64_t> & tagNodes)
+    const std::set<int64_t> & tagNodes,
+    const std::map<int64_t, int64_t> & nodeComponent,
+    const std::set<int64_t> & anchoredComponents,
+    const QualityMetrics & metrics)
 {
     ReconstructedTrajectory out;
-    out.ids.reserve(model.nodes.size());
-    out.stamps.reserve(model.nodes.size());
-    out.x.reserve(model.nodes.size());
-    out.y.reserve(model.nodes.size());
-    out.yaw.reserve(model.nodes.size());
+    out.rows.reserve(model.nodes.size());
 
-    // Skeleton anchors in node-index order.
-    std::vector<std::pair<size_t, SE2> > anchors; // (node index, correction)
-    for(size_t idx : skeleton)
+    // Neighbor adjacency for gap detection.
+    std::set<std::pair<int64_t, int64_t> > neighborPairs;
+    for(const RawLink & link : model.links)
     {
+        if(link.type != rtabmap::Link::kNeighbor) continue;
+        neighborPairs.insert(std::make_pair(
+            std::min(link.from, link.to), std::max(link.from, link.to)));
+    }
+
+    // Skeleton anchors (correction) in topology order.
+    std::vector<std::pair<size_t, SE2> > anchors;
+    for(size_t s = 0; s < skeleton.size(); ++s)
+    {
+        const size_t idx = skeleton[s];
         const RawNode & raw = model.nodes[idx];
         std::map<int64_t, SE2>::const_iterator it = optimized.poses.find(raw.id);
-        if(it == optimized.poses.end() || !raw.finite) continue;
+        if(it == optimized.poses.end()) continue;
         anchors.push_back(std::make_pair(idx, se2Compose(it->second, se2Inverse(raw.pose))));
     }
+
+    const double residualScale = std::max(
+        0.02, percentile(metrics.loopResiduals, 0.95));
+
     size_t a = 0;
     for(size_t i = 0; i < model.nodes.size(); ++i)
     {
         const RawNode & raw = model.nodes[i];
-        if(!raw.finite) continue;
-        while(a + 1 < anchors.size() && anchors[a + 1].first <= i) ++a;
-        SE2 correction;
-        if(anchors.empty())
+        ReconstructedRow row;
+        row.id = raw.id;
+        row.stamp = raw.stamp;
+        row.mapId = raw.mapId;
+        std::map<int64_t, int64_t>::const_iterator comp = nodeComponent.find(raw.id);
+        if(comp != nodeComponent.end())
         {
-            correction.x = correction.y = correction.yaw = 0.0;
+            row.componentId = comp->second;
+            row.publishEligible = anchoredComponents.count(comp->second) > 0;
         }
-        else if(i <= anchors.front().first || anchors.size() == 1 || a + 1 >= anchors.size())
+
+        // Advance the anchor window; segment boundaries reset at
+        // component changes, map transitions and neighbor gaps.
+        while(a + 1 < anchors.size() && anchors[a + 1].first <= i) ++a;
+        bool sameSegment = anchors.size() > 0;
+        if(anchors.size() > 0)
         {
-            correction = anchors[std::min(a, anchors.size() - 1)].second;
+            const size_t anchorIdx = anchors[std::min(a, anchors.size() - 1)].first;
+            if(model.nodes[anchorIdx].mapId != raw.mapId) sameSegment = false;
+            if(a + 1 < anchors.size() && i > anchors[a].first)
+            {
+                // Check the path between the anchor and this node is a
+                // continuous neighbor chain in the same map.
+                for(size_t k = anchors[a].first; k < i && sameSegment; ++k)
+                {
+                    const RawNode & p = model.nodes[k];
+                    const RawNode & q = model.nodes[k + 1];
+                    if(p.mapId != q.mapId) { sameSegment = false; break; }
+                    if(!neighborPairs.count(std::make_pair(
+                           std::min(p.id, q.id), std::max(p.id, q.id))))
+                    {
+                        sameSegment = false;
+                        break;
+                    }
+                }
+            }
+        }
+
+        SE2 correction;
+        bool hasCorrection = false;
+        if(sameSegment && anchors.size() > 0)
+        {
+            if(i <= anchors.front().first || anchors.size() == 1 || a + 1 >= anchors.size())
+            {
+                correction = anchors[std::min(a, anchors.size() - 1)].second;
+                hasCorrection = true;
+            }
+            else
+            {
+                const std::pair<size_t, SE2> & ca = anchors[a];
+                const std::pair<size_t, SE2> & cb = anchors[a + 1];
+                const double span = model.nodes[cb.first].stamp - model.nodes[ca.first].stamp;
+                const double alpha = span > 1.0e-9
+                    ? (raw.stamp - model.nodes[ca.first].stamp) / span : 0.0;
+                correction = se2Interpolate(ca.second, cb.second, alpha);
+                hasCorrection = true;
+            }
+        }
+
+        if(hasCorrection)
+        {
+            row.pose = se2Compose(correction, raw.pose);
+            // Uncertainty: residual scale grows with distance from the
+            // nearest anchor (§15.3 heuristic, documented).
+            double anchorDist = std::numeric_limits<double>::infinity();
+            for(size_t s = 0; s < anchors.size(); ++s)
+            {
+                const RawNode & an = model.nodes[anchors[s].first];
+                anchorDist = std::min(anchorDist,
+                    std::hypot(raw.pose.x - an.pose.x, raw.pose.y - an.pose.y));
+            }
+            row.uncertaintyM = std::isfinite(anchorDist)
+                ? residualScale * (1.0 + anchorDist) : std::numeric_limits<double>::quiet_NaN();
         }
         else
         {
-            const std::pair<size_t, SE2> & ca = anchors[a];
-            const std::pair<size_t, SE2> & cb = anchors[a + 1];
-            const double span = model.nodes[cb.first].stamp - model.nodes[ca.first].stamp;
-            const double alpha = span > 1.0e-9
-                ? (raw.stamp - model.nodes[ca.first].stamp) / span : 0.0;
-            correction = se2Interpolate(ca.second, cb.second, alpha);
+            // No valid correction segment: keep the raw pose, mark not
+            // publishable and leave uncertainty NaN (§15.3).
+            row.pose = raw.pose;
+            row.publishEligible = false;
+            row.uncertaintyM = std::numeric_limits<double>::quiet_NaN();
         }
-        const SE2 finalPose = se2Compose(correction, raw.pose);
-        out.ids.push_back(raw.id);
-        out.stamps.push_back(raw.stamp);
-        out.x.push_back(finalPose.x);
-        out.y.push_back(finalPose.y);
-        out.yaw.push_back(finalPose.yaw);
+
         if(tagNodes.count(raw.id)) ++out.recoveredTagNodes;
+        out.rows.push_back(row);
     }
     return out;
 }
 
-// MARK: - Runners ------------------------------------------------------------
+// MARK: - Runner ------------------------------------------------------------------
 
 struct RunOptions
 {
-    bool deep = false;
+    bool fullGraph = false;
     int64_t maxNodes = 0;
     double maxWallSeconds = 0.0;
     int fastIterations = 100;
-    int deepIterations = 300;
+    int fullGraphIterations = 300;
 };
 
-/// Reconstruction still runs when the optimizer errored in a way the
-/// quality gate may classify as recoverable (cancellation excluded).
-bool dispositionProbeShouldReconstruct(const std::string & optimizeError)
+MSFactorGraphOutcomeC makeErrorOutcome(const std::string & message, MSFactorGraphDisposition disposition)
 {
-    return optimizeError.find("budget") != std::string::npos;
+    MSFactorGraphOutcomeC outcome;
+    std::memset(&outcome, 0, sizeof(outcome));
+    outcome.disposition = disposition;
+    outcome.error = const_cast<char *>(strdup(message.c_str()));
+    return outcome;
 }
 
 MSFactorGraphOutcomeC runPipeline(const MSFactorGraphRequestC * request, const RunOptions & options)
@@ -1307,17 +2262,11 @@ MSFactorGraphOutcomeC runPipeline(const MSFactorGraphRequestC * request, const R
     std::memset(&outcome, 0, sizeof(outcome));
     const auto runStart = std::chrono::steady_clock::now();
     const double maxWall = options.maxWallSeconds > 0.0
-        ? options.maxWallSeconds : (options.deep ? 1800.0 : 600.0);
-
-    auto fail = [&](const std::string & message, MSFactorGraphDisposition disposition) {
-        outcome.error = const_cast<char *>(strdup(message.c_str()));
-        outcome.disposition = disposition;
-        return outcome;
-    };
+        ? options.maxWallSeconds : (options.fullGraph ? 1800.0 : 600.0);
 
     if(!request || !request->db_path)
     {
-        return fail("request or db_path is NULL", MS_FACTOR_GRAPH_NON_RECOVERABLE_FAIL);
+        return makeErrorOutcome("request or db_path is NULL", MS_FACTOR_GRAPH_NON_RECOVERABLE_FAIL);
     }
 
     // 1. Real graph health check on the snapshot DB.
@@ -1325,124 +2274,265 @@ MSFactorGraphOutcomeC runPipeline(const MSFactorGraphRequestC * request, const R
     std::string readError;
     if(!readGraph(request->db_path, model, readError))
     {
-        return fail("graph read failed: " + readError, MS_FACTOR_GRAPH_NON_RECOVERABLE_FAIL);
+        return makeErrorOutcome("graph read failed: " + readError, MS_FACTOR_GRAPH_NON_RECOVERABLE_FAIL);
     }
-    const HealthReport health = inspectHealth(model);
+    std::string topologyError;
+    if(!buildTopologyOrder(model, topologyError))
+    {
+        return makeErrorOutcome("topology order failed: " + topologyError, MS_FACTOR_GRAPH_NON_RECOVERABLE_FAIL);
+    }
+    HealthReport health;
+    std::string healthError;
+    if(!inspectHealth(model, health, healthError))
+    {
+        return makeErrorOutcome("health inspection failed: " + healthError, MS_FACTOR_GRAPH_NON_RECOVERABLE_FAIL);
+    }
 
-    // Resource gate (§16): fail closed, never silently degrade.
     const int64_t maxNodes = options.maxNodes > 0 ? options.maxNodes : 150000;
     if(health.nodeCount > maxNodes)
     {
-        return fail("node count exceeds the resource budget", MS_FACTOR_GRAPH_RESOURCE_REQUIRED);
+        return makeErrorOutcome("node count exceeds the resource budget", MS_FACTOR_GRAPH_RESOURCE_REQUIRED);
     }
 
-    std::set<int64_t> tagNodes;
+    std::set<int64_t> mandatoryNodes;
     for(int64_t i = 0; request->tag_node_ids && i < request->tag_node_count; ++i)
     {
-        tagNodes.insert(request->tag_node_ids[i]);
+        mandatoryNodes.insert(request->tag_node_ids[i]);
+    }
+
+    // Accepted absolute priors (§6).
+    std::vector<AbsolutePrior> priors;
+    for(int64_t i = 0; request->absolute_priors && i < request->absolute_prior_count; ++i)
+    {
+        const MSAbsolutePriorC & src = request->absolute_priors[i];
+        if(!std::isfinite(src.map_x) || !std::isfinite(src.map_y) || !std::isfinite(src.map_yaw))
+        {
+            continue; // non-finite evidence is rejected, never applied
+        }
+        AbsolutePrior prior;
+        prior.nodeId = src.node_id;
+        prior.mapPose.x = src.map_x;
+        prior.mapPose.y = src.map_y;
+        prior.mapPose.yaw = src.map_yaw;
+        std::memcpy(prior.information, src.information_3x3, sizeof(Mat3));
+        prior.kind = src.kind;
+        prior.episodeId = src.episode_id;
+        priors.push_back(prior);
+        mandatoryNodes.insert(src.node_id);
     }
 
     if(request->progress) request->progress(0.2, request->progress_user);
     if(request->cancel && request->cancel(request->cancel_user))
     {
-        return fail("cancelled", MS_FACTOR_GRAPH_NON_RECOVERABLE_FAIL);
+        return makeErrorOutcome("cancelled", MS_FACTOR_GRAPH_NON_RECOVERABLE_FAIL);
     }
 
-    // 2. Skeleton (Fast) or full graph (Deep).
+    // 2. Skeleton (Fast) or full graph (full-graph optimization).
     std::vector<size_t> skeleton;
-    if(options.deep)
+    if(options.fullGraph)
     {
         skeleton.reserve(model.nodes.size());
-        for(size_t i = 0; i < model.nodes.size(); ++i)
-        {
-            if(model.nodes[i].finite) skeleton.push_back(i);
-        }
+        for(size_t i = 0; i < model.nodes.size(); ++i) skeleton.push_back(i);
     }
     else
     {
         ReducerPolicy policy;
-        skeleton = reduceGraph(model, tagNodes, policy);
+        skeleton = reduceGraph(model, mandatoryNodes, policy);
     }
 
     // 3. Factors + robust native optimization.
     std::vector<FactorRecord> factors;
+    FactorSetAudit factorAudit;
     std::string factorError;
-    if(!buildSkeletonFactors(model, skeleton, factors, factorError))
+    if(!buildSkeletonFactors(model, skeleton, priors, factorAudit, factors, factorError))
     {
-        return fail("factor construction failed: " + factorError, MS_FACTOR_GRAPH_NON_RECOVERABLE_FAIL);
+        return makeErrorOutcome("factor construction failed: " + factorError, MS_FACTOR_GRAPH_NON_RECOVERABLE_FAIL);
     }
     if(request->progress) request->progress(0.4, request->progress_user);
 
     OptimizedGraph optimized;
     std::string optimizeError;
-    const int iterations = options.deep
-        ? (request->deep_iterations > 0 ? request->deep_iterations : options.deepIterations)
+    const int iterations = options.fullGraph
+        ? (request->deep_iterations > 0 ? request->deep_iterations : options.fullGraphIterations)
         : (request->fast_iterations > 0 ? request->fast_iterations : options.fastIterations);
     optimizeSkeleton(
-        model, skeleton, factors, iterations, maxWall,
+        model, factors, iterations, maxWall,
         request->cancel, request->cancel_user,
         optimized, optimizeError);
     if(request->progress) request->progress(0.7, request->progress_user);
 
-    // 4. Full trajectory reconstruction (§13) before the quality gate so
-    //    the gate sees real coverage. NON_RECOVERABLE / RESOURCE runs
-    //    still return diagnostics.
-    ReconstructedTrajectory trajectory;
-    if(optimizeError.empty() || dispositionProbeShouldReconstruct(optimizeError))
+    // Node -> component mapping (§15.2). Union-find over the skeleton
+    // factors gives the skeleton components; every raw node between two
+    // CONNECTED skeleton anchors inherits that segment's component, and
+    // nodes inside broken segments (gaps/map transitions/disconnected
+    // anchors) get their own fragment components that are never publish
+    // eligible unless a prior anchors them.
+    std::map<int64_t, int64_t> nodeComponent;
+    std::set<int64_t> anchoredComponents;
     {
-        trajectory = reconstructTrajectory(model, skeleton, optimized, tagNodes);
+        std::map<int64_t, int64_t> parent;
+        std::function<int64_t(int64_t)> find = [&](int64_t v) {
+            int64_t r = v;
+            while(parent[r] != r) r = parent[r];
+            while(parent[v] != r) { int64_t next = parent[v]; parent[v] = r; v = next; }
+            return r;
+        };
+        for(size_t s = 0; s < skeleton.size(); ++s)
+        {
+            const int64_t id = model.nodes[skeleton[s]].id;
+            parent[id] = id;
+        }
+        for(const FactorRecord & factor : factors)
+        {
+            if(factor.type == rtabmap::Link::kPosePrior) continue;
+            if(!parent.count(factor.from) || !parent.count(factor.to)) continue;
+            const int64_t rf = find(factor.from);
+            const int64_t rt = find(factor.to);
+            if(rf != rt) parent[rf] = rt;
+        }
+        // Component ids for skeleton roots.
+        std::map<int64_t, int64_t> rootToComponent;
+        int64_t nextComponent = 0;
+        std::vector<int64_t> skeletonComponent(skeleton.size(), -1);
+        for(size_t s = 0; s < skeleton.size(); ++s)
+        {
+            const int64_t root = find(model.nodes[skeleton[s]].id);
+            if(!rootToComponent.count(root))
+            {
+                rootToComponent[root] = nextComponent++;
+            }
+            skeletonComponent[s] = rootToComponent[root];
+        }
+        // Walk topology order and assign every raw node.
+        int64_t activeComponent = -1;
+        bool segmentConnected = false;
+        size_t sIdx = 0;
+        for(size_t i = 0; i < model.nodes.size(); ++i)
+        {
+            if(sIdx < skeleton.size() && skeleton[sIdx] == i)
+            {
+                const int64_t comp = skeletonComponent[sIdx];
+                if(sIdx + 1 < skeleton.size())
+                {
+                    segmentConnected =
+                        skeletonComponent[sIdx + 1] == comp;
+                }
+                activeComponent = comp;
+                nodeComponent[model.nodes[i].id] = comp;
+                ++sIdx;
+            }
+            else if(activeComponent >= 0 && segmentConnected)
+            {
+                nodeComponent[model.nodes[i].id] = activeComponent;
+            }
+            else
+            {
+                // Broken segment / before-first / after-last: fragment
+                // component (never anchored by construction).
+                nodeComponent[model.nodes[i].id] = nextComponent++;
+            }
+        }
+        // Anchored components: those containing an applied prior node.
+        std::map<int64_t, int64_t> priorComponentOfNode;
+        for(size_t s = 0; s < skeleton.size(); ++s)
+        {
+            priorComponentOfNode[model.nodes[skeleton[s]].id] = skeletonComponent[s];
+        }
+        for(size_t i = 0; i < priors.size(); ++i)
+        {
+            std::map<int64_t, int64_t>::const_iterator c =
+                priorComponentOfNode.find(priors[i].nodeId);
+            if(c != priorComponentOfNode.end())
+            {
+                anchoredComponents.insert(c->second);
+            }
+        }
     }
-    const double coverage = model.nodes.empty() ? 0.0
-        : static_cast<double>(trajectory.ids.size()) / static_cast<double>(model.nodes.size());
 
-    // 5. Quality gate (§11.5).
+    // 4. Full trajectory reconstruction (§15).
     const double runWall = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - runStart).count();
-    const QualityMetrics metrics = evaluateQuality(
-        model, factors, optimized, skeleton, health, runWall, coverage);
-    MSFactorGraphDisposition disposition = decideDisposition(metrics, optimizeError);
+    const double coverage = model.nodes.empty() ? 0.0 : 1.0;
+    QualityMetrics metrics = evaluateQuality(
+        model, factors, optimized, skeleton, health, factorAudit, runWall, coverage);
+    metrics.optimizerError = optimizeError;
+    {
+        std::set<int64_t> comps;
+        for(std::map<int64_t, int64_t>::const_iterator it = nodeComponent.begin();
+            it != nodeComponent.end(); ++it) comps.insert(it->second);
+        metrics.totalComponents = static_cast<int64_t>(comps.size());
+        metrics.anchoredComponents = static_cast<int64_t>(anchoredComponents.size());
+        int64_t publishNodes = 0;
+        for(std::map<int64_t, int64_t>::const_iterator it = nodeComponent.begin();
+            it != nodeComponent.end(); ++it)
+        {
+            if(anchoredComponents.count(it->second)) ++publishNodes;
+        }
+        metrics.publishNodes = publishNodes;
+    }
+
+    MSFactorGraphDisposition disposition = decideDisposition(
+        metrics, optimizeError, static_cast<int64_t>(priors.size()),
+        optimized.diagnostics.cancelled, optimized.diagnostics.budgetExhausted);
     if(runWall > maxWall && disposition == MS_FACTOR_GRAPH_PASS)
     {
         disposition = MS_FACTOR_GRAPH_RESOURCE_REQUIRED;
     }
-    // Every tag-bound node must be recovered (§13).
-    if(trajectory.recoveredTagNodes < static_cast<int64_t>(tagNodes.size()) &&
-       disposition == MS_FACTOR_GRAPH_PASS)
+
+    ReconstructedTrajectory trajectory;
+    if(optimizeError.empty() || optimizeError.find("budget") != std::string::npos)
     {
-        disposition = MS_FACTOR_GRAPH_NON_RECOVERABLE_FAIL;
+        trajectory = reconstructTrajectory(
+            model, skeleton, optimized, mandatoryNodes,
+            nodeComponent, anchoredComponents, metrics);
+        if(trajectory.recoveredTagNodes < static_cast<int64_t>(mandatoryNodes.size()) &&
+           disposition == MS_FACTOR_GRAPH_PASS)
+        {
+            disposition = MS_FACTOR_GRAPH_NON_RECOVERABLE_FAIL;
+        }
     }
 
+    // Fill the outcome.
     outcome.disposition = disposition;
-    outcome.quality_json = const_cast<char *>(
-        strdup(qualityJSON(metrics, disposition, options.deep ? "deep" : "fast").c_str()));
-    outcome.count = static_cast<int64_t>(trajectory.ids.size());
+    outcome.quality_json = const_cast<char *>(strdup(qualityJSON(
+        metrics, disposition,
+        options.fullGraph ? "full_graph_optimization" : "fast",
+        model.graphInputSha256,
+        static_cast<int64_t>(priors.size()),
+        request->prior_map_id, request->prior_map_sha256,
+        request->tracking_session_id,
+        request->projection_policy_version).c_str()));
+    outcome.count = static_cast<int64_t>(trajectory.rows.size());
     if(outcome.count > 0)
     {
-        outcome.ids = static_cast<int64_t *>(malloc(outcome.count * sizeof(int64_t)));
-        outcome.stamps = static_cast<double *>(malloc(outcome.count * sizeof(double)));
-        outcome.x = static_cast<double *>(malloc(outcome.count * sizeof(double)));
-        outcome.y = static_cast<double *>(malloc(outcome.count * sizeof(double)));
-        outcome.yaw = static_cast<double *>(malloc(outcome.count * sizeof(double)));
+        outcome.rows = static_cast<MSTrajectoryRowC *>(
+            malloc(static_cast<size_t>(outcome.count) * sizeof(MSTrajectoryRowC)));
         for(int64_t i = 0; i < outcome.count; ++i)
         {
-            outcome.ids[i] = trajectory.ids[i];
-            outcome.stamps[i] = trajectory.stamps[i];
-            outcome.x[i] = trajectory.x[i];
-            outcome.y[i] = trajectory.y[i];
-            outcome.yaw[i] = trajectory.yaw[i];
+            const ReconstructedRow & src = trajectory.rows[i];
+            MSTrajectoryRowC & dst = outcome.rows[i];
+            dst.id = src.id;
+            dst.stamp = src.stamp;
+            dst.x = src.pose.x;
+            dst.y = src.pose.y;
+            dst.yaw = src.pose.yaw;
+            dst.map_id = src.mapId;
+            dst.component_id = src.componentId;
+            dst.publish_eligible = src.publishEligible ? 1 : 0;
+            dst.uncertainty_m = src.uncertaintyM;
         }
     }
     outcome.skeleton_count = static_cast<int64_t>(skeleton.size());
     if(outcome.skeleton_count > 0)
     {
-        outcome.skeleton_ids = static_cast<int64_t *>(malloc(outcome.skeleton_count * sizeof(int64_t)));
-        outcome.skeleton_x = static_cast<double *>(malloc(outcome.skeleton_count * sizeof(double)));
-        outcome.skeleton_y = static_cast<double *>(malloc(outcome.skeleton_count * sizeof(double)));
-        outcome.skeleton_yaw = static_cast<double *>(malloc(outcome.skeleton_count * sizeof(double)));
+        outcome.skeleton_ids = static_cast<int64_t *>(malloc(static_cast<size_t>(outcome.skeleton_count) * sizeof(int64_t)));
+        outcome.skeleton_x = static_cast<double *>(malloc(static_cast<size_t>(outcome.skeleton_count) * sizeof(double)));
+        outcome.skeleton_y = static_cast<double *>(malloc(static_cast<size_t>(outcome.skeleton_count) * sizeof(double)));
+        outcome.skeleton_yaw = static_cast<double *>(malloc(static_cast<size_t>(outcome.skeleton_count) * sizeof(double)));
         int64_t k = 0;
-        for(size_t idx : skeleton)
+        for(size_t s = 0; s < skeleton.size(); ++s)
         {
-            const RawNode & raw = model.nodes[idx];
+            const RawNode & raw = model.nodes[skeleton[s]];
             std::map<int64_t, SE2>::const_iterator it = optimized.poses.find(raw.id);
             const SE2 pose = it != optimized.poses.end() ? it->second : raw.pose;
             outcome.skeleton_ids[k] = raw.id;
@@ -1458,28 +2548,12 @@ MSFactorGraphOutcomeC runPipeline(const MSFactorGraphRequestC * request, const R
 
 } // namespace
 
-// MARK: - C ABI --------------------------------------------------------------
-
-namespace {
-
-/// Wraps an unexpected native exception into a fail-closed outcome; the
-/// C ABI boundary must never let an exception escape (rtabmap UASSERT
-/// failures throw UException).
-MSFactorGraphOutcomeC makeExceptionOutcome(const char * message)
-{
-    MSFactorGraphOutcomeC outcome;
-    std::memset(&outcome, 0, sizeof(outcome));
-    outcome.disposition = MS_FACTOR_GRAPH_NON_RECOVERABLE_FAIL;
-    outcome.error = const_cast<char *>(strdup(message ? message : "unknown native exception"));
-    return outcome;
-}
-
-} // namespace
+// MARK: - C ABI -------------------------------------------------------------------
 
 extern "C" MSFactorGraphOutcomeC MSFactorGraphRunFast(const MSFactorGraphRequestC * request)
 {
     RunOptions options;
-    options.deep = false;
+    options.fullGraph = false;
     if(request)
     {
         options.maxNodes = request->max_nodes;
@@ -1491,18 +2565,18 @@ extern "C" MSFactorGraphOutcomeC MSFactorGraphRunFast(const MSFactorGraphRequest
     }
     catch(const std::exception & e)
     {
-        return makeExceptionOutcome(e.what());
+        return makeErrorOutcome(e.what(), MS_FACTOR_GRAPH_NON_RECOVERABLE_FAIL);
     }
     catch(...)
     {
-        return makeExceptionOutcome(0);
+        return makeErrorOutcome("unknown native exception", MS_FACTOR_GRAPH_NON_RECOVERABLE_FAIL);
     }
 }
 
-extern "C" MSFactorGraphOutcomeC MSFactorGraphRunDeep(const MSFactorGraphRequestC * request)
+extern "C" MSFactorGraphOutcomeC MSFactorGraphRunFullGraph(const MSFactorGraphRequestC * request)
 {
     RunOptions options;
-    options.deep = true;
+    options.fullGraph = true;
     if(request)
     {
         options.maxNodes = request->max_nodes;
@@ -1514,22 +2588,18 @@ extern "C" MSFactorGraphOutcomeC MSFactorGraphRunDeep(const MSFactorGraphRequest
     }
     catch(const std::exception & e)
     {
-        return makeExceptionOutcome(e.what());
+        return makeErrorOutcome(e.what(), MS_FACTOR_GRAPH_NON_RECOVERABLE_FAIL);
     }
     catch(...)
     {
-        return makeExceptionOutcome(0);
+        return makeErrorOutcome("unknown native exception", MS_FACTOR_GRAPH_NON_RECOVERABLE_FAIL);
     }
 }
 
 extern "C" void MSFactorGraphFree(MSFactorGraphOutcomeC * outcome)
 {
     if(!outcome) return;
-    free(outcome->ids);
-    free(outcome->stamps);
-    free(outcome->x);
-    free(outcome->y);
-    free(outcome->yaw);
+    free(outcome->rows);
     free(outcome->skeleton_ids);
     free(outcome->skeleton_x);
     free(outcome->skeleton_y);

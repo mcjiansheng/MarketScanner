@@ -1,5 +1,6 @@
 /*
- * MarketScanner shared factor-graph core (V1R2 Gate G §11 / Gate H §12).
+ * MarketScanner shared factor-graph core (V1R2 Gate G, V1R3 native
+ * correctness closeout).
  *
  * One native implementation serves both product surfaces:
  * - the iOS app links this translation unit directly (pure C ABI below);
@@ -7,15 +8,23 @@
  *   development oracle.
  *
  * Components (§11.1):
- *   RTABMapGraphReader       raw graph read (sqlite ro+immutable, strict)
- *   GraphHealthInspector     inventory/finite/component/cross-floor checks
- *   AdaptiveGraphReducer     skeleton selection (never fixed stride)
- *   RobustSE2Optimizer       rtabmap g2o, information + robust kernel
- *   GraphQualityEvaluator    metrics + PASS/RECOVERABLE_FAIL/... verdict
- *   FullTrajectoryReconstructor  C_i interpolation, recovers every node
+ *   RTABMapGraphReader       raw graph read (sqlite ro+immutable, strict
+ *                            exact-BLOB contracts, V1R3 §10)
+ *   GraphHealthInspector     inventory/finite/component/cross-map checks
+ *   AdaptiveGraphReducer     skeleton selection (never fixed stride,
+ *                            topology-ordered, V1R3 §11.6/§11.7)
+ *   RobustSE2Optimizer       rtabmap g2o, information + robust kernel,
+ *                            cancellable per iteration chunk (V1R3 §12)
+ *   GraphQualityEvaluator    full rᵀΩr chi² incl. pose priors, global
+ *                            anchor gate (V1R3 §14)
+ *   FullTrajectoryReconstructor  C_i interpolation that never crosses
+ *                            components/gaps, per-row component/floor
+ *                            (V1R3 §15)
  *
- * The Swift SE(2) solver stays a host-test reference only; production
- * runs through this core (§11.5).
+ * V1R3 naming: the "full-graph optimization" entry point is exactly that
+ * — it is NOT a sensor reprocess. True RTAB-Map sensor reprocessing is
+ * not implemented on device this round and the pipeline fails closed
+ * instead of silently substituting (§13).
  */
 
 #ifndef MARKETSCANNER_FACTOR_GRAPH_H
@@ -27,15 +36,50 @@
 extern "C" {
 #endif
 
+/// Core ABI version; bumped on any semantic change.
+#define MS_FACTOR_GRAPH_ABI_VERSION 2
+
+/// Policy version of the built-in quality thresholds. Thresholds are
+/// CANDIDATES until the Replay Pareto freezes a production policy
+/// (V1R3 §14.5); the version travels with every quality report.
+#define MS_QUALITY_POLICY_VERSION "candidate-1"
+
 /// Quality gate dispositions (§11.5 / §2).
 typedef enum {
     MS_FACTOR_GRAPH_PASS = 0,
     MS_FACTOR_GRAPH_RECOVERABLE_FAIL = 1,
     MS_FACTOR_GRAPH_NON_RECOVERABLE_FAIL = 2,
-    MS_FACTOR_GRAPH_RESOURCE_REQUIRED = 3
+    MS_FACTOR_GRAPH_RESOURCE_REQUIRED = 3,
+    /// The graph could only be solved in its local frame: no accepted
+    /// prior-map absolute constraint anchors it to the map. Diagnostic
+    /// output only — never publishable (§6.4).
+    MS_FACTOR_GRAPH_LOCAL_FRAME_ONLY = 4
 } MSFactorGraphDisposition;
 
-/// Cancellation probe: returns non-zero to abort the run.
+/// Absolute prior-map constraint kind (V1R3 §6.3).
+typedef enum {
+    MS_PRIOR_KIND_LOCALIZATION = 0,
+    MS_PRIOR_KIND_RECOVERY = 1,
+    MS_PRIOR_KIND_MANUAL = 2
+} MSPriorKind;
+
+/// One absolute prior: the node pose expressed in the PRIOR-MAP frame
+/// (T_map_node). Never confused with the DB raw node pose (§6.3).
+typedef struct {
+    int64_t node_id;
+    double map_x;
+    double map_y;
+    double map_yaw;
+    /// Planar 3x3 information (row-major). Must come from the evidence
+    /// policy (matcher uncertainty / recovery quality / manual policy),
+    /// never an undocumented constant (§6.3).
+    double information_3x3[9];
+    int32_t kind;
+    int64_t episode_id;
+} MSAbsolutePriorC;
+
+/// Cancellation probe: returns non-zero to abort the run. Probed at
+/// least once per optimizer iteration chunk and between stages (§12.1).
 typedef int (*MSFactorGraphCancelFn)(void *user);
 
 /// Progress callback: fraction in [0,1].
@@ -48,6 +92,15 @@ typedef struct {
     /// the trajectory reconstruction must recover all of them.
     const int64_t *tag_node_ids;
     int64_t tag_node_count;
+    /// Accepted prior-map absolute constraints (V1R3 Gate C). May be
+    /// empty: the run then only yields LOCAL_FRAME_ONLY diagnostics.
+    const MSAbsolutePriorC *absolute_priors;
+    int64_t absolute_prior_count;
+    /// Identity bindings carried into the quality report (§14.4).
+    const char *prior_map_id;
+    const char *prior_map_sha256;
+    const char *tracking_session_id;
+    int32_t projection_policy_version;
     /// Resource budgets (§16 / Gate L). Zero keeps the built-in default.
     int64_t max_nodes;
     double max_wall_seconds;
@@ -61,25 +114,37 @@ typedef struct {
     void *progress_user;
 } MSFactorGraphRequestC;
 
+/// One reconstructed trajectory row (V1R3 §15): component and floor
+/// identity travel with every node; uncertainty is NaN when it cannot be
+/// estimated (never fabricated as 0).
 typedef struct {
-    /// Reconstructed full trajectory (§13): one row per raw DB node,
-    /// skeleton corrections interpolated between anchors. All arrays
-    /// share `count` and are heap-allocated.
-    int64_t *ids;
-    double *stamps;
-    double *x;
-    double *y;
-    double *yaw;
+    int64_t id;
+    double stamp;
+    double x;
+    double y;
+    double yaw;
+    int32_t map_id;
+    int64_t component_id;
+    /// Non-zero when the component is anchored by accepted prior-map
+    /// constraints and may emit AVAILABLE positions.
+    int32_t publish_eligible;
+    double uncertainty_m;
+} MSTrajectoryRowC;
+
+typedef struct {
+    /// Reconstructed full trajectory (§13): one row per raw DB node.
+    MSTrajectoryRowC *rows;
     int64_t count;
 
-    /// Optimized skeleton (subset of the trajectory): ids + SE2 poses.
+    /// Optimized skeleton (subset): ids + SE2 poses.
     int64_t *skeleton_ids;
     double *skeleton_x;
     double *skeleton_y;
     double *skeleton_yaw;
     int64_t skeleton_count;
 
-    /// §11.5 quality metrics serialized as canonical JSON.
+    /// §11.5/§14 quality metrics serialized as canonical JSON (streaming
+    /// builder, fully escaped — no fixed buffer, V1R3 §14.4).
     char *quality_json;
 
     /// Disposition deciding the pipeline branch (§2).
@@ -93,9 +158,10 @@ typedef struct {
 /// optimization → quality gate → full trajectory reconstruction.
 MSFactorGraphOutcomeC MSFactorGraphRunFast(const MSFactorGraphRequestC *request);
 
-/// Deep Path (§12): resource-controlled full-graph rebuild. Callers must
-/// run it AT MOST once, only after a Fast RECOVERABLE_FAIL.
-MSFactorGraphOutcomeC MSFactorGraphRunDeep(const MSFactorGraphRequestC *request);
+/// Full-graph optimization (V1R3 §13.1): every finite node participates;
+/// this is NOT a sensor reprocess. Callers must run it AT MOST once and
+/// only after a Fast RECOVERABLE_FAIL whose recovery policy allows it.
+MSFactorGraphOutcomeC MSFactorGraphRunFullGraph(const MSFactorGraphRequestC *request);
 
 void MSFactorGraphFree(MSFactorGraphOutcomeC *outcome);
 
