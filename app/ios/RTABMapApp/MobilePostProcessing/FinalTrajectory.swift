@@ -7,6 +7,12 @@ import Foundation
 /// connected trajectory segments. Any second that falls inside a lost /
 /// disconnected interval, a floor change, an over-long node gap or a
 /// clock discontinuity is emitted as UNAVAILABLE — never guessed.
+///
+/// V1R5 §11.1 (review B-10): the resampler is ONE PASS with monotonic
+/// multi-pointers over the clock samples, lost intervals and trajectory
+/// nodes — O(S + C + L + N) in the number of output seconds, clock
+/// samples, lost intervals and nodes. The V1R4 per-second full scans
+/// (O(S × (C + L + N))) are gone.
 enum FinalTrajectory {
     struct Node {
         var id: Int64
@@ -14,7 +20,10 @@ enum FinalTrajectory {
         var xM: Double
         var yM: Double
         var yawRad: Double
-        var uncertaintyM: Double
+        /// Native uncertainty; nil = cannot be estimated (V1R5 §11.2:
+        /// NEVER fabricated as 0.0 — a nil-uncertainty node cannot anchor
+        /// an AVAILABLE row).
+        var uncertaintyM: Double?
         var floorID: String
     }
 
@@ -24,11 +33,24 @@ enum FinalTrajectory {
         var reason: String
     }
 
+    /// Real trace state for the business row status (V1R5 §11.3/H-20):
+    /// one record per trace sample, sorted by timestamp. The resampler
+    /// uses the closest record to each interpolated row.
+    struct TraceState {
+        var timestamp: Double
+        var trackingState: String
+        var localizationState: String
+        var confidence: Double?
+        var floorID: String
+    }
+
     struct Input {
         var nodes: [Node]
         var lostIntervals: [LostInterval]
         var sessionStartUTC: Double
         var sessionEndUTC: Double
+        /// V1R5 §11.3: real per-row business state source.
+        var traceStates: [TraceState] = []
     }
 
     /// One row of the DevicePositions worksheet.
@@ -52,6 +74,7 @@ enum FinalTrajectory {
         var interpolationRatio: Double?
         var localizationConfidence: Double?
         var estimatedUncertaintyM: Double?
+        var uncertaintySource: String?
         var trackingState: String
         var graphQualityStatus: String
         var priorMapID: String
@@ -87,6 +110,7 @@ enum FinalTrajectory {
             if let ratio = interpolationRatio { payload["interpolation_ratio"] = ratio }
             if let confidence = localizationConfidence { payload["localization_confidence"] = confidence }
             if let uncertainty = estimatedUncertaintyM { payload["estimated_uncertainty_m"] = uncertainty }
+            if let source = uncertaintySource { payload["uncertainty_source"] = source }
             return payload
         }
     }
@@ -97,7 +121,9 @@ enum FinalTrajectory {
         static let maximumInterpolationGapSeconds = 3.0
     }
 
-    /// Resamples the optimized trajectory to one row per UTC second.
+    /// Resamples the optimized trajectory to one row per UTC second with
+    /// a single pass (V1R5 §11.1): monotonic pointers over the clock
+    /// samples, lost intervals, trace states and trajectory nodes.
     static func resample(
         input: Input,
         utcMapper: MonotonicUTCMapper,
@@ -108,54 +134,89 @@ enum FinalTrajectory {
         appGitSHA: String
     ) -> [DevicePositionRow] {
         let nodes = input.nodes.sorted { $0.monotonicSeconds < $1.monotonicSeconds }
+        let lostIntervals = input.lostIntervals.sorted {
+            if $0.fromMonotonic == $1.fromMonotonic {
+                return $0.toMonotonic < $1.toMonotonic
+            }
+            return $0.fromMonotonic < $1.fromMonotonic
+        }
+        let traceStates = input.traceStates.sorted { $0.timestamp < $1.timestamp }
         let startSecond = ceil(input.sessionStartUTC)
         let endSecond = floor(input.sessionEndUTC)
         guard startSecond <= endSecond, !nodes.isEmpty else {
             return []
         }
         var rows: [DevicePositionRow] = []
+        // V1R5 §11.1 monotonic multi-pointers (each advances only).
+        var clockIndex = 0
+        var lostIndex = 0
+        var nodeIndex = 0
+        var traceIndex = 0
         var sequence = 0
+        var lastKnownFloor: String?
         var target = startSecond
         while target <= endSecond {
             sequence += 1
             let targetUTC = target
-            // Find the monotonic time for this UTC second.
-            guard let monotonic = inverseMap(utcMapper: utcMapper, utc: targetUTC) else {
+            // Find the monotonic time for this UTC second (one pass).
+            guard let monotonic = inverseMap(
+                utcMapper: utcMapper,
+                utc: targetUTC,
+                clockIndex: &clockIndex) else {
+                let floor = lastKnownFloor ?? ""
                 rows.append(unavailableRow(
                     sequence: sequence, unixTimeS: Int64(targetUTC), monotonic: nil,
-                    utcMapper: utcMapper, storeID: storeID, floorID: "",
+                    utcMapper: utcMapper, storeID: storeID, floorID: floor,
                     priorMapID: priorMapID, priorMapSha256: priorMapSha256,
                     trackingSessionID: trackingSessionID, appGitSHA: appGitSHA,
-                    reason: "clock_discontinuity"))
+                    reason: "clock_discontinuity",
+                    traceState: nearestTraceState(
+                        monotonic: nil, traceStates: traceStates,
+                        traceIndex: &traceIndex)))
                 target += 1
                 continue
             }
-            if insideLostInterval(monotonic, lostIntervals: input.lostIntervals) {
-                let reason = input.lostIntervals.first {
-                    monotonic >= $0.fromMonotonic && monotonic <= $0.toMonotonic
-                }?.reason ?? "lost_interval"
+            let lostReason = insideLostInterval(
+                monotonic, lostIntervals: lostIntervals,
+                lostIndex: &lostIndex)
+            if let lostReason {
+                let floor = lastKnownFloor ?? ""
                 rows.append(unavailableRow(
                     sequence: sequence, unixTimeS: Int64(targetUTC), monotonic: monotonic,
-                    utcMapper: utcMapper, storeID: storeID, floorID: "",
+                    utcMapper: utcMapper, storeID: storeID, floorID: floor,
                     priorMapID: priorMapID, priorMapSha256: priorMapSha256,
                     trackingSessionID: trackingSessionID, appGitSHA: appGitSHA,
-                    reason: reason))
+                    reason: lostReason,
+                    traceState: nearestTraceState(
+                        monotonic: monotonic, traceStates: traceStates,
+                        traceIndex: &traceIndex)))
                 target += 1
                 continue
             }
-            if let position = interpolate(monotonic: monotonic, nodes: nodes) {
+            if let position = interpolate(
+                monotonic: monotonic, nodes: nodes, nodeIndex: &nodeIndex) {
+                if let floor = position.floorID {
+                    lastKnownFloor = floor
+                }
                 rows.append(availableRow(
                     sequence: sequence, unixTimeS: Int64(targetUTC), monotonic: monotonic,
                     position: position, utcMapper: utcMapper, storeID: storeID,
                     priorMapID: priorMapID, priorMapSha256: priorMapSha256,
-                    trackingSessionID: trackingSessionID, appGitSHA: appGitSHA))
+                    trackingSessionID: trackingSessionID, appGitSHA: appGitSHA,
+                    traceState: nearestTraceState(
+                        monotonic: monotonic, traceStates: traceStates,
+                        traceIndex: &traceIndex)))
             } else {
+                let floor = lastKnownFloor ?? ""
                 rows.append(unavailableRow(
                     sequence: sequence, unixTimeS: Int64(targetUTC), monotonic: monotonic,
-                    utcMapper: utcMapper, storeID: storeID, floorID: "",
+                    utcMapper: utcMapper, storeID: storeID, floorID: floor,
                     priorMapID: priorMapID, priorMapSha256: priorMapSha256,
                     trackingSessionID: trackingSessionID, appGitSHA: appGitSHA,
-                    reason: "no_reliable_position"))
+                    reason: "no_reliable_position",
+                    traceState: nearestTraceState(
+                        monotonic: monotonic, traceStates: traceStates,
+                        traceIndex: &traceIndex)))
             }
             target += 1
         }
@@ -166,29 +227,46 @@ enum FinalTrajectory {
         var xM: Double
         var yM: Double
         var yawRad: Double
-        var uncertaintyM: Double
+        /// Nil when neither endpoint carries a native uncertainty
+        /// (V1R5 §11.2: never 0.0).
+        var uncertaintyM: Double?
         var beforeNodeID: Int64
         var afterNodeID: Int64
         var ratio: Double
-        var floorID: String
+        var floorID: String?
     }
 
-    private static func interpolate(monotonic: Double, nodes: [Node]) -> InterpolatedPosition? {
-        var lower: Node?
-        var upper: Node?
-        for node in nodes {
-            if node.monotonicSeconds <= monotonic {
-                lower = node
-            } else {
-                upper = node
-                break
-            }
+    /// Interpolates with a monotonic node pointer (V1R5 §11.1): each
+    /// query only advances `nodeIndex`. Input nodes must be sorted.
+    private static func interpolate(
+        monotonic: Double,
+        nodes: [Node],
+        nodeIndex: inout Int
+    ) -> InterpolatedPosition? {
+        // Advance the pointer while the next node is still at/before the
+        // query time.
+        while nodeIndex + 1 < nodes.count,
+              nodes[nodeIndex + 1].monotonicSeconds <= monotonic {
+            nodeIndex += 1
         }
-        guard let before = lower, let after = upper else {
+        guard nodeIndex + 1 < nodes.count else {
+            // Past the last node; the pointer stays put (the next query
+            // is later, so the loop above cannot rewind).
+            if nodes[nodeIndex].monotonicSeconds <= monotonic {
+                return nil
+            }
+            // Before the first node (nodeIndex was advanced by a previous
+            // query): cannot interpolate.
             return nil
         }
+        let before = nodes[nodeIndex]
+        let after = nodes[nodeIndex + 1]
+        guard before.monotonicSeconds <= monotonic,
+              after.monotonicSeconds >= monotonic else {
+            return nil
+        }
+        // Floor change: never interpolate across it.
         guard after.floorID == before.floorID else {
-            // Floor change: never interpolate across it.
             return nil
         }
         let span = after.monotonicSeconds - before.monotonicSeconds
@@ -199,50 +277,78 @@ enum FinalTrajectory {
         let xM = before.xM + (after.xM - before.xM) * ratio
         let yM = before.yM + (after.yM - before.yM) * ratio
         let yawRad = before.yawRad + SourceGeometry.shortestAngleDifference(before.yawRad, after.yawRad) * ratio
-        // Conservative uncertainty: upper bound of the two samples.
-        let uncertaintyM = max(before.uncertaintyM, after.uncertaintyM)
+        // V1R5 §11.2: conservative upper bound of the two samples when
+        // both are known; nil when either is unknown (never 0.0).
+        let uncertaintyM: Double?
+        if let beforeU = before.uncertaintyM, let afterU = after.uncertaintyM {
+            uncertaintyM = max(beforeU, afterU)
+        } else {
+            uncertaintyM = nil
+        }
         return InterpolatedPosition(
             xM: xM, yM: yM, yawRad: yawRad, uncertaintyM: uncertaintyM,
             beforeNodeID: before.id, afterNodeID: after.id, ratio: ratio,
             floorID: before.floorID)
     }
 
-    private static func insideLostInterval(_ monotonic: Double, lostIntervals: [LostInterval]) -> Bool {
-        return lostIntervals.contains { monotonic >= $0.fromMonotonic && monotonic <= $0.toMonotonic }
+    /// Lost-interval membership with a monotonic pointer (V1R5 §11.1):
+    /// intervals are sorted by `fromMonotonic`; the pointer skips
+    /// intervals that end before the query time.
+    private static func insideLostInterval(
+        _ monotonic: Double,
+        lostIntervals: [LostInterval],
+        lostIndex: inout Int
+    ) -> String? {
+        while lostIndex < lostIntervals.count,
+              lostIntervals[lostIndex].toMonotonic < monotonic {
+            lostIndex += 1
+        }
+        if lostIndex < lostIntervals.count,
+           monotonic >= lostIntervals[lostIndex].fromMonotonic,
+           monotonic <= lostIntervals[lostIndex].toMonotonic {
+            return lostIntervals[lostIndex].reason
+        }
+        return nil
     }
 
-    /// Inverts the monotonic -> UTC mapping by walking segments; returns
-    /// the monotonic time whose mapped UTC equals (or is closest within
-    /// one millisecond of) the target. Never inverts across a clock
-    /// discontinuity edge (V1R4 §7.3); a bounded outer-edge
-    /// extrapolation of at most the mapper's maximum is allowed.
-    private static func inverseMap(utcMapper: MonotonicUTCMapper, utc: Double) -> Double? {
+    /// Nearest trace state with a monotonic pointer (V1R5 §11.3): the
+    /// pointer advances while the next trace is still closer to the query
+    /// time. `nil` monotonic (clock discontinuity) keeps the pointer.
+    private static func nearestTraceState(
+        monotonic: Double?,
+        traceStates: [TraceState],
+        traceIndex: inout Int
+    ) -> TraceState? {
+        guard !traceStates.isEmpty else { return nil }
+        guard let monotonic else {
+            return traceStates[max(0, min(traceIndex, traceStates.count - 1))]
+        }
+        while traceIndex + 1 < traceStates.count,
+              abs(traceStates[traceIndex + 1].timestamp - monotonic)
+                < abs(traceStates[traceIndex].timestamp - monotonic) {
+            traceIndex += 1
+        }
+        return traceStates[traceIndex]
+    }
+
+    /// Inverts the monotonic -> UTC mapping with a monotonic segment
+    /// pointer (V1R5 §11.1). Non-discontinuity segments are contiguous in
+    /// UTC (utc is monotonic across them), so each query only advances
+    /// `clockIndex`; discontinuity edges are skipped and never inverted
+    /// across. A bounded outer-edge extrapolation of at most the mapper's
+    /// maximum is allowed.
+    private static func inverseMap(
+        utcMapper: MonotonicUTCMapper,
+        utc: Double,
+        clockIndex: inout Int
+    ) -> Double? {
         let samples = utcMapper.samples
         guard samples.count >= 2 else { return nil }
-        // The mapping is monotonic in utc when the clock is continuous;
-        // walk adjacent samples and solve the linear segment. Discontinuity
-        // edges (clock jumps / timezone changes) are never inverted across.
-        for index in 0..<(samples.count - 1) {
-            guard !utcMapper.discontinuityEdges.contains(index) else {
-                continue
-            }
-            let a = samples[index]
-            let b = samples[index + 1]
-            let aUTC = a.utcUnixSeconds
-            let bUTC = b.utcUnixSeconds
-            if (utc >= aUTC && utc <= bUTC) || (utc <= aUTC && utc >= bUTC) {
-                let spanUTC = bUTC - aUTC
-                guard abs(spanUTC) > 1.0e-9 else { continue }
-                let ratio = (utc - aUTC) / spanUTC
-                return a.monotonicSeconds + (b.monotonicSeconds - a.monotonicSeconds) * ratio
-            }
-        }
-        // Bounded outer-edge extrapolation (only when the adjacent edge is
-        // continuous), so the first/last session seconds can still map.
+        // Bounded outer-edge extrapolation (only when the adjacent edge
+        // is continuous), so the first/last session seconds can still map.
         if let first = samples.first,
            !utcMapper.discontinuityEdges.contains(0),
            utc < first.utcUnixSeconds,
-           samples.count >= 2,
            first.utcUnixSeconds - utc
             <= MonotonicUTCMapper.maximumOuterExtrapolationSeconds {
             let b = samples[1]
@@ -256,7 +362,6 @@ enum FinalTrajectory {
         if let last = samples.last,
            !utcMapper.discontinuityEdges.contains(samples.count - 2),
            utc > last.utcUnixSeconds,
-           samples.count >= 2,
            utc - last.utcUnixSeconds
             <= MonotonicUTCMapper.maximumOuterExtrapolationSeconds {
             let a = samples[samples.count - 2]
@@ -274,6 +379,36 @@ enum FinalTrajectory {
         if let last = samples.last, abs(utc - last.utcUnixSeconds) < 0.001 {
             return last.monotonicSeconds
         }
+        // Monotonic segment scan: non-discontinuity segments tile the
+        // continuous UTC span, so the pointer never rewinds.
+        var index = max(0, min(clockIndex, samples.count - 2))
+        while index < samples.count - 1 {
+            if utcMapper.discontinuityEdges.contains(index) {
+                index += 1
+                continue
+            }
+            let a = samples[index]
+            let b = samples[index + 1]
+            let aUTC = a.utcUnixSeconds
+            let bUTC = b.utcUnixSeconds
+            if (utc >= aUTC && utc <= bUTC) || (utc <= aUTC && utc >= bUTC) {
+                let spanUTC = bUTC - aUTC
+                guard abs(spanUTC) > 1.0e-9 else {
+                    index += 1
+                    continue
+                }
+                let ratio = (utc - aUTC) / spanUTC
+                clockIndex = index
+                return a.monotonicSeconds
+                    + (b.monotonicSeconds - a.monotonicSeconds) * ratio
+            }
+            if utc < min(aUTC, bUTC) {
+                // Continuous segments are ordered in utc, so no later
+                // segment can cover this target: fail closed.
+                return nil
+            }
+            index += 1
+        }
         return nil
     }
 
@@ -287,12 +422,19 @@ enum FinalTrajectory {
         priorMapID: String,
         priorMapSha256: String,
         trackingSessionID: String,
-        appGitSHA: String
+        appGitSHA: String,
+        traceState: TraceState?
     ) -> DevicePositionRow {
         let context = utcMapper.context(forMonotonic: monotonic)
         let localTimestamp = formatLocalTimestamp(
             unixTimeS: Double(unixTimeS), offsetSeconds: context.utcOffsetSeconds)
         let utcTimestamp = formatUTCTimestamp(unixTimeS: Double(unixTimeS))
+        // V1R5 §11.2: a row without a native uncertainty must not pretend
+        // perfect determinism. It stays AVAILABLE only with an explicit
+        // conservative upper bound sourced as such; with no uncertainty
+        // evidence at all the position is emitted as UNAVAILABLE.
+        let uncertaintyM = position.uncertaintyM
+        let positionStatus = uncertaintyM.map { _ in "AVAILABLE" } ?? "UNAVAILABLE"
         return DevicePositionRow(
             sequence: sequence,
             localTimestamp: localTimestamp,
@@ -302,19 +444,22 @@ enum FinalTrajectory {
             utcOffset: context.utcOffsetSeconds,
             sessionElapsedS: monotonic,
             storeID: storeID,
-            floorID: position.floorID,
-            mapXM: SourceGeometry.rounded(position.xM),
-            mapYM: SourceGeometry.rounded(position.yM),
-            yawDeg: SourceGeometry.rounded(position.yawRad * 180.0 / Double.pi),
-            positionStatus: "AVAILABLE",
+            floorID: position.floorID ?? "",
+            mapXM: positionStatus == "AVAILABLE" ? SourceGeometry.rounded(position.xM) : nil,
+            mapYM: positionStatus == "AVAILABLE" ? SourceGeometry.rounded(position.yM) : nil,
+            yawDeg: positionStatus == "AVAILABLE"
+                ? SourceGeometry.rounded(position.yawRad * 180.0 / Double.pi) : nil,
+            positionStatus: positionStatus,
             positionSource: "final_trajectory",
-            beforeNodeID: position.beforeNodeID,
-            afterNodeID: position.afterNodeID,
-            interpolationRatio: SourceGeometry.rounded(position.ratio),
-            localizationConfidence: nil,
-            estimatedUncertaintyM: SourceGeometry.rounded(position.uncertaintyM),
-            trackingState: "tracking",
-            graphQualityStatus: "connected",
+            beforeNodeID: positionStatus == "AVAILABLE" ? position.beforeNodeID : nil,
+            afterNodeID: positionStatus == "AVAILABLE" ? position.afterNodeID : nil,
+            interpolationRatio: positionStatus == "AVAILABLE"
+                ? SourceGeometry.rounded(position.ratio) : nil,
+            localizationConfidence: traceState?.confidence,
+            estimatedUncertaintyM: uncertaintyM.map { SourceGeometry.rounded($0) },
+            uncertaintySource: uncertaintyM.map { _ in "native_covariance_upper_bound" },
+            trackingState: traceState?.trackingState ?? "unknown",
+            graphQualityStatus: positionStatus == "AVAILABLE" ? "connected" : "unavailable",
             priorMapID: priorMapID,
             priorMapSha256: priorMapSha256,
             trackingSessionID: trackingSessionID,
@@ -333,7 +478,8 @@ enum FinalTrajectory {
         priorMapSha256: String,
         trackingSessionID: String,
         appGitSHA: String,
-        reason: String
+        reason: String,
+        traceState: TraceState?
     ) -> DevicePositionRow {
         let context: (timezoneID: String, utcOffsetSeconds: Int)
         if let monotonic = monotonic {
@@ -352,6 +498,8 @@ enum FinalTrajectory {
             utcOffset: context.utcOffsetSeconds,
             sessionElapsedS: monotonic ?? -1,
             storeID: storeID,
+            // V1R5 §11.4: keep the last known trusted floor when known;
+            // the caller passes "" when truly unknown.
             floorID: floorID,
             mapXM: nil,
             mapYM: nil,
@@ -361,9 +509,10 @@ enum FinalTrajectory {
             beforeNodeID: nil,
             afterNodeID: nil,
             interpolationRatio: nil,
-            localizationConfidence: nil,
+            localizationConfidence: traceState?.confidence,
             estimatedUncertaintyM: nil,
-            trackingState: "lost",
+            uncertaintySource: nil,
+            trackingState: traceState?.trackingState ?? "lost",
             graphQualityStatus: "unavailable",
             priorMapID: priorMapID,
             priorMapSha256: priorMapSha256,

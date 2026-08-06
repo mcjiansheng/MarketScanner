@@ -232,13 +232,47 @@ enum MobileProcessingPipeline {
         // rejected record blocks publish fail-closed; it is never silently
         // dropped (the audit is counted and surfaced in the error).
         let nodeInventory = Self.absolutePriorNodeInventoryProvider?(snapshotDatabase) ?? []
+
+        // V1R5 §5.3/§5.4 (review B-02): the durable burst sidecar is
+        // parsed with the strict burst parser BEFORE the observations;
+        // every observation that may reach ACCEPTED must belong to a
+        // verified complete burst. Missing watermarks fail closed.
+        let burstEvidence = try TagObservationBurstEvidenceParser.parse(
+            snapshotDirectory: snapshot.snapshotDirectory,
+            nodes: nodeInventory,
+            priorMapID: request.priorMap.priorMapID,
+            priorMapSHA256: request.priorMap.packageSHA256,
+            trackingSessionID: request.trackingSessionID,
+            floorID: floorID,
+            expectedBurstCount: (metadata["tagObservationBurstCount"] as? NSNumber)?.intValue,
+            expectedLastBurstID: metadata["tagObservationBurstLastID"] as? String)
+        guard burstEvidence.clean else {
+            let audit = burstEvidence.audit
+            throw PipelineError.tagEvidenceInvalid(
+                "\(audit.totalRejected) bad burst records of \(audit.recordTotal)"
+                + " (first: \(audit.rejectedDetails.prefix(3).map {"\($0.recordIndex):\($0.reason)" }.joined(separator: ", ")))")
+        }
+        if (metadata["tagObservationBurstCount"] as? NSNumber)?.intValue ?? 0 > 0
+            && burstEvidence.bursts.isEmpty {
+            throw PipelineError.tagEvidenceInvalid(
+                "metadata declares bursts but the sidecar carries none")
+        }
+
+        // V1R4 §13.2: tag observations are strict-parsed BEFORE
+        // optimization — every record is identity/format/pose checked and
+        // bound to an exact snapshot-DB node via the node-timebase axis
+        // (wired provider, §6.1). Bound node ids pin the adaptive skeleton
+        // (§11.3) so tag-bound nodes survive reconstruction (§13). Any
+        // rejected record blocks publish fail-closed; it is never silently
+        // dropped (the audit is counted and surfaced in the error).
         let tagEvidence = try TagObservationEvidenceParser.parse(
             snapshotDirectory: snapshot.snapshotDirectory,
             nodes: nodeInventory,
             priorMapID: request.priorMap.priorMapID,
             priorMapSHA256: request.priorMap.packageSHA256,
             trackingSessionID: request.trackingSessionID,
-            floorID: floorID)
+            floorID: floorID,
+            verifiedBursts: burstEvidence)
         guard tagEvidence.audit.rejectedDetails.isEmpty else {
             let audit = tagEvidence.audit
             throw PipelineError.tagEvidenceInvalid(
@@ -259,6 +293,17 @@ enum MobileProcessingPipeline {
             priorMapSHA256: request.priorMap.packageSHA256,
             trackingSessionID: request.trackingSessionID,
             floorID: floorID)
+        // V1R5 §8.3 (review B-06): an authoritative prior audit must be
+        // CLEAN before the pipeline runs — a rejected authoritative
+        // record blocks processing fail-closed (absolute priors are the
+        // global map-frame anchor; they never degrade to a "skip bad
+        // records" log policy).
+        guard priorEvidence.audit.rejectedDetails.isEmpty else {
+            let audit = priorEvidence.audit
+            throw PipelineError.tagEvidenceInvalid(
+                "\(audit.rejectedDetails.count) bad prior records"
+                + " (first: \(audit.rejectedDetails.prefix(3).map {"\($0.source):\($0.recordIndex):\($0.reason)" }.joined(separator: ", ")))")
+        }
         let absolutePriors = priorEvidence.priors
 
         // --- Fast Path: shared native factor-graph core (§2 / §11) -----
@@ -386,7 +431,18 @@ enum MobileProcessingPipeline {
 
         // --- Clock mapping on the native UTC stamp axis (§7/§13) -------
         progress(0.40, "构建时钟映射")
-        let traces = try readTrace(in: snapshot.snapshotDirectory)
+        // V1R5 §9.6 (review B-09): the trace is strict-parsed — a bad
+        // line throws instead of silently disappearing, so lost intervals
+        // can never hide behind a lenient reader. The count is verified
+        // against the metadata watermark.
+        let expectedTraceCount = ((metadata["captureHealth"] as? [String: Any])?["localizationTraceRecordCount"] as? NSNumber)?.intValue
+        let traces = try StrictLocalizationTraceParser.parse(
+            snapshotDirectory: snapshot.snapshotDirectory,
+            trackingSessionID: request.trackingSessionID,
+            priorMapID: request.priorMap.priorMapID,
+            priorMapSHA256: request.priorMap.packageSHA256,
+            floorID: floorID,
+            expectedCount: expectedTraceCount)
         let sessionStartStamp = nativeOutcome.trajectory.first?.stamp ?? finalizedAtUnix - 1
         // Session end is the LAST COLLECTED stamp (§7.5) — never the
         // finalization wall-clock.
@@ -444,7 +500,11 @@ enum MobileProcessingPipeline {
                 xM: $0.xM,
                 yM: $0.yM,
                 yawRad: $0.yawRad,
-                uncertaintyM: $0.uncertaintyM ?? 0.0,
+                // V1R5 §11.2 (review B-11): native uncertainty stays nil
+                // when it cannot be estimated — it is NEVER fabricated as
+                // 0.0. A nil-uncertainty node cannot anchor an AVAILABLE
+                // row (the resampler emits UNAVAILABLE instead).
+                uncertaintyM: $0.uncertaintyM,
                 floorID: floorID)
         }
         guard !finalNodes.isEmpty else {
@@ -456,7 +516,17 @@ enum MobileProcessingPipeline {
             nodes: finalNodes,
             lostIntervals: lostIntervals,
             sessionStartUTC: sessionStartUTC,
-            sessionEndUTC: sessionEndUTC)
+            sessionEndUTC: sessionEndUTC,
+            // V1R5 §11.3 (H-20): real trace states drive the per-row
+            // business status instead of hard-coded "tracking/connected".
+            traceStates: traces.map {
+                FinalTrajectory.TraceState(
+                    timestamp: $0.timestamp,
+                    trackingState: $0.trackingState,
+                    localizationState: $0.localizationState,
+                    confidence: $0.confidence,
+                    floorID: $0.floorID)
+            })
         let devicePositions = FinalTrajectory.resample(
             input: trajectoryInput,
             utcMapper: utcMapper,
@@ -491,8 +561,10 @@ enum MobileProcessingPipeline {
         // Raw snapshot-DB node poses for the propagation chain
         // P_final = T_final_node * inverse(T_raw_node) * P_raw (§13.2).
         let rawNodePoses = Self.rawNodePoseProvider?(snapshotDatabase) ?? [:]
-        let (priceTags, rescanTasks) = try finalizeTags(
-            observations: tagObservations,
+        // V1R5 §6.5 (review B-03): the resolver uses O(1) indexes — the
+        // parser-bound node id is the only resolution path, and the raw
+        // snapshot node stamps verify the exact node-timebase binding.
+        let resolverIndex = TagObservationResolver.NodeIndex(
             finalNodes: finalNodes.map {
                 TagObservationResolver.FinalNodePose(
                     id: $0.id,
@@ -500,6 +572,11 @@ enum MobileProcessingPipeline {
                     pose: SE2Transform(xM: $0.xM, yM: $0.yM, yawRad: $0.yawRad),
                     floorID: $0.floorID)
             },
+            rawNodeStamps: Dictionary(
+                uniqueKeysWithValues: nodeInventory.map { ($0.nodeID, $0.stamp) }))
+        let (priceTags, rescanTasks) = try finalizeTags(
+            observations: tagObservations,
+            resolverIndex: resolverIndex,
             shelves: shelves,
             shelfIndex: shelfIndex,
             structures: structures,
@@ -551,7 +628,11 @@ enum MobileProcessingPipeline {
             defer { try? handle.close() }
             var hasher = SHA256()
             for row in devicePositions {
-                guard let data = try? CanonicalJSONEncoder.encode(row.canonicalPayload) else { continue }
+                // V1R5 §6.6 (review B-12): an encode failure BLOCKS the
+                // whole result commit — a silently missing line would
+                // corrupt the counts and the SHA identity. `try?` with
+                // `continue` is forbidden on the authoritative writers.
+                let data = try CanonicalJSONEncoder.encode(row.canonicalPayload)
                 hasher.update(data: data)
                 try handle.write(contentsOf: data)
                 let newline = Data("\n".utf8)
@@ -792,20 +873,6 @@ enum MobileProcessingPipeline {
 
     // MARK: - Evidence readers
 
-    /// One localized node record from `localization_trace.jsonl`.
-    struct TraceRecord {
-        var timestamp: Double
-        var xM: Double
-        var yM: Double
-        var yawRad: Double
-        var localizationState: String
-        var trackingState: String
-        var floorID: String
-        var nodeTimebaseOffsetSeconds: Double
-        var nodeTimebaseTimestamp: Double
-        var confidence: Double
-    }
-
     static func readMetadata(in snapshotDirectory: URL) throws -> [String: Any] {
         let url = snapshotDirectory.appendingPathComponent("metadata.json")
         let data = try Data(contentsOf: url)
@@ -814,37 +881,6 @@ enum MobileProcessingPipeline {
             limits: StrictJSONDocumentLimits(maximumBytes: data.count + 1)) as? [String: Any]
         else { throw PipelineError.missingMetadata }
         return object
-    }
-
-    static func readTrace(in snapshotDirectory: URL) throws -> [TraceRecord] {
-        let url = snapshotDirectory.appendingPathComponent("localization_trace.jsonl")
-        guard let content = try? String(contentsOf: url, encoding: .utf8) else {
-            return []
-        }
-        var records: [TraceRecord] = []
-        for line in content.split(separator: "\n") {
-            guard let data = line.data(using: .utf8),
-                  let object = try? StrictJSONDocumentParser.object(
-                      from: data,
-                      limits: StrictJSONDocumentLimits(maximumBytes: data.count + 1)) as? [String: Any]
-            else { continue }
-            guard let timestamp = object["timestamp"] as? Double,
-                  let pose = object["estimatedPose"] as? [String: Any],
-                  let xM = pose["x_m"] as? Double,
-                  let yM = pose["y_m"] as? Double,
-                  let yawRad = pose["yaw_rad"] as? Double
-            else { continue }
-            records.append(TraceRecord(
-                timestamp: timestamp,
-                xM: xM, yM: yM, yawRad: yawRad,
-                localizationState: object["localizationState"] as? String ?? "unknown",
-                trackingState: object["trackingState"] as? String ?? "unknown",
-                floorID: object["floorId"] as? String ?? "1",
-                nodeTimebaseOffsetSeconds: object["nodeTimebaseOffsetSeconds"] as? Double ?? 0,
-                nodeTimebaseTimestamp: object["nodeTimebaseTimestamp"] as? Double ?? timestamp,
-                confidence: object["confidence"] as? Double ?? 0))
-        }
-        return records
     }
 
     // MARK: - Fast Path graph
@@ -860,7 +896,10 @@ enum MobileProcessingPipeline {
 
     /// Samples the trace into graph nodes (stride keeps the solve fast on
     /// device while preserving loop structure).
-    static func buildGraphNodes(from traces: [TraceRecord], stride: Int = 4) -> [GraphSampledNode] {
+    static func buildGraphNodes(
+        from traces: [StrictLocalizationTraceParser.TraceRecord],
+        stride: Int = 4
+    ) -> [GraphSampledNode] {
         var nodes: [GraphSampledNode] = []
         for (index, trace) in traces.enumerated() where index % stride == 0 {
             let id = Int64(index / stride) + 1
@@ -900,11 +939,12 @@ enum MobileProcessingPipeline {
     /// Lost intervals from the real localization/tracking states, mapped
     /// onto the native UTC stamp axis (monotonic = utc - sessionStart).
     static func buildLostIntervals(
-        from traces: [TraceRecord], sessionStartStamp: Double
+        from traces: [StrictLocalizationTraceParser.TraceRecord],
+        sessionStartStamp: Double
     ) -> [FinalTrajectory.LostInterval] {
         /// Trace monotonic axis -> stamp axis conversion: prefer the
         /// recorded node-timebase UTC, fall back to the raw timestamp.
-        func axisTime(_ trace: TraceRecord) -> Double {
+        func axisTime(_ trace: StrictLocalizationTraceParser.TraceRecord) -> Double {
             if trace.nodeTimebaseTimestamp > 0 {
                 return trace.nodeTimebaseTimestamp - sessionStartStamp
             }
@@ -967,12 +1007,9 @@ enum MobileProcessingPipeline {
     ) throws -> MonotonicUTCMapper {
         let clockURL = snapshotDirectory
             .appendingPathComponent("clock_correlations.jsonl")
-        let content: String
-        do {
-            content = try String(contentsOf: clockURL, encoding: .utf8)
-        } catch {
+        guard FileManager.default.fileExists(atPath: clockURL.path) else {
             throw PipelineError.clockEvidenceIncomplete(
-                "clock_correlations.jsonl missing: \(error.localizedDescription)")
+                "clock_correlations.jsonl missing")
         }
         let expectedCorrelationCount =
             (metadata["clockCorrelationCount"] as? NSNumber)?.intValue
@@ -980,8 +1017,10 @@ enum MobileProcessingPipeline {
             (metadata["clockNodeBindingCount"] as? NSNumber)?.intValue
         let evidence: StrictClockEvidenceParser.ParsedEvidence
         do {
+            // V1R5 §7.1: streaming parse — the sidecar is never loaded
+            // as one String (60k+ bindings stay bounded).
             evidence = try StrictClockEvidenceParser.parse(
-                content: content,
+                url: clockURL,
                 expectedTrackingSessionID: trackingSessionID,
                 expectedCorrelationCount: expectedCorrelationCount,
                 expectedBindingCount: expectedBindingCount)
@@ -1043,9 +1082,10 @@ enum MobileProcessingPipeline {
     static var rawNodePoseProvider: ((URL) -> [Int64: SE2Transform])? = nil
 
     /// Shelf segments from the compiled prior-map package (`shelves.json`),
-    /// computed per V1R4 §13.5: the rotated polygon (when present) defines
-    /// the longitudinal axis, start/end and front/back normals; the AABB is
-    /// only an index envelope. A malformed shelf element is skipped with
+    /// computed per V1R5 §12.2: the compiler emits EXPLICIT business side
+    /// semantics (`shelf_segments` with front/back normals and
+    /// orientation provenance) and the consumer uses them — geometry is
+    /// only the index envelope. A malformed shelf element is skipped with
     /// the segment-level identity intact (code/floor are validated first).
     static func readShelves(from map: MobileMapLibrary.MapEntry) throws -> [ShelfAssociationEngine.ShelfSegment] {
         let url = map.packageDirectory.appendingPathComponent("shelves.json")
@@ -1055,6 +1095,26 @@ enum MobileProcessingPipeline {
             limits: StrictJSONDocumentLimits(maximumBytes: data.count + 1)) as? [String: Any],
             let rawShelves = object["shelves"] as? [[String: Any]]
         else { throw PipelineError.invalidPriorMap(map.packageDirectory.path) }
+        // V1R5 §12.2: compiled business semantics by (shelf_code, floor).
+        var compiledNormals: [String: (normal: (Double, Double), provenance: String)] = [:]
+        if let segments = object["shelf_segments"] as? [[String: Any]] {
+            for segment in segments {
+                guard let shelfCode = segment["shelf_code"] as? String,
+                      let floorID = segment["floor_id"] as? String,
+                      let provenance = segment["orientation_provenance"] as? String,
+                      let rawNormal = segment["front_normal"] as? [Any],
+                      rawNormal.count == 2,
+                      let nx = StrictJSONScalar.number(rawNormal[0]),
+                      let ny = StrictJSONScalar.number(rawNormal[1]),
+                      nx.isFinite, ny.isFinite else {
+                    continue
+                }
+                let length = hypot(nx, ny)
+                guard length > 1.0e-9 else { continue }
+                compiledNormals["\(floorID)|\(shelfCode)"] = (
+                    (nx / length, ny / length), provenance)
+            }
+        }
         var shelves: [ShelfAssociationEngine.ShelfSegment] = []
         for raw in rawShelves {
             guard let shelfCode = raw["code"] as? String,
@@ -1087,13 +1147,17 @@ enum MobileProcessingPipeline {
                 boundsMaxM = (maxX, maxY)
             }
             let yawRad = raw["yaw_rad"] as? Double
+            let compiled = compiledNormals["\(floorID)|\(shelfCode)"]
+            let provenance = compiled?.provenance ?? "geometry"
             if let segment = ShelfAssociationEngine.makeSegment(
                 shelfCode: shelfCode,
                 floorID: floorID,
                 polygonM: polygonM,
                 boundsMinM: boundsMinM,
                 boundsMaxM: boundsMaxM,
-                yawRad: yawRad) {
+                yawRad: yawRad,
+                compiledFrontNormal: compiled?.normal,
+                orientationProvenance: provenance) {
                 shelves.append(segment)
             }
         }
@@ -1161,7 +1225,7 @@ enum MobileProcessingPipeline {
     /// become explicit RESCAN tasks — nothing is silently dropped.
     static func finalizeTags(
         observations: [TagObservationEvidenceObservation],
-        finalNodes: [TagObservationResolver.FinalNodePose],
+        resolverIndex: TagObservationResolver.NodeIndex,
         shelves: [ShelfAssociationEngine.ShelfSegment],
         shelfIndex: ShelfAssociationEngine.ShelfSpatialIndex?,
         structures: [ShelfAssociationEngine.FixedStructure],
@@ -1214,11 +1278,13 @@ enum MobileProcessingPipeline {
                 frameMonotonicSeconds: raw.frameTimestamp,
                 rawPositionM: position,
                 rawNodePose: rawNodePose,
-                trackingSessionID: raw.trackingSessionID)
+                trackingSessionID: raw.trackingSessionID,
+                burstID: raw.burstID,
+                frameID: raw.frameID)
             do {
                 resolved.append(try TagObservationResolver.resolve(
                     observation: observation,
-                    finalNodes: finalNodes,
+                    index: resolverIndex,
                     sessionID: sessionID))
             } catch {
                 resolutionFailures.append((

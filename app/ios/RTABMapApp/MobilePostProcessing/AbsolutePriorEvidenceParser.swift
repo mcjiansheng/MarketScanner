@@ -4,8 +4,11 @@ import Foundation
 // RecoveryLifecycleEvidenceLimits; §6.3 sigma policy)
 
 enum AbsolutePriorEvidenceLimits {
-    /// Sidecar file size / record size / record-count gates.
-    static let maximumFileBytes = 16 * 1024 * 1024
+    /// Sidecar file size / record size / record-count gates. V1R5 §8.1:
+    /// constraints scale with the product ceiling (60k nodes; priors are
+    /// far fewer than tag observations, so 64 MiB / 100k is ample) and
+    /// the parser streams via the shared strict JSONL reader.
+    static let maximumFileBytes = 64 * 1024 * 1024
     static let maximumRecordBytes = 1024 * 1024
     static let maximumRecords = 100_000
     /// Manual v3 node-binding gate (identical to the PC reader
@@ -13,6 +16,9 @@ enum AbsolutePriorEvidenceLimits {
     static let maximumNodeTimeDeltaSeconds = 1.0
     /// Stamp / delta re-check tolerance (identical to the PC reader).
     static let stampEpsilon = 1.0e-6
+    /// V1R5 §8.2: stamp-fallback binding must be unambiguous — the
+    /// second-best candidate must be farther than this margin.
+    static let minimumNodeMarginSeconds = 0.01
     // Localization-sigma policy (§6.3): information must derive from
     // recorded uncertainty, never an undocumented constant.
     static let minimumSigmaM = 0.02
@@ -214,7 +220,7 @@ enum AbsolutePriorEvidenceParser {
                     reason: "constraint_format_invalid"))
                 continue
             }
-            guard object["accepted"] as? Bool == true else {
+            guard StrictJSONScalar.boolean(object["accepted"]) == true else {
                 audit.constraintNotAcceptedRejected += 1
                 audit.rejectedDetails.append(AbsolutePriorRejectedDetail(
                     source: "constraints", recordIndex: recordIndex,
@@ -263,11 +269,30 @@ enum AbsolutePriorEvidenceParser {
                     reason: "constraint_timestamp_invalid"))
                 continue
             }
-            guard let bound = nearestNode(nodes: nodes, stamp: nodeTimestamp) else {
+            guard let bound = nearestNodeBinding(
+                nodes: nodes, stamp: nodeTimestamp) else {
                 audit.constraintNodeBindingRejected += 1
                 audit.rejectedDetails.append(AbsolutePriorRejectedDetail(
                     source: "constraints", recordIndex: recordIndex,
                     reason: "constraint_node_binding_failed"))
+                continue
+            }
+            // V1R5 §8.2 (review B-06): the stamp fallback must be exact —
+            // frozen delta AND second-candidate ambiguity margin.
+            guard bound.delta <= AbsolutePriorEvidenceLimits
+                .maximumNodeTimeDeltaSeconds else {
+                audit.constraintNodeBindingRejected += 1
+                audit.rejectedDetails.append(AbsolutePriorRejectedDetail(
+                    source: "constraints", recordIndex: recordIndex,
+                    reason: "constraint_node_time_delta_exceeded"))
+                continue
+            }
+            guard bound.secondDelta - bound.delta
+                > AbsolutePriorEvidenceLimits.minimumNodeMarginSeconds else {
+                audit.constraintNodeBindingRejected += 1
+                audit.rejectedDetails.append(AbsolutePriorRejectedDetail(
+                    source: "constraints", recordIndex: recordIndex,
+                    reason: "constraint_node_binding_ambiguous"))
                 continue
             }
             // Derive sigma from the recorded uniqueness, exactly like
@@ -284,7 +309,7 @@ enum AbsolutePriorEvidenceParser {
                 continue
             }
             priors.append(MobileAbsolutePrior(
-                nodeID: bound.nodeID,
+                nodeID: bound.node.nodeID,
                 mapXM: pose.xM, mapYM: pose.yM, mapYawRad: pose.yawRad,
                 information3x3: information, kind: 0, episodeID: 0))
             audit.constraintAccepted += 1
@@ -498,10 +523,12 @@ enum AbsolutePriorEvidenceParser {
 
     // MARK: - Record helpers
 
-    /// Reads a sidecar exactly once with the file-level limits. A
-    /// missing file is a legal empty input; a file-level anomaly throws;
-    /// a single unparseable line is audited as `invalid_record` (the PC
-    /// reader also skips damaged lines instead of failing the run).
+    /// Reads a sidecar exactly once with the file-level limits and the
+    /// V1R5 §8.1 frozen JSONL framing (streaming 64 KiB chunks, final
+    /// newline, no blank lines). A missing file is a legal empty input; a
+    /// file-level anomaly throws; a single unparseable line is audited as
+    /// `invalid_record` (the PC reader also skips damaged lines instead
+    /// of failing the run).
     private static func readSidecar(
         url: URL,
         source: String,
@@ -513,35 +540,28 @@ enum AbsolutePriorEvidenceParser {
         guard fileSize <= AbsolutePriorEvidenceLimits.maximumFileBytes else {
             throw AbsolutePriorEvidenceParseError.fileTooLarge(source, fileSize)
         }
-        guard let content = try? String(contentsOf: url, encoding: .utf8) else {
-            throw AbsolutePriorEvidenceParseError.fileUnreadable(source)
+        let framing: StrictJSONLStreamReader.ParsedLines
+        do {
+            framing = try StrictJSONLStreamReader.readLines(
+                from: url,
+                maximumLineBytes: AbsolutePriorEvidenceLimits.maximumRecordBytes,
+                maximumLineCount: AbsolutePriorEvidenceLimits.maximumRecords)
+        } catch let error as StrictJSONLStreamReader.StreamError {
+            throw AbsolutePriorEvidenceParseError.fileUnreadable(
+                "\(source): \(error.localizedDescription)")
         }
         var records: [[String: Any]] = []
-        var lineNumber = 0
-        for rawLine in content.split(
-            separator: "\n", omittingEmptySubsequences: false) {
-            lineNumber += 1
-            let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
-            if line.isEmpty { continue }
-            guard let data = line.data(using: .utf8) else {
-                if source == "constraints" {
-                    audit.constraintInvalidRecordRejected += 1
-                } else {
-                    audit.manualInvalidRecordRejected += 1
-                }
-                audit.rejectedDetails.append(AbsolutePriorRejectedDetail(
-                    source: source, recordIndex: lineNumber,
-                    reason: "invalid_record"))
-                continue
-            }
-            guard data.count <= AbsolutePriorEvidenceLimits.maximumRecordBytes else {
+        for (offset, line) in framing.lines.enumerated() {
+            let lineNumber = offset + 1
+            guard line.utf8.count <= AbsolutePriorEvidenceLimits.maximumRecordBytes else {
                 throw AbsolutePriorEvidenceParseError.recordTooLarge(
-                    source, data.count)
+                    source, line.utf8.count)
             }
-            guard let object = try? StrictJSONDocumentParser.object(
-                from: data,
-                limits: StrictJSONDocumentLimits(maximumBytes: data.count + 1))
-                as? [String: Any] else {
+            let object: [String: Any]
+            do {
+                object = try StrictJSONLStreamReader.strictObject(
+                    from: line, lineNumber: lineNumber)
+            } catch {
                 if source == "constraints" {
                     audit.constraintInvalidRecordRejected += 1
                 } else {
@@ -561,8 +581,9 @@ enum AbsolutePriorEvidenceParser {
         return records
     }
 
-    /// Counts non-empty lines of a sidecar (recovery audit). Missing
-    /// file -> 0; file-level limits identical to the evidence parser.
+    /// Counts non-empty lines of a sidecar (recovery audit) through the
+    /// shared strict framing. Missing file -> 0; file-level limits
+    /// identical to the evidence parser.
     private static func countNonEmptyLines(url: URL, source: String) throws -> Int {
         guard FileManager.default.fileExists(atPath: url.path) else { return 0 }
         let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
@@ -570,20 +591,20 @@ enum AbsolutePriorEvidenceParser {
         guard fileSize <= AbsolutePriorEvidenceLimits.maximumFileBytes else {
             throw AbsolutePriorEvidenceParseError.fileTooLarge(source, fileSize)
         }
-        guard let content = try? String(contentsOf: url, encoding: .utf8) else {
-            throw AbsolutePriorEvidenceParseError.fileUnreadable(source)
+        let framing: StrictJSONLStreamReader.ParsedLines
+        do {
+            framing = try StrictJSONLStreamReader.readLines(
+                from: url,
+                maximumLineBytes: AbsolutePriorEvidenceLimits.maximumRecordBytes,
+                maximumLineCount: AbsolutePriorEvidenceLimits.maximumRecords)
+        } catch let error as StrictJSONLStreamReader.StreamError {
+            throw AbsolutePriorEvidenceParseError.fileUnreadable(
+                "\(source): \(error.localizedDescription)")
         }
-        var count = 0
-        for rawLine in content.split(
-            separator: "\n", omittingEmptySubsequences: false) {
-            if !rawLine.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                count += 1
-            }
+        guard framing.lineCount <= AbsolutePriorEvidenceLimits.maximumRecords else {
+            throw AbsolutePriorEvidenceParseError.tooManyRecords(source, framing.lineCount)
         }
-        guard count <= AbsolutePriorEvidenceLimits.maximumRecords else {
-            throw AbsolutePriorEvidenceParseError.tooManyRecords(source, count)
-        }
-        return count
+        return framing.lineCount
     }
 
     /// Identity is required and must match exactly: a record missing an
@@ -629,40 +650,77 @@ enum AbsolutePriorEvidenceParser {
         return PriorMapPose2D(xM: xM, yM: yM, yawRad: yawRad)
     }
 
-    /// JSON booleans decode as CFBoolean and would otherwise pass the
-    /// NSNumber casts; JSON integers decode as NSNumber whose `as?
-    /// Double`/`as? Int` bridging is unreliable (integer-valued doubles
-    /// can fail or be treated as Bool). Cast through NSNumber and
-    /// exclude CFBoolean by type id.
+    /// V1R5 §6.1: strict finite JSON number via the shared scalar helper
+    /// (never a Bool, never non-finite).
     private static func finiteDouble(_ value: Any?) -> Double? {
-        guard let number = value as? NSNumber,
-              CFGetTypeID(number) != CFBooleanGetTypeID() else { return nil }
-        let double = number.doubleValue
-        guard double.isFinite else { return nil }
-        return double
+        return StrictJSONScalar.number(value)
     }
 
+    /// V1R5 §6.1 (review B-06): strict integer — a fractional number or a
+    /// numeric Bool can never pass (the V1R4 `NSNumber.intValue`
+    /// truncated 1.9 into 1).
     private static func intField(_ object: [String: Any], _ key: String) -> Int? {
-        guard let number = object[key] as? NSNumber,
-              CFGetTypeID(number) != CFBooleanGetTypeID() else { return nil }
-        return number.intValue
+        return StrictJSONScalar.integer(object[key])
     }
 
-    /// Nearest node by stamp (no delta gate) — online-structure binding
-    /// parity with the PC reader.
-    private static func nearestNode(
+    /// V1R5 §8.2: nearest node by stamp with the frozen delta and
+    /// second-candidate margin (binary search over pre-sorted stamps —
+    /// never a P×N linear scan). Returns nil when no node exists, the
+    /// best delta exceeds the gate, or the second candidate is too close.
+    private static func nearestNodeBinding(
         nodes: [AbsolutePriorEvidenceNode], stamp: Double
-    ) -> AbsolutePriorEvidenceNode? {
-        var best: AbsolutePriorEvidenceNode?
-        var bestDelta = Double.greatestFiniteMagnitude
-        for node in nodes {
-            let delta = abs(node.stamp - stamp)
-            if delta < bestDelta {
-                bestDelta = delta
-                best = node
+    ) -> (node: AbsolutePriorEvidenceNode, delta: Double, secondDelta: Double)? {
+        guard !nodes.isEmpty else { return nil }
+        let sortedNodes = nodes.sorted { $0.stamp < $1.stamp }
+        let stamps = sortedNodes.map { $0.stamp }
+        var lower = 0
+        var upper = stamps.count - 1
+        while lower < upper {
+            let mid = (lower + upper) / 2
+            if stamps[mid] < stamp {
+                lower = mid + 1
+            } else {
+                upper = mid
             }
         }
-        return best
+        var bestIndex = lower
+        var bestDelta = abs(stamps[lower] - stamp)
+        var secondDelta = Double.infinity
+        if lower > 0 {
+            let previous = abs(stamps[lower - 1] - stamp)
+            if previous < bestDelta {
+                secondDelta = bestDelta
+                bestIndex = lower - 1
+                bestDelta = previous
+            } else {
+                secondDelta = min(secondDelta, previous)
+            }
+        }
+        if lower + 1 < stamps.count {
+            let next = abs(stamps[lower + 1] - stamp)
+            if next < bestDelta {
+                secondDelta = bestDelta
+                bestIndex = lower + 1
+                bestDelta = next
+            } else {
+                secondDelta = min(secondDelta, next)
+            }
+        }
+        // A tie within the stamp epsilon is ambiguous (PC parity).
+        if bestIndex > 0,
+           abs(stamps[bestIndex - 1] - stamp) - bestDelta
+                <= AbsolutePriorEvidenceLimits.stampEpsilon {
+            return nil
+        }
+        if bestIndex + 1 < stamps.count,
+           abs(stamps[bestIndex + 1] - stamp) - bestDelta
+                <= AbsolutePriorEvidenceLimits.stampEpsilon {
+            return nil
+        }
+        if !secondDelta.isFinite {
+            secondDelta = bestDelta
+        }
+        return (sortedNodes[bestIndex], bestDelta, secondDelta)
     }
 
     /// Exact node-id lookup; a duplicate id is ambiguous (never occurs
@@ -676,29 +734,6 @@ enum AbsolutePriorEvidenceParser {
             found = node
         }
         return found
-    }
-
-    /// v2 frame-timestamp binding: nearest node by stamp; a tie within
-    /// the stamp epsilon is ambiguous and rejected (PC parity).
-    private static func nearestNodeBinding(
-        nodes: [AbsolutePriorEvidenceNode], stamp: Double
-    ) -> (node: AbsolutePriorEvidenceNode, delta: Double)? {
-        var best: AbsolutePriorEvidenceNode?
-        var bestDelta = Double.greatestFiniteMagnitude
-        var ambiguous = false
-        for node in nodes {
-            let delta = abs(node.stamp - stamp)
-            if delta < bestDelta {
-                bestDelta = delta
-                best = node
-                ambiguous = false
-            } else if abs(delta - bestDelta)
-                <= AbsolutePriorEvidenceLimits.stampEpsilon {
-                ambiguous = true
-            }
-        }
-        guard let node = best, !ambiguous else { return nil }
-        return (node, bestDelta)
     }
 
     private static func nodeNotFoundReason(
