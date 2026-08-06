@@ -4,6 +4,6 @@
   "base_branch": "mobile-only-v1r1-product-integration-closeout",
   "base_sha": "a9f8c46cda0bf975cf9bab3fd39183c5aee8efc3",
   "v1r1_head_sha": "a9f8c46cda0bf975cf9bab3fd39183c5aee8efc3",
-  "implementation_sha": "<FINAL_CODE_BUILD_TEST_SHA>",
-  "validation_sha": "<FINAL_GOVERNANCE_SHA>"
+  "implementation_sha": "bee865258f7d1973a9a7ebf6c9acde738fffe46e",
+  "validation_sha": "2544101386dcb88ba474816a0702d8556b86a74f"
 }
