@@ -39,8 +39,11 @@ class DocumentGovernanceTests(unittest.TestCase):
         self.assertRegex(wave["base_sha"], r"^[0-9a-f]{40}$")
         # P7R6A/P7R6B waves name their base branches with a lettered
         # sub-wave suffix (e.g. repair-v2-p7r6a-recovery-persisted-...).
+        # Mobile-Only product waves continue the line from a previous
+        # mobile-only closeout branch instead.
         self.assertRegex(
-            wave["base_branch"], r"^repair-v2-p[0-9]+(?:r[0-9]+[a-z]?)?-"
+            wave["base_branch"],
+            r"^(repair-v2-p[0-9]+(?:r[0-9]+[a-z]?)?-|mobile-only-)",
         )
         self.assertIn("PRODUCTION_READINESS_REVIEW.md", current)
         self.assertIn("当前有效", current)

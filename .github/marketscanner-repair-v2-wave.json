@@ -1,8 +1,9 @@
 {
-  "wave": "mobile-only-v1-end-to-end-integration",
-  "branch": "mobile-only-v1-end-to-end-integration",
-  "base_branch": "repair-v2-p7r6c-stable-input-total-json-closeout",
-  "base_sha": "04cdfe9a4c533908d1eb175ba84e3e39d2ca2654",
-  "p7r6c_implementation_sha": "04cdfe9a4c533908d1eb175ba84e3e39d2ca2654",
-  "implementation_sha": "f616b9711b860d8f473c94405420cb5d0ebf3c1b"
+  "wave": "mobile-only-v1r2-production-pipeline-and-device-readiness-closeout",
+  "branch": "mobile-only-v1r2-production-pipeline-and-device-readiness-closeout",
+  "base_branch": "mobile-only-v1r1-product-integration-closeout",
+  "base_sha": "a9f8c46cda0bf975cf9bab3fd39183c5aee8efc3",
+  "v1r1_head_sha": "a9f8c46cda0bf975cf9bab3fd39183c5aee8efc3",
+  "implementation_sha": "<FINAL_CODE_BUILD_TEST_SHA>",
+  "validation_sha": "<FINAL_GOVERNANCE_SHA>"
 }

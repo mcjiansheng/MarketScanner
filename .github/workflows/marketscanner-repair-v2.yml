@@ -417,6 +417,16 @@ jobs:
             app/ios/RTABMapApp/MobileResults/MobileResultExporter.swift \
             app/ios/RTABMapApp/MobileResults/MobileWorksheets.swift \
             app/ios/RTABMapApp/MobileResults/XLSXWorkbookWriter.swift \
+            app/ios/RTABMapApp/MobileOnlyWorkflow/MobileGraphReader.swift \
+            app/ios/RTABMapApp/MobileOnlyWorkflow/MobileMapLibrary.swift \
+            app/ios/RTABMapApp/MobileOnlyWorkflow/MobileNativeFactorGraph.swift \
+            app/ios/RTABMapApp/MobileOnlyWorkflow/MobileOnlyWorkflowCoordinator.swift \
+            app/ios/RTABMapApp/MobileOnlyWorkflow/MobileOnlyWorkflowError.swift \
+            app/ios/RTABMapApp/MobileOnlyWorkflow/MobileOnlyWorkflowState.swift \
+            app/ios/RTABMapApp/MobileOnlyWorkflow/MobileProcessingPipeline.swift \
+            app/ios/RTABMapApp/MobileOnlyWorkflow/MobileProcessingTaskStore.swift \
+            app/ios/RTABMapApp/MobileOnlyWorkflow/MobileResultLibrary.swift \
+            app/ios/RTABMapApp/MobileOnlyWorkflow/ProcessingResourceGovernor.swift \
       - name: Run platform-independent iOS contract test
         id: swift_contracts
         run: python3 -m unittest tools.PriorMap.tests.test_prior_map.IOSCoreContractTests tools.PriorMap.tests.test_c4_session_input_snapshot -v

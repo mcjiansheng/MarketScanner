@@ -38,3 +38,14 @@ NOT CI VERIFIED / NOT DEVICE SMOKE PASS / NOT SAM FIELD PASS / NOT PRODUCTION QU
 真实 App UI 与总协调器（Gate A）、严格导入/canonical v2（Gate B）、
 in-process RTAB-Map 图读取 bridge（Gate E）、流式原子 XLSX（Gate J）、
 Replay E2E、CI 分支匹配。当前状态与未执行项见 V1R1 文档。
+
+## V1R2 收口（见 MOBILE_ONLY_V1R2_PRODUCT_INTEGRATION.md）
+
+分支 `mobile-only-v1r2-production-pipeline-and-device-readiness-closeout`
+（基线 `a9f8c46`）关闭 V1R1 审查 REJECTED 的代码级缺口：
+Gate 0 编译/导入死锁修复、Gate A 正式工作流（后台执行/完整
+持久化/token 观察者/转换表）、Gate D 真实扫描接线（预览选点 +
+`MobileOnlyScanStarting` 真实启动）、共享 native core
+`core/MarketScannerFactorGraph`（iOS 与 PC oracle 同源，真实 DB 图
+→ 自适应骨架 → g2o robust Fast/一次受控 Deep → §11.5 质量门 →
+完整轨迹重建）、Gate L 资源治理。当前状态与未执行项见 V1R2 文档。
