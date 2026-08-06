@@ -105,13 +105,16 @@ struct ScanSegmentMetadata: Codable {
     let tagObservationBurstComplete: Bool?
 }
 
-/// A durable burst of price-tag observations (V1R4 §13.1): consecutive
-/// observations of the same barcode within a bounded time window, written to
-/// `tag_observation_bursts.jsonl` as one JSON object per line. Node IDs are
-/// not known on the phone (the observation schema binds through the node
-/// timebase); the PC parser resolves node bindings from
-/// `nodeTimebaseMin`/`nodeTimebaseMax` and validates the sidecar against the
-/// metadata watermarks fail-closed.
+/// A durable burst of price-tag observations (V1R4 §13.1, V1R5 §5.2):
+/// consecutive observations of the same barcode within a bounded time
+/// window, written to `tag_observation_bursts.jsonl` as one JSON object
+/// per line. Node IDs are not known on the phone (the observation schema
+/// binds through the node timebase); the PC parser resolves node
+/// bindings from `nodeTimebaseMin`/`nodeTimebaseMax` and validates the
+/// sidecar against the metadata watermarks fail-closed. `frameCount` is
+/// the number of UNIQUE frames (V1R5 §5.1 fixes the V1R4 first-frame
+/// double count); `frameIds` lets the parser verify uniqueness and the
+/// exact count without trusting the summary field.
 struct TagObservationBurstRecord: Codable {
     let format: String
     let version: Int
@@ -132,6 +135,9 @@ struct TagObservationBurstRecord: Codable {
     let rawSamples: [PriorMapTagPoint3D]
     let trackingSessionId: String
     let complete: Bool
+    /// V1R5 §5.2: per-frame identity (unique frame ids, exact count).
+    let frameIds: [String]
+    let frameSamples: [TagBurstFrameSample]
 
     enum CodingKeys: String, CodingKey {
         case format
@@ -153,6 +159,8 @@ struct TagObservationBurstRecord: Codable {
         case rawSamples = "raw_3d_samples"
         case trackingSessionId = "tracking_session_id"
         case complete
+        case frameIds = "frame_ids"
+        case frameSamples = "frame_samples"
     }
 }
 
@@ -221,8 +229,18 @@ private struct LocalizationRecordWriteResult {
     let errorReason: String?
 }
 
-/// V1R4 §13.1: in-flight aggregation state for one tag observation burst.
-/// Mutable and only touched under `localizationTransactionLock`.
+/// V1R4 §13.1 / V1R5 §5.1-§5.2: in-flight aggregation state for one tag
+/// observation burst. Mutable and only touched under
+/// `localizationTransactionLock`.
+///
+/// V1R5 fix (review B-01): `frameCount` counts UNIQUE frames only and
+/// starts at 0 — `init` consumes the first frame exclusively through
+/// `ingest`, so 1 real frame always yields `frameCount == 1` (the V1R4
+/// init set `frameCount = 1` AND called `ingest`, double-counting the
+/// first frame). A duplicate frame id inside one burst is rejected by
+/// `ingest` (it can never increase the frame count); the observation is
+/// still durably persisted but is not part of the verified burst and can
+/// therefore never reach ACCEPTED on the PC side.
 private struct PendingTagBurst {
     let burstId: String
     let sequence: Int
@@ -241,6 +259,9 @@ private struct PendingTagBurst {
     var localizationStateVotes: [String: Int]
     var viewVotes: (front: Int, back: Int, unknown: Int)
     var rawSamples: [PriorMapTagPoint3D]
+    /// V1R5 §5.2: unique frame ids in arrival order.
+    var frameIds: [String]
+    var frameSamples: [TagBurstFrameSample]
     let maxRawSamples: Int
 
     init(
@@ -257,7 +278,9 @@ private struct PendingTagBurst {
         self.trackingSessionId = observation.trackingSessionId
         self.firstFrameTimestamp = observation.frameTimestamp
         self.lastFrameTimestamp = observation.frameTimestamp
-        self.frameCount = 1
+        // V1R5 B-01: the burst starts EMPTY; ingest() below counts the
+        // first frame exactly once.
+        self.frameCount = 0
         self.nodeTimebaseMin = observation.nodeTimebaseFrameTimestamp
         self.nodeTimebaseMax = observation.nodeTimebaseFrameTimestamp
         self.depthInlierRatioSum = 0
@@ -266,11 +289,45 @@ private struct PendingTagBurst {
         self.localizationStateVotes = [:]
         self.viewVotes = (front: 0, back: 0, unknown: 0)
         self.rawSamples = []
+        self.frameIds = []
+        self.frameSamples = []
         self.maxRawSamples = maxRawSamples
         ingest(observation)
     }
 
-    mutating func ingest(_ observation: PriorMapTagObservationRecord) {
+    /// True when the observation carries a valid frame identity (both
+    /// burst_id and frame_id assigned at persistence time, V1R5 §5.4).
+    private static func frameIdentity(_ observation: PriorMapTagObservationRecord)
+        -> (burstId: String, frameId: String)? {
+        guard let burstId = observation.burstId,
+              !burstId.isEmpty,
+              let frameId = observation.frameId,
+              !frameId.isEmpty else {
+            return nil
+        }
+        return (burstId, frameId)
+    }
+
+    /// Ingests one observation. Returns false when the frame identity is
+    /// missing or duplicated inside this burst (the observation is then
+    /// NOT part of the verified burst; it stays in the observation
+    /// sidecar but can never be accepted). All aggregated fields are
+    /// updated through this single path (V1R5 §5.1).
+    mutating func ingest(_ observation: PriorMapTagObservationRecord) -> Bool {
+        guard let identity = Self.frameIdentity(observation),
+              identity.burstId == burstId else {
+            return false
+        }
+        // V1R5 §5.2: frame ids must be unique inside one burst.
+        guard !frameIds.contains(identity.frameId) else {
+            return false
+        }
+        frameIds.append(identity.frameId)
+        frameSamples.append(TagBurstFrameSample(
+            frameId: identity.frameId,
+            frameTimestamp: observation.frameTimestamp,
+            nodeTimebaseTimestamp: observation.nodeTimebaseFrameTimestamp,
+            observationId: observation.observationId))
         frameCount += 1
         lastFrameTimestamp = observation.frameTimestamp
         nodeTimebaseMin = min(nodeTimebaseMin, observation.nodeTimebaseFrameTimestamp)
@@ -303,6 +360,7 @@ private struct PendingTagBurst {
                 rawSamples.removeFirst(rawSamples.count - maxRawSamples)
             }
         }
+        return true
     }
 
     func depthQuality() -> Double {
@@ -354,7 +412,9 @@ private struct PendingTagBurst {
             localizationConfidenceMean: min(1, max(0, localizationConfidenceSum / Double(sampleCount))),
             rawSamples: rawSamples,
             trackingSessionId: trackingSessionId,
-            complete: complete)
+            complete: complete,
+            frameIds: frameIds,
+            frameSamples: frameSamples)
     }
 }
 
@@ -1918,10 +1978,18 @@ final class SupermarketScanSession {
         guard !hasLocalizationRequiredWriteFailure() else {
             return false
         }
+        // V1R5 §5.4: assign the durable burst/frame identity BEFORE the
+        // record is persisted so every observation carries its burst
+        // linkage. The frame id is the capture-frame timestamp (unique
+        // inside one burst; the burst ingest rejects duplicates).
+        let burstID = tagBurstIdentity(for: observation)
+        let frameID = String(format: "%.9f", observation.frameTimestamp)
+        let bound = observation.bindingBurst(
+            burstId: burstID, frameId: frameID)
         let result = appendLocalizationRecord(
-            observation,
+            bound,
             fileName: "tag_observations.jsonl",
-            expectedTrackingSessionId: observation.trackingSessionId)
+            expectedTrackingSessionId: bound.trackingSessionId)
         if !result.succeeded {
             let failures = [
                 "tag_observations.jsonl": result.errorReason ?? "write_failed"
@@ -1938,11 +2006,42 @@ final class SupermarketScanSession {
         // sidecar may enter burst aggregation. A burst flush failure marks
         // the session processing-ineligible fail-closed (watermark count
         // stays short and the finalization flag flips false).
-        ingestTagObservationBurst(observation)
+        ingestTagObservationBurst(bound)
         return true
     }
 
     // MARK: - Tag burst aggregation (V1R4 §13.1)
+
+    /// V1R5 §5.4: returns the burst identity an observation belongs to.
+    /// The observation joins the in-flight burst only when barcode /
+    /// symbology / floor / tracking session and the frame-time gap all
+    /// match; otherwise a NEW burst id is minted (the burst is created
+    /// later, after the record is durably persisted).
+    private func tagBurstIdentity(for observation: PriorMapTagObservationRecord)
+        -> String {
+        guard scanConfiguration.workflowMode == .priorMapLocalized,
+              observation.frameTimestamp.isFinite,
+              observation.nodeTimebaseFrameTimestamp.isFinite else {
+            // Non-localized workflow: the observation is stored without
+            // burst linkage (it can never reach ACCEPTED; V1R5 §5.4).
+            return UUID().uuidString
+        }
+        if let pending = pendingTagBurst {
+            let sameBarcode = pending.barcode == observation.payload
+                && pending.symbology == observation.symbology
+            // V1R5 review fix: a frame timestamp going BACKWARD (clock
+            // rollback) can never join the burst — the gap must be
+            // non-negative, otherwise first/last timestamps would drift
+            // and the burst time range would no longer contain its
+            // observations.
+            let gap = observation.frameTimestamp - pending.lastFrameTimestamp
+            let withinGap = gap >= 0 && gap <= tagBurstMaxGapSeconds
+            if sameBarcode, withinGap {
+                return pending.burstId
+            }
+        }
+        return UUID().uuidString
+    }
 
     private func ingestTagObservationBurst(
         _ observation: PriorMapTagObservationRecord
@@ -1955,10 +2054,12 @@ final class SupermarketScanSession {
         if var pending = pendingTagBurst {
             let sameBarcode = pending.barcode == observation.payload
                 && pending.symbology == observation.symbology
-            let withinGap = observation.frameTimestamp
-                - pending.lastFrameTimestamp <= tagBurstMaxGapSeconds
+            // V1R5 review fix: negative gaps (clock rollback) never join
+            // the burst (see `tagBurstIdentity`).
+            let gap = observation.frameTimestamp - pending.lastFrameTimestamp
+            let withinGap = gap >= 0 && gap <= tagBurstMaxGapSeconds
             if sameBarcode, withinGap {
-                pending.ingest(observation)
+                _ = pending.ingest(observation)
                 pendingTagBurst = pending
                 return
             }
@@ -1966,7 +2067,7 @@ final class SupermarketScanSession {
         }
         tagBurstSequence += 1
         pendingTagBurst = PendingTagBurst(
-            burstId: UUID().uuidString,
+            burstId: observation.burstId ?? UUID().uuidString,
             sequence: tagBurstSequence,
             observation: observation,
             maxRawSamples: tagBurstMaxRawSamples)

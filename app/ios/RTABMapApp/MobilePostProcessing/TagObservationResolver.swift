@@ -3,21 +3,52 @@ import Foundation
 /// Resolves raw tag observations against the final optimized trajectory
 /// and fuses multi-frame bursts into physical tag instances.
 ///
-/// Binding priority (per the product contract): explicit node ID with a
-/// matching timestamp, then nearest node timestamp, then the frame
-/// monotonic timestamp. Position propagation is
+/// V1R5 time-axis contract (review B-03): the parser already bound every
+/// observation to an EXACT snapshot-DB node (`boundNodeID`) on the node
+/// timebase axis. The resolver never re-guesses a nearest node and never
+/// compares relative session time against absolute node stamps. It uses
+/// two O(1) indexes built once per run:
+/// - `finalNodeByID`: id -> final optimized node pose;
+/// - `rawNodeStampByID`: id -> raw snapshot-DB node stamp (the axis the
+///   parser bound on).
+/// For each observation: O(1) lookup by `boundNodeID`, exact stamp
+/// re-verification (`|raw stamp - parser stamp| <= frozen delta`), then
+/// P_final = T_final_node * inverse(T_raw_node) * P_raw. The V1R4 5-second
+/// nearest-node fallback is deleted from the formal path.
+///
+/// Position propagation is
 /// P_final = T_final_node * inverse(T_raw_node) * P_raw; 3D is preserved
 /// internally, the business output is 2D. Same barcode on different
 /// shelves/floors stays distinct instances — barcodes are never globally
 /// deduplicated.
 enum TagObservationResolver {
+
+    /// O(1) lookup tables built once per run (V1R5 §6.5).
+    struct NodeIndex {
+        var finalNodeByID: [Int64: FinalNodePose]
+        var rawNodeStampByID: [Int64: Double]
+
+        init(
+            finalNodes: [FinalNodePose],
+            rawNodeStamps: [Int64: Double]
+        ) {
+            var finalByID: [Int64: FinalNodePose] = [:]
+            finalByID.reserveCapacity(finalNodes.count)
+            for node in finalNodes {
+                finalByID[node.id] = node
+            }
+            finalNodeByID = finalByID
+            rawNodeStampByID = rawNodeStamps
+        }
+    }
+
     struct RawObservation {
         var barcode: String
         var symbology: String
         var floorID: String
         /// Snapshot-DB node id produced by the strict parser's
-        /// node-timebase binding (V1R4 §13.2); never nil for resolved
-        /// observations.
+        /// node-timebase binding (V1R4 §13.2 / V1R5 §6.4); never nil for
+        /// resolved observations.
         var nodeID: Int64
         /// Node-timebase timestamp of the observation frame (the axis
         /// used for the strict binding); always present.
@@ -28,6 +59,10 @@ enum TagObservationResolver {
         var rawPositionM: (Double, Double, Double)? // x, y, z
         var rawNodePose: SE2Transform
         var trackingSessionID: String
+        /// V1R5 §5.4: verified-burst linkage (optional at resolution; the
+        /// burst gate is enforced by the quality policy).
+        var burstID: String?
+        var frameID: String?
     }
 
     struct FinalNodePose {
@@ -54,34 +89,45 @@ enum TagObservationResolver {
     enum ResolutionError: Error {
         case sessionMismatch
         case nodeMissing
+        case rawNodeStampMissing
         case timeDeltaTooLarge
-        case ambiguousNearbyNodes
         case staleAlignment
         case unlocalized
     }
 
-    static let maximumTimeDeltaSeconds = 5.0
-    static let maximumNodeAmbiguityDeltaSeconds = 0.5
+    /// Frozen binding re-verification delta (V1R5 §6.4: identical to the
+    /// parser gate `maximumNodeTimeDeltaSeconds = 1.0`). The V1R4 5.0 s
+    /// nearest-node fallback is deleted.
+    static let maximumTimeDeltaSeconds = 1.0
 
-    /// Resolves one raw observation against the final nodes.
+    /// Resolves one raw observation against the final nodes via the
+    /// O(1) node index (V1R5 §6.5). The parser-bound node id is the only
+    /// resolution path — there is no nearest-node fallback.
     static func resolve(
         observation: RawObservation,
-        finalNodes: [FinalNodePose],
+        index: NodeIndex,
         sessionID: String
     ) throws -> ResolvedObservation {
         guard observation.trackingSessionID == sessionID else {
             throw ResolutionError.sessionMismatch
         }
         // The strict parser bound the observation to an exact snapshot
-        // node (V1R4 §13.2); the same node id must exist in the final
-        // optimized reconstruction.
+        // node; the same node id must exist in the final optimized
+        // reconstruction.
         guard let position = observation.rawPositionM else {
             throw ResolutionError.unlocalized
         }
-        guard let node = finalNodes.first(where: { $0.id == observation.nodeID }) else {
+        guard let node = index.finalNodeByID[observation.nodeID] else {
             throw ResolutionError.nodeMissing
         }
-        let delta = abs(node.monotonicSeconds - observation.nodeTimestamp)
+        // Exact stamp re-verification against the raw snapshot node
+        // (V1R5 §6.4): the parser bound on the node-timebase axis, so the
+        // raw DB stamp must agree with the parser's stamp within the
+        // frozen delta. Relative-vs-absolute time comparison is gone.
+        guard let rawStamp = index.rawNodeStampByID[observation.nodeID] else {
+            throw ResolutionError.rawNodeStampMissing
+        }
+        let delta = abs(rawStamp - observation.nodeTimestamp)
         guard delta <= maximumTimeDeltaSeconds else {
             throw ResolutionError.timeDeltaTooLarge
         }

@@ -426,6 +426,14 @@ struct PriorMapTagObservationRecord: Codable {
     let floorId: String
     let trackingSessionId: String
     let needsReview: Bool
+    /// V1R5 §5.2/§5.4: durable burst linkage. `burstId` is the identity
+    /// of the verified burst this observation belongs to; `frameId` is
+    /// the capture-frame identity (unique inside one burst). Both are
+    /// assigned by `appendTagObservation` at persistence time — nil on
+    /// legacy records written before V1R5, which are never accepted for
+    /// ACCEPTED price tags (they cannot satisfy the verified-burst gate).
+    let burstId: String?
+    let frameId: String?
 
     enum CodingKeys: String, CodingKey {
         case format
@@ -461,6 +469,49 @@ struct PriorMapTagObservationRecord: Codable {
         case floorId = "floor_id"
         case trackingSessionId = "tracking_session_id"
         case needsReview = "needs_review"
+        case burstId = "burst_id"
+        case frameId = "frame_id"
+    }
+
+    /// V1R5: returns a copy bound to the durable burst/frame identity
+    /// assigned at persistence time. The original record never mutates.
+    func bindingBurst(burstId: String?, frameId: String?) -> PriorMapTagObservationRecord {
+        return PriorMapTagObservationRecord(
+            format: format,
+            version: version,
+            observationId: observationId,
+            timestamp: timestamp,
+            payload: payload,
+            symbology: symbology,
+            normalizedBounds: normalizedBounds,
+            frameTimestamp: frameTimestamp,
+            nodeTimebaseFrameTimestamp: nodeTimebaseFrameTimestamp,
+            nodeTimebaseOffsetSeconds: nodeTimebaseOffsetSeconds,
+            poseTimestampDeltaMs: poseTimestampDeltaMs,
+            alignmentVersion: alignmentVersion,
+            alignmentSnapshotTimestamp: alignmentSnapshotTimestamp,
+            alignmentAgeMs: alignmentAgeMs,
+            alignmentVersionLag: alignmentVersionLag,
+            alignmentFreshness: alignmentFreshness,
+            rawMapPosition: rawMapPosition,
+            measurementMethod: measurementMethod,
+            measurementConfidence: measurementConfidence,
+            depthSampleCount: depthSampleCount,
+            depthInlierCount: depthInlierCount,
+            depthInlierRatio: depthInlierRatio,
+            depthMedianM: depthMedianM,
+            depthMadM: depthMadM,
+            planeResidualM: planeResidualM,
+            surfaceNormalCamera: surfaceNormalCamera,
+            localizationState: localizationState,
+            localizationConfidence: localizationConfidence,
+            priorMapId: priorMapId,
+            priorMapSha256: priorMapSha256,
+            floorId: floorId,
+            trackingSessionId: trackingSessionId,
+            needsReview: needsReview,
+            burstId: burstId,
+            frameId: frameId)
     }
 }
 
