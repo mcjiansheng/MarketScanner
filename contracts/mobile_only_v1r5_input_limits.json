@@ -1,0 +1,171 @@
+{
+  "contract_version": 1,
+  "evidence_files": {
+    "clock_correlations.jsonl": {
+      "blank_line_policy": "reject",
+      "final_newline": true,
+      "identity_fields": [
+        "tracking_session_id"
+      ],
+      "max_file_bytes": 268435456,
+      "max_nesting_depth": 8,
+      "max_record_bytes": 1048576,
+      "max_records": 1000000,
+      "strict_bool": true,
+      "strict_integer": true,
+      "watermark_fields": [
+        "clockCorrelationCount",
+        "clockNodeBindingCount"
+      ]
+    },
+    "localization_constraints.jsonl": {
+      "blank_line_policy": "reject",
+      "final_newline": true,
+      "identity_fields": [
+        "priorMapId",
+        "priorMapSha256",
+        "trackingSessionId",
+        "floorId"
+      ],
+      "max_file_bytes": 67108864,
+      "max_nesting_depth": 8,
+      "max_record_bytes": 1048576,
+      "max_records": 100000,
+      "strict_bool": true,
+      "strict_integer": true,
+      "watermark_fields": []
+    },
+    "localization_trace.jsonl": {
+      "blank_line_policy": "reject",
+      "final_newline": true,
+      "identity_fields": [
+        "trackingSessionId",
+        "priorMapId",
+        "priorMapSha256",
+        "floorId"
+      ],
+      "max_file_bytes": 536870912,
+      "max_nesting_depth": 8,
+      "max_record_bytes": 1048576,
+      "max_records": 2000000,
+      "strict_bool": true,
+      "strict_integer": true,
+      "watermark_fields": [
+        "captureHealth.localizationTraceRecordCount"
+      ]
+    },
+    "manual_localization_events.jsonl": {
+      "blank_line_policy": "reject",
+      "final_newline": true,
+      "identity_fields": [
+        "prior_map_id",
+        "prior_map_sha256",
+        "tracking_session_id",
+        "floor_id"
+      ],
+      "max_file_bytes": 67108864,
+      "max_nesting_depth": 8,
+      "max_record_bytes": 1048576,
+      "max_records": 100000,
+      "strict_bool": true,
+      "strict_integer": true,
+      "watermark_fields": []
+    },
+    "metadata.json": {
+      "blank_line_policy": "n_a",
+      "final_newline": false,
+      "identity_fields": [
+        "storeId",
+        "floorId",
+        "priorMapId",
+        "priorMapSha256",
+        "trackingSessionId"
+      ],
+      "max_file_bytes": 16777216,
+      "max_nesting_depth": 8,
+      "max_record_bytes": 16777216,
+      "max_records": 1,
+      "strict_bool": true,
+      "strict_integer": true,
+      "watermark_fields": [
+        "finalized",
+        "clockCorrelationCount",
+        "clockNodeBindingCount",
+        "tagObservationBurstCount",
+        "tagObservationBurstLastID",
+        "tagObservationBurstComplete",
+        "localizationTraceRecordCount"
+      ]
+    },
+    "native_graph": {
+      "max_factors": 400000,
+      "max_priors": 100000,
+      "max_raw_nodes": 200000,
+      "max_skeleton_nodes": 200000,
+      "max_trajectory_rows": 200000
+    },
+    "result_package": {
+      "immutable": true,
+      "max_manifest_bytes": 4194304,
+      "max_package_files": 64,
+      "max_per_file_bytes": 2147483648,
+      "package_sha256": true,
+      "per_file_sha256": true
+    },
+    "tag_observation_bursts.jsonl": {
+      "blank_line_policy": "reject",
+      "final_newline": true,
+      "identity_fields": [
+        "tracking_session_id",
+        "floor_id"
+      ],
+      "max_file_bytes": 268435456,
+      "max_nesting_depth": 8,
+      "max_record_bytes": 4194304,
+      "max_records": 200000,
+      "strict_bool": true,
+      "strict_integer": true,
+      "watermark_fields": [
+        "tagObservationBurstCount",
+        "tagObservationBurstLastID",
+        "tagObservationBurstComplete"
+      ]
+    },
+    "tag_observations.jsonl": {
+      "blank_line_policy": "reject",
+      "final_newline": true,
+      "identity_fields": [
+        "prior_map_id",
+        "prior_map_sha256",
+        "tracking_session_id",
+        "floor_id"
+      ],
+      "max_file_bytes": 268435456,
+      "max_nesting_depth": 8,
+      "max_record_bytes": 1048576,
+      "max_records": 200000,
+      "strict_bool": true,
+      "strict_integer": true,
+      "watermark_fields": [
+        "tagObservationBurstCount",
+        "tagObservationBurstLastID",
+        "tagObservationBurstComplete"
+      ]
+    },
+    "xlsx_workbook": {
+      "crc_and_size_verified": true,
+      "exact_four_sheets": true,
+      "max_file_bytes": 2147483648,
+      "max_sheet_rows": 500000,
+      "no_formula": true
+    }
+  },
+  "product_scale": {
+    "max_clock_node_bindings": 60000,
+    "max_raw_nodes": 60000,
+    "max_tag_observations": 200000,
+    "scan_hours_upper_bound": 48
+  },
+  "rationale": "Limits derive from the qualified store ceiling (60k nodes / 200k observations): each gate = real per-record bytes \u00d7 product maximum \u00d7 safety factor. The parser streams via 64 KiB chunks so large gates do not imply large memory.",
+  "wave": "mobile-only-v1r5-field-qualification-integrity-scale-closeout"
+}

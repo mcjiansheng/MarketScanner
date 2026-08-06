@@ -1,9 +1,9 @@
 {
-  "wave": "mobile-only-v1r4-field-readiness-evidence-clock-tag-native-closeout",
-  "branch": "mobile-only-v1r4-field-readiness-evidence-clock-tag-native-closeout",
-  "base_branch": "mobile-only-v1r3-evidence-integrity-native-correctness-and-device-qualification-closeout",
-  "base_sha": "8a524e0b6ecfa2755c3db7118212621fb464d8d8",
-  "v1r3_head_sha": "8a524e0b6ecfa2755c3db7118212621fb464d8d8",
+  "wave": "mobile-only-v1r5-field-qualification-integrity-scale-closeout",
+  "branch": "mobile-only-v1r5-field-qualification-integrity-scale-closeout",
+  "base_branch": "mobile-only-v1r4-field-readiness-evidence-clock-tag-native-closeout",
+  "base_sha": "b7598fb623e677b605466afd6afef6f43fe5b735",
+  "v1r4_head_sha": "b7598fb623e677b605466afd6afef6f43fe5b735",
   "implementation_sha": "<FINAL_PRODUCTION_AND_TEST_SHA>",
   "validation_sha": "<FINAL_DOCS_GOVERNANCE_SHA>"
 }
