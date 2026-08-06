@@ -98,40 +98,61 @@ enum MobileProcessingPipeline {
         let tagObservations = try readTagObservations(in: snapshot.snapshotDirectory)
         let tagNodeIDs = Array(Set(tagObservations.compactMap { $0.nodeID })).sorted()
 
+        // Accepted prior-map absolute constraints (§6.2): identity-bound,
+        // finite, node-bound evidence only.
+        let absolutePriors = parseAbsolutePriors(
+            in: snapshot.snapshotDirectory,
+            priorMapID: request.priorMap.priorMapID,
+            priorMapSHA256: request.priorMap.packageSHA256,
+            trackingSessionID: request.trackingSessionID)
+
         // --- Fast Path: shared native factor-graph core (§2 / §11) -----
         // Real RTAB-Map nodes/links from the immutable snapshot DB drive
         // the run; the Swift solver is a host-test reference only.
         progress(0.30, "快速路径优化")
         let startRun = Date()
+        let nativeRequest = MobileNativeGraphRequest(
+            databaseURL: snapshotDatabase,
+            tagNodeIDs: tagNodeIDs,
+            absolutePriors: absolutePriors,
+            priorMapID: request.priorMap.priorMapID,
+            priorMapSHA256: request.priorMap.packageSHA256,
+            trackingSessionID: request.trackingSessionID,
+            projectionPolicyVersion: 1,
+            maxWallSeconds: 600)
         var nativeOutcome: MobileNativeGraphOutcome
         var processingPath = "fast"
         do {
             nativeOutcome = try MobileNativeFactorGraphGateway.runFast(
-                databaseURL: snapshotDatabase,
-                tagNodeIDs: tagNodeIDs,
+                request: nativeRequest,
                 isCancelled: isCancelled)
         } catch let error as MobileNativeFactorGraphError {
             throw MobileOnlyWorkflowError.processingFailed("Fast Path 求解失败：\(error.localizedDescription)")
         }
         guard !nativeOutcome.trajectory.isEmpty else { throw PipelineError.emptyGraph }
 
-        // One controlled Deep run after a Fast RECOVERABLE_FAIL (§12).
+        // One controlled full-graph optimization after a Fast
+        // RECOVERABLE_FAIL (§13). This is NOT a sensor reprocess; when it
+        // still cannot PASS the session needs a rescan, never a publish.
         if nativeOutcome.disposition == .recoverableFail {
             guard !isCancelled() else { throw MobileOnlyWorkflowError.cancelled }
             try ProcessingResourceGovernor.checkBudget(stage: "deep")
+            var fullGraphRequest = nativeRequest
+            fullGraphRequest.maxWallSeconds = 1800
             do {
-                let deepOutcome = try MobileNativeFactorGraphGateway.runDeep(
-                    databaseURL: snapshotDatabase,
-                    tagNodeIDs: tagNodeIDs,
+                let fullOutcome = try MobileNativeFactorGraphGateway.runFullGraph(
+                    request: fullGraphRequest,
                     isCancelled: isCancelled)
-                nativeOutcome = deepOutcome
-                processingPath = "deep"
+                nativeOutcome = fullOutcome
+                processingPath = "full_graph_optimization"
             } catch let error as MobileNativeFactorGraphError {
-                throw MobileOnlyWorkflowError.processingFailed("Deep Path 求解失败：\(error.localizedDescription)")
+                throw MobileOnlyWorkflowError.processingFailed("全图优化失败：\(error.localizedDescription)")
             }
         }
 
         // Strict quality gate: only PASS publishes (§2 / §11.5).
+        // LOCAL_FRAME_ONLY means no accepted global anchor: diagnostics
+        // only, never PriceTags/DevicePositions (§6.4).
         guard nativeOutcome.disposition == .pass else {
             throw PipelineError.qualityGateRejected(
                 "\(processingPath) disposition=\(nativeOutcome.disposition.reportValue)")
@@ -139,62 +160,52 @@ enum MobileProcessingPipeline {
         let graphQualityPassed = true
         guard !isCancelled() else { throw MobileOnlyWorkflowError.cancelled }
 
-        // --- Clock mapping on the native UTC stamp axis (§13) ----------
-        // DB node stamps ARE UTC seconds, so the reconstructed trajectory
-        // carries its own exact clock axis: utc(m) = startStamp + m. The
-        // trace sidecars still supply the lost intervals (mapped onto the
-        // same axis through their node-timebase UTC values).
+        // --- Clock mapping on the native UTC stamp axis (§7/§13) -------
         progress(0.40, "构建时钟映射")
         let traces = try readTrace(in: snapshot.snapshotDirectory)
-
-        // --- Final trajectory (1 Hz) from the native reconstruction -----
-        progress(0.50, "构建最终轨迹")
         let sessionStartStamp = nativeOutcome.trajectory.first?.stamp ?? finalizedAtUnix - 1
+        // Session end is the LAST COLLECTED stamp (§7.5) — never the
+        // finalization wall-clock.
         let sessionEndStamp = max(
             nativeOutcome.trajectory.last?.stamp ?? sessionStartStamp,
             sessionStartStamp + 1)
-        // Fail closed on a pathological time span (never emit billions of
-        // rows from an inconsistent clock basis).
-        let sessionSpan = max(finalizedAtUnix, sessionEndStamp) - sessionStartStamp
+        let sessionSpan = sessionEndStamp - sessionStartStamp
         guard sessionSpan >= 0, sessionSpan <= 48 * 3600 else {
             throw MobileOnlyWorkflowError.invalidState(
                 "session time span inconsistent: \(sessionSpan) seconds")
         }
-        let timezoneID = TimeZone.current.identifier
-        let timezoneOffset = TimeZone.current.secondsFromGMT()
-        let utcMapper = MonotonicUTCMapper(records: [
-            ClockCorrelationRecord.make(
-                trackingSessionID: request.trackingSessionID,
-                monotonicSeconds: 0,
-                utcUnixSeconds: sessionStartStamp,
-                timezoneID: timezoneID,
-                utcOffsetSeconds: timezoneOffset,
-                reason: "native_stamp_axis_start"),
-            ClockCorrelationRecord.make(
-                trackingSessionID: request.trackingSessionID,
-                monotonicSeconds: sessionEndStamp - sessionStartStamp,
-                utcUnixSeconds: sessionEndStamp,
-                timezoneID: timezoneID,
-                utcOffsetSeconds: timezoneOffset,
-                reason: "native_stamp_axis_end"),
-        ])
-        let finalNodes = nativeOutcome.trajectory.map {
+        let utcMapper = buildClockMapper(
+            snapshotDirectory: snapshot.snapshotDirectory,
+            sessionStartStamp: sessionStartStamp,
+            sessionEndStamp: sessionEndStamp)
+
+        // --- Final trajectory (1 Hz) from the native reconstruction -----
+        progress(0.50, "构建最终轨迹")
+        // Rows that are not publish-eligible (fragment components, gaps,
+        // other floors) become UNAVAILABLE intervals — never interpolated
+        // across (§15.2).
+        let eligibilityLost = lostIntervalsFromEligibility(
+            rows: nativeOutcome.trajectory, sessionStartStamp: sessionStartStamp)
+        let finalNodes = nativeOutcome.trajectory.filter { $0.publishEligible }.map {
             FinalTrajectory.Node(
                 id: $0.id,
                 monotonicSeconds: $0.stamp - sessionStartStamp,
                 xM: $0.xM,
                 yM: $0.yM,
                 yawRad: $0.yawRad,
-                uncertaintyM: 0.0,
+                uncertaintyM: $0.uncertaintyM ?? 0.0,
                 floorID: floorID)
         }
+        guard !finalNodes.isEmpty else {
+            throw PipelineError.qualityGateRejected("no publish-eligible trajectory nodes")
+        }
         let lostIntervals = buildLostIntervals(
-            from: traces, sessionStartStamp: sessionStartStamp)
+            from: traces, sessionStartStamp: sessionStartStamp) + eligibilityLost
         let trajectoryInput = FinalTrajectory.Input(
             nodes: finalNodes,
             lostIntervals: lostIntervals,
             sessionStartUTC: sessionStartStamp,
-            sessionEndUTC: max(finalizedAtUnix, sessionEndStamp))
+            sessionEndUTC: sessionEndStamp)
         let devicePositions = FinalTrajectory.resample(
             input: trajectoryInput,
             utcMapper: utcMapper,
@@ -570,6 +581,225 @@ enum MobileProcessingPipeline {
                 fromMonotonic: start,
                 toMonotonic: traces.last.map { axisTime($0) } ?? start,
                 reason: currentReason))
+        }
+        return intervals
+    }
+
+    // MARK: - Absolute prior evidence (§6.2)
+
+    /// Localization-sigma policy bounds (§6.3): information must derive
+    /// from recorded uncertainty, never an undocumented constant.
+    private static let minimumSigmaM = 0.02
+    private static let maximumSigmaM = 5.0
+    private static let manualSigmaM = 0.10
+    private static let manualSigmaYawRad = 0.05
+
+    static func informationFromSigmas(sigmaXM: Double, sigmaYM: Double, sigmaYawRad: Double) -> [Double]? {
+        guard sigmaXM.isFinite, sigmaYM.isFinite, sigmaYawRad.isFinite,
+              sigmaXM > 0, sigmaYM > 0, sigmaYawRad > 0 else { return nil }
+        let cx = min(max(sigmaXM, minimumSigmaM), maximumSigmaM)
+        let cy = min(max(sigmaYM, minimumSigmaM), maximumSigmaM)
+        let cyaw = min(max(sigmaYawRad, 0.005), 1.0)
+        return [1.0 / (cx * cx), 0, 0,
+                0, 1.0 / (cy * cy), 0,
+                0, 0, 1.0 / (cyaw * cyaw)]
+    }
+
+    /// Parses accepted absolute prior-map constraints from the snapshot
+    /// evidence sidecars (§6.2): localization constraints, converged
+    /// recovery episodes and manual resets. Every record must be
+    /// accepted, identity-consistent, finite and node-bound; anything
+    /// else is skipped with an audit count (never applied).
+    static func parseAbsolutePriors(
+        in snapshotDirectory: URL,
+        priorMapID: String,
+        priorMapSHA256: String,
+        trackingSessionID: String
+    ) -> [MobileAbsolutePrior] {
+        var priors: [MobileAbsolutePrior] = []
+
+        func identityMatches(_ object: [String: Any]) -> Bool {
+            let recordMapID = object["priorMapId"] as? String
+                ?? object["prior_map_id"] as? String
+            let recordSession = object["trackingSessionId"] as? String
+                ?? object["tracking_session_id"] as? String
+            if let recordMapID = recordMapID, recordMapID != priorMapID { return false }
+            if let recordSession = recordSession, recordSession != trackingSessionID { return false }
+            return true
+        }
+
+        func appendPrior(
+            nodeID: Int64, xM: Double, yM: Double, yawRad: Double,
+            information: [Double], kind: Int32, episodeID: Int64
+        ) {
+            guard nodeID > 0, xM.isFinite, yM.isFinite, yawRad.isFinite else { return }
+            priors.append(MobileAbsolutePrior(
+                nodeID: nodeID, mapXM: xM, mapYM: yM, mapYawRad: yawRad,
+                information3x3: information, kind: kind, episodeID: episodeID))
+        }
+
+        func parseSidecar(_ name: String, handler: ([String: Any]) -> Void) {
+            let url = snapshotDirectory.appendingPathComponent(name)
+            guard let content = try? String(contentsOf: url, encoding: .utf8) else { return }
+            for line in content.split(separator: "\n") {
+                guard let data = line.data(using: .utf8),
+                      let object = try? StrictJSONDocumentParser.object(
+                          from: data,
+                          limits: StrictJSONDocumentLimits(maximumBytes: data.count + 1)) as? [String: Any]
+                else { continue }
+                handler(object)
+            }
+        }
+
+        // 1) Localization constraints (accepted matcher results).
+        parseSidecar("localization_constraints.jsonl") { object in
+            let accepted = object["accepted"] as? Bool
+                ?? ((object["disposition"] as? String) == "accepted")
+            guard accepted, identityMatches(object) else { return }
+            guard let nodeID = (object["nodeId"] as? NSNumber)?.int64Value
+                ?? (object["node_id"] as? NSNumber)?.int64Value else { return }
+            let pose = object["mapPose"] as? [String: Any]
+                ?? object["map_pose"] as? [String: Any]
+            guard let pose = pose,
+                  let xM = pose["x_m"] as? Double,
+                  let yM = pose["y_m"] as? Double,
+                  let yawRad = pose["yaw_rad"] as? Double else { return }
+            let sigmaX = object["translationSigmaM"] as? Double
+                ?? object["translation_sigma_m"] as? Double ?? 0.10
+            let sigmaYaw = object["yawSigmaRad"] as? Double
+                ?? object["yaw_sigma_rad"] as? Double ?? 0.05
+            guard let information = informationFromSigmas(
+                sigmaXM: sigmaX, sigmaYM: sigmaX, sigmaYawRad: sigmaYaw) else { return }
+            appendPrior(
+                nodeID: nodeID, xM: xM, yM: yM, yawRad: yawRad,
+                information: information, kind: 0,
+                episodeID: (object["episodeId"] as? NSNumber)?.int64Value ?? 0)
+        }
+
+        // 2) Converged recovery episodes (bounded correction applied).
+        parseSidecar("localization_recovery_events.jsonl") { object in
+            let result = object["result"] as? String ?? object["outcome"] as? String
+            guard result == "converged", identityMatches(object) else { return }
+            guard let nodeID = (object["nodeId"] as? NSNumber)?.int64Value
+                ?? (object["node_id"] as? NSNumber)?.int64Value else { return }
+            let pose = object["mapPose"] as? [String: Any]
+                ?? object["correctedMapPose"] as? [String: Any]
+            guard let pose = pose,
+                  let xM = pose["x_m"] as? Double,
+                  let yM = pose["y_m"] as? Double,
+                  let yawRad = pose["yaw_rad"] as? Double else { return }
+            // Recovery quality is weaker than direct localization.
+            guard let information = informationFromSigmas(
+                sigmaXM: 0.30, sigmaYM: 0.30, sigmaYawRad: 0.15) else { return }
+            appendPrior(
+                nodeID: nodeID, xM: xM, yM: yM, yawRad: yawRad,
+                information: information, kind: 1,
+                episodeID: (object["episodeId"] as? NSNumber)?.int64Value
+                    ?? (object["episode_id"] as? NSNumber)?.int64Value ?? 0)
+        }
+
+        // 3) Manual resets (fixed policy, §6.3).
+        parseSidecar("manual_localization_events.jsonl") { object in
+            let accepted = object["accepted"] as? Bool ?? true
+            guard accepted, identityMatches(object) else { return }
+            guard let nodeID = (object["nodeId"] as? NSNumber)?.int64Value
+                ?? (object["node_id"] as? NSNumber)?.int64Value else { return }
+            let pose = object["mapPose"] as? [String: Any]
+                ?? object["map_pose"] as? [String: Any]
+            guard let pose = pose,
+                  let xM = pose["x_m"] as? Double,
+                  let yM = pose["y_m"] as? Double,
+                  let yawRad = pose["yaw_rad"] as? Double else { return }
+            guard let information = informationFromSigmas(
+                sigmaXM: manualSigmaM, sigmaYM: manualSigmaM,
+                sigmaYawRad: manualSigmaYawRad) else { return }
+            appendPrior(
+                nodeID: nodeID, xM: xM, yM: yM, yawRad: yawRad,
+                information: information, kind: 2, episodeID: 0)
+        }
+
+        return priors
+    }
+
+    // MARK: - Clock evidence (§7)
+
+    /// Builds the monotonic(=stamp-sessionStart) -> UTC mapper from the
+    /// recorded clock correlations when present (scan-time timezone and
+    /// jump isolation, §7.4/§7.6); otherwise falls back to the identity
+    /// stamp axis with the processing timezone.
+    static func buildClockMapper(
+        snapshotDirectory: URL,
+        sessionStartStamp: Double,
+        sessionEndStamp: Double
+    ) -> MonotonicUTCMapper {
+        let clockURL = snapshotDirectory.appendingPathComponent("clock_correlations.jsonl")
+        if let content = try? String(contentsOf: clockURL, encoding: .utf8) {
+            var records: [ClockCorrelationRecord] = []
+            for line in content.split(separator: "\n") {
+                guard let data = line.data(using: .utf8),
+                      let object = try? StrictJSONDocumentParser.object(
+                          from: data,
+                          limits: StrictJSONDocumentLimits(maximumBytes: data.count + 1)) as? [String: Any],
+                      let utc = object["utc_unix_seconds"] as? Double,
+                      utc.isFinite
+                else { continue }
+                // Monotonic axis is the node-stamp axis; the correlation
+                // records it directly when available.
+                let monotonic = (object["monotonic_seconds"] as? Double) ?? (utc - sessionStartStamp)
+                guard monotonic.isFinite else { continue }
+                records.append(ClockCorrelationRecord.make(
+                    trackingSessionID: object["tracking_session_id"] as? String ?? "",
+                    monotonicSeconds: monotonic,
+                    utcUnixSeconds: utc,
+                    timezoneID: object["timezone_id"] as? String ?? TimeZone.current.identifier,
+                    utcOffsetSeconds: object["utc_offset_seconds"] as? Int
+                        ?? TimeZone.current.secondsFromGMT(),
+                    reason: object["reason"] as? String ?? "periodic"))
+            }
+            if records.count >= 2 {
+                return MonotonicUTCMapper(records: records)
+            }
+        }
+        // Fallback: identity axis on the UTC stamps.
+        let timezoneID = TimeZone.current.identifier
+        let offset = TimeZone.current.secondsFromGMT()
+        return MonotonicUTCMapper(records: [
+            ClockCorrelationRecord.make(
+                trackingSessionID: "", monotonicSeconds: 0,
+                utcUnixSeconds: sessionStartStamp,
+                timezoneID: timezoneID, utcOffsetSeconds: offset,
+                reason: "native_stamp_axis_start"),
+            ClockCorrelationRecord.make(
+                trackingSessionID: "", monotonicSeconds: sessionEndStamp - sessionStartStamp,
+                utcUnixSeconds: sessionEndStamp,
+                timezoneID: timezoneID, utcOffsetSeconds: offset,
+                reason: "native_stamp_axis_end"),
+        ])
+    }
+
+    /// Lost intervals covering trajectory rows that are not publish
+    /// eligible (fragment components / gaps / other floors). Runs of
+    /// ineligible rows become one interval on the stamp axis (§15.2).
+    static func lostIntervalsFromEligibility(
+        rows: [MobileNativeTrajectoryRow],
+        sessionStartStamp: Double
+    ) -> [FinalTrajectory.LostInterval] {
+        var intervals: [FinalTrajectory.LostInterval] = []
+        var start: Double?
+        for row in rows {
+            if !row.publishEligible {
+                if start == nil { start = row.stamp - sessionStartStamp }
+            } else if let s = start {
+                intervals.append(FinalTrajectory.LostInterval(
+                    fromMonotonic: s, toMonotonic: row.stamp - sessionStartStamp,
+                    reason: "unanchored_component"))
+                start = nil
+            }
+        }
+        if let s = start, let last = rows.last {
+            intervals.append(FinalTrajectory.LostInterval(
+                fromMonotonic: s, toMonotonic: last.stamp - sessionStartStamp,
+                reason: "unanchored_component"))
         }
         return intervals
     }

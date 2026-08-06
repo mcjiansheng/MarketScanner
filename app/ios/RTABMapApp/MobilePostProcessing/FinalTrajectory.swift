@@ -270,7 +270,7 @@ enum FinalTrajectory {
             mapXM: SourceGeometry.rounded(position.xM),
             mapYM: SourceGeometry.rounded(position.yM),
             yawDeg: SourceGeometry.rounded(position.yawRad * 180.0 / Double.pi),
-            positionStatus: "ACCEPTED",
+            positionStatus: "AVAILABLE",
             positionSource: "final_trajectory",
             beforeNodeID: position.beforeNodeID,
             afterNodeID: position.afterNodeID,

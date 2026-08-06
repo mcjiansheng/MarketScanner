@@ -2914,7 +2914,7 @@ func makePositions(_ count: Int) -> [FinalTrajectory.DevicePositionRow] {
             timezoneID: "Asia/Shanghai", utcOffset: 28_800,
             sessionElapsedS: Double(index), storeID: "s1", floorID: "1",
             mapXM: 1.5, mapYM: -2.5, yawDeg: 90.0,
-            positionStatus: "ACCEPTED", positionSource: "final_trajectory",
+            positionStatus: "AVAILABLE", positionSource: "final_trajectory",
             beforeNodeID: Int64(index), afterNodeID: Int64(index + 1),
             interpolationRatio: 0.5, localizationConfidence: 0.9,
             estimatedUncertaintyM: 0.05, trackingState: "tracking",
@@ -5831,9 +5831,9 @@ do {
         rows.count == 3,
         "T1 resample must emit one row per UTC second, got \(rows.count)")
     require(
-        rows[0].positionStatus == "ACCEPTED"
+        rows[0].positionStatus == "AVAILABLE"
             && rows[0].unixTimeS == 1_785_762_000,
-        "T1 first row must be ACCEPTED at the start second")
+        "T1 first row must be AVAILABLE at the start second")
     require(
         rows[0].timezoneID == "Asia/Shanghai" && rows[0].utcOffset == 28_800,
         "T1 row must carry the local timezone and offset")
@@ -5854,7 +5854,7 @@ do {
     // Second 1785762002 -> monotonic 102.0, between node 2 (101.5) and
     // node 3 (102.5): ratio 0.5 -> x=1, y=0.5, yaw=45 deg.
     require(
-        rows[2].positionStatus == "ACCEPTED"
+        rows[2].positionStatus == "AVAILABLE"
             && close(rows[2].mapXM ?? -1, 1.0)
             && close(rows[2].mapYM ?? -1, 0.5),
         "T1 third row must interpolate across nodes 2->3")
@@ -5898,7 +5898,7 @@ do {
         priorMapID: "m", priorMapSha256: "a",
         trackingSessionID: "s", appGitSHA: "g")
     require(
-        rows.count == 2 && rows[0].positionStatus == "ACCEPTED",
+        rows.count == 2 && rows[0].positionStatus == "AVAILABLE",
         "T3 yaw interpolation must produce accepted rows")
     // Shortest arc from +3.0 to -3.0 passes through +pi (not through 0).
     let interpolatedYaw = (rows[0].yawDeg ?? 0) * Double.pi / 180.0
@@ -5946,16 +5946,16 @@ do {
         lostRows.allSatisfy { $0.element.positionStatus == "UNAVAILABLE" },
         "T4 lost-interval seconds must be UNAVAILABLE")
     // Seconds 8 falls between nodes at monotonic 1 and 9 (8s gap > 3s)
-    // -> UNAVAILABLE; second 9 lands exactly on node 3 -> ACCEPTED.
+    // -> UNAVAILABLE; second 9 lands exactly on node 3 -> AVAILABLE.
     require(
         rows[8].positionStatus == "UNAVAILABLE",
         "T4 over-long node gaps must be UNAVAILABLE")
     require(
-        rows[9].positionStatus == "ACCEPTED",
-        "T4 a second landing on a node after a gap must be ACCEPTED")
+        rows[9].positionStatus == "AVAILABLE",
+        "T4 a second landing on a node after a gap must be AVAILABLE")
     require(
-        rows[0].positionStatus == "ACCEPTED",
-        "T4 connected seconds must stay ACCEPTED")
+        rows[0].positionStatus == "AVAILABLE",
+        "T4 connected seconds must stay AVAILABLE")
     // Second 1 (monotonic 1) has no upper node within the interpolation
     // window (node at 9 is 8s away) -> UNAVAILABLE.
     require(
@@ -6749,11 +6749,33 @@ do {
     }
     try traces.data(using: .utf8)!.write(
         to: session.appendingPathComponent("localization_trace.jsonl"))
-    for name in ["localization_constraints.jsonl", "localization_events.jsonl",
+    for name in ["localization_events.jsonl",
                  "manual_localization_events.jsonl", "tag_observations.jsonl",
                  "localization_recovery_events.jsonl"] {
         try Data().write(to: session.appendingPathComponent(name))
     }
+    // Accepted prior-map absolute constraints (§6.2): the E2E must carry
+    // identity-bound evidence, otherwise the quality gate is allowed to
+    // return LOCAL_FRAME_ONLY only.
+    var constraints = ""
+    for index in 0..<6 {
+        let record: [String: Any] = [
+            "format": "MarketScannerLocalizationConstraint",
+            "version": 1,
+            "accepted": true,
+            "nodeId": index + 1,
+            "mapPose": [
+                "x_m": Double(index) * 1.0, "y_m": 0.0, "yaw_rad": 0.0,
+            ],
+            "translationSigmaM": 0.05,
+            "yawSigmaRad": 0.03,
+            "trackingSessionId": "E2E-SESSION",
+        ]
+        let recordData = try CanonicalJSONEncoder.encode(record)
+        constraints += String(data: recordData, encoding: .utf8)! + "\n"
+    }
+    try constraints.data(using: .utf8)!.write(
+        to: session.appendingPathComponent("localization_constraints.jsonl"))
     try Data("[]".utf8).write(
         to: session.appendingPathComponent("localized_price_tags.json"))
     try Data("e2e-fake-db".utf8).write(
@@ -6764,8 +6786,8 @@ do {
     // V1R2: the host suite wires the deterministic reference
     // implementation of the factor-graph gateway; the real app wires the
     // shared native core (`MobileNativeFactorGraph.wireIntoGateway()`).
-    let referenceImplementation: MobileNativeFactorGraphGateway.RunImplementation = { databaseURL, _, _, _ in
-        let snapshotDirectory = databaseURL.deletingLastPathComponent()
+    let referenceImplementation: MobileNativeFactorGraphGateway.RunImplementation = { request, _ in
+        let snapshotDirectory = request.databaseURL.deletingLastPathComponent()
         let traceURL = snapshotDirectory.appendingPathComponent("localization_trace.jsonl")
         var rows: [MobileNativeTrajectoryRow] = []
         if let content = try? String(contentsOf: traceURL, encoding: .utf8) {
@@ -6787,21 +6809,25 @@ do {
                     stamp: timestamp + offset,
                     xM: pose["x_m"] as? Double ?? 0,
                     yM: pose["y_m"] as? Double ?? 0,
-                    yawRad: pose["yaw_rad"] as? Double ?? 0))
+                    yawRad: pose["yaw_rad"] as? Double ?? 0,
+                    mapID: 0,
+                    componentID: 0,
+                    publishEligible: true,
+                    uncertaintyM: 0.05))
             }
         }
         guard !rows.isEmpty else {
             throw MobileNativeFactorGraphError.nativeFailed("reference graph is empty")
         }
         return MobileNativeGraphOutcome(
-            disposition: .pass,
-            qualityJSON: "{\"format\": \"MarketScannerGraphQuality\", \"version\": 1, "
-                + "\"path\": \"host-reference\", \"disposition\": \"PASS\"}",
+            disposition: request.absolutePriors.isEmpty ? .localFrameOnly : .pass,
+            qualityJSON: "{\"format\": \"MarketScannerGraphQuality\", \"version\": 2, "
+                + "\"path\": \"host-reference\", \"disposition\": \"" + (request.absolutePriors.isEmpty ? "LOCAL_FRAME_ONLY" : "PASS") + "\"}",
             trajectory: rows,
             skeletonIDs: rows.map { $0.id })
     }
     MobileNativeFactorGraphGateway.runFastImplementation = referenceImplementation
-    MobileNativeFactorGraphGateway.runDeepImplementation = referenceImplementation
+    MobileNativeFactorGraphGateway.runFullGraphImplementation = referenceImplementation
 
     MobileProcessingTaskStore.rootOverride = temporary.appendingPathComponent("Tasks")
     MobileResultLibrary.rootOverride = temporary.appendingPathComponent("Results")
