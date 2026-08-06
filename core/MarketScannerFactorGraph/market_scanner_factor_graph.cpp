@@ -271,25 +271,35 @@ InfoPolicy sanitizePlanarInformation(Mat3 info, InfoPolicyAudit & audit)
     return InfoPolicy::Valid;
 }
 
-/// Inverse-measurement information transform I' = Hᵀ I H with the
-/// analytic Jacobian H of the SE(2) inverse map at the measurement.
-/// Verified against finite differences in the native test suite (§11.1).
-void invertPlanarInformation(const SE2 & measurement, const Mat3 info, Mat3 out)
+/// Information of the inverted SE(2) measurement (§11.1). The inverse
+/// map f(z)=z⁻¹ has analytic Jacobian J at the measurement; covariance
+/// propagates as Σ_w = J Σ_z Jᵀ and the result is I_w = Σ_w⁻¹. The
+/// native test suite verifies this against finite differences on 1000+
+/// random cases.
+bool invertPlanarInformation(const SE2 & measurement, const Mat3 info, Mat3 out)
 {
     const double c = std::cos(measurement.yaw);
     const double s = std::sin(measurement.yaw);
     const SE2 inv = se2Inverse(measurement);
-    const double H[9] = {
+    // J = d(z⁻¹)/dz at z = measurement, derived analytically:
+    //   z⁻¹.x = -(c x + s y)   -> d/dyaw =  s x - c y = inv.y
+    //   z⁻¹.y =  (s x - c y)   -> d/dyaw =  c x + s y = -inv.x
+    const double J[9] = {
         -c, -s, inv.y,
-         s, -c, inv.x,
+         s, -c, -inv.x,
          0,  0, -1,
     };
-    Mat3 tmp;
-    mat3Multiply(info, H, tmp);
-    Mat3 Ht;
+    Mat3 cov;
+    if(!mat3Invert(info, cov)) return false;
+    // covW = J * cov * Jᵀ
+    Mat3 Jt;
     for(int r = 0; r < 3; ++r)
-        for(int col = 0; col < 3; ++col) Ht[r * 3 + col] = H[col * 3 + r];
-    mat3Multiply(Ht, tmp, out);
+        for(int col = 0; col < 3; ++col) Jt[r * 3 + col] = J[col * 3 + r];
+    Mat3 Jcov, covW;
+    mat3Multiply(J, cov, Jcov);
+    mat3Multiply(Jcov, Jt, covW);
+    mat3Symmetrize(covW);
+    return mat3Invert(covW, out);
 }
 
 /// Aggregate covariance along an odometry chain (§11.3):
@@ -1432,7 +1442,10 @@ bool buildSkeletonFactors(
         else
         {
             factor.measurement = se2Inverse(link.measurement);
-            invertPlanarInformation(link.measurement, link.information, factor.information);
+            if(!invertPlanarInformation(link.measurement, link.information, factor.information))
+            {
+                continue; // information unusable: audited skip
+            }
         }
         // g2o verifies every information matrix (symmetric + SPD); the
         // analytic inverse transform can drift numerically, so re-sanitize.

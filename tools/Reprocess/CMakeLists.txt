@@ -39,6 +39,19 @@ INSTALL(TARGETS market_scanner_graph
 		RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}" COMPONENT runtime
 		BUNDLE DESTINATION "${CMAKE_BUNDLE_LOCATION}" COMPONENT runtime)
 
+# V1R3 Gate T: executable native qualification suite. Unity build: the
+# test translation unit includes the core .cpp directly so internal math
+# is testable; it therefore does NOT link marketscanner_factor_graph.
+ADD_EXECUTABLE(market_scanner_native_tests market_scanner_native_tests.cpp)
+IF(SQLite3_FOUND)
+	TARGET_INCLUDE_DIRECTORIES(market_scanner_native_tests PRIVATE ${SQLite3_INCLUDE_DIRS})
+	TARGET_LINK_LIBRARIES(market_scanner_native_tests rtabmap_core ${SQLite3_LIBRARIES})
+ELSE()
+	TARGET_LINK_LIBRARIES(market_scanner_native_tests rtabmap_core sqlite3)
+ENDIF()
+SET_TARGET_PROPERTIES(market_scanner_native_tests
+	PROPERTIES OUTPUT_NAME ${PROJECT_PREFIX}-market-scanner-native-tests)
+
 ADD_EXECUTABLE(prior_map_factor_graph prior_map_factor_graph.cpp)
 
 IF(MARKETSCANNER_RELEASE_BUILD)
