@@ -39,6 +39,56 @@ enum MobileOnlyWorkflowState: String, Codable, Equatable, CaseIterable {
         }
     }
 
+    /// V1R2 §5.4: explicit transition table. The coordinator drives every
+    /// state change through `allowsTransition(to:)`; an illegal transition
+    /// is a typed error and never silently applied.
+    var allowedNextStates: Set<MobileOnlyWorkflowState> {
+        switch self {
+        case .idle:
+            return [.pickingMap, .configuringScan, .snapshotting, .interrupted]
+        case .pickingMap:
+            return [.stagingMapSource, .importingMap, .idle, .failed, .cancelled, .interrupted]
+        case .stagingMapSource:
+            return [.importingMap, .idle, .failed, .cancelled, .interrupted]
+        case .importingMap:
+            return [.compilingMap, .failed, .cancelled, .interrupted]
+        case .compilingMap:
+            return [.mapReady, .failed, .cancelled, .interrupted]
+        case .mapReady:
+            return [.configuringScan, .idle, .pickingMap, .interrupted]
+        case .configuringScan:
+            return [.scanning, .idle, .failed, .interrupted]
+        case .scanning:
+            return [.finalizingScan, .cancelled, .failed, .interrupted]
+        case .finalizingScan:
+            return [.snapshotting, .idle, .failed, .interrupted]
+        case .snapshotting:
+            return [.fastProcessing, .failed, .cancelled, .interrupted]
+        case .fastProcessing:
+            return [.deepProcessing, .buildingTrajectory, .failed, .cancelled, .interrupted]
+        case .deepProcessing:
+            return [.buildingTrajectory, .failed, .cancelled, .interrupted]
+        case .buildingTrajectory:
+            return [.resolvingTags, .failed, .cancelled, .interrupted]
+        case .resolvingTags:
+            return [.exporting, .failed, .cancelled, .interrupted]
+        case .exporting:
+            return [.completed, .failed, .cancelled, .interrupted]
+        case .completed:
+            return [.idle, .pickingMap, .configuringScan, .snapshotting]
+        case .failed:
+            return [.idle, .pickingMap, .configuringScan, .snapshotting]
+        case .cancelled:
+            return [.idle, .pickingMap, .configuringScan, .snapshotting]
+        case .interrupted:
+            return [.idle, .pickingMap, .configuringScan, .snapshotting]
+        }
+    }
+
+    func allowsTransition(to next: MobileOnlyWorkflowState) -> Bool {
+        return allowedNextStates.contains(next)
+    }
+
     /// Human readable (localized) label for UI.
     var displayName: String {
         switch self {

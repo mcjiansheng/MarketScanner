@@ -75,17 +75,24 @@ final class MobileOnlyHomeViewController: UIViewController {
     }
 
     private func makeEntryButton(_ entry: Entry) -> UIButton {
-        var configuration = UIButton.Configuration.filled()
-        configuration.image = UIImage(systemName: entry.symbol)
-        configuration.imagePadding = 12
-        configuration.title = entry.title
-        configuration.subtitle = entry.subtitle
-        configuration.cornerStyle = .medium
-        configuration.contentInsets = NSDirectionalEdgeInsets(
-            top: 14, leading: 16, bottom: 14, trailing: 16)
-        let button = UIButton(configuration: configuration, primaryAction: UIAction { _ in
-            entry.action()
-        })
+        // Deployment target is iOS 14.3, so `UIButton.Configuration`
+        // (iOS 15+) must not be used here (V1R2 Gate 0 §4.4).
+        let button = UIButton(type: .system)
+        button.backgroundColor = .secondarySystemBackground
+        button.layer.cornerRadius = 12
+        button.contentEdgeInsets = UIEdgeInsets(top: 14, left: 16, bottom: 14, right: 16)
+        button.contentHorizontalAlignment = .left
+        button.setImage(UIImage(systemName: entry.symbol), for: .normal)
+        let title = NSMutableAttributedString(
+            string: "  " + entry.title,
+            attributes: [.font: UIFont.preferredFont(forTextStyle: .headline)])
+        title.append(NSAttributedString(
+            string: "\n  " + entry.subtitle,
+            attributes: [.font: UIFont.preferredFont(forTextStyle: .caption1)]))
+        button.setAttributedTitle(title, for: .normal)
+        button.titleLabel?.numberOfLines = 0
+        button.titleLabel?.textAlignment = .left
+        button.addAction(UIAction { _ in entry.action() }, for: .touchUpInside)
         return button
     }
 
@@ -95,6 +102,11 @@ final class MobileOnlyHomeViewController: UIViewController {
             message: "上次操作在「\(state.displayName)」时被中断，已安全恢复为中断状态。",
             preferredStyle: .alert)
         alert.addAction(UIAlertAction(title: "知道了", style: .default))
+        alert.addAction(UIAlertAction(title: "尝试恢复", style: .default) { _ in
+            // Resumes only when every durable reference was verified on
+            // launch (§5.2); otherwise the run stays in idle.
+            MobileOnlyWorkflowCoordinator.shared.attemptResume()
+        })
         present(alert, animated: true)
     }
 

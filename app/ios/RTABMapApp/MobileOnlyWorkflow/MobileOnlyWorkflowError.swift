@@ -14,6 +14,18 @@ enum MobileOnlyWorkflowError: Error, LocalizedError, Equatable {
     case exportFailed(String)
     case pickerCopyFailed(String)
     case invalidState(String)
+    /// V1R2 §5.4: the requested state transition is not in the table.
+    case illegalTransition(String)
+    /// V1R2 §4.1: an import/compile run is already in flight (double
+    /// click / concurrent import guard).
+    case duplicateImport(String)
+    /// V1R2 §4.2: no map bound to the session metadata is registered.
+    case mapNotBound(String)
+    /// V1R2 §5.2: a persisted reference (staged file, map package,
+    /// session, database) disappeared before resume.
+    case referenceMissing(String)
+    /// V1R2 §16 / Gate L: a resource budget blocked the run.
+    case resourceRequired(String)
     case cancelled
     case interrupted
 
@@ -28,6 +40,11 @@ enum MobileOnlyWorkflowError: Error, LocalizedError, Equatable {
         case .exportFailed: return "workflow.export_failed"
         case .pickerCopyFailed: return "workflow.picker_copy_failed"
         case .invalidState: return "workflow.invalid_state"
+        case .illegalTransition: return "workflow.illegal_transition"
+        case .duplicateImport: return "workflow.duplicate_import"
+        case .mapNotBound: return "workflow.map_not_bound"
+        case .referenceMissing: return "workflow.reference_missing"
+        case .resourceRequired: return "workflow.resource_required"
         case .cancelled: return "workflow.cancelled"
         case .interrupted: return "workflow.interrupted"
         }
@@ -51,6 +68,16 @@ enum MobileOnlyWorkflowError: Error, LocalizedError, Equatable {
             return "文件复制失败：\(detail)"
         case .invalidState(let detail):
             return "流程状态错误：\(detail)"
+        case .illegalTransition(let detail):
+            return "非法状态转换：\(detail)"
+        case .duplicateImport(let detail):
+            return "导入已在进行中：\(detail)"
+        case .mapNotBound(let detail):
+            return "会话绑定的地图不在地图库：\(detail)"
+        case .referenceMissing(let detail):
+            return "恢复所需的引用缺失：\(detail)"
+        case .resourceRequired(let detail):
+            return "资源不足，无法继续：\(detail)"
         case .cancelled:
             return "操作已取消"
         case .interrupted:

@@ -8,6 +8,7 @@ final class MobileMapCompileProgressViewController: UIViewController {
     private let coordinator = MobileOnlyWorkflowCoordinator.shared
     private let progressView = UIProgressView(progressViewStyle: .default)
     private let statusLabel = UILabel()
+    private var observerTokens: [MobileOnlyWorkflowCoordinator.ObserverToken] = []
 
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -29,13 +30,20 @@ final class MobileMapCompileProgressViewController: UIViewController {
             stack.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -20),
         ])
 
-        coordinator.onStateChange = { [weak self] state in
+        // Token observer (§5.3): this page never overwrites other pages'
+        // callbacks.
+        observerTokens.append(coordinator.addStateObserver { [weak self] state in
             self?.updateStatus(state)
-        }
+        })
+        observerTokens.append(coordinator.addProgressObserver { [weak self] fraction, _ in
+            self?.progressView.setProgress(Float(max(0.1, fraction)), animated: true)
+        })
     }
 
     deinit {
-        coordinator.onStateChange = nil
+        for token in observerTokens {
+            coordinator.removeObserver(token)
+        }
     }
 
     private func updateStatus(_ state: MobileOnlyWorkflowState) {
