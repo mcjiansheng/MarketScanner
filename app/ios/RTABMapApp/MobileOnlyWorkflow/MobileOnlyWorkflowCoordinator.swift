@@ -179,6 +179,9 @@ final class MobileOnlyWorkflowCoordinator {
     /// Guards `state` reads/writes; transitions may be requested from
     /// the main thread (UI) and the serial work queue.
     private let stateLock = NSLock()
+    /// Guards every read/write of the durable `context` (mutated from the
+    /// background work queue and read from the main thread).
+    private let contextLock = NSLock()
 
     /// Serial background queue for every heavy step (§5.1). MainActor is
     /// never used for import/compile/snapshot/optimize/export work.
@@ -234,16 +237,20 @@ final class MobileOnlyWorkflowCoordinator {
             coordinatorLock.lock(); importBusy = false; coordinatorLock.unlock()
             return
         }
+        contextLock.lock()
         context.contractRaw = contract == .topLeft ? "top_left" : "bottom_left"
         context.storeID = storeID ?? ""
+        contextLock.unlock()
         persistContext()
 
         let picker = MapSourceDocumentPicker { [weak self] outcome in
             guard let self = self else { return }
             switch outcome {
             case .staged(let url, let originalFilename):
+                self.contextLock.lock()
                 self.context.stagedSource = url.path
                 self.context.originalFilename = originalFilename
+                self.contextLock.unlock()
                 self.persistContext()
                 self.transition(to: .stagingMapSource)
                 self.runImportChain(
@@ -274,8 +281,10 @@ final class MobileOnlyWorkflowCoordinator {
 
     private func releaseImport() {
         documentPicker = nil
+        contextLock.lock()
         context.stagedSource = ""
         context.originalFilename = ""
+        contextLock.unlock()
         coordinatorLock.lock(); importBusy = false; coordinatorLock.unlock()
         persistContext()
     }
@@ -360,8 +369,10 @@ final class MobileOnlyWorkflowCoordinator {
         notifyProgress(0.60, "手机端编译地图")
         do {
             let taskID = "compile-\(UUID().uuidString)"
+            contextLock.lock()
             context.taskID = taskID
             context.mapID = ""
+            contextLock.unlock()
             persistContext()
             let staging = try MobileMapLibrary.stagingDirectory(for: taskID)
             let compileResult = try MobilePriorMapCompiler.compile(
@@ -395,9 +406,11 @@ final class MobileOnlyWorkflowCoordinator {
                 compilerVersion: "swift-v1",
                 canonicalSourceSHA256: report.canonicalSourceSha256)
             self.activeMap = entry
+            self.contextLock.lock()
             self.context.mapID = entry.priorMapID
             self.context.mapSHA = entry.packageSHA256
             self.context.taskID = ""
+            self.contextLock.unlock()
             self.persistContext()
             self.transition(to: .mapReady)
             self.notifyProgress(1.0, "地图已注册")
@@ -417,8 +430,10 @@ final class MobileOnlyWorkflowCoordinator {
 
     func beginScanSetup(map: MobileMapLibrary.MapEntry) {
         activeMap = map
+        contextLock.lock()
         context.mapID = map.priorMapID
         context.mapSHA = map.packageSHA256
+        contextLock.unlock()
         transition(to: .configuringScan)
         persistContext()
     }
@@ -434,6 +449,17 @@ final class MobileOnlyWorkflowCoordinator {
 
     func scanFinalized() {
         transition(to: .finalizingScan)
+    }
+
+    /// Reported by the scanner host when the real scan start failed
+    /// (package missing, SHA mismatch, ARKit/RTAB-Map refused). The
+    /// workflow must not stay stuck in `.scanning` (V1R2 review fix).
+    func scanStartFailed(with error: Error) {
+        if let workflowError = error as? MobileOnlyWorkflowError {
+            fail(with: workflowError)
+        } else {
+            fail(with: .invalidState(error.localizedDescription))
+        }
     }
 
     // MARK: - Processing flow (Gate A / Fast+Deep / results)
@@ -470,6 +496,7 @@ final class MobileOnlyWorkflowCoordinator {
             notifyProcessing(.failure(lastError ?? .snapshotFailed("unknown")))
             return
         }
+        contextLock.lock()
         context.taskID = taskID
         context.sessionID = trackingSessionID
         context.segmentDirectory = finalizedSession.path
@@ -478,6 +505,7 @@ final class MobileOnlyWorkflowCoordinator {
         context.mapSHA = priorMap.packageSHA256
         context.progress = 0
         context.checkpoint = "snapshotting"
+        contextLock.unlock()
         persistContext()
 
         let request = MobileProcessingPipeline.Request(
@@ -505,8 +533,10 @@ final class MobileOnlyWorkflowCoordinator {
                 request: request,
                 progress: { [weak self] fraction, message in
                     guard let self = self else { return }
+                    self.contextLock.lock()
                     self.context.progress = fraction
                     self.context.checkpoint = message
+                    self.contextLock.unlock()
                     self.persistContext()
                     self.transitionToPipelineFraction(fraction)
                     self.notifyProgress(fraction, message)
@@ -514,9 +544,11 @@ final class MobileOnlyWorkflowCoordinator {
                 isCancelled: { [weak self] in
                     self?.processingOperation?.isCancelled ?? false
                 })
+            self.contextLock.lock()
             self.context.resultID = outcome.resultEntry.resultID
             self.context.progress = 1.0
             self.context.checkpoint = "completed"
+            self.contextLock.unlock()
             self.persistContext()
             self.transition(to: .completed)
             self.notifyProcessing(.success(outcome.resultEntry))
@@ -572,14 +604,18 @@ final class MobileOnlyWorkflowCoordinator {
             let error = MobileOnlyWorkflowError.illegalTransition(
                 "\(current.rawValue) -> \(newState.rawValue)")
             lastError = error
+            contextLock.lock()
             context.errorCode = error.code
+            contextLock.unlock()
             persistContext()
             return false
         }
         state = newState
         stateLock.unlock()
         if newState != .failed {
+            contextLock.lock()
             context.errorCode = ""
+            contextLock.unlock()
         }
         persistContext()
         notifyState(newState)
@@ -588,21 +624,27 @@ final class MobileOnlyWorkflowCoordinator {
 
     private func fail(with error: MobileOnlyWorkflowError) {
         lastError = error
+        contextLock.lock()
         context.errorCode = error.code
+        contextLock.unlock()
         transition(to: .failed)
     }
 
     // MARK: - Persistence (§5.2)
 
     private func persistContext() {
-        context.state = state
+        stateLock.lock()
+        let currentState = state
+        stateLock.unlock()
+        contextLock.lock()
+        context.state = currentState
         context.appGitSHA = appGitSHA
         context.policySHA = policySHA
         context.updatedAt = Date().timeIntervalSince1970
         let payload: [String: Any] = [
             "format": "MarketScannerWorkflowState",
             "version": 2,
-            "state": state.rawValue,
+            "state": currentState.rawValue,
             "task_id": context.taskID,
             "staged_source": context.stagedSource,
             "original_filename": context.originalFilename,
@@ -621,6 +663,7 @@ final class MobileOnlyWorkflowCoordinator {
             "policy_sha": context.policySHA,
             "updated_at": context.updatedAt,
         ]
+        contextLock.unlock()
         guard let data = try? CanonicalJSONEncoder.encode(payload) else { return }
         do {
             let directory = stateFileURL.deletingLastPathComponent()
@@ -728,20 +771,29 @@ final class MobileOnlyWorkflowCoordinator {
     /// to idle because the picker interaction cannot be replayed.
     func attemptResume() -> Bool {
         guard state == .interrupted else { return false }
-        switch context.checkpoint {
-        case _ where !context.segmentDirectory.isEmpty && !context.sourceDatabase.isEmpty:
+        contextLock.lock()
+        let checkpoint = context.checkpoint
+        let segmentDirectory = context.segmentDirectory
+        let sourceDatabase = context.sourceDatabase
+        let mapID = context.mapID
+        let mapSHA = context.mapSHA
+        let storeID = context.storeID
+        let sessionID = context.sessionID
+        contextLock.unlock()
+        switch checkpoint {
+        case _ where !segmentDirectory.isEmpty && !sourceDatabase.isEmpty:
             guard let map = activeMap ?? (try? MobileMapLibrary.map(
-                priorMapID: context.mapID, packageSHA256: context.mapSHA)) else {
+                priorMapID: mapID, packageSHA256: mapSHA)) else {
                 transition(to: .idle)
                 return false
             }
             transition(to: .idle)
             beginProcessing(
-                finalizedSession: URL(fileURLWithPath: context.segmentDirectory),
-                sourceDatabase: URL(fileURLWithPath: context.sourceDatabase),
+                finalizedSession: URL(fileURLWithPath: segmentDirectory),
+                sourceDatabase: URL(fileURLWithPath: sourceDatabase),
                 priorMap: map,
-                storeID: context.storeID,
-                trackingSessionID: context.sessionID)
+                storeID: storeID,
+                trackingSessionID: sessionID)
             return true
         default:
             transition(to: .idle)

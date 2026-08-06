@@ -61,11 +61,14 @@ enum MobileNativeFactorGraph {
             : MSFactorGraphRunFast(&request)
         defer { MSFactorGraphFree(&outcome) }
 
-        if let error = outcome.error {
-            throw MobileNativeFactorGraphError.nativeFailed(String(cString: error))
-        }
+        // Cancellation first: the native core reports it through the
+        // error string, and the run must surface `.cancelled`, not a
+        // generic failure (V1R2 review fix).
         if context.cancelledFlag {
             throw MobileOnlyWorkflowError.cancelled
+        }
+        if let error = outcome.error {
+            throw MobileNativeFactorGraphError.nativeFailed(String(cString: error))
         }
 
         let qualityJSON: String

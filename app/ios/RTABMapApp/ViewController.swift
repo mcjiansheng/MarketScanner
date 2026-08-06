@@ -450,6 +450,9 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                 self.persistScanConfiguration(configuration)
             }
             catch {
+                // Report the failure so the workflow never stays stuck in
+                // `.scanning` (V1R2 review fix).
+                MobileOnlyWorkflowCoordinator.shared.scanStartFailed(with: error)
                 self.showToast(
                     message: String(
                         format: self.localized("Could not start the store scan: %@"),
@@ -5403,6 +5406,11 @@ extension SKStoreReviewController {
 extension ViewController: MobileOnlyScanStarting {
 
     func startMobileOnlyScan(_ configuration: MobileScanConfiguration) throws {
+        // Never start a second scan on top of an active one (newScan would
+        // silently refuse and the workflow would report a phantom success).
+        guard mState != .STATE_MAPPING else {
+            throw MobileOnlyWorkflowError.invalidState("a scan is already in progress")
+        }
         // 1. Production package load from the durable on-device library
         //    (containment + registration verified by the library).
         let entry = try MobileMapLibrary.map(

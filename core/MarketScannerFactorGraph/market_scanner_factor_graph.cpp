@@ -139,8 +139,11 @@ struct GraphModel
 };
 
 /// Extracts the planar (x, y, yaw) information block from the RTAB-Map
-/// 6x6 information matrix ([x y z roll pitch yaw]). Falls back to a
-/// modest diagonal when the stored block carries no planar weight.
+/// 6x6 information matrix ([x y z roll pitch yaw]). Every diagonal entry
+/// is clamped to a strictly positive finite value because rtabmap::Link
+/// asserts positivity; a near-zero clamp keeps a "no weight" intent
+/// (e.g. yaw-free pose priors) while staying fail-closed. Falls back to
+/// a modest diagonal when the stored block carries no planar weight.
 void planarBlock(const double info36[36], double out[9])
 {
     const int idx[3] = {0, 1, 5};
@@ -149,8 +152,10 @@ void planarBlock(const double info36[36], double out[9])
     {
         for(int c = 0; c < 3; ++c)
         {
-            const double v = info36[idx[r] * 6 + idx[c]];
-            out[r * 3 + c] = std::isfinite(v) ? v : 0.0;
+            double v = info36[idx[r] * 6 + idx[c]];
+            if(!std::isfinite(v)) v = 0.0;
+            if(r != c && std::fabs(v) > 1.0e12) v = 0.0;
+            out[r * 3 + c] = v;
             if(r == c) sum += std::fabs(out[r * 3 + c]);
         }
     }
@@ -158,6 +163,13 @@ void planarBlock(const double info36[36], double out[9])
     {
         for(int i = 0; i < 9; ++i) out[i] = 0.0;
         out[0] = out[4] = out[8] = 10.0;
+        return;
+    }
+    // Partial zero/negative diagonals (legal upstream, e.g. yaw-free
+    // priors): clamp to a near-zero positive weight.
+    for(int d = 0; d < 3; ++d)
+    {
+        if(!(out[d * 3 + d] > 0.0)) out[d * 3 + d] = 1.0e-6;
     }
 }
 
@@ -211,7 +223,10 @@ cv::Mat sixFromPlanar(const double planar[9])
     {
         for(int c = 0; c < 3; ++c)
         {
-            info.at<double>(idx[r], idx[c]) = planar[r * 3 + c];
+            double v = planar[r * 3 + c];
+            if(!std::isfinite(v)) v = 0.0;
+            if(r == c && !(v > 0.0)) v = 1.0e-6;
+            info.at<double>(idx[r], idx[c]) = v;
         }
     }
     // rtabmap::Link rejects null Z/roll/pitch information; the planar
@@ -230,8 +245,22 @@ cv::Mat sixFromPlanar(const double planar[9])
 /// in SQLITE_DONE (§10).
 bool readGraph(const std::string & dbPath, GraphModel & model, std::string & error)
 {
+    // The read-only contract must never be defeated by a crafted path:
+    // '?'/'#' would inject URI parameters/fragments overriding mode=ro.
+    if(dbPath.empty() ||
+       dbPath.find('?') != std::string::npos ||
+       dbPath.find('#') != std::string::npos)
+    {
+        error = "database path contains unsupported URI characters";
+        return false;
+    }
     char uri[4096];
-    snprintf(uri, sizeof(uri), "file:%s?mode=ro&immutable=1", dbPath.c_str());
+    const int written = snprintf(uri, sizeof(uri), "file:%s?mode=ro&immutable=1", dbPath.c_str());
+    if(written < 0 || written >= static_cast<int>(sizeof(uri)))
+    {
+        error = "database path too long";
+        return false;
+    }
     sqlite3 * db = 0;
     if(sqlite3_open_v2(uri, &db, SQLITE_OPEN_READONLY | SQLITE_OPEN_URI, 0) != SQLITE_OK)
     {
@@ -1431,6 +1460,22 @@ MSFactorGraphOutcomeC runPipeline(const MSFactorGraphRequestC * request, const R
 
 // MARK: - C ABI --------------------------------------------------------------
 
+namespace {
+
+/// Wraps an unexpected native exception into a fail-closed outcome; the
+/// C ABI boundary must never let an exception escape (rtabmap UASSERT
+/// failures throw UException).
+MSFactorGraphOutcomeC makeExceptionOutcome(const char * message)
+{
+    MSFactorGraphOutcomeC outcome;
+    std::memset(&outcome, 0, sizeof(outcome));
+    outcome.disposition = MS_FACTOR_GRAPH_NON_RECOVERABLE_FAIL;
+    outcome.error = const_cast<char *>(strdup(message ? message : "unknown native exception"));
+    return outcome;
+}
+
+} // namespace
+
 extern "C" MSFactorGraphOutcomeC MSFactorGraphRunFast(const MSFactorGraphRequestC * request)
 {
     RunOptions options;
@@ -1440,7 +1485,18 @@ extern "C" MSFactorGraphOutcomeC MSFactorGraphRunFast(const MSFactorGraphRequest
         options.maxNodes = request->max_nodes;
         options.maxWallSeconds = request->max_wall_seconds;
     }
-    return runPipeline(request, options);
+    try
+    {
+        return runPipeline(request, options);
+    }
+    catch(const std::exception & e)
+    {
+        return makeExceptionOutcome(e.what());
+    }
+    catch(...)
+    {
+        return makeExceptionOutcome(0);
+    }
 }
 
 extern "C" MSFactorGraphOutcomeC MSFactorGraphRunDeep(const MSFactorGraphRequestC * request)
@@ -1452,7 +1508,18 @@ extern "C" MSFactorGraphOutcomeC MSFactorGraphRunDeep(const MSFactorGraphRequest
         options.maxNodes = request->max_nodes;
         options.maxWallSeconds = request->max_wall_seconds;
     }
-    return runPipeline(request, options);
+    try
+    {
+        return runPipeline(request, options);
+    }
+    catch(const std::exception & e)
+    {
+        return makeExceptionOutcome(e.what());
+    }
+    catch(...)
+    {
+        return makeExceptionOutcome(0);
+    }
 }
 
 extern "C" void MSFactorGraphFree(MSFactorGraphOutcomeC * outcome)
