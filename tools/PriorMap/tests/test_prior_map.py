@@ -341,6 +341,9 @@ class IOSCoreContractTests(unittest.TestCase):
             repository
             / "app/ios/RTABMapApp/RecoveryLifecycleEvidenceParser.swift",
             repository / "app/ios/RTABMapApp/StrictJSONScalar.swift",
+            # V1R5 Gate A: auto-generated evidence input-limit contracts.
+            repository
+            / "app/ios/RTABMapApp/GeneratedMobileEvidenceContracts.swift",
             repository
             / "app/ios/RTABMapApp/StrictJSONKeyUniquenessValidator.swift",
             repository / "app/ios/RTABMapApp/StrictJSONDocumentParser.swift",
@@ -416,6 +419,14 @@ class IOSCoreContractTests(unittest.TestCase):
             / "app/ios/RTABMapApp/MobilePostProcessing/TagObservationEvidenceParser.swift",
             repository
             / "app/ios/RTABMapApp/MobilePostProcessing/StrictClockEvidenceParser.swift",
+            # Mobile-Only V1R5: shared strict JSONL framing, the verified
+            # tag-burst parser (§5.3) and the strict trace parser (§9.6).
+            repository
+            / "app/ios/RTABMapApp/MobilePostProcessing/StrictJSONLStreamReader.swift",
+            repository
+            / "app/ios/RTABMapApp/MobilePostProcessing/TagObservationBurstEvidenceParser.swift",
+            repository
+            / "app/ios/RTABMapApp/MobilePostProcessing/StrictLocalizationTraceParser.swift",
             repository
             / "app/ios/RTABMapApp/MobileResults/MobileWorksheets.swift",
             repository

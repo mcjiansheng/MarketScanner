@@ -6189,8 +6189,9 @@ catch {
 // =====================================================================
 
 // G1/G2: explicit snapshot-node binding, propagation and the strict
-// time-delta / unlocalized gates (V1R4 §13.2: the parser binds the
-// node; resolution only verifies the final reconstruction).
+// time-delta / unlocalized gates (V1R4 §13.2, V1R5 §6.5: the parser
+// binds the node; the resolver verifies the exact raw stamp via the
+// O(1) index — the 5-second nearest fallback is gone).
 do {
     let finalNodes = [
         TagObservationResolver.FinalNodePose(
@@ -6202,6 +6203,9 @@ do {
             pose: SE2Transform(xM: 2, yM: 4, yawRad: Double.pi / 2),
             floorID: "1"),
     ]
+    let index = TagObservationResolver.NodeIndex(
+        finalNodes: finalNodes,
+        rawNodeStamps: [10: 500.0, 11: 501.5])
     // Explicit node 10, raw pose = identity, raw position (0, 0).
     let resolved = try TagObservationResolver.resolve(
         observation: TagObservationResolver.RawObservation(
@@ -6209,7 +6213,7 @@ do {
             nodeID: 10, nodeTimestamp: 500.0, frameMonotonicSeconds: 500.0,
             rawPositionM: (0, 0, 0), rawNodePose: .identity,
             trackingSessionID: "s"),
-        finalNodes: finalNodes, sessionID: "s")
+        index: index, sessionID: "s")
     require(
         resolved.mapXM == 2 && resolved.mapYM == 3 && resolved.nodeID == 10
             && resolved.bindingMethod == "explicit_node",
@@ -6224,12 +6228,12 @@ do {
             rawPositionM: (-1, 0, 0),
             rawNodePose: SE2Transform(xM: 0, yM: 0, yawRad: 0),
             trackingSessionID: "s"),
-        finalNodes: finalNodes, sessionID: "s")
+        index: index, sessionID: "s")
     require(
         close(resolved2.mapXM, 2.0) && close(resolved2.mapYM, 3.0),
         "G1 position propagation must apply T_final*inv(T_raw)*P, got \(resolved2.mapXM),\(resolved2.mapYM)")
-    // Time-delta gate: the bound node's timestamp must be within the
-    // 5.0 s window of the observation's node-timebase timestamp.
+    // Time-delta gate: the raw snapshot stamp must agree with the
+    // parser-bound stamp within the frozen 1.0 s window (V1R5 §6.4).
     do {
         _ = try TagObservationResolver.resolve(
             observation: TagObservationResolver.RawObservation(
@@ -6237,7 +6241,7 @@ do {
                 nodeID: 10, nodeTimestamp: 506.0, frameMonotonicSeconds: 506.0,
                 rawPositionM: (0, 0, 0), rawNodePose: .identity,
                 trackingSessionID: "s"),
-            finalNodes: finalNodes, sessionID: "s")
+            index: index, sessionID: "s")
         require(false, "G2 time-delta gate must reject a stale binding")
     }
     catch let error as TagObservationResolver.ResolutionError {
@@ -6253,7 +6257,7 @@ do {
                 nodeID: 10, nodeTimestamp: 500.0, frameMonotonicSeconds: 500.0,
                 rawPositionM: nil, rawNodePose: .identity,
                 trackingSessionID: "s"),
-            finalNodes: finalNodes, sessionID: "s")
+            index: index, sessionID: "s")
         require(false, "G2 unlocalized observations must be rejected")
     }
     catch let error as TagObservationResolver.ResolutionError {
@@ -6269,7 +6273,7 @@ do {
                 nodeID: 10, nodeTimestamp: 500.0, frameMonotonicSeconds: 500.0,
                 rawPositionM: (0, 0, 0), rawNodePose: .identity,
                 trackingSessionID: "other"),
-            finalNodes: finalNodes, sessionID: "s")
+            index: index, sessionID: "s")
         require(false, "G1 session mismatch must be rejected")
     }
     catch let error as TagObservationResolver.ResolutionError {
@@ -6765,15 +6769,18 @@ if CommandLine.arguments.count == 3,
             let xlsxReport = try MapSourceImportCoordinator.importMap(
                 stagedURL: try writeTemporary(xlsxData, named: "sample.xlsx"),
                 originalFilename: "sample.xlsx",
-                contract: .topLeft)
+                contract: .topLeft,
+                storeId: "s1")
             let csvReport = try MapSourceImportCoordinator.importMap(
                 stagedURL: try writeTemporary(csvData, named: "sample.csv"),
                 originalFilename: "sample.csv",
-                contract: .topLeft)
+                contract: .topLeft,
+                storeId: "s1")
             let jsonReport = try MapSourceImportCoordinator.importMap(
                 stagedURL: try writeTemporary(jsonData, named: "sample.json"),
                 originalFilename: "sample.json",
-                contract: .topLeft)
+                contract: .topLeft,
+                storeId: "s1")
 
             if xlsxReport.canonicalSourceSha256 != csvReport.canonicalSourceSha256 {
                 failures.append("parity: xlsx vs csv canonical SHA mismatch")
@@ -6844,7 +6851,8 @@ if CommandLine.arguments.count == 3,
             _ = try MapSourceImportCoordinator.importMap(
                 stagedURL: try writeTemporary(data, named: "formula.xlsx"),
                 originalFilename: "formula.xlsx",
-                contract: .topLeft)
+                contract: .topLeft,
+                storeId: "s1")
             failures.append("formula: expected rejection")
         }
         catch let error as MapSourceImportError {
@@ -6862,7 +6870,8 @@ if CommandLine.arguments.count == 3,
             _ = try MapSourceImportCoordinator.importMap(
                 stagedURL: try writeTemporary(data, named: "traversal.xlsx"),
                 originalFilename: "traversal.xlsx",
-                contract: .topLeft)
+                contract: .topLeft,
+                storeId: "s1")
             failures.append("traversal: expected rejection")
         }
         catch let error as MapSourceImportError {
@@ -6880,7 +6889,8 @@ if CommandLine.arguments.count == 3,
             _ = try MapSourceImportCoordinator.importMap(
                 stagedURL: try writeTemporary(data, named: "bomb.xlsx"),
                 originalFilename: "bomb.xlsx",
-                contract: .topLeft)
+                contract: .topLeft,
+                storeId: "s1")
             failures.append("bomb: expected rejection")
         }
         catch let error as MapSourceImportError {
@@ -7006,7 +7016,8 @@ do {
     let report = try MapSourceImportCoordinator.importMap(
         stagedURL: stagedMap,
         originalFilename: "e2e-map.csv",
-        contract: .topLeft)
+        contract: .topLeft,
+        storeId: "s1")
     require(report.elementCount == 3, "E2E import must yield 3 elements, got \(report.elementCount)")
     require(!report.canonicalSourceSha256.isEmpty, "E2E canonical SHA must be non-empty")
     require(report.audit != nil, "E2E import must carry a v2 audit record")
@@ -7080,9 +7091,15 @@ do {
             "estimatedPose": [
                 "x_m": Double(index) * 1.0, "y_m": 0.0, "yaw_rad": 0.0,
             ],
-            "localizationState": "normal",
+            "rawPose": [
+                "x_m": Double(index) * 1.0, "y_m": 0.0, "yaw_rad": 0.0,
+            ],
+            "localizationState": "stable",
             "trackingState": "normal",
             "floorId": "1",
+            "trackingSessionId": "E2E-SESSION",
+            "priorMapId": maps[0].priorMapID,
+            "priorMapSha256": maps[0].packageSHA256,
             "nodeTimebaseOffsetSeconds": now - 100.0,
             "nodeTimebaseTimestamp": now + Double(index) * 8.0,
             "confidence": 1.0,
@@ -7373,8 +7390,25 @@ do {
         workbookFilename: tamperName,
         manifestExtras: [:])
     let tamperDirectory = try MobileResultLibrary.resultDirectory(resultID: "result-tamper")
-    // Exact bytes: appending to an artifact must fail the read.
+    // V1R5 §13.1 (review H-02): a committed result is IMMUTABLE — every
+    // file is 0444 and the directory tree is 0555.
     let tamperA = tamperDirectory.appendingPathComponent("a.json")
+    let immutableAttributes = try FileManager.default
+        .attributesOfItem(atPath: tamperA.path)
+    require(
+        (immutableAttributes[.posixPermissions] as? NSNumber)?.intValue == 0o444,
+        "X-strict committed result files must be read-only 0444")
+    do {
+        try Data("{}drift".utf8).write(to: tamperA)
+        require(false, "X-strict committed result must reject writes")
+    } catch {
+        // Expected: the immutable package refuses mutation.
+    }
+    // A hostile writer with owner permissions can still chmod; the read
+    // path must then isolate the tampered artifact (exact bytes).
+    try FileManager.default.setAttributes(
+        [.posixPermissions: 0o644], ofItemAtPath: tamperA.path)
+    // Exact bytes: appending to an artifact must fail the read.
     try Data("{}drift".utf8).write(to: tamperA)
     do {
         _ = try MobileResultLibrary.readResult(resultID: "result-tamper")
@@ -7388,6 +7422,8 @@ do {
     try Data("{}".utf8).write(to: tamperA)
     let tamperManifestURL = tamperDirectory
         .appendingPathComponent(MobileResultLibrary.manifestFileName)
+    try FileManager.default.setAttributes(
+        [.posixPermissions: 0o644], ofItemAtPath: tamperManifestURL.path)
     var tampered = try JSONSerialization.jsonObject(
         with: Data(contentsOf: tamperManifestURL)) as! [String: Any]
     tampered["sneaky_extension"] = 1
@@ -7937,7 +7973,8 @@ if CommandLine.arguments.count == 3,
         let report = try MapSourceImportCoordinator.importMap(
             stagedURL: stagedMap,
             originalFilename: "cas-map.csv",
-            contract: .topLeft)
+            contract: .topLeft,
+            storeId: "s1")
         require(report.elementCount == 3, "CAS import must yield 3 elements")
         let compileDir = try MobileMapLibrary.stagingDirectory(for: "cas-compile")
         let compileResult = try MobilePriorMapCompiler.compile(
@@ -8030,9 +8067,10 @@ if CommandLine.arguments.count == 3,
             dirMode & 0o555 == 0o555,
             "CAS: package directories must be 555, got \(String(format: "%o", dirMode))")
 
-        // 4) list/map re-verify; a path-escape registry record is dropped
-        //    and map() fails closed (it never resolves a path that leaves
-        //    the packages root).
+        // 4) list/map re-verify; a path-escape registry record marks the
+        //    WHOLE index corrupt (V1R5 §13.4 / review H-10: a persistent
+        //    identity index never drops entries silently — list and map
+        //    fail closed with registryCorrupt until the index is rebuilt).
         let listedBeforeEscape = try MobileMapLibrary.listMaps()
         require(listedBeforeEscape.count == 1, "CAS: list must return the verified map")
         _ = try MobileMapLibrary.map(
@@ -8053,17 +8091,26 @@ if CommandLine.arguments.count == 3,
         corrupt["maps"] = corruptMaps
         try (try CanonicalJSONEncoder.encode(corrupt)).write(
             to: try MobileMapLibrary.registryURL())
-        let afterEscape = try MobileMapLibrary.listMaps()
-        require(afterEscape.isEmpty, "CAS: escaped package_directory must be dropped")
+        var listCorruptRejected = false
+        do {
+            _ = try MobileMapLibrary.listMaps()
+            require(false, "CAS: corrupt registry must fail closed on list")
+        } catch let error as MobileMapLibrary.LibraryError {
+            if case .registryCorrupt = error { listCorruptRejected = true }
+        }
+        require(listCorruptRejected, "CAS: corrupt registry list must be registryCorrupt")
         var escapeRejected = false
         do {
             _ = try MobileMapLibrary.map(
                 priorMapID: compileResult.priorMapID,
                 packageSHA256: compileResult.packageSHA256)
         } catch let error as MobileMapLibrary.LibraryError {
-            if case .notRegistered = error { escapeRejected = true }
+            if case .registryCorrupt = error { escapeRejected = true }
         }
-        require(escapeRejected, "CAS: escaped registry record must make map fail closed")
+        require(escapeRejected, "CAS: escaped registry record must fail map closed")
+        // Restore the registry before the serialized-write phase.
+        try (try CanonicalJSONEncoder.encode(registry!)).write(
+            to: try MobileMapLibrary.registryURL())
 
         // 5) Registrations serialize under the library lock: two
         //    back-to-back writes must both survive and advance the
@@ -8357,12 +8404,15 @@ catch {
     exit(10)
 }
 
-// === Mobile-Only V1R4: strict tag-observation evidence parser (§13.2) ===
-// The parser must classify records against the REAL write-side schema
-// (PriorMapTagObservationRecord snake_case): identity exact, finite-only,
-// known-field whitelist, duplicate observation_id rejection, raw-pose
-// sanity and node-timebase binding with a 1.0 s gate. Every rejection is
-// fail-closed with a stable audit code; unlocalized records are counted.
+// === Mobile-Only V1R4/V1R5: strict tag-observation evidence parser ===
+// (§13.2 + §5.4) The parser must classify records against the REAL
+// write-side schema (PriorMapTagObservationRecord snake_case): identity
+// exact, finite-only, known-field whitelist, duplicate observation_id
+// rejection, raw-pose sanity and node-timebase binding with a 1.0 s gate
+// plus the V1R5 verified-burst gate (every accepted observation must
+// belong to a verified complete burst with exact identity and a
+// timestamp/node range inside the burst). Every rejection is fail-closed
+// with a stable audit code; unlocalized records are counted.
 do {
     let temporary = FileManager.default.temporaryDirectory
         .appendingPathComponent("ms-tag-parser-\(UUID().uuidString)", isDirectory: true)
@@ -8418,6 +8468,9 @@ do {
         "floor_id": floor,
         "tracking_session_id": session,
         "needs_review": false,
+        // V1R5 §5.4: durable burst linkage assigned at persistence time.
+        "burst_id": "BURST-1",
+        "frame_id": "frame-1001",
     ]
     func observation(_ edits: [String: Any]) throws -> String {
         var record = validRecord
@@ -8429,18 +8482,29 @@ do {
     lines.append(try observation([
         "observation_id": "OBS-1",
         "node_timebase_frame_timestamp": 1001.0,
+        "frame_id": "frame-1001",
         "raw_map_position": ["x_m": 1.0, "y_m": 2.0, "height_m": 1.5],
     ]))
     lines.append(try observation([
         "observation_id": "OBS-2",
         "node_timebase_frame_timestamp": 1002.0,
+        "frame_id": "frame-1002",
         "raw_map_position": ["x_m": 1.1, "y_m": 2.1, "height_m": 1.5],
     ]))
     // 1 valid unlocalized record bound to node 3 (no raw position).
     lines.append(try observation([
         "observation_id": "OBS-3",
         "node_timebase_frame_timestamp": 1003.0,
+        "frame_id": "frame-1003",
         "raw_map_position": NSNull(),
+    ]))
+    // V1R5 §5.4: a record whose burst is not in the verified set is
+    // rejected (legacy records can never reach ACCEPTED).
+    lines.append(try observation([
+        "observation_id": "OBS-NO-BURST",
+        "node_timebase_frame_timestamp": 1004.0,
+        "frame_id": "frame-1004",
+        "burst_id": "BURST-UNKNOWN",
     ]))
     // Rejections: format / version / unknown field / identity / schema /
     // duplicate / raw pose / node binding.
@@ -8452,6 +8516,7 @@ do {
     lines.append(try observation([
         "observation_id": "OBS-1",
         "node_timebase_frame_timestamp": 1004.0,
+        "frame_id": "frame-1004",
     ]))
     lines.append(try observation([
         "observation_id": "OBS-RAW",
@@ -8460,9 +8525,47 @@ do {
     lines.append(try observation([
         "node_timebase_frame_timestamp": 2000.0,
         "observation_id": "OBS-BIND",
+        "frame_id": "frame-2000",
     ]))
     try lines.joined().data(using: .utf8)!.write(
         to: temporary.appendingPathComponent("tag_observations.jsonl"))
+
+    // V1R5 §5.3/§5.4: the verified burst covering the accepted records.
+    let verifiedBurst = VerifiedTagBurst(
+        burstID: "BURST-1",
+        sequence: 1,
+        barcode: "6901234567890",
+        symbology: "EAN13",
+        floorID: floor,
+        trackingSessionID: session,
+        frameIDs: ["frame-1001", "frame-1002", "frame-1003"],
+        uniqueFrameCount: 3,
+        firstFrameTimestamp: 1000.0,
+        lastFrameTimestamp: 1003.0,
+        nodeTimebaseMin: 1001.0,
+        nodeTimebaseMax: 1003.0,
+        depthQuality: 0.9,
+        viewAngle: "front",
+        trackingQuality: "stable",
+        localizationConfidenceMean: 0.9,
+        complete: true,
+        frameSamples: [
+            TagBurstFrameSample(
+                frameId: "frame-1001", frameTimestamp: 1000.0,
+                nodeTimebaseTimestamp: 1001.0, observationId: "OBS-1"),
+            TagBurstFrameSample(
+                frameId: "frame-1002", frameTimestamp: 1000.5,
+                nodeTimebaseTimestamp: 1002.0, observationId: "OBS-2"),
+            TagBurstFrameSample(
+                frameId: "frame-1003", frameTimestamp: 1001.0,
+                nodeTimebaseTimestamp: 1003.0, observationId: "OBS-3"),
+        ],
+        rawSamples: [],
+        boundNodeIDs: [1, 2, 3])
+    let verifiedBursts = TagObservationBurstEvidenceParseResult(
+        bursts: [verifiedBurst],
+        byBurstID: ["BURST-1": verifiedBurst],
+        audit: TagObservationBurstEvidenceAudit())
 
     let result = try TagObservationEvidenceParser.parse(
         snapshotDirectory: temporary,
@@ -8470,10 +8573,11 @@ do {
         priorMapID: mapID,
         priorMapSHA256: sha,
         trackingSessionID: session,
-        floorID: floor)
+        floorID: floor,
+        verifiedBursts: verifiedBursts)
     let audit = result.audit
     require(
-        audit.recordTotal == 11,
+        audit.recordTotal == 12,
         "tag parser record total wrong: \(audit.recordTotal)")
     require(
         audit.recordAccepted == 3
@@ -8486,13 +8590,13 @@ do {
             && audit.recordIdentityRejected == 1
             && audit.recordDuplicateRejected == 1
             && audit.recordPoseRejected == 1
-            && audit.recordNodeBindingRejected == 1,
+            && audit.recordNodeBindingRejected == 2,
         "tag parser rejection breakdown wrong: format=\(audit.recordFormatRejected) version=\(audit.recordVersionRejected) schema=\(audit.recordSchemaRejected) identity=\(audit.recordIdentityRejected) duplicate=\(audit.recordDuplicateRejected) pose=\(audit.recordPoseRejected) binding=\(audit.recordNodeBindingRejected)")
     require(
-        audit.totalRejected == 8,
+        audit.totalRejected == 9,
         "tag parser total rejected wrong: \(audit.totalRejected)")
     require(
-        audit.rejectedDetails.count == 8,
+        audit.rejectedDetails.count == 9,
         "tag parser rejected details must count every rejection: \(audit.rejectedDetails.count)")
     let reasons = Set(audit.rejectedDetails.map { $0.reason })
     require(
@@ -8503,7 +8607,8 @@ do {
             && reasons.contains("schema_or_finite_invalid")
             && reasons.contains("duplicate_observation_id")
             && reasons.contains("raw_pose_invalid")
-            && reasons.contains("node_time_delta_exceeded"),
+            && reasons.contains("node_time_delta_exceeded")
+            && reasons.contains("observation_not_in_verified_burst"),
         "tag parser stable codes incomplete: \(reasons.sorted())")
     require(
         result.boundNodeIDs == [1, 2, 3],
@@ -8515,8 +8620,10 @@ do {
     require(
         localized.boundNodeID == 1
             && localized.barcode == "6901234567890"
-            && localized.rawPositionM != nil,
-        "tag parser first observation must bind node 1 with a position")
+            && localized.rawPositionM != nil
+            && localized.burstID == "BURST-1"
+            && localized.frameID == "frame-1001",
+        "tag parser first observation must bind node 1 with a position and burst linkage")
     let unlocalized = result.observations[2]
     require(
         unlocalized.boundNodeID == 3 && unlocalized.rawPositionM == nil,
@@ -8708,10 +8815,14 @@ do {
         "T2 scaled clock must map to absolute UTC")
 
     // T3: manual clock jump +300 s mid-session -> explicit discontinuity
-    // segment; interpolation across it is forbidden (UNAVAILABLE).
+    // segment; interpolation across it is forbidden (UNAVAILABLE). V1R5
+    // §7.4: bindings INSIDE the jump segment cannot be attributed to
+    // either side and are rejected fail-closed; bindings on the
+    // continuous sides map exactly.
     var t3Lines: [String] = []
     let t3Correlations: [(Double, Double, String)] = [
-        (1000.0, now, "session_start"),
+        (980.0, now - 20.0, "session_start"),
+        (1000.0, now, "periodic"),
         (1015.0, now + 315.0, "system_clock_change"),
         (1030.0, now + 330.0, "periodic"),
         (1060.0, now + 360.0, "session_end"),
@@ -8720,7 +8831,7 @@ do {
         t3Lines.append(try clockLine(correlation(uptime, utc: utc, reason: reason)))
     }
     let t3Bindings: [(Int, Double, Double)] = [
-        (1, 1000.5, now + 0.5), (2, 1001.0, now + 1.0),
+        (1, 990.5, now - 9.5), (2, 995.0, now - 5.0),
         (3, 1015.5, now + 315.5), (4, 1016.0, now + 316.0),
     ]
     for (nodeID, uptime, utc) in t3Bindings {
@@ -8728,18 +8839,31 @@ do {
             nodeID, nodeStamp: uptime, uptime: uptime, utc: utc)))
     }
     let t3Evidence = try parseLines(
-        t3Lines, expectedCorrelation: 4, expectedBinding: 4)
+        t3Lines, expectedCorrelation: 5, expectedBinding: 4)
     let t3Mapper = StrictClockEvidenceParser.buildMapper(
-        evidence: t3Evidence, sessionStartStamp: 1000.5)
+        evidence: t3Evidence, sessionStartStamp: 990.5)
     require(
-        abs((t3Mapper.utcSeconds(forMonotonic: 0) ?? -1) - (now + 0.5)) < 1.0e-6,
+        abs((t3Mapper.utcSeconds(forMonotonic: 0) ?? -1) - (now - 9.5)) < 1.0e-6,
         "T3 pre-jump mapping must be exact")
     require(
-        t3Mapper.utcSeconds(forMonotonic: 1.0) == nil,
+        t3Mapper.utcSeconds(forMonotonic: 10.0) == nil,
         "T3 must not interpolate across the clock jump")
     require(
-        abs((t3Mapper.utcSeconds(forMonotonic: 15.5) ?? -1) - (now + 316.0)) < 1.0e-6,
+        abs((t3Mapper.utcSeconds(forMonotonic: 25.0) ?? -1) - (now + 315.5)) < 1.0e-6,
         "T3 post-jump mapping must be exact")
+    // T3b: a binding INSIDE the jump segment is not attributable and
+    // must fail closed (V1R5 §7.4).
+    expectRejection("T3b jump-segment binding", { if case .bindingUTCMismatch = $0 { return true }; return false }) {
+        try parseLines([
+            try clockLine(correlation(980.0, utc: now - 20.0, reason: "session_start")),
+            try clockLine(correlation(1000.0, utc: now, reason: "periodic")),
+            try clockLine(correlation(1015.0, utc: now + 315.0, reason: "system_clock_change")),
+            try clockLine(correlation(1030.0, utc: now + 330.0, reason: "periodic")),
+            try clockLine(binding(1, nodeStamp: 990.5, uptime: 990.5, utc: now - 9.5)),
+            try clockLine(binding(2, nodeStamp: 1001.0, uptime: 1001.0, utc: now + 1.0)),
+            try clockLine(binding(3, nodeStamp: 1015.5, uptime: 1015.5, utc: now + 315.5)),
+        ])
+    }
 
     // T4: DST transition (same timezone id, offset -18000 -> -14400);
     // absolute UTC stays continuous so no discontinuity edge, and the
@@ -8771,10 +8895,13 @@ do {
         "T4 DST local offset context must switch")
 
     // T5: timezone change (UTC -> Asia/Shanghai) is an explicit
-    // discontinuity; interpolation across it is forbidden.
+    // discontinuity; interpolation across it is forbidden. V1R5 §7.4:
+    // bindings inside the change segment are rejected fail-closed.
     var t5Lines: [String] = []
     t5Lines.append(try clockLine(correlation(
-        1000.0, utc: now, reason: "session_start")))
+        985.0, utc: now - 15.0, reason: "session_start")))
+    t5Lines.append(try clockLine(correlation(
+        1000.0, utc: now)))
     t5Lines.append(try clockLine(correlation(
         1030.0, utc: now + 30.0, timezone: "Asia/Shanghai", offset: 28800,
         reason: "timezone_change")))
@@ -8782,9 +8909,9 @@ do {
         1060.0, utc: now + 60.0, timezone: "Asia/Shanghai", offset: 28800,
         reason: "session_end")))
     t5Lines.append(try clockLine(binding(
-        1, nodeStamp: 1000.5, uptime: 1000.5, utc: now + 0.5)))
+        1, nodeStamp: 990.5, uptime: 990.5, utc: now - 9.5)))
     t5Lines.append(try clockLine(binding(
-        2, nodeStamp: 1001.0, uptime: 1001.0, utc: now + 1.0)))
+        2, nodeStamp: 995.0, uptime: 995.0, utc: now - 5.0)))
     t5Lines.append(try clockLine(binding(
         3, nodeStamp: 1030.5, uptime: 1030.5, utc: now + 30.5,
         timezone: "Asia/Shanghai", offset: 28800)))
@@ -8792,14 +8919,14 @@ do {
         4, nodeStamp: 1031.0, uptime: 1031.0, utc: now + 31.0,
         timezone: "Asia/Shanghai", offset: 28800)))
     let t5Evidence = try parseLines(
-        t5Lines, expectedCorrelation: 3, expectedBinding: 4)
+        t5Lines, expectedCorrelation: 4, expectedBinding: 4)
     let t5Mapper = StrictClockEvidenceParser.buildMapper(
-        evidence: t5Evidence, sessionStartStamp: 1000.5)
+        evidence: t5Evidence, sessionStartStamp: 990.5)
     require(
         t5Mapper.utcSeconds(forMonotonic: 15.0) == nil,
         "T5 must not interpolate across the timezone change")
     require(
-        abs((t5Mapper.utcSeconds(forMonotonic: 30.0) ?? -1) - (now + 30.5)) < 1.0e-6,
+        abs((t5Mapper.utcSeconds(forMonotonic: 40.0) ?? -1) - (now + 30.5)) < 1.0e-6,
         "T5 post-change mapping must be exact")
 
     // T6: metadata watermark count mismatch.
