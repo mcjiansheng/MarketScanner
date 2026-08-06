@@ -69,6 +69,12 @@ enum MobileProcessingPipeline {
         progress: (Double, String) -> Void,
         isCancelled: @escaping () -> Bool
     ) throws -> Outcome {
+        // V1R3 §8.1 eligibility: an unknown build identity must never
+        // reach a publishable session.
+        guard request.appGitSHA != "unknown", !request.appGitSHA.isEmpty else {
+            throw MobileOnlyWorkflowError.invalidState(
+                "app build identity is unknown; processing is blocked")
+        }
         progress(0.05, "生成会话快照")
         try ProcessingResourceGovernor.checkBudget(stage: "snapshot")
         let snapshot = try SessionSnapshotTransaction.snapshot(

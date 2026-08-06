@@ -11,6 +11,7 @@
 		4EA7C2000000000200200001 /* market_scanner_factor_graph.cpp in Sources */ = {isa = PBXBuildFile; fileRef = 4EA7C2000000000200200002 /* market_scanner_factor_graph.cpp */; };
 		4EA7C1000000000F00200001 /* MobileNativeFactorGraph.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA7C1000000000F00200002 /* MobileNativeFactorGraph.swift */; };
 		4EA7C1000000001100200001 /* MobileNativeGraphTypes.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA7C1000000001100200002 /* MobileNativeGraphTypes.swift */; };
+		4EA7C1000000001200200001 /* MobileBuildIdentity.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA7C1000000001200200002 /* MobileBuildIdentity.swift */; };
 		4EA7C1000000001000200001 /* ProcessingResourceGovernor.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA7C1000000001000200002 /* ProcessingResourceGovernor.swift */; };
 		4EA7C2000000000200100001 /* MobileGraphReader.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA7C2000000000200100002 /* MobileGraphReader.swift */; };
 		4EA7C1000000000000100001 /* MobileOnlyWorkflowState.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA7C1000000000000100002 /* MobileOnlyWorkflowState.swift */; };
@@ -206,6 +207,7 @@
 		4EA7C2000000000200200004 /* MSMarketScannerFactorGraphBridge.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; name = MSMarketScannerFactorGraphBridge.h; path = RTABMapApp/MSMarketScannerFactorGraphBridge.h; sourceTree = "<group>"; };
 		4EA7C1000000000F00200002 /* MobileNativeFactorGraph.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = MobileNativeFactorGraph.swift; path = RTABMapApp/MobileOnlyWorkflow/MobileNativeFactorGraph.swift; sourceTree = "<group>"; };
 		4EA7C1000000001100200002 /* MobileNativeGraphTypes.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = MobileNativeGraphTypes.swift; path = RTABMapApp/MobileOnlyWorkflow/MobileNativeGraphTypes.swift; sourceTree = "<group>"; };
+		4EA7C1000000001200200002 /* MobileBuildIdentity.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = MobileBuildIdentity.swift; path = RTABMapApp/MobileOnlyWorkflow/MobileBuildIdentity.swift; sourceTree = "<group>"; };
 		4EA7C1000000001000200002 /* ProcessingResourceGovernor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = ProcessingResourceGovernor.swift; path = RTABMapApp/MobileOnlyWorkflow/ProcessingResourceGovernor.swift; sourceTree = "<group>"; };
 		4EA7C2000000000200100002 /* MobileGraphReader.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = MobileGraphReader.swift; path = RTABMapApp/MobileOnlyWorkflow/MobileGraphReader.swift; sourceTree = "<group>"; };
 		4EA7C1000000000000100002 /* MobileOnlyWorkflowState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = MobileOnlyWorkflowState.swift; path = RTABMapApp/MobileOnlyWorkflow/MobileOnlyWorkflowState.swift; sourceTree = "<group>"; };
@@ -684,7 +686,7 @@
 				4EB1A66525A0D90B0043C7BF /* RTABMap.swift */,
 				4E2C516525A63119005CEDBD /* DatabaseView.swift */,
 				4E2C516625A63119005CEDBD /* VerticalScrollerView.swift */,
-				4EA7C1000000000000100002 /* MobileOnlyWorkflowState.swift */,				4EA7C1000000000100100002 /* MobileOnlyWorkflowError.swift */,				4EA7C1000000000200100002 /* MobileMapLibrary.swift */,				4EA7C1000000000300100002 /* MobileProcessingTaskStore.swift */,				4EA7C1000000000400100002 /* MobileResultLibrary.swift */,				4EA7C1000000000500100002 /* MobileOnlyWorkflowCoordinator.swift */,				4EA7C1000000000600100002 /* MobileProcessingPipeline.swift */,				4EA7C1000000000F00200002 /* MobileNativeFactorGraph.swift */,				4EA7C1000000001100200002 /* MobileNativeGraphTypes.swift */,				4EA7C1000000001000200002 /* ProcessingResourceGovernor.swift */,				4EA7C1000000000700100002 /* MobileOnlyHomeViewController.swift */,				4EA7C1000000000800100002 /* MobileMapLibraryViewController.swift */,				4EA7C1000000000900100002 /* MobileMapImportViewController.swift */,				4EA7C1000000000A00100002 /* MobileMapCompileProgressViewController.swift */,				4EA7C1000000000B00100002 /* MobileScanSetupViewController.swift */,				4EA7C1000000000C00100002 /* MobileProcessingViewController.swift */,				4EA7C1000000000D00100002 /* MobileResultViewController.swift */,				4EA7C1000000000E00100002 /* MobileRescanTasksViewController.swift */,
+				4EA7C1000000000000100002 /* MobileOnlyWorkflowState.swift */,				4EA7C1000000000100100002 /* MobileOnlyWorkflowError.swift */,				4EA7C1000000000200100002 /* MobileMapLibrary.swift */,				4EA7C1000000000300100002 /* MobileProcessingTaskStore.swift */,				4EA7C1000000000400100002 /* MobileResultLibrary.swift */,				4EA7C1000000000500100002 /* MobileOnlyWorkflowCoordinator.swift */,				4EA7C1000000000600100002 /* MobileProcessingPipeline.swift */,				4EA7C1000000000F00200002 /* MobileNativeFactorGraph.swift */,				4EA7C1000000001100200002 /* MobileNativeGraphTypes.swift */,				4EA7C1000000001200200002 /* MobileBuildIdentity.swift */,				4EA7C1000000001000200002 /* ProcessingResourceGovernor.swift */,				4EA7C1000000000700100002 /* MobileOnlyHomeViewController.swift */,				4EA7C1000000000800100002 /* MobileMapLibraryViewController.swift */,				4EA7C1000000000900100002 /* MobileMapImportViewController.swift */,				4EA7C1000000000A00100002 /* MobileMapCompileProgressViewController.swift */,				4EA7C1000000000B00100002 /* MobileScanSetupViewController.swift */,				4EA7C1000000000C00100002 /* MobileProcessingViewController.swift */,				4EA7C1000000000D00100002 /* MobileResultViewController.swift */,				4EA7C1000000000E00100002 /* MobileRescanTasksViewController.swift */,
 				4EA7C2000000000000100002 /* MSRTABMapGraphReaderBridge.h */,				4EA7C2000000000100100002 /* MSRTABMapGraphReaderBridge.mm */,				4EA7C2000000000200200004 /* MSMarketScannerFactorGraphBridge.h */,				4EA7C2000000000200200002 /* market_scanner_factor_graph.cpp */,				4EA7C2000000000200200003 /* market_scanner_factor_graph.h */,				4EA7C2000000000200100002 /* MobileGraphReader.swift */,
 			);
 			name = RTABMapApp;
@@ -962,6 +964,7 @@
 				4EE015BF259A2AF0008CCE65 /* Frameworks */,
 				4EA4BDE12635BD4500706703 /* ShellScript */,
 				4EE015C0259A2AF0008CCE65 /* Resources */,
+				4EA7C3000000000000300001 /* MarketScanner Build Identity */,
 			);
 			buildRules = (
 			);
@@ -1045,6 +1048,25 @@
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;
 			shellScript = "# Type a script or drag a script file from your workspace to insert its path.\nversion=\"$MARKETING_VERSION\"\n/usr/libexec/PlistBuddy -c \"Set PreferenceSpecifiers:24:DefaultValue $version\" \"${SRCROOT}/Settings.bundle/Root.plist\"\n";
+		};
+		4EA7C3000000000000300001 /* MarketScanner Build Identity */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+			);
+			name = "MarketScanner Build Identity";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "# V1R3: embed the exact git SHA, wave and native core SHA into the\n# app bundle; 'unknown' must never reach an eligible session.\nset -e\nREPO_ROOT=\"$SRCROOT/../..\"\nAPP_SHA=$(cd \"$REPO_ROOT\" && git rev-parse HEAD 2>/dev/null || echo unknown)\nWAVE=$(cd \"$REPO_ROOT\" && python3 -c \"import json;print(json.load(open('.github/marketscanner-repair-v2-wave.json')).get('wave','unknown'))\" 2>/dev/null || echo unknown)\nCORE_SHA=$(cd \"$REPO_ROOT\" && cat core/MarketScannerFactorGraph/market_scanner_factor_graph.cpp core/MarketScannerFactorGraph/market_scanner_factor_graph.h | shasum -a 256 | cut -d\" \" -f1 || echo unknown)\nOUT=\"$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH/MarketScannerBuildIdentity.json\"\nprintf '{\n  \"format\": \"MarketScannerBuildIdentity\",\n  \"version\": 1,\n  \"app_git_sha\": \"%s\",\n  \"wave\": \"%s\",\n  \"native_core_sha256\": \"%s\"\n}\n' \"$APP_SHA\" \"$WAVE\" \"$CORE_SHA\" > \"$OUT\"\n";
 		};
 /* End PBXShellScriptBuildPhase section */
 
@@ -1158,6 +1180,7 @@
 				4EA7C2000000000200200001 /* market_scanner_factor_graph.cpp in Sources */,
 				4EA7C1000000000F00200001 /* MobileNativeFactorGraph.swift in Sources */,
 				4EA7C1000000001100200001 /* MobileNativeGraphTypes.swift in Sources */,
+				4EA7C1000000001200200001 /* MobileBuildIdentity.swift in Sources */,
 				4EA7C1000000001000200001 /* ProcessingResourceGovernor.swift in Sources */,
 				4EA7C2000000000200100001 /* MobileGraphReader.swift in Sources */,
 			);

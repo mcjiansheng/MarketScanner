@@ -15,12 +15,17 @@ on:
       - "CMakePresets.json"
       - "app/android/jni/**"
       - "app/ios/RTABMapApp/**"
+      - "core/MarketScannerFactorGraph/**"
       - "docs/map-assisted-localization/**"
       - "tools/PriorMap/**"
       - "tools/Qualification/**"
       - "tools/Reprocess/CMakeLists.txt"
       - "tools/Reprocess/main.cpp"
       - "tools/Reprocess/prior_map_factor_graph.cpp"
+      - "tools/Reprocess/market_scanner_graph_cli.cpp"
+      - "tools/Reprocess/market_scanner_native_tests.cpp"
+      - "app/ios/RTABMapApp/MSMarketScannerFactorGraphBridge.h"
+      - "app/ios/RTABMapApp/MobileOnlyWorkflow/MobileNativeFactorGraph.swift"
       - "tools/SupermarketMapStudio/**"
 
 concurrency:
@@ -58,6 +63,49 @@ jobs:
             echo "- Required persisted evidence failures block finalized metadata"
             echo "- Job result: \`${{ job.status }}\`"
           } | tee "$GITHUB_STEP_SUMMARY"
+
+  exact-sha-bindings:
+    name: Exact SHA and wave bindings
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Emit exact SHAs
+        shell: bash
+        run: |
+          echo "head_sha=$(git rev-parse HEAD)" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "native_core_sha256=$(sha256sum core/MarketScannerFactorGraph/market_scanner_factor_graph.cpp core/MarketScannerFactorGraph/market_scanner_factor_graph.h | sha256sum | cut -d' ' -f1)" | tee -a "$GITHUB_STEP_SUMMARY"
+          python3 - <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
+          import json
+          wave = json.load(open(".github/marketscanner-repair-v2-wave.json", encoding="utf-8"))
+          print("wave_implementation_sha=" + wave.get("implementation_sha", ""))
+          print("wave_validation_sha=" + wave.get("validation_sha", ""))
+          PY
+      - name: Enforce no production drift after bound implementation SHA
+        shell: bash
+        run: |
+          impl="$(python3 -c 'import json; print(json.load(open(".github/marketscanner-repair-v2-wave.json", encoding="utf-8"))["implementation_sha"])')"
+          if ! printf '%s' "$impl" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "implementation_sha not yet bound; drift check skipped."
+            exit 0
+          fi
+          git cat-file -e "$impl^{commit}"
+          # After the implementation SHA only docs/wave/status may change.
+          if ! git diff --quiet "$impl...HEAD" -- \
+              core app/ios tools/Reprocess tools/PriorMap tools/Qualification \
+              tools/SupermarketMapStudio CMakeLists.txt CMakePresets.json; then
+            echo "::error::Production code changed after the bound implementation SHA $impl"
+            git diff --stat "$impl...HEAD" -- \
+              core app/ios tools/Reprocess tools/PriorMap tools/Qualification \
+              tools/SupermarketMapStudio CMakeLists.txt CMakePresets.json
+            exit 1
+          fi
+          echo "No production drift since implementation SHA $impl."
 
   python-and-web:
     name: Ubuntu Python, API and web contracts
@@ -426,6 +474,8 @@ jobs:
             app/ios/RTABMapApp/MobileOnlyWorkflow/MobileProcessingPipeline.swift \
             app/ios/RTABMapApp/MobileOnlyWorkflow/MobileProcessingTaskStore.swift \
             app/ios/RTABMapApp/MobileOnlyWorkflow/MobileResultLibrary.swift \
+            app/ios/RTABMapApp/MobileOnlyWorkflow/MobileNativeGraphTypes.swift \
+            app/ios/RTABMapApp/MobileOnlyWorkflow/MobileBuildIdentity.swift \
             app/ios/RTABMapApp/MobileOnlyWorkflow/ProcessingResourceGovernor.swift \
       - name: Run platform-independent iOS contract test
         id: swift_contracts
@@ -501,6 +551,17 @@ jobs:
             build
           echo "status=succeeded" >> "$GITHUB_OUTPUT"
           echo "- Unsigned generic arm64 iOS build: **SUCCEEDED** (Swift and native translation units compiled and linked)" >> ci-artifacts/macos-ios-summary.md
+      - name: Verify embedded build identity matches the exact HEAD
+        if: steps.ios_build.outputs.status == 'succeeded'
+        shell: bash
+        run: |
+          identity="$RUNNER_TEMP/MarketScannerDerivedData/Build/Products/Release-iphoneos/RTABMapApp.app/MarketScannerBuildIdentity.json"
+          test -f "$identity" || { echo "::error::MarketScannerBuildIdentity.json missing from the app bundle"; exit 1; }
+          cat "$identity" >> ci-artifacts/macos-ios-summary.md
+          grep -F "\"app_git_sha\": \"$(git rev-parse HEAD)\"" "$identity" \
+            || { echo "::error::embedded app SHA does not match the exact HEAD"; exit 1; }
+          grep -F "\"native_core_sha256\": \"$(sha256sum core/MarketScannerFactorGraph/market_scanner_factor_graph.cpp core/MarketScannerFactorGraph/market_scanner_factor_graph.h | sha256sum | cut -d' ' -f1)\"" "$identity" \
+            || { echo "::error::embedded native core SHA does not match the source tree"; exit 1; }
       - name: Finalize macOS test summary
         if: always()
         shell: bash

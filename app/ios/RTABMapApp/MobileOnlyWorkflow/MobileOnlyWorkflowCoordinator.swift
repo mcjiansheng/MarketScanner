@@ -142,6 +142,9 @@ final class MobileOnlyWorkflowCoordinator {
     var osVersion: String = "unknown"
     /// SHA of the processing policy in effect (§5.2 policy_sha).
     var policySHA: String = "mobile-processing-policy-v1"
+    /// Exact source SHA of the shared native factor-graph core compiled
+    /// into this app (V1R3 §4.4 / §14.4 binding).
+    var nativeCoreSHA256: String = "unknown"
 
     // MARK: - Durable context (§5.2)
 

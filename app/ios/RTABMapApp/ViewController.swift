@@ -434,7 +434,12 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         // gateway (V1R2 Gate G): production Fast/Deep runs never use the
         // Swift reference solver.
         MobileNativeFactorGraph.wireIntoGateway()
-        coordinator.appGitSHA = "unknown" // bound by the CI build step
+        // Exact build identity embedded by the Xcode script phase (V1R3
+        // §4.4); an unusable identity blocks processing eligibility.
+        let identity = MobileBuildIdentity.loadFromBundle()
+        coordinator.appGitSHA = identity.appGitSHA
+        coordinator.policySHA = identity.wave
+        coordinator.nativeCoreSHA256 = identity.nativeCoreSHA256
         coordinator.appVersion =
             Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.22.0"
         coordinator.deviceModel = UIDevice.current.model

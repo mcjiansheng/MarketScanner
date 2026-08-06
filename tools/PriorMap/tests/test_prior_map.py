@@ -430,6 +430,8 @@ class IOSCoreContractTests(unittest.TestCase):
             repository
             / "app/ios/RTABMapApp/MobileOnlyWorkflow/MobileNativeGraphTypes.swift",
             repository
+            / "app/ios/RTABMapApp/MobileOnlyWorkflow/MobileBuildIdentity.swift",
+            repository
             / "app/ios/RTABMapApp/MobileOnlyWorkflow/ProcessingResourceGovernor.swift",
             repository
             / "app/ios/RTABMapApp/MobileOnlyWorkflow/MobileProcessingPipeline.swift",
