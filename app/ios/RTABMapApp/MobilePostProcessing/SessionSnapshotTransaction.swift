@@ -491,13 +491,17 @@ enum SessionSnapshotTransaction {
             var installedNewSnapshot = false
             do {
                 if fileManager.fileExists(atPath: snapshotDirectory.path) {
-                    try fileManager.moveItem(
-                        at: snapshotDirectory, to: backupDirectory)
+                    try renameDirectoryExclusively(
+                        snapshotDirectory,
+                        to: backupDirectory,
+                        context: "cannot stage previous snapshot backup")
                     movedPreviousSnapshot = true
                     try fsyncDirectory(taskRoot)
                 }
-                try fileManager.moveItem(
-                    at: stagingDirectory, to: snapshotDirectory)
+                try renameDirectoryExclusively(
+                    stagingDirectory,
+                    to: snapshotDirectory,
+                    context: "cannot install immutable snapshot")
                 installedNewSnapshot = true
                 try fsyncDirectory(taskRoot)
                 try faultInjector?(.afterSnapshotInstall)
@@ -520,8 +524,10 @@ enum SessionSnapshotTransaction {
                     }
                     if movedPreviousSnapshot,
                        fileManager.fileExists(atPath: backupDirectory.path) {
-                        try fileManager.moveItem(
-                            at: backupDirectory, to: snapshotDirectory)
+                        try renameDirectoryExclusively(
+                            backupDirectory,
+                            to: snapshotDirectory,
+                            context: "cannot restore previous snapshot")
                     }
                     if let priorTaskManifest {
                         try priorTaskManifest.write(
@@ -1259,6 +1265,25 @@ enum SessionSnapshotTransaction {
         try FileManager.default.removeItem(at: directory)
     }
 
+    /// Foundation's `moveItem` may reject a 0555 source directory before
+    /// issuing the same-volume rename on some macOS releases. Snapshot
+    /// generations are deliberately frozen before publication, so use the
+    /// Darwin primitive directly and keep the destination no-replace.
+    private static func renameDirectoryExclusively(
+        _ source: URL,
+        to destination: URL,
+        context: String
+    ) throws {
+        guard renameatx_np(
+            AT_FDCWD, source.path,
+            AT_FDCWD, destination.path,
+            UInt32(RENAME_EXCL)) == 0 else {
+            let renameError = errno
+            throw SessionError.copyFailed(
+                context + ": " + String(cString: strerror(renameError)))
+        }
+    }
+
     private static func recoverInterruptedCommitIfNeeded(
         taskRoot: URL,
         snapshotDirectory: URL,
@@ -1278,16 +1303,20 @@ enum SessionSnapshotTransaction {
                 do {
                     try revalidateSnapshot(backupDirectory)
                     try removeImmutableTree(snapshotDirectory)
-                    try fileManager.moveItem(
-                        at: backupDirectory, to: snapshotDirectory)
+                    try renameDirectoryExclusively(
+                        backupDirectory,
+                        to: snapshotDirectory,
+                        context: "cannot restore verified snapshot backup")
                     try fsyncDirectory(taskRoot)
                     return
                 } catch {
                     if snapshotMatchesTaskReferenceLoosely(
                         backupDirectory, taskRoot: taskRoot) {
                         try removeImmutableTree(snapshotDirectory)
-                        try fileManager.moveItem(
-                            at: backupDirectory, to: snapshotDirectory)
+                        try renameDirectoryExclusively(
+                            backupDirectory,
+                            to: snapshotDirectory,
+                            context: "cannot restore referenced snapshot backup")
                         try fsyncDirectory(taskRoot)
                         return
                     }
@@ -1303,8 +1332,10 @@ enum SessionSnapshotTransaction {
             throw SessionError.copyFailed(
                 "orphaned snapshot backup does not match the task reference")
         }
-        try fileManager.moveItem(
-            at: backupDirectory, to: snapshotDirectory)
+        try renameDirectoryExclusively(
+            backupDirectory,
+            to: snapshotDirectory,
+            context: "cannot recover orphaned snapshot backup")
         try fsyncDirectory(taskRoot)
     }
 

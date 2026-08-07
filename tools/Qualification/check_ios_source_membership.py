@@ -482,11 +482,20 @@ def audit_project(
             disk_production.add(_normal_path(path))
 
     target_swift = set(result.swift_sources)
-    target_swift_casefold = {str(path).casefold(): path for path in target_swift}
+    # `WindowsPath` equality is case-insensitive. Compare the path spelling
+    # as a plain string first so a pbxproj entry with the wrong case cannot
+    # collapse into the real production path before the casefold lookup.
+    target_swift_spellings = {
+        os.fspath(path): path for path in result.swift_sources
+    }
+    target_swift_casefold = {
+        os.fspath(path).casefold(): path for path in result.swift_sources
+    }
     for production_path in sorted(disk_production, key=lambda item: item.as_posix()):
-        if production_path in target_swift:
+        production_spelling = os.fspath(production_path)
+        if production_spelling in target_swift_spellings:
             continue
-        wrong_case = target_swift_casefold.get(str(production_path).casefold())
+        wrong_case = target_swift_casefold.get(production_spelling.casefold())
         if wrong_case:
             result.issues.append(
                 Issue(

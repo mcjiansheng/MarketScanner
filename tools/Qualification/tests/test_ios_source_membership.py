@@ -1,6 +1,7 @@
 import json
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 from tools.Qualification.check_ios_source_membership import audit_project
@@ -149,8 +150,20 @@ class IOSSourceMembershipTests(unittest.TestCase):
 
     def test_case_mismatch_is_rejected(self):
         self.write_source("Feature.swift")
-        result = self.audit(fixture_pbxproj(source_path="RTABMapApp/feature.swift"))
+        # Exercise the inventory fallback even when the component-by-component
+        # disk spelling probe cannot help (the Windows failure mode). Path
+        # equality itself must never be the exact-case gate.
+        with mock.patch(
+            "tools.Qualification.check_ios_source_membership._case_mismatch",
+            return_value=None,
+        ):
+            result = self.audit(
+                fixture_pbxproj(source_path="RTABMapApp/feature.swift")
+            )
         self.assertIn("case_mismatch", self.issue_codes(result))
+        issue = next(issue for issue in result.issues if issue.code == "case_mismatch")
+        self.assertIn("Feature.swift", issue.message)
+        self.assertIn("feature.swift", issue.message)
 
     def test_orphan_file_ref_and_build_file_are_rejected(self):
         self.write_source()
