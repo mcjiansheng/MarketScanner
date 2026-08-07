@@ -114,7 +114,16 @@ final class MobileProcessingViewController: UIViewController, UITableViewDataSou
                 self.pushResult(entry)
             case .failure(let error):
                 self.progressView.setProgress(0.0, animated: true)
-                self.statusLabel.text = "处理失败：\(error.localizedDescription)"
+                if case .rescanSessionRequired(let detail) = error {
+                    self.statusLabel.text = "需要重新扫描整个会话：\(detail)"
+                    self.presentNotice(
+                        "本会话的快速优化和一次全图优化仍未达到发布门槛，"
+                        + "或最终轨迹没有可发布节点。\n\n"
+                        + "系统已安全保存 RESCAN_SESSION 记录；本次没有发布 "
+                        + "PriceTags、DevicePositions 或普通结果。请重新扫描整个会话。")
+                } else {
+                    self.statusLabel.text = "处理失败：\(error.localizedDescription)"
+                }
             }
             self.tableView.reloadData()
         })

@@ -731,6 +731,15 @@ class MapStudioApiTests(unittest.TestCase):
             Path(server.localized.__file__).read_bytes(),
         )
 
+    def test_prior_map_frontend_requires_and_preserves_exact_store_id(self) -> None:
+        page, _ = self.fetch("/")
+        script, _ = self.fetch("/app.js")
+        self.assertIn(b'id="prior-store-id"', page)
+        self.assertIn(b"store_id: $(\"#prior-store-id\").value", script)
+        self.assertNotIn(b"store_id: $(\"#prior-store-id\").value.trim()", script)
+        self.assertIn(b"payload.store_id.trim() !== payload.store_id", script)
+        self.assertIn(b'mapName === "" ? null : mapName', script)
+
     def test_operator_diagnostics_bundle_excludes_session_token(self) -> None:
         result = self.api(
             "/api/diagnostics/export",
@@ -1247,11 +1256,17 @@ class MapStudioApiTests(unittest.TestCase):
         source_before = workbook.read_bytes()
         job = self.api(
             "/api/prior-map/convert",
-            {"xlsx": str(workbook), "output": str(output), "name": "测试货架图"},
+            {
+                "xlsx": str(workbook),
+                "output": str(output),
+                "name": "测试货架图",
+                "store_id": "STORE-001",
+            },
         )
         completed = self.wait_for_job(job["id"])
         self.assertEqual(completed["status"], "complete", completed.get("error"))
         self.assertEqual(completed["kind"], "prior_map")
+        self.assertEqual(completed["map"]["store_id"], "STORE-001")
         self.assertEqual(completed["map"]["name"], "测试货架图")
         self.assertEqual(completed["map"]["element_statistics"]["MapShelf"], 1)
         self.assertIn("preview.png", completed["artifacts"])
@@ -1265,6 +1280,27 @@ class MapStudioApiTests(unittest.TestCase):
         self.assertTrue(inspection["valid"])
         self.assertEqual(inspection["manifest"]["prior_map_id"], completed["map"]["prior_map_id"])
         self.assertEqual(workbook.read_bytes(), source_before)
+
+    def test_prior_map_api_requires_exact_business_identity(self) -> None:
+        workbook = self.root / "prior-map-identity.xlsx"
+        create_prior_map_workbook(workbook)
+
+        for suffix, store_id in (("missing", None), ("whitespace", " STORE-001")):
+            output = self.root / f"PriorMap-output-{suffix}"
+            request = {
+                "xlsx": str(workbook),
+                "output": str(output),
+                "name": "测试货架图",
+            }
+            if store_id is not None:
+                request["store_id"] = store_id
+            with self.subTest(store_id=store_id):
+                with self.assertRaises(HTTPError) as rejected:
+                    self.api("/api/prior-map/convert", request)
+                self.assertEqual(rejected.exception.code, 400)
+                self.assertEqual(rejected.exception.payload["code"], "bad_request")
+                self.assertIn("store_id", rejected.exception.payload["error"])
+                self.assertFalse(output.exists())
 
     def test_session_inspection_keeps_storage_and_workflow_modes_separate(self) -> None:
         legacy = self.api(

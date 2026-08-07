@@ -11,6 +11,11 @@ enum MobileOnlyWorkflowError: Error, LocalizedError, Equatable {
     case libraryUnavailable(String)
     case snapshotFailed(String)
     case processingFailed(String)
+    /// Route A terminal product outcome: Fast plus the single allowed
+    /// full existing-graph optimization could not produce a publishable
+    /// session. This is not a generic processing failure and must never
+    /// publish a normal Result package.
+    case rescanSessionRequired(String)
     case exportFailed(String)
     case pickerCopyFailed(String)
     case invalidState(String)
@@ -37,6 +42,7 @@ enum MobileOnlyWorkflowError: Error, LocalizedError, Equatable {
         case .libraryUnavailable: return "workflow.library_unavailable"
         case .snapshotFailed: return "workflow.snapshot_failed"
         case .processingFailed: return "workflow.processing_failed"
+        case .rescanSessionRequired: return "workflow.rescan_session_required"
         case .exportFailed: return "workflow.export_failed"
         case .pickerCopyFailed: return "workflow.picker_copy_failed"
         case .invalidState: return "workflow.invalid_state"
@@ -62,6 +68,8 @@ enum MobileOnlyWorkflowError: Error, LocalizedError, Equatable {
             return "会话快照失败：\(detail)"
         case .processingFailed(let detail):
             return "处理失败：\(detail)"
+        case .rescanSessionRequired(let detail):
+            return "需要重新扫描整个会话：\(detail)"
         case .exportFailed(let detail):
             return "结果导出失败：\(detail)"
         case .pickerCopyFailed(let detail):

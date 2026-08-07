@@ -372,7 +372,8 @@ MSFactorGraphRequestC makeRequest(
     request.absolute_priors = priors.empty() ? nullptr : priors.data();
     request.absolute_prior_count = static_cast<int64_t>(priors.size());
     request.prior_map_id = "test-map";
-    request.prior_map_sha256 = "test-sha";
+    request.prior_map_sha256 =
+        "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
     request.tracking_session_id = "test-session";
     request.projection_policy_version = 1;
     request.max_wall_seconds = 300;
@@ -393,6 +394,8 @@ void testSyntheticScenarios()
         MSFactorGraphRequestC request = makeRequest(builder.path, priors, noTags);
         MSFactorGraphOutcomeC outcome = MSFactorGraphRunFast(&request);
         CHECK(outcome.error == nullptr, "clean run has no error");
+        CHECK(outcome.abi_version == MS_FACTOR_GRAPH_ABI_VERSION,
+              "C outcome carries the exact runtime ABI version");
         CHECK(outcome.disposition == MS_FACTOR_GRAPH_PASS, "clean graph with priors must PASS");
         CHECK(outcome.count > 0 && outcome.rows != nullptr, "clean trajectory present");
         bool allEligible = outcome.count > 0;
@@ -401,6 +404,40 @@ void testSyntheticScenarios()
             if(!outcome.rows[i].publish_eligible) { allEligible = false; break; }
         }
         CHECK(allEligible, "clean graph rows are publish-eligible");
+        int64_t publishCount = 0;
+        for(int64_t i = 0; i < outcome.count; ++i)
+        {
+            if(outcome.rows[i].publish_eligible) ++publishCount;
+        }
+        CHECK(outcome.publish_count == publishCount,
+              "C publish_count mirrors publish-eligible trajectory rows");
+        CHECK(outcome.factor_count > 0 &&
+              outcome.factor_count <= MS_FACTOR_GRAPH_HARD_OPTIMIZER_FACTORS,
+              "C factor_count is bounded native optimizer truth");
+        CHECK(outcome.quality_json != nullptr && outcome.quality_json_size > 0 &&
+              static_cast<size_t>(outcome.quality_json_size) ==
+                  std::strlen(outcome.quality_json),
+              "quality JSON carries its exact bounded UTF-8 byte size");
+        CHECK(outcome.graph_input_sha256 != nullptr &&
+              outcome.graph_input_sha256_size == 64 &&
+              std::strlen(outcome.graph_input_sha256) == 64,
+              "graph input SHA has an independent exact C-ABI copy");
+        CHECK(outcome.factor_set_sha256 != nullptr &&
+              outcome.factor_set_sha256_size == 64 &&
+              std::strlen(outcome.factor_set_sha256) == 64,
+              "factor-set SHA has an independent exact C-ABI copy");
+        const std::string quality(outcome.quality_json);
+        CHECK(quality.find("\"abi_version\": 4") != std::string::npos,
+              "quality JSON runtime ABI matches C ABI v4");
+        CHECK(quality.find(outcome.graph_input_sha256) != std::string::npos &&
+              quality.find(outcome.factor_set_sha256) != std::string::npos,
+              "quality JSON graph/factor SHAs match C outcome copies");
+        CHECK(quality.find("\"factor_count\": " +
+              std::to_string(outcome.factor_count)) != std::string::npos,
+              "quality solver.factor_count matches C outcome truth");
+        CHECK(quality.find("\"publish_nodes\": " +
+              std::to_string(outcome.publish_count)) != std::string::npos,
+              "quality publish_nodes matches C outcome truth");
         bool uncertaintiesPresent = false;
         for(int64_t i = 0; i < outcome.count && !uncertaintiesPresent; ++i)
         {
@@ -451,6 +488,8 @@ void testSyntheticScenarios()
         MSFactorGraphOutcomeC outcome = MSFactorGraphRunFast(&request);
         CHECK(outcome.disposition == MS_FACTOR_GRAPH_NON_RECOVERABLE_FAIL,
               "malformed required link must fail closed");
+        CHECK(outcome.abi_version == MS_FACTOR_GRAPH_ABI_VERSION,
+              "error outcome still carries runtime ABI identity");
         CHECK(outcome.error != nullptr, "malformed run reports an error");
         MSFactorGraphFree(&outcome);
     }
@@ -538,6 +577,174 @@ void testReducerAndTopology()
     }
 }
 
+// MARK: - Hard optimizer scale boundary (RC-B11) -------------------------------
+
+GraphModel makeScaleModel(size_t count, bool neighborChain)
+{
+    GraphModel model;
+    model.nodes.reserve(count);
+    if(neighborChain && count > 0) model.links.reserve(count - 1);
+    for(size_t i = 0; i < count; ++i)
+    {
+        RawNode node;
+        node.id = static_cast<int64_t>(i + 1);
+        node.stamp = 1700000000.0 + static_cast<double>(i) * 0.1;
+        node.mapId = 0;
+        node.pose = SE2{static_cast<double>(i) * 0.1, 0.0, 0.0};
+        model.nodeIndex[node.id] = model.nodes.size();
+        model.nodes.push_back(node);
+        if(neighborChain && i > 0)
+        {
+            RawLink link;
+            link.from = static_cast<int64_t>(i);
+            link.to = static_cast<int64_t>(i + 1);
+            link.type = rtabmap::Link::kNeighbor;
+            link.measurement = SE2{0.1, 0.0, 0.0};
+            for(int k = 0; k < 9; ++k)
+                link.information[k] = (k % 4 == 0) ? 10.0 : 0.0;
+            model.links.push_back(link);
+        }
+    }
+    return model;
+}
+
+void testHardOptimizerScaleBoundary()
+{
+    ReducerPolicy policy;
+
+    // A large reducible chain stays at or below the exact hard cap.
+    {
+        GraphModel model = makeScaleModel(60000, true);
+        bool resourceExceeded = false;
+        const std::vector<size_t> skeleton = reduceGraph(
+            model, std::set<int64_t>(), policy, &resourceExceeded);
+        CHECK(!resourceExceeded, "reducible 60k chain should fit the hard cap");
+        CHECK(skeleton.size() <= kSkeletonMaxNodes,
+              "reduced skeleton must never exceed 4096 nodes");
+    }
+
+    // 60k tag-bound nodes: all are mandatory, so the reducer must stop
+    // with RESOURCE_REQUIRED rather than form an oversized g2o problem.
+    {
+        GraphModel model = makeScaleModel(60000, true);
+        std::set<int64_t> tags;
+        for(int64_t id = 1; id <= 60000; ++id) tags.insert(id);
+        bool resourceExceeded = false;
+        const std::vector<size_t> skeleton = reduceGraph(
+            model, tags, policy, &resourceExceeded);
+        CHECK(resourceExceeded, "60k tag-bound nodes must exceed the hard bound");
+        CHECK(skeleton.empty(), "resource rejection must not return a skeleton");
+    }
+
+    // 60k missing-neighbor gaps: every adjacent pair is a mandatory gap.
+    {
+        GraphModel model = makeScaleModel(60000, false);
+        bool resourceExceeded = false;
+        const std::vector<size_t> skeleton = reduceGraph(
+            model, std::set<int64_t>(), policy, &resourceExceeded);
+        CHECK(resourceExceeded, "60k gap endpoints must exceed the hard bound");
+        CHECK(skeleton.empty(), "gap overload must not return a skeleton");
+    }
+
+    // 60k curvature turns: alternating y makes every interior node a
+    // mandatory path-curvature anchor while neighbor topology is intact.
+    {
+        GraphModel model = makeScaleModel(60000, true);
+        for(size_t i = 0; i < model.nodes.size(); ++i)
+        {
+            model.nodes[i].pose.x = static_cast<double>(i);
+            model.nodes[i].pose.y = (i % 2 == 0) ? 0.0 : 1.0;
+        }
+        bool resourceExceeded = false;
+        const std::vector<size_t> skeleton = reduceGraph(
+            model, std::set<int64_t>(), policy, &resourceExceeded);
+        CHECK(resourceExceeded, "60k turn anchors must exceed the hard bound");
+        CHECK(skeleton.empty(), "turn overload must not return a skeleton");
+    }
+
+    // 60k non-neighbor constraint endpoints cover every node.
+    {
+        GraphModel model = makeScaleModel(60000, true);
+        model.links.reserve(model.links.size() + 30000);
+        for(int64_t id = 1; id <= 60000; id += 2)
+        {
+            RawLink link;
+            link.from = id;
+            link.to = id + 1;
+            link.type = rtabmap::Link::kGlobalClosure;
+            link.measurement = SE2{0.1, 0.0, 0.0};
+            for(int k = 0; k < 9; ++k)
+                link.information[k] = (k % 4 == 0) ? 10.0 : 0.0;
+            model.links.push_back(link);
+        }
+        bool resourceExceeded = false;
+        const std::vector<size_t> skeleton = reduceGraph(
+            model, std::set<int64_t>(), policy, &resourceExceeded);
+        CHECK(resourceExceeded, "60k constraint endpoints must exceed the hard bound");
+        CHECK(skeleton.empty(), "constraint overload must not return a skeleton");
+    }
+
+    // C ABI proof: 4097 real tag-bound DB nodes must report
+    // RESOURCE_REQUIRED with no skeleton/trajectory allocation.
+    {
+        SyntheticBuilder builder("hard_cap_4097");
+        sqlite3_exec(builder.db, "BEGIN IMMEDIATE", nullptr, nullptr, nullptr);
+        for(int64_t id = 1; id <= 4097; ++id)
+        {
+            builder.addNode(id, 1700000000.0 + id * 0.1, id * 0.1, 0.0, 0.0);
+            if(id > 1)
+                builder.addLink(id - 1, id, 0, 0.1, 0.0, 0.0, 50, 50, 80);
+        }
+        sqlite3_exec(builder.db, "COMMIT", nullptr, nullptr, nullptr);
+        std::vector<int64_t> tags(4097);
+        for(size_t i = 0; i < tags.size(); ++i) tags[i] = static_cast<int64_t>(i + 1);
+        std::vector<MSAbsolutePriorC> priors;
+        MSFactorGraphRequestC request = makeRequest(builder.path, priors, tags);
+        MSFactorGraphOutcomeC outcome = MSFactorGraphRunFast(&request);
+        CHECK(outcome.disposition == MS_FACTOR_GRAPH_RESOURCE_REQUIRED,
+              "4097 mandatory DB nodes must return RESOURCE_REQUIRED");
+        CHECK(outcome.count == 0 && outcome.rows == nullptr,
+              "resource rejection must not allocate trajectory rows");
+        CHECK(outcome.skeleton_count == 0 && outcome.skeleton_ids == nullptr,
+              "resource rejection must not allocate a skeleton");
+        MSFactorGraphFree(&outcome);
+    }
+
+    // Even with exactly 4096 vertices, 4097 factors must stop before g2o.
+    {
+        SyntheticBuilder builder("hard_factor_cap");
+        sqlite3_exec(builder.db, "BEGIN IMMEDIATE", nullptr, nullptr, nullptr);
+        for(int64_t id = 1; id <= 4096; ++id)
+        {
+            builder.addNode(id, 1700000000.0 + id * 0.1, id * 0.1, 0.0, 0.0);
+            if(id > 1)
+                builder.addLink(id - 1, id, 0, 0.1, 0.0, 0.0, 50, 50, 80);
+        }
+        sqlite3_exec(builder.db, "COMMIT", nullptr, nullptr, nullptr);
+        std::vector<int64_t> tags(4096);
+        for(size_t i = 0; i < tags.size(); ++i) tags[i] = static_cast<int64_t>(i + 1);
+        std::vector<MSAbsolutePriorC> priors(2);
+        for(size_t i = 0; i < priors.size(); ++i)
+        {
+            std::memset(&priors[i], 0, sizeof(priors[i]));
+            priors[i].node_id = i == 0 ? 1 : 4096;
+            priors[i].map_x = i == 0 ? 0.1 : 409.6;
+            priors[i].information_3x3[0] = 20.0;
+            priors[i].information_3x3[4] = 20.0;
+            priors[i].information_3x3[8] = 15.0;
+            priors[i].kind = MS_PRIOR_KIND_LOCALIZATION;
+            priors[i].episode_id = static_cast<int64_t>(i + 1);
+        }
+        MSFactorGraphRequestC request = makeRequest(builder.path, priors, tags);
+        MSFactorGraphOutcomeC outcome = MSFactorGraphRunFast(&request);
+        CHECK(outcome.disposition == MS_FACTOR_GRAPH_RESOURCE_REQUIRED,
+              "4097 optimizer factors must return RESOURCE_REQUIRED");
+        CHECK(outcome.skeleton_count == 0 && outcome.count == 0,
+              "factor overload must not materialize an outcome graph");
+        MSFactorGraphFree(&outcome);
+    }
+}
+
 // MARK: - JSON escaping (§14.4) --------------------------------------------------------
 
 void testJSONEscaping()
@@ -576,6 +783,7 @@ int main()
     testSPDPolicy();
     testAggregateCovariance();
     testReducerAndTopology();
+    testHardOptimizerScaleBoundary();
     testJSONEscaping();
     testSyntheticScenarios();
 

@@ -85,12 +85,16 @@ enum ProcessingResourceGovernor {
     static var thermalStateOverride: ProcessInfo.ThermalState?
     static var freeDiskOverrideBytes: Int64 = -1
     static var availableMemoryOverrideBytes: Int64 = -1
+    /// Host-only injection for the production fail-closed path where
+    /// `os_proc_available_memory()` cannot provide a measurement.
+    static var availableMemoryMeasurementFailureOverride = false
     static var physicalMemoryOverrideBytes: Int64 = 0
 
     static func resetOverrides() {
         thermalStateOverride = nil
         freeDiskOverrideBytes = -1
         availableMemoryOverrideBytes = -1
+        availableMemoryMeasurementFailureOverride = false
         physicalMemoryOverrideBytes = 0
     }
 
@@ -152,13 +156,25 @@ enum ProcessingResourceGovernor {
             throw MobileOnlyWorkflowError.resourceRequired(
                 "\(stage): thermal state \(thermalStateName())")
         }
+        // A long stage may have crossed serious/critical and recovered
+        // before this boundary. The periodic sampler is evidence of a
+        // real interruption; recovery does not make the run publishable.
+        if runSeriousOrCriticalThermalSampleCount() > 0 {
+            throw MobileOnlyWorkflowError.resourceRequired(
+                "\(stage): serious/critical thermal pressure was observed during the run")
+        }
         // §18 RSS headroom: current footprint + full-task estimate must
         // fit under the device-class ceiling of physical memory.
         let physical = physicalMemoryBytes()
         if physical > 0 {
             let ceiling = Int64(
                 Double(physical) * headroomRatio(for: deviceClass()))
-            let footprint = currentMemoryFootprintMB() * 1024 * 1024
+            let footprintMB = currentMemoryFootprintMB()
+            guard footprintMB > 0 else {
+                throw MobileOnlyWorkflowError.resourceRequired(
+                    "\(stage): process-memory measurement unavailable")
+            }
+            let footprint = footprintMB * 1024 * 1024
             if footprint + estimate.totalBytes > ceiling {
                 throw MobileOnlyWorkflowError.resourceRequired(
                     "\(stage): task estimate \(estimate.totalBytes) B + RSS "
@@ -168,6 +184,18 @@ enum ProcessingResourceGovernor {
         }
         // Available memory must cover the estimate plus the baseline.
         let availableMemory = availableMemoryBytesForBudget()
+        #if canImport(UIKit) && !targetEnvironment(macCatalyst)
+        let mustRejectUnavailableMemoryMeasurement = availableMemory < 0
+        #else
+        // Darwin host tools do not expose os_proc_available_memory().
+        // They may inject the failure to exercise the same rejection.
+        let mustRejectUnavailableMemoryMeasurement =
+            availableMemoryMeasurementFailureOverride && availableMemory < 0
+        #endif
+        if mustRejectUnavailableMemoryMeasurement {
+            throw MobileOnlyWorkflowError.resourceRequired(
+                "\(stage): available-memory measurement unavailable")
+        }
         if availableMemory >= 0
             && availableMemory < estimate.totalBytes + minimumAvailableMemoryBytes {
             throw MobileOnlyWorkflowError.resourceRequired(
@@ -176,8 +204,11 @@ enum ProcessingResourceGovernor {
         }
         // Free disk must cover the estimate plus the baseline.
         let freeDisk = currentFreeDiskBytesForBudget()
-        if freeDisk >= 0
-            && freeDisk < estimate.totalBytes + minimumFreeDiskBytes {
+        guard freeDisk >= 0 else {
+            throw MobileOnlyWorkflowError.resourceRequired(
+                "\(stage): free-disk measurement unavailable")
+        }
+        if freeDisk < estimate.totalBytes + minimumFreeDiskBytes {
             throw MobileOnlyWorkflowError.resourceRequired(
                 "\(stage): free disk \(freeDisk) B below estimate "
                 + "\(estimate.totalBytes) B + baseline")
@@ -193,19 +224,56 @@ enum ProcessingResourceGovernor {
 
     // MARK: - Run-scoped real diagnostics (V1R4 §12.4)
 
-    /// Run-scoped counters, reset per processing run and sampled at every
-    /// budget checkpoint so the RunSummary reports REAL peak RSS and REAL
-    /// thermal interruptions instead of placeholders.
+    /// Run-scoped counters, reset per processing run and sampled every
+    /// 250 ms in addition to every budget checkpoint. This captures peaks
+    /// and thermal pressure occurring inside a long native/export stage.
     private static let diagnosticsLock = NSLock()
+    private static let diagnosticsQueue = DispatchQueue(
+        label: "com.marketscanner.processing-resource-sampler",
+        qos: .utility)
+    private static var diagnosticsTimer: DispatchSourceTimer?
     private static var runPeakMemoryMB: Int64 = 0
     private static var runSeriousOrCriticalThermalSamples = 0
 
-    /// Resets the run-scoped diagnostics; call once at run start.
+    /// Resets the run-scoped diagnostics and starts the periodic sampler;
+    /// call once at run start and balance with `endRun()` on every exit.
     static func beginRun() {
+        let previousTimer: DispatchSourceTimer?
         diagnosticsLock.lock()
-        defer { diagnosticsLock.unlock() }
+        previousTimer = diagnosticsTimer
+        diagnosticsTimer = nil
         runPeakMemoryMB = 0
         runSeriousOrCriticalThermalSamples = 0
+        diagnosticsLock.unlock()
+
+        previousTimer?.setEventHandler {}
+        previousTimer?.cancel()
+
+        let timer = DispatchSource.makeTimerSource(queue: diagnosticsQueue)
+        timer.schedule(
+            deadline: .now() + .milliseconds(250),
+            repeating: .milliseconds(250),
+            leeway: .milliseconds(50))
+        timer.setEventHandler {
+            sampleRunDiagnostics()
+        }
+        diagnosticsLock.lock()
+        diagnosticsTimer = timer
+        diagnosticsLock.unlock()
+        timer.resume()
+    }
+
+    /// Stops periodic sampling and records one final sample so the
+    /// completion boundary itself is represented in the run summary.
+    static func endRun() {
+        let timer: DispatchSourceTimer?
+        diagnosticsLock.lock()
+        timer = diagnosticsTimer
+        diagnosticsTimer = nil
+        diagnosticsLock.unlock()
+        timer?.setEventHandler {}
+        timer?.cancel()
+        sampleRunDiagnostics()
     }
 
     /// Samples the current footprint/thermal state into the run counters.
@@ -263,17 +331,23 @@ enum ProcessingResourceGovernor {
     static func currentFreeDiskBytes() -> Int64 {
         let documents = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
             ?? URL(fileURLWithPath: NSHomeDirectory())
+        var positiveMeasurements: [Int64] = []
         if let values = try? documents.resourceValues(
             forKeys: [.volumeAvailableCapacityForImportantUsageKey]),
-           let capacity = values.volumeAvailableCapacityForImportantUsage {
-            return capacity
+           let capacity = values.volumeAvailableCapacityForImportantUsage,
+           capacity > 0 {
+            positiveMeasurements.append(capacity)
         }
         let attributes = try? FileManager.default.attributesOfFileSystem(
             forPath: documents.path)
-        if let free = (attributes?[.systemFreeSize] as? NSNumber)?.int64Value {
-            return free
+        if let free = (attributes?[.systemFreeSize] as? NSNumber)?.int64Value,
+           free > 0 {
+            positiveMeasurements.append(free)
         }
-        return -1
+        // Some Darwin hosts report 0 for the important-usage key even
+        // though statfs has a valid capacity. Ignore non-positive
+        // sentinels; when both APIs work, use the smaller value.
+        return positiveMeasurements.min() ?? -1
     }
 
     static func thermalStateName() -> String {

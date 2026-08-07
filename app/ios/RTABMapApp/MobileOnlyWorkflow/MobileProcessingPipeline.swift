@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import CryptoKit
 
@@ -19,6 +20,49 @@ import CryptoKit
 /// 6. Result package files + streaming four-sheet XLSX + external
 ///    manifest commit.
 enum MobileProcessingPipeline {
+
+    /// Dedicated task-local terminal artifact. It is deliberately outside
+    /// `MobileResultLibrary`: a RESCAN_SESSION outcome must remain visible
+    /// and restart-safe without publishing PriceTags, DevicePositions, a
+    /// workbook, or any ordinary Result entry.
+    static let sessionRescanArtifactFileName = "rescan_session_outcome.json"
+    static let maximumSessionRescanArtifactBytes = 256 * 1024
+
+    enum SessionRescanArtifactWriteStage: String {
+        case beforeTemporaryWrite = "before_temporary_write"
+        case afterTemporaryFsync = "after_temporary_fsync"
+        case afterRename = "after_rename"
+        case afterParentFsync = "after_parent_fsync"
+    }
+
+    /// Host-test crash/failure injection at every durability boundary.
+    static var sessionRescanArtifactWriteFaultInjector:
+        ((SessionRescanArtifactWriteStage) throws -> Void)?
+
+    enum SessionRescanArtifactError: Error, LocalizedError {
+        case invalid(String)
+        case conflictingOutcome(String)
+        case cannotWrite(String)
+
+        var errorDescription: String? {
+            switch self {
+            case .invalid(let detail):
+                return "RESCAN_SESSION artifact invalid: \(detail)"
+            case .conflictingOutcome(let detail):
+                return "RESCAN_SESSION artifact outcome conflicts: \(detail)"
+            case .cannotWrite(let detail):
+                return "RESCAN_SESSION artifact write failed: \(detail)"
+            }
+        }
+    }
+
+    private struct SessionRescanArtifactRecord {
+        var sha256: String
+        var processingPath: String
+        var graphDisposition: String
+        var reasonCode: String
+        var humanMessage: String
+    }
 
     struct Request {
         var finalizedSession: URL
@@ -87,24 +131,78 @@ enum MobileProcessingPipeline {
         do {
             return try runPipeline(
                 request: request, progress: progress, isCancelled: isCancelled)
-        } catch let error as MobileOnlyWorkflowError where error == .cancelled {
-            // §15: a user-cancelled run is recorded as cancelled and can
-            // still be resumed later.
-            try? PersistentTaskCoordinator.updateState(
-                .cancelled, taskRoot: request.taskRoot, error: "cancelled")
-            throw error
         } catch let error as PersistentTaskCheckpoint.CheckpointError {
             // Task-record/reference/identity failures never overwrite an
             // existing terminal state (fail closed).
             throw error
         } catch {
-            // §15: any other failure is recorded; the durable task is
-            // never left claiming an intermediate stage it did not
-            // finish.
-            try? PersistentTaskCoordinator.updateState(
-                .failed, taskRoot: request.taskRoot,
-                error: String(describing: error))
-            throw error
+            // The result publication transaction crosses two durable
+            // stores: an immutable Result becomes visible first, then
+            // task.json advances from committing_result to completed. A
+            // fault after the exclusive result rename (including the
+            // completed-task writer's own crash boundaries) must never be
+            // reclassified by generic terminal persistence as `failed`.
+            // Reopen and fully validate the one receipt/result owned by
+            // this task; if it exists, finish or verify the exact
+            // completed checkpoint and return that committed outcome.
+            do {
+                if let recovered = try reconcileCommittedResultAfterFailure(
+                        request: request) {
+                    return recovered
+                }
+            } catch let recoveryError as PersistentTaskCheckpoint.CheckpointError {
+                throw recoveryError
+            } catch {
+                throw PersistentTaskCheckpoint.CheckpointError.invalidRecord(
+                    "committed-result failure reconciliation blocked: \(error)")
+            }
+            // RESCAN_SESSION has the same cross-file durability window:
+            // its immutable task-local artifact is published before the
+            // checkpoint binding and terminal task state. Once that final
+            // artifact is visible, a later writer fault must never be
+            // mapped to generic workflow_failed. Reopen it by exact task /
+            // snapshot identity, repair the parent fsync, and ensure the
+            // hash-bound checkpoint exists before terminal persistence.
+            do {
+                if let rescanError = try reconcileSessionRescanOutcomeAfterFailure(
+                        request: request,
+                        originalError: error) {
+                    do {
+                        try MobileTerminalStatePersistence.persistThenRethrow(
+                            rescanError, taskRoot: request.taskRoot)
+                    } catch let durabilityError
+                            as MobileTerminalStatePersistence.DurabilityFailure {
+                        // A task writer can throw after its rename or after
+                        // parent fsync even though rescan_required is already
+                        // durable. Accept only an exact artifact/checkpoint/
+                        // state reread, and reconcile the matching intent.
+                        if try reconcileExactSessionRescanTerminalIfPresent(
+                                request: request) {
+                            throw rescanError
+                        }
+                        throw durabilityError
+                    } catch {
+                        throw error
+                    }
+                }
+            } catch let recoveryError as PersistentTaskCheckpoint.CheckpointError {
+                throw recoveryError
+            } catch let workflowError as MobileOnlyWorkflowError {
+                throw workflowError
+            } catch let durabilityError
+                    as MobileTerminalStatePersistence.DurabilityFailure {
+                throw durabilityError
+            } catch {
+                throw PersistentTaskCheckpoint.CheckpointError.invalidRecord(
+                    "RESCAN_SESSION failure reconciliation blocked: \(error)")
+            }
+            // P1-11: the production-shared helper durably establishes a
+            // terminal intent, persists the mapped terminal task state,
+            // clears the intent, then rethrows the ORIGINAL business
+            // error. Any persistence failure instead throws a typed
+            // DurabilityFailure carrying both outcome and storage detail.
+            try MobileTerminalStatePersistence.persistThenRethrow(
+                error, taskRoot: request.taskRoot)
         }
     }
 
@@ -116,6 +214,7 @@ enum MobileProcessingPipeline {
         // V1R4 §12.4: reset the run-scoped resource diagnostics so the
         // RunSummary reports this run's REAL peak RSS / thermal samples.
         ProcessingResourceGovernor.beginRun()
+        defer { ProcessingResourceGovernor.endRun() }
         // Cancel latency (§12.4): measured from the first moment the
         // cancellation probe returns true until the run actually stops.
         var cancelRequestedAt: Double?
@@ -126,32 +225,104 @@ enum MobileProcessingPipeline {
             }
             if now { throw MobileOnlyWorkflowError.cancelled }
         }
-        // V1R3 §8.1 eligibility: an unknown build identity must never
-        // reach a publishable session.
-        guard request.appGitSHA != "unknown", !request.appGitSHA.isEmpty else {
-            throw MobileOnlyWorkflowError.invalidState(
-                "app build identity is unknown; processing is blocked")
-        }
         // V1R4 §15 Gate L: launch recovery. The persisted task.json is
         // validated together with every durable reference; a verified
         // snapshot is resumed without ever re-reading the mutable
         // source database, and a terminal task (completed/cancelled/
-        // failed) is never restarted in-place.
+        // failed) is never restarted in-place. Bootstrap/recovery MUST
+        // happen before any business eligibility check so every later
+        // failure has an existing task.json to receive its terminal state.
         let taskFileURL = PersistentTaskCoordinator.taskFileURL(taskRoot: request.taskRoot)
         let recovery: PersistentTaskCheckpoint.Recovery
+        var existingTaskRecord: PersistentTaskCoordinator.TaskRecord?
         var retryCount = 0
         if FileManager.default.fileExists(atPath: taskFileURL.path) {
-            if let existing = try? PersistentTaskCoordinator.read(taskRoot: request.taskRoot),
-               let checkpoint = existing.checkpoint {
+            let existing = try PersistentTaskCoordinator.read(
+                taskRoot: request.taskRoot)
+            existingTaskRecord = existing
+            if let checkpoint = existing.checkpoint {
                 retryCount = ((checkpoint["retry_count"] as? NSNumber)?.intValue ?? 0) + 1
             }
             recovery = try PersistentTaskCheckpoint.recover(
                 taskRoot: request.taskRoot, request: request)
         } else {
+            do {
+                guard try MobileTerminalStatePersistence.readIntentIfPresent(
+                        taskRoot: request.taskRoot) == nil else {
+                    throw PersistentTaskCheckpoint.CheckpointError.invalidRecord(
+                        "terminal-state intent exists without task.json; "
+                            + "refusing to create a replacement task record")
+                }
+            } catch let error as PersistentTaskCheckpoint.CheckpointError {
+                throw error
+            } catch {
+                throw PersistentTaskCheckpoint.CheckpointError.invalidRecord(
+                    "terminal-state intent cannot be safely read without "
+                        + "task.json: \(error)")
+            }
+            if FileManager.default.fileExists(atPath: request.taskRoot.path) {
+                let entries: [String]
+                do {
+                    entries = try FileManager.default.contentsOfDirectory(
+                        atPath: request.taskRoot.path)
+                } catch {
+                    throw PersistentTaskCheckpoint.CheckpointError.invalidRecord(
+                        "cannot inspect task directory without task.json: \(error)")
+                }
+                guard entries.isEmpty else {
+                    throw PersistentTaskCheckpoint.CheckpointError.invalidRecord(
+                        "task.json is missing from a non-empty task directory")
+                }
+            }
             _ = try PersistentTaskCoordinator.createTask(
                 taskID: request.taskRoot.lastPathComponent,
                 taskRoot: request.taskRoot)
             recovery = .fresh
+        }
+        // V1R3 §8.1 eligibility: an unknown build identity must never
+        // reach a publishable session. Because task bootstrap is already
+        // durable, this early rejection is recorded as a terminal failure
+        // instead of leaving an orphan intent with no task.json.
+        guard request.appGitSHA != "unknown", !request.appGitSHA.isEmpty else {
+            throw MobileOnlyWorkflowError.invalidState(
+                "app build identity is unknown; processing is blocked")
+        }
+        if case .committedResult(let entry) = recovery {
+            guard let checkpoint = existingTaskRecord?.checkpoint else {
+                throw PersistentTaskCheckpoint.CheckpointError.invalidRecord(
+                    "committed result has no task checkpoint")
+            }
+            // The prior process may have stopped immediately after the
+            // exclusive final rename and before the library-parent fsync.
+            // Repair that boundary and reopen the immutable package before
+            // the task is allowed to become completed.
+            do {
+                try MobileMapLibrary.syncDirectory(entry.directory)
+                try MobileMapLibrary.syncDirectory(try MobileResultLibrary.root())
+            } catch {
+                throw PersistentTaskCheckpoint.CheckpointError.invalidRecord(
+                    "committed result cannot be synchronized on restart: \(error)")
+            }
+            let reopened: MobileResultLibrary.ResultEntry
+            do {
+                reopened = try MobileResultLibrary.readResult(
+                    resultID: entry.resultID)
+            } catch {
+                throw PersistentTaskCheckpoint.CheckpointError.invalidRecord(
+                    "committed result cannot be reopened on restart: \(error)")
+            }
+            try PersistentTaskCheckpoint.validateCommittedResult(
+                reopened,
+                checkpoint: checkpoint,
+                taskRoot: request.taskRoot,
+                request: request)
+            let completedCheckpoint = PersistentTaskCheckpoint
+                .withCommittedResult(reopened, in: checkpoint)
+            try PersistentTaskCoordinator.updateState(
+                .completed, taskRoot: request.taskRoot, progress: 1.0,
+                checkpoint: completedCheckpoint,
+                clearError: true)
+            return outcome(from: reopened)
         }
         // §16.4: remove crash-leftover uncommitted result staging of
         // this task (committed results are never touched).
@@ -167,7 +338,8 @@ enum MobileProcessingPipeline {
             try PersistentTaskCoordinator.updateState(
                 .snapshotting, taskRoot: request.taskRoot, progress: 0.05,
                 checkpoint: PersistentTaskCheckpoint.baseCheckpoint(
-                    request: request, retryCount: retryCount))
+                    request: request, retryCount: retryCount),
+                clearError: true)
             snapshot = try SessionSnapshotTransaction.snapshot(
                 finalizedSession: request.finalizedSession,
                 sourceDatabase: request.sourceDatabase,
@@ -199,8 +371,23 @@ enum MobileProcessingPipeline {
                 .snapshotting, taskRoot: request.taskRoot, progress: 0.12,
                 checkpoint: PersistentTaskCheckpoint.snapshotCheckpoint(
                     request: request, snapshot: snapshot,
-                    retryCount: retryCount))
+                    retryCount: retryCount),
+                clearError: true,
+                allowRecoveryReentry: true)
+        case .committedResult:
+            preconditionFailure("committed result handled before snapshot switch")
         }
+
+        // A crash may happen after the dedicated RESCAN_SESSION artifact
+        // is durably renamed but before task.json reaches its terminal
+        // state. Detect the identity-bound artifact before parsing evidence
+        // or invoking either graph optimizer, restore its checkpoint
+        // reference, and rethrow the typed product outcome. This makes
+        // restart idempotent without publishing or re-running Route A.
+        try resumeSessionRescanOutcomeIfPresent(
+            request: request,
+            snapshot: snapshot,
+            retryCount: retryCount)
         try checkCancelled()
         let snapshotDatabase = snapshot.snapshotDirectory
             .appendingPathComponent(request.sourceDatabase.lastPathComponent)
@@ -220,9 +407,11 @@ enum MobileProcessingPipeline {
                 "floorId mismatch: metadata='\(metadataFloorID)' request='\(request.floorID)'")
         }
         let floorID = request.floorID
-        let finalizedAtUnix = metadata["finalizedAtUnix"] as? Double
-            ?? metadata["finalized_at_unix"] as? Double
-            ?? Date().timeIntervalSince1970
+        guard let finalizedAtUnix = StrictJSONScalar.number(
+                metadata["finalizedAtUnix"]),
+              finalizedAtUnix > 0 else {
+            throw PipelineError.missingMetadata
+        }
 
         // V1R4 §13.2: tag observations are strict-parsed BEFORE
         // optimization — every record is identity/format/pose checked and
@@ -273,7 +462,11 @@ enum MobileProcessingPipeline {
             trackingSessionID: request.trackingSessionID,
             floorID: floorID,
             verifiedBursts: burstEvidence)
-        guard tagEvidence.audit.rejectedDetails.isEmpty else {
+        guard burstEvidence.releaseConsumedFrames() else {
+            throw PipelineError.tagEvidenceInvalid(
+                "verified burst frames were not consumed exactly once")
+        }
+        guard tagEvidence.audit.clean else {
             let audit = tagEvidence.audit
             throw PipelineError.tagEvidenceInvalid(
                 "\(audit.totalRejected) bad records of \(audit.recordTotal)"
@@ -286,19 +479,42 @@ enum MobileProcessingPipeline {
         // finite, node-bound evidence only. The strict parser binds each
         // record to an exact RTAB-Map node via the snapshot-DB node
         // inventory (wired provider, §6.1) and audits every rejection.
-        let priorEvidence = try AbsolutePriorEvidenceParser.parse(
-            snapshotDirectory: snapshot.snapshotDirectory,
-            nodes: nodeInventory,
-            priorMapID: request.priorMap.priorMapID,
-            priorMapSHA256: request.priorMap.packageSHA256,
-            trackingSessionID: request.trackingSessionID,
-            floorID: floorID)
-        // V1R5 §8.3 (review B-06): an authoritative prior audit must be
-        // CLEAN before the pipeline runs — a rejected authoritative
-        // record blocks processing fail-closed (absolute priors are the
-        // global map-frame anchor; they never degrade to a "skip bad
-        // records" log policy).
-        guard priorEvidence.audit.rejectedDetails.isEmpty else {
+        guard let captureHealth = metadata["captureHealth"] as? [String: Any],
+              let expectedConstraintCount = StrictJSONScalar.integer(
+                captureHealth["localizationConstraintRecordCount"]),
+              expectedConstraintCount >= 0,
+              let expectedManualCount = StrictJSONScalar.integer(
+                captureHealth["manualLocalizationEventCount"]),
+              expectedManualCount >= 0,
+              let expectedRecoveryCount = StrictJSONScalar.integer(
+                captureHealth["localizationRecoveryEventCount"]),
+              expectedRecoveryCount >= 0 else {
+            throw PipelineError.missingMetadata
+        }
+        let priorEvidence: AbsolutePriorEvidenceParseResult
+        do {
+            priorEvidence = try AbsolutePriorEvidenceParser.parse(
+                snapshotDirectory: snapshot.snapshotDirectory,
+                nodes: nodeInventory,
+                priorMapID: request.priorMap.priorMapID,
+                priorMapSHA256: request.priorMap.packageSHA256,
+                trackingSessionID: request.trackingSessionID,
+                floorID: floorID,
+                expectedConstraintCount: expectedConstraintCount,
+                expectedManualCount: expectedManualCount,
+                expectedRecoveryCount: expectedRecoveryCount)
+        } catch AbsolutePriorEvidenceParseError.qualificationLimitExceeded(
+            let actual, let maximum) {
+            throw MobileOnlyWorkflowError.resourceRequired(
+                "localization_constraints qualification ceiling exceeded: "
+                    + "\(actual) > \(maximum) records (48h @ 2 Hz)")
+        }
+        // V1R5 §8.3 (review B-06): parser/schema/identity failures are
+        // fatal because absolute priors are authoritative map-frame anchors.
+        // A well-formed, identity-bound `accepted=false` constraint is a
+        // normal negative measurement: it is audited in nonAcceptedDetails,
+        // contributes no prior, and does not make an otherwise clean run fail.
+        guard priorEvidence.audit.clean else {
             let audit = priorEvidence.audit
             throw PipelineError.tagEvidenceInvalid(
                 "\(audit.rejectedDetails.count) bad prior records"
@@ -334,9 +550,14 @@ enum MobileProcessingPipeline {
         var nativeOutcome: MobileNativeGraphOutcome
         var processingPath = "fast"
         do {
-            nativeOutcome = try MobileNativeFactorGraphGateway.runFast(
+            let fastOutcome = try MobileNativeFactorGraphGateway.runFast(
                 request: nativeRequest,
                 isCancelled: isCancelled)
+            _ = try MobileNativeOutcomeContract.qualityReport(
+                in: fastOutcome,
+                request: nativeRequest,
+                expectedPath: "fast")
+            nativeOutcome = fastOutcome
         } catch let error as MobileNativeFactorGraphError {
             throw MobileOnlyWorkflowError.processingFailed("Fast Path 求解失败：\(error.localizedDescription)")
         }
@@ -373,6 +594,10 @@ enum MobileProcessingPipeline {
                 let fullOutcome = try MobileNativeFactorGraphGateway.runFullGraph(
                     request: fullGraphRequest,
                     isCancelled: isCancelled)
+                _ = try MobileNativeOutcomeContract.qualityReport(
+                    in: fullOutcome,
+                    request: fullGraphRequest,
+                    expectedPath: "full_graph_optimization")
                 nativeOutcome = fullOutcome
                 processingPath = "full_graph_optimization"
                 try PersistentTaskCoordinator.updateState(
@@ -401,6 +626,7 @@ enum MobileProcessingPipeline {
                 barcode: "",
                 tagInstanceID: nil,
                 shelfCode: "",
+                shelfSegmentID: "",
                 regionStartCm: nil,
                 regionEndCm: nil,
                 localStartTime: "",
@@ -411,20 +637,15 @@ enum MobileProcessingPipeline {
                     + "V1 无设备端 sensor Deep，需要重新扫描",
                 suggestedAction: "RESCAN_SESSION",
                 priority: 1)
-            let rescanURL = request.taskRoot
-                .appendingPathComponent("rescan_tasks.json")
-            let rescanRecord: [String: Any] = [
-                "count": 1,
-                "format": "MarketScannerRescanTasks",
-                "tasks": [rescanTaskPayload(graphRescan)],
-                "version": 1,
-            ]
-            try CanonicalJSONEncoder.encode(rescanRecord).write(
-                to: rescanURL, options: [.atomic])
-            throw PipelineError.qualityGateRejected(
-                "\(processingPath) disposition="
-                + "\(nativeOutcome.disposition.reportValue)；"
-                + "已生成图级 RESCAN：\(rescanURL.path)")
+            try persistSessionRescanOutcome(
+                request: request,
+                snapshot: snapshot,
+                processingPath: processingPath,
+                graphDisposition: nativeOutcome.disposition.reportValue,
+                reasonCode: "graph_quality_failed",
+                humanMessage: graphRescan.humanMessage,
+                rescanTask: graphRescan,
+                checkpoint: snapshotCheckpoint)
         }
         let graphQualityPassed = true
         try checkCancelled()
@@ -435,15 +656,30 @@ enum MobileProcessingPipeline {
         // line throws instead of silently disappearing, so lost intervals
         // can never hide behind a lenient reader. The count is verified
         // against the metadata watermark.
-        let expectedTraceCount = ((metadata["captureHealth"] as? [String: Any])?["localizationTraceRecordCount"] as? NSNumber)?.intValue
-        let traces = try StrictLocalizationTraceParser.parse(
-            snapshotDirectory: snapshot.snapshotDirectory,
-            trackingSessionID: request.trackingSessionID,
-            priorMapID: request.priorMap.priorMapID,
-            priorMapSHA256: request.priorMap.packageSHA256,
-            floorID: floorID,
-            expectedCount: expectedTraceCount)
-        let sessionStartStamp = nativeOutcome.trajectory.first?.stamp ?? finalizedAtUnix - 1
+        guard let expectedTraceCount = StrictJSONScalar.integer(
+                captureHealth["localizationTraceRecordCount"]),
+              expectedTraceCount >= 0 else {
+            throw PipelineError.missingMetadata
+        }
+        let sessionStartStamp = nativeOutcome.trajectory.first?.stamp
+            ?? finalizedAtUnix - 1
+        let traces: [StrictLocalizationTraceParser.TraceRecord]
+        do {
+            traces = try StrictLocalizationTraceParser.parse(
+                snapshotDirectory: snapshot.snapshotDirectory,
+                trackingSessionID: request.trackingSessionID,
+                priorMapID: request.priorMap.priorMapID,
+                priorMapSHA256: request.priorMap.packageSHA256,
+                floorID: floorID,
+                expectedCount: expectedTraceCount,
+                retentionOriginNodeTimestamp: sessionStartStamp)
+        } catch StrictLocalizationTraceParser.ParseError
+                    .qualificationLimitExceeded(let actual, let maximum) {
+            throw MobileOnlyWorkflowError.resourceRequired(
+                "localization_trace qualification ceiling exceeded: "
+                    + "\(actual) > \(maximum) records "
+                    + "(48h @ \(StrictLocalizationTraceParser.qualificationRecordRateHz) Hz)")
+        }
         // Session end is the LAST COLLECTED stamp (§7.5) — never the
         // finalization wall-clock.
         let sessionEndStamp = max(
@@ -465,7 +701,8 @@ enum MobileProcessingPipeline {
             metadata: metadata,
             trackingSessionID: request.trackingSessionID,
             sessionStartStamp: sessionStartStamp,
-            sessionEndStamp: sessionEndStamp)
+            sessionEndStamp: sessionEndStamp,
+            nodeInventory: nodeInventory)
         guard let sessionStartUTC = utcMapper.utcSeconds(forMonotonic: 0),
               let sessionEndUTC = utcMapper.utcSeconds(
                   forMonotonic: sessionEndStamp - sessionStartStamp) else {
@@ -508,7 +745,34 @@ enum MobileProcessingPipeline {
                 floorID: floorID)
         }
         guard !finalNodes.isEmpty else {
-            throw PipelineError.qualityGateRejected("no publish-eligible trajectory nodes")
+            let message = "图优化虽通过，但最终快照没有可发布的轨迹节点；"
+                + "本次不会生成 PriceTags、DevicePositions 或普通结果，"
+                + "需要重新扫描整个会话"
+            let trajectoryRescan = RescanTask(
+                taskID: "rescan-\(request.trackingSessionID)-trajectory",
+                taskType: .weakLocalization,
+                floorID: floorID,
+                barcode: "",
+                tagInstanceID: nil,
+                shelfCode: "",
+                shelfSegmentID: "",
+                regionStartCm: nil,
+                regionEndCm: nil,
+                localStartTime: "",
+                localEndTime: "",
+                reasonCode: "no_publish_eligible_trajectory",
+                humanMessage: message,
+                suggestedAction: "RESCAN_SESSION",
+                priority: 1)
+            try persistSessionRescanOutcome(
+                request: request,
+                snapshot: snapshot,
+                processingPath: processingPath,
+                graphDisposition: nativeOutcome.disposition.reportValue,
+                reasonCode: trajectoryRescan.reasonCode,
+                humanMessage: message,
+                rescanTask: trajectoryRescan,
+                checkpoint: snapshotCheckpoint)
         }
         let lostIntervals = buildLostIntervals(
             from: traces, sessionStartStamp: sessionStartStamp) + eligibilityLost
@@ -521,7 +785,7 @@ enum MobileProcessingPipeline {
             // business status instead of hard-coded "tracking/connected".
             traceStates: traces.map {
                 FinalTrajectory.TraceState(
-                    timestamp: $0.timestamp,
+                    timestamp: $0.nodeTimebaseTimestamp - sessionStartStamp,
                     trackingState: $0.trackingState,
                     localizationState: $0.localizationState,
                     confidence: $0.confidence,
@@ -570,7 +834,8 @@ enum MobileProcessingPipeline {
                     id: $0.id,
                     monotonicSeconds: $0.monotonicSeconds,
                     pose: SE2Transform(xM: $0.xM, yM: $0.yM, yawRad: $0.yawRad),
-                    floorID: $0.floorID)
+                    floorID: $0.floorID,
+                    uncertaintyM: $0.uncertaintyM)
             },
             rawNodeStamps: Dictionary(
                 uniqueKeysWithValues: nodeInventory.map { ($0.nodeID, $0.stamp) }))
@@ -747,8 +1012,9 @@ enum MobileProcessingPipeline {
                 devicePositionCount: devicePositions.count,
                 tagCount: priceTags.count,
                 rescanCount: rescanTasks.count))
-        let runSummary = buildRunSummary(
+        let runSummary = try buildRunSummary(
             request: request,
+            snapshotDirectory: snapshot.snapshotDirectory,
             resultID: resultID,
             metadata: metadata,
             nativeOutcome: nativeOutcome,
@@ -782,17 +1048,20 @@ enum MobileProcessingPipeline {
         // §15: the result artifacts are durable now; the checkpoint
         // binds every one of them (validating_result / committing_result
         // crash points resume from the snapshot and re-export).
-        let resultDurableOutputs = [
-            request.taskRoot.appendingPathComponent("input_snapshot").path,
-            request.taskRoot.appendingPathComponent("input_manifest.json").path,
-            resultDirectory.appendingPathComponent("final_trajectory.jsonl").path,
-            resultDirectory.appendingPathComponent("final_tags.json").path,
-            resultDirectory.appendingPathComponent("quality_report.json").path,
-            resultDirectory.appendingPathComponent("graph_quality.json").path,
-            resultDirectory.appendingPathComponent("rescan_tasks.json").path,
-            resultDirectory.appendingPathComponent("input_manifest.json").path,
-            workbookURL.path,
+        let stagedArtifactNames = [
+            "final_trajectory.jsonl", "final_tags.json",
+            "quality_report.json", "graph_quality.json",
+            "rescan_tasks.json", "input_manifest.json", workbookName,
         ]
+        let resultDurableOutputs = [
+            PersistentTaskCheckpoint.taskReference("input_snapshot"),
+            PersistentTaskCheckpoint.taskReference("input_manifest.json"),
+        ] + stagedArtifactNames.map {
+            PersistentTaskCheckpoint.resultStagingReference(
+                taskID: request.taskRoot.lastPathComponent,
+                resultID: resultID,
+                relativePath: $0)
+        }
         progress(0.94, "校验结果包")
         try ProcessingResourceGovernor.checkBudget(
             stage: "result_commit",
@@ -852,16 +1121,23 @@ enum MobileProcessingPipeline {
                 "trajectory_sha256": trajectorySHA256,
                 "graph_quality_sha256": CanonicalSourceHasher.sha256(
                     Data(nativeOutcome.qualityJSON.utf8)),
+                "device_position_count": devicePositions.count,
+                "available_position_count": devicePositions.filter {
+                    $0.positionStatus == "AVAILABLE"
+                }.count,
+                "tag_count": priceTags.count,
+                "rescan_count": rescanTasks.count,
             ])
         committed = true
         // §15: terminal durable state — the committed result is the
         // final checkpoint binding.
         try PersistentTaskCoordinator.updateState(
             .completed, taskRoot: request.taskRoot, progress: 1.0,
-            checkpoint: PersistentTaskCheckpoint.withDurableOutputs(
-                resultDurableOutputs,
+            checkpoint: PersistentTaskCheckpoint.withCommittedResult(
+                entry,
                 in: PersistentTaskCheckpoint.withProcessingPath(
-                    processingPath, in: snapshotCheckpoint)))
+                    processingPath, in: snapshotCheckpoint)),
+            clearError: true)
         progress(1.0, "完成")
         return Outcome(
             resultEntry: entry,
@@ -869,6 +1145,153 @@ enum MobileProcessingPipeline {
             availablePositionCount: devicePositions.filter { $0.positionStatus == "AVAILABLE" }.count,
             tagCount: priceTags.count,
             rescanCount: rescanTasks.count)
+    }
+
+    /// Repairs the narrow crash window after an immutable Result has
+    /// become visible but before task.json is durably `completed`.
+    ///
+    /// Returning nil means no committed Result exists and the caller may
+    /// use ordinary terminal-error persistence. Any candidate conflict,
+    /// duplicate, malformed receipt/package, identity mismatch, or task
+    /// state mismatch throws a fail-closed checkpoint error and leaves the
+    /// task/result evidence untouched.
+    private static func reconcileCommittedResultAfterFailure(
+        request: Request
+    ) throws -> Outcome? {
+        let taskFileURL = PersistentTaskCoordinator.taskFileURL(
+            taskRoot: request.taskRoot)
+        guard FileManager.default.fileExists(atPath: taskFileURL.path) else {
+            return nil
+        }
+        let record: PersistentTaskCoordinator.TaskRecord
+        do {
+            record = try PersistentTaskCoordinator.read(taskRoot: request.taskRoot)
+        } catch {
+            throw PersistentTaskCheckpoint.CheckpointError.invalidRecord(
+                "task.json unreadable during committed-result reconciliation: \(error)")
+        }
+        let expectedResultIDs = try PersistentTaskCheckpoint
+            .expectedCommittedResultIDs(
+                in: record.checkpoint, taskID: record.taskID)
+        let entry: MobileResultLibrary.ResultEntry?
+        do {
+            entry = try MobileResultLibrary.committedResult(
+                taskID: record.taskID,
+                expectedResultIDs: expectedResultIDs)
+        } catch {
+            throw PersistentTaskCheckpoint.CheckpointError.invalidRecord(
+                "committed result lookup failed: \(error)")
+        }
+        guard let entry else { return nil }
+        guard record.state == .committingResult || record.state == .completed else {
+            throw PersistentTaskCheckpoint.CheckpointError.invalidRecord(
+                "committed result exists while task is \(record.state.rawValue)")
+        }
+        guard let checkpoint = record.checkpoint else {
+            throw PersistentTaskCheckpoint.CheckpointError.invalidRecord(
+                "committed result has no task checkpoint")
+        }
+        try PersistentTaskCheckpoint.validateCommittedResult(
+            entry,
+            checkpoint: checkpoint,
+            taskRoot: request.taskRoot,
+            request: request)
+
+        // A fault injected immediately after final rename occurs before
+        // the result-library parent fsync. Reconciliation explicitly
+        // repairs that durability boundary, then reopens every immutable
+        // byte/receipt before touching task.json.
+        do {
+            try MobileMapLibrary.syncDirectory(entry.directory)
+            try MobileMapLibrary.syncDirectory(try MobileResultLibrary.root())
+        } catch {
+            throw PersistentTaskCheckpoint.CheckpointError.invalidRecord(
+                "committed result cannot be durably synchronized: \(error)")
+        }
+        let reopened: MobileResultLibrary.ResultEntry
+        do {
+            reopened = try MobileResultLibrary.readResult(resultID: entry.resultID)
+        } catch {
+            throw PersistentTaskCheckpoint.CheckpointError.invalidRecord(
+                "committed result cannot be reopened: \(error)")
+        }
+        try PersistentTaskCheckpoint.validateCommittedResult(
+            reopened,
+            checkpoint: checkpoint,
+            taskRoot: request.taskRoot,
+            request: request)
+        let completedCheckpoint = PersistentTaskCheckpoint.withCommittedResult(
+            reopened, in: checkpoint)
+
+        if record.state == .committingResult {
+            do {
+                _ = try PersistentTaskCoordinator.updateState(
+                    .completed,
+                    taskRoot: request.taskRoot,
+                    progress: 1.0,
+                    checkpoint: completedCheckpoint,
+                    clearError: true)
+            } catch {
+                // afterRename/afterParentFsync write faults report an error
+                // even though the completed record may already be the
+                // durable final bytes. Accept only an exact reread; a
+                // pre-rename failure remains committing_result for launch
+                // recovery and is NEVER rewritten to failed here.
+                guard let reread = try? PersistentTaskCoordinator.read(
+                        taskRoot: request.taskRoot),
+                      exactCompletedRecord(
+                        reread,
+                        expectedCheckpoint: completedCheckpoint) else {
+                    throw PersistentTaskCheckpoint.CheckpointError.invalidRecord(
+                        "completed task transition failed after result commit: \(error)")
+                }
+            }
+        }
+        let finalRecord: PersistentTaskCoordinator.TaskRecord
+        do {
+            finalRecord = try PersistentTaskCoordinator.read(
+                taskRoot: request.taskRoot)
+        } catch {
+            throw PersistentTaskCheckpoint.CheckpointError.invalidRecord(
+                "completed task cannot be reopened: \(error)")
+        }
+        guard exactCompletedRecord(
+                finalRecord, expectedCheckpoint: completedCheckpoint) else {
+            throw PersistentTaskCheckpoint.CheckpointError.invalidRecord(
+                "completed task/result checkpoint mismatch")
+        }
+        return outcome(from: reopened)
+    }
+
+    private static func exactCompletedRecord(
+        _ record: PersistentTaskCoordinator.TaskRecord,
+        expectedCheckpoint: [String: Any]
+    ) -> Bool {
+        guard record.state == .completed,
+              record.progress == 1.0,
+              record.error == nil,
+              let actualCheckpoint = record.checkpoint,
+              let actual = try? CanonicalJSONEncoder.encode(actualCheckpoint),
+              let expected = try? CanonicalJSONEncoder.encode(expectedCheckpoint)
+        else {
+            return false
+        }
+        return actual == expected
+    }
+
+    private static func outcome(
+        from entry: MobileResultLibrary.ResultEntry
+    ) -> Outcome {
+        return Outcome(
+            resultEntry: entry,
+            devicePositionCount: PersistentTaskCheckpoint.exactNonnegativeCount(
+                "device_position_count", in: entry.manifest)!,
+            availablePositionCount: PersistentTaskCheckpoint.exactNonnegativeCount(
+                "available_position_count", in: entry.manifest)!,
+            tagCount: PersistentTaskCheckpoint.exactNonnegativeCount(
+                "tag_count", in: entry.manifest)!,
+            rescanCount: PersistentTaskCheckpoint.exactNonnegativeCount(
+                "rescan_count", in: entry.manifest)!)
     }
 
     // MARK: - Evidence readers
@@ -956,7 +1379,7 @@ enum MobileProcessingPipeline {
         for trace in traces {
             let lost = trace.localizationState == "lost"
                 || trace.localizationState == "initializing"
-                || trace.trackingState == "unavailable"
+                || trace.trackingState == "notAvailable"
             if lost {
                 if currentStart == nil {
                     currentStart = axisTime(trace)
@@ -1003,7 +1426,8 @@ enum MobileProcessingPipeline {
         metadata: [String: Any],
         trackingSessionID: String,
         sessionStartStamp: Double,
-        sessionEndStamp: Double
+        sessionEndStamp: Double,
+        nodeInventory: [AbsolutePriorEvidenceNode]
     ) throws -> MonotonicUTCMapper {
         let clockURL = snapshotDirectory
             .appendingPathComponent("clock_correlations.jsonl")
@@ -1011,10 +1435,25 @@ enum MobileProcessingPipeline {
             throw PipelineError.clockEvidenceIncomplete(
                 "clock_correlations.jsonl missing")
         }
-        let expectedCorrelationCount =
-            (metadata["clockCorrelationCount"] as? NSNumber)?.intValue
-        let expectedBindingCount =
-            (metadata["clockNodeBindingCount"] as? NSNumber)?.intValue
+        guard let expectedCorrelationCount = StrictJSONScalar.integer(
+                metadata["clockCorrelationCount"]),
+              expectedCorrelationCount >= 0,
+              let expectedBindingCount = StrictJSONScalar.integer(
+                metadata["clockNodeBindingCount"]),
+              expectedBindingCount >= 0 else {
+            throw PipelineError.clockEvidenceIncomplete(
+                "clock evidence watermarks missing or invalid")
+        }
+        var expectedNodeStampsByID: [Int: Double] = [:]
+        expectedNodeStampsByID.reserveCapacity(nodeInventory.count)
+        for node in nodeInventory {
+            guard let nodeID = Int(exactly: node.nodeID),
+                  expectedNodeStampsByID[nodeID] == nil else {
+                throw PipelineError.clockEvidenceIncomplete(
+                    "database node inventory contains invalid or duplicate ids")
+            }
+            expectedNodeStampsByID[nodeID] = node.stamp
+        }
         let evidence: StrictClockEvidenceParser.ParsedEvidence
         do {
             // V1R5 §7.1: streaming parse — the sidecar is never loaded
@@ -1023,7 +1462,8 @@ enum MobileProcessingPipeline {
                 url: clockURL,
                 expectedTrackingSessionID: trackingSessionID,
                 expectedCorrelationCount: expectedCorrelationCount,
-                expectedBindingCount: expectedBindingCount)
+                expectedBindingCount: expectedBindingCount,
+                expectedNodeStampsByID: expectedNodeStampsByID)
         } catch {
             throw PipelineError.clockEvidenceIncomplete(
                 "invalid clock evidence: \(error.localizedDescription)")
@@ -1081,87 +1521,108 @@ enum MobileProcessingPipeline {
     /// reference implementation.
     static var rawNodePoseProvider: ((URL) -> [Int64: SE2Transform])? = nil
 
-    /// Shelf segments from the compiled prior-map package (`shelves.json`),
-    /// computed per V1R5 §12.2: the compiler emits EXPLICIT business side
-    /// semantics (`shelf_segments` with front/back normals and
-    /// orientation provenance) and the consumer uses them — geometry is
-    /// only the index envelope. A malformed shelf element is skipped with
-    /// the segment-level identity intact (code/floor are validated first).
+    /// Shelf segments from the compiled prior-map package (`shelves.json`).
+    /// V2 consumes compiler-authored start/end/axis/front/back values
+    /// directly and uses the legacy element polygon only as an index
+    /// envelope. V1 remains readable through its geometry fallback.
+    /// Unknown versions or any broken v2 relation fail the whole map.
     static func readShelves(from map: MobileMapLibrary.MapEntry) throws -> [ShelfAssociationEngine.ShelfSegment] {
         let url = map.packageDirectory.appendingPathComponent("shelves.json")
         let data = try Data(contentsOf: url)
         guard let object = try? StrictJSONDocumentParser.object(
             from: data,
-            limits: StrictJSONDocumentLimits(maximumBytes: data.count + 1)) as? [String: Any],
-            let rawShelves = object["shelves"] as? [[String: Any]]
+            limits: StrictJSONDocumentLimits(maximumBytes: data.count + 1)) as? [String: Any]
         else { throw PipelineError.invalidPriorMap(map.packageDirectory.path) }
-        // V1R5 §12.2: compiled business semantics by (shelf_code, floor).
-        var compiledNormals: [String: (normal: (Double, Double), provenance: String)] = [:]
-        if let segments = object["shelf_segments"] as? [[String: Any]] {
-            for segment in segments {
-                guard let shelfCode = segment["shelf_code"] as? String,
-                      let floorID = segment["floor_id"] as? String,
-                      let provenance = segment["orientation_provenance"] as? String,
-                      let rawNormal = segment["front_normal"] as? [Any],
-                      rawNormal.count == 2,
-                      let nx = StrictJSONScalar.number(rawNormal[0]),
-                      let ny = StrictJSONScalar.number(rawNormal[1]),
-                      nx.isFinite, ny.isFinite else {
-                    continue
-                }
-                let length = hypot(nx, ny)
-                guard length > 1.0e-9 else { continue }
-                compiledNormals["\(floorID)|\(shelfCode)"] = (
-                    (nx / length, ny / length), provenance)
-            }
+        let parsed: PriorMapShelvesSchema.ParsedDocument
+        do {
+            parsed = try PriorMapShelvesSchema.parse(object)
+        } catch {
+            throw PipelineError.invalidPriorMap("\(map.packageDirectory.path): \(error)")
         }
-        var shelves: [ShelfAssociationEngine.ShelfSegment] = []
-        for raw in rawShelves {
-            guard let shelfCode = raw["code"] as? String,
-                  let floorID = raw["floor_id"] as? String
-            else { continue }
-            // Rotated polygon geometry (metres).
+
+        func polygon(_ raw: [String: Any]) -> [(Double, Double)]? {
             var polygonM: [(Double, Double)]?
             if let geometry = raw["geometry"] as? [String: Any],
-               let coordinates = geometry["coordinates"] as? [[Double]] {
-                let vertices = coordinates.compactMap { coordinate -> (Double, Double)? in
-                    guard coordinate.count >= 2 else { return nil }
-                    let x = coordinate[0]
-                    let y = coordinate[1]
-                    guard x.isFinite, y.isFinite else { return nil }
-                    return (x, y)
+               let coordinates = geometry["coordinates"] as? [[Any]] {
+                var vertices: [(Double, Double)] = []
+                for coordinate in coordinates {
+                    guard coordinate.count >= 2,
+                          let x = StrictJSONScalar.number(coordinate[0]),
+                          let y = StrictJSONScalar.number(coordinate[1]),
+                          x.isFinite, y.isFinite else {
+                        return nil
+                    }
+                    vertices.append((x, y))
                 }
                 if vertices.count >= 4 {
                     polygonM = vertices
                 }
             }
-            // AABB: index envelope only (§13.5).
-            var boundsMinM: (Double, Double)?
-            var boundsMaxM: (Double, Double)?
-            if let bounds = raw["bounds"] as? [String: Double],
-               let minX = bounds["min_x_m"], let minY = bounds["min_y_m"],
-               let maxX = bounds["max_x_m"], let maxY = bounds["max_y_m"],
+            return polygonM
+        }
+
+        func bounds(
+            _ raw: [String: Any]
+        ) -> (minimum: (Double, Double), maximum: (Double, Double))? {
+            if let value = raw["bounds"] as? [String: Any],
+               let minX = StrictJSONScalar.number(value["min_x_m"]),
+               let minY = StrictJSONScalar.number(value["min_y_m"]),
+               let maxX = StrictJSONScalar.number(value["max_x_m"]),
+               let maxY = StrictJSONScalar.number(value["max_y_m"]),
                minX.isFinite, minY.isFinite, maxX.isFinite, maxY.isFinite,
                maxX >= minX, maxY >= minY {
-                boundsMinM = (minX, minY)
-                boundsMaxM = (maxX, maxY)
+                return ((minX, minY), (maxX, maxY))
             }
-            let yawRad = raw["yaw_rad"] as? Double
-            let compiled = compiledNormals["\(floorID)|\(shelfCode)"]
-            let provenance = compiled?.provenance ?? "geometry"
-            if let segment = ShelfAssociationEngine.makeSegment(
-                shelfCode: shelfCode,
-                floorID: floorID,
-                polygonM: polygonM,
-                boundsMinM: boundsMinM,
-                boundsMaxM: boundsMaxM,
-                yawRad: yawRad,
-                compiledFrontNormal: compiled?.normal,
-                orientationProvenance: provenance) {
+            return nil
+        }
+
+        let rawByID = Dictionary(uniqueKeysWithValues: parsed.rawShelves.map {
+            ($0["id"] as! String, $0)
+        })
+        if parsed.version == 2 {
+            var shelves: [ShelfAssociationEngine.ShelfSegment] = []
+            for compiled in parsed.segments {
+                guard let raw = rawByID[compiled.shelfSegmentID] else {
+                    throw PipelineError.invalidPriorMap(map.packageDirectory.path)
+                }
+                let envelope = bounds(raw)
+                guard let segment = ShelfAssociationEngine.makeCompiledSegment(
+                    compiled,
+                    polygonM: polygon(raw),
+                    boundsMinM: envelope?.minimum,
+                    boundsMaxM: envelope?.maximum) else {
+                    throw PipelineError.invalidPriorMap(
+                        "\(map.packageDirectory.path): invalid compiled shelf \(compiled.shelfSegmentID)")
+                }
                 shelves.append(segment)
             }
+            return shelves
         }
-        return shelves
+
+        var legacyShelves: [ShelfAssociationEngine.ShelfSegment] = []
+        for raw in parsed.rawShelves {
+            guard let shelfSegmentID = raw["id"] as? String,
+                  let floorID = raw["floor_id"] as? String else {
+                throw PipelineError.invalidPriorMap(map.packageDirectory.path)
+            }
+            let shelfCode = raw["code"] as? String ?? shelfSegmentID
+            let envelope = bounds(raw)
+            let yawRad = StrictJSONScalar.number(raw["yaw_rad"])
+            guard let segment = ShelfAssociationEngine.makeSegment(
+                shelfSegmentID: shelfSegmentID,
+                shelfCode: shelfCode,
+                floorID: floorID,
+                polygonM: polygon(raw),
+                boundsMinM: envelope?.minimum,
+                boundsMaxM: envelope?.maximum,
+                yawRad: yawRad,
+                orientationProvenance: "legacy_geometry") else {
+                throw PipelineError.invalidPriorMap(
+                    "\(map.packageDirectory.path): invalid legacy shelf \(shelfSegmentID)")
+            }
+            legacyShelves.append(segment)
+        }
+        return legacyShelves
     }
 
     /// Fixed structures (`fixed_structures.json`) used by the occlusion
@@ -1218,9 +1679,9 @@ enum MobileProcessingPipeline {
     /// final optimized frame via
     /// P_final = T_final_node * inverse(T_raw_node) * P_raw, then
     /// associated to a shelf/side candidate (first/second margin +
-    /// occlusion) BEFORE any clustering, bucketed by
-    /// barcode+floor+shelf+side, and only then clustered with a bounded
-    /// diameter. Unlocalized observations are counted and never
+    /// occlusion) BEFORE any clustering, bucketed by the exact
+    /// barcode+symbology+floor+shelf-segment+side+session identity, and
+    /// only then clustered with a bounded diameter. Unlocalized observations are counted and never
     /// published; observations that fail resolution or association
     /// become explicit RESCAN tasks — nothing is silently dropped.
     static func finalizeTags(
@@ -1241,15 +1702,23 @@ enum MobileProcessingPipeline {
 
         // Resolve each observation against the final optimized nodes.
         var resolved: [TagObservationResolver.ResolvedObservation] = []
-        // (barcode, floorID, reason) for every observation that cannot
+        // Exact identity + reason for every observation that cannot
         // produce a price tag; surfaced as RESCAN tasks (never dropped).
-        var resolutionFailures: [(barcode: String, floorID: String, reason: String)] = []
+        typealias TagFailure = (
+            barcode: String,
+            symbology: String,
+            floorID: String,
+            trackingSessionID: String,
+            reason: String)
+        var resolutionFailures: [TagFailure] = []
         for raw in observations {
             guard let position = raw.rawPositionM else {
                 // Valid unlocalized evidence: never a price tag, never
                 // silently dropped — counted in the quality report.
                 resolutionFailures.append((
-                    barcode: raw.barcode, floorID: raw.floorID,
+                    barcode: raw.barcode, symbology: raw.symbology,
+                    floorID: raw.floorID,
+                    trackingSessionID: raw.trackingSessionID,
                     reason: "unlocalized_observation"))
                 continue
             }
@@ -1257,7 +1726,9 @@ enum MobileProcessingPipeline {
                 // The propagation chain needs the parser-bound node id;
                 // explicit RESCAN task below.
                 resolutionFailures.append((
-                    barcode: raw.barcode, floorID: raw.floorID,
+                    barcode: raw.barcode, symbology: raw.symbology,
+                    floorID: raw.floorID,
+                    trackingSessionID: raw.trackingSessionID,
                     reason: "node_binding_missing"))
                 continue
             }
@@ -1265,9 +1736,19 @@ enum MobileProcessingPipeline {
                 // The propagation chain cannot be built without the raw
                 // snapshot node pose; explicit RESCAN task below.
                 resolutionFailures.append((
-                    barcode: raw.barcode, floorID: raw.floorID,
+                    barcode: raw.barcode, symbology: raw.symbology,
+                    floorID: raw.floorID,
+                    trackingSessionID: raw.trackingSessionID,
                     reason: "raw_node_pose_missing"))
                 continue
+            }
+            let viewQuality: String
+            if let normal = raw.surfaceNormalCamera, normal.count == 3 {
+                if normal[2] < 0 { viewQuality = "front" }
+                else if normal[2] > 0 { viewQuality = "back" }
+                else { viewQuality = "unknown" }
+            } else {
+                viewQuality = "unknown"
             }
             let observation = TagObservationResolver.RawObservation(
                 barcode: raw.barcode,
@@ -1280,7 +1761,14 @@ enum MobileProcessingPipeline {
                 rawNodePose: rawNodePose,
                 trackingSessionID: raw.trackingSessionID,
                 burstID: raw.burstID,
-                frameID: raw.frameID)
+                frameID: raw.frameID,
+                depthQuality: raw.depthInlierRatio,
+                viewQuality: viewQuality,
+                trackingQuality: raw.localizationState,
+                measurementConfidence: raw.measurementConfidence,
+                localizationConfidence: raw.localizationConfidence,
+                needsReview: raw.needsReview,
+                measurementMethod: raw.measurementMethod)
             do {
                 resolved.append(try TagObservationResolver.resolve(
                     observation: observation,
@@ -1288,16 +1776,31 @@ enum MobileProcessingPipeline {
                     sessionID: sessionID))
             } catch {
                 resolutionFailures.append((
-                    barcode: raw.barcode, floorID: raw.floorID,
+                    barcode: raw.barcode, symbology: raw.symbology,
+                    floorID: raw.floorID,
+                    trackingSessionID: raw.trackingSessionID,
                     reason: String(describing: error)))
             }
         }
 
         // Shelf/side candidates per observation BEFORE any clustering
-        // (§13.4: barcode+floor+shelf+side bucket — never cluster across
-        // shelves first).
-        var buckets: [String: [TagObservationResolver.ResolvedObservation]] = [:]
-        var associationFailures: [(barcode: String, floorID: String, reason: String)] = []
+        // (§13.4/H-07): use a typed identity so delimiter-bearing barcode
+        // values cannot collide, and never cluster across symbologies,
+        // floors, physical shelf segments, sides or sessions.
+        struct TagBucketKey: Hashable {
+            let barcode: String
+            let symbology: String
+            let floorID: String
+            let shelfSegmentID: String
+            let shelfSide: String
+            let trackingSessionID: String
+        }
+        var buckets: [TagBucketKey: (
+            shelfSegmentID: String,
+            shelfSide: String,
+            observations: [TagObservationResolver.ResolvedObservation]
+        )] = [:]
+        var associationFailures: [TagFailure] = []
         for observation in resolved {
             guard let association = ShelfAssociationEngine.bestAssociation(
                 point: (observation.mapXM, observation.mapYM),
@@ -1312,12 +1815,28 @@ enum MobileProcessingPipeline {
                 }) else {
                 associationFailures.append((
                     barcode: observation.barcode,
+                    symbology: observation.symbology,
                     floorID: observation.floorID,
+                    trackingSessionID: observation.trackingSessionID,
                     reason: "no_shelf_association"))
                 continue
             }
-            let key = "\(observation.barcode)|\(observation.floorID)|\(association.shelfCode)|\(association.shelfSide)"
-            buckets[key, default: []].append(observation)
+            let key = TagBucketKey(
+                barcode: observation.barcode,
+                symbology: observation.symbology,
+                floorID: observation.floorID,
+                shelfSegmentID: association.shelfSegmentID,
+                shelfSide: association.shelfSide,
+                trackingSessionID: observation.trackingSessionID)
+            if var bucket = buckets[key] {
+                bucket.observations.append(observation)
+                buckets[key] = bucket
+            } else {
+                buckets[key] = (
+                    shelfSegmentID: association.shelfSegmentID,
+                    shelfSide: association.shelfSide,
+                    observations: [observation])
+            }
         }
 
         var priceTags: [FinalPriceTag] = []
@@ -1329,19 +1848,35 @@ enum MobileProcessingPipeline {
             $0.trackingSessionID == sessionID
         }
         // Resolution/association failures become explicit RESCAN tasks
-        // grouped by (barcode, floorID, reason).
-        var failureGroups: [(key: String, barcode: String, floorID: String, reason: String, count: Int)] = []
-        for failure in resolutionFailures + associationFailures {
-            let key = "\(failure.barcode)|\(failure.floorID)|\(failure.reason)"
-            if let index = failureGroups.firstIndex(where: { $0.key == key }) {
-                failureGroups[index].count += 1
-            } else {
-                failureGroups.append((key: key, barcode: failure.barcode,
-                                      floorID: failure.floorID,
-                                      reason: failure.reason, count: 1))
-            }
+        // grouped in O(M) by exact observation identity + reason. The old
+        // firstIndex scan made a 200k-rejection run quadratic.
+        struct FailureGroupKey: Hashable {
+            let barcode: String
+            let symbology: String
+            let floorID: String
+            let trackingSessionID: String
+            let reason: String
         }
-        for group in failureGroups {
+        var failureGroups: [FailureGroupKey: Int] = [:]
+        failureGroups.reserveCapacity(
+            resolutionFailures.count + associationFailures.count)
+        for failure in resolutionFailures + associationFailures {
+            let key = FailureGroupKey(
+                barcode: failure.barcode,
+                symbology: failure.symbology,
+                floorID: failure.floorID,
+                trackingSessionID: failure.trackingSessionID,
+                reason: failure.reason)
+            failureGroups[key, default: 0] += 1
+        }
+        let orderedFailureKeys = failureGroups.keys.sorted {
+            ($0.barcode, $0.symbology, $0.floorID,
+             $0.trackingSessionID, $0.reason)
+                < ($1.barcode, $1.symbology, $1.floorID,
+                   $1.trackingSessionID, $1.reason)
+        }
+        for group in orderedFailureKeys {
+            let failureCount = failureGroups[group] ?? 0
             rescanTasks.append(RescanTask(
                 taskID: "rescan-\(rescanTasks.count + 1)-\(group.barcode)-\(group.reason)",
                 taskType: .tagRescan,
@@ -1349,21 +1884,29 @@ enum MobileProcessingPipeline {
                 barcode: group.barcode,
                 tagInstanceID: "\(group.barcode)-\(group.floorID)-unresolved",
                 shelfCode: "",
+                shelfSegmentID: "",
                 regionStartCm: nil,
                 regionEndCm: nil,
                 localStartTime: "",
                 localEndTime: "",
                 reasonCode: group.reason,
-                humanMessage: "价签观测无法解析（\(group.count) 条）：\(group.reason)",
+                humanMessage: "价签观测无法解析（\(failureCount) 条）：\(group.reason)",
                 suggestedAction: "重新扫描该价签",
                 priority: 1))
         }
         // Per bucket: bounded-diameter robust cluster -> burst fusion ->
         // quality gate (the gate re-associates the fused centroid for
         // first/second margin + occlusion).
-        for bucket in buckets.values {
+        let orderedBucketKeys = buckets.keys.sorted {
+            ($0.barcode, $0.symbology, $0.floorID, $0.shelfSegmentID,
+             $0.shelfSide, $0.trackingSessionID)
+                < ($1.barcode, $1.symbology, $1.floorID, $1.shelfSegmentID,
+                   $1.shelfSide, $1.trackingSessionID)
+        }
+        for bucketKey in orderedBucketKeys {
+            guard let bucket = buckets[bucketKey] else { continue }
             let instances = TagObservationResolver.clusterInstances(
-                observations: bucket, clusterRadiusM: 1.5)
+                observations: bucket.observations, clusterRadiusM: 1.5)
             for instance in instances {
                 guard let association = ShelfAssociationEngine.bestAssociation(
                     point: (instance.mapXM, instance.mapYM),
@@ -1386,6 +1929,7 @@ enum MobileProcessingPipeline {
                         priorMapSha256: priorMap.packageSHA256,
                         trackingSessionID: sessionID,
                         shelfCode: "",
+                        shelfSegmentID: "",
                         shelfSide: "",
                         distanceFromShelfStartCm: nil,
                         positionRatio: nil,
@@ -1404,6 +1948,7 @@ enum MobileProcessingPipeline {
                         barcode: instance.barcode,
                         tagInstanceID: "\(instance.barcode)-\(instance.floorID)-\(priceTags.count)",
                         shelfCode: "",
+                        shelfSegmentID: "",
                         regionStartCm: nil,
                         regionEndCm: nil,
                         localStartTime: "",
@@ -1414,19 +1959,45 @@ enum MobileProcessingPipeline {
                         priority: 1))
                     continue
                 }
-                let evaluation = AutomaticQualityGate.evaluate(
-                    AutomaticQualityGate.TagQualityInput(
-                        observationCount: instance.observationCount,
-                        positionSpreadM: instance.positionSpreadM,
-                        minimumBurstSamples: 3,
-                        maximumSpreadM: 0.15,
-                        bindingMethod: "resolved",
-                        association: association,
-                        maximumEndpointDistanceM: 0.15,
-                        maximumAssociationDistanceM: 0.75,
-                        minimumAssociationMarginM: minimumAssociationMarginM,
-                        graphQualityPassed: graphQualityPassed,
-                        mapSessionIdentityConsistent: mapSessionIdentityConsistent))
+                let evaluation: (
+                    AutomaticQualityGate.QualityStatus, String)
+                if association.shelfSegmentID != bucket.shelfSegmentID
+                    || association.shelfSide != bucket.shelfSide {
+                    // The fused centroid crossed a segment/side boundary;
+                    // never publish it as an automatic acceptance.
+                    evaluation = (
+                        .rescanRequired, "shelf_centroid_reassociation_changed")
+                } else {
+                    evaluation = AutomaticQualityGate.evaluate(
+                        AutomaticQualityGate.TagQualityInput(
+                            observationCount: instance.observationCount,
+                            uniqueVerifiedFrameCount:
+                                instance.uniqueVerifiedFrameCount,
+                            effectiveSampleSize: instance.effectiveSampleSize,
+                            positionSpreadM: instance.positionSpreadM,
+                            minimumBurstSamples: 3,
+                            maximumSpreadM: 0.10,
+                            minimumDepthQuality: instance.minimumDepthQuality,
+                            viewQualitySufficient: instance.allViewsKnown,
+                            trackingQualitySufficient:
+                                instance.trackingQualitySufficient,
+                            localizationConfidence:
+                                instance.localizationConfidence,
+                            measurementConfidence:
+                                instance.measurementConfidence,
+                            needsReview: instance.needsReview,
+                            measurementMethodAccepted:
+                                instance.measurementMethodAccepted,
+                            maximumNodeUncertaintyM:
+                                instance.maximumNodeUncertaintyM,
+                            bindingMethod: "resolved",
+                            association: association,
+                            maximumEndpointDistanceM: 0.15,
+                            maximumAssociationDistanceM: 0.20,
+                            minimumAssociationMarginM: minimumAssociationMarginM,
+                            graphQualityPassed: graphQualityPassed,
+                            mapSessionIdentityConsistent: mapSessionIdentityConsistent))
+                }
                 let status = evaluation.0.rawValue
                 let reason = evaluation.1
                 priceTags.append(FinalPriceTag(
@@ -1439,6 +2010,7 @@ enum MobileProcessingPipeline {
                     priorMapSha256: priorMap.packageSHA256,
                     trackingSessionID: sessionID,
                     shelfCode: association.shelfCode,
+                    shelfSegmentID: association.shelfSegmentID,
                     shelfSide: association.shelfSide,
                     distanceFromShelfStartCm: association.distanceFromShelfStartCm,
                     positionRatio: association.positionRatio,
@@ -1458,6 +2030,7 @@ enum MobileProcessingPipeline {
                         barcode: instance.barcode,
                         tagInstanceID: "\(instance.barcode)-\(instance.floorID)-\(priceTags.count)",
                         shelfCode: association.shelfCode,
+                        shelfSegmentID: association.shelfSegmentID,
                         regionStartCm: nil,
                         regionEndCm: nil,
                         localStartTime: "",
@@ -1474,40 +2047,30 @@ enum MobileProcessingPipeline {
 
     // MARK: - Payload builders
 
-    /// Real factor-graph metrics parsed from the verbatim native quality
-    /// JSON (V1R4 §12.4: RunSummary must report actual counts and SHAs,
-    /// never placeholders). The native core serializes
-    /// `solver.factor_count`, `health.loop_links/prior_links/
-    /// recovery_links`, `graph_input_sha256`, `factor_set_sha256` and
-    /// `policy_version`; values absent from the payload (e.g. the host
-    /// reference implementation) stay nil/empty — never fabricated.
+    /// RunSummary projection of the strict typed native quality DTO. No
+    /// security-relevant value is read through JSONSerialization/NSNumber
+    /// coercion: the complete report has already passed duplicate/unknown/
+    /// type/schema validation and request/C-outcome binding.
     struct NativeQualityMetrics {
-        var factorCount: Int?
-        var loopLinks: Int?
-        var priorLinks: Int?
-        var recoveryLinks: Int?
-        var graphInputSHA256: String = ""
-        var factorSetSHA256: String = ""
-        var policyVersion: String = ""
+        let factorCount: Int64
+        let loopLinks: Int64
+        let priorLinks: Int64
+        let recoveryLinks: Int64
+        let graphInputSHA256: String
+        let factorSetSHA256: String
+        let policyVersion: String
 
-        static func parse(qualityJSON: String) -> NativeQualityMetrics {
-            var metrics = NativeQualityMetrics()
-            guard let data = qualityJSON.data(using: .utf8),
-                  let object = try? JSONSerialization.jsonObject(with: data)
-                      as? [String: Any]
-            else { return metrics }
-            if let solver = object["solver"] as? [String: Any] {
-                metrics.factorCount = (solver["factor_count"] as? NSNumber)?.intValue
-            }
-            if let health = object["health"] as? [String: Any] {
-                metrics.loopLinks = (health["loop_links"] as? NSNumber)?.intValue
-                metrics.priorLinks = (health["prior_links"] as? NSNumber)?.intValue
-                metrics.recoveryLinks = (health["recovery_links"] as? NSNumber)?.intValue
-            }
-            metrics.graphInputSHA256 = object["graph_input_sha256"] as? String ?? ""
-            metrics.factorSetSHA256 = object["factor_set_sha256"] as? String ?? ""
-            metrics.policyVersion = object["policy_version"] as? String ?? ""
-            return metrics
+        static func parse(qualityJSON: String) throws -> NativeQualityMetrics {
+            let report = try MobileNativeQualityReport.parse(
+                qualityJSON: qualityJSON)
+            return NativeQualityMetrics(
+                factorCount: report.solver.factorCount,
+                loopLinks: report.health.loopLinks,
+                priorLinks: report.health.priorLinks,
+                recoveryLinks: report.health.recoveryLinks,
+                graphInputSHA256: report.graphInputSHA256,
+                factorSetSHA256: report.factorSetSHA256,
+                policyVersion: report.policyVersion)
         }
     }
 
@@ -1515,28 +2078,128 @@ enum MobileProcessingPipeline {
     /// `scan_events.jsonl` (event == "thermal_critical"), plus the
     /// processing-phase serious/critical thermal samples. Both are real
     /// evidence; no placeholder is ever written.
+    enum ScanEventEvidenceError: Error, LocalizedError, Equatable {
+        case missingFile
+        case framing(String)
+        case record(Int, String)
+
+        var errorDescription: String? {
+            switch self {
+            case .missingFile:
+                return "扫描事件证据缺失：scan_events.jsonl"
+            case .framing(let reason):
+                return "扫描事件证据格式错误：\(reason)"
+            case .record(let line, let reason):
+                return "扫描事件第 \(line) 行无效：\(reason)"
+            }
+        }
+    }
+
     static func countThermalInterruptions(
         in snapshotDirectory: URL,
+        expectedTrackingSessionID: String,
         processingThermalSamples: Int
-    ) -> Int {
+    ) throws -> Int {
+        guard !expectedTrackingSessionID.isEmpty else {
+            throw ScanEventEvidenceError.framing(
+                "expected tracking session identity is empty")
+        }
         var scanInterruptions = 0
         let eventsURL = snapshotDirectory.appendingPathComponent("scan_events.jsonl")
-        if let content = try? String(contentsOf: eventsURL, encoding: .utf8) {
-            for line in content.split(separator: "\n") {
-                guard let data = line.data(using: .utf8),
-                      let object = try? JSONSerialization.jsonObject(with: data)
-                          as? [String: Any]
-                else { continue }
-                if (object["event"] as? String) == "thermal_critical" {
+        guard FileManager.default.fileExists(atPath: eventsURL.path) else {
+            throw ScanEventEvidenceError.missingFile
+        }
+        let contract = GeneratedMobileEvidenceContracts.File_scan_events_jsonl.self
+        let knownFields: Set<String> = [
+            "format", "version", "timestamp", "timestampUnix", "level",
+            "event", "message", "trackingSessionId", "fields",
+        ]
+        let timestampParser = ISO8601DateFormatter()
+        timestampParser.formatOptions = [
+            .withInternetDateTime, .withFractionalSeconds,
+        ]
+        do {
+            _ = try StrictJSONLStreamReader.forEachLine(
+                from: eventsURL,
+                limits: StrictJSONLStreamReader.Limits(
+                    maximumFileBytes: contract.max_file_bytes,
+                    maximumLineBytes: contract.max_record_bytes,
+                    maximumLineCount: contract.max_records)) { line in
+                let object: [String: Any]
+                do {
+                    guard let data = line.text.data(using: .utf8) else {
+                        throw StrictJSONDocumentParseError.invalidUTF8
+                    }
+                    object = try StrictJSONDocumentParser.object(
+                        from: data,
+                        limits: StrictJSONDocumentLimits(
+                            maximumBytes: contract.max_record_bytes,
+                            maximumNestingDepth: contract.max_nesting_depth))
+                } catch {
+                    throw ScanEventEvidenceError.record(
+                        line.number, "invalid_json")
+                }
+                let unknown = object.keys.filter { !knownFields.contains($0) }
+                guard unknown.isEmpty else {
+                    throw ScanEventEvidenceError.record(
+                        line.number,
+                        "unknown_field_\(unknown.sorted().joined(separator: ","))")
+                }
+                let missing = knownFields.filter { object[$0] == nil }
+                guard missing.isEmpty else {
+                    throw ScanEventEvidenceError.record(
+                        line.number,
+                        "required_field_missing_\(missing.sorted().joined(separator: ","))")
+                }
+                guard object["format"] as? String == "SupermarketScanEvent" else {
+                    throw ScanEventEvidenceError.record(
+                        line.number, "format_invalid")
+                }
+                guard StrictJSONScalar.integer(object["version"]) == 1 else {
+                    throw ScanEventEvidenceError.record(
+                        line.number, "version_unsupported")
+                }
+                guard let timestamp = object["timestamp"] as? String,
+                      let timestampDate = timestampParser.date(from: timestamp),
+                      let timestampUnix = StrictJSONScalar.number(
+                          object["timestampUnix"]),
+                      timestampUnix >= 0,
+                      abs(timestampDate.timeIntervalSince1970 - timestampUnix)
+                        <= 0.001,
+                      let level = object["level"] as? String,
+                      ["info", "warning", "error"].contains(level),
+                      let event = object["event"] as? String,
+                      !event.isEmpty,
+                      let message = object["message"] as? String,
+                      !message.isEmpty,
+                      let trackingSessionID = object["trackingSessionId"] as? String,
+                      !trackingSessionID.isEmpty,
+                      let fields = object["fields"] as? [String: Any],
+                      fields.allSatisfy({ !$0.key.isEmpty && $0.value is String })
+                else {
+                    throw ScanEventEvidenceError.record(
+                        line.number, "schema_or_type_invalid")
+                }
+                guard trackingSessionID == expectedTrackingSessionID else {
+                    throw ScanEventEvidenceError.record(
+                        line.number, "tracking_session_identity_mismatch")
+                }
+                if event == "thermal_critical" {
                     scanInterruptions += 1
                 }
             }
+        } catch let error as ScanEventEvidenceError {
+            throw error
+        } catch let error as StrictJSONLStreamReader.StreamError {
+            throw ScanEventEvidenceError.framing(
+                error.localizedDescription)
         }
         return scanInterruptions + max(processingThermalSamples, 0)
     }
 
     private static func buildRunSummary(
         request: Request,
+        snapshotDirectory: URL,
         resultID: String,
         metadata: [String: Any],
         nativeOutcome: MobileNativeGraphOutcome,
@@ -1546,11 +2209,15 @@ enum MobileProcessingPipeline {
         devicePositions: [FinalTrajectory.DevicePositionRow],
         priceTags: [FinalPriceTag],
         rescanTasks: [RescanTask]
-    ) -> [String: String] {
+    ) throws -> [String: String] {
+        // Capture the completion boundary immediately before embedding
+        // the run diagnostics into the workbook.
+        ProcessingResourceGovernor.sampleRunDiagnostics()
         let available = devicePositions.filter { $0.positionStatus == "AVAILABLE" }.count
-        // V1R4 §12.4: real native metrics only. Fields the quality JSON
-        // does not carry are written empty (never a fabricated 0).
-        let nativeMetrics = NativeQualityMetrics.parse(
+        // V1R4 §12.4 / RC strict binding: every metric is mandatory in the
+        // typed native report. Missing/coerced fields fail the run instead of
+        // silently becoming empty strings or fabricated integer values.
+        let nativeMetrics = try NativeQualityMetrics.parse(
             qualityJSON: nativeOutcome.qualityJSON)
         return [
             "app_git_sha": request.appGitSHA,
@@ -1573,15 +2240,16 @@ enum MobileProcessingPipeline {
                 (devicePositions.last?.sessionElapsedS ?? 0) - (devicePositions.first?.sessionElapsedS ?? 0)),
             "rtabmap_node_count": String(nativeOutcome.trajectory.count),
             "skeleton_node_count": String(nativeOutcome.skeletonIDs.count),
-            "factor_count": nativeMetrics.factorCount.map(String.init) ?? "",
-            "loop_closure_count": nativeMetrics.loopLinks.map(String.init) ?? "",
-            "recovery_count": nativeMetrics.recoveryLinks.map(String.init) ?? "",
-            "prior_count": nativeMetrics.priorLinks.map(String.init) ?? "",
+            "factor_count": String(nativeMetrics.factorCount),
+            "loop_closure_count": String(nativeMetrics.loopLinks),
+            "recovery_count": String(nativeMetrics.recoveryLinks),
+            "prior_count": String(nativeMetrics.priorLinks),
             "processing_path": processingPath,
             "processing_duration_seconds": String(format: "%.1f", runDurationSeconds),
             "peak_memory_mb": String(ProcessingResourceGovernor.runPeakMemoryFootprintMB()),
-            "thermal_interruptions": String(countThermalInterruptions(
-                in: request.finalizedSession,
+            "thermal_interruptions": String(try countThermalInterruptions(
+                in: snapshotDirectory,
+                expectedTrackingSessionID: request.trackingSessionID,
                 processingThermalSamples:
                     ProcessingResourceGovernor.runSeriousOrCriticalThermalSampleCount())),
             "cancel_latency_seconds": String(format: "%.3f", cancelLatencySeconds),
@@ -1668,6 +2336,645 @@ enum MobileProcessingPipeline {
         return total
     }
 
+    // MARK: - Dedicated RESCAN_SESSION terminal artifact
+
+    /// Validates the artifact named by a terminal checkpoint. Recovery
+    /// calls this before it treats any task-local reference as reusable.
+    static func validateSessionRescanArtifact(
+        taskRoot: URL,
+        request: Request,
+        inputBundleSHA256: String,
+        expectedSHA256: String
+    ) throws {
+        guard try readSessionRescanArtifactIfPresent(
+            taskRoot: taskRoot,
+            request: request,
+            inputBundleSHA256: inputBundleSHA256,
+            expectedSHA256: expectedSHA256) != nil else {
+            throw SessionRescanArtifactError.invalid(
+                "checkpoint references a missing artifact")
+        }
+    }
+
+    /// Catch-path reconciliation for the window after the immutable
+    /// RESCAN_SESSION artifact rename but before its checkpoint and
+    /// terminal task state are durable. A missing final artifact returns
+    /// nil (pre-rename write failures may follow ordinary failure policy);
+    /// every visible candidate is strict-validated and either recovered or
+    /// rejected fail-closed.
+    private static func reconcileSessionRescanOutcomeAfterFailure(
+        request: Request,
+        originalError: Error
+    ) throws -> MobileOnlyWorkflowError? {
+        if case SessionRescanArtifactError.conflictingOutcome(let detail)
+                = originalError {
+            throw PersistentTaskCheckpoint.CheckpointError.invalidRecord(
+                "conflicting RESCAN_SESSION publication: \(detail)")
+        }
+        let artifactURL = request.taskRoot.appendingPathComponent(
+            sessionRescanArtifactFileName)
+        var artifactStat = stat()
+        guard lstat(artifactURL.path, &artifactStat) == 0 else {
+            if errno == ENOENT { return nil }
+            throw PersistentTaskCheckpoint.CheckpointError.invalidRecord(
+                "cannot inspect RESCAN_SESSION artifact after failure")
+        }
+        let record: PersistentTaskCoordinator.TaskRecord
+        do {
+            record = try PersistentTaskCoordinator.read(taskRoot: request.taskRoot)
+        } catch {
+            throw PersistentTaskCheckpoint.CheckpointError.invalidRecord(
+                "task.json unreadable during RESCAN_SESSION reconciliation: \(error)")
+        }
+        guard let checkpoint = record.checkpoint,
+              let inputBundleSHA256 = checkpoint["input_bundle_sha256"] as? String,
+              !inputBundleSHA256.isEmpty else {
+            throw PersistentTaskCheckpoint.CheckpointError.invalidRecord(
+                "visible RESCAN_SESSION artifact has no snapshot binding")
+        }
+        let artifact: SessionRescanArtifactRecord
+        do {
+            guard let candidate = try readSessionRescanArtifactIfPresent(
+                    taskRoot: request.taskRoot,
+                    request: request,
+                    inputBundleSHA256: inputBundleSHA256,
+                    expectedSHA256: nil) else {
+                throw SessionRescanArtifactError.invalid(
+                    "visible artifact disappeared during reconciliation")
+            }
+            // afterRename injection happens before the task-root fsync.
+            // Repair it, then require an exact hash-bound stable reread.
+            try syncSessionRescanParent(request.taskRoot)
+            guard let reopened = try readSessionRescanArtifactIfPresent(
+                    taskRoot: request.taskRoot,
+                    request: request,
+                    inputBundleSHA256: inputBundleSHA256,
+                    expectedSHA256: candidate.sha256) else {
+                throw SessionRescanArtifactError.invalid(
+                    "artifact disappeared after reconciliation fsync")
+            }
+            artifact = reopened
+        } catch {
+            throw PersistentTaskCheckpoint.CheckpointError.invalidRecord(
+                "RESCAN_SESSION artifact validation failed: \(error)")
+        }
+        guard try MobileResultLibrary.committedResult(
+                taskID: record.taskID) == nil else {
+            throw PersistentTaskCheckpoint.CheckpointError.invalidRecord(
+                "RESCAN_SESSION task also owns a committed Result")
+        }
+        guard record.state != .completed,
+              record.state != .failed,
+              record.state != .cancelled,
+              record.state != .interrupted else {
+            throw PersistentTaskCheckpoint.CheckpointError.invalidRecord(
+                "visible RESCAN_SESSION artifact conflicts with task state "
+                    + record.state.rawValue)
+        }
+        let boundCheckpoint = PersistentTaskCheckpoint.withSessionRescanOutcome(
+            artifactSHA256: artifact.sha256,
+            in: PersistentTaskCheckpoint.withProcessingPath(
+                artifact.processingPath, in: checkpoint))
+        if record.state == .rescanRequired {
+            guard exactSessionRescanTaskRecord(
+                    record, expectedCheckpoint: boundCheckpoint) else {
+                throw PersistentTaskCheckpoint.CheckpointError.invalidRecord(
+                    "rescan_required task does not exactly bind its artifact")
+            }
+            return sessionRescanWorkflowError(artifact)
+        }
+        guard PersistentTaskCoordinator.isResumable(record) else {
+            throw PersistentTaskCheckpoint.CheckpointError.invalidRecord(
+                "RESCAN_SESSION artifact belongs to a non-resumable task")
+        }
+        do {
+            _ = try PersistentTaskCoordinator.updateState(
+                record.state,
+                taskRoot: request.taskRoot,
+                progress: record.progress,
+                checkpoint: boundCheckpoint)
+        } catch {
+            // A checkpoint writer can report afterRename/afterParentFsync
+            // even though the exact reference+SHA generation is durable.
+            // Pre-rename failures remain on the old checkpoint for restart.
+            guard let reread = try? PersistentTaskCoordinator.read(
+                    taskRoot: request.taskRoot),
+                  reread.state == record.state,
+                  exactCheckpoint(
+                    reread.checkpoint, expected: boundCheckpoint) else {
+                throw PersistentTaskCheckpoint.CheckpointError.invalidRecord(
+                    "RESCAN_SESSION checkpoint transition failed: \(error)")
+            }
+        }
+        return sessionRescanWorkflowError(artifact)
+    }
+
+    /// Accepts a terminal task-writer post-rename error only when the
+    /// complete no-publish outcome can be reread exactly. Matching terminal
+    /// intent cleanup is idempotent; any mismatch remains fail closed.
+    private static func reconcileExactSessionRescanTerminalIfPresent(
+        request: Request
+    ) throws -> Bool {
+        var record = try PersistentTaskCoordinator.read(taskRoot: request.taskRoot)
+        guard record.state == .rescanRequired else { return false }
+        guard record.error == "rescan_session_required",
+              let checkpoint = record.checkpoint,
+              let inputBundleSHA256 = checkpoint["input_bundle_sha256"] as? String,
+              let terminal = checkpoint["terminal_outcome"] as? [String: Any],
+              let expectedSHA256 = terminal["sha256"] as? String,
+              let artifact = try readSessionRescanArtifactIfPresent(
+                taskRoot: request.taskRoot,
+                request: request,
+                inputBundleSHA256: inputBundleSHA256,
+                expectedSHA256: expectedSHA256) else {
+            throw PersistentTaskCheckpoint.CheckpointError.invalidRecord(
+                "rescan_required task cannot revalidate its artifact")
+        }
+        try syncSessionRescanParent(request.taskRoot)
+        let expectedCheckpoint = PersistentTaskCheckpoint.withSessionRescanOutcome(
+            artifactSHA256: artifact.sha256,
+            in: PersistentTaskCheckpoint.withProcessingPath(
+                artifact.processingPath, in: checkpoint))
+        guard exactSessionRescanTaskRecord(
+                record, expectedCheckpoint: expectedCheckpoint),
+              try MobileResultLibrary.committedResult(
+                taskID: record.taskID) == nil else {
+            throw PersistentTaskCheckpoint.CheckpointError.invalidRecord(
+                "rescan_required task/result/checkpoint conflict")
+        }
+        do {
+            try MobileTerminalStatePersistence.reconcilePendingIntent(
+                taskRoot: request.taskRoot)
+        } catch {
+            throw PersistentTaskCheckpoint.CheckpointError.invalidRecord(
+                "rescan_required terminal intent cleanup failed: \(error)")
+        }
+        record = try PersistentTaskCoordinator.read(taskRoot: request.taskRoot)
+        guard exactSessionRescanTaskRecord(
+                record, expectedCheckpoint: expectedCheckpoint) else {
+            throw PersistentTaskCheckpoint.CheckpointError.invalidRecord(
+                "rescan_required task changed during exact reread")
+        }
+        return true
+    }
+
+    private static func exactSessionRescanTaskRecord(
+        _ record: PersistentTaskCoordinator.TaskRecord,
+        expectedCheckpoint: [String: Any]
+    ) -> Bool {
+        return record.state == .rescanRequired
+            && record.error == "rescan_session_required"
+            && exactCheckpoint(record.checkpoint, expected: expectedCheckpoint)
+    }
+
+    private static func exactCheckpoint(
+        _ actual: [String: Any]?,
+        expected: [String: Any]
+    ) -> Bool {
+        guard let actual,
+              let actualData = try? CanonicalJSONEncoder.encode(actual),
+              let expectedData = try? CanonicalJSONEncoder.encode(expected) else {
+            return false
+        }
+        return actualData == expectedData
+    }
+
+    private static func sessionRescanWorkflowError(
+        _ artifact: SessionRescanArtifactRecord
+    ) -> MobileOnlyWorkflowError {
+        return .rescanSessionRequired(
+            "\(artifact.reasonCode)：\(artifact.humanMessage)")
+    }
+
+    /// Replays a crash-leftover artifact before evidence parsing/native
+    /// graph work. The task state may still be any resumable intermediate
+    /// state; updating that same state only adds the hash-bound durable
+    /// reference, then the ordinary terminal-intent transaction commits
+    /// `.rescanRequired` when the typed error reaches `run`.
+    private static func resumeSessionRescanOutcomeIfPresent(
+        request: Request,
+        snapshot: SessionSnapshotTransaction.SessionSnapshot,
+        retryCount: Int
+    ) throws {
+        guard let artifact = try readSessionRescanArtifactIfPresent(
+            taskRoot: request.taskRoot,
+            request: request,
+            inputBundleSHA256: snapshot.bundleSHA256,
+            expectedSHA256: nil) else {
+            return
+        }
+        let checkpoint = PersistentTaskCheckpoint.withSessionRescanOutcome(
+            artifactSHA256: artifact.sha256,
+            in: PersistentTaskCheckpoint.snapshotCheckpoint(
+                request: request,
+                snapshot: snapshot,
+                retryCount: retryCount,
+                processingPath: artifact.processingPath))
+        let record = try PersistentTaskCoordinator.read(taskRoot: request.taskRoot)
+        _ = try PersistentTaskCoordinator.updateState(
+            record.state,
+            taskRoot: request.taskRoot,
+            progress: record.progress,
+            checkpoint: checkpoint)
+        throw sessionRescanWorkflowError(artifact)
+    }
+
+    private static func persistSessionRescanOutcome(
+        request: Request,
+        snapshot: SessionSnapshotTransaction.SessionSnapshot,
+        processingPath: String,
+        graphDisposition: String,
+        reasonCode: String,
+        humanMessage: String,
+        rescanTask: RescanTask,
+        checkpoint: [String: Any]
+    ) throws -> Never {
+        let artifact = try writeSessionRescanArtifact(
+            request: request,
+            inputBundleSHA256: snapshot.bundleSHA256,
+            processingPath: processingPath,
+            graphDisposition: graphDisposition,
+            reasonCode: reasonCode,
+            humanMessage: humanMessage,
+            rescanTask: rescanTask)
+        let boundCheckpoint = PersistentTaskCheckpoint.withSessionRescanOutcome(
+            artifactSHA256: artifact.sha256,
+            in: PersistentTaskCheckpoint.withProcessingPath(
+                processingPath, in: checkpoint))
+        let record = try PersistentTaskCoordinator.read(taskRoot: request.taskRoot)
+        _ = try PersistentTaskCoordinator.updateState(
+            record.state,
+            taskRoot: request.taskRoot,
+            progress: record.progress,
+            checkpoint: boundCheckpoint)
+        throw sessionRescanWorkflowError(artifact)
+    }
+
+    private static func writeSessionRescanArtifact(
+        request: Request,
+        inputBundleSHA256: String,
+        processingPath: String,
+        graphDisposition: String,
+        reasonCode: String,
+        humanMessage: String,
+        rescanTask: RescanTask
+    ) throws -> SessionRescanArtifactRecord {
+        if let existing = try readSessionRescanArtifactIfPresent(
+            taskRoot: request.taskRoot,
+            request: request,
+            inputBundleSHA256: inputBundleSHA256,
+            expectedSHA256: nil) {
+            try validateSessionRescanOutcomeEquivalence(
+                existing,
+                processingPath: processingPath,
+                graphDisposition: graphDisposition,
+                reasonCode: reasonCode,
+                humanMessage: humanMessage)
+            return existing
+        }
+
+        let taskPayload = rescanTaskPayload(rescanTask)
+        let payload: [String: Any] = [
+            "format": "MarketScannerSessionRescanOutcome",
+            "version": 1,
+            "terminal_outcome": "RESCAN_SESSION",
+            "task_id": request.taskRoot.lastPathComponent,
+            "tracking_session_id": request.trackingSessionID,
+            "store_id": request.storeID,
+            "floor_id": request.floorID,
+            "prior_map_id": request.priorMap.priorMapID,
+            "prior_map_sha256": request.priorMap.packageSHA256,
+            "input_bundle_sha256": inputBundleSHA256,
+            "processing_path": processingPath,
+            "graph_disposition": graphDisposition,
+            "reason_code": reasonCode,
+            "human_message": humanMessage,
+            "suggested_action": "RESCAN_SESSION",
+            "publish_permitted": false,
+            "result_published": false,
+            "created_at_utc": Date().timeIntervalSince1970,
+            "rescan_tasks": [
+                "count": 1,
+                "format": "MarketScannerRescanTasks",
+                "tasks": [taskPayload],
+                "version": 1,
+            ],
+        ]
+        let data = try CanonicalJSONEncoder.encode(payload)
+        guard !data.isEmpty, data.count <= maximumSessionRescanArtifactBytes else {
+            throw SessionRescanArtifactError.cannotWrite(
+                "payload exceeds \(maximumSessionRescanArtifactBytes) bytes")
+        }
+
+        let finalURL = request.taskRoot.appendingPathComponent(
+            sessionRescanArtifactFileName)
+        let temporaryURL = request.taskRoot.appendingPathComponent(
+            ".rescan-session-outcome.tmp-\(UUID().uuidString)")
+        var removeTemporary = true
+        defer {
+            if removeTemporary {
+                try? FileManager.default.removeItem(at: temporaryURL)
+            }
+        }
+        do {
+            try sessionRescanArtifactWriteFaultInjector?(.beforeTemporaryWrite)
+            let fd = open(
+                temporaryURL.path,
+                O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW,
+                mode_t(0o600))
+            guard fd >= 0 else {
+                throw SessionRescanArtifactError.cannotWrite(
+                    "cannot create exclusive temporary file")
+            }
+            do {
+                try writeAllSessionRescanBytes(data, descriptor: fd)
+                guard fchmod(fd, mode_t(0o400)) == 0, fsync(fd) == 0 else {
+                    throw SessionRescanArtifactError.cannotWrite(
+                        "temporary file chmod/fsync failed")
+                }
+            } catch {
+                close(fd)
+                throw error
+            }
+            close(fd)
+            try sessionRescanArtifactWriteFaultInjector?(.afterTemporaryFsync)
+            guard renameatx_np(
+                AT_FDCWD, temporaryURL.path,
+                AT_FDCWD, finalURL.path,
+                UInt32(RENAME_EXCL)) == 0 else {
+                if errno == EEXIST,
+                   let existing = try readSessionRescanArtifactIfPresent(
+                    taskRoot: request.taskRoot,
+                    request: request,
+                    inputBundleSHA256: inputBundleSHA256,
+                    expectedSHA256: nil) {
+                    // The race winner is acceptable only when it is the
+                    // exact same business outcome. Identity/schema validity
+                    // alone cannot turn a conflicting RESCAN reason into an
+                    // idempotent write.
+                    try validateSessionRescanOutcomeEquivalence(
+                        existing,
+                        processingPath: processingPath,
+                        graphDisposition: graphDisposition,
+                        reasonCode: reasonCode,
+                        humanMessage: humanMessage)
+                    return existing
+                }
+                throw SessionRescanArtifactError.cannotWrite(
+                    "exclusive rename failed: \(String(cString: strerror(errno)))")
+            }
+            removeTemporary = false
+            try sessionRescanArtifactWriteFaultInjector?(.afterRename)
+            try syncSessionRescanParent(request.taskRoot)
+            try sessionRescanArtifactWriteFaultInjector?(.afterParentFsync)
+        } catch let error as SessionRescanArtifactError {
+            throw error
+        } catch {
+            throw SessionRescanArtifactError.cannotWrite(String(describing: error))
+        }
+
+        guard let committed = try readSessionRescanArtifactIfPresent(
+            taskRoot: request.taskRoot,
+            request: request,
+            inputBundleSHA256: inputBundleSHA256,
+            expectedSHA256: sessionRescanSHA256(data)) else {
+            throw SessionRescanArtifactError.invalid(
+                "artifact disappeared after parent fsync")
+        }
+        return committed
+    }
+
+    private static func readSessionRescanArtifactIfPresent(
+        taskRoot: URL,
+        request: Request,
+        inputBundleSHA256: String,
+        expectedSHA256: String?
+    ) throws -> SessionRescanArtifactRecord? {
+        let url = taskRoot.appendingPathComponent(sessionRescanArtifactFileName)
+        var pathBefore = stat()
+        guard lstat(url.path, &pathBefore) == 0 else {
+            if errno == ENOENT { return nil }
+            throw SessionRescanArtifactError.invalid("cannot lstat artifact")
+        }
+        guard (pathBefore.st_mode & S_IFMT) == S_IFREG,
+              pathBefore.st_nlink == 1,
+              (pathBefore.st_mode & mode_t(0o222)) == 0,
+              pathBefore.st_size > 0,
+              pathBefore.st_size <= maximumSessionRescanArtifactBytes else {
+            throw SessionRescanArtifactError.invalid(
+                "artifact must be one bounded read-only regular file")
+        }
+        let fd = open(url.path, O_RDONLY | O_NOFOLLOW)
+        guard fd >= 0 else {
+            throw SessionRescanArtifactError.invalid("cannot open artifact no-follow")
+        }
+        defer { close(fd) }
+        var opened = stat()
+        guard fstat(fd, &opened) == 0,
+              sameSessionRescanIdentity(opened, pathBefore) else {
+            throw SessionRescanArtifactError.invalid(
+                "artifact identity changed before open")
+        }
+        var data = Data()
+        var buffer = [UInt8](repeating: 0, count: 4096)
+        while true {
+            let count = buffer.withUnsafeMutableBytes { rawBuffer in
+                Darwin.read(fd, rawBuffer.baseAddress, rawBuffer.count)
+            }
+            if count < 0 && errno == EINTR { continue }
+            guard count >= 0 else {
+                throw SessionRescanArtifactError.invalid("artifact read failed")
+            }
+            if count == 0 { break }
+            guard data.count + count <= maximumSessionRescanArtifactBytes else {
+                throw SessionRescanArtifactError.invalid(
+                    "artifact grew beyond its hard bound")
+            }
+            data.append(contentsOf: buffer.prefix(count))
+        }
+        var openedAfter = stat()
+        var pathAfter = stat()
+        guard fstat(fd, &openedAfter) == 0,
+              lstat(url.path, &pathAfter) == 0,
+              data.count == Int(opened.st_size),
+              sameSessionRescanIdentity(openedAfter, opened),
+              sameSessionRescanIdentity(pathAfter, opened) else {
+            throw SessionRescanArtifactError.invalid(
+                "artifact changed or was replaced while reading")
+        }
+        let digest = sessionRescanSHA256(data)
+        if let expectedSHA256 = expectedSHA256,
+           digest != expectedSHA256.lowercased() {
+            throw SessionRescanArtifactError.invalid("checkpoint SHA-256 mismatch")
+        }
+        guard let object = try? StrictJSONDocumentParser.object(
+            from: data,
+            limits: StrictJSONDocumentLimits(
+                maximumBytes: maximumSessionRescanArtifactBytes)) as? [String: Any],
+              Set(object.keys) == Set([
+                "format", "version", "terminal_outcome", "task_id",
+                "tracking_session_id", "store_id", "floor_id",
+                "prior_map_id", "prior_map_sha256", "input_bundle_sha256",
+                "processing_path", "graph_disposition", "reason_code",
+                "human_message", "suggested_action", "publish_permitted",
+                "result_published", "created_at_utc", "rescan_tasks",
+              ]),
+              object["format"] as? String == "MarketScannerSessionRescanOutcome",
+              StrictJSONScalar.integer(object["version"]) == 1,
+              object["terminal_outcome"] as? String == "RESCAN_SESSION",
+              object["task_id"] as? String == taskRoot.lastPathComponent,
+              object["tracking_session_id"] as? String == request.trackingSessionID,
+              object["store_id"] as? String == request.storeID,
+              object["floor_id"] as? String == request.floorID,
+              object["prior_map_id"] as? String == request.priorMap.priorMapID,
+              object["prior_map_sha256"] as? String == request.priorMap.packageSHA256,
+              object["input_bundle_sha256"] as? String == inputBundleSHA256,
+              let processingPath = object["processing_path"] as? String,
+              processingPath == "fast" || processingPath == "full_graph_optimization",
+              let graphDisposition = object["graph_disposition"] as? String,
+              let reasonCode = object["reason_code"] as? String,
+              reasonCode == "graph_quality_failed"
+                || reasonCode == "no_publish_eligible_trajectory",
+              sessionRescanDispositionMatchesReason(
+                graphDisposition: graphDisposition,
+                reasonCode: reasonCode),
+              let humanMessage = object["human_message"] as? String,
+              !humanMessage.isEmpty,
+              object["suggested_action"] as? String == "RESCAN_SESSION",
+              StrictJSONScalar.boolean(object["publish_permitted"]) == false,
+              StrictJSONScalar.boolean(object["result_published"]) == false,
+              let createdAtUTC = StrictJSONScalar.number(object["created_at_utc"]),
+              createdAtUTC.isFinite, createdAtUTC > 0,
+              let tasksObject = object["rescan_tasks"] as? [String: Any],
+              Set(tasksObject.keys) == Set(["count", "format", "tasks", "version"]),
+              StrictJSONScalar.integer(tasksObject["count"]) == 1,
+              tasksObject["format"] as? String == "MarketScannerRescanTasks",
+              StrictJSONScalar.integer(tasksObject["version"]) == 1,
+              let tasks = tasksObject["tasks"] as? [[String: Any]],
+              tasks.count == 1,
+              Set(tasks[0].keys) == Set([
+                "task_id", "task_type", "floor_id", "barcode",
+                "shelf_code", "shelf_segment_id", "reason_code",
+                "human_message", "suggested_action", "priority",
+              ]),
+              let rescanTaskID = tasks[0]["task_id"] as? String,
+              MobileResultLibrary.isSafeBasename(rescanTaskID),
+              tasks[0]["task_type"] as? String == (reasonCode == "graph_quality_failed"
+                ? MobileWorksheets.RescanTaskType.insufficientLoop.rawValue
+                : MobileWorksheets.RescanTaskType.weakLocalization.rawValue),
+              let taskReason = tasks[0]["reason_code"] as? String,
+              taskReason == reasonCode,
+              tasks[0]["floor_id"] as? String == request.floorID,
+              tasks[0]["barcode"] as? String == "",
+              tasks[0]["shelf_code"] as? String == "",
+              tasks[0]["shelf_segment_id"] as? String == "",
+              tasks[0]["human_message"] as? String == humanMessage,
+              tasks[0]["suggested_action"] as? String == "RESCAN_SESSION",
+              StrictJSONScalar.integer(tasks[0]["priority"]) == 1 else {
+            throw SessionRescanArtifactError.invalid(
+                "schema, identity, action, or publish invariant mismatch")
+        }
+        return SessionRescanArtifactRecord(
+            sha256: digest,
+            processingPath: processingPath,
+            graphDisposition: graphDisposition,
+            reasonCode: reasonCode,
+            humanMessage: humanMessage)
+    }
+
+    private static func validateSessionRescanOutcomeEquivalence(
+        _ existing: SessionRescanArtifactRecord,
+        processingPath: String,
+        graphDisposition: String,
+        reasonCode: String,
+        humanMessage: String
+    ) throws {
+        guard existing.processingPath == processingPath,
+              existing.graphDisposition == graphDisposition,
+              existing.reasonCode == reasonCode,
+              existing.humanMessage == humanMessage else {
+            throw SessionRescanArtifactError.conflictingOutcome(
+                "an existing artifact conflicts with the new outcome")
+        }
+    }
+
+    private static func sessionRescanDispositionMatchesReason(
+        graphDisposition: String,
+        reasonCode: String
+    ) -> Bool {
+        switch reasonCode {
+        case "no_publish_eligible_trajectory":
+            return graphDisposition == MobileGraphDisposition.pass.reportValue
+        case "graph_quality_failed":
+            return Set([
+                MobileGraphDisposition.recoverableFail.reportValue,
+                MobileGraphDisposition.nonRecoverableFail.reportValue,
+                MobileGraphDisposition.localFrameOnly.reportValue,
+            ]).contains(graphDisposition)
+        default:
+            return false
+        }
+    }
+
+    private static func sameSessionRescanIdentity(
+        _ lhs: stat,
+        _ rhs: stat
+    ) -> Bool {
+        return lhs.st_dev == rhs.st_dev
+            && lhs.st_ino == rhs.st_ino
+            && lhs.st_size == rhs.st_size
+            && lhs.st_mtimespec.tv_sec == rhs.st_mtimespec.tv_sec
+            && lhs.st_mtimespec.tv_nsec == rhs.st_mtimespec.tv_nsec
+            && lhs.st_ctimespec.tv_sec == rhs.st_ctimespec.tv_sec
+            && lhs.st_ctimespec.tv_nsec == rhs.st_ctimespec.tv_nsec
+            && (lhs.st_mode & S_IFMT) == S_IFREG
+            && lhs.st_nlink == 1
+            && (lhs.st_mode & mode_t(0o222)) == 0
+    }
+
+    private static func writeAllSessionRescanBytes(
+        _ data: Data,
+        descriptor: Int32
+    ) throws {
+        var written = 0
+        let success = data.withUnsafeBytes { rawBuffer -> Bool in
+            guard let base = rawBuffer.baseAddress else { return data.isEmpty }
+            while written < rawBuffer.count {
+                let count = Darwin.write(
+                    descriptor,
+                    base.advanced(by: written),
+                    rawBuffer.count - written)
+                if count < 0 && errno == EINTR { continue }
+                if count <= 0 { return false }
+                written += count
+            }
+            return true
+        }
+        guard success else {
+            throw SessionRescanArtifactError.cannotWrite(
+                "temporary file write failed")
+        }
+    }
+
+    private static func syncSessionRescanParent(_ taskRoot: URL) throws {
+        let fd = open(taskRoot.path, O_RDONLY | O_DIRECTORY)
+        guard fd >= 0 else {
+            throw SessionRescanArtifactError.cannotWrite(
+                "cannot open task root for fsync")
+        }
+        defer { close(fd) }
+        guard fsync(fd) == 0 else {
+            throw SessionRescanArtifactError.cannotWrite(
+                "task root fsync failed")
+        }
+    }
+
+    private static func sessionRescanSHA256(_ data: Data) -> String {
+        return SHA256.hash(data: data).map {
+            String(format: "%02x", $0)
+        }.joined()
+    }
+
     private static func priceTagPayload(_ tag: FinalPriceTag) -> [String: Any] {
         var payload: [String: Any] = [
             "tag_instance_id": tag.tagInstanceID,
@@ -1679,6 +2986,7 @@ enum MobileProcessingPipeline {
             "prior_map_sha256": tag.priorMapSha256,
             "tracking_session_id": tag.trackingSessionID,
             "shelf_code": tag.shelfCode,
+            "shelf_segment_id": tag.shelfSegmentID,
             "shelf_side": tag.shelfSide,
             "map_x_m": tag.mapXM,
             "map_y_m": tag.mapYM,
@@ -1701,6 +3009,7 @@ enum MobileProcessingPipeline {
             "floor_id": task.floorID,
             "barcode": task.barcode,
             "shelf_code": task.shelfCode,
+            "shelf_segment_id": task.shelfSegmentID,
             "reason_code": task.reasonCode,
             "human_message": task.humanMessage,
             "suggested_action": task.suggestedAction,

@@ -31,8 +31,10 @@ if __package__ in {None, ""}:
         PACKAGE_MANIFEST_FILE,
         PACKAGE_FORMAT,
         PACKAGE_VERSION,
+        PriorMapValidationError,
         SUPPORTED_TYPES,
         build_package_manifest,
+        validate_business_identity,
         validate_package,
     )
     from PriorMap.render_prior_map import render_package
@@ -52,8 +54,10 @@ else:
         PACKAGE_MANIFEST_FILE,
         PACKAGE_FORMAT,
         PACKAGE_VERSION,
+        PriorMapValidationError,
         SUPPORTED_TYPES,
         build_package_manifest,
+        validate_business_identity,
         validate_package,
     )
     from .render_prior_map import render_package
@@ -492,8 +496,14 @@ def convert_workbook(
     source: Path | str,
     output: Path | str | None = None,
     map_name: str | None = None,
+    store_id: str | None = None,
 ) -> Path:
     source_path = Path(source).resolve()
+    resolved_map_name = str(map_name or source_path.stem)
+    try:
+        validate_business_identity(store_id, resolved_map_name)
+    except PriorMapValidationError as exc:
+        raise ConversionError(str(exc)) from exc
     source_hash = _sha256(source_path)
     result = read_element_info(source_path)
     warnings = list(result.warnings)
@@ -526,7 +536,8 @@ def convert_workbook(
             "format": PACKAGE_FORMAT,
             "version": PACKAGE_VERSION,
             "prior_map_id": prior_map_id,
-            "name": str(map_name or source_path.stem),
+            "store_id": store_id,
+            "name": resolved_map_name,
             "source_file": source_path.name,
             "source_sha256": source_hash,
             "source_coordinate_system": {
@@ -655,9 +666,15 @@ def main(argv: Iterable[str] | None = None) -> int:
     parser.add_argument("xlsx", type=Path)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--name")
+    parser.add_argument("--store-id", required=True)
     args = parser.parse_args(argv)
     try:
-        output = convert_workbook(args.xlsx, args.output, args.name)
+        output = convert_workbook(
+            args.xlsx,
+            args.output,
+            map_name=args.name,
+            store_id=args.store_id,
+        )
     except (WorkbookError, ConversionError, OSError) as exc:
         parser.error(str(exc))
     print(output)

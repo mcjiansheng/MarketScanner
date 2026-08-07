@@ -96,6 +96,14 @@ private struct PriorMapShelvesPayload: Codable {
     let format: String
     let version: Int
     let shelves: [PriorMapShelf]
+    let shelfSegments: [PriorMapShelfSegmentV2]?
+
+    enum CodingKeys: String, CodingKey {
+        case format
+        case version
+        case shelves
+        case shelfSegments = "shelf_segments"
+    }
 }
 
 private struct PriorMapStructuresPayload: Codable {
@@ -143,6 +151,7 @@ struct PriorMapPackage {
     let spatialIndex: PriorMapSpatialIndexPayload
     let distanceFields: PriorMapDistanceFieldFile
     let shelves: [PriorMapShelf]
+    let shelfSegments: [PriorMapShelfSegmentV2]
     let fixedStructures: [PriorMapFixedStructure]
     let preview: UIImage
     let previewsByFloor: [String: UIImage]
@@ -175,7 +184,9 @@ struct PriorMapPackage {
         for (name, expectedFormat) in requiredJSONFormats {
             guard let payload = snapshot.artifactsByName[name]?.parsedJSON,
                   payload["format"] as? String == expectedFormat,
-                  StrictJSONScalar.integer(payload["version"]) == 1 else {
+                  let version = StrictJSONScalar.integer(payload["version"]),
+                  name == "shelves.json" ? (version == 1 || version == 2)
+                    : version == 1 else {
                 throw NSError(
                     domain: "PriorMap",
                     code: 5,
@@ -224,6 +235,21 @@ struct PriorMapPackage {
         let distanceFields = try decoder.decode(
             PriorMapDistanceFieldFile.self,
             from: try artifactBytes("distance_fields.json"))
+        guard let shelvesObject = snapshot.artifactsByName["shelves.json"]?.parsedJSON else {
+            throw NSError(
+                domain: "PriorMap",
+                code: 8,
+                userInfo: [NSLocalizedDescriptionKey: "货架数据缺失，请重新生成地图包。"])
+        }
+        let parsedShelves: PriorMapShelvesSchema.ParsedDocument
+        do {
+            parsedShelves = try PriorMapShelvesSchema.parse(shelvesObject)
+        } catch {
+            throw NSError(
+                domain: "PriorMap",
+                code: 8,
+                userInfo: [NSLocalizedDescriptionKey: "货架 schema 无效：\(error)"])
+        }
         let shelvesPayload = try decoder.decode(
             PriorMapShelvesPayload.self,
             from: try artifactBytes("shelves.json"))
@@ -244,7 +270,10 @@ struct PriorMapPackage {
               distanceFields.truncationDistanceM <= 2.55,
               Set(distanceFields.floors.keys) == Set(manifest.floors.map(\.id)),
               shelvesPayload.format == "MarketScannerPriorMapShelves",
-              shelvesPayload.version == 1,
+              shelvesPayload.version == parsedShelves.version,
+              (parsedShelves.version == 1
+                ? (shelvesPayload.shelfSegments ?? []).isEmpty
+                : shelvesPayload.shelfSegments == parsedShelves.segments),
               structuresPayload.format == "MarketScannerPriorMapStructures",
               structuresPayload.version == 1 else {
             throw NSError(
@@ -287,6 +316,7 @@ struct PriorMapPackage {
             spatialIndex: spatial,
             distanceFields: distanceFields,
             shelves: shelvesPayload.shelves,
+            shelfSegments: parsedShelves.segments,
             fixedStructures: structuresPayload.structures,
             preview: preview,
             previewsByFloor: previewsByFloor,
@@ -999,23 +1029,27 @@ final class PriorMapStageOneLocalizer {
             priorMapId: priorMapId,
             priorMapSha256: priorMapSha256,
             timestamp: Date().timeIntervalSince1970)
+        let observationTimestamp = Date().timeIntervalSince1970
         let bounds = detection.normalizedBounds
+        let normalizedBounds: [Double] = [
+            Double(bounds.minX),
+            Double(bounds.minY),
+            Double(bounds.width),
+            Double(bounds.height),
+        ]
+        let nodeTimebaseFrameTimestamp =
+            detection.frame.timestamp + nodeTimebaseOffsetSeconds
+        let depthEvidence = measurement.depthEvidence
         let observation = PriorMapTagObservationRecord(
             format: "MarketScannerPriceTagObservation",
             version: 1,
             observationId: detection.observationId,
-            timestamp: Date().timeIntervalSince1970,
+            timestamp: observationTimestamp,
             payload: detection.payload,
             symbology: detection.symbology,
-            normalizedBounds: [
-                Double(bounds.minX),
-                Double(bounds.minY),
-                Double(bounds.width),
-                Double(bounds.height),
-            ],
+            normalizedBounds: normalizedBounds,
             frameTimestamp: detection.frame.timestamp,
-            nodeTimebaseFrameTimestamp:
-                detection.frame.timestamp + nodeTimebaseOffsetSeconds,
+            nodeTimebaseFrameTimestamp: nodeTimebaseFrameTimestamp,
             nodeTimebaseOffsetSeconds: nodeTimebaseOffsetSeconds,
             poseTimestampDeltaMs: measurement.poseTimestampDeltaMs,
             alignmentVersion: snapshot.alignmentVersion,
@@ -1026,20 +1060,22 @@ final class PriorMapStageOneLocalizer {
             rawMapPosition: measurement.rawMapPosition,
             measurementMethod: measurement.method,
             measurementConfidence: measurement.confidence,
-            depthSampleCount: measurement.depthEvidence.sampleCount,
-            depthInlierCount: measurement.depthEvidence.inlierCount,
-            depthInlierRatio: measurement.depthEvidence.inlierRatio,
-            depthMedianM: measurement.depthEvidence.medianM,
-            depthMadM: measurement.depthEvidence.madM,
-            planeResidualM: measurement.depthEvidence.planeResidualM,
-            surfaceNormalCamera: measurement.depthEvidence.surfaceNormalCamera,
+            depthSampleCount: depthEvidence.sampleCount,
+            depthInlierCount: depthEvidence.inlierCount,
+            depthInlierRatio: depthEvidence.inlierRatio,
+            depthMedianM: depthEvidence.medianM,
+            depthMadM: depthEvidence.madM,
+            planeResidualM: depthEvidence.planeResidualM,
+            surfaceNormalCamera: depthEvidence.surfaceNormalCamera,
             localizationState: effectiveLocalizationState,
             localizationConfidence: effectiveLocalizationConfidence,
             priorMapId: priorMapId,
             priorMapSha256: priorMapSha256,
             floorId: floorId,
             trackingSessionId: trackingSessionId,
-            needsReview: localized.needsReview)
+            needsReview: localized.needsReview,
+            burstId: nil,
+            frameId: nil)
         return (observation, localized)
     }
 

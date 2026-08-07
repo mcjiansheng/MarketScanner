@@ -25,6 +25,32 @@ enum XLSXWorkbookVerifier {
         var sheetName: String
         /// Frozen business headers of the first row, in order.
         var headers: [String]
+
+        var minimumDataRows: Int
+        var maximumDataRows: Int?
+
+        init(
+            partName: String,
+            sheetName: String,
+            headers: [String],
+            minimumDataRows: Int? = nil,
+            maximumDataRows: Int? = nil
+        ) {
+            self.partName = partName
+            self.sheetName = sheetName
+            self.headers = headers
+            switch sheetName {
+            case "DevicePositions":
+                self.minimumDataRows = minimumDataRows ?? 1
+                self.maximumDataRows = maximumDataRows
+            case "RunSummary":
+                self.minimumDataRows = minimumDataRows ?? 1
+                self.maximumDataRows = maximumDataRows ?? 1
+            default:
+                self.minimumDataRows = minimumDataRows ?? 0
+                self.maximumDataRows = maximumDataRows
+            }
+        }
     }
 
     struct VerificationResult {
@@ -105,8 +131,13 @@ enum XLSXWorkbookVerifier {
                    index + 3 < buffer.count,
                    buffer[index + 1] == 0x4B,
                    buffer[index + 2] == 0x05,
-                   buffer[index + 3] == 0x06 {
-                    return index
+                   buffer[index + 3] == 0x06,
+                   index + 22 <= buffer.count {
+                    let commentLength = Int(buffer[index + 20])
+                        | (Int(buffer[index + 21]) << 8)
+                    if index + 22 + commentLength == buffer.count {
+                        return index
+                    }
                 }
                 index -= 1
             }
@@ -116,11 +147,18 @@ enum XLSXWorkbookVerifier {
             throw VerifyError.notAZIP("EOCD signature not found")
         }
         let eocd = Array(tail[eocdOffset..<(eocdOffset + 22)])
+        guard readUInt16(eocd, 4) == 0,
+              readUInt16(eocd, 6) == 0,
+              readUInt16(eocd, 8) == readUInt16(eocd, 10),
+              readUInt16(eocd, 10) != 0xFFFF else {
+            throw VerifyError.corrupt("multi-disk/ZIP64 EOCD is unsupported")
+        }
         let totalEntries = readUInt16(eocd, 10)
         let centralSize = Int(readUInt32(eocd, 12))
         let centralOffset = Int(readUInt32(eocd, 16))
+        let absoluteEOCDOffset = Int(fileSize) - tailSize + eocdOffset
         guard totalEntries > 0, centralSize > 0, centralOffset >= 0,
-              centralOffset + centralSize <= fileSize else {
+              centralOffset + centralSize == absoluteEOCDOffset else {
             throw VerifyError.corrupt("invalid central directory bounds")
         }
 
@@ -131,6 +169,7 @@ enum XLSXWorkbookVerifier {
             throw VerifyError.truncated("cannot read central directory")
         }
         var entries: [CentralEntry] = []
+        var seenNames = Set<String>()
         var cursor = 0
         for _ in 0..<totalEntries {
             guard cursor + 46 <= centralData.count else {
@@ -152,13 +191,33 @@ enum XLSXWorkbookVerifier {
                 data: centralData[nameStart..<nameEnd], encoding: .utf8) else {
                 throw VerifyError.corrupt("central entry name not utf-8")
             }
+            try validateEntryName(name)
+            let canonicalName = name.precomposedStringWithCanonicalMapping
+            guard seenNames.insert(canonicalName).inserted else {
+                throw VerifyError.corrupt("duplicate entry name: \(name)")
+            }
+            let flags = readUInt16(header, 8)
+            let method = readUInt16(header, 10)
+            try validateFlags(flags, name: name)
+            guard method == 0 || method == 8,
+                  readUInt16(header, 34) == 0,
+                  readUInt32(header, 20) != 0xFFFFFFFF,
+                  readUInt32(header, 24) != 0xFFFFFFFF,
+                  readUInt32(header, 42) != 0xFFFFFFFF else {
+                throw VerifyError.corrupt("unsupported ZIP entry: \(name)")
+            }
             entries.append(CentralEntry(
                 name: name,
+                flags: flags,
+                method: method,
                 crc32: readUInt32(header, 16),
                 compressedSize: Int(readUInt32(header, 20)),
                 uncompressedSize: Int(readUInt32(header, 24)),
                 localHeaderOffset: Int(readUInt32(header, 42))))
             cursor = nameEnd + extraLength + commentLength
+        }
+        guard cursor == centralData.count else {
+            throw VerifyError.corrupt("central directory length mismatch")
         }
 
         // 3. Required parts are present.
@@ -176,20 +235,65 @@ enum XLSXWorkbookVerifier {
                 throw VerifyError.corrupt("unexpected worksheet part: \(name)")
             }
         }
+        let allowedParts = requiredParts.union(expectedPartNames)
+        guard names == allowedParts else {
+            let unexpected = names.subtracting(allowedParts).sorted()
+            throw VerifyError.corrupt(
+                "unexpected package parts: \(unexpected.joined(separator: ","))")
+        }
 
-        // 4. workbook.xml binds every expected sheet name (small part,
-        // read in full by construction).
+        // 4. Parse workbook.xml and its relationship part as exact XML
+        // relations: ordered unique sheet names/ids/r:ids must resolve
+        // to the exact expected worksheet parts.
         guard let workbookEntry = entries.first(where: { $0.name == "xl/workbook.xml" }) else {
             throw VerifyError.corrupt("workbook.xml missing")
         }
-        let workbookXML = try inflateEntry(workbookEntry, handle: handle)
-        guard let workbookText = String(data: workbookXML, encoding: .utf8) else {
-            throw VerifyError.corrupt("workbook.xml not utf-8")
+        let workbookXML = try inflateAndVerifyEntry(
+            workbookEntry, handle: handle,
+            maximumBytes: min(maximumEntryBytes, 1_048_576))
+        guard workbookXML.count <= 1_048_576,
+              let relationshipsEntry = entries.first(where: {
+                  $0.name == "xl/_rels/workbook.xml.rels"
+              }) else {
+            throw VerifyError.corrupt("workbook metadata missing/too large")
         }
-        for expectation in expectedSheets {
-            guard workbookText.contains("name=\"\(expectation.sheetName)\"") else {
+        let relationshipsXML = try inflateAndVerifyEntry(
+            relationshipsEntry, handle: handle,
+            maximumBytes: min(maximumEntryBytes, 1_048_576))
+        guard relationshipsXML.count <= 1_048_576 else {
+            throw VerifyError.corrupt("workbook relationships too large")
+        }
+        // Every required non-sheet XML part is a real ZIP payload, not
+        // merely a name in the central directory. Validate local/central
+        // headers, bounded decompression, CRC and exact uncompressed size.
+        for part in requiredParts
+            where part != "xl/workbook.xml"
+                && part != "xl/_rels/workbook.xml.rels" {
+            guard let entry = entries.first(where: { $0.name == part }) else {
+                throw VerifyError.corrupt("required part missing: \(part)")
+            }
+            try verifyEntryIntegrity(
+                entry, handle: handle, maximumBytes: maximumEntryBytes)
+        }
+        let sheetRecords = try parseWorkbookSheets(workbookXML)
+        let relationshipTargets = try parseWorkbookRelationships(
+            relationshipsXML)
+        guard sheetRecords.count == expectedSheets.count else {
+            throw VerifyError.corrupt("workbook sheet count mismatch")
+        }
+        var sheetNames = Set<String>()
+        var relationshipIDs = Set<String>()
+        for (index, expectation) in expectedSheets.enumerated() {
+            let record = sheetRecords[index]
+            let expectedID = "rId\(index + 1)"
+            guard record.name == expectation.sheetName,
+                  record.sheetID == index + 1,
+                  record.relationshipID == expectedID,
+                  sheetNames.insert(record.name).inserted,
+                  relationshipIDs.insert(record.relationshipID).inserted,
+                  relationshipTargets[expectedID] == expectation.partName else {
                 throw VerifyError.corrupt(
-                    "workbook.xml does not bind sheet \(expectation.sheetName)")
+                    "workbook sheet relation mismatch at index \(index)")
             }
         }
 
@@ -205,12 +309,23 @@ enum XLSXWorkbookVerifier {
                 throw VerifyError.entryTooLarge("\(expectation.partName)")
             }
             let (scan, crc, uncompressed) = try streamScanSheet(
-                entry, handle: handle, headers: expectation.headers)
+                entry, handle: handle, headers: expectation.headers,
+                maximumBytes: maximumEntryBytes)
             guard crc == entry.crc32 else {
                 throw VerifyError.crcMismatch(expectation.partName)
             }
             guard uncompressed == entry.uncompressedSize else {
                 throw VerifyError.sizeMismatch(expectation.partName)
+            }
+            guard scan.dataRows >= expectation.minimumDataRows else {
+                throw VerifyError.emptySheet(
+                    "\(expectation.sheetName) requires at least "
+                    + "\(expectation.minimumDataRows) data rows")
+            }
+            if let maximum = expectation.maximumDataRows,
+               scan.dataRows > maximum {
+                throw VerifyError.sheetXMLInvalid(
+                    "\(expectation.sheetName) exceeds \(maximum) data rows")
             }
             rowCounts[expectation.partName] = scan.dataRows
         }
@@ -224,116 +339,474 @@ enum XLSXWorkbookVerifier {
         var dataRows: Int
     }
 
-    private static let rowOpenBytes: [UInt8] = Array("<row r=\"".utf8)
-    private static let rowCloseBytes: [UInt8] = Array("</row>".utf8)
-
-    /// Streams one worksheet through raw inflate while scanning the XML
-    /// with a bounded byte state machine: row-marker count, the frozen
-    /// first-row headers (accumulated only up to the closing `</row>`),
-    /// the no-formula rule and the incremental CRC-32. Memory stays
-    /// bounded to the header row + one 7-byte cross-chunk tail.
+    /// Streams one worksheet through raw inflate while scanning exact XML
+    /// tag names. Comments/CDATA/DOCTYPE are rejected (the writer never
+    /// emits them), a real `<f>` element is detected without confusing
+    /// `<foo>`, and only the bounded first row is retained for exact cell
+    /// reference/value verification.
     private static func streamScanSheet(
         _ entry: CentralEntry,
         handle: FileHandle,
-        headers: [String]
+        headers: [String],
+        maximumBytes: Int64
     ) throws -> (SheetScan, UInt32, Int) {
-        var rowMarkers = 0
         var crc: uLong = 0
         var uncompressed = 0
-        var headerBuffer: [UInt8] = []
-        var inHeaderRow = false
-        var headerClosed = false
-        var formulaDetected = false
-        var tail: [UInt8] = []
+        var scanner = WorksheetTokenScanner()
         _ = try inflateChunked(entry: entry, handle: handle) { chunk in
             crc = chunk.withUnsafeBytes { buffer in
                 crc32(crc, buffer.bindMemory(to: Bytef.self).baseAddress, uInt(buffer.count))
             }
             uncompressed += chunk.count
-            let bytes = [UInt8](chunk)
-            let window = tail + bytes
-            var index = 0
-            let count = window.count
-            while index < count {
-                let byte = window[index]
-                if byte == 0x3C { // '<'
-                    if index + 1 < count && window[index + 1] == 0x66 { // 'f'
-                        formulaDetected = true
-                    }
-                    if index + 7 < count && matches(rowOpenBytes, in: window, at: index) {
-                        rowMarkers += 1
-                        if !headerClosed && !inHeaderRow {
-                            inHeaderRow = true
-                        }
-                    }
-                }
-                index += 1
+            guard Int64(uncompressed) <= maximumBytes else {
+                throw VerifyError.entryTooLarge(entry.name)
             }
-            // V1R5 §13.2 (review H-04): the header buffer only ever
-            // receives the CURRENT chunk's new bytes; `tail` exists
-            // solely for pattern matching across chunk boundaries. The
-            // V1R4 code appended the whole window (tail + bytes), which
-            // duplicated the previous chunk's tail into the header row.
-            if inHeaderRow && !headerClosed {
-                for byte in bytes {
-                    headerBuffer.append(byte)
-                    if headerBuffer.count > 1_048_576 {
-                        throw VerifyError.sheetXMLInvalid("header row too large")
-                    }
-                    if byte == 0x3E && headerBuffer.count >= 6,
-                       Array(headerBuffer.suffix(6)) == rowCloseBytes {
-                        headerClosed = true
-                        break
-                    }
-                }
+            guard uncompressed <= entry.uncompressedSize else {
+                throw VerifyError.sizeMismatch(entry.name)
             }
-            tail = Array(bytes.suffix(7))
+            try scanner.consume(chunk)
         }
-        if formulaDetected {
-            throw VerifyError.formulaDetected("formula element present")
-        }
-        guard rowMarkers >= 1 else {
+        try scanner.finish()
+        guard scanner.rowCount >= 1,
+              let headerRow = scanner.headerRow else {
             throw VerifyError.sheetXMLInvalid("no header row")
         }
-        guard let headerRow = String(bytes: headerBuffer, encoding: .utf8) else {
-            throw VerifyError.sheetXMLInvalid("header row not utf-8")
-        }
-        var searchRange = headerRow.startIndex..<headerRow.endIndex
-        for header in headers {
-            guard let found = headerRow.range(of: header, range: searchRange) else {
-                throw VerifyError.headerMismatch(
-                    "header '\(header)' missing or out of order in \(headers)")
-            }
-            searchRange = found.upperBound..<headerRow.endIndex
-        }
-        return (SheetScan(dataRows: rowMarkers - 1), UInt32(truncatingIfNeeded: crc), uncompressed)
+        try verifyHeaderRow(headerRow, expectedHeaders: headers)
+        return (
+            SheetScan(dataRows: scanner.rowCount - 1),
+            UInt32(truncatingIfNeeded: crc),
+            uncompressed)
     }
 
-    private static func matches(_ needle: [UInt8], in window: [UInt8], at index: Int) -> Bool {
-        guard index + needle.count <= window.count else { return false }
-        for offset in 0..<needle.count where window[index + offset] != needle[offset] {
-            return false
+    private struct WorksheetTokenScanner {
+        private var inTag = false
+        private var quote: UInt8?
+        private var tag = [UInt8]()
+        private var captureHeader = false
+        private(set) var headerRow: Data?
+        private var headerBytes = Data()
+        private(set) var rowCount = 0
+
+        mutating func consume(_ data: Data) throws {
+            for byte in data {
+                if captureHeader {
+                    headerBytes.append(byte)
+                    guard headerBytes.count <= 1_048_576 else {
+                        throw VerifyError.sheetXMLInvalid(
+                            "header row exceeds 1 MiB")
+                    }
+                }
+                if !inTag {
+                    if byte == 0x3C { // '<'
+                        inTag = true
+                        quote = nil
+                        tag = [byte]
+                    }
+                    continue
+                }
+                if !(captureHeader && tag.isEmpty) {
+                    tag.append(byte)
+                }
+                guard tag.count <= 64 * 1024 else {
+                    throw VerifyError.sheetXMLInvalid("XML tag too large")
+                }
+                if let activeQuote = quote {
+                    if byte == activeQuote { quote = nil }
+                    continue
+                }
+                if byte == 0x22 || byte == 0x27 { // quote
+                    quote = byte
+                    continue
+                }
+                if byte == 0x3E { // '>'
+                    try finishTag()
+                    inTag = false
+                    tag.removeAll(keepingCapacity: true)
+                }
+            }
         }
-        return true
+
+        mutating func finish() throws {
+            guard !inTag, !captureHeader else {
+                throw VerifyError.sheetXMLInvalid(
+                    "unterminated XML tag/header row")
+            }
+        }
+
+        private mutating func finishTag() throws {
+            guard tag.count >= 3,
+                  let text = String(bytes: tag, encoding: .utf8) else {
+                throw VerifyError.sheetXMLInvalid("invalid UTF-8 XML tag")
+            }
+            if text.hasPrefix("<?") {
+                guard text.hasSuffix("?>") else {
+                    throw VerifyError.sheetXMLInvalid(
+                        "invalid processing instruction")
+                }
+                return
+            }
+            if text.hasPrefix("<!") {
+                throw VerifyError.sheetXMLInvalid(
+                    "DOCTYPE/comment/CDATA is not allowed")
+            }
+            let trimmed = text.dropFirst().dropLast()
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let isEnd = trimmed.hasPrefix("/")
+            let nameStart = isEnd ? trimmed.index(after: trimmed.startIndex)
+                : trimmed.startIndex
+            let remainder = trimmed[nameStart...]
+            let name = String(remainder.prefix { character in
+                !character.isWhitespace && character != "/"
+            })
+            guard !name.isEmpty else {
+                throw VerifyError.sheetXMLInvalid("empty XML tag name")
+            }
+            if !isEnd && name == "f" {
+                throw VerifyError.formulaDetected("formula element present")
+            }
+            if !isEnd && name == "row" {
+                rowCount += 1
+                if rowCount == 1 {
+                    captureHeader = true
+                    headerBytes = Data(tag)
+                }
+            } else if isEnd && name == "row" && captureHeader {
+                captureHeader = false
+                headerRow = headerBytes
+            }
+        }
+    }
+
+    private struct WorkbookSheetRecord {
+        var name: String
+        var sheetID: Int
+        var relationshipID: String
+    }
+
+    private static func parseWorkbookSheets(
+        _ data: Data
+    ) throws -> [WorkbookSheetRecord] {
+        let delegate = WorkbookSheetXMLDelegate()
+        let parser = XMLParser(data: data)
+        parser.delegate = delegate
+        parser.shouldProcessNamespaces = false
+        parser.shouldResolveExternalEntities = false
+        guard parser.parse(), delegate.failure == nil else {
+            throw VerifyError.corrupt(
+                "invalid workbook.xml: \(delegate.failure ?? parser.parserError?.localizedDescription ?? "parse failed")")
+        }
+        return delegate.records
+    }
+
+    private static func parseWorkbookRelationships(
+        _ data: Data
+    ) throws -> [String: String] {
+        let delegate = WorkbookRelationshipsXMLDelegate()
+        let parser = XMLParser(data: data)
+        parser.delegate = delegate
+        parser.shouldProcessNamespaces = false
+        parser.shouldResolveExternalEntities = false
+        guard parser.parse(), delegate.failure == nil else {
+            throw VerifyError.corrupt(
+                "invalid workbook relationships: \(delegate.failure ?? parser.parserError?.localizedDescription ?? "parse failed")")
+        }
+        return delegate.worksheetTargets
+    }
+
+    private static func verifyHeaderRow(
+        _ rowData: Data,
+        expectedHeaders: [String]
+    ) throws {
+        var wrapper = Data(
+            "<root xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\">".utf8)
+        wrapper.append(rowData)
+        wrapper.append(Data("</root>".utf8))
+        let delegate = HeaderRowXMLDelegate()
+        let parser = XMLParser(data: wrapper)
+        parser.delegate = delegate
+        parser.shouldProcessNamespaces = false
+        parser.shouldResolveExternalEntities = false
+        guard parser.parse(), delegate.failure == nil else {
+            throw VerifyError.headerMismatch(
+                delegate.failure ?? parser.parserError?.localizedDescription
+                    ?? "header XML parse failed")
+        }
+        guard delegate.rowReference == 1,
+              delegate.cells.count == expectedHeaders.count else {
+            throw VerifyError.headerMismatch(
+                "header row/cell count mismatch")
+        }
+        for (index, expected) in expectedHeaders.enumerated() {
+            let expectedReference = columnLetters(index + 1) + "1"
+            let cell = delegate.cells[index]
+            guard cell.reference == expectedReference,
+                  cell.type == "inlineStr",
+                  cell.value == expected else {
+                throw VerifyError.headerMismatch(
+                    "expected \(expectedReference)=\(expected), got "
+                    + "\(cell.reference)=\(cell.value)")
+            }
+        }
+    }
+
+    private static func columnLetters(_ column: Int) -> String {
+        var value = column
+        var result = ""
+        while value > 0 {
+            let remainder = (value - 1) % 26
+            result = String(Character(UnicodeScalar(65 + remainder)!)) + result
+            value = (value - 1) / 26
+        }
+        return result
+    }
+
+    private final class WorkbookSheetXMLDelegate: NSObject, XMLParserDelegate {
+        var records: [WorkbookSheetRecord] = []
+        var failure: String?
+        private var relationshipIDs = Set<String>()
+        private var names = Set<String>()
+
+        func parser(
+            _ parser: XMLParser,
+            didStartElement elementName: String,
+            namespaceURI: String?,
+            qualifiedName qName: String?,
+            attributes attributeDict: [String: String] = [:]
+        ) {
+            guard elementName == "sheet" else { return }
+            guard let name = attributeDict["name"], !name.isEmpty,
+                  let rawSheetID = attributeDict["sheetId"],
+                  let sheetID = Int(rawSheetID), sheetID > 0,
+                  let relationshipID = attributeDict["r:id"],
+                  !relationshipID.isEmpty,
+                  names.insert(name).inserted,
+                  relationshipIDs.insert(relationshipID).inserted else {
+                failure = "invalid/duplicate sheet attributes"
+                parser.abortParsing()
+                return
+            }
+            records.append(WorkbookSheetRecord(
+                name: name,
+                sheetID: sheetID,
+                relationshipID: relationshipID))
+        }
+
+        func parser(
+            _ parser: XMLParser,
+            foundExternalEntityDeclarationWithName name: String,
+            publicID: String?,
+            systemID: String?
+        ) {
+            failure = "external entity is forbidden"
+            parser.abortParsing()
+        }
+    }
+
+    private final class WorkbookRelationshipsXMLDelegate:
+        NSObject, XMLParserDelegate {
+        var worksheetTargets: [String: String] = [:]
+        var failure: String?
+        private let worksheetType =
+            "http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet"
+        private var allIDs = Set<String>()
+
+        func parser(
+            _ parser: XMLParser,
+            didStartElement elementName: String,
+            namespaceURI: String?,
+            qualifiedName qName: String?,
+            attributes attributeDict: [String: String] = [:]
+        ) {
+            guard elementName == "Relationship" else { return }
+            guard let identifier = attributeDict["Id"],
+                  let type = attributeDict["Type"],
+                  let target = attributeDict["Target"],
+                  allIDs.insert(identifier).inserted else {
+                failure = "invalid/duplicate relationship"
+                parser.abortParsing()
+                return
+            }
+            guard type == worksheetType else { return }
+            guard !target.isEmpty, !target.hasPrefix("/"),
+                  !target.contains("\\"),
+                  target.split(separator: "/", omittingEmptySubsequences: false)
+                    .allSatisfy({ $0 != "." && $0 != ".." && !$0.isEmpty }) else {
+                failure = "unsafe worksheet relationship target"
+                parser.abortParsing()
+                return
+            }
+            worksheetTargets[identifier] = "xl/\(target)"
+        }
+
+        func parser(
+            _ parser: XMLParser,
+            foundExternalEntityDeclarationWithName name: String,
+            publicID: String?,
+            systemID: String?
+        ) {
+            failure = "external entity is forbidden"
+            parser.abortParsing()
+        }
+    }
+
+    private final class HeaderRowXMLDelegate: NSObject, XMLParserDelegate {
+        struct Cell {
+            var reference: String
+            var type: String
+            var value: String
+        }
+
+        var rowReference: Int?
+        var cells: [Cell] = []
+        var failure: String?
+        private var currentReference: String?
+        private var currentType: String?
+        private var currentText = ""
+        private var inText = false
+
+        func parser(
+            _ parser: XMLParser,
+            didStartElement elementName: String,
+            namespaceURI: String?,
+            qualifiedName qName: String?,
+            attributes attributeDict: [String: String] = [:]
+        ) {
+            switch elementName {
+            case "row":
+                guard rowReference == nil,
+                      let raw = attributeDict["r"],
+                      let value = Int(raw) else {
+                    failure = "invalid/duplicate header row"
+                    parser.abortParsing()
+                    return
+                }
+                rowReference = value
+            case "c":
+                guard currentReference == nil,
+                      let reference = attributeDict["r"],
+                      let type = attributeDict["t"] else {
+                    failure = "invalid nested header cell"
+                    parser.abortParsing()
+                    return
+                }
+                currentReference = reference
+                currentType = type
+                currentText = ""
+            case "t":
+                guard currentReference != nil, !inText else {
+                    failure = "text outside/duplicated in header cell"
+                    parser.abortParsing()
+                    return
+                }
+                inText = true
+            case "f":
+                failure = "formula in header"
+                parser.abortParsing()
+            default:
+                break
+            }
+        }
+
+        func parser(_ parser: XMLParser, foundCharacters string: String) {
+            if inText { currentText += string }
+        }
+
+        func parser(
+            _ parser: XMLParser,
+            didEndElement elementName: String,
+            namespaceURI: String?,
+            qualifiedName qName: String?
+        ) {
+            if elementName == "t" {
+                inText = false
+            } else if elementName == "c" {
+                guard let reference = currentReference,
+                      let type = currentType else {
+                    failure = "header cell end without start"
+                    parser.abortParsing()
+                    return
+                }
+                cells.append(Cell(
+                    reference: reference, type: type, value: currentText))
+                currentReference = nil
+                currentType = nil
+                currentText = ""
+            }
+        }
+
+        func parser(
+            _ parser: XMLParser,
+            foundExternalEntityDeclarationWithName name: String,
+            publicID: String?,
+            systemID: String?
+        ) {
+            failure = "external entity is forbidden"
+            parser.abortParsing()
+        }
     }
 
     // MARK: - Streaming inflate
 
     private struct CentralEntry {
         var name: String
+        var flags: UInt16
+        var method: UInt16
         var crc32: UInt32
         var compressedSize: Int
         var uncompressedSize: Int
         var localHeaderOffset: Int
     }
 
-    /// Fully inflates one (small) entry; used for `workbook.xml` only.
-    private static func inflateEntry(
+    /// Fully inflates and verifies one bounded small entry.
+    private static func inflateAndVerifyEntry(
         _ entry: CentralEntry,
-        handle: FileHandle
+        handle: FileHandle,
+        maximumBytes: Int64
     ) throws -> Data {
-        let (data, _, _) = try streamInflateEntry(entry, handle: handle)
+        guard Int64(entry.uncompressedSize) <= maximumBytes else {
+            throw VerifyError.entryTooLarge(entry.name)
+        }
+        let (data, crc, uncompressed) = try streamInflateEntry(
+            entry, handle: handle, maximumBytes: maximumBytes)
+        guard crc == entry.crc32 else {
+            throw VerifyError.crcMismatch(entry.name)
+        }
+        guard uncompressed == entry.uncompressedSize else {
+            throw VerifyError.sizeMismatch(entry.name)
+        }
         return data
+    }
+
+    private static func verifyEntryIntegrity(
+        _ entry: CentralEntry,
+        handle: FileHandle,
+        maximumBytes: Int64
+    ) throws {
+        guard Int64(entry.uncompressedSize) <= maximumBytes else {
+            throw VerifyError.entryTooLarge(entry.name)
+        }
+        var crc: uLong = 0
+        var uncompressed = 0
+        _ = try inflateChunked(entry: entry, handle: handle) { chunk in
+            uncompressed += chunk.count
+            guard Int64(uncompressed) <= maximumBytes else {
+                throw VerifyError.entryTooLarge(entry.name)
+            }
+            guard uncompressed <= entry.uncompressedSize else {
+                throw VerifyError.sizeMismatch(entry.name)
+            }
+            crc = chunk.withUnsafeBytes { buffer in
+                crc32(
+                    crc, buffer.bindMemory(to: Bytef.self).baseAddress,
+                    uInt(buffer.count))
+            }
+        }
+        guard UInt32(truncatingIfNeeded: crc) == entry.crc32 else {
+            throw VerifyError.crcMismatch(entry.name)
+        }
+        guard uncompressed == entry.uncompressedSize else {
+            throw VerifyError.sizeMismatch(entry.name)
+        }
     }
 
     /// Streams one entry through raw inflate, returning the decompressed
@@ -343,7 +816,8 @@ enum XLSXWorkbookVerifier {
     /// `streamInflateChunked`).
     private static func streamInflateEntry(
         _ entry: CentralEntry,
-        handle: FileHandle
+        handle: FileHandle,
+        maximumBytes: Int64
     ) throws -> (Data, UInt32, Int) {
         var chunks: [Data] = []
         var crc: uLong = 0
@@ -353,6 +827,12 @@ enum XLSXWorkbookVerifier {
                 crc32(crc, buffer.bindMemory(to: Bytef.self).baseAddress, uInt(buffer.count))
             }
             uncompressed += chunk.count
+            guard Int64(uncompressed) <= maximumBytes else {
+                throw VerifyError.entryTooLarge(entry.name)
+            }
+            guard uncompressed <= entry.uncompressedSize else {
+                throw VerifyError.sizeMismatch(entry.name)
+            }
             chunks.append(chunk)
         }
         return (chunks.reduce(into: Data(), { $0.append($1) }), UInt32(truncatingIfNeeded: crc), uncompressed)
@@ -374,11 +854,63 @@ enum XLSXWorkbookVerifier {
         guard readUInt32(Array(localHeader), 0) == 0x04034B50 else {
             throw VerifyError.corrupt("bad local header signature: \(entry.name)")
         }
-        let nameLength = Int(readUInt16(Array(localHeader), 26))
-        let extraLength = Int(readUInt16(Array(localHeader), 28))
+        let localBytes = Array(localHeader)
+        let localFlags = readUInt16(localBytes, 6)
+        let localMethod = readUInt16(localBytes, 8)
+        let localCRC = readUInt32(localBytes, 14)
+        let localCompressedSize = readUInt32(localBytes, 18)
+        let localUncompressedSize = readUInt32(localBytes, 22)
+        let nameLength = Int(readUInt16(localBytes, 26))
+        let extraLength = Int(readUInt16(localBytes, 28))
+        guard localFlags == entry.flags, localMethod == entry.method else {
+            throw VerifyError.corrupt(
+                "local/central flags or method mismatch: \(entry.name)")
+        }
         guard let skipped = try handle.read(upToCount: nameLength + extraLength),
               skipped.count == nameLength + extraLength else {
             throw VerifyError.corrupt("local header name/extra truncated: \(entry.name)")
+        }
+        guard let localName = String(
+            data: skipped.prefix(nameLength), encoding: .utf8),
+              localName == entry.name else {
+            throw VerifyError.corrupt(
+                "local/central name mismatch: \(entry.name)")
+        }
+        let usesDataDescriptor = entry.flags & 0x0008 != 0
+        if usesDataDescriptor {
+            guard (localCRC == 0 || localCRC == entry.crc32),
+                  (localCompressedSize == 0
+                    || Int(localCompressedSize) == entry.compressedSize),
+                  (localUncompressedSize == 0
+                    || Int(localUncompressedSize) == entry.uncompressedSize) else {
+                throw VerifyError.corrupt(
+                    "local/central descriptor fields mismatch: \(entry.name)")
+            }
+        } else {
+            guard localCRC == entry.crc32,
+                  Int(localCompressedSize) == entry.compressedSize,
+                  Int(localUncompressedSize) == entry.uncompressedSize else {
+                throw VerifyError.corrupt(
+                    "local/central size or CRC mismatch: \(entry.name)")
+            }
+        }
+
+        if entry.method == 0 {
+            var remaining = entry.compressedSize
+            while remaining > 0 {
+                guard let chunk = try handle.read(
+                    upToCount: min(remaining, 256 * 1024)),
+                      !chunk.isEmpty else {
+                    throw VerifyError.truncated(
+                        "stored payload truncated: \(entry.name)")
+                }
+                remaining -= chunk.count
+                try body(chunk)
+            }
+            if usesDataDescriptor {
+                try validateDataDescriptor(entry, handle: handle)
+            }
+            return
         }
 
         var stream = z_stream()
@@ -460,6 +992,60 @@ enum XLSXWorkbookVerifier {
         }
         guard remaining == 0 else {
             throw VerifyError.corrupt("payload shorter than central record: \(entry.name)")
+        }
+        if usesDataDescriptor {
+            try validateDataDescriptor(entry, handle: handle)
+        }
+    }
+
+    private static func validateDataDescriptor(
+        _ entry: CentralEntry,
+        handle: FileHandle
+    ) throws {
+        guard let descriptor = try handle.read(upToCount: 16),
+              descriptor.count == 16 else {
+            throw VerifyError.truncated(
+                "data descriptor truncated: \(entry.name)")
+        }
+        let bytes = Array(descriptor)
+        guard readUInt32(bytes, 0) == 0x08074B50,
+              readUInt32(bytes, 4) == entry.crc32,
+              Int(readUInt32(bytes, 8)) == entry.compressedSize,
+              Int(readUInt32(bytes, 12)) == entry.uncompressedSize else {
+            throw VerifyError.corrupt(
+                "data descriptor mismatch: \(entry.name)")
+        }
+    }
+
+    private static func validateFlags(
+        _ flags: UInt16,
+        name: String
+    ) throws {
+        // The verifier explicitly supports bit 3 data descriptors and
+        // bit 11 UTF-8 names. Encryption/strong encryption and every
+        // other unsupported semantic flag are rejected.
+        let supported: UInt16 = 0x0008 | 0x0800
+        guard flags & 0x0001 == 0,
+              flags & 0x0040 == 0,
+              flags & ~supported == 0 else {
+            throw VerifyError.corrupt(
+                "unsupported/encrypted flags for \(name)")
+        }
+    }
+
+    private static func validateEntryName(_ name: String) throws {
+        guard !name.isEmpty, !name.hasPrefix("/"),
+              !name.hasPrefix("\\"), !name.contains("\\"),
+              !(name.count >= 2
+                && name[name.index(after: name.startIndex)] == ":") else {
+            throw VerifyError.corrupt("unsafe ZIP entry name: \(name)")
+        }
+        let components = name.split(
+            separator: "/", omittingEmptySubsequences: false)
+        guard components.allSatisfy({
+            !$0.isEmpty && $0 != "." && $0 != ".."
+        }) else {
+            throw VerifyError.corrupt("unsafe ZIP entry path: \(name)")
         }
     }
 

@@ -47,6 +47,7 @@ enum MapSourceImportError: Error, Equatable {
     /// user-confirmed store ID — a defaulted "default" can collide
     /// across stores and sessions.
     case storeIDRequired
+    case invalidBusinessIdentity(field: String, reason: String)
     case cancelled
 
     /// Frozen machine-readable code. UI and tests must not parse the
@@ -90,6 +91,8 @@ enum MapSourceImportError: Error, Equatable {
         case .invalidGeometry: return "map_source_invalid_geometry"
         case .duplicateElementIdentity: return "map_source_duplicate_element_identity"
         case .storeIDRequired: return "map_source_store_id_required"
+        case .invalidBusinessIdentity:
+            return "map_source_invalid_business_identity"
         case .cancelled: return "map_source_cancelled"
         }
     }
@@ -170,8 +173,78 @@ enum MapSourceImportError: Error, Equatable {
             return "地图包含重复的元素身份：\(duplicateID)"
         case .storeIDRequired:
             return "导入要求用户确认的 store ID（不允许默认值）。"
+        case .invalidBusinessIdentity(let field, let reason):
+            return "地图业务标识 \(field) 无效：\(reason)"
         case .cancelled:
             return "导入已取消。"
+        }
+    }
+}
+
+/// One policy for every store/map identity entering canonical JSON,
+/// compiler manifests, the map registry and result exports. Values are
+/// preserved byte-for-byte; unsafe values are rejected, never trimmed or
+/// silently rewritten into a different business identity.
+enum MapSourceBusinessIdentityPolicy {
+    static let maximumStoreIDBytes = 128
+    static let maximumMapNameBytes = 200
+
+    static func validate(storeID: String, mapName: String) throws {
+        try validateComponent(
+            storeID, field: "store_id", maximumUTF8Bytes: maximumStoreIDBytes)
+        try validateComponent(
+            mapName, field: "map_name", maximumUTF8Bytes: maximumMapNameBytes)
+    }
+
+    static func isValidStoreID(_ value: String) -> Bool {
+        return (try? validateComponent(
+            value, field: "store_id",
+            maximumUTF8Bytes: maximumStoreIDBytes)) != nil
+    }
+
+    static func isValidMapName(_ value: String) -> Bool {
+        return (try? validateComponent(
+            value, field: "map_name",
+            maximumUTF8Bytes: maximumMapNameBytes)) != nil
+    }
+
+    private static func validateComponent(
+        _ value: String,
+        field: String,
+        maximumUTF8Bytes: Int
+    ) throws {
+        guard !value.isEmpty else {
+            throw MapSourceImportError.invalidBusinessIdentity(
+                field: field, reason: "must not be empty")
+        }
+        guard value == value.precomposedStringWithCanonicalMapping else {
+            throw MapSourceImportError.invalidBusinessIdentity(
+                field: field, reason: "must use NFC Unicode normalization")
+        }
+        guard value.utf8.count <= maximumUTF8Bytes else {
+            throw MapSourceImportError.invalidBusinessIdentity(
+                field: field,
+                reason: "exceeds \(maximumUTF8Bytes) UTF-8 bytes")
+        }
+        guard value != ".", value != "..", !value.hasPrefix("."),
+              !value.contains("/"), !value.contains("\\") else {
+            throw MapSourceImportError.invalidBusinessIdentity(
+                field: field, reason: "must be a safe non-hidden basename")
+        }
+        guard value == value.trimmingCharacters(in: .whitespacesAndNewlines),
+              !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw MapSourceImportError.invalidBusinessIdentity(
+                field: field, reason: "leading/trailing or all whitespace is forbidden")
+        }
+        guard !value.unicodeScalars.contains(where: {
+            $0.value < 0x20 || ($0.value >= 0x7F && $0.value <= 0x9F)
+        }) else {
+            throw MapSourceImportError.invalidBusinessIdentity(
+                field: field, reason: "control characters are forbidden")
+        }
+        guard URL(fileURLWithPath: value).lastPathComponent == value else {
+            throw MapSourceImportError.invalidBusinessIdentity(
+                field: field, reason: "must be one path-safe component")
         }
     }
 }

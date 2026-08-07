@@ -52,6 +52,8 @@ final class MobileOnlyHomeViewController: UIViewController {
         let state = MobileOnlyWorkflowCoordinator.shared.state
         if state.isResumable {
             presentInterruptedBanner(state)
+        } else if state == .rescanRequired {
+            presentRescanRequiredBanner()
         }
     }
 
@@ -107,6 +109,16 @@ final class MobileOnlyHomeViewController: UIViewController {
             // launch (§5.2); otherwise the run stays in idle.
             MobileOnlyWorkflowCoordinator.shared.attemptResume()
         })
+        present(alert, animated: true)
+    }
+
+    private func presentRescanRequiredBanner() {
+        let alert = UIAlertController(
+            title: "需要重新扫描整个会话",
+            message: "上次处理已形成 RESCAN_SESSION 终态。系统未发布普通结果；"
+                + "请在确认现场条件后重新扫描整个会话。",
+            preferredStyle: .alert)
+        alert.addAction(UIAlertAction(title: "知道了", style: .default))
         present(alert, animated: true)
     }
 

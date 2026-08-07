@@ -30,85 +30,21 @@
 		4EA7C1000000000D00100001 /* MobileResultViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA7C1000000000D00100002 /* MobileResultViewController.swift */; };
 		4EA7C1000000000E00100001 /* MobileRescanTasksViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA7C1000000000E00100002 /* MobileRescanTasksViewController.swift */; };
 		4E0D83832621F52C00C879AC /* Settings.bundle in Resources */ = {isa = PBXBuildFile; fileRef = 4E0D83822621F52C00C879AC /* Settings.bundle */; };
-		4E10D89C2DE409870015926D /* librtabmap_core.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 4EFD0EB0259D5BE500575D88 /* librtabmap_core.a */; };
-		4E10D89D2DE409870015926D /* librtabmap_utilite.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 4EFD0EAF259D5BE500575D88 /* librtabmap_utilite.a */; };
-		4E10D89E2DE409A60015926D /* libopencv_xfeatures2d.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 4EFD0ED9259D5BFC00575D88 /* libopencv_xfeatures2d.a */; };
-		4E10D89F2DE409B20015926D /* libopencv_video.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 4EFD0EB4259D5BFB00575D88 /* libopencv_video.a */; };
-		4E10D8A02DE409BB0015926D /* libopencv_tracking.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 4EFD0ECC259D5BFC00575D88 /* libopencv_tracking.a */; };
-		4E10D8A12DE409C00015926D /* libopencv_optflow.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 4EFD0EC3259D5BFC00575D88 /* libopencv_optflow.a */; };
-		4E10D8A22DE409C70015926D /* libopencv_imgproc.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 4EFD0EBE259D5BFC00575D88 /* libopencv_imgproc.a */; };
-		4E10D8A32DE409CA0015926D /* libopencv_features2d.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 4EFD0EB8259D5BFB00575D88 /* libopencv_features2d.a */; };
-		4E10D8A42DE409CE0015926D /* libopencv_core.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 4EFD0ED1259D5BFC00575D88 /* libopencv_core.a */; };
-		4E10D8A52DE409D10015926D /* libopencv_calib3d.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 4EFD0ED6259D5BFC00575D88 /* libopencv_calib3d.a */; };
-		4E10D8A62DE409D50015926D /* libopencv_aruco.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 4EFD0EB5259D5BFB00575D88 /* libopencv_aruco.a */; };
-		4E10D8A72DE409F40015926D /* libopencv_flann.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 4EFD0EBC259D5BFB00575D88 /* libopencv_flann.a */; };
-		4E10D8A82DE40A1B0015926D /* libopencv_ximgproc.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 4EFD0EDC259D5BFC00575D88 /* libopencv_ximgproc.a */; };
-		4E10D8A92DE40A3A0015926D /* libopencv_photo.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 4EFD0EB6259D5BFB00575D88 /* libopencv_photo.a */; };
-		4E10D8AA2DE40A6C0015926D /* libopencv_objdetect.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 4EFD0EBB259D5BFB00575D88 /* libopencv_objdetect.a */; };
-		4E10D8AB2DE40A8C0015926D /* libopencv_stitching.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 4EFD0EBD259D5BFB00575D88 /* libopencv_stitching.a */; };
-		4E10D8AC2DE40AA20015926D /* libopencv_imgcodecs.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 4EFD0EC4259D5BFC00575D88 /* libopencv_imgcodecs.a */; };
-		4E10D8AD2DE40E990015926D /* libg2o_core.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 4EFD0F0D259D5C2200575D88 /* libg2o_core.a */; };
-		4E10D8AE2DE40E990015926D /* libg2o_solver_dense.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 4EFD0F07259D5C2100575D88 /* libg2o_solver_dense.a */; };
-		4E10D8AF2DE40E990015926D /* libg2o_solver_eigen.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 4EFD0F12259D5C2200575D88 /* libg2o_solver_eigen.a */; };
-		4E10D8B02DE40E990015926D /* libg2o_solver_pcg.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 4EFD0F0B259D5C2200575D88 /* libg2o_solver_pcg.a */; };
-		4E10D8B12DE40E990015926D /* libg2o_solver_slam2d_linear.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 4EFD0F09259D5C2100575D88 /* libg2o_solver_slam2d_linear.a */; };
-		4E10D8B22DE40E990015926D /* libg2o_solver_structure_only.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 4EFD0F11259D5C2200575D88 /* libg2o_solver_structure_only.a */; };
-		4E10D8B32DE40E990015926D /* libg2o_stuff.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 4EFD0F14259D5C2200575D88 /* libg2o_stuff.a */; };
-		4E10D8B42DE40E990015926D /* libg2o_types_data.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 4EFD0F0C259D5C2200575D88 /* libg2o_types_data.a */; };
-		4E10D8B52DE40E990015926D /* libg2o_types_icp.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 4EFD0F0F259D5C2200575D88 /* libg2o_types_icp.a */; };
-		4E10D8B62DE40E990015926D /* libg2o_types_sba.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 4EFD0F15259D5C2200575D88 /* libg2o_types_sba.a */; };
-		4E10D8B72DE40E990015926D /* libg2o_types_sclam2d.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 4EFD0F1A259D5C2200575D88 /* libg2o_types_sclam2d.a */; };
-		4E10D8B82DE40E990015926D /* libg2o_types_sim3.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 4EFD0F1B259D5C2200575D88 /* libg2o_types_sim3.a */; };
-		4E10D8B92DE40E990015926D /* libg2o_types_slam2d_addons.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 4EFD0F16259D5C2200575D88 /* libg2o_types_slam2d_addons.a */; };
-		4E10D8BA2DE40E990015926D /* libg2o_types_slam2d.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 4EFD0F0A259D5C2100575D88 /* libg2o_types_slam2d.a */; };
-		4E10D8BB2DE40E990015926D /* libg2o_types_slam3d_addons.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 4EFD0F17259D5C2200575D88 /* libg2o_types_slam3d_addons.a */; };
-		4E10D8BC2DE40E990015926D /* libg2o_types_slam3d.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 4EFD0F18259D5C2200575D88 /* libg2o_types_slam3d.a */; };
-		4E10D8BD2DE40EC70015926D /* libpcl_common.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 4EFD0B4D259D4DF100575D88 /* libpcl_common.a */; };
-		4E10D8BE2DE40EC70015926D /* libpcl_features.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 4EFD0B43259D4DF100575D88 /* libpcl_features.a */; };
-		4E10D8BF2DE40EC70015926D /* libpcl_filters.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 4EFD0B44259D4DF100575D88 /* libpcl_filters.a */; };
-		4E10D8C02DE40EC70015926D /* libpcl_io_ply.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 4EFD0B4E259D4DF100575D88 /* libpcl_io_ply.a */; };
-		4E10D8C12DE40EC70015926D /* libpcl_io.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 4EFD0B4C259D4DF100575D88 /* libpcl_io.a */; };
-		4E10D8C22DE40EC70015926D /* libpcl_kdtree.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 4EFD0B46259D4DF100575D88 /* libpcl_kdtree.a */; };
-		4E10D8C32DE40EC70015926D /* libpcl_keypoints.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 4EFD0B49259D4DF100575D88 /* libpcl_keypoints.a */; };
-		4E10D8C42DE40EC70015926D /* libpcl_ml.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 4EFD0B4F259D4DF100575D88 /* libpcl_ml.a */; };
-		4E10D8C52DE40EC70015926D /* libpcl_octree.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 4EFD0B4B259D4DF100575D88 /* libpcl_octree.a */; };
-		4E10D8C62DE40EC70015926D /* libpcl_registration.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 4EFD0B42259D4DF100575D88 /* libpcl_registration.a */; };
-		4E10D8C72DE40EC70015926D /* libpcl_sample_consensus.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 4EFD0B45259D4DF100575D88 /* libpcl_sample_consensus.a */; };
-		4E10D8C82DE40EC70015926D /* libpcl_search.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 4EFD0B47259D4DF100575D88 /* libpcl_search.a */; };
-		4E10D8C92DE40EC70015926D /* libpcl_segmentation.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 4EFD0B50259D4DF100575D88 /* libpcl_segmentation.a */; };
-		4E10D8CA2DE40EC70015926D /* libpcl_stereo.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 4EFD0B41259D4DF100575D88 /* libpcl_stereo.a */; };
-		4E10D8CB2DE40EC70015926D /* libpcl_surface.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 4EFD0B48259D4DF100575D88 /* libpcl_surface.a */; };
-		4E10D8CC2DE40EE30015926D /* libgtsam_unstable.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 4EFD0F0E259D5C2200575D88 /* libgtsam_unstable.a */; };
-		4E10D8CD2DE40EE30015926D /* libgtsam.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 4EFD0F1C259D5C2200575D88 /* libgtsam.a */; };
-		4E10D8CE2DE40EE30015926D /* libmetis-gtsam.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 4E10D8622DE408EE0015926D /* libmetis-gtsam.a */; };
-		4E10D8CF2DE40EF90015926D /* libboost_serialization.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 4EFD0B30259D4DE900575D88 /* libboost_serialization.a */; };
-		4E10D8D02DE40F060015926D /* libboost_timer.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 4EFD0B34259D4DE900575D88 /* libboost_timer.a */; };
-		4E10D8D12DE40F190015926D /* liblas_c.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 4E10D8752DE408EF0015926D /* liblas_c.a */; };
-		4E10D8D22DE40F190015926D /* liblas.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 4EFAA9422CAE4E960055DA51 /* liblas.a */; };
-		4E10D8D32DE40F190015926D /* liblaszip.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 4ED73AD02D7FECF3007899C2 /* liblaszip.a */; };
-		4E10D8D42DE40F2A0015926D /* libboost_thread.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 4EFD0B33259D4DE900575D88 /* libboost_thread.a */; };
-		4E10D8E12DE4101B0015926D /* liblibjpeg-turbo.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 4E10D8D52DE40FBE0015926D /* liblibjpeg-turbo.a */; };
-		4E10D8E22DE4101B0015926D /* liblibpng.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 4E10D8D72DE40FCA0015926D /* liblibpng.a */; };
 		4E1E9CF72D618E69000CB881 /* quad_color.cpp in Sources */ = {isa = PBXBuildFile; fileRef = 4E1E9CF62D618079000CB881 /* quad_color.cpp */; };
 		4E1E9CF82D618E69000CB881 /* text_drawable.cpp in Sources */ = {isa = PBXBuildFile; fileRef = 4E1E9CF52D618079000CB881 /* text_drawable.cpp */; };
 		4E20B24E266AB94300316EE6 /* Images.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 4E20B24D266AB94300316EE6 /* Images.xcassets */; };
 		4E20B250266AB95600316EE6 /* Images.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 4E20B24F266AB95600316EE6 /* Images.xcassets */; };
 		4E2C516725A63119005CEDBD /* DatabaseView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4E2C516525A63119005CEDBD /* DatabaseView.swift */; };
 		4E2C516825A63119005CEDBD /* VerticalScrollerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4E2C516625A63119005CEDBD /* VerticalScrollerView.swift */; };
-		4E3525542DE4C6E500F39D8F /* libg2o_csparse_extension.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 4EFD0F13259D5C2200575D88 /* libg2o_csparse_extension.a */; };
-		4E3525552DE4C6E500F39D8F /* libg2o_solver_csparse.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 4EFD0F10259D5C2200575D88 /* libg2o_solver_csparse.a */; };
-		4E3525572DE4C6E500F39D8F /* libg2o_solver_cholmod.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 4E3525562DE4C6E500F39D8F /* libg2o_solver_cholmod.a */; };
-		4E3525592DE4C6F600F39D8F /* libcholmod.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 4E3525582DE4C6F600F39D8F /* libcholmod.a */; };
-		4E35255E2DE4C71000F39D8F /* libcxsparse.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 4E35255A2DE4C71000F39D8F /* libcxsparse.a */; };
-		4E35255F2DE4C71000F39D8F /* libcolamd.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 4E35255B2DE4C71000F39D8F /* libcolamd.a */; };
-		4E3525602DE4C71000F39D8F /* libcamd.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 4E35255C2DE4C71000F39D8F /* libcamd.a */; };
-		4E3525612DE4C71000F39D8F /* libccolamd.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 4E35255D2DE4C71000F39D8F /* libccolamd.a */; };
-		4E3525642DE4C71C00F39D8F /* libsuitesparseconfig.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 4E3525622DE4C71C00F39D8F /* libsuitesparseconfig.a */; };
-		4E3525652DE4C71C00F39D8F /* libspqr.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 4E3525632DE4C71C00F39D8F /* libspqr.a */; };
-		4E3525672DE4C72D00F39D8F /* libamd.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 4E3525662DE4C72D00F39D8F /* libamd.a */; };
 		4E3525682DE4C73E00F39D8F /* Accelerate.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 4E3525692DE4C73E00F39D8F /* Accelerate.framework */; };
 		4E8B155426273A580037FC53 /* Zip in Frameworks */ = {isa = PBXBuildFile; productRef = 4E8B155326273A580037FC53 /* Zip */; };
 		4EA100012F00000100100001 /* SupermarketScanSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA100012F00000100100002 /* SupermarketScanSession.swift */; };
+		4EA800012F70000100100001 /* GeneratedMobileEvidenceContracts.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA800012F70000100100002 /* GeneratedMobileEvidenceContracts.swift */; };
+		4EA800012F70000200100001 /* StrictJSONLStreamReader.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA800012F70000200100002 /* StrictJSONLStreamReader.swift */; };
+		4EA800012F70000300100001 /* TagObservationBurstEvidenceParser.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA800012F70000300100002 /* TagObservationBurstEvidenceParser.swift */; };
+		4EA800012F70000400100001 /* StrictLocalizationTraceParser.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA800012F70000400100002 /* StrictLocalizationTraceParser.swift */; };
+		4EA800012F70000500100001 /* TagObservationEvidenceParser.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA800012F70000500100002 /* TagObservationEvidenceParser.swift */; };
+		4EA800012F70000600100001 /* XLSXWorkbookVerifier.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA800012F70000600100002 /* XLSXWorkbookVerifier.swift */; };
 		4EA400012F30000100100001 /* PriorMapLocalization.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA400012F30000100100002 /* PriorMapLocalization.swift */; };
 		4EA400012F30000100100003 /* PriorMapLocalizationCore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA400012F30000100100004 /* PriorMapLocalizationCore.swift */; };
 		4EA700012F60000100100001 /* SupermarketFinalizationCore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60000100100002 /* SupermarketFinalizationCore.swift */; };
@@ -194,7 +130,6 @@
 		4EFD0BBC259D509300575D88 /* point_cloud_drawable.cpp in Sources */ = {isa = PBXBuildFile; fileRef = 4EFD0BBA259D509300575D88 /* point_cloud_drawable.cpp */; };
 		4EFD0BC0259D50A800575D88 /* scene.cpp in Sources */ = {isa = PBXBuildFile; fileRef = 4EFD0BBE259D50A800575D88 /* scene.cpp */; };
 		4EFD0EAB259D581800575D88 /* OpenGLES.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 4EFD0EAA259D581800575D88 /* OpenGLES.framework */; };
-		4EFD0F36259D5C7300575D88 /* vtk.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 4EFD0F35259D5C7300575D88 /* vtk.framework */; };
 		4EFD0F3A259D5D1500575D88 /* CameraMobile.cpp in Sources */ = {isa = PBXBuildFile; fileRef = 4EFD0F38259D5D1500575D88 /* CameraMobile.cpp */; };
 		4EFD0F62259E341C00575D88 /* RTABMapApp.cpp in Sources */ = {isa = PBXBuildFile; fileRef = 4EFD0F61259E341C00575D88 /* RTABMapApp.cpp */; };
 		4EFD0F67259E38DE00575D88 /* NativeWrapper.cpp in Sources */ = {isa = PBXBuildFile; fileRef = 4EFD0F66259E38DE00575D88 /* NativeWrapper.cpp */; };
@@ -229,42 +164,42 @@
 		4EA7C1000000000E00100002 /* MobileRescanTasksViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = MobileRescanTasksViewController.swift; path = RTABMapApp/MobileOnlyWorkflow/UI/MobileRescanTasksViewController.swift; sourceTree = "<group>"; };
 		44D4681D2D538A4100B094BA /* RTABMapApp.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; name = RTABMapApp.entitlements; path = RTABMapApp/RTABMapApp.entitlements; sourceTree = "<group>"; };
 		4E0D83822621F52C00C879AC /* Settings.bundle */ = {isa = PBXFileReference; lastKnownFileType = "wrapper.plug-in"; path = Settings.bundle; sourceTree = "<group>"; };
-		4E10D8602DE408EE0015926D /* libboost_stacktrace_noop.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libboost_stacktrace_noop.a; path = RTABMapApp/Libraries/lib/libboost_stacktrace_noop.a; sourceTree = "<group>"; };
-		4E10D8612DE408EE0015926D /* libboost_wserialization.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libboost_wserialization.a; path = RTABMapApp/Libraries/lib/libboost_wserialization.a; sourceTree = "<group>"; };
-		4E10D8622DE408EE0015926D /* libmetis-gtsam.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = "libmetis-gtsam.a"; path = "RTABMapApp/Libraries/lib/libmetis-gtsam.a"; sourceTree = "<group>"; };
-		4E10D8632DE408EE0015926D /* libopencv_wechat_qrcode.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libopencv_wechat_qrcode.a; path = RTABMapApp/Libraries/lib/libopencv_wechat_qrcode.a; sourceTree = "<group>"; };
-		4E10D8642DE408EE0015926D /* libboost_container.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libboost_container.a; path = RTABMapApp/Libraries/lib/libboost_container.a; sourceTree = "<group>"; };
-		4E10D8652DE408EE0015926D /* libboost_graph.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libboost_graph.a; path = RTABMapApp/Libraries/lib/libboost_graph.a; sourceTree = "<group>"; };
-		4E10D8662DE408EE0015926D /* libboost_json.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libboost_json.a; path = RTABMapApp/Libraries/lib/libboost_json.a; sourceTree = "<group>"; };
-		4E10D8672DE408EE0015926D /* libboost_stacktrace_basic.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libboost_stacktrace_basic.a; path = RTABMapApp/Libraries/lib/libboost_stacktrace_basic.a; sourceTree = "<group>"; };
-		4E10D8682DE408EE0015926D /* libboost_atomic.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libboost_atomic.a; path = RTABMapApp/Libraries/lib/libboost_atomic.a; sourceTree = "<group>"; };
-		4E10D8692DE408EE0015926D /* libopencv_intensity_transform.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libopencv_intensity_transform.a; path = RTABMapApp/Libraries/lib/libopencv_intensity_transform.a; sourceTree = "<group>"; };
-		4E10D86A2DE408EF0015926D /* libboost_locale.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libboost_locale.a; path = RTABMapApp/Libraries/lib/libboost_locale.a; sourceTree = "<group>"; };
-		4E10D86B2DE408EF0015926D /* liblz4.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = liblz4.a; path = RTABMapApp/Libraries/lib/liblz4.a; sourceTree = "<group>"; };
-		4E10D86C2DE408EF0015926D /* libopencv_dnn_superres.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libopencv_dnn_superres.a; path = RTABMapApp/Libraries/lib/libopencv_dnn_superres.a; sourceTree = "<group>"; };
-		4E10D86D2DE408EF0015926D /* libopencv_rapid.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libopencv_rapid.a; path = RTABMapApp/Libraries/lib/libopencv_rapid.a; sourceTree = "<group>"; };
-		4E10D86E2DE408EF0015926D /* libopencv_quality.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libopencv_quality.a; path = RTABMapApp/Libraries/lib/libopencv_quality.a; sourceTree = "<group>"; };
-		4E10D86F2DE408EF0015926D /* libboost_url.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libboost_url.a; path = RTABMapApp/Libraries/lib/libboost_url.a; sourceTree = "<group>"; };
-		4E10D8702DE408EF0015926D /* libboost_unit_test_framework.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libboost_unit_test_framework.a; path = RTABMapApp/Libraries/lib/libboost_unit_test_framework.a; sourceTree = "<group>"; };
-		4E10D8712DE408EF0015926D /* libboost_random.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libboost_random.a; path = RTABMapApp/Libraries/lib/libboost_random.a; sourceTree = "<group>"; };
-		4E10D8722DE408EF0015926D /* libboost_wave.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libboost_wave.a; path = RTABMapApp/Libraries/lib/libboost_wave.a; sourceTree = "<group>"; };
-		4E10D8732DE408EF0015926D /* libboost_charconv.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libboost_charconv.a; path = RTABMapApp/Libraries/lib/libboost_charconv.a; sourceTree = "<group>"; };
-		4E10D8742DE408EF0015926D /* libboost_type_erasure.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libboost_type_erasure.a; path = RTABMapApp/Libraries/lib/libboost_type_erasure.a; sourceTree = "<group>"; };
-		4E10D8752DE408EF0015926D /* liblas_c.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = liblas_c.a; path = RTABMapApp/Libraries/lib/liblas_c.a; sourceTree = "<group>"; };
-		4E10D8762DE408EF0015926D /* libboost_contract.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libboost_contract.a; path = RTABMapApp/Libraries/lib/libboost_contract.a; sourceTree = "<group>"; };
-		4E10D8772DE408EF0015926D /* libopencv_gapi.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libopencv_gapi.a; path = RTABMapApp/Libraries/lib/libopencv_gapi.a; sourceTree = "<group>"; };
-		4E10D8782DE408EF0015926D /* libopencv_signal.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libopencv_signal.a; path = RTABMapApp/Libraries/lib/libopencv_signal.a; sourceTree = "<group>"; };
-		4E10D8792DE408EF0015926D /* libboost_prg_exec_monitor.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libboost_prg_exec_monitor.a; path = RTABMapApp/Libraries/lib/libboost_prg_exec_monitor.a; sourceTree = "<group>"; };
-		4E10D87A2DE408EF0015926D /* libboost_stacktrace_addr2line.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libboost_stacktrace_addr2line.a; path = RTABMapApp/Libraries/lib/libboost_stacktrace_addr2line.a; sourceTree = "<group>"; };
-		4E10D87B2DE408EF0015926D /* libboost_nowide.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libboost_nowide.a; path = RTABMapApp/Libraries/lib/libboost_nowide.a; sourceTree = "<group>"; };
-		4E10D87C2DE408EF0015926D /* libboost_test_exec_monitor.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libboost_test_exec_monitor.a; path = RTABMapApp/Libraries/lib/libboost_test_exec_monitor.a; sourceTree = "<group>"; };
-		4E10D87D2DE408EF0015926D /* libopencv_mcc.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libopencv_mcc.a; path = RTABMapApp/Libraries/lib/libopencv_mcc.a; sourceTree = "<group>"; };
-		4E10D8D52DE40FBE0015926D /* liblibjpeg-turbo.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = "liblibjpeg-turbo.a"; path = "RTABMapApp/Libraries/lib/opencv4/3rdparty/liblibjpeg-turbo.a"; sourceTree = "<group>"; };
-		4E10D8D72DE40FCA0015926D /* liblibpng.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = liblibpng.a; path = RTABMapApp/Libraries/lib/opencv4/3rdparty/liblibpng.a; sourceTree = "<group>"; };
-		4E10D8D92DE40FF60015926D /* libzlib.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libzlib.a; path = RTABMapApp/Libraries/lib/opencv4/3rdparty/libzlib.a; sourceTree = "<group>"; };
-		4E10D8DA2DE40FF60015926D /* libIlmImf.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libIlmImf.a; path = RTABMapApp/Libraries/lib/opencv4/3rdparty/libIlmImf.a; sourceTree = "<group>"; };
-		4E10D8DB2DE40FF60015926D /* libade.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libade.a; path = RTABMapApp/Libraries/lib/opencv4/3rdparty/libade.a; sourceTree = "<group>"; };
-		4E10D8DC2DE40FF60015926D /* liblibprotobuf.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = liblibprotobuf.a; path = RTABMapApp/Libraries/lib/opencv4/3rdparty/liblibprotobuf.a; sourceTree = "<group>"; };
+		4E10D8602DE408EE0015926D /* libboost_stacktrace_noop.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libboost_stacktrace_noop.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libboost_stacktrace_noop.a"; sourceTree = "<group>"; };
+		4E10D8612DE408EE0015926D /* libboost_wserialization.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libboost_wserialization.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libboost_wserialization.a"; sourceTree = "<group>"; };
+		4E10D8622DE408EE0015926D /* libmetis-gtsam.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = "libmetis-gtsam.a"; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libmetis-gtsam.a"; sourceTree = "<group>"; };
+		4E10D8632DE408EE0015926D /* libopencv_wechat_qrcode.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libopencv_wechat_qrcode.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libopencv_wechat_qrcode.a"; sourceTree = "<group>"; };
+		4E10D8642DE408EE0015926D /* libboost_container.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libboost_container.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libboost_container.a"; sourceTree = "<group>"; };
+		4E10D8652DE408EE0015926D /* libboost_graph.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libboost_graph.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libboost_graph.a"; sourceTree = "<group>"; };
+		4E10D8662DE408EE0015926D /* libboost_json.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libboost_json.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libboost_json.a"; sourceTree = "<group>"; };
+		4E10D8672DE408EE0015926D /* libboost_stacktrace_basic.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libboost_stacktrace_basic.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libboost_stacktrace_basic.a"; sourceTree = "<group>"; };
+		4E10D8682DE408EE0015926D /* libboost_atomic.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libboost_atomic.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libboost_atomic.a"; sourceTree = "<group>"; };
+		4E10D8692DE408EE0015926D /* libopencv_intensity_transform.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libopencv_intensity_transform.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libopencv_intensity_transform.a"; sourceTree = "<group>"; };
+		4E10D86A2DE408EF0015926D /* libboost_locale.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libboost_locale.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libboost_locale.a"; sourceTree = "<group>"; };
+		4E10D86B2DE408EF0015926D /* liblz4.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = liblz4.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/liblz4.a"; sourceTree = "<group>"; };
+		4E10D86C2DE408EF0015926D /* libopencv_dnn_superres.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libopencv_dnn_superres.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libopencv_dnn_superres.a"; sourceTree = "<group>"; };
+		4E10D86D2DE408EF0015926D /* libopencv_rapid.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libopencv_rapid.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libopencv_rapid.a"; sourceTree = "<group>"; };
+		4E10D86E2DE408EF0015926D /* libopencv_quality.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libopencv_quality.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libopencv_quality.a"; sourceTree = "<group>"; };
+		4E10D86F2DE408EF0015926D /* libboost_url.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libboost_url.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libboost_url.a"; sourceTree = "<group>"; };
+		4E10D8702DE408EF0015926D /* libboost_unit_test_framework.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libboost_unit_test_framework.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libboost_unit_test_framework.a"; sourceTree = "<group>"; };
+		4E10D8712DE408EF0015926D /* libboost_random.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libboost_random.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libboost_random.a"; sourceTree = "<group>"; };
+		4E10D8722DE408EF0015926D /* libboost_wave.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libboost_wave.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libboost_wave.a"; sourceTree = "<group>"; };
+		4E10D8732DE408EF0015926D /* libboost_charconv.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libboost_charconv.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libboost_charconv.a"; sourceTree = "<group>"; };
+		4E10D8742DE408EF0015926D /* libboost_type_erasure.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libboost_type_erasure.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libboost_type_erasure.a"; sourceTree = "<group>"; };
+		4E10D8752DE408EF0015926D /* liblas_c.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = liblas_c.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/liblas_c.a"; sourceTree = "<group>"; };
+		4E10D8762DE408EF0015926D /* libboost_contract.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libboost_contract.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libboost_contract.a"; sourceTree = "<group>"; };
+		4E10D8772DE408EF0015926D /* libopencv_gapi.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libopencv_gapi.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libopencv_gapi.a"; sourceTree = "<group>"; };
+		4E10D8782DE408EF0015926D /* libopencv_signal.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libopencv_signal.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libopencv_signal.a"; sourceTree = "<group>"; };
+		4E10D8792DE408EF0015926D /* libboost_prg_exec_monitor.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libboost_prg_exec_monitor.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libboost_prg_exec_monitor.a"; sourceTree = "<group>"; };
+		4E10D87A2DE408EF0015926D /* libboost_stacktrace_addr2line.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libboost_stacktrace_addr2line.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libboost_stacktrace_addr2line.a"; sourceTree = "<group>"; };
+		4E10D87B2DE408EF0015926D /* libboost_nowide.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libboost_nowide.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libboost_nowide.a"; sourceTree = "<group>"; };
+		4E10D87C2DE408EF0015926D /* libboost_test_exec_monitor.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libboost_test_exec_monitor.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libboost_test_exec_monitor.a"; sourceTree = "<group>"; };
+		4E10D87D2DE408EF0015926D /* libopencv_mcc.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libopencv_mcc.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libopencv_mcc.a"; sourceTree = "<group>"; };
+		4E10D8D52DE40FBE0015926D /* liblibjpeg-turbo.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = "liblibjpeg-turbo.a"; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/opencv4/3rdparty/liblibjpeg-turbo.a"; sourceTree = "<group>"; };
+		4E10D8D72DE40FCA0015926D /* liblibpng.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = liblibpng.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/opencv4/3rdparty/liblibpng.a"; sourceTree = "<group>"; };
+		4E10D8D92DE40FF60015926D /* libzlib.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libzlib.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/opencv4/3rdparty/libzlib.a"; sourceTree = "<group>"; };
+		4E10D8DA2DE40FF60015926D /* libIlmImf.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libIlmImf.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/opencv4/3rdparty/libIlmImf.a"; sourceTree = "<group>"; };
+		4E10D8DB2DE40FF60015926D /* libade.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libade.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/opencv4/3rdparty/libade.a"; sourceTree = "<group>"; };
+		4E10D8DC2DE40FF60015926D /* liblibprotobuf.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = liblibprotobuf.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/opencv4/3rdparty/liblibprotobuf.a"; sourceTree = "<group>"; };
 		4E1E9CF22D617D08000CB881 /* Measure.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; name = Measure.h; path = ../android/jni/Measure.h; sourceTree = "<group>"; };
 		4E1E9CF32D618079000CB881 /* quad_color.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; name = quad_color.h; path = ../android/jni/quad_color.h; sourceTree = "<group>"; };
 		4E1E9CF42D618079000CB881 /* text_drawable.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; name = text_drawable.h; path = ../android/jni/text_drawable.h; sourceTree = "<group>"; };
@@ -275,18 +210,25 @@
 		4E20B24F266AB95600316EE6 /* Images.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; name = Images.xcassets; path = RTABMapApp/Images.xcassets; sourceTree = "<group>"; };
 		4E2C516525A63119005CEDBD /* DatabaseView.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; name = DatabaseView.swift; path = RTABMapApp/DatabaseView.swift; sourceTree = "<group>"; };
 		4E2C516625A63119005CEDBD /* VerticalScrollerView.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; name = VerticalScrollerView.swift; path = RTABMapApp/VerticalScrollerView.swift; sourceTree = "<group>"; };
-		4E3525562DE4C6E500F39D8F /* libg2o_solver_cholmod.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libg2o_solver_cholmod.a; path = RTABMapApp/Libraries/lib/libg2o_solver_cholmod.a; sourceTree = "<group>"; };
-		4E3525582DE4C6F600F39D8F /* libcholmod.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libcholmod.a; path = RTABMapApp/Libraries/lib/libcholmod.a; sourceTree = "<group>"; };
-		4E35255A2DE4C71000F39D8F /* libcxsparse.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libcxsparse.a; path = RTABMapApp/Libraries/lib/libcxsparse.a; sourceTree = "<group>"; };
-		4E35255B2DE4C71000F39D8F /* libcolamd.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libcolamd.a; path = RTABMapApp/Libraries/lib/libcolamd.a; sourceTree = "<group>"; };
-		4E35255C2DE4C71000F39D8F /* libcamd.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libcamd.a; path = RTABMapApp/Libraries/lib/libcamd.a; sourceTree = "<group>"; };
-		4E35255D2DE4C71000F39D8F /* libccolamd.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libccolamd.a; path = RTABMapApp/Libraries/lib/libccolamd.a; sourceTree = "<group>"; };
-		4E3525622DE4C71C00F39D8F /* libsuitesparseconfig.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libsuitesparseconfig.a; path = RTABMapApp/Libraries/lib/libsuitesparseconfig.a; sourceTree = "<group>"; };
-		4E3525632DE4C71C00F39D8F /* libspqr.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libspqr.a; path = RTABMapApp/Libraries/lib/libspqr.a; sourceTree = "<group>"; };
-		4E3525662DE4C72D00F39D8F /* libamd.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libamd.a; path = RTABMapApp/Libraries/lib/libamd.a; sourceTree = "<group>"; };
+		4E3525562DE4C6E500F39D8F /* libg2o_solver_cholmod.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libg2o_solver_cholmod.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libg2o_solver_cholmod.a"; sourceTree = "<group>"; };
+		4E3525582DE4C6F600F39D8F /* libcholmod.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libcholmod.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libcholmod.a"; sourceTree = "<group>"; };
+		4E35255A2DE4C71000F39D8F /* libcxsparse.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libcxsparse.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libcxsparse.a"; sourceTree = "<group>"; };
+		4E35255B2DE4C71000F39D8F /* libcolamd.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libcolamd.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libcolamd.a"; sourceTree = "<group>"; };
+		4E35255C2DE4C71000F39D8F /* libcamd.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libcamd.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libcamd.a"; sourceTree = "<group>"; };
+		4E35255D2DE4C71000F39D8F /* libccolamd.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libccolamd.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libccolamd.a"; sourceTree = "<group>"; };
+		4E3525622DE4C71C00F39D8F /* libsuitesparseconfig.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libsuitesparseconfig.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libsuitesparseconfig.a"; sourceTree = "<group>"; };
+		4E3525632DE4C71C00F39D8F /* libspqr.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libspqr.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libspqr.a"; sourceTree = "<group>"; };
+		4E3525662DE4C72D00F39D8F /* libamd.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libamd.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libamd.a"; sourceTree = "<group>"; };
 		4E3525692DE4C73E00F39D8F /* Accelerate.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Accelerate.framework; path = System/Library/Frameworks/Accelerate.framework; sourceTree = SDKROOT; };
 		4E401BE825CC92C100240A56 /* ProgressionStatus.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; name = ProgressionStatus.h; path = ../android/jni/ProgressionStatus.h; sourceTree = "<group>"; };
 		4EA100012F00000100100002 /* SupermarketScanSession.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = SupermarketScanSession.swift; path = RTABMapApp/SupermarketScanSession.swift; sourceTree = "<group>"; };
+		4EA800012F70000100100002 /* GeneratedMobileEvidenceContracts.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = GeneratedMobileEvidenceContracts.swift; path = RTABMapApp/GeneratedMobileEvidenceContracts.swift; sourceTree = "<group>"; };
+		4EA800012F70000200100002 /* StrictJSONLStreamReader.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = StrictJSONLStreamReader.swift; path = RTABMapApp/MobilePostProcessing/StrictJSONLStreamReader.swift; sourceTree = "<group>"; };
+		4EA800012F70000300100002 /* TagObservationBurstEvidenceParser.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = TagObservationBurstEvidenceParser.swift; path = RTABMapApp/MobilePostProcessing/TagObservationBurstEvidenceParser.swift; sourceTree = "<group>"; };
+		4EA800012F70000400100002 /* StrictLocalizationTraceParser.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = StrictLocalizationTraceParser.swift; path = RTABMapApp/MobilePostProcessing/StrictLocalizationTraceParser.swift; sourceTree = "<group>"; };
+		4EA800012F70000500100002 /* TagObservationEvidenceParser.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = TagObservationEvidenceParser.swift; path = RTABMapApp/MobilePostProcessing/TagObservationEvidenceParser.swift; sourceTree = "<group>"; };
+		4EA800012F70000600100002 /* XLSXWorkbookVerifier.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = XLSXWorkbookVerifier.swift; path = RTABMapApp/MobileResults/XLSXWorkbookVerifier.swift; sourceTree = "<group>"; };
+		4EA800012F70000700100002 /* MarketScannerNativeDependencies.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; name = MarketScannerNativeDependencies.xcconfig; path = RTABMapApp/MarketScannerNativeDependencies.xcconfig; sourceTree = "<group>"; };
 		4EA100012F00000100100004 /* PriceTagNFCReader.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = PriceTagNFCReader.swift; path = RTABMapApp/PriceTagNFCReader.swift; sourceTree = "<group>"; };
 		4EA400012F30000100100002 /* PriorMapLocalization.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = PriorMapLocalization.swift; path = RTABMapApp/PriorMapLocalization.swift; sourceTree = "<group>"; };
 		4EA400012F30000100100004 /* PriorMapLocalizationCore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = PriorMapLocalizationCore.swift; path = RTABMapApp/PriorMapLocalizationCore.swift; sourceTree = "<group>"; };
@@ -338,7 +280,7 @@
 		4EA100012F00000100100006 /* CoreNFC.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = CoreNFC.framework; path = System/Library/Frameworks/CoreNFC.framework; sourceTree = SDKROOT; };
 		4EA300012F20000100100002 /* SupermarketStructureCoverage.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = SupermarketStructureCoverage.swift; path = RTABMapApp/SupermarketStructureCoverage.swift; sourceTree = "<group>"; };
 		4EB1A66525A0D90B0043C7BF /* RTABMap.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; name = RTABMap.swift; path = RTABMapApp/RTABMap.swift; sourceTree = "<group>"; };
-		4ED73AD02D7FECF3007899C2 /* liblaszip.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = liblaszip.a; path = RTABMapApp/Libraries/lib/liblaszip.a; sourceTree = "<group>"; };
+		4ED73AD02D7FECF3007899C2 /* liblaszip.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = liblaszip.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/liblaszip.a"; sourceTree = "<group>"; };
 		4EE015C2259A2AF0008CCE65 /* RTABMapApp.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = RTABMapApp.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		4EE016AF259BE441008CCE65 /* ViewController.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; name = ViewController.swift; path = RTABMapApp/ViewController.swift; sourceTree = "<group>"; };
 		4EE016B0259BE441008CCE65 /* SceneDelegate.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; name = SceneDelegate.swift; path = RTABMapApp/SceneDelegate.swift; sourceTree = "<group>"; };
@@ -350,34 +292,34 @@
 		4EE016C2259BE464008CCE65 /* Base */ = {isa = PBXFileReference; lastKnownFileType = file.storyboard; name = Base; path = RTABMapApp/Base.lproj/LaunchScreen.storyboard; sourceTree = "<group>"; };
 		4EE016C6259BE46F008CCE65 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; name = Assets.xcassets; path = RTABMapApp/Assets.xcassets; sourceTree = "<group>"; };
 		4EE016E1259BE96A008CCE65 /* RTABMapApp-Bridging-Header.h */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.h; name = "RTABMapApp-Bridging-Header.h"; path = "RTABMapApp/RTABMapApp-Bridging-Header.h"; sourceTree = "<group>"; };
-		4EFAA9422CAE4E960055DA51 /* liblas.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = liblas.a; path = RTABMapApp/Libraries/lib/liblas.a; sourceTree = "<group>"; };
-		4EFD0B2B259D4DE900575D88 /* libboost_filesystem.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libboost_filesystem.a; path = RTABMapApp/Libraries/lib/libboost_filesystem.a; sourceTree = "<group>"; };
-		4EFD0B2C259D4DE900575D88 /* libboost_program_options.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libboost_program_options.a; path = RTABMapApp/Libraries/lib/libboost_program_options.a; sourceTree = "<group>"; };
-		4EFD0B2D259D4DE900575D88 /* libboost_regex.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libboost_regex.a; path = RTABMapApp/Libraries/lib/libboost_regex.a; sourceTree = "<group>"; };
-		4EFD0B2E259D4DE900575D88 /* libboost_iostreams.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libboost_iostreams.a; path = RTABMapApp/Libraries/lib/libboost_iostreams.a; sourceTree = "<group>"; };
-		4EFD0B2F259D4DE900575D88 /* libboost_date_time.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libboost_date_time.a; path = RTABMapApp/Libraries/lib/libboost_date_time.a; sourceTree = "<group>"; };
-		4EFD0B30259D4DE900575D88 /* libboost_serialization.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libboost_serialization.a; path = RTABMapApp/Libraries/lib/libboost_serialization.a; sourceTree = "<group>"; };
-		4EFD0B31259D4DE900575D88 /* libboost_system.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libboost_system.a; path = RTABMapApp/Libraries/lib/libboost_system.a; sourceTree = "<group>"; };
-		4EFD0B32259D4DE900575D88 /* libboost_signals.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libboost_signals.a; path = RTABMapApp/Libraries/lib/libboost_signals.a; sourceTree = "<group>"; };
-		4EFD0B33259D4DE900575D88 /* libboost_thread.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libboost_thread.a; path = RTABMapApp/Libraries/lib/libboost_thread.a; sourceTree = "<group>"; };
-		4EFD0B34259D4DE900575D88 /* libboost_timer.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libboost_timer.a; path = RTABMapApp/Libraries/lib/libboost_timer.a; sourceTree = "<group>"; };
-		4EFD0B35259D4DE900575D88 /* libboost_chrono.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libboost_chrono.a; path = RTABMapApp/Libraries/lib/libboost_chrono.a; sourceTree = "<group>"; };
-		4EFD0B41259D4DF100575D88 /* libpcl_stereo.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libpcl_stereo.a; path = RTABMapApp/Libraries/lib/libpcl_stereo.a; sourceTree = "<group>"; };
-		4EFD0B42259D4DF100575D88 /* libpcl_registration.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libpcl_registration.a; path = RTABMapApp/Libraries/lib/libpcl_registration.a; sourceTree = "<group>"; };
-		4EFD0B43259D4DF100575D88 /* libpcl_features.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libpcl_features.a; path = RTABMapApp/Libraries/lib/libpcl_features.a; sourceTree = "<group>"; };
-		4EFD0B44259D4DF100575D88 /* libpcl_filters.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libpcl_filters.a; path = RTABMapApp/Libraries/lib/libpcl_filters.a; sourceTree = "<group>"; };
-		4EFD0B45259D4DF100575D88 /* libpcl_sample_consensus.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libpcl_sample_consensus.a; path = RTABMapApp/Libraries/lib/libpcl_sample_consensus.a; sourceTree = "<group>"; };
-		4EFD0B46259D4DF100575D88 /* libpcl_kdtree.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libpcl_kdtree.a; path = RTABMapApp/Libraries/lib/libpcl_kdtree.a; sourceTree = "<group>"; };
-		4EFD0B47259D4DF100575D88 /* libpcl_search.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libpcl_search.a; path = RTABMapApp/Libraries/lib/libpcl_search.a; sourceTree = "<group>"; };
-		4EFD0B48259D4DF100575D88 /* libpcl_surface.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libpcl_surface.a; path = RTABMapApp/Libraries/lib/libpcl_surface.a; sourceTree = "<group>"; };
-		4EFD0B49259D4DF100575D88 /* libpcl_keypoints.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libpcl_keypoints.a; path = RTABMapApp/Libraries/lib/libpcl_keypoints.a; sourceTree = "<group>"; };
-		4EFD0B4A259D4DF100575D88 /* libpcl_recognition.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libpcl_recognition.a; path = RTABMapApp/Libraries/lib/libpcl_recognition.a; sourceTree = "<group>"; };
-		4EFD0B4B259D4DF100575D88 /* libpcl_octree.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libpcl_octree.a; path = RTABMapApp/Libraries/lib/libpcl_octree.a; sourceTree = "<group>"; };
-		4EFD0B4C259D4DF100575D88 /* libpcl_io.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libpcl_io.a; path = RTABMapApp/Libraries/lib/libpcl_io.a; sourceTree = "<group>"; };
-		4EFD0B4D259D4DF100575D88 /* libpcl_common.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libpcl_common.a; path = RTABMapApp/Libraries/lib/libpcl_common.a; sourceTree = "<group>"; };
-		4EFD0B4E259D4DF100575D88 /* libpcl_io_ply.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libpcl_io_ply.a; path = RTABMapApp/Libraries/lib/libpcl_io_ply.a; sourceTree = "<group>"; };
-		4EFD0B4F259D4DF100575D88 /* libpcl_ml.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libpcl_ml.a; path = RTABMapApp/Libraries/lib/libpcl_ml.a; sourceTree = "<group>"; };
-		4EFD0B50259D4DF100575D88 /* libpcl_segmentation.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libpcl_segmentation.a; path = RTABMapApp/Libraries/lib/libpcl_segmentation.a; sourceTree = "<group>"; };
+		4EFAA9422CAE4E960055DA51 /* liblas.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = liblas.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/liblas.a"; sourceTree = "<group>"; };
+		4EFD0B2B259D4DE900575D88 /* libboost_filesystem.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libboost_filesystem.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libboost_filesystem.a"; sourceTree = "<group>"; };
+		4EFD0B2C259D4DE900575D88 /* libboost_program_options.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libboost_program_options.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libboost_program_options.a"; sourceTree = "<group>"; };
+		4EFD0B2D259D4DE900575D88 /* libboost_regex.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libboost_regex.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libboost_regex.a"; sourceTree = "<group>"; };
+		4EFD0B2E259D4DE900575D88 /* libboost_iostreams.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libboost_iostreams.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libboost_iostreams.a"; sourceTree = "<group>"; };
+		4EFD0B2F259D4DE900575D88 /* libboost_date_time.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libboost_date_time.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libboost_date_time.a"; sourceTree = "<group>"; };
+		4EFD0B30259D4DE900575D88 /* libboost_serialization.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libboost_serialization.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libboost_serialization.a"; sourceTree = "<group>"; };
+		4EFD0B31259D4DE900575D88 /* libboost_system.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libboost_system.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libboost_system.a"; sourceTree = "<group>"; };
+		4EFD0B32259D4DE900575D88 /* libboost_signals.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libboost_signals.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libboost_signals.a"; sourceTree = "<group>"; };
+		4EFD0B33259D4DE900575D88 /* libboost_thread.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libboost_thread.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libboost_thread.a"; sourceTree = "<group>"; };
+		4EFD0B34259D4DE900575D88 /* libboost_timer.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libboost_timer.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libboost_timer.a"; sourceTree = "<group>"; };
+		4EFD0B35259D4DE900575D88 /* libboost_chrono.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libboost_chrono.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libboost_chrono.a"; sourceTree = "<group>"; };
+		4EFD0B41259D4DF100575D88 /* libpcl_stereo.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libpcl_stereo.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libpcl_stereo.a"; sourceTree = "<group>"; };
+		4EFD0B42259D4DF100575D88 /* libpcl_registration.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libpcl_registration.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libpcl_registration.a"; sourceTree = "<group>"; };
+		4EFD0B43259D4DF100575D88 /* libpcl_features.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libpcl_features.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libpcl_features.a"; sourceTree = "<group>"; };
+		4EFD0B44259D4DF100575D88 /* libpcl_filters.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libpcl_filters.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libpcl_filters.a"; sourceTree = "<group>"; };
+		4EFD0B45259D4DF100575D88 /* libpcl_sample_consensus.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libpcl_sample_consensus.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libpcl_sample_consensus.a"; sourceTree = "<group>"; };
+		4EFD0B46259D4DF100575D88 /* libpcl_kdtree.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libpcl_kdtree.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libpcl_kdtree.a"; sourceTree = "<group>"; };
+		4EFD0B47259D4DF100575D88 /* libpcl_search.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libpcl_search.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libpcl_search.a"; sourceTree = "<group>"; };
+		4EFD0B48259D4DF100575D88 /* libpcl_surface.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libpcl_surface.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libpcl_surface.a"; sourceTree = "<group>"; };
+		4EFD0B49259D4DF100575D88 /* libpcl_keypoints.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libpcl_keypoints.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libpcl_keypoints.a"; sourceTree = "<group>"; };
+		4EFD0B4A259D4DF100575D88 /* libpcl_recognition.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libpcl_recognition.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libpcl_recognition.a"; sourceTree = "<group>"; };
+		4EFD0B4B259D4DF100575D88 /* libpcl_octree.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libpcl_octree.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libpcl_octree.a"; sourceTree = "<group>"; };
+		4EFD0B4C259D4DF100575D88 /* libpcl_io.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libpcl_io.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libpcl_io.a"; sourceTree = "<group>"; };
+		4EFD0B4D259D4DF100575D88 /* libpcl_common.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libpcl_common.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libpcl_common.a"; sourceTree = "<group>"; };
+		4EFD0B4E259D4DF100575D88 /* libpcl_io_ply.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libpcl_io_ply.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libpcl_io_ply.a"; sourceTree = "<group>"; };
+		4EFD0B4F259D4DF100575D88 /* libpcl_ml.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libpcl_ml.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libpcl_ml.a"; sourceTree = "<group>"; };
+		4EFD0B50259D4DF100575D88 /* libpcl_segmentation.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libpcl_segmentation.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libpcl_segmentation.a"; sourceTree = "<group>"; };
 		4EFD0B63259D501E00575D88 /* line.cpp */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.cpp.cpp; path = line.cpp; sourceTree = "<group>"; };
 		4EFD0B64259D501E00575D88 /* util.cpp */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.cpp.cpp; path = util.cpp; sourceTree = "<group>"; };
 		4EFD0B65259D501E00575D88 /* obj_loader.cpp */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.cpp.cpp; path = obj_loader.cpp; sourceTree = "<group>"; };
@@ -436,81 +378,81 @@
 		4EFD0BBF259D50A800575D88 /* scene.h */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.h; name = scene.h; path = ../android/jni/scene.h; sourceTree = "<group>"; };
 		4EFD0D33259D50CF00575D88 /* util.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; name = util.h; path = ../android/jni/util.h; sourceTree = "<group>"; };
 		4EFD0EAA259D581800575D88 /* OpenGLES.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = OpenGLES.framework; path = System/Library/Frameworks/OpenGLES.framework; sourceTree = SDKROOT; };
-		4EFD0EAF259D5BE500575D88 /* librtabmap_utilite.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = librtabmap_utilite.a; path = RTABMapApp/Libraries/lib/librtabmap_utilite.a; sourceTree = "<group>"; };
-		4EFD0EB0259D5BE500575D88 /* librtabmap_core.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = librtabmap_core.a; path = RTABMapApp/Libraries/lib/librtabmap_core.a; sourceTree = "<group>"; };
-		4EFD0EB4259D5BFB00575D88 /* libopencv_video.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libopencv_video.a; path = RTABMapApp/Libraries/lib/libopencv_video.a; sourceTree = "<group>"; };
-		4EFD0EB5259D5BFB00575D88 /* libopencv_aruco.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libopencv_aruco.a; path = RTABMapApp/Libraries/lib/libopencv_aruco.a; sourceTree = "<group>"; };
-		4EFD0EB6259D5BFB00575D88 /* libopencv_photo.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libopencv_photo.a; path = RTABMapApp/Libraries/lib/libopencv_photo.a; sourceTree = "<group>"; };
-		4EFD0EB7259D5BFB00575D88 /* libopencv_line_descriptor.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libopencv_line_descriptor.a; path = RTABMapApp/Libraries/lib/libopencv_line_descriptor.a; sourceTree = "<group>"; };
-		4EFD0EB8259D5BFB00575D88 /* libopencv_features2d.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libopencv_features2d.a; path = RTABMapApp/Libraries/lib/libopencv_features2d.a; sourceTree = "<group>"; };
-		4EFD0EB9259D5BFB00575D88 /* libopencv_bgsegm.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libopencv_bgsegm.a; path = RTABMapApp/Libraries/lib/libopencv_bgsegm.a; sourceTree = "<group>"; };
-		4EFD0EBA259D5BFB00575D88 /* libopencv_dnn_objdetect.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libopencv_dnn_objdetect.a; path = RTABMapApp/Libraries/lib/libopencv_dnn_objdetect.a; sourceTree = "<group>"; };
-		4EFD0EBB259D5BFB00575D88 /* libopencv_objdetect.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libopencv_objdetect.a; path = RTABMapApp/Libraries/lib/libopencv_objdetect.a; sourceTree = "<group>"; };
-		4EFD0EBC259D5BFB00575D88 /* libopencv_flann.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libopencv_flann.a; path = RTABMapApp/Libraries/lib/libopencv_flann.a; sourceTree = "<group>"; };
-		4EFD0EBD259D5BFB00575D88 /* libopencv_stitching.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libopencv_stitching.a; path = RTABMapApp/Libraries/lib/libopencv_stitching.a; sourceTree = "<group>"; };
-		4EFD0EBE259D5BFC00575D88 /* libopencv_imgproc.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libopencv_imgproc.a; path = RTABMapApp/Libraries/lib/libopencv_imgproc.a; sourceTree = "<group>"; };
-		4EFD0EBF259D5BFC00575D88 /* libopencv_ml.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libopencv_ml.a; path = RTABMapApp/Libraries/lib/libopencv_ml.a; sourceTree = "<group>"; };
-		4EFD0EC0259D5BFC00575D88 /* libopencv_rgbd.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libopencv_rgbd.a; path = RTABMapApp/Libraries/lib/libopencv_rgbd.a; sourceTree = "<group>"; };
-		4EFD0EC1259D5BFC00575D88 /* libopencv_xphoto.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libopencv_xphoto.a; path = RTABMapApp/Libraries/lib/libopencv_xphoto.a; sourceTree = "<group>"; };
-		4EFD0EC2259D5BFC00575D88 /* libopencv_phase_unwrapping.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libopencv_phase_unwrapping.a; path = RTABMapApp/Libraries/lib/libopencv_phase_unwrapping.a; sourceTree = "<group>"; };
-		4EFD0EC3259D5BFC00575D88 /* libopencv_optflow.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libopencv_optflow.a; path = RTABMapApp/Libraries/lib/libopencv_optflow.a; sourceTree = "<group>"; };
-		4EFD0EC4259D5BFC00575D88 /* libopencv_imgcodecs.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libopencv_imgcodecs.a; path = RTABMapApp/Libraries/lib/libopencv_imgcodecs.a; sourceTree = "<group>"; };
-		4EFD0EC5259D5BFC00575D88 /* libopencv_fuzzy.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libopencv_fuzzy.a; path = RTABMapApp/Libraries/lib/libopencv_fuzzy.a; sourceTree = "<group>"; };
-		4EFD0EC6259D5BFC00575D88 /* libopencv_dpm.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libopencv_dpm.a; path = RTABMapApp/Libraries/lib/libopencv_dpm.a; sourceTree = "<group>"; };
-		4EFD0EC7259D5BFC00575D88 /* libopencv_plot.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libopencv_plot.a; path = RTABMapApp/Libraries/lib/libopencv_plot.a; sourceTree = "<group>"; };
-		4EFD0EC8259D5BFC00575D88 /* libopencv_dnn.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libopencv_dnn.a; path = RTABMapApp/Libraries/lib/libopencv_dnn.a; sourceTree = "<group>"; };
-		4EFD0EC9259D5BFC00575D88 /* libopencv_saliency.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libopencv_saliency.a; path = RTABMapApp/Libraries/lib/libopencv_saliency.a; sourceTree = "<group>"; };
-		4EFD0ECA259D5BFC00575D88 /* libopencv_videoio.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libopencv_videoio.a; path = RTABMapApp/Libraries/lib/libopencv_videoio.a; sourceTree = "<group>"; };
-		4EFD0ECB259D5BFC00575D88 /* libopencv_hfs.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libopencv_hfs.a; path = RTABMapApp/Libraries/lib/libopencv_hfs.a; sourceTree = "<group>"; };
-		4EFD0ECC259D5BFC00575D88 /* libopencv_tracking.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libopencv_tracking.a; path = RTABMapApp/Libraries/lib/libopencv_tracking.a; sourceTree = "<group>"; };
-		4EFD0ECD259D5BFC00575D88 /* libopencv_text.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libopencv_text.a; path = RTABMapApp/Libraries/lib/libopencv_text.a; sourceTree = "<group>"; };
-		4EFD0ECE259D5BFC00575D88 /* libopencv_face.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libopencv_face.a; path = RTABMapApp/Libraries/lib/libopencv_face.a; sourceTree = "<group>"; };
-		4EFD0ECF259D5BFC00575D88 /* libopencv_bioinspired.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libopencv_bioinspired.a; path = RTABMapApp/Libraries/lib/libopencv_bioinspired.a; sourceTree = "<group>"; };
-		4EFD0ED0259D5BFC00575D88 /* libopencv_highgui.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libopencv_highgui.a; path = RTABMapApp/Libraries/lib/libopencv_highgui.a; sourceTree = "<group>"; };
-		4EFD0ED1259D5BFC00575D88 /* libopencv_core.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libopencv_core.a; path = RTABMapApp/Libraries/lib/libopencv_core.a; sourceTree = "<group>"; };
-		4EFD0ED2259D5BFC00575D88 /* libopencv_shape.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libopencv_shape.a; path = RTABMapApp/Libraries/lib/libopencv_shape.a; sourceTree = "<group>"; };
-		4EFD0ED3259D5BFC00575D88 /* libopencv_datasets.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libopencv_datasets.a; path = RTABMapApp/Libraries/lib/libopencv_datasets.a; sourceTree = "<group>"; };
-		4EFD0ED4259D5BFC00575D88 /* libopencv_img_hash.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libopencv_img_hash.a; path = RTABMapApp/Libraries/lib/libopencv_img_hash.a; sourceTree = "<group>"; };
-		4EFD0ED5259D5BFC00575D88 /* libopencv_surface_matching.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libopencv_surface_matching.a; path = RTABMapApp/Libraries/lib/libopencv_surface_matching.a; sourceTree = "<group>"; };
-		4EFD0ED6259D5BFC00575D88 /* libopencv_calib3d.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libopencv_calib3d.a; path = RTABMapApp/Libraries/lib/libopencv_calib3d.a; sourceTree = "<group>"; };
-		4EFD0ED7259D5BFC00575D88 /* libopencv_structured_light.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libopencv_structured_light.a; path = RTABMapApp/Libraries/lib/libopencv_structured_light.a; sourceTree = "<group>"; };
-		4EFD0ED8259D5BFC00575D88 /* libopencv_reg.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libopencv_reg.a; path = RTABMapApp/Libraries/lib/libopencv_reg.a; sourceTree = "<group>"; };
-		4EFD0ED9259D5BFC00575D88 /* libopencv_xfeatures2d.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libopencv_xfeatures2d.a; path = RTABMapApp/Libraries/lib/libopencv_xfeatures2d.a; sourceTree = "<group>"; };
-		4EFD0EDA259D5BFC00575D88 /* libopencv_videostab.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libopencv_videostab.a; path = RTABMapApp/Libraries/lib/libopencv_videostab.a; sourceTree = "<group>"; };
-		4EFD0EDB259D5BFC00575D88 /* libopencv_ccalib.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libopencv_ccalib.a; path = RTABMapApp/Libraries/lib/libopencv_ccalib.a; sourceTree = "<group>"; };
-		4EFD0EDC259D5BFC00575D88 /* libopencv_ximgproc.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libopencv_ximgproc.a; path = RTABMapApp/Libraries/lib/libopencv_ximgproc.a; sourceTree = "<group>"; };
-		4EFD0F07259D5C2100575D88 /* libg2o_solver_dense.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libg2o_solver_dense.a; path = RTABMapApp/Libraries/lib/libg2o_solver_dense.a; sourceTree = "<group>"; };
-		4EFD0F08259D5C2100575D88 /* libg2o_ext_csparse.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libg2o_ext_csparse.a; path = RTABMapApp/Libraries/lib/libg2o_ext_csparse.a; sourceTree = "<group>"; };
-		4EFD0F09259D5C2100575D88 /* libg2o_solver_slam2d_linear.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libg2o_solver_slam2d_linear.a; path = RTABMapApp/Libraries/lib/libg2o_solver_slam2d_linear.a; sourceTree = "<group>"; };
-		4EFD0F0A259D5C2100575D88 /* libg2o_types_slam2d.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libg2o_types_slam2d.a; path = RTABMapApp/Libraries/lib/libg2o_types_slam2d.a; sourceTree = "<group>"; };
-		4EFD0F0B259D5C2200575D88 /* libg2o_solver_pcg.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libg2o_solver_pcg.a; path = RTABMapApp/Libraries/lib/libg2o_solver_pcg.a; sourceTree = "<group>"; };
-		4EFD0F0C259D5C2200575D88 /* libg2o_types_data.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libg2o_types_data.a; path = RTABMapApp/Libraries/lib/libg2o_types_data.a; sourceTree = "<group>"; };
-		4EFD0F0D259D5C2200575D88 /* libg2o_core.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libg2o_core.a; path = RTABMapApp/Libraries/lib/libg2o_core.a; sourceTree = "<group>"; };
-		4EFD0F0E259D5C2200575D88 /* libgtsam_unstable.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libgtsam_unstable.a; path = RTABMapApp/Libraries/lib/libgtsam_unstable.a; sourceTree = "<group>"; };
-		4EFD0F0F259D5C2200575D88 /* libg2o_types_icp.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libg2o_types_icp.a; path = RTABMapApp/Libraries/lib/libg2o_types_icp.a; sourceTree = "<group>"; };
-		4EFD0F10259D5C2200575D88 /* libg2o_solver_csparse.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libg2o_solver_csparse.a; path = RTABMapApp/Libraries/lib/libg2o_solver_csparse.a; sourceTree = "<group>"; };
-		4EFD0F11259D5C2200575D88 /* libg2o_solver_structure_only.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libg2o_solver_structure_only.a; path = RTABMapApp/Libraries/lib/libg2o_solver_structure_only.a; sourceTree = "<group>"; };
-		4EFD0F12259D5C2200575D88 /* libg2o_solver_eigen.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libg2o_solver_eigen.a; path = RTABMapApp/Libraries/lib/libg2o_solver_eigen.a; sourceTree = "<group>"; };
-		4EFD0F13259D5C2200575D88 /* libg2o_csparse_extension.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libg2o_csparse_extension.a; path = RTABMapApp/Libraries/lib/libg2o_csparse_extension.a; sourceTree = "<group>"; };
-		4EFD0F14259D5C2200575D88 /* libg2o_stuff.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libg2o_stuff.a; path = RTABMapApp/Libraries/lib/libg2o_stuff.a; sourceTree = "<group>"; };
-		4EFD0F15259D5C2200575D88 /* libg2o_types_sba.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libg2o_types_sba.a; path = RTABMapApp/Libraries/lib/libg2o_types_sba.a; sourceTree = "<group>"; };
-		4EFD0F16259D5C2200575D88 /* libg2o_types_slam2d_addons.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libg2o_types_slam2d_addons.a; path = RTABMapApp/Libraries/lib/libg2o_types_slam2d_addons.a; sourceTree = "<group>"; };
-		4EFD0F17259D5C2200575D88 /* libg2o_types_slam3d_addons.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libg2o_types_slam3d_addons.a; path = RTABMapApp/Libraries/lib/libg2o_types_slam3d_addons.a; sourceTree = "<group>"; };
-		4EFD0F18259D5C2200575D88 /* libg2o_types_slam3d.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libg2o_types_slam3d.a; path = RTABMapApp/Libraries/lib/libg2o_types_slam3d.a; sourceTree = "<group>"; };
-		4EFD0F19259D5C2200575D88 /* libmetis.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libmetis.a; path = RTABMapApp/Libraries/lib/libmetis.a; sourceTree = "<group>"; };
-		4EFD0F1A259D5C2200575D88 /* libg2o_types_sclam2d.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libg2o_types_sclam2d.a; path = RTABMapApp/Libraries/lib/libg2o_types_sclam2d.a; sourceTree = "<group>"; };
-		4EFD0F1B259D5C2200575D88 /* libg2o_types_sim3.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libg2o_types_sim3.a; path = RTABMapApp/Libraries/lib/libg2o_types_sim3.a; sourceTree = "<group>"; };
-		4EFD0F1C259D5C2200575D88 /* libgtsam.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libgtsam.a; path = RTABMapApp/Libraries/lib/libgtsam.a; sourceTree = "<group>"; };
-		4EFD0F33259D5C2900575D88 /* libflann_cpp_s.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libflann_cpp_s.a; path = RTABMapApp/Libraries/lib/libflann_cpp_s.a; sourceTree = "<group>"; };
-		4EFD0F35259D5C7300575D88 /* vtk.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = vtk.framework; path = RTABMapApp/Libraries/lib/vtk.framework; sourceTree = "<group>"; };
+		4EFD0EAF259D5BE500575D88 /* librtabmap_utilite.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = librtabmap_utilite.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/librtabmap_utilite.a"; sourceTree = "<group>"; };
+		4EFD0EB0259D5BE500575D88 /* librtabmap_core.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = librtabmap_core.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/librtabmap_core.a"; sourceTree = "<group>"; };
+		4EFD0EB4259D5BFB00575D88 /* libopencv_video.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libopencv_video.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libopencv_video.a"; sourceTree = "<group>"; };
+		4EFD0EB5259D5BFB00575D88 /* libopencv_aruco.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libopencv_aruco.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libopencv_aruco.a"; sourceTree = "<group>"; };
+		4EFD0EB6259D5BFB00575D88 /* libopencv_photo.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libopencv_photo.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libopencv_photo.a"; sourceTree = "<group>"; };
+		4EFD0EB7259D5BFB00575D88 /* libopencv_line_descriptor.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libopencv_line_descriptor.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libopencv_line_descriptor.a"; sourceTree = "<group>"; };
+		4EFD0EB8259D5BFB00575D88 /* libopencv_features2d.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libopencv_features2d.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libopencv_features2d.a"; sourceTree = "<group>"; };
+		4EFD0EB9259D5BFB00575D88 /* libopencv_bgsegm.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libopencv_bgsegm.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libopencv_bgsegm.a"; sourceTree = "<group>"; };
+		4EFD0EBA259D5BFB00575D88 /* libopencv_dnn_objdetect.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libopencv_dnn_objdetect.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libopencv_dnn_objdetect.a"; sourceTree = "<group>"; };
+		4EFD0EBB259D5BFB00575D88 /* libopencv_objdetect.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libopencv_objdetect.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libopencv_objdetect.a"; sourceTree = "<group>"; };
+		4EFD0EBC259D5BFB00575D88 /* libopencv_flann.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libopencv_flann.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libopencv_flann.a"; sourceTree = "<group>"; };
+		4EFD0EBD259D5BFB00575D88 /* libopencv_stitching.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libopencv_stitching.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libopencv_stitching.a"; sourceTree = "<group>"; };
+		4EFD0EBE259D5BFC00575D88 /* libopencv_imgproc.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libopencv_imgproc.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libopencv_imgproc.a"; sourceTree = "<group>"; };
+		4EFD0EBF259D5BFC00575D88 /* libopencv_ml.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libopencv_ml.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libopencv_ml.a"; sourceTree = "<group>"; };
+		4EFD0EC0259D5BFC00575D88 /* libopencv_rgbd.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libopencv_rgbd.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libopencv_rgbd.a"; sourceTree = "<group>"; };
+		4EFD0EC1259D5BFC00575D88 /* libopencv_xphoto.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libopencv_xphoto.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libopencv_xphoto.a"; sourceTree = "<group>"; };
+		4EFD0EC2259D5BFC00575D88 /* libopencv_phase_unwrapping.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libopencv_phase_unwrapping.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libopencv_phase_unwrapping.a"; sourceTree = "<group>"; };
+		4EFD0EC3259D5BFC00575D88 /* libopencv_optflow.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libopencv_optflow.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libopencv_optflow.a"; sourceTree = "<group>"; };
+		4EFD0EC4259D5BFC00575D88 /* libopencv_imgcodecs.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libopencv_imgcodecs.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libopencv_imgcodecs.a"; sourceTree = "<group>"; };
+		4EFD0EC5259D5BFC00575D88 /* libopencv_fuzzy.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libopencv_fuzzy.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libopencv_fuzzy.a"; sourceTree = "<group>"; };
+		4EFD0EC6259D5BFC00575D88 /* libopencv_dpm.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libopencv_dpm.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libopencv_dpm.a"; sourceTree = "<group>"; };
+		4EFD0EC7259D5BFC00575D88 /* libopencv_plot.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libopencv_plot.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libopencv_plot.a"; sourceTree = "<group>"; };
+		4EFD0EC8259D5BFC00575D88 /* libopencv_dnn.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libopencv_dnn.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libopencv_dnn.a"; sourceTree = "<group>"; };
+		4EFD0EC9259D5BFC00575D88 /* libopencv_saliency.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libopencv_saliency.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libopencv_saliency.a"; sourceTree = "<group>"; };
+		4EFD0ECA259D5BFC00575D88 /* libopencv_videoio.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libopencv_videoio.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libopencv_videoio.a"; sourceTree = "<group>"; };
+		4EFD0ECB259D5BFC00575D88 /* libopencv_hfs.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libopencv_hfs.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libopencv_hfs.a"; sourceTree = "<group>"; };
+		4EFD0ECC259D5BFC00575D88 /* libopencv_tracking.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libopencv_tracking.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libopencv_tracking.a"; sourceTree = "<group>"; };
+		4EFD0ECD259D5BFC00575D88 /* libopencv_text.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libopencv_text.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libopencv_text.a"; sourceTree = "<group>"; };
+		4EFD0ECE259D5BFC00575D88 /* libopencv_face.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libopencv_face.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libopencv_face.a"; sourceTree = "<group>"; };
+		4EFD0ECF259D5BFC00575D88 /* libopencv_bioinspired.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libopencv_bioinspired.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libopencv_bioinspired.a"; sourceTree = "<group>"; };
+		4EFD0ED0259D5BFC00575D88 /* libopencv_highgui.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libopencv_highgui.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libopencv_highgui.a"; sourceTree = "<group>"; };
+		4EFD0ED1259D5BFC00575D88 /* libopencv_core.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libopencv_core.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libopencv_core.a"; sourceTree = "<group>"; };
+		4EFD0ED2259D5BFC00575D88 /* libopencv_shape.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libopencv_shape.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libopencv_shape.a"; sourceTree = "<group>"; };
+		4EFD0ED3259D5BFC00575D88 /* libopencv_datasets.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libopencv_datasets.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libopencv_datasets.a"; sourceTree = "<group>"; };
+		4EFD0ED4259D5BFC00575D88 /* libopencv_img_hash.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libopencv_img_hash.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libopencv_img_hash.a"; sourceTree = "<group>"; };
+		4EFD0ED5259D5BFC00575D88 /* libopencv_surface_matching.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libopencv_surface_matching.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libopencv_surface_matching.a"; sourceTree = "<group>"; };
+		4EFD0ED6259D5BFC00575D88 /* libopencv_calib3d.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libopencv_calib3d.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libopencv_calib3d.a"; sourceTree = "<group>"; };
+		4EFD0ED7259D5BFC00575D88 /* libopencv_structured_light.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libopencv_structured_light.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libopencv_structured_light.a"; sourceTree = "<group>"; };
+		4EFD0ED8259D5BFC00575D88 /* libopencv_reg.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libopencv_reg.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libopencv_reg.a"; sourceTree = "<group>"; };
+		4EFD0ED9259D5BFC00575D88 /* libopencv_xfeatures2d.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libopencv_xfeatures2d.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libopencv_xfeatures2d.a"; sourceTree = "<group>"; };
+		4EFD0EDA259D5BFC00575D88 /* libopencv_videostab.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libopencv_videostab.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libopencv_videostab.a"; sourceTree = "<group>"; };
+		4EFD0EDB259D5BFC00575D88 /* libopencv_ccalib.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libopencv_ccalib.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libopencv_ccalib.a"; sourceTree = "<group>"; };
+		4EFD0EDC259D5BFC00575D88 /* libopencv_ximgproc.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libopencv_ximgproc.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libopencv_ximgproc.a"; sourceTree = "<group>"; };
+		4EFD0F07259D5C2100575D88 /* libg2o_solver_dense.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libg2o_solver_dense.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libg2o_solver_dense.a"; sourceTree = "<group>"; };
+		4EFD0F08259D5C2100575D88 /* libg2o_ext_csparse.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libg2o_ext_csparse.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libg2o_ext_csparse.a"; sourceTree = "<group>"; };
+		4EFD0F09259D5C2100575D88 /* libg2o_solver_slam2d_linear.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libg2o_solver_slam2d_linear.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libg2o_solver_slam2d_linear.a"; sourceTree = "<group>"; };
+		4EFD0F0A259D5C2100575D88 /* libg2o_types_slam2d.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libg2o_types_slam2d.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libg2o_types_slam2d.a"; sourceTree = "<group>"; };
+		4EFD0F0B259D5C2200575D88 /* libg2o_solver_pcg.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libg2o_solver_pcg.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libg2o_solver_pcg.a"; sourceTree = "<group>"; };
+		4EFD0F0C259D5C2200575D88 /* libg2o_types_data.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libg2o_types_data.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libg2o_types_data.a"; sourceTree = "<group>"; };
+		4EFD0F0D259D5C2200575D88 /* libg2o_core.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libg2o_core.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libg2o_core.a"; sourceTree = "<group>"; };
+		4EFD0F0E259D5C2200575D88 /* libgtsam_unstable.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libgtsam_unstable.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libgtsam_unstable.a"; sourceTree = "<group>"; };
+		4EFD0F0F259D5C2200575D88 /* libg2o_types_icp.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libg2o_types_icp.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libg2o_types_icp.a"; sourceTree = "<group>"; };
+		4EFD0F10259D5C2200575D88 /* libg2o_solver_csparse.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libg2o_solver_csparse.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libg2o_solver_csparse.a"; sourceTree = "<group>"; };
+		4EFD0F11259D5C2200575D88 /* libg2o_solver_structure_only.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libg2o_solver_structure_only.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libg2o_solver_structure_only.a"; sourceTree = "<group>"; };
+		4EFD0F12259D5C2200575D88 /* libg2o_solver_eigen.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libg2o_solver_eigen.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libg2o_solver_eigen.a"; sourceTree = "<group>"; };
+		4EFD0F13259D5C2200575D88 /* libg2o_csparse_extension.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libg2o_csparse_extension.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libg2o_csparse_extension.a"; sourceTree = "<group>"; };
+		4EFD0F14259D5C2200575D88 /* libg2o_stuff.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libg2o_stuff.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libg2o_stuff.a"; sourceTree = "<group>"; };
+		4EFD0F15259D5C2200575D88 /* libg2o_types_sba.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libg2o_types_sba.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libg2o_types_sba.a"; sourceTree = "<group>"; };
+		4EFD0F16259D5C2200575D88 /* libg2o_types_slam2d_addons.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libg2o_types_slam2d_addons.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libg2o_types_slam2d_addons.a"; sourceTree = "<group>"; };
+		4EFD0F17259D5C2200575D88 /* libg2o_types_slam3d_addons.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libg2o_types_slam3d_addons.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libg2o_types_slam3d_addons.a"; sourceTree = "<group>"; };
+		4EFD0F18259D5C2200575D88 /* libg2o_types_slam3d.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libg2o_types_slam3d.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libg2o_types_slam3d.a"; sourceTree = "<group>"; };
+		4EFD0F19259D5C2200575D88 /* libmetis.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libmetis.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libmetis.a"; sourceTree = "<group>"; };
+		4EFD0F1A259D5C2200575D88 /* libg2o_types_sclam2d.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libg2o_types_sclam2d.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libg2o_types_sclam2d.a"; sourceTree = "<group>"; };
+		4EFD0F1B259D5C2200575D88 /* libg2o_types_sim3.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libg2o_types_sim3.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libg2o_types_sim3.a"; sourceTree = "<group>"; };
+		4EFD0F1C259D5C2200575D88 /* libgtsam.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libgtsam.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libgtsam.a"; sourceTree = "<group>"; };
+		4EFD0F33259D5C2900575D88 /* libflann_cpp_s.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libflann_cpp_s.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libflann_cpp_s.a"; sourceTree = "<group>"; };
+		4EFD0F35259D5C7300575D88 /* vtk.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = vtk.framework; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/vtk.framework"; sourceTree = "<group>"; };
 		4EFD0F38259D5D1500575D88 /* CameraMobile.cpp */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.cpp.cpp; name = CameraMobile.cpp; path = ../android/jni/CameraMobile.cpp; sourceTree = "<group>"; };
 		4EFD0F39259D5D1500575D88 /* CameraMobile.h */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.h; name = CameraMobile.h; path = ../android/jni/CameraMobile.h; sourceTree = "<group>"; };
 		4EFD0F3C259D5D5C00575D88 /* libsqlite3.tbd */ = {isa = PBXFileReference; lastKnownFileType = "sourcecode.text-based-dylib-definition"; name = libsqlite3.tbd; path = usr/lib/libsqlite3.tbd; sourceTree = SDKROOT; };
-		4EFD0F4B259D67D900575D88 /* liblibwebp.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = liblibwebp.a; path = RTABMapApp/Libraries/share/OpenCV/3rdparty/lib/liblibwebp.a; sourceTree = "<group>"; };
-		4EFD0F4C259D67D900575D88 /* liblibpng.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = liblibpng.a; path = RTABMapApp/Libraries/share/OpenCV/3rdparty/lib/liblibpng.a; sourceTree = "<group>"; };
-		4EFD0F4D259D67D900575D88 /* liblibjpeg-turbo.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = "liblibjpeg-turbo.a"; path = "RTABMapApp/Libraries/share/OpenCV/3rdparty/lib/liblibjpeg-turbo.a"; sourceTree = "<group>"; };
-		4EFD0F4E259D67D900575D88 /* libzlib.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libzlib.a; path = RTABMapApp/Libraries/share/OpenCV/3rdparty/lib/libzlib.a; sourceTree = "<group>"; };
-		4EFD0F4F259D67D900575D88 /* liblibprotobuf.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = liblibprotobuf.a; path = RTABMapApp/Libraries/share/OpenCV/3rdparty/lib/liblibprotobuf.a; sourceTree = "<group>"; };
+		4EFD0F4B259D67D900575D88 /* liblibwebp.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = liblibwebp.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/share/OpenCV/3rdparty/lib/liblibwebp.a"; sourceTree = "<group>"; };
+		4EFD0F4C259D67D900575D88 /* liblibpng.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = liblibpng.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/share/OpenCV/3rdparty/lib/liblibpng.a"; sourceTree = "<group>"; };
+		4EFD0F4D259D67D900575D88 /* liblibjpeg-turbo.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = "liblibjpeg-turbo.a"; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/share/OpenCV/3rdparty/lib/liblibjpeg-turbo.a"; sourceTree = "<group>"; };
+		4EFD0F4E259D67D900575D88 /* libzlib.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libzlib.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/share/OpenCV/3rdparty/lib/libzlib.a"; sourceTree = "<group>"; };
+		4EFD0F4F259D67D900575D88 /* liblibprotobuf.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = liblibprotobuf.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/share/OpenCV/3rdparty/lib/liblibprotobuf.a"; sourceTree = "<group>"; };
 		4EFD0F60259E341C00575D88 /* RTABMapApp.h */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.h; name = RTABMapApp.h; path = ../android/jni/RTABMapApp.h; sourceTree = "<group>"; };
 		4EFD0F61259E341C00575D88 /* RTABMapApp.cpp */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.cpp.cpp; name = RTABMapApp.cpp; path = ../android/jni/RTABMapApp.cpp; sourceTree = "<group>"; };
 		4EFD0F65259E38DE00575D88 /* NativeWrapper.hpp */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.cpp.h; name = NativeWrapper.hpp; path = RTABMapApp/NativeWrapper.hpp; sourceTree = SOURCE_ROOT; };
@@ -527,78 +469,7 @@
 				4E8B155426273A580037FC53 /* Zip in Frameworks */,
 				4E3525682DE4C73E00F39D8F /* Accelerate.framework in Frameworks */,
 				4EA100012F00000100100005 /* CoreNFC.framework in Frameworks */,
-				4EFD0F36259D5C7300575D88 /* vtk.framework in Frameworks */,
 				4EFD0EAB259D581800575D88 /* OpenGLES.framework in Frameworks */,
-				4E10D89C2DE409870015926D /* librtabmap_core.a in Frameworks */,
-				4E10D89D2DE409870015926D /* librtabmap_utilite.a in Frameworks */,
-				4E10D89E2DE409A60015926D /* libopencv_xfeatures2d.a in Frameworks */,
-				4E10D89F2DE409B20015926D /* libopencv_video.a in Frameworks */,
-				4E10D8A02DE409BB0015926D /* libopencv_tracking.a in Frameworks */,
-				4E10D8A12DE409C00015926D /* libopencv_optflow.a in Frameworks */,
-				4E10D8A22DE409C70015926D /* libopencv_imgproc.a in Frameworks */,
-				4E10D8A32DE409CA0015926D /* libopencv_features2d.a in Frameworks */,
-				4E10D8A42DE409CE0015926D /* libopencv_core.a in Frameworks */,
-				4E10D8A52DE409D10015926D /* libopencv_calib3d.a in Frameworks */,
-				4E10D8A62DE409D50015926D /* libopencv_aruco.a in Frameworks */,
-				4E10D8A72DE409F40015926D /* libopencv_flann.a in Frameworks */,
-				4E10D8A82DE40A1B0015926D /* libopencv_ximgproc.a in Frameworks */,
-				4E10D8A92DE40A3A0015926D /* libopencv_photo.a in Frameworks */,
-				4E10D8AA2DE40A6C0015926D /* libopencv_objdetect.a in Frameworks */,
-				4E10D8AB2DE40A8C0015926D /* libopencv_stitching.a in Frameworks */,
-				4E10D8AC2DE40AA20015926D /* libopencv_imgcodecs.a in Frameworks */,
-				4E3525672DE4C72D00F39D8F /* libamd.a in Frameworks */,
-				4E3525642DE4C71C00F39D8F /* libsuitesparseconfig.a in Frameworks */,
-				4E3525652DE4C71C00F39D8F /* libspqr.a in Frameworks */,
-				4E35255E2DE4C71000F39D8F /* libcxsparse.a in Frameworks */,
-				4E35255F2DE4C71000F39D8F /* libcolamd.a in Frameworks */,
-				4E3525602DE4C71000F39D8F /* libcamd.a in Frameworks */,
-				4E3525612DE4C71000F39D8F /* libccolamd.a in Frameworks */,
-				4E3525592DE4C6F600F39D8F /* libcholmod.a in Frameworks */,
-				4E10D8AD2DE40E990015926D /* libg2o_core.a in Frameworks */,
-				4E3525572DE4C6E500F39D8F /* libg2o_solver_cholmod.a in Frameworks */,
-				4E3525542DE4C6E500F39D8F /* libg2o_csparse_extension.a in Frameworks */,
-				4E3525552DE4C6E500F39D8F /* libg2o_solver_csparse.a in Frameworks */,
-				4E10D8AE2DE40E990015926D /* libg2o_solver_dense.a in Frameworks */,
-				4E10D8AF2DE40E990015926D /* libg2o_solver_eigen.a in Frameworks */,
-				4E10D8B02DE40E990015926D /* libg2o_solver_pcg.a in Frameworks */,
-				4E10D8B12DE40E990015926D /* libg2o_solver_slam2d_linear.a in Frameworks */,
-				4E10D8B22DE40E990015926D /* libg2o_solver_structure_only.a in Frameworks */,
-				4E10D8B32DE40E990015926D /* libg2o_stuff.a in Frameworks */,
-				4E10D8B42DE40E990015926D /* libg2o_types_data.a in Frameworks */,
-				4E10D8B52DE40E990015926D /* libg2o_types_icp.a in Frameworks */,
-				4E10D8B62DE40E990015926D /* libg2o_types_sba.a in Frameworks */,
-				4E10D8B72DE40E990015926D /* libg2o_types_sclam2d.a in Frameworks */,
-				4E10D8B82DE40E990015926D /* libg2o_types_sim3.a in Frameworks */,
-				4E10D8B92DE40E990015926D /* libg2o_types_slam2d_addons.a in Frameworks */,
-				4E10D8BA2DE40E990015926D /* libg2o_types_slam2d.a in Frameworks */,
-				4E10D8BB2DE40E990015926D /* libg2o_types_slam3d_addons.a in Frameworks */,
-				4E10D8BC2DE40E990015926D /* libg2o_types_slam3d.a in Frameworks */,
-				4E10D8BD2DE40EC70015926D /* libpcl_common.a in Frameworks */,
-				4E10D8BE2DE40EC70015926D /* libpcl_features.a in Frameworks */,
-				4E10D8BF2DE40EC70015926D /* libpcl_filters.a in Frameworks */,
-				4E10D8C02DE40EC70015926D /* libpcl_io_ply.a in Frameworks */,
-				4E10D8C12DE40EC70015926D /* libpcl_io.a in Frameworks */,
-				4E10D8C22DE40EC70015926D /* libpcl_kdtree.a in Frameworks */,
-				4E10D8C32DE40EC70015926D /* libpcl_keypoints.a in Frameworks */,
-				4E10D8C42DE40EC70015926D /* libpcl_ml.a in Frameworks */,
-				4E10D8C52DE40EC70015926D /* libpcl_octree.a in Frameworks */,
-				4E10D8C62DE40EC70015926D /* libpcl_registration.a in Frameworks */,
-				4E10D8C72DE40EC70015926D /* libpcl_sample_consensus.a in Frameworks */,
-				4E10D8C82DE40EC70015926D /* libpcl_search.a in Frameworks */,
-				4E10D8C92DE40EC70015926D /* libpcl_segmentation.a in Frameworks */,
-				4E10D8CA2DE40EC70015926D /* libpcl_stereo.a in Frameworks */,
-				4E10D8CB2DE40EC70015926D /* libpcl_surface.a in Frameworks */,
-				4E10D8CC2DE40EE30015926D /* libgtsam_unstable.a in Frameworks */,
-				4E10D8CD2DE40EE30015926D /* libgtsam.a in Frameworks */,
-				4E10D8CE2DE40EE30015926D /* libmetis-gtsam.a in Frameworks */,
-				4E10D8CF2DE40EF90015926D /* libboost_serialization.a in Frameworks */,
-				4E10D8D02DE40F060015926D /* libboost_timer.a in Frameworks */,
-				4E10D8D42DE40F2A0015926D /* libboost_thread.a in Frameworks */,
-				4E10D8D12DE40F190015926D /* liblas_c.a in Frameworks */,
-				4E10D8D22DE40F190015926D /* liblas.a in Frameworks */,
-				4E10D8D32DE40F190015926D /* liblaszip.a in Frameworks */,
-				4E10D8E12DE4101B0015926D /* liblibjpeg-turbo.a in Frameworks */,
-				4E10D8E22DE4101B0015926D /* liblibpng.a in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -635,6 +506,13 @@
 				4EE016B0259BE441008CCE65 /* SceneDelegate.swift */,
 				4EE016AF259BE441008CCE65 /* ViewController.swift */,
 				4EA100012F00000100100002 /* SupermarketScanSession.swift */,
+				4EA800012F70000100100002 /* GeneratedMobileEvidenceContracts.swift */,
+				4EA800012F70000200100002 /* StrictJSONLStreamReader.swift */,
+				4EA800012F70000300100002 /* TagObservationBurstEvidenceParser.swift */,
+				4EA800012F70000400100002 /* StrictLocalizationTraceParser.swift */,
+				4EA800012F70000500100002 /* TagObservationEvidenceParser.swift */,
+				4EA800012F70000600100002 /* XLSXWorkbookVerifier.swift */,
+				4EA800012F70000700100002 /* MarketScannerNativeDependencies.xcconfig */,
 				4EA400012F30000100100002 /* PriorMapLocalization.swift */,
 				4EA400012F30000100100004 /* PriorMapLocalizationCore.swift */,
 				4EA700012F60000100100002 /* SupermarketFinalizationCore.swift */,
@@ -1088,6 +966,12 @@
 				4E2C516825A63119005CEDBD /* VerticalScrollerView.swift in Sources */,
 				4EE016B3259BE441008CCE65 /* ViewController.swift in Sources */,
 				4EA100012F00000100100001 /* SupermarketScanSession.swift in Sources */,
+				4EA800012F70000100100001 /* GeneratedMobileEvidenceContracts.swift in Sources */,
+				4EA800012F70000200100001 /* StrictJSONLStreamReader.swift in Sources */,
+				4EA800012F70000300100001 /* TagObservationBurstEvidenceParser.swift in Sources */,
+				4EA800012F70000400100001 /* StrictLocalizationTraceParser.swift in Sources */,
+				4EA800012F70000500100001 /* TagObservationEvidenceParser.swift in Sources */,
+				4EA800012F70000600100001 /* XLSXWorkbookVerifier.swift in Sources */,
 				4EA400012F30000100100001 /* PriorMapLocalization.swift in Sources */,
 				4EA400012F30000100100003 /* PriorMapLocalizationCore.swift in Sources */,
 				4EA700012F60000100100001 /* SupermarketFinalizationCore.swift in Sources */,
@@ -1345,6 +1229,7 @@
 		};
 		4EE015D7259A2AF0008CCE65 /* Debug */ = {
 			isa = XCBuildConfiguration;
+			baseConfigurationReference = 4EA800012F70000700100002 /* MarketScannerNativeDependencies.xcconfig */;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
@@ -1359,7 +1244,7 @@
 				EXCLUDED_ARCHS = "";
 				FRAMEWORK_SEARCH_PATHS = (
 					"$(inherited)",
-					"$(PROJECT_DIR)/RTABMapApp/Libraries/lib",
+					"$(PROJECT_DIR)/RTABMapApp/Libraries/$(PLATFORM_NAME)/lib",
 					"$(PROJECT_DIR)/RTABMapApp/Carthage/Build/iOS",
 				);
 				GCC_PREPROCESSOR_DEFINITIONS = (
@@ -1376,9 +1261,9 @@
 				);
 				LIBRARY_SEARCH_PATHS = (
 					"$(inherited)",
-					"$(PROJECT_DIR)/RTABMapApp/Libraries/lib",
-					"$(PROJECT_DIR)/RTABMapApp/Libraries/share/OpenCV/3rdparty/lib",
-					"$(PROJECT_DIR)/RTABMapApp/Libraries/lib/opencv4/3rdparty",
+					"$(PROJECT_DIR)/RTABMapApp/Libraries/$(PLATFORM_NAME)/lib",
+					"$(PROJECT_DIR)/RTABMapApp/Libraries/$(PLATFORM_NAME)/share/OpenCV/3rdparty/lib",
+					"$(PROJECT_DIR)/RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/opencv4/3rdparty",
 				);
 				MARKETING_VERSION = 0.22.0;
 				OTHER_CFLAGS = "";
@@ -1388,20 +1273,20 @@
 				SWIFT_OBJC_BRIDGING_HEADER = "RTABMapApp/$(SWIFT_MODULE_NAME)-Bridging-Header.h";
 				SWIFT_OBJC_INTERFACE_HEADER_NAME = "$(SWIFT_MODULE_NAME)-Swift.h";
 				SWIFT_VERSION = 5.0;
-				SYSTEM_FRAMEWORK_SEARCH_PATHS = "\"$(SRCROOT)/RTABMapApp/Libraries/lib\"";
+				SYSTEM_FRAMEWORK_SEARCH_PATHS = "\"$(SRCROOT)/RTABMapApp/Libraries/$(PLATFORM_NAME)/lib\"";
 				SYSTEM_HEADER_SEARCH_PATHS = (
 					"\"$(SRCROOT)/../../corelib/include\"",
 					"\"$(SRCROOT)/../../guilib/include\"",
 					"\"$(SRCROOT)/../../utilite/include\"",
 					"\"$(SRCROOT)/../../core/MarketScannerFactorGraph\"",
-					"\"$(SRCROOT)/RTABMapApp/Libraries/include\"",
-					"\"$(SRCROOT)/RTABMapApp/Libraries/include/eigen3\"",
-					"\"$(SRCROOT)/RTABMapApp/Libraries/include/pcl-1.15\"",
-					"\"$(SRCROOT)/RTABMapApp/Libraries/include/rtabmap-0.23\"",
+					"\"$(SRCROOT)/RTABMapApp/Libraries/$(PLATFORM_NAME)/include\"",
+					"\"$(SRCROOT)/RTABMapApp/Libraries/$(PLATFORM_NAME)/include/eigen3\"",
+					"\"$(SRCROOT)/RTABMapApp/Libraries/$(PLATFORM_NAME)/include/pcl-1.15\"",
+					"\"$(SRCROOT)/RTABMapApp/Libraries/$(PLATFORM_NAME)/include/rtabmap-0.23\"",
 					"\"$(SRCROOT)/../android/jni/tango-gl/include\"",
 					"\"$(SRCROOT)/../android/jni/third-party/include\"",
-					"\"$(SRCROOT)/RTABMapApp/Libraries/lib/vtk.framework/Headers\"",
-					"\"$(SRCROOT)/RTABMapApp/Libraries/include/opencv4\"",
+					"\"$(SRCROOT)/RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/vtk.framework/Headers\"",
+					"\"$(SRCROOT)/RTABMapApp/Libraries/$(PLATFORM_NAME)/include/opencv4\"",
 				);
 				TARGETED_DEVICE_FAMILY = "1,2";
 				VALIDATE_WORKSPACE = NO;
@@ -1410,6 +1295,7 @@
 		};
 		4EE015D8259A2AF0008CCE65 /* Release */ = {
 			isa = XCBuildConfiguration;
+			baseConfigurationReference = 4EA800012F70000700100002 /* MarketScannerNativeDependencies.xcconfig */;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
@@ -1423,7 +1309,7 @@
 				DEVELOPMENT_TEAM = MC9ZJHZ2RL;
 				FRAMEWORK_SEARCH_PATHS = (
 					"$(inherited)",
-					"$(PROJECT_DIR)/RTABMapApp/Libraries/lib",
+					"$(PROJECT_DIR)/RTABMapApp/Libraries/$(PLATFORM_NAME)/lib",
 					"$(PROJECT_DIR)/RTABMapApp/Carthage/Build/iOS",
 				);
 				GCC_OPTIMIZATION_LEVEL = 2;
@@ -1441,9 +1327,9 @@
 				);
 				LIBRARY_SEARCH_PATHS = (
 					"$(inherited)",
-					"$(PROJECT_DIR)/RTABMapApp/Libraries/lib",
-					"$(PROJECT_DIR)/RTABMapApp/Libraries/share/OpenCV/3rdparty/lib",
-					"$(PROJECT_DIR)/RTABMapApp/Libraries/lib/opencv4/3rdparty",
+					"$(PROJECT_DIR)/RTABMapApp/Libraries/$(PLATFORM_NAME)/lib",
+					"$(PROJECT_DIR)/RTABMapApp/Libraries/$(PLATFORM_NAME)/share/OpenCV/3rdparty/lib",
+					"$(PROJECT_DIR)/RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/opencv4/3rdparty",
 				);
 				MARKETING_VERSION = 0.22.0;
 				ONLY_ACTIVE_ARCH = YES;
@@ -1454,20 +1340,20 @@
 				SWIFT_OBJC_BRIDGING_HEADER = "RTABMapApp/$(SWIFT_MODULE_NAME)-Bridging-Header.h";
 				SWIFT_OBJC_INTERFACE_HEADER_NAME = "$(SWIFT_MODULE_NAME)-Swift.h";
 				SWIFT_VERSION = 5.0;
-				SYSTEM_FRAMEWORK_SEARCH_PATHS = "\"$(SRCROOT)/RTABMapApp/Libraries/lib\"";
+				SYSTEM_FRAMEWORK_SEARCH_PATHS = "\"$(SRCROOT)/RTABMapApp/Libraries/$(PLATFORM_NAME)/lib\"";
 				SYSTEM_HEADER_SEARCH_PATHS = (
 					"\"$(SRCROOT)/../../corelib/include\"",
 					"\"$(SRCROOT)/../../guilib/include\"",
 					"\"$(SRCROOT)/../../utilite/include\"",
 					"\"$(SRCROOT)/../../core/MarketScannerFactorGraph\"",
-					"\"$(SRCROOT)/RTABMapApp/Libraries/include\"",
-					"\"$(SRCROOT)/RTABMapApp/Libraries/include/eigen3\"",
-					"\"$(SRCROOT)/RTABMapApp/Libraries/include/pcl-1.15\"",
-					"\"$(SRCROOT)/RTABMapApp/Libraries/include/rtabmap-0.23\"",
+					"\"$(SRCROOT)/RTABMapApp/Libraries/$(PLATFORM_NAME)/include\"",
+					"\"$(SRCROOT)/RTABMapApp/Libraries/$(PLATFORM_NAME)/include/eigen3\"",
+					"\"$(SRCROOT)/RTABMapApp/Libraries/$(PLATFORM_NAME)/include/pcl-1.15\"",
+					"\"$(SRCROOT)/RTABMapApp/Libraries/$(PLATFORM_NAME)/include/rtabmap-0.23\"",
 					"\"$(SRCROOT)/../android/jni/tango-gl/include\"",
 					"\"$(SRCROOT)/../android/jni/third-party/include\"",
-					"\"$(SRCROOT)/RTABMapApp/Libraries/lib/vtk.framework/Headers\"",
-					"\"$(SRCROOT)/RTABMapApp/Libraries/include/opencv4\"",
+					"\"$(SRCROOT)/RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/vtk.framework/Headers\"",
+					"\"$(SRCROOT)/RTABMapApp/Libraries/$(PLATFORM_NAME)/include/opencv4\"",
 				);
 				TARGETED_DEVICE_FAMILY = "1,2";
 				VALIDATE_WORKSPACE = NO;

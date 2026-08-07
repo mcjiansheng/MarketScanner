@@ -6,10 +6,11 @@ enum MobileWorksheets {
     static let priceTagsHeaders = [
         "tag_instance_id", "barcode", "symbology", "store_id", "floor_id",
         "map_version", "prior_map_sha256", "tracking_session_id",
-        "shelf_code", "shelf_side", "distance_from_shelf_start_cm",
-        "position_ratio", "map_x_m", "map_y_m", "observation_count",
-        "position_spread_cm", "localization_confidence",
-        "association_confidence", "quality_status", "reason",
+        "shelf_code", "shelf_segment_id", "shelf_side",
+        "distance_from_shelf_start_cm", "position_ratio", "map_x_m",
+        "map_y_m", "observation_count", "position_spread_cm",
+        "localization_confidence", "association_confidence",
+        "quality_status", "reason",
     ]
 
     static let devicePositionsHeaders = [
@@ -44,9 +45,9 @@ enum MobileWorksheets {
 
     static let rescanRequiredHeaders = [
         "task_id", "task_type", "floor_id", "barcode", "tag_instance_id",
-        "shelf_code", "region_start_cm", "region_end_cm",
-        "local_start_time", "local_end_time", "reason_code",
-        "human_message", "suggested_action", "priority",
+        "shelf_code", "shelf_segment_id", "region_start_cm",
+        "region_end_cm", "local_start_time", "local_end_time",
+        "reason_code", "human_message", "suggested_action", "priority",
     ]
 
     enum RescanTaskType: String {
@@ -70,6 +71,9 @@ struct FinalPriceTag: Equatable {
     var priorMapSha256: String
     var trackingSessionID: String
     var shelfCode: String
+    /// Immutable physical shelf-segment identity. Shelf codes are display
+    /// labels and may be shared by multiple segments.
+    var shelfSegmentID: String
     var shelfSide: String
     var distanceFromShelfStartCm: Double?
     var positionRatio: Double?
@@ -91,6 +95,9 @@ struct RescanTask: Equatable {
     var barcode: String
     var tagInstanceID: String?
     var shelfCode: String
+    /// Exact segment that requires follow-up; empty only for tasks that
+    /// could not be associated or apply to the whole session.
+    var shelfSegmentID: String
     var regionStartCm: Double?
     var regionEndCm: Double?
     var localStartTime: String

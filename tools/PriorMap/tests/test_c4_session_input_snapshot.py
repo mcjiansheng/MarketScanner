@@ -54,7 +54,9 @@ class SessionInputSnapshotFixture(unittest.TestCase):
         self.root = Path(self.temporary.name)
         workbook = self.root / "fixture.xlsx"
         write_workbook(workbook, fixture_rows())
-        self.prior_map = convert_workbook(workbook, self.root / "PriorMap-fixture")
+        self.prior_map = convert_workbook(
+            workbook, self.root / "PriorMap-fixture", store_id="s1"
+        )
         manifest = json.loads((self.prior_map / "manifest.json").read_text())
         self.session = self.root / "SupermarketSession-fixture"
         self.segment = self.session / "segment_0001"

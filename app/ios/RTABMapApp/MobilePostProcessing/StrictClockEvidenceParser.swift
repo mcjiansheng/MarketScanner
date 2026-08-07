@@ -29,14 +29,25 @@ enum StrictClockEvidenceParser {
     /// V1R5 §7.1/§7.5 (review B-07): the sidecar must fit the product
     /// ceiling — 60k node bindings × ≈250 bytes each plus correlations
     /// and a safety factor (§4 contract), never the V1R4 8 MiB cap.
-    static let maximumSidecarBytes = 256 * 1024 * 1024
-    static let maximumRecordCount = 1_000_000
+    static let maximumSidecarBytes =
+        GeneratedMobileEvidenceContracts.File_clock_correlations_jsonl
+            .max_file_bytes
+    static let maximumRecordBytes =
+        GeneratedMobileEvidenceContracts.File_clock_correlations_jsonl
+            .max_record_bytes
+    static let maximumRecordCount =
+        GeneratedMobileEvidenceContracts.File_clock_correlations_jsonl
+            .max_records
     /// A system clock jump is a utc delta that deviates from the
     /// uptime delta by more than this tolerance (seconds).
     static let discontinuityToleranceSeconds = 2.0
     /// Cross-check tolerance between a node binding's utc and the
     /// correlation uptime->utc mapping (seconds).
     static let bindingCrossCheckToleranceSeconds = 2.0
+    /// ARKit frame timestamps and ProcessInfo.systemUptime are both
+    /// boot-relative clocks sampled for the same node binding.
+    static let bindingFrameUptimeToleranceSeconds = 2.0
+    static let nodeStampIdentityToleranceSeconds = 1.0e-6
     /// Minimum evidence for an authoritative mapping.
     static let minimumCorrelationCount = 2
     static let minimumBindingCount = 2
@@ -62,12 +73,17 @@ enum StrictClockEvidenceParser {
         case nonFiniteNumber(Int, String)
         case invalidInteger(Int, String)
         case invalidTimezone(Int, String)
+        case timezoneOffsetMismatch(Int)
         case nonIncreasingMonotonic(Int, String)
         case backwardClock(Int)
         case duplicateSample(Int, String)
         case duplicateNodeBinding(Int)
+        case reasonInvalid(Int, String)
+        case nonInjectiveUTC(Int)
         case countMismatch(String)
         case bindingUTCMismatch(Int)
+        case bindingFrameUptimeMismatch(Int)
+        case nodeInventoryMismatch(String)
 
         var errorDescription: String? {
             switch self {
@@ -86,12 +102,17 @@ enum StrictClockEvidenceParser {
             case .nonFiniteNumber(let line, let field): return "时钟侧车第 \(line) 行字段 \(field) 非有限数"
             case .invalidInteger(let line, let field): return "时钟侧车第 \(line) 行字段 \(field) 不是严格整数"
             case .invalidTimezone(let line, let field): return "时钟侧车第 \(line) 行时区 \(field) 无效"
+            case .timezoneOffsetMismatch(let line): return "时钟侧车第 \(line) 行时区偏移与 IANA 规则不一致"
             case .nonIncreasingMonotonic(let line, let field): return "时钟侧车第 \(line) 行 \(field) 未严格递增"
             case .backwardClock(let line): return "时钟侧车第 \(line) 行时钟倒退"
             case .duplicateSample(let line, let field): return "时钟侧车第 \(line) 行 \(field) 重复"
             case .duplicateNodeBinding(let line): return "时钟侧车第 \(line) 行 node_id 重复"
+            case .reasonInvalid(let line, let reason): return "时钟侧车第 \(line) 行 reason 无效：\(reason)"
+            case .nonInjectiveUTC(let line): return "时钟侧车第 \(line) 行 UTC 非严格递增，无法建立单射"
             case .countMismatch(let detail): return "时钟侧车计数与 metadata 不一致：\(detail)"
             case .bindingUTCMismatch(let line): return "时钟侧车第 \(line) 行 node binding 与 correlation 映射不一致"
+            case .bindingFrameUptimeMismatch(let line): return "时钟侧车第 \(line) 行 frame timestamp 与 system uptime 不一致"
+            case .nodeInventoryMismatch(let detail): return "时钟侧车 node binding 与数据库节点清单不一致：\(detail)"
             }
         }
     }
@@ -107,6 +128,12 @@ enum StrictClockEvidenceParser {
         "system_uptime", "utc_unix_seconds", "timezone_id",
         "utc_offset_seconds", "reason",
     ]
+    static let correlationReasons: Set<String> = [
+        "session_start", "periodic", "will_resign_active",
+        "did_become_active", "system_clock_change", "timezone_change",
+        "session_end",
+    ]
+    static let bindingReasons: Set<String> = ["node_bound"]
 
     /// Strictly parses the sidecar from a file through the shared
     /// streaming JSONL reader (V1R5 §7.1 — the file is never loaded as
@@ -115,7 +142,8 @@ enum StrictClockEvidenceParser {
         url: URL,
         expectedTrackingSessionID: String,
         expectedCorrelationCount: Int?,
-        expectedBindingCount: Int?
+        expectedBindingCount: Int?,
+        expectedNodeStampsByID: [Int: Double]? = nil
     ) throws -> ParsedEvidence {
         let attributes = try FileManager.default
             .attributesOfItem(atPath: url.path)
@@ -123,39 +151,56 @@ enum StrictClockEvidenceParser {
         guard fileSize <= Int64(maximumSidecarBytes) else {
             throw ParseError.tooLarge("\(fileSize) bytes")
         }
-        let framing: StrictJSONLStreamReader.ParsedLines
-        do {
-            framing = try StrictJSONLStreamReader.readLines(
-                from: url,
-                maximumLineBytes: 1024 * 1024,
-                maximumLineCount: maximumRecordCount)
-        } catch let error as StrictJSONLStreamReader.StreamError {
-            throw ParseError.tooLarge(error.localizedDescription)
-        }
         var correlations: [ClockCorrelationRecord] = []
         var bindings: [ClockNodeBindingRecord] = []
         var correlationMonotonic: Double?
         var bindingStamp: Double?
+        var bindingUTC: Double?
         var seenNodeIDs = Set<Int>()
-        for (offset, line) in framing.lines.enumerated() {
-            let lineNumber = offset + 1
-            let object: [String: Any]
-            do {
-                object = try StrictJSONLStreamReader.strictObject(
-                    from: line, lineNumber: lineNumber)
-            } catch {
-                throw ParseError.jsonInvalid(
-                    lineNumber, "cannot parse object")
+        var bindingLineNumbers: [Int] = []
+        do {
+            _ = try StrictJSONLStreamReader.forEachLine(
+                from: url,
+                limits: .init(
+                    maximumFileBytes: maximumSidecarBytes,
+                    maximumLineBytes: maximumRecordBytes,
+                    maximumLineCount: maximumRecordCount)
+            ) { line in
+                let object: [String: Any]
+                do {
+                    object = try StrictJSONLStreamReader.strictObject(
+                        from: line.text, lineNumber: line.number)
+                } catch {
+                    throw ParseError.jsonInvalid(
+                        line.number, "cannot parse object")
+                }
+                try parseRecord(
+                    object,
+                    lineNumber: line.number,
+                    expectedTrackingSessionID: expectedTrackingSessionID,
+                    correlations: &correlations,
+                    bindings: &bindings,
+                    correlationMonotonic: &correlationMonotonic,
+                    bindingStamp: &bindingStamp,
+                    bindingUTC: &bindingUTC,
+                    bindingLineNumbers: &bindingLineNumbers,
+                    seenNodeIDs: &seenNodeIDs)
             }
-            try parseRecord(
-                object,
-                lineNumber: lineNumber,
-                expectedTrackingSessionID: expectedTrackingSessionID,
-                correlations: &correlations,
-                bindings: &bindings,
-                correlationMonotonic: &correlationMonotonic,
-                bindingStamp: &bindingStamp,
-                seenNodeIDs: &seenNodeIDs)
+        } catch let error as ParseError {
+            throw error
+        } catch let error as StrictJSONLStreamReader.StreamError {
+            switch error {
+            case .noFinalNewline:
+                throw ParseError.noFinalNewline
+            case .blankLine(let line):
+                throw ParseError.blankLine(line)
+            case .invalidUTF8(let line):
+                throw ParseError.partialLine(line)
+            case .invalidJSON(let line, let detail):
+                throw ParseError.jsonInvalid(line, detail)
+            default:
+                throw ParseError.tooLarge(error.localizedDescription)
+            }
         }
         if let expectedCorrelationCount {
             guard correlations.count == expectedCorrelationCount else {
@@ -169,7 +214,13 @@ enum StrictClockEvidenceParser {
                     "node_binding \(bindings.count) != metadata \(expectedBindingCount)")
             }
         }
-        try crossCheckBindings(correlations: correlations, bindings: bindings)
+        try crossCheckBindings(
+            correlations: correlations,
+            bindings: bindings,
+            bindingLineNumbers: bindingLineNumbers)
+        try validateNodeInventory(
+            bindings: bindings,
+            expectedNodeStampsByID: expectedNodeStampsByID)
         return ParsedEvidence(
             correlations: correlations,
             bindings: bindings)
@@ -181,7 +232,8 @@ enum StrictClockEvidenceParser {
         content: String,
         expectedTrackingSessionID: String,
         expectedCorrelationCount: Int?,
-        expectedBindingCount: Int?
+        expectedBindingCount: Int?,
+        expectedNodeStampsByID: [Int: Double]? = nil
     ) throws -> ParsedEvidence {
         guard !content.isEmpty else {
             throw ParseError.missingSidecar("empty sidecar")
@@ -205,7 +257,9 @@ enum StrictClockEvidenceParser {
         var bindings: [ClockNodeBindingRecord] = []
         var correlationMonotonic: Double?
         var bindingStamp: Double?
+        var bindingUTC: Double?
         var seenNodeIDs = Set<Int>()
+        var bindingLineNumbers: [Int] = []
         for (offset, rawLine) in lines.enumerated() {
             let lineNumber = offset + 1
             let line = String(rawLine)
@@ -229,6 +283,8 @@ enum StrictClockEvidenceParser {
                 bindings: &bindings,
                 correlationMonotonic: &correlationMonotonic,
                 bindingStamp: &bindingStamp,
+                bindingUTC: &bindingUTC,
+                bindingLineNumbers: &bindingLineNumbers,
                 seenNodeIDs: &seenNodeIDs)
         }
         if let expectedCorrelationCount {
@@ -243,7 +299,13 @@ enum StrictClockEvidenceParser {
                     "node_binding \(bindings.count) != metadata \(expectedBindingCount)")
             }
         }
-        try crossCheckBindings(correlations: correlations, bindings: bindings)
+        try crossCheckBindings(
+            correlations: correlations,
+            bindings: bindings,
+            bindingLineNumbers: bindingLineNumbers)
+        try validateNodeInventory(
+            bindings: bindings,
+            expectedNodeStampsByID: expectedNodeStampsByID)
         return ParsedEvidence(
             correlations: correlations,
             bindings: bindings)
@@ -258,6 +320,8 @@ enum StrictClockEvidenceParser {
         bindings: inout [ClockNodeBindingRecord],
         correlationMonotonic: inout Double?,
         bindingStamp: inout Double?,
+        bindingUTC: inout Double?,
+        bindingLineNumbers: inout [Int],
         seenNodeIDs: inout Set<Int>
     ) throws {
         guard object["format"] as? String == ClockCorrelationRecord.formatValue else {
@@ -280,6 +344,11 @@ enum StrictClockEvidenceParser {
         }
         guard let reason = object["reason"] as? String, !reason.isEmpty else {
             throw ParseError.missingField(lineNumber, "reason")
+        }
+        let allowedReasons = kind == ClockCorrelationRecord.kindCorrelation
+            ? correlationReasons : bindingReasons
+        guard allowedReasons.contains(reason) else {
+            throw ParseError.reasonInvalid(lineNumber, reason)
         }
         // V1R5 §7.2 (review B-07): a REAL IANA timezone id is required —
         // a non-empty string is not enough.
@@ -306,6 +375,9 @@ enum StrictClockEvidenceParser {
                 object["utc_unix_seconds"], line: lineNumber) else {
                 throw ParseError.nonFiniteNumber(lineNumber, "utc_unix_seconds")
             }
+            try validateTimezoneOffset(
+                timezoneID: timezoneID, utcOffset: utcOffset,
+                utcUnixSeconds: utc, lineNumber: lineNumber)
             if let previous = correlationMonotonic {
                 guard monotonic > previous else {
                     if monotonic == previous {
@@ -316,8 +388,13 @@ enum StrictClockEvidenceParser {
                         lineNumber, "monotonic_seconds")
                 }
             }
-            if let previous = correlations.last, utc < previous.utcUnixSeconds {
-                throw ParseError.backwardClock(lineNumber)
+            if let previous = correlations.last {
+                if utc == previous.utcUnixSeconds {
+                    throw ParseError.nonInjectiveUTC(lineNumber)
+                }
+                if utc < previous.utcUnixSeconds {
+                    throw ParseError.backwardClock(lineNumber)
+                }
             }
             correlationMonotonic = monotonic
             correlations.append(ClockCorrelationRecord.make(
@@ -352,6 +429,13 @@ enum StrictClockEvidenceParser {
                 object["utc_unix_seconds"], line: lineNumber) else {
                 throw ParseError.nonFiniteNumber(lineNumber, "utc_unix_seconds")
             }
+            try validateTimezoneOffset(
+                timezoneID: timezoneID, utcOffset: utcOffset,
+                utcUnixSeconds: utc, lineNumber: lineNumber)
+            guard abs(frameTimestamp - uptime)
+                    <= bindingFrameUptimeToleranceSeconds else {
+                throw ParseError.bindingFrameUptimeMismatch(lineNumber)
+            }
             guard !seenNodeIDs.contains(nodeID) else {
                 throw ParseError.duplicateNodeBinding(lineNumber)
             }
@@ -365,8 +449,13 @@ enum StrictClockEvidenceParser {
                         lineNumber, "node_stamp")
                 }
             }
+            if let previousUTC = bindingUTC, utc <= previousUTC {
+                throw ParseError.nonInjectiveUTC(lineNumber)
+            }
             bindingStamp = nodeStamp
+            bindingUTC = utc
             seenNodeIDs.insert(nodeID)
+            bindingLineNumbers.append(lineNumber)
             bindings.append(ClockNodeBindingRecord.make(
                 trackingSessionID: expectedTrackingSessionID,
                 nodeID: nodeID,
@@ -386,7 +475,8 @@ enum StrictClockEvidenceParser {
     /// REJECTED — it is never skipped "and the rest continues".
     private static func crossCheckBindings(
         correlations: [ClockCorrelationRecord],
-        bindings: [ClockNodeBindingRecord]
+        bindings: [ClockNodeBindingRecord],
+        bindingLineNumbers: [Int]
     ) throws {
         guard correlations.count >= 2, !bindings.isEmpty else { return }
         let correlationEdges = discontinuityEdges(of: correlations)
@@ -397,21 +487,93 @@ enum StrictClockEvidenceParser {
                 edges: correlationEdges) else {
                 // Inside a discontinuity segment: cannot attribute the
                 // binding to either side -> fail closed.
-                throw ParseError.bindingUTCMismatch(index + 1)
+                throw ParseError.bindingUTCMismatch(bindingLineNumbers[index])
             }
             if abs(expected - binding.utcUnixSeconds)
                 > bindingCrossCheckToleranceSeconds {
-                throw ParseError.bindingUTCMismatch(index + 1)
+                throw ParseError.bindingUTCMismatch(bindingLineNumbers[index])
+            }
+            guard let context = correlationContext(
+                uptime: binding.systemUptime,
+                correlations: correlations),
+                  context.timezoneID == binding.timezoneID,
+                  context.utcOffsetSeconds == binding.utcOffsetSeconds else {
+                throw ParseError.bindingUTCMismatch(bindingLineNumbers[index])
             }
         }
+    }
+
+    private static func validateNodeInventory(
+        bindings: [ClockNodeBindingRecord],
+        expectedNodeStampsByID: [Int: Double]?
+    ) throws {
+        guard let expected = expectedNodeStampsByID else { return }
+        guard bindings.count == expected.count else {
+            throw ParseError.nodeInventoryMismatch(
+                "binding count \(bindings.count) != DB node count \(expected.count)")
+        }
+        var seen = Set<Int>()
+        seen.reserveCapacity(bindings.count)
+        for binding in bindings {
+            guard let stamp = expected[binding.nodeID] else {
+                throw ParseError.nodeInventoryMismatch(
+                    "node_id \(binding.nodeID) missing from DB")
+            }
+            guard abs(stamp - binding.nodeStamp)
+                    <= nodeStampIdentityToleranceSeconds else {
+                throw ParseError.nodeInventoryMismatch(
+                    "node_id \(binding.nodeID) stamp mismatch")
+            }
+            seen.insert(binding.nodeID)
+        }
+        guard seen.count == expected.count else {
+            throw ParseError.nodeInventoryMismatch("DB node coverage incomplete")
+        }
+    }
+
+    private static func validateTimezoneOffset(
+        timezoneID: String,
+        utcOffset: Int,
+        utcUnixSeconds: Double,
+        lineNumber: Int
+    ) throws {
+        guard let timezone = TimeZone(identifier: timezoneID) else {
+            throw ParseError.invalidTimezone(lineNumber, "timezone_id")
+        }
+        let actual = timezone.secondsFromGMT(
+            for: Date(timeIntervalSince1970: utcUnixSeconds))
+        guard actual == utcOffset else {
+            throw ParseError.timezoneOffsetMismatch(lineNumber)
+        }
+    }
+
+    private static func correlationContext(
+        uptime: Double,
+        correlations: [ClockCorrelationRecord]
+    ) -> (timezoneID: String, utcOffsetSeconds: Int)? {
+        guard !correlations.isEmpty else { return nil }
+        var lower = 0
+        var upper = correlations.count
+        while lower < upper {
+            let middle = (lower + upper) / 2
+            if correlations[middle].monotonicSeconds <= uptime {
+                lower = middle + 1
+            } else {
+                upper = middle
+            }
+        }
+        let index = max(0, lower - 1)
+        let record = correlations[index]
+        return (record.timezoneID, record.utcOffsetSeconds)
     }
 
     /// Discontinuity edges on the correlation timeline (shared by the
     /// cross-check and the mapper): a system clock jump or a timezone
     /// change. The jump test is RELATIVE — a constant non-1:1 clock
     /// scale (e.g. 2× uptime under background throttling) is not a
-    /// discontinuity, so the edge test compares each segment's
-    /// utc/uptime ratio against the median ratio of the run.
+    /// discontinuity. We estimate one robust run scale and compare each
+    /// edge by an ABSOLUTE UTC residual in seconds. Explicit system-clock
+    /// and timezone-change records always split the mapping.
     static func discontinuityEdges(
         of correlations: [ClockCorrelationRecord]
     ) -> Set<Int> {
@@ -429,19 +591,22 @@ enum StrictClockEvidenceParser {
         }
         guard !ratios.isEmpty else { return edges }
         let sorted = ratios.sorted()
-        let median = sorted[sorted.count / 2]
-        let medianMagnitude = max(abs(median), 1.0e-9)
+        // Lower median is deliberate for even small samples: [1, 10]
+        // must preserve the ordinary 1:1 segment and identify 10x as the
+        // outlier instead of choosing the upper-median jump as baseline.
+        let robustScale = sorted[(sorted.count - 1) / 2]
         for index in 0..<(correlations.count - 1) {
             let a = correlations[index]
             let b = correlations[index + 1]
             let utcDelta = b.utcUnixSeconds - a.utcUnixSeconds
             let uptimeDelta = b.monotonicSeconds - a.monotonicSeconds
             let timezoneChanged = a.timezoneID != b.timezoneID
-            var jump = false
+                || b.reason == "timezone_change"
+            var jump = b.reason == "system_clock_change"
             if abs(uptimeDelta) > 1.0e-9 {
-                let ratio = utcDelta / uptimeDelta
-                if abs(ratio - median) / medianMagnitude
-                    > discontinuityToleranceSeconds * 0.25 {
+                let absoluteResidual = abs(
+                    utcDelta - robustScale * uptimeDelta)
+                if absoluteResidual > discontinuityToleranceSeconds {
                     jump = true
                 }
             }

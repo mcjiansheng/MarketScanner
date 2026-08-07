@@ -1,6 +1,6 @@
 # 已有地图辅助扫描数据格式
 
-> 文档状态：**当前有效**。最后核对日期：2026-08-04。
+> 文档状态：**当前有效**。最后核对日期：2026-08-07。
 
 ## 会话元数据
 
@@ -182,6 +182,10 @@ helper 可用且所有门通过时 `solver.type=relative_se2_factor_graph`、`fu
 `localization_trace.jsonl` keeps version 1 and adds optional/defaulted fields: `measurementAccepted`, `hypothesisTrusted`, `correctionStepApplied`, `recoveryConvergedThisUpdate`, `confidenceAccepted`, `constraintDisposition`, `postRecoveryTrustedLocalFrames`, `scanSearchPerformed`, `recoveryFinishedAtUptime`, `recoverySelectedHypothesisId`, `recoveryFinalResidualTranslationM`, `recoveryFinalResidualYawDeg`, `recoveryCorrectionStepAppliedOnCompletionFrame`, `recoveryCooldownRemainingMs`, `recoveryAutomaticTriggerSuppressed`, and `recoveryAutomaticTriggerReason`.
 
 `localization_constraints.jsonl` keeps version 1 and adds `measurementAccepted`, `correctionStepApplied`, `confidenceAccepted`, and `disposition`. `accepted=true` means a formal high-confidence constraint only. `provisional_recovery_step` must always have `accepted=false` and `confidenceAccepted=false`; the PC reader fails closed on a contradictory record. Allowed dispositions are `rejected`, `provisional_recovery_step`, `accepted_local`, and `accepted_recovery_convergence`. All numeric diagnostics must be finite.
+
+Mobile post-processing validates the current writer schema exactly: unknown top-level/pose/candidate fields, non-strict version/Bool/Int values, floor/map/SHA/session mismatches, node-timebase invariant failures and disposition/measurement/correction/confidence contradictions are fatal evidence. A complete identity-bound `accepted=false` record is a normal negative decision, is retained in the non-accepted audit and never creates an absolute prior; it is not itself a corrupt-record blocker. The qualified constraint scale is 48 hours × 2 Hz = 345,600 rows, with a 400,000-row parser hard cap, 64 KiB per-record cap and 768 MiB file cap. `captureHealth.localizationConstraintRecordCount`、`captureHealth.manualLocalizationEventCount` 和 `captureHealth.localizationRecoveryEventCount` 分别是 constraint/manual/recovery 的严格原始行数水位。Manual v2/v3 records reject unknown fields, cross-check ISO/Unix and node-timebase timestamps, and both enforce nearest-node plus second-candidate margin; v3's claimed node ID must equal the recomputed nearest node.
+
+Component identity is not present in the current formal constraint schema. The final snapshot DB exposes node `map_id` and links, but `PriorMapConstraintRecord` has no atomic bound node ID/map ID; manual v3 has a nearest node ID but no RTAB-Map map ID. A connected-component number is also not stable while later loop links can merge components. Therefore current readers must not synthesize a claimed component. Closing J-04 requires a new writer schema with atomic bound node ID/stamp/delta/snapshot generation and real RTAB-Map map ID; the final component is then derived from snapshot links. Existing version-1 constraints cannot be retroactively certified as same-component evidence.
 
 Recovery completion fields belong to the completed episode. On a completion frame the flat current-hypothesis fields are left empty rather than associating a new Local candidate with the old Recovery outcome. A just-converged frame is at most `usable`; only later ordinary Local evidence may reach `stable`, and only `stable` may authorize automatic price-tag confirmation.
 

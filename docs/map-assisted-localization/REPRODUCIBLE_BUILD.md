@@ -1,6 +1,6 @@
 # MarketScanner 可复现构建与依赖供应链
 
-> 文档状态：**当前有效**。最后核对日期：2026-07-30。
+> 文档状态：**当前有效**。最后核对日期：2026-08-07。
 
 ## PC release preset
 
@@ -21,9 +21,28 @@ macOS 使用 `tools/SupermarketMapStudio/configure_pc_macos.sh` 安装/发现 Ho
 
 依赖能力和许可证入口为 `tools/SupermarketMapStudio/release_dependencies.json`。它是 policy，不伪装成某台机器的 resolved lock；实际版本和产物身份由 configure summary、binary `--version` 和 release manifest 共同绑定。
 
+## iOS 内嵌 Build Identity
+
+`tools/Qualification/market_scanner_build_identity.py` 是 Xcode 脚本阶段、CI 和字节复核共用的唯一生成/验证入口。当前 `MarketScannerBuildIdentity` 为 version 3，必须精确包含 `format`、`version`、`app_git_sha`、`native_core_sha256`、`wave`、`branch`、`base_branch`、`base_sha`、`implementation_sha`、`validation_sha`；多字段、少字段、JSON 重复 key 或任意字段格式错误均阻断构建/验证。
+
+`wave`、`branch`、`base_branch` 只接受 `^[a-z0-9][a-z0-9._-]{0,127}$`，当前 RC `mobile-only-v1-release-candidate-blocker-closeout` 是合法值，不得再用历史 `mobile-only-v1r4-` 前缀判断当前 wave。`app_git_sha`、`base_sha` 及已绑定的 implementation/validation SHA 必须是 40 位小写十六进制，`native_core_sha256` 必须是 64 位小写十六进制。implementation/validation 提交尚未产生时，Python 生成/治理验证阶段分别只允许精确占位符 `<CODE_CONTRACT_TEST_BUILD_SHA>` 和 `<EVIDENCE_DOCS_SHA>`；任意其他占位文本均 fail closed。Swift `MobileBuildIdentity` 可加载该 exact schema 供诊断，但运行时 `isUsable` 要求 implementation/validation 两个字段均已绑定为 40 位小写 SHA；包含任一占位符的 App 都不得进入 eligible processing session。
+
 ## iOS native dependency cache
 
-hosted macOS CI 的 cache key 同时绑定 runner architecture、`install_deps.sh` 和 dependency policy。cache miss 必须实际运行 native dependency build；不再把依赖缺失记为成功 skip。`ios_dependency_manifest.py` 对生成的全部 `Libraries/include` 与 `Libraries/lib` regular files记录 bytes/SHA-256，并记录仍保留在 build tree 中的第三方 Git HEAD/patch 状态。无论 fresh build 或 restore，都先逐文件验证 manifest；cache miss 在验证成功后、App link 前立即保存已验证 cache，避免后续 App 错误丢失完整依赖成果；随后执行 unsigned generic arm64 App compile/link。
+当前 iOS 构建把 device 与 simulator 视为两个不同的 native 平台，不再仅用 `arm64` 架构名判断兼容性：
+
+```text
+Libraries/iphoneos/        -> LC_BUILD_VERSION platform 2
+Libraries/iphonesimulator/ -> LC_BUILD_VERSION platform 7
+```
+
+`install_deps.sh` 必须显式传入 `--platform iphoneos` 或 `--platform iphonesimulator`；未知值和缺失值直接失败。每个平台拥有独立的第三方源码、CMake build tree、install prefix、manifest 和 Actions cache。Xcode target 的 headers、frameworks 和完整 native link input 均通过 `$(PLATFORM_NAME)` 指向对应 prefix；旧的平铺 `Libraries/include`/`Libraries/lib` 不在当前链接合同内。Simulator 固定输出 arm64 slice，工程同时固定 simulator `ARCHS=arm64`，使 hosted builder 的 CPU 架构不会改变 Apple build gate 的链接目标。
+
+hosted macOS CI 的两个 cache key 分别绑定平台、runner architecture、Xcode 版本、依赖脚本/policy/manifest 实现，以及 RTAB-Map 相关 CMake/corelib/utilite 输入树。cache miss 必须实际运行对应平台的完整 native dependency build；任一平台缺失都不能记为 skipped success。`ios_dependency_manifest.py` version 2 对该 prefix 下全部 `include`/`lib` regular files记录 bytes/SHA-256，并记录仍保留在 build tree 中的第三方 Git HEAD/patch 状态；同时直接解析 static archive、universal binary 和嵌套 VTK archive 中每个 Mach-O 对象的 `LC_BUILD_VERSION` 与 architecture。Device archive 出现在 simulator prefix、simulator archive 出现在 device prefix、缺失平台字段、存在无平台 Mach-O 对象、非 arm64 slice，或 CI 使用 legacy/unscoped prefix，都会 fail closed。无论 fresh build 或 restore，都先验证 manifest；cache miss 在验证成功后、App link 前保存对应 cache，随后分别执行 Debug simulator `clean build` 和 unsigned generic arm64 device `clean build`。
+
+SwiftPM 依赖由共享 `Package.resolved` 固定到完整 40 位 revision。CI 首先在空 package cache 中用 `-onlyUsePackageVersionsFromResolvedFile` 冷解析，然后在 project metadata、simulator clean build 和 device clean build 后逐次与 checkout 时的锁文件做字节比较；Xcode 只要重写 lock，即使解析或编译本身成功，Apple build gate 仍直接失败，禁止用复制旧 lock 的方式掩盖漂移。
+
+本机历史 `Libraries/` 仍可能保留早期 device-only 产物，但它不构成当前 simulator 验证证据。若尚未完成 `iphonesimulator` cold build，只能记录为“平台选路和合同测试通过、真实 simulator clean link 未执行”；不得用 `swiftc -parse`、缺依赖跳过、stub 或 device archive 代替 simulator build PASS。
 
 首次 hosted cold-cache run `30361769032` 验证了 Ubuntu clean native build，但在 iOS GTSAM 编译时暴露 Boost 1.88 需要 C++14 以后标准库别名、而生成工程仍使用旧标准的问题。依赖脚本现对 GTSAM 同时固定 `CMAKE_CXX_STANDARD=17` 与 `GTSAM_CXX_STANDARD=17`，要求标准且关闭 compiler extensions；该失败 run 是修复依据，不能记作成功证据，后续 run 必须重新完成 dependency manifest 和 App 全量链接。
 

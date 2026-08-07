@@ -51,7 +51,11 @@ import supermarket_staged_map as staged
 import offline_processing as offline
 import gpu_acceleration as gpu
 import merge_processing as merge
-from PriorMap.prior_map_schema import validate_package as validate_prior_map_package
+from PriorMap.prior_map_schema import (
+    PriorMapValidationError,
+    validate_business_identity,
+    validate_package as validate_prior_map_package,
+)
 from PriorMap.xlsx_to_prior_map import convert_workbook as convert_prior_map_workbook
 from PriorMap import offline_localization as localized
 from PriorMap.factor_graph_runner import find_factor_graph_binary
@@ -2953,6 +2957,14 @@ def start_prior_map_job(data: Dict[str, Any]) -> Job:
         raise RequestError("先验地图输出目录必须为空；源 Excel 不会被修改。")
     if not output.parent.is_dir():
         raise RequestError(f"先验地图输出目录的上级目录不存在：{output.parent}")
+    map_name = data.get("name")
+    if map_name is not None and not isinstance(map_name, str):
+        raise RequestError("地图 name 必须是字符串。")
+    store_id = data.get("store_id")
+    try:
+        validate_business_identity(store_id, map_name if map_name is not None else source.stem)
+    except PriorMapValidationError as exc:
+        raise RequestError(str(exc)) from exc
     job = STATE.add("prior_map", output, (str(source),))
 
     def worker() -> None:
@@ -2974,7 +2986,8 @@ def start_prior_map_job(data: Dict[str, Any]) -> Job:
             convert_prior_map_workbook(
                 source,
                 output,
-                str(data.get("name") or "").strip() or None,
+                map_name,
+                store_id,
             )
             STATE.update_progress(
                 job.identifier,

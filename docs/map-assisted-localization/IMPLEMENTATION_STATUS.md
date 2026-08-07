@@ -1,6 +1,12 @@
 # 地图辅助定位实现状态
 
-> 文档状态：**当前有效**。最后核对日期：2026-08-04。
+> 文档状态：**当前有效**。最后核对日期：2026-08-07。
+
+当前 Mobile-Only V1 RC 分支为 `mobile-only-v1-release-candidate-blocker-closeout`，基线为 `81b6dbb216e843d363fd0088f673076add78013f`。除 RC-B19/J-04 component identity 外，第二次独立全量审查的 RC-B01…RC-B03、RC-B05…RC-B28 已完成本轮代码和本地主机自动化闭包；J-04 仍需冻结 prior-independent final-link component policy，并完成 node snapshot C ABI 与 constraint/manual evidence schema 的 breaking migration。RC-B04 exact-SHA CI、RC-B29 Replay/FAR policy freeze、RC-B30 Apple clean build/Device Lab 也仍未关闭。当前回归证据为 PriorMap 166/166、Qualification 28/28、Map Studio 104/104、native 7,878 checks/0 failures；这些不替代真实 Apple link、LiDAR、热/内存/后台/provider 或现场精度证据。
+
+当前 RC 独立只读 diff review 已完成，状态为 **COMPLETED / BLOCKERS FOUND AND FIXED IN CURRENT DIFF**。本轮新增修复 committed RESCAN/Result 跨文件事务恢复、stale completed task error、RESCAN strict Bool/reason-disposition/EEXIST、Map quarantine 三个真实 `_exit` 崩溃窗口和 canonical integer、trace 超出 `Int64` 秒轴拒绝，以及 strict JSONL 每行 autorelease pool。规模证据包括 1,728,000 条 transition-storm trace 保留 172,801 条、300,000 条 finalization peak RSS 12,795,904 bytes、200,000 burst frames + 200,000 observations 全链路 peak RSS 670,662,656 bytes。以上均是未优化 macOS host developer evidence，不构成 target-device scale PASS。
+
+Mobile V1 产品路线固定为 Route A：Fast reduced graph 后至多一次 Full existing-graph optimization，仍失败即 `RESCAN_SESSION`。True sensor Deep 不属于 V1。当前状态保持 **REJECTED / NO-GO / developer smoke only**，不得声明 `DEVICE LAB TESTABLE`、`DEVICE LAB PASS`、`SAM FIELD PASS` 或 `PRODUCTION READY`。
 
 2026-08-02 的 Sam 真实扫描暴露了数据库位姿与 iOS prior-map 坐标契约不一致、reciprocal loop 被过严判为矛盾边、在线定位长期歧义和交互困难。现场证据、指标、根因、代码整改和同一优化数据库的只读回归结果见 [`SAM_SCAN_REPORT_2026-08-02.md`](SAM_SCAN_REPORT_2026-08-02.md)。修复后完整因子图已覆盖 4,442 个节点并收敛，测试草稿可查看；修复后的 iPhone 真机重扫和现场控制点验收仍未执行，不能据此标记生产通过。
 
@@ -165,5 +171,4 @@ trajectory with local time, tag finalization and the four-sheet XLSX workbook.
 Status words per module: IMPLEMENTED / UNIT TESTED / INTEGRATION TESTED (Swift
 host suites I/C/P/T/G/X plus the three-format `--import-suite`); NOT CI
 VERIFIED, NOT DEVICE SMOKE PASS, NOT SAM FIELD PASS, NOT PRODUCTION QUALIFIED.
-Deep Path (native RTAB-Map reprocess bridge) remains DESIGNED. Full details in
-`docs/mobile-only/`.
+True sensor Deep (sensor decode/reprocessing that reconstructs missing visual evidence) is outside Mobile V1 and is not a pending V1 implementation route. The compatible `deep_*` state names refer only to the single Full existing-graph optimization allowed by Route A. Full details are in `docs/mobile-only/`.

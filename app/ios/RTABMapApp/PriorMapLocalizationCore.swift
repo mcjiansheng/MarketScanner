@@ -144,6 +144,10 @@ struct PriorMapScanConfiguration: Codable {
     let priorMapId: String?
     let priorMapSha256: String?
     let floorId: String?
+    /// Business identity committed by the Mobile-Only scan setup. Prior-map
+    /// capture is not formally startable without it because finalized
+    /// metadata and later XLSX/result processing validate the store fail-closed.
+    let storeID: String?
     let initialMapPose: PriorMapPose2D?
 
     static let freeMapping = PriorMapScanConfiguration(
@@ -153,6 +157,7 @@ struct PriorMapScanConfiguration: Codable {
         priorMapId: nil,
         priorMapSha256: nil,
         floorId: nil,
+        storeID: nil,
         initialMapPose: nil)
 
     var isReadyToStart: Bool {
@@ -164,6 +169,7 @@ struct PriorMapScanConfiguration: Codable {
                 && !(priorMapId ?? "").isEmpty
                 && !(priorMapSha256 ?? "").isEmpty
                 && !(floorId ?? "").isEmpty
+                && !(storeID ?? "").isEmpty
                 && initialMapPose != nil
         }
     }
@@ -175,6 +181,7 @@ struct PriorMapScanConfiguration: Codable {
         case priorMapId
         case priorMapSha256
         case floorId
+        case storeID = "storeId"
         case initialMapPose
     }
 
@@ -185,6 +192,7 @@ struct PriorMapScanConfiguration: Codable {
         priorMapId: String?,
         priorMapSha256: String?,
         floorId: String?,
+        storeID: String? = nil,
         initialMapPose: PriorMapPose2D?
     ) {
         self.formatVersion = formatVersion
@@ -193,6 +201,7 @@ struct PriorMapScanConfiguration: Codable {
         self.priorMapId = priorMapId
         self.priorMapSha256 = priorMapSha256
         self.floorId = floorId
+        self.storeID = storeID
         self.initialMapPose = initialMapPose
     }
 }

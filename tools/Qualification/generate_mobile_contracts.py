@@ -34,6 +34,10 @@ PYTHON_FILE = ROOT / "tools" / "PriorMap" / "generated_mobile_evidence_contracts
 # Policy fields per evidence file:
 #   max_file_bytes      hard file-size gate (pre-read)
 #   max_records         hard record-count gate
+#   qualification_max_records
+#                       qualified product ceiling (may be below hard cap)
+#   qualification_record_rate_hz
+#                       evidence rate used to derive that ceiling
 #   max_record_bytes    hard single-record gate
 #   max_nesting_depth   JSON nesting gate (strict parser)
 #   final_newline       file must end with "\\n"
@@ -55,9 +59,9 @@ CONTRACT = {
     },
     "evidence_files": {
         "metadata.json": {
-            "max_file_bytes": 16 * 1024 * 1024,
+            "max_file_bytes": 1024 * 1024,
             "max_records": 1,
-            "max_record_bytes": 16 * 1024 * 1024,
+            "max_record_bytes": 1024 * 1024,
             "max_nesting_depth": 8,
             "final_newline": False,
             "blank_line_policy": "n_a",
@@ -70,11 +74,19 @@ CONTRACT = {
                                  "tagObservationBurstCount",
                                  "tagObservationBurstLastID",
                                  "tagObservationBurstComplete",
-                                 "localizationTraceRecordCount"],
+                                 "captureHealth.localizationTraceRecordCount",
+                                 "captureHealth.localizationConstraintRecordCount",
+                                 "captureHealth.manualLocalizationEventCount",
+                                 "captureHealth.localizationRecoveryEventCount"],
         },
         "localization_trace.jsonl": {
             "max_file_bytes": 512 * 1024 * 1024,
             "max_records": 2000000,
+            # Product qualification is 48 hours at a maximum formal trace
+            # rate of 10 Hz. The larger max_records value remains a parser
+            # safety cap; it must never be presented as a qualified scale.
+            "qualification_max_records": 48 * 3600 * 10,
+            "qualification_record_rate_hz": 10,
             "max_record_bytes": 1024 * 1024,
             "max_nesting_depth": 8,
             "final_newline": True,
@@ -85,10 +97,28 @@ CONTRACT = {
                                 "priorMapSha256", "floorId"],
             "watermark_fields": ["captureHealth.localizationTraceRecordCount"],
         },
-        "localization_constraints.jsonl": {
-            "max_file_bytes": 64 * 1024 * 1024,
-            "max_records": 100000,
+        "scan_events.jsonl": {
+            "max_file_bytes": 256 * 1024 * 1024,
+            "max_records": 1000000,
             "max_record_bytes": 1024 * 1024,
+            "max_nesting_depth": 8,
+            "final_newline": True,
+            "blank_line_policy": "reject",
+            "strict_bool": True,
+            "strict_integer": True,
+            "identity_fields": ["trackingSessionId"],
+            "watermark_fields": [],
+        },
+        "localization_constraints.jsonl": {
+            # 48 qualified hours × 2 formal decisions/s = 345,600 rows.
+            # Current encoded records are normally below 2 KiB; 768 MiB
+            # retains >1 KiB/row safety headroom without allowing an
+            # unbounded evidence log. 64 KiB is a hostile single-row cap.
+            "max_file_bytes": 768 * 1024 * 1024,
+            "max_records": 400000,
+            "qualification_max_records": 48 * 3600 * 2,
+            "qualification_record_rate_hz": 2,
+            "max_record_bytes": 64 * 1024,
             "max_nesting_depth": 8,
             "final_newline": True,
             "blank_line_policy": "reject",
@@ -96,7 +126,9 @@ CONTRACT = {
             "strict_integer": True,
             "identity_fields": ["priorMapId", "priorMapSha256",
                                 "trackingSessionId", "floorId"],
-            "watermark_fields": [],
+            "watermark_fields": [
+                "captureHealth.localizationConstraintRecordCount"
+            ],
         },
         "manual_localization_events.jsonl": {
             "max_file_bytes": 64 * 1024 * 1024,
@@ -109,7 +141,9 @@ CONTRACT = {
             "strict_integer": True,
             "identity_fields": ["prior_map_id", "prior_map_sha256",
                                 "tracking_session_id", "floor_id"],
-            "watermark_fields": [],
+            "watermark_fields": [
+                "captureHealth.manualLocalizationEventCount"
+            ],
         },
         "clock_correlations.jsonl": {
             "max_file_bytes": 256 * 1024 * 1024,
@@ -169,9 +203,9 @@ CONTRACT = {
         },
         "native_graph": {
             "max_raw_nodes": 200000,
-            "max_skeleton_nodes": 200000,
-            "max_factors": 400000,
-            "max_priors": 100000,
+            "max_skeleton_nodes": 4096,
+            "max_factors": 4096,
+            "max_priors": 4096,
             "max_trajectory_rows": 200000,
         },
     },

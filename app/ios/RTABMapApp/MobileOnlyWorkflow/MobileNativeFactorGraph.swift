@@ -23,11 +23,13 @@ enum MobileNativeFactorGraph {
     /// one row per raw node. The V1R4 generic 5,000,000 ceiling would
     /// let an anomalous native outcome allocate tens of GiB before the
     /// resource governor could react.
-    static let maximumTrajectoryRows: Int64 = 200_000
-    static let maximumSkeletonNodes: Int64 = 200_000
-    static let maximumRawNodes: Int64 = 200_000
-    static let maximumFactors: Int64 = 400_000
-    static let maximumPriors: Int64 = 100_000
+    static let maximumTrajectoryRows = MobileNativeOutcomeContract
+        .maximumTrajectoryRows
+    static let maximumSkeletonNodes = MobileNativeOutcomeContract
+        .maximumSkeletonNodes
+    static let maximumRawNodes = MobileNativeOutcomeContract.maximumRawNodes
+    static let maximumFactors = MobileNativeOutcomeContract.maximumFactors
+    static let maximumPriors = MobileNativeOutcomeContract.maximumPriors
 
     static func wireIntoGateway() {
         MobileNativeFactorGraphGateway.runFastImplementation = { request, isCancelled in
@@ -60,8 +62,11 @@ enum MobileNativeFactorGraph {
             }
             var poses: [Int64: SE2Transform] = [:]
             for node in readout.nodes {
-                poses[node.id] = MobileGraphReader.projectToSE2(
-                    poseRowMajor3x4: node.poseRowMajor3x4)
+                guard let pose = try? MobileGraphReader.projectToSE2(
+                    poseRowMajor3x4: node.poseRowMajor3x4) else {
+                    return [:]
+                }
+                poses[node.id] = pose
             }
             return poses
         }
@@ -93,11 +98,34 @@ enum MobileNativeFactorGraph {
         // buffer pointer is only used inside the nested C call below.
         // V1R5 §10.1 (review H-16): product-derived bounds — an
         // oversized input must fail before any native allocation.
-        guard Int64(request.absolutePriors.count) <= maximumPriors,
-              Int64(request.tagNodeIDs.count) <= maximumRawNodes else {
+        try MobileNativeOutcomeContract.validateInputCounts(
+            priorCount: request.absolutePriors.count,
+            tagNodeCount: request.tagNodeIDs.count)
+        guard request.projectionPolicyVersion == 1,
+              request.maxWallSeconds.isFinite,
+              request.maxWallSeconds > 0,
+              !request.priorMapID.isEmpty,
+              !request.trackingSessionID.isEmpty,
+              Self.isLowercaseSHA256(request.priorMapSHA256) else {
             throw MobileNativeFactorGraphError.invalidOutcome(
-                "input limits exceeded: priors=\(request.absolutePriors.count) "
-                + "tagNodes=\(request.tagNodeIDs.count)")
+                "input projection/time/identity contract invalid")
+        }
+        var seenTagNodeIDs = Set<Int64>()
+        guard request.tagNodeIDs.allSatisfy({
+            $0 > 0 && seenTagNodeIDs.insert($0).inserted
+        }) else {
+            throw MobileNativeFactorGraphError.invalidOutcome(
+                "tag node IDs must be positive and unique")
+        }
+        guard request.absolutePriors.allSatisfy({ prior in
+            prior.nodeID > 0 && prior.mapXM.isFinite && prior.mapYM.isFinite &&
+                prior.mapYawRad.isFinite && prior.information3x3.count == 9 &&
+                prior.information3x3.allSatisfy({ $0.isFinite }) &&
+                (prior.kind == 0 || prior.kind == 1 || prior.kind == 2) &&
+                prior.episodeID >= 0
+        }) else {
+            throw MobileNativeFactorGraphError.invalidOutcome(
+                "absolute prior shape/finite/identity contract invalid")
         }
         var cPriors: [MSAbsolutePriorC] = request.absolutePriors.map { prior in
             var c = MSAbsolutePriorC(
@@ -108,7 +136,7 @@ enum MobileNativeFactorGraph {
                 information_3x3: (0, 0, 0, 0, 0, 0, 0, 0, 0),
                 kind: prior.kind,
                 episode_id: prior.episodeID)
-            for (index, value) in prior.information3x3.prefix(9).enumerated() {
+            for (index, value) in prior.information3x3.enumerated() {
                 withUnsafeMutablePointer(to: &c.information_3x3) { tuplePtr in
                     tuplePtr.withMemoryRebound(to: Double.self, capacity: 9) { raw in
                         raw[index] = value
@@ -149,7 +177,12 @@ enum MobileNativeFactorGraph {
                             ? MSFactorGraphRunFullGraph(&cRequest)
                             : MSFactorGraphRunFast(&cRequest)
                         defer { MSFactorGraphFree(&cOutcome) }
-                        return try Self.convert(cOutcome, context: context)
+                        return try Self.convert(
+                            cOutcome,
+                            context: context,
+                            request: request,
+                            expectedPath: fullGraph
+                                ? "full_graph_optimization" : "fast")
                     }}
                     }
                 }
@@ -163,63 +196,50 @@ enum MobileNativeFactorGraph {
     /// trusted; unknown ABI values are errors, never silent downgrades.
     private static func convert(
         _ cOutcome: MSFactorGraphOutcomeC,
-        context: RunContext
+        context: RunContext,
+        request: MobileNativeGraphRequest,
+        expectedPath: String
     ) throws -> MobileNativeGraphOutcome {
         if context.cancelledFlag {
             throw MobileOnlyWorkflowError.cancelled
         }
-        if let error = cOutcome.error {
-            throw MobileNativeFactorGraphError.nativeFailed(String(cString: error))
-        }
-
-        // §10.4: an unknown disposition is an ABI error, never a silent
-        // downgrade to a generic failure.
-        guard let disposition = MobileGraphDisposition(rawValue: cOutcome.disposition) else {
+        guard Int64(cOutcome.abi_version)
+                == MobileNativeQualityReport.expectedABIVersion else {
             throw MobileNativeFactorGraphError.invalidOutcome(
-                "unknown ABI disposition \(cOutcome.disposition)")
+                "runtime ABI version mismatch: \(cOutcome.abi_version)")
         }
+        // Disposition is authoritative and is parsed BEFORE the optional
+        // error string. RESOURCE_REQUIRED often carries a diagnostic error
+        // and must remain a resumable resource pause, while an unknown ABI
+        // disposition is invalid even if an error string is present.
+        let disposition = try MobileNativeOutcomeContract.disposition(
+            rawValue: cOutcome.disposition,
+            errorMessage: cOutcome.error.map { String(cString: $0) })
 
         let count = cOutcome.count
         guard count >= 0, count <= maximumTrajectoryRows else {
             throw MobileNativeFactorGraphError.invalidOutcome(
                 "trajectory row count out of bounds: \(count)")
         }
-        if count > 0 && cOutcome.rows == nil {
+        if (count == 0) != (cOutcome.rows == nil) {
             throw MobileNativeFactorGraphError.invalidOutcome(
-                "trajectory rows pointer is NULL with count > 0")
+                "trajectory rows pointer/count mismatch")
         }
         let skeletonCount = cOutcome.skeleton_count
         guard skeletonCount >= 0, skeletonCount <= maximumSkeletonNodes else {
             throw MobileNativeFactorGraphError.invalidOutcome(
                 "skeleton count out of bounds: \(skeletonCount)")
         }
-        if skeletonCount > 0 &&
-            (cOutcome.skeleton_ids == nil || cOutcome.skeleton_x == nil ||
-             cOutcome.skeleton_y == nil || cOutcome.skeleton_yaw == nil) {
+        let allSkeletonPointersNil = cOutcome.skeleton_ids == nil &&
+            cOutcome.skeleton_x == nil && cOutcome.skeleton_y == nil &&
+            cOutcome.skeleton_yaw == nil
+        let allSkeletonPointersPresent = cOutcome.skeleton_ids != nil &&
+            cOutcome.skeleton_x != nil && cOutcome.skeleton_y != nil &&
+            cOutcome.skeleton_yaw != nil
+        if (skeletonCount == 0 && !allSkeletonPointersNil) ||
+            (skeletonCount > 0 && !allSkeletonPointersPresent) {
             throw MobileNativeFactorGraphError.invalidOutcome(
-                "skeleton pointers NULL with count > 0")
-        }
-
-        let qualityJSON: String
-        if let json = cOutcome.quality_json {
-            let candidate = String(cString: json)
-            // The quality report must be valid UTF-8 JSON (§9.2 / §10.4).
-            guard let data = candidate.data(using: .utf8),
-                  let parsed = try? JSONSerialization.jsonObject(with: data),
-                  parsed is [String: Any] else {
-                throw MobileNativeFactorGraphError.invalidOutcome(
-                    "quality JSON is not a well-formed object")
-            }
-            qualityJSON = candidate
-        } else if disposition == .resourceRequired {
-            // H-06 native OOM path: the core cannot materialize the
-            // diagnostics when allocation itself failed — the
-            // disposition is the signal, and it is preserved.
-            qualityJSON = ""
-        } else {
-            // §10.4: the quality JSON must exist.
-            throw MobileNativeFactorGraphError.invalidOutcome(
-                "quality JSON is missing")
+                "skeleton pointers/count mismatch")
         }
 
         var trajectory: [MobileNativeTrajectoryRow] = []
@@ -227,6 +247,7 @@ enum MobileNativeFactorGraph {
         var seenIDs = Set<Int64>()
         // §10.4: stamps must be monotonic within each component.
         var lastStampByComponent: [Int64: Double] = [:]
+        var lastGlobalStamp: Double?
         if count > 0, let rows = cOutcome.rows {
             for index in 0..<Int(count) {
                 let row = rows[index]
@@ -267,7 +288,12 @@ enum MobileNativeFactorGraph {
                     throw MobileNativeFactorGraphError.invalidOutcome(
                         "non-monotonic stamp at id \(row.id) in component \(row.component_id)")
                 }
+                if let previous = lastGlobalStamp, row.stamp < previous {
+                    throw MobileNativeFactorGraphError.invalidOutcome(
+                        "globally non-monotonic stamp at id \(row.id)")
+                }
                 lastStampByComponent[row.component_id] = row.stamp
+                lastGlobalStamp = row.stamp
                 trajectory.append(MobileNativeTrajectoryRow(
                     id: row.id,
                     stamp: row.stamp,
@@ -309,11 +335,91 @@ enum MobileNativeFactorGraph {
             }
         }
 
+        guard cOutcome.factor_count >= 0,
+              cOutcome.factor_count <= maximumFactors,
+              cOutcome.publish_count >= 0,
+              cOutcome.publish_count <= count else {
+            throw MobileNativeFactorGraphError.invalidOutcome(
+                "native factor/publish counts are out of bounds")
+        }
+        let actualPublishCount = trajectory.filter { $0.publishEligible }.count
+        guard cOutcome.publish_count == Int64(actualPublishCount) else {
+            throw MobileNativeFactorGraphError.invalidOutcome(
+                "native publish_count does not match C trajectory rows")
+        }
+
+        let qualityJSON = try boundedNativeUTF8(
+            cOutcome.quality_json,
+            byteCount: cOutcome.quality_json_size,
+            maximumBytes: MobileNativeOutcomeContract.maximumQualityJSONBytes,
+            name: "quality JSON")
+        let graphInputSHA256 = try boundedNativeUTF8(
+            cOutcome.graph_input_sha256,
+            byteCount: cOutcome.graph_input_sha256_size,
+            maximumBytes: 64,
+            name: "graph_input_sha256")
+        let factorSetSHA256 = try boundedNativeUTF8(
+            cOutcome.factor_set_sha256,
+            byteCount: cOutcome.factor_set_sha256_size,
+            maximumBytes: 64,
+            name: "factor_set_sha256")
+        guard isLowercaseSHA256(graphInputSHA256),
+              isLowercaseSHA256(factorSetSHA256) else {
+            throw MobileNativeFactorGraphError.invalidOutcome(
+                "native graph/factor SHA is malformed")
+        }
+        let report = try MobileNativeQualityReport.parse(
+            qualityJSON: qualityJSON)
+        try report.validate(
+            request: request,
+            expectedPath: expectedPath,
+            disposition: disposition,
+            trajectoryCount: trajectory.count,
+            skeletonCount: skeletonIDs.count,
+            publishCount: actualPublishCount,
+            cABIVersion: Int64(cOutcome.abi_version),
+            cFactorCount: cOutcome.factor_count,
+            cGraphInputSHA256: graphInputSHA256,
+            cFactorSetSHA256: factorSetSHA256)
+
         return MobileNativeGraphOutcome(
             disposition: disposition,
             qualityJSON: qualityJSON,
             trajectory: trajectory,
             skeletonIDs: skeletonIDs)
+    }
+
+    private static func boundedNativeUTF8(
+        _ pointer: UnsafePointer<CChar>?,
+        byteCount: Int64,
+        maximumBytes: Int,
+        name: String
+    ) throws -> String {
+        guard byteCount > 0,
+              byteCount <= Int64(maximumBytes),
+              let pointer else {
+            throw MobileNativeFactorGraphError.invalidOutcome(
+                "\(name) pointer/size mismatch")
+        }
+        let count = Int(byteCount)
+        guard pointer[count] == 0 else {
+            throw MobileNativeFactorGraphError.invalidOutcome(
+                "\(name) is not NUL terminated at its declared size")
+        }
+        let data = Data(bytes: pointer, count: count)
+        guard let value = String(data: data, encoding: .utf8),
+              !value.isEmpty else {
+            throw MobileNativeFactorGraphError.invalidOutcome(
+                "\(name) is not non-empty UTF-8")
+        }
+        return value
+    }
+
+    private static func isLowercaseSHA256(_ value: String) -> Bool {
+        guard value.utf8.count == 64 else { return false }
+        return value.utf8.allSatisfy {
+            ($0 >= 48 && $0 <= 57) || ($0 >= 97 && $0 <= 102)
+        }
     }
 }
 

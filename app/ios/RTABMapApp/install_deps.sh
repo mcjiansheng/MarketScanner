@@ -2,14 +2,65 @@
 
 set -euxo pipefail
 
-# Tested on Apple Silicon Mac, with cmake 4.0.2, XCode 16.3.
+# Tested on Apple Silicon Mac. Device and simulator artifacts are intentionally
+# built into different prefixes because arm64 alone does not identify the
+# Mach-O platform accepted by Apple's linker.
 
-mkdir -p Libraries
-cd Libraries
-pwd=$(pwd)
-prefix=$pwd
-sysroot=iphoneos
-#sysroot=iphonesimulator
+usage()
+{
+  echo "Usage: $0 --platform iphoneos|iphonesimulator" >&2
+}
+
+platform=""
+while [ "$#" -gt 0 ]
+do
+  case "$1" in
+    --platform)
+      if [ "$#" -lt 2 ]
+      then
+        usage
+        exit 2
+      fi
+      platform=$2
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "Unknown install_deps.sh argument: $1" >&2
+      usage
+      exit 2
+      ;;
+  esac
+done
+
+case "$platform" in
+  iphoneos)
+    vtk_device_architectures="arm64"
+    vtk_simulator_architectures=""
+    ;;
+  iphonesimulator)
+    vtk_device_architectures=""
+    vtk_simulator_architectures="arm64"
+    ;;
+  *)
+    echo "Unsupported or missing iOS dependency platform: ${platform:-<missing>}" >&2
+    usage
+    exit 2
+    ;;
+esac
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+repo_root=$(CDPATH= cd -- "$script_dir/../../.." && pwd -P)
+libraries_root="$script_dir/Libraries"
+prefix="$libraries_root/$platform"
+work_root="$prefix"
+sysroot="$platform"
+
+mkdir -p "$work_root"
+cd "$work_root"
 
 clone_with_retry()
 {
@@ -23,7 +74,7 @@ clone_with_retry()
   local attempt temporary
   for attempt in 1 2 3
   do
-    temporary=$(mktemp -d "$pwd/.clone-${destination}.XXXXXX")
+    temporary=$(mktemp -d "$work_root/.clone-${destination}.XXXXXX")
     if git clone "$@" "$temporary/repository"
     then
       mv "$temporary/repository" "$destination"
@@ -79,7 +130,7 @@ cd build
 cmake -G Xcode -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_SYSROOT=$sysroot -DBUILD_SHARED_LIBS=OFF -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_DEPLOYMENT_TARGET=12.0 -DCMAKE_INSTALL_PREFIX=$prefix -DBOOST_INCOMPATIBLE_LIBRARIES="process;context;coroutine;fiber;fiber_numa;log_setup;log;cobalt" -DBOOST_IOSTREAMS_ENABLE_ZLIB=OFF -DBOOST_IOSTREAMS_ENABLE_BZIP2=OFF ..
 cmake --build . --config Release
 cmake --build . --config Release --target install
-cd $pwd
+cd "$work_root"
 #rm -r boost-1.88.0-cmake.tar.gz boost-1.88.0
 fi
 
@@ -98,7 +149,7 @@ cd build
 cmake -G Xcode -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_SYSROOT=$sysroot -DBUILD_SHARED_LIBS=OFF -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_DEPLOYMENT_TARGET=12.0 -DCMAKE_INSTALL_PREFIX=$prefix ..
 cmake --build . --config Release
 cmake --build . --config Release --target install
-cd $pwd
+cd "$work_root"
 #rm -r 3.4.0.tar.gz eigen-3.4.0
 fi
 
@@ -124,7 +175,7 @@ cd build
 cmake -G Xcode -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_SYSROOT=$sysroot -DBUILD_SHARED_LIBS=OFF -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_DEPLOYMENT_TARGET=12.0 -DCMAKE_INSTALL_PREFIX=$prefix ..
 cmake --build . --config Release -- CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED="NO" CODE_SIGN_ENTITLEMENTS=""  CODE_SIGNING_ALLOWED="NO"
 cmake --build . --config Release --target install -- CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED="NO" CODE_SIGN_ENTITLEMENTS=""  CODE_SIGNING_ALLOWED="NO"
-cd $pwd
+cd "$work_root"
 #rm -r lz4
 fi
 
@@ -147,7 +198,7 @@ cd build
 cmake -G Xcode -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_SYSROOT=$sysroot -DBUILD_SHARED_LIBS=OFF -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_DEPLOYMENT_TARGET=12.0 -DCMAKE_INSTALL_PREFIX=$prefix -DBUILD_PYTHON_BINDINGS=OFF -DBUILD_MATLAB_BINDINGS=OFF -DBUILD_C_BINDINGS=OFF -DBUILD_EXAMPLES=OFF -DBUILD_TESTS=OFF -DBUILD_DOC=OFF -DUSE_OPENMP=OFF -DLZ4_DIR=$prefix/lib/lz4  ..
 cmake --build . --config Release -- CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED="NO" CODE_SIGN_ENTITLEMENTS=""  CODE_SIGNING_ALLOWED="NO"
 cmake --build . --config Release --target install -- CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED="NO" CODE_SIGN_ENTITLEMENTS=""  CODE_SIGNING_ALLOWED="NO"
-cd $pwd
+cd "$work_root"
 #rm -r flann
 fi
 
@@ -170,7 +221,7 @@ cd build
 cmake -G Xcode -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_SYSROOT=$sysroot -DBUILD_SHARED_LIBS=OFF -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_STANDARD=17 -DGTSAM_CXX_STANDARD=17 -DCMAKE_CXX_STANDARD_REQUIRED=ON -DCMAKE_CXX_EXTENSIONS=OFF -DCMAKE_OSX_DEPLOYMENT_TARGET=12.0 -DCMAKE_INSTALL_PREFIX=$prefix -DMETIS_SHARED=OFF -DGTSAM_BUILD_STATIC_LIBRARY=ON -DGTSAM_BUILD_TESTS=OFF -DGTSAM_BUILD_EXAMPLES_ALWAYS=OFF -DGTSAM_USE_SYSTEM_EIGEN=ON -DGTSAM_WRAP_SERIALIZATION=OFF -DGTSAM_BUILD_WRAP=OFF -DGTSAM_INSTALL_CPPUNITLITE=OFF -DCMAKE_FIND_ROOT_PATH=$prefix ..
 cmake --build . --config Release -- CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED="NO" CODE_SIGN_ENTITLEMENTS=""  CODE_SIGNING_ALLOWED="NO"
 cmake --build . --config Release --target install -- CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED="NO" CODE_SIGN_ENTITLEMENTS=""  CODE_SIGNING_ALLOWED="NO"
-cd $pwd
+cd "$work_root"
 #rm -rf gtsam
 fi
 
@@ -187,7 +238,7 @@ cd build
 cmake -G Xcode -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_SYSROOT=$sysroot -DBUILD_SHARED_LIBS=OFF -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_DEPLOYMENT_TARGET=12.0 -DCMAKE_INSTALL_PREFIX=$prefix -DCMAKE_FIND_ROOT_PATH=$prefix -DSUITESPARSE_USE_OPENMP=OFF -DSUITESPARSE_ENABLE_PROJECTS="cholmod;cxsparse;spqr"  ..
 cmake --build . --config Release -- CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED="NO" CODE_SIGN_ENTITLEMENTS=""  CODE_SIGNING_ALLOWED="NO"
 cmake --build . --config Release --target install -- CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED="NO" CODE_SIGN_ENTITLEMENTS=""  CODE_SIGNING_ALLOWED="NO"
-cd $pwd
+cd "$work_root"
 fi
 
 # g2o
@@ -210,7 +261,7 @@ cd build
 cmake -G Xcode -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_SYSROOT=$sysroot -DBUILD_SHARED_LIBS=OFF -DCMAKE_BUILD_TYPE=Release "-DCMAKE_CXX_FLAGS=-include TargetConditionals.h" -DCMAKE_OSX_DEPLOYMENT_TARGET=12.0 -DCMAKE_INSTALL_PREFIX=$prefix -DBUILD_LGPL_SHARED_LIBS=OFF -DG2O_BUILD_APPS=OFF -DG2O_BUILD_EXAMPLES=OFF -DCMAKE_FIND_ROOT_PATH=$prefix ..
 cmake --build . --config Release -- CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED="NO" CODE_SIGN_ENTITLEMENTS=""  CODE_SIGNING_ALLOWED="NO"
 cmake --build . --config Release --target install -- CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED="NO" CODE_SIGN_ENTITLEMENTS=""  CODE_SIGNING_ALLOWED="NO"
-cd $pwd
+cd "$work_root"
 #rm -rf g2o
 fi
 
@@ -226,10 +277,9 @@ else
 fi
 mkdir -p build
 cd build
-cmake -DBUILD_SHARED_LIBS=OFF -DCMAKE_BUILD_TYPE=Release -DCMAKE_FRAMEWORK_INSTALL_PREFIX=$prefix/lib -DIOS_DEPLOYMENT_TARGET=12.0 -DIOS_DEVICE_ARCHITECTURES="arm64" -DIOS_SIMULATOR_ARCHITECTURES="" -DBUILD_EXAMPLES=OFF -DBUILD_TESTING=OFF -DVTK_IOS_BUILD=ON -DModule_vtkFiltersModeling=ON ..
-# For iphonesimulator: add -DIOS_DEVICE_ARCHITECTURES=""
+cmake -DBUILD_SHARED_LIBS=OFF -DCMAKE_BUILD_TYPE=Release -DCMAKE_FRAMEWORK_INSTALL_PREFIX=$prefix/lib -DIOS_DEPLOYMENT_TARGET=12.0 -DIOS_DEVICE_ARCHITECTURES="$vtk_device_architectures" -DIOS_SIMULATOR_ARCHITECTURES="$vtk_simulator_architectures" -DBUILD_EXAMPLES=OFF -DBUILD_TESTING=OFF -DVTK_IOS_BUILD=ON -DModule_vtkFiltersModeling=ON ..
 cmake --build . --config Release
-cd $pwd
+cd "$work_root"
 #rm -rf VTK
 fi
 
@@ -256,7 +306,7 @@ cd build
 cmake -G Xcode -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_SYSROOT=$sysroot -DBUILD_SHARED_LIBS=OFF -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_DEPLOYMENT_TARGET=12.0 -DCMAKE_INSTALL_PREFIX=$prefix -DBUILD_apps=OFF -DBUILD_examples=OFF -DBUILD_tools=OFF -DBUILD_visualization=OFF -DBUILD_tracking=OFF -DBUILD_people=OFF -DBUILD_recognition=OFF -DBUILD_global_tests=OFF -DWITH_QT=OFF -DWITH_OPENGL=OFF -DWITH_OPENMP=OFF -DWITH_VTK=ON -DPCL_FLANN_REQUIRED_TYPE=STATIC -DPCL_SHARED_LIBS=OFF -DPCL_ENABLE_SSE=OFF -DCMAKE_FIND_ROOT_PATH=$prefix ..
 cmake --build . --config Release
 cmake --build . --config Release --target install
-cd $pwd
+cd "$work_root"
 #rm -rf pcl
 fi
 
@@ -267,7 +317,7 @@ if [ ! -e opencv_contrib ]
 then
   clone_with_retry opencv_contrib --branch 4.11.0 https://github.com/opencv/opencv_contrib.git
 fi
-cd $pwd
+cd "$work_root"
 if [ ! -e opencv ]
 then
   clone_with_retry opencv --branch 4.11.0 https://github.com/opencv/opencv.git
@@ -278,7 +328,7 @@ cd build
 cmake -G Xcode -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_SYSROOT=$sysroot -DBUILD_SHARED_LIBS=OFF -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_DEPLOYMENT_TARGET=12.0 -DCMAKE_INSTALL_PREFIX=$prefix -DOPENCV_EXTRA_MODULES_PATH=$prefix/opencv_contrib/modules -DBUILD_TESTS=OFF -DBUILD_PERF_TESTS=OFF -DWITH_CUDA=OFF -DWITH_WEBP=OFF -DWITH_OPENEXR=OFF -DBUILD_opencv_apps=OFF -DBUILD_opencv_xobjdetect=OFF -DBUILD_opencv_stereo=OFF -DOPENCV_ENABLE_NONFREE=ON ..
 cmake --build . --config Release
 cmake --build . --config Release --target install
-cd $pwd
+cd "$work_root"
 #rm -rf opencv opencv_contrib
 fi
 
@@ -298,7 +348,7 @@ cd build
 cmake -G Xcode -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_SYSROOT=$sysroot -DBUILD_SHARED_LIBS=OFF -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_DEPLOYMENT_TARGET=12.0 -DCMAKE_INSTALL_PREFIX=$prefix -DCMAKE_FIND_ROOT_PATH=$prefix -DBUILD_STATIC=ON ..
 cmake --build . --config Release -- CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED="NO" CODE_SIGN_ENTITLEMENTS=""  CODE_SIGNING_ALLOWED="NO"
 cmake --build . --config Release --target install -- CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED="NO" CODE_SIGN_ENTITLEMENTS=""  CODE_SIGNING_ALLOWED="NO"
-cd $pwd
+cd "$work_root"
 fi
 
 # LAS
@@ -317,15 +367,13 @@ cd build
 cmake -G Xcode -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_SYSROOT=$sysroot -DBUILD_SHARED_LIBS=OFF -DCMAKE_BUILD_TYPE=Release -DCMAKE_POLICY_VERSION_MINIMUM=3.5 -DCMAKE_OSX_DEPLOYMENT_TARGET=12.0 -DCMAKE_INSTALL_PREFIX=$prefix -DCMAKE_FIND_ROOT_PATH=$prefix -DWITH_UTILITIES=OFF -DWITH_TESTS=OFF -DWITH_GEOTIFF=OFF -DWITH_LASZIP=ON -DWITH_STATIC_LASZIP=ON ..
 cmake --build . --config Release -- CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED="NO" CODE_SIGN_ENTITLEMENTS=""  CODE_SIGNING_ALLOWED="NO"
 cmake --build . --config Release --target install -- CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED="NO" CODE_SIGN_ENTITLEMENTS=""  CODE_SIGNING_ALLOWED="NO"
-cd $pwd
+cd "$work_root"
 fi
 
-mkdir -p rtabmap
-cd rtabmap
-cmake -DANDROID_PREBUILD=ON ../../../../..
-cmake --build . --config Release
-mkdir -p ios
-cd ios
-cmake -G Xcode -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_SYSROOT=$sysroot -DBUILD_SHARED_LIBS=OFF -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_DEPLOYMENT_TARGET=12.0 -DCMAKE_INSTALL_PREFIX=$prefix -DCMAKE_FIND_ROOT_PATH=$prefix -DWITH_QT=OFF -DBUILD_APP=OFF -DBUILD_TOOLS=OFF -DWITH_TORO=OFF -DWITH_VERTIGO=OFF -DWITH_MADGWICK=OFF -DWITH_ORB_OCTREE=ON  -DBUILD_EXAMPLES=OFF -DWITH_LIBLAS=ON -DWITH_OPENGV=OFF ../../../../../..
-cmake --build . --config Release
-cmake --build . --config Release --target install
+rtabmap_prebuild="$work_root/rtabmap/prebuild"
+rtabmap_ios_build="$work_root/rtabmap/ios"
+cmake -S "$repo_root" -B "$rtabmap_prebuild" -DANDROID_PREBUILD=ON
+cmake --build "$rtabmap_prebuild" --config Release
+cmake -S "$repo_root" -B "$rtabmap_ios_build" -G Xcode -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_SYSROOT=$sysroot -DBUILD_SHARED_LIBS=OFF -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_DEPLOYMENT_TARGET=12.0 -DCMAKE_INSTALL_PREFIX=$prefix -DCMAKE_FIND_ROOT_PATH=$prefix -DWITH_QT=OFF -DBUILD_APP=OFF -DBUILD_TOOLS=OFF -DWITH_TORO=OFF -DWITH_VERTIGO=OFF -DWITH_MADGWICK=OFF -DWITH_ORB_OCTREE=ON -DBUILD_EXAMPLES=OFF -DWITH_LIBLAS=ON -DWITH_OPENGV=OFF
+cmake --build "$rtabmap_ios_build" --config Release
+cmake --build "$rtabmap_ios_build" --config Release --target install

@@ -720,7 +720,11 @@ final class MobileOnlyWorkflowCoordinator {
             if (error as? MobileOnlyWorkflowError) == .cancelled {
                 self.transition(to: .cancelled)
             } else if let workflowError = error as? MobileOnlyWorkflowError {
-                self.fail(with: workflowError)
+                if case .rescanSessionRequired = workflowError {
+                    self.markRescanRequired(with: workflowError)
+                } else {
+                    self.fail(with: workflowError)
+                }
                 self.notifyProcessing(.failure(workflowError))
             } else {
                 let wrapped = MobileOnlyWorkflowError.processingFailed(error.localizedDescription)
@@ -776,7 +780,7 @@ final class MobileOnlyWorkflowCoordinator {
         }
         state = newState
         stateLock.unlock()
-        if newState != .failed {
+        if newState != .failed && newState != .rescanRequired {
             contextLock.lock()
             context.errorCode = ""
             contextLock.unlock()
@@ -792,6 +796,15 @@ final class MobileOnlyWorkflowCoordinator {
         context.errorCode = error.code
         contextLock.unlock()
         transition(to: .failed)
+    }
+
+    private func markRescanRequired(with error: MobileOnlyWorkflowError) {
+        lastError = error
+        contextLock.lock()
+        context.errorCode = error.code
+        context.checkpoint = "RESCAN_SESSION"
+        contextLock.unlock()
+        transition(to: .rescanRequired)
     }
 
     // MARK: - Persistence (§5.2)
@@ -869,7 +882,12 @@ final class MobileOnlyWorkflowCoordinator {
         context.errorCode = object["error_code"] as? String ?? ""
 
         guard persistedState.isResumable else {
-            state = persistedState == .interrupted ? .interrupted : .idle
+            // RESCAN_SESSION is a product terminal outcome, not a stale
+            // failure. Keep it visible across relaunch until the operator
+            // deliberately starts another workflow.
+            state = persistedState == .rescanRequired
+                ? .rescanRequired
+                : (persistedState == .interrupted ? .interrupted : .idle)
             return
         }
 

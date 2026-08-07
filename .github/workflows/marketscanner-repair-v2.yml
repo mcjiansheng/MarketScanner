@@ -15,6 +15,7 @@ on:
       - "CMakePresets.json"
       - "app/android/jni/**"
       - "app/ios/RTABMapApp/**"
+      - "app/ios/RTABMapApp.xcodeproj/**"
       - "core/MarketScannerFactorGraph/**"
       - "docs/map-assisted-localization/**"
       - "tools/PriorMap/**"
@@ -408,7 +409,7 @@ jobs:
   ios-source-contracts:
     name: macOS and iOS source contracts
     runs-on: macos-14
-    timeout-minutes: 240
+    timeout-minutes: 360
     steps:
       - uses: actions/checkout@v4
         with:
@@ -422,118 +423,192 @@ jobs:
             echo
             echo "- Head SHA: \`$(git rev-parse HEAD)\`"
             echo "- Xcode: \`$(xcodebuild -version | head -1)\`"
-            echo "- Checks: Repair V2 Swift parse, Swift core contracts, Xcode metadata, conditional unsigned arm64 build"
+            echo "- Checks: project-derived shipping sources, SwiftPM exact lock, Swift parse, Xcode metadata, clean simulator build, clean unsigned arm64 build"
           } > ci-artifacts/macos-ios-summary.md
-      - name: Parse all MarketScanner Swift sources touched by Repair V2
+      - name: Validate and parse project-derived shipping Swift sources
         id: swift_parse
+        shell: bash
         run: |
-          xcrun swiftc -parse \
-            app/ios/RTABMapApp/SupermarketFinalizationCore.swift \
-            app/ios/RTABMapApp/RecoveryLifecyclePersistenceCore.swift \
-            app/ios/RTABMapApp/RecoveryLifecycleEvidenceParser.swift \
-            app/ios/RTABMapApp/StrictJSONScalar.swift \
-            app/ios/RTABMapApp/StrictJSONKeyUniquenessValidator.swift \
-            app/ios/RTABMapApp/StrictJSONDocumentParser.swift \
-            app/ios/RTABMapApp/PriorMapPackageSnapshotCore.swift \
-            app/ios/RTABMapApp/PriorMapLocalizationCore.swift \
-            app/ios/RTABMapApp/PriorMapLocalization.swift \
-            app/ios/RTABMapApp/PriceTagLocalizationCore.swift \
-            app/ios/RTABMapApp/SupermarketScanSession.swift \
-            app/ios/RTABMapApp/ViewController.swift \
-            app/ios/RTABMapApp/RTABMap.swift
-            app/ios/RTABMapApp/MobileMapImport/CSVMapSourceImporter.swift \
-            app/ios/RTABMapApp/MobileMapImport/CanonicalJSONEncoder.swift \
-            app/ios/RTABMapApp/MobileMapImport/CanonicalPriorMapSource.swift \
-            app/ios/RTABMapApp/MobileMapImport/ElementNormalizer.swift \
-            app/ios/RTABMapApp/MobileMapImport/JSONMapSourceImporter.swift \
-            app/ios/RTABMapApp/MobileMapImport/MapSourceImportCoordinator.swift \
-            app/ios/RTABMapApp/MobileMapImport/MapSourceImportError.swift \
-            app/ios/RTABMapApp/MobileMapImport/MapSourceImportReport.swift \
-            app/ios/RTABMapApp/MobileMapImport/RFC4180CSVReader.swift \
-            app/ios/RTABMapApp/MobileMapImport/SourceGeometry.swift \
-            app/ios/RTABMapApp/MobileMapImport/XLSXMapSourceImporter.swift \
-            app/ios/RTABMapApp/MobileMapImport/XLSXWorkbookReader.swift \
-            app/ios/RTABMapApp/MobileMapImport/XLSXWorksheetReader.swift \
-            app/ios/RTABMapApp/MobileMapImport/XLSXZipReader.swift \
-            app/ios/RTABMapApp/MobilePriorMapCompiler/MobileDistanceFieldBuilder.swift \
-            app/ios/RTABMapApp/MobilePriorMapCompiler/MobilePackageManifestBuilder.swift \
-            app/ios/RTABMapApp/MobilePriorMapCompiler/MobilePreviewRenderer.swift \
-            app/ios/RTABMapApp/MobilePriorMapCompiler/MobilePriorMapCompiler.swift \
-            app/ios/RTABMapApp/MobilePriorMapCompiler/MobileRoadGraphBuilder.swift \
-            app/ios/RTABMapApp/MobilePostProcessing/ClockCorrelationRecorder.swift \
-            app/ios/RTABMapApp/MobilePostProcessing/FinalTrajectory.swift \
-            app/ios/RTABMapApp/MobilePostProcessing/SE2FactorGraphCore.swift \
-            app/ios/RTABMapApp/MobilePostProcessing/SE2Transform.swift \
-            app/ios/RTABMapApp/MobilePostProcessing/SessionSnapshotTransaction.swift \
-            app/ios/RTABMapApp/MobilePostProcessing/ShelfAssociationEngine.swift \
-            app/ios/RTABMapApp/MobilePostProcessing/TagObservationResolver.swift \
-            app/ios/RTABMapApp/MobileResults/MobileResultExporter.swift \
-            app/ios/RTABMapApp/MobileResults/MobileWorksheets.swift \
-            app/ios/RTABMapApp/MobileResults/XLSXWorkbookWriter.swift \
-            app/ios/RTABMapApp/MobileOnlyWorkflow/MobileGraphReader.swift \
-            app/ios/RTABMapApp/MobileOnlyWorkflow/MobileMapLibrary.swift \
-            app/ios/RTABMapApp/MobileOnlyWorkflow/MobileNativeFactorGraph.swift \
-            app/ios/RTABMapApp/MobileOnlyWorkflow/MobileOnlyWorkflowCoordinator.swift \
-            app/ios/RTABMapApp/MobileOnlyWorkflow/MobileOnlyWorkflowError.swift \
-            app/ios/RTABMapApp/MobileOnlyWorkflow/MobileOnlyWorkflowState.swift \
-            app/ios/RTABMapApp/MobileOnlyWorkflow/MobileProcessingPipeline.swift \
-            app/ios/RTABMapApp/MobileOnlyWorkflow/MobileProcessingTaskStore.swift \
-            app/ios/RTABMapApp/MobileOnlyWorkflow/MobileResultLibrary.swift \
-            app/ios/RTABMapApp/MobileOnlyWorkflow/MobileNativeGraphTypes.swift \
-            app/ios/RTABMapApp/MobileOnlyWorkflow/MobileBuildIdentity.swift \
-            app/ios/RTABMapApp/MobileOnlyWorkflow/ProcessingResourceGovernor.swift \
+          source_list="$RUNNER_TEMP/marketscanner-ios-swift-sources.bin"
+          python3 tools/Qualification/check_ios_source_membership.py \
+            --source-list-output "$source_list"
+          xargs -0 xcrun swiftc -parse < "$source_list"
       - name: Run platform-independent iOS contract test
         id: swift_contracts
         run: python3 -m unittest tools.PriorMap.tests.test_prior_map.IOSCoreContractTests tools.PriorMap.tests.test_c4_session_input_snapshot -v
+      - name: Cold-resolve exact SwiftPM revisions
+        id: swiftpm_resolve
+        shell: bash
+        run: |
+          lock="app/ios/RTABMapApp.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved"
+          lock_backup="$RUNNER_TEMP/MarketScanner-Package.resolved"
+          package_cache="$RUNNER_TEMP/MarketScannerSourcePackages"
+          package_derived_data="$RUNNER_TEMP/MarketScannerPackageDerivedData"
+          cp "$lock" "$lock_backup"
+          rm -rf "$package_cache" "$package_derived_data"
+          xcodebuild \
+            -resolvePackageDependencies \
+            -project app/ios/RTABMapApp.xcodeproj \
+            -scheme RTABMapApp \
+            -clonedSourcePackagesDirPath "$package_cache" \
+            -derivedDataPath "$package_derived_data" \
+            -onlyUsePackageVersionsFromResolvedFile
+          cmp -s "$lock_backup" "$lock" || {
+            echo "::error::Xcode rewrote Package.resolved during cold exact-revision resolution"
+            exit 1
+          }
+          python3 tools/Qualification/check_ios_source_membership.py
+          python3 - <<'PY' | tee -a ci-artifacts/macos-ios-summary.md
+          import json
+          from pathlib import Path
+          lock = Path("app/ios/RTABMapApp.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved")
+          for pin in json.loads(lock.read_text(encoding="utf-8"))["pins"]:
+              state = pin["state"]
+              print(f"- SwiftPM pin: `{pin['identity']}@{state.get('version', '')}` revision `{state['revision']}`")
+          PY
       - name: Validate Xcode project metadata
         id: xcode_list
-        run: xcodebuild -project app/ios/RTABMapApp.xcodeproj -list
-      - name: Restore traceable iOS native dependency cache
-        id: ios_native_cache
+        shell: bash
+        run: |
+          lock="app/ios/RTABMapApp.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved"
+          lock_backup="$RUNNER_TEMP/MarketScanner-Package.resolved"
+          xcodebuild \
+            -project app/ios/RTABMapApp.xcodeproj \
+            -scheme RTABMapApp \
+            -clonedSourcePackagesDirPath "$RUNNER_TEMP/MarketScannerSourcePackages" \
+            -disableAutomaticPackageResolution \
+            -onlyUsePackageVersionsFromResolvedFile \
+            -list
+          cmp -s "$lock_backup" "$lock" || {
+            echo "::error::Xcode rewrote Package.resolved while loading project metadata"
+            exit 1
+          }
+          python3 tools/Qualification/check_ios_source_membership.py
+      - name: Compute iOS native dependency cache identity
+        id: ios_native_identity
+        shell: bash
+        run: |
+          {
+            xcodebuild -version
+            uname -m
+            git rev-parse \
+              HEAD:CMakeLists.txt \
+              HEAD:cmake_modules \
+              HEAD:corelib \
+              HEAD:utilite
+            shasum -a 256 \
+              app/ios/RTABMapApp/install_deps.sh \
+              tools/SupermarketMapStudio/ios_dependency_manifest.py \
+              tools/SupermarketMapStudio/release_dependencies.json
+          } > "$RUNNER_TEMP/marketscanner-ios-native-inputs.txt"
+          digest="$(shasum -a 256 "$RUNNER_TEMP/marketscanner-ios-native-inputs.txt" | awk '{print $1}')"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          echo "- iOS native input digest: \`$digest\`" >> ci-artifacts/macos-ios-summary.md
+      - name: Restore iphoneos native dependency cache
+        id: ios_native_iphoneos_cache
         uses: actions/cache/restore@v4
         with:
           path: |
-            app/ios/RTABMapApp/Libraries/include
-            app/ios/RTABMapApp/Libraries/lib
-            app/ios/RTABMapApp/Libraries/ios-dependency-manifest.json
-          key: marketscanner-ios-native-${{ runner.arch }}-${{ hashFiles('app/ios/RTABMapApp/install_deps.sh', 'tools/SupermarketMapStudio/release_dependencies.json') }}
-      - name: Build iOS native dependencies on cache miss
-        if: steps.ios_native_cache.outputs.cache-hit != 'true'
+            app/ios/RTABMapApp/Libraries/iphoneos/include
+            app/ios/RTABMapApp/Libraries/iphoneos/lib
+            app/ios/RTABMapApp/Libraries/iphoneos/ios-dependency-manifest.json
+          key: marketscanner-ios-native-iphoneos-${{ runner.arch }}-${{ steps.ios_native_identity.outputs.digest }}
+      - name: Restore iphonesimulator native dependency cache
+        id: ios_native_iphonesimulator_cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            app/ios/RTABMapApp/Libraries/iphonesimulator/include
+            app/ios/RTABMapApp/Libraries/iphonesimulator/lib
+            app/ios/RTABMapApp/Libraries/iphonesimulator/ios-dependency-manifest.json
+          key: marketscanner-ios-native-iphonesimulator-${{ runner.arch }}-${{ steps.ios_native_identity.outputs.digest }}
+      - name: Build iphoneos native dependencies on cache miss
+        if: steps.ios_native_iphoneos_cache.outputs.cache-hit != 'true'
         shell: bash
         run: |
-          cd app/ios/RTABMapApp
-          bash install_deps.sh
-          cd ../../..
+          bash app/ios/RTABMapApp/install_deps.sh --platform iphoneos
           python3 tools/SupermarketMapStudio/ios_dependency_manifest.py \
-            --libraries app/ios/RTABMapApp/Libraries \
-            --output app/ios/RTABMapApp/Libraries/ios-dependency-manifest.json \
+            --platform iphoneos \
+            --ci \
+            --libraries app/ios/RTABMapApp/Libraries/iphoneos \
+            --output app/ios/RTABMapApp/Libraries/iphoneos/ios-dependency-manifest.json \
             --git-sha "$(git rev-parse HEAD)"
-      - name: Verify cached or freshly built iOS dependencies
+      - name: Build iphonesimulator native dependencies on cache miss
+        if: steps.ios_native_iphonesimulator_cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          bash app/ios/RTABMapApp/install_deps.sh --platform iphonesimulator
+          python3 tools/SupermarketMapStudio/ios_dependency_manifest.py \
+            --platform iphonesimulator \
+            --ci \
+            --libraries app/ios/RTABMapApp/Libraries/iphonesimulator \
+            --output app/ios/RTABMapApp/Libraries/iphonesimulator/ios-dependency-manifest.json \
+            --git-sha "$(git rev-parse HEAD)"
+      - name: Verify platform-scoped iOS dependencies
         run: |
           python3 tools/SupermarketMapStudio/ios_dependency_manifest.py \
             --verify \
-            --libraries app/ios/RTABMapApp/Libraries \
-            --output app/ios/RTABMapApp/Libraries/ios-dependency-manifest.json \
-            --git-sha "$(git rev-parse HEAD)"
-      - name: Save verified iOS native dependency cache before App link
-        if: steps.ios_native_cache.outputs.cache-hit != 'true'
+            --platform iphoneos \
+            --ci \
+            --libraries app/ios/RTABMapApp/Libraries/iphoneos \
+            --output app/ios/RTABMapApp/Libraries/iphoneos/ios-dependency-manifest.json
+          python3 tools/SupermarketMapStudio/ios_dependency_manifest.py \
+            --verify \
+            --platform iphonesimulator \
+            --ci \
+            --libraries app/ios/RTABMapApp/Libraries/iphonesimulator \
+            --output app/ios/RTABMapApp/Libraries/iphonesimulator/ios-dependency-manifest.json
+      - name: Save verified iphoneos native dependency cache before App link
+        if: steps.ios_native_iphoneos_cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
           path: |
-            app/ios/RTABMapApp/Libraries/include
-            app/ios/RTABMapApp/Libraries/lib
-            app/ios/RTABMapApp/Libraries/ios-dependency-manifest.json
-          key: marketscanner-ios-native-${{ runner.arch }}-${{ hashFiles('app/ios/RTABMapApp/install_deps.sh', 'tools/SupermarketMapStudio/release_dependencies.json') }}
+            app/ios/RTABMapApp/Libraries/iphoneos/include
+            app/ios/RTABMapApp/Libraries/iphoneos/lib
+            app/ios/RTABMapApp/Libraries/iphoneos/ios-dependency-manifest.json
+          key: marketscanner-ios-native-iphoneos-${{ runner.arch }}-${{ steps.ios_native_identity.outputs.digest }}
+      - name: Save verified iphonesimulator native dependency cache before App link
+        if: steps.ios_native_iphonesimulator_cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            app/ios/RTABMapApp/Libraries/iphonesimulator/include
+            app/ios/RTABMapApp/Libraries/iphonesimulator/lib
+            app/ios/RTABMapApp/Libraries/iphonesimulator/ios-dependency-manifest.json
+          key: marketscanner-ios-native-iphonesimulator-${{ runner.arch }}-${{ steps.ios_native_identity.outputs.digest }}
+      - name: Clean-build iOS simulator app
+        id: ios_simulator_build
+        shell: bash
+        run: |
+          derived_data="$RUNNER_TEMP/MarketScannerDerivedData"
+          rm -rf "$derived_data"
+          xcodebuild \
+            -project app/ios/RTABMapApp.xcodeproj \
+            -scheme RTABMapApp \
+            -configuration Debug \
+            -sdk iphonesimulator \
+            -destination 'generic/platform=iOS Simulator' \
+            -clonedSourcePackagesDirPath "$RUNNER_TEMP/MarketScannerSourcePackages" \
+            -disableAutomaticPackageResolution \
+            -onlyUsePackageVersionsFromResolvedFile \
+            -derivedDataPath "$derived_data" \
+            clean build
+          cmp -s "$RUNNER_TEMP/MarketScanner-Package.resolved" \
+            app/ios/RTABMapApp.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved || {
+            echo "::error::Xcode rewrote Package.resolved during simulator clean build"
+            exit 1
+          }
+          echo "- Clean iOS simulator build: **SUCCEEDED**" >> ci-artifacts/macos-ios-summary.md
       - name: Build unsigned generic arm64 iOS app
         id: ios_build
         shell: bash
         run: |
           required_dependencies=(
-            app/ios/RTABMapApp/Libraries/include/rtabmap-0.23/rtabmap/core/Rtabmap.h
-            app/ios/RTABMapApp/Libraries/lib/librtabmap_core.a
-            app/ios/RTABMapApp/Libraries/lib/librtabmap_utilite.a
-            app/ios/RTABMapApp/Libraries/lib/libopencv_core.a
-            app/ios/RTABMapApp/Libraries/lib/libpcl_common.a
+            app/ios/RTABMapApp/Libraries/iphoneos/include/rtabmap-0.23/rtabmap/core/Rtabmap.h
+            app/ios/RTABMapApp/Libraries/iphoneos/lib/librtabmap_core.a
+            app/ios/RTABMapApp/Libraries/iphoneos/lib/librtabmap_utilite.a
+            app/ios/RTABMapApp/Libraries/iphoneos/lib/libopencv_core.a
+            app/ios/RTABMapApp/Libraries/iphoneos/lib/libpcl_common.a
           )
           for dependency in "${required_dependencies[@]}"; do
             if [ ! -f "$dependency" ]; then
@@ -541,19 +616,29 @@ jobs:
               exit 1
             fi
           done
+          derived_data="$RUNNER_TEMP/MarketScannerDerivedData"
+          rm -rf "$derived_data"
           xcodebuild \
             -project app/ios/RTABMapApp.xcodeproj \
             -scheme RTABMapApp \
             -configuration Release \
             -sdk iphoneos \
             -destination 'generic/platform=iOS' \
-            -derivedDataPath "$RUNNER_TEMP/MarketScannerDerivedData" \
+            -clonedSourcePackagesDirPath "$RUNNER_TEMP/MarketScannerSourcePackages" \
+            -disableAutomaticPackageResolution \
+            -onlyUsePackageVersionsFromResolvedFile \
+            -derivedDataPath "$derived_data" \
             ARCHS=arm64 \
             ONLY_ACTIVE_ARCH=YES \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY='' \
-            build
+            clean build
+          cmp -s "$RUNNER_TEMP/MarketScanner-Package.resolved" \
+            app/ios/RTABMapApp.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved || {
+            echo "::error::Xcode rewrote Package.resolved during device clean build"
+            exit 1
+          }
           echo "status=succeeded" >> "$GITHUB_OUTPUT"
           echo "- Unsigned generic arm64 iOS build: **SUCCEEDED** (Swift and native translation units compiled and linked)" >> ci-artifacts/macos-ios-summary.md
       - name: Verify embedded build identity matches the exact HEAD
@@ -575,7 +660,10 @@ jobs:
             echo "- Swift parse step outcome: \`${{ steps.swift_parse.outcome }}\`"
             echo "- Swift core contract step outcome: \`${{ steps.swift_contracts.outcome }}\`"
             echo "- Xcode metadata step outcome: \`${{ steps.xcode_list.outcome }}\`"
-            echo "- iOS dependency cache hit: \`${{ steps.ios_native_cache.outputs.cache-hit || 'false' }}\`"
+            echo "- SwiftPM cold resolve outcome: \`${{ steps.swiftpm_resolve.outcome }}\`"
+            echo "- iphoneos dependency cache hit: \`${{ steps.ios_native_iphoneos_cache.outputs.cache-hit || 'false' }}\`"
+            echo "- iphonesimulator dependency cache hit: \`${{ steps.ios_native_iphonesimulator_cache.outputs.cache-hit || 'false' }}\`"
+            echo "- Clean simulator build step outcome: \`${{ steps.ios_simulator_build.outcome }}\`"
             echo "- Unsigned iOS build step outcome: \`${{ steps.ios_build.outcome }}\`"
             echo "- Unsigned iOS build status: \`${{ steps.ios_build.outputs.status || 'not-run' }}\`"
             echo "- Job result: \`${{ job.status }}\`"

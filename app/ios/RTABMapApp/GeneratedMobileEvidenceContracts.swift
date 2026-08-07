@@ -31,13 +31,15 @@ enum GeneratedMobileEvidenceContracts {
         static let blank_line_policy = "reject"
         static let final_newline = true
         static let identity_fields: [String] = ["priorMapId", "priorMapSha256", "trackingSessionId", "floorId"]
-        static let max_file_bytes = 67108864
+        static let max_file_bytes = 805306368
         static let max_nesting_depth = 8
-        static let max_record_bytes = 1048576
-        static let max_records = 100000
+        static let max_record_bytes = 65536
+        static let max_records = 400000
+        static let qualification_max_records = 345600
+        static let qualification_record_rate_hz = 2
         static let strict_bool = true
         static let strict_integer = true
-        static let watermark_fields: [String] = []
+        static let watermark_fields: [String] = ["captureHealth.localizationConstraintRecordCount"]
     }
 
     enum File_localization_trace_jsonl {
@@ -48,6 +50,8 @@ enum GeneratedMobileEvidenceContracts {
         static let max_nesting_depth = 8
         static let max_record_bytes = 1048576
         static let max_records = 2000000
+        static let qualification_max_records = 1728000
+        static let qualification_record_rate_hz = 10
         static let strict_bool = true
         static let strict_integer = true
         static let watermark_fields: [String] = ["captureHealth.localizationTraceRecordCount"]
@@ -63,27 +67,27 @@ enum GeneratedMobileEvidenceContracts {
         static let max_records = 100000
         static let strict_bool = true
         static let strict_integer = true
-        static let watermark_fields: [String] = []
+        static let watermark_fields: [String] = ["captureHealth.manualLocalizationEventCount"]
     }
 
     enum File_metadata_json {
         static let blank_line_policy = "n_a"
         static let final_newline = false
         static let identity_fields: [String] = ["storeId", "floorId", "priorMapId", "priorMapSha256", "trackingSessionId"]
-        static let max_file_bytes = 16777216
+        static let max_file_bytes = 1048576
         static let max_nesting_depth = 8
-        static let max_record_bytes = 16777216
+        static let max_record_bytes = 1048576
         static let max_records = 1
         static let strict_bool = true
         static let strict_integer = true
-        static let watermark_fields: [String] = ["finalized", "clockCorrelationCount", "clockNodeBindingCount", "tagObservationBurstCount", "tagObservationBurstLastID", "tagObservationBurstComplete", "localizationTraceRecordCount"]
+        static let watermark_fields: [String] = ["finalized", "clockCorrelationCount", "clockNodeBindingCount", "tagObservationBurstCount", "tagObservationBurstLastID", "tagObservationBurstComplete", "captureHealth.localizationTraceRecordCount", "captureHealth.localizationConstraintRecordCount", "captureHealth.manualLocalizationEventCount", "captureHealth.localizationRecoveryEventCount"]
     }
 
     enum File_native_graph {
-        static let max_factors = 400000
-        static let max_priors = 100000
+        static let max_factors = 4096
+        static let max_priors = 4096
         static let max_raw_nodes = 200000
-        static let max_skeleton_nodes = 200000
+        static let max_skeleton_nodes = 4096
         static let max_trajectory_rows = 200000
     }
 
@@ -94,6 +98,19 @@ enum GeneratedMobileEvidenceContracts {
         static let max_per_file_bytes = 2147483648
         static let package_sha256 = true
         static let per_file_sha256 = true
+    }
+
+    enum File_scan_events_jsonl {
+        static let blank_line_policy = "reject"
+        static let final_newline = true
+        static let identity_fields: [String] = ["trackingSessionId"]
+        static let max_file_bytes = 268435456
+        static let max_nesting_depth = 8
+        static let max_record_bytes = 1048576
+        static let max_records = 1000000
+        static let strict_bool = true
+        static let strict_integer = true
+        static let watermark_fields: [String] = []
     }
 
     enum File_tag_observation_bursts_jsonl {

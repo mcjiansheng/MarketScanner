@@ -1218,8 +1218,12 @@ const double kMinHeadingDistanceM = 0.05;
 /// and MarginalCovarianceCholesky::computeEntry recurses over the
 /// vertices, so an unbounded skeleton would overflow the stack. Mandatory
 /// nodes (constraint endpoints / tags / gaps / map transitions / path
-/// turns) always survive the uniform downsampling below this cap.
-const size_t kSkeletonMaxNodes = 4096;
+/// turns) are retained when they fit; otherwise the run returns
+/// RESOURCE_REQUIRED before entering the optimizer.
+const size_t kSkeletonMaxNodes =
+    static_cast<size_t>(MS_FACTOR_GRAPH_HARD_OPTIMIZER_NODES);
+const size_t kSkeletonMaxFactors =
+    static_cast<size_t>(MS_FACTOR_GRAPH_HARD_OPTIMIZER_FACTORS);
 
 /// Selects the optimization skeleton over the TOPOLOGY order. Mandatory
 /// nodes: endpoints, loop/prior/recovery endpoints, tag nodes, map
@@ -1228,8 +1232,10 @@ const size_t kSkeletonMaxNodes = 4096;
 std::vector<size_t> reduceGraph(
     const GraphModel & model,
     const std::set<int64_t> & tagNodes,
-    const ReducerPolicy & policy)
+    const ReducerPolicy & policy,
+    bool * resourceExceeded = NULL)
 {
+    if(resourceExceeded) *resourceExceeded = false;
     const size_t n = model.nodes.size();
     std::set<size_t> kept;
     if(n == 0) return std::vector<size_t>();
@@ -1295,6 +1301,16 @@ std::vector<size_t> reduceGraph(
         }
     }
 
+    // Mandatory anchors are not negotiable. If endpoints, constraints,
+    // tags, gaps, map transitions and curvature turns alone exceed the
+    // optimizer bound, return RESOURCE_REQUIRED instead of building an
+    // oversized skeleton and entering g2o.
+    if(kept.size() > kSkeletonMaxNodes)
+    {
+        if(resourceExceeded) *resourceExceeded = true;
+        return std::vector<size_t>();
+    }
+
     // Adaptive spacing between mandatory anchors.
     std::vector<size_t> skeleton;
     skeleton.push_back(0);
@@ -1333,28 +1349,44 @@ std::vector<size_t> reduceGraph(
     std::sort(skeleton.begin(), skeleton.end());
     skeleton.erase(std::unique(skeleton.begin(), skeleton.end()), skeleton.end());
 
-    // Uniform cap (§10.1 depth defense): beyond kSkeletonMaxNodes keep
-    // every mandatory anchor and one uniformly-spaced representative per
-    // stride bucket so the optimizer stays O(cap) bounded.
+    // Hard cap (§10.1 depth defense): mandatory anchors consume their
+    // slots first, then the remaining budget is filled uniformly from
+    // non-mandatory skeleton candidates. The result can NEVER exceed the
+    // cap (the previous bucket implementation could retain cap+mandatory).
     if(skeleton.size() > kSkeletonMaxNodes)
     {
-        std::vector<size_t> capped;
-        capped.reserve(kSkeletonMaxNodes + kept.size());
-        const double stride =
-            static_cast<double>(skeleton.size()) / static_cast<double>(kSkeletonMaxNodes);
-        size_t lastBucket = static_cast<size_t>(-1);
+        std::vector<size_t> candidates;
+        candidates.reserve(skeleton.size() - kept.size());
         for(size_t s = 0; s < skeleton.size(); ++s)
         {
-            const size_t bucket = static_cast<size_t>(std::floor(s / stride));
-            const bool mandatory = kept.count(skeleton[s]) != 0;
-            if(mandatory || bucket != lastBucket)
+            if(!kept.count(skeleton[s]))
             {
-                capped.push_back(skeleton[s]);
-                lastBucket = bucket;
+                candidates.push_back(skeleton[s]);
             }
         }
-        if(capped.back() != n - 1) capped.push_back(n - 1);
-        skeleton.swap(capped);
+        std::set<size_t> selected = kept;
+        const size_t remaining = kSkeletonMaxNodes - selected.size();
+        if(remaining >= candidates.size())
+        {
+            selected.insert(candidates.begin(), candidates.end());
+        }
+        else if(remaining > 0)
+        {
+            for(size_t slot = 0; slot < remaining; ++slot)
+            {
+                const size_t candidate = static_cast<size_t>(std::floor(
+                    (static_cast<double>(slot) + 0.5) *
+                    static_cast<double>(candidates.size()) /
+                    static_cast<double>(remaining)));
+                selected.insert(candidates[std::min(candidate, candidates.size() - 1)]);
+            }
+        }
+        skeleton.assign(selected.begin(), selected.end());
+    }
+    if(skeleton.size() > kSkeletonMaxNodes)
+    {
+        if(resourceExceeded) *resourceExceeded = true;
+        return std::vector<size_t>();
     }
     return skeleton;
 }
@@ -3119,6 +3151,7 @@ MSFactorGraphOutcomeC makeErrorOutcome(const std::string & message, MSFactorGrap
 {
     MSFactorGraphOutcomeC outcome;
     std::memset(&outcome, 0, sizeof(outcome));
+    outcome.abi_version = MS_FACTOR_GRAPH_ABI_VERSION;
     outcome.disposition = disposition;
     outcome.error = const_cast<char *>(strdup(message.c_str()));
     if(!outcome.error)
@@ -3135,6 +3168,7 @@ MSFactorGraphOutcomeC runPipeline(const MSFactorGraphRequestC * request, const R
 {
     MSFactorGraphOutcomeC outcome;
     std::memset(&outcome, 0, sizeof(outcome));
+    outcome.abi_version = MS_FACTOR_GRAPH_ABI_VERSION;
     const auto runStart = std::chrono::steady_clock::now();
     const double maxWall = options.maxWallSeconds > 0.0
         ? options.maxWallSeconds : (options.fullGraph ? 1800.0 : 600.0);
@@ -3142,6 +3176,28 @@ MSFactorGraphOutcomeC runPipeline(const MSFactorGraphRequestC * request, const R
     if(!request || !request->db_path)
     {
         return makeErrorOutcome("request or db_path is NULL", MS_FACTOR_GRAPH_NON_RECOVERABLE_FAIL);
+    }
+    if(request->tag_node_count < 0 || request->absolute_prior_count < 0 ||
+       (request->tag_node_count > 0 && !request->tag_node_ids) ||
+       (request->absolute_prior_count > 0 && !request->absolute_priors))
+    {
+        return makeErrorOutcome(
+            "input pointer/count contract is invalid",
+            MS_FACTOR_GRAPH_NON_RECOVERABLE_FAIL);
+    }
+    if(request->tag_node_count > MS_FACTOR_GRAPH_MAX_TRAJECTORY_ROWS ||
+       request->absolute_prior_count > MS_FACTOR_GRAPH_MAX_TRAJECTORY_ROWS)
+    {
+        return makeErrorOutcome(
+            "mandatory input count exceeds product resource budget",
+            MS_FACTOR_GRAPH_RESOURCE_REQUIRED);
+    }
+    if(request->tag_node_count > MS_FACTOR_GRAPH_HARD_OPTIMIZER_NODES ||
+       request->absolute_prior_count > MS_FACTOR_GRAPH_HARD_OPTIMIZER_NODES)
+    {
+        return makeErrorOutcome(
+            "mandatory input count exceeds the 4096 optimizer bound",
+            MS_FACTOR_GRAPH_RESOURCE_REQUIRED);
     }
 
     // 1. Real graph health check on the snapshot DB.
@@ -3163,7 +3219,9 @@ MSFactorGraphOutcomeC runPipeline(const MSFactorGraphRequestC * request, const R
         return makeErrorOutcome("health inspection failed: " + healthError, MS_FACTOR_GRAPH_NON_RECOVERABLE_FAIL);
     }
 
-    const int64_t maxNodes = options.maxNodes > 0 ? options.maxNodes : 150000;
+    const int64_t maxNodes = options.maxNodes > 0
+        ? std::min(options.maxNodes, MS_FACTOR_GRAPH_MAX_TRAJECTORY_ROWS)
+        : MS_FACTOR_GRAPH_MAX_TRAJECTORY_ROWS;
     if(health.nodeCount > maxNodes)
     {
         return makeErrorOutcome("node count exceeds the resource budget", MS_FACTOR_GRAPH_RESOURCE_REQUIRED);
@@ -3199,6 +3257,12 @@ MSFactorGraphOutcomeC runPipeline(const MSFactorGraphRequestC * request, const R
         priors.push_back(prior);
         mandatoryNodes.insert(src.node_id);
     }
+    if(mandatoryNodes.size() > kSkeletonMaxNodes)
+    {
+        return makeErrorOutcome(
+            "unique tag/prior nodes exceed the 4096 optimizer bound",
+            MS_FACTOR_GRAPH_RESOURCE_REQUIRED);
+    }
 
     if(request->progress) request->progress(0.2, request->progress_user);
     if(request->cancel && request->cancel(request->cancel_user))
@@ -3210,13 +3274,33 @@ MSFactorGraphOutcomeC runPipeline(const MSFactorGraphRequestC * request, const R
     std::vector<size_t> skeleton;
     if(options.fullGraph)
     {
+        if(model.nodes.size() > kSkeletonMaxNodes)
+        {
+            return makeErrorOutcome(
+                "full-graph optimizer nodes exceed the 4096 hard bound",
+                MS_FACTOR_GRAPH_RESOURCE_REQUIRED);
+        }
         skeleton.reserve(model.nodes.size());
         for(size_t i = 0; i < model.nodes.size(); ++i) skeleton.push_back(i);
     }
     else
     {
         ReducerPolicy policy;
-        skeleton = reduceGraph(model, mandatoryNodes, policy);
+        bool resourceExceeded = false;
+        skeleton = reduceGraph(
+            model, mandatoryNodes, policy, &resourceExceeded);
+        if(resourceExceeded)
+        {
+            return makeErrorOutcome(
+                "mandatory optimizer nodes exceed the 4096 hard bound",
+                MS_FACTOR_GRAPH_RESOURCE_REQUIRED);
+        }
+    }
+    if(skeleton.size() > kSkeletonMaxNodes)
+    {
+        return makeErrorOutcome(
+            "optimizer skeleton exceeds the 4096 hard bound",
+            MS_FACTOR_GRAPH_RESOURCE_REQUIRED);
     }
 
     // 3. Factors + robust native optimization.
@@ -3225,7 +3309,13 @@ MSFactorGraphOutcomeC runPipeline(const MSFactorGraphRequestC * request, const R
     std::string factorError;
     if(!buildSkeletonFactors(model, skeleton, priors, factorAudit, factors, factorError))
     {
-        return makeErrorOutcome("factor construction failed: " + factorError, MS_FACTOR_GRAPH_NON_RECOVERABLE_FAIL);
+            return makeErrorOutcome("factor construction failed: " + factorError, MS_FACTOR_GRAPH_NON_RECOVERABLE_FAIL);
+    }
+    if(factors.size() > kSkeletonMaxFactors)
+    {
+        return makeErrorOutcome(
+            "optimizer factors exceed the 4096 hard bound",
+            MS_FACTOR_GRAPH_RESOURCE_REQUIRED);
     }
     if(request->progress) request->progress(0.4, request->progress_user);
 
@@ -3407,14 +3497,15 @@ MSFactorGraphOutcomeC runPipeline(const MSFactorGraphRequestC * request, const R
 
     // Fill the outcome.
     outcome.disposition = disposition;
-    outcome.quality_json = const_cast<char *>(strdup(qualityJSON(
+    const std::string qualityPayload = qualityJSON(
         metrics, disposition,
         options.fullGraph ? "full_graph_optimization" : "fast",
         model.graphInputSha256,
         static_cast<int64_t>(priors.size()),
         request->prior_map_id, request->prior_map_sha256,
         request->tracking_session_id,
-        request->projection_policy_version).c_str()));
+        request->projection_policy_version);
+    outcome.quality_json = const_cast<char *>(strdup(qualityPayload.c_str()));
     if(!outcome.quality_json)
     {
         // H-06: OOM on diagnostics must still be observable as
@@ -3422,6 +3513,22 @@ MSFactorGraphOutcomeC runPipeline(const MSFactorGraphRequestC * request, const R
         outcome.disposition = MS_FACTOR_GRAPH_RESOURCE_REQUIRED;
         goto outcome_alloc_failed;
     }
+    outcome.quality_json_size = static_cast<int64_t>(qualityPayload.size());
+    outcome.graph_input_sha256 = const_cast<char *>(
+        strdup(model.graphInputSha256.c_str()));
+    outcome.graph_input_sha256_size = static_cast<int64_t>(
+        model.graphInputSha256.size());
+    outcome.factor_set_sha256 = const_cast<char *>(
+        strdup(metrics.factorAudit.factorSetSha256.c_str()));
+    outcome.factor_set_sha256_size = static_cast<int64_t>(
+        metrics.factorAudit.factorSetSha256.size());
+    if(!outcome.graph_input_sha256 || !outcome.factor_set_sha256)
+    {
+        outcome.disposition = MS_FACTOR_GRAPH_RESOURCE_REQUIRED;
+        goto outcome_alloc_failed;
+    }
+    outcome.factor_count = metrics.skeletonFactors;
+    outcome.publish_count = metrics.publishNodes;
     outcome.count = static_cast<int64_t>(trajectory.rows.size());
     if(outcome.count > 0)
     {
@@ -3550,6 +3657,8 @@ extern "C" void MSFactorGraphFree(MSFactorGraphOutcomeC * outcome)
     free(outcome->skeleton_y);
     free(outcome->skeleton_yaw);
     free(outcome->quality_json);
+    free(outcome->graph_input_sha256);
+    free(outcome->factor_set_sha256);
     free(outcome->error);
     std::memset(outcome, 0, sizeof(*outcome));
 }

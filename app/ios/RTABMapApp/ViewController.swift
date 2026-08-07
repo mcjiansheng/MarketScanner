@@ -37,7 +37,6 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
     // flushed to clock_correlations.jsonl on finalization.
     private var clockRecorder: ClockCorrelationRecorder?
     private var clockTimer: Timer?
-    private var clockSidecarURL: URL?
     // V1R4 §7.2/§7.4: system clock / timezone change observers; the
     // recorder appends an explicit segment-start correlation on each.
     private var clockChangeObservers: [NSObjectProtocol] = []
@@ -506,18 +505,19 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
     private func startClockCorrelationRecording(
         segmentDirectory: URL,
         trackingSessionID: String
-    ) {
+    ) throws {
         stopClockCorrelationRecording(flush: false)
-        let recorder = ClockCorrelationRecorder(trackingSessionID: trackingSessionID)
         let url = segmentDirectory.appendingPathComponent("clock_correlations.jsonl")
-        recorder.record(
+        let recorder = try ClockCorrelationRecorder(
+            trackingSessionID: trackingSessionID,
+            url: url)
+        try recorder.record(
             reason: .sessionStart,
             monotonicSeconds: ProcessInfo.processInfo.systemUptime,
             utcUnixSeconds: Date().timeIntervalSince1970,
             timezoneID: TimeZone.current.identifier,
             utcOffsetSeconds: TimeZone.current.secondsFromGMT())
         clockRecorder = recorder
-        clockSidecarURL = url
         clockSidecarWriteFailure = nil
         clockSidecarWriteResult = nil
         lastClockBoundNodeID = 0
@@ -541,11 +541,15 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
             withTimeInterval: ClockCorrelationRecorder.periodicIntervalSeconds,
             repeats: true) { [weak self] _ in
             guard let self = self, let recorder = self.clockRecorder else { return }
-            recorder.maybeRecordPeriodic(
-                monotonicSeconds: ProcessInfo.processInfo.systemUptime,
-                utcUnixSeconds: Date().timeIntervalSince1970,
-                timezoneID: TimeZone.current.identifier,
-                utcOffsetSeconds: TimeZone.current.secondsFromGMT())
+            do {
+                try recorder.maybeRecordPeriodic(
+                    monotonicSeconds: ProcessInfo.processInfo.systemUptime,
+                    utcUnixSeconds: Date().timeIntervalSince1970,
+                    timezoneID: TimeZone.current.identifier,
+                    utcOffsetSeconds: TimeZone.current.secondsFromGMT())
+            } catch {
+                self.recordClockSidecarFailure(error)
+            }
         }
     }
 
@@ -553,12 +557,25 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
     /// timezone change / app lifecycle events, V1R4 §7.4).
     private func recordClockCorrelation(reason: ClockCorrelationRecorder.Reason) {
         guard let recorder = clockRecorder else { return }
-        recorder.record(
-            reason: reason,
-            monotonicSeconds: ProcessInfo.processInfo.systemUptime,
-            utcUnixSeconds: Date().timeIntervalSince1970,
-            timezoneID: TimeZone.current.identifier,
-            utcOffsetSeconds: TimeZone.current.secondsFromGMT())
+        do {
+            try recorder.record(
+                reason: reason,
+                monotonicSeconds: ProcessInfo.processInfo.systemUptime,
+                utcUnixSeconds: Date().timeIntervalSince1970,
+                timezoneID: TimeZone.current.identifier,
+                utcOffsetSeconds: TimeZone.current.secondsFromGMT())
+        } catch {
+            recordClockSidecarFailure(error)
+        }
+    }
+
+    private func recordClockSidecarFailure(_ error: Error) {
+        if clockSidecarWriteFailure == nil {
+            clockSidecarWriteFailure =
+                "clock_sidecar_write_failed: \(error.localizedDescription)"
+        }
+        clockSidecarWriteResult = nil
+        clockRecorder?.cancel()
     }
 
     /// Stops the periodic timer and observers and, when flushing, appends
@@ -578,35 +595,27 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         clockChangeObservers = []
         guard let recorder = clockRecorder else {
             clockRecorder = nil
-            clockSidecarURL = nil
             return nil
         }
         var result: ClockSidecarWriteResult?
-        if flush {
-            recorder.record(
-                reason: .sessionEnd,
-                monotonicSeconds: ProcessInfo.processInfo.systemUptime,
-                utcUnixSeconds: Date().timeIntervalSince1970,
-                timezoneID: TimeZone.current.identifier,
-                utcOffsetSeconds: TimeZone.current.secondsFromGMT())
-            if let url = clockSidecarURL {
-                do {
-                    let writeResult = try recorder.write(to: url)
-                    clockSidecarWriteResult = writeResult
-                    clockSidecarWriteFailure = nil
-                    result = writeResult
-                } catch {
-                    clockSidecarWriteResult = nil
-                    clockSidecarWriteFailure =
-                        "clock_sidecar_write_failed: \(error.localizedDescription)"
-                }
-            } else {
-                clockSidecarWriteResult = nil
-                clockSidecarWriteFailure = "clock_sidecar_write_failed: sidecar URL unavailable"
+        if flush, clockSidecarWriteFailure == nil {
+            do {
+                try recorder.record(
+                    reason: .sessionEnd,
+                    monotonicSeconds: ProcessInfo.processInfo.systemUptime,
+                    utcUnixSeconds: Date().timeIntervalSince1970,
+                    timezoneID: TimeZone.current.identifier,
+                    utcOffsetSeconds: TimeZone.current.secondsFromGMT())
+                let writeResult = try recorder.finish()
+                clockSidecarWriteResult = writeResult
+                result = writeResult
+            } catch {
+                recordClockSidecarFailure(error)
             }
+        } else {
+            recorder.cancel()
         }
         clockRecorder = nil
-        clockSidecarURL = nil
         return result
     }
 
@@ -2208,15 +2217,21 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
            let binding = rtabmap?.latestNodeBinding(
                frameTimestamp: frame.timestamp),
            binding.nodeId != lastClockBoundNodeID {
-            lastClockBoundNodeID = binding.nodeId
-            recorder.recordNodeBinding(
-                nodeID: binding.nodeId,
-                nodeStamp: binding.nodeStamp,
-                sampledFrameTimestamp: binding.nodeTimebaseFrameTimestamp,
-                systemUptime: ProcessInfo.processInfo.systemUptime,
-                utcUnixSeconds: Date().timeIntervalSince1970,
-                timezoneID: TimeZone.current.identifier,
-                utcOffsetSeconds: TimeZone.current.secondsFromGMT())
+            do {
+                try recorder.recordNodeBinding(
+                    nodeID: binding.nodeId,
+                    nodeStamp: binding.nodeStamp,
+                    sampledFrameTimestamp: binding.nodeTimebaseFrameTimestamp,
+                    systemUptime: ProcessInfo.processInfo.systemUptime,
+                    utcUnixSeconds: Date().timeIntervalSince1970,
+                    timezoneID: TimeZone.current.identifier,
+                    utcOffsetSeconds: TimeZone.current.secondsFromGMT())
+                // Advance only after the append succeeded. A failed write
+                // must not make a missing node look durably recorded.
+                lastClockBoundNodeID = binding.nodeId
+            } catch {
+                recordClockSidecarFailure(error)
+            }
         }
         
         if !status.isEmpty {
@@ -2967,7 +2982,9 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         let generation = priorMapGeneration
         let trackingSessionId = supermarketSession?.trackingSessionId ?? ""
         let nodeTimebase = rtabmap?.nodeTimebase(frameTimestamp: frame.timestamp)
-        if let binding = rtabmap?.latestNodeBinding(frameTimestamp: frame.timestamp) {
+        let priceTagNodeBinding = rtabmap?.latestNodeBinding(
+            frameTimestamp: frame.timestamp)
+        if let binding = priceTagNodeBinding {
             priorMapLastNodeBinding = (
                 binding.nodeId,
                 binding.nodeStamp,
@@ -3008,9 +3025,13 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                         detection,
                         trackingSessionId: trackingSessionId,
                         nodeTimebaseOffsetSeconds:
-                            nodeTimebase?.offsetSeconds ?? .nan)
+                            priceTagNodeBinding?
+                                .nodeTimebaseOffsetSeconds ?? .nan)
                     let observationSaved =
-                        self.supermarketSession?.appendTagObservation(result.0) == true
+                        priceTagNodeBinding.map {
+                            self.supermarketSession?.appendTagObservation(
+                                result.0, boundNodeID: Int64($0.nodeId)) == true
+                        } ?? false
                     DispatchQueue.main.async {
                         guard generation == self.priorMapGeneration else { return }
                         if observationSaved {
@@ -4307,6 +4328,8 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                             + processingBlockers.joined(separator: ", ")
                     }
                     let metadata = ScanSegmentMetadata(
+                        format: "MarketScannerFinalizedSessionMetadata",
+                        version: 1,
                         segmentIndex: 1,
                         scanMode: "continuous_streaming",
                         finalized: metadataFinalized,
@@ -5647,6 +5670,7 @@ extension ViewController: MobileOnlyScanStarting {
             priorMapId: entry.priorMapID,
             priorMapSha256: entry.packageSHA256,
             floorId: configuration.floorID,
+            storeID: configuration.storeID,
             initialMapPose: PriorMapPose2D(
                 xM: configuration.startXM,
                 yM: configuration.startYM,
@@ -5706,12 +5730,19 @@ extension ViewController: MobileOnlyScanStarting {
             throw error
         }
 
+        // V1R3 §7.1 / RC-B06: open the durable incremental clock writer
+        // before reporting a successful scan start. Parent-directory fsync or
+        // the first record append failing rolls the already-live scan back.
+        do {
+            try startClockCorrelationRecording(
+                segmentDirectory: segmentDirectory,
+                trackingSessionID: session.trackingSessionId)
+        } catch {
+            stopMapping(ignoreSaving: true)
+            throw MobileOnlyWorkflowError.invalidState(
+                "clock evidence writer not ready: \(error.localizedDescription)")
+        }
         self.persistScanConfiguration(configuration)
-        // V1R3 §7.1: begin recording clock correlation evidence for the
-        // scan; it is flushed to the segment sidecar on finalization.
-        startClockCorrelationRecording(
-            segmentDirectory: segmentDirectory,
-            trackingSessionID: session.trackingSessionId)
         // B-09: "recording started" must be proven, not assumed: the
         // camera pipeline must be live AND the streaming database must
         // exist with a real header on disk.

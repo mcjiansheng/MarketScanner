@@ -23,6 +23,7 @@ enum MobileOnlyWorkflowState: String, Codable, Equatable, CaseIterable {
     case resolvingTags
     case exporting
     case completed
+    case rescanRequired = "rescan_required"
     case failed
     case cancelled
     case interrupted
@@ -30,7 +31,7 @@ enum MobileOnlyWorkflowState: String, Codable, Equatable, CaseIterable {
     /// States that can be resumed after an app relaunch.
     var isResumable: Bool {
         switch self {
-        case .completed, .failed, .cancelled, .idle:
+        case .completed, .rescanRequired, .failed, .cancelled, .idle:
             return false
         case .interrupted:
             return true
@@ -63,18 +64,20 @@ enum MobileOnlyWorkflowState: String, Codable, Equatable, CaseIterable {
         case .finalizingScan:
             return [.snapshotting, .idle, .failed, .interrupted]
         case .snapshotting:
-            return [.fastProcessing, .failed, .cancelled, .interrupted]
+            return [.fastProcessing, .rescanRequired, .failed, .cancelled, .interrupted]
         case .fastProcessing:
-            return [.deepProcessing, .buildingTrajectory, .failed, .cancelled, .interrupted]
+            return [.deepProcessing, .buildingTrajectory, .rescanRequired, .failed, .cancelled, .interrupted]
         case .deepProcessing:
-            return [.buildingTrajectory, .failed, .cancelled, .interrupted]
+            return [.buildingTrajectory, .rescanRequired, .failed, .cancelled, .interrupted]
         case .buildingTrajectory:
-            return [.resolvingTags, .failed, .cancelled, .interrupted]
+            return [.resolvingTags, .rescanRequired, .failed, .cancelled, .interrupted]
         case .resolvingTags:
-            return [.exporting, .failed, .cancelled, .interrupted]
+            return [.exporting, .rescanRequired, .failed, .cancelled, .interrupted]
         case .exporting:
-            return [.completed, .failed, .cancelled, .interrupted]
+            return [.completed, .rescanRequired, .failed, .cancelled, .interrupted]
         case .completed:
+            return [.idle, .pickingMap, .configuringScan, .snapshotting]
+        case .rescanRequired:
             return [.idle, .pickingMap, .configuringScan, .snapshotting]
         case .failed:
             return [.idle, .pickingMap, .configuringScan, .snapshotting]
@@ -110,6 +113,7 @@ enum MobileOnlyWorkflowState: String, Codable, Equatable, CaseIterable {
         case .resolvingTags: return "解析价签"
         case .exporting: return "导出结果"
         case .completed: return "已完成"
+        case .rescanRequired: return "需要重新扫描整个会话"
         case .failed: return "失败"
         case .cancelled: return "已取消"
         case .interrupted: return "已中断"

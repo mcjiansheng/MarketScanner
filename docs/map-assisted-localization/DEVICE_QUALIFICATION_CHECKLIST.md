@@ -1,15 +1,20 @@
 # 真实 LiDAR iPhone 资格验证清单
 
-> 文档状态：**当前有效，尚未执行**。最后核对日期：2026-07-28。
+> 文档状态：**当前有效，尚未执行**。最后核对日期：2026-08-07。
 
 本清单用于 P5 人工真机执行。勾选、日志和 JSON 声明必须来自实际操作者；fixture、模拟器、本机 Swift 测试和 CI 均不能替代。本仓库目前没有真实设备证据，因此结论保持 **NOT EXECUTED / NO-GO**。
+
+当前 `mobile-only-v1-release-candidate-blocker-closeout` 仍不具备 `DEVICE LAB TESTABLE` 状态。开始本清单前必须先完成并保存当前 exact SHA 的 GitHub Actions、平台正确的 iOS Simulator/iphoneos clean compile-link、独立只读代码审查以及 Replay/FAR 冻结证据；缺少任一项时只能做 developer smoke，不能把运行结果登记为正式 Device Lab。
 
 ## 执行前冻结
 
 - 记录操作者、日期、iPhone 型号、iOS build、LiDAR availability；
 - 记录 App 40 位 Git SHA、build ID，并提供所有 native 静态库文件给 collector 重算 SHA-256；
 - App Git SHA 必须精确等于本轮正式 release manifest 的 `git_sha`；当前 V1 使用同仓库同 SHA 合同，PC/iOS 若确需不同 SHA，必须先引入版本化 release-bundle identity，禁止现场静默豁免；
+- 记录 `.github/marketscanner-repair-v2-wave.json` 的 implementation/validation SHA，并证明本次 App SHA 对应的 required Actions jobs 可见且成功；
+- 保存 iphoneos 与 iphonesimulator 各自的 native dependency manifest v2，核对 archive/fat/nested Mach-O 架构和 `LC_BUILD_VERSION` platform，禁止 device/simulator 依赖混用；
 - 记录 prior-map ID，并提供导入的原始 prior-map package 给 collector 重算 SHA-256；
+- 记录显式 store ID 和 map name；原值必须符合 NFC、UTF-8 byte limit、无首尾空白、无 hidden/path/control 字符和单一安全路径组件合同；
 - 记录测试区域尺寸、Files provider、初始可用空间、电量和热状态；
 - 保证每个 run 使用唯一 run ID，失败 run 不删除、不重命名成成功。
 
@@ -29,6 +34,9 @@
 | `low_disk` | 可用空间逼近产品阈值 | 资源保护、日志和最终状态一致 |
 | `thermal_serious` | 真机达到 serious 并记录系统状态 | 节流/告警有证据，数据库安全 |
 | `checkpoint_cleanup` | 对已 finalized 的旧 checkpoint 执行显式确认清理 | 同 identity、时间、SHA CAS；审计失败不删除 |
+| `route_a_fallback` | 构造 Fast 质量失败并允许至多一次 Full existing-graph optimization | Full 仍失败时明确 `RESCAN_SESSION`；不得进入 True sensor Deep |
+| `result_commit_relaunch` | 在 result validating/committing 边界执行 crash/relaunch | receipt 可恢复 commit→completed 窗口；result 已冻结且无重复发布 |
+| `business_identity` | 分别尝试合法、缺失、首尾空白和路径型 store/map identity | 非法输入在导入/任务创建前 fail closed，合法 manifest 保留 exact identity |
 
 异常 run 的 `expectedSessionOutcome` 使用 `interrupted_or_ineligible`，正常完成且可处理的 run 使用 `finalized_eligible`。每个 run 至少附一份真实日志、屏幕录制或系统诊断文件，并填写所有 `operatorAssertions=true`；任何 false/缺项都会使整体 FAIL。
 
@@ -43,6 +51,8 @@ python3 tools/Qualification/qualification.py device \
 ```
 
 自动门检查 metadata、continuous streaming、raw DB、required sidecars、capture health、processing eligibility、live checkpoint、tracking/prior identity、复制 receipt/package 的实际逐文件 SHA、同尺寸 mutation、路径隐私和本地副本保留。输出为 FAIL 时不得手改结果；修复代码后使用新 App SHA、新 run ID 和新输出文件重测。
+
+Mobile-Only run 还必须保存 Route A 的 Fast/Full/RESCAN disposition、snapshot generation/manifest SHA、clock/trace/burst watermarks、peak RSS/disk/battery/thermal samples、result commit receipt、result manifest/workbook SHA，以及 quarantine（若发生）的 immutable diagnostic。CPU fallback 不得标记成 GPU 成功，未采到的 resource measurement 必须按 fail-closed 处理。
 
 ## 人工签收
 

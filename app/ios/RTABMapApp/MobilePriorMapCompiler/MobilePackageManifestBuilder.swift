@@ -77,7 +77,15 @@ enum MobilePackageManifestBuilder {
 
     private static func stringField(_ item: [String: Any], _ key: String) -> String {
         guard let value = item[key] else { return "" }
-        if let number = value as? Int { return String(number) }
+        // Snapshot artifact sizes are intentionally accumulated as Int64
+        // to detect overflow. After a manifest round-trip Foundation may
+        // expose the same JSON integer as NSNumber/Int. Normalize every
+        // strict JSON integer representation so the pre-commit and resume
+        // package digests are identical; booleans and fractional values
+        // remain excluded.
+        if let number = StrictJSONScalar.integer(value) {
+            return String(number)
+        }
         if let text = value as? String { return text }
         return ""
     }

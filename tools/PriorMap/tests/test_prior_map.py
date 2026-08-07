@@ -328,6 +328,64 @@ class CoordinateSystemTests(unittest.TestCase):
 
 
 class IOSCoreContractTests(unittest.TestCase):
+    def test_graph_reader_bridge_rejects_malformed_blobs(self) -> None:
+        xcrun = shutil.which("xcrun")
+        if xcrun is None:
+            self.skipTest("xcrun is unavailable outside the macOS build environment")
+        repository = Path(__file__).resolve().parents[3]
+        test_source = Path(__file__).with_name("graph_reader_bridge_tests.mm")
+        implementation = (
+            repository / "app/ios/RTABMapApp/MSRTABMapGraphReaderBridge.mm"
+        )
+        include_directory = repository / "app/ios/RTABMapApp"
+        with tempfile.TemporaryDirectory() as temporary:
+            executable = Path(temporary) / "graph-reader-bridge-tests"
+            compile_result = subprocess.run(
+                [
+                    xcrun,
+                    "clang++",
+                    "-std=c++17",
+                    "-x",
+                    "objective-c++",
+                    str(test_source),
+                    str(implementation),
+                    f"-I{include_directory}",
+                    "-lsqlite3",
+                    "-o",
+                    str(executable),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(compile_result.returncode, 0, compile_result.stderr)
+            run_result = subprocess.run(
+                [str(executable)],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(run_result.returncode, 0, run_result.stderr)
+            self.assertIn("graph reader bridge tests passed", run_result.stdout)
+
+        swift_reader = (
+            repository
+            / "app/ios/RTABMapApp/MobileOnlyWorkflow/MobileGraphReader.swift"
+        ).read_text(encoding="utf-8")
+        self.assertRegex(
+            swift_reader,
+            r"static func projectToSE2\([\s\S]*?\) throws -> SE2Transform",
+        )
+        self.assertNotIn("return SE2Transform.identity", swift_reader)
+        for required_token in (
+            "node pointer/count mismatch",
+            "link pointer/count mismatch",
+            "node id must be positive and unique",
+            "link endpoint missing from node inventory",
+            "projection policy version mismatch",
+        ):
+            self.assertIn(required_token, swift_reader)
+
     def test_swift_workflow_state_and_se2_projection(self) -> None:
         xcrun = shutil.which("xcrun")
         if xcrun is None:
@@ -479,6 +537,21 @@ class IOSCoreContractTests(unittest.TestCase):
                 env=environment,
             )
             self.assertEqual(compile_result.returncode, 0, compile_result.stderr)
+            absolute_prior_contract_result = subprocess.run(
+                [str(executable), "--absolute-prior-contract", "run"],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                absolute_prior_contract_result.returncode,
+                0,
+                absolute_prior_contract_result.stderr,
+            )
+            self.assertIn(
+                "Absolute prior/native targeted contract tests passed",
+                absolute_prior_contract_result.stdout,
+            )
             run_result = subprocess.run(
                 [str(executable)],
                 check=False,
@@ -487,17 +560,116 @@ class IOSCoreContractTests(unittest.TestCase):
             )
             self.assertEqual(run_result.returncode, 0, run_result.stderr)
             self.assertIn("Swift tests passed", run_result.stdout)
+            # The 100k-record finalization qualification runs in its own
+            # process. ru_maxrss is a lifetime high-water mark, so the
+            # full suite's unrelated clock/workbook/replay allocations
+            # must not contaminate this frozen 256 MiB gate.
+            finalization_result = subprocess.run(
+                [str(executable), "--finalization-scale"],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                finalization_result.returncode,
+                0,
+                finalization_result.stderr + "\n" + finalization_result.stdout,
+            )
+            print(finalization_result.stdout.strip())
             match = re.search(
                 r"(?m)^Finalization test peak RSS bytes: (\d+)$",
-                run_result.stdout,
+                finalization_result.stdout,
             )
-            self.assertIsNotNone(match, run_result.stdout)
+            self.assertIsNotNone(match, finalization_result.stdout)
             peak_rss_bytes = int(match.group(1))
             self.assertLess(
                 peak_rss_bytes,
                 256 * 1024 * 1024,
                 f"100k-record finalization peak RSS was {peak_rss_bytes} bytes",
             )
+            self.assertRegex(
+                finalization_result.stdout,
+                r"(?m)^Finalization test records: 300000$",
+            )
+            for metric in (
+                "input bytes", "temporary disk bytes", "wall seconds",
+                "CPU seconds",
+            ):
+                self.assertRegex(
+                    finalization_result.stdout,
+                    rf"(?m)^Finalization test {metric}: [0-9]+(?:\.[0-9]+)?$",
+                )
+            trace_scale_result = subprocess.run(
+                [str(executable), "--trace-compaction-scale"],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                trace_scale_result.returncode,
+                0,
+                trace_scale_result.stderr + "\n" + trace_scale_result.stdout,
+            )
+            print(trace_scale_result.stdout.strip())
+            trace_match = re.search(
+                r"(?m)^Trace compaction peak RSS bytes: (\d+)$",
+                trace_scale_result.stdout,
+            )
+            self.assertIsNotNone(trace_match, trace_scale_result.stdout)
+            trace_peak_rss = int(trace_match.group(1))
+            self.assertLess(
+                trace_peak_rss,
+                256 * 1024 * 1024,
+                f"1.728M transition-storm compaction peak RSS was {trace_peak_rss} bytes",
+            )
+            self.assertRegex(
+                trace_scale_result.stdout,
+                r"(?m)^Trace compaction input records: 1728000$",
+            )
+            for metric in ("wall seconds", "CPU seconds"):
+                self.assertRegex(
+                    trace_scale_result.stdout,
+                    rf"(?m)^Trace compaction {metric}: [0-9]+(?:\.[0-9]+)?$",
+                )
+            self.assertIn(
+                "Trace compaction temporary disk bytes: 0",
+                trace_scale_result.stdout,
+            )
+            tag_scale_result = subprocess.run(
+                [str(executable), "--tag-evidence-scale"],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                tag_scale_result.returncode,
+                0,
+                tag_scale_result.stderr + "\n" + tag_scale_result.stdout,
+            )
+            print(tag_scale_result.stdout.strip())
+            tag_match = re.search(
+                r"(?m)^Tag evidence peak RSS bytes: (\d+)$",
+                tag_scale_result.stdout,
+            )
+            self.assertIsNotNone(tag_match, tag_scale_result.stdout)
+            tag_peak_rss = int(tag_match.group(1))
+            self.assertLess(
+                tag_peak_rss,
+                768 * 1024 * 1024,
+                f"200k burst/observation evidence peak RSS was {tag_peak_rss} bytes",
+            )
+            self.assertRegex(
+                tag_scale_result.stdout,
+                r"(?m)^Tag evidence input records: 400000$",
+            )
+            for metric in (
+                "input bytes", "temporary disk bytes", "wall seconds",
+                "CPU seconds",
+            ):
+                self.assertRegex(
+                    tag_scale_result.stdout,
+                    rf"(?m)^Tag evidence {metric}: [0-9]+(?:\.[0-9]+)?$",
+                )
             # V1R4 §14.2: the Map Library generation-CAS scenario runs as
             # its own process (same pattern as --xlsx-scale) so the default
             # host mode stays inside the frozen peak-RSS gate.
@@ -509,6 +681,260 @@ class IOSCoreContractTests(unittest.TestCase):
             )
             self.assertEqual(cas_result.returncode, 0, cas_result.stderr)
             self.assertIn("map library CAS passed", cas_result.stdout)
+
+            # RC-HIGH: exercise the map-quarantine transaction with real
+            # process death, not a caught Swift error. Each worker exits at a
+            # different durable rename/fsync boundary; a fresh process then
+            # enters through list/map/rebuild and must reconcile the same tree.
+            prior_map_id = "crash-recovery-map"
+            package_sha = "c" * 64
+            crash_cases = (
+                ("after_payload", "list", 71),
+                ("after_diagnostic", "map", 72),
+                ("after_publish", "rebuild", 73),
+            )
+            recovered_roots: list[Path] = []
+            for phase, recovery_entry, expected_exit in crash_cases:
+                crash_root = Path(temporary) / f"map-quarantine-{phase}" / "Maps"
+                crash_result = subprocess.run(
+                    [
+                        str(executable),
+                        "--map-quarantine-crash-worker",
+                        str(crash_root),
+                        phase,
+                        "unused",
+                    ],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(
+                    crash_result.returncode,
+                    expected_exit,
+                    crash_result.stderr + crash_result.stdout,
+                )
+                source = crash_root / "packages" / prior_map_id / package_sha
+                quarantine_root = crash_root / "quarantine" / prior_map_id
+                self.assertFalse(source.exists(), phase)
+                self.assertTrue(quarantine_root.is_dir(), phase)
+
+                recovery_result = subprocess.run(
+                    [
+                        str(executable),
+                        "--map-quarantine-crash-worker",
+                        str(crash_root),
+                        "recover",
+                        recovery_entry,
+                    ],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(
+                    recovery_result.returncode,
+                    0,
+                    recovery_result.stderr + recovery_result.stdout,
+                )
+                self.assertIn("recovered listed=0 registry=0", recovery_result.stdout)
+                entries = sorted(quarantine_root.iterdir())
+                hidden = [item for item in entries if item.name.startswith(".")]
+                finals = [item for item in entries if not item.name.startswith(".")]
+                self.assertFalse(hidden, f"{phase}: {hidden}")
+                self.assertEqual(len(finals), 1, f"{phase}: {entries}")
+                self.assertTrue(
+                    source.exists() ^ finals[0].is_dir(),
+                    f"{phase}: source/final outcome must be exclusive",
+                )
+                diagnostic = finals[0] / "quarantine_diagnostic.json"
+                self.assertTrue(diagnostic.is_file())
+                self.assertEqual(diagnostic.stat().st_mode & 0o777, 0o444)
+                self.assertEqual(finals[0].stat().st_mode & 0o777, 0o555)
+                registry = json.loads((crash_root / "registry.json").read_text())
+                self.assertEqual(registry["map_count"], 0)
+                self.assertFalse(
+                    any(".pending" in item.get("package_directory", "")
+                        for item in registry["maps"])
+                )
+                recovered_roots.append(crash_root)
+
+            # A quarantine transaction must reject symlinked destination
+            # roots before it writes a diagnostic or renames the package.
+            for symlink_level in ("base", "map"):
+                symlink_root = (
+                    Path(temporary)
+                    / f"map-quarantine-symlink-{symlink_level}"
+                    / "Maps"
+                )
+                symlink_root.mkdir(parents=True)
+                external = Path(temporary) / f"quarantine-external-{symlink_level}"
+                external.mkdir()
+                if symlink_level == "base":
+                    (symlink_root / "quarantine").symlink_to(
+                        external, target_is_directory=True
+                    )
+                else:
+                    (symlink_root / "quarantine").mkdir()
+                    (symlink_root / "quarantine" / prior_map_id).symlink_to(
+                        external, target_is_directory=True
+                    )
+                symlink_result = subprocess.run(
+                    [
+                        str(executable),
+                        "--map-quarantine-crash-worker",
+                        str(symlink_root),
+                        "after_payload",
+                        "unused",
+                    ],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(
+                    symlink_result.returncode,
+                    19,
+                    symlink_result.stderr + symlink_result.stdout,
+                )
+                self.assertEqual(
+                    list(external.iterdir()),
+                    [],
+                    f"{symlink_level}: quarantine must not follow destination symlink",
+                )
+
+            # A recovered published quarantine and a recreated production
+            # source are conflicting copies. Recovery must preserve both and
+            # fail closed instead of guessing which bytes should win.
+            conflict_root = recovered_roots[1]
+            conflict_source = (
+                conflict_root / "packages" / prior_map_id / package_sha
+            )
+            conflict_source.mkdir(parents=True)
+            (conflict_source / "recreated.bin").write_bytes(b"recreated\n")
+            conflict_final = next(
+                item
+                for item in (conflict_root / "quarantine" / prior_map_id).iterdir()
+                if not item.name.startswith(".")
+            )
+            conflict_result = subprocess.run(
+                [
+                    str(executable),
+                    "--map-quarantine-crash-worker",
+                    str(conflict_root),
+                    "recover",
+                    "list",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(conflict_result.returncode, 19)
+            self.assertTrue(conflict_source.is_dir())
+            self.assertTrue(conflict_final.is_dir())
+
+            # Strict recovery is fail-closed. A non-0444 diagnostic and an
+            # unknown transaction name are not repaired by guessing, while
+            # the already-published payload remains present and auditable.
+            strict_root = Path(temporary) / "map-quarantine-strict" / "Maps"
+            strict_crash = subprocess.run(
+                [
+                    str(executable),
+                    "--map-quarantine-crash-worker",
+                    str(strict_root),
+                    "after_diagnostic",
+                    "unused",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(strict_crash.returncode, 72, strict_crash.stderr)
+            strict_quarantine = strict_root / "quarantine" / prior_map_id
+            pending = next(strict_quarantine.glob(".*.pending"))
+            pending_diagnostic = pending / "quarantine_diagnostic.json"
+            pending_diagnostic.chmod(0o644)
+            strict_recovery = subprocess.run(
+                [
+                    str(executable),
+                    "--map-quarantine-crash-worker",
+                    str(strict_root),
+                    "recover",
+                    "list",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(strict_recovery.returncode, 19)
+            self.assertTrue(pending.is_dir())
+            self.assertFalse(
+                (strict_root / "packages" / prior_map_id / package_sha).exists()
+            )
+            pending_diagnostic.chmod(0o444)
+            pending_payload = pending / "payload.bin"
+            pending.chmod(0o755)
+            pending_payload.chmod(0o644)
+            pending_payload.write_bytes(b"tampered-after-crash\n")
+            pending_payload.chmod(0o444)
+            pending.chmod(0o555)
+            hash_recovery = subprocess.run(
+                [
+                    str(executable),
+                    "--map-quarantine-crash-worker",
+                    str(strict_root),
+                    "recover",
+                    "list",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(hash_recovery.returncode, 19)
+            self.assertTrue(pending.is_dir())
+            pending.chmod(0o755)
+            pending_payload.chmod(0o644)
+            pending_payload.write_bytes(b"crash-window-payload\n")
+            pending_payload.chmod(0o444)
+            pending.chmod(0o555)
+            strict_retry = subprocess.run(
+                [
+                    str(executable),
+                    "--map-quarantine-crash-worker",
+                    str(strict_root),
+                    "recover",
+                    "list",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                strict_retry.returncode,
+                0,
+                strict_retry.stderr + strict_retry.stdout,
+            )
+
+            published_root = recovered_roots[0]
+            published_quarantine = published_root / "quarantine" / prior_map_id
+            unknown = published_quarantine / ".unknown.pending"
+            unknown.mkdir()
+            unknown_result = subprocess.run(
+                [
+                    str(executable),
+                    "--map-quarantine-crash-worker",
+                    str(published_root),
+                    "recover",
+                    "list",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(unknown_result.returncode, 19)
+            self.assertEqual(
+                len([p for p in published_quarantine.iterdir()
+                     if not p.name.startswith(".")]),
+                1,
+            )
+            unknown.rmdir()
             # P7R6A: the device-side strict parser and the PC reader must
             # classify every shared recovery fixture identically.
             from tools.PriorMap.tests.test_stage3 import (
@@ -554,7 +980,9 @@ class IOSCoreContractTests(unittest.TestCase):
                 )
             workbook = Path(temporary) / "integrity.xlsx"
             write_workbook(workbook, fixture_rows())
-            package = convert_workbook(workbook, Path(temporary) / "package")
+            package = convert_workbook(
+                workbook, Path(temporary) / "package", store_id="s1"
+            )
             valid_result = subprocess.run(
                 [str(executable), str(package)],
                 check=False,
@@ -979,7 +1407,9 @@ class PriorMapConversionTests(unittest.TestCase):
         )
 
     def test_conversion_preserves_supported_unknown_hidden_and_business_fields(self) -> None:
-        package = convert_workbook(self.workbook, self.root / "package")
+        package = convert_workbook(
+            self.workbook, self.root / "package", store_id="s1"
+        )
         manifest = json.loads((package / "manifest.json").read_text())
         elements = json.loads((package / "elements.json").read_text())["elements"]
         report = json.loads(
@@ -1003,7 +1433,9 @@ class PriorMapConversionTests(unittest.TestCase):
         self.assertTrue((package / "preview.png").read_bytes().startswith(b"\x89PNG\r\n\x1a\n"))
 
     def test_package_integrity_ignores_macos_filesystem_metadata(self) -> None:
-        package = convert_workbook(self.workbook, self.root / "package")
+        package = convert_workbook(
+            self.workbook, self.root / "package", store_id="s1"
+        )
         expected_manifest = json.loads(
             (package / "package_manifest.json").read_text(encoding="utf-8")
         )
@@ -1024,7 +1456,9 @@ class PriorMapConversionTests(unittest.TestCase):
         )
 
     def test_distance_fields_are_decodable_bounded_and_integrity_checked(self) -> None:
-        package = convert_workbook(self.workbook, self.root / "package")
+        package = convert_workbook(
+            self.workbook, self.root / "package", store_id="s1"
+        )
         payload = json.loads((package / "distance_fields.json").read_text())
         self.assertEqual(payload["format"], "MarketScannerDistanceFields")
         self.assertEqual(
@@ -1106,7 +1540,9 @@ class PriorMapConversionTests(unittest.TestCase):
         self.assertGreater(value_at(2.5, 2.5), 50)
 
     def test_road_graph_normalizes_numeric_ids_and_spatial_query_is_bounded(self) -> None:
-        package = convert_workbook(self.workbook, self.root / "package")
+        package = convert_workbook(
+            self.workbook, self.root / "package", store_id="s1"
+        )
         graph = json.loads((package / "road_graph.json").read_text())
         self.assertEqual({node["id"] for node in graph["nodes"]}, {"1", "2"})
         self.assertEqual(len(graph["edges"]), 1)
@@ -1128,7 +1564,9 @@ class PriorMapConversionTests(unittest.TestCase):
         self.assertLess(len(nearby), len(road_cells) // 100)
 
     def test_validator_rejects_corrupt_or_cross_file_inconsistent_packages(self) -> None:
-        package = convert_workbook(self.workbook, self.root / "package")
+        package = convert_workbook(
+            self.workbook, self.root / "package", store_id="s1"
+        )
         cases: list[tuple[str, str, object]] = [
             (
                 "bad-hash",
@@ -1183,8 +1621,12 @@ class PriorMapConversionTests(unittest.TestCase):
         self.assertFalse(validate_package(invalid_png)["valid"])
 
     def test_conversion_is_reproducible(self) -> None:
-        first = convert_workbook(self.workbook, self.root / "first")
-        second = convert_workbook(self.workbook, self.root / "second")
+        first = convert_workbook(
+            self.workbook, self.root / "first", store_id="s1"
+        )
+        second = convert_workbook(
+            self.workbook, self.root / "second", store_id="s1"
+        )
         for name in (
             "package_manifest.json",
             "manifest.json",
@@ -1200,7 +1642,9 @@ class PriorMapConversionTests(unittest.TestCase):
             self.assertEqual((first / name).read_bytes(), (second / name).read_bytes(), name)
 
     def test_replay_checks_error_road_assignment_and_tracking_state(self) -> None:
-        package = convert_workbook(self.workbook, self.root / "package")
+        package = convert_workbook(
+            self.workbook, self.root / "package", store_id="s1"
+        )
         report = replay(
             package,
             self.root / "replay",
@@ -1219,7 +1663,9 @@ class PriorMapConversionTests(unittest.TestCase):
         self.assertGreater(report["summary"]["maximum_yaw_error_deg"], 0.0)
 
     def test_rotation_drift_changes_xy_and_reports_yaw_error(self) -> None:
-        package = convert_workbook(self.workbook, self.root / "package")
+        package = convert_workbook(
+            self.workbook, self.root / "package", store_id="s1"
+        )
         baseline = replay(package, self.root / "baseline", floor_id="1", seed=12)
         rotated = replay(
             package,
@@ -1240,7 +1686,9 @@ class PriorMapConversionTests(unittest.TestCase):
         )
 
     def test_stage_two_replay_improves_drift_and_rejects_wrong_initialization(self) -> None:
-        package = convert_workbook(self.workbook, self.root / "package")
+        package = convert_workbook(
+            self.workbook, self.root / "package", store_id="s1"
+        )
         report = replay_stage2(
             package,
             self.root / "stage2-replay",
@@ -1317,7 +1765,9 @@ class PriorMapStrictSchemaTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         workbook = self.root / "fixture.xlsx"
         write_workbook(workbook, fixture_rows())
-        self.package = convert_workbook(workbook, self.root / "package")
+        self.package = convert_workbook(
+            workbook, self.root / "package", store_id="s1"
+        )
 
     def tearDown(self) -> None:
         self.temp.cleanup()

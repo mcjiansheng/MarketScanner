@@ -22,6 +22,13 @@
 
 #include <stdint.h>
 
+/// Product-derived hard bounds shared by the Objective-C++ reader and
+/// its Swift validation layer.  The reader rejects a database before an
+/// allocation can grow beyond these limits.
+#define MS_MOBILE_GRAPH_MAX_NODES INT64_C(200000)
+#define MS_MOBILE_GRAPH_MAX_LINKS INT64_C(400000)
+#define MS_MOBILE_GRAPH_PROJECTION_POLICY_VERSION 1
+
 #ifdef __cplusplus
 extern "C" {
 #endif

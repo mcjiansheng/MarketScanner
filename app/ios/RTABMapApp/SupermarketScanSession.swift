@@ -25,6 +25,11 @@ struct PriceTagRecord: Codable {
 }
 
 struct ScanSegmentMetadata: Codable {
+    /// Formal finalized-session schema identity. Older metadata that lacks
+    /// these fields remains readable for diagnostics, but mobile processing
+    /// never snapshots or publishes it.
+    let format: String?
+    let version: Int?
     let segmentIndex: Int
     /// `continuous_streaming` means that all nodes belong to one uninterrupted
     /// RTAB-Map database. `segmented` is the legacy rollover workflow. PC
@@ -108,13 +113,10 @@ struct ScanSegmentMetadata: Codable {
 /// A durable burst of price-tag observations (V1R4 §13.1, V1R5 §5.2):
 /// consecutive observations of the same barcode within a bounded time
 /// window, written to `tag_observation_bursts.jsonl` as one JSON object
-/// per line. Node IDs are not known on the phone (the observation schema
-/// binds through the node timebase); the PC parser resolves node
-/// bindings from `nodeTimebaseMin`/`nodeTimebaseMax` and validates the
-/// sidecar against the metadata watermarks fail-closed. `frameCount` is
-/// the number of UNIQUE frames (V1R5 §5.1 fixes the V1R4 first-frame
-/// double count); `frameIds` lets the parser verify uniqueness and the
-/// exact count without trusting the summary field.
+/// per line. Burst v2 stores the exact node binding and quality evidence
+/// for every frame; summary fields are redundant audit values that the
+/// parser recomputes from `frames`. `frameCount` is the number of UNIQUE
+/// frames (V1R5 §5.1 fixes the V1R4 first-frame double count).
 struct TagObservationBurstRecord: Codable {
     let format: String
     let version: Int
@@ -122,22 +124,21 @@ struct TagObservationBurstRecord: Codable {
     let sequence: Int
     let barcode: String
     let symbology: String
+    let priorMapId: String
+    let priorMapSha256: String
     let floorId: String
     let frameCount: Int
     let firstFrameTimestamp: TimeInterval
     let lastFrameTimestamp: TimeInterval
-    let nodeTimebaseMin: TimeInterval
-    let nodeTimebaseMax: TimeInterval
+    let boundNodeIdMin: Int64
+    let boundNodeIdMax: Int64
     let depthQuality: Double
     let viewAngle: String
     let trackingQuality: String
     let localizationConfidenceMean: Double
-    let rawSamples: [PriorMapTagPoint3D]
     let trackingSessionId: String
     let complete: Bool
-    /// V1R5 §5.2: per-frame identity (unique frame ids, exact count).
-    let frameIds: [String]
-    let frameSamples: [TagBurstFrameSample]
+    let frames: [TagBurstFrameSample]
 
     enum CodingKeys: String, CodingKey {
         case format
@@ -146,21 +147,21 @@ struct TagObservationBurstRecord: Codable {
         case sequence
         case barcode
         case symbology
+        case priorMapId = "prior_map_id"
+        case priorMapSha256 = "prior_map_sha256"
         case floorId = "floor_id"
         case frameCount = "frame_count"
         case firstFrameTimestamp = "first_frame_timestamp"
         case lastFrameTimestamp = "last_frame_timestamp"
-        case nodeTimebaseMin = "node_timebase_min"
-        case nodeTimebaseMax = "node_timebase_max"
+        case boundNodeIdMin = "bound_node_id_min"
+        case boundNodeIdMax = "bound_node_id_max"
         case depthQuality = "depth_quality"
         case viewAngle = "view_angle"
         case trackingQuality = "tracking_quality"
         case localizationConfidenceMean = "localization_confidence_mean"
-        case rawSamples = "raw_3d_samples"
         case trackingSessionId = "tracking_session_id"
         case complete
-        case frameIds = "frame_ids"
-        case frameSamples = "frame_samples"
+        case frames
     }
 }
 
@@ -246,34 +247,27 @@ private struct PendingTagBurst {
     let sequence: Int
     let barcode: String
     let symbology: String
+    let priorMapId: String
+    let priorMapSha256: String
     let floorId: String
     let trackingSessionId: String
     var firstFrameTimestamp: TimeInterval
     var lastFrameTimestamp: TimeInterval
     var frameCount: Int
-    var nodeTimebaseMin: TimeInterval
-    var nodeTimebaseMax: TimeInterval
-    var depthInlierRatioSum: Double
-    var depthSampleCount: Int
-    var localizationConfidenceSum: Double
-    var localizationStateVotes: [String: Int]
-    var viewVotes: (front: Int, back: Int, unknown: Int)
-    var rawSamples: [PriorMapTagPoint3D]
-    /// V1R5 §5.2: unique frame ids in arrival order.
-    var frameIds: [String]
     var frameSamples: [TagBurstFrameSample]
-    let maxRawSamples: Int
 
     init(
         burstId: String,
         sequence: Int,
         observation: PriorMapTagObservationRecord,
-        maxRawSamples: Int
+        boundNodeID: Int64
     ) {
         self.burstId = burstId
         self.sequence = sequence
         self.barcode = observation.payload
         self.symbology = observation.symbology
+        self.priorMapId = observation.priorMapId
+        self.priorMapSha256 = observation.priorMapSha256
         self.floorId = observation.floorId
         self.trackingSessionId = observation.trackingSessionId
         self.firstFrameTimestamp = observation.frameTimestamp
@@ -281,18 +275,8 @@ private struct PendingTagBurst {
         // V1R5 B-01: the burst starts EMPTY; ingest() below counts the
         // first frame exactly once.
         self.frameCount = 0
-        self.nodeTimebaseMin = observation.nodeTimebaseFrameTimestamp
-        self.nodeTimebaseMax = observation.nodeTimebaseFrameTimestamp
-        self.depthInlierRatioSum = 0
-        self.depthSampleCount = 0
-        self.localizationConfidenceSum = 0
-        self.localizationStateVotes = [:]
-        self.viewVotes = (front: 0, back: 0, unknown: 0)
-        self.rawSamples = []
-        self.frameIds = []
         self.frameSamples = []
-        self.maxRawSamples = maxRawSamples
-        ingest(observation)
+        _ = ingest(observation, boundNodeID: boundNodeID)
     }
 
     /// True when the observation carries a valid frame identity (both
@@ -313,108 +297,96 @@ private struct PendingTagBurst {
     /// NOT part of the verified burst; it stays in the observation
     /// sidecar but can never be accepted). All aggregated fields are
     /// updated through this single path (V1R5 §5.1).
-    mutating func ingest(_ observation: PriorMapTagObservationRecord) -> Bool {
+    mutating func ingest(
+        _ observation: PriorMapTagObservationRecord,
+        boundNodeID: Int64
+    ) -> Bool {
         guard let identity = Self.frameIdentity(observation),
-              identity.burstId == burstId else {
+              identity.burstId == burstId,
+              boundNodeID > 0 else {
             return false
         }
         // V1R5 §5.2: frame ids must be unique inside one burst.
-        guard !frameIds.contains(identity.frameId) else {
+        guard !frameSamples.contains(where: { $0.frameId == identity.frameId }) else {
             return false
         }
-        frameIds.append(identity.frameId)
+        let view: String
+        if let normal = observation.surfaceNormalCamera,
+           normal.count == 3,
+           normal.allSatisfy(\.isFinite) {
+            if normal[2] < 0 { view = "front" }
+            else if normal[2] > 0 { view = "back" }
+            else { view = "unknown" }
+        } else {
+            view = "unknown"
+        }
         frameSamples.append(TagBurstFrameSample(
             frameId: identity.frameId,
+            observationId: observation.observationId,
+            boundNodeId: boundNodeID,
             frameTimestamp: observation.frameTimestamp,
-            nodeTimebaseTimestamp: observation.nodeTimebaseFrameTimestamp,
-            observationId: observation.observationId))
+            nodeTimestamp: observation.nodeTimebaseFrameTimestamp,
+            depth: observation.depthSampleCount > 0
+                ? min(1, max(0, observation.depthInlierRatio)) : 0,
+            view: view,
+            tracking: observation.localizationState,
+            confidence: min(1, max(0, observation.localizationConfidence))))
         frameCount += 1
         lastFrameTimestamp = observation.frameTimestamp
-        nodeTimebaseMin = min(nodeTimebaseMin, observation.nodeTimebaseFrameTimestamp)
-        nodeTimebaseMax = max(nodeTimebaseMax, observation.nodeTimebaseFrameTimestamp)
-        if observation.depthSampleCount > 0, observation.depthInlierRatio.isFinite {
-            depthInlierRatioSum += observation.depthInlierRatio
-            depthSampleCount += 1
-        }
-        if observation.localizationConfidence.isFinite {
-            localizationConfidenceSum += observation.localizationConfidence
-        }
-        localizationStateVotes[observation.localizationState, default: 0] += 1
-        if let normal = observation.surfaceNormalCamera, normal.count >= 3 {
-            if normal[2] < 0 {
-                viewVotes.front += 1
-            }
-            else if normal[2] > 0 {
-                viewVotes.back += 1
-            }
-            else {
-                viewVotes.unknown += 1
-            }
-        }
-        else {
-            viewVotes.unknown += 1
-        }
-        if let position = observation.rawMapPosition {
-            rawSamples.append(position)
-            if rawSamples.count > maxRawSamples {
-                rawSamples.removeFirst(rawSamples.count - maxRawSamples)
-            }
-        }
         return true
     }
 
     func depthQuality() -> Double {
-        guard depthSampleCount > 0 else { return 0 }
-        return min(1, max(0, depthInlierRatioSum / Double(depthSampleCount)))
+        guard !frameSamples.isEmpty else { return 0 }
+        return frameSamples.reduce(0) { $0 + $1.depth }
+            / Double(frameSamples.count)
     }
 
     func dominantLocalizationState() -> String {
-        guard let best = localizationStateVotes.max(by: {
-            $0.value == $1.value ? $0.key > $1.key : $0.value < $1.value
-        }) else {
-            return "unknown"
-        }
-        return best.key
+        return dominantVote(frameSamples.map(\.tracking))
     }
 
     func dominantViewAngle() -> String {
-        let votes = [viewVotes.front, viewVotes.back, viewVotes.unknown]
-        guard votes.max() != nil, votes.max()! > 0 else {
+        return dominantVote(frameSamples.map(\.view))
+    }
+
+    private func dominantVote(_ values: [String]) -> String {
+        var counts: [String: Int] = [:]
+        values.forEach { counts[$0, default: 0] += 1 }
+        guard let maximum = counts.values.max(), maximum > 0 else {
             return "unknown"
         }
-        if viewVotes.front >= viewVotes.back, viewVotes.front >= viewVotes.unknown {
-            return "front"
-        }
-        if viewVotes.back >= viewVotes.unknown {
-            return "back"
-        }
-        return "unknown"
+        let winners = counts.filter { $0.value == maximum }
+        return winners.count == 1 ? winners.first!.key : "unknown"
     }
 
     func record(complete: Bool) -> TagObservationBurstRecord {
-        let sampleCount = max(1, frameCount)
+        precondition(!frameSamples.isEmpty)
+        let boundNodeIDs = frameSamples.map(\.boundNodeId)
         return TagObservationBurstRecord(
             format: "MarketScannerPriceTagBurst",
-            version: 1,
+            version: 2,
             burstId: burstId,
             sequence: sequence,
             barcode: barcode,
             symbology: symbology,
+            priorMapId: priorMapId,
+            priorMapSha256: priorMapSha256,
             floorId: floorId,
             frameCount: frameCount,
             firstFrameTimestamp: firstFrameTimestamp,
             lastFrameTimestamp: lastFrameTimestamp,
-            nodeTimebaseMin: nodeTimebaseMin,
-            nodeTimebaseMax: nodeTimebaseMax,
+            boundNodeIdMin: boundNodeIDs.min()!,
+            boundNodeIdMax: boundNodeIDs.max()!,
             depthQuality: depthQuality(),
             viewAngle: dominantViewAngle(),
             trackingQuality: dominantLocalizationState(),
-            localizationConfidenceMean: min(1, max(0, localizationConfidenceSum / Double(sampleCount))),
-            rawSamples: rawSamples,
+            localizationConfidenceMean: frameSamples.reduce(0) {
+                $0 + $1.confidence
+            } / Double(frameSamples.count),
             trackingSessionId: trackingSessionId,
             complete: complete,
-            frameIds: frameIds,
-            frameSamples: frameSamples)
+            frames: frameSamples)
     }
 }
 
@@ -439,6 +411,10 @@ struct ScanCaptureHealth: Codable {
     let firstLocalizationRequiredWriteError: String?
     let localizationTraceRecordCount: Int
     let localizationConstraintRecordCount: Int
+    /// Exact durable row count for `manual_localization_events.jsonl`.
+    /// Optional only for decoding pre-contract local metadata; all newly
+    /// finalized prior-map sessions write a non-nil value, including zero.
+    let manualLocalizationEventCount: Int?
     let localizationStateEventCount: Int
     let localizationLastDurableState: String?
     let localizationEvidenceComplete: Bool
@@ -482,6 +458,7 @@ struct ScanLiveCheckpoint: Codable {
     let priorMapId: String?
     let priorMapSha256: String?
     let floorId: String?
+    let storeId: String?
     let initialMapPose: PriorMapPose2D?
 }
 
@@ -752,6 +729,7 @@ final class SupermarketScanSession {
     private var firstLocalizationRequiredWriteError: String?
     private var localizationTraceRecordCount = 0
     private var localizationConstraintRecordCount = 0
+    private var manualLocalizationEventCount = 0
     private var localizationStateEventCount = 0
     private var localizationRecoveryEventCount = 0
     private var localizationLastRecoveryEpisodeId: Int?
@@ -777,7 +755,6 @@ final class SupermarketScanSession {
     private let tagBurstMaxGapSeconds: TimeInterval = 3.0
     /// Upper bound on raw 3D samples retained per burst; the newest samples
     /// are kept.
-    private let tagBurstMaxRawSamples = 32
 
     private var finalizingScan = false
     var isFinalizingScan: Bool {
@@ -925,6 +902,7 @@ final class SupermarketScanSession {
         firstLocalizationRequiredWriteError = nil
         localizationTraceRecordCount = 0
         localizationConstraintRecordCount = 0
+        manualLocalizationEventCount = 0
         localizationStateEventCount = 0
         localizationRecoveryEventCount = 0
         localizationLastRecoveryEpisodeId = nil
@@ -1544,6 +1522,7 @@ final class SupermarketScanSession {
             priorMapId: scanConfiguration.priorMapId,
             priorMapSha256: scanConfiguration.priorMapSha256,
             floorId: scanConfiguration.floorId,
+            storeId: scanConfiguration.storeID,
             initialMapPose: scanConfiguration.initialMapPose)
     }
 
@@ -1572,6 +1551,7 @@ final class SupermarketScanSession {
             localizationTraceRecordCount: localizationTraceRecordCount,
             localizationConstraintRecordCount:
                 localizationConstraintRecordCount,
+            manualLocalizationEventCount: manualLocalizationEventCount,
             localizationStateEventCount: localizationStateEventCount,
             localizationLastDurableState: lastLocalizationState,
             localizationEvidenceComplete:
@@ -1648,15 +1628,20 @@ final class SupermarketScanSession {
         // back to the legacy zero expectation.
         let expectedRecoveryEventCount =
             snapshot.metadata.captureHealth?.localizationRecoveryEventCount ?? 0
+        let expectedManualEventCount =
+            snapshot.metadata.captureHealth?.manualLocalizationEventCount ?? 0
         if scanConfiguration.workflowMode == .priorMapLocalized {
-            for fileName in [
-                "manual_localization_events.jsonl",
-                "tag_observations.jsonl",
-            ] {
+            for fileName in ["tag_observations.jsonl"] {
                 let url = segmentDirectory.appendingPathComponent(fileName)
                 if !sidecarWriter.fileExists(at: url) {
                     try sidecarWriter.writeAtomic(Data(), to: url)
                 }
+            }
+            let manualURL = segmentDirectory.appendingPathComponent(
+                "manual_localization_events.jsonl")
+            if !sidecarWriter.fileExists(at: manualURL),
+               expectedManualEventCount == 0 {
+                try sidecarWriter.writeAtomic(Data(), to: manualURL)
             }
             // V1R4 §13.1: a burst sidecar is required for processing. An
             // empty file is only created when no burst is expected; a
@@ -1706,6 +1691,13 @@ final class SupermarketScanSession {
                     evidenceValidationBlockers.append(
                         "evidence_bundle_recovery_file_missing_blocker")
                 }
+                if expectedManualEventCount > 0,
+                   !sidecarWriter.fileExists(at: segmentDirectory
+                    .appendingPathComponent(
+                        "manual_localization_events.jsonl")) {
+                    evidenceValidationBlockers.append(
+                        "evidence_bundle_manual_file_missing_blocker")
+                }
                 evidenceValidationBlockers +=
                     LocalizationEvidenceBundleValidator.blockers(
                         in: segmentDirectory,
@@ -1718,6 +1710,8 @@ final class SupermarketScanSession {
                                 captureHealth.localizationTraceRecordCount,
                             constraintRecordCount:
                                 captureHealth.localizationConstraintRecordCount,
+                            manualLocalizationEventCount:
+                                captureHealth.manualLocalizationEventCount ?? 0,
                             stateEventCount:
                                 captureHealth.localizationStateEventCount,
                             lastDurableState: lastDurableState,
@@ -1972,10 +1966,13 @@ final class SupermarketScanSession {
     }
 
     @discardableResult
-    func appendTagObservation(_ observation: PriorMapTagObservationRecord) -> Bool {
+    func appendTagObservation(
+        _ observation: PriorMapTagObservationRecord,
+        boundNodeID: Int64
+    ) -> Bool {
         localizationTransactionLock.lock()
         defer { localizationTransactionLock.unlock() }
-        guard !hasLocalizationRequiredWriteFailure() else {
+        guard !hasLocalizationRequiredWriteFailure(), boundNodeID > 0 else {
             return false
         }
         // V1R5 §5.4: assign the durable burst/frame identity BEFORE the
@@ -2006,7 +2003,7 @@ final class SupermarketScanSession {
         // sidecar may enter burst aggregation. A burst flush failure marks
         // the session processing-ineligible fail-closed (watermark count
         // stays short and the finalization flag flips false).
-        ingestTagObservationBurst(bound)
+        ingestTagObservationBurst(bound, boundNodeID: boundNodeID)
         return true
     }
 
@@ -2029,6 +2026,10 @@ final class SupermarketScanSession {
         if let pending = pendingTagBurst {
             let sameBarcode = pending.barcode == observation.payload
                 && pending.symbology == observation.symbology
+                && pending.priorMapId == observation.priorMapId
+                && pending.priorMapSha256 == observation.priorMapSha256
+                && pending.floorId == observation.floorId
+                && pending.trackingSessionId == observation.trackingSessionId
             // V1R5 review fix: a frame timestamp going BACKWARD (clock
             // rollback) can never join the burst — the gap must be
             // non-negative, otherwise first/last timestamps would drift
@@ -2044,7 +2045,8 @@ final class SupermarketScanSession {
     }
 
     private func ingestTagObservationBurst(
-        _ observation: PriorMapTagObservationRecord
+        _ observation: PriorMapTagObservationRecord,
+        boundNodeID: Int64
     ) {
         guard scanConfiguration.workflowMode == .priorMapLocalized,
               observation.frameTimestamp.isFinite,
@@ -2054,12 +2056,16 @@ final class SupermarketScanSession {
         if var pending = pendingTagBurst {
             let sameBarcode = pending.barcode == observation.payload
                 && pending.symbology == observation.symbology
+                && pending.priorMapId == observation.priorMapId
+                && pending.priorMapSha256 == observation.priorMapSha256
+                && pending.floorId == observation.floorId
+                && pending.trackingSessionId == observation.trackingSessionId
             // V1R5 review fix: negative gaps (clock rollback) never join
             // the burst (see `tagBurstIdentity`).
             let gap = observation.frameTimestamp - pending.lastFrameTimestamp
             let withinGap = gap >= 0 && gap <= tagBurstMaxGapSeconds
             if sameBarcode, withinGap {
-                _ = pending.ingest(observation)
+                _ = pending.ingest(observation, boundNodeID: boundNodeID)
                 pendingTagBurst = pending
                 return
             }
@@ -2070,7 +2076,7 @@ final class SupermarketScanSession {
             burstId: observation.burstId ?? UUID().uuidString,
             sequence: tagBurstSequence,
             observation: observation,
-            maxRawSamples: tagBurstMaxRawSamples)
+            boundNodeID: boundNodeID)
     }
 
     /// Flushes the in-flight burst (if any) as a complete durable record.
@@ -2080,6 +2086,13 @@ final class SupermarketScanSession {
     private func flushPendingTagBurstLocked() {
         guard let pending = pendingTagBurst else { return }
         pendingTagBurst = nil
+        // A malformed/duplicate first frame must make the evidence
+        // incomplete, never terminate the shipping app through the
+        // `PendingTagBurst.record` precondition.
+        guard !pending.frameSamples.isEmpty else {
+            recordTagBurstWriteFailure("empty_complete_burst")
+            return
+        }
         let directory = rootDirectory?.appendingPathComponent(
             "segment_0001", isDirectory: true)
         guard let directory,
@@ -2266,6 +2279,12 @@ final class SupermarketScanSession {
                     result.errorReason ?? "write_failed"
             ]
             recordLocalizationEvidenceFailures(failures)
+        } else {
+            // Advance only after appendLocalizationRecord confirms the
+            // durable JSONL append, matching the recovery watermark rule.
+            captureLock.lock()
+            manualLocalizationEventCount += 1
+            captureLock.unlock()
         }
         return result.succeeded
     }

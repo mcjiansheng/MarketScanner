@@ -13,6 +13,9 @@ enum ShelfAssociationEngine {
     // MARK: - Geometry
 
     struct ShelfSegment {
+        /// Stable primary key from the compiled package. Shelf codes are
+        /// display/business labels and are not unique across an aisle.
+        var shelfSegmentID: String
         var shelfCode: String
         var floorID: String
         /// Longitudinal axis start/end (metres, map frame).
@@ -24,6 +27,7 @@ enum ShelfAssociationEngine {
         /// (dot(point - start, normal) > 0) is on the "front" side,
         /// otherwise on the "back" side (§13.5 side regions).
         var frontNormalM: (Double, Double)
+        var backNormalM: (Double, Double)
         /// AABB used ONLY as an index envelope (§13.5).
         var boundsMinM: (Double, Double)
         var boundsMaxM: (Double, Double)
@@ -42,23 +46,28 @@ enum ShelfAssociationEngine {
 
         /// Convenience initializer for the compiled element fields.
         init(
+            shelfSegmentID: String? = nil,
             shelfCode: String,
             floorID: String,
             startM: (Double, Double),
             endM: (Double, Double),
             axisM: (Double, Double),
             frontNormalM: (Double, Double),
+            backNormalM: (Double, Double)? = nil,
             boundsMinM: (Double, Double),
             boundsMaxM: (Double, Double),
             polygonM: [(Double, Double)]?,
             orientationProvenance: String = "geometry"
         ) {
+            self.shelfSegmentID = shelfSegmentID ?? shelfCode
             self.shelfCode = shelfCode
             self.floorID = floorID
             self.startM = startM
             self.endM = endM
             self.axisM = axisM
             self.frontNormalM = frontNormalM
+            self.backNormalM = backNormalM
+                ?? (-frontNormalM.0, -frontNormalM.1)
             self.boundsMinM = boundsMinM
             self.boundsMaxM = boundsMaxM
             self.polygonM = polygonM
@@ -90,6 +99,7 @@ enum ShelfAssociationEngine {
     /// (when present) fixes the axis sign so the front side is
     /// reproducible across sessions.
     static func makeSegment(
+        shelfSegmentID: String? = nil,
         shelfCode: String,
         floorID: String,
         polygonM: [(Double, Double)]?,
@@ -206,6 +216,7 @@ enum ShelfAssociationEngine {
             normal = (axis.1, -axis.0)
         }
         return ShelfSegment(
+            shelfSegmentID: shelfSegmentID,
             shelfCode: shelfCode,
             floorID: floorID,
             startM: start,
@@ -216,6 +227,60 @@ enum ShelfAssociationEngine {
             boundsMaxM: envelopeMax,
             polygonM: polygonM,
             orientationProvenance: orientationProvenance)
+    }
+
+    /// Builds a production v2 shelf directly from compiler-authored
+    /// start/end/axis/front/back semantics. Polygon and bounds are used
+    /// only for the spatial-index envelope; they cannot change the
+    /// business direction or side classification.
+    static func makeCompiledSegment(
+        _ compiled: PriorMapShelfSegmentV2,
+        polygonM: [(Double, Double)]?,
+        boundsMinM: (Double, Double)?,
+        boundsMaxM: (Double, Double)?
+    ) -> ShelfSegment? {
+        var envelopeMin = boundsMinM
+        var envelopeMax = boundsMaxM
+        if envelopeMin == nil || envelopeMax == nil {
+            let envelopePoints = (polygonM ?? [])
+                + [
+                    (compiled.longitudinalStartM[0], compiled.longitudinalStartM[1]),
+                    (compiled.longitudinalEndM[0], compiled.longitudinalEndM[1]),
+                ]
+            guard !envelopePoints.isEmpty else { return nil }
+            envelopeMin = (
+                envelopePoints.map(\.0).min()!,
+                envelopePoints.map(\.1).min()!)
+            envelopeMax = (
+                envelopePoints.map(\.0).max()!,
+                envelopePoints.map(\.1).max()!)
+        }
+        guard let envelopeMin, let envelopeMax,
+              envelopeMax.0 >= envelopeMin.0,
+              envelopeMax.1 >= envelopeMin.1 else {
+            return nil
+        }
+        return ShelfSegment(
+            shelfSegmentID: compiled.shelfSegmentID,
+            shelfCode: compiled.shelfCode,
+            floorID: compiled.floorID,
+            startM: (
+                compiled.longitudinalStartM[0],
+                compiled.longitudinalStartM[1]),
+            endM: (
+                compiled.longitudinalEndM[0],
+                compiled.longitudinalEndM[1]),
+            axisM: (
+                compiled.longitudinalAxis[0],
+                compiled.longitudinalAxis[1]),
+            frontNormalM: (
+                compiled.frontNormal[0], compiled.frontNormal[1]),
+            backNormalM: (
+                compiled.backNormal[0], compiled.backNormal[1]),
+            boundsMinM: envelopeMin,
+            boundsMaxM: envelopeMax,
+            polygonM: polygonM,
+            orientationProvenance: compiled.orientationProvenance)
     }
 
     // MARK: - Spatial index (V1R4 §13.3: shelf grid)
@@ -265,7 +330,7 @@ enum ShelfAssociationEngine {
                     guard let bucket = cells[Self.key(floorID: floorID, cellX: cellX, cellY: cellY)] else {
                         continue
                     }
-                    for shelf in bucket where seen.insert(shelf.shelfCode).inserted {
+                    for shelf in bucket where seen.insert(shelf.shelfSegmentID).inserted {
                         result.append(shelf)
                     }
                 }
@@ -277,6 +342,7 @@ enum ShelfAssociationEngine {
     // MARK: - Association
 
     struct Association {
+        var shelfSegmentID: String
         var shelfCode: String
         var shelfSide: String
         var distanceFromShelfStartCm: Double
@@ -321,6 +387,7 @@ enum ShelfAssociationEngine {
         let distanceToSegment = hypot(point.0 - projectedX, point.1 - projectedY)
         let atEndpoint = s < endpointMarginM || s > length - endpointMarginM
         return Association(
+            shelfSegmentID: shelf.shelfSegmentID,
             shelfCode: shelf.shelfCode,
             shelfSide: shelf.side(for: point),
             distanceFromShelfStartCm: SourceGeometry.rounded(s * 100.0),
@@ -350,7 +417,11 @@ enum ShelfAssociationEngine {
             ?? shelves.filter { $0.floorID == floorID }
         var first: (Association, Double)?
         var secondDistance = Double.infinity
+        var evaluatedSegmentIDs = Set<String>()
         for shelf in candidates {
+            guard evaluatedSegmentIDs.insert(shelf.shelfSegmentID).inserted else {
+                continue
+            }
             guard let association = associate(
                 point: point,
                 shelf: shelf,
@@ -410,11 +481,12 @@ enum ShelfAssociationEngine {
         return inside
     }
 
-    /// Occlusion: the midpoint between the tag and its closest point on
-    /// the shelf axis lies inside a fixed structure of the same floor
-    /// (a pillar/table between scanner and shelf blocks the sight line,
-    /// §13.4 occlusion check). The structure must be within
-    /// `maximumDistanceM` of the shelf to avoid far-away false hits.
+    /// Occlusion: the complete tag-to-shelf sight segment intersects a fixed
+    /// structure polygon (or its explicit AABB fallback) on the same floor.
+    /// A midpoint-only test misses thin pillars and structures close to either
+    /// endpoint, so every polygon edge is tested. The intersection must remain
+    /// within `maximumDistanceM` of the shelf projection to avoid far-away
+    /// structures producing false hits.
     static func isOccluded(
         tagPoint: (Double, Double),
         shelf: ShelfSegment,
@@ -431,28 +503,104 @@ enum ShelfAssociationEngine {
         let projection = (
             shelf.startM.0 + ratio * dx,
             shelf.startM.1 + ratio * dy)
-        let midpoint = (
-            (tagPoint.0 + projection.0) / 2.0,
-            (tagPoint.1 + projection.1) / 2.0)
         for structure in structures where structure.floorID == shelf.floorID {
-            guard structure.boundsContains(x: midpoint.0, y: midpoint.1) else {
+            let sightMinX = min(tagPoint.0, projection.0)
+            let sightMaxX = max(tagPoint.0, projection.0)
+            let sightMinY = min(tagPoint.1, projection.1)
+            let sightMaxY = max(tagPoint.1, projection.1)
+            guard sightMaxX >= structure.boundsMinM.0,
+                  sightMinX <= structure.boundsMaxM.0,
+                  sightMaxY >= structure.boundsMinM.1,
+                  sightMinY <= structure.boundsMaxM.1 else {
                 continue
             }
-            if let polygon = structure.polygonM {
-                if pointInPolygon(point: midpoint, polygon: polygon) {
-                    // The structure must sit near the shelf line.
-                    let structureDistance = hypot(
-                        midpoint.0 - projection.0,
-                        midpoint.1 - projection.1)
-                    if structureDistance <= maximumDistanceM {
-                        return true
-                    }
-                }
-            } else {
+            let polygon = structure.polygonM ?? [
+                structure.boundsMinM,
+                (structure.boundsMaxM.0, structure.boundsMinM.1),
+                structure.boundsMaxM,
+                (structure.boundsMinM.0, structure.boundsMaxM.1),
+            ]
+            if segmentIntersectsPolygonNearShelf(
+                start: tagPoint,
+                end: projection,
+                polygon: polygon,
+                maximumDistanceFromEndM: maximumDistanceM) {
                 return true
             }
         }
         return false
+    }
+
+    private static func segmentIntersectsPolygonNearShelf(
+        start: (Double, Double),
+        end: (Double, Double),
+        polygon: [(Double, Double)],
+        maximumDistanceFromEndM: Double
+    ) -> Bool {
+        guard polygon.count >= 3,
+              maximumDistanceFromEndM >= 0 else { return false }
+        if pointInPolygon(point: end, polygon: polygon) {
+            return true
+        }
+        var previous = polygon[polygon.count - 1]
+        for vertex in polygon {
+            if let ratio = segmentIntersectionRatio(
+                start: start,
+                end: end,
+                edgeStart: previous,
+                edgeEnd: vertex) {
+                let intersection = (
+                    start.0 + ratio * (end.0 - start.0),
+                    start.1 + ratio * (end.1 - start.1))
+                if hypot(
+                    end.0 - intersection.0,
+                    end.1 - intersection.1) <= maximumDistanceFromEndM {
+                    return true
+                }
+            }
+            previous = vertex
+        }
+        return false
+    }
+
+    /// Returns the ratio on `start...end` where it intersects an edge.
+    /// Collinear overlap is conservatively treated as an intersection.
+    private static func segmentIntersectionRatio(
+        start: (Double, Double),
+        end: (Double, Double),
+        edgeStart: (Double, Double),
+        edgeEnd: (Double, Double)
+    ) -> Double? {
+        let ray = (end.0 - start.0, end.1 - start.1)
+        let edge = (edgeEnd.0 - edgeStart.0, edgeEnd.1 - edgeStart.1)
+        let delta = (edgeStart.0 - start.0, edgeStart.1 - start.1)
+        let denominator = ray.0 * edge.1 - ray.1 * edge.0
+        let epsilon = 1.0e-9
+        if abs(denominator) <= epsilon {
+            let cross = delta.0 * ray.1 - delta.1 * ray.0
+            guard abs(cross) <= epsilon else { return nil }
+            let rayLengthSquared = ray.0 * ray.0 + ray.1 * ray.1
+            guard rayLengthSquared > epsilon else { return nil }
+            let first = (delta.0 * ray.0 + delta.1 * ray.1)
+                / rayLengthSquared
+            let edgeDelta = (edgeEnd.0 - start.0, edgeEnd.1 - start.1)
+            let second = (edgeDelta.0 * ray.0 + edgeDelta.1 * ray.1)
+                / rayLengthSquared
+            let overlapStart = max(0.0, min(first, second))
+            let overlapEnd = min(1.0, max(first, second))
+            return overlapStart <= overlapEnd + epsilon
+                ? max(0.0, min(1.0, overlapStart))
+                : nil
+        }
+        let rayRatio = (delta.0 * edge.1 - delta.1 * edge.0)
+            / denominator
+        let edgeRatio = (delta.0 * ray.1 - delta.1 * ray.0)
+            / denominator
+        guard rayRatio >= -epsilon, rayRatio <= 1.0 + epsilon,
+              edgeRatio >= -epsilon, edgeRatio <= 1.0 + epsilon else {
+            return nil
+        }
+        return max(0.0, min(1.0, rayRatio))
     }
 }
 
@@ -461,9 +609,19 @@ enum ShelfAssociationEngine {
 enum AutomaticQualityGate {
     struct TagQualityInput {
         var observationCount: Int
+        var uniqueVerifiedFrameCount: Int
+        var effectiveSampleSize: Double
         var positionSpreadM: Double
         var minimumBurstSamples: Int
         var maximumSpreadM: Double
+        var minimumDepthQuality: Double
+        var viewQualitySufficient: Bool
+        var trackingQualitySufficient: Bool
+        var localizationConfidence: Double
+        var measurementConfidence: Double
+        var needsReview: Bool
+        var measurementMethodAccepted: Bool
+        var maximumNodeUncertaintyM: Double?
         var bindingMethod: String
         var association: ShelfAssociationEngine.Association
         var maximumEndpointDistanceM: Double
@@ -480,6 +638,12 @@ enum AutomaticQualityGate {
         case rescanRequired = "RESCAN_REQUIRED"
     }
 
+    static let minimumDepthQuality = 0.65
+    static let minimumLocalizationConfidence = 0.65
+    static let minimumMeasurementConfidence = 0.65
+    static let maximumNodeUncertaintyM = 0.20
+    static let minimumEffectiveSampleSize = 2.5
+
     static func evaluate(_ input: TagQualityInput) -> (QualityStatus, String) {
         guard input.mapSessionIdentityConsistent else {
             return (.rescanRequired, "map_session_identity_mismatch")
@@ -490,8 +654,38 @@ enum AutomaticQualityGate {
         guard input.bindingMethod != "stale_alignment" else {
             return (.rescanRequired, "stale_alignment")
         }
-        guard input.observationCount >= input.minimumBurstSamples else {
+        guard input.uniqueVerifiedFrameCount >= input.minimumBurstSamples else {
             return (.rescanRequired, "insufficient_burst_samples")
+        }
+        guard input.effectiveSampleSize >= minimumEffectiveSampleSize else {
+            return (.rescanRequired, "insufficient_effective_samples")
+        }
+        guard !input.needsReview else {
+            return (.rescanRequired, "measurement_needs_review")
+        }
+        guard input.measurementMethodAccepted else {
+            return (.rescanRequired, "measurement_method_unavailable")
+        }
+        guard input.trackingQualitySufficient else {
+            return (.rescanRequired, "tracking_quality_insufficient")
+        }
+        guard input.viewQualitySufficient else {
+            return (.rescanRequired, "view_quality_insufficient")
+        }
+        guard input.minimumDepthQuality >= minimumDepthQuality else {
+            return (.rescanRequired, "depth_quality_insufficient")
+        }
+        guard input.localizationConfidence >= minimumLocalizationConfidence else {
+            return (.rescanRequired, "localization_confidence_insufficient")
+        }
+        guard input.measurementConfidence >= minimumMeasurementConfidence else {
+            return (.rescanRequired, "measurement_confidence_insufficient")
+        }
+        guard let uncertainty = input.maximumNodeUncertaintyM else {
+            return (.rescanRequired, "node_uncertainty_unavailable")
+        }
+        guard uncertainty <= maximumNodeUncertaintyM else {
+            return (.rescanRequired, "node_uncertainty_exceeded")
         }
         guard input.positionSpreadM <= input.maximumSpreadM else {
             return (.rescanRequired, "position_spread_exceeded")

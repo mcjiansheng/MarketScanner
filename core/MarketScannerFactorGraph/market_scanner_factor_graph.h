@@ -37,12 +37,19 @@ extern "C" {
 #endif
 
 /// Core ABI version; bumped on any semantic change.
-#define MS_FACTOR_GRAPH_ABI_VERSION 2
+#define MS_FACTOR_GRAPH_ABI_VERSION 4
 
 /// Policy version of the built-in quality thresholds. Thresholds are
 /// CANDIDATES until the Replay Pareto freezes a production policy
 /// (V1R3 §14.5); the version travels with every quality report.
 #define MS_QUALITY_POLICY_VERSION "candidate-1"
+
+/// The on-device optimizer's non-negotiable stack/resource boundary.
+/// Both vertices and factors must remain at or below this value before
+/// entering g2o. Raw input and reconstructed trajectory may be larger.
+#define MS_FACTOR_GRAPH_HARD_OPTIMIZER_NODES INT64_C(4096)
+#define MS_FACTOR_GRAPH_HARD_OPTIMIZER_FACTORS INT64_C(4096)
+#define MS_FACTOR_GRAPH_MAX_TRAJECTORY_ROWS INT64_C(200000)
 
 /// Quality gate dispositions (§11.5 / §2).
 typedef enum {
@@ -132,6 +139,10 @@ typedef struct {
 } MSTrajectoryRowC;
 
 typedef struct {
+    /// Runtime ABI identity. Swift rejects an outcome whose runtime value
+    /// differs from the ABI version compiled into its strict quality DTO.
+    int32_t abi_version;
+
     /// Reconstructed full trajectory (§13): one row per raw DB node.
     MSTrajectoryRowC *rows;
     int64_t count;
@@ -146,6 +157,23 @@ typedef struct {
     /// §11.5/§14 quality metrics serialized as canonical JSON (streaming
     /// builder, fully escaped — no fixed buffer, V1R3 §14.4).
     char *quality_json;
+    /// Exact UTF-8 byte count, excluding the trailing NUL. The Swift bridge
+    /// never performs an unbounded strlen() over native-owned memory.
+    int64_t quality_json_size;
+
+    /// Independent C-ABI copies of the two native audit identities. Swift
+    /// requires exact equality with the strict quality JSON before either
+    /// value can reach RunSummary.
+    char *graph_input_sha256;
+    int64_t graph_input_sha256_size;
+    char *factor_set_sha256;
+    int64_t factor_set_sha256_size;
+
+    /// Canonical native counts duplicated outside JSON so the bridge can
+    /// detect a forged/stale report. `factor_count` mirrors the optimizer
+    /// factor inventory; `publish_count` mirrors publish-eligible C rows.
+    int64_t factor_count;
+    int64_t publish_count;
 
     /// Disposition deciding the pipeline branch (§2).
     int32_t disposition;

@@ -27,13 +27,17 @@
         "trackingSessionId",
         "floorId"
       ],
-      "max_file_bytes": 67108864,
+      "max_file_bytes": 805306368,
       "max_nesting_depth": 8,
-      "max_record_bytes": 1048576,
-      "max_records": 100000,
+      "max_record_bytes": 65536,
+      "max_records": 400000,
+      "qualification_max_records": 345600,
+      "qualification_record_rate_hz": 2,
       "strict_bool": true,
       "strict_integer": true,
-      "watermark_fields": []
+      "watermark_fields": [
+        "captureHealth.localizationConstraintRecordCount"
+      ]
     },
     "localization_trace.jsonl": {
       "blank_line_policy": "reject",
@@ -48,6 +52,8 @@
       "max_nesting_depth": 8,
       "max_record_bytes": 1048576,
       "max_records": 2000000,
+      "qualification_max_records": 1728000,
+      "qualification_record_rate_hz": 10,
       "strict_bool": true,
       "strict_integer": true,
       "watermark_fields": [
@@ -69,7 +75,9 @@
       "max_records": 100000,
       "strict_bool": true,
       "strict_integer": true,
-      "watermark_fields": []
+      "watermark_fields": [
+        "captureHealth.manualLocalizationEventCount"
+      ]
     },
     "metadata.json": {
       "blank_line_policy": "n_a",
@@ -81,9 +89,9 @@
         "priorMapSha256",
         "trackingSessionId"
       ],
-      "max_file_bytes": 16777216,
+      "max_file_bytes": 1048576,
       "max_nesting_depth": 8,
-      "max_record_bytes": 16777216,
+      "max_record_bytes": 1048576,
       "max_records": 1,
       "strict_bool": true,
       "strict_integer": true,
@@ -94,14 +102,17 @@
         "tagObservationBurstCount",
         "tagObservationBurstLastID",
         "tagObservationBurstComplete",
-        "localizationTraceRecordCount"
+        "captureHealth.localizationTraceRecordCount",
+        "captureHealth.localizationConstraintRecordCount",
+        "captureHealth.manualLocalizationEventCount",
+        "captureHealth.localizationRecoveryEventCount"
       ]
     },
     "native_graph": {
-      "max_factors": 400000,
-      "max_priors": 100000,
+      "max_factors": 4096,
+      "max_priors": 4096,
       "max_raw_nodes": 200000,
-      "max_skeleton_nodes": 200000,
+      "max_skeleton_nodes": 4096,
       "max_trajectory_rows": 200000
     },
     "result_package": {
@@ -111,6 +122,20 @@
       "max_per_file_bytes": 2147483648,
       "package_sha256": true,
       "per_file_sha256": true
+    },
+    "scan_events.jsonl": {
+      "blank_line_policy": "reject",
+      "final_newline": true,
+      "identity_fields": [
+        "trackingSessionId"
+      ],
+      "max_file_bytes": 268435456,
+      "max_nesting_depth": 8,
+      "max_record_bytes": 1048576,
+      "max_records": 1000000,
+      "strict_bool": true,
+      "strict_integer": true,
+      "watermark_fields": []
     },
     "tag_observation_bursts.jsonl": {
       "blank_line_policy": "reject",

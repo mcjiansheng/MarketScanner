@@ -119,6 +119,9 @@ enum FinalTrajectory {
         /// Maximum monotonic gap between two trajectory nodes across
         /// which interpolation is allowed.
         static let maximumInterpolationGapSeconds = 3.0
+        /// A trace record farther than this from the one-hertz output row
+        /// is stale and cannot describe that row's business state.
+        static let maximumTraceStateDeltaSeconds = 1.0
     }
 
     /// Resamples the optimized trajectory to one row per UTC second with
@@ -152,6 +155,8 @@ enum FinalTrajectory {
         var lostIndex = 0
         var nodeIndex = 0
         var traceIndex = 0
+        var contextIndex = 0
+        var utcContextIndex = 0
         var sequence = 0
         var lastKnownFloor: String?
         var target = startSecond
@@ -164,15 +169,19 @@ enum FinalTrajectory {
                 utc: targetUTC,
                 clockIndex: &clockIndex) else {
                 let floor = lastKnownFloor ?? ""
+                let context = clockContext(
+                    forUTC: targetUTC, utcMapper: utcMapper,
+                    contextIndex: &utcContextIndex)
                 rows.append(unavailableRow(
                     sequence: sequence, unixTimeS: Int64(targetUTC), monotonic: nil,
-                    utcMapper: utcMapper, storeID: storeID, floorID: floor,
+                    context: context, storeID: storeID, floorID: floor,
                     priorMapID: priorMapID, priorMapSha256: priorMapSha256,
                     trackingSessionID: trackingSessionID, appGitSHA: appGitSHA,
                     reason: "clock_discontinuity",
                     traceState: nearestTraceState(
                         monotonic: nil, traceStates: traceStates,
-                        traceIndex: &traceIndex)))
+                        traceIndex: &traceIndex,
+                        expectedFloorID: floor)))
                 target += 1
                 continue
             }
@@ -181,15 +190,19 @@ enum FinalTrajectory {
                 lostIndex: &lostIndex)
             if let lostReason {
                 let floor = lastKnownFloor ?? ""
+                let context = clockContext(
+                    forMonotonic: monotonic, utcMapper: utcMapper,
+                    contextIndex: &contextIndex)
                 rows.append(unavailableRow(
                     sequence: sequence, unixTimeS: Int64(targetUTC), monotonic: monotonic,
-                    utcMapper: utcMapper, storeID: storeID, floorID: floor,
+                    context: context, storeID: storeID, floorID: floor,
                     priorMapID: priorMapID, priorMapSha256: priorMapSha256,
                     trackingSessionID: trackingSessionID, appGitSHA: appGitSHA,
                     reason: lostReason,
                     traceState: nearestTraceState(
                         monotonic: monotonic, traceStates: traceStates,
-                        traceIndex: &traceIndex)))
+                        traceIndex: &traceIndex,
+                        expectedFloorID: floor)))
                 target += 1
                 continue
             }
@@ -198,25 +211,33 @@ enum FinalTrajectory {
                 if let floor = position.floorID {
                     lastKnownFloor = floor
                 }
+                let context = clockContext(
+                    forMonotonic: monotonic, utcMapper: utcMapper,
+                    contextIndex: &contextIndex)
                 rows.append(availableRow(
                     sequence: sequence, unixTimeS: Int64(targetUTC), monotonic: monotonic,
-                    position: position, utcMapper: utcMapper, storeID: storeID,
+                    position: position, context: context, storeID: storeID,
                     priorMapID: priorMapID, priorMapSha256: priorMapSha256,
                     trackingSessionID: trackingSessionID, appGitSHA: appGitSHA,
                     traceState: nearestTraceState(
                         monotonic: monotonic, traceStates: traceStates,
-                        traceIndex: &traceIndex)))
+                        traceIndex: &traceIndex,
+                        expectedFloorID: position.floorID ?? "")))
             } else {
                 let floor = lastKnownFloor ?? ""
+                let context = clockContext(
+                    forMonotonic: monotonic, utcMapper: utcMapper,
+                    contextIndex: &contextIndex)
                 rows.append(unavailableRow(
                     sequence: sequence, unixTimeS: Int64(targetUTC), monotonic: monotonic,
-                    utcMapper: utcMapper, storeID: storeID, floorID: floor,
+                    context: context, storeID: storeID, floorID: floor,
                     priorMapID: priorMapID, priorMapSha256: priorMapSha256,
                     trackingSessionID: trackingSessionID, appGitSHA: appGitSHA,
                     reason: "no_reliable_position",
                     traceState: nearestTraceState(
                         monotonic: monotonic, traceStates: traceStates,
-                        traceIndex: &traceIndex)))
+                        traceIndex: &traceIndex,
+                        expectedFloorID: floor)))
             }
             target += 1
         }
@@ -250,13 +271,16 @@ enum FinalTrajectory {
             nodeIndex += 1
         }
         guard nodeIndex + 1 < nodes.count else {
-            // Past the last node; the pointer stays put (the next query
-            // is later, so the loop above cannot rewind).
-            if nodes[nodeIndex].monotonicSeconds <= monotonic {
-                return nil
+            // An exact hit on the last collected node is authoritative.
+            // Only a query strictly after it is outside the trajectory.
+            let last = nodes[nodeIndex]
+            if abs(last.monotonicSeconds - monotonic) <= 1.0e-9 {
+                return InterpolatedPosition(
+                    xM: last.xM, yM: last.yM, yawRad: last.yawRad,
+                    uncertaintyM: last.uncertaintyM,
+                    beforeNodeID: last.id, afterNodeID: last.id,
+                    ratio: 0, floorID: last.floorID)
             }
-            // Before the first node (nodeIndex was advanced by a previous
-            // query): cannot interpolate.
             return nil
         }
         let before = nodes[nodeIndex]
@@ -317,18 +341,70 @@ enum FinalTrajectory {
     private static func nearestTraceState(
         monotonic: Double?,
         traceStates: [TraceState],
-        traceIndex: inout Int
+        traceIndex: inout Int,
+        expectedFloorID: String
     ) -> TraceState? {
-        guard !traceStates.isEmpty else { return nil }
-        guard let monotonic else {
-            return traceStates[max(0, min(traceIndex, traceStates.count - 1))]
-        }
+        guard !traceStates.isEmpty, let monotonic,
+              !expectedFloorID.isEmpty else { return nil }
         while traceIndex + 1 < traceStates.count,
               abs(traceStates[traceIndex + 1].timestamp - monotonic)
                 < abs(traceStates[traceIndex].timestamp - monotonic) {
             traceIndex += 1
         }
-        return traceStates[traceIndex]
+        // The nearest record overall can belong to another floor at a
+        // transition. Inspect only the adjacent candidates and require an
+        // exact floor plus a frozen freshness bound.
+        let candidates = [traceIndex - 1, traceIndex, traceIndex + 1]
+            .filter { $0 >= 0 && $0 < traceStates.count }
+            .map { traceStates[$0] }
+            .filter { $0.floorID == expectedFloorID }
+            .sorted {
+                abs($0.timestamp - monotonic) < abs($1.timestamp - monotonic)
+            }
+        guard let best = candidates.first,
+              abs(best.timestamp - monotonic)
+                <= ResamplePolicy.maximumTraceStateDeltaSeconds else {
+            return nil
+        }
+        return best
+    }
+
+    /// O(1)-amortized timezone context lookup on the monotonic axis.
+    private static func clockContext(
+        forMonotonic monotonic: Double,
+        utcMapper: MonotonicUTCMapper,
+        contextIndex: inout Int
+    ) -> (timezoneID: String, utcOffsetSeconds: Int) {
+        let samples = utcMapper.samples
+        guard !samples.isEmpty else { return ("UTC", 0) }
+        contextIndex = max(0, min(contextIndex, samples.count - 1))
+        while contextIndex + 1 < samples.count,
+              samples[contextIndex + 1].monotonicSeconds <= monotonic {
+            contextIndex += 1
+        }
+        let sample = samples[contextIndex]
+        return (sample.timezoneID, sample.utcOffsetSeconds)
+    }
+
+    /// Selects the nearest segment context for a UTC second that lies in a
+    /// clock-discontinuity gap. Binding UTC is strictly increasing, so the
+    /// pointer never rewinds and the post-change timezone is selected once
+    /// it becomes the closer authoritative sample.
+    private static func clockContext(
+        forUTC utc: Double,
+        utcMapper: MonotonicUTCMapper,
+        contextIndex: inout Int
+    ) -> (timezoneID: String, utcOffsetSeconds: Int) {
+        let samples = utcMapper.samples
+        guard !samples.isEmpty else { return ("UTC", 0) }
+        contextIndex = max(0, min(contextIndex, samples.count - 1))
+        while contextIndex + 1 < samples.count,
+              abs(samples[contextIndex + 1].utcUnixSeconds - utc)
+                < abs(samples[contextIndex].utcUnixSeconds - utc) {
+            contextIndex += 1
+        }
+        let sample = samples[contextIndex]
+        return (sample.timezoneID, sample.utcOffsetSeconds)
     }
 
     /// Inverts the monotonic -> UTC mapping with a monotonic segment
@@ -417,7 +493,7 @@ enum FinalTrajectory {
         unixTimeS: Int64,
         monotonic: Double,
         position: InterpolatedPosition,
-        utcMapper: MonotonicUTCMapper,
+        context: (timezoneID: String, utcOffsetSeconds: Int),
         storeID: String,
         priorMapID: String,
         priorMapSha256: String,
@@ -425,7 +501,6 @@ enum FinalTrajectory {
         appGitSHA: String,
         traceState: TraceState?
     ) -> DevicePositionRow {
-        let context = utcMapper.context(forMonotonic: monotonic)
         let localTimestamp = formatLocalTimestamp(
             unixTimeS: Double(unixTimeS), offsetSeconds: context.utcOffsetSeconds)
         let utcTimestamp = formatUTCTimestamp(unixTimeS: Double(unixTimeS))
@@ -471,7 +546,7 @@ enum FinalTrajectory {
         sequence: Int,
         unixTimeS: Int64,
         monotonic: Double?,
-        utcMapper: MonotonicUTCMapper,
+        context: (timezoneID: String, utcOffsetSeconds: Int),
         storeID: String,
         floorID: String,
         priorMapID: String,
@@ -481,13 +556,6 @@ enum FinalTrajectory {
         reason: String,
         traceState: TraceState?
     ) -> DevicePositionRow {
-        let context: (timezoneID: String, utcOffsetSeconds: Int)
-        if let monotonic = monotonic {
-            context = utcMapper.context(forMonotonic: monotonic)
-        } else {
-            context = (utcMapper.samples.first?.timezoneID ?? "UTC",
-                       utcMapper.samples.first?.utcOffsetSeconds ?? 0)
-        }
         return DevicePositionRow(
             sequence: sequence,
             localTimestamp: formatLocalTimestamp(

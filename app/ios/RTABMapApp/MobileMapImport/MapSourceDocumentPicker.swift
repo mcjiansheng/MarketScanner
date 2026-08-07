@@ -1,5 +1,6 @@
 import UIKit
 import UniformTypeIdentifiers
+import Darwin
 
 /// Picks an XLSX / CSV / JSON store map from the Files app. The picked
 /// document is immediately copied into the app-private staging directory
@@ -59,9 +60,8 @@ final class MapSourceDocumentPicker: NSObject, UIDocumentPickerDelegate {
             // close -> stop security scope.
             let staging = try Self.stagingURL(originalFilename: originalFilename)
             try Self.streamCopy(from: url, to: staging)
-            try Self.syncFile(staging)
             _ = CanonicalSourceHasher.sha256(
-                try Data(contentsOf: staging, options: .mappedIfSafe))
+                try StableMapSourceFileReader.read(staging))
             onResult(.staged(staging, originalFilename: originalFilename))
         } catch {
             // Copy failed: NO map record is created and the provider URL
@@ -95,60 +95,126 @@ final class MapSourceDocumentPicker: NSObject, UIDocumentPickerDelegate {
         return directory.appendingPathComponent(name)
     }
 
-    /// Stream copy with exclusive destination creation (fails if the
-    /// staging path already exists — never overwrites).
+    /// Stream copy with descriptor-level stable-source validation and
+    /// exclusive destination creation. Both data and directory entries
+    /// are synced before the staged path is exposed to the importer.
     private static func streamCopy(from source: URL, to destination: URL) throws {
-        let fileManager = FileManager.default
-        // Exclusive creation: fail if a stale staging file exists.
-        guard !fileManager.fileExists(atPath: destination.path) else {
-            throw MapSourceImportError.copyFailed(reason: "staging file already exists")
+        let sourceDescriptor = open(
+            source.path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW)
+        guard sourceDescriptor >= 0 else {
+            throw MapSourceImportError.copyFailed(
+                reason: "cannot open provider file without following links")
         }
-        guard let input = InputStream(url: source) else {
-            throw MapSourceImportError.copyFailed(reason: "cannot open source stream")
+        defer { _ = close(sourceDescriptor) }
+        var sourceBefore = stat()
+        guard fstat(sourceDescriptor, &sourceBefore) == 0,
+              (sourceBefore.st_mode & S_IFMT) == S_IFREG,
+              sourceBefore.st_size >= 0 else {
+            throw MapSourceImportError.copyFailed(
+                reason: "provider source is not a regular file")
         }
-        input.open()
-        defer { input.close() }
-        guard fileManager.createFile(
-            atPath: destination.path, contents: nil, attributes: nil) else {
-            throw MapSourceImportError.copyFailed(reason: "cannot create staging file")
+        guard sourceBefore.st_size <= MapSourceImportLimits.maximumSourceFileBytes else {
+            throw MapSourceImportError.fileTooLarge(
+                limitBytes: MapSourceImportLimits.maximumSourceFileBytes)
         }
-        let output = OutputStream(
-            toFileAtPath: destination.path, append: false)
-        guard let output = output else {
-            throw MapSourceImportError.copyFailed(reason: "cannot open staging stream")
+
+        let destinationDescriptor = open(
+            destination.path,
+            O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
+            mode_t(0o600))
+        guard destinationDescriptor >= 0 else {
+            throw MapSourceImportError.copyFailed(
+                reason: "cannot exclusively create staging file")
         }
-        output.open()
-        defer { output.close() }
+        var keepDestination = false
+        var destinationNeedsClose = true
+        defer {
+            if destinationNeedsClose { _ = close(destinationDescriptor) }
+            if !keepDestination { try? FileManager.default.removeItem(at: destination) }
+        }
+
+        var destinationStat = stat()
+        guard fstat(destinationDescriptor, &destinationStat) == 0,
+              (destinationStat.st_mode & S_IFMT) == S_IFREG,
+              destinationStat.st_nlink == 1 else {
+            throw MapSourceImportError.copyFailed(
+                reason: "staging destination is not a single regular file")
+        }
+
         var buffer = [UInt8](repeating: 0, count: 256 * 1024)
         var copied: Int64 = 0
-        while input.hasBytesAvailable {
-            let read = input.read(&buffer, maxLength: buffer.count)
-            if read < 0 {
-                throw MapSourceImportError.copyFailed(reason: "read failed")
-            }
-            if read == 0 {
-                break
-            }
-            var written = 0
-            while written < read {
-                let result = output.write(&buffer[written], maxLength: read - written)
-                if result < 0 {
-                    throw MapSourceImportError.copyFailed(reason: "write failed")
+        while true {
+            let readCount = buffer.withUnsafeMutableBytes { rawBuffer -> Int in
+                while true {
+                    let result = Darwin.read(
+                        sourceDescriptor, rawBuffer.baseAddress, rawBuffer.count)
+                    if result < 0 && errno == EINTR { continue }
+                    return result
                 }
-                written += result
             }
-            copied += Int64(read)
+            guard readCount >= 0 else {
+                throw MapSourceImportError.copyFailed(reason: "provider read failed")
+            }
+            if readCount == 0 { break }
+            copied += Int64(readCount)
             if copied > MapSourceImportLimits.maximumSourceFileBytes {
                 throw MapSourceImportError.fileTooLarge(
                     limitBytes: MapSourceImportLimits.maximumSourceFileBytes)
             }
+            var written = 0
+            while written < readCount {
+                let result = buffer.withUnsafeBytes { rawBuffer -> Int in
+                    while true {
+                        let address = rawBuffer.baseAddress!.advanced(by: written)
+                        let value = Darwin.write(
+                            destinationDescriptor, address, readCount - written)
+                        if value < 0 && errno == EINTR { continue }
+                        return value
+                    }
+                }
+                guard result > 0 else {
+                    throw MapSourceImportError.copyFailed(
+                        reason: "staging write failed")
+                }
+                written += result
+            }
         }
-    }
 
-    private static func syncFile(_ url: URL) throws {
-        let descriptor = open(url.path, O_RDONLY)
-        guard descriptor >= 0 else { return }
-        defer { close(descriptor) }
-        fsync(descriptor)
+        var sourceAfter = stat()
+        guard fstat(sourceDescriptor, &sourceAfter) == 0,
+              sourceAfter.st_dev == sourceBefore.st_dev,
+              sourceAfter.st_ino == sourceBefore.st_ino,
+              sourceAfter.st_size == sourceBefore.st_size,
+              sourceAfter.st_mtimespec.tv_sec == sourceBefore.st_mtimespec.tv_sec,
+              sourceAfter.st_mtimespec.tv_nsec == sourceBefore.st_mtimespec.tv_nsec,
+              sourceAfter.st_ctimespec.tv_sec == sourceBefore.st_ctimespec.tv_sec,
+              sourceAfter.st_ctimespec.tv_nsec == sourceBefore.st_ctimespec.tv_nsec,
+              copied == sourceBefore.st_size else {
+            throw MapSourceImportError.copyFailed(
+                reason: "provider source changed while it was copied")
+        }
+        guard fsync(destinationDescriptor) == 0 else {
+            throw MapSourceImportError.copyFailed(
+                reason: "staging data sync failed")
+        }
+        guard close(destinationDescriptor) == 0 else {
+            throw MapSourceImportError.copyFailed(
+                reason: "staging close failed")
+        }
+        destinationNeedsClose = false
+
+        let parentDescriptor = open(
+            destination.deletingLastPathComponent().path,
+            O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+        guard parentDescriptor >= 0 else {
+            throw MapSourceImportError.copyFailed(
+                reason: "cannot open staging directory for sync")
+        }
+        defer { _ = close(parentDescriptor) }
+        guard fsync(parentDescriptor) == 0 else {
+            throw MapSourceImportError.copyFailed(
+                reason: "staging directory sync failed")
+        }
+        keepDestination = true
     }
 }

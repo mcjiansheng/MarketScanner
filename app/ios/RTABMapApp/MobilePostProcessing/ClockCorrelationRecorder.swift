@@ -147,10 +147,10 @@ struct ClockSidecarWriteResult {
     }
 }
 
-/// Collects correlation + node-binding records and serializes them
-/// deterministically (one JSON object per line). The recorder is a pure
-/// accumulator so the Swift host tests can drive it without Foundation
-/// timers.
+/// Incrementally persists correlation + node-binding records as strict
+/// JSONL. The writer never assembles the sidecar in memory: each record is
+/// appended immediately and a bounded batch is fsynced before its durable
+/// watermark advances. Finalization fsyncs the last partial batch.
 final class ClockCorrelationRecorder {
     enum Reason: String {
         case sessionStart = "session_start"
@@ -164,14 +164,88 @@ final class ClockCorrelationRecorder {
     }
 
     static let periodicIntervalSeconds: Double = 30.0
+    static let durabilityBatchRecordCount = 64
 
     private(set) var records: [ClockCorrelationRecord] = []
-    private(set) var bindings: [ClockNodeBindingRecord] = []
     let trackingSessionID: String
+    private let lock = NSLock()
+    private let parentDescriptor: Int32
+    private var descriptor: Int32
+    private let faultInjector: ((ClockSidecarWriteStage) throws -> Void)?
     private var lastPeriodicMonotonic: Double?
+    private var writtenCorrelationCount = 0
+    private var writtenNodeBindingCount = 0
+    private var durableCorrelationCount = 0
+    private var durableNodeBindingCount = 0
+    private var recordsSinceDurableSync = 0
+    private var lastWrittenMonotonicSeconds: Double?
+    private var lastWrittenUTCSeconds: Double?
+    private var failedReason: String?
+    private var finished = false
 
-    init(trackingSessionID: String) {
+    init(
+        trackingSessionID: String,
+        url: URL,
+        faultInjector: ((ClockSidecarWriteStage) throws -> Void)? = nil
+    ) throws {
+        guard !trackingSessionID.isEmpty,
+              url.lastPathComponent == "clock_correlations.jsonl" else {
+            throw ClockSidecarWriteError.invalidInput
+        }
         self.trackingSessionID = trackingSessionID
+        self.faultInjector = faultInjector
+
+        let parent = Darwin.open(
+            url.deletingLastPathComponent().path,
+            O_RDONLY | O_DIRECTORY | O_NOFOLLOW)
+        guard parent >= 0 else {
+            throw ClockSidecarWriteError.openFailed(
+                "cannot open sidecar parent: errno \(errno)")
+        }
+        parentDescriptor = parent
+        descriptor = -1
+        do {
+            try faultInjector?(.create)
+            let output = Darwin.openat(
+                parent,
+                url.lastPathComponent,
+                O_CREAT | O_EXCL | O_WRONLY | O_NOFOLLOW,
+                S_IRUSR | S_IWUSR)
+            guard output >= 0 else {
+                throw ClockSidecarWriteError.openFailed(
+                    "cannot create sidecar: errno \(errno)")
+            }
+            descriptor = output
+            var info = stat()
+            guard fstat(output, &info) == 0,
+                  (info.st_mode & S_IFMT) == S_IFREG,
+                  info.st_nlink == 1 else {
+                Darwin.close(output)
+                descriptor = -1
+                throw ClockSidecarWriteError.openFailed(
+                    "sidecar is not one regular file")
+            }
+            try faultInjector?(.parentSync)
+            guard fsync(parent) == 0 else {
+                throw ClockSidecarWriteError.fsyncFailed(
+                    "parent fsync failed with errno \(errno)")
+            }
+        } catch {
+            if descriptor >= 0 {
+                Darwin.close(descriptor)
+                descriptor = -1
+            }
+            _ = Darwin.unlinkat(parent, url.lastPathComponent, 0)
+            Darwin.close(parent)
+            throw error
+        }
+    }
+
+    deinit {
+        if descriptor >= 0 {
+            Darwin.close(descriptor)
+        }
+        Darwin.close(parentDescriptor)
     }
 
     func record(
@@ -180,15 +254,18 @@ final class ClockCorrelationRecorder {
         utcUnixSeconds: Double,
         timezoneID: String,
         utcOffsetSeconds: Int
-    ) {
-        records.append(ClockCorrelationRecord.make(
+    ) throws {
+        let value = ClockCorrelationRecord.make(
             trackingSessionID: trackingSessionID,
             monotonicSeconds: monotonicSeconds,
             utcUnixSeconds: utcUnixSeconds,
             timezoneID: timezoneID,
             utcOffsetSeconds: utcOffsetSeconds,
             reason: reason.rawValue
-        ))
+        )
+        lock.lock()
+        defer { lock.unlock() }
+        try appendCorrelationLocked(value)
     }
 
     /// Records a periodic sample if at least 30 seconds elapsed since the
@@ -198,19 +275,23 @@ final class ClockCorrelationRecorder {
         utcUnixSeconds: Double,
         timezoneID: String,
         utcOffsetSeconds: Int
-    ) {
+    ) throws {
+        lock.lock()
+        defer { lock.unlock() }
         if let previous = lastPeriodicMonotonic,
            monotonicSeconds - previous < Self.periodicIntervalSeconds {
             return
         }
-        lastPeriodicMonotonic = monotonicSeconds
-        record(
-            reason: .periodic,
+        let value = ClockCorrelationRecord.make(
+            trackingSessionID: trackingSessionID,
             monotonicSeconds: monotonicSeconds,
             utcUnixSeconds: utcUnixSeconds,
             timezoneID: timezoneID,
-            utcOffsetSeconds: utcOffsetSeconds
+            utcOffsetSeconds: utcOffsetSeconds,
+            reason: Reason.periodic.rawValue
         )
+        try appendCorrelationLocked(value)
+        lastPeriodicMonotonic = monotonicSeconds
     }
 
     /// Records a node-timebase binding (V1R4 §7.1) at node creation /
@@ -223,8 +304,8 @@ final class ClockCorrelationRecorder {
         utcUnixSeconds: Double,
         timezoneID: String,
         utcOffsetSeconds: Int
-    ) {
-        bindings.append(ClockNodeBindingRecord.make(
+    ) throws {
+        let value = ClockNodeBindingRecord.make(
             trackingSessionID: trackingSessionID,
             nodeID: nodeID,
             nodeStamp: nodeStamp,
@@ -234,87 +315,191 @@ final class ClockCorrelationRecorder {
             timezoneID: timezoneID,
             utcOffsetSeconds: utcOffsetSeconds,
             reason: Reason.nodeBound.rawValue
-        ))
+        )
+        lock.lock()
+        defer { lock.unlock() }
+        try requireWritableLocked()
+        guard nodeID > 0,
+              nodeStamp.isFinite,
+              sampledFrameTimestamp.isFinite,
+              systemUptime.isFinite,
+              utcUnixSeconds.isFinite,
+              !timezoneID.isEmpty else {
+            throw failLocked(ClockSidecarWriteError.invalidInput)
+        }
+        do {
+            try appendPayloadLocked(value.canonicalPayload)
+            writtenNodeBindingCount += 1
+            recordsSinceDurableSync += 1
+            if recordsSinceDurableSync >= Self.durabilityBatchRecordCount {
+                try synchronizeLocked()
+            }
+        } catch {
+            throw failLocked(error)
+        }
     }
 
-    /// Serializes the collected records as one strict-JSON object per
-    /// line (sorted keys, compact) with a final newline, then persists
-    /// them durably: temp file + fsync + atomic rename + parent fsync
-    /// (V1R4 §7.2). Returns the exact watermark for metadata write-back.
-    /// Any write failure throws; callers must never swallow it (`try?`).
-    func write(to url: URL) throws -> ClockSidecarWriteResult {
-        var lines = Data()
-        for record in records {
-            let data = try CanonicalJSONEncoder.encode(record.canonicalPayload)
-            lines.append(data)
-            lines.append(0x0A)
+    /// Flushes the last partial batch, closes the stream and returns only the
+    /// fsync-proven watermark. Once this succeeds no further append is legal.
+    func finish() throws -> ClockSidecarWriteResult {
+        lock.lock()
+        defer { lock.unlock() }
+        try requireWritableLocked()
+        guard writtenCorrelationCount + writtenNodeBindingCount > 0 else {
+            throw failLocked(ClockSidecarWriteError.emptySidecar)
         }
-        for binding in bindings {
-            let data = try CanonicalJSONEncoder.encode(binding.canonicalPayload)
-            lines.append(data)
-            lines.append(0x0A)
-        }
-        guard !lines.isEmpty else {
-            throw ClockSidecarWriteError.emptySidecar
-        }
-        let temporary = url.appendingPathExtension("tmp-\(UUID().uuidString)")
         do {
-            try lines.write(to: temporary, options: [])
-            let fd = open(temporary.path, O_RDONLY)
-            guard fd >= 0 else {
-                throw ClockSidecarWriteError.fsyncFailed(
-                    "cannot reopen temporary sidecar")
+            try synchronizeLocked()
+            try faultInjector?(.close)
+            guard Darwin.close(descriptor) == 0 else {
+                throw ClockSidecarWriteError.closeFailed(
+                    "close failed with errno \(errno)")
             }
-            let fsyncResult = fsync(fd)
-            close(fd)
-            guard fsyncResult == 0 else {
-                throw ClockSidecarWriteError.fsyncFailed(
-                    "fsync failed with errno \(errno)")
-            }
-            guard rename(temporary.path, url.path) == 0 else {
-                throw ClockSidecarWriteError.renameFailed(
-                    "rename failed with errno \(errno)")
-            }
-            let directoryFD = open(
-                url.deletingLastPathComponent().path, O_RDONLY)
-            if directoryFD >= 0 {
-                _ = fsync(directoryFD)
-                close(directoryFD)
-            }
-        } catch let error as ClockSidecarWriteError {
-            try? FileManager.default.removeItem(at: temporary)
-            throw error
+            descriptor = -1
+            finished = true
         } catch {
-            try? FileManager.default.removeItem(at: temporary)
-            throw ClockSidecarWriteError.writeFailed(error.localizedDescription)
+            throw failLocked(error)
         }
         return ClockSidecarWriteResult(
-            correlationCount: records.count,
-            nodeBindingCount: bindings.count,
-            lastMonotonicSeconds: records.last?.monotonicSeconds,
-            lastUTCSeconds: records.last?.utcUnixSeconds)
+            correlationCount: durableCorrelationCount,
+            nodeBindingCount: durableNodeBindingCount,
+            lastMonotonicSeconds: lastWrittenMonotonicSeconds,
+            lastUTCSeconds: lastWrittenUTCSeconds)
+    }
+
+    /// Abandons an in-flight writer after the session has already become
+    /// ineligible. The partial sidecar remains as audit evidence, but no
+    /// metadata watermark can be produced from it.
+    func cancel() {
+        lock.lock()
+        defer { lock.unlock() }
+        if descriptor >= 0 {
+            Darwin.close(descriptor)
+            descriptor = -1
+        }
+        finished = true
     }
 
     /// Builds a piecewise-linear monotonic -> UTC mapping from the
     /// recorded correlations (device-uptime axis). Node-stamp mapping is
     /// built separately by `StrictClockEvidenceParser` (V1R4 §7.3).
     func buildUTCMapper() -> MonotonicUTCMapper {
+        lock.lock()
+        defer { lock.unlock() }
         return MonotonicUTCMapper(records: records)
+    }
+
+    private func appendCorrelationLocked(
+        _ value: ClockCorrelationRecord
+    ) throws {
+        try requireWritableLocked()
+        guard value.monotonicSeconds.isFinite,
+              value.utcUnixSeconds.isFinite,
+              !value.timezoneID.isEmpty else {
+            throw failLocked(ClockSidecarWriteError.invalidInput)
+        }
+        do {
+            try appendPayloadLocked(value.canonicalPayload)
+            records.append(value)
+            writtenCorrelationCount += 1
+            recordsSinceDurableSync += 1
+            lastWrittenMonotonicSeconds = value.monotonicSeconds
+            lastWrittenUTCSeconds = value.utcUnixSeconds
+            if recordsSinceDurableSync >= Self.durabilityBatchRecordCount {
+                try synchronizeLocked()
+            }
+        } catch {
+            throw failLocked(error)
+        }
+    }
+
+    private func appendPayloadLocked(_ payload: [String: Any]) throws {
+        try faultInjector?(.append)
+        var data = try CanonicalJSONEncoder.encode(payload)
+        data.append(0x0A)
+        try data.withUnsafeBytes { rawBuffer in
+            guard let base = rawBuffer.baseAddress else { return }
+            var offset = 0
+            while offset < rawBuffer.count {
+                let count = Darwin.write(
+                    descriptor,
+                    base.advanced(by: offset),
+                    rawBuffer.count - offset)
+                if count < 0 {
+                    if errno == EINTR { continue }
+                    throw ClockSidecarWriteError.writeFailed(
+                        "append failed with errno \(errno)")
+                }
+                guard count > 0 else {
+                    throw ClockSidecarWriteError.writeFailed(
+                        "append made no progress")
+                }
+                offset += count
+            }
+        }
+    }
+
+    private func synchronizeLocked() throws {
+        guard recordsSinceDurableSync > 0 else { return }
+        try faultInjector?(.dataSync)
+        guard fsync(descriptor) == 0 else {
+            throw ClockSidecarWriteError.fsyncFailed(
+                "sidecar fsync failed with errno \(errno)")
+        }
+        durableCorrelationCount = writtenCorrelationCount
+        durableNodeBindingCount = writtenNodeBindingCount
+        recordsSinceDurableSync = 0
+    }
+
+    private func requireWritableLocked() throws {
+        if let failedReason {
+            throw ClockSidecarWriteError.writerFailed(failedReason)
+        }
+        guard !finished, descriptor >= 0 else {
+            throw ClockSidecarWriteError.writerClosed
+        }
+    }
+
+    private func failLocked(_ error: Error) -> ClockSidecarWriteError {
+        let value: ClockSidecarWriteError
+        if let typed = error as? ClockSidecarWriteError {
+            value = typed
+        } else {
+            value = .writeFailed(error.localizedDescription)
+        }
+        failedReason = value.localizedDescription
+        return value
     }
 }
 
+enum ClockSidecarWriteStage {
+    case create
+    case parentSync
+    case append
+    case dataSync
+    case close
+}
+
 enum ClockSidecarWriteError: Error, LocalizedError {
+    case invalidInput
     case emptySidecar
+    case openFailed(String)
     case writeFailed(String)
     case fsyncFailed(String)
-    case renameFailed(String)
+    case closeFailed(String)
+    case writerFailed(String)
+    case writerClosed
 
     var errorDescription: String? {
         switch self {
+        case .invalidInput: return "时钟侧车记录字段无效"
         case .emptySidecar: return "时钟侧车为空"
+        case .openFailed(let detail): return "时钟侧车打开失败：\(detail)"
         case .writeFailed(let detail): return "时钟侧车写入失败：\(detail)"
         case .fsyncFailed(let detail): return "时钟侧车 fsync 失败：\(detail)"
-        case .renameFailed(let detail): return "时钟侧车原子替换失败：\(detail)"
+        case .closeFailed(let detail): return "时钟侧车关闭失败：\(detail)"
+        case .writerFailed(let detail): return "时钟侧车 writer 已失败：\(detail)"
+        case .writerClosed: return "时钟侧车 writer 已关闭"
         }
     }
 }
@@ -434,10 +619,21 @@ struct MonotonicUTCMapper {
 
     /// Timezone context at a monotonic time (the most recent sample).
     func context(forMonotonic monotonic: Double) -> (timezoneID: String, utcOffsetSeconds: Int) {
-        var best = samples.first
-        for sample in samples where sample.monotonicSeconds <= monotonic {
-            best = sample
+        guard !samples.isEmpty else { return ("UTC", 0) }
+        // Binary search keeps incidental callers bounded. The final
+        // trajectory resampler uses its own monotonic pointer so a 48-hour
+        // run remains O(output rows + clock samples), not O(S * C).
+        var lower = 0
+        var upper = samples.count
+        while lower < upper {
+            let middle = (lower + upper) / 2
+            if samples[middle].monotonicSeconds <= monotonic {
+                lower = middle + 1
+            } else {
+                upper = middle
+            }
         }
-        return (best?.timezoneID ?? "UTC", best?.utcOffsetSeconds ?? 0)
+        let index = max(0, lower - 1)
+        return (samples[index].timezoneID, samples[index].utcOffsetSeconds)
     }
 }

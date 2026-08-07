@@ -42,6 +42,436 @@ func close(_ first: Double, _ second: Double, tolerance: Double = 1.0e-9) -> Boo
     return abs(first - second) <= tolerance
 }
 
+func processCPUSeconds(_ usage: rusage) -> Double {
+    let user = Double(usage.ru_utime.tv_sec)
+        + Double(usage.ru_utime.tv_usec) / 1_000_000.0
+    let system = Double(usage.ru_stime.tv_sec)
+        + Double(usage.ru_stime.tv_usec) / 1_000_000.0
+    return user + system
+}
+
+func regularFileBytes(in directory: URL) throws -> Int64 {
+    var enumerationError: Error?
+    guard let enumerator = FileManager.default.enumerator(
+        at: directory,
+        includingPropertiesForKeys: [.isRegularFileKey, .fileSizeKey],
+        options: [],
+        errorHandler: { _, error in
+            enumerationError = error
+            return false
+        }) else {
+        throw NSError(domain: "MarketScannerScaleMetrics", code: 1)
+    }
+    var total: Int64 = 0
+    for case let url as URL in enumerator {
+        let values = try url.resourceValues(
+            forKeys: [.isRegularFileKey, .fileSizeKey])
+        if values.isRegularFile == true {
+            guard let size = values.fileSize, size >= 0 else {
+                throw NSError(domain: "MarketScannerScaleMetrics", code: 2)
+            }
+            total += Int64(size)
+        }
+    }
+    if let enumerationError { throw enumerationError }
+    return total
+}
+
+// The 100k-record finalization memory qualification runs in a dedicated
+// process. `ru_maxrss` is a lifetime high-water mark, so measuring it at
+// the end of the full host suite would include unrelated 60k clock,
+// workbook, replay and crash-recovery workloads.
+if CommandLine.arguments.count == 2,
+   CommandLine.arguments[1] == "--finalization-scale" {
+    do {
+        let scaleStartedAt = ProcessInfo.processInfo.systemUptime
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "ms-finalization-scale-\(UUID().uuidString)",
+                isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let recordCount = 100_000
+        let mapHash = String(repeating: "b", count: 64)
+        func writeEvidence(
+            _ fileName: String,
+            format: String,
+            recordBody: (Int) -> String
+        ) throws {
+            let url = directory.appendingPathComponent(fileName)
+            guard FileManager.default.createFile(
+                atPath: url.path, contents: nil) else {
+                throw NSError(
+                    domain: "MarketScannerFinalizationScale", code: 1)
+            }
+            let handle = try FileHandle(forWritingTo: url)
+            defer { try? handle.close() }
+            var batch = Data()
+            batch.reserveCapacity(1024 * 1024)
+            for index in 1...recordCount {
+                let identity = "\"format\":\"\(format)\",\"version\":1,"
+                    + "\"trackingSessionId\":\"session-long\","
+                    + "\"priorMapId\":\"map-long\","
+                    + "\"priorMapSha256\":\"\(mapHash)\","
+                    + "\"floorId\":\"1\","
+                batch.append(contentsOf:
+                    ("{" + identity + recordBody(index) + "}\n").utf8)
+                if batch.count >= 1024 * 1024 {
+                    try handle.write(contentsOf: batch)
+                    batch.removeAll(keepingCapacity: true)
+                }
+            }
+            if !batch.isEmpty { try handle.write(contentsOf: batch) }
+            try handle.synchronize()
+        }
+        let poseJSON = "{\"x_m\":0,\"y_m\":0,\"yaw_rad\":0}"
+        try writeEvidence(
+            "localization_trace.jsonl",
+            format: "MarketScannerLocalizationTrace"
+        ) { index in
+            "\"timestamp\":\(index),\"nodeTimebaseTimestamp\":\(index),"
+                + "\"nodeTimebaseOffsetSeconds\":0,\"rawPose\":\(poseJSON),"
+                + "\"estimatedPose\":\(poseJSON),\"trackingState\":\"normal\","
+                + "\"localizationState\":\"stable\",\"confidence\":1"
+        }
+        try writeEvidence(
+            "localization_constraints.jsonl",
+            format: "MarketScannerLocalizationConstraint"
+        ) { index in
+            "\"timestamp\":\(index),\"nodeTimebaseTimestamp\":\(index),"
+                + "\"nodeTimebaseOffsetSeconds\":0,\"accepted\":false,"
+                + "\"predictedPose\":\(poseJSON),\"uniqueness\":0.9"
+        }
+        try writeEvidence(
+            "localization_events.jsonl",
+            format: "MarketScannerLocalizationStateEvent"
+        ) { index in
+            "\"timestamp\":\(index),\"nodeTimebaseTimestamp\":\(index),"
+                + "\"nodeTimebaseOffsetSeconds\":0,\"state\":\"stable\","
+                + "\"confidence\":1"
+        }
+        for name in [
+            "manual_localization_events.jsonl", "tag_observations.jsonl",
+            "tag_observation_bursts.jsonl",
+            "localization_recovery_events.jsonl",
+        ] {
+            try Data().write(to: directory.appendingPathComponent(name))
+        }
+        try Data("[]".utf8).write(
+            to: directory.appendingPathComponent("localized_price_tags.json"))
+        let expectation = LocalizationEvidenceBundleExpectation(
+            trackingSessionId: "session-long",
+            priorMapId: "map-long",
+            priorMapSha256: mapHash,
+            floorId: "1",
+            traceRecordCount: recordCount,
+            constraintRecordCount: recordCount,
+            stateEventCount: recordCount,
+            lastDurableState: "stable",
+            localizedPriceTagCount: 0)
+        let blockers = LocalizationEvidenceBundleValidator.blockers(
+            in: directory, expectation: expectation)
+        guard blockers.isEmpty else {
+            FileHandle.standardError.write(Data(
+                "100k finalization validation failed: \(blockers)\n".utf8))
+            exit(15)
+        }
+        var usage = rusage()
+        guard getrusage(RUSAGE_SELF, &usage) == 0 else {
+            FileHandle.standardError.write(
+                Data("getrusage failed\n".utf8))
+            exit(15)
+        }
+        let temporaryDiskBytes = try regularFileBytes(in: directory)
+        print("Finalization test records: \(recordCount * 3)")
+        print("Finalization test input bytes: \(temporaryDiskBytes)")
+        print("Finalization test temporary disk bytes: \(temporaryDiskBytes)")
+        print("Finalization test wall seconds: \(ProcessInfo.processInfo.systemUptime - scaleStartedAt)")
+        print("Finalization test CPU seconds: \(processCPUSeconds(usage))")
+        print("Finalization test peak RSS bytes: \(usage.ru_maxrss)")
+        exit(0)
+    } catch {
+        FileHandle.standardError.write(
+            Data("100k finalization scale failed: \(error)\n".utf8))
+        exit(15)
+    }
+}
+
+// RC scale closeout: 48 hours at 10 Hz with a discrete state transition on
+// every record must still retain at most one conservative record/second plus
+// the exact final record. This dedicated process makes ru_maxrss attributable
+// to the production compactor rather than the rest of the host suite.
+if CommandLine.arguments.count == 2,
+   CommandLine.arguments[1] == "--trace-compaction-scale" {
+    let scaleStartedAt = ProcessInfo.processInfo.systemUptime
+    let recordCount = StrictLocalizationTraceParser
+        .qualificationMaximumRecords
+    let expectedSeconds = 48 * 60 * 60
+    require(
+        recordCount == expectedSeconds * 10,
+        "trace scale contract must remain 48h at 10 Hz")
+    var compactor = StrictLocalizationTraceParser.RetainedTraceCompactor(
+        originNodeTimestamp: 1_000_000)
+    for index in 0..<recordCount {
+        let isExactFinal = index == recordCount - 1
+        let lost = !isExactFinal && index % 2 == 1
+        let timestamp = 1_000_000 + Double(index) / 10.0
+        compactor.consume(StrictLocalizationTraceParser.TraceRecord(
+            timestamp: Double(index) / 10.0,
+            xM: 0, yM: 0, yawRad: 0,
+            localizationState: lost ? "lost" : "stable",
+            trackingState: lost ? "notAvailable" : "normal",
+            floorID: "1",
+            nodeTimebaseOffsetSeconds: 1_000_000,
+            nodeTimebaseTimestamp: timestamp,
+            confidence: lost ? 0 : 1))
+    }
+    let retained = compactor.finish()
+    require(
+        retained.count == expectedSeconds + 1,
+        "48h transition storm must retain one/second plus exact final; "
+            + "got \(retained.count)")
+    require(
+        retained.dropLast().allSatisfy {
+            $0.localizationState == "lost"
+                && $0.trackingState == "notAvailable"
+        },
+        "per-second compaction must conservatively retain lost evidence")
+    require(
+        retained.last?.localizationState == "stable",
+        "trace compactor must retain the exact final sample")
+    var usage = rusage()
+    require(getrusage(RUSAGE_SELF, &usage) == 0, "trace scale getrusage failed")
+    print("Trace compaction input records: \(recordCount)")
+    print("Trace compaction temporary disk bytes: 0")
+    print("Trace compaction wall seconds: \(ProcessInfo.processInfo.systemUptime - scaleStartedAt)")
+    print("Trace compaction CPU seconds: \(processCPUSeconds(usage))")
+    print("Trace compaction retained records: \(retained.count)")
+    print("Trace compaction peak RSS bytes: \(usage.ru_maxrss)")
+    exit(0)
+}
+
+// RC scale closeout: exercise the real strict burst parser, exact observation
+// consumer and retained production DTOs at the qualified 200k observation
+// ceiling. The fixture is streamed to disk in bounded batches.
+if CommandLine.arguments.count == 2,
+   CommandLine.arguments[1] == "--tag-evidence-scale" {
+    do {
+        let scaleStartedAt = ProcessInfo.processInfo.systemUptime
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "ms-tag-evidence-scale-\(UUID().uuidString)",
+                isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let observationCount = GeneratedMobileEvidenceContracts.ProductScale
+            .maxTagObservations
+        let framesPerBurst = 100
+        require(
+            observationCount == 200_000
+                && observationCount % framesPerBurst == 0,
+            "tag scale contract must remain exactly 200k")
+        let burstCount = observationCount / framesPerBurst
+        let mapID = "scale-map"
+        let mapSHA = String(repeating: "a", count: 64)
+        let sessionID = "scale-session"
+        let floorID = "1"
+
+        func writeBatched(
+            to url: URL,
+            count: Int,
+            line: (Int) -> String
+        ) throws {
+            guard FileManager.default.createFile(
+                atPath: url.path, contents: nil) else {
+                throw NSError(domain: "TagEvidenceScale", code: 1)
+            }
+            let handle = try FileHandle(forWritingTo: url)
+            defer { try? handle.close() }
+            var batch = Data()
+            batch.reserveCapacity(1024 * 1024)
+            for index in 0..<count {
+                batch.append(contentsOf: line(index).utf8)
+                if batch.count >= 1024 * 1024 {
+                    try handle.write(contentsOf: batch)
+                    batch.removeAll(keepingCapacity: true)
+                }
+            }
+            if !batch.isEmpty { try handle.write(contentsOf: batch) }
+            try handle.synchronize()
+        }
+
+        let burstURL = directory.appendingPathComponent(
+            "tag_observation_bursts.jsonl")
+        try writeBatched(to: burstURL, count: burstCount) { burstIndex in
+            let first = burstIndex * framesPerBurst
+            var frames = ""
+            frames.reserveCapacity(framesPerBurst * 190)
+            for offset in 0..<framesPerBurst {
+                let index = first + offset
+                if offset > 0 { frames.append(",") }
+                frames += "{\"bound_node_id\":1,\"confidence\":0.9,"
+                    + "\"depth\":0.95,\"frame_id\":\"frame-\(index)\","
+                    + "\"frame_timestamp\":1000,"
+                    + "\"node_timestamp\":1000,"
+                    + "\"observation_id\":\"OBS-\(index)\","
+                    + "\"tracking\":\"stable\",\"view\":\"front\"}"
+            }
+            let burstID = "BURST-\(burstIndex + 1)"
+            return "{\"barcode\":\"6901234567890\","
+                + "\"bound_node_id_max\":1,\"bound_node_id_min\":1,"
+                + "\"burst_id\":\"\(burstID)\",\"complete\":true,"
+                + "\"depth_quality\":0.95,\"first_frame_timestamp\":1000,"
+                + "\"floor_id\":\"\(floorID)\",\"format\":"
+                + "\"MarketScannerPriceTagBurst\",\"frame_count\":"
+                + "\(framesPerBurst),\"frames\":[\(frames)],"
+                + "\"last_frame_timestamp\":1000,"
+                + "\"localization_confidence_mean\":0.9,"
+                + "\"prior_map_id\":\"\(mapID)\","
+                + "\"prior_map_sha256\":\"\(mapSHA)\","
+                + "\"sequence\":\(burstIndex + 1),"
+                + "\"symbology\":\"EAN13\","
+                + "\"tracking_quality\":\"stable\","
+                + "\"tracking_session_id\":\"\(sessionID)\","
+                + "\"version\":2,\"view_angle\":\"front\"}\n"
+        }
+
+        let observationURL = directory.appendingPathComponent(
+            "tag_observations.jsonl")
+        try writeBatched(
+            to: observationURL, count: observationCount
+        ) { index in
+            let burstID = "BURST-\(index / framesPerBurst + 1)"
+            return "{\"alignment_age_ms\":2,"
+                + "\"alignment_freshness\":\"fresh\","
+                + "\"alignment_snapshot_timestamp\":999.998,"
+                + "\"alignment_version\":3,\"alignment_version_lag\":0,"
+                + "\"burst_id\":\"\(burstID)\","
+                + "\"depth_inlier_count\":38,\"depth_inlier_ratio\":0.95,"
+                + "\"depth_mad_m\":0.1,\"depth_median_m\":1.2,"
+                + "\"depth_sample_count\":40,\"floor_id\":\"\(floorID)\","
+                + "\"format\":\"MarketScannerPriceTagObservation\","
+                + "\"frame_id\":\"frame-\(index)\","
+                + "\"frame_timestamp\":1000,\"localization_confidence\":0.9,"
+                + "\"localization_state\":\"stable\","
+                + "\"measurement_confidence\":0.9,"
+                + "\"measurement_method\":\"scene_depth\","
+                + "\"needs_review\":false,"
+                + "\"node_timebase_frame_timestamp\":1000,"
+                + "\"node_timebase_offset_seconds\":0,"
+                + "\"normalized_bounds\":[0.1,0.2,0.3,0.4],"
+                + "\"observation_id\":\"OBS-\(index)\","
+                + "\"payload\":\"6901234567890\",\"plane_residual_m\":0.02,"
+                + "\"pose_timestamp_delta_ms\":2,"
+                + "\"prior_map_id\":\"\(mapID)\","
+                + "\"prior_map_sha256\":\"\(mapSHA)\","
+                + "\"raw_map_position\":{\"height_m\":0,\"x_m\":5,\"y_m\":-0.1},"
+                + "\"surface_normal_camera\":[0,0,-1],"
+                + "\"symbology\":\"EAN13\",\"timestamp\":100,"
+                + "\"tracking_session_id\":\"\(sessionID)\",\"version\":1}\n"
+        }
+
+        let nodes = [AbsolutePriorEvidenceNode(nodeID: 1, stamp: 1000)]
+        let bursts = try TagObservationBurstEvidenceParser.parse(
+            snapshotDirectory: directory,
+            nodes: nodes,
+            priorMapID: mapID,
+            priorMapSHA256: mapSHA,
+            trackingSessionID: sessionID,
+            floorID: floorID,
+            expectedBurstCount: burstCount,
+            expectedLastBurstID: "BURST-\(burstCount)")
+        require(
+            bursts.clean && bursts.frameCount == observationCount,
+            "200k burst evidence did not parse cleanly")
+        let observations = try TagObservationEvidenceParser.parse(
+            snapshotDirectory: directory,
+            nodes: nodes,
+            priorMapID: mapID,
+            priorMapSHA256: mapSHA,
+            trackingSessionID: sessionID,
+            floorID: floorID,
+            verifiedBursts: bursts)
+        require(
+            observations.clean
+                && observations.observations.count == observationCount
+                && observations.boundNodeIDs == [1]
+                && bursts.remainingFrameCount == 0,
+            "200k observation exact-consumption contract failed")
+        require(
+            bursts.releaseConsumedFrames(),
+            "200k consumed burst index must be releasable before optimization")
+
+        // Continue through the production resolver, shelf association,
+        // evidence-weighted fusion and automatic tag quality gate. This
+        // closes the previous gap where only clustering (not strict parsing
+        // plus the downstream pipeline) was exercised at 200k.
+        let finalNode = TagObservationResolver.FinalNodePose(
+            id: 1,
+            monotonicSeconds: 1000,
+            pose: .identity,
+            floorID: floorID,
+            uncertaintyM: 0.1)
+        let resolverIndex = TagObservationResolver.NodeIndex(
+            finalNodes: [finalNode], rawNodeStamps: [1: 1000])
+        let shelf = ShelfAssociationEngine.ShelfSegment(
+            shelfSegmentID: "scale-shelf-segment",
+            shelfCode: "SCALE-SHELF",
+            floorID: floorID,
+            startM: (0, 0), endM: (10, 0),
+            axisM: (1, 0), frontNormalM: (0, -1),
+            boundsMinM: (0, -0.5), boundsMaxM: (10, 0.5),
+            polygonM: nil,
+            orientationProvenance: "scale_fixture")
+        let priorMap = MobileMapLibrary.MapEntry(
+            priorMapID: mapID,
+            name: "Scale Map",
+            packageSHA256: mapSHA,
+            packageDirectory: directory,
+            floorCount: 1,
+            elementCount: 1,
+            compiledAtUTC: 0,
+            compilerVersion: "scale-test",
+            canonicalSourceSHA256: String(repeating: "b", count: 64))
+        let finalized = try MobileProcessingPipeline.finalizeTags(
+            observations: observations.observations,
+            resolverIndex: resolverIndex,
+            shelves: [shelf],
+            shelfIndex: ShelfAssociationEngine.ShelfSpatialIndex(
+                shelves: [shelf]),
+            structures: [],
+            sessionID: sessionID,
+            storeID: "SCALE-STORE",
+            priorMap: priorMap,
+            floorID: floorID,
+            graphQualityPassed: true,
+            rawNodePoses: [1: .identity],
+            minimumAssociationMarginM: 0.5)
+        require(
+            finalized.0.count == 1 && finalized.1.isEmpty,
+            "200k full tag pipeline must fuse one accepted physical tag")
+        var usage = rusage()
+        require(getrusage(RUSAGE_SELF, &usage) == 0, "tag scale getrusage failed")
+        let inputBytes = try regularFileBytes(in: directory)
+        print("Tag evidence input records: \(observationCount * 2)")
+        print("Tag evidence input bytes: \(inputBytes)")
+        print("Tag evidence temporary disk bytes: \(inputBytes)")
+        print("Tag evidence wall seconds: \(ProcessInfo.processInfo.systemUptime - scaleStartedAt)")
+        print("Tag evidence CPU seconds: \(processCPUSeconds(usage))")
+        print("Tag evidence accepted observations: \(observations.observations.count)")
+        print("Tag evidence peak RSS bytes: \(usage.ru_maxrss)")
+        exit(0)
+    } catch {
+        FileHandle.standardError.write(
+            Data("200k tag evidence scale failed: \(error)\n".utf8))
+        exit(24)
+    }
+}
+
 let injectedFailure = NSError(
     domain: "MarketScannerFinalizationTests",
     code: 1,
@@ -361,6 +791,47 @@ let initialEvidenceBlockers = LocalizationEvidenceBundleValidator.blockers(
 require(
     initialEvidenceBlockers.isEmpty,
     "a complete persisted evidence bundle must validate: \(initialEvidenceBlockers)")
+
+// J-07: manual evidence uses an exact raw-line watermark just like recovery.
+let manualEvidenceURL = evidenceDirectory.appendingPathComponent(
+    "manual_localization_events.jsonl")
+var manualEvidenceData = try JSONSerialization.data(withJSONObject: [
+    "format": "MarketScannerManualLocalizationEvent",
+    "version": 3,
+    "tracking_session_id": "session-a",
+    "prior_map_id": "map-a",
+    "prior_map_sha256": String(repeating: "a", count: 64),
+    "floor_id": "1",
+    "frame_timestamp": 1.0,
+    "node_timebase_frame_timestamp": 1.0,
+    "node_timebase_offset_seconds": 0.0,
+])
+manualEvidenceData.append(0x0A)
+try manualEvidenceData.write(to: manualEvidenceURL)
+let manualEvidenceExpectation = LocalizationEvidenceBundleExpectation(
+    trackingSessionId: "session-a",
+    priorMapId: "map-a",
+    priorMapSha256: String(repeating: "a", count: 64),
+    floorId: "1",
+    traceRecordCount: 1,
+    constraintRecordCount: 1,
+    manualLocalizationEventCount: 1,
+    stateEventCount: 1,
+    lastDurableState: "stable",
+    localizedPriceTagCount: 0)
+require(
+    LocalizationEvidenceBundleValidator.blockers(
+        in: evidenceDirectory,
+        expectation: manualEvidenceExpectation).isEmpty,
+    "a manual event with an exact count watermark must validate")
+require(
+    LocalizationEvidenceBundleValidator.blockers(
+        in: evidenceDirectory,
+        expectation: evidenceExpectation).contains {
+            $0.contains("manual_localization_events.jsonl_count_mismatch")
+        },
+    "a manual event without its exact watermark must fail closed")
+try Data().write(to: manualEvidenceURL)
 
 // P7R6: recovery lifecycle records are reconciled against an exact
 // expected-count watermark. A valid terminal record validates only when the
@@ -689,93 +1160,6 @@ catch {
 }
 require(replacementRejected, "a path inode replacement during streaming must fail closed")
 
-let longEvidenceDirectory = finalizationTemp.appendingPathComponent(
-    "evidence-100k",
-    isDirectory: true)
-try FileManager.default.createDirectory(
-    at: longEvidenceDirectory,
-    withIntermediateDirectories: true)
-let longRecordCount = 100_000
-let longMapHash = String(repeating: "b", count: 64)
-func writeLongEvidence(
-    _ fileName: String,
-    format: String,
-    recordBody: (Int) -> String
-) throws {
-    let url = longEvidenceDirectory.appendingPathComponent(fileName)
-    FileManager.default.createFile(atPath: url.path, contents: nil)
-    let handle = try FileHandle(forWritingTo: url)
-    defer { try? handle.close() }
-    var batch = Data()
-    batch.reserveCapacity(1024 * 1024)
-    for index in 1...longRecordCount {
-        let identity = "\"format\":\"\(format)\",\"version\":1,"
-            + "\"trackingSessionId\":\"session-long\","
-            + "\"priorMapId\":\"map-long\","
-            + "\"priorMapSha256\":\"\(longMapHash)\","
-            + "\"floorId\":\"1\","
-        batch.append(contentsOf: ("{" + identity + recordBody(index) + "}\n").utf8)
-        if batch.count >= 1024 * 1024 {
-            try handle.write(contentsOf: batch)
-            batch.removeAll(keepingCapacity: true)
-        }
-    }
-    if !batch.isEmpty { try handle.write(contentsOf: batch) }
-    try handle.synchronize()
-}
-let poseJSON = "{\"x_m\":0,\"y_m\":0,\"yaw_rad\":0}"
-try writeLongEvidence(
-    "localization_trace.jsonl",
-    format: "MarketScannerLocalizationTrace"
-) { index in
-    return "\"timestamp\":\(index),\"nodeTimebaseTimestamp\":\(index),"
-        + "\"nodeTimebaseOffsetSeconds\":0,\"rawPose\":\(poseJSON),"
-        + "\"estimatedPose\":\(poseJSON),\"trackingState\":\"normal\","
-        + "\"localizationState\":\"stable\",\"confidence\":1"
-}
-try writeLongEvidence(
-    "localization_constraints.jsonl",
-    format: "MarketScannerLocalizationConstraint"
-) { index in
-    return "\"timestamp\":\(index),\"nodeTimebaseTimestamp\":\(index),"
-        + "\"nodeTimebaseOffsetSeconds\":0,\"accepted\":false,"
-        + "\"predictedPose\":\(poseJSON),\"uniqueness\":0.9"
-}
-try writeLongEvidence(
-    "localization_events.jsonl",
-    format: "MarketScannerLocalizationStateEvent"
-) { index in
-    return "\"timestamp\":\(index),\"nodeTimebaseTimestamp\":\(index),"
-        + "\"nodeTimebaseOffsetSeconds\":0,\"state\":\"stable\","
-        + "\"confidence\":1"
-}
-try Data().write(to: longEvidenceDirectory.appendingPathComponent(
-    "manual_localization_events.jsonl"))
-try Data().write(to: longEvidenceDirectory.appendingPathComponent(
-    "tag_observations.jsonl"))
-try Data().write(to: longEvidenceDirectory.appendingPathComponent(
-    "tag_observation_bursts.jsonl"))
-try Data().write(to: longEvidenceDirectory.appendingPathComponent(
-    "localization_recovery_events.jsonl"))
-try Data("[]".utf8).write(to: longEvidenceDirectory.appendingPathComponent(
-    "localized_price_tags.json"))
-let longExpectation = LocalizationEvidenceBundleExpectation(
-    trackingSessionId: "session-long",
-    priorMapId: "map-long",
-    priorMapSha256: longMapHash,
-    floorId: "1",
-    traceRecordCount: longRecordCount,
-    constraintRecordCount: longRecordCount,
-    stateEventCount: longRecordCount,
-    lastDurableState: "stable",
-    localizedPriceTagCount: 0)
-let longEvidenceBlockers = LocalizationEvidenceBundleValidator.blockers(
-    in: longEvidenceDirectory,
-    expectation: longExpectation)
-require(
-    longEvidenceBlockers.isEmpty,
-    "100k trace/constraint/state records must validate: \(longEvidenceBlockers)")
-
 let cleanupRoot = finalizationTemp.appendingPathComponent(
     "SupermarketSession-Cleanup",
     isDirectory: true)
@@ -866,6 +1250,7 @@ require(
         priorMapId: nil,
         priorMapSha256: nil,
         floorId: nil,
+        storeID: nil,
         initialMapPose: nil
     ).isReadyToStart == false,
     "incomplete prior-map setup must not start")
@@ -877,6 +1262,7 @@ let ready = PriorMapScanConfiguration(
     priorMapId: "fixture",
     priorMapSha256: String(repeating: "a", count: 64),
     floorId: "1",
+    storeID: "STORE-1",
     initialMapPose: PriorMapPose2D(xM: 2, yM: 3, yawRad: .pi / 2))
 require(ready.isReadyToStart, "complete prior-map setup must start")
 
@@ -2936,7 +3322,8 @@ func makeInput(positions: [FinalTrajectory.DevicePositionRow]) -> MobileResultEx
                 tagInstanceID: "t1", barcode: "=HYPERLINK(\"x\")", symbology: "CODE128",
                 storeID: "s1", floorID: "1", mapVersion: 1,
                 priorMapSha256: "a", trackingSessionID: "s",
-                shelfCode: "A1", shelfSide: "front",
+                shelfCode: "A1", shelfSegmentID: "segment-a1-main",
+                shelfSide: "front",
                 distanceFromShelfStartCm: 123.4, positionRatio: 0.62,
                 mapXM: 1.5, mapYM: -2.5, observationCount: 12,
                 positionSpreadCm: 3.2, localizationConfidence: 0.95,
@@ -2945,6 +3332,7 @@ func makeInput(positions: [FinalTrajectory.DevicePositionRow]) -> MobileResultEx
         rescanTasks: [
             RescanTask(taskID: "r1", taskType: .tagRescan, floorID: "1",
                        barcode: "123", tagInstanceID: "t2", shelfCode: "B2",
+                       shelfSegmentID: "segment-b2-main",
                        regionStartCm: 10, regionEndCm: 40,
                        localStartTime: "2026-08-05 21:00:00.000 +08:00",
                        localEndTime: "2026-08-05 21:00:05.000 +08:00",
@@ -5879,6 +6267,94 @@ do {
             && snapshot.artifactNames.contains("preview.png")
             && snapshot.artifactNames.contains("road_graph.json"),
         "C9 compiled package must expose manifest/distance/preview/road artifacts")
+    // RC-B01/B17: the production compiler writes shelves v2 with the
+    // complete typed segment contract, and the production post-processing
+    // loader reopens the exact compiled package using those directions.
+    let shelvesData = try Data(contentsOf: output.appendingPathComponent("shelves.json"))
+    let shelvesObject = try StrictJSONDocumentParser.object(
+        from: shelvesData,
+        limits: StrictJSONDocumentLimits(maximumBytes: shelvesData.count + 1))
+    let shelvesDocument = try PriorMapShelvesSchema.parse(shelvesObject)
+    require(
+        shelvesDocument.version == 2 && shelvesDocument.segments.count == 1,
+        "RC-B01 compiler must emit one shelves-v2 segment")
+    if let compiled = shelvesDocument.segments.first {
+        require(
+            compiled.shelfSegmentID == shelvesDocument.rawShelves[0]["id"] as? String
+                && compiled.shelfCode == "S1"
+                && compiled.floorID == "1"
+                && compiled.longitudinalStartM.count == 2
+                && compiled.longitudinalEndM.count == 2
+                && close(hypot(
+                    compiled.longitudinalAxis[0],
+                    compiled.longitudinalAxis[1]), 1.0, tolerance: 1.0e-6)
+                && close(
+                    compiled.frontNormal[0] + compiled.backNormal[0],
+                    0, tolerance: 1.0e-6)
+                && close(
+                    compiled.frontNormal[1] + compiled.backNormal[1],
+                    0, tolerance: 1.0e-6),
+            "RC-B17 compiled shelf identity/direction relations must be complete")
+    }
+    let loaderEntry = MobileMapLibrary.MapEntry(
+        priorMapID: result.priorMapID,
+        name: "sample",
+        packageSHA256: result.packageSHA256,
+        packageDirectory: output,
+        floorCount: result.floorCount,
+        elementCount: result.elementCount,
+        compiledAtUTC: 0,
+        compilerVersion: "test",
+        canonicalSourceSHA256: String(repeating: "a", count: 64))
+    let reopenedShelves = try MobileProcessingPipeline.readShelves(from: loaderEntry)
+    require(
+        reopenedShelves.count == 1
+            && reopenedShelves[0].shelfSegmentID
+                == shelvesDocument.segments[0].shelfSegmentID
+            && close(
+                reopenedShelves[0].startM.0,
+                shelvesDocument.segments[0].longitudinalStartM[0])
+            && close(
+                reopenedShelves[0].axisM.0,
+                shelvesDocument.segments[0].longitudinalAxis[0]),
+        "RC-B01 production readShelves must reopen compiler-authored v2 directions")
+
+    // Legacy v1 remains readable; unknown versions and malformed v2
+    // vectors/fields fail closed.
+    var legacyShelves = shelvesObject
+    legacyShelves["version"] = 1
+    legacyShelves.removeValue(forKey: "shelf_segments")
+    let parsedLegacyShelves = try PriorMapShelvesSchema.parse(legacyShelves)
+    require(
+        parsedLegacyShelves.version == 1,
+        "RC-B01 shelves v1 legacy read must remain supported")
+    func shelfSchemaRejects(_ object: [String: Any]) -> Bool {
+        do {
+            _ = try PriorMapShelvesSchema.parse(object)
+            return false
+        } catch {
+            return true
+        }
+    }
+    var unknownVersion = shelvesObject
+    unknownVersion["version"] = 3
+    require(
+        shelfSchemaRejects(unknownVersion),
+        "RC-B01 unknown shelves versions must be rejected")
+    var invalidAxis = shelvesObject
+    var invalidAxisSegments = invalidAxis["shelf_segments"] as! [[String: Any]]
+    invalidAxisSegments[0]["longitudinal_axis"] = [0.5, 0.0]
+    invalidAxis["shelf_segments"] = invalidAxisSegments
+    require(
+        shelfSchemaRejects(invalidAxis),
+        "RC-B17 non-unit shelf axis must be rejected")
+    var unknownSegmentField = shelvesObject
+    var unknownFieldSegments = unknownSegmentField["shelf_segments"] as! [[String: Any]]
+    unknownFieldSegments[0]["unexpected"] = true
+    unknownSegmentField["shelf_segments"] = unknownFieldSegments
+    require(
+        shelfSchemaRejects(unknownSegmentField),
+        "RC-B17 unknown v2 segment fields must be rejected")
     // Distance-field per-level digests are frozen PC-parity values.
     let distance = try MobilePackageManifestBuilder.requiredFilesPresent(directory: output)
     _ = distance
@@ -6097,6 +6573,227 @@ catch {
     require(false, "T4 lost interval failed: \(error)")
 }
 
+// RC-B22: an exact hit on the final node remains AVAILABLE, stale or
+// wrong-floor trace state is not reused, and a discontinuity row chooses
+// the nearest segment's timezone instead of the session's first timezone.
+do {
+    let exactMapper = MonotonicUTCMapper(samples: [
+        .init(monotonicSeconds: 0, utcUnixSeconds: 3_000_000_000,
+              utcOffsetSeconds: 0, timezoneID: "UTC"),
+        .init(monotonicSeconds: 2, utcUnixSeconds: 3_000_000_002,
+              utcOffsetSeconds: 0, timezoneID: "UTC"),
+    ], discontinuityEdges: [])
+    let exactRows = FinalTrajectory.resample(
+        input: FinalTrajectory.Input(
+            nodes: [
+                .init(id: 1, monotonicSeconds: 0, xM: 0, yM: 0,
+                      yawRad: 0, uncertaintyM: 0.1, floorID: "1"),
+                .init(id: 2, monotonicSeconds: 2, xM: 2, yM: 0,
+                      yawRad: 0, uncertaintyM: 0.1, floorID: "1"),
+            ],
+            lostIntervals: [],
+            sessionStartUTC: 3_000_000_000,
+            sessionEndUTC: 3_000_000_002,
+            traceStates: [
+                .init(timestamp: 0.2, trackingState: "normal",
+                      localizationState: "stable", confidence: 0.9,
+                      floorID: "1"),
+                .init(timestamp: 2.0, trackingState: "normal",
+                      localizationState: "stable", confidence: 1.0,
+                      floorID: "2"),
+            ]),
+        utcMapper: exactMapper, storeID: "s1",
+        priorMapID: "m", priorMapSha256: "a",
+        trackingSessionID: "s", appGitSHA: "g")
+    require(
+        exactRows.count == 3
+            && exactRows[2].positionStatus == "AVAILABLE"
+            && exactRows[2].beforeNodeID == 2
+            && exactRows[2].afterNodeID == 2,
+        "RC-B22 exact final node must remain AVAILABLE")
+    require(
+        exactRows[2].trackingState == "unknown"
+            && exactRows[2].localizationConfidence == nil,
+        "RC-B22 stale/wrong-floor trace state must not contaminate final row")
+
+    let jumpMapper = MonotonicUTCMapper(samples: [
+        .init(monotonicSeconds: 0, utcUnixSeconds: 4_000_000_000,
+              utcOffsetSeconds: 0, timezoneID: "UTC"),
+        .init(monotonicSeconds: 1, utcUnixSeconds: 4_000_000_010,
+              utcOffsetSeconds: 28_800, timezoneID: "Asia/Shanghai"),
+    ], discontinuityEdges: [0])
+    let jumpRows = FinalTrajectory.resample(
+        input: FinalTrajectory.Input(
+            nodes: [
+                .init(id: 1, monotonicSeconds: 0, xM: 0, yM: 0,
+                      yawRad: 0, uncertaintyM: 0.1, floorID: "1"),
+            ],
+            lostIntervals: [],
+            sessionStartUTC: 4_000_000_006,
+            sessionEndUTC: 4_000_000_006),
+        utcMapper: jumpMapper, storeID: "s1",
+        priorMapID: "m", priorMapSha256: "a",
+        trackingSessionID: "s", appGitSHA: "g")
+    require(
+        jumpRows.count == 1
+            && jumpRows[0].positionStatus == "UNAVAILABLE"
+            && jumpRows[0].timezoneID == "Asia/Shanghai"
+            && jumpRows[0].utcOffset == 28_800,
+        "RC-B22 discontinuity row must use nearest post-change timezone")
+}
+catch {
+    require(false, "RC-B22 final trajectory regression tests failed: \(error)")
+}
+
+// RC-B06: the clock writer is genuinely incremental and its durable
+// watermark advances only after fsync. Exercise the production-scale
+// 60k node-binding ceiling and deterministic fault stages.
+do {
+    let directory = try p7r6FreshDirectory("clock-writer")
+    let url = directory.appendingPathComponent("clock_correlations.jsonl")
+    let writer = try ClockCorrelationRecorder(
+        trackingSessionID: "clock-writer-session", url: url)
+    try writer.record(
+        reason: .sessionStart,
+        monotonicSeconds: 1,
+        utcUnixSeconds: 2_000_000_001,
+        timezoneID: "UTC",
+        utcOffsetSeconds: 0)
+    let bindingCount = GeneratedMobileEvidenceContracts.ProductScale
+        .maxClockNodeBindings
+    for nodeID in 1...bindingCount {
+        let timestamp = Double(nodeID) + 1
+        try writer.recordNodeBinding(
+            nodeID: nodeID,
+            nodeStamp: timestamp,
+            sampledFrameTimestamp: timestamp,
+            systemUptime: timestamp,
+            utcUnixSeconds: 2_000_000_000 + timestamp,
+            timezoneID: "UTC",
+            utcOffsetSeconds: 0)
+    }
+    try writer.record(
+        reason: .sessionEnd,
+        monotonicSeconds: Double(bindingCount) + 2,
+        utcUnixSeconds: 2_000_000_000 + Double(bindingCount) + 2,
+        timezoneID: "UTC",
+        utcOffsetSeconds: 0)
+    let watermark = try writer.finish()
+    require(
+        watermark.correlationCount == 2
+            && watermark.nodeBindingCount == bindingCount
+            && watermark.evidenceComplete,
+        "RC-B06 durable watermark must exactly match 2 correlations + \(bindingCount) bindings")
+    require(
+        writer.records.count == 2,
+        "RC-B06 writer must not retain 60k node bindings in memory")
+    let clockBytes = try Data(contentsOf: url)
+    require(
+        clockBytes.last == 0x0A,
+        "RC-B06 clock sidecar must end in exactly a complete JSONL line")
+    let clockSummary = try StrictJSONLStreamReader.forEachLine(
+        from: url,
+        limits: StrictJSONLStreamReader.Limits(
+            maximumFileBytes: GeneratedMobileEvidenceContracts
+                .File_clock_correlations_jsonl.max_file_bytes,
+            maximumLineBytes: GeneratedMobileEvidenceContracts
+                .File_clock_correlations_jsonl.max_record_bytes,
+            maximumLineCount: GeneratedMobileEvidenceContracts
+                .File_clock_correlations_jsonl.max_records),
+        body: { _ in })
+    require(
+        clockSummary.lineCount == bindingCount + 2,
+        "RC-B06 strict framing count must match every durable record")
+
+    enum ClockInjectedFailure: Error { case injected }
+    func throwsAt(
+        _ injectedStage: ClockSidecarWriteStage,
+        _ body: (URL, @escaping (ClockSidecarWriteStage) throws -> Void) throws -> Void
+    ) throws {
+        let failureURL = directory.appendingPathComponent(
+            "\(UUID().uuidString)-clock_correlations.jsonl")
+        // The production initializer requires the frozen basename.
+        let caseDirectory = directory.appendingPathComponent(
+            UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: caseDirectory, withIntermediateDirectories: false)
+        let exactURL = caseDirectory.appendingPathComponent(
+            "clock_correlations.jsonl")
+        _ = failureURL
+        try body(exactURL) { stage in
+            switch (stage, injectedStage) {
+            case (.create, .create),
+                 (.parentSync, .parentSync),
+                 (.append, .append),
+                 (.dataSync, .dataSync),
+                 (.close, .close):
+                throw ClockInjectedFailure.injected
+            default:
+                break
+            }
+        }
+    }
+
+    for stage in [ClockSidecarWriteStage.create, .parentSync] {
+        try throwsAt(stage) { failureURL, injector in
+            do {
+                _ = try ClockCorrelationRecorder(
+                    trackingSessionID: "fault", url: failureURL,
+                    faultInjector: injector)
+                require(false, "RC-B06 \(stage) fault must fail initialization")
+            } catch {}
+            require(
+                !FileManager.default.fileExists(atPath: failureURL.path),
+                "RC-B06 \(stage) fault must not leave a visible sidecar")
+        }
+    }
+
+    try throwsAt(.append) { failureURL, injector in
+        let failedWriter = try ClockCorrelationRecorder(
+            trackingSessionID: "fault", url: failureURL,
+            faultInjector: injector)
+        do {
+            try failedWriter.record(
+                reason: .sessionStart, monotonicSeconds: 1,
+                utcUnixSeconds: 2, timezoneID: "UTC",
+                utcOffsetSeconds: 0)
+            require(false, "RC-B06 append fault must throw")
+        } catch {}
+        do {
+            try failedWriter.record(
+                reason: .periodic, monotonicSeconds: 2,
+                utcUnixSeconds: 3, timezoneID: "UTC",
+                utcOffsetSeconds: 0)
+            require(false, "RC-B06 failed writer must remain failed")
+        } catch let error as ClockSidecarWriteError {
+            if case .writerFailed = error {} else {
+                require(false, "RC-B06 subsequent append must be writerFailed")
+            }
+        }
+        failedWriter.cancel()
+    }
+
+    for stage in [ClockSidecarWriteStage.dataSync, .close] {
+        try throwsAt(stage) { failureURL, injector in
+            let failedWriter = try ClockCorrelationRecorder(
+                trackingSessionID: "fault", url: failureURL,
+                faultInjector: injector)
+            try failedWriter.record(
+                reason: .sessionStart, monotonicSeconds: 1,
+                utcUnixSeconds: 2, timezoneID: "UTC",
+                utcOffsetSeconds: 0)
+            do {
+                _ = try failedWriter.finish()
+                require(false, "RC-B06 \(stage) fault must block watermark")
+            } catch {}
+            failedWriter.cancel()
+        }
+    }
+    print("RC-B06 clock writer passed: bindings=\(bindingCount) fault-stages=5")
+} catch {
+    require(false, "RC-B06 clock writer tests failed: \(error)")
+}
+
 // T12: 100k rows export inside a real workbook (X6), plus formula
 // injection and control-character sanitization (X8/X9). The 100k-scale
 // run lives in the separate --xlsx-scale mode so the default host mode
@@ -6142,6 +6839,17 @@ do {
     require(
         !sheet1.contains("<f>"),
         "X8 the workbook must never contain formula elements")
+    require(
+        sheet1.contains("shelf_segment_id")
+            && sheet1.contains("segment-a1-main"),
+        "RC-B17 PriceTags XLSX must carry the physical shelf segment ID")
+    let sheet4 = String(
+        data: entries.first { $0.name == "xl/worksheets/sheet4.xml" }!.data,
+        encoding: .utf8) ?? ""
+    require(
+        sheet4.contains("shelf_segment_id")
+            && sheet4.contains("segment-b2-main"),
+        "RC-B17 RescanRequired XLSX must carry the physical shelf segment ID")
     let sanitized = XLSXWorkbookWriter.sanitizeXML("a\u{0001}b\u{0008}c")
     require(
         sanitized == "abc",
@@ -6152,9 +6860,7 @@ do {
     // V1R4 §16.2: the production reopen verifier streams the package
     // (central directory + required parts + per-sheet header/row/
     // no-formula) without materialising the sheets.
-    let verification = try XLSXWorkbookVerifier.verify(
-        workbookURL: output,
-        expectedSheets: [
+    let expectedWorkbookSheets = [
             XLSXWorkbookVerifier.SheetExpectation(
                 partName: "xl/worksheets/sheet1.xml",
                 sheetName: "PriceTags",
@@ -6171,13 +6877,89 @@ do {
                 partName: "xl/worksheets/sheet4.xml",
                 sheetName: "RescanRequired",
                 headers: MobileWorksheets.rescanRequiredHeaders),
-        ])
+        ]
+    let verification = try XLSXWorkbookVerifier.verify(
+        workbookURL: output,
+        expectedSheets: expectedWorkbookSheets)
     require(
         verification.sheetRowCounts["xl/worksheets/sheet2.xml"] == 10_000,
         "X1 verifier must count 10k DevicePositions rows")
     require(
         verification.sheetRowCounts["xl/worksheets/sheet1.xml"] == 1,
         "X1 verifier must count the price-tag row")
+    // RC-B28: required non-sheet parts are not accepted by central-name
+    // presence alone. Corrupt the declared CRC in BOTH local and central
+    // headers for styles.xml; header consistency still holds, so only an
+    // actual payload CRC recomputation can reject it.
+    func little16(_ bytes: [UInt8], _ offset: Int) -> Int {
+        Int(bytes[offset]) | (Int(bytes[offset + 1]) << 8)
+    }
+    func little32(_ bytes: [UInt8], _ offset: Int) -> UInt32 {
+        UInt32(bytes[offset])
+            | (UInt32(bytes[offset + 1]) << 8)
+            | (UInt32(bytes[offset + 2]) << 16)
+            | (UInt32(bytes[offset + 3]) << 24)
+    }
+    func write32(_ value: UInt32, _ bytes: inout [UInt8], _ offset: Int) {
+        bytes[offset] = UInt8(value & 0xFF)
+        bytes[offset + 1] = UInt8((value >> 8) & 0xFF)
+        bytes[offset + 2] = UInt8((value >> 16) & 0xFF)
+        bytes[offset + 3] = UInt8((value >> 24) & 0xFF)
+    }
+    var corruptedPackage = [UInt8](data)
+    var centralCursor = 0
+    var corruptedStyles = false
+    while centralCursor + 46 <= corruptedPackage.count {
+        if little32(corruptedPackage, centralCursor) != 0x02014B50 {
+            centralCursor += 1
+            continue
+        }
+        let nameLength = little16(corruptedPackage, centralCursor + 28)
+        let extraLength = little16(corruptedPackage, centralCursor + 30)
+        let commentLength = little16(corruptedPackage, centralCursor + 32)
+        let nameStart = centralCursor + 46
+        let nameEnd = nameStart + nameLength
+        guard nameEnd <= corruptedPackage.count else { break }
+        let name = String(bytes: corruptedPackage[nameStart..<nameEnd],
+                          encoding: .utf8) ?? ""
+        if name == "xl/styles.xml" {
+            let localOffset = Int(little32(corruptedPackage, centralCursor + 42))
+            let wrongCRC = little32(corruptedPackage, centralCursor + 16)
+                ^ 0xFFFF_FFFF
+            write32(wrongCRC, &corruptedPackage, centralCursor + 16)
+            write32(wrongCRC, &corruptedPackage, localOffset + 14)
+            let localNameLength = little16(corruptedPackage, localOffset + 26)
+            let localExtraLength = little16(corruptedPackage, localOffset + 28)
+            let compressedSize = Int(little32(
+                corruptedPackage, centralCursor + 20))
+            let descriptorOffset = localOffset + 30 + localNameLength
+                + localExtraLength + compressedSize
+            if little32(corruptedPackage, descriptorOffset) == 0x08074B50 {
+                write32(wrongCRC, &corruptedPackage, descriptorOffset + 4)
+            } else {
+                write32(wrongCRC, &corruptedPackage, descriptorOffset)
+            }
+            corruptedStyles = true
+            break
+        }
+        centralCursor = nameEnd + extraLength + commentLength
+    }
+    require(corruptedStyles, "RC-B28 styles.xml central entry must exist")
+    let corruptOutput = output.deletingLastPathComponent()
+        .appendingPathComponent("result-corrupt-styles.xlsx")
+    try Data(corruptedPackage).write(to: corruptOutput)
+    do {
+        _ = try XLSXWorkbookVerifier.verify(
+            workbookURL: corruptOutput,
+            expectedSheets: expectedWorkbookSheets)
+        require(false, "RC-B28 corrupt required styles.xml CRC must reject")
+    } catch let error as XLSXWorkbookVerifier.VerifyError {
+        if case .crcMismatch(let part) = error {
+            require(part == "xl/styles.xml", "RC-B28 wrong CRC part: \(part)")
+        } else {
+            require(false, "RC-B28 expected styles CRC mismatch, got \(error)")
+        }
+    }
 }
 catch {
     require(false, "X6/X8/X9 workbook tests failed: \(error)")
@@ -6342,9 +7124,64 @@ catch {
     require(false, "G4/G5 burst fusion failed: \(error)")
 }
 
+// RC-B16/H-07: the clusterer must keep formal symbology/session identity
+// separate and complete the former quadratic 200k worst case through the
+// radius-sized spatial hash.
+do {
+    let identitySamples = [
+        TagObservationResolver.ResolvedObservation(
+            barcode: "SAME", symbology: "CODE128", floorID: "1",
+            mapXM: 1, mapYM: 1, mapZM: 0, nodeID: 1,
+            nodeTimestamp: 0, frameMonotonicSeconds: 0,
+            trackingSessionID: "session-a", bindingMethod: "explicit_node"),
+        TagObservationResolver.ResolvedObservation(
+            barcode: "SAME", symbology: "QR", floorID: "1",
+            mapXM: 1, mapYM: 1, mapZM: 0, nodeID: 1,
+            nodeTimestamp: 0, frameMonotonicSeconds: 0,
+            trackingSessionID: "session-a", bindingMethod: "explicit_node"),
+        TagObservationResolver.ResolvedObservation(
+            barcode: "SAME", symbology: "CODE128", floorID: "1",
+            mapXM: 1, mapYM: 1, mapZM: 0, nodeID: 1,
+            nodeTimestamp: 0, frameMonotonicSeconds: 0,
+            trackingSessionID: "session-b", bindingMethod: "explicit_node"),
+    ]
+    let identityInstances = TagObservationResolver.clusterInstances(
+        observations: identitySamples, clusterRadiusM: 1.5)
+    require(
+        identityInstances.count == 3,
+        "H-07 symbology and tracking session must isolate tag clusters")
+
+    let benchmarkCount = 200_000
+    var worstCase: [TagObservationResolver.ResolvedObservation] = []
+    worstCase.reserveCapacity(benchmarkCount)
+    for index in 0..<benchmarkCount {
+        worstCase.append(TagObservationResolver.ResolvedObservation(
+            barcode: "WORST-CASE", symbology: "CODE128", floorID: "1",
+            mapXM: Double(index) * 2.0, mapYM: 0, mapZM: 0,
+            nodeID: Int64(index), nodeTimestamp: Double(index),
+            frameMonotonicSeconds: Double(index),
+            trackingSessionID: "benchmark", bindingMethod: "explicit_node"))
+    }
+    let benchmarkStarted = ProcessInfo.processInfo.systemUptime
+    let benchmarkInstances = TagObservationResolver.clusterInstances(
+        observations: worstCase, clusterRadiusM: 0.5)
+    let benchmarkElapsed =
+        ProcessInfo.processInfo.systemUptime - benchmarkStarted
+    require(
+        benchmarkInstances.count == benchmarkCount,
+        "RC-B16 200k separated observations must remain distinct")
+    require(
+        benchmarkElapsed < 60.0,
+        "RC-B16 200k spatial clustering exceeded 60 seconds: \(benchmarkElapsed)")
+    print(String(
+        format: "RC-B16 200k spatial clustering: %.3f seconds",
+        benchmarkElapsed))
+}
+
 // G6/G7/G10: shelf association and the automatic quality gate.
 do {
     let shelf = ShelfAssociationEngine.ShelfSegment(
+        shelfSegmentID: "segment-a1-main",
         shelfCode: "A1", floorID: "1",
         startM: (0, 0), endM: (10, 0),
         axisM: (1, 0), frontNormalM: (0, -1),
@@ -6382,11 +7219,29 @@ do {
         spread: Double,
         association: ShelfAssociationEngine.Association,
         graphOK: Bool = true,
-        identityOK: Bool = true
+        identityOK: Bool = true,
+        depthQuality: Double = 0.9,
+        localizationConfidence: Double = 0.9,
+        measurementConfidence: Double = 0.9,
+        needsReview: Bool = false,
+        trackingOK: Bool = true,
+        viewOK: Bool = true,
+        nodeUncertaintyM: Double? = 0.1
     ) -> AutomaticQualityGate.TagQualityInput {
         return AutomaticQualityGate.TagQualityInput(
-            observationCount: count, positionSpreadM: spread,
+            observationCount: count,
+            uniqueVerifiedFrameCount: count,
+            effectiveSampleSize: Double(count),
+            positionSpreadM: spread,
             minimumBurstSamples: 3, maximumSpreadM: 0.1,
+            minimumDepthQuality: depthQuality,
+            viewQualitySufficient: viewOK,
+            trackingQualitySufficient: trackingOK,
+            localizationConfidence: localizationConfidence,
+            measurementConfidence: measurementConfidence,
+            needsReview: needsReview,
+            measurementMethodAccepted: true,
+            maximumNodeUncertaintyM: nodeUncertaintyM,
             bindingMethod: "explicit_node",
             association: association,
             maximumEndpointDistanceM: 0.15,
@@ -6405,6 +7260,21 @@ do {
     require(
         sparse.0 == .rescanRequired,
         "G10 insufficient burst samples must be RESCAN_REQUIRED, got \(sparse.0.rawValue)")
+    require(
+        AutomaticQualityGate.evaluate(gateInput(
+            count: 5, spread: 0.02, association: mid,
+            needsReview: true)).0 == .rescanRequired,
+        "G10 needs-review evidence must never be automatically accepted")
+    require(
+        AutomaticQualityGate.evaluate(gateInput(
+            count: 5, spread: 0.02, association: mid,
+            depthQuality: 0.2)).0 == .rescanRequired,
+        "G10 low-depth complete burst must require a rescan")
+    require(
+        AutomaticQualityGate.evaluate(gateInput(
+            count: 5, spread: 0.02, association: mid,
+            nodeUncertaintyM: nil)).0 == .rescanRequired,
+        "G10 missing native node uncertainty must require a rescan")
     let endpointGate = AutomaticQualityGate.evaluate(gateInput(
         count: 5, spread: 0.02, association: endpoint))
     require(
@@ -6413,7 +7283,8 @@ do {
     // Parallel-aisle ambiguity: a second shelf nearly as close collapses
     // the margin and must be RESCAN_REQUIRED.
     let aisle = ShelfAssociationEngine.ShelfSegment(
-        shelfCode: "A2", floorID: "1",
+        shelfSegmentID: "segment-a1-parallel",
+        shelfCode: "A1", floorID: "1",
         startM: (0, 0.5), endM: (10, 0.5),
         axisM: (1, 0), frontNormalM: (0, -1),
         boundsMinM: (0, 0.25), boundsMaxM: (10, 0.75),
@@ -6428,9 +7299,10 @@ do {
     }
     require(
         between.shelfCode == "A1"
+            && between.shelfSegmentID == "segment-a1-main"
             && between.marginM != nil
             && between.marginM! < 0.5,
-        "G7 second candidate must be reported with a small margin")
+        "RC-B18 same-code second segment must be retained by segment ID")
     let aisleGate = AutomaticQualityGate.evaluate(gateInput(
         count: 5, spread: 0.02, association: between))
     require(
@@ -6448,6 +7320,51 @@ do {
     require(
         occluded,
         "G7 a structure between tag and shelf must occlude the sight line")
+    // RC-H07: a thin obstacle close to the shelf intersects the sight
+    // segment even though the old midpoint probe would miss it.
+    let thinPillar = ShelfAssociationEngine.FixedStructure(
+        structureCode: "THIN", floorID: "1",
+        polygonM: [
+            (4.95, 0.04), (5.05, 0.04),
+            (5.05, 0.08), (4.95, 0.08),
+        ],
+        boundsMinM: (4.95, 0.04), boundsMaxM: (5.05, 0.08))
+    require(
+        ShelfAssociationEngine.isOccluded(
+            tagPoint: (5, 0.5), shelf: shelf,
+            structures: [thinPillar]),
+        "RC-H07 thin near-shelf pillar must intersect the full sight segment")
+    let aabbFallback = ShelfAssociationEngine.FixedStructure(
+        structureCode: "AABB", floorID: "1", polygonM: nil,
+        boundsMinM: (4.9, 0.10), boundsMaxM: (5.1, 0.14))
+    require(
+        ShelfAssociationEngine.isOccluded(
+            tagPoint: (5, 0.5), shelf: shelf,
+            structures: [aabbFallback]),
+        "RC-H07 explicit AABB fallback must participate in intersection")
+    var otherFloor = thinPillar
+    otherFloor.floorID = "2"
+    require(
+        !ShelfAssociationEngine.isOccluded(
+            tagPoint: (5, 0.5), shelf: shelf,
+            structures: [otherFloor]),
+        "RC-H07 structures on another floor must not occlude")
+    let offRay = ShelfAssociationEngine.FixedStructure(
+        structureCode: "OFF-RAY", floorID: "1", polygonM: nil,
+        boundsMinM: (6, 0.10), boundsMaxM: (6.2, 0.14))
+    require(
+        !ShelfAssociationEngine.isOccluded(
+            tagPoint: (5, 0.5), shelf: shelf,
+            structures: [offRay]),
+        "RC-H07 non-intersecting structure must remain non-occluding")
+    let farFromShelf = ShelfAssociationEngine.FixedStructure(
+        structureCode: "FAR", floorID: "1", polygonM: nil,
+        boundsMinM: (4.9, 0.35), boundsMaxM: (5.1, 0.40))
+    require(
+        !ShelfAssociationEngine.isOccluded(
+            tagPoint: (5, 0.5), shelf: shelf,
+            structures: [farFromShelf], maximumDistanceM: 0.05),
+        "RC-H07 intersection outside the shelf-distance gate must be rejected")
     var occludedAssociation = mid
     occludedAssociation.occludedByStructure = occluded
     let occlusionGate = AutomaticQualityGate.evaluate(gateInput(
@@ -6478,9 +7395,167 @@ do {
     } else {
         require(false, "G7 rotated shelf geometry must build")
     }
+
+    // RC-B17: v2 consumers must use compiler-authored direction, not a
+    // conflicting polygon PCA/AABB direction.
+    let compiled = try PriorMapShelfSegmentV2(
+        shelfSegmentID: "compiled-vertical",
+        shelfCode: "CV",
+        floorID: "1",
+        longitudinalStartM: [2, 0],
+        longitudinalEndM: [2, 4],
+        longitudinalAxis: [0, 1],
+        frontNormal: [1, 0],
+        backNormal: [-1, 0],
+        sideSemanticsVersion: 1,
+        orientationProvenance: "element_yaw")
+    guard let compiledShelf = ShelfAssociationEngine.makeCompiledSegment(
+        compiled,
+        polygonM: [(0, 0), (5, 0), (5, 1), (0, 1)],
+        boundsMinM: (0, 0),
+        boundsMaxM: (5, 1)) else {
+        require(false, "RC-B17 compiled segment must build")
+        throw MapSourceImportError.unknownFormat
+    }
+    require(
+        compiledShelf.shelfSegmentID == "compiled-vertical"
+            && close(compiledShelf.axisM.0, 0)
+            && close(compiledShelf.axisM.1, 1)
+            && close(compiledShelf.startM.0, 2)
+            && close(compiledShelf.endM.1, 4),
+        "RC-B17 polygon envelope must not replace compiled direction")
 }
 catch {
     require(false, "G6/G7/G10 shelf/quality tests failed: \(error)")
+}
+
+// RC-B17/H-07/H-08: finalization keeps same-code physical segments and
+// symbologies in separate buckets, then carries the exact segment ID into
+// both the finalized tag and its RESCAN task/output model.
+do {
+    let segmentLow = ShelfAssociationEngine.ShelfSegment(
+        shelfSegmentID: "segment-shared-low",
+        shelfCode: "SHARED", floorID: "1",
+        startM: (0, 0), endM: (10, 0),
+        axisM: (1, 0), frontNormalM: (0, -1),
+        boundsMinM: (0, -0.5), boundsMaxM: (10, 0.5),
+        polygonM: nil, orientationProvenance: "element_yaw")
+    let segmentHigh = ShelfAssociationEngine.ShelfSegment(
+        shelfSegmentID: "segment-shared-high",
+        shelfCode: "SHARED", floorID: "1",
+        startM: (0, 1), endM: (10, 1),
+        axisM: (1, 0), frontNormalM: (0, 1),
+        boundsMinM: (0, 0.5), boundsMaxM: (10, 1.5),
+        polygonM: nil, orientationProvenance: "element_yaw")
+    let finalizerNode = TagObservationResolver.FinalNodePose(
+        id: 77, monotonicSeconds: 10, pose: .identity, floorID: "1",
+        uncertaintyM: 0.1)
+    let finalizerIndex = TagObservationResolver.NodeIndex(
+        finalNodes: [finalizerNode], rawNodeStamps: [77: 10])
+    let finalizerMap = MobileMapLibrary.MapEntry(
+        priorMapID: "bucket-map",
+        name: "bucket-map",
+        packageSHA256: String(repeating: "b", count: 64),
+        packageDirectory: FileManager.default.temporaryDirectory,
+        floorCount: 1,
+        elementCount: 2,
+        compiledAtUTC: 0,
+        compilerVersion: "test",
+        canonicalSourceSHA256: String(repeating: "c", count: 64))
+    func finalizerEvidence(
+        barcode: String,
+        symbology: String,
+        y: Double,
+        count: Int
+    ) -> [TagObservationEvidenceObservation] {
+        return (0..<count).map { index in
+            TagObservationEvidenceObservation(
+                observationID: "\(barcode)-\(symbology)-\(y)-\(index)",
+                barcode: barcode,
+                symbology: symbology,
+                floorID: "1",
+                frameTimestamp: Double(index),
+                nodeTimebaseTimestamp: 10,
+                rawPositionM: (5, y, 0),
+                measurementConfidence: 1,
+                localizationState: "stable",
+                localizationConfidence: 1,
+                needsReview: false,
+                trackingSessionID: "bucket-session",
+                boundNodeID: 77,
+                boundNodeDelta: 0,
+                secondCandidateDelta: 2,
+                burstID: "burst-\(barcode)-\(symbology)-\(y)",
+                frameID: "frame-\(index)",
+                measurementMethod: "scene_depth",
+                depthSampleCount: 10,
+                depthInlierCount: 9,
+                depthInlierRatio: 0.9,
+                depthMedianM: 1.0,
+                depthMadM: 0.01,
+                planeResidualM: 0.01,
+                surfaceNormalCamera: [0, 0, -1])
+        }
+    }
+    func finalizeBucketEvidence(
+        _ observations: [TagObservationEvidenceObservation],
+        shelves: [ShelfAssociationEngine.ShelfSegment]
+    ) throws -> ([FinalPriceTag], [RescanTask]) {
+        return try MobileProcessingPipeline.finalizeTags(
+            observations: observations,
+            resolverIndex: finalizerIndex,
+            shelves: shelves,
+            shelfIndex: ShelfAssociationEngine.ShelfSpatialIndex(
+                shelves: shelves),
+            structures: [],
+            sessionID: "bucket-session",
+            storeID: "STORE-BUCKET",
+            priorMap: finalizerMap,
+            floorID: "1",
+            graphQualityPassed: true,
+            rawNodePoses: [77: .identity],
+            minimumAssociationMarginM: 0.5)
+    }
+
+    // These centroids are only 1.2 m apart (inside the 1.5 m cluster
+    // radius). Segment-ID bucketing must keep them as two physical tags
+    // even though both business shelves share code SHARED and side front.
+    let segmentEvidence =
+        finalizerEvidence(barcode: "SEGMENTED", symbology: "CODE128", y: -0.1, count: 3)
+        + finalizerEvidence(barcode: "SEGMENTED", symbology: "CODE128", y: 1.1, count: 3)
+    let (segmentTags, segmentRescans) = try finalizeBucketEvidence(
+        segmentEvidence, shelves: [segmentLow, segmentHigh])
+    require(
+        segmentTags.count == 2 && segmentRescans.isEmpty
+            && Set(segmentTags.map(\.shelfCode)) == ["SHARED"]
+            && Set(segmentTags.map(\.shelfSegmentID))
+                == ["segment-shared-low", "segment-shared-high"],
+        "RC-B17 same-code physical segments must finalize independently")
+
+    let symbologyEvidence =
+        finalizerEvidence(barcode: "MULTI", symbology: "CODE128", y: -0.1, count: 3)
+        + finalizerEvidence(barcode: "MULTI", symbology: "QR", y: -0.1, count: 3)
+    let (symbologyTags, symbologyRescans) = try finalizeBucketEvidence(
+        symbologyEvidence, shelves: [segmentLow])
+    require(
+        symbologyTags.count == 2 && symbologyRescans.isEmpty
+            && Set(symbologyTags.map(\.symbology)) == ["CODE128", "QR"],
+        "H-07 symbology must be part of the finalization bucket identity")
+
+    let (sparseTags, sparseRescans) = try finalizeBucketEvidence(
+        finalizerEvidence(
+            barcode: "SPARSE", symbology: "CODE128", y: -0.1, count: 1),
+        shelves: [segmentLow])
+    require(
+        sparseTags.count == 1
+            && sparseTags[0].qualityStatus == "RESCAN_REQUIRED"
+            && sparseTags[0].shelfSegmentID == "segment-shared-low"
+            && sparseRescans.count == 1
+            && sparseRescans[0].shelfSegmentID == "segment-shared-low",
+        "RC-B17 associated RESCAN rows must carry shelf_segment_id")
+}
+catch {
+    require(false, "RC-B17/H-07 finalization bucket tests failed: \(error)")
 }
 
 // =====================================================================
@@ -6525,9 +7600,51 @@ catch {
 do {
     let session = try p7r6FreshDirectory("mobile-session")
     let fileManager = FileManager.default
-    let metadata = Data((
-        "{\"finalized\":true,\"scanMode\":\"continuous_streaming\","
-        + "\"trackingSessionId\":\"P7-SESSION\"}").utf8)
+    let priorMapSHA = String(repeating: "a", count: 64)
+    let metadata = try CanonicalJSONEncoder.encode([
+        "format": "MarketScannerFinalizedSessionMetadata",
+        "version": 1,
+        "formatVersion": 2,
+        "finalized": true,
+        "finalizedAtUnix": 1_700_000_100.0,
+        "scanMode": "continuous_streaming",
+        "workflowMode": "prior_map_localized",
+        "trackingSessionId": "P7-SESSION",
+        "storeId": "STORE-P7",
+        "floorId": "FLOOR-P7",
+        "priorMapId": "MAP-P7",
+        "priorMapSha256": priorMapSHA,
+        "processingEligibility": [
+            "status": "eligible",
+            "blockers": [],
+        ],
+        "captureHealth": [
+            "localizationRequiredWriteFailureCount": 0,
+            "localizationTraceRecordCount": 1,
+            "localizationConstraintRecordCount": 1,
+            "manualLocalizationEventCount": 0,
+            "localizationStateEventCount": 1,
+            "localizationEvidenceComplete": true,
+            "localizationRecoveryEventCount": 1,
+            "localizationLastRecoveryEpisodeId": 1,
+            "localizationLastRecoveryFinishedAtUptime": 42.0,
+            "localizationRecoveryEvidenceComplete": true,
+        ],
+        "localizationTrace": "localization_trace.jsonl",
+        "manualLocalizationEvents": "manual_localization_events.jsonl",
+        "localizationConstraints": "localization_constraints.jsonl",
+        "localizationEvents": "localization_events.jsonl",
+        "localizationRecoveryEvents": "localization_recovery_events.jsonl",
+        "tagObservations": "tag_observations.jsonl",
+        "localizedPriceTags": "localized_price_tags.json",
+        "clockCorrelationCount": 2,
+        "clockNodeBindingCount": 2,
+        "clockLastMonotonic": 41.0,
+        "clockLastUTC": 1_700_000_041.0,
+        "clockEvidenceComplete": true,
+        "tagObservationBurstCount": 0,
+        "tagObservationBurstComplete": true,
+    ])
     try metadata.write(to: session.appendingPathComponent("metadata.json"))
     try Data("trace\n".utf8).write(to: session.appendingPathComponent("localization_trace.jsonl"))
     try Data("constraints\n".utf8).write(to: session.appendingPathComponent("localization_constraints.jsonl"))
@@ -6536,6 +7653,22 @@ do {
     try Data("events\n".utf8).write(to: session.appendingPathComponent("localization_events.jsonl"))
     try Data("recovery\n".utf8).write(to: session.appendingPathComponent("localization_recovery_events.jsonl"))
     try Data("[]".utf8).write(to: session.appendingPathComponent("localized_price_tags.json"))
+    try Data("clock\n".utf8).write(to: session.appendingPathComponent("clock_correlations.jsonl"))
+    try Data().write(to: session.appendingPathComponent("tag_observation_bursts.jsonl"))
+    var p7ScanEvent = try CanonicalJSONEncoder.encode([
+        "format": "SupermarketScanEvent",
+        "version": 1,
+        "timestamp": "2023-11-14T22:13:20.000Z",
+        "timestampUnix": 1_700_000_000.0,
+        "level": "info",
+        "event": "scan_started",
+        "message": "fixture scan started",
+        "trackingSessionId": "P7-SESSION",
+        "fields": [String: String](),
+    ])
+    p7ScanEvent.append(0x0A)
+    try p7ScanEvent.write(
+        to: session.appendingPathComponent("scan_events.jsonl"))
     let database = session.appendingPathComponent("source.db")
     // V1R3: the snapshot validates the DB (quick_check + Node/Link
     // inventory), so the fixture must be a real SQLite database.
@@ -6559,7 +7692,15 @@ do {
 
     let taskRoot = try p7r6FreshDirectory("mobile-task")
     let snapshot = try SessionSnapshotTransaction.snapshot(
-        finalizedSession: session, sourceDatabase: database, taskRoot: taskRoot)
+        finalizedSession: session,
+        sourceDatabase: database,
+        taskRoot: taskRoot,
+        eligibility: SessionSnapshotTransaction.Eligibility(
+            priorMapID: "MAP-P7",
+            priorMapSHA256: priorMapSHA,
+            storeID: "STORE-P7",
+            floorID: "FLOOR-P7",
+            appGitSHA: "test-git-sha"))
     require(
         !snapshot.bundleSHA256.isEmpty,
         "P7 snapshot must compute a non-empty bundle digest")
@@ -6567,6 +7708,11 @@ do {
         fileManager.fileExists(
             atPath: snapshot.snapshotDirectory.appendingPathComponent("source.db").path),
         "P7 snapshot must contain the immutable source DB copy")
+    require(
+        fileManager.fileExists(
+            atPath: snapshot.snapshotDirectory
+                .appendingPathComponent("scan_events.jsonl").path),
+        "RC-H34 snapshot must contain the immutable scan event evidence")
     // The persisted input manifest must agree with the snapshot digest,
     // and mutating the original session afterwards must not change it.
     let persistedManifestData = try Data(
@@ -6577,6 +7723,258 @@ do {
     require(
         (persistedManifest["bundle_sha256"] as? String) == snapshot.bundleSHA256,
         "P7 the persisted input manifest must bind the snapshot digest")
+    require(
+        (persistedManifest["generation"] as? String)?.isEmpty == false,
+        "RC-B09 task reference must carry the committed generation")
+    try SessionSnapshotTransaction.revalidateSnapshot(
+        snapshot.snapshotDirectory)
+    let snapshotMode = (try fileManager.attributesOfItem(
+        atPath: snapshot.snapshotDirectory.path)[.posixPermissions]
+        as? NSNumber)?.intValue
+    let databaseMode = (try fileManager.attributesOfItem(
+        atPath: snapshot.snapshotDirectory
+            .appendingPathComponent("source.db").path)[.posixPermissions]
+        as? NSNumber)?.intValue
+    require(
+        snapshotMode == 0o555 && databaseMode == 0o444,
+        "RC-B09 committed snapshot directory/files must be 0555/0444")
+
+    // Resume rejects permission drift even when bytes and hashes match.
+    let snapshotDatabase = snapshot.snapshotDirectory
+        .appendingPathComponent("source.db")
+    try fileManager.setAttributes(
+        [.posixPermissions: 0o644], ofItemAtPath: snapshotDatabase.path)
+    var modeDriftRejected = false
+    do {
+        try SessionSnapshotTransaction.revalidateSnapshot(
+            snapshot.snapshotDirectory)
+    } catch {
+        modeDriftRejected = true
+    }
+    require(modeDriftRejected, "RC-B09 resume must reject artifact mode drift")
+    try fileManager.setAttributes(
+        [.posixPermissions: 0o444], ofItemAtPath: snapshotDatabase.path)
+    try SessionSnapshotTransaction.revalidateSnapshot(
+        snapshot.snapshotDirectory)
+
+    // RC-B07 reads the nested captureHealth failure counter. A legacy
+    // top-level zero must not hide a non-zero formal nested failure.
+    let invalidSession = try p7r6FreshDirectory("mobile-session-invalid-health")
+    for name in try fileManager.contentsOfDirectory(atPath: session.path) {
+        try fileManager.copyItem(
+            at: session.appendingPathComponent(name),
+            to: invalidSession.appendingPathComponent(name))
+    }
+    var invalidMetadata = try StrictJSONDocumentParser.object(
+        from: metadata,
+        limits: StrictJSONDocumentLimits(maximumBytes: metadata.count + 1))
+    var invalidCapture = invalidMetadata["captureHealth"] as! [String: Any]
+    invalidCapture["localizationRequiredWriteFailureCount"] = 1
+    invalidMetadata["captureHealth"] = invalidCapture
+    invalidMetadata["requiredWriteFailureCount"] = 0
+    try CanonicalJSONEncoder.encode(invalidMetadata).write(
+        to: invalidSession.appendingPathComponent("metadata.json"))
+    var nestedWriteFailureRejected = false
+    do {
+        _ = try SessionSnapshotTransaction.snapshot(
+            finalizedSession: invalidSession,
+            sourceDatabase: invalidSession.appendingPathComponent("source.db"),
+            taskRoot: try p7r6FreshDirectory("mobile-task-invalid-health"),
+            eligibility: SessionSnapshotTransaction.Eligibility(
+                priorMapID: "MAP-P7",
+                priorMapSHA256: priorMapSHA,
+                storeID: "STORE-P7",
+                floorID: "FLOOR-P7",
+                appGitSHA: "test-git-sha"))
+    } catch {
+        nestedWriteFailureRejected = true
+    }
+    require(
+        nestedWriteFailureRejected,
+        "RC-B07 nested localization write failures must block snapshot")
+
+    let missingManualWatermarkSession = try p7r6FreshDirectory(
+        "mobile-session-missing-manual-watermark")
+    for name in try fileManager.contentsOfDirectory(atPath: session.path) {
+        try fileManager.copyItem(
+            at: session.appendingPathComponent(name),
+            to: missingManualWatermarkSession.appendingPathComponent(name))
+    }
+    var missingManualMetadata = try StrictJSONDocumentParser.object(
+        from: metadata,
+        limits: StrictJSONDocumentLimits(maximumBytes: metadata.count + 1))
+    var missingManualCapture = missingManualMetadata["captureHealth"]
+        as! [String: Any]
+    missingManualCapture.removeValue(forKey: "manualLocalizationEventCount")
+    missingManualMetadata["captureHealth"] = missingManualCapture
+    try CanonicalJSONEncoder.encode(missingManualMetadata).write(
+        to: missingManualWatermarkSession.appendingPathComponent(
+            "metadata.json"))
+    var missingManualWatermarkRejected = false
+    do {
+        _ = try SessionSnapshotTransaction.snapshot(
+            finalizedSession: missingManualWatermarkSession,
+            sourceDatabase: missingManualWatermarkSession
+                .appendingPathComponent("source.db"),
+            taskRoot: try p7r6FreshDirectory(
+                "mobile-task-missing-manual-watermark"),
+            eligibility: SessionSnapshotTransaction.Eligibility(
+                priorMapID: "MAP-P7",
+                priorMapSHA256: priorMapSHA,
+                storeID: "STORE-P7",
+                floorID: "FLOOR-P7",
+                appGitSHA: "test-git-sha"))
+    } catch {
+        missingManualWatermarkRejected = true
+    }
+    require(
+        missingManualWatermarkRejected,
+        "formal snapshot must reject a missing manual exact-count watermark")
+
+    // RC-H34: thermal counts are derived from scan_events.jsonl. A formal
+    // finalized session cannot silently omit that evidence and publish a
+    // lower interruption count.
+    let missingEventsSession = try p7r6FreshDirectory(
+        "mobile-session-missing-scan-events")
+    for name in try fileManager.contentsOfDirectory(atPath: session.path)
+        where name != "scan_events.jsonl" {
+        try fileManager.copyItem(
+            at: session.appendingPathComponent(name),
+            to: missingEventsSession.appendingPathComponent(name))
+    }
+    var missingEventsRejected = false
+    do {
+        _ = try SessionSnapshotTransaction.snapshot(
+            finalizedSession: missingEventsSession,
+            sourceDatabase: missingEventsSession.appendingPathComponent("source.db"),
+            taskRoot: try p7r6FreshDirectory("mobile-task-missing-scan-events"),
+            eligibility: SessionSnapshotTransaction.Eligibility(
+                priorMapID: "MAP-P7",
+                priorMapSHA256: priorMapSHA,
+                storeID: "STORE-P7",
+                floorID: "FLOOR-P7",
+                appGitSHA: "test-git-sha"))
+    } catch {
+        missingEventsRejected = true
+    }
+    require(
+        missingEventsRejected,
+        "RC-H34 missing scan event evidence must block snapshot")
+
+    let malformedGraphSession = try p7r6FreshDirectory(
+        "mobile-session-invalid-blob")
+    for name in try fileManager.contentsOfDirectory(atPath: session.path) {
+        try fileManager.copyItem(
+            at: session.appendingPathComponent(name),
+            to: malformedGraphSession.appendingPathComponent(name))
+    }
+    let malformedDatabase = malformedGraphSession.appendingPathComponent(
+        "source.db")
+    do {
+        var db: OpaquePointer?
+        guard sqlite3_open_v2(
+            malformedDatabase.path, &db, SQLITE_OPEN_READWRITE, nil) == SQLITE_OK,
+              let handle = db else {
+            fatalError("RC-B10 cannot open malformed fixture DB")
+        }
+        defer { sqlite3_close(handle) }
+        var statement: OpaquePointer?
+        sqlite3_prepare_v2(
+            handle, "INSERT INTO Node VALUES (1,0,1,1.0,?)",
+            -1, &statement, nil)
+        if let statement {
+            let shortPose = Data(repeating: 0, count: 4)
+            sqlite3_bind_blob(
+                statement, 1, (shortPose as NSData).bytes,
+                Int32(shortPose.count), unsafeBitCast(
+                    -1, to: sqlite3_destructor_type.self))
+            sqlite3_step(statement)
+            sqlite3_finalize(statement)
+        }
+    }
+    var malformedGraphRejected = false
+    do {
+        _ = try SessionSnapshotTransaction.snapshot(
+            finalizedSession: malformedGraphSession,
+            sourceDatabase: malformedDatabase,
+            taskRoot: try p7r6FreshDirectory("mobile-task-invalid-blob"),
+            eligibility: SessionSnapshotTransaction.Eligibility(
+                priorMapID: "MAP-P7",
+                priorMapSHA256: priorMapSHA,
+                storeID: "STORE-P7",
+                floorID: "FLOOR-P7",
+                appGitSHA: "test-git-sha"))
+    } catch {
+        malformedGraphRejected = true
+    }
+    require(
+        malformedGraphRejected,
+        "RC-B10 snapshot validator must reject an exact-BLOB violation")
+
+    let injectedSidecar = session.appendingPathComponent("late-sidecar.jsonl")
+    SessionSnapshotTransaction.faultInjector = { point in
+        if case .afterSourceInventory = point {
+            try Data("late\n".utf8).write(to: injectedSidecar)
+        }
+    }
+    var lateFileRejected = false
+    do {
+        _ = try SessionSnapshotTransaction.snapshot(
+            finalizedSession: session,
+            sourceDatabase: database,
+            taskRoot: try p7r6FreshDirectory("mobile-task-late-file"),
+            eligibility: SessionSnapshotTransaction.Eligibility(
+                priorMapID: "MAP-P7",
+                priorMapSHA256: priorMapSHA,
+                storeID: "STORE-P7",
+                floorID: "FLOOR-P7",
+                appGitSHA: "test-git-sha"))
+    } catch {
+        lateFileRejected = true
+    }
+    SessionSnapshotTransaction.faultInjector = nil
+    try? fileManager.removeItem(at: injectedSidecar)
+    require(
+        lateFileRejected,
+        "RC-B08 a sidecar added after pre-inventory must block commit")
+
+    // RC-B09 deterministic crash point after the new directory rename but
+    // before the task reference: the previous generation and reference must
+    // be restored, with no swallowed rollback failure.
+    SessionSnapshotTransaction.faultInjector = { point in
+        if case .afterSnapshotInstall = point {
+            throw NSError(
+                domain: "SnapshotFaultInjection", code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "after install"])
+        }
+    }
+    var interruptedCommitRejected = false
+    do {
+        _ = try SessionSnapshotTransaction.snapshot(
+            finalizedSession: session,
+            sourceDatabase: database,
+            taskRoot: taskRoot,
+            eligibility: SessionSnapshotTransaction.Eligibility(
+                priorMapID: "MAP-P7",
+                priorMapSHA256: priorMapSHA,
+                storeID: "STORE-P7",
+                floorID: "FLOOR-P7",
+                appGitSHA: "test-git-sha"))
+    } catch {
+        interruptedCommitRejected = true
+    }
+    SessionSnapshotTransaction.faultInjector = nil
+    require(
+        interruptedCommitRejected,
+        "RC-B09 injected interrupted commit must surface failure")
+    let restoredTaskManifest = try Data(
+        contentsOf: taskRoot.appendingPathComponent("input_manifest.json"))
+    require(
+        restoredTaskManifest == persistedManifestData,
+        "RC-B09 interrupted commit must restore the previous task reference")
+    try SessionSnapshotTransaction.revalidateSnapshot(
+        snapshot.snapshotDirectory)
+
     try Data("tampered".utf8).write(to: database)
     try Data("tampered-trace\n".utf8).write(
         to: session.appendingPathComponent("localization_trace.jsonl"))
@@ -6584,6 +7982,27 @@ do {
     require(
         manifestAfter == persistedManifestData,
         "P7 the persisted snapshot manifest must not change when the original is tampered")
+
+    // A non-empty source WAL blocks a new generation before the invalid
+    // main DB can ever be copied or opened.
+    let walURL = session.appendingPathComponent("source.db-wal")
+    try Data([0x01]).write(to: walURL)
+    var walRejected = false
+    do {
+        _ = try SessionSnapshotTransaction.snapshot(
+            finalizedSession: session,
+            sourceDatabase: database,
+            taskRoot: try p7r6FreshDirectory("mobile-task-wal"),
+            eligibility: SessionSnapshotTransaction.Eligibility(
+                priorMapID: "MAP-P7",
+                priorMapSHA256: priorMapSHA,
+                storeID: "STORE-P7",
+                floorID: "FLOOR-P7",
+                appGitSHA: "test-git-sha"))
+    } catch {
+        walRejected = true
+    }
+    require(walRejected, "RC-B08 non-empty WAL must block snapshot")
 }
 catch {
     require(false, "P7 session snapshot transaction failed: \(error)")
@@ -6592,7 +8011,8 @@ catch {
 // P8/P12: the persistent task state machine survives atomic writes and
 // interrupted states are never reported completed.
 do {
-    let taskRoot = try p7r6FreshDirectory("mobile-state")
+    let taskParent = try p7r6FreshDirectory("mobile-state")
+    let taskRoot = taskParent.appendingPathComponent("t1", isDirectory: true)
     _ = try PersistentTaskCoordinator.createTask(taskID: "t1", taskRoot: taskRoot)
     _ = try PersistentTaskCoordinator.updateState(.snapshotting, taskRoot: taskRoot, progress: 0.1)
     _ = try PersistentTaskCoordinator.updateState(.fastOptimizing, taskRoot: taskRoot, progress: 0.4)
@@ -6607,7 +8027,34 @@ do {
     require(
         PersistentTaskCoordinator.isResumable(record),
         "P12 an interrupted task must be resumable after a crash")
-    _ = try PersistentTaskCoordinator.updateState(.completed, taskRoot: taskRoot, progress: 1.0)
+    var invalidCompletionJumpRejected = false
+    do {
+        _ = try PersistentTaskCoordinator.updateState(
+            .completed, taskRoot: taskRoot, progress: 1.0)
+    } catch PersistentTaskCoordinator.TaskError.invalidTransition {
+        invalidCompletionJumpRejected = true
+    }
+    require(
+        invalidCompletionJumpRejected,
+        "RC-B25 interrupted must not jump directly to completed")
+    _ = try PersistentTaskCoordinator.updateState(
+        .snapshotting,
+        taskRoot: taskRoot,
+        progress: 0.1,
+        allowRecoveryReentry: true)
+    for (state, progress) in [
+        (PersistentTaskCoordinator.TaskState.fastOptimizing, 0.2),
+        (.fastQualityCheck, 0.3),
+        (.buildingTrajectory, 0.5),
+        (.resolvingTags, 0.6),
+        (.buildingWorkbook, 0.75),
+        (.validatingResult, 0.85),
+        (.committingResult, 0.95),
+        (.completed, 1.0),
+    ] {
+        _ = try PersistentTaskCoordinator.updateState(
+            state, taskRoot: taskRoot, progress: progress)
+    }
     let completed = try PersistentTaskCoordinator.read(taskRoot: taskRoot)
     require(
         completed.state == .completed && !PersistentTaskCoordinator.isResumable(completed),
@@ -6615,6 +8062,193 @@ do {
 }
 catch {
     require(false, "P8/P12 persistent task state machine failed: \(error)")
+}
+
+// RC-H29/H37: staged map reads bind one single regular inode and every
+// store/map identity follows the same bounded path-safe policy.
+do {
+    let directory = try p7r6FreshDirectory("stable-map-source")
+    let source = directory.appendingPathComponent("source.json")
+    let payload = Data("{\"format\":\"fixture\"}".utf8)
+    try payload.write(to: source)
+    let stablePayload = try StableMapSourceFileReader.read(source)
+    require(
+        stablePayload == payload,
+        "RC-H29 stable regular-file read must preserve exact bytes")
+
+    let hardlink = directory.appendingPathComponent("hardlink.json")
+    require(
+        Darwin.link(source.path, hardlink.path) == 0,
+        "RC-H29 fixture must create a hardlink")
+    do {
+        _ = try StableMapSourceFileReader.read(source)
+        require(false, "RC-H29 hardlinked staged source must be rejected")
+    } catch let error as MapSourceImportError {
+        require(
+            error.stableCode == "map_source_unreadable",
+            "RC-H29 hardlink rejection must use stable unreadable code")
+    }
+    try FileManager.default.removeItem(at: hardlink)
+
+    let symlink = directory.appendingPathComponent("symlink.json")
+    require(
+        Darwin.symlink(source.path, symlink.path) == 0,
+        "RC-H29 fixture must create a symlink")
+    do {
+        _ = try StableMapSourceFileReader.read(symlink)
+        require(false, "RC-H29 symlink staged source must be rejected")
+    } catch let error as MapSourceImportError {
+        require(
+            error.stableCode == "map_source_unreadable",
+            "RC-H29 symlink rejection must use stable unreadable code")
+    }
+
+    try MapSourceBusinessIdentityPolicy.validate(
+        storeID: "STORE-上海-01", mapName: "一层 主地图")
+    for invalid in [
+        ("bad/store", "map"),
+        ("store", ".hidden"),
+        ("store\u{0001}", "map"),
+        (String(repeating: "s", count:
+            MapSourceBusinessIdentityPolicy.maximumStoreIDBytes + 1), "map"),
+        ("store", " map "),
+    ] {
+        do {
+            try MapSourceBusinessIdentityPolicy.validate(
+                storeID: invalid.0, mapName: invalid.1)
+            require(false, "RC-H37 unsafe store/map identity must be rejected")
+        } catch let error as MapSourceImportError {
+            require(
+                error.stableCode == "map_source_invalid_business_identity",
+                "RC-H37 invalid identity must use one stable error code")
+        }
+    }
+} catch {
+    require(false, "RC-H29/H37 stable source/identity tests failed: \(error)")
+}
+
+// RC-H34: thermal evidence comes only from strict immutable snapshot
+// JSONL. Missing, partial, malformed and unknown-field records all block
+// the summary instead of being skipped and undercounted.
+do {
+    func scanEvent(
+        event: String,
+        trackingSessionID: String = "THERMAL-SESSION",
+        extra: [String: Any] = [:]
+    ) throws -> Data {
+        var object: [String: Any] = [
+            "format": "SupermarketScanEvent",
+            "version": 1,
+            "timestamp": "2023-11-14T22:13:20.000Z",
+            "timestampUnix": 1_700_000_000.0,
+            "level": "warning",
+            "event": event,
+            "message": "fixture event",
+            "trackingSessionId": trackingSessionID,
+            "fields": [String: String](),
+        ]
+        for (key, value) in extra { object[key] = value }
+        var data = try CanonicalJSONEncoder.encode(object)
+        data.append(0x0A)
+        return data
+    }
+
+    let snapshot = try p7r6FreshDirectory("strict-scan-events")
+    var valid = try scanEvent(event: "scan_started")
+    valid.append(try scanEvent(event: "thermal_critical"))
+    try valid.write(to: snapshot.appendingPathComponent("scan_events.jsonl"))
+    let combinedThermalCount = try MobileProcessingPipeline
+        .countThermalInterruptions(
+            in: snapshot,
+            expectedTrackingSessionID: "THERMAL-SESSION",
+            processingThermalSamples: 2)
+    require(
+        combinedThermalCount == 3,
+        "RC-H34 strict snapshot count must include 1 scan + 2 processing samples")
+
+    let liveDirectory = try p7r6FreshDirectory("live-scan-events")
+    var live = Data()
+    for _ in 0..<5 { live.append(try scanEvent(event: "thermal_critical")) }
+    try live.write(to: liveDirectory.appendingPathComponent("scan_events.jsonl"))
+    let immutableThermalCount = try MobileProcessingPipeline
+        .countThermalInterruptions(
+            in: snapshot,
+            expectedTrackingSessionID: "THERMAL-SESSION",
+            processingThermalSamples: 0)
+    require(
+        immutableThermalCount == 1,
+        "RC-H34 mutable live events must not affect immutable snapshot count")
+
+    let missing = try p7r6FreshDirectory("missing-scan-events")
+    do {
+        _ = try MobileProcessingPipeline.countThermalInterruptions(
+            in: missing,
+            expectedTrackingSessionID: "THERMAL-SESSION",
+            processingThermalSamples: 0)
+        require(false, "RC-H34 missing scan_events must fail closed")
+    } catch let error as MobileProcessingPipeline.ScanEventEvidenceError {
+        require(error == .missingFile, "RC-H34 missing file stable reason")
+    }
+
+    let unknown = try p7r6FreshDirectory("unknown-scan-events")
+    try scanEvent(event: "scan_started", extra: ["unexpected": true])
+        .write(to: unknown.appendingPathComponent("scan_events.jsonl"))
+    do {
+        _ = try MobileProcessingPipeline.countThermalInterruptions(
+            in: unknown,
+            expectedTrackingSessionID: "THERMAL-SESSION",
+            processingThermalSamples: 0)
+        require(false, "RC-H34 unknown scan-event field must fail closed")
+    } catch let error as MobileProcessingPipeline.ScanEventEvidenceError {
+        if case .record(let line, let reason) = error {
+            require(
+                line == 1 && reason.hasPrefix("unknown_field_"),
+                "RC-H34 unknown-field reason must retain original line")
+        } else {
+            require(false, "RC-H34 unknown field must be a record error")
+        }
+    }
+
+    let partial = try p7r6FreshDirectory("partial-scan-events")
+    var partialBytes = try scanEvent(event: "scan_started")
+    partialBytes.removeLast()
+    try partialBytes.write(
+        to: partial.appendingPathComponent("scan_events.jsonl"))
+    do {
+        _ = try MobileProcessingPipeline.countThermalInterruptions(
+            in: partial,
+            expectedTrackingSessionID: "THERMAL-SESSION",
+            processingThermalSamples: 0)
+        require(false, "RC-H34 partial final line must fail closed")
+    } catch let error as MobileProcessingPipeline.ScanEventEvidenceError {
+        if case .framing = error {} else {
+            require(false, "RC-H34 partial line must be a framing error")
+        }
+    }
+
+    let mixedIdentity = try p7r6FreshDirectory("mixed-session-scan-events")
+    var mixedIdentityBytes = try scanEvent(event: "scan_started")
+    mixedIdentityBytes.append(try scanEvent(
+        event: "thermal_critical", trackingSessionID: "OTHER-SESSION"))
+    try mixedIdentityBytes.write(
+        to: mixedIdentity.appendingPathComponent("scan_events.jsonl"))
+    do {
+        _ = try MobileProcessingPipeline.countThermalInterruptions(
+            in: mixedIdentity,
+            expectedTrackingSessionID: "THERMAL-SESSION",
+            processingThermalSamples: 0)
+        require(false, "RC-H34 mixed-session scan events must fail closed")
+    } catch let error as MobileProcessingPipeline.ScanEventEvidenceError {
+        if case .record(let line, let reason) = error {
+            require(
+                line == 2 && reason == "tracking_session_identity_mismatch",
+                "RC-H34 mixed-session rejection must retain line and stable reason")
+        } else {
+            require(false, "RC-H34 mixed-session evidence must be a record error")
+        }
+    }
+} catch {
+    require(false, "RC-H34 strict thermal evidence tests failed: \(error)")
 }
 
 } // end of C1/C2 default-mode-only host tests
@@ -7064,30 +8698,58 @@ do {
     try FileManager.default.createDirectory(at: session, withIntermediateDirectories: true)
     let now = Date().timeIntervalSince1970
     let metadata: [String: Any] = [
+        "format": "MarketScannerFinalizedSessionMetadata",
+        "version": 1,
         "formatVersion": 2,
         "finalized": true,
         "scanMode": "continuous_streaming",
+        "workflowMode": "prior_map_localized",
         "finalizedAtUnix": now + 30.0,
         "floorId": "1",
         "trackingSessionId": "E2E-SESSION",
         "storeId": "s1",
         "priorMapId": maps[0].priorMapID,
         "priorMapSha256": maps[0].packageSHA256,
+        "processingEligibility": [
+            "status": "eligible",
+            "blockers": [],
+        ],
+        "captureHealth": [
+            "localizationRequiredWriteFailureCount": 0,
+            "localizationTraceRecordCount": 6,
+            "localizationConstraintRecordCount": 6,
+            "manualLocalizationEventCount": 0,
+            "localizationStateEventCount": 1,
+            "localizationEvidenceComplete": true,
+            "localizationRecoveryEventCount": 0,
+            "localizationRecoveryEvidenceComplete": true,
+        ],
+        "localizationTrace": "localization_trace.jsonl",
+        "manualLocalizationEvents": "manual_localization_events.jsonl",
+        "localizationConstraints": "localization_constraints.jsonl",
+        "localizationEvents": "localization_events.jsonl",
+        "localizationRecoveryEvents": "localization_recovery_events.jsonl",
+        "tagObservations": "tag_observations.jsonl",
+        "localizedPriceTags": "localized_price_tags.json",
+        "localizedPriceTagCount": 0,
         // V1R4 §7.2 watermark: exact counts of the sidecar below.
         "clockCorrelationCount": 6,
         "clockNodeBindingCount": 6,
         "clockLastMonotonic": 50150.0,
         "clockLastUTC": now + 150.0,
         "clockEvidenceComplete": true,
+        "tagObservationBurstCount": 0,
+        "tagObservationBurstComplete": true,
     ]
     let metadataData = try CanonicalJSONEncoder.encode(metadata)
     try metadataData.write(to: session.appendingPathComponent("metadata.json"))
     var traces = ""
     for index in 0..<6 {
+        let traceTimestamp = 100.0 + Double(index + 1) * 0.5
         let record: [String: Any] = [
             "format": "MarketScannerLocalizationTrace",
             "version": 1,
-            "timestamp": 100.0 + Double(index) * 0.5,
+            "timestamp": traceTimestamp,
             "estimatedPose": [
                 "x_m": Double(index) * 1.0, "y_m": 0.0, "yaw_rad": 0.0,
             ],
@@ -7101,8 +8763,36 @@ do {
             "priorMapId": maps[0].priorMapID,
             "priorMapSha256": maps[0].packageSHA256,
             "nodeTimebaseOffsetSeconds": now - 100.0,
-            "nodeTimebaseTimestamp": now + Double(index) * 8.0,
+            "nodeTimebaseTimestamp": traceTimestamp + (now - 100.0),
             "confidence": 1.0,
+            "roadCandidates": [],
+            "structureSource": "smoothed_scene_depth",
+            "structurePointCount": 80,
+            "structureCoverageAngleRad": 2.8,
+            "matchCandidates": [],
+            "matchUniqueness": 0.9,
+            "matchResidualCost": 0.05,
+            "matcherElapsedMs": 4.0,
+            "constraintAccepted": true,
+            "constraintReason": "E2E accepted matcher result",
+            "measurementAccepted": true,
+            "hypothesisTrusted": true,
+            "correctionStepApplied": true,
+            "recoveryConvergedThisUpdate": false,
+            "confidenceAccepted": true,
+            "constraintDisposition": "accepted_local",
+            "postRecoveryTrustedLocalFrames": 3,
+            "scanSearchPerformed": true,
+            "hypothesisSupportFrames": 3,
+            "hypothesisScoreMargin": 0.4,
+            "recoverySearch": false,
+            "correctionTranslationM": 0.0,
+            "correctionYawDeg": 0.0,
+            "activeHypothesisTrackCount": 1,
+            "hypothesisReason": "trusted_hypothesis",
+            "hypothesisTrackerElapsedMs": 1.0,
+            "recoveryCooldownRemainingMs": 0.0,
+            "recoveryAutomaticTriggerSuppressed": false,
         ]
         let recordData = try CanonicalJSONEncoder.encode(record)
         traces += String(data: recordData, encoding: .utf8)! + "\n"
@@ -7124,7 +8814,7 @@ do {
         let record: [String: Any] = [
             "format": "MarketScannerLocalizationConstraint",
             "version": 1,
-            "timestamp": 100.0 + Double(index) * 0.5,
+            "timestamp": 100.0 + Double(index + 1) * 0.5,
             "nodeTimebaseTimestamp": now + Double(index + 1) * 0.5,
             "nodeTimebaseOffsetSeconds": now - 100.0,
             "trackingSessionId": "E2E-SESSION",
@@ -7199,6 +8889,29 @@ do {
         to: session.appendingPathComponent("clock_correlations.jsonl"))
     try Data("[]".utf8).write(
         to: session.appendingPathComponent("localized_price_tags.json"))
+    try Data().write(
+        to: session.appendingPathComponent("tag_observation_bursts.jsonl"))
+    let scanEventTimestampFormatter = ISO8601DateFormatter()
+    scanEventTimestampFormatter.formatOptions = [
+        .withInternetDateTime,
+        .withFractionalSeconds,
+    ]
+    let scanEventTimestamp = scanEventTimestampFormatter.string(
+        from: Date(timeIntervalSince1970: now))
+    var scanEvent = try CanonicalJSONEncoder.encode([
+        "format": "SupermarketScanEvent",
+        "version": 1,
+        "timestamp": scanEventTimestamp,
+        "timestampUnix": now,
+        "level": "info",
+        "event": "scan_started",
+        "message": "fixture scan started",
+        "trackingSessionId": "E2E-SESSION",
+        "fields": [String: String](),
+    ])
+    scanEvent.append(0x0A)
+    try scanEvent.write(
+        to: session.appendingPathComponent("scan_events.jsonl"))
     // Minimal REAL SQLite source DB: the V1R3 snapshot validates the DB
     // (quick_check + Node/Link inventory), so a fake byte blob is no
     // longer accepted.
@@ -7254,7 +8967,10 @@ do {
     // V1R2: the host suite wires the deterministic reference
     // implementation of the factor-graph gateway; the real app wires the
     // shared native core (`MobileNativeFactorGraph.wireIntoGateway()`).
-    let referenceImplementation: MobileNativeFactorGraphGateway.RunImplementation = { request, _ in
+    func referenceImplementation(
+        path: String
+    ) -> MobileNativeFactorGraphGateway.RunImplementation {
+        return { request, _ in
         let snapshotDirectory = request.databaseURL.deletingLastPathComponent()
         let traceURL = snapshotDirectory.appendingPathComponent("localization_trace.jsonl")
         var rows: [MobileNativeTrajectoryRow] = []
@@ -7287,15 +9003,25 @@ do {
         guard !rows.isEmpty else {
             throw MobileNativeFactorGraphError.nativeFailed("reference graph is empty")
         }
+        let disposition: MobileGraphDisposition = request.absolutePriors.isEmpty
+            ? .localFrameOnly : .pass
         return MobileNativeGraphOutcome(
-            disposition: request.absolutePriors.isEmpty ? .localFrameOnly : .pass,
-            qualityJSON: "{\"format\": \"MarketScannerGraphQuality\", \"version\": 2, "
-                + "\"path\": \"host-reference\", \"disposition\": \"" + (request.absolutePriors.isEmpty ? "LOCAL_FRAME_ONLY" : "PASS") + "\"}",
+            disposition: disposition,
+            qualityJSON: try nativeQualityFixture(
+                request: request,
+                path: path,
+                disposition: disposition,
+                trajectoryCount: rows.count,
+                skeletonCount: rows.count,
+                publishCount: rows.count),
             trajectory: rows,
             skeletonIDs: rows.map { $0.id })
+        }
     }
-    MobileNativeFactorGraphGateway.runFastImplementation = referenceImplementation
-    MobileNativeFactorGraphGateway.runFullGraphImplementation = referenceImplementation
+    MobileNativeFactorGraphGateway.runFastImplementation = referenceImplementation(
+        path: "fast")
+    MobileNativeFactorGraphGateway.runFullGraphImplementation = referenceImplementation(
+        path: "full_graph_optimization")
 
     // Strict absolute-prior parsing (§6.1) needs the snapshot-DB node
     // inventory; the host suite reads the fixture Node table directly
@@ -7437,29 +9163,66 @@ do {
             require(false, "X-strict unknown field must be invalidManifest, got \(error)")
         }
     }
-    // The tampered result is never listed.
+    // The tampered result is never listed and is moved, not deleted,
+    // into a durable audit wrapper.
+    let visibleAfterTamper = MobileResultLibrary.listResults()
     require(
-        MobileResultLibrary.listResults().count == 1,
+        visibleAfterTamper.count == 1,
         "X-strict tampered result must be isolated from listResults")
+    require(
+        !FileManager.default.fileExists(atPath: tamperDirectory.path),
+        "RC-H24 corrupted result must leave the visible result root")
+    require(
+        !MobileResultLibrary.lastListingDiagnostics().isEmpty,
+        "RC-H24 result listing must expose a runtime audit diagnostic")
+    let resultQuarantine = try MobileResultLibrary.root()
+        .appendingPathComponent("quarantine", isDirectory: true)
+    let resultQuarantineEntries = try FileManager.default
+        .contentsOfDirectory(atPath: resultQuarantine.path)
+    require(
+        resultQuarantineEntries.count == 1,
+        "RC-H24 exactly one corrupted result must be quarantined")
+    let resultQuarantineWrapper = resultQuarantine.appendingPathComponent(
+        resultQuarantineEntries[0], isDirectory: true)
+    require(
+        FileManager.default.fileExists(atPath: resultQuarantineWrapper
+            .appendingPathComponent("result_payload").path)
+            && FileManager.default.fileExists(atPath: resultQuarantineWrapper
+                .appendingPathComponent(
+                    MobileResultLibrary.quarantineDiagnosticFileName).path),
+        "RC-H24 quarantine must preserve payload plus durable diagnostic")
 
     // =================================================================
-    // V1R4 §17 Gate N freeze: V1 has no true sensor Deep on device.
-    // A graph that still fails after the controlled full-graph recovery
-    // turns into an EXPLICIT session-level RESCAN task (never a silent
-    // drop) and publish stays blocked (qualityGateRejected). Runs BEFORE
-    // the §15 crash block because that block deletes the source session.
+    // RC RESCAN terminal outcome: Route A graph/no-trajectory rejection
+    // is a durable, restart-safe, product-visible RESCAN_SESSION state.
+    // It never publishes PriceTags, DevicePositions, workbook, or Result.
+    // Runs BEFORE §15 because that block deletes the source session.
     // =================================================================
     do {
-        let gateNTaskRoot = try MobileProcessingTaskStore.createTask(
-            taskID: "gate-n-graph-fail")
         let savedFast = MobileNativeFactorGraphGateway.runFastImplementation
         let savedFull = MobileNativeFactorGraphGateway.runFullGraphImplementation
-        let failingGraph: MobileNativeFactorGraphGateway.RunImplementation = { _, _ in
+        defer {
+            MobileNativeFactorGraphGateway.runFastImplementation = savedFast
+            MobileNativeFactorGraphGateway.runFullGraphImplementation = savedFull
+            MobileProcessingPipeline.sessionRescanArtifactWriteFaultInjector = nil
+            PersistentTaskCoordinator.writeFaultInjector = nil
+        }
+        let resultCountBefore = MobileResultLibrary.listResults().count
+        var fastInvocationCount = 0
+        var fullInvocationCount = 0
+        func failingGraph(
+            request: MobileNativeGraphRequest,
+            path: String
+        ) throws -> MobileNativeGraphOutcome {
             return MobileNativeGraphOutcome(
                 disposition: .recoverableFail,
-                qualityJSON: "{\"format\": \"MarketScannerGraphQuality\", "
-                    + "\"version\": 2, \"path\": \"host-gate-n\", "
-                    + "\"disposition\": \"RECOVERABLE_FAIL\"}",
+                qualityJSON: try nativeQualityFixture(
+                    request: request,
+                    path: path,
+                    disposition: .recoverableFail,
+                    trajectoryCount: 1,
+                    skeletonCount: 1,
+                    publishCount: 1),
                 trajectory: [MobileNativeTrajectoryRow(
                     id: 1,
                     stamp: now + 1.0,
@@ -7472,9 +9235,18 @@ do {
                     uncertaintyM: 0.05)],
                 skeletonIDs: [1])
         }
-        MobileNativeFactorGraphGateway.runFastImplementation = failingGraph
-        MobileNativeFactorGraphGateway.runFullGraphImplementation = failingGraph
-        var gateNRequest = MobileProcessingPipeline.Request(
+        MobileNativeFactorGraphGateway.runFastImplementation = { request, cancelled in
+            fastInvocationCount += 1
+            return try failingGraph(request: request, path: "fast")
+        }
+        MobileNativeFactorGraphGateway.runFullGraphImplementation = { request, cancelled in
+            fullInvocationCount += 1
+            return try failingGraph(
+                request: request, path: "full_graph_optimization")
+        }
+        let gateNTaskRoot = try MobileProcessingTaskStore.createTask(
+            taskID: "gate-n-graph-fail")
+        let gateNRequest = MobileProcessingPipeline.Request(
             finalizedSession: session,
             sourceDatabase: session.appendingPathComponent("rtabmap_segment_0001.db"),
             taskRoot: gateNTaskRoot,
@@ -7488,39 +9260,559 @@ do {
             osVersion: "macos",
             nativeCoreSHA256: "",
             policySHA: "host-policy-v1")
-        var blockedByGate = false
+        var typedRescanObserved = false
         do {
             _ = try MobileProcessingPipeline.run(
                 request: gateNRequest, progress: { _, _ in }, isCancelled: { false })
-        } catch let error as MobileProcessingPipeline.PipelineError {
-            if case .qualityGateRejected = error { blockedByGate = true } else {
-                require(false, "§17 gate failure must be qualityGateRejected, got \(error)")
+        } catch let error as MobileOnlyWorkflowError {
+            if case .rescanSessionRequired = error {
+                typedRescanObserved = error.code == "workflow.rescan_session_required"
+            } else {
+                require(false, "RC RESCAN graph failure typed error wrong: \(error)")
             }
         }
-        require(blockedByGate, "§17 failing graph must block publish")
-        MobileNativeFactorGraphGateway.runFastImplementation = savedFast
-        MobileNativeFactorGraphGateway.runFullGraphImplementation = savedFull
-        let gateNRescanURL = gateNTaskRoot.appendingPathComponent("rescan_tasks.json")
+        require(typedRescanObserved, "RC RESCAN graph failure must use stable typed code")
+        require(
+            fastInvocationCount == 1 && fullInvocationCount == 1,
+            "RC RESCAN Route A must run Fast once and Full at most once")
+        let gateNRecord = try PersistentTaskCoordinator.read(taskRoot: gateNTaskRoot)
+        require(
+            gateNRecord.state == .rescanRequired
+                && gateNRecord.error == "rescan_session_required",
+            "RC RESCAN task terminal state/reason must be exact")
+        require(!PersistentTaskCoordinator.isResumable(gateNRecord),
+            "RC RESCAN terminal task must not be resumed as ordinary work")
+        let gateNRescanURL = gateNTaskRoot.appendingPathComponent(
+            MobileProcessingPipeline.sessionRescanArtifactFileName)
         let gateNRescanData = try Data(contentsOf: gateNRescanURL)
         let gateNRescan = try JSONSerialization.jsonObject(
             with: gateNRescanData) as! [String: Any]
         require(
-            (gateNRescan["count"] as? Int) == 1,
-            "§17 graph-level RESCAN must be counted exactly once")
-        let gateNTasks = gateNRescan["tasks"] as! [[String: Any]]
+            gateNRescan["terminal_outcome"] as? String == "RESCAN_SESSION"
+                && gateNRescan["reason_code"] as? String == "graph_quality_failed"
+                && gateNRescan["publish_permitted"] as? Bool == false
+                && gateNRescan["result_published"] as? Bool == false,
+            "RC RESCAN artifact must encode terminal action and no-publish invariant")
+        let gateNRescanTasks = gateNRescan["rescan_tasks"] as! [String: Any]
+        let gateNTasks = gateNRescanTasks["tasks"] as! [[String: Any]]
         require(
-            (gateNTasks[0]["reason_code"] as? String) == "graph_quality_failed",
-            "§17 RESCAN reason must be graph_quality_failed")
+            gateNRescanTasks["count"] as? Int == 1
+                && gateNTasks[0]["task_type"] as? String == "INSUFFICIENT_LOOP"
+                && gateNTasks[0]["reason_code"] as? String == "graph_quality_failed"
+                && gateNTasks[0]["suggested_action"] as? String == "RESCAN_SESSION",
+            "RC RESCAN graph task payload must be complete")
+        var artifactStat = stat()
+        require(lstat(gateNRescanURL.path, &artifactStat) == 0
+                && (artifactStat.st_mode & S_IFMT) == S_IFREG
+                && artifactStat.st_nlink == 1
+                && (artifactStat.st_mode & mode_t(0o222)) == 0,
+            "RC RESCAN artifact must be one read-only regular file")
+        let artifactSHA = SHA256.hash(data: gateNRescanData).map {
+            String(format: "%02x", $0)
+        }.joined()
+        let terminalBinding = gateNRecord.checkpoint?["terminal_outcome"]
+            as? [String: Any]
         require(
-            (gateNTasks[0]["task_type"] as? String) == "INSUFFICIENT_LOOP",
-            "§17 RESCAN type must be INSUFFICIENT_LOOP")
+            terminalBinding?["code"] as? String == "RESCAN_SESSION"
+                && terminalBinding?["artifact"] as? String
+                    == "task:\(MobileProcessingPipeline.sessionRescanArtifactFileName)"
+                && terminalBinding?["sha256"] as? String == artifactSHA,
+            "RC RESCAN checkpoint must hash-bind the task-local artifact")
         require(
-            (gateNTasks[0]["suggested_action"] as? String) == "RESCAN_SESSION",
-            "§17 RESCAN action must be RESCAN_SESSION")
+            MobileResultLibrary.listResults().count == resultCountBefore,
+            "RC RESCAN graph rejection must not publish an ordinary Result")
+
+        // Adversarial artifact parser fixtures: JSON numeric 0/1 cannot
+        // impersonate Bool, and reason/disposition combinations are a
+        // cross-field contract rather than two independent enums.
+        func updateRescanTaskPayload(
+            _ payload: inout [String: Any],
+            reasonCode: String,
+            taskType: String,
+            humanMessage: String? = nil
+        ) {
+            var rescanTasks = payload["rescan_tasks"] as! [String: Any]
+            var tasks = rescanTasks["tasks"] as! [[String: Any]]
+            tasks[0]["reason_code"] = reasonCode
+            tasks[0]["task_type"] = taskType
+            if let humanMessage {
+                tasks[0]["human_message"] = humanMessage
+            }
+            rescanTasks["tasks"] = tasks
+            payload["rescan_tasks"] = rescanTasks
+        }
+        func writeAdversarialRescanArtifact(
+            taskID: String,
+            mutate: (inout [String: Any]) -> Void
+        ) throws -> (URL, MobileProcessingPipeline.Request, String, String, Data) {
+            let taskRoot = try MobileProcessingTaskStore.createTask(taskID: taskID)
+            var request = gateNRequest
+            request.taskRoot = taskRoot
+            var payload = gateNRescan
+            payload["task_id"] = taskID
+            mutate(&payload)
+            let data = try CanonicalJSONEncoder.encode(payload)
+            let url = taskRoot.appendingPathComponent(
+                MobileProcessingPipeline.sessionRescanArtifactFileName)
+            try data.write(to: url, options: .withoutOverwriting)
+            require(chmod(url.path, 0o400) == 0,
+                "RC RESCAN adversarial fixture must freeze artifact")
+            let inputBundleSHA = payload["input_bundle_sha256"] as! String
+            let sha = SHA256.hash(data: data).map {
+                String(format: "%02x", $0)
+            }.joined()
+            return (taskRoot, request, inputBundleSHA, sha, data)
+        }
+        func requireAdversarialRescanRejected(
+            _ fixture: (
+                URL, MobileProcessingPipeline.Request, String, String, Data),
+            label: String
+        ) throws {
+            do {
+                try MobileProcessingPipeline.validateSessionRescanArtifact(
+                    taskRoot: fixture.0,
+                    request: fixture.1,
+                    inputBundleSHA256: fixture.2,
+                    expectedSHA256: fixture.3)
+                require(false, "RC RESCAN \(label) must be rejected")
+            } catch let error
+                    as MobileProcessingPipeline.SessionRescanArtifactError {
+                if case .invalid = error {} else {
+                    require(false,
+                        "RC RESCAN \(label) rejection type wrong: \(error)")
+                }
+            }
+            let record = try PersistentTaskCoordinator.read(taskRoot: fixture.0)
+            let artifact = try Data(contentsOf: fixture.0.appendingPathComponent(
+                MobileProcessingPipeline.sessionRescanArtifactFileName))
+            require(record.state == .created && record.error == nil
+                    && artifact == fixture.4,
+                "RC RESCAN \(label) rejection must not mutate task/artifact")
+        }
+
+        let numericPublish = try writeAdversarialRescanArtifact(
+            taskID: "rescan-numeric-publish-bool") { payload in
+                payload["publish_permitted"] = 0
+            }
+        try requireAdversarialRescanRejected(
+            numericPublish, label: "numeric publish_permitted")
+        let numericResult = try writeAdversarialRescanArtifact(
+            taskID: "rescan-numeric-result-bool") { payload in
+                payload["result_published"] = 1
+            }
+        try requireAdversarialRescanRejected(
+            numericResult, label: "numeric result_published")
+
+        let noPublishNonPass = try writeAdversarialRescanArtifact(
+            taskID: "rescan-no-publish-non-pass") { payload in
+                payload["reason_code"] = "no_publish_eligible_trajectory"
+                payload["graph_disposition"] = "RECOVERABLE_FAIL"
+                updateRescanTaskPayload(
+                    &payload,
+                    reasonCode: "no_publish_eligible_trajectory",
+                    taskType: MobileWorksheets.RescanTaskType
+                        .weakLocalization.rawValue)
+            }
+        try requireAdversarialRescanRejected(
+            noPublishNonPass, label: "no-publish + non-PASS")
+        let graphFailurePass = try writeAdversarialRescanArtifact(
+            taskID: "rescan-graph-failure-pass") { payload in
+                payload["graph_disposition"] = "PASS"
+            }
+        try requireAdversarialRescanRejected(
+            graphFailurePass, label: "graph-quality-failed + PASS")
+        let graphFailureResource = try writeAdversarialRescanArtifact(
+            taskID: "rescan-graph-failure-resource") { payload in
+                payload["graph_disposition"] = "RESOURCE_REQUIRED"
+            }
+        try requireAdversarialRescanRejected(
+            graphFailureResource,
+            label: "graph-quality-failed + RESOURCE_REQUIRED")
+
+        // EEXIST race fixtures: after the production temp file is fsynced,
+        // publish a different but individually valid artifact at the final
+        // path. The writer must compare the race winner with its intended
+        // outcome field-for-field. Any conflict stays fail-closed without
+        // generic failed terminalization or mutation of the winning bytes.
+        enum RescanEquivalenceConflict {
+            case processingPath
+            case disposition
+            case reason
+            case humanMessage
+        }
+        let equivalenceConflicts: [(String, RescanEquivalenceConflict)] = [
+            ("processing-path", .processingPath),
+            ("disposition", .disposition),
+            ("reason", .reason),
+            ("human-message", .humanMessage),
+        ]
+        for (label, conflict) in equivalenceConflicts {
+            let taskRoot = try MobileProcessingTaskStore.createTask(
+                taskID: "rescan-eexist-conflict-\(label)")
+            var request = gateNRequest
+            request.taskRoot = taskRoot
+            var winningBytes: Data?
+            MobileProcessingPipeline.sessionRescanArtifactWriteFaultInjector = {
+                stage in
+                guard stage == .afterTemporaryFsync else { return }
+                let temporaryNames = try FileManager.default.contentsOfDirectory(
+                    atPath: taskRoot.path).filter {
+                        $0.hasPrefix(".rescan-session-outcome.tmp-")
+                    }
+                require(temporaryNames.count == 1,
+                    "RC RESCAN EEXIST fixture must find one production temp")
+                let temporaryURL = taskRoot.appendingPathComponent(
+                    temporaryNames[0])
+                var payload = try JSONSerialization.jsonObject(
+                    with: Data(contentsOf: temporaryURL)) as! [String: Any]
+                switch conflict {
+                case .processingPath:
+                    payload["processing_path"] = "fast"
+                case .disposition:
+                    payload["graph_disposition"] = "NON_RECOVERABLE_FAIL"
+                case .reason:
+                    payload["reason_code"] = "no_publish_eligible_trajectory"
+                    payload["graph_disposition"] = "PASS"
+                    updateRescanTaskPayload(
+                        &payload,
+                        reasonCode: "no_publish_eligible_trajectory",
+                        taskType: MobileWorksheets.RescanTaskType
+                            .weakLocalization.rawValue)
+                case .humanMessage:
+                    let message = "conflicting EEXIST outcome"
+                    payload["human_message"] = message
+                    updateRescanTaskPayload(
+                        &payload,
+                        reasonCode: "graph_quality_failed",
+                        taskType: MobileWorksheets.RescanTaskType
+                            .insufficientLoop.rawValue,
+                        humanMessage: message)
+                }
+                let data = try CanonicalJSONEncoder.encode(payload)
+                let finalURL = taskRoot.appendingPathComponent(
+                    MobileProcessingPipeline.sessionRescanArtifactFileName)
+                try data.write(to: finalURL, options: .withoutOverwriting)
+                require(chmod(finalURL.path, 0o400) == 0,
+                    "RC RESCAN EEXIST race winner must be read-only")
+                winningBytes = data
+            }
+            var observedCheckpointError = false
+            do {
+                _ = try MobileProcessingPipeline.run(
+                    request: request,
+                    progress: { _, _ in },
+                    isCancelled: { false })
+            } catch let error as PersistentTaskCheckpoint.CheckpointError {
+                if case .invalidRecord(let detail) = error {
+                    observedCheckpointError = detail.contains(
+                        "conflicting RESCAN_SESSION publication")
+                }
+            }
+            MobileProcessingPipeline.sessionRescanArtifactWriteFaultInjector = nil
+            let record = try PersistentTaskCoordinator.read(taskRoot: taskRoot)
+            let finalBytes = try Data(contentsOf: taskRoot.appendingPathComponent(
+                MobileProcessingPipeline.sessionRescanArtifactFileName))
+            let intent = try MobileTerminalStatePersistence.readIntentIfPresent(
+                taskRoot: taskRoot)
+            require(observedCheckpointError,
+                "RC RESCAN EEXIST \(label) conflict must fail closed")
+            require(record.state != .failed && record.state != .rescanRequired
+                    && record.error == nil && intent == nil,
+                "RC RESCAN EEXIST \(label) must not terminalize task")
+            require(winningBytes != nil && finalBytes == winningBytes,
+                "RC RESCAN EEXIST \(label) must not alter race winner")
+            require(MobileResultLibrary.listResults().count == resultCountBefore,
+                "RC RESCAN EEXIST \(label) must not publish Result")
+        }
+
+        // Real-filesystem restart simulation: retain the durable artifact
+        // but roll task.json back to the last pre-terminal graph stage,
+        // exactly as a process crash can expose after artifact fsync. The
+        // next run must detect the artifact before either native path.
+        var crashRecord = gateNRecord
+        crashRecord.state = .deepOptimizing
+        crashRecord.error = nil
+        if var checkpoint = crashRecord.checkpoint {
+            checkpoint.removeValue(forKey: "terminal_outcome")
+            checkpoint["durable_outputs"] = (checkpoint["durable_outputs"] as? [String] ?? [])
+                .filter { !$0.hasSuffix(
+                    MobileProcessingPipeline.sessionRescanArtifactFileName) }
+            crashRecord.checkpoint = checkpoint
+        }
+        try PersistentTaskCoordinator.write(crashRecord, taskRoot: gateNTaskRoot)
+        fastInvocationCount = 0
+        fullInvocationCount = 0
+        var restartRescanObserved = false
+        do {
+            _ = try MobileProcessingPipeline.run(
+                request: gateNRequest, progress: { _, _ in }, isCancelled: { false })
+        } catch let error as MobileOnlyWorkflowError {
+            if case .rescanSessionRequired = error { restartRescanObserved = true }
+        }
+        require(restartRescanObserved,
+            "RC RESCAN crash-leftover artifact must recover the typed outcome")
+        require(fastInvocationCount == 0 && fullInvocationCount == 0,
+            "RC RESCAN restart must not re-run Fast or Full")
+        let recoveredGateNRecord = try PersistentTaskCoordinator.read(
+            taskRoot: gateNTaskRoot)
+        require(
+            recoveredGateNRecord.state == .rescanRequired,
+            "RC RESCAN restart must restore terminal task state")
+
+        // A subsequent launch cannot restart the terminal task in place.
+        do {
+            _ = try MobileProcessingPipeline.run(
+                request: gateNRequest, progress: { _, _ in }, isCancelled: { false })
+            require(false, "RC RESCAN terminal task must reject in-place restart")
+        } catch let error as PersistentTaskCheckpoint.CheckpointError {
+            if case .notResumable = error {} else {
+                require(false, "RC RESCAN terminal restart error wrong: \(error)")
+            }
+        }
+        require(fastInvocationCount == 0 && fullInvocationCount == 0
+                && MobileResultLibrary.listResults().count == resultCountBefore,
+            "RC RESCAN terminal restart must neither process nor publish")
+
+        // Artifact write failure is fail-closed: no artifact, no Result,
+        // and the task is durably failed rather than falsely claiming a
+        // RESCAN_SESSION record that storage never committed.
+        let writeFailureRoot = try MobileProcessingTaskStore.createTask(
+            taskID: "gate-n-rescan-write-failure")
+        var writeFailureRequest = gateNRequest
+        writeFailureRequest.taskRoot = writeFailureRoot
+        MobileProcessingPipeline.sessionRescanArtifactWriteFaultInjector = { stage in
+            if stage == .beforeTemporaryWrite {
+                throw NSError(domain: "RescanArtifactFault", code: 1)
+            }
+        }
+        do {
+            _ = try MobileProcessingPipeline.run(
+                request: writeFailureRequest,
+                progress: { _, _ in },
+                isCancelled: { false })
+            require(false, "RC RESCAN injected artifact write failure must surface")
+        } catch let error as MobileProcessingPipeline.SessionRescanArtifactError {
+            if case .cannotWrite = error {} else {
+                require(false, "RC RESCAN write failure type wrong: \(error)")
+            }
+        }
+        MobileProcessingPipeline.sessionRescanArtifactWriteFaultInjector = nil
+        let writeFailureRecord = try PersistentTaskCoordinator.read(
+            taskRoot: writeFailureRoot)
+        require(writeFailureRecord.state == .failed,
+            "RC RESCAN artifact write failure must fail closed")
+        require(!FileManager.default.fileExists(atPath: writeFailureRoot
+                .appendingPathComponent(
+                    MobileProcessingPipeline.sessionRescanArtifactFileName).path)
+                && MobileResultLibrary.listResults().count == resultCountBefore,
+            "RC RESCAN write failure must not leave a claimed artifact or Result")
+
+        // Complete artifact-writer crash matrix. afterTemporaryFsync is
+        // still pre-rename and may become ordinary workflow failure; once
+        // final rename is visible, catch-path reconciliation must repair
+        // parent fsync, hash-bind the checkpoint and commit RESCAN_SESSION.
+        let remainingArtifactStages: [
+            MobileProcessingPipeline.SessionRescanArtifactWriteStage
+        ] = [.afterTemporaryFsync, .afterRename, .afterParentFsync]
+        for artifactStage in remainingArtifactStages {
+            let taskRoot = try MobileProcessingTaskStore.createTask(
+                taskID: "rescan-artifact-fault-\(artifactStage.rawValue)")
+            var request = gateNRequest
+            request.taskRoot = taskRoot
+            MobileProcessingPipeline.sessionRescanArtifactWriteFaultInjector = {
+                stage in
+                if stage == artifactStage {
+                    throw NSError(domain: "RescanArtifactMatrix", code: 2)
+                }
+            }
+            var observedError: Error?
+            do {
+                _ = try MobileProcessingPipeline.run(
+                    request: request,
+                    progress: { _, _ in },
+                    isCancelled: { false })
+            } catch {
+                observedError = error
+            }
+            MobileProcessingPipeline.sessionRescanArtifactWriteFaultInjector = nil
+            let record = try PersistentTaskCoordinator.read(taskRoot: taskRoot)
+            let artifactURL = taskRoot.appendingPathComponent(
+                MobileProcessingPipeline.sessionRescanArtifactFileName)
+            if artifactStage == .afterTemporaryFsync {
+                require(observedError is MobileProcessingPipeline.SessionRescanArtifactError,
+                    "RC RESCAN pre-rename artifact fault must surface writer error")
+                require(record.state == .failed
+                        && !FileManager.default.fileExists(atPath: artifactURL.path),
+                    "RC RESCAN pre-rename artifact fault may fail but cannot claim RESCAN")
+            } else {
+                guard let workflowError = observedError as? MobileOnlyWorkflowError,
+                      case .rescanSessionRequired = workflowError else {
+                    require(false,
+                        "RC RESCAN post-rename artifact fault must recover typed outcome")
+                    continue
+                }
+                require(record.state == .rescanRequired
+                        && record.error == "rescan_session_required"
+                        && FileManager.default.fileExists(atPath: artifactURL.path),
+                    "RC RESCAN post-rename artifact fault must finish exact terminal state")
+                let terminal = record.checkpoint?["terminal_outcome"] as? [String: Any]
+                require(terminal?["artifact"] as? String
+                        == "task:\(MobileProcessingPipeline.sessionRescanArtifactFileName)"
+                        && terminal?["sha256"] as? String != nil,
+                    "RC RESCAN post-rename artifact fault must hash-bind checkpoint")
+            }
+            require(MobileResultLibrary.listResults().count == resultCountBefore,
+                "RC RESCAN artifact matrix must never publish Result")
+        }
+
+        // Checkpoint writer crash matrix. The fault is armed only after
+        // the artifact parent fsync, so it targets the first task.json
+        // write that binds the artifact. Pre-rename task writes preserve a
+        // resumable intermediate state; restart detects the durable
+        // artifact before native work. Post-rename writes are accepted only
+        // through exact checkpoint/terminal reread.
+        let rescanCheckpointWriteStages: [PersistentTaskCoordinator.WriteStage] = [
+            .beforeTemporaryWrite, .afterTemporaryFsync,
+            .afterRename, .afterParentFsync,
+        ]
+        for writeStage in rescanCheckpointWriteStages {
+            let taskRoot = try MobileProcessingTaskStore.createTask(
+                taskID: "rescan-checkpoint-fault-\(writeStage.rawValue)")
+            var request = gateNRequest
+            request.taskRoot = taskRoot
+            MobileProcessingPipeline.sessionRescanArtifactWriteFaultInjector = {
+                stage in
+                if stage == .afterParentFsync {
+                    PersistentTaskCoordinator.writeFaultInjector = { actual in
+                        if actual == writeStage {
+                            throw NSError(
+                                domain: "RescanCheckpointMatrix", code: 3)
+                        }
+                    }
+                }
+            }
+            var firstError: Error?
+            do {
+                _ = try MobileProcessingPipeline.run(
+                    request: request,
+                    progress: { _, _ in },
+                    isCancelled: { false })
+            } catch {
+                firstError = error
+            }
+            MobileProcessingPipeline.sessionRescanArtifactWriteFaultInjector = nil
+            PersistentTaskCoordinator.writeFaultInjector = nil
+            var record = try PersistentTaskCoordinator.read(taskRoot: taskRoot)
+            let artifactURL = taskRoot.appendingPathComponent(
+                MobileProcessingPipeline.sessionRescanArtifactFileName)
+            require(FileManager.default.fileExists(atPath: artifactURL.path),
+                "RC RESCAN checkpoint fault must retain immutable artifact")
+            require(record.state != .failed,
+                "RC RESCAN checkpoint fault must never become generic failed")
+            let pendingIntent = try MobileTerminalStatePersistence
+                .readIntentIfPresent(taskRoot: taskRoot)
+            require(pendingIntent == nil,
+                "RC RESCAN checkpoint reconciliation must not leave failed intent")
+
+            switch writeStage {
+            case .beforeTemporaryWrite, .afterTemporaryFsync:
+                require(firstError is PersistentTaskCheckpoint.CheckpointError,
+                    "RC RESCAN checkpoint pre-rename fault must fail closed")
+                require(record.state != .rescanRequired,
+                    "RC RESCAN checkpoint pre-rename fault must await restart")
+                fastInvocationCount = 0
+                fullInvocationCount = 0
+                var restartTyped = false
+                do {
+                    _ = try MobileProcessingPipeline.run(
+                        request: request,
+                        progress: { _, _ in },
+                        isCancelled: { false })
+                } catch let error as MobileOnlyWorkflowError {
+                    if case .rescanSessionRequired = error {
+                        restartTyped = true
+                    }
+                }
+                record = try PersistentTaskCoordinator.read(taskRoot: taskRoot)
+                require(restartTyped && record.state == .rescanRequired,
+                    "RC RESCAN checkpoint pre-rename restart must complete terminal outcome")
+                require(fastInvocationCount == 0 && fullInvocationCount == 0,
+                    "RC RESCAN checkpoint restart must not rerun native graph")
+            case .afterRename, .afterParentFsync:
+                guard let workflowError = firstError as? MobileOnlyWorkflowError,
+                      case .rescanSessionRequired = workflowError else {
+                    require(false,
+                        "RC RESCAN checkpoint post-rename fault must return typed outcome")
+                    continue
+                }
+                require(record.state == .rescanRequired
+                        && record.error == "rescan_session_required",
+                    "RC RESCAN checkpoint post-rename fault must exact-reread terminal state")
+            }
+            let binding = record.checkpoint?["terminal_outcome"] as? [String: Any]
+            require(binding?["code"] as? String == "RESCAN_SESSION"
+                    && binding?["sha256"] as? String != nil
+                    && MobileResultLibrary.listResults().count == resultCountBefore,
+                "RC RESCAN checkpoint matrix must retain hash binding and no Result")
+        }
+
+        // Graph PASS with zero publish-eligible nodes is the same product
+        // outcome, not generic qualityGateRejected/processing_failed.
+        let noTrajectoryRoot = try MobileProcessingTaskStore.createTask(
+            taskID: "gate-n-no-publish-trajectory")
+        var noTrajectoryRequest = gateNRequest
+        noTrajectoryRequest.taskRoot = noTrajectoryRoot
+        MobileNativeFactorGraphGateway.runFastImplementation = { request, _ in
+            return MobileNativeGraphOutcome(
+                disposition: .pass,
+                qualityJSON: try nativeQualityFixture(
+                    request: request,
+                    path: "fast",
+                    disposition: .pass,
+                    trajectoryCount: 1,
+                    skeletonCount: 1,
+                    publishCount: 0),
+                trajectory: [MobileNativeTrajectoryRow(
+                    id: 1, stamp: now + 1.0,
+                    xM: 1.0, yM: 2.0, yawRad: 0.5,
+                    mapID: 0, componentID: 0,
+                    publishEligible: false, uncertaintyM: 0.05)],
+                skeletonIDs: [1])
+        }
+        MobileNativeFactorGraphGateway.runFullGraphImplementation = { request, cancelled in
+            require(false, "RC RESCAN graph PASS must not invoke Full")
+            return try failingGraph(
+                request: request, path: "full_graph_optimization")
+        }
+        var noTrajectoryRescanObserved = false
+        do {
+            _ = try MobileProcessingPipeline.run(
+                request: noTrajectoryRequest,
+                progress: { _, _ in },
+                isCancelled: { false })
+        } catch let error as MobileOnlyWorkflowError {
+            if case .rescanSessionRequired(let detail) = error {
+                noTrajectoryRescanObserved = detail.contains(
+                    "no_publish_eligible_trajectory")
+            }
+        }
+        require(noTrajectoryRescanObserved,
+            "RC RESCAN no publish-eligible trajectory must use typed outcome")
+        let noTrajectoryRecord = try PersistentTaskCoordinator.read(
+            taskRoot: noTrajectoryRoot)
+        let noTrajectoryArtifact = try JSONSerialization.jsonObject(
+            with: Data(contentsOf: noTrajectoryRoot.appendingPathComponent(
+                MobileProcessingPipeline.sessionRescanArtifactFileName)))
+            as! [String: Any]
+        require(noTrajectoryRecord.state == .rescanRequired
+                && noTrajectoryArtifact["reason_code"] as? String
+                    == "no_publish_eligible_trajectory"
+                && MobileResultLibrary.listResults().count == resultCountBefore,
+            "RC RESCAN no-trajectory branch must persist terminal no-publish evidence")
         print(
-            "§17 gate-n freeze passed: graph-fail -> explicit RESCAN, publish blocked")
+            "RC RESCAN terminal outcome passed: artifact-writer=4 checkpoint-writer=4 restart/no-publish")
     } catch {
-        require(false, "§17 gate-n failed: \(error)")
+        require(false, "RC RESCAN terminal outcome failed: \(error)")
     }
 
     // =================================================================
@@ -7562,11 +9854,20 @@ do {
             seedRecord.checkpoint?["task_id"] as? String == "crash-seed"
                 && (seedRecord.checkpoint?["retry_count"] as? Int ?? -1) == 0,
             "§15 completed checkpoint must bind task_id and retry_count")
-        let seedManifestData = try Data(
-            contentsOf: seedRoot.appendingPathComponent("input_manifest.json"))
-        let seedManifest = try JSONSerialization.jsonObject(
-            with: seedManifestData) as! [String: Any]
-        let seedBundleSHA = seedManifest["bundle_sha256"] as! String
+        func makeCrashSnapshot(
+            taskRoot: URL
+        ) throws -> SessionSnapshotTransaction.SessionSnapshot {
+            try SessionSnapshotTransaction.snapshot(
+                finalizedSession: session,
+                sourceDatabase: seedRequest.sourceDatabase,
+                taskRoot: taskRoot,
+                eligibility: SessionSnapshotTransaction.Eligibility(
+                    priorMapID: maps[0].priorMapID,
+                    priorMapSHA256: maps[0].packageSHA256,
+                    storeID: "s1",
+                    floorID: "1",
+                    appGitSHA: "e2e"))
+        }
 
         // Every durable stage of the pipeline (spec §15 stage list),
         // snapshotting included (snapshot completed, crash before the
@@ -7577,23 +9878,466 @@ do {
             .buildingTrajectory, .resolvingTags,
             .buildingWorkbook, .validatingResult, .committingResult,
         ]
+        func advanceCrashFixture(
+            taskRoot: URL,
+            to target: PersistentTaskCoordinator.TaskState,
+            checkpoint: [String: Any]
+        ) throws {
+            let fastRoute: [PersistentTaskCoordinator.TaskState] = [
+                .snapshotting, .fastOptimizing, .fastQualityCheck,
+                .buildingTrajectory, .resolvingTags, .buildingWorkbook,
+                .validatingResult, .committingResult,
+            ]
+            let deepRoute: [PersistentTaskCoordinator.TaskState] = [
+                .snapshotting, .fastOptimizing, .fastQualityCheck,
+                .deepReprocessing, .deepOptimizing,
+                .buildingTrajectory, .resolvingTags, .buildingWorkbook,
+                .validatingResult, .committingResult,
+            ]
+            let route = target == .deepReprocessing || target == .deepOptimizing
+                ? deepRoute : fastRoute
+            guard let targetIndex = route.firstIndex(of: target) else {
+                fatalError("unsupported crash fixture target: \(target.rawValue)")
+            }
+            for state in route[...targetIndex] {
+                try PersistentTaskCoordinator.updateState(
+                    state, taskRoot: taskRoot, progress: 0.5,
+                    checkpoint: checkpoint)
+            }
+        }
+
+        // Recovery must explicitly clear the diagnostic attached to an
+        // interrupted/resource-pause terminal generation. nil keeps its
+        // historical "preserve" meaning for ordinary updates; clearError
+        // is used at recovery reentry and completed transitions.
+        for (taskID, oldReason) in [
+            ("clear-interrupted-error", "system_interrupted"),
+            ("clear-resource-pause-error", "resource_pause"),
+        ] {
+            let taskRoot = try MobileProcessingTaskStore.createTask(taskID: taskID)
+            _ = try PersistentTaskCoordinator.updateState(
+                .interrupted, taskRoot: taskRoot, error: oldReason)
+            _ = try PersistentTaskCoordinator.updateState(
+                .snapshotting,
+                taskRoot: taskRoot,
+                clearError: true,
+                allowRecoveryReentry: true)
+            let successRoute: [PersistentTaskCoordinator.TaskState] = [
+                .fastOptimizing, .fastQualityCheck, .buildingTrajectory,
+                .resolvingTags, .buildingWorkbook, .validatingResult,
+                .committingResult,
+            ]
+            for state in successRoute {
+                _ = try PersistentTaskCoordinator.updateState(
+                    state, taskRoot: taskRoot)
+            }
+            _ = try PersistentTaskCoordinator.updateState(
+                .completed,
+                taskRoot: taskRoot,
+                progress: 1.0,
+                clearError: true)
+            let completed = try PersistentTaskCoordinator.read(taskRoot: taskRoot)
+            require(completed.state == .completed && completed.error == nil,
+                "RC recovery \(oldReason) must not leak stale error into completed")
+        }
+
+        // RC committed-result transaction blocker: once the immutable
+        // result receipt/final rename is visible, neither a result-commit
+        // post-rename fault nor any completed task-writer boundary may
+        // demote the task to generic failed or trigger a duplicate export.
+        struct InjectedCommittedResultFault: Error {
+            let label: String
+        }
+        func exactCommittedEntry(
+            taskRoot: URL
+        ) throws -> MobileResultLibrary.ResultEntry {
+            let record = try PersistentTaskCoordinator.read(taskRoot: taskRoot)
+            let expected = try PersistentTaskCheckpoint
+                .expectedCommittedResultIDs(
+                    in: record.checkpoint, taskID: record.taskID)
+            guard let entry = try MobileResultLibrary.committedResult(
+                    taskID: record.taskID,
+                    expectedResultIDs: expected) else {
+                throw InjectedCommittedResultFault(
+                    label: "missing committed result for \(record.taskID)")
+            }
+            return entry
+        }
+        func requireImmutableCommittedResult(
+            _ entry: MobileResultLibrary.ResultEntry,
+            label: String
+        ) throws {
+            let directoryMode = (try FileManager.default.attributesOfItem(
+                atPath: entry.directory.path)[.posixPermissions] as? NSNumber)?.intValue
+            let receiptMode = (try FileManager.default.attributesOfItem(
+                atPath: entry.directory.appendingPathComponent(
+                    MobileResultLibrary.commitReceiptFileName).path)[
+                        .posixPermissions] as? NSNumber)?.intValue
+            require(directoryMode == 0o555,
+                "\(label) committed result root must remain 0555")
+            require(receiptMode == 0o444,
+                "\(label) committed receipt must remain 0444")
+        }
+
+        let postRenameCommitStages: [MobileResultLibrary.CommitStage] = [
+            .afterRename, .afterParentFsync,
+        ]
+        for commitStage in postRenameCommitStages {
+            let taskID = "result-commit-fault-\(commitStage.rawValue)"
+            let taskRoot = try MobileProcessingTaskStore.createTask(taskID: taskID)
+            var request = seedRequest
+            request.taskRoot = taskRoot
+            MobileResultLibrary.commitFaultInjector = { stage in
+                if stage == commitStage {
+                    throw InjectedCommittedResultFault(label: stage.rawValue)
+                }
+            }
+            var faultOutcome: MobileProcessingPipeline.Outcome?
+            do {
+                faultOutcome = try MobileProcessingPipeline.run(
+                    request: request,
+                    progress: { _, _ in },
+                    isCancelled: { false })
+            } catch {
+                MobileResultLibrary.commitFaultInjector = nil
+                require(false,
+                    "RC committed result \(commitStage.rawValue) must reconcile, got \(error)")
+            }
+            MobileResultLibrary.commitFaultInjector = nil
+            let record = try PersistentTaskCoordinator.read(taskRoot: taskRoot)
+            require(record.state == .completed,
+                "RC committed result \(commitStage.rawValue) must finish completed")
+            require(record.error == nil,
+                "RC committed result \(commitStage.rawValue) must clear stale error")
+            let terminalIntent = try MobileTerminalStatePersistence
+                .readIntentIfPresent(taskRoot: taskRoot)
+            require(
+                terminalIntent == nil,
+                "RC committed result \(commitStage.rawValue) must not create failed intent")
+            let committedEntry = try exactCommittedEntry(taskRoot: taskRoot)
+            require(
+                faultOutcome?.resultEntry.resultID == committedEntry.resultID,
+                "RC committed result \(commitStage.rawValue) must return the one visible result")
+            try requireImmutableCommittedResult(
+                committedEntry, label: commitStage.rawValue)
+        }
+
+        let completedWriteStages: [PersistentTaskCoordinator.WriteStage] = [
+            .beforeTemporaryWrite, .afterTemporaryFsync,
+            .afterRename, .afterParentFsync,
+        ]
+        for writeStage in completedWriteStages {
+            let taskID = "completed-write-fault-\(writeStage.rawValue)"
+            let taskRoot = try MobileProcessingTaskStore.createTask(taskID: taskID)
+            var request = seedRequest
+            request.taskRoot = taskRoot
+            // Install the task writer fault only after the result's parent
+            // fsync. Earlier task transitions therefore remain real
+            // production writes; only the completed boundary is injected.
+            MobileResultLibrary.commitFaultInjector = { stage in
+                if stage == .afterParentFsync {
+                    PersistentTaskCoordinator.writeFaultInjector = { actual in
+                        if actual == writeStage {
+                            throw InjectedCommittedResultFault(
+                                label: "completed-\(actual.rawValue)")
+                        }
+                    }
+                }
+            }
+            var firstOutcome: MobileProcessingPipeline.Outcome?
+            var firstError: Error?
+            do {
+                firstOutcome = try MobileProcessingPipeline.run(
+                    request: request,
+                    progress: { _, _ in },
+                    isCancelled: { false })
+            } catch {
+                firstError = error
+            }
+            MobileResultLibrary.commitFaultInjector = nil
+            PersistentTaskCoordinator.writeFaultInjector = nil
+
+            var record = try PersistentTaskCoordinator.read(taskRoot: taskRoot)
+            let firstCommitted = try exactCommittedEntry(taskRoot: taskRoot)
+            try requireImmutableCommittedResult(
+                firstCommitted, label: "completed-\(writeStage.rawValue)")
+            let terminalIntent = try MobileTerminalStatePersistence
+                .readIntentIfPresent(taskRoot: taskRoot)
+            require(
+                terminalIntent == nil,
+                "RC completed \(writeStage.rawValue) must not create failed intent")
+
+            switch writeStage {
+            case .beforeTemporaryWrite, .afterTemporaryFsync:
+                require(firstOutcome == nil && firstError != nil,
+                    "RC completed \(writeStage.rawValue) pre-rename fault must surface")
+                require(record.state == .committingResult,
+                    "RC completed \(writeStage.rawValue) must preserve committing_result")
+                let recovered = try MobileProcessingPipeline.run(
+                    request: request,
+                    progress: { _, _ in },
+                    isCancelled: { false })
+                record = try PersistentTaskCoordinator.read(taskRoot: taskRoot)
+                require(record.state == .completed,
+                    "RC completed \(writeStage.rawValue) restart must reconcile completed")
+                require(record.error == nil,
+                    "RC completed \(writeStage.rawValue) restart must clear stale error")
+                require(recovered.resultEntry.resultID == firstCommitted.resultID,
+                    "RC completed \(writeStage.rawValue) restart must not duplicate export")
+            case .afterRename, .afterParentFsync:
+                require(firstError == nil && firstOutcome != nil,
+                    "RC completed \(writeStage.rawValue) must accept exact durable reread")
+                require(record.state == .completed,
+                    "RC completed \(writeStage.rawValue) must remain completed")
+                require(record.error == nil,
+                    "RC completed \(writeStage.rawValue) must not retain stale error")
+                require(firstOutcome?.resultEntry.resultID == firstCommitted.resultID,
+                    "RC completed \(writeStage.rawValue) must return exact committed result")
+            }
+            let finalCommitted = try exactCommittedEntry(taskRoot: taskRoot)
+            require(finalCommitted.resultID == firstCommitted.resultID,
+                "RC completed \(writeStage.rawValue) must keep exactly one result")
+        }
+
+        // Fail-closed negative fixtures: an expected result with a
+        // conflicting receipt and two valid results claiming one task are
+        // never treated as "no result", never resumed, and never demoted
+        // to generic failed.
+        func commitRecoveryFixture(
+            taskID: String,
+            resultIDs: [String]
+        ) throws -> (MobileProcessingPipeline.Request, URL, [MobileResultLibrary.ResultEntry]) {
+            let taskRoot = try MobileProcessingTaskStore.createTask(taskID: taskID)
+            var request = seedRequest
+            request.taskRoot = taskRoot
+            let snapshot = try makeCrashSnapshot(taskRoot: taskRoot)
+            let primaryResultID = resultIDs[0]
+            var checkpoint = PersistentTaskCheckpoint.snapshotCheckpoint(
+                request: request,
+                snapshot: snapshot,
+                retryCount: 1,
+                processingPath: "fast")
+            checkpoint = PersistentTaskCheckpoint.withDurableOutputs(
+                [PersistentTaskCheckpoint.taskReference("input_snapshot"),
+                 PersistentTaskCheckpoint.taskReference("input_manifest.json"),
+                 PersistentTaskCheckpoint.resultStagingReference(
+                    taskID: taskID,
+                    resultID: primaryResultID,
+                    relativePath: "payload.json")],
+                in: checkpoint)
+            try advanceCrashFixture(
+                taskRoot: taskRoot,
+                to: .committingResult,
+                checkpoint: checkpoint)
+            var entries: [MobileResultLibrary.ResultEntry] = []
+            for resultID in resultIDs {
+                let staging = try MobileResultLibrary.stagingDirectory(
+                    taskID: taskID, resultID: resultID)
+                try Data("{}".utf8).write(
+                    to: staging.appendingPathComponent("payload.json"))
+                let workbookName = "\(resultID).xlsx"
+                try Data("fixture".utf8).write(
+                    to: staging.appendingPathComponent(workbookName))
+                entries.append(try MobileResultLibrary.commit(
+                    resultID: resultID,
+                    taskID: taskID,
+                    stagingDirectory: staging,
+                    packageFiles: ["payload.json"],
+                    workbookFilename: workbookName,
+                    manifestExtras: [
+                        "store_id": request.storeID,
+                        "prior_map_id": request.priorMap.priorMapID,
+                        "prior_map_sha256": request.priorMap.packageSHA256,
+                        "tracking_session_id": request.trackingSessionID,
+                        "source_database": request.sourceDatabase.lastPathComponent,
+                        "input_bundle_sha256": snapshot.bundleSHA256,
+                        "native_core_sha256": request.nativeCoreSHA256,
+                        "processing_path": "fast",
+                        "policy_sha": request.policySHA,
+                        "projection_policy_version": 1,
+                        "trajectory_sha256": String(repeating: "1", count: 64),
+                        "graph_quality_sha256": String(repeating: "2", count: 64),
+                        "device_position_count": 1,
+                        "available_position_count": 1,
+                        "tag_count": 0,
+                        "rescan_count": 0,
+                    ]))
+            }
+            return (request, taskRoot, entries)
+        }
+
+        let receiptFixture = try commitRecoveryFixture(
+            taskID: "committed-receipt-conflict",
+            resultIDs: ["result-receipt-conflict"])
+        let badReceiptURL = receiptFixture.2[0].directory
+            .appendingPathComponent(MobileResultLibrary.commitReceiptFileName)
+        var badReceipt = try JSONSerialization.jsonObject(
+            with: Data(contentsOf: badReceiptURL)) as! [String: Any]
+        badReceipt["manifest_sha256"] = String(repeating: "0", count: 64)
+        require(chmod(badReceiptURL.path, 0o644) == 0,
+            "RC receipt conflict fixture must unlock receipt")
+        try CanonicalJSONEncoder.encode(badReceipt).write(to: badReceiptURL)
+        require(chmod(badReceiptURL.path, 0o444) == 0,
+            "RC receipt conflict fixture must refreeze receipt")
+        do {
+            _ = try PersistentTaskCheckpoint.recover(
+                taskRoot: receiptFixture.1,
+                request: receiptFixture.0)
+            require(false, "RC conflicting commit receipt must fail closed")
+        } catch {
+            let record = try PersistentTaskCoordinator.read(
+                taskRoot: receiptFixture.1)
+            require(record.state == .committingResult,
+                "RC conflicting receipt must preserve committing_result")
+        }
+
+        let multipleFixture = try commitRecoveryFixture(
+            taskID: "committed-multiple-results",
+            resultIDs: ["result-multiple-a", "result-multiple-b"])
+        do {
+            _ = try PersistentTaskCheckpoint.recover(
+                taskRoot: multipleFixture.1,
+                request: multipleFixture.0)
+            require(false, "RC multiple committed results must fail closed")
+        } catch {
+            let record = try PersistentTaskCoordinator.read(
+                taskRoot: multipleFixture.1)
+            require(record.state == .committingResult,
+                "RC multiple results must preserve committing_result")
+        }
+        print(
+            "RC committed-result recovery passed: result-faults=2 completed-writer=4 fail-closed=2")
+
+        // RC orphan terminal-intent bootstrap blocker: an existing task
+        // directory without task.json must never let a later run replace a
+        // durable terminal marker. Early business gates now run only after a
+        // real task record exists, so they can be terminalized exactly.
+        let orphanTaskID = "orphan-terminal-intent"
+        let orphanRoot = try MobileProcessingTaskStore.taskRoot(
+            taskID: orphanTaskID)
+        try FileManager.default.createDirectory(
+            at: orphanRoot, withIntermediateDirectories: true)
+        let orphanBusinessError = MobileOnlyWorkflowError.invalidState(
+            "orphan intent fixture")
+        do {
+            try MobileTerminalStatePersistence.persistThenRethrow(
+                orphanBusinessError, taskRoot: orphanRoot)
+            require(false, "orphan intent fixture must fail task persistence")
+        } catch let failure as MobileTerminalStatePersistence.DurabilityFailure {
+            require(
+                failure.phase == .persistTaskState,
+                "orphan intent must fail only after its marker is durable")
+        }
+        let orphanIntent = try MobileTerminalStatePersistence
+            .readIntentIfPresent(taskRoot: orphanRoot)
+        require(
+            !FileManager.default.fileExists(
+                atPath: PersistentTaskCoordinator.taskFileURL(
+                    taskRoot: orphanRoot).path)
+                && orphanIntent != nil,
+            "orphan fixture must contain intent and no task.json")
+        do {
+            _ = try MobileProcessingTaskStore.createTask(taskID: orphanTaskID)
+            require(false, "createTask must not replace an orphan intent")
+        } catch let error as MobileProcessingTaskStore.StoreError {
+            if case .invalidTask = error {} else {
+                require(false, "orphan createTask returned wrong store error")
+            }
+        }
+        var orphanRequest = seedRequest
+        orphanRequest.taskRoot = orphanRoot
+        do {
+            _ = try MobileProcessingPipeline.run(
+                request: orphanRequest,
+                progress: { _, _ in },
+                isCancelled: { false })
+            require(false, "pipeline must not replace an orphan intent")
+        } catch let error as PersistentTaskCheckpoint.CheckpointError {
+            if case .invalidRecord(let detail) = error {
+                require(
+                    detail.contains("intent") && detail.contains("task.json"),
+                    "orphan checkpoint error must identify the conflict")
+            } else {
+                require(false, "orphan pipeline returned wrong checkpoint error")
+            }
+        }
+        let retainedOrphanIntent = try MobileTerminalStatePersistence
+            .readIntentIfPresent(taskRoot: orphanRoot)
+        require(
+            !FileManager.default.fileExists(
+                atPath: PersistentTaskCoordinator.taskFileURL(
+                    taskRoot: orphanRoot).path)
+                && retainedOrphanIntent != nil,
+            "failed orphan restart must preserve the exact audit marker")
+
+        let nonemptyTaskID = "missing-task-record-nonempty"
+        let nonemptyRoot = try MobileProcessingTaskStore.taskRoot(
+            taskID: nonemptyTaskID)
+        try FileManager.default.createDirectory(
+            at: nonemptyRoot, withIntermediateDirectories: true)
+        try Data("unexpected".utf8).write(
+            to: nonemptyRoot.appendingPathComponent("unexpected.bin"))
+        do {
+            _ = try MobileProcessingTaskStore.createTask(taskID: nonemptyTaskID)
+            require(false, "non-empty task directory without task.json must reject")
+        } catch let error as MobileProcessingTaskStore.StoreError {
+            if case .invalidTask = error {} else {
+                require(false, "non-empty task directory returned wrong error")
+            }
+        }
+
+        let repairedTaskID = "empty-create-residue"
+        let repairedRoot = try MobileProcessingTaskStore.taskRoot(
+            taskID: repairedTaskID)
+        try FileManager.default.createDirectory(
+            at: repairedRoot, withIntermediateDirectories: true)
+        _ = try MobileProcessingTaskStore.createTask(taskID: repairedTaskID)
+        let repairedRecord = try PersistentTaskCoordinator.read(
+            taskRoot: repairedRoot)
+        require(
+            repairedRecord.taskID == repairedTaskID
+                && repairedRecord.state == .created,
+            "empty mkdir residue must be repaired with an exact created record")
+
+        let earlyGateTaskID = "early-build-identity-gate"
+        let earlyGateRoot = try MobileProcessingTaskStore.taskRoot(
+            taskID: earlyGateTaskID)
+        var earlyGateRequest = seedRequest
+        earlyGateRequest.taskRoot = earlyGateRoot
+        earlyGateRequest.appGitSHA = "unknown"
+        do {
+            _ = try MobileProcessingPipeline.run(
+                request: earlyGateRequest,
+                progress: { _, _ in },
+                isCancelled: { false })
+            require(false, "unknown build identity must reject")
+        } catch let error as MobileOnlyWorkflowError {
+            if case .invalidState(let detail) = error {
+                require(
+                    detail.contains("build identity"),
+                    "early gate returned wrong invalid-state detail")
+            } else {
+                require(false, "early build gate returned wrong workflow error")
+            }
+        }
+        let earlyGateRecord = try PersistentTaskCoordinator.read(
+            taskRoot: earlyGateRoot)
+        let earlyGateIntent = try MobileTerminalStatePersistence
+            .readIntentIfPresent(taskRoot: earlyGateRoot)
+        require(
+            earlyGateRecord.state == .failed
+                && earlyGateRecord.error?.contains("build identity") == true
+                && earlyGateIntent == nil,
+            "early business gate must durably commit failed task without orphan intent")
+        print("RC task bootstrap/orphan-intent recovery passed")
+
         var crashRequests: [MobileProcessingPipeline.Request] = []
         for stage in stages {
             let taskID = "crash-\(stage.rawValue)"
             let taskRoot = try MobileProcessingTaskStore.createTask(taskID: taskID)
-            try FileManager.default.copyItem(
-                at: seedRoot.appendingPathComponent("input_snapshot"),
-                to: taskRoot.appendingPathComponent("input_snapshot"))
-            try FileManager.default.copyItem(
-                at: seedRoot.appendingPathComponent("input_manifest.json"),
-                to: taskRoot.appendingPathComponent("input_manifest.json"))
             var request = seedRequest
             request.taskRoot = taskRoot
-            let snapshot = SessionSnapshotTransaction.SessionSnapshot(
-                taskID: taskID,
-                snapshotDirectory: taskRoot.appendingPathComponent("input_snapshot"),
-                inputManifest: seedManifest,
-                bundleSHA256: seedBundleSHA)
+            let snapshot = try makeCrashSnapshot(taskRoot: taskRoot)
             var checkpoint = PersistentTaskCheckpoint.snapshotCheckpoint(
                 request: request, snapshot: snapshot, retryCount: 1)
             checkpoint = PersistentTaskCheckpoint.withProcessingPath(
@@ -7601,27 +10345,24 @@ do {
             // The result-stage checkpoints bind the staged result
             // artifacts too (they are durable at that point).
             if stage == .validatingResult || stage == .committingResult {
+                let stagedResultID = "result-crash"
                 checkpoint = PersistentTaskCheckpoint.withDurableOutputs(
-                    [taskRoot.appendingPathComponent("input_snapshot").path,
-                     taskRoot.appendingPathComponent("input_manifest.json").path,
-                     crashResultsRoot
-                        .appendingPathComponent("staging", isDirectory: true)
-                        .appendingPathComponent(taskID, isDirectory: true)
-                        .appendingPathComponent("result-crash.xlsx").path],
+                    [PersistentTaskCheckpoint.taskReference("input_snapshot"),
+                     PersistentTaskCheckpoint.taskReference("input_manifest.json"),
+                     PersistentTaskCheckpoint.resultStagingReference(
+                        taskID: taskID,
+                        resultID: stagedResultID,
+                        relativePath: "result-crash.xlsx")],
                     in: checkpoint)
                 // The staged workbook must exist: the checkpoint claims
                 // the result artifacts are durable.
-                let stagedWorkbook = crashResultsRoot
-                    .appendingPathComponent("staging", isDirectory: true)
-                    .appendingPathComponent(taskID, isDirectory: true)
-                try FileManager.default.createDirectory(
-                    at: stagedWorkbook, withIntermediateDirectories: true)
+                let stagedWorkbook = try MobileResultLibrary.stagingDirectory(
+                    taskID: taskID, resultID: stagedResultID)
                 try Data("crash-stage".utf8).write(
                     to: stagedWorkbook.appendingPathComponent("result-crash.xlsx"))
             }
-            try PersistentTaskCoordinator.updateState(
-                stage, taskRoot: taskRoot, progress: 0.5,
-                checkpoint: checkpoint)
+            try advanceCrashFixture(
+                taskRoot: taskRoot, to: stage, checkpoint: checkpoint)
             crashRequests.append(request)
         }
 
@@ -7636,6 +10377,20 @@ do {
         require(
             freshRecord.state == .completed,
             "§15 a created task without checkpoint must run from scratch")
+
+        // Prepare the negative recovery fixtures while the mutable source
+        // still exists. Each snapshot is generated for its own task ID;
+        // after the source is deleted the tests exercise only checkpoint
+        // validation and immutable-snapshot recovery.
+        let mismatchRoot = try MobileProcessingTaskStore.createTask(
+            taskID: "crash-identity")
+        let mismatchSnapshot = try makeCrashSnapshot(taskRoot: mismatchRoot)
+        let refRoot = try MobileProcessingTaskStore.createTask(
+            taskID: "crash-ref-missing")
+        let refSnapshot = try makeCrashSnapshot(taskRoot: refRoot)
+        let persistRoot = try MobileProcessingTaskStore.createTask(
+            taskID: "crash-persist")
+        let persistSnapshot = try makeCrashSnapshot(taskRoot: persistRoot)
 
         // Delete the source session: every resume below must succeed
         // WITHOUT re-reading the mutable source database.
@@ -7678,18 +10433,6 @@ do {
 
         // Identity mismatch is fail-closed: the checkpoint binds the
         // map/app/native/policy identity of the original run.
-        let mismatchRoot = try MobileProcessingTaskStore.createTask(taskID: "crash-identity")
-        try FileManager.default.copyItem(
-            at: seedRoot.appendingPathComponent("input_snapshot"),
-            to: mismatchRoot.appendingPathComponent("input_snapshot"))
-        try FileManager.default.copyItem(
-            at: seedRoot.appendingPathComponent("input_manifest.json"),
-            to: mismatchRoot.appendingPathComponent("input_manifest.json"))
-        let mismatchSnapshot = SessionSnapshotTransaction.SessionSnapshot(
-            taskID: "crash-identity",
-            snapshotDirectory: mismatchRoot.appendingPathComponent("input_snapshot"),
-            inputManifest: seedManifest,
-            bundleSHA256: seedBundleSHA)
         var mismatchRequest = seedRequest
         mismatchRequest.taskRoot = mismatchRoot
         var mismatchCheckpoint = PersistentTaskCheckpoint.snapshotCheckpoint(
@@ -7699,8 +10442,8 @@ do {
             "prior_map_sha256": "deadbeef",
             "canonical_source_sha256": "cafe",
         ]
-        try PersistentTaskCoordinator.updateState(
-            .fastOptimizing, taskRoot: mismatchRoot,
+        try advanceCrashFixture(
+            taskRoot: mismatchRoot, to: .fastOptimizing,
             checkpoint: mismatchCheckpoint)
         do {
             _ = try MobileProcessingPipeline.run(
@@ -7713,26 +10456,14 @@ do {
         }
 
         // A missing durable reference fails recovery (fail closed).
-        let refRoot = try MobileProcessingTaskStore.createTask(taskID: "crash-ref-missing")
-        try FileManager.default.copyItem(
-            at: seedRoot.appendingPathComponent("input_snapshot"),
-            to: refRoot.appendingPathComponent("input_snapshot"))
-        try FileManager.default.copyItem(
-            at: seedRoot.appendingPathComponent("input_manifest.json"),
-            to: refRoot.appendingPathComponent("input_manifest.json"))
-        let refSnapshot = SessionSnapshotTransaction.SessionSnapshot(
-            taskID: "crash-ref-missing",
-            snapshotDirectory: refRoot.appendingPathComponent("input_snapshot"),
-            inputManifest: seedManifest,
-            bundleSHA256: seedBundleSHA)
         var refRequest = seedRequest
         refRequest.taskRoot = refRoot
         var refCheckpoint = PersistentTaskCheckpoint.snapshotCheckpoint(
             request: refRequest, snapshot: refSnapshot, retryCount: 1)
-        refCheckpoint["snapshot_path"] = refRoot
-            .appendingPathComponent("input_snapshot_does_not_exist").path
-        try PersistentTaskCoordinator.updateState(
-            .fastOptimizing, taskRoot: refRoot, checkpoint: refCheckpoint)
+        refCheckpoint["snapshot_path"] = "input_snapshot_does_not_exist"
+        try advanceCrashFixture(
+            taskRoot: refRoot, to: .fastOptimizing,
+            checkpoint: refCheckpoint)
         do {
             _ = try MobileProcessingPipeline.run(
                 request: refRequest, progress: { _, _ in }, isCancelled: { false })
@@ -7746,22 +10477,10 @@ do {
         // Persist failure must block stage progress: with the task
         // directory read-only, the resume's updateState cannot write
         // task.json and the run must stop.
-        let persistRoot = try MobileProcessingTaskStore.createTask(taskID: "crash-persist")
-        try FileManager.default.copyItem(
-            at: seedRoot.appendingPathComponent("input_snapshot"),
-            to: persistRoot.appendingPathComponent("input_snapshot"))
-        try FileManager.default.copyItem(
-            at: seedRoot.appendingPathComponent("input_manifest.json"),
-            to: persistRoot.appendingPathComponent("input_manifest.json"))
-        let persistSnapshot = SessionSnapshotTransaction.SessionSnapshot(
-            taskID: "crash-persist",
-            snapshotDirectory: persistRoot.appendingPathComponent("input_snapshot"),
-            inputManifest: seedManifest,
-            bundleSHA256: seedBundleSHA)
         var persistRequest = seedRequest
         persistRequest.taskRoot = persistRoot
-        try PersistentTaskCoordinator.updateState(
-            .fastOptimizing, taskRoot: persistRoot,
+        try advanceCrashFixture(
+            taskRoot: persistRoot, to: .fastOptimizing,
             checkpoint: PersistentTaskCheckpoint.snapshotCheckpoint(
                 request: persistRequest, snapshot: persistSnapshot, retryCount: 1))
         require(chmod(persistRoot.path, 0o555) == 0, "§15 cannot make task root read-only")
@@ -7856,9 +10575,11 @@ do {
                 require(false, "§18 thermal rejection must be resourceRequired, got \(error)")
             }
         }
+        ProcessingResourceGovernor.endRun()
         ProcessingResourceGovernor.resetOverrides()
 
         // 5) Free disk below estimate + baseline fails closed.
+        ProcessingResourceGovernor.beginRun()
         ProcessingResourceGovernor.freeDiskOverrideBytes = 0
         do {
             try ProcessingResourceGovernor.checkBudget(
@@ -7869,9 +10590,11 @@ do {
                 require(false, "§18 disk rejection must be resourceRequired, got \(error)")
             }
         }
+        ProcessingResourceGovernor.endRun()
         ProcessingResourceGovernor.resetOverrides()
 
         // 6) Available memory below estimate + baseline fails closed.
+        ProcessingResourceGovernor.beginRun()
         ProcessingResourceGovernor.availableMemoryOverrideBytes = 0
         do {
             try ProcessingResourceGovernor.checkBudget(
@@ -7882,11 +10605,29 @@ do {
                 require(false, "§18 memory rejection must be resourceRequired, got \(error)")
             }
         }
+        ProcessingResourceGovernor.endRun()
         ProcessingResourceGovernor.resetOverrides()
 
-        // 7) RSS headroom: current footprint + task estimate must fit
+        // 7) A missing available-memory measurement is fail-closed on
+        //    device; the host injects the same production outcome.
+        ProcessingResourceGovernor.beginRun()
+        ProcessingResourceGovernor.availableMemoryMeasurementFailureOverride = true
+        do {
+            try ProcessingResourceGovernor.checkBudget(
+                stage: "trajectory", estimate: stageEstimate)
+            require(false, "§18 unavailable memory measurement must fail closed")
+        } catch let error as MobileOnlyWorkflowError {
+            if case .resourceRequired = error {} else {
+                require(false, "§18 measurement failure must be resourceRequired")
+            }
+        }
+        ProcessingResourceGovernor.endRun()
+        ProcessingResourceGovernor.resetOverrides()
+
+        // 8) RSS headroom: current footprint + task estimate must fit
         //    the device-class ceiling. A 512 MB low-class device cannot
         //    take a 1 GB estimate.
+        ProcessingResourceGovernor.beginRun()
         ProcessingResourceGovernor.physicalMemoryOverrideBytes = 512 * 1024 * 1024
         var hugeEstimate = ProcessingResourceGovernor.TaskEstimate()
         hugeEstimate.snapshotBytes = 1024 * 1024 * 1024
@@ -7899,17 +10640,39 @@ do {
                 require(false, "§18 headroom rejection must be resourceRequired, got \(error)")
             }
         }
+        ProcessingResourceGovernor.endRun()
         ProcessingResourceGovernor.resetOverrides()
 
-        // 8) Continuous sampling: serious thermal samples are counted
-        //    against the run, beginRun resets them, and the peak RSS
-        //    counter stays monotonic within the run.
+        // 9) The 250 ms timer catches pressure inside a long stage. Even
+        //    if the thermal state later recovers, the next budget boundary
+        //    must reject that interrupted run.
+        ProcessingResourceGovernor.beginRun()
+        ProcessingResourceGovernor.thermalStateOverride = .serious
+        Thread.sleep(forTimeInterval: 0.35)
+        ProcessingResourceGovernor.thermalStateOverride = nil
+        require(
+            ProcessingResourceGovernor.runSeriousOrCriticalThermalSampleCount() >= 1,
+            "§18 periodic sampler must observe serious thermal pressure")
+        do {
+            try ProcessingResourceGovernor.checkBudget(
+                stage: "result_commit", estimate: stageEstimate)
+            require(false, "§18 recovered thermal interruption must still block publish")
+        } catch let error as MobileOnlyWorkflowError {
+            if case .resourceRequired = error {} else {
+                require(false, "§18 sampled thermal history must be resourceRequired")
+            }
+        }
+        ProcessingResourceGovernor.endRun()
+        ProcessingResourceGovernor.resetOverrides()
+
+        // 10) Manual samples remain exact lower-bound evidence, beginRun
+        //     resets counters, and peak RSS is monotonic within one run.
         ProcessingResourceGovernor.beginRun()
         ProcessingResourceGovernor.thermalStateOverride = .serious
         ProcessingResourceGovernor.sampleRunDiagnostics()
         ProcessingResourceGovernor.sampleRunDiagnostics()
         require(
-            ProcessingResourceGovernor.runSeriousOrCriticalThermalSampleCount() == 2,
+            ProcessingResourceGovernor.runSeriousOrCriticalThermalSampleCount() >= 2,
             "§18 serious thermal samples must be counted per run")
         let peakAfterThermal = ProcessingResourceGovernor.runPeakMemoryFootprintMB()
         require(peakAfterThermal > 0,
@@ -7922,10 +10685,12 @@ do {
         require(
             ProcessingResourceGovernor.runPeakMemoryFootprintMB() == 0,
             "§18 beginRun must reset peak RSS")
+        ProcessingResourceGovernor.endRun()
 
         print(
-            "§18 resource-governor passed: stages=7 rejections=4 thermal-samples=2")
+            "§18 resource-governor passed: stages=7 rejections=6 periodic-sampling=PASS")
     } catch {
+        ProcessingResourceGovernor.endRun()
         ProcessingResourceGovernor.resetOverrides()
         require(false, "§18 resource-governor failed: \(error)")
     }
@@ -7939,6 +10704,117 @@ catch {
     FileHandle.standardError.write(
         Data("E2E replay failed: \(error)\n".utf8))
     exit(9)
+}
+
+// RC-HIGH Map Library quarantine crash worker. The Python host launches this
+// mode as a separate process and the production fault injector calls `_exit`
+// at the three rename/fsync boundaries. A second process enters through
+// list/map/rebuild and proves startup reconciliation against the same real
+// filesystem tree.
+if CommandLine.arguments.count == 5,
+   CommandLine.arguments[1] == "--map-quarantine-crash-worker" {
+    let mapRoot = URL(
+        fileURLWithPath: CommandLine.arguments[2], isDirectory: true)
+    let phase = CommandLine.arguments[3]
+    let entry = CommandLine.arguments[4]
+    let priorMapID = "crash-recovery-map"
+    let packageSHA = String(repeating: "c", count: 64)
+    MobileMapLibrary.rootOverride = mapRoot
+    do {
+        let source = try MobileMapLibrary.packageDirectory(
+            priorMapID: priorMapID, packageSHA: packageSHA)
+        if phase != "recover" {
+            try FileManager.default.createDirectory(
+                at: source, withIntermediateDirectories: true)
+            let invalidManifest = Data("{}\n".utf8)
+            let manifestURL = source.appendingPathComponent("manifest.json")
+            try invalidManifest.write(to: manifestURL)
+            let payloadURL = source.appendingPathComponent("payload.bin")
+            try Data("crash-window-payload\n".utf8).write(to: payloadURL)
+            try MobileMapLibrary.syncFile(manifestURL)
+            try MobileMapLibrary.syncFile(payloadURL)
+            try MobileMapLibrary.syncDirectory(source)
+            try MobileMapLibrary.syncDirectory(source.deletingLastPathComponent())
+            try MobileMapLibrary.syncDirectory(try MobileMapLibrary.packagesRoot())
+
+            let registry: [String: Any] = [
+                "format": "MarketScannerMapRegistry",
+                "version": MobileMapLibrary.currentRegistryVersion,
+                "generation": 1,
+                "map_count": 1,
+                "maps": [[
+                    "prior_map_id": priorMapID,
+                    "name": "Crash Recovery Map",
+                    "package_sha256": packageSHA,
+                    "package_directory": "\(priorMapID)/\(packageSHA)",
+                    "floor_count": 1,
+                    "element_count": 0,
+                    "compiled_at_utc": 1.0,
+                    "compiler_version": "crash-fixture",
+                    "canonical_source_sha256": String(repeating: "d", count: 64),
+                ]],
+            ]
+            let registryURL = try MobileMapLibrary.registryURL()
+            try (try CanonicalJSONEncoder.encode(registry)).write(to: registryURL)
+            try MobileMapLibrary.syncFile(registryURL)
+            try MobileMapLibrary.syncDirectory(mapRoot)
+
+            MobileMapLibrary.quarantineFaultInjector = { point in
+                switch (phase, point) {
+                case ("after_payload", .afterPayloadRename): Darwin._exit(71)
+                case ("after_diagnostic", .afterDiagnosticPlacementAndFreeze):
+                    Darwin._exit(72)
+                case ("after_publish", .afterPublishRenameAndParentSync):
+                    Darwin._exit(73)
+                default: break
+                }
+            }
+            try MobileMapLibrary.rebuildRegistry()
+            FileHandle.standardError.write(
+                Data("crash worker did not reach requested fault point\n".utf8))
+            exit(18)
+        }
+
+        switch entry {
+        case "list":
+            _ = try MobileMapLibrary.listMaps()
+        case "map":
+            do {
+                _ = try MobileMapLibrary.map(
+                    priorMapID: priorMapID, packageSHA256: packageSHA)
+            } catch let error as MobileMapLibrary.LibraryError {
+                switch error {
+                case .packageMissing, .packageNotContained,
+                     .packageVerificationFailed:
+                    break
+                default:
+                    throw error
+                }
+            }
+        case "rebuild":
+            try MobileMapLibrary.rebuildRegistry()
+        default:
+            throw NSError(
+                domain: "MapQuarantineCrashWorker", code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "unknown recovery entry"])
+        }
+        // Rebuild removes the stale production registry record after the
+        // recovery entry has reconciled the hidden transaction.
+        try MobileMapLibrary.rebuildRegistry()
+        let listed = try MobileMapLibrary.listMaps()
+        let registryData = try Data(contentsOf: try MobileMapLibrary.registryURL())
+        let registry = try StrictJSONDocumentParser.object(
+            from: registryData,
+            limits: StrictJSONDocumentLimits(
+                maximumBytes: registryData.count + 1))
+        let mapCount = StrictJSONScalar.integer(registry["map_count"]) ?? -1
+        print("recovered listed=\(listed.count) registry=\(mapCount)")
+        exit(0)
+    } catch {
+        FileHandle.standardError.write(
+            Data("map quarantine crash worker failed: \(error)\n".utf8))
+        exit(19)
+    }
 }
 
 // V1R4 §14.2 Map Library CAS: the library must serialize registry
@@ -8022,6 +10898,47 @@ if CommandLine.arguments.count == 3,
             listedAfterReregister.count == 1,
             "CAS: re-registration must still list exactly one map")
 
+        // RC-B26 version policy: one map ID may retain multiple exact-SHA
+        // versions. Build a second valid package with the same frozen map
+        // identity but changed shelf content; both must remain addressable.
+        var variantSource = report.canonicalSource
+        variantSource.elements[0].code = "S1-V2"
+        let variantCompileDir = try MobileMapLibrary.stagingDirectory(
+            for: "cas-compile-variant")
+        let variantResult = try MobilePriorMapCompiler.compile(
+            canonicalSource: variantSource,
+            outputDirectory: variantCompileDir)
+        require(
+            variantResult.priorMapID == compileResult.priorMapID
+                && variantResult.packageSHA256 != compileResult.packageSHA256,
+            "RC-B26 fixture must produce same map ID with a different SHA")
+        let variantTarget = try MobileMapLibrary.packageDirectory(
+            priorMapID: variantResult.priorMapID,
+            packageSHA: variantResult.packageSHA256)
+        try FileManager.default.moveItem(
+            at: variantCompileDir, to: variantTarget)
+        _ = try MobileMapLibrary.register(
+            priorMapID: variantResult.priorMapID,
+            name: report.mapName,
+            packageSHA256: variantResult.packageSHA256,
+            packageURL: variantTarget,
+            floorCount: variantResult.floorCount,
+            elementCount: variantResult.elementCount,
+            compilerVersion: "swift-v2",
+            canonicalSourceSHA256: report.canonicalSourceSha256)
+        registryObject = try JSONSerialization.jsonObject(
+            with: Data(contentsOf: try MobileMapLibrary.registryURL()))
+            as? [String: Any]
+        let listedVersions = try MobileMapLibrary.listMaps()
+        require(
+            registryObject?["generation"] as? Int == 3
+                && (registryObject?["maps"] as? [[String: Any]])?.count == 2
+                && listedVersions.count == 2,
+            "RC-B26 same map ID must retain both exact-SHA versions")
+        _ = try MobileMapLibrary.map(
+            priorMapID: variantResult.priorMapID,
+            packageSHA256: variantResult.packageSHA256)
+
         // 2) Unsafe identities are rejected before any filesystem mutation.
         var unsafeRejected = false
         do {
@@ -8059,12 +10976,12 @@ if CommandLine.arguments.count == 3,
             atPath: target.appendingPathComponent("manifest.json").path)
         let fileMode = (fileAttributes[.posixPermissions] as? NSNumber)?.intValue ?? 0
         require(
-            fileMode & 0o444 == 0o444,
+            fileMode & 0o777 == 0o444,
             "CAS: package files must be read-only, got \(String(format: "%o", fileMode))")
         let dirAttributes = try FileManager.default.attributesOfItem(atPath: target.path)
         let dirMode = (dirAttributes[.posixPermissions] as? NSNumber)?.intValue ?? 0
         require(
-            dirMode & 0o555 == 0o555,
+            dirMode & 0o777 == 0o555,
             "CAS: package directories must be 555, got \(String(format: "%o", dirMode))")
 
         // 4) list/map re-verify; a path-escape registry record marks the
@@ -8072,7 +10989,7 @@ if CommandLine.arguments.count == 3,
         //    identity index never drops entries silently — list and map
         //    fail closed with registryCorrupt until the index is rebuilt).
         let listedBeforeEscape = try MobileMapLibrary.listMaps()
-        require(listedBeforeEscape.count == 1, "CAS: list must return the verified map")
+        require(listedBeforeEscape.count == 2, "CAS: list must return both verified versions")
         _ = try MobileMapLibrary.map(
             priorMapID: compileResult.priorMapID,
             packageSHA256: compileResult.packageSHA256)
@@ -8125,27 +11042,170 @@ if CommandLine.arguments.count == 3,
             with: Data(contentsOf: try MobileMapLibrary.registryURL())) as? [String: Any]
         let generationAfterWrites = registry?["generation"] as? Int ?? 0
         require(
-            generationAfterWrites == 4
-                && (registry?["maps"] as? [[String: Any]])?.count == 1,
+            generationAfterWrites == 5
+                && (registry?["maps"] as? [[String: Any]])?.count == 2,
             "CAS: serialized registrations must advance the generation twice "
-                + "(generation \(generationAfterWrites), expected 4)")
+                + "(generation \(generationAfterWrites), expected 5)")
         let listedAfterWrites = try MobileMapLibrary.listMaps()
         require(
-            listedAfterWrites.count == 1,
-            "CAS: post-registration list must still return the map")
+            listedAfterWrites.count == 2,
+            "CAS: post-registration list must still return both versions")
 
         // 6) rebuildRegistry derives floorCount from the REAL manifest
         //    floors and restores a corrupt index.
         try MobileMapLibrary.rebuildRegistry()
         let rebuilt = try MobileMapLibrary.listMaps()
-        require(rebuilt.count == 1, "CAS: rebuild must recover exactly one map")
+        require(rebuilt.count == 2, "CAS: rebuild must recover both SHA versions")
         require(
-            rebuilt[0].floorCount == compileResult.floorCount
-                && rebuilt[0].elementCount == compileResult.elementCount,
+            rebuilt.allSatisfy {
+                $0.floorCount == compileResult.floorCount
+                    && $0.elementCount == compileResult.elementCount
+            },
             "CAS: rebuild must derive floor/element counts from the manifest")
+
+        // RC-B27: a valid-identity directory with a digest mismatch is
+        // fully verified, rejected and moved outside packages/.
+        let invalidSHA = String(repeating: "a", count: 64)
+        let invalidPackage = try MobileMapLibrary.packageDirectory(
+            priorMapID: compileResult.priorMapID,
+            packageSHA: invalidSHA)
+        try FileManager.default.copyItem(at: target, to: invalidPackage)
+        try MobileMapLibrary.rebuildRegistry()
+        let listedAfterQuarantine = try MobileMapLibrary.listMaps()
+        require(
+            !FileManager.default.fileExists(atPath: invalidPackage.path)
+                && listedAfterQuarantine.count == 2,
+            "RC-B27 rebuild must quarantine a package whose digest mismatches its SHA path")
+        let quarantineID = try MobileMapLibrary.root()
+            .appendingPathComponent("quarantine", isDirectory: true)
+            .appendingPathComponent(compileResult.priorMapID, isDirectory: true)
+        let quarantineEntries = try FileManager.default.contentsOfDirectory(
+            atPath: quarantineID.path)
+        let quarantineEntry = quarantineEntries.first(where: {
+            $0.hasPrefix(invalidSHA + "-")
+        }) ?? ""
+        require(
+            !quarantineEntry.isEmpty,
+            "RC-B27 quarantined package must remain auditable")
+        let quarantineDirectory = quarantineID.appendingPathComponent(
+            quarantineEntry, isDirectory: true)
+        let diagnosticURL = quarantineDirectory.appendingPathComponent(
+            MobileMapLibrary.quarantineDiagnosticFileName)
+        let diagnosticData = try Data(contentsOf: diagnosticURL)
+        let diagnostic = try StrictJSONDocumentParser.object(
+            from: diagnosticData,
+            limits: StrictJSONDocumentLimits(
+                maximumBytes: diagnosticData.count + 1))
+        let sourceIdentity = diagnostic["source_identity"] as? [String: Any]
+        require(
+            diagnostic["format"] as? String
+                == "MarketScannerMapQuarantineDiagnostic"
+                && StrictJSONScalar.integer(diagnostic["version"]) == 2
+                && diagnostic["transaction_id"] as? String == quarantineEntry
+                && diagnostic["reason"] as? String
+                    == "package_validation_failed"
+                && (StrictJSONScalar.number(
+                    diagnostic["quarantined_at_unix"]) ?? 0) > 0
+                && sourceIdentity?["prior_map_id"] as? String
+                    == compileResult.priorMapID
+                && sourceIdentity?["package_sha256"] as? String == invalidSHA
+                && diagnostic["source_path"] as? String == invalidPackage.path
+                && StrictJSONScalar.integer(diagnostic["source_mode"]) != nil
+                && diagnostic["quarantine_path"] as? String
+                    == quarantineDirectory.path
+                && MobileMapLibrary.isSHA256(
+                    diagnostic["payload_tree_sha256"] as? String ?? "")
+                && !(diagnostic["validator_detail"] as? String ?? "").isEmpty,
+            "RC-B27 quarantine diagnostic must bind transaction/reason/time/"
+                + "source/path/mode/payload hash/detail")
+        let diagnosticAttributes = try FileManager.default.attributesOfItem(
+            atPath: diagnosticURL.path)
+        let diagnosticMode = (diagnosticAttributes[.posixPermissions]
+            as? NSNumber)?.intValue ?? 0
+        let quarantineAttributes = try FileManager.default.attributesOfItem(
+            atPath: quarantineDirectory.path)
+        let quarantineMode = (quarantineAttributes[.posixPermissions]
+            as? NSNumber)?.intValue ?? 0
+        require(
+            diagnosticAttributes[.type] as? FileAttributeType == .typeRegular
+                && diagnosticMode & 0o777 == 0o444
+                && quarantineMode & 0o777 == 0o555,
+            "RC-B27 quarantine diagnostic/package must be immutable")
+
+        // A diagnostic-commit failure after the payload rename must restore
+        // the exact source path and abort rebuild; it may not leave a hidden
+        // or published quarantine entry without its diagnostic.
+        enum InjectedMapQuarantineFailure: Error {
+            case afterPayloadRename
+        }
+        let rollbackSHA = String(repeating: "b", count: 64)
+        let rollbackPackage = try MobileMapLibrary.packageDirectory(
+            priorMapID: compileResult.priorMapID,
+            packageSHA: rollbackSHA)
+        try FileManager.default.copyItem(at: target, to: rollbackPackage)
+        MobileMapLibrary.quarantineFaultInjector = { point in
+            if case .afterPayloadRename = point {
+                throw InjectedMapQuarantineFailure.afterPayloadRename
+            }
+        }
+        var quarantineFailureRejected = false
+        do {
+            try MobileMapLibrary.rebuildRegistry()
+        } catch let error as MobileMapLibrary.LibraryError {
+            if case .packageVerificationFailed = error {
+                quarantineFailureRejected = true
+            }
+        }
+        MobileMapLibrary.quarantineFaultInjector = nil
+        let afterRollbackEntries = try FileManager.default.contentsOfDirectory(
+            atPath: quarantineID.path)
+        require(
+            quarantineFailureRejected
+                && FileManager.default.fileExists(atPath: rollbackPackage.path)
+                && !afterRollbackEntries.contains(where: {
+                    $0.contains(rollbackSHA)
+                }),
+            "RC-B27 quarantine diagnostic failure must rollback and fail closed")
+        try MobileMapLibrary.rebuildRegistry()
+        let afterRetryEntries = try FileManager.default.contentsOfDirectory(
+            atPath: quarantineID.path)
+        require(
+            !FileManager.default.fileExists(atPath: rollbackPackage.path)
+                && afterRetryEntries.contains(where: {
+                    $0.hasPrefix(rollbackSHA + "-")
+                }),
+            "RC-B27 retry must publish one diagnosed quarantine package")
+
+        // RC-B27: an existing registry with a missing/illegal generation
+        // is corrupt. Neither queries nor rebuild may silently overwrite
+        // it as generation zero.
+        var missingGeneration = try JSONSerialization.jsonObject(
+            with: Data(contentsOf: try MobileMapLibrary.registryURL()))
+            as! [String: Any]
+        missingGeneration.removeValue(forKey: "generation")
+        try (try CanonicalJSONEncoder.encode(missingGeneration)).write(
+            to: try MobileMapLibrary.registryURL())
+        var missingGenerationRejected = false
+        do {
+            _ = try MobileMapLibrary.listMaps()
+        } catch let error as MobileMapLibrary.LibraryError {
+            if case .registryCorrupt = error { missingGenerationRejected = true }
+        }
+        require(
+            missingGenerationRejected,
+            "RC-B27 missing registry generation must be registryCorrupt")
+        var rebuildGenerationRejected = false
+        do {
+            try MobileMapLibrary.rebuildRegistry()
+        } catch let error as MobileMapLibrary.LibraryError {
+            if case .registryCorrupt = error { rebuildGenerationRejected = true }
+        }
+        require(
+            rebuildGenerationRejected,
+            "RC-B27 rebuild must not overwrite an illegal generation")
         print(
             "map library CAS passed: generation CAS, immutable packages, "
-                + "safe identity, containment, re-verification, serialized writes")
+                + "multi-SHA identity, full rebuild verification and quarantine")
     }
     catch {
         FileHandle.standardError.write(
@@ -8191,7 +11251,7 @@ do {
     let validConstraint: [String: Any] = [
         "format": "MarketScannerLocalizationConstraint",
         "version": 1,
-        "timestamp": 990.0,
+        "timestamp": 992.0,
         "nodeTimebaseTimestamp": 1002.0,
         "nodeTimebaseOffsetSeconds": 10.0,
         "trackingSessionId": session,
@@ -8216,6 +11276,7 @@ do {
     for index in 0..<3 {
         var record = validConstraint
         record["nodeTimebaseTimestamp"] = 1002.0 + Double(index)
+        record["timestamp"] = 992.0 + Double(index)
         record["estimatedPose"] = [
             "x_m": Double(index + 1), "y_m": 0.0, "yaw_rad": 0.0,
         ]
@@ -8227,7 +11288,13 @@ do {
         return try jsonLine(record)
     }
     constraintLines.append(try constraint(["priorMapId": "OTHER"]))
-    constraintLines.append(try constraint(["accepted": false]))
+    constraintLines.append(try constraint([
+        "accepted": false,
+        "measurementAccepted": false,
+        "correctionStepApplied": false,
+        "confidenceAccepted": false,
+        "disposition": "rejected",
+    ]))
     constraintLines.append(try constraint(["uniqueness": 1.5]))
     constraintLines.append(try constraint(["disposition": "rejected"]))
     constraintLines.append(try constraint([
@@ -8247,9 +11314,9 @@ do {
     let validManual: [String: Any] = [
         "format": "MarketScannerManualLocalizationEvent",
         "version": 3,
-        "wall_clock_timestamp": "2026-08-06T10:00:00+00:00",
-        "wall_clock_timestamp_unix": 1775000000.0,
-        "frame_timestamp": 990.0,
+        "wall_clock_timestamp": "2027-01-15T08:00:00.000Z",
+        "wall_clock_timestamp_unix": 1800000000.0,
+        "frame_timestamp": 991.0,
         "node_timebase_frame_timestamp": 1001.0,
         "node_timebase_offset_seconds": 10.0,
         "nearest_node_id": 1,
@@ -8277,7 +11344,7 @@ do {
     // Stale alignment watermark (same version again).
     manualLines.append(try manual([
         "nearest_node_id": 2, "nearest_node_stamp": 1002.0,
-        "node_timebase_frame_timestamp": 1002.0,
+        "frame_timestamp": 992.0, "node_timebase_frame_timestamp": 1002.0,
     ]))
     // Unmatched binding status.
     manualLines.append(try manual([
@@ -8287,13 +11354,15 @@ do {
     // Node id not present in the inventory.
     manualLines.append(try manual([
         "alignment_version": 5, "nearest_node_id": 99,
-        "nearest_node_stamp": 1099.0, "node_timebase_frame_timestamp": 1099.0,
+        "nearest_node_stamp": 1099.0, "frame_timestamp": 1089.0,
+        "node_timebase_frame_timestamp": 1099.0,
         "node_time_delta_seconds": 0.0,
     ]))
     // Node stamp mismatch.
     manualLines.append(try manual([
         "alignment_version": 6, "nearest_node_id": 2,
-        "nearest_node_stamp": 9999.0, "node_timebase_frame_timestamp": 1002.0,
+        "nearest_node_stamp": 9999.0, "frame_timestamp": 992.0,
+        "node_timebase_frame_timestamp": 1002.0,
         "node_time_delta_seconds": 0.0,
     ]))
     // Missing wall clock.
@@ -8321,7 +11390,10 @@ do {
         priorMapID: mapID,
         priorMapSHA256: sha,
         trackingSessionID: session,
-        floorID: floor)
+        floorID: floor,
+        expectedConstraintCount: 12,
+        expectedManualCount: 6,
+        expectedRecoveryCount: 2)
     let audit = parseResult.audit
     require(
         audit.constraintTotal == 12 && audit.constraintAccepted == 3,
@@ -8374,21 +11446,319 @@ do {
     require(
         abs(manualPrior!.information3x3[0] - 1.0 / (0.10 * 0.10)) < 1.0e-9,
         "manual prior must use the fixed policy sigma")
-    // Rejected details are recorded with stable codes (9 constraint +
-    // 5 manual rejections).
+    // Fatal details contain 8 corrupt/contradictory constraints + 5 manual
+    // failures. The one well-formed accepted=false constraint is audited
+    // separately and must not poison the pipeline clean gate.
     require(
-        audit.rejectedDetails.count == 14,
+        audit.rejectedDetails.count == 13,
         "rejected detail count wrong: \(audit.rejectedDetails.count)")
+    require(
+        audit.nonAcceptedDetails.count == 1
+            && audit.nonAcceptedDetails[0].reason == "constraint_not_accepted",
+        "normal non-accepted constraint must be non-fatal audit evidence")
     let reasons = Set(audit.rejectedDetails.map { $0.reason })
     require(
         reasons.contains("constraint_identity_missing_or_mismatch")
-            && reasons.contains("constraint_not_accepted")
             && reasons.contains("constraint_uniqueness_invalid")
             && reasons.contains("manual_event_node_id_not_found")
             && reasons.contains("manual_event_node_stamp_mismatch")
             && reasons.contains("manual_event_wall_clock_missing_or_invalid")
             && reasons.contains("manual_event_time_or_alignment_invalid"),
         "rejected stable codes incomplete: \(reasons.sorted())")
+
+    func parseConstraintAudit(
+        directoryName: String,
+        constraintRecord: [String: Any],
+        expectedConstraintCount: Int? = nil
+    ) throws -> AbsolutePriorEvidenceParseResult {
+        let directory = temporary.appendingPathComponent(
+            directoryName, isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: directory, withIntermediateDirectories: true)
+        try jsonLine(constraintRecord).data(using: .utf8)!.write(
+            to: directory.appendingPathComponent(
+                "localization_constraints.jsonl"))
+        try Data().write(
+            to: directory.appendingPathComponent(
+                "manual_localization_events.jsonl"))
+        return try AbsolutePriorEvidenceParser.parse(
+            snapshotDirectory: directory,
+            nodes: nodes,
+            priorMapID: mapID,
+            priorMapSHA256: sha,
+            trackingSessionID: session,
+            floorID: floor,
+            expectedConstraintCount: expectedConstraintCount,
+            expectedManualCount: 0,
+            expectedRecoveryCount: 0)
+    }
+    var normalRejected = validConstraint
+    normalRejected["accepted"] = false
+    normalRejected["measurementAccepted"] = false
+    normalRejected["correctionStepApplied"] = false
+    normalRejected["confidenceAccepted"] = false
+    normalRejected["disposition"] = "rejected"
+    let normalRejectedResult = try parseConstraintAudit(
+        directoryName: "normal-rejected",
+        constraintRecord: normalRejected,
+        expectedConstraintCount: 1)
+    require(
+        normalRejectedResult.audit.clean
+            && normalRejectedResult.audit.nonAcceptedDetails.count == 1
+            && normalRejectedResult.priors.isEmpty,
+        "well-formed accepted=false constraint must not block clean processing")
+
+    var invalidAcceptedType = normalRejected
+    invalidAcceptedType["accepted"] = 0
+    let invalidAcceptedResult = try parseConstraintAudit(
+        directoryName: "invalid-accepted-type",
+        constraintRecord: invalidAcceptedType)
+    require(
+        !invalidAcceptedResult.audit.clean
+            && invalidAcceptedResult.audit.rejectedDetails.map(\.reason)
+                .contains("constraint_accepted_invalid"),
+        "numeric accepted flag must remain fatal schema evidence")
+
+    var rejectedWrongIdentity = normalRejected
+    rejectedWrongIdentity["floorId"] = "OTHER"
+    let rejectedWrongIdentityResult = try parseConstraintAudit(
+        directoryName: "rejected-wrong-identity",
+        constraintRecord: rejectedWrongIdentity)
+    require(
+        !rejectedWrongIdentityResult.audit.clean
+            && rejectedWrongIdentityResult.audit.rejectedDetails.map(\.reason)
+                .contains("constraint_identity_missing_or_mismatch"),
+        "accepted=false must not hide identity corruption")
+
+    require(
+        AbsolutePriorEvidenceLimits.qualificationMaximumConstraintRecords
+            == 345_600
+            && AbsolutePriorEvidenceLimits.maximumRecords >= 345_600
+            && AbsolutePriorEvidenceLimits.manualMaximumFileBytes
+                == GeneratedMobileEvidenceContracts
+                    .File_manual_localization_events_jsonl.max_file_bytes
+            && AbsolutePriorEvidenceLimits.manualMaximumRecordBytes
+                == GeneratedMobileEvidenceContracts
+                    .File_manual_localization_events_jsonl.max_record_bytes
+            && AbsolutePriorEvidenceLimits.manualMaximumRecords
+                == GeneratedMobileEvidenceContracts
+                    .File_manual_localization_events_jsonl.max_records
+            && AbsolutePriorEvidenceLimits.recoveryMaximumFileBytes
+                == RecoveryLifecycleEvidenceLimits.maximumFileBytes
+            && AbsolutePriorEvidenceLimits.recoveryMaximumRecordBytes
+                == RecoveryLifecycleEvidenceLimits.maximumRecordBytes
+            && AbsolutePriorEvidenceLimits.recoveryMaximumRecords
+                == RecoveryLifecycleEvidenceLimits.maximumRecords,
+        "absolute-prior sidecars must use their own frozen input contracts")
+    var oversizedManualWatermarkRejected = false
+    do {
+        _ = try AbsolutePriorEvidenceParser.parse(
+            snapshotDirectory: temporary,
+            nodes: nodes,
+            priorMapID: mapID,
+            priorMapSHA256: sha,
+            trackingSessionID: session,
+            floorID: floor,
+            expectedConstraintCount: 12,
+            expectedManualCount:
+                AbsolutePriorEvidenceLimits.manualMaximumRecords + 1,
+            expectedRecoveryCount: 2)
+    } catch AbsolutePriorEvidenceParseError.tooManyRecords(
+        let source, let actual) {
+        oversizedManualWatermarkRejected = source == "manual metadata watermark"
+            && actual == AbsolutePriorEvidenceLimits.manualMaximumRecords + 1
+    }
+    require(
+        oversizedManualWatermarkRejected,
+        "manual metadata watermark above its generated hard cap must reject before I/O")
+    var oversizedRecoveryWatermarkRejected = false
+    do {
+        _ = try AbsolutePriorEvidenceParser.parse(
+            snapshotDirectory: temporary,
+            nodes: nodes,
+            priorMapID: mapID,
+            priorMapSHA256: sha,
+            trackingSessionID: session,
+            floorID: floor,
+            expectedConstraintCount: 12,
+            expectedManualCount: 6,
+            expectedRecoveryCount:
+                AbsolutePriorEvidenceLimits.recoveryMaximumRecords + 1)
+    } catch AbsolutePriorEvidenceParseError.tooManyRecords(
+        let source, let actual) {
+        oversizedRecoveryWatermarkRejected = source == "recovery metadata watermark"
+            && actual == AbsolutePriorEvidenceLimits.recoveryMaximumRecords + 1
+    }
+    require(
+        oversizedRecoveryWatermarkRejected,
+        "recovery metadata watermark above its lifecycle hard cap must reject before I/O")
+    var watermarkMismatchRejected = false
+    do {
+        _ = try parseConstraintAudit(
+            directoryName: "constraint-watermark-mismatch",
+            constraintRecord: normalRejected,
+            expectedConstraintCount: 2)
+    } catch AbsolutePriorEvidenceParseError.constraintCountMismatch(
+        let actual, let expected) {
+        watermarkMismatchRejected = actual == 1 && expected == 2
+    }
+    require(
+        watermarkMismatchRejected,
+        "localization constraint metadata watermark must match exact JSONL rows")
+
+    func constraintFatalReason(
+        _ directoryName: String, _ record: [String: Any], _ reason: String
+    ) throws -> Bool {
+        let result = try parseConstraintAudit(
+            directoryName: directoryName, constraintRecord: record)
+        return !result.audit.clean
+            && result.audit.rejectedDetails.map(\.reason).contains(reason)
+    }
+    var unknownConstraintField = validConstraint
+    unknownConstraintField["futureDrift"] = 1
+    let unknownConstraintFieldRejected = try constraintFatalReason(
+        "constraint-unknown-field", unknownConstraintField,
+        "constraint_unknown_field")
+    require(
+        unknownConstraintFieldRejected,
+        "unknown constraint top-level fields must fail closed")
+    var unknownConstraintPoseField = validConstraint
+    unknownConstraintPoseField["estimatedPose"] = [
+        "x_m": 2.0, "y_m": 0.0, "yaw_rad": 0.0, "z_m": 0.0,
+    ]
+    let unknownConstraintPoseRejected = try constraintFatalReason(
+        "constraint-unknown-pose-field", unknownConstraintPoseField,
+        "constraint_pose_invalid")
+    require(
+        unknownConstraintPoseRejected,
+        "unknown constraint pose fields must fail closed")
+    var unknownCandidateField = validConstraint
+    unknownCandidateField["candidates"] = [[
+        "pose": ["x_m": 2.0, "y_m": 0.0, "yaw_rad": 0.0],
+        "cost": 0.1, "score": 0.9, "futureDrift": true,
+    ]]
+    let unknownCandidateRejected = try constraintFatalReason(
+        "constraint-unknown-candidate-field", unknownCandidateField,
+        "constraint_pose_invalid")
+    require(
+        unknownCandidateRejected,
+        "unknown candidate subobject fields must fail closed")
+    for (name, invalidVersion): (String, Any) in [
+        ("bool", true), ("fractional", 1.5),
+    ] {
+        var invalidVersionRecord = validConstraint
+        invalidVersionRecord["version"] = invalidVersion
+        let invalidVersionRejected = try constraintFatalReason(
+            "constraint-version-\(name)", invalidVersionRecord,
+            "constraint_version_unsupported")
+        require(
+            invalidVersionRejected,
+            "constraint version \(name) must be a strict integer")
+    }
+
+    func parseManualAudit(
+        directoryName: String,
+        manualRecord: [String: Any],
+        manualNodes: [AbsolutePriorEvidenceNode] = nodes,
+        expectedManualCount: Int = 1
+    ) throws -> AbsolutePriorEvidenceParseResult {
+        let directory = temporary.appendingPathComponent(
+            directoryName, isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: directory, withIntermediateDirectories: true)
+        try Data().write(
+            to: directory.appendingPathComponent(
+                "localization_constraints.jsonl"))
+        try jsonLine(manualRecord).data(using: .utf8)!.write(
+            to: directory.appendingPathComponent(
+                "manual_localization_events.jsonl"))
+        return try AbsolutePriorEvidenceParser.parse(
+            snapshotDirectory: directory,
+            nodes: manualNodes,
+            priorMapID: mapID,
+            priorMapSHA256: sha,
+            trackingSessionID: session,
+            floorID: floor,
+            expectedConstraintCount: 0,
+            expectedManualCount: expectedManualCount,
+            expectedRecoveryCount: 0)
+    }
+    var manualWatermarkMismatchRejected = false
+    do {
+        _ = try parseManualAudit(
+            directoryName: "manual-watermark-mismatch",
+            manualRecord: validManual,
+            expectedManualCount: 2)
+    } catch AbsolutePriorEvidenceParseError.manualCountMismatch(
+        let actual, let expected) {
+        manualWatermarkMismatchRejected = actual == 1 && expected == 2
+    }
+    require(
+        manualWatermarkMismatchRejected,
+        "manual localization metadata watermark must match exact JSONL rows")
+
+    var recoveryWatermarkMismatchRejected = false
+    do {
+        _ = try AbsolutePriorEvidenceParser.parse(
+            snapshotDirectory: temporary,
+            nodes: nodes,
+            priorMapID: mapID,
+            priorMapSHA256: sha,
+            trackingSessionID: session,
+            floorID: floor,
+            expectedConstraintCount: 12,
+            expectedManualCount: 6,
+            expectedRecoveryCount: 3)
+    } catch AbsolutePriorEvidenceParseError.recoveryCountMismatch(
+        let actual, let expected) {
+        recoveryWatermarkMismatchRejected = actual == 2 && expected == 3
+    }
+    require(
+        recoveryWatermarkMismatchRejected,
+        "recovery metadata watermark must match exact JSONL rows")
+    var wallClockMismatch = validManual
+    wallClockMismatch["wall_clock_timestamp_unix"] = 1_800_000_001.0
+    let wallClockMismatchResult = try parseManualAudit(
+        directoryName: "manual-wall-clock-mismatch",
+        manualRecord: wallClockMismatch)
+    require(
+        wallClockMismatchResult.audit.rejectedDetails.map(\.reason)
+            .contains("manual_event_wall_clock_missing_or_invalid"),
+        "manual ISO and Unix timestamps must identify the same instant")
+
+    var ambiguousV2 = validManual
+    ambiguousV2["version"] = 2
+    ambiguousV2["frame_timestamp"] = 991.0
+    ambiguousV2["node_timebase_frame_timestamp"] = 1001.0
+    ambiguousV2["nearest_node_id"] = NSNull()
+    ambiguousV2["nearest_node_stamp"] = NSNull()
+    ambiguousV2["node_time_delta_seconds"] = NSNull()
+    ambiguousV2["node_binding_status"] = "frame_timestamp_only"
+    let ambiguousV2Result = try parseManualAudit(
+        directoryName: "manual-v2-ambiguous",
+        manualRecord: ambiguousV2,
+        manualNodes: [
+            AbsolutePriorEvidenceNode(nodeID: 1, stamp: 1000.0),
+            AbsolutePriorEvidenceNode(nodeID: 2, stamp: 1002.0),
+        ])
+    require(
+        ambiguousV2Result.audit.rejectedDetails.map(\.reason)
+            .contains("manual_event_node_binding_ambiguous"),
+        "manual v2 binding must enforce the second-nearest margin")
+
+    var claimedWrongV3 = validManual
+    claimedWrongV3["frame_timestamp"] = 991.9
+    claimedWrongV3["node_timebase_frame_timestamp"] = 1001.9
+    claimedWrongV3["nearest_node_id"] = 1
+    claimedWrongV3["nearest_node_stamp"] = 1001.0
+    claimedWrongV3["node_time_delta_seconds"] = 0.9
+    let claimedWrongV3Result = try parseManualAudit(
+        directoryName: "manual-v3-not-nearest",
+        manualRecord: claimedWrongV3)
+    require(
+        claimedWrongV3Result.audit.rejectedDetails.map(\.reason)
+            .contains("manual_event_claimed_node_not_nearest"),
+        "manual v3 claimed ID must equal the recomputed nearest node")
     // Report payload round-trips through CanonicalJSONEncoder.
     let report = audit.reportPayload(priors: parseResult.priors)
     let reportData = try CanonicalJSONEncoder.encode(report)
@@ -8404,15 +11774,7 @@ catch {
     exit(10)
 }
 
-// === Mobile-Only V1R4/V1R5: strict tag-observation evidence parser ===
-// (§13.2 + §5.4) The parser must classify records against the REAL
-// write-side schema (PriorMapTagObservationRecord snake_case): identity
-// exact, finite-only, known-field whitelist, duplicate observation_id
-// rejection, raw-pose sanity and node-timebase binding with a 1.0 s gate
-// plus the V1R5 verified-burst gate (every accepted observation must
-// belong to a verified complete burst with exact identity and a
-// timestamp/node range inside the burst). Every rejection is fail-closed
-// with a stable audit code; unlocalized records are counted.
+// === RC-B12..B14: burst v2 + strict tag DTO/exact consumption ===
 do {
     let temporary = FileManager.default.temporaryDirectory
         .appendingPathComponent("ms-tag-parser-\(UUID().uuidString)", isDirectory: true)
@@ -8434,6 +11796,121 @@ do {
         return String(data: data, encoding: .utf8)! + "\n"
     }
 
+    func frame(
+        _ index: Int, observationID: String? = nil,
+        view: String = "front", tracking: String = "stable"
+    ) -> [String: Any] {
+        [
+            "frame_id": "frame-\(index)",
+            "observation_id": observationID ?? "OBS-\(index)",
+            "bound_node_id": index,
+            "frame_timestamp": 999.0 + Double(index),
+            "node_timestamp": 1000.0 + Double(index),
+            "depth": 0.95,
+            "view": view,
+            "tracking": tracking,
+            "confidence": 0.9,
+        ]
+    }
+    func burst(
+        _ burstID: String, sequence: Int, frames: [[String: Any]]
+    ) -> [String: Any] {
+        let frameTimes = frames.map { StrictJSONScalar.number($0["frame_timestamp"])! }
+        let nodeIDs = frames.map { StrictJSONScalar.integer($0["bound_node_id"])! }
+        let depths = frames.map { StrictJSONScalar.number($0["depth"])! }
+        let confidences = frames.map { StrictJSONScalar.number($0["confidence"])! }
+        return [
+            "format": "MarketScannerPriceTagBurst", "version": 2,
+            "prior_map_id": mapID, "prior_map_sha256": sha,
+            "tracking_session_id": session, "floor_id": floor,
+            "burst_id": burstID, "sequence": sequence,
+            "barcode": "6901234567890", "symbology": "EAN13",
+            "complete": true, "frame_count": frames.count, "frames": frames,
+            "first_frame_timestamp": frameTimes.min() ?? 0,
+            "last_frame_timestamp": frameTimes.max() ?? 0,
+            "bound_node_id_min": nodeIDs.min() ?? 0,
+            "bound_node_id_max": nodeIDs.max() ?? 0,
+            "depth_quality": depths.reduce(0, +) / Double(max(1, depths.count)),
+            "view_angle": TagObservationBurstEvidenceParser.dominantVote(
+                frames.map { $0["view"] as! String }),
+            "tracking_quality": TagObservationBurstEvidenceParser.dominantVote(
+                frames.map { $0["tracking"] as! String }),
+            "localization_confidence_mean": confidences.reduce(0, +)
+                / Double(max(1, confidences.count)),
+        ]
+    }
+    func parseBurstFixture(
+        name: String, object: [String: Any], expectedCount: Int,
+        expectedLastID: String?
+    ) throws -> TagObservationBurstEvidenceParseResult {
+        let directory = temporary.appendingPathComponent(name, isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: directory, withIntermediateDirectories: true)
+        try jsonLine(object).data(using: .utf8)!.write(
+            to: directory.appendingPathComponent("tag_observation_bursts.jsonl"))
+        return try TagObservationBurstEvidenceParser.parse(
+            snapshotDirectory: directory, nodes: nodes,
+            priorMapID: mapID, priorMapSHA256: sha,
+            trackingSessionID: session, floorID: floor,
+            expectedBurstCount: expectedCount,
+            expectedLastBurstID: expectedLastID)
+    }
+
+    // 1/2/3-frame smoke: frame count is exact and ties are ambiguous.
+    for count in 1...3 {
+        var samples = (1...count).map { frame($0) }
+        if count == 2 {
+            samples[1]["view"] = "back"
+        }
+        let burstID = "BURST-\(count)"
+        let parsed = try parseBurstFixture(
+            name: "burst-\(count)",
+            object: burst(burstID, sequence: 1, frames: samples),
+            expectedCount: 1,
+            expectedLastID: burstID)
+        require(parsed.frameCount == count, "burst \(count) frame count drift")
+        if count == 2 {
+            require(parsed.bursts[0].viewAngle == "unknown", "front/back tie must be unknown")
+        }
+    }
+    var tampered = burst("BURST-TAMPER", sequence: 1, frames: [frame(1)])
+    tampered["depth_quality"] = 0.1
+    let tamperedResult = try parseBurstFixture(
+        name: "burst-tampered", object: tampered,
+        expectedCount: 0, expectedLastID: nil)
+    require(
+        tamperedResult.audit.rejectedDetails.map(\.reason).contains("summary_mismatch"),
+        "tampered burst summary must reject")
+    let zeroResult = try parseBurstFixture(
+        name: "burst-zero",
+        object: burst("BURST-ZERO", sequence: 1, frames: []),
+        expectedCount: 0, expectedLastID: nil)
+    require(
+        zeroResult.audit.rejectedDetails.map(\.reason)
+            .contains("frame_count_or_frames_invalid"),
+        "complete zero-frame burst must reject")
+    let duplicateResult = try parseBurstFixture(
+        name: "burst-duplicate",
+        object: burst(
+            "BURST-DUP", sequence: 1,
+            frames: [frame(1, observationID: "OBS-DUP"),
+                     frame(2, observationID: "OBS-DUP")]),
+        expectedCount: 0, expectedLastID: nil)
+    require(
+        duplicateResult.audit.rejectedDetails.map(\.reason)
+            .contains("duplicate_observation_id"),
+        "burst observation IDs must be globally unique")
+
+    let mainFrames = [frame(1), frame(2), frame(3)]
+    try jsonLine(burst("BURST-MAIN", sequence: 1, frames: mainFrames))
+        .data(using: .utf8)!.write(
+            to: temporary.appendingPathComponent("tag_observation_bursts.jsonl"))
+    let verifiedBursts = try TagObservationBurstEvidenceParser.parse(
+        snapshotDirectory: temporary, nodes: nodes,
+        priorMapID: mapID, priorMapSHA256: sha,
+        trackingSessionID: session, floorID: floor,
+        expectedBurstCount: 1, expectedLastBurstID: "BURST-MAIN")
+
     let validRecord: [String: Any] = [
         "format": "MarketScannerPriceTagObservation",
         "version": 1,
@@ -8445,14 +11922,14 @@ do {
         "frame_timestamp": 1000.0,
         "node_timebase_frame_timestamp": 1001.0,
         "node_timebase_offset_seconds": 1.0,
-        "pose_timestamp_delta_ms": 12.0,
+        "pose_timestamp_delta_ms": 2.0,
         "alignment_version": 3,
-        "alignment_snapshot_timestamp": 998.0,
+        "alignment_snapshot_timestamp": 999.998,
         "alignment_age_ms": 2.0,
         "alignment_version_lag": 0,
         "alignment_freshness": "fresh",
         "raw_map_position": ["x_m": 1.0, "y_m": 2.0, "height_m": 1.5],
-        "measurement_method": "center_bearing",
+        "measurement_method": "scene_depth",
         "measurement_confidence": 0.9,
         "depth_sample_count": 40,
         "depth_inlier_count": 38,
@@ -8461,7 +11938,7 @@ do {
         "depth_mad_m": 0.1,
         "plane_residual_m": 0.02,
         "surface_normal_camera": [0.0, 0.0, -1.0],
-        "localization_state": "localized",
+        "localization_state": "stable",
         "localization_confidence": 0.9,
         "prior_map_id": mapID,
         "prior_map_sha256": sha,
@@ -8469,103 +11946,74 @@ do {
         "tracking_session_id": session,
         "needs_review": false,
         // V1R5 §5.4: durable burst linkage assigned at persistence time.
-        "burst_id": "BURST-1",
-        "frame_id": "frame-1001",
+        "burst_id": "BURST-MAIN",
+        "frame_id": "frame-1",
     ]
-    func observation(_ edits: [String: Any]) throws -> String {
+    func observation(
+        _ edits: [String: Any], removing: [String] = []
+    ) throws -> String {
         var record = validRecord
         for (key, value) in edits { record[key] = value }
+        removing.forEach { record.removeValue(forKey: $0) }
         return try jsonLine(record)
     }
     var lines: [String] = []
-    // 2 valid localized records bound to node 1 and node 2.
     lines.append(try observation([
         "observation_id": "OBS-1",
+        "frame_timestamp": 1000.0,
         "node_timebase_frame_timestamp": 1001.0,
-        "frame_id": "frame-1001",
+        "alignment_snapshot_timestamp": 999.998,
+        "frame_id": "frame-1",
         "raw_map_position": ["x_m": 1.0, "y_m": 2.0, "height_m": 1.5],
     ]))
+    // height_m absent is valid; the record stays planar/review-only.
     lines.append(try observation([
         "observation_id": "OBS-2",
+        "frame_timestamp": 1001.0,
         "node_timebase_frame_timestamp": 1002.0,
-        "frame_id": "frame-1002",
-        "raw_map_position": ["x_m": 1.1, "y_m": 2.1, "height_m": 1.5],
+        "alignment_snapshot_timestamp": 1000.998,
+        "frame_id": "frame-2", "needs_review": true,
+        "raw_map_position": ["x_m": 1.1, "y_m": 2.1],
     ]))
-    // 1 valid unlocalized record bound to node 3 (no raw position).
     lines.append(try observation([
         "observation_id": "OBS-3",
+        "frame_timestamp": 1002.0,
         "node_timebase_frame_timestamp": 1003.0,
-        "frame_id": "frame-1003",
-        "raw_map_position": NSNull(),
-    ]))
-    // V1R5 §5.4: a record whose burst is not in the verified set is
-    // rejected (legacy records can never reach ACCEPTED).
+        "alignment_snapshot_timestamp": 1001.998,
+        "frame_id": "frame-3", "needs_review": true,
+        "measurement_method": "unavailable", "measurement_confidence": 0.0,
+    ], removing: ["raw_map_position"]))
     lines.append(try observation([
-        "observation_id": "OBS-NO-BURST",
-        "node_timebase_frame_timestamp": 1004.0,
-        "frame_id": "frame-1004",
-        "burst_id": "BURST-UNKNOWN",
+        "observation_id": "OBS-NOT-IN-BURST", "frame_id": "frame-x",
     ]))
-    // Rejections: format / version / unknown field / identity / schema /
-    // duplicate / raw pose / node binding.
-    lines.append(try observation(["format": "Wrong"]))
-    lines.append(try observation(["version": 2]))
-    lines.append(try observation(["unknown_drift_field": 1]))
-    lines.append(try observation(["prior_map_id": "OTHER"]))
-    lines.append(try observation(["measurement_confidence": 1.5]))
     lines.append(try observation([
         "observation_id": "OBS-1",
-        "node_timebase_frame_timestamp": 1004.0,
-        "frame_id": "frame-1004",
     ]))
     lines.append(try observation([
         "observation_id": "OBS-RAW",
-        "raw_map_position": ["x_m": 99999.0, "y_m": 2.0, "height_m": 1.5],
+        "raw_map_position": "wrong-type",
     ]))
     lines.append(try observation([
-        "node_timebase_frame_timestamp": 2000.0,
-        "observation_id": "OBS-BIND",
-        "frame_id": "frame-2000",
+        "observation_id": "OBS-HEIGHT",
+        "raw_map_position": ["x_m": 1.0, "y_m": 2.0, "height_m": "bad"],
+    ]))
+    lines.append(try observation([
+        "observation_id": "OBS-TIME", "node_timebase_offset_seconds": 2.0,
+    ]))
+    lines.append(try observation([
+        "observation_id": "OBS-DEPTH", "depth_inlier_count": 37,
+    ]))
+    lines.append(try observation([
+        "observation_id": "OBS-NORMAL", "surface_normal_camera": [0.0, 0.0, -2.0],
+    ]))
+    lines.append(try observation([
+        "observation_id": "OBS-FRESH", "alignment_freshness": "aging",
+    ]))
+    lines.append(try observation([
+        "observation_id": "OBS-METHOD", "measurement_method": "center_bearing",
     ]))
     try lines.joined().data(using: .utf8)!.write(
         to: temporary.appendingPathComponent("tag_observations.jsonl"))
-
-    // V1R5 §5.3/§5.4: the verified burst covering the accepted records.
-    let verifiedBurst = VerifiedTagBurst(
-        burstID: "BURST-1",
-        sequence: 1,
-        barcode: "6901234567890",
-        symbology: "EAN13",
-        floorID: floor,
-        trackingSessionID: session,
-        frameIDs: ["frame-1001", "frame-1002", "frame-1003"],
-        uniqueFrameCount: 3,
-        firstFrameTimestamp: 1000.0,
-        lastFrameTimestamp: 1003.0,
-        nodeTimebaseMin: 1001.0,
-        nodeTimebaseMax: 1003.0,
-        depthQuality: 0.9,
-        viewAngle: "front",
-        trackingQuality: "stable",
-        localizationConfidenceMean: 0.9,
-        complete: true,
-        frameSamples: [
-            TagBurstFrameSample(
-                frameId: "frame-1001", frameTimestamp: 1000.0,
-                nodeTimebaseTimestamp: 1001.0, observationId: "OBS-1"),
-            TagBurstFrameSample(
-                frameId: "frame-1002", frameTimestamp: 1000.5,
-                nodeTimebaseTimestamp: 1002.0, observationId: "OBS-2"),
-            TagBurstFrameSample(
-                frameId: "frame-1003", frameTimestamp: 1001.0,
-                nodeTimebaseTimestamp: 1003.0, observationId: "OBS-3"),
-        ],
-        rawSamples: [],
-        boundNodeIDs: [1, 2, 3])
-    let verifiedBursts = TagObservationBurstEvidenceParseResult(
-        bursts: [verifiedBurst],
-        byBurstID: ["BURST-1": verifiedBurst],
-        audit: TagObservationBurstEvidenceAudit())
 
     let result = try TagObservationEvidenceParser.parse(
         snapshotDirectory: temporary,
@@ -8581,34 +12029,23 @@ do {
         "tag parser record total wrong: \(audit.recordTotal)")
     require(
         audit.recordAccepted == 3
-            && audit.recordUnlocalizedSkipped == 1,
+            && audit.recordUnlocalizedSkipped == 2,
         "tag parser accepted/unlocalized wrong: \(audit.recordAccepted)/\(audit.recordUnlocalizedSkipped)")
-    require(
-        audit.recordFormatRejected == 1
-            && audit.recordVersionRejected == 1
-            && audit.recordSchemaRejected == 2
-            && audit.recordIdentityRejected == 1
-            && audit.recordDuplicateRejected == 1
-            && audit.recordPoseRejected == 1
-            && audit.recordNodeBindingRejected == 2,
-        "tag parser rejection breakdown wrong: format=\(audit.recordFormatRejected) version=\(audit.recordVersionRejected) schema=\(audit.recordSchemaRejected) identity=\(audit.recordIdentityRejected) duplicate=\(audit.recordDuplicateRejected) pose=\(audit.recordPoseRejected) binding=\(audit.recordNodeBindingRejected)")
-    require(
-        audit.totalRejected == 9,
-        "tag parser total rejected wrong: \(audit.totalRejected)")
+    require(audit.totalRejected == 9, "tag parser total rejected wrong: \(audit.totalRejected)")
     require(
         audit.rejectedDetails.count == 9,
         "tag parser rejected details must count every rejection: \(audit.rejectedDetails.count)")
     let reasons = Set(audit.rejectedDetails.map { $0.reason })
     require(
-        reasons.contains("format_invalid")
-            && reasons.contains("version_unsupported")
-            && reasons.contains("unknown_field_unknown_drift_field")
-            && reasons.contains("identity_missing_or_mismatch")
-            && reasons.contains("schema_or_finite_invalid")
+        reasons.contains("observation_frame_exact_mismatch")
             && reasons.contains("duplicate_observation_id")
             && reasons.contains("raw_pose_invalid")
-            && reasons.contains("node_time_delta_exceeded")
-            && reasons.contains("observation_not_in_verified_burst"),
+            && reasons.contains("raw_height_invalid")
+            && reasons.contains("node_timebase_invariant_invalid")
+            && reasons.contains("depth_count_ratio_inconsistent")
+            && reasons.contains("surface_normal_not_unit")
+            && reasons.contains("alignment_freshness_inconsistent")
+            && reasons.contains("schema_or_finite_invalid"),
         "tag parser stable codes incomplete: \(reasons.sorted())")
     require(
         result.boundNodeIDs == [1, 2, 3],
@@ -8621,13 +12058,14 @@ do {
         localized.boundNodeID == 1
             && localized.barcode == "6901234567890"
             && localized.rawPositionM != nil
-            && localized.burstID == "BURST-1"
-            && localized.frameID == "frame-1001",
+            && localized.burstID == "BURST-MAIN"
+            && localized.frameID == "frame-1",
         "tag parser first observation must bind node 1 with a position and burst linkage")
     let unlocalized = result.observations[2]
     require(
-        unlocalized.boundNodeID == 3 && unlocalized.rawPositionM == nil,
-        "tag parser unlocalized observation must bind node 3 without a position")
+        result.observations[1].rawPositionM == nil
+            && unlocalized.boundNodeID == 3 && unlocalized.rawPositionM == nil,
+        "optional/absent height observations must remain legal review-only evidence")
     // Report payload round-trips through CanonicalJSONEncoder.
     let report = audit.reportPayload()
     let reportData = try CanonicalJSONEncoder.encode(report)
@@ -8642,47 +12080,333 @@ catch {
     exit(11)
 }
 
-// V1R4 §12.4: RunSummary real metrics — the native quality JSON must
-// parse into the actual factor/loop/prior/recovery counts and the
-// graph/factor SHAs; absent fields stay nil/empty, never fabricated.
+// MARK: - Strict native quality JSON / C outcome / RunSummary binding
+
+/// Complete production-format native quality fixture. Host gateway tests use
+/// the same strict schema/request/count binding as the C bridge; no minimal
+/// or permissive test-only JSON is allowed to reach the pipeline.
+func nativeQualityFixture(
+    request: MobileNativeGraphRequest,
+    path: String,
+    disposition: MobileGraphDisposition,
+    trajectoryCount: Int,
+    skeletonCount: Int,
+    publishCount: Int,
+    factorCount: Int = 1,
+    graphSHA256: String = String(repeating: "a", count: 64),
+    factorSHA256: String = String(repeating: "b", count: 64)
+) throws -> String {
+    let residual: [String: Any] = [
+        "count": 0, "p50": 0.0, "p95": 0.0, "max": 0.0,
+    ]
+    let residuals: [String: Any] = [
+        "odometry": residual, "loop": residual,
+        "prior": residual, "recovery": residual,
+    ]
+    let appliedPriors = min(request.absolutePriors.count, factorCount)
+    let root: [String: Any] = [
+        "format": "MarketScannerGraphQuality",
+        "version": 2,
+        "policy_version": "candidate-1",
+        "abi_version": 4,
+        "path": path,
+        "disposition": disposition.reportValue,
+        "graph_input_sha256": graphSHA256,
+        "factor_set_sha256": factorSHA256,
+        "projection_policy_version": Int(request.projectionPolicyVersion),
+        "prior_map_id": request.priorMapID,
+        "prior_map_sha256": request.priorMapSHA256,
+        "tracking_session_id": request.trackingSessionID,
+        "absolute_prior_count": request.absolutePriors.count,
+        "parsed_valid_prior_count": request.absolutePriors.count,
+        "applied_prior_factor_count": appliedPriors,
+        "unique_prior_node_count": appliedPriors,
+        "applied_prior_count": appliedPriors,
+        "rejected_priors": 0,
+        "fused_prior_duplicates": 0,
+        "prior_conflicts": 0,
+        "component_count": trajectoryCount > 0 ? 1 : 0,
+        "total_components": trajectoryCount > 0 ? 1 : 0,
+        "anchored_components": publishCount > 0 ? 1 : 0,
+        "publish_nodes": publishCount,
+        "publish_ratio": trajectoryCount > 0
+            ? Double(publishCount) / Double(trajectoryCount) : 0.0,
+        "anchored_ratio": publishCount > 0 ? 1.0 : 0.0,
+        "isolated_count": 0,
+        "cross_floor_link_count": 0,
+        "gap_segments": 0,
+        "aggregated_chains": 0,
+        "reciprocal_inconsistent": 0,
+        "weighted_chi2": 0.0,
+        "dof": 0,
+        "chi2_per_dof": 0.0,
+        "residual_by_kind": residuals,
+        "yaw_residual_by_kind": residuals,
+        "residual_threshold_ratio": 0.0,
+        "yaw_threshold_ratio": 0.0,
+        "info_policy": ["regularized": 0, "rejected": 0],
+        "correction": [
+            "median": 0.0, "p95": 0.0, "max": 0.0, "max_jump": 0.0,
+            "yaw_median": 0.0, "yaw_p95": 0.0, "yaw_max": 0.0,
+            "yaw_max_jump": 0.0,
+        ],
+        "coverage": trajectoryCount > 0
+            ? Double(publishCount) / Double(trajectoryCount) : 0.0,
+        "optimizer_error": "",
+        "solver": [
+            "strategy": "g2o_robust", "iterations": 1,
+            "final_error": 0.0, "converged": true,
+            "stopped_reason": "converged", "initial_error": 0.0,
+            "relative_improvement": 0.0, "wall_seconds": 0.01,
+            "chunks": 1, "skeleton_nodes": skeletonCount,
+            "factor_count": factorCount, "available": true,
+        ],
+        "gauge_by_component": [],
+        "health": [
+            "node_count": trajectoryCount, "link_count": 0,
+            "malformed_links": 0, "void_links": 0,
+            "ignored_optional_links": 0, "loop_links": 0,
+            "prior_links": 0, "recovery_links": 0,
+        ],
+    ]
+    let data = try CanonicalJSONEncoder.encode(root)
+    guard let value = String(data: data, encoding: .utf8) else {
+        throw MobileNativeFactorGraphError.invalidOutcome(
+            "host quality fixture UTF-8 encoding failed")
+    }
+    return value
+}
+
+// P0 native outcome contract: disposition is authoritative before the
+// optional error string; quality is a complete strict DTO bound exactly to
+// request identity, C/runtime truth and RunSummary.
 do {
-    let full = MobileProcessingPipeline.NativeQualityMetrics.parse(
-        qualityJSON: """
-        {"format":"MarketScannerGraphQuality","version":2,
-         "policy_version":"candidate-1","path":"oracle",
-         "graph_input_sha256":"\(String(repeating: "a", count: 64))",
-         "factor_set_sha256":"\(String(repeating: "b", count: 64))",
-         "solver":{"factor_count":42},
-         "health":{"loop_links":3,"prior_links":2,"recovery_links":1}}
-        """)
     require(
-        full.factorCount == 42 && full.loopLinks == 3
-            && full.priorLinks == 2 && full.recoveryLinks == 1,
-        "H-18 native metrics must parse real counts, got \(full.factorCount ?? -1)/\(full.loopLinks ?? -1)")
+        MobileNativeOutcomeContract.maximumPriors == 4_096
+            && MobileNativeOutcomeContract.maximumFactors == 4_096,
+        "native prior/factor caps must match the generated 4096 contract")
+    try MobileNativeOutcomeContract.validateInputCounts(
+        priorCount: 4_096, tagNodeCount: 0)
+    var priorOverflowRejected = false
+    do {
+        try MobileNativeOutcomeContract.validateInputCounts(
+            priorCount: 4_097, tagNodeCount: 0)
+    } catch let error as MobileNativeFactorGraphError {
+        if case .invalidOutcome = error { priorOverflowRejected = true }
+    }
+    require(priorOverflowRejected, "4097 Swift priors must fail before native allocation")
+
+    var resourceSemanticsPreserved = false
+    do {
+        _ = try MobileNativeOutcomeContract.disposition(
+            rawValue: MobileGraphDisposition.resourceRequired.rawValue,
+            errorMessage: "optimizer factors exceed the 4096 hard bound")
+    } catch let error as MobileOnlyWorkflowError {
+        if case .resourceRequired(let detail) = error {
+            resourceSemanticsPreserved = detail.contains("4096")
+        }
+    }
     require(
-        full.graphInputSHA256 == String(repeating: "a", count: 64)
-            && full.factorSetSHA256 == String(repeating: "b", count: 64)
-            && full.policyVersion == "candidate-1",
-        "H-18 native metrics must parse the graph/factor SHAs and policy")
-    let minimal = MobileProcessingPipeline.NativeQualityMetrics.parse(
-        qualityJSON: "{\"format\":\"MarketScannerGraphQuality\",\"version\":2,\"path\":\"host-reference\"}")
+        resourceSemanticsPreserved,
+        "RESOURCE_REQUIRED + native error must remain a resumable resource error")
+
+    var unknownDispositionRejectedFirst = false
+    do {
+        _ = try MobileNativeOutcomeContract.disposition(
+            rawValue: 99, errorMessage: "generic native error")
+    } catch let error as MobileNativeFactorGraphError {
+        if case .invalidOutcome(let detail) = error {
+            unknownDispositionRejectedFirst = detail.contains("unknown ABI disposition")
+        }
+    }
     require(
-        minimal.factorCount == nil && minimal.loopLinks == nil
-            && minimal.priorLinks == nil && minimal.recoveryLinks == nil
-            && minimal.graphInputSHA256.isEmpty
-            && minimal.factorSetSHA256.isEmpty,
-        "H-18 absent native fields must stay nil/empty, never 0")
-    let garbage = MobileProcessingPipeline.NativeQualityMetrics.parse(
-        qualityJSON: "not-json")
+        unknownDispositionRejectedFirst,
+        "unknown disposition must be rejected before interpreting native error")
+
+    let request = MobileNativeGraphRequest(
+        databaseURL: URL(fileURLWithPath: "/private/tmp/native-quality.db"),
+        tagNodeIDs: [],
+        absolutePriors: [MobileAbsolutePrior(
+            nodeID: 1, mapXM: 0, mapYM: 0, mapYawRad: 0,
+            information3x3: [1, 0, 0, 0, 1, 0, 0, 0, 1],
+            kind: 0, episodeID: 1)],
+        priorMapID: "map-quality",
+        priorMapSHA256: String(repeating: "c", count: 64),
+        trackingSessionID: "session-quality",
+        projectionPolicyVersion: 1,
+        maxWallSeconds: 600)
+    let trajectory = [
+        MobileNativeTrajectoryRow(
+            id: 1, stamp: 1, xM: 0, yM: 0, yawRad: 0,
+            mapID: 0, componentID: 0, publishEligible: true,
+            uncertaintyM: 0.1),
+        MobileNativeTrajectoryRow(
+            id: 2, stamp: 2, xM: 1, yM: 0, yawRad: 0,
+            mapID: 0, componentID: 0, publishEligible: false,
+            uncertaintyM: nil),
+    ]
+    let qualityAtBoundary = try nativeQualityFixture(
+        request: request,
+        path: "fast",
+        disposition: .pass,
+        trajectoryCount: 2,
+        skeletonCount: 1,
+        publishCount: 1,
+        factorCount: 4_096)
+    let outcome = MobileNativeGraphOutcome(
+        disposition: .pass,
+        qualityJSON: qualityAtBoundary,
+        trajectory: trajectory,
+        skeletonIDs: [1])
+    let report = try MobileNativeOutcomeContract.qualityReport(
+        in: outcome, request: request, expectedPath: "fast")
     require(
-        garbage.factorCount == nil && garbage.graphInputSHA256.isEmpty,
-        "H-18 malformed quality JSON must parse safely")
-    print("H-18 RunSummary real metrics parsing passed")
+        report.solver.factorCount == 4_096,
+        "native success must read solver.factor_count, not top-level factor_count")
+
+    func qualityObject(_ json: String) throws -> [String: Any] {
+        return try StrictJSONDocumentParser.object(
+            from: Data(json.utf8),
+            limits: StrictJSONDocumentLimits(maximumBytes: 1024 * 1024))
+    }
+    func mutatedQuality(
+        _ json: String, _ mutate: (inout [String: Any]) -> Void
+    ) throws -> String {
+        var object = try qualityObject(json)
+        mutate(&object)
+        return String(
+            data: try CanonicalJSONEncoder.encode(object), encoding: .utf8)!
+    }
+    func qualityRejected(_ json: String) -> Bool {
+        do {
+            _ = try MobileNativeQualityReport.parse(qualityJSON: json)
+            return false
+        } catch {
+            return true
+        }
+    }
+
+    let unknown = try mutatedQuality(qualityAtBoundary) {
+        $0["factor_count"] = 4_096
+    }
+    let wrongType = try mutatedQuality(qualityAtBoundary) { $0["version"] = "2" }
+    let wrongBool = try mutatedQuality(qualityAtBoundary) {
+        var solver = $0["solver"] as! [String: Any]
+        solver["factor_count"] = true
+        $0["solver"] = solver
+    }
+    let overflow = try mutatedQuality(qualityAtBoundary) {
+        var solver = $0["solver"] as! [String: Any]
+        solver["factor_count"] = 4_097
+        $0["solver"] = solver
+    }
+    let duplicate = qualityAtBoundary.replacingOccurrences(
+        of: "\"version\":2",
+        with: "\"version\":2,\"version\":2")
+    require(
+        qualityRejected(unknown) && qualityRejected(wrongType)
+            && qualityRejected(wrongBool) && qualityRejected(overflow)
+            && qualityRejected(duplicate),
+        "strict quality must reject unknown/duplicate/wrong-type/Bool/overflow")
+
+    func bindingRejected(
+        qualityJSON: String = qualityAtBoundary,
+        request candidateRequest: MobileNativeGraphRequest = request,
+        expectedPath: String = "fast",
+        disposition: MobileGraphDisposition = .pass,
+        trajectoryRows: [MobileNativeTrajectoryRow] = trajectory,
+        skeletonIDs: [Int64] = [1]
+    ) -> Bool {
+        do {
+            _ = try MobileNativeOutcomeContract.qualityReport(
+                in: MobileNativeGraphOutcome(
+                    disposition: disposition,
+                    qualityJSON: qualityJSON,
+                    trajectory: trajectoryRows,
+                    skeletonIDs: skeletonIDs),
+                request: candidateRequest,
+                expectedPath: expectedPath)
+            return false
+        } catch {
+            return true
+        }
+    }
+    var wrongIdentityRequest = request
+    wrongIdentityRequest.trackingSessionID = "other-session"
+    require(
+        bindingRejected(expectedPath: "full_graph_optimization")
+            && bindingRejected(disposition: .recoverableFail)
+            && bindingRejected(request: wrongIdentityRequest)
+            && bindingRejected(skeletonIDs: [1, 2])
+            && bindingRejected(trajectoryRows: [trajectory[0], trajectory[1], trajectory[1]]),
+        "quality request/path/disposition/C-count mismatch must fail closed")
+
+    let badSHA = try mutatedQuality(qualityAtBoundary) {
+        $0["graph_input_sha256"] = String(repeating: "A", count: 64)
+    }
+    let badABI = try mutatedQuality(qualityAtBoundary) { $0["abi_version"] = 3 }
+    require(
+        qualityRejected(badSHA) && qualityRejected(badABI),
+        "quality SHA shape and ABI version mismatch must fail closed")
+    var cBindingRejected = false
+    do {
+        try report.validate(
+            request: request,
+            expectedPath: "fast",
+            disposition: .pass,
+            trajectoryCount: 2,
+            skeletonCount: 1,
+            publishCount: 1,
+            cABIVersion: 3,
+            cFactorCount: 4_095,
+            cGraphInputSHA256: String(repeating: "d", count: 64),
+            cFactorSetSHA256: String(repeating: "e", count: 64))
+    } catch {
+        cBindingRejected = true
+    }
+    require(cBindingRejected, "runtime ABI/factor/graph/factor C binding mismatch must reject")
+
+    var metricsObject = try qualityObject(qualityAtBoundary)
+    var health = metricsObject["health"] as! [String: Any]
+    health["loop_links"] = 3
+    health["prior_links"] = 2
+    health["recovery_links"] = 1
+    metricsObject["health"] = health
+    let metricsJSON = String(
+        data: try CanonicalJSONEncoder.encode(metricsObject), encoding: .utf8)!
+    let metrics = try MobileProcessingPipeline.NativeQualityMetrics.parse(
+        qualityJSON: metricsJSON)
+    require(
+        metrics.factorCount == 4_096 && metrics.loopLinks == 3
+            && metrics.priorLinks == 2 && metrics.recoveryLinks == 1
+            && metrics.graphInputSHA256 == String(repeating: "a", count: 64)
+            && metrics.factorSetSHA256 == String(repeating: "b", count: 64),
+        "RunSummary projection must use exact typed quality values")
+    var lenientMetricsRejected = false
+    do {
+        _ = try MobileProcessingPipeline.NativeQualityMetrics.parse(
+            qualityJSON: "{\"format\":\"MarketScannerGraphQuality\",\"version\":2}")
+    } catch {
+        lenientMetricsRejected = true
+    }
+    require(
+        lenientMetricsRejected,
+        "RunSummary must reject partial quality instead of returning empty metrics")
+    print("P0 strict native quality/C outcome/RunSummary binding passed")
 }
 catch {
     FileHandle.standardError.write(
-        Data("H-18 native metrics parsing failed: \(error)\n".utf8))
-    exit(12)
+        Data("P0 native outcome contract failed: \(error)\n".utf8))
+    exit(18)
+}
+
+// Focused mode used by the Python host harness so the release-blocking
+// absolute-prior/native contracts remain independently executable even when
+// an unrelated earlier default-suite fixture is under active repair.
+if CommandLine.arguments.count == 3,
+   CommandLine.arguments[1] == "--absolute-prior-contract" {
+    print("Absolute prior/native targeted contract tests passed")
+    exit(0)
 }
 
 // === Mobile-Only V1R4: strict clock evidence parser (§7.3) ===
@@ -8870,24 +12594,28 @@ do {
     // local offset context switches at the transition.
     var t4Lines: [String] = []
     let tz = "America/Toronto"
+    // 2025-03-09 06:59:30 UTC -> 07:00:00 UTC is the real Toronto
+    // spring-forward boundary. Fixed UTC makes IANA offset validation
+    // deterministic on every test date.
+    let dstNow = 1_741_503_570.0
     t4Lines.append(try clockLine(correlation(
-        1000.0, utc: now, timezone: tz, offset: -18000, reason: "session_start")))
+        1000.0, utc: dstNow, timezone: tz, offset: -18000, reason: "session_start")))
     t4Lines.append(try clockLine(correlation(
-        1030.0, utc: now + 30.0, timezone: tz, offset: -14400)))
+        1030.0, utc: dstNow + 30.0, timezone: tz, offset: -14400)))
     t4Lines.append(try clockLine(correlation(
-        1060.0, utc: now + 60.0, timezone: tz, offset: -14400, reason: "session_end")))
+        1060.0, utc: dstNow + 60.0, timezone: tz, offset: -14400, reason: "session_end")))
     t4Lines.append(try clockLine(binding(
-        1, nodeStamp: 1000.5, uptime: 1000.5, utc: now + 0.5,
+        1, nodeStamp: 1000.5, uptime: 1000.5, utc: dstNow + 0.5,
         timezone: tz, offset: -18000)))
     t4Lines.append(try clockLine(binding(
-        2, nodeStamp: 1030.5, uptime: 1030.5, utc: now + 30.5,
+        2, nodeStamp: 1030.5, uptime: 1030.5, utc: dstNow + 30.5,
         timezone: tz, offset: -14400)))
     let t4Evidence = try parseLines(
         t4Lines, expectedCorrelation: 3, expectedBinding: 2)
     let t4Mapper = StrictClockEvidenceParser.buildMapper(
         evidence: t4Evidence, sessionStartStamp: 1000.5)
     require(
-        abs((t4Mapper.utcSeconds(forMonotonic: 15.0) ?? -1) - (now + 15.5)) < 1.0e-6,
+        abs((t4Mapper.utcSeconds(forMonotonic: 15.0) ?? -1) - (dstNow + 15.5)) < 1.0e-6,
         "T4 DST must keep absolute UTC continuous")
     require(
         t4Mapper.context(forMonotonic: 5.0).utcOffsetSeconds == -18000
@@ -9020,6 +12748,109 @@ do {
             try clockLine(correlation(1030.0, utc: now - 10.0)),
         ])
     }
+    // RC-H10: reason is a closed enum, and node_bound is binding-only.
+    expectRejection("T19 reason whitelist", { if case .reasonInvalid = $0 { return true }; return false }) {
+        try parseLines([
+            try clockLine(correlation(1000.0, utc: now, reason: "invented_reason")),
+        ])
+    }
+    // RC-H11: UTC is the authoritative injective axis. Local timestamps
+    // may repeat during DST fall-back because timezone + offset remain in
+    // every output row, but duplicate UTC can never be inverted safely.
+    expectRejection("T20 non-injective UTC", { if case .nonInjectiveUTC = $0 { return true }; return false }) {
+        try parseLines([
+            try clockLine(correlation(1000.0, utc: now, reason: "session_start")),
+            try clockLine(correlation(1030.0, utc: now)),
+        ])
+    }
+    // RC-H09: errors report the original JSONL line, not the ordinal of
+    // the binding-only compact array.
+    expectRejection("T21 original binding line", {
+        if case .bindingUTCMismatch(let line) = $0 { return line == 3 }
+        return false
+    }) {
+        try parseLines([
+            try clockLine(correlation(1000.0, utc: now, reason: "session_start")),
+            try clockLine(correlation(1030.0, utc: now + 30.0)),
+            try clockLine(binding(
+                1, nodeStamp: now, uptime: 1005.0, utc: now + 15.0)),
+        ])
+    }
+    // RC-B21: IANA id alone is insufficient; the offset must match that
+    // timezone's rules at the exact UTC instant.
+    expectRejection("T22 timezone offset", {
+        if case .timezoneOffsetMismatch = $0 { return true }
+        return false
+    }) {
+        try parseLines([
+            try clockLine(correlation(
+                1000.0, utc: now, timezone: "UTC", offset: 3600,
+                reason: "session_start")),
+        ])
+    }
+    // The two boot-relative clocks are sampled for one node binding.
+    expectRejection("T23 frame/uptime relation", {
+        if case .bindingFrameUptimeMismatch = $0 { return true }
+        return false
+    }) {
+        var badBinding = binding(
+            1, nodeStamp: now, uptime: 1000.5, utc: now + 0.5)
+        badBinding["sampled_frame_timestamp"] = 9990.0
+        return try parseLines([
+            try clockLine(correlation(
+                1000.0, utc: now, reason: "session_start")),
+            try clockLine(correlation(1030.0, utc: now + 30.0)),
+            try clockLine(badBinding),
+        ])
+    }
+    // A self-consistent sidecar must still bind the exact snapshot DB
+    // node inventory; a fabricated id/stamp or missing coverage rejects.
+    expectRejection("T24 DB node inventory", {
+        if case .nodeInventoryMismatch = $0 { return true }
+        return false
+    }) {
+        try StrictClockEvidenceParser.parse(
+            content: t1Lines.joined(),
+            expectedTrackingSessionID: sessionID,
+            expectedCorrelationCount: 4,
+            expectedBindingCount: 4,
+            expectedNodeStampsByID: [
+                1: now + 300.0,
+                2: now + 300.5,
+                3: now + 301.0,
+                4: now + 999.0,
+            ])
+    }
+    // Absolute residuals, not dimensionless 50% ratio drift, identify a
+    // modest unannounced +3s jump. An explicit system_clock_change also
+    // splits a two-sample run where no independent scale estimate exists.
+    let modestJump = [
+        ClockCorrelationRecord.make(
+            trackingSessionID: sessionID, monotonicSeconds: 0,
+            utcUnixSeconds: now, timezoneID: "UTC",
+            utcOffsetSeconds: 0, reason: "session_start"),
+        ClockCorrelationRecord.make(
+            trackingSessionID: sessionID, monotonicSeconds: 30,
+            utcUnixSeconds: now + 30, timezoneID: "UTC",
+            utcOffsetSeconds: 0, reason: "periodic"),
+        ClockCorrelationRecord.make(
+            trackingSessionID: sessionID, monotonicSeconds: 60,
+            utcUnixSeconds: now + 63, timezoneID: "UTC",
+            utcOffsetSeconds: 0, reason: "periodic"),
+    ]
+    require(
+        StrictClockEvidenceParser.discontinuityEdges(of: modestJump) == Set([1]),
+        "T25 +3s absolute clock residual must mark the exact jump edge")
+    let explicitJump = [
+        modestJump[0],
+        ClockCorrelationRecord.make(
+            trackingSessionID: sessionID, monotonicSeconds: 30,
+            utcUnixSeconds: now + 300, timezoneID: "UTC",
+            utcOffsetSeconds: 0, reason: "system_clock_change"),
+    ]
+    require(
+        StrictClockEvidenceParser.discontinuityEdges(of: explicitJump) == Set([0]),
+        "T26 explicit system_clock_change must split a two-sample run")
     print(
         "strict clock parser passed: offset/scale/jump/DST/tz mapped, "
             + "count/truncate/duplicate/session/legacy/unknown/bool rejected")
@@ -9032,6 +12863,6 @@ catch {
 
 var finalizationResourceUsage = rusage()
 if getrusage(RUSAGE_SELF, &finalizationResourceUsage) == 0 {
-    print("Finalization test peak RSS bytes: \(finalizationResourceUsage.ru_maxrss)")
+    print("Default test peak RSS bytes: \(finalizationResourceUsage.ru_maxrss)")
 }
 print("PriorMapLocalizationCore Swift tests passed")

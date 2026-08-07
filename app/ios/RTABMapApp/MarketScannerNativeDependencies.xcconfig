@@ -1,0 +1,82 @@
+// Platform-scoped native link inputs. PLATFORM_NAME is resolved by Xcode to
+// iphoneos or iphonesimulator; no legacy Libraries/ fallback is permitted.
+
+MARKETSCANNER_IOS_DEPENDENCY_ROOT = $(PROJECT_DIR)/RTABMapApp/Libraries/$(PLATFORM_NAME)
+
+// The generated simulator prefix is an arm64 slice on every builder. Pinning
+// the app side keeps the exact `-sdk iphonesimulator clean build` gate
+// deterministic even when the hosted macOS machine itself is x86_64.
+ARCHS[sdk=iphonesimulator*] = arm64
+
+OTHER_LDFLAGS = $(inherited) \
+    -framework vtk \
+    "$(MARKETSCANNER_IOS_DEPENDENCY_ROOT)/lib/librtabmap_core.a" \
+    "$(MARKETSCANNER_IOS_DEPENDENCY_ROOT)/lib/librtabmap_utilite.a" \
+    "$(MARKETSCANNER_IOS_DEPENDENCY_ROOT)/lib/libopencv_xfeatures2d.a" \
+    "$(MARKETSCANNER_IOS_DEPENDENCY_ROOT)/lib/libopencv_video.a" \
+    "$(MARKETSCANNER_IOS_DEPENDENCY_ROOT)/lib/libopencv_tracking.a" \
+    "$(MARKETSCANNER_IOS_DEPENDENCY_ROOT)/lib/libopencv_optflow.a" \
+    "$(MARKETSCANNER_IOS_DEPENDENCY_ROOT)/lib/libopencv_imgproc.a" \
+    "$(MARKETSCANNER_IOS_DEPENDENCY_ROOT)/lib/libopencv_features2d.a" \
+    "$(MARKETSCANNER_IOS_DEPENDENCY_ROOT)/lib/libopencv_core.a" \
+    "$(MARKETSCANNER_IOS_DEPENDENCY_ROOT)/lib/libopencv_calib3d.a" \
+    "$(MARKETSCANNER_IOS_DEPENDENCY_ROOT)/lib/libopencv_aruco.a" \
+    "$(MARKETSCANNER_IOS_DEPENDENCY_ROOT)/lib/libopencv_flann.a" \
+    "$(MARKETSCANNER_IOS_DEPENDENCY_ROOT)/lib/libopencv_ximgproc.a" \
+    "$(MARKETSCANNER_IOS_DEPENDENCY_ROOT)/lib/libopencv_photo.a" \
+    "$(MARKETSCANNER_IOS_DEPENDENCY_ROOT)/lib/libopencv_objdetect.a" \
+    "$(MARKETSCANNER_IOS_DEPENDENCY_ROOT)/lib/libopencv_stitching.a" \
+    "$(MARKETSCANNER_IOS_DEPENDENCY_ROOT)/lib/libopencv_imgcodecs.a" \
+    "$(MARKETSCANNER_IOS_DEPENDENCY_ROOT)/lib/libamd.a" \
+    "$(MARKETSCANNER_IOS_DEPENDENCY_ROOT)/lib/libsuitesparseconfig.a" \
+    "$(MARKETSCANNER_IOS_DEPENDENCY_ROOT)/lib/libspqr.a" \
+    "$(MARKETSCANNER_IOS_DEPENDENCY_ROOT)/lib/libcxsparse.a" \
+    "$(MARKETSCANNER_IOS_DEPENDENCY_ROOT)/lib/libcolamd.a" \
+    "$(MARKETSCANNER_IOS_DEPENDENCY_ROOT)/lib/libcamd.a" \
+    "$(MARKETSCANNER_IOS_DEPENDENCY_ROOT)/lib/libccolamd.a" \
+    "$(MARKETSCANNER_IOS_DEPENDENCY_ROOT)/lib/libcholmod.a" \
+    "$(MARKETSCANNER_IOS_DEPENDENCY_ROOT)/lib/libg2o_core.a" \
+    "$(MARKETSCANNER_IOS_DEPENDENCY_ROOT)/lib/libg2o_solver_cholmod.a" \
+    "$(MARKETSCANNER_IOS_DEPENDENCY_ROOT)/lib/libg2o_csparse_extension.a" \
+    "$(MARKETSCANNER_IOS_DEPENDENCY_ROOT)/lib/libg2o_solver_csparse.a" \
+    "$(MARKETSCANNER_IOS_DEPENDENCY_ROOT)/lib/libg2o_solver_dense.a" \
+    "$(MARKETSCANNER_IOS_DEPENDENCY_ROOT)/lib/libg2o_solver_eigen.a" \
+    "$(MARKETSCANNER_IOS_DEPENDENCY_ROOT)/lib/libg2o_solver_pcg.a" \
+    "$(MARKETSCANNER_IOS_DEPENDENCY_ROOT)/lib/libg2o_solver_slam2d_linear.a" \
+    "$(MARKETSCANNER_IOS_DEPENDENCY_ROOT)/lib/libg2o_solver_structure_only.a" \
+    "$(MARKETSCANNER_IOS_DEPENDENCY_ROOT)/lib/libg2o_stuff.a" \
+    "$(MARKETSCANNER_IOS_DEPENDENCY_ROOT)/lib/libg2o_types_data.a" \
+    "$(MARKETSCANNER_IOS_DEPENDENCY_ROOT)/lib/libg2o_types_icp.a" \
+    "$(MARKETSCANNER_IOS_DEPENDENCY_ROOT)/lib/libg2o_types_sba.a" \
+    "$(MARKETSCANNER_IOS_DEPENDENCY_ROOT)/lib/libg2o_types_sclam2d.a" \
+    "$(MARKETSCANNER_IOS_DEPENDENCY_ROOT)/lib/libg2o_types_sim3.a" \
+    "$(MARKETSCANNER_IOS_DEPENDENCY_ROOT)/lib/libg2o_types_slam2d_addons.a" \
+    "$(MARKETSCANNER_IOS_DEPENDENCY_ROOT)/lib/libg2o_types_slam2d.a" \
+    "$(MARKETSCANNER_IOS_DEPENDENCY_ROOT)/lib/libg2o_types_slam3d_addons.a" \
+    "$(MARKETSCANNER_IOS_DEPENDENCY_ROOT)/lib/libg2o_types_slam3d.a" \
+    "$(MARKETSCANNER_IOS_DEPENDENCY_ROOT)/lib/libpcl_common.a" \
+    "$(MARKETSCANNER_IOS_DEPENDENCY_ROOT)/lib/libpcl_features.a" \
+    "$(MARKETSCANNER_IOS_DEPENDENCY_ROOT)/lib/libpcl_filters.a" \
+    "$(MARKETSCANNER_IOS_DEPENDENCY_ROOT)/lib/libpcl_io_ply.a" \
+    "$(MARKETSCANNER_IOS_DEPENDENCY_ROOT)/lib/libpcl_io.a" \
+    "$(MARKETSCANNER_IOS_DEPENDENCY_ROOT)/lib/libpcl_kdtree.a" \
+    "$(MARKETSCANNER_IOS_DEPENDENCY_ROOT)/lib/libpcl_keypoints.a" \
+    "$(MARKETSCANNER_IOS_DEPENDENCY_ROOT)/lib/libpcl_ml.a" \
+    "$(MARKETSCANNER_IOS_DEPENDENCY_ROOT)/lib/libpcl_octree.a" \
+    "$(MARKETSCANNER_IOS_DEPENDENCY_ROOT)/lib/libpcl_registration.a" \
+    "$(MARKETSCANNER_IOS_DEPENDENCY_ROOT)/lib/libpcl_sample_consensus.a" \
+    "$(MARKETSCANNER_IOS_DEPENDENCY_ROOT)/lib/libpcl_search.a" \
+    "$(MARKETSCANNER_IOS_DEPENDENCY_ROOT)/lib/libpcl_segmentation.a" \
+    "$(MARKETSCANNER_IOS_DEPENDENCY_ROOT)/lib/libpcl_stereo.a" \
+    "$(MARKETSCANNER_IOS_DEPENDENCY_ROOT)/lib/libpcl_surface.a" \
+    "$(MARKETSCANNER_IOS_DEPENDENCY_ROOT)/lib/libgtsam_unstable.a" \
+    "$(MARKETSCANNER_IOS_DEPENDENCY_ROOT)/lib/libgtsam.a" \
+    "$(MARKETSCANNER_IOS_DEPENDENCY_ROOT)/lib/libmetis-gtsam.a" \
+    "$(MARKETSCANNER_IOS_DEPENDENCY_ROOT)/lib/libboost_serialization.a" \
+    "$(MARKETSCANNER_IOS_DEPENDENCY_ROOT)/lib/libboost_timer.a" \
+    "$(MARKETSCANNER_IOS_DEPENDENCY_ROOT)/lib/libboost_thread.a" \
+    "$(MARKETSCANNER_IOS_DEPENDENCY_ROOT)/lib/liblas_c.a" \
+    "$(MARKETSCANNER_IOS_DEPENDENCY_ROOT)/lib/liblas.a" \
+    "$(MARKETSCANNER_IOS_DEPENDENCY_ROOT)/lib/liblaszip.a" \
+    "$(MARKETSCANNER_IOS_DEPENDENCY_ROOT)/lib/opencv4/3rdparty/liblibjpeg-turbo.a" \
+    "$(MARKETSCANNER_IOS_DEPENDENCY_ROOT)/lib/opencv4/3rdparty/liblibpng.a"

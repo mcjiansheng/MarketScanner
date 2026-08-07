@@ -1,4 +1,120 @@
 import Foundation
+import Darwin
+
+/// Reads an app-private staged import through one no-follow descriptor.
+/// The bounded chunked read and pre/post identity checks prevent mmap
+/// races, symlink/hardlink substitution, truncation and replacement.
+enum StableMapSourceFileReader {
+    private struct Identity: Equatable {
+        let device: dev_t
+        let inode: ino_t
+        let size: off_t
+        let modificationSeconds: Int
+        let modificationNanoseconds: Int
+        let changeSeconds: Int
+        let changeNanoseconds: Int
+
+        init(_ value: stat) {
+            device = value.st_dev
+            inode = value.st_ino
+            size = value.st_size
+            modificationSeconds = value.st_mtimespec.tv_sec
+            modificationNanoseconds = value.st_mtimespec.tv_nsec
+            changeSeconds = value.st_ctimespec.tv_sec
+            changeNanoseconds = value.st_ctimespec.tv_nsec
+        }
+    }
+
+    static func read(
+        _ url: URL,
+        maximumBytes: Int64 = MapSourceImportLimits.maximumSourceFileBytes
+    ) throws -> Data {
+        var pathBefore = stat()
+        guard lstat(url.path, &pathBefore) == 0 else {
+            throw MapSourceImportError.unreadableSource(
+                reason: "cannot inspect staged source")
+        }
+        guard isSingleRegularFile(pathBefore) else {
+            throw MapSourceImportError.unreadableSource(
+                reason: "staged source is not a single regular file")
+        }
+
+        let descriptor = open(url.path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW)
+        guard descriptor >= 0 else {
+            throw MapSourceImportError.unreadableSource(
+                reason: "cannot open staged source without following links")
+        }
+        var needsClose = true
+        defer {
+            if needsClose { _ = close(descriptor) }
+        }
+
+        var descriptorBefore = stat()
+        guard fstat(descriptor, &descriptorBefore) == 0,
+              isSingleRegularFile(descriptorBefore),
+              Identity(descriptorBefore) == Identity(pathBefore) else {
+            throw MapSourceImportError.unreadableSource(
+                reason: "staged source identity changed before read")
+        }
+        guard descriptorBefore.st_size >= 0 else {
+            throw MapSourceImportError.unreadableSource(
+                reason: "staged source has an invalid size")
+        }
+        guard descriptorBefore.st_size <= maximumBytes else {
+            throw MapSourceImportError.fileTooLarge(limitBytes: maximumBytes)
+        }
+
+        var data = Data()
+        data.reserveCapacity(Int(descriptorBefore.st_size))
+        var buffer = [UInt8](repeating: 0, count: 256 * 1024)
+        while true {
+            let count = buffer.withUnsafeMutableBytes { rawBuffer -> Int in
+                while true {
+                    let result = Darwin.read(
+                        descriptor, rawBuffer.baseAddress, rawBuffer.count)
+                    if result < 0 && errno == EINTR { continue }
+                    return result
+                }
+            }
+            guard count >= 0 else {
+                throw MapSourceImportError.unreadableSource(
+                    reason: "staged source read failed")
+            }
+            if count == 0 { break }
+            guard Int64(data.count) + Int64(count) <= maximumBytes else {
+                throw MapSourceImportError.fileTooLarge(limitBytes: maximumBytes)
+            }
+            buffer.withUnsafeBytes { rawBuffer in
+                data.append(
+                    rawBuffer.bindMemory(to: UInt8.self).baseAddress!,
+                    count: count)
+            }
+        }
+
+        var descriptorAfter = stat()
+        var pathAfter = stat()
+        guard fstat(descriptor, &descriptorAfter) == 0,
+              lstat(url.path, &pathAfter) == 0,
+              isSingleRegularFile(descriptorAfter),
+              isSingleRegularFile(pathAfter),
+              Identity(descriptorBefore) == Identity(descriptorAfter),
+              Identity(descriptorBefore) == Identity(pathAfter),
+              Int64(data.count) == Int64(descriptorBefore.st_size) else {
+            throw MapSourceImportError.unreadableSource(
+                reason: "staged source changed while it was read")
+        }
+        guard close(descriptor) == 0 else {
+            throw MapSourceImportError.unreadableSource(
+                reason: "cannot close staged source")
+        }
+        needsClose = false
+        return data
+    }
+
+    private static func isSingleRegularFile(_ value: stat) -> Bool {
+        return (value.st_mode & S_IFMT) == S_IFREG && value.st_nlink == 1
+    }
+}
 
 /// Orchestrates a map-source import from a stable, app-private staged
 /// copy of the provider document.
@@ -17,17 +133,16 @@ enum MapSourceImportCoordinator {
         mapName: String? = nil,
         strict: Bool = true
     ) throws -> MapSourceImportReport {
-        let attributes = try FileManager.default.attributesOfItem(atPath: stagedURL.path)
-        let fileSize = (attributes[.size] as? NSNumber)?.int64Value ?? 0
-        guard fileSize <= MapSourceImportLimits.maximumSourceFileBytes else {
-            throw MapSourceImportError.fileTooLarge(limitBytes: MapSourceImportLimits.maximumSourceFileBytes)
-        }
         let data: Data
         do {
-            data = try Data(contentsOf: stagedURL, options: [.mappedIfSafe])
+            data = try StableMapSourceFileReader.read(stagedURL)
+        } catch let error as MapSourceImportError {
+            throw error
         } catch {
-            throw MapSourceImportError.unreadableSource(reason: error.localizedDescription)
+            throw MapSourceImportError.unreadableSource(
+                reason: "stable staged-source read failed")
         }
+        let fileSize = Int64(data.count)
         let sourceFileSha256 = CanonicalSourceHasher.sha256(data)
         let format = try detectFormat(filename: originalFilename, data: data)
 
@@ -90,6 +205,8 @@ enum MapSourceImportCoordinator {
         let finalStoreID = outcome.storeId ?? resolvedStoreId
         let finalMapName = outcome.mapName ?? resolvedMapName
         let finalContract = outcome.coordinateContract ?? contract
+        try MapSourceBusinessIdentityPolicy.validate(
+            storeID: finalStoreID, mapName: finalMapName)
 
         // V1R4 §14.1: official element ids must be globally unique in the
         // store/map context; a duplicate identity is a blocker, never a

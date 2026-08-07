@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import unicodedata
 
 from .strict_json import StrictJSONError, load_strict_json_bytes
 import hashlib
@@ -40,10 +41,38 @@ PACKAGE_FILES = {
     "validation_report.json",
 }
 IGNORABLE_FILESYSTEM_METADATA = frozenset({".DS_Store"})
+MAXIMUM_STORE_ID_UTF8_BYTES = 128
+MAXIMUM_MAP_NAME_UTF8_BYTES = 200
 
 
 class PriorMapValidationError(ValueError):
     pass
+
+
+def _valid_business_identity_component(value: Any, maximum_utf8_bytes: int) -> bool:
+    if not isinstance(value, str) or not value:
+        return False
+    if unicodedata.normalize("NFC", value) != value:
+        return False
+    if len(value.encode("utf-8")) > maximum_utf8_bytes:
+        return False
+    if value in {".", ".."} or value.startswith("."):
+        return False
+    if "/" in value or "\\" in value or Path(value).name != value:
+        return False
+    if value != value.strip() or not value.strip():
+        return False
+    if any(ord(character) < 0x20 or 0x7F <= ord(character) <= 0x9F for character in value):
+        return False
+    return True
+
+
+def validate_business_identity(store_id: Any, map_name: Any) -> None:
+    """Enforce the shared Mobile/PC store and map-name contract."""
+    if not _valid_business_identity_component(store_id, MAXIMUM_STORE_ID_UTF8_BYTES):
+        raise PriorMapValidationError("store_id 不符合统一业务标识策略。")
+    if not _valid_business_identity_component(map_name, MAXIMUM_MAP_NAME_UTF8_BYTES):
+        raise PriorMapValidationError("地图 name 不符合统一业务标识策略。")
 
 
 def _is_ignorable_filesystem_metadata(path: Path) -> bool:
@@ -441,6 +470,11 @@ def validate_package(directory: Path | str) -> dict[str, Any]:
     assert spatial is not None
     assert distance_fields is not None
     assert validation_report is not None
+
+    try:
+        validate_business_identity(manifest.get("store_id"), manifest.get("name"))
+    except PriorMapValidationError as exc:
+        errors.append({"code": "business_identity", "message": str(exc)})
 
     if not isinstance(manifest.get("prior_map_id"), str) or not manifest["prior_map_id"]:
         errors.append({"code": "map_id", "message": "地图包缺少 prior_map_id。"})

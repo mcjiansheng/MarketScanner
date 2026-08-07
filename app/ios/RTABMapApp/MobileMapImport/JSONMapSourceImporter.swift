@@ -115,6 +115,8 @@ enum JSONMapSourceImporter {
         guard let mapName = root["map_name"] as? String, !mapName.isEmpty else {
             throw MapSourceImportError.invalidJSON(detail: "map_name 不能为空。")
         }
+        try MapSourceBusinessIdentityPolicy.validate(
+            storeID: storeID, mapName: mapName)
         let contract = try decodeCoordinateContract(root["coordinate_contract"])
 
         var warnings: [MapSourceWarning] = []
@@ -371,6 +373,13 @@ enum LegacyV1JSONMapSourceDecoder {
         for key in requiredTopLevel where root[key] == nil {
             throw MapSourceImportError.invalidJSON(detail: "缺少必需顶层字段 \(key)。")
         }
+        guard let storeID = root["storeId"] as? String,
+              let mapName = root["mapName"] as? String else {
+            throw MapSourceImportError.invalidJSON(
+                detail: "storeId/mapName 必须是字符串。")
+        }
+        try MapSourceBusinessIdentityPolicy.validate(
+            storeID: storeID, mapName: mapName)
 
         var warnings: [MapSourceWarning] = []
         var extensions: [String: Any] = [:]

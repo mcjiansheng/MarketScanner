@@ -37,6 +37,7 @@ from .strict_json import (
 from .localized_output_store import LocalizedVersionStore
 from .prior_map_schema import load_json, validate_package
 from .factor_graph_runner import FactorGraphRunnerError, run_relative_se2_factor_graph
+from .generated_mobile_evidence_contracts import MOBILE_EVIDENCE_CONTRACTS
 
 
 FORMAT_VERSION = 1
@@ -731,7 +732,9 @@ def build_local_input_record(
 
 
 class OfflineLocalizationError(ValueError):
-    pass
+    def __init__(self, message: str, *, reason: str | None = None) -> None:
+        super().__init__(message)
+        self.reason = reason
 
 
 @dataclass(frozen=True)
@@ -780,9 +783,11 @@ class JsonlContract:
     maximum_records: int = 500_000
     maximum_file_bytes: int | None = None
     maximum_nesting_depth: int | None = None
+    qualification_maximum_records: int | None = None
     strictly_increasing_timestamps: bool = False
 
 
+TRACE_LIMITS = MOBILE_EVIDENCE_CONTRACTS["localization_trace.jsonl"]
 TRACE_CONTRACT = JsonlContract(
     "localization_trace",
     "MarketScannerLocalizationTrace",
@@ -790,6 +795,11 @@ TRACE_CONTRACT = JsonlContract(
     True,
     False,
     ("node_timebase_timestamp", "nodeTimebaseTimestamp"),
+    maximum_record_bytes=TRACE_LIMITS["max_record_bytes"],
+    maximum_records=TRACE_LIMITS["max_records"],
+    maximum_file_bytes=TRACE_LIMITS["max_file_bytes"],
+    maximum_nesting_depth=TRACE_LIMITS["max_nesting_depth"],
+    qualification_maximum_records=TRACE_LIMITS["qualification_max_records"],
     strictly_increasing_timestamps=True,
 )
 CONSTRAINT_CONTRACT = JsonlContract(
@@ -1225,6 +1235,267 @@ def _node_timebase_timestamp(
     return converted_number
 
 
+_FORMAL_TRACE_FIELDS = frozenset(
+    {
+        "format", "version", "timestamp", "trackingState",
+        "localizationState", "confidence", "rawPose", "estimatedPose",
+        "roadCandidates", "structureSource", "structurePointCount",
+        "structureCoverageAngleRad", "matchCandidates", "matchUniqueness",
+        "matchResidualCost", "matcherElapsedMs", "constraintAccepted",
+        "constraintReason", "measurementAccepted", "hypothesisTrusted",
+        "correctionStepApplied", "recoveryConvergedThisUpdate",
+        "confidenceAccepted", "constraintDisposition",
+        "postRecoveryTrustedLocalFrames", "scanSearchPerformed",
+        "hypothesisSupportFrames", "hypothesisScoreMargin", "recoverySearch",
+        "correctionTranslationM", "correctionYawDeg", "mapFromArkitX",
+        "mapFromArkitY", "mapFromArkitYawDeg", "selectedHypothesisId",
+        "activeHypothesisTrackCount", "hypothesisBestCost",
+        "hypothesisSecondCost", "hypothesisReason",
+        "hypothesisTrackerElapsedMs", "recoveryEpisodeId", "recoveryReason",
+        "recoveryOutcome", "recoveryValidAttemptCount",
+        "recoveryRemainingValidAttempts", "recoveryElapsedMs",
+        "recoveryFreshSupportFrames", "recoveryTriggerCount",
+        "recoveryFinishedAtUptime", "recoverySelectedHypothesisId",
+        "recoveryFinalResidualTranslationM", "recoveryFinalResidualYawDeg",
+        "recoveryCorrectionStepAppliedOnCompletionFrame",
+        "recoveryCooldownRemainingMs", "recoveryAutomaticTriggerSuppressed",
+        "recoveryAutomaticTriggerReason", "trackingSessionId", "priorMapId",
+        "priorMapSha256", "floorId", "nodeTimebaseTimestamp",
+        "nodeTimebaseOffsetSeconds",
+    }
+)
+_FORMAL_TRACE_LOCALIZATION_STATES = frozenset(
+    {
+        "uninitialized", "initializing", "stable", "usable", "recovering",
+        "weak", "lost", "manualCorrection",
+    }
+)
+_FORMAL_TRACE_TRACKING_STATES = frozenset(
+    {
+        "normal", "notAvailable", "limited.excessiveMotion",
+        "limited.insufficientFeatures", "limited.initializing",
+        "limited.relocalizing", "unknown",
+    }
+)
+_FORMAL_TRACE_DISPOSITIONS = frozenset(
+    {
+        "rejected", "provisional_recovery_step", "accepted_local",
+        "accepted_recovery_convergence",
+    }
+)
+_FORMAL_TRACE_RECOVERY_OUTCOMES = frozenset(
+    {"active", "converged", "timed_out", "cancelled", "manual_reset"}
+)
+
+
+def _trace_failure(reason: str, line_label: str) -> None:
+    raise OfflineLocalizationError(
+        f"{reason} at {line_label}", reason=reason
+    )
+
+
+def _validate_formal_trace_state(value: dict[str, Any], line_label: str) -> None:
+    """PC parity validator for the device's current camelCase trace schema.
+
+    Historical PC fixtures omit ``constraintDisposition`` and retain their
+    legacy compatibility path. Every current device record contains it and is
+    therefore checked against the exact same stable reason categories as the
+    Swift parser.
+    """
+    if "constraintDisposition" not in value:
+        return
+    unknown = sorted(set(value) - _FORMAL_TRACE_FIELDS)
+    if unknown:
+        _trace_failure(f"unknown_field_{','.join(unknown)}", line_label)
+    boolean_fields = {
+        "constraintAccepted", "measurementAccepted", "hypothesisTrusted",
+        "correctionStepApplied", "recoveryConvergedThisUpdate",
+        "confidenceAccepted", "scanSearchPerformed", "recoverySearch",
+        "recoveryAutomaticTriggerSuppressed",
+    }
+    for field in boolean_fields:
+        if type(value.get(field)) is not bool:
+            _trace_failure(f"state_field_type_invalid_{field}", line_label)
+    nonnegative_integer_fields = {
+        "structurePointCount", "postRecoveryTrustedLocalFrames",
+        "hypothesisSupportFrames", "activeHypothesisTrackCount",
+    }
+    for field in nonnegative_integer_fields:
+        item = value.get(field)
+        if type(item) is not int or item < 0:
+            _trace_failure(f"state_field_type_invalid_{field}", line_label)
+    required_numbers = {
+        "structureCoverageAngleRad", "matchUniqueness", "matcherElapsedMs",
+        "hypothesisScoreMargin", "correctionTranslationM", "correctionYawDeg",
+        "hypothesisTrackerElapsedMs", "recoveryCooldownRemainingMs",
+    }
+    numbers: dict[str, float] = {}
+    for field in required_numbers:
+        item = _strict_number(value.get(field))
+        if item is None:
+            _trace_failure(f"state_field_type_invalid_{field}", line_label)
+        numbers[field] = item
+    for field in {
+        "matcherElapsedMs", "correctionTranslationM",
+        "hypothesisTrackerElapsedMs", "recoveryCooldownRemainingMs",
+    }:
+        if numbers[field] < 0:
+            _trace_failure(f"state_field_range_invalid_{field}", line_label)
+    if not 0 <= numbers["matchUniqueness"] <= 1:
+        _trace_failure("state_field_range_invalid_matchUniqueness", line_label)
+    optional_numbers = {
+        "matchResidualCost", "mapFromArkitX", "mapFromArkitY",
+        "mapFromArkitYawDeg", "hypothesisBestCost", "hypothesisSecondCost",
+        "recoveryElapsedMs", "recoveryFinishedAtUptime",
+        "recoveryFinalResidualTranslationM", "recoveryFinalResidualYawDeg",
+    }
+    for field in optional_numbers:
+        if field in value and _strict_number(value[field]) is None:
+            _trace_failure(f"state_field_type_invalid_{field}", line_label)
+    optional_integers = {
+        "selectedHypothesisId", "recoveryEpisodeId",
+        "recoveryValidAttemptCount", "recoveryRemainingValidAttempts",
+        "recoveryFreshSupportFrames", "recoveryTriggerCount",
+        "recoverySelectedHypothesisId",
+    }
+    for field in optional_integers:
+        if field in value and (
+            type(value[field]) is not int or value[field] < 0
+        ):
+            _trace_failure(f"state_field_type_invalid_{field}", line_label)
+    completion_step = value.get(
+        "recoveryCorrectionStepAppliedOnCompletionFrame"
+    )
+    if completion_step is not None and type(completion_step) is not bool:
+        _trace_failure(
+            "state_field_type_invalid_"
+            "recoveryCorrectionStepAppliedOnCompletionFrame",
+            line_label,
+        )
+    automatic_reason = value.get("recoveryAutomaticTriggerReason")
+    if automatic_reason is not None and (
+        not isinstance(automatic_reason, str) or not automatic_reason
+    ):
+        _trace_failure(
+            "state_field_type_invalid_recoveryAutomaticTriggerReason",
+            line_label,
+        )
+    disposition = value.get("constraintDisposition")
+    if (
+        not isinstance(value.get("structureSource"), str)
+        or not value["structureSource"]
+        or not isinstance(value.get("constraintReason"), str)
+        or not value["constraintReason"]
+        or not isinstance(value.get("hypothesisReason"), str)
+        or not value["hypothesisReason"]
+        or not isinstance(value.get("roadCandidates"), list)
+        or not isinstance(value.get("matchCandidates"), list)
+        or disposition not in _FORMAL_TRACE_DISPOSITIONS
+    ):
+        _trace_failure("formal_state_schema_invalid", line_label)
+    localization_state = value.get("localizationState")
+    tracking_state = value.get("trackingState")
+    if localization_state not in _FORMAL_TRACE_LOCALIZATION_STATES:
+        _trace_failure("schema_or_state_invalid", line_label)
+    if tracking_state not in _FORMAL_TRACE_TRACKING_STATES:
+        _trace_failure("schema_or_state_invalid", line_label)
+
+    accepted_disposition = disposition in {
+        "accepted_local", "accepted_recovery_convergence"
+    }
+    measurement_disposition = accepted_disposition or disposition == (
+        "provisional_recovery_step"
+    )
+    recovery_converged = value["recoveryConvergedThisUpdate"]
+    if not (
+        value["constraintAccepted"] == accepted_disposition
+        and value["measurementAccepted"] == measurement_disposition
+        and value["correctionStepApplied"] == measurement_disposition
+        and value["confidenceAccepted"] == accepted_disposition
+        and recovery_converged
+        == (disposition == "accepted_recovery_convergence")
+    ):
+        _trace_failure("constraint_disposition_inconsistent", line_label)
+    if value["measurementAccepted"] and (
+        not value["hypothesisTrusted"] or not value["scanSearchPerformed"]
+    ):
+        _trace_failure("measurement_state_inconsistent", line_label)
+    recovery_search = value["recoverySearch"]
+    if disposition == "accepted_local" and recovery_search:
+        _trace_failure("local_acceptance_during_recovery", line_label)
+    if disposition == "provisional_recovery_step" and not recovery_search:
+        _trace_failure("provisional_step_without_recovery", line_label)
+    if tracking_state != "normal" and any(
+        value[field]
+        for field in {
+            "constraintAccepted", "measurementAccepted",
+            "correctionStepApplied", "confidenceAccepted",
+        }
+    ):
+        _trace_failure("tracking_state_inconsistent", line_label)
+    confidence = _strict_number(value.get("confidence"))
+    if tracking_state == "notAvailable" and (
+        localization_state != "lost" or confidence != 0
+    ):
+        _trace_failure("tracking_state_inconsistent", line_label)
+
+    recovery_core = {
+        "recoveryEpisodeId", "recoveryReason", "recoveryOutcome",
+        "recoveryValidAttemptCount", "recoveryRemainingValidAttempts",
+        "recoveryElapsedMs", "recoveryTriggerCount",
+    }
+    present_count = sum(field in value for field in recovery_core)
+    if present_count not in {0, len(recovery_core)}:
+        _trace_failure("recovery_bundle_incomplete", line_label)
+    recovery_outcome = value.get("recoveryOutcome")
+    if present_count:
+        if (
+            type(value["recoveryEpisodeId"]) is not int
+            or value["recoveryEpisodeId"] <= 0
+            or not isinstance(value["recoveryReason"], str)
+            or not value["recoveryReason"]
+            or recovery_outcome not in _FORMAL_TRACE_RECOVERY_OUTCOMES
+        ):
+            _trace_failure("recovery_bundle_invalid", line_label)
+        if recovery_outcome == "active":
+            if (
+                not recovery_search
+                or "recoveryFinishedAtUptime" in value
+                or "recoveryCorrectionStepAppliedOnCompletionFrame" in value
+            ):
+                _trace_failure("recovery_active_state_inconsistent", line_label)
+        elif not {
+            "recoveryFinishedAtUptime", "recoveryFreshSupportFrames",
+            "recoveryCorrectionStepAppliedOnCompletionFrame",
+        }.issubset(value):
+            _trace_failure("recovery_completion_incomplete", line_label)
+    else:
+        stray = {
+            "recoveryFreshSupportFrames", "recoveryFinishedAtUptime",
+            "recoverySelectedHypothesisId",
+            "recoveryFinalResidualTranslationM",
+            "recoveryFinalResidualYawDeg",
+            "recoveryCorrectionStepAppliedOnCompletionFrame",
+        }
+        if any(field in value for field in stray):
+            _trace_failure("recovery_bundle_incomplete", line_label)
+    if localization_state == "recovering" and not (
+        recovery_search and recovery_outcome == "active" and not recovery_converged
+    ):
+        _trace_failure("localization_recovery_state_inconsistent", line_label)
+    if recovery_outcome == "active" and localization_state != "recovering":
+        if not (
+            tracking_state == "notAvailable" and localization_state == "lost"
+        ):
+            _trace_failure("localization_recovery_state_inconsistent", line_label)
+    if recovery_converged and recovery_outcome != "converged":
+        _trace_failure("recovery_convergence_inconsistent", line_label)
+    if value["recoveryAutomaticTriggerSuppressed"] != (
+        "recoveryAutomaticTriggerReason" in value
+    ):
+        _trace_failure("automatic_trigger_state_inconsistent", line_label)
+
+
 def _validate_jsonl_business_record(
     contract: JsonlContract, value: dict[str, Any], line_label: str
 ) -> None:
@@ -1254,6 +1525,7 @@ def _validate_jsonl_business_record(
         confidence = _strict_number(value.get("confidence"))
         if confidence is None or not 0 <= confidence <= 1:
             raise OfflineLocalizationError(f"Invalid trace confidence at {line_label}")
+        _validate_formal_trace_state(value, line_label)
         disposition = _field(value, "constraint_disposition", "constraintDisposition")
         accepted = _field(value, "constraint_accepted", "constraintAccepted")
         if disposition is not None:
@@ -1394,7 +1666,8 @@ def _read_jsonl_bytes(
         except (json.JSONDecodeError, ValueError, RecursionError) as exc:
             diagnostics["invalid_json_lines"] += 1
             raise OfflineLocalizationError(
-                f"Invalid JSON at {path_label}:{line_no}: {exc}"
+                f"Invalid JSON at {path_label}:{line_no}: {exc}",
+                reason="invalid_json" if contract.name == "localization_trace" else None,
             ) from exc
         if not isinstance(value, dict):
             diagnostics["non_object_lines"] += 1
@@ -1489,6 +1762,16 @@ def _read_jsonl_bytes(
             seen_ids.add(record_id)
         values.append(value)
         diagnostics["valid_records"] += 1
+        if (
+            contract.qualification_maximum_records is not None
+            and len(values) > contract.qualification_maximum_records
+        ):
+            raise OfflineLocalizationError(
+                "qualification_limit_exceeded at "
+                f"{path_label}:{line_no}: {len(values)} > "
+                f"{contract.qualification_maximum_records}",
+                reason="qualification_limit_exceeded",
+            )
         if len(values) > contract.maximum_records:
             raise OfflineLocalizationError(
                 f"{path_label} exceeds the bounded "

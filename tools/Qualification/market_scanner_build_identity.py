@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Unified MarketScanner build-identity contract (V1R4 §3.3).
+"""Unified MarketScanner build-identity and governance contract.
 
 This is the SINGLE source of the native-core digest algorithm. The
 Xcode "MarketScanner Build Identity" script phase, the GitHub Actions
@@ -13,10 +13,11 @@ Digest contract (byte-exact, frozen):
         b"market_scanner_factor_graph.h\\0"   + h_bytes
     )
 
-The embedded JSON always carries format/version, the app git SHA
-(40 lowercase hex), the wave name and the native core SHA (64 lowercase
-hex). A dirty tree or any malformed field fails closed (exit != 0);
-`unknown` must never reach an eligible session.
+The embedded version-3 JSON carries the exact governance descriptor
+(`wave`, `branch`, `base_branch`, and its three SHA bindings), the app Git
+SHA (40 lowercase hex), and the native-core SHA-256 (64 lowercase hex).
+Unknown, missing, duplicate, unsafe, or malformed fields fail closed
+(exit != 0); `unknown` must never reach an eligible session.
 
 Usage:
     market_scanner_build_identity.py emit --repo <root> [--out file]
@@ -28,15 +29,37 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
 
 FORMAT = "MarketScannerBuildIdentity"
-VERSION = 2
+VERSION = 3
 CPP_REL = os.path.join("core", "MarketScannerFactorGraph", "market_scanner_factor_graph.cpp")
 H_REL = os.path.join("core", "MarketScannerFactorGraph", "market_scanner_factor_graph.h")
 WAVE_REL = os.path.join(".github", "marketscanner-repair-v2-wave.json")
+GOVERNANCE_KEYS = {
+    "wave",
+    "branch",
+    "base_branch",
+    "base_sha",
+    "implementation_sha",
+    "validation_sha",
+}
+IDENTITY_KEYS = GOVERNANCE_KEYS | {
+    "format",
+    "version",
+    "app_git_sha",
+    "native_core_sha256",
+}
+SAFE_GOVERNANCE_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,127}$")
+LOWER_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+LOWER_DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
+UNBOUND_SHA_PLACEHOLDERS = {
+    "implementation_sha": "<CODE_CONTRACT_TEST_BUILD_SHA>",
+    "validation_sha": "<EVIDENCE_DOCS_SHA>",
+}
 
 
 def fail(message: str) -> None:
@@ -88,42 +111,112 @@ def git_sha(repo_root: str, allow_dirty: bool) -> str:
     return sha
 
 
-def wave_name(repo_root: str) -> str:
+def _strict_json_object(pairs: list[tuple[str, object]]) -> dict:
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            fail("governance descriptor contains duplicate field: %s" % key)
+        result[key] = value
+    return result
+
+
+def _validate_safe_governance_name(value: object, field: str) -> str:
+    if not isinstance(value, str) or not SAFE_GOVERNANCE_NAME_RE.fullmatch(value):
+        fail("%s is not a safe non-empty governance name: %r" % (field, value))
+    return value
+
+
+def _validate_governance_sha(
+    value: object,
+    field: str,
+    *,
+    allow_unbound_placeholder: bool,
+) -> str:
+    if not isinstance(value, str):
+        fail("%s is not a string" % field)
+    if LOWER_SHA_RE.fullmatch(value):
+        return value
+    if allow_unbound_placeholder and value == UNBOUND_SHA_PLACEHOLDERS[field]:
+        return value
+    fail("%s is not a 40-char lowercase SHA or its exact unbound placeholder: %r"
+         % (field, value))
+    raise AssertionError("unreachable")
+
+
+def validate_governance_descriptor(descriptor: object) -> dict:
+    if not isinstance(descriptor, dict):
+        fail("governance descriptor root must be an object")
+    if set(descriptor) != GOVERNANCE_KEYS:
+        fail("governance descriptor schema mismatch: expected=%r actual=%r"
+             % (sorted(GOVERNANCE_KEYS), sorted(descriptor)))
+    validated = {
+        "wave": _validate_safe_governance_name(descriptor.get("wave"), "wave"),
+        "branch": _validate_safe_governance_name(
+            descriptor.get("branch"), "branch"),
+        "base_branch": _validate_safe_governance_name(
+            descriptor.get("base_branch"), "base_branch"),
+        "base_sha": _validate_governance_sha(
+            descriptor.get("base_sha"), "base_sha",
+            allow_unbound_placeholder=False),
+        "implementation_sha": _validate_governance_sha(
+            descriptor.get("implementation_sha"), "implementation_sha",
+            allow_unbound_placeholder=True),
+        "validation_sha": _validate_governance_sha(
+            descriptor.get("validation_sha"), "validation_sha",
+            allow_unbound_placeholder=True),
+    }
+    return validated
+
+
+def governance_descriptor(repo_root: str) -> dict:
     path = os.path.join(repo_root, WAVE_REL)
     if not os.path.isfile(path):
-        fail("wave json missing")
-    with open(path, encoding="utf-8") as handle:
-        wave = json.load(handle).get("wave", "")
-    if not wave or not wave.startswith("mobile-only-v1r4-"):
-        fail("wave name not the V1R4 wave: %r" % wave)
-    return wave
+        fail("governance descriptor missing")
+    try:
+        with open(path, encoding="utf-8") as handle:
+            descriptor = json.load(
+                handle, object_pairs_hook=_strict_json_object)
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        fail("governance descriptor cannot be read: %s" % error)
+    return validate_governance_descriptor(descriptor)
+
+
+def wave_name(repo_root: str) -> str:
+    return governance_descriptor(repo_root)["wave"]
 
 
 def build_identity(repo_root: str, allow_dirty: bool) -> dict:
+    governance = governance_descriptor(repo_root)
     identity = {
         "format": FORMAT,
         "version": VERSION,
         "app_git_sha": git_sha(repo_root, allow_dirty),
-        "wave": wave_name(repo_root),
         "native_core_sha256": native_core_digest(repo_root),
+        **governance,
     }
     validate_fields(identity)
     return identity
 
 
 def validate_fields(identity: dict) -> None:
+    if not isinstance(identity, dict):
+        fail("build identity root must be an object")
+    if set(identity) != IDENTITY_KEYS:
+        fail("build identity schema mismatch: expected=%r actual=%r"
+             % (sorted(IDENTITY_KEYS), sorted(identity)))
     if identity.get("format") != FORMAT:
         fail("bad format")
     if identity.get("version") != VERSION:
         fail("bad version")
     sha = identity.get("app_git_sha", "")
-    if len(sha) != 40 or any(c not in "0123456789abcdef" for c in sha):
+    if not isinstance(sha, str) or not LOWER_SHA_RE.fullmatch(sha):
         fail("app_git_sha not 40 lowercase hex: %r" % sha)
     digest = identity.get("native_core_sha256", "")
-    if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
+    if not isinstance(digest, str) or not LOWER_DIGEST_RE.fullmatch(digest):
         fail("native_core_sha256 not 64 lowercase hex: %r" % digest)
-    if not identity.get("wave"):
-        fail("wave missing")
+    validate_governance_descriptor({
+        key: identity.get(key) for key in GOVERNANCE_KEYS
+    })
 
 
 def atomic_write(path: str, content: bytes) -> None:
@@ -170,11 +263,15 @@ def main() -> None:
     # verify
     if not args.identity or not os.path.isfile(args.identity):
         fail("--identity file required")
-    with open(args.identity, "rb") as handle:
-        embedded = json.loads(handle.read().decode("utf-8"))
+    try:
+        with open(args.identity, "r", encoding="utf-8") as handle:
+            embedded = json.load(
+                handle, object_pairs_hook=_strict_json_object)
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        fail("identity cannot be read: %s" % error)
     validate_fields(embedded)
     expected = build_identity(repo, allow_dirty=True)
-    for key in ("app_git_sha", "wave", "native_core_sha256"):
+    for key in sorted(IDENTITY_KEYS - {"format", "version"}):
         if embedded.get(key) != expected.get(key):
             fail("embedded %s=%r != checked-out %r" % (key, embedded.get(key), expected.get(key)))
     print("build identity verified")

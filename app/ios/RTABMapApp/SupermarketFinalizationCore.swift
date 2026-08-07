@@ -66,6 +66,7 @@ struct LocalizationEvidenceBundleExpectation {
     let floorId: String
     let traceRecordCount: Int
     let constraintRecordCount: Int
+    let manualLocalizationEventCount: Int
     let stateEventCount: Int
     let lastDurableState: String
     let localizedPriceTagCount: Int
@@ -91,6 +92,7 @@ struct LocalizationEvidenceBundleExpectation {
         floorId: String,
         traceRecordCount: Int,
         constraintRecordCount: Int,
+        manualLocalizationEventCount: Int = 0,
         stateEventCount: Int,
         lastDurableState: String,
         localizedPriceTagCount: Int,
@@ -107,6 +109,7 @@ struct LocalizationEvidenceBundleExpectation {
         self.floorId = floorId
         self.traceRecordCount = traceRecordCount
         self.constraintRecordCount = constraintRecordCount
+        self.manualLocalizationEventCount = manualLocalizationEventCount
         self.stateEventCount = stateEventCount
         self.lastDurableState = lastDurableState
         self.localizedPriceTagCount = localizedPriceTagCount
@@ -183,8 +186,9 @@ enum LocalizationEvidenceBundleValidator {
                 fileName: "manual_localization_events.jsonl",
                 format: "MarketScannerManualLocalizationEvent",
                 version: 3,
-                expectedCount: nil,
-                requiredNonEmpty: false,
+                expectedCount: expectation.manualLocalizationEventCount,
+                requiredNonEmpty:
+                    expectation.manualLocalizationEventCount > 0,
                 strictlyIncreasingTimestamps: false,
                 recordIdField: nil),
             JSONLContract(

@@ -118,9 +118,22 @@ enum PriorMapPackageIntegrity {
         let distance = try object(snapshot, "distance_fields.json")
         let validation = try object(snapshot, "validation_report.json")
 
+        guard let storeID = manifest["store_id"] as? String,
+              let mapName = manifest["name"] as? String,
+              MapSourceBusinessIdentityPolicy.isValidStoreID(storeID),
+              MapSourceBusinessIdentityPolicy.isValidMapName(mapName) else {
+            throw PriorMapPackageIntegrityError.invalid(
+                "地图包 store_id/name 不符合统一业务标识策略。")
+        }
+
+        let parsedShelves: PriorMapShelvesSchema.ParsedDocument
+        do {
+            parsedShelves = try PriorMapShelvesSchema.parse(shelvesPayload)
+        } catch {
+            throw PriorMapPackageIntegrityError.invalid("\(error)")
+        }
         guard let floors = manifest["floors"] as? [[String: Any]],
               let elements = elementsPayload["elements"] as? [[String: Any]],
-              let shelves = shelvesPayload["shelves"] as? [[String: Any]],
               let structures = structuresPayload["structures"] as? [[String: Any]],
               let nodes = graph["nodes"] as? [[String: Any]],
               let edges = graph["edges"] as? [[String: Any]],
@@ -149,7 +162,7 @@ enum PriorMapPackageIntegrity {
                     == elements.count,
             "地图包元素 ID 或数量不一致。")
         try validateSubset(
-            shelves,
+            parsedShelves.rawShelves,
             expectedTypes: ["MapShelf"],
             elements: byId,
             label: "shelves.json")

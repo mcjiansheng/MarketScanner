@@ -1,6 +1,16 @@
 # Map Studio 发布、启动、恢复与数据生命周期
 
-> 文档状态：**当前有效**。最后核对日期：2026-08-02。
+> 文档状态：**当前有效**。最后核对日期：2026-08-07。
+
+## Mobile-Only V1 RC 发布边界
+
+当前 RC 分支为 `mobile-only-v1-release-candidate-blocker-closeout`，基线为 `81b6dbb216e843d363fd0088f673076add78013f`。`.github/marketscanner-repair-v2-wave.json` 在 implementation/validation 提交产生前使用明确占位符；不得复用旧 V1R5 SHA，也不得在 exact-SHA Actions 成功前写成 CI PASS。
+
+Mobile V1 使用 Route A：Fast reduced graph 后至多一次 Full existing-graph optimization，仍失败即 `RESCAN_SESSION`。True sensor Deep 不属于 V1，发布包、UI、资格报告和运维手册都不得声称存在该回退。
+
+iOS native dependency 必须按 `iphoneos` 与 `iphonesimulator` 分离安装和缓存。每个平台的 manifest v2 都要验证普通 archive、fat archive、nested Mach-O 的架构和 `LC_BUILD_VERSION` platform；Xcode 只通过 `$(PLATFORM_NAME)` 选择对应依赖。SwiftPM `Package.resolved` 必须保留 exact `Zip` revision。当前本机没有完整的双平台 native dependency trees，因此 simulator/device clean compile-link 仍为 **NOT RUN / BLOCKED**，历史 `releases/`、IPA 或 xcarchive 不能代替当前 exact SHA 的 clean build。
+
+当前允许状态为 **REJECTED / NO-GO / developer smoke only**。只有本地主机回归、独立审查、implementation/validation SHA 绑定、exact-SHA CI、Apple clean builds、Replay/FAR 和后续 Device Lab 分层完成后，才能按对应门槛提升；`SAM FIELD PASS` 和 `PRODUCTION READY` 仍需真实现场证据。
 
 ## 安全启动边界
 

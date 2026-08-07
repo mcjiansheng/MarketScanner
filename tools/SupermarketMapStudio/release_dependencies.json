@@ -1,7 +1,7 @@
 {
   "format": "MarketScannerDependencyPolicy",
-  "version": 1,
-  "last_reviewed": "2026-07-28",
+  "version": 2,
+  "last_reviewed": "2026-08-07",
   "pc": [
     {"name": "OpenCV", "supported_major": [4, 5], "required": true, "license_note": "Apache-2.0/BSD; inspect enabled nonfree modules in the resolved build"},
     {"name": "PCL", "minimum": "1.7", "required": true, "license_note": "BSD-3-Clause"},
@@ -12,14 +12,24 @@
   ],
   "ios": {
     "build_script": "app/ios/RTABMapApp/install_deps.sh",
-    "output": "app/ios/RTABMapApp/Libraries",
-    "cache_contract": "The cache key includes this policy, install_deps.sh, Xcode version and architecture; a build manifest hashes every produced header/library before app link.",
+    "supported_platforms": ["iphoneos", "iphonesimulator"],
+    "output_pattern": "app/ios/RTABMapApp/Libraries/<platform>",
+    "cache_contract": "iphoneos and iphonesimulator use separate prefixes, source trees, build trees, cache keys and manifests. CI rejects legacy unscoped prefixes. Each manifest hashes the complete generated header/library set and verifies Mach-O LC_BUILD_VERSION platform evidence before app link.",
+    "required_architectures": ["arm64"],
     "required_artifacts": [
       "include/rtabmap-0.23/rtabmap/core/Rtabmap.h",
       "lib/librtabmap_core.a",
       "lib/librtabmap_utilite.a",
       "lib/libopencv_core.a",
-      "lib/libpcl_common.a"
+      "lib/libpcl_common.a",
+      "lib/vtk.framework/vtk"
+    ],
+    "platform_validated_artifacts": [
+      "lib/librtabmap_core.a",
+      "lib/librtabmap_utilite.a",
+      "lib/libopencv_core.a",
+      "lib/libpcl_common.a",
+      "lib/vtk.framework/vtk"
     ]
   }
 }

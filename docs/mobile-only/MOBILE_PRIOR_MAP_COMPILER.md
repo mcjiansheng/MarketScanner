@@ -1,6 +1,6 @@
 # 手机 PriorMap 编译器（Mobile Prior Map Compiler）
 
-> 状态：IMPLEMENTED / UNIT TESTED / INTEGRATION TESTED（C5/C7/C8/C9/C10）
+> 状态：**当前有效**；IMPLEMENTED / UNIT TESTED / INTEGRATION TESTED（C5/C7/C8/C9/C10）。最后核对：2026-08-07。
 
 ## 模块
 
@@ -18,10 +18,14 @@
 `road_graph.json` / `spatial_index.json` / `distance_fields.json` / `preview.png` /
 `preview_floor_<NNN>_<floor>.png` / `validation_report.json` / `package_manifest.json`
 
+`manifest.json` 必须包含通过统一业务标识策略的 `store_id` 与 `name`。手机 XLSX/CSV/JSON 导入和 PC `xlsx_to_prior_map.py` 均要求显式门店 ID；不得从文件名或旧 registry 隐式猜测门店。
+
 ## 六类元素
 
 MapShelf（货架）/ MapTable（桌）/ MapPillar（柱）/ MapTableFeature（桌台特征）/ MapCross（道路线）/ MapRoadPoint（道路点）。
 货架/桌/柱/桌台特征为结构体（参与距离场与空间索引），MapCross/MapRoadPoint 构成路网。
+
+`shelves.json` 当前为 schema v2。每个货架物理段以 `shelf_segment_id` 唯一标识，并携带 start/end、longitudinal axis、front/back normal、side semantics version 和 orientation provenance；相同 `shelf_code` 的不同段不得合并或覆盖。loader 与 compiler 同时按 v2 验证，旧 v1 只作为明确的历史兼容输入处理。
 
 ## 坐标变换（冻结）
 

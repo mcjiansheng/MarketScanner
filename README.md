@@ -1,6 +1,6 @@
 # RTAB-Map 大型超市扫描与地图工作台
 
-> 文档状态：**当前有效**。最后一次与源码交叉核对日期：2026-07-28。
+> 文档状态：**当前有效**。最后一次与源码交叉核对日期：2026-08-07。
 
 本项目是在开源 **RTAB-Map** 基础上进行的业务化改造，面向大型超市、仓储卖场等室内场景，形成从 iPhone Pro 连续采集，到 PC 端离线优化，再到二维地图、彩色俯视图和三维预览的一套本地工作流。
 
@@ -276,7 +276,19 @@ python3 -m unittest discover -s tools/SupermarketMapStudio/tests -v
 
 ### 5. 构建 iOS 应用
 
-使用 Xcode 打开 `app/ios/RTABMapApp.xcodeproj`。完整扫描流程需要支持 ARKit 和 LiDAR 的真机，建议使用 iPhone Pro 系列设备。NFC 当前暂停，不属于构建或验收范围。首次构建前仍需按上游 iOS 工程方式准备 RTAB-Map 依赖库和签名；生成的本地 Libraries 目录不会提交到 Git。
+使用 Xcode 打开 `app/ios/RTABMapApp.xcodeproj`。完整扫描流程需要支持 ARKit 和 LiDAR 的真机，建议使用 iPhone Pro 系列设备。NFC 当前暂停，不属于构建或验收范围。
+
+首次构建前必须为目标平台生成独立的 native dependency prefix：
+
+```bash
+# 真机 / generic iOS device
+bash app/ios/RTABMapApp/install_deps.sh --platform iphoneos
+
+# iOS Simulator（arm64）
+bash app/ios/RTABMapApp/install_deps.sh --platform iphonesimulator
+```
+
+产物分别位于 `app/ios/RTABMapApp/Libraries/iphoneos/` 和 `app/ios/RTABMapApp/Libraries/iphonesimulator/`。Xcode 使用 `$(PLATFORM_NAME)` 选择对应 headers、archives 和 `vtk.framework`；平铺的旧 `Libraries/include`/`Libraries/lib` 不属于当前 build 输入，也不会被 CI 接受。两个平台首次 cold build 都会重新构建完整 Boost、Eigen、LZ4、FLANN、GTSAM、SuiteSparse、g2o、VTK、PCL、OpenCV、LASzip、libLAS 和 RTAB-Map 依赖，耗时和磁盘占用较大。生成的本地 `Libraries` 目录不会提交到 Git。
 
 ## 目录导航
 

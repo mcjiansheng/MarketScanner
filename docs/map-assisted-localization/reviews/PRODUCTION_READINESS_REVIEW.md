@@ -1,14 +1,18 @@
 # MarketScanner RepairV2 生产就绪当前代码审查
 
-> 文档状态：**当前有效**。最后核对日期：2026-07-30。
-> 当前增量审查输入：`MarketScanner_P7R1_Agent_Repair_Prompts.md`；完整入口见 [`CURRENT_REVIEW.md`](CURRENT_REVIEW.md)。
-> P7R1 审查基线：`repair-v2-p7r0-independent-baseline@79c86b120fc47c28bd350e86abc9b0354d7e838d`。
-> 当前 wave：`P7R1-evidence-publication-closeout`；实施分支：`repair-v2-p7r1-evidence-publication-closeout`。
-> P0 已验证头：`011ce479b74d10cb43106dda6ea757fb1ee2fa73`；本文件之后的证据提交不改变 P0 CI/测试树。
+> 文档状态：**当前有效**。最后核对日期：2026-08-07。
+> 当前增量审查输入：`MarketScanner_Mobile_Only_V1R5_Second_Independent_Full_Code_Review_NO_GO.md` 和 `MarketScanner_Mobile_Only_V1_Release_Candidate_Blocker_Closeout_Prompt_V2.md`；完整入口见 [`CURRENT_REVIEW.md`](CURRENT_REVIEW.md)。
+> 当前 RC 基线：`mobile-only-v1r5-field-qualification-integrity-scale-closeout@81b6dbb216e843d363fd0088f673076add78013f`。
+> 当前 wave：`mobile-only-v1-release-candidate-blocker-closeout`；实施分支同名。
+> 历史 P7R1/P0 审查证据保留在下文，不代表当前 RC 的 exact-SHA CI 或 Apple/设备资格已经执行。
 
 ## 当前判定
 
 当前结论为 **NO-GO / NOT PRODUCTION READY**。W2R 的 evidence bundle、checkpoint cleanup、原子可见写入、复制后本地保留及 typed finalization disposition 已有自动化保护；这些能力是生产化工作的安全起点，不代表最终产品验收完成。
+
+当前 Mobile-Only RC 除 RC-B19/J-04 component identity 外，已完成 RC-B01…RC-B03、RC-B05…RC-B28 的本轮代码与本地主机自动化闭包，并同步处理影响正确性、事务、安全、规模和审计的 RC-H01…RC-H40。J-04 仍需冻结 prior-independent final-link component policy，并完成 node snapshot C ABI 与 constraint/manual evidence schema 的 breaking migration；现有记录不得追溯伪证 same-component。RC-B04 exact-SHA CI、RC-B29 Replay/FAR policy freeze、RC-B30 Apple clean build/Device Lab 也仍未关闭。Route A 固定为 Fast reduced graph → 至多一次 Full existing-graph optimization → `RESCAN_SESSION`；True sensor Deep 不属于 V1。当前最高允许表述是 **REJECTED / NO-GO / developer smoke only**。
+
+当前 RC diff 的独立只读代码审查已执行，状态为 **COMPLETED / BLOCKERS FOUND AND FIXED IN CURRENT DIFF**。审查与随后全量回归发现并修复 committed RESCAN/Result 跨文件事务、stale completed task error、RESCAN schema/race、Map quarantine 崩溃恢复/canonical integer、trace `Int64` 边界及 200k tag 证据 RSS 问题。当前本地主机证据为 PriorMap 166/166、Qualification 28/28、Map Studio 104/104、native 7,878/0；1,728,000 trace storm 与 200,000 frame + 200,000 observation 全链路也已执行。该审查不关闭 J-04，也不替代 exact-SHA、Apple、Replay/FAR 或设备/现场资格。
 
 P7R1 增量已实现 production-only publish、publish 前即时 production selfcheck、package-bound release identity、Device App SHA 与 release SHA 精确绑定、从 immutable version 自动生成且可由 self-contained source bundle 重新派生的 typed trajectory evidence、Field Evidence v3、descriptor-bound JSON/CSV 读取、exact plan/release/policy/CSV/Device Evidence publication package、published manifest v4 自包含 evidence、package stable-read 和真实 About runtime mode。上述只能标记 **IMPLEMENTED / AUTOMATED TESTED**；最终精确 SHA 全矩阵成功后才是 **CI VERIFIED / READY FOR HUMAN QUALIFICATION**。真实 P5/P6/P7/P8 未执行，禁止标记 **HUMAN REVIEWED / REAL DEVICE PASS / FIELD PASS / PRODUCTION QUALIFIED**。
 
@@ -39,11 +43,11 @@ P0 只冻结安全基线，不改变业务算法。CI 必须单独运行并报�
 | P1 | 完整相对 SE(2) 因子图与发布门 | 已实现并完成本机真实 DB 只读验证；P1 GitHub Actions run `30360809785` 五个 job 全部成功；native clean build 属 P2 |
 | P2 | 干净、可复现的 PC/iOS 构建 | 自动化出口已关闭：macOS 本机 clean build、Ubuntu/Windows hosted native clean build、Windows Python、iOS cold-cache manifest/cache 与 unsigned arm64 full App link 全部通过；干净终端安装 smoke 归 P7 |
 | P3 | Map Studio 持久任务和重启恢复 | 已实现并通过工作台测试目录 86 项回归；独立运行时进程强杀后由新进程恢复为 `interrupted`，服务重启不猜测续跑，不按不可信 journal 路径清理 |
-| P4 | iOS finalization、保留和 provider hardening | 代码与主机压力测试已完成：100k×3 streaming、15,040,512-byte peak RSS、descriptor identity、copy v2 隐私和未执行 durability hook；真机 smoke 未执行，不声称 power-loss durability |
+| P4 | iOS finalization、保留和 provider hardening | 代码与主机压力测试已完成：100k trace/constraint/state streaming 使用独立 finalization 进程并通过固定 peak RSS `<256 MiB` 门、descriptor identity、strict immutable snapshot thermal evidence、copy v2 隐私和未执行 durability hook；真机 smoke 未执行，不声称 power-loss durability |
 | P5 | 真实设备矩阵 | Device Evidence v2 与 App/release exact SHA 门已实现；真实 LiDAR iPhone 未执行，因此仍为 NO-GO |
 | P6 | 正式现场验收 | Field v3、可重新派生的 immutable trajectory/source evidence、exact CSV/Device bytes、3-run、20 控制点和重复性验证已实现；办公室/卖场未执行，因此仍为 NO-GO |
 | P7 | 安装包、升级/卸载和 selfcheck | production-only publish、即时 selfcheck、package-bound release、evidence 自包含、真实 About mode、package stable-read 已实现；既有同机 smoke 不替代干净 macOS/Windows 安装/升级/卸载测试 |
-| P8 | 独立代码、证据和发布复核 | 未执行 |
+| P8 | 独立代码、证据和发布复核 | 当前 RC code diff 独立只读审查已执行且 findings 已修复；exact-SHA 证据与最终发布复核仍未执行，因此 P8 整体未关闭 |
 
 P1 至 P4 可以在 P0 通过后组织，但每一 wave 必须使用独立分支、明确基线、原子提交和单独验证；不得把多个大型 wave 合并成一次不可审查的改动。P5/P6 的证据必须来自真实设备和现场，缺失时如实保持未执行。
 

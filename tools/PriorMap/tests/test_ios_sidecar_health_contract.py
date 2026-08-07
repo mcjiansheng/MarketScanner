@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 import unittest
 from pathlib import Path
@@ -21,6 +22,13 @@ PERSISTENCE_COORDINATOR_SOURCE = (
 RECOVERY_EVIDENCE_PARSER_SOURCE = (
     REPOSITORY / "app/ios/RTABMapApp/RecoveryLifecycleEvidenceParser.swift"
 )
+MOBILE_INPUT_CONTRACT = (
+    REPOSITORY / "contracts/mobile_only_v1r5_input_limits.json"
+)
+SNAPSHOT_SOURCE = (
+    REPOSITORY
+    / "app/ios/RTABMapApp/MobilePostProcessing/SessionSnapshotTransaction.swift"
+)
 
 
 def source(path: Path) -> str:
@@ -28,6 +36,44 @@ def source(path: Path) -> str:
 
 
 class IOSLocalizationSidecarHealthContractTests(unittest.TestCase):
+    def test_finalized_metadata_uses_one_stable_read_for_parse_and_digest(self) -> None:
+        snapshot = source(SNAPSHOT_SOURCE)
+        reader = snapshot.split("private static func readMetadata(", 1)[1].split(
+            "private static func checkEligibility(", 1
+        )[0]
+        self.assertIn("O_RDONLY | O_NOFOLLOW", reader)
+        self.assertIn("before.st_nlink == 1", reader)
+        self.assertIn("Int64(before.st_size) <= maximumMetadataBytes", reader)
+        self.assertIn("sameFileIdentity(before, after)", reader)
+        self.assertIn("sameFileIdentity(before, pathAfter)", reader)
+        self.assertNotIn("mappedIfSafe", reader)
+        self.assertIn("return (value, sha256(data))", reader)
+        self.assertIn(
+            "metadataSnapshot.sha256 == stagedMetadataSnapshot.sha256",
+            snapshot,
+        )
+
+    def test_generated_metadata_and_native_limits_match_shipping_gates(self) -> None:
+        contract = json.loads(MOBILE_INPUT_CONTRACT.read_text(encoding="utf-8"))
+        metadata = contract["evidence_files"]["metadata.json"]
+        self.assertEqual(metadata["max_file_bytes"], 1024 * 1024)
+        self.assertEqual(metadata["max_record_bytes"], 1024 * 1024)
+        self.assertIn(
+            "captureHealth.localizationTraceRecordCount",
+            metadata["watermark_fields"],
+        )
+        self.assertNotIn(
+            "localizationTraceRecordCount",
+            metadata["watermark_fields"],
+        )
+
+        native = contract["evidence_files"]["native_graph"]
+        self.assertEqual(native["max_raw_nodes"], 200_000)
+        self.assertEqual(native["max_skeleton_nodes"], 4_096)
+        self.assertEqual(native["max_factors"], 4_096)
+        self.assertEqual(native["max_priors"], 4_096)
+        self.assertEqual(native["max_trajectory_rows"], 200_000)
+
     def test_sam_recovery_and_dynamic_filtering_contracts_are_wired(self) -> None:
         view = source(VIEW_SOURCE)
         overlay = source(OVERLAY_SOURCE)
@@ -216,10 +262,20 @@ class IOSLocalizationSidecarHealthContractTests(unittest.TestCase):
             "firstLocalizationRequiredWriteError",
             "localizationTraceRecordCount",
             "localizationConstraintRecordCount",
+            "manualLocalizationEventCount",
             "localizationStateEventCount",
             "localizationEvidenceComplete",
         ):
             self.assertIn(token, session)
+        self.assertRegex(
+            session,
+            r"(?s)if !result\.succeeded \{.*?\} else \{.*?"
+            r"manualLocalizationEventCount \+= 1",
+        )
+        self.assertIn(
+            "manualLocalizationEventCount:",
+            session,
+        )
         # V1R4 §7.2/§13.1: the finalization gate is driven by the
         # processing blockers (clock sidecar, prior-map evidence,
         # tag burst flush) and maps to eligible/invalid eligibility.

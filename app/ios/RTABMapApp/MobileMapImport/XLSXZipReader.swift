@@ -74,8 +74,9 @@ enum XLSXZipReader {
         var seenNames: Set<String> = []
         var totalBytes: Int64 = 0
         var cursor = end.centralDirectoryOffset
+        let centralEnd = end.centralDirectoryOffset + end.centralDirectorySize
         for _ in 0..<end.entryCount {
-            guard cursor + 46 <= data.count else {
+            guard cursor + 46 <= centralEnd else {
                 throw MapSourceImportError.zipCorrupt(reason: "中央目录越界。")
             }
             let signature = readUInt32(data, at: cursor)
@@ -93,7 +94,9 @@ enum XLSXZipReader {
             let diskStart = readUInt16(data, at: cursor + 34)
             let localHeaderOffset = readUInt32(data, at: cursor + 42)
 
-            guard nameLength > 0, cursor + 46 + nameLength <= data.count else {
+            guard nameLength > 0,
+                  cursor + 46 + nameLength + extraLength + commentLength
+                    <= centralEnd else {
                 throw MapSourceImportError.zipCorrupt(reason: "条目名越界。")
             }
             let nameData = data.subdata(in: (cursor + 46)..<(cursor + 46 + nameLength))
@@ -138,6 +141,9 @@ enum XLSXZipReader {
             )
             entries.append(Entry(name: name, data: payload))
             cursor += 46 + nameLength + extraLength + commentLength
+        }
+        guard cursor == centralEnd else {
+            throw MapSourceImportError.zipCorrupt(reason: "中央目录长度不一致。")
         }
         return entries
     }
@@ -222,8 +228,14 @@ enum XLSXZipReader {
         if flags & 0x0001 != 0 || flags & 0x0040 != 0 {
             throw MapSourceImportError.zipCorrupt(reason: "加密条目不支持：\(name)")
         }
-        // Bit 3 (data descriptor) is permitted; sizes are re-read from
-        // the local header when present (see extractEntryPayload).
+        // This reader explicitly supports bit 3 data descriptors and bit
+        // 11 UTF-8 entry names. Every other semantic flag is rejected so
+        // local/central interpretation cannot drift.
+        let supported: UInt16 = 0x0008 | 0x0800
+        if flags & ~supported != 0 {
+            throw MapSourceImportError.zipCorrupt(
+                reason: "条目标志不受支持：\(name)")
+        }
     }
 
     /// Canonical path components only: no `..`, no `.`, no backslash, no
@@ -237,7 +249,7 @@ enum XLSXZipReader {
         }
         let components = name.split(separator: "/", omittingEmptySubsequences: false)
         for component in components {
-            guard component != "..", component != "." else {
+            guard !component.isEmpty, component != "..", component != "." else {
                 throw MapSourceImportError.zipTraversalDetected(entry: name)
             }
         }
@@ -281,6 +293,7 @@ enum XLSXZipReader {
         }
         let localFlags = readUInt16(data, at: localHeaderOffset + 6)
         let localMethod = readUInt16(data, at: localHeaderOffset + 8)
+        let localCRC32 = readUInt32(data, at: localHeaderOffset + 14)
         let localCompressedSize = readUInt32(data, at: localHeaderOffset + 18)
         let localUncompressedSize = readUInt32(data, at: localHeaderOffset + 22)
         let localNameLength = Int(readUInt16(data, at: localHeaderOffset + 26))
@@ -290,8 +303,8 @@ enum XLSXZipReader {
         guard Int(localMethod) == method else {
             throw MapSourceImportError.zipCorrupt(reason: "本地/中央压缩方法不一致：\(name)")
         }
-        guard localFlags & 0x0001 == flags & 0x0001 else {
-            throw MapSourceImportError.zipCorrupt(reason: "本地/中央加密标志不一致：\(name)")
+        guard localFlags == flags else {
+            throw MapSourceImportError.zipCorrupt(reason: "本地/中央标志不一致：\(name)")
         }
         guard localHeaderOffset + 30 + localNameLength <= data.count else {
             throw MapSourceImportError.zipCorrupt(reason: "本地文件名越界：\(name)")
@@ -314,9 +327,14 @@ enum XLSXZipReader {
                 || (localUncompressed != 0 && localUncompressed != uncompressedSize) {
                 throw MapSourceImportError.zipCorrupt(reason: "本地/中央尺寸不一致：\(name)")
             }
+            if localCRC32 != 0 && localCRC32 != crc32Value {
+                throw MapSourceImportError.zipCorrupt(
+                    reason: "本地/中央 CRC 不一致：\(name)")
+            }
         } else {
             guard localCompressed == compressedSize,
-                  localUncompressed == uncompressedSize else {
+                  localUncompressed == uncompressedSize,
+                  localCRC32 == crc32Value else {
                 throw MapSourceImportError.zipCorrupt(reason: "本地/中央尺寸不一致：\(name)")
             }
         }
@@ -325,6 +343,18 @@ enum XLSXZipReader {
         let payloadEnd = payloadStart + Int(compressedSize)
         guard payloadStart >= 0, payloadEnd <= data.count else {
             throw MapSourceImportError.zipCorrupt(reason: "条目数据越界。")
+        }
+        if usesDataDescriptor {
+            guard payloadEnd + 16 <= data.count,
+                  readUInt32(data, at: payloadEnd) == 0x08074B50,
+                  readUInt32(data, at: payloadEnd + 4) == crc32Value,
+                  Int64(readUInt32(data, at: payloadEnd + 8))
+                    == compressedSize,
+                  Int64(readUInt32(data, at: payloadEnd + 12))
+                    == uncompressedSize else {
+                throw MapSourceImportError.zipCorrupt(
+                    reason: "数据描述符不一致：\(name)")
+            }
         }
         let compressed = data.subdata(in: payloadStart..<payloadEnd)
         let payload: Data

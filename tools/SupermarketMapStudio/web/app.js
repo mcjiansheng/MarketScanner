@@ -771,11 +771,13 @@ function updateSingleAlignmentState() {
 
 function activeRequest() {
   if (activeMode === "prior") {
+    const mapName = $("#prior-name").value;
     return {
       kind: "prior_map",
       xlsx: $("#prior-xlsx").value.trim(),
       output: $("#prior-output").value.trim(),
-      name: $("#prior-name").value.trim(),
+      store_id: $("#prior-store-id").value,
+      name: mapName === "" ? null : mapName,
     };
   }
   if (activeMode === "single") {
@@ -824,6 +826,14 @@ function activeRequestKey(payload) {
 async function runActiveJob() {
   try {
     let payload = activeRequest();
+    if (payload.kind === "prior_map") {
+      if (!payload.store_id || payload.store_id.trim() !== payload.store_id) {
+        throw new Error("请填写不带首尾空格的真实门店 ID");
+      }
+      if (payload.name !== null && payload.name.trim() !== payload.name) {
+        throw new Error("地图名称不能包含首尾空格");
+      }
+    }
     let requestKey = activeRequestKey(payload);
     if (completedJobId && completedJobKey === requestKey) {
       setStatus("当前设置已经生成，继续显示上次结果", "complete");

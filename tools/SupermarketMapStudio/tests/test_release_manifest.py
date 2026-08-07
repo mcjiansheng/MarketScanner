@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+import struct
 import sys
 import tempfile
 import unittest
@@ -20,6 +21,40 @@ STUDIO_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(STUDIO_DIR))
 import tools.SupermarketMapStudio.server as server_module  # noqa: E402
 from tools.SupermarketMapStudio.server import operator_package_diagnostic  # noqa: E402
+
+
+def _macho_archive(platform_id: int, cpu_type: int = 0x0100000C) -> bytes:
+    command = struct.pack("<IIIIII", 0x32, 24, platform_id, 0x000C0000, 0, 0)
+    obj = struct.pack(
+        "<IiiIIIII", 0xFEEDFACF, cpu_type, 0, 1, 1, len(command), 0, 0
+    ) + command
+    header = b"".join(
+        (
+            b"fixture.o/".ljust(16),
+            b"0".ljust(12),
+            b"0".ljust(6),
+            b"0".ljust(6),
+            b"100644".ljust(8),
+            str(len(obj)).encode("ascii").ljust(10),
+            b"`\n",
+        )
+    )
+    return b"!<arch>\n" + header + obj + (b"\n" if len(obj) % 2 else b"")
+
+
+def _write_ios_dependency_fixture(root: Path, platform_id: int) -> dict[str, object]:
+    policy = json.loads(
+        (Path(__file__).parents[1] / "release_dependencies.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    binary = _macho_archive(platform_id)
+    platform_artifacts = set(policy["ios"]["platform_validated_artifacts"])
+    for relative in policy["ios"]["required_artifacts"]:
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(binary if relative in platform_artifacts else b"fixture")
+    return policy
 
 
 class ReleaseManifestTests(unittest.TestCase):
@@ -165,7 +200,7 @@ class ReleaseManifestTests(unittest.TestCase):
         self.assertIn("download_with_retry()", active_lines)
         self.assertEqual([line for line in active_lines if "git clone" in line], ['if git clone "$@" "$temporary/repository"'])
         self.assertEqual([line for line in active_lines if line.startswith("curl ")], ["curl --fail --location --retry 3 --retry-all-errors --retry-delay 5 \\"])
-        self.assertIn('temporary=$(mktemp -d "$pwd/.clone-${destination}.XXXXXX")', active_lines)
+        self.assertIn('temporary=$(mktemp -d "$work_root/.clone-${destination}.XXXXXX")', active_lines)
         self.assertIn('local temporary="${output}.partial"', active_lines)
         self.assertEqual(sum(line.startswith("clone_with_retry ") for line in active_lines), 11)
 
@@ -185,9 +220,65 @@ class ReleaseManifestTests(unittest.TestCase):
         vtk_block = install_script.split("# VTK", 1)[1].split("# PCL", 1)[0]
         self.assertIn("-DIOS_DEPLOYMENT_TARGET=12.0", vtk_block)
         self.assertIn("uses: actions/cache/restore@v4", workflow)
+        self.assertIn("Libraries/iphoneos", workflow)
+        self.assertIn("Libraries/iphonesimulator", workflow)
         save_position = workflow.index("uses: actions/cache/save@v4")
         link_position = workflow.index("- name: Build unsigned generic arm64 iOS app")
         self.assertLess(save_position, link_position)
+
+    def test_ios_native_build_and_link_contract_is_platform_scoped(self) -> None:
+        repository = Path(__file__).resolve().parents[3]
+        project = (repository / "app/ios/RTABMapApp.xcodeproj/project.pbxproj").read_text(
+            encoding="utf-8"
+        )
+        xcconfig = (
+            repository
+            / "app/ios/RTABMapApp/MarketScannerNativeDependencies.xcconfig"
+        ).read_text(encoding="utf-8")
+        install_script = (repository / "app/ios/RTABMapApp/install_deps.sh").read_text(
+            encoding="utf-8"
+        )
+        workflow = (repository / ".github/workflows/marketscanner-repair-v2.yml").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("--platform iphoneos|iphonesimulator", install_script)
+        self.assertIn('prefix="$libraries_root/$platform"', install_script)
+        self.assertIn('sysroot="$platform"', install_script)
+        self.assertIn('vtk_device_architectures="arm64"', install_script)
+        self.assertIn('vtk_simulator_architectures="arm64"', install_script)
+        self.assertNotIn("sysroot=iphoneos", install_script)
+
+        library_project_lines = [
+            line for line in project.splitlines() if "RTABMapApp/Libraries/" in line
+        ]
+        self.assertTrue(library_project_lines)
+        self.assertTrue(
+            all("$(PLATFORM_NAME)" in line for line in library_project_lines)
+        )
+        self.assertNotIn(".a in Frameworks", project)
+        self.assertNotIn("vtk.framework in Frameworks", project)
+        self.assertEqual(project.count("baseConfigurationReference = 4EA800012F70000700100002"), 2)
+
+        self.assertIn("Libraries/$(PLATFORM_NAME)", xcconfig)
+        self.assertIn("ARCHS[sdk=iphonesimulator*] = arm64", xcconfig)
+        self.assertIn("-framework vtk", xcconfig)
+        self.assertIn("librtabmap_core.a", xcconfig)
+
+        self.assertIn("id: ios_native_iphoneos_cache", workflow)
+        self.assertIn("id: ios_native_iphonesimulator_cache", workflow)
+        self.assertIn("install_deps.sh --platform iphoneos", workflow)
+        self.assertIn("install_deps.sh --platform iphonesimulator", workflow)
+        self.assertIn("--platform iphoneos", workflow)
+        self.assertIn("--platform iphonesimulator", workflow)
+        self.assertNotIn("app/ios/RTABMapApp/Libraries/include", workflow)
+        self.assertNotIn("app/ios/RTABMapApp/Libraries/lib\n", workflow)
+        self.assertIn("-destination 'generic/platform=iOS Simulator'", workflow)
+        self.assertGreaterEqual(
+            workflow.count('cmp -s "$RUNNER_TEMP/MarketScanner-Package.resolved"'),
+            2,
+        )
+        self.assertNotIn('cp "$lock_backup" "$lock"', workflow)
 
     def test_manifest_hashes_artifacts_and_is_reproducible_for_fixed_inputs(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -225,20 +316,123 @@ class ReleaseManifestTests(unittest.TestCase):
     def test_ios_dependency_manifest_detects_same_size_tampering(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            policy = json.loads(
-                (Path(__file__).parents[1] / "release_dependencies.json").read_text(encoding="utf-8")
-            )
-            for relative in policy["ios"]["required_artifacts"]:
-                path = root / relative
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_bytes(b"abcd")
+            policy = _write_ios_dependency_fixture(root, platform_id=2)
             manifest = root / "ios-dependency-manifest.json"
-            generate_ios(root, manifest, "a" * 40)
-            verify_ios(root, manifest)
+            generate_ios(root, manifest, "a" * 40, "iphoneos")
+            verify_ios(root, manifest, "iphoneos")
             changed = root / policy["ios"]["required_artifacts"][0]
-            changed.write_bytes(b"wxyz")
+            contents = changed.read_bytes()
+            changed.write_bytes(bytes([contents[0] ^ 1]) + contents[1:])
             with self.assertRaisesRegex(ValueError, "differs"):
-                verify_ios(root, manifest)
+                verify_ios(root, manifest, "iphoneos")
+
+    def test_ios_dependency_manifest_rejects_device_archive_for_simulator(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            _write_ios_dependency_fixture(root, platform_id=2)
+            with self.assertRaisesRegex(ValueError, "platform mismatch"):
+                generate_ios(
+                    root,
+                    root / "ios-dependency-manifest.json",
+                    "a" * 40,
+                    "iphonesimulator",
+                )
+
+    def test_ios_dependency_manifest_rejects_simulator_archive_for_device(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            _write_ios_dependency_fixture(root, platform_id=7)
+            with self.assertRaisesRegex(ValueError, "platform mismatch"):
+                generate_ios(
+                    root,
+                    root / "ios-dependency-manifest.json",
+                    "a" * 40,
+                    "iphoneos",
+                )
+
+    def test_ios_dependency_manifest_requires_platform_field(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            _write_ios_dependency_fixture(root, platform_id=2)
+            manifest = root / "ios-dependency-manifest.json"
+            payload = generate_ios(root, manifest, "a" * 40, "iphoneos")
+            del payload["platform"]
+            manifest.write_text(json.dumps(payload), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "platform mismatch"):
+                verify_ios(root, manifest, "iphoneos")
+
+    def test_ios_dependency_manifest_malformed_json_fails_with_value_error(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            _write_ios_dependency_fixture(root, platform_id=2)
+            manifest = root / "ios-dependency-manifest.json"
+            original = generate_ios(root, manifest, "a" * 40, "iphoneos")
+
+            manifest.write_text("[]", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "root must be an object"):
+                verify_ios(root, manifest, "iphoneos")
+
+            for malformed_files, expected_message in (
+                ([None], "file entry 0 must be an object"),
+                (
+                    [{"file": "../escape", "bytes": 1, "sha256": "a" * 64}],
+                    "outside include/lib",
+                ),
+                (
+                    [{"file": "include/bad", "bytes": "1", "sha256": "a" * 64}],
+                    "invalid byte count",
+                ),
+            ):
+                payload = dict(original)
+                payload["files"] = malformed_files
+                body = {
+                    key: value
+                    for key, value in payload.items()
+                    if key != "manifest_body_sha256"
+                }
+                payload["manifest_body_sha256"] = hashlib.sha256(
+                    json.dumps(body, sort_keys=True, separators=(",", ":")).encode()
+                ).hexdigest()
+                manifest.write_text(json.dumps(payload), encoding="utf-8")
+                with self.subTest(malformed_files=malformed_files):
+                    with self.assertRaisesRegex(ValueError, expected_message):
+                        verify_ios(root, manifest, "iphoneos")
+
+    def test_ios_dependency_manifest_rejects_unsupported_platform(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            _write_ios_dependency_fixture(root, platform_id=2)
+            with self.assertRaisesRegex(ValueError, "unsupported"):
+                generate_ios(root, root / "manifest.json", "a" * 40, "watchos")
+
+    def test_ios_dependency_manifest_ci_rejects_legacy_unscoped_prefix(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "Libraries"
+            root.mkdir()
+            _write_ios_dependency_fixture(root, platform_id=2)
+            with self.assertRaisesRegex(ValueError, "platform-scoped"):
+                generate_ios(
+                    root,
+                    root / "ios-dependency-manifest.json",
+                    "a" * 40,
+                    "iphoneos",
+                    ci_mode=True,
+                )
+
+    def test_ios_dependency_manifest_ci_accepts_exact_scoped_prefix(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "Libraries" / "iphonesimulator"
+            root.mkdir(parents=True)
+            _write_ios_dependency_fixture(root, platform_id=7)
+            manifest = root / "ios-dependency-manifest.json"
+            generate_ios(
+                root,
+                manifest,
+                "a" * 40,
+                "iphonesimulator",
+                ci_mode=True,
+            )
+            verify_ios(root, manifest, "iphonesimulator", ci_mode=True)
 
     def test_operator_package_is_hash_bound_and_no_overwrite(self):
         with tempfile.TemporaryDirectory() as temporary:
