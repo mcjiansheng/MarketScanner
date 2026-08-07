@@ -4,6 +4,6 @@
   "base_branch": "mobile-only-v1r4-field-readiness-evidence-clock-tag-native-closeout",
   "base_sha": "b7598fb623e677b605466afd6afef6f43fe5b735",
   "v1r4_head_sha": "b7598fb623e677b605466afd6afef6f43fe5b735",
-  "implementation_sha": "<FINAL_PRODUCTION_AND_TEST_SHA>",
+  "implementation_sha": "bd84fc1917ee9557761a3519a28b9e10488c51c2",
   "validation_sha": "<FINAL_DOCS_GOVERNANCE_SHA>"
 }
