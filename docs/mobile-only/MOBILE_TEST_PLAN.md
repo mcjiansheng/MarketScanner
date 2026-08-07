@@ -30,4 +30,4 @@
 - 资源门：peak RSS、处理时长、thermal、磁盘、电量、中断/崩溃恢复。
 - exact-final-SHA GitHub Actions：run `31174285439` 与 `31177319567` 均已运行但为 FAIL；后者 6/8 jobs 成功，macOS snapshot EACCES 与 Windows case-mismatch 修复需新的精确 SHA 全量 rerun。
 - Apple simulator/device 两套 cold native dependencies + 两次真实 clean compile/link：run `31177319567` 中因前置 macOS host E2E 失败而全部 skipped，仍为 NOT RUN。
-- pre-CI diff 独立只读审查已完成；post-CI snapshot 与 Windows membership 修复已通过代码路径审查和本地回归，仍需复核包含同步文档的精确 staged manifest/cached diff、绑定新 implementation SHA，并完成 exact-SHA evidence/release review。J-04 component identity 继续保持 NOT CLOSED。
+- pre-CI diff 独立只读审查已完成；post-CI snapshot 与 Windows membership implementation `7841c28a37b80334cd14aef7cecaad829d29c8ef` 已通过代码路径审查、本地回归和精确 staged manifest/cached diff 双重只读复核，且 implementation SHA 已绑定。仍需完成新 exact-SHA evidence/release review；J-04 component identity 继续保持 NOT CLOSED。
