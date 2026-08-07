@@ -33,7 +33,7 @@
 ## 本轮审查与回归证据
 
 - 独立只读代码审查：**COMPLETED / BLOCKERS FOUND AND FIXED IN CURRENT DIFF**。已修复 committed RESCAN、stale task error、strict Bool/reason-disposition/EEXIST、trace `Int64`、Map quarantine 崩溃恢复/canonical integer 和 JSONL/RSS findings；J-04 仍是独立未关闭 blocker。
-- PriorMap 166/166、Qualification 28/28、Map Studio 104/104、native 7,878 checks / 0 failures。
+- PriorMap 166/166、Qualification 28/28、Map Studio 106/106、native 7,878 checks / 0 failures。
 - 300,000 条 finalization：peak RSS 12,795,904 bytes；1,728,000 条 trace transition storm：保留 172,801 条，peak RSS 58,769,408 bytes。
 - 200,000 burst frames + 200,000 observations 全链路：243,952,646 input/temporary bytes，200,000 accepted observations，融合 1 个 accepted physical tag，884.922 s wall，peak RSS 670,662,656 bytes（约 639.6 MiB，低于 768 MiB host 门）。`StrictJSONLStreamReader` 通过每行 autorelease pool 消除长时 Foundation autorelease 累积，并保留完整 strict validator。
 - Map quarantine 真实子进程在 payload rename、diagnostic placement/freeze、publish rename/parent sync 三个窗口分别 `_exit`，新进程从 list/map/rebuild 执行 startup reconciliation；source+published、destination symlink、mode/hash 篡改和 unknown transaction 均 fail closed。

@@ -354,16 +354,28 @@ enum FinalTrajectory {
         // The nearest record overall can belong to another floor at a
         // transition. Inspect only the adjacent candidates and require an
         // exact floor plus a frozen freshness bound.
-        let candidates = [traceIndex - 1, traceIndex, traceIndex + 1]
-            .filter { $0 >= 0 && $0 < traceStates.count }
-            .map { traceStates[$0] }
-            .filter { $0.floorID == expectedFloorID }
-            .sorted {
-                abs($0.timestamp - monotonic) < abs($1.timestamp - monotonic)
+        let candidateIndices: [Int] = [
+            traceIndex - 1,
+            traceIndex,
+            traceIndex + 1,
+        ]
+        var best: TraceState?
+        var bestDelta = Double.infinity
+        for candidateIndex in candidateIndices {
+            guard candidateIndex >= 0,
+                  candidateIndex < traceStates.count else {
+                continue
             }
-        guard let best = candidates.first,
-              abs(best.timestamp - monotonic)
-                <= ResamplePolicy.maximumTraceStateDeltaSeconds else {
+            let candidate = traceStates[candidateIndex]
+            guard candidate.floorID == expectedFloorID else { continue }
+            let delta = abs(candidate.timestamp - monotonic)
+            if delta < bestDelta {
+                best = candidate
+                bestDelta = delta
+            }
+        }
+        guard let best,
+              bestDelta <= ResamplePolicy.maximumTraceStateDeltaSeconds else {
             return nil
         }
         return best

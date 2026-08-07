@@ -303,6 +303,41 @@ class ReleaseManifestTests(unittest.TestCase):
             self.assertEqual(one, two)
             self.assertEqual(one["artifacts"][0]["sha256"], hashlib.sha256(b"release-binary").hexdigest())
 
+    def test_repository_dependency_policy_v2_is_release_manifest_compatible(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            artifact = root / "tool.bin"
+            artifact.write_bytes(b"release-binary")
+            repository_policy = Path(__file__).parents[1] / "release_dependencies.json"
+            manifest = generate(
+                output=root / "release.json",
+                git_sha="a" * 40,
+                target_platform="linux",
+                artifacts=[artifact],
+                dependency_policy=repository_policy,
+                build_time_utc="2026-08-07T00:00:00+00:00",
+            )
+            self.assertEqual(manifest["dependency_policy"]["version"], 2)
+
+    def test_linux_release_preset_builds_the_native_qualification_binary(self):
+        repository = Path(__file__).resolve().parents[3]
+        presets = json.loads(
+            (repository / "CMakePresets.json").read_text(encoding="utf-8")
+        )
+        linux = next(
+            preset
+            for preset in presets["buildPresets"]
+            if preset["name"] == "marketscanner-linux-release"
+        )
+        self.assertIn("market_scanner_native_tests", linux["targets"])
+        workflow = (
+            repository / ".github/workflows/marketscanner-repair-v2.yml"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            "build/marketscanner-linux-release/bin/rtabmap-market-scanner-native-tests",
+            workflow,
+        )
+
     def test_invalid_sha_and_missing_artifact_fail_closed(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -312,6 +347,28 @@ class ReleaseManifestTests(unittest.TestCase):
                 generate(output=root / "out", git_sha="bad", target_platform="macos", artifacts=[root / "missing"], dependency_policy=policy)
             with self.assertRaises(ValueError):
                 generate(output=root / "out", git_sha="a" * 40, target_platform="macos", artifacts=[root / "missing"], dependency_policy=policy)
+            artifact = root / "artifact"
+            artifact.write_bytes(b"artifact")
+            for invalid_value in (True, 2.0, 3):
+                with self.subTest(dependency_policy_version=invalid_value):
+                    invalid_version = root / "invalid-version.json"
+                    invalid_version.write_text(
+                        json.dumps(
+                            {
+                                "format": "MarketScannerDependencyPolicy",
+                                "version": invalid_value,
+                            }
+                        ),
+                        encoding="utf-8",
+                    )
+                    with self.assertRaisesRegex(ValueError, "format/version"):
+                        generate(
+                            output=root / "out",
+                            git_sha="a" * 40,
+                            target_platform="macos",
+                            artifacts=[artifact],
+                            dependency_policy=invalid_version,
+                        )
 
     def test_ios_dependency_manifest_detects_same_size_tampering(self):
         with tempfile.TemporaryDirectory() as temporary:

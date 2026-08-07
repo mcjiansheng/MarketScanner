@@ -76,7 +76,7 @@ True sensor Deep 不属于 Mobile V1。设备端不会在 Fast/Full 失败后重
 | --- | --- |
 | `python3 -m unittest discover -s tools/PriorMap/tests -v` | 166 tests，PASS；1059.678 s |
 | `python3 -m unittest discover -s tools/Qualification/tests -v` | 28 tests，PASS |
-| `python3 -m unittest discover -s tools/SupermarketMapStudio/tests -v` | 104 tests，PASS |
+| `python3 -m unittest discover -s tools/SupermarketMapStudio/tests -v` | 106 tests，PASS |
 | `rtabmap-market-scanner-native-tests` | 7,878 checks，0 failures |
 | iOS source membership | 82 Swift sources，PASS |
 | SwiftPM dependency lock | 1 direct package / 1 exact resolved pin，PASS |

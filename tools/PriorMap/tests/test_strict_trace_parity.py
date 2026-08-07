@@ -4,7 +4,9 @@ import json
 import os
 from dataclasses import replace
 from pathlib import Path
+import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -100,6 +102,11 @@ def fixture_cases() -> dict[str, tuple[bytes, str]]:
 class StrictTraceParityTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
+        xcrun = shutil.which("xcrun")
+        if xcrun is None and sys.platform == "darwin":
+            raise RuntimeError("strict trace device parity requires Xcode xcrun on macOS")
+        if xcrun is None:
+            raise unittest.SkipTest("strict trace device parity requires Xcode swiftc")
         cls.temporary = tempfile.TemporaryDirectory()
         cls.root = Path(cls.temporary.name)
         cls.fixture_directory = cls.root / "fixtures"
@@ -122,7 +129,7 @@ class StrictTraceParityTests(unittest.TestCase):
         environment["CLANG_MODULE_CACHE_PATH"] = str(cls.root / "clang-cache")
         environment["SWIFT_MODULECACHE_PATH"] = str(cls.root / "swift-cache")
         subprocess.run(
-            ["xcrun", "swiftc", *map(str, sources), "-o", str(cls.runner)],
+            [xcrun, "swiftc", *map(str, sources), "-o", str(cls.runner)],
             check=True,
             cwd=ROOT,
             env=environment,

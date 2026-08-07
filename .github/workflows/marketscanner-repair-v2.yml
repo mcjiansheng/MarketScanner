@@ -325,7 +325,7 @@ jobs:
             libg2o-dev libopencv-dev libpcl-dev libsqlite3-dev zlib1g-dev
       - name: Fresh configure from the release preset
         run: cmake --fresh --preset marketscanner-linux-release
-      - name: Build reprocess and factor helper from the empty build tree
+      - name: Build reprocess, factor helper and native qualification suite from the empty build tree
         run: cmake --build --preset marketscanner-linux-release -j2
       - name: Run executable native factor-graph qualification suite
         run: |

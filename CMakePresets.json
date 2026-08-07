@@ -49,7 +49,7 @@
     }
   ],
   "buildPresets": [
-    {"name": "marketscanner-linux-release", "configurePreset": "marketscanner-linux-release", "targets": ["reprocess", "prior_map_factor_graph"]},
+    {"name": "marketscanner-linux-release", "configurePreset": "marketscanner-linux-release", "targets": ["reprocess", "prior_map_factor_graph", "market_scanner_native_tests"]},
     {"name": "marketscanner-macos-release", "configurePreset": "marketscanner-macos-release", "targets": ["reprocess", "prior_map_factor_graph"]},
     {"name": "marketscanner-windows-release", "configurePreset": "marketscanner-windows-release", "targets": ["reprocess", "prior_map_factor_graph"]}
   ]

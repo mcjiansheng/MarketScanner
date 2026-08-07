@@ -49,7 +49,12 @@ def generate(
         raise ValueError("at least one release artifact is required")
     policy_bytes = dependency_policy.read_bytes()
     policy = json.loads(policy_bytes)
-    if policy.get("format") != "MarketScannerDependencyPolicy" or policy.get("version") != 1:
+    policy_version = policy.get("version")
+    if (
+        policy.get("format") != "MarketScannerDependencyPolicy"
+        or type(policy_version) is not int
+        or policy_version not in {1, 2}
+    ):
         raise ValueError("dependency policy format/version is invalid")
     quality_policy_bytes = quality_policy.read_bytes()
     quality = json.loads(quality_policy_bytes)
