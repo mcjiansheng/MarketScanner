@@ -15,7 +15,7 @@
 7. 验证 `tag_observations.jsonl`、`tag_observation_bursts.jsonl`、`localized_price_tags.json`、metadata watermark 和 PC manifest v3 的 count、last ID、SHA-256 与 exact observation/burst binding。
 8. 在 PC 完成现场 A + optimized A、现场 A + optimized B、现场 A + offline unavailable 三类回放，分别验证 `NO_CONFLICT` approved、`USER_CONFIRMATION_CONFLICT` review/rescan、`OFFLINE_ASSOCIATION_UNAVAILABLE` review/rescan。
 9. 补齐平台 scoped `Libraries/iphonesimulator` / `Libraries/iphoneos` native dependencies，完成 simulator/device clean compile-link；当前本机 Xcode 已编译本轮 Swift 文件并 emit module，但最终被缺失的 Eigen/PCL/OpenCV headers（`Eigen/Core`、`pcl/point_cloud.h`、`opencv2/highgui/highgui.hpp`）阻断，不能记为 clean build PASS。
-10. 完整运行长时 PriorMap host workflow（包括 snapshot crash matrix）；本轮执行已通过早期 compile 与 ESL focused 阶段，但因时间手工中断，不能记录为 PASS。
+10. 完整运行 `python3 -m unittest discover -s tools/PriorMap/tests -v`；I5 的关键长时 host workflow 已在 943.159 秒内 PASS（包括 Snapshot/Result/Map crash matrix、finalization/trace/tag scale），但不能把单方法结果冒充完整 discover PASS。
 11. 测量 scan-stop 期间 finalization-owned audit append、`persistTerminalRecoveryEvidence()` 与 `priorMapQueue.sync` 的主线程延迟；正确性和 snapshot 线性化已关闭，但慢盘或较大 Recovery sidecar 下的 UI latency 尚未资格化。
 
 ## 已延期的低影响实现
@@ -32,6 +32,9 @@
 - MapCase02 等待地图项目组提供正式规则；禁止猜测坐标、scale、offset、rotation 或加入 store/map/file-specific hack。
 - 深化 Windows-portable source database basename：拒绝尾随点/空格别名和 `CON`、`NUL` 等保留设备名。当前已拒绝 slash、drive path 与 canonical casefold 冲突，macOS 当前生产路径风险较低，因此延期。
 - 评估 `PriceTagCaptureCoordinator.illegalTransitionLocked` 的 Debug 诊断顺序。当前 `assertionFailure` 可能在 diagnostic 被 ViewController 持久化前中止 Debug 进程；后续可采用非致命 assertion hook 或先持久化再触发的测试策略，Release 行为不受影响。
+- 为 `ProcessingResourceGovernor` host test 增加独立的约 250 ms cadence 合同，并用锁保护 `thermalStateOverride` 的测试 backing storage。当前 2 秒有界轮询只验证真实 production timer liveness；完全不触发仍会失败，但不把严格 cadence 或 Thread Sanitizer 资格写成已完成。
+- 深化 Result publish-intent removal 回归：对 replacement conflict 再执行一次重启恢复并继续要求同一 conflict inode 永久阻断；另增加 identity 完全匹配的合法 removal tombstone 正例，证明正常 crash cleanup 不被永久 quarantine。
+- 深化 Map quarantine lock-replacement 证据断言：除 `diagnostic.tmp` / `diagnostic.removing` 合计恰好一个外，再核对 regular-file、`0444` 和 canonical diagnostic bytes。
 
 ## 明确不属于本清单的事项
 
