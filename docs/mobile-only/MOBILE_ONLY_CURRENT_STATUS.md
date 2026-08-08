@@ -4,14 +4,14 @@
 
 ## 总体
 
-当前 RC 分支 `mobile-only-v1-release-candidate-blocker-closeout`，基线 `81b6dbb216e843d363fd0088f673076add78013f`。当前事务加固 implementation 为 `f0ffcec4480ce04ac61f3a8aad2453e5b4b27a35`，governance `dbc2f2626dbf655b916b9afe4ab24fbd812a2590` 已将 descriptor 的 `implementation_sha` 绑定到该提交；`validation_sha` 等待本次 evidence docs SHA。历史 exact-SHA CI 三次均失败：`31174285439@00018f4` 为 3/8、`31177319567@37accce` 为 6/8、`31180693841@359e5c2` 为 7/8；新 implementation 尚未取得远端 exact-SHA PASS。当前发布判断仍为 **REJECTED / NO-GO / developer smoke only**。
+当前 RC 分支 `mobile-only-v1-release-candidate-blocker-closeout`，基线 `81b6dbb216e843d363fd0088f673076add78013f`。当前事务加固 implementation 为 `f0ffcec4480ce04ac61f3a8aad2453e5b4b27a35`，governance `dbc2f2626dbf655b916b9afe4ab24fbd812a2590` 已将 descriptor 的 `implementation_sha` 绑定到该提交；evidence SHA由后续纯治理提交绑定，当前`validation_sha`以descriptor为唯一事实源。历史 exact-SHA CI 三次均失败：`31174285439@00018f4` 为 3/8、`31177319567@37accce` 为 6/8、`31180693841@359e5c2` 为 7/8；新 implementation 尚未取得远端 exact-SHA PASS。当前发布判断仍为 **REJECTED / NO-GO / developer smoke only**。
 
 新增明确 blocker：J-04 absolute-prior component identity 尚未关闭。最终 DB graph 可以由 node `mapID` 和 links 推导 component，但现行 constraint 写侧没有 atomic bound node/map ID，manual v3 也没有 RTAB-Map map ID；因此 reader 不能事后伪造 same-component 证明。需先完成正式 evidence schema 迁移，再进行 component 资格测试。
 
 ## RC 最终治理和 Result 事务加固
 
 - iOS 内嵌 `MarketScannerBuildIdentity` 已升级为 version 3；Python 生成/验证器和 Swift 读取器必须接受完全一致的 exact schema：`format`、`version`、`app_git_sha`、`native_core_sha256`，以及 governance descriptor 的 `wave`、`branch`、`base_branch`、`base_sha`、`implementation_sha`、`validation_sha`。任何缺失、未知或重复字段均 fail closed。
-- `wave` / `branch` / `base_branch` 使用统一安全 ASCII 规则；当前 I2/G2 已绑定 implementation，validation 仍待 evidence commit。Swift 运行时只有 implementation/validation 均为40位小写 SHA时才允许 `isUsable`；即使完成绑定，也必须另有 exact-SHA CI和资格证据。
+- `wave` / `branch` / `base_branch` 使用统一安全 ASCII 规则；implementation与evidence分别通过纯治理后继提交绑定，当前值以descriptor为准。Swift运行时只有implementation/validation均为40位小写SHA时才允许`isUsable`；即使完成绑定，也必须另有exact-SHA CI和资格证据。
 - Result 从 `Results/` 下同父目录隐藏 staging 提交：先 fsync 全部文件/清单/receipt，把 payload 文件冻结为 `0444`，root 保持 `0755`。durable publish intent 绑定 task/result/manifest 与 directory dev/inode；root-scoped cross-process advisory lock 覆盖 cleanup、commit、recovery、list 和 read，阻止这些受锁操作清理或误读 active publisher 的 intent。exclusive rename 后，通过仍打开的 inode-bound FD 执行 `0755→0555`、directory fsync、destination path/dev/inode 复核，再验证 exact set、receipt、manifest 和每个 artifact 哈希。rename 或 final pathname 出现均不是业务提交点；intent 清理前只允许按 exact identity 恢复。该 lock/lease 不覆盖 active staging 的长期写入阶段；生产依赖 `MobileProcessingPipeline` 单一主 App 串行，`cleanupStaging` 仅在 task pipeline 启动且 staging 创建前调用，同一 task 禁止跨进程并发构建。
 - Snapshot 的 task-root 与 `input_snapshot.lock`、Result 的 Results root 与 `.result-library.lock`、Map 的 Maps root 与 `.map-library.lock` 均绑定 descriptor/path dev/inode，并在公开成功返回前最终复核；pathname replacement不会继续返回成功。
 - Result quarantine 使用 hidden pending + source move前 durable canonical v2 diagnostic，绑定 source/payload/wrapper dev/inode，并在启动时恢复 external/embedded diagnostic、pending/final与removal tombstone。未知/冲突状态保留并使listing整体fail closed；历史 v1 immutable wrapper保持兼容，包括顶层symlink payload，嵌套symlink/special/hardlink仍拒绝。
