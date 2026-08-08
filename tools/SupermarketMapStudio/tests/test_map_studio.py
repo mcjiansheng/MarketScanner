@@ -159,6 +159,7 @@ def create_localized_store(
         "source_manifest.json": {
             "format": "MarketScannerLocalizedSourceManifest", "version": 2,
             **source_manifest,
+            "source_database_name": "source.db",
             "input_identity_id": input_identity_id,
             "session_input_bundle_sha256": bundle_hash,
             "source_database_sha256_before": source_hash,
@@ -171,12 +172,17 @@ def create_localized_store(
             "publish_state": report_payload["publish_state"],
             "input_identity_id": input_identity_id,
             **identities,
+            "session_input_manifest_version": 1,
+            "recovery_evidence_binding":
+                "recovery_lifecycle_evidence_unbound_legacy",
             "factor_graph_quality_policy_sha256": "e" * 64,
             "factor_graph_quality_policy_version": "test-frozen-1",
             "replay_parameters": replay_parameters,
         },
         "session_input_manifest.json": {
             **bundle_body,
+            "recovery_evidence_binding":
+                "recovery_lifecycle_evidence_unbound_legacy",
             "bundle_sha256": bundle_hash,
             "input_identity_id": input_identity_id,
         },
@@ -189,6 +195,9 @@ def create_localized_store(
         "localization_report.json": {
             "format": "MarketScannerLocalizationReport", "version": 1,
             **report_payload,
+            "session_input_manifest_version": 1,
+            "recovery_evidence_binding":
+                "recovery_lifecycle_evidence_unbound_legacy",
         },
         "factor_graph_report.json": {
             "format": "MarketScannerRelativeSE2FactorGraphReport",
