@@ -3543,10 +3543,9 @@ enum MobileResultLibrary {
             && sameCommittedRegularFileObject(
                 stable.metadata, tombstoneMetadata)
         guard tombstoneMatches else {
-            try restoreOrQuarantineUnexpectedPublishIntentRemoval(
+            try quarantineUnexpectedPublishIntentRemoval(
                 parentDescriptor: openedParent.descriptor,
                 tombstoneName: tombstoneName,
-                canonicalName: url.lastPathComponent,
                 context: "detached result publish-intent")
         }
         guard fsync(openedParent.descriptor) == 0,
@@ -3761,30 +3760,16 @@ enum MobileResultLibrary {
             "\(context) identity mismatch; evidence preserved")
     }
 
-    private static func restoreOrQuarantineUnexpectedPublishIntentRemoval(
+    private static func quarantineUnexpectedPublishIntentRemoval(
         parentDescriptor: Int32,
         tombstoneName: String,
-        canonicalName: String,
         context: String
     ) throws -> Never {
-        var canonicalMetadata = stat()
-        let canonicalLookup = fstatat(
-            parentDescriptor,
-            canonicalName,
-            &canonicalMetadata,
-            AT_SYMLINK_NOFOLLOW)
-        if canonicalLookup != 0, errno == ENOENT,
-           renameatx_np(
-                parentDescriptor, tombstoneName,
-                parentDescriptor, canonicalName,
-                UInt32(RENAME_EXCL)) == 0 {
-            guard fsync(parentDescriptor) == 0 else {
-                throw ResultError.commitFailed(
-                    "cannot sync restored \(context)")
-            }
-            throw ResultError.commitFailed(
-                "\(context) identity mismatch; unexpected authority restored")
-        }
+        // A tombstone whose inode no longer matches its identity-bound name
+        // can never regain the canonical intent basename. Restoring it would
+        // let a later recovery pass treat the replacement inode as fresh
+        // authority. Preserve it under the durable conflict namespace so all
+        // subsequent recovery attempts remain fail-closed.
         try quarantineUnexpectedPublishIntentFile(
             parentDescriptor: parentDescriptor,
             basename: tombstoneName,
@@ -3814,10 +3799,9 @@ enum MobileResultLibrary {
             &moved,
             AT_SYMLINK_NOFOLLOW) == 0,
               sameCommittedOrCreationFileObject(expectedMetadata, moved) else {
-            try restoreOrQuarantineUnexpectedPublishIntentRemoval(
+            try quarantineUnexpectedPublishIntentRemoval(
                 parentDescriptor: parentDescriptor,
                 tombstoneName: tombstoneName,
-                canonicalName: basename,
                 context: context)
         }
         guard fsync(parentDescriptor) == 0,
@@ -3949,10 +3933,9 @@ enum MobileResultLibrary {
                 taskID: record.intent.taskID,
                 resultID: record.intent.resultID)
             guard record.fileIdentity == parsed.identity else {
-                try restoreOrQuarantineUnexpectedPublishIntentRemoval(
+                try quarantineUnexpectedPublishIntentRemoval(
                     parentDescriptor: openedRoot.descriptor,
                     tombstoneName: name,
-                    canonicalName: canonicalName,
                     context: "result publish-intent tombstone")
             }
             var canonicalMetadata = stat()

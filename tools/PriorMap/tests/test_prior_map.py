@@ -2085,7 +2085,8 @@ class IOSCoreContractTests(unittest.TestCase):
 
             # Simulate a process death after canonical intent -> removal
             # tombstone rename, then replace the tombstone. Startup must
-            # restore/quarantine the unexpected inode and return failure.
+            # quarantine the unexpected inode and return failure. It must
+            # never regain the canonical authority basename on a later run.
             removal_root = Path(temporary) / "result-intent-removal-replacement"
             removal_crash = subprocess.run(
                 [
@@ -2134,8 +2135,19 @@ class IOSCoreContractTests(unittest.TestCase):
                 removal_recovery.stderr + removal_recovery.stdout,
             )
             self.assertTrue(removal_original.is_file())
-            self.assertTrue(canonical_intent.is_file())
-            self.assertEqual(canonical_intent.stat().st_ino, replacement_removal_inode)
+            self.assertFalse(canonical_intent.exists())
+            removal_conflicts = list(
+                removal_root.glob(".result-publish-intent-conflict-*")
+            )
+            self.assertEqual(len(removal_conflicts), 1)
+            self.assertEqual(
+                removal_conflicts[0].stat().st_ino,
+                replacement_removal_inode,
+            )
+            self.assertEqual(
+                removal_conflicts[0].read_bytes(),
+                removal_original.read_bytes(),
+            )
 
             # After a durable intent but before directory publication, a
             # byte-identical staging clone is still a different authority.
@@ -2153,7 +2165,14 @@ class IOSCoreContractTests(unittest.TestCase):
                 text=True,
             )
             self.assertEqual(staging_crash.returncode, 81, staging_crash.stderr)
-            staging_paths = list(staging_replace_root.glob(".result-staging-*"))
+            # The canonical publish-intent filename shares the hidden staging
+            # basename plus `.publish-intent.json`; select the directory
+            # authority explicitly instead of matching both path types.
+            staging_paths = [
+                path
+                for path in staging_replace_root.glob(".result-staging-*")
+                if path.is_dir()
+            ]
             self.assertEqual(len(staging_paths), 1)
             staging_path = staging_paths[0]
             staging_original = Path(temporary) / "result-staging-original"
@@ -2927,18 +2946,19 @@ class IOSCoreContractTests(unittest.TestCase):
                         canonical_lock.stat().st_ino,
                         displaced_lock.stat().st_ino,
                     )
-                    self.assertEqual(
-                        len(
-                            list(
-                                (
-                                    binding_root
-                                    / "quarantine"
-                                    / prior_map_id
-                                ).glob(".*.diagnostic.tmp")
-                            )
-                        ),
-                        1,
+                    quarantine_binding_root = (
+                        binding_root / "quarantine" / prior_map_id
                     )
+                    # Lock validation can fail either before the diagnostic
+                    # is detached or after its identity-bound removal rename.
+                    # Both names are durable recovery evidence; neither is a
+                    # successful cleanup state.
+                    diagnostic_evidence = list(
+                        quarantine_binding_root.glob(".*.diagnostic.tmp")
+                    ) + list(
+                        quarantine_binding_root.glob(".*.diagnostic.removing")
+                    )
+                    self.assertEqual(len(diagnostic_evidence), 1)
 
             # If rollback finds both canonical temporary and removal
             # tombstone names, RENAME_EXCL semantics must fail closed and

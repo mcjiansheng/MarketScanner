@@ -10771,6 +10771,11 @@ if CommandLine.arguments.count == 3,
 // result package -> streaming XLSX -> reopen validation) ===
 // Runs through the production importer/compiler/pipeline only; no direct
 // construction of FinalTrajectory.Node or FinalPriceTag (V1R1 §15).
+// Worker modes below launch this executable repeatedly to exercise crash
+// recovery. They must not rerun the complete E2E suite before reaching their
+// requested worker entry: doing so multiplies runtime and lets unrelated
+// periodic-timer assertions make a crash-worker invocation flaky.
+if CommandLine.arguments.count <= 1 {
 do {
     let temporary = FileManager.default.temporaryDirectory
         .appendingPathComponent("ms-replay-e2e-\(UUID().uuidString)", isDirectory: true)
@@ -12792,7 +12797,19 @@ do {
         //    must reject that interrupted run.
         ProcessingResourceGovernor.beginRun()
         ProcessingResourceGovernor.thermalStateOverride = .serious
-        Thread.sleep(forTimeInterval: 0.35)
+        // The sampler runs on a utility queue. A fixed 350 ms sleep is only
+        // one nominal timer interval plus leeway and can expire before that
+        // queue is scheduled on a loaded CI host. Poll for bounded evidence
+        // instead: this still requires the production timer to fire (no
+        // manual sample is injected), while allowing ordinary scheduler
+        // latency without making the contract flaky.
+        let periodicSampleDeadline =
+            ProcessInfo.processInfo.systemUptime + 2.0
+        while ProcessingResourceGovernor
+                .runSeriousOrCriticalThermalSampleCount() == 0,
+              ProcessInfo.processInfo.systemUptime < periodicSampleDeadline {
+            Thread.sleep(forTimeInterval: 0.025)
+        }
         ProcessingResourceGovernor.thermalStateOverride = nil
         require(
             ProcessingResourceGovernor.runSeriousOrCriticalThermalSampleCount() >= 1,
@@ -12848,6 +12865,7 @@ catch {
     FileHandle.standardError.write(
         Data("E2E replay failed: \(error)\n".utf8))
     exit(9)
+}
 }
 
 // RC Snapshot transaction crash worker. Every crash phase starts from one
@@ -13777,6 +13795,23 @@ func runResultPublicationCrashWorkerIfRequested() {
         }
         MobileResultLibrary.cleanupStaging(taskID: taskID)
         let visible = MobileResultLibrary.listResults()
+        // `listResults()` and `cleanupStaging()` are intentionally
+        // non-throwing for the app UI: recovery failures are represented by
+        // an empty listing plus a diagnostic. The crash-worker process must
+        // promote every recovery diagnostic to a failing exit so the
+        // executable contract can distinguish fail-closed recovery from an
+        // ordinary empty library. Check after the final listing because an
+        // earlier pass may first restore or quarantine unexpected authority,
+        // and only the subsequent pass reports the durable failure state.
+        let recoveryDiagnostics = MobileResultLibrary.lastListingDiagnostics()
+        if !recoveryDiagnostics.isEmpty {
+            throw NSError(
+                domain: "ResultCrashWorker",
+                code: 9,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "result recovery failed closed: "
+                        + recoveryDiagnostics.joined(separator: "; ")])
+        }
         let committed = FileManager.default.fileExists(atPath: final.path)
         if committed {
             let reopened = try MobileResultLibrary.readResult(resultID: resultID)
