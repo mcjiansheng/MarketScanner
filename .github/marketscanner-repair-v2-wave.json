@@ -3,6 +3,6 @@
   "branch": "mobile-only-v1-release-candidate-blocker-closeout",
   "base_branch": "mobile-only-v1r5-field-qualification-integrity-scale-closeout",
   "base_sha": "81b6dbb216e843d363fd0088f673076add78013f",
-  "implementation_sha": "f0ffcec4480ce04ac61f3a8aad2453e5b4b27a35",
+  "implementation_sha": "fdcc5c87005a0128e0654eb43b1364898edd8f5d",
   "validation_sha": "8387a77cb2f5115cc596f8eeaf07eb65310e6904"
 }
