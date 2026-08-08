@@ -5,8 +5,10 @@ import math
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
 import tempfile
+import time
 import unittest
 import zipfile
 from pathlib import Path
@@ -467,6 +469,8 @@ class IOSCoreContractTests(unittest.TestCase):
             repository
             / "app/ios/RTABMapApp/MobilePostProcessing/SE2FactorGraphCore.swift",
             repository
+            / "app/ios/RTABMapApp/MobilePostProcessing/ImmutableDirectoryPublication.swift",
+            repository
             / "app/ios/RTABMapApp/MobilePostProcessing/SessionSnapshotTransaction.swift",
             # Mobile-Only V1R4: strict absolute prior-map evidence parser
             # (§6.1): real write-side schema, identity fail-closed,
@@ -560,6 +564,1748 @@ class IOSCoreContractTests(unittest.TestCase):
             )
             self.assertEqual(run_result.returncode, 0, run_result.stderr)
             self.assertIn("Swift tests passed", run_result.stdout)
+
+            def make_snapshot_crash_session(session: Path) -> None:
+                session.mkdir(parents=True)
+                prior_map_sha = "a" * 64
+                metadata = {
+                    "format": "MarketScannerFinalizedSessionMetadata",
+                    "version": 1,
+                    "formatVersion": 2,
+                    "finalized": True,
+                    "finalizedAtUnix": 1_700_000_100.0,
+                    "scanMode": "continuous_streaming",
+                    "workflowMode": "prior_map_localized",
+                    "trackingSessionId": "P7-SESSION",
+                    "storeId": "STORE-P7",
+                    "floorId": "FLOOR-P7",
+                    "priorMapId": "MAP-P7",
+                    "priorMapSha256": prior_map_sha,
+                    "processingEligibility": {
+                        "status": "eligible",
+                        "blockers": [],
+                    },
+                    "captureHealth": {
+                        "localizationRequiredWriteFailureCount": 0,
+                        "localizationTraceRecordCount": 1,
+                        "localizationConstraintRecordCount": 1,
+                        "manualLocalizationEventCount": 0,
+                        "localizationStateEventCount": 1,
+                        "localizationEvidenceComplete": True,
+                        "localizationRecoveryEventCount": 1,
+                        "localizationLastRecoveryEpisodeId": 1,
+                        "localizationLastRecoveryFinishedAtUptime": 42.0,
+                        "localizationRecoveryEvidenceComplete": True,
+                    },
+                    "localizationTrace": "localization_trace.jsonl",
+                    "manualLocalizationEvents":
+                        "manual_localization_events.jsonl",
+                    "localizationConstraints":
+                        "localization_constraints.jsonl",
+                    "localizationEvents": "localization_events.jsonl",
+                    "localizationRecoveryEvents":
+                        "localization_recovery_events.jsonl",
+                    "tagObservations": "tag_observations.jsonl",
+                    "localizedPriceTags": "localized_price_tags.json",
+                    "clockCorrelationCount": 2,
+                    "clockNodeBindingCount": 2,
+                    "clockLastMonotonic": 41.0,
+                    "clockLastUTC": 1_700_000_041.0,
+                    "clockEvidenceComplete": True,
+                    "tagObservationBurstCount": 0,
+                    "tagObservationBurstComplete": True,
+                }
+                (session / "metadata.json").write_text(
+                    json.dumps(
+                        metadata,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                )
+                sidecars = {
+                    "localization_trace.jsonl": b"trace\n",
+                    "localization_constraints.jsonl": b"constraints\n",
+                    "manual_localization_events.jsonl": b"manual\n",
+                    "tag_observations.jsonl": b"obs\n",
+                    "localization_events.jsonl": b"events\n",
+                    "localization_recovery_events.jsonl": b"recovery\n",
+                    "localized_price_tags.json": b"[]",
+                    "clock_correlations.jsonl": b"clock\n",
+                    "tag_observation_bursts.jsonl": b"",
+                }
+                for name, payload in sidecars.items():
+                    (session / name).write_bytes(payload)
+                scan_event = {
+                    "format": "SupermarketScanEvent",
+                    "version": 1,
+                    "timestamp": "2023-11-14T22:13:20.000Z",
+                    "timestampUnix": 1_700_000_000.0,
+                    "level": "info",
+                    "event": "scan_started",
+                    "message": "fixture scan started",
+                    "trackingSessionId": "P7-SESSION",
+                    "fields": {},
+                }
+                (session / "scan_events.jsonl").write_text(
+                    json.dumps(
+                        scan_event,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                    + "\n"
+                )
+                database = sqlite3.connect(session / "source.db")
+                try:
+                    database.executescript(
+                        """
+                        CREATE TABLE Node (
+                            id INTEGER PRIMARY KEY,
+                            map_id INTEGER,
+                            weight INTEGER,
+                            stamp REAL,
+                            pose BLOB
+                        );
+                        CREATE TABLE Link (
+                            from_id INTEGER,
+                            to_id INTEGER,
+                            type INTEGER,
+                            transform BLOB,
+                            information_matrix BLOB
+                        );
+                        """
+                    )
+                    database.commit()
+                finally:
+                    database.close()
+
+            snapshot_crash_cases = (
+                ("after_intent_temp", 90),
+                ("after_intent_rename", 91),
+                ("old_thaw", 92),
+                ("old_rename", 101),
+                ("old_freeze", 102),
+                ("new_rename", 93),
+                ("new_freeze", 94),
+                ("after_install", 95),
+                ("reference_temp", 100),
+                ("reference_rename", 96),
+                ("reference_swap_postrename", 106),
+                ("reference_durable", 97),
+                ("cleanup_root", 98),
+                ("cleanup_child", 104),
+                ("rollback_after_authority", 99),
+                ("intent_remove_postrename", 113),
+            )
+            snapshot_fixture_root = Path(temporary) / "snapshot-crash-fixture"
+            snapshot_session = snapshot_fixture_root / "session"
+            snapshot_baseline_task = snapshot_fixture_root / "task"
+            make_snapshot_crash_session(snapshot_session)
+            snapshot_baseline_task.mkdir(parents=True)
+            baseline = subprocess.run(
+                [
+                    str(executable),
+                    "--snapshot-publication-crash-worker",
+                    str(snapshot_session),
+                    str(snapshot_baseline_task),
+                    "baseline",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                baseline.returncode,
+                0,
+                baseline.stderr + baseline.stdout,
+            )
+            for phase, expected_exit in snapshot_crash_cases:
+                case_root = Path(temporary) / f"snapshot-crash-{phase}"
+                task_root = case_root / "task"
+                case_root.mkdir(parents=True)
+                shutil.copytree(snapshot_baseline_task, task_root)
+                crashed = subprocess.run(
+                    [
+                        str(executable),
+                        "--snapshot-publication-crash-worker",
+                        str(snapshot_session),
+                        str(task_root),
+                        phase,
+                    ],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(
+                    crashed.returncode,
+                    expected_exit,
+                    crashed.stderr + crashed.stdout,
+                )
+                recovered = subprocess.run(
+                    [
+                        str(executable),
+                        "--snapshot-publication-crash-worker",
+                        str(snapshot_session),
+                        str(task_root),
+                        "recover",
+                    ],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(
+                    recovered.returncode,
+                    0,
+                    recovered.stderr + recovered.stdout,
+                )
+                self.assertIn("snapshot recover passed", recovered.stdout)
+                self.assertEqual(
+                    (task_root / "input_snapshot").stat().st_mode & 0o777,
+                    0o555,
+                )
+                self.assertEqual(
+                    (task_root / "input_manifest.json").stat().st_mode & 0o777,
+                    0o444,
+                )
+                self.assertFalse((task_root / "input_snapshot.backup").exists())
+                self.assertFalse((task_root / "input_snapshot.staging").exists())
+                self.assertFalse(
+                    (task_root / "input_snapshot.transaction.json").exists()
+                )
+                self.assertFalse(
+                    list(task_root.glob("input_snapshot.transaction.tmp-*"))
+                )
+                self.assertFalse(list(task_root.glob(".input_manifest.*.tmp")))
+
+            double_crash_root = Path(temporary) / "snapshot-reference-temp-double-crash"
+            double_crash_task = double_crash_root / "task"
+            double_crash_root.mkdir(parents=True)
+            shutil.copytree(snapshot_baseline_task, double_crash_task)
+            double_crash_first = subprocess.run(
+                [
+                    str(executable),
+                    "--snapshot-publication-crash-worker",
+                    str(snapshot_session),
+                    str(double_crash_task),
+                    "reference_temp",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                double_crash_first.returncode,
+                100,
+                double_crash_first.stderr + double_crash_first.stdout,
+            )
+            self.assertTrue(list(double_crash_task.glob(".input_manifest.*.tmp")))
+            double_crash_second = subprocess.run(
+                [
+                    str(executable),
+                    "--snapshot-publication-crash-worker",
+                    str(snapshot_session),
+                    str(double_crash_task),
+                    "recovery_core_postintent_crash",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                double_crash_second.returncode,
+                114,
+                double_crash_second.stderr + double_crash_second.stdout,
+            )
+            self.assertFalse(list(double_crash_task.glob(".input_manifest.*.tmp")))
+            self.assertFalse(
+                (double_crash_task / "input_snapshot.transaction.json").exists()
+            )
+            double_crash_recovered = subprocess.run(
+                [
+                    str(executable),
+                    "--snapshot-publication-crash-worker",
+                    str(snapshot_session),
+                    str(double_crash_task),
+                    "recover",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                double_crash_recovered.returncode,
+                0,
+                double_crash_recovered.stderr + double_crash_recovered.stdout,
+            )
+
+            first_generation_root = Path(temporary) / "snapshot-first-generation-temp"
+            first_generation_task = first_generation_root / "task"
+            first_generation_task.mkdir(parents=True)
+            first_generation_crash = subprocess.run(
+                [
+                    str(executable),
+                    "--snapshot-publication-crash-worker",
+                    str(snapshot_session),
+                    str(first_generation_task),
+                    "reference_temp",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                first_generation_crash.returncode,
+                100,
+                first_generation_crash.stderr + first_generation_crash.stdout,
+            )
+            first_generation_recovery = subprocess.run(
+                [
+                    str(executable),
+                    "--snapshot-publication-crash-worker",
+                    str(snapshot_session),
+                    str(first_generation_task),
+                    "recovery_core_postintent_crash",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                first_generation_recovery.returncode,
+                114,
+                first_generation_recovery.stderr + first_generation_recovery.stdout,
+            )
+            self.assertFalse(
+                list(first_generation_task.glob(".input_manifest.*.tmp"))
+            )
+            self.assertFalse(
+                (first_generation_task / "input_snapshot.transaction.json").exists()
+            )
+            first_generation_final_recovery = subprocess.run(
+                [
+                    str(executable),
+                    "--snapshot-publication-crash-worker",
+                    str(snapshot_session),
+                    str(first_generation_task),
+                    "recover",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                first_generation_final_recovery.returncode,
+                0,
+                first_generation_final_recovery.stderr
+                + first_generation_final_recovery.stdout,
+            )
+
+            first_clear_crash_root = (
+                Path(temporary) / "snapshot-first-clear-postrename"
+            )
+            first_clear_crash_task = first_clear_crash_root / "task"
+            first_clear_crash_task.mkdir(parents=True)
+            first_clear_crash = subprocess.run(
+                [
+                    str(executable),
+                    "--snapshot-publication-crash-worker",
+                    str(snapshot_session),
+                    str(first_clear_crash_task),
+                    "first_clear_postrename",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                first_clear_crash.returncode,
+                112,
+                first_clear_crash.stderr + first_clear_crash.stdout,
+            )
+            self.assertTrue(
+                list(first_clear_crash_task.glob(".input_manifest.remove-*"))
+            )
+            first_clear_crash_recovery = subprocess.run(
+                [
+                    str(executable),
+                    "--snapshot-publication-crash-worker",
+                    str(snapshot_session),
+                    str(first_clear_crash_task),
+                    "recover",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                first_clear_crash_recovery.returncode,
+                0,
+                first_clear_crash_recovery.stderr
+                + first_clear_crash_recovery.stdout,
+            )
+            self.assertFalse(
+                list(first_clear_crash_task.glob(".input_manifest.remove-*"))
+            )
+
+            for conflict_phase, seed_prior in (
+                ("reference_replace", True),
+                ("reference_appear", False),
+            ):
+                conflict_root = Path(temporary) / f"snapshot-{conflict_phase}"
+                conflict_task = conflict_root / "task"
+                conflict_root.mkdir(parents=True)
+                if seed_prior:
+                    shutil.copytree(snapshot_baseline_task, conflict_task)
+                else:
+                    conflict_task.mkdir()
+                conflict = subprocess.run(
+                    [
+                        str(executable),
+                        "--snapshot-publication-crash-worker",
+                        str(snapshot_session),
+                        str(conflict_task),
+                        conflict_phase,
+                    ],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(
+                    conflict.returncode,
+                    39,
+                    conflict.stderr + conflict.stdout,
+                )
+                authority = conflict_task / "input_manifest.json"
+                self.assertEqual(authority.read_text(), '{"unrelated":true}\n')
+                self.assertEqual(authority.stat().st_mode & 0o777, 0o444)
+                self.assertTrue(
+                    (conflict_task / "input_snapshot.transaction.json").is_file()
+                )
+                if seed_prior:
+                    self.assertTrue(
+                        (conflict_task / "input_manifest.displaced-by-test").is_file()
+                    )
+
+            postcheck_authority_payload = '{"unrelated_postcheck":true}\n'
+            for conflict_phase, seed_prior, displaced_name in (
+                (
+                    "reference_postcheck_replace",
+                    True,
+                    "input_manifest.displaced-postcheck-test",
+                ),
+                ("reference_postcheck_appear", False, None),
+            ):
+                conflict_root = Path(temporary) / f"snapshot-{conflict_phase}"
+                conflict_task = conflict_root / "task"
+                conflict_root.mkdir(parents=True)
+                if seed_prior:
+                    shutil.copytree(snapshot_baseline_task, conflict_task)
+                else:
+                    conflict_task.mkdir()
+                conflict = subprocess.run(
+                    [
+                        str(executable),
+                        "--snapshot-publication-crash-worker",
+                        str(snapshot_session),
+                        str(conflict_task),
+                        conflict_phase,
+                    ],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(
+                    conflict.returncode,
+                    39,
+                    conflict.stderr + conflict.stdout,
+                )
+                authority = conflict_task / "input_manifest.json"
+                self.assertEqual(authority.read_text(), postcheck_authority_payload)
+                self.assertEqual(authority.stat().st_mode & 0o777, 0o444)
+                intent = conflict_task / "input_snapshot.transaction.json"
+                self.assertTrue(intent.is_file())
+                if displaced_name is not None:
+                    self.assertTrue((conflict_task / displaced_name).is_file())
+                self.assertFalse(list(conflict_task.glob(".input_manifest.*.tmp")))
+                self.assertFalse(
+                    list(conflict_task.glob(".input_manifest.conflict-*"))
+                )
+
+                recovery = subprocess.run(
+                    [
+                        str(executable),
+                        "--snapshot-publication-crash-worker",
+                        str(snapshot_session),
+                        str(conflict_task),
+                        "recover",
+                    ],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(
+                    recovery.returncode,
+                    39,
+                    recovery.stderr + recovery.stdout,
+                )
+                self.assertEqual(authority.read_text(), postcheck_authority_payload)
+                self.assertTrue(intent.is_file())
+                if displaced_name is not None:
+                    self.assertTrue((conflict_task / displaced_name).is_file())
+
+            swap_crash_root = (
+                Path(temporary) / "snapshot-reference-swap-postrename-replace"
+            )
+            swap_crash_task = swap_crash_root / "task"
+            swap_crash_root.mkdir(parents=True)
+            shutil.copytree(snapshot_baseline_task, swap_crash_task)
+            swap_crash = subprocess.run(
+                [
+                    str(executable),
+                    "--snapshot-publication-crash-worker",
+                    str(snapshot_session),
+                    str(swap_crash_task),
+                    "reference_swap_postrename_replace",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                swap_crash.returncode,
+                107,
+                swap_crash.stderr + swap_crash.stdout,
+            )
+            swap_temporaries = list(
+                swap_crash_task.glob(".input_manifest.*.tmp")
+            )
+            self.assertEqual(len(swap_temporaries), 1)
+            self.assertEqual(
+                swap_temporaries[0].read_text(), postcheck_authority_payload
+            )
+            self.assertTrue(
+                (swap_crash_task / "input_snapshot.transaction.json").is_file()
+            )
+            self.assertTrue(
+                (
+                    swap_crash_task
+                    / "input_manifest.displaced-postcheck-test"
+                ).is_file()
+            )
+            swap_crash_recovery = subprocess.run(
+                [
+                    str(executable),
+                    "--snapshot-publication-crash-worker",
+                    str(snapshot_session),
+                    str(swap_crash_task),
+                    "recover",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                swap_crash_recovery.returncode,
+                39,
+                swap_crash_recovery.stderr + swap_crash_recovery.stdout,
+            )
+            self.assertEqual(
+                swap_temporaries[0].read_text(), postcheck_authority_payload
+            )
+            self.assertTrue(
+                (swap_crash_task / "input_snapshot.transaction.json").is_file()
+            )
+
+            clear_root = Path(temporary) / "snapshot-first-clear-postcheck-appear"
+            clear_task = clear_root / "task"
+            clear_root.mkdir(parents=True)
+            clear_task.mkdir()
+            clear_conflict = subprocess.run(
+                [
+                    str(executable),
+                    "--snapshot-publication-crash-worker",
+                    str(snapshot_session),
+                    str(clear_task),
+                    "first_clear_postcheck_appear",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                clear_conflict.returncode,
+                39,
+                clear_conflict.stderr + clear_conflict.stdout,
+            )
+            clear_authority = clear_task / "input_manifest.json"
+            clear_displaced = (
+                clear_task / "input_manifest.displaced-clear-postcheck-test"
+            )
+            clear_intent = clear_task / "input_snapshot.transaction.json"
+            self.assertEqual(
+                clear_authority.read_text(), postcheck_authority_payload
+            )
+            self.assertEqual(clear_authority.stat().st_mode & 0o777, 0o444)
+            self.assertTrue(clear_displaced.is_file())
+            self.assertTrue(clear_intent.is_file())
+            self.assertFalse(list(clear_task.glob(".input_manifest.*.tmp")))
+            self.assertFalse(list(clear_task.glob(".input_manifest.conflict-*")))
+
+            clear_recovery = subprocess.run(
+                [
+                    str(executable),
+                    "--snapshot-publication-crash-worker",
+                    str(snapshot_session),
+                    str(clear_task),
+                    "recover",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                clear_recovery.returncode,
+                39,
+                clear_recovery.stderr + clear_recovery.stdout,
+            )
+            self.assertEqual(
+                clear_authority.read_text(), postcheck_authority_payload
+            )
+            self.assertTrue(clear_displaced.is_file())
+            self.assertTrue(clear_intent.is_file())
+
+            clear_crash_root = (
+                Path(temporary) / "snapshot-first-clear-postrename-crash-appear"
+            )
+            clear_crash_task = clear_crash_root / "task"
+            clear_crash_task.mkdir(parents=True)
+            clear_crash = subprocess.run(
+                [
+                    str(executable),
+                    "--snapshot-publication-crash-worker",
+                    str(snapshot_session),
+                    str(clear_crash_task),
+                    "first_clear_postrename_crash_appear",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                clear_crash.returncode,
+                108,
+                clear_crash.stderr + clear_crash.stdout,
+            )
+            clear_crash_tombstones = list(
+                clear_crash_task.glob(".input_manifest.remove-*")
+            )
+            self.assertEqual(len(clear_crash_tombstones), 1)
+            self.assertEqual(
+                clear_crash_tombstones[0].read_text(),
+                postcheck_authority_payload,
+            )
+            clear_crash_recovery = subprocess.run(
+                [
+                    str(executable),
+                    "--snapshot-publication-crash-worker",
+                    str(snapshot_session),
+                    str(clear_crash_task),
+                    "recover",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                clear_crash_recovery.returncode,
+                39,
+                clear_crash_recovery.stderr + clear_crash_recovery.stdout,
+            )
+            clear_crash_authority = clear_crash_task / "input_manifest.json"
+            self.assertEqual(
+                clear_crash_authority.read_text(), postcheck_authority_payload
+            )
+            self.assertFalse(
+                list(clear_crash_task.glob(".input_manifest.remove-*"))
+            )
+            self.assertTrue(
+                (
+                    clear_crash_task
+                    / "input_manifest.displaced-clear-postcheck-test"
+                ).is_file()
+            )
+            self.assertTrue(
+                (clear_crash_task / "input_snapshot.transaction.json").is_file()
+            )
+
+            intent_replace_root = (
+                Path(temporary) / "snapshot-intent-removal-replacement"
+            )
+            intent_replace_task = intent_replace_root / "task"
+            intent_replace_root.mkdir(parents=True)
+            shutil.copytree(snapshot_baseline_task, intent_replace_task)
+            intent_replace = subprocess.run(
+                [
+                    str(executable),
+                    "--snapshot-publication-crash-worker",
+                    str(snapshot_session),
+                    str(intent_replace_task),
+                    "intent_removal_replace",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                intent_replace.returncode,
+                105,
+                intent_replace.stderr + intent_replace.stdout,
+            )
+            self.assertIn(
+                "snapshot intent-removal replacement injected",
+                intent_replace.stdout,
+            )
+            unrelated_intent_payload = '{"unrelated_intent":true}\n'
+            intent_authority = (
+                intent_replace_task / "input_snapshot.transaction.json"
+            )
+            displaced_intent = (
+                intent_replace_task
+                / "input_snapshot.transaction.displaced-postcheck-test"
+            )
+            self.assertEqual(
+                intent_authority.read_text(), unrelated_intent_payload
+            )
+            self.assertEqual(intent_authority.stat().st_mode & 0o777, 0o444)
+            self.assertTrue(displaced_intent.is_file())
+            self.assertFalse(
+                list(intent_replace_task.glob("input_snapshot.transaction.remove-*"))
+            )
+            self.assertFalse(
+                list(
+                    intent_replace_task.glob(
+                        "input_snapshot.transaction.conflict-*"
+                    )
+                )
+            )
+
+            intent_recovery = subprocess.run(
+                [
+                    str(executable),
+                    "--snapshot-publication-crash-worker",
+                    str(snapshot_session),
+                    str(intent_replace_task),
+                    "recover",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                intent_recovery.returncode,
+                39,
+                intent_recovery.stderr + intent_recovery.stdout,
+            )
+            self.assertEqual(
+                intent_authority.read_text(), unrelated_intent_payload
+            )
+            self.assertTrue(displaced_intent.is_file())
+
+            intent_crash_root = (
+                Path(temporary) / "snapshot-intent-removal-postrename-replacement"
+            )
+            intent_crash_task = intent_crash_root / "task"
+            intent_crash_root.mkdir(parents=True)
+            shutil.copytree(snapshot_baseline_task, intent_crash_task)
+            intent_crash = subprocess.run(
+                [
+                    str(executable),
+                    "--snapshot-publication-crash-worker",
+                    str(snapshot_session),
+                    str(intent_crash_task),
+                    "intent_removal_postrename_crash_replace",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                intent_crash.returncode,
+                109,
+                intent_crash.stderr + intent_crash.stdout,
+            )
+            intent_crash_tombstones = list(
+                intent_crash_task.glob("input_snapshot.transaction.remove-*")
+            )
+            self.assertEqual(len(intent_crash_tombstones), 1)
+            self.assertEqual(
+                intent_crash_tombstones[0].read_text(),
+                unrelated_intent_payload,
+            )
+            intent_crash_recovery = subprocess.run(
+                [
+                    str(executable),
+                    "--snapshot-publication-crash-worker",
+                    str(snapshot_session),
+                    str(intent_crash_task),
+                    "recover",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                intent_crash_recovery.returncode,
+                39,
+                intent_crash_recovery.stderr + intent_crash_recovery.stdout,
+            )
+            self.assertEqual(
+                (
+                    intent_crash_task
+                    / "input_snapshot.transaction.json"
+                ).read_text(),
+                unrelated_intent_payload,
+            )
+            self.assertFalse(
+                list(intent_crash_task.glob("input_snapshot.transaction.remove-*"))
+            )
+            self.assertTrue(
+                (
+                    intent_crash_task
+                    / "input_snapshot.transaction.displaced-postcheck-test"
+                ).is_file()
+            )
+
+            unbound_cases = (
+                (
+                    "transaction_unbound_temp_replace",
+                    110,
+                    "input_snapshot.transaction.conflict-*",
+                    b"unrelated-unbound-intent\n",
+                    "input_snapshot.transaction.unbound-displaced-test",
+                ),
+                (
+                    "task_unbound_temp_replace",
+                    111,
+                    ".input_manifest.conflict-*",
+                    b"unrelated-unbound-task-reference\n",
+                    "input_manifest.unbound-displaced-test",
+                ),
+            )
+            for (
+                unbound_phase,
+                unbound_exit,
+                conflict_pattern,
+                conflict_payload,
+                displaced_basename,
+            ) in unbound_cases:
+                unbound_root = Path(temporary) / f"snapshot-{unbound_phase}"
+                unbound_task = unbound_root / "task"
+                unbound_root.mkdir(parents=True)
+                shutil.copytree(snapshot_baseline_task, unbound_task)
+                unbound_crash = subprocess.run(
+                    [
+                        str(executable),
+                        "--snapshot-publication-crash-worker",
+                        str(snapshot_session),
+                        str(unbound_task),
+                        unbound_phase,
+                    ],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(
+                    unbound_crash.returncode,
+                    unbound_exit,
+                    unbound_crash.stderr + unbound_crash.stdout,
+                )
+                unbound_recovery = subprocess.run(
+                    [
+                        str(executable),
+                        "--snapshot-publication-crash-worker",
+                        str(snapshot_session),
+                        str(unbound_task),
+                        "recover",
+                    ],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(
+                    unbound_recovery.returncode,
+                    39,
+                    unbound_recovery.stderr + unbound_recovery.stdout,
+                )
+                conflicts = list(unbound_task.glob(conflict_pattern))
+                self.assertEqual(len(conflicts), 1)
+                self.assertEqual(conflicts[0].read_bytes(), conflict_payload)
+                self.assertTrue((unbound_task / displaced_basename).is_file())
+
+            def prime_snapshot_authority_race_task(label: str) -> Path:
+                race_root = Path(temporary) / f"snapshot-{label}"
+                task_root = race_root / "task"
+                task_root.mkdir(parents=True)
+                primed = subprocess.run(
+                    [
+                        str(executable),
+                        "--snapshot-publication-crash-worker",
+                        str(snapshot_session),
+                        str(task_root),
+                        "reference_durable",
+                    ],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(
+                    primed.returncode,
+                    97,
+                    primed.stderr + primed.stdout,
+                )
+                self.assertTrue((task_root / "input_snapshot").is_dir())
+                self.assertTrue((task_root / "input_manifest.json").is_file())
+                self.assertTrue(
+                    (task_root / "input_snapshot.transaction.json").is_file()
+                )
+                return task_root
+
+            def immutable_snapshot_payload(
+                snapshot_root: Path,
+            ) -> dict[str, tuple[bytes, int]]:
+                self.assertTrue(snapshot_root.is_dir())
+                payload: dict[str, tuple[bytes, int]] = {}
+                for entry in sorted(snapshot_root.iterdir()):
+                    self.assertFalse(entry.is_symlink(), entry)
+                    self.assertTrue(entry.is_file(), entry)
+                    payload[entry.name] = (
+                        entry.read_bytes(),
+                        entry.stat().st_mode & 0o777,
+                    )
+                return payload
+
+            root_race_task = prime_snapshot_authority_race_task(
+                "generation-root-postopen-replace"
+            )
+            root_race_snapshot = root_race_task / "input_snapshot"
+            original_root_stat = root_race_snapshot.stat()
+            original_root_payload = immutable_snapshot_payload(
+                root_race_snapshot
+            )
+            root_race = subprocess.run(
+                [
+                    str(executable),
+                    "--snapshot-publication-crash-worker",
+                    str(snapshot_session),
+                    str(root_race_task),
+                    "generation_root_postopen_replace",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                root_race.returncode,
+                39,
+                root_race.stderr + root_race.stdout,
+            )
+            displaced_root = (
+                root_race_task / "input_snapshot.displaced-root-test"
+            )
+            self.assertTrue(root_race_snapshot.is_dir())
+            self.assertTrue(displaced_root.is_dir())
+            self.assertEqual(root_race_snapshot.stat().st_mode & 0o777, 0o555)
+            self.assertEqual(displaced_root.stat().st_mode & 0o777, 0o555)
+            self.assertEqual(
+                immutable_snapshot_payload(root_race_snapshot),
+                original_root_payload,
+            )
+            self.assertEqual(
+                immutable_snapshot_payload(displaced_root),
+                original_root_payload,
+            )
+            self.assertEqual(
+                (displaced_root.stat().st_dev, displaced_root.stat().st_ino),
+                (original_root_stat.st_dev, original_root_stat.st_ino),
+            )
+            self.assertNotEqual(
+                (root_race_snapshot.stat().st_dev, root_race_snapshot.stat().st_ino),
+                (displaced_root.stat().st_dev, displaced_root.stat().st_ino),
+            )
+            root_race_intent = (
+                root_race_task / "input_snapshot.transaction.json"
+            )
+            self.assertTrue(root_race_intent.is_file())
+            self.assertFalse(
+                (
+                    root_race_task
+                    / "input_snapshot.prepared-root-replacement-test"
+                ).exists()
+            )
+
+            root_race_recovery = subprocess.run(
+                [
+                    str(executable),
+                    "--snapshot-publication-crash-worker",
+                    str(snapshot_session),
+                    str(root_race_task),
+                    "recover",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                root_race_recovery.returncode,
+                39,
+                root_race_recovery.stderr + root_race_recovery.stdout,
+            )
+            self.assertTrue(root_race_intent.is_file())
+            self.assertEqual(
+                immutable_snapshot_payload(root_race_snapshot),
+                original_root_payload,
+            )
+            self.assertEqual(
+                immutable_snapshot_payload(displaced_root),
+                original_root_payload,
+            )
+
+            artifact_races = (
+                (
+                    "artifact_metadata_symlink",
+                    "metadata.original-symlink-test",
+                ),
+                (
+                    "artifact_metadata_hardlink",
+                    "metadata.original-hardlink-test",
+                ),
+                (
+                    "artifact_metadata_mode_clone",
+                    "metadata.original-mode-clone-test",
+                ),
+            )
+            for artifact_phase, original_name in artifact_races:
+                artifact_task = prime_snapshot_authority_race_task(
+                    artifact_phase.replace("_", "-")
+                )
+                artifact_snapshot = artifact_task / "input_snapshot"
+                metadata = artifact_snapshot / "metadata.json"
+                original_metadata_bytes = metadata.read_bytes()
+                original_metadata_mode = metadata.stat().st_mode & 0o777
+                self.assertEqual(original_metadata_mode, 0o444)
+                artifact_race = subprocess.run(
+                    [
+                        str(executable),
+                        "--snapshot-publication-crash-worker",
+                        str(snapshot_session),
+                        str(artifact_task),
+                        artifact_phase,
+                    ],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(
+                    artifact_race.returncode,
+                    39,
+                    artifact_race.stderr + artifact_race.stdout,
+                )
+                original_metadata = artifact_snapshot / original_name
+                artifact_intent = (
+                    artifact_task / "input_snapshot.transaction.json"
+                )
+                self.assertEqual(
+                    artifact_snapshot.stat().st_mode & 0o777, 0o555
+                )
+                self.assertTrue(artifact_intent.is_file())
+                self.assertTrue(original_metadata.is_file())
+                self.assertFalse(original_metadata.is_symlink())
+                self.assertEqual(
+                    original_metadata.read_bytes(), original_metadata_bytes
+                )
+                self.assertEqual(
+                    original_metadata.stat().st_mode & 0o777, 0o444
+                )
+                if artifact_phase == "artifact_metadata_symlink":
+                    self.assertTrue(metadata.is_symlink())
+                    self.assertEqual(os.readlink(metadata), original_name)
+                    self.assertEqual(metadata.read_bytes(), original_metadata_bytes)
+                elif artifact_phase == "artifact_metadata_hardlink":
+                    self.assertFalse(metadata.is_symlink())
+                    self.assertTrue(os.path.samefile(metadata, original_metadata))
+                    self.assertEqual(metadata.stat().st_nlink, 2)
+                    self.assertEqual(metadata.stat().st_mode & 0o777, 0o444)
+                else:
+                    self.assertFalse(metadata.is_symlink())
+                    self.assertEqual(metadata.read_bytes(), original_metadata_bytes)
+                    self.assertEqual(metadata.stat().st_mode & 0o777, 0o644)
+                    self.assertNotEqual(
+                        (metadata.stat().st_dev, metadata.stat().st_ino),
+                        (
+                            original_metadata.stat().st_dev,
+                            original_metadata.stat().st_ino,
+                        ),
+                    )
+
+                artifact_recovery = subprocess.run(
+                    [
+                        str(executable),
+                        "--snapshot-publication-crash-worker",
+                        str(snapshot_session),
+                        str(artifact_task),
+                        "recover",
+                    ],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(
+                    artifact_recovery.returncode,
+                    39,
+                    artifact_recovery.stderr + artifact_recovery.stdout,
+                )
+                self.assertTrue(artifact_intent.is_file())
+                self.assertTrue(original_metadata.is_file())
+                self.assertEqual(
+                    original_metadata.read_bytes(), original_metadata_bytes
+                )
+                if artifact_phase == "artifact_metadata_symlink":
+                    self.assertTrue(metadata.is_symlink())
+                    self.assertEqual(os.readlink(metadata), original_name)
+                elif artifact_phase == "artifact_metadata_hardlink":
+                    self.assertTrue(os.path.samefile(metadata, original_metadata))
+                    self.assertEqual(metadata.stat().st_nlink, 2)
+                else:
+                    self.assertEqual(metadata.read_bytes(), original_metadata_bytes)
+                    self.assertEqual(metadata.stat().st_mode & 0o777, 0o644)
+
+            posthash_task = prime_snapshot_authority_race_task(
+                "artifact-posthash-mutate"
+            )
+            posthash_snapshot = posthash_task / "input_snapshot"
+            posthash_artifact = posthash_snapshot / "localization_trace.jsonl"
+            posthash_before = posthash_artifact.stat()
+            self.assertEqual(posthash_artifact.read_bytes(), b"trace\n")
+            posthash_race = subprocess.run(
+                [
+                    str(executable),
+                    "--snapshot-publication-crash-worker",
+                    str(snapshot_session),
+                    str(posthash_task),
+                    "artifact_posthash_mutate",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                posthash_race.returncode,
+                39,
+                posthash_race.stderr + posthash_race.stdout,
+            )
+            posthash_after = posthash_artifact.stat()
+            self.assertEqual(
+                (posthash_after.st_dev, posthash_after.st_ino),
+                (posthash_before.st_dev, posthash_before.st_ino),
+            )
+            self.assertEqual(posthash_artifact.read_bytes(), b"TRACE\n")
+            self.assertEqual(posthash_after.st_mode & 0o777, 0o444)
+            self.assertEqual(posthash_snapshot.stat().st_mode & 0o777, 0o555)
+            self.assertTrue(
+                (posthash_task / "input_snapshot.transaction.json").is_file()
+            )
+            posthash_recovery = subprocess.run(
+                [
+                    str(executable),
+                    "--snapshot-publication-crash-worker",
+                    str(snapshot_session),
+                    str(posthash_task),
+                    "recover",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                posthash_recovery.returncode,
+                39,
+                posthash_recovery.stderr + posthash_recovery.stdout,
+            )
+            self.assertEqual(posthash_artifact.read_bytes(), b"TRACE\n")
+
+            cleanup_replace_root = Path(temporary) / "snapshot-cleanup-replacement"
+            cleanup_replace_task = cleanup_replace_root / "task"
+            cleanup_replace_root.mkdir(parents=True)
+            shutil.copytree(snapshot_baseline_task, cleanup_replace_task)
+            cleanup_replace_crash = subprocess.run(
+                [
+                    str(executable),
+                    "--snapshot-publication-crash-worker",
+                    str(snapshot_session),
+                    str(cleanup_replace_task),
+                    "cleanup_replace",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                cleanup_replace_crash.returncode,
+                103,
+                cleanup_replace_crash.stderr + cleanup_replace_crash.stdout,
+            )
+            replacement_backup = cleanup_replace_task / "input_snapshot.backup"
+            replacement_marker = replacement_backup / "marker.txt"
+            self.assertTrue(replacement_marker.is_file())
+            cleanup_replace_recovery = subprocess.run(
+                [
+                    str(executable),
+                    "--snapshot-publication-crash-worker",
+                    str(snapshot_session),
+                    str(cleanup_replace_task),
+                    "recover",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                cleanup_replace_recovery.returncode,
+                39,
+                cleanup_replace_recovery.stderr
+                + cleanup_replace_recovery.stdout,
+            )
+            self.assertTrue(replacement_marker.is_file())
+            self.assertTrue(
+                (cleanup_replace_task / "input_snapshot.transaction.json").is_file()
+            )
+
+            result_crash_cases = (
+                ("after_intent_temp", "cleanup", 80, 0),
+                ("after_intent_rename", "list", 81, 0),
+                ("after_directory_rename", "committed", 82, 1),
+                ("after_destination_fchmod", "read", 88, 1),
+                ("after_destination_freeze", "read", 83, 1),
+                ("after_exact_read", "list", 84, 1),
+                ("after_parent_fsync", "cleanup", 85, 1),
+            )
+            committed_result_roots: list[Path] = []
+            for phase, recovery_entry, expected_exit, expected_committed in (
+                result_crash_cases
+            ):
+                results_root = Path(temporary) / f"result-crash-{phase}"
+                crashed = subprocess.run(
+                    [
+                        str(executable),
+                        "--result-publication-crash-worker",
+                        str(results_root),
+                        phase,
+                        "unused",
+                    ],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(
+                    crashed.returncode,
+                    expected_exit,
+                    crashed.stderr + crashed.stdout,
+                )
+                recovered = subprocess.run(
+                    [
+                        str(executable),
+                        "--result-publication-crash-worker",
+                        str(results_root),
+                        "recover",
+                        recovery_entry,
+                    ],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(
+                    recovered.returncode,
+                    0,
+                    recovered.stderr + recovered.stdout,
+                )
+                self.assertIn(
+                    f"result recovered committed={expected_committed}",
+                    recovered.stdout,
+                )
+                if expected_committed:
+                    committed_result_roots.append(results_root)
+
+            # A UUID-only legacy/partial temporary has no dev/inode authority.
+            # Startup must fail closed and preserve it instead of treating an
+            # arbitrary hidden pathname as disposable transaction state.
+            partial_root = Path(temporary) / "result-partial-intent"
+            partial_root.mkdir()
+            partial_name = (
+                ".result-publish-intent-tmp-"
+                "00000000-0000-0000-0000-000000000001"
+            )
+            (partial_root / partial_name).write_bytes(b"{")
+            partial_recovery = subprocess.run(
+                [
+                    str(executable),
+                    "--result-publication-crash-worker",
+                    str(partial_root),
+                    "recover",
+                    "cleanup",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                partial_recovery.returncode,
+                29,
+                partial_recovery.stderr + partial_recovery.stdout,
+            )
+            self.assertTrue((partial_root / partial_name).is_file())
+            self.assertEqual((partial_root / partial_name).read_bytes(), b"{")
+
+            # Publication helper post-freeze authority checks are executable
+            # primitives, not comments: destination replacement, source-name
+            # recreation and interrupted-freeze replacement must all reject
+            # while preserving the injected evidence.
+            for primitive_phase in (
+                "primitive_publication_destination_replace",
+                "primitive_publication_source_reappear",
+                "primitive_interrupted_destination_replace",
+            ):
+                primitive_root = Path(temporary) / f"result-{primitive_phase}"
+                primitive_result = subprocess.run(
+                    [
+                        str(executable),
+                        "--result-publication-crash-worker",
+                        str(primitive_root),
+                        primitive_phase,
+                        "unused",
+                    ],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(
+                    primitive_result.returncode,
+                    0,
+                    primitive_result.stderr + primitive_result.stdout,
+                )
+                self.assertIn("passed", primitive_result.stdout)
+
+            # Unbound creation names are evidence, not cleanup authority. A
+            # replacement at the creation basename must be moved to conflict
+            # storage and the recovery entry must fail closed; neither inode
+            # may be silently deleted.
+            creation_root = Path(temporary) / "result-intent-create-replacement"
+            creation_root.mkdir()
+            creation_name = (
+                ".result-publish-intent-create-"
+                "00000000-0000-0000-0000-000000000011"
+            )
+            creation_path = creation_root / creation_name
+            creation_original = Path(temporary) / "result-intent-create-original"
+            creation_path.write_bytes(b"original-creation-evidence\n")
+            creation_path.rename(creation_original)
+            creation_path.write_bytes(b"replacement-creation-evidence\n")
+            creation_recovery = subprocess.run(
+                [
+                    str(executable),
+                    "--result-publication-crash-worker",
+                    str(creation_root),
+                    "recover",
+                    "list",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                creation_recovery.returncode,
+                29,
+                creation_recovery.stderr + creation_recovery.stdout,
+            )
+            self.assertEqual(
+                creation_original.read_bytes(), b"original-creation-evidence\n"
+            )
+            creation_conflicts = list(
+                creation_root.glob(".result-publish-intent-conflict-*")
+            )
+            self.assertEqual(len(creation_conflicts), 1)
+            self.assertEqual(
+                creation_conflicts[0].read_bytes(),
+                b"replacement-creation-evidence\n",
+            )
+
+            # A correctly named identity-bound temporary does not authorize
+            # deletion after its pathname is replaced with another inode.
+            temp_replace_root = Path(temporary) / "result-intent-temp-replacement"
+            temp_crash = subprocess.run(
+                [
+                    str(executable),
+                    "--result-publication-crash-worker",
+                    str(temp_replace_root),
+                    "after_intent_temp",
+                    "unused",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(temp_crash.returncode, 80, temp_crash.stderr)
+            bound_temps = list(
+                temp_replace_root.glob(".result-publish-intent-tmp-*")
+            )
+            self.assertEqual(len(bound_temps), 1)
+            bound_temp = bound_temps[0]
+            temp_original = Path(temporary) / "result-intent-temp-original"
+            bound_temp.rename(temp_original)
+            shutil.copy2(temp_original, bound_temp)
+            bound_temp.chmod(0o444)
+            replacement_temp_inode = bound_temp.stat().st_ino
+            self.assertNotEqual(replacement_temp_inode, temp_original.stat().st_ino)
+            temp_recovery = subprocess.run(
+                [
+                    str(executable),
+                    "--result-publication-crash-worker",
+                    str(temp_replace_root),
+                    "recover",
+                    "cleanup",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                temp_recovery.returncode,
+                29,
+                temp_recovery.stderr + temp_recovery.stdout,
+            )
+            self.assertTrue(temp_original.is_file())
+            self.assertTrue(bound_temp.is_file())
+            self.assertEqual(bound_temp.stat().st_ino, replacement_temp_inode)
+
+            # Simulate a process death after canonical intent -> removal
+            # tombstone rename, then replace the tombstone. Startup must
+            # restore/quarantine the unexpected inode and return failure.
+            removal_root = Path(temporary) / "result-intent-removal-replacement"
+            removal_crash = subprocess.run(
+                [
+                    str(executable),
+                    "--result-publication-crash-worker",
+                    str(removal_root),
+                    "after_intent_rename",
+                    "unused",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(removal_crash.returncode, 81, removal_crash.stderr)
+            canonical_intents = list(removal_root.glob(".*.publish-intent.json"))
+            self.assertEqual(len(canonical_intents), 1)
+            canonical_intent = canonical_intents[0]
+            canonical_stat = canonical_intent.stat()
+            removal_name = (
+                ".result-publish-intent-remove-"
+                f"{canonical_stat.st_dev}-{canonical_stat.st_ino}."
+                "00000000-0000-0000-0000-000000000012"
+            )
+            removal_tombstone = removal_root / removal_name
+            canonical_intent.rename(removal_tombstone)
+            removal_original = Path(temporary) / "result-intent-removal-original"
+            removal_tombstone.rename(removal_original)
+            shutil.copy2(removal_original, removal_tombstone)
+            removal_tombstone.chmod(0o444)
+            replacement_removal_inode = removal_tombstone.stat().st_ino
+            removal_recovery = subprocess.run(
+                [
+                    str(executable),
+                    "--result-publication-crash-worker",
+                    str(removal_root),
+                    "recover",
+                    "list",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                removal_recovery.returncode,
+                29,
+                removal_recovery.stderr + removal_recovery.stdout,
+            )
+            self.assertTrue(removal_original.is_file())
+            self.assertTrue(canonical_intent.is_file())
+            self.assertEqual(canonical_intent.stat().st_ino, replacement_removal_inode)
+
+            # After a durable intent but before directory publication, a
+            # byte-identical staging clone is still a different authority.
+            staging_replace_root = Path(temporary) / "result-staging-replacement"
+            staging_crash = subprocess.run(
+                [
+                    str(executable),
+                    "--result-publication-crash-worker",
+                    str(staging_replace_root),
+                    "after_intent_rename",
+                    "unused",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(staging_crash.returncode, 81, staging_crash.stderr)
+            staging_paths = list(staging_replace_root.glob(".result-staging-*"))
+            self.assertEqual(len(staging_paths), 1)
+            staging_path = staging_paths[0]
+            staging_original = Path(temporary) / "result-staging-original"
+            staging_clone = Path(temporary) / "result-staging-clone"
+            shutil.copytree(staging_path, staging_clone, copy_function=shutil.copy2)
+            staging_path.rename(staging_original)
+            staging_clone.rename(staging_path)
+            replacement_staging_inode = staging_path.stat().st_ino
+            staging_recovery = subprocess.run(
+                [
+                    str(executable),
+                    "--result-publication-crash-worker",
+                    str(staging_replace_root),
+                    "recover",
+                    "cleanup",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                staging_recovery.returncode,
+                29,
+                staging_recovery.stderr + staging_recovery.stdout,
+            )
+            self.assertTrue(staging_original.is_dir())
+            self.assertTrue(staging_path.is_dir())
+            self.assertEqual(staging_path.stat().st_ino, replacement_staging_inode)
+            self.assertTrue(list(staging_replace_root.glob(".*.publish-intent.json")))
+
+            # Result read-time binding rejects links, writable clones,
+            # same-inode post-hash mutation, manifest/receipt replacement and
+            # whole-root replacement during the final stability sweep.
+            for verification_phase in (
+                "verify_artifact_symlink",
+                "verify_artifact_hardlink",
+                "verify_artifact_mode_clone",
+                "verify_artifact_posthash_mutate",
+                "verify_manifest_postread_replace",
+                "verify_receipt_postread_replace",
+                "verify_result_root_final_sweep_replace",
+            ):
+                verification_root = (
+                    Path(temporary) / f"result-{verification_phase}"
+                )
+                verification_result = subprocess.run(
+                    [
+                        str(executable),
+                        "--result-publication-crash-worker",
+                        str(verification_root),
+                        verification_phase,
+                        "unused",
+                    ],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                )
+                self.assertEqual(
+                    verification_result.returncode,
+                    0,
+                    verification_result.stderr + verification_result.stdout,
+                )
+                self.assertIn("rejected replacement", verification_result.stdout)
+
+            # The advisory lock prevents another process from deleting a
+            # durable intent that still belongs to an active publisher.
+            lock_root = Path(temporary) / "result-cross-process-lock"
+            lock_attempt_marker = (
+                lock_root.parent / f".{lock_root.name}.recovery-lock-attempt"
+            )
+            lock_acquired_marker = (
+                lock_root.parent / f".{lock_root.name}.recovery-lock-acquired"
+            )
+            publisher_release_marker = (
+                lock_root.parent / f".{lock_root.name}.release-publisher"
+            )
+            publisher = None
+            lock_recovery = None
+            try:
+                publisher = subprocess.Popen(
+                    [
+                        str(executable),
+                        "--result-publication-crash-worker",
+                        str(lock_root),
+                        "hold_after_intent",
+                        "unused",
+                    ],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                intent_pattern = ".*.publish-intent.json"
+                intent_deadline = time.monotonic() + 8.0
+                while (
+                    time.monotonic() < intent_deadline
+                    and publisher.poll() is None
+                    and not list(lock_root.glob(intent_pattern))
+                ):
+                    time.sleep(0.01)
+                self.assertTrue(
+                    list(lock_root.glob(intent_pattern)),
+                    "publisher did not expose durable intent",
+                )
+
+                lock_recovery = subprocess.Popen(
+                    [
+                        str(executable),
+                        "--result-publication-crash-worker",
+                        str(lock_root),
+                        "recover_lock_probe",
+                        "list",
+                    ],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                attempt_deadline = time.monotonic() + 30.0
+                while (
+                    time.monotonic() < attempt_deadline
+                    and lock_recovery.poll() is None
+                    and not lock_attempt_marker.exists()
+                ):
+                    time.sleep(0.01)
+                self.assertTrue(
+                    lock_attempt_marker.is_file(),
+                    "recovery never reached the real lockf acquisition boundary",
+                )
+                self.assertIsNone(publisher.poll())
+                self.assertIsNone(lock_recovery.poll())
+                self.assertTrue(list(lock_root.glob(intent_pattern)))
+                self.assertFalse(
+                    lock_acquired_marker.exists(),
+                    "recovery acquired the process lock before publisher release",
+                )
+                self.assertFalse(
+                    (lock_root / lock_attempt_marker.name).exists()
+                    or (lock_root / lock_acquired_marker.name).exists(),
+                    "cross-process coordination markers polluted Results root",
+                )
+                time.sleep(0.2)
+                self.assertIsNone(lock_recovery.poll())
+                self.assertFalse(lock_acquired_marker.exists())
+                self.assertTrue(list(lock_root.glob(intent_pattern)))
+
+                publisher_release_marker.write_text("release\n")
+                lock_stdout, lock_stderr = lock_recovery.communicate(timeout=15)
+                publisher_stdout, publisher_stderr = publisher.communicate(timeout=5)
+                self.assertEqual(
+                    publisher.returncode,
+                    86,
+                    publisher_stderr + publisher_stdout,
+                )
+                self.assertEqual(
+                    lock_recovery.returncode,
+                    0,
+                    lock_stderr + lock_stdout,
+                )
+                self.assertTrue(
+                    lock_acquired_marker.is_file(),
+                    "recovery did not publish its post-lockf acquired marker",
+                )
+                self.assertFalse(
+                    (lock_root / lock_acquired_marker.name).exists(),
+                    "lock-acquired marker polluted Results root",
+                )
+                self.assertIn("result recovered committed=0", lock_stdout)
+            finally:
+                for process in (lock_recovery, publisher):
+                    if process is None:
+                        continue
+                    if process.poll() is None:
+                        process.terminate()
+                    try:
+                        process.communicate(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.communicate()
+
+            # Replacing an intent-bound writable final with byte-identical
+            # bytes on a new inode is not authorized by the intent.
+            identity_root = Path(temporary) / "result-identity-replacement"
+            identity_crash = subprocess.run(
+                [
+                    str(executable),
+                    "--result-publication-crash-worker",
+                    str(identity_root),
+                    "after_directory_rename",
+                    "unused",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(identity_crash.returncode, 82)
+            identity_final = identity_root / "result-crash-final"
+            identity_copy = Path(temporary) / "result-identity-copy"
+            shutil.copytree(identity_final, identity_copy)
+            shutil.rmtree(identity_final)
+            identity_copy.rename(identity_final)
+            identity_recovery = subprocess.run(
+                [
+                    str(executable),
+                    "--result-publication-crash-worker",
+                    str(identity_root),
+                    "recover",
+                    "list",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                identity_recovery.returncode,
+                29,
+                identity_recovery.stderr + identity_recovery.stdout,
+            )
+            self.assertTrue(
+                list(identity_root.glob(".*.publish-intent.json"))
+            )
+            self.assertEqual(identity_final.stat().st_mode & 0o777, 0o755)
+
+            # A writable final without any durable intent is tamper evidence,
+            # not a recoverable committed result. Listing isolates it.
+            unbound_root = committed_result_roots[-1]
+            unbound_final = unbound_root / "result-crash-final"
+            unbound_final.chmod(0o755)
+            unbound_recovery = subprocess.run(
+                [
+                    str(executable),
+                    "--result-publication-crash-worker",
+                    str(unbound_root),
+                    "recover",
+                    "list",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                unbound_recovery.returncode,
+                0,
+                unbound_recovery.stderr + unbound_recovery.stdout,
+            )
+            self.assertIn("result recovered committed=0", unbound_recovery.stdout)
+            self.assertFalse(unbound_final.exists())
+            self.assertTrue((unbound_root / "quarantine").is_dir())
+
             # The 100k-record finalization qualification runs in its own
             # process. ru_maxrss is a lifetime high-water mark, so the
             # full suite's unrelated clock/workbook/replay allocations
@@ -689,8 +2435,12 @@ class IOSCoreContractTests(unittest.TestCase):
             prior_map_id = "crash-recovery-map"
             package_sha = "c" * 64
             crash_cases = (
+                ("after_source_thaw", "list", 70),
                 ("after_payload", "list", 71),
+                ("after_diagnostic_placement", "map", 76),
                 ("after_diagnostic", "map", 72),
+                ("after_publish_rename", "list", 74),
+                ("after_publish_freeze", "map", 75),
                 ("after_publish", "rebuild", 73),
             )
             recovered_roots: list[Path] = []
@@ -715,7 +2465,35 @@ class IOSCoreContractTests(unittest.TestCase):
                 )
                 source = crash_root / "packages" / prior_map_id / package_sha
                 quarantine_root = crash_root / "quarantine" / prior_map_id
-                self.assertFalse(source.exists(), phase)
+                self.assertEqual(
+                    source.exists(),
+                    phase == "after_source_thaw",
+                    phase,
+                )
+                if phase == "after_source_thaw":
+                    self.assertEqual(source.stat().st_mode & 0o777, 0o755)
+                    restore_boundary = subprocess.run(
+                        [
+                            str(executable),
+                            "--map-quarantine-crash-worker",
+                            str(crash_root),
+                            "recover_after_source_restore",
+                            "list",
+                        ],
+                        check=False,
+                        capture_output=True,
+                        text=True,
+                    )
+                    self.assertEqual(
+                        restore_boundary.returncode,
+                        77,
+                        restore_boundary.stderr + restore_boundary.stdout,
+                    )
+                    self.assertEqual(source.stat().st_mode & 0o777, 0o555)
+                    self.assertEqual(
+                        len(list(quarantine_root.glob(".*.diagnostic.tmp"))),
+                        1,
+                    )
                 self.assertTrue(quarantine_root.is_dir(), phase)
 
                 recovery_result = subprocess.run(
@@ -756,6 +2534,820 @@ class IOSCoreContractTests(unittest.TestCase):
                         for item in registry["maps"])
                 )
                 recovered_roots.append(crash_root)
+
+            def rewrite_quarantine_diagnostic_as_legacy_v2(
+                diagnostic: Path,
+            ) -> bytes:
+                payload = json.loads(diagnostic.read_text())
+                payload["version"] = 2
+                payload.pop("payload_device")
+                payload.pop("payload_inode")
+                canonical = json.dumps(
+                    payload,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode()
+                diagnostic.chmod(0o644)
+                diagnostic.write_bytes(canonical)
+                diagnostic.chmod(0o444)
+                return canonical
+
+            # Legacy v2 has no dev/inode authority and is compatible only as
+            # an already-published immutable final. It must never complete a
+            # hidden pending transaction, whether the diagnostic is still at
+            # `.diagnostic.tmp` or has already been embedded in the payload.
+            v2_temporary_root = (
+                Path(temporary) / "map-quarantine-v2-pending-temporary" / "Maps"
+            )
+            v2_temporary_crash = subprocess.run(
+                [
+                    str(executable),
+                    "--map-quarantine-crash-worker",
+                    str(v2_temporary_root),
+                    "after_payload",
+                    "unused",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(v2_temporary_crash.returncode, 71)
+            v2_temporary_quarantine = (
+                v2_temporary_root / "quarantine" / prior_map_id
+            )
+            v2_temporary_pending = next(
+                v2_temporary_quarantine.glob(".*.pending")
+            )
+            v2_temporary_diagnostic = next(
+                v2_temporary_quarantine.glob(".*.diagnostic.tmp")
+            )
+            v2_temporary_bytes = rewrite_quarantine_diagnostic_as_legacy_v2(
+                v2_temporary_diagnostic
+            )
+            v2_temporary_recovery = subprocess.run(
+                [
+                    str(executable),
+                    "--map-quarantine-crash-worker",
+                    str(v2_temporary_root),
+                    "recover",
+                    "list",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                v2_temporary_recovery.returncode,
+                19,
+                v2_temporary_recovery.stderr + v2_temporary_recovery.stdout,
+            )
+            self.assertTrue(v2_temporary_pending.is_dir())
+            self.assertEqual(
+                v2_temporary_diagnostic.read_bytes(), v2_temporary_bytes
+            )
+            self.assertFalse(
+                (
+                    v2_temporary_root
+                    / "packages"
+                    / prior_map_id
+                    / package_sha
+                ).exists()
+            )
+
+            v2_embedded_root = (
+                Path(temporary) / "map-quarantine-v2-pending-embedded" / "Maps"
+            )
+            v2_embedded_crash = subprocess.run(
+                [
+                    str(executable),
+                    "--map-quarantine-crash-worker",
+                    str(v2_embedded_root),
+                    "after_diagnostic_placement",
+                    "unused",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(v2_embedded_crash.returncode, 76)
+            v2_embedded_quarantine = (
+                v2_embedded_root / "quarantine" / prior_map_id
+            )
+            v2_embedded_pending = next(v2_embedded_quarantine.glob(".*.pending"))
+            v2_embedded_diagnostic = (
+                v2_embedded_pending / "quarantine_diagnostic.json"
+            )
+            v2_embedded_bytes = rewrite_quarantine_diagnostic_as_legacy_v2(
+                v2_embedded_diagnostic
+            )
+            v2_embedded_recovery = subprocess.run(
+                [
+                    str(executable),
+                    "--map-quarantine-crash-worker",
+                    str(v2_embedded_root),
+                    "recover",
+                    "list",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                v2_embedded_recovery.returncode,
+                19,
+                v2_embedded_recovery.stderr + v2_embedded_recovery.stdout,
+            )
+            self.assertTrue(v2_embedded_pending.is_dir())
+            self.assertEqual(
+                v2_embedded_diagnostic.read_bytes(), v2_embedded_bytes
+            )
+
+            # A byte-identical clone at the pending pathname is still a new
+            # directory authority. The v3 diagnostic binds the original inode
+            # and recovery must preserve both copies instead of publishing the
+            # clone or deleting either one.
+            pending_clone_root = (
+                Path(temporary) / "map-quarantine-pending-clone" / "Maps"
+            )
+            pending_clone_crash = subprocess.run(
+                [
+                    str(executable),
+                    "--map-quarantine-crash-worker",
+                    str(pending_clone_root),
+                    "after_payload",
+                    "unused",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(pending_clone_crash.returncode, 71)
+            pending_clone_quarantine = (
+                pending_clone_root / "quarantine" / prior_map_id
+            )
+            pending_clone = next(pending_clone_quarantine.glob(".*.pending"))
+            pending_original = Path(temporary) / "pending-clone-original"
+            pending_replacement = Path(temporary) / "pending-clone-replacement"
+            shutil.copytree(
+                pending_clone, pending_replacement, copy_function=shutil.copy2
+            )
+            pending_clone.rename(pending_original)
+            pending_replacement.rename(pending_clone)
+            replacement_pending_inode = pending_clone.stat().st_ino
+            self.assertNotEqual(
+                replacement_pending_inode, pending_original.stat().st_ino
+            )
+            pending_clone_recovery = subprocess.run(
+                [
+                    str(executable),
+                    "--map-quarantine-crash-worker",
+                    str(pending_clone_root),
+                    "recover",
+                    "list",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                pending_clone_recovery.returncode,
+                19,
+                pending_clone_recovery.stderr + pending_clone_recovery.stdout,
+            )
+            self.assertTrue(pending_original.is_dir())
+            self.assertTrue(pending_clone.is_dir())
+            self.assertEqual(pending_clone.stat().st_ino, replacement_pending_inode)
+            self.assertTrue(
+                (
+                    pending_clone
+                    / "quarantine_diagnostic.json"
+                ).is_file(),
+                "recovery may durably embed the diagnostic before the v3 "
+                "payload-inode mismatch is detected",
+            )
+
+            # The large payload keeps verification inside its streaming hash
+            # long enough for deterministic delayed replacement. The worker
+            # succeeds only when production rejects the replacement and both
+            # the opened original evidence and replacement pathname survive.
+            delayed_recovery_cases = (
+                (
+                    "recover_replace_pending_after_open",
+                    "pending-root-open-original",
+                ),
+                (
+                    "recover_replace_embedded_after_read",
+                    "embedded-diagnostic-original",
+                ),
+            )
+            for delayed_phase, displaced_name in delayed_recovery_cases:
+                delayed_root = (
+                    Path(temporary) / f"map-quarantine-{delayed_phase}" / "Maps"
+                )
+                delayed_crash = subprocess.run(
+                    [
+                        str(executable),
+                        "--map-quarantine-crash-worker",
+                        str(delayed_root),
+                        "after_diagnostic_large",
+                        "unused",
+                    ],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
+                )
+                self.assertEqual(
+                    delayed_crash.returncode,
+                    89,
+                    delayed_crash.stderr + delayed_crash.stdout,
+                )
+                delayed_result = subprocess.run(
+                    [
+                        str(executable),
+                        "--map-quarantine-crash-worker",
+                        str(delayed_root),
+                        delayed_phase,
+                        "list",
+                    ],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
+                )
+                self.assertEqual(
+                    delayed_result.returncode,
+                    0,
+                    delayed_result.stderr + delayed_result.stdout,
+                )
+                self.assertIn("rejected replacement", delayed_result.stdout)
+                self.assertTrue(
+                    (delayed_root.parent / displaced_name).exists(),
+                    delayed_phase,
+                )
+                delayed_pending = next(
+                    (delayed_root / "quarantine" / prior_map_id).glob(
+                        ".*.pending"
+                    )
+                )
+                self.assertTrue(delayed_pending.is_dir())
+
+            # Replacing either the already-open Maps root pathname or the
+            # acquired `.map-library.lock` pathname is detected at the next
+            # production validation. The durable diagnostic remains, and the
+            # old/new authorities both survive for audit.
+            for binding_phase, displaced_name in (
+                ("replace_map_root_after_open", "map-root-open-displaced"),
+                ("replace_map_lock_after_acquire", "map-lock-open-displaced"),
+            ):
+                binding_root = (
+                    Path(temporary) / f"map-quarantine-{binding_phase}" / "Maps"
+                )
+                binding_result = subprocess.run(
+                    [
+                        str(executable),
+                        "--map-quarantine-crash-worker",
+                        str(binding_root),
+                        binding_phase,
+                        "unused",
+                    ],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(
+                    binding_result.returncode,
+                    19,
+                    binding_result.stderr + binding_result.stdout,
+                )
+                self.assertTrue(binding_root.exists())
+                self.assertTrue((binding_root.parent / displaced_name).exists())
+                if binding_phase == "replace_map_lock_after_acquire":
+                    canonical_lock = binding_root / ".map-library.lock"
+                    displaced_lock = binding_root.parent / displaced_name
+                    self.assertTrue(canonical_lock.is_file())
+                    self.assertNotEqual(
+                        canonical_lock.stat().st_ino,
+                        displaced_lock.stat().st_ino,
+                    )
+                    self.assertEqual(
+                        len(
+                            list(
+                                (
+                                    binding_root
+                                    / "quarantine"
+                                    / prior_map_id
+                                ).glob(".*.diagnostic.tmp")
+                            )
+                        ),
+                        1,
+                    )
+
+            # If rollback finds both canonical temporary and removal
+            # tombstone names, RENAME_EXCL semantics must fail closed and
+            # retain both diagnostic copies.
+            eexist_root = (
+                Path(temporary) / "map-quarantine-rollback-eexist" / "Maps"
+            )
+            eexist_crash = subprocess.run(
+                [
+                    str(executable),
+                    "--map-quarantine-crash-worker",
+                    str(eexist_root),
+                    "after_source_thaw",
+                    "unused",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(eexist_crash.returncode, 70)
+            eexist_quarantine = eexist_root / "quarantine" / prior_map_id
+            eexist_temporary = next(eexist_quarantine.glob(".*.diagnostic.tmp"))
+            eexist_removal = eexist_quarantine / (
+                eexist_temporary.name.removesuffix(".diagnostic.tmp")
+                + ".diagnostic.removing"
+            )
+            shutil.copy2(eexist_temporary, eexist_removal)
+            eexist_removal.chmod(0o444)
+            eexist_recovery = subprocess.run(
+                [
+                    str(executable),
+                    "--map-quarantine-crash-worker",
+                    str(eexist_root),
+                    "recover",
+                    "list",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                eexist_recovery.returncode,
+                19,
+                eexist_recovery.stderr + eexist_recovery.stdout,
+            )
+            self.assertTrue(eexist_temporary.is_file())
+            self.assertTrue(eexist_removal.is_file())
+
+            # Real process death after `.diagnostic.tmp` ->
+            # `.diagnostic.removing` exercises restart from the durable
+            # tombstone name without Swift unwinding or caught-error cleanup.
+            tombstone_root = (
+                Path(temporary) / "map-quarantine-tombstone-restart" / "Maps"
+            )
+            tombstone_crash = subprocess.run(
+                [
+                    str(executable),
+                    "--map-quarantine-crash-worker",
+                    str(tombstone_root),
+                    "after_source_thaw",
+                    "unused",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(tombstone_crash.returncode, 70)
+            tombstone_boundary = subprocess.run(
+                [
+                    str(executable),
+                    "--map-quarantine-crash-worker",
+                    str(tombstone_root),
+                    "recover_after_tombstone_rename",
+                    "list",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                tombstone_boundary.returncode,
+                78,
+                tombstone_boundary.stderr + tombstone_boundary.stdout,
+            )
+            tombstone_quarantine = tombstone_root / "quarantine" / prior_map_id
+            self.assertEqual(
+                len(list(tombstone_quarantine.glob(".*.diagnostic.removing"))),
+                1,
+            )
+            self.assertFalse(
+                list(tombstone_quarantine.glob(".*.diagnostic.tmp"))
+            )
+            tombstone_restart = subprocess.run(
+                [
+                    str(executable),
+                    "--map-quarantine-crash-worker",
+                    str(tombstone_root),
+                    "recover",
+                    "list",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                tombstone_restart.returncode,
+                0,
+                tombstone_restart.stderr + tombstone_restart.stdout,
+            )
+            self.assertFalse(
+                list(tombstone_quarantine.glob(".*.diagnostic.removing"))
+            )
+
+            # Once the tombstone is durable, replacing the source pathname
+            # with a byte-identical clone must not grant cleanup authority.
+            tombstone_replace_root = (
+                Path(temporary) / "map-quarantine-tombstone-source-replace" / "Maps"
+            )
+            tombstone_replace_crash = subprocess.run(
+                [
+                    str(executable),
+                    "--map-quarantine-crash-worker",
+                    str(tombstone_replace_root),
+                    "after_source_thaw",
+                    "unused",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(tombstone_replace_crash.returncode, 70)
+            tombstone_replace_boundary = subprocess.run(
+                [
+                    str(executable),
+                    "--map-quarantine-crash-worker",
+                    str(tombstone_replace_root),
+                    "recover_replace_source_after_tombstone",
+                    "list",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                tombstone_replace_boundary.returncode,
+                79,
+                tombstone_replace_boundary.stderr
+                + tombstone_replace_boundary.stdout,
+            )
+            tombstone_replace_quarantine = (
+                tombstone_replace_root / "quarantine" / prior_map_id
+            )
+            tombstone_replace_intent = next(
+                tombstone_replace_quarantine.glob(".*.diagnostic.removing")
+            )
+            tombstone_replace_source = (
+                tombstone_replace_root
+                / "packages"
+                / prior_map_id
+                / package_sha
+            )
+            tombstone_replace_original = (
+                tombstone_replace_source.parent
+                / f"tombstone-original-{package_sha}"
+            )
+            self.assertTrue(tombstone_replace_source.is_dir())
+            self.assertTrue(tombstone_replace_original.is_dir())
+            self.assertNotEqual(
+                tombstone_replace_source.stat().st_ino,
+                tombstone_replace_original.stat().st_ino,
+            )
+            tombstone_replace_restart = subprocess.run(
+                [
+                    str(executable),
+                    "--map-quarantine-crash-worker",
+                    str(tombstone_replace_root),
+                    "recover",
+                    "list",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                tombstone_replace_restart.returncode,
+                19,
+                tombstone_replace_restart.stderr
+                + tombstone_replace_restart.stdout,
+            )
+            self.assertTrue(tombstone_replace_intent.is_file())
+            self.assertTrue(tombstone_replace_source.is_dir())
+            self.assertTrue(tombstone_replace_original.is_dir())
+
+            # The opposite restart image is unlink visible but its parent
+            # fsync not yet reached. A fresh rebuild must safely re-quarantine
+            # the restored source and leave no hidden diagnostic residue.
+            unlink_window_root = (
+                Path(temporary) / "map-quarantine-unlink-window" / "Maps"
+            )
+            unlink_window_crash = subprocess.run(
+                [
+                    str(executable),
+                    "--map-quarantine-crash-worker",
+                    str(unlink_window_root),
+                    "after_source_thaw",
+                    "unused",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(unlink_window_crash.returncode, 70)
+            unlink_boundary = subprocess.run(
+                [
+                    str(executable),
+                    "--map-quarantine-crash-worker",
+                    str(unlink_window_root),
+                    "recover_after_tombstone_unlink_before_fsync",
+                    "list",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                unlink_boundary.returncode,
+                80,
+                unlink_boundary.stderr + unlink_boundary.stdout,
+            )
+            unlink_quarantine = unlink_window_root / "quarantine" / prior_map_id
+            self.assertFalse(list(unlink_quarantine.glob(".*.diagnostic.tmp")))
+            self.assertFalse(
+                list(unlink_quarantine.glob(".*.diagnostic.removing"))
+            )
+            unlink_restart = subprocess.run(
+                [
+                    str(executable),
+                    "--map-quarantine-crash-worker",
+                    str(unlink_window_root),
+                    "recover",
+                    "rebuild",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                unlink_restart.returncode,
+                0,
+                unlink_restart.stderr + unlink_restart.stdout,
+            )
+            unlink_entries = list(unlink_quarantine.iterdir())
+            self.assertFalse(
+                [item for item in unlink_entries if item.name.startswith(".")]
+            )
+            self.assertEqual(
+                len(
+                    [
+                        item
+                        for item in unlink_entries
+                        if not item.name.startswith(".")
+                    ]
+                ),
+                1,
+            )
+
+            # Durable transaction UUID spellings are canonical lowercase
+            # hyphenated UUIDs. Foundation's permissive UUID parser must not
+            # alias uppercase or non-hyphenated hidden names to writer output.
+            for uuid_variant in ("uppercase", "nonhyphenated"):
+                uuid_root = (
+                    Path(temporary)
+                    / f"map-quarantine-uuid-{uuid_variant}"
+                    / "Maps"
+                )
+                uuid_crash = subprocess.run(
+                    [
+                        str(executable),
+                        "--map-quarantine-crash-worker",
+                        str(uuid_root),
+                        "after_source_thaw",
+                        "unused",
+                    ],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(uuid_crash.returncode, 70)
+                uuid_quarantine = uuid_root / "quarantine" / prior_map_id
+                canonical_temporary = next(
+                    uuid_quarantine.glob(".*.diagnostic.tmp")
+                )
+                suffix = ".diagnostic.tmp"
+                transaction_id = canonical_temporary.name[1 : -len(suffix)]
+                uuid_text = transaction_id[65:]
+                if uuid_variant == "uppercase":
+                    mutated_uuid = uuid_text.upper()
+                else:
+                    mutated_uuid = uuid_text.replace("-", "")
+                mutated_transaction_id = (
+                    transaction_id[:65] + mutated_uuid
+                )
+                mutated_temporary = uuid_quarantine / (
+                    f".{mutated_transaction_id}{suffix}"
+                )
+                canonical_temporary.rename(mutated_temporary)
+                uuid_recovery = subprocess.run(
+                    [
+                        str(executable),
+                        "--map-quarantine-crash-worker",
+                        str(uuid_root),
+                        "recover",
+                        "list",
+                    ],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(
+                    uuid_recovery.returncode,
+                    19,
+                    uuid_recovery.stderr + uuid_recovery.stdout,
+                )
+                self.assertTrue(mutated_temporary.is_file())
+
+            # A v3 durable diagnostic authorizes recovery of one exact
+            # payload inode, not merely any directory with the same bytes.
+            # Replace the pre-rename source with a byte-identical new inode
+            # and prove startup preserves the intent and fails closed.
+            replacement_root = (
+                Path(temporary) / "map-quarantine-source-replacement" / "Maps"
+            )
+            replacement_crash = subprocess.run(
+                [
+                    str(executable),
+                    "--map-quarantine-crash-worker",
+                    str(replacement_root),
+                    "after_source_thaw",
+                    "unused",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(replacement_crash.returncode, 70)
+            replacement_source = (
+                replacement_root / "packages" / prior_map_id / package_sha
+            )
+            replacement_copy = Path(temporary) / "replacement-package-copy"
+            shutil.copytree(replacement_source, replacement_copy)
+            shutil.rmtree(replacement_source)
+            replacement_copy.rename(replacement_source)
+            replacement_recovery = subprocess.run(
+                [
+                    str(executable),
+                    "--map-quarantine-crash-worker",
+                    str(replacement_root),
+                    "recover",
+                    "list",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                replacement_recovery.returncode,
+                19,
+                replacement_recovery.stderr + replacement_recovery.stdout,
+            )
+            self.assertTrue(replacement_source.is_dir())
+            replacement_quarantine = (
+                replacement_root / "quarantine" / prior_map_id
+            )
+            self.assertEqual(
+                len(list(replacement_quarantine.glob(".*.diagnostic.tmp"))),
+                1,
+            )
+
+            # Replace the source after recovery has hashed and restored the
+            # exact diagnostic-bound inode to 0555, but before it removes the
+            # durable intent. The final path check must detect the new inode,
+            # preserve the intent and avoid chmodding the replacement.
+            in_recovery_root = (
+                Path(temporary) / "map-quarantine-recovery-replacement" / "Maps"
+            )
+            in_recovery_crash = subprocess.run(
+                [
+                    str(executable),
+                    "--map-quarantine-crash-worker",
+                    str(in_recovery_root),
+                    "after_source_thaw",
+                    "unused",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(in_recovery_crash.returncode, 70)
+            in_recovery_result = subprocess.run(
+                [
+                    str(executable),
+                    "--map-quarantine-crash-worker",
+                    str(in_recovery_root),
+                    "recover_replace_after_mode_restore",
+                    "list",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                in_recovery_result.returncode,
+                19,
+                in_recovery_result.stderr + in_recovery_result.stdout,
+            )
+            in_recovery_source = (
+                in_recovery_root / "packages" / prior_map_id / package_sha
+            )
+            self.assertTrue(in_recovery_source.is_dir())
+            self.assertEqual(in_recovery_source.stat().st_mode & 0o777, 0o755)
+            in_recovery_quarantine = (
+                in_recovery_root / "quarantine" / prior_map_id
+            )
+            self.assertEqual(
+                len(list(in_recovery_quarantine.glob(".*.diagnostic.tmp"))),
+                1,
+            )
+
+            def rewrite_final_diagnostic_as_legacy_v2(
+                map_root: Path, *, writable_root: bool
+            ) -> Path:
+                quarantine = map_root / "quarantine" / prior_map_id
+                final = next(
+                    item for item in quarantine.iterdir()
+                    if not item.name.startswith(".")
+                )
+                diagnostic = final / "quarantine_diagnostic.json"
+                payload = json.loads(diagnostic.read_text())
+                payload["version"] = 2
+                payload.pop("payload_device")
+                payload.pop("payload_inode")
+                final.chmod(0o755)
+                diagnostic.chmod(0o644)
+                diagnostic.write_text(
+                    json.dumps(
+                        payload,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                )
+                diagnostic.chmod(0o444)
+                final.chmod(0o755 if writable_root else 0o555)
+                return final
+
+            # Legacy v2 diagnostics remain readable only for their historical
+            # fully frozen 0555 final state. They cannot authorize recovery of
+            # a writable 0755 final because v2 has no durable inode binding.
+            legacy_immutable_root = recovered_roots[1]
+            legacy_immutable_final = rewrite_final_diagnostic_as_legacy_v2(
+                legacy_immutable_root, writable_root=False
+            )
+            legacy_immutable_recovery = subprocess.run(
+                [
+                    str(executable),
+                    "--map-quarantine-crash-worker",
+                    str(legacy_immutable_root),
+                    "recover",
+                    "list",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                legacy_immutable_recovery.returncode,
+                0,
+                legacy_immutable_recovery.stderr
+                + legacy_immutable_recovery.stdout,
+            )
+            self.assertEqual(legacy_immutable_final.stat().st_mode & 0o777, 0o555)
+
+            legacy_writable_root = recovered_roots[2]
+            legacy_writable_final = rewrite_final_diagnostic_as_legacy_v2(
+                legacy_writable_root, writable_root=True
+            )
+            legacy_writable_recovery = subprocess.run(
+                [
+                    str(executable),
+                    "--map-quarantine-crash-worker",
+                    str(legacy_writable_root),
+                    "recover",
+                    "list",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                legacy_writable_recovery.returncode,
+                19,
+                legacy_writable_recovery.stderr
+                + legacy_writable_recovery.stdout,
+            )
+            self.assertEqual(legacy_writable_final.stat().st_mode & 0o777, 0o755)
 
             # A quarantine transaction must reject symlinked destination
             # roots before it writes a diagnostic or renames the package.

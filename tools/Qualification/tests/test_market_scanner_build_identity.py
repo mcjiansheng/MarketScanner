@@ -143,6 +143,7 @@ class MarketScannerBuildIdentityTests(unittest.TestCase):
             ROOT / "app/ios/RTABMapApp/MobileMapImport/CanonicalJSONEncoder.swift",
             ROOT / "app/ios/RTABMapApp/MobileOnlyWorkflow/MobileOnlyWorkflowError.swift",
             ROOT / "app/ios/RTABMapApp/MobileOnlyWorkflow/MobileBuildIdentity.swift",
+            ROOT / "app/ios/RTABMapApp/MobilePostProcessing/ImmutableDirectoryPublication.swift",
             ROOT / "app/ios/RTABMapApp/MobileOnlyWorkflow/MobileResultLibrary.swift",
             ROOT / "app/ios/RTABMapApp/MobilePostProcessing/SessionSnapshotTransaction.swift",
             Path(__file__).with_name("swift") / "main.swift",
@@ -178,7 +179,27 @@ class MarketScannerBuildIdentityTests(unittest.TestCase):
                 run_result.stdout,
             )
             self.assertIn(
-                "Swift result pre-rename freeze and recovery contract passed",
+                "Swift result macOS-14 publication and recovery contract passed",
+                run_result.stdout,
+            )
+            self.assertIn(
+                "Swift immutable-directory post-freeze replacement contract passed",
+                run_result.stdout,
+            )
+            self.assertIn(
+                "Swift result process-lock pathname binding contract passed",
+                run_result.stdout,
+            )
+            self.assertIn(
+                "Swift result final process-lock validation contract passed",
+                run_result.stdout,
+            )
+            self.assertIn(
+                "Swift snapshot process-lock pathname binding contract passed",
+                run_result.stdout,
+            )
+            self.assertIn(
+                "Swift snapshot final process-lock validation contract passed",
                 run_result.stdout,
             )
             self.assertIn(

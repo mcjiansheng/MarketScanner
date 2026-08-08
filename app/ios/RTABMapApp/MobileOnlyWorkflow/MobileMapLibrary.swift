@@ -99,23 +99,31 @@ enum MobileMapLibrary {
     static let quarantineDiagnosticFileName = "quarantine_diagnostic.json"
     private static let quarantineDiagnosticFormat =
         "MarketScannerMapQuarantineDiagnostic"
-    private static let quarantineDiagnosticVersion = 2
+    private static let quarantineDiagnosticVersion = 3
     private static let maximumQuarantineDiagnosticBytes = 64 * 1024
     private static let maximumQuarantinePayloadEntries = 256
     private static let maximumQuarantinePayloadFileBytes: Int64 =
         512 * 1024 * 1024
     private static let maximumQuarantinePayloadTotalBytes: Int64 =
         1024 * 1024 * 1024
+    private static let processLockFileName = ".map-library.lock"
+    private static let quarantineDiagnosticRemovalSuffix =
+        ".diagnostic.removing"
 
     enum QuarantineFaultPoint {
+        case afterSourceThawBeforePayloadRename
         case afterPayloadRename
+        case afterDiagnosticPlacementBeforeFreeze
         case afterDiagnosticPlacementAndFreeze
+        case afterPublishRenameBeforeFreeze
+        case afterPublishFreezeBeforeParentSync
         case afterPublishRenameAndParentSync
+        case afterRollbackSourceModeRestoreBeforeIntentRemoval
     }
 
     /// Host-only fault injection for the quarantine transaction. Production
     /// leaves this nil; tests use thrown errors for rollback checks and a
-    /// child process `_exit` for the three real crash windows.
+    /// child process `_exit` for every durable transaction boundary.
     static var quarantineFaultInjector: ((QuarantineFaultPoint) throws -> Void)?
 
     /// Test/embedding hook: when set, `root()` returns this directory
@@ -128,6 +136,147 @@ enum MobileMapLibrary {
     /// inside `writeRegistry` additionally guards against external
     /// writers (crash recovery, another process).
     private static let libraryLock = NSLock()
+
+    private struct ProcessLockHandle {
+        let rootDescriptor: Int32
+        let lockDescriptor: Int32
+        let rootURL: URL
+        let rootMetadata: stat
+        let lockMetadata: stat
+    }
+
+    /// Every production entry that can reconcile or mutate the map library
+    /// also holds this advisory process lock. `NSLock` protects threads only;
+    /// without a shared `lockf` lock, a second app process could replace a
+    /// diagnostic-bound source between its final identity check and intent
+    /// removal.
+    private static func acquireProcessLock() throws -> ProcessLockHandle {
+        let mapRoot = try root()
+        let openedRoot = try openStableDirectoryNoFollow(
+            mapRoot, context: "map-library process-lock root")
+        var keepRootDescriptor = false
+        defer {
+            if !keepRootDescriptor { _ = close(openedRoot.descriptor) }
+        }
+        let descriptor = openat(
+            openedRoot.descriptor,
+            processLockFileName,
+            O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW,
+            mode_t(0o600))
+        guard descriptor >= 0 else {
+            throw LibraryError.packageVerificationFailed(
+                "cannot open map-library process lock: "
+                    + String(cString: strerror(errno)))
+        }
+        var metadata = stat()
+        var pathMetadata = stat()
+        guard fstat(descriptor, &metadata) == 0,
+              (metadata.st_mode & S_IFMT) == S_IFREG,
+              metadata.st_nlink == 1,
+              metadata.st_size == 0,
+              metadata.st_mode & mode_t(0o777) == mode_t(0o600),
+              fstatat(
+                openedRoot.descriptor,
+                processLockFileName,
+                &pathMetadata,
+                AT_SYMLINK_NOFOLLOW) == 0,
+              sameRegularFileInode(metadata, pathMetadata) else {
+            _ = close(descriptor)
+            throw LibraryError.packageVerificationFailed(
+                "map-library process lock identity/mode invalid")
+        }
+        do {
+            try requireOpenDirectoryPath(
+                descriptor: openedRoot.descriptor,
+                url: mapRoot,
+                expectedMetadata: openedRoot.metadata,
+                context: "map-library process-lock root before lock")
+        } catch {
+            _ = close(descriptor)
+            throw error
+        }
+        while lockf(descriptor, F_LOCK, 0) != 0 {
+            if errno == EINTR { continue }
+            let detail = String(cString: strerror(errno))
+            _ = close(descriptor)
+            throw LibraryError.packageVerificationFailed(
+                "cannot acquire map-library process lock: \(detail)")
+        }
+        var lockedMetadata = stat()
+        var lockedPathMetadata = stat()
+        do {
+            guard fstat(descriptor, &lockedMetadata) == 0,
+                  fstatat(
+                    openedRoot.descriptor,
+                    processLockFileName,
+                    &lockedPathMetadata,
+                    AT_SYMLINK_NOFOLLOW) == 0,
+                  sameRegularFileInode(metadata, lockedMetadata),
+                  sameRegularFileInode(metadata, lockedPathMetadata),
+                  lockedMetadata.st_nlink == 1,
+                  lockedMetadata.st_size == 0,
+                  lockedMetadata.st_mode & mode_t(0o777) == mode_t(0o600) else {
+                throw LibraryError.packageVerificationFailed(
+                    "map-library process lock pathname changed while acquiring")
+            }
+            try requireOpenDirectoryPath(
+                descriptor: openedRoot.descriptor,
+                url: mapRoot,
+                expectedMetadata: openedRoot.metadata,
+                context: "map-library process-lock root after lock")
+        } catch {
+            _ = lockf(descriptor, F_ULOCK, 0)
+            _ = close(descriptor)
+            throw error
+        }
+        keepRootDescriptor = true
+        return ProcessLockHandle(
+            rootDescriptor: openedRoot.descriptor,
+            lockDescriptor: descriptor,
+            rootURL: mapRoot,
+            rootMetadata: openedRoot.metadata,
+            lockMetadata: lockedMetadata)
+    }
+
+    private static func validateProcessLock(
+        _ handle: ProcessLockHandle
+    ) throws {
+        var rootDescriptorMetadata = stat()
+        var rootPathMetadata = stat()
+        var lockDescriptorMetadata = stat()
+        var lockPathMetadata = stat()
+        guard fstat(handle.rootDescriptor, &rootDescriptorMetadata) == 0,
+              lstat(handle.rootURL.path, &rootPathMetadata) == 0,
+              sameDirectoryIdentity(
+                handle.rootMetadata, rootDescriptorMetadata),
+              sameDirectoryIdentity(handle.rootMetadata, rootPathMetadata),
+              fstat(handle.lockDescriptor, &lockDescriptorMetadata) == 0,
+              fstatat(
+                handle.rootDescriptor,
+                processLockFileName,
+                &lockPathMetadata,
+                AT_SYMLINK_NOFOLLOW) == 0,
+              sameRegularFileInode(
+                handle.lockMetadata, lockDescriptorMetadata),
+              sameRegularFileInode(handle.lockMetadata, lockPathMetadata),
+              lockDescriptorMetadata.st_nlink == 1,
+              lockPathMetadata.st_nlink == 1,
+              lockDescriptorMetadata.st_size == 0,
+              lockPathMetadata.st_size == 0,
+              lockDescriptorMetadata.st_mode & mode_t(0o777)
+                == mode_t(0o600),
+              lockPathMetadata.st_mode & mode_t(0o777)
+                == mode_t(0o600) else {
+            throw LibraryError.packageVerificationFailed(
+                "map-library process lock/root binding changed while held")
+        }
+    }
+
+    private static func releaseProcessLock(_ handle: ProcessLockHandle) {
+        _ = lockf(handle.lockDescriptor, F_ULOCK, 0)
+        _ = close(handle.lockDescriptor)
+        _ = close(handle.rootDescriptor)
+    }
 
     // MARK: - Roots
 
@@ -206,7 +355,9 @@ enum MobileMapLibrary {
     ) throws -> MapEntry {
         libraryLock.lock()
         defer { libraryLock.unlock() }
-        try recoverQuarantineTransactionsLocked()
+        let processLock = try acquireProcessLock()
+        defer { releaseProcessLock(processLock) }
+        try recoverQuarantineTransactionsLocked(processLock: processLock)
 
         // §14.2: safe identity — anything else is rejected before any
         // filesystem mutation.
@@ -264,7 +415,11 @@ enum MobileMapLibrary {
             compilerVersion: compilerVersion,
             canonicalSourceSHA256: canonicalSourceSHA256)
         entries.append(entry)
-        try writeRegistry(entries, expectedGeneration: payload.generation)
+        try writeRegistry(
+            entries,
+            expectedGeneration: payload.generation,
+            processLock: processLock)
+        try validateProcessLock(processLock)
         return entry
     }
 
@@ -273,7 +428,9 @@ enum MobileMapLibrary {
     static func unregister(priorMapID: String, packageSHA256: String? = nil) throws {
         libraryLock.lock()
         defer { libraryLock.unlock() }
-        try recoverQuarantineTransactionsLocked()
+        let processLock = try acquireProcessLock()
+        defer { releaseProcessLock(processLock) }
+        try recoverQuarantineTransactionsLocked(processLock: processLock)
         let payload = try readRegistryPayload()
         var entries = payload.entries
         if let packageSHA256 = packageSHA256 {
@@ -283,7 +440,11 @@ enum MobileMapLibrary {
         } else {
             entries.removeAll { $0.priorMapID == priorMapID }
         }
-        try writeRegistry(entries, expectedGeneration: payload.generation)
+        try writeRegistry(
+            entries,
+            expectedGeneration: payload.generation,
+            processLock: processLock)
+        try validateProcessLock(processLock)
     }
 
     // MARK: - Package verification
@@ -365,20 +526,26 @@ enum MobileMapLibrary {
     static func listMaps() throws -> [MapEntry] {
         libraryLock.lock()
         defer { libraryLock.unlock() }
-        try recoverQuarantineTransactionsLocked()
+        let processLock = try acquireProcessLock()
+        defer { releaseProcessLock(processLock) }
+        try recoverQuarantineTransactionsLocked(processLock: processLock)
         // §14.2: every listed map is re-verified against its package
         // manifest/digest; a missing or corrupt package is dropped from
         // the reported list (the registry itself is untouched).
-        return try readRegistryPayload().entries.filter { entry in
+        let entries = try readRegistryPayload().entries.filter { entry in
             guard let digest = try? quickVerifyPackage(entry) else { return false }
             return digest == entry.packageSHA256
         }.sorted { $0.compiledAtUTC > $1.compiledAtUTC }
+        try validateProcessLock(processLock)
+        return entries
     }
 
     static func map(priorMapID: String, packageSHA256: String) throws -> MapEntry {
         libraryLock.lock()
         defer { libraryLock.unlock() }
-        try recoverQuarantineTransactionsLocked()
+        let processLock = try acquireProcessLock()
+        defer { releaseProcessLock(processLock) }
+        try recoverQuarantineTransactionsLocked(processLock: processLock)
         guard isSafeIdentifier(priorMapID), isSHA256(packageSHA256) else {
             throw LibraryError.unsafeIdentifier("\(priorMapID)/\(packageSHA256)")
         }
@@ -396,6 +563,7 @@ enum MobileMapLibrary {
             expectedElementCount: entry.elementCount,
             expectedCanonicalSourceSHA256: entry.canonicalSourceSHA256)
         try verifyImmutable(at: entry.packageDirectory)
+        try validateProcessLock(processLock)
         return entry
     }
 
@@ -476,8 +644,10 @@ enum MobileMapLibrary {
     /// fails closed.
     private static func writeRegistry(
         _ entries: [MapEntry],
-        expectedGeneration: Int
+        expectedGeneration: Int,
+        processLock: ProcessLockHandle
     ) throws {
+        try validateProcessLock(processLock)
         let url = try registryURL()
         let nextGeneration = expectedGeneration + 1
         let payload: [String: Any] = [
@@ -507,6 +677,7 @@ enum MobileMapLibrary {
                 throw LibraryError.registryGenerationConflict(
                     expected: expectedGeneration, actual: current)
             }
+            try validateProcessLock(processLock)
             let fileManager = FileManager.default
             if fileManager.fileExists(atPath: url.path) {
                 try fileManager.replaceItemAt(
@@ -518,6 +689,7 @@ enum MobileMapLibrary {
                 try fileManager.moveItem(at: temp, to: url)
             }
             try syncDirectory(directory)
+            try validateProcessLock(processLock)
         } catch {
             try? FileManager.default.removeItem(at: temp)
             if let libraryError = error as? LibraryError {
@@ -557,7 +729,9 @@ enum MobileMapLibrary {
     static func rebuildRegistry() throws {
         libraryLock.lock()
         defer { libraryLock.unlock() }
-        try recoverQuarantineTransactionsLocked()
+        let processLock = try acquireProcessLock()
+        defer { releaseProcessLock(processLock) }
+        try recoverQuarantineTransactionsLocked(processLock: processLock)
         let root = try packagesRoot()
         let fileManager = FileManager.default
         var entries: [MapEntry] = []
@@ -621,7 +795,8 @@ enum MobileMapLibrary {
                         package,
                         priorMapID: priorMapID,
                         packageSHA256: sha,
-                        validationError: validationError)
+                        validationError: validationError,
+                        processLock: processLock)
                 }
             }
         }
@@ -629,7 +804,11 @@ enum MobileMapLibrary {
         // generation is still valid. Missing/illegal generation never
         // defaults to zero and is not overwritten silently.
         let expectedGeneration = try readDiskGeneration()
-        try writeRegistry(entries, expectedGeneration: expectedGeneration)
+        try writeRegistry(
+            entries,
+            expectedGeneration: expectedGeneration,
+            processLock: processLock)
+        try validateProcessLock(processLock)
     }
 
     private static func readManifest(in package: URL) throws -> [String: Any] {
@@ -644,9 +823,11 @@ enum MobileMapLibrary {
 
     // MARK: - Safety
 
-    /// §14.2 safe prior-map ID: non-empty, bounded, `[a-z0-9._-]` only.
+    /// §14.2 safe prior-map ID: non-empty, bounded, `[a-z0-9._-]` only,
+    /// and never either POSIX self/parent path component.
     static func isSafeIdentifier(_ value: String, maximumLength: Int = 128) -> Bool {
-        guard !value.isEmpty, value.unicodeScalars.count <= maximumLength else {
+        guard !value.isEmpty, value != ".", value != "..",
+              value.unicodeScalars.count <= maximumLength else {
             return false
         }
         for scalar in value.unicodeScalars {
@@ -716,7 +897,10 @@ enum MobileMapLibrary {
 
     /// §14.2: freezes a registered package — files 0o444, directories
     /// 0o555, recursive. Any chmod failure aborts registration.
-    static func makeImmutable(at root: URL) throws {
+    static func makeImmutable(
+        at root: URL,
+        freezeRootDirectory: Bool = true
+    ) throws {
         var directories: [URL] = [root]
         if let enumerator = FileManager.default.enumerator(
             at: root,
@@ -733,9 +917,12 @@ enum MobileMapLibrary {
         }
         // Directories deepest-first so a parent write-bit removal never
         // blocks chmodding its children.
-        for url in directories.reversed() {
+        for url in directories.reversed() where url != root {
             try setPermissions(0o555, on: url)
         }
+        try setPermissions(
+            freezeRootDirectory ? 0o555 : 0o755,
+            on: root)
     }
 
     /// Verifies the exact immutable mode/type contract after chmod and on
@@ -774,11 +961,14 @@ enum MobileMapLibrary {
         let sourceMode: mode_t
         let destinationURL: URL
         let payloadTreeSHA256: String
+        let payloadIdentity: ImmutableDirectoryPublication.Identity?
+        let canonicalData: Data
     }
 
     private struct QuarantineRecoveryGroup {
         var pending: URL?
         var diagnosticTemporary: URL?
+        var diagnosticRemovalTombstone: URL?
         var published: URL?
     }
 
@@ -787,8 +977,10 @@ enum MobileMapLibrary {
     /// rebuild so a crash cannot strand a production package under a hidden
     /// name forever. The state machine accepts only these atomic-rename states:
     ///
-    /// - source + `.diagnostic.tmp`: the payload rename did not commit; remove
-    ///   the verified temporary diagnostic and keep the source;
+    /// - v3 source + `.diagnostic.tmp`: the payload rename did not commit;
+    ///   verify the exact dev/inode/tree, restore the source and remove intent;
+    ///   legacy v2 incomplete transactions lack that durable inode binding and
+    ///   remain preserved fail-closed (only a frozen v2 final is compatible);
     /// - `.pending` + `.diagnostic.tmp`: finish diagnostic placement/freeze;
     /// - `.pending` + embedded diagnostic: verify/freeze and publish;
     /// - final quarantine directory: verify and complete every parent fsync.
@@ -796,14 +988,20 @@ enum MobileMapLibrary {
     /// Missing payloads, duplicate phase artifacts, unknown names, symlinks,
     /// hard links, non-canonical diagnostics or identity/path/hash conflicts
     /// fail closed. Recovery never guesses which bytes should win.
-    private static func recoverQuarantineTransactionsLocked() throws {
+    private static func recoverQuarantineTransactionsLocked(
+        processLock: ProcessLockHandle
+    ) throws {
+        try validateProcessLock(processLock)
         let mapRoot = try root()
         try requireRealDirectory(mapRoot, context: "map library root")
         let quarantineBase = mapRoot.appendingPathComponent(
             "quarantine", isDirectory: true)
         var baseStat = stat()
         if lstat(quarantineBase.path, &baseStat) != 0 {
-            if errno == ENOENT { return }
+            if errno == ENOENT {
+                try validateProcessLock(processLock)
+                return
+            }
             throw LibraryError.packageVerificationFailed(
                 "cannot inspect quarantine root: "
                     + String(cString: strerror(errno)))
@@ -828,7 +1026,9 @@ enum MobileMapLibrary {
                 atPath: quarantineRoot.path).sorted()
             for name in names {
                 let transactionID: String
-                enum ArtifactKind { case pending, temporary, published }
+                enum ArtifactKind {
+                    case pending, temporary, removalTombstone, published
+                }
                 let kind: ArtifactKind
                 if name.hasPrefix("."), name.hasSuffix(".pending") {
                     transactionID = String(name.dropFirst().dropLast(".pending".count))
@@ -838,6 +1038,12 @@ enum MobileMapLibrary {
                     transactionID = String(
                         name.dropFirst().dropLast(".diagnostic.tmp".count))
                     kind = .temporary
+                } else if name.hasPrefix("."),
+                          name.hasSuffix(quarantineDiagnosticRemovalSuffix) {
+                    transactionID = String(
+                        name.dropFirst().dropLast(
+                            quarantineDiagnosticRemovalSuffix.count))
+                    kind = .removalTombstone
                 } else {
                     transactionID = name
                     kind = .published
@@ -848,8 +1054,13 @@ enum MobileMapLibrary {
                         "unknown quarantine transaction entry: \(name)")
                 }
                 var group = groups[transactionID] ?? QuarantineRecoveryGroup()
+                let isDirectory: Bool
+                switch kind {
+                case .pending, .published: isDirectory = true
+                case .temporary, .removalTombstone: isDirectory = false
+                }
                 let url = quarantineRoot.appendingPathComponent(
-                    name, isDirectory: kind != .temporary)
+                    name, isDirectory: isDirectory)
                 switch kind {
                 case .pending:
                     guard group.pending == nil else {
@@ -864,6 +1075,12 @@ enum MobileMapLibrary {
                             "duplicate quarantine diagnostic temporary")
                     }
                     group.diagnosticTemporary = url
+                case .removalTombstone:
+                    guard group.diagnosticRemovalTombstone == nil else {
+                        throw LibraryError.packageVerificationFailed(
+                            "duplicate quarantine diagnostic removal tombstone")
+                    }
+                    group.diagnosticRemovalTombstone = url
                 case .published:
                     guard group.published == nil else {
                         throw LibraryError.packageVerificationFailed(
@@ -882,6 +1099,7 @@ enum MobileMapLibrary {
                 if let published = group.published {
                     guard group.pending == nil,
                           group.diagnosticTemporary == nil,
+                          group.diagnosticRemovalTombstone == nil,
                           published.path == destination.path else {
                         throw LibraryError.packageVerificationFailed(
                             "conflicting published quarantine transaction \(transactionID)")
@@ -895,6 +1113,9 @@ enum MobileMapLibrary {
                     try requireMissing(
                         diagnostic.sourceURL,
                         context: "quarantine source and published payload both exist")
+                    try validateProcessLock(processLock)
+                    try recoverInterruptedPublishedQuarantineIfNeeded(
+                        published, diagnostic: diagnostic)
                     try verifyPublishedQuarantine(
                         published, diagnostic: diagnostic)
                     try syncQuarantineTree(published)
@@ -902,10 +1123,15 @@ enum MobileMapLibrary {
                     try syncDirectory(quarantineRoot)
                     try syncDirectory(quarantineBase)
                     try syncDirectory(mapRoot)
+                    try validateProcessLock(processLock)
                     continue
                 }
 
                 if let pending = group.pending {
+                    guard group.diagnosticRemovalTombstone == nil else {
+                        throw LibraryError.packageVerificationFailed(
+                            "pending quarantine conflicts with diagnostic removal tombstone")
+                    }
                     var diagnostic: QuarantineDiagnostic
                     let embeddedDiagnostic = pending.appendingPathComponent(
                         quarantineDiagnosticFileName)
@@ -922,6 +1148,10 @@ enum MobileMapLibrary {
                             transactionID: transactionID,
                             priorMapID: priorMapID,
                             quarantineRoot: quarantineRoot)
+                        guard diagnostic.payloadIdentity != nil else {
+                            throw LibraryError.packageVerificationFailed(
+                                "legacy quarantine pending transaction lacks durable payload identity")
+                        }
                         try requireMissing(
                             diagnostic.sourceURL,
                             context: "quarantine source and pending both exist")
@@ -931,6 +1161,7 @@ enum MobileMapLibrary {
                             throw LibraryError.packageVerificationFailed(
                                 "pending quarantine payload hash mismatch")
                         }
+                        try validateProcessLock(processLock)
                         guard renameatx_np(
                             AT_FDCWD, temporary.path,
                             AT_FDCWD, embeddedDiagnostic.path,
@@ -942,6 +1173,7 @@ enum MobileMapLibrary {
                         try syncFileNoFollow(embeddedDiagnostic)
                         try syncDirectory(pending)
                         try syncDirectory(quarantineRoot)
+                        try validateProcessLock(processLock)
                     } else {
                         guard embeddedExists else {
                             throw LibraryError.packageVerificationFailed(
@@ -952,66 +1184,63 @@ enum MobileMapLibrary {
                             transactionID: transactionID,
                             priorMapID: priorMapID,
                             quarantineRoot: quarantineRoot)
+                        guard diagnostic.payloadIdentity != nil else {
+                            throw LibraryError.packageVerificationFailed(
+                                "legacy quarantine pending transaction lacks durable payload identity")
+                        }
                         try requireMissing(
                             diagnostic.sourceURL,
                             context: "quarantine source and pending both exist")
                     }
-                    try makeImmutable(at: pending)
-                    try verifyPublishedQuarantine(pending, diagnostic: diagnostic)
+                    try makeImmutable(
+                        at: pending, freezeRootDirectory: false)
+                    try verifyPreparedQuarantine(
+                        pending, diagnostic: diagnostic)
                     try syncQuarantineTree(pending)
-                    guard renameatx_np(
-                        AT_FDCWD, pending.path,
-                        AT_FDCWD, destination.path,
-                        UInt32(RENAME_EXCL)) == 0 else {
-                        throw LibraryError.packageVerificationFailed(
-                            "recovery quarantine publish failed: "
-                                + String(cString: strerror(errno)))
-                    }
+                    try publishPreparedQuarantine(
+                        pending,
+                        to: destination,
+                        diagnostic: diagnostic,
+                        injectFaults: false,
+                        processLock: processLock)
+                    try verifyPublishedQuarantine(
+                        destination, diagnostic: diagnostic)
                     try syncQuarantineTree(destination)
                     try syncDirectory(diagnostic.sourceURL.deletingLastPathComponent())
                     try syncDirectory(quarantineRoot)
                     try syncDirectory(quarantineBase)
                     try syncDirectory(mapRoot)
+                    try validateProcessLock(processLock)
                     continue
                 }
 
-                guard let temporary = group.diagnosticTemporary else {
+                guard !(group.diagnosticTemporary != nil
+                        && group.diagnosticRemovalTombstone != nil) else {
+                    throw LibraryError.packageVerificationFailed(
+                        "quarantine rollback has both temporary and removal tombstone")
+                }
+                guard let rollbackIntent = group.diagnosticTemporary
+                        ?? group.diagnosticRemovalTombstone else {
                     throw LibraryError.packageVerificationFailed(
                         "empty quarantine transaction \(transactionID)")
                 }
                 let diagnostic = try readQuarantineDiagnostic(
-                    at: temporary,
+                    at: rollbackIntent,
                     transactionID: transactionID,
                     priorMapID: priorMapID,
                     quarantineRoot: quarantineRoot)
-                try requireRealDirectory(
-                    diagnostic.sourceURL, context: "quarantine rollback source")
-                let actualPayloadSHA = try quarantinePayloadTreeSHA256(
-                    at: diagnostic.sourceURL, diagnosticIsEmbedded: false)
-                guard actualPayloadSHA == diagnostic.payloadTreeSHA256 else {
+                guard diagnostic.payloadIdentity != nil else {
                     throw LibraryError.packageVerificationFailed(
-                        "quarantine rollback source hash mismatch")
+                        "legacy quarantine rollback lacks durable payload identity")
                 }
-                // A crash may land after the source directory was made
-                // writable but before the payload rename. Restore the exact
-                // pre-transaction root mode recorded by the diagnostic.
-                guard chmod(
-                    diagnostic.sourceURL.path, diagnostic.sourceMode) == 0 else {
-                    throw LibraryError.cannotMakeImmutable(
-                        "cannot restore quarantine source mode")
-                }
-                try syncDirectory(diagnostic.sourceURL)
-                guard unlink(temporary.path) == 0 else {
-                    throw LibraryError.packageVerificationFailed(
-                        "cannot remove recovered diagnostic temporary: "
-                            + String(cString: strerror(errno)))
-                }
-                try syncDirectory(diagnostic.sourceURL.deletingLastPathComponent())
-                try syncDirectory(quarantineRoot)
-                try syncDirectory(quarantineBase)
-                try syncDirectory(mapRoot)
+                try restoreQuarantineSourceAndRemoveIntent(
+                    rollbackIntent,
+                    diagnostic: diagnostic,
+                    quarantineRoot: quarantineRoot,
+                    processLock: processLock)
             }
         }
+        try validateProcessLock(processLock)
     }
 
     /// Moves a valid-identity but invalid package out of the production
@@ -1025,8 +1254,10 @@ enum MobileMapLibrary {
         _ package: URL,
         priorMapID: String,
         packageSHA256: String,
-        validationError: Error
+        validationError: Error,
+        processLock: ProcessLockHandle
     ) throws {
+        try validateProcessLock(processLock)
         let mapRoot = try root()
         try requireRealDirectory(mapRoot, context: "map library root")
         let quarantineBase = mapRoot.appendingPathComponent(
@@ -1096,6 +1327,8 @@ enum MobileMapLibrary {
             "source_mode": Int(originalMode),
             "quarantine_path": destination.path,
             "payload_tree_sha256": payloadTreeSHA256,
+            "payload_device": String(UInt64(packageStat.st_dev)),
+            "payload_inode": String(UInt64(packageStat.st_ino)),
             "validator_detail": validatorDetail,
         ]
         let diagnosticData: Data
@@ -1114,69 +1347,48 @@ enum MobileMapLibrary {
             throw error
         }
 
-        var modeChanged = false
         var payloadMoved = false
         var diagnosticMoved = false
         var published = false
         var diagnosticDurable = false
-        if (originalMode & mode_t(S_IWUSR)) == 0 {
-            guard chmod(package.path, originalMode | mode_t(S_IWUSR)) == 0 else {
-                try? FileManager.default.removeItem(at: diagnosticTemporary)
-                throw LibraryError.cannotMakeImmutable(package.path)
-            }
-            modeChanged = true
-        }
 
         func rollback(_ originalError: Error) throws -> Never {
             var failures: [String] = []
-            let activeDestination = published ? destination : pendingDestination
-            if payloadMoved {
-                var canRestorePayload = true
-                if chmod(
-                    activeDestination.path,
-                    originalMode | mode_t(S_IWUSR)) != 0 {
-                    failures.append("cannot restore quarantine write mode")
-                    canRestorePayload = false
+            do {
+                let diagnostic = try readQuarantineDiagnostic(
+                    at: diagnosticTemporary,
+                    transactionID: quarantineID,
+                    priorMapID: priorMapID,
+                    quarantineRoot: quarantineRoot)
+                guard diagnostic.payloadIdentity != nil else {
+                    throw LibraryError.packageVerificationFailed(
+                        "rollback diagnostic lacks durable payload identity")
                 }
-                if diagnosticMoved,
-                   unlink(activeDestination.appendingPathComponent(
-                        quarantineDiagnosticFileName).path) != 0,
-                   errno != ENOENT {
-                    failures.append("cannot remove rolled-back diagnostic")
-                    canRestorePayload = false
-                }
-                if canRestorePayload && renameatx_np(
-                    AT_FDCWD, activeDestination.path,
-                    AT_FDCWD, package.path,
-                    UInt32(RENAME_EXCL)) != 0 {
-                    failures.append(
-                        "cannot restore source package: "
-                            + String(cString: strerror(errno)))
-                } else if canRestorePayload {
+                if payloadMoved {
+                    guard !diagnosticMoved, !published else {
+                        throw LibraryError.packageVerificationFailed(
+                            "rollback reached a durable embedded diagnostic state")
+                    }
+                    try restoreMovedQuarantinePayload(
+                        pendingDestination,
+                        to: package,
+                        diagnostic: diagnostic,
+                        quarantineRoot: quarantineRoot)
                     payloadMoved = false
                     published = false
-                    if chmod(package.path, originalMode) != 0 {
-                        failures.append("cannot restore source package mode")
-                    }
                 }
-            } else if modeChanged, chmod(package.path, originalMode) != 0 {
-                failures.append("cannot restore source package mode")
+                // This helper is the only code allowed to remove the durable
+                // diagnostic.  It first restores and hashes the exact v3-bound
+                // source, then uses an identity-bound removal tombstone.  Any
+                // post-unlink failure recreates the canonical diagnostic.
+                try restoreQuarantineSourceAndRemoveIntent(
+                    diagnosticTemporary,
+                    diagnostic: diagnostic,
+                    quarantineRoot: quarantineRoot,
+                    processLock: processLock)
+            } catch {
+                failures.append(error.localizedDescription)
             }
-            if FileManager.default.fileExists(atPath: diagnosticTemporary.path) {
-                do {
-                    try FileManager.default.removeItem(at: diagnosticTemporary)
-                } catch {
-                    failures.append("cannot remove diagnostic temporary file")
-                }
-            }
-            do { try syncDirectory(sourceParent) }
-            catch { failures.append("cannot sync source parent after rollback") }
-            do { try syncDirectory(quarantineRoot) }
-            catch { failures.append("cannot sync quarantine root after rollback") }
-            do { try syncDirectory(quarantineBase) }
-            catch { failures.append("cannot sync quarantine base after rollback") }
-            do { try syncDirectory(mapRoot) }
-            catch { failures.append("cannot sync map root after rollback") }
 
             let suffix = failures.isEmpty
                 ? ""
@@ -1186,6 +1398,17 @@ enum MobileMapLibrary {
         }
 
         do {
+            if (originalMode & mode_t(S_IWUSR)) == 0 {
+                guard chmod(
+                    package.path,
+                    originalMode | mode_t(S_IWUSR)) == 0 else {
+                    throw LibraryError.cannotMakeImmutable(package.path)
+                }
+                try syncDirectory(package)
+                try quarantineFaultInjector?(
+                    .afterSourceThawBeforePayloadRename)
+            }
+            try validateProcessLock(processLock)
             guard renameatx_np(
                 AT_FDCWD, package.path,
                 AT_FDCWD, pendingDestination.path,
@@ -1197,8 +1420,10 @@ enum MobileMapLibrary {
             payloadMoved = true
             try syncDirectory(sourceParent)
             try syncDirectory(quarantineRoot)
+            try validateProcessLock(processLock)
             try quarantineFaultInjector?(.afterPayloadRename)
 
+            try validateProcessLock(processLock)
             guard renameatx_np(
                 AT_FDCWD, diagnosticTemporary.path,
                 AT_FDCWD, diagnosticURL.path,
@@ -1213,33 +1438,37 @@ enum MobileMapLibrary {
             // the embedded rename target. Preserve it instead of attempting
             // a lossy rollback after recursive chmod/fsync has started.
             diagnosticDurable = true
-            try makeImmutable(at: pendingDestination)
+            try validateProcessLock(processLock)
+            try quarantineFaultInjector?(.afterDiagnosticPlacementBeforeFreeze)
+            try makeImmutable(
+                at: pendingDestination, freezeRootDirectory: false)
             let diagnostic = try readQuarantineDiagnostic(
                 at: diagnosticURL,
                 transactionID: quarantineID,
                 priorMapID: priorMapID,
                 quarantineRoot: quarantineRoot)
-            try verifyPublishedQuarantine(
+            try verifyPreparedQuarantine(
                 pendingDestination, diagnostic: diagnostic)
             try syncQuarantineTree(pendingDestination)
             try syncDirectory(quarantineRoot)
             try quarantineFaultInjector?(.afterDiagnosticPlacementAndFreeze)
 
-            guard renameatx_np(
-                AT_FDCWD, pendingDestination.path,
-                AT_FDCWD, destination.path,
-                UInt32(RENAME_EXCL)) == 0 else {
-                throw LibraryError.packageVerificationFailed(
-                    "quarantine publish rename failed: "
-                        + String(cString: strerror(errno)))
-            }
+            try publishPreparedQuarantine(
+                pendingDestination,
+                to: destination,
+                diagnostic: diagnostic,
+                injectFaults: true,
+                processLock: processLock)
             published = true
+            try verifyPublishedQuarantine(
+                destination, diagnostic: diagnostic)
             try syncQuarantineTree(destination)
             try syncDirectory(sourceParent)
             try syncDirectory(quarantineRoot)
             try syncDirectory(quarantineBase)
             try syncDirectory(mapRoot)
             try quarantineFaultInjector?(.afterPublishRenameAndParentSync)
+            try validateProcessLock(processLock)
         } catch {
             if diagnosticDurable || published {
                 if let libraryError = error as? LibraryError {
@@ -1261,7 +1490,12 @@ enum MobileMapLibrary {
         let sha = String(transactionID[..<shaEnd])
         guard isSHA256(sha), transactionID[shaEnd] == "-" else { return nil }
         let uuidStart = transactionID.index(after: shaEnd)
-        guard UUID(uuidString: String(transactionID[uuidStart...])) != nil else {
+        let uuidText = String(transactionID[uuidStart...])
+        // Foundation accepts uppercase UUID text and normalizes it.  Durable
+        // transaction names use the writer's one canonical lowercase form;
+        // recovery must not alias a second spelling to the same UUID value.
+        guard let uuid = UUID(uuidString: uuidText),
+              uuid.uuidString.lowercased() == uuidText else {
             return nil
         }
         return sha
@@ -1281,15 +1515,9 @@ enum MobileMapLibrary {
             limits: StrictJSONDocumentLimits(
                 maximumBytes: maximumQuarantineDiagnosticBytes))
                 as? [String: Any],
-              Set(object.keys) == Set([
-                "format", "version", "transaction_id", "reason",
-                "quarantined_at_unix", "source_identity", "source_path",
-                "source_mode", "quarantine_path", "payload_tree_sha256",
-                "validator_detail",
-              ]),
               object["format"] as? String == quarantineDiagnosticFormat,
-              StrictJSONScalar.integer(object["version"])
-                == quarantineDiagnosticVersion,
+              let version = StrictJSONScalar.integer(object["version"]),
+              version == 2 || version == quarantineDiagnosticVersion,
               object["transaction_id"] as? String == transactionID,
               object["reason"] as? String == "package_validation_failed",
               let quarantinedAt = StrictJSONScalar.number(
@@ -1314,6 +1542,36 @@ enum MobileMapLibrary {
             throw LibraryError.packageVerificationFailed(
                 "quarantine diagnostic schema/canonical form invalid: \(url.path)")
         }
+        let version2Keys = Set([
+            "format", "version", "transaction_id", "reason",
+            "quarantined_at_unix", "source_identity", "source_path",
+            "source_mode", "quarantine_path", "payload_tree_sha256",
+            "validator_detail",
+        ])
+        let version3Keys = version2Keys.union([
+            "payload_device", "payload_inode",
+        ])
+        guard Set(object.keys) == (version == 2 ? version2Keys : version3Keys)
+        else {
+            throw LibraryError.packageVerificationFailed(
+                "quarantine diagnostic field set invalid: \(url.path)")
+        }
+        let payloadIdentity: ImmutableDirectoryPublication.Identity?
+        if version == quarantineDiagnosticVersion {
+            guard let deviceText = object["payload_device"] as? String,
+                  let inodeText = object["payload_inode"] as? String,
+                  isCanonicalUnsignedDecimal(deviceText),
+                  isCanonicalUnsignedDecimal(inodeText),
+                  let device = UInt64(deviceText),
+                  let inode = UInt64(inodeText) else {
+                throw LibraryError.packageVerificationFailed(
+                    "quarantine diagnostic payload identity invalid: \(url.path)")
+            }
+            payloadIdentity = ImmutableDirectoryPublication.Identity(
+                device: device, inode: inode)
+        } else {
+            payloadIdentity = nil
+        }
         // `StrictJSONDocumentParser` intentionally returns Foundation
         // `NSNumber` values. Re-encoding that untyped object would turn JSON
         // integers such as version/source_mode into `2.0`/`365.0`, even
@@ -1321,9 +1579,9 @@ enum MobileMapLibrary {
         // already type-checked schema so canonical byte comparison preserves
         // the integer-vs-number contract instead of depending on NSNumber's
         // bridge representation.
-        let normalizedCanonicalObject: [String: Any] = [
+        var normalizedCanonicalObject: [String: Any] = [
             "format": quarantineDiagnosticFormat,
-            "version": quarantineDiagnosticVersion,
+            "version": version,
             "transaction_id": transactionID,
             "reason": "package_validation_failed",
             "quarantined_at_unix": quarantinedAt,
@@ -1337,6 +1595,12 @@ enum MobileMapLibrary {
             "payload_tree_sha256": payloadTreeSHA256,
             "validator_detail": validatorDetail,
         ]
+        if let payloadIdentity {
+            normalizedCanonicalObject["payload_device"] = String(
+                payloadIdentity.device)
+            normalizedCanonicalObject["payload_inode"] = String(
+                payloadIdentity.inode)
+        }
         guard let canonical = try? CanonicalJSONEncoder.encode(
                 normalizedCanonicalObject),
               canonical == data else {
@@ -1359,51 +1623,757 @@ enum MobileMapLibrary {
             sourceURL: expectedSource,
             sourceMode: mode_t(sourceModeValue),
             destinationURL: expectedDestination,
-            payloadTreeSHA256: payloadTreeSHA256)
+            payloadTreeSHA256: payloadTreeSHA256,
+            payloadIdentity: payloadIdentity,
+            canonicalData: data)
+    }
+
+    private static func isCanonicalUnsignedDecimal(_ value: String) -> Bool {
+        guard !value.isEmpty,
+              value.utf8.allSatisfy({ $0 >= 48 && $0 <= 57 }) else {
+            return false
+        }
+        return value == "0" || !value.hasPrefix("0")
+    }
+
+    private static func verifyPreparedQuarantine(
+        _ directory: URL,
+        diagnostic: QuarantineDiagnostic
+    ) throws {
+        try verifyQuarantine(
+            directory,
+            diagnostic: diagnostic,
+            expectedRootMode: ImmutableDirectoryPublication.renameableMode)
     }
 
     private static func verifyPublishedQuarantine(
         _ directory: URL,
         diagnostic: QuarantineDiagnostic
     ) throws {
-        try requireRealDirectory(directory, context: "quarantine payload")
-        let rootStat = try lstatValue(directory)
-        guard rootStat.st_mode & mode_t(0o777) == mode_t(0o555) else {
+        try verifyQuarantine(
+            directory,
+            diagnostic: diagnostic,
+            expectedRootMode: ImmutableDirectoryPublication.immutableMode)
+    }
+
+    private static func verifyQuarantine(
+        _ directory: URL,
+        diagnostic: QuarantineDiagnostic,
+        expectedRootMode: mode_t
+    ) throws {
+        let parentURL = directory.deletingLastPathComponent()
+        let openedParent = try openStableDirectoryNoFollow(
+            parentURL, context: "quarantine payload parent")
+        defer { _ = close(openedParent.descriptor) }
+        let descriptor = openat(
+            openedParent.descriptor,
+            directory.lastPathComponent,
+            O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)
+        guard descriptor >= 0 else {
             throw LibraryError.packageVerificationFailed(
-                "quarantine directory mode is not 0555")
+                "cannot open quarantine payload root without following links")
         }
-        try verifyQuarantineTreeModes(directory)
+        defer { _ = close(descriptor) }
+        var opened = stat()
+        var pathBefore = stat()
+        guard fstat(descriptor, &opened) == 0,
+              (opened.st_mode & S_IFMT) == S_IFDIR,
+              fstatat(
+                openedParent.descriptor,
+                directory.lastPathComponent,
+                &pathBefore,
+                AT_SYMLINK_NOFOLLOW) == 0,
+              sameStableFileIdentity(opened, pathBefore),
+              opened.st_mode & mode_t(0o777) == expectedRootMode else {
+            throw LibraryError.packageVerificationFailed(
+                "quarantine directory mode is not "
+                    + String(expectedRootMode, radix: 8))
+        }
+        if let expectedIdentity = diagnostic.payloadIdentity {
+            let actualIdentity = ImmutableDirectoryPublication.Identity(
+                device: UInt64(opened.st_dev),
+                inode: UInt64(opened.st_ino))
+            guard actualIdentity == expectedIdentity else {
+                throw LibraryError.packageVerificationFailed(
+                    "quarantine payload dev/inode identity mismatch")
+            }
+        }
+        // The payload inventory intentionally excludes the embedded
+        // diagnostic from its tree hash, so bind that file separately to the
+        // exact canonical bytes that authorized this transaction.  Keep the
+        // FD open across payload hashing and rebind the pathname afterwards.
+        let openedDiagnostic = try openBoundQuarantineDiagnosticIntent(
+            parentDescriptor: descriptor,
+            basename: quarantineDiagnosticFileName,
+            expectedData: diagnostic.canonicalData)
+        defer { _ = close(openedDiagnostic.descriptor) }
         let actualPayloadSHA = try quarantinePayloadTreeSHA256(
-            at: directory, diagnosticIsEmbedded: true)
+            atBoundDirectoryDescriptor: descriptor,
+            diagnosticIsEmbedded: true,
+            requiredRootMode: expectedRootMode,
+            requireImmutableDescendantModes: true)
         guard actualPayloadSHA == diagnostic.payloadTreeSHA256 else {
             throw LibraryError.packageVerificationFailed(
                 "quarantine payload tree hash mismatch")
         }
+        try requireBoundQuarantineDiagnosticIntent(
+            descriptor: openedDiagnostic.descriptor,
+            parentDescriptor: descriptor,
+            basename: quarantineDiagnosticFileName,
+            expectedDataSize: diagnostic.canonicalData.count)
+        var openedAfter = stat()
+        var pathAfter = stat()
+        guard fstat(descriptor, &openedAfter) == 0,
+              fstatat(
+                openedParent.descriptor,
+                directory.lastPathComponent,
+                &pathAfter,
+                AT_SYMLINK_NOFOLLOW) == 0,
+              sameStableFileIdentity(opened, openedAfter),
+              sameStableFileIdentity(opened, pathAfter) else {
+            throw LibraryError.packageVerificationFailed(
+                "quarantine payload root changed during verification")
+        }
+        try requireOpenDirectoryPath(
+            descriptor: openedParent.descriptor,
+            url: parentURL,
+            expectedMetadata: openedParent.metadata,
+            context: "quarantine payload parent after verification")
     }
 
-    private static func verifyQuarantineTreeModes(_ directory: URL) throws {
-        let names = try FileManager.default.contentsOfDirectory(
-            atPath: directory.path).sorted()
-        for name in names {
-            let url = directory.appendingPathComponent(name)
-            let metadata = try lstatValue(url)
-            switch metadata.st_mode & S_IFMT {
-            case S_IFDIR:
-                guard metadata.st_mode & mode_t(0o777) == mode_t(0o555) else {
-                    throw LibraryError.packageVerificationFailed(
-                        "quarantine nested directory mode is not 0555")
-                }
-                try verifyQuarantineTreeModes(url)
-            case S_IFREG:
-                guard metadata.st_nlink == 1,
-                      metadata.st_mode & mode_t(0o777) == mode_t(0o444) else {
-                    throw LibraryError.packageVerificationFailed(
-                        "quarantine file is not single-link regular 0444")
-                }
-            default:
+    /// Restores a payload that was exclusively renamed to `.pending` before
+    /// the diagnostic itself entered the payload.  The v3 diagnostic binds the
+    /// directory dev/inode and tree hash; the durable diagnostic is deliberately
+    /// left untouched here so any failure remains recoverable.
+    private static func restoreMovedQuarantinePayload(
+        _ pending: URL,
+        to source: URL,
+        diagnostic: QuarantineDiagnostic,
+        quarantineRoot: URL
+    ) throws {
+        guard let expectedIdentity = diagnostic.payloadIdentity,
+              source.path == diagnostic.sourceURL.path,
+              pending.deletingLastPathComponent().path == quarantineRoot.path
+        else {
+            throw LibraryError.packageVerificationFailed(
+                "quarantine payload rollback path/identity binding invalid")
+        }
+        let sourceParentURL = source.deletingLastPathComponent()
+        let openedSourceParent = try openStableDirectoryNoFollow(
+            sourceParentURL, context: "quarantine rollback source parent")
+        defer { _ = close(openedSourceParent.descriptor) }
+        let openedQuarantineRoot = try openStableDirectoryNoFollow(
+            quarantineRoot, context: "quarantine rollback root")
+        defer { _ = close(openedQuarantineRoot.descriptor) }
+
+        let payloadDescriptor = openat(
+            openedQuarantineRoot.descriptor,
+            pending.lastPathComponent,
+            O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)
+        guard payloadDescriptor >= 0 else {
+            throw LibraryError.packageVerificationFailed(
+                "cannot open moved quarantine payload: "
+                    + String(cString: strerror(errno)))
+        }
+        defer { _ = close(payloadDescriptor) }
+
+        try validateBoundQuarantineRollbackSource(
+            descriptor: payloadDescriptor,
+            expectedIdentity: expectedIdentity,
+            expectedMode: nil,
+            parentDescriptor: openedQuarantineRoot.descriptor,
+            parentURL: quarantineRoot,
+            parentMetadata: openedQuarantineRoot.metadata,
+            basename: pending.lastPathComponent,
+            diagnostic: diagnostic,
+            context: "moved quarantine rollback payload")
+
+        let renameableMode = diagnostic.sourceMode | mode_t(S_IWUSR)
+        guard fchmod(payloadDescriptor, renameableMode) == 0,
+              fsync(payloadDescriptor) == 0 else {
+            throw LibraryError.cannotMakeImmutable(
+                "cannot make moved quarantine payload rollback-safe")
+        }
+        try validateBoundQuarantineRollbackSource(
+            descriptor: payloadDescriptor,
+            expectedIdentity: expectedIdentity,
+            expectedMode: renameableMode,
+            parentDescriptor: openedQuarantineRoot.descriptor,
+            parentURL: quarantineRoot,
+            parentMetadata: openedQuarantineRoot.metadata,
+            basename: pending.lastPathComponent,
+            diagnostic: diagnostic,
+            context: "renameable quarantine rollback payload")
+
+        var sourceMetadata = stat()
+        if fstatat(
+            openedSourceParent.descriptor,
+            source.lastPathComponent,
+            &sourceMetadata,
+            AT_SYMLINK_NOFOLLOW) == 0 || errno != ENOENT {
+            throw LibraryError.packageVerificationFailed(
+                "quarantine rollback source path is no longer absent")
+        }
+        try requireOpenDirectoryPath(
+            descriptor: openedSourceParent.descriptor,
+            url: sourceParentURL,
+            expectedMetadata: openedSourceParent.metadata,
+            context: "quarantine rollback source parent before rename")
+        try requireOpenDirectoryPath(
+            descriptor: openedQuarantineRoot.descriptor,
+            url: quarantineRoot,
+            expectedMetadata: openedQuarantineRoot.metadata,
+            context: "quarantine rollback root before source rename")
+        guard renameatx_np(
+            openedQuarantineRoot.descriptor,
+            pending.lastPathComponent,
+            openedSourceParent.descriptor,
+            source.lastPathComponent,
+            UInt32(RENAME_EXCL)) == 0 else {
+            throw LibraryError.packageVerificationFailed(
+                "cannot restore source package: "
+                    + String(cString: strerror(errno)))
+        }
+
+        var oldPathMetadata = stat()
+        guard fstatat(
+            openedQuarantineRoot.descriptor,
+            pending.lastPathComponent,
+            &oldPathMetadata,
+            AT_SYMLINK_NOFOLLOW) != 0,
+              errno == ENOENT else {
+            throw LibraryError.packageVerificationFailed(
+                "moved quarantine payload remained at the pending path")
+        }
+        guard fchmod(payloadDescriptor, diagnostic.sourceMode) == 0,
+              fsync(payloadDescriptor) == 0,
+              fsync(openedSourceParent.descriptor) == 0,
+              fsync(openedQuarantineRoot.descriptor) == 0 else {
+            throw LibraryError.cannotSync(
+                "cannot durably restore moved quarantine payload")
+        }
+        try validateBoundQuarantineRollbackSource(
+            descriptor: payloadDescriptor,
+            expectedIdentity: expectedIdentity,
+            expectedMode: diagnostic.sourceMode,
+            parentDescriptor: openedSourceParent.descriptor,
+            parentURL: sourceParentURL,
+            parentMetadata: openedSourceParent.metadata,
+            basename: source.lastPathComponent,
+            diagnostic: diagnostic,
+            context: "restored quarantine source")
+        try requireOpenDirectoryPath(
+            descriptor: openedQuarantineRoot.descriptor,
+            url: quarantineRoot,
+            expectedMetadata: openedQuarantineRoot.metadata,
+            context: "quarantine rollback root after source rename")
+    }
+
+    /// Completes a source-only rollback transaction.  Diagnostic removal is a
+    /// two-name protocol: `.diagnostic.tmp` is first exclusively renamed to an
+    /// identity-bound `.diagnostic.removing` tombstone and fsynced.  Only after
+    /// the exact v3 source is rebound and rehashed is that tombstone unlinked.
+    /// If unlink/durability/post-validation detects any conflict, the canonical
+    /// diagnostic bytes are recreated before returning an error.
+    private static func restoreQuarantineSourceAndRemoveIntent(
+        _ rollbackIntent: URL,
+        diagnostic: QuarantineDiagnostic,
+        quarantineRoot: URL,
+        processLock: ProcessLockHandle
+    ) throws {
+        guard let expectedIdentity = diagnostic.payloadIdentity else {
+            throw LibraryError.packageVerificationFailed(
+                "legacy quarantine rollback lacks durable payload identity")
+        }
+        let temporaryBasename =
+            ".\(diagnostic.transactionID).diagnostic.tmp"
+        let removalBasename =
+            ".\(diagnostic.transactionID)\(quarantineDiagnosticRemovalSuffix)"
+        guard rollbackIntent.deletingLastPathComponent().path
+                == quarantineRoot.path,
+              rollbackIntent.lastPathComponent == temporaryBasename
+                || rollbackIntent.lastPathComponent == removalBasename else {
+            throw LibraryError.packageVerificationFailed(
+                "quarantine rollback intent path binding invalid")
+        }
+
+        let sourceParentURL = diagnostic.sourceURL.deletingLastPathComponent()
+        let openedSourceParent = try openStableDirectoryNoFollow(
+            sourceParentURL, context: "quarantine rollback source parent")
+        defer { _ = close(openedSourceParent.descriptor) }
+        let sourceDescriptor = openat(
+            openedSourceParent.descriptor,
+            diagnostic.sourceURL.lastPathComponent,
+            O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)
+        guard sourceDescriptor >= 0 else {
+            throw LibraryError.packageVerificationFailed(
+                "cannot open quarantine rollback source: "
+                    + String(cString: strerror(errno)))
+        }
+        defer { _ = close(sourceDescriptor) }
+
+        try validateBoundQuarantineRollbackSource(
+            descriptor: sourceDescriptor,
+            expectedIdentity: expectedIdentity,
+            expectedMode: nil,
+            parentDescriptor: openedSourceParent.descriptor,
+            parentURL: sourceParentURL,
+            parentMetadata: openedSourceParent.metadata,
+            basename: diagnostic.sourceURL.lastPathComponent,
+            diagnostic: diagnostic,
+            context: "quarantine rollback source before mode restore")
+        guard fchmod(sourceDescriptor, diagnostic.sourceMode) == 0,
+              fsync(sourceDescriptor) == 0 else {
+            throw LibraryError.cannotMakeImmutable(
+                "cannot restore quarantine source mode")
+        }
+        try validateBoundQuarantineRollbackSource(
+            descriptor: sourceDescriptor,
+            expectedIdentity: expectedIdentity,
+            expectedMode: diagnostic.sourceMode,
+            parentDescriptor: openedSourceParent.descriptor,
+            parentURL: sourceParentURL,
+            parentMetadata: openedSourceParent.metadata,
+            basename: diagnostic.sourceURL.lastPathComponent,
+            diagnostic: diagnostic,
+            context: "quarantine rollback source after mode restore")
+
+        let openedQuarantineRoot = try openStableDirectoryNoFollow(
+            quarantineRoot, context: "quarantine rollback root")
+        defer { _ = close(openedQuarantineRoot.descriptor) }
+        try quarantineFaultInjector?(
+            .afterRollbackSourceModeRestoreBeforeIntentRemoval)
+        // Rebind immediately after the externally visible fault/race window.
+        // A replacement here must leave the original `.diagnostic.tmp` name
+        // untouched; the removal tombstone is published only for an exact,
+        // still-path-bound source.
+        try validateBoundQuarantineRollbackSource(
+            descriptor: sourceDescriptor,
+            expectedIdentity: expectedIdentity,
+            expectedMode: diagnostic.sourceMode,
+            parentDescriptor: openedSourceParent.descriptor,
+            parentURL: sourceParentURL,
+            parentMetadata: openedSourceParent.metadata,
+            basename: diagnostic.sourceURL.lastPathComponent,
+            diagnostic: diagnostic,
+            context: "quarantine rollback source after final race window")
+
+        var conflictingMetadata = stat()
+        let conflictingBasename = rollbackIntent.lastPathComponent
+            == temporaryBasename ? removalBasename : temporaryBasename
+        if fstatat(
+            openedQuarantineRoot.descriptor,
+            conflictingBasename,
+            &conflictingMetadata,
+            AT_SYMLINK_NOFOLLOW) == 0 || errno != ENOENT {
+            throw LibraryError.packageVerificationFailed(
+                "quarantine rollback has conflicting diagnostic intents")
+        }
+
+        let openedIntent = try openBoundQuarantineDiagnosticIntent(
+            parentDescriptor: openedQuarantineRoot.descriptor,
+            basename: rollbackIntent.lastPathComponent,
+            expectedData: diagnostic.canonicalData)
+        defer { _ = close(openedIntent.descriptor) }
+
+        if rollbackIntent.lastPathComponent == temporaryBasename {
+            guard renameatx_np(
+                openedQuarantineRoot.descriptor,
+                temporaryBasename,
+                openedQuarantineRoot.descriptor,
+                removalBasename,
+                UInt32(RENAME_EXCL)) == 0 else {
                 throw LibraryError.packageVerificationFailed(
-                    "quarantine tree contains a link or special file")
+                    "cannot publish quarantine diagnostic removal tombstone: "
+                        + String(cString: strerror(errno)))
             }
+            guard fsync(openedQuarantineRoot.descriptor) == 0 else {
+                throw LibraryError.cannotSync(
+                    "quarantine diagnostic removal tombstone")
+            }
+            var temporaryMetadata = stat()
+            guard fstatat(
+                openedQuarantineRoot.descriptor,
+                temporaryBasename,
+                &temporaryMetadata,
+                AT_SYMLINK_NOFOLLOW) != 0,
+                  errno == ENOENT else {
+                throw LibraryError.packageVerificationFailed(
+                    "quarantine diagnostic temporary remained after tombstone rename")
+            }
+        }
+        try requireBoundQuarantineDiagnosticIntent(
+            descriptor: openedIntent.descriptor,
+            parentDescriptor: openedQuarantineRoot.descriptor,
+            basename: removalBasename,
+            expectedDataSize: diagnostic.canonicalData.count)
+        try validateBoundQuarantineRollbackSource(
+            descriptor: sourceDescriptor,
+            expectedIdentity: expectedIdentity,
+            expectedMode: diagnostic.sourceMode,
+            parentDescriptor: openedSourceParent.descriptor,
+            parentURL: sourceParentURL,
+            parentMetadata: openedSourceParent.metadata,
+            basename: diagnostic.sourceURL.lastPathComponent,
+            diagnostic: diagnostic,
+            context: "quarantine rollback source before intent removal")
+        try requireOpenDirectoryPath(
+            descriptor: openedQuarantineRoot.descriptor,
+            url: quarantineRoot,
+            expectedMetadata: openedQuarantineRoot.metadata,
+            context: "quarantine rollback root before intent removal")
+        try validateProcessLock(processLock)
+        guard fsync(openedSourceParent.descriptor) == 0 else {
+            throw LibraryError.cannotSync(
+                "quarantine rollback source parent before intent removal")
+        }
+
+        do {
+            // `unlinkat` itself has no inode-CAS variant.  Keep the verified
+            // tombstone FD open across removal, prove that exact inode reached
+            // nlink=0, and recreate canonical evidence on every mismatch.
+            guard unlinkat(
+                openedQuarantineRoot.descriptor,
+                removalBasename,
+                0) == 0 else {
+                throw LibraryError.packageVerificationFailed(
+                    "cannot remove quarantine diagnostic tombstone: "
+                        + String(cString: strerror(errno)))
+            }
+            var removedMetadata = stat()
+            var removedPathMetadata = stat()
+            guard fstat(openedIntent.descriptor, &removedMetadata) == 0,
+                  sameRegularFileInode(
+                    openedIntent.metadata, removedMetadata),
+                  removedMetadata.st_nlink == 0,
+                  fstatat(
+                    openedQuarantineRoot.descriptor,
+                    removalBasename,
+                    &removedPathMetadata,
+                    AT_SYMLINK_NOFOLLOW) != 0,
+                  errno == ENOENT,
+                  fsync(openedQuarantineRoot.descriptor) == 0 else {
+                throw LibraryError.packageVerificationFailed(
+                    "quarantine diagnostic tombstone removal was not identity-stable")
+            }
+            try validateBoundQuarantineRollbackSource(
+                descriptor: sourceDescriptor,
+                expectedIdentity: expectedIdentity,
+                expectedMode: diagnostic.sourceMode,
+                parentDescriptor: openedSourceParent.descriptor,
+                parentURL: sourceParentURL,
+                parentMetadata: openedSourceParent.metadata,
+                basename: diagnostic.sourceURL.lastPathComponent,
+                diagnostic: diagnostic,
+                context: "quarantine rollback source after intent removal")
+            try requireOpenDirectoryPath(
+                descriptor: openedQuarantineRoot.descriptor,
+                url: quarantineRoot,
+                expectedMetadata: openedQuarantineRoot.metadata,
+                context: "quarantine rollback root after intent removal")
+            try validateProcessLock(processLock)
+        } catch {
+            do {
+                try restoreRemovedQuarantineDiagnostic(
+                    diagnostic,
+                    quarantineRootDescriptor: openedQuarantineRoot.descriptor,
+                    temporaryBasename: temporaryBasename,
+                    removalBasename: removalBasename)
+            } catch let restorationError {
+                throw LibraryError.packageVerificationFailed(
+                    "\(error.localizedDescription); cannot restore durable "
+                        + "quarantine diagnostic: "
+                        + restorationError.localizedDescription)
+            }
+            throw error
+        }
+    }
+
+    private static func validateBoundQuarantineRollbackSource(
+        descriptor: Int32,
+        expectedIdentity: ImmutableDirectoryPublication.Identity,
+        expectedMode: mode_t?,
+        parentDescriptor: Int32,
+        parentURL: URL,
+        parentMetadata: stat,
+        basename: String,
+        diagnostic: QuarantineDiagnostic,
+        context: String
+    ) throws {
+        var parentDescriptorMetadata = stat()
+        var parentPathMetadata = stat()
+        var openedMetadata = stat()
+        var pathMetadata = stat()
+        guard fstat(parentDescriptor, &parentDescriptorMetadata) == 0,
+              lstat(parentURL.path, &parentPathMetadata) == 0,
+              sameDirectoryIdentity(parentMetadata, parentDescriptorMetadata),
+              sameDirectoryIdentity(parentMetadata, parentPathMetadata),
+              fstat(descriptor, &openedMetadata) == 0,
+              fstatat(
+                parentDescriptor,
+                basename,
+                &pathMetadata,
+                AT_SYMLINK_NOFOLLOW) == 0,
+              sameDirectoryIdentity(openedMetadata, pathMetadata),
+              ImmutableDirectoryPublication.Identity(
+                device: UInt64(openedMetadata.st_dev),
+                inode: UInt64(openedMetadata.st_ino)) == expectedIdentity else {
+            throw LibraryError.packageVerificationFailed(
+                "\(context) dev/inode/path binding changed")
+        }
+        if let expectedMode,
+           openedMetadata.st_mode & mode_t(0o777) != expectedMode
+            || pathMetadata.st_mode & mode_t(0o777) != expectedMode {
+            throw LibraryError.packageVerificationFailed(
+                "\(context) root mode changed")
+        }
+        let payloadSHA = try quarantinePayloadTreeSHA256(
+            atBoundDirectoryDescriptor: descriptor,
+            diagnosticIsEmbedded: false,
+            requiredRootMode: expectedMode)
+        guard payloadSHA == diagnostic.payloadTreeSHA256 else {
+            throw LibraryError.packageVerificationFailed(
+                "\(context) payload hash mismatch")
+        }
+        var openedAfter = stat()
+        var pathAfter = stat()
+        guard fstat(descriptor, &openedAfter) == 0,
+              fstatat(
+                parentDescriptor,
+                basename,
+                &pathAfter,
+                AT_SYMLINK_NOFOLLOW) == 0,
+              sameDirectoryIdentity(openedMetadata, openedAfter),
+              sameDirectoryIdentity(openedMetadata, pathAfter),
+              ImmutableDirectoryPublication.Identity(
+                device: UInt64(openedAfter.st_dev),
+                inode: UInt64(openedAfter.st_ino)) == expectedIdentity else {
+            throw LibraryError.packageVerificationFailed(
+                "\(context) changed during payload verification")
+        }
+        if let expectedMode,
+           openedAfter.st_mode & mode_t(0o777) != expectedMode
+            || pathAfter.st_mode & mode_t(0o777) != expectedMode {
+            throw LibraryError.packageVerificationFailed(
+                "\(context) root mode changed during payload verification")
+        }
+    }
+
+    private static func openBoundQuarantineDiagnosticIntent(
+        parentDescriptor: Int32,
+        basename: String,
+        expectedData: Data
+    ) throws -> (descriptor: Int32, metadata: stat) {
+        let descriptor = openat(
+            parentDescriptor,
+            basename,
+            O_RDONLY | O_CLOEXEC | O_NOFOLLOW)
+        guard descriptor >= 0 else {
+            throw LibraryError.packageVerificationFailed(
+                "cannot open quarantine diagnostic intent: "
+                    + String(cString: strerror(errno)))
+        }
+        do {
+            var metadata = stat()
+            var pathMetadata = stat()
+            guard fstat(descriptor, &metadata) == 0,
+                  (metadata.st_mode & S_IFMT) == S_IFREG,
+                  metadata.st_nlink == 1,
+                  metadata.st_mode & mode_t(0o777) == mode_t(0o444),
+                  metadata.st_size == expectedData.count,
+                  fstatat(
+                    parentDescriptor,
+                    basename,
+                    &pathMetadata,
+                    AT_SYMLINK_NOFOLLOW) == 0,
+                  sameStableFileIdentity(metadata, pathMetadata) else {
+                throw LibraryError.packageVerificationFailed(
+                    "quarantine diagnostic intent identity/mode invalid")
+            }
+            var data = Data()
+            data.reserveCapacity(expectedData.count)
+            var buffer = [UInt8](repeating: 0, count: 16 * 1024)
+            while data.count <= maximumQuarantineDiagnosticBytes {
+                let count = Darwin.read(descriptor, &buffer, buffer.count)
+                if count < 0 && errno == EINTR { continue }
+                guard count >= 0 else {
+                    throw LibraryError.packageVerificationFailed(
+                        "cannot read quarantine diagnostic intent")
+                }
+                if count == 0 { break }
+                data.append(buffer, count: count)
+            }
+            var after = stat()
+            var pathAfter = stat()
+            guard data == expectedData,
+                  fstat(descriptor, &after) == 0,
+                  fstatat(
+                    parentDescriptor,
+                    basename,
+                    &pathAfter,
+                    AT_SYMLINK_NOFOLLOW) == 0,
+                  sameStableFileIdentity(metadata, after),
+                  sameStableFileIdentity(metadata, pathAfter) else {
+                throw LibraryError.packageVerificationFailed(
+                    "quarantine diagnostic intent changed during read")
+            }
+            return (descriptor, metadata)
+        } catch {
+            _ = close(descriptor)
+            throw error
+        }
+    }
+
+    private static func requireBoundQuarantineDiagnosticIntent(
+        descriptor: Int32,
+        parentDescriptor: Int32,
+        basename: String,
+        expectedDataSize: Int
+    ) throws {
+        var openedMetadata = stat()
+        var pathMetadata = stat()
+        guard fstat(descriptor, &openedMetadata) == 0,
+              fstatat(
+                parentDescriptor,
+                basename,
+                &pathMetadata,
+                AT_SYMLINK_NOFOLLOW) == 0,
+              sameRegularFileInode(openedMetadata, pathMetadata),
+              openedMetadata.st_nlink == 1,
+              pathMetadata.st_nlink == 1,
+              openedMetadata.st_mode & mode_t(0o777) == mode_t(0o444),
+              pathMetadata.st_mode & mode_t(0o777) == mode_t(0o444),
+              openedMetadata.st_size == expectedDataSize,
+              pathMetadata.st_size == expectedDataSize else {
+            throw LibraryError.packageVerificationFailed(
+                "quarantine diagnostic tombstone path binding changed")
+        }
+    }
+
+    private static func restoreRemovedQuarantineDiagnostic(
+        _ diagnostic: QuarantineDiagnostic,
+        quarantineRootDescriptor: Int32,
+        temporaryBasename: String,
+        removalBasename: String
+    ) throws {
+        for basename in [removalBasename, temporaryBasename] {
+            var metadata = stat()
+            if fstatat(
+                quarantineRootDescriptor,
+                basename,
+                &metadata,
+                AT_SYMLINK_NOFOLLOW) == 0 {
+                do {
+                    let opened = try openBoundQuarantineDiagnosticIntent(
+                        parentDescriptor: quarantineRootDescriptor,
+                        basename: basename,
+                        expectedData: diagnostic.canonicalData)
+                    _ = close(opened.descriptor)
+                    guard fsync(quarantineRootDescriptor) == 0 else {
+                        throw LibraryError.cannotSync(
+                            "existing restored quarantine diagnostic")
+                    }
+                    return
+                } catch {
+                    if basename == temporaryBasename { throw error }
+                    // Preserve a conflicting removal name and continue.  A
+                    // canonical temporary can coexist with it fail-closed;
+                    // recovery will reject the two-name conflict while still
+                    // retaining the authoritative v3 evidence.
+                }
+                continue
+            }
+            guard errno == ENOENT else {
+                throw LibraryError.packageVerificationFailed(
+                    "cannot inspect quarantine diagnostic restoration path")
+            }
+        }
+        try writeNewRegularFileDurably(
+            diagnostic.canonicalData,
+            parentDescriptor: quarantineRootDescriptor,
+            basename: temporaryBasename)
+        guard fsync(quarantineRootDescriptor) == 0 else {
+            throw LibraryError.cannotSync(
+                "restored quarantine diagnostic parent")
+        }
+    }
+
+    private static func publishPreparedQuarantine(
+        _ pending: URL,
+        to destination: URL,
+        diagnostic: QuarantineDiagnostic,
+        injectFaults: Bool,
+        processLock: ProcessLockHandle
+    ) throws {
+        guard let expectedIdentity = diagnostic.payloadIdentity else {
+            throw LibraryError.packageVerificationFailed(
+                "legacy quarantine diagnostic cannot authorize publication")
+        }
+        try validateProcessLock(processLock)
+        do {
+            try ImmutableDirectoryPublication.publish(
+                source: pending,
+                destination: destination,
+                expectedIdentity: expectedIdentity,
+                afterRenameBeforeFreeze: injectFaults ? {
+                    try quarantineFaultInjector?(
+                        .afterPublishRenameBeforeFreeze)
+                } : nil,
+                afterFreezeBeforeParentSync: injectFaults ? {
+                    try quarantineFaultInjector?(
+                        .afterPublishFreezeBeforeParentSync)
+                } : nil)
+            try validateProcessLock(processLock)
+        } catch let error as LibraryError {
+            throw error
+        } catch {
+            throw LibraryError.packageVerificationFailed(
+                "quarantine publish transaction failed: "
+                    + error.localizedDescription)
+        }
+    }
+
+    private static func recoverInterruptedPublishedQuarantineIfNeeded(
+        _ published: URL,
+        diagnostic: QuarantineDiagnostic
+    ) throws {
+        let metadata = try lstatValue(published)
+        let mode = metadata.st_mode & mode_t(0o777)
+        guard mode == ImmutableDirectoryPublication.renameableMode
+                || mode == ImmutableDirectoryPublication.immutableMode else {
+            throw LibraryError.packageVerificationFailed(
+                "published quarantine root mode is neither 0755 nor 0555")
+        }
+        if mode == ImmutableDirectoryPublication.immutableMode {
+            if let expectedIdentity = diagnostic.payloadIdentity {
+                do {
+                    try ImmutableDirectoryPublication
+                        .freezeInterruptedDestination(
+                            published, expectedIdentity: expectedIdentity)
+                } catch {
+                    throw LibraryError.packageVerificationFailed(
+                        "cannot resync interrupted quarantine publication: "
+                            + error.localizedDescription)
+                }
+            }
+            return
+        }
+
+        // A writable final is recoverable only because the durable embedded
+        // diagnostic binds the transaction, path, payload tree and (for v3)
+        // the source dev/inode.  No diagnostic means no permission repair.
+        try verifyPreparedQuarantine(published, diagnostic: diagnostic)
+        guard let expectedIdentity = diagnostic.payloadIdentity else {
+            throw LibraryError.packageVerificationFailed(
+                "writable published quarantine lacks durable payload identity")
+        }
+        do {
+            try ImmutableDirectoryPublication.freezeInterruptedDestination(
+                published, expectedIdentity: expectedIdentity)
+        } catch {
+            throw LibraryError.packageVerificationFailed(
+                "cannot recover interrupted quarantine publication: "
+                    + error.localizedDescription)
         }
     }
 
@@ -1411,14 +2381,56 @@ enum MobileMapLibrary {
         at directory: URL,
         diagnosticIsEmbedded: Bool
     ) throws -> String {
+        let opened = try openStableDirectoryNoFollow(
+            directory, context: "quarantine payload root")
+        defer { _ = close(opened.descriptor) }
+        let digest = try quarantinePayloadTreeSHA256(
+            atBoundDirectoryDescriptor: opened.descriptor,
+            diagnosticIsEmbedded: diagnosticIsEmbedded)
+        var openedAfter = stat()
+        var pathAfter = stat()
+        guard fstat(opened.descriptor, &openedAfter) == 0,
+              lstat(directory.path, &pathAfter) == 0,
+              sameStableFileIdentity(opened.metadata, openedAfter),
+              sameStableFileIdentity(opened.metadata, pathAfter) else {
+            throw LibraryError.packageVerificationFailed(
+                "quarantine payload root changed during inventory")
+        }
+        return digest
+    }
+
+    private static func quarantinePayloadTreeSHA256(
+        atBoundDirectoryDescriptor descriptor: Int32,
+        diagnosticIsEmbedded: Bool,
+        requiredRootMode: mode_t? = nil,
+        requireImmutableDescendantModes: Bool = false
+    ) throws -> String {
+        var before = stat()
+        guard fstat(descriptor, &before) == 0,
+              (before.st_mode & S_IFMT) == S_IFDIR else {
+            throw LibraryError.packageVerificationFailed(
+                "quarantine payload descriptor is not a directory")
+        }
+        if let requiredRootMode,
+           before.st_mode & mode_t(0o777) != requiredRootMode {
+            throw LibraryError.packageVerificationFailed(
+                "quarantine payload root mode changed before inventory")
+        }
         var records: [[String: Any]] = []
         var totalBytes: Int64 = 0
         try appendQuarantinePayloadInventory(
-            directory: directory,
+            directoryDescriptor: descriptor,
             relativePath: "",
             diagnosticIsEmbedded: diagnosticIsEmbedded,
+            requireImmutableModes: requireImmutableDescendantModes,
             records: &records,
             totalBytes: &totalBytes)
+        var after = stat()
+        guard fstat(descriptor, &after) == 0,
+              sameStableFileIdentity(before, after) else {
+            throw LibraryError.packageVerificationFailed(
+                "quarantine payload directory changed during inventory")
+        }
         let data = try CanonicalJSONEncoder.encode(records)
         return SHA256.hash(data: data).map {
             String(format: "%02x", $0)
@@ -1426,19 +2438,22 @@ enum MobileMapLibrary {
     }
 
     private static func appendQuarantinePayloadInventory(
-        directory: URL,
+        directoryDescriptor: Int32,
         relativePath: String,
         diagnosticIsEmbedded: Bool,
+        requireImmutableModes: Bool,
         records: inout [[String: Any]],
         totalBytes: inout Int64
     ) throws {
-        let before = try lstatValue(directory)
-        guard (before.st_mode & S_IFMT) == S_IFDIR else {
+        var before = stat()
+        guard fstat(directoryDescriptor, &before) == 0,
+              (before.st_mode & S_IFMT) == S_IFDIR else {
             throw LibraryError.packageVerificationFailed(
                 "quarantine payload contains a non-directory component")
         }
-        let names = try FileManager.default.contentsOfDirectory(
-            atPath: directory.path).sorted()
+        let names = try directoryEntryNames(
+            atBoundDirectoryDescriptor: directoryDescriptor,
+            maximumEntries: maximumQuarantinePayloadEntries + 1)
         for name in names {
             if relativePath.isEmpty, name == quarantineDiagnosticFileName {
                 guard diagnosticIsEmbedded else {
@@ -1452,19 +2467,65 @@ enum MobileMapLibrary {
                     "quarantine payload entry limit exceeded")
             }
             let relative = relativePath.isEmpty ? name : "\(relativePath)/\(name)"
-            let url = directory.appendingPathComponent(name)
-            let metadata = try lstatValue(url)
+            var metadata = stat()
+            guard fstatat(
+                directoryDescriptor,
+                name,
+                &metadata,
+                AT_SYMLINK_NOFOLLOW) == 0 else {
+                throw LibraryError.packageVerificationFailed(
+                    "cannot inspect quarantine payload entry: "
+                        + String(cString: strerror(errno)))
+            }
             switch metadata.st_mode & S_IFMT {
             case S_IFDIR:
+                if requireImmutableModes,
+                   metadata.st_mode & mode_t(0o777) != mode_t(0o555) {
+                    throw LibraryError.packageVerificationFailed(
+                        "quarantine nested directory mode is not 0555")
+                }
+                let childDescriptor = openat(
+                    directoryDescriptor,
+                    name,
+                    O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)
+                guard childDescriptor >= 0 else {
+                    throw LibraryError.packageVerificationFailed(
+                        "cannot open quarantine payload directory without following links")
+                }
                 records.append(["path": relative, "type": "directory"])
-                try appendQuarantinePayloadInventory(
-                    directory: url,
-                    relativePath: relative,
-                    diagnosticIsEmbedded: diagnosticIsEmbedded,
-                    records: &records,
-                    totalBytes: &totalBytes)
+                do {
+                    defer { _ = close(childDescriptor) }
+                    var opened = stat()
+                    guard fstat(childDescriptor, &opened) == 0,
+                          sameStableFileIdentity(metadata, opened) else {
+                        throw LibraryError.packageVerificationFailed(
+                            "quarantine payload directory identity changed before inventory")
+                    }
+                    try appendQuarantinePayloadInventory(
+                        directoryDescriptor: childDescriptor,
+                        relativePath: relative,
+                        diagnosticIsEmbedded: diagnosticIsEmbedded,
+                        requireImmutableModes: requireImmutableModes,
+                        records: &records,
+                        totalBytes: &totalBytes)
+                    var openedAfter = stat()
+                    var pathAfter = stat()
+                    guard fstat(childDescriptor, &openedAfter) == 0,
+                          fstatat(
+                            directoryDescriptor,
+                            name,
+                            &pathAfter,
+                            AT_SYMLINK_NOFOLLOW) == 0,
+                          sameStableFileIdentity(opened, openedAfter),
+                          sameStableFileIdentity(opened, pathAfter) else {
+                        throw LibraryError.packageVerificationFailed(
+                            "quarantine payload directory changed during inventory")
+                    }
+                }
             case S_IFREG:
                 guard metadata.st_nlink == 1,
+                      !requireImmutableModes
+                        || metadata.st_mode & mode_t(0o777) == mode_t(0o444),
                       metadata.st_size >= 0,
                       metadata.st_size <= maximumQuarantinePayloadFileBytes,
                       totalBytes <= maximumQuarantinePayloadTotalBytes
@@ -1473,7 +2534,9 @@ enum MobileMapLibrary {
                         "quarantine payload file/link/size limit invalid")
                 }
                 let digest = try sha256StableRegularFileNoFollow(
-                    url, expected: metadata)
+                    parentDescriptor: directoryDescriptor,
+                    basename: name,
+                    expected: metadata)
                 totalBytes += metadata.st_size
                 records.append([
                     "path": relative,
@@ -1486,18 +2549,71 @@ enum MobileMapLibrary {
                     "quarantine payload contains a symlink or special file")
             }
         }
-        let after = try lstatValue(directory)
-        guard sameStableFileIdentity(before, after) else {
+        var after = stat()
+        guard fstat(directoryDescriptor, &after) == 0,
+              sameStableFileIdentity(before, after) else {
             throw LibraryError.packageVerificationFailed(
                 "quarantine payload directory changed during inventory")
         }
     }
 
+    private static func directoryEntryNames(
+        atBoundDirectoryDescriptor descriptor: Int32,
+        maximumEntries: Int
+    ) throws -> [String] {
+        let enumerationDescriptor = openat(
+            descriptor, ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)
+        guard enumerationDescriptor >= 0 else {
+            throw LibraryError.packageVerificationFailed(
+                "cannot duplicate quarantine payload directory for inventory")
+        }
+        guard let stream = fdopendir(enumerationDescriptor) else {
+            _ = close(enumerationDescriptor)
+            throw LibraryError.packageVerificationFailed(
+                "cannot enumerate quarantine payload directory")
+        }
+        defer { _ = closedir(stream) }
+        var names: [String] = []
+        while true {
+            errno = 0
+            guard let entry = readdir(stream) else {
+                guard errno == 0 else {
+                    throw LibraryError.packageVerificationFailed(
+                        "cannot finish quarantine payload enumeration")
+                }
+                break
+            }
+            guard let name = withUnsafePointer(to: entry.pointee.d_name, {
+                pointer -> String? in
+                pointer.withMemoryRebound(
+                    to: CChar.self,
+                    capacity: Int(MAXNAMLEN) + 1
+                ) { String(validatingUTF8: $0) }
+            }) else {
+                throw LibraryError.packageVerificationFailed(
+                    "quarantine payload entry name is not valid UTF-8")
+            }
+            if name == "." || name == ".." { continue }
+            guard !name.isEmpty, !name.contains("/") else {
+                throw LibraryError.packageVerificationFailed(
+                    "quarantine payload entry has an unsafe name")
+            }
+            guard names.count < maximumEntries else {
+                throw LibraryError.packageVerificationFailed(
+                    "quarantine payload entry limit exceeded during enumeration")
+            }
+            names.append(name)
+        }
+        return names.sorted()
+    }
+
     private static func sha256StableRegularFileNoFollow(
-        _ url: URL,
+        parentDescriptor: Int32,
+        basename: String,
         expected: stat
     ) throws -> String {
-        let descriptor = open(url.path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW)
+        let descriptor = openat(
+            parentDescriptor, basename, O_RDONLY | O_CLOEXEC | O_NOFOLLOW)
         guard descriptor >= 0 else {
             throw LibraryError.packageVerificationFailed(
                 "cannot open quarantine payload file without following links")
@@ -1526,7 +2642,11 @@ enum MobileMapLibrary {
         var after = stat()
         var pathAfter = stat()
         guard fstat(descriptor, &after) == 0,
-              lstat(url.path, &pathAfter) == 0,
+              fstatat(
+                parentDescriptor,
+                basename,
+                &pathAfter,
+                AT_SYMLINK_NOFOLLOW) == 0,
               sameStableFileIdentity(opened, after),
               sameStableFileIdentity(opened, pathAfter) else {
             throw LibraryError.packageVerificationFailed(
@@ -1606,6 +2726,13 @@ enum MobileMapLibrary {
             && lhs.st_ctimespec.tv_nsec == rhs.st_ctimespec.tv_nsec
     }
 
+    private static func sameRegularFileInode(_ lhs: stat, _ rhs: stat) -> Bool {
+        return (lhs.st_mode & S_IFMT) == S_IFREG
+            && (rhs.st_mode & S_IFMT) == S_IFREG
+            && lhs.st_dev == rhs.st_dev
+            && lhs.st_ino == rhs.st_ino
+    }
+
     private static func lstatValue(_ url: URL) throws -> stat {
         var metadata = stat()
         guard lstat(url.path, &metadata) == 0 else {
@@ -1613,6 +2740,90 @@ enum MobileMapLibrary {
                 "cannot lstat \(url.path): " + String(cString: strerror(errno)))
         }
         return metadata
+    }
+
+    private static func sameDirectoryIdentity(_ lhs: stat, _ rhs: stat) -> Bool {
+        return (lhs.st_mode & S_IFMT) == S_IFDIR
+            && (rhs.st_mode & S_IFMT) == S_IFDIR
+            && lhs.st_dev == rhs.st_dev
+            && lhs.st_ino == rhs.st_ino
+    }
+
+    private static func openStableDirectoryNoFollow(
+        _ url: URL,
+        context: String
+    ) throws -> (descriptor: Int32, metadata: stat) {
+        let pathMetadata = try lstatValue(url)
+        guard (pathMetadata.st_mode & S_IFMT) == S_IFDIR else {
+            throw LibraryError.packageVerificationFailed(
+                "\(context) is not a real directory")
+        }
+        let descriptor = open(
+            url.path, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)
+        guard descriptor >= 0 else {
+            throw LibraryError.packageVerificationFailed(
+                "cannot open \(context): " + String(cString: strerror(errno)))
+        }
+        var openedMetadata = stat()
+        guard fstat(descriptor, &openedMetadata) == 0,
+              sameStableFileIdentity(pathMetadata, openedMetadata) else {
+            _ = close(descriptor)
+            throw LibraryError.packageVerificationFailed(
+                "\(context) changed while opening")
+        }
+        return (descriptor, openedMetadata)
+    }
+
+    private static func requireBoundDirectoryPath(
+        descriptor: Int32,
+        expectedIdentity: ImmutableDirectoryPublication.Identity,
+        expectedMode: mode_t,
+        parentDescriptor: Int32,
+        parentURL: URL,
+        parentMetadata: stat,
+        basename: String,
+        context: String
+    ) throws {
+        var parentDescriptorMetadata = stat()
+        var parentPathMetadata = stat()
+        var openedMetadata = stat()
+        var pathMetadata = stat()
+        guard fstat(parentDescriptor, &parentDescriptorMetadata) == 0,
+              lstat(parentURL.path, &parentPathMetadata) == 0,
+              sameDirectoryIdentity(parentMetadata, parentDescriptorMetadata),
+              sameDirectoryIdentity(parentMetadata, parentPathMetadata),
+              fstat(descriptor, &openedMetadata) == 0,
+              fstatat(
+                parentDescriptor,
+                basename,
+                &pathMetadata,
+                AT_SYMLINK_NOFOLLOW) == 0,
+              sameDirectoryIdentity(openedMetadata, pathMetadata),
+              ImmutableDirectoryPublication.Identity(
+                device: UInt64(openedMetadata.st_dev),
+                inode: UInt64(openedMetadata.st_ino)) == expectedIdentity,
+              openedMetadata.st_mode & mode_t(0o777) == expectedMode,
+              pathMetadata.st_mode & mode_t(0o777) == expectedMode else {
+            throw LibraryError.packageVerificationFailed(
+                "\(context) dev/inode/path/mode binding changed")
+        }
+    }
+
+    private static func requireOpenDirectoryPath(
+        descriptor: Int32,
+        url: URL,
+        expectedMetadata: stat,
+        context: String
+    ) throws {
+        var descriptorMetadata = stat()
+        var pathMetadata = stat()
+        guard fstat(descriptor, &descriptorMetadata) == 0,
+              lstat(url.path, &pathMetadata) == 0,
+              sameDirectoryIdentity(expectedMetadata, descriptorMetadata),
+              sameDirectoryIdentity(expectedMetadata, pathMetadata) else {
+            throw LibraryError.packageVerificationFailed(
+                "\(context) dev/inode/path binding changed")
+        }
     }
 
     private static func requireRealDirectory(
@@ -1776,6 +2987,71 @@ enum MobileMapLibrary {
         }
         guard close(descriptor) == 0 else {
             throw LibraryError.cannotSync(url.path)
+        }
+        needsClose = false
+    }
+
+    /// FD-relative variant used only when a removed rollback intent must be
+    /// recreated inside the already-bound quarantine root.  It never follows
+    /// or replaces a pathname and leaves any partial file fail-closed if the
+    /// underlying storage reports a write/durability failure.
+    private static func writeNewRegularFileDurably(
+        _ data: Data,
+        parentDescriptor: Int32,
+        basename: String
+    ) throws {
+        let descriptor = openat(
+            parentDescriptor,
+            basename,
+            O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
+            mode_t(0o600))
+        guard descriptor >= 0 else {
+            throw LibraryError.packageVerificationFailed(
+                "cannot recreate quarantine diagnostic: "
+                    + String(cString: strerror(errno)))
+        }
+        var needsClose = true
+        defer {
+            if needsClose { _ = close(descriptor) }
+        }
+        var offset = 0
+        let completed = data.withUnsafeBytes { rawBuffer -> Bool in
+            guard let base = rawBuffer.baseAddress else { return data.isEmpty }
+            while offset < rawBuffer.count {
+                let count = Darwin.write(
+                    descriptor,
+                    base.advanced(by: offset),
+                    rawBuffer.count - offset)
+                if count < 0 && errno == EINTR { continue }
+                if count <= 0 { return false }
+                offset += count
+            }
+            return true
+        }
+        guard completed,
+              fchmod(descriptor, mode_t(0o444)) == 0,
+              fsync(descriptor) == 0 else {
+            throw LibraryError.packageVerificationFailed(
+                "cannot durably recreate quarantine diagnostic")
+        }
+        var openedMetadata = stat()
+        var pathMetadata = stat()
+        guard fstat(descriptor, &openedMetadata) == 0,
+              fstatat(
+                parentDescriptor,
+                basename,
+                &pathMetadata,
+                AT_SYMLINK_NOFOLLOW) == 0,
+              sameRegularFileInode(openedMetadata, pathMetadata),
+              openedMetadata.st_nlink == 1,
+              openedMetadata.st_mode & mode_t(0o777) == mode_t(0o444),
+              openedMetadata.st_size == data.count else {
+            throw LibraryError.packageVerificationFailed(
+                "recreated quarantine diagnostic path binding invalid")
+        }
+        guard close(descriptor) == 0 else {
+            throw LibraryError.cannotSync(
+                "recreated quarantine diagnostic close")
         }
         needsClose = false
     }

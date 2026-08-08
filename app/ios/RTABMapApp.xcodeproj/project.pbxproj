@@ -60,6 +60,7 @@
 		4EA700012F60002200100001 /* TagObservationResolver.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60002200100002 /* TagObservationResolver.swift */; };
 		4EA700012F60002100100001 /* ShelfAssociationEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60002100100002 /* ShelfAssociationEngine.swift */; };
 		4EA700012F60002000100001 /* SessionSnapshotTransaction.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60002000100002 /* SessionSnapshotTransaction.swift */; };
+		4EA700012F60002000A00001 /* ImmutableDirectoryPublication.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60002000A00002 /* ImmutableDirectoryPublication.swift */; };
 		4EA700012F60003000100001 /* AbsolutePriorEvidenceParser.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60003000100002 /* AbsolutePriorEvidenceParser.swift */; };
 		4EA700012F60003100100001 /* StrictClockEvidenceParser.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60003100100002 /* StrictClockEvidenceParser.swift */; };
 		4EA700012F60001F00100001 /* SE2Transform.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60001F00100002 /* SE2Transform.swift */; };
@@ -245,6 +246,7 @@
 		4EA700012F60002200100002 /* TagObservationResolver.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = TagObservationResolver.swift; path = RTABMapApp/MobilePostProcessing/TagObservationResolver.swift; sourceTree = "<group>"; };
 		4EA700012F60002100100002 /* ShelfAssociationEngine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = ShelfAssociationEngine.swift; path = RTABMapApp/MobilePostProcessing/ShelfAssociationEngine.swift; sourceTree = "<group>"; };
 		4EA700012F60002000100002 /* SessionSnapshotTransaction.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = SessionSnapshotTransaction.swift; path = RTABMapApp/MobilePostProcessing/SessionSnapshotTransaction.swift; sourceTree = "<group>"; };
+		4EA700012F60002000A00002 /* ImmutableDirectoryPublication.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = ImmutableDirectoryPublication.swift; path = RTABMapApp/MobilePostProcessing/ImmutableDirectoryPublication.swift; sourceTree = "<group>"; };
 		4EA700012F60003000100002 /* AbsolutePriorEvidenceParser.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = AbsolutePriorEvidenceParser.swift; path = RTABMapApp/MobilePostProcessing/AbsolutePriorEvidenceParser.swift; sourceTree = "<group>"; };
 		4EA700012F60003100100002 /* StrictClockEvidenceParser.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = StrictClockEvidenceParser.swift; path = RTABMapApp/MobilePostProcessing/StrictClockEvidenceParser.swift; sourceTree = "<group>"; };
 		4EA700012F60001F00100002 /* SE2Transform.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = SE2Transform.swift; path = RTABMapApp/MobilePostProcessing/SE2Transform.swift; sourceTree = "<group>"; };
@@ -528,6 +530,7 @@
 				4EA700012F60002200100002 /* TagObservationResolver.swift */,
 				4EA700012F60002100100002 /* ShelfAssociationEngine.swift */,
 				4EA700012F60002000100002 /* SessionSnapshotTransaction.swift */,
+				4EA700012F60002000A00002 /* ImmutableDirectoryPublication.swift */,
 				4EA700012F60003000100002 /* AbsolutePriorEvidenceParser.swift */,
 				4EA700012F60003100100002 /* StrictClockEvidenceParser.swift */,
 				4EA700012F60001F00100002 /* SE2Transform.swift */,
@@ -987,6 +990,7 @@
 				4EA700012F60002200100001 /* TagObservationResolver.swift in Sources */,
 				4EA700012F60002100100001 /* ShelfAssociationEngine.swift in Sources */,
 				4EA700012F60002000100001 /* SessionSnapshotTransaction.swift in Sources */,
+				4EA700012F60002000A00001 /* ImmutableDirectoryPublication.swift in Sources */,
 				4EA700012F60003000100001 /* AbsolutePriorEvidenceParser.swift in Sources */,
 				4EA700012F60003100100001 /* StrictClockEvidenceParser.swift in Sources */,
 				4EA700012F60001F00100001 /* SE2Transform.swift in Sources */,

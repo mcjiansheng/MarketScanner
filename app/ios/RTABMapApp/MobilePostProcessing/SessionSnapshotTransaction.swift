@@ -16,26 +16,109 @@ import SQLite3
 /// - the DB is validated read-only (quick_check exactly one "ok" and the
 ///   expected table inventory, §8.5);
 /// - a dynamic disk budget is enforced before any copy (§8.6);
-/// - the whole snapshot commits atomically: staging dir → fsync →
-///   rename → fsync task root (§8.7).
+/// - the whole snapshot uses a durable intent-bound transaction: payloads
+///   are frozen while the publication root remains 0755, the same-parent
+///   rename publishes only a pathname, the exact renamed inode is then
+///   frozen/fsynced as 0555, and the task-root authority is installed last
+///   (§8.7). Rename alone is never the business commit point.
 enum SessionSnapshotTransaction {
     enum FaultPoint {
         case afterSourceInventory
         case beforeManifestWrite
+        case afterTransactionIntentCreationBeforeIdentityBind
+        case afterTransactionIntentTemporaryFsyncBeforeRename
+        case afterTransactionIntentRenameBeforeParentFsync
+        case afterPreviousSnapshotThawBeforeBackupRename
+        case afterPreviousSnapshotRenameBeforeFreeze
+        case afterPreviousSnapshotFreezeBeforeParentFsync
+        case afterSnapshotRenameBeforeFreeze
+        case afterSnapshotFreezeBeforeParentFsync
         case afterSnapshotInstall
+        case afterTaskReferenceAuthorityReadBeforeInstall
+        case afterTaskReferenceCreationBeforeIdentityBind
+        case afterTaskReferenceTemporaryFsyncBeforeRename
+        case afterTaskReferenceAuthorityRecheckBeforeInstall
+        case afterTaskReferenceRenameBeforePostcheck
+        case afterTaskReferenceAuthorityRecheckBeforeClear
+        case afterTaskReferenceClearRenameBeforePostcheck
         case beforeTaskReferenceFsync
+        case afterTaskReferenceDurableBeforeCleanup
+        case afterRecoveryCoreBeforeReturn
         case beforeBackupRestore
+        case afterPriorAuthorityRestoreBeforeGenerationCleanup
+        case afterCleanupRootPreparedBeforeRemoval
+        case afterCleanupChildRemoval
+        case afterTransactionIntentAuthorityRecheckBeforeRemoval
+        case afterTransactionIntentRemovalRenameBeforePostcheck
+        case afterGenerationRootOpenBeforeValidation
+        case afterArtifactAuthorityReadBeforeOpen(String)
+        case afterArtifactHashBeforeGenerationEnd(String)
     }
 
     /// Deterministic filesystem fault injection used by the executable host
     /// suite. Production leaves this nil.
     static var faultInjector: ((FaultPoint) throws -> Void)?
+    /// Host-only synchronization hooks for exact process-lock namespace
+    /// replacement tests. Production leaves all three nil.
+    static var processLockAttemptObserver: (() throws -> Void)?
+    static var processLockAcquiredObserver: (() throws -> Void)?
+    static var processLockValidationObserver: (() throws -> Void)?
+    private static let transactionLock = NSLock()
 
     struct SessionSnapshot {
         var taskID: String
         var snapshotDirectory: URL
         var inputManifest: [String: Any]
         var bundleSHA256: String
+    }
+
+    private struct ValidatedSnapshotGeneration {
+        let manifestData: Data
+        let manifestSHA256: String
+        let taskID: String
+        let generation: String
+        let bundleSHA256: String
+        let directoryIdentity: ImmutableDirectoryPublication.Identity
+        let directoryMode: mode_t
+    }
+
+    private struct SnapshotCommitIntent: Equatable {
+        let taskID: String
+        let newManifestSHA256: String
+        let newIdentity: ImmutableDirectoryPublication.Identity
+        let priorManifestSHA256: String?
+        let priorIdentity: ImmutableDirectoryPublication.Identity?
+    }
+
+    private struct ReadSnapshotCommitIntent {
+        let intent: SnapshotCommitIntent
+        let fileIdentity: ImmutableDirectoryPublication.Identity
+        let data: Data
+    }
+
+    private struct ProcessLockHandle {
+        let rootURL: URL
+        let rootDescriptor: Int32
+        let rootMetadata: stat
+        let lockDescriptor: Int32
+        let lockMetadata: stat
+    }
+
+    /// Signals an authority CAS conflict whose pre-transaction state could
+    /// not be restored atomically. The caller must preserve the durable
+    /// intent and every generation instead of attempting ordinary rollback.
+    private enum SnapshotTransactionConflict: Error {
+        case taskAuthorityDisplaced
+    }
+
+    private struct TaskManifestTemporaryName {
+        let temporaryIdentity: ImmutableDirectoryPublication.Identity
+        let expectedDisplacedIdentity: ImmutableDirectoryPublication.Identity?
+        let targetSHA256: String
+    }
+
+    private struct IdentityBoundTemporaryName {
+        let identity: ImmutableDirectoryPublication.Identity
     }
 
     /// Identity bindings the snapshot must match (§8.1). When nil (legacy
@@ -181,6 +264,31 @@ enum SessionSnapshotTransaction {
     static let maximumMetadataBytes: Int64 = 1024 * 1024
     static let committedFileMode: mode_t = 0o444
     static let committedDirectoryMode: mode_t = 0o555
+    static let preparedDirectoryMode: mode_t = 0o755
+    static let cleanupDirectoryMode: mode_t = 0o700
+    static let transactionIntentFileName = "input_snapshot.transaction.json"
+    static let transactionIntentTemporaryPrefix =
+        "input_snapshot.transaction.tmp-"
+    static let transactionIntentCreationPrefix =
+        "input_snapshot.transaction.create-"
+    static let transactionIntentRemovalPrefix =
+        "input_snapshot.transaction.remove-"
+    static let transactionIntentTemporaryRemovalPrefix =
+        "input_snapshot.transaction.tmp-remove-"
+    static let transactionIntentConflictPrefix =
+        "input_snapshot.transaction.conflict-"
+    static let taskManifestTemporaryPrefix = ".input_manifest."
+    static let taskManifestTemporarySuffix = ".tmp"
+    static let taskManifestCreationPrefix = ".input_manifest.create-"
+    static let taskManifestRemovalPrefix = ".input_manifest.remove-"
+    static let taskManifestTemporaryRemovalPrefix =
+        ".input_manifest.tmp-remove-"
+    static let taskManifestConflictPrefix = ".input_manifest.conflict-"
+    static let processLockFileName = "input_snapshot.lock"
+    static let maximumSnapshotTransactionIntentBytes = 64 * 1024
+    static let maximumSnapshotCommitMarkerBytes = 64 * 1024
+    static let maximumTaskManifestBytes = 4 * 1024 * 1024
+    static let maximumSnapshotDirectoryEntries = 4_096
     static let maximumGraphNodes: Int64 = 200_000
     static let maximumGraphLinks: Int64 = 400_000
 
@@ -188,6 +296,148 @@ enum SessionSnapshotTransaction {
     /// `Application Support/MarketScanner/Processing/<taskID>/input_snapshot/`
     /// and returns the verified snapshot.
     static func snapshot(
+        finalizedSession: URL,
+        sourceDatabase: URL,
+        taskRoot: URL,
+        eligibility: Eligibility? = nil
+    ) throws -> SessionSnapshot {
+        transactionLock.lock()
+        defer { transactionLock.unlock() }
+        let processLock = try acquireProcessLock(taskRoot: taskRoot)
+        defer { releaseProcessLock(processLock) }
+        let value = try snapshotLocked(
+            finalizedSession: finalizedSession,
+            sourceDatabase: sourceDatabase,
+            taskRoot: taskRoot,
+            eligibility: eligibility)
+        try validateProcessLock(processLock)
+        return value
+    }
+
+    private static func acquireProcessLock(
+        taskRoot: URL
+    ) throws -> ProcessLockHandle {
+        let openedRoot = try openStableDirectoryNoFollow(
+            taskRoot, context: "snapshot process-lock task root")
+        var keepRootDescriptor = false
+        defer {
+            if !keepRootDescriptor { _ = close(openedRoot.descriptor) }
+        }
+        let descriptor = openat(
+            openedRoot.descriptor,
+            processLockFileName,
+            O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW,
+            mode_t(0o600))
+        guard descriptor >= 0 else {
+            throw SessionError.copyFailed(
+                "cannot open snapshot process lock")
+        }
+        var metadata = stat()
+        var pathMetadata = stat()
+        guard fstat(descriptor, &metadata) == 0,
+              (metadata.st_mode & S_IFMT) == S_IFREG,
+              metadata.st_nlink == 1,
+              metadata.st_size == 0,
+              (metadata.st_mode & mode_t(0o777)) == 0o600,
+              fstatat(
+                openedRoot.descriptor,
+                processLockFileName,
+                &pathMetadata,
+                AT_SYMLINK_NOFOLLOW) == 0,
+              sameFileIdentity(metadata, pathMetadata) else {
+            _ = close(descriptor)
+            throw SessionError.copyFailed(
+                "snapshot process lock identity/mode invalid")
+        }
+        do {
+            try requireOpenDirectoryPath(
+                descriptor: openedRoot.descriptor,
+                url: taskRoot,
+                expectedMetadata: openedRoot.metadata,
+                context: "snapshot process-lock task root before lock")
+            try processLockAttemptObserver?()
+        } catch {
+            _ = close(descriptor)
+            throw error
+        }
+        while Darwin.lockf(descriptor, F_LOCK, 0) != 0 {
+            if errno == EINTR { continue }
+            _ = close(descriptor)
+            throw SessionError.copyFailed(
+                "cannot acquire snapshot process lock")
+        }
+        do {
+            try processLockAcquiredObserver?()
+            var lockedMetadata = stat()
+            var lockedPathMetadata = stat()
+            guard fstat(descriptor, &lockedMetadata) == 0,
+                  fstatat(
+                    openedRoot.descriptor,
+                    processLockFileName,
+                    &lockedPathMetadata,
+                    AT_SYMLINK_NOFOLLOW) == 0,
+                  sameFileIdentity(metadata, lockedMetadata),
+                  sameFileIdentity(metadata, lockedPathMetadata),
+                  lockedMetadata.st_nlink == 1,
+                  lockedMetadata.st_size == 0,
+                  (lockedMetadata.st_mode & mode_t(0o777)) == 0o600 else {
+                throw SessionError.copyFailed(
+                    "snapshot process lock pathname changed while acquiring")
+            }
+            try requireOpenDirectoryPath(
+                descriptor: openedRoot.descriptor,
+                url: taskRoot,
+                expectedMetadata: openedRoot.metadata,
+                context: "snapshot process-lock task root after lock")
+            keepRootDescriptor = true
+            return ProcessLockHandle(
+                rootURL: taskRoot,
+                rootDescriptor: openedRoot.descriptor,
+                rootMetadata: openedRoot.metadata,
+                lockDescriptor: descriptor,
+                lockMetadata: lockedMetadata)
+        } catch {
+            _ = Darwin.lockf(descriptor, F_ULOCK, 0)
+            _ = close(descriptor)
+            throw error
+        }
+    }
+
+    private static func validateProcessLock(
+        _ handle: ProcessLockHandle
+    ) throws {
+        try processLockValidationObserver?()
+        var lockDescriptorMetadata = stat()
+        var lockPathMetadata = stat()
+        guard fstat(handle.lockDescriptor, &lockDescriptorMetadata) == 0,
+              fstatat(
+                handle.rootDescriptor,
+                processLockFileName,
+                &lockPathMetadata,
+                AT_SYMLINK_NOFOLLOW) == 0,
+              sameFileIdentity(
+                handle.lockMetadata, lockDescriptorMetadata),
+              sameFileIdentity(handle.lockMetadata, lockPathMetadata),
+              lockDescriptorMetadata.st_nlink == 1,
+              lockDescriptorMetadata.st_size == 0,
+              (lockDescriptorMetadata.st_mode & mode_t(0o777)) == 0o600 else {
+            throw SessionError.copyFailed(
+                "snapshot process lock authority changed")
+        }
+        try requireOpenDirectoryPath(
+            descriptor: handle.rootDescriptor,
+            url: handle.rootURL,
+            expectedMetadata: handle.rootMetadata,
+            context: "snapshot process-lock final validation")
+    }
+
+    private static func releaseProcessLock(_ handle: ProcessLockHandle) {
+        _ = Darwin.lockf(handle.lockDescriptor, F_ULOCK, 0)
+        _ = close(handle.lockDescriptor)
+        _ = close(handle.rootDescriptor)
+    }
+
+    private static func snapshotLocked(
         finalizedSession: URL,
         sourceDatabase: URL,
         taskRoot: URL,
@@ -307,19 +557,19 @@ enum SessionSnapshotTransaction {
         // 4. Streaming stable copies into staging (§8.3/§8.7).
         let snapshotDirectory = taskRoot.appendingPathComponent("input_snapshot")
         let stagingDirectory = taskRoot.appendingPathComponent("input_snapshot.staging")
-        // Idempotence: rebuild the staging tree from the source on
-        // retry. The committed snapshot is NOT deleted here — B-08 keeps
-        // the previous valid snapshot until the new one is complete and
-        // verified (see step 7).
-        if fileManager.fileExists(atPath: stagingDirectory.path) {
-            try removeImmutableTree(stagingDirectory)
-        }
         let backupDirectory = taskRoot
             .appendingPathComponent("input_snapshot.backup")
         try recoverInterruptedCommitIfNeeded(
             taskRoot: taskRoot,
             snapshotDirectory: snapshotDirectory,
-            backupDirectory: backupDirectory)
+            backupDirectory: backupDirectory,
+            stagingDirectory: stagingDirectory)
+        // Idempotence: after durable transaction recovery, rebuild any
+        // remaining uncommitted staging tree from the source. The committed
+        // snapshot is never deleted here.
+        if fileManager.fileExists(atPath: stagingDirectory.path) {
+            try removeImmutableTree(stagingDirectory)
+        }
         try fileManager.createDirectory(
             at: stagingDirectory, withIntermediateDirectories: true)
 
@@ -473,9 +723,12 @@ enum SessionSnapshotTransaction {
             try fsyncURL(stagingCommitMarker)
             try fsyncDirectory(stagingDirectory)
             try fileManager.setAttributes(
-                [.posixPermissions: NSNumber(value: committedDirectoryMode)],
+                [.posixPermissions: NSNumber(value: preparedDirectoryMode)],
                 ofItemAtPath: stagingDirectory.path)
             try fsyncDirectory(stagingDirectory)
+            _ = try validateSnapshotGeneration(
+                stagingDirectory,
+                allowedDirectoryModes: [preparedDirectoryMode])
 
             // RC-B09: one generation includes the immutable directory,
             // its manifest, its commit marker and the durable task-root
@@ -484,63 +737,108 @@ enum SessionSnapshotTransaction {
             // is durable and has passed resume validation.
             let taskManifestURL = taskRoot.appendingPathComponent(
                 "input_manifest.json")
-            let priorTaskManifest = fileManager.fileExists(
-                atPath: taskManifestURL.path)
-                ? try Data(contentsOf: taskManifestURL) : nil
-            var movedPreviousSnapshot = false
-            var installedNewSnapshot = false
+            let priorTaskManifest = try readStableCommittedFileIfPresent(
+                taskManifestURL,
+                maximumBytes: maximumTaskManifestBytes)?.data
+            let stagingIdentity = try ImmutableDirectoryPublication.identity(
+                of: stagingDirectory,
+                allowedModes: [preparedDirectoryMode])
+            var priorIdentity: ImmutableDirectoryPublication.Identity?
+            var priorManifestSHA256: String?
+            if fileManager.fileExists(atPath: snapshotDirectory.path) {
+                try revalidateSnapshot(snapshotDirectory)
+                let priorGeneration = try validateSnapshotGeneration(
+                    snapshotDirectory,
+                    allowedDirectoryModes: [committedDirectoryMode])
+                priorIdentity = try ImmutableDirectoryPublication.identity(
+                    of: snapshotDirectory,
+                    allowedModes: [committedDirectoryMode])
+                priorManifestSHA256 = priorGeneration.manifestSHA256
+                guard priorTaskManifest == priorGeneration.manifestData else {
+                    throw SessionError.copyFailed(
+                        "prior snapshot/task reference mismatch before commit")
+                }
+            } else if priorTaskManifest != nil {
+                throw SessionError.copyFailed(
+                    "task reference exists without a prior snapshot")
+            }
+            let commitIntent = SnapshotCommitIntent(
+                taskID: taskID,
+                newManifestSHA256: manifestSHA,
+                newIdentity: stagingIdentity,
+                priorManifestSHA256: priorManifestSHA256,
+                priorIdentity: priorIdentity)
+            let transactionIntentURL = taskRoot.appendingPathComponent(
+                transactionIntentFileName)
+            let transactionIntentIdentity = try writeSnapshotCommitIntent(
+                commitIntent, to: transactionIntentURL)
             do {
                 if fileManager.fileExists(atPath: snapshotDirectory.path) {
-                    try renameDirectoryExclusively(
-                        snapshotDirectory,
-                        to: backupDirectory,
-                        context: "cannot stage previous snapshot backup")
-                    movedPreviousSnapshot = true
-                    try fsyncDirectory(taskRoot)
+                    try ImmutableDirectoryPublication.publish(
+                        source: snapshotDirectory,
+                        destination: backupDirectory,
+                        expectedIdentity: priorIdentity,
+                        afterRootThawBeforeRename: {
+                            try faultInjector?(
+                                .afterPreviousSnapshotThawBeforeBackupRename)
+                        },
+                        afterRenameBeforeFreeze: {
+                            try faultInjector?(
+                                .afterPreviousSnapshotRenameBeforeFreeze)
+                        },
+                        afterFreezeBeforeParentSync: {
+                            try faultInjector?(
+                                .afterPreviousSnapshotFreezeBeforeParentFsync)
+                        })
                 }
-                try renameDirectoryExclusively(
-                    stagingDirectory,
-                    to: snapshotDirectory,
-                    context: "cannot install immutable snapshot")
-                installedNewSnapshot = true
-                try fsyncDirectory(taskRoot)
+                try ImmutableDirectoryPublication.publish(
+                    source: stagingDirectory,
+                    destination: snapshotDirectory,
+                    expectedIdentity: stagingIdentity,
+                    afterRenameBeforeFreeze: {
+                        try faultInjector?(.afterSnapshotRenameBeforeFreeze)
+                    },
+                    afterFreezeBeforeParentSync: {
+                        try faultInjector?(
+                            .afterSnapshotFreezeBeforeParentFsync)
+                    })
+                try ImmutableDirectoryPublication.freezeInterruptedDestination(
+                    snapshotDirectory, expectedIdentity: stagingIdentity)
+                _ = try validateIntentBoundGeneration(
+                    snapshotDirectory,
+                    expectedManifestSHA256: manifestSHA,
+                    expectedIdentity: stagingIdentity)
                 try faultInjector?(.afterSnapshotInstall)
-                try manifestData.write(
-                    to: taskManifestURL, options: [.atomic])
-                try fileManager.setAttributes(
-                    [.posixPermissions: NSNumber(value: committedFileMode)],
-                    ofItemAtPath: taskManifestURL.path)
-                try faultInjector?(.beforeTaskReferenceFsync)
-                try fsyncURL(taskManifestURL)
-                try fsyncDirectory(taskRoot)
-                try revalidateSnapshot(snapshotDirectory)
+                try writeTaskManifest(
+                    manifestData,
+                    to: taskManifestURL,
+                    taskRoot: taskRoot,
+                    afterRenameBeforeParentSync: {
+                        try faultInjector?(.beforeTaskReferenceFsync)
+                    })
+                try revalidateSnapshot(
+                    snapshotDirectory,
+                    expectedDirectoryIdentity: stagingIdentity,
+                    expectedManifestSHA256: manifestSHA)
+                try faultInjector?(.afterTaskReferenceDurableBeforeCleanup)
+            } catch let conflict as SnapshotTransactionConflict {
+                throw SessionError.copyFailed(
+                    "snapshot commit found an unrecoverable authority conflict; "
+                    + "transaction intent and generations were preserved: "
+                    + String(describing: conflict))
             } catch {
                 let commitError = error
                 do {
                     try faultInjector?(.beforeBackupRestore)
-                    if installedNewSnapshot,
-                       fileManager.fileExists(atPath: snapshotDirectory.path) {
-                        try removeImmutableTree(snapshotDirectory)
-                    }
-                    if movedPreviousSnapshot,
-                       fileManager.fileExists(atPath: backupDirectory.path) {
-                        try renameDirectoryExclusively(
-                            backupDirectory,
-                            to: snapshotDirectory,
-                            context: "cannot restore previous snapshot")
-                    }
-                    if let priorTaskManifest {
-                        try priorTaskManifest.write(
-                            to: taskManifestURL, options: [.atomic])
-                        try fileManager.setAttributes(
-                            [.posixPermissions: NSNumber(value: committedFileMode)],
-                            ofItemAtPath: taskManifestURL.path)
-                        try fsyncURL(taskManifestURL)
-                    } else if fileManager.fileExists(
-                        atPath: taskManifestURL.path) {
-                        try fileManager.removeItem(at: taskManifestURL)
-                    }
-                    try fsyncDirectory(taskRoot)
+                    try rollbackSnapshotCommit(
+                        intent: commitIntent,
+                        priorTaskManifest: priorTaskManifest,
+                        taskRoot: taskRoot,
+                        snapshotDirectory: snapshotDirectory,
+                        backupDirectory: backupDirectory,
+                        stagingDirectory: stagingDirectory,
+                        transactionIntentURL: transactionIntentURL,
+                        transactionIntentIdentity: transactionIntentIdentity)
                 } catch {
                     throw SessionError.copyFailed(
                         "snapshot commit rollback failed after "
@@ -555,10 +853,25 @@ enum SessionSnapshotTransaction {
             // it never rolls back or obscures the already durable generation.
             if fileManager.fileExists(atPath: backupDirectory.path) {
                 do {
-                    try removeImmutableTree(backupDirectory)
-                    try? fsyncDirectory(taskRoot)
+                    guard let priorIdentity else {
+                        throw SessionError.copyFailed(
+                            "snapshot backup exists without prior identity")
+                    }
+                    try removeImmutableTree(
+                        backupDirectory, expectedIdentity: priorIdentity)
+                    try fsyncDirectory(taskRoot)
                 } catch { /* durable commit remains authoritative */ }
             }
+            try revalidateSnapshot(
+                snapshotDirectory,
+                expectedDirectoryIdentity: stagingIdentity,
+                expectedManifestSHA256: manifestSHA)
+            do {
+                try removeSnapshotCommitIntent(
+                    transactionIntentURL,
+                    expectedIntent: commitIntent,
+                    expectedIdentity: transactionIntentIdentity)
+            } catch { /* durable committed generation remains authoritative */ }
 
             return SessionSnapshot(
                 taskID: taskID,
@@ -566,7 +879,10 @@ enum SessionSnapshotTransaction {
                 inputManifest: manifest,
                 bundleSHA256: bundleSHA)
         } catch {
-            if fileManager.fileExists(atPath: stagingDirectory.path) {
+            let transactionIntentURL = taskRoot.appendingPathComponent(
+                transactionIntentFileName)
+            if !fileManager.fileExists(atPath: transactionIntentURL.path),
+               fileManager.fileExists(atPath: stagingDirectory.path) {
                 try? removeImmutableTree(stagingDirectory)
             }
             throw error
@@ -584,12 +900,113 @@ enum SessionSnapshotTransaction {
     /// snapshot before a task resume — the manifest, every artifact's
     /// exact bytes + SHA-256, the DB quick-check and the WAL/journal
     /// contract are re-verified. Resume never trusts "the file exists".
-    static func revalidateSnapshot(_ directory: URL) throws {
-        let fileManager = FileManager.default
-        try validateCommittedDirectory(directory)
-        let manifestURL = directory.appendingPathComponent("input_manifest.json")
-        try validateCommittedRegularFile(manifestURL)
-        let manifestData = try Data(contentsOf: manifestURL)
+    static func revalidateSnapshot(
+        _ directory: URL,
+        expectedDirectoryIdentity: ImmutableDirectoryPublication.Identity? = nil,
+        expectedManifestSHA256: String? = nil
+    ) throws {
+        let validated = try validateSnapshotGeneration(
+            directory,
+            allowedDirectoryModes: [committedDirectoryMode],
+            expectedDirectoryIdentity: expectedDirectoryIdentity)
+        if let expectedManifestSHA256,
+           validated.manifestSHA256 != expectedManifestSHA256 {
+            throw SessionError.notEligible(
+                "snapshot manifest differs from expected transaction generation")
+        }
+
+        // The task-root copy is the durable reference to this exact
+        // generation. A snapshot directory without the matching reference
+        // is an interrupted commit and cannot be resumed.
+        let taskRoot = directory.deletingLastPathComponent()
+        guard taskRoot.lastPathComponent == validated.taskID else {
+            throw SessionError.notEligible(
+                "snapshot task identity mismatch")
+        }
+        let taskManifestURL = taskRoot.appendingPathComponent(
+            "input_manifest.json")
+        guard let taskManifestData = try readStableCommittedFileIfPresent(
+                taskManifestURL,
+                maximumBytes: maximumTaskManifestBytes)?.data else {
+            throw SessionError.notEligible(
+                "snapshot task reference is missing")
+        }
+        guard taskManifestData == validated.manifestData else {
+            throw SessionError.notEligible(
+                "task reference generation does not match snapshot manifest")
+        }
+        let finalIdentity = try ImmutableDirectoryPublication.identity(
+            of: directory, allowedModes: [validated.directoryMode])
+        guard finalIdentity == validated.directoryIdentity else {
+            throw SessionError.notEligible(
+                "snapshot generation changed while validating task authority")
+        }
+    }
+
+    private static func validateSnapshotGeneration(
+        _ directory: URL,
+        allowedDirectoryModes: Set<mode_t>,
+        expectedDirectoryIdentity: ImmutableDirectoryPublication.Identity? = nil
+    ) throws -> ValidatedSnapshotGeneration {
+        let parent = directory.deletingLastPathComponent()
+        let openedParent = try openStableDirectoryNoFollow(
+            parent, context: "snapshot generation parent")
+        defer { _ = close(openedParent.descriptor) }
+        let directoryDescriptor = openat(
+            openedParent.descriptor,
+            directory.lastPathComponent,
+            O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)
+        guard directoryDescriptor >= 0 else {
+            throw SessionError.notEligible(
+                "cannot open snapshot generation without following links")
+        }
+        defer { _ = close(directoryDescriptor) }
+        var openedDirectory = stat()
+        var pathDirectory = stat()
+        guard fstat(directoryDescriptor, &openedDirectory) == 0,
+              fstatat(
+                openedParent.descriptor,
+                directory.lastPathComponent,
+                &pathDirectory,
+                AT_SYMLINK_NOFOLLOW) == 0,
+              sameDirectoryIdentity(openedDirectory, pathDirectory) else {
+            throw SessionError.notEligible(
+                "snapshot generation changed while opening")
+        }
+        let directoryMode = openedDirectory.st_mode & mode_t(0o777)
+        guard allowedDirectoryModes.contains(directoryMode),
+              pathDirectory.st_mode & mode_t(0o777) == directoryMode else {
+            throw SessionError.notEligible(
+                "snapshot directory mode is not allowed: "
+                    + String(directoryMode, radix: 8))
+        }
+        let openedIdentity = ImmutableDirectoryPublication.Identity(
+            device: UInt64(openedDirectory.st_dev),
+            inode: UInt64(openedDirectory.st_ino))
+        if let expectedDirectoryIdentity,
+           openedIdentity != expectedDirectoryIdentity {
+            throw SessionError.copyFailed(
+                "snapshot generation dev/inode differs from transaction intent")
+        }
+        try faultInjector?(.afterGenerationRootOpenBeforeValidation)
+        try requireBoundDirectoryPath(
+            descriptor: directoryDescriptor,
+            expectedIdentity: expectedDirectoryIdentity,
+            expectedMode: directoryMode,
+            parentDescriptor: openedParent.descriptor,
+            parentURL: parent,
+            parentMetadata: openedParent.metadata,
+            basename: directory.lastPathComponent,
+            context: "snapshot generation before validation")
+
+        guard let stableManifest = try readStableCommittedFileIfPresent(
+                parentDescriptor: directoryDescriptor,
+                basename: "input_manifest.json",
+                maximumBytes: maximumTaskManifestBytes) else {
+            throw SessionError.notEligible(
+                "input_manifest.json is missing for resume")
+        }
+        let manifestData = stableManifest.data
         guard let manifest = try? StrictJSONDocumentParser.object(
             from: manifestData,
             limits: StrictJSONDocumentLimits(maximumBytes: manifestData.count + 1))
@@ -631,25 +1048,9 @@ enum SessionSnapshotTransaction {
             }
         }
 
-        // The task-root copy is the durable reference to this exact
-        // generation. A snapshot directory without the matching reference
-        // is an interrupted commit and cannot be resumed.
-        let taskRoot = directory.deletingLastPathComponent()
-        guard taskRoot.lastPathComponent == taskID else {
-            throw SessionError.notEligible(
-                "snapshot task identity mismatch")
-        }
-        let taskManifestURL = taskRoot.appendingPathComponent(
-            "input_manifest.json")
-        try validateCommittedRegularFile(taskManifestURL)
-        let taskManifestData = try Data(contentsOf: taskManifestURL)
-        guard taskManifestData == manifestData else {
-            throw SessionError.notEligible(
-                "task reference generation does not match snapshot manifest")
-        }
-
         var expectedNames = Set(["input_manifest.json", "snapshot_commit.json"])
         var artifactNames = Set<String>()
+        var artifactMetadata: [String: stat] = [:]
         for artifact in artifacts {
             guard let name = artifact["file"] as? String,
                   isSafeTopLevelName(name),
@@ -661,24 +1062,22 @@ enum SessionSnapshotTransaction {
                     "input_manifest.json artifact record invalid")
             }
             guard expectedBytes >= 0,
-                  !expectedSHA.isEmpty,
+                  isSHA256(expectedSHA),
                   artifactNames.insert(name).inserted,
                   expectedNames.insert(name).inserted else {
                 throw SessionError.notEligible(
                     "input_manifest.json artifact name/count invalid")
             }
-            let url = directory.appendingPathComponent(name)
-            let fileStat = try validateCommittedRegularFile(url)
-            let actualBytes = Int64(fileStat.st_size)
-            guard actualBytes == expectedBytes else {
-                throw SessionError.copyFailed(
-                    "resume bytes mismatch: \(name) \(actualBytes) != \(expectedBytes)")
-            }
-            let actualSHA = try CanonicalSourceHasher.sha256File(url)
-            guard actualSHA == expectedSHA else {
+            let stableArtifact = try sha256StableCommittedFile(
+                parentDescriptor: directoryDescriptor,
+                basename: name,
+                expectedBytes: expectedBytes)
+            guard stableArtifact.sha256 == expectedSHA else {
                 throw SessionError.copyFailed(
                     "resume sha mismatch: \(name)")
             }
+            artifactMetadata[name] = stableArtifact.metadata
+            try faultInjector?(.afterArtifactHashBeforeGenerationEnd(name))
         }
 
         // Explicit WAL/journal gate runs before the exact directory-name
@@ -693,12 +1092,14 @@ enum SessionSnapshotTransaction {
             throw SessionError.emptyInput
         }
         try validateWALJournalState(
-            sessionDirectory: directory,
+            parentDescriptor: directoryDescriptor,
             databaseName: databaseName,
             phase: "resume")
 
-        let actualNames = Set(try fileManager.contentsOfDirectory(
-            atPath: directory.path))
+        let actualNames = Set(try directoryEntryNames(
+            atBoundDirectoryDescriptor: directoryDescriptor,
+            context: "snapshot generation",
+            maximumEntries: maximumSnapshotDirectoryEntries))
         guard actualNames == expectedNames else {
             throw SessionError.notEligible(
                 "snapshot file inventory differs from committed manifest")
@@ -708,10 +1109,14 @@ enum SessionSnapshotTransaction {
                 "snapshot bundle digest does not match artifacts")
         }
 
-        let commitMarkerURL = directory.appendingPathComponent(
-            "snapshot_commit.json")
-        try validateCommittedRegularFile(commitMarkerURL)
-        let commitData = try Data(contentsOf: commitMarkerURL)
+        guard let stableCommit = try readStableCommittedFileIfPresent(
+                parentDescriptor: directoryDescriptor,
+                basename: "snapshot_commit.json",
+                maximumBytes: maximumSnapshotCommitMarkerBytes) else {
+            throw SessionError.notEligible(
+                "snapshot commit marker is missing")
+        }
+        let commitData = stableCommit.data
         guard let commit = try? StrictJSONDocumentParser.object(
             from: commitData,
             limits: StrictJSONDocumentLimits(maximumBytes: commitData.count + 1))
@@ -730,13 +1135,96 @@ enum SessionSnapshotTransaction {
         // Formal metadata is re-parsed on every resume. Legacy metadata,
         // incomplete evidence and a changed eligibility status remain
         // diagnostic-only even if artifact hashes happen to match.
-        let metadata = try readMetadata(
-            directory.appendingPathComponent("metadata.json"))
+        guard let metadataBefore = artifactMetadata["metadata.json"] else {
+            throw SessionError.notEligible(
+                "metadata.json is missing from the committed artifact set")
+        }
+        try requireBoundDirectoryPath(
+            descriptor: directoryDescriptor,
+            expectedIdentity: expectedDirectoryIdentity,
+            expectedMode: directoryMode,
+            parentDescriptor: openedParent.descriptor,
+            parentURL: parent,
+            parentMetadata: openedParent.metadata,
+            basename: directory.lastPathComponent,
+            context: "snapshot generation before metadata validation")
+        guard let committedMetadata = try readStableCommittedFileIfPresent(
+            parentDescriptor: directoryDescriptor,
+            basename: "metadata.json",
+            maximumBytes: Int(maximumMetadataBytes)),
+              sameFileIdentity(
+                metadataBefore, committedMetadata.metadata) else {
+            throw SessionError.copyFailed(
+                "metadata.json changed during snapshot eligibility validation")
+        }
+        let metadata = try parseMetadataData(committedMetadata.data)
         try checkEligibility(metadata.value, eligibility: nil)
 
         // DB quick-check + WAL contract on the snapshot copy.
+        guard let databaseBefore = artifactMetadata[databaseName] else {
+            throw SessionError.emptyInput
+        }
+        try requireBoundDirectoryPath(
+            descriptor: directoryDescriptor,
+            expectedIdentity: expectedDirectoryIdentity,
+            expectedMode: directoryMode,
+            parentDescriptor: openedParent.descriptor,
+            parentURL: parent,
+            parentMetadata: openedParent.metadata,
+            basename: directory.lastPathComponent,
+            context: "snapshot generation before database validation")
         try validateSnapshotDatabase(
-            directory.appendingPathComponent(databaseName))
+            parentDescriptor: directoryDescriptor,
+            databaseName: databaseName,
+            expectedMetadata: databaseBefore)
+        var databaseAfter = stat()
+        guard fstatat(
+            directoryDescriptor,
+            databaseName,
+            &databaseAfter,
+            AT_SYMLINK_NOFOLLOW) == 0,
+              sameFileIdentity(databaseBefore, databaseAfter) else {
+            throw SessionError.dbIntegrity(
+                "snapshot database changed during read-only validation")
+        }
+
+        // Extend every per-file stable-read/hash guarantee through the end
+        // of the complete generation validation. Without this final sweep,
+        // an early sidecar could be modified in place after its hash window
+        // and restored to 0444 before the later metadata/SQLite checks end.
+        var finalExpectedMetadata = artifactMetadata
+        finalExpectedMetadata["input_manifest.json"] = stableManifest.metadata
+        finalExpectedMetadata["snapshot_commit.json"] = stableCommit.metadata
+        for name in finalExpectedMetadata.keys.sorted() {
+            guard let expected = finalExpectedMetadata[name] else { continue }
+            var current = stat()
+            guard fstatat(
+                directoryDescriptor,
+                name,
+                &current,
+                AT_SYMLINK_NOFOLLOW) == 0,
+                  sameFileIdentity(expected, current) else {
+                throw SessionError.copyFailed(
+                    "snapshot generation file changed during validation: \(name)")
+            }
+        }
+        try requireBoundDirectoryPath(
+            descriptor: directoryDescriptor,
+            expectedIdentity: expectedDirectoryIdentity,
+            expectedMode: directoryMode,
+            parentDescriptor: openedParent.descriptor,
+            parentURL: parent,
+            parentMetadata: openedParent.metadata,
+            basename: directory.lastPathComponent,
+            context: "snapshot generation after validation")
+        return ValidatedSnapshotGeneration(
+            manifestData: manifestData,
+            manifestSHA256: sha256(manifestData),
+            taskID: taskID,
+            generation: generation,
+            bundleSHA256: bundleSHA,
+            directoryIdentity: openedIdentity,
+            directoryMode: directoryMode)
     }
 
     // MARK: - Eligibility (§8.1)
@@ -791,6 +1279,12 @@ enum SessionSnapshotTransaction {
             throw SessionError.notEligible(
                 "metadata.json changed during stable read")
         }
+        return try parseMetadataData(data)
+    }
+
+    private static func parseMetadataData(
+        _ data: Data
+    ) throws -> (value: StrictFinalizedSessionMetadata, sha256: String) {
         guard let object = try? StrictJSONDocumentParser.object(
             from: data,
             limits: StrictJSONDocumentLimits(
@@ -983,6 +1477,29 @@ enum SessionSnapshotTransaction {
             lhs.st_mtimespec.tv_nsec == rhs.st_mtimespec.tv_nsec &&
             lhs.st_ctimespec.tv_sec == rhs.st_ctimespec.tv_sec &&
             lhs.st_ctimespec.tv_nsec == rhs.st_ctimespec.tv_nsec
+    }
+
+    private static func sameDirectoryIdentity(_ lhs: stat, _ rhs: stat) -> Bool {
+        return (lhs.st_mode & S_IFMT) == S_IFDIR
+            && (rhs.st_mode & S_IFMT) == S_IFDIR
+            && lhs.st_dev == rhs.st_dev
+            && lhs.st_ino == rhs.st_ino
+    }
+
+    /// Rename and RENAME_SWAP may legitimately advance ctime on the same
+    /// inode. Across an atomic namespace mutation, bind the immutable file by
+    /// dev/inode/type/mode/link/size; stable reads still use the stricter
+    /// `sameFileIdentity` including mtime/ctime.
+    private static func sameCommittedFileObject(_ lhs: stat, _ rhs: stat) -> Bool {
+        return lhs.st_dev == rhs.st_dev
+            && lhs.st_ino == rhs.st_ino
+            && (lhs.st_mode & S_IFMT) == S_IFREG
+            && (rhs.st_mode & S_IFMT) == S_IFREG
+            && (lhs.st_mode & mode_t(0o777)) == committedFileMode
+            && (rhs.st_mode & mode_t(0o777)) == committedFileMode
+            && lhs.st_nlink == 1
+            && rhs.st_nlink == 1
+            && lhs.st_size == rhs.st_size
     }
 
     private static func checkEligibility(
@@ -1216,80 +1733,234 @@ enum SessionSnapshotTransaction {
         }
     }
 
+    /// FD-relative form used for committed generation validation. Every
+    /// lookup stays under the already-bound snapshot root, so replacing the
+    /// generation pathname cannot redirect WAL/journal inspection.
+    private static func validateWALJournalState(
+        parentDescriptor: Int32,
+        databaseName: String,
+        phase: String
+    ) throws {
+        for suffix in walJournalNames {
+            let name = databaseName + suffix
+            var fileStat = stat()
+            if fstatat(
+                parentDescriptor,
+                name,
+                &fileStat,
+                AT_SYMLINK_NOFOLLOW) != 0 {
+                if errno == ENOENT { continue }
+                throw SessionError.notEligible(
+                    "\(phase): cannot inspect \(name)")
+            }
+            guard (fileStat.st_mode & S_IFMT) == S_IFREG,
+                  fileStat.st_nlink == 1 else {
+                throw SessionError.notEligible(
+                    "\(phase): \(name) is not a single regular file")
+            }
+            guard fileStat.st_size == 0 else {
+                throw SessionError.notEligible(
+                    "\(phase): non-empty \(name) present; "
+                    + "the session DB is not a single-file checkpoint")
+            }
+        }
+    }
+
     // MARK: - Immutable commit / recovery helpers
 
-    @discardableResult
-    private static func validateCommittedRegularFile(
-        _ url: URL
-    ) throws -> stat {
-        var fileStat = stat()
-        guard lstat(url.path, &fileStat) == 0,
-              (fileStat.st_mode & S_IFMT) == S_IFREG,
-              fileStat.st_nlink == 1 else {
-            throw SessionError.notEligible(
-                "committed artifact is not one regular file: "
-                + url.lastPathComponent)
-        }
-        guard (fileStat.st_mode & 0o777) == committedFileMode else {
-            throw SessionError.notEligible(
-                "committed artifact mode is not 0444: "
-                + url.lastPathComponent)
-        }
-        return fileStat
-    }
-
-    private static func validateCommittedDirectory(_ url: URL) throws {
-        var directoryStat = stat()
-        guard lstat(url.path, &directoryStat) == 0,
-              (directoryStat.st_mode & S_IFMT) == S_IFDIR else {
-            throw SessionError.notEligible(
-                "snapshot is not a real directory")
-        }
-        guard (directoryStat.st_mode & 0o777) == committedDirectoryMode else {
-            throw SessionError.notEligible(
-                "snapshot directory mode is not 0555")
-        }
-    }
-
-    private static func removeImmutableTree(_ directory: URL) throws {
-        var directoryStat = stat()
-        guard lstat(directory.path, &directoryStat) == 0,
-              (directoryStat.st_mode & S_IFMT) == S_IFDIR else {
+    /// Removes a snapshot transaction tree after first binding the pathname
+    /// to the durable intent's dev/inode. The 0700 cleanup mode is accepted
+    /// on retry so a real process death during recursive deletion remains
+    /// recoverable even after manifest/payload files have already vanished.
+    private static func removeImmutableTree(
+        _ directory: URL,
+        expectedIdentity: ImmutableDirectoryPublication.Identity? = nil
+    ) throws {
+        let parent = directory.deletingLastPathComponent()
+        let openedParent = try openStableDirectoryNoFollow(
+            parent, context: "snapshot cleanup parent")
+        defer { _ = close(openedParent.descriptor) }
+        let descriptor = openat(
+            openedParent.descriptor,
+            directory.lastPathComponent,
+            O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)
+        guard descriptor >= 0 else {
             throw SessionError.copyFailed(
-                "refusing to remove non-directory snapshot path")
+                "cannot open snapshot tree for identity-bound removal")
         }
-        guard chmod(directory.path, S_IRWXU) == 0 else {
+        defer { _ = close(descriptor) }
+        var opened = stat()
+        var pathBefore = stat()
+        guard fstat(descriptor, &opened) == 0,
+              (opened.st_mode & S_IFMT) == S_IFDIR,
+              fstatat(
+                openedParent.descriptor,
+                directory.lastPathComponent,
+                &pathBefore,
+                AT_SYMLINK_NOFOLLOW) == 0,
+              sameDirectoryIdentity(opened, pathBefore) else {
+            throw SessionError.copyFailed(
+                "snapshot tree changed before removal")
+        }
+        if let expectedIdentity {
+            guard UInt64(opened.st_dev) == expectedIdentity.device,
+                  UInt64(opened.st_ino) == expectedIdentity.inode else {
+                throw SessionError.copyFailed(
+                    "snapshot cleanup dev/inode differs from transaction intent")
+            }
+        }
+        guard fchmod(descriptor, cleanupDirectoryMode) == 0,
+              fsync(descriptor) == 0 else {
             throw SessionError.copyFailed(
                 "cannot make immutable snapshot removable")
         }
-        try FileManager.default.removeItem(at: directory)
+        try faultInjector?(.afterCleanupRootPreparedBeforeRemoval)
+        try requireBoundDirectoryPath(
+            descriptor: descriptor,
+            expectedIdentity: expectedIdentity,
+            expectedMode: cleanupDirectoryMode,
+            parentDescriptor: openedParent.descriptor,
+            parentURL: parent,
+            parentMetadata: openedParent.metadata,
+            basename: directory.lastPathComponent,
+            context: "snapshot tree before recursive removal")
+        try removeFlatSnapshotContents(
+            directoryDescriptor: descriptor,
+            context: directory.lastPathComponent)
+        guard fsync(descriptor) == 0 else {
+            throw SessionError.copyFailed(
+                "cannot sync snapshot tree after content removal")
+        }
+        try requireBoundDirectoryPath(
+            descriptor: descriptor,
+            expectedIdentity: expectedIdentity,
+            expectedMode: cleanupDirectoryMode,
+            parentDescriptor: openedParent.descriptor,
+            parentURL: parent,
+            parentMetadata: openedParent.metadata,
+            basename: directory.lastPathComponent,
+            context: "snapshot tree before root removal")
+        guard unlinkat(
+            openedParent.descriptor,
+            directory.lastPathComponent,
+            AT_REMOVEDIR) == 0 else {
+            throw SessionError.copyFailed(
+                "cannot remove identity-bound snapshot root")
+        }
+        guard fsync(openedParent.descriptor) == 0 else {
+            throw SessionError.copyFailed(
+                "cannot sync snapshot cleanup parent")
+        }
     }
 
-    /// Foundation's `moveItem` may reject a 0555 source directory before
-    /// issuing the same-volume rename on some macOS releases. Snapshot
-    /// generations are deliberately frozen before publication, so use the
-    /// Darwin primitive directly and keep the destination no-replace.
-    private static func renameDirectoryExclusively(
-        _ source: URL,
-        to destination: URL,
+    private static func removeFlatSnapshotContents(
+        directoryDescriptor: Int32,
         context: String
     ) throws {
-        guard renameatx_np(
-            AT_FDCWD, source.path,
-            AT_FDCWD, destination.path,
-            UInt32(RENAME_EXCL)) == 0 else {
-            let renameError = errno
-            throw SessionError.copyFailed(
-                context + ": " + String(cString: strerror(renameError)))
+        let names = try directoryEntryNames(
+            atBoundDirectoryDescriptor: directoryDescriptor,
+            context: context,
+            maximumEntries: maximumSnapshotDirectoryEntries)
+        for name in names {
+            var metadata = stat()
+            guard fstatat(
+                directoryDescriptor,
+                name,
+                &metadata,
+                AT_SYMLINK_NOFOLLOW) == 0,
+                  (metadata.st_mode & S_IFMT) == S_IFREG,
+                  metadata.st_nlink == 1 else {
+                throw SessionError.copyFailed(
+                    "snapshot cleanup found a non-regular or linked child")
+            }
+            guard unlinkat(directoryDescriptor, name, 0) == 0 else {
+                throw SessionError.copyFailed(
+                    "cannot remove snapshot cleanup child")
+            }
+            try faultInjector?(.afterCleanupChildRemoval)
         }
     }
 
     private static func recoverInterruptedCommitIfNeeded(
         taskRoot: URL,
         snapshotDirectory: URL,
-        backupDirectory: URL
+        backupDirectory: URL,
+        stagingDirectory: URL
+    ) throws {
+        try rejectUnboundSnapshotCreationTemporaries(taskRoot: taskRoot)
+        try cleanupSnapshotIntentTemporaryRemovalTombstones(
+            taskRoot: taskRoot)
+        try cleanupSnapshotIntentRemovalTombstones(taskRoot: taskRoot)
+        try cleanupSnapshotIntentTemporaries(taskRoot: taskRoot)
+        try cleanupTaskManifestTemporaryRemovalTombstones(taskRoot: taskRoot)
+        try cleanupTaskManifestRemovalTombstones(taskRoot: taskRoot)
+        let authorizedTaskTemporaries = try authorizeTaskManifestTemporaries(
+            taskRoot: taskRoot)
+        // These entries have already been jointly classified against the
+        // canonical task authority and durable intent. They are cleanup-only
+        // state in both pre-swap and normal post-swap cases, so detach them
+        // before recovery can remove the intent. A second crash can then
+        // never strand an authorized temp without its classification record.
+        try cleanupTaskManifestTemporaries(
+            taskRoot: taskRoot,
+            authorized: authorizedTaskTemporaries)
+        try recoverInterruptedCommitCore(
+            taskRoot: taskRoot,
+            snapshotDirectory: snapshotDirectory,
+            backupDirectory: backupDirectory,
+            stagingDirectory: stagingDirectory)
+        try faultInjector?(.afterRecoveryCoreBeforeReturn)
+    }
+
+    private static func recoverInterruptedCommitCore(
+        taskRoot: URL,
+        snapshotDirectory: URL,
+        backupDirectory: URL,
+        stagingDirectory: URL
     ) throws {
         let fileManager = FileManager.default
+        let transactionIntentURL = taskRoot.appendingPathComponent(
+            transactionIntentFileName)
+        if fileManager.fileExists(atPath: transactionIntentURL.path) {
+            let intentRecord = try readSnapshotCommitIntent(transactionIntentURL)
+            let intent = intentRecord.intent
+            guard intent.taskID == taskRoot.lastPathComponent else {
+                throw SessionError.copyFailed(
+                    "snapshot transaction intent task mismatch")
+            }
+            let taskManifest = try taskManifestDataIfPresent(taskRoot)
+            let taskManifestSHA = taskManifest.map(sha256)
+            if taskManifestSHA == intent.newManifestSHA256 {
+                try finishNewSnapshotGeneration(
+                    intent: intent,
+                    taskRoot: taskRoot,
+                    snapshotDirectory: snapshotDirectory,
+                    backupDirectory: backupDirectory,
+                    stagingDirectory: stagingDirectory,
+                    transactionIntentURL: transactionIntentURL,
+                    transactionIntentIdentity: intentRecord.fileIdentity)
+                return
+            }
+            guard taskManifestSHA == intent.priorManifestSHA256 else {
+                throw SessionError.copyFailed(
+                    "snapshot task reference matches neither transaction generation")
+            }
+            try restorePriorSnapshotGeneration(
+                intent: intent,
+                priorTaskManifest: taskManifest,
+                taskRoot: taskRoot,
+                snapshotDirectory: snapshotDirectory,
+                backupDirectory: backupDirectory,
+                stagingDirectory: stagingDirectory,
+                transactionIntentURL: transactionIntentURL,
+                transactionIntentIdentity: intentRecord.fileIdentity)
+            return
+        }
+
+        // Legacy cleanup for a transaction created before the durable intent
+        // existed. Only a fully frozen generation matching the authoritative
+        // task reference may be selected. A writable root without an intent
+        // is never repaired because it may be a post-commit mode tamper.
         guard fileManager.fileExists(atPath: backupDirectory.path) else {
             return
         }
@@ -1303,21 +1974,29 @@ enum SessionSnapshotTransaction {
                 do {
                     try revalidateSnapshot(backupDirectory)
                     try removeImmutableTree(snapshotDirectory)
-                    try renameDirectoryExclusively(
-                        backupDirectory,
-                        to: snapshotDirectory,
-                        context: "cannot restore verified snapshot backup")
-                    try fsyncDirectory(taskRoot)
+                    let backupIdentity = try ImmutableDirectoryPublication
+                        .identity(
+                            of: backupDirectory,
+                            allowedModes: [committedDirectoryMode])
+                    try ImmutableDirectoryPublication.publish(
+                        source: backupDirectory,
+                        destination: snapshotDirectory,
+                        expectedIdentity: backupIdentity)
+                    try revalidateSnapshot(snapshotDirectory)
                     return
                 } catch {
                     if snapshotMatchesTaskReferenceLoosely(
                         backupDirectory, taskRoot: taskRoot) {
                         try removeImmutableTree(snapshotDirectory)
-                        try renameDirectoryExclusively(
-                            backupDirectory,
-                            to: snapshotDirectory,
-                            context: "cannot restore referenced snapshot backup")
-                        try fsyncDirectory(taskRoot)
+                        let backupIdentity = try ImmutableDirectoryPublication
+                            .identity(
+                                of: backupDirectory,
+                                allowedModes: [committedDirectoryMode])
+                        try ImmutableDirectoryPublication.publish(
+                            source: backupDirectory,
+                            destination: snapshotDirectory,
+                            expectedIdentity: backupIdentity)
+                        try revalidateSnapshot(snapshotDirectory)
                         return
                     }
                     throw SessionError.copyFailed(
@@ -1332,11 +2011,1895 @@ enum SessionSnapshotTransaction {
             throw SessionError.copyFailed(
                 "orphaned snapshot backup does not match the task reference")
         }
-        try renameDirectoryExclusively(
-            backupDirectory,
-            to: snapshotDirectory,
-            context: "cannot recover orphaned snapshot backup")
+        let backupIdentity = try ImmutableDirectoryPublication.identity(
+            of: backupDirectory,
+            allowedModes: [committedDirectoryMode])
+        try ImmutableDirectoryPublication.publish(
+            source: backupDirectory,
+            destination: snapshotDirectory,
+            expectedIdentity: backupIdentity)
+        try revalidateSnapshot(snapshotDirectory)
+    }
+
+    private static func identityToken(
+        _ identity: ImmutableDirectoryPublication.Identity
+    ) -> String {
+        return String(identity.device) + "-" + String(identity.inode)
+    }
+
+    private static func parseIdentityToken(
+        _ token: String
+    ) -> ImmutableDirectoryPublication.Identity? {
+        let parts = token.split(
+            separator: "-", omittingEmptySubsequences: false)
+        guard parts.count == 2 else { return nil }
+        let deviceText = String(parts[0])
+        let inodeText = String(parts[1])
+        guard isCanonicalUnsignedDecimal(deviceText),
+              isCanonicalUnsignedDecimal(inodeText),
+              let device = UInt64(deviceText),
+              let inode = UInt64(inodeText) else {
+            return nil
+        }
+        return ImmutableDirectoryPublication.Identity(
+            device: device, inode: inode)
+    }
+
+    private static func isCanonicalLowercaseUUID(_ value: String) -> Bool {
+        guard let uuid = UUID(uuidString: value) else { return false }
+        return uuid.uuidString.lowercased() == value
+    }
+
+    private static func parseIdentityBoundName(
+        _ name: String,
+        prefix: String
+    ) -> IdentityBoundTemporaryName? {
+        guard name.hasPrefix(prefix) else { return nil }
+        let body = String(name.dropFirst(prefix.count))
+        let parts = body.split(
+            separator: ".", omittingEmptySubsequences: false)
+        guard parts.count == 2,
+              let identity = parseIdentityToken(String(parts[0])),
+              isCanonicalLowercaseUUID(String(parts[1])) else {
+            return nil
+        }
+        return IdentityBoundTemporaryName(identity: identity)
+    }
+
+    private static func parseTaskManifestTemporaryName(
+        _ name: String
+    ) -> TaskManifestTemporaryName? {
+        guard name.hasPrefix(taskManifestTemporaryPrefix),
+              name.hasSuffix(taskManifestTemporarySuffix) else {
+            return nil
+        }
+        let start = name.index(
+            name.startIndex,
+            offsetBy: taskManifestTemporaryPrefix.count)
+        let end = name.index(
+            name.endIndex,
+            offsetBy: -taskManifestTemporarySuffix.count)
+        let body = String(name[start..<end])
+        let parts = body.split(
+            separator: ".", omittingEmptySubsequences: false)
+        guard parts.count == 4,
+              let temporaryIdentity = parseIdentityToken(String(parts[0])),
+              isSHA256(String(parts[2])),
+              String(parts[2]) == String(parts[2]).lowercased(),
+              isCanonicalLowercaseUUID(String(parts[3])) else {
+            return nil
+        }
+        let displacedToken = String(parts[1])
+        let displacedIdentity: ImmutableDirectoryPublication.Identity?
+        if displacedToken == "none" {
+            displacedIdentity = nil
+        } else {
+            guard let parsed = parseIdentityToken(displacedToken) else {
+                return nil
+            }
+            displacedIdentity = parsed
+        }
+        return TaskManifestTemporaryName(
+            temporaryIdentity: temporaryIdentity,
+            expectedDisplacedIdentity: displacedIdentity,
+            targetSHA256: String(parts[2]))
+    }
+
+    private static func metadataIdentity(
+        _ metadata: stat
+    ) -> ImmutableDirectoryPublication.Identity {
+        return ImmutableDirectoryPublication.Identity(
+            device: UInt64(metadata.st_dev), inode: UInt64(metadata.st_ino))
+    }
+
+    private static func quarantineUnexpectedFile(
+        parentDescriptor: Int32,
+        basename: String,
+        conflictPrefix: String,
+        context: String
+    ) throws {
+        let conflictName = conflictPrefix + UUID().uuidString.lowercased()
+        if renameatx_np(
+            parentDescriptor, basename,
+            parentDescriptor, conflictName,
+            UInt32(RENAME_EXCL)) == 0 {
+            guard fsync(parentDescriptor) == 0 else {
+                throw SessionError.copyFailed(
+                    "cannot sync preserved \(context)")
+            }
+        }
+        throw SessionError.copyFailed(
+            "\(context) identity mismatch; evidence preserved")
+    }
+
+    private static func restoreOrQuarantineUnexpectedRemoval(
+        parentDescriptor: Int32,
+        tombstoneName: String,
+        canonicalName: String,
+        conflictPrefix: String,
+        context: String
+    ) throws {
+        var canonicalMetadata = stat()
+        let lookup = fstatat(
+            parentDescriptor,
+            canonicalName,
+            &canonicalMetadata,
+            AT_SYMLINK_NOFOLLOW)
+        if lookup != 0, errno == ENOENT,
+           renameatx_np(
+                parentDescriptor, tombstoneName,
+                parentDescriptor, canonicalName,
+                UInt32(RENAME_EXCL)) == 0 {
+            guard fsync(parentDescriptor) == 0 else {
+                throw SessionError.copyFailed(
+                    "cannot sync restored \(context)")
+            }
+            throw SessionError.copyFailed(
+                "\(context) identity mismatch; unexpected authority restored")
+        }
+        try quarantineUnexpectedFile(
+            parentDescriptor: parentDescriptor,
+            basename: tombstoneName,
+            conflictPrefix: conflictPrefix,
+            context: context)
+    }
+
+    private static func removeIdentityBoundTemporary(
+        parentDescriptor: Int32,
+        basename: String,
+        expectedMetadata: stat,
+        removalPrefix: String,
+        conflictPrefix: String,
+        context: String
+    ) throws {
+        let expectedIdentity = metadataIdentity(expectedMetadata)
+        let tombstoneName = removalPrefix + identityToken(expectedIdentity)
+            + "." + UUID().uuidString.lowercased()
+        guard renameatx_np(
+            parentDescriptor, basename,
+            parentDescriptor, tombstoneName,
+            UInt32(RENAME_EXCL)) == 0 else {
+            throw SessionError.copyFailed(
+                "cannot detach \(context)")
+        }
+        var moved = stat()
+        guard fstatat(
+            parentDescriptor,
+            tombstoneName,
+            &moved,
+            AT_SYMLINK_NOFOLLOW) == 0,
+              metadataIdentity(moved) == expectedIdentity,
+              (moved.st_mode & S_IFMT) == S_IFREG,
+              moved.st_nlink == 1 else {
+            try quarantineUnexpectedFile(
+                parentDescriptor: parentDescriptor,
+                basename: tombstoneName,
+                conflictPrefix: conflictPrefix,
+                context: context)
+            return
+        }
+        guard fsync(parentDescriptor) == 0,
+              unlinkat(parentDescriptor, tombstoneName, 0) == 0,
+              fsync(parentDescriptor) == 0 else {
+            throw SessionError.copyFailed(
+                "cannot durably remove \(context)")
+        }
+    }
+
+    private static func rejectUnboundSnapshotCreationTemporaries(
+        taskRoot: URL
+    ) throws {
+        let openedParent = try openStableDirectoryNoFollow(
+            taskRoot, context: "snapshot unbound temporary parent")
+        defer { _ = close(openedParent.descriptor) }
+        let names = try directoryEntryNames(
+            atBoundDirectoryDescriptor: openedParent.descriptor,
+            context: "snapshot unbound temporary parent",
+            maximumEntries: maximumSnapshotDirectoryEntries)
+        for name in names {
+            let mapping: (prefix: String, conflict: String)?
+            if name.hasPrefix(transactionIntentCreationPrefix) {
+                mapping = (
+                    transactionIntentCreationPrefix,
+                    transactionIntentConflictPrefix)
+            } else if name.hasPrefix(taskManifestCreationPrefix) {
+                mapping = (
+                    taskManifestCreationPrefix,
+                    taskManifestConflictPrefix)
+            } else {
+                mapping = nil
+            }
+            guard let mapping else { continue }
+            let suffix = String(name.dropFirst(mapping.prefix.count))
+            guard isCanonicalLowercaseUUID(suffix) else {
+                throw SessionError.copyFailed(
+                    "malformed unbound snapshot creation temporary preserved")
+            }
+            try quarantineUnexpectedFile(
+                parentDescriptor: openedParent.descriptor,
+                basename: name,
+                conflictPrefix: mapping.conflict,
+                context: "unbound snapshot creation temporary")
+        }
+    }
+
+    private static func cleanupIdentityBoundTemporaryRemovalTombstones(
+        taskRoot: URL,
+        prefix: String,
+        conflictPrefix: String,
+        maximumBytes: Int,
+        context: String
+    ) throws {
+        let openedParent = try openStableDirectoryNoFollow(
+            taskRoot, context: context + " parent")
+        defer { _ = close(openedParent.descriptor) }
+        let names = try directoryEntryNames(
+            atBoundDirectoryDescriptor: openedParent.descriptor,
+            context: context + " parent",
+            maximumEntries: maximumSnapshotDirectoryEntries)
+        var removed = false
+        for name in names where name.hasPrefix(prefix) {
+            guard let parsed = parseIdentityBoundName(name, prefix: prefix) else {
+                throw SessionError.copyFailed(
+                    "malformed \(context) preserved")
+            }
+            var metadata = stat()
+            guard fstatat(
+                openedParent.descriptor,
+                name,
+                &metadata,
+                AT_SYMLINK_NOFOLLOW) == 0 else {
+                throw SessionError.copyFailed(
+                    "cannot inspect \(context)")
+            }
+            guard metadataIdentity(metadata) == parsed.identity else {
+                try quarantineUnexpectedFile(
+                    parentDescriptor: openedParent.descriptor,
+                    basename: name,
+                    conflictPrefix: conflictPrefix,
+                    context: context)
+                return
+            }
+            guard (metadata.st_mode & S_IFMT) == S_IFREG,
+                  metadata.st_nlink == 1,
+                  metadata.st_size >= 0,
+                  metadata.st_size <= maximumBytes,
+                  [mode_t(0o600), committedFileMode].contains(
+                    metadata.st_mode & mode_t(0o777)),
+                  unlinkat(openedParent.descriptor, name, 0) == 0 else {
+                throw SessionError.copyFailed(
+                    "invalid \(context)")
+            }
+            removed = true
+        }
+        if removed, fsync(openedParent.descriptor) != 0 {
+            throw SessionError.copyFailed(
+                "cannot sync \(context) cleanup")
+        }
+    }
+
+    private static func cleanupSnapshotIntentTemporaryRemovalTombstones(
+        taskRoot: URL
+    ) throws {
+        try cleanupIdentityBoundTemporaryRemovalTombstones(
+            taskRoot: taskRoot,
+            prefix: transactionIntentTemporaryRemovalPrefix,
+            conflictPrefix: transactionIntentConflictPrefix,
+            maximumBytes: maximumSnapshotTransactionIntentBytes,
+            context: "snapshot intent-temporary removal tombstone")
+    }
+
+    private static func cleanupTaskManifestTemporaryRemovalTombstones(
+        taskRoot: URL
+    ) throws {
+        try cleanupIdentityBoundTemporaryRemovalTombstones(
+            taskRoot: taskRoot,
+            prefix: taskManifestTemporaryRemovalPrefix,
+            conflictPrefix: taskManifestConflictPrefix,
+            maximumBytes: maximumTaskManifestBytes,
+            context: "task-reference temporary removal tombstone")
+    }
+
+    private static func cleanupSnapshotIntentTemporaries(
+        taskRoot: URL
+    ) throws {
+        let openedParent = try openStableDirectoryNoFollow(
+            taskRoot, context: "snapshot intent temporary parent")
+        defer { _ = close(openedParent.descriptor) }
+        let names = try directoryEntryNames(
+            atBoundDirectoryDescriptor: openedParent.descriptor,
+            context: "snapshot intent temporary parent",
+            maximumEntries: maximumSnapshotDirectoryEntries)
+        for name in names where
+            name.hasPrefix(transactionIntentTemporaryPrefix)
+                && !name.hasPrefix(transactionIntentTemporaryRemovalPrefix) {
+            guard let parsed = parseIdentityBoundName(
+                name, prefix: transactionIntentTemporaryPrefix) else {
+                throw SessionError.copyFailed(
+                    "malformed orphan snapshot transaction temporary preserved")
+            }
+            var canonical = stat()
+            guard fstatat(
+                openedParent.descriptor,
+                transactionIntentFileName,
+                &canonical,
+                AT_SYMLINK_NOFOLLOW) != 0,
+                  errno == ENOENT else {
+                throw SessionError.copyFailed(
+                    "snapshot transaction temporary coexists with canonical intent")
+            }
+            var metadata = stat()
+            guard fstatat(
+                openedParent.descriptor,
+                name,
+                &metadata,
+                AT_SYMLINK_NOFOLLOW) == 0,
+                  metadataIdentity(metadata) == parsed.identity,
+                  (metadata.st_mode & S_IFMT) == S_IFREG,
+                  metadata.st_nlink == 1,
+                  metadata.st_size >= 0,
+                  metadata.st_size <= maximumSnapshotTransactionIntentBytes,
+                  [mode_t(0o600), committedFileMode].contains(
+                    metadata.st_mode & mode_t(0o777)) else {
+                throw SessionError.copyFailed(
+                    "orphan snapshot transaction temporary identity mismatch")
+            }
+            if metadata.st_mode & mode_t(0o777) == committedFileMode {
+                let record = try readSnapshotCommitIntent(
+                    taskRoot.appendingPathComponent(name))
+                guard record.fileIdentity == parsed.identity,
+                      record.intent.taskID == taskRoot.lastPathComponent else {
+                    throw SessionError.copyFailed(
+                        "orphan snapshot transaction temporary payload mismatch")
+                }
+            }
+            try removeIdentityBoundTemporary(
+                parentDescriptor: openedParent.descriptor,
+                basename: name,
+                expectedMetadata: metadata,
+                removalPrefix: transactionIntentTemporaryRemovalPrefix,
+                conflictPrefix: transactionIntentConflictPrefix,
+                context: "snapshot transaction temporary")
+        }
+        try requireOpenDirectoryPath(
+            descriptor: openedParent.descriptor,
+            url: taskRoot,
+            expectedMetadata: openedParent.metadata,
+            context: "snapshot intent temporary parent after cleanup")
+    }
+
+    private static func cleanupSnapshotIntentRemovalTombstones(
+        taskRoot: URL
+    ) throws {
+        let openedParent = try openStableDirectoryNoFollow(
+            taskRoot, context: "snapshot intent-removal parent")
+        defer { _ = close(openedParent.descriptor) }
+        let names = try directoryEntryNames(
+            atBoundDirectoryDescriptor: openedParent.descriptor,
+            context: "snapshot intent-removal parent",
+            maximumEntries: maximumSnapshotDirectoryEntries)
+        var removed = false
+        for name in names where name.hasPrefix(transactionIntentRemovalPrefix) {
+            guard let parsed = parseIdentityBoundName(
+                name, prefix: transactionIntentRemovalPrefix) else {
+                throw SessionError.copyFailed(
+                    "malformed snapshot intent-removal tombstone preserved")
+            }
+            var metadata = stat()
+            guard fstatat(
+                openedParent.descriptor,
+                name,
+                &metadata,
+                AT_SYMLINK_NOFOLLOW) == 0 else {
+                throw SessionError.copyFailed(
+                    "cannot inspect snapshot intent-removal tombstone")
+            }
+            guard metadataIdentity(metadata) == parsed.identity else {
+                try restoreOrQuarantineUnexpectedRemoval(
+                    parentDescriptor: openedParent.descriptor,
+                    tombstoneName: name,
+                    canonicalName: transactionIntentFileName,
+                    conflictPrefix: transactionIntentConflictPrefix,
+                    context: "snapshot intent-removal tombstone")
+                return
+            }
+            let record = try readSnapshotCommitIntent(
+                taskRoot.appendingPathComponent(name))
+            guard record.fileIdentity == parsed.identity,
+                  record.intent.taskID == taskRoot.lastPathComponent,
+                  unlinkat(openedParent.descriptor, name, 0) == 0 else {
+                throw SessionError.copyFailed(
+                    "invalid snapshot intent-removal tombstone")
+            }
+            removed = true
+        }
+        if removed, fsync(openedParent.descriptor) != 0 {
+            throw SessionError.copyFailed(
+                "cannot sync snapshot intent-removal cleanup")
+        }
+    }
+
+    private static func cleanupTaskManifestRemovalTombstones(
+        taskRoot: URL
+    ) throws {
+        let openedParent = try openStableDirectoryNoFollow(
+            taskRoot, context: "task-reference removal parent")
+        defer { _ = close(openedParent.descriptor) }
+        let names = try directoryEntryNames(
+            atBoundDirectoryDescriptor: openedParent.descriptor,
+            context: "task-reference removal parent",
+            maximumEntries: maximumSnapshotDirectoryEntries)
+        let removalNames = names.filter {
+            $0.hasPrefix(taskManifestRemovalPrefix)
+        }
+        guard !removalNames.isEmpty else { return }
+        let intentRecord: ReadSnapshotCommitIntent
+        do {
+            intentRecord = try readSnapshotCommitIntent(
+                taskRoot.appendingPathComponent(transactionIntentFileName))
+        } catch {
+            throw SessionError.copyFailed(
+                "task-reference removal tombstone exists without durable intent")
+        }
+        let intent = intentRecord.intent
+        guard intent.priorManifestSHA256 == nil,
+              intent.priorIdentity == nil else {
+            throw SessionError.copyFailed(
+                "task-reference removal tombstone intent is inconsistent")
+        }
+        var removed = false
+        for name in removalNames {
+            guard let parsed = parseIdentityBoundName(
+                name, prefix: taskManifestRemovalPrefix) else {
+                throw SessionError.copyFailed(
+                    "malformed task-reference removal tombstone preserved")
+            }
+            var metadata = stat()
+            guard fstatat(
+                openedParent.descriptor,
+                name,
+                &metadata,
+                AT_SYMLINK_NOFOLLOW) == 0 else {
+                throw SessionError.copyFailed(
+                    "cannot inspect task-reference removal tombstone")
+            }
+            guard metadataIdentity(metadata) == parsed.identity else {
+                try restoreOrQuarantineUnexpectedRemoval(
+                    parentDescriptor: openedParent.descriptor,
+                    tombstoneName: name,
+                    canonicalName: "input_manifest.json",
+                    conflictPrefix: taskManifestConflictPrefix,
+                    context: "task-reference removal tombstone")
+                return
+            }
+            guard let stable = try readStableCommittedFileIfPresent(
+                parentDescriptor: openedParent.descriptor,
+                basename: name,
+                maximumBytes: maximumTaskManifestBytes),
+                  stable.identity == parsed.identity,
+                  sha256(stable.data) == intent.newManifestSHA256,
+                  unlinkat(openedParent.descriptor, name, 0) == 0 else {
+                throw SessionError.copyFailed(
+                    "invalid task-reference removal tombstone")
+            }
+            removed = true
+        }
+        if removed, fsync(openedParent.descriptor) != 0 {
+            throw SessionError.copyFailed(
+                "cannot sync task-reference removal cleanup")
+        }
+    }
+
+    /// Preflights identity-bearing task-reference temporaries before recovery
+    /// mutates a generation. The encoded temporary/old-authority identities
+    /// distinguish pre-swap, normal post-swap and unrelated displaced files.
+    private static func authorizeTaskManifestTemporaries(
+        taskRoot: URL
+    ) throws -> [String: stat] {
+        let openedParent = try openStableDirectoryNoFollow(
+            taskRoot, context: "task manifest temporary parent")
+        defer { _ = close(openedParent.descriptor) }
+        let names = try directoryEntryNames(
+            atBoundDirectoryDescriptor: openedParent.descriptor,
+            context: "task manifest temporary parent",
+            maximumEntries: maximumSnapshotDirectoryEntries)
+        let temporaryNames = names.filter {
+            $0.hasPrefix(taskManifestTemporaryPrefix)
+                && $0.hasSuffix(taskManifestTemporarySuffix)
+        }
+        guard !temporaryNames.isEmpty else { return [:] }
+
+        let intentURL = taskRoot.appendingPathComponent(
+            transactionIntentFileName)
+        let intent: SnapshotCommitIntent?
+        var intentMetadata = stat()
+        if fstatat(
+            openedParent.descriptor,
+            transactionIntentFileName,
+            &intentMetadata,
+            AT_SYMLINK_NOFOLLOW) == 0 {
+            intent = try readSnapshotCommitIntent(intentURL).intent
+        } else if errno == ENOENT {
+            intent = nil
+        } else {
+            throw SessionError.copyFailed(
+                "cannot inspect snapshot transaction intent during temporary recovery")
+        }
+        let allowedSHA256 = Set([
+            intent?.newManifestSHA256,
+            intent?.priorManifestSHA256,
+        ].compactMap { $0 })
+        var authorized: [String: stat] = [:]
+        for name in temporaryNames {
+            guard let parsed = parseTaskManifestTemporaryName(name) else {
+                throw SessionError.copyFailed(
+                    "malformed snapshot task-reference temporary preserved")
+            }
+            if let intent,
+               !allowedSHA256.contains(parsed.targetSHA256) {
+                throw SessionError.copyFailed(
+                    "snapshot task-reference temporary target is not intent-bound")
+            }
+            var metadata = stat()
+            guard fstatat(
+                openedParent.descriptor,
+                name,
+                &metadata,
+                AT_SYMLINK_NOFOLLOW) == 0,
+                  (metadata.st_mode & S_IFMT) == S_IFREG,
+                  metadata.st_nlink == 1,
+                  metadata.st_size >= 0,
+                  metadata.st_size <= maximumTaskManifestBytes else {
+                throw SessionError.copyFailed(
+                    "invalid orphan snapshot task-reference temporary")
+            }
+            let actualIdentity = metadataIdentity(metadata)
+            let canonical = try readStableCommittedFileIfPresent(
+                parentDescriptor: openedParent.descriptor,
+                basename: "input_manifest.json",
+                maximumBytes: maximumTaskManifestBytes)
+
+            if actualIdentity == parsed.temporaryIdentity {
+                guard intent != nil,
+                      [mode_t(0o600), committedFileMode].contains(
+                        metadata.st_mode & mode_t(0o777)) else {
+                    throw SessionError.copyFailed(
+                        "pre-swap task-reference temporary lacks durable intent")
+                }
+                if let expectedDisplaced = parsed.expectedDisplacedIdentity {
+                    guard canonical?.identity == expectedDisplaced else {
+                        throw SessionError.copyFailed(
+                            "pre-swap task-reference authority identity changed")
+                    }
+                } else {
+                    guard canonical == nil else {
+                        throw SessionError.copyFailed(
+                            "first-generation task-reference authority appeared")
+                    }
+                }
+                if metadata.st_mode & mode_t(0o777) == committedFileMode {
+                    guard let stable = try readStableCommittedFileIfPresent(
+                        parentDescriptor: openedParent.descriptor,
+                        basename: name,
+                        maximumBytes: maximumTaskManifestBytes),
+                          stable.identity == parsed.temporaryIdentity,
+                          sha256(stable.data) == parsed.targetSHA256 else {
+                        throw SessionError.copyFailed(
+                            "pre-swap task-reference temporary payload changed")
+                    }
+                    metadata = stable.metadata
+                }
+                authorized[name] = metadata
+                continue
+            }
+
+            guard let expectedDisplaced = parsed.expectedDisplacedIdentity,
+                  actualIdentity == expectedDisplaced,
+                  metadata.st_mode & mode_t(0o777) == committedFileMode,
+                  let installed = canonical,
+                  installed.identity == parsed.temporaryIdentity,
+                  sha256(installed.data) == parsed.targetSHA256 else {
+                throw SessionError.copyFailed(
+                    "task-reference swap displaced unrelated authority; evidence preserved")
+            }
+            guard let stableDisplaced = try readStableCommittedFileIfPresent(
+                    parentDescriptor: openedParent.descriptor,
+                    basename: name,
+                    maximumBytes: maximumTaskManifestBytes),
+                  stableDisplaced.identity == expectedDisplaced else {
+                throw SessionError.copyFailed(
+                    "displaced task-reference identity changed during authorization")
+            }
+            if intent != nil {
+                guard allowedSHA256.contains(sha256(stableDisplaced.data)) else {
+                    throw SessionError.copyFailed(
+                        "displaced task-reference bytes are not intent-bound")
+                }
+            }
+            authorized[name] = stableDisplaced.metadata
+        }
+        try requireOpenDirectoryPath(
+            descriptor: openedParent.descriptor,
+            url: taskRoot,
+            expectedMetadata: openedParent.metadata,
+            context: "task manifest temporary parent after authorization")
+        return authorized
+    }
+
+    private static func cleanupTaskManifestTemporaries(
+        taskRoot: URL,
+        authorized: [String: stat]
+    ) throws {
+        guard !authorized.isEmpty else { return }
+        let openedParent = try openStableDirectoryNoFollow(
+            taskRoot, context: "task manifest temporary cleanup parent")
+        defer { _ = close(openedParent.descriptor) }
+        for (name, expectedMetadata) in authorized {
+            var current = stat()
+            if fstatat(
+                openedParent.descriptor,
+                name,
+                &current,
+                AT_SYMLINK_NOFOLLOW) != 0 {
+                if errno == ENOENT { continue }
+                throw SessionError.copyFailed(
+                    "cannot inspect authorized task-reference temporary")
+            }
+            guard sameFileIdentity(expectedMetadata, current) else {
+                throw SessionError.copyFailed(
+                    "authorized task-reference temporary changed before cleanup")
+            }
+            try removeIdentityBoundTemporary(
+                parentDescriptor: openedParent.descriptor,
+                basename: name,
+                expectedMetadata: current,
+                removalPrefix: taskManifestTemporaryRemovalPrefix,
+                conflictPrefix: taskManifestConflictPrefix,
+                context: "authorized task-reference temporary")
+        }
+        if fsync(openedParent.descriptor) != 0 {
+            throw SessionError.copyFailed(
+                "cannot sync task root after task-reference temporary cleanup")
+        }
+    }
+
+    private static func rollbackSnapshotCommit(
+        intent: SnapshotCommitIntent,
+        priorTaskManifest: Data?,
+        taskRoot: URL,
+        snapshotDirectory: URL,
+        backupDirectory: URL,
+        stagingDirectory: URL,
+        transactionIntentURL: URL,
+        transactionIntentIdentity: ImmutableDirectoryPublication.Identity
+    ) throws {
+        try restorePriorSnapshotGeneration(
+            intent: intent,
+            priorTaskManifest: priorTaskManifest,
+            taskRoot: taskRoot,
+            snapshotDirectory: snapshotDirectory,
+            backupDirectory: backupDirectory,
+            stagingDirectory: stagingDirectory,
+            transactionIntentURL: transactionIntentURL,
+            transactionIntentIdentity: transactionIntentIdentity)
+    }
+
+    private static func finishNewSnapshotGeneration(
+        intent: SnapshotCommitIntent,
+        taskRoot: URL,
+        snapshotDirectory: URL,
+        backupDirectory: URL,
+        stagingDirectory: URL,
+        transactionIntentURL: URL,
+        transactionIntentIdentity: ImmutableDirectoryPublication.Identity
+    ) throws {
+        let generation = try validateIntentBoundGeneration(
+            snapshotDirectory,
+            expectedManifestSHA256: intent.newManifestSHA256,
+            expectedIdentity: intent.newIdentity)
+        try ImmutableDirectoryPublication.freezeInterruptedDestination(
+            snapshotDirectory, expectedIdentity: intent.newIdentity)
+        guard generation.taskID == intent.taskID else {
+            throw SessionError.copyFailed(
+                "new snapshot generation task mismatch")
+        }
+        try revalidateSnapshot(
+            snapshotDirectory,
+            expectedDirectoryIdentity: intent.newIdentity,
+            expectedManifestSHA256: intent.newManifestSHA256)
+        if FileManager.default.fileExists(atPath: backupDirectory.path) {
+            guard let priorIdentity = intent.priorIdentity else {
+                throw SessionError.copyFailed(
+                    "committed snapshot has an unexpected backup generation")
+            }
+            try removeImmutableTree(
+                backupDirectory, expectedIdentity: priorIdentity)
+        }
+        if FileManager.default.fileExists(atPath: stagingDirectory.path) {
+            try removeImmutableTree(
+                stagingDirectory, expectedIdentity: intent.newIdentity)
+        }
         try fsyncDirectory(taskRoot)
+        try revalidateSnapshot(
+            snapshotDirectory,
+            expectedDirectoryIdentity: intent.newIdentity,
+            expectedManifestSHA256: intent.newManifestSHA256)
+        try removeSnapshotCommitIntent(
+            transactionIntentURL,
+            expectedIntent: intent,
+            expectedIdentity: transactionIntentIdentity)
+    }
+
+    private static func restorePriorSnapshotGeneration(
+        intent: SnapshotCommitIntent,
+        priorTaskManifest: Data?,
+        taskRoot: URL,
+        snapshotDirectory: URL,
+        backupDirectory: URL,
+        stagingDirectory: URL,
+        transactionIntentURL: URL,
+        transactionIntentIdentity: ImmutableDirectoryPublication.Identity
+    ) throws {
+        let fileManager = FileManager.default
+        let taskManifestURL = taskRoot.appendingPathComponent(
+            "input_manifest.json")
+        let currentTaskManifestSHA = try taskManifestDataIfPresent(taskRoot)
+            .map(sha256)
+        let allowedAuthoritySHAs = Set([
+            intent.newManifestSHA256,
+            intent.priorManifestSHA256,
+        ].compactMap { $0 })
+        if let currentTaskManifestSHA {
+            guard allowedAuthoritySHAs.contains(currentTaskManifestSHA) else {
+                throw SessionError.copyFailed(
+                    "snapshot rollback found an unrelated task authority")
+            }
+        } else if intent.priorManifestSHA256 != nil {
+            throw SessionError.copyFailed(
+                "snapshot rollback lost the prior task authority")
+        }
+
+        if let priorSHA = intent.priorManifestSHA256,
+           let priorIdentity = intent.priorIdentity {
+            var priorLocation: URL?
+            if fileManager.fileExists(atPath: backupDirectory.path),
+               (try? validateIntentBoundGeneration(
+                    backupDirectory,
+                    expectedManifestSHA256: priorSHA,
+                    expectedIdentity: priorIdentity)) != nil {
+                priorLocation = backupDirectory
+            } else if fileManager.fileExists(atPath: snapshotDirectory.path),
+                      (try? validateIntentBoundGeneration(
+                        snapshotDirectory,
+                        expectedManifestSHA256: priorSHA,
+                        expectedIdentity: priorIdentity)) != nil {
+                priorLocation = snapshotDirectory
+            }
+            guard let priorLocation else {
+                throw SessionError.copyFailed(
+                    "transaction cannot locate the prior snapshot generation")
+            }
+
+            guard let priorTaskManifest,
+                  sha256(priorTaskManifest) == priorSHA else {
+                throw SessionError.copyFailed(
+                    "prior task reference bytes unavailable for rollback")
+            }
+            // Restore the authority first. If a second process death lands
+            // during cleanup or backup publication, restart will select the
+            // prior generation again instead of trying to finish a new
+            // generation that has already been removed.
+            if currentTaskManifestSHA != priorSHA {
+                try writeTaskManifest(
+                    priorTaskManifest, to: taskManifestURL, taskRoot: taskRoot)
+            } else {
+                try fsyncDirectory(taskRoot)
+            }
+            try faultInjector?(
+                .afterPriorAuthorityRestoreBeforeGenerationCleanup)
+
+            if priorLocation == backupDirectory {
+                if fileManager.fileExists(atPath: snapshotDirectory.path) {
+                    try removeImmutableTree(
+                        snapshotDirectory,
+                        expectedIdentity: intent.newIdentity)
+                }
+                try ImmutableDirectoryPublication.publish(
+                    source: backupDirectory,
+                    destination: snapshotDirectory,
+                    expectedIdentity: priorIdentity)
+            } else {
+                try ImmutableDirectoryPublication.freezeInterruptedDestination(
+                    snapshotDirectory, expectedIdentity: priorIdentity)
+            }
+            try revalidateSnapshot(
+                snapshotDirectory,
+                expectedDirectoryIdentity: priorIdentity,
+                expectedManifestSHA256: priorSHA)
+        } else {
+            guard intent.priorManifestSHA256 == nil,
+                  intent.priorIdentity == nil,
+                  priorTaskManifest == nil else {
+                throw SessionError.copyFailed(
+                    "first-generation snapshot intent is internally inconsistent")
+            }
+            // Absence is the prior authority for the first generation. Make
+            // that state durable before destroying any new snapshot bytes.
+            try clearTaskManifestForRollback(
+                taskRoot: taskRoot,
+                expectedNewManifestSHA256: intent.newManifestSHA256)
+            try faultInjector?(
+                .afterPriorAuthorityRestoreBeforeGenerationCleanup)
+            if fileManager.fileExists(atPath: snapshotDirectory.path) {
+                try removeImmutableTree(
+                    snapshotDirectory,
+                    expectedIdentity: intent.newIdentity)
+            }
+        }
+
+        if fileManager.fileExists(atPath: stagingDirectory.path) {
+            try removeImmutableTree(
+                stagingDirectory, expectedIdentity: intent.newIdentity)
+        }
+        if fileManager.fileExists(atPath: backupDirectory.path) {
+            throw SessionError.copyFailed(
+                "snapshot rollback left an unexpected backup generation")
+        }
+        try fsyncDirectory(taskRoot)
+        if let priorSHA = intent.priorManifestSHA256,
+           let priorIdentity = intent.priorIdentity {
+            try revalidateSnapshot(
+                snapshotDirectory,
+                expectedDirectoryIdentity: priorIdentity,
+                expectedManifestSHA256: priorSHA)
+        } else {
+            guard !fileManager.fileExists(atPath: snapshotDirectory.path),
+                  try taskManifestDataIfPresent(taskRoot) == nil else {
+                throw SessionError.copyFailed(
+                    "first-generation rollback authority changed before intent cleanup")
+            }
+        }
+        try removeSnapshotCommitIntent(
+            transactionIntentURL,
+            expectedIntent: intent,
+            expectedIdentity: transactionIntentIdentity)
+    }
+
+    private static func validateIntentBoundGeneration(
+        _ directory: URL,
+        expectedManifestSHA256: String,
+        expectedIdentity: ImmutableDirectoryPublication.Identity
+    ) throws -> ValidatedSnapshotGeneration {
+        let generation = try validateSnapshotGeneration(
+            directory,
+            allowedDirectoryModes: [
+                preparedDirectoryMode, committedDirectoryMode,
+            ],
+            expectedDirectoryIdentity: expectedIdentity)
+        guard generation.manifestSHA256 == expectedManifestSHA256 else {
+            throw SessionError.copyFailed(
+                "snapshot generation manifest differs from transaction intent")
+        }
+        return generation
+    }
+
+    private static func taskManifestDataIfPresent(
+        _ taskRoot: URL
+    ) throws -> Data? {
+        let url = taskRoot.appendingPathComponent("input_manifest.json")
+        return try readStableCommittedFileIfPresent(
+            url, maximumBytes: maximumTaskManifestBytes)?.data
+    }
+
+    private static func writeTaskManifest(
+        _ data: Data,
+        to url: URL,
+        taskRoot: URL,
+        afterRenameBeforeParentSync: (() throws -> Void)? = nil
+    ) throws {
+        guard !data.isEmpty, data.count <= maximumTaskManifestBytes,
+              url.deletingLastPathComponent().standardizedFileURL
+                == taskRoot.standardizedFileURL,
+              url.lastPathComponent == "input_manifest.json" else {
+            throw SessionError.copyFailed(
+                "task snapshot reference payload/path is invalid")
+        }
+        let openedParent = try openStableDirectoryNoFollow(
+            taskRoot, context: "task root for snapshot reference update")
+        let parentDescriptor = openedParent.descriptor
+        defer { _ = close(parentDescriptor) }
+        // Existing authority must already be one stable committed file. A
+        // symlink, hardlink or mode-drifted reference is not replaceable.
+        let existing = try readStableCommittedFileIfPresent(
+            parentDescriptor: parentDescriptor,
+            basename: url.lastPathComponent,
+            maximumBytes: maximumTaskManifestBytes)
+        try faultInjector?(.afterTaskReferenceAuthorityReadBeforeInstall)
+
+        let targetSHA256 = sha256(data)
+        let displacedToken = existing.map {
+            String($0.identity.device) + "-" + String($0.identity.inode)
+        } ?? "none"
+        let temporaryUUID = UUID().uuidString.lowercased()
+        var temporaryName = taskManifestCreationPrefix + temporaryUUID
+        let temporaryDescriptor = openat(
+            parentDescriptor,
+            temporaryName,
+            O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
+            mode_t(0o600))
+        guard temporaryDescriptor >= 0 else {
+            throw SessionError.copyFailed(
+                "cannot create snapshot reference temporary")
+        }
+        var temporaryOpen = true
+        var renamed = false
+        var cleanupExpectedMetadata: stat?
+        defer {
+            if temporaryOpen { _ = close(temporaryDescriptor) }
+            if !renamed, let cleanupExpectedMetadata {
+                try? removeIdentityBoundTemporary(
+                    parentDescriptor: parentDescriptor,
+                    basename: temporaryName,
+                    expectedMetadata: cleanupExpectedMetadata,
+                    removalPrefix: taskManifestTemporaryRemovalPrefix,
+                    conflictPrefix: taskManifestConflictPrefix,
+                    context: "failed task-reference temporary")
+            }
+        }
+
+        var createdMetadata = stat()
+        guard fstat(temporaryDescriptor, &createdMetadata) == 0,
+              (createdMetadata.st_mode & S_IFMT) == S_IFREG,
+              (createdMetadata.st_mode & mode_t(0o777)) == 0o600,
+              createdMetadata.st_nlink == 1,
+              createdMetadata.st_size == 0 else {
+            throw SessionError.copyFailed(
+                "snapshot reference creation temporary identity is invalid")
+        }
+        cleanupExpectedMetadata = createdMetadata
+        try faultInjector?(.afterTaskReferenceCreationBeforeIdentityBind)
+        let boundTemporaryName = taskManifestTemporaryPrefix
+            + identityToken(metadataIdentity(createdMetadata)) + "."
+            + displacedToken + "." + targetSHA256 + "."
+            + temporaryUUID + taskManifestTemporarySuffix
+        guard renameatx_np(
+            parentDescriptor, temporaryName,
+            parentDescriptor, boundTemporaryName,
+            UInt32(RENAME_EXCL)) == 0 else {
+            throw SessionError.copyFailed(
+                "cannot bind snapshot reference temporary identity")
+        }
+        temporaryName = boundTemporaryName
+        guard fsync(parentDescriptor) == 0 else {
+            throw SessionError.copyFailed(
+                "cannot sync snapshot reference temporary identity")
+        }
+
+        guard writeAll(data, to: temporaryDescriptor),
+              fchmod(temporaryDescriptor, committedFileMode) == 0,
+              fsync(temporaryDescriptor) == 0 else {
+            throw SessionError.copyFailed(
+                "cannot persist frozen snapshot reference temporary")
+        }
+        var temporaryMetadata = stat()
+        guard fstat(temporaryDescriptor, &temporaryMetadata) == 0,
+              (temporaryMetadata.st_mode & S_IFMT) == S_IFREG,
+              (temporaryMetadata.st_mode & mode_t(0o777)) == committedFileMode,
+              temporaryMetadata.st_nlink == 1,
+              temporaryMetadata.st_size == data.count,
+              close(temporaryDescriptor) == 0 else {
+            throw SessionError.copyFailed(
+                "snapshot reference temporary identity is invalid")
+        }
+        temporaryOpen = false
+        try faultInjector?(.afterTaskReferenceTemporaryFsyncBeforeRename)
+
+        var currentAuthority = stat()
+        let authorityLookup = fstatat(
+            parentDescriptor,
+            url.lastPathComponent,
+            &currentAuthority,
+            AT_SYMLINK_NOFOLLOW)
+        if let existing {
+            guard authorityLookup == 0,
+                  sameFileIdentity(existing.metadata, currentAuthority) else {
+                throw SessionError.copyFailed(
+                    "snapshot task reference changed before atomic swap")
+            }
+        } else {
+            guard authorityLookup != 0, errno == ENOENT else {
+                throw SessionError.copyFailed(
+                    "snapshot task reference appeared before exclusive install")
+            }
+        }
+        try faultInjector?(.afterTaskReferenceAuthorityRecheckBeforeInstall)
+        let renameFlags = existing == nil
+            ? UInt32(RENAME_EXCL)
+            : UInt32(RENAME_SWAP)
+        guard renameatx_np(
+            parentDescriptor, temporaryName,
+            parentDescriptor, url.lastPathComponent,
+            renameFlags) == 0 else {
+            throw SessionError.copyFailed(
+                "cannot atomically install snapshot task reference: "
+                    + String(cString: strerror(errno)))
+        }
+        renamed = true
+        try faultInjector?(.afterTaskReferenceRenameBeforePostcheck)
+        var installedPathMetadata = stat()
+        guard fstatat(
+            parentDescriptor,
+            url.lastPathComponent,
+            &installedPathMetadata,
+            AT_SYMLINK_NOFOLLOW) == 0,
+              sameCommittedFileObject(
+                temporaryMetadata, installedPathMetadata) else {
+            throw SessionError.copyFailed(
+                "new snapshot task reference identity changed during install")
+        }
+        if let existing {
+            var displacedMetadata = stat()
+            let displacedMatches = fstatat(
+                parentDescriptor,
+                temporaryName,
+                &displacedMetadata,
+                AT_SYMLINK_NOFOLLOW) == 0
+                && sameCommittedFileObject(
+                    existing.metadata, displacedMetadata)
+            if !displacedMatches {
+                if renameatx_np(
+                    parentDescriptor, temporaryName,
+                    parentDescriptor, url.lastPathComponent,
+                    UInt32(RENAME_SWAP)) == 0 {
+                    var restoredAuthority = stat()
+                    guard fstatat(
+                        parentDescriptor,
+                        url.lastPathComponent,
+                        &restoredAuthority,
+                        AT_SYMLINK_NOFOLLOW) == 0,
+                          sameCommittedFileObject(
+                            displacedMetadata, restoredAuthority),
+                          fsync(parentDescriptor) == 0 else {
+                        throw SessionError.copyFailed(
+                            "cannot verify restored conflicting task authority")
+                    }
+                    // The temporary once again contains only our new manifest.
+                    // Delete it durably; never leave the unrelated authority in
+                    // the generic orphan-temp namespace.
+                    guard unlinkat(parentDescriptor, temporaryName, 0) == 0,
+                          fsync(parentDescriptor) == 0 else {
+                        throw SessionError.copyFailed(
+                            "cannot remove rejected task-reference temporary")
+                    }
+                } else {
+                    let conflictName = taskManifestConflictPrefix
+                        + UUID().uuidString.lowercased()
+                    _ = renameatx_np(
+                        parentDescriptor, temporaryName,
+                        parentDescriptor, conflictName,
+                        UInt32(RENAME_EXCL))
+                    _ = fsync(parentDescriptor)
+                    throw SnapshotTransactionConflict.taskAuthorityDisplaced
+                }
+                throw SessionError.copyFailed(
+                    "atomic snapshot task-reference swap displaced an unrelated file")
+            }
+        }
+        try afterRenameBeforeParentSync?()
+        guard fsync(parentDescriptor) == 0 else {
+            throw SessionError.copyFailed(
+                "cannot sync task root after snapshot reference replacement")
+        }
+        guard let installed = try readStableCommittedFileIfPresent(
+                parentDescriptor: parentDescriptor,
+                basename: url.lastPathComponent,
+                maximumBytes: maximumTaskManifestBytes),
+              installed.data == data,
+              installed.identity.device == UInt64(temporaryMetadata.st_dev),
+              installed.identity.inode == UInt64(temporaryMetadata.st_ino) else {
+            throw SessionError.copyFailed(
+                "installed snapshot task reference changed after replacement")
+        }
+        if let existing {
+            var displacedMetadata = stat()
+            guard fstatat(
+                parentDescriptor,
+                temporaryName,
+                &displacedMetadata,
+                AT_SYMLINK_NOFOLLOW) == 0,
+                  sameCommittedFileObject(
+                    existing.metadata, displacedMetadata),
+                  unlinkat(parentDescriptor, temporaryName, 0) == 0,
+                  fsync(parentDescriptor) == 0 else {
+                throw SessionError.copyFailed(
+                    "cannot durably remove displaced snapshot task reference")
+            }
+        }
+        try requireOpenDirectoryPath(
+            descriptor: parentDescriptor,
+            url: taskRoot,
+            expectedMetadata: openedParent.metadata,
+            context: "task root after snapshot reference update")
+    }
+
+    private static func clearTaskManifestForRollback(
+        taskRoot: URL,
+        expectedNewManifestSHA256: String
+    ) throws {
+        let url = taskRoot.appendingPathComponent("input_manifest.json")
+        let openedParent = try openStableDirectoryNoFollow(
+            taskRoot, context: "task root for snapshot reference rollback")
+        defer { _ = close(openedParent.descriptor) }
+        guard let current = try readStableCommittedFileIfPresent(
+                parentDescriptor: openedParent.descriptor,
+                basename: url.lastPathComponent,
+                maximumBytes: maximumTaskManifestBytes) else {
+            guard fsync(openedParent.descriptor) == 0 else {
+                throw SessionError.copyFailed(
+                    "cannot sync absent first-generation snapshot reference")
+            }
+            return
+        }
+        guard sha256(current.data) == expectedNewManifestSHA256 else {
+            throw SessionError.copyFailed(
+                "first-generation rollback found an unrelated task reference")
+        }
+        var beforeRename = stat()
+        guard fstatat(
+            openedParent.descriptor,
+            url.lastPathComponent,
+            &beforeRename,
+            AT_SYMLINK_NOFOLLOW) == 0,
+              sameFileIdentity(current.metadata, beforeRename) else {
+            throw SessionError.copyFailed(
+                "first-generation snapshot reference changed before rollback")
+        }
+        try faultInjector?(.afterTaskReferenceAuthorityRecheckBeforeClear)
+        let tombstoneName = taskManifestRemovalPrefix
+            + identityToken(current.identity) + "."
+            + UUID().uuidString.lowercased()
+        guard renameatx_np(
+            openedParent.descriptor,
+            url.lastPathComponent,
+            openedParent.descriptor,
+            tombstoneName,
+            UInt32(RENAME_EXCL)) == 0 else {
+            throw SessionError.copyFailed(
+                "cannot atomically clear first-generation snapshot reference")
+        }
+        try faultInjector?(.afterTaskReferenceClearRenameBeforePostcheck)
+        var tombstoneMetadata = stat()
+        let tombstoneMatches = fstatat(
+            openedParent.descriptor,
+            tombstoneName,
+            &tombstoneMetadata,
+            AT_SYMLINK_NOFOLLOW) == 0
+            && sameCommittedFileObject(current.metadata, tombstoneMetadata)
+        guard tombstoneMatches else {
+            if renameatx_np(
+                openedParent.descriptor, tombstoneName,
+                openedParent.descriptor, url.lastPathComponent,
+                UInt32(RENAME_EXCL)) == 0 {
+                var restoredMetadata = stat()
+                guard fstatat(
+                    openedParent.descriptor,
+                    url.lastPathComponent,
+                    &restoredMetadata,
+                    AT_SYMLINK_NOFOLLOW) == 0,
+                      sameCommittedFileObject(
+                        tombstoneMetadata, restoredMetadata),
+                      fsync(openedParent.descriptor) == 0 else {
+                    throw SessionError.copyFailed(
+                        "cannot verify restored conflicting task authority")
+                }
+            } else {
+                let conflictName = taskManifestConflictPrefix
+                    + UUID().uuidString.lowercased()
+                _ = renameatx_np(
+                    openedParent.descriptor, tombstoneName,
+                    openedParent.descriptor, conflictName,
+                    UInt32(RENAME_EXCL))
+                _ = fsync(openedParent.descriptor)
+            }
+            throw SessionError.copyFailed(
+                "cleared snapshot reference does not match expected authority")
+        }
+        guard fsync(openedParent.descriptor) == 0 else {
+            throw SessionError.copyFailed(
+                "cannot sync cleared snapshot reference")
+        }
+        guard unlinkat(openedParent.descriptor, tombstoneName, 0) == 0,
+              fsync(openedParent.descriptor) == 0 else {
+            throw SessionError.copyFailed(
+                "cannot durably remove cleared snapshot reference tombstone")
+        }
+    }
+
+    private static func readStableCommittedFileIfPresent(
+        _ url: URL,
+        maximumBytes: Int
+    ) throws -> (
+        data: Data,
+        identity: ImmutableDirectoryPublication.Identity,
+        metadata: stat
+    )? {
+        let parent = url.deletingLastPathComponent()
+        let openedParent = try openStableDirectoryNoFollow(
+            parent, context: "committed transaction file parent")
+        defer { _ = close(openedParent.descriptor) }
+        let result = try readStableCommittedFileIfPresent(
+            parentDescriptor: openedParent.descriptor,
+            basename: url.lastPathComponent,
+            maximumBytes: maximumBytes)
+        try requireOpenDirectoryPath(
+            descriptor: openedParent.descriptor,
+            url: parent,
+            expectedMetadata: openedParent.metadata,
+            context: "committed transaction file parent after read")
+        return result
+    }
+
+    private static func readStableCommittedFileIfPresent(
+        parentDescriptor: Int32,
+        basename: String,
+        maximumBytes: Int
+    ) throws -> (
+        data: Data,
+        identity: ImmutableDirectoryPublication.Identity,
+        metadata: stat
+    )? {
+        var pathBefore = stat()
+        guard fstatat(
+            parentDescriptor,
+            basename,
+            &pathBefore,
+            AT_SYMLINK_NOFOLLOW) == 0 else {
+            if errno == ENOENT { return nil }
+            throw SessionError.copyFailed(
+                "cannot inspect committed transaction file")
+        }
+        guard (pathBefore.st_mode & S_IFMT) == S_IFREG,
+              (pathBefore.st_mode & mode_t(0o777)) == committedFileMode,
+              pathBefore.st_nlink == 1,
+              pathBefore.st_size > 0,
+              pathBefore.st_size <= maximumBytes else {
+            throw SessionError.copyFailed(
+                "committed transaction file type/mode/size is invalid")
+        }
+        let descriptor = openat(
+            parentDescriptor,
+            basename,
+            O_RDONLY | O_CLOEXEC | O_NOFOLLOW)
+        guard descriptor >= 0 else {
+            throw SessionError.copyFailed(
+                "cannot open committed transaction file no-follow")
+        }
+        defer { _ = close(descriptor) }
+        var openedBefore = stat()
+        guard fstat(descriptor, &openedBefore) == 0,
+              sameFileIdentity(pathBefore, openedBefore) else {
+            throw SessionError.copyFailed(
+                "committed transaction file changed before open")
+        }
+        var data = Data()
+        data.reserveCapacity(Int(openedBefore.st_size))
+        var buffer = [UInt8](repeating: 0, count: 16 * 1024)
+        while true {
+            let count = buffer.withUnsafeMutableBytes { rawBuffer -> Int in
+                guard let base = rawBuffer.baseAddress else { return -1 }
+                return Darwin.read(descriptor, base, rawBuffer.count)
+            }
+            if count < 0 && errno == EINTR { continue }
+            guard count >= 0 else {
+                throw SessionError.copyFailed(
+                    "committed transaction file read failed")
+            }
+            if count == 0 { break }
+            guard data.count <= maximumBytes - count else {
+                throw SessionError.copyFailed(
+                    "committed transaction file grew beyond limit")
+            }
+            data.append(contentsOf: buffer.prefix(count))
+        }
+        var openedAfter = stat()
+        var pathAfter = stat()
+        guard fstat(descriptor, &openedAfter) == 0,
+              fstatat(
+                parentDescriptor,
+                basename,
+                &pathAfter,
+                AT_SYMLINK_NOFOLLOW) == 0,
+              sameFileIdentity(openedBefore, openedAfter),
+              sameFileIdentity(openedBefore, pathAfter),
+              data.count == Int(openedBefore.st_size) else {
+            throw SessionError.copyFailed(
+                "committed transaction file changed during read")
+        }
+        return (
+            data,
+            ImmutableDirectoryPublication.Identity(
+                device: UInt64(openedBefore.st_dev),
+                inode: UInt64(openedBefore.st_ino)),
+            openedBefore)
+    }
+
+    /// Streams and hashes one immutable artifact through a descriptor opened
+    /// relative to the already-bound snapshot root. The pre-open pathname,
+    /// opened inode, post-read inode and final pathname must all remain the
+    /// same 0444, single-link regular file.
+    private static func sha256StableCommittedFile(
+        parentDescriptor: Int32,
+        basename: String,
+        expectedBytes: Int64
+    ) throws -> (sha256: String, metadata: stat) {
+        guard expectedBytes >= 0 else {
+            throw SessionError.copyFailed(
+                "committed artifact has a negative expected size")
+        }
+        var pathBefore = stat()
+        guard fstatat(
+            parentDescriptor,
+            basename,
+            &pathBefore,
+            AT_SYMLINK_NOFOLLOW) == 0,
+              (pathBefore.st_mode & S_IFMT) == S_IFREG,
+              (pathBefore.st_mode & mode_t(0o777)) == committedFileMode,
+              pathBefore.st_nlink == 1,
+              Int64(pathBefore.st_size) == expectedBytes else {
+            throw SessionError.copyFailed(
+                "committed artifact type/mode/link/size is invalid: \(basename)")
+        }
+        try faultInjector?(.afterArtifactAuthorityReadBeforeOpen(basename))
+        let descriptor = openat(
+            parentDescriptor,
+            basename,
+            O_RDONLY | O_CLOEXEC | O_NOFOLLOW)
+        guard descriptor >= 0 else {
+            throw SessionError.copyFailed(
+                "cannot open committed artifact no-follow: \(basename)")
+        }
+        defer { _ = close(descriptor) }
+        var openedBefore = stat()
+        guard fstat(descriptor, &openedBefore) == 0,
+              sameFileIdentity(pathBefore, openedBefore) else {
+            throw SessionError.copyFailed(
+                "committed artifact changed before open: \(basename)")
+        }
+
+        var hasher = SHA256()
+        var totalBytes: Int64 = 0
+        var buffer = [UInt8](repeating: 0, count: copyChunkBytes)
+        while true {
+            let count = buffer.withUnsafeMutableBytes { rawBuffer -> Int in
+                guard let base = rawBuffer.baseAddress else { return -1 }
+                return Darwin.read(descriptor, base, rawBuffer.count)
+            }
+            if count < 0 && errno == EINTR { continue }
+            guard count >= 0 else {
+                throw SessionError.copyFailed(
+                    "committed artifact read failed: \(basename)")
+            }
+            if count == 0 { break }
+            guard totalBytes <= expectedBytes - Int64(count) else {
+                throw SessionError.copyFailed(
+                    "committed artifact grew during hash: \(basename)")
+            }
+            let chunk = buffer.withUnsafeBytes { rawBuffer -> Data in
+                Data(bytes: rawBuffer.baseAddress!, count: count)
+            }
+            hasher.update(data: chunk)
+            totalBytes += Int64(count)
+        }
+
+        var openedAfter = stat()
+        var pathAfter = stat()
+        guard totalBytes == expectedBytes,
+              fstat(descriptor, &openedAfter) == 0,
+              fstatat(
+                parentDescriptor,
+                basename,
+                &pathAfter,
+                AT_SYMLINK_NOFOLLOW) == 0,
+              sameFileIdentity(openedBefore, openedAfter),
+              sameFileIdentity(openedBefore, pathAfter) else {
+            throw SessionError.copyFailed(
+                "committed artifact changed during hash: \(basename)")
+        }
+        let digest = hasher.finalize().map {
+            String(format: "%02x", $0)
+        }.joined()
+        return (digest, openedBefore)
+    }
+
+    private static func openStableDirectoryNoFollow(
+        _ url: URL,
+        context: String
+    ) throws -> (descriptor: Int32, metadata: stat) {
+        var pathMetadata = stat()
+        guard lstat(url.path, &pathMetadata) == 0,
+              (pathMetadata.st_mode & S_IFMT) == S_IFDIR else {
+            throw SessionError.copyFailed(
+                "\(context) is not a real directory")
+        }
+        let descriptor = open(
+            url.path, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)
+        guard descriptor >= 0 else {
+            throw SessionError.copyFailed(
+                "cannot open \(context) without following links")
+        }
+        var openedMetadata = stat()
+        guard fstat(descriptor, &openedMetadata) == 0,
+              sameFileIdentity(pathMetadata, openedMetadata) else {
+            _ = close(descriptor)
+            throw SessionError.copyFailed(
+                "\(context) changed while opening")
+        }
+        return (descriptor, openedMetadata)
+    }
+
+    private static func requireOpenDirectoryPath(
+        descriptor: Int32,
+        url: URL,
+        expectedMetadata: stat,
+        context: String
+    ) throws {
+        var descriptorMetadata = stat()
+        var pathMetadata = stat()
+        guard fstat(descriptor, &descriptorMetadata) == 0,
+              lstat(url.path, &pathMetadata) == 0,
+              sameDirectoryIdentity(expectedMetadata, descriptorMetadata),
+              sameDirectoryIdentity(expectedMetadata, pathMetadata) else {
+            throw SessionError.copyFailed(
+                "\(context) dev/inode/path binding changed")
+        }
+    }
+
+    private static func requireBoundDirectoryPath(
+        descriptor: Int32,
+        expectedIdentity: ImmutableDirectoryPublication.Identity?,
+        expectedMode: mode_t,
+        parentDescriptor: Int32,
+        parentURL: URL,
+        parentMetadata: stat,
+        basename: String,
+        context: String
+    ) throws {
+        try requireOpenDirectoryPath(
+            descriptor: parentDescriptor,
+            url: parentURL,
+            expectedMetadata: parentMetadata,
+            context: "\(context) parent")
+        var openedMetadata = stat()
+        var pathMetadata = stat()
+        guard fstat(descriptor, &openedMetadata) == 0,
+              fstatat(
+                parentDescriptor,
+                basename,
+                &pathMetadata,
+                AT_SYMLINK_NOFOLLOW) == 0,
+              sameDirectoryIdentity(openedMetadata, pathMetadata),
+              openedMetadata.st_mode & mode_t(0o777) == expectedMode,
+              pathMetadata.st_mode & mode_t(0o777) == expectedMode else {
+            throw SessionError.copyFailed(
+                "\(context) dev/inode/path/mode binding changed")
+        }
+        if let expectedIdentity {
+            guard UInt64(openedMetadata.st_dev) == expectedIdentity.device,
+                  UInt64(openedMetadata.st_ino) == expectedIdentity.inode else {
+                throw SessionError.copyFailed(
+                    "\(context) differs from the transaction identity")
+            }
+        }
+    }
+
+    private static func directoryEntryNames(
+        atBoundDirectoryDescriptor descriptor: Int32,
+        context: String,
+        maximumEntries: Int
+    ) throws -> [String] {
+        let enumerationDescriptor = openat(
+            descriptor, ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)
+        guard enumerationDescriptor >= 0 else {
+            throw SessionError.copyFailed(
+                "cannot duplicate \(context) for enumeration")
+        }
+        guard let stream = fdopendir(enumerationDescriptor) else {
+            _ = close(enumerationDescriptor)
+            throw SessionError.copyFailed(
+                "cannot enumerate \(context)")
+        }
+        defer { _ = closedir(stream) }
+        var names: [String] = []
+        while true {
+            errno = 0
+            guard let entry = readdir(stream) else {
+                guard errno == 0 else {
+                    throw SessionError.copyFailed(
+                        "cannot finish enumerating \(context)")
+                }
+                break
+            }
+            guard let name = withUnsafePointer(to: entry.pointee.d_name, {
+                pointer -> String? in
+                pointer.withMemoryRebound(
+                    to: CChar.self,
+                    capacity: Int(MAXNAMLEN) + 1
+                ) { String(validatingUTF8: $0) }
+            }) else {
+                throw SessionError.copyFailed(
+                    "\(context) contains a non-UTF-8 name")
+            }
+            if name == "." || name == ".." { continue }
+            guard !name.isEmpty, !name.contains("/") else {
+                throw SessionError.copyFailed(
+                    "\(context) contains an unsafe name")
+            }
+            guard names.count < maximumEntries else {
+                throw SessionError.copyFailed(
+                    "\(context) entry limit exceeded")
+            }
+            names.append(name)
+        }
+        return names.sorted()
+    }
+
+    private static func writeAll(_ data: Data, to descriptor: Int32) -> Bool {
+        var offset = 0
+        return data.withUnsafeBytes { rawBuffer -> Bool in
+            guard let base = rawBuffer.baseAddress else { return data.isEmpty }
+            while offset < rawBuffer.count {
+                let count = Darwin.write(
+                    descriptor,
+                    base.advanced(by: offset),
+                    rawBuffer.count - offset)
+                if count < 0 && errno == EINTR { continue }
+                if count <= 0 { return false }
+                offset += count
+            }
+            return true
+        }
+    }
+
+    private static func writeSnapshotCommitIntent(
+        _ intent: SnapshotCommitIntent,
+        to url: URL
+    ) throws -> ImmutableDirectoryPublication.Identity {
+        let null = NSNull()
+        let payload: [String: Any] = [
+            "format": "MarketScannerSessionSnapshotTransaction",
+            "version": 1,
+            "task_id": intent.taskID,
+            "new_manifest_sha256": intent.newManifestSHA256,
+            "new_device": String(intent.newIdentity.device),
+            "new_inode": String(intent.newIdentity.inode),
+            "prior_manifest_sha256": intent.priorManifestSHA256 ?? null,
+            "prior_device": intent.priorIdentity.map {
+                String($0.device)
+            } ?? null,
+            "prior_inode": intent.priorIdentity.map {
+                String($0.inode)
+            } ?? null,
+        ]
+        let data = try CanonicalJSONEncoder.encode(payload)
+        guard !data.isEmpty,
+              data.count <= maximumSnapshotTransactionIntentBytes else {
+            throw SessionError.copyFailed(
+                "snapshot transaction intent exceeds size limit")
+        }
+        let parent = url.deletingLastPathComponent()
+        let openedParent = try openStableDirectoryNoFollow(
+            parent, context: "task root for snapshot transaction intent")
+        let parentDescriptor = openedParent.descriptor
+        defer { _ = close(parentDescriptor) }
+        let temporaryUUID = UUID().uuidString.lowercased()
+        var temporaryName = transactionIntentCreationPrefix + temporaryUUID
+        let descriptor = openat(
+            parentDescriptor,
+            temporaryName,
+            O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
+            mode_t(0o600))
+        guard descriptor >= 0 else {
+            throw SessionError.copyFailed(
+                "cannot create snapshot transaction intent temporary")
+        }
+        var descriptorOpen = true
+        var renamed = false
+        var cleanupExpectedMetadata: stat?
+        defer {
+            if descriptorOpen { _ = close(descriptor) }
+            if !renamed, let cleanupExpectedMetadata {
+                try? removeIdentityBoundTemporary(
+                    parentDescriptor: parentDescriptor,
+                    basename: temporaryName,
+                    expectedMetadata: cleanupExpectedMetadata,
+                    removalPrefix: transactionIntentTemporaryRemovalPrefix,
+                    conflictPrefix: transactionIntentConflictPrefix,
+                    context: "failed snapshot transaction intent temporary")
+            }
+        }
+        var createdMetadata = stat()
+        guard fstat(descriptor, &createdMetadata) == 0,
+              (createdMetadata.st_mode & S_IFMT) == S_IFREG,
+              (createdMetadata.st_mode & mode_t(0o777)) == 0o600,
+              createdMetadata.st_nlink == 1,
+              createdMetadata.st_size == 0 else {
+            throw SessionError.copyFailed(
+                "snapshot transaction intent creation identity is invalid")
+        }
+        cleanupExpectedMetadata = createdMetadata
+        try faultInjector?(.afterTransactionIntentCreationBeforeIdentityBind)
+        let boundTemporaryName = transactionIntentTemporaryPrefix
+            + identityToken(metadataIdentity(createdMetadata)) + "."
+            + temporaryUUID
+        guard renameatx_np(
+            parentDescriptor, temporaryName,
+            parentDescriptor, boundTemporaryName,
+            UInt32(RENAME_EXCL)) == 0 else {
+            throw SessionError.copyFailed(
+                "cannot bind snapshot transaction intent temporary identity")
+        }
+        temporaryName = boundTemporaryName
+        guard fsync(parentDescriptor) == 0 else {
+            throw SessionError.copyFailed(
+                "cannot sync snapshot transaction intent temporary identity")
+        }
+        guard writeAll(data, to: descriptor),
+              fchmod(descriptor, committedFileMode) == 0,
+              fsync(descriptor) == 0,
+              close(descriptor) == 0 else {
+            throw SessionError.copyFailed(
+                "cannot persist frozen snapshot transaction intent temporary")
+        }
+        descriptorOpen = false
+        try faultInjector?(.afterTransactionIntentTemporaryFsyncBeforeRename)
+        guard renameatx_np(
+            parentDescriptor, temporaryName,
+            parentDescriptor, url.lastPathComponent,
+            UInt32(RENAME_EXCL)) == 0 else {
+            throw SessionError.copyFailed(
+                "cannot publish snapshot transaction intent exclusively: "
+                    + String(cString: strerror(errno)))
+        }
+        renamed = true
+        try faultInjector?(.afterTransactionIntentRenameBeforeParentFsync)
+        guard fsync(parentDescriptor) == 0 else {
+            throw SessionError.copyFailed(
+                "cannot sync task root after snapshot intent rename")
+        }
+        let installed = try readSnapshotCommitIntent(url)
+        guard installed.intent == intent,
+              installed.fileIdentity == metadataIdentity(createdMetadata) else {
+            throw SessionError.copyFailed(
+                "installed snapshot transaction intent identity mismatch")
+        }
+        try requireOpenDirectoryPath(
+            descriptor: parentDescriptor,
+            url: parent,
+            expectedMetadata: openedParent.metadata,
+            context: "task root after snapshot transaction intent install")
+        return installed.fileIdentity
+    }
+
+    private static func readSnapshotCommitIntent(
+        _ url: URL
+    ) throws -> ReadSnapshotCommitIntent {
+        guard let stable = try readStableCommittedFileIfPresent(
+                url,
+                maximumBytes: maximumSnapshotTransactionIntentBytes) else {
+            throw SessionError.copyFailed(
+                "snapshot transaction intent disappeared during recovery")
+        }
+        let data = stable.data
+        guard let object = try? StrictJSONDocumentParser.object(
+                from: data,
+                limits: StrictJSONDocumentLimits(
+                    maximumBytes: maximumSnapshotTransactionIntentBytes))
+                as? [String: Any],
+              Set(object.keys) == Set([
+                "format", "version", "task_id",
+                "new_manifest_sha256", "new_device", "new_inode",
+                "prior_manifest_sha256", "prior_device", "prior_inode",
+              ]),
+              object["format"] as? String ==
+                "MarketScannerSessionSnapshotTransaction",
+              strictInteger(object["version"]) == 1,
+              let taskID = nonEmptyString(object["task_id"]),
+              let newManifestSHA = object["new_manifest_sha256"] as? String,
+              isSHA256(newManifestSHA),
+              let newDeviceText = object["new_device"] as? String,
+              let newInodeText = object["new_inode"] as? String,
+              isCanonicalUnsignedDecimal(newDeviceText),
+              isCanonicalUnsignedDecimal(newInodeText),
+              let newDevice = UInt64(newDeviceText),
+              let newInode = UInt64(newInodeText) else {
+            throw SessionError.copyFailed(
+                "snapshot transaction intent schema invalid")
+        }
+
+        let priorManifestValue = object["prior_manifest_sha256"]
+        let priorDeviceValue = object["prior_device"]
+        let priorInodeValue = object["prior_inode"]
+        let priorManifest: String?
+        let priorIdentity: ImmutableDirectoryPublication.Identity?
+        if priorManifestValue is NSNull,
+           priorDeviceValue is NSNull,
+           priorInodeValue is NSNull {
+            priorManifest = nil
+            priorIdentity = nil
+        } else {
+            guard let manifest = priorManifestValue as? String,
+                  isSHA256(manifest),
+                  let deviceText = priorDeviceValue as? String,
+                  let inodeText = priorInodeValue as? String,
+                  isCanonicalUnsignedDecimal(deviceText),
+                  isCanonicalUnsignedDecimal(inodeText),
+                  let device = UInt64(deviceText),
+                  let inode = UInt64(inodeText) else {
+                throw SessionError.copyFailed(
+                    "snapshot transaction prior identity invalid")
+            }
+            priorManifest = manifest
+            priorIdentity = ImmutableDirectoryPublication.Identity(
+                device: device, inode: inode)
+        }
+
+        let normalized: [String: Any] = [
+            "format": "MarketScannerSessionSnapshotTransaction",
+            "version": 1,
+            "task_id": taskID,
+            "new_manifest_sha256": newManifestSHA,
+            "new_device": newDeviceText,
+            "new_inode": newInodeText,
+            "prior_manifest_sha256": priorManifest ?? NSNull(),
+            "prior_device": priorIdentity.map {
+                String($0.device)
+            } ?? NSNull(),
+            "prior_inode": priorIdentity.map {
+                String($0.inode)
+            } ?? NSNull(),
+        ]
+        guard (try? CanonicalJSONEncoder.encode(normalized)) == data else {
+            throw SessionError.copyFailed(
+                "snapshot transaction intent is not canonical")
+        }
+        return ReadSnapshotCommitIntent(
+            intent: SnapshotCommitIntent(
+                taskID: taskID,
+                newManifestSHA256: newManifestSHA,
+                newIdentity: ImmutableDirectoryPublication.Identity(
+                    device: newDevice, inode: newInode),
+                priorManifestSHA256: priorManifest,
+                priorIdentity: priorIdentity),
+            fileIdentity: stable.identity,
+            data: data)
+    }
+
+    private static func removeSnapshotCommitIntent(
+        _ url: URL,
+        expectedIntent: SnapshotCommitIntent,
+        expectedIdentity: ImmutableDirectoryPublication.Identity
+    ) throws {
+        let record = try readSnapshotCommitIntent(url)
+        guard record.intent == expectedIntent,
+              record.fileIdentity == expectedIdentity else {
+            throw SessionError.copyFailed(
+                "snapshot transaction intent authority changed before removal")
+        }
+        let parent = url.deletingLastPathComponent()
+        let openedParent = try openStableDirectoryNoFollow(
+            parent, context: "snapshot transaction intent parent")
+        defer { _ = close(openedParent.descriptor) }
+        guard let stable = try readStableCommittedFileIfPresent(
+                parentDescriptor: openedParent.descriptor,
+                basename: url.lastPathComponent,
+                maximumBytes: maximumSnapshotTransactionIntentBytes),
+              stable.identity == expectedIdentity,
+              stable.data == record.data else {
+            throw SessionError.copyFailed(
+                "snapshot transaction intent changed before unlink")
+        }
+        var beforeRemoval = stat()
+        guard fstatat(
+            openedParent.descriptor,
+            url.lastPathComponent,
+            &beforeRemoval,
+            AT_SYMLINK_NOFOLLOW) == 0,
+              sameFileIdentity(stable.metadata, beforeRemoval) else {
+            throw SessionError.copyFailed(
+                "snapshot transaction intent changed before removal")
+        }
+        try faultInjector?(.afterTransactionIntentAuthorityRecheckBeforeRemoval)
+        let tombstoneName = transactionIntentRemovalPrefix
+            + identityToken(expectedIdentity) + "."
+            + UUID().uuidString.lowercased()
+        guard renameatx_np(
+            openedParent.descriptor,
+            url.lastPathComponent,
+            openedParent.descriptor,
+            tombstoneName,
+            UInt32(RENAME_EXCL)) == 0 else {
+            throw SessionError.copyFailed(
+                "cannot atomically detach snapshot transaction intent")
+        }
+        try faultInjector?(.afterTransactionIntentRemovalRenameBeforePostcheck)
+        var tombstoneMetadata = stat()
+        let tombstoneMatches = fstatat(
+            openedParent.descriptor,
+            tombstoneName,
+            &tombstoneMetadata,
+            AT_SYMLINK_NOFOLLOW) == 0
+            && sameCommittedFileObject(stable.metadata, tombstoneMetadata)
+        guard tombstoneMatches else {
+            if renameatx_np(
+                openedParent.descriptor, tombstoneName,
+                openedParent.descriptor, url.lastPathComponent,
+                UInt32(RENAME_EXCL)) == 0 {
+                var restoredMetadata = stat()
+                guard fstatat(
+                    openedParent.descriptor,
+                    url.lastPathComponent,
+                    &restoredMetadata,
+                    AT_SYMLINK_NOFOLLOW) == 0,
+                      sameCommittedFileObject(
+                        tombstoneMetadata, restoredMetadata),
+                      fsync(openedParent.descriptor) == 0 else {
+                    throw SessionError.copyFailed(
+                        "cannot verify restored conflicting transaction intent")
+                }
+            } else {
+                let conflictName = transactionIntentConflictPrefix
+                    + UUID().uuidString.lowercased()
+                _ = renameatx_np(
+                    openedParent.descriptor, tombstoneName,
+                    openedParent.descriptor, conflictName,
+                    UInt32(RENAME_EXCL))
+                _ = fsync(openedParent.descriptor)
+            }
+            throw SessionError.copyFailed(
+                "detached snapshot transaction intent is not the expected inode")
+        }
+        guard fsync(openedParent.descriptor) == 0 else {
+            throw SessionError.copyFailed(
+                "cannot sync detached snapshot transaction intent")
+        }
+        guard unlinkat(openedParent.descriptor, tombstoneName, 0) == 0,
+              fsync(openedParent.descriptor) == 0 else {
+            throw SessionError.copyFailed(
+                "cannot durably remove snapshot transaction intent tombstone")
+        }
+        try requireOpenDirectoryPath(
+            descriptor: openedParent.descriptor,
+            url: parent,
+            expectedMetadata: openedParent.metadata,
+            context: "snapshot transaction intent parent after removal")
+    }
+
+    private static func isCanonicalUnsignedDecimal(_ value: String) -> Bool {
+        guard !value.isEmpty,
+              value.utf8.allSatisfy({ $0 >= 48 && $0 <= 57 }) else {
+            return false
+        }
+        return value == "0" || !value.hasPrefix("0")
     }
 
     /// Upgrade-safe rollback check for a pre-v3 committed generation. It is
@@ -1356,17 +3919,12 @@ enum SessionSnapshotTransaction {
             "input_manifest.json")
         let taskManifest = taskRoot.appendingPathComponent(
             "input_manifest.json")
-        var snapshotStat = stat()
-        var taskStat = stat()
-        guard lstat(snapshotManifest.path, &snapshotStat) == 0,
-              lstat(taskManifest.path, &taskStat) == 0,
-              (snapshotStat.st_mode & S_IFMT) == S_IFREG,
-              (taskStat.st_mode & S_IFMT) == S_IFREG,
-              snapshotStat.st_nlink == 1,
-              taskStat.st_nlink == 1,
-              snapshotStat.st_size == taskStat.st_size,
-              let snapshotData = try? Data(contentsOf: snapshotManifest),
-              let taskData = try? Data(contentsOf: taskManifest) else {
+        guard let snapshotData = try? readStableCommittedFileIfPresent(
+                snapshotManifest,
+                maximumBytes: maximumTaskManifestBytes)?.data,
+              let taskData = try? readStableCommittedFileIfPresent(
+                taskManifest,
+                maximumBytes: maximumTaskManifestBytes)?.data else {
             return false
         }
         return snapshotData == taskData
@@ -1561,7 +4119,6 @@ enum SessionSnapshotTransaction {
     // MARK: - DB validation (§8.5)
 
     private static func validateSnapshotDatabase(_ url: URL) throws {
-        var db: OpaquePointer?
         // Percent-encode the path so '%', '#', '?' in file names cannot
         // inject URI parameters/fragments (mirrors the C++ core's
         // uriEncodePath hardening).
@@ -1570,6 +4127,52 @@ enum SessionSnapshotTransaction {
         let encodedPath = url.path.addingPercentEncoding(withAllowedCharacters: allowed)
             ?? url.path
         let uri = "file:\(encodedPath)?mode=ro&immutable=1"
+        try validateSnapshotDatabase(uri: uri)
+    }
+
+    /// Opens the committed database relative to the bound snapshot root and
+    /// makes SQLite duplicate that exact descriptor through Darwin's
+    /// `/dev/fd` namespace. This prevents a pathname replacement between the
+    /// artifact hash and `quick_check` from redirecting SQLite to a clone.
+    private static func validateSnapshotDatabase(
+        parentDescriptor: Int32,
+        databaseName: String,
+        expectedMetadata: stat
+    ) throws {
+        let descriptor = openat(
+            parentDescriptor,
+            databaseName,
+            O_RDONLY | O_CLOEXEC | O_NOFOLLOW)
+        guard descriptor >= 0 else {
+            throw SessionError.dbIntegrity(
+                "cannot open committed snapshot DB no-follow")
+        }
+        defer { _ = close(descriptor) }
+        var openedBefore = stat()
+        guard fstat(descriptor, &openedBefore) == 0,
+              sameFileIdentity(expectedMetadata, openedBefore) else {
+            throw SessionError.dbIntegrity(
+                "committed snapshot DB changed before validation")
+        }
+        try validateSnapshotDatabase(
+            uri: "file:/dev/fd/\(descriptor)?mode=ro&immutable=1")
+        var openedAfter = stat()
+        var pathAfter = stat()
+        guard fstat(descriptor, &openedAfter) == 0,
+              fstatat(
+                parentDescriptor,
+                databaseName,
+                &pathAfter,
+                AT_SYMLINK_NOFOLLOW) == 0,
+              sameFileIdentity(openedBefore, openedAfter),
+              sameFileIdentity(openedBefore, pathAfter) else {
+            throw SessionError.dbIntegrity(
+                "committed snapshot DB changed during validation")
+        }
+    }
+
+    private static func validateSnapshotDatabase(uri: String) throws {
+        var db: OpaquePointer?
         guard sqlite3_open_v2(uri, &db, SQLITE_OPEN_READONLY | SQLITE_OPEN_URI, nil) == SQLITE_OK,
               let database = db
         else {

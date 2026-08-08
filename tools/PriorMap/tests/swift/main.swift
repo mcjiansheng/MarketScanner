@@ -1,6 +1,7 @@
 import Foundation
 import CryptoKit
 import Darwin
+import Dispatch
 import SQLite3
 
 final class InjectedSidecarWriter: ScanSidecarFileWriting {
@@ -42,6 +43,18 @@ func close(_ first: Double, _ second: Double, tolerance: Double = 1.0e-9) -> Boo
     return abs(first - second) <= tolerance
 }
 
+func permissions(_ url: URL) throws -> Int {
+    var metadata = stat()
+    guard lstat(url.path, &metadata) == 0 else {
+        throw NSError(
+            domain: "MarketScannerTestPermissions",
+            code: Int(errno),
+            userInfo: [NSLocalizedDescriptionKey:
+                "cannot lstat \(url.path): \(String(cString: strerror(errno)))"])
+    }
+    return Int(metadata.st_mode & mode_t(0o777))
+}
+
 func processCPUSeconds(_ usage: rusage) -> Double {
     let user = Double(usage.ru_utime.tv_sec)
         + Double(usage.ru_utime.tv_usec) / 1_000_000.0
@@ -76,6 +89,12 @@ func regularFileBytes(in directory: URL) throws -> Int64 {
     if let enumerationError { throw enumerationError }
     return total
 }
+
+// Dispatch the Result crash worker before the default/E2E host suites. Each
+// crash phase is a standalone process and must reach its requested lock or
+// fault boundary without first running unrelated tests.
+runResultPublicationCrashWorkerIfRequested()
+runMapQuarantineCrashWorkerIfRequested()
 
 // The 100k-record finalization memory qualification runs in a dedicated
 // process. `ru_maxrss` is a lifetime high-water mark, so measuring it at
@@ -7938,42 +7957,72 @@ do {
         lateFileRejected,
         "RC-B08 a sidecar added after pre-inventory must block commit")
 
-    // RC-B09 deterministic crash point after the new directory rename but
-    // before the task reference: the previous generation and reference must
-    // be restored, with no swallowed rollback failure.
-    SessionSnapshotTransaction.faultInjector = { point in
-        if case .afterSnapshotInstall = point {
-            throw NSError(
-                domain: "SnapshotFaultInjection", code: 1,
-                userInfo: [NSLocalizedDescriptionKey: "after install"])
+    // RC-B09/macOS 14: every transient owner-write publication boundary
+    // must roll back to the previous frozen generation on an injected error.
+    // The durable transaction intent is removed only after recovery succeeds.
+    for faultName in [
+        "old_thaw_before_backup_rename",
+        "new_rename_before_freeze",
+        "new_freeze_before_parent_fsync",
+        "after_snapshot_install",
+    ] {
+        SessionSnapshotTransaction.faultInjector = { point in
+            let shouldFail: Bool
+            switch (faultName, point) {
+            case ("old_thaw_before_backup_rename",
+                  .afterPreviousSnapshotThawBeforeBackupRename),
+                 ("new_rename_before_freeze",
+                  .afterSnapshotRenameBeforeFreeze),
+                 ("new_freeze_before_parent_fsync",
+                  .afterSnapshotFreezeBeforeParentFsync),
+                 ("after_snapshot_install", .afterSnapshotInstall):
+                shouldFail = true
+            default:
+                shouldFail = false
+            }
+            if shouldFail {
+                throw NSError(
+                    domain: "SnapshotFaultInjection", code: 1,
+                    userInfo: [NSLocalizedDescriptionKey: faultName])
+            }
         }
+        var interruptedCommitRejected = false
+        do {
+            _ = try SessionSnapshotTransaction.snapshot(
+                finalizedSession: session,
+                sourceDatabase: database,
+                taskRoot: taskRoot,
+                eligibility: SessionSnapshotTransaction.Eligibility(
+                    priorMapID: "MAP-P7",
+                    priorMapSHA256: priorMapSHA,
+                    storeID: "STORE-P7",
+                    floorID: "FLOOR-P7",
+                    appGitSHA: "test-git-sha"))
+        } catch {
+            interruptedCommitRejected = true
+        }
+        SessionSnapshotTransaction.faultInjector = nil
+        require(
+            interruptedCommitRejected,
+            "RC-B09 \(faultName) must surface failure")
+        let restoredTaskManifest = try Data(
+            contentsOf: taskRoot.appendingPathComponent("input_manifest.json"))
+        require(
+            restoredTaskManifest == persistedManifestData,
+            "RC-B09 \(faultName) must restore the previous task reference")
+        require(
+            !fileManager.fileExists(atPath: taskRoot.appendingPathComponent(
+                "input_snapshot.transaction.json").path),
+            "RC-B09 \(faultName) must clear the recovered transaction intent")
+        try SessionSnapshotTransaction.revalidateSnapshot(
+            snapshot.snapshotDirectory)
+        let restoredSnapshotMode = (try fileManager.attributesOfItem(
+            atPath: snapshot.snapshotDirectory.path)[.posixPermissions]
+            as? NSNumber)?.intValue
+        require(
+            restoredSnapshotMode == 0o555,
+            "RC-B09 \(faultName) must leave the restored root frozen")
     }
-    var interruptedCommitRejected = false
-    do {
-        _ = try SessionSnapshotTransaction.snapshot(
-            finalizedSession: session,
-            sourceDatabase: database,
-            taskRoot: taskRoot,
-            eligibility: SessionSnapshotTransaction.Eligibility(
-                priorMapID: "MAP-P7",
-                priorMapSHA256: priorMapSHA,
-                storeID: "STORE-P7",
-                floorID: "FLOOR-P7",
-                appGitSHA: "test-git-sha"))
-    } catch {
-        interruptedCommitRejected = true
-    }
-    SessionSnapshotTransaction.faultInjector = nil
-    require(
-        interruptedCommitRejected,
-        "RC-B09 injected interrupted commit must surface failure")
-    let restoredTaskManifest = try Data(
-        contentsOf: taskRoot.appendingPathComponent("input_manifest.json"))
-    require(
-        restoredTaskManifest == persistedManifestData,
-        "RC-B09 interrupted commit must restore the previous task reference")
-    try SessionSnapshotTransaction.revalidateSnapshot(
-        snapshot.snapshotDirectory)
 
     try Data("tampered".utf8).write(to: database)
     try Data("tampered-trace\n".utf8).write(
@@ -10706,13 +10755,1002 @@ catch {
     exit(9)
 }
 
+// RC Snapshot transaction crash worker. Every crash phase starts from one
+// committed baseline generation; a fresh process then re-enters the normal
+// snapshot API, which reconciles the durable intent before creating the next
+// generation.
+if CommandLine.arguments.count == 5,
+   CommandLine.arguments[1] == "--snapshot-publication-crash-worker" {
+    let session = URL(
+        fileURLWithPath: CommandLine.arguments[2], isDirectory: true)
+    let taskRoot = URL(
+        fileURLWithPath: CommandLine.arguments[3], isDirectory: true)
+    let phase = CommandLine.arguments[4]
+    let priorMapSHA = String(repeating: "a", count: 64)
+    let eligibility = SessionSnapshotTransaction.Eligibility(
+        priorMapID: "MAP-P7",
+        priorMapSHA256: priorMapSHA,
+        storeID: "STORE-P7",
+        floorID: "FLOOR-P7",
+        appGitSHA: "snapshot-crash-worker")
+    enum SnapshotCrashWorkerFault: Error {
+        case enterRollback
+    }
+    let postcheckAuthorityPayload = Data(
+        "{\"unrelated_postcheck\":true}\n".utf8)
+    let unrelatedIntentPayload = Data(
+        "{\"unrelated_intent\":true}\n".utf8)
+    var intentRemovalReplacementInjected = false
+    var generationRootReplacementInjected = false
+    var artifactReplacementInjected = false
+    var artifactPostHashMutationInjected = false
+    let generationRoot = taskRoot.appendingPathComponent(
+        "input_snapshot", isDirectory: true)
+    let preparedGenerationRootReplacement = taskRoot.appendingPathComponent(
+        "input_snapshot.prepared-root-replacement-test", isDirectory: true)
+    let displacedGenerationRoot = taskRoot.appendingPathComponent(
+        "input_snapshot.displaced-root-test", isDirectory: true)
+    do {
+        if phase == "generation_root_postopen_replace" {
+            guard FileManager.default.fileExists(atPath: generationRoot.path),
+                  !FileManager.default.fileExists(
+                    atPath: preparedGenerationRootReplacement.path),
+                  !FileManager.default.fileExists(
+                    atPath: displacedGenerationRoot.path) else {
+                Darwin._exit(55)
+            }
+            do {
+                try FileManager.default.copyItem(
+                    at: generationRoot,
+                    to: preparedGenerationRootReplacement)
+            } catch {
+                Darwin._exit(56)
+            }
+        }
+        if phase != "baseline" && phase != "recover" {
+            SessionSnapshotTransaction.faultInjector = { point in
+                if phase == "generation_root_postopen_replace",
+                   case .afterGenerationRootOpenBeforeValidation = point {
+                    guard !generationRootReplacementInjected else { return }
+                    guard chmod(generationRoot.path, mode_t(0o755)) == 0,
+                          chmod(
+                            preparedGenerationRootReplacement.path,
+                            mode_t(0o755)) == 0 else {
+                        Darwin._exit(57)
+                    }
+                    guard renameatx_np(
+                        AT_FDCWD, generationRoot.path,
+                        AT_FDCWD, displacedGenerationRoot.path,
+                        UInt32(RENAME_EXCL)) == 0 else {
+                        Darwin._exit(58)
+                    }
+                    guard renameatx_np(
+                        AT_FDCWD, preparedGenerationRootReplacement.path,
+                        AT_FDCWD, generationRoot.path,
+                        UInt32(RENAME_EXCL)) == 0 else {
+                        Darwin._exit(59)
+                    }
+                    guard chmod(displacedGenerationRoot.path, mode_t(0o555)) == 0,
+                          chmod(generationRoot.path, mode_t(0o555)) == 0 else {
+                        Darwin._exit(66)
+                    }
+                    generationRootReplacementInjected = true
+                    return
+                }
+                if (phase == "artifact_metadata_symlink"
+                        || phase == "artifact_metadata_hardlink"
+                        || phase == "artifact_metadata_mode_clone"),
+                   case let .afterArtifactAuthorityReadBeforeOpen(name) = point,
+                   name == "metadata.json" {
+                    guard !artifactReplacementInjected else { return }
+                    let metadata = generationRoot.appendingPathComponent(name)
+                    let originalName: String
+                    switch phase {
+                    case "artifact_metadata_symlink":
+                        originalName = "metadata.original-symlink-test"
+                    case "artifact_metadata_hardlink":
+                        originalName = "metadata.original-hardlink-test"
+                    default:
+                        originalName = "metadata.original-mode-clone-test"
+                    }
+                    let original = generationRoot.appendingPathComponent(
+                        originalName)
+                    guard chmod(generationRoot.path, mode_t(0o755)) == 0 else {
+                        Darwin._exit(67)
+                    }
+                    guard renameatx_np(
+                        AT_FDCWD, metadata.path,
+                        AT_FDCWD, original.path,
+                        UInt32(RENAME_EXCL)) == 0 else {
+                        Darwin._exit(60)
+                    }
+                    if phase == "artifact_metadata_symlink" {
+                        guard Darwin.symlink(
+                            originalName, metadata.path) == 0 else {
+                            Darwin._exit(61)
+                        }
+                    } else if phase == "artifact_metadata_hardlink" {
+                        guard Darwin.link(original.path, metadata.path) == 0 else {
+                            Darwin._exit(62)
+                        }
+                    } else {
+                        do {
+                            try FileManager.default.copyItem(
+                                at: original, to: metadata)
+                        } catch {
+                            Darwin._exit(63)
+                        }
+                        guard chmod(metadata.path, mode_t(0o644)) == 0 else {
+                            Darwin._exit(64)
+                        }
+                    }
+                    guard chmod(generationRoot.path, mode_t(0o555)) == 0 else {
+                        Darwin._exit(65)
+                    }
+                    artifactReplacementInjected = true
+                    return
+                }
+                if phase == "artifact_posthash_mutate",
+                   case let .afterArtifactHashBeforeGenerationEnd(name) = point,
+                   name == "localization_trace.jsonl" {
+                    guard !artifactPostHashMutationInjected else { return }
+                    let artifact = generationRoot.appendingPathComponent(name)
+                    guard chmod(generationRoot.path, mode_t(0o755)) == 0,
+                          chmod(artifact.path, mode_t(0o644)) == 0 else {
+                        Darwin._exit(78)
+                    }
+                    do {
+                        let handle = try FileHandle(forWritingTo: artifact)
+                        try handle.seek(toOffset: 0)
+                        try handle.write(contentsOf: Data("TRACE\n".utf8))
+                        try handle.truncate(atOffset: 6)
+                        try handle.synchronize()
+                        try handle.close()
+                    } catch {
+                        Darwin._exit(79)
+                    }
+                    guard chmod(artifact.path, mode_t(0o444)) == 0,
+                          chmod(generationRoot.path, mode_t(0o555)) == 0 else {
+                        Darwin._exit(69)
+                    }
+                    artifactPostHashMutationInjected = true
+                    return
+                }
+                if phase == "rollback_after_authority" {
+                    if case .afterTaskReferenceDurableBeforeCleanup = point {
+                        throw SnapshotCrashWorkerFault.enterRollback
+                    }
+                    if case .afterPriorAuthorityRestoreBeforeGenerationCleanup
+                            = point {
+                        Darwin._exit(99)
+                    }
+                    return
+                }
+                if phase == "cleanup_replace",
+                   case .afterCleanupRootPreparedBeforeRemoval = point {
+                    let backup = taskRoot.appendingPathComponent(
+                        "input_snapshot.backup", isDirectory: true)
+                    let displaced = taskRoot.appendingPathComponent(
+                        "input_snapshot.displaced", isDirectory: true)
+                    guard renameatx_np(
+                        AT_FDCWD, backup.path,
+                        AT_FDCWD, displaced.path,
+                        UInt32(RENAME_EXCL)) == 0 else {
+                        Darwin._exit(41)
+                    }
+                    do {
+                        try FileManager.default.createDirectory(
+                            at: backup, withIntermediateDirectories: false)
+                        try Data("replacement-must-survive\n".utf8).write(
+                            to: backup.appendingPathComponent("marker.txt"))
+                    } catch {
+                        Darwin._exit(42)
+                    }
+                    Darwin._exit(103)
+                }
+                if (phase == "reference_postcheck_replace"
+                        || phase == "reference_postcheck_appear"
+                        || phase == "reference_swap_postrename_replace"),
+                   case .afterTaskReferenceAuthorityRecheckBeforeInstall = point {
+                    let authority = taskRoot.appendingPathComponent(
+                        "input_manifest.json")
+                    if phase == "reference_postcheck_replace"
+                        || phase == "reference_swap_postrename_replace" {
+                        let displaced = taskRoot.appendingPathComponent(
+                            "input_manifest.displaced-postcheck-test")
+                        guard renameatx_np(
+                            AT_FDCWD, authority.path,
+                            AT_FDCWD, displaced.path,
+                            UInt32(RENAME_EXCL)) == 0 else {
+                            Darwin._exit(46)
+                        }
+                    }
+                    do {
+                        try postcheckAuthorityPayload.write(to: authority)
+                        guard chmod(authority.path, mode_t(0o444)) == 0 else {
+                            Darwin._exit(47)
+                        }
+                    } catch {
+                        Darwin._exit(48)
+                    }
+                    return
+                }
+                if phase == "reference_swap_postrename_replace",
+                   case .afterTaskReferenceRenameBeforePostcheck = point {
+                    Darwin._exit(107)
+                }
+                if phase == "first_clear_postcheck_appear"
+                    || phase == "first_clear_postrename_crash_appear"
+                    || phase == "first_clear_postrename" {
+                    if case .afterTaskReferenceDurableBeforeCleanup = point {
+                        throw SnapshotCrashWorkerFault.enterRollback
+                    }
+                    if (phase == "first_clear_postcheck_appear"
+                            || phase == "first_clear_postrename_crash_appear"),
+                       case .afterTaskReferenceAuthorityRecheckBeforeClear = point {
+                        let authority = taskRoot.appendingPathComponent(
+                            "input_manifest.json")
+                        let displaced = taskRoot.appendingPathComponent(
+                            "input_manifest.displaced-clear-postcheck-test")
+                        guard renameatx_np(
+                            AT_FDCWD, authority.path,
+                            AT_FDCWD, displaced.path,
+                            UInt32(RENAME_EXCL)) == 0 else {
+                            Darwin._exit(49)
+                        }
+                        do {
+                            try postcheckAuthorityPayload.write(to: authority)
+                            guard chmod(authority.path, mode_t(0o444)) == 0 else {
+                                Darwin._exit(50)
+                            }
+                        } catch {
+                            Darwin._exit(51)
+                        }
+                        return
+                    }
+                    if phase == "first_clear_postrename_crash_appear",
+                       case .afterTaskReferenceClearRenameBeforePostcheck = point {
+                        Darwin._exit(108)
+                    }
+                    if phase == "first_clear_postrename",
+                       case .afterTaskReferenceClearRenameBeforePostcheck = point {
+                        Darwin._exit(112)
+                    }
+                }
+                if (phase == "intent_removal_replace"
+                        || phase == "intent_removal_postrename_crash_replace"),
+                   case .afterTransactionIntentAuthorityRecheckBeforeRemoval = point {
+                    guard !intentRemovalReplacementInjected else { return }
+                    let intent = taskRoot.appendingPathComponent(
+                        SessionSnapshotTransaction.transactionIntentFileName)
+                    let displaced = taskRoot.appendingPathComponent(
+                        "input_snapshot.transaction.displaced-postcheck-test")
+                    guard renameatx_np(
+                        AT_FDCWD, intent.path,
+                        AT_FDCWD, displaced.path,
+                        UInt32(RENAME_EXCL)) == 0 else {
+                        Darwin._exit(52)
+                    }
+                    do {
+                        try unrelatedIntentPayload.write(to: intent)
+                        guard chmod(intent.path, mode_t(0o444)) == 0 else {
+                            Darwin._exit(53)
+                        }
+                    } catch {
+                        Darwin._exit(54)
+                    }
+                    intentRemovalReplacementInjected = true
+                    return
+                }
+                if phase == "intent_removal_postrename_crash_replace",
+                   case .afterTransactionIntentRemovalRenameBeforePostcheck = point {
+                    Darwin._exit(109)
+                }
+                if phase == "transaction_unbound_temp_replace",
+                   case .afterTransactionIntentCreationBeforeIdentityBind = point {
+                    let names = try FileManager.default.contentsOfDirectory(
+                        atPath: taskRoot.path).filter {
+                            $0.hasPrefix(
+                                SessionSnapshotTransaction
+                                    .transactionIntentCreationPrefix)
+                        }
+                    guard names.count == 1 else { Darwin._exit(70) }
+                    let temporary = taskRoot.appendingPathComponent(names[0])
+                    let displaced = taskRoot.appendingPathComponent(
+                        "input_snapshot.transaction.unbound-displaced-test")
+                    guard renameatx_np(
+                        AT_FDCWD, temporary.path,
+                        AT_FDCWD, displaced.path,
+                        UInt32(RENAME_EXCL)) == 0 else {
+                        Darwin._exit(71)
+                    }
+                    do {
+                        try Data("unrelated-unbound-intent\n".utf8).write(
+                            to: temporary)
+                        guard chmod(temporary.path, mode_t(0o600)) == 0 else {
+                            Darwin._exit(72)
+                        }
+                    } catch {
+                        Darwin._exit(73)
+                    }
+                    Darwin._exit(110)
+                }
+                if phase == "task_unbound_temp_replace",
+                   case .afterTaskReferenceCreationBeforeIdentityBind = point {
+                    let names = try FileManager.default.contentsOfDirectory(
+                        atPath: taskRoot.path).filter {
+                            $0.hasPrefix(
+                                SessionSnapshotTransaction
+                                    .taskManifestCreationPrefix)
+                        }
+                    guard names.count == 1 else { Darwin._exit(74) }
+                    let temporary = taskRoot.appendingPathComponent(names[0])
+                    let displaced = taskRoot.appendingPathComponent(
+                        "input_manifest.unbound-displaced-test")
+                    guard renameatx_np(
+                        AT_FDCWD, temporary.path,
+                        AT_FDCWD, displaced.path,
+                        UInt32(RENAME_EXCL)) == 0 else {
+                        Darwin._exit(75)
+                    }
+                    do {
+                        try Data("unrelated-unbound-task-reference\n".utf8).write(
+                            to: temporary)
+                        guard chmod(temporary.path, mode_t(0o600)) == 0 else {
+                            Darwin._exit(76)
+                        }
+                    } catch {
+                        Darwin._exit(77)
+                    }
+                    Darwin._exit(111)
+                }
+                if (phase == "reference_replace" || phase == "reference_appear"),
+                   case .afterTaskReferenceAuthorityReadBeforeInstall = point {
+                    let authority = taskRoot.appendingPathComponent(
+                        "input_manifest.json")
+                    let displaced = taskRoot.appendingPathComponent(
+                        "input_manifest.displaced-by-test")
+                    if FileManager.default.fileExists(atPath: authority.path) {
+                        guard renameatx_np(
+                            AT_FDCWD, authority.path,
+                            AT_FDCWD, displaced.path,
+                            UInt32(RENAME_EXCL)) == 0 else {
+                            Darwin._exit(43)
+                        }
+                    }
+                    do {
+                        try Data("{\"unrelated\":true}\n".utf8).write(
+                            to: authority)
+                        guard chmod(authority.path, mode_t(0o444)) == 0 else {
+                            Darwin._exit(44)
+                        }
+                    } catch {
+                        Darwin._exit(45)
+                    }
+                    return
+                }
+                switch (phase, point) {
+                case ("after_intent_temp",
+                      .afterTransactionIntentTemporaryFsyncBeforeRename):
+                    Darwin._exit(90)
+                case ("after_intent_rename",
+                      .afterTransactionIntentRenameBeforeParentFsync):
+                    Darwin._exit(91)
+                case ("old_thaw",
+                      .afterPreviousSnapshotThawBeforeBackupRename):
+                    Darwin._exit(92)
+                case ("old_rename",
+                      .afterPreviousSnapshotRenameBeforeFreeze):
+                    Darwin._exit(101)
+                case ("old_freeze",
+                      .afterPreviousSnapshotFreezeBeforeParentFsync):
+                    Darwin._exit(102)
+                case ("new_rename", .afterSnapshotRenameBeforeFreeze):
+                    Darwin._exit(93)
+                case ("new_freeze", .afterSnapshotFreezeBeforeParentFsync):
+                    Darwin._exit(94)
+                case ("after_install", .afterSnapshotInstall):
+                    Darwin._exit(95)
+                case ("reference_temp",
+                      .afterTaskReferenceTemporaryFsyncBeforeRename):
+                    Darwin._exit(100)
+                case ("reference_swap_postrename",
+                      .afterTaskReferenceRenameBeforePostcheck):
+                    Darwin._exit(106)
+                case ("reference_rename", .beforeTaskReferenceFsync):
+                    Darwin._exit(96)
+                case ("reference_durable",
+                      .afterTaskReferenceDurableBeforeCleanup):
+                    Darwin._exit(97)
+                case ("recovery_core_postintent_crash",
+                      .afterRecoveryCoreBeforeReturn):
+                    Darwin._exit(114)
+                case ("cleanup_root",
+                      .afterCleanupRootPreparedBeforeRemoval):
+                    Darwin._exit(98)
+                case ("cleanup_child", .afterCleanupChildRemoval):
+                    Darwin._exit(104)
+                case ("intent_remove_postrename",
+                      .afterTransactionIntentRemovalRenameBeforePostcheck):
+                    Darwin._exit(113)
+                default:
+                    break
+                }
+            }
+        }
+        let snapshot = try SessionSnapshotTransaction.snapshot(
+            finalizedSession: session,
+            sourceDatabase: session.appendingPathComponent("source.db"),
+            taskRoot: taskRoot,
+            eligibility: eligibility)
+        SessionSnapshotTransaction.faultInjector = nil
+        if phase == "intent_removal_replace" {
+            guard intentRemovalReplacementInjected else {
+                FileHandle.standardError.write(
+                    Data("snapshot intent-removal replacement missed fault point\n".utf8))
+                exit(38)
+            }
+            print("snapshot intent-removal replacement injected")
+            exit(105)
+        }
+        if phase != "baseline" && phase != "recover" {
+            FileHandle.standardError.write(
+                Data("snapshot crash worker missed fault point\n".utf8))
+            exit(38)
+        }
+        try SessionSnapshotTransaction.revalidateSnapshot(
+            snapshot.snapshotDirectory)
+        guard (try permissions(snapshot.snapshotDirectory)) == 0o555,
+              (try permissions(taskRoot.appendingPathComponent(
+                "input_manifest.json"))) == 0o444 else {
+            throw NSError(
+                domain: "SnapshotCrashWorker", code: 1,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "snapshot recovery modes are not 0555/0444"])
+        }
+        let forbidden = [
+            "input_snapshot.backup",
+            "input_snapshot.staging",
+            SessionSnapshotTransaction.transactionIntentFileName,
+        ]
+        for name in forbidden {
+            guard !FileManager.default.fileExists(
+                    atPath: taskRoot.appendingPathComponent(name).path) else {
+                throw NSError(
+                    domain: "SnapshotCrashWorker", code: 2,
+                    userInfo: [NSLocalizedDescriptionKey:
+                        "snapshot recovery left \(name)"])
+            }
+        }
+        let temporaryIntents = try FileManager.default.contentsOfDirectory(
+            atPath: taskRoot.path).filter {
+                $0.hasPrefix(
+                    SessionSnapshotTransaction.transactionIntentTemporaryPrefix)
+                    || ($0.hasPrefix(
+                        SessionSnapshotTransaction.taskManifestTemporaryPrefix)
+                        && $0.hasSuffix(
+                            SessionSnapshotTransaction.taskManifestTemporarySuffix))
+            }
+        guard temporaryIntents.isEmpty else {
+            throw NSError(
+                domain: "SnapshotCrashWorker", code: 3,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "snapshot recovery left intent temporary"])
+        }
+        print("snapshot \(phase) passed")
+        exit(0)
+    } catch {
+        SessionSnapshotTransaction.faultInjector = nil
+        FileHandle.standardError.write(
+            Data("snapshot crash worker failed: \(error)\n".utf8))
+        exit(39)
+    }
+}
+
+// RC Result publication crash worker. Production fault points call process
+// exit directly so restart recovery is exercised without Swift stack
+// unwinding, catch or defer cleanup.
+func runResultPublicationCrashWorkerIfRequested() {
+    guard CommandLine.arguments.count == 5,
+          CommandLine.arguments[1] == "--result-publication-crash-worker"
+    else { return }
+    let resultsRoot = URL(
+        fileURLWithPath: CommandLine.arguments[2], isDirectory: true)
+    let phase = CommandLine.arguments[3]
+    let recoveryEntry = CommandLine.arguments[4]
+    let taskID = "result-crash-task"
+    let resultID = "result-crash-final"
+    let workbookName = "result-crash.xlsx"
+    let coordinationRoot = resultsRoot.deletingLastPathComponent()
+    let lockAttemptMarker = coordinationRoot.appendingPathComponent(
+        ".\(resultsRoot.lastPathComponent).recovery-lock-attempt")
+    let lockAcquiredMarker = coordinationRoot.appendingPathComponent(
+        ".\(resultsRoot.lastPathComponent).recovery-lock-acquired")
+    let publisherReleaseMarker = coordinationRoot.appendingPathComponent(
+        ".\(resultsRoot.lastPathComponent).release-publisher")
+    MobileResultLibrary.rootOverride = resultsRoot
+    do {
+        if phase.hasPrefix("primitive_") {
+            try FileManager.default.createDirectory(
+                at: resultsRoot, withIntermediateDirectories: true)
+            let source = resultsRoot.appendingPathComponent(
+                "publication-source", isDirectory: true)
+            let destination = resultsRoot.appendingPathComponent(
+                "publication-destination", isDirectory: true)
+            let replacement = resultsRoot.appendingPathComponent(
+                "publication-replacement", isDirectory: true)
+            let displaced = resultsRoot.appendingPathComponent(
+                "publication-displaced", isDirectory: true)
+            try FileManager.default.createDirectory(
+                at: source, withIntermediateDirectories: false)
+            let payload = source.appendingPathComponent("marker.txt")
+            try Data("publication-original\n".utf8).write(to: payload)
+            guard chmod(payload.path, mode_t(0o444)) == 0 else {
+                Darwin._exit(120)
+            }
+            let sourceIdentity = try ImmutableDirectoryPublication.identity(
+                of: source,
+                allowedModes: [ImmutableDirectoryPublication.renameableMode])
+
+            if phase == "primitive_publication_source_reappear" {
+                var rejected = false
+                do {
+                    try ImmutableDirectoryPublication.publish(
+                        source: source,
+                        destination: destination,
+                        expectedIdentity: sourceIdentity,
+                        afterFreezeBeforeParentSync: {
+                            try FileManager.default.createDirectory(
+                                at: source, withIntermediateDirectories: false)
+                            try Data("replacement-source-must-survive\n".utf8)
+                                .write(to: source.appendingPathComponent("evidence.txt"))
+                        })
+                } catch {
+                    rejected = true
+                }
+                guard rejected,
+                      FileManager.default.fileExists(
+                        atPath: source.appendingPathComponent("evidence.txt").path),
+                      FileManager.default.fileExists(atPath: destination.path) else {
+                    Darwin._exit(121)
+                }
+                print("result primitive source-reappear passed")
+                exit(0)
+            }
+
+            try FileManager.default.copyItem(at: source, to: replacement)
+            guard chmod(replacement.path, mode_t(0o555)) == 0 else {
+                Darwin._exit(122)
+            }
+            func replacePublishedDestination() {
+                guard chmod(destination.path, mode_t(0o755)) == 0,
+                      chmod(replacement.path, mode_t(0o755)) == 0,
+                      renameatx_np(
+                        AT_FDCWD, destination.path,
+                        AT_FDCWD, displaced.path,
+                        UInt32(RENAME_EXCL)) == 0,
+                      renameatx_np(
+                        AT_FDCWD, replacement.path,
+                        AT_FDCWD, destination.path,
+                        UInt32(RENAME_EXCL)) == 0,
+                      chmod(displaced.path, mode_t(0o555)) == 0,
+                      chmod(destination.path, mode_t(0o555)) == 0 else {
+                    Darwin._exit(123)
+                }
+            }
+
+            if phase == "primitive_publication_destination_replace" {
+                var rejected = false
+                do {
+                    try ImmutableDirectoryPublication.publish(
+                        source: source,
+                        destination: destination,
+                        expectedIdentity: sourceIdentity,
+                        afterFreezeBeforeParentSync: replacePublishedDestination)
+                } catch {
+                    rejected = true
+                }
+                let replacementIdentity = try ImmutableDirectoryPublication.identity(
+                    of: destination,
+                    allowedModes: [ImmutableDirectoryPublication.immutableMode])
+                guard rejected,
+                      replacementIdentity != sourceIdentity,
+                      FileManager.default.fileExists(atPath: displaced.path) else {
+                    Darwin._exit(124)
+                }
+                print("result primitive destination-replace passed")
+                exit(0)
+            }
+
+            if phase == "primitive_interrupted_destination_replace" {
+                guard chmod(source.path, mode_t(0o755)) == 0,
+                      renameatx_np(
+                        AT_FDCWD, source.path,
+                        AT_FDCWD, destination.path,
+                        UInt32(RENAME_EXCL)) == 0 else {
+                    Darwin._exit(125)
+                }
+                var rejected = false
+                do {
+                    try ImmutableDirectoryPublication.freezeInterruptedDestination(
+                        destination,
+                        expectedIdentity: sourceIdentity,
+                        afterFreezeBeforeParentSync: replacePublishedDestination)
+                } catch {
+                    rejected = true
+                }
+                let replacementIdentity = try ImmutableDirectoryPublication.identity(
+                    of: destination,
+                    allowedModes: [ImmutableDirectoryPublication.immutableMode])
+                guard rejected,
+                      replacementIdentity != sourceIdentity,
+                      FileManager.default.fileExists(atPath: displaced.path) else {
+                    Darwin._exit(126)
+                }
+                print("result primitive interrupted-replace passed")
+                exit(0)
+            }
+            Darwin._exit(127)
+        }
+
+        if phase.hasPrefix("verify_") {
+            let delayedPhases: Set<String> = [
+                "verify_artifact_posthash_mutate",
+                "verify_manifest_postread_replace",
+                "verify_receipt_postread_replace",
+                "verify_result_root_final_sweep_replace",
+            ]
+            let payloadBytes = delayedPhases.contains(phase)
+                ? 128 * 1024 * 1024 : 64
+            let staging = try MobileResultLibrary.stagingDirectory(
+                taskID: taskID, resultID: resultID)
+            try Data(repeating: 0x61, count: payloadBytes).write(
+                to: staging.appendingPathComponent("payload.json"))
+            try Data("xlsx-verification\n".utf8).write(
+                to: staging.appendingPathComponent(workbookName))
+            _ = try MobileResultLibrary.commit(
+                resultID: resultID,
+                taskID: taskID,
+                stagingDirectory: staging,
+                packageFiles: ["payload.json"],
+                workbookFilename: workbookName)
+            let final = try MobileResultLibrary.resultDirectory(resultID: resultID)
+            let payloadURL = final.appendingPathComponent("payload.json")
+            let manifestURL = final.appendingPathComponent(
+                MobileResultLibrary.manifestFileName)
+            let receiptURL = final.appendingPathComponent(
+                MobileResultLibrary.commitReceiptFileName)
+            let displacedEvidence = resultsRoot.appendingPathComponent(
+                "verification-displaced-evidence")
+            let replacementRoot = resultsRoot.appendingPathComponent(
+                "verification-root-replacement", isDirectory: true)
+            let displacedRoot = resultsRoot.appendingPathComponent(
+                "verification-root-displaced", isDirectory: true)
+            if phase == "verify_result_root_final_sweep_replace" {
+                try FileManager.default.copyItem(at: final, to: replacementRoot)
+                guard chmod(replacementRoot.path, mode_t(0o555)) == 0 else {
+                    Darwin._exit(128)
+                }
+            }
+
+            let mutationFinished = DispatchSemaphore(value: 0)
+            let mutationLock = NSLock()
+            var mutationError: Error?
+            var mutationScheduled = false
+            func recordMutationError(_ error: Error) {
+                mutationLock.lock()
+                mutationError = error
+                mutationLock.unlock()
+            }
+            func mutateVerificationFixture() {
+                do {
+                    switch phase {
+                    case "verify_artifact_symlink":
+                        guard chmod(final.path, mode_t(0o755)) == 0,
+                              renameatx_np(
+                                AT_FDCWD, payloadURL.path,
+                                AT_FDCWD, displacedEvidence.path,
+                                UInt32(RENAME_EXCL)) == 0,
+                              Darwin.symlink(
+                                displacedEvidence.path, payloadURL.path) == 0,
+                              chmod(final.path, mode_t(0o555)) == 0 else {
+                            throw NSError(domain: "ResultVerification", code: 1)
+                        }
+                    case "verify_artifact_hardlink":
+                        guard chmod(final.path, mode_t(0o755)) == 0,
+                              renameatx_np(
+                                AT_FDCWD, payloadURL.path,
+                                AT_FDCWD, displacedEvidence.path,
+                                UInt32(RENAME_EXCL)) == 0,
+                              Darwin.link(
+                                displacedEvidence.path, payloadURL.path) == 0,
+                              chmod(final.path, mode_t(0o555)) == 0 else {
+                            throw NSError(domain: "ResultVerification", code: 2)
+                        }
+                    case "verify_artifact_mode_clone":
+                        guard chmod(final.path, mode_t(0o755)) == 0,
+                              renameatx_np(
+                                AT_FDCWD, payloadURL.path,
+                                AT_FDCWD, displacedEvidence.path,
+                                UInt32(RENAME_EXCL)) == 0 else {
+                            throw NSError(domain: "ResultVerification", code: 3)
+                        }
+                        try FileManager.default.copyItem(
+                            at: displacedEvidence, to: payloadURL)
+                        guard chmod(payloadURL.path, mode_t(0o644)) == 0,
+                              chmod(final.path, mode_t(0o555)) == 0 else {
+                            throw NSError(domain: "ResultVerification", code: 4)
+                        }
+                    case "verify_artifact_posthash_mutate":
+                        guard chmod(final.path, mode_t(0o755)) == 0,
+                              chmod(payloadURL.path, mode_t(0o644)) == 0 else {
+                            throw NSError(domain: "ResultVerification", code: 5)
+                        }
+                        let descriptor = open(
+                            payloadURL.path, O_WRONLY | O_CLOEXEC | O_NOFOLLOW)
+                        guard descriptor >= 0 else {
+                            throw NSError(domain: "ResultVerification", code: 6)
+                        }
+                        var byte: UInt8 = 0x62
+                        let wrote = Darwin.pwrite(descriptor, &byte, 1, 0)
+                        let synced = fsync(descriptor)
+                        _ = close(descriptor)
+                        guard wrote == 1, synced == 0,
+                              chmod(payloadURL.path, mode_t(0o444)) == 0,
+                              chmod(final.path, mode_t(0o555)) == 0 else {
+                            throw NSError(domain: "ResultVerification", code: 7)
+                        }
+                    case "verify_manifest_postread_replace",
+                         "verify_receipt_postread_replace":
+                        let authority = phase == "verify_manifest_postread_replace"
+                            ? manifestURL : receiptURL
+                        guard chmod(final.path, mode_t(0o755)) == 0,
+                              renameatx_np(
+                                AT_FDCWD, authority.path,
+                                AT_FDCWD, displacedEvidence.path,
+                                UInt32(RENAME_EXCL)) == 0 else {
+                            throw NSError(domain: "ResultVerification", code: 8)
+                        }
+                        try FileManager.default.copyItem(
+                            at: displacedEvidence, to: authority)
+                        guard chmod(authority.path, mode_t(0o444)) == 0,
+                              chmod(final.path, mode_t(0o555)) == 0 else {
+                            throw NSError(domain: "ResultVerification", code: 9)
+                        }
+                    case "verify_result_root_final_sweep_replace":
+                        guard chmod(final.path, mode_t(0o755)) == 0,
+                              chmod(replacementRoot.path, mode_t(0o755)) == 0,
+                              renameatx_np(
+                                AT_FDCWD, final.path,
+                                AT_FDCWD, displacedRoot.path,
+                                UInt32(RENAME_EXCL)) == 0,
+                              renameatx_np(
+                                AT_FDCWD, replacementRoot.path,
+                                AT_FDCWD, final.path,
+                                UInt32(RENAME_EXCL)) == 0,
+                              chmod(displacedRoot.path, mode_t(0o555)) == 0,
+                              chmod(final.path, mode_t(0o555)) == 0 else {
+                            throw NSError(domain: "ResultVerification", code: 10)
+                        }
+                    default:
+                        throw NSError(domain: "ResultVerification", code: 11)
+                    }
+                } catch {
+                    recordMutationError(error)
+                }
+                mutationFinished.signal()
+            }
+            MobileResultLibrary.processLockAcquiredObserver = {
+                guard !mutationScheduled else { return }
+                mutationScheduled = true
+                if delayedPhases.contains(phase) {
+                    DispatchQueue.global().asyncAfter(
+                        deadline: .now() + .milliseconds(10),
+                        execute: mutateVerificationFixture)
+                } else {
+                    mutateVerificationFixture()
+                }
+            }
+            var rejected = false
+            do {
+                _ = try MobileResultLibrary.readResult(resultID: resultID)
+            } catch {
+                rejected = true
+            }
+            MobileResultLibrary.processLockAcquiredObserver = nil
+            guard mutationFinished.wait(timeout: .now() + 10.0) == .success else {
+                Darwin._exit(129)
+            }
+            mutationLock.lock()
+            let capturedMutationError = mutationError
+            mutationLock.unlock()
+            guard capturedMutationError == nil, rejected else {
+                Darwin._exit(130)
+            }
+            if phase == "verify_artifact_posthash_mutate" {
+                let attributes = try FileManager.default.attributesOfItem(
+                    atPath: payloadURL.path)
+                guard (attributes[.size] as? NSNumber)?.intValue == payloadBytes else {
+                    Darwin._exit(131)
+                }
+            }
+            guard FileManager.default.fileExists(atPath: final.path) else {
+                Darwin._exit(132)
+            }
+            print("result \(phase) rejected replacement")
+            exit(0)
+        }
+
+        if !phase.hasPrefix("recover") {
+            let staging = try MobileResultLibrary.stagingDirectory(
+                taskID: taskID, resultID: resultID)
+            try Data("{\"crash\":true}\n".utf8).write(
+                to: staging.appendingPathComponent("payload.json"))
+            try Data("xlsx-crash\n".utf8).write(
+                to: staging.appendingPathComponent(workbookName))
+            MobileResultLibrary.commitFaultInjector = { stage in
+                switch (phase, stage) {
+                case ("after_intent_temp",
+                      .afterPublishIntentTemporaryFsyncBeforeRename):
+                    Darwin._exit(80)
+                case ("after_intent_rename",
+                      .afterPublishIntentRenameBeforeParentFsync):
+                    Darwin._exit(81)
+                case ("hold_after_intent",
+                      .afterPublishIntentDurableBeforeDirectoryRename):
+                    let deadline = ProcessInfo.processInfo.systemUptime + 30.0
+                    while !FileManager.default.fileExists(
+                            atPath: publisherReleaseMarker.path),
+                          ProcessInfo.processInfo.systemUptime < deadline {
+                        usleep(10_000)
+                    }
+                    Darwin._exit(
+                        FileManager.default.fileExists(
+                            atPath: publisherReleaseMarker.path) ? 86 : 87)
+                case ("after_directory_rename",
+                      .afterDirectoryRenameBeforeFreeze):
+                    Darwin._exit(82)
+                case ("after_destination_fchmod",
+                      .afterDestinationFchmodBeforeDirectoryFsync):
+                    Darwin._exit(88)
+                case ("after_destination_freeze",
+                      .afterDestinationFreezeBeforeParentFsync):
+                    Darwin._exit(83)
+                case ("after_exact_read", .afterRename):
+                    Darwin._exit(84)
+                case ("after_parent_fsync", .afterParentFsync):
+                    Darwin._exit(85)
+                default:
+                    break
+                }
+            }
+            _ = try MobileResultLibrary.commit(
+                resultID: resultID,
+                taskID: taskID,
+                stagingDirectory: staging,
+                packageFiles: ["payload.json"],
+                workbookFilename: workbookName)
+            FileHandle.standardError.write(
+                Data("result crash worker missed fault point\n".utf8))
+            exit(28)
+        }
+
+        if phase == "recover_lock_probe" {
+            MobileResultLibrary.processLockAttemptObserver = {
+                guard FileManager.default.createFile(
+                    atPath: lockAttemptMarker.path,
+                    contents: Data("attempt\n".utf8)) else {
+                    throw NSError(
+                        domain: "ResultCrashWorker", code: 7,
+                        userInfo: [NSLocalizedDescriptionKey:
+                            "cannot publish lock-attempt marker"])
+                }
+            }
+            MobileResultLibrary.processLockAcquiredObserver = {
+                guard FileManager.default.createFile(
+                    atPath: lockAcquiredMarker.path,
+                    contents: Data("acquired\n".utf8)) else {
+                    throw NSError(
+                        domain: "ResultCrashWorker", code: 8,
+                        userInfo: [NSLocalizedDescriptionKey:
+                            "cannot publish lock-acquired marker"])
+                }
+            }
+        }
+
+        let final = try MobileResultLibrary.resultDirectory(resultID: resultID)
+        let finalExistedBeforeRecovery = FileManager.default.fileExists(
+            atPath: final.path)
+        switch recoveryEntry {
+        case "list":
+            _ = MobileResultLibrary.listResults()
+        case "read":
+            if finalExistedBeforeRecovery {
+                _ = try MobileResultLibrary.readResult(resultID: resultID)
+            } else {
+                _ = MobileResultLibrary.listResults()
+            }
+        case "committed":
+            _ = try MobileResultLibrary.committedResult(
+                taskID: taskID, expectedResultIDs: [resultID])
+        case "cleanup":
+            MobileResultLibrary.cleanupStaging(taskID: taskID)
+        default:
+            throw NSError(
+                domain: "ResultCrashWorker", code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "unknown recovery entry"])
+        }
+        MobileResultLibrary.cleanupStaging(taskID: taskID)
+        let visible = MobileResultLibrary.listResults()
+        let committed = FileManager.default.fileExists(atPath: final.path)
+        if committed {
+            let reopened = try MobileResultLibrary.readResult(resultID: resultID)
+            guard reopened.resultID == resultID,
+                  (try permissions(final)) == 0o555 else {
+                throw NSError(
+                    domain: "ResultCrashWorker", code: 2,
+                    userInfo: [NSLocalizedDescriptionKey:
+                        "recovered result is not exact immutable final"])
+            }
+            for name in [
+                "payload.json", workbookName,
+                MobileResultLibrary.manifestFileName,
+                MobileResultLibrary.commitReceiptFileName,
+            ] {
+                guard (try permissions(final.appendingPathComponent(name)))
+                        == 0o444 else {
+                    throw NSError(
+                        domain: "ResultCrashWorker", code: 3,
+                        userInfo: [NSLocalizedDescriptionKey:
+                            "recovered result artifact is not 0444"])
+                }
+            }
+            guard visible.count == 1 else {
+                throw NSError(
+                    domain: "ResultCrashWorker", code: 4,
+                    userInfo: [NSLocalizedDescriptionKey:
+                        "committed crash result is not uniquely listed"])
+            }
+        } else if !visible.isEmpty {
+            throw NSError(
+                domain: "ResultCrashWorker", code: 5,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "pre-rename crash exposed a result"])
+        }
+        let internalNames = try FileManager.default.contentsOfDirectory(
+            atPath: resultsRoot.path).filter {
+                $0.contains(".publish-intent")
+                    || $0.hasPrefix(".result-publish-intent-tmp-")
+                    || $0.hasPrefix(".result-staging-")
+            }
+        guard internalNames.isEmpty else {
+            throw NSError(
+                domain: "ResultCrashWorker", code: 6,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "result recovery left transaction artifacts: \(internalNames)"])
+        }
+        print("result recovered committed=\(committed ? 1 : 0)")
+        MobileResultLibrary.processLockAttemptObserver = nil
+        MobileResultLibrary.processLockAcquiredObserver = nil
+        exit(0)
+    } catch {
+        MobileResultLibrary.processLockAttemptObserver = nil
+        MobileResultLibrary.processLockAcquiredObserver = nil
+        FileHandle.standardError.write(
+            Data("result crash worker failed: \(error)\n".utf8))
+        exit(29)
+    }
+}
+
 // RC-HIGH Map Library quarantine crash worker. The Python host launches this
 // mode as a separate process and the production fault injector calls `_exit`
-// at the three rename/fsync boundaries. A second process enters through
+// at seven durable thaw/rename/freeze/fsync boundaries. A second process enters through
 // list/map/rebuild and proves startup reconciliation against the same real
 // filesystem tree.
-if CommandLine.arguments.count == 5,
-   CommandLine.arguments[1] == "--map-quarantine-crash-worker" {
+func runMapQuarantineCrashWorkerIfRequested() {
+    guard CommandLine.arguments.count == 5,
+          CommandLine.arguments[1] == "--map-quarantine-crash-worker"
+    else { return }
     let mapRoot = URL(
         fileURLWithPath: CommandLine.arguments[2], isDirectory: true)
     let phase = CommandLine.arguments[3]
@@ -10723,19 +11761,70 @@ if CommandLine.arguments.count == 5,
     do {
         let source = try MobileMapLibrary.packageDirectory(
             priorMapID: priorMapID, packageSHA: packageSHA)
-        if phase != "recover" {
+        let coordinationRoot = mapRoot.deletingLastPathComponent()
+        let quarantineRoot = mapRoot
+            .appendingPathComponent("quarantine", isDirectory: true)
+            .appendingPathComponent(priorMapID, isDirectory: true)
+
+        func rollbackDiagnosticTemporary() throws -> URL {
+            let names = try FileManager.default.contentsOfDirectory(
+                atPath: quarantineRoot.path)
+            guard let name = names.first(where: {
+                $0.hasPrefix(".") && $0.hasSuffix(".diagnostic.tmp")
+            }) else {
+                throw NSError(
+                    domain: "MapQuarantineCrashWorker", code: 10,
+                    userInfo: [NSLocalizedDescriptionKey:
+                        "missing rollback diagnostic temporary"])
+            }
+            return quarantineRoot.appendingPathComponent(name)
+        }
+
+        func publishRemovalTombstone() throws -> URL {
+            let temporary = try rollbackDiagnosticTemporary()
+            let suffix = ".diagnostic.tmp"
+            let transactionID = String(
+                temporary.lastPathComponent.dropFirst().dropLast(suffix.count))
+            let removal = quarantineRoot.appendingPathComponent(
+                ".\(transactionID).diagnostic.removing")
+            guard renameatx_np(
+                AT_FDCWD, temporary.path,
+                AT_FDCWD, removal.path,
+                UInt32(RENAME_EXCL)) == 0 else {
+                throw NSError(
+                    domain: "MapQuarantineCrashWorker", code: 11,
+                    userInfo: [NSLocalizedDescriptionKey:
+                        "cannot publish diagnostic removal tombstone"])
+            }
+            try MobileMapLibrary.syncDirectory(quarantineRoot)
+            return removal
+        }
+
+        if !phase.hasPrefix("recover") {
             try FileManager.default.createDirectory(
                 at: source, withIntermediateDirectories: true)
             let invalidManifest = Data("{}\n".utf8)
             let manifestURL = source.appendingPathComponent("manifest.json")
             try invalidManifest.write(to: manifestURL)
             let payloadURL = source.appendingPathComponent("payload.bin")
-            try Data("crash-window-payload\n".utf8).write(to: payloadURL)
+            if phase == "after_diagnostic_large" {
+                try Data(repeating: 0x71, count: 128 * 1024 * 1024)
+                    .write(to: payloadURL)
+            } else {
+                try Data("crash-window-payload\n".utf8).write(to: payloadURL)
+            }
             try MobileMapLibrary.syncFile(manifestURL)
             try MobileMapLibrary.syncFile(payloadURL)
             try MobileMapLibrary.syncDirectory(source)
             try MobileMapLibrary.syncDirectory(source.deletingLastPathComponent())
             try MobileMapLibrary.syncDirectory(try MobileMapLibrary.packagesRoot())
+            guard chmod(source.path, mode_t(0o555)) == 0 else {
+                throw NSError(
+                    domain: "MapQuarantineCrashWorker", code: 7,
+                    userInfo: [NSLocalizedDescriptionKey:
+                        "cannot freeze source fixture before quarantine"])
+            }
+            try MobileMapLibrary.syncDirectory(source)
 
             let registry: [String: Any] = [
                 "format": "MarketScannerMapRegistry",
@@ -10761,11 +11850,82 @@ if CommandLine.arguments.count == 5,
 
             MobileMapLibrary.quarantineFaultInjector = { point in
                 switch (phase, point) {
+                case ("after_source_thaw", .afterSourceThawBeforePayloadRename):
+                    Darwin._exit(70)
                 case ("after_payload", .afterPayloadRename): Darwin._exit(71)
+                case ("after_diagnostic_placement",
+                      .afterDiagnosticPlacementBeforeFreeze):
+                    Darwin._exit(76)
                 case ("after_diagnostic", .afterDiagnosticPlacementAndFreeze):
                     Darwin._exit(72)
+                case ("after_diagnostic_large",
+                      .afterDiagnosticPlacementAndFreeze):
+                    Darwin._exit(89)
+                case ("after_publish_rename", .afterPublishRenameBeforeFreeze):
+                    Darwin._exit(74)
+                case ("after_publish_freeze", .afterPublishFreezeBeforeParentSync):
+                    Darwin._exit(75)
                 case ("after_publish", .afterPublishRenameAndParentSync):
                     Darwin._exit(73)
+                case ("replace_map_root_after_open",
+                      .afterSourceThawBeforePayloadRename):
+                    let displaced = coordinationRoot.appendingPathComponent(
+                        "map-root-open-displaced", isDirectory: true)
+                    let replacement = coordinationRoot.appendingPathComponent(
+                        "map-root-open-replacement", isDirectory: true)
+                    guard renameatx_np(
+                        AT_FDCWD, mapRoot.path,
+                        AT_FDCWD, displaced.path,
+                        UInt32(RENAME_EXCL)) == 0 else {
+                        throw NSError(
+                            domain: "MapQuarantineCrashWorker", code: 12,
+                            userInfo: [NSLocalizedDescriptionKey:
+                                "cannot displace opened map root"])
+                    }
+                    try FileManager.default.copyItem(
+                        at: displaced, to: replacement)
+                    guard renameatx_np(
+                        AT_FDCWD, replacement.path,
+                        AT_FDCWD, mapRoot.path,
+                        UInt32(RENAME_EXCL)) == 0 else {
+                        throw NSError(
+                            domain: "MapQuarantineCrashWorker", code: 13,
+                            userInfo: [NSLocalizedDescriptionKey:
+                                "cannot install replacement map root"])
+                    }
+                case ("replace_map_lock_after_acquire",
+                      .afterSourceThawBeforePayloadRename):
+                    let lock = mapRoot.appendingPathComponent(
+                        ".map-library.lock")
+                    let displaced = coordinationRoot.appendingPathComponent(
+                        "map-lock-open-displaced")
+                    guard renameatx_np(
+                        AT_FDCWD, lock.path,
+                        AT_FDCWD, displaced.path,
+                        UInt32(RENAME_EXCL)) == 0 else {
+                        throw NSError(
+                            domain: "MapQuarantineCrashWorker", code: 14,
+                            userInfo: [NSLocalizedDescriptionKey:
+                                "cannot displace acquired map lock"])
+                    }
+                    let replacementDescriptor = Darwin.open(
+                        lock.path,
+                        O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
+                        mode_t(0o600))
+                    guard replacementDescriptor >= 0 else {
+                        throw NSError(
+                            domain: "MapQuarantineCrashWorker", code: 15,
+                            userInfo: [NSLocalizedDescriptionKey:
+                                "cannot create replacement map lock"])
+                    }
+                    let replacementSynced = fsync(replacementDescriptor)
+                    _ = close(replacementDescriptor)
+                    guard replacementSynced == 0 else {
+                        throw NSError(
+                            domain: "MapQuarantineCrashWorker", code: 16,
+                            userInfo: [NSLocalizedDescriptionKey:
+                                "cannot sync replacement map lock"])
+                    }
                 default: break
                 }
             }
@@ -10773,6 +11933,201 @@ if CommandLine.arguments.count == 5,
             FileHandle.standardError.write(
                 Data("crash worker did not reach requested fault point\n".utf8))
             exit(18)
+        }
+
+        if phase == "recover_after_source_restore" {
+            MobileMapLibrary.quarantineFaultInjector = { point in
+                guard case .afterRollbackSourceModeRestoreBeforeIntentRemoval = point else {
+                    return
+                }
+                Darwin._exit(77)
+            }
+        }
+        if phase == "recover_replace_after_mode_restore" {
+            let replacement = source.deletingLastPathComponent()
+                .appendingPathComponent("replacement-\(packageSHA)", isDirectory: true)
+            let displaced = source.deletingLastPathComponent()
+                .appendingPathComponent("displaced-\(packageSHA)", isDirectory: true)
+            try FileManager.default.copyItem(at: source, to: replacement)
+            guard chmod(replacement.path, mode_t(0o755)) == 0 else {
+                throw NSError(
+                    domain: "MapQuarantineCrashWorker", code: 8,
+                    userInfo: [NSLocalizedDescriptionKey:
+                        "cannot prepare writable replacement source"])
+            }
+            MobileMapLibrary.quarantineFaultInjector = { point in
+                guard case .afterRollbackSourceModeRestoreBeforeIntentRemoval = point else {
+                    return
+                }
+                guard renameatx_np(
+                    AT_FDCWD, source.path,
+                    AT_FDCWD, displaced.path,
+                    UInt32(RENAME_EXCL)) == 0,
+                      renameatx_np(
+                        AT_FDCWD, replacement.path,
+                        AT_FDCWD, source.path,
+                        UInt32(RENAME_EXCL)) == 0 else {
+                    throw NSError(
+                        domain: "MapQuarantineCrashWorker", code: 9,
+                        userInfo: [NSLocalizedDescriptionKey:
+                            "cannot replace source during recovery"])
+                }
+            }
+        }
+        if phase == "recover_after_tombstone_rename" {
+            MobileMapLibrary.quarantineFaultInjector = { point in
+                guard case .afterRollbackSourceModeRestoreBeforeIntentRemoval = point
+                else { return }
+                _ = try publishRemovalTombstone()
+                Darwin._exit(78)
+            }
+        }
+        if phase == "recover_replace_source_after_tombstone" {
+            let sourceParent = source.deletingLastPathComponent()
+            let replacement = sourceParent.appendingPathComponent(
+                "tombstone-replacement-\(packageSHA)", isDirectory: true)
+            let displaced = sourceParent.appendingPathComponent(
+                "tombstone-original-\(packageSHA)", isDirectory: true)
+            try FileManager.default.copyItem(at: source, to: replacement)
+            guard chmod(replacement.path, mode_t(0o755)) == 0 else {
+                throw NSError(
+                    domain: "MapQuarantineCrashWorker", code: 17,
+                    userInfo: [NSLocalizedDescriptionKey:
+                        "cannot prepare tombstone source replacement"])
+            }
+            MobileMapLibrary.quarantineFaultInjector = { point in
+                guard case .afterRollbackSourceModeRestoreBeforeIntentRemoval = point
+                else { return }
+                _ = try publishRemovalTombstone()
+                guard renameatx_np(
+                    AT_FDCWD, source.path,
+                    AT_FDCWD, displaced.path,
+                    UInt32(RENAME_EXCL)) == 0,
+                      renameatx_np(
+                        AT_FDCWD, replacement.path,
+                        AT_FDCWD, source.path,
+                        UInt32(RENAME_EXCL)) == 0 else {
+                    Darwin._exit(91)
+                }
+                Darwin._exit(79)
+            }
+        }
+        if phase == "recover_after_tombstone_unlink_before_fsync" {
+            MobileMapLibrary.quarantineFaultInjector = { point in
+                guard case .afterRollbackSourceModeRestoreBeforeIntentRemoval = point
+                else { return }
+                let removal = try publishRemovalTombstone()
+                guard Darwin.unlink(removal.path) == 0 else {
+                    Darwin._exit(92)
+                }
+                // Deliberately omit the quarantine-root fsync. This is the
+                // exact process-death window after unlink and before its
+                // directory durability barrier.
+                Darwin._exit(80)
+            }
+        }
+
+        if phase == "recover_replace_pending_after_open"
+                || phase == "recover_replace_embedded_after_read" {
+            let pendingName = try FileManager.default.contentsOfDirectory(
+                atPath: quarantineRoot.path).first(where: {
+                    $0.hasPrefix(".") && $0.hasSuffix(".pending")
+                })
+            guard let pendingName else {
+                throw NSError(
+                    domain: "MapQuarantineCrashWorker", code: 18,
+                    userInfo: [NSLocalizedDescriptionKey:
+                        "missing pending fixture for delayed replacement"])
+            }
+            let pending = quarantineRoot.appendingPathComponent(
+                pendingName, isDirectory: true)
+            let displaced = coordinationRoot.appendingPathComponent(
+                phase == "recover_replace_pending_after_open"
+                    ? "pending-root-open-original"
+                    : "embedded-diagnostic-original")
+            let replacement = coordinationRoot.appendingPathComponent(
+                phase == "recover_replace_pending_after_open"
+                    ? "pending-root-open-replacement"
+                    : "embedded-diagnostic-replacement")
+            if phase == "recover_replace_pending_after_open" {
+                try FileManager.default.copyItem(at: pending, to: replacement)
+            } else {
+                let diagnostic = pending.appendingPathComponent(
+                    MobileMapLibrary.quarantineDiagnosticFileName)
+                try FileManager.default.copyItem(at: diagnostic, to: replacement)
+                guard chmod(replacement.path, mode_t(0o444)) == 0 else {
+                    throw NSError(
+                        domain: "MapQuarantineCrashWorker", code: 19,
+                        userInfo: [NSLocalizedDescriptionKey:
+                            "cannot freeze replacement embedded diagnostic"])
+                }
+            }
+
+            let mutationFinished = DispatchSemaphore(value: 0)
+            let mutationLock = NSLock()
+            var mutationError: Error?
+            DispatchQueue.global().asyncAfter(
+                deadline: .now() + .milliseconds(15)) {
+                do {
+                    if phase == "recover_replace_pending_after_open" {
+                        guard renameatx_np(
+                            AT_FDCWD, pending.path,
+                            AT_FDCWD, displaced.path,
+                            UInt32(RENAME_EXCL)) == 0,
+                              renameatx_np(
+                                AT_FDCWD, replacement.path,
+                                AT_FDCWD, pending.path,
+                                UInt32(RENAME_EXCL)) == 0 else {
+                            throw NSError(
+                                domain: "MapQuarantineCrashWorker", code: 20,
+                                userInfo: [NSLocalizedDescriptionKey:
+                                    "cannot replace opened pending root"])
+                        }
+                    } else {
+                        let diagnostic = pending.appendingPathComponent(
+                            MobileMapLibrary.quarantineDiagnosticFileName)
+                        guard chmod(pending.path, mode_t(0o755)) == 0,
+                              renameatx_np(
+                                AT_FDCWD, diagnostic.path,
+                                AT_FDCWD, displaced.path,
+                                UInt32(RENAME_EXCL)) == 0,
+                              renameatx_np(
+                                AT_FDCWD, replacement.path,
+                                AT_FDCWD, diagnostic.path,
+                                UInt32(RENAME_EXCL)) == 0,
+                              chmod(pending.path, mode_t(0o555)) == 0 else {
+                            throw NSError(
+                                domain: "MapQuarantineCrashWorker", code: 21,
+                                userInfo: [NSLocalizedDescriptionKey:
+                                    "cannot replace opened embedded diagnostic"])
+                        }
+                    }
+                } catch {
+                    mutationLock.lock()
+                    mutationError = error
+                    mutationLock.unlock()
+                }
+                mutationFinished.signal()
+            }
+            var rejected = false
+            do {
+                _ = try MobileMapLibrary.listMaps()
+            } catch {
+                rejected = true
+            }
+            guard mutationFinished.wait(timeout: .now() + 20.0) == .success else {
+                Darwin._exit(93)
+            }
+            mutationLock.lock()
+            let capturedMutationError = mutationError
+            mutationLock.unlock()
+            guard rejected, capturedMutationError == nil,
+                  FileManager.default.fileExists(atPath: displaced.path),
+                  FileManager.default.fileExists(atPath: pending.path) else {
+                Darwin._exit(94)
+            }
+            print("map \(phase) rejected replacement")
+            exit(0)
         }
 
         switch entry {
@@ -10955,6 +12310,33 @@ if CommandLine.arguments.count == 3,
             if case .unsafeIdentifier = error { unsafeRejected = true }
         }
         require(unsafeRejected, "CAS: unsafe priorMapID must be rejected")
+        for reservedComponent in [".", ".."] {
+            require(
+                !MobileMapLibrary.isSafeIdentifier(reservedComponent),
+                "CAS: reserved path component \(reservedComponent) must not be a safe ID")
+            var packagePathRejected = false
+            do {
+                _ = try MobileMapLibrary.packageDirectory(
+                    priorMapID: reservedComponent,
+                    packageSHA: compileResult.packageSHA256)
+            } catch let error as MobileMapLibrary.LibraryError {
+                if case .unsafeIdentifier = error {
+                    packagePathRejected = true
+                }
+            }
+            require(
+                packagePathRejected,
+                "CAS: packageDirectory must reject reserved ID \(reservedComponent)")
+        }
+        let twoLevelPackage = try MobileMapLibrary.packageDirectory(
+            priorMapID: compileResult.priorMapID,
+            packageSHA: compileResult.packageSHA256)
+        require(
+            twoLevelPackage.deletingLastPathComponent().lastPathComponent
+                == compileResult.priorMapID
+                && twoLevelPackage.lastPathComponent
+                    == compileResult.packageSHA256,
+            "CAS: safe package path must remain exactly <id>/<sha>")
         var shaRejected = false
         do {
             _ = try MobileMapLibrary.register(
@@ -11100,7 +12482,7 @@ if CommandLine.arguments.count == 3,
         require(
             diagnostic["format"] as? String
                 == "MarketScannerMapQuarantineDiagnostic"
-                && StrictJSONScalar.integer(diagnostic["version"]) == 2
+                && StrictJSONScalar.integer(diagnostic["version"]) == 3
                 && diagnostic["transaction_id"] as? String == quarantineEntry
                 && diagnostic["reason"] as? String
                     == "package_validation_failed"
@@ -11115,9 +12497,11 @@ if CommandLine.arguments.count == 3,
                     == quarantineDirectory.path
                 && MobileMapLibrary.isSHA256(
                     diagnostic["payload_tree_sha256"] as? String ?? "")
+                && UInt64(diagnostic["payload_device"] as? String ?? "") != nil
+                && UInt64(diagnostic["payload_inode"] as? String ?? "") != nil
                 && !(diagnostic["validator_detail"] as? String ?? "").isEmpty,
             "RC-B27 quarantine diagnostic must bind transaction/reason/time/"
-                + "source/path/mode/payload hash/detail")
+                + "source/path/mode/payload dev-inode/hash/detail")
         let diagnosticAttributes = try FileManager.default.attributesOfItem(
             atPath: diagnosticURL.path)
         let diagnosticMode = (diagnosticAttributes[.posixPermissions]
