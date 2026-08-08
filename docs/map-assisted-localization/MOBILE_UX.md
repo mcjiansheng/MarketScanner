@@ -40,7 +40,7 @@
 
 人工确认使用 native 一次性冻结的最近 node ID/stamp、CameraMobile timebase offset 和 generation。短暂无新快照时可使用最近 1 秒内、按当前 frame time 复核仍与 node 相差不超过 1 秒的缓存快照；超过边界仍拒绝，不会伪造 PC 锚点事件。
 
-“扫描价签条码”进入专用 camera-only Capture Mode，持续消费当前 `ARFrame.capturedImage`，支持 QR、EAN‑8/13、Code128、UPC‑E 和 PDF417，不启动第二路相机，也不暂停 ARSession、RTAB-Map、数据库、Clock、Pose、node creation 或 prior-map localization。固定 scan box 会映射成 Vision 的真实 ROI；Vision 最多 8 Hz、one-in-flight，预览最多 24 Hz。候选连续 2 帧锁定，同一 capture 目标 4 个、最低 3 个独立 frame，最大窗口 2 秒；达到 deadline 时已有 3 个 durable frame 即进入解析，否则保留原始观测并要求重扫。
+“扫描价签条码”进入专用 camera-only Capture Mode，持续消费当前 `ARFrame.capturedImage`，支持 QR、EAN‑8/13、Code128、UPC‑E 和 PDF417，不启动第二路相机，也不暂停 ARSession、RTAB-Map、数据库、Clock、Pose、node creation 或 prior-map localization。固定 scan box 会映射成 Vision 的真实 ROI；Vision 最多 8 Hz、one-in-flight，每个 request 有 1 秒 ARFrame deadline，预览最多 24 Hz。Vision worker 固定为两条 lane：超时 lane 被 cancel/quarantine，备用 lane 可继续；两条都挂起时 Barcode UX fail closed，原扫描继续。候选连续 2 帧锁定，同一 capture 目标 4 个、最低 3 个独立 frame，最大窗口 2 秒；达到 deadline 时已有 3 个 durable frame 即进入解析，否则保留原始观测并要求重扫。
 
 深度使用内缩 9×9 ROI，记录样本数、内点数/比例、中值、MAD、平面残差和法向；样本不足、前后景分层、反射/孔洞或平面不稳定时退化为货架射线或待复核，不能因为“有深度”就获得高置信。对齐快照超过 250 ms 降级，超过 600 ms 或版本落后强制 lost/review。只有至少 3 个逐帧可靠证据共同指向同一 `shelfSegmentId + side` 才允许确认；弱帧可以保留作 raw audit，但不能凑足确认 quorum。
 

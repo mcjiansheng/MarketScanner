@@ -20,12 +20,21 @@
 
 ## 已延期的低影响实现
 
+- Candidate lock 增加 maximum inter-frame gap，明确覆盖 `A → 长停顿/Vision error → A`，避免跨过长间隔直接锁定。
+- `didReceiveMemoryWarning` 和 host `ViewController` dismissal 路径增加 Barcode UX 的显式 generation invalidation、overlay/preview 清理回归。
+- candidate lock 增加一次 light haptic，错误状态增加 warning haptic；不得按 frame 重复震动。
 - 小地图使用统一米制 scale 并居中 letterbox，避免 X/Y 分别拉伸造成几何误导。
 - VoiceOver announcement 只在语义状态变化时播报，并对采集进度做节流。
+- 增加 in-flight request 遇设备旋转时的 ROI/orientation race 回归；旧 orientation callback 必须被 request/generation 身份拒绝或按其捕获时几何解释。
+- 补齐 ESL 新文案的 `zh-Hans` 本地化资源，不以英文 fallback 冒充已完成中文现场 UX。
 - resolving / confirming 阶段停止不必要的 24 Hz camera-only preview，降低 GPU 和热压力。
 - 将 Vision 底层错误安全截断后写入 audit，同时保持 UI 使用稳定错误码。
+- 增加可注入 Vision request/worker 的 scanner 级集成测试，端到端覆盖 A hang→deadline restart→B 在 A 返回前实际开始→late A 被拒→B 成功→A/B 连续 hang 后 capacity exhausted；当前 coordinator、token gate 和真实阻塞 executor 分层测试已覆盖生产逻辑，因此本项不阻断 I6。
 - 增加 torch 控制和对应热/电量策略。
 - confirmation sheet 增加明确的 submitting 状态；持久化失败的恢复交互继续优化。
+- 对大楼层 shelf association 做 `O(N + kN)` 基准；基准证明需要后再引入 spatial index，避免在没有规模证据时扩大算法改动。
+- PC observation/burst parity 继续交叉验证 `depth / tracking / confidence / prior_map_id`，当前 exact node/frame/payload/symbology 合同不得放宽。
+- `SupermarketScanSession` completed-capture cache 除 observation ID set 外，评估即时缓存并复核 payload + symbology，减少最终化前重复读取；磁盘 strict validator 仍是 authority。
 - 对确认字段进入正式 XLSX/CSV schema bump，而不是依赖当前 JSON/GeoJSON/内部导出字段。
 - 继续 UI 视觉精修、Dynamic Type、VoiceOver focus order 和横竖屏真机检查。
 - 完整 PriorMap、scale、Replay/FAR 和现场控制点矩阵按主测试计划执行。

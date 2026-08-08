@@ -87,7 +87,7 @@ GET  /api/jobs/<id>/localized/versions/<version>/artifact/<allowlisted-name>
 
 当前结果从 `draft` 可在 review gate 通过后生成新的 `review` 版本。只有严格验证通过的 `full_relative_se2_factor_graph` 才具备进入 `published` 状态的 solver capability；bounded fallback 仍固定包含 `solver_not_full_relative_se2_factor_graph` 并返回 422。真实设备与现场资格门在 P5/P6 完成前，产品整体仍为 NO-GO，当前也不向外部业务系统上传。
 
-ESL capture 的 simulator build 已完成本轮 Swift module/文件编译证据，但最终 native C++ 编译被缺失的 platform-scoped Eigen/PCL/OpenCV headers 阻断；真机和现场测试见 [`ESL_CAPTURE_TODO.md`](ESL_CAPTURE_TODO.md)。该证据不是 Apple clean compile-link PASS。当前 Stage-3 + localized-output-store 聚焦回归为 104/104 PASS；I5 关键长时 PriorMap host workflow 为 1/1（943.159 s）PASS，但完整 `discover` 尚未运行，不能把单方法结果或历史结果写成完整套件 PASS。
+ESL capture 的 simulator build 已完成当前 App Swift module/文件编译证据，但最终 native C++ 编译被缺失的 platform-scoped Eigen/PCL/OpenCV headers 阻断；真机和现场测试见 [`ESL_CAPTURE_TODO.md`](ESL_CAPTURE_TODO.md)。该证据不是 Apple clean compile-link PASS。当前聚焦回归为 Stage-3 82/82、localized-output-store 28/28、session snapshot 10/10，合计 120/120 PASS；I5 关键长时 PriorMap host workflow 历史证据为 1/1（943.159 s）PASS，I6 未重跑该完整长方法，完整 `discover` 也尚未运行，不能把单方法结果或历史结果写成当前完整套件 PASS。
 
 ## 任务恢复与取消
 

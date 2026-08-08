@@ -4,7 +4,7 @@
 
 ## 总体
 
-当前 RC 分支 `mobile-only-v1-release-candidate-blocker-closeout`，基线 `81b6dbb216e843d363fd0088f673076add78013f`。底层事务加固与 ESL I3/I4 历史绑定保持可追溯。V4 exact-HEAD run `31276999280@8ba2f697a8213a1bcd4bf6fb7197d155cb09b865` 为 7/8：P0、SHA/wave、ABI、Ubuntu/Windows native clean build 与 Python contracts 均 PASS，唯一失败是 macOS/iOS host §18 timer liveness。当前 I5 `4d78d4646c01fe50bc0ac07eb2266879a24348db` 已由 G5 `d2eb9e2cb9b349179c410205d8eb9f44c2c30188` 绑定；它关闭 timer/worker 抖动和 Result removal tombstone authority-laundering P1。evidence SHA 由纯治理后继绑定，当前精确值以 descriptor 为唯一事实源。新 E5/V5 exact-HEAD 尚未形成 PASS，当前发布判断仍为 **REJECTED / NO-GO / developer smoke only**。
+当前 RC 分支 `mobile-only-v1-release-candidate-blocker-closeout`，基线 `81b6dbb216e843d363fd0088f673076add78013f`。底层事务加固与 ESL I3/I4 历史绑定保持可追溯。V4 exact-HEAD run `31276999280@8ba2f697a8213a1bcd4bf6fb7197d155cb09b865` 为 7/8：P0、SHA/wave、ABI、Ubuntu/Windows native clean build 与 Python contracts 均 PASS，唯一失败是 macOS/iOS host §18 timer liveness。Result recovery I5 `4d78d4646c01fe50bc0ac07eb2266879a24348db` / G5 `d2eb9e2cb9b349179c410205d8eb9f44c2c30188` 关闭 timer/worker 抖动和 tombstone authority-laundering P1。当前 ESL follow-up I6 `396097ea474be2e1155098cd709d1edfa9064a83` 已由 G6 `f65dbb0a3d0337ca926f4142489555d409089939` 绑定；它关闭 Vision hung-worker、deadline、取消线性化与 manifest v3/v1 兼容阻断。evidence SHA 由纯治理后继绑定，当前精确值以 descriptor 为唯一事实源。新 E6/V6 exact-HEAD 尚未形成 PASS，当前发布判断仍为 **REJECTED / NO-GO / developer smoke only**。
 
 新增明确 blocker：J-04 absolute-prior component identity 尚未关闭。最终 DB graph 可以由 node `mapID` 和 links 推导 component，但现行 constraint 写侧没有 atomic bound node/map ID，manual v3 也没有 RTAB-Map map ID；因此 reader 不能事后伪造 same-component 证明。需先完成正式 evidence schema 迁移，再进行 component 资格测试。
 
@@ -38,21 +38,21 @@
 ## ESL Barcode Capture / Shelf Confirmation 阻断级收口
 
 - iOS Capture Mode 只叠加 camera-only `MTKView` 预览、Vision 和 durable evidence；直接使用持续到达的 `ARFrame.capturedImage`，没有第二个 `AVCaptureSession`，没有暂停 ARSession、RTAB-Map、连续 SQLite、Clock、Pose、node creation 或 prior-map localization。
-- Vision 使用固定 scan box 的真实 ROI，最多 8 Hz、one-in-flight；预览最多 24 Hz。candidate 需连续 2 帧锁定，同一 capture 目标 4 个、最低 3 个独立帧，最大 2 秒；deadline 时已有 3 个 durable frame 即解析，持续 no-detection/multiple 也不会无限 collecting。
+- Vision 使用固定 scan box 的真实 ROI，最多 8 Hz、one-in-flight；每个请求有独立 1 秒 ARFrame deadline，预览最多 24 Hz。固定两条 worker lane；超时 lane 被 best-effort cancel/quarantine，fresh request 可在备用 lane 实际开始，两条 lane 都挂起时仅结束 ESL UX，不创建第三 worker，原扫描继续。candidate 需连续 2 帧锁定，同一 capture 目标 4 个、最低 3 个独立帧，最大 2 秒；deadline 时已有 3 个 durable frame 即解析，持续 no-detection/multiple 也不会无限 collecting。
 - confirmation gate 只统计逐帧 `algorithmCandidateReliable=true` 且 `needsReview=false`、共同指向同一 `shelfSegmentId + side` 的独立证据；弱帧只保留 raw audit，不能凑足 3-frame reliable quorum。替代候选按 segment + side 精确绑定。
 - `tag_observations.jsonl` 与 `tag_observation_bursts.jsonl` 在最终化和 PC 上逐项核对 `observation_id / burst_id / frame_id / payload / symbology`；localized tag v2 的 frame set 必须精确等于一个 verified complete burst。capture cache 使用完成顺序 FIFO，超过 512 个 burst 时不会随机淘汰刚完成、正在确认的 capture。
 - iOS finalization 还要求 localized v2 tag 的 payload/symbology 与该 verified burst 完全一致；burst sequence 必须为正且严格递增，但不要求从 1 开始或连续。duplicate/decreasing sequence 使用稳定 blocker fail closed。
 - additive v2 将 algorithm evidence 与 `USER_CONFIRMED` / `USER_OVERRIDDEN` 用户证据分开；用户确认不能覆盖算法事实，也不修改 SLAM、trajectory、node pose 或 localization constraint。
-- PC session input manifest v3 在 v2 Recovery binding 之上绑定 burst sidecar。可靠 optimized association 与现场选择一致时为 `NO_CONFLICT` / approved；冲突为 `USER_CONFIRMATION_CONFLICT`，离线证据不可用为 `OFFLINE_ASSOCIATION_UNAVAILABLE`，后两者强制 review/rescan。
+- PC session input manifest v3 在 v2 Recovery binding 之上绑定 burst sidecar；只有 localized tag v2 使用 verified complete burst `bound_node_id` 作为唯一节点权威，同一会话历史 tag v1 保持 legacy explicit-node/timestamp 路径。可靠 optimized association 与现场选择一致时为 `NO_CONFLICT` / approved；冲突为 `USER_CONFIRMATION_CONFLICT`，离线证据不可用为 `OFFLINE_ASSOCIATION_UNAVAILABLE`，后两者强制 review/rescan。
 - confirmation 提交由 coordinator 锁内 immutable map/session authority 与单次 claim 线性化；session writer 在同一 localization/capture 事务内复核 workflow、required-write health、tracking、map ID/SHA、floor、capture ID 和 verified burst。统一 session admission gate 在 finalization 前登记 transaction/reservation，finalization 关闭新 admission 后等待已登记 writer，inner writer 不再二次误拒。prior-map sentinel 后普通 ARFrame/Recovery 由入队/执行双重 gate 拦截，ordinary/terminal Recovery 的 `allowDuringFinalization` 已分离。capture generation 冻结 exact tracking identity，active-only audit 不创建 session；迟到旧 generation 不污染新 scan，scan-stop 自有 audit 仅使用窄范围 override。
 - PC pose/raw-position early-error 统一生成 unavailable audit。共享 manifest validator 强制 strict integer version、v1/v2/v3 Recovery binding、case-insensitive filename uniqueness、source database 安全 basename与 source-manifest cross-binding；manifest/snapshot/verified-copy 全链拒绝 source DB hardlink、非空 WAL/journal。
-- frozen-worktree 验证已覆盖 ESL capture/finalization、ARFrame-only source contract、长时 Swift host workflow **1/1（943.159 s）**、iOS/C4 **12/12**、Stage-3 与 localized output store **104/104**、Map Studio **106/106**、P0 **4/4**、Python compile、Swift parse 和 diff check。Xcode simulator 本机曾编译本轮 Swift module，但 native C++ 因缺失 platform-scoped Eigen/PCL/OpenCV headers 失败；这不是本机 clean build PASS。
-- MapCase02、坐标转换和 store/map/file-specific scale/offset/rotation 未修改。真机 30 秒连续性、Vision p50/p95、CPU/memory/thermal、光照/反光/斜视/多价签和现场矩阵见 [`../map-assisted-localization/ESL_CAPTURE_TODO.md`](../map-assisted-localization/ESL_CAPTURE_TODO.md)，均为 NOT RUN。
+- I6 frozen-worktree 验证已覆盖 ESL capture/finalization、ARFrame-only source contract **1/1**、Stage-3 **82/82**、localized output store **28/28**、session snapshot **10/10**，合计 **120/120 PASS**，以及 Python compile、Swift parse 和 diff check。I5 长时 Swift host workflow 的历史证据为 **1/1（943.159 s）PASS**，I6 未重新完整运行。Xcode simulator 本机已生成当前 App Swift module，但 native C++ 在 `Eigen/Core` 缺失处失败；这不是本机 clean build PASS。
+- MapCase02、坐标转换和 store/map/file-specific scale/offset/rotation 未在 ESL 增量中修改；后续修复按独立正式规范执行。真机 30 秒连续性、Vision p50/p95、CPU/memory/thermal、光照/反光/斜视/多价签和现场矩阵见 [`../map-assisted-localization/ESL_CAPTURE_TODO.md`](../map-assisted-localization/ESL_CAPTURE_TODO.md)，均为 NOT RUN。
 
 ## 本轮审查与回归证据
 
-- 最终关键生产增量完成两轮只读审查，发现的 Map `.`/`..`、Result quarantine crash orphan、Snapshot process-lock binding和历史v1顶层symlink兼容均已修复；该事务增量最终 `P0=0 / P1=0 / 新的可修P2=0`。ESL 最终独立复审另关闭 3 个 P1 race，复审为 `P0=0 / P1=0`；Windows portable basename、Debug assertion/audit 顺序和 scan-stop UI latency 三个 P2 已登记 [`../map-assisted-localization/ESL_CAPTURE_TODO.md`](../map-assisted-localization/ESL_CAPTURE_TODO.md)。这不是 release review PASS，J-04 仍是独立未关闭 blocker。
-- 当前证据：长时 host workflow 943.159 s PASS；Qualification 28/28、Map Studio 106/106、P0 4/4、iOS/C4 12/12、Stage-3/output-store 104/104 PASS；85-source membership、SwiftPM exact pin、contract drift、pbxproj、Swift/Python compile和diff-check PASS；Map/Result/Snapshot fault matrix 已进入长方法。完整 PriorMap `discover` 仍按时间要求延期，不复用历史 166/166 作为 I5 结论。
+- 最终关键生产增量完成两轮只读审查，发现的 Map `.`/`..`、Result quarantine crash orphan、Snapshot process-lock binding和历史v1顶层symlink兼容均已修复；该事务增量最终 `P0=0 / P1=0 / 新的可修P2=0`。I6 ESL 最终独立复审关闭 callback/evidence timeout 误取消 fresh request 和 manifest v3 误强制历史 tag v1 使用 burst authority两个 P1，复审为 `P0=0 / P1=0`；scanner 级可注入 hung-worker 集成测试及其他低影响项已登记 [`../map-assisted-localization/ESL_CAPTURE_TODO.md`](../map-assisted-localization/ESL_CAPTURE_TODO.md)。这不是 release review PASS，J-04 仍是独立未关闭 blocker。
+- 当前 I6 证据：Stage-3 82/82、localized-output-store 28/28、session snapshot 10/10，合计 120/120 PASS；Qualification 28/28、Map Studio 106/106、P0 4/4、iOS/C4 12/12及 I5 长时 host workflow 943.159 s 是既有证据；85-source membership、SwiftPM exact pin、contract drift、pbxproj、Swift/Python compile和diff-check PASS。完整 PriorMap `discover` 与 I6 长方法重跑仍按时间要求延期，不复用历史 166/166 作为 I6 结论。
 - 300,000 条 finalization：peak RSS 12,795,904 bytes；1,728,000 条 trace transition storm：保留 172,801 条，peak RSS 58,769,408 bytes。
 - 200,000 burst frames + 200,000 observations 全链路：243,952,646 input/temporary bytes，200,000 accepted observations，融合 1 个 accepted physical tag，884.922 s wall，peak RSS 670,662,656 bytes（约 639.6 MiB，低于 768 MiB host 门）。`StrictJSONLStreamReader` 通过每行 autorelease pool 消除长时 Foundation autorelease 累积，并保留完整 strict validator。
 - Map quarantine 当前 diagnostic v3 以 strict canonical bytes 绑定 transaction/prior-map/source/quarantine/payload-tree 和 payload dev/inode；真实子进程覆盖 source thaw、payload/diagnostic/publish 的七个 durable `_exit` 窗口，并验证 source replacement 在 intent 删除前被拒绝。legacy v2 仅兼容完整冻结的 `0555` final；v2 writable `0755` final 和 v2 incomplete source transaction 均保留现场并 fail closed。
@@ -62,15 +62,15 @@
 
 ## 未关闭（已有失败 run，禁止写 PASS）
 
-- exact-SHA CI 历史三次、V3 和 V4 均未全绿；V4 `31276999280` 已到 7/8，仅 macOS/iOS host contract FAIL。当前 I5/G5 尚无新的 exact-SHA required-gate PASS。
+- exact-SHA CI 历史三次、V3 和 V4 均未全绿；V4 `31276999280` 已到 7/8，仅 macOS/iOS host contract FAIL。当前 I6/G6 尚无新的 exact-SHA required-gate PASS。
 - 最新 run `31180693841` 的 Apple SwiftPM/Xcode metadata、双平台 cold dependencies、simulator/device clean compile-link 和 identity 检查因前置 macOS host E2E 失败而 skipped，仍未形成 Apple compile-link 证据。
 - Replay / 三格式 E2E（Python 驱动 + host 模式化套件已完成基础设施）。
 - 真机短路线 / Sam 路线 / Excel-Numbers-WPS 打开验证。
-- implementation/governance 已绑定为 I5 `4d78d4646c01fe50bc0ac07eb2266879a24348db` / G5 `d2eb9e2cb9b349179c410205d8eb9f44c2c30188`；仍需 E5/V5 evidence/validation SHA 绑定、新 exact-SHA evidence 和 production-drift-free 复核。
+- implementation/governance 已绑定为 I6 `396097ea474be2e1155098cd709d1edfa9064a83` / G6 `f65dbb0a3d0337ca926f4142489555d409089939`；仍需 E6/V6 evidence/validation SHA 绑定、新 exact-SHA evidence 和 production-drift-free 复核。
 
 ## 明日 TODO（按 2026-08-09 时间收口决定延期）
 
-- 完整 `python3 -m unittest discover -s tools/PriorMap/tests -v`；I5 已完成其中最重的 host workflow/finalization/trace/tag 路径，但不把单方法 PASS 冒充全 discover PASS。
+- 完整 `python3 -m unittest discover -s tools/PriorMap/tests -v`；I5 已完成其中最重的 host workflow/finalization/trace/tag 路径，但 I6 未重跑，不把历史单方法 PASS 冒充 I6 全 discover PASS。
 - 已写但未运行的 Map EEXIST、uppercase/noncanonical UUID、`.`/`..` CAS和 Result artifact/manifest/receipt/final-sweep/intent replacement完整集成断言。
 - 两个128 MiB delayed replacement场景增加精确测试hook，消除时序依赖。
 - `listResultsLocked()` root创建/枚举失败补持久可见的listing diagnostic与`NSLog`，不再静默等价于空库。
