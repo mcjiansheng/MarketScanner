@@ -1,6 +1,6 @@
 # iPhone 已有地图辅助扫描交互
 
-> 文档状态：**当前有效（阶段二移动端）**。最后核对日期：2026-08-02。
+> 文档状态：**当前有效（阶段二移动端）**。最后核对日期：2026-08-09。
 
 ## 新建扫描
 
@@ -40,7 +40,13 @@
 
 人工确认使用 native 一次性冻结的最近 node ID/stamp、CameraMobile timebase offset 和 generation。短暂无新快照时可使用最近 1 秒内、按当前 frame time 复核仍与 node 相差不超过 1 秒的缓存快照；超过边界仍拒绝，不会伪造 PC 锚点事件。
 
-“扫描价签条码”只在用户点击后消费下一帧 `ARFrame.capturedImage`，支持 QR、EAN‑8/13、Code128、UPC‑E 和 PDF417，不启动第二路相机。深度使用内缩 9×9 ROI，记录样本数、内点数/比例、中值、MAD、平面残差和法向；样本不足、前后景分层、反射/孔洞或平面不稳定时退化为货架射线或待复核，不能因为“有深度”就获得高置信。对齐快照超过 250 ms 降级，超过 600 ms 或版本落后强制 lost/review。
+“扫描价签条码”进入专用 camera-only Capture Mode，持续消费当前 `ARFrame.capturedImage`，支持 QR、EAN‑8/13、Code128、UPC‑E 和 PDF417，不启动第二路相机，也不暂停 ARSession、RTAB-Map、数据库、Clock、Pose、node creation 或 prior-map localization。固定 scan box 会映射成 Vision 的真实 ROI；Vision 最多 8 Hz、one-in-flight，预览最多 24 Hz。候选连续 2 帧锁定，同一 capture 目标 4 个、最低 3 个独立 frame，最大窗口 2 秒；达到 deadline 时已有 3 个 durable frame 即进入解析，否则保留原始观测并要求重扫。
+
+深度使用内缩 9×9 ROI，记录样本数、内点数/比例、中值、MAD、平面残差和法向；样本不足、前后景分层、反射/孔洞或平面不稳定时退化为货架射线或待复核，不能因为“有深度”就获得高置信。对齐快照超过 250 ms 降级，超过 600 ms 或版本落后强制 lost/review。只有至少 3 个逐帧可靠证据共同指向同一 `shelfSegmentId + side` 才允许确认；弱帧可以保留作 raw audit，但不能凑足确认 quorum。
+
+逐帧 observation 先落盘，complete burst 后才进入确认页。确认页显示 ESL、算法货架/侧面、迷你地图、高亮货架和替代候选，提供“正确”“错误/选择替代”“重扫”“仅保留观测”。替代选择按 segment + side 精确绑定。`USER_CONFIRMED` / `USER_OVERRIDDEN` 只新增用户证据，不覆盖算法关联，更不修改 SLAM、轨迹或 localization constraint。required evidence 写入失败、prior-map generation 失效或持久化失败时 fail closed，原始 RTAB-Map 数据库仍继续记录。
+
+用户结束扫描时，Capture Mode 会失效 generation 并停止新的普通 Vision/定位工作；finalization 在后台等待此前已登记的 observation、confirmation 和 localization writer 完成，不会因超时提示而跳过 drain。普通 Recovery/audit 不能越过 finalization 边界，只有终端 Recovery 与本次 scan-stop 自有 audit 可以使用窄范围写权限。迟到 callback 只认 capture 开始时冻结的 tracking session；旧会话已 detach 时直接拒绝，不会新建空扫描目录或写入下一次扫描。
 
 定位 trace、constraint、state、观测或已确认价签的必需写入失败时，HUD 持续显示红色“辅助定位证据写入失败”提示；首次失败另显示长 Toast。失败对当前会话是粘性的：立即停止新的先验地图修正、人工校正和价签确认，但原始 RTAB‑Map 数据库继续记录到用户结束。结束后数据库关闭，metadata 保存 `finalized=false`，checkpoint 保留，并可导出完整恢复包；应用不会回到 prior-map 录制。用户应开始新扫描，不要把红色告警会话交给 PC 强行优化。
 
@@ -51,3 +57,4 @@
 - 二维 HUD 忽略 ARKit 竖直高度；原始连续数据库仍保留三维运动。
 - 当前扫描绑定一个楼层，不支持楼梯、电梯或其他跨楼层过程。
 - 预定路线编辑和无条件全图搜索仍属于后续增强；当前只在持续 weak/lost 或可靠闭环后启用有界恢复。
+- 真实 LiDAR iPhone 的 30 秒性能、照明/反光/斜视/多价签矩阵和完整现场确认尚未执行；低影响增强与明日测试见 [`ESL_CAPTURE_TODO.md`](ESL_CAPTURE_TODO.md)。当前不得宣称 ESL FIELD CAPTURE UX COMPLETE 或 Production Ready。

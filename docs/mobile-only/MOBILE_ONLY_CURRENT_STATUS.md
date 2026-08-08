@@ -4,7 +4,7 @@
 
 ## 总体
 
-当前 RC 分支 `mobile-only-v1-release-candidate-blocker-closeout`，基线 `81b6dbb216e843d363fd0088f673076add78013f`。当前事务加固 implementation 为 `f0ffcec4480ce04ac61f3a8aad2453e5b4b27a35`，governance `dbc2f2626dbf655b916b9afe4ab24fbd812a2590` 已将 descriptor 的 `implementation_sha` 绑定到该提交；evidence SHA由后续纯治理提交绑定，当前`validation_sha`以descriptor为唯一事实源。历史 exact-SHA CI 三次均失败：`31174285439@00018f4` 为 3/8、`31177319567@37accce` 为 6/8、`31180693841@359e5c2` 为 7/8；新 implementation 尚未取得远端 exact-SHA PASS。当前发布判断仍为 **REJECTED / NO-GO / developer smoke only**。
+当前 RC 分支 `mobile-only-v1-release-candidate-blocker-closeout`，基线 `81b6dbb216e843d363fd0088f673076add78013f`。底层事务加固 implementation 为 `f0ffcec4480ce04ac61f3a8aad2453e5b4b27a35`；本轮 ESL blocker implementation I3 为 `fdcc5c87005a0128e0654eb43b1364898edd8f5d`，governance G3 `2a0a808554b9183cd76420b01135d5f6cdf7d38d` 已将 descriptor 的 `implementation_sha` 绑定到 I3。evidence SHA 由后续纯治理提交绑定，当前 `validation_sha` 以 descriptor 为唯一事实源。历史 exact-SHA CI 三次均失败：`31174285439@00018f4` 为 3/8、`31177319567@37accce` 为 6/8、`31180693841@359e5c2` 为 7/8；I3 尚未取得远端 exact-SHA PASS。当前发布判断仍为 **REJECTED / NO-GO / developer smoke only**。
 
 新增明确 blocker：J-04 absolute-prior component identity 尚未关闭。最终 DB graph 可以由 node `mapID` 和 links 推导 component，但现行 constraint 写侧没有 atomic bound node/map ID，manual v3 也没有 RTAB-Map map ID；因此 reader 不能事后伪造 same-component 证明。需先完成正式 evidence schema 迁移，再进行 component 资格测试。
 
@@ -35,9 +35,23 @@
 - 工程登记：project.pbxproj（31 个新文件四段）、CI swiftc -parse 列表、Swift host 编译列表。
 - 修复 P7R6C 遗留缺陷：Swift host 默认模式 guard 从 `arguments.isEmpty` 修正为 `count <= 1`（C1/C2 此前未真正执行）。
 
+## ESL Barcode Capture / Shelf Confirmation 阻断级收口
+
+- iOS Capture Mode 只叠加 camera-only `MTKView` 预览、Vision 和 durable evidence；直接使用持续到达的 `ARFrame.capturedImage`，没有第二个 `AVCaptureSession`，没有暂停 ARSession、RTAB-Map、连续 SQLite、Clock、Pose、node creation 或 prior-map localization。
+- Vision 使用固定 scan box 的真实 ROI，最多 8 Hz、one-in-flight；预览最多 24 Hz。candidate 需连续 2 帧锁定，同一 capture 目标 4 个、最低 3 个独立帧，最大 2 秒；deadline 时已有 3 个 durable frame 即解析，持续 no-detection/multiple 也不会无限 collecting。
+- confirmation gate 只统计逐帧 `algorithmCandidateReliable=true` 且 `needsReview=false`、共同指向同一 `shelfSegmentId + side` 的独立证据；弱帧只保留 raw audit，不能凑足 3-frame reliable quorum。替代候选按 segment + side 精确绑定。
+- `tag_observations.jsonl` 与 `tag_observation_bursts.jsonl` 在最终化和 PC 上逐项核对 `observation_id / burst_id / frame_id / payload / symbology`；localized tag v2 的 frame set 必须精确等于一个 verified complete burst。capture cache 使用完成顺序 FIFO，超过 512 个 burst 时不会随机淘汰刚完成、正在确认的 capture。
+- iOS finalization 还要求 localized v2 tag 的 payload/symbology 与该 verified burst 完全一致；burst sequence 必须为正且严格递增，但不要求从 1 开始或连续。duplicate/decreasing sequence 使用稳定 blocker fail closed。
+- additive v2 将 algorithm evidence 与 `USER_CONFIRMED` / `USER_OVERRIDDEN` 用户证据分开；用户确认不能覆盖算法事实，也不修改 SLAM、trajectory、node pose 或 localization constraint。
+- PC session input manifest v3 在 v2 Recovery binding 之上绑定 burst sidecar。可靠 optimized association 与现场选择一致时为 `NO_CONFLICT` / approved；冲突为 `USER_CONFIRMATION_CONFLICT`，离线证据不可用为 `OFFLINE_ASSOCIATION_UNAVAILABLE`，后两者强制 review/rescan。
+- confirmation 提交由 coordinator 锁内 immutable map/session authority 与单次 claim 线性化；session writer 在同一 localization/capture 事务内复核 workflow、required-write health、tracking、map ID/SHA、floor、capture ID 和 verified burst。统一 session admission gate 在 finalization 前登记 transaction/reservation，finalization 关闭新 admission 后等待已登记 writer，inner writer 不再二次误拒。prior-map sentinel 后普通 ARFrame/Recovery 由入队/执行双重 gate 拦截，ordinary/terminal Recovery 的 `allowDuringFinalization` 已分离。capture generation 冻结 exact tracking identity，active-only audit 不创建 session；迟到旧 generation 不污染新 scan，scan-stop 自有 audit 仅使用窄范围 override。
+- PC pose/raw-position early-error 统一生成 unavailable audit。共享 manifest validator 强制 strict integer version、v1/v2/v3 Recovery binding、case-insensitive filename uniqueness、source database 安全 basename与 source-manifest cross-binding；manifest/snapshot/verified-copy 全链拒绝 source DB hardlink、非空 WAL/journal。
+- frozen-worktree 聚焦验证已覆盖 ESL capture/finalization Swift host、ARFrame-only source contract、Stage-3 与 localized output store **104/104**、Python compile、Swift parse 和 diff check。Xcode simulator 构建已实际编译本轮 Swift 文件并 emit module，但 native C++ 最终因缺失 platform-scoped Eigen/PCL/OpenCV headers 失败；这不是 clean build PASS。完整长时 PriorMap host workflow 本轮手工中断，不能写 PASS。
+- MapCase02、坐标转换和 store/map/file-specific scale/offset/rotation 未修改。真机 30 秒连续性、Vision p50/p95、CPU/memory/thermal、光照/反光/斜视/多价签和现场矩阵见 [`../map-assisted-localization/ESL_CAPTURE_TODO.md`](../map-assisted-localization/ESL_CAPTURE_TODO.md)，均为 NOT RUN。
+
 ## 本轮审查与回归证据
 
-- 最终关键生产增量完成两轮只读审查，发现的 Map `.`/`..`、Result quarantine crash orphan、Snapshot process-lock binding和历史v1顶层symlink兼容均已修复；最终 `P0=0 / P1=0 / 新的可修P2=0`。这不是release review PASS，J-04仍是独立未关闭 blocker。
+- 最终关键生产增量完成两轮只读审查，发现的 Map `.`/`..`、Result quarantine crash orphan、Snapshot process-lock binding和历史v1顶层symlink兼容均已修复；该事务增量最终 `P0=0 / P1=0 / 新的可修P2=0`。ESL 最终独立复审另关闭 3 个 P1 race，复审为 `P0=0 / P1=0`；Windows portable basename、Debug assertion/audit 顺序和 scan-stop UI latency 三个 P2 已登记 [`../map-assisted-localization/ESL_CAPTURE_TODO.md`](../map-assisted-localization/ESL_CAPTURE_TODO.md)。这不是 release review PASS，J-04 仍是独立未关闭 blocker。
 - 当前短时证据：Qualification 28/28 PASS；Map Studio 106/106 PASS；83-source membership、SwiftPM exact pin、11-file contract drift、pbxproj、Swift parse/typecheck、Python compile和diff-check PASS；Map/Result/Snapshot关键fault smoke PASS。完整 PriorMap当前提交套件按时间要求延期，不复用历史166/166作为新implementation结论。
 - 300,000 条 finalization：peak RSS 12,795,904 bytes；1,728,000 条 trace transition storm：保留 172,801 条，peak RSS 58,769,408 bytes。
 - 200,000 burst frames + 200,000 observations 全链路：243,952,646 input/temporary bytes，200,000 accepted observations，融合 1 个 accepted physical tag，884.922 s wall，peak RSS 670,662,656 bytes（约 639.6 MiB，低于 768 MiB host 门）。`StrictJSONLStreamReader` 通过每行 autorelease pool 消除长时 Foundation autorelease 累积，并保留完整 strict validator。
@@ -62,6 +76,7 @@
 - `listResultsLocked()` root创建/枚举失败补持久可见的listing diagnostic与`NSLog`，不再静默等价于空库。
 - 根级非symlink special file补 durable conflict diagnostic策略。
 - 同UID非协作writer、ACL、BSD flags、xattr和第三方文件系统语义继续保持未资格化。
+- 执行 [`../map-assisted-localization/ESL_CAPTURE_TODO.md`](../map-assisted-localization/ESL_CAPTURE_TODO.md) 中的 LiDAR 真机、性能、视觉条件、确认冲突和 manifest v3 全矩阵；补齐 platform-scoped Eigen/native dependencies 后完成 simulator/device clean compile-link。
 
 True sensor Deep（重新解码传感器、重建缺失视觉证据）不属于当前 Mobile V1，也不是“尚未接线”的待执行路线；状态机历史 `deep_*` 名称只表示 Route A 允许的一次 Full existing-graph optimization。
 

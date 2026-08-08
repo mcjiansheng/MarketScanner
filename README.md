@@ -1,6 +1,6 @@
 # RTAB-Map 大型超市扫描与地图工作台
 
-> 文档状态：**当前有效**。最后一次与源码交叉核对日期：2026-08-07。
+> 文档状态：**当前有效**。最后一次与源码交叉核对日期：2026-08-09。
 
 本项目是在开源 **RTAB-Map** 基础上进行的业务化改造，面向大型超市、仓储卖场等室内场景，形成从 iPhone Pro 连续采集，到 PC 端离线优化，再到二维地图、彩色俯视图和三维预览的一套本地工作流。
 
@@ -62,7 +62,13 @@ Android 目录中的部分 C++ 原生实现也因共享移动渲染和数据库�
 
 当前已有地图模式按**单次扫描、单一楼层**工作：开始前绑定一个楼层，扫描中不自动切层，也不支持跨楼层定位。楼层内部允许坡道、地面起伏等少量竖直位移；二维先验定位忽略 ARKit 高度分量，而原始 ARKit/RTAB-Map 数据仍完整保留三维运动。
 
-已有地图模式提供用户触发的 Vision 二维码/条形码识别，直接使用当前 `ARFrame.capturedImage`，不启动第二路相机。价签优先用同帧 scene depth 测量，深度不足时才退化为货架平面射线；结果显示货架、侧面、沿货架距离、高度和分项置信度。原始观测始终审计落盘，最终价签需要用户确认，弱定位或丢失状态绝不会自动确认。定位失败不会停止 RTAB-Map 原始数据库记录。
+已有地图模式提供用户触发的 ESL Barcode Capture Mode，直接复用持续到达的 `ARFrame.capturedImage`，不启动第二路相机。进入该模式不会暂停 `ARSession`、RTAB-Map、连续 SQLite 数据库、节点创建、时钟/位姿记录或先验地图定位；相机画面只由 camera-only `MTKView` 预览覆盖，原扫描链继续在后台运行。Vision 使用屏幕固定 scan box 对应的真实 `regionOfInterest`，按最多 8 Hz 且 one-in-flight 执行；相机预览最多 24 Hz。候选需要连续 2 帧锁定，同一 burst 目标 4 个、最低 3 个独立帧；达到 2 秒上限时，已有 3 个合法持久帧即可进入解析，否则只保留原始证据并要求重扫。
+
+每个 frame observation 先写入 `tag_observations.jsonl`，完整 burst 再写入 `tag_observation_bursts.jsonl`，最终确认前必须证明 burst complete，并对 `observation_id / burst_id / frame_id / payload / symbology` 做精确磁盘交叉绑定。只有至少 3 个逐帧通过定位、测量、关联质量门且共同指向同一 `shelfSegmentId + side` 的独立证据，才能打开可提交的货架确认。确认页显示小地图、高亮货架、算法候选和替代侧面；`USER_CONFIRMED` / `USER_OVERRIDDEN` 作为 additive v2 用户证据保存，不能覆盖算法字段，更不能修改 SLAM、轨迹、node pose 或定位约束。
+
+扫描最终化与证据 writer 通过统一 admission gate 线性化：finalization 关闭新 admission 后，会等待此前已登记的 localization/confirmation transaction 完成；已登记 writer 不会被内部二次 finalization 检查误拒。finalization sentinel 之后到达的普通 ARFrame 定位任务和普通 Recovery append 会被拒绝，只有终端 Recovery 与 scan-stop 自有 audit 使用窄范围 `allowDuringFinalization`。ESL audit 冻结 generation 对应的 exact tracking session，只能追加到仍存在的既有 `segment_0001`，不会创建空的后继会话，也不会把旧 capture audit 写入新会话。
+
+PC 输入 manifest v3 在既有 Recovery 证据之外绑定 burst sidecar。共享 validator 严格验证 v1/v2/v3 整数版本、Recovery binding、role/filename 顺序、大小写不敏感文件名唯一性、source database 安全 basename 及其与 `source_manifest` 的名称一致性；snapshot 与 verified copy 拒绝 source DB hardlink、非空 WAL 和 rollback journal。离线优化与现场选择一致时输出 `NO_CONFLICT` 并保持批准；可靠优化结果冲突时输出 `USER_CONFIRMATION_CONFLICT`，离线证据不可用时输出 `OFFLINE_ASSOCIATION_UNAVAILABLE`，两者都强制 `REVIEW_REQUIRED` / rescan。MapCase02、地图坐标变换和任何 store/map/file-specific scale、offset、rotation 启发式均未在本轮修改。真实 LiDAR iPhone 的 30 秒性能、强弱光/反光/斜视/多价签矩阵和完整现场验收仍未执行，因此项目判断仍是 **REJECTED / NO-GO / developer smoke only**，J-04 仍为 **BLOCKER / NOT CLOSED**。
 
 阶段一/二整改和阶段三草稿复核链路已有自动测试；真实 LiDAR iPhone 完整干跑和正式超市现场验收仍是发布前门槛。本文不把模拟指标表述为现场精度或生产批准。完整架构、格式、UI、测试和当前状态见 [docs/map-assisted-localization/](docs/map-assisted-localization/)，双模式操作、复核、备份和失败恢复见 [用户操作手册](docs/map-assisted-localization/USER_GUIDE.md)，本轮 RepairV2 审查闭环见 [当前审查记录](docs/map-assisted-localization/reviews/CURRENT_REVIEW.md)。
 
@@ -123,6 +129,12 @@ SupermarketSession-YYYYMMDD-HHMMSS/
     trajectory_samples.json
     trajectory_samples.csv
     scan_events.jsonl
+    localization_trace.jsonl          # 仅已有地图辅助扫描
+    localization_constraints.jsonl    # 仅已有地图辅助扫描
+    localization_events.jsonl         # 仅已有地图辅助扫描
+    tag_observations.jsonl             # ESL 原始逐帧证据
+    tag_observation_bursts.jsonl       # ESL 完整 burst 证据
+    localized_price_tags.json          # 用户确认后的 additive v2 结果
 ```
 
 主要内容：
@@ -134,6 +146,8 @@ SupermarketSession-YYYYMMDD-HHMMSS/
 - `structure_coverage_cells.json`：跨帧深度结构证据、时间/视角重复次数和最终覆盖摘要；用于审计采集是否充分，不替代原始 RGB-D 数据库。
 - `trajectory_samples.*`：移动端采样轨迹，供检查和兼容流程使用。
 - `scan_events.jsonl`：tracking、中断恢复、自适应采样、结构覆盖提示、闭环健康、内存、热状态、磁盘和结束事件的结构化日志。
+- `tag_observations.jsonl` / `tag_observation_bursts.jsonl`：已有地图模式下的严格 ESL 逐帧与完整 burst 证据；两者必须在最终化和 PC parse-and-hash-once snapshot 中精确交叉绑定。
+- `localized_price_tags.json`：用户确认后的价签结果；v2 将 algorithm evidence 与 user-confirmed evidence 分开，现场确认不会回写或覆盖算法/SLAM 事实。
 
 如果会话中仍存在 `live_checkpoint.json`，PC 工作台会把它视为正在写入或异常未完成的数据，拒绝自动重处理。
 

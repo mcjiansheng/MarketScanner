@@ -1,6 +1,6 @@
 # 已有地图辅助扫描数据格式
 
-> 文档状态：**当前有效**。最后核对日期：2026-08-07。
+> 文档状态：**当前有效**。最后核对日期：2026-08-09。
 
 ## 会话元数据
 
@@ -34,6 +34,10 @@
   "localizationEvents": "localization_events.jsonl",
   "localizationRecoveryEvents": "localization_recovery_events.jsonl",
   "tagObservations": "tag_observations.jsonl",
+  "tagObservationBursts": "tag_observation_bursts.jsonl",
+  "tagObservationBurstCount": 4,
+  "tagObservationBurstLastID": "12345678-1234-4234-8234-123456789abc",
+  "tagObservationBurstComplete": true,
   "localizedPriceTags": "localized_price_tags.json",
   "localizedPriceTagCount": 12,
   "captureHealth": {
@@ -55,7 +59,11 @@
 
 实时 `live_checkpoint.json` 同步记录业务模式、地图身份、`updatedAtUnix` 和 capture health。`metadata.json` 是最终 sidecar bundle 的最后提交标记，并在最终提交时记录 `finalizedAtUnix`。metadata 写入失败属于提交前失败，可恢复录制；一旦 `finalized=true` 成功写入即进入不可逆终态。其后的 checkpoint 删除失败只能标记“已完成、待清理”，不得恢复相机或继续写数据库。手机和 PC 的显式清理都要求 finalized、同 tracking identity、两个有限 Unix 时间且 `checkpoint.updatedAtUnix <= metadata.finalizedAtUnix`，并在删除前写审计；正常 PC 优化仍无条件拒绝任何残留 checkpoint。
 
-prior-map 会话提交 metadata 前，在 sidecar 写锁内重新读取实际文件字节。`localization_trace.jsonl`、`localization_constraints.jsonl`、`localization_events.jsonl` 必须是非符号链接的非空 regular file，严格 UTF-8、每行完整 JSON object、format/version/会话/地图/floor 身份一致，记录数必须与 capture health 一致，最后 state 必须与 `localizationLastDurableState` 水位一致。`localized_price_tags.json` 必须是合法数组且数量、身份一致；manual/tag observation 与 `localization_recovery_events.jsonl`（P7R5 终态 Recovery 生命周期证据，uptime 时间戳而非 node-timebase）可以为空，但非空时同样必须通过格式和身份校验。任何 required 文件丢失、空、半行、损坏、链接、数量或身份不符，手机都把 metadata 降级为 `finalized=false/invalid`，写入稳定的 `evidence_bundle_*` blocker 并保留 checkpoint；不得创建空 required 文件掩盖丢失。自由扫描仍按既有完成条件结束。
+prior-map 会话提交 metadata 前，在 sidecar 写锁内重新读取实际文件字节。`localization_trace.jsonl`、`localization_constraints.jsonl`、`localization_events.jsonl` 必须是非符号链接的非空 regular file，严格 UTF-8、每行完整 JSON object、format/version/会话/地图/floor 身份一致，记录数必须与 capture health 一致，最后 state 必须与 `localizationLastDurableState` 水位一致。`localized_price_tags.json` 必须是合法数组且数量、身份一致；manual/tag observation 与 `localization_recovery_events.jsonl`（P7R5 终态 Recovery 生命周期证据，uptime 时间戳而非 node-timebase）可以为空，但非空时同样必须通过格式和身份校验。只要存在 localized tag v2 或 burst watermark 大于 0，`tag_observation_bursts.jsonl` 就成为必需、非空且 strict JSONL 的 authority：count、last ID、complete 标记必须与 metadata 完全一致；burst sequence 必须为正并按文件顺序严格递增（允许从任意正数开始且允许跳号）；每个 burst frame 与 durable observation 必须按 `observation_id/burst_id/frame_id/payload/symbology` 双向集合相等；localized v2 tag 的 `capture_id`、exact observation set、payload 和 symbology 必须与同一个 verified complete burst 一致。任何 required 文件丢失、空、半行、损坏、链接、数量、身份或 exact binding 不符，手机都把 metadata 降级为 `finalized=false/invalid`，写入稳定的 `evidence_bundle_*` blocker 并保留 checkpoint；不得创建空 required 文件掩盖丢失。自由扫描仍按既有完成条件结束。
+
+所有普通 localization/confirmation writer 在进入序列化 I/O 前先向 `PriceTagSessionAdmissionGate` 登记 transaction/reservation。`beginFinalization` 与 admission 在同一短锁域线性化：finalization 后的新普通 writer 被拒绝，但此前已登记 writer 即使尚在等待 writer lock 也必须完成或明确失败，finalization drain 会等待其计数归零。writer 内部不再通过再次读取 `isFinalizingScan` 否定已获得的 admission。普通 frame-driven Recovery 与 ARFrame localization 在入队和执行前都检查 generation/finalization，并使用 `allowDuringFinalization=false`；只有 terminal teardown/finalization Recovery、finalization-owned burst flush/session completion，以及 scan-stop 自有 audit 使用显式窄范围 override。
+
+ESL audit 不是 session 创建 API。每个 capture generation 冻结 exact tracking session ID；`appendScanEventIfSessionActive` 只在 admission 后、`captureLock` 内核对该 identity、既有 root、`segmentIndex == 1` 和已存在的 `segment_0001`，从不调用隐式 `startNewSessionIfNeeded()`。因此无 active session、finalization 后的普通 audit、detach 后的旧 generation 和未知/已驱逐 generation 都 fail closed，不会创建空 successor session 或把旧事件写入新 session。
 
 checkpoint cleanup 是显式破坏性恢复事务。iOS 与 PC 都按 path component 验证 session/唯一 `segment_0001`，拒绝 symlink；Windows 额外拒绝 junction/reparse point。metadata、checkpoint 和既有 audit 文件以 no-follow descriptor 打开，`fstat` 证明 regular file 和设备/文件身份，授权审计后重新打开并比较身份、长度和字节，再删除同一 checkpoint；删除失败追加 `finalization_checkpoint_cleanup_failed`，审计自身失败会明确记录 degraded。Map Studio inspect 返回客户端看到的 tracking identity、finalized time 及 metadata/checkpoint SHA-256；POST 必须携带严格 `confirmed=true` 和全部 expected evidence，任何变化返回 HTTP 409 `checkpoint_cleanup_conflict`。普通 inspect/reprocess 从不自动删除。
 
@@ -116,10 +124,13 @@ P7R3 把宽搜索改为显式 Recovery episode。`inactive -> active -> converge
 
 - `localization_constraints.jsonl`：每个匹配周期的预测/估计、Top‑3、残差、唯一性、有效点数、角覆盖、耗时、接受标记和原因；同时保存 raw/node timebase/offset。
 - `localization_events.jsonl`：状态发生变化时记录 previous/state/confidence/reason 和双时间基准。
-- `tag_observations.jsonl`：每次成功 Vision 识别的原始观测，即使用户取消最终保存也保留；保存 `frame_timestamp/node_timebase_frame_timestamp/node_timebase_offset_seconds`，以及 `alignment_age_ms/alignment_version_lag/alignment_freshness` 和深度证据。地图点必须使用提交 Vision 时冻结且通过时效门的对齐快照计算。
-- `localized_price_tags.json`：用户确认后的数组；包含 shelf code、row flag、cross code、货架侧面、沿货架起点距离、相对地面高度、raw/snapped 位置、定位/测量/关联三项置信度、测量方式、`needs_review` 和 `user_confirmed`。
+- `tag_observations.jsonl`：每个成功 Barcode Capture frame 的独立原始观测，即使用户取消最终确认也保留；保存 `observation_id/burst_id/frame_id`、`frame_timestamp/node_timebase_frame_timestamp/node_timebase_offset_seconds`，以及 `alignment_age_ms/alignment_version_lag/alignment_freshness` 和逐帧深度证据。地图点必须使用该 frame 提交 Vision 时冻结且通过时效门的对齐快照计算，不能用第一帧位置重复伪造多帧证据。
+- `tag_observation_bursts.jsonl`：每个完成 capture 的 `MarketScannerPriceTagBurst` version 2；包含 canonical burst/capture ID、严格递增 sequence、barcode/symbology、完整 scan/map/floor identity、3—64 个唯一 frame、node/time/depth/view/tracking/confidence 摘要和 `complete=true`。同一 observation 或 frame 不得跨 burst 复用；durable observation 中只要带有 burst/frame identity，就必须出现在该 complete burst 中，反向亦然。
+- `localized_price_tags.json`：version 1 继续只读兼容旧字段。新的现场确认写 additive version 2：`capture_id/frame_observation_ids` 必须精确等于一个 verified complete burst；`algorithm_*` 保存算法货架 segment/code/side/offset/confidence，`user_confirmed_*` 保存操作员选择，`confirmation_status=USER_CONFIRMED|USER_OVERRIDDEN`、确认时间和 `confirmation_source=on_device_operator` 独立审计。用户 override 不得覆盖 `algorithm_*`，也不得写回 SLAM、trajectory、node pose、localization constraint 或 map alignment。
 
-JSONL 文件逐行独立编码和同步追加；最终价签数组用同目录唯一 temp、完整写入、`synchronize()` 和原子 rename 替换。write/flush/rename 三个提交前阶段可故障注入，失败保留旧文件并清理 temp。该合同保证应用进程观察到旧文件或完整新文件，并为进程崩溃恢复提供 checkpoint；iOS 没有在此路径声明父目录 fsync/设备断电持久化保证，因此类型和文档只称“原子可见提交”，不能把它写成 power-loss durable。必需定位追加使用 throwing `FileHandle` I/O 并返回结构化的 trace/constraint/state 成败；任一失败都是本会话不可清除的 capture-health 失败。写入前必须确认 tracking session ID 与活动会话一致且未进入 finalization，不允许日志接口自动创建新会话目录。PC 对每类文件使用正式 contract：严格 UTF‑8/JSON（禁止 NaN/Infinity）、format/version、会话/地图/floor 身份、有限且按契约单调的时间戳、业务必填字段、单行/记录上限和重复 ID 检查。`localization_trace`、constraints、state events 为必需；最终 metadata 必须明确 `localizedPriceTags` 文件名与准确计数，即使为 0 也必须存在；有最终价签时 observations 必需且不得为空。manual v3 是当前格式，v2 仅作严格兼容；legacy v1 只允许进入拒绝审计和 review blocker，不能形成锚点。
+只有至少 3 个逐帧 `algorithmCandidateReliable=true`、`needsReview=false` 的独立 observation 共同指向同一 `shelfSegmentId + side`，UI 才能提供可靠确认。确认提交使用一次性 capture authority，并在同一 session writer 事务中重新核对 workflow、required-write health、tracking session、prior-map ID/SHA-256、floor、capture ID 和 verified burst frame set；取消先于 claim 时不写，claim 先于取消时已接受的提交继续由持久化回调收口。
+
+JSONL 文件逐行独立编码和同步追加，禁止空行且最后一条记录也必须带换行；最终价签数组用同目录唯一 temp、完整写入、`synchronize()` 和原子 rename 替换。write/flush/rename 三个提交前阶段可故障注入，失败保留旧文件并清理 temp。该合同保证应用进程观察到旧文件或完整新文件，并为进程崩溃恢复提供 checkpoint；iOS 没有在此路径声明父目录 fsync/设备断电持久化保证，因此类型和文档只称“原子可见提交”，不能把它写成 power-loss durable。必需定位追加使用 throwing `FileHandle` I/O 并返回结构化的 trace/constraint/state 成败；任一 observation 已持久化但无法进入相同 burst 时立即增加 sticky required-write failure，不能只写 warning 等待最终化发现 orphan。写入前必须确认 tracking session ID 与活动会话一致且未进入 finalization，不允许日志接口自动创建新会话目录。PC 对每类文件使用正式 contract：严格 UTF‑8/JSON（禁止 NaN/Infinity 和未知 v2 tag/burst 字段）、format/version、会话/地图/floor 身份、有限且按契约单调的时间戳、业务必填字段、单行/记录上限、重复 ID 和 observation↔burst exact binding 检查。`localization_trace`、constraints、state events 为必需；最终 metadata 必须明确 `localizedPriceTags` 文件名与准确计数，即使为 0 也必须存在；有最终价签时 observations 必需且不得为空。manual v3 是当前格式，v2 仅作严格兼容；legacy v1 只允许进入拒绝审计和 review blocker，不能形成锚点。
 
 外部复制的 `segment_0001` 必须满足复制前源清单 = 关闭句柄后目标复读清单 = 复制后源清单，每项包含 POSIX 相对路径、字节数和 SHA-256。验证成功后在目标 session 根写 `copy_verification.json`（format `MarketScannerExternalCopyVerification` version 2），只记录 session/package ID、provider display name、相对路径、清单、package content SHA-256、验证时间、`localCopyRetained=true` 和 provider durability 边界，不写绝对源/目标路径。`copy_package_manifest.json`（format `MarketScannerExternalCopyPackageManifest` version 1）把 segment 和 receipt 纳入 export-root 清单，并固定 `durabilityQualificationStatus=not_executed`。真实设备在实际 reconnect/disconnect/power-cycle 后可通过资格 hook 重散列并生成 `copy_durability_qualification.json`；普通复制不能生成该证据。默认始终保留本地会话；provider 复制完成和复读一致不能证明云盘/外接介质已承受设备断电，真机 provider 策略验收前不提供自动删除。
 
@@ -173,7 +184,9 @@ helper 可用且所有门通过时 `solver.type=relative_se2_factor_graph`、`fu
 
 `manual_edits.json` version 4 绑定 `input_identity_id/session_input_bundle_sha256/prior_map_sha256/source_database_sha256/optimized_database_sha256/processing_parameter_sha256/tool_version/coordinate_contract_version`。事件保存服务端生成的 `event_id/created_at_utc/base_revision/old_value/new_value/actor/reason`；`audit_events` 单独记录 append/undo/redo 的旧/新 cursor。API 强制 `expected_version_id + expected_revision`，冲突返回 409；只有完整重放和版本校验成功后才推进 current。
 
-可导出的 `source_manifest.json` 只保存会话/数据库文件名、地图 ID 和各输入 SHA‑256，不保存用户名或绝对路径。不可变 version 内的 `session_input_manifest.json` 按规范顺序绑定数据库、metadata 和全部必需 sidecar 的文件身份、大小及 SHA‑256，并生成 `input_identity_id`。人工复核重放所需的本机绝对路径按该身份单独写在 `localized/local_inputs/<input_identity_id>.json`；它不进入不可变 version、artifact allowlist 或导出包。读取时先验证 version 本身，再验证 local-input identity 和当前输入字节；不能用可变全局路径状态重放旧版本。
+可导出的 `source_manifest.json` 只保存会话/数据库文件名、地图 ID 和各输入 SHA‑256，不保存用户名或绝对路径。不可变 version 内的 `session_input_manifest.json` 按规范顺序绑定数据库、metadata 和全部必需 sidecar 的 role、规范文件名、大小及 SHA‑256，并生成 `input_identity_id`。v1 是 legacy 输入，v2 额外绑定 Recovery sidecar，v3 再绑定 `tag_observation_bursts.jsonl`。共享 manifest validator 强制 version 为非 Boolean 的严格 JSON integer；v1 对应 `recovery_lifecycle_evidence_unbound_legacy`，v2/v3 对应 `recovery_lifecycle_evidence_bound_v2`，并要求 processing/report 中的 manifest version 与 binding 一致。`metadata` role 只能指向 `metadata.json`，除 `source_database` 可保留实际数据库 basename 外，其余 role 的 `file` 必须与 role 完全相同；全部文件名按 case-insensitive 规则唯一。source database 名称必须非空、不是 `.`/`..`、不含 slash/backslash/NUL、不是 POSIX/Windows absolute 或 drive-relative path、不与 canonical sidecar 冲突，并与 `source_manifest.source_database_name` 完全一致。即使攻击者重算 bundle/cross-artifact hash，role→filename 改绑仍会 fail-closed。source database 在 manifest build、snapshot 和 verified copy 三个入口都必须是稳定的 single-link regular file，且相邻非空 WAL 或 rollback journal 会拒绝输入。人工复核重放所需的本机绝对路径按该身份单独写在 `localized/local_inputs/<input_identity_id>.json`；它不进入不可变 version、artifact allowlist 或导出包。读取时先验证 version 本身，再验证 local-input identity 和当前输入字节；不能用可变全局路径状态重放旧版本。
+
+PC 重关联不会静默覆盖操作员确认：optimized segment+side 与用户选择一致时写 `NO_CONFLICT` 并保持 approved；可靠 optimized 证据指向另一 segment/side 时写 `USER_CONFIRMATION_CONFLICT`；pose binding、raw map position 或 offline association 不可用/不可靠时统一写 `OFFLINE_ASSOCIATION_UNAVAILABLE`。后两者固定为 `REVIEW_REQUIRED`、`rescan_required=true`、`needs_review=true`、`approval_status=pending`，并保留全部 algorithm/user evidence。
 
 版本写入在 `localized/.write.lock` 的跨进程排他锁内完成父版本复核、staging 清理、版本号分配、rename 和单一指针提交。版本目录 rename 后必须先 fsync `versions/`，失败时不切指针；指针 replace 后的目录 fsync 失败会返回“durability indeterminate”，调用方必须先读取实际指针再恢复，禁止盲目重试。读取 current/published 或下载 artifact 时会重新核对 exact file set、regular-file、字节数及逐文件 SHA‑256，下载还对已打开 fd 的实际字节再次验 hash。发布创建独立 published snapshot 并只切换 `published.json`；存在 active published 时必须先撤销。正式发布还要求 production-only server 即时 selfcheck、store 层空 blocker/完整因子图门，以及由 actor/UTC、`localized_review.json` SHA、exact Field Evidence bytes 和 candidate manifest SHA 共同绑定的现场验收记录。没有匹配的自包含现场证据时仍不能正式发布。
 
@@ -302,7 +315,7 @@ Directory identity is captured before and after the reads; symlinked/hard-linked
 
 ## PC finalized-session input snapshot (C4)
 
-`read_finalized_session_input_snapshot` reads metadata, the source database, all JSONL sidecars and `localized_price_tags.json` exactly once through descriptor-stable reads (`_stable_read_bytes`/`_read_jsonl_stable`), parses the same bytes, and derives the manifest identities from them. The bytes bound by `session_input_bundle_sha256` are therefore exactly the bytes localization/review/export consume; `build_session_input_manifest` stays as a re-verification path and the render before/after checks remain tamper gates. The source database is never opened by SQLite directly: a descriptor-verified immutable copy (Plan A) is created and verified against the snapshot identity, and SQLite only opens that copy. Metadata identity and the v1/v2 version decision come from one stable read.
+`read_finalized_session_input_snapshot` reads metadata, the source database, all JSONL sidecars and `localized_price_tags.json` exactly once through descriptor-stable reads (`_stable_read_bytes`/`_read_jsonl_stable`), parses the same bytes, and derives the manifest identities from them. The bytes bound by `session_input_bundle_sha256` are therefore exactly the bytes localization/review/export consume; `build_session_input_manifest` stays as a re-verification path and the render before/after checks remain tamper gates. The source database is never opened by SQLite directly: a descriptor-verified immutable copy (Plan A) is created and verified against the snapshot identity, and SQLite only opens that copy. Metadata identity and the v1/v2/v3 version decision, including Recovery and ESL burst watermarks, come from one stable read.
 
 ## Prior-map strict JSON schema (C5)
 

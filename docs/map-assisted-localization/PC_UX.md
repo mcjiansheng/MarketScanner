@@ -1,6 +1,6 @@
 # PC 先验地图工作台交互
 
-> 文档状态：**当前有效（阶段三草稿复核）**。最后核对日期：2026-08-02。
+> 文档状态：**当前有效（阶段三草稿复核）**。最后核对日期：2026-08-09。
 
 Map Studio 保留单设备、多设备和“导入/管理先验地图”入口，并新增“先验地图会话优化”。自由扫描不要求地图，也不显示无意义的价签复核步骤。
 
@@ -24,7 +24,7 @@ Map Studio 保留单设备、多设备和“导入/管理先验地图”入口�
 4. `rtabmap-reprocess` 写入 `rtabmap_optimized/optimized.db`；
 5. 从优化副本读取全局一致相对轨迹；
 6. 运行 native 完整相对 SE(2) 因子图，并对 helper 报告、factor digest、连通性、gauge、收敛和 node coverage 做严格二次校验；仅在 helper 不可用时生成不可发布的 bounded draft；
-7. 重算价签位置和结构关联；
+7. 对 ESL v2 输入先验证 session input manifest v3、complete burst watermark、observation/burst exact binding，再重算价签位置和结构关联；
 8. 运行质量门禁并进入轨迹/价签复核；
 9. 导出 JSON/CSV/GeoJSON 和审计日志。
 
@@ -56,6 +56,10 @@ Map Studio 保留单设备、多设备和“导入/管理先验地图”入口�
 
 结果文件同时保存 online、自动重算和 final 位置、online/offline 距离、货架 code/row/cross、`A/B` 或 `E##` 面、offset、高度、三项置信度、人工修改、来源 observation、needsReview 和审批状态。
 
+手机 additive v2 结果把 algorithm evidence 与 on-device user evidence 分开；PC 不允许离线优化静默覆盖任一方。可靠 optimized association 与现场 segment+side 一致时写 `NO_CONFLICT` 并保持 approved；可靠但不一致时写 `USER_CONFIRMATION_CONFLICT`，没有可靠离线候选时写 `OFFLINE_ASSOCIATION_UNAVAILABLE`。后两种情况都必须进入 `REVIEW_REQUIRED`、`rescan_required=true`、`needs_review=true`、`approval_status=pending`。
+
+每个不可变版本的 `session_input_manifest.json`：v1 为历史输入，v2 绑定 Recovery lifecycle，v3 在此基础上额外绑定 `tag_observation_bursts.jsonl`。共享 validator 被 builder、parse-and-hash-once snapshot、bundle hash validator、render/replay 和 localized output store 共同调用：version 必须是严格 JSON integer；v1 只能是 legacy Recovery binding，v2/v3 必须是 bound-v2；文件名按大小写不敏感规则唯一。source database 只能使用安全 basename，并与 `source_manifest.source_database_name` 完全一致；manifest 构建、snapshot 和 verified copy 都拒绝 hardlink、非空 WAL 和 rollback journal。count、last burst ID、payload/symbology、严格递增 burst sequence 或 frame membership 不一致都会在进入业务结果前 fail closed。
+
 人工编辑支持修改价签字段、批准单个价签和批量批准显式 ID 列表。人工值不会被静默覆盖；重新处理先校验 `manual_edits.json` 的地图/会话 hash，再按 cursor 重放。
 
 成果中的 `source_manifest.json` 不包含本机绝对路径。每个不可变版本的 `session_input_manifest.json` 绑定原数据库、metadata 和全部必需 sidecar 的名称、大小、SHA‑256 与 `input_identity_id`。重放所需路径按该 identity 保存在 Map Studio 本机输出根下的 `localized/local_inputs/<input_identity_id>.json`，不通过 artifact API 提供；旧版本不会读取当前版本的可变路径状态。移动成果到另一台电脑后应重新选择完全相同字节的原会话/地图建立本机状态，不能把旧机器路径当作可移植元数据。
@@ -82,6 +86,8 @@ GET  /api/jobs/<id>/localized/versions/<version>/artifact/<allowlisted-name>
 ## 发布含义
 
 当前结果从 `draft` 可在 review gate 通过后生成新的 `review` 版本。只有严格验证通过的 `full_relative_se2_factor_graph` 才具备进入 `published` 状态的 solver capability；bounded fallback 仍固定包含 `solver_not_full_relative_se2_factor_graph` 并返回 422。真实设备与现场资格门在 P5/P6 完成前，产品整体仍为 NO-GO，当前也不向外部业务系统上传。
+
+ESL capture 的 simulator build 已完成本轮 Swift module/文件编译证据，但最终 native C++ 编译被缺失的 platform-scoped Eigen/PCL/OpenCV headers 阻断；真机和现场测试见 [`ESL_CAPTURE_TODO.md`](ESL_CAPTURE_TODO.md)。该证据不是 Apple clean compile-link PASS。当前 Stage-3 + localized-output-store 聚焦回归为 104/104 PASS；完整长时 PriorMap host workflow 本轮被手工中断，不能借用聚焦结果或历史结果写成完整套件 PASS。
 
 ## 任务恢复与取消
 

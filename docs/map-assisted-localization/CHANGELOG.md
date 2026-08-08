@@ -1,6 +1,18 @@
 # 地图辅助定位变更记录
 
-> 文档状态：**当前有效**。最后核对日期：2026-08-02。
+> 文档状态：**当前有效**。最后核对日期：2026-08-09。
+
+## 2026-08-09 — ESL Barcode Capture / Shelf Confirmation 阻断级收口
+
+- implementation I3：`fdcc5c87005a0128e0654eb43b1364898edd8f5d`；governance G3：`2a0a808554b9183cd76420b01135d5f6cdf7d38d`，descriptor 已绑定 I3，validation SHA 等待 E3/V3 后继绑定。
+- 旧 one-shot Barcode action 改为 ARFrame-only Capture Mode：camera-only Metal preview、真实四方向 Vision ROI、8 Hz one-in-flight、2-frame candidate lock、3-frame minimum/4-frame target 和 2 秒 minimum fallback；不创建第二相机，不暂停 ARSession、RTAB-Map、连续数据库、Clock、Pose、node creation 或 prior-map localization。
+- 货架确认改为 dedicated sheet + 局部小地图；只有 3 个独立可靠 frame 对同一 `shelfSegmentId + side` 达成 quorum 才能确认。替代货架选择绑定精确 segment+side，算法证据与 `USER_CONFIRMED/USER_OVERRIDDEN` 用户证据 additive 分离，绝不反写定位数学。
+- 新增 strict `tag_observation_bursts.jsonl`、localized tag v2 与 session input manifest v3；iOS finalization 和 PC 对 observation/burst/frame/payload/symbology 做双向 exact binding，localized v2 tag 还必须匹配 verified burst 的 exact observation set、payload 和 symbology。burst sequence 必须为正且严格递增，duplicate/decreasing 以稳定 blocker fail closed；durable orphan 立即造成 sticky required-write failure。
+- confirmation persistence 使用锁保护的 immutable map/session authority、单次 commit claim 和同一 session writer 事务内的 workflow/tracking/map/floor/capture/burst 身份复核，关闭 cancel/clear 与后台持久化之间的 TOCTOU/data-race。共享 session admission gate 关闭 finalization 后的新 writer 并等待 pre-admitted writer；inner writer 不再二次误拒。prior-map sentinel 后普通 ARFrame/Recovery 被双重 gate 拦截，ordinary/terminal Recovery 的 `allowDuringFinalization` 权限已分离。
+- ESL audit 冻结 generation→tracking identity，并通过 active-only append API 只写既有 `segment_0001`；迟到/未知 generation 不回退到新 session，普通 audit 在 finalization 后拒绝，scan-stop 自有 audit 只获得窄范围 override，关闭空 successor session 与跨会话污染。
+- PC 对一致、冲突和不可用证据分别输出 `NO_CONFLICT`、`USER_CONFIRMATION_CONFLICT`、`OFFLINE_ASSOCIATION_UNAVAILABLE`；所有 early-error 分支保留用户选择并稳定进入 review/rescan。共享 manifest validator 强制严格 integer/version/Recovery binding、case-insensitive filename uniqueness、source basename/source-manifest cross-binding；source DB hardlink、非空 WAL/journal 在 manifest/snapshot/verified-copy 全链拒绝。
+- 聚焦验证为 ESL capture/finalization Swift host PASS、ARFrame-only source contract PASS、Stage-3 + localized-output-store 104/104 PASS。Xcode 已编译本轮 Swift module，但完整 simulator build 因 platform-scoped Eigen/PCL/OpenCV headers 缺失而 FAIL；完整长时 host workflow 本轮中断，不能写 PASS。
+- 非阻断 UI/性能增强和真机/现场矩阵登记在 [`ESL_CAPTURE_TODO.md`](ESL_CAPTURE_TODO.md)。MapCase02 与坐标转换未修改。整体仍为 **REJECTED / NO-GO / developer smoke only**，J-04 仍是 **BLOCKER / NOT CLOSED**；Apple clean link、LiDAR 真机、Device Lab、Sam field 和 exact-SHA CI 均未据此宣称通过。
 
 ## 2026-08-02 — P7R2 Sam 全局对齐修复
 
