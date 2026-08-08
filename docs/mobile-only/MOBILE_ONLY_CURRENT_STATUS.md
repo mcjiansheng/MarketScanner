@@ -4,7 +4,7 @@
 
 ## 总体
 
-当前 RC 分支 `mobile-only-v1-release-candidate-blocker-closeout`，基线 `81b6dbb216e843d363fd0088f673076add78013f`。底层事务加固 implementation 为 `f0ffcec4480ce04ac61f3a8aad2453e5b4b27a35`；本轮 ESL blocker implementation I3 为 `fdcc5c87005a0128e0654eb43b1364898edd8f5d`，governance G3 `2a0a808554b9183cd76420b01135d5f6cdf7d38d` 已将 descriptor 的 `implementation_sha` 绑定到 I3。evidence SHA 由后续纯治理提交绑定，当前 `validation_sha` 以 descriptor 为唯一事实源。历史 exact-SHA CI 三次均失败：`31174285439@00018f4` 为 3/8、`31177319567@37accce` 为 6/8、`31180693841@359e5c2` 为 7/8；I3 尚未取得远端 exact-SHA PASS。当前发布判断仍为 **REJECTED / NO-GO / developer smoke only**。
+当前 RC 分支 `mobile-only-v1-release-candidate-blocker-closeout`，基线 `81b6dbb216e843d363fd0088f673076add78013f`。底层事务加固 implementation 为 `f0ffcec4480ce04ac61f3a8aad2453e5b4b27a35`；ESL 核心 I3 为 `fdcc5c87005a0128e0654eb43b1364898edd8f5d`。V3 exact-HEAD run `31276419986` 的 P0 job 暴露 Map Studio legacy v1 manifest fixture 未同步 strict Recovery/version/source-name binding；fixture 修复 I4 为 `ec1fe96fc676c03514e591c40226112cde30fe76`，G4 `17871d839834487c777824c062980f3322521cdb` 已将 descriptor `implementation_sha` 绑定到 I4。evidence SHA 由纯治理后继绑定，当前 `validation_sha` 以 descriptor 为唯一事实源。历史三次 CI 与 run `31276419986` 均未形成全绿；新 E4/V4 exact-HEAD 尚未取得 PASS。当前发布判断仍为 **REJECTED / NO-GO / developer smoke only**。
 
 新增明确 blocker：J-04 absolute-prior component identity 尚未关闭。最终 DB graph 可以由 node `mapID` 和 links 推导 component，但现行 constraint 写侧没有 atomic bound node/map ID，manual v3 也没有 RTAB-Map map ID；因此 reader 不能事后伪造 same-component 证明。需先完成正式 evidence schema 迁移，再进行 component 资格测试。
 
@@ -62,11 +62,11 @@
 
 ## 未关闭（已有失败 run，禁止写 PASS）
 
-- exact-SHA CI 历史三次均未通过；当前 `f0ffcec` / `dbc2f26` 尚无新的 exact-SHA required-gate PASS。
+- exact-SHA CI 历史三次均未通过，V3 run `31276419986` 也因 P0 legacy fixture 不同步而失败；当前 I4 `ec1fe96` / G4 `17871d8` 尚无新的 exact-SHA required-gate PASS。
 - 最新 run `31180693841` 的 Apple SwiftPM/Xcode metadata、双平台 cold dependencies、simulator/device clean compile-link 和 identity 检查因前置 macOS host E2E 失败而 skipped，仍未形成 Apple compile-link 证据。
 - Replay / 三格式 E2E（Python 驱动 + host 模式化套件已完成基础设施）。
 - 真机短路线 / Sam 路线 / Excel-Numbers-WPS 打开验证。
-- implementation/governance已绑定为 `f0ffcec4480ce04ac61f3a8aad2453e5b4b27a35` / `dbc2f2626dbf655b916b9afe4ab24fbd812a2590`；仍需 evidence/validation SHA绑定、exact-SHA evidence和production-drift-free复核。
+- implementation/governance 已绑定为 I4 `ec1fe96fc676c03514e591c40226112cde30fe76` / G4 `17871d839834487c777824c062980f3322521cdb`；仍需 E4/V4 evidence/validation SHA 绑定、新 exact-SHA evidence 和 production-drift-free 复核。
 
 ## 明日 TODO（按 2026-08-09 时间收口决定延期）
 

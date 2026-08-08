@@ -4,7 +4,7 @@
 
 ## 2026-08-09 — ESL Barcode Capture / Shelf Confirmation 阻断级收口
 
-- implementation I3：`fdcc5c87005a0128e0654eb43b1364898edd8f5d`；governance G3：`2a0a808554b9183cd76420b01135d5f6cdf7d38d`，descriptor 已绑定 I3，validation SHA 等待 E3/V3 后继绑定。
+- 核心 implementation I3：`fdcc5c87005a0128e0654eb43b1364898edd8f5d`；G3：`2a0a808554b9183cd76420b01135d5f6cdf7d38d`；证据 E3：`744cbb386403dbb548f4c27bf8988e85fa8c2c7e`；V3：`7dd42beac00a2144712503662147e77fee679ffc`。V3 exact-HEAD run `31276419986` 的 P0 job 暴露 Map Studio v1 manifest fixture 未同步新 Recovery/version/source-name 合同；生产 validator 未放宽。fixture 修复为 I4 `ec1fe96fc676c03514e591c40226112cde30fe76`，G4 `17871d839834487c777824c062980f3322521cdb` 已重新绑定 implementation；P0 四项与 Map Studio 106/106 本地 PASS，新 exact-HEAD run 待 E4/V4 后触发。
 - 旧 one-shot Barcode action 改为 ARFrame-only Capture Mode：camera-only Metal preview、真实四方向 Vision ROI、8 Hz one-in-flight、2-frame candidate lock、3-frame minimum/4-frame target 和 2 秒 minimum fallback；不创建第二相机，不暂停 ARSession、RTAB-Map、连续数据库、Clock、Pose、node creation 或 prior-map localization。
 - 货架确认改为 dedicated sheet + 局部小地图；只有 3 个独立可靠 frame 对同一 `shelfSegmentId + side` 达成 quorum 才能确认。替代货架选择绑定精确 segment+side，算法证据与 `USER_CONFIRMED/USER_OVERRIDDEN` 用户证据 additive 分离，绝不反写定位数学。
 - 新增 strict `tag_observation_bursts.jsonl`、localized tag v2 与 session input manifest v3；iOS finalization 和 PC 对 observation/burst/frame/payload/symbology 做双向 exact binding，localized v2 tag 还必须匹配 verified burst 的 exact observation set、payload 和 symbology。burst sequence 必须为正且严格递增，duplicate/decreasing 以稳定 blocker fail closed；durable orphan 立即造成 sticky required-write failure。

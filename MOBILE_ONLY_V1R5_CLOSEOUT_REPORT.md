@@ -10,7 +10,7 @@
 
 ## 1. 结论和产品边界
 
-本分支已关闭第二次独立审查中的大部分正确性、事务、安全、规模及审计缺口，并积累了本地主机 developer-smoke 回归。底层事务加固实现为 `f0ffcec4480ce04ac61f3a8aad2453e5b4b27a35`；本轮 ESL blocker implementation I3 为 `fdcc5c87005a0128e0654eb43b1364898edd8f5d`，governance G3 `2a0a808554b9183cd76420b01135d5f6cdf7d38d` 已将 descriptor 的 `implementation_sha` 更新到 I3。evidence 文档由后续纯治理提交绑定到 `validation_sha`，当前精确值以 `.github/marketscanner-repair-v2-wave.json` 为唯一事实源。该结论不是 release PASS；J-04 absolute-prior `same floor/map/component` 仍是明确的代码/合同阻断项。exact-SHA GitHub Actions 历史三次运行全部失败：`31174285439@00018f4` 为 3/8、`31177319567@37accce` 为 6/8、`31180693841@359e5c2` 为 7/8；I3 尚未取得远端 exact-SHA PASS。当前实现采用 payload/nested directory 先冻结、root `0755` exclusive rename、inode-bound FD `fchmod(0555)`/`fsync`/path identity 复核的 publication 协议；Snapshot、Result 和 quarantine 的 rename 均不是业务提交点。Apple clean compile-link、Replay/FAR、Device Lab 和 Sam 现场复测仍未完成，因此本报告不声明 `DEVICE LAB TESTABLE`、`DEVICE LAB PASS`、`SAM FIELD PASS` 或 `PRODUCTION READY`。
+本分支已关闭第二次独立审查中的大部分正确性、事务、安全、规模及审计缺口，并积累了本地主机 developer-smoke 回归。底层事务加固实现为 `f0ffcec4480ce04ac61f3a8aad2453e5b4b27a35`，ESL 核心 I3 为 `fdcc5c87005a0128e0654eb43b1364898edd8f5d`；当前 implementation I4 为 `ec1fe96fc676c03514e591c40226112cde30fe76`，G4 `17871d839834487c777824c062980f3322521cdb` 已将 descriptor 的 `implementation_sha` 更新到 I4。evidence 文档由后续纯治理提交绑定到 `validation_sha`，当前精确值以 `.github/marketscanner-repair-v2-wave.json` 为唯一事实源。该结论不是 release PASS；J-04 absolute-prior `same floor/map/component` 仍是明确的代码/合同阻断项。exact-SHA GitHub Actions 历史三次运行全部失败，V3 run `31276419986` 又出现 P0 fixture failure；I4 尚未取得远端 exact-SHA PASS。当前实现采用 payload/nested directory 先冻结、root `0755` exclusive rename、inode-bound FD `fchmod(0555)`/`fsync`/path identity 复核的 publication 协议；Snapshot、Result 和 quarantine 的 rename 均不是业务提交点。Apple clean compile-link、Replay/FAR、Device Lab 和 Sam 现场复测仍未完成，因此本报告不声明 `DEVICE LAB TESTABLE`、`DEVICE LAB PASS`、`SAM FIELD PASS` 或 `PRODUCTION READY`。
 
 Mobile V1 冻结为 Route A：
 
@@ -29,7 +29,7 @@ True sensor Deep 不属于 Mobile V1。设备端不会在 Fast/Full 失败后重
 | RC-B01 | 代码关闭 | compiler、loader、integrity validator 和测试统一消费 shelves v2；包含物理 `shelf_segment_id`、显式 start/end/axis/normal 和跨文件关系校验 |
 | RC-B02 | 代码关闭，待新 exact-SHA 复验 | production Swift 全部登记到 RTABMapApp target；自动 membership checker 当前确认 83 个 Swift 源文件；exact-case gate 使用原始路径字符串，不再被 Windows 大小写不敏感 `Path` equality 绕过 |
 | RC-B03 | 代码关闭 | workflow 不再维护易漂移的手写 Swift parse 清单；source membership、SwiftPM lock 和 Apple build gate 分离 |
-| RC-B04 | **EXACT-SHA CI EXECUTED 3× / ALL FAIL；NEW RUN PENDING** | 历史三次为 3/8、6/8、7/8；新 implementation `f0ffcec` / governance `dbc2f26` 尚未取得 exact-SHA required-gate PASS |
+| RC-B04 | **EXACT-SHA CI FAILED；NEW RUN REQUIRED** | 历史三次为 3/8、6/8、7/8；V3 run `31276419986` 的 P0 job 又因 legacy fixture 不同步而 FAIL。当前 I4 `ec1fe96` / G4 `17871d8` 已修复并绑定，仍需 E4/V4 exact-HEAD required-gate PASS |
 | RC-B05 | 代码关闭 | `StrictJSONLStreamReader` 为 64 KiB bounded streaming API；不再返回或保留全量 `ParsedLines`/`String` 数组；每行 caller body 在独立 autorelease pool 内运行，且不再重复执行同一 strict document validator，200k frame + 200k observation 全链路 RSS 回到门限内 |
 | RC-B06 | 代码关闭 | clock correlation writer 使用 `O_CREAT|O_EXCL|O_NOFOLLOW` 增量 JSONL，每 64 条 fsync，durable watermark 只在同步成功后推进，final partial batch 同步，parent fsync 失败阻断 |
 | RC-B07 | 代码关闭 | finalized metadata v2 严格类型化；读取正式 nested watermark `captureHealth.localizationTraceRecordCount`；metadata 有 1 MiB 上限，缺失/错误字段 fail closed |
@@ -74,7 +74,7 @@ True sensor Deep 不属于 Mobile V1。设备端不会在 Fast/Full 失败后重
 
 | 验证 | 结果 |
 | --- | --- |
-| `python3 -m unittest discover -s tools/PriorMap/tests -v` | 历史基线 166 tests PASS；当前 implementation `f0ffcec` 的完整套件按时间要求延期到明日，不复用旧 PASS 作为当前提交结论 |
+| `python3 -m unittest discover -s tools/PriorMap/tests -v` | 历史基线 166 tests PASS；当前 implementation I4 的完整套件按时间要求延期到明日，不复用旧 PASS 作为当前提交结论 |
 | `IOSCoreContractTests` portability targeted rerun | 2 tests，PASS；1122.825 s；覆盖 immutable snapshot E2E、300k finalization、1,728,000 trace storm、200k frame + 200k observation tag scale |
 | `python3 -m unittest discover -s tools/Qualification/tests -v` | 28 tests，PASS；7.663 s；包含 Snapshot/Result acquisition 与最终 process-lock pathname/root replacement |
 | `python3 -m unittest discover -s tools/SupermarketMapStudio/tests -v` | 106 tests，PASS |
@@ -90,7 +90,7 @@ True sensor Deep 不属于 Mobile V1。设备端不会在 Fast/Full 失败后重
 | JSONL legacy API residue | `ParsedLines` / `readLines(` 为 0 matches |
 | 静态检查 | Python compile、shell syntax、Xcode project plist、workflow YAML、`git diff --check` PASS |
 
-这些是未优化 macOS Swift host / 本地主机自动化证据，不等价于完整 PriorMap 当前提交回归、target-device 60k/200k 性能、simulator/device clean link、热状态、电池、后台、provider、断电或现场精度证据，也不能抵消历史三个远端 FAIL；尤其不能把 `f0ffcec` 描述为 exact-SHA PASS。
+这些是未优化 macOS Swift host / 本地主机自动化证据，不等价于完整 PriorMap 当前提交回归、target-device 60k/200k 性能、simulator/device clean link、热状态、电池、后台、provider、断电或现场精度证据，也不能抵消历史失败 run；尤其不能把 I4 描述为 exact-SHA PASS。
 
 ## 5. 最终独立只读审查
 
@@ -105,7 +105,7 @@ True sensor Deep 不属于 Mobile V1。设备端不会在 Fast/Full 失败后重
 - `RESCAN_SESSION` 使用独立不可变 `rescan_session_outcome.json`，artifact、checkpoint 和 terminal task 的 rename 前后四类边界均有故障注入；artifact 已可见时先 stable no-follow 重读、补 task-root parent fsync、复核 exact identity/SHA 与 checkpoint reference，再恢复 `rescan_required`。numeric Bool、错误 reason/disposition、RESOURCE_REQUIRED 冒充 graph failure、EEXIST 不等价 winner 或同时存在普通 Result 均 fail closed。
 - cancelled / interrupted / resource_required / workflow_failed 先写 durable `terminal_state_intent.json`，再写 terminal `task.json`，最后清除 intent。task writer 任一注入边界失败均向调用方返回含业务 outcome/code/detail 和 durability phase/detail 的 typed error；重启只在 task identity、目标状态和 reason 精确一致时清理，或把已知非终态推进到 intent 目标，completed、不同终态/理由和 task identity 冲突均保持 task/intent 不变并 fail closed。若底层存储连 intent 都无法 durable 建立，只能 fail closed 并保留存储故障边界，不能宣称具有绝对可靠的磁盘 marker。
 - interrupted/resource pause 恢复、fresh/recovered snapshot、正常 completed 和 committed-result recovery 均显式清除旧 task error；`nil` 不再被错误解释成“保留旧错误”。
-- iOS 内嵌 build identity 使用 version 3 exact schema。当前 implementation `f0ffcec4480ce04ac61f3a8aad2453e5b4b27a35` 已由 governance `dbc2f2626dbf655b916b9afe4ab24fbd812a2590` 绑定；evidence SHA由后续纯治理提交写入descriptor，当前值以descriptor为准。两个字段均为40位小写 SHA 后运行时 identity 才可 `isUsable`，但这仍不替代 exact-SHA CI。
+- iOS 内嵌 build identity 使用 version 3 exact schema。当前 implementation I4 `ec1fe96fc676c03514e591c40226112cde30fe76` 已由 G4 `17871d839834487c777824c062980f3322521cdb` 绑定；evidence SHA 由后续纯治理提交写入 descriptor，当前值以 descriptor 为准。两个字段均为 40 位小写 SHA 后运行时 identity 才可 `isUsable`，但这仍不替代 exact-SHA CI。
 - 损坏或未知 result root entry 使用 `Results/quarantine/.quarantine-<uuid>.pending/` 隐藏事务；source move 前先持久化 canonical v2 diagnostic，绑定 source/payload/wrapper dev/inode，再冻结并 exclusive publish到 `quarantine-<uuid>/`。startup recovery分类 external/embedded diagnostic、pending/final和tombstone；未知冲突保留证据并使listing整体fail closed。历史 v1 immutable final继续兼容，包括顶层 symlink payload；嵌套 symlink/special/hardlink仍拒绝。
 - Map Library 对 invalid immutable package 使用 exclusive quarantine；当前 diagnostic v3 以 strict typed schema 重建 canonical bytes，绑定 transaction/prior-map/source/quarantine/payload-tree/validator identity 和 payload dev/inode。v3 incomplete source rollback 使用 bound FD 做 payload hash、`fchmod/fsync`、最终 path/dev/inode 复核后才删除 durable intent。legacy v2 仅向后兼容完整冻结的 `0555` final；v2 writable final 和 v2 incomplete transaction 不具备 durable payload identity，必须保留现场并 fail closed。
 - 当前 immutable 资格合同只覆盖 POSIX type/mode、single-link、symlink/hardlink、dev/inode、hash 和 fsync/rename 边界；尚未对 macOS ACL、BSD `uchg`/`schg` file flags 或相关扩展属性进行 hostile-input/恢复资格测试。不得把 `0444/0555` 宣称为已证明可以清除或覆盖 ACL/flags。
@@ -131,7 +131,7 @@ True sensor Deep 不属于 Mobile V1。设备端不会在 Fast/Full 失败后重
 | --- | --- | --- |
 | J-04 component identity schema/C ABI | **BLOCKER / NOT CLOSED** | 冻结 prior-independent final-link component policy；node snapshot 原子携带 node/map identity；constraint/manual 新 schema；final DB node/map/component exact 重验；旧 schema 不追溯认证；完成 Apple 双平台 compile-link |
 | current transaction diff review | **COMPLETED / P0=0 / P1=0** | Snapshot/Map/Result 与 ESL finalization/admission 增量均已独立复审；最新 ESL 复审的 3 个低影响 P2 已登记 TODO，完整 PriorMap 当前提交回归仍延期，不能写 release PASS |
-| implementation/validation binding | **I2/G2 BOUND / EVIDENCE BOUND BY PURE GOVERNANCE SUCCESSOR** | implementation `f0ffcec4480ce04ac61f3a8aad2453e5b4b27a35`；governance `dbc2f2626dbf655b916b9afe4ab24fbd812a2590`；当前`validation_sha`以descriptor为准，文档不做自引用SHA声明 |
+| implementation/validation binding | **I4/G4 BOUND / E4-V4 PENDING** | implementation `ec1fe96fc676c03514e591c40226112cde30fe76`；governance `17871d839834487c777824c062980f3322521cdb`；当前 `validation_sha` 在 E4/V4 后由 descriptor 更新，文档不做自引用 SHA 声明 |
 | exact-SHA GitHub Actions | **3 RUNS FAILED / NEW COMMITTED RERUN REQUIRED** | `31174285439`、`31177319567`、`31180693841` 均为 FAIL，最新为 7/8；只能查询未来明确提交 SHA 的全部 required jobs，不可用分支最新状态或当前工作树替代 |
 | Apple simulator/device clean link | NOT RUN / BLOCKED | 最新 run `31180693841` 中相关步骤因前置 macOS host E2E 失败而 skipped；必须在新的 committed exact-SHA run 使用平台正确的冷构建依赖树分别 clean build 并验证 link |
 | Replay/FAR/policy freeze | NOT RUN | 真实/合成资格数据、误接受率、精度/性能 Pareto 和冻结 policy |
@@ -140,7 +140,7 @@ True sensor Deep 不属于 Mobile V1。设备端不会在 Fast/Full 失败后重
 
 ### 明日详细测试与低影响 TODO（2026-08-09 登记）
 
-- 运行当前 implementation 的完整 `python3 -m unittest discover -s tools/PriorMap/tests -v`，不得复用历史 166/166 作为 `f0ffcec` 证据。
+- 运行当前 implementation I4 的完整 `python3 -m unittest discover -s tools/PriorMap/tests -v`，不得复用历史 166/166 作为 I4 证据。
 - 执行已写但今日未运行的 Map EEXIST、uppercase/noncanonical UUID、`.`/`..` CAS 集成场景。
 - 执行 Result artifact hardlink、`0644` clone、hash 后同 inode修改、manifest/receipt post-read replacement、generation final sweep、intent creation/temp/removal/staging replacement完整 Python断言。
 - 重跑完整 workflow/E2E 与 finalization、trace、tag、XLSX scale；两个128 MiB delayed replacement场景后续增加精确只测试 hook，消除时序依赖。
@@ -193,3 +193,9 @@ simulator/device clean compile-link PASS
 REJECTED / NO-GO / developer smoke only
 J-04 = BLOCKER / NOT CLOSED
 ```
+
+## 10. exact-HEAD P0 fixture 后续收口
+
+V3 `7dd42beac00a2144712503662147e77fee679ffc` 推送后触发 exact-HEAD run [`31276419986`](https://github.com/mcjiansheng/MarketScanner/actions/runs/31276419986)。`Exact SHA and wave bindings` 已通过，但 `P0 production safety invariants` 在业务断言前失败：Map Studio 测试 helper 仍生成旧 v1 session manifest fixture，缺少共享 validator 现在强制的 `recovery_lifecycle_evidence_unbound_legacy`、`session_input_manifest_version`、processing/report Recovery binding 和 `source_database_name` cross-binding。生产 validator 行为正确；失败暴露的是 P0 fixture 与新合同不同步，不能通过放宽 validator 处理。
+
+fixture 已在 I4 `ec1fe96fc676c03514e591c40226112cde30fe76` 修复，G4 `17871d839834487c777824c062980f3322521cdb` 已将 descriptor `implementation_sha` 绑定到 I4。修复后 exact CI 的四个 P0 合同本地 **4/4 PASS**，完整 Map Studio **106/106 PASS**，Python compile 与 `git diff --check` PASS。E4/V4 将绑定本段证据并触发新的 exact-HEAD run；在新 run 全部 required jobs 成功前，run `31276419986` 只能记录为失败证据，不能声明 exact-SHA CI PASS。

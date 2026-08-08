@@ -24,13 +24,14 @@
 
 ## 未关闭（未写 PASS；逐项注明已运行/未运行）
 
-- Host E2E fixture历史仅作为developer smoke；当前 implementation `f0ffcec` 的完整 workflow/PriorMap套件按时间要求延期。新publication协议仍需 committed `macos-14-arm64` exact-SHA run，不是Replay/FAR或真机PASS。
+- Host E2E fixture 历史仅作为 developer smoke；当前 implementation I4 的完整 workflow/PriorMap 套件按时间要求延期。新 publication/ESL 合同仍需 committed exact-SHA run，不是 Replay/FAR 或真机 PASS。
 - 三格式 canonical/编译语义 parity 已自动覆盖；真实业务大图 Replay/FAR 仍 NOT RUN。
 - E2E-3 真机短路线（5~10 分钟扫描、10 个价签、手机处理、手机导出）。
 - E2E-4 Sam 路线（100+ truth tags、现场控制点）。
 - Excel / Numbers / WPS 打开验证。
 - 资源门：peak RSS、处理时长、thermal、磁盘、电量、中断/崩溃恢复。macOS ACL、BSD `uchg`/`schg` file flags 和相关扩展属性仍未资格化；POSIX `0444/0555` 不能冒充这些边界的 PASS。
-- exact-final-SHA GitHub Actions：历史三次为3/8、6/8、7/8且均FAIL；当前 implementation/governance `f0ffcec`/`dbc2f26` 需新的全量rerun。
+- exact-final-SHA GitHub Actions：历史三次为 3/8、6/8、7/8 且均 FAIL；V3 run `31276419986` 的 P0 job 也 FAIL。当前 I4/G4 需 E4/V4 后新的全量 rerun。
+- V3 exact-HEAD run `31276419986` 的 exact binding job PASS，但 P0 safety job 因 Map Studio legacy v1 manifest fixture 未携带新 Recovery/version/source-name binding 而 FAIL。fixture 已在 I4 `ec1fe96fc676c03514e591c40226112cde30fe76` 修复并由 G4 `17871d839834487c777824c062980f3322521cdb` 绑定；exact P0 4/4 与 Map Studio 106/106 本地 PASS，E4/V4 新 run 尚未形成结果。
 - Apple simulator/device 两套 cold native dependencies + 两次真实 clean compile/link：最新 run `31180693841` 中因前置 macOS host E2E 失败而全部 skipped，仍为 NOT RUN。
 - 最终关键生产增量两轮只读审查完成；原事务增量为 `P0=0 / P1=0 / 新的可修P2=0`，ESL 最终复审为 `P0=0 / P1=0`，3 个允许延期 P2 已登记 TODO。Qualification 28/28、Map Studio 106/106和关键focused PASS。完整PriorMap/scale、新exact-SHA与J-04仍未关闭，最终判断保持 **REJECTED / NO-GO / developer smoke only**。
 
