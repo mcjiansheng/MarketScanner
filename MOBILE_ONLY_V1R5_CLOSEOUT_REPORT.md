@@ -1,6 +1,6 @@
 # MarketScanner Mobile-Only V1 Release Candidate 阻断项收口报告
 
-> 文档状态：**当前有效**。最后核对日期：2026-08-07。
+> 文档状态：**当前有效**。最后核对日期：2026-08-09。
 > 仓库：`mcjiansheng/MarketScanner`
 > 分支：`mobile-only-v1-release-candidate-blocker-closeout`
 > 基线：`81b6dbb216e843d363fd0088f673076add78013f`
@@ -10,7 +10,7 @@
 
 ## 1. 结论和产品边界
 
-本分支已关闭第二次独立审查中的大部分正确性、事务、安全、规模及审计缺口，当前本地主机回归通过。pre-CI implementation diff 的独立只读代码审查已经执行，审查发现的 committed RESCAN 被降级、completed task 残留旧 error、RESCAN strict Bool/reason-disposition/EEXIST 绑定、trace `Int64` 边界崩溃、Map quarantine 崩溃恢复与 canonical integer、以及 200k tag 长时进程 RSS 问题均已修复并加入可执行回归。该结论不是 release PASS；仍有一个明确的代码/合同阻断项：J-04 absolute-prior `same floor/map/component` 不能由现行 evidence schema 证明。关闭它需要先冻结 prior-independent final-link component policy，再完成 node snapshot C ABI、constraint/manual schema、finalization、Graph Reader 和 parser 的 breaking migration。exact-SHA GitHub Actions 已执行两次但均失败：run `31174285439@00018f4bf29a66d42aa94b47e6890cae8408d878` 为 3/8 jobs success；run `31177319567@37accce79201482926b9c3ea3247f649e95b375b` 为 6/8 jobs success。最新 run 的 macOS host E2E 暴露冻结 snapshot 目录经 Foundation `moveItem` 发布时的 EACCES，Windows Qualification 暴露大小写不敏感 `Path` equality 绕过 exact-case membership gate。当前代码已分别改为 `renameatx_np(..., RENAME_EXCL)` 和原始路径字符串 exact-case 比较，并通过本地主机回归；implementation `7841c28a37b80334cd14aef7cecaad829d29c8ef` 的精确 staged/cached diff 双重只读审查结论为 **NO ACTIONABLE FINDINGS**。新的 exact-SHA required-gate rerun 尚未执行。真实 Apple 双平台 clean compile-link 在 run `31177319567` 中仍因前置 macOS E2E 失败而 skipped，Replay/FAR policy freeze、Device Lab 和 Sam 现场复测也仍未完成。因此本报告不声明 `DEVICE LAB TESTABLE`、`DEVICE LAB PASS`、`SAM FIELD PASS` 或 `PRODUCTION READY`。
+本分支已关闭第二次独立审查中的大部分正确性、事务、安全、规模及审计缺口，并积累了本地主机 developer-smoke 回归。当前事务加固实现已提交为 `f0ffcec4480ce04ac61f3a8aad2453e5b4b27a35`，治理提交 `dbc2f2626dbf655b916b9afe4ab24fbd812a2590` 已将 `implementation_sha` 绑定到该实现；`validation_sha` 仍待本报告证据提交后绑定。该结论不是 release PASS；J-04 absolute-prior `same floor/map/component` 仍是明确的代码/合同阻断项。exact-SHA GitHub Actions 历史三次运行全部失败：`31174285439@00018f4` 为 3/8、`31177319567@37accce` 为 6/8、`31180693841@359e5c2` 为 7/8；新实现尚未取得远端 exact-SHA PASS。当前实现采用 payload/nested directory 先冻结、root `0755` exclusive rename、inode-bound FD `fchmod(0555)`/`fsync`/path identity 复核的 publication 协议；Snapshot、Result 和 quarantine 的 rename 均不是业务提交点。Apple clean compile-link、Replay/FAR、Device Lab 和 Sam 现场复测仍未完成，因此本报告不声明 `DEVICE LAB TESTABLE`、`DEVICE LAB PASS`、`SAM FIELD PASS` 或 `PRODUCTION READY`。
 
 Mobile V1 冻结为 Route A：
 
@@ -27,14 +27,14 @@ True sensor Deep 不属于 Mobile V1。设备端不会在 Fast/Full 失败后重
 | ID | 本分支状态 | 实现和验证摘要 |
 | --- | --- | --- |
 | RC-B01 | 代码关闭 | compiler、loader、integrity validator 和测试统一消费 shelves v2；包含物理 `shelf_segment_id`、显式 start/end/axis/normal 和跨文件关系校验 |
-| RC-B02 | 代码关闭，待新 exact-SHA 复验 | production Swift 全部登记到 RTABMapApp target；自动 membership checker 当前确认 82 个 Swift 源文件；exact-case gate 使用原始路径字符串，不再被 Windows 大小写不敏感 `Path` equality 绕过 |
+| RC-B02 | 代码关闭，待新 exact-SHA 复验 | production Swift 全部登记到 RTABMapApp target；自动 membership checker 当前确认 83 个 Swift 源文件；exact-case gate 使用原始路径字符串，不再被 Windows 大小写不敏感 `Path` equality 绕过 |
 | RC-B03 | 代码关闭 | workflow 不再维护易漂移的手写 Swift parse 清单；source membership、SwiftPM lock 和 Apple build gate 分离 |
-| RC-B04 | **EXACT-SHA CI EXECUTED / FAIL** | run `31174285439@00018f4` 为 3/8 jobs success，run `31177319567@37accce` 为 6/8 jobs success；后者证明 Linux/Windows native 与 Python 主门可执行，但本轮两项 portability 修复仍需新的精确 governance SHA required-gate 全绿证明 |
+| RC-B04 | **EXACT-SHA CI EXECUTED 3× / ALL FAIL；NEW RUN PENDING** | 历史三次为 3/8、6/8、7/8；新 implementation `f0ffcec` / governance `dbc2f26` 尚未取得 exact-SHA required-gate PASS |
 | RC-B05 | 代码关闭 | `StrictJSONLStreamReader` 为 64 KiB bounded streaming API；不再返回或保留全量 `ParsedLines`/`String` 数组；每行 caller body 在独立 autorelease pool 内运行，且不再重复执行同一 strict document validator，200k frame + 200k observation 全链路 RSS 回到门限内 |
 | RC-B06 | 代码关闭 | clock correlation writer 使用 `O_CREAT|O_EXCL|O_NOFOLLOW` 增量 JSONL，每 64 条 fsync，durable watermark 只在同步成功后推进，final partial batch 同步，parent fsync 失败阻断 |
 | RC-B07 | 代码关闭 | finalized metadata v2 严格类型化；读取正式 nested watermark `captureHealth.localizationTraceRecordCount`；metadata 有 1 MiB 上限，缺失/错误字段 fail closed |
 | RC-B08 | 代码关闭 | snapshot 对 required file set、DB/WAL/journal/shm、hardlink/symlink、pre/post inventory 和 inode identity 做稳定校验；`scan_events.jsonl` 纳入 immutable snapshot并逐行绑定当前 `trackingSessionId`。当前 metadata 无 scan-event count/last-ID，故不声明 exact cardinality watermark |
-| RC-B09 | **REOPENED BY CI / LOCAL FIX TESTED** | generation/manifest/backup 事务合同已实现，但 `37accce` 在 macOS 14 暴露冻结目录 publication EACCES；当前冻结的 `0555` staging、snapshot 和 backup 使用 Darwin `renameatx_np(..., RENAME_EXCL)` 同父目录发布/恢复，保持 no-replace，并已通过本地完整 host targeted rerun；新 exact-SHA PASS 前不得重新标为 closed |
+| RC-B09 | **IMPLEMENTATION COMMITTED / EXACT-SHA PENDING** | Snapshot 使用 durable transaction intent 绑定 new/prior generation 的 dev/inode 与 manifest SHA；task-root 与 `input_snapshot.lock` 的 FD/path authority 在获取前后及公开 API 返回前复核。payload/nested directories 先冻结，root 以 `0755` exclusive rename，再由 bound FD 冻结为 `0555`、fsync 并复核 path identity；新 exact-SHA PASS 前不得标为 closed |
 | RC-B10 | 代码关闭 | Objective-C++ Graph Reader 严格验证 SQLite BLOB/NULL/count/byte length/pointer/finite/link；不再为短 BLOB 补零 |
 | RC-B11 | 代码关闭 | native mandatory skeleton、factors 和 priors 使用 4096 硬上限；Swift 先解析 disposition 再处理 error，`RESOURCE_REQUIRED` 不降级；成功质量只认严格 `solver.factor_count` |
 | RC-B12 | 代码关闭 | burst v2 强制 frame 与 observation exact 一对一、burst 内及全局 ID 唯一、verified complete burst 才可消费 |
@@ -48,16 +48,16 @@ True sensor Deep 不属于 Mobile V1。设备端不会在 Fast/Full 失败后重
 | RC-B20 | 代码关闭 | strict trace 验证 formal state、node timebase identity、统一 monotonic axis、状态关系和 watermark；Swift/PC 共用 fixture 输出稳定 reason parity；有限但无法安全映射到 `Int64` 秒轴的 hostile timestamp 返回 `compaction_axis_out_of_range`，不再触发 runtime trap |
 | RC-B21 | 代码关闭 | clock parser 严格检查 reason、DB node binding、timezone offset、jump/rollback 和非单射 UTC；错误报告保留原文件行号 |
 | RC-B22 | 代码关闭 | final trajectory 保留精确最后节点、stale trace/floor gate、线性 clock context pointer 和正确 discontinuity timezone；整体保持线性遍历 |
-| RC-B23 | 代码关闭 | Result 使用 `Results/.result-staging-<task-sha256>.<result-sha256>/` 同父目录隐藏 staging；全部文件 `0444` 和 staging 根目录 `0555` 在 final path 不存在时完成冻结/验证，然后执行同父目录 `renameatx_np(..., RENAME_EXCL)`；rename 后重读 exact set/modes、receipt、manifest 和逐 artifact bytes/SHA |
+| RC-B23 | 实现已提交，待 exact-SHA | Result 使用同父目录隐藏 staging、durable publish intent、root-scoped process lock 与最终 root/lock authority validation；exclusive rename 后由同一 bound FD 执行 `0755→0555`、fsync、path/dev/inode 与 generation-wide manifest/receipt/artifact 重验。损坏 Result 的 quarantine 另使用 hidden pending + source move 前 durable v2 diagnostic + dev/inode 绑定 + startup recovery；历史 v1 顶层 symlink quarantine 保持兼容 |
 | RC-B24 | 代码关闭 | result commit receipt 绑定 task/result/manifest；通用 failure terminalization 前先调和 committed immutable Result 或 committed immutable RESCAN artifact，重启可恢复 commit→completed / rescan-required 窗口，不把已提交业务事实降级为 generic failed，也不重复导出或重跑 native |
 | RC-B25 | 代码关闭 | task state transition 严格、cancel 与 interrupt 区分；四类普通失败共用 terminal intent → terminal `task.json` → intent cleanup 事务，4 outcomes × 4 write boundaries 返回 typed business+durability failure；RESCAN artifact/checkpoint/terminal writer 各边界独立覆盖；恢复进入正常阶段或 completed 时使用显式 `clearError` 清除旧 `system_interrupted` / `resource_pause`；durable outputs 使用 namespace-qualified root-relative references |
 | RC-B26 | 代码关闭 | mobile prior-map compiler 对 artifact、manifest、目录和 parent 执行强制同步；任一步失败不注册地图 |
-| RC-B27 | 代码关闭 | Map Library rebuild 对包做完整验证而非 quick verify；损坏包与 canonical durable immutable `quarantine_diagnostic.json` 经 hidden pending 事务发布；list/map/register/unregister/rebuild 均在 library lock 下执行 startup reconciliation，并用三个真实 `_exit` 崩溃窗口验证 payload rename、diagnostic placement/freeze、publish rename/parent sync 后的新进程恢复；冲突或篡改保留现场并 fail closed |
+| RC-B27 | 实现已提交，待 exact-SHA | Map Library diagnostic v3、legacy v2 fail-closed、payload dev/inode、FD-relative rollback、所有公开成功路径 root/lock 最终复核及 canonical lowercase UUID 已提交；safe prior-map ID 额外拒绝 `.`/`..`。本轮 focused 真实进程覆盖 root/lock replacement、tombstone rename/unlink、source replacement、pending/embedded diagnostic replacement等关键边界 |
 | RC-B28 | 代码关闭 | XLSX verifier 严格校验 ZIP、workbook relationships、sheet binding、header、formula 和 row count；导入必须提供显式 store ID |
 | RC-B29 | **外部门未关闭** | native policy 仍是 candidate；真实 Replay/FAR、Pareto 证据和最终 policy freeze 未执行 |
-| RC-B30 | **外部门未关闭** | device/simulator dependency 和 workflow 已修复，但本机缺少完整双平台 native trees；run `31177319567` 在 macOS host E2E 前置步骤失败，后续 SwiftPM/Xcode metadata/simulator/device clean compile-link 全部 skipped，Device Lab 和现场资格未执行 |
+| RC-B30 | **外部门未关闭** | device/simulator dependency 和 workflow 已实现，但本机缺少完整双平台 native trees；最新 run `31180693841` 在 macOS 14 host E2E 前置步骤失败，后续 Apple SwiftPM/Xcode metadata、cold dependencies、simulator/device clean compile-link 与 identity 检查全部 skipped，Device Lab 和现场资格未执行 |
 
-结论：除 RC-B19/J-04 的 component identity breaking migration 外，大部分 RC-B01…RC-B03、RC-B05…RC-B28 已完成本地代码闭包；RC-B09 因 exact-SHA macOS 14 CI 暴露的 frozen snapshot publication 移植性问题重新打开，当前修复仅有本地测试证据。RC-B04、RC-B09、RC-B29、RC-B30 还必须分别由远端 exact-SHA CI、真实 Replay/FAR 数据和 Apple/真实设备证据关闭。J-04 与这些门任一未关闭时，整体均保持 `REJECTED / NO-GO`。
+结论：除 RC-B19/J-04 的 component identity breaking migration 外，大部分 RC-B01…RC-B03、RC-B05…RC-B28 已形成代码闭包或当前工作树加固；但 RC-B09/RC-B23 的 macOS directory publication 修复尚无 exact-SHA 远端 PASS。RC-B04、RC-B09、RC-B23、RC-B29、RC-B30 还必须分别由新的精确提交 CI、真实 Replay/FAR 数据和 Apple/真实设备证据关闭。J-04 与这些门任一未关闭时，整体均保持 `REJECTED / NO-GO / developer smoke only`。
 
 ## 3. RC-H01…RC-H40 收口摘要
 
@@ -74,12 +74,14 @@ True sensor Deep 不属于 Mobile V1。设备端不会在 Fast/Full 失败后重
 
 | 验证 | 结果 |
 | --- | --- |
-| `python3 -m unittest discover -s tools/PriorMap/tests -v` | 166 tests，PASS；1059.678 s |
+| `python3 -m unittest discover -s tools/PriorMap/tests -v` | 历史基线 166 tests PASS；当前 implementation `f0ffcec` 的完整套件按时间要求延期到明日，不复用旧 PASS 作为当前提交结论 |
 | `IOSCoreContractTests` portability targeted rerun | 2 tests，PASS；1122.825 s；覆盖 immutable snapshot E2E、300k finalization、1,728,000 trace storm、200k frame + 200k observation tag scale |
-| `python3 -m unittest discover -s tools/Qualification/tests -v` | 28 tests，PASS |
+| `python3 -m unittest discover -s tools/Qualification/tests -v` | 28 tests，PASS；7.663 s；包含 Snapshot/Result acquisition 与最终 process-lock pathname/root replacement |
 | `python3 -m unittest discover -s tools/SupermarketMapStudio/tests -v` | 106 tests，PASS |
+| Result quarantine focused smoke | PASS；正常隔离、intent durable→source move、source move→freeze、publish rename→freeze、根级 symlink、重启后无 hidden transaction residue |
+| Map/Result focused fault smoke | PASS；Map root/lock replacement、tombstone crash/restart、source/pending/diagnostic inode replacement；Result publication destination/source/interrupted replacement与 artifact symlink拒绝 |
 | `rtabmap-market-scanner-native-tests` | 7,878 checks，0 failures |
-| iOS source membership | 82 Swift sources，本地主机 PASS；Windows exact-case regression 已本地修复，待新 exact-SHA 复验 |
+| iOS source membership | 83 Swift sources，当前本地主机 checker PASS；Windows exact-case regression 待新 exact-SHA 复验 |
 | SwiftPM dependency lock | 1 direct package / 1 exact resolved pin，PASS |
 | generated mobile evidence contracts | 11 generated/authoritative files，version 1，无漂移 |
 | 300k finalization scale | 300,000 records / 114,933,372 input bytes / 114,933,372 temporary bytes；7.877 s wall / 7.871 s CPU；peak RSS 12,795,904 bytes |
@@ -88,23 +90,25 @@ True sensor Deep 不属于 Mobile V1。设备端不会在 Fast/Full 失败后重
 | JSONL legacy API residue | `ParsedLines` / `readLines(` 为 0 matches |
 | 静态检查 | Python compile、shell syntax、Xcode project plist、workflow YAML、`git diff --check` PASS |
 
-这些是未优化 macOS Swift host / 本地主机自动化证据，不等价于 target-device 60k/200k 性能、simulator/device clean link、热状态、电池、后台、provider、断电或现场精度证据，也不能抵消 run `31174285439` 和 `31177319567` 的远端 FAIL。
+这些是未优化 macOS Swift host / 本地主机自动化证据，不等价于完整 PriorMap 当前提交回归、target-device 60k/200k 性能、simulator/device clean link、热状态、电池、后台、provider、断电或现场精度证据，也不能抵消历史三个远端 FAIL；尤其不能把 `f0ffcec` 描述为 exact-SHA PASS。
 
 ## 5. 最终独立只读审查
 
-pre-CI implementation diff 的独立审查覆盖 correctness、transaction、security、scale、audit、docs 和 CI 合同，状态为 **COMPLETED / BLOCKERS FOUND AND FIXED**。修复内容包括：committed RESCAN/Result 的跨目录恢复顺序；RESCAN artifact/checkpoint/task 写边界与 EEXIST race；strict Bool 和 reason/disposition 交叉约束；completed task 的 stale error 清除；Map quarantine 三个真实进程崩溃窗口、destination symlink/source+published 冲突和 canonical integer；trace 超出 `Int64` 秒轴的稳定拒绝；以及 strict JSONL 每行 autorelease pool 解决的 200k 证据 RSS blocker。随后 exact-SHA CI 新发现 macOS snapshot publication 和 Windows path-case 两个 portability blocker；implementation `7841c28a37b80334cd14aef7cecaad829d29c8ef` 已完成代码路径审查、本地回归及包含同步文档的精确 staged manifest/cached diff 双重只读复核，结论为 **NO ACTIONABLE FINDINGS**。J-04 与外部资格门保持未关闭，所以这里不得写 release review PASS、Device Lab ready 或 production ready。
+最终关键生产增量已完成两轮只读审查。第一轮发现 Map `.`/`..` safe identifier、Result quarantine payload-move→diagnostic crash orphan和 Snapshot process-lock pathname binding；均已修复。第二轮发现历史 v1 顶层 symlink quarantine 兼容问题并已修复。最终结论为 `P0=0 / P1=0 / 新的可修 P2=0`。审查同时确认 Result quarantine v2 hidden pending/diagnostic/temp/tombstone/recovery 状态机不会删除唯一 payload，Snapshot/Map/Result 最终 authority validation均 fail closed。该结论仍不是 release review PASS：完整 PriorMap 当前提交套件、exact-SHA、J-04、ACL/file-flags与外部资格门仍未关闭。
 
 ## 6. 事务与审计边界
 
 - 原始 session/SQLite 只读；snapshot、task staging、result staging 和最终 result 使用不同命名空间。
-- snapshot 拒绝非空 WAL/journal/shm、hardlink、symlink、路径替换和 file-set 变化；成功后文件 `0444`、目录 `0555`。
-- Result 只允许从 `Results/.result-staging-<task-sha256>.<result-sha256>/` 同父目录隐藏 staging 提交；exact set、SHA、mode、receipt 和 parent durability 任一失败都不进入 completed。rename 前失败时 final path 不存在，已冻结的隐藏 staging 恢复为 directories `0755` / files `0644` 以便重启清理；rename 后使用 commit receipt 与逐文件 hash 重建并复核提交事实。通用失败路径必须先调和 committed Result，真实提交不得改写为 failed。
+- snapshot 拒绝非空 WAL/journal/shm、hardlink、symlink、路径替换和 file-set 变化；payload 文件与嵌套目录冻结后，durable transaction intent 绑定 new/prior generation 的 manifest SHA 和 dev/inode。task-root 与 `input_snapshot.lock` 的 descriptor/path dev/inode、mode、link、size在获取前后及 API 返回前复核。macOS 14 publication 期间 root 必须允许 `0755` rename，rename 后通过仍打开的 FD 冻结到 `0555` 并 fsync；task reference、generation/path identity、parent durability 和 intent cleanup 完成前，rename 不是业务 commit point。
+- Result 只允许从 `Results/.result-staging-<task-sha256>.<result-sha256>/` 同父目录隐藏 staging 提交；durable publish intent 绑定 task/result/manifest 与 directory dev/inode，root-scoped cross-process advisory lock 序列化 cleanup、commit、recovery、list 和 read，防止这些受锁操作清理或误读 active publish intent。payload 为 `0444`，root 以 `0755` exclusive rename 后由 bound FD 冻结为 `0555`、fsync 并重验 exact set、receipt、manifest 和逐 artifact SHA。rename 或 final pathname 出现均不是业务提交；只有完整验证、parent durability 和 intent cleanup 后才能调和为 committed。该 lock/lease 不覆盖 active staging 的长期 payload 写入阶段；生产安全依赖 `MobileProcessingPipeline` 单一主 App 串行，`cleanupStaging` 只在 task pipeline 启动且 staging 创建之前调用，并禁止同一 task 跨进程并发构建。
+- 共享 publication helper 和目录枚举会以 `O_RDONLY|O_DIRECTORY` 打开 parent/root，因此 app owner 对相关 parent 必须具备 read + write + search 权限，不能只假设 write + search。目标文件系统还必须支持 no-follow directory FD、directory `fsync`、`lockf` advisory locking，以及同卷同父目录的 `renameatx_np(..., RENAME_EXCL)`；这些是当前 macOS/iOS 运行前提，不得泛化为任意文件系统均已资格化。
 - `RESCAN_SESSION` 使用独立不可变 `rescan_session_outcome.json`，artifact、checkpoint 和 terminal task 的 rename 前后四类边界均有故障注入；artifact 已可见时先 stable no-follow 重读、补 task-root parent fsync、复核 exact identity/SHA 与 checkpoint reference，再恢复 `rescan_required`。numeric Bool、错误 reason/disposition、RESOURCE_REQUIRED 冒充 graph failure、EEXIST 不等价 winner 或同时存在普通 Result 均 fail closed。
 - cancelled / interrupted / resource_required / workflow_failed 先写 durable `terminal_state_intent.json`，再写 terminal `task.json`，最后清除 intent。task writer 任一注入边界失败均向调用方返回含业务 outcome/code/detail 和 durability phase/detail 的 typed error；重启只在 task identity、目标状态和 reason 精确一致时清理，或把已知非终态推进到 intent 目标，completed、不同终态/理由和 task identity 冲突均保持 task/intent 不变并 fail closed。若底层存储连 intent 都无法 durable 建立，只能 fail closed 并保留存储故障边界，不能宣称具有绝对可靠的磁盘 marker。
 - interrupted/resource pause 恢复、fresh/recovered snapshot、正常 completed 和 committed-result recovery 均显式清除旧 task error；`nil` 不再被错误解释成“保留旧错误”。
-- iOS 内嵌 build identity 使用 version 3 exact schema，完整消费 governance descriptor 的 wave/branch/base/SHA 字段；当前 RC wave 不再被历史 `mobile-only-v1r4-` 前缀硬编码拒绝。implementation `7841c28a37b80334cd14aef7cecaad829d29c8ef` 已由当前纯治理提交绑定，`validation_sha` 仍为 `<EVIDENCE_DOCS_SHA>`，因此 Swift 运行时继续 fail closed，descriptor/runtime identity 尚非最终可用状态。最终 implementation/validation 必须均为 40 位小写 SHA 才能使 `isUsable` 成立。
-- 损坏或未知 result root entry 移入 `Results/quarantine/quarantine-<uuid>/result_payload`，并写入 immutable `quarantine_diagnostic.json`。
-- Map Library 对 invalid immutable package 使用 exclusive quarantine；diagnostic v2 以 strict typed 字段重建 canonical bytes，绑定 transaction/prior-map/source/quarantine/payload-tree/validator identity。library lock 下的 startup reconciliation 能恢复 `.diagnostic.tmp`、`.pending` 与 final quarantine 的合法崩溃状态；source+published 双份、symlink destination、mode/hash 篡改或未知 transaction 保留现场并 fail closed。
+- iOS 内嵌 build identity 使用 version 3 exact schema。当前 implementation `f0ffcec4480ce04ac61f3a8aad2453e5b4b27a35` 已由 governance `dbc2f2626dbf655b916b9afe4ab24fbd812a2590` 绑定；`validation_sha` 等待本次 evidence docs SHA。两个字段均为40位小写 SHA 后运行时 identity 才可 `isUsable`，但这仍不替代 exact-SHA CI。
+- 损坏或未知 result root entry 使用 `Results/quarantine/.quarantine-<uuid>.pending/` 隐藏事务；source move 前先持久化 canonical v2 diagnostic，绑定 source/payload/wrapper dev/inode，再冻结并 exclusive publish到 `quarantine-<uuid>/`。startup recovery分类 external/embedded diagnostic、pending/final和tombstone；未知冲突保留证据并使listing整体fail closed。历史 v1 immutable final继续兼容，包括顶层 symlink payload；嵌套 symlink/special/hardlink仍拒绝。
+- Map Library 对 invalid immutable package 使用 exclusive quarantine；当前 diagnostic v3 以 strict typed schema 重建 canonical bytes，绑定 transaction/prior-map/source/quarantine/payload-tree/validator identity 和 payload dev/inode。v3 incomplete source rollback 使用 bound FD 做 payload hash、`fchmod/fsync`、最终 path/dev/inode 复核后才删除 durable intent。legacy v2 仅向后兼容完整冻结的 `0555` final；v2 writable final 和 v2 incomplete transaction 不具备 durable payload identity，必须保留现场并 fail closed。
+- 当前 immutable 资格合同只覆盖 POSIX type/mode、single-link、symlink/hardlink、dev/inode、hash 和 fsync/rename 边界；尚未对 macOS ACL、BSD `uchg`/`schg` file flags 或相关扩展属性进行 hostile-input/恢复资格测试。不得把 `0444/0555` 宣称为已证明可以清除或覆盖 ACL/flags。
 - stable import 使用 no-follow、regular、single-link、bounded chunks、pre/post identity、destination `O_EXCL`、data fsync 和 parent fsync。
 - 业务身份原值必须 NFC、非空、无首尾空白、无 hidden/path/control 字符，且为单一安全路径组件；store ID 最多 128 UTF-8 bytes，map name 最多 200 UTF-8 bytes。
 
@@ -119,20 +123,30 @@ pre-CI implementation diff 的独立审查覆盖 correctness、transaction、sec
 - device/simulator cold cache 与真实 `clean build` workflow gate；
 - SwiftPM `Zip` 2.1.2 exact revision `67fa55813b9e7b3b9acee9c0ae501def28746d76`。
 
-当前工作机没有可供完整链接的 `Libraries/iphoneos/` 和 `Libraries/iphonesimulator/` 生产依赖树，因此不能引用历史 archive 或发布目录产物代替。run `31177319567` 的 macOS job 在 platform-independent host E2E 以 EACCES 失败后，cold SwiftPM resolve、Xcode metadata、iphoneos/iphonesimulator dependencies、simulator clean build、unsigned arm64 device build 和 embedded identity 验证均被 skipped；Apple simulator/device clean compile-link 仍为 **NOT RUN / BLOCKED ON SUCCESSFUL PREREQUISITES**。
+当前工作机没有可供完整链接的 `Libraries/iphoneos/` 和 `Libraries/iphonesimulator/` 生产依赖树，因此不能引用历史 archive 或发布目录产物代替。最新 run `31180693841@359e5c2` 的 macOS job 在 platform-independent host E2E 因 `0555` directory-root rename `EACCES` 失败后，cold SwiftPM resolve、Xcode metadata、iphoneos/iphonesimulator dependencies、simulator clean build、unsigned arm64 device build 和 embedded identity 验证均被 skipped；Apple simulator/device clean compile-link 仍为 **NOT RUN / BLOCKED ON SUCCESSFUL PREREQUISITES**。
 
 ## 8. 未完成且禁止冒充 PASS 的资格门
 
 | 门 | 当前状态 | 关闭要求 |
 | --- | --- | --- |
 | J-04 component identity schema/C ABI | **BLOCKER / NOT CLOSED** | 冻结 prior-independent final-link component policy；node snapshot 原子携带 node/map identity；constraint/manual 新 schema；final DB node/map/component exact 重验；旧 schema 不追溯认证；完成 Apple 双平台 compile-link |
-| final independent diff review | **POST-CI STAGED REVIEW COMPLETED / NO ACTIONABLE FINDINGS** | implementation `7841c28a37b80334cd14aef7cecaad829d29c8ef` 的 8-file staged manifest/cached diff 已双重只读复核；J-04 仍独立保持 BLOCKER，不能把此项写成 release review PASS |
-| implementation SHA binding | BOUND | 当前纯治理提交把 descriptor 绑定到 implementation `7841c28a37b80334cd14aef7cecaad829d29c8ef`；validation 仍保持精确占位符，等待后续无 production drift 的 evidence/validation 链 |
-| exact-SHA GitHub Actions | **2 RUNS FAILED / NEW RERUN PENDING** | `31174285439`、`31177319567` 均为 FAIL；修复提交和 governance 绑定后查询只属于新精确 SHA 的全部 required jobs，不可用分支最新状态替代 |
-| Apple simulator/device clean link | NOT RUN / BLOCKED | run `31177319567` 中相关步骤因前置 macOS E2E 失败而 skipped；必须在新 exact-SHA run 使用平台正确的冷构建依赖树分别 clean build 并验证 link |
+| current transaction diff review | **COMPLETED / P0=0 / P1=0 / ACTIONABLE P2 FIXED** | 两轮只读审查已覆盖 Snapshot/Map/Result publication、quarantine、process-lock和Xcode membership；完整 PriorMap当前提交回归仍延期，不能写 release PASS |
+| implementation SHA binding | **I2/G2 BOUND / VALIDATION PENDING** | implementation `f0ffcec4480ce04ac61f3a8aad2453e5b4b27a35`；governance `dbc2f2626dbf655b916b9afe4ab24fbd812a2590`；`validation_sha` 待 evidence docs commit 后绑定 |
+| exact-SHA GitHub Actions | **3 RUNS FAILED / NEW COMMITTED RERUN REQUIRED** | `31174285439`、`31177319567`、`31180693841` 均为 FAIL，最新为 7/8；只能查询未来明确提交 SHA 的全部 required jobs，不可用分支最新状态或当前工作树替代 |
+| Apple simulator/device clean link | NOT RUN / BLOCKED | 最新 run `31180693841` 中相关步骤因前置 macOS host E2E 失败而 skipped；必须在新的 committed exact-SHA run 使用平台正确的冷构建依赖树分别 clean build 并验证 link |
 | Replay/FAR/policy freeze | NOT RUN | 真实/合成资格数据、误接受率、精度/性能 Pareto 和冻结 policy |
 | Device Lab | NOT RUN | 支持 LiDAR 的真实 iPhone、Route A、tag、弱纹理、后台、热/内存/磁盘、crash/relaunch、result receipt |
 | Sam field re-test | NOT RUN | 同路线真实重扫、控制点、价签和独立证据复核 |
+
+### 明日详细测试与低影响 TODO（2026-08-09 登记）
+
+- 运行当前 implementation 的完整 `python3 -m unittest discover -s tools/PriorMap/tests -v`，不得复用历史 166/166 作为 `f0ffcec` 证据。
+- 执行已写但今日未运行的 Map EEXIST、uppercase/noncanonical UUID、`.`/`..` CAS 集成场景。
+- 执行 Result artifact hardlink、`0644` clone、hash 后同 inode修改、manifest/receipt post-read replacement、generation final sweep、intent creation/temp/removal/staging replacement完整 Python断言。
+- 重跑完整 workflow/E2E 与 finalization、trace、tag、XLSX scale；两个128 MiB delayed replacement场景后续增加精确只测试 hook，消除时序依赖。
+- `listResultsLocked()` 根目录创建/枚举失败目前安全地返回空列表，但未写 `lastListingDiagnostics()`/`NSLog`；补显式 `do/catch` 审计诊断。
+- 根级非 symlink special file当前留在原位并使 listing fail closed；补 durable conflict diagnostic fixture与策略。
+- 恶意同 UID 非协作 namespace writer、macOS ACL、BSD `uchg/schg`、相关扩展属性和第三方 file-provider/非本地文件系统语义继续作为未资格化平台边界。
 
 在上述资格门全部按对应层级完成前，允许的最高表述仍是：
 

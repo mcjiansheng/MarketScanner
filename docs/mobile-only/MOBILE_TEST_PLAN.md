@@ -1,6 +1,6 @@
 # 手机端测试计划（Mobile Test Plan）
 
-> 状态：**当前有效**；自动测试已实现，exact-SHA CI 已运行但尚未通过，DEVICE 未完成。最后核对：2026-08-07。
+> 状态：**当前有效**；关键修复短时回归已执行，详细长时测试按时间安排延期；exact-SHA 历史三次失败，DEVICE 未完成。最后核对：2026-08-09。
 
 ## 自动测试（已实现，Swift host 默认模式 + 模式化套件）
 
@@ -8,26 +8,36 @@
 |---|---|---|
 | I1-I14 | 三格式导入、canonical parity、公式/ZIP/CSV/JSON 安全 | Swift host + --import-suite |
 | C5/C7/C9/C10 | 编译器路网统计、距离场 SHA、package self-load、PC parity | Swift host |
-| P1/P2/P7/P8/P12 | Fast Path 收敛、快照事务、任务状态机；immutable snapshot 的 install/backup/recovery 使用 `renameatx_np(..., RENAME_EXCL)`，覆盖 macOS 14 冻结目录 publication portability | Swift host；最新 targeted `IOSCoreContractTests` 2/2 PASS |
+| P1/P2/P7/P8/P12 | Fast Path 收敛、快照事务、任务状态机；Snapshot durable intent、`0755→rename→bound-FD 0555/fsync`、task-root/`input_snapshot.lock` descriptor/path最终复核 | Qualification focused与host typecheck PASS；完整PriorMap当前提交回归延期；exact-SHA待新run |
 | Native/AbsolutePrior contract | 4096/4097、RESOURCE_REQUIRED+error；quality v2 strict typed DTO 的 unknown/duplicate/wrong type/Bool、path/disposition/request identity、graph/factor SHA、runtime ABI、C trajectory/skeleton/publish/factor count mismatch；RunSummary 仅投影已验证 `solver.factor_count`；constraint/manual/recovery exact raw-line watermark、345,600 资格上限、accepted=false 非致命、manual ISO/Unix 与 v2/v3 nearest/second margin | Native executable + Swift host（合并后统一重跑） |
 | J-04 component identity | Graph Reader node mapID/link component derivation；constraint/manual 新 schema 的原子 bound node + RTAB-Map map ID；最终 component 重算与错 component 拒绝 | **BLOCKER：写侧 schema 尚无可核验证据，NOT RUN / NOT CLOSED** |
 | T1/T3/T4/T6/T7/T12 | 1 Hz 重采样、yaw 最短弧、lost/gap、100k 行 | Swift host |
 | G1-G10 | 价签绑定/传播/融合/货架/质量门 | Swift host |
 | X1-X9 | 工作簿结构、四表、公式注入、控制字符、100k | Swift host |
 | Scale/stream | 300k finalization（12,795,904-byte peak RSS）；60k clock writer；1,728,000 trace transition storm（保留 172,801、58,769,408-byte peak RSS）；200k burst frames + 200k observations 经 parser/resolver/shelf/fusion/quality 全链路（670,662,656-byte peak RSS，低于 768 MiB host 门）；JSONL per-line autorelease pool | Swift host；未优化 macOS developer evidence，不是 target-device PASS |
-| Contract/parity | 11 份生成证据合同、scan-event mixed-session fail-closed、strict trace PC/device stable reason parity、82 shipping Swift source membership；Windows exact-case membership 使用原始路径字符串，不依赖大小写不敏感 `Path` equality | Python + Swift runner；Qualification 28/28 PASS |
-| Map quarantine | 损坏 package 的 v2 durable immutable diagnostic（transaction/source identity/path/mode/payload-tree SHA）、library-lock startup reconciliation；真实子进程分别在 payload rename、diagnostic placement/freeze、publish rename + parent fsync 后 `_exit`，新进程从 list/map/rebuild 入口恢复；最终只能保留 source 或 durable final quarantine，registry 不引用 pending；权限篡改、unknown/conflicting state fail closed 且无 silent loss | Swift host + real filesystem subprocess |
-| Result/RESCAN transaction | committed Result rename/parent-fsync 与 completed task writer 4 边界恢复；RESCAN artifact writer 4 边界、checkpoint writer 4 边界、terminal writer 4 边界；restart no-native-rerun/no-Result；strict Bool、reason/disposition、RESOURCE_REQUIRED、EEXIST race、same-task Result conflict；recovered completed clears stale interruption/resource error | Swift host + real filesystem failure injection |
+| Contract/parity | 11 份生成证据合同、scan-event mixed-session fail-closed、strict trace parity、83 shipping Swift source membership与Windows exact-case | Qualification 28/28 PASS；membership/SwiftPM lock/contracts PASS |
+| Map quarantine | diagnostic v3、legacy v2 fail-closed、payload dev/inode、FD-relative rollback、root/lock最终复核、canonical UUID和`.`/`..`拒绝 | 关键focused真实进程PASS；EEXIST/UUID/CAS完整Python集成延期 |
+| Result/RESCAN transaction | Result publish intent、root lock最终验证、artifact generation sweep；Result quarantine hidden pending + source move前durable v2 diagnostic + startup recovery + v1顶层symlink兼容；RESCAN既有事务 | Qualification与quarantine/publication focused PASS；完整artifact/intent replacement矩阵延期 |
+| Publication platform contract | parent/root 以 `O_RDONLY|O_DIRECTORY` 打开，app owner 必须具备 read + write + search；no-follow directory FD、directory `fsync`、`lockf`、同卷同父目录 `renameatx_np(..., RENAME_EXCL)` 均为必要能力 | 当前 macOS/iOS 运行前提；不满足这些能力的文件系统不在已资格范围 |
 | P7R2-P7R6C 回归 | 既有三端套件 | 全量 unittest |
 
 ## 未关闭（未写 PASS；逐项注明已运行/未运行）
 
-- Host E2E fixture（导入 → 编译 → immutable snapshot → Fast/full-existing-graph → trajectory/tag/result/workbook reopen）已作为 developer smoke 执行；但 run `31177319567` 的 macOS 14 E2E 在 frozen snapshot publication 阶段因 Foundation `moveItem` EACCES 失败。当前 `renameatx_np` 修复已本地通过，仍需新 `macos-14-arm64` exact-SHA run 证明；它不是 Replay/FAR 或真机 PASS。
+- Host E2E fixture历史仅作为developer smoke；当前 implementation `f0ffcec` 的完整 workflow/PriorMap套件按时间要求延期。新publication协议仍需 committed `macos-14-arm64` exact-SHA run，不是Replay/FAR或真机PASS。
 - 三格式 canonical/编译语义 parity 已自动覆盖；真实业务大图 Replay/FAR 仍 NOT RUN。
 - E2E-3 真机短路线（5~10 分钟扫描、10 个价签、手机处理、手机导出）。
 - E2E-4 Sam 路线（100+ truth tags、现场控制点）。
 - Excel / Numbers / WPS 打开验证。
-- 资源门：peak RSS、处理时长、thermal、磁盘、电量、中断/崩溃恢复。
-- exact-final-SHA GitHub Actions：run `31174285439` 与 `31177319567` 均已运行但为 FAIL；后者 6/8 jobs 成功，macOS snapshot EACCES 与 Windows case-mismatch 修复需新的精确 SHA 全量 rerun。
-- Apple simulator/device 两套 cold native dependencies + 两次真实 clean compile/link：run `31177319567` 中因前置 macOS host E2E 失败而全部 skipped，仍为 NOT RUN。
-- pre-CI diff 独立只读审查已完成；post-CI snapshot 与 Windows membership implementation `7841c28a37b80334cd14aef7cecaad829d29c8ef` 已通过代码路径审查、本地回归和精确 staged manifest/cached diff 双重只读复核，且 implementation SHA 已绑定。仍需完成新 exact-SHA evidence/release review；J-04 component identity 继续保持 NOT CLOSED。
+- 资源门：peak RSS、处理时长、thermal、磁盘、电量、中断/崩溃恢复。macOS ACL、BSD `uchg`/`schg` file flags 和相关扩展属性仍未资格化；POSIX `0444/0555` 不能冒充这些边界的 PASS。
+- exact-final-SHA GitHub Actions：历史三次为3/8、6/8、7/8且均FAIL；当前 implementation/governance `f0ffcec`/`dbc2f26` 需新的全量rerun。
+- Apple simulator/device 两套 cold native dependencies + 两次真实 clean compile/link：最新 run `31180693841` 中因前置 macOS host E2E 失败而全部 skipped，仍为 NOT RUN。
+- 最终关键生产增量两轮只读审查完成，`P0=0 / P1=0 / 新的可修P2=0`；Qualification 28/28、Map Studio 106/106和关键focused PASS。完整PriorMap/scale、新exact-SHA与J-04仍未关闭，最终判断保持 **REJECTED / NO-GO / developer smoke only**。
+
+## 明日详细执行队列
+
+1. `python3 -m unittest discover -s tools/PriorMap/tests -v`。
+2. 完整 workflow/E2E与finalization、trace、tag、XLSX scale。
+3. Map EEXIST、uppercase/noncanonical UUID、`.`/`..` CAS集成。
+4. Result hardlink/`0644` clone/post-hash mutation、manifest/receipt post-read、root final sweep、intent creation/temp/removal/staging replacement。
+5. 将两个128 MiB delayed replacement改为精确fault hook测试。
+6. 修复`listResultsLocked()` root枚举错误的审计诊断；为根级非symlink special file设计durable conflict evidence。
