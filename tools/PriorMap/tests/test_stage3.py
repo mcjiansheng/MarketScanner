@@ -21,6 +21,7 @@ from tools.PriorMap.offline_localization import (
     SESSION_INPUT_FILE_NAMES_V3,
     Pose,
     TagPoseBinding,
+    VerifiedTagBurstFrameAuthority,
     OfflineLocalizationError,
     _read_jsonl,
     _validate_jsonl_business_record,
@@ -30,6 +31,7 @@ from tools.PriorMap.offline_localization import (
     _enforce_on_device_confirmation_conflict,
     _read_localized_price_tags_bytes,
     _verified_tag_burst_observation_ids,
+    _verified_tag_burst_evidence,
     _segment_intersection,
     apply_pose_delta_to_point,
     bind_tag_observation_to_pose,
@@ -200,6 +202,33 @@ class TagObservationBindingTests(unittest.TestCase):
             maximum_time_delta_seconds=0.2,
         )
 
+    def _verified_authority(
+        self,
+        *,
+        bound_node_id: int = 10,
+        node_timestamp: float = 101.05,
+    ) -> VerifiedTagBurstFrameAuthority:
+        return VerifiedTagBurstFrameAuthority(
+            burst_id="burst-1",
+            frame_id="frame-1",
+            observation_id="obs-1",
+            bound_node_id=bound_node_id,
+            frame_timestamp=1.05,
+            node_timestamp=node_timestamp,
+            payload="ESL-001",
+            symbology="EAN13",
+        )
+
+    def _verified_observation(self) -> dict[str, object]:
+        return {
+            **self.observation,
+            "observation_id": "obs-1",
+            "burst_id": "burst-1",
+            "frame_id": "frame-1",
+            "payload": "ESL-001",
+            "symbology": "EAN13",
+        }
+
     def test_frame_timestamp_binds_nearest_real_node(self) -> None:
         binding = self._bind()
         self.assertEqual(binding.node_index, 1)
@@ -264,6 +293,74 @@ class TagObservationBindingTests(unittest.TestCase):
         for invalid in (True, 10.5):
             with self.assertRaisesRegex(OfflineLocalizationError, "invalid"):
                 self._bind({**self.observation, "nearest_node_id": invalid})
+
+    def test_verified_burst_exact_node_wins_over_nearer_timestamp_node(self) -> None:
+        poses = [
+            Pose(10, 101.0, 0.0, 0.0, 0.0),
+            Pose(11, 101.04, 1.0, 0.0, 0.0),
+        ]
+        binding = bind_tag_observation_to_pose(
+            poses,
+            self._verified_observation(),
+            expected_tracking_session_id="tracking-1",
+            expected_map_hashes={"a" * 64},
+            expected_floor_id="1",
+            maximum_time_delta_seconds=0.2,
+            verified_burst_frame=self._verified_authority(),
+        )
+        self.assertEqual(binding.node_index, 0)
+        self.assertEqual(binding.binding_source, "verified_burst_bound_node_id")
+        self.assertAlmostEqual(binding.time_delta_seconds, 0.05)
+
+    def test_verified_burst_observation_node_fields_cannot_override(self) -> None:
+        for field in ("nearest_node_id", "node_id"):
+            with self.subTest(field=field):
+                with self.assertRaisesRegex(
+                    OfflineLocalizationError,
+                    "verified_burst_node_override",
+                ):
+                    bind_tag_observation_to_pose(
+                        self.poses,
+                        {**self._verified_observation(), field: 11},
+                        expected_tracking_session_id="tracking-1",
+                        expected_map_hashes={"a" * 64},
+                        expected_floor_id="1",
+                        verified_burst_frame=self._verified_authority(),
+                    )
+
+    def test_verified_burst_missing_or_duplicate_node_never_falls_back(self) -> None:
+        observation = self._verified_observation()
+        with self.assertRaisesRegex(
+            OfflineLocalizationError,
+            "verified_burst_node_id_not_found",
+        ):
+            bind_tag_observation_to_pose(
+                self.poses,
+                observation,
+                expected_tracking_session_id="tracking-1",
+                expected_map_hashes={"a" * 64},
+                expected_floor_id="1",
+                verified_burst_frame=self._verified_authority(
+                    bound_node_id=99
+                ),
+            )
+        duplicate = [
+            Pose(10, 101.0, 0.0, 0.0, 0.0),
+            Pose(10, 101.04, 1.0, 0.0, 0.0),
+            Pose(11, 101.05, 2.0, 0.0, 0.0),
+        ]
+        with self.assertRaisesRegex(
+            OfflineLocalizationError,
+            "verified_burst_node_id_ambiguous",
+        ):
+            bind_tag_observation_to_pose(
+                duplicate,
+                observation,
+                expected_tracking_session_id="tracking-1",
+                expected_map_hashes={"a" * 64},
+                expected_floor_id="1",
+                verified_burst_frame=self._verified_authority(),
+            )
 
 
 class ManualLocalizationTimebaseTests(unittest.TestCase):
@@ -817,6 +914,9 @@ class ESLConfirmationContractTests(unittest.TestCase):
                 "observation_id": f"obs-{index}",
                 "burst_id": capture_id,
                 "frame_id": f"frame-{index}",
+                "frame_timestamp": 10.0 + index * 0.1,
+                "node_timebase_frame_timestamp": 110.0 + index * 0.1,
+                "nearest_node_id": 11,
                 "payload": "ESL-001",
                 "symbology": "VNBarcodeSymbologyCode128",
             }
@@ -832,12 +932,29 @@ class ESLConfirmationContractTests(unittest.TestCase):
                 {
                     "observation_id": f"obs-{index}",
                     "frame_id": f"frame-{index}",
+                    "bound_node_id": 11,
+                    "frame_timestamp": 10.0 + index * 0.1,
+                    "node_timestamp": 110.0 + index * 0.1,
                 }
                 for index in range(1, 4)
             ],
         }
-        verified = _verified_tag_burst_observation_ids([burst], observations)
+        verified, authorities = _verified_tag_burst_evidence(
+            [burst], observations
+        )
         self.assertEqual(verified[capture_id], {"obs-1", "obs-2", "obs-3"})
+        self.assertEqual(authorities["obs-1"].bound_node_id, 11)
+        tolerated = [dict(item) for item in observations]
+        tolerated[0]["frame_timestamp"] = float(
+            tolerated[0]["frame_timestamp"]
+        ) + 0.5e-6
+        _verified_tag_burst_evidence([burst], tolerated)
+        outside_tolerance = [dict(item) for item in observations]
+        outside_tolerance[0]["frame_timestamp"] = float(
+            outside_tolerance[0]["frame_timestamp"]
+        ) + 2.0e-6
+        with self.assertRaises(OfflineLocalizationError):
+            _verified_tag_burst_evidence([burst], outside_tolerance)
         observations[1]["burst_id"] = "other"
         with self.assertRaises(OfflineLocalizationError):
             _verified_tag_burst_observation_ids([burst], observations)
@@ -848,12 +965,23 @@ class ESLConfirmationContractTests(unittest.TestCase):
                 "observation_id": "obs-extra",
                 "burst_id": capture_id,
                 "frame_id": "frame-extra",
+                "frame_timestamp": 10.5,
+                "node_timebase_frame_timestamp": 110.5,
+                "nearest_node_id": 11,
                 "payload": "ESL-001",
                 "symbology": "VNBarcodeSymbologyCode128",
             }
         )
         with self.assertRaises(OfflineLocalizationError):
             _verified_tag_burst_observation_ids([burst], observations)
+
+        observations.pop()
+        observations[1]["nearest_node_id"] = 12
+        with self.assertRaisesRegex(
+            OfflineLocalizationError,
+            "conflicts with its verified burst bound node",
+        ):
+            _verified_tag_burst_evidence([burst], observations)
 
     def test_offline_conflict_keeps_user_choice_and_requires_review(self) -> None:
         tag, _ = self._fixture()
@@ -1300,6 +1428,125 @@ class LocalizedPipelineTests(unittest.TestCase):
             ],
         )
 
+    def test_esl_v3_transform_audit_uses_verified_burst_node_authority(
+        self,
+    ) -> None:
+        self._upgrade_fixture_to_esl_confirmation_v3()
+        output = self.root / "localized-esl-verified-burst-authority"
+        result = process_localized_session(
+            self.prior_map,
+            self.session,
+            self.poses,
+            self.source_database,
+            self.optimized_database,
+            output,
+        )
+        snapshot = LocalizedVersionStore(output).resolve_version(
+            str(result["version_id"])
+        )
+        tag = json.loads(
+            (snapshot.version_dir / "localized_price_tags.json").read_text(
+                encoding="utf-8"
+            )
+        )[0]
+        self.assertEqual(tag["transform_audit"]["bound_node_id"], 11)
+        self.assertEqual(
+            tag["transform_audit"]["binding_source"],
+            "verified_burst_bound_node_id",
+        )
+
+    def test_esl_v3_mixed_v1_and_v2_tags_keep_versioned_node_authority(
+        self,
+    ) -> None:
+        self._upgrade_fixture_to_esl_confirmation_v3()
+        legacy_tag = self._append_legacy_v1_tag_fixture()
+        tags_path = self.segment / "localized_price_tags.json"
+        tags = json.loads(tags_path.read_text(encoding="utf-8"))
+        json_write(tags_path, [*tags, legacy_tag])
+        metadata_path = self.segment / "metadata.json"
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        metadata["localizedPriceTagCount"] = 2
+        json_write(metadata_path, metadata)
+
+        output = self.root / "localized-esl-mixed-v1-v2"
+        result = process_localized_session(
+            self.prior_map,
+            self.session,
+            self.poses,
+            self.source_database,
+            self.optimized_database,
+            output,
+        )
+        snapshot = LocalizedVersionStore(output).resolve_version(
+            str(result["version_id"])
+        )
+        final_tags = json.loads(
+            (snapshot.version_dir / "localized_price_tags.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        by_id = {item["tag_id"]: item for item in final_tags}
+        self.assertEqual(
+            by_id["tag-1"]["transform_audit"]["binding_source"],
+            "verified_burst_bound_node_id",
+        )
+        self.assertEqual(
+            by_id["tag-legacy"]["transform_audit"]["binding_source"],
+            "nearest_node_id",
+        )
+        self.assertEqual(
+            by_id["tag-legacy"]["transform_audit"]["bound_node_id"],
+            12,
+        )
+        self.assertNotIn(
+            "tag_observation_verified_burst_frame_missing",
+            by_id["tag-legacy"].get("review_reasons", []),
+        )
+
+    def test_esl_v3_observation_only_burst_does_not_rebind_legacy_v1_tag(
+        self,
+    ) -> None:
+        self._upgrade_fixture_to_esl_confirmation_v3()
+        legacy_tag = self._append_legacy_v1_tag_fixture()
+        json_write(
+            self.segment / "localized_price_tags.json",
+            [legacy_tag],
+        )
+        metadata_path = self.segment / "metadata.json"
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        metadata["localizedPriceTagCount"] = 1
+        json_write(metadata_path, metadata)
+
+        output = self.root / "localized-esl-v1-with-observation-only-burst"
+        result = process_localized_session(
+            self.prior_map,
+            self.session,
+            self.poses,
+            self.source_database,
+            self.optimized_database,
+            output,
+        )
+        manifest = json.loads(
+            (LocalizedVersionStore(output).resolve_version(
+                str(result["version_id"])
+            ).version_dir / "session_input_manifest.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(manifest["version"], 3)
+        final_tag = json.loads(
+            (LocalizedVersionStore(output).resolve_version(
+                str(result["version_id"])
+            ).version_dir / "localized_price_tags.json").read_text(
+                encoding="utf-8"
+            )
+        )[0]
+        self.assertEqual(
+            final_tag["transform_audit"]["binding_source"],
+            "nearest_node_id",
+        )
+        self.assertEqual(final_tag["transform_audit"]["bound_node_id"], 12)
+
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
@@ -1706,6 +1953,65 @@ class LocalizedPipelineTests(unittest.TestCase):
             ],
         )
 
+    def _append_legacy_v1_tag_fixture(self) -> dict[str, object]:
+        manifest = json.loads((self.prior_map / "manifest.json").read_text())
+        observations_path = self.segment / "tag_observations.jsonl"
+        observations = [
+            json.loads(line)
+            for line in observations_path.read_text(encoding="utf-8").splitlines()
+        ]
+        observations.append(
+            {
+                "format": "MarketScannerPriceTagObservation",
+                "version": 1,
+                "observation_id": "obs-legacy",
+                "frame_timestamp": 11.0,
+                "node_timebase_frame_timestamp": self.node_timebase_offset + 11.0,
+                "node_timebase_offset_seconds": self.node_timebase_offset,
+                "nearest_node_id": 12,
+                "tracking_session_id": "tracking-1",
+                "prior_map_sha256": manifest["source_sha256"],
+                "floor_id": "1",
+                "raw_map_position": {
+                    "x_m": 2.5,
+                    "y_m": -2.0,
+                    "height_m": 1.1,
+                },
+                "payload": "690000000099",
+                "symbology": "EAN13",
+            }
+        )
+        jsonl_write(observations_path, observations)
+        return {
+            "format": "MarketScannerLocalizedPriceTag",
+            "version": 1,
+            "tag_id": "tag-legacy",
+            "observation_id": "obs-legacy",
+            "payload": "690000000099",
+            "symbology": "EAN13",
+            "timestamp": 11.0,
+            "tracking_session_id": "tracking-1",
+            "prior_map_id": manifest["prior_map_id"],
+            "prior_map_sha256": manifest["source_sha256"],
+            "floor_id": "1",
+            "raw_map_position": {
+                "x_m": 2.5,
+                "y_m": -2.0,
+                "height_m": 1.1,
+            },
+            "snapped_map_position": {
+                "x_m": 2.5,
+                "y_m": -2.0,
+                "height_m": 1.1,
+            },
+            "localization_confidence": 0.8,
+            "measurement_confidence": 0.8,
+            "association_confidence": 0.8,
+            "measurement_method": "depth_plane",
+            "needs_review": False,
+            "user_confirmed": False,
+        }
+
     def _assert_unavailable_confirmation_output(
         self,
         output: Path,
@@ -1739,31 +2045,34 @@ class LocalizedPipelineTests(unittest.TestCase):
         self.assertTrue(tag["needs_review"])
         self.assertEqual(tag["approval_status"], "pending")
 
-    def test_esl_confirmation_pose_binding_failure_has_stable_unavailable_audit(
+    def test_esl_v3_observation_node_injection_fails_before_render(
         self,
     ) -> None:
         self._upgrade_fixture_to_esl_confirmation_v3()
         observations_path = self.segment / "tag_observations.jsonl"
-        observations = [
+        baseline = [
             json.loads(line)
             for line in observations_path.read_text(encoding="utf-8").splitlines()
         ]
-        observations[0]["nearest_node_id"] = 999
-        jsonl_write(observations_path, observations)
-        output = self.root / "localized-esl-pose-binding-unavailable"
-        result = process_localized_session(
-            self.prior_map,
-            self.session,
-            self.poses,
-            self.source_database,
-            self.optimized_database,
-            output,
-        )
-        self._assert_unavailable_confirmation_output(
-            output,
-            result,
-            "tag_pose_binding_failed",
-        )
+        for field in ("nearest_node_id", "node_id"):
+            with self.subTest(field=field):
+                observations = json.loads(json.dumps(baseline))
+                observations[0][field] = 999
+                jsonl_write(observations_path, observations)
+                output = self.root / f"localized-esl-node-injection-{field}"
+                with self.assertRaisesRegex(
+                    OfflineLocalizationError,
+                    "conflicts with its verified burst bound node",
+                ):
+                    process_localized_session(
+                        self.prior_map,
+                        self.session,
+                        self.poses,
+                        self.source_database,
+                        self.optimized_database,
+                        output,
+                    )
+                self.assertIsNone(LocalizedVersionStore(output).current())
 
     def test_esl_confirmation_missing_raw_position_has_stable_unavailable_audit(
         self,

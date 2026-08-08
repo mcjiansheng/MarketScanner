@@ -100,6 +100,8 @@ RECOVERY_MAXIMUM_FILE_BYTES = 16 * 1024 * 1024
 RECOVERY_MAXIMUM_RECORD_BYTES = 1_000_000
 RECOVERY_MAXIMUM_RECORDS = 100_000
 RECOVERY_MAXIMUM_NESTING_DEPTH = 32
+TAG_EVIDENCE_NUMERIC_TOLERANCE = 1.0e-6
+TAG_EVIDENCE_MAXIMUM_NODE_TIME_DELTA_SECONDS = 1.0
 EDITABLE_TAG_FIELDS = frozenset(
     {
         "shelf_code",
@@ -278,6 +280,7 @@ def _regular_file_identity(path: Path, role: str) -> dict[str, Any]:
     if (
         not stat.S_ISREG(before.st_mode)
         or not stat.S_ISREG(path_after.st_mode)
+        or path_before.st_nlink != 1
         or before.st_nlink != 1
         or after.st_nlink != 1
         or path_after.st_nlink != 1
@@ -808,6 +811,7 @@ def _verified_source_database_copy(
     if (
         not stat.S_ISREG(before.st_mode)
         or not stat.S_ISREG(path_after.st_mode)
+        or path_before.st_nlink != 1
         or before.st_nlink != 1
         or after.st_nlink != 1
         or path_after.st_nlink != 1
@@ -908,6 +912,24 @@ class TagPoseBinding:
     node_timestamp: float
     time_delta_seconds: float
     binding_source: str
+
+
+@dataclass(frozen=True)
+class VerifiedTagBurstFrameAuthority:
+    """Manifest-v3 node authority for one durable tag observation.
+
+    The phone persists the exact RTAB-Map node in the complete burst frame.
+    Stage-3 must not let optional/legacy observation fields replace that node.
+    """
+
+    burst_id: str
+    frame_id: str
+    observation_id: str
+    bound_node_id: int
+    frame_timestamp: float
+    node_timestamp: float
+    payload: str
+    symbology: str
 
 
 @dataclass(frozen=True)
@@ -1135,6 +1157,16 @@ def _strict_integer(value: Any) -> int | None:
     if isinstance(value, float) and math.isfinite(value) and value.is_integer():
         return int(value)
     return None
+
+
+def _strict_numbers_match(left: Any, right: Any) -> bool:
+    left_number = _strict_number(left)
+    right_number = _strict_number(right)
+    return (
+        left_number is not None
+        and right_number is not None
+        and abs(left_number - right_number) <= TAG_EVIDENCE_NUMERIC_TOLERANCE
+    )
 
 
 RECOVERY_OUTCOMES = frozenset(
@@ -2105,13 +2137,20 @@ def _read_jsonl(
     return values, diagnostics
 
 
-def _verified_tag_burst_observation_ids(
+def _verified_tag_burst_evidence(
     bursts: Sequence[dict[str, Any]],
     observations: Sequence[dict[str, Any]],
-) -> dict[str, set[str]]:
-    """Return exact complete-burst membership after cross-checking every
-    frame against the durable observation sidecar. A v2 confirmation may only
-    reference one of these verified sets."""
+) -> tuple[
+    dict[str, set[str]],
+    dict[str, VerifiedTagBurstFrameAuthority],
+]:
+    """Return exact complete-burst membership and per-frame node authority.
+
+    A v2 confirmation may only reference one verified observation set. For a
+    manifest-v3 session, the burst frame's ``bound_node_id`` is also the only
+    node authority consumed by Stage-3; optional legacy node fields in the
+    observation may agree with it, but can never replace it.
+    """
 
     observations_by_id: dict[str, dict[str, Any]] = {}
     for observation in observations:
@@ -2127,6 +2166,7 @@ def _verified_tag_burst_observation_ids(
         observations_by_id[observation_id] = observation
 
     verified: dict[str, set[str]] = {}
+    frame_authorities: dict[str, VerifiedTagBurstFrameAuthority] = {}
     globally_bound_observations: set[str] = set()
     previous_sequence: int | None = None
     for burst in bursts:
@@ -2152,6 +2192,9 @@ def _verified_tag_burst_observation_ids(
                 raise OfflineLocalizationError("Tag burst frame is invalid.")
             observation_id = frame.get("observation_id")
             frame_id = frame.get("frame_id")
+            bound_node_id = _strict_integer(frame.get("bound_node_id"))
+            frame_timestamp = _strict_number(frame.get("frame_timestamp"))
+            node_timestamp = _strict_number(frame.get("node_timestamp"))
             observation = observations_by_id.get(str(observation_id or ""))
             if (
                 not isinstance(observation_id, str)
@@ -2160,17 +2203,46 @@ def _verified_tag_burst_observation_ids(
                 or observation_id in globally_bound_observations
                 or not isinstance(frame_id, str)
                 or not frame_id
+                or bound_node_id is None
+                or bound_node_id <= 0
+                or frame_timestamp is None
+                or node_timestamp is None
                 or observation is None
                 or observation.get("burst_id") != burst_id
                 or observation.get("frame_id") != frame_id
                 or observation.get("payload") != burst.get("barcode")
                 or observation.get("symbology") != burst.get("symbology")
+                or not _strict_numbers_match(
+                    observation.get("frame_timestamp"), frame_timestamp
+                )
+                or not _strict_numbers_match(
+                    observation.get("node_timebase_frame_timestamp"),
+                    node_timestamp,
+                )
             ):
                 raise OfflineLocalizationError(
                     "Tag burst frame does not match its durable observation."
                 )
+            for explicit_field in ("nearest_node_id", "node_id"):
+                if explicit_field not in observation:
+                    continue
+                if _strict_integer(observation.get(explicit_field)) != bound_node_id:
+                    raise OfflineLocalizationError(
+                        "Tag observation node field conflicts with its verified "
+                        "burst bound node."
+                    )
             member_ids.add(observation_id)
             globally_bound_observations.add(observation_id)
+            frame_authorities[observation_id] = VerifiedTagBurstFrameAuthority(
+                burst_id=burst_id,
+                frame_id=frame_id,
+                observation_id=observation_id,
+                bound_node_id=bound_node_id,
+                frame_timestamp=frame_timestamp,
+                node_timestamp=node_timestamp,
+                payload=str(burst.get("barcode")),
+                symbology=str(burst.get("symbology")),
+            )
         verified[burst_id] = member_ids
     for observation_id, observation in observations_by_id.items():
         burst_id = observation.get("burst_id")
@@ -2186,6 +2258,18 @@ def _verified_tag_burst_observation_ids(
                 "A durable burst-bound observation is missing from the "
                 "verified complete burst set."
             )
+    return verified, frame_authorities
+
+
+def _verified_tag_burst_observation_ids(
+    bursts: Sequence[dict[str, Any]],
+    observations: Sequence[dict[str, Any]],
+) -> dict[str, set[str]]:
+    """Compatibility wrapper returning only verified burst membership."""
+
+    verified, _frame_authorities = _verified_tag_burst_evidence(
+        bursts, observations
+    )
     return verified
 
 
@@ -2542,13 +2626,14 @@ def bind_tag_observation_to_pose(
     expected_map_hashes: set[str],
     expected_floor_id: str,
     maximum_time_delta_seconds: float = 1.5,
+    verified_burst_frame: VerifiedTagBurstFrameAuthority | None = None,
 ) -> TagPoseBinding:
     """Bind one tag observation to a real RTAB-Map node, or fail closed.
 
-    An explicit node ID is authoritative when present. Otherwise the
-    observation's ARFrame timestamp is matched against ``Node.stamp``.  Wall
-    clock timestamps are deliberately ignored. Identity fields are required
-    whenever the session declares the corresponding identity.
+    Manifest-v3 observations use the verified complete burst frame's exact
+    node ID. Optional observation node fields may agree but can never override
+    it. Legacy v1/v2 inputs retain the historical explicit-ID / timestamp
+    behavior. Wall-clock timestamps are deliberately ignored.
     """
     if not isinstance(observation, dict):
         raise OfflineLocalizationError("tag_observation_missing")
@@ -2654,36 +2739,97 @@ def bind_tag_observation_to_pose(
         ):
             raise OfflineLocalizationError("tag_and_observation_raw_position_mismatch")
 
-    explicit_node_id = observation.get("nearest_node_id")
-    if explicit_node_id is None:
-        explicit_node_id = observation.get("node_id")
-    binding_source = "frame_timestamp"
-    if explicit_node_id is not None:
-        if isinstance(explicit_node_id, bool):
-            raise OfflineLocalizationError("tag_observation_node_id_invalid")
-        try:
-            node_id_number = float(explicit_node_id)
-        except (TypeError, ValueError):
-            raise OfflineLocalizationError("tag_observation_node_id_invalid")
-        if not math.isfinite(node_id_number) or not node_id_number.is_integer():
-            raise OfflineLocalizationError("tag_observation_node_id_invalid")
-        node_id = int(node_id_number)
-        matches = [index for index, pose in enumerate(poses) if pose.node_id == node_id]
+    if verified_burst_frame is not None:
+        observation_id = observation.get("observation_id")
+        if (
+            observation_id != verified_burst_frame.observation_id
+            or observation.get("burst_id") != verified_burst_frame.burst_id
+            or observation.get("frame_id") != verified_burst_frame.frame_id
+            or observation.get("payload") != verified_burst_frame.payload
+            or observation.get("symbology") != verified_burst_frame.symbology
+            or not _strict_numbers_match(
+                observation.get("frame_timestamp"),
+                verified_burst_frame.frame_timestamp,
+            )
+            or not _strict_numbers_match(
+                observation_timestamp,
+                verified_burst_frame.node_timestamp,
+            )
+        ):
+            raise OfflineLocalizationError(
+                "tag_observation_verified_burst_frame_mismatch"
+            )
+        for explicit_field in ("nearest_node_id", "node_id"):
+            if explicit_field not in observation:
+                continue
+            if (
+                _strict_integer(observation.get(explicit_field))
+                != verified_burst_frame.bound_node_id
+            ):
+                raise OfflineLocalizationError(
+                    "tag_observation_verified_burst_node_override"
+                )
+        matches = [
+            index
+            for index, pose in enumerate(poses)
+            if pose.node_id == verified_burst_frame.bound_node_id
+        ]
         if not matches:
-            raise OfflineLocalizationError("tag_observation_node_id_not_found")
+            raise OfflineLocalizationError(
+                "tag_observation_verified_burst_node_id_not_found"
+            )
         if len(matches) != 1:
-            raise OfflineLocalizationError("tag_observation_node_id_ambiguous")
+            raise OfflineLocalizationError(
+                "tag_observation_verified_burst_node_id_ambiguous"
+            )
         index = matches[0]
-        binding_source = "nearest_node_id"
+        binding_source = "verified_burst_bound_node_id"
     else:
-        index = _nearest_pose_index(poses, observation_timestamp)
+        explicit_node_id = observation.get("nearest_node_id")
+        if explicit_node_id is None:
+            explicit_node_id = observation.get("node_id")
+        binding_source = "frame_timestamp"
+        if explicit_node_id is not None:
+            if isinstance(explicit_node_id, bool):
+                raise OfflineLocalizationError("tag_observation_node_id_invalid")
+            try:
+                node_id_number = float(explicit_node_id)
+            except (TypeError, ValueError):
+                raise OfflineLocalizationError("tag_observation_node_id_invalid")
+            if not math.isfinite(node_id_number) or not node_id_number.is_integer():
+                raise OfflineLocalizationError("tag_observation_node_id_invalid")
+            node_id = int(node_id_number)
+            matches = [index for index, pose in enumerate(poses) if pose.node_id == node_id]
+            if not matches:
+                raise OfflineLocalizationError("tag_observation_node_id_not_found")
+            if len(matches) != 1:
+                raise OfflineLocalizationError("tag_observation_node_id_ambiguous")
+            index = matches[0]
+            binding_source = "nearest_node_id"
+        else:
+            index = _nearest_pose_index(poses, observation_timestamp)
 
     node_timestamp_value = poses[index].timestamp
     if node_timestamp_value is None or not math.isfinite(float(node_timestamp_value)):
         raise OfflineLocalizationError("tag_observation_bound_node_stamp_invalid")
     node_timestamp = float(node_timestamp_value)
+    if verified_burst_frame is not None and (
+        abs(node_timestamp - verified_burst_frame.node_timestamp)
+        > TAG_EVIDENCE_MAXIMUM_NODE_TIME_DELTA_SECONDS
+    ):
+        raise OfflineLocalizationError(
+            "tag_observation_verified_burst_node_stamp_mismatch"
+        )
     time_delta = abs(observation_timestamp - node_timestamp)
-    if time_delta > maximum_time_delta_seconds:
+    effective_maximum_delta = (
+        min(
+            maximum_time_delta_seconds,
+            TAG_EVIDENCE_MAXIMUM_NODE_TIME_DELTA_SECONDS,
+        )
+        if verified_burst_frame is not None
+        else maximum_time_delta_seconds
+    )
+    if time_delta > effective_maximum_delta:
         raise OfflineLocalizationError("tag_observation_node_time_delta_exceeded")
     return TagPoseBinding(
         node_index=index,
@@ -2692,7 +2838,6 @@ def bind_tag_observation_to_pose(
         time_delta_seconds=time_delta,
         binding_source=binding_source,
     )
-
 
 def bind_manual_localization_event_to_pose(
     poses: Sequence[Pose],
@@ -4815,7 +4960,10 @@ def _render_localized_version(
     # snapshot. The tag bytes and the JSONL records below are the exact
     # bytes that produced the manifest identities, so the bundle SHA always
     # describes what localization actually parsed.
-    verified_burst_observation_ids = _verified_tag_burst_observation_ids(
+    (
+        verified_burst_observation_ids,
+        verified_burst_frame_authorities,
+    ) = _verified_tag_burst_evidence(
         input_snapshot.jsonl_values.get("tag_observation_bursts.jsonl", []),
         input_snapshot.jsonl_values.get("tag_observations.jsonl", []),
     )
@@ -5185,6 +5333,19 @@ def _render_localized_version(
         tag = _apply_on_device_confirmation_authority(dict(tag))
         observation = observations_by_id.get(str(tag.get("observation_id")))
         try:
+            verified_burst_frame = None
+            # Manifest v3 means the session contains verified burst evidence;
+            # it does not retroactively convert every historical v1 tag in the
+            # same finalized file into a burst-bound v2 confirmation. Only v2
+            # tags use the complete burst frame as their exact node authority.
+            if input_manifest_version == 3 and tag.get("version") == 2:
+                verified_burst_frame = verified_burst_frame_authorities.get(
+                    str(tag.get("observation_id") or "")
+                )
+                if verified_burst_frame is None:
+                    raise OfflineLocalizationError(
+                        "tag_observation_verified_burst_frame_missing"
+                    )
             binding = bind_tag_observation_to_pose(
                 baseline,
                 observation,
@@ -5193,6 +5354,7 @@ def _render_localized_version(
                 expected_map_hashes=expected_map_hashes,
                 expected_floor_id=expected_floor_id,
                 maximum_time_delta_seconds=max_node_time_delta_seconds,
+                verified_burst_frame=verified_burst_frame,
             )
         except OfflineLocalizationError as exc:
             reason = str(exc)

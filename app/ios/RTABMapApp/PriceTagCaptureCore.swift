@@ -183,6 +183,12 @@ enum PriceTagBarcodeSelection: Equatable {
 }
 
 enum PriceTagBarcodeSelector {
+    /// Vision can occasionally return duplicate observations for the same
+    /// physical symbol. Only nearly coincident boxes are detector duplicates;
+    /// equal payload text at a different position is still a second physical
+    /// barcode and must participate in the ambiguity gate.
+    private static let duplicateObservationIoU = 0.85
+
     static func select(
         candidates: [PriceTagBarcodeCandidate],
         regionOfInterest roi: CGRect,
@@ -195,7 +201,7 @@ enum PriceTagBarcodeSelector {
         }
         let roiCenter = CGPoint(x: roi.midX, y: roi.midY)
         let halfDiagonal = max(1.0e-9, hypot(roi.width, roi.height) / 2)
-        var bestByIdentity: [String: PriceTagSelectedBarcode] = [:]
+        var physicalCandidates: [PriceTagSelectedBarcode] = []
         for value in candidates {
             let payload = value.payload.trimmingCharacters(
                 in: .whitespacesAndNewlines)
@@ -237,18 +243,36 @@ enum PriceTagBarcodeSelector {
                 centerProximity: centerProximity,
                 normalizedArea: normalizedArea,
                 score: score)
-            let identity = payload + "\u{0}" + value.symbology
-            if bestByIdentity[identity] == nil
-                || selected.score > bestByIdentity[identity]!.score {
-                bestByIdentity[identity] = selected
+            if let duplicateIndex = physicalCandidates.firstIndex(where: {
+                $0.candidate.payload == payload
+                    && $0.candidate.symbology == value.symbology
+                    && intersectionOverUnion(
+                        $0.candidate.visionBounds,
+                        value.visionBounds) >= duplicateObservationIoU
+            }) {
+                if selected.score > physicalCandidates[duplicateIndex].score {
+                    physicalCandidates[duplicateIndex] = selected
+                }
+            }
+            else {
+                physicalCandidates.append(selected)
             }
         }
-        let ranked = bestByIdentity.values.sorted {
+        let ranked = physicalCandidates.sorted {
             if $0.score != $1.score { return $0.score > $1.score }
             if $0.candidate.payload != $1.candidate.payload {
                 return $0.candidate.payload < $1.candidate.payload
             }
-            return $0.candidate.symbology < $1.candidate.symbology
+            if $0.candidate.symbology != $1.candidate.symbology {
+                return $0.candidate.symbology < $1.candidate.symbology
+            }
+            if $0.candidate.visionBounds.minX
+                != $1.candidate.visionBounds.minX {
+                return $0.candidate.visionBounds.minX
+                    < $1.candidate.visionBounds.minX
+            }
+            return $0.candidate.visionBounds.minY
+                < $1.candidate.visionBounds.minY
         }
         guard let first = ranked.first else { return .none }
         if ranked.count > 1,
@@ -256,6 +280,20 @@ enum PriceTagBarcodeSelector {
             return .ambiguous(Array(ranked.prefix(3)))
         }
         return .selected(first)
+    }
+
+    private static func intersectionOverUnion(
+        _ first: CGRect,
+        _ second: CGRect
+    ) -> CGFloat {
+        let intersection = first.intersection(second)
+        guard !intersection.isNull, !intersection.isEmpty else { return 0 }
+        let intersectionArea = intersection.width * intersection.height
+        let unionArea = first.width * first.height
+            + second.width * second.height
+            - intersectionArea
+        guard unionArea > 0 else { return 0 }
+        return intersectionArea / unionArea
     }
 }
 
@@ -265,6 +303,7 @@ struct PriceTagCapturePolicy: Equatable {
     let targetEvidenceFrames: Int
     let minimumCaptureDuration: TimeInterval
     let maximumCaptureDuration: TimeInterval
+    let maximumVisionRequestDuration: TimeInterval
     let visionRateHz: Double
     let previewRateHz: Double
     let minimumROIIntersectionRatio: Double
@@ -278,6 +317,7 @@ struct PriceTagCapturePolicy: Equatable {
         targetEvidenceFrames: 4,
         minimumCaptureDuration: 0.30,
         maximumCaptureDuration: 2.0,
+        maximumVisionRequestDuration: 1.0,
         visionRateHz: 8,
         previewRateHz: 24,
         minimumROIIntersectionRatio: 0.80,
@@ -333,6 +373,159 @@ struct PriceTagVisionSubmission: Equatable {
     let geometry: PriceTagCaptureGeometry
 }
 
+/// Scanner-local admission authority for one asynchronous Vision request.
+///
+/// A capture generation alone is not sufficient when a request can hang past
+/// the collection deadline and the same generation returns to `aiming`. A
+/// restart therefore revokes the old request ID while keeping the generation
+/// active. The eventual old callback cannot clear or complete the fresh
+/// request that replaced it.
+struct PriceTagVisionRequestTokenGate {
+    private(set) var activeGeneration: UUID?
+    private(set) var activeRequestID: UUID?
+
+    mutating func activate(generation: UUID) {
+        activeGeneration = generation
+        activeRequestID = nil
+    }
+
+    mutating func cancel(generation: UUID? = nil) {
+        guard generation == nil || generation == activeGeneration else {
+            return
+        }
+        activeGeneration = nil
+        activeRequestID = nil
+    }
+
+    @discardableResult
+    mutating func restart(generation: UUID) -> Bool {
+        guard activeGeneration == generation else { return false }
+        activeRequestID = nil
+        return true
+    }
+
+    mutating func beginRequest(generation: UUID) -> UUID? {
+        guard activeGeneration == generation,
+              activeRequestID == nil else {
+            return nil
+        }
+        let requestID = UUID()
+        activeRequestID = requestID
+        return requestID
+    }
+
+    mutating func completeRequest(
+        generation: UUID,
+        requestID: UUID
+    ) -> Bool {
+        guard activeGeneration == generation,
+              activeRequestID == requestID else {
+            return false
+        }
+        activeRequestID = nil
+        return true
+    }
+}
+
+struct PriceTagVisionWorkerExecutorSnapshot: Equatable {
+    let availableWorkers: Int
+    let activeWorkers: Int
+    let quarantinedWorkers: Int
+}
+
+/// A bounded executor that lets one replacement Vision request actually run
+/// when a prior synchronous `perform()` call fails to return. Normal operation
+/// uses one lane. A timed-out/cancelled lane is quarantined until its work
+/// returns; at most one spare lane exists, so repeated hangs fail closed
+/// instead of creating an unbounded queue or thread population.
+final class PriceTagVisionWorkerExecutor {
+    private enum WorkerState: Equatable {
+        case available
+        case active(requestID: UUID)
+        case quarantined(requestID: UUID)
+    }
+
+    private let lock = NSLock()
+    private let queues: [DispatchQueue]
+    private var states: [WorkerState]
+
+    init(
+        maximumWorkers: Int = 2,
+        labelPrefix: String = "com.introlab.rtabmap.price-tag-vision"
+    ) {
+        precondition(maximumWorkers > 0)
+        states = Array(repeating: .available, count: maximumWorkers)
+        queues = (0..<maximumWorkers).map { index in
+            DispatchQueue(
+                label: "\(labelPrefix).worker-\(index)",
+                qos: .userInitiated)
+        }
+    }
+
+    @discardableResult
+    func submit(
+        requestID: UUID,
+        _ body: @escaping () -> Void
+    ) -> Bool {
+        lock.lock()
+        guard let workerIndex = states.firstIndex(of: .available) else {
+            lock.unlock()
+            return false
+        }
+        states[workerIndex] = .active(requestID: requestID)
+        let queue = queues[workerIndex]
+        lock.unlock()
+        queue.async {
+            body()
+            self.lock.lock()
+            switch self.states[workerIndex] {
+            case .active(let activeID) where activeID == requestID:
+                self.states[workerIndex] = .available
+            case .quarantined(let activeID) where activeID == requestID:
+                self.states[workerIndex] = .available
+            default:
+                break
+            }
+            self.lock.unlock()
+        }
+        return true
+    }
+
+    @discardableResult
+    func quarantine(requestID: UUID) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let workerIndex = states.firstIndex(
+            of: .active(requestID: requestID)) else {
+            return false
+        }
+        states[workerIndex] = .quarantined(requestID: requestID)
+        return true
+    }
+
+    func snapshot() -> PriceTagVisionWorkerExecutorSnapshot {
+        lock.lock()
+        defer { lock.unlock() }
+        var available = 0
+        var active = 0
+        var quarantined = 0
+        for state in states {
+            switch state {
+            case .available:
+                available += 1
+            case .active:
+                active += 1
+            case .quarantined:
+                quarantined += 1
+            }
+        }
+        return PriceTagVisionWorkerExecutorSnapshot(
+            availableWorkers: available,
+            activeWorkers: active,
+            quarantinedWorkers: quarantined)
+    }
+}
+
 enum PriceTagCaptureVisionAction: Equatable {
     case ignored
     case keepAiming(code: String)
@@ -342,8 +535,14 @@ enum PriceTagCaptureVisionAction: Equatable {
     case duplicateCompleted(payload: String)
     case multipleBarcodes
     case targetChanged(previousCaptureID: UUID, payload: String)
+    case requestTimedOut(frameTimestamp: TimeInterval)
     case resolve(captureID: UUID, observationIDs: [String])
-    case timedOut(captureID: UUID)
+    /// `revokeVisionRequest` is true only for the synchronous ARFrame-deadline
+    /// path that just revoked coordinator admission while a scanner request
+    /// may still be running. Callback/evidence completion paths have already
+    /// completed their exact scanner request and must not restart by generation
+    /// later, because that could cancel a fresh same-generation request.
+    case timedOut(captureID: UUID, revokeVisionRequest: Bool)
 }
 
 enum PriceTagCaptureEvidenceAction: Equatable {
@@ -352,6 +551,171 @@ enum PriceTagCaptureEvidenceAction: Equatable {
     case resolve(captureID: UUID, observationIDs: [String])
     case timedOut(captureID: UUID)
     case requiredEvidenceFailed(captureID: UUID)
+}
+
+enum PriceTagCaptureTrackingDisposition: Equatable {
+    case allow
+    case pause(reason: String)
+    case cancel(reason: String)
+}
+
+/// One shared fail-closed policy for the ARKit and prior-map states that may
+/// authorize barcode evidence. Hard tracking/localization loss invalidates the
+/// workflow; the two recoverable ARKit limited states pause new submissions
+/// without stopping the underlying AR/RTAB-Map scan.
+enum PriceTagCaptureTrackingGate {
+    static func evaluate(
+        trackingState: String,
+        localizationState: String?
+    ) -> PriceTagCaptureTrackingDisposition {
+        if localizationState == "lost" {
+            return .cancel(reason: "prior_map_localization_lost")
+        }
+        switch trackingState {
+        case "normal":
+            return .allow
+        case "limited.excessiveMotion":
+            return .pause(reason: "arkit_tracking_excessive_motion")
+        case "limited.insufficientFeatures":
+            return .pause(reason: "arkit_tracking_insufficient_features")
+        case "notAvailable":
+            return .cancel(reason: "arkit_tracking_not_available")
+        case "limited.initializing":
+            return .cancel(reason: "arkit_tracking_initializing")
+        case "limited.relocalizing":
+            return .cancel(reason: "arkit_tracking_relocalizing")
+        default:
+            return .cancel(reason: "arkit_tracking_unknown")
+        }
+    }
+}
+
+struct PriceTagCaptureContinuitySample: Equatable {
+    let generation: UUID
+    let capturedAtMonotonic: TimeInterval
+    let frameTimestamp: TimeInterval
+    let trackingSessionID: String
+    let mappingActive: Bool
+    let dataRecording: Bool
+    let nativePipelineAvailable: Bool
+    let databaseWriterReady: Bool
+    let databaseIdentity: String?
+    let clockWriterReady: Bool
+    let sessionFinalizing: Bool
+    let localizationRequiredWriteFailed: Bool
+    let sensorPoseCount: Int
+    let odometrySubmissionCount: UInt64
+    let mapNodeCount: Int
+    /// Audit-only. SQLite checkpointing can legitimately reduce the WAL and
+    /// total byte count, so this value is never treated as monotonic evidence.
+    let databaseBytes: UInt64
+    let clockBoundNodeID: Int
+    let localizationTraceCount: Int
+    let localizationConstraintCount: Int
+}
+
+enum PriceTagCaptureContinuityAssessment: Equatable {
+    case passed
+    case notEvaluable(reasons: [String])
+    case failed(reasons: [String])
+}
+
+enum PriceTagCaptureContinuityEvaluator {
+    /// The prior-map trace is intentionally rate-limited to 2 Hz. Shorter
+    /// workflows cannot honestly prove that every asynchronous channel moved.
+    static let minimumEvaluationDuration: TimeInterval = 0.75
+
+    static func evaluate(
+        start: PriceTagCaptureContinuitySample,
+        end: PriceTagCaptureContinuitySample
+    ) -> PriceTagCaptureContinuityAssessment {
+        var failures: [String] = []
+        let duration = end.capturedAtMonotonic - start.capturedAtMonotonic
+        if !duration.isFinite || duration < 0 {
+            failures.append("invalid_monotonic_duration")
+        }
+        if start.generation != end.generation {
+            failures.append("capture_generation_changed")
+        }
+        if start.trackingSessionID.isEmpty
+            || start.trackingSessionID != end.trackingSessionID {
+            failures.append("tracking_session_changed")
+        }
+        if !start.mappingActive || !end.mappingActive {
+            failures.append("mapping_state_inactive")
+        }
+        if start.dataRecording || end.dataRecording {
+            failures.append("data_recording_mode_active")
+        }
+        if !start.nativePipelineAvailable || !end.nativePipelineAvailable {
+            failures.append("native_pipeline_unavailable")
+        }
+        if !start.databaseWriterReady || !end.databaseWriterReady {
+            failures.append("database_writer_unavailable")
+        }
+        if start.databaseIdentity == nil
+            || start.databaseIdentity != end.databaseIdentity {
+            failures.append("database_identity_changed")
+        }
+        if !start.clockWriterReady || !end.clockWriterReady {
+            failures.append("clock_writer_unavailable")
+        }
+        if start.sessionFinalizing || end.sessionFinalizing {
+            failures.append("session_finalization_active")
+        }
+        if start.localizationRequiredWriteFailed
+            || end.localizationRequiredWriteFailed {
+            failures.append("required_localization_write_failed")
+        }
+        if end.frameTimestamp < start.frameTimestamp {
+            failures.append("frame_timestamp_regressed")
+        }
+        if end.sensorPoseCount < start.sensorPoseCount {
+            failures.append("sensor_pose_count_regressed")
+        }
+        if end.odometrySubmissionCount < start.odometrySubmissionCount {
+            failures.append("odometry_submission_count_regressed")
+        }
+        if end.mapNodeCount < start.mapNodeCount {
+            failures.append("map_node_count_regressed")
+        }
+        if end.clockBoundNodeID < start.clockBoundNodeID {
+            failures.append("clock_node_binding_regressed")
+        }
+        if end.localizationTraceCount < start.localizationTraceCount {
+            failures.append("localization_trace_count_regressed")
+        }
+        if end.localizationConstraintCount
+            < start.localizationConstraintCount {
+            failures.append("localization_constraint_count_regressed")
+        }
+        if !failures.isEmpty {
+            return .failed(reasons: failures)
+        }
+        guard duration >= minimumEvaluationDuration else {
+            return .notEvaluable(
+                reasons: ["capture_duration_below_evaluation_window"])
+        }
+        if end.frameTimestamp <= start.frameTimestamp {
+            failures.append("frame_timestamp_did_not_advance")
+        }
+        if end.sensorPoseCount == start.sensorPoseCount {
+            failures.append("sensor_pose_did_not_advance")
+        }
+        if end.odometrySubmissionCount == start.odometrySubmissionCount {
+            failures.append("odometry_submission_did_not_advance")
+        }
+        if end.localizationTraceCount == start.localizationTraceCount {
+            failures.append("localization_trace_did_not_advance")
+        }
+        if end.mapNodeCount > start.mapNodeCount,
+           end.clockBoundNodeID == start.clockBoundNodeID {
+            failures.append("new_map_node_missing_clock_binding")
+        }
+        return failures.isEmpty
+            ? .passed
+            : .failed(reasons: failures)
+    }
 }
 
 struct PriceTagCaptureCancellation: Equatable {
@@ -673,11 +1037,13 @@ final class PriceTagCaptureCoordinator {
     private var stateValue = PriceTagCaptureState.idle
     private var geometryValue: PriceTagCaptureGeometry?
     private var visionInFlight = false
+    private var visionInFlightFrameTimestamp: TimeInterval?
     private var evidenceInFlight = false
     private var lastVisionSubmission = -Double.infinity
     private var lastPreviewSubmission = -Double.infinity
     private var candidateLastFrameTimestamp = -Double.infinity
     private var captureStartedAt = -Double.infinity
+    private var deadlinePending = false
     private var pendingEvidenceFrameTimestamp: TimeInterval?
     private var acceptedFrameTimestamps = Set<TimeInterval>()
     private var acceptedObservationIDs: [String] = []
@@ -791,16 +1157,58 @@ final class PriceTagCaptureCoordinator {
               frameTimestamp.isFinite,
               !visionInFlight,
               !evidenceInFlight,
+              !deadlinePending,
               isDetectionStateLocked(),
               frameTimestamp - lastVisionSubmission
                 >= 1 / max(1, policy.visionRateHz) else {
             return nil
         }
         visionInFlight = true
+        visionInFlightFrameTimestamp = frameTimestamp
         lastVisionSubmission = frameTimestamp
         return PriceTagVisionSubmission(
             generation: generation,
             geometry: geometry)
+    }
+
+    /// Independent ARFrame-driven deadline. It does not depend on a successful
+    /// Vision request or evidence callback. A Vision request still running at
+    /// the deadline loses coordinator admission immediately, so its late
+    /// callback is ignored. If one evidence frame is already in flight, the
+    /// deadline is latched and that exact frame is allowed to reach the
+    /// linearized durable boundary before the final resolve/timeout choice.
+    func tickDeadline(
+        frameTimestamp: TimeInterval
+    ) -> PriceTagCaptureVisionAction {
+        lock.lock()
+        defer { lock.unlock() }
+        guard frameTimestamp.isFinite else { return .ignored }
+        if let requestTimestamp = visionInFlightFrameTimestamp,
+           frameTimestamp - requestTimestamp
+                >= policy.maximumVisionRequestDuration {
+            visionInFlight = false
+            visionInFlightFrameTimestamp = nil
+            return .requestTimedOut(frameTimestamp: requestTimestamp)
+        }
+        guard case .collecting(
+                let generation, let captureID, _, _, _, _) = stateValue,
+              frameTimestamp - captureStartedAt
+                >= policy.maximumCaptureDuration else {
+            return .ignored
+        }
+        deadlinePending = true
+        // Vision has not crossed the evidence persistence boundary. Revoking
+        // its in-flight bit makes the eventual callback generation-current but
+        // admission-stale, which finishVision() rejects without side effects.
+        visionInFlight = false
+        visionInFlightFrameTimestamp = nil
+        guard !evidenceInFlight else {
+            return .ignored
+        }
+        return finishDeadlineLocked(
+            generation: generation,
+            captureID: captureID,
+            revokeVisionRequest: true)
     }
 
     func finishVision(
@@ -811,10 +1219,13 @@ final class PriceTagCaptureCoordinator {
     ) -> PriceTagCaptureVisionAction {
         lock.lock()
         defer { lock.unlock() }
-        guard stateValue.generation == generation, visionInFlight else {
+        guard stateValue.generation == generation,
+              visionInFlight,
+              visionInFlightFrameTimestamp == frameTimestamp else {
             return .ignored
         }
         visionInFlight = false
+        visionInFlightFrameTimestamp = nil
         let selection = PriceTagBarcodeSelector.select(
             candidates: candidates,
             regionOfInterest: regionOfInterest,
@@ -828,34 +1239,18 @@ final class PriceTagCaptureCoordinator {
                 candidateLastFrameTimestamp = -Double.infinity
             }
             if case .collecting(_, let captureID, _, _, _, _) = stateValue,
-               frameTimestamp - captureStartedAt >= policy.maximumCaptureDuration {
-                if acceptedObservationIDs.count >= policy.minimumEvidenceFrames {
-                    stateValue = .resolving(
-                        generation: generation,
-                        captureID: captureID)
-                    return .resolve(
-                        captureID: captureID,
-                        observationIDs: acceptedObservationIDs)
-                }
-                stateValue = .aiming(generation: generation)
-                resetCollectionLocked()
-                return .timedOut(captureID: captureID)
+               deadlineReachedLocked(frameTimestamp: frameTimestamp) {
+                return finishDeadlineLocked(
+                    generation: generation,
+                    captureID: captureID)
             }
             return .keepAiming(code: "price_tag_roi_miss")
         case .ambiguous:
             if case .collecting(_, let captureID, _, _, _, _) = stateValue,
-               frameTimestamp - captureStartedAt >= policy.maximumCaptureDuration {
-                if acceptedObservationIDs.count >= policy.minimumEvidenceFrames {
-                    stateValue = .resolving(
-                        generation: generation,
-                        captureID: captureID)
-                    return .resolve(
-                        captureID: captureID,
-                        observationIDs: acceptedObservationIDs)
-                }
-                stateValue = .aiming(generation: generation)
-                resetCollectionLocked()
-                return .timedOut(captureID: captureID)
+               deadlineReachedLocked(frameTimestamp: frameTimestamp) {
+                return finishDeadlineLocked(
+                    generation: generation,
+                    captureID: captureID)
             }
             if case .candidate = stateValue {
                 stateValue = .aiming(generation: generation)
@@ -936,6 +1331,11 @@ final class PriceTagCaptureCoordinator {
                 _, _):
                 guard payload == activePayload,
                       symbology == activeSymbology else {
+                    if deadlinePending {
+                        return finishDeadlineLocked(
+                            generation: generation,
+                            captureID: captureID)
+                    }
                     stateValue = .candidate(
                         generation: generation,
                         payload: payload,
@@ -950,6 +1350,11 @@ final class PriceTagCaptureCoordinator {
                 }
                 guard !acceptedFrameTimestamps.contains(frameTimestamp),
                       pendingEvidenceFrameTimestamp != frameTimestamp else {
+                    if deadlinePending {
+                        return finishDeadlineLocked(
+                            generation: generation,
+                            captureID: captureID)
+                    }
                     return .keepAiming(code: "price_tag_duplicate_capture_frame")
                 }
                 pendingEvidenceFrameTimestamp = frameTimestamp
@@ -961,14 +1366,54 @@ final class PriceTagCaptureCoordinator {
         }
     }
 
-    func failVision(generation: UUID) {
+    func failVision(
+        generation: UUID,
+        frameTimestamp: TimeInterval
+    ) {
         lock.lock()
-        guard stateValue.generation == generation else {
+        guard stateValue.generation == generation,
+              visionInFlightFrameTimestamp == frameTimestamp else {
             lock.unlock()
             return
         }
         visionInFlight = false
+        visionInFlightFrameTimestamp = nil
         lock.unlock()
+    }
+
+    /// Linearizes the last generation/capture/frame check with the durable
+    /// observation append. Without this boundary, cancellation can flush the
+    /// pending burst after a callback's last generation check but before its
+    /// append; that stale callback could then create a second pending burst
+    /// with the same capture ID and make the finalized evidence ambiguous.
+    ///
+    /// The body must not call back into this coordinator. It is intentionally
+    /// executed while the coordinator lock is held so cancellation has only
+    /// two safe orders: win before the append (body is skipped), or wait until
+    /// the append has joined the still-active burst.
+    @discardableResult
+    func performEvidenceCommitIfCurrent(
+        generation: UUID,
+        captureID: UUID,
+        frameTimestamp: TimeInterval,
+        priorMapGeneration: UUID,
+        _ body: () -> Void
+    ) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard case .collecting(
+                let currentGeneration, let currentCaptureID,
+                _, _, _, _) = stateValue,
+              currentGeneration == generation,
+              currentCaptureID == captureID,
+              capturePriorMapAuthorityValue?.priorMapGeneration
+                == priorMapGeneration,
+              evidenceInFlight,
+              pendingEvidenceFrameTimestamp == frameTimestamp else {
+            return false
+        }
+        body()
+        return true
     }
 
     func finishEvidence(
@@ -1008,7 +1453,8 @@ final class PriceTagCaptureCoordinator {
         let duration = frameTimestamp - captureStartedAt
         let reachedTarget = accepted >= policy.targetEvidenceFrames
             && duration >= policy.minimumCaptureDuration
-        let reachedDeadline = duration >= policy.maximumCaptureDuration
+        let reachedDeadline = deadlinePending
+            || duration >= policy.maximumCaptureDuration
         if reachedTarget
             || (reachedDeadline && accepted >= policy.minimumEvidenceFrames) {
             stateValue = .resolving(
@@ -1193,15 +1639,45 @@ final class PriceTagCaptureCoordinator {
 
     private func resetCollectionLocked() {
         captureStartedAt = -Double.infinity
+        deadlinePending = false
         pendingEvidenceFrameTimestamp = nil
         acceptedFrameTimestamps.removeAll(keepingCapacity: true)
         acceptedObservationIDs.removeAll(keepingCapacity: true)
         evidenceInFlight = false
     }
 
+    private func deadlineReachedLocked(
+        frameTimestamp: TimeInterval
+    ) -> Bool {
+        return deadlinePending
+            || frameTimestamp - captureStartedAt
+                >= policy.maximumCaptureDuration
+    }
+
+    private func finishDeadlineLocked(
+        generation: UUID,
+        captureID: UUID,
+        revokeVisionRequest: Bool = false
+    ) -> PriceTagCaptureVisionAction {
+        if acceptedObservationIDs.count >= policy.minimumEvidenceFrames {
+            stateValue = .resolving(
+                generation: generation,
+                captureID: captureID)
+            return .resolve(
+                captureID: captureID,
+                observationIDs: acceptedObservationIDs)
+        }
+        stateValue = .aiming(generation: generation)
+        resetCollectionLocked()
+        return .timedOut(
+            captureID: captureID,
+            revokeVisionRequest: revokeVisionRequest)
+    }
+
     private func resetTransientLocked(keepingState: Bool = false) {
         geometryValue = keepingState ? geometryValue : nil
         visionInFlight = false
+        visionInFlightFrameTimestamp = nil
         lastVisionSubmission = -Double.infinity
         lastPreviewSubmission = -Double.infinity
         candidateLastFrameTimestamp = -Double.infinity

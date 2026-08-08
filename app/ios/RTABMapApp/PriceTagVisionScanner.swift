@@ -48,6 +48,7 @@ struct PriceTagVisionScanResult {
 enum PriceTagVisionScannerError: Error, LocalizedError {
     case invalidRegionOfInterest
     case requestFailed(String)
+    case workerCapacityExhausted
 
     var errorDescription: String? {
         switch self {
@@ -55,32 +56,49 @@ enum PriceTagVisionScannerError: Error, LocalizedError {
             return "price_tag_roi_invalid"
         case .requestFailed:
             return "price_tag_vision_request_failed"
+        case .workerCapacityExhausted:
+            return "price_tag_vision_worker_capacity_exhausted"
         }
     }
 }
 
 final class PriceTagVisionScanner {
-    private let queue = DispatchQueue(
-        label: "com.introlab.rtabmap.price-tag-vision",
-        qos: .userInitiated)
     private let lock = NSLock()
-    private var inFlight = false
-    private var activeGeneration: UUID?
+    private let workerExecutor = PriceTagVisionWorkerExecutor(
+        maximumWorkers: 2)
+    private var requestTokens = PriceTagVisionRequestTokenGate()
+    private var activeRequests: [UUID: VNDetectBarcodesRequest] = [:]
 
     func activate(generation: UUID) {
         lock.lock()
-        activeGeneration = generation
-        inFlight = false
+        abandonActiveRequestLocked()
+        requestTokens.activate(generation: generation)
         lock.unlock()
     }
 
     func cancel(generation: UUID? = nil) {
         lock.lock()
-        if generation == nil || generation == activeGeneration {
-            activeGeneration = nil
-            inFlight = false
+        if generation == nil || generation == requestTokens.activeGeneration {
+            abandonActiveRequestLocked()
         }
+        requestTokens.cancel(generation: generation)
         lock.unlock()
+    }
+
+    /// Revokes a request that exceeded the coordinator deadline without
+    /// ending the capture generation. A fresh request may then be submitted
+    /// while the old Vision callback is rejected by its stale request ID.
+    @discardableResult
+    func restart(generation: UUID) -> Bool {
+        lock.lock()
+        guard requestTokens.activeGeneration == generation else {
+            lock.unlock()
+            return false
+        }
+        abandonActiveRequestLocked()
+        let restarted = requestTokens.restart(generation: generation)
+        lock.unlock()
+        return restarted
     }
 
     @discardableResult
@@ -100,27 +118,26 @@ final class PriceTagVisionScanner {
             completion(.failure(PriceTagVisionScannerError.invalidRegionOfInterest))
             return false
         }
+        let request = VNDetectBarcodesRequest()
+        request.symbologies = [
+            .QR,
+            .EAN8,
+            .EAN13,
+            .Code128,
+            .UPCE,
+            .PDF417,
+        ]
+        request.regionOfInterest = regionOfInterest
         lock.lock()
-        guard activeGeneration == generation, !inFlight else {
+        guard let requestID = requestTokens.beginRequest(
+                generation: generation) else {
             lock.unlock()
             return false
         }
-        inFlight = true
-        lock.unlock()
-
-        queue.async {
+        activeRequests[requestID] = request
+        let started = workerExecutor.submit(requestID: requestID) {
             let result: Result<PriceTagVisionScanResult, Error>
             do {
-                let request = VNDetectBarcodesRequest()
-                request.symbologies = [
-                    .QR,
-                    .EAN8,
-                    .EAN13,
-                    .Code128,
-                    .UPCE,
-                    .PDF417,
-                ]
-                request.regionOfInterest = regionOfInterest
                 let handler = VNImageRequestHandler(
                     cvPixelBuffer: frame.capturedImage,
                     orientation: orientation,
@@ -152,15 +169,43 @@ final class PriceTagVisionScanner {
             }
 
             self.lock.lock()
-            guard generation == self.activeGeneration else {
-                self.lock.unlock()
-                return
-            }
-            self.inFlight = false
+            self.activeRequests.removeValue(forKey: requestID)
+            let accepted = self.requestTokens.completeRequest(
+                generation: generation,
+                requestID: requestID)
             self.lock.unlock()
-            completion(result)
+            if accepted {
+                completion(result)
+            }
         }
+        guard started else {
+            activeRequests.removeValue(forKey: requestID)
+            _ = requestTokens.completeRequest(
+                generation: generation,
+                requestID: requestID)
+            lock.unlock()
+            completion(.failure(
+                PriceTagVisionScannerError.workerCapacityExhausted))
+            return true
+        }
+        lock.unlock()
         return true
+    }
+
+    /// Must be called with `lock` held. Cancelling the Vision request is best
+    /// effort; the worker lane remains quarantined until synchronous
+    /// `perform()` actually returns, so a truly wedged request cannot receive
+    /// another queued job or mutate the replacement request's token.
+    private func abandonActiveRequestLocked() {
+        guard let generation = requestTokens.activeGeneration,
+              let requestID = requestTokens.activeRequestID else {
+            return
+        }
+        activeRequests[requestID]?.cancel()
+        _ = workerExecutor.quarantine(requestID: requestID)
+        _ = requestTokens.completeRequest(
+            generation: generation,
+            requestID: requestID)
     }
 
     static func captureOrientation(

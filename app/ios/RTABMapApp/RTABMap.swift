@@ -340,7 +340,7 @@ class RTABMap {
         orientation: UIInterfaceOrientation,
         viewport: CGSize,
         poseOverride: simd_float4x4? = nil
-    ) {
+    ) -> Bool {
         // The image/depth calibration still comes from the ARFrame. Only the
         // global VIO pose may be rebased to remove an impossible ARKit jump.
         let pose = poseOverride ?? frame.camera.transform
@@ -355,6 +355,7 @@ class RTABMap {
         let depthMap = frame.sceneDepth?.depthMap
         let points = frame.rawFeaturePoints?.points
 
+        var submitted = false
         if points != nil && (depthMap != nil || points!.count>0)
         {
             var v = frame.camera.viewMatrix(for: orientation)
@@ -472,6 +473,7 @@ class RTABMap {
                                         v[3,0], v[3,1], v[3,2], quatv.x, quatv.y, quatv.z, quatv.w,
                                         p[0,0], p[1,1], p[2,0], p[2,1], p[2,2], p[2,3], p[3,2],
                                         texCoord[0],texCoord[1],texCoord[2],texCoord[3],texCoord[4],texCoord[5],texCoord[6],texCoord[7])
+                submitted = true
                 if depthMap != nil {
                     CVPixelBufferUnlockBaseAddress(depthMap!, CVPixelBufferLockFlags.readOnly)
                 }
@@ -481,6 +483,7 @@ class RTABMap {
                 CVPixelBufferUnlockBaseAddress(frame.capturedImage, CVPixelBufferLockFlags.readOnly)
             }
         }
+        return submitted
     }
         
     // Parameters

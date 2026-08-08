@@ -23,19 +23,6 @@ extension Array {
 extension SupermarketScanSession: RecoveryLifecycleWriting {
 }
 
-private struct PriceTagCaptureContinuitySnapshot {
-    let generation: UUID
-    let capturedAtMonotonic: TimeInterval
-    let frameTimestamp: TimeInterval
-    let trackingSessionID: String
-    let sensorPoseCount: Int
-    let mapNodeCount: Int
-    let databaseBytes: UInt64
-    let clockBoundNodeID: Int
-    let localizationTraceCount: Int
-    let localizationConstraintCount: Int
-}
-
 private struct PriceTagCaptureNodeBinding {
     let nodeID: Int64
     let nodeTimebaseOffsetSeconds: TimeInterval
@@ -99,7 +86,8 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
     private var priceTagCapturePresentationGeneration: UUID?
     private var priceTagCapturePriorMapOverlayWasHidden: Bool?
     private var priceTagCaptureContinuityStart:
-        PriceTagCaptureContinuitySnapshot?
+        PriceTagCaptureContinuitySample?
+    private var priceTagCapturePausedReason: String?
     private let priorMapAlignmentSnapshots = PriorMapAlignmentSnapshotStore()
     private var priceTagNFCReader: PriceTagNFCReader?
     // NFC is intentionally paused. Presenting Core NFC interrupts the active
@@ -121,6 +109,7 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
     
     private var mTotalLoopClosures: Int = 0
     private var mMapNodes: Int = 0
+    private var mOdometrySubmissionCount: UInt64 = 0
     private var mTimeThr: Int = 0
     private var mMaxFeatures: Int = 0
     private var mLoopThr = 0.11
@@ -2219,7 +2208,9 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                 updatePriorMapLocalization(
                     frame: frame,
                     trackingState: trackingStateLabel)
-                updatePriceTagCapture(frame: frame)
+                updatePriceTagCapture(
+                    frame: frame,
+                    trackingState: trackingStateLabel)
             }
             if mState == .STATE_MAPPING && trackingStateLabel != mLastLoggedTrackingState {
                 let level = trackingStateLabel == "normal" ? "info" : "warning"
@@ -2247,15 +2238,22 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                     updateAdaptiveStructureCapture(
                         feedback: coverageFeedback,
                         frameTimestamp: frame.timestamp)
-                    rtabmap?.postOdometryEvent(
+                    if rtabmap?.postOdometryEvent(
                         frame: frame,
                         orientation: rotation,
                         viewport: self.view.frame.size,
-                        poseOverride: correctedPose)
+                        poseOverride: correctedPose) == true {
+                        mOdometrySubmissionCount &+= 1
+                    }
                 }
             }
             else if accept {
-                rtabmap?.postOdometryEvent(frame: frame, orientation: rotation, viewport: self.view.frame.size)
+                if rtabmap?.postOdometryEvent(
+                    frame: frame,
+                    orientation: rotation,
+                    viewport: self.view.frame.size) == true {
+                    mOdometrySubmissionCount &+= 1
+                }
             }
         }
 
@@ -3108,14 +3106,34 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
             self.reportCoordinatorLevelRecoveryFailure(
                 recoveryResult,
                 scanSession: scanSession)
+            let preclaimedCancellation: PriceTagCaptureCancellation?
+            if !writeResult.succeeded {
+                preclaimedCancellation = self.priceTagCaptureCoordinator.cancel(
+                    reason: "localization_evidence_write_failed")
+            }
+            else if !recoveryEvidenceSucceeded {
+                preclaimedCancellation = self.priceTagCaptureCoordinator.cancel(
+                    reason: "recovery_evidence_write_failed")
+            }
+            else if alignmentSnapshot?.localizationState == "lost" {
+                // Invalidate the generation on the prior-map queue before it
+                // can admit another queued ESL evidence job. Main-thread UI
+                // cleanup receives the already-claimed cancellation below.
+                preclaimedCancellation = self.priceTagCaptureCoordinator.cancel(
+                    reason: "prior_map_localization_lost")
+            }
+            else {
+                preclaimedCancellation = nil
+            }
             DispatchQueue.main.async {
                 guard generation == self.priorMapGeneration else {
                     return
                 }
-                if let writeResult, !writeResult.succeeded {
+                if !writeResult.succeeded {
                     self.cancelPriceTagCapture(
                         reason: "localization_evidence_write_failed",
-                        userMessage: nil)
+                        userMessage: nil,
+                        preclaimedCancellation: preclaimedCancellation)
                     self.priorMapAlignmentSnapshots.reset()
                     self.presentLocalizationEvidenceWriteFailure(
                         writeResult.failedRequiredFiles)
@@ -3124,11 +3142,19 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                 if !recoveryEvidenceSucceeded {
                     self.cancelPriceTagCapture(
                         reason: "recovery_evidence_write_failed",
-                        userMessage: nil)
+                        userMessage: nil,
+                        preclaimedCancellation: preclaimedCancellation)
                     self.priorMapAlignmentSnapshots.reset()
                     self.presentLocalizationEvidenceWriteFailure(
                         [PriorMapRecoveryLifecycleRecord.fileName])
                     return
+                }
+                if let alignmentSnapshot,
+                   alignmentSnapshot.localizationState == "lost" {
+                    self.cancelPriceTagCapture(
+                        reason: "prior_map_localization_lost",
+                        userMessage: self.localized("Prior-map localization was lost. ESL capture stopped; raw scanning continues."),
+                        preclaimedCancellation: preclaimedCancellation)
                 }
                 if let alignmentSnapshot {
                     self.priorMapAlignmentSnapshots.publish(alignmentSnapshot)
@@ -3246,6 +3272,8 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
     }
 
     private func startPriceTagCapture() {
+        let currentFrame = session.currentFrame
+        let currentAlignment = priorMapAlignmentSnapshots.snapshot()
         let startFailure: String?
         if activeScanConfiguration.workflowMode != .priorMapLocalized {
             startFailure = "workflow_not_prior_map_localized"
@@ -3253,10 +3281,10 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         else if priorMapLocalizer == nil {
             startFailure = "prior_map_localizer_unavailable"
         }
-        else if session.currentFrame == nil {
+        else if currentFrame == nil {
             startFailure = "arkit_frame_unavailable"
         }
-        else if priorMapAlignmentSnapshots.snapshot() == nil {
+        else if currentAlignment == nil {
             startFailure = "alignment_snapshot_unavailable"
         }
         else if mState != .STATE_MAPPING || mDataRecording {
@@ -3266,10 +3294,22 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
             == true {
             startFailure = "required_localization_evidence_failed"
         }
-        else {
-            startFailure = nil
+        else if let frame = currentFrame,
+                let alignment = currentAlignment {
+            switch PriceTagCaptureTrackingGate.evaluate(
+                trackingState: priceTagTrackingStateLabel(
+                    frame.camera.trackingState),
+                localizationState: alignment.localizationState) {
+            case .allow:
+                startFailure = nil
+            case .pause(let reason), .cancel(let reason):
+                startFailure = reason
+            }
         }
-        guard startFailure == nil, let frame = session.currentFrame else {
+        else {
+            startFailure = "capture_authority_unavailable"
+        }
+        guard startFailure == nil, let frame = currentFrame else {
             recordPriceTagCaptureAudit(
                 .startUnavailable,
                 phase: "start",
@@ -3330,6 +3370,7 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         }
         priceTagCaptureAuditLock.unlock()
         clearPriceTagCaptureResults()
+        priceTagCapturePausedReason = nil
 
         let overlay = PriceTagCaptureOverlayView()
         overlay.translatesAutoresizingMaskIntoConstraints = false
@@ -3392,10 +3433,91 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         }
     }
 
-    private func updatePriceTagCapture(frame: ARFrame) {
+    private func priceTagTrackingStateLabel(
+        _ state: ARCamera.TrackingState
+    ) -> String {
+        switch state {
+        case .normal:
+            return "normal"
+        case .notAvailable:
+            return "notAvailable"
+        case .limited(.excessiveMotion):
+            return "limited.excessiveMotion"
+        case .limited(.insufficientFeatures):
+            return "limited.insufficientFeatures"
+        case .limited(.initializing):
+            return "limited.initializing"
+        case .limited(.relocalizing):
+            return "limited.relocalizing"
+        default:
+            return "unknown"
+        }
+    }
+
+    private func updatePriceTagCapture(
+        frame: ARFrame,
+        trackingState: String
+    ) {
         guard priceTagCaptureCoordinator.isActive(),
               let capturePriorMapGeneration = priceTagCaptureCoordinator
                 .currentPriorMapGeneration() else {
+            return
+        }
+        guard let alignmentSnapshot = priorMapAlignmentSnapshots.snapshot(),
+              let localizer = priorMapLocalizer else {
+            cancelPriceTagCapture(
+                reason: "prior_map_capture_authority_unavailable",
+                userMessage: localized("Prior-map localization is unavailable. ESL capture stopped; raw scanning continues."))
+            return
+        }
+        switch PriceTagCaptureTrackingGate.evaluate(
+            trackingState: trackingState,
+            localizationState: alignmentSnapshot.localizationState) {
+        case .cancel(let reason):
+            recordPriceTagCaptureAudit(
+                .trackingUnavailable,
+                generation: priceTagCaptureCoordinator.currentState().generation,
+                phase: "tracking_gate",
+                sourceReason: reason,
+                terminal: true)
+            cancelPriceTagCapture(
+                reason: reason,
+                userMessage: localized("Tracking or prior-map localization was lost. ESL capture stopped; raw scanning continues."))
+            return
+        case .pause(let reason):
+            let deadlineAction = priceTagCaptureCoordinator.tickDeadline(
+                frameTimestamp: frame.timestamp)
+            if handlePriceTagDeadlineAction(
+                deadlineAction,
+                generation: priceTagCaptureCoordinator.currentState().generation) {
+                return
+            }
+            if priceTagCapturePausedReason != reason {
+                priceTagCapturePausedReason = reason
+                recordPriceTagCaptureAudit(
+                    .trackingUnavailable,
+                    generation: priceTagCaptureCoordinator.currentState().generation,
+                    phase: "tracking_gate",
+                    sourceReason: reason,
+                    terminal: false,
+                    minimumInterval: 0.5)
+                DispatchQueue.main.async {
+                    guard self.priceTagCaptureCoordinator.isActive() else {
+                        return
+                    }
+                    self.priceTagCaptureOverlay?.update(.error(
+                        message: self.localized("Hold steady and keep the ESL in view. Barcode evidence is paused until tracking recovers.")))
+                }
+            }
+            return
+        case .allow:
+            priceTagCapturePausedReason = nil
+        }
+        let deadlineAction = priceTagCaptureCoordinator.tickDeadline(
+            frameTimestamp: frame.timestamp)
+        if handlePriceTagDeadlineAction(
+            deadlineAction,
+            generation: priceTagCaptureCoordinator.currentState().generation) {
             return
         }
         let orientation = priceTagImageOrientation()
@@ -3406,9 +3528,7 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                 orientation: orientation,
                 generation: generation)
         }
-        guard let alignmentSnapshot = priorMapAlignmentSnapshots.snapshot(),
-              let localizer = priorMapLocalizer,
-              let submission = priceTagCaptureCoordinator.requestVisionSubmission(
+        guard let submission = priceTagCaptureCoordinator.requestVisionSubmission(
                 frameTimestamp: frame.timestamp) else {
             return
         }
@@ -3421,7 +3541,9 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                 orientation: orientation)
         }
         catch {
-            priceTagCaptureCoordinator.failVision(generation: submission.generation)
+            priceTagCaptureCoordinator.failVision(
+                generation: submission.generation,
+                frameTimestamp: frame.timestamp)
             recordPriceTagCaptureAudit(
                 .roiUnavailable,
                 generation: submission.generation,
@@ -3457,14 +3579,35 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                     return
                 }
                 switch result {
-                case .failure:
+                case .failure(let error):
                     self.priceTagCaptureCoordinator.failVision(
-                        generation: submission.generation)
+                        generation: submission.generation,
+                        frameTimestamp: frame.timestamp)
+                    if let scannerError = error as? PriceTagVisionScannerError,
+                       case .workerCapacityExhausted = scannerError {
+                        self.recordPriceTagCaptureAudit(
+                            .visionFailed,
+                            generation: submission.generation,
+                            phase: "vision_worker_capacity",
+                            sourceReason:
+                                "price_tag_vision_worker_capacity_exhausted",
+                            terminal: true)
+                        DispatchQueue.main.async {
+                            guard self.priceTagCaptureCoordinator.isCurrent(
+                                submission.generation) else { return }
+                            self.cancelPriceTagCapture(
+                                reason:
+                                    "price_tag_vision_worker_capacity_exhausted",
+                                userMessage: self.localized("Barcode detection stopped after repeated Vision timeouts. Raw scanning continues; try ESL capture again after restarting the app."))
+                        }
+                        return
+                    }
                     self.recordPriceTagCaptureAudit(
                         .visionFailed,
                         generation: submission.generation,
                         phase: "vision",
-                        sourceReason: "vision_request_failed",
+                        sourceReason: (error as? LocalizedError)?
+                            .errorDescription ?? "vision_request_failed",
                         terminal: false,
                         minimumInterval: 1)
                     DispatchQueue.main.async {
@@ -3486,7 +3629,8 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
             }
         if !submitted {
             priceTagCaptureCoordinator.failVision(
-                generation: submission.generation)
+                generation: submission.generation,
+                frameTimestamp: frame.timestamp)
             recordPriceTagCaptureAudit(
                 .visionFailed,
                 generation: submission.generation,
@@ -3494,6 +3638,58 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                 sourceReason: "scanner_rejected_submission",
                 terminal: false,
                 minimumInterval: 1)
+        }
+    }
+
+    @discardableResult
+    private func handlePriceTagDeadlineAction(
+        _ action: PriceTagCaptureVisionAction,
+        generation: UUID?
+    ) -> Bool {
+        guard let generation else { return false }
+        switch action {
+        case .requestTimedOut:
+            _ = priceTagVisionScanner.restart(generation: generation)
+            recordPriceTagCaptureAudit(
+                .visionFailed,
+                generation: generation,
+                phase: "vision_request_deadline",
+                sourceReason: "price_tag_vision_request_timeout",
+                terminal: false,
+                minimumInterval: 0.5)
+            DispatchQueue.main.async {
+                guard self.priceTagCaptureCoordinator.isCurrent(
+                    generation) else { return }
+                self.priceTagCaptureOverlay?.update(.error(
+                    message: self.localized("Barcode detection timed out. Hold steady while the scanner retries.")))
+            }
+            return true
+        case .resolve(let captureID, let observationIDs):
+            handlePriceTagEvidenceAction(
+                .resolve(
+                    captureID: captureID,
+                    observationIDs: observationIDs),
+                generation: generation,
+                captureID: captureID,
+                payload: "")
+            return true
+        case .timedOut(let captureID, let revokeVisionRequest):
+            if revokeVisionRequest {
+                // This branch runs synchronously on the ARSession delegate
+                // callback that crossed the burst deadline. No fresh frame can
+                // be admitted between the coordinator transition and this
+                // exact cleanup. Callback/evidence timeout paths carry false
+                // and must never cancel a newer same-generation request.
+                _ = priceTagVisionScanner.restart(generation: generation)
+            }
+            handlePriceTagEvidenceAction(
+                .timedOut(captureID: captureID),
+                generation: generation,
+                captureID: captureID,
+                payload: "")
+            return true
+        default:
+            return false
         }
     }
 
@@ -3512,6 +3708,8 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
             regionOfInterest: regionOfInterest)
         switch action {
         case .ignored:
+            return
+        case .requestTimedOut:
             return
         case .keepAiming(let code):
             recordPriceTagCaptureAudit(
@@ -3615,7 +3813,7 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                 generation: result.generation,
                 captureID: captureID,
                 payload: "")
-        case .timedOut(let captureID):
+        case .timedOut(let captureID, _):
             recordPriceTagCaptureAudit(
                 .captureTimeout,
                 generation: result.generation,
@@ -3735,16 +3933,22 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                     terminal: false,
                     minimumInterval: 0.5)
             }
-            guard self.priceTagCaptureCoordinator.matchesPriorMapAuthority(
+            var appendResult: TagObservationAppendResult?
+            let commitAccepted = self.priceTagCaptureCoordinator
+                .performEvidenceCommitIfCurrent(
                     generation: result.generation,
-                    priorMapGeneration: capturePriorMapGeneration) else {
+                    captureID: captureID,
+                    frameTimestamp: result.frame.timestamp,
+                    priorMapGeneration: capturePriorMapGeneration) {
+                        appendResult = self.supermarketSession?
+                            .appendTagObservationForCapture(
+                                localized.observation,
+                                boundNodeID: binding.nodeID,
+                                captureID: captureID)
+                    }
+            guard commitAccepted else {
                 return
             }
-            let appendResult = self.supermarketSession?
-                .appendTagObservationForCapture(
-                    localized.observation,
-                    boundNodeID: binding.nodeID,
-                    captureID: captureID)
             if appendResult != nil {
                 self.appendPriceTagCaptureResult(
                     localized.association,
@@ -3795,6 +3999,7 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                     requiredFrames: requiredFrames))
             }
         case .resolve(_, let observationIDs):
+            priceTagVisionScanner.cancel(generation: generation)
             guard let completion = supermarketSession?
                     .finalizeTagObservationCapture(
                         captureID: captureID,
@@ -4196,6 +4401,7 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         priceTagVisionScanner.cancel(generation: generation)
         removePriceTagCaptureOverlay(generation: generation)
         priceTagShelfConfirmationController = nil
+        priceTagCapturePausedReason = nil
         clearPriceTagCaptureResults()
         recordPriceTagCaptureContinuityEnd(
             generation: generation,
@@ -4217,19 +4423,22 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
     private func cancelPriceTagCapture(
         reason: String,
         userMessage: String?,
-        captureIDToFinalize: UUID? = nil
+        captureIDToFinalize: UUID? = nil,
+        preclaimedCancellation: PriceTagCaptureCancellation? = nil
     ) {
         if !Thread.isMainThread {
             DispatchQueue.main.async {
                 self.cancelPriceTagCapture(
                     reason: reason,
                     userMessage: userMessage,
-                    captureIDToFinalize: captureIDToFinalize)
+                    captureIDToFinalize: captureIDToFinalize,
+                    preclaimedCancellation: preclaimedCancellation)
             }
             return
         }
         let presentationGeneration = priceTagCapturePresentationGeneration
-        let cancellation = priceTagCaptureCoordinator.cancel(reason: reason)
+        let cancellation = preclaimedCancellation
+            ?? priceTagCaptureCoordinator.cancel(reason: reason)
         guard let generation = cancellation?.generation
                 ?? priceTagCaptureContinuityStart?.generation
                 ?? presentationGeneration else {
@@ -4283,6 +4492,7 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
             controller.dismiss(animated: false)
         }
         priceTagShelfConfirmationController = nil
+        priceTagCapturePausedReason = nil
         removePriceTagCaptureOverlay(generation: generation)
         clearPriceTagCaptureResults()
         recordPriceTagCaptureContinuityEnd(
@@ -4364,18 +4574,49 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         }
     }
 
+    private func activeStreamingDatabaseIdentity() -> String? {
+        guard let scanSession = supermarketSession,
+              let root = scanSession.rootDirectory,
+              scanSession.segmentIndex == 1,
+              mState == .STATE_MAPPING,
+              !mDataRecording,
+              rtabmap != nil else {
+            return nil
+        }
+        let databaseURL = root
+            .appendingPathComponent("segment_0001", isDirectory: true)
+            .appendingPathComponent("rtabmap_segment_0001.db")
+            .standardizedFileURL
+        guard FileManager.default.fileExists(atPath: databaseURL.path) else {
+            return nil
+        }
+        return databaseURL.path
+    }
+
     private func makePriceTagCaptureContinuitySnapshot(
         generation: UUID,
         frameTimestamp: TimeInterval
-    ) -> PriceTagCaptureContinuitySnapshot? {
+    ) -> PriceTagCaptureContinuitySample? {
         guard let scanSession = supermarketSession else { return nil }
         let health = scanSession.boundarySnapshot().captureHealth
-        return PriceTagCaptureContinuitySnapshot(
+        let databaseIdentity = activeStreamingDatabaseIdentity()
+        return PriceTagCaptureContinuitySample(
             generation: generation,
             capturedAtMonotonic: ProcessInfo.processInfo.systemUptime,
             frameTimestamp: frameTimestamp,
             trackingSessionID: scanSession.trackingSessionId,
+            mappingActive: mState == .STATE_MAPPING,
+            dataRecording: mDataRecording,
+            nativePipelineAvailable: rtabmap != nil,
+            databaseWriterReady: databaseIdentity != nil,
+            databaseIdentity: databaseIdentity,
+            clockWriterReady: clockRecorder != nil
+                && clockSidecarWriteFailure == nil,
+            sessionFinalizing: scanSession.isFinalizingScan,
+            localizationRequiredWriteFailed:
+                scanSession.hasLocalizationRequiredWriteFailure(),
             sensorPoseCount: health.sensorPoseCount,
+            odometrySubmissionCount: mOdometrySubmissionCount,
             mapNodeCount: mMapNodes,
             databaseBytes: activeStreamingDatabaseBytes(),
             clockBoundNodeID: lastClockBoundNodeID,
@@ -4400,42 +4641,71 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         }
         priceTagCaptureContinuityStart = nil
         let duration = end.capturedAtMonotonic - start.capturedAtMonotonic
-        let monotonic = end.frameTimestamp >= start.frameTimestamp
-            && end.sensorPoseCount >= start.sensorPoseCount
-            && end.mapNodeCount >= start.mapNodeCount
-            && end.databaseBytes >= start.databaseBytes
-            && end.clockBoundNodeID >= start.clockBoundNodeID
-            && end.localizationTraceCount >= start.localizationTraceCount
-            && end.localizationConstraintCount
-                >= start.localizationConstraintCount
-        let observedFrames = end.sensorPoseCount > start.sensorPoseCount
-        let evaluable = duration >= 0.20
-        let passed = start.trackingSessionID == end.trackingSessionID
-            && monotonic
-            && (!evaluable || observedFrames)
+        let assessment = PriceTagCaptureContinuityEvaluator.evaluate(
+            start: start,
+            end: end)
+        let level: String
+        let event: String
+        let message: String
+        let reasons: [String]
+        switch assessment {
+        case .passed:
+            level = "info"
+            event = "price_tag_capture_continuity_passed"
+            message = "AR pose, native odometry submission, prior-map trace and the active database/clock writer identity remained continuous during ESL capture"
+            reasons = []
+        case .notEvaluable(let values):
+            level = "warning"
+            event = "price_tag_capture_continuity_not_evaluable"
+            message = "The ESL workflow ended before every asynchronous continuity channel could be evaluated"
+            reasons = values
+        case .failed(let values):
+            level = "error"
+            event = "price_tag_capture_continuity_failed"
+            message = "An ESL capture continuity invariant failed"
+            reasons = values
+        }
+        let databaseByteDelta = end.databaseBytes >= start.databaseBytes
+            ? "+\(end.databaseBytes - start.databaseBytes)"
+            : "-\(start.databaseBytes - end.databaseBytes)"
+        let odometryDelta = end.odometrySubmissionCount
+            >= start.odometrySubmissionCount
+            ? end.odometrySubmissionCount - start.odometrySubmissionCount
+            : 0
         supermarketSession?.appendScanEventIfSessionActive(
             expectedTrackingSessionId: start.trackingSessionID,
             allowDuringFinalization: allowDuringFinalization,
-            level: passed ? "info" : "error",
-            event: passed
-                ? "price_tag_capture_continuity_passed"
-                : "price_tag_capture_continuity_failed",
-            message: passed
-                ? "AR/Pose/DB/localization counters remained continuous during ESL capture"
-                : "A capture continuity invariant changed during ESL capture",
+            level: level,
+            event: event,
+            message: message,
             fields: [
                 "capture_generation": generation.uuidString.lowercased(),
                 "outcome": outcome,
                 "duration_seconds": String(format: "%.3f", duration),
+                "assessment_reasons": reasons.joined(separator: ","),
                 "tracking_session_unchanged":
                     start.trackingSessionID == end.trackingSessionID
                         ? "true" : "false",
+                "mapping_active_at_boundaries":
+                    start.mappingActive && end.mappingActive
+                        ? "true" : "false",
+                "database_writer_ready_at_boundaries":
+                    start.databaseWriterReady && end.databaseWriterReady
+                        ? "true" : "false",
+                "database_identity_unchanged":
+                    start.databaseIdentity != nil
+                        && start.databaseIdentity == end.databaseIdentity
+                        ? "true" : "false",
+                "clock_writer_ready_at_boundaries":
+                    start.clockWriterReady && end.clockWriterReady
+                        ? "true" : "false",
                 "sensor_pose_delta":
                     "\(end.sensorPoseCount - start.sensorPoseCount)",
+                "odometry_submission_delta": "\(odometryDelta)",
                 "map_node_delta":
                     "\(end.mapNodeCount - start.mapNodeCount)",
-                "database_byte_delta":
-                    "\(Int64(end.databaseBytes) - Int64(start.databaseBytes))",
+                "database_byte_delta": databaseByteDelta,
+                "database_bytes_are_audit_only": "true",
                 "clock_binding_delta":
                     "\(end.clockBoundNodeID - start.clockBoundNodeID)",
                 "localization_trace_delta":

@@ -442,6 +442,33 @@ func runESLBarcodeCaptureFocusedTests() {
     require(
         isAmbiguous(select([centerA, centerB])),
         "BC-03 near-equal in-ROI candidates must be ambiguous")
+    let sameIdentityLeft = barcode(
+        "SAME", CGRect(x: 0.41, y: 0.46, width: 0.08, height: 0.08))
+    let sameIdentityRight = barcode(
+        "SAME", CGRect(x: 0.51, y: 0.46, width: 0.08, height: 0.08))
+    require(
+        isAmbiguous(select([sameIdentityLeft, sameIdentityRight])),
+        "BC-03 equal payloads at disjoint physical positions must remain ambiguous")
+    require(
+        isSelected(select([
+            barcode(
+                "SAME",
+                CGRect(x: 0.45, y: 0.45, width: 0.10, height: 0.10)),
+            barcode(
+                "SAME",
+                CGRect(x: 0.452, y: 0.452, width: 0.10, height: 0.10)),
+        ])),
+        "BC-03 high-IoU observations of one physical barcode must deduplicate")
+    require(
+        isSelected(select([
+            barcode(
+                "SAME",
+                CGRect(x: 0.47, y: 0.47, width: 0.06, height: 0.06)),
+            barcode(
+                "SAME",
+                CGRect(x: 0.57, y: 0.47, width: 0.05, height: 0.05)),
+        ])),
+        "BC-03 the existing score-margin policy may select a clear physical winner")
 
     require(
         PriceTagCapturePolicy.field.minimumCandidateLockFrames == 2
@@ -466,12 +493,161 @@ func runESLBarcodeCaptureFocusedTests() {
             stableAuditCodes.contains(requiredCode),
             "stable ESL audit contract must include \(requiredCode)")
     }
+
+    require(
+        PriceTagCaptureTrackingGate.evaluate(
+            trackingState: "normal",
+            localizationState: "stable") == .allow,
+        "tracking gate must allow normal ARKit plus stable prior-map state")
+    require(
+        PriceTagCaptureTrackingGate.evaluate(
+            trackingState: "limited.insufficientFeatures",
+            localizationState: "stable")
+            == .pause(reason: "arkit_tracking_insufficient_features"),
+        "recoverable limited tracking must pause new barcode submissions")
+    for (tracking, reason) in [
+        ("notAvailable", "arkit_tracking_not_available"),
+        ("limited.initializing", "arkit_tracking_initializing"),
+        ("limited.relocalizing", "arkit_tracking_relocalizing"),
+    ] {
+        require(
+            PriceTagCaptureTrackingGate.evaluate(
+                trackingState: tracking,
+                localizationState: "stable") == .cancel(reason: reason),
+            "hard ARKit state \(tracking) must cancel the capture generation")
+    }
+    require(
+        PriceTagCaptureTrackingGate.evaluate(
+            trackingState: "normal",
+            localizationState: "lost")
+            == .cancel(reason: "prior_map_localization_lost"),
+        "prior-map localization loss must override otherwise normal ARKit")
+
+    let continuityGeneration = UUID()
+    func continuitySample(
+        uptime: TimeInterval,
+        frameTimestamp: TimeInterval,
+        sensorPoses: Int,
+        odometrySubmissions: UInt64,
+        mapNodes: Int = 10,
+        databaseBytes: UInt64 = 10_000,
+        clockNodeID: Int = 10,
+        localizationTraces: Int,
+        mappingActive: Bool = true,
+        databaseWriterReady: Bool = true
+    ) -> PriceTagCaptureContinuitySample {
+        return PriceTagCaptureContinuitySample(
+            generation: continuityGeneration,
+            capturedAtMonotonic: uptime,
+            frameTimestamp: frameTimestamp,
+            trackingSessionID: "SESSION-ESL",
+            mappingActive: mappingActive,
+            dataRecording: false,
+            nativePipelineAvailable: true,
+            databaseWriterReady: databaseWriterReady,
+            databaseIdentity: databaseWriterReady ? "/scan/segment_0001.db" : nil,
+            clockWriterReady: true,
+            sessionFinalizing: false,
+            localizationRequiredWriteFailed: false,
+            sensorPoseCount: sensorPoses,
+            odometrySubmissionCount: odometrySubmissions,
+            mapNodeCount: mapNodes,
+            databaseBytes: databaseBytes,
+            clockBoundNodeID: clockNodeID,
+            localizationTraceCount: localizationTraces,
+            localizationConstraintCount: 2)
+    }
+    let continuityStart = continuitySample(
+        uptime: 0,
+        frameTimestamp: 1,
+        sensorPoses: 100,
+        odometrySubmissions: 80,
+        localizationTraces: 20)
+    let stationaryEnd = continuitySample(
+        uptime: 1,
+        frameTimestamp: 2,
+        sensorPoses: 130,
+        odometrySubmissions: 110,
+        databaseBytes: 9_000,
+        localizationTraces: 22)
+    require(
+        PriceTagCaptureContinuityEvaluator.evaluate(
+            start: continuityStart,
+            end: stationaryEnd) == .passed,
+        "continuity must pass while standing without a new node and after WAL shrink when odometry/trace/writers advance")
+    let frozenNativeEnd = continuitySample(
+        uptime: 1,
+        frameTimestamp: 2,
+        sensorPoses: 130,
+        odometrySubmissions: 80,
+        localizationTraces: 20)
+    if case .failed(let reasons) = PriceTagCaptureContinuityEvaluator.evaluate(
+        start: continuityStart,
+        end: frozenNativeEnd) {
+        require(
+            reasons.contains("odometry_submission_did_not_advance")
+                && reasons.contains("localization_trace_did_not_advance"),
+            "AR-only progress must fail when native odometry and localization freeze")
+    }
+    else {
+        require(false, "AR-only continuity false-pass must be rejected")
+    }
+    let unboundNodeEnd = continuitySample(
+        uptime: 1,
+        frameTimestamp: 2,
+        sensorPoses: 130,
+        odometrySubmissions: 110,
+        mapNodes: 11,
+        clockNodeID: 10,
+        localizationTraces: 22)
+    if case .failed(let reasons) = PriceTagCaptureContinuityEvaluator.evaluate(
+        start: continuityStart,
+        end: unboundNodeEnd) {
+        require(
+            reasons.contains("new_map_node_missing_clock_binding"),
+            "a new map node without its durable clock binding must fail")
+    }
+    else {
+        require(false, "unbound map-node continuity must fail")
+    }
+    let shortEnd = continuitySample(
+        uptime: 0.2,
+        frameTimestamp: 1.2,
+        sensorPoses: 106,
+        odometrySubmissions: 86,
+        localizationTraces: 21)
+    require(
+        PriceTagCaptureContinuityEvaluator.evaluate(
+            start: continuityStart,
+            end: shortEnd)
+            == .notEvaluable(
+                reasons: ["capture_duration_below_evaluation_window"]),
+        "short capture must be not-evaluable instead of a false PASS")
+    let writerLostEnd = continuitySample(
+        uptime: 1,
+        frameTimestamp: 2,
+        sensorPoses: 130,
+        odometrySubmissions: 110,
+        localizationTraces: 22,
+        databaseWriterReady: false)
+    if case .failed(let reasons) = PriceTagCaptureContinuityEvaluator.evaluate(
+        start: continuityStart,
+        end: writerLostEnd) {
+        require(
+            reasons.contains("database_writer_unavailable")
+                && reasons.contains("database_identity_changed"),
+            "database writer/identity loss must fail continuity")
+    }
+    else {
+        require(false, "database writer loss must not pass continuity")
+    }
     let policy = PriceTagCapturePolicy(
         minimumCandidateLockFrames: 2,
         minimumEvidenceFrames: 3,
         targetEvidenceFrames: 3,
         minimumCaptureDuration: 0.30,
         maximumCaptureDuration: 2.0,
+        maximumVisionRequestDuration: 1.0,
         visionRateHz: 8,
         previewRateHz: 24,
         minimumROIIntersectionRatio: 0.8,
@@ -1154,6 +1330,7 @@ func runESLBarcodeCaptureFocusedTests() {
             targetEvidenceFrames: 4,
             minimumCaptureDuration: 0.30,
             maximumCaptureDuration: 2.0,
+            maximumVisionRequestDuration: 1.0,
             visionRateHz: 8,
             previewRateHz: 24,
             minimumROIIntersectionRatio: 0.8,
@@ -1218,6 +1395,417 @@ func runESLBarcodeCaptureFocusedTests() {
         }
     }
 
+    let deadlinePolicy = PriceTagCapturePolicy(
+        minimumCandidateLockFrames: 2,
+        minimumEvidenceFrames: 3,
+        targetEvidenceFrames: 4,
+        minimumCaptureDuration: 0.30,
+        maximumCaptureDuration: 2.0,
+        maximumVisionRequestDuration: 1.0,
+        visionRateHz: 8,
+        previewRateHz: 24,
+        minimumROIIntersectionRatio: 0.8,
+        minimumCandidateNormalizedArea: 0.002,
+        ambiguityScoreDelta: 0.08,
+        completedDuplicateSuppressionSeconds: 2.0)
+
+    // A per-request deadline exists before candidate lock. A first Vision
+    // request that never calls back must not leave aiming/candidate admission
+    // permanently occupied while ARFrame timestamps continue advancing.
+    do {
+        let coordinator = PriceTagCaptureCoordinator(policy: deadlinePolicy)
+        let generation = coordinator.begin(now: 0)
+        require(
+            coordinator.markAiming(generation: generation),
+            "aiming request-deadline fixture must enter aiming")
+        coordinator.updateGeometry(captureGeometry)
+        require(
+            coordinator.requestVisionSubmission(frameTimestamp: 0) != nil,
+            "aiming request-deadline fixture must admit request A")
+        require(
+            coordinator.tickDeadline(frameTimestamp: 1.01)
+                == .requestTimedOut(frameTimestamp: 0),
+            "aiming request A must expire independently of burst collection")
+        require(
+            coordinator.requestVisionSubmission(frameTimestamp: 1.2) != nil,
+            "aiming must admit request B after request A expires")
+        coordinator.failVision(
+            generation: generation,
+            frameTimestamp: 1.2)
+
+        let firstCandidate = submit(
+            coordinator,
+            generation: generation,
+            timestamp: 1.4,
+            candidates: [activeA])
+        if case .candidateSeen = firstCandidate {
+            // Expected.
+        }
+        else {
+            require(false, "candidate request-deadline fixture must see A")
+        }
+        require(
+            coordinator.requestVisionSubmission(frameTimestamp: 1.6) != nil,
+            "candidate request-deadline fixture must admit request C")
+        require(
+            coordinator.tickDeadline(frameTimestamp: 2.61)
+                == .requestTimedOut(frameTimestamp: 1.6),
+            "candidate request C must expire without waiting for collecting")
+        require(
+            coordinator.requestVisionSubmission(frameTimestamp: 2.8) != nil,
+            "candidate must admit a fresh request after timeout")
+        coordinator.failVision(
+            generation: generation,
+            frameTimestamp: 2.8)
+    }
+
+    func startDeadlineCoordinator() -> (PriceTagCaptureCoordinator, UUID, UUID) {
+        let coordinator = PriceTagCaptureCoordinator(policy: deadlinePolicy)
+        let generation = coordinator.begin(now: 0)
+        require(
+            coordinator.markAiming(generation: generation),
+            "deadline fixture must enter aiming")
+        coordinator.updateGeometry(captureGeometry)
+        _ = submit(
+            coordinator,
+            generation: generation,
+            timestamp: 0,
+            candidates: [activeA])
+        let locked = submit(
+            coordinator,
+            generation: generation,
+            timestamp: 0.2,
+            candidates: [activeA])
+        guard case .candidateLocked(let captureID, _) = locked else {
+            fatalError("deadline fixture must lock")
+        }
+        return (coordinator, generation, captureID)
+    }
+
+    // The 2-second deadline is driven by ARFrame ticks, not by successful
+    // Vision callbacks. Three durable frames survive repeated Vision errors.
+    do {
+        let (coordinator, generation, captureID) = startDeadlineCoordinator()
+        _ = coordinator.finishEvidence(
+            generation: generation,
+            captureID: captureID,
+            frameTimestamp: 0.2,
+            observationID: "deadline-vision-1",
+            succeeded: true)
+        for (timestamp, observationID) in [
+            (0.4, "deadline-vision-2"),
+            (0.6, "deadline-vision-3"),
+        ] {
+            _ = submit(
+                coordinator,
+                generation: generation,
+                timestamp: timestamp,
+                candidates: [activeA])
+            _ = coordinator.finishEvidence(
+                generation: generation,
+                captureID: captureID,
+                frameTimestamp: timestamp,
+                observationID: observationID,
+                succeeded: true)
+        }
+        for timestamp in [0.8, 1.0, 1.2] {
+            require(
+                coordinator.requestVisionSubmission(
+                    frameTimestamp: timestamp) != nil,
+                "deadline fixture must submit the failing Vision request")
+            coordinator.failVision(
+                generation: generation,
+                frameTimestamp: timestamp)
+        }
+        let deadline = coordinator.tickDeadline(frameTimestamp: 2.21)
+        if case .resolve(let resolvedID, let observationIDs) = deadline {
+            require(
+                resolvedID == captureID && observationIDs.count == 3,
+                "independent deadline must resolve three durable frames after Vision failure")
+        }
+        else {
+            require(false, "Vision failure must not leave collecting unbounded")
+        }
+    }
+
+    // A Vision implementation that never calls back cannot own the capture
+    // past the deadline. The coordinator revokes that request and rejects its
+    // eventual late completion without starting another evidence write.
+    do {
+        let (coordinator, generation, captureID) = startDeadlineCoordinator()
+        _ = coordinator.finishEvidence(
+            generation: generation,
+            captureID: captureID,
+            frameTimestamp: 0.2,
+            observationID: "deadline-hung-vision-1",
+            succeeded: true)
+        require(
+            coordinator.requestVisionSubmission(frameTimestamp: 0.4) != nil,
+            "hung Vision fixture must have one admitted request")
+        require(
+            coordinator.tickDeadline(frameTimestamp: 1.41)
+                == .requestTimedOut(frameTimestamp: 0.4),
+            "collecting request A must expire before the burst deadline")
+        let deadline = coordinator.tickDeadline(frameTimestamp: 2.21)
+        require(
+            deadline == .timedOut(
+                captureID: captureID,
+                revokeVisionRequest: true)
+                && coordinator.currentState() == .aiming(
+                    generation: generation),
+            "a hung Vision request must not keep collecting past the deadline")
+        require(
+            coordinator.requestVisionSubmission(frameTimestamp: 2.4) != nil,
+            "the aiming state may admit a fresh request after deadline cleanup")
+        let late = coordinator.finishVision(
+            generation: generation,
+            frameTimestamp: 0.4,
+            candidates: [activeA],
+            regionOfInterest: captureROI)
+        require(
+            late == .ignored,
+            "the callback revoked by the deadline must not consume a fresh admission")
+        let fresh = coordinator.finishVision(
+            generation: generation,
+            frameTimestamp: 2.4,
+            candidates: [activeA],
+            regionOfInterest: captureROI)
+        if case .candidateSeen = fresh {
+            // Expected.
+        }
+        else {
+            require(false, "the fresh post-deadline Vision request must remain valid")
+        }
+    }
+
+    // A timeout returned by an already-completed Vision callback must not ask
+    // the ViewController to restart by generation. Between finishVision()
+    // returning and UI handling, a fresh request B may already be active; a
+    // generation-only restart there would cancel/quarantine healthy B.
+    do {
+        let (coordinator, generation, captureID) = startDeadlineCoordinator()
+        _ = coordinator.finishEvidence(
+            generation: generation,
+            captureID: captureID,
+            frameTimestamp: 0.2,
+            observationID: "callback-timeout-1",
+            succeeded: true)
+        let callbackTimeout = submit(
+            coordinator,
+            generation: generation,
+            timestamp: 2.3,
+            candidates: [])
+        guard case .timedOut(
+                let timedOutCaptureID,
+                let revokeVisionRequest) = callbackTimeout else {
+            require(false, "completed Vision callback must return a timeout")
+            return
+        }
+        require(
+            timedOutCaptureID == captureID && !revokeVisionRequest,
+            "completed Vision callback timeout must not revoke a future request")
+
+        var requestTokens = PriceTagVisionRequestTokenGate()
+        requestTokens.activate(generation: generation)
+        guard let requestA = requestTokens.beginRequest(generation: generation)
+        else {
+            require(false, "callback-timeout token fixture must admit A")
+            return
+        }
+        require(
+            requestTokens.completeRequest(
+                generation: generation,
+                requestID: requestA),
+            "request A must finish before its callback timeout is handled")
+        guard let requestB = requestTokens.beginRequest(generation: generation)
+        else {
+            require(false, "callback-timeout token fixture must admit B")
+            return
+        }
+        require(
+            requestTokens.activeRequestID == requestB,
+            "callback timeout handling must leave fresh request B active")
+        require(
+            requestTokens.completeRequest(
+                generation: generation,
+                requestID: requestB),
+            "fresh request B must complete without stale A cleanup")
+    }
+
+    // Scanner-level request identity must survive a same-generation restart.
+    // The deadline may return the coordinator to aiming without changing the
+    // capture generation, so generation-only callback checks are insufficient.
+    do {
+        var requestTokens = PriceTagVisionRequestTokenGate()
+        let generation = UUID()
+        requestTokens.activate(generation: generation)
+        guard let oldRequestID = requestTokens.beginRequest(
+                generation: generation) else {
+            require(false, "scanner token fixture must admit the old request")
+            return
+        }
+        require(
+            requestTokens.restart(generation: generation),
+            "deadline cleanup must restart the current scanner generation")
+        guard let freshRequestID = requestTokens.beginRequest(
+                generation: generation) else {
+            require(false, "same-generation restart must admit a fresh request")
+            return
+        }
+        require(
+            oldRequestID != freshRequestID,
+            "a restarted request must receive a distinct identity")
+        require(
+            !requestTokens.completeRequest(
+                generation: generation,
+                requestID: oldRequestID),
+            "the old callback must be rejected after same-generation restart")
+        require(
+            requestTokens.activeRequestID == freshRequestID,
+            "the old callback must not clear the fresh in-flight request")
+        require(
+            requestTokens.completeRequest(
+                generation: generation,
+                requestID: freshRequestID),
+            "the fresh callback must complete normally")
+        require(
+            requestTokens.activeRequestID == nil,
+            "successful completion must release scanner admission")
+    }
+
+    // The executor test blocks worker A for real. Quarantining A must let B
+    // start on the sole spare lane before A returns; two simultaneous hangs
+    // must exhaust the fixed pool instead of queuing or creating worker C.
+    do {
+        let executor = PriceTagVisionWorkerExecutor(
+            maximumWorkers: 2,
+            labelPrefix: "marketscanner.tests.price-tag-vision")
+        let requestA = UUID()
+        let requestB = UUID()
+        let requestC = UUID()
+        let startedA = DispatchSemaphore(value: 0)
+        let releaseA = DispatchSemaphore(value: 0)
+        let finishedA = DispatchSemaphore(value: 0)
+        let startedB = DispatchSemaphore(value: 0)
+        let releaseB = DispatchSemaphore(value: 0)
+        let finishedB = DispatchSemaphore(value: 0)
+        require(
+            executor.submit(requestID: requestA) {
+                startedA.signal()
+                _ = releaseA.wait(timeout: .now() + 2)
+                finishedA.signal()
+            },
+            "worker A must start")
+        require(
+            startedA.wait(timeout: .now() + 1) == .success,
+            "worker A must actually occupy its executor lane")
+        require(
+            executor.quarantine(requestID: requestA),
+            "timed-out worker A must enter quarantine")
+        require(
+            executor.submit(requestID: requestB) {
+                startedB.signal()
+                _ = releaseB.wait(timeout: .now() + 2)
+                finishedB.signal()
+            },
+            "worker B must use the bounded replacement lane")
+        require(
+            startedB.wait(timeout: .now() + 1) == .success,
+            "worker B must actually start before worker A returns")
+        require(
+            executor.quarantine(requestID: requestB),
+            "a second hung worker must enter quarantine")
+        require(
+            executor.snapshot()
+                == PriceTagVisionWorkerExecutorSnapshot(
+                    availableWorkers: 0,
+                    activeWorkers: 0,
+                    quarantinedWorkers: 2),
+            "the worker population must remain bounded at two quarantined lanes")
+        require(
+            !executor.submit(requestID: requestC) {},
+            "worker C must fail closed instead of forming an unbounded backlog")
+        releaseA.signal()
+        releaseB.signal()
+        require(
+            finishedA.wait(timeout: .now() + 1) == .success
+                && finishedB.wait(timeout: .now() + 1) == .success,
+            "quarantined test workers must be released")
+    }
+
+    // A frame that was already admitted before the deadline may finish its
+    // durable write once. The latched deadline is applied immediately after.
+    do {
+        let (coordinator, generation, captureID) = startDeadlineCoordinator()
+        _ = coordinator.finishEvidence(
+            generation: generation,
+            captureID: captureID,
+            frameTimestamp: 0.2,
+            observationID: "deadline-pending-1",
+            succeeded: true)
+        _ = submit(
+            coordinator,
+            generation: generation,
+            timestamp: 0.4,
+            candidates: [activeA])
+        _ = coordinator.finishEvidence(
+            generation: generation,
+            captureID: captureID,
+            frameTimestamp: 0.4,
+            observationID: "deadline-pending-2",
+            succeeded: true)
+        _ = submit(
+            coordinator,
+            generation: generation,
+            timestamp: 0.6,
+            candidates: [activeA])
+        require(
+            coordinator.tickDeadline(frameTimestamp: 2.21) == .ignored,
+            "deadline must latch while one admitted evidence frame is in flight")
+        let completion = coordinator.finishEvidence(
+            generation: generation,
+            captureID: captureID,
+            frameTimestamp: 0.6,
+            observationID: "deadline-pending-3",
+            succeeded: true)
+        if case .resolve(let resolvedID, let observationIDs) = completion {
+            require(
+                resolvedID == captureID && observationIDs.count == 3,
+                "the third admitted frame must resolve immediately after the latched deadline")
+        }
+        else {
+            require(false, "latched deadline must resolve after the third durable frame")
+        }
+    }
+    do {
+        let (coordinator, generation, captureID) = startDeadlineCoordinator()
+        _ = coordinator.finishEvidence(
+            generation: generation,
+            captureID: captureID,
+            frameTimestamp: 0.2,
+            observationID: "deadline-insufficient-1",
+            succeeded: true)
+        _ = submit(
+            coordinator,
+            generation: generation,
+            timestamp: 0.4,
+            candidates: [activeA])
+        require(
+            coordinator.tickDeadline(frameTimestamp: 2.21) == .ignored,
+            "insufficient pending evidence must still be linearized")
+        let completion = coordinator.finishEvidence(
+            generation: generation,
+            captureID: captureID,
+            frameTimestamp: 0.4,
+            observationID: "deadline-insufficient-2",
+            succeeded: true)
+        require(
+            completion == .timedOut(captureID: captureID)
+                && coordinator.currentState() == .aiming(
+                    generation: generation),
+            "latched deadline with fewer than three durable frames must time out")
+    }
+
     // BC-07: a callback that returns after cancellation is generation-stale
     // and cannot mutate state or progress toward confirmation.
     do {
@@ -1275,6 +1863,147 @@ func runESLBarcodeCaptureFocusedTests() {
         } else {
             require(false, "BC-08 the new generation must accept fresh evidence")
         }
+    }
+
+    // Evidence append linearization: cancellation and the final durable
+    // append must have only two safe orders. If cancellation wins, the stale
+    // callback cannot execute its append body. If append wins, cancellation
+    // waits until that append has joined the still-active burst instead of
+    // flushing first and allowing a duplicate capture ID to be recreated.
+    do {
+        let (coordinator, generation) = startCoordinator(now: 20)
+        _ = submit(
+            coordinator,
+            generation: generation,
+            timestamp: 20,
+            candidates: [activeA])
+        let locked = submit(
+            coordinator,
+            generation: generation,
+            timestamp: 20.2,
+            candidates: [activeA])
+        guard case .candidateLocked(let captureID, _) = locked else {
+            require(false, "cancel-wins evidence fixture must lock")
+            return
+        }
+        _ = coordinator.cancel(reason: "cancel_before_evidence_commit")
+        var staleBodyRan = false
+        let staleAccepted = coordinator.performEvidenceCommitIfCurrent(
+            generation: generation,
+            captureID: captureID,
+            frameTimestamp: 20.2,
+            priorMapGeneration:
+                capturePriorMapAuthority.priorMapGeneration) {
+                staleBodyRan = true
+            }
+        require(
+            !staleAccepted && !staleBodyRan,
+            "cancel-wins must reject the stale durable append body")
+    }
+    do {
+        let (coordinator, generation) = startCoordinator(now: 25)
+        _ = submit(
+            coordinator,
+            generation: generation,
+            timestamp: 25,
+            candidates: [activeA])
+        let locked = submit(
+            coordinator,
+            generation: generation,
+            timestamp: 25.2,
+            candidates: [activeA])
+        guard case .candidateLocked(let captureID, _) = locked else {
+            require(false, "prior-map authority fixture must lock")
+            return
+        }
+        var bodyRan = false
+        let accepted = coordinator.performEvidenceCommitIfCurrent(
+            generation: generation,
+            captureID: captureID,
+            frameTimestamp: 25.2,
+            priorMapGeneration: UUID()) {
+                bodyRan = true
+            }
+        require(
+            !accepted && !bodyRan,
+            "a changed prior-map generation must not enter the durable append")
+        _ = coordinator.cancel(reason: "prior_map_authority_test_complete")
+    }
+    do {
+        let (coordinator, generation) = startCoordinator(now: 30)
+        _ = submit(
+            coordinator,
+            generation: generation,
+            timestamp: 30,
+            candidates: [activeA])
+        let locked = submit(
+            coordinator,
+            generation: generation,
+            timestamp: 30.2,
+            candidates: [activeA])
+        guard case .candidateLocked(let captureID, _) = locked else {
+            require(false, "append-wins evidence fixture must lock")
+            return
+        }
+        let appendEntered = DispatchSemaphore(value: 0)
+        let releaseAppend = DispatchSemaphore(value: 0)
+        let appendFinished = DispatchSemaphore(value: 0)
+        let cancelStarted = DispatchSemaphore(value: 0)
+        let cancelFinished = DispatchSemaphore(value: 0)
+        let resultLock = NSLock()
+        var appendAccepted = false
+        var appendBodyCount = 0
+        var cancellation: PriceTagCaptureCancellation?
+        DispatchQueue.global(qos: .userInitiated).async {
+            let accepted = coordinator.performEvidenceCommitIfCurrent(
+                generation: generation,
+                captureID: captureID,
+                frameTimestamp: 30.2,
+                priorMapGeneration:
+                    capturePriorMapAuthority.priorMapGeneration) {
+                    resultLock.lock()
+                    appendBodyCount += 1
+                    resultLock.unlock()
+                    appendEntered.signal()
+                    _ = releaseAppend.wait(timeout: .now() + 2)
+                }
+            resultLock.lock()
+            appendAccepted = accepted
+            resultLock.unlock()
+            appendFinished.signal()
+        }
+        require(
+            appendEntered.wait(timeout: .now() + 1) == .success,
+            "append-wins fixture must enter the linearized append body")
+        DispatchQueue.global(qos: .userInitiated).async {
+            cancelStarted.signal()
+            let value = coordinator.cancel(
+                reason: "cancel_during_evidence_commit")
+            resultLock.lock()
+            cancellation = value
+            resultLock.unlock()
+            cancelFinished.signal()
+        }
+        require(
+            cancelStarted.wait(timeout: .now() + 1) == .success
+                && cancelFinished.wait(timeout: .now() + 0.05) == .timedOut,
+            "append-wins must keep cancellation behind the durable append boundary")
+        releaseAppend.signal()
+        require(
+            appendFinished.wait(timeout: .now() + 1) == .success
+                && cancelFinished.wait(timeout: .now() + 1) == .success,
+            "append-wins append and following cancellation must both finish")
+        resultLock.lock()
+        let observedAppendAccepted = appendAccepted
+        let observedAppendBodyCount = appendBodyCount
+        let observedCancellation = cancellation
+        resultLock.unlock()
+        require(
+            observedAppendAccepted
+                && observedAppendBodyCount == 1
+                && observedCancellation?.captureID == captureID
+                && coordinator.currentState() == .idle,
+            "append-wins must append exactly once before cancellation finalizes the capture")
     }
 
     func shelfCandidate(
