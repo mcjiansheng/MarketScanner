@@ -375,7 +375,7 @@ struct PriorMapFixedStructure: Codable {
     }
 }
 
-struct PriorMapShelfGeometry: Codable {
+struct PriorMapShelfGeometry: Codable, Equatable {
     let type: String
     let coordinates: [[Double]]
 }
@@ -515,6 +515,50 @@ struct PriorMapTagObservationRecord: Codable {
     }
 }
 
+struct PriceTagShelfPreviewPoint: Codable, Equatable {
+    let xM: Double
+    let yM: Double
+}
+
+struct PriceTagShelfCandidate: Codable, Equatable {
+    let shelfSegmentId: String
+    let shelfCode: String?
+    let rowFlag: String?
+    let crossCode: String?
+    let side: String
+    let distanceFromStartCm: Double
+    let distanceToShelfM: Double
+    let associationConfidence: Double
+    let occluded: Bool
+    let blockedByOtherStructure: Bool
+    let snappedPosition: PriorMapTagPoint3D
+    let outline: [PriceTagShelfPreviewPoint]
+
+    var isSelectable: Bool {
+        return !occluded
+            && !blockedByOtherStructure
+            && associationConfidence >= 0.65
+    }
+}
+
+struct PriceTagShelfAssociationResult {
+    let tag: LocalizedPriceTag
+    let candidates: [PriceTagShelfCandidate]
+    let algorithmCandidateReliable: Bool
+}
+
+struct PriceTagLocalizedFrameResult {
+    let observation: PriorMapTagObservationRecord
+    let association: PriceTagShelfAssociationResult
+}
+
+enum ShelfConfirmationDecision: Equatable {
+    case confirmedAlgorithmCandidate
+    case selectedAlternative(segmentID: String, side: String)
+    case rescan
+    case observationOnly
+}
+
 struct LocalizedPriceTag: Codable, Equatable {
     let format: String
     let version: Int
@@ -527,6 +571,9 @@ struct LocalizedPriceTag: Codable, Equatable {
     let trackingSessionId: String
     let priorMapId: String
     let priorMapSha256: String
+    /// Legacy/current display fields retain the algorithm candidate. User
+    /// confirmation is persisted separately below and never overwrites it.
+    let shelfSegmentId: String?
     let shelfCode: String?
     let rowFlag: String?
     let crossCode: String?
@@ -541,6 +588,23 @@ struct LocalizedPriceTag: Codable, Equatable {
     let measurementMethod: String
     let needsReview: Bool
     let userConfirmed: Bool
+    /// Additive v2 capture and confirmation audit. Legacy v1 records decode
+    /// with nil values and continue to use the fields above.
+    let captureId: String?
+    let frameObservationIds: [String]?
+    let algorithmShelfSegmentId: String?
+    let algorithmShelfCode: String?
+    let algorithmSide: String?
+    let algorithmDistanceFromShelfStartCm: Double?
+    let algorithmAssociationConfidence: Double?
+    let confirmationStatus: String?
+    let userConfirmedShelfSegmentId: String?
+    let userConfirmedShelfCode: String?
+    let userConfirmedSide: String?
+    let userConfirmedDistanceFromShelfStartCm: Double?
+    let confirmedAtUTC: TimeInterval?
+    let confirmedAtMonotonic: TimeInterval?
+    let confirmationSource: String?
 
     enum CodingKeys: String, CodingKey {
         case format
@@ -554,6 +618,7 @@ struct LocalizedPriceTag: Codable, Equatable {
         case trackingSessionId = "tracking_session_id"
         case priorMapId = "prior_map_id"
         case priorMapSha256 = "prior_map_sha256"
+        case shelfSegmentId = "shelf_segment_id"
         case shelfCode = "shelf_code"
         case rowFlag = "row_flag"
         case crossCode = "cross_code"
@@ -568,14 +633,123 @@ struct LocalizedPriceTag: Codable, Equatable {
         case measurementMethod = "measurement_method"
         case needsReview = "needs_review"
         case userConfirmed = "user_confirmed"
+        case captureId = "capture_id"
+        case frameObservationIds = "frame_observation_ids"
+        case algorithmShelfSegmentId = "algorithm_shelf_segment_id"
+        case algorithmShelfCode = "algorithm_shelf_code"
+        case algorithmSide = "algorithm_side"
+        case algorithmDistanceFromShelfStartCm =
+            "algorithm_distance_from_shelf_start_cm"
+        case algorithmAssociationConfidence =
+            "algorithm_association_confidence"
+        case confirmationStatus = "confirmation_status"
+        case userConfirmedShelfSegmentId = "user_confirmed_shelf_segment_id"
+        case userConfirmedShelfCode = "user_confirmed_shelf_code"
+        case userConfirmedSide = "user_confirmed_side"
+        case userConfirmedDistanceFromShelfStartCm =
+            "user_confirmed_distance_from_shelf_start_cm"
+        case confirmedAtUTC = "confirmed_at_utc"
+        case confirmedAtMonotonic = "confirmed_at_monotonic"
+        case confirmationSource = "confirmation_source"
+    }
+
+    init(
+        format: String,
+        version: Int,
+        tagId: String,
+        observationId: String,
+        payload: String,
+        symbology: String,
+        floorId: String,
+        timestamp: TimeInterval,
+        trackingSessionId: String,
+        priorMapId: String,
+        priorMapSha256: String,
+        shelfSegmentId: String? = nil,
+        shelfCode: String?,
+        rowFlag: String?,
+        crossCode: String?,
+        shelfSide: String?,
+        distanceFromShelfStartCm: Double?,
+        heightCm: Double?,
+        rawMapPosition: PriorMapTagPoint3D?,
+        snappedMapPosition: PriorMapTagPoint3D?,
+        localizationConfidence: Double,
+        measurementConfidence: Double,
+        associationConfidence: Double,
+        measurementMethod: String,
+        needsReview: Bool,
+        userConfirmed: Bool,
+        captureId: String? = nil,
+        frameObservationIds: [String]? = nil,
+        algorithmShelfSegmentId: String? = nil,
+        algorithmShelfCode: String? = nil,
+        algorithmSide: String? = nil,
+        algorithmDistanceFromShelfStartCm: Double? = nil,
+        algorithmAssociationConfidence: Double? = nil,
+        confirmationStatus: String? = nil,
+        userConfirmedShelfSegmentId: String? = nil,
+        userConfirmedShelfCode: String? = nil,
+        userConfirmedSide: String? = nil,
+        userConfirmedDistanceFromShelfStartCm: Double? = nil,
+        confirmedAtUTC: TimeInterval? = nil,
+        confirmedAtMonotonic: TimeInterval? = nil,
+        confirmationSource: String? = nil
+    ) {
+        self.format = format
+        self.version = version
+        self.tagId = tagId
+        self.observationId = observationId
+        self.payload = payload
+        self.symbology = symbology
+        self.floorId = floorId
+        self.timestamp = timestamp
+        self.trackingSessionId = trackingSessionId
+        self.priorMapId = priorMapId
+        self.priorMapSha256 = priorMapSha256
+        self.shelfSegmentId = shelfSegmentId
+        self.shelfCode = shelfCode
+        self.rowFlag = rowFlag
+        self.crossCode = crossCode
+        self.shelfSide = shelfSide
+        self.distanceFromShelfStartCm = distanceFromShelfStartCm
+        self.heightCm = heightCm
+        self.rawMapPosition = rawMapPosition
+        self.snappedMapPosition = snappedMapPosition
+        self.localizationConfidence = localizationConfidence
+        self.measurementConfidence = measurementConfidence
+        self.associationConfidence = associationConfidence
+        self.measurementMethod = measurementMethod
+        self.needsReview = needsReview
+        self.userConfirmed = userConfirmed
+        self.captureId = captureId
+        self.frameObservationIds = frameObservationIds
+        self.algorithmShelfSegmentId = algorithmShelfSegmentId
+        self.algorithmShelfCode = algorithmShelfCode
+        self.algorithmSide = algorithmSide
+        self.algorithmDistanceFromShelfStartCm =
+            algorithmDistanceFromShelfStartCm
+        self.algorithmAssociationConfidence = algorithmAssociationConfidence
+        self.confirmationStatus = confirmationStatus
+        self.userConfirmedShelfSegmentId = userConfirmedShelfSegmentId
+        self.userConfirmedShelfCode = userConfirmedShelfCode
+        self.userConfirmedSide = userConfirmedSide
+        self.userConfirmedDistanceFromShelfStartCm =
+            userConfirmedDistanceFromShelfStartCm
+        self.confirmedAtUTC = confirmedAtUTC
+        self.confirmedAtMonotonic = confirmedAtMonotonic
+        self.confirmationSource = confirmationSource
     }
 }
 
 extension LocalizedPriceTag {
-    func confirmedByUser() -> LocalizedPriceTag {
+    func bindingCapture(
+        captureID: UUID,
+        observationIDs: [String]
+    ) -> LocalizedPriceTag {
         return LocalizedPriceTag(
             format: format,
-            version: version,
+            version: max(2, version),
             tagId: tagId,
             observationId: observationId,
             payload: payload,
@@ -585,6 +759,7 @@ extension LocalizedPriceTag {
             trackingSessionId: trackingSessionId,
             priorMapId: priorMapId,
             priorMapSha256: priorMapSha256,
+            shelfSegmentId: shelfSegmentId,
             shelfCode: shelfCode,
             rowFlag: rowFlag,
             crossCode: crossCode,
@@ -598,7 +773,112 @@ extension LocalizedPriceTag {
             associationConfidence: associationConfidence,
             measurementMethod: measurementMethod,
             needsReview: needsReview,
-            userConfirmed: true)
+            userConfirmed: userConfirmed,
+            captureId: captureID.uuidString.lowercased(),
+            frameObservationIds: observationIDs,
+            algorithmShelfSegmentId:
+                algorithmShelfSegmentId ?? shelfSegmentId,
+            algorithmShelfCode: algorithmShelfCode ?? shelfCode,
+            algorithmSide: algorithmSide ?? shelfSide,
+            algorithmDistanceFromShelfStartCm:
+                algorithmDistanceFromShelfStartCm
+                    ?? distanceFromShelfStartCm,
+            algorithmAssociationConfidence:
+                algorithmAssociationConfidence ?? associationConfidence,
+            confirmationStatus: confirmationStatus ?? "ALGORITHM_ONLY",
+            userConfirmedShelfSegmentId: userConfirmedShelfSegmentId,
+            userConfirmedShelfCode: userConfirmedShelfCode,
+            userConfirmedSide: userConfirmedSide,
+            userConfirmedDistanceFromShelfStartCm:
+                userConfirmedDistanceFromShelfStartCm,
+            confirmedAtUTC: confirmedAtUTC,
+            confirmedAtMonotonic: confirmedAtMonotonic,
+            confirmationSource: confirmationSource)
+    }
+
+    func applyingConfirmation(
+        decision: ShelfConfirmationDecision,
+        candidates: [PriceTagShelfCandidate],
+        confirmedAtUTC: TimeInterval,
+        confirmedAtMonotonic: TimeInterval
+    ) -> LocalizedPriceTag? {
+        let candidate: PriceTagShelfCandidate
+        let status: String
+        switch decision {
+        case .confirmedAlgorithmCandidate:
+            guard let segmentID = algorithmShelfSegmentId ?? shelfSegmentId,
+                  let value = candidates.first(where: {
+                      $0.shelfSegmentId == segmentID
+                          && $0.side == (algorithmSide ?? shelfSide)
+                  }), value.isSelectable else {
+                return nil
+            }
+            candidate = value
+            status = "USER_CONFIRMED"
+        case .selectedAlternative(let segmentID, let side):
+            guard let value = candidates.first(where: {
+                $0.shelfSegmentId == segmentID
+                    && $0.side == side
+                    && $0.isSelectable
+            }) else {
+                return nil
+            }
+            candidate = value
+            status = candidate.shelfSegmentId
+                == (algorithmShelfSegmentId ?? shelfSegmentId)
+                && candidate.side == (algorithmSide ?? shelfSide)
+                ? "USER_CONFIRMED"
+                : "USER_OVERRIDDEN"
+        case .rescan, .observationOnly:
+            return nil
+        }
+        return LocalizedPriceTag(
+            format: format,
+            version: max(2, version),
+            tagId: tagId,
+            observationId: observationId,
+            payload: payload,
+            symbology: symbology,
+            floorId: floorId,
+            timestamp: timestamp,
+            trackingSessionId: trackingSessionId,
+            priorMapId: priorMapId,
+            priorMapSha256: priorMapSha256,
+            shelfSegmentId: shelfSegmentId,
+            shelfCode: shelfCode,
+            rowFlag: rowFlag,
+            crossCode: crossCode,
+            shelfSide: shelfSide,
+            distanceFromShelfStartCm: distanceFromShelfStartCm,
+            heightCm: heightCm,
+            rawMapPosition: rawMapPosition,
+            snappedMapPosition: snappedMapPosition,
+            localizationConfidence: localizationConfidence,
+            measurementConfidence: measurementConfidence,
+            associationConfidence: associationConfidence,
+            measurementMethod: measurementMethod,
+            needsReview: needsReview,
+            userConfirmed: true,
+            captureId: captureId,
+            frameObservationIds: frameObservationIds,
+            algorithmShelfSegmentId:
+                algorithmShelfSegmentId ?? shelfSegmentId,
+            algorithmShelfCode: algorithmShelfCode ?? shelfCode,
+            algorithmSide: algorithmSide ?? shelfSide,
+            algorithmDistanceFromShelfStartCm:
+                algorithmDistanceFromShelfStartCm
+                    ?? distanceFromShelfStartCm,
+            algorithmAssociationConfidence:
+                algorithmAssociationConfidence ?? associationConfidence,
+            confirmationStatus: status,
+            userConfirmedShelfSegmentId: candidate.shelfSegmentId,
+            userConfirmedShelfCode: candidate.shelfCode,
+            userConfirmedSide: candidate.side,
+            userConfirmedDistanceFromShelfStartCm:
+                candidate.distanceFromStartCm,
+            confirmedAtUTC: confirmedAtUTC,
+            confirmedAtMonotonic: confirmedAtMonotonic,
+            confirmationSource: "on_device_operator")
     }
 }
 
@@ -937,6 +1217,45 @@ enum ShelfAssociation {
         priorMapSha256: String = "",
         timestamp: TimeInterval = 0
     ) -> LocalizedPriceTag {
+        return localizedTagResult(
+            observationId: observationId,
+            payload: payload,
+            symbology: symbology,
+            floorId: floorId,
+            rawPosition: rawPosition,
+            cameraPosition: cameraPosition,
+            shelves: shelves,
+            fixedStructures: fixedStructures,
+            localizationState: localizationState,
+            localizationConfidence: localizationConfidence,
+            measurementConfidence: measurementConfidence,
+            measurementMethod: measurementMethod,
+            userConfirmed: userConfirmed,
+            trackingSessionId: trackingSessionId,
+            priorMapId: priorMapId,
+            priorMapSha256: priorMapSha256,
+            timestamp: timestamp).tag
+    }
+
+    static func localizedTagResult(
+        observationId: String,
+        payload: String,
+        symbology: String,
+        floorId: String,
+        rawPosition: PriorMapTagPoint3D?,
+        cameraPosition: SIMD2<Double>,
+        shelves: [PriorMapShelf],
+        fixedStructures: [PriorMapFixedStructure] = [],
+        localizationState: String,
+        localizationConfidence: Double,
+        measurementConfidence: Double,
+        measurementMethod: String,
+        userConfirmed: Bool,
+        trackingSessionId: String = "",
+        priorMapId: String = "",
+        priorMapSha256: String = "",
+        timestamp: TimeInterval = 0
+    ) -> PriceTagShelfAssociationResult {
         let candidates = rawPosition.map {
             associationCandidates(
                 rawPosition: $0,
@@ -977,9 +1296,34 @@ enum ShelfAssociation {
                 yM: $0.snapped.y,
                 heightM: rawPosition?.heightM)
         }
-        return LocalizedPriceTag(
+        let publicCandidates = candidates.prefix(5).map { candidate in
+            PriceTagShelfCandidate(
+                shelfSegmentId: candidate.shelf.id,
+                shelfCode: candidate.shelf.code,
+                rowFlag: candidate.shelf.rowFlag,
+                crossCode: candidate.shelf.crossCode,
+                side: candidate.side,
+                distanceFromStartCm: candidate.offsetM * 100,
+                distanceToShelfM: candidate.distanceM,
+                associationConfidence: min(1, max(0, candidate.score)),
+                occluded: candidate.occluded,
+                blockedByOtherStructure: candidate.blockedByOtherStructure,
+                snappedPosition: PriorMapTagPoint3D(
+                    xM: candidate.snapped.x,
+                    yM: candidate.snapped.y,
+                    heightM: rawPosition?.heightM),
+                outline: candidate.shelf.geometry.coordinates.compactMap {
+                    guard $0.count >= 2,
+                          $0[0].isFinite,
+                          $0[1].isFinite else {
+                        return nil
+                    }
+                    return PriceTagShelfPreviewPoint(xM: $0[0], yM: $0[1])
+                })
+        }
+        let tag = LocalizedPriceTag(
             format: "MarketScannerLocalizedPriceTag",
-            version: 1,
+            version: 2,
             tagId: UUID().uuidString,
             observationId: observationId,
             payload: payload,
@@ -989,6 +1333,7 @@ enum ShelfAssociation {
             trackingSessionId: trackingSessionId,
             priorMapId: priorMapId,
             priorMapSha256: priorMapSha256,
+            shelfSegmentId: best?.shelf.id,
             shelfCode: best?.shelf.code,
             rowFlag: best?.shelf.rowFlag,
             crossCode: best?.shelf.crossCode,
@@ -1002,6 +1347,17 @@ enum ShelfAssociation {
             associationConfidence: associationConfidence,
             measurementMethod: measurementMethod,
             needsReview: needsReview,
-            userConfirmed: userConfirmed)
+            userConfirmed: userConfirmed,
+            algorithmShelfSegmentId: best?.shelf.id,
+            algorithmShelfCode: best?.shelf.code,
+            algorithmSide: best?.side,
+            algorithmDistanceFromShelfStartCm:
+                best.map { $0.offsetM * 100 },
+            algorithmAssociationConfidence: associationConfidence,
+            confirmationStatus: "ALGORITHM_ONLY")
+        return PriceTagShelfAssociationResult(
+            tag: tag,
+            candidates: publicCandidates,
+            algorithmCandidateReliable: !needsReview && best != nil)
     }
 }

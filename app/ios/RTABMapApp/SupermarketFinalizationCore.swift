@@ -142,6 +142,27 @@ enum LocalizationEvidenceBundleValidator {
         let recordIdField: String?
     }
 
+    private struct TagObservationBinding: Equatable {
+        let burstID: String
+        let frameID: String
+        let payload: String
+        let symbology: String
+    }
+
+    private struct TagBurstFrameBinding: Equatable {
+        let burstID: String
+        let frameID: String
+        let payload: String
+        let symbology: String
+    }
+
+    private struct VerifiedTagBurstAuthority {
+        let burstID: String
+        let payload: String
+        let symbology: String
+        let observationIDs: Set<String>
+    }
+
     private struct JSONLValidationSummary {
         var count = 0
         var lastState: String?
@@ -149,6 +170,12 @@ enum LocalizationEvidenceBundleValidator {
         var seenRecordIds = Set<String>()
         var lastRecoveryEpisodeId: Int?
         var lastRecordId: String?
+        var previousTagBurstSequence: Int?
+        var verifiedTagBurstAuthoritiesByID:
+            [String: VerifiedTagBurstAuthority] = [:]
+        var tagObservationBindingsByID: [String: TagObservationBinding] = [:]
+        var burstFrameBindingsByObservationID:
+            [String: TagBurstFrameBinding] = [:]
     }
 
     static func blockers(
@@ -219,7 +246,7 @@ enum LocalizationEvidenceBundleValidator {
             JSONLContract(
                 fileName: "tag_observation_bursts.jsonl",
                 format: "MarketScannerPriceTagBurst",
-                version: 1,
+                version: 2,
                 expectedCount: expectation.tagBurstCount,
                 requiredNonEmpty: expectation.tagBurstCount > 0,
                 strictlyIncreasingTimestamps: false,
@@ -259,12 +286,37 @@ enum LocalizationEvidenceBundleValidator {
             }
         }
 
+        let burstFrameBindings =
+            summaries["tag_observation_bursts.jsonl"]?
+                .burstFrameBindingsByObservationID ?? [:]
+        let observationBindings = summaries["tag_observations.jsonl"]?
+            .tagObservationBindingsByID ?? [:]
+        if !burstFrameBindings.isEmpty || !observationBindings.isEmpty {
+            let exactBinding =
+                burstFrameBindings.count == observationBindings.count
+                && burstFrameBindings.allSatisfy {
+                    observationID, burstFrame in
+                    observationBindings[observationID] == TagObservationBinding(
+                        burstID: burstFrame.burstID,
+                        frameID: burstFrame.frameID,
+                        payload: burstFrame.payload,
+                        symbology: burstFrame.symbology)
+                }
+            if !exactBinding {
+                blockers.append(
+                    "evidence_bundle_tag_burst_observation_binding_mismatch")
+            }
+        }
+
         let tagsURL = segmentDirectory.appendingPathComponent(
             "localized_price_tags.json")
         do {
             let tags = try validateLocalizedTags(
                 at: tagsURL,
-                expectation: expectation)
+                expectation: expectation,
+                verifiedBurstAuthorities:
+                    summaries["tag_observation_bursts.jsonl"]?
+                        .verifiedTagBurstAuthoritiesByID ?? [:])
             if tags.count != expectation.localizedPriceTagCount {
                 blockers.append("evidence_bundle_localized_price_tags_count_mismatch")
             }
@@ -513,7 +565,8 @@ enum LocalizationEvidenceBundleValidator {
 
     private static func validateLocalizedTags(
         at url: URL,
-        expectation: LocalizationEvidenceBundleExpectation
+        expectation: LocalizationEvidenceBundleExpectation,
+        verifiedBurstAuthorities: [String: VerifiedTagBurstAuthority]
     ) throws -> [[String: Any]] {
         let data = try SafeSessionPath.readRegularFile(
             url,
@@ -539,7 +592,7 @@ enum LocalizationEvidenceBundleValidator {
               values.count <= maximumLocalizedTagRecords else {
             throw validationError("invalid_json_array")
         }
-        let allowedFields = Set([
+        let legacyFields = Set([
             "format", "version", "tag_id", "observation_id", "payload",
             "symbology", "floor_id", "timestamp", "tracking_session_id",
             "prior_map_id", "prior_map_sha256", "shelf_code", "row_flag",
@@ -549,12 +602,32 @@ enum LocalizationEvidenceBundleValidator {
             "association_confidence", "measurement_method", "needs_review",
             "user_confirmed",
         ])
+        let confirmationFields = Set([
+            "shelf_segment_id", "capture_id", "frame_observation_ids",
+            "algorithm_shelf_segment_id", "algorithm_shelf_code",
+            "algorithm_side", "algorithm_distance_from_shelf_start_cm",
+            "algorithm_association_confidence", "confirmation_status",
+            "user_confirmed_shelf_segment_id", "user_confirmed_shelf_code",
+            "user_confirmed_side",
+            "user_confirmed_distance_from_shelf_start_cm",
+            "confirmed_at_utc", "confirmed_at_monotonic",
+            "confirmation_source",
+        ])
         var tagIds = Set<String>()
         var observationIds = Set<String>()
+        var captureIds = Set<String>()
+        var frameObservationIds = Set<String>()
         for value in values {
-            guard Set(value.keys).isSubset(of: allowedFields),
-                  value["format"] as? String == "MarketScannerLocalizedPriceTag",
-                  strictInteger(value["version"]) == 1 else {
+            guard value["format"] as? String
+                    == "MarketScannerLocalizedPriceTag",
+                  let version = strictInteger(value["version"]),
+                  version == 1 || version == 2 else {
+                throw validationError("tag_contract_mismatch")
+            }
+            let allowedFields = version == 1
+                ? legacyFields
+                : legacyFields.union(confirmationFields)
+            guard Set(value.keys).isSubset(of: allowedFields) else {
                 throw validationError("tag_contract_mismatch")
             }
             try validateIdentity(value, expectation: expectation)
@@ -565,8 +638,10 @@ enum LocalizationEvidenceBundleValidator {
                   let observationId = value["observation_id"] as? String,
                   !observationId.isEmpty,
                   observationIds.insert(observationId).inserted,
-                  nonEmptyString(value["payload"]),
-                  nonEmptyString(value["symbology"]),
+                  let payload = value["payload"] as? String,
+                  !payload.isEmpty,
+                  let symbology = value["symbology"] as? String,
+                  !symbology.isEmpty,
                   nonEmptyString(value["measurement_method"]),
                   strictNumber(value["timestamp"]) != nil,
                   validUnitInterval(value["localization_confidence"]),
@@ -599,8 +674,121 @@ enum LocalizationEvidenceBundleValidator {
                     throw validationError("tag_business_schema_invalid")
                 }
             }
+            if version == 2 {
+                guard let captureId = value["capture_id"] as? String,
+                      let parsedCaptureId = UUID(uuidString: captureId),
+                      parsedCaptureId.uuidString.lowercased() == captureId,
+                      captureIds.insert(captureId).inserted,
+                      let frames = value["frame_observation_ids"] as? [Any],
+                      frames.count >= 3,
+                      frames.count <= 64,
+                      let frameIds = frames as? [String],
+                      Set(frameIds).count == frameIds.count,
+                      frameIds.allSatisfy({ !$0.isEmpty && $0.count <= 128 }),
+                      frameIds.contains(observationId),
+                      frameIds.allSatisfy({
+                          frameObservationIds.insert($0).inserted
+                      }),
+                      let verifiedBurst =
+                        verifiedBurstAuthorities[captureId],
+                      verifiedBurst.burstID == captureId,
+                      verifiedBurst.payload == payload,
+                      verifiedBurst.symbology == symbology,
+                      verifiedBurst.observationIDs == Set(frameIds),
+                      let algorithmSegmentId =
+                        value["algorithm_shelf_segment_id"] as? String,
+                      !algorithmSegmentId.isEmpty,
+                      algorithmSegmentId.count <= 128,
+                      value["shelf_segment_id"] as? String
+                        == algorithmSegmentId,
+                      let algorithmSide = value["algorithm_side"] as? String,
+                      !algorithmSide.isEmpty,
+                      algorithmSide.count <= 128,
+                      value["shelf_side"] as? String == algorithmSide,
+                      validUnitInterval(
+                        value["algorithm_association_confidence"]),
+                      let status = value["confirmation_status"] as? String,
+                      status == "USER_CONFIRMED"
+                        || status == "USER_OVERRIDDEN",
+                      StrictJSONScalar.boolean(value["user_confirmed"])
+                        == true,
+                      StrictJSONScalar.boolean(value["needs_review"]) == false,
+                      let userSegmentId =
+                        value["user_confirmed_shelf_segment_id"] as? String,
+                      !userSegmentId.isEmpty,
+                      userSegmentId.count <= 128,
+                      let userSide = value["user_confirmed_side"] as? String,
+                      !userSide.isEmpty,
+                      userSide.count <= 128,
+                      let confirmedAtUTC =
+                        strictNumber(value["confirmed_at_utc"]),
+                      confirmedAtUTC > 0,
+                      let confirmedAtMonotonic =
+                        strictNumber(value["confirmed_at_monotonic"]),
+                      confirmedAtMonotonic >= 0,
+                      value["confirmation_source"] as? String
+                        == "on_device_operator" else {
+                    throw validationError("tag_confirmation_schema_invalid")
+                }
+                let sameCandidate = algorithmSegmentId == userSegmentId
+                    && algorithmSide == userSide
+                guard (status == "USER_CONFIRMED" && sameCandidate)
+                    || (status == "USER_OVERRIDDEN" && !sameCandidate) else {
+                    throw validationError("tag_confirmation_schema_invalid")
+                }
+                for fieldName in [
+                    "algorithm_shelf_code", "user_confirmed_shelf_code",
+                ] {
+                    if let string = value[fieldName] as? String {
+                        guard !string.isEmpty && string.count <= 128 else {
+                            throw validationError(
+                                "tag_confirmation_schema_invalid")
+                        }
+                    }
+                    else if value[fieldName] != nil
+                        && !(value[fieldName] is NSNull) {
+                        throw validationError(
+                            "tag_confirmation_schema_invalid")
+                    }
+                }
+                for fieldName in [
+                    "algorithm_distance_from_shelf_start_cm",
+                    "user_confirmed_distance_from_shelf_start_cm",
+                ] {
+                    guard let number = strictNumber(value[fieldName]),
+                          (0.0...100_000.0).contains(number) else {
+                        throw validationError(
+                            "tag_confirmation_schema_invalid")
+                    }
+                }
+                guard optionalStringsEqual(
+                        value["shelf_code"],
+                        value["algorithm_shelf_code"]),
+                      numbersEqual(
+                        value["distance_from_shelf_start_cm"],
+                        value["algorithm_distance_from_shelf_start_cm"]),
+                      numbersEqual(
+                        value["association_confidence"],
+                        value["algorithm_association_confidence"]) else {
+                    throw validationError("tag_confirmation_schema_invalid")
+                }
+            }
         }
         return values
+    }
+
+    private static func optionalStringsEqual(_ lhs: Any?, _ rhs: Any?) -> Bool {
+        let left = lhs is NSNull ? nil : lhs as? String
+        let right = rhs is NSNull ? nil : rhs as? String
+        return left == right
+    }
+
+    private static func numbersEqual(_ lhs: Any?, _ rhs: Any?) -> Bool {
+        guard let left = strictNumber(lhs),
+              let right = strictNumber(rhs) else {
+            return false
+        }
+        return abs(left - right) <= 1.0e-9
     }
 
     private static func validateIdentity(
@@ -625,6 +813,100 @@ enum LocalizationEvidenceBundleValidator {
         fileName: String,
         summary: inout JSONLValidationSummary
     ) throws -> Double {
+        if fileName == "tag_observation_bursts.jsonl" {
+            let allowedFields = Set([
+                "format", "version", "burst_id", "sequence", "barcode",
+                "symbology", "prior_map_id", "prior_map_sha256", "floor_id",
+                "frame_count", "first_frame_timestamp", "last_frame_timestamp",
+                "bound_node_id_min", "bound_node_id_max", "depth_quality",
+                "view_angle", "tracking_quality",
+                "localization_confidence_mean", "tracking_session_id",
+                "complete", "frames",
+            ])
+            let allowedFrameFields = Set([
+                "frame_id", "observation_id", "bound_node_id",
+                "frame_timestamp", "node_timestamp", "depth", "view",
+                "tracking", "confidence",
+            ])
+            guard Set(object.keys).isSubset(of: allowedFields),
+                  let burstID = object["burst_id"] as? String,
+                  !burstID.isEmpty,
+                  let sequence = strictInteger(object["sequence"]),
+                  sequence > 0,
+                  let frameCount = strictInteger(object["frame_count"]),
+                  frameCount > 0,
+                  let frames = object["frames"] as? [[String: Any]],
+                  frames.count == frameCount,
+                  StrictJSONScalar.boolean(object["complete"]) == true,
+                  let barcode = object["barcode"] as? String,
+                  !barcode.isEmpty,
+                  let symbology = object["symbology"] as? String,
+                  !symbology.isEmpty,
+                  validUnitInterval(object["depth_quality"]),
+                  validUnitInterval(object["localization_confidence_mean"]),
+                  let firstTimestamp = strictNumber(
+                    object["first_frame_timestamp"]),
+                  let lastTimestamp = strictNumber(
+                    object["last_frame_timestamp"]),
+                  lastTimestamp >= firstTimestamp else {
+                throw validationError("tag_burst_business_schema_invalid")
+            }
+            guard summary.previousTagBurstSequence.map({ sequence > $0 })
+                    ?? true else {
+                throw validationError("tag_burst_sequence_invalid")
+            }
+            var frameIDs = Set<String>()
+            var observationIDs = Set<String>()
+            var frameTimestamps: [Double] = []
+            var nodeIDs: [Int] = []
+            for frame in frames {
+                guard Set(frame.keys).isSubset(of: allowedFrameFields),
+                      let frameID = frame["frame_id"] as? String,
+                      !frameID.isEmpty,
+                      frameIDs.insert(frameID).inserted,
+                      let observationID = frame["observation_id"] as? String,
+                      !observationID.isEmpty,
+                      observationIDs.insert(observationID).inserted,
+                      let nodeID = strictInteger(frame["bound_node_id"]),
+                      nodeID > 0,
+                      let frameTimestamp = strictNumber(
+                        frame["frame_timestamp"]),
+                      strictNumber(frame["node_timestamp"]) != nil,
+                      validUnitInterval(frame["depth"]),
+                      nonEmptyString(frame["view"]),
+                      nonEmptyString(frame["tracking"]),
+                      validUnitInterval(frame["confidence"]) else {
+                    throw validationError("tag_burst_frame_schema_invalid")
+                }
+                let frameBinding = TagBurstFrameBinding(
+                    burstID: burstID,
+                    frameID: frameID,
+                    payload: barcode,
+                    symbology: symbology)
+                guard summary.burstFrameBindingsByObservationID.updateValue(
+                    frameBinding,
+                    forKey: observationID) == nil else {
+                    throw validationError("tag_burst_frame_schema_invalid")
+                }
+                frameTimestamps.append(frameTimestamp)
+                nodeIDs.append(nodeID)
+            }
+            guard frameTimestamps.min() == firstTimestamp,
+                  frameTimestamps.max() == lastTimestamp,
+                  nodeIDs.min() == strictInteger(object["bound_node_id_min"]),
+                  nodeIDs.max() == strictInteger(object["bound_node_id_max"]),
+                  summary.verifiedTagBurstAuthoritiesByID[burstID] == nil else {
+                throw validationError("tag_burst_summary_mismatch")
+            }
+            summary.verifiedTagBurstAuthoritiesByID[burstID] =
+                VerifiedTagBurstAuthority(
+                    burstID: burstID,
+                    payload: barcode,
+                    symbology: symbology,
+                    observationIDs: observationIDs)
+            summary.previousTagBurstSequence = sequence
+            return lastTimestamp
+        }
         let frameTimestamp = fileName == "tag_observations.jsonl"
             || fileName == "manual_localization_events.jsonl"
         let rawKey = frameTimestamp ? "frameTimestamp" : "timestamp"
@@ -670,6 +952,27 @@ enum LocalizationEvidenceBundleValidator {
                   nonEmptyString(object["symbology"]),
                   validPosition(object["raw_map_position"]) else {
                 throw validationError("tag_business_schema_invalid")
+            }
+            let burstID = object["burst_id"] as? String
+            let frameID = object["frame_id"] as? String
+            guard (burstID == nil) == (frameID == nil) else {
+                throw validationError("tag_business_schema_invalid")
+            }
+            if let burstID, let frameID {
+                guard !burstID.isEmpty,
+                      !frameID.isEmpty,
+                      let observationID = object["observation_id"] as? String,
+                      let payload = object["payload"] as? String,
+                      let symbology = object["symbology"] as? String,
+                      summary.tagObservationBindingsByID.updateValue(
+                        TagObservationBinding(
+                            burstID: burstID,
+                            frameID: frameID,
+                            payload: payload,
+                            symbology: symbology),
+                        forKey: observationID) == nil else {
+                    throw validationError("tag_business_schema_invalid")
+                }
             }
         default:
             break

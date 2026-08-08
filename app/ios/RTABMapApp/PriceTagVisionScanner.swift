@@ -13,6 +13,7 @@ import Vision
 import simd
 
 struct PriceTagVisionDetection {
+    let captureGeneration: UUID
     let observationId: String
     let payload: String
     let symbology: String
@@ -22,51 +23,93 @@ struct PriceTagVisionDetection {
     let imageOrientation: PriorMapCapturedImageOrientation
 }
 
+struct PriceTagVisionScanResult {
+    let generation: UUID
+    let frame: ARFrame
+    let orientation: CGImagePropertyOrientation
+    let alignmentSnapshot: PriorMapAlignmentSnapshot
+    let candidates: [PriceTagBarcodeCandidate]
+
+    func detection(for selected: PriceTagSelectedBarcode) -> PriceTagVisionDetection {
+        return PriceTagVisionDetection(
+            captureGeneration: generation,
+            observationId: UUID().uuidString,
+            payload: selected.candidate.payload,
+            symbology: selected.candidate.symbology,
+            normalizedBounds: PriorMapImageGeometry.nativeSensorBounds(
+                visionBounds: selected.candidate.visionBounds,
+                orientation: PriceTagVisionScanner.captureOrientation(orientation)),
+            frame: frame,
+            alignmentSnapshot: alignmentSnapshot,
+            imageOrientation: PriceTagVisionScanner.captureOrientation(orientation))
+    }
+}
+
+enum PriceTagVisionScannerError: Error, LocalizedError {
+    case invalidRegionOfInterest
+    case requestFailed(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .invalidRegionOfInterest:
+            return "price_tag_roi_invalid"
+        case .requestFailed:
+            return "price_tag_vision_request_failed"
+        }
+    }
+}
+
 final class PriceTagVisionScanner {
     private let queue = DispatchQueue(
         label: "com.introlab.rtabmap.price-tag-vision",
         qos: .userInitiated)
     private let lock = NSLock()
-    private var pending = false
     private var inFlight = false
-    private var generation = UUID()
-    private var recentlySeen: [String: TimeInterval] = [:]
+    private var activeGeneration: UUID?
 
-    func requestScan() -> Bool {
+    func activate(generation: UUID) {
         lock.lock()
-        defer { lock.unlock() }
-        guard !pending, !inFlight else { return false }
-        pending = true
-        return true
-    }
-
-    func reset() {
-        lock.lock()
-        pending = false
+        activeGeneration = generation
         inFlight = false
-        generation = UUID()
-        recentlySeen.removeAll()
         lock.unlock()
     }
 
-    func submitIfRequested(
+    func cancel(generation: UUID? = nil) {
+        lock.lock()
+        if generation == nil || generation == activeGeneration {
+            activeGeneration = nil
+            inFlight = false
+        }
+        lock.unlock()
+    }
+
+    @discardableResult
+    func detect(
         frame: ARFrame,
         orientation: CGImagePropertyOrientation,
+        regionOfInterest: CGRect,
+        generation: UUID,
         alignmentSnapshot: PriorMapAlignmentSnapshot,
-        completion: @escaping (Result<PriceTagVisionDetection, Error>) -> Void
-    ) {
-        lock.lock()
-        guard pending, !inFlight else {
-            lock.unlock()
-            return
+        completion: @escaping (Result<PriceTagVisionScanResult, Error>) -> Void
+    ) -> Bool {
+        guard regionOfInterest.minX >= 0,
+              regionOfInterest.minY >= 0,
+              regionOfInterest.maxX <= 1,
+              regionOfInterest.maxY <= 1,
+              !regionOfInterest.isEmpty else {
+            completion(.failure(PriceTagVisionScannerError.invalidRegionOfInterest))
+            return false
         }
-        pending = false
+        lock.lock()
+        guard activeGeneration == generation, !inFlight else {
+            lock.unlock()
+            return false
+        }
         inFlight = true
-        let token = generation
         lock.unlock()
 
         queue.async {
-            let result: Result<PriceTagVisionDetection, Error>
+            let result: Result<PriceTagVisionScanResult, Error>
             do {
                 let request = VNDetectBarcodesRequest()
                 request.symbologies = [
@@ -77,74 +120,50 @@ final class PriceTagVisionScanner {
                     .UPCE,
                     .PDF417,
                 ]
+                request.regionOfInterest = regionOfInterest
                 let handler = VNImageRequestHandler(
                     cvPixelBuffer: frame.capturedImage,
                     orientation: orientation,
                     options: [:])
                 try handler.perform([request])
                 let candidates = (request.results ?? [])
-                    .compactMap { observation -> VNBarcodeObservation? in
+                    .compactMap { observation -> PriceTagBarcodeCandidate? in
                         guard let payload = observation.payloadStringValue,
                               !payload.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
                             return nil
                         }
-                        return observation
+                        return PriceTagBarcodeCandidate(
+                            payload: payload,
+                            symbology: observation.symbology.rawValue,
+                            visionBounds: observation.boundingBox)
                     }
-                    .sorted {
-                        ($0.boundingBox.width * $0.boundingBox.height)
-                            > ($1.boundingBox.width * $1.boundingBox.height)
-                    }
-                guard let best = candidates.first,
-                      let payload = best.payloadStringValue else {
-                    throw NSError(
-                        domain: "PriceTagVision",
-                        code: 1,
-                        userInfo: [NSLocalizedDescriptionKey: "当前画面未识别到支持的条码，请靠近并保持稳定后重试。"])
-                }
                 result = .success(
-                    PriceTagVisionDetection(
-                        observationId: UUID().uuidString,
-                        payload: payload,
-                        symbology: best.symbology.rawValue,
-                        normalizedBounds: PriorMapImageGeometry.nativeSensorBounds(
-                            visionBounds: best.boundingBox,
-                            orientation: Self.captureOrientation(orientation)),
+                    PriceTagVisionScanResult(
+                        generation: generation,
                         frame: frame,
+                        orientation: orientation,
                         alignmentSnapshot: alignmentSnapshot,
-                        imageOrientation: Self.captureOrientation(orientation)))
+                        candidates: candidates))
             }
             catch {
-                result = .failure(error)
+                result = .failure(
+                    PriceTagVisionScannerError.requestFailed(
+                        error.localizedDescription))
             }
 
             self.lock.lock()
-            guard token == self.generation else {
+            guard generation == self.activeGeneration else {
                 self.lock.unlock()
                 return
             }
             self.inFlight = false
-            if case .success(let detection) = result {
-                let now = detection.frame.timestamp
-                let previous = self.recentlySeen[detection.payload]
-                self.recentlySeen = self.recentlySeen.filter {
-                    now - $0.value <= 5
-                }
-                if let previous = previous, now - previous < 2 {
-                    self.lock.unlock()
-                    completion(.failure(NSError(
-                        domain: "PriceTagVision",
-                        code: 2,
-                        userInfo: [NSLocalizedDescriptionKey: "同一条码刚刚已经识别，请稍后再试。"])))
-                    return
-                }
-                self.recentlySeen[detection.payload] = now
-            }
             self.lock.unlock()
             completion(result)
         }
+        return true
     }
 
-    private static func captureOrientation(
+    static func captureOrientation(
         _ orientation: CGImagePropertyOrientation
     ) -> PriorMapCapturedImageOrientation {
         switch orientation {

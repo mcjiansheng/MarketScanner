@@ -4,24 +4,32 @@ import hashlib
 import json
 import sqlite3
 import math
+import os
 import shutil
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
+import tools.PriorMap.offline_localization as offline_localization
 from tools.PriorMap.offline_localization import (
     CONSTRAINT_CONTRACT,
     DEFAULT_REPLAY_PARAMETERS,
     RECOVERY_EVIDENCE_UNBOUND_LEGACY,
     RECOVERY_EVENT_CONTRACT,
     SESSION_INPUT_FILE_NAMES_V2,
+    SESSION_INPUT_FILE_NAMES_V3,
     Pose,
+    TagPoseBinding,
     OfflineLocalizationError,
     _read_jsonl,
     _validate_jsonl_business_record,
     _validate_recovery_event_sequence,
     _associate_tag,
+    _apply_on_device_confirmation_authority,
+    _enforce_on_device_confirmation_conflict,
+    _read_localized_price_tags_bytes,
+    _verified_tag_burst_observation_ids,
     _segment_intersection,
     apply_pose_delta_to_point,
     bind_tag_observation_to_pose,
@@ -676,6 +684,289 @@ class ShelfAssociationSafetyTests(unittest.TestCase):
         self.assertTrue(result.get("needs_review"))
 
 
+class ESLConfirmationContractTests(unittest.TestCase):
+    def _fixture(self) -> tuple[dict, dict[str, set[str]]]:
+        capture_id = "12345678-1234-4234-8234-123456789abc"
+        frame_ids = ["obs-1", "obs-2", "obs-3"]
+        tag = {
+            "format": "MarketScannerLocalizedPriceTag",
+            "version": 2,
+            "tag_id": "tag-1",
+            "observation_id": "obs-1",
+            "payload": "ESL-001",
+            "symbology": "VNBarcodeSymbologyCode128",
+            "floor_id": "floor-1",
+            "timestamp": 1_700_000_000.0,
+            "tracking_session_id": "session-1",
+            "prior_map_id": "map-1",
+            "prior_map_sha256": "a" * 64,
+            "shelf_segment_id": "shelf-A",
+            "shelf_code": "A-01",
+            "row_flag": "R1",
+            "cross_code": "C1",
+            "shelf_side": "A",
+            "distance_from_shelf_start_cm": 120.0,
+            "height_cm": 110.0,
+            "raw_map_position": {"x_m": 1.0, "y_m": 2.0, "height_m": 1.1},
+            "snapped_map_position": {"x_m": 1.0, "y_m": 1.9, "height_m": 1.1},
+            "localization_confidence": 0.9,
+            "measurement_confidence": 0.85,
+            "association_confidence": 0.8,
+            "measurement_method": "scene_depth",
+            "needs_review": False,
+            "user_confirmed": True,
+            "capture_id": capture_id,
+            "frame_observation_ids": frame_ids,
+            "algorithm_shelf_segment_id": "shelf-A",
+            "algorithm_shelf_code": "A-01",
+            "algorithm_side": "A",
+            "algorithm_distance_from_shelf_start_cm": 120.0,
+            "algorithm_association_confidence": 0.8,
+            "confirmation_status": "USER_OVERRIDDEN",
+            "user_confirmed_shelf_segment_id": "shelf-B",
+            "user_confirmed_shelf_code": "B-02",
+            "user_confirmed_side": "B",
+            "user_confirmed_distance_from_shelf_start_cm": 75.0,
+            "confirmed_at_utc": 1_700_000_001.0,
+            "confirmed_at_monotonic": 123.0,
+            "confirmation_source": "on_device_operator",
+        }
+        return tag, {capture_id: set(frame_ids)}
+
+    def test_strict_v2_tag_requires_exact_verified_complete_burst(self) -> None:
+        tag, verified = self._fixture()
+        encoded = json.dumps([tag], sort_keys=True).encode("utf-8")
+        parsed = _read_localized_price_tags_bytes(
+            encoded,
+            session_id="session-1",
+            expected_map_id="map-1",
+            expected_map_hash="a" * 64,
+            expected_floor_id="floor-1",
+            expected_count=1,
+            verified_burst_observation_ids=verified,
+            verified_burst_identities={
+                next(iter(verified)): (
+                    "ESL-001",
+                    "VNBarcodeSymbologyCode128",
+                )
+            },
+        )
+        self.assertEqual(parsed[0]["confirmation_status"], "USER_OVERRIDDEN")
+
+        unknown = dict(tag)
+        unknown["untrusted_field"] = True
+        with self.assertRaises(OfflineLocalizationError):
+            _read_localized_price_tags_bytes(
+                json.dumps([unknown]).encode("utf-8"),
+                session_id="session-1",
+                expected_map_id="map-1",
+                expected_map_hash="a" * 64,
+                expected_floor_id="floor-1",
+                expected_count=1,
+                verified_burst_observation_ids=verified,
+                verified_burst_identities={
+                    next(iter(verified)): (
+                        "ESL-001",
+                        "VNBarcodeSymbologyCode128",
+                    )
+                },
+            )
+
+        with self.assertRaises(OfflineLocalizationError):
+            _read_localized_price_tags_bytes(
+                encoded,
+                session_id="session-1",
+                expected_map_id="map-1",
+                expected_map_hash="a" * 64,
+                expected_floor_id="floor-1",
+                expected_count=1,
+                verified_burst_observation_ids={
+                    next(iter(verified)): {"obs-1", "obs-2"}
+                },
+                verified_burst_identities={
+                    next(iter(verified)): (
+                        "ESL-001",
+                        "VNBarcodeSymbologyCode128",
+                    )
+                },
+            )
+
+        wrong_payload = dict(tag)
+        wrong_payload["payload"] = "ESL-OTHER"
+        with self.assertRaises(OfflineLocalizationError):
+            _read_localized_price_tags_bytes(
+                json.dumps([wrong_payload]).encode("utf-8"),
+                session_id="session-1",
+                expected_map_id="map-1",
+                expected_map_hash="a" * 64,
+                expected_floor_id="floor-1",
+                expected_count=1,
+                verified_burst_observation_ids=verified,
+                verified_burst_identities={
+                    next(iter(verified)): (
+                        "ESL-001",
+                        "VNBarcodeSymbologyCode128",
+                    )
+                },
+            )
+
+    def test_burst_frames_cross_check_durable_observations(self) -> None:
+        capture_id = "12345678-1234-4234-8234-123456789abc"
+        observations = [
+            {
+                "observation_id": f"obs-{index}",
+                "burst_id": capture_id,
+                "frame_id": f"frame-{index}",
+                "payload": "ESL-001",
+                "symbology": "VNBarcodeSymbologyCode128",
+            }
+            for index in range(1, 4)
+        ]
+        burst = {
+            "burst_id": capture_id,
+            "sequence": 1,
+            "complete": True,
+            "barcode": "ESL-001",
+            "symbology": "VNBarcodeSymbologyCode128",
+            "frames": [
+                {
+                    "observation_id": f"obs-{index}",
+                    "frame_id": f"frame-{index}",
+                }
+                for index in range(1, 4)
+            ],
+        }
+        verified = _verified_tag_burst_observation_ids([burst], observations)
+        self.assertEqual(verified[capture_id], {"obs-1", "obs-2", "obs-3"})
+        observations[1]["burst_id"] = "other"
+        with self.assertRaises(OfflineLocalizationError):
+            _verified_tag_burst_observation_ids([burst], observations)
+
+        observations[1]["burst_id"] = capture_id
+        observations.append(
+            {
+                "observation_id": "obs-extra",
+                "burst_id": capture_id,
+                "frame_id": "frame-extra",
+                "payload": "ESL-001",
+                "symbology": "VNBarcodeSymbologyCode128",
+            }
+        )
+        with self.assertRaises(OfflineLocalizationError):
+            _verified_tag_burst_observation_ids([burst], observations)
+
+    def test_offline_conflict_keeps_user_choice_and_requires_review(self) -> None:
+        tag, _ = self._fixture()
+        tag["final_map_position"] = {"x_m": 1.0, "y_m": 2.0, "height_m": 1.1}
+        derived = _apply_on_device_confirmation_authority(dict(tag))
+        self.assertEqual(derived["shelf_code"], "B-02")
+        self.assertEqual(derived["algorithm_shelf_code"], "A-01")
+        derived["association_audit"] = {
+            "status": "suggested_only",
+            "offline_evidence_reliable": True,
+            "candidates": [{"element_id": "shelf-C", "edge_id": "A"}],
+        }
+        reviewed = _enforce_on_device_confirmation_conflict(derived)
+        self.assertEqual(reviewed["shelf_code"], "B-02")
+        self.assertEqual(
+            reviewed["confirmation_conflict"]["code"],
+            "USER_CONFIRMATION_CONFLICT",
+        )
+        self.assertTrue(reviewed["needs_review"])
+        self.assertEqual(reviewed["approval_status"], "pending")
+
+        consistent = _apply_on_device_confirmation_authority(dict(tag))
+        consistent["association_audit"] = {
+            "status": "suggested_only",
+            "offline_evidence_reliable": True,
+            "candidates": [{"element_id": "shelf-B", "edge_id": "B"}],
+        }
+        consistent_result = _enforce_on_device_confirmation_conflict(
+            consistent
+        )
+        self.assertEqual(
+            consistent_result["confirmation_conflict"]["code"],
+            "NO_CONFLICT",
+        )
+        self.assertFalse(consistent_result["needs_review"])
+        self.assertEqual(consistent_result["approval_status"], "approved")
+
+        weak = _apply_on_device_confirmation_authority(dict(tag))
+        weak["association_audit"] = {
+            "status": "suggested_only",
+            "offline_evidence_reliable": False,
+            "candidates": [{"element_id": "shelf-B", "edge_id": "B"}],
+        }
+        weak_result = _enforce_on_device_confirmation_conflict(weak)
+        self.assertEqual(
+            weak_result["confirmation_conflict"]["code"],
+            "OFFLINE_ASSOCIATION_UNAVAILABLE",
+        )
+        self.assertTrue(weak_result["needs_review"])
+
+    def test_consistent_v2_confirmation_stays_approved_after_reassociation(
+        self,
+    ) -> None:
+        tag, _ = self._fixture()
+        tag.update(
+            {
+                "confirmation_status": "USER_CONFIRMED",
+                "user_confirmed_shelf_segment_id": "shelf-A",
+                "user_confirmed_shelf_code": "A-01",
+                "user_confirmed_side": "A",
+                "user_confirmed_distance_from_shelf_start_cm": 200.0,
+                "final_map_position": {
+                    "x_m": 2.0,
+                    "y_m": 1.1,
+                    "height_m": 1.1,
+                },
+            }
+        )
+
+        def shelf(
+            shelf_id: str,
+            coordinates: list[tuple[float, float]],
+        ) -> dict:
+            return {
+                "id": shelf_id,
+                "code": "A-01" if shelf_id == "shelf-A" else "Z-01",
+                "shape_type": "MapShelf",
+                "row_flag": "R1",
+                "cross_code": "C1",
+                "center_m": [
+                    sum(point[0] for point in coordinates) / len(coordinates),
+                    sum(point[1] for point in coordinates) / len(coordinates),
+                ],
+                "geometry": {
+                    "type": "Polygon",
+                    "coordinates": [list(point) for point in coordinates],
+                },
+            }
+
+        elements = [
+            shelf(
+                "shelf-A",
+                [(0.0, 0.0), (4.0, 0.0), (4.0, 1.0), (0.0, 1.0)],
+            ),
+            shelf(
+                "shelf-Z",
+                [(2.8, 0.0), (6.8, 0.0), (6.8, 1.0), (2.8, 1.0)],
+            ),
+        ]
+        authoritative = _apply_on_device_confirmation_authority(dict(tag))
+        associated = _associate_tag(
+            authoritative,
+            elements,
+            camera_xy=(2.0, 2.0),
+        )
+        result = _enforce_on_device_confirmation_conflict(associated)
+        self.assertEqual(result["confirmation_conflict"]["code"], "NO_CONFLICT")
+        self.assertFalse(result["needs_review"])
+        self.assertEqual(result["approval_status"], "approved")
+        self.assertEqual(result["shelf_code"], "A-01")
+        self.assertEqual(result["algorithm_shelf_code"], "A-01")
+
+
 class ManualEditJournalTests(unittest.TestCase):
     def test_append_after_undo_discards_redo_branch(self) -> None:
         journal = new_manual_edits("a" * 64, "b" * 64)
@@ -1274,6 +1565,300 @@ class LocalizedPipelineTests(unittest.TestCase):
         )
         return recovery_path
 
+    def _upgrade_fixture_to_esl_confirmation_v3(self) -> None:
+        self._upgrade_fixture_to_recovery_manifest_v2()
+        manifest = json.loads((self.prior_map / "manifest.json").read_text())
+        capture_id = "12345678-1234-4234-8234-123456789abc"
+        observation_ids = ["obs-1", "obs-2", "obs-3"]
+        observations: list[dict[str, object]] = []
+        burst_frames: list[dict[str, object]] = []
+        for index, observation_id in enumerate(observation_ids):
+            frame_timestamp = 10.0 + index * 0.1
+            node_timestamp = self.node_timebase_offset + frame_timestamp
+            frame_id = f"frame-{index + 1}"
+            observations.append(
+                {
+                    "format": "MarketScannerPriceTagObservation",
+                    "version": 1,
+                    "observation_id": observation_id,
+                    "burst_id": capture_id,
+                    "frame_id": frame_id,
+                    "frame_timestamp": frame_timestamp,
+                    "node_timebase_frame_timestamp": node_timestamp,
+                    "node_timebase_offset_seconds": self.node_timebase_offset,
+                    "nearest_node_id": 11,
+                    "tracking_session_id": "tracking-1",
+                    "prior_map_sha256": manifest["source_sha256"],
+                    "floor_id": "1",
+                    "raw_map_position": {
+                        "x_m": 2.0,
+                        "y_m": -2.0,
+                        "height_m": 1.2,
+                    },
+                    "payload": "690000000001",
+                    "symbology": "EAN13",
+                }
+            )
+            burst_frames.append(
+                {
+                    "frame_id": frame_id,
+                    "observation_id": observation_id,
+                    "bound_node_id": 11,
+                    "frame_timestamp": frame_timestamp,
+                    "node_timestamp": node_timestamp,
+                    "depth": 0.9,
+                    "view": "front",
+                    "tracking": "normal",
+                    "confidence": 0.9,
+                }
+            )
+        jsonl_write(self.segment / "tag_observations.jsonl", observations)
+        jsonl_write(
+            self.segment / "tag_observation_bursts.jsonl",
+            [
+                {
+                    "format": "MarketScannerPriceTagBurst",
+                    "version": 2,
+                    "burst_id": capture_id,
+                    "sequence": 1,
+                    "barcode": "690000000001",
+                    "symbology": "EAN13",
+                    "prior_map_id": manifest["prior_map_id"],
+                    "prior_map_sha256": manifest["source_sha256"],
+                    "floor_id": "1",
+                    "frame_count": len(burst_frames),
+                    "first_frame_timestamp": 10.0,
+                    "last_frame_timestamp": 10.2,
+                    "bound_node_id_min": 11,
+                    "bound_node_id_max": 11,
+                    "depth_quality": 0.9,
+                    "localization_confidence_mean": 0.9,
+                    "tracking_session_id": "tracking-1",
+                    "complete": True,
+                    "frames": burst_frames,
+                }
+            ],
+        )
+        metadata_path = self.segment / "metadata.json"
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        metadata.update(
+            {
+                "tagObservationBurstCount": 1,
+                "tagObservationBurstLastID": capture_id,
+                "tagObservationBurstComplete": True,
+            }
+        )
+        json_write(metadata_path, metadata)
+        json_write(
+            self.segment / "localized_price_tags.json",
+            [
+                {
+                    "format": "MarketScannerLocalizedPriceTag",
+                    "version": 2,
+                    "tag_id": "tag-1",
+                    "observation_id": "obs-1",
+                    "payload": "690000000001",
+                    "symbology": "EAN13",
+                    "floor_id": "1",
+                    "timestamp": 10.0,
+                    "tracking_session_id": "tracking-1",
+                    "prior_map_id": manifest["prior_map_id"],
+                    "prior_map_sha256": manifest["source_sha256"],
+                    "shelf_segment_id": "shelf-user",
+                    "shelf_code": "USER-01",
+                    "row_flag": "R1",
+                    "cross_code": "C1",
+                    "shelf_side": "A",
+                    "distance_from_shelf_start_cm": 200.0,
+                    "height_cm": 120.0,
+                    "raw_map_position": {
+                        "x_m": 2.0,
+                        "y_m": -2.0,
+                        "height_m": 1.2,
+                    },
+                    "snapped_map_position": {
+                        "x_m": 2.0,
+                        "y_m": -2.0,
+                        "height_m": 1.2,
+                    },
+                    "localization_confidence": 0.9,
+                    "measurement_confidence": 0.9,
+                    "association_confidence": 0.9,
+                    "measurement_method": "scene_depth",
+                    "needs_review": False,
+                    "user_confirmed": True,
+                    "capture_id": capture_id,
+                    "frame_observation_ids": observation_ids,
+                    "algorithm_shelf_segment_id": "shelf-user",
+                    "algorithm_shelf_code": "USER-01",
+                    "algorithm_side": "A",
+                    "algorithm_distance_from_shelf_start_cm": 200.0,
+                    "algorithm_association_confidence": 0.9,
+                    "confirmation_status": "USER_CONFIRMED",
+                    "user_confirmed_shelf_segment_id": "shelf-user",
+                    "user_confirmed_shelf_code": "USER-01",
+                    "user_confirmed_side": "A",
+                    "user_confirmed_distance_from_shelf_start_cm": 200.0,
+                    "confirmed_at_utc": 1_700_000_001.0,
+                    "confirmed_at_monotonic": 123.0,
+                    "confirmation_source": "on_device_operator",
+                }
+            ],
+        )
+
+    def _assert_unavailable_confirmation_output(
+        self,
+        output: Path,
+        result: dict[str, object],
+        expected_reason: str,
+    ) -> None:
+        version_id = str(result["version_id"])
+        snapshot = LocalizedVersionStore(output).resolve_version(version_id)
+        tag = json.loads(
+            (snapshot.version_dir / "localized_price_tags.json").read_text(
+                encoding="utf-8"
+            )
+        )[0]
+        self.assertEqual(tag["user_confirmed_shelf_segment_id"], "shelf-user")
+        self.assertEqual(tag["user_confirmed_side"], "A")
+        self.assertEqual(tag["shelf_code"], "USER-01")
+        self.assertEqual(tag["shelf_side"], "A")
+        self.assertEqual(tag["association_audit"]["status"], "not_attempted")
+        self.assertEqual(tag["association_audit"]["reason"], expected_reason)
+        self.assertFalse(tag["association_audit"]["offline_evidence_reliable"])
+        self.assertEqual(tag["association_audit"]["candidates"], [])
+        self.assertEqual(
+            tag["confirmation_conflict"]["code"],
+            "OFFLINE_ASSOCIATION_UNAVAILABLE",
+        )
+        self.assertEqual(
+            tag["confirmation_conflict"]["disposition"],
+            "REVIEW_REQUIRED",
+        )
+        self.assertTrue(tag["confirmation_conflict"]["rescan_required"])
+        self.assertTrue(tag["needs_review"])
+        self.assertEqual(tag["approval_status"], "pending")
+
+    def test_esl_confirmation_pose_binding_failure_has_stable_unavailable_audit(
+        self,
+    ) -> None:
+        self._upgrade_fixture_to_esl_confirmation_v3()
+        observations_path = self.segment / "tag_observations.jsonl"
+        observations = [
+            json.loads(line)
+            for line in observations_path.read_text(encoding="utf-8").splitlines()
+        ]
+        observations[0]["nearest_node_id"] = 999
+        jsonl_write(observations_path, observations)
+        output = self.root / "localized-esl-pose-binding-unavailable"
+        result = process_localized_session(
+            self.prior_map,
+            self.session,
+            self.poses,
+            self.source_database,
+            self.optimized_database,
+            output,
+        )
+        self._assert_unavailable_confirmation_output(
+            output,
+            result,
+            "tag_pose_binding_failed",
+        )
+
+    def test_esl_confirmation_missing_raw_position_has_stable_unavailable_audit(
+        self,
+    ) -> None:
+        self._upgrade_fixture_to_esl_confirmation_v3()
+        real_reader = offline_localization.read_finalized_session_input_snapshot
+
+        def snapshot_without_raw_position(*args: object, **kwargs: object):
+            snapshot = real_reader(*args, **kwargs)
+            snapshot.jsonl_values["tag_observations.jsonl"][0].pop(
+                "raw_map_position", None
+            )
+            return snapshot
+
+        binding = TagPoseBinding(
+            node_index=10,
+            observation_timestamp=self.node_timebase_offset + 10.0,
+            node_timestamp=self.node_timebase_offset + 10.0,
+            time_delta_seconds=0.0,
+            binding_source="nearest_node_id",
+        )
+        output = self.root / "localized-esl-raw-position-missing"
+        with (
+            mock.patch.object(
+                offline_localization,
+                "read_finalized_session_input_snapshot",
+                side_effect=snapshot_without_raw_position,
+            ),
+            mock.patch.object(
+                offline_localization,
+                "bind_tag_observation_to_pose",
+                return_value=binding,
+            ),
+        ):
+            result = process_localized_session(
+                self.prior_map,
+                self.session,
+                self.poses,
+                self.source_database,
+                self.optimized_database,
+                output,
+            )
+        self._assert_unavailable_confirmation_output(
+            output,
+            result,
+            "tag_raw_map_position_missing",
+        )
+
+    def test_esl_confirmation_invalid_raw_position_has_stable_unavailable_audit(
+        self,
+    ) -> None:
+        self._upgrade_fixture_to_esl_confirmation_v3()
+        real_reader = offline_localization.read_finalized_session_input_snapshot
+
+        def snapshot_with_invalid_raw_position(*args: object, **kwargs: object):
+            snapshot = real_reader(*args, **kwargs)
+            snapshot.jsonl_values["tag_observations.jsonl"][0][
+                "raw_map_position"
+            ] = {"x_m": "invalid", "y_m": -2.0, "height_m": 1.2}
+            return snapshot
+
+        binding = TagPoseBinding(
+            node_index=10,
+            observation_timestamp=self.node_timebase_offset + 10.0,
+            node_timestamp=self.node_timebase_offset + 10.0,
+            time_delta_seconds=0.0,
+            binding_source="nearest_node_id",
+        )
+        output = self.root / "localized-esl-raw-position-invalid"
+        with (
+            mock.patch.object(
+                offline_localization,
+                "read_finalized_session_input_snapshot",
+                side_effect=snapshot_with_invalid_raw_position,
+            ),
+            mock.patch.object(
+                offline_localization,
+                "bind_tag_observation_to_pose",
+                return_value=binding,
+            ),
+        ):
+            result = process_localized_session(
+                self.prior_map,
+                self.session,
+                self.poses,
+                self.source_database,
+                self.optimized_database,
+                output,
+            )
+        self._assert_unavailable_confirmation_output(
+            output,
+            result,
+            "tag_raw_map_position_invalid",
+        )
+
     def test_p1_p3_recovery_file_bytes_bind_the_v2_bundle_sha(self) -> None:
         recovery_path = self._upgrade_fixture_to_recovery_manifest_v2()
         baseline = build_session_input_manifest(self.segment, self.source_database)
@@ -1389,6 +1974,163 @@ class LocalizedPipelineTests(unittest.TestCase):
             session_input_bundle_sha256(transported_with_audit),
             first["bundle_sha256"],
         )
+
+    def test_session_manifest_rejects_non_integer_version_after_rehash(self) -> None:
+        baseline = build_session_input_manifest(
+            self.segment, self.source_database
+        )
+        for invalid_version in (True, 1.0, "1"):
+            with self.subTest(invalid_version=repr(invalid_version)):
+                tampered = json.loads(json.dumps(baseline))
+                tampered["version"] = invalid_version
+                canonical = {
+                    "format": tampered["format"],
+                    "version": invalid_version,
+                    "source_database_sha256": tampered[
+                        "source_database_sha256"
+                    ],
+                    "files": tampered["files"],
+                }
+                tampered["bundle_sha256"] = hashlib.sha256(
+                    json.dumps(
+                        canonical,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                ).hexdigest()
+                with self.assertRaisesRegex(
+                    OfflineLocalizationError,
+                    "contract is invalid",
+                ):
+                    session_input_bundle_sha256(tampered)
+
+    def test_source_database_hardlink_is_rejected_at_every_read_stage(self) -> None:
+        alias = self.segment / "source-hardlink.db"
+        os.link(self.source_database, alias)
+        actions = (
+            lambda: build_session_input_manifest(
+                self.segment, self.source_database
+            ),
+            lambda: offline_localization.read_finalized_session_input_snapshot(
+                self.segment, self.source_database
+            ),
+            lambda: offline_localization._verified_source_database_copy(
+                self.source_database,
+                self.root / "hardlink-copy",
+                hashlib.sha256(self.source_database.read_bytes()).hexdigest(),
+            ),
+        )
+        for action in actions:
+            with self.subTest(action=repr(action)):
+                with self.assertRaisesRegex(
+                    OfflineLocalizationError,
+                    "unlinked regular file",
+                ):
+                    action()
+
+    def test_source_database_wal_and_journal_gate_is_deterministic(self) -> None:
+        baseline = build_session_input_manifest(
+            self.segment, self.source_database
+        )
+        wal = self.source_database.with_name(self.source_database.name + "-wal")
+        journal = self.source_database.with_name(
+            self.source_database.name + "-journal"
+        )
+        wal.write_bytes(b"")
+        self.assertEqual(
+            build_session_input_manifest(self.segment, self.source_database),
+            baseline,
+        )
+        wal.unlink()
+        self.assertEqual(
+            build_session_input_manifest(self.segment, self.source_database),
+            baseline,
+        )
+        wal.write_bytes(b"pending-wal")
+        for action in (
+            lambda: build_session_input_manifest(
+                self.segment, self.source_database
+            ),
+            lambda: offline_localization.read_finalized_session_input_snapshot(
+                self.segment, self.source_database
+            ),
+            lambda: offline_localization._verified_source_database_copy(
+                self.source_database,
+                self.root / "wal-copy",
+                baseline["source_database_sha256"],
+            ),
+        ):
+            with self.assertRaisesRegex(
+                OfflineLocalizationError,
+                "non-empty WAL",
+            ):
+                action()
+        wal.unlink()
+        journal.write_bytes(b"")
+        self.assertEqual(
+            build_session_input_manifest(self.segment, self.source_database),
+            baseline,
+        )
+        journal.write_bytes(b"active-journal")
+        for action in (
+            lambda: build_session_input_manifest(
+                self.segment, self.source_database
+            ),
+            lambda: offline_localization.read_finalized_session_input_snapshot(
+                self.segment, self.source_database
+            ),
+            lambda: offline_localization._verified_source_database_copy(
+                self.source_database,
+                self.root / "journal-copy",
+                baseline["source_database_sha256"],
+            ),
+        ):
+            with self.assertRaisesRegex(
+                OfflineLocalizationError,
+                "active rollback journal",
+            ):
+                action()
+
+    def test_esl_v3_manifest_binds_complete_burst_sidecar(self) -> None:
+        self._upgrade_fixture_to_recovery_manifest_v2()
+        metadata_path = self.segment / "metadata.json"
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        metadata.update(
+            {
+                "tagObservationBurstCount": 1,
+                "tagObservationBurstLastID": "burst-1",
+                "tagObservationBurstComplete": True,
+            }
+        )
+        json_write(metadata_path, metadata)
+        tags_path = self.segment / "localized_price_tags.json"
+        tags = json.loads(tags_path.read_text(encoding="utf-8"))
+        tags[0]["version"] = 2
+        json_write(tags_path, tags)
+        (self.segment / "tag_observation_bursts.jsonl").write_text(
+            '{"format":"MarketScannerPriceTagBurst","version":2}\n',
+            encoding="utf-8",
+        )
+
+        first = build_session_input_manifest(self.segment, self.source_database)
+        second = build_session_input_manifest(self.segment, self.source_database)
+        self.assertEqual(first, second)
+        self.assertEqual(first["version"], 3)
+        self.assertEqual(
+            [entry["role"] for entry in first["files"]],
+            ["metadata", "source_database", *SESSION_INPUT_FILE_NAMES_V3[1:]],
+        )
+        self.assertEqual(
+            session_input_bundle_sha256(first), first["bundle_sha256"]
+        )
+
+        burst_path = self.segment / "tag_observation_bursts.jsonl"
+        original = burst_path.read_bytes()
+        burst_path.write_bytes(original + b" ")
+        changed = build_session_input_manifest(
+            self.segment, self.source_database
+        )
+        self.assertNotEqual(changed["bundle_sha256"], first["bundle_sha256"])
 
     def test_output_root_rejects_a_different_session_identity(self) -> None:
         output = self.root / "localized-bound-output"

@@ -624,6 +624,7 @@ class LocalizedVersionStoreTests(unittest.TestCase):
                 "source_database_sha256_before": self.identity_hashes[
                     "source_database_sha256"
                 ],
+                "source_database_name": "source.db",
                 "optimized_database_sha256": self.identity_hashes[
                     "optimized_database_sha256"
                 ],
@@ -637,6 +638,10 @@ class LocalizedVersionStoreTests(unittest.TestCase):
                 "input_identity_id": self.input_identity_id,
                 "factor_graph_quality_policy_sha256": TEST_QUALITY_POLICY_SHA,
                 "factor_graph_quality_policy_version": "test-frozen-1",
+                "session_input_manifest_version": 1,
+                "recovery_evidence_binding": (
+                    "recovery_lifecycle_evidence_unbound_legacy"
+                ),
                 **self.identity_hashes,
             },
             "session_input_manifest.json": {
@@ -649,6 +654,9 @@ class LocalizedVersionStoreTests(unittest.TestCase):
                     "session_input_bundle_sha256"
                 ],
                 "input_identity_id": self.input_identity_id,
+                "recovery_evidence_binding": (
+                    "recovery_lifecycle_evidence_unbound_legacy"
+                ),
                 "files": self.session_input_files,
             },
             "online_localization_trace.json": [],
@@ -664,6 +672,10 @@ class LocalizedVersionStoreTests(unittest.TestCase):
                 "format": "MarketScannerLocalizationReport",
                 "version": 1,
                 "publish_state": state,
+                "session_input_manifest_version": 1,
+                "recovery_evidence_binding": (
+                    "recovery_lifecycle_evidence_unbound_legacy"
+                ),
                 "publish_gate": {"passed": True, "blockers": []},
                 "solver": {
                     "type": "relative_se2_factor_graph",
@@ -734,6 +746,40 @@ class LocalizedVersionStoreTests(unittest.TestCase):
             {path.name for path in staging.iterdir()},
         )
         return staging
+
+    def rewrite_session_bundle(
+        self,
+        staging: Path,
+        mutate,
+    ) -> dict[str, object]:
+        session_path = staging / "session_input_manifest.json"
+        payload = json.loads(session_path.read_text(encoding="utf-8"))
+        mutate(payload)
+        canonical = {
+            "format": payload["format"],
+            "version": payload["version"],
+            "source_database_sha256": payload["source_database_sha256"],
+            "files": payload["files"],
+        }
+        bundle_sha = hashlib.sha256(
+            json.dumps(
+                canonical,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        payload["bundle_sha256"] = bundle_sha
+        session_path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+        for name in (
+            "source_manifest.json",
+            "processing_manifest.json",
+            "manual_edits.json",
+        ):
+            path = staging / name
+            cross_payload = json.loads(path.read_text(encoding="utf-8"))
+            cross_payload["session_input_bundle_sha256"] = bundle_sha
+            path.write_text(json.dumps(cross_payload) + "\n", encoding="utf-8")
+        return payload
 
     def commit_valid(
         self, *, revision: int = 1, state: str = "draft", update_current: bool = True
@@ -867,6 +913,295 @@ class LocalizedVersionStoreTests(unittest.TestCase):
         assert current is not None
         self.assertEqual(current.version_id, first.version_id)
         self.assertTrue(first.version_dir.is_dir())
+
+    def test_validate_staging_accepts_bound_session_manifest_v2_and_v3(self) -> None:
+        for manifest_version, extra_roles in (
+            (
+                2,
+                (
+                    (
+                        "localization_recovery_events.jsonl",
+                        "localization_recovery_events.jsonl",
+                    ),
+                ),
+            ),
+            (
+                3,
+                (
+                    (
+                        "localization_recovery_events.jsonl",
+                        "localization_recovery_events.jsonl",
+                    ),
+                    (
+                        "tag_observation_bursts.jsonl",
+                        "tag_observation_bursts.jsonl",
+                    ),
+                ),
+            ),
+        ):
+            with self.subTest(manifest_version=manifest_version):
+                staging = self.write_valid_staging(revision=manifest_version)
+                files = list(self.session_input_files)
+                for role, file_name in extra_roles:
+                    insert_at = 5 if role == "localization_recovery_events.jsonl" else -1
+                    files.insert(
+                        insert_at,
+                        {
+                            "role": role,
+                            "file": file_name,
+                            "bytes": 0,
+                            "sha256": "9" * 64,
+                        },
+                    )
+                canonical = {
+                    "format": "MarketScannerLocalizedInputManifest",
+                    "version": manifest_version,
+                    "source_database_sha256": "b" * 64,
+                    "files": files,
+                }
+                bundle_sha = hashlib.sha256(
+                    json.dumps(
+                        canonical,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                ).hexdigest()
+                session_path = staging / "session_input_manifest.json"
+                session_payload = json.loads(session_path.read_text(encoding="utf-8"))
+                session_payload.update(
+                    {
+                        "version": manifest_version,
+                        "files": files,
+                        "bundle_sha256": bundle_sha,
+                    }
+                )
+                session_payload.pop("recovery_evidence_binding", None)
+                session_path.write_text(
+                    json.dumps(session_payload) + "\n", encoding="utf-8"
+                )
+                for name in (
+                    "source_manifest.json",
+                    "processing_manifest.json",
+                    "manual_edits.json",
+                ):
+                    path = staging / name
+                    payload = json.loads(path.read_text(encoding="utf-8"))
+                    payload["session_input_bundle_sha256"] = bundle_sha
+                    if name == "processing_manifest.json":
+                        payload["session_input_manifest_version"] = manifest_version
+                        payload["recovery_evidence_binding"] = (
+                            "recovery_lifecycle_evidence_bound_v2"
+                        )
+                    path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+                report_path = staging / "localization_report.json"
+                report_payload = json.loads(report_path.read_text(encoding="utf-8"))
+                report_payload["session_input_manifest_version"] = manifest_version
+                report_payload["recovery_evidence_binding"] = (
+                    "recovery_lifecycle_evidence_bound_v2"
+                )
+                report_path.write_text(
+                    json.dumps(report_payload) + "\n", encoding="utf-8"
+                )
+
+                manifest = self.store.validate_staging(
+                    staging, parent_version=None
+                )
+                self.assertEqual(
+                    manifest["session_input_bundle_sha256"], bundle_sha
+                )
+                self.store.abort(staging)
+
+    def test_validate_staging_rejects_v3_role_filename_tampering(self) -> None:
+        staging = self.write_valid_staging(revision=3)
+        files = list(self.session_input_files)
+        files.insert(
+            5,
+            {
+                "role": "localization_recovery_events.jsonl",
+                "file": "localization_recovery_events.jsonl",
+                "bytes": 0,
+                "sha256": "9" * 64,
+            },
+        )
+        files.insert(
+            -1,
+            {
+                "role": "tag_observation_bursts.jsonl",
+                "file": "not-the-burst-sidecar.jsonl",
+                "bytes": 0,
+                "sha256": "8" * 64,
+            },
+        )
+        canonical = {
+            "format": "MarketScannerLocalizedInputManifest",
+            "version": 3,
+            "source_database_sha256": "b" * 64,
+            "files": files,
+        }
+        bundle_sha = hashlib.sha256(
+            json.dumps(
+                canonical,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        session_path = staging / "session_input_manifest.json"
+        session_payload = json.loads(session_path.read_text(encoding="utf-8"))
+        session_payload.update(
+            {
+                "version": 3,
+                "files": files,
+                "bundle_sha256": bundle_sha,
+            }
+        )
+        session_payload.pop("recovery_evidence_binding", None)
+        session_path.write_text(
+            json.dumps(session_payload) + "\n", encoding="utf-8"
+        )
+        for name in (
+            "source_manifest.json",
+            "processing_manifest.json",
+            "manual_edits.json",
+        ):
+            path = staging / name
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            payload["session_input_bundle_sha256"] = bundle_sha
+            if name == "processing_manifest.json":
+                payload["session_input_manifest_version"] = 3
+                payload["recovery_evidence_binding"] = (
+                    "recovery_lifecycle_evidence_bound_v2"
+                )
+            path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+        report_path = staging / "localization_report.json"
+        report_payload = json.loads(report_path.read_text(encoding="utf-8"))
+        report_payload["session_input_manifest_version"] = 3
+        report_payload["recovery_evidence_binding"] = (
+            "recovery_lifecycle_evidence_bound_v2"
+        )
+        report_path.write_text(
+            json.dumps(report_payload) + "\n", encoding="utf-8"
+        )
+
+        with self.assertRaisesRegex(
+            LocalizedStoreError,
+            "Session input manifest filename is invalid",
+        ):
+            self.store.validate_staging(staging, parent_version=None)
+        self.store.abort(staging)
+
+    def test_validate_staging_rejects_unsafe_source_database_names_after_rehash(
+        self,
+    ) -> None:
+        unsafe_names = (
+            "",
+            ".",
+            "..",
+            "../source.db",
+            "nested/source.db",
+            r"nested\source.db",
+            "source\x00.db",
+            "/source.db",
+            r"C:\source.db",
+            "C:source.db",
+            "metadata.json",
+            "METADATA.JSON",
+            "tag_observations.jsonl",
+        )
+        for source_name in unsafe_names:
+            with self.subTest(source_name=repr(source_name)):
+                staging = self.write_valid_staging()
+
+                def mutate(payload, name=source_name):
+                    payload["files"][1]["file"] = name
+
+                self.rewrite_session_bundle(staging, mutate)
+                source_path = staging / "source_manifest.json"
+                source_payload = json.loads(
+                    source_path.read_text(encoding="utf-8")
+                )
+                source_payload["source_database_name"] = source_name
+                source_path.write_text(
+                    json.dumps(source_payload) + "\n", encoding="utf-8"
+                )
+                with self.assertRaises(LocalizedStoreError):
+                    self.store.validate_staging(staging, parent_version=None)
+                self.store.abort(staging)
+
+    def test_validate_staging_rejects_source_manifest_database_name_rebinding(
+        self,
+    ) -> None:
+        staging = self.write_valid_staging()
+
+        def mutate(payload):
+            payload["files"][1]["file"] = "renamed-source.db"
+
+        self.rewrite_session_bundle(staging, mutate)
+        with self.assertRaisesRegex(
+            LocalizedStoreError,
+            "source database name differs",
+        ):
+            self.store.validate_staging(staging, parent_version=None)
+        self.store.abort(staging)
+
+    def test_validate_staging_rejects_non_integer_session_versions_after_rehash(
+        self,
+    ) -> None:
+        for invalid_version in (True, 1.0, "1"):
+            with self.subTest(invalid_version=repr(invalid_version)):
+                staging = self.write_valid_staging()
+
+                def mutate(payload, version=invalid_version):
+                    payload["version"] = version
+
+                self.rewrite_session_bundle(staging, mutate)
+                for artifact_name in (
+                    "processing_manifest.json",
+                    "localization_report.json",
+                ):
+                    artifact_path = staging / artifact_name
+                    artifact = json.loads(
+                        artifact_path.read_text(encoding="utf-8")
+                    )
+                    artifact["session_input_manifest_version"] = invalid_version
+                    artifact_path.write_text(
+                        json.dumps(artifact) + "\n", encoding="utf-8"
+                    )
+                with self.assertRaisesRegex(
+                    LocalizedStoreError,
+                    "session_input_manifest.json",
+                ):
+                    self.store.validate_staging(staging, parent_version=None)
+                self.store.abort(staging)
+
+    def test_validate_staging_rejects_cross_artifact_version_binding_rewrite(
+        self,
+    ) -> None:
+        for artifact_name, field, value in (
+            ("localization_report.json", "session_input_manifest_version", 2),
+            (
+                "localization_report.json",
+                "recovery_evidence_binding",
+                "recovery_lifecycle_evidence_bound_v2",
+            ),
+            ("processing_manifest.json", "session_input_manifest_version", 2),
+            (
+                "processing_manifest.json",
+                "recovery_evidence_binding",
+                "recovery_lifecycle_evidence_bound_v2",
+            ),
+        ):
+            with self.subTest(artifact_name=artifact_name, field=field):
+                staging = self.write_valid_staging()
+                path = staging / artifact_name
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                payload[field] = value
+                path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+                with self.assertRaisesRegex(
+                    LocalizedStoreError,
+                    "version or recovery binding differs",
+                ):
+                    self.store.validate_staging(staging, parent_version=None)
+                self.store.abort(staging)
 
     def test_trajectory_evidence_is_derived_from_verified_version(self) -> None:
         snapshot = self.commit_qualification_version()

@@ -6,6 +6,7 @@ import csv
 from datetime import datetime, timezone
 import hashlib
 import json
+import ntpath
 import os
 import re
 import shutil
@@ -58,6 +59,65 @@ LEGACY_REQUIRED_VERSION_FILES = tuple(
 VERSION_STATES = frozenset(
     {"invalid", "draft", "review", "published", "superseded", "revoked"}
 )
+RECOVERY_EVIDENCE_UNBOUND_LEGACY = (
+    "recovery_lifecycle_evidence_unbound_legacy"
+)
+RECOVERY_EVIDENCE_BOUND_V2 = "recovery_lifecycle_evidence_bound_v2"
+SESSION_INPUT_ROLE_FILES_BY_VERSION = {
+    1: (
+        ("metadata", "metadata.json"),
+        ("source_database", None),
+        ("localization_trace.jsonl", "localization_trace.jsonl"),
+        ("localization_constraints.jsonl", "localization_constraints.jsonl"),
+        ("localization_events.jsonl", "localization_events.jsonl"),
+        ("manual_localization_events.jsonl", "manual_localization_events.jsonl"),
+        ("tag_observations.jsonl", "tag_observations.jsonl"),
+        ("localized_price_tags.json", "localized_price_tags.json"),
+    ),
+    2: (
+        ("metadata", "metadata.json"),
+        ("source_database", None),
+        ("localization_trace.jsonl", "localization_trace.jsonl"),
+        ("localization_constraints.jsonl", "localization_constraints.jsonl"),
+        ("localization_events.jsonl", "localization_events.jsonl"),
+        (
+            "localization_recovery_events.jsonl",
+            "localization_recovery_events.jsonl",
+        ),
+        ("manual_localization_events.jsonl", "manual_localization_events.jsonl"),
+        ("tag_observations.jsonl", "tag_observations.jsonl"),
+        ("localized_price_tags.json", "localized_price_tags.json"),
+    ),
+    3: (
+        ("metadata", "metadata.json"),
+        ("source_database", None),
+        ("localization_trace.jsonl", "localization_trace.jsonl"),
+        ("localization_constraints.jsonl", "localization_constraints.jsonl"),
+        ("localization_events.jsonl", "localization_events.jsonl"),
+        (
+            "localization_recovery_events.jsonl",
+            "localization_recovery_events.jsonl",
+        ),
+        ("manual_localization_events.jsonl", "manual_localization_events.jsonl"),
+        ("tag_observations.jsonl", "tag_observations.jsonl"),
+        ("tag_observation_bursts.jsonl", "tag_observation_bursts.jsonl"),
+        ("localized_price_tags.json", "localized_price_tags.json"),
+    ),
+}
+RECOVERY_EVIDENCE_BINDING_BY_SESSION_VERSION = {
+    1: RECOVERY_EVIDENCE_UNBOUND_LEGACY,
+    2: RECOVERY_EVIDENCE_BOUND_V2,
+    3: RECOVERY_EVIDENCE_BOUND_V2,
+}
+_CANONICAL_SESSION_SIDECAR_FILES = frozenset(
+    file_name
+    for role_files in SESSION_INPUT_ROLE_FILES_BY_VERSION.values()
+    for role, file_name in role_files
+    if role != "source_database" and file_name is not None
+)
+_CANONICAL_SESSION_SIDECAR_FILES_CASEFOLDED = frozenset(
+    file_name.casefold() for file_name in _CANONICAL_SESSION_SIDECAR_FILES
+)
 
 
 class LocalizedStoreError(ValueError):
@@ -99,6 +159,143 @@ def _canonical_json_bytes(payload: dict[str, Any]) -> bytes:
         sort_keys=True,
         allow_nan=False,
     ).encode("utf-8")
+
+
+def _safe_session_input_basename(value: Any) -> bool:
+    if (
+        not isinstance(value, str)
+        or not value
+        or value in {".", ".."}
+        or "\x00" in value
+        or "/" in value
+        or "\\" in value
+    ):
+        return False
+    drive, _tail = ntpath.splitdrive(value)
+    return not drive and not ntpath.isabs(value)
+
+
+def validate_session_input_manifest_contract(
+    payload: Any,
+) -> dict[str, Any]:
+    """Validate one canonical v1/v2/v3 finalized-session manifest.
+
+    The returned fields are safe to use for cross-artifact binding.  In
+    particular, version is a strict JSON integer (Bool, float and string are
+    rejected), the source DB is a portable basename that cannot alias a
+    canonical sidecar, and every filename is unique even when an attacker has
+    recomputed the bundle SHA.
+    """
+
+    if (
+        not isinstance(payload, dict)
+        or payload.get("format") != "MarketScannerLocalizedInputManifest"
+    ):
+        raise LocalizedStoreError("Session input manifest contract is invalid.")
+    version = payload.get("version")
+    if (
+        isinstance(version, bool)
+        or not isinstance(version, int)
+        or version not in SESSION_INPUT_ROLE_FILES_BY_VERSION
+    ):
+        raise LocalizedStoreError("Session input manifest contract is invalid.")
+    base_keys = {
+        "format",
+        "version",
+        "source_database_sha256",
+        "files",
+        "bundle_sha256",
+    }
+    required_keys = (
+        base_keys | {"recovery_evidence_binding"}
+        if version == 1
+        else base_keys
+    )
+    allowed_keys = required_keys | {"input_identity_id"}
+    if frozenset(payload) not in {
+        frozenset(required_keys),
+        frozenset(allowed_keys),
+    }:
+        raise LocalizedStoreError("Session input manifest contract is invalid.")
+    if version == 1:
+        if (
+            payload.get("recovery_evidence_binding")
+            != RECOVERY_EVIDENCE_UNBOUND_LEGACY
+        ):
+            raise LocalizedStoreError("Session input manifest contract is invalid.")
+    elif "recovery_evidence_binding" in payload:
+        raise LocalizedStoreError("Session input manifest contract is invalid.")
+
+    role_files = SESSION_INPUT_ROLE_FILES_BY_VERSION[version]
+    files = payload.get("files")
+    if not isinstance(files, list) or len(files) != len(role_files):
+        raise LocalizedStoreError("Session input manifest file set is invalid.")
+    observed_files: set[str] = set()
+    source_database_name: str | None = None
+    for entry, (role, canonical_file) in zip(files, role_files):
+        if (
+            not isinstance(entry, dict)
+            or set(entry) != {"role", "file", "bytes", "sha256"}
+            or entry.get("role") != role
+            or not _safe_session_input_basename(entry.get("file"))
+            or isinstance(entry.get("bytes"), bool)
+            or not isinstance(entry.get("bytes"), int)
+            or entry["bytes"] < 0
+            or not isinstance(entry.get("sha256"), str)
+            or re.fullmatch(r"[0-9a-f]{64}", entry["sha256"]) is None
+        ):
+            raise LocalizedStoreError("Session input manifest entry is invalid.")
+        file_name = entry["file"]
+        normalized_file_name = file_name.casefold()
+        if normalized_file_name in observed_files:
+            raise LocalizedStoreError("Session input manifest filename is invalid.")
+        observed_files.add(normalized_file_name)
+        if role == "source_database":
+            if (
+                normalized_file_name
+                in _CANONICAL_SESSION_SIDECAR_FILES_CASEFOLDED
+            ):
+                raise LocalizedStoreError(
+                    "Session input manifest source database filename is invalid."
+                )
+            source_database_name = file_name
+        elif file_name != canonical_file:
+            raise LocalizedStoreError("Session input manifest filename is invalid.")
+
+    source_database_sha256 = payload.get("source_database_sha256")
+    if (
+        not isinstance(source_database_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", source_database_sha256) is None
+        or source_database_sha256 != files[1]["sha256"]
+    ):
+        raise LocalizedStoreError(
+            "Session input manifest source database hash is inconsistent."
+        )
+    canonical = {
+        "format": payload["format"],
+        "version": version,
+        "source_database_sha256": source_database_sha256,
+        "files": files,
+    }
+    calculated = hashlib.sha256(_canonical_json_bytes(canonical)).hexdigest()
+    if payload.get("bundle_sha256") != calculated:
+        raise LocalizedStoreError("Session input manifest bundle hash is invalid.")
+    input_identity_id = payload.get("input_identity_id")
+    if input_identity_id is not None and (
+        not isinstance(input_identity_id, str)
+        or re.fullmatch(r"[0-9a-f]{64}", input_identity_id) is None
+    ):
+        raise LocalizedStoreError("Session input manifest input identity is invalid.")
+    assert source_database_name is not None
+    return {
+        "version": version,
+        "bundle_sha256": calculated,
+        "source_database_name": source_database_name,
+        "source_database_sha256": source_database_sha256,
+        "recovery_evidence_binding": (
+            RECOVERY_EVIDENCE_BINDING_BY_SESSION_VERSION[version]
+        ),
+    }
 
 
 def local_input_identity_id(payload: dict[str, Any]) -> str:
@@ -547,7 +744,6 @@ class LocalizedVersionStore:
             "prior_map_manifest.json": ("MarketScannerPriorMap", 1),
             "source_manifest.json": ("MarketScannerLocalizedSourceManifest", 2),
             "processing_manifest.json": ("MarketScannerLocalizedProcessing", 2),
-            "session_input_manifest.json": ("MarketScannerLocalizedInputManifest", 1),
             "localization_constraints.json": ("MarketScannerOfflineLocalizationConstraints", 1),
             "localization_report.json": ("MarketScannerLocalizationReport", 1),
             "factor_graph_report.json": (
@@ -637,6 +833,16 @@ class LocalizedVersionStore:
         processing = parsed["processing_manifest.json"]
         session_input = parsed["session_input_manifest.json"]
         journal = parsed["manual_edits.json"]
+        try:
+            session_contract = validate_session_input_manifest_contract(
+                session_input
+            )
+        except LocalizedStoreError as exc:
+            raise LocalizedStoreError(
+                "Localized artifact contract is invalid: "
+                f"session_input_manifest.json: {exc}"
+            ) from exc
+        session_input_version = session_contract["version"]
         if publication_files_present and report.get("publish_state") not in {
             "published",
             "revoked",
@@ -645,49 +851,31 @@ class LocalizedVersionStore:
             raise LocalizedStoreError(
                 "Qualification evidence is allowed only in publication states."
             )
-        session_files = session_input.get("files")
-        expected_session_roles = (
-            "metadata",
-            "source_database",
-            "localization_trace.jsonl",
-            "localization_constraints.jsonl",
-            "localization_events.jsonl",
-            "manual_localization_events.jsonl",
-            "tag_observations.jsonl",
-            "localized_price_tags.json",
-        )
-        if not isinstance(session_files, list) or len(session_files) != len(
-            expected_session_roles
+        expected_recovery_binding = session_contract[
+            "recovery_evidence_binding"
+        ]
+        for artifact_name, artifact in (
+            ("localization_report.json", report),
+            ("processing_manifest.json", processing),
         ):
-            raise LocalizedStoreError("Localized session input file set is invalid.")
-        for entry, role in zip(session_files, expected_session_roles):
+            artifact_version = artifact.get("session_input_manifest_version")
             if (
-                not isinstance(entry, dict)
-                or set(entry) != {"role", "file", "bytes", "sha256"}
-                or entry.get("role") != role
-                or not isinstance(entry.get("file"), str)
-                or isinstance(entry.get("bytes"), bool)
-                or not isinstance(entry.get("bytes"), int)
-                or entry["bytes"] < 0
-                or not isinstance(entry.get("sha256"), str)
-                or re.fullmatch(r"[0-9a-f]{64}", entry["sha256"]) is None
+                isinstance(artifact_version, bool)
+                or not isinstance(artifact_version, int)
+                or artifact_version != session_input_version
+                or artifact.get("recovery_evidence_binding")
+                != expected_recovery_binding
             ):
-                raise LocalizedStoreError("Localized session input entry is invalid.")
-        session_bundle_body = {
-            "format": session_input["format"],
-            "version": session_input["version"],
-            "source_database_sha256": session_input.get(
-                "source_database_sha256"
-            ),
-            "files": session_files,
-        }
-        if (
-            session_files[1]["sha256"]
-            != session_input.get("source_database_sha256")
-            or hashlib.sha256(_canonical_json_bytes(session_bundle_body)).hexdigest()
-            != session_input.get("bundle_sha256")
-        ):
-            raise LocalizedStoreError("Localized session input bundle is invalid.")
+                raise LocalizedStoreError(
+                    "Localized session input version or recovery binding differs: "
+                    f"{artifact_name}"
+                )
+        if source.get("source_database_name") != session_contract[
+            "source_database_name"
+        ]:
+            raise LocalizedStoreError(
+                "Localized source database name differs from session manifest."
+            )
         state = str(report.get("publish_state") or "invalid")
         if state not in VERSION_STATES:
             raise LocalizedStoreError(f"Localized publish state is invalid: {state}")

@@ -330,6 +330,70 @@ class CoordinateSystemTests(unittest.TestCase):
 
 
 class IOSCoreContractTests(unittest.TestCase):
+    def test_esl_capture_uses_arkit_frames_without_pausing_scan(self) -> None:
+        repository = Path(__file__).resolve().parents[3]
+        app = repository / "app/ios/RTABMapApp"
+        scanner = (app / "PriceTagVisionScanner.swift").read_text(encoding="utf-8")
+        ui = (app / "PriceTagCaptureUI.swift").read_text(encoding="utf-8")
+        capture_core = (app / "PriceTagCaptureCore.swift").read_text(
+            encoding="utf-8"
+        )
+        scan_session = (app / "SupermarketScanSession.swift").read_text(
+            encoding="utf-8"
+        )
+        view_controller = (app / "ViewController.swift").read_text(encoding="utf-8")
+        flow_start = view_controller.index("private func startPriceTagCapture()")
+        flow_end = view_controller.index(
+            "@objc private func confirmPriorMapPosition()", flow_start
+        )
+        barcode_flow = view_controller[flow_start:flow_end]
+        capture_sources = "\n".join((scanner, ui, barcode_flow))
+
+        self.assertIn("cvPixelBuffer: frame.capturedImage", scanner)
+        self.assertIn("request.regionOfInterest = regionOfInterest", scanner)
+        self.assertIn("PriceTagCapturePreviewView: MTKView", ui)
+        self.assertIn("claimConfirmationCommit", capture_core)
+        self.assertIn("confirmationCommitInFlight", capture_core)
+        self.assertIn("PriceTagConfirmationIdentityValidator.matches", scan_session)
+        self.assertIn("authority: PriceTagConfirmationCommitAuthority", scan_session)
+        self.assertIn("appendScanEventIfSessionActive", scan_session)
+        self.assertIn("appendScanEventIfSessionActive", barcode_flow)
+        self.assertIn("matchesPriorMapAuthority", barcode_flow)
+        self.assertIn("!scanSession.isFinalizingScan", view_controller)
+        self.assertIn("allowDuringFinalization: false", view_controller)
+        active_directory = re.search(
+            r"private func activeLocalizationDirectory\([\s\S]*?\n    \}",
+            scan_session,
+        )
+        self.assertIsNotNone(active_directory)
+        self.assertNotIn(
+            "!isFinalizingScan",
+            active_directory.group(0),
+            "an already-admitted writer must not be rejected behind the lock",
+        )
+        self.assertNotIn(
+            "capturePriorMapGeneration == self.priorMapGeneration",
+            barcode_flow,
+            "background ESL callbacks must not race the main-thread map generation",
+        )
+        self.assertNotIn(
+            "priceTagCapturePriorMapGeneration",
+            barcode_flow,
+            "prior-map authority must live behind the capture coordinator lock",
+        )
+        for prohibited in (
+            "AVCaptureSession(",
+            "session.pause(",
+            "rtabmap?.stopCamera(",
+            "stopMapping(",
+            ".resetTracking",
+        ):
+            self.assertNotIn(
+                prohibited,
+                capture_sources,
+                f"ESL capture must not own or pause the production scan: {prohibited}",
+            )
+
     def test_graph_reader_bridge_rejects_malformed_blobs(self) -> None:
         xcrun = shutil.which("xcrun")
         if xcrun is None:
@@ -410,6 +474,8 @@ class IOSCoreContractTests(unittest.TestCase):
             repository / "app/ios/RTABMapApp/PriorMapPackageSnapshotCore.swift",
             repository / "app/ios/RTABMapApp/PriorMapScanMatcher.swift",
             repository / "app/ios/RTABMapApp/PriceTagLocalizationCore.swift",
+            repository / "app/ios/RTABMapApp/PriceTagCaptureCore.swift",
+            repository / "app/ios/RTABMapApp/SupermarketScanSession.swift",
             repository
             / "app/ios/RTABMapApp/PriorMapPackageIntegrityCore.swift",
             # Mobile-Only V1: map-source import pipeline (pure logic; the
@@ -541,6 +607,36 @@ class IOSCoreContractTests(unittest.TestCase):
                 env=environment,
             )
             self.assertEqual(compile_result.returncode, 0, compile_result.stderr)
+            esl_capture_result = subprocess.run(
+                [str(executable), "--esl-capture-focused"],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                esl_capture_result.returncode,
+                0,
+                esl_capture_result.stderr,
+            )
+            self.assertIn(
+                "ESL barcode capture focused tests passed",
+                esl_capture_result.stdout,
+            )
+            esl_finalization_result = subprocess.run(
+                [str(executable), "--esl-finalization-focused"],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                esl_finalization_result.returncode,
+                0,
+                esl_finalization_result.stderr,
+            )
+            self.assertIn(
+                "ESL finalization binding focused tests passed",
+                esl_finalization_result.stdout,
+            )
             absolute_prior_contract_result = subprocess.run(
                 [str(executable), "--absolute-prior-contract", "run"],
                 check=False,

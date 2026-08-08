@@ -34,7 +34,13 @@ from .strict_json import (
     reject_duplicate_object_pairs,
     reject_nonfinite_json,
 )
-from .localized_output_store import LocalizedVersionStore
+from .localized_output_store import (
+    RECOVERY_EVIDENCE_BOUND_V2,
+    RECOVERY_EVIDENCE_UNBOUND_LEGACY,
+    LocalizedStoreError,
+    LocalizedVersionStore,
+    validate_session_input_manifest_contract,
+)
 from .prior_map_schema import load_json, validate_package
 from .factor_graph_runner import FactorGraphRunnerError, run_relative_se2_factor_graph
 from .generated_mobile_evidence_contracts import MOBILE_EVIDENCE_CONTRACTS
@@ -71,10 +77,22 @@ SESSION_INPUT_FILE_NAMES_V2 = (
     "tag_observations.jsonl",
     "localized_price_tags.json",
 )
+# ESL confirmation v2 binds the strict complete-burst sidecar into the same
+# immutable parse-and-hash-once snapshot as the localized tag document.
+SESSION_INPUT_FILE_NAMES_V3 = (
+    "metadata.json",
+    "localization_trace.jsonl",
+    "localization_constraints.jsonl",
+    "localization_events.jsonl",
+    "localization_recovery_events.jsonl",
+    "manual_localization_events.jsonl",
+    "tag_observations.jsonl",
+    "tag_observation_bursts.jsonl",
+    "localized_price_tags.json",
+)
 # Historical alias: v1 stays the legacy contract and never carries Recovery
 # evidence binding.
 SESSION_INPUT_FILE_NAMES = SESSION_INPUT_FILE_NAMES_V1
-RECOVERY_EVIDENCE_UNBOUND_LEGACY = "recovery_lifecycle_evidence_unbound_legacy"
 # P7R6B: the PC reader shares the frozen Recovery evidence limits with the
 # device parser, the finalization bundle validator and the session
 # stable-read snapshot. One file never carries two different size policies.
@@ -90,6 +108,35 @@ EDITABLE_TAG_FIELDS = frozenset(
         "height_cm",
         "final_map_position",
     }
+)
+
+LOCALIZED_TAG_V1_FIELDS = frozenset(
+    {
+        "format", "version", "tag_id", "observation_id", "payload", "symbology",
+        "floor_id", "timestamp", "tracking_session_id", "prior_map_id",
+        "prior_map_sha256", "shelf_code", "row_flag", "cross_code", "shelf_side",
+        "distance_from_shelf_start_cm", "height_cm", "raw_map_position",
+        "snapped_map_position", "localization_confidence", "measurement_confidence",
+        "association_confidence", "measurement_method", "needs_review",
+        "user_confirmed",
+    }
+)
+LOCALIZED_TAG_V2_CONFIRMATION_FIELDS = frozenset(
+    {
+        "shelf_segment_id", "capture_id", "frame_observation_ids",
+        "algorithm_shelf_segment_id", "algorithm_shelf_code", "algorithm_side",
+        "algorithm_distance_from_shelf_start_cm",
+        "algorithm_association_confidence", "confirmation_status",
+        "user_confirmed_shelf_segment_id", "user_confirmed_shelf_code",
+        "user_confirmed_side", "user_confirmed_distance_from_shelf_start_cm",
+        "confirmed_at_utc", "confirmed_at_monotonic", "confirmation_source",
+    }
+)
+LOCALIZED_TAG_V2_FIELDS = (
+    LOCALIZED_TAG_V1_FIELDS | LOCALIZED_TAG_V2_CONFIRMATION_FIELDS
+)
+_CANONICAL_LOWERCASE_UUID = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
 )
 
 
@@ -199,6 +246,8 @@ def _canonical_json_bytes(payload: dict[str, Any]) -> bytes:
 def _regular_file_identity(path: Path, role: str) -> dict[str, Any]:
     """Hash one regular file through the same descriptor used for its size."""
 
+    if role == "source_database":
+        _validate_source_database_storage(path)
     try:
         path_before = path.lstat()
         if not stat.S_ISREG(path_before.st_mode):
@@ -229,6 +278,9 @@ def _regular_file_identity(path: Path, role: str) -> dict[str, Any]:
     if (
         not stat.S_ISREG(before.st_mode)
         or not stat.S_ISREG(path_after.st_mode)
+        or before.st_nlink != 1
+        or after.st_nlink != 1
+        or path_after.st_nlink != 1
         or (path_before.st_dev, path_before.st_ino, path_before.st_size)
         != (before.st_dev, before.st_ino, before.st_size)
         or (before.st_dev, before.st_ino, before.st_size)
@@ -240,12 +292,87 @@ def _regular_file_identity(path: Path, role: str) -> dict[str, Any]:
         raise OfflineLocalizationError(
             f"Session input {role} changed while it was being hashed: {path.name}"
         )
+    if role == "source_database":
+        _validate_source_database_storage(path)
     return {
         "role": role,
         "file": path.name,
         "bytes": byte_count,
         "sha256": digest.hexdigest(),
     }
+
+
+def _validate_source_database_storage(source_database: Path) -> None:
+    """Reject mutable SQLite companion state and linked source identities.
+
+    An absent or descriptor-stable zero-byte WAL is equivalent to no pending
+    WAL content.  A non-empty WAL, a non-empty rollback journal, any linked
+    source DB, or any non-regular/linked companion fails closed.
+    """
+
+    try:
+        database_stat = source_database.lstat()
+    except OSError as exc:
+        raise OfflineLocalizationError(
+            f"Source database could not be inspected safely: {source_database.name}"
+        ) from exc
+    if not stat.S_ISREG(database_stat.st_mode) or database_stat.st_nlink != 1:
+        raise OfflineLocalizationError(
+            f"Source database must be an unlinked regular file: {source_database.name}"
+        )
+    for suffix, active_description in (
+        ("-wal", "non-empty WAL"),
+        ("-journal", "active rollback journal"),
+    ):
+        companion = source_database.with_name(source_database.name + suffix)
+        try:
+            path_before = companion.lstat()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise OfflineLocalizationError(
+                f"Source database companion could not be inspected safely: {companion.name}"
+            ) from exc
+        if not stat.S_ISREG(path_before.st_mode) or path_before.st_nlink != 1:
+            raise OfflineLocalizationError(
+                f"Source database companion is unsafe: {companion.name}"
+            )
+        try:
+            flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+            descriptor = os.open(companion, flags)
+            with os.fdopen(descriptor, "rb") as handle:
+                before = os.fstat(handle.fileno())
+                first_byte = handle.read(1)
+                after = os.fstat(handle.fileno())
+            path_after = companion.lstat()
+        except OSError as exc:
+            raise OfflineLocalizationError(
+                f"Source database companion could not be read safely: {companion.name}"
+            ) from exc
+        stable_identity = (
+            path_before.st_dev,
+            path_before.st_ino,
+            path_before.st_size,
+        )
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or not stat.S_ISREG(path_after.st_mode)
+            or before.st_nlink != 1
+            or after.st_nlink != 1
+            or path_after.st_nlink != 1
+            or stable_identity
+            != (before.st_dev, before.st_ino, before.st_size)
+            or stable_identity != (after.st_dev, after.st_ino, after.st_size)
+            or stable_identity
+            != (path_after.st_dev, path_after.st_ino, path_after.st_size)
+        ):
+            raise OfflineLocalizationError(
+                f"Source database companion changed while inspected: {companion.name}"
+            )
+        if before.st_size != 0 or first_byte:
+            raise OfflineLocalizationError(
+                f"Source database has a {active_description}: {companion.name}"
+            )
 
 
 def _stable_read_bytes(
@@ -313,83 +440,11 @@ def _stable_read_bytes(
 
 def session_input_bundle_sha256(payload: dict[str, Any]) -> str:
     """Validate and return the canonical finalized-session bundle identity."""
-
-    if (
-        not isinstance(payload, dict)
-        or payload.get("format") != "MarketScannerLocalizedInputManifest"
-    ):
-        raise OfflineLocalizationError("Session input manifest contract is invalid.")
-    version = payload.get("version")
-    if version == 1:
-        file_names = SESSION_INPUT_FILE_NAMES_V1
-    elif version == 2:
-        file_names = SESSION_INPUT_FILE_NAMES_V2
-    else:
-        raise OfflineLocalizationError("Session input manifest contract is invalid.")
-    base_keys = {
-        "format",
-        "version",
-        "source_database_sha256",
-        "files",
-        "bundle_sha256",
-    }
-    if set(payload) not in (
-        base_keys,
-        base_keys | {"input_identity_id"},
-        base_keys | {"recovery_evidence_binding"},
-        base_keys | {"input_identity_id", "recovery_evidence_binding"},
-    ):
-        raise OfflineLocalizationError("Session input manifest contract is invalid.")
-    # v1 historical sessions must never pretend to carry P7R6 recovery
-    # evidence; v2 sessions are bound by construction and forbid the marker.
-    recovery_binding = payload.get("recovery_evidence_binding")
-    if recovery_binding is not None and (
-        not isinstance(recovery_binding, str)
-        or recovery_binding != RECOVERY_EVIDENCE_UNBOUND_LEGACY
-        or version != 1
-    ):
-        raise OfflineLocalizationError("Session input manifest contract is invalid.")
-    files = payload.get("files")
-    expected_roles = ("metadata", "source_database", *file_names[1:])
-    if not isinstance(files, list) or len(files) != len(expected_roles):
-        raise OfflineLocalizationError("Session input manifest file set is invalid.")
-    for entry, role in zip(files, expected_roles):
-        if (
-            not isinstance(entry, dict)
-            or set(entry) != {"role", "file", "bytes", "sha256"}
-            or entry.get("role") != role
-            or not isinstance(entry.get("file"), str)
-            or not entry["file"]
-            or isinstance(entry.get("bytes"), bool)
-            or not isinstance(entry.get("bytes"), int)
-            or entry["bytes"] < 0
-            or not isinstance(entry.get("sha256"), str)
-            or re.fullmatch(r"[0-9a-f]{64}", entry["sha256"]) is None
-        ):
-            raise OfflineLocalizationError("Session input manifest entry is invalid.")
-        expected_file = "metadata.json" if role == "metadata" else role
-        if role != "source_database" and entry["file"] != expected_file:
-            raise OfflineLocalizationError("Session input manifest filename is invalid.")
-    canonical = {
-        "format": payload["format"],
-        "version": payload["version"],
-        "source_database_sha256": payload.get("source_database_sha256"),
-        "files": files,
-    }
-    if canonical["source_database_sha256"] != files[1]["sha256"]:
-        raise OfflineLocalizationError(
-            "Session input manifest source database hash is inconsistent."
-        )
-    calculated = hashlib.sha256(_canonical_json_bytes(canonical)).hexdigest()
-    if payload.get("bundle_sha256") != calculated:
-        raise OfflineLocalizationError("Session input manifest bundle hash is invalid.")
-    input_identity_id = payload.get("input_identity_id")
-    if input_identity_id is not None and (
-        not isinstance(input_identity_id, str)
-        or re.fullmatch(r"[0-9a-f]{64}", input_identity_id) is None
-    ):
-        raise OfflineLocalizationError("Session input manifest input identity is invalid.")
-    return calculated
+    try:
+        validated = validate_session_input_manifest_contract(payload)
+    except LocalizedStoreError as exc:
+        raise OfflineLocalizationError(str(exc)) from exc
+    return str(validated["bundle_sha256"])
 
 
 def build_session_input_manifest(
@@ -415,14 +470,49 @@ def build_session_input_manifest(
     # one descriptor-stable read of the same bytes.
     metadata_bytes, _ = _stable_read_bytes(segment / "metadata.json", "metadata")
     metadata = load_strict_json_bytes(metadata_bytes, name="metadata.json")
+    if not isinstance(metadata, dict):
+        raise OfflineLocalizationError("Session metadata is invalid.")
     capture_health = (
-        metadata.get("captureHealth") if isinstance(metadata, dict) else None
+        metadata.get("captureHealth")
     )
     recovery_bound = (
         isinstance(capture_health, dict)
         and "localizationRecoveryEventCount" in capture_health
     )
-    if recovery_bound:
+    tags_bytes, _ = _stable_read_bytes(
+        segment / "localized_price_tags.json",
+        "localized_price_tags.json",
+        maximum_bytes=128 * 1024 * 1024,
+    )
+    raw_tags = load_strict_json_bytes(
+        tags_bytes, name="localized_price_tags.json"
+    )
+    if not isinstance(raw_tags, list):
+        raise OfflineLocalizationError(
+            "localized_price_tags.json must be a bounded array."
+        )
+    has_v2_tags = any(
+        isinstance(item, dict) and item.get("version") == 2
+        for item in raw_tags
+    )
+    burst_count = metadata.get("tagObservationBurstCount")
+    if isinstance(burst_count, bool) or not isinstance(burst_count, int):
+        burst_count = None
+    burst_bound = has_v2_tags or (burst_count is not None and burst_count > 0)
+    if burst_bound:
+        if (
+            not recovery_bound
+            or burst_count is None
+            or burst_count <= 0
+            or metadata.get("tagObservationBurstComplete") is not True
+        ):
+            raise OfflineLocalizationError(
+                "ESL confirmation requires recovery-bound metadata and a "
+                "complete tag-burst watermark."
+            )
+        manifest_version = 3
+        file_names = SESSION_INPUT_FILE_NAMES_V3
+    elif recovery_bound:
         manifest_version = 2
         file_names = SESSION_INPUT_FILE_NAMES_V2
     else:
@@ -514,10 +604,6 @@ def read_finalized_session_input_snapshot(
         isinstance(capture_health, dict)
         and "localizationRecoveryEventCount" in capture_health
     )
-    manifest_version = 2 if recovery_bound else 1
-    file_names = (
-        SESSION_INPUT_FILE_NAMES_V2 if recovery_bound else SESSION_INPUT_FILE_NAMES_V1
-    )
     session_id = str(metadata.get("trackingSessionId") or "")
     map_hash = str(metadata.get("priorMapSha256") or "")
     floor_id = str(metadata.get("floorId") or "")
@@ -546,6 +632,34 @@ def read_finalized_session_input_snapshot(
         raise OfflineLocalizationError(
             "localized_price_tags.json must be a bounded array."
         )
+    has_v2_tags = any(
+        isinstance(item, dict) and item.get("version") == 2
+        for item in raw_tags
+    )
+    burst_count = metadata.get("tagObservationBurstCount")
+    if isinstance(burst_count, bool) or not isinstance(burst_count, int):
+        burst_count = None
+    burst_bound = has_v2_tags or (burst_count is not None and burst_count > 0)
+    if burst_bound:
+        if (
+            not recovery_bound
+            or burst_count is None
+            or burst_count <= 0
+            or metadata.get("tagObservationBurstComplete") is not True
+        ):
+            raise OfflineLocalizationError(
+                "ESL confirmation requires recovery-bound metadata and a "
+                "complete tag-burst watermark."
+            )
+        manifest_version = 3
+        file_names = SESSION_INPUT_FILE_NAMES_V3
+    else:
+        manifest_version = 2 if recovery_bound else 1
+        file_names = (
+            SESSION_INPUT_FILE_NAMES_V2
+            if recovery_bound
+            else SESSION_INPUT_FILE_NAMES_V1
+        )
     jsonl_names = [name for name in file_names[1:] if name != "localized_price_tags.json"]
     for name in jsonl_names:
         if name == "localization_recovery_events.jsonl":
@@ -559,6 +673,12 @@ def read_finalized_session_input_snapshot(
                 TAG_OBSERVATION_CONTRACT,
                 required=bool(raw_tags),
                 allow_empty=not bool(raw_tags),
+            )
+        elif name == "tag_observation_bursts.jsonl":
+            contract = replace(
+                TAG_OBSERVATION_BURST_CONTRACT,
+                required=True,
+                allow_empty=False,
             )
         else:
             contract = contracts[name]
@@ -583,6 +703,22 @@ def read_finalized_session_input_snapshot(
                     "sha256": identity["sha256"],
                 }
             )
+    if burst_bound:
+        bursts = jsonl_values.get("tag_observation_bursts.jsonl", [])
+        if len(bursts) != burst_count:
+            raise OfflineLocalizationError(
+                "Tag burst count does not match the finalized watermark."
+            )
+        expected_last_burst = metadata.get("tagObservationBurstLastID")
+        observed_last_burst = bursts[-1].get("burst_id") if bursts else None
+        if observed_last_burst != expected_last_burst:
+            raise OfflineLocalizationError(
+                "Tag burst last ID does not match the finalized watermark."
+            )
+        _verified_tag_burst_observation_ids(
+            bursts,
+            jsonl_values.get("tag_observations.jsonl", []),
+        )
     if not recovery_bound:
         # P7R6: legacy v1 sessions read the Recovery sidecar when it exists
         # but never bind it into the manifest identity. The snapshot still
@@ -643,6 +779,7 @@ def _verified_source_database_copy(
     matches the snapshot identity, and hand SQLite only the verified
     immutable copy. The original database stays read-only."""
 
+    _validate_source_database_storage(source)
     work_directory.mkdir(parents=True, exist_ok=True)
     destination = work_directory / source.name
     try:
@@ -671,6 +808,9 @@ def _verified_source_database_copy(
     if (
         not stat.S_ISREG(before.st_mode)
         or not stat.S_ISREG(path_after.st_mode)
+        or before.st_nlink != 1
+        or after.st_nlink != 1
+        or path_after.st_nlink != 1
         or (path_before.st_dev, path_before.st_ino, path_before.st_size)
         != (before.st_dev, before.st_ino, before.st_size)
         or (before.st_dev, before.st_ino, before.st_size)
@@ -681,6 +821,7 @@ def _verified_source_database_copy(
         raise OfflineLocalizationError(
             f"Source database changed while it was being copied: {source.name}"
         )
+    _validate_source_database_storage(source)
     if digest.hexdigest() != expected_sha256:
         raise OfflineLocalizationError(
             "Source database no longer matches the finalized input snapshot."
@@ -827,6 +968,21 @@ TAG_OBSERVATION_CONTRACT = JsonlContract(
     True,
     ("node_timebase_frame_timestamp", "nodeTimebaseFrameTimestamp"),
     record_id_field="observation_id",
+)
+TAG_BURST_LIMITS = MOBILE_EVIDENCE_CONTRACTS["tag_observation_bursts.jsonl"]
+TAG_OBSERVATION_BURST_CONTRACT = JsonlContract(
+    "tag_observation_bursts",
+    "MarketScannerPriceTagBurst",
+    frozenset({2}),
+    False,
+    True,
+    ("last_frame_timestamp",),
+    record_id_field="burst_id",
+    maximum_record_bytes=TAG_BURST_LIMITS["max_record_bytes"],
+    maximum_records=TAG_BURST_LIMITS["max_records"],
+    maximum_file_bytes=TAG_BURST_LIMITS["max_file_bytes"],
+    maximum_nesting_depth=TAG_BURST_LIMITS["max_nesting_depth"],
+    qualification_maximum_records=TAG_BURST_LIMITS.get("qualification_max_records"),
 )
 MANUAL_EVENT_CONTRACT = JsonlContract(
     "manual_localization_events",
@@ -1586,6 +1742,101 @@ def _validate_jsonl_business_record(
                 raise OfflineLocalizationError(f"Missing tag observation {field} at {line_label}")
         if not _strict_pose_2d_or_3d(value.get("raw_map_position")):
             raise OfflineLocalizationError(f"Invalid tag observation raw position at {line_label}")
+    elif contract.name == "tag_observation_bursts":
+        allowed_fields = {
+            "format", "version", "burst_id", "sequence", "barcode",
+            "symbology", "prior_map_id", "prior_map_sha256", "floor_id",
+            "frame_count", "first_frame_timestamp", "last_frame_timestamp",
+            "bound_node_id_min", "bound_node_id_max", "depth_quality",
+            "view_angle", "tracking_quality", "localization_confidence_mean",
+            "tracking_session_id", "complete", "frames",
+        }
+        allowed_frame_fields = {
+            "frame_id", "observation_id", "bound_node_id", "frame_timestamp",
+            "node_timestamp", "depth", "view", "tracking", "confidence",
+        }
+        frames = value.get("frames")
+        frame_count = _strict_integer(value.get("frame_count"))
+        sequence = _strict_integer(value.get("sequence"))
+        first_timestamp = _strict_number(value.get("first_frame_timestamp"))
+        last_timestamp = _strict_number(value.get("last_frame_timestamp"))
+        if (
+            not set(value).issubset(allowed_fields)
+            or not isinstance(value.get("burst_id"), str)
+            or not value.get("burst_id")
+            or not isinstance(value.get("barcode"), str)
+            or not value.get("barcode")
+            or not isinstance(value.get("symbology"), str)
+            or not value.get("symbology")
+            or sequence is None
+            or sequence <= 0
+            or frame_count is None
+            or frame_count <= 0
+            or not isinstance(frames, list)
+            or len(frames) != frame_count
+            or value.get("complete") is not True
+            or first_timestamp is None
+            or last_timestamp is None
+            or last_timestamp < first_timestamp
+            or (_strict_number(value.get("depth_quality")) is None)
+            or not 0 <= float(value.get("depth_quality")) <= 1
+            or (_strict_number(value.get("localization_confidence_mean")) is None)
+            or not 0 <= float(value.get("localization_confidence_mean")) <= 1
+        ):
+            raise OfflineLocalizationError(
+                f"Invalid tag burst contract at {line_label}"
+            )
+        frame_ids: set[str] = set()
+        observation_ids: set[str] = set()
+        frame_timestamps: list[float] = []
+        node_ids: list[int] = []
+        for frame in frames:
+            if not isinstance(frame, dict) or not set(frame).issubset(
+                allowed_frame_fields
+            ):
+                raise OfflineLocalizationError(
+                    f"Invalid tag burst frame contract at {line_label}"
+                )
+            frame_id = frame.get("frame_id")
+            observation_id = frame.get("observation_id")
+            node_id = _strict_integer(frame.get("bound_node_id"))
+            frame_timestamp = _strict_number(frame.get("frame_timestamp"))
+            if (
+                not isinstance(frame_id, str)
+                or not frame_id
+                or frame_id in frame_ids
+                or not isinstance(observation_id, str)
+                or not observation_id
+                or observation_id in observation_ids
+                or node_id is None
+                or node_id <= 0
+                or frame_timestamp is None
+                or _strict_number(frame.get("node_timestamp")) is None
+                or _strict_number(frame.get("depth")) is None
+                or not 0 <= float(frame.get("depth")) <= 1
+                or not isinstance(frame.get("view"), str)
+                or not frame.get("view")
+                or not isinstance(frame.get("tracking"), str)
+                or not frame.get("tracking")
+                or _strict_number(frame.get("confidence")) is None
+                or not 0 <= float(frame.get("confidence")) <= 1
+            ):
+                raise OfflineLocalizationError(
+                    f"Invalid tag burst frame at {line_label}"
+                )
+            frame_ids.add(frame_id)
+            observation_ids.add(observation_id)
+            frame_timestamps.append(frame_timestamp)
+            node_ids.append(node_id)
+        if (
+            min(frame_timestamps) != first_timestamp
+            or max(frame_timestamps) != last_timestamp
+            or min(node_ids) != _strict_integer(value.get("bound_node_id_min"))
+            or max(node_ids) != _strict_integer(value.get("bound_node_id_max"))
+        ):
+            raise OfflineLocalizationError(
+                f"Tag burst summary mismatch at {line_label}"
+            )
 
 
 def _read_jsonl_bytes(
@@ -1854,6 +2105,90 @@ def _read_jsonl(
     return values, diagnostics
 
 
+def _verified_tag_burst_observation_ids(
+    bursts: Sequence[dict[str, Any]],
+    observations: Sequence[dict[str, Any]],
+) -> dict[str, set[str]]:
+    """Return exact complete-burst membership after cross-checking every
+    frame against the durable observation sidecar. A v2 confirmation may only
+    reference one of these verified sets."""
+
+    observations_by_id: dict[str, dict[str, Any]] = {}
+    for observation in observations:
+        observation_id = observation.get("observation_id")
+        if not isinstance(observation_id, str) or not observation_id:
+            raise OfflineLocalizationError(
+                "Tag observation is missing its durable observation ID."
+            )
+        if observation_id in observations_by_id:
+            raise OfflineLocalizationError(
+                "Tag observation IDs must be globally unique."
+            )
+        observations_by_id[observation_id] = observation
+
+    verified: dict[str, set[str]] = {}
+    globally_bound_observations: set[str] = set()
+    previous_sequence: int | None = None
+    for burst in bursts:
+        burst_id = burst.get("burst_id")
+        sequence = _strict_integer(burst.get("sequence"))
+        frames = burst.get("frames")
+        if (
+            not isinstance(burst_id, str)
+            or not burst_id
+            or burst_id in verified
+            or sequence is None
+            or (previous_sequence is not None and sequence <= previous_sequence)
+            or burst.get("complete") is not True
+            or not isinstance(frames, list)
+        ):
+            raise OfflineLocalizationError(
+                "Tag burst identity, order or completion state is invalid."
+            )
+        previous_sequence = sequence
+        member_ids: set[str] = set()
+        for frame in frames:
+            if not isinstance(frame, dict):
+                raise OfflineLocalizationError("Tag burst frame is invalid.")
+            observation_id = frame.get("observation_id")
+            frame_id = frame.get("frame_id")
+            observation = observations_by_id.get(str(observation_id or ""))
+            if (
+                not isinstance(observation_id, str)
+                or not observation_id
+                or observation_id in member_ids
+                or observation_id in globally_bound_observations
+                or not isinstance(frame_id, str)
+                or not frame_id
+                or observation is None
+                or observation.get("burst_id") != burst_id
+                or observation.get("frame_id") != frame_id
+                or observation.get("payload") != burst.get("barcode")
+                or observation.get("symbology") != burst.get("symbology")
+            ):
+                raise OfflineLocalizationError(
+                    "Tag burst frame does not match its durable observation."
+                )
+            member_ids.add(observation_id)
+            globally_bound_observations.add(observation_id)
+        verified[burst_id] = member_ids
+    for observation_id, observation in observations_by_id.items():
+        burst_id = observation.get("burst_id")
+        frame_id = observation.get("frame_id")
+        if (burst_id is not None or frame_id is not None) and (
+            not isinstance(burst_id, str)
+            or not burst_id
+            or not isinstance(frame_id, str)
+            or not frame_id
+            or observation_id not in globally_bound_observations
+        ):
+            raise OfflineLocalizationError(
+                "A durable burst-bound observation is missing from the "
+                "verified complete burst set."
+            )
+    return verified
+
+
 def _read_localized_price_tags_bytes(
     data: bytes,
     *,
@@ -1862,6 +2197,8 @@ def _read_localized_price_tags_bytes(
     expected_map_hash: str,
     expected_floor_id: str,
     expected_count: int,
+    verified_burst_observation_ids: dict[str, set[str]] | None = None,
+    verified_burst_identities: dict[str, tuple[str, str]] | None = None,
     maximum_bytes: int = 128 * 1024 * 1024,
     maximum_records: int = 500_000,
 ) -> list[dict[str, Any]]:
@@ -1883,37 +2220,36 @@ def _read_localized_price_tags_bytes(
         raise OfflineLocalizationError(
             "localized_price_tags.json count does not match finalized metadata."
         )
-    allowed_fields = {
-        "format", "version", "tag_id", "observation_id", "payload", "symbology",
-        "floor_id", "timestamp", "tracking_session_id", "prior_map_id",
-        "prior_map_sha256", "shelf_code", "row_flag", "cross_code", "shelf_side",
-        "distance_from_shelf_start_cm", "height_cm", "raw_map_position",
-        "snapped_map_position", "localization_confidence", "measurement_confidence",
-        "association_confidence", "measurement_method", "needs_review", "user_confirmed",
-    }
     tags: list[dict[str, Any]] = []
     tag_ids: set[str] = set()
     observation_ids: set[str] = set()
+    capture_ids: set[str] = set()
+    confirmed_frame_observation_ids: set[str] = set()
     for index, item in enumerate(payload):
         if not isinstance(item, dict):
             raise OfflineLocalizationError(
                 f"localized_price_tags.json item {index} is not an object."
-            )
-        unexpected_fields = sorted(set(item) - allowed_fields)
-        if unexpected_fields:
-            raise OfflineLocalizationError(
-                "localized_price_tags.json item "
-                f"{index} contains forbidden derived fields: {unexpected_fields}."
             )
         version = item.get("version")
         if (
             item.get("format") != "MarketScannerLocalizedPriceTag"
             or isinstance(version, bool)
             or not isinstance(version, int)
-            or version != 1
+            or version not in {1, 2}
         ):
             raise OfflineLocalizationError(
                 f"localized_price_tags.json item {index} has an invalid contract."
+            )
+        allowed_fields = (
+            LOCALIZED_TAG_V1_FIELDS
+            if version == 1
+            else LOCALIZED_TAG_V2_FIELDS
+        )
+        unexpected_fields = sorted(set(item) - allowed_fields)
+        if unexpected_fields:
+            raise OfflineLocalizationError(
+                "localized_price_tags.json item "
+                f"{index} contains forbidden fields: {unexpected_fields}."
             )
         if (
             _identity_field(item, "tracking_session_id", "trackingSessionId")
@@ -1999,6 +2335,128 @@ def _read_localized_price_tags_bytes(
                 raise OfflineLocalizationError(
                     f"localized_price_tags.json item {index} has invalid {position_field}."
                 )
+        if version == 2:
+            capture_id = item.get("capture_id")
+            frame_ids = item.get("frame_observation_ids")
+            algorithm_segment_id = item.get("algorithm_shelf_segment_id")
+            algorithm_side = item.get("algorithm_side")
+            algorithm_confidence = _strict_number(
+                item.get("algorithm_association_confidence")
+            )
+            confirmation_status = item.get("confirmation_status")
+            user_segment_id = item.get("user_confirmed_shelf_segment_id")
+            user_side = item.get("user_confirmed_side")
+            confirmed_at_utc = _strict_number(item.get("confirmed_at_utc"))
+            confirmed_at_monotonic = _strict_number(
+                item.get("confirmed_at_monotonic")
+            )
+            if (
+                not isinstance(capture_id, str)
+                or _CANONICAL_LOWERCASE_UUID.fullmatch(capture_id) is None
+                or capture_id in capture_ids
+                or not isinstance(frame_ids, list)
+                or not 3 <= len(frame_ids) <= 64
+                or any(
+                    not isinstance(value, str)
+                    or not value
+                    or len(value) > 128
+                    for value in frame_ids
+                )
+                or len(set(frame_ids)) != len(frame_ids)
+                or observation_id not in frame_ids
+                or any(value in confirmed_frame_observation_ids for value in frame_ids)
+                or not isinstance(algorithm_segment_id, str)
+                or not algorithm_segment_id
+                or len(algorithm_segment_id) > 128
+                or item.get("shelf_segment_id") != algorithm_segment_id
+                or not isinstance(algorithm_side, str)
+                or not algorithm_side
+                or len(algorithm_side) > 128
+                or item.get("shelf_side") != algorithm_side
+                or algorithm_confidence is None
+                or not 0 <= algorithm_confidence <= 1
+                or confirmation_status
+                not in {"USER_CONFIRMED", "USER_OVERRIDDEN"}
+                or item.get("user_confirmed") is not True
+                or item.get("needs_review") is not False
+                or not isinstance(user_segment_id, str)
+                or not user_segment_id
+                or len(user_segment_id) > 128
+                or not isinstance(user_side, str)
+                or not user_side
+                or len(user_side) > 128
+                or confirmed_at_utc is None
+                or confirmed_at_utc <= 0
+                or confirmed_at_monotonic is None
+                or confirmed_at_monotonic < 0
+                or item.get("confirmation_source") != "on_device_operator"
+            ):
+                raise OfflineLocalizationError(
+                    f"localized_price_tags.json item {index} has invalid confirmation evidence."
+                )
+            verified_frames = (
+                verified_burst_observation_ids or {}
+            ).get(capture_id)
+            if verified_frames != set(frame_ids):
+                raise OfflineLocalizationError(
+                    f"localized_price_tags.json item {index} is not bound to one verified complete burst."
+                )
+            verified_identity = (verified_burst_identities or {}).get(capture_id)
+            if verified_identity != (item.get("payload"), item.get("symbology")):
+                raise OfflineLocalizationError(
+                    f"localized_price_tags.json item {index} payload does not match its verified burst."
+                )
+            same_candidate = (
+                algorithm_segment_id == user_segment_id
+                and algorithm_side == user_side
+            )
+            if (
+                confirmation_status == "USER_CONFIRMED" and not same_candidate
+            ) or (
+                confirmation_status == "USER_OVERRIDDEN" and same_candidate
+            ):
+                raise OfflineLocalizationError(
+                    f"localized_price_tags.json item {index} has inconsistent confirmation status."
+                )
+            for field in (
+                "algorithm_distance_from_shelf_start_cm",
+                "user_confirmed_distance_from_shelf_start_cm",
+            ):
+                value = _strict_number(item.get(field))
+                if value is None or not 0 <= value <= 100_000:
+                    raise OfflineLocalizationError(
+                        f"localized_price_tags.json item {index} has invalid {field}."
+                    )
+            for field in ("algorithm_shelf_code", "user_confirmed_shelf_code"):
+                value = item.get(field)
+                if value is not None and (
+                    not isinstance(value, str) or not value or len(value) > 128
+                ):
+                    raise OfflineLocalizationError(
+                        f"localized_price_tags.json item {index} has invalid {field}."
+                    )
+            legacy_distance = _strict_number(
+                item.get("distance_from_shelf_start_cm")
+            )
+            algorithm_distance = _strict_number(
+                item.get("algorithm_distance_from_shelf_start_cm")
+            )
+            legacy_confidence = _strict_number(
+                item.get("association_confidence")
+            )
+            if (
+                item.get("shelf_code") != item.get("algorithm_shelf_code")
+                or legacy_distance is None
+                or algorithm_distance is None
+                or abs(legacy_distance - algorithm_distance) > 1.0e-9
+                or legacy_confidence is None
+                or abs(legacy_confidence - algorithm_confidence) > 1.0e-9
+            ):
+                raise OfflineLocalizationError(
+                    f"localized_price_tags.json item {index} overwrites algorithm evidence."
+                )
+            capture_ids.add(capture_id)
+            confirmed_frame_observation_ids.update(frame_ids)
         tag_ids.add(tag_id)
         observation_ids.add(observation_id)
         tags.append({key: item[key] for key in allowed_fields if key in item})
@@ -3388,6 +3846,109 @@ def enforce_tag_state_invariants(tag: dict[str, Any]) -> dict[str, Any]:
     return tag
 
 
+def _apply_on_device_confirmation_authority(
+    tag: dict[str, Any],
+) -> dict[str, Any]:
+    """Map additive v2 operator evidence to the derived business fields.
+
+    The immutable ``algorithm_*`` fields remain untouched. Only the derived
+    PC output's legacy business columns follow the explicit on-device choice.
+    """
+
+    if tag.get("version") != 2:
+        return tag
+    tag["final_shelf_segment_id"] = tag.get(
+        "user_confirmed_shelf_segment_id"
+    )
+    tag["shelf_code"] = tag.get("user_confirmed_shelf_code")
+    tag["shelf_side"] = tag.get("user_confirmed_side")
+    tag["distance_from_shelf_start_cm"] = tag.get(
+        "user_confirmed_distance_from_shelf_start_cm"
+    )
+    tag["final_business_association_source"] = "on_device_operator"
+    return tag
+
+
+def _enforce_on_device_confirmation_conflict(
+    tag: dict[str, Any],
+) -> dict[str, Any]:
+    """Never silently replace an operator shelf with offline reassociation."""
+
+    if tag.get("version") != 2:
+        return tag
+    audit = tag.get("association_audit")
+    candidates = audit.get("candidates") if isinstance(audit, dict) else None
+    best = candidates[0] if isinstance(candidates, list) and candidates else None
+    user_segment = tag.get("user_confirmed_shelf_segment_id")
+    user_side = tag.get("user_confirmed_side")
+    if (
+        not isinstance(best, dict)
+        or audit.get("offline_evidence_reliable") is not True
+    ):
+        _mark_tag_for_review(tag, "price_tag_offline_association_unavailable")
+        tag["confirmation_conflict"] = {
+            "code": "OFFLINE_ASSOCIATION_UNAVAILABLE",
+            "disposition": "REVIEW_REQUIRED",
+            "rescan_required": True,
+            "user_shelf_segment_id": user_segment,
+            "user_side": user_side,
+        }
+        return enforce_tag_state_invariants(tag)
+    optimized_segment = best.get("element_id")
+    optimized_side = best.get("edge_id")
+    if optimized_segment == user_segment and optimized_side == user_side:
+        audit["offline_association_status"] = audit.get("status")
+        audit["status"] = "user_confirmation_consistent"
+        tag["confirmation_conflict"] = {
+            "code": "NO_CONFLICT",
+            "disposition": "CONFIRMED",
+            "rescan_required": False,
+            "user_shelf_segment_id": user_segment,
+            "user_side": user_side,
+            "optimized_shelf_segment_id": optimized_segment,
+            "optimized_side": optimized_side,
+        }
+        return enforce_tag_state_invariants(tag)
+    _mark_tag_for_review(tag, "price_tag_confirmation_conflict")
+    audit["offline_association_status"] = audit.get("status")
+    audit["status"] = "price_tag_confirmation_conflict"
+    tag["confirmation_conflict"] = {
+        "code": "USER_CONFIRMATION_CONFLICT",
+        "disposition": "REVIEW_REQUIRED",
+        "rescan_required": True,
+        "user_shelf_segment_id": user_segment,
+        "user_side": user_side,
+        "optimized_shelf_segment_id": optimized_segment,
+        "optimized_side": optimized_side,
+    }
+    return enforce_tag_state_invariants(tag)
+
+
+def _finalize_tag_with_unavailable_offline_association(
+    tag: dict[str, Any],
+    reason: str,
+) -> dict[str, Any]:
+    """Emit one stable fail-closed audit when reassociation cannot run.
+
+    Defensive transform/binding failures must not bypass the additive v2
+    confirmation adjudicator.  Keeping the audit shape identical for every
+    early exit makes the operator decision immutable while giving downstream
+    review and rescan tooling one machine-readable unavailable outcome.
+    """
+
+    tag["association_audit"] = {
+        "status": "not_attempted",
+        "reason": reason,
+        "offline_evidence_reliable": False,
+        "candidate_search_complete": False,
+        "candidate_count": 0,
+        "candidates": [],
+    }
+    return enforce_tag_state_invariants(
+        _enforce_on_device_confirmation_conflict(tag)
+    )
+
+
 def _associate_tag(
     tag: dict[str, Any],
     elements: Sequence[dict[str, Any]],
@@ -3528,7 +4089,7 @@ def _associate_tag(
         or tag.get("approval_status") == "approved"
     )
 
-    can_auto_confirm = (
+    offline_evidence_reliable = (
         has_camera
         and best_distance <= 0.45
         and ray_clear
@@ -3538,6 +4099,9 @@ def _associate_tag(
         and margin >= min_margin
         and loc_conf >= min_auto_confidence
         and meas_conf >= min_auto_confidence
+    )
+    can_auto_confirm = (
+        offline_evidence_reliable
         and not human_authoritative
         and tag.get("needs_review") is not True
     )
@@ -3575,23 +4139,35 @@ def _associate_tag(
         }
         rejection_reason = tag["suggested_association"]["reason"]
         if human_authoritative:
-            current = (
-                tag.get("shelf_code"),
-                tag.get("shelf_side"),
-                tag.get("distance_from_shelf_start_cm"),
-            )
-            suggested = (
-                tag["suggested_association"].get("shelf_code"),
-                tag["suggested_association"].get("shelf_side"),
-                tag["suggested_association"].get("distance_from_shelf_start_cm"),
-            )
-            same_business_edge = current[:2] == suggested[:2]
-            try:
-                offset_difference_cm = abs(float(current[2]) - float(suggested[2]))
-            except (TypeError, ValueError):
-                offset_difference_cm = math.inf
-            if not same_business_edge or offset_difference_cm > 1.0:
-                _mark_tag_for_review(tag, "human_association_conflicts_with_offline_evidence")
+            if tag.get("version") != 2:
+                current = (
+                    tag.get("shelf_code"),
+                    tag.get("shelf_side"),
+                    tag.get("distance_from_shelf_start_cm"),
+                )
+                suggested = (
+                    tag["suggested_association"].get("shelf_code"),
+                    tag["suggested_association"].get("shelf_side"),
+                    tag["suggested_association"].get(
+                        "distance_from_shelf_start_cm"
+                    ),
+                )
+                same_business_edge = current[:2] == suggested[:2]
+                try:
+                    offset_difference_cm = abs(
+                        float(current[2]) - float(suggested[2])
+                    )
+                except (TypeError, ValueError):
+                    offset_difference_cm = math.inf
+                if not same_business_edge or offset_difference_cm > 1.0:
+                    _mark_tag_for_review(
+                        tag,
+                        "human_association_conflicts_with_offline_evidence",
+                    )
+            # Additive v2 on-device confirmation is adjudicated exactly once
+            # by `_enforce_on_device_confirmation_conflict` after this audit
+            # is complete. Do not pre-mark a consistent confirmation merely
+            # because it is intentionally ineligible for auto-confirmation.
         else:
             _mark_tag_for_review(tag, rejection_reason)
         if "association_confidence" not in tag:
@@ -3611,6 +4187,7 @@ def _associate_tag(
         "ray_clear": ray_clear,
         "visible_side_consistent": visible_side_consistent,
         "near_endpoint": near_endpoint,
+        "offline_evidence_reliable": offline_evidence_reliable,
         "human_authoritative": human_authoritative,
         "candidates_truncated": len(candidates) > 100,
         "candidate_set_sha256": hashlib.sha256(
@@ -4238,6 +4815,19 @@ def _render_localized_version(
     # snapshot. The tag bytes and the JSONL records below are the exact
     # bytes that produced the manifest identities, so the bundle SHA always
     # describes what localization actually parsed.
+    verified_burst_observation_ids = _verified_tag_burst_observation_ids(
+        input_snapshot.jsonl_values.get("tag_observation_bursts.jsonl", []),
+        input_snapshot.jsonl_values.get("tag_observations.jsonl", []),
+    )
+    verified_burst_identities = {
+        str(burst.get("burst_id") or ""): (
+            str(burst.get("barcode") or ""),
+            str(burst.get("symbology") or ""),
+        )
+        for burst in input_snapshot.jsonl_values.get(
+            "tag_observation_bursts.jsonl", []
+        )
+    }
     raw_tags = _read_localized_price_tags_bytes(
         input_snapshot.localized_tags_bytes,
         session_id=sidecar_session_id,
@@ -4245,6 +4835,8 @@ def _render_localized_version(
         expected_map_hash=sidecar_map_hash,
         expected_floor_id=sidecar_floor_id,
         expected_count=localized_tag_count,
+        verified_burst_observation_ids=verified_burst_observation_ids,
+        verified_burst_identities=verified_burst_identities,
     )
     trace = input_snapshot.jsonl_values["localization_trace.jsonl"]
     trace_diag = input_snapshot.jsonl_diagnostics["localization_trace.jsonl"]
@@ -4274,7 +4866,7 @@ def _render_localized_version(
         if isinstance(capture_health, dict)
         else None
     )
-    if input_manifest_version == 2:
+    if input_manifest_version in {2, 3}:
         if (
             isinstance(recovery_watermark, bool)
             or not isinstance(recovery_watermark, int)
@@ -4316,7 +4908,7 @@ def _render_localized_version(
                     "Recovery lifecycle watermark does not reconcile with "
                     "the last persisted episode."
                 )
-        recovery_evidence_binding = "recovery_lifecycle_evidence_bound_v2"
+        recovery_evidence_binding = RECOVERY_EVIDENCE_BOUND_V2
     else:
         recovery_events = input_snapshot.jsonl_values[
             "localization_recovery_events.jsonl"
@@ -4331,6 +4923,10 @@ def _render_localized_version(
         "localization_constraints": constraint_diag,
         "manual_localization_events": manual_diag,
         "tag_observations": obs_diag,
+        "tag_observation_bursts": input_snapshot.jsonl_diagnostics.get(
+            "tag_observation_bursts.jsonl",
+            {},
+        ),
         "localization_events": state_diag,
         "localization_recovery_events": recovery_diag,
     }
@@ -4586,6 +5182,7 @@ def _render_localized_version(
     expected_floor_id = str(metadata.get("floorId") or metadata.get("floor_id") or "")
     expected_map_hashes = {str(expected_hash)} if expected_hash else set()
     for tag in raw_tags:
+        tag = _apply_on_device_confirmation_authority(dict(tag))
         observation = observations_by_id.get(str(tag.get("observation_id")))
         try:
             binding = bind_tag_observation_to_pose(
@@ -4606,11 +5203,12 @@ def _render_localized_version(
                 "source_observation_id": str(tag.get("observation_id") or ""),
                 "reason": reason,
             }
-            tag["association_audit"] = {
-                "status": "not_attempted",
-                "reason": "tag_pose_binding_failed",
-            }
-            final_tags.append(enforce_tag_state_invariants(tag))
+            final_tags.append(
+                _finalize_tag_with_unavailable_offline_association(
+                    tag,
+                    "tag_pose_binding_failed",
+                )
+            )
             continue
         index = binding.node_index
         baseline_node = baseline[index]
@@ -4632,11 +5230,12 @@ def _render_localized_version(
                 "bound_node_id": baseline_node.node_id,
                 "reason": "tag_raw_map_position_missing",
             }
-            tag["association_audit"] = {
-                "status": "not_attempted",
-                "reason": "tag_raw_map_position_missing",
-            }
-            final_tags.append(enforce_tag_state_invariants(tag))
+            final_tags.append(
+                _finalize_tag_with_unavailable_offline_association(
+                    tag,
+                    "tag_raw_map_position_missing",
+                )
+            )
             continue
         tag["online_map_position"] = dict(original)
         try:
@@ -4654,11 +5253,12 @@ def _render_localized_version(
                 "bound_node_id": baseline_node.node_id,
                 "reason": "tag_raw_map_position_invalid",
             }
-            tag["association_audit"] = {
-                "status": "not_attempted",
-                "reason": "tag_raw_map_position_invalid",
-            }
-            final_tags.append(enforce_tag_state_invariants(tag))
+            final_tags.append(
+                _finalize_tag_with_unavailable_offline_association(
+                    tag,
+                    "tag_raw_map_position_invalid",
+                )
+            )
             continue
         tag["final_map_position"] = {
             "x_m": round(final_x, 6),
@@ -4701,8 +5301,13 @@ def _render_localized_version(
                 _normalize_angle(optimized_node.yaw - baseline_node.yaw), 6
             ),
         }
+        associated = _associate_tag(
+            tag,
+            elements,
+            (optimized_node.x, optimized_node.y),
+        )
         final_tags.append(
-            _associate_tag(tag, elements, (optimized_node.x, optimized_node.y))
+            _enforce_on_device_confirmation_conflict(associated)
         )
     # Manual tag decisions are deliberately replayed after all automatic
     # reassociation so a reprocess never silently overwrites a human edit.

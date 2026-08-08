@@ -173,6 +173,41 @@ struct TagObservationBurstFlushResult {
     let complete: Bool
 }
 
+struct TagObservationAppendResult {
+    let observation: PriorMapTagObservationRecord
+    let burstID: String
+    let frameID: String
+}
+
+struct TagObservationCaptureCompletionResult {
+    let burstID: String
+    let frameCount: Int
+    let observationIDs: [String]
+    let persisted: Bool
+    let sufficient: Bool
+}
+
+enum PriceTagConfirmationCommitFailure: String, Equatable {
+    case finalizationInProgress = "finalization_in_progress"
+    case duplicateReservation = "duplicate_reservation"
+    case reservationMissing = "reservation_missing"
+    case requiredEvidenceFailed = "required_evidence_failed"
+    case captureBindingInvalid = "capture_binding_invalid"
+    case sessionIdentityMismatch = "session_identity_mismatch"
+    case activeSessionUnavailable = "active_session_unavailable"
+    case persistenceFailed = "persistence_failed"
+}
+
+struct PriceTagConfirmationReservationOutcome: Equatable {
+    let reserved: Bool
+    let failure: PriceTagConfirmationCommitFailure?
+}
+
+struct PriceTagConfirmationCommitOutcome: Equatable {
+    let persisted: Bool
+    let failure: PriceTagConfirmationCommitFailure?
+}
+
 struct ScanAreaCells: Codable {
     let segmentIndex: Int
     let cellSizeM: Double
@@ -698,6 +733,7 @@ final class SupermarketScanSession {
     private let eventLogLock = NSLock()
     private let localizationLogLock = NSLock()
     private let localizationTransactionLock = NSLock()
+    private let localizationAdmissionGate = PriceTagSessionAdmissionGate()
     private var customBaseDirectory: URL?
     private(set) var rootDirectory: URL?
     private(set) var segmentIndex: Int = 0
@@ -746,6 +782,8 @@ final class SupermarketScanSession {
     // `localizationTransactionLock` (the same lock guarding
     // `appendTagObservation`), so no separate lock is needed.
     private var pendingTagBurst: PendingTagBurst?
+    private var completedTagCaptureFrames: [String: Set<String>] = [:]
+    private var completedTagCaptureOrder: [String] = []
     private var tagBurstSequence = 0
     private(set) var tagObservationBurstCount = 0
     private var lastTagObservationBurstID: String?
@@ -756,24 +794,33 @@ final class SupermarketScanSession {
     /// Upper bound on raw 3D samples retained per burst; the newest samples
     /// are kept.
 
-    private var finalizingScan = false
     var isFinalizingScan: Bool {
-        get {
-            captureLock.lock()
-            defer { captureLock.unlock() }
-            return finalizingScan
-        }
-        set {
-            if newValue {
-                localizationTransactionLock.lock()
-            }
-            captureLock.lock()
-            finalizingScan = newValue
-            captureLock.unlock()
-            if newValue {
-                localizationTransactionLock.unlock()
-            }
-        }
+        return localizationAdmissionGate.isFinalizing
+    }
+
+    /// Foundation-only verification visibility for the finalization drain.
+    /// Production code does not use this count for business decisions.
+    var activeLocalizationTransactionCount: Int {
+        return localizationAdmissionGate.activeTransactionCount
+    }
+
+    /// Closes ordinary localization/tag write admission with a short
+    /// condition lock. It never waits for the serialized writer or performs
+    /// file I/O, so callers may invoke it from the main thread.
+    @discardableResult
+    func beginFinalization() -> Bool {
+        return localizationAdmissionGate.beginFinalization()
+    }
+
+    func endFinalization() {
+        localizationAdmissionGate.endFinalization()
+    }
+
+    /// Waits for every transaction admitted before `beginFinalization()` and
+    /// every confirmation reserved before that linearization point. Call only
+    /// on a background queue; new ordinary writes are rejected meanwhile.
+    func waitForFinalizationTransactionDrain() {
+        localizationAdmissionGate.waitForFinalizationDrain()
     }
 
     init(
@@ -803,6 +850,12 @@ final class SupermarketScanSession {
     }
 
     func configureScan(_ configuration: PriorMapScanConfiguration) {
+        guard localizationAdmissionGate.beginTransaction() == nil else {
+            return
+        }
+        defer { localizationAdmissionGate.endTransaction() }
+        localizationTransactionLock.lock()
+        defer { localizationTransactionLock.unlock() }
         captureLock.lock()
         defer { captureLock.unlock() }
         scanConfiguration = configuration
@@ -861,18 +914,38 @@ final class SupermarketScanSession {
     /// guarantees that the next scan gets a new directory instead of opening
     /// the completed database with `clearDatabase=true`.
     func completeCurrentSession() {
+        guard localizationAdmissionGate.beginTransaction(
+                allowDuringFinalization: true) == nil else {
+            return
+        }
+        defer { localizationAdmissionGate.endTransaction() }
+        localizationTransactionLock.lock()
+        defer { localizationTransactionLock.unlock() }
         captureLock.lock()
         defer { captureLock.unlock() }
         rootDirectory = nil
         segmentIndex = 0
         nextTagId = 1
         scanConfiguration = .freeMapping
-        resetCurrentSegment()
+        resetCurrentSegmentLocked()
     }
 
     func resetCurrentSegment() {
+        // Match the production write order (localization transaction before
+        // capture state) so a session reset cannot deadlock with a localized
+        // tag commit or leave burst watermarks from the previous scan.
+        guard localizationAdmissionGate.beginTransaction() == nil else {
+            return
+        }
+        defer { localizationAdmissionGate.endTransaction() }
+        localizationTransactionLock.lock()
+        defer { localizationTransactionLock.unlock() }
         captureLock.lock()
         defer { captureLock.unlock() }
+        resetCurrentSegmentLocked()
+    }
+
+    private func resetCurrentSegmentLocked() {
         areaEstimator.reset()
         currentAreaM2 = 0
         priceTags.removeAll()
@@ -909,6 +982,13 @@ final class SupermarketScanSession {
         localizationLastRecoveryFinishedAtUptime = nil
         latestStructureCoverageSnapshot = nil
         latestStructureCoverageSummary = nil
+        pendingTagBurst = nil
+        completedTagCaptureFrames.removeAll()
+        completedTagCaptureOrder.removeAll()
+        tagBurstSequence = 0
+        tagObservationBurstCount = 0
+        lastTagObservationBurstID = nil
+        tagBurstWriteFailureCount = 0
     }
 
     func currentSegmentDirectory() throws -> URL {
@@ -1780,6 +1860,76 @@ final class SupermarketScanSession {
             return
         }
 
+        _ = appendScanEvent(
+            level: level,
+            event: event,
+            message: message,
+            fields: fields,
+            directory: directory,
+            trackingSessionId: trackingSessionId)
+    }
+
+    /// Appends a late/asynchronous audit record only when the exact scan is
+    /// still active. Unlike appendScanEvent(), this method never creates a
+    /// session directory. Its admission is included in the finalization drain,
+    /// so an audit admitted before finalization finishes before snapshotting;
+    /// one arriving after admission closes is rejected without mutating a
+    /// finalized package or creating an empty successor session. The explicit
+    /// override is reserved for finalization-owned scan-stop audit records.
+    @discardableResult
+    func appendScanEventIfSessionActive(
+        expectedTrackingSessionId: String,
+        allowDuringFinalization: Bool = false,
+        level: String = "info",
+        event: String,
+        message: String,
+        fields: [String: String] = [:]
+    ) -> Bool {
+        guard localizationAdmissionGate.beginTransaction(
+                allowDuringFinalization: allowDuringFinalization) == nil else {
+            return false
+        }
+        defer { localizationAdmissionGate.endTransaction() }
+
+        captureLock.lock()
+        guard !expectedTrackingSessionId.isEmpty,
+              expectedTrackingSessionId == trackingSessionId,
+              let root = rootDirectory,
+              segmentIndex == 1 else {
+            captureLock.unlock()
+            return false
+        }
+        let directory = root.appendingPathComponent(
+            "segment_0001",
+            isDirectory: true)
+        let recordTrackingSessionId = trackingSessionId
+        captureLock.unlock()
+        var isDirectory: ObjCBool = false
+        guard fileManager.fileExists(
+                atPath: directory.path,
+                isDirectory: &isDirectory),
+              isDirectory.boolValue else {
+            return false
+        }
+        return appendScanEvent(
+            level: level,
+            event: event,
+            message: message,
+            fields: fields,
+            directory: directory,
+            trackingSessionId: recordTrackingSessionId)
+    }
+
+    @discardableResult
+    private func appendScanEvent(
+        level: String,
+        event: String,
+        message: String,
+        fields: [String: String],
+        directory: URL,
+        trackingSessionId: String
+    ) -> Bool {
+
         let now = Date()
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
@@ -1803,9 +1953,11 @@ final class SupermarketScanSession {
             data.append(0x0A)
             let logURL = directory.appendingPathComponent("scan_events.jsonl")
             try sidecarWriter.append(data, to: logURL)
+            return true
         }
         catch {
             print("Could not append scan event log: \(error)")
+            return false
         }
     }
 
@@ -1814,6 +1966,17 @@ final class SupermarketScanSession {
         expectedTrackingSessionId: String,
         nodeTimebaseOffsetSeconds: TimeInterval
     ) -> LocalizationWriteResult {
+        guard localizationAdmissionGate.beginTransaction() == nil else {
+            return LocalizationWriteResult(
+                traceWritten: false,
+                constraintWritten: false,
+                stateWriteRequired: false,
+                stateWritten: false,
+                failureReasons: [
+                    "localization_session": "finalization_in_progress"
+                ])
+        }
+        defer { localizationAdmissionGate.endTransaction() }
         localizationTransactionLock.lock()
         defer { localizationTransactionLock.unlock() }
         if hasLocalizationRequiredWriteFailure() {
@@ -1970,16 +2133,36 @@ final class SupermarketScanSession {
         _ observation: PriorMapTagObservationRecord,
         boundNodeID: Int64
     ) -> Bool {
+        return appendTagObservationForCapture(
+            observation,
+            boundNodeID: boundNodeID,
+            captureID: nil) != nil
+    }
+
+    /// Barcode Capture Mode entry point. `captureID` is also the durable
+    /// burst identity, so an active capture cannot accidentally merge with a
+    /// previous/next scan merely because the payload and frame gap match.
+    @discardableResult
+    func appendTagObservationForCapture(
+        _ observation: PriorMapTagObservationRecord,
+        boundNodeID: Int64,
+        captureID: UUID?
+    ) -> TagObservationAppendResult? {
+        guard localizationAdmissionGate.beginTransaction() == nil else {
+            return nil
+        }
+        defer { localizationAdmissionGate.endTransaction() }
         localizationTransactionLock.lock()
         defer { localizationTransactionLock.unlock() }
         guard !hasLocalizationRequiredWriteFailure(), boundNodeID > 0 else {
-            return false
+            return nil
         }
         // V1R5 §5.4: assign the durable burst/frame identity BEFORE the
         // record is persisted so every observation carries its burst
         // linkage. The frame id is the capture-frame timestamp (unique
         // inside one burst; the burst ingest rejects duplicates).
-        let burstID = tagBurstIdentity(for: observation)
+        let burstID = captureID?.uuidString.lowercased()
+            ?? tagBurstIdentity(for: observation)
         let frameID = String(format: "%.9f", observation.frameTimestamp)
         let bound = observation.bindingBurst(
             burstId: burstID, frameId: frameID)
@@ -1997,14 +2180,26 @@ final class SupermarketScanSession {
                 event: "tag_observation_write_failed",
                 message: "Required price-tag observation evidence was not persisted",
                 fields: ["reason": failures["tag_observations.jsonl"]!])
-            return false
+            return nil
         }
         // V1R4 §13.1: only observations durably persisted to the main
         // sidecar may enter burst aggregation. A burst flush failure marks
         // the session processing-ineligible fail-closed (watermark count
         // stays short and the finalization flag flips false).
-        ingestTagObservationBurst(bound, boundNodeID: boundNodeID)
-        return true
+        guard ingestTagObservationBurst(bound, boundNodeID: boundNodeID) else {
+            // The observation is already durable and carries burst/frame
+            // identity. If it cannot enter the matching burst, the bundle
+            // can no longer satisfy the two-way exact binding contract.
+            // Mark the required evidence health sticky immediately instead
+            // of waiting for finalization to discover the orphan record.
+            recordTagBurstWriteFailure(
+                "burst_ingest_rejected_after_observation_persisted")
+            return nil
+        }
+        return TagObservationAppendResult(
+            observation: bound,
+            burstID: burstID,
+            frameID: frameID)
     }
 
     // MARK: - Tag burst aggregation (V1R4 §13.1)
@@ -2044,16 +2239,18 @@ final class SupermarketScanSession {
         return UUID().uuidString
     }
 
+    @discardableResult
     private func ingestTagObservationBurst(
         _ observation: PriorMapTagObservationRecord,
         boundNodeID: Int64
-    ) {
+    ) -> Bool {
         guard scanConfiguration.workflowMode == .priorMapLocalized,
               observation.frameTimestamp.isFinite,
               observation.nodeTimebaseFrameTimestamp.isFinite else {
-            return
+            return false
         }
         if var pending = pendingTagBurst {
+            let sameBurst = pending.burstId == observation.burstId
             let sameBarcode = pending.barcode == observation.payload
                 && pending.symbology == observation.symbology
                 && pending.priorMapId == observation.priorMapId
@@ -2064,12 +2261,14 @@ final class SupermarketScanSession {
             // the burst (see `tagBurstIdentity`).
             let gap = observation.frameTimestamp - pending.lastFrameTimestamp
             let withinGap = gap >= 0 && gap <= tagBurstMaxGapSeconds
-            if sameBarcode, withinGap {
-                _ = pending.ingest(observation, boundNodeID: boundNodeID)
+            if sameBurst, sameBarcode, withinGap {
+                let accepted = pending.ingest(
+                    observation,
+                    boundNodeID: boundNodeID)
                 pendingTagBurst = pending
-                return
+                return accepted
             }
-            flushPendingTagBurstLocked()
+            _ = flushPendingTagBurstLocked()
         }
         tagBurstSequence += 1
         pendingTagBurst = PendingTagBurst(
@@ -2077,33 +2276,35 @@ final class SupermarketScanSession {
             sequence: tagBurstSequence,
             observation: observation,
             boundNodeID: boundNodeID)
+        return pendingTagBurst?.frameCount == 1
     }
 
     /// Flushes the in-flight burst (if any) as a complete durable record.
     /// On write failure the burst is dropped (it can never be made complete
     /// in memory), the failure is recorded fail-closed, and the watermark
     /// count stays short so the PC side blocks processing.
-    private func flushPendingTagBurstLocked() {
-        guard let pending = pendingTagBurst else { return }
+    private func flushPendingTagBurstLocked() -> TagObservationBurstRecord? {
+        guard let pending = pendingTagBurst else { return nil }
         pendingTagBurst = nil
         // A malformed/duplicate first frame must make the evidence
         // incomplete, never terminate the shipping app through the
         // `PendingTagBurst.record` precondition.
         guard !pending.frameSamples.isEmpty else {
             recordTagBurstWriteFailure("empty_complete_burst")
-            return
+            return nil
         }
         let directory = rootDirectory?.appendingPathComponent(
             "segment_0001", isDirectory: true)
         guard let directory,
               fileManager.fileExists(atPath: directory.path) else {
             recordTagBurstWriteFailure("active_directory_unavailable")
-            return
+            return nil
         }
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
         do {
-            var data = try encoder.encode(pending.record(complete: true))
+            let record = pending.record(complete: true)
+            var data = try encoder.encode(record)
             data.append(0x0A)
             sidecarWriteLock.lock()
             defer { sidecarWriteLock.unlock() }
@@ -2112,9 +2313,18 @@ final class SupermarketScanSession {
                 to: directory.appendingPathComponent("tag_observation_bursts.jsonl"))
             tagObservationBurstCount += 1
             lastTagObservationBurstID = pending.burstId
+            completedTagCaptureFrames[pending.burstId] = Set(
+                pending.frameSamples.map(\.observationId))
+            completedTagCaptureOrder.append(pending.burstId)
+            while completedTagCaptureOrder.count > 512 {
+                let oldest = completedTagCaptureOrder.removeFirst()
+                completedTagCaptureFrames.removeValue(forKey: oldest)
+            }
+            return record
         }
         catch {
             recordTagBurstWriteFailure(error.localizedDescription)
+            return nil
         }
     }
 
@@ -2133,28 +2343,214 @@ final class SupermarketScanSession {
     /// Finalization entry point: flushes the last in-flight burst and
     /// returns the durable sidecar watermarks for metadata commit. Called
     /// exactly once per finalization, before the metadata snapshot is built.
-    func flushTagObservationBursts() -> TagObservationBurstFlushResult {
+    func flushTagObservationBursts(
+        allowDuringFinalization: Bool = false
+    ) -> TagObservationBurstFlushResult {
+        guard localizationAdmissionGate.beginTransaction(
+                allowDuringFinalization: allowDuringFinalization) == nil else {
+            return TagObservationBurstFlushResult(
+                count: 0,
+                lastBurstID: nil,
+                complete: false)
+        }
+        defer { localizationAdmissionGate.endTransaction() }
         localizationTransactionLock.lock()
         defer { localizationTransactionLock.unlock() }
-        flushPendingTagBurstLocked()
+        _ = flushPendingTagBurstLocked()
         return TagObservationBurstFlushResult(
             count: tagObservationBurstCount,
             lastBurstID: lastTagObservationBurstID,
             complete: tagBurstWriteFailureCount == 0)
     }
 
+    /// Closes one UI capture as a durable complete burst. A short capture is
+    /// still retained for audit, but `sufficient` stays false and the UI may
+    /// not create a user-confirmed localized tag from it.
+    func finalizeTagObservationCapture(
+        captureID: UUID,
+        minimumFrameCount: Int
+    ) -> TagObservationCaptureCompletionResult? {
+        guard localizationAdmissionGate.beginTransaction() == nil else {
+            return nil
+        }
+        defer { localizationAdmissionGate.endTransaction() }
+        localizationTransactionLock.lock()
+        defer { localizationTransactionLock.unlock() }
+        let identity = captureID.uuidString.lowercased()
+        guard let pending = pendingTagBurst,
+              pending.burstId == identity else {
+            return nil
+        }
+        let frameCount = pending.frameSamples.count
+        let observationIDs = pending.frameSamples.map(\.observationId)
+        let record = flushPendingTagBurstLocked()
+        return TagObservationCaptureCompletionResult(
+            burstID: identity,
+            frameCount: frameCount,
+            observationIDs: observationIDs,
+            persisted: record != nil,
+            sufficient: record != nil
+                && frameCount >= max(0, minimumFrameCount))
+    }
+
+    private func validLocalizedPriceTagCaptureLocked(
+        _ tag: LocalizedPriceTag
+    ) -> Bool {
+        // Legacy v1 decode/write compatibility remains intact. New field UX
+        // must use v2 and prove it references an already durable complete
+        // multi-frame burst before any user-confirmed tag can be committed.
+        guard tag.version >= 2 else { return tag.version == 1 }
+        guard tag.format == "MarketScannerLocalizedPriceTag",
+              tag.userConfirmed,
+              !tag.needsReview,
+              let captureID = tag.captureId,
+              let parsedCaptureID = UUID(uuidString: captureID),
+              parsedCaptureID.uuidString.lowercased() == captureID,
+              let durableFrames = completedTagCaptureFrames[captureID],
+              let frameObservationIDs = tag.frameObservationIds,
+              frameObservationIDs.count >= 3,
+              Set(frameObservationIDs).count == frameObservationIDs.count,
+              Set(frameObservationIDs) == durableFrames,
+              durableFrames.count >= 3,
+              frameObservationIDs.contains(tag.observationId),
+              let algorithmSegmentID = tag.algorithmShelfSegmentId,
+              !algorithmSegmentID.isEmpty,
+              tag.shelfSegmentId == algorithmSegmentID,
+              let algorithmSide = tag.algorithmSide,
+              !algorithmSide.isEmpty,
+              tag.shelfSide == algorithmSide,
+              let algorithmConfidence = tag.algorithmAssociationConfidence,
+              algorithmConfidence.isFinite,
+              (0...1).contains(algorithmConfidence),
+              let status = tag.confirmationStatus,
+              status == "USER_CONFIRMED" || status == "USER_OVERRIDDEN",
+              let userSegmentID = tag.userConfirmedShelfSegmentId,
+              !userSegmentID.isEmpty,
+              let userSide = tag.userConfirmedSide,
+              !userSide.isEmpty,
+              let confirmedAtUTC = tag.confirmedAtUTC,
+              confirmedAtUTC.isFinite,
+              confirmedAtUTC > 0,
+              let confirmedAtMonotonic = tag.confirmedAtMonotonic,
+              confirmedAtMonotonic.isFinite,
+              confirmedAtMonotonic >= 0,
+              tag.confirmationSource == "on_device_operator" else {
+            return false
+        }
+        let sameCandidate = algorithmSegmentID == userSegmentID
+            && algorithmSide == userSide
+        return status == "USER_CONFIRMED" ? sameCandidate : !sameCandidate
+    }
+
+    func reserveLocalizedPriceTagConfirmation(
+        _ tag: LocalizedPriceTag,
+        authority: PriceTagConfirmationCommitAuthority
+    ) -> PriceTagConfirmationReservationOutcome {
+        captureLock.lock()
+        let validationFailure: PriceTagConfirmationCommitFailure?
+        if localizationRequiredWriteFailureCount > 0 {
+            validationFailure = .requiredEvidenceFailed
+        }
+        else if !PriceTagConfirmationIdentityValidator.matches(
+            tag: tag,
+            authority: authority,
+            configuration: scanConfiguration,
+            trackingSessionID: trackingSessionId
+        ) {
+            validationFailure = .sessionIdentityMismatch
+        }
+        else if rootDirectory == nil || segmentIndex != 1 {
+            validationFailure = .activeSessionUnavailable
+        }
+        else {
+            validationFailure = nil
+        }
+        captureLock.unlock()
+        if let validationFailure {
+            return PriceTagConfirmationReservationOutcome(
+                reserved: false,
+                failure: validationFailure)
+        }
+        switch localizationAdmissionGate.reserveConfirmation(authority) {
+        case .reserved:
+            return PriceTagConfirmationReservationOutcome(
+                reserved: true,
+                failure: nil)
+        case .rejected(.finalizationInProgress):
+            return PriceTagConfirmationReservationOutcome(
+                reserved: false,
+                failure: .finalizationInProgress)
+        case .rejected(.duplicateReservation):
+            return PriceTagConfirmationReservationOutcome(
+                reserved: false,
+                failure: .duplicateReservation)
+        case .rejected(.reservationMissing):
+            return PriceTagConfirmationReservationOutcome(
+                reserved: false,
+                failure: .reservationMissing)
+        }
+    }
+
+    func cancelLocalizedPriceTagConfirmationReservation(
+        authority: PriceTagConfirmationCommitAuthority
+    ) {
+        localizationAdmissionGate.cancelConfirmationReservation(authority)
+    }
+
     @discardableResult
-    func recordLocalizedPriceTag(_ tag: LocalizedPriceTag) -> Bool {
+    func recordLocalizedPriceTag(
+        _ tag: LocalizedPriceTag,
+        authority: PriceTagConfirmationCommitAuthority
+    ) -> PriceTagConfirmationCommitOutcome {
+        if let admissionFailure = localizationAdmissionGate.beginTransaction(
+            reservedConfirmation: authority
+        ) {
+            let failure: PriceTagConfirmationCommitFailure
+            switch admissionFailure {
+            case .finalizationInProgress:
+                failure = .finalizationInProgress
+            case .duplicateReservation:
+                failure = .duplicateReservation
+            case .reservationMissing:
+                failure = .reservationMissing
+            }
+            return PriceTagConfirmationCommitOutcome(
+                persisted: false,
+                failure: failure)
+        }
+        defer {
+            localizationAdmissionGate.endTransaction(
+                reservedConfirmation: authority)
+        }
         localizationTransactionLock.lock()
         defer { localizationTransactionLock.unlock() }
         captureLock.lock()
-        guard !finalizingScan,
-              localizationRequiredWriteFailureCount == 0,
-              tag.trackingSessionId == trackingSessionId,
-              let root = rootDirectory,
-              segmentIndex == 1 else {
+        let validationFailure: PriceTagConfirmationCommitFailure?
+        if localizationRequiredWriteFailureCount > 0 {
+            validationFailure = .requiredEvidenceFailed
+        }
+        else if !validLocalizedPriceTagCaptureLocked(tag) {
+            validationFailure = .captureBindingInvalid
+        }
+        else if !PriceTagConfirmationIdentityValidator.matches(
+                tag: tag,
+                authority: authority,
+                configuration: scanConfiguration,
+                trackingSessionID: trackingSessionId) {
+            validationFailure = .sessionIdentityMismatch
+        }
+        else if rootDirectory == nil || segmentIndex != 1 {
+            validationFailure = .activeSessionUnavailable
+        }
+        else {
+            validationFailure = nil
+        }
+        guard validationFailure == nil,
+              let root = rootDirectory else {
             captureLock.unlock()
-            return false
+            return PriceTagConfirmationCommitOutcome(
+                persisted: false,
+                failure: validationFailure ?? .activeSessionUnavailable)
         }
         let directory = root.appendingPathComponent(
             "segment_0001",
@@ -2177,7 +2573,13 @@ final class SupermarketScanSession {
             try sidecarWriter.writeAtomic(
                 data,
                 to: directory.appendingPathComponent("localized_price_tags.json"))
-            return true
+            if let captureID = tag.captureId {
+                completedTagCaptureFrames.removeValue(forKey: captureID)
+                completedTagCaptureOrder.removeAll { $0 == captureID }
+            }
+            return PriceTagConfirmationCommitOutcome(
+                persisted: true,
+                failure: nil)
         }
         catch {
             captureLock.lock()
@@ -2192,7 +2594,9 @@ final class SupermarketScanSession {
                 message: "Required confirmed price-tag state was not persisted",
                 fields: ["reason": error.localizedDescription])
             print("Could not persist localized price tag: \(error)")
-            return false
+            return PriceTagConfirmationCommitOutcome(
+                persisted: false,
+                failure: .persistenceFailed)
         }
     }
 
@@ -2212,6 +2616,10 @@ final class SupermarketScanSession {
         alignmentVersion: Int,
         expectedTrackingSessionId: String
     ) -> Bool {
+        guard localizationAdmissionGate.beginTransaction() == nil else {
+            return false
+        }
+        defer { localizationAdmissionGate.endTransaction() }
         localizationTransactionLock.lock()
         defer { localizationTransactionLock.unlock() }
         guard frameTimestamp.isFinite,
@@ -2297,8 +2705,14 @@ final class SupermarketScanSession {
     @discardableResult
     func appendRecoveryLifecycleEvent(
         _ completion: PriorMapRecoveryCompletion,
-        expectedTrackingSessionId: String
+        expectedTrackingSessionId: String,
+        allowDuringFinalization: Bool = false
     ) -> Bool {
+        guard localizationAdmissionGate.beginTransaction(
+                allowDuringFinalization: allowDuringFinalization) == nil else {
+            return false
+        }
+        defer { localizationAdmissionGate.endTransaction() }
         localizationTransactionLock.lock()
         defer { localizationTransactionLock.unlock() }
         guard let priorMapId = scanConfiguration.priorMapId,
@@ -2334,7 +2748,7 @@ final class SupermarketScanSession {
             record,
             fileName: PriorMapRecoveryLifecycleRecord.fileName,
             expectedTrackingSessionId: expectedTrackingSessionId,
-            allowDuringFinalization: true)
+            allowDuringFinalization: allowDuringFinalization)
         if result.succeeded {
             // Advance the capture watermark only after the durable append is
             // confirmed; finalization validates the sidecar against it.
@@ -2433,8 +2847,15 @@ final class SupermarketScanSession {
         allowDuringFinalization: Bool = false
     ) throws -> URL {
         captureLock.lock()
-        guard (allowDuringFinalization || !finalizingScan),
-              expectedTrackingSessionId == trackingSessionId,
+        // PriceTagSessionAdmissionGate is the single write-admission
+        // linearization point. A transaction admitted just before
+        // beginFinalization() may wait behind localizationTransactionLock and
+        // must still finish while the finalization drain waits for it. Do not
+        // re-read the global finalization state here and reject that admitted
+        // writer. Finalization-owned operations are authorized at their public
+        // entry point; this helper keeps enforcing the exact session identity.
+        _ = allowDuringFinalization
+        guard expectedTrackingSessionId == trackingSessionId,
               let root = rootDirectory,
               segmentIndex == 1 else {
             captureLock.unlock()

@@ -974,7 +974,7 @@ final class PriorMapStageOneLocalizer {
         _ detection: PriceTagVisionDetection,
         trackingSessionId: String,
         nodeTimebaseOffsetSeconds: TimeInterval
-    ) -> (PriorMapTagObservationRecord, LocalizedPriceTag) {
+    ) -> PriceTagLocalizedFrameResult {
         let snapshot = detection.alignmentSnapshot
         let origin = snapshot.arkitOrigin
         let mapPoint: (SIMD3<Float>) -> PriorMapTagPoint3D = { world in
@@ -1011,7 +1011,7 @@ final class PriorMapStageOneLocalizer {
         let alignmentFreshness = freshness.label
         let effectiveLocalizationState = freshness.localizationState
         let effectiveLocalizationConfidence = freshness.localizationConfidence
-        let localized = ShelfAssociation.localizedTag(
+        let localized = ShelfAssociation.localizedTagResult(
             observationId: detection.observationId,
             payload: detection.payload,
             symbology: detection.symbology,
@@ -1073,10 +1073,12 @@ final class PriorMapStageOneLocalizer {
             priorMapSha256: priorMapSha256,
             floorId: floorId,
             trackingSessionId: trackingSessionId,
-            needsReview: localized.needsReview,
+            needsReview: localized.tag.needsReview,
             burstId: nil,
             frameId: nil)
-        return (observation, localized)
+        return PriceTagLocalizedFrameResult(
+            observation: observation,
+            association: localized)
     }
 
     static func pose(from transform: simd_float4x4) -> PriorMapPose2D {

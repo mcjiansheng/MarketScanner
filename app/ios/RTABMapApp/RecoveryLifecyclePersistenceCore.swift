@@ -33,7 +33,8 @@ protocol RecoveryCompletionDraining {
 protocol RecoveryLifecycleWriting {
     func appendRecoveryLifecycleEvent(
         _ completion: PriorMapRecoveryCompletion,
-        expectedTrackingSessionId: String
+        expectedTrackingSessionId: String,
+        allowDuringFinalization: Bool
     ) -> Bool
 }
 
@@ -111,6 +112,7 @@ final class RecoveryLifecyclePersistenceCoordinator {
     private let priorMapId: String?
     private let priorMapSha256: String?
     private let floorId: String?
+    private let allowDuringFinalization: Bool
     private let persistedEvidenceSnapshot: () throws -> Data
 
     init(
@@ -120,6 +122,7 @@ final class RecoveryLifecyclePersistenceCoordinator {
         priorMapId: String?,
         priorMapSha256: String?,
         floorId: String?,
+        allowDuringFinalization: Bool = false,
         persistedEvidenceSnapshot: @escaping () throws -> Data
     ) {
         self.source = source
@@ -128,6 +131,7 @@ final class RecoveryLifecyclePersistenceCoordinator {
         self.priorMapId = priorMapId
         self.priorMapSha256 = priorMapSha256
         self.floorId = floorId
+        self.allowDuringFinalization = allowDuringFinalization
         self.persistedEvidenceSnapshot = persistedEvidenceSnapshot
     }
 
@@ -295,7 +299,8 @@ final class RecoveryLifecyclePersistenceCoordinator {
             }
             guard writer.appendRecoveryLifecycleEvent(
                 completion,
-                expectedTrackingSessionId: trackingSessionId) else {
+                expectedTrackingSessionId: trackingSessionId,
+                allowDuringFinalization: allowDuringFinalization) else {
                 // Keep this completion and every later one queued so the
                 // failure stays retryable and auditable.
                 return RecoveryLifecyclePersistenceResult(

@@ -1,8 +1,99 @@
 import Foundation
+import CoreGraphics
 import CryptoKit
 import Darwin
 import Dispatch
+import ImageIO
 import SQLite3
+
+extension Date {
+    func getFormattedDate(format: String) -> String {
+        let formatter = DateFormatter()
+        formatter.dateFormat = format
+        return formatter.string(from: self)
+    }
+}
+
+// Foundation-host stubs for the ARKit/UI-owned types consumed by
+// SupermarketScanSession. Production definitions remain in their iOS files;
+// the host executable uses these exact Codable shapes to exercise real session
+// admission and persistence code without importing UIKit.
+struct ScanStructureCoverageCell: Codable {
+    let x: Int
+    let z: Int
+    let floorObservationCount: Int
+    let elevatedObservationCount: Int
+    let highObservationCount: Int
+    let distinctTimeBucketCount: Int
+    let viewDirectionMask: Int
+    let highConfidenceObservationCount: Int
+    let firstElevatedObservedAt: TimeInterval?
+    let lastElevatedObservedAt: TimeInterval?
+    let lastObservedAt: TimeInterval
+}
+
+struct ScanStructureCoverageSummary: Codable {
+    let evaluatedDepthFrameCount: Int
+    let depthUnavailableFrameCount: Int
+    let validDepthSampleCount: Int
+    let observedCellCount: Int
+    let floorCellCount: Int
+    let elevatedCellCount: Int
+    let stableStructureCellCount: Int
+    let multiViewStructureCellCount: Int
+    let groundConflictCellCount: Int
+    let singleViewStructureCellCount: Int
+    let coverageScore: Double
+    let currentDetectionRateHz: Double
+}
+
+struct ScanStructureCoverageSnapshot: Codable {
+    let format: String
+    let version: Int
+    let updatedAt: String
+    let cellSizeM: Double
+    let floorHeightM: Double?
+    let summary: ScanStructureCoverageSummary
+    let cells: [ScanStructureCoverageCell]
+}
+
+struct PriorMapRoadCandidate: Codable {
+    let edgeId: String
+    let distanceM: Double
+}
+
+struct PriorMapLocalizationUpdate: Codable {
+    let format: String
+    let version: Int
+    let timestamp: TimeInterval
+    let trackingState: String
+    let localizationState: String
+    let confidence: Double
+    let rawPose: PriorMapPose2D
+    let estimatedPose: PriorMapPose2D
+    let roadCandidates: [PriorMapRoadCandidate]
+    let structureSource: String
+    let structurePointCount: Int
+    let structureCoverageAngleRad: Double
+    let matchCandidates: [PriorMapScanMatchCandidate]
+    let matchUniqueness: Double
+    let matchResidualCost: Double?
+    let matcherElapsedMs: Double
+    let constraintAccepted: Bool
+    let constraintReason: String
+    var measurementAccepted = false
+    var hypothesisTrusted = false
+    var correctionStepApplied = false
+    var recoveryConvergedThisUpdate = false
+    var confidenceAccepted = false
+    var constraintDisposition: PriorMapConstraintDisposition = .rejected
+    var trackingSessionId: String? = nil
+    var priorMapId: String? = nil
+    var priorMapSha256: String? = nil
+    var floorId: String? = nil
+    var nodeTimebaseTimestamp: TimeInterval? = nil
+    var nodeTimebaseOffsetSeconds: TimeInterval? = nil
+}
 
 final class InjectedSidecarWriter: ScanSidecarFileWriting {
     var storage: [URL: Data] = [:]
@@ -32,6 +123,46 @@ final class InjectedSidecarWriter: ScanSidecarFileWriting {
     }
 }
 
+final class BlockingFirstAppendSidecarWriter: ScanSidecarFileWriting {
+    let firstAppendEntered = DispatchSemaphore(value: 0)
+    let releaseFirstAppend = DispatchSemaphore(value: 0)
+    private let lock = NSLock()
+    private var appendCount = 0
+    private var storage: [URL: Data] = [:]
+
+    func fileExists(at url: URL) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return storage[url] != nil
+    }
+
+    func append(_ data: Data, to url: URL) throws {
+        lock.lock()
+        let shouldBlock = appendCount == 0
+        appendCount += 1
+        lock.unlock()
+        if shouldBlock {
+            firstAppendEntered.signal()
+            _ = releaseFirstAppend.wait(timeout: .now() + 5)
+        }
+        lock.lock()
+        storage[url, default: Data()].append(data)
+        lock.unlock()
+    }
+
+    func writeAtomic(_ data: Data, to url: URL) throws {
+        lock.lock()
+        storage[url] = data
+        lock.unlock()
+    }
+
+    func removeItem(at url: URL) throws {
+        lock.lock()
+        storage.removeValue(forKey: url)
+        lock.unlock()
+    }
+}
+
 func require(_ condition: @autoclosure () -> Bool, _ message: String) {
     if !condition() {
         FileHandle.standardError.write(Data("FAILED: \(message)\n".utf8))
@@ -41,6 +172,1472 @@ func require(_ condition: @autoclosure () -> Bool, _ message: String) {
 
 func close(_ first: Double, _ second: Double, tolerance: Double = 1.0e-9) -> Bool {
     return abs(first - second) <= tolerance
+}
+
+func runESLFinalizationBindingFocusedTests() {
+    do {
+        let cleanDirectory = try p7r6FreshDirectory("esl-focused-clean")
+        _ = try p7r6WriteBaseBundle(in: cleanDirectory)
+        try p7r6WriteTagBurstBindingFixture(in: cleanDirectory)
+        let cleanBlockers = LocalizationEvidenceBundleValidator.blockers(
+            in: cleanDirectory,
+            expectation: p7r6BundleExpectation(
+                recoveryCount: 0,
+                tagBurstCount: 1,
+                tagBurstLastID: "burst-1"))
+        require(
+            cleanBlockers.isEmpty,
+            "ESL focused exact durable binding must finalize: \(cleanBlockers)")
+
+        let mismatchedDirectory = try p7r6FreshDirectory(
+            "esl-focused-mismatch")
+        _ = try p7r6WriteBaseBundle(in: mismatchedDirectory)
+        try p7r6WriteTagBurstBindingFixture(
+            in: mismatchedDirectory,
+            observationFrameID: "different-frame")
+        let mismatchedBlockers = LocalizationEvidenceBundleValidator.blockers(
+            in: mismatchedDirectory,
+            expectation: p7r6BundleExpectation(
+                recoveryCount: 0,
+                tagBurstCount: 1,
+                tagBurstLastID: "burst-1"))
+        require(
+            mismatchedBlockers.contains(
+                "evidence_bundle_tag_burst_observation_binding_mismatch"),
+            "ESL focused mismatched durable binding must block: "
+                + "\(mismatchedBlockers)")
+
+        let extraDirectory = try p7r6FreshDirectory("esl-focused-extra")
+        _ = try p7r6WriteBaseBundle(in: extraDirectory)
+        try p7r6WriteTagBurstBindingFixture(
+            in: extraDirectory,
+            includeUnlistedBoundObservation: true)
+        let extraBlockers = LocalizationEvidenceBundleValidator.blockers(
+            in: extraDirectory,
+            expectation: p7r6BundleExpectation(
+                recoveryCount: 0,
+                tagBurstCount: 1,
+                tagBurstLastID: "burst-1"))
+        require(
+            extraBlockers.contains(
+                "evidence_bundle_tag_burst_observation_binding_mismatch"),
+            "ESL focused unlisted durable binding must block: "
+                + "\(extraBlockers)")
+
+        let sequenceCleanDirectory = try p7r6FreshDirectory(
+            "esl-focused-sequence-clean")
+        _ = try p7r6WriteBaseBundle(in: sequenceCleanDirectory)
+        let sequenceLastID = try p7r6WriteBurstSequenceFixture(
+            in: sequenceCleanDirectory,
+            sequences: [1, 2])
+        let sequenceCleanBlockers =
+            LocalizationEvidenceBundleValidator.blockers(
+                in: sequenceCleanDirectory,
+                expectation: p7r6BundleExpectation(
+                    recoveryCount: 0,
+                    tagBurstCount: 2,
+                    tagBurstLastID: sequenceLastID))
+        require(
+            sequenceCleanBlockers.isEmpty,
+            "strictly increasing burst sequences must finalize: "
+                + "\(sequenceCleanBlockers)")
+
+        for (label, sequences) in [
+            ("duplicate", [1, 1]),
+            ("decreasing", [2, 1]),
+        ] {
+            let directory = try p7r6FreshDirectory(
+                "esl-focused-sequence-\(label)")
+            _ = try p7r6WriteBaseBundle(in: directory)
+            let lastID = try p7r6WriteBurstSequenceFixture(
+                in: directory,
+                sequences: sequences)
+            let blockers = LocalizationEvidenceBundleValidator.blockers(
+                in: directory,
+                expectation: p7r6BundleExpectation(
+                    recoveryCount: 0,
+                    tagBurstCount: sequences.count,
+                    tagBurstLastID: lastID))
+            require(
+                blockers.contains(
+                    "evidence_bundle_tag_observation_bursts.jsonl_tag_burst_sequence_invalid"),
+                "\(label) burst sequence must fail closed: \(blockers)")
+        }
+
+        let confirmedDirectory = try p7r6FreshDirectory(
+            "esl-focused-confirmed-clean")
+        _ = try p7r6WriteBaseBundle(in: confirmedDirectory)
+        let confirmedCaptureID = try p7r6WriteConfirmedTagBurstFixture(
+            in: confirmedDirectory)
+        let confirmedBlockers = LocalizationEvidenceBundleValidator.blockers(
+            in: confirmedDirectory,
+            expectation: p7r6BundleExpectation(
+                recoveryCount: 0,
+                localizedPriceTagCount: 1,
+                tagBurstCount: 1,
+                tagBurstLastID: confirmedCaptureID))
+        require(
+            confirmedBlockers.isEmpty,
+            "localized v2 tag must match its verified burst authority: "
+                + "\(confirmedBlockers)")
+
+        for (label, payload, symbology) in [
+            ("payload", "DIFFERENT-PAYLOAD", "EAN13"),
+            ("symbology", "6901234567890", "Code128"),
+        ] {
+            let directory = try p7r6FreshDirectory(
+                "esl-focused-confirmed-\(label)")
+            _ = try p7r6WriteBaseBundle(in: directory)
+            let captureID = try p7r6WriteConfirmedTagBurstFixture(
+                in: directory,
+                tagPayload: payload,
+                tagSymbology: symbology)
+            let blockers = LocalizationEvidenceBundleValidator.blockers(
+                in: directory,
+                expectation: p7r6BundleExpectation(
+                    recoveryCount: 0,
+                    localizedPriceTagCount: 1,
+                    tagBurstCount: 1,
+                    tagBurstLastID: captureID))
+            require(
+                blockers.contains(
+                    "evidence_bundle_localized_price_tags_tag_confirmation_schema_invalid"),
+                "localized tag \(label) tamper must fail closed: \(blockers)")
+        }
+    } catch {
+        require(false, "ESL finalization focused tests failed: \(error)")
+    }
+    print("ESL finalization binding focused tests passed")
+}
+
+// MARK: - ESL barcode capture focused blocker tests
+
+func runESLBarcodeCaptureFocusedTests() {
+    func closeRect(
+        _ first: CGRect,
+        _ second: CGRect,
+        tolerance: Double = 1.0e-9
+    ) -> Bool {
+        return close(Double(first.minX), Double(second.minX), tolerance: tolerance)
+            && close(Double(first.minY), Double(second.minY), tolerance: tolerance)
+            && close(Double(first.width), Double(second.width), tolerance: tolerance)
+            && close(Double(first.height), Double(second.height), tolerance: tolerance)
+    }
+
+    let selectorROI = CGRect(x: 0.4, y: 0.4, width: 0.2, height: 0.2)
+    func barcode(
+        _ payload: String,
+        _ bounds: CGRect,
+        symbology: String = "EAN13"
+    ) -> PriceTagBarcodeCandidate {
+        return PriceTagBarcodeCandidate(
+            payload: payload,
+            symbology: symbology,
+            visionBounds: bounds)
+    }
+    func select(
+        _ candidates: [PriceTagBarcodeCandidate],
+        roi: CGRect? = nil
+    ) -> PriceTagBarcodeSelection {
+        return PriceTagBarcodeSelector.select(
+            candidates: candidates,
+            regionOfInterest: roi ?? selectorROI,
+            minimumIntersectionRatio: 0.8,
+            minimumNormalizedArea: 0.002,
+            ambiguityScoreDelta: 0.08)
+    }
+    func isSelected(_ selection: PriceTagBarcodeSelection) -> Bool {
+        if case .selected = selection { return true }
+        return false
+    }
+    func isNone(_ selection: PriceTagBarcodeSelection) -> Bool {
+        if case .none = selection { return true }
+        return false
+    }
+    func isAmbiguous(_ selection: PriceTagBarcodeSelection) -> Bool {
+        if case .ambiguous = selection { return true }
+        return false
+    }
+
+    // BC-01: the visible scan box is also the actual detector ROI. Center,
+    // containment and the 80% intersection threshold all apply.
+    require(
+        isSelected(select([
+            barcode("inside", CGRect(x: 0.45, y: 0.45, width: 0.1, height: 0.1)),
+        ])),
+        "BC-01 a barcode centered inside the ROI must be accepted")
+    require(
+        isNone(select([
+            barcode("outside", CGRect(x: 0.1, y: 0.1, width: 0.1, height: 0.1)),
+        ])),
+        "BC-01 a barcode outside the ROI must be rejected")
+    require(
+        isNone(select([
+            // Center is inside, but only 20% of the candidate area overlaps.
+            barcode("overlap-20", CGRect(x: 0, y: 0.45, width: 1, height: 0.1)),
+        ])),
+        "BC-01 20% ROI overlap must be rejected")
+    require(
+        isSelected(select([
+            // 0.20 / 0.25 = exactly 80% horizontal overlap.
+            barcode("overlap-80", CGRect(x: 0.35, y: 0.45, width: 0.25, height: 0.1)),
+        ])),
+        "BC-01 80% ROI overlap must be accepted")
+
+    // BC-02: the one production mapper must round-trip the center and all
+    // corners for every supported back-camera orientation.
+    let previewBounds = CGRect(x: 0, y: 0, width: 390, height: 844)
+    let scanRect = CGRect(x: 62, y: 292, width: 266, height: 180)
+    let imageResolution = CGSize(width: 1920, height: 1080)
+    let orientations: [CGImagePropertyOrientation] = [
+        .up, .down, .left, .right,
+    ]
+    for orientation in orientations {
+        do {
+            let roi = try PriceTagScanROIMapper.visionRegionOfInterest(
+                scanRectInView: scanRect,
+                previewBounds: previewBounds,
+                imageResolution: imageResolution,
+                orientation: orientation,
+                videoGravity: .resizeAspectFill)
+            let roundTrip = try PriceTagScanROIMapper.viewRect(
+                forVisionRegion: roi,
+                previewBounds: previewBounds,
+                imageResolution: imageResolution,
+                orientation: orientation,
+                videoGravity: .resizeAspectFill)
+            require(
+                closeRect(roundTrip, scanRect, tolerance: 1.0e-7),
+                "BC-02 orientation \(orientation.rawValue) must round-trip center and corners")
+            require(
+                roi.contains(CGPoint(x: roi.midX, y: roi.midY)),
+                "BC-02 mapped ROI center must remain inside")
+        } catch {
+            require(false, "BC-02 orientation mapping failed: \(error)")
+        }
+    }
+    require(
+        PriceTagScanROIMapper.orientedImageSize(
+            imageResolution: imageResolution,
+            orientation: .left) == CGSize(width: 1080, height: 1920),
+        "BC-02 left/right orientations must swap sensor dimensions")
+    require(
+        PriceTagScanROIMapper.orientedImageSize(
+            imageResolution: imageResolution,
+            orientation: .down) == imageResolution,
+        "BC-02 up/down orientations must retain sensor dimensions")
+
+    // BC-03: outside candidates cannot steal the target and near-equal
+    // in-ROI candidates fail closed as an ambiguity.
+    let centerA = barcode(
+        "A", CGRect(x: 0.445, y: 0.445, width: 0.11, height: 0.11))
+    let centerB = barcode(
+        "B", CGRect(x: 0.45, y: 0.45, width: 0.10, height: 0.10))
+    let outsideB = barcode(
+        "B", CGRect(x: 0.05, y: 0.05, width: 0.12, height: 0.12))
+    require(isSelected(select([centerA])), "BC-03 one candidate must select")
+    require(
+        isSelected(select([centerA, outsideB])),
+        "BC-03 an outside candidate must not steal an in-ROI target")
+    require(
+        isAmbiguous(select([centerA, centerB])),
+        "BC-03 near-equal in-ROI candidates must be ambiguous")
+
+    require(
+        PriceTagCapturePolicy.field.minimumCandidateLockFrames == 2
+            && PriceTagCapturePolicy.field.minimumEvidenceFrames == 3
+            && PriceTagCapturePolicy.field.targetEvidenceFrames == 4
+            && PriceTagCapturePolicy.field.visionRateHz >= 5
+            && PriceTagCapturePolicy.field.visionRateHz <= 10,
+        "field policy must retain 2-frame lock, 3-frame minimum, 4-frame target and bounded Vision")
+    let stableAuditCodes = Set(
+        PriceTagCaptureAuditCode.allCases.map(\.rawValue))
+    for requiredCode in [
+        "price_tag_capture_timeout",
+        "price_tag_multiple_barcodes",
+        "price_tag_tracking_unavailable",
+        "price_tag_measurement_unavailable",
+        "price_tag_shelf_ambiguous",
+        "price_tag_user_rescan",
+        "price_tag_confirmation_admission_rejected",
+        "price_tag_confirmation_persistence_failed",
+    ] {
+        require(
+            stableAuditCodes.contains(requiredCode),
+            "stable ESL audit contract must include \(requiredCode)")
+    }
+    let policy = PriceTagCapturePolicy(
+        minimumCandidateLockFrames: 2,
+        minimumEvidenceFrames: 3,
+        targetEvidenceFrames: 3,
+        minimumCaptureDuration: 0.30,
+        maximumCaptureDuration: 2.0,
+        visionRateHz: 8,
+        previewRateHz: 24,
+        minimumROIIntersectionRatio: 0.8,
+        minimumCandidateNormalizedArea: 0.002,
+        ambiguityScoreDelta: 0.08,
+        completedDuplicateSuppressionSeconds: 2.0)
+    let captureGeometry = PriceTagCaptureGeometry(
+        previewBounds: previewBounds,
+        scanRect: scanRect)
+    let captureROI = CGRect(x: 0.2, y: 0.2, width: 0.6, height: 0.6)
+    let activeA = barcode(
+        "ACTIVE-A", CGRect(x: 0.42, y: 0.45, width: 0.16, height: 0.10))
+    let activeB = barcode(
+        "ACTIVE-B", CGRect(x: 0.42, y: 0.45, width: 0.16, height: 0.10))
+    let capturePriorMapAuthority = PriceTagCapturePriorMapAuthority(
+        priorMapGeneration: UUID(),
+        trackingSessionID: "SESSION-ESL",
+        priorMapID: "MAP-ESL",
+        priorMapSHA256: String(repeating: "a", count: 64),
+        floorID: "F1")
+
+    func startCoordinator(
+        now: TimeInterval = 0
+    ) -> (PriceTagCaptureCoordinator, UUID) {
+        let coordinator = PriceTagCaptureCoordinator(policy: policy)
+        let generation = coordinator.begin(
+            now: now,
+            priorMapAuthority: capturePriorMapAuthority)
+        require(
+            coordinator.markAiming(generation: generation),
+            "capture must enter aiming from its current generation")
+        coordinator.updateGeometry(captureGeometry)
+        return (coordinator, generation)
+    }
+    func submit(
+        _ coordinator: PriceTagCaptureCoordinator,
+        generation: UUID,
+        timestamp: TimeInterval,
+        candidates: [PriceTagBarcodeCandidate]
+    ) -> PriceTagCaptureVisionAction {
+        guard let submission = coordinator.requestVisionSubmission(
+                frameTimestamp: timestamp) else {
+            require(false, "expected bounded Vision submission at \(timestamp)")
+            return .ignored
+        }
+        require(
+            submission.generation == generation,
+            "Vision submission must carry the current generation")
+        return coordinator.finishVision(
+            generation: generation,
+            frameTimestamp: timestamp,
+            candidates: candidates,
+            regionOfInterest: captureROI)
+    }
+
+    // Workstream D: at most one request is in-flight and the policy enforces
+    // the configured 8 Hz submission ceiling.
+    do {
+        let (coordinator, generation) = startCoordinator()
+        require(
+            coordinator.requestVisionSubmission(frameTimestamp: 0) != nil,
+            "bounded Vision must accept the first request")
+        require(
+            coordinator.requestVisionSubmission(frameTimestamp: 0.01) == nil,
+            "bounded Vision must allow at most one in-flight request")
+        _ = coordinator.finishVision(
+            generation: generation,
+            frameTimestamp: 0,
+            candidates: [],
+            regionOfInterest: captureROI)
+        require(
+            coordinator.requestVisionSubmission(frameTimestamp: 0.05) == nil,
+            "bounded Vision must reject submissions above 8 Hz")
+        require(
+            coordinator.requestVisionSubmission(frameTimestamp: 0.13) != nil,
+            "bounded Vision must reopen after the 8 Hz interval")
+        _ = coordinator.cancel(reason: "focused_test_complete")
+    }
+
+    // BC-04: A,A locks; A,B resets; A,none,A resets and requires another
+    // subsequent A before it can lock.
+    do {
+        let (coordinator, generation) = startCoordinator()
+        let first = submit(
+            coordinator, generation: generation,
+            timestamp: 0, candidates: [activeA])
+        let second = submit(
+            coordinator, generation: generation,
+            timestamp: 0.2, candidates: [activeA])
+        if case .candidateSeen(_, let lockFrames, _) = first {
+            require(lockFrames == 1, "BC-04 first A must start lock at one")
+        } else {
+            require(false, "BC-04 first A must enter candidate state")
+        }
+        if case .candidateLocked = second {
+            // Expected.
+        } else {
+            require(false, "BC-04 A,A must lock")
+        }
+    }
+    do {
+        let (coordinator, generation) = startCoordinator()
+        _ = submit(
+            coordinator, generation: generation,
+            timestamp: 0, candidates: [activeA])
+        let changed = submit(
+            coordinator, generation: generation,
+            timestamp: 0.2, candidates: [activeB])
+        if case .candidateSeen(let payload, let lockFrames, _) = changed {
+            require(
+                payload == activeB.payload && lockFrames == 1,
+                "BC-04 A,B must reset the lock to B/1")
+        } else {
+            require(false, "BC-04 A,B must stay candidate, not collect")
+        }
+    }
+    do {
+        let (coordinator, generation) = startCoordinator()
+        _ = submit(
+            coordinator, generation: generation,
+            timestamp: 0, candidates: [activeA])
+        let empty = submit(
+            coordinator, generation: generation,
+            timestamp: 0.2, candidates: [])
+        if case .keepAiming = empty {
+            // Expected: the empty frame contributes no lock/evidence count.
+        } else {
+            require(false, "BC-04 A,none must remain in bounded aiming behavior")
+        }
+        let nextA = submit(
+            coordinator, generation: generation,
+            timestamp: 0.4, candidates: [activeA])
+        if case .candidateSeen(let payload, let lockFrames, _) = nextA {
+            require(
+                payload == activeA.payload && lockFrames == 1,
+                "BC-04 A,none,A must restart candidate lock at A/1")
+        } else {
+            require(false, "BC-04 A,none,A must not lock across an empty frame")
+        }
+        let finalA = submit(
+            coordinator, generation: generation,
+            timestamp: 0.6, candidates: [activeA])
+        if case .candidateLocked = finalA {
+            // Expected.
+        } else {
+            require(false, "BC-04 A,none,A,A must lock on consecutive real frames")
+        }
+    }
+
+    // BC-05/06: the active burst accepts repeated payloads only from unique
+    // frame timestamps and unique durable observation ids. After commit, the
+    // same payload is suppressed for the short duplicate window.
+    do {
+        let (coordinator, generation) = startCoordinator()
+        _ = submit(
+            coordinator, generation: generation,
+            timestamp: 0, candidates: [activeA])
+        let locked = submit(
+            coordinator, generation: generation,
+            timestamp: 0.2, candidates: [activeA])
+        let captureID: UUID
+        if case .candidateLocked(let value, _) = locked {
+            captureID = value
+        } else {
+            require(false, "BC-05 second stable frame must start the burst")
+            return
+        }
+        let evidence1 = coordinator.finishEvidence(
+            generation: generation,
+            captureID: captureID,
+            frameTimestamp: 0.2,
+            observationID: "observation-1",
+            succeeded: true)
+        if case .continueCollecting(let accepted, _) = evidence1 {
+            require(accepted == 1, "BC-05 first unique frame must count once")
+        } else {
+            require(false, "BC-05 first evidence frame must continue")
+        }
+        let repeatedSameFrame = coordinator.finishEvidence(
+            generation: generation,
+            captureID: captureID,
+            frameTimestamp: 0.2,
+            observationID: "observation-2",
+            succeeded: true)
+        if case .ignored = repeatedSameFrame {
+            // Expected: no pending evidence exists for the same ARFrame.
+        } else {
+            require(false, "BC-05 the same ARFrame cannot count twice")
+        }
+
+        let collect2 = submit(
+            coordinator, generation: generation,
+            timestamp: 0.4, candidates: [activeA])
+        if case .collect(let value, _) = collect2 {
+            require(value == captureID, "BC-05 same-payload frame 2 stays in burst")
+        } else {
+            require(false, "BC-05 unique frame 2 must collect")
+        }
+        _ = coordinator.finishEvidence(
+            generation: generation,
+            captureID: captureID,
+            frameTimestamp: 0.4,
+            observationID: "observation-2",
+            succeeded: true)
+
+        let collect3 = submit(
+            coordinator, generation: generation,
+            timestamp: 0.6, candidates: [activeA])
+        if case .collect = collect3 {
+            // Expected.
+        } else {
+            require(false, "BC-05 unique frame 3 must collect")
+        }
+        let evidence3 = coordinator.finishEvidence(
+            generation: generation,
+            captureID: captureID,
+            frameTimestamp: 0.6,
+            observationID: "observation-3",
+            succeeded: true)
+        if case .resolve(let resolvedID, let observationIDs) = evidence3 {
+            require(
+                resolvedID == captureID
+                    && Set(observationIDs).count == 3
+                    && observationIDs.count == 3,
+                "BC-05 three unique frames and observation ids must resolve")
+        } else {
+            require(false, "BC-05 three unique evidence frames must succeed")
+        }
+        require(
+            coordinator.markConfirming(
+                generation: generation,
+                captureID: captureID),
+            "BC-06 resolved burst must enter confirmation")
+        guard let commitAuthority = coordinator.claimConfirmationCommit(
+                generation: generation,
+                captureID: captureID) else {
+            require(false, "SC commit must atomically claim its authority")
+            return
+        }
+        let cancellationAfterClaim = coordinator.cancel(
+            reason: "system_interruption_after_commit_claim")
+        require(
+            cancellationAfterClaim?.confirmationCommitInFlight == true
+                && coordinator.currentState() == .confirming(
+                    generation: generation,
+                    captureID: captureID)
+                && coordinator.isConfirmationCommitInFlight(commitAuthority),
+            "cancel after the linearization point must not stale the claimed write")
+        require(
+            coordinator.claimConfirmationCommit(
+                generation: generation,
+                captureID: captureID) == nil,
+            "a confirmation authority may be claimed exactly once")
+        require(
+            coordinator.finishConfirmation(
+                generation: generation,
+                payload: activeA.payload,
+                completedAt: 0.7,
+                committed: true),
+            "BC-06 committed confirmation must complete")
+        require(
+            !coordinator.finishConfirmation(
+                generation: generation,
+                payload: activeA.payload,
+                completedAt: 0.71,
+                committed: true),
+            "a claimed confirmation may finish exactly once")
+
+        let duplicateGeneration = coordinator.begin(now: 0.8)
+        require(
+            coordinator.markAiming(generation: duplicateGeneration),
+            "BC-06 duplicate scan must enter aiming")
+        coordinator.updateGeometry(captureGeometry)
+        let duplicate = submit(
+            coordinator,
+            generation: duplicateGeneration,
+            timestamp: 0.8,
+            candidates: [activeA])
+        if case .duplicateCompleted(let payload) = duplicate {
+            require(payload == activeA.payload, "BC-06 duplicate payload must be reported")
+        } else {
+            require(false, "BC-06 a just-committed payload must be suppressed")
+        }
+    }
+
+    // Confirmation linearization: when cancellation wins before the atomic
+    // claim, the generation becomes idle and no persistence authority can be
+    // obtained afterwards.
+    do {
+        let (coordinator, generation) = startCoordinator(now: 10)
+        _ = submit(
+            coordinator,
+            generation: generation,
+            timestamp: 10,
+            candidates: [activeA])
+        let locked = submit(
+            coordinator,
+            generation: generation,
+            timestamp: 10.2,
+            candidates: [activeA])
+        guard case .candidateLocked(let captureID, _) = locked else {
+            require(false, "pre-claim cancellation fixture must lock")
+            return
+        }
+        _ = coordinator.finishEvidence(
+            generation: generation,
+            captureID: captureID,
+            frameTimestamp: 10.2,
+            observationID: "cancel-before-1",
+            succeeded: true)
+        _ = submit(
+            coordinator,
+            generation: generation,
+            timestamp: 10.4,
+            candidates: [activeA])
+        _ = coordinator.finishEvidence(
+            generation: generation,
+            captureID: captureID,
+            frameTimestamp: 10.4,
+            observationID: "cancel-before-2",
+            succeeded: true)
+        _ = submit(
+            coordinator,
+            generation: generation,
+            timestamp: 10.6,
+            candidates: [activeA])
+        let resolved = coordinator.finishEvidence(
+            generation: generation,
+            captureID: captureID,
+            frameTimestamp: 10.6,
+            observationID: "cancel-before-3",
+            succeeded: true)
+        guard case .resolve = resolved else {
+            require(false, "pre-claim cancellation fixture must resolve")
+            return
+        }
+        require(
+            coordinator.markConfirming(
+                generation: generation,
+                captureID: captureID),
+            "pre-claim cancellation fixture must confirm")
+        let cancellation = coordinator.cancel(reason: "cancel_before_claim")
+        require(
+            cancellation?.confirmationCommitInFlight == false
+                && coordinator.currentState() == .idle,
+            "cancel before claim must invalidate the generation")
+        require(
+            coordinator.claimConfirmationCommit(
+                generation: generation,
+                captureID: captureID) == nil,
+            "cancel-before-claim must never produce persistence authority")
+    }
+
+    // Session admission linearization: finalization and confirmation
+    // reservation share one authority. A reservation that wins first drains
+    // before snapshot; finalization that wins first rejects the reservation.
+    do {
+        let gate = PriceTagSessionAdmissionGate()
+        let authority = PriceTagConfirmationCommitAuthority(
+            captureGeneration: UUID(),
+            captureID: UUID(),
+            priorMapGeneration: capturePriorMapAuthority.priorMapGeneration,
+            trackingSessionID: capturePriorMapAuthority.trackingSessionID,
+            priorMapID: capturePriorMapAuthority.priorMapID,
+            priorMapSHA256: capturePriorMapAuthority.priorMapSHA256,
+            floorID: capturePriorMapAuthority.floorID)
+        require(
+            gate.reserveConfirmation(authority) == .reserved,
+            "session confirmation reservation must succeed before finalization")
+        require(
+            gate.beginFinalization(),
+            "finalization admission must close after the reservation")
+        require(
+            gate.beginTransaction() == .finalizationInProgress,
+            "ordinary writes must be rejected after finalization admission")
+        require(
+            gate.beginTransaction(reservedConfirmation: authority) == nil,
+            "the exact pre-finalization reservation must remain admissible")
+        let drained = DispatchSemaphore(value: 0)
+        DispatchQueue.global(qos: .userInitiated).async {
+            gate.waitForFinalizationDrain()
+            drained.signal()
+        }
+        require(
+            drained.wait(timeout: .now() + 0.05) == .timedOut,
+            "finalization drain must wait for the reserved durable attempt")
+        gate.endTransaction(reservedConfirmation: authority)
+        require(
+            drained.wait(timeout: .now() + 1) == .success,
+            "finalization drain must finish after the reserved commit attempt")
+        gate.endFinalization()
+    }
+    do {
+        let gate = PriceTagSessionAdmissionGate()
+        let authority = PriceTagConfirmationCommitAuthority(
+            captureGeneration: UUID(),
+            captureID: UUID(),
+            priorMapGeneration: capturePriorMapAuthority.priorMapGeneration,
+            trackingSessionID: capturePriorMapAuthority.trackingSessionID,
+            priorMapID: capturePriorMapAuthority.priorMapID,
+            priorMapSHA256: capturePriorMapAuthority.priorMapSHA256,
+            floorID: capturePriorMapAuthority.floorID)
+        require(
+            gate.beginFinalization(),
+            "finalization-first fixture must close admission")
+        require(
+            gate.reserveConfirmation(authority)
+                == .rejected(.finalizationInProgress),
+            "finalization admission that wins first must reject confirmation")
+        gate.waitForFinalizationDrain()
+        gate.endFinalization()
+    }
+    do {
+        let gate = PriceTagSessionAdmissionGate()
+        let authority = PriceTagConfirmationCommitAuthority(
+            captureGeneration: UUID(),
+            captureID: UUID(),
+            priorMapGeneration: capturePriorMapAuthority.priorMapGeneration,
+            trackingSessionID: capturePriorMapAuthority.trackingSessionID,
+            priorMapID: capturePriorMapAuthority.priorMapID,
+            priorMapSHA256: capturePriorMapAuthority.priorMapSHA256,
+            floorID: capturePriorMapAuthority.floorID)
+        require(
+            gate.reserveConfirmation(authority) == .reserved,
+            "cancel-before-claim fixture must reserve")
+        gate.cancelConfirmationReservation(authority)
+        require(
+            gate.confirmationReservationCount == 0
+                && gate.beginFinalization(),
+            "a coordinator claim loss must release the session reservation")
+        gate.waitForFinalizationDrain()
+        gate.endFinalization()
+    }
+
+    // Session-level writer regression: the second localization transaction
+    // registers before finalization but waits behind the first writer. Both
+    // pre-admitted writes must finish successfully, and the drain must remain
+    // blocked until they do. This catches any inner isFinalizing re-check that
+    // would reject an already-admitted waiter after it acquires the writer lock.
+    do {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "marketscanner-session-admission-\(UUID().uuidString)",
+                isDirectory: true)
+        try? FileManager.default.createDirectory(
+            at: root,
+            withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let writer = BlockingFirstAppendSidecarWriter()
+        let session = SupermarketScanSession(
+            documentsDirectory: root,
+            sidecarWriter: writer)
+        do {
+            try session.startNewSessionIfNeeded()
+            _ = try session.currentSegmentDirectory()
+        }
+        catch {
+            require(false, "session admission fixture must create its segment")
+        }
+        session.configureScan(PriorMapScanConfiguration(
+            formatVersion: 1,
+            workflowMode: .priorMapLocalized,
+            packageDirectory: root,
+            priorMapId: "map-a",
+            priorMapSha256: String(repeating: "a", count: 64),
+            floorId: "1",
+            storeID: "store-a",
+            initialMapPose: PriorMapPose2D(xM: 0, yM: 0, yawRad: 0)))
+        func update(_ timestamp: TimeInterval) -> PriorMapLocalizationUpdate {
+            let pose = PriorMapPose2D(xM: timestamp, yM: 0, yawRad: 0)
+            return PriorMapLocalizationUpdate(
+                format: "MarketScannerLocalizationTrace",
+                version: 1,
+                timestamp: timestamp,
+                trackingState: "normal",
+                localizationState: "tracking",
+                confidence: 0.9,
+                rawPose: pose,
+                estimatedPose: pose,
+                roadCandidates: [],
+                structureSource: "host_test",
+                structurePointCount: 10,
+                structureCoverageAngleRad: 1,
+                matchCandidates: [],
+                matchUniqueness: 1,
+                matchResidualCost: 0,
+                matcherElapsedMs: 1,
+                constraintAccepted: false,
+                constraintReason: "host_test")
+        }
+        let resultLock = NSLock()
+        var firstResult: LocalizationWriteResult?
+        var secondResult: LocalizationWriteResult?
+        let firstFinished = DispatchSemaphore(value: 0)
+        let secondFinished = DispatchSemaphore(value: 0)
+        DispatchQueue.global(qos: .userInitiated).async {
+            let result = session.appendLocalizationTrace(
+                update(1),
+                expectedTrackingSessionId: session.trackingSessionId,
+                nodeTimebaseOffsetSeconds: 0)
+            resultLock.lock()
+            firstResult = result
+            resultLock.unlock()
+            firstFinished.signal()
+        }
+        require(
+            writer.firstAppendEntered.wait(timeout: .now() + 1) == .success,
+            "first localization writer must reach the injected block")
+        DispatchQueue.global(qos: .userInitiated).async {
+            let result = session.appendLocalizationTrace(
+                update(2),
+                expectedTrackingSessionId: session.trackingSessionId,
+                nodeTimebaseOffsetSeconds: 0)
+            resultLock.lock()
+            secondResult = result
+            resultLock.unlock()
+            secondFinished.signal()
+        }
+        let admissionDeadline = Date().addingTimeInterval(1)
+        while session.activeLocalizationTransactionCount < 2,
+              Date() < admissionDeadline {
+            usleep(1_000)
+        }
+        require(
+            session.activeLocalizationTransactionCount == 2,
+            "second localization transaction must register before finalization")
+        require(
+            session.beginFinalization(),
+            "session finalization must close after both writers are admitted")
+        let drained = DispatchSemaphore(value: 0)
+        DispatchQueue.global(qos: .userInitiated).async {
+            session.waitForFinalizationTransactionDrain()
+            drained.signal()
+        }
+        require(
+            drained.wait(timeout: .now() + 0.05) == .timedOut,
+            "session drain must wait for both admitted localization writers")
+        writer.releaseFirstAppend.signal()
+        require(
+            firstFinished.wait(timeout: .now() + 1) == .success
+                && secondFinished.wait(timeout: .now() + 1) == .success
+                && drained.wait(timeout: .now() + 1) == .success,
+            "both admitted writers and the session drain must complete")
+        resultLock.lock()
+        let bothSucceeded = firstResult?.succeeded == true
+            && secondResult?.succeeded == true
+        resultLock.unlock()
+        require(
+            bothSucceeded,
+            "pre-finalization admitted localization writers must both persist")
+        session.endFinalization()
+    }
+
+    // Ordinary frame-driven Recovery persistence must not inherit terminal
+    // finalization authority. Only the explicit terminal coordinator may pass
+    // allowDuringFinalization=true to the durable writer.
+    do {
+        func recoveryFixture() -> (
+            P7R6FakeRecoverySource,
+            PriorMapRecoveryCompletion
+        ) {
+            let controller = PriorMapRecoveryController()
+            _ = controller.request(
+                reason: "esl_finalization_admission", now: 1)
+            guard let completion = controller.finish(.converged, now: 2) else {
+                fatalError("Recovery fixture must complete")
+            }
+            let source = P7R6FakeRecoverySource()
+            source.pending = [completion]
+            return (source, completion)
+        }
+
+        let ordinaryFixture = recoveryFixture()
+        let ordinaryWriter = P7R6FakeRecoveryWriter()
+        let ordinaryCoordinator = RecoveryLifecyclePersistenceCoordinator(
+            source: ordinaryFixture.0,
+            writer: ordinaryWriter,
+            trackingSessionId: "session-a",
+            priorMapId: "map-a",
+            priorMapSha256: String(repeating: "a", count: 64),
+            floorId: "1",
+            persistedEvidenceSnapshot: { Data() })
+        require(
+            ordinaryCoordinator.persistTerminalEvidence(
+                cancellationReason: nil, now: 3).allPersisted
+                && ordinaryWriter.allowDuringFinalizationValues == [false],
+            "frame-driven Recovery persistence must use ordinary admission")
+
+        let terminalFixture = recoveryFixture()
+        let terminalWriter = P7R6FakeRecoveryWriter()
+        let terminalCoordinator = RecoveryLifecyclePersistenceCoordinator(
+            source: terminalFixture.0,
+            writer: terminalWriter,
+            trackingSessionId: "session-a",
+            priorMapId: "map-a",
+            priorMapSha256: String(repeating: "a", count: 64),
+            floorId: "1",
+            allowDuringFinalization: true,
+            persistedEvidenceSnapshot: { Data() })
+        require(
+            terminalCoordinator.persistTerminalEvidence(
+                cancellationReason: nil, now: 3).allPersisted
+                && terminalWriter.allowDuringFinalizationValues == [true],
+            "only terminal Recovery persistence may bypass closed admission")
+    }
+
+    // A delayed ESL audit must never create a successor session after the
+    // original session has been detached. The active-only API binds the exact
+    // tracking identity and fails closed without calling currentSegmentDirectory.
+    do {
+        let auditRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "marketscanner-esl-audit-\(UUID().uuidString)",
+                isDirectory: true)
+        try? FileManager.default.createDirectory(
+            at: auditRoot,
+            withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: auditRoot) }
+        let session = SupermarketScanSession(
+            documentsDirectory: auditRoot,
+            sidecarWriter: InjectedSidecarWriter())
+        require(
+            !session.appendScanEventIfSessionActive(
+                expectedTrackingSessionId: "missing",
+                event: "price_tag_capture_cancelled",
+                message: "late audit"),
+            "active-only audit must reject when no scan exists")
+        require(
+            (try? FileManager.default.contentsOfDirectory(atPath: auditRoot.path))?
+                .isEmpty == true,
+            "rejected audit must not create an empty session directory")
+        do {
+            try session.startNewSessionIfNeeded()
+            _ = try session.currentSegmentDirectory()
+        }
+        catch {
+            require(false, "active-only audit fixture must create one session")
+        }
+        let completedTrackingSessionID = session.trackingSessionId
+        let sessionNamesBeforeDetach =
+            (try? FileManager.default.contentsOfDirectory(atPath: auditRoot.path))
+                ?? []
+        require(
+            session.beginFinalization(),
+            "active-only audit fixture must close ordinary admission")
+        require(
+            !session.appendScanEventIfSessionActive(
+                expectedTrackingSessionId: completedTrackingSessionID,
+                event: "price_tag_capture_cancelled",
+                message: "ordinary late audit"),
+            "ordinary audit must not bypass finalization admission")
+        require(
+            session.appendScanEventIfSessionActive(
+                expectedTrackingSessionId: completedTrackingSessionID,
+                allowDuringFinalization: true,
+                event: "price_tag_capture_cancelled",
+                message: "finalization-owned audit"),
+            "explicit scan-stop audit must remain writable during finalization")
+        session.endFinalization()
+        session.completeCurrentSession()
+        require(
+            !session.appendScanEventIfSessionActive(
+                expectedTrackingSessionId: completedTrackingSessionID,
+                event: "price_tag_capture_cancelled",
+                message: "late audit after detach"),
+            "late audit must reject after the exact session is detached")
+        require(
+            ((try? FileManager.default.contentsOfDirectory(
+                atPath: auditRoot.path)) ?? []) == sessionNamesBeforeDetach,
+            "late audit must not create a successor session")
+    }
+
+    // BC-05 deadline fallback: three durable independent frames satisfy the
+    // minimum even when the barcode leaves the ROI before a fourth target
+    // frame. The maximum window must resolve, not discard valid evidence.
+    do {
+        let minimumPolicy = PriceTagCapturePolicy(
+            minimumCandidateLockFrames: 2,
+            minimumEvidenceFrames: 3,
+            targetEvidenceFrames: 4,
+            minimumCaptureDuration: 0.30,
+            maximumCaptureDuration: 2.0,
+            visionRateHz: 8,
+            previewRateHz: 24,
+            minimumROIIntersectionRatio: 0.8,
+            minimumCandidateNormalizedArea: 0.002,
+            ambiguityScoreDelta: 0.08,
+            completedDuplicateSuppressionSeconds: 2.0)
+        let coordinator = PriceTagCaptureCoordinator(policy: minimumPolicy)
+        let generation = coordinator.begin(now: 0)
+        require(
+            coordinator.markAiming(generation: generation),
+            "BC-05 minimum fallback must enter aiming")
+        coordinator.updateGeometry(captureGeometry)
+        _ = submit(
+            coordinator, generation: generation,
+            timestamp: 0, candidates: [activeA])
+        let locked = submit(
+            coordinator, generation: generation,
+            timestamp: 0.2, candidates: [activeA])
+        guard case .candidateLocked(let captureID, _) = locked else {
+            require(false, "BC-05 minimum fallback must lock")
+            return
+        }
+        _ = coordinator.finishEvidence(
+            generation: generation,
+            captureID: captureID,
+            frameTimestamp: 0.2,
+            observationID: "minimum-observation-1",
+            succeeded: true)
+        for (timestamp, observationID) in [
+            (0.4, "minimum-observation-2"),
+            (0.6, "minimum-observation-3"),
+        ] {
+            let action = submit(
+                coordinator,
+                generation: generation,
+                timestamp: timestamp,
+                candidates: [activeA])
+            if case .collect = action {
+                _ = coordinator.finishEvidence(
+                    generation: generation,
+                    captureID: captureID,
+                    frameTimestamp: timestamp,
+                    observationID: observationID,
+                    succeeded: true)
+            } else {
+                require(false, "BC-05 minimum fallback frame must collect")
+            }
+        }
+        let deadline = submit(
+            coordinator,
+            generation: generation,
+            timestamp: 2.3,
+            candidates: [])
+        if case .resolve(let resolvedID, let observationIDs) = deadline {
+            require(
+                resolvedID == captureID && observationIDs.count == 3,
+                "BC-05 three-frame deadline fallback must preserve evidence")
+        } else {
+            require(
+                false,
+                "BC-05 three-frame deadline fallback must resolve, not time out")
+        }
+    }
+
+    // BC-07: a callback that returns after cancellation is generation-stale
+    // and cannot mutate state or progress toward confirmation.
+    do {
+        let (coordinator, generation) = startCoordinator()
+        require(
+            coordinator.requestVisionSubmission(frameTimestamp: 1) != nil,
+            "BC-07 Vision request must be in-flight before cancellation")
+        let cancellation = coordinator.cancel(reason: "price_tag_capture_cancelled")
+        require(
+            cancellation?.generation == generation
+                && coordinator.currentState() == .idle,
+            "BC-07 cancellation must invalidate the active generation")
+        let late = coordinator.finishVision(
+            generation: generation,
+            frameTimestamp: 1,
+            candidates: [activeA],
+            regionOfInterest: captureROI)
+        if case .ignored = late {
+            // Expected.
+        } else {
+            require(false, "BC-07 a late Vision callback must be ignored")
+        }
+    }
+
+    // BC-08: beginning a new generation invalidates the old in-flight
+    // callback while allowing the new capture to proceed normally.
+    do {
+        let (coordinator, oldGeneration) = startCoordinator(now: 2)
+        require(
+            coordinator.requestVisionSubmission(frameTimestamp: 2) != nil,
+            "BC-08 old generation must have an in-flight callback")
+        let newGeneration = coordinator.begin(now: 2.01)
+        require(
+            newGeneration != oldGeneration
+                && coordinator.markAiming(generation: newGeneration),
+            "BC-08 begin must issue and activate a new generation")
+        coordinator.updateGeometry(captureGeometry)
+        let stale = coordinator.finishVision(
+            generation: oldGeneration,
+            frameTimestamp: 2,
+            candidates: [activeA],
+            regionOfInterest: captureROI)
+        if case .ignored = stale {
+            // Expected.
+        } else {
+            require(false, "BC-08 an old callback cannot pollute a new scan")
+        }
+        let fresh = submit(
+            coordinator,
+            generation: newGeneration,
+            timestamp: 2.01,
+            candidates: [activeA])
+        if case .candidateSeen = fresh {
+            // Expected.
+        } else {
+            require(false, "BC-08 the new generation must accept fresh evidence")
+        }
+    }
+
+    func shelfCandidate(
+        segmentID: String,
+        side: String,
+        confidence: Double = 0.9
+    ) -> PriceTagShelfCandidate {
+        let origin = segmentID == "shelf-A" ? 0.0 : 3.0
+        return PriceTagShelfCandidate(
+            shelfSegmentId: segmentID,
+            shelfCode: segmentID == "shelf-A" ? "A-01" : "B-01",
+            rowFlag: "R1",
+            crossCode: "C1",
+            side: side,
+            distanceFromStartCm: segmentID == "shelf-A" ? 120 : 80,
+            distanceToShelfM: 0.1,
+            associationConfidence: confidence,
+            occluded: false,
+            blockedByOtherStructure: false,
+            snappedPosition: PriorMapTagPoint3D(
+                xM: origin + 1, yM: 0, heightM: 1.2),
+            outline: [
+                PriceTagShelfPreviewPoint(xM: origin, yM: 0),
+                PriceTagShelfPreviewPoint(xM: origin + 2, yM: 0),
+                PriceTagShelfPreviewPoint(xM: origin + 2, yM: 1),
+                PriceTagShelfPreviewPoint(xM: origin, yM: 1),
+            ])
+    }
+    let shelfA = shelfCandidate(segmentID: "shelf-A", side: "L")
+    let shelfB = shelfCandidate(segmentID: "shelf-B", side: "R")
+    func localizedTag(
+        observationID: String,
+        segmentID: String,
+        side: String,
+        version: Int = 2,
+        includeV2: Bool = true,
+        needsReview: Bool = false
+    ) -> LocalizedPriceTag {
+        let isA = segmentID == "shelf-A"
+        return LocalizedPriceTag(
+            format: "MarketScannerLocalizedPriceTag",
+            version: version,
+            tagId: "tag-\(observationID)",
+            observationId: observationID,
+            payload: "ACTIVE-A",
+            symbology: "EAN13",
+            floorId: "F1",
+            timestamp: 100,
+            trackingSessionId: "SESSION-ESL",
+            priorMapId: "MAP-ESL",
+            priorMapSha256: String(repeating: "a", count: 64),
+            shelfSegmentId: segmentID,
+            shelfCode: isA ? "A-01" : "B-01",
+            rowFlag: "R1",
+            crossCode: "C1",
+            shelfSide: side,
+            distanceFromShelfStartCm: isA ? 120 : 80,
+            heightCm: 120,
+            rawMapPosition: PriorMapTagPoint3D(xM: 1, yM: 0.1, heightM: 1.2),
+            snappedMapPosition: PriorMapTagPoint3D(xM: 1, yM: 0, heightM: 1.2),
+            localizationConfidence: 0.92,
+            measurementConfidence: 0.90,
+            associationConfidence: 0.88,
+            measurementMethod: "scene_depth",
+            needsReview: needsReview,
+            userConfirmed: false,
+            algorithmShelfSegmentId: includeV2 ? segmentID : nil,
+            algorithmShelfCode: includeV2 ? (isA ? "A-01" : "B-01") : nil,
+            algorithmSide: includeV2 ? side : nil,
+            algorithmDistanceFromShelfStartCm: includeV2 ? (isA ? 120 : 80) : nil,
+            algorithmAssociationConfidence: includeV2 ? 0.88 : nil,
+            confirmationStatus: includeV2 ? "ALGORITHM_ONLY" : nil)
+    }
+    func association(
+        observationID: String,
+        segmentID: String,
+        side: String,
+        algorithmCandidateReliable: Bool = true,
+        needsReview: Bool = false
+    ) -> PriceTagShelfAssociationResult {
+        return PriceTagShelfAssociationResult(
+            tag: localizedTag(
+                observationID: observationID,
+                segmentID: segmentID,
+                side: side,
+                needsReview: needsReview),
+            candidates: [shelfA, shelfB],
+            algorithmCandidateReliable: algorithmCandidateReliable)
+    }
+
+    // Multi-frame shelf resolution must use a stable modal group and retain
+    // fail-closed reliability when frames disagree or ids are duplicated.
+    let modalFrames = [
+        association(observationID: "frame-1", segmentID: "shelf-A", side: "L"),
+        association(observationID: "frame-2", segmentID: "shelf-A", side: "L"),
+        association(observationID: "frame-3", segmentID: "shelf-A", side: "L"),
+        association(observationID: "frame-4", segmentID: "shelf-B", side: "R"),
+    ]
+    guard let modalResolution = PriceTagCaptureResolver.resolve(
+            modalFrames, minimumEvidenceFrames: 3) else {
+        require(false, "resolver must accept a three-frame stable shelf mode")
+        return
+    }
+    require(
+        modalResolution.algorithmCandidateReliable
+            && modalResolution.tag.algorithmShelfSegmentId == "shelf-A",
+        "resolver must select the stable modal shelf group")
+    let splitFrames = [
+        association(observationID: "split-1", segmentID: "shelf-A", side: "L"),
+        association(observationID: "split-2", segmentID: "shelf-A", side: "L"),
+        association(observationID: "split-3", segmentID: "shelf-B", side: "R"),
+        association(observationID: "split-4", segmentID: "shelf-B", side: "R"),
+    ]
+    require(
+        PriceTagCaptureResolver.resolve(
+            splitFrames, minimumEvidenceFrames: 3)?.algorithmCandidateReliable == false,
+        "shelf disagreement must remain fail-closed")
+    let mixedReliabilityFrames = [
+        association(
+            observationID: "weak-1",
+            segmentID: "shelf-A",
+            side: "L",
+            algorithmCandidateReliable: false,
+            needsReview: true),
+        association(
+            observationID: "weak-2",
+            segmentID: "shelf-A",
+            side: "L",
+            algorithmCandidateReliable: false,
+            needsReview: true),
+        association(
+            observationID: "strong-1",
+            segmentID: "shelf-A",
+            side: "L",
+            algorithmCandidateReliable: true,
+            needsReview: false),
+    ]
+    require(
+        PriceTagCaptureResolver.resolve(
+            mixedReliabilityFrames,
+            minimumEvidenceFrames: 3)?.algorithmCandidateReliable == false,
+        "two weak frames plus one strong frame on the same shelf/side "
+            + "must not become reliably confirmable")
+    let duplicateObservationFrames = [
+        association(observationID: "duplicate", segmentID: "shelf-A", side: "L"),
+        association(observationID: "duplicate", segmentID: "shelf-A", side: "L"),
+        association(observationID: "unique", segmentID: "shelf-A", side: "L"),
+    ]
+    require(
+        PriceTagCaptureResolver.resolve(
+            duplicateObservationFrames, minimumEvidenceFrames: 3) == nil,
+        "resolver must reject repeated observation ids as non-independent frames")
+
+    // SC-01..05 plus v1/v2 compatibility: confirmation is explicit, bounded
+    // to selectable candidates, and never overwrites algorithm evidence.
+    let captureID = UUID()
+    let boundTag = modalResolution.tag.bindingCapture(
+        captureID: captureID,
+        observationIDs: ["frame-1", "frame-2", "frame-3"])
+    guard let confirmed = boundTag.applyingConfirmation(
+            decision: .confirmedAlgorithmCandidate,
+            candidates: [shelfA, shelfB],
+            confirmedAtUTC: 1_700_000_000,
+            confirmedAtMonotonic: 10) else {
+        require(false, "SC-01 a reliable algorithm candidate must be confirmable")
+        return
+    }
+    require(
+        confirmed.confirmationStatus == "USER_CONFIRMED"
+            && confirmed.userConfirmedShelfSegmentId == "shelf-A"
+            && confirmed.algorithmShelfSegmentId == "shelf-A"
+            && confirmed.userConfirmed,
+        "SC-01 correct/save must persist explicit user confirmation")
+    func priorMapConfiguration(
+        mapID: String = "MAP-ESL",
+        sha256: String = String(repeating: "a", count: 64),
+        floorID: String = "F1"
+    ) -> PriorMapScanConfiguration {
+        return PriorMapScanConfiguration(
+            formatVersion: 1,
+            workflowMode: .priorMapLocalized,
+            packageDirectory: URL(fileURLWithPath: "/private/tmp/esl-map"),
+            priorMapId: mapID,
+            priorMapSha256: sha256,
+            floorId: floorID,
+            storeID: "STORE-ESL",
+            initialMapPose: PriorMapPose2D(xM: 0, yM: 0, yawRad: 0))
+    }
+    let validCommitAuthority = PriceTagConfirmationCommitAuthority(
+        captureGeneration: UUID(),
+        captureID: captureID,
+        priorMapGeneration: capturePriorMapAuthority.priorMapGeneration,
+        trackingSessionID: "SESSION-ESL",
+        priorMapID: "MAP-ESL",
+        priorMapSHA256: String(repeating: "a", count: 64),
+        floorID: "F1")
+    require(
+        PriceTagConfirmationIdentityValidator.matches(
+            tag: confirmed,
+            authority: validCommitAuthority,
+            configuration: priorMapConfiguration(),
+            trackingSessionID: "SESSION-ESL"),
+        "confirmation persistence must accept the exact scan identity")
+    require(
+        !PriceTagConfirmationIdentityValidator.matches(
+            tag: confirmed,
+            authority: validCommitAuthority,
+            configuration: priorMapConfiguration(mapID: "MAP-OTHER"),
+            trackingSessionID: "SESSION-ESL"),
+        "confirmation persistence must reject a different prior-map id")
+    require(
+        !PriceTagConfirmationIdentityValidator.matches(
+            tag: confirmed,
+            authority: validCommitAuthority,
+            configuration: priorMapConfiguration(
+                sha256: String(repeating: "b", count: 64)),
+            trackingSessionID: "SESSION-ESL"),
+        "confirmation persistence must reject a different prior-map SHA")
+    require(
+        !PriceTagConfirmationIdentityValidator.matches(
+            tag: confirmed,
+            authority: validCommitAuthority,
+            configuration: priorMapConfiguration(floorID: "F2"),
+            trackingSessionID: "SESSION-ESL"),
+        "confirmation persistence must reject a different floor")
+    require(
+        !PriceTagConfirmationIdentityValidator.matches(
+            tag: confirmed,
+            authority: validCommitAuthority,
+            configuration: priorMapConfiguration(),
+            trackingSessionID: "SESSION-OTHER"),
+        "confirmation persistence must reject a different tracking session")
+    require(
+        !PriceTagConfirmationIdentityValidator.matches(
+            tag: confirmed,
+            authority: validCommitAuthority,
+            configuration: .freeMapping,
+            trackingSessionID: "SESSION-ESL"),
+        "confirmation persistence must reject the free-mapping workflow")
+    let wrongCaptureAuthority = PriceTagConfirmationCommitAuthority(
+        captureGeneration: validCommitAuthority.captureGeneration,
+        captureID: UUID(),
+        priorMapGeneration: validCommitAuthority.priorMapGeneration,
+        trackingSessionID: validCommitAuthority.trackingSessionID,
+        priorMapID: validCommitAuthority.priorMapID,
+        priorMapSHA256: validCommitAuthority.priorMapSHA256,
+        floorID: validCommitAuthority.floorID)
+    require(
+        !PriceTagConfirmationIdentityValidator.matches(
+            tag: confirmed,
+            authority: wrongCaptureAuthority,
+            configuration: priorMapConfiguration(),
+            trackingSessionID: "SESSION-ESL"),
+        "confirmation persistence must reject a different burst identity")
+    guard let overridden = boundTag.applyingConfirmation(
+            decision: .selectedAlternative(segmentID: "shelf-B", side: "R"),
+            candidates: [shelfA, shelfB],
+            confirmedAtUTC: 1_700_000_001,
+            confirmedAtMonotonic: 11) else {
+        require(false, "SC-02 a bounded selectable alternative must be overridable")
+        return
+    }
+    require(
+        overridden.confirmationStatus == "USER_OVERRIDDEN"
+            && overridden.algorithmShelfSegmentId == "shelf-A"
+            && overridden.shelfSegmentId == "shelf-A"
+            && overridden.userConfirmedShelfSegmentId == "shelf-B"
+            && overridden.confirmationSource == "on_device_operator",
+        "SC-02 override must preserve algorithm evidence and audit the user choice")
+    let shelfAOtherSide = shelfCandidate(segmentID: "shelf-A", side: "R")
+    guard let sameSegmentOtherSide = boundTag.applyingConfirmation(
+            decision: .selectedAlternative(segmentID: "shelf-A", side: "R"),
+            candidates: [shelfA, shelfAOtherSide],
+            confirmedAtUTC: 1_700_000_002,
+            confirmedAtMonotonic: 12) else {
+        require(false, "SC-02 a bounded same-segment opposite side must be selectable")
+        return
+    }
+    require(
+        sameSegmentOtherSide.confirmationStatus == "USER_OVERRIDDEN"
+            && sameSegmentOtherSide.userConfirmedShelfSegmentId == "shelf-A"
+            && sameSegmentOtherSide.userConfirmedSide == "R"
+            && sameSegmentOtherSide.algorithmSide == "L",
+        "SC-02 override identity must include segment id and side")
+    require(
+        boundTag.applyingConfirmation(
+            decision: .rescan,
+            candidates: [shelfA, shelfB],
+            confirmedAtUTC: 1,
+            confirmedAtMonotonic: 1) == nil,
+        "SC-03 rescan must not create a finalized tag")
+    require(
+        boundTag.applyingConfirmation(
+            decision: .observationOnly,
+            candidates: [shelfA, shelfB],
+            confirmedAtUTC: 1,
+            confirmedAtMonotonic: 1) == nil,
+        "SC-03 observation-only must not create a finalized tag")
+    require(
+        boundTag.applyingConfirmation(
+            decision: .confirmedAlgorithmCandidate,
+            candidates: [],
+            confirmedAtUTC: 1,
+            confirmedAtMonotonic: 1) == nil,
+        "SC-04 no candidate must fail closed")
+    let weakShelfA = shelfCandidate(
+        segmentID: "shelf-A", side: "L", confidence: 0.4)
+    require(
+        boundTag.applyingConfirmation(
+            decision: .confirmedAlgorithmCandidate,
+            candidates: [weakShelfA],
+            confirmedAtUTC: 1,
+            confirmedAtMonotonic: 1) == nil,
+        "SC-05 a non-selectable weak candidate must fail closed")
+
+    do {
+        let legacy = localizedTag(
+            observationID: "legacy-v1",
+            segmentID: "shelf-A",
+            side: "L",
+            version: 1,
+            includeV2: false)
+        let legacyData = try JSONEncoder().encode(legacy)
+        let legacyObject = try JSONSerialization.jsonObject(
+            with: legacyData) as? [String: Any]
+        require(
+            legacyObject?["capture_id"] == nil
+                && legacyObject?["algorithm_shelf_segment_id"] == nil,
+            "v1 encoder fixture must omit additive v2 fields")
+        let decodedLegacy = try JSONDecoder().decode(
+            LocalizedPriceTag.self, from: legacyData)
+        require(
+            decodedLegacy.version == 1
+                && decodedLegacy.captureId == nil
+                && decodedLegacy.confirmationStatus == nil,
+            "legacy v1 LocalizedPriceTag must remain decodable")
+
+        let v2Data = try JSONEncoder().encode(overridden)
+        let decodedV2 = try JSONDecoder().decode(
+            LocalizedPriceTag.self, from: v2Data)
+        require(
+            decodedV2 == overridden
+                && decodedV2.frameObservationIds == ["frame-1", "frame-2", "frame-3"],
+            "v2 capture/confirmation audit must round-trip without losing evidence")
+    } catch {
+        require(false, "LocalizedPriceTag v1/v2 Codable compatibility failed: \(error)")
+    }
+
+    print("ESL barcode capture focused tests passed")
+}
+
+if CommandLine.arguments.count == 2,
+   CommandLine.arguments[1] == "--esl-finalization-focused" {
+    runESLFinalizationBindingFocusedTests()
+    exit(0)
+}
+if CommandLine.arguments.count == 2,
+   CommandLine.arguments[1] == "--esl-capture-focused" {
+    runESLBarcodeCaptureFocusedTests()
+    exit(0)
+}
+if CommandLine.arguments.count <= 1 {
+    runESLBarcodeCaptureFocusedTests()
 }
 
 func permissions(_ url: URL) throws -> Int {
@@ -3153,14 +4750,17 @@ final class P7R6FakeRecoverySource: RecoveryCompletionDraining {
 final class P7R6FakeRecoveryWriter: RecoveryLifecycleWriting {
     var appendedEpisodeIds: [Int] = []
     var failingEpisodeIds: Set<Int> = []
+    var allowDuringFinalizationValues: [Bool] = []
 
     func appendRecoveryLifecycleEvent(
         _ completion: PriorMapRecoveryCompletion,
-        expectedTrackingSessionId: String
+        expectedTrackingSessionId: String,
+        allowDuringFinalization: Bool = false
     ) -> Bool {
         guard !failingEpisodeIds.contains(completion.episode.id) else {
             return false
         }
+        allowDuringFinalizationValues.append(allowDuringFinalization)
         appendedEpisodeIds.append(completion.episode.id)
         return true
     }
@@ -3407,7 +5007,10 @@ func p7r6BundleExpectation(
     recoveryCount: Int,
     lastEpisodeId: Int? = nil,
     lastFinishedAtUptime: TimeInterval? = nil,
-    localizedPriceTagCount: Int = 0
+    localizedPriceTagCount: Int = 0,
+    tagBurstCount: Int = 0,
+    tagBurstLastID: String? = nil,
+    tagBurstComplete: Bool = true
 ) -> LocalizationEvidenceBundleExpectation {
     return LocalizationEvidenceBundleExpectation(
         trackingSessionId: "session-a",
@@ -3421,7 +5024,408 @@ func p7r6BundleExpectation(
         localizedPriceTagCount: localizedPriceTagCount,
         recoveryEventCount: recoveryCount,
         lastRecoveryEpisodeId: lastEpisodeId,
-        lastRecoveryFinishedAtUptime: lastFinishedAtUptime)
+        lastRecoveryFinishedAtUptime: lastFinishedAtUptime,
+        tagBurstCount: tagBurstCount,
+        tagBurstLastID: tagBurstLastID,
+        tagBurstComplete: tagBurstComplete)
+}
+
+func p7r6JSONLine(_ object: [String: Any]) throws -> Data {
+    var data = try JSONSerialization.data(
+        withJSONObject: object,
+        options: [.sortedKeys])
+    data.append(0x0A)
+    return data
+}
+
+func p7r6WriteTagBurstBindingFixture(
+    in directory: URL,
+    observationFrameID: String = "frame-1",
+    includeUnlistedBoundObservation: Bool = false
+) throws {
+    let observation: [String: Any] = [
+        "format": "MarketScannerPriceTagObservation",
+        "version": 1,
+        "observation_id": "obs-1",
+        "timestamp": 100.0,
+        "payload": "6901234567890",
+        "symbology": "EAN13",
+        "frame_timestamp": 100.0,
+        "node_timebase_frame_timestamp": 100.0,
+        "node_timebase_offset_seconds": 0.0,
+        "raw_map_position": ["x_m": 1.0, "y_m": 2.0],
+        "tracking_session_id": "session-a",
+        "prior_map_id": "map-a",
+        "prior_map_sha256": p7r6aIdentitySha(),
+        "floor_id": "1",
+        "burst_id": "burst-1",
+        "frame_id": observationFrameID,
+    ]
+    let frame: [String: Any] = [
+        "frame_id": "frame-1",
+        "observation_id": "obs-1",
+        "bound_node_id": 1,
+        "frame_timestamp": 100.0,
+        "node_timestamp": 100.0,
+        "depth": 0.9,
+        "view": "front",
+        "tracking": "stable",
+        "confidence": 0.9,
+    ]
+    let burst: [String: Any] = [
+        "format": "MarketScannerPriceTagBurst",
+        "version": 2,
+        "burst_id": "burst-1",
+        "sequence": 1,
+        "barcode": "6901234567890",
+        "symbology": "EAN13",
+        "tracking_session_id": "session-a",
+        "prior_map_id": "map-a",
+        "prior_map_sha256": p7r6aIdentitySha(),
+        "floor_id": "1",
+        "frame_count": 1,
+        "first_frame_timestamp": 100.0,
+        "last_frame_timestamp": 100.0,
+        "bound_node_id_min": 1,
+        "bound_node_id_max": 1,
+        "depth_quality": 0.9,
+        "view_angle": "front",
+        "tracking_quality": "stable",
+        "localization_confidence_mean": 0.9,
+        "complete": true,
+        "frames": [frame],
+    ]
+    var observationData = try p7r6JSONLine(observation)
+    if includeUnlistedBoundObservation {
+        var extraObservation = observation
+        extraObservation["observation_id"] = "obs-extra"
+        extraObservation["timestamp"] = 101.0
+        extraObservation["frame_timestamp"] = 101.0
+        extraObservation["node_timebase_frame_timestamp"] = 101.0
+        extraObservation["frame_id"] = "frame-extra"
+        observationData.append(try p7r6JSONLine(extraObservation))
+    }
+    try observationData.write(
+        to: directory.appendingPathComponent("tag_observations.jsonl"))
+    try p7r6JSONLine(burst).write(
+        to: directory.appendingPathComponent("tag_observation_bursts.jsonl"))
+}
+
+func p7r6WriteBurstSequenceFixture(
+    in directory: URL,
+    sequences: [Int]
+) throws -> String? {
+    var observations = Data()
+    var bursts = Data()
+    for (index, sequence) in sequences.enumerated() {
+        let suffix = index + 1
+        let burstID = "sequence-burst-\(suffix)"
+        let observationID = "sequence-observation-\(suffix)"
+        let frameID = "sequence-frame-\(suffix)"
+        let timestamp = 100.0 + Double(index)
+        observations.append(try p7r6JSONLine([
+            "format": "MarketScannerPriceTagObservation",
+            "version": 1,
+            "observation_id": observationID,
+            "timestamp": timestamp,
+            "payload": "PAYLOAD-\(suffix)",
+            "symbology": "EAN13",
+            "frame_timestamp": timestamp,
+            "node_timebase_frame_timestamp": timestamp,
+            "node_timebase_offset_seconds": 0.0,
+            "raw_map_position": ["x_m": 1.0, "y_m": 2.0],
+            "tracking_session_id": "session-a",
+            "prior_map_id": "map-a",
+            "prior_map_sha256": p7r6aIdentitySha(),
+            "floor_id": "1",
+            "burst_id": burstID,
+            "frame_id": frameID,
+        ]))
+        bursts.append(try p7r6JSONLine([
+            "format": "MarketScannerPriceTagBurst",
+            "version": 2,
+            "burst_id": burstID,
+            "sequence": sequence,
+            "barcode": "PAYLOAD-\(suffix)",
+            "symbology": "EAN13",
+            "tracking_session_id": "session-a",
+            "prior_map_id": "map-a",
+            "prior_map_sha256": p7r6aIdentitySha(),
+            "floor_id": "1",
+            "frame_count": 1,
+            "first_frame_timestamp": timestamp,
+            "last_frame_timestamp": timestamp,
+            "bound_node_id_min": suffix,
+            "bound_node_id_max": suffix,
+            "depth_quality": 0.9,
+            "view_angle": "front",
+            "tracking_quality": "stable",
+            "localization_confidence_mean": 0.9,
+            "complete": true,
+            "frames": [[
+                "frame_id": frameID,
+                "observation_id": observationID,
+                "bound_node_id": suffix,
+                "frame_timestamp": timestamp,
+                "node_timestamp": timestamp,
+                "depth": 0.9,
+                "view": "front",
+                "tracking": "stable",
+                "confidence": 0.9,
+            ]],
+        ]))
+    }
+    try observations.write(
+        to: directory.appendingPathComponent("tag_observations.jsonl"))
+    try bursts.write(
+        to: directory.appendingPathComponent("tag_observation_bursts.jsonl"))
+    return sequences.indices.last.map { "sequence-burst-\($0 + 1)" }
+}
+
+func p7r6WriteConfirmedTagBurstFixture(
+    in directory: URL,
+    tagPayload: String = "6901234567890",
+    tagSymbology: String = "EAN13"
+) throws -> String {
+    let captureID = UUID().uuidString.lowercased()
+    let observationIDs = ["confirmed-obs-1", "confirmed-obs-2", "confirmed-obs-3"]
+    var observations = Data()
+    var frames: [[String: Any]] = []
+    for (index, observationID) in observationIDs.enumerated() {
+        let timestamp = 200.0 + Double(index) * 0.2
+        let frameID = "confirmed-frame-\(index + 1)"
+        observations.append(try p7r6JSONLine([
+            "format": "MarketScannerPriceTagObservation",
+            "version": 1,
+            "observation_id": observationID,
+            "timestamp": timestamp,
+            "payload": "6901234567890",
+            "symbology": "EAN13",
+            "frame_timestamp": timestamp,
+            "node_timebase_frame_timestamp": timestamp,
+            "node_timebase_offset_seconds": 0.0,
+            "raw_map_position": [
+                "x_m": 1.0,
+                "y_m": 2.0,
+                "height_m": 1.2,
+            ],
+            "tracking_session_id": "session-a",
+            "prior_map_id": "map-a",
+            "prior_map_sha256": p7r6aIdentitySha(),
+            "floor_id": "1",
+            "burst_id": captureID,
+            "frame_id": frameID,
+        ]))
+        frames.append([
+            "frame_id": frameID,
+            "observation_id": observationID,
+            "bound_node_id": index + 1,
+            "frame_timestamp": timestamp,
+            "node_timestamp": timestamp,
+            "depth": 0.9,
+            "view": "front",
+            "tracking": "stable",
+            "confidence": 0.9,
+        ])
+    }
+    let burst = try p7r6JSONLine([
+        "format": "MarketScannerPriceTagBurst",
+        "version": 2,
+        "burst_id": captureID,
+        "sequence": 1,
+        "barcode": "6901234567890",
+        "symbology": "EAN13",
+        "tracking_session_id": "session-a",
+        "prior_map_id": "map-a",
+        "prior_map_sha256": p7r6aIdentitySha(),
+        "floor_id": "1",
+        "frame_count": 3,
+        "first_frame_timestamp": 200.0,
+        "last_frame_timestamp": 200.4,
+        "bound_node_id_min": 1,
+        "bound_node_id_max": 3,
+        "depth_quality": 0.9,
+        "view_angle": "front",
+        "tracking_quality": "stable",
+        "localization_confidence_mean": 0.9,
+        "complete": true,
+        "frames": frames,
+    ])
+    let tag: [String: Any] = [
+        "format": "MarketScannerLocalizedPriceTag",
+        "version": 2,
+        "tag_id": "confirmed-tag-1",
+        "observation_id": observationIDs[0],
+        "payload": tagPayload,
+        "symbology": tagSymbology,
+        "floor_id": "1",
+        "timestamp": 200.0,
+        "tracking_session_id": "session-a",
+        "prior_map_id": "map-a",
+        "prior_map_sha256": p7r6aIdentitySha(),
+        "shelf_segment_id": "shelf-1",
+        "shelf_code": "S1",
+        "shelf_side": "L",
+        "distance_from_shelf_start_cm": 120.0,
+        "height_cm": 120.0,
+        "raw_map_position": [
+            "x_m": 1.0,
+            "y_m": 2.0,
+            "height_m": 1.2,
+        ],
+        "snapped_map_position": [
+            "x_m": 1.0,
+            "y_m": 2.0,
+            "height_m": 1.2,
+        ],
+        "localization_confidence": 0.9,
+        "measurement_confidence": 0.9,
+        "association_confidence": 0.9,
+        "measurement_method": "scene_depth",
+        "needs_review": false,
+        "user_confirmed": true,
+        "capture_id": captureID,
+        "frame_observation_ids": observationIDs,
+        "algorithm_shelf_segment_id": "shelf-1",
+        "algorithm_shelf_code": "S1",
+        "algorithm_side": "L",
+        "algorithm_distance_from_shelf_start_cm": 120.0,
+        "algorithm_association_confidence": 0.9,
+        "confirmation_status": "USER_CONFIRMED",
+        "user_confirmed_shelf_segment_id": "shelf-1",
+        "user_confirmed_shelf_code": "S1",
+        "user_confirmed_side": "L",
+        "user_confirmed_distance_from_shelf_start_cm": 120.0,
+        "confirmed_at_utc": 1_700_000_000.0,
+        "confirmed_at_monotonic": 20.0,
+        "confirmation_source": "on_device_operator",
+    ]
+    try observations.write(
+        to: directory.appendingPathComponent("tag_observations.jsonl"))
+    try burst.write(
+        to: directory.appendingPathComponent("tag_observation_bursts.jsonl"))
+    try JSONSerialization.data(
+        withJSONObject: [tag],
+        options: [.sortedKeys]).write(
+            to: directory.appendingPathComponent("localized_price_tags.json"))
+    return captureID
+}
+
+func p7r6WriteV2LocalizedTagFixture(
+    in directory: URL,
+    mutateTag: (inout [String: Any]) -> Void = { _ in }
+) throws {
+    let captureID = "12345678-1234-4234-8234-123456789abc"
+    var observationData = Data()
+    var frames: [[String: Any]] = []
+    var observationIDs: [String] = []
+    for index in 1...3 {
+        let observationID = "obs-\(index)"
+        let frameID = "frame-\(index)"
+        let timestamp = 99.0 + Double(index)
+        observationIDs.append(observationID)
+        observationData.append(try p7r6JSONLine([
+            "format": "MarketScannerPriceTagObservation",
+            "version": 1,
+            "observation_id": observationID,
+            "timestamp": timestamp,
+            "payload": "6901234567890",
+            "symbology": "EAN13",
+            "frame_timestamp": timestamp,
+            "node_timebase_frame_timestamp": timestamp,
+            "node_timebase_offset_seconds": 0.0,
+            "raw_map_position": ["x_m": 1.0, "y_m": 2.0],
+            "tracking_session_id": "session-a",
+            "prior_map_id": "map-a",
+            "prior_map_sha256": p7r6aIdentitySha(),
+            "floor_id": "1",
+            "burst_id": captureID,
+            "frame_id": frameID,
+        ]))
+        frames.append([
+            "frame_id": frameID,
+            "observation_id": observationID,
+            "bound_node_id": 1,
+            "frame_timestamp": timestamp,
+            "node_timestamp": timestamp,
+            "depth": 0.9,
+            "view": "front",
+            "tracking": "stable",
+            "confidence": 0.9,
+        ])
+    }
+    let burst: [String: Any] = [
+        "format": "MarketScannerPriceTagBurst",
+        "version": 2,
+        "burst_id": captureID,
+        "sequence": 1,
+        "barcode": "6901234567890",
+        "symbology": "EAN13",
+        "tracking_session_id": "session-a",
+        "prior_map_id": "map-a",
+        "prior_map_sha256": p7r6aIdentitySha(),
+        "floor_id": "1",
+        "frame_count": 3,
+        "first_frame_timestamp": 100.0,
+        "last_frame_timestamp": 102.0,
+        "bound_node_id_min": 1,
+        "bound_node_id_max": 1,
+        "depth_quality": 0.9,
+        "view_angle": "front",
+        "tracking_quality": "stable",
+        "localization_confidence_mean": 0.9,
+        "complete": true,
+        "frames": frames,
+    ]
+    var tag: [String: Any] = [
+        "format": "MarketScannerLocalizedPriceTag",
+        "version": 2,
+        "tag_id": "tag-1",
+        "observation_id": "obs-1",
+        "payload": "6901234567890",
+        "symbology": "EAN13",
+        "floor_id": "1",
+        "timestamp": 100.0,
+        "tracking_session_id": "session-a",
+        "prior_map_id": "map-a",
+        "prior_map_sha256": p7r6aIdentitySha(),
+        "shelf_segment_id": "shelf-A",
+        "shelf_code": "A-01",
+        "shelf_side": "A",
+        "distance_from_shelf_start_cm": 120.0,
+        "raw_map_position": ["x_m": 1.0, "y_m": 2.0],
+        "snapped_map_position": ["x_m": 1.0, "y_m": 1.9],
+        "localization_confidence": 0.9,
+        "measurement_confidence": 0.9,
+        "association_confidence": 0.8,
+        "measurement_method": "scene_depth",
+        "needs_review": false,
+        "user_confirmed": true,
+        "capture_id": captureID,
+        "frame_observation_ids": observationIDs,
+        "algorithm_shelf_segment_id": "shelf-A",
+        "algorithm_shelf_code": "A-01",
+        "algorithm_side": "A",
+        "algorithm_distance_from_shelf_start_cm": 120.0,
+        "algorithm_association_confidence": 0.8,
+        "confirmation_status": "USER_CONFIRMED",
+        "user_confirmed_shelf_segment_id": "shelf-A",
+        "user_confirmed_shelf_code": "A-01",
+        "user_confirmed_side": "A",
+        "user_confirmed_distance_from_shelf_start_cm": 120.0,
+        "confirmed_at_utc": 1_700_000_000.0,
+        "confirmed_at_monotonic": 123.0,
+        "confirmation_source": "on_device_operator",
+    ]
+    mutateTag(&tag)
+    try observationData.write(
+        to: directory.appendingPathComponent("tag_observations.jsonl"))
+    try p7r6JSONLine(burst).write(
+        to: directory.appendingPathComponent("tag_observation_bursts.jsonl"))
+    try JSONSerialization.data(
+        withJSONObject: [tag], options: [.sortedKeys])
+        .write(to: directory.appendingPathComponent(
+            "localized_price_tags.json"))
 }
 
 func p7r6EncodedLifecycleLine(
@@ -3497,7 +5501,8 @@ final class P7R6DurableRecoveryWriter: RecoveryLifecycleWriting {
 
     func appendRecoveryLifecycleEvent(
         _ completion: PriorMapRecoveryCompletion,
-        expectedTrackingSessionId: String
+        expectedTrackingSessionId: String,
+        allowDuringFinalization: Bool = false
     ) -> Bool {
         guard expectedTrackingSessionId == trackingSessionId,
               completion.episode.startedAtUptime.isFinite,
@@ -5420,6 +7425,96 @@ do {
                 + "tag_business_schema_invalid"),
         "P-B12 numeric tag booleans must block finalization (SB5): "
             + "\(blockers)")
+}
+
+// ESL-F1/F2/F3: a syntactically valid complete burst is only verified when
+// the durable observation and burst-frame bindings are exactly equal in both
+// directions. Internal burst consistency or a one-way subset is insufficient.
+do {
+    let cleanDirectory = try p7r6FreshDirectory("esl-f1")
+    _ = try p7r6WriteBaseBundle(in: cleanDirectory)
+    try p7r6WriteTagBurstBindingFixture(in: cleanDirectory)
+    let cleanBlockers = LocalizationEvidenceBundleValidator.blockers(
+        in: cleanDirectory,
+        expectation: p7r6BundleExpectation(
+            recoveryCount: 0,
+            tagBurstCount: 1,
+            tagBurstLastID: "burst-1"))
+    require(
+        cleanBlockers.isEmpty,
+        "ESL-F1 exact durable observation/burst binding must finalize: "
+            + "\(cleanBlockers)")
+
+    let mismatchedDirectory = try p7r6FreshDirectory("esl-f2")
+    _ = try p7r6WriteBaseBundle(in: mismatchedDirectory)
+    try p7r6WriteTagBurstBindingFixture(
+        in: mismatchedDirectory,
+        observationFrameID: "different-frame")
+    let mismatchedBlockers = LocalizationEvidenceBundleValidator.blockers(
+        in: mismatchedDirectory,
+        expectation: p7r6BundleExpectation(
+            recoveryCount: 0,
+            tagBurstCount: 1,
+            tagBurstLastID: "burst-1"))
+    require(
+        mismatchedBlockers.contains(
+            "evidence_bundle_tag_burst_observation_binding_mismatch"),
+        "ESL-F2 mismatched durable observation/burst binding must block: "
+            + "\(mismatchedBlockers)")
+
+    let extraDirectory = try p7r6FreshDirectory("esl-f3")
+    _ = try p7r6WriteBaseBundle(in: extraDirectory)
+    try p7r6WriteTagBurstBindingFixture(
+        in: extraDirectory,
+        includeUnlistedBoundObservation: true)
+    let extraBlockers = LocalizationEvidenceBundleValidator.blockers(
+        in: extraDirectory,
+        expectation: p7r6BundleExpectation(
+            recoveryCount: 0,
+            tagBurstCount: 1,
+            tagBurstLastID: "burst-1"))
+    require(
+        extraBlockers.contains(
+            "evidence_bundle_tag_burst_observation_binding_mismatch"),
+        "ESL-F3 an unlisted durable burst-bound observation must block: "
+            + "\(extraBlockers)")
+}
+
+// ESL-F4/F5: additive v2 localized tags remain version-specific and can only
+// finalize when their confirmation fields bind the exact verified burst.
+do {
+    let cleanDirectory = try p7r6FreshDirectory("esl-f4")
+    _ = try p7r6WriteBaseBundle(in: cleanDirectory)
+    try p7r6WriteV2LocalizedTagFixture(in: cleanDirectory)
+    let cleanBlockers = LocalizationEvidenceBundleValidator.blockers(
+        in: cleanDirectory,
+        expectation: p7r6BundleExpectation(
+            recoveryCount: 0,
+            localizedPriceTagCount: 1,
+            tagBurstCount: 1,
+            tagBurstLastID: "12345678-1234-4234-8234-123456789abc"))
+    require(
+        cleanBlockers.isEmpty,
+        "ESL-F4 exact v2 confirmation evidence must finalize: "
+            + "\(cleanBlockers)")
+
+    let unknownDirectory = try p7r6FreshDirectory("esl-f5")
+    _ = try p7r6WriteBaseBundle(in: unknownDirectory)
+    try p7r6WriteV2LocalizedTagFixture(in: unknownDirectory) {
+        $0["future_confirmation_field"] = true
+    }
+    let unknownBlockers = LocalizationEvidenceBundleValidator.blockers(
+        in: unknownDirectory,
+        expectation: p7r6BundleExpectation(
+            recoveryCount: 0,
+            localizedPriceTagCount: 1,
+            tagBurstCount: 1,
+            tagBurstLastID: "12345678-1234-4234-8234-123456789abc"))
+    require(
+        unknownBlockers.contains(
+            "evidence_bundle_localized_price_tags_tag_contract_mismatch"),
+        "ESL-F5 unknown v2 confirmation fields must fail closed: "
+            + "\(unknownBlockers)")
 }
 
 // P-B13/P-B14: the frozen 16 MB file limit is exact on both sides of the
