@@ -13,7 +13,7 @@
 
 本轮新增局部结论：`MAPCASE02 / STANDARD SUPERMARKET XLSX FORMAT PASS`。正式 MapCase02 源 SHA `1ddf428fc4dd6e4e8bd33258d0cbfaab87b809c4dedd6b8baca9e167c14b5e6a`，源/active/shelf/fixed/road/presentation 为 `1838/1630/1301/329/0/208`，active 越界 0；canonical `5ddfac7dc439afc45abdcf800b799c05d53704895b620d161ef08a442c55b2db`、Swift package `5cc223ca505d72158748caf5a0efc540f870ea6d9858fee1572e9f570a69b72a`、preview `d0c02be63dff3ab002dcf931ce7d0c5149152b78bea139fb1b0a2d86be196a18`。该结论不改变下述 RC 产品边界。
 
-本分支已关闭第二次独立审查中的大部分正确性、事务、安全、规模及审计缺口，并积累了本地主机 developer-smoke 回归。底层事务加固实现为 `f0ffcec4480ce04ac61f3a8aad2453e5b4b27a35`，ESL 核心 I3 为 `fdcc5c87005a0128e0654eb43b1364898edd8f5d`；Result recovery implementation I5 为 `4d78d4646c01fe50bc0ac07eb2266879a24348db`。当前 ESL follow-up implementation I6 为 `396097ea474be2e1155098cd709d1edfa9064a83`，G6 `f65dbb0a3d0337ca926f4142489555d409089939` 已将 descriptor 的 `implementation_sha` 更新到 I6。evidence 文档由后续纯治理提交绑定到 `validation_sha`，当前精确值以 `.github/marketscanner-repair-v2-wave.json` 为唯一事实源。V4 exact-HEAD run `31276999280@8ba2f697a8213a1bcd4bf6fb7197d155cb09b865` 为 7/8，唯一失败是 macOS/iOS host §18 timer contract；I5 已在本地关闭该抖动及长回归解封的 Result removal tombstone authority-laundering P1，I6 又关闭 ESL Vision hung-worker、deadline、取消线性化和 manifest v3/v1 兼容阻断。该结论仍不是 release PASS；J-04 absolute-prior `same floor/map/component`、新 exact-HEAD、Apple/设备/现场资格均未关闭。
+本分支已关闭第二次独立审查中的大部分正确性、事务、安全、规模及审计缺口，并积累了本地主机 developer-smoke 回归。底层事务加固实现为 `f0ffcec4480ce04ac61f3a8aad2453e5b4b27a35`，ESL 核心 I3 为 `fdcc5c87005a0128e0654eb43b1364898edd8f5d`；Result recovery implementation I5 为 `4d78d4646c01fe50bc0ac07eb2266879a24348db`，ESL follow-up I6 为 `396097ea474be2e1155098cd709d1edfa9064a83`。MapCase02 validation HEAD `770d94b078a0dd94653b9d6b33576890f88f7296` 的 exact-SHA run `31299358502` 为 7/8：唯一失败是 macOS/iOS 200k tag-evidence 峰值 RSS `812,892,160` bytes 超过 `768 MiB` 门 `7,585,792` bytes，功能、CPU/时间及其余 required jobs 均通过。当前 RSS blocker implementation I7 为 `cbba284ad1b0694f5302ec3abbb9a446d9d3a970`，G7 `5dd8201` 已将 descriptor 的 `implementation_sha` 更新到 I7；它删除 burst frame index 中由 dictionary key/同 burst authority 已承载的重复 String，并把有限 view/tracking 域改为单射 `UInt8` 编码，不改变 exact-match、duplicate 或 unconsumed fail-closed 合同。本地同一 200k 规模峰值降至 `629,735,424` bytes。evidence 文档由后续纯治理提交绑定到 `validation_sha`，精确值以 `.github/marketscanner-repair-v2-wave.json` 为唯一事实源；replacement exact-SHA required run 全绿前不得创建冻结标签。该结论仍不是 release PASS；J-04 absolute-prior `same floor/map/component`、Apple/设备/现场资格均未关闭。
 
 Mobile V1 冻结为 Route A：
 
@@ -30,10 +30,10 @@ True sensor Deep 不属于 Mobile V1。设备端不会在 Fast/Full 失败后重
 | ID | 本分支状态 | 实现和验证摘要 |
 | --- | --- | --- |
 | RC-B01 | 代码关闭 | compiler、loader、integrity validator 和测试统一消费 shelves v2；包含物理 `shelf_segment_id`、显式 start/end/axis/normal 和跨文件关系校验 |
-| RC-B02 | 代码关闭，待新 exact-SHA 复验 | production Swift 全部登记到 RTABMapApp target；自动 membership checker 当前确认 83 个 Swift 源文件；exact-case gate 使用原始路径字符串，不再被 Windows 大小写不敏感 `Path` equality 绕过 |
+| RC-B02 | 代码关闭，待新 exact-SHA 复验 | production Swift 全部登记到 RTABMapApp target；自动 membership checker 当前确认 85 个 Swift 源文件；exact-case gate 使用原始路径字符串，不再被 Windows 大小写不敏感 `Path` equality 绕过 |
 | RC-B03 | 代码关闭 | workflow 不再维护易漂移的手写 Swift parse 清单；source membership、SwiftPM lock 和 Apple build gate 分离 |
-| RC-B04 | **EXACT-SHA CI FAILED；NEW RUN REQUIRED** | V4 run `31276999280` 为 7/8：除 macOS/iOS host §18 contract 外全部 required jobs PASS。当前 I6 `396097e` / G6 `f65dbb0` 已修复并绑定，仍需 E6/V6 exact-HEAD required-gate PASS |
-| RC-B05 | 代码关闭 | `StrictJSONLStreamReader` 为 64 KiB bounded streaming API；不再返回或保留全量 `ParsedLines`/`String` 数组；每行 caller body 在独立 autorelease pool 内运行，且不再重复执行同一 strict document validator，200k frame + 200k observation 全链路 RSS 回到门限内 |
+| RC-B04 | **EXACT-SHA CI FAILED；NEW RUN REQUIRED** | run `31299358502@770d94b078a0dd94653b9d6b33576890f88f7296` 为 7/8；唯一失败是 macOS/iOS 200k tag-evidence RSS `812,892,160 > 805,306,368` bytes。I7 `cbba284` / G7 `5dd8201` 已完成本地修复与治理绑定，仍需新的 final exact-HEAD required-gate PASS |
+| RC-B05 | 代码关闭，待 exact-SHA 复验 | `StrictJSONLStreamReader` 为 64 KiB bounded streaming API；不再返回或保留全量 `ParsedLines`/`String` 数组；每行 caller body 在独立 autorelease pool 内运行。I7 进一步消除 200k burst frame index 中 observation/view/tracking 的重复 String 保留，有限域使用单射 compact code；本地同一规模 RSS `629,735,424` bytes，低于 768 MiB 门 |
 | RC-B06 | 代码关闭 | clock correlation writer 使用 `O_CREAT|O_EXCL|O_NOFOLLOW` 增量 JSONL，每 64 条 fsync，durable watermark 只在同步成功后推进，final partial batch 同步，parent fsync 失败阻断 |
 | RC-B07 | 代码关闭 | finalized metadata v2 严格类型化；读取正式 nested watermark `captureHealth.localizationTraceRecordCount`；metadata 有 1 MiB 上限，缺失/错误字段 fail closed |
 | RC-B08 | 代码关闭 | snapshot 对 required file set、DB/WAL/journal/shm、hardlink/symlink、pre/post inventory 和 inode identity 做稳定校验；`scan_events.jsonl` 纳入 immutable snapshot并逐行绑定当前 `trackingSessionId`。当前 metadata 无 scan-event count/last-ID，故不声明 exact cardinality watermark |
@@ -83,6 +83,7 @@ True sensor Deep 不属于 Mobile V1。设备端不会在 Fast/Full 失败后重
 | `python3 -m unittest discover -s tools/Qualification/tests -v` | 28 tests，PASS；7.663 s；包含 Snapshot/Result acquisition 与最终 process-lock pathname/root replacement |
 | `python3 -m unittest discover -s tools/SupermarketMapStudio/tests -v` | 108 tests，PASS |
 | MapCase02 Swift/PC | `--mapcase02-suite` PASS；PC conversion + validator `valid=true`；canonical/package/preview golden 未漂移 |
+| exact-SHA run `31299358502@770d94b…` | 7/8；P0、SHA/wave、ABI、Ubuntu/Windows native 与 Python/API/Web 均 PASS；macOS/iOS 仅 200k tag-evidence RSS 超门，故该 SHA 未冻结 |
 | Result quarantine focused smoke | PASS；正常隔离、intent durable→source move、source move→freeze、publish rename→freeze、根级 symlink、重启后无 hidden transaction residue |
 | Map/Result focused fault smoke | PASS；Map root/lock replacement、tombstone crash/restart、source/pending/diagnostic inode replacement；Result publication destination/source/interrupted replacement与 artifact symlink拒绝 |
 | `rtabmap-market-scanner-native-tests` | 7,878 checks，0 failures |
@@ -91,17 +92,19 @@ True sensor Deep 不属于 Mobile V1。设备端不会在 Fast/Full 失败后重
 | generated mobile evidence contracts | 11 generated/authoritative files，version 1，无漂移 |
 | 300k finalization scale | 300,000 records / 114,933,372 input bytes / 114,933,372 temporary bytes；7.877 s wall / 7.871 s CPU；peak RSS 12,795,904 bytes |
 | 48 h trace transition storm | 1,728,000 records；保留 172,801 个每秒保守最坏状态 + exact final sample；0 temporary bytes；0.334 s wall / 0.337 s CPU；peak RSS 58,769,408 bytes |
-| 200k tag 全链路 | 200,000 burst frames + 200,000 observations，243,952,646 input/temporary bytes；经过 strict parser、resolver、shelf association、fusion 和 quality gate；200,000 accepted observations、1 个 accepted physical tag；884.922 s wall / 880.926 s CPU；peak RSS 670,662,656 bytes（约 639.6 MiB，低于 768 MiB 门） |
+| 200k tag 全链路（I7） | 200,000 burst frames + 200,000 observations，243,952,646 input/temporary bytes；经过 strict parser、resolver、shelf association、fusion 和 quality gate；200,000 accepted observations；801.437 s wall / 800.947 s CPU；peak RSS 629,735,424 bytes（约 600.6 MiB，低于 768 MiB 门约 167.4 MiB） |
 | JSONL legacy API residue | `ParsedLines` / `readLines(` 为 0 matches |
 | 静态检查 | Python compile、shell syntax、Xcode project plist、workflow YAML、`git diff --check` PASS |
 
-这些是未优化 macOS Swift host / 本地主机自动化证据，不等价于完整 PriorMap discover、target-device 性能、simulator/device clean link、热状态、电池、后台、provider、断电或现场精度证据，也不能抵消 V4 失败 run；尤其不能把 I5 描述为 exact-SHA PASS。
+这些是未优化 macOS Swift host / 本地主机自动化证据，不等价于完整 PriorMap discover、target-device 性能、simulator/device clean link、热状态、电池、后台、provider、断电或现场精度证据，也不能把本地 I7 规模 PASS 写成新的 exact-SHA PASS。冻结标签必须等待 replacement final SHA 的全部 required jobs 通过。
 
 ## 5. 最终独立只读审查
 
 最终关键生产增量已完成两轮只读审查。I5 复审确认 timer bounded poll 仍由真实 production timer 提供证据，worker default-only guard 不跳过主路径；mismatched Result removal tombstone 永久 conflict quarantine 不会误伤 identity 匹配的合法 cleanup，也不会让 replacement inode 重获 canonical authority。最终结论为 `P0=0 / P1=0`；cadence/override 和更深 recovery evidence 正反例是可延期 P2，已登记 TODO。该结论仍不是 release review PASS：完整 PriorMap discover、exact-SHA、J-04、ACL/file-flags与外部资格门仍未关闭。
 
 MapCase02 另行完成完整只读 P0/P1 审查。发现并关闭角色几何 fail-open、canonical/source identity 未重算、relationship/worksheet alias、row/cell crash、严格整数 parity、distance OOM、shelf/graph/spatial/distance 派生工件未绑定，以及 workbook 元数据 O(N²)/无数量门、PC XML authority、v2 六字段 bounds、`center_m/yaw_rad` 数值 parity 和重复 stable business identity 等问题；最终复审为 `P0=0 / P1=0`。空行 parity、数值 code/crossCodes、XML 预扫描内存、UI/preview/visual baseline 和完整长/真机矩阵登记在 `MAPCASE02_TODO.md`。
+
+run `31299358502` 暴露的 RSS blocker 也已完成独立只读复审：compact frame 表示对 view/tracking 的编码域完整且单射，observation lookup、逐字段 exact binding、burst identity、duplicate/already-consumed 和 remaining-frame 检查均未放宽；未发现新增崩溃、并发或无界内存路径，结论为 `P0=0 / P1=0`。该审查只覆盖 I7 增量，不能替代 exact-SHA CI、Apple clean link 或真机资格。
 
 ## 6. 事务与审计边界
 

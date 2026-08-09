@@ -4,6 +4,8 @@
 
 ## 2026-08-09 — MapCase02 标准工作簿格式/几何阻断级收口
 
+- validation HEAD `770d94b078a0dd94653b9d6b33576890f88f7296` 的 exact-SHA run [`31299358502`](https://github.com/mcjiansheng/MarketScanner/actions/runs/31299358502) 为 7/8：除 macOS/iOS 200k tag-evidence RSS 外全部 required jobs PASS；失败值 `812,892,160` bytes，比 768 MiB 门高 `7,585,792` bytes，因此未创建冻结标签。
+- RSS blocker implementation I7 `cbba284ad1b0694f5302ec3abbb9a446d9d3a970` 删除 burst frame dictionary value 中重复 observation ID，并把已严格验证的 view/tracking 有限域压缩为单射 `UInt8` code；observation key lookup、所有数值/身份 exact-match、duplicate/already-consumed 与 remaining-frame fail-closed 合同保持不变。新增全域 round-trip/mismatch/unknown 回归；本地同一 200k 规模为 `629,735,424` bytes，低于门约 167.4 MiB，独立复审 `P0=0 / P1=0`。replacement final exact-SHA 全绿前仍不冻结。
 - 正式 XLSX 以 `Basic Info + Element Info` 为权威，`Shelf Info` 仅审计；冻结 top-left anchor/pivot、生产角色集合、active/ignored 统计和 100,000 元素上限。
 - Swift/PC 同步关闭 relationship/worksheet alias、External/歧义 target、XML root/namespace 伪 authority、row/cell 引用、shared-string/boolean/公式、单元格大小、严格 JSON 数值与 duplicate element ID 的 fail-open/crash 路径；workbook sheet/relationship 各限制 4096 并使用线性索引。
 - prior-map v2 完整性从权威 active elements 重建 canonical identity、road graph、spatial index、distance fields 和 shelves-v2 segment；六字段 bounds、可选 `center_m/yaw_rad` 严格 finite 数值与 stable business identity uniqueness 均 fail closed。距离场在任何分配前执行 20k 单维、8m 单层、16m 包总 cells 上限与 RLE row budget。
