@@ -19,6 +19,8 @@ I8 validation run `31303500822@9478aa5981c664abb98760e24aaba2a4ec537e12` 再次�
 
 I9 validation run `31305157950@b22bd8878fcf001b38cca275b8eddcc6e48974e8` 仍为 7/8：runner RSS `792,576,000 < 805,306,368` bytes，I8/I9 fixture 均通过；随后 mode-restore replacement 测试观察到原 source `0555` 而非 replacement `0755`，证明两步 rename 没有完成却被通用退出码 19 掩盖。I10 `2b111d351173b80575d37229ad55c13b42d8c3f9` / G10 `f7cad97` 将 mode-restore、map-root、pending-root 与 embedded-diagnostic 测试窗口统一改为同卷 `RENAME_SWAP`，增加 mode/inode/payload 方向证明，map-root mutation failure 专用退出 95。最终源码 204 次聚焦执行、默认 host、完整 Python 外层长方法 1/1（973.769 s；tag peak RSS `688,111,616` bytes）及两轮独立复审均 PASS，结论 `P0=0 / P1=0`。新 final exact-SHA 全绿前仍不冻结。
 
+I10 validation run `31307753672@8f0e730d92773eea2ab58f56742d901ac02eead4` 仍为 7/8，但已通过全部七个非 Apple jobs、完整 macOS host、SwiftPM cold resolve、Xcode metadata 和 200k tag-evidence RSS `794,099,712 < 805,306,368` bytes。唯一失败发生在 iphoneos cold dependency：host prebuild 把 `rtabmap-res_tool` 生成到 `rtabmap/prebuild/bin/`，iOS cross-build 的隐式搜索却查找另一 sibling 路径，因此 RTAB-Map configure fail closed，后续 simulator/device clean link skipped。I11 `37e6ed8c4afa00202693cd56919aea78fd4c7af5` / G11 `7eef33e` 在配置前验证工具可执行并显式传入 `RTABMAP_RES_TOOL`；本地全新 host prebuild、全新 iphoneos configure、focused 22/22、Map Studio 109/109 和独立复审 `P0=0/P1=0` 均 PASS。新 exact-SHA 8/8 前仍不冻结。
+
 Mobile V1 冻结为 Route A：
 
 ```text
@@ -36,7 +38,7 @@ True sensor Deep 不属于 Mobile V1。设备端不会在 Fast/Full 失败后重
 | RC-B01 | 代码关闭 | compiler、loader、integrity validator 和测试统一消费 shelves v2；包含物理 `shelf_segment_id`、显式 start/end/axis/normal 和跨文件关系校验 |
 | RC-B02 | 代码关闭，待新 exact-SHA 复验 | production Swift 全部登记到 RTABMapApp target；自动 membership checker 当前确认 85 个 Swift 源文件；exact-case gate 使用原始路径字符串，不再被 Windows 大小写不敏感 `Path` equality 绕过 |
 | RC-B03 | 代码关闭 | workflow 不再维护易漂移的手写 Swift parse 清单；source membership、SwiftPM lock 和 Apple build gate 分离 |
-| RC-B04 | **EXACT-SHA CI FAILED；NEW RUN REQUIRED** | run `31305157950@b22bd8878fcf001b38cca275b8eddcc6e48974e8` 为 7/8；RSS 与 I8/I9 fixture 均通过，后续 mode-restore 两步 replace 未完成却被通用 19 掩盖。I10 `2b111d3` / G10 `f7cad97` 已统一使用 atomic `RENAME_SWAP` 并完成 204 次聚焦、完整长方法、默认 host 和独立复审，仍需新的 final exact-HEAD required-gate PASS |
+| RC-B04 | **EXACT-SHA CI FAILED；NEW RUN REQUIRED** | run `31307753672@8f0e730d92773eea2ab58f56742d901ac02eead4` 为 7/8；全部 host/RSS 与非 Apple gates 通过，iphoneos cold dependency configure 缺 host `rtabmap-res_tool` 显式绑定。I11 `37e6ed8` / G11 `7eef33e` 已验证并显式传入该工具，完成 fresh prebuild/configure、Map Studio 109/109 和独立复审，仍需新的 final exact-HEAD required-gate PASS |
 | RC-B05 | 代码关闭，RSS exact-SHA 已通过 | `StrictJSONLStreamReader` 为 64 KiB bounded streaming API；I7 消除 200k burst frame index 中 observation/view/tracking 的重复 String 保留，有限域使用单射 compact code。run `31301693439` 的 RSS `790,839,296` bytes 低于 768 MiB 门；该 run 因后续独立 fixture 失败而非 RSS 失败 |
 | RC-B06 | 代码关闭 | clock correlation writer 使用 `O_CREAT|O_EXCL|O_NOFOLLOW` 增量 JSONL，每 64 条 fsync，durable watermark 只在同步成功后推进，final partial batch 同步，parent fsync 失败阻断 |
 | RC-B07 | 代码关闭 | finalized metadata v2 严格类型化；读取正式 nested watermark `captureHealth.localizationTraceRecordCount`；metadata 有 1 MiB 上限，缺失/错误字段 fail closed |
@@ -62,7 +64,7 @@ True sensor Deep 不属于 Mobile V1。设备端不会在 Fast/Full 失败后重
 | RC-B27 | 实现已提交，待 exact-SHA | Map Library diagnostic v3、legacy v2 fail-closed、payload dev/inode、FD-relative rollback、所有公开成功路径 root/lock 最终复核及 canonical lowercase UUID 已提交；safe prior-map ID 额外拒绝 `.`/`..`。本轮 focused 真实进程覆盖 root/lock replacement、tombstone rename/unlink、source replacement、pending/embedded diagnostic replacement等关键边界 |
 | RC-B28 | 代码关闭 | XLSX verifier 严格校验 ZIP、workbook relationships、sheet binding、header、formula 和 row count；导入必须提供显式 store ID |
 | RC-B29 | **外部门未关闭** | native policy 仍是 candidate；真实 Replay/FAR、Pareto 证据和最终 policy freeze 未执行 |
-| RC-B30 | **外部门未关闭** | device/simulator dependency 和 workflow 已实现，但本机缺少完整双平台 native trees；最新 run `31180693841` 在 macOS 14 host E2E 前置步骤失败，后续 Apple SwiftPM/Xcode metadata、cold dependencies、simulator/device clean compile-link 与 identity 检查全部 skipped，Device Lab 和现场资格未执行 |
+| RC-B30 | **外部门未关闭** | device/simulator dependency 和 workflow 已实现；run `31307753672` 已通过 SwiftPM/Xcode metadata 和完整 host，iphoneos cold build 到 RTAB-Map configure 后因 resource tool 未绑定失败。I11 已本地 fresh configure PASS，但双平台 clean compile-link、Device Lab 和现场资格仍未执行 |
 
 结论：除 RC-B19/J-04 的 component identity breaking migration 外，大部分 RC-B01…RC-B03、RC-B05…RC-B28 已形成代码闭包或当前工作树加固；但 RC-B09/RC-B23 的 macOS directory publication 修复尚无 exact-SHA 远端 PASS。RC-B04、RC-B09、RC-B23、RC-B29、RC-B30 还必须分别由新的精确提交 CI、真实 Replay/FAR 数据和 Apple/真实设备证据关闭。J-04 与这些门任一未关闭时，整体均保持 `REJECTED / NO-GO / developer smoke only`。
 
@@ -91,6 +93,7 @@ True sensor Deep 不属于 Mobile V1。设备端不会在 Fast/Full 失败后重
 | exact-SHA run `31301693439@a61920b…` | 7/8；200k RSS `790,839,296` bytes PASS；macOS/iOS 后续 Map quarantine delayed fixture `_exit(94)`，Apple build 未执行，故该 SHA 未冻结 |
 | exact-SHA run `31303500822@9478aa5…` | 7/8；200k RSS `793,296,896` bytes PASS，I8 delayed fixture PASS；后续 tombstone source-replace `_exit(91)`，Apple build 未执行，故该 SHA 未冻结 |
 | exact-SHA run `31305157950@b22bd887…` | 7/8；200k RSS `792,576,000` bytes PASS，I8/I9 fixtures PASS；后续 mode-restore source 仍为 `0555`，Apple build 未执行，故该 SHA 未冻结 |
+| exact-SHA run `31307753672@8f0e730d…` | 7/8；全部非 Apple jobs、完整 macOS host、SwiftPM/Xcode metadata 与 RSS `794,099,712` bytes PASS；iphoneos cold dependency 在 RTAB-Map configure 因 host resource tool 未绑定 FAIL，后续双平台 link skipped，故该 SHA 未冻结 |
 | Result quarantine focused smoke | PASS；正常隔离、intent durable→source move、source move→freeze、publish rename→freeze、根级 symlink、重启后无 hidden transaction residue |
 | Map/Result focused fault smoke | PASS；Map root/lock replacement、tombstone crash/restart、source/pending/diagnostic inode replacement；Result publication destination/source/interrupted replacement与 artifact symlink拒绝 |
 | `rtabmap-market-scanner-native-tests` | 7,878 checks，0 failures |
@@ -101,6 +104,7 @@ True sensor Deep 不属于 Mobile V1。设备端不会在 Fast/Full 失败后重
 | 48 h trace transition storm | 1,728,000 records；保留 172,801 个每秒保守最坏状态 + exact final sample；0 temporary bytes；0.334 s wall / 0.337 s CPU；peak RSS 58,769,408 bytes |
 | 200k tag 全链路（I7） | 200,000 burst frames + 200,000 observations，243,952,646 input/temporary bytes；经过 strict parser、resolver、shelf association、fusion 和 quality gate；200,000 accepted observations；801.437 s wall / 800.947 s CPU；peak RSS 629,735,424 bytes（约 600.6 MiB，低于 768 MiB 门约 167.4 MiB） |
 | I10 完整 Python 外层 Swift host | 1/1 PASS；973.769 s；300,000 finalization、1,728,000 trace、200,000 burst + 200,000 observation；tag wall 852.791 s / CPU 849.930 s；peak RSS `688,111,616` bytes；最终源码另有 204 次 atomic replacement 聚焦执行 0 失败 |
+| I11 iOS cold-build 修复 | host `rtabmap-res_tool` fresh prebuild PASS；全新 iphoneos CMake configure 明确使用该工具 PASS；focused 22/22、Map Studio 109/109、source membership/contracts/plist/diff 与独立 `P0=0/P1=0` PASS |
 | JSONL legacy API residue | `ParsedLines` / `readLines(` 为 0 matches |
 | 静态检查 | Python compile、shell syntax、Xcode project plist、workflow YAML、`git diff --check` PASS |
 
@@ -120,6 +124,8 @@ run `31303500822` 暴露的 tombstone 两步 rename fixture 由 I9 改为同卷 
 
 run `31305157950` 暴露的 mode-restore fixture 假失败/假阳性由 I10 关闭。独立复审确认 source 与预制 clone 原子交换后必须分别呈现 `0755/0555`、不同 inode、相同 payload；未触发回调或 swap 失败均不能满足断言。map-root swap failure 以专用 95 退出，不会被 worker 通用 19 掩盖；pending/embedded 两处只有 swap 与 mode 恢复全部完成才设置 `mutationPerformed`。最终复审 `P0=0 / P1=0`。lock-path rename→open 的短缺路径仅影响测试健壮性，作为 P2 登记 `MAPCASE02_TODO.md`。
 
+run `31307753672` 暴露的 cold-cache host resource tool discovery blocker 由 I11 关闭。独立复审确认 prebuild 在 device/simulator 各自 platform prefix 下运行但生成 macOS host 架构工具，单/多配置输出均稳定在 `prebuild/bin/rtabmap-res_tool`；完整引用的 CMake 参数兼容空格路径，`-x` 在 cross-configure 前 fail-fast，脚本 hash 会使 CI cache identity 失效并触发新构建。结论 `P0=0 / P1=0`；显式 Release build type、`:FILEPATH` 标注和实际工具执行 smoke 为 P2 TODO。
+
 ## 6. 事务与审计边界
 
 - 原始 session/SQLite 只读；snapshot、task staging、result staging 和最终 result 使用不同命名空间。
@@ -129,7 +135,7 @@ run `31305157950` 暴露的 mode-restore fixture 假失败/假阳性由 I10 关�
 - `RESCAN_SESSION` 使用独立不可变 `rescan_session_outcome.json`，artifact、checkpoint 和 terminal task 的 rename 前后四类边界均有故障注入；artifact 已可见时先 stable no-follow 重读、补 task-root parent fsync、复核 exact identity/SHA 与 checkpoint reference，再恢复 `rescan_required`。numeric Bool、错误 reason/disposition、RESOURCE_REQUIRED 冒充 graph failure、EEXIST 不等价 winner 或同时存在普通 Result 均 fail closed。
 - cancelled / interrupted / resource_required / workflow_failed 先写 durable `terminal_state_intent.json`，再写 terminal `task.json`，最后清除 intent。task writer 任一注入边界失败均向调用方返回含业务 outcome/code/detail 和 durability phase/detail 的 typed error；重启只在 task identity、目标状态和 reason 精确一致时清理，或把已知非终态推进到 intent 目标，completed、不同终态/理由和 task identity 冲突均保持 task/intent 不变并 fail closed。若底层存储连 intent 都无法 durable 建立，只能 fail closed 并保留存储故障边界，不能宣称具有绝对可靠的磁盘 marker。
 - interrupted/resource pause 恢复、fresh/recovered snapshot、正常 completed 和 committed-result recovery 均显式清除旧 task error；`nil` 不再被错误解释成“保留旧错误”。
-- iOS 内嵌 build identity 使用 version 3 exact schema。当前 implementation I6 `396097ea474be2e1155098cd709d1edfa9064a83` 已由 G6 `f65dbb0a3d0337ca926f4142489555d409089939` 绑定；evidence SHA 由后续纯治理提交写入 descriptor，当前值以 descriptor 为准。两个字段均为 40 位小写 SHA 后运行时 identity 才可 `isUsable`，但这仍不替代 exact-SHA CI。
+- iOS 内嵌 build identity 使用 version 3 exact schema。当前 implementation I11 `37e6ed8c4afa00202693cd56919aea78fd4c7af5` 已由 G11 `7eef33e` 绑定；evidence SHA 由后续纯治理提交写入 descriptor，当前值以 descriptor 为准。两个字段均为 40 位小写 SHA 后运行时 identity 才可 `isUsable`，但这仍不替代 exact-SHA CI。
 - 损坏或未知 result root entry 使用 `Results/quarantine/.quarantine-<uuid>.pending/` 隐藏事务；source move 前先持久化 canonical v2 diagnostic，绑定 source/payload/wrapper dev/inode，再冻结并 exclusive publish到 `quarantine-<uuid>/`。startup recovery分类 external/embedded diagnostic、pending/final和tombstone；未知冲突保留证据并使listing整体fail closed。历史 v1 immutable final继续兼容，包括顶层 symlink payload；嵌套 symlink/special/hardlink仍拒绝。
 - Map Library 对 invalid immutable package 使用 exclusive quarantine；当前 diagnostic v3 以 strict typed schema 重建 canonical bytes，绑定 transaction/prior-map/source/quarantine/payload-tree/validator identity 和 payload dev/inode。v3 incomplete source rollback 使用 bound FD 做 payload hash、`fchmod/fsync`、最终 path/dev/inode 复核后才删除 durable intent。legacy v2 仅向后兼容完整冻结的 `0555` final；v2 writable final 和 v2 incomplete transaction 不具备 durable payload identity，必须保留现场并 fail closed。
 - 当前 immutable 资格合同只覆盖 POSIX type/mode、single-link、symlink/hardlink、dev/inode、hash 和 fsync/rename 边界；尚未对 macOS ACL、BSD `uchg`/`schg` file flags 或相关扩展属性进行 hostile-input/恢复资格测试。不得把 `0444/0555` 宣称为已证明可以清除或覆盖 ACL/flags。
@@ -138,7 +144,7 @@ run `31305157950` 暴露的 mode-restore fixture 假失败/假阳性由 I10 关�
 
 ## 7. Apple 构建和依赖状态
 
-已实现但尚未由新的 exact SHA 远端证明：
+已实现但尚未由新的 exact SHA 远端完整证明：
 
 - `install_deps.sh --platform iphoneos|iphonesimulator`；
 - `Libraries/iphoneos/` 与 `Libraries/iphonesimulator/` 分离；
@@ -147,7 +153,9 @@ run `31305157950` 暴露的 mode-restore fixture 假失败/假阳性由 I10 关�
 - device/simulator cold cache 与真实 `clean build` workflow gate；
 - SwiftPM `Zip` 2.1.2 exact revision `67fa55813b9e7b3b9acee9c0ae501def28746d76`。
 
-当前工作机没有可供完整链接的 `Libraries/iphoneos/` 和 `Libraries/iphonesimulator/` 生产依赖树，因此不能引用历史 archive 或发布目录产物代替。最新 run `31180693841@359e5c2` 的 macOS job 在 platform-independent host E2E 因 `0555` directory-root rename `EACCES` 失败后，cold SwiftPM resolve、Xcode metadata、iphoneos/iphonesimulator dependencies、simulator clean build、unsigned arm64 device build 和 embedded identity 验证均被 skipped；Apple simulator/device clean compile-link 仍为 **NOT RUN / BLOCKED ON SUCCESSFUL PREREQUISITES**。
+run `31307753672` 已证明 SwiftPM cold resolve、Xcode metadata、完整 macOS host/RSS，并把 iphoneos cold dependency 执行到 RTAB-Map configure；该配置因 host `rtabmap-res_tool` 搜索路径不匹配失败，因而没有 simulator/device clean link。I11 已显式绑定并在本机 fresh configure 通过，仍必须由 replacement exact SHA 完成双平台依赖、clean link 与 embedded identity。
+
+当前工作机有足以执行 iphoneos fresh configure 的本地依赖前缀，但没有经本轮清洁构建和 manifest 验证的完整 device+simulator 成对产物，因此不能引用历史 archive 或本地 prefix 代替 clean link。run `31307753672` 的 iphoneos cold build 已到 RTAB-Map configure，后续 iphonesimulator、simulator/device app build 与 embedded identity 因该步骤失败而 skipped；Apple simulator/device clean compile-link 仍为 **NOT RUN / BLOCKED ON SUCCESSFUL PREREQUISITES**。
 
 ## 8. 未完成且禁止冒充 PASS 的资格门
 
@@ -155,16 +163,16 @@ run `31305157950` 暴露的 mode-restore fixture 假失败/假阳性由 I10 关�
 | --- | --- | --- |
 | J-04 component identity schema/C ABI | **BLOCKER / NOT CLOSED** | 冻结 prior-independent final-link component policy；node snapshot 原子携带 node/map identity；constraint/manual 新 schema；final DB node/map/component exact 重验；旧 schema 不追溯认证；完成 Apple 双平台 compile-link |
 | current transaction / ESL diff review | **COMPLETED / P0=0 / P1=0** | I5 Result recovery 与 I6 ESL follow-up 独立复审完成；I5 历史长 host workflow PASS，I6 聚焦回归 PASS；低影响测试深化项已登记 TODO，完整 PriorMap discover 仍延期，不能写 release PASS |
-| implementation/validation binding | **I6/G6 BOUND / E6-V6 PENDING** | implementation `396097ea474be2e1155098cd709d1edfa9064a83`；governance `f65dbb0a3d0337ca926f4142489555d409089939`；当前 `validation_sha` 在 E6/V6 后由 descriptor 更新，文档不做自引用 SHA 声明 |
-| exact-SHA GitHub Actions | **V4 7/8 FAILED / NEW COMMITTED RERUN REQUIRED** | `31276999280` 除 macOS/iOS host contract 外全部 PASS；只能查询未来明确提交 SHA 的全部 required jobs，不可用分支最新状态或当前工作树替代 |
-| Apple simulator/device clean link | NOT RUN / BLOCKED | 最新 run `31180693841` 中相关步骤因前置 macOS host E2E 失败而 skipped；必须在新的 committed exact-SHA run 使用平台正确的冷构建依赖树分别 clean build 并验证 link |
+| implementation/validation binding | **I11/G11 BOUND / E11-V11 PENDING** | implementation `37e6ed8c4afa00202693cd56919aea78fd4c7af5`；governance `7eef33e`；当前 `validation_sha` 在 evidence/validation 后继由 descriptor 更新，文档不做自引用 SHA 声明 |
+| exact-SHA GitHub Actions | **RUN 31307753672 7/8 FAILED / NEW COMMITTED RERUN REQUIRED** | `8f0e730d…` 除 Apple cold dependency job 外全部 PASS；Apple job 内 host/SwiftPM/Xcode metadata 也 PASS，iphoneos configure 因 resource tool 未绑定 FAIL。只能查询未来明确提交 SHA 的全部 required jobs，不可用分支最新状态或当前工作树替代 |
+| Apple simulator/device clean link | NOT RUN / BLOCKED | `31307753672` 已进入 iphoneos cold dependency 并在 RTAB-Map configure 失败；后续 simulator/device link skipped。I11 本机 fresh configure PASS，但必须由新的 committed exact-SHA 分别 clean build 并验证 link |
 | Replay/FAR/policy freeze | NOT RUN | 真实/合成资格数据、误接受率、精度/性能 Pareto 和冻结 policy |
 | Device Lab | NOT RUN | 支持 LiDAR 的真实 iPhone、Route A、tag、弱纹理、后台、热/内存/磁盘、crash/relaunch、result receipt |
 | Sam field re-test | NOT RUN | 同路线真实重扫、控制点、价签和独立证据复核 |
 
 ### 明日详细测试与低影响 TODO（2026-08-09 登记）
 
-- 运行当前 implementation I6 的完整 `python3 -m unittest discover -s tools/PriorMap/tests -v`；943.159 秒的关键长方法是 I5 历史 PASS，I6 未完整重跑，不得把该历史单方法或历史 166/166 冒充 I6 全 discover 证据。
+- 运行当前 implementation I11 的完整 `python3 -m unittest discover -s tools/PriorMap/tests -v`；I10 本地完整长方法和远端 host contract 已 PASS，但不得把单个长方法或非超长分组冒充 I11 全 discover 证据。
 - 执行已写但今日未运行的 Map EEXIST、uppercase/noncanonical UUID、`.`/`..` CAS 集成场景。
 - 执行 Result artifact hardlink、`0644` clone、hash 后同 inode修改、manifest/receipt post-read replacement、generation final sweep、intent creation/temp/removal/staging replacement完整 Python断言。
 - 保留完整 discover、XLSX scale、Replay/FAR 与真实业务数据矩阵；workflow/E2E、finalization、trace 和 tag 的关键长路径已在 I5 长方法中 PASS。两个 128 MiB delayed replacement 场景后续增加精确测试 hook，消除时序依赖。
@@ -222,4 +230,4 @@ J-04 = BLOCKER / NOT CLOSED
 
 V3 `7dd42beac00a2144712503662147e77fee679ffc` 推送后触发 exact-HEAD run [`31276419986`](https://github.com/mcjiansheng/MarketScanner/actions/runs/31276419986)。`Exact SHA and wave bindings` 已通过，但 `P0 production safety invariants` 在业务断言前失败：Map Studio 测试 helper 仍生成旧 v1 session manifest fixture，缺少共享 validator 现在强制的 `recovery_lifecycle_evidence_unbound_legacy`、`session_input_manifest_version`、processing/report Recovery binding 和 `source_database_name` cross-binding。生产 validator 行为正确；失败暴露的是 P0 fixture 与新合同不同步，不能通过放宽 validator 处理。
 
-fixture 已在 I4 `ec1fe96fc676c03514e591c40226112cde30fe76` 修复，G4 `17871d839834487c777824c062980f3322521cdb` 已将 descriptor `implementation_sha` 绑定到 I4；E4 `7b6597e34ac77e3dc087884df9691247968344d3` 随后由 V4 `8ba2f697a8213a1bcd4bf6fb7197d155cb09b865` 绑定。修复后 exact CI 的四个 P0 合同本地 **4/4 PASS**，完整 Map Studio **106/106 PASS**，Python compile 与 `git diff --check` PASS。V4 exact-HEAD run `31276999280` 最终为 7/8，唯一失败是 macOS/iOS host §18 timer contract；因此 V3/V4 都只能记录为失败证据，不能声明 exact-SHA CI PASS。当前 I6/G6 仍需 E6/V6 和新的 exact-HEAD run。
+fixture 已在 I4 `ec1fe96fc676c03514e591c40226112cde30fe76` 修复，G4 `17871d839834487c777824c062980f3322521cdb` 已将 descriptor `implementation_sha` 绑定到 I4；E4 `7b6597e34ac77e3dc087884df9691247968344d3` 随后由 V4 `8ba2f697a8213a1bcd4bf6fb7197d155cb09b865` 绑定。修复后 exact CI 的四个 P0 合同本地 **4/4 PASS**，完整 Map Studio **106/106 PASS**，Python compile 与 `git diff --check` PASS。V4 exact-HEAD run `31276999280` 最终为 7/8，唯一失败是 macOS/iOS host §18 timer contract；因此 V3/V4 都只能记录为历史失败证据。当前资格链已推进到 I11/G11，仍需新的 exact-HEAD run。

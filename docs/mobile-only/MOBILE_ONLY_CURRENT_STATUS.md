@@ -4,7 +4,7 @@
 
 ## 总体
 
-当前 RC 分支 `mobile-only-v1-release-candidate-blocker-closeout`，基线 `81b6dbb216e843d363fd0088f673076add78013f`。底层事务加固与 ESL I3/I4 历史绑定保持可追溯。V4 exact-HEAD run `31276999280@8ba2f697a8213a1bcd4bf6fb7197d155cb09b865` 为 7/8：P0、SHA/wave、ABI、Ubuntu/Windows native clean build 与 Python contracts 均 PASS，唯一失败是 macOS/iOS host §18 timer liveness。Result recovery I5 `4d78d4646c01fe50bc0ac07eb2266879a24348db` / G5 `d2eb9e2cb9b349179c410205d8eb9f44c2c30188` 关闭 timer/worker 抖动和 tombstone authority-laundering P1。当前 ESL follow-up I6 `396097ea474be2e1155098cd709d1edfa9064a83` 已由 G6 `f65dbb0a3d0337ca926f4142489555d409089939` 绑定；它关闭 Vision hung-worker、deadline、取消线性化与 manifest v3/v1 兼容阻断。evidence SHA 由纯治理后继绑定，当前精确值以 descriptor 为唯一事实源。新 E6/V6 exact-HEAD 尚未形成 PASS，当前发布判断仍为 **REJECTED / NO-GO / developer smoke only**。
+当前 RC 分支 `mobile-only-v1-release-candidate-blocker-closeout`，基线 `81b6dbb216e843d363fd0088f673076add78013f`。I10 final SHA `8f0e730d92773eea2ab58f56742d901ac02eead4` 的 exact-SHA run `31307753672` 为 7/8：P0、SHA/wave、ABI、Ubuntu/Windows native、Python/API/Web 与完整 macOS host 合同均 PASS，200k tag-evidence RSS 为 `794,099,712 < 805,306,368` bytes；唯一失败是 cold-cache iphoneos RTAB-Map 配置没有找到已生成在 `rtabmap/prebuild/bin/` 的宿主 `rtabmap-res_tool`，因此 simulator/device clean link 被跳过。I11 `37e6ed8c4afa00202693cd56919aea78fd4c7af5` 已在交叉编译前验证该宿主工具并通过 `RTABMAP_RES_TOOL` 显式绑定，G11 `7eef33e` 已绑定 implementation SHA；本地全新 host prebuild、全新 iOS CMake configure、Map Studio 109/109 和独立复审 `P0=0/P1=0` 均通过。新的 exact-SHA 8/8 前不冻结，当前发布判断仍为 **REJECTED / NO-GO / developer smoke only**。
 
 新增明确 blocker：J-04 absolute-prior component identity 尚未关闭。最终 DB graph 可以由 node `mapID` 和 links 推导 component，但现行 constraint 写侧没有 atomic bound node/map ID，manual v3 也没有 RTAB-Map map ID；因此 reader 不能事后伪造 same-component 证明。需先完成正式 evidence schema 迁移，再进行 component 资格测试。
 
@@ -20,8 +20,8 @@
 - `PersistentTaskCoordinator.updateState` 使用显式 `clearError` 区分“保留旧错误”和“清除错误”；`system_interrupted` / `resource_pause` 恢复后进入 snapshot/normal completion/committed-result recovery 时最终 `task.error == nil`。
 - RESCAN schema 对 `publish_permitted` / `result_published` 使用 strict Bool，reason 与 graph disposition 交叉绑定，`RESOURCE_REQUIRED`、numeric Bool、EEXIST 不等价 winner、普通 Result 共存或 checkpoint/SHA 冲突均保留现场并 fail closed。
 - 上述合同由独立 Qualification Swift host 在真实文件系统上执行，包含 pre-rename failure injection、权限观测、final-path absence、staging recovery/cleanup、terminal 4×4 fault matrix、四类 terminal-intent 冲突拒绝、restart reconciliation 与成功后重开 hash/receipt 验证。这些本地自动化证据不替代 exact-SHA CI、Apple clean build 或真机资格。
-- exact-SHA run `31177319567` 首先暴露 frozen snapshot publication EACCES；`31180693841@359e5c2` 证明 macOS 14 会拒绝直接 rename `0555` directory root。当前提交使用 `0755→exclusive rename→bound-FD 0555/fsync` 协议，但尚无新的 exact-SHA PASS。
-- Windows exact-case membership已使用原始路径字符串，当前 repository audit确认83个 shipping Swift source。当前 Qualification全量28/28 PASS。
+- exact-SHA run `31177319567` 首先暴露 frozen snapshot publication EACCES；后续事务、RSS 与 host fixture 阻断均已逐项收口。最新 `31307753672@8f0e730d…` 已通过完整 macOS host 与 RSS 门，但在 iphoneos cold dependency 配置缺失宿主 resource tool 绑定处失败；I11 已显式绑定，仍需新的 exact-SHA PASS。
+- Windows exact-case membership已使用原始路径字符串，当前 repository audit确认85个 shipping Swift source。当前 Qualification全量28/28 PASS。
 
 ## 已交付（IMPLEMENTED / UNIT TESTED / INTEGRATION TESTED）
 
@@ -58,7 +58,7 @@
 - 独立 MapCase02 复审发现的 P1 已全部修复，最终为 `P0=0 / P1=0`；P2 与延期资格项见 [`../map-assisted-localization/MAPCASE02_TODO.md`](../map-assisted-localization/MAPCASE02_TODO.md)。该局部 PASS 不关闭 J-04、Apple、Device Lab、现场或 exact-SHA 门。
 
 - 最终关键生产增量完成两轮只读审查，发现的 Map `.`/`..`、Result quarantine crash orphan、Snapshot process-lock binding和历史v1顶层symlink兼容均已修复；该事务增量最终 `P0=0 / P1=0 / 新的可修P2=0`。I6 ESL 最终独立复审关闭 callback/evidence timeout 误取消 fresh request 和 manifest v3 误强制历史 tag v1 使用 burst authority两个 P1，复审为 `P0=0 / P1=0`；scanner 级可注入 hung-worker 集成测试及其他低影响项已登记 [`../map-assisted-localization/ESL_CAPTURE_TODO.md`](../map-assisted-localization/ESL_CAPTURE_TODO.md)。这不是 release review PASS，J-04 仍是独立未关闭 blocker。
-- 当前 MapCase02 后证据：PriorMap 非超长分组 217 项 PASS、Map Studio 108/108 PASS、MapCase02 Swift/PC 正式套件 PASS；85-source membership、SwiftPM exact pin、contract drift、pbxproj、Swift/Python compile和diff-check PASS。完整长方法已通过 300k finalization 与 1,728,000 trace 阶段，但按时间主动停在 `tag-evidence-scale`，所以仍不登记完整 discover PASS。
+- 当前 MapCase02 后证据：PriorMap 非超长分组 217 项 PASS、Map Studio 109/109 PASS、MapCase02 Swift/PC 正式套件 PASS；85-source membership、SwiftPM exact pin、contract drift、pbxproj、Swift/Python compile和diff-check PASS。I10 完整外层 Swift host 长方法与 run `31307753672` 远端 host contract 已 PASS，但仍不登记完整 discover PASS。
 - 300,000 条 finalization：peak RSS 12,795,904 bytes；1,728,000 条 trace transition storm：保留 172,801 条，peak RSS 58,769,408 bytes。
 - 200,000 burst frames + 200,000 observations 全链路：243,952,646 input/temporary bytes，200,000 accepted observations，融合 1 个 accepted physical tag，884.922 s wall，peak RSS 670,662,656 bytes（约 639.6 MiB，低于 768 MiB host 门）。`StrictJSONLStreamReader` 通过每行 autorelease pool 消除长时 Foundation autorelease 累积，并保留完整 strict validator。
 - Map quarantine 当前 diagnostic v3 以 strict canonical bytes 绑定 transaction/prior-map/source/quarantine/payload-tree 和 payload dev/inode；真实子进程覆盖 source thaw、payload/diagnostic/publish 的七个 durable `_exit` 窗口，并验证 source replacement 在 intent 删除前被拒绝。legacy v2 仅兼容完整冻结的 `0555` final；v2 writable `0755` final 和 v2 incomplete source transaction 均保留现场并 fail closed。
@@ -68,15 +68,15 @@
 
 ## 未关闭（已有失败 run，禁止写 PASS）
 
-- exact-SHA CI 历史三次、V3 和 V4 均未全绿；V4 `31276999280` 已到 7/8，仅 macOS/iOS host contract FAIL。当前 I6/G6 尚无新的 exact-SHA required-gate PASS。
-- 最新 run `31180693841` 的 Apple SwiftPM/Xcode metadata、双平台 cold dependencies、simulator/device clean compile-link 和 identity 检查因前置 macOS host E2E 失败而 skipped，仍未形成 Apple compile-link 证据。
+- exact-SHA CI 尚未全绿；最新 `31307753672@8f0e730d92773eea2ab58f56742d901ac02eead4` 为 7/8，完整 macOS host 合同和 200k RSS 已 PASS，iphoneos cold dependency configure 因 `RTABMAP_RES_TOOL` 未绑定 FAIL。I11/G11 已修复，等待新 run。
+- `31307753672` 的 SwiftPM cold resolve、Xcode metadata 与 platform-independent host contract 已 PASS；iphoneos cold build 到 RTAB-Map configure 才失败，iphonesimulator、两端依赖验证和 simulator/device clean compile-link 被 skipped，仍未形成 Apple compile-link 证据。
 - Replay / 三格式 E2E（Python 驱动 + host 模式化套件已完成基础设施）。
 - 真机短路线 / Sam 路线 / Excel-Numbers-WPS 打开验证。
-- implementation/governance 已绑定为 I6 `396097ea474be2e1155098cd709d1edfa9064a83` / G6 `f65dbb0a3d0337ca926f4142489555d409089939`；仍需 E6/V6 evidence/validation SHA 绑定、新 exact-SHA evidence 和 production-drift-free 复核。
+- 当前 implementation/governance 已绑定为 I11 `37e6ed8c4afa00202693cd56919aea78fd4c7af5` / G11 `7eef33e`；validation SHA 以 descriptor 为准，仍需新的 exact-SHA evidence 和 production-drift-free 复核。
 
 ## 明日 TODO（按 2026-08-09 时间收口决定延期）
 
-- 完整 `python3 -m unittest discover -s tools/PriorMap/tests -v` 的超长 `tag-evidence-scale` 后半段；本轮其他 217 项与前置 300k finalization/1,728,000 trace 已通过，仍不能冒充完整 discover PASS。
+- 完整 `python3 -m unittest discover -s tools/PriorMap/tests -v`；I10 完整外层 Swift host 长方法与远端 host 合同已通过，但不能冒充整个 discover PASS。
 - 按 [`../map-assisted-localization/MAPCASE02_TODO.md`](../map-assisted-localization/MAPCASE02_TODO.md) 执行低影响 parity/UI/visual baseline 与真机 MapCase02 矩阵。
 - 已写但未运行的 Map EEXIST、uppercase/noncanonical UUID、`.`/`..` CAS和 Result artifact/manifest/receipt/final-sweep/intent replacement完整集成断言。
 - 两个128 MiB delayed replacement场景增加精确测试hook，消除时序依赖。
@@ -98,7 +98,7 @@ RC-B02/RC-B03 的 shipping source membership 与 CI parse 问题已进入代码�
 
 共享 SwiftPM `Package.resolved` 固定 Zip 2.1.2 的完整 revision；CI 对 cold resolve、project metadata 和两个 clean build 后的 lock 做字节稳定性检查，任何 Xcode 自动改写都会 fail closed。本机 Xcode `-showBuildSettings` 已分别确认 simulator/device 的完整 header、framework 和静态库输入展开到 `Libraries/iphonesimulator` / `Libraries/iphoneos`，该证据只证明选路，不等同于完成链接。
 
-当前本机只存在历史 device-only `Libraries/` 产物，因此 simulator native cold build 和最终 Debug simulator `clean build` 仍不能由本地历史产物证明，不能写成 PASS。CI 已配置在两个独立 cache miss 时分别执行完整 cold dependency build，然后进行真实 simulator/device compile + link；但最新 run `31180693841` 在这些步骤之前因 macOS 14 host E2E 的 `0555` root rename `EACCES` 终止，所有后续 Apple dependency/build/identity 步骤均 skipped。其最终状态必须以修复后新的 committed exact-final-SHA Actions run 为准。
+当前本机有足以完成 iphoneos fresh configure 的历史依赖前缀，但没有本轮 clean、成对验证的 device+simulator trees，因此不能写 link PASS。CI 已配置在两个独立 cache miss 时分别执行完整 cold dependency build，再进行真实 simulator/device compile + link；run `31307753672` 已到 iphoneos RTAB-Map configure，因 host resource tool 搜索失败而停止。I11 本地已关闭该 configure 错误，最终状态仍必须以新的 committed exact-final-SHA Actions run 为准。
 
 ## V1R1 收口（见 MOBILE_ONLY_V1R1_PRODUCT_INTEGRATION.md）
 

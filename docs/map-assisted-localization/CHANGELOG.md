@@ -2,6 +2,9 @@
 
 > 文档状态：**当前有效**。最后核对日期：2026-08-09。
 
+- I10 exact-SHA run [`31307753672`](https://github.com/mcjiansheng/MarketScanner/actions/runs/31307753672) 在 `8f0e730d92773eea2ab58f56742d901ac02eead4` 为 7/8：七个非 Apple required jobs、完整 macOS host、SwiftPM cold resolve、Xcode metadata 与 200k tag-evidence RSS `794,099,712 < 805,306,368` bytes 均 PASS；唯一失败是 iphoneos cold dependency 的 RTAB-Map configure 无法自动发现位于 `rtabmap/prebuild/bin/` 的宿主 `rtabmap-res_tool`，所以 simulator/device clean link skipped，未冻结。
+- I11 `37e6ed8c4afa00202693cd56919aea78fd4c7af5` / G11 `7eef33e` 在 host prebuild 后验证 resource tool 可执行，并通过 `RTABMAP_RES_TOOL` 显式绑定给 iOS cross-compile；全新 host tool build、全新 iphoneos CMake configure、focused 22/22、Map Studio 109/109、静态合同与独立复审均 PASS（`P0=0 / P1=0`）。Release 优化标注与工具执行 smoke 作为 P2 记录；新的 final exact-SHA 8/8 前不冻结。
+
 ## 2026-08-09 — MapCase02 标准工作簿格式/几何阻断级收口
 
 - I9 validation run [`31305157950`](https://github.com/mcjiansheng/MarketScanner/actions/runs/31305157950) 在 `b22bd8878fcf001b38cca275b8eddcc6e48974e8` 再次为 7/8：RSS `792,576,000 < 805,306,368` bytes，I8/I9 边界均已通过；随后 mode-restore replacement 用例得到实际 `0555` 而非期望 replacement `0755`，说明两步 `RENAME_EXCL` fixture 没有完成替换却被通用退出码 19 掩盖，Apple build 仍未执行。

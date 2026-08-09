@@ -10,7 +10,7 @@
 
 负例覆盖关系别名/外部 target/namespace 伪 authority、缺失/重复/前导零 row 与 cell、非法 shared-string/boolean/公式/超大 cell、100001 元素、错误角色几何、重复 element ID、严格整数 token、距离场预算，以及重签名后 canonical/graph/spatial/distance/shelf 派生工件篡改。任一端接受集合不同即失败。
 
-2026-08-09 本机证据：MapCase02 Swift 正式套件 PASS；PriorMap 非超长组 217 项 PASS；Map Studio 108/108 PASS；PC MapCase02 validator `valid=true`。run `31305157950@b22bd887…` 的 200k RSS `792,576,000` bytes 与 I8/I9 fixture 均通过，但后续 mode-restore 两步 replacement 未完成却被通用 19 掩盖，Apple build 未执行。I10 `2b111d351173b80575d37229ad55c13b42d8c3f9` 用 `RENAME_SWAP` 收口四个同构 fixture，最终源码聚焦 204/204、默认 host、完整 Python 外层长方法 1/1（973.769 s；tag peak RSS `688,111,616` bytes）和独立复审 `P0=0 / P1=0`。I10 replacement exact-SHA、Apple clean link、真机/LiDAR/现场仍待执行，不能用该局部 PASS 关闭 J-04 或产品 NO-GO，也不得在 required jobs 全绿前冻结。
+2026-08-09 本机证据：MapCase02 Swift 正式套件 PASS；PriorMap 非超长组 217 项 PASS；Map Studio 109/109 PASS；PC MapCase02 validator `valid=true`；I10 完整 Python 外层 Swift host 1/1 PASS（973.769 s）。run `31307753672@8f0e730d…` 的全部非 Apple jobs、完整 macOS host、SwiftPM/Xcode metadata 与 200k RSS `794,099,712 < 805,306,368` bytes 均 PASS，但 iphoneos cold dependency configure 未找到 host `rtabmap-res_tool`，整体仍为 7/8，双平台 clean link skipped。I11 `37e6ed8c4afa00202693cd56919aea78fd4c7af5` 显式绑定该工具，本地全新 prebuild/configure 与独立复审 `P0=0/P1=0` PASS；replacement exact-SHA、Apple clean link、完整 discover、真机/LiDAR/现场仍待执行，required jobs 全绿前不得冻结。
 
 P0 生产安全不变量（CI 使用相同选择器，任一失败即失败关闭）：
 

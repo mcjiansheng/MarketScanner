@@ -26,11 +26,12 @@
 - 当前 crash-worker 断言生产拒绝、替换确实执行且原/替换证据均保留；后续再绑定稳定的 pathname/inode rejection category，防止未来由更下游校验代偿而假绿。该增强不改变现有 fail-closed 生产合同。
 - Tombstone atomic-swap fixture 后续可在 Python 侧记录交换前 source/clone 双方 inode，并在边界后精确断言交换方向、原 inode 审计路径和 payload bytes 一致；当前 syscall 语义、50 次边界重复、restart return 19 与三方证据保留已足够关闭 P1。
 - Map quarantine 的 lock-path 替换负例仍用 `RENAME_EXCL` 后 `open(O_EXCL)` 安装新 inode；生产会在下一次 descriptor/path identity 校验 fail-closed，当前用例也已稳定通过，但后续可预制 replacement 并用 `RENAME_SWAP` 消除测试自身的短暂缺路径窗口。
+- iOS dependency 的 host `rtabmap-res_tool` prebuild 后续可显式设置 `CMAKE_BUILD_TYPE=Release`、把 cache 参数标注为 `FILEPATH`，并增加一次实际执行/动态库装载 smoke；I11 当前已验证产物可执行并完成 iOS configure，这些只属于构建一致性深化，不是当前阻断。
 
 ## 延期测试（2026-08-10 起执行）
 
-- 在 I10 final exact SHA 上重新完整运行 `IOSCoreContractTests.test_swift_workflow_state_and_se2_projection`；本机当前源码已 1/1 PASS（973.769 s），但 run `31305157950@b22bd887…` 仍是 I9 SHA 的 7/8 失败证据，不能登记为 I10 final exact-SHA PASS。
-- 在依赖齐全的 clean runner 补齐 `Eigen/PCL/OpenCV` 后完成 iphoneos 与 iphonesimulator Release clean compile-link；当前本机只通过 Xcode project/SwiftPM 解析，完整 build 在缺失 `Eigen/Core` 处停止。
+- 完整运行 `python3 -m unittest discover -s tools/PriorMap/tests -v`；I10 final SHA 的本机完整长方法与 run `31307753672` 的远端 host contract 已 PASS，但不等于全 discover PASS。
+- 在新 I11 exact SHA 上完成 iphoneos 与 iphonesimulator cold dependency、Release clean compile-link；`31307753672` 已到 iphoneos RTAB-Map configure 后因 host resource tool discovery 失败，I11 本地已关闭该配置错误，但远端双平台 link 仍待证明。
 - 执行真实 LiDAR iPhone、30 秒连续性、内存/thermal/background/provider、Device Lab、Replay/FAR、Sam 同路线和正式现场控制点矩阵。
 - 对 MapCase02 执行更多设备端 package discover/import、长时间 scan matcher 和真实地图点击/定位回放，不把 host suite 当作真机证据。
 

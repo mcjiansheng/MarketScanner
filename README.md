@@ -68,7 +68,7 @@ Android 目录中的部分 C++ 原生实现也因共享移动渲染和数据库�
 
 `MAPCASE02 / STANDARD SUPERMARKET XLSX FORMAT PASS`：Swift/PC 对正式工作簿 top-left anchor、production role geometry、canonical v3、package v2、road/spatial/distance/shelf 派生工件与资源上限已完成阻断级收口。冻结统计为源 1838、active 1630、货架 1301、固定结构 329、展示审计 208、active 越界 0；canonical SHA `5ddfac7dc439afc45abdcf800b799c05d53704895b620d161ef08a442c55b2db`。
 
-这是地图格式局部链路结论，不是产品发布结论。当前整体仍为 **REJECTED / NO-GO / developer smoke only**，J-04 为 **BLOCKER / NOT CLOSED**；Apple clean link、超长 host 后半段、LiDAR 真机、Device Lab、Replay/FAR 和现场验收仍待执行。
+这是地图格式局部链路结论，不是产品发布结论。当前整体仍为 **REJECTED / NO-GO / developer smoke only**，J-04 为 **BLOCKER / NOT CLOSED**；Apple 双平台 clean link、完整 PriorMap discover、LiDAR 真机、Device Lab、Replay/FAR 和现场验收仍待执行。I10 exact-SHA 已通过完整 macOS host 合同，但在冷构建 iphoneos 依赖时暴露宿主 `rtabmap-res_tool` 未显式绑定；I11 已修复并等待新的 exact-SHA 复验，未创建冻结标签。
 
 每个 frame observation 先写入 `tag_observations.jsonl`，完整 burst 再写入 `tag_observation_bursts.jsonl`，最终确认前必须证明 burst complete，并对 `observation_id / burst_id / frame_id / payload / symbology` 做精确磁盘交叉绑定。只有至少 3 个逐帧通过定位、测量、关联质量门且共同指向同一 `shelfSegmentId + side` 的独立证据，才能打开可提交的货架确认。确认页显示小地图、高亮货架、算法候选和替代侧面；`USER_CONFIRMED` / `USER_OVERRIDDEN` 作为 additive v2 用户证据保存，不能覆盖算法字段，更不能修改 SLAM、轨迹、node pose 或定位约束。
 
