@@ -4,5 +4,5 @@
   "base_branch": "mobile-only-v1r5-field-qualification-integrity-scale-closeout",
   "base_sha": "81b6dbb216e843d363fd0088f673076add78013f",
   "implementation_sha": "37e6ed8c4afa00202693cd56919aea78fd4c7af5",
-  "validation_sha": "8a928b5b9e12ec9916329ee533bf67893f5caccd"
+  "validation_sha": "378e6ed66cbf970c915a28724842bde2278673ae"
 }
