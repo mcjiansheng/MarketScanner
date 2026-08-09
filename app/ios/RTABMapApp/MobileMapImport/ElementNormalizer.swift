@@ -7,14 +7,22 @@ import Foundation
 /// Geometry problems never silently drop the element: they become typed
 /// warnings and the raw business fields stay preserved.
 enum ElementNormalizer {
+    enum RectangleSemantics: Equatable {
+        case legacyCenterPivot
+        case topLeftAnchor
+    }
+
     static func normalize(
         floor: String,
         row: Int,
         raw: [String: Any],
         contract: CoordinateContract,
+        rectangleSemantics: RectangleSemantics = .legacyCenterPivot,
+        strict: Bool = true,
         warnings: inout [MapSourceWarning]
-    ) -> PriorMapSourceElement {
+    ) throws -> PriorMapSourceElement {
         let shapeType = String(describing: raw["shapeType"] as? String ?? "Unknown")
+        let role = ElementRoleClassifier.role(for: shapeType)
         let identifier = "f\(floor)-r\(row)"
         let visible = (raw["visible"] as? Bool) ?? true
         let code: String = {
@@ -38,14 +46,29 @@ enum ElementNormalizer {
                     throw MapSourceImportError.invalidGeometry(
                         shapeType: shapeType, reason: "width and height must be positive")
                 }
-                let polygon = SourceGeometry.sourceRectanglePolygon(
-                    xCm: x, yCm: y, widthCm: width, heightCm: height,
-                    rotationDegrees: rotation, contract: contract)
+                let polygon: [[Double]]
+                switch rectangleSemantics {
+                case .legacyCenterPivot:
+                    polygon = SourceGeometry.legacyCenterPivotRectanglePolygon(
+                        xCm: x, yCm: y, widthCm: width, heightCm: height,
+                        rotationDegrees: rotation, contract: contract)
+                case .topLeftAnchor:
+                    polygon = SourceGeometry.sourceRectanglePolygon(
+                        xCm: x, yCm: y, widthCm: width, heightCm: height,
+                        rotationDegrees: rotation, contract: contract)
+                }
                 geometry = ["type": "polygon", "coordinates": polygon]
                 bounds = try SourceGeometry.polygonBounds(polygon).asDictionary
-                let (centerX, centerY) = SourceGeometry.sourcePointToMap(
-                    x + width / 2.0, y + height / 2.0, contract: contract)
-                center = [centerX, centerY]
+                if rectangleSemantics == .topLeftAnchor {
+                    center = SourceGeometry.sourceRectangleCenter(
+                        xCm: x, yCm: y, widthCm: width, heightCm: height,
+                        rotationDegrees: rotation, contract: contract)
+                } else {
+                    let (centerX, centerY) = SourceGeometry.sourcePointToMap(
+                        x + width / 2.0, y + height / 2.0,
+                        contract: contract)
+                    center = [centerX, centerY]
+                }
                 yawRad = SourceGeometry.sourceRotationToYaw(rotation)
             } else if shapeType == "MapCross" {
                 guard let points = raw["points"] as? [Any],
@@ -74,16 +97,27 @@ enum ElementNormalizer {
                     "width_m": 0.0, "height_m": 0.0,
                 ]
                 center = point
-            } else if !MobileElementTypes.supportedTypes.contains(shapeType) {
+            } else if role == .presentationOnly {
                 warnings.append(MapSourceWarning(
-                    code: "unknown_shape_type",
+                    code: "presentation_only_element_ignored",
                     row: row,
                     floor: floor,
                     shapeType: shapeType,
-                    message: "发现未知元素类型 \(shapeType)；原始数据已保留但不会参与定位。"
+                    message: "展示元素 \(shapeType) 仅保留在导入审计中，不参与生产地图。"
+                ))
+            } else if role == .unsupported {
+                warnings.append(MapSourceWarning(
+                    code: "unsupported_element_ignored",
+                    row: row,
+                    floor: floor,
+                    shapeType: shapeType,
+                    message: "不支持的元素类型 \(shapeType) 仅保留在导入审计中。"
                 ))
             }
         } catch let error as MapSourceImportError {
+            if strict && visible && role.isProduction {
+                throw error
+            }
             warnings.append(MapSourceWarning(
                 code: "invalid_geometry",
                 row: row,
@@ -92,6 +126,10 @@ enum ElementNormalizer {
                 message: "元素几何无效：\(error.message)；原始数据已保留。"
             ))
         } catch {
+            if strict && visible && role.isProduction {
+                throw MapSourceImportError.invalidGeometry(
+                    shapeType: shapeType, reason: String(describing: error))
+            }
             warnings.append(MapSourceWarning(
                 code: "invalid_geometry",
                 row: row,
@@ -103,11 +141,11 @@ enum ElementNormalizer {
 
         if !visible {
             warnings.append(MapSourceWarning(
-                code: "hidden_element",
+                code: "hidden_element_ignored",
                 row: row,
                 floor: floor,
                 shapeType: shapeType,
-                message: "元素 visible=false，已保留并从默认定位索引中排除。"
+                message: "元素 visible=false，仅保留在导入审计中并从生产地图排除。"
             ))
         }
 
@@ -121,7 +159,7 @@ enum ElementNormalizer {
             code: code,
             crossCode: String(describing: raw["crossCode"] as? String ?? ""),
             rowFlag: String(describing: raw["rowFlag"] as? String ?? ""),
-            subsection: raw["subsection"] as? String,
+            subsection: raw["subsection"],
             geometry: geometry,
             bounds: bounds,
             centerM: center,
@@ -140,7 +178,7 @@ enum ElementNormalizer {
                 code: element.code,
                 crossCode: element.crossCode,
                 rowFlag: element.rowFlag,
-                subsection: raw["subsection"] as? String,
+                subsection: raw["subsection"],
                 geometry: nil,
                 bounds: nil,
                 centerM: nil,
@@ -155,10 +193,7 @@ enum ElementNormalizer {
         guard let value = raw[key] else {
             throw MapSourceImportError.invalidGeometry(shapeType: shapeType, reason: "\(key) must be numeric")
         }
-        if value is Bool {
-            throw MapSourceImportError.invalidGeometry(shapeType: shapeType, reason: "\(key) must be numeric")
-        }
-        guard let number = asDouble(value), number.isFinite else {
+        guard let number = StrictJSONScalar.number(value) else {
             throw MapSourceImportError.invalidGeometry(shapeType: shapeType, reason: "\(key) must be numeric")
         }
         return number
@@ -178,14 +213,6 @@ enum ElementNormalizer {
     }
 
     static func asDouble(_ value: Any) -> Double? {
-        switch value {
-        case let number as Double: return number
-        case let number as Int: return Double(number)
-        case let number as Int64: return Double(number)
-        case let number as NSNumber:
-            guard CFGetTypeID(number) != CFBooleanGetTypeID() else { return nil }
-            return number.doubleValue
-        default: return nil
-        }
+        return StrictJSONScalar.number(value)
     }
 }

@@ -62,6 +62,16 @@ enum MobileResultLibrary {
         case afterParentFsync
     }
 
+    /// Deterministic host-test synchronization points for the immutable
+    /// result reader. Production leaves the observer nil. These phases make
+    /// post-read/post-hash namespace races reproducible without relying on
+    /// artifact size, scheduler timing or arbitrary async delays.
+    enum ResultReadVerificationPhase: Equatable {
+        case initialManifestAndReceiptBound
+        case artifactHashed(String)
+        case beforeFinalSweep
+    }
+
     enum ResultError: Error, LocalizedError {
         case cannotCreateRoot(String)
         case invalidManifest(String)
@@ -222,6 +232,9 @@ enum MobileResultLibrary {
     /// Host-only fault hook fired immediately before a public operation's
     /// final root/lock authority validation. Production leaves this nil.
     static var processLockValidationObserver: (() throws -> Void)?
+    /// Host-only observer for deterministic read-verification race tests.
+    static var resultReadVerificationObserver:
+        ((ResultReadVerificationPhase) throws -> Void)?
 
     private struct ProcessLockHandle {
         let rootURL: URL
@@ -2967,6 +2980,8 @@ enum MobileResultLibrary {
               receipt.commitGeneration == 1 else {
             throw ResultError.invalidManifest("commit receipt mismatch")
         }
+        try resultReadVerificationObserver?(
+            .initialManifestAndReceiptBound)
         let workbookURL = directory.appendingPathComponent(workbookName)
         // Hash every artifact through one descriptor opened relative to the
         // already-bound result root. Size, hash and final pathname therefore
@@ -2985,12 +3000,14 @@ enum MobileResultLibrary {
                 throw ResultError.artifactCorrupt(name)
             }
             verifiedArtifactMetadata[name] = actual.metadata
+            try resultReadVerificationObserver?(.artifactHashed(name))
         }
 
         // A generation-wide final sweep catches replacement or same-inode
         // mutation after an earlier artifact was hashed. The exact inventory,
         // manifest, receipt, every artifact and the root pathname must all
         // remain bound until this method returns success.
+        try resultReadVerificationObserver?(.beforeFinalSweep)
         let expectedNames = artifactFiles.union([
             manifestFileName, commitReceiptFileName,
         ])

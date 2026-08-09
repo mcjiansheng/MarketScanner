@@ -769,15 +769,32 @@ function updateSingleAlignmentState() {
     : "";
 }
 
+function updatePriorLegacyState() {
+  const legacy = $("#prior-legacy-element-only").checked;
+  const storeID = $("#prior-store-id");
+  const mapName = $("#prior-name");
+  storeID.required = legacy;
+  mapName.required = legacy;
+  $("#prior-store-id-label").textContent = legacy ? "门店 ID（旧版必填）" : "门店 ID 断言（可选）";
+  $("#prior-name-label").textContent = legacy ? "地图名称（旧版必填）" : "地图名称断言（可选）";
+  storeID.placeholder = legacy ? "例如：STORE-6599" : "默认读取 Basic Info.storeCode";
+  mapName.placeholder = legacy ? "例如：6599 门店货架图" : "默认读取 Basic Info.map_name";
+  $("#prior-legacy-hint").textContent = legacy
+    ? "已开启旧版兼容：只读取 Element Info；门店 ID 和地图名称由操作者提供并写入地图包，源 Excel 仍保持只读。"
+    : "默认关闭并按正式模板严格校验。旧版兼容模式必须由操作者明确开启，并填写真实门店 ID 和地图名称。";
+}
+
 function activeRequest() {
   if (activeMode === "prior") {
     const mapName = $("#prior-name").value;
+    const storeID = $("#prior-store-id").value;
     return {
       kind: "prior_map",
       xlsx: $("#prior-xlsx").value.trim(),
       output: $("#prior-output").value.trim(),
-      store_id: $("#prior-store-id").value,
+      store_id: storeID === "" ? null : storeID,
       name: mapName === "" ? null : mapName,
+      allow_legacy_element_only: $("#prior-legacy-element-only").checked,
     };
   }
   if (activeMode === "single") {
@@ -827,11 +844,17 @@ async function runActiveJob() {
   try {
     let payload = activeRequest();
     if (payload.kind === "prior_map") {
-      if (!payload.store_id || payload.store_id.trim() !== payload.store_id) {
-        throw new Error("请填写不带首尾空格的真实门店 ID");
+      if (payload.store_id !== null && payload.store_id.trim() !== payload.store_id) {
+        throw new Error("门店 ID 断言不能包含首尾空格");
       }
       if (payload.name !== null && payload.name.trim() !== payload.name) {
         throw new Error("地图名称不能包含首尾空格");
+      }
+      if (payload.allow_legacy_element_only && payload.store_id === null) {
+        throw new Error("旧版仅 Element Info 导入必须填写真实门店 ID");
+      }
+      if (payload.allow_legacy_element_only && payload.name === null) {
+        throw new Error("旧版仅 Element Info 导入必须填写地图名称");
       }
     }
     let requestKey = activeRequestKey(payload);
@@ -992,7 +1015,7 @@ async function renderJob(job) {
     clearNode(inspection);
     appendText(inspection, "div", `地图 ID：${manifest.prior_map_id || "未知"}`, "complete");
     appendText(inspection, "div", `源文件 SHA-256：${manifest.source_sha256 || "缺失"}`);
-    appendText(inspection, "div", `楼层：${floors}；货架 ${stats.MapShelf || 0}，柜台 ${stats.MapTable || 0}，柱子 ${stats.MapPillar || 0}，道路 ${stats.MapCross || 0}`);
+    appendText(inspection, "div", `楼层：${floors}；货架 ${Number(manifest.shelf_count ?? stats.MapShelf ?? 0).toLocaleString()}，固定结构 ${Number(manifest.fixed_structure_count ?? 0).toLocaleString()}，道路 ${Number(manifest.road_element_count ?? 0).toLocaleString()}，忽略展示元素 ${Number(manifest.presentation_ignored_count ?? 0).toLocaleString()}`);
     appendText(inspection, "div", "阶段二实验能力：已启用有界 LiDAR 结构匹配；正式真机场测和大范围自动恢复尚未完成。", "warning");
     return;
   }
@@ -3490,6 +3513,7 @@ function bindEvents() {
   $("#add-device").addEventListener("click", addDevice);
   $("#add-stage").addEventListener("click", addStage);
   $("#option-offline-optimize").addEventListener("change", updateSingleAlignmentState);
+  $("#prior-legacy-element-only").addEventListener("change", updatePriorLegacyState);
   $("#show-surface").addEventListener("change", (event) => { viewer3d.showSurface = event.target.checked; drawScene(); });
   $("#show-cloud").addEventListener("change", (event) => { viewer3d.showCloud = event.target.checked; drawScene(); });
   $("#show-trajectory").addEventListener("change", (event) => { viewer3d.showTrajectory = event.target.checked; drawScene(); });
@@ -3588,6 +3612,7 @@ function bindEvents() {
 
 async function initializeApplication() {
   bindEvents();
+  updatePriorLegacyState();
   try {
     await bootstrapSession();
     await renderRuntimeMode();

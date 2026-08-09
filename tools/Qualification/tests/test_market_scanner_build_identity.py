@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+import xml.etree.ElementTree as ET
 
 from tools.Qualification import market_scanner_build_identity as identity
 
@@ -131,6 +132,32 @@ class MarketScannerBuildIdentityTests(unittest.TestCase):
         unknown = copy.deepcopy(valid)
         unknown["unexpected"] = True
         self.assert_rejected(lambda: identity.validate_fields(unknown))
+
+    def test_xcode_debug_launch_omits_identity_without_weakening_release(self) -> None:
+        scheme_path = (
+            ROOT
+            / "app/ios/RTABMapApp.xcodeproj/xcshareddata/xcschemes/RTABMapApp.xcscheme"
+        )
+        scheme = ET.parse(scheme_path).getroot()
+        for action in ("TestAction", "LaunchAction", "AnalyzeAction"):
+            node = scheme.find(action)
+            self.assertIsNotNone(node)
+            self.assertEqual(node.attrib.get("buildConfiguration"), "Debug")
+        for action in ("ProfileAction", "ArchiveAction"):
+            node = scheme.find(action)
+            self.assertIsNotNone(node)
+            self.assertEqual(node.attrib.get("buildConfiguration"), "Release")
+
+        project = (
+            ROOT / "app/ios/RTABMapApp.xcodeproj/project.pbxproj"
+        ).read_text(encoding="utf-8")
+        self.assertIn('if [ \\"$CONFIGURATION\\" = \\"Debug\\" ]', project)
+        self.assertIn('rm -f \\"$OUT\\"', project)
+        self.assertIn("production processing remains ineligible", project)
+        self.assertNotIn(
+            "market_scanner_build_identity.py\\\" emit --allow-dirty",
+            project,
+        )
 
     @unittest.skipUnless(shutil.which("xcrun"), "Swift host requires Xcode")
     def test_swift_host_matches_governance_and_pre_rename_freeze_contracts(self) -> None:

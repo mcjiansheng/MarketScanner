@@ -39,6 +39,7 @@ enum JSONMapSourceImporter {
         var storeId: String?
         var mapName: String?
         var coordinateContract: CoordinateContract?
+        var sourceMapInfo: SourceMapInfo?
         var elements: [PriorMapSourceElement]
         var warnings: [MapSourceWarning]
         var sourceIdentity: MapSourceIdentity?
@@ -48,10 +49,13 @@ enum JSONMapSourceImporter {
         "format", "version", "store_id", "map_name",
         "coordinate_contract", "elements",
     ]
+    private static let v3RequiredTopLevel: Set<String> = v2RequiredTopLevel.union([
+        "source_map_info", "role_contract",
+    ])
     /// Top-level keys known across both document versions (v2 snake_case
     /// and legacy v1 camelCase); anything else is preserved in
     /// `source["extensions"]` with a warning.
-    static let knownTopLevel: Set<String> = v2RequiredTopLevel.union([
+    static let knownTopLevel: Set<String> = v3RequiredTopLevel.union([
         "storeId", "mapName", "coordinateContract",
         "source", "warnings",
     ])
@@ -92,6 +96,8 @@ enum JSONMapSourceImporter {
             throw MapSourceImportError.invalidJSON(detail: "缺少或错误的 version 字段。")
         }
         switch version {
+        case 3:
+            return try decodeV3(root: root)
         case 2:
             return try decodeV2(root: root)
         case 1:
@@ -100,6 +106,92 @@ enum JSONMapSourceImporter {
         default:
             throw MapSourceImportError.invalidJSON(detail: "不支持的 version 字段。")
         }
+    }
+
+    // MARK: - Canonical v3
+
+    private static func decodeV3(root: [String: Any]) throws -> ImportOutcome {
+        for key in v3RequiredTopLevel where root[key] == nil {
+            throw MapSourceImportError.invalidJSON(
+                detail: "缺少必需顶层字段 \(key)。")
+        }
+        guard let storeID = root["store_id"] as? String,
+              let mapName = root["map_name"] as? String else {
+            throw MapSourceImportError.invalidJSON(
+                detail: "store_id/map_name 必须是字符串。")
+        }
+        try MapSourceBusinessIdentityPolicy.validate(
+            storeID: storeID, mapName: mapName)
+        let contract = try decodeCoordinateContract(root["coordinate_contract"])
+        guard contract == .topLeft,
+              let coordinate = root["coordinate_contract"] as? [String: Any],
+              coordinate["rectangle_anchor"] as? String == "top_left",
+              coordinate["rotation_pivot"] as? String == "top_left_anchor" else {
+            throw MapSourceImportError.invalidJSON(
+                detail: "canonical v3 必须声明 top-left anchor/pivot 坐标合同。")
+        }
+        guard let role = root["role_contract"] as? [String: Any],
+              StrictJSONScalar.integer(role["version"])
+                == ElementRoleClassifier.contractVersion,
+              role["presentation_policy"] as? String
+                == "excluded_from_production_elements" else {
+            throw MapSourceImportError.invalidJSON(
+                detail: "canonical v3 role_contract 无效。")
+        }
+        let sourceMapInfo = try decodeSourceMapInfo(root["source_map_info"])
+        guard sourceMapInfo.storeCode == storeID,
+              sourceMapInfo.mapName == mapName else {
+            throw MapSourceImportError.invalidJSON(
+                detail: "source_map_info 与文档业务身份不一致。")
+        }
+        var warnings: [MapSourceWarning] = []
+        let elements = try decodeElements(
+            root: root, extensions: [:], warnings: &warnings,
+            sourceRowRequired: false, sourceRequired: false)
+        return ImportOutcome(
+            documentVersion: 3,
+            storeId: storeID,
+            mapName: mapName,
+            coordinateContract: contract,
+            sourceMapInfo: sourceMapInfo,
+            elements: elements,
+            warnings: warnings,
+            sourceIdentity: nil)
+    }
+
+    private static func decodeSourceMapInfo(_ raw: Any?) throws -> SourceMapInfo {
+        guard let object = raw as? [String: Any],
+              let mapName = object["map_name"] as? String,
+              let storeCode = object["store_code"] as? String,
+              let width = StrictJSONScalar.number(object["width_cm"]), width > 0,
+              let height = StrictJSONScalar.number(object["height_cm"]), height > 0 else {
+            throw MapSourceImportError.invalidJSON(
+                detail: "source_map_info 字段无效。")
+        }
+        let rawScale = object["scale"]
+        let scale: Double?
+        if rawScale == nil || rawScale is NSNull {
+            scale = nil
+        } else if let number = StrictJSONScalar.number(rawScale), number > 0 {
+            scale = number
+        } else {
+            throw MapSourceImportError.invalidJSON(
+                detail: "source_map_info.scale 必须为空或正有限数值。")
+        }
+        let info = SourceMapInfo(
+            mapName: mapName, storeCode: storeCode,
+            widthCm: width, heightCm: height, scale: scale)
+        if let declaredCanvas = object["source_canvas"] as? [String: Any] {
+            let expected = info.sourceCanvasBounds.asDictionary
+            for key in ["min_x_m", "min_y_m", "max_x_m", "max_y_m"] {
+                guard let actual = StrictJSONScalar.number(declaredCanvas[key]),
+                      let wanted = expected[key], abs(actual - wanted) <= 1.0e-6 else {
+                    throw MapSourceImportError.invalidJSON(
+                        detail: "source_map_info.source_canvas 与 width/height 不一致。")
+                }
+            }
+        }
+        return info
     }
 
     // MARK: - Canonical v2
@@ -147,6 +239,7 @@ enum JSONMapSourceImporter {
             storeId: storeID,
             mapName: mapName,
             coordinateContract: contract,
+            sourceMapInfo: nil,
             elements: elements,
             warnings: warnings,
             sourceIdentity: sourceIdentity)
@@ -317,7 +410,8 @@ enum JSONMapSourceImporter {
             code: code,
             crossCode: element["cross_code"] as? String ?? "",
             rowFlag: element["row_flag"] as? String ?? "",
-            subsection: element["subsection"] as? String,
+            subsection: element["subsection"] is NSNull
+                ? nil : element["subsection"],
             geometry: geometry,
             bounds: bounds,
             centerM: center,
@@ -409,6 +503,7 @@ enum LegacyV1JSONMapSourceDecoder {
             storeId: nil,
             mapName: nil,
             coordinateContract: nil,
+            sourceMapInfo: nil,
             elements: elements,
             warnings: warnings,
             sourceIdentity: sourceIdentity)

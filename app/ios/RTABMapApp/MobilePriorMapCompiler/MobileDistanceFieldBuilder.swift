@@ -9,11 +9,21 @@ enum MobileDistanceFieldBuilder {
     static let versionValue = 1
     static let defaultResolutionsM: [Double] = [0.40, 0.20, 0.10]
     static let defaultTruncationM: Double = 2.0
-    static let structureTypes = MobileElementTypes.structureTypes
+    static let maximumDimensionCells = 20_000
+    static let maximumCellsPerLevel = 8_000_000
+    static let maximumTotalCells = 16_000_000
+    static let maximumSeedSamplesPerSegment = 100_000
 
     struct Segment {
         var start: (Double, Double)
         var end: (Double, Double)
+    }
+
+    private struct Grid {
+        var originX: Double
+        var originY: Double
+        var width: Int
+        var height: Int
     }
 
     /// Builds the distance-fields artifact for the given elements and
@@ -25,25 +35,56 @@ enum MobileDistanceFieldBuilder {
         truncationM: Double = defaultTruncationM
     ) throws -> [String: Any] {
         guard !resolutionsM.isEmpty,
-              resolutionsM.allSatisfy({ $0 > 0 }),
+              resolutionsM.allSatisfy({ $0.isFinite && $0 > 0 }),
+              truncationM.isFinite,
               truncationM > 0, truncationM <= 2.55 else {
             throw MapSourceImportError.invalidGeometry(
                 shapeType: "distance_field",
                 reason: "resolutions/truncation are invalid")
         }
+        var gridsByFloor: [String: [Grid]] = [:]
+        var totalCells: Int64 = 0
+        for floor in floors {
+            guard let floorID = floor["id"] as? String, !floorID.isEmpty,
+                  gridsByFloor[floorID] == nil,
+                  let bounds = floor["bounds"] as? [String: Any] else {
+                throw MapSourceImportError.invalidGeometry(
+                    shapeType: "distance_field",
+                    reason: "floor identity/bounds are invalid or duplicated")
+            }
+            var floorGrids: [Grid] = []
+            for resolution in resolutionsM {
+                let grid = try validatedGrid(
+                    bounds: bounds,
+                    resolution: resolution,
+                    truncationM: truncationM)
+                totalCells += Int64(grid.width) * Int64(grid.height)
+                guard totalCells <= Int64(maximumTotalCells) else {
+                    throw MapSourceImportError.invalidGeometry(
+                        shapeType: "distance_field",
+                        reason: "total grid cell budget exceeds \(maximumTotalCells)")
+                }
+                floorGrids.append(grid)
+            }
+            gridsByFloor[floorID] = floorGrids
+        }
         let segmentsByFloor = segments(elements)
         var payloadFloors: [String: Any] = [:]
         for floor in floors {
-            guard let floorID = floor["id"] as? String else { continue }
-            guard let bounds = floor["bounds"] as? [String: Any] else { continue }
+            guard let floorID = floor["id"] as? String,
+                  let floorGrids = gridsByFloor[floorID] else {
+                throw MapSourceImportError.invalidGeometry(
+                    shapeType: "distance_field",
+                    reason: "preflight grid is missing")
+            }
             var levels: [[String: Any]] = []
-            for resolution in resolutionsM {
+            for (resolution, grid) in zip(resolutionsM, floorGrids) {
                 levels.append(
                     try level(
                         segments: segmentsByFloor[floorID] ?? [],
-                        bounds: bounds,
                         resolution: resolution,
-                        truncationM: truncationM
+                        truncationM: truncationM,
+                        grid: grid
                     )
                 )
             }
@@ -62,8 +103,8 @@ enum MobileDistanceFieldBuilder {
     static func segments(_ elements: [PriorMapSourceElement]) -> [String: [Segment]] {
         var result: [String: [Segment]] = [:]
         for element in elements {
-            guard structureTypes.contains(element.shapeType),
-                  element.visible,
+            let role = ElementRoleClassifier.role(for: element.shapeType)
+            guard (role == .shelf || role == .fixedStructure), element.visible,
                   let geometry = element.geometry,
                   let coordinates = geometry["coordinates"] as? [[Double]],
                   coordinates.count >= 2
@@ -91,13 +132,21 @@ enum MobileDistanceFieldBuilder {
         resolution: Double,
         width: Int,
         height: Int
-    ) -> Set<Int64> {
+    ) throws -> Set<Int64> {
         var seeds = Set<Int64>()
         for segment in segments {
             let dx = segment.end.0 - segment.start.0
             let dy = segment.end.1 - segment.start.1
             let length = hypot(dx, dy)
-            let steps = max(1, Int(ceil(length / max(resolution * 0.45, 0.01))))
+            let rawSteps = ceil(length / max(resolution * 0.45, 0.01))
+            guard length.isFinite, rawSteps.isFinite,
+                  rawSteps <= Double(maximumSeedSamplesPerSegment),
+                  let convertedSteps = Int(exactly: rawSteps) else {
+                throw MapSourceImportError.invalidGeometry(
+                    shapeType: "distance_field",
+                    reason: "segment seed sampling exceeds the resource budget")
+            }
+            let steps = max(1, convertedSteps)
             for index in 0...steps {
                 let ratio = Double(index) / Double(steps)
                 let x = segment.start.0 + dx * ratio
@@ -145,25 +194,54 @@ enum MobileDistanceFieldBuilder {
         return rows
     }
 
-    private static func level(
-        segments: [Segment],
+    private static func validatedGrid(
         bounds: [String: Any],
         resolution: Double,
         truncationM: Double
-    ) throws -> [String: Any] {
-        let minX = (bounds["min_x_m"] as? Double) ?? 0
-        let minY = (bounds["min_y_m"] as? Double) ?? 0
-        let maxX = (bounds["max_x_m"] as? Double) ?? 0
-        let maxY = (bounds["max_y_m"] as? Double) ?? 0
+    ) throws -> Grid {
+        guard let minX = StrictJSONScalar.number(bounds["min_x_m"]),
+              let minY = StrictJSONScalar.number(bounds["min_y_m"]),
+              let maxX = StrictJSONScalar.number(bounds["max_x_m"]),
+              let maxY = StrictJSONScalar.number(bounds["max_y_m"]),
+              minX <= maxX, minY <= maxY else {
+            throw MapSourceImportError.invalidGeometry(
+                shapeType: "distance_field", reason: "bounds are invalid")
+        }
         let originX = floor((minX - truncationM) / resolution) * resolution
         let originY = floor((minY - truncationM) / resolution) * resolution
         let maximumX = ceil((maxX + truncationM) / resolution) * resolution
         let maximumY = ceil((maxY + truncationM) / resolution) * resolution
-        let width = max(1, Int(((maximumX - originX) / resolution).rounded()) + 1)
-        let height = max(1, Int(((maximumY - originY) / resolution).rounded()) + 1)
+        let rawWidth = ((maximumX - originX) / resolution).rounded() + 1
+        let rawHeight = ((maximumY - originY) / resolution).rounded() + 1
+        guard originX.isFinite, originY.isFinite,
+              maximumX.isFinite, maximumY.isFinite,
+              rawWidth.isFinite, rawHeight.isFinite,
+              rawWidth >= 1, rawHeight >= 1,
+              rawWidth <= Double(maximumDimensionCells),
+              rawHeight <= Double(maximumDimensionCells),
+              let width = Int(exactly: rawWidth),
+              let height = Int(exactly: rawHeight),
+              Int64(width) * Int64(height) <= Int64(maximumCellsPerLevel) else {
+            throw MapSourceImportError.invalidGeometry(
+                shapeType: "distance_field",
+                reason: "grid exceeds dimension/cell budget")
+        }
+        return Grid(originX: originX, originY: originY, width: width, height: height)
+    }
+
+    private static func level(
+        segments: [Segment],
+        resolution: Double,
+        truncationM: Double,
+        grid: Grid
+    ) throws -> [String: Any] {
+        let originX = grid.originX
+        let originY = grid.originY
+        let width = grid.width
+        let height = grid.height
         let truncationCm = Int((truncationM * 100.0).rounded())
 
-        let seeds = seedCells(
+        let seeds = try seedCells(
             segments: segments, originX: originX, originY: originY,
             resolution: resolution, width: width, height: height)
         var distances: [Int64: Double] = [:]

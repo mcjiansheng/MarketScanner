@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import math
 import os
 import re
@@ -12,14 +13,17 @@ import time
 import unittest
 import zipfile
 from pathlib import Path
+from unittest import mock
 
 from tools.PriorMap.coordinate_system import (
     source_point_to_map,
+    source_rectangle_center,
     source_rectangle_polygon,
     source_rotation_to_yaw,
 )
 from tools.PriorMap.distance_field import build_distance_fields, decode_level
 from tools.PriorMap.prior_map_schema import build_package_manifest, validate_package
+from tools.PriorMap.render_prior_map import render_package
 from tools.PriorMap.replay_localization import replay
 from tools.PriorMap.replay_stage2 import (
     Pose as Stage2Pose,
@@ -28,24 +32,97 @@ from tools.PriorMap.replay_stage2 import (
 )
 from tools.PriorMap.spatial_index import PriorMapSpatialIndex
 from tools.PriorMap.stage1_localizer import Pose2D, StageOneLocalizer
-from tools.PriorMap.xlsx_to_prior_map import _polyline_abscissa, convert_workbook
+from tools.PriorMap.xlsx_to_prior_map import (
+    ConversionError,
+    _canonical_business_sha256,
+    _polyline_abscissa,
+    _spatial_index,
+    convert_workbook,
+)
+from tools.PriorMap import xlsx_reader as xlsx_reader_module
+from tools.PriorMap.xlsx_reader import BasicMapInfo, WorkbookError, read_workbook
 
 
-def write_workbook(path: Path, rows: list[tuple[str, str]]) -> None:
-    strings = ["floor", "element"]
-    for floor, element in rows:
-        strings.extend((floor, element))
-    shared = "".join(f"<si><t>{value.replace('&', '&amp;').replace('<', '&lt;')}</t></si>" for value in strings)
-    row_xml = [
-        '<row r="1"><c r="A1" t="s"><v>0</v></c><c r="B1" t="s"><v>1</v></c></row>'
-    ]
-    for index, _row in enumerate(rows, start=2):
-        string_index = 2 + (index - 2) * 2
-        row_xml.append(
-            f'<row r="{index}"><c r="A{index}" t="s"><v>{string_index}</v></c>'
-            f'<c r="B{index}" t="s"><v>{string_index + 1}</v></c></row>'
+def write_workbook(
+    path: Path,
+    rows: list[tuple[str, str]],
+    *,
+    basic_info: dict[str, object] | None = None,
+    shelf_rows: list[list[object]] | None = None,
+    include_basic: bool = True,
+) -> None:
+    """Write a self-contained fixture workbook for the current contract.
+
+    ``shelf_rows=None`` omits the legacy audit-only worksheet.  Setting
+    ``include_basic=False`` is reserved for explicit legacy importer tests.
+    """
+
+    if basic_info is None:
+        basic_info = {
+            "map_name": "fixture",
+            "width": 2000,
+            "height": 1000,
+            "storeCode": "s1",
+            "scale": 20,
+        }
+    strings: list[str] = []
+
+    def shared_index(value: object) -> int:
+        strings.append(str(value))
+        return len(strings) - 1
+
+    def sheet_xml(values: list[list[object]]) -> str:
+        xml_rows: list[str] = []
+        for row_index, values_row in enumerate(values, start=1):
+            cells: list[str] = []
+            for column_index, value in enumerate(values_row, start=1):
+                number = column_index
+                letters = ""
+                while number:
+                    number, remainder = divmod(number - 1, 26)
+                    letters = chr(ord("A") + remainder) + letters
+                cells.append(
+                    f'<c r="{letters}{row_index}" t="s"><v>{shared_index(value)}</v></c>'
+                )
+            xml_rows.append(f'<row r="{row_index}">{"".join(cells)}</row>')
+        return (
+            '<?xml version="1.0"?><worksheet '
+            'xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+            f'<sheetData>{"".join(xml_rows)}</sheetData></worksheet>'
         )
+
+    sheets: list[tuple[str, str]] = []
+    if include_basic:
+        basic_headers = list(basic_info)
+        sheets.append(
+            (
+                "Basic Info",
+                sheet_xml(
+                    [basic_headers, [basic_info[name] for name in basic_headers]]
+                ),
+            )
+        )
+    if shelf_rows is not None:
+        sheets.append(("Shelf Info", sheet_xml(shelf_rows)))
+    sheets.append(
+        (
+            "Element Info",
+            sheet_xml([["floor", "element"], *[[floor, element] for floor, element in rows]]),
+        )
+    )
+    escaped_strings = "".join(
+        "<si><t>"
+        + value.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        + "</t></si>"
+        for value in strings
+    )
     with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        overrides = "".join(
+            '<Override PartName="/xl/worksheets/sheet{index}.xml" '
+            'ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+            .format(index=index)
+            for index in range(1, len(sheets) + 1)
+        )
         archive.writestr(
             "[Content_Types].xml",
             '<?xml version="1.0"?>'
@@ -53,7 +130,8 @@ def write_workbook(path: Path, rows: list[tuple[str, str]]) -> None:
             '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
             '<Default Extension="xml" ContentType="application/xml"/>'
             '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
-            '<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+            + overrides
+            +
             '<Override PartName="/xl/sharedStrings.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml"/>'
             "</Types>",
         )
@@ -69,24 +147,47 @@ def write_workbook(path: Path, rows: list[tuple[str, str]]) -> None:
             '<?xml version="1.0"?>'
             '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
             'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
-            '<sheets><sheet name="Element Info" sheetId="1" r:id="rId1"/></sheets></workbook>',
+            '<sheets>'
+            + "".join(
+                f'<sheet name="{name}" sheetId="{index}" r:id="rId{index}"/>'
+                for index, (name, _xml) in enumerate(sheets, start=1)
+            )
+            + '</sheets></workbook>',
         )
         archive.writestr(
             "xl/_rels/workbook.xml.rels",
             '<?xml version="1.0"?>'
             '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
-            '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>'
+            + "".join(
+                '<Relationship Id="rId{index}" '
+                'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" '
+                'Target="worksheets/sheet{index}.xml"/>'.format(index=index)
+                for index in range(1, len(sheets) + 1)
+            )
+            +
             "</Relationships>",
         )
         archive.writestr(
             "xl/sharedStrings.xml",
-            f'<?xml version="1.0"?><sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="{len(strings)}" uniqueCount="{len(strings)}">{shared}</sst>',
+            f'<?xml version="1.0"?><sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="{len(strings)}" uniqueCount="{len(strings)}">{escaped_strings}</sst>',
         )
-        archive.writestr(
-            "xl/worksheets/sheet1.xml",
-            '<?xml version="1.0"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
-            f"<sheetData>{''.join(row_xml)}</sheetData></worksheet>",
-        )
+        for index, (_name, xml) in enumerate(sheets, start=1):
+            archive.writestr(f"xl/worksheets/sheet{index}.xml", xml)
+
+
+def rewrite_xlsx_member(
+    source: Path,
+    target: Path,
+    member: str,
+    transform: object,
+) -> None:
+    """Copy an XLSX fixture while deterministically rewriting one member."""
+
+    with zipfile.ZipFile(source) as archive:
+        entries = [(info, archive.read(info.filename)) for info in archive.infolist()]
+    with zipfile.ZipFile(target, "w") as archive:
+        for info, data in entries:
+            archive.writestr(info, transform(data) if info.filename == member else data)
 
 
 def _canonical_json_elements(business_elements: list) -> list[dict]:
@@ -95,9 +196,10 @@ def _canonical_json_elements(business_elements: list) -> list[dict]:
     three-format parity holds. Geometry fields are computed with the same
     source-to-map contract used by XLSX/CSV import (top-left origin)."""
     from tools.PriorMap.coordinate_system import (
+        legacy_center_pivot_rectangle_center,
+        legacy_center_pivot_rectangle_polygon,
         polygon_bounds,
         source_point_to_map,
-        source_rectangle_polygon,
     )
 
     elements: list[dict] = []
@@ -109,15 +211,14 @@ def _canonical_json_elements(business_elements: list) -> list[dict]:
         center: list | None = None
         yaw: float | None = None
         if shape_type in {"MapShelf", "MapTable", "MapPillar", "MapTableFeature"}:
-            polygon = source_rectangle_polygon(
+            polygon = legacy_center_pivot_rectangle_polygon(
                 value["x"], value["y"], value["width"], value["height"],
                 float(value.get("rotation", 0)),
             )
             geometry = {"type": "polygon", "coordinates": polygon}
             bounds = polygon_bounds(polygon).as_dict()
-            center = list(source_point_to_map(
-                value["x"] + value["width"] / 2.0,
-                value["y"] + value["height"] / 2.0,
+            center = list(legacy_center_pivot_rectangle_center(
+                value["x"], value["y"], value["width"], value["height"],
             ))
             yaw = round(-float(value.get("rotation", 0)) * math.pi / 180.0, 9)
         elif shape_type == "MapCross":
@@ -313,9 +414,7 @@ def fixture_rows() -> list[tuple[str, str]]:
             },
         ),
     ]
-    rows = [(floor, json.dumps(value, ensure_ascii=False)) for floor, value in values]
-    rows.append(("2", "{bad json"))
-    return rows
+    return [(floor, json.dumps(value, ensure_ascii=False)) for floor, value in values]
 
 
 class CoordinateSystemTests(unittest.TestCase):
@@ -325,8 +424,591 @@ class CoordinateSystemTests(unittest.TestCase):
         polygon = source_rectangle_polygon(100, 200, 300, 100, 90)
         self.assertEqual(
             {(round(point[0], 2), round(point[1], 2)) for point in polygon},
-            {(2.0, -1.0), (3.0, -1.0), (3.0, -4.0), (2.0, -4.0)},
+            {(1.0, -2.0), (1.0, -5.0), (0.0, -5.0), (0.0, -2.0)},
         )
+        self.assertEqual(source_rectangle_center(100, 200, 300, 100, 90), (0.5, -3.5))
+        self.assertIn([1.0, -2.0], polygon)
+
+    def test_top_left_anchor_is_frozen_for_cardinal_and_arbitrary_rotations(self) -> None:
+        anchor = list(source_point_to_map(4193, 390))
+        for rotation in (0, 90, 180, 270, 45):
+            with self.subTest(rotation=rotation):
+                polygon = source_rectangle_polygon(4193, 390, 1163, 106, rotation)
+                self.assertEqual(
+                    polygon[0],
+                    anchor,
+                    "canonical P0 must remain the top-left rotation anchor",
+                )
+                centroid = (
+                    round(sum(point[0] for point in polygon) / 4.0, 6),
+                    round(sum(point[1] for point in polygon) / 4.0, 6),
+                )
+                center = source_rectangle_center(4193, 390, 1163, 106, rotation)
+                self.assertAlmostEqual(center[0], centroid[0], places=5)
+                self.assertAlmostEqual(center[1], centroid[1], places=5)
+
+
+class StandardWorkbookContractTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.rows = [
+            (
+                "1",
+                json.dumps(
+                    {
+                        "shapeType": "MapShelf",
+                        "x": 100,
+                        "y": 100,
+                        "width": 200,
+                        "height": 50,
+                        "rotation": 0,
+                        "code": "S1",
+                        "visible": True,
+                    }
+                ),
+            )
+        ]
+
+    def tearDown(self) -> None:
+        self.temp.cleanup()
+
+    def test_basic_info_is_authoritative_and_shelf_info_is_audit_only(self) -> None:
+        workbook = self.root / "standard.xlsx"
+        write_workbook(
+            workbook,
+            self.rows,
+            basic_info={
+                "map_name": "Piaseczno",
+                "width": 13129,
+                "height": 8770,
+                "storeCode": "CAPL.2794",
+                "scale": 20,
+            },
+            shelf_rows=[["code"], ["legacy-1"], ["legacy-2"]],
+        )
+        result = read_workbook(workbook)
+        self.assertEqual(result.basic_info.map_name, "Piaseczno")
+        self.assertEqual(result.basic_info.store_code, "CAPL.2794")
+        self.assertEqual(result.basic_info.width_cm, 13129)
+        self.assertEqual(result.basic_info.height_cm, 8770)
+        self.assertEqual(result.basic_info.source_scale, 20)
+        self.assertTrue(result.legacy_shelf_info.present)
+        self.assertEqual(result.legacy_shelf_info.row_count, 2)
+        with self.assertRaises(ConversionError):
+            convert_workbook(workbook, self.root / "bad-store", store_id="OTHER")
+        with self.assertRaises(ConversionError):
+            convert_workbook(workbook, self.root / "bad-name", map_name="Other")
+
+    def test_missing_basic_info_requires_explicit_legacy_mode(self) -> None:
+        workbook = self.root / "legacy.xlsx"
+        write_workbook(workbook, self.rows, include_basic=False)
+        with self.assertRaises(WorkbookError):
+            read_workbook(workbook)
+        package = convert_workbook(
+            workbook,
+            self.root / "legacy-package",
+            store_id="s1",
+            allow_legacy_element_only=True,
+        )
+        manifest = json.loads((package / "manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual(manifest["version"], 1)
+        self.assertNotIn("source_canvas", manifest)
+        self.assertNotIn("source_map_info", manifest)
+        shelves = json.loads((package / "shelves.json").read_text(encoding="utf-8"))
+        self.assertEqual(shelves["version"], 1)
+        self.assertNotIn("shelf_segments", shelves)
+        self.assertTrue(validate_package(package)["valid"])
+
+    def test_formal_workbook_rejects_every_malformed_element_row(self) -> None:
+        workbook = self.root / "malformed-formal.xlsx"
+        write_workbook(workbook, [*self.rows, ("1", "{bad json")])
+        parsed = read_workbook(workbook)
+        self.assertEqual(len(parsed.malformed_rows), 1)
+        output = self.root / "malformed-formal-output"
+        with self.assertRaisesRegex(
+            ConversionError,
+            "reject every malformed Element Info row",
+        ):
+            convert_workbook(workbook, output)
+        self.assertFalse(output.exists())
+
+    def test_duplicate_official_and_hash_derived_business_identity_are_blockers(
+        self,
+    ) -> None:
+        official = self.root / "duplicate-official.xlsx"
+        write_workbook(
+            official,
+            [
+                (
+                    "1",
+                    json.dumps(
+                        {
+                            "shapeType": "MapShelf",
+                            "sourceId": "duplicate-shelf",
+                            "x": 100,
+                            "y": 100,
+                            "width": 200,
+                            "height": 50,
+                            "code": "S1",
+                        }
+                    ),
+                ),
+                (
+                    "1",
+                    json.dumps(
+                        {
+                            "shapeType": "MapShelf",
+                            "sourceId": "duplicate-shelf",
+                            "x": 500,
+                            "y": 100,
+                            "width": 200,
+                            "height": 50,
+                            "code": "S2",
+                        }
+                    ),
+                ),
+            ],
+        )
+        with self.assertRaisesRegex(ConversionError, "Duplicate business element identity"):
+            convert_workbook(official, self.root / "duplicate-official-output")
+
+        hash_derived = self.root / "duplicate-hash-derived.xlsx"
+        duplicate_row = json.dumps(
+            {
+                "shapeType": "MapShelf",
+                "x": 100,
+                "y": 100,
+                "width": 200,
+                "height": 50,
+                "code": "S1",
+            }
+        )
+        write_workbook(hash_derived, [("1", duplicate_row), ("1", duplicate_row)])
+        with self.assertRaisesRegex(ConversionError, "Duplicate business element identity"):
+            convert_workbook(hash_derived, self.root / "duplicate-hash-output")
+
+    def test_optional_scale_is_metadata_only_and_duplicate_basic_header_is_rejected(
+        self,
+    ) -> None:
+        no_scale = self.root / "no-scale.xlsx"
+        scale_20 = self.root / "scale-20.xlsx"
+        scale_40 = self.root / "scale-40.xlsx"
+        common = {
+            "map_name": "fixture",
+            "width": 2000,
+            "height": 1000,
+            "storeCode": "s1",
+        }
+        write_workbook(no_scale, self.rows, basic_info=common)
+        write_workbook(scale_20, self.rows, basic_info={**common, "scale": 20})
+        write_workbook(scale_40, self.rows, basic_info={**common, "scale": 40})
+
+        self.assertIsNone(read_workbook(no_scale).basic_info.source_scale)
+        packages = [
+            convert_workbook(no_scale, self.root / "package-no-scale"),
+            convert_workbook(scale_20, self.root / "package-scale-20"),
+            convert_workbook(scale_40, self.root / "package-scale-40"),
+        ]
+        manifests = [
+            json.loads((package / "manifest.json").read_text(encoding="utf-8"))
+            for package in packages
+        ]
+        elements = [
+            json.loads((package / "elements.json").read_text(encoding="utf-8"))
+            for package in packages
+        ]
+        self.assertIsNone(manifests[0]["source_canvas"]["source_scale"])
+        self.assertEqual(elements[0]["elements"], elements[1]["elements"])
+        self.assertEqual(elements[1]["elements"], elements[2]["elements"])
+        self.assertEqual(manifests[0]["bounds"], manifests[1]["bounds"])
+        self.assertEqual(manifests[1]["bounds"], manifests[2]["bounds"])
+        self.assertNotEqual(
+            manifests[1]["canonical_source_sha256"],
+            manifests[2]["canonical_source_sha256"],
+            "scale is identity metadata but must never alter physical geometry",
+        )
+
+        duplicate = self.root / "duplicate-basic-header.xlsx"
+        rewrite_xlsx_member(
+            scale_20,
+            duplicate,
+            "xl/sharedStrings.xml",
+            lambda data: data.replace(
+                b"<si><t>height</t></si>",
+                b"<si><t>width</t></si>",
+                1,
+            ),
+        )
+        with self.assertRaisesRegex(WorkbookError, "duplicate header"):
+            read_workbook(duplicate)
+
+    def test_duplicate_workbook_relationship_id_is_rejected(self) -> None:
+        workbook = self.root / "relationships.xlsx"
+        duplicate = self.root / "relationships-duplicate.xlsx"
+        write_workbook(workbook, self.rows)
+        rewrite_xlsx_member(
+            workbook,
+            duplicate,
+            "xl/_rels/workbook.xml.rels",
+            lambda data: data.replace(
+                b"</Relationships>",
+                (
+                    b'<Relationship Id="rId1" '
+                    b'Type="http://schemas.openxmlformats.org/officeDocument/2006/'
+                    b'relationships/worksheet" Target="worksheets/sheet9.xml"/>'
+                    b"</Relationships>"
+                ),
+                1,
+            ),
+        )
+        with self.assertRaisesRegex(WorkbookError, "duplicate ID"):
+            read_workbook(duplicate)
+
+    def test_row_and_cell_references_are_unique_monotonic_and_consistent(self) -> None:
+        workbook = self.root / "row-reference.xlsx"
+        write_workbook(workbook, self.rows)
+        mutations = {
+            "missing-row": lambda data: data.replace(
+                b'<row r="2">', b"<row>", 1
+            ),
+            "duplicate-row": lambda data: data.replace(
+                b'<row r="2"><c r="A2"', b'<row r="1"><c r="A1"', 1
+            ).replace(b'<c r="B2"', b'<c r="B1"', 1),
+            "mismatched-cell": lambda data: data.replace(
+                b'<c r="A2"', b'<c r="A3"', 1
+            ),
+            "duplicate-cell": lambda data: data.replace(
+                b'</row></sheetData>',
+                b'<c r="A2"><v>0</v></c></row></sheetData>',
+                1,
+            ),
+        }
+        for label, transform in mutations.items():
+            with self.subTest(label=label):
+                mutated = self.root / f"{label}.xlsx"
+                rewrite_xlsx_member(
+                    workbook,
+                    mutated,
+                    "xl/worksheets/sheet2.xml",
+                    transform,
+                )
+                with self.assertRaises(WorkbookError):
+                    read_workbook(mutated)
+
+    def test_element_limit_counts_source_business_rows(self) -> None:
+        workbook = self.root / "element-limit.xlsx"
+        write_workbook(workbook, [*self.rows, *self.rows])
+        self.assertEqual(xlsx_reader_module.MAXIMUM_ELEMENTS, 100_000)
+        with mock.patch.object(xlsx_reader_module, "MAXIMUM_ELEMENTS", 1):
+            with self.assertRaisesRegex(WorkbookError, "100,000-element limit"):
+                read_workbook(workbook)
+
+    def test_shared_string_and_column_references_fail_closed(self) -> None:
+        workbook = self.root / "reference-contract.xlsx"
+        write_workbook(workbook, self.rows)
+
+        negative_shared = self.root / "negative-shared.xlsx"
+        rewrite_xlsx_member(
+            workbook,
+            negative_shared,
+            "xl/worksheets/sheet2.xml",
+            lambda data: re.sub(br"<v>[0-9]+</v>", b"<v>-1</v>", data, count=1),
+        )
+        with self.assertRaisesRegex(WorkbookError, "invalid shared-string"):
+            read_workbook(negative_shared)
+
+        oversized_column = self.root / "oversized-column.xlsx"
+        rewrite_xlsx_member(
+            workbook,
+            oversized_column,
+            "xl/worksheets/sheet2.xml",
+            lambda data: data.replace(
+                b'r="A1"', b'r="AAAAAAAAAAAAAAAAAAAA1"', 1
+            ),
+        )
+        with self.assertRaisesRegex(WorkbookError, "duplicate/invalid cells"):
+            read_workbook(oversized_column)
+
+    def test_workbook_sheet_relationship_and_target_aliases_are_rejected(self) -> None:
+        workbook = self.root / "sheet-authority.xlsx"
+        write_workbook(workbook, self.rows)
+
+        duplicate_relationship = self.root / "sheet-relationship-alias.xlsx"
+        rewrite_xlsx_member(
+            workbook,
+            duplicate_relationship,
+            "xl/workbook.xml",
+            lambda data: data.replace(b'r:id="rId2"', b'r:id="rId1"', 1),
+        )
+        with self.assertRaisesRegex(WorkbookError, "relationship IDs"):
+            read_workbook(duplicate_relationship)
+
+        duplicate_target = self.root / "sheet-target-alias.xlsx"
+        rewrite_xlsx_member(
+            workbook,
+            duplicate_target,
+            "xl/_rels/workbook.xml.rels",
+            lambda data: data.replace(
+                b'Target="worksheets/sheet2.xml"',
+                b'Target="worksheets/sheet1.xml"',
+                1,
+            ),
+        )
+        with self.assertRaisesRegex(WorkbookError, "alias one worksheet"):
+            read_workbook(duplicate_target)
+
+    def test_workbook_xml_authority_and_cell_resource_contract_fail_closed(self) -> None:
+        workbook = self.root / "xml-authority.xlsx"
+        write_workbook(workbook, self.rows)
+
+        mutations = [
+            (
+                "external-relationship",
+                "xl/_rels/workbook.xml.rels",
+                lambda data: data.replace(
+                    b'Target="worksheets/sheet1.xml"',
+                    b'Target="worksheets/sheet1.xml" TargetMode="External"',
+                    1,
+                ),
+            ),
+            (
+                "doctype",
+                "xl/workbook.xml",
+                lambda data: data.replace(
+                    b"?>", b'?><!DOCTYPE workbook [<!ENTITY x "x">]>', 1
+                ),
+            ),
+            (
+                "foreign-sheet-data",
+                "xl/worksheets/sheet2.xml",
+                lambda data: data.replace(
+                    b"<sheetData>",
+                    b'<evil:sheetData xmlns:evil="urn:evil">',
+                    1,
+                ).replace(b"</sheetData>", b"</evil:sheetData>", 1),
+            ),
+            (
+                "leading-zero-row",
+                "xl/worksheets/sheet2.xml",
+                lambda data: data.replace(b'<row r="2">', b'<row r="02">', 1),
+            ),
+            (
+                "invalid-boolean-cell",
+                "xl/worksheets/sheet1.xml",
+                lambda data: re.sub(
+                    br't="s"><v>[0-9]+</v>', b't="b"><v>2</v>', data, count=1
+                ),
+            ),
+            (
+                "oversized-shared-string",
+                "xl/sharedStrings.xml",
+                lambda data: data.replace(
+                    b"<si><t>",
+                    b"<si><t>" + b"x" * (xlsx_reader_module.MAXIMUM_CELL_BYTES + 1),
+                    1,
+                ),
+            ),
+        ]
+        for label, member, transform in mutations:
+            with self.subTest(label=label):
+                mutated = self.root / f"{label}.xlsx"
+                rewrite_xlsx_member(workbook, mutated, member, transform)
+                with self.assertRaises(WorkbookError):
+                    read_workbook(mutated)
+
+    def test_workbook_metadata_limits_and_exact_xml_roots_fail_closed(self) -> None:
+        workbook = self.root / "metadata-limits.xlsx"
+        write_workbook(workbook, self.rows)
+        self.assertEqual(xlsx_reader_module.MAXIMUM_WORKBOOK_SHEETS, 4096)
+        self.assertEqual(xlsx_reader_module.MAXIMUM_WORKBOOK_RELATIONSHIPS, 4096)
+        for label, limit_name in (
+            ("sheet-limit", "MAXIMUM_WORKBOOK_SHEETS"),
+            ("relationship-limit", "MAXIMUM_WORKBOOK_RELATIONSHIPS"),
+        ):
+            with self.subTest(label=label), mock.patch.object(
+                xlsx_reader_module, limit_name, 1
+            ):
+                with self.assertRaisesRegex(WorkbookError, "too many"):
+                    read_workbook(workbook)
+
+        root_mutations = (
+            (
+                "wrong-workbook-root",
+                "xl/workbook.xml",
+                lambda data: data.replace(b"<workbook ", b"<evil ", 1).replace(
+                    b"</workbook>", b"</evil>", 1
+                ),
+            ),
+            (
+                "wrong-relationships-root",
+                "xl/_rels/workbook.xml.rels",
+                lambda data: data.replace(
+                    b"<Relationships ", b"<evil ", 1
+                ).replace(b"</Relationships>", b"</evil>", 1),
+            ),
+            (
+                "wrong-shared-strings-root",
+                "xl/sharedStrings.xml",
+                lambda data: data.replace(b"<sst ", b"<evil ", 1).replace(
+                    b"</sst>", b"</evil>", 1
+                ),
+            ),
+            (
+                "wrong-worksheet-root",
+                "xl/worksheets/sheet2.xml",
+                lambda data: data.replace(
+                    b"<worksheet ", b"<evil ", 1
+                ).replace(b"</worksheet>", b"</evil>", 1),
+            ),
+            (
+                "duplicate-sheet-data",
+                "xl/worksheets/sheet2.xml",
+                lambda data: data.replace(
+                    b"</worksheet>", b"<sheetData/></worksheet>", 1
+                ),
+            ),
+        )
+        for label, member, transform in root_mutations:
+            with self.subTest(label=label):
+                mutated = self.root / f"{label}.xlsx"
+                rewrite_xlsx_member(workbook, mutated, member, transform)
+                with self.assertRaises(WorkbookError):
+                    read_workbook(mutated)
+
+    def test_basic_identity_whitespace_is_rejected_without_trimming(self) -> None:
+        for field in ("map_name", "storeCode"):
+            with self.subTest(field=field):
+                workbook = self.root / f"whitespace-{field}.xlsx"
+                basic = {
+                    "map_name": "fixture",
+                    "width": 2000,
+                    "height": 1000,
+                    "storeCode": "s1",
+                }
+                basic[field] = " " + str(basic[field])
+                write_workbook(workbook, self.rows, basic_info=basic)
+                with self.assertRaisesRegex(WorkbookError, "leading/trailing whitespace"):
+                    read_workbook(workbook)
+
+    def test_shelf_info_formula_is_counted_but_never_used_as_authority(self) -> None:
+        plain = self.root / "shelf-plain.xlsx"
+        formula = self.root / "shelf-formula.xlsx"
+        write_workbook(
+            plain,
+            self.rows,
+            shelf_rows=[["code"], ["legacy-business-value"]],
+        )
+        formula_xml = (
+            '<?xml version="1.0"?><worksheet '
+            'xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+            '<sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>code</t></is></c></row>'
+            '<row r="2"><c r="A2"><f>1+1</f><v>2</v></c></row>'
+            '</sheetData></worksheet>'
+        ).encode("utf-8")
+        rewrite_xlsx_member(
+            plain,
+            formula,
+            "xl/worksheets/sheet2.xml",
+            lambda _data: formula_xml,
+        )
+        plain_read = read_workbook(plain)
+        formula_read = read_workbook(formula)
+        self.assertEqual(plain_read.legacy_shelf_info.row_count, 1)
+        self.assertEqual(formula_read.legacy_shelf_info.row_count, 1)
+        plain_package = convert_workbook(plain, self.root / "plain-package")
+        formula_package = convert_workbook(formula, self.root / "formula-package")
+        plain_manifest = json.loads((plain_package / "manifest.json").read_text())
+        formula_manifest = json.loads((formula_package / "manifest.json").read_text())
+        self.assertEqual(
+            plain_manifest["canonical_source_sha256"],
+            formula_manifest["canonical_source_sha256"],
+        )
+
+    def test_shelf_and_presentation_mutations_do_not_change_business_identity(self) -> None:
+        first = self.root / "first.xlsx"
+        second = self.root / "second.xlsx"
+        circle_a = (
+            "1",
+            json.dumps(
+                {
+                    "shapeType": "Circle",
+                    "x": 20,
+                    "y": 30,
+                    "width": 10,
+                    "height": 10,
+                    "visible": True,
+                }
+            ),
+        )
+        circle_b = (
+            "1",
+            json.dumps(
+                {
+                    "shapeType": "Circle",
+                    "x": 999,
+                    "y": 888,
+                    "width": 500,
+                    "height": 500,
+                    "visible": False,
+                }
+            ),
+        )
+        write_workbook(first, [*self.rows, circle_a], shelf_rows=[["code"], ["old"]])
+        write_workbook(second, [*self.rows, circle_b], shelf_rows=[["code"], ["new"]])
+        first_package = convert_workbook(first, self.root / "first-package")
+        second_package = convert_workbook(second, self.root / "second-package")
+        first_manifest = json.loads((first_package / "manifest.json").read_text())
+        second_manifest = json.loads((second_package / "manifest.json").read_text())
+        self.assertNotEqual(first_manifest["source_sha256"], second_manifest["source_sha256"])
+        self.assertEqual(
+            first_manifest["canonical_source_sha256"],
+            second_manifest["canonical_source_sha256"],
+        )
+        self.assertEqual(first_manifest["prior_map_id"], second_manifest["prior_map_id"])
+        self.assertEqual(first_manifest["presentation_ignored_count"], 1)
+        self.assertEqual(second_manifest["presentation_ignored_count"], 1)
+
+    def test_active_geometry_one_centimetre_outside_canvas_is_rejected(self) -> None:
+        workbook = self.root / "outside.xlsx"
+        rows = [
+            (
+                "1",
+                json.dumps(
+                    {
+                        "shapeType": "MapShelf",
+                        "x": 1999,
+                        "y": 100,
+                        "width": 2,
+                        "height": 10,
+                        "visible": True,
+                    }
+                ),
+            )
+        ]
+        write_workbook(workbook, rows)
+        with self.assertRaisesRegex(ConversionError, "outside"):
+            convert_workbook(workbook, self.root / "outside-package")
+
+    def test_renderer_ignores_null_presentation_geometry(self) -> None:
+        workbook = self.root / "render.xlsx"
+        write_workbook(workbook, self.rows)
+        package = convert_workbook(workbook, self.root / "render-package")
+        elements_path = package / "elements.json"
+        payload = json.loads(elements_path.read_text(encoding="utf-8"))
+        payload["elements"].append(
+            {
+                "id": "presentation",
+                "floor_id": "1",
+                "shape_type": "Circle",
+                "role": "presentation_only",
+                "visible": True,
+                "geometry": None,
+            }
+        )
+        elements_path.write_text(json.dumps(payload), encoding="utf-8")
+        output = render_package(package, self.root / "rendered.png")
+        self.assertTrue(output.read_bytes().startswith(b"\x89PNG\r\n\x1a\n"))
 
 
 class IOSCoreContractTests(unittest.TestCase):
@@ -3708,6 +4390,35 @@ class IOSCoreContractTests(unittest.TestCase):
             )
             self.assertEqual(valid_result.returncode, 0, valid_result.stderr)
 
+            expected_segments = Path(temporary) / "python-shelf-segments.json"
+            expected_segments.write_text(
+                json.dumps(
+                    json.loads(
+                        (package / "shelves.json").read_text(encoding="utf-8")
+                    )["shelf_segments"],
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ),
+                encoding="utf-8",
+            )
+            shelf_parity = subprocess.run(
+                [
+                    str(executable),
+                    "--shelf-segment-parity",
+                    str(workbook),
+                    str(expected_segments),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                shelf_parity.returncode,
+                0,
+                shelf_parity.stderr + "\n" + shelf_parity.stdout,
+            )
+
             (package / "._manifest.json").write_bytes(
                 b"\x00\x05\x16\x07AppleDouble metadata\xb0"
             )
@@ -3841,6 +4552,67 @@ class IOSCoreContractTests(unittest.TestCase):
                 corrupted = suite_root / f"{name}.fail"
                 shutil.copytree(package, corrupted)
                 mutate(corrupted)
+
+            # Rebind the package manifest after semantic shelves mutations so
+            # the Swift validator must reject the version/segment contract,
+            # rather than merely observing a stale artifact hash.
+            formal_shelves_v1 = suite_root / "formal-shelves-v1.fail"
+            shutil.copytree(package, formal_shelves_v1)
+            formal_shelves_payload = json.loads(
+                (formal_shelves_v1 / "shelves.json").read_text(encoding="utf-8")
+            )
+            formal_shelves_payload["version"] = 1
+            formal_shelves_payload.pop("shelf_segments")
+            (formal_shelves_v1 / "shelves.json").write_text(
+                json.dumps(
+                    formal_shelves_payload,
+                    ensure_ascii=False,
+                    indent=2,
+                    sort_keys=True,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (formal_shelves_v1 / "package_manifest.json").write_text(
+                json.dumps(
+                    build_package_manifest(formal_shelves_v1),
+                    ensure_ascii=False,
+                    indent=2,
+                    sort_keys=True,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            invalid_shelf_axis = suite_root / "invalid-shelf-axis.fail"
+            shutil.copytree(package, invalid_shelf_axis)
+            invalid_shelf_payload = json.loads(
+                (invalid_shelf_axis / "shelves.json").read_text(encoding="utf-8")
+            )
+            invalid_shelf_payload["shelf_segments"][0]["longitudinal_axis"] = [
+                0.5,
+                0.0,
+            ]
+            (invalid_shelf_axis / "shelves.json").write_text(
+                json.dumps(
+                    invalid_shelf_payload,
+                    ensure_ascii=False,
+                    indent=2,
+                    sort_keys=True,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (invalid_shelf_axis / "package_manifest.json").write_text(
+                json.dumps(
+                    build_package_manifest(invalid_shelf_axis),
+                    ensure_ascii=False,
+                    indent=2,
+                    sort_keys=True,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
             suite_result = subprocess.run(
                 [str(executable), "--integrity-suite", str(suite_root)],
                 check=False,
@@ -3877,6 +4649,7 @@ class IOSCoreContractTests(unittest.TestCase):
                     (str(floor), json.dumps(value, ensure_ascii=False))
                     for floor, value in business_elements
                 ],
+                include_basic=False,
             )
 
             # sample.csv
@@ -4109,6 +4882,52 @@ class PriorMapConversionTests(unittest.TestCase):
         self.assertAlmostEqual(after_corner, 11.0)
         self.assertLess(before_corner, after_corner)
 
+    def test_distance_and_spatial_grid_resource_budgets_fail_closed(self) -> None:
+        oversized_floor = [
+            {
+                "id": "1",
+                "bounds": {
+                    "min_x_m": 0.0,
+                    "min_y_m": 0.0,
+                    "max_x_m": 3_000.0,
+                    "max_y_m": 1.0,
+                },
+            }
+        ]
+        with self.assertRaisesRegex(ValueError, "resource budget"):
+            build_distance_fields([], oversized_floor)
+
+        per_floor = {
+            "min_x_m": 0.0,
+            "min_y_m": 0.0,
+            "max_x_m": 100.0,
+            "max_y_m": 100.0,
+        }
+        with self.assertRaisesRegex(ValueError, "total grid cell budget"):
+            build_distance_fields(
+                [],
+                [
+                    {"id": str(index), "bounds": per_floor}
+                    for index in range(12)
+                ],
+            )
+
+        oversized_structure = {
+            "id": "huge",
+            "floor_id": "1",
+            "shape_type": "MapShelf",
+            "role": "shelf",
+            "visible": True,
+            "bounds": {
+                "min_x_m": 0.0,
+                "min_y_m": 0.0,
+                "max_x_m": 40_000_000.0,
+                "max_y_m": 0.0,
+            },
+        }
+        with self.assertRaisesRegex(ConversionError, "budget"):
+            _spatial_index([oversized_structure], {"nodes": [], "edges": []})
+
     def corrupted_package(self, source: Path, name: str) -> Path:
         destination = self.root / name
         shutil.copytree(source, destination)
@@ -4123,7 +4942,7 @@ class PriorMapConversionTests(unittest.TestCase):
             encoding="utf-8",
         )
 
-    def test_conversion_preserves_supported_unknown_hidden_and_business_fields(self) -> None:
+    def test_conversion_emits_only_active_elements_and_audits_ignored_rows(self) -> None:
         package = convert_workbook(
             self.workbook, self.root / "package", store_id="s1"
         )
@@ -4132,22 +4951,46 @@ class PriorMapConversionTests(unittest.TestCase):
         report = json.loads(
             (package / "validation_report.json").read_text(encoding="utf-8")
         )
-        self.assertEqual(manifest["element_count"], 8)
+        self.assertEqual(manifest["version"], 2)
+        self.assertEqual(manifest["source_element_count"], 8)
+        self.assertEqual(manifest["element_count"], 6)
+        self.assertEqual(manifest["active_element_count"], 6)
         self.assertEqual(manifest["hidden_element_count"], 1)
+        self.assertEqual(manifest["unsupported_ignored_count"], 1)
         self.assertEqual([floor["id"] for floor in manifest["floors"]], ["1"])
         shelf = next(item for item in elements if item["code"] == "S1")
         self.assertEqual(shelf["cross_code"], "7")
         self.assertEqual(shelf["row_flag"], "R1")
         self.assertEqual(shelf["subsection"], 2)
-        unknown = next(item for item in elements if item["shape_type"] == "FutureShape")
-        self.assertIsNone(unknown["geometry"])
-        self.assertEqual(report["summary"]["malformed_row_count"], 1)
+        self.assertFalse(any(item["shape_type"] == "FutureShape" for item in elements))
+        self.assertFalse(any(item["visible"] is False for item in elements))
+        self.assertEqual(report["summary"]["malformed_row_count"], 0)
         warning_codes = {item["code"] for item in report["warnings"]}
         self.assertIn("unknown_shape_type", warning_codes)
         self.assertIn("hidden_element", warning_codes)
         self.assertIn("missing_cross", warning_codes)
         self.assertTrue(validate_package(package)["valid"])
         self.assertTrue((package / "preview.png").read_bytes().startswith(b"\x89PNG\r\n\x1a\n"))
+
+        shelves = json.loads((package / "shelves.json").read_text(encoding="utf-8"))
+        self.assertEqual(shelves["version"], 2)
+        self.assertEqual(len(shelves["shelves"]), 1)
+        self.assertEqual(len(shelves["shelf_segments"]), 1)
+        segment = shelves["shelf_segments"][0]
+        self.assertEqual(segment["shelf_segment_id"], shelves["shelves"][0]["id"])
+        self.assertEqual(segment["shelf_code"], "S1")
+        self.assertEqual(segment["floor_id"], "1")
+        self.assertEqual(segment["side_semantics_version"], 1)
+        self.assertEqual(segment["orientation_provenance"], "element_yaw")
+        self.assertAlmostEqual(math.hypot(*segment["longitudinal_axis"]), 1.0)
+        self.assertAlmostEqual(
+            segment["front_normal"][0] + segment["back_normal"][0],
+            0.0,
+        )
+        self.assertAlmostEqual(
+            segment["front_normal"][1] + segment["back_normal"][1],
+            0.0,
+        )
 
     def test_package_integrity_ignores_macos_filesystem_metadata(self) -> None:
         package = convert_workbook(
@@ -4337,6 +5180,78 @@ class PriorMapConversionTests(unittest.TestCase):
         (invalid_png / "preview.png").write_bytes(b"\x89PNG\r\n\x1a\ntruncated")
         self.assertFalse(validate_package(invalid_png)["valid"])
 
+    def test_v2_manifest_requires_strict_relation_bound_shelves_v2(self) -> None:
+        package = convert_workbook(
+            self.workbook, self.root / "shelves-v2-package", store_id="s1"
+        )
+
+        downgraded = self.corrupted_package(package, "formal-shelves-v1")
+        shelves = json.loads((downgraded / "shelves.json").read_text(encoding="utf-8"))
+        shelves["version"] = 1
+        shelves.pop("shelf_segments")
+        (downgraded / "shelves.json").write_text(
+            json.dumps(shelves, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        (downgraded / "package_manifest.json").write_text(
+            json.dumps(
+                build_package_manifest(downgraded),
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        validation = validate_package(downgraded)
+        self.assertFalse(validation["valid"])
+        self.assertIn(
+            "shelf_version_contract",
+            {item["code"] for item in validation["errors"]},
+        )
+
+        mutations = {
+            "unknown-field": lambda segments: segments[0].__setitem__(
+                "unexpected", True
+            ),
+            "non-unit-axis": lambda segments: segments[0].__setitem__(
+                "longitudinal_axis", [0.5, 0.0]
+            ),
+            "wrong-floor-binding": lambda segments: segments[0].__setitem__(
+                "floor_id", "wrong-floor"
+            ),
+            "missing-segment": lambda segments: segments.clear(),
+        }
+        for name, mutate in mutations.items():
+            with self.subTest(name=name):
+                corrupted = self.corrupted_package(package, f"shelf-segment-{name}")
+                payload = json.loads(
+                    (corrupted / "shelves.json").read_text(encoding="utf-8")
+                )
+                mutate(payload["shelf_segments"])
+                (corrupted / "shelves.json").write_text(
+                    json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True)
+                    + "\n",
+                    encoding="utf-8",
+                )
+                (corrupted / "package_manifest.json").write_text(
+                    json.dumps(
+                        build_package_manifest(corrupted),
+                        ensure_ascii=False,
+                        indent=2,
+                        sort_keys=True,
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+                result = validate_package(corrupted)
+                self.assertFalse(result["valid"], result)
+                self.assertTrue(
+                    {"shelf_segment_schema", "shelf_segment_relation"}
+                    & {item["code"] for item in result["errors"]},
+                    result,
+                )
+
     def test_conversion_is_reproducible(self) -> None:
         first = convert_workbook(
             self.workbook, self.root / "first", store_id="s1"
@@ -4436,10 +5351,10 @@ class PriorMapConversionTests(unittest.TestCase):
             package,
             seed=24,
             dynamic_fraction=0.2,
-            tracking_loss_indices={8, 9},
+            tracking_loss_indices={3, 4},
         )
-        self.assertEqual(recovered["samples"][8]["state"], "lost")
-        self.assertEqual(recovered["samples"][9]["state"], "lost")
+        self.assertEqual(recovered["samples"][3]["state"], "lost")
+        self.assertEqual(recovered["samples"][4]["state"], "lost")
         self.assertIsNotNone(recovered["summary"]["tracking_recovery_frames"])
         self.assertGreaterEqual(recovered["summary"]["tracking_recovery_frames"], 2)
 
@@ -4533,6 +5448,18 @@ class PriorMapStrictSchemaTests(unittest.TestCase):
             package, "package_artifact_schema", "N1 fractional manifest version"
         )
 
+    def test_n1b_integral_float_version_token_rejected(self) -> None:
+        package = self.copy_with("n1b-integral-float-version")
+        self.rewrite_json(
+            package / "package_manifest.json",
+            lambda value: value["artifacts"][0].__setitem__("version", 1.0),
+        )
+        self.assert_invalid(
+            package,
+            "package_artifact_schema",
+            "N1b integral floating version token",
+        )
+
     def test_n2_boolean_artifact_count_rejected(self) -> None:
         # N2: {"artifact_count":true} must be rejected.
         package = self.copy_with("n2-boolean-count")
@@ -4565,7 +5492,7 @@ class PriorMapStrictSchemaTests(unittest.TestCase):
         )
         self.refresh_manifest(package)
         self.assert_invalid(
-            package, "visibility_count", "N4 numeric visible field"
+            package, "active_element_contract", "N4 numeric visible field"
         )
 
     def test_n5_boolean_geometry_coordinate_rejected(self) -> None:
@@ -4581,7 +5508,23 @@ class PriorMapStrictSchemaTests(unittest.TestCase):
         )
         self.refresh_manifest(package)
         self.assert_invalid(
-            package, "floor_bounds", "N5 boolean geometry coordinate"
+            package, "active_geometry_contract", "N5 boolean geometry coordinate"
+        )
+
+    def test_n5b_role_correct_element_with_wrong_geometry_kind_rejected(self) -> None:
+        package = self.copy_with("n5b-wrong-geometry-kind")
+        elements = json.loads((package / "elements.json").read_text())
+        geometry = elements["elements"][0]["geometry"]
+        self.assertEqual(geometry["type"], "polygon")
+        geometry["type"] = "line_string"
+        (package / "elements.json").write_text(
+            json.dumps(elements, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+        )
+        self.refresh_manifest(package)
+        self.assert_invalid(
+            package,
+            "active_geometry_contract",
+            "N5b role-correct element with wrong geometry kind",
         )
 
     def test_n6_boolean_bounds_rejected(self) -> None:
@@ -4594,6 +5537,341 @@ class PriorMapStrictSchemaTests(unittest.TestCase):
         )
         self.refresh_manifest(package)
         self.assert_invalid(package, "map_bounds", "N6 boolean bounds field")
+
+    def test_n6a_formal_bounds_require_six_consistent_fields(self) -> None:
+        for label, mutate in (
+            ("missing-width", lambda bounds: bounds.pop("width_m")),
+            ("extra-field", lambda bounds: bounds.__setitem__("extra", 0.0)),
+            (
+                "tiny-width-drift",
+                lambda bounds: bounds.__setitem__(
+                    "width_m", float(bounds["width_m"]) + 5.0e-7
+                ),
+            ),
+            (
+                "mismatched-height",
+                lambda bounds: bounds.__setitem__(
+                    "height_m", float(bounds["height_m"]) + 1.0
+                ),
+            ),
+        ):
+            with self.subTest(label=label):
+                package = self.copy_with(f"n6a-{label}")
+                elements_path = package / "elements.json"
+                elements_payload = json.loads(
+                    elements_path.read_text(encoding="utf-8")
+                )
+                mutate(elements_payload["elements"][0]["bounds"])
+                elements_path.write_text(
+                    json.dumps(
+                        elements_payload,
+                        ensure_ascii=False,
+                        indent=2,
+                        sort_keys=True,
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+                self.refresh_manifest(package)
+                self.assert_invalid(
+                    package,
+                    "element_bounds",
+                    f"N6a formal bounds {label}",
+                )
+
+        for label, target, expected_code in (
+            ("manifest-missing-width", "manifest", "map_bounds"),
+            ("manifest-tiny-width-drift", "manifest_drift", "map_bounds"),
+            ("floor-missing-height", "floor", "floor_bounds"),
+        ):
+            with self.subTest(label=label):
+                package = self.copy_with(f"n6a-{label}")
+                manifest_path = package / "manifest.json"
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                if target == "manifest":
+                    manifest["bounds"].pop("width_m")
+                elif target == "manifest_drift":
+                    manifest["bounds"]["width_m"] += 5.0e-7
+                else:
+                    manifest["floors"][0]["bounds"].pop("height_m")
+                manifest_path.write_text(
+                    json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True)
+                    + "\n",
+                    encoding="utf-8",
+                )
+                self.refresh_manifest(package)
+                self.assert_invalid(
+                    package,
+                    expected_code,
+                    f"N6a formal bounds {label}",
+                )
+
+    def test_n6b_distance_field_integer_and_rle_scalars_are_strict(self) -> None:
+        mutations = {
+            "width-bool": lambda level: level.__setitem__("width", True),
+            "width-fractional": lambda level: level.__setitem__("width", 1.5),
+            "width-integral-float": lambda level: level.__setitem__("width", 1.0),
+            "count-bool": lambda level: level["rows"][0].__setitem__(0, True),
+            "count-integral-float": lambda level: level["rows"][0].__setitem__(0, 1.0),
+            "value-bool": lambda level: level["rows"][0].__setitem__(1, False),
+            "count-huge": lambda level: level["rows"][0].__setitem__(0, 10**9),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(label=label):
+                package = self.copy_with(f"n6b-distance-{label}")
+                distance_path = package / "distance_fields.json"
+                distance = json.loads(distance_path.read_text(encoding="utf-8"))
+                floor = next(iter(distance["floors"].values()))
+                level = floor["levels"][0]
+                mutate(level)
+                level["data_sha256"] = hashlib.sha256(
+                    json.dumps(
+                        level["rows"],
+                        separators=(",", ":"),
+                        ensure_ascii=True,
+                    ).encode("utf-8")
+                ).hexdigest()
+                distance_path.write_text(
+                    json.dumps(distance, ensure_ascii=False, indent=2, sort_keys=True)
+                    + "\n",
+                    encoding="utf-8",
+                )
+                self.refresh_manifest(package)
+                self.assert_invalid(
+                    package,
+                    "distance_data",
+                    f"N6b distance scalar {label}",
+                )
+
+    def test_n6e_formal_center_and_yaw_scalars_are_strict(self) -> None:
+        for label, field, invalid_value, expected_code in (
+            ("center", "center_m", ["bad", 0.0], "element_center"),
+            ("yaw", "yaw_rad", True, "element_yaw"),
+        ):
+            with self.subTest(label=label):
+                package = self.copy_with(f"n6e-{label}")
+                elements_path = package / "elements.json"
+                elements_payload = json.loads(
+                    elements_path.read_text(encoding="utf-8")
+                )
+                candidate = next(
+                    item
+                    for item in elements_payload["elements"]
+                    if item.get("role") == "fixed_structure"
+                )
+                candidate[field] = invalid_value
+                elements_path.write_text(
+                    json.dumps(
+                        elements_payload,
+                        ensure_ascii=False,
+                        indent=2,
+                        sort_keys=True,
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+                structures_path = package / "fixed_structures.json"
+                structures_payload = json.loads(
+                    structures_path.read_text(encoding="utf-8")
+                )
+                matching = next(
+                    item
+                    for item in structures_payload["structures"]
+                    if item["id"] == candidate["id"]
+                )
+                matching[field] = invalid_value
+                structures_path.write_text(
+                    json.dumps(
+                        structures_payload,
+                        ensure_ascii=False,
+                        indent=2,
+                        sort_keys=True,
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+                manifest_path = package / "manifest.json"
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                source_info = manifest["source_map_info"]
+                basic_info = BasicMapInfo(
+                    map_name=source_info["map_name"],
+                    width_cm=float(source_info["width_cm"]),
+                    height_cm=float(source_info["height_cm"]),
+                    store_code=source_info["store_code"],
+                    source_scale=source_info.get("scale"),
+                )
+                canonical_hash = _canonical_business_sha256(
+                    basic_info, elements_payload["elements"]
+                )
+                manifest["canonical_source_sha256"] = canonical_hash
+                base_name = (
+                    re.sub(
+                        r"[^A-Za-z0-9._-]+", "-", manifest["name"]
+                    ).strip("-")
+                    or "map"
+                )
+                manifest["prior_map_id"] = f"{base_name}-{canonical_hash[:12]}"
+                manifest_path.write_text(
+                    json.dumps(
+                        manifest,
+                        ensure_ascii=False,
+                        indent=2,
+                        sort_keys=True,
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+                self.refresh_manifest(package)
+                self.assert_invalid(
+                    package,
+                    expected_code,
+                    f"N6e formal {label} scalar",
+                )
+
+    def test_n6c_derived_artifacts_are_bound_to_authoritative_elements(self) -> None:
+        spatial_package = self.copy_with("n6c-spatial-cell")
+        spatial_path = spatial_package / "spatial_index.json"
+        spatial = json.loads(spatial_path.read_text(encoding="utf-8"))
+        floor = next(iter(spatial["floors"].values()))
+        identifiers = sorted(
+            {
+                identifier
+                for values in floor["cells"].values()
+                for identifier in values
+            }
+        )
+        floor["cells"] = {"999,999": identifiers}
+        spatial_path.write_text(
+            json.dumps(spatial, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        self.refresh_manifest(spatial_package)
+        self.assert_invalid(
+            spatial_package,
+            "spatial_source_binding",
+            "N6c spatial cells must match deterministic bounds",
+        )
+
+        distance_package = self.copy_with("n6c-distance-all-zero")
+        distance_path = distance_package / "distance_fields.json"
+        distance = json.loads(distance_path.read_text(encoding="utf-8"))
+        for floor_value in distance["floors"].values():
+            for level in floor_value["levels"]:
+                level["rows"] = [[level["width"], 0] for _ in range(level["height"])]
+                level["data_sha256"] = hashlib.sha256(
+                    json.dumps(
+                        level["rows"], separators=(",", ":"), ensure_ascii=True
+                    ).encode("utf-8")
+                ).hexdigest()
+        distance_path.write_text(
+            json.dumps(distance, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        self.refresh_manifest(distance_package)
+        self.assert_invalid(
+            distance_package,
+            "distance_source_binding",
+            "N6c distance field must match deterministic structures",
+        )
+
+        shelf_package = self.copy_with("n6c-shelf-shift")
+        shelf_path = shelf_package / "shelves.json"
+        shelves = json.loads(shelf_path.read_text(encoding="utf-8"))
+        segment = shelves["shelf_segments"][0]
+        segment["longitudinal_start_m"][0] += 1.0
+        segment["longitudinal_end_m"][0] += 1.0
+        shelf_path.write_text(
+            json.dumps(shelves, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        self.refresh_manifest(shelf_package)
+        self.assert_invalid(
+            shelf_package,
+            "shelf_segment_source_binding",
+            "N6c shelf segment must bind source geometry/yaw",
+        )
+
+    def test_n6d_canonical_hash_and_stable_ids_are_recomputed(self) -> None:
+        canonical_package = self.copy_with("n6d-canonical-claim")
+        manifest_path = canonical_package / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        forged_hash = "0" * 64
+        manifest["canonical_source_sha256"] = forged_hash
+        base_name = re.sub(r"[^A-Za-z0-9._-]+", "-", manifest["name"]).strip("-") or "map"
+        manifest["prior_map_id"] = f"{base_name}-{forged_hash[:12]}"
+        manifest_path.write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        self.refresh_manifest(canonical_package)
+        self.assert_invalid(
+            canonical_package,
+            "canonical_source_binding",
+            "N6d claimed canonical hash must be recomputed",
+        )
+
+        duplicate_package = self.copy_with("n6d-duplicate-stable-id")
+        elements_path = duplicate_package / "elements.json"
+        elements_payload = json.loads(elements_path.read_text(encoding="utf-8"))
+        candidates = [
+            item
+            for item in elements_payload["elements"]
+            if item.get("role") in {"shelf", "fixed_structure"}
+        ][:2]
+        self.assertEqual(len(candidates), 2)
+        duplicate_source = {"id": "duplicate-official-business-id"}
+        candidate_ids = {item["id"] for item in candidates}
+        for item in elements_payload["elements"]:
+            if item["id"] in candidate_ids:
+                item["source"] = duplicate_source
+        elements_path.write_text(
+            json.dumps(elements_payload, ensure_ascii=False, indent=2, sort_keys=True)
+            + "\n",
+            encoding="utf-8",
+        )
+        for filename, key in (
+            ("shelves.json", "shelves"),
+            ("fixed_structures.json", "structures"),
+        ):
+            path = duplicate_package / filename
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            for item in payload[key]:
+                if item["id"] in candidate_ids:
+                    item["source"] = duplicate_source
+            path.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True)
+                + "\n",
+                encoding="utf-8",
+            )
+        manifest_path = duplicate_package / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        source_info = manifest["source_map_info"]
+        basic_info = BasicMapInfo(
+            map_name=source_info["map_name"],
+            width_cm=float(source_info["width_cm"]),
+            height_cm=float(source_info["height_cm"]),
+            store_code=source_info["store_code"],
+            source_scale=source_info.get("scale"),
+        )
+        canonical_hash = _canonical_business_sha256(
+            basic_info, elements_payload["elements"]
+        )
+        manifest["canonical_source_sha256"] = canonical_hash
+        base_name = (
+            re.sub(r"[^A-Za-z0-9._-]+", "-", manifest["name"]).strip("-")
+            or "map"
+        )
+        manifest["prior_map_id"] = f"{base_name}-{canonical_hash[:12]}"
+        manifest_path.write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        self.refresh_manifest(duplicate_package)
+        self.assert_invalid(
+            duplicate_package,
+            "duplicate_stable_element_id",
+            "N6d duplicate stable business identities must fail closed",
+        )
 
     def test_n7_manifest_duplicate_version_rejected(self) -> None:
         # N7: a duplicate manifest version key must be rejected before

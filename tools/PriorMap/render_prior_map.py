@@ -14,8 +14,14 @@ from typing import Iterable, Sequence
 
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from PriorMap.element_roles import (
+        ROLE_FIXED_STRUCTURE,
+        ROLE_SHELF,
+        role_for,
+    )
     from PriorMap.prior_map_schema import load_json
 else:
+    from .element_roles import ROLE_FIXED_STRUCTURE, ROLE_SHELF, role_for
     from .prior_map_schema import load_json
 
 
@@ -187,15 +193,19 @@ def render_package(
         (
             item
             for item in elements
-            if str(item.get("floor_id")) == floor and item.get("geometry", {}).get("type") == "polygon"
+            if str(item.get("floor_id")) == floor
+            and item.get("visible") is True
+            and role_for(str(item.get("shape_type")))
+            in {ROLE_SHELF, ROLE_FIXED_STRUCTURE}
+            and isinstance(item.get("geometry"), dict)
+            and item["geometry"].get("type") == "polygon"
+            and isinstance(item["geometry"].get("coordinates"), list)
         ),
         key=lambda item: draw_order.get(str(item.get("shape_type")), 9),
     )
     for element in structures:
         polygon = [point(value) for value in element["geometry"]["coordinates"]]
-        if element.get("visible") is False:
-            fill, edge = WHITE, HIDDEN
-        elif element["shape_type"] == "MapPillar":
+        if element["shape_type"] == "MapPillar":
             fill = edge = PILLAR
         elif element["shape_type"] in {"MapTable", "MapTableFeature"}:
             fill, edge = TABLE_FILL, TABLE_EDGE

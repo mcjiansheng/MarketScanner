@@ -309,10 +309,57 @@ enum MobilePriorMapCompiler {
             throw CompileError.outputNotUsable(
                 "invalid store/map identity: \(error)")
         }
-        let elements = canonicalSource.elements
-        let warnings = canonicalSource.warnings
+        var warnings = canonicalSource.warnings
+        let filtered = ElementRoleClassifier.productionElements(
+            from: canonicalSource.elements, warnings: &warnings)
+        let elements = filtered.active
+        guard elements.count <= MapSourceImportLimits.maximumElements else {
+            throw CompileError.outputNotUsable(
+                "active element count exceeds \(MapSourceImportLimits.maximumElements)")
+        }
+        if (canonicalSource.importSummary?.malformedRowCount ?? 0) != 0 {
+            throw CompileError.outputNotUsable(
+                "strict production compilation rejects malformed source rows")
+        }
 
-        // Floor inventory with merged bounds.
+        var activeElementIDs = Set<String>()
+        var stableBusinessIDs = Set<String>()
+        for element in elements {
+            guard !element.id.isEmpty,
+                  activeElementIDs.insert(element.id).inserted else {
+                throw CompileError.outputNotUsable(
+                    "active element id is empty or duplicated: \(element.id)")
+            }
+            let stableBusinessID = CanonicalPriorMapBusinessSourceV2
+                .stableElementID(
+                    for: element,
+                    storeID: canonicalSource.storeId,
+                    mapName: canonicalSource.mapName)
+            guard !stableBusinessID.isEmpty,
+                  stableBusinessIDs.insert(stableBusinessID).inserted else {
+                throw CompileError.outputNotUsable(
+                    "active stable business identity is empty or duplicated: "
+                        + stableBusinessID)
+            }
+            guard let points = SourceGeometry.validatedProductionGeometryPoints(
+                    shapeType: element.shapeType,
+                    geometry: element.geometry),
+                  let boundsValue = element.bounds,
+                  let bounds = boundsFromDictionary(boundsValue),
+                  let geometryBounds = try? SourceGeometry.polygonBounds(points),
+                  boundsMatch(bounds, geometryBounds) else {
+                throw CompileError.outputNotUsable(
+                    "active element \(element.id) has an invalid role/geometry contract")
+            }
+            if let canvas = canonicalSource.sourceMapInfo?.sourceCanvasBounds,
+               !SourceGeometry.contains(geometry: element.geometry, in: canvas) {
+                throw CompileError.outputNotUsable(
+                    "active element \(element.id) is outside the Basic Info canvas")
+            }
+        }
+
+        // Formal v3 packages use the immutable Basic Info canvas for every
+        // floor. Legacy sources retain their frozen geometry-union behavior.
         var groupedBounds: [String: [SourceGeometry.Bounds]] = [:]
         for element in elements {
             guard let boundsValue = element.bounds,
@@ -325,7 +372,8 @@ enum MobilePriorMapCompiler {
         }
         var floors: [[String: Any]] = []
         for floorID in groupedBounds.keys.sorted() {
-            let merged = SourceGeometry.mergeBounds(groupedBounds[floorID] ?? [])
+            let merged = canonicalSource.sourceMapInfo?.sourceCanvasBounds
+                ?? SourceGeometry.mergeBounds(groupedBounds[floorID] ?? [])
             var floor: [String: Any] = [
                 "id": floorID,
                 "bounds": merged.asDictionary,
@@ -360,9 +408,9 @@ enum MobilePriorMapCompiler {
 
             var warningsCopy = warnings
             let graph = MobileRoadGraphBuilder.build(elements: elements, warnings: &warningsCopy)
-            let spatial = MobileSpatialIndexBuilder.build(
-                elements: elements, graph: graph, floors: floors)
             let distanceFields = try MobileDistanceFieldBuilder.build(elements: elements, floors: floors)
+            let spatial = try MobileSpatialIndexBuilder.build(
+                elements: elements, graph: graph, floors: floors)
 
             let counts = Dictionary(grouping: elements, by: { $0.shapeType })
                 .mapValues { $0.count }
@@ -372,14 +420,26 @@ enum MobilePriorMapCompiler {
                 elementStatistics[key] = value
             }
 
-            let bounds = SourceGeometry.mergeBounds(
+            let bounds = canonicalSource.sourceMapInfo?.sourceCanvasBounds
+                ?? SourceGeometry.mergeBounds(
                 floors.compactMap { floor in
                     guard let floorBounds = floor["bounds"] as? [String: Double] else { return nil }
                     return boundsFromDictionary(floorBounds)
-                } ?? [])
-            let manifest: [String: Any] = [
+                })
+            let manifestVersion = canonicalSource.sourceMapInfo == nil ? 1 : 2
+            let summary = canonicalSource.importSummary
+            let shelfCount = elements.filter {
+                ElementRoleClassifier.role(for: $0.shapeType) == .shelf
+            }.count
+            let fixedStructureCount = elements.filter {
+                ElementRoleClassifier.role(for: $0.shapeType) == .fixedStructure
+            }.count
+            let roadElementCount = elements.filter {
+                ElementRoleClassifier.role(for: $0.shapeType) == .road
+            }.count
+            var manifest: [String: Any] = [
                 "format": "MarketScannerPriorMap",
-                "version": 1,
+                "version": manifestVersion,
                 "prior_map_id": priorMapID,
                 "name": canonicalSource.mapName,
                 "store_id": canonicalSource.storeId,
@@ -391,8 +451,11 @@ enum MobilePriorMapCompiler {
                     "origin": canonicalSource.coordinateContract.origin.rawValue,
                     "x_axis": canonicalSource.coordinateContract.xAxis,
                     "y_axis": canonicalSource.coordinateContract.yAxis,
-                    "rotation": canonicalSource.coordinateContract.rotationDirection,
-                    "rectangle_anchor": "top_left_rotated_about_center",
+                    "rotation_direction": canonicalSource.coordinateContract.rotationDirection,
+                    "rectangle_anchor": canonicalSource.sourceMapInfo == nil
+                        ? "top_left_rotated_about_center" : "top_left",
+                    "rotation_pivot": canonicalSource.sourceMapInfo == nil
+                        ? "rectangle_center" : "top_left_anchor",
                 ],
                 "map_coordinate_system": [
                     "unit": "metre",
@@ -412,7 +475,9 @@ enum MobilePriorMapCompiler {
                 "element_statistics": elementStatistics,
                 "element_count": elements.count,
                 "visible_element_count": elements.filter { $0.visible }.count,
-                "hidden_element_count": elements.filter { !$0.visible }.count,
+                "hidden_element_count": manifestVersion == 2
+                    ? (summary?.hiddenElementCount ?? 0)
+                    : elements.filter { !$0.visible }.count,
                 "warning_count": warningsCopy.count,
                 "distance_fields": [
                     "file": "distance_fields.json",
@@ -422,13 +487,57 @@ enum MobilePriorMapCompiler {
                     "truncation_distance_m": MobileDistanceFieldBuilder.defaultTruncationM,
                 ],
             ]
-
-            let shelves = elements.filter { $0.shapeType == "MapShelf" }
-            let fixed = elements.filter {
-                ["MapTable", "MapPillar", "MapTableFeature"].contains($0.shapeType)
+            if let sourceMapInfo = canonicalSource.sourceMapInfo {
+                manifest["source_map_info"] = sourceMapInfo.canonicalPayload
+                manifest["source_canvas"] = [
+                    "width_cm": SourceGeometry.rounded(sourceMapInfo.widthCm),
+                    "height_cm": SourceGeometry.rounded(sourceMapInfo.heightCm),
+                    "source_scale": sourceMapInfo.scale.map {
+                        SourceGeometry.rounded($0)
+                    } ?? NSNull(),
+                ]
+                manifest["element_role_contract"] =
+                    ElementRoleClassifier.manifestContractPayload
+                manifest["source_element_count"] = summary?.sourceElementCount
+                    ?? elements.count
+                manifest["active_element_count"] = elements.count
+                manifest["shelf_count"] = shelfCount
+                manifest["fixed_structure_count"] = fixedStructureCount
+                manifest["road_element_count"] = roadElementCount
+                manifest["presentation_ignored_count"] =
+                    summary?.presentationIgnoredCount ?? 0
+                manifest["unsupported_ignored_count"] =
+                    summary?.unsupportedIgnoredCount ?? 0
+                manifest["invalid_geometry_ignored_count"] =
+                    summary?.invalidGeometryIgnoredCount ?? 0
+                manifest["ignored_by_shape_type"] =
+                    summary?.ignoredByShapeType ?? [:]
+                manifest["legacy_shelf_info"] = [
+                    "present": summary?.legacyShelfInfoPresent ?? false,
+                    "row_count": summary?.legacyShelfInfoRowCount ?? 0,
+                    "authority": false,
+                ]
             }
 
-            try writeJSON(["format": "MarketScannerPriorMapElements", "version": 1, "elements": elements.map { $0.canonicalPayload }], to: staging, name: "elements.json")
+            let shelves = elements.filter {
+                ElementRoleClassifier.role(for: $0.shapeType) == .shelf
+            }
+            let fixed = elements.filter {
+                ElementRoleClassifier.role(for: $0.shapeType) == .fixedStructure
+            }
+
+            let packageElements = elements.map(packageElementPayload)
+            var packageElementsByID: [String: [String: Any]] = [:]
+            for payload in packageElements {
+                guard let identifier = payload["id"] as? String,
+                      !identifier.isEmpty,
+                      packageElementsByID[identifier] == nil else {
+                    throw CompileError.outputNotUsable(
+                        "compiled package element id is missing or duplicated")
+                }
+                packageElementsByID[identifier] = payload
+            }
+            try writeJSON(["format": "MarketScannerPriorMapElements", "version": 1, "elements": packageElements], to: staging, name: "elements.json")
             // V1R5 §12.2 (review B-14): the compiler emits EXPLICIT shelf
             // side semantics (front/back normals, longitudinal axis,
             // orientation provenance) so consumers never guess the
@@ -437,11 +546,11 @@ enum MobilePriorMapCompiler {
             try writeJSON([
                 "format": "MarketScannerPriorMapShelves",
                 "version": 2,
-                "shelves": shelves.map { $0.canonicalPayload },
+                "shelves": shelves.compactMap { packageElementsByID[$0.id] },
                 "shelf_segments": try compiledShelfSegments(shelves)
                     .map(\.canonicalPayload),
             ], to: staging, name: "shelves.json")
-            try writeJSON(["format": "MarketScannerPriorMapStructures", "version": 1, "structures": fixed.map { $0.canonicalPayload }], to: staging, name: "fixed_structures.json")
+            try writeJSON(["format": "MarketScannerPriorMapStructures", "version": 1, "structures": fixed.compactMap { packageElementsByID[$0.id] }], to: staging, name: "fixed_structures.json")
             try writeJSON(manifest, to: staging, name: "manifest.json")
             try writeJSON(graph, to: staging, name: "road_graph.json")
             try writeJSON(spatial, to: staging, name: "spatial_index.json")
@@ -459,6 +568,20 @@ enum MobilePriorMapCompiler {
                 "valid": true,
                 "summary": [
                     "element_count": elements.count,
+                    "source_element_count": manifestVersion == 2
+                        ? (summary?.sourceElementCount ?? elements.count)
+                        : elements.count,
+                    "active_element_count": elements.count,
+                    "shelf_count": shelfCount,
+                    "fixed_structure_count": fixedStructureCount,
+                    "road_element_count": roadElementCount,
+                    "presentation_ignored_count":
+                        summary?.presentationIgnoredCount ?? 0,
+                    "unsupported_ignored_count":
+                        summary?.unsupportedIgnoredCount ?? 0,
+                    "hidden_element_count": summary?.hiddenElementCount ?? 0,
+                    "invalid_geometry_ignored_count":
+                        summary?.invalidGeometryIgnoredCount ?? 0,
                     "malformed_row_count": 0,
                     "warning_count": warningsCopy.count,
                     "floor_count": floors.count,
@@ -501,6 +624,15 @@ enum MobilePriorMapCompiler {
             try? fileManager.removeItem(at: staging)
             throw error
         }
+    }
+
+    private static func packageElementPayload(
+        _ element: PriorMapSourceElement
+    ) -> [String: Any] {
+        var payload = element.canonicalPayload
+        payload["role"] = ElementRoleClassifier.role(
+            for: element.shapeType).rawValue
+        return payload
     }
 
     private static func writeJSON(_ payload: [String: Any], to directory: URL, name: String) throws {
@@ -597,10 +729,24 @@ enum MobilePriorMapCompiler {
 
     private static func boundsFromDictionary(_ value: [String: Double]) -> SourceGeometry.Bounds? {
         guard let minX = value["min_x_m"], let minY = value["min_y_m"],
-              let maxX = value["max_x_m"], let maxY = value["max_y_m"]
-        else { return nil }
+              let maxX = value["max_x_m"], let maxY = value["max_y_m"],
+              let width = value["width_m"], let height = value["height_m"],
+              [minX, minY, maxX, maxY, width, height].allSatisfy(\.isFinite),
+              minX <= maxX, minY <= maxY, width >= 0, height >= 0,
+              abs(width - (maxX - minX)) <= 1.0e-8,
+              abs(height - (maxY - minY)) <= 1.0e-8 else { return nil }
         return SourceGeometry.Bounds(
             minX_m: minX, minY_m: minY, maxX_m: maxX, maxY_m: maxY)
+    }
+
+    private static func boundsMatch(
+        _ lhs: SourceGeometry.Bounds,
+        _ rhs: SourceGeometry.Bounds
+    ) -> Bool {
+        return abs(lhs.minX_m - rhs.minX_m) <= 1.0e-8
+            && abs(lhs.minY_m - rhs.minY_m) <= 1.0e-8
+            && abs(lhs.maxX_m - rhs.maxX_m) <= 1.0e-8
+            && abs(lhs.maxY_m - rhs.maxY_m) <= 1.0e-8
     }
 
     /// Slugs a name like the PC `SAFE_NAME` contract.

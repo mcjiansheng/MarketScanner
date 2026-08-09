@@ -393,6 +393,11 @@ final class MobileOnlyWorkflowCoordinator {
             self.releaseImport()
             return
         }
+        contextLock.lock()
+        context.storeID = report.storeId
+        context.contractRaw = report.coordinateContractOrigin
+        contextLock.unlock()
+        persistContext()
         self.notifyImport(.success(report))
 
         // 2. Compile into a staging directory.

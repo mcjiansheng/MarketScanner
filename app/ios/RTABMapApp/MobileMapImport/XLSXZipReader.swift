@@ -112,7 +112,8 @@ enum XLSXZipReader {
             }
 
             // Encryption and general-purpose flag policy.
-            try validateGeneralPurposeFlags(flags, name: name)
+            try validateGeneralPurposeFlags(
+                flags, method: Int(method), name: name)
             // Multi-disk archives are rejected in EOCD; entries must not
             // point at another disk either.
             guard diskStart == 0 else {
@@ -223,15 +224,24 @@ enum XLSXZipReader {
 
     // MARK: - Entry validation
 
-    private static func validateGeneralPurposeFlags(_ flags: UInt16, name: String) throws {
+    private static func validateGeneralPurposeFlags(
+        _ flags: UInt16,
+        method: Int,
+        name: String
+    ) throws {
         // Bit 0: encrypted. Bit 6: strong encryption. Both are rejected.
         if flags & 0x0001 != 0 || flags & 0x0040 != 0 {
             throw MapSourceImportError.zipCorrupt(reason: "加密条目不支持：\(name)")
         }
-        // This reader explicitly supports bit 3 data descriptors and bit
-        // 11 UTF-8 entry names. Every other semantic flag is rejected so
-        // local/central interpretation cannot drift.
-        let supported: UInt16 = 0x0008 | 0x0800
+        // Deflate bits 1/2 are standardized compression-level hints and are
+        // emitted by real Excel-compatible writers (MapCase01 uses 0x0006).
+        // They do not change payload interpretation. Bit 3 data descriptors
+        // and bit 11 UTF-8 names remain supported as before.
+        if method != 8, flags & 0x0006 != 0 {
+            throw MapSourceImportError.zipCorrupt(
+                reason: "非 Deflate 条目包含压缩级别标志：\(name)")
+        }
+        let supported: UInt16 = 0x0006 | 0x0008 | 0x0800
         if flags & ~supported != 0 {
             throw MapSourceImportError.zipCorrupt(
                 reason: "条目标志不受支持：\(name)")
@@ -345,13 +355,24 @@ enum XLSXZipReader {
             throw MapSourceImportError.zipCorrupt(reason: "条目数据越界。")
         }
         if usesDataDescriptor {
-            guard payloadEnd + 16 <= data.count,
-                  readUInt32(data, at: payloadEnd) == 0x08074B50,
-                  readUInt32(data, at: payloadEnd + 4) == crc32Value,
-                  Int64(readUInt32(data, at: payloadEnd + 8))
-                    == compressedSize,
-                  Int64(readUInt32(data, at: payloadEnd + 12))
-                    == uncompressedSize else {
+            // APPNOTE permits the optional 0x08074B50 signature to be
+            // omitted. Accept both the 16-byte signed form and the 12-byte
+            // unsigned form while still binding CRC and both sizes to the
+            // authoritative central-directory record.
+            let signedDescriptorMatches = payloadEnd + 16 <= data.count
+                && readUInt32(data, at: payloadEnd) == 0x08074B50
+                && readUInt32(data, at: payloadEnd + 4) == crc32Value
+                && Int64(readUInt32(data, at: payloadEnd + 8))
+                    == compressedSize
+                && Int64(readUInt32(data, at: payloadEnd + 12))
+                    == uncompressedSize
+            let unsignedDescriptorMatches = payloadEnd + 12 <= data.count
+                && readUInt32(data, at: payloadEnd) == crc32Value
+                && Int64(readUInt32(data, at: payloadEnd + 4))
+                    == compressedSize
+                && Int64(readUInt32(data, at: payloadEnd + 8))
+                    == uncompressedSize
+            guard signedDescriptorMatches || unsignedDescriptorMatches else {
                 throw MapSourceImportError.zipCorrupt(
                     reason: "数据描述符不一致：\(name)")
             }

@@ -10,10 +10,9 @@ import Foundation
 /// payload (they live in `MapSourceIdentity` only).
 struct MarketScannerPriorMapSource: Equatable {
     static let formatValue = "MarketScannerPriorMapSource"
-    /// V1R4 §14.1: the primary type is version 2 with a snake_case JSON
-    /// document contract; legacy version 1 documents keep a separate
-    /// decoder (`LegacyV1JSONMapSourceDecoder`).
-    static let versionValue = 2
+    /// Standard-workbook imports use canonical v3. Legacy v1/v2 JSON and
+    /// element-only XLSX/CSV remain readable through their frozen decoders.
+    static let versionValue = 3
 
     var format: String
     var version: Int
@@ -21,8 +20,41 @@ struct MarketScannerPriorMapSource: Equatable {
     var mapName: String
     var source: MapSourceIdentity
     var coordinateContract: CoordinateContract
+    /// Present for a standard workbook (or canonical v3 JSON). Legacy
+    /// sources intentionally keep this nil and retain geometry-union bounds.
+    var sourceMapInfo: SourceMapInfo?
+    /// Non-canonical import statistics used only for package audit/reporting.
+    /// These values never enter the canonical business hash.
+    var importSummary: SourceImportSummary?
+    var roleContractVersion: Int
     var elements: [PriorMapSourceElement]
     var warnings: [MapSourceWarning]
+
+    init(
+        format: String,
+        version: Int,
+        storeId: String,
+        mapName: String,
+        source: MapSourceIdentity,
+        coordinateContract: CoordinateContract,
+        sourceMapInfo: SourceMapInfo? = nil,
+        importSummary: SourceImportSummary? = nil,
+        roleContractVersion: Int = ElementRoleClassifier.contractVersion,
+        elements: [PriorMapSourceElement],
+        warnings: [MapSourceWarning]
+    ) {
+        self.format = format
+        self.version = version
+        self.storeId = storeId
+        self.mapName = mapName
+        self.source = source
+        self.coordinateContract = coordinateContract
+        self.sourceMapInfo = sourceMapInfo
+        self.importSummary = importSummary
+        self.roleContractVersion = roleContractVersion
+        self.elements = elements
+        self.warnings = warnings
+    }
 
     /// The canonical payload whose deterministic encoding feeds
     /// `canonicalSourceSha256`. V2 business payload (see
@@ -30,6 +62,16 @@ struct MarketScannerPriorMapSource: Equatable {
     /// source rows, warnings and raw fields so that the same store map
     /// imported from XLSX, CSV and JSON produces the same digest.
     var canonicalPayload: [String: Any] {
+        if let sourceMapInfo = sourceMapInfo {
+            return CanonicalPriorMapBusinessSourceV3(
+                storeID: storeId,
+                mapName: mapName,
+                coordinateContract: coordinateContract,
+                sourceMapInfo: sourceMapInfo,
+                roleContractVersion: roleContractVersion,
+                elements: elements
+            ).payload
+        }
         return CanonicalPriorMapBusinessSourceV2(
             storeID: storeId,
             mapName: mapName,
@@ -42,6 +84,9 @@ struct MarketScannerPriorMapSource: Equatable {
         guard lhs.format == rhs.format, lhs.version == rhs.version,
               lhs.storeId == rhs.storeId, lhs.mapName == rhs.mapName,
               lhs.source == rhs.source, lhs.coordinateContract == rhs.coordinateContract,
+              lhs.sourceMapInfo == rhs.sourceMapInfo,
+              lhs.importSummary == rhs.importSummary,
+              lhs.roleContractVersion == rhs.roleContractVersion,
               lhs.elements.count == rhs.elements.count,
               lhs.warnings.count == rhs.warnings.count
         else { return false }
@@ -52,6 +97,101 @@ struct MarketScannerPriorMapSource: Equatable {
             return false
         }
         return true
+    }
+}
+
+struct SourceImportSummary: Equatable {
+    var sourceElementCount: Int
+    var presentationIgnoredCount: Int
+    var unsupportedIgnoredCount: Int
+    var hiddenElementCount: Int
+    var invalidGeometryIgnoredCount: Int
+    var ignoredByShapeType: [String: Int]
+    var legacyShelfInfoPresent: Bool
+    var legacyShelfInfoRowCount: Int
+    var malformedRowCount: Int
+}
+
+/// Authoritative `Basic Info` business and canvas contract. Width/height
+/// are source centimetres; `scale` is preserved in the canonical identity
+/// but never applied as a second coordinate conversion.
+struct SourceMapInfo: Equatable {
+    var mapName: String
+    var storeCode: String
+    var widthCm: Double
+    var heightCm: Double
+    var scale: Double?
+
+    var sourceCanvasBounds: SourceGeometry.Bounds {
+        return SourceGeometry.Bounds(
+            minX_m: 0,
+            minY_m: SourceGeometry.rounded(-SourceGeometry.cmToM(heightCm)),
+            maxX_m: SourceGeometry.rounded(SourceGeometry.cmToM(widthCm)),
+            maxY_m: 0)
+    }
+
+    var canonicalPayload: [String: Any] {
+        var payload: [String: Any] = [
+            "map_name": mapName,
+            "store_code": storeCode,
+            "width_cm": SourceGeometry.rounded(widthCm),
+            "height_cm": SourceGeometry.rounded(heightCm),
+            "scale": NSNull(),
+        ]
+        if let scale = scale {
+            payload["scale"] = SourceGeometry.rounded(scale)
+        }
+        return payload
+    }
+}
+
+/// Canonical v3 binds the formal workbook identity, Basic Info canvas,
+/// top-left rotation semantics and the unified production-role contract.
+struct CanonicalPriorMapBusinessSourceV3 {
+    static let formatValue = "MarketScannerPriorMapSource"
+    static let versionValue = 3
+
+    var storeID: String
+    var mapName: String
+    var coordinateContract: CoordinateContract
+    var sourceMapInfo: SourceMapInfo
+    var roleContractVersion: Int
+    var elements: [PriorMapSourceElement]
+
+    var payload: [String: Any] {
+        let keyed = elements.map { element in
+            (id: CanonicalPriorMapBusinessSourceV2.stableElementID(
+                for: element, storeID: storeID, mapName: mapName), element: element)
+        }
+        let ordered = keyed.sorted { lhs, rhs in
+            if lhs.id != rhs.id { return lhs.id < rhs.id }
+            let lhsString = (try? CanonicalJSONEncoder.encodeString(
+                CanonicalPriorMapBusinessSourceV2.elementPayload(
+                    lhs.element, storeID: storeID, mapName: mapName))) ?? ""
+            let rhsString = (try? CanonicalJSONEncoder.encodeString(
+                CanonicalPriorMapBusinessSourceV2.elementPayload(
+                    rhs.element, storeID: storeID, mapName: mapName))) ?? ""
+            return lhsString < rhsString
+        }
+        var coordinate = coordinateContract.canonicalPayload
+        coordinate["rectangle_anchor"] = "top_left"
+        coordinate["rotation_pivot"] = "top_left_anchor"
+        return [
+            "format": Self.formatValue,
+            "version": Self.versionValue,
+            "store_id": storeID,
+            "map_name": mapName,
+            "source_map_info": sourceMapInfo.canonicalPayload,
+            "coordinate_contract": coordinate,
+            "role_contract": [
+                "version": roleContractVersion,
+                "presentation_policy": "excluded_from_production_elements",
+            ],
+            "elements": ordered.map {
+                CanonicalPriorMapBusinessSourceV2.elementPayload(
+                    $0.element, storeID: storeID, mapName: mapName)
+            },
+        ]
     }
 }
 
@@ -202,7 +342,7 @@ struct CanonicalPriorMapBusinessSourceV2 {
         if let value = element.source["id"] as? String, !value.isEmpty {
             return value
         }
-        if let value = element.source["id"] as? Int {
+        if let value = StrictJSONScalar.integer(element.source["id"]) {
             return String(value)
         }
         return nil
@@ -217,6 +357,10 @@ struct MapImportAudit: Equatable {
     var sourceRows: [Int]
     var warnings: [MapSourceWarning]
     var rawFields: [[String: Any]]
+    var ignoredElementCount: Int = 0
+    var legacyShelfInfoPresent: Bool = false
+    var legacyShelfInfoRowCount: Int = 0
+    var sourceElementCount: Int = 0
 
     var payload: [String: Any] {
         return [
@@ -228,12 +372,20 @@ struct MapImportAudit: Equatable {
             "warnings": warnings.map { $0.canonicalPayload },
             "raw_field_count": rawFields.count,
             "raw_fields": rawFields,
+            "source_element_count": sourceElementCount,
+            "ignored_element_count": ignoredElementCount,
+            "legacy_shelf_info_present": legacyShelfInfoPresent,
+            "legacy_shelf_info_row_count": legacyShelfInfoRowCount,
         ]
     }
 
     static func == (lhs: MapImportAudit, rhs: MapImportAudit) -> Bool {
         guard lhs.format == rhs.format, lhs.sourceRows == rhs.sourceRows,
               lhs.warnings == rhs.warnings,
+              lhs.ignoredElementCount == rhs.ignoredElementCount,
+              lhs.legacyShelfInfoPresent == rhs.legacyShelfInfoPresent,
+              lhs.legacyShelfInfoRowCount == rhs.legacyShelfInfoRowCount,
+              lhs.sourceElementCount == rhs.sourceElementCount,
               lhs.rawFields.count == rhs.rawFields.count
         else { return false }
         return JSONValueComparer.equal(lhs.rawFields, rhs.rawFields)
@@ -305,7 +457,10 @@ struct PriorMapSourceElement: Equatable {
     var code: String
     var crossCode: String
     var rowFlag: String
-    var subsection: String?
+    /// Source business scalar. Standard workbooks currently use an integer;
+    /// older fixtures may use a string or null. Preserve the strict-JSON
+    /// value instead of coercing it across Swift/Python.
+    var subsection: Any?
     var geometry: [String: Any]?
     var bounds: [String: Double]?
     var centerM: [Double]?
@@ -356,7 +511,7 @@ struct PriorMapSourceElement: Equatable {
         code: String,
         crossCode: String,
         rowFlag: String,
-        subsection: String?,
+        subsection: Any?,
         geometry: [String: Any]?,
         bounds: [String: Double]?,
         centerM: [Double]?,
@@ -385,11 +540,12 @@ struct PriorMapSourceElement: Equatable {
               lhs.floorId == rhs.floorId, lhs.shapeType == rhs.shapeType,
               lhs.visible == rhs.visible, lhs.locked == rhs.locked,
               lhs.code == rhs.code, lhs.crossCode == rhs.crossCode,
-              lhs.rowFlag == rhs.rowFlag, lhs.subsection == rhs.subsection,
+              lhs.rowFlag == rhs.rowFlag,
               lhs.bounds == rhs.bounds, lhs.centerM == rhs.centerM,
               lhs.yawRad == rhs.yawRad
         else { return false }
-        return JSONValueComparer.equal(lhs.geometry, rhs.geometry)
+        return JSONValueComparer.equal(lhs.subsection, rhs.subsection)
+            && JSONValueComparer.equal(lhs.geometry, rhs.geometry)
             && JSONValueComparer.equal(lhs.source, rhs.source)
     }
 }

@@ -67,16 +67,15 @@ def source_rectangle_polygon(
 ) -> list[list[float]]:
     """Return a CCW map-space polygon for a source rectangle.
 
-    ``x`` and ``y`` denote the unrotated source rectangle's top-left corner.
-    Rotation is applied around its centre, matching the supplied map editor.
+    ``x`` and ``y`` are both the rectangle's top-left anchor and the frozen
+    rotation pivot.  Positive source rotation is clockwise because source
+    ``+y`` points down.
     """
 
     x = float(x_cm)
     y = float(y_cm)
     width = float(width_cm)
     height = float(height_cm)
-    cx = x + width / 2.0
-    cy = y + height / 2.0
     radians = math.radians(float(rotation_deg))
     cosine = math.cos(radians)
     sine = math.sin(radians)
@@ -88,15 +87,97 @@ def source_rectangle_polygon(
     )
     polygon: list[list[float]] = []
     for px, py in source_corners:
-        dx = px - cx
-        dy = py - cy
-        rotated_x = cx + dx * cosine - dy * sine
-        rotated_y = cy + dx * sine + dy * cosine
+        dx = px - x
+        dy = py - y
+        rotated_x = x + dx * cosine - dy * sine
+        rotated_y = y + dx * sine + dy * cosine
         map_x, map_y = source_point_to_map(rotated_x, rotated_y)
         polygon.append([map_x, map_y])
-    # Flipping source y reverses winding. Restore CCW order.
+    # Flipping source y reverses winding. Restore CCW order while retaining
+    # the source anchor as canonical P0: [P0, P3, P2, P1].  A plain
+    # ``reverse()`` would move P0 to the last slot and make the Python
+    # canonical geometry differ from the mobile contract even though the
+    # covered polygon is geometrically equivalent.
+    polygon = [polygon[0], polygon[3], polygon[2], polygon[1]]
+    return polygon
+
+
+def source_rectangle_center(
+    x_cm: float,
+    y_cm: float,
+    width_cm: float,
+    height_cm: float,
+    rotation_deg: float = 0.0,
+) -> tuple[float, float]:
+    """Return the rotated rectangle centroid in map metres.
+
+    The unrotated centroid is rotated around the same top-left anchor used
+    by :func:`source_rectangle_polygon`; using ``x+w/2,y+h/2`` directly
+    would disagree with the polygon for every non-zero rotation.
+    """
+
+    x = float(x_cm)
+    y = float(y_cm)
+    dx = float(width_cm) / 2.0
+    dy = float(height_cm) / 2.0
+    radians = math.radians(float(rotation_deg))
+    rotated_x = x + dx * math.cos(radians) - dy * math.sin(radians)
+    rotated_y = y + dx * math.sin(radians) + dy * math.cos(radians)
+    return source_point_to_map(rotated_x, rotated_y)
+
+
+def legacy_center_pivot_rectangle_polygon(
+    x_cm: float,
+    y_cm: float,
+    width_cm: float,
+    height_cm: float,
+    rotation_deg: float = 0.0,
+) -> list[list[float]]:
+    """Frozen v1/v2 rectangle geometry for explicit legacy imports.
+
+    Standard workbooks must use :func:`source_rectangle_polygon`.  This
+    center-pivot variant exists only so Element-Info-only XLSX/CSV/canonical
+    v1-v2 data stays byte-for-byte compatible with the mobile legacy path.
+    """
+
+    x = float(x_cm)
+    y = float(y_cm)
+    width = float(width_cm)
+    height = float(height_cm)
+    center_x = x + width / 2.0
+    center_y = y + height / 2.0
+    radians = math.radians(float(rotation_deg))
+    cosine = math.cos(radians)
+    sine = math.sin(radians)
+    source_corners = (
+        (x, y),
+        (x + width, y),
+        (x + width, y + height),
+        (x, y + height),
+    )
+    polygon: list[list[float]] = []
+    for px, py in source_corners:
+        dx = px - center_x
+        dy = py - center_y
+        rotated_x = center_x + dx * cosine - dy * sine
+        rotated_y = center_y + dx * sine + dy * cosine
+        polygon.append(list(source_point_to_map(rotated_x, rotated_y)))
     polygon.reverse()
     return polygon
+
+
+def legacy_center_pivot_rectangle_center(
+    x_cm: float,
+    y_cm: float,
+    width_cm: float,
+    height_cm: float,
+) -> tuple[float, float]:
+    """Frozen v1/v2 centroid; rotation about the centre leaves it fixed."""
+
+    return source_point_to_map(
+        float(x_cm) + float(width_cm) / 2.0,
+        float(y_cm) + float(height_cm) / 2.0,
+    )
 
 
 def polygon_bounds(points: Sequence[Sequence[float]]) -> Bounds:

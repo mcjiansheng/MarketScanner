@@ -78,11 +78,17 @@ enum CanonicalJSONEncoder {
         }
         if let number = value as? NSNumber {
             // JSONSerialization product: CFBoolean is the only way to tell
-            // a JSON boolean apart from a JSON number here.
+            // a JSON boolean apart from a JSON number here. Preserve the
+            // parser's integer-vs-floating representation as well: Python's
+            // strict JSON decoder keeps `1` as an integer and `1.0` as a
+            // float, and those business scalars must produce byte-identical
+            // canonical JSON on both platforms.
             if CFGetTypeID(number) == CFBooleanGetTypeID() {
                 output.append(Data((number.boolValue ? "true" : "false").utf8))
-            } else {
+            } else if foundationNumberIsFloatingPoint(number) {
                 try writeFiniteNumber(number.doubleValue, into: &output)
+            } else {
+                output.append(Data(number.stringValue.utf8))
             }
             return
         }
@@ -173,6 +179,14 @@ enum CanonicalJSONEncoder {
             throw CanonicalJSONError.nonFiniteNumber
         }
         output.append(Data(canonicalNumber(double).utf8))
+    }
+
+    /// `JSONSerialization` represents integer and floating JSON tokens with
+    /// different NSNumber Objective-C encodings. Checking `as? Int` is not
+    /// safe here because Foundation bridges integral doubles to Int too.
+    private static func foundationNumberIsFloatingPoint(_ number: NSNumber) -> Bool {
+        let encoding = String(cString: number.objCType)
+        return encoding == "f" || encoding == "d"
     }
 
     /// Lexicographic comparison by Unicode scalar values, matching the

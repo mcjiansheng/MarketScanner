@@ -9,12 +9,17 @@ import math
 from collections import defaultdict
 from typing import Any, Iterable
 
+from .element_roles import STRUCTURE_TYPES
+
 
 DISTANCE_FIELD_FORMAT = "MarketScannerDistanceFields"
 DISTANCE_FIELD_VERSION = 1
 DEFAULT_RESOLUTIONS_M = (0.40, 0.20, 0.10)
 DEFAULT_TRUNCATION_M = 2.0
-STRUCTURE_TYPES = {"MapShelf", "MapTable", "MapPillar", "MapTableFeature"}
+MAXIMUM_DIMENSION_CELLS = 20_000
+MAXIMUM_CELLS_PER_LEVEL = 8_000_000
+MAXIMUM_TOTAL_CELLS = 16_000_000
+MAXIMUM_SEED_SAMPLES_PER_SEGMENT = 100_000
 
 
 def _segments(
@@ -63,7 +68,13 @@ def _seed_cells(
     seeds: set[tuple[int, int]] = set()
     for start, end in segments:
         length = math.hypot(end[0] - start[0], end[1] - start[1])
-        steps = max(1, int(math.ceil(length / max(resolution * 0.45, 0.01))))
+        raw_steps = math.ceil(length / max(resolution * 0.45, 0.01))
+        if (
+            not math.isfinite(length)
+            or raw_steps > MAXIMUM_SEED_SAMPLES_PER_SEGMENT
+        ):
+            raise ValueError("Distance-field segment seed budget exceeded.")
+        steps = max(1, int(raw_steps))
         for index in range(steps + 1):
             ratio = index / steps
             x = start[0] + (end[0] - start[0]) * ratio
@@ -103,26 +114,50 @@ def _row_rle(
     return rows
 
 
-def _level(
-    segments: list[tuple[tuple[float, float], tuple[float, float]]],
+def _validated_grid(
     bounds: dict[str, Any],
     resolution: float,
     truncation_m: float,
+) -> tuple[float, float, int, int]:
+    values = [bounds.get(key) for key in ("min_x_m", "min_y_m", "max_x_m", "max_y_m")]
+    if any(
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(float(value))
+        for value in values
+    ):
+        raise ValueError("Distance-field bounds are invalid.")
+    min_x, min_y, max_x, max_y = (float(value) for value in values)
+    if min_x > max_x or min_y > max_y:
+        raise ValueError("Distance-field bounds are invalid.")
+    origin_x = math.floor((min_x - truncation_m) / resolution) * resolution
+    origin_y = math.floor((min_y - truncation_m) / resolution) * resolution
+    maximum_x = math.ceil((max_x + truncation_m) / resolution) * resolution
+    maximum_y = math.ceil((max_y + truncation_m) / resolution) * resolution
+    raw_width = round((maximum_x - origin_x) / resolution) + 1
+    raw_height = round((maximum_y - origin_y) / resolution) + 1
+    if (
+        not all(
+            math.isfinite(value)
+            for value in (origin_x, origin_y, maximum_x, maximum_y)
+        )
+        or raw_width < 1
+        or raw_height < 1
+        or raw_width > MAXIMUM_DIMENSION_CELLS
+        or raw_height > MAXIMUM_DIMENSION_CELLS
+        or raw_width * raw_height > MAXIMUM_CELLS_PER_LEVEL
+    ):
+        raise ValueError("Distance-field grid exceeds the resource budget.")
+    return origin_x, origin_y, int(raw_width), int(raw_height)
+
+
+def _level(
+    segments: list[tuple[tuple[float, float], tuple[float, float]]],
+    resolution: float,
+    truncation_m: float,
+    grid: tuple[float, float, int, int],
 ) -> dict[str, Any]:
-    origin_x = math.floor(
-        (float(bounds["min_x_m"]) - truncation_m) / resolution
-    ) * resolution
-    origin_y = math.floor(
-        (float(bounds["min_y_m"]) - truncation_m) / resolution
-    ) * resolution
-    maximum_x = math.ceil(
-        (float(bounds["max_x_m"]) + truncation_m) / resolution
-    ) * resolution
-    maximum_y = math.ceil(
-        (float(bounds["max_y_m"]) + truncation_m) / resolution
-    ) * resolution
-    width = max(1, int(round((maximum_x - origin_x) / resolution)) + 1)
-    height = max(1, int(round((maximum_y - origin_y) / resolution)) + 1)
+    origin_x, origin_y, width, height = grid
     seeds = _seed_cells(
         segments,
         origin_x,
@@ -188,11 +223,26 @@ def build_distance_fields(
 ) -> dict[str, Any]:
     if (
         not resolutions_m
-        or any(value <= 0 for value in resolutions_m)
+        or any(not math.isfinite(value) or value <= 0 for value in resolutions_m)
+        or not math.isfinite(truncation_m)
         or truncation_m <= 0
         or truncation_m > 2.55
     ):
         raise ValueError("Distance-field resolutions/truncation are invalid.")
+    grids_by_floor: dict[str, list[tuple[float, float, int, int]]] = {}
+    total_cells = 0
+    for floor in floors:
+        floor_id = str(floor.get("id", ""))
+        if not floor_id or floor_id in grids_by_floor or not isinstance(floor.get("bounds"), dict):
+            raise ValueError("Distance-field floor identity/bounds are invalid or duplicated.")
+        floor_grids = [
+            _validated_grid(floor["bounds"], resolution, truncation_m)
+            for resolution in resolutions_m
+        ]
+        total_cells += sum(width * height for _x, _y, width, height in floor_grids)
+        if total_cells > MAXIMUM_TOTAL_CELLS:
+            raise ValueError("Distance-field total grid cell budget exceeded.")
+        grids_by_floor[floor_id] = floor_grids
     by_floor = _segments(elements)
     payload_floors: dict[str, Any] = {}
     for floor in floors:
@@ -201,11 +251,13 @@ def build_distance_fields(
             "levels": [
                 _level(
                     by_floor.get(floor_id, []),
-                    floor["bounds"],
                     resolution,
                     truncation_m,
+                    grid,
                 )
-                for resolution in resolutions_m
+                for resolution, grid in zip(
+                    resolutions_m, grids_by_floor[floor_id]
+                )
             ]
         }
     return {
@@ -219,8 +271,18 @@ def build_distance_fields(
 
 
 def decode_level(level: dict[str, Any]) -> list[int]:
-    width = int(level["width"])
-    height = int(level["height"])
+    width = level.get("width")
+    height = level.get("height")
+    if (
+        type(width) is not int
+        or type(height) is not int
+        or width <= 0
+        or height <= 0
+        or width > MAXIMUM_DIMENSION_CELLS
+        or height > MAXIMUM_DIMENSION_CELLS
+        or width * height > MAXIMUM_CELLS_PER_LEVEL
+    ):
+        raise ValueError("Distance-field dimensions are invalid or exceed the budget.")
     values: list[int] = []
     rows = level["rows"]
     if not isinstance(rows, list) or len(rows) != height:
@@ -229,20 +291,29 @@ def decode_level(level: dict[str, Any]) -> list[int]:
         if not isinstance(row, list) or len(row) % 2:
             raise ValueError("Distance-field RLE row is invalid.")
         decoded: list[int] = []
+        decoded_count = 0
         for index in range(0, len(row), 2):
             count, value = row[index], row[index + 1]
             if (
-                not isinstance(count, int)
+                type(count) is not int
                 or count <= 0
-                or not isinstance(value, int)
+                or type(value) is not int
                 or not 0 <= value <= 255
+                or count > width - decoded_count
             ):
                 raise ValueError("Distance-field RLE value is invalid.")
             decoded.extend([value] * count)
+            decoded_count += count
         if len(decoded) != width:
             raise ValueError("Distance-field RLE width is invalid.")
         values.extend(decoded)
     canonical = json.dumps(rows, separators=(",", ":"), ensure_ascii=True).encode()
-    if hashlib.sha256(canonical).hexdigest() != level.get("data_sha256"):
+    data_sha256 = level.get("data_sha256")
+    if (
+        not isinstance(data_sha256, str)
+        or len(data_sha256) != 64
+        or any(character not in "0123456789abcdef" for character in data_sha256)
+        or hashlib.sha256(canonical).hexdigest() != data_sha256
+    ):
         raise ValueError("Distance-field checksum does not match.")
     return values

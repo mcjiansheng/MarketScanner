@@ -51,11 +51,7 @@ import supermarket_staged_map as staged
 import offline_processing as offline
 import gpu_acceleration as gpu
 import merge_processing as merge
-from PriorMap.prior_map_schema import (
-    PriorMapValidationError,
-    validate_business_identity,
-    validate_package as validate_prior_map_package,
-)
+from PriorMap.prior_map_schema import validate_package as validate_prior_map_package
 from PriorMap.xlsx_to_prior_map import convert_workbook as convert_prior_map_workbook
 from PriorMap import offline_localization as localized
 from PriorMap.factor_graph_runner import find_factor_graph_binary
@@ -2951,7 +2947,9 @@ def start_job(data: Dict[str, Any]) -> Job:
 def start_prior_map_job(data: Dict[str, Any]) -> Job:
     source = resolve_path(data.get("xlsx"), "Prior-map workbook")
     if not source.is_file() or source.suffix.lower() != ".xlsx":
-        raise RequestError("请选择包含 Element Info 工作表的 .xlsx 地图文件。")
+        raise RequestError(
+            "请选择包含 Basic Info 和 Element Info 工作表的正式 .xlsx 地图文件。"
+        )
     output = resolve_path(data.get("output"), "Prior-map output directory")
     if output.exists() and (not output.is_dir() or any(output.iterdir())):
         raise RequestError("先验地图输出目录必须为空；源 Excel 不会被修改。")
@@ -2961,10 +2959,20 @@ def start_prior_map_job(data: Dict[str, Any]) -> Job:
     if map_name is not None and not isinstance(map_name, str):
         raise RequestError("地图 name 必须是字符串。")
     store_id = data.get("store_id")
-    try:
-        validate_business_identity(store_id, map_name if map_name is not None else source.stem)
-    except PriorMapValidationError as exc:
-        raise RequestError(str(exc)) from exc
+    if store_id is not None and not isinstance(store_id, str):
+        raise RequestError("门店 store_id 断言必须是字符串。")
+    allow_legacy_element_only = data.get("allow_legacy_element_only", False)
+    if type(allow_legacy_element_only) is not bool:
+        raise RequestError("旧版 Element Info 兼容开关必须是布尔值。")
+    if allow_legacy_element_only:
+        if not store_id:
+            raise RequestError("旧版仅 Element Info 导入必须填写真实门店 ID。")
+        if not map_name:
+            raise RequestError("旧版仅 Element Info 导入必须填写地图名称。")
+        if store_id.strip() != store_id:
+            raise RequestError("旧版门店 ID 不能包含首尾空格。")
+        if map_name.strip() != map_name:
+            raise RequestError("旧版地图名称不能包含首尾空格。")
     job = STATE.add("prior_map", output, (str(source),))
 
     def worker() -> None:
@@ -2975,19 +2983,28 @@ def start_prior_map_job(data: Dict[str, Any]) -> Job:
                 job.identifier,
                 5,
                 "读取先验地图",
-                "正在读取 Element Info；源 Excel 保持只读。",
+                (
+                    "正在以显式旧版兼容模式读取 Element Info；门店 ID 与地图名称由操作者提供，源 Excel 保持只读。"
+                    if allow_legacy_element_only
+                    else "正在读取权威 Basic Info 与 Element Info，并审计但不使用 Shelf Info；源 Excel 保持只读。"
+                ),
             )
             STATE.update_progress(
                 job.identifier,
                 25,
                 "转换坐标与几何",
-                "正在统一厘米、坐标轴、旋转矩形和楼层范围。",
+                (
+                    "正在按旧版元素几何推导地图范围，并转换厘米坐标、旋转与楼层。"
+                    if allow_legacy_element_only
+                    else "正在按左上角锚点旋转、厘米到米转换和 Basic Info 画布生成生产几何。"
+                ),
             )
             convert_prior_map_workbook(
                 source,
                 output,
                 map_name,
                 store_id,
+                allow_legacy_element_only=allow_legacy_element_only,
             )
             STATE.update_progress(
                 job.identifier,
@@ -3013,13 +3030,23 @@ def start_prior_map_job(data: Dict[str, Any]) -> Job:
             STATE.update_progress(job.identifier, 99, "已取消", str(exc))
             STATE.set_status(job.identifier, "cancelled", str(exc))
         except Exception as exc:
+            error_message = str(exc)
+            if (
+                not allow_legacy_element_only
+                and error_message
+                == 'Workbook does not contain the required "Basic Info" worksheet.'
+            ):
+                error_message = (
+                    '当前 Excel 缺少 "Basic Info" 工作表。如果这是旧版仅含 '
+                    '"Element Info" 的文件，请明确勾选旧版兼容，并填写门店 ID 与地图名称。'
+                )
             STATE.update_progress(
                 job.identifier,
                 99,
                 "导入失败",
-                f"地图未发布，源 Excel 不受影响：{exc}",
+                f"地图未发布，源 Excel 不受影响：{error_message}",
             )
-            STATE.set_status(job.identifier, "failed", str(exc))
+            STATE.set_status(job.identifier, "failed", error_message)
             print(traceback.format_exc(), file=sys.stderr, flush=True)
         else:
             STATE.set_status(job.identifier, "complete")

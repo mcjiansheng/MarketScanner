@@ -26,18 +26,19 @@ enum StrictJSONScalar {
         return number.boolValue
     }
 
-    /// Strict JSON integer: a real number (never a boolean, never a
-    /// non-finite double, never a fractional double) that fits in Int.
+    /// Strict JSON integer token: never a boolean and never a floating-point
+    /// JSON token, even when that token has an integral value such as `2.0`.
+    /// Python's strict reader preserves the same int-vs-float distinction.
     static func integer(_ value: Any?) -> Int? {
         guard let number = value as? NSNumber,
               CFGetTypeID(number) != CFBooleanGetTypeID() else {
             return nil
         }
-        let double = number.doubleValue
-        guard double.isFinite, double.rounded() == double else {
+        let encoding = String(cString: number.objCType)
+        guard encoding != "f", encoding != "d" else {
             return nil
         }
-        return Int(exactly: double)
+        return Int(number.stringValue)
     }
 
     /// Strict JSON number: a real finite double, never a boolean.

@@ -101,7 +101,9 @@ enum MobilePreviewRenderer {
         context.setStrokeColor(CGColor(red: 0.6, green: 0.6, blue: 0.6, alpha: 1))
         context.setLineWidth(2)
         for element in elements {
-            guard let geometry = element.geometry,
+            guard element.visible,
+                  ElementRoleClassifier.role(for: element.shapeType) == .road,
+                  let geometry = element.geometry,
                   let coordinates = geometry["coordinates"] as? [Any]
             else { continue }
             if element.shapeType == "MapCross" || element.shapeType == "MapRoadPoint" {
@@ -110,7 +112,9 @@ enum MobilePreviewRenderer {
         }
         context.setFillColor(CGColor(red: 0.2, green: 0.5, blue: 0.9, alpha: 1))
         for element in elements {
-            guard let geometry = element.geometry,
+            let role = ElementRoleClassifier.role(for: element.shapeType)
+            guard element.visible, (role == .shelf || role == .fixedStructure),
+                  let geometry = element.geometry,
                   let coordinates = geometry["coordinates"] as? [Any]
             else { continue }
             if MobileElementTypes.rectangleTypes.contains(element.shapeType) {

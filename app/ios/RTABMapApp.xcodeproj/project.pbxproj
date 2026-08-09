@@ -7,13 +7,68 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
-		4EA7C2000000000100100001 /* MSRTABMapGraphReaderBridge.mm in Sources */ = {isa = PBXBuildFile; fileRef = 4EA7C2000000000100100002 /* MSRTABMapGraphReaderBridge.mm */; };
-		4EA7C2000000000200200001 /* market_scanner_factor_graph.cpp in Sources */ = {isa = PBXBuildFile; fileRef = 4EA7C2000000000200200002 /* market_scanner_factor_graph.cpp */; };
-		4EA7C1000000000F00200001 /* MobileNativeFactorGraph.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA7C1000000000F00200002 /* MobileNativeFactorGraph.swift */; };
-		4EA7C1000000001100200001 /* MobileNativeGraphTypes.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA7C1000000001100200002 /* MobileNativeGraphTypes.swift */; };
-		4EA7C1000000001200200001 /* MobileBuildIdentity.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA7C1000000001200200002 /* MobileBuildIdentity.swift */; };
-		4EA7C1000000001000200001 /* ProcessingResourceGovernor.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA7C1000000001000200002 /* ProcessingResourceGovernor.swift */; };
-		4EA7C2000000000200100001 /* MobileGraphReader.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA7C2000000000200100002 /* MobileGraphReader.swift */; };
+		4E0D83832621F52C00C879AC /* Settings.bundle in Resources */ = {isa = PBXBuildFile; fileRef = 4E0D83822621F52C00C879AC /* Settings.bundle */; };
+		4E1E9CF72D618E69000CB881 /* quad_color.cpp in Sources */ = {isa = PBXBuildFile; fileRef = 4E1E9CF62D618079000CB881 /* quad_color.cpp */; };
+		4E1E9CF82D618E69000CB881 /* text_drawable.cpp in Sources */ = {isa = PBXBuildFile; fileRef = 4E1E9CF52D618079000CB881 /* text_drawable.cpp */; };
+		4E20B24E266AB94300316EE6 /* Images.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 4E20B24D266AB94300316EE6 /* Images.xcassets */; };
+		4E20B250266AB95600316EE6 /* Images.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 4E20B24F266AB95600316EE6 /* Images.xcassets */; };
+		4E2C516725A63119005CEDBD /* DatabaseView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4E2C516525A63119005CEDBD /* DatabaseView.swift */; };
+		4E2C516825A63119005CEDBD /* VerticalScrollerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4E2C516625A63119005CEDBD /* VerticalScrollerView.swift */; };
+		4E3525682DE4C73E00F39D8F /* Accelerate.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 4E3525692DE4C73E00F39D8F /* Accelerate.framework */; };
+		4E8B155426273A580037FC53 /* Zip in Frameworks */ = {isa = PBXBuildFile; productRef = 4E8B155326273A580037FC53 /* Zip */; };
+		4EA100012F00000100100001 /* SupermarketScanSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA100012F00000100100002 /* SupermarketScanSession.swift */; };
+		4EA100012F00000100100003 /* PriceTagNFCReader.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA100012F00000100100004 /* PriceTagNFCReader.swift */; };
+		4EA100012F00000100100005 /* CoreNFC.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 4EA100012F00000100100006 /* CoreNFC.framework */; };
+		4EA200012F12B00100100001 /* Localizable.strings in Resources */ = {isa = PBXBuildFile; fileRef = 4EA200012F12B00100100002 /* Localizable.strings */; };
+		4EA300012F20000100100001 /* SupermarketStructureCoverage.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA300012F20000100100002 /* SupermarketStructureCoverage.swift */; };
+		4EA400012F30000100100001 /* PriorMapLocalization.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA400012F30000100100002 /* PriorMapLocalization.swift */; };
+		4EA400012F30000100100003 /* PriorMapLocalizationCore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA400012F30000100100004 /* PriorMapLocalizationCore.swift */; };
+		4EA500012F40000100100001 /* PriorMapScanMatcher.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA500012F40000100100002 /* PriorMapScanMatcher.swift */; };
+		4EA500012F40000100100003 /* PriorMapDepthSampler.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA500012F40000100100004 /* PriorMapDepthSampler.swift */; };
+		4EA500012F40000100100005 /* PriceTagLocalizationCore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA500012F40000100100006 /* PriceTagLocalizationCore.swift */; };
+		4EA500012F40000100100007 /* PriceTagVisionScanner.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA500012F40000100100008 /* PriceTagVisionScanner.swift */; };
+		4EA600012F50000100100007 /* PriorMapPackageIntegrityCore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA600012F50000100100008 /* PriorMapPackageIntegrityCore.swift */; };
+		4EA700012F60000100100001 /* SupermarketFinalizationCore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60000100100002 /* SupermarketFinalizationCore.swift */; };
+		4EA700012F60000200100001 /* RecoveryLifecyclePersistenceCore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60000200100002 /* RecoveryLifecyclePersistenceCore.swift */; };
+		4EA700012F60000300100001 /* RecoveryLifecycleEvidenceParser.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60000300100002 /* RecoveryLifecycleEvidenceParser.swift */; };
+		4EA700012F60000400100001 /* StrictJSONScalar.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60000400100002 /* StrictJSONScalar.swift */; };
+		4EA700012F60000500100001 /* StrictJSONKeyUniquenessValidator.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60000500100002 /* StrictJSONKeyUniquenessValidator.swift */; };
+		4EA700012F60000600100001 /* StrictJSONDocumentParser.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60000600100002 /* StrictJSONDocumentParser.swift */; };
+		4EA700012F60000700100001 /* PriorMapPackageSnapshotCore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60000700100002 /* PriorMapPackageSnapshotCore.swift */; };
+		4EA700012F60000800100001 /* CSVMapSourceImporter.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60000800100002 /* CSVMapSourceImporter.swift */; };
+		4EA700012F60000900100001 /* CanonicalJSONEncoder.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60000900100002 /* CanonicalJSONEncoder.swift */; };
+		4EA700012F60000A00100001 /* CanonicalPriorMapSource.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60000A00100002 /* CanonicalPriorMapSource.swift */; };
+		4EA700012F60000B00100001 /* ElementNormalizer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60000B00100002 /* ElementNormalizer.swift */; };
+		4EA700012F60000C00100001 /* JSONMapSourceImporter.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60000C00100002 /* JSONMapSourceImporter.swift */; };
+		4EA700012F60000D00100001 /* MapSourceDocumentPicker.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60000D00100002 /* MapSourceDocumentPicker.swift */; };
+		4EA700012F60000E00100001 /* MapSourceImportCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60000E00100002 /* MapSourceImportCoordinator.swift */; };
+		4EA700012F60000F00100001 /* MapSourceImportError.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60000F00100002 /* MapSourceImportError.swift */; };
+		4EA700012F60001000100001 /* MapSourceImportReport.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60001000100002 /* MapSourceImportReport.swift */; };
+		4EA700012F60001100100001 /* RFC4180CSVReader.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60001100100002 /* RFC4180CSVReader.swift */; };
+		4EA700012F60001200100001 /* SourceGeometry.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60001200100002 /* SourceGeometry.swift */; };
+		4EA700012F60001300100001 /* XLSXMapSourceImporter.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60001300100002 /* XLSXMapSourceImporter.swift */; };
+		4EA700012F60001400100001 /* XLSXWorkbookReader.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60001400100002 /* XLSXWorkbookReader.swift */; };
+		4EA700012F60001500100001 /* XLSXWorksheetReader.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60001500100002 /* XLSXWorksheetReader.swift */; };
+		4EA700012F60001600100001 /* XLSXZipReader.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60001600100002 /* XLSXZipReader.swift */; };
+		4EA700012F60001700100001 /* MobileDistanceFieldBuilder.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60001700100002 /* MobileDistanceFieldBuilder.swift */; };
+		4EA700012F60001800100001 /* MobilePackageManifestBuilder.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60001800100002 /* MobilePackageManifestBuilder.swift */; };
+		4EA700012F60001900100001 /* MobilePreviewRenderer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60001900100002 /* MobilePreviewRenderer.swift */; };
+		4EA700012F60001A00100001 /* MobilePriorMapCompiler.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60001A00100002 /* MobilePriorMapCompiler.swift */; };
+		4EA700012F60001B00100001 /* MobileRoadGraphBuilder.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60001B00100002 /* MobileRoadGraphBuilder.swift */; };
+		4EA700012F60001C00100001 /* ClockCorrelationRecorder.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60001C00100002 /* ClockCorrelationRecorder.swift */; };
+		4EA700012F60001D00100001 /* FinalTrajectory.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60001D00100002 /* FinalTrajectory.swift */; };
+		4EA700012F60001E00100001 /* SE2FactorGraphCore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60001E00100002 /* SE2FactorGraphCore.swift */; };
+		4EA700012F60001F00100001 /* SE2Transform.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60001F00100002 /* SE2Transform.swift */; };
+		4EA700012F60002000100001 /* SessionSnapshotTransaction.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60002000100002 /* SessionSnapshotTransaction.swift */; };
+		4EA700012F60002000A00001 /* ImmutableDirectoryPublication.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60002000A00002 /* ImmutableDirectoryPublication.swift */; };
+		4EA700012F60002100100001 /* ShelfAssociationEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60002100100002 /* ShelfAssociationEngine.swift */; };
+		4EA700012F60002200100001 /* TagObservationResolver.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60002200100002 /* TagObservationResolver.swift */; };
+		4EA700012F60002300100001 /* MobileResultExporter.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60002300100002 /* MobileResultExporter.swift */; };
+		4EA700012F60002400100001 /* MobileWorksheets.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60002400100002 /* MobileWorksheets.swift */; };
+		4EA700012F60002500100001 /* ResultShareController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60002500100002 /* ResultShareController.swift */; };
+		4EA700012F60002600100001 /* XLSXWorkbookWriter.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60002600100002 /* XLSXWorkbookWriter.swift */; };
+		4EA700012F60003000100001 /* AbsolutePriorEvidenceParser.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60003000100002 /* AbsolutePriorEvidenceParser.swift */; };
+		4EA700012F60003100100001 /* StrictClockEvidenceParser.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60003100100002 /* StrictClockEvidenceParser.swift */; };
 		4EA7C1000000000000100001 /* MobileOnlyWorkflowState.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA7C1000000000000100002 /* MobileOnlyWorkflowState.swift */; };
 		4EA7C1000000000100100001 /* MobileOnlyWorkflowError.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA7C1000000000100100002 /* MobileOnlyWorkflowError.swift */; };
 		4EA7C1000000000200100001 /* MobileMapLibrary.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA7C1000000000200100002 /* MobileMapLibrary.swift */; };
@@ -29,76 +84,21 @@
 		4EA7C1000000000C00100001 /* MobileProcessingViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA7C1000000000C00100002 /* MobileProcessingViewController.swift */; };
 		4EA7C1000000000D00100001 /* MobileResultViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA7C1000000000D00100002 /* MobileResultViewController.swift */; };
 		4EA7C1000000000E00100001 /* MobileRescanTasksViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA7C1000000000E00100002 /* MobileRescanTasksViewController.swift */; };
-		4E0D83832621F52C00C879AC /* Settings.bundle in Resources */ = {isa = PBXBuildFile; fileRef = 4E0D83822621F52C00C879AC /* Settings.bundle */; };
-		4E1E9CF72D618E69000CB881 /* quad_color.cpp in Sources */ = {isa = PBXBuildFile; fileRef = 4E1E9CF62D618079000CB881 /* quad_color.cpp */; };
-		4E1E9CF82D618E69000CB881 /* text_drawable.cpp in Sources */ = {isa = PBXBuildFile; fileRef = 4E1E9CF52D618079000CB881 /* text_drawable.cpp */; };
-		4E20B24E266AB94300316EE6 /* Images.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 4E20B24D266AB94300316EE6 /* Images.xcassets */; };
-		4E20B250266AB95600316EE6 /* Images.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 4E20B24F266AB95600316EE6 /* Images.xcassets */; };
-		4E2C516725A63119005CEDBD /* DatabaseView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4E2C516525A63119005CEDBD /* DatabaseView.swift */; };
-		4E2C516825A63119005CEDBD /* VerticalScrollerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4E2C516625A63119005CEDBD /* VerticalScrollerView.swift */; };
-		4E3525682DE4C73E00F39D8F /* Accelerate.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 4E3525692DE4C73E00F39D8F /* Accelerate.framework */; };
-		4E8B155426273A580037FC53 /* Zip in Frameworks */ = {isa = PBXBuildFile; productRef = 4E8B155326273A580037FC53 /* Zip */; };
-		4EA100012F00000100100001 /* SupermarketScanSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA100012F00000100100002 /* SupermarketScanSession.swift */; };
+		4EA7C1000000000F00200001 /* MobileNativeFactorGraph.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA7C1000000000F00200002 /* MobileNativeFactorGraph.swift */; };
+		4EA7C1000000001000200001 /* ProcessingResourceGovernor.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA7C1000000001000200002 /* ProcessingResourceGovernor.swift */; };
+		4EA7C1000000001100200001 /* MobileNativeGraphTypes.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA7C1000000001100200002 /* MobileNativeGraphTypes.swift */; };
+		4EA7C1000000001200200001 /* MobileBuildIdentity.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA7C1000000001200200002 /* MobileBuildIdentity.swift */; };
+		4EA7C2000000000100100001 /* MSRTABMapGraphReaderBridge.mm in Sources */ = {isa = PBXBuildFile; fileRef = 4EA7C2000000000100100002 /* MSRTABMapGraphReaderBridge.mm */; };
+		4EA7C2000000000200100001 /* MobileGraphReader.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA7C2000000000200100002 /* MobileGraphReader.swift */; };
+		4EA7C2000000000200200001 /* market_scanner_factor_graph.cpp in Sources */ = {isa = PBXBuildFile; fileRef = 4EA7C2000000000200200002 /* market_scanner_factor_graph.cpp */; };
 		4EA800012F70000100100001 /* GeneratedMobileEvidenceContracts.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA800012F70000100100002 /* GeneratedMobileEvidenceContracts.swift */; };
 		4EA800012F70000200100001 /* StrictJSONLStreamReader.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA800012F70000200100002 /* StrictJSONLStreamReader.swift */; };
 		4EA800012F70000300100001 /* TagObservationBurstEvidenceParser.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA800012F70000300100002 /* TagObservationBurstEvidenceParser.swift */; };
 		4EA800012F70000400100001 /* StrictLocalizationTraceParser.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA800012F70000400100002 /* StrictLocalizationTraceParser.swift */; };
 		4EA800012F70000500100001 /* TagObservationEvidenceParser.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA800012F70000500100002 /* TagObservationEvidenceParser.swift */; };
 		4EA800012F70000600100001 /* XLSXWorkbookVerifier.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA800012F70000600100002 /* XLSXWorkbookVerifier.swift */; };
-		4EA400012F30000100100001 /* PriorMapLocalization.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA400012F30000100100002 /* PriorMapLocalization.swift */; };
-		4EA400012F30000100100003 /* PriorMapLocalizationCore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA400012F30000100100004 /* PriorMapLocalizationCore.swift */; };
-		4EA700012F60000100100001 /* SupermarketFinalizationCore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60000100100002 /* SupermarketFinalizationCore.swift */; };
-		4EA700012F60000200100001 /* RecoveryLifecyclePersistenceCore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60000200100002 /* RecoveryLifecyclePersistenceCore.swift */; };
-		4EA700012F60000300100001 /* RecoveryLifecycleEvidenceParser.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60000300100002 /* RecoveryLifecycleEvidenceParser.swift */; };
-		4EA700012F60000400100001 /* StrictJSONScalar.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60000400100002 /* StrictJSONScalar.swift */; };
-		4EA700012F60000500100001 /* StrictJSONKeyUniquenessValidator.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60000500100002 /* StrictJSONKeyUniquenessValidator.swift */; };
-		4EA700012F60000700100001 /* PriorMapPackageSnapshotCore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60000700100002 /* PriorMapPackageSnapshotCore.swift */; };
-		4EA700012F60002600100001 /* XLSXWorkbookWriter.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60002600100002 /* XLSXWorkbookWriter.swift */; };
-		4EA700012F60002500100001 /* ResultShareController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60002500100002 /* ResultShareController.swift */; };
-		4EA700012F60002400100001 /* MobileWorksheets.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60002400100002 /* MobileWorksheets.swift */; };
-		4EA700012F60002300100001 /* MobileResultExporter.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60002300100002 /* MobileResultExporter.swift */; };
-		4EA700012F60002200100001 /* TagObservationResolver.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60002200100002 /* TagObservationResolver.swift */; };
-		4EA700012F60002100100001 /* ShelfAssociationEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60002100100002 /* ShelfAssociationEngine.swift */; };
-		4EA700012F60002000100001 /* SessionSnapshotTransaction.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60002000100002 /* SessionSnapshotTransaction.swift */; };
-		4EA700012F60002000A00001 /* ImmutableDirectoryPublication.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60002000A00002 /* ImmutableDirectoryPublication.swift */; };
-		4EA700012F60003000100001 /* AbsolutePriorEvidenceParser.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60003000100002 /* AbsolutePriorEvidenceParser.swift */; };
-		4EA700012F60003100100001 /* StrictClockEvidenceParser.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60003100100002 /* StrictClockEvidenceParser.swift */; };
-		4EA700012F60001F00100001 /* SE2Transform.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60001F00100002 /* SE2Transform.swift */; };
-		4EA700012F60001E00100001 /* SE2FactorGraphCore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60001E00100002 /* SE2FactorGraphCore.swift */; };
-		4EA700012F60001D00100001 /* FinalTrajectory.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60001D00100002 /* FinalTrajectory.swift */; };
-		4EA700012F60001C00100001 /* ClockCorrelationRecorder.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60001C00100002 /* ClockCorrelationRecorder.swift */; };
-		4EA700012F60001B00100001 /* MobileRoadGraphBuilder.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60001B00100002 /* MobileRoadGraphBuilder.swift */; };
-		4EA700012F60001A00100001 /* MobilePriorMapCompiler.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60001A00100002 /* MobilePriorMapCompiler.swift */; };
-		4EA700012F60001900100001 /* MobilePreviewRenderer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60001900100002 /* MobilePreviewRenderer.swift */; };
-		4EA700012F60001800100001 /* MobilePackageManifestBuilder.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60001800100002 /* MobilePackageManifestBuilder.swift */; };
-		4EA700012F60001700100001 /* MobileDistanceFieldBuilder.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60001700100002 /* MobileDistanceFieldBuilder.swift */; };
-		4EA700012F60001600100001 /* XLSXZipReader.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60001600100002 /* XLSXZipReader.swift */; };
-		4EA700012F60001500100001 /* XLSXWorksheetReader.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60001500100002 /* XLSXWorksheetReader.swift */; };
-		4EA700012F60001400100001 /* XLSXWorkbookReader.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60001400100002 /* XLSXWorkbookReader.swift */; };
-		4EA700012F60001300100001 /* XLSXMapSourceImporter.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60001300100002 /* XLSXMapSourceImporter.swift */; };
-		4EA700012F60001200100001 /* SourceGeometry.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60001200100002 /* SourceGeometry.swift */; };
-		4EA700012F60001100100001 /* RFC4180CSVReader.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60001100100002 /* RFC4180CSVReader.swift */; };
-		4EA700012F60001000100001 /* MapSourceImportReport.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60001000100002 /* MapSourceImportReport.swift */; };
-		4EA700012F60000F00100001 /* MapSourceImportError.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60000F00100002 /* MapSourceImportError.swift */; };
-		4EA700012F60000E00100001 /* MapSourceImportCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60000E00100002 /* MapSourceImportCoordinator.swift */; };
-		4EA700012F60000D00100001 /* MapSourceDocumentPicker.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60000D00100002 /* MapSourceDocumentPicker.swift */; };
-		4EA700012F60000C00100001 /* JSONMapSourceImporter.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60000C00100002 /* JSONMapSourceImporter.swift */; };
-		4EA700012F60000B00100001 /* ElementNormalizer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60000B00100002 /* ElementNormalizer.swift */; };
-		4EA700012F60000A00100001 /* CanonicalPriorMapSource.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60000A00100002 /* CanonicalPriorMapSource.swift */; };
-		4EA700012F60000900100001 /* CanonicalJSONEncoder.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60000900100002 /* CanonicalJSONEncoder.swift */; };
-		4EA700012F60000800100001 /* CSVMapSourceImporter.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60000800100002 /* CSVMapSourceImporter.swift */; };
-		4EA700012F60000600100001 /* StrictJSONDocumentParser.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60000600100002 /* StrictJSONDocumentParser.swift */; };
-		4EA500012F40000100100001 /* PriorMapScanMatcher.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA500012F40000100100002 /* PriorMapScanMatcher.swift */; };
-		4EA500012F40000100100003 /* PriorMapDepthSampler.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA500012F40000100100004 /* PriorMapDepthSampler.swift */; };
-		4EA500012F40000100100005 /* PriceTagLocalizationCore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA500012F40000100100006 /* PriceTagLocalizationCore.swift */; };
-		4EA600012F50000100100007 /* PriorMapPackageIntegrityCore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA600012F50000100100008 /* PriorMapPackageIntegrityCore.swift */; };
-		4EA500012F40000100100007 /* PriceTagVisionScanner.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA500012F40000100100008 /* PriceTagVisionScanner.swift */; };
 		4EA900012F80000100100001 /* PriceTagCaptureCore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA900012F80000100100002 /* PriceTagCaptureCore.swift */; };
 		4EA900012F80000200100001 /* PriceTagCaptureUI.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA900012F80000200100002 /* PriceTagCaptureUI.swift */; };
-		4EA100012F00000100100003 /* PriceTagNFCReader.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA100012F00000100100004 /* PriceTagNFCReader.swift */; };
-		4EA100012F00000100100005 /* CoreNFC.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 4EA100012F00000100100006 /* CoreNFC.framework */; };
-		4EA300012F20000100100001 /* SupermarketStructureCoverage.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA300012F20000100100002 /* SupermarketStructureCoverage.swift */; };
-		4EA200012F12B00100100001 /* Localizable.strings in Resources */ = {isa = PBXBuildFile; fileRef = 4EA200012F12B00100100002 /* Localizable.strings */; };
 		4EB1A66625A0D90B0043C7BF /* RTABMap.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EB1A66525A0D90B0043C7BF /* RTABMap.swift */; };
 		4EE016B3259BE441008CCE65 /* ViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EE016AF259BE441008CCE65 /* ViewController.swift */; };
 		4EE016B4259BE441008CCE65 /* SceneDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EE016B0259BE441008CCE65 /* SceneDelegate.swift */; };
@@ -140,31 +140,6 @@
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
-		4EA7C2000000000000100002 /* MSRTABMapGraphReaderBridge.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; name = MSRTABMapGraphReaderBridge.h; path = RTABMapApp/MSRTABMapGraphReaderBridge.h; sourceTree = "<group>"; };
-		4EA7C2000000000100100002 /* MSRTABMapGraphReaderBridge.mm */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.objcpp; name = MSRTABMapGraphReaderBridge.mm; path = RTABMapApp/MSRTABMapGraphReaderBridge.mm; sourceTree = "<group>"; };
-		4EA7C2000000000200200002 /* market_scanner_factor_graph.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; name = market_scanner_factor_graph.cpp; path = ../../core/MarketScannerFactorGraph/market_scanner_factor_graph.cpp; sourceTree = "<group>"; };
-		4EA7C2000000000200200003 /* market_scanner_factor_graph.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; name = market_scanner_factor_graph.h; path = ../../core/MarketScannerFactorGraph/market_scanner_factor_graph.h; sourceTree = "<group>"; };
-		4EA7C2000000000200200004 /* MSMarketScannerFactorGraphBridge.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; name = MSMarketScannerFactorGraphBridge.h; path = RTABMapApp/MSMarketScannerFactorGraphBridge.h; sourceTree = "<group>"; };
-		4EA7C1000000000F00200002 /* MobileNativeFactorGraph.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = MobileNativeFactorGraph.swift; path = RTABMapApp/MobileOnlyWorkflow/MobileNativeFactorGraph.swift; sourceTree = "<group>"; };
-		4EA7C1000000001100200002 /* MobileNativeGraphTypes.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = MobileNativeGraphTypes.swift; path = RTABMapApp/MobileOnlyWorkflow/MobileNativeGraphTypes.swift; sourceTree = "<group>"; };
-		4EA7C1000000001200200002 /* MobileBuildIdentity.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = MobileBuildIdentity.swift; path = RTABMapApp/MobileOnlyWorkflow/MobileBuildIdentity.swift; sourceTree = "<group>"; };
-		4EA7C1000000001000200002 /* ProcessingResourceGovernor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = ProcessingResourceGovernor.swift; path = RTABMapApp/MobileOnlyWorkflow/ProcessingResourceGovernor.swift; sourceTree = "<group>"; };
-		4EA7C2000000000200100002 /* MobileGraphReader.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = MobileGraphReader.swift; path = RTABMapApp/MobileOnlyWorkflow/MobileGraphReader.swift; sourceTree = "<group>"; };
-		4EA7C1000000000000100002 /* MobileOnlyWorkflowState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = MobileOnlyWorkflowState.swift; path = RTABMapApp/MobileOnlyWorkflow/MobileOnlyWorkflowState.swift; sourceTree = "<group>"; };
-		4EA7C1000000000100100002 /* MobileOnlyWorkflowError.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = MobileOnlyWorkflowError.swift; path = RTABMapApp/MobileOnlyWorkflow/MobileOnlyWorkflowError.swift; sourceTree = "<group>"; };
-		4EA7C1000000000200100002 /* MobileMapLibrary.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = MobileMapLibrary.swift; path = RTABMapApp/MobileOnlyWorkflow/MobileMapLibrary.swift; sourceTree = "<group>"; };
-		4EA7C1000000000300100002 /* MobileProcessingTaskStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = MobileProcessingTaskStore.swift; path = RTABMapApp/MobileOnlyWorkflow/MobileProcessingTaskStore.swift; sourceTree = "<group>"; };
-		4EA7C1000000000400100002 /* MobileResultLibrary.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = MobileResultLibrary.swift; path = RTABMapApp/MobileOnlyWorkflow/MobileResultLibrary.swift; sourceTree = "<group>"; };
-		4EA7C1000000000500100002 /* MobileOnlyWorkflowCoordinator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = MobileOnlyWorkflowCoordinator.swift; path = RTABMapApp/MobileOnlyWorkflow/MobileOnlyWorkflowCoordinator.swift; sourceTree = "<group>"; };
-		4EA7C1000000000600100002 /* MobileProcessingPipeline.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = MobileProcessingPipeline.swift; path = RTABMapApp/MobileOnlyWorkflow/MobileProcessingPipeline.swift; sourceTree = "<group>"; };
-		4EA7C1000000000700100002 /* MobileOnlyHomeViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = MobileOnlyHomeViewController.swift; path = RTABMapApp/MobileOnlyWorkflow/UI/MobileOnlyHomeViewController.swift; sourceTree = "<group>"; };
-		4EA7C1000000000800100002 /* MobileMapLibraryViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = MobileMapLibraryViewController.swift; path = RTABMapApp/MobileOnlyWorkflow/UI/MobileMapLibraryViewController.swift; sourceTree = "<group>"; };
-		4EA7C1000000000900100002 /* MobileMapImportViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = MobileMapImportViewController.swift; path = RTABMapApp/MobileOnlyWorkflow/UI/MobileMapImportViewController.swift; sourceTree = "<group>"; };
-		4EA7C1000000000A00100002 /* MobileMapCompileProgressViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = MobileMapCompileProgressViewController.swift; path = RTABMapApp/MobileOnlyWorkflow/UI/MobileMapCompileProgressViewController.swift; sourceTree = "<group>"; };
-		4EA7C1000000000B00100002 /* MobileScanSetupViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = MobileScanSetupViewController.swift; path = RTABMapApp/MobileOnlyWorkflow/UI/MobileScanSetupViewController.swift; sourceTree = "<group>"; };
-		4EA7C1000000000C00100002 /* MobileProcessingViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = MobileProcessingViewController.swift; path = RTABMapApp/MobileOnlyWorkflow/UI/MobileProcessingViewController.swift; sourceTree = "<group>"; };
-		4EA7C1000000000D00100002 /* MobileResultViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = MobileResultViewController.swift; path = RTABMapApp/MobileOnlyWorkflow/UI/MobileResultViewController.swift; sourceTree = "<group>"; };
-		4EA7C1000000000E00100002 /* MobileRescanTasksViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = MobileRescanTasksViewController.swift; path = RTABMapApp/MobileOnlyWorkflow/UI/MobileRescanTasksViewController.swift; sourceTree = "<group>"; };
 		44D4681D2D538A4100B094BA /* RTABMapApp.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; name = RTABMapApp.entitlements; path = RTABMapApp/RTABMapApp.entitlements; sourceTree = "<group>"; };
 		4E0D83822621F52C00C879AC /* Settings.bundle */ = {isa = PBXFileReference; lastKnownFileType = "wrapper.plug-in"; path = Settings.bundle; sourceTree = "<group>"; };
 		4E10D8602DE408EE0015926D /* libboost_stacktrace_noop.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libboost_stacktrace_noop.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/libboost_stacktrace_noop.a"; sourceTree = "<group>"; };
@@ -225,6 +200,84 @@
 		4E3525692DE4C73E00F39D8F /* Accelerate.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Accelerate.framework; path = System/Library/Frameworks/Accelerate.framework; sourceTree = SDKROOT; };
 		4E401BE825CC92C100240A56 /* ProgressionStatus.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; name = ProgressionStatus.h; path = ../android/jni/ProgressionStatus.h; sourceTree = "<group>"; };
 		4EA100012F00000100100002 /* SupermarketScanSession.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = SupermarketScanSession.swift; path = RTABMapApp/SupermarketScanSession.swift; sourceTree = "<group>"; };
+		4EA100012F00000100100004 /* PriceTagNFCReader.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = PriceTagNFCReader.swift; path = RTABMapApp/PriceTagNFCReader.swift; sourceTree = "<group>"; };
+		4EA100012F00000100100006 /* CoreNFC.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = CoreNFC.framework; path = System/Library/Frameworks/CoreNFC.framework; sourceTree = SDKROOT; };
+		4EA200012F12B00100100003 /* zh-Hans */ = {isa = PBXFileReference; lastKnownFileType = text.plist.strings; name = "zh-Hans"; path = "RTABMapApp/zh-Hans.lproj/Main.strings"; sourceTree = "<group>"; };
+		4EA200012F12B00100100004 /* zh-Hans */ = {isa = PBXFileReference; lastKnownFileType = text.plist.strings; name = "zh-Hans"; path = "RTABMapApp/zh-Hans.lproj/Localizable.strings"; sourceTree = "<group>"; };
+		4EA300012F20000100100002 /* SupermarketStructureCoverage.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = SupermarketStructureCoverage.swift; path = RTABMapApp/SupermarketStructureCoverage.swift; sourceTree = "<group>"; };
+		4EA400012F30000100100002 /* PriorMapLocalization.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = PriorMapLocalization.swift; path = RTABMapApp/PriorMapLocalization.swift; sourceTree = "<group>"; };
+		4EA400012F30000100100004 /* PriorMapLocalizationCore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = PriorMapLocalizationCore.swift; path = RTABMapApp/PriorMapLocalizationCore.swift; sourceTree = "<group>"; };
+		4EA500012F40000100100002 /* PriorMapScanMatcher.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = PriorMapScanMatcher.swift; path = RTABMapApp/PriorMapScanMatcher.swift; sourceTree = "<group>"; };
+		4EA500012F40000100100004 /* PriorMapDepthSampler.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = PriorMapDepthSampler.swift; path = RTABMapApp/PriorMapDepthSampler.swift; sourceTree = "<group>"; };
+		4EA500012F40000100100006 /* PriceTagLocalizationCore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = PriceTagLocalizationCore.swift; path = RTABMapApp/PriceTagLocalizationCore.swift; sourceTree = "<group>"; };
+		4EA500012F40000100100008 /* PriceTagVisionScanner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = PriceTagVisionScanner.swift; path = RTABMapApp/PriceTagVisionScanner.swift; sourceTree = "<group>"; };
+		4EA600012F50000100100008 /* PriorMapPackageIntegrityCore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = PriorMapPackageIntegrityCore.swift; path = RTABMapApp/PriorMapPackageIntegrityCore.swift; sourceTree = "<group>"; };
+		4EA700012F60000100100002 /* SupermarketFinalizationCore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = SupermarketFinalizationCore.swift; path = RTABMapApp/SupermarketFinalizationCore.swift; sourceTree = "<group>"; };
+		4EA700012F60000200100002 /* RecoveryLifecyclePersistenceCore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = RecoveryLifecyclePersistenceCore.swift; path = RTABMapApp/RecoveryLifecyclePersistenceCore.swift; sourceTree = "<group>"; };
+		4EA700012F60000300100002 /* RecoveryLifecycleEvidenceParser.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = RecoveryLifecycleEvidenceParser.swift; path = RTABMapApp/RecoveryLifecycleEvidenceParser.swift; sourceTree = "<group>"; };
+		4EA700012F60000400100002 /* StrictJSONScalar.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = StrictJSONScalar.swift; path = RTABMapApp/StrictJSONScalar.swift; sourceTree = "<group>"; };
+		4EA700012F60000500100002 /* StrictJSONKeyUniquenessValidator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = StrictJSONKeyUniquenessValidator.swift; path = RTABMapApp/StrictJSONKeyUniquenessValidator.swift; sourceTree = "<group>"; };
+		4EA700012F60000600100002 /* StrictJSONDocumentParser.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = StrictJSONDocumentParser.swift; path = RTABMapApp/StrictJSONDocumentParser.swift; sourceTree = "<group>"; };
+		4EA700012F60000700100002 /* PriorMapPackageSnapshotCore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = PriorMapPackageSnapshotCore.swift; path = RTABMapApp/PriorMapPackageSnapshotCore.swift; sourceTree = "<group>"; };
+		4EA700012F60000800100002 /* CSVMapSourceImporter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = CSVMapSourceImporter.swift; path = RTABMapApp/MobileMapImport/CSVMapSourceImporter.swift; sourceTree = "<group>"; };
+		4EA700012F60000900100002 /* CanonicalJSONEncoder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = CanonicalJSONEncoder.swift; path = RTABMapApp/MobileMapImport/CanonicalJSONEncoder.swift; sourceTree = "<group>"; };
+		4EA700012F60000A00100002 /* CanonicalPriorMapSource.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = CanonicalPriorMapSource.swift; path = RTABMapApp/MobileMapImport/CanonicalPriorMapSource.swift; sourceTree = "<group>"; };
+		4EA700012F60000B00100002 /* ElementNormalizer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = ElementNormalizer.swift; path = RTABMapApp/MobileMapImport/ElementNormalizer.swift; sourceTree = "<group>"; };
+		4EA700012F60000C00100002 /* JSONMapSourceImporter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = JSONMapSourceImporter.swift; path = RTABMapApp/MobileMapImport/JSONMapSourceImporter.swift; sourceTree = "<group>"; };
+		4EA700012F60000D00100002 /* MapSourceDocumentPicker.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = MapSourceDocumentPicker.swift; path = RTABMapApp/MobileMapImport/MapSourceDocumentPicker.swift; sourceTree = "<group>"; };
+		4EA700012F60000E00100002 /* MapSourceImportCoordinator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = MapSourceImportCoordinator.swift; path = RTABMapApp/MobileMapImport/MapSourceImportCoordinator.swift; sourceTree = "<group>"; };
+		4EA700012F60000F00100002 /* MapSourceImportError.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = MapSourceImportError.swift; path = RTABMapApp/MobileMapImport/MapSourceImportError.swift; sourceTree = "<group>"; };
+		4EA700012F60001000100002 /* MapSourceImportReport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = MapSourceImportReport.swift; path = RTABMapApp/MobileMapImport/MapSourceImportReport.swift; sourceTree = "<group>"; };
+		4EA700012F60001100100002 /* RFC4180CSVReader.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = RFC4180CSVReader.swift; path = RTABMapApp/MobileMapImport/RFC4180CSVReader.swift; sourceTree = "<group>"; };
+		4EA700012F60001200100002 /* SourceGeometry.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = SourceGeometry.swift; path = RTABMapApp/MobileMapImport/SourceGeometry.swift; sourceTree = "<group>"; };
+		4EA700012F60001300100002 /* XLSXMapSourceImporter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = XLSXMapSourceImporter.swift; path = RTABMapApp/MobileMapImport/XLSXMapSourceImporter.swift; sourceTree = "<group>"; };
+		4EA700012F60001400100002 /* XLSXWorkbookReader.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = XLSXWorkbookReader.swift; path = RTABMapApp/MobileMapImport/XLSXWorkbookReader.swift; sourceTree = "<group>"; };
+		4EA700012F60001500100002 /* XLSXWorksheetReader.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = XLSXWorksheetReader.swift; path = RTABMapApp/MobileMapImport/XLSXWorksheetReader.swift; sourceTree = "<group>"; };
+		4EA700012F60001600100002 /* XLSXZipReader.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = XLSXZipReader.swift; path = RTABMapApp/MobileMapImport/XLSXZipReader.swift; sourceTree = "<group>"; };
+		4EA700012F60001700100002 /* MobileDistanceFieldBuilder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = MobileDistanceFieldBuilder.swift; path = RTABMapApp/MobilePriorMapCompiler/MobileDistanceFieldBuilder.swift; sourceTree = "<group>"; };
+		4EA700012F60001800100002 /* MobilePackageManifestBuilder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = MobilePackageManifestBuilder.swift; path = RTABMapApp/MobilePriorMapCompiler/MobilePackageManifestBuilder.swift; sourceTree = "<group>"; };
+		4EA700012F60001900100002 /* MobilePreviewRenderer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = MobilePreviewRenderer.swift; path = RTABMapApp/MobilePriorMapCompiler/MobilePreviewRenderer.swift; sourceTree = "<group>"; };
+		4EA700012F60001A00100002 /* MobilePriorMapCompiler.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = MobilePriorMapCompiler.swift; path = RTABMapApp/MobilePriorMapCompiler/MobilePriorMapCompiler.swift; sourceTree = "<group>"; };
+		4EA700012F60001B00100002 /* MobileRoadGraphBuilder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = MobileRoadGraphBuilder.swift; path = RTABMapApp/MobilePriorMapCompiler/MobileRoadGraphBuilder.swift; sourceTree = "<group>"; };
+		4EA700012F60001C00100002 /* ClockCorrelationRecorder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = ClockCorrelationRecorder.swift; path = RTABMapApp/MobilePostProcessing/ClockCorrelationRecorder.swift; sourceTree = "<group>"; };
+		4EA700012F60001D00100002 /* FinalTrajectory.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = FinalTrajectory.swift; path = RTABMapApp/MobilePostProcessing/FinalTrajectory.swift; sourceTree = "<group>"; };
+		4EA700012F60001E00100002 /* SE2FactorGraphCore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = SE2FactorGraphCore.swift; path = RTABMapApp/MobilePostProcessing/SE2FactorGraphCore.swift; sourceTree = "<group>"; };
+		4EA700012F60001F00100002 /* SE2Transform.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = SE2Transform.swift; path = RTABMapApp/MobilePostProcessing/SE2Transform.swift; sourceTree = "<group>"; };
+		4EA700012F60002000100002 /* SessionSnapshotTransaction.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = SessionSnapshotTransaction.swift; path = RTABMapApp/MobilePostProcessing/SessionSnapshotTransaction.swift; sourceTree = "<group>"; };
+		4EA700012F60002000A00002 /* ImmutableDirectoryPublication.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = ImmutableDirectoryPublication.swift; path = RTABMapApp/MobilePostProcessing/ImmutableDirectoryPublication.swift; sourceTree = "<group>"; };
+		4EA700012F60002100100002 /* ShelfAssociationEngine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = ShelfAssociationEngine.swift; path = RTABMapApp/MobilePostProcessing/ShelfAssociationEngine.swift; sourceTree = "<group>"; };
+		4EA700012F60002200100002 /* TagObservationResolver.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = TagObservationResolver.swift; path = RTABMapApp/MobilePostProcessing/TagObservationResolver.swift; sourceTree = "<group>"; };
+		4EA700012F60002300100002 /* MobileResultExporter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = MobileResultExporter.swift; path = RTABMapApp/MobileResults/MobileResultExporter.swift; sourceTree = "<group>"; };
+		4EA700012F60002400100002 /* MobileWorksheets.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = MobileWorksheets.swift; path = RTABMapApp/MobileResults/MobileWorksheets.swift; sourceTree = "<group>"; };
+		4EA700012F60002500100002 /* ResultShareController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = ResultShareController.swift; path = RTABMapApp/MobileResults/ResultShareController.swift; sourceTree = "<group>"; };
+		4EA700012F60002600100002 /* XLSXWorkbookWriter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = XLSXWorkbookWriter.swift; path = RTABMapApp/MobileResults/XLSXWorkbookWriter.swift; sourceTree = "<group>"; };
+		4EA700012F60003000100002 /* AbsolutePriorEvidenceParser.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = AbsolutePriorEvidenceParser.swift; path = RTABMapApp/MobilePostProcessing/AbsolutePriorEvidenceParser.swift; sourceTree = "<group>"; };
+		4EA700012F60003100100002 /* StrictClockEvidenceParser.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = StrictClockEvidenceParser.swift; path = RTABMapApp/MobilePostProcessing/StrictClockEvidenceParser.swift; sourceTree = "<group>"; };
+		4EA7C1000000000000100002 /* MobileOnlyWorkflowState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = MobileOnlyWorkflowState.swift; path = RTABMapApp/MobileOnlyWorkflow/MobileOnlyWorkflowState.swift; sourceTree = "<group>"; };
+		4EA7C1000000000100100002 /* MobileOnlyWorkflowError.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = MobileOnlyWorkflowError.swift; path = RTABMapApp/MobileOnlyWorkflow/MobileOnlyWorkflowError.swift; sourceTree = "<group>"; };
+		4EA7C1000000000200100002 /* MobileMapLibrary.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = MobileMapLibrary.swift; path = RTABMapApp/MobileOnlyWorkflow/MobileMapLibrary.swift; sourceTree = "<group>"; };
+		4EA7C1000000000300100002 /* MobileProcessingTaskStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = MobileProcessingTaskStore.swift; path = RTABMapApp/MobileOnlyWorkflow/MobileProcessingTaskStore.swift; sourceTree = "<group>"; };
+		4EA7C1000000000400100002 /* MobileResultLibrary.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = MobileResultLibrary.swift; path = RTABMapApp/MobileOnlyWorkflow/MobileResultLibrary.swift; sourceTree = "<group>"; };
+		4EA7C1000000000500100002 /* MobileOnlyWorkflowCoordinator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = MobileOnlyWorkflowCoordinator.swift; path = RTABMapApp/MobileOnlyWorkflow/MobileOnlyWorkflowCoordinator.swift; sourceTree = "<group>"; };
+		4EA7C1000000000600100002 /* MobileProcessingPipeline.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = MobileProcessingPipeline.swift; path = RTABMapApp/MobileOnlyWorkflow/MobileProcessingPipeline.swift; sourceTree = "<group>"; };
+		4EA7C1000000000700100002 /* MobileOnlyHomeViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = MobileOnlyHomeViewController.swift; path = RTABMapApp/MobileOnlyWorkflow/UI/MobileOnlyHomeViewController.swift; sourceTree = "<group>"; };
+		4EA7C1000000000800100002 /* MobileMapLibraryViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = MobileMapLibraryViewController.swift; path = RTABMapApp/MobileOnlyWorkflow/UI/MobileMapLibraryViewController.swift; sourceTree = "<group>"; };
+		4EA7C1000000000900100002 /* MobileMapImportViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = MobileMapImportViewController.swift; path = RTABMapApp/MobileOnlyWorkflow/UI/MobileMapImportViewController.swift; sourceTree = "<group>"; };
+		4EA7C1000000000A00100002 /* MobileMapCompileProgressViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = MobileMapCompileProgressViewController.swift; path = RTABMapApp/MobileOnlyWorkflow/UI/MobileMapCompileProgressViewController.swift; sourceTree = "<group>"; };
+		4EA7C1000000000B00100002 /* MobileScanSetupViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = MobileScanSetupViewController.swift; path = RTABMapApp/MobileOnlyWorkflow/UI/MobileScanSetupViewController.swift; sourceTree = "<group>"; };
+		4EA7C1000000000C00100002 /* MobileProcessingViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = MobileProcessingViewController.swift; path = RTABMapApp/MobileOnlyWorkflow/UI/MobileProcessingViewController.swift; sourceTree = "<group>"; };
+		4EA7C1000000000D00100002 /* MobileResultViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = MobileResultViewController.swift; path = RTABMapApp/MobileOnlyWorkflow/UI/MobileResultViewController.swift; sourceTree = "<group>"; };
+		4EA7C1000000000E00100002 /* MobileRescanTasksViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = MobileRescanTasksViewController.swift; path = RTABMapApp/MobileOnlyWorkflow/UI/MobileRescanTasksViewController.swift; sourceTree = "<group>"; };
+		4EA7C1000000000F00200002 /* MobileNativeFactorGraph.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = MobileNativeFactorGraph.swift; path = RTABMapApp/MobileOnlyWorkflow/MobileNativeFactorGraph.swift; sourceTree = "<group>"; };
+		4EA7C1000000001000200002 /* ProcessingResourceGovernor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = ProcessingResourceGovernor.swift; path = RTABMapApp/MobileOnlyWorkflow/ProcessingResourceGovernor.swift; sourceTree = "<group>"; };
+		4EA7C1000000001100200002 /* MobileNativeGraphTypes.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = MobileNativeGraphTypes.swift; path = RTABMapApp/MobileOnlyWorkflow/MobileNativeGraphTypes.swift; sourceTree = "<group>"; };
+		4EA7C1000000001200200002 /* MobileBuildIdentity.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = MobileBuildIdentity.swift; path = RTABMapApp/MobileOnlyWorkflow/MobileBuildIdentity.swift; sourceTree = "<group>"; };
+		4EA7C2000000000000100002 /* MSRTABMapGraphReaderBridge.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; name = MSRTABMapGraphReaderBridge.h; path = RTABMapApp/MSRTABMapGraphReaderBridge.h; sourceTree = "<group>"; };
+		4EA7C2000000000100100002 /* MSRTABMapGraphReaderBridge.mm */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.objcpp; name = MSRTABMapGraphReaderBridge.mm; path = RTABMapApp/MSRTABMapGraphReaderBridge.mm; sourceTree = "<group>"; };
+		4EA7C2000000000200100002 /* MobileGraphReader.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = MobileGraphReader.swift; path = RTABMapApp/MobileOnlyWorkflow/MobileGraphReader.swift; sourceTree = "<group>"; };
+		4EA7C2000000000200200002 /* market_scanner_factor_graph.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; name = market_scanner_factor_graph.cpp; path = ../../core/MarketScannerFactorGraph/market_scanner_factor_graph.cpp; sourceTree = "<group>"; };
+		4EA7C2000000000200200003 /* market_scanner_factor_graph.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; name = market_scanner_factor_graph.h; path = ../../core/MarketScannerFactorGraph/market_scanner_factor_graph.h; sourceTree = "<group>"; };
+		4EA7C2000000000200200004 /* MSMarketScannerFactorGraphBridge.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; name = MSMarketScannerFactorGraphBridge.h; path = RTABMapApp/MSMarketScannerFactorGraphBridge.h; sourceTree = "<group>"; };
 		4EA800012F70000100100002 /* GeneratedMobileEvidenceContracts.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = GeneratedMobileEvidenceContracts.swift; path = RTABMapApp/GeneratedMobileEvidenceContracts.swift; sourceTree = "<group>"; };
 		4EA800012F70000200100002 /* StrictJSONLStreamReader.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = StrictJSONLStreamReader.swift; path = RTABMapApp/MobilePostProcessing/StrictJSONLStreamReader.swift; sourceTree = "<group>"; };
 		4EA800012F70000300100002 /* TagObservationBurstEvidenceParser.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = TagObservationBurstEvidenceParser.swift; path = RTABMapApp/MobilePostProcessing/TagObservationBurstEvidenceParser.swift; sourceTree = "<group>"; };
@@ -232,59 +285,8 @@
 		4EA800012F70000500100002 /* TagObservationEvidenceParser.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = TagObservationEvidenceParser.swift; path = RTABMapApp/MobilePostProcessing/TagObservationEvidenceParser.swift; sourceTree = "<group>"; };
 		4EA800012F70000600100002 /* XLSXWorkbookVerifier.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = XLSXWorkbookVerifier.swift; path = RTABMapApp/MobileResults/XLSXWorkbookVerifier.swift; sourceTree = "<group>"; };
 		4EA800012F70000700100002 /* MarketScannerNativeDependencies.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; name = MarketScannerNativeDependencies.xcconfig; path = RTABMapApp/MarketScannerNativeDependencies.xcconfig; sourceTree = "<group>"; };
-		4EA100012F00000100100004 /* PriceTagNFCReader.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = PriceTagNFCReader.swift; path = RTABMapApp/PriceTagNFCReader.swift; sourceTree = "<group>"; };
-		4EA400012F30000100100002 /* PriorMapLocalization.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = PriorMapLocalization.swift; path = RTABMapApp/PriorMapLocalization.swift; sourceTree = "<group>"; };
-		4EA400012F30000100100004 /* PriorMapLocalizationCore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = PriorMapLocalizationCore.swift; path = RTABMapApp/PriorMapLocalizationCore.swift; sourceTree = "<group>"; };
-		4EA700012F60000100100002 /* SupermarketFinalizationCore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = SupermarketFinalizationCore.swift; path = RTABMapApp/SupermarketFinalizationCore.swift; sourceTree = "<group>"; };
-		4EA700012F60000200100002 /* RecoveryLifecyclePersistenceCore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = RecoveryLifecyclePersistenceCore.swift; path = RTABMapApp/RecoveryLifecyclePersistenceCore.swift; sourceTree = "<group>"; };
-		4EA700012F60000300100002 /* RecoveryLifecycleEvidenceParser.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = RecoveryLifecycleEvidenceParser.swift; path = RTABMapApp/RecoveryLifecycleEvidenceParser.swift; sourceTree = "<group>"; };
-		4EA700012F60000400100002 /* StrictJSONScalar.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = StrictJSONScalar.swift; path = RTABMapApp/StrictJSONScalar.swift; sourceTree = "<group>"; };
-		4EA700012F60000500100002 /* StrictJSONKeyUniquenessValidator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = StrictJSONKeyUniquenessValidator.swift; path = RTABMapApp/StrictJSONKeyUniquenessValidator.swift; sourceTree = "<group>"; };
-		4EA700012F60000700100002 /* PriorMapPackageSnapshotCore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = PriorMapPackageSnapshotCore.swift; path = RTABMapApp/PriorMapPackageSnapshotCore.swift; sourceTree = "<group>"; };
-		4EA700012F60002600100002 /* XLSXWorkbookWriter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = XLSXWorkbookWriter.swift; path = RTABMapApp/MobileResults/XLSXWorkbookWriter.swift; sourceTree = "<group>"; };
-		4EA700012F60002500100002 /* ResultShareController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = ResultShareController.swift; path = RTABMapApp/MobileResults/ResultShareController.swift; sourceTree = "<group>"; };
-		4EA700012F60002400100002 /* MobileWorksheets.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = MobileWorksheets.swift; path = RTABMapApp/MobileResults/MobileWorksheets.swift; sourceTree = "<group>"; };
-		4EA700012F60002300100002 /* MobileResultExporter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = MobileResultExporter.swift; path = RTABMapApp/MobileResults/MobileResultExporter.swift; sourceTree = "<group>"; };
-		4EA700012F60002200100002 /* TagObservationResolver.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = TagObservationResolver.swift; path = RTABMapApp/MobilePostProcessing/TagObservationResolver.swift; sourceTree = "<group>"; };
-		4EA700012F60002100100002 /* ShelfAssociationEngine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = ShelfAssociationEngine.swift; path = RTABMapApp/MobilePostProcessing/ShelfAssociationEngine.swift; sourceTree = "<group>"; };
-		4EA700012F60002000100002 /* SessionSnapshotTransaction.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = SessionSnapshotTransaction.swift; path = RTABMapApp/MobilePostProcessing/SessionSnapshotTransaction.swift; sourceTree = "<group>"; };
-		4EA700012F60002000A00002 /* ImmutableDirectoryPublication.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = ImmutableDirectoryPublication.swift; path = RTABMapApp/MobilePostProcessing/ImmutableDirectoryPublication.swift; sourceTree = "<group>"; };
-		4EA700012F60003000100002 /* AbsolutePriorEvidenceParser.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = AbsolutePriorEvidenceParser.swift; path = RTABMapApp/MobilePostProcessing/AbsolutePriorEvidenceParser.swift; sourceTree = "<group>"; };
-		4EA700012F60003100100002 /* StrictClockEvidenceParser.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = StrictClockEvidenceParser.swift; path = RTABMapApp/MobilePostProcessing/StrictClockEvidenceParser.swift; sourceTree = "<group>"; };
-		4EA700012F60001F00100002 /* SE2Transform.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = SE2Transform.swift; path = RTABMapApp/MobilePostProcessing/SE2Transform.swift; sourceTree = "<group>"; };
-		4EA700012F60001E00100002 /* SE2FactorGraphCore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = SE2FactorGraphCore.swift; path = RTABMapApp/MobilePostProcessing/SE2FactorGraphCore.swift; sourceTree = "<group>"; };
-		4EA700012F60001D00100002 /* FinalTrajectory.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = FinalTrajectory.swift; path = RTABMapApp/MobilePostProcessing/FinalTrajectory.swift; sourceTree = "<group>"; };
-		4EA700012F60001C00100002 /* ClockCorrelationRecorder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = ClockCorrelationRecorder.swift; path = RTABMapApp/MobilePostProcessing/ClockCorrelationRecorder.swift; sourceTree = "<group>"; };
-		4EA700012F60001B00100002 /* MobileRoadGraphBuilder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = MobileRoadGraphBuilder.swift; path = RTABMapApp/MobilePriorMapCompiler/MobileRoadGraphBuilder.swift; sourceTree = "<group>"; };
-		4EA700012F60001A00100002 /* MobilePriorMapCompiler.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = MobilePriorMapCompiler.swift; path = RTABMapApp/MobilePriorMapCompiler/MobilePriorMapCompiler.swift; sourceTree = "<group>"; };
-		4EA700012F60001900100002 /* MobilePreviewRenderer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = MobilePreviewRenderer.swift; path = RTABMapApp/MobilePriorMapCompiler/MobilePreviewRenderer.swift; sourceTree = "<group>"; };
-		4EA700012F60001800100002 /* MobilePackageManifestBuilder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = MobilePackageManifestBuilder.swift; path = RTABMapApp/MobilePriorMapCompiler/MobilePackageManifestBuilder.swift; sourceTree = "<group>"; };
-		4EA700012F60001700100002 /* MobileDistanceFieldBuilder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = MobileDistanceFieldBuilder.swift; path = RTABMapApp/MobilePriorMapCompiler/MobileDistanceFieldBuilder.swift; sourceTree = "<group>"; };
-		4EA700012F60001600100002 /* XLSXZipReader.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = XLSXZipReader.swift; path = RTABMapApp/MobileMapImport/XLSXZipReader.swift; sourceTree = "<group>"; };
-		4EA700012F60001500100002 /* XLSXWorksheetReader.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = XLSXWorksheetReader.swift; path = RTABMapApp/MobileMapImport/XLSXWorksheetReader.swift; sourceTree = "<group>"; };
-		4EA700012F60001400100002 /* XLSXWorkbookReader.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = XLSXWorkbookReader.swift; path = RTABMapApp/MobileMapImport/XLSXWorkbookReader.swift; sourceTree = "<group>"; };
-		4EA700012F60001300100002 /* XLSXMapSourceImporter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = XLSXMapSourceImporter.swift; path = RTABMapApp/MobileMapImport/XLSXMapSourceImporter.swift; sourceTree = "<group>"; };
-		4EA700012F60001200100002 /* SourceGeometry.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = SourceGeometry.swift; path = RTABMapApp/MobileMapImport/SourceGeometry.swift; sourceTree = "<group>"; };
-		4EA700012F60001100100002 /* RFC4180CSVReader.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = RFC4180CSVReader.swift; path = RTABMapApp/MobileMapImport/RFC4180CSVReader.swift; sourceTree = "<group>"; };
-		4EA700012F60001000100002 /* MapSourceImportReport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = MapSourceImportReport.swift; path = RTABMapApp/MobileMapImport/MapSourceImportReport.swift; sourceTree = "<group>"; };
-		4EA700012F60000F00100002 /* MapSourceImportError.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = MapSourceImportError.swift; path = RTABMapApp/MobileMapImport/MapSourceImportError.swift; sourceTree = "<group>"; };
-		4EA700012F60000E00100002 /* MapSourceImportCoordinator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = MapSourceImportCoordinator.swift; path = RTABMapApp/MobileMapImport/MapSourceImportCoordinator.swift; sourceTree = "<group>"; };
-		4EA700012F60000D00100002 /* MapSourceDocumentPicker.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = MapSourceDocumentPicker.swift; path = RTABMapApp/MobileMapImport/MapSourceDocumentPicker.swift; sourceTree = "<group>"; };
-		4EA700012F60000C00100002 /* JSONMapSourceImporter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = JSONMapSourceImporter.swift; path = RTABMapApp/MobileMapImport/JSONMapSourceImporter.swift; sourceTree = "<group>"; };
-		4EA700012F60000B00100002 /* ElementNormalizer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = ElementNormalizer.swift; path = RTABMapApp/MobileMapImport/ElementNormalizer.swift; sourceTree = "<group>"; };
-		4EA700012F60000A00100002 /* CanonicalPriorMapSource.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = CanonicalPriorMapSource.swift; path = RTABMapApp/MobileMapImport/CanonicalPriorMapSource.swift; sourceTree = "<group>"; };
-		4EA700012F60000900100002 /* CanonicalJSONEncoder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = CanonicalJSONEncoder.swift; path = RTABMapApp/MobileMapImport/CanonicalJSONEncoder.swift; sourceTree = "<group>"; };
-		4EA700012F60000800100002 /* CSVMapSourceImporter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = CSVMapSourceImporter.swift; path = RTABMapApp/MobileMapImport/CSVMapSourceImporter.swift; sourceTree = "<group>"; };
-		4EA700012F60000600100002 /* StrictJSONDocumentParser.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = StrictJSONDocumentParser.swift; path = RTABMapApp/StrictJSONDocumentParser.swift; sourceTree = "<group>"; };
-		4EA500012F40000100100002 /* PriorMapScanMatcher.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = PriorMapScanMatcher.swift; path = RTABMapApp/PriorMapScanMatcher.swift; sourceTree = "<group>"; };
-		4EA500012F40000100100004 /* PriorMapDepthSampler.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = PriorMapDepthSampler.swift; path = RTABMapApp/PriorMapDepthSampler.swift; sourceTree = "<group>"; };
-		4EA500012F40000100100006 /* PriceTagLocalizationCore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = PriceTagLocalizationCore.swift; path = RTABMapApp/PriceTagLocalizationCore.swift; sourceTree = "<group>"; };
-		4EA600012F50000100100008 /* PriorMapPackageIntegrityCore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = PriorMapPackageIntegrityCore.swift; path = RTABMapApp/PriorMapPackageIntegrityCore.swift; sourceTree = "<group>"; };
-		4EA500012F40000100100008 /* PriceTagVisionScanner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = PriceTagVisionScanner.swift; path = RTABMapApp/PriceTagVisionScanner.swift; sourceTree = "<group>"; };
 		4EA900012F80000100100002 /* PriceTagCaptureCore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = PriceTagCaptureCore.swift; path = RTABMapApp/PriceTagCaptureCore.swift; sourceTree = "<group>"; };
 		4EA900012F80000200100002 /* PriceTagCaptureUI.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = PriceTagCaptureUI.swift; path = RTABMapApp/PriceTagCaptureUI.swift; sourceTree = "<group>"; };
-		4EA100012F00000100100006 /* CoreNFC.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = CoreNFC.framework; path = System/Library/Frameworks/CoreNFC.framework; sourceTree = SDKROOT; };
-		4EA300012F20000100100002 /* SupermarketStructureCoverage.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = SupermarketStructureCoverage.swift; path = RTABMapApp/SupermarketStructureCoverage.swift; sourceTree = "<group>"; };
 		4EB1A66525A0D90B0043C7BF /* RTABMap.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; name = RTABMap.swift; path = RTABMapApp/RTABMap.swift; sourceTree = "<group>"; };
 		4ED73AD02D7FECF3007899C2 /* liblaszip.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = liblaszip.a; path = "RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/liblaszip.a"; sourceTree = "<group>"; };
 		4EE015C2259A2AF0008CCE65 /* RTABMapApp.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = RTABMapApp.app; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -293,8 +295,6 @@
 		4EE016B8259BE449008CCE65 /* AppDelegate.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; name = AppDelegate.swift; path = RTABMapApp/AppDelegate.swift; sourceTree = "<group>"; };
 		4EE016BC259BE45C008CCE65 /* Info.plist */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = text.plist.xml; name = Info.plist; path = RTABMapApp/Info.plist; sourceTree = "<group>"; };
 		4EE016C0259BE464008CCE65 /* Base */ = {isa = PBXFileReference; lastKnownFileType = file.storyboard; name = Base; path = RTABMapApp/Base.lproj/Main.storyboard; sourceTree = "<group>"; };
-		4EA200012F12B00100100003 /* zh-Hans */ = {isa = PBXFileReference; lastKnownFileType = text.plist.strings; name = "zh-Hans"; path = "RTABMapApp/zh-Hans.lproj/Main.strings"; sourceTree = "<group>"; };
-		4EA200012F12B00100100004 /* zh-Hans */ = {isa = PBXFileReference; lastKnownFileType = text.plist.strings; name = "zh-Hans"; path = "RTABMapApp/zh-Hans.lproj/Localizable.strings"; sourceTree = "<group>"; };
 		4EE016C2259BE464008CCE65 /* Base */ = {isa = PBXFileReference; lastKnownFileType = file.storyboard; name = Base; path = RTABMapApp/Base.lproj/LaunchScreen.storyboard; sourceTree = "<group>"; };
 		4EE016C6259BE46F008CCE65 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; name = Assets.xcassets; path = RTABMapApp/Assets.xcassets; sourceTree = "<group>"; };
 		4EE016E1259BE96A008CCE65 /* RTABMapApp-Bridging-Header.h */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.h; name = "RTABMapApp-Bridging-Header.h"; path = "RTABMapApp/RTABMapApp-Bridging-Header.h"; sourceTree = "<group>"; };
@@ -579,8 +579,31 @@
 				4EB1A66525A0D90B0043C7BF /* RTABMap.swift */,
 				4E2C516525A63119005CEDBD /* DatabaseView.swift */,
 				4E2C516625A63119005CEDBD /* VerticalScrollerView.swift */,
-				4EA7C1000000000000100002 /* MobileOnlyWorkflowState.swift */,				4EA7C1000000000100100002 /* MobileOnlyWorkflowError.swift */,				4EA7C1000000000200100002 /* MobileMapLibrary.swift */,				4EA7C1000000000300100002 /* MobileProcessingTaskStore.swift */,				4EA7C1000000000400100002 /* MobileResultLibrary.swift */,				4EA7C1000000000500100002 /* MobileOnlyWorkflowCoordinator.swift */,				4EA7C1000000000600100002 /* MobileProcessingPipeline.swift */,				4EA7C1000000000F00200002 /* MobileNativeFactorGraph.swift */,				4EA7C1000000001100200002 /* MobileNativeGraphTypes.swift */,				4EA7C1000000001200200002 /* MobileBuildIdentity.swift */,				4EA7C1000000001000200002 /* ProcessingResourceGovernor.swift */,				4EA7C1000000000700100002 /* MobileOnlyHomeViewController.swift */,				4EA7C1000000000800100002 /* MobileMapLibraryViewController.swift */,				4EA7C1000000000900100002 /* MobileMapImportViewController.swift */,				4EA7C1000000000A00100002 /* MobileMapCompileProgressViewController.swift */,				4EA7C1000000000B00100002 /* MobileScanSetupViewController.swift */,				4EA7C1000000000C00100002 /* MobileProcessingViewController.swift */,				4EA7C1000000000D00100002 /* MobileResultViewController.swift */,				4EA7C1000000000E00100002 /* MobileRescanTasksViewController.swift */,
-				4EA7C2000000000000100002 /* MSRTABMapGraphReaderBridge.h */,				4EA7C2000000000100100002 /* MSRTABMapGraphReaderBridge.mm */,				4EA7C2000000000200200004 /* MSMarketScannerFactorGraphBridge.h */,				4EA7C2000000000200200002 /* market_scanner_factor_graph.cpp */,				4EA7C2000000000200200003 /* market_scanner_factor_graph.h */,				4EA7C2000000000200100002 /* MobileGraphReader.swift */,
+				4EA7C1000000000000100002 /* MobileOnlyWorkflowState.swift */,
+				4EA7C1000000000100100002 /* MobileOnlyWorkflowError.swift */,
+				4EA7C1000000000200100002 /* MobileMapLibrary.swift */,
+				4EA7C1000000000300100002 /* MobileProcessingTaskStore.swift */,
+				4EA7C1000000000400100002 /* MobileResultLibrary.swift */,
+				4EA7C1000000000500100002 /* MobileOnlyWorkflowCoordinator.swift */,
+				4EA7C1000000000600100002 /* MobileProcessingPipeline.swift */,
+				4EA7C1000000000F00200002 /* MobileNativeFactorGraph.swift */,
+				4EA7C1000000001100200002 /* MobileNativeGraphTypes.swift */,
+				4EA7C1000000001200200002 /* MobileBuildIdentity.swift */,
+				4EA7C1000000001000200002 /* ProcessingResourceGovernor.swift */,
+				4EA7C1000000000700100002 /* MobileOnlyHomeViewController.swift */,
+				4EA7C1000000000800100002 /* MobileMapLibraryViewController.swift */,
+				4EA7C1000000000900100002 /* MobileMapImportViewController.swift */,
+				4EA7C1000000000A00100002 /* MobileMapCompileProgressViewController.swift */,
+				4EA7C1000000000B00100002 /* MobileScanSetupViewController.swift */,
+				4EA7C1000000000C00100002 /* MobileProcessingViewController.swift */,
+				4EA7C1000000000D00100002 /* MobileResultViewController.swift */,
+				4EA7C1000000000E00100002 /* MobileRescanTasksViewController.swift */,
+				4EA7C2000000000000100002 /* MSRTABMapGraphReaderBridge.h */,
+				4EA7C2000000000100100002 /* MSRTABMapGraphReaderBridge.mm */,
+				4EA7C2000000000200200004 /* MSMarketScannerFactorGraphBridge.h */,
+				4EA7C2000000000200200002 /* market_scanner_factor_graph.cpp */,
+				4EA7C2000000000200200003 /* market_scanner_factor_graph.h */,
+				4EA7C2000000000200100002 /* MobileGraphReader.swift */,
 			);
 			name = RTABMapApp;
 			sourceTree = "<group>";
@@ -959,7 +982,7 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;
-			shellScript = "# V1R4 §3.3: the ONE unified build-identity contract. The digest\n# algorithm, dirty-tree refusal and field validation all live in\n# tools/Qualification/market_scanner_build_identity.py; CI uses the\n# exact same script. Fails the build on dirty tree / unknown SHA.\nset -e\nREPO_ROOT=\"$SRCROOT/../..\"\nOUT=\"$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH/MarketScannerBuildIdentity.json\"\nmkdir -p \"$(dirname \"$OUT\")\"\npython3 \"$REPO_ROOT/tools/Qualification/market_scanner_build_identity.py\" emit --repo \"$REPO_ROOT\" --out \"$OUT\"\npython3 \"$REPO_ROOT/tools/Qualification/market_scanner_build_identity.py\" verify --repo \"$REPO_ROOT\" --identity \"$OUT\"\n";
+			shellScript = "# V1R4 §3.3: the ONE unified build-identity contract. Release\n# builds fail closed on dirty source or an invalid identity. Debug builds\n# intentionally carry no identity, so they can launch for development but\n# cannot enter an eligible processing or prior-map scan session.\nset -e\nREPO_ROOT=\"$SRCROOT/../..\"\nOUT=\"$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH/MarketScannerBuildIdentity.json\"\nmkdir -p \"$(dirname \"$OUT\")\"\nif [ \"$CONFIGURATION\" = \"Debug\" ]; then\n  rm -f \"$OUT\"\n  echo \"Debug build: MarketScanner build identity intentionally omitted; production processing remains ineligible.\"\n  exit 0\nfi\npython3 \"$REPO_ROOT/tools/Qualification/market_scanner_build_identity.py\" emit --repo \"$REPO_ROOT\" --out \"$OUT\"\npython3 \"$REPO_ROOT/tools/Qualification/market_scanner_build_identity.py\" verify --repo \"$REPO_ROOT\" --identity \"$OUT\"\n";
 		};
 /* End PBXShellScriptBuildPhase section */
 
@@ -1093,6 +1116,14 @@
 /* End PBXSourcesBuildPhase section */
 
 /* Begin PBXVariantGroup section */
+		4EA200012F12B00100100002 /* Localizable.strings */ = {
+			isa = PBXVariantGroup;
+			children = (
+				4EA200012F12B00100100004 /* zh-Hans */,
+			);
+			name = Localizable.strings;
+			sourceTree = "<group>";
+		};
 		4EE016BF259BE464008CCE65 /* Main.storyboard */ = {
 			isa = PBXVariantGroup;
 			children = (
@@ -1100,14 +1131,6 @@
 				4EA200012F12B00100100003 /* zh-Hans */,
 			);
 			name = Main.storyboard;
-			sourceTree = "<group>";
-		};
-		4EA200012F12B00100100002 /* Localizable.strings */ = {
-			isa = PBXVariantGroup;
-			children = (
-				4EA200012F12B00100100004 /* zh-Hans */,
-			);
-			name = Localizable.strings;
 			sourceTree = "<group>";
 		};
 		4EE016C1259BE464008CCE65 /* LaunchScreen.storyboard */ = {
@@ -1279,7 +1302,7 @@
 				);
 				MARKETING_VERSION = 0.22.0;
 				OTHER_CFLAGS = "";
-				PRODUCT_BUNDLE_IDENTIFIER = com.mcjiansheng.rtabmap;
+				PRODUCT_BUNDLE_IDENTIFIER = com.xiehaotian.marketscanner.dev;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				PROVISIONING_PROFILE_SPECIFIER = "";
 				SWIFT_OBJC_BRIDGING_HEADER = "RTABMapApp/$(SWIFT_MODULE_NAME)-Bridging-Header.h";
@@ -1346,7 +1369,7 @@
 				MARKETING_VERSION = 0.22.0;
 				ONLY_ACTIVE_ARCH = YES;
 				OTHER_CFLAGS = "";
-				PRODUCT_BUNDLE_IDENTIFIER = com.mcjiansheng.rtabmap;
+				PRODUCT_BUNDLE_IDENTIFIER = com.xiehaotian.marketscanner.dev;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				PROVISIONING_PROFILE_SPECIFIER = "";
 				SWIFT_OBJC_BRIDGING_HEADER = "RTABMapApp/$(SWIFT_MODULE_NAME)-Bridging-Header.h";

@@ -186,7 +186,9 @@ struct PriorMapPackage {
                   payload["format"] as? String == expectedFormat,
                   let version = StrictJSONScalar.integer(payload["version"]),
                   name == "shelves.json" ? (version == 1 || version == 2)
-                    : version == 1 else {
+                    : (name == "manifest.json"
+                        ? (version == 1 || version == 2)
+                        : version == 1) else {
                 throw NSError(
                     domain: "PriorMap",
                     code: 5,
@@ -205,7 +207,8 @@ struct PriorMapPackage {
         let manifest = try decoder.decode(
             PriorMapManifest.self,
             from: try artifactBytes("manifest.json"))
-        guard manifest.format == "MarketScannerPriorMap", manifest.version == 1 else {
+        guard manifest.format == "MarketScannerPriorMap",
+              manifest.version == 1 || manifest.version == 2 else {
             throw NSError(
                 domain: "PriorMap",
                 code: 1,
@@ -283,8 +286,19 @@ struct PriorMapPackage {
         }
         // Decode every level now so corrupted RLE or a checksum mismatch is
         // rejected before a scan can begin.
+        var totalDistanceCells = 0
         for floor in distanceFields.floors.values {
             for level in floor.levels {
+                let cellCount = try level.validatedCellCount()
+                guard cellCount <= PriorMapDistanceFieldLevel.maximumTotalCells
+                        - totalDistanceCells else {
+                    throw NSError(
+                        domain: "PriorMap",
+                        code: 8,
+                        userInfo: [NSLocalizedDescriptionKey:
+                            "地图包距离场超过总资源预算，请在 PC 工作台重新生成。"])
+                }
+                totalDistanceCells += cellCount
                 _ = try level.decodedValues()
             }
         }

@@ -58,11 +58,12 @@ enum CSVMapSourceImporter {
             }
             do {
                 let raw = try parseElementJSON(elementValue, row: rowNumber)
-                let element = ElementNormalizer.normalize(
+                let element = try ElementNormalizer.normalize(
                     floor: floorValue,
                     row: rowNumber,
                     raw: raw,
                     contract: contract,
+                    strict: strict,
                     warnings: &warnings
                 )
                 elements.append(element)

@@ -19,58 +19,121 @@ if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     from PriorMap.coordinate_system import (
         Bounds,
+        legacy_center_pivot_rectangle_center,
+        legacy_center_pivot_rectangle_polygon,
         merge_bounds,
         polygon_bounds,
         rounded,
         source_point_to_map,
+        source_rectangle_center,
         source_rectangle_polygon,
         source_rotation_to_yaw,
     )
     from PriorMap.distance_field import build_distance_fields
+    from PriorMap.element_roles import (
+        ACTIVE_TYPES,
+        ELEMENT_ROLE_CONTRACT_VERSION,
+        FIXED_STRUCTURE_TYPES,
+        RECTANGLE_TYPES,
+        ROLE_PRESENTATION_ONLY,
+        ROLE_UNSUPPORTED,
+        SHELF_TYPES,
+        STRUCTURE_TYPES,
+        role_contract_payload,
+        role_for,
+    )
     from PriorMap.prior_map_schema import (
         PACKAGE_MANIFEST_FILE,
         PACKAGE_FORMAT,
         PACKAGE_VERSION,
         PriorMapValidationError,
-        SUPPORTED_TYPES,
         build_package_manifest,
         validate_business_identity,
         validate_package,
     )
     from PriorMap.render_prior_map import render_package
-    from PriorMap.xlsx_reader import WorkbookElement, WorkbookError, read_element_info
+    from PriorMap.xlsx_reader import (
+        BasicMapInfo,
+        WorkbookElement,
+        WorkbookError,
+        read_workbook,
+    )
 else:
     from .coordinate_system import (
         Bounds,
+        legacy_center_pivot_rectangle_center,
+        legacy_center_pivot_rectangle_polygon,
         merge_bounds,
         polygon_bounds,
         rounded,
         source_point_to_map,
+        source_rectangle_center,
         source_rectangle_polygon,
         source_rotation_to_yaw,
     )
     from .distance_field import build_distance_fields
+    from .element_roles import (
+        ACTIVE_TYPES,
+        ELEMENT_ROLE_CONTRACT_VERSION,
+        FIXED_STRUCTURE_TYPES,
+        RECTANGLE_TYPES,
+        ROLE_PRESENTATION_ONLY,
+        ROLE_UNSUPPORTED,
+        SHELF_TYPES,
+        STRUCTURE_TYPES,
+        role_contract_payload,
+        role_for,
+    )
     from .prior_map_schema import (
         PACKAGE_MANIFEST_FILE,
         PACKAGE_FORMAT,
         PACKAGE_VERSION,
         PriorMapValidationError,
-        SUPPORTED_TYPES,
         build_package_manifest,
         validate_business_identity,
         validate_package,
     )
     from .render_prior_map import render_package
-    from .xlsx_reader import WorkbookElement, WorkbookError, read_element_info
+    from .xlsx_reader import BasicMapInfo, WorkbookElement, WorkbookError, read_workbook
 
 
-RECTANGLE_TYPES = {"MapShelf", "MapTable", "MapPillar", "MapTableFeature"}
-STRUCTURE_TYPES = RECTANGLE_TYPES
 SAFE_NAME = re.compile(r"[^A-Za-z0-9._-]+")
+MAXIMUM_SPATIAL_CELL_ASSIGNMENTS = 8_000_000
 
 
 class ConversionError(ValueError):
     pass
+
+
+def _spatial_cell_ranges(
+    min_x: float,
+    max_x: float,
+    min_y: float,
+    max_y: float,
+    cell_size_m: float,
+) -> tuple[range, range, int]:
+    values = (min_x, max_x, min_y, max_y, cell_size_m)
+    if (
+        not all(math.isfinite(value) for value in values)
+        or min_x > max_x
+        or min_y > max_y
+        or cell_size_m <= 0
+    ):
+        raise ConversionError("Spatial-index bounds are invalid.")
+    lower_x = math.floor(min_x / cell_size_m)
+    upper_x = math.floor(max_x / cell_size_m)
+    lower_y = math.floor(min_y / cell_size_m)
+    upper_y = math.floor(max_y / cell_size_m)
+    width = upper_x - lower_x + 1
+    height = upper_y - lower_y + 1
+    assignments = width * height
+    if (
+        width <= 0
+        or height <= 0
+        or assignments > MAXIMUM_SPATIAL_CELL_ASSIGNMENTS
+    ):
+        raise ConversionError("Spatial-index cell assignment budget exceeded.")
+    return range(lower_x, upper_x + 1), range(lower_y, upper_y + 1), assignments
 
 
 def _json_write(path: Path, payload: Any, *, compact: bool = False) -> None:
@@ -117,9 +180,12 @@ def _line_geometry(points: Any) -> dict[str, Any]:
 def _normalized_element(
     record: WorkbookElement,
     warnings: list[dict[str, Any]],
+    *,
+    legacy_center_pivot: bool = False,
 ) -> dict[str, Any]:
     raw = record.element
     shape_type = str(raw.get("shapeType") or "Unknown")
+    element_role = role_for(shape_type)
     identifier = f"f{record.floor}-r{record.row}"
     visible = raw.get("visible", True) is not False
     geometry: dict[str, Any] | None = None
@@ -135,10 +201,20 @@ def _normalized_element(
             rotation = _number(raw, "rotation") if "rotation" in raw else 0.0
             if width <= 0 or height <= 0:
                 raise ConversionError("width and height must be positive")
-            polygon = source_rectangle_polygon(x, y, width, height, rotation)
+            polygon = (
+                legacy_center_pivot_rectangle_polygon(
+                    x, y, width, height, rotation
+                )
+                if legacy_center_pivot
+                else source_rectangle_polygon(x, y, width, height, rotation)
+            )
             geometry = {"type": "polygon", "coordinates": polygon}
             bounds = polygon_bounds(polygon)
-            center = list(source_point_to_map(x + width / 2.0, y + height / 2.0))
+            center = list(
+                legacy_center_pivot_rectangle_center(x, y, width, height)
+                if legacy_center_pivot
+                else source_rectangle_center(x, y, width, height, rotation)
+            )
             yaw_rad = source_rotation_to_yaw(rotation)
         elif shape_type == "MapCross":
             geometry = _line_geometry(raw.get("points"))
@@ -148,7 +224,7 @@ def _normalized_element(
             geometry = {"type": "point", "coordinates": point}
             bounds = Bounds(point[0], point[1], point[0], point[1])
             center = point
-        elif shape_type not in SUPPORTED_TYPES:
+        elif element_role == ROLE_UNSUPPORTED:
             warnings.append(
                 {
                     "code": "unknown_shape_type",
@@ -184,6 +260,7 @@ def _normalized_element(
         "source_row": record.row,
         "floor_id": str(record.floor),
         "shape_type": shape_type,
+        "role": element_role,
         "visible": visible,
         "locked": bool(raw.get("locked", False)),
         "code": str(raw.get("code") or ""),
@@ -410,6 +487,8 @@ def _spatial_index(
     cell_size_m: float = 5.0,
 ) -> dict[str, Any]:
     floors: dict[str, dict[str, Any]] = {}
+    element_roles: dict[str, dict[str, str]] = {}
+    total_assignments = 0
     by_floor: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for element in elements:
         if (
@@ -418,16 +497,26 @@ def _spatial_index(
             and element.get("bounds") is not None
         ):
             by_floor[element["floor_id"]].append(element)
+            element_roles[element["id"]] = {
+                "role": element["role"],
+                "shape_type": element["shape_type"],
+            }
     for floor_id, floor_elements in sorted(by_floor.items()):
         cells: dict[str, list[str]] = defaultdict(list)
         for element in floor_elements:
             bounds = element["bounds"]
-            min_x = math.floor(float(bounds["min_x_m"]) / cell_size_m)
-            max_x = math.floor(float(bounds["max_x_m"]) / cell_size_m)
-            min_y = math.floor(float(bounds["min_y_m"]) / cell_size_m)
-            max_y = math.floor(float(bounds["max_y_m"]) / cell_size_m)
-            for cell_x in range(min_x, max_x + 1):
-                for cell_y in range(min_y, max_y + 1):
+            x_cells, y_cells, assignments = _spatial_cell_ranges(
+                float(bounds["min_x_m"]),
+                float(bounds["max_x_m"]),
+                float(bounds["min_y_m"]),
+                float(bounds["max_y_m"]),
+                cell_size_m,
+            )
+            total_assignments += assignments
+            if total_assignments > MAXIMUM_SPATIAL_CELL_ASSIGNMENTS:
+                raise ConversionError("Spatial-index total cell assignment budget exceeded.")
+            for cell_x in x_cells:
+                for cell_y in y_cells:
                     cells[f"{cell_x},{cell_y}"].append(element["id"])
         floors[floor_id] = {
             "cells": {
@@ -450,12 +539,18 @@ def _spatial_index(
         if start is None or end is None:
             continue
         floor_id = str(edge["floor_id"])
-        min_x = math.floor(min(float(start[0]), float(end[0])) / cell_size_m)
-        max_x = math.floor(max(float(start[0]), float(end[0])) / cell_size_m)
-        min_y = math.floor(min(float(start[1]), float(end[1])) / cell_size_m)
-        max_y = math.floor(max(float(start[1]), float(end[1])) / cell_size_m)
-        for cell_x in range(min_x, max_x + 1):
-            for cell_y in range(min_y, max_y + 1):
+        x_cells, y_cells, assignments = _spatial_cell_ranges(
+            min(float(start[0]), float(end[0])),
+            max(float(start[0]), float(end[0])),
+            min(float(start[1]), float(end[1])),
+            max(float(start[1]), float(end[1])),
+            cell_size_m,
+        )
+        total_assignments += assignments
+        if total_assignments > MAXIMUM_SPATIAL_CELL_ASSIGNMENTS:
+            raise ConversionError("Spatial-index total cell assignment budget exceeded.")
+        for cell_x in x_cells:
+            for cell_y in y_cells:
                 road_cells_by_floor[floor_id][f"{cell_x},{cell_y}"].append(
                     str(edge["id"])
                 )
@@ -469,6 +564,7 @@ def _spatial_index(
         "format": "MarketScannerSpatialIndex",
         "version": 1,
         "cell_size_m": cell_size_m,
+        "element_roles": dict(sorted(element_roles.items())),
         "floors": floors,
     }
 
@@ -492,31 +588,445 @@ def _floor_bounds(elements: list[dict[str, Any]]) -> list[dict[str, Any]]:
     ]
 
 
+def _canvas_bounds(basic_info: BasicMapInfo) -> Bounds:
+    return Bounds(
+        0.0,
+        rounded(-basic_info.height_cm / 100.0),
+        rounded(basic_info.width_cm / 100.0),
+        0.0,
+    )
+
+
+def _official_source_id(element: dict[str, Any]) -> str | None:
+    source = element.get("source")
+    if not isinstance(source, dict):
+        return None
+    for key in ("sourceId", "source_id", "id"):
+        value = source.get(key)
+        if isinstance(value, str) and value:
+            return value
+        if key == "id" and isinstance(value, int) and not isinstance(value, bool):
+            return str(value)
+    return None
+
+
+def _stable_element_id(
+    element: dict[str, Any],
+    basic_info: BasicMapInfo,
+) -> str:
+    return _stable_element_id_for_context(
+        element,
+        store_id=basic_info.store_code,
+        map_name=basic_info.map_name,
+    )
+
+
+def _stable_element_id_for_context(
+    element: dict[str, Any],
+    *,
+    store_id: str,
+    map_name: str,
+) -> str:
+    official = _official_source_id(element)
+    if official is not None:
+        return official
+    identity: dict[str, Any] = {
+        "shape_type": element["shape_type"],
+        "floor_id": element["floor_id"],
+        "code": element["code"],
+        "cross_code": element["cross_code"],
+    }
+    for name in ("geometry", "bounds", "center_m", "yaw_rad"):
+        if name in element and element[name] is not None:
+            identity[name] = element[name]
+    context = {
+        "store_id": store_id,
+        "map_name": map_name,
+        "identity": identity,
+    }
+    encoded = json.dumps(
+        context,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+        allow_nan=False,
+    ).encode("utf-8")
+    return "e-" + hashlib.sha256(encoded).hexdigest()[:20]
+
+
+def _require_unique_stable_element_ids(
+    elements: Sequence[dict[str, Any]],
+    *,
+    store_id: str,
+    map_name: str,
+) -> None:
+    """Reject duplicate business identities before canonical/package output.
+
+    The row-scoped ``f<floor>-r<row>`` identifier is only an import audit
+    handle.  Production identity is the official source id when present, or
+    the same store/map/business hash used by the mobile importer.  Letting two
+    rows share that identity would make canonical ordering and shelf
+    association ambiguous even if their row handles differ.
+    """
+
+    seen: dict[str, dict[str, Any]] = {}
+    for element in elements:
+        stable_id = _stable_element_id_for_context(
+            element,
+            store_id=store_id,
+            map_name=map_name,
+        )
+        previous = seen.get(stable_id)
+        if previous is not None:
+            raise ConversionError(
+                "Duplicate business element identity "
+                f"{stable_id!r} at Element Info rows "
+                f"{previous.get('source_row')} and {element.get('source_row')}; "
+                "strict production import is fail-closed."
+            )
+        seen[stable_id] = element
+
+
+def _compiled_shelf_segments(
+    shelves: Sequence[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Build the shelves-v2 direction contract used by the mobile compiler.
+
+    Business yaw is authoritative.  The longest explicit polygon edge is
+    used only to create a deterministic segment when yaw is unavailable; the
+    provenance remains ``unavailable`` so downstream quality gates cannot
+    treat that fallback as explicit business-side evidence.
+    """
+
+    segments: list[dict[str, Any]] = []
+    for element in shelves:
+        geometry = element.get("geometry")
+        raw_coordinates = (
+            geometry.get("coordinates") if isinstance(geometry, dict) else None
+        )
+        if (
+            not isinstance(raw_coordinates, list)
+            or len(raw_coordinates) < 3
+            or not all(
+                isinstance(point, list)
+                and len(point) >= 2
+                and isinstance(point[0], (int, float))
+                and not isinstance(point[0], bool)
+                and isinstance(point[1], (int, float))
+                and not isinstance(point[1], bool)
+                and math.isfinite(float(point[0]))
+                and math.isfinite(float(point[1]))
+                for point in raw_coordinates
+            )
+        ):
+            raise ConversionError(
+                f"Shelf {element.get('id')} is missing finite polygon geometry."
+            )
+        points = [(float(point[0]), float(point[1])) for point in raw_coordinates]
+        center_x = sum(point[0] for point in points) / len(points)
+        center_y = sum(point[1] for point in points) / len(points)
+
+        yaw = element.get("yaw_rad")
+        if (
+            isinstance(yaw, (int, float))
+            and not isinstance(yaw, bool)
+            and math.isfinite(float(yaw))
+        ):
+            axis = (math.cos(float(yaw)), math.sin(float(yaw)))
+            provenance = "element_yaw"
+        else:
+            longest_length = 0.0
+            axis = (1.0, 0.0)
+            for index, point in enumerate(points):
+                following = points[(index + 1) % len(points)]
+                dx = following[0] - point[0]
+                dy = following[1] - point[1]
+                length = math.hypot(dx, dy)
+                if length > longest_length:
+                    longest_length = length
+                    axis = (dx / length, dy / length)
+            if longest_length <= 1.0e-9:
+                raise ConversionError(
+                    f"Shelf {element.get('id')} polygon has no nonzero edge."
+                )
+            provenance = "unavailable"
+
+        projections = [
+            (point[0] - center_x) * axis[0]
+            + (point[1] - center_y) * axis[1]
+            for point in points
+        ]
+        minimum_projection = min(projections)
+        maximum_projection = max(projections)
+        start = [
+            center_x + minimum_projection * axis[0],
+            center_y + minimum_projection * axis[1],
+        ]
+        end = [
+            center_x + maximum_projection * axis[0],
+            center_y + maximum_projection * axis[1],
+        ]
+        segments.append(
+            {
+                "shelf_segment_id": element["id"],
+                "shelf_code": element["code"],
+                "floor_id": element["floor_id"],
+                "longitudinal_start_m": start,
+                "longitudinal_end_m": end,
+                "longitudinal_axis": [axis[0], axis[1]],
+                "front_normal": [axis[1], -axis[0]],
+                "back_normal": [-axis[1], axis[0]],
+                "side_semantics_version": 1,
+                "orientation_provenance": provenance,
+            }
+        )
+    return segments
+
+
+def _canonical_business_element(
+    element: dict[str, Any],
+    basic_info: BasicMapInfo,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "id": _stable_element_id(element, basic_info),
+        "floor_id": element["floor_id"],
+        "shape_type": element["shape_type"],
+        "visible": element["visible"],
+        "locked": element["locked"],
+        "code": element["code"],
+        "cross_code": element["cross_code"],
+        "row_flag": element["row_flag"],
+        "subsection": element["subsection"],
+    }
+    for name in ("geometry", "bounds", "center_m", "yaw_rad"):
+        if name in element and element[name] is not None:
+            payload[name] = element[name]
+    return payload
+
+
+def _canonical_business_sha256(
+    basic_info: BasicMapInfo,
+    elements: list[dict[str, Any]],
+) -> str:
+    ordered = sorted(
+        (_canonical_business_element(element, basic_info) for element in elements),
+        key=lambda value: (
+            str(value["id"]),
+            json.dumps(
+                value,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+                allow_nan=False,
+            ),
+        ),
+    )
+    payload = {
+        "format": "MarketScannerPriorMapSource",
+        "version": 3,
+        "store_id": basic_info.store_code,
+        "map_name": basic_info.map_name,
+        "source_map_info": basic_info.canonical_payload(),
+        "coordinate_contract": {
+            "unit": "centimetre",
+            "origin": "top_left",
+            "x_axis": "right",
+            "y_axis": "down",
+            "rotation_direction": "clockwise_degrees",
+            "rectangle_anchor": "top_left",
+            "rotation_pivot": "top_left_anchor",
+        },
+        "role_contract": {
+            "version": ELEMENT_ROLE_CONTRACT_VERSION,
+            "presentation_policy": "excluded_from_production_elements",
+        },
+        "elements": ordered,
+    }
+    canonical = json.dumps(
+        payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def _geometry_inside_bounds(
+    element: dict[str, Any],
+    bounds: Bounds,
+    tolerance: float = 1.0e-8,
+) -> bool:
+    geometry = element.get("geometry")
+    if not isinstance(geometry, dict):
+        return False
+    coordinates = geometry.get("coordinates")
+    if geometry.get("type") == "point":
+        coordinates = [coordinates]
+    if not isinstance(coordinates, list) or not coordinates:
+        return False
+    for point in coordinates:
+        if not isinstance(point, list) or len(point) < 2:
+            return False
+        x, y = float(point[0]), float(point[1])
+        if (
+            x < bounds.min_x_m - tolerance
+            or x > bounds.max_x_m + tolerance
+            or y < bounds.min_y_m - tolerance
+            or y > bounds.max_y_m + tolerance
+        ):
+            return False
+    return True
+
+
 def convert_workbook(
     source: Path | str,
     output: Path | str | None = None,
     map_name: str | None = None,
     store_id: str | None = None,
+    *,
+    allow_legacy_element_only: bool = False,
 ) -> Path:
     source_path = Path(source).resolve()
-    resolved_map_name = str(map_name or source_path.stem)
+    result = read_workbook(
+        source_path,
+        allow_legacy_element_only=allow_legacy_element_only,
+    )
+    basic_info = result.basic_info
+    if basic_info is not None and result.malformed_rows:
+        first = result.malformed_rows[0]
+        raise ConversionError(
+            "Standard Basic Info + Element Info workbooks reject every "
+            "malformed Element Info row; "
+            f"row {first.get('row')} ({first.get('code', 'malformed_row')}): "
+            f"{first.get('message', 'invalid row')}"
+        )
+    if basic_info is not None:
+        if store_id is not None and store_id != basic_info.store_code:
+            raise ConversionError(
+                "--store-id must exactly match Basic Info.storeCode; "
+                "the workbook is authoritative."
+            )
+        if map_name is not None and map_name != basic_info.map_name:
+            raise ConversionError(
+                "--name must exactly match Basic Info.map_name; "
+                "the workbook is authoritative."
+            )
+        resolved_store_id = basic_info.store_code
+        resolved_map_name = basic_info.map_name
+    else:
+        if not allow_legacy_element_only:
+            raise ConversionError("Basic Info is required for the standard workbook format.")
+        resolved_store_id = store_id
+        resolved_map_name = str(map_name or source_path.stem)
     try:
-        validate_business_identity(store_id, resolved_map_name)
+        validate_business_identity(resolved_store_id, resolved_map_name)
     except PriorMapValidationError as exc:
         raise ConversionError(str(exc)) from exc
     source_hash = _sha256(source_path)
-    result = read_element_info(source_path)
     warnings = list(result.warnings)
-    elements = [_normalized_element(item, warnings) for item in result.elements]
+    source_elements = [
+        _normalized_element(
+            item,
+            warnings,
+            legacy_center_pivot=basic_info is None,
+        )
+        for item in result.elements
+    ]
+    ignored_by_shape_type = Counter(
+        item["shape_type"]
+        for item in source_elements
+        if item["role"] == ROLE_PRESENTATION_ONLY
+    )
+    unsupported_ignored_count = sum(
+        item["role"] == ROLE_UNSUPPORTED for item in source_elements
+    )
+    hidden_element_count = sum(
+        item["shape_type"] in ACTIVE_TYPES and item["visible"] is False
+        for item in source_elements
+    )
+    invalid_geometry_ignored_count = sum(
+        item["shape_type"] in ACTIVE_TYPES
+        and item["visible"] is True
+        and item.get("geometry") is None
+        for item in source_elements
+    )
+    if invalid_geometry_ignored_count:
+        first = next(
+            item
+            for item in source_elements
+            if item["shape_type"] in ACTIVE_TYPES
+            and item["visible"] is True
+            and item.get("geometry") is None
+        )
+        raise ConversionError(
+            f"Active element {first['id']} ({first['shape_type']}) has invalid geometry; "
+            "strict production import is fail-closed."
+        )
+    if ignored_by_shape_type:
+        warnings.append(
+            {
+                "code": "presentation_only_element_ignored",
+                "count": sum(ignored_by_shape_type.values()),
+                "by_shape_type": dict(sorted(ignored_by_shape_type.items())),
+                "message": (
+                    f"已自动忽略 {sum(ignored_by_shape_type.values())} 个仅用于源地图展示的元素。"
+                ),
+            }
+        )
+    if result.legacy_shelf_info.present:
+        warnings.append(
+            {
+                "code": "legacy_shelf_info_ignored",
+                "count": result.legacy_shelf_info.row_count,
+                "message": (
+                    "Shelf Info 是历史冗余投影，已审计但不参与几何、业务身份或 canonical hash。"
+                ),
+            }
+        )
+    elements = [
+        item
+        for item in source_elements
+        if item["role"] not in {ROLE_PRESENTATION_ONLY, ROLE_UNSUPPORTED}
+        and item["shape_type"] in ACTIVE_TYPES
+        and item["visible"] is True
+        and item.get("geometry") is not None
+    ]
+    assert isinstance(resolved_store_id, str)
+    _require_unique_stable_element_ids(
+        elements,
+        store_id=resolved_store_id,
+        map_name=resolved_map_name,
+    )
     counts = Counter(item["shape_type"] for item in elements)
-    floors = _floor_bounds(elements)
+    floor_ids = sorted({str(item["floor_id"]) for item in elements})
+    if basic_info is not None:
+        canvas_bounds = _canvas_bounds(basic_info)
+        for element in elements:
+            if not _geometry_inside_bounds(element, canvas_bounds):
+                raise ConversionError(
+                    f"Active element {element['id']} ({element['shape_type']}) "
+                    "falls outside the authoritative Basic Info canvas."
+                )
+        floors = [
+            {"id": floor_id, "bounds": canvas_bounds.as_dict()}
+            for floor_id in floor_ids
+        ]
+    else:
+        floors = _floor_bounds(elements)
     if not floors:
         raise ConversionError("No valid geometry was found in the workbook.")
     for index, floor in enumerate(floors):
         safe_floor = SAFE_NAME.sub("-", str(floor["id"])).strip("-") or "floor"
         floor["preview_file"] = f"preview_floor_{index + 1:03d}_{safe_floor}.png"
-    base_name = SAFE_NAME.sub("-", source_path.stem).strip("-") or "map"
-    prior_map_id = f"{base_name}-{source_hash[:12]}"
+    if basic_info is not None:
+        canonical_source_hash = _canonical_business_sha256(basic_info, elements)
+        base_name = SAFE_NAME.sub("-", resolved_map_name).strip("-") or "map"
+        prior_map_id = f"{base_name}-{canonical_source_hash[:12]}"
+    else:
+        canonical_source_hash = None
+        base_name = SAFE_NAME.sub("-", source_path.stem).strip("-") or "map"
+        prior_map_id = f"{base_name}-{source_hash[:12]}"
     output_path = (
         Path(output).resolve()
         if output is not None
@@ -532,11 +1042,12 @@ def convert_workbook(
         tempfile.mkdtemp(prefix=f".{output_path.name}.", dir=str(output_path.parent))
     )
     try:
-        manifest = {
+        formal_workbook = result.basic_info is not None
+        manifest: dict[str, Any] = {
             "format": PACKAGE_FORMAT,
-            "version": PACKAGE_VERSION,
+            "version": PACKAGE_VERSION if formal_workbook else 1,
             "prior_map_id": prior_map_id,
-            "store_id": store_id,
+            "store_id": resolved_store_id,
             "name": resolved_map_name,
             "source_file": source_path.name,
             "source_sha256": source_hash,
@@ -545,8 +1056,14 @@ def convert_workbook(
                 "origin": "top_left",
                 "x_axis": "right",
                 "y_axis": "down",
-                "rotation": "clockwise_degrees",
-                "rectangle_anchor": "top_left_rotated_about_center",
+                "rotation_direction": "clockwise_degrees",
+                "rectangle_anchor": (
+                    "top_left" if formal_workbook
+                    else "top_left_rotated_about_center"
+                ),
+                "rotation_pivot": (
+                    "top_left_anchor" if formal_workbook else "rectangle_center"
+                ),
             },
             "map_coordinate_system": {
                 "unit": "metre",
@@ -573,14 +1090,53 @@ def convert_workbook(
             ).as_dict(),
             "element_statistics": dict(sorted(counts.items())),
             "element_count": len(elements),
-            "visible_element_count": sum(item["visible"] for item in elements),
-            "hidden_element_count": sum(not item["visible"] for item in elements),
+            "visible_element_count": len(elements),
+            "hidden_element_count": hidden_element_count if formal_workbook else 0,
             "warning_count": len(warnings) + len(result.malformed_rows),
         }
+        if formal_workbook:
+            assert basic_info is not None
+            assert canonical_source_hash is not None
+            manifest.update(
+                {
+                    "canonical_source_sha256": canonical_source_hash,
+                    "source_canvas": {
+                        "width_cm": basic_info.width_cm,
+                        "height_cm": basic_info.height_cm,
+                        "source_scale": basic_info.source_scale,
+                    },
+                    "source_map_info": basic_info.canonical_payload(),
+                    "element_role_contract": role_contract_payload(),
+                    "source_element_count": len(source_elements),
+                    "active_element_count": len(elements),
+                    "shelf_count": sum(
+                        item["role"] == "shelf" for item in elements
+                    ),
+                    "fixed_structure_count": sum(
+                        item["role"] == "fixed_structure" for item in elements
+                    ),
+                    "road_element_count": sum(
+                        item["role"] == "road" for item in elements
+                    ),
+                    "presentation_ignored_count": sum(
+                        ignored_by_shape_type.values()
+                    ),
+                    "unsupported_ignored_count": unsupported_ignored_count,
+                    "invalid_geometry_ignored_count": invalid_geometry_ignored_count,
+                    "ignored_by_shape_type": dict(
+                        sorted(ignored_by_shape_type.items())
+                    ),
+                    "legacy_shelf_info": {
+                        "present": result.legacy_shelf_info.present,
+                        "row_count": result.legacy_shelf_info.row_count,
+                        "authority": False,
+                    },
+                }
+            )
         graph = _road_graph(elements, warnings)
         manifest["warning_count"] = len(warnings) + len(result.malformed_rows)
-        spatial = _spatial_index(elements, graph)
         distance_fields = build_distance_fields(elements, floors)
+        spatial = _spatial_index(elements, graph)
         manifest["distance_fields"] = {
             "file": "distance_fields.json",
             "format": distance_fields["format"],
@@ -591,21 +1147,25 @@ def convert_workbook(
             ],
             "truncation_distance_m": distance_fields["truncation_distance_m"],
         }
-        shelves = [item for item in elements if item["shape_type"] == "MapShelf"]
+        shelves = [item for item in elements if item["shape_type"] in SHELF_TYPES]
         fixed = [
             item
             for item in elements
-            if item["shape_type"] in {"MapTable", "MapPillar", "MapTableFeature"}
+            if item["shape_type"] in FIXED_STRUCTURE_TYPES
         ]
         _json_write(temporary / "manifest.json", manifest)
         _json_write(
             temporary / "elements.json",
             {"format": "MarketScannerPriorMapElements", "version": 1, "elements": elements},
         )
-        _json_write(
-            temporary / "shelves.json",
-            {"format": "MarketScannerPriorMapShelves", "version": 1, "shelves": shelves},
-        )
+        shelves_payload: dict[str, Any] = {
+            "format": "MarketScannerPriorMapShelves",
+            "version": 2 if formal_workbook else 1,
+            "shelves": shelves,
+        }
+        if formal_workbook:
+            shelves_payload["shelf_segments"] = _compiled_shelf_segments(shelves)
+        _json_write(temporary / "shelves.json", shelves_payload)
         _json_write(
             temporary / "fixed_structures.json",
             {"format": "MarketScannerPriorMapStructures", "version": 1, "structures": fixed},
@@ -626,6 +1186,15 @@ def convert_workbook(
             "valid": True,
             "summary": {
                 "element_count": len(elements),
+                "source_element_count": len(source_elements),
+                "active_element_count": len(elements),
+                "shelf_count": len(shelves),
+                "fixed_structure_count": len(fixed),
+                "road_element_count": sum(item["role"] == "road" for item in elements),
+                "presentation_ignored_count": sum(ignored_by_shape_type.values()),
+                "unsupported_ignored_count": unsupported_ignored_count,
+                "hidden_element_count": hidden_element_count,
+                "invalid_geometry_ignored_count": invalid_geometry_ignored_count,
                 "malformed_row_count": len(result.malformed_rows),
                 "warning_count": len(warnings) + len(result.malformed_rows),
                 "floor_count": len(floors),
@@ -661,12 +1230,17 @@ def convert_workbook(
 
 def main(argv: Iterable[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Convert an Element Info XLSX workbook to a MarketScanner prior-map package."
+        description="Convert a standard Basic Info + Element Info XLSX workbook to a MarketScanner prior-map package."
     )
     parser.add_argument("xlsx", type=Path)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--name")
-    parser.add_argument("--store-id", required=True)
+    parser.add_argument("--store-id")
+    parser.add_argument(
+        "--allow-legacy-element-only",
+        action="store_true",
+        help="Explicitly import a legacy workbook without Basic Info.",
+    )
     args = parser.parse_args(argv)
     try:
         output = convert_workbook(
@@ -674,6 +1248,7 @@ def main(argv: Iterable[str] | None = None) -> int:
             args.output,
             map_name=args.name,
             store_id=args.store_id,
+            allow_legacy_element_only=args.allow_legacy_element_only,
         )
     except (WorkbookError, ConversionError, OSError) as exc:
         parser.error(str(exc))

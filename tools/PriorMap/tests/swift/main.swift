@@ -2365,6 +2365,23 @@ if CommandLine.arguments.count == 2,
     runESLBarcodeCaptureFocusedTests()
     exit(0)
 }
+if (CommandLine.arguments.count == 5 || CommandLine.arguments.count == 6),
+   CommandLine.arguments[1] == "--mapcase02-suite" {
+    runMapCase02Suite(
+        workbookPath: CommandLine.arguments[2],
+        outputPath: CommandLine.arguments[3],
+        expectedCanonicalSHA256: CommandLine.arguments[4],
+        legacyWorkbookPath: CommandLine.arguments.count == 6
+            ? CommandLine.arguments[5] : nil)
+    exit(0)
+}
+if CommandLine.arguments.count == 4,
+   CommandLine.arguments[1] == "--shelf-segment-parity" {
+    runShelfSegmentParity(
+        workbookPath: CommandLine.arguments[2],
+        expectedPath: CommandLine.arguments[3])
+    exit(0)
+}
 if CommandLine.arguments.count <= 1 {
     runESLBarcodeCaptureFocusedTests()
 }
@@ -8769,7 +8786,8 @@ do {
     let csv = "floor,element\n1,\"{ \"\"shapeType\"\": \"\"MapShelf\"\"}\"\n"
     let outcome = try CSVMapSourceImporter.importSource(
         data: Data(csv.utf8),
-        contract: .topLeft)
+        contract: .topLeft,
+        strict: false)
     require(
         outcome.elements.count == 1,
         "I8 quoted-newline CSV must import 1 element, got \(outcome.elements.count)")
@@ -8938,10 +8956,11 @@ do {
         guard lhs.floorId == rhs.floorId, lhs.shapeType == rhs.shapeType,
               lhs.visible == rhs.visible, lhs.locked == rhs.locked,
               lhs.code == rhs.code, lhs.crossCode == rhs.crossCode,
-              lhs.rowFlag == rhs.rowFlag, lhs.subsection == rhs.subsection,
+              lhs.rowFlag == rhs.rowFlag,
               lhs.bounds == rhs.bounds, lhs.centerM == rhs.centerM,
               lhs.yawRad == rhs.yawRad else { return false }
-        return JSONValueComparer.equal(lhs.geometry, rhs.geometry)
+        return JSONValueComparer.equal(lhs.subsection, rhs.subsection)
+            && JSONValueComparer.equal(lhs.geometry, rhs.geometry)
     }
 
     let csv = """
@@ -9806,6 +9825,117 @@ do {
 }
 catch {
     require(false, "X6/X8/X9 workbook tests failed: \(error)")
+}
+
+// Formal XLSX interoperability: namespace prefixes are legal on workbook,
+// relationship and shared-string elements, and ZIP bit-3 data descriptors
+// may omit their optional signature.
+do {
+    let prefixedEntries = [
+        XLSXZipReader.Entry(
+            name: "xl/workbook.xml",
+            data: Data((
+                "<x:workbook xmlns:x=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">"
+                    + "<x:sheets><x:sheet name=\"Element Info\" r:id=\"rId1\"/>"
+                    + "</x:sheets></x:workbook>"
+            ).utf8)),
+        XLSXZipReader.Entry(
+            name: "xl/_rels/workbook.xml.rels",
+            data: Data((
+                "<pr:Relationships xmlns:pr=\"http://schemas.openxmlformats.org/package/2006/relationships\">"
+                    + "<pr:Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" "
+                    + "Target=\"worksheets/sheet1.xml\"/>"
+                    + "</pr:Relationships>"
+            ).utf8)),
+        XLSXZipReader.Entry(
+            name: "xl/sharedStrings.xml",
+            data: Data((
+                "<x:sst xmlns:x=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"><x:si><x:t>Element Info</x:t>"
+                    + "</x:si></x:sst>"
+            ).utf8)),
+    ]
+    let prefixedSheets = try XLSXWorkbookReader.readSheets(entries: prefixedEntries)
+    let prefixedRelationships = try XLSXWorkbookReader.readRelationships(
+        entries: prefixedEntries)
+    let prefixedStrings = try XLSXWorkbookReader.readSharedStrings(
+        entries: prefixedEntries)
+    require(
+        prefixedSheets.count == 1
+            && prefixedSheets[0].name == "Element Info"
+            && prefixedSheets[0].relationshipID == "rId1"
+            && prefixedRelationships.count == 1
+            && prefixedRelationships[0].target == "worksheets/sheet1.xml"
+            && prefixedStrings == ["Element Info"],
+        "formal XLSX prefixed workbook/rels/sharedStrings must parse by local name")
+
+    func append16(_ value: UInt16, to data: inout Data) {
+        data.append(UInt8(value & 0xFF))
+        data.append(UInt8((value >> 8) & 0xFF))
+    }
+    func append32(_ value: UInt32, to data: inout Data) {
+        data.append(UInt8(value & 0xFF))
+        data.append(UInt8((value >> 8) & 0xFF))
+        data.append(UInt8((value >> 16) & 0xFF))
+        data.append(UInt8((value >> 24) & 0xFF))
+    }
+    let memberName = Data("payload.bin".utf8)
+    let memberPayload = Data("abc".utf8)
+    let memberCRC: UInt32 = 0x3524_41C2
+    var unsignedDescriptorZIP = Data()
+    append32(0x0403_4B50, to: &unsignedDescriptorZIP)
+    append16(20, to: &unsignedDescriptorZIP)
+    append16(0x0008, to: &unsignedDescriptorZIP)
+    append16(0, to: &unsignedDescriptorZIP)
+    append16(0, to: &unsignedDescriptorZIP)
+    append16(0, to: &unsignedDescriptorZIP)
+    append32(0, to: &unsignedDescriptorZIP)
+    append32(0, to: &unsignedDescriptorZIP)
+    append32(0, to: &unsignedDescriptorZIP)
+    append16(UInt16(memberName.count), to: &unsignedDescriptorZIP)
+    append16(0, to: &unsignedDescriptorZIP)
+    unsignedDescriptorZIP.append(memberName)
+    unsignedDescriptorZIP.append(memberPayload)
+    append32(memberCRC, to: &unsignedDescriptorZIP)
+    append32(UInt32(memberPayload.count), to: &unsignedDescriptorZIP)
+    append32(UInt32(memberPayload.count), to: &unsignedDescriptorZIP)
+    let centralOffset = UInt32(unsignedDescriptorZIP.count)
+    append32(0x0201_4B50, to: &unsignedDescriptorZIP)
+    append16(20, to: &unsignedDescriptorZIP)
+    append16(20, to: &unsignedDescriptorZIP)
+    append16(0x0008, to: &unsignedDescriptorZIP)
+    append16(0, to: &unsignedDescriptorZIP)
+    append16(0, to: &unsignedDescriptorZIP)
+    append16(0, to: &unsignedDescriptorZIP)
+    append32(memberCRC, to: &unsignedDescriptorZIP)
+    append32(UInt32(memberPayload.count), to: &unsignedDescriptorZIP)
+    append32(UInt32(memberPayload.count), to: &unsignedDescriptorZIP)
+    append16(UInt16(memberName.count), to: &unsignedDescriptorZIP)
+    append16(0, to: &unsignedDescriptorZIP)
+    append16(0, to: &unsignedDescriptorZIP)
+    append16(0, to: &unsignedDescriptorZIP)
+    append16(0, to: &unsignedDescriptorZIP)
+    append32(0, to: &unsignedDescriptorZIP)
+    append32(0, to: &unsignedDescriptorZIP)
+    unsignedDescriptorZIP.append(memberName)
+    let centralSize = UInt32(unsignedDescriptorZIP.count) - centralOffset
+    append32(0x0605_4B50, to: &unsignedDescriptorZIP)
+    append16(0, to: &unsignedDescriptorZIP)
+    append16(0, to: &unsignedDescriptorZIP)
+    append16(1, to: &unsignedDescriptorZIP)
+    append16(1, to: &unsignedDescriptorZIP)
+    append32(centralSize, to: &unsignedDescriptorZIP)
+    append32(centralOffset, to: &unsignedDescriptorZIP)
+    append16(0, to: &unsignedDescriptorZIP)
+    let unsignedEntries = try XLSXZipReader.readEntries(
+        data: unsignedDescriptorZIP)
+    require(
+        unsignedEntries.count == 1
+            && unsignedEntries[0].name == "payload.bin"
+            && unsignedEntries[0].data == memberPayload,
+        "ZIP bit-3 unsigned data descriptor must be accepted and verified")
+}
+catch {
+    require(false, "formal XLSX prefix/data-descriptor tests failed: \(error)")
 }
 
 // =====================================================================
@@ -11277,7 +11407,8 @@ if CommandLine.arguments.count == 3,
                 stagedURL: try writeTemporary(xlsxData, named: "sample.xlsx"),
                 originalFilename: "sample.xlsx",
                 contract: .topLeft,
-                storeId: "s1")
+                storeId: "s1",
+                allowLegacyXLSX: true)
             let csvReport = try MapSourceImportCoordinator.importMap(
                 stagedURL: try writeTemporary(csvData, named: "sample.csv"),
                 originalFilename: "sample.csv",
@@ -11299,7 +11430,18 @@ if CommandLine.arguments.count == 3,
                 failures.append("parity: xlsx vs csv elements mismatch")
             }
             if xlsxReport.canonicalSource.elements != jsonReport.canonicalSource.elements {
-                failures.append("parity: xlsx vs json elements mismatch")
+                let mismatch = zip(
+                    xlsxReport.canonicalSource.elements,
+                    jsonReport.canonicalSource.elements
+                ).first { $0 != $1 }
+                let left = mismatch.flatMap {
+                    try? CanonicalJSONEncoder.encodeString($0.0.canonicalPayload)
+                } ?? "missing"
+                let right = mismatch.flatMap {
+                    try? CanonicalJSONEncoder.encodeString($0.1.canonicalPayload)
+                } ?? "missing"
+                failures.append(
+                    "parity: xlsx vs json elements mismatch; xlsx=\(left) json=\(right)")
             }
             if xlsxReport.elementCount != csvReport.elementCount
                 || xlsxReport.elementCount != jsonReport.elementCount {
@@ -11334,7 +11476,8 @@ if CommandLine.arguments.count == 3,
                 originalFilename: "sample.xlsx",
                 contract: .topLeft,
                 storeId: "s1",
-                mapName: "sample")
+                mapName: "sample",
+                allowLegacyXLSX: true)
             if v2Report.canonicalSourceSha256 != xlsxReference.canonicalSourceSha256 {
                 failures.append("v2 parity: canonical v2 digest must match xlsx")
             }
@@ -11359,7 +11502,8 @@ if CommandLine.arguments.count == 3,
                 stagedURL: try writeTemporary(data, named: "formula.xlsx"),
                 originalFilename: "formula.xlsx",
                 contract: .topLeft,
-                storeId: "s1")
+                storeId: "s1",
+                allowLegacyXLSX: true)
             failures.append("formula: expected rejection")
         }
         catch let error as MapSourceImportError {
@@ -11418,7 +11562,9 @@ if CommandLine.arguments.count == 3,
             let report = try MapSourceImportCoordinator.importMap(
                 stagedURL: try writeTemporary(data, named: "multi-floor.json"),
                 originalFilename: "multi-floor.json",
-                contract: .topLeft)
+                contract: .topLeft,
+                storeId: "s1",
+                mapName: "sample")
             if report.floorCount != 3 {
                 failures.append("multi-floor: expected 3 floors, got \(report.floorCount)")
             }
@@ -11453,6 +11599,961 @@ private func writeTemporary(_ data: Data, named name: String) throws -> URL {
     let url = directory.appendingPathComponent(name)
     try data.write(to: url, options: [.atomic])
     return url
+}
+
+private func runShelfSegmentParity(
+    workbookPath: String,
+    expectedPath: String
+) {
+    do {
+        let workbook = URL(fileURLWithPath: workbookPath)
+        let report = try MapSourceImportCoordinator.importMap(
+            stagedURL: workbook,
+            originalFilename: workbook.lastPathComponent,
+            contract: .bottomLeft,
+            strict: true)
+        let shelves = report.canonicalSource.elements.filter {
+            ElementRoleClassifier.role(for: $0.shapeType) == .shelf
+        }
+        let actual = try MobilePriorMapCompiler.compiledShelfSegments(shelves)
+            .map(\.canonicalPayload)
+        let expectedData = try Data(
+            contentsOf: URL(fileURLWithPath: expectedPath))
+        let expected = try JSONSerialization.jsonObject(
+            with: expectedData, options: [.fragmentsAllowed])
+        let actualData = try CanonicalJSONEncoder.encode(actual as [Any])
+        let expectedCanonical = try CanonicalJSONEncoder.encode(expected)
+        guard actualData == expectedCanonical else {
+            let actualText = String(data: actualData, encoding: .utf8) ?? "<invalid>"
+            let expectedText = String(
+                data: expectedCanonical, encoding: .utf8) ?? "<invalid>"
+            throw PriorMapShelfSchemaError.invalid(
+                "Swift/Python shelf segment mismatch; "
+                    + "actual=\(actualText) expected=\(expectedText)")
+        }
+        print("Shelf segment parity passed count=\(actual.count)")
+    } catch {
+        FileHandle.standardError.write(
+            Data("Shelf segment parity failed: \(error)\n".utf8))
+        exit(13)
+    }
+}
+
+private func runMapCase02Suite(
+    workbookPath: String,
+    outputPath: String,
+    expectedCanonicalSHA256: String,
+    legacyWorkbookPath: String?
+) {
+    do {
+        let workbook = URL(fileURLWithPath: workbookPath)
+        let report = try MapSourceImportCoordinator.importMap(
+            stagedURL: workbook,
+            originalFilename: workbook.lastPathComponent,
+            contract: .bottomLeft,
+            strict: true)
+        require(report.mapName == "Piaseczno", "MapCase02 map_name mismatch")
+        require(report.storeId == "CAPL.2794", "MapCase02 storeCode mismatch")
+        require(report.coordinateContractOrigin == "top_left",
+                "formal XLSX must freeze top-left coordinate contract")
+        require(report.elementCount == 1_630, "MapCase02 active count mismatch")
+        require(report.ignoredElementCount == 208, "MapCase02 ignored count mismatch")
+        require(report.legacyShelfInfoPresent
+                && report.legacyShelfInfoRowCount == 1_573,
+                "MapCase02 Shelf Info audit mismatch")
+        let canonicalData = try CanonicalJSONEncoder.encode(
+            report.canonicalSource.canonicalPayload)
+        try canonicalData.write(
+            to: URL(fileURLWithPath: outputPath + ".canonical.json"),
+            options: [.atomic])
+        require(report.canonicalSourceSha256 == expectedCanonicalSHA256,
+                "Swift/Python canonical SHA mismatch: \(report.canonicalSourceSha256)")
+        guard let mapInfo = report.canonicalSource.sourceMapInfo,
+              let summary = report.canonicalSource.importSummary else {
+            require(false, "MapCase02 formal source metadata missing")
+            return
+        }
+        require(mapInfo.widthCm == 13_129 && mapInfo.heightCm == 8_770
+                && mapInfo.scale == 20,
+                "MapCase02 Basic Info dimensions/scale mismatch")
+        require(summary.sourceElementCount == 1_838
+                && summary.presentationIgnoredCount == 208
+                && summary.ignoredByShapeType == [
+                    "Circle": 93, "MapMark": 104, "Rect": 11,
+                ],
+                "MapCase02 source/presentation statistics mismatch")
+
+        let expectedPolygons: [String: [[Double]]] = [
+            "041-08": [[41.93, -3.90], [40.87, -3.90], [40.87, -15.53], [41.93, -15.53]],
+            "042-03": [[45.35, -3.83], [44.29, -3.83], [44.29, -15.58], [45.35, -15.58]],
+            "043-08": [[48.74, -3.85], [47.68, -3.85], [47.68, -15.56], [48.74, -15.56]],
+            "060-07": [[114.85, -1.84], [113.66, -1.84], [113.66, -4.49], [114.85, -4.49]],
+            "001-01": [[14.28, -78.68], [14.28, -77.72], [12.95, -77.72], [12.95, -78.68]],
+            "TableFeature-106-330": [[127.00, -40.94], [124.44, -40.94], [124.44, -56.10], [127.00, -56.10]],
+            "TableFeature-106-333": [[130.99, -56.73], [129.52, -56.73], [129.52, -72.43], [130.99, -72.43]],
+            "Shelf-106-391-1": [[130.92, -73.25], [129.76, -73.25], [129.76, -75.25], [130.92, -75.25]],
+            "Shelf-106-399-1": [[130.95, -25.03], [129.73, -25.03], [129.73, -27.87], [130.95, -27.87]],
+        ]
+        for (code, expected) in expectedPolygons {
+            let matches = report.canonicalSource.elements.filter { $0.code == code }
+            require(matches.count == 1, "MapCase02 landmark \(code) must be unique")
+            guard let actual = matches.first?.geometry?["coordinates"] as? [[Double]] else {
+                require(false, "MapCase02 landmark \(code) geometry missing")
+                continue
+            }
+            require(actual.count == expected.count,
+                    "MapCase02 landmark \(code) point count mismatch")
+            for (actualPoint, expectedPoint) in zip(actual, expected) {
+                require(close(actualPoint[0], expectedPoint[0], tolerance: 1.0e-6)
+                        && close(actualPoint[1], expectedPoint[1], tolerance: 1.0e-6),
+                        "MapCase02 landmark \(code) polygon mismatch: \(actual)")
+            }
+        }
+
+        let canonicalURL = try writeTemporary(
+            canonicalData, named: "mapcase02-canonical-v3.json")
+        let roundTrip = try MapSourceImportCoordinator.importMap(
+            stagedURL: canonicalURL,
+            originalFilename: canonicalURL.lastPathComponent,
+            contract: .bottomLeft,
+            strict: true)
+        require(roundTrip.canonicalSourceSha256 == report.canonicalSourceSha256
+                && roundTrip.elementCount == report.elementCount,
+                "MapCase02 canonical v3 JSON round trip mismatch")
+
+        // A canonical v3 document is a formal input, not a trusted
+        // in-memory DTO. Keep the role but replace a structure polygon with
+        // a line string: import must fail before compilation/rendering.
+        var invalidCanonical = report.canonicalSource.canonicalPayload
+        guard var invalidElements = invalidCanonical["elements"]
+                as? [[String: Any]],
+              let invalidElementIndex = invalidElements.firstIndex(where: {
+                  ElementRoleClassifier.role(
+                    for: $0["shape_type"] as? String ?? "")
+                    == .fixedStructure
+              }),
+              var invalidGeometry = invalidElements[invalidElementIndex]["geometry"]
+                as? [String: Any] else {
+            require(false, "MapCase02 invalid canonical fixture could not be built")
+            return
+        }
+        invalidGeometry["type"] = "line_string"
+        invalidElements[invalidElementIndex]["geometry"] = invalidGeometry
+        invalidCanonical["elements"] = invalidElements
+        let invalidCanonicalData = try CanonicalJSONEncoder.encode(
+            invalidCanonical)
+        let invalidCanonicalURL = try writeTemporary(
+            invalidCanonicalData,
+            named: "mapcase02-invalid-geometry-v3.json")
+        do {
+            _ = try MapSourceImportCoordinator.importMap(
+                stagedURL: invalidCanonicalURL,
+                originalFilename: invalidCanonicalURL.lastPathComponent,
+                contract: .topLeft,
+                strict: true)
+            require(false, "canonical v3 wrong geometry kind must be rejected")
+        } catch let error as MapSourceImportError {
+            require(error.stableCode == "map_source_invalid_geometry",
+                    "canonical v3 wrong geometry returned \(error.stableCode)")
+        }
+
+        let excessiveSheetsXML = """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets>
+        """ + (1...(MapSourceImportLimits.maximumWorkbookSheets + 1)).map {
+            "<sheet name=\"S\($0)\" sheetId=\"\($0)\" r:id=\"rId\($0)\"/>"
+        }.joined() + "</sheets></workbook>"
+        do {
+            _ = try XLSXWorkbookReader.readSheets(entries: [
+                XLSXZipReader.Entry(
+                    name: "xl/workbook.xml",
+                    data: Data(excessiveSheetsXML.utf8)),
+            ])
+            require(false, "excessive workbook sheet records must be rejected")
+        } catch let error as MapSourceImportError {
+            require(error.stableCode == "map_source_xlsx_invalid_xml",
+                    "excessive sheets returned \(error.stableCode)")
+        }
+        let excessiveRelationshipsXML = """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+        """ + (1...(MapSourceImportLimits.maximumWorkbookRelationships + 1)).map {
+            "<Relationship Id=\"rId\($0)\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" Target=\"worksheets/sheet\($0).xml\"/>"
+        }.joined() + "</Relationships>"
+        do {
+            _ = try XLSXWorkbookReader.readRelationships(entries: [
+                XLSXZipReader.Entry(
+                    name: "xl/_rels/workbook.xml.rels",
+                    data: Data(excessiveRelationshipsXML.utf8)),
+            ])
+            require(false, "excessive workbook relationships must be rejected")
+        } catch let error as MapSourceImportError {
+            require(error.stableCode == "map_source_xlsx_invalid_xml",
+                    "excessive relationships returned \(error.stableCode)")
+        }
+
+        let duplicateRelationshipsXML = Data("""
+        <?xml version="1.0" encoding="UTF-8"?>
+        <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+          <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
+          <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet2.xml"/>
+        </Relationships>
+        """.utf8)
+        do {
+            _ = try XLSXWorkbookReader.readRelationships(entries: [
+                XLSXZipReader.Entry(
+                    name: "xl/_rels/workbook.xml.rels",
+                    data: duplicateRelationshipsXML),
+            ])
+            require(false, "duplicate workbook relationship IDs must be rejected")
+        } catch let error as MapSourceImportError {
+            require(error.stableCode == "map_source_xlsx_invalid_xml",
+                    "duplicate relationship returned \(error.stableCode)")
+        }
+        let externalRelationshipsXML = Data("""
+        <?xml version="1.0" encoding="UTF-8"?>
+        <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+          <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml" TargetMode="External"/>
+        </Relationships>
+        """.utf8)
+        do {
+            _ = try XLSXWorkbookReader.readRelationships(entries: [
+                XLSXZipReader.Entry(
+                    name: "xl/_rels/workbook.xml.rels",
+                    data: externalRelationshipsXML),
+            ])
+            require(false, "external worksheet relationship must be rejected")
+        } catch let error as MapSourceImportError {
+            require(error.stableCode == "map_source_xlsx_invalid_xml",
+                    "external relationship returned \(error.stableCode)")
+        }
+        do {
+            _ = try XLSXWorkbookReader.worksheetEntry(
+                entries: [
+                    XLSXZipReader.Entry(
+                        name: "xl/worksheets/sheet1.xml", data: Data()),
+                    XLSXZipReader.Entry(
+                        name: "worksheets/sheet1.xml", data: Data()),
+                ],
+                target: "worksheets/sheet1.xml")
+            require(false, "ambiguous worksheet targets must be rejected")
+        } catch let error as MapSourceImportError {
+            require(error.stableCode == "map_source_xlsx_invalid_xml",
+                    "ambiguous worksheet target returned \(error.stableCode)")
+        }
+        do {
+            _ = try XLSXWorkbookReader.readSheets(entries: [
+                XLSXZipReader.Entry(
+                    name: "xl/workbook.xml",
+                    data: Data("""
+                    <?xml version="1.0"?><!DOCTYPE workbook [<!ENTITY x "x">]><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheets/></workbook>
+                    """.utf8)),
+            ])
+            require(false, "DOCTYPE workbook must be rejected")
+        } catch let error as MapSourceImportError {
+            require(error.stableCode == "map_source_xlsx_invalid_xml",
+                    "DOCTYPE workbook returned \(error.stableCode)")
+        }
+        do {
+            let aliasedSheets = [
+                XLSXWorkbookReader.SheetInfo(
+                    name: "Basic Info", relationshipID: "rId1"),
+                XLSXWorkbookReader.SheetInfo(
+                    name: "Element Info", relationshipID: "rId2"),
+            ]
+            let aliasedRelationships = [
+                XLSXWorkbookReader.Relationship(
+                    identifier: "rId1",
+                    type: "http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet",
+                    target: "worksheets/sheet1.xml"),
+                XLSXWorkbookReader.Relationship(
+                    identifier: "rId2",
+                    type: "http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet",
+                    target: "worksheets/sheet1.xml"),
+            ]
+            try XLSXWorkbookReader.validateSheetAuthorities(
+                sheets: aliasedSheets,
+                relationships: aliasedRelationships,
+                entries: [XLSXZipReader.Entry(
+                    name: "xl/worksheets/sheet1.xml", data: Data())])
+            require(false, "aliased worksheet authorities must be rejected")
+        } catch let error as MapSourceImportError {
+            require(error.stableCode == "map_source_xlsx_invalid_xml",
+                    "worksheet authority alias returned \(error.stableCode)")
+        }
+
+        func requireWorksheetRejection(_ label: String, _ xml: String) {
+            do {
+                _ = try XLSXWorksheetReader.readWorksheet(
+                    entry: XLSXZipReader.Entry(
+                        name: "xl/worksheets/\(label).xml",
+                        data: Data(xml.utf8)),
+                    sharedStrings: [])
+                require(false, "\(label) worksheet must be rejected")
+            } catch let error as MapSourceImportError {
+                require(error.stableCode == "map_source_xlsx_invalid_xml",
+                        "\(label) returned \(error.stableCode)")
+            } catch {
+                require(false, "\(label) returned unexpected error \(error)")
+            }
+        }
+        requireWorksheetRejection(
+            "missing-row-reference",
+            """
+            <?xml version="1.0"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row><c r="A1"><v>1</v></c></row></sheetData></worksheet>
+            """)
+        requireWorksheetRejection(
+            "duplicate-row-reference",
+            """
+            <?xml version="1.0"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1"><v>1</v></c></row><row r="1"><c r="B1"><v>2</v></c></row></sheetData></worksheet>
+            """)
+        requireWorksheetRejection(
+            "mismatched-cell-reference",
+            """
+            <?xml version="1.0"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="2"><c r="A3"><v>1</v></c></row></sheetData></worksheet>
+            """)
+        requireWorksheetRejection(
+            "duplicate-cell-reference",
+            """
+            <?xml version="1.0"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1"><v>1</v></c><c r="A1"><v>2</v></c></row></sheetData></worksheet>
+            """)
+        requireWorksheetRejection(
+            "oversized-column-reference",
+            """
+            <?xml version="1.0"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="AAAAAAAAAAAAAAAAAAAA1"><v>1</v></c></row></sheetData></worksheet>
+            """)
+        requireWorksheetRejection(
+            "leading-zero-row-reference",
+            """
+            <?xml version="1.0"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="01"><c r="A01"><v>1</v></c></row></sheetData></worksheet>
+            """)
+        requireWorksheetRejection(
+            "foreign-sheet-data",
+            """
+            <?xml version="1.0"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:evil="urn:evil"><evil:sheetData><row r="1"><c r="A1"><v>1</v></c></row></evil:sheetData></worksheet>
+            """)
+        requireWorksheetRejection(
+            "invalid-boolean-cell",
+            """
+            <?xml version="1.0"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1" t="b"><v>2</v></c></row></sheetData></worksheet>
+            """)
+        let oversizedInlineText = String(
+            repeating: "x",
+            count: Int(MapSourceImportLimits.maximumCellBytes) + 1)
+        requireWorksheetRejection(
+            "oversized-inline-cell",
+            """
+            <?xml version="1.0"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>\(oversizedInlineText)</t></is></c></row></sheetData></worksheet>
+            """)
+        do {
+            _ = try XLSXWorksheetReader.readWorksheet(
+                entry: XLSXZipReader.Entry(
+                    name: "xl/worksheets/negative-shared-string.xml",
+                    data: Data("""
+                    <?xml version="1.0"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1" t="s"><v>-1</v></c></row></sheetData></worksheet>
+                    """.utf8)),
+                sharedStrings: ["last"])
+            require(false, "negative shared-string index must be rejected")
+        } catch let error as MapSourceImportError {
+            require(error.stableCode == "map_source_xlsx_invalid_xml",
+                    "negative shared-string index returned \(error.stableCode)")
+        }
+
+        do {
+            try XLSXMapSourceImporter.enforceElementCount(
+                MapSourceImportLimits.maximumElements)
+        } catch {
+            require(false, "100,000 source elements must remain within the limit")
+        }
+        do {
+            try XLSXMapSourceImporter.enforceElementCount(
+                MapSourceImportLimits.maximumElements + 1)
+            require(false, "100,001 source elements must be rejected")
+        } catch let error as MapSourceImportError {
+            require(error.stableCode == "map_source_element_count_too_large",
+                    "100,001 source elements returned \(error.stableCode)")
+        }
+
+        var duplicateIDSource = report.canonicalSource
+        require(duplicateIDSource.elements.count >= 2,
+                "MapCase02 duplicate-ID fixture needs two elements")
+        duplicateIDSource.elements[1].id = duplicateIDSource.elements[0].id
+        let duplicateIDOutput = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "mapcase02-duplicate-id-\(UUID().uuidString)",
+                isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: duplicateIDOutput) }
+        do {
+            _ = try MobilePriorMapCompiler.compile(
+                canonicalSource: duplicateIDSource,
+                outputDirectory: duplicateIDOutput)
+            require(false, "duplicate active element IDs must be rejected without a trap")
+        } catch let error as MobilePriorMapCompiler.CompileError {
+            if case .outputNotUsable = error {
+                // Expected typed rejection.
+            } else {
+                require(false, "duplicate active ID returned \(error)")
+            }
+        } catch {
+            require(false, "duplicate active ID returned unexpected error \(error)")
+        }
+
+        var duplicateStableSource = report.canonicalSource
+        guard var duplicateBusinessElement = duplicateStableSource.elements.first
+        else {
+            require(false, "MapCase02 stable-ID fixture needs one element")
+            return
+        }
+        duplicateBusinessElement.id += "-duplicate-row"
+        duplicateBusinessElement.sourceRow =
+            (duplicateStableSource.elements.map(\.sourceRow).max() ?? 0) + 1
+        duplicateStableSource.elements.append(duplicateBusinessElement)
+        if var summary = duplicateStableSource.importSummary {
+            summary.sourceElementCount += 1
+            duplicateStableSource.importSummary = summary
+        }
+        let duplicateStableOutput = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "mapcase02-duplicate-stable-id-\(UUID().uuidString)",
+                isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: duplicateStableOutput) }
+        do {
+            _ = try MobilePriorMapCompiler.compile(
+                canonicalSource: duplicateStableSource,
+                outputDirectory: duplicateStableOutput)
+            require(false, "duplicate stable business IDs must be rejected")
+        } catch let error as MobilePriorMapCompiler.CompileError {
+            if case .outputNotUsable = error {
+                // Expected typed rejection before package output.
+            } else {
+                require(false, "duplicate stable business ID returned \(error)")
+            }
+        } catch {
+            require(false,
+                    "duplicate stable business ID returned unexpected error \(error)")
+        }
+
+        let oversizedFloor: [[String: Any]] = [[
+            "id": "1",
+            "bounds": [
+                "min_x_m": 0.0, "min_y_m": 0.0,
+                "max_x_m": 3_000.0, "max_y_m": 1.0,
+            ],
+        ]]
+        do {
+            _ = try MobileDistanceFieldBuilder.build(
+                elements: [], floors: oversizedFloor)
+            require(false, "oversized distance-field dimension must be rejected")
+        } catch let error as MapSourceImportError {
+            require(error.stableCode == "map_source_invalid_geometry",
+                    "distance-field budget returned \(error.stableCode)")
+        }
+        let oversizedDecodedLevel = PriorMapDistanceFieldLevel(
+            resolutionM: 0.1,
+            originM: [0, 0],
+            width: Int.max,
+            height: 1,
+            encoding: "row_rle_u8_cm",
+            dataSha256: String(repeating: "0", count: 64),
+            rows: [])
+        do {
+            _ = try oversizedDecodedLevel.decodedValues()
+            require(false, "oversized decoded distance level must reject before allocation")
+        } catch {
+            // Expected typed fail-closed rejection before width*height.
+        }
+        let oversizedRLELevel = PriorMapDistanceFieldLevel(
+            resolutionM: 0.1,
+            originM: [0, 0],
+            width: 1,
+            height: 1,
+            encoding: "row_rle_u8_cm",
+            dataSha256: String(repeating: "0", count: 64),
+            rows: [[Int.max, 0]])
+        do {
+            _ = try oversizedRLELevel.decodedValues()
+            require(false, "oversized RLE count must reject before append")
+        } catch {
+            // Expected fail-closed rejection before repeatElement allocation.
+        }
+
+        var oversizedSpatialElement = report.canonicalSource.elements[0]
+        oversizedSpatialElement.bounds = [
+            "min_x_m": 0, "min_y_m": 0,
+            "max_x_m": 40_000_000, "max_y_m": 0,
+            "width_m": 40_000_000, "height_m": 0,
+        ]
+        do {
+            _ = try MobileSpatialIndexBuilder.build(
+                elements: [oversizedSpatialElement],
+                graph: ["nodes": [[String: Any]](), "edges": [[String: Any]]()],
+                floors: oversizedFloor)
+            require(false, "oversized spatial assignment must be rejected")
+        } catch let error as MapSourceImportError {
+            require(error.stableCode == "map_source_invalid_geometry",
+                    "spatial budget returned \(error.stableCode)")
+        }
+
+        let output = URL(fileURLWithPath: outputPath, isDirectory: true)
+        let compiled = try MobilePriorMapCompiler.compile(
+            canonicalSource: report.canonicalSource,
+            outputDirectory: output)
+        require(compiled.elementCount == 1_630 && compiled.floorCount == 1,
+                "MapCase02 compiler counts mismatch")
+        let packageSHA = try PriorMapPackageIntegrity.validate(directory: output)
+        require(packageSHA == compiled.packageSHA256,
+                "MapCase02 production integrity digest mismatch")
+        let manifest = try JSONSerialization.jsonObject(
+            with: Data(contentsOf: output.appendingPathComponent("manifest.json")))
+            as? [String: Any]
+        require(StrictJSONScalar.integer(manifest?["version"]) == 2
+                && StrictJSONScalar.integer(manifest?["source_element_count"]) == 1_838
+                && StrictJSONScalar.integer(manifest?["shelf_count"]) == 1_301
+                && StrictJSONScalar.integer(manifest?["fixed_structure_count"]) == 329,
+                "MapCase02 compiled manifest metrics mismatch")
+
+        let duplicateStablePackage = output.deletingLastPathComponent()
+            .appendingPathComponent(
+                ".mapcase02-duplicate-stable-package-\(UUID().uuidString)",
+                isDirectory: true)
+        try FileManager.default.copyItem(at: output, to: duplicateStablePackage)
+        defer { try? FileManager.default.removeItem(at: duplicateStablePackage) }
+        let duplicateElementsURL = duplicateStablePackage
+            .appendingPathComponent("elements.json")
+        guard var duplicateElementsPayload = try JSONSerialization.jsonObject(
+                with: Data(contentsOf: duplicateElementsURL)) as? [String: Any],
+              var duplicatePackageElements = duplicateElementsPayload["elements"]
+                as? [[String: Any]],
+              duplicatePackageElements.count >= 2,
+              let firstDuplicateID = duplicatePackageElements[0]["id"] as? String,
+              let secondDuplicateID = duplicatePackageElements[1]["id"] as? String
+        else {
+            require(false, "duplicate stable package fixture could not be built")
+            return
+        }
+        let duplicateBusinessSource: [String: Any] = [
+            "id": "duplicate-official-business-id",
+        ]
+        let duplicatePackageIDs = Set([firstDuplicateID, secondDuplicateID])
+        for index in duplicatePackageElements.indices
+        where duplicatePackageIDs.contains(
+            duplicatePackageElements[index]["id"] as? String ?? "") {
+            duplicatePackageElements[index]["source"] = duplicateBusinessSource
+        }
+        duplicateElementsPayload["elements"] = duplicatePackageElements
+        try CanonicalJSONEncoder.encode(duplicateElementsPayload)
+            .write(to: duplicateElementsURL)
+        for (filename, key) in [
+            ("shelves.json", "shelves"),
+            ("fixed_structures.json", "structures"),
+        ] {
+            let url = duplicateStablePackage.appendingPathComponent(filename)
+            guard var payload = try JSONSerialization.jsonObject(
+                    with: Data(contentsOf: url)) as? [String: Any],
+                  var values = payload[key] as? [[String: Any]] else {
+                require(false, "duplicate stable \(filename) fixture is invalid")
+                return
+            }
+            for index in values.indices
+            where duplicatePackageIDs.contains(values[index]["id"] as? String ?? "") {
+                values[index]["source"] = duplicateBusinessSource
+            }
+            payload[key] = values
+            try CanonicalJSONEncoder.encode(payload).write(to: url)
+        }
+        var duplicateCanonicalSource = report.canonicalSource
+        for index in duplicateCanonicalSource.elements.indices
+        where duplicatePackageIDs.contains(
+            duplicateCanonicalSource.elements[index].id) {
+            duplicateCanonicalSource.elements[index].source = duplicateBusinessSource
+        }
+        let duplicateCanonicalData = try CanonicalJSONEncoder.encode(
+            duplicateCanonicalSource.canonicalPayload)
+        let duplicateCanonicalSHA = CanonicalSourceHasher.sha256(
+            duplicateCanonicalData)
+        let duplicateManifestURL = duplicateStablePackage
+            .appendingPathComponent("manifest.json")
+        guard var duplicateManifest = try JSONSerialization.jsonObject(
+                with: Data(contentsOf: duplicateManifestURL)) as? [String: Any]
+        else {
+            require(false, "duplicate stable manifest fixture is invalid")
+            return
+        }
+        duplicateManifest["canonical_source_sha256"] = duplicateCanonicalSHA
+        duplicateManifest["prior_map_id"] = MobilePriorMapCompiler.safeName(
+            report.mapName) + "-" + String(duplicateCanonicalSHA.prefix(12))
+        try CanonicalJSONEncoder.encode(duplicateManifest)
+            .write(to: duplicateManifestURL)
+        let duplicateReboundManifest = try MobilePackageManifestBuilder
+            .buildManifest(directory: duplicateStablePackage)
+        try CanonicalJSONEncoder.encode(duplicateReboundManifest).write(
+            to: duplicateStablePackage.appendingPathComponent(
+                MobilePackageManifestBuilder.manifestFileName))
+        do {
+            _ = try PriorMapPackageIntegrity.validate(
+                directory: duplicateStablePackage)
+            require(false,
+                    "re-signed duplicate stable business IDs must be rejected")
+        } catch {
+            // Expected: hashes and canonical claim are current, but stable
+            // business identity remains ambiguous.
+        }
+
+        let extraBoundsPackage = output.deletingLastPathComponent()
+            .appendingPathComponent(
+                ".mapcase02-extra-bounds-package-\(UUID().uuidString)",
+                isDirectory: true)
+        try FileManager.default.copyItem(at: output, to: extraBoundsPackage)
+        defer { try? FileManager.default.removeItem(at: extraBoundsPackage) }
+        let extraElementsURL = extraBoundsPackage
+            .appendingPathComponent("elements.json")
+        let extraStructuresURL = extraBoundsPackage
+            .appendingPathComponent("fixed_structures.json")
+        guard var extraElementsPayload = try JSONSerialization.jsonObject(
+                with: Data(contentsOf: extraElementsURL)) as? [String: Any],
+              var extraElements = extraElementsPayload["elements"]
+                as? [[String: Any]],
+              let extraElementIndex = extraElements.firstIndex(where: {
+                  $0["role"] as? String
+                    == PriorMapElementRole.fixedStructure.rawValue
+              }),
+              let extraElementID = extraElements[extraElementIndex]["id"]
+                as? String,
+              var extraBounds = extraElements[extraElementIndex]["bounds"]
+                as? [String: Any],
+              var extraStructuresPayload = try JSONSerialization.jsonObject(
+                with: Data(contentsOf: extraStructuresURL)) as? [String: Any],
+              var extraStructures = extraStructuresPayload["structures"]
+                as? [[String: Any]],
+              let extraStructureIndex = extraStructures.firstIndex(where: {
+                  $0["id"] as? String == extraElementID
+              }) else {
+            require(false, "extra bounds fixture could not be built")
+            return
+        }
+        extraBounds["unexpected"] = 0.0
+        extraElements[extraElementIndex]["bounds"] = extraBounds
+        extraStructures[extraStructureIndex]["bounds"] = extraBounds
+        extraElementsPayload["elements"] = extraElements
+        extraStructuresPayload["structures"] = extraStructures
+        try CanonicalJSONEncoder.encode(extraElementsPayload)
+            .write(to: extraElementsURL)
+        try CanonicalJSONEncoder.encode(extraStructuresPayload)
+            .write(to: extraStructuresURL)
+        let extraBoundsRebound = try MobilePackageManifestBuilder
+            .buildManifest(directory: extraBoundsPackage)
+        try CanonicalJSONEncoder.encode(extraBoundsRebound).write(
+            to: extraBoundsPackage.appendingPathComponent(
+                MobilePackageManifestBuilder.manifestFileName))
+        do {
+            _ = try PriorMapPackageIntegrity.validate(
+                directory: extraBoundsPackage)
+            require(false, "re-signed extra v2 bounds keys must be rejected")
+        } catch {
+            // Expected: subset and package hashes are current, but formal
+            // v2 bounds are an exact six-field contract.
+        }
+
+        // Rebind package hashes after a cross-file-consistent geometry-kind
+        // mutation. The production validator must reject the semantic
+        // contract itself, not merely notice a stale package hash.
+        let invalidPackage = output.deletingLastPathComponent()
+            .appendingPathComponent(
+                ".mapcase02-invalid-package-\(UUID().uuidString)",
+                isDirectory: true)
+        try FileManager.default.copyItem(at: output, to: invalidPackage)
+        defer { try? FileManager.default.removeItem(at: invalidPackage) }
+        let invalidElementsURL = invalidPackage.appendingPathComponent(
+            "elements.json")
+        let invalidStructuresURL = invalidPackage.appendingPathComponent(
+            "fixed_structures.json")
+        guard var invalidElementsPayload = try JSONSerialization.jsonObject(
+                with: Data(contentsOf: invalidElementsURL)) as? [String: Any],
+              var packageElements = invalidElementsPayload["elements"]
+                as? [[String: Any]],
+              let packageElementIndex = packageElements.firstIndex(where: {
+                  $0["role"] as? String == PriorMapElementRole.fixedStructure.rawValue
+              }),
+              let invalidElementID = packageElements[packageElementIndex]["id"]
+                as? String,
+              var packageGeometry = packageElements[packageElementIndex]["geometry"]
+                as? [String: Any],
+              var invalidStructuresPayload = try JSONSerialization.jsonObject(
+                with: Data(contentsOf: invalidStructuresURL)) as? [String: Any],
+              var packageStructures = invalidStructuresPayload["structures"]
+                as? [[String: Any]],
+              let packageStructureIndex = packageStructures.firstIndex(where: {
+                  $0["id"] as? String == invalidElementID
+              }) else {
+            require(false, "MapCase02 invalid package fixture could not be built")
+            return
+        }
+        packageGeometry["type"] = "line_string"
+        packageElements[packageElementIndex]["geometry"] = packageGeometry
+        packageStructures[packageStructureIndex]["geometry"] = packageGeometry
+        invalidElementsPayload["elements"] = packageElements
+        invalidStructuresPayload["structures"] = packageStructures
+        try CanonicalJSONEncoder.encode(invalidElementsPayload)
+            .write(to: invalidElementsURL)
+        try CanonicalJSONEncoder.encode(invalidStructuresPayload)
+            .write(to: invalidStructuresURL)
+        let reboundManifest = try MobilePackageManifestBuilder.buildManifest(
+            directory: invalidPackage)
+        try CanonicalJSONEncoder.encode(reboundManifest).write(
+            to: invalidPackage.appendingPathComponent(
+                MobilePackageManifestBuilder.manifestFileName))
+        do {
+            _ = try PriorMapPackageIntegrity.validate(directory: invalidPackage)
+            require(false, "v2 package wrong geometry kind must be rejected")
+        } catch {
+            // Expected: package hashes are current, relationship validation
+            // rejects the role-specific geometry kind.
+        }
+
+        func requireReboundManifestRejection(
+            _ label: String,
+            mutate: (inout [String: Any]) -> Void
+        ) throws {
+            let package = output.deletingLastPathComponent()
+                .appendingPathComponent(
+                    ".mapcase02-\(label)-\(UUID().uuidString)",
+                    isDirectory: true)
+            try FileManager.default.copyItem(at: output, to: package)
+            defer { try? FileManager.default.removeItem(at: package) }
+            let manifestURL = package.appendingPathComponent("manifest.json")
+            guard var payload = try JSONSerialization.jsonObject(
+                    with: Data(contentsOf: manifestURL)) as? [String: Any] else {
+                require(false, "\(label) manifest fixture is invalid")
+                return
+            }
+            mutate(&payload)
+            try CanonicalJSONEncoder.encode(payload).write(to: manifestURL)
+            let rebound = try MobilePackageManifestBuilder.buildManifest(
+                directory: package)
+            try CanonicalJSONEncoder.encode(rebound).write(
+                to: package.appendingPathComponent(
+                    MobilePackageManifestBuilder.manifestFileName))
+            var rejected = false
+            do {
+                _ = try PriorMapPackageIntegrity.validate(directory: package)
+            } catch {
+                rejected = true
+            }
+            require(rejected, "\(label) must fail after package hashes are rebound")
+        }
+        try requireReboundManifestRejection("forged-map-identity") { payload in
+            payload["prior_map_id"] = "forged"
+            payload["canonical_source_sha256"] = String(repeating: "0", count: 64)
+        }
+        try requireReboundManifestRejection("forged-coordinate-contract") { payload in
+            payload["source_coordinate_system"] = [
+                "unit": "inch",
+                "origin": "bottom_left",
+                "x_axis": "left",
+                "y_axis": "up",
+                "rotation_direction": "clockwise_degrees",
+                "rectangle_anchor": "top_left",
+                "rotation_pivot": "top_left_anchor",
+            ]
+        }
+        try requireReboundManifestRejection("missing-manifest-width") { payload in
+            guard var bounds = payload["bounds"] as? [String: Any] else {
+                require(false, "missing manifest width fixture has no bounds")
+                return
+            }
+            bounds.removeValue(forKey: "width_m")
+            payload["bounds"] = bounds
+        }
+        try requireReboundManifestRejection("tiny-manifest-width-drift") { payload in
+            guard var bounds = payload["bounds"] as? [String: Any],
+                  let width = StrictJSONScalar.number(bounds["width_m"]) else {
+                require(false, "tiny manifest width drift fixture has no bounds")
+                return
+            }
+            bounds["width_m"] = width + 5.0e-7
+            payload["bounds"] = bounds
+        }
+        try requireReboundManifestRejection("missing-floor-height") { payload in
+            guard var floors = payload["floors"] as? [[String: Any]],
+                  !floors.isEmpty,
+                  var bounds = floors[0]["bounds"] as? [String: Any] else {
+                require(false, "missing floor height fixture has no bounds")
+                return
+            }
+            bounds.removeValue(forKey: "height_m")
+            floors[0]["bounds"] = bounds
+            payload["floors"] = floors
+        }
+        try requireReboundManifestRejection("claimed-canonical-hash") { payload in
+            let forged = String(repeating: "0", count: 64)
+            payload["canonical_source_sha256"] = forged
+            payload["prior_map_id"] = "Piaseczno-" + String(forged.prefix(12))
+        }
+
+        func requireReboundArtifactRejection(
+            _ label: String,
+            artifactName: String,
+            mutate: (inout [String: Any]) throws -> Void
+        ) throws {
+            let package = output.deletingLastPathComponent()
+                .appendingPathComponent(
+                    ".mapcase02-\(label)-\(UUID().uuidString)",
+                    isDirectory: true)
+            try FileManager.default.copyItem(at: output, to: package)
+            defer { try? FileManager.default.removeItem(at: package) }
+            let artifactURL = package.appendingPathComponent(artifactName)
+            guard var payload = try JSONSerialization.jsonObject(
+                    with: Data(contentsOf: artifactURL)) as? [String: Any] else {
+                require(false, "\(label) artifact fixture is invalid")
+                return
+            }
+            try mutate(&payload)
+            try CanonicalJSONEncoder.encode(payload).write(to: artifactURL)
+            let rebound = try MobilePackageManifestBuilder.buildManifest(
+                directory: package)
+            try CanonicalJSONEncoder.encode(rebound).write(
+                to: package.appendingPathComponent(
+                    MobilePackageManifestBuilder.manifestFileName))
+            var rejected = false
+            do {
+                _ = try PriorMapPackageIntegrity.validate(directory: package)
+            } catch {
+                rejected = true
+            }
+            require(rejected, "\(label) must fail after package hashes are rebound")
+        }
+
+        try requireReboundArtifactRejection(
+            "shifted-shelf-segment",
+            artifactName: "shelves.json"
+        ) { payload in
+            guard var segments = payload["shelf_segments"]
+                    as? [[String: Any]],
+                  !segments.isEmpty,
+                  var start = segments[0]["longitudinal_start_m"] as? [Double],
+                  var end = segments[0]["longitudinal_end_m"] as? [Double] else {
+                require(false, "shifted shelf fixture missing segment")
+                return
+            }
+            start[0] += 1
+            end[0] += 1
+            segments[0]["longitudinal_start_m"] = start
+            segments[0]["longitudinal_end_m"] = end
+            payload["shelf_segments"] = segments
+        }
+        try requireReboundArtifactRejection(
+            "wrong-spatial-cell",
+            artifactName: "spatial_index.json"
+        ) { payload in
+            guard var floors = payload["floors"] as? [String: Any],
+                  let floorID = floors.keys.sorted().first,
+                  var floor = floors[floorID] as? [String: Any],
+                  let cells = floor["cells"] as? [String: Any] else {
+                require(false, "spatial fixture missing floor cells")
+                return
+            }
+            let identifiers = Set(cells.values.flatMap {
+                ($0 as? [String]) ?? []
+            }).sorted()
+            floor["cells"] = ["999,999": identifiers]
+            floors[floorID] = floor
+            payload["floors"] = floors
+        }
+        try requireReboundArtifactRejection(
+            "forged-road-graph",
+            artifactName: "road_graph.json"
+        ) { payload in
+            payload["nodes"] = [[
+                "id": "forged-node",
+                "element_id": "forged-element",
+                "floor_id": "1",
+                "position_m": [0.0, 0.0],
+                "cross_ids": [String](),
+                "visible": true,
+            ]]
+        }
+        try requireReboundArtifactRejection(
+            "integral-float-distance-token",
+            artifactName: "distance_fields.json"
+        ) { payload in
+            guard var floors = payload["floors"] as? [String: Any],
+                  let floorID = floors.keys.sorted().first,
+                  var floor = floors[floorID] as? [String: Any],
+                  var levels = floor["levels"] as? [[String: Any]],
+                  let width = StrictJSONScalar.integer(levels[0]["width"]) else {
+                require(false, "distance token fixture missing level")
+                return
+            }
+            levels[0]["width"] = Double(width)
+            floor["levels"] = levels
+            floors[floorID] = floor
+            payload["floors"] = floors
+        }
+        try requireReboundArtifactRejection(
+            "all-zero-distance-field",
+            artifactName: "distance_fields.json"
+        ) { payload in
+            guard var floors = payload["floors"] as? [String: Any] else {
+                require(false, "distance fixture missing floors")
+                return
+            }
+            for floorID in floors.keys.sorted() {
+                guard var floor = floors[floorID] as? [String: Any],
+                      var levels = floor["levels"] as? [[String: Any]] else {
+                    require(false, "distance fixture missing levels")
+                    return
+                }
+                for index in levels.indices {
+                    guard let width = StrictJSONScalar.integer(
+                            levels[index]["width"]),
+                          let height = StrictJSONScalar.integer(
+                            levels[index]["height"]) else {
+                        require(false, "distance fixture dimensions invalid")
+                        return
+                    }
+                    let rows = [[Int]](
+                        repeating: [width, 0], count: height)
+                    levels[index]["rows"] = rows
+                    levels[index]["data_sha256"] = CanonicalSourceHasher.sha256(
+                        try CanonicalJSONEncoder.encode(rows))
+                }
+                floor["levels"] = levels
+                floors[floorID] = floor
+            }
+            payload["floors"] = floors
+        }
+
+        let strictIntegerTokens = try JSONSerialization.jsonObject(
+            with: Data("{\"integer\":2,\"float\":2.0,\"exponent\":2e0}".utf8))
+            as? [String: Any]
+        require(
+            StrictJSONScalar.integer(strictIntegerTokens?["integer"]) == 2
+                && StrictJSONScalar.integer(strictIntegerTokens?["float"]) == nil
+                && StrictJSONScalar.integer(strictIntegerTokens?["exponent"]) == nil,
+            "integral floating JSON tokens must not pass as strict integers")
+
+        if let legacyWorkbookPath = legacyWorkbookPath {
+            do {
+                let legacy = URL(fileURLWithPath: legacyWorkbookPath)
+                _ = try MapSourceImportCoordinator.importMap(
+                    stagedURL: legacy,
+                    originalFilename: legacy.lastPathComponent,
+                    contract: .topLeft,
+                    storeId: "legacy",
+                    strict: true)
+                require(false, "MapCase01 formal import must reject missing Basic Info")
+            } catch let error as MapSourceImportError {
+                require(error.stableCode == "map_source_xlsx_sheet_not_found",
+                        "MapCase01 missing Basic Info returned \(error.stableCode): "
+                            + error.localizedDescription)
+            }
+        }
+        print("MapCase02 suite passed canonical=\(report.canonicalSourceSha256) package=\(packageSHA)")
+    } catch {
+        FileHandle.standardError.write(
+            Data("MapCase02 suite failed: \(error)\n".utf8))
+        exit(12)
+    }
 }
 
 // V1R4 §14.2: registered packages are frozen immutable (555/444);
@@ -14236,14 +15337,13 @@ func runResultPublicationCrashWorkerIfRequested() {
         }
 
         if phase.hasPrefix("verify_") {
-            let delayedPhases: Set<String> = [
+            let deterministicReadPhases: Set<String> = [
                 "verify_artifact_posthash_mutate",
                 "verify_manifest_postread_replace",
                 "verify_receipt_postread_replace",
                 "verify_result_root_final_sweep_replace",
             ]
-            let payloadBytes = delayedPhases.contains(phase)
-                ? 128 * 1024 * 1024 : 64
+            let payloadBytes = 64
             let staging = try MobileResultLibrary.stagingDirectory(
                 taskID: taskID, resultID: resultID)
             try Data(repeating: 0x61, count: payloadBytes).write(
@@ -14384,14 +15484,27 @@ func runResultPublicationCrashWorkerIfRequested() {
             }
             MobileResultLibrary.processLockAcquiredObserver = {
                 guard !mutationScheduled else { return }
+                guard !deterministicReadPhases.contains(phase) else { return }
                 mutationScheduled = true
-                if delayedPhases.contains(phase) {
-                    DispatchQueue.global().asyncAfter(
-                        deadline: .now() + .milliseconds(10),
-                        execute: mutateVerificationFixture)
-                } else {
-                    mutateVerificationFixture()
+                mutateVerificationFixture()
+            }
+            MobileResultLibrary.resultReadVerificationObserver = { stage in
+                guard !mutationScheduled else { return }
+                let shouldMutate: Bool
+                switch stage {
+                case .artifactHashed(let name):
+                    shouldMutate = phase == "verify_artifact_posthash_mutate"
+                        && name == "payload.json"
+                case .initialManifestAndReceiptBound:
+                    shouldMutate = phase == "verify_manifest_postread_replace"
+                        || phase == "verify_receipt_postread_replace"
+                case .beforeFinalSweep:
+                    shouldMutate =
+                        phase == "verify_result_root_final_sweep_replace"
                 }
+                guard shouldMutate else { return }
+                mutationScheduled = true
+                mutateVerificationFixture()
             }
             var rejected = false
             do {
@@ -14400,6 +15513,7 @@ func runResultPublicationCrashWorkerIfRequested() {
                 rejected = true
             }
             MobileResultLibrary.processLockAcquiredObserver = nil
+            MobileResultLibrary.resultReadVerificationObserver = nil
             guard mutationFinished.wait(timeout: .now() + 10.0) == .success else {
                 Darwin._exit(129)
             }

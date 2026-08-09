@@ -257,7 +257,10 @@ enum MapSourceImportLimits {
     static let maximumZIPTotalBytes: Int64 = 256 * 1024 * 1024
     static let maximumZIPRatio: Int64 = 200
     static let maximumXMLBytes: Int64 = 64 * 1024 * 1024
+    static let maximumWorkbookSheets: Int = 4096
+    static let maximumWorkbookRelationships: Int = 4096
     static let maximumWorksheetRows: Int = 500_000
+    static let maximumWorksheetColumns: Int = 16_384
     static let maximumSharedStrings: Int = 1_000_000
     static let maximumCellBytes: Int64 = 1 * 1024 * 1024
     static let maximumJSONBytes: Int64 = 64 * 1024 * 1024

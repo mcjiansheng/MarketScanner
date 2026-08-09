@@ -131,7 +131,8 @@ enum MapSourceImportCoordinator {
         contract: CoordinateContract,
         storeId: String? = nil,
         mapName: String? = nil,
-        strict: Bool = true
+        strict: Bool = true,
+        allowLegacyXLSX: Bool = false
     ) throws -> MapSourceImportReport {
         let data: Data
         do {
@@ -146,14 +147,6 @@ enum MapSourceImportCoordinator {
         let sourceFileSha256 = CanonicalSourceHasher.sha256(data)
         let format = try detectFormat(filename: originalFilename, data: data)
 
-        // V1R5 §13.5 (review H-13): the store ID is business identity —
-        // a defaulted "default" can collide across stores and sessions.
-        // XLSX/CSV imports REQUIRE an explicit, user-confirmed store ID;
-        // canonical JSON carries its own identity and overrides below.
-        guard format == "json" || (storeId.map({ !$0.isEmpty }) ?? false) else {
-            throw MapSourceImportError.storeIDRequired
-        }
-        let resolvedStoreId = storeId ?? "default"
         let resolvedMapName = mapName
             ?? (originalFilename as NSString).deletingPathExtension
 
@@ -161,14 +154,35 @@ enum MapSourceImportCoordinator {
         switch format {
         case "xlsx":
             let imported = try XLSXMapSourceImporter.importSource(
-                data: data, contract: contract, strict: strict)
+                data: data,
+                contract: contract,
+                strict: strict,
+                allowLegacyElementOnly: allowLegacyXLSX)
+            if let basic = imported.basicInfo {
+                if let storeId = storeId, storeId != basic.storeCode {
+                    throw MapSourceImportError.invalidBusinessIdentity(
+                        field: "store_id",
+                        reason: "must exactly match Basic Info.storeCode")
+                }
+                if let mapName = mapName, mapName != basic.mapName {
+                    throw MapSourceImportError.invalidBusinessIdentity(
+                        field: "map_name",
+                        reason: "must exactly match Basic Info.map_name")
+                }
+            }
             outcome = MapSourceImportOutcome(
-                storeId: nil,
-                mapName: nil,
-                coordinateContract: nil,
+                storeId: imported.basicInfo?.storeCode,
+                mapName: imported.basicInfo?.mapName,
+                coordinateContract: imported.basicInfo == nil ? nil : .topLeft,
+                sourceMapInfo: imported.basicInfo,
                 elements: imported.elements,
+                ignoredElements: imported.ignoredElements,
+                auditElements: imported.elements + imported.ignoredElements,
                 warnings: imported.warnings,
                 malformedRows: imported.malformedRows,
+                legacyShelfInfoPresent: imported.legacyShelfInfoPresent,
+                legacyShelfInfoRowCount: imported.legacyShelfInfoRowCount,
+                sourceElementCount: imported.sourceElementCount,
                 jsonSourceIdentity: nil
             )
         case "csv":
@@ -178,9 +192,15 @@ enum MapSourceImportCoordinator {
                 storeId: nil,
                 mapName: nil,
                 coordinateContract: nil,
+                sourceMapInfo: nil,
                 elements: imported.elements,
+                ignoredElements: [],
+                auditElements: imported.elements,
                 warnings: imported.warnings,
                 malformedRows: imported.malformedRows,
+                legacyShelfInfoPresent: false,
+                legacyShelfInfoRowCount: 0,
+                sourceElementCount: imported.elements.count,
                 jsonSourceIdentity: nil
             )
         case "json":
@@ -189,9 +209,15 @@ enum MapSourceImportCoordinator {
                 storeId: imported.storeId,
                 mapName: imported.mapName,
                 coordinateContract: imported.coordinateContract,
+                sourceMapInfo: imported.sourceMapInfo,
                 elements: imported.elements,
+                ignoredElements: [],
+                auditElements: imported.elements,
                 warnings: imported.warnings,
                 malformedRows: [],
+                legacyShelfInfoPresent: false,
+                legacyShelfInfoRowCount: 0,
+                sourceElementCount: imported.elements.count,
                 jsonSourceIdentity: imported.sourceIdentity
             )
         default:
@@ -202,7 +228,12 @@ enum MapSourceImportCoordinator {
         // (store/map/contract) and override the wizard parameters so the
         // canonical self round trip is byte-identical. Legacy v1 and
         // XLSX/CSV documents keep the caller-provided values.
-        let finalStoreID = outcome.storeId ?? resolvedStoreId
+        guard let finalStoreID = outcome.storeId ?? storeId,
+              !finalStoreID.isEmpty else {
+            // Standard XLSX obtains identity from Basic Info. CSV and
+            // explicit legacy XLSX still require caller confirmation.
+            throw MapSourceImportError.storeIDRequired
+        }
         let finalMapName = outcome.mapName ?? resolvedMapName
         let finalContract = outcome.coordinateContract ?? contract
         try MapSourceBusinessIdentityPolicy.validate(
@@ -211,20 +242,68 @@ enum MapSourceImportCoordinator {
         // V1R4 §14.1: official element ids must be globally unique in the
         // store/map context; a duplicate identity is a blocker, never a
         // merge.
+        var warnings = outcome.warnings
+        let filtered = ElementRoleClassifier.productionElements(
+            from: outcome.elements, warnings: &warnings)
+        let productionElements = filtered.active
+        let ignoredElements = outcome.ignoredElements + filtered.ignored
+        var ignoredByShapeType: [String: Int] = [:]
+        for element in outcome.auditElements
+        where ElementRoleClassifier.role(for: element.shapeType) == .presentationOnly {
+            ignoredByShapeType[element.shapeType, default: 0] += 1
+        }
+        let importSummary = SourceImportSummary(
+            sourceElementCount: outcome.sourceElementCount,
+            presentationIgnoredCount: ignoredByShapeType.values.reduce(0, +),
+            unsupportedIgnoredCount: outcome.auditElements.filter {
+                ElementRoleClassifier.role(for: $0.shapeType) == .unsupported
+            }.count,
+            hiddenElementCount: outcome.auditElements.filter {
+                ElementRoleClassifier.role(for: $0.shapeType).isProduction && !$0.visible
+            }.count,
+            invalidGeometryIgnoredCount: outcome.auditElements.filter {
+                ElementRoleClassifier.role(for: $0.shapeType).isProduction
+                    && $0.visible && $0.geometry == nil
+            }.count,
+            ignoredByShapeType: ignoredByShapeType,
+            legacyShelfInfoPresent: outcome.legacyShelfInfoPresent,
+            legacyShelfInfoRowCount: outcome.legacyShelfInfoRowCount,
+            malformedRowCount: outcome.malformedRows.count)
         var seenStableIDs: Set<String> = []
-        for element in outcome.elements {
+        for element in productionElements {
             let stableID = CanonicalPriorMapBusinessSourceV2.stableElementID(
                 for: element, storeID: finalStoreID, mapName: finalMapName)
             guard seenStableIDs.insert(stableID).inserted else {
                 throw MapSourceImportError.duplicateElementIdentity(duplicateID: stableID)
             }
         }
+        if strict {
+            for element in productionElements {
+                guard SourceGeometry.validatedProductionGeometryPoints(
+                        shapeType: element.shapeType,
+                        geometry: element.geometry) != nil,
+                      element.bounds != nil else {
+                    throw MapSourceImportError.invalidGeometry(
+                        shapeType: element.shapeType,
+                        reason: "active production element geometry kind, point count, or coordinates are invalid")
+                }
+                if let mapInfo = outcome.sourceMapInfo,
+                   !SourceGeometry.contains(
+                    geometry: element.geometry,
+                    in: mapInfo.sourceCanvasBounds) {
+                    throw MapSourceImportError.invalidGeometry(
+                        shapeType: element.shapeType,
+                        reason: "active geometry is outside Basic Info source canvas")
+                }
+            }
+        }
 
-        var warnings = outcome.warnings
-        let floors = Set(outcome.elements.map { $0.floorId }).sorted()
+        let floors = Set(productionElements.map { $0.floorId }).sorted()
         let canonicalSource = MarketScannerPriorMapSource(
             format: MarketScannerPriorMapSource.formatValue,
-            version: MarketScannerPriorMapSource.versionValue,
+            version: outcome.sourceMapInfo == nil
+                ? CanonicalPriorMapBusinessSourceV2.versionValue
+                : CanonicalPriorMapBusinessSourceV3.versionValue,
             storeId: finalStoreID,
             mapName: finalMapName,
             source: MapSourceIdentity(
@@ -234,7 +313,9 @@ enum MapSourceImportCoordinator {
                 canonicalSourceSha256: ""
             ),
             coordinateContract: finalContract,
-            elements: outcome.elements,
+            sourceMapInfo: outcome.sourceMapInfo,
+            importSummary: importSummary,
+            elements: productionElements,
             warnings: warnings
         )
 
@@ -254,7 +335,9 @@ enum MapSourceImportCoordinator {
                 canonicalSourceSha256: canonicalSha256
             ),
             coordinateContract: finalContract,
-            elements: outcome.elements,
+            sourceMapInfo: outcome.sourceMapInfo,
+            importSummary: importSummary,
+            elements: productionElements,
             warnings: warnings
         )
 
@@ -264,18 +347,26 @@ enum MapSourceImportCoordinator {
             mapName: finalMapName,
             storeId: finalStoreID,
             floorCount: floors.count,
-            elementCount: outcome.elements.count,
+            elementCount: productionElements.count,
             sourceFileSha256: sourceFileSha256,
             canonicalSourceSha256: canonicalSha256,
             warningCount: warnings.count,
             malformedRowCount: outcome.malformedRows.count,
             coordinateContractOrigin: finalContract.origin.rawValue,
+            ignoredElementCount: ignoredElements.count,
+            legacyShelfInfoPresent: outcome.legacyShelfInfoPresent,
+            legacyShelfInfoRowCount: outcome.legacyShelfInfoRowCount,
+            sourceCanvasBounds: outcome.sourceMapInfo?.sourceCanvasBounds.asDictionary,
             canonicalSource: finalSource,
             audit: MapImportAudit(
                 format: format,
-                sourceRows: outcome.elements.map { $0.sourceRow },
-                warnings: outcome.warnings,
-                rawFields: outcome.elements.map { $0.source }))
+                sourceRows: outcome.auditElements.map { $0.sourceRow },
+                warnings: warnings,
+                rawFields: outcome.auditElements.map { $0.source },
+                ignoredElementCount: ignoredElements.count,
+                legacyShelfInfoPresent: outcome.legacyShelfInfoPresent,
+                legacyShelfInfoRowCount: outcome.legacyShelfInfoRowCount,
+                sourceElementCount: outcome.sourceElementCount))
     }
 
     static func detectFormat(filename: String, data: Data) throws -> String {
@@ -308,8 +399,14 @@ private struct MapSourceImportOutcome {
     var storeId: String?
     var mapName: String?
     var coordinateContract: CoordinateContract?
+    var sourceMapInfo: SourceMapInfo?
     var elements: [PriorMapSourceElement]
+    var ignoredElements: [PriorMapSourceElement]
+    var auditElements: [PriorMapSourceElement]
     var warnings: [MapSourceWarning]
     var malformedRows: [[String: Any]]
+    var legacyShelfInfoPresent: Bool
+    var legacyShelfInfoRowCount: Int
+    var sourceElementCount: Int
     var jsonSourceIdentity: MapSourceIdentity?
 }

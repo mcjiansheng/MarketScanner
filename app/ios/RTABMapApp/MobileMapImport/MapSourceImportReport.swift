@@ -14,6 +14,10 @@ struct MapSourceImportReport: Equatable {
     var warningCount: Int
     var malformedRowCount: Int
     var coordinateContractOrigin: String
+    var ignoredElementCount: Int
+    var legacyShelfInfoPresent: Bool
+    var legacyShelfInfoRowCount: Int
+    var sourceCanvasBounds: [String: Double]?
 
     var canonicalSource: MarketScannerPriorMapSource
     /// V2 audit record (source rows, warnings, raw fields) kept separate

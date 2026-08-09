@@ -12,7 +12,9 @@ enum MobileRoadGraphBuilder {
         // Crosses from MapCross elements.
         var crosses: [[String: Any]] = []
         var crossByKey: [String: [String: Any]] = [:] // floor|code -> cross
-        for element in elements where element.shapeType == "MapCross" {
+        for element in elements where element.visible
+            && ElementRoleClassifier.role(for: element.shapeType) == .road
+            && element.shapeType == "MapCross" {
             guard let geometry = element.geometry,
                   let coordinates = geometry["coordinates"] as? [[Double]]
             else { continue }
@@ -51,7 +53,9 @@ enum MobileRoadGraphBuilder {
         var nodes: [[String: Any]] = []
         var nodesByCross: [String: [[String: Any]]] = [:]
         var usedNodeIDs: Set<String> = []
-        for element in elements where element.shapeType == "MapRoadPoint" {
+        for element in elements where element.visible
+            && ElementRoleClassifier.role(for: element.shapeType) == .road
+            && element.shapeType == "MapRoadPoint" {
             guard let geometry = element.geometry,
                   let coordinates = geometry["coordinates"] as? [Double],
                   coordinates.count >= 2
@@ -270,6 +274,8 @@ enum MobileRoadGraphBuilder {
 }
 
 enum MobileSpatialIndexBuilder {
+    static let maximumCellAssignments = 8_000_000
+
     /// `floors` names every manifest floor so the spatial index keys
     /// exactly match `manifest.floors` (the production integrity
     /// validator requires the exact set).
@@ -277,9 +283,11 @@ enum MobileSpatialIndexBuilder {
         elements: [PriorMapSourceElement],
         graph: [String: Any],
         floors: [[String: Any]]
-    ) -> [String: Any] {
+    ) throws -> [String: Any] {
         let cellSizeM = 5.0
+        var totalAssignments: Int64 = 0
         var floorsByID: [String: Any] = [:]
+        var elementRoles: [String: Any] = [:]
         for floor in floors {
             guard let floorID = floor["id"] as? String else { continue }
             floorsByID[floorID] = [
@@ -289,24 +297,42 @@ enum MobileSpatialIndexBuilder {
         }
         var byFloor: [String: [[String: Any]]] = [:]
         for element in elements {
-            if MobileElementTypes.structureTypes.contains(element.shapeType),
-               element.visible,
+            let role = ElementRoleClassifier.role(for: element.shapeType)
+            if (role == .shelf || role == .fixedStructure), element.visible,
                element.bounds != nil {
                 byFloor[element.floorId, default: []].append(element.canonicalPayload)
+                elementRoles[element.id] = [
+                    "role": role.rawValue,
+                    "shape_type": element.shapeType,
+                ]
             }
         }
         for floorID in byFloor.keys.sorted() {
             let floorElements = byFloor[floorID] ?? []
             var cells: [String: [String]] = [:]
             for element in floorElements {
-                guard let bounds = element["bounds"] as? [String: Double] else { continue }
-                let minX = floor((bounds["min_x_m"] ?? 0) / cellSizeM)
-                let maxX = floor((bounds["max_x_m"] ?? 0) / cellSizeM)
-                let minY = floor((bounds["min_y_m"] ?? 0) / cellSizeM)
-                let maxY = floor((bounds["max_y_m"] ?? 0) / cellSizeM)
+                guard let bounds = element["bounds"] as? [String: Double],
+                      let minXValue = bounds["min_x_m"],
+                      let maxXValue = bounds["max_x_m"],
+                      let minYValue = bounds["min_y_m"],
+                      let maxYValue = bounds["max_y_m"] else {
+                    throw MapSourceImportError.invalidGeometry(
+                        shapeType: "spatial_index",
+                        reason: "structure bounds are missing")
+                }
+                let ranges = try cellRanges(
+                    minX: minXValue, maxX: maxXValue,
+                    minY: minYValue, maxY: maxYValue,
+                    cellSizeM: cellSizeM)
+                totalAssignments += ranges.assignmentCount
+                guard totalAssignments <= Int64(maximumCellAssignments) else {
+                    throw MapSourceImportError.invalidGeometry(
+                        shapeType: "spatial_index",
+                        reason: "cell assignment budget exceeds \(maximumCellAssignments)")
+                }
                 let elementID = (element["id"] as? String) ?? ""
-                for cellX in Int(minX)...Int(maxX) {
-                    for cellY in Int(minY)...Int(maxY) {
+                for cellX in ranges.x {
+                    for cellY in ranges.y {
                         cells["\(cellX),\(cellY)", default: []].append(elementID)
                     }
                 }
@@ -332,12 +358,20 @@ enum MobileSpatialIndexBuilder {
                 else { continue }
                 let floorID = (edge["floor_id"] as? String) ?? ""
                 let edgeID = (edge["id"] as? String) ?? ""
-                let minX = floor(min(from[0], to[0]) / cellSizeM)
-                let maxX = floor(max(from[0], to[0]) / cellSizeM)
-                let minY = floor(min(from[1], to[1]) / cellSizeM)
-                let maxY = floor(max(from[1], to[1]) / cellSizeM)
-                for cellX in Int(minX)...Int(maxX) {
-                    for cellY in Int(minY)...Int(maxY) {
+                let ranges = try cellRanges(
+                    minX: min(from[0], to[0]),
+                    maxX: max(from[0], to[0]),
+                    minY: min(from[1], to[1]),
+                    maxY: max(from[1], to[1]),
+                    cellSizeM: cellSizeM)
+                totalAssignments += ranges.assignmentCount
+                guard totalAssignments <= Int64(maximumCellAssignments) else {
+                    throw MapSourceImportError.invalidGeometry(
+                        shapeType: "spatial_index",
+                        reason: "cell assignment budget exceeds \(maximumCellAssignments)")
+                }
+                for cellX in ranges.x {
+                    for cellY in ranges.y {
                         var floorCells = roadCellsByFloor[floorID] ?? [:]
                         floorCells["\(cellX),\(cellY)", default: []].append(edgeID)
                         roadCellsByFloor[floorID] = floorCells
@@ -355,7 +389,49 @@ enum MobileSpatialIndexBuilder {
             "format": "MarketScannerSpatialIndex",
             "version": 1,
             "cell_size_m": cellSizeM,
+            "element_roles": elementRoles,
             "floors": floorsByID,
         ]
+    }
+
+    private static func cellRanges(
+        minX: Double,
+        maxX: Double,
+        minY: Double,
+        maxY: Double,
+        cellSizeM: Double
+    ) throws -> (x: ClosedRange<Int>, y: ClosedRange<Int>, assignmentCount: Int64) {
+        guard minX.isFinite, maxX.isFinite, minY.isFinite, maxY.isFinite,
+              minX <= maxX, minY <= maxY,
+              cellSizeM.isFinite, cellSizeM > 0 else {
+            throw MapSourceImportError.invalidGeometry(
+                shapeType: "spatial_index", reason: "bounds are invalid")
+        }
+        let lowerX = floor(minX / cellSizeM)
+        let upperX = floor(maxX / cellSizeM)
+        let lowerY = floor(minY / cellSizeM)
+        let upperY = floor(maxY / cellSizeM)
+        let spanX = upperX - lowerX + 1
+        let spanY = upperY - lowerY + 1
+        guard lowerX.isFinite, upperX.isFinite,
+              lowerY.isFinite, upperY.isFinite,
+              spanX >= 1, spanY >= 1,
+              spanX <= Double(maximumCellAssignments),
+              spanY <= Double(maximumCellAssignments),
+              let minimumX = Int(exactly: lowerX),
+              let maximumX = Int(exactly: upperX),
+              let minimumY = Int(exactly: lowerY),
+              let maximumY = Int(exactly: upperY),
+              let width = Int64(exactly: spanX),
+              let height = Int64(exactly: spanY),
+              width <= Int64(maximumCellAssignments) / height else {
+            throw MapSourceImportError.invalidGeometry(
+                shapeType: "spatial_index",
+                reason: "cell span exceeds the resource budget")
+        }
+        return (
+            minimumX...maximumX,
+            minimumY...maximumY,
+            width * height)
     }
 }

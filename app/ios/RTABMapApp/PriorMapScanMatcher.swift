@@ -29,6 +29,10 @@ struct PriorMapDistanceFieldFloor: Codable {
 }
 
 struct PriorMapDistanceFieldLevel: Codable {
+    static let maximumDimensionCells = 20_000
+    static let maximumCellsPerLevel = 8_000_000
+    static let maximumTotalCells = 16_000_000
+
     let resolutionM: Double
     let originM: [Double]
     let width: Int
@@ -47,20 +51,34 @@ struct PriorMapDistanceFieldLevel: Codable {
         case rows
     }
 
-    func decodedValues() throws -> [UInt8] {
-        guard resolutionM > 0,
+    func validatedCellCount() throws -> Int {
+        guard resolutionM.isFinite,
+              resolutionM > 0,
               originM.count == 2,
+              originM.allSatisfy(\.isFinite),
               width > 0,
               height > 0,
+              width <= Self.maximumDimensionCells,
+              height <= Self.maximumDimensionCells,
+              width <= Self.maximumCellsPerLevel / height,
               encoding == "row_rle_u8_cm",
-              rows.count == height else {
+              rows.count == height,
+              dataSha256.count == 64,
+              dataSha256.utf8.allSatisfy({
+                  (48...57).contains($0) || (97...102).contains($0)
+              }) else {
             throw NSError(
                 domain: "PriorMapDistanceField",
                 code: 1,
                 userInfo: [NSLocalizedDescriptionKey: "距离场元数据无效。"])
         }
+        return width * height
+    }
+
+    func decodedValues() throws -> [UInt8] {
+        let cellCount = try validatedCellCount()
         var result = [UInt8]()
-        result.reserveCapacity(width * height)
+        result.reserveCapacity(cellCount)
         for row in rows {
             guard row.count % 2 == 0 else {
                 throw NSError(
@@ -72,14 +90,16 @@ struct PriorMapDistanceFieldLevel: Codable {
             for index in stride(from: 0, to: row.count, by: 2) {
                 let count = row[index]
                 let value = row[index + 1]
-                guard count > 0, (0...255).contains(value) else {
+                guard count > 0,
+                      count <= width - rowCount,
+                      (0...255).contains(value) else {
                     throw NSError(
                         domain: "PriorMapDistanceField",
                         code: 3,
                         userInfo: [NSLocalizedDescriptionKey: "距离场压缩值无效。"])
                 }
-                result.append(contentsOf: repeatElement(UInt8(value), count: count))
                 rowCount += count
+                result.append(contentsOf: repeatElement(UInt8(value), count: count))
             }
             guard rowCount == width else {
                 throw NSError(
@@ -94,7 +114,7 @@ struct PriorMapDistanceFieldLevel: Codable {
         let digest = SHA256.hash(data: Data(canonicalRows.utf8))
             .map { String(format: "%02x", $0) }
             .joined()
-        guard digest == dataSha256.lowercased() else {
+        guard digest == dataSha256 else {
             throw NSError(
                 domain: "PriorMapDistanceField",
                 code: 5,

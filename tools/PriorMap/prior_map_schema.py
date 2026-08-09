@@ -1,4 +1,4 @@
-"""Schema constants and package validation for a version-1 prior map."""
+"""Schema constants and validation for legacy-v1 and current-v2 prior maps."""
 
 from __future__ import annotations
 
@@ -8,26 +8,42 @@ import unicodedata
 from .strict_json import StrictJSONError, load_strict_json_bytes
 import hashlib
 import math
+import re
 import struct
 import zlib
 from pathlib import Path
 from typing import Any
 
-from .distance_field import decode_level
+from .distance_field import (
+    MAXIMUM_TOTAL_CELLS,
+    build_distance_fields,
+    decode_level,
+)
+from .element_roles import (
+    ACTIVE_TYPES,
+    FIXED_STRUCTURE_TYPES,
+    PRESENTATION_ONLY_TYPES,
+    ROLE_FIXED_STRUCTURE,
+    ROLE_SHELF,
+    SHELF_TYPES,
+    STRUCTURE_TYPES,
+    role_contract_payload,
+    role_for,
+)
 
 
 PACKAGE_FORMAT = "MarketScannerPriorMap"
-PACKAGE_VERSION = 1
+LEGACY_PACKAGE_VERSION = 1
+PACKAGE_VERSION = 2
+SUPPORTED_PACKAGE_VERSIONS = frozenset({LEGACY_PACKAGE_VERSION, PACKAGE_VERSION})
+PACKAGE_MANIFEST_VERSION = 1
+ARTIFACT_VERSION = 1
 PACKAGE_MANIFEST_FORMAT = "MarketScannerPriorMapPackageManifest"
 PACKAGE_MANIFEST_FILE = "package_manifest.json"
-SUPPORTED_TYPES = {
-    "MapShelf",
-    "MapTable",
-    "MapPillar",
-    "MapTableFeature",
-    "MapCross",
-    "MapRoadPoint",
-}
+# Compatibility export for older callers.  New code must classify through
+# element_roles.py instead of maintaining another role table here.
+SUPPORTED_TYPES = set(ACTIVE_TYPES)
+SAFE_NAME = re.compile(r"[^A-Za-z0-9._-]+")
 PACKAGE_FILES = {
     PACKAGE_MANIFEST_FILE,
     "manifest.json",
@@ -130,7 +146,7 @@ def build_package_manifest(root: Path) -> dict[str, Any]:
         artifacts.append(record)
     return {
         "format": PACKAGE_MANIFEST_FORMAT,
-        "version": PACKAGE_VERSION,
+        "version": PACKAGE_MANIFEST_VERSION,
         "hash_algorithm": "sha256",
         "artifact_count": len(artifacts),
         "artifacts": artifacts,
@@ -147,6 +163,7 @@ def _validate_package_manifest(
         PACKAGE_MANIFEST_FILE,
         PACKAGE_MANIFEST_FORMAT,
         errors,
+        frozenset({PACKAGE_MANIFEST_VERSION}),
     )
     if payload is None:
         return None
@@ -155,6 +172,7 @@ def _validate_package_manifest(
         payload.get("hash_algorithm") != "sha256"
         or not isinstance(artifacts, list)
         or not all(isinstance(item, dict) for item in artifacts)
+        or type(payload.get("artifact_count")) is not int
         or payload.get("artifact_count") != len(artifacts)
     ):
         errors.append(
@@ -223,6 +241,8 @@ def _validate_package_manifest(
             if (
                 not isinstance(child, dict)
                 or artifact.get("format") != child.get("format")
+                or type(artifact.get("version")) is not int
+                or type(child.get("version")) is not int
                 or artifact.get("version") != child.get("version")
             ):
                 errors.append(
@@ -254,6 +274,7 @@ def _payload(
     name: str,
     expected_format: str,
     errors: list[dict[str, str]],
+    supported_versions: frozenset[int] = SUPPORTED_PACKAGE_VERSIONS,
 ) -> dict[str, Any] | None:
     try:
         value = load_json(root / name)
@@ -265,7 +286,8 @@ def _payload(
         return None
     if value.get("format") != expected_format:
         errors.append({"code": "file_format", "message": f"{name} 格式标识不正确。"})
-    if value.get("version") != PACKAGE_VERSION:
+    version = value.get("version")
+    if type(version) is not int or version not in supported_versions:
         errors.append({"code": "file_version", "message": f"{name} 版本不受支持。"})
     return value
 
@@ -280,7 +302,7 @@ def _geometry_points(geometry: Any) -> list[tuple[float, float]]:
         return []
     points: list[tuple[float, float]] = []
     for point in coordinates:
-        if (
+        if not (
             isinstance(point, list)
             and len(point) >= 2
             and isinstance(point[0], (int, float))
@@ -290,27 +312,457 @@ def _geometry_points(geometry: Any) -> list[tuple[float, float]]:
             and math.isfinite(float(point[0]))
             and math.isfinite(float(point[1]))
         ):
-            points.append((float(point[0]), float(point[1])))
+            return []
+        points.append((float(point[0]), float(point[1])))
     return points
 
 
-def _bounds(points: list[tuple[float, float]]) -> dict[str, float]:
-    return {
+def _production_geometry_points(
+    shape_type: str,
+    geometry: Any,
+) -> list[tuple[float, float]] | None:
+    """Validate the role-specific v2 production geometry contract.
+
+    Package validation must not infer geometry from a merely parseable
+    coordinate list.  Shelves/fixed structures are four-point polygons,
+    crosses are non-degenerate line strings, and road points are one
+    finite 2D point.  This mirrors the mobile validator and prevents a
+    hash-consistent package from passing while downstream builders silently
+    ignore its structure geometry.
+    """
+
+    if not isinstance(geometry, dict):
+        return None
+    geometry_type = geometry.get("type")
+    coordinates = geometry.get("coordinates")
+
+    def point(value: Any) -> tuple[float, float] | None:
+        if not (
+            isinstance(value, list)
+            and len(value) == 2
+            and all(
+                isinstance(component, (int, float))
+                and not isinstance(component, bool)
+                and math.isfinite(float(component))
+                for component in value
+            )
+        ):
+            return None
+        return float(value[0]), float(value[1])
+
+    if shape_type in STRUCTURE_TYPES:
+        if geometry_type != "polygon" or not isinstance(coordinates, list):
+            return None
+        if len(coordinates) != 4:
+            return None
+        points = [point(value) for value in coordinates]
+        if any(value is None for value in points):
+            return None
+        polygon = [value for value in points if value is not None]
+        twice_area = 0.0
+        for index, current in enumerate(polygon):
+            following = polygon[(index + 1) % len(polygon)]
+            if math.hypot(
+                following[0] - current[0], following[1] - current[1]
+            ) <= 1.0e-9:
+                return None
+            twice_area += current[0] * following[1] - following[0] * current[1]
+        return polygon if abs(twice_area) > 1.0e-12 else None
+
+    if shape_type == "MapCross":
+        if geometry_type != "line_string" or not isinstance(coordinates, list):
+            return None
+        if len(coordinates) < 2:
+            return None
+        points = [point(value) for value in coordinates]
+        if any(value is None for value in points):
+            return None
+        line = [value for value in points if value is not None]
+        return line if any(
+            math.hypot(second[0] - first[0], second[1] - first[1]) > 1.0e-9
+            for first, second in zip(line, line[1:])
+        ) else None
+
+    if shape_type == "MapRoadPoint":
+        if geometry_type != "point":
+            return None
+        converted = point(coordinates)
+        return [converted] if converted is not None else None
+
+    return None
+
+
+def _bounds(
+    points: list[tuple[float, float]], *, include_dimensions: bool = False
+) -> dict[str, float]:
+    result = {
         "min_x_m": min(point[0] for point in points),
         "min_y_m": min(point[1] for point in points),
         "max_x_m": max(point[0] for point in points),
         "max_y_m": max(point[1] for point in points),
     }
+    if include_dimensions:
+        result["width_m"] = result["max_x_m"] - result["min_x_m"]
+        result["height_m"] = result["max_y_m"] - result["min_y_m"]
+    return result
 
 
-def _bounds_match(first: Any, second: dict[str, float], tolerance: float = 1.0e-5) -> bool:
-    return isinstance(first, dict) and all(
-        isinstance(first.get(key), (int, float))
-        and not isinstance(first.get(key), bool)
-        and math.isfinite(float(first[key]))
-        and abs(float(first[key]) - value) <= tolerance
-        for key, value in second.items()
+def _bounds_match(
+    first: Any,
+    second: dict[str, float],
+    tolerance: float = 1.0e-5,
+    *,
+    exact_keys: bool = False,
+) -> bool:
+    return (
+        isinstance(first, dict)
+        and (not exact_keys or set(first) == set(second))
+        and all(
+            isinstance(first.get(key), (int, float))
+            and not isinstance(first.get(key), bool)
+            and math.isfinite(float(first[key]))
+            and abs(float(first[key]) - value) <= tolerance
+            for key, value in second.items()
+        )
     )
+
+
+def _valid_sha256(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _positive_finite(value: Any) -> bool:
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(float(value))
+        and float(value) > 0
+    )
+
+
+def _points_inside_bounds(
+    points: list[tuple[float, float]],
+    bounds: dict[str, float],
+    tolerance: float = 1.0e-5,
+) -> bool:
+    return all(
+        bounds["min_x_m"] - tolerance <= point[0] <= bounds["max_x_m"] + tolerance
+        and bounds["min_y_m"] - tolerance <= point[1] <= bounds["max_y_m"] + tolerance
+        for point in points
+    )
+
+
+def _finite_vector2(value: Any) -> tuple[float, float] | None:
+    if (
+        not isinstance(value, list)
+        or len(value) != 2
+        or not all(
+            isinstance(component, (int, float))
+            and not isinstance(component, bool)
+            and math.isfinite(float(component))
+            for component in value
+        )
+    ):
+        return None
+    return float(value[0]), float(value[1])
+
+
+def _validate_shelves_document(
+    payload: dict[str, Any],
+    *,
+    package_version: int,
+    elements_by_id: dict[str, dict[str, Any]],
+    errors: list[dict[str, str]],
+) -> None:
+    """Validate the shared legacy-v1 / production-v2 shelves contract.
+
+    Package v2 is a formal production package and therefore requires
+    shelves v2.  Package v1 remains readable with its historical shelves v1
+    document, and also accepts shelves v2 produced by newer mobile compilers.
+    Whenever shelves v2 is present, all segment vectors and cross-file
+    shelf/floor/code relations are fail-closed.
+    """
+
+    version = payload.get("version")
+    if package_version == PACKAGE_VERSION and version != 2:
+        errors.append(
+            {
+                "code": "shelf_version_contract",
+                "message": "v2 正式地图包必须携带 shelves.json v2 显式方向合同。",
+            }
+        )
+
+    expected_top_level = (
+        {"format", "version", "shelves"}
+        if version == 1
+        else {"format", "version", "shelves", "shelf_segments"}
+    )
+    if type(version) is not int or version not in {1, 2} or set(payload) != expected_top_level:
+        errors.append(
+            {
+                "code": "shelf_schema",
+                "message": "shelves.json 顶层字段与版本合同不一致。",
+            }
+        )
+        return
+
+    raw_shelves = payload.get("shelves")
+    if not isinstance(raw_shelves, list) or not all(
+        isinstance(item, dict) for item in raw_shelves
+    ):
+        errors.append(
+            {"code": "shelf_schema", "message": "shelves.json shelves 列表无效。"}
+        )
+        return
+
+    inventory: dict[str, tuple[str, str | None]] = {}
+    for shelf in raw_shelves:
+        identifier = shelf.get("id")
+        floor_id = shelf.get("floor_id")
+        code = shelf.get("code")
+        if (
+            not isinstance(identifier, str)
+            or not identifier
+            or not isinstance(floor_id, str)
+            or not floor_id
+            or (code is not None and not isinstance(code, str))
+            or identifier in inventory
+        ):
+            errors.append(
+                {
+                    "code": "shelf_schema",
+                    "message": "shelves.json 货架 identity/floor/code 无效或重复。",
+                }
+            )
+            return
+        inventory[identifier] = (floor_id, code)
+
+    if version == 1:
+        return
+
+    raw_segments = payload.get("shelf_segments")
+    if not isinstance(raw_segments, list) or not all(
+        isinstance(item, dict) for item in raw_segments
+    ):
+        errors.append(
+            {
+                "code": "shelf_segment_schema",
+                "message": "shelves.json v2 shelf_segments 列表无效。",
+            }
+        )
+        return
+
+    segment_fields = {
+        "shelf_segment_id",
+        "shelf_code",
+        "floor_id",
+        "longitudinal_start_m",
+        "longitudinal_end_m",
+        "longitudinal_axis",
+        "front_normal",
+        "back_normal",
+        "side_semantics_version",
+        "orientation_provenance",
+    }
+    allowed_provenance = {"element_yaw", "unavailable"}
+    vector_tolerance = 1.0e-6
+    seen_segment_ids: set[str] = set()
+
+    for index, segment in enumerate(raw_segments, start=1):
+        if set(segment) != segment_fields:
+            errors.append(
+                {
+                    "code": "shelf_segment_schema",
+                    "message": f"第 {index} 个 shelf segment 字段集合无效。",
+                }
+            )
+            continue
+        segment_id = segment.get("shelf_segment_id")
+        shelf_code = segment.get("shelf_code")
+        floor_id = segment.get("floor_id")
+        provenance = segment.get("orientation_provenance")
+        semantics_version = segment.get("side_semantics_version")
+        start = _finite_vector2(segment.get("longitudinal_start_m"))
+        end = _finite_vector2(segment.get("longitudinal_end_m"))
+        axis = _finite_vector2(segment.get("longitudinal_axis"))
+        front = _finite_vector2(segment.get("front_normal"))
+        back = _finite_vector2(segment.get("back_normal"))
+        if (
+            not isinstance(segment_id, str)
+            or not segment_id
+            or not isinstance(shelf_code, str)
+            or not isinstance(floor_id, str)
+            or not floor_id
+            or type(semantics_version) is not int
+            or semantics_version != 1
+            or provenance not in allowed_provenance
+            or start is None
+            or end is None
+            or axis is None
+            or front is None
+            or back is None
+        ):
+            errors.append(
+                {
+                    "code": "shelf_segment_schema",
+                    "message": f"第 {index} 个 shelf segment 标量或二维向量无效。",
+                }
+            )
+            continue
+        if segment_id in seen_segment_ids:
+            errors.append(
+                {
+                    "code": "shelf_segment_relation",
+                    "message": f"shelf_segment_id 重复：{segment_id}",
+                }
+            )
+            continue
+        seen_segment_ids.add(segment_id)
+
+        dx = end[0] - start[0]
+        dy = end[1] - start[1]
+        segment_length = math.hypot(dx, dy)
+
+        def is_unit(value: tuple[float, float]) -> bool:
+            return abs(math.hypot(value[0], value[1]) - 1.0) <= vector_tolerance
+
+        geometric_relations_valid = (
+            segment_length > vector_tolerance
+            and is_unit(axis)
+            and is_unit(front)
+            and is_unit(back)
+            and abs(axis[0] * front[0] + axis[1] * front[1])
+            <= vector_tolerance
+            and abs(axis[0] * back[0] + axis[1] * back[1])
+            <= vector_tolerance
+            and abs(front[0] + back[0]) <= vector_tolerance
+            and abs(front[1] + back[1]) <= vector_tolerance
+            and (
+                dx / segment_length * axis[0]
+                + dy / segment_length * axis[1]
+            )
+            >= 1.0 - vector_tolerance
+        )
+        if not geometric_relations_valid:
+            errors.append(
+                {
+                    "code": "shelf_segment_relation",
+                    "message": f"第 {index} 个 shelf segment 轴、法向或起止方向关系无效。",
+                }
+            )
+            continue
+        if inventory.get(segment_id) != (floor_id, shelf_code):
+            errors.append(
+                {
+                    "code": "shelf_segment_relation",
+                    "message": (
+                        f"第 {index} 个 shelf segment 未精确绑定对应货架的 ID/floor/code。"
+                    ),
+                }
+            )
+            continue
+
+        element = elements_by_id.get(segment_id)
+        expected = _expected_shelf_segment(element)
+        vector_fields = (
+            "longitudinal_start_m",
+            "longitudinal_end_m",
+            "longitudinal_axis",
+            "front_normal",
+            "back_normal",
+        )
+        if (
+            expected is None
+            or any(
+                any(
+                    abs(float(actual) - float(reference)) > 1.0e-8
+                    for actual, reference in zip(segment[field], expected[field])
+                )
+                for field in vector_fields
+            )
+            or segment.get("orientation_provenance")
+            != expected["orientation_provenance"]
+            or segment.get("side_semantics_version")
+            != expected["side_semantics_version"]
+        ):
+            errors.append(
+                {
+                    "code": "shelf_segment_source_binding",
+                    "message": (
+                        f"第 {index} 个 shelf segment 未确定性绑定对应货架 geometry/yaw。"
+                    ),
+                }
+            )
+
+    if len(raw_segments) != len(inventory) or seen_segment_ids != set(inventory):
+        errors.append(
+            {
+                "code": "shelf_segment_relation",
+                "message": "shelves v2 的货架与 shelf segment 不是一对一关系。",
+            }
+        )
+
+
+def _expected_shelf_segment(
+    element: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    if not isinstance(element, dict) or element.get("shape_type") != "MapShelf":
+        return None
+    geometry = element.get("geometry")
+    coordinates = geometry.get("coordinates") if isinstance(geometry, dict) else None
+    if not isinstance(coordinates, list) or len(coordinates) < 3:
+        return None
+    points = [_finite_vector2(point) for point in coordinates]
+    if any(point is None for point in points):
+        return None
+    finite_points = [point for point in points if point is not None]
+    center_x = sum(point[0] for point in finite_points) / len(finite_points)
+    center_y = sum(point[1] for point in finite_points) / len(finite_points)
+    yaw = element.get("yaw_rad")
+    if (
+        isinstance(yaw, (int, float))
+        and not isinstance(yaw, bool)
+        and math.isfinite(float(yaw))
+    ):
+        axis = (math.cos(float(yaw)), math.sin(float(yaw)))
+        provenance = "element_yaw"
+    else:
+        longest_length = 0.0
+        axis = (1.0, 0.0)
+        for index, point in enumerate(finite_points):
+            following = finite_points[(index + 1) % len(finite_points)]
+            dx = following[0] - point[0]
+            dy = following[1] - point[1]
+            length = math.hypot(dx, dy)
+            if length > longest_length:
+                longest_length = length
+                axis = (dx / length, dy / length)
+        if longest_length <= 1.0e-9:
+            return None
+        provenance = "unavailable"
+    projections = [
+        (point[0] - center_x) * axis[0] + (point[1] - center_y) * axis[1]
+        for point in finite_points
+    ]
+    minimum = min(projections)
+    maximum = max(projections)
+    return {
+        "longitudinal_start_m": [
+            center_x + minimum * axis[0], center_y + minimum * axis[1]
+        ],
+        "longitudinal_end_m": [
+            center_x + maximum * axis[0], center_y + maximum * axis[1]
+        ],
+        "longitudinal_axis": [axis[0], axis[1]],
+        "front_normal": [axis[1], -axis[0]],
+        "back_normal": [-axis[1], axis[0]],
+        "side_semantics_version": 1,
+        "orientation_provenance": provenance,
+    }
 
 
 def _validate_png(path: Path) -> str | None:
@@ -420,28 +872,67 @@ def validate_package(directory: Path | str) -> dict[str, Any]:
         return {"valid": False, "errors": errors, "warnings": warnings}
 
     package_manifest = _validate_package_manifest(root, errors)
-    manifest = _payload(root, "manifest.json", PACKAGE_FORMAT, errors)
+    manifest = _payload(
+        root,
+        "manifest.json",
+        PACKAGE_FORMAT,
+        errors,
+        SUPPORTED_PACKAGE_VERSIONS,
+    )
+    if package_manifest is None or manifest is None:
+        return {"valid": False, "errors": errors, "warnings": warnings}
+    package_version = manifest.get("version")
+    if type(package_version) is not int or package_version not in SUPPORTED_PACKAGE_VERSIONS:
+        return {"valid": False, "errors": errors, "warnings": warnings}
+    artifact_versions = frozenset({ARTIFACT_VERSION})
     elements_payload = _payload(
-        root, "elements.json", "MarketScannerPriorMapElements", errors
+        root,
+        "elements.json",
+        "MarketScannerPriorMapElements",
+        errors,
+        artifact_versions,
     )
     shelves_payload = _payload(
-        root, "shelves.json", "MarketScannerPriorMapShelves", errors
+        root,
+        "shelves.json",
+        "MarketScannerPriorMapShelves",
+        errors,
+        frozenset({1, 2}),
     )
     structures_payload = _payload(
-        root, "fixed_structures.json", "MarketScannerPriorMapStructures", errors
+        root,
+        "fixed_structures.json",
+        "MarketScannerPriorMapStructures",
+        errors,
+        artifact_versions,
     )
-    graph = _payload(root, "road_graph.json", "MarketScannerRoadGraph", errors)
+    graph = _payload(
+        root,
+        "road_graph.json",
+        "MarketScannerRoadGraph",
+        errors,
+        artifact_versions,
+    )
     spatial = _payload(
-        root, "spatial_index.json", "MarketScannerSpatialIndex", errors
+        root,
+        "spatial_index.json",
+        "MarketScannerSpatialIndex",
+        errors,
+        artifact_versions,
     )
     distance_fields = _payload(
-        root, "distance_fields.json", "MarketScannerDistanceFields", errors
+        root,
+        "distance_fields.json",
+        "MarketScannerDistanceFields",
+        errors,
+        artifact_versions,
     )
     validation_report = _payload(
         root,
         "validation_report.json",
         "MarketScannerPriorMapValidation",
         errors,
+        artifact_versions,
     )
     png_error = _validate_png(root / "preview.png")
     if png_error:
@@ -457,12 +948,10 @@ def validate_package(directory: Path | str) -> dict[str, Any]:
             spatial,
             distance_fields,
             validation_report,
-            package_manifest,
         )
     ):
         return {"valid": False, "errors": errors, "warnings": warnings}
 
-    assert manifest is not None
     assert elements_payload is not None
     assert shelves_payload is not None
     assert structures_payload is not None
@@ -479,12 +968,86 @@ def validate_package(directory: Path | str) -> dict[str, Any]:
     if not isinstance(manifest.get("prior_map_id"), str) or not manifest["prior_map_id"]:
         errors.append({"code": "map_id", "message": "地图包缺少 prior_map_id。"})
     source_hash = manifest.get("source_sha256")
-    if (
-        not isinstance(source_hash, str)
-        or len(source_hash) != 64
-        or any(character not in "0123456789abcdef" for character in source_hash)
-    ):
+    if not _valid_sha256(source_hash):
         errors.append({"code": "source_hash", "message": "地图包缺少有效的源文件 SHA-256。"})
+    authoritative_canvas: dict[str, float] | None = None
+    if package_version == PACKAGE_VERSION:
+        canonical_hash = manifest.get("canonical_source_sha256")
+        if not _valid_sha256(canonical_hash):
+            errors.append(
+                {
+                    "code": "canonical_source_hash",
+                    "message": "v2 地图包缺少有效的 canonical source SHA-256。",
+                }
+            )
+        else:
+            base_name = SAFE_NAME.sub("-", str(manifest.get("name", ""))).strip("-") or "map"
+            if manifest.get("prior_map_id") != f"{base_name}-{canonical_hash[:12]}":
+                errors.append(
+                    {
+                        "code": "map_id",
+                        "message": "v2 prior_map_id 未绑定 canonical source SHA-256。",
+                    }
+                )
+        expected_source_coordinate_system = {
+            "unit": "centimetre",
+            "origin": "top_left",
+            "x_axis": "right",
+            "y_axis": "down",
+            "rotation_direction": "clockwise_degrees",
+            "rectangle_anchor": "top_left",
+            "rotation_pivot": "top_left_anchor",
+        }
+        if manifest.get("source_coordinate_system") != expected_source_coordinate_system:
+            errors.append(
+                {
+                    "code": "source_coordinate_system",
+                    "message": "v2 source coordinate contract 必须使用 top-left anchor/pivot。",
+                }
+            )
+        if manifest.get("element_role_contract") != role_contract_payload():
+            errors.append(
+                {
+                    "code": "element_role_contract",
+                    "message": "v2 元素角色合同与唯一角色表不一致。",
+                }
+            )
+        source_canvas = manifest.get("source_canvas")
+        if not isinstance(source_canvas, dict):
+            errors.append({"code": "source_canvas", "message": "v2 manifest 缺少 source_canvas。"})
+        else:
+            width_cm = source_canvas.get("width_cm")
+            height_cm = source_canvas.get("height_cm")
+            source_scale = source_canvas.get("source_scale")
+            if (
+                not _positive_finite(width_cm)
+                or not _positive_finite(height_cm)
+                or (source_scale is not None and not _positive_finite(source_scale))
+            ):
+                errors.append({"code": "source_canvas", "message": "v2 source_canvas 字段无效。"})
+            else:
+                authoritative_canvas = {
+                    "min_x_m": 0.0,
+                    "min_y_m": -float(height_cm) / 100.0,
+                    "max_x_m": float(width_cm) / 100.0,
+                    "max_y_m": 0.0,
+                    "width_m": float(width_cm) / 100.0,
+                    "height_m": float(height_cm) / 100.0,
+                }
+            source_map_info = manifest.get("source_map_info")
+            if not isinstance(source_map_info, dict) or source_map_info != {
+                "map_name": manifest.get("name"),
+                "store_code": manifest.get("store_id"),
+                "width_cm": width_cm,
+                "height_cm": height_cm,
+                "scale": source_scale,
+            }:
+                errors.append(
+                    {
+                        "code": "source_map_info",
+                        "message": "v2 source_map_info 与业务身份/source_canvas 不一致。",
+                    }
+                )
     floors = manifest.get("floors")
     if not isinstance(floors, list) or not floors:
         errors.append({"code": "floors", "message": "地图包没有可用楼层。"})
@@ -530,7 +1093,70 @@ def validate_package(directory: Path | str) -> dict[str, Any]:
         else:
             identifiers.add(identifier)
             elements_by_id[identifier] = element
-        points = _geometry_points(element.get("geometry"))
+        shape_type = str(element.get("shape_type"))
+        if package_version == PACKAGE_VERSION:
+            expected_role = role_for(shape_type)
+            if (
+                shape_type not in ACTIVE_TYPES
+                or element.get("visible") is not True
+                or element.get("role") != expected_role
+            ):
+                errors.append(
+                    {
+                        "code": "active_element_contract",
+                        "message": (
+                            f"v2 元素 {identifier or index + 1} 含非 active/hidden/错误角色记录。"
+                        ),
+                    }
+                )
+            center = element.get("center_m")
+            if center is not None and (
+                not isinstance(center, list)
+                or len(center) != 2
+                or not all(
+                    isinstance(value, (int, float))
+                    and not isinstance(value, bool)
+                    and math.isfinite(float(value))
+                    for value in center
+                )
+            ):
+                errors.append(
+                    {
+                        "code": "element_center",
+                        "message": f"v2 元素 {identifier or index + 1} 的 center_m 无效。",
+                    }
+                )
+            yaw = element.get("yaw_rad")
+            if yaw is not None and (
+                not isinstance(yaw, (int, float))
+                or isinstance(yaw, bool)
+                or not math.isfinite(float(yaw))
+            ):
+                errors.append(
+                    {
+                        "code": "element_yaw",
+                        "message": f"v2 元素 {identifier or index + 1} 的 yaw_rad 无效。",
+                    }
+                )
+        points: list[tuple[float, float]]
+        if package_version == PACKAGE_VERSION:
+            validated_points = _production_geometry_points(
+                shape_type, element.get("geometry")
+            )
+            if validated_points is None:
+                errors.append(
+                    {
+                        "code": "active_geometry_contract",
+                        "message": (
+                            f"v2 元素 {identifier or index + 1} 的几何类型、点数或坐标无效。"
+                        ),
+                    }
+                )
+                points = []
+            else:
+                points = validated_points
+        else:
+            points = _geometry_points(element.get("geometry"))
         if points:
             floor_id = str(element.get("floor_id"))
             if floor_id not in floor_records:
@@ -541,14 +1167,33 @@ def validate_package(directory: Path | str) -> dict[str, Any]:
                     }
                 )
             geometry_by_floor.setdefault(floor_id, []).extend(points)
-            if not _bounds_match(element.get("bounds"), _bounds(points)):
+            expected_bounds = _bounds(
+                points, include_dimensions=package_version == PACKAGE_VERSION
+            )
+            if not _bounds_match(
+                element.get("bounds"),
+                expected_bounds,
+                tolerance=1.0e-8 if package_version == PACKAGE_VERSION else 1.0e-5,
+                exact_keys=package_version == PACKAGE_VERSION,
+            ):
                 errors.append(
                     {
                         "code": "element_bounds",
                         "message": f"元素 {identifier or index + 1} 的 bounds 与几何不一致。",
                     }
                 )
-        if element.get("shape_type") in SUPPORTED_TYPES and element.get("geometry") is None:
+            if (
+                package_version == PACKAGE_VERSION
+                and authoritative_canvas is not None
+                and not _points_inside_bounds(points, authoritative_canvas)
+            ):
+                errors.append(
+                    {
+                        "code": "canvas_containment",
+                        "message": f"v2 元素 {identifier or index + 1} 超出 Basic Info 画布。",
+                    }
+                )
+        if shape_type in SUPPORTED_TYPES and not points:
             errors.append(
                 {
                     "code": "geometry",
@@ -566,17 +1211,87 @@ def validate_package(directory: Path | str) -> dict[str, Any]:
     if manifest.get("element_statistics") != dict(sorted(expected_statistics.items())):
         errors.append({"code": "element_statistics", "message": "manifest 元素分类统计不一致。"})
     visible_count = sum(element.get("visible") is True for element in elements if isinstance(element, dict))
-    if (
-        manifest.get("visible_element_count") != visible_count
-        or manifest.get("hidden_element_count") != len(elements) - visible_count
-    ):
-        errors.append({"code": "visibility_count", "message": "manifest 可见/隐藏元素统计不一致。"})
+    if package_version == LEGACY_PACKAGE_VERSION:
+        if (
+            manifest.get("visible_element_count") != visible_count
+            or manifest.get("hidden_element_count") != len(elements) - visible_count
+        ):
+            errors.append({"code": "visibility_count", "message": "manifest 可见/隐藏元素统计不一致。"})
+    else:
+        role_counts = {
+            ROLE_SHELF: sum(
+                item.get("role") == ROLE_SHELF for item in elements if isinstance(item, dict)
+            ),
+            ROLE_FIXED_STRUCTURE: sum(
+                item.get("role") == ROLE_FIXED_STRUCTURE
+                for item in elements
+                if isinstance(item, dict)
+            ),
+            "road": sum(
+                item.get("role") == "road" for item in elements if isinstance(item, dict)
+            ),
+        }
+        ignored_by_shape_type = manifest.get("ignored_by_shape_type")
+        ignored_valid = (
+            isinstance(ignored_by_shape_type, dict)
+            and all(
+                shape_type in PRESENTATION_ONLY_TYPES
+                and type(count) is int
+                and count >= 0
+                for shape_type, count in ignored_by_shape_type.items()
+            )
+        )
+        presentation_count = (
+            sum(ignored_by_shape_type.values()) if ignored_valid else -1
+        )
+        source_count_parts = [
+            len(elements),
+            presentation_count,
+            manifest.get("unsupported_ignored_count"),
+            manifest.get("hidden_element_count"),
+            manifest.get("invalid_geometry_ignored_count"),
+        ]
+        if (
+            manifest.get("active_element_count") != len(elements)
+            or manifest.get("visible_element_count") != len(elements)
+            or manifest.get("shelf_count") != role_counts[ROLE_SHELF]
+            or manifest.get("fixed_structure_count") != role_counts[ROLE_FIXED_STRUCTURE]
+            or manifest.get("road_element_count") != role_counts["road"]
+            or not ignored_valid
+            or manifest.get("presentation_ignored_count") != presentation_count
+            or not all(type(value) is int and value >= 0 for value in source_count_parts)
+            or manifest.get("source_element_count") != sum(source_count_parts)
+        ):
+            errors.append(
+                {
+                    "code": "v2_element_counts",
+                    "message": "v2 source/active/role/ignored 元素统计不一致。",
+                }
+            )
     for floor_id, record in floor_records.items():
         points = geometry_by_floor.get(floor_id, [])
         if not points:
             errors.append({"code": "floor_geometry", "message": f"楼层 {floor_id} 没有有效几何。"})
-        elif not _bounds_match(record.get("bounds"), _bounds(points)):
+        elif package_version == LEGACY_PACKAGE_VERSION and not _bounds_match(
+            record.get("bounds"), _bounds(points)
+        ):
             errors.append({"code": "floor_bounds", "message": f"楼层 {floor_id} 的 bounds 与实际几何不一致。"})
+        elif (
+            package_version == PACKAGE_VERSION
+            and authoritative_canvas is not None
+            and not _bounds_match(
+                record.get("bounds"),
+                authoritative_canvas,
+                tolerance=1.0e-8,
+                exact_keys=True,
+            )
+        ):
+            errors.append(
+                {
+                    "code": "floor_bounds",
+                    "message": f"v2 楼层 {floor_id} bounds 不等于 Basic Info 画布。",
+                }
+            )
         preview_file = record.get("preview_file")
         if (
             not isinstance(preview_file, str)
@@ -595,8 +1310,23 @@ def validate_package(directory: Path | str) -> dict[str, Any]:
                     }
                 )
     all_points = [point for values in geometry_by_floor.values() for point in values]
-    if all_points and not _bounds_match(manifest.get("bounds"), _bounds(all_points)):
+    if (
+        package_version == LEGACY_PACKAGE_VERSION
+        and all_points
+        and not _bounds_match(manifest.get("bounds"), _bounds(all_points))
+    ):
         errors.append({"code": "map_bounds", "message": "manifest 总体 bounds 与实际几何不一致。"})
+    elif (
+        package_version == PACKAGE_VERSION
+        and authoritative_canvas is not None
+        and not _bounds_match(
+            manifest.get("bounds"),
+            authoritative_canvas,
+            tolerance=1.0e-8,
+            exact_keys=True,
+        )
+    ):
+        errors.append({"code": "map_bounds", "message": "v2 manifest bounds 不等于 Basic Info 画布。"})
 
     def validate_subset(
         payload: dict[str, Any],
@@ -624,11 +1354,17 @@ def validate_package(directory: Path | str) -> dict[str, Any]:
         if any(item != elements_by_id[str(item["id"])] for item in values):
             errors.append({"code": "subset_content", "message": f"{label} 内容与 elements.json 不一致。"})
 
-    validate_subset(shelves_payload, "shelves", {"MapShelf"}, "shelves.json")
+    validate_subset(shelves_payload, "shelves", set(SHELF_TYPES), "shelves.json")
+    _validate_shelves_document(
+        shelves_payload,
+        package_version=package_version,
+        elements_by_id=elements_by_id,
+        errors=errors,
+    )
     validate_subset(
         structures_payload,
         "structures",
-        {"MapTable", "MapPillar", "MapTableFeature"},
+        set(FIXED_STRUCTURE_TYPES),
         "fixed_structures.json",
     )
 
@@ -691,6 +1427,92 @@ def validate_package(directory: Path | str) -> dict[str, Any]:
         ):
             errors.append({"code": "road_edge_floor", "message": "道路边与节点楼层不一致。"})
 
+    if package_version == PACKAGE_VERSION:
+        try:
+            # Local import avoids a module cycle: the converter imports this
+            # validator, while formal validation reuses the converter's one
+            # deterministic spatial-index implementation.
+            from .xlsx_reader import BasicMapInfo
+            from .xlsx_to_prior_map import (
+                _canonical_business_sha256,
+                _road_graph,
+                _spatial_index,
+                _stable_element_id_for_context,
+            )
+
+            source_map_info = manifest["source_map_info"]
+            basic_info = BasicMapInfo(
+                map_name=str(source_map_info["map_name"]),
+                width_cm=float(source_map_info["width_cm"]),
+                height_cm=float(source_map_info["height_cm"]),
+                store_code=str(source_map_info["store_code"]),
+                source_scale=(
+                    None
+                    if source_map_info.get("scale") is None
+                    else float(source_map_info["scale"])
+                ),
+            )
+            stable_business_ids = [
+                _stable_element_id_for_context(
+                    element,
+                    store_id=basic_info.store_code,
+                    map_name=basic_info.map_name,
+                )
+                for element in elements
+            ]
+            if (
+                any(not value for value in stable_business_ids)
+                or len(set(stable_business_ids)) != len(stable_business_ids)
+            ):
+                errors.append(
+                    {
+                        "code": "duplicate_stable_element_id",
+                        "message": "v2 elements.json 含重复 stable business identity。",
+                    }
+                )
+            if (
+                manifest.get("canonical_source_sha256")
+                != _canonical_business_sha256(basic_info, elements)
+            ):
+                errors.append(
+                    {
+                        "code": "canonical_source_binding",
+                        "message": "v2 canonical_source_sha256 与权威业务内容不一致。",
+                    }
+                )
+
+            expected_graph = _road_graph(elements, [])
+            if graph != expected_graph:
+                errors.append(
+                    {
+                        "code": "road_graph_source_binding",
+                        "message": "v2 road_graph 未确定性绑定道路元素。",
+                    }
+                )
+            expected_spatial = _spatial_index(elements, expected_graph)
+            if spatial != expected_spatial:
+                errors.append(
+                    {
+                        "code": "spatial_source_binding",
+                        "message": "v2 spatial_index 未确定性绑定 elements/road_graph。",
+                    }
+                )
+            expected_distance = build_distance_fields(elements, floors)
+            if distance_fields != expected_distance:
+                errors.append(
+                    {
+                        "code": "distance_source_binding",
+                        "message": "v2 distance_fields 未确定性绑定 elements/floor bounds。",
+                    }
+                )
+        except (KeyError, TypeError, ValueError, OverflowError) as exc:
+            errors.append(
+                {
+                    "code": "derived_artifact_binding",
+                    "message": f"v2 派生空间工件无法从权威元素重建：{exc}",
+                }
+            )
+
     cell_size = spatial.get("cell_size_m")
     if (
         not isinstance(cell_size, (int, float))
@@ -715,7 +1537,7 @@ def validate_package(directory: Path | str) -> dict[str, Any]:
     expected_indexed_ids = {
         identifier
         for identifier, element in elements_by_id.items()
-        if element.get("shape_type") in {"MapShelf", "MapTable", "MapPillar", "MapTableFeature"}
+        if element.get("shape_type") in STRUCTURE_TYPES
         and element.get("visible") is True
         and element.get("bounds") is not None
     }
@@ -726,6 +1548,31 @@ def validate_package(directory: Path | str) -> dict[str, Any]:
                 "message": "结构空间索引未完整且精确覆盖可见固定结构。",
             }
         )
+    if package_version == PACKAGE_VERSION:
+        declared_roles = spatial.get("element_roles")
+        if not isinstance(declared_roles, dict) or set(declared_roles) != expected_indexed_ids:
+            errors.append(
+                {
+                    "code": "spatial_element_roles",
+                    "message": "v2 spatial_index.element_roles 未精确覆盖结构元素。",
+                }
+            )
+        else:
+            for identifier, record in declared_roles.items():
+                element = elements_by_id[identifier]
+                if not isinstance(record, dict) or record != {
+                    "role": role_for(str(element.get("shape_type"))),
+                    "shape_type": element.get("shape_type"),
+                }:
+                    errors.append(
+                        {
+                            "code": "spatial_element_role",
+                            "message": (
+                                f"v2 spatial role/type 与元素不一致：{identifier}"
+                            ),
+                        }
+                    )
+                    break
     indexed_road_ids = _indexed_identifiers(spatial_floors, "road_cells", errors)
     missing_road_references = sorted(indexed_road_ids - edge_ids)
     if missing_road_references:
@@ -747,7 +1594,7 @@ def validate_package(directory: Path | str) -> dict[str, Any]:
         not isinstance(distance_manifest, dict)
         or distance_manifest.get("file") != "distance_fields.json"
         or distance_manifest.get("format") != "MarketScannerDistanceFields"
-        or distance_manifest.get("version") != PACKAGE_VERSION
+        or distance_manifest.get("version") != distance_fields.get("version")
     ):
         errors.append({"code": "distance_manifest", "message": "manifest 距离场声明无效。"})
     truncation = distance_fields.get("truncation_distance_m")
@@ -769,6 +1616,7 @@ def validate_package(directory: Path | str) -> dict[str, Any]:
                 "message": "距离场必须包含 0.40/0.20/0.10 m 三个层级。",
             }
         )
+    total_distance_cells = 0
     for floor_id, floor in distance_floors.items():
         levels = floor.get("levels") if isinstance(floor, dict) else None
         if not isinstance(levels, list) or not levels:
@@ -784,9 +1632,26 @@ def validate_package(directory: Path | str) -> dict[str, Any]:
                     or level.get("encoding") != "row_rle_u8_cm"
                     or not isinstance(level.get("origin_m"), list)
                     or len(level["origin_m"]) != 2
-                    or float(level.get("resolution_m", 0)) <= 0
+                    or any(
+                        isinstance(value, bool)
+                        or not isinstance(value, (int, float))
+                        or not math.isfinite(float(value))
+                        for value in level["origin_m"]
+                    )
+                    or isinstance(level.get("resolution_m"), bool)
+                    or not isinstance(level.get("resolution_m"), (int, float))
+                    or not math.isfinite(float(level["resolution_m"]))
+                    or float(level["resolution_m"]) <= 0
                 ):
                     raise ValueError("Distance-field metadata is invalid.")
+                width = level.get("width")
+                height = level.get("height")
+                if type(width) is not int or type(height) is not int:
+                    raise ValueError("Distance-field dimensions are not strict integers.")
+                cells = width * height
+                if cells < 1 or cells > MAXIMUM_TOTAL_CELLS - total_distance_cells:
+                    raise ValueError("Distance-field total grid cell budget exceeded.")
+                total_distance_cells += cells
                 values = decode_level(level)
                 if 0 not in values:
                     raise ValueError(
@@ -817,6 +1682,27 @@ def validate_package(directory: Path | str) -> dict[str, Any]:
             and summary.get("warning_count") != len(report_warnings) + len(malformed_rows)
         )
         or summary.get("warning_count") != manifest.get("warning_count")
+        or (
+            package_version == PACKAGE_VERSION
+            and (
+                summary.get("source_element_count")
+                != manifest.get("source_element_count")
+                or summary.get("active_element_count") != len(elements)
+                or summary.get("shelf_count") != manifest.get("shelf_count")
+                or summary.get("fixed_structure_count")
+                != manifest.get("fixed_structure_count")
+                or summary.get("road_element_count")
+                != manifest.get("road_element_count")
+                or summary.get("presentation_ignored_count")
+                != manifest.get("presentation_ignored_count")
+                or summary.get("unsupported_ignored_count")
+                != manifest.get("unsupported_ignored_count")
+                or summary.get("hidden_element_count")
+                != manifest.get("hidden_element_count")
+                or summary.get("invalid_geometry_ignored_count")
+                != manifest.get("invalid_geometry_ignored_count")
+            )
+        )
     ):
         errors.append({"code": "validation_report", "message": "validation_report.json 与地图包内容不一致。"})
     return {"valid": not errors, "errors": errors, "warnings": warnings}

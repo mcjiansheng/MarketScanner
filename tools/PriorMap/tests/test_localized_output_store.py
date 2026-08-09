@@ -747,6 +747,40 @@ class LocalizedVersionStoreTests(unittest.TestCase):
         )
         return staging
 
+    def test_prior_map_manifest_accepts_frozen_v1_and_formal_v2_only(self) -> None:
+        legacy = self.write_valid_staging()
+        try:
+            self.store.validate_staging(legacy, parent_version=None)
+        finally:
+            self.store.abort(legacy)
+
+        formal = self.write_valid_staging(revision=2)
+        try:
+            manifest_path = formal / "prior_map_manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["version"] = 2
+            manifest_path.write_text(
+                json.dumps(manifest, sort_keys=True, separators=(",", ":")),
+                encoding="utf-8",
+            )
+            self.store.validate_staging(formal, parent_version=None)
+        finally:
+            self.store.abort(formal)
+
+        invalid = self.write_valid_staging(revision=3)
+        try:
+            invalid_path = invalid / "prior_map_manifest.json"
+            invalid_manifest = json.loads(invalid_path.read_text(encoding="utf-8"))
+            invalid_manifest["version"] = True
+            invalid_path.write_text(
+                json.dumps(invalid_manifest, sort_keys=True, separators=(",", ":")),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(LocalizedStoreError, "contract is invalid"):
+                self.store.validate_staging(invalid, parent_version=None)
+        finally:
+            self.store.abort(invalid)
+
     def rewrite_session_bundle(
         self,
         staging: Path,

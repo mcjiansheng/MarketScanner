@@ -26,12 +26,12 @@
 	<true/>
 	<key>LSSupportsOpeningDocumentsInPlace</key>
 	<true/>
+	<key>NFCReaderUsageDescription</key>
+	<string>NFC is used to read electronic price tag identifiers while scanning the supermarket.</string>
 	<key>NSCameraUsageDescription</key>
 	<string>The camera is used for scanning (ideally with LiDAR).</string>
 	<key>NSLocationWhenInUseUsageDescription</key>
 	<string>The GPS is used when GPS option is enabled in Settings-&gt;Mapping...</string>
-	<key>NFCReaderUsageDescription</key>
-	<string>NFC is used to read electronic price tag identifiers while scanning the supermarket.</string>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>

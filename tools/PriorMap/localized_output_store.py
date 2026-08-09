@@ -741,7 +741,10 @@ class LocalizedVersionStore:
             if parsed[name].get("type") != "FeatureCollection":
                 raise LocalizedStoreError(f"GeoJSON is not a FeatureCollection: {name}")
         expected_contracts = {
-            "prior_map_manifest.json": ("MarketScannerPriorMap", 1),
+            # Standard-workbook MapCase02 packages are formal prior-map v2;
+            # legacy packages remain v1. The localized store preserves the
+            # exact source manifest and must accept both frozen versions.
+            "prior_map_manifest.json": ("MarketScannerPriorMap", {1, 2}),
             "source_manifest.json": ("MarketScannerLocalizedSourceManifest", 2),
             "processing_manifest.json": ("MarketScannerLocalizedProcessing", 2),
             "localization_constraints.json": ("MarketScannerOfflineLocalizationConstraints", 1),
@@ -770,10 +773,17 @@ class LocalizedVersionStore:
             )
         for name, (expected_format, expected_version) in expected_contracts.items():
             payload = parsed[name]
+            allowed_versions = (
+                expected_version
+                if isinstance(expected_version, set)
+                else {expected_version}
+            )
+            actual_version = payload.get("version") if isinstance(payload, dict) else None
             if (
                 not isinstance(payload, dict)
                 or payload.get("format") != expected_format
-                or payload.get("version") != expected_version
+                or type(actual_version) is not int
+                or actual_version not in allowed_versions
             ):
                 raise LocalizedStoreError(f"Localized artifact contract is invalid: {name}")
         if not isinstance(parsed["online_localization_trace.json"], list):

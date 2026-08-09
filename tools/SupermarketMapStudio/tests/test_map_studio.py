@@ -344,60 +344,111 @@ def create_session(root: Path, name: str, offset: float, scan_mode: str | None =
     return session
 
 
-def create_prior_map_workbook(path: Path) -> None:
-    elements = [
-        {
-            "shapeType": "MapShelf",
-            "x": 100,
-            "y": 200,
-            "width": 300,
-            "height": 100,
-            "rotation": 90,
-            "code": "Shelf-A",
-            "crossCode": "Cross-A",
-            "rowFlag": "Row-A",
-            "visible": True,
-        },
-        {
-            "shapeType": "MapCross",
-            "points": [0, 500, 1000, 500],
-            "lineWidth": 200,
-            "code": "Cross-A",
-            "visible": True,
-        },
-        {
-            "shapeType": "MapRoadPoint",
-            "x": 100,
-            "y": 500,
-            "code": "Road-1",
-            "crossCodes": ["Cross-A"],
-            "visible": True,
-        },
-        {
-            "shapeType": "MapRoadPoint",
-            "x": 900,
-            "y": 500,
-            "code": "Road-2",
-            "crossCodes": ["Cross-A"],
-            "visible": True,
-        },
-    ]
-    strings = ["floor", "element"]
+def create_prior_map_workbook(
+    path: Path,
+    elements: list[dict[str, object] | str] | None = None,
+    *,
+    include_basic_info: bool = True,
+) -> None:
+    if elements is None:
+        elements = [
+            {
+                "shapeType": "MapShelf",
+                "x": 100,
+                "y": 200,
+                "width": 300,
+                "height": 100,
+                "rotation": 90,
+                "code": "Shelf-A",
+                "crossCode": "Cross-A",
+                "rowFlag": "Row-A",
+                "visible": True,
+            },
+            {
+                "shapeType": "MapCross",
+                "points": [0, 500, 1000, 500],
+                "lineWidth": 200,
+                "code": "Cross-A",
+                "visible": True,
+            },
+            {
+                "shapeType": "MapRoadPoint",
+                "x": 100,
+                "y": 500,
+                "code": "Road-1",
+                "crossCodes": ["Cross-A"],
+                "visible": True,
+            },
+            {
+                "shapeType": "MapRoadPoint",
+                "x": 900,
+                "y": 500,
+                "code": "Road-2",
+                "crossCodes": ["Cross-A"],
+                "visible": True,
+            },
+        ]
+    basic_headers = ["map_name", "width", "height", "storeCode", "scale"]
+    basic_values = ["测试货架图", "1200", "1000", "STORE-001", "20"]
+    strings = (
+        (basic_headers + basic_values if include_basic_info else [])
+        + ["floor", "element"]
+    )
     for element in elements:
-        strings.extend(("1", json.dumps(element)))
+        strings.extend(("1", element if isinstance(element, str) else json.dumps(element)))
     shared = "".join(
         f"<si><t>{value.replace('&', '&amp;').replace('<', '&lt;')}</t></si>"
         for value in strings
     )
+    basic_rows = [
+        '<row r="1">'
+        + "".join(
+            f'<c r="{column}1" t="s"><v>{index}</v></c>'
+            for index, column in enumerate(("A", "B", "C", "D", "E"))
+        )
+        + "</row>",
+        '<row r="2">'
+        + "".join(
+            f'<c r="{column}2" t="s"><v>{index + len(basic_headers)}</v></c>'
+            for index, column in enumerate(("A", "B", "C", "D", "E"))
+        )
+        + "</row>",
+    ]
+    element_header_offset = (
+        len(basic_headers) + len(basic_values) if include_basic_info else 0
+    )
     rows = [
-        '<row r="1"><c r="A1" t="s"><v>0</v></c><c r="B1" t="s"><v>1</v></c></row>'
+        '<row r="1">'
+        f'<c r="A1" t="s"><v>{element_header_offset}</v></c>'
+        f'<c r="B1" t="s"><v>{element_header_offset + 1}</v></c>'
+        "</row>"
     ]
     for row_index in range(2, len(elements) + 2):
-        string_index = 2 + (row_index - 2) * 2
+        string_index = element_header_offset + 2 + (row_index - 2) * 2
         rows.append(
             f'<row r="{row_index}"><c r="A{row_index}" t="s"><v>{string_index}</v></c>'
             f'<c r="B{row_index}" t="s"><v>{string_index + 1}</v></c></row>'
         )
+    worksheet_overrides = (
+        '<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+        + (
+            '<Override PartName="/xl/worksheets/sheet2.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+            if include_basic_info
+            else ""
+        )
+    )
+    workbook_sheets = (
+        '<sheet name="Basic Info" sheetId="1" r:id="rId1"/>'
+        '<sheet name="Element Info" sheetId="2" r:id="rId2"/>'
+        if include_basic_info
+        else '<sheet name="Element Info" sheetId="1" r:id="rId1"/>'
+    )
+    workbook_relationships = (
+        '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>'
+        '<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet2.xml"/>'
+        if include_basic_info
+        else '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>'
+    )
     with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as archive:
         archive.writestr(
             "[Content_Types].xml",
@@ -405,7 +456,7 @@ def create_prior_map_workbook(path: Path) -> None:
             '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
             '<Default Extension="xml" ContentType="application/xml"/>'
             '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
-            '<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+            f'{worksheet_overrides}'
             '<Override PartName="/xl/sharedStrings.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml"/>'
             "</Types>",
         )
@@ -419,20 +470,25 @@ def create_prior_map_workbook(path: Path) -> None:
             "xl/workbook.xml",
             '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
             'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
-            '<sheets><sheet name="Element Info" sheetId="1" r:id="rId1"/></sheets></workbook>',
+            f'<sheets>{workbook_sheets}</sheets></workbook>',
         )
         archive.writestr(
             "xl/_rels/workbook.xml.rels",
             '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
-            '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>'
-            "</Relationships>",
+            f'{workbook_relationships}</Relationships>',
         )
         archive.writestr(
             "xl/sharedStrings.xml",
             f'<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="{len(strings)}" uniqueCount="{len(strings)}">{shared}</sst>',
         )
+        if include_basic_info:
+            archive.writestr(
+                "xl/worksheets/sheet1.xml",
+                '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+                f"<sheetData>{''.join(basic_rows)}</sheetData></worksheet>",
+            )
         archive.writestr(
-            "xl/worksheets/sheet1.xml",
+            "xl/worksheets/sheet2.xml" if include_basic_info else "xl/worksheets/sheet1.xml",
             '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
             f"<sheetData>{''.join(rows)}</sheetData></worksheet>",
         )
@@ -740,13 +796,24 @@ class MapStudioApiTests(unittest.TestCase):
             Path(server.localized.__file__).read_bytes(),
         )
 
-    def test_prior_map_frontend_requires_and_preserves_exact_store_id(self) -> None:
+    def test_prior_map_frontend_uses_basic_info_with_optional_exact_assertions(self) -> None:
         page, _ = self.fetch("/")
         script, _ = self.fetch("/app.js")
+        self.assertIn(b'id="prior-legacy-element-only"', page)
         self.assertIn(b'id="prior-store-id"', page)
-        self.assertIn(b"store_id: $(\"#prior-store-id\").value", script)
-        self.assertNotIn(b"store_id: $(\"#prior-store-id\").value.trim()", script)
-        self.assertIn(b"payload.store_id.trim() !== payload.store_id", script)
+        self.assertNotIn(b'id="prior-store-id" class="path-input" type="text" required', page)
+        self.assertIn(b'placeholder="\xe9\xbb\x98\xe8\xae\xa4\xe8\xaf\xbb\xe5\x8f\x96 Basic Info.storeCode"', page)
+        self.assertIn(b'store_id: storeID === "" ? null : storeID', script)
+        self.assertIn(
+            b'allow_legacy_element_only: $("#prior-legacy-element-only").checked',
+            script,
+        )
+        self.assertIn(
+            b"payload.store_id !== null && payload.store_id.trim() !== payload.store_id",
+            script,
+        )
+        self.assertIn("旧版仅 Element Info 导入必须填写真实门店 ID".encode(), script)
+        self.assertIn("旧版仅 Element Info 导入必须填写地图名称".encode(), script)
         self.assertIn(b'mapName === "" ? null : mapName', script)
 
     def test_operator_diagnostics_bundle_excludes_session_token(self) -> None:
@@ -1268,8 +1335,6 @@ class MapStudioApiTests(unittest.TestCase):
             {
                 "xlsx": str(workbook),
                 "output": str(output),
-                "name": "测试货架图",
-                "store_id": "STORE-001",
             },
         )
         completed = self.wait_for_job(job["id"])
@@ -1290,25 +1355,122 @@ class MapStudioApiTests(unittest.TestCase):
         self.assertEqual(inspection["manifest"]["prior_map_id"], completed["map"]["prior_map_id"])
         self.assertEqual(workbook.read_bytes(), source_before)
 
-    def test_prior_map_api_requires_exact_business_identity(self) -> None:
+    def test_prior_map_api_requires_explicit_safe_legacy_element_only_mode(self) -> None:
+        workbook = self.root / "prior-map-legacy-element-only.xlsx"
+        create_prior_map_workbook(workbook, include_basic_info=False)
+        source_before = workbook.read_bytes()
+
+        strict_output = self.root / "PriorMap-legacy-strict-output"
+        strict_job = self.api(
+            "/api/prior-map/convert",
+            {"xlsx": str(workbook), "output": str(strict_output)},
+        )
+        strict_result = self.wait_for_job(strict_job["id"])
+        self.assertEqual(strict_result["status"], "failed")
+        self.assertIn("请明确勾选旧版兼容", strict_result.get("error", ""))
+        self.assertFalse(strict_output.exists())
+
+        for payload, message in (
+            ({"allow_legacy_element_only": "true"}, "必须是布尔值"),
+            ({"allow_legacy_element_only": True}, "必须填写真实门店 ID"),
+            (
+                {
+                    "allow_legacy_element_only": True,
+                    "store_id": "STORE-6599",
+                },
+                "必须填写地图名称",
+            ),
+        ):
+            request = {
+                "xlsx": str(workbook),
+                "output": str(self.root / f"PriorMap-invalid-{len(message)}"),
+                **payload,
+            }
+            with self.subTest(payload=payload):
+                with self.assertRaises(HTTPError) as rejected:
+                    self.api("/api/prior-map/convert", request)
+                self.assertEqual(rejected.exception.code, 400)
+                self.assertIn(message, rejected.exception.payload["error"])
+
+        legacy_output = self.root / "PriorMap-legacy-output"
+        legacy_job = self.api(
+            "/api/prior-map/convert",
+            {
+                "xlsx": str(workbook),
+                "output": str(legacy_output),
+                "allow_legacy_element_only": True,
+                "store_id": "STORE-6599",
+                "name": "6599 门店货架图",
+            },
+        )
+        legacy_result = self.wait_for_job(legacy_job["id"])
+        self.assertEqual(legacy_result["status"], "complete", legacy_result.get("error"))
+        self.assertEqual(legacy_result["map"]["store_id"], "STORE-6599")
+        self.assertEqual(legacy_result["map"]["name"], "6599 门店货架图")
+        self.assertEqual(workbook.read_bytes(), source_before)
+
+    def test_prior_map_api_rejects_malformed_formal_element_row(self) -> None:
+        workbook = self.root / "prior-map-malformed.xlsx"
+        output = self.root / "PriorMap-malformed-output"
+        create_prior_map_workbook(
+            workbook,
+            [
+                {
+                    "shapeType": "MapShelf",
+                    "x": 100,
+                    "y": 200,
+                    "width": 300,
+                    "height": 100,
+                    "rotation": 0,
+                    "code": "Shelf-A",
+                    "visible": True,
+                },
+                "{bad json",
+            ],
+        )
+        job = self.api(
+            "/api/prior-map/convert",
+            {"xlsx": str(workbook), "output": str(output)},
+        )
+        completed = self.wait_for_job(job["id"])
+        self.assertEqual(completed["status"], "failed")
+        self.assertIn(
+            "reject every malformed Element Info row",
+            completed.get("error", ""),
+        )
+        self.assertFalse(output.exists())
+
+    def test_prior_map_api_accepts_missing_assertions_and_rejects_mismatch(self) -> None:
         workbook = self.root / "prior-map-identity.xlsx"
         create_prior_map_workbook(workbook)
 
-        for suffix, store_id in (("missing", None), ("whitespace", " STORE-001")):
+        accepted_output = self.root / "PriorMap-output-no-assertions"
+        accepted = self.api(
+            "/api/prior-map/convert",
+            {"xlsx": str(workbook), "output": str(accepted_output)},
+        )
+        completed = self.wait_for_job(accepted["id"])
+        self.assertEqual(completed["status"], "complete", completed.get("error"))
+        self.assertEqual(completed["map"]["store_id"], "STORE-001")
+        self.assertEqual(completed["map"]["name"], "测试货架图")
+
+        for suffix, extra in (
+            ("store-whitespace", {"store_id": " STORE-001"}),
+            ("store-mismatch", {"store_id": "STORE-999"}),
+            ("name-whitespace", {"name": " 测试货架图"}),
+            ("name-mismatch", {"name": "其他地图"}),
+        ):
             output = self.root / f"PriorMap-output-{suffix}"
             request = {
                 "xlsx": str(workbook),
                 "output": str(output),
-                "name": "测试货架图",
             }
-            if store_id is not None:
-                request["store_id"] = store_id
-            with self.subTest(store_id=store_id):
-                with self.assertRaises(HTTPError) as rejected:
-                    self.api("/api/prior-map/convert", request)
-                self.assertEqual(rejected.exception.code, 400)
-                self.assertEqual(rejected.exception.payload["code"], "bad_request")
-                self.assertIn("store_id", rejected.exception.payload["error"])
+            request.update(extra)
+            with self.subTest(extra=extra):
+                job = self.api("/api/prior-map/convert", request)
+                rejected = self.wait_for_job(job["id"])
+                self.assertEqual(rejected["status"], "failed")
+                self.assertIn("must exactly match Basic Info", rejected["error"])
                 self.assertFalse(output.exists())
 
     def test_session_inspection_keeps_storage_and_workflow_modes_separate(self) -> None:

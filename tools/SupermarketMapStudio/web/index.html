@@ -96,22 +96,24 @@
         </section>
 
         <section class="mode-panel" data-panel="prior" aria-label="先验地图导入">
-          <p class="mode-explanation">把已有货架结构 Excel 转换为手机和 PC 共用的版本化地图包。源 Excel 只读，不会被改写。</p>
+          <p class="mode-explanation">把正式超市地图 Excel 转换为手机和 PC 共用的版本化地图包。Basic Info 与 Element Info 是权威输入；Shelf Info 只做历史审计。源 Excel 只读，不会被改写。</p>
           <div class="field-row">
             <label for="prior-xlsx">货架结构 Excel</label>
             <div class="path-control">
-              <input id="prior-xlsx" class="path-input" type="text" spellcheck="false" placeholder="请选择包含 Element Info 的 .xlsx">
+              <input id="prior-xlsx" class="path-input" type="text" spellcheck="false" placeholder="请选择包含 Basic Info 与 Element Info 的正式 .xlsx">
               <button class="secondary" type="button" data-pick-file="prior-xlsx" data-title="选择先验地图 Excel">选择文件</button>
             </div>
           </div>
+          <label class="check-row"><input id="prior-legacy-element-only" type="checkbox"> 兼容旧版仅 Element Info（无 Basic Info）</label>
+          <div id="prior-legacy-hint" class="field-hint">默认关闭并按正式模板严格校验。旧版兼容模式必须由操作者明确开启，并填写真实门店 ID 和地图名称。</div>
           <div class="field-row">
-            <label for="prior-store-id">门店 ID（必填）</label>
-            <input id="prior-store-id" class="path-input" type="text" required maxlength="128" spellcheck="false" placeholder="例如：STORE-001">
-            <div class="field-hint">必须输入真实门店 ID；不会自动裁剪空格，也不会使用 default。最多 128 UTF-8 bytes。</div>
+            <label id="prior-store-id-label" for="prior-store-id">门店 ID 断言（可选）</label>
+            <input id="prior-store-id" class="path-input" type="text" maxlength="128" spellcheck="false" placeholder="默认读取 Basic Info.storeCode">
+            <div class="field-hint">通常留空；如填写，必须与 Basic Info.storeCode 完全一致，用于防止选错文件。不会自动裁剪空格。</div>
           </div>
           <div class="field-row">
-            <label for="prior-name">地图名称（可选）</label>
-            <input id="prior-name" class="path-input" type="text" placeholder="例如：一号店货架图">
+            <label id="prior-name-label" for="prior-name">地图名称断言（可选）</label>
+            <input id="prior-name" class="path-input" type="text" placeholder="默认读取 Basic Info.map_name">
           </div>
           <div class="field-row">
             <label for="prior-output">地图包保存目录</label>
