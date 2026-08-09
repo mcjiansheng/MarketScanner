@@ -121,10 +121,24 @@ enum MobileMapLibrary {
         case afterRollbackSourceModeRestoreBeforeIntentRemoval
     }
 
+    /// Deterministic host-test synchronization points for quarantine reads.
+    /// Production leaves the observer nil. Tests replace an authority only
+    /// after its descriptor has been opened and identity-bound, avoiding
+    /// scheduler timing and payload-size guesses while still exercising the
+    /// production post-read pathname/inode verification.
+    enum QuarantineReadVerificationPhase: Equatable {
+        case payloadFileOpened(String)
+        case diagnosticOpened
+    }
+
     /// Host-only fault injection for the quarantine transaction. Production
     /// leaves this nil; tests use thrown errors for rollback checks and a
     /// child process `_exit` for every durable transaction boundary.
     static var quarantineFaultInjector: ((QuarantineFaultPoint) throws -> Void)?
+
+    /// Host-only observer for deterministic quarantine read races.
+    static var quarantineReadVerificationObserver:
+        ((QuarantineReadVerificationPhase) throws -> Void)?
 
     /// Test/embedding hook: when set, `root()` returns this directory
     /// instead of the Application Support location. The host suite uses
@@ -2627,6 +2641,7 @@ enum MobileMapLibrary {
             throw LibraryError.packageVerificationFailed(
                 "quarantine payload file identity changed before read")
         }
+        try quarantineReadVerificationObserver?(.payloadFileOpened(basename))
         var hasher = SHA256()
         var buffer = [UInt8](repeating: 0, count: 64 * 1024)
         while true {
@@ -2682,6 +2697,7 @@ enum MobileMapLibrary {
             throw LibraryError.packageVerificationFailed(
                 "quarantine diagnostic identity changed before read")
         }
+        try quarantineReadVerificationObserver?(.diagnosticOpened)
         var data = Data()
         data.reserveCapacity(Int(opened.st_size))
         var buffer = [UInt8](repeating: 0, count: 16 * 1024)

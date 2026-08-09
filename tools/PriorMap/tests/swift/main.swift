@@ -16036,51 +16036,48 @@ func runMapQuarantineCrashWorkerIfRequested() {
                 }
             }
 
-            let mutationFinished = DispatchSemaphore(value: 0)
-            let mutationLock = NSLock()
-            var mutationError: Error?
-            DispatchQueue.global().asyncAfter(
-                deadline: .now() + .milliseconds(15)) {
-                do {
-                    if phase == "recover_replace_pending_after_open" {
-                        guard renameatx_np(
+            var mutationPerformed = false
+            MobileMapLibrary.quarantineReadVerificationObserver = { point in
+                guard !mutationPerformed else { return }
+                if phase == "recover_replace_pending_after_open" {
+                    guard case .payloadFileOpened = point else { return }
+                    guard renameatx_np(
+                        AT_FDCWD, pending.path,
+                        AT_FDCWD, displaced.path,
+                        UInt32(RENAME_EXCL)) == 0,
+                          renameatx_np(
+                            AT_FDCWD, replacement.path,
                             AT_FDCWD, pending.path,
+                            UInt32(RENAME_EXCL)) == 0 else {
+                        throw NSError(
+                            domain: "MapQuarantineCrashWorker", code: 20,
+                            userInfo: [NSLocalizedDescriptionKey:
+                                "cannot replace opened pending root"])
+                    }
+                } else {
+                    guard case .diagnosticOpened = point else { return }
+                    let diagnostic = pending.appendingPathComponent(
+                        MobileMapLibrary.quarantineDiagnosticFileName)
+                    guard chmod(pending.path, mode_t(0o755)) == 0,
+                          renameatx_np(
+                            AT_FDCWD, diagnostic.path,
                             AT_FDCWD, displaced.path,
                             UInt32(RENAME_EXCL)) == 0,
-                              renameatx_np(
-                                AT_FDCWD, replacement.path,
-                                AT_FDCWD, pending.path,
-                                UInt32(RENAME_EXCL)) == 0 else {
-                            throw NSError(
-                                domain: "MapQuarantineCrashWorker", code: 20,
-                                userInfo: [NSLocalizedDescriptionKey:
-                                    "cannot replace opened pending root"])
-                        }
-                    } else {
-                        let diagnostic = pending.appendingPathComponent(
-                            MobileMapLibrary.quarantineDiagnosticFileName)
-                        guard chmod(pending.path, mode_t(0o755)) == 0,
-                              renameatx_np(
-                                AT_FDCWD, diagnostic.path,
-                                AT_FDCWD, displaced.path,
-                                UInt32(RENAME_EXCL)) == 0,
-                              renameatx_np(
-                                AT_FDCWD, replacement.path,
-                                AT_FDCWD, diagnostic.path,
-                                UInt32(RENAME_EXCL)) == 0,
-                              chmod(pending.path, mode_t(0o555)) == 0 else {
-                            throw NSError(
-                                domain: "MapQuarantineCrashWorker", code: 21,
-                                userInfo: [NSLocalizedDescriptionKey:
-                                    "cannot replace opened embedded diagnostic"])
-                        }
+                          renameatx_np(
+                            AT_FDCWD, replacement.path,
+                            AT_FDCWD, diagnostic.path,
+                            UInt32(RENAME_EXCL)) == 0,
+                          chmod(pending.path, mode_t(0o555)) == 0 else {
+                        throw NSError(
+                            domain: "MapQuarantineCrashWorker", code: 21,
+                            userInfo: [NSLocalizedDescriptionKey:
+                                "cannot replace opened embedded diagnostic"])
                     }
-                } catch {
-                    mutationLock.lock()
-                    mutationError = error
-                    mutationLock.unlock()
                 }
-                mutationFinished.signal()
+                mutationPerformed = true
+            }
+            defer {
+                MobileMapLibrary.quarantineReadVerificationObserver = nil
             }
             var rejected = false
             do {
@@ -16088,13 +16085,7 @@ func runMapQuarantineCrashWorkerIfRequested() {
             } catch {
                 rejected = true
             }
-            guard mutationFinished.wait(timeout: .now() + 20.0) == .success else {
-                Darwin._exit(93)
-            }
-            mutationLock.lock()
-            let capturedMutationError = mutationError
-            mutationLock.unlock()
-            guard rejected, capturedMutationError == nil,
+            guard rejected, mutationPerformed,
                   FileManager.default.fileExists(atPath: displaced.path),
                   FileManager.default.fileExists(atPath: pending.path) else {
                 Darwin._exit(94)
