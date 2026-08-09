@@ -372,8 +372,14 @@ fi
 
 rtabmap_prebuild="$work_root/rtabmap/prebuild"
 rtabmap_ios_build="$work_root/rtabmap/ios"
+rtabmap_host_res_tool="$rtabmap_prebuild/bin/rtabmap-res_tool"
 cmake -S "$repo_root" -B "$rtabmap_prebuild" -DANDROID_PREBUILD=ON
 cmake --build "$rtabmap_prebuild" --config Release
-cmake -S "$repo_root" -B "$rtabmap_ios_build" -G Xcode -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_SYSROOT=$sysroot -DBUILD_SHARED_LIBS=OFF -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_DEPLOYMENT_TARGET=12.0 -DCMAKE_INSTALL_PREFIX=$prefix -DCMAKE_FIND_ROOT_PATH=$prefix -DWITH_QT=OFF -DBUILD_APP=OFF -DBUILD_TOOLS=OFF -DWITH_TORO=OFF -DWITH_VERTIGO=OFF -DWITH_MADGWICK=OFF -DWITH_ORB_OCTREE=ON -DBUILD_EXAMPLES=OFF -DWITH_LIBLAS=ON -DWITH_OPENGV=OFF
+if [ ! -x "$rtabmap_host_res_tool" ]
+then
+  echo "RTAB-Map host resource tool was not produced: $rtabmap_host_res_tool" >&2
+  exit 1
+fi
+cmake -S "$repo_root" -B "$rtabmap_ios_build" -G Xcode -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_SYSROOT=$sysroot -DBUILD_SHARED_LIBS=OFF -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_DEPLOYMENT_TARGET=12.0 -DCMAKE_INSTALL_PREFIX=$prefix -DCMAKE_FIND_ROOT_PATH=$prefix "-DRTABMAP_RES_TOOL=$rtabmap_host_res_tool" -DWITH_QT=OFF -DBUILD_APP=OFF -DBUILD_TOOLS=OFF -DWITH_TORO=OFF -DWITH_VERTIGO=OFF -DWITH_MADGWICK=OFF -DWITH_ORB_OCTREE=ON -DBUILD_EXAMPLES=OFF -DWITH_LIBLAS=ON -DWITH_OPENGV=OFF
 cmake --build "$rtabmap_ios_build" --config Release
 cmake --build "$rtabmap_ios_build" --config Release --target install

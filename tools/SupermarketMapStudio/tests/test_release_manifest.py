@@ -280,6 +280,29 @@ class ReleaseManifestTests(unittest.TestCase):
         )
         self.assertNotIn('cp "$lock_backup" "$lock"', workflow)
 
+    def test_ios_cross_compile_binds_the_prebuilt_host_resource_tool(self) -> None:
+        install_script = (
+            Path(__file__).resolve().parents[3]
+            / "app"
+            / "ios"
+            / "RTABMapApp"
+            / "install_deps.sh"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn(
+            'rtabmap_host_res_tool="$rtabmap_prebuild/bin/rtabmap-res_tool"',
+            install_script,
+        )
+        self.assertIn('if [ ! -x "$rtabmap_host_res_tool" ]', install_script)
+        self.assertIn(
+            '"-DRTABMAP_RES_TOOL=$rtabmap_host_res_tool"',
+            install_script,
+        )
+        self.assertLess(
+            install_script.index('cmake --build "$rtabmap_prebuild" --config Release'),
+            install_script.index('"-DRTABMAP_RES_TOOL=$rtabmap_host_res_tool"'),
+        )
+
     def test_manifest_hashes_artifacts_and_is_reproducible_for_fixed_inputs(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
