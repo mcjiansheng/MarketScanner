@@ -4,6 +4,8 @@
 
 ## 2026-08-09 — MapCase02 标准工作簿格式/几何阻断级收口
 
+- I9 validation run [`31305157950`](https://github.com/mcjiansheng/MarketScanner/actions/runs/31305157950) 在 `b22bd8878fcf001b38cca275b8eddcc6e48974e8` 再次为 7/8：RSS `792,576,000 < 805,306,368` bytes，I8/I9 边界均已通过；随后 mode-restore replacement 用例得到实际 `0555` 而非期望 replacement `0755`，说明两步 `RENAME_EXCL` fixture 没有完成替换却被通用退出码 19 掩盖，Apple build 仍未执行。
+- I10 `2b111d351173b80575d37229ad55c13b42d8c3f9` / G10 `f7cad97` 将 mode-restore、map-root、pending-root 和 embedded-diagnostic 的测试替换统一为同卷 `RENAME_SWAP`，并绑定 source/displaced mode、inode 与 payload；map-root swap 失败使用专用退出码 95，不能假冒生产拒绝。最终源码 204 次聚焦执行、完整 Python 外层长方法 1/1（973.769 s，tag peak RSS `688,111,616` bytes）、默认 host 和两轮独立复审均 PASS（`P0=0 / P1=0`）。新的 final exact-SHA 全绿前仍不冻结。
 - I8 validation run [`31303500822`](https://github.com/mcjiansheng/MarketScanner/actions/runs/31303500822) 的 RSS `793,296,896 < 805,306,368` bytes 且原退出 94 fixture 已通过；随后独立 tombstone source-replacement fixture 的两步 `RENAME_EXCL` 以 91 退出，Apple build 仍未执行，run 为 7/8、未冻结。
 - I9 `5c576dc0818f0908ef05ac1333b189aa9743d211` 将该 fixture 改为同 parent/volume `RENAME_SWAP`：durable tombstone 后一次原子交换 source 与 byte-identical clone，原 inode 直接保留在 `tombstone-original-*`。swap 失败仍退出 91；精确边界 50/50、默认 host 与独立复审均 PASS（`P0=0 / P1=0`）。进一步显式绑定交换前后双方 inode/payload bytes 仅登记 TODO。
 - replacement exact-SHA run [`31301693439`](https://github.com/mcjiansheng/MarketScanner/actions/runs/31301693439) 的 200k tag-evidence RSS 已以 `790,839,296 < 805,306,368` bytes 通过；随后 Map quarantine delayed-replacement fixture 因固定 15 ms 调度错位 `_exit(94)`，macOS/iOS job 失败且 Apple build 未执行，run 仍为 7/8、未冻结。

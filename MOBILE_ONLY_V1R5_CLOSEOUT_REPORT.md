@@ -17,6 +17,8 @@
 
 I8 validation run `31303500822@9478aa5981c664abb98760e24aaba2a4ec537e12` 再次为 7/8：RSS `793,296,896 < 805,306,368` bytes，退出 94 已关闭；新失败发生在更靠后的 tombstone source-replacement fixture，两步 `RENAME_EXCL` 的替换以 91 退出而非预期边界 79。I9 `5c576dc0818f0908ef05ac1333b189aa9743d211` / G9 `ba6104c` 将该测试改为同 parent/volume `RENAME_SWAP`：durable tombstone 后一次原子交换 authoritative source 与字节相同 clone，原 inode 直接保留在 `tombstone-original-*`；swap 失败仍退出 91，不会假通过。精确边界 50/50 次、默认 host PASS，独立复审 `P0=0 / P1=0`。新 final exact-SHA 全绿前仍不冻结。
 
+I9 validation run `31305157950@b22bd8878fcf001b38cca275b8eddcc6e48974e8` 仍为 7/8：runner RSS `792,576,000 < 805,306,368` bytes，I8/I9 fixture 均通过；随后 mode-restore replacement 测试观察到原 source `0555` 而非 replacement `0755`，证明两步 rename 没有完成却被通用退出码 19 掩盖。I10 `2b111d351173b80575d37229ad55c13b42d8c3f9` / G10 `f7cad97` 将 mode-restore、map-root、pending-root 与 embedded-diagnostic 测试窗口统一改为同卷 `RENAME_SWAP`，增加 mode/inode/payload 方向证明，map-root mutation failure 专用退出 95。最终源码 204 次聚焦执行、默认 host、完整 Python 外层长方法 1/1（973.769 s；tag peak RSS `688,111,616` bytes）及两轮独立复审均 PASS，结论 `P0=0 / P1=0`。新 final exact-SHA 全绿前仍不冻结。
+
 Mobile V1 冻结为 Route A：
 
 ```text
@@ -34,7 +36,7 @@ True sensor Deep 不属于 Mobile V1。设备端不会在 Fast/Full 失败后重
 | RC-B01 | 代码关闭 | compiler、loader、integrity validator 和测试统一消费 shelves v2；包含物理 `shelf_segment_id`、显式 start/end/axis/normal 和跨文件关系校验 |
 | RC-B02 | 代码关闭，待新 exact-SHA 复验 | production Swift 全部登记到 RTABMapApp target；自动 membership checker 当前确认 85 个 Swift 源文件；exact-case gate 使用原始路径字符串，不再被 Windows 大小写不敏感 `Path` equality 绕过 |
 | RC-B03 | 代码关闭 | workflow 不再维护易漂移的手写 Swift parse 清单；source membership、SwiftPM lock 和 Apple build gate 分离 |
-| RC-B04 | **EXACT-SHA CI FAILED；NEW RUN REQUIRED** | run `31303500822@9478aa5981c664abb98760e24aaba2a4ec537e12` 为 7/8；RSS 与 I8 退出 94 修复均已通过，后续 tombstone 两步 replace 以 91 退出。I9 `5c576dc` / G9 `ba6104c` 已改为 atomic `RENAME_SWAP` 并完成 50 次重复/默认 host/独立复审，仍需新的 final exact-HEAD required-gate PASS |
+| RC-B04 | **EXACT-SHA CI FAILED；NEW RUN REQUIRED** | run `31305157950@b22bd8878fcf001b38cca275b8eddcc6e48974e8` 为 7/8；RSS 与 I8/I9 fixture 均通过，后续 mode-restore 两步 replace 未完成却被通用 19 掩盖。I10 `2b111d3` / G10 `f7cad97` 已统一使用 atomic `RENAME_SWAP` 并完成 204 次聚焦、完整长方法、默认 host 和独立复审，仍需新的 final exact-HEAD required-gate PASS |
 | RC-B05 | 代码关闭，RSS exact-SHA 已通过 | `StrictJSONLStreamReader` 为 64 KiB bounded streaming API；I7 消除 200k burst frame index 中 observation/view/tracking 的重复 String 保留，有限域使用单射 compact code。run `31301693439` 的 RSS `790,839,296` bytes 低于 768 MiB 门；该 run 因后续独立 fixture 失败而非 RSS 失败 |
 | RC-B06 | 代码关闭 | clock correlation writer 使用 `O_CREAT|O_EXCL|O_NOFOLLOW` 增量 JSONL，每 64 条 fsync，durable watermark 只在同步成功后推进，final partial batch 同步，parent fsync 失败阻断 |
 | RC-B07 | 代码关闭 | finalized metadata v2 严格类型化；读取正式 nested watermark `captureHealth.localizationTraceRecordCount`；metadata 有 1 MiB 上限，缺失/错误字段 fail closed |
@@ -88,6 +90,7 @@ True sensor Deep 不属于 Mobile V1。设备端不会在 Fast/Full 失败后重
 | exact-SHA run `31299358502@770d94b…` | 7/8；P0、SHA/wave、ABI、Ubuntu/Windows native 与 Python/API/Web 均 PASS；macOS/iOS 仅 200k tag-evidence RSS 超门，故该 SHA 未冻结 |
 | exact-SHA run `31301693439@a61920b…` | 7/8；200k RSS `790,839,296` bytes PASS；macOS/iOS 后续 Map quarantine delayed fixture `_exit(94)`，Apple build 未执行，故该 SHA 未冻结 |
 | exact-SHA run `31303500822@9478aa5…` | 7/8；200k RSS `793,296,896` bytes PASS，I8 delayed fixture PASS；后续 tombstone source-replace `_exit(91)`，Apple build 未执行，故该 SHA 未冻结 |
+| exact-SHA run `31305157950@b22bd887…` | 7/8；200k RSS `792,576,000` bytes PASS，I8/I9 fixtures PASS；后续 mode-restore source 仍为 `0555`，Apple build 未执行，故该 SHA 未冻结 |
 | Result quarantine focused smoke | PASS；正常隔离、intent durable→source move、source move→freeze、publish rename→freeze、根级 symlink、重启后无 hidden transaction residue |
 | Map/Result focused fault smoke | PASS；Map root/lock replacement、tombstone crash/restart、source/pending/diagnostic inode replacement；Result publication destination/source/interrupted replacement与 artifact symlink拒绝 |
 | `rtabmap-market-scanner-native-tests` | 7,878 checks，0 failures |
@@ -97,6 +100,7 @@ True sensor Deep 不属于 Mobile V1。设备端不会在 Fast/Full 失败后重
 | 300k finalization scale | 300,000 records / 114,933,372 input bytes / 114,933,372 temporary bytes；7.877 s wall / 7.871 s CPU；peak RSS 12,795,904 bytes |
 | 48 h trace transition storm | 1,728,000 records；保留 172,801 个每秒保守最坏状态 + exact final sample；0 temporary bytes；0.334 s wall / 0.337 s CPU；peak RSS 58,769,408 bytes |
 | 200k tag 全链路（I7） | 200,000 burst frames + 200,000 observations，243,952,646 input/temporary bytes；经过 strict parser、resolver、shelf association、fusion 和 quality gate；200,000 accepted observations；801.437 s wall / 800.947 s CPU；peak RSS 629,735,424 bytes（约 600.6 MiB，低于 768 MiB 门约 167.4 MiB） |
+| I10 完整 Python 外层 Swift host | 1/1 PASS；973.769 s；300,000 finalization、1,728,000 trace、200,000 burst + 200,000 observation；tag wall 852.791 s / CPU 849.930 s；peak RSS `688,111,616` bytes；最终源码另有 204 次 atomic replacement 聚焦执行 0 失败 |
 | JSONL legacy API residue | `ParsedLines` / `readLines(` 为 0 matches |
 | 静态检查 | Python compile、shell syntax、Xcode project plist、workflow YAML、`git diff --check` PASS |
 
@@ -113,6 +117,8 @@ run `31299358502` 暴露的 RSS blocker 也已完成独立只读复审：compact
 run `31301693439` 暴露的 15 ms fixture 调度竞态由 I8 关闭。独立审查确认 observer 默认 `nil`，触发点位于 `O_NOFOLLOW open/openat + fstat + expected identity` 之后、读取之前；闭包返回后原 FD 读取及 post-read pathname/inode/root sweep 均保持，throw 路径关闭 FD，worker 只有替换成功、生产拒绝且原/替换证据均存在才通过。结论 `P0=0 / P1=0`。128 MiB fixture 缩小和更具体 rejection category assertion 属 P2，已登记 `MAPCASE02_TODO.md`，本轮不扩修。
 
 run `31303500822` 暴露的 tombstone 两步 rename fixture 由 I9 改为同卷 atomic swap。独立审查确认 `.diagnostic.removing` 先 durable，swap 后 source 指向 clone、`tombstone-original-*` 指向原 inode；失败退出 91，只有交换成功才到边界 79，随后 restart 仍必须返回 19 且保留 tombstone/source/original。结论 `P0=0 / P1=0`。交换前后 inode 方向与 payload bytes 的额外显式断言登记为 P2 TODO。
+
+run `31305157950` 暴露的 mode-restore fixture 假失败/假阳性由 I10 关闭。独立复审确认 source 与预制 clone 原子交换后必须分别呈现 `0755/0555`、不同 inode、相同 payload；未触发回调或 swap 失败均不能满足断言。map-root swap failure 以专用 95 退出，不会被 worker 通用 19 掩盖；pending/embedded 两处只有 swap 与 mode 恢复全部完成才设置 `mutationPerformed`。最终复审 `P0=0 / P1=0`。lock-path rename→open 的短缺路径仅影响测试健壮性，作为 P2 登记 `MAPCASE02_TODO.md`。
 
 ## 6. 事务与审计边界
 

@@ -25,10 +25,11 @@
 - Map quarantine 的两个 descriptor-opened/read-before 确定性替换用例仍复用 `after_diagnostic_large` 创建 128 MiB payload；同步 observer 已不再依赖大文件延迟，后续改用小 fixture，并同步删除旧的 timing 说明。
 - 当前 crash-worker 断言生产拒绝、替换确实执行且原/替换证据均保留；后续再绑定稳定的 pathname/inode rejection category，防止未来由更下游校验代偿而假绿。该增强不改变现有 fail-closed 生产合同。
 - Tombstone atomic-swap fixture 后续可在 Python 侧记录交换前 source/clone 双方 inode，并在边界后精确断言交换方向、原 inode 审计路径和 payload bytes 一致；当前 syscall 语义、50 次边界重复、restart return 19 与三方证据保留已足够关闭 P1。
+- Map quarantine 的 lock-path 替换负例仍用 `RENAME_EXCL` 后 `open(O_EXCL)` 安装新 inode；生产会在下一次 descriptor/path identity 校验 fail-closed，当前用例也已稳定通过，但后续可预制 replacement 并用 `RENAME_SWAP` 消除测试自身的短暂缺路径窗口。
 
 ## 延期测试（2026-08-10 起执行）
 
-- 在 I9 final exact SHA 上重新完整运行 `IOSCoreContractTests.test_swift_workflow_state_and_se2_projection`；run `31303500822` 已完成 300k finalization、1,728,000 trace、200k tag-evidence RSS 和 I8 fixture，但被随后已修复的 tombstone fixture 91 退出阻断，不能登记为 final exact-SHA PASS。
+- 在 I10 final exact SHA 上重新完整运行 `IOSCoreContractTests.test_swift_workflow_state_and_se2_projection`；本机当前源码已 1/1 PASS（973.769 s），但 run `31305157950@b22bd887…` 仍是 I9 SHA 的 7/8 失败证据，不能登记为 I10 final exact-SHA PASS。
 - 在依赖齐全的 clean runner 补齐 `Eigen/PCL/OpenCV` 后完成 iphoneos 与 iphonesimulator Release clean compile-link；当前本机只通过 Xcode project/SwiftPM 解析，完整 build 在缺失 `Eigen/Core` 处停止。
 - 执行真实 LiDAR iPhone、30 秒连续性、内存/thermal/background/provider、Device Lab、Replay/FAR、Sam 同路线和正式现场控制点矩阵。
 - 对 MapCase02 执行更多设备端 package discover/import、长时间 scan matcher 和真实地图点击/定位回放，不把 host suite 当作真机证据。
