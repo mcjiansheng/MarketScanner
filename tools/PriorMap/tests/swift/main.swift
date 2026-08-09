@@ -15844,27 +15844,17 @@ func runMapQuarantineCrashWorkerIfRequested() {
                       .afterSourceThawBeforePayloadRename):
                     let displaced = coordinationRoot.appendingPathComponent(
                         "map-root-open-displaced", isDirectory: true)
-                    let replacement = coordinationRoot.appendingPathComponent(
-                        "map-root-open-replacement", isDirectory: true)
+                    try FileManager.default.copyItem(
+                        at: mapRoot, to: displaced)
                     guard renameatx_np(
                         AT_FDCWD, mapRoot.path,
                         AT_FDCWD, displaced.path,
-                        UInt32(RENAME_EXCL)) == 0 else {
-                        throw NSError(
-                            domain: "MapQuarantineCrashWorker", code: 12,
-                            userInfo: [NSLocalizedDescriptionKey:
-                                "cannot displace opened map root"])
-                    }
-                    try FileManager.default.copyItem(
-                        at: displaced, to: replacement)
-                    guard renameatx_np(
-                        AT_FDCWD, replacement.path,
-                        AT_FDCWD, mapRoot.path,
-                        UInt32(RENAME_EXCL)) == 0 else {
-                        throw NSError(
-                            domain: "MapQuarantineCrashWorker", code: 13,
-                            userInfo: [NSLocalizedDescriptionKey:
-                                "cannot install replacement map root"])
+                        UInt32(RENAME_SWAP)) == 0 else {
+                        // The worker's outer catch intentionally maps
+                        // production rejection to 19.  Use a distinct exit
+                        // for fixture mutation failure so the host test cannot
+                        // mistake a failed swap for the expected rejection.
+                        Darwin._exit(95)
                     }
                 case ("replace_map_lock_after_acquire",
                       .afterSourceThawBeforePayloadRename):
@@ -15917,12 +15907,10 @@ func runMapQuarantineCrashWorkerIfRequested() {
             }
         }
         if phase == "recover_replace_after_mode_restore" {
-            let replacement = source.deletingLastPathComponent()
-                .appendingPathComponent("replacement-\(packageSHA)", isDirectory: true)
             let displaced = source.deletingLastPathComponent()
                 .appendingPathComponent("displaced-\(packageSHA)", isDirectory: true)
-            try FileManager.default.copyItem(at: source, to: replacement)
-            guard chmod(replacement.path, mode_t(0o755)) == 0 else {
+            try FileManager.default.copyItem(at: source, to: displaced)
+            guard chmod(displaced.path, mode_t(0o755)) == 0 else {
                 throw NSError(
                     domain: "MapQuarantineCrashWorker", code: 8,
                     userInfo: [NSLocalizedDescriptionKey:
@@ -15932,14 +15920,15 @@ func runMapQuarantineCrashWorkerIfRequested() {
                 guard case .afterRollbackSourceModeRestoreBeforeIntentRemoval = point else {
                     return
                 }
+                // Exchange the diagnostic-bound source and its byte-identical
+                // clone atomically.  A two-rename replacement has an
+                // avoidable missing-path window and can fail between renames
+                // under hosted APFS scheduling; RENAME_SWAP leaves both
+                // identities present for the subsequent assertions.
                 guard renameatx_np(
                     AT_FDCWD, source.path,
                     AT_FDCWD, displaced.path,
-                    UInt32(RENAME_EXCL)) == 0,
-                      renameatx_np(
-                        AT_FDCWD, replacement.path,
-                        AT_FDCWD, source.path,
-                        UInt32(RENAME_EXCL)) == 0 else {
+                    UInt32(RENAME_SWAP)) == 0 else {
                     throw NSError(
                         domain: "MapQuarantineCrashWorker", code: 9,
                         userInfo: [NSLocalizedDescriptionKey:
@@ -16017,17 +16006,13 @@ func runMapQuarantineCrashWorkerIfRequested() {
                 phase == "recover_replace_pending_after_open"
                     ? "pending-root-open-original"
                     : "embedded-diagnostic-original")
-            let replacement = coordinationRoot.appendingPathComponent(
-                phase == "recover_replace_pending_after_open"
-                    ? "pending-root-open-replacement"
-                    : "embedded-diagnostic-replacement")
             if phase == "recover_replace_pending_after_open" {
-                try FileManager.default.copyItem(at: pending, to: replacement)
+                try FileManager.default.copyItem(at: pending, to: displaced)
             } else {
                 let diagnostic = pending.appendingPathComponent(
                     MobileMapLibrary.quarantineDiagnosticFileName)
-                try FileManager.default.copyItem(at: diagnostic, to: replacement)
-                guard chmod(replacement.path, mode_t(0o444)) == 0 else {
+                try FileManager.default.copyItem(at: diagnostic, to: displaced)
+                guard chmod(displaced.path, mode_t(0o444)) == 0 else {
                     throw NSError(
                         domain: "MapQuarantineCrashWorker", code: 19,
                         userInfo: [NSLocalizedDescriptionKey:
@@ -16043,11 +16028,7 @@ func runMapQuarantineCrashWorkerIfRequested() {
                     guard renameatx_np(
                         AT_FDCWD, pending.path,
                         AT_FDCWD, displaced.path,
-                        UInt32(RENAME_EXCL)) == 0,
-                          renameatx_np(
-                            AT_FDCWD, replacement.path,
-                            AT_FDCWD, pending.path,
-                            UInt32(RENAME_EXCL)) == 0 else {
+                        UInt32(RENAME_SWAP)) == 0 else {
                         throw NSError(
                             domain: "MapQuarantineCrashWorker", code: 20,
                             userInfo: [NSLocalizedDescriptionKey:
@@ -16061,11 +16042,7 @@ func runMapQuarantineCrashWorkerIfRequested() {
                           renameatx_np(
                             AT_FDCWD, diagnostic.path,
                             AT_FDCWD, displaced.path,
-                            UInt32(RENAME_EXCL)) == 0,
-                          renameatx_np(
-                            AT_FDCWD, replacement.path,
-                            AT_FDCWD, diagnostic.path,
-                            UInt32(RENAME_EXCL)) == 0,
+                            UInt32(RENAME_SWAP)) == 0,
                           chmod(pending.path, mode_t(0o555)) == 0 else {
                         throw NSError(
                             domain: "MapQuarantineCrashWorker", code: 21,

@@ -3628,8 +3628,14 @@ class IOSCoreContractTests(unittest.TestCase):
                     binding_result.stderr + binding_result.stdout,
                 )
                 self.assertTrue(binding_root.exists())
-                self.assertTrue((binding_root.parent / displaced_name).exists())
-                if binding_phase == "replace_map_lock_after_acquire":
+                displaced_binding = binding_root.parent / displaced_name
+                self.assertTrue(displaced_binding.exists())
+                if binding_phase == "replace_map_root_after_open":
+                    self.assertNotEqual(
+                        binding_root.stat().st_ino,
+                        displaced_binding.stat().st_ino,
+                    )
+                else:
                     canonical_lock = binding_root / ".map-library.lock"
                     displaced_lock = binding_root.parent / displaced_name
                     self.assertTrue(canonical_lock.is_file())
@@ -4068,8 +4074,24 @@ class IOSCoreContractTests(unittest.TestCase):
             in_recovery_source = (
                 in_recovery_root / "packages" / prior_map_id / package_sha
             )
+            in_recovery_displaced = (
+                in_recovery_source.parent / f"displaced-{package_sha}"
+            )
             self.assertTrue(in_recovery_source.is_dir())
+            self.assertTrue(in_recovery_displaced.is_dir())
             self.assertEqual(in_recovery_source.stat().st_mode & 0o777, 0o755)
+            self.assertEqual(
+                in_recovery_displaced.stat().st_mode & 0o777,
+                0o555,
+            )
+            self.assertNotEqual(
+                in_recovery_source.stat().st_ino,
+                in_recovery_displaced.stat().st_ino,
+            )
+            self.assertEqual(
+                (in_recovery_source / "payload.bin").read_bytes(),
+                (in_recovery_displaced / "payload.bin").read_bytes(),
+            )
             in_recovery_quarantine = (
                 in_recovery_root / "quarantine" / prior_map_id
             )
