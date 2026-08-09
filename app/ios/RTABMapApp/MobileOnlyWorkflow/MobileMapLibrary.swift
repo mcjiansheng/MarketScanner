@@ -74,6 +74,7 @@ enum MobileMapLibrary {
         case packageVerificationFailed(String)
         case cannotMakeImmutable(String)
         case cannotSync(String)
+        case noncanonicalPackageDirectorySpelling(expected: String, actual: String)
         case registryGenerationConflict(expected: Int, actual: Int)
 
         var errorDescription: String? {
@@ -88,6 +89,9 @@ enum MobileMapLibrary {
             case .packageVerificationFailed(let d): return "地图包验证失败：\(d)"
             case .cannotMakeImmutable(let d): return "地图包置为只读失败：\(d)"
             case .cannotSync(let d): return "文件同步失败：\(d)"
+            case .noncanonicalPackageDirectorySpelling(let expected, let actual):
+                return "检测到旧开发版地图目录大小写冲突：实际 \(actual)，"
+                    + "当前应为 \(expected)。请保留原始扫描证据并重新导入地图。"
             case .registryGenerationConflict(let expected, let actual):
                 return "注册表代际冲突：期望 \(expected) 实际 \(actual)"
             }
@@ -330,6 +334,24 @@ enum MobileMapLibrary {
         return directory
     }
 
+    /// Rejects an on-disk case-fold alias before a canonical lowercase ID is
+    /// used as a path. Default iOS/APFS volumes are case-insensitive, so an
+    /// old `Piaseczno-*` directory could otherwise silently receive a new
+    /// `piaseczno-*` package and later disappear during registry rebuild.
+    private static func rejectNoncanonicalDirectorySpelling(
+        priorMapID: String,
+        packagesRoot: URL
+    ) throws {
+        let names = try FileManager.default.contentsOfDirectory(
+            atPath: packagesRoot.path)
+        if let actual = names.first(where: {
+            $0 != priorMapID && $0.lowercased() == priorMapID
+        }) {
+            throw LibraryError.noncanonicalPackageDirectorySpelling(
+                expected: priorMapID, actual: actual)
+        }
+    }
+
     /// §14.2: identity safety is enforced at the boundary; a caller may
     /// only ever address `<safe-id>/<sha256>` package paths.
     static func packageDirectory(priorMapID: String, packageSHA: String) throws -> URL {
@@ -339,7 +361,10 @@ enum MobileMapLibrary {
         guard isSHA256(packageSHA) else {
             throw LibraryError.unsafeIdentifier(packageSHA)
         }
-        return try packagesRoot()
+        let root = try packagesRoot()
+        try rejectNoncanonicalDirectorySpelling(
+            priorMapID: priorMapID, packagesRoot: root)
+        return root
             .appendingPathComponent(priorMapID, isDirectory: true)
             .appendingPathComponent(packageSHA, isDirectory: true)
     }
@@ -475,7 +500,15 @@ enum MobileMapLibrary {
         expectedElementCount: Int? = nil,
         expectedCanonicalSourceSHA256: String? = nil
     ) throws -> String {
-        try verifyContainment(at: packageURL, under: packagesRoot())
+        let expectedPackageURL = try packageDirectory(
+            priorMapID: priorMapID, packageSHA: packageSHA256)
+        guard packageURL.standardizedFileURL.path
+                == expectedPackageURL.standardizedFileURL.path else {
+            throw LibraryError.packageNotContained(packageURL.path)
+        }
+        try verifyContainment(
+            at: packageURL, under: expectedPackageURL.deletingLastPathComponent()
+                .deletingLastPathComponent())
         let digest: String
         do {
             digest = try PriorMapPackageIntegrity.validate(directory: packageURL)
@@ -633,6 +666,8 @@ enum MobileMapLibrary {
                 throw LibraryError.registryCorrupt(
                     "\(url.path): entry \(index) invalid")
             }
+            try rejectNoncanonicalDirectorySpelling(
+                priorMapID: priorMapID, packagesRoot: packagesRoot)
             // Rebuild the URL from the validated identity instead of
             // trusting the stored relative path.
             result.append(MapEntry(
@@ -751,7 +786,14 @@ enum MobileMapLibrary {
         var entries: [MapEntry] = []
         let ids = try fileManager.contentsOfDirectory(atPath: root.path).sorted()
         for priorMapID in ids {
-            guard isSafeIdentifier(priorMapID) else { continue }
+            guard isSafeIdentifier(priorMapID) else {
+                let folded = priorMapID.lowercased()
+                if folded != priorMapID, isSafeIdentifier(folded) {
+                    throw LibraryError.noncanonicalPackageDirectorySpelling(
+                        expected: folded, actual: priorMapID)
+                }
+                continue
+            }
             let idDir = root.appendingPathComponent(priorMapID)
             var isDirectory: ObjCBool = false
             guard fileManager.fileExists(atPath: idDir.path, isDirectory: &isDirectory),

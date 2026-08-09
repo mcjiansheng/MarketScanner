@@ -80,7 +80,7 @@ PriorMap-<id>/
   validation_report.json
 ```
 
-正式包 `prior_map_id` 为安全文件名化的 `map_name` 加 `canonical_source_sha256` 前 12 位；历史包仍保留旧源 SHA 规则。所有 JSON 使用 UTF-8、严格 JSON scalar 和排序 key，不写入当前时间，因此相同输入和参数产生逐字节相同输出。
+正式包 `prior_map_id` 为 canonical filesystem slug 加 `canonical_source_sha256` 前 12 位。slug 只从原始名称保留 ASCII `A-Z/a-z/0-9/._-`，连续其他字符折叠为 `-`，去除首尾 `-` 后仅对保留下来的 ASCII 大写做小写映射，主体最长 115 字符；空结果回退 `map`，因此最终 `<slug>-<12hex>` 最长 128 字符并可直接作为 MobileMapLibrary 路径。PC 与 Swift 必须执行同一顺序，不能先做 Unicode lowercase。历史 package v1 保留旧源 SHA 规则；pre-canonical uppercase v2 包在普通 validator、旧 iOS 加载向导和 PC 离线定位中一律拒绝，只能通过显式 diagnostic-only 开关做只读完整性检查，不能作为路径 authority 或新扫描输入，必须从原始地图重新导入。所有 JSON 使用 UTF-8、严格 JSON scalar 和排序 key，不写入当前时间，因此相同输入和参数产生逐字节相同输出。
 
 `package_manifest.json` 是手机和 PC 共用的规范完整性入口，精确列出包内每个权威文件的文件名、字节数、SHA‑256、媒体类型以及 JSON 格式/版本，并记录规范化 `package_sha256`。清单不自哈希；包 hash 按清单顺序对 `file/bytes/sha256/format/version` 计算。macOS 在外置盘上生成的 `._*` AppleDouble 旁车和 `.DS_Store` 不属于地图包权威内容，PC 生成/验证和 iOS 导入会一致忽略；其他额外普通文件仍会触发文件集合不一致。iOS 在显示“完整性通过”前必须完成全部摘要和下述跨文件关系校验。
 
@@ -116,7 +116,7 @@ PriorMap-<id>/
 
 ## MapCase02 冻结证据（2026-08-09）
 
-`MAPCASE02 / STANDARD SUPERMARKET XLSX FORMAT PASS` 是正式工作簿局部链路结论：`Piaseczno / CAPL.2794 / 13129 cm × 8770 cm / scale 20`，源元素 1838、active 1630、货架 1301、固定结构 329、展示审计 208、越界 0。canonical SHA 为 `5ddfac7dc439afc45abdcf800b799c05d53704895b620d161ef08a442c55b2db`，Swift package SHA 为 `5cc223ca505d72158748caf5a0efc540f870ea6d9858fee1572e9f570a69b72a`，PC preview SHA 为 `d0c02be63dff3ab002dcf931ce7d0c5149152b78bea139fb1b0a2d86be196a18`。
+`MAPCASE02 / STANDARD SUPERMARKET XLSX FORMAT PASS` 是正式工作簿局部链路结论：`Piaseczno / CAPL.2794 / 13129 cm × 8770 cm / scale 20`，源元素 1838、active 1630、货架 1301、固定结构 329、展示审计 208、越界 0。canonical ID 为 `piaseczno-5ddfac7dc439`，canonical SHA 为 `5ddfac7dc439afc45abdcf800b799c05d53704895b620d161ef08a442c55b2db`，Swift package SHA 为 `8d3564ce68aadb087a2820a02b4747d15ea1f4d22b14e8776f913d33775b1b84`，PC package SHA 为 `41332d093e652ec2de94f0f86b8f15107cd6f67f3b2e5ddec1c0685ab4d7d3be`，PC preview SHA 为 `d0c02be63dff3ab002dcf931ce7d0c5149152b78bea139fb1b0a2d86be196a18`。manifest/report 所有计数必须是严格 JSON integer，warnings/malformed rows 必须是数组；`validation_report.summary` 还必须包含与 `road_graph.json` 精确一致的 `node_count`/`edge_count`。Swift 正式套件继续执行完整性 mutation、实际地图库安装/注册/列表/exact ID/SHA 读取，并由 Python production validator 直接复核 Swift 包。
 
 该 PASS 不扩大为产品发布资格。整体仍为 **REJECTED / NO-GO / developer smoke only**，J-04 为 **BLOCKER / NOT CLOSED**。
 

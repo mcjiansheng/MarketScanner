@@ -11,7 +11,7 @@
 
 ## 1. 结论和产品边界
 
-本轮新增局部结论：`MAPCASE02 / STANDARD SUPERMARKET XLSX FORMAT PASS`。正式 MapCase02 源 SHA `1ddf428fc4dd6e4e8bd33258d0cbfaab87b809c4dedd6b8baca9e167c14b5e6a`，源/active/shelf/fixed/road/presentation 为 `1838/1630/1301/329/0/208`，active 越界 0；canonical `5ddfac7dc439afc45abdcf800b799c05d53704895b620d161ef08a442c55b2db`、Swift package `5cc223ca505d72158748caf5a0efc540f870ea6d9858fee1572e9f570a69b72a`、preview `d0c02be63dff3ab002dcf931ce7d0c5149152b78bea139fb1b0a2d86be196a18`。该结论不改变下述 RC 产品边界。
+本轮新增局部结论：`MAPCASE02 / STANDARD SUPERMARKET XLSX FORMAT PASS`。正式 MapCase02 源 SHA `1ddf428fc4dd6e4e8bd33258d0cbfaab87b809c4dedd6b8baca9e167c14b5e6a`，源/active/shelf/fixed/road/presentation 为 `1838/1630/1301/329/0/208`，active 越界 0；canonical ID `piaseczno-5ddfac7dc439`、canonical `5ddfac7dc439afc45abdcf800b799c05d53704895b620d161ef08a442c55b2db`、Swift package `8d3564ce68aadb087a2820a02b4747d15ea1f4d22b14e8776f913d33775b1b84`、PC package `41332d093e652ec2de94f0f86b8f15107cd6f67f3b2e5ddec1c0685ab4d7d3be`、PC preview `d0c02be63dff3ab002dcf931ce7d0c5149152b78bea139fb1b0a2d86be196a18`。真机发现并关闭 compiler uppercase ID 与 MobileMapLibrary lowercase 路径合同断层；Swift `validation_report` 现精确绑定 road graph node/edge 计数，手机包也必须通过 Python production validator；四张真实 XLSX 均通过 PC validator 和 Swift install/register/list/exact-read。该结论不改变下述 RC 产品边界。
 
 本分支已关闭第二次独立审查中的大部分正确性、事务、安全、规模及审计缺口，并积累了本地主机 developer-smoke 回归。底层事务加固实现为 `f0ffcec4480ce04ac61f3a8aad2453e5b4b27a35`，ESL 核心 I3 为 `fdcc5c87005a0128e0654eb43b1364898edd8f5d`；Result recovery implementation I5 为 `4d78d4646c01fe50bc0ac07eb2266879a24348db`，ESL follow-up I6 为 `396097ea474be2e1155098cd709d1edfa9064a83`。MapCase02 validation HEAD `770d94b078a0dd94653b9d6b33576890f88f7296` 的 exact-SHA run `31299358502` 为 7/8：唯一失败是 macOS/iOS 200k tag-evidence 峰值 RSS `812,892,160` bytes 超过 `768 MiB` 门。I7 `cbba284ad1b0694f5302ec3abbb9a446d9d3a970` 删除 burst frame index 中重复 String 并保持 exact-match/duplicate/unconsumed 合同；replacement run `31301693439@a61920b995d8c95d10e5353bfd593a21a941c1c9` 的 RSS 已通过（`790,839,296 < 805,306,368` bytes），但随后 Map quarantine delayed-replacement fixture 因固定 `asyncAfter(15 ms)` 调度错位以 94 退出，故仍为 7/8，未进入 Apple build。当前 I8 `0a3606ecd4e06086ea95c0ab99d92f4e80fcc2dc` / G8 `fc495be` 用默认 `nil` 的 descriptor-opened/read-before host 同步点替代任意延迟；production 仍沿原 FD 读取并执行 post-read pathname/inode 复核。两个原失败场景各 10 轮、共 20 次无失败，默认 host PASS，独立复审 `P0=0 / P1=0`。evidence 文档由后续纯治理提交绑定到 `validation_sha`，精确值以 `.github/marketscanner-repair-v2-wave.json` 为唯一事实源；新的 final exact-SHA required run 全绿前不得创建冻结标签。该结论仍不是 release PASS；J-04 absolute-prior `same floor/map/component`、Apple/设备/现场资格均未关闭。
 
@@ -84,11 +84,11 @@ True sensor Deep 不属于 Mobile V1。设备端不会在 Fast/Full 失败后重
 | 验证 | 结果 |
 | --- | --- |
 | `IOSCoreContractTests.test_swift_workflow_state_and_se2_projection` | I5 **PASS**；943.159 s；覆盖 default E2E、§18、Snapshot/Result/Map crash matrix、300k finalization、1,728,000 trace、400k tag evidence |
-| PriorMap Python 分组 | 非超长 217 项 PASS；完整 discover 长方法已通过 300k finalization/1,728,000 trace，主动停在 `tag-evidence-scale`，不登记完整 PASS |
+| PriorMap Python 分组 | 既有非超长 217 项 PASS；本轮正式 PC frozen-golden、canonical ID 与严格 report/manifest 计数增量的相关分组 52/52 PASS。完整 discover 不在本轮重复登记 |
 | `IOSCoreContractTests` portability targeted rerun | 2 tests，PASS；1122.825 s；覆盖 immutable snapshot E2E、300k finalization、1,728,000 trace storm、200k frame + 200k observation tag scale |
 | `python3 -m unittest discover -s tools/Qualification/tests -v` | 28 tests，PASS；7.663 s；包含 Snapshot/Result acquisition 与最终 process-lock pathname/root replacement |
-| `python3 -m unittest discover -s tools/SupermarketMapStudio/tests -v` | 108 tests，PASS |
-| MapCase02 Swift/PC | `--mapcase02-suite` PASS；PC conversion + validator `valid=true`；canonical/package/preview golden 未漂移 |
+| `python3 -m unittest discover -s tools/SupermarketMapStudio/tests -v` | 109 tests，PASS |
+| MapCase02 Swift/PC | `--mapcase02-suite` PASS；PC conversion + validator `valid=true`；canonical/preview 未漂移，Swift/PC package golden 已按 lowercase ID 更新并由 exact assertion 冻结；旧 uppercase v2 production 拒绝、diagnostic-only 检查 PASS |
 | exact-SHA run `31299358502@770d94b…` | 7/8；P0、SHA/wave、ABI、Ubuntu/Windows native 与 Python/API/Web 均 PASS；macOS/iOS 仅 200k tag-evidence RSS 超门，故该 SHA 未冻结 |
 | exact-SHA run `31301693439@a61920b…` | 7/8；200k RSS `790,839,296` bytes PASS；macOS/iOS 后续 Map quarantine delayed fixture `_exit(94)`，Apple build 未执行，故该 SHA 未冻结 |
 | exact-SHA run `31303500822@9478aa5…` | 7/8；200k RSS `793,296,896` bytes PASS，I8 delayed fixture PASS；后续 tombstone source-replace `_exit(91)`，Apple build 未执行，故该 SHA 未冻结 |
@@ -114,7 +114,7 @@ True sensor Deep 不属于 Mobile V1。设备端不会在 Fast/Full 失败后重
 
 最终关键生产增量已完成两轮只读审查。I5 复审确认 timer bounded poll 仍由真实 production timer 提供证据，worker default-only guard 不跳过主路径；mismatched Result removal tombstone 永久 conflict quarantine 不会误伤 identity 匹配的合法 cleanup，也不会让 replacement inode 重获 canonical authority。最终结论为 `P0=0 / P1=0`；cadence/override 和更深 recovery evidence 正反例是可延期 P2，已登记 TODO。该结论仍不是 release review PASS：完整 PriorMap discover、exact-SHA、J-04、ACL/file-flags与外部资格门仍未关闭。
 
-MapCase02 另行完成完整只读 P0/P1 审查。发现并关闭角色几何 fail-open、canonical/source identity 未重算、relationship/worksheet alias、row/cell crash、严格整数 parity、distance OOM、shelf/graph/spatial/distance 派生工件未绑定，以及 workbook 元数据 O(N²)/无数量门、PC XML authority、v2 六字段 bounds、`center_m/yaw_rad` 数值 parity 和重复 stable business identity 等问题；最终复审为 `P0=0 / P1=0`。空行 parity、数值 code/crossCodes、XML 预扫描内存、UI/preview/visual baseline 和完整长/真机矩阵登记在 `MAPCASE02_TODO.md`。
+MapCase02 另行完成完整只读 P0/P1 审查。发现并关闭角色几何 fail-open、canonical/source identity 未重算、relationship/worksheet alias、row/cell crash、严格整数 parity、distance OOM、shelf/graph/spatial/distance 派生工件未绑定，以及 workbook 元数据 O(N²)/无数量门、PC XML authority、v2 六字段 bounds、`center_m/yaw_rad` 数值 parity、重复 stable business identity、compiler uppercase 与 library lowercase 合同断层、frozen package SHA 假绿、legacy uppercase v2 从通用 validator 泄漏到生产加载/离线处理，以及 validation report 缺 road graph 计数和 Python 把 bool/integral-float 当作 manifest/report integer 的跨端 fail-open。当前 production validator 默认只接受 canonical lowercase v2；旧 uppercase v2 仅可显式 diagnostic-only 只读检查；manifest/report count、warnings 与 malformed rows 在 Swift/Python 两端共同严格校验。空行 parity、数值 code/crossCodes、XML 预扫描内存、UI/preview/visual baseline、case-fold 大规模枚举和完整真机矩阵登记在 `MAPCASE02_TODO.md`。
 
 run `31299358502` 暴露的 RSS blocker 也已完成独立只读复审：compact frame 表示对 view/tracking 的编码域完整且单射，observation lookup、逐字段 exact binding、burst identity、duplicate/already-consumed 和 remaining-frame 检查均未放宽；未发现新增崩溃、并发或无界内存路径，结论为 `P0=0 / P1=0`。该审查只覆盖 I7 增量，不能替代 exact-SHA CI、Apple clean link 或真机资格。
 

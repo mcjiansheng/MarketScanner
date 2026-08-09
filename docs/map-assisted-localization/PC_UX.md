@@ -14,7 +14,7 @@ Map Studio 保留单设备、多设备和“导入/管理先验地图”入口�
 
 地图包成果只通过 artifact allowlist 读取；源 XLSX 不修改。界面说明阶段二有界 LiDAR 结构匹配已经实现，但真实 LiDAR 现场验收仍未完成。
 
-MapCase02 已在 2026-08-09 通过 PC 转换、v2 schema、确定性 canonical/preview 与跨端 golden；该结论只覆盖标准工作簿导入/编译链路。更广产品仍是 **REJECTED / NO-GO / developer smoke only**，J-04 未关闭。
+MapCase02 已在 2026-08-09 通过 PC 转换、v2 schema、确定性 canonical/preview 与跨端 frozen golden；手机 host 还完成 compile → integrity → content-addressed install → register → list → exact ID/SHA read。四张真实 XLSX library smoke 通过，但这仍是 host 标准工作簿链路证据，真机重新导入、LiDAR 和现场资格尚未完成；更广产品仍是 **REJECTED / NO-GO / developer smoke only**，J-04 未关闭。PC 离线定位使用 production-default validator，旧 uppercase v2 开发包必须重新导入，不能通过 diagnostic-only 选项进入处理。
 
 ## 地图辅助会话向导
 

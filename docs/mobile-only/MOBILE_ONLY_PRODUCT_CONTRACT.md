@@ -35,7 +35,7 @@ Mobile V1 只承诺 `Fast reduced graph`，以及 Fast 质量失败后至多一�
 - 支持 `.xlsx` / `.csv` / `.json` 三种格式，从 Files 应用经 security-scoped document picker 选择。
 - 正式 `Basic Info + Element Info` XLSX 从 `Basic Info` 取得 `storeCode`、`map_name`、画布和可选 scale；UI/CLI 门店与名称只能省略或作为 exact assertion，不能覆盖。CSV、legacy Element-only XLSX 与缺少内嵌 identity 的 JSON 仍必须显式提供 `store_id` 和地图名称。业务标识统一要求 NFC、非空、无首尾空白/控制字符/隐藏 basename/路径分隔符，`store_id` 最多 128 UTF-8 bytes，地图名称最多 200 UTF-8 bytes。
 - 选中的文件通过 no-follow、regular-file、单 hardlink、前后 inode/size/mtime/ctime 一致性检查复制到 App 私有 staging；复制使用 bounded chunk、`O_EXCL`、data fsync 与 parent-directory fsync。后续不再读取 provider 原路径；复制失败只清理本次新建 staging 文件，不建立地图记录。
-- 正式 workbook 解析为 canonical source v3 并编译为 package manifest v2；历史输入保留 v1/v2 明确兼容，不能把旧坐标或身份规则隐式升级。
+- 正式 workbook 解析为 canonical source v3 并编译为 package manifest v2。新生成 v2 的 `prior_map_id` 使用 lowercase、最长 115 字符的 ASCII slug 加 12 位 canonical SHA，最终路径 ID 不超过 128；Swift/PC 必须先过滤原始 Unicode 再做 ASCII lowercase。历史 v1 内容继续按冻结合同读取；pre-canonical uppercase v2 包只允许显式 diagnostic-only 完整性检查，普通 iOS/PC validator、旧向导、离线定位和 MobileMapLibrary 全部拒绝，不能隐式重写或复用 exact ID/SHA。旧包与无 generation 的旧开发 registry 必须保留原始证据并从原始地图重新导入。
 - 坐标合同：源文件必须显式或通过用户预设得到 unit/origin/x_axis/y_axis/rotation。V1 提供两个用户可理解的预设：
   - 门店图：左上角为原点（unit=centimetre, origin=top_left, x=right, y=down, rotation=clockwise_degrees）
   - CAD 图：左下角为原点（origin=bottom_left, y=up）
@@ -65,6 +65,7 @@ XLSX 的 `floor` / `element` 单元格使用公式一律拒绝（`map_source_for
 ## 4. 手机 PriorMap 编译器（Track B2）
 
 - 输入 canonical source，输出自校验 prior-map package（元素/货架/固定结构/路网/空间索引/距离场/预览/manifest/validation report/package manifest）。
+- 生成层与安装层共享 `[a-z0-9._-]`、最大 128 字符的路径身份合同；`packageDirectory`、register、verify、registry read/rebuild 在写入或恢复前拒绝大小写折叠后相同但磁盘拼写不同的旧目录，不能让新 lower ID 写入旧 uppercase APFS 别名。
 - `manifest.json` 必须绑定同一 `store_id` 和安全地图名称；`shelves.json` 使用 schema v2，每个物理货架段具有不可混用的 `shelf_segment_id`、start/end、longitudinal axis、front/back normal 与方向来源。`shelf_code` 只是显示标签，不是物理唯一键。
 - 与 PC 编译器共享数据契约：元素 ID `f<floor>-r<row>`、六类元素（MapShelf/MapTable/MapPillar/MapTableFeature/MapCross/MapRoadPoint）、坐标变换 `x_m=x_cm/100; y_m=-y_cm/100; yaw_rad=-rotation_deg*pi/180`、路网统计、5 m 空间索引、距离场（0.40/0.20/0.10 m，2 m truncation，row_rle_u8_cm，per-level `data_sha256`）。
 - 距离场 `data_sha256` 与 PC oracle 字节级一致（已验证 fixture 6 个 level 全匹配）。

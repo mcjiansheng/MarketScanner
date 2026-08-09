@@ -44,6 +44,11 @@ PACKAGE_MANIFEST_FILE = "package_manifest.json"
 # element_roles.py instead of maintaining another role table here.
 SUPPORTED_TYPES = set(ACTIVE_TYPES)
 SAFE_NAME = re.compile(r"[^A-Za-z0-9._-]+")
+MAXIMUM_PRIOR_MAP_ID_LENGTH = 128
+PRIOR_MAP_ID_HASH_PREFIX_LENGTH = 12
+MAXIMUM_PRIOR_MAP_SLUG_LENGTH = (
+    MAXIMUM_PRIOR_MAP_ID_LENGTH - PRIOR_MAP_ID_HASH_PREFIX_LENGTH - 1
+)
 PACKAGE_FILES = {
     PACKAGE_MANIFEST_FILE,
     "manifest.json",
@@ -63,6 +68,29 @@ MAXIMUM_MAP_NAME_UTF8_BYTES = 200
 
 class PriorMapValidationError(ValueError):
     pass
+
+
+def canonical_safe_name(value: Any, fallback: str = "map") -> str:
+    """Return the canonical lowercase filesystem slug used by map packages."""
+
+    # Filter original Unicode scalars before ASCII lowercasing. Python's full
+    # Unicode lower() can otherwise create ASCII bytes that Swift never sees
+    # (for example U+0130 or the Kelvin sign), breaking cross-end IDs.
+    filtered = SAFE_NAME.sub("-", str(value)).strip("-")
+    lowered = filtered.translate(
+        str.maketrans(
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZ",
+            "abcdefghijklmnopqrstuvwxyz",
+        )
+    )
+    bounded = lowered[:MAXIMUM_PRIOR_MAP_SLUG_LENGTH].rstrip("-")
+    return bounded or fallback
+
+
+def legacy_safe_name(value: Any, fallback: str = "map") -> str:
+    """Return the pre-canonical v2 slug for read-only compatibility."""
+
+    return SAFE_NAME.sub("-", str(value)).strip("-") or fallback
 
 
 def _valid_business_identity_component(value: Any, maximum_utf8_bytes: int) -> bool:
@@ -859,7 +887,11 @@ def _indexed_identifiers(
     return result
 
 
-def validate_package(directory: Path | str) -> dict[str, Any]:
+def validate_package(
+    directory: Path | str,
+    *,
+    allow_legacy_v2_identifier_for_diagnostics: bool = False,
+) -> dict[str, Any]:
     root = Path(directory)
     errors: list[dict[str, str]] = []
     warnings: list[dict[str, str]] = []
@@ -981,12 +1013,23 @@ def validate_package(directory: Path | str) -> dict[str, Any]:
                 }
             )
         else:
-            base_name = SAFE_NAME.sub("-", str(manifest.get("name", ""))).strip("-") or "map"
-            if manifest.get("prior_map_id") != f"{base_name}-{canonical_hash[:12]}":
+            suffix = canonical_hash[:PRIOR_MAP_ID_HASH_PREFIX_LENGTH]
+            accepted_ids = {
+                f"{canonical_safe_name(manifest.get('name', ''))}-{suffix}",
+            }
+            if allow_legacy_v2_identifier_for_diagnostics:
+                accepted_ids.add(
+                    f"{legacy_safe_name(manifest.get('name', ''))}-{suffix}"
+                )
+            if manifest.get("prior_map_id") not in accepted_ids:
                 errors.append(
                     {
                         "code": "map_id",
-                        "message": "v2 prior_map_id 未绑定 canonical source SHA-256。",
+                        "message": (
+                            "v2 prior_map_id 未绑定 canonical lowercase slug 与 "
+                            "canonical source SHA-256；旧 uppercase 开发包只能"
+                            "通过显式只读诊断模式检查，不能用于加载或定位。"
+                        ),
                     }
                 )
         expected_source_coordinate_system = {
@@ -1201,20 +1244,36 @@ def validate_package(directory: Path | str) -> dict[str, Any]:
                 }
             )
 
-    if manifest.get("element_count") != len(elements):
+    if (
+        type(manifest.get("element_count")) is not int
+        or manifest.get("element_count") != len(elements)
+    ):
         errors.append({"code": "element_count", "message": "manifest 元素数量与 elements.json 不一致。"})
     expected_statistics: dict[str, int] = {}
     for element in elements:
         if isinstance(element, dict):
             shape_type = str(element.get("shape_type"))
             expected_statistics[shape_type] = expected_statistics.get(shape_type, 0) + 1
-    if manifest.get("element_statistics") != dict(sorted(expected_statistics.items())):
+    declared_statistics = manifest.get("element_statistics")
+    expected_statistics = dict(sorted(expected_statistics.items()))
+    if (
+        not isinstance(declared_statistics, dict)
+        or set(declared_statistics) != set(expected_statistics)
+        or not all(
+            type(declared_statistics.get(shape_type)) is int
+            and declared_statistics.get(shape_type) == count
+            for shape_type, count in expected_statistics.items()
+        )
+    ):
         errors.append({"code": "element_statistics", "message": "manifest 元素分类统计不一致。"})
     visible_count = sum(element.get("visible") is True for element in elements if isinstance(element, dict))
     if package_version == LEGACY_PACKAGE_VERSION:
         if (
-            manifest.get("visible_element_count") != visible_count
-            or manifest.get("hidden_element_count") != len(elements) - visible_count
+            type(manifest.get("visible_element_count")) is not int
+            or manifest.get("visible_element_count") != visible_count
+            or type(manifest.get("hidden_element_count")) is not int
+            or manifest.get("hidden_element_count")
+            != len(elements) - visible_count
         ):
             errors.append({"code": "visibility_count", "message": "manifest 可见/隐藏元素统计不一致。"})
     else:
@@ -1244,23 +1303,40 @@ def validate_package(directory: Path | str) -> dict[str, Any]:
         presentation_count = (
             sum(ignored_by_shape_type.values()) if ignored_valid else -1
         )
-        source_count_parts = [
-            len(elements),
-            presentation_count,
-            manifest.get("unsupported_ignored_count"),
-            manifest.get("hidden_element_count"),
-            manifest.get("invalid_geometry_ignored_count"),
-        ]
+        expected_v2_counts = {
+            "active_element_count": len(elements),
+            "visible_element_count": len(elements),
+            "shelf_count": role_counts[ROLE_SHELF],
+            "fixed_structure_count": role_counts[ROLE_FIXED_STRUCTURE],
+            "road_element_count": role_counts["road"],
+            "presentation_ignored_count": presentation_count,
+        }
+        ignored_count_keys = (
+            "unsupported_ignored_count",
+            "hidden_element_count",
+            "invalid_geometry_ignored_count",
+        )
+        ignored_counts_valid = all(
+            type(manifest.get(key)) is int and manifest.get(key) >= 0
+            for key in ignored_count_keys
+        )
+        expected_source_count = (
+            len(elements)
+            + presentation_count
+            + sum(manifest.get(key, 0) for key in ignored_count_keys)
+            if ignored_counts_valid
+            else -1
+        )
         if (
-            manifest.get("active_element_count") != len(elements)
-            or manifest.get("visible_element_count") != len(elements)
-            or manifest.get("shelf_count") != role_counts[ROLE_SHELF]
-            or manifest.get("fixed_structure_count") != role_counts[ROLE_FIXED_STRUCTURE]
-            or manifest.get("road_element_count") != role_counts["road"]
+            not all(
+                type(manifest.get(key)) is int
+                and manifest.get(key) == expected
+                for key, expected in expected_v2_counts.items()
+            )
             or not ignored_valid
-            or manifest.get("presentation_ignored_count") != presentation_count
-            or not all(type(value) is int and value >= 0 for value in source_count_parts)
-            or manifest.get("source_element_count") != sum(source_count_parts)
+            or not ignored_counts_valid
+            or type(manifest.get("source_element_count")) is not int
+            or manifest.get("source_element_count") != expected_source_count
         ):
             errors.append(
                 {
@@ -1667,42 +1743,50 @@ def validate_package(directory: Path | str) -> dict[str, Any]:
     summary = validation_report.get("summary")
     report_warnings = validation_report.get("warnings")
     malformed_rows = validation_report.get("malformed_rows")
+    summary_counts_match = False
+    if (
+        isinstance(summary, dict)
+        and isinstance(report_warnings, list)
+        and isinstance(malformed_rows, list)
+    ):
+        expected_summary_counts = {
+            "element_count": len(elements),
+            "floor_count": len(floor_records),
+            "node_count": len(nodes),
+            "edge_count": len(edges),
+            "malformed_row_count": len(malformed_rows),
+            "warning_count": len(report_warnings) + len(malformed_rows),
+        }
+        if package_version == PACKAGE_VERSION:
+            expected_summary_counts.update(
+                {
+                    "source_element_count": manifest.get("source_element_count"),
+                    "active_element_count": len(elements),
+                    "shelf_count": manifest.get("shelf_count"),
+                    "fixed_structure_count": manifest.get("fixed_structure_count"),
+                    "road_element_count": manifest.get("road_element_count"),
+                    "presentation_ignored_count": manifest.get(
+                        "presentation_ignored_count"
+                    ),
+                    "unsupported_ignored_count": manifest.get(
+                        "unsupported_ignored_count"
+                    ),
+                    "hidden_element_count": manifest.get("hidden_element_count"),
+                    "invalid_geometry_ignored_count": manifest.get(
+                        "invalid_geometry_ignored_count"
+                    ),
+                }
+            )
+        summary_counts_match = all(
+            type(summary.get(key)) is int and summary.get(key) == expected
+            for key, expected in expected_summary_counts.items()
+        ) and (
+            type(manifest.get("warning_count")) is int
+            and summary.get("warning_count") == manifest.get("warning_count")
+        )
     if (
         validation_report.get("valid") is not True
-        or not isinstance(summary, dict)
-        or not isinstance(report_warnings, list)
-        or not isinstance(malformed_rows, list)
-        or summary.get("element_count") != len(elements)
-        or summary.get("floor_count") != len(floor_records)
-        or summary.get("node_count") != len(nodes)
-        or summary.get("edge_count") != len(edges)
-        or (
-            isinstance(report_warnings, list)
-            and isinstance(malformed_rows, list)
-            and summary.get("warning_count") != len(report_warnings) + len(malformed_rows)
-        )
-        or summary.get("warning_count") != manifest.get("warning_count")
-        or (
-            package_version == PACKAGE_VERSION
-            and (
-                summary.get("source_element_count")
-                != manifest.get("source_element_count")
-                or summary.get("active_element_count") != len(elements)
-                or summary.get("shelf_count") != manifest.get("shelf_count")
-                or summary.get("fixed_structure_count")
-                != manifest.get("fixed_structure_count")
-                or summary.get("road_element_count")
-                != manifest.get("road_element_count")
-                or summary.get("presentation_ignored_count")
-                != manifest.get("presentation_ignored_count")
-                or summary.get("unsupported_ignored_count")
-                != manifest.get("unsupported_ignored_count")
-                or summary.get("hidden_element_count")
-                != manifest.get("hidden_element_count")
-                or summary.get("invalid_geometry_ignored_count")
-                != manifest.get("invalid_geometry_ignored_count")
-            )
-        )
+        or not summary_counts_match
     ):
         errors.append({"code": "validation_report", "message": "validation_report.json 与地图包内容不一致。"})
     return {"valid": not errors, "errors": errors, "warnings": warnings}

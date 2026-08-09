@@ -2,7 +2,7 @@
 
 > 文档状态：**当前有效**。最后核对日期：2026-08-09。
 
-MapCase02 reproducibility golden：source SHA `1ddf428fc4dd6e4e8bd33258d0cbfaab87b809c4dedd6b8baca9e167c14b5e6a`，canonical `5ddfac7dc439afc45abdcf800b799c05d53704895b620d161ef08a442c55b2db`，Swift package `5cc223ca505d72158748caf5a0efc540f870ea6d9858fee1572e9f570a69b72a`，PC preview `d0c02be63dff3ab002dcf931ce7d0c5149152b78bea139fb1b0a2d86be196a18`。这些 hash 只冻结标准工作簿链路，不能替代 exact-final-SHA CI 或产品资格。
+MapCase02 reproducibility golden：source SHA `1ddf428fc4dd6e4e8bd33258d0cbfaab87b809c4dedd6b8baca9e167c14b5e6a`，canonical ID `piaseczno-5ddfac7dc439`，canonical SHA `5ddfac7dc439afc45abdcf800b799c05d53704895b620d161ef08a442c55b2db`，Swift package `8d3564ce68aadb087a2820a02b4747d15ea1f4d22b14e8776f913d33775b1b84`，PC package `41332d093e652ec2de94f0f86b8f15107cd6f67f3b2e5ddec1c0685ab4d7d3be`，PC preview `d0c02be63dff3ab002dcf931ce7d0c5149152b78bea139fb1b0a2d86be196a18`。Swift `--mapcase02-suite` 与 Python 正式 MapCase02 测试直接断言这些值，且 Python production validator 必须接受原样 Swift 输出，不能只比较编译结果与自身 manifest。上述 hash 只冻结标准工作簿链路，不能替代 exact-final-SHA CI 或产品资格。相同业务地图若原始文件名不同，canonical ID/SHA 可以相同，但 manifest 的 `source_file` 不同会产生另一个合法 package SHA；选择仍必须使用 exact ID/SHA。
 
 ## PC release preset
 

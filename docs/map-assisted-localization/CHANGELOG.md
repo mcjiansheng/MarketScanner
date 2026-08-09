@@ -2,6 +2,10 @@
 
 > 文档状态：**当前有效**。最后核对日期：2026-08-09。
 
+- 修复真机 XLSX 地图导入的 `不安全的地图标识` 阻断：Swift/PC 新生成 `prior_map_id` 统一为先过滤原始 ASCII、再 ASCII lowercase、slug 最长 115、最终 ID 最长 128；同时拒绝 APFS 上旧 uppercase 目录与新 lowercase ID 的 case-fold 别名。旧 uppercase v2 包只保留只读 integrity 兼容，不自动改写 exact ID/SHA。
+- `map 2.xlsx` 与正式 MapCase02 source SHA 完全相同；修复后 MapCase02 ID 为 `piaseczno-5ddfac7dc439`、Swift package `8d3564ce68aadb087a2820a02b4747d15ea1f4d22b14e8776f913d33775b1b84`、PC package `41332d093e652ec2de94f0f86b8f15107cd6f67f3b2e5ddec1c0685ab4d7d3be`。Swift validation report 新增并强校验 road graph `node_count`/`edge_count`；Swift/Python 同步严格拒绝 v1/v2 manifest/report 计数中的 bool/integral-float、非数组 warnings/malformed rows，legacy v1 的 element statistics 与 visible/hidden 也重新派生，Python 外层测试直接以 production validator 验证 Swift 包。新增 `--xlsx-library-smoke`，MapCase02、TianHong、北京昌平与 Kohl's 四张真实地图全部通过 compile/integrity/install/register/list/exact-read。
+- Swift 正式套件和 Python MapCase02 回归现在直接绑定 source/canonical/Swift package/PC package/PC preview frozen SHA，消除“编译结果只与自身 digest 比较”的假绿。旧 uppercase v2 仅在显式 diagnostic-only 模式保留只读完整性结果；普通 iOS/PC validator、旧向导和离线定位默认拒绝。
+
 - I10 exact-SHA run [`31307753672`](https://github.com/mcjiansheng/MarketScanner/actions/runs/31307753672) 在 `8f0e730d92773eea2ab58f56742d901ac02eead4` 为 7/8：七个非 Apple required jobs、完整 macOS host、SwiftPM cold resolve、Xcode metadata 与 200k tag-evidence RSS `794,099,712 < 805,306,368` bytes 均 PASS；唯一失败是 iphoneos cold dependency 的 RTAB-Map configure 无法自动发现位于 `rtabmap/prebuild/bin/` 的宿主 `rtabmap-res_tool`，所以 simulator/device clean link skipped，未冻结。
 - I11 `37e6ed8c4afa00202693cd56919aea78fd4c7af5` / G11 `7eef33e` 在 host prebuild 后验证 resource tool 可执行，并通过 `RTABMAP_RES_TOOL` 显式绑定给 iOS cross-compile；全新 host tool build、全新 iphoneos CMake configure、focused 22/22、Map Studio 109/109、静态合同与独立复审均 PASS（`P0=0 / P1=0`）。Release 优化标注与工具执行 smoke 作为 P2 记录；新的 final exact-SHA 8/8 前不冻结。
 
@@ -18,7 +22,7 @@
 - 正式 XLSX 以 `Basic Info + Element Info` 为权威，`Shelf Info` 仅审计；冻结 top-left anchor/pivot、生产角色集合、active/ignored 统计和 100,000 元素上限。
 - Swift/PC 同步关闭 relationship/worksheet alias、External/歧义 target、XML root/namespace 伪 authority、row/cell 引用、shared-string/boolean/公式、单元格大小、严格 JSON 数值与 duplicate element ID 的 fail-open/crash 路径；workbook sheet/relationship 各限制 4096 并使用线性索引。
 - prior-map v2 完整性从权威 active elements 重建 canonical identity、road graph、spatial index、distance fields 和 shelves-v2 segment；六字段 bounds、可选 `center_m/yaw_rad` 严格 finite 数值与 stable business identity uniqueness 均 fail closed。距离场在任何分配前执行 20k 单维、8m 单层、16m 包总 cells 上限与 RLE row budget。
-- `mapcase02.xlsx` 冻结结果：源 1838、active 1630、shelf 1301、fixed 329、road 0、presentation 208、active 越界 0；canonical `5ddfac…2db`、Swift package `5cc223…72a`、preview `d0c02b…a18` 未漂移。
+- `mapcase02.xlsx` 冻结结果：源 1838、active 1630、shelf 1301、fixed 329、road 0、presentation 208、active 越界 0；canonical `5ddfac…2db` 与 PC preview `d0c02b…a18` 未漂移；canonical lowercase ID 与跨端 validation report 修复使 Swift package 更新为 `8d3564…b1b84`，PC package 为 `41332d…d3be`。
 - 最终独立只读复审为 `P0=0 / P1=0`；低影响 parity/UX/visual/scale 项登记在 [`MAPCASE02_TODO.md`](MAPCASE02_TODO.md)。整体仍为 **REJECTED / NO-GO / developer smoke only**，J-04 仍为 **BLOCKER / NOT CLOSED**。
 
 ## 2026-08-09 — ESL Barcode Capture / Shelf Confirmation 阻断级收口

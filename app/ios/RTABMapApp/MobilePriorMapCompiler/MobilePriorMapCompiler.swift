@@ -281,6 +281,8 @@ enum PriorMapShelvesSchema {
 /// only then atomically renamed into place — a failed compile never
 /// overwrites an existing map.
 enum MobilePriorMapCompiler {
+    private static let maximumPriorMapSlugLength = 115
+
     struct CompileResult {
         var priorMapID: String
         var packageSHA256: String
@@ -408,6 +410,11 @@ enum MobilePriorMapCompiler {
 
             var warningsCopy = warnings
             let graph = MobileRoadGraphBuilder.build(elements: elements, warnings: &warningsCopy)
+            guard let graphNodes = graph["nodes"] as? [[String: Any]],
+                  let graphEdges = graph["edges"] as? [[String: Any]] else {
+                throw CompileError.outputNotUsable(
+                    "compiled road graph is missing nodes or edges")
+            }
             let distanceFields = try MobileDistanceFieldBuilder.build(elements: elements, floors: floors)
             let spatial = try MobileSpatialIndexBuilder.build(
                 elements: elements, graph: graph, floors: floors)
@@ -585,6 +592,8 @@ enum MobilePriorMapCompiler {
                     "malformed_row_count": 0,
                     "warning_count": warningsCopy.count,
                     "floor_count": floors.count,
+                    "node_count": graphNodes.count,
+                    "edge_count": graphEdges.count,
                 ],
                 "warnings": warningsCopy.map { $0.canonicalPayload },
                 "malformed_rows": [],
@@ -749,7 +758,7 @@ enum MobilePriorMapCompiler {
             && abs(lhs.maxY_m - rhs.maxY_m) <= 1.0e-8
     }
 
-    /// Slugs a name like the PC `SAFE_NAME` contract.
+    /// Slugs a name into the canonical lowercase PC/iOS filesystem contract.
     static func safeName(_ value: String) -> String {
         var result = ""
         var pendingDash = false
@@ -763,7 +772,12 @@ enum MobilePriorMapCompiler {
                     result.append("-")
                     pendingDash = false
                 }
-                result.append(Character(scalar))
+                if scalar.value >= 0x41 && scalar.value <= 0x5A,
+                   let lowercase = UnicodeScalar(scalar.value + 0x20) {
+                    result.append(Character(lowercase))
+                } else {
+                    result.append(Character(scalar))
+                }
             } else {
                 pendingDash = true
             }
@@ -773,6 +787,10 @@ enum MobilePriorMapCompiler {
         }
         while result.hasPrefix("-") { result.removeFirst() }
         while result.hasSuffix("-") { result.removeLast() }
+        if result.count > maximumPriorMapSlugLength {
+            result = String(result.prefix(maximumPriorMapSlugLength))
+            while result.hasSuffix("-") { result.removeLast() }
+        }
         return result.isEmpty ? "map" : result
     }
 

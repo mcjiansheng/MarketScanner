@@ -26,17 +26,24 @@ enum PriorMapPackageIntegrity {
     private static let packageManifestName = "package_manifest.json"
 
     /// Reads the package once and validates the resulting snapshot.
-    static func validate(directory: URL) throws -> String {
+    static func validate(
+        directory: URL,
+        allowLegacyV2IdentifierForDiagnostics: Bool = false
+    ) throws -> String {
         let snapshot = try PriorMapPackageSnapshotReader.read(
             directory: directory)
-        return try validate(snapshot: snapshot)
+        return try validate(
+            snapshot: snapshot,
+            allowLegacyV2IdentifierForDiagnostics:
+                allowLegacyV2IdentifierForDiagnostics)
     }
 
     /// Validates an already-read immutable package snapshot. Callers that
     /// also load the package model (PriorMapPackage.load) must pass the
     /// same snapshot so hash and parse can never diverge.
     static func validate(
-        snapshot: PriorMapPackageSnapshot
+        snapshot: PriorMapPackageSnapshot,
+        allowLegacyV2IdentifierForDiagnostics: Bool = false
     ) throws -> String {
         let package = snapshot.packageManifest
         try require(
@@ -108,12 +115,16 @@ enum PriorMapPackageIntegrity {
         try require(
             package["package_sha256"] as? String == packageHash,
             "地图包规范化 SHA-256 校验失败。")
-        try validateRelationships(snapshot: snapshot)
+        try validateRelationships(
+            snapshot: snapshot,
+            allowLegacyV2IdentifierForDiagnostics:
+                allowLegacyV2IdentifierForDiagnostics)
         return packageHash
     }
 
     private static func validateRelationships(
-        snapshot: PriorMapPackageSnapshot
+        snapshot: PriorMapPackageSnapshot,
+        allowLegacyV2IdentifierForDiagnostics: Bool
     ) throws {
         let manifest = try object(snapshot, "manifest.json")
         let elementsPayload = try object(snapshot, "elements.json")
@@ -139,17 +150,28 @@ enum PriorMapPackageIntegrity {
                 "地图包 store_id/name 不符合统一业务标识策略。")
         }
         if manifestVersion == 2 {
-            guard let priorMapID = manifest["prior_map_id"] as? String,
-                  !priorMapID.isEmpty,
-                  let sourceSHA256 = manifest["source_sha256"] as? String,
+            guard let sourceSHA256 = manifest["source_sha256"] as? String,
                   isValidSHA256(sourceSHA256),
                   let canonicalSHA256 = manifest["canonical_source_sha256"]
                     as? String,
-                  isValidSHA256(canonicalSHA256),
-                  priorMapID == "\(MobilePriorMapCompiler.safeName(mapName))-"
-                    + String(canonicalSHA256.prefix(12)) else {
+                  isValidSHA256(canonicalSHA256) else {
                 throw PriorMapPackageIntegrityError.invalid(
-                    "v2 prior_map_id 未绑定合法 canonical source SHA-256。")
+                    "v2 source/canonical SHA-256 无效。")
+            }
+            let canonicalPriorMapID =
+                "\(MobilePriorMapCompiler.safeName(mapName))-"
+                + String(canonicalSHA256.prefix(12))
+            let legacyPriorMapID = "\(legacySafeName(mapName))-"
+                + String(canonicalSHA256.prefix(12))
+            guard let priorMapID = manifest["prior_map_id"] as? String,
+                  !priorMapID.isEmpty,
+                  priorMapID == canonicalPriorMapID
+                    || (allowLegacyV2IdentifierForDiagnostics
+                        && priorMapID == legacyPriorMapID) else {
+                throw PriorMapPackageIntegrityError.invalid(
+                    "v2 prior_map_id 未绑定 canonical lowercase slug 与 "
+                        + "canonical source SHA-256；旧 uppercase 开发包只能"
+                        + "通过显式只读诊断模式检查，不能用于加载或定位。")
             }
             guard let localizationScope = manifest["localization_scope"]
                     as? [String: Any],
@@ -228,26 +250,37 @@ enum PriorMapPackageIntegrity {
                 && StrictJSONScalar.integer(manifest["element_count"])
                     == elements.count,
             "地图包元素 ID 或数量不一致。")
-        if manifestVersion == 2 {
-            var expectedElementStatistics: [String: Int] = [:]
-            for element in elements {
-                guard let shapeType = element["shape_type"] as? String else {
-                    throw PriorMapPackageIntegrityError.invalid(
-                        "v2 地图包元素缺少 shape_type。")
-                }
-                expectedElementStatistics[shapeType, default: 0] += 1
-            }
-            guard let declaredElementStatistics = manifest["element_statistics"]
-                    as? [String: Any],
-                  Set(declaredElementStatistics.keys)
-                    == Set(expectedElementStatistics.keys),
-                  expectedElementStatistics.allSatisfy({ shapeType, count in
-                      StrictJSONScalar.integer(
-                        declaredElementStatistics[shapeType]) == count
-                  }) else {
+        var expectedElementStatistics: [String: Int] = [:]
+        for element in elements {
+            guard let shapeType = element["shape_type"] as? String else {
                 throw PriorMapPackageIntegrityError.invalid(
-                    "v2 manifest element_statistics 与 active elements 不一致。")
+                    "地图包元素缺少 shape_type。")
             }
+            expectedElementStatistics[shapeType, default: 0] += 1
+        }
+        guard let declaredElementStatistics = manifest["element_statistics"]
+                as? [String: Any],
+              Set(declaredElementStatistics.keys)
+                == Set(expectedElementStatistics.keys),
+              expectedElementStatistics.allSatisfy({ shapeType, count in
+                  StrictJSONScalar.integer(
+                    declaredElementStatistics[shapeType]) == count
+              }) else {
+            throw PriorMapPackageIntegrityError.invalid(
+                "manifest element_statistics 与 elements 不一致。")
+        }
+        if manifestVersion == 1 {
+            let visibleCount = elements.filter {
+                StrictJSONScalar.boolean($0["visible"]) == true
+            }.count
+            try require(
+                StrictJSONScalar.integer(manifest["visible_element_count"])
+                    == visibleCount
+                    && StrictJSONScalar.integer(
+                        manifest["hidden_element_count"])
+                        == elements.count - visibleCount,
+                "v1 manifest 可见/隐藏元素统计与 elements 不一致。")
+        } else {
             let ignoredByShape = manifest["ignored_by_shape_type"]
                 as? [String: Any]
             let presentationCount = ignoredByShape?.reduce(0) { partial, item in
@@ -572,10 +605,24 @@ enum PriorMapPackageIntegrity {
             StrictJSONScalar.boolean(validation["valid"]) == true,
             "PC 验证报告未标记为有效。")
         guard let validationSummary = validation["summary"] as? [String: Any],
+              let validationWarnings = validation["warnings"] as? [Any],
+              let validationMalformedRows = validation["malformed_rows"]
+                as? [Any],
               StrictJSONScalar.integer(validationSummary["element_count"])
                 == elements.count,
               StrictJSONScalar.integer(validationSummary["floor_count"])
-                == floors.count else {
+                == floors.count,
+              StrictJSONScalar.integer(validationSummary["node_count"])
+                == nodes.count,
+              StrictJSONScalar.integer(validationSummary["edge_count"])
+                == edges.count,
+              StrictJSONScalar.integer(
+                validationSummary["malformed_row_count"])
+                == validationMalformedRows.count,
+              StrictJSONScalar.integer(validationSummary["warning_count"])
+                == validationWarnings.count + validationMalformedRows.count,
+              StrictJSONScalar.integer(validationSummary["warning_count"])
+                == StrictJSONScalar.integer(manifest["warning_count"]) else {
             throw PriorMapPackageIntegrityError.invalid(
                 "validation_report.json 基础统计与地图包不一致。")
         }
@@ -925,5 +972,34 @@ enum PriorMapPackageIntegrity {
     private static func indexedIds(_ value: Any?) -> Set<String> {
         guard let cells = value as? [String: Any] else { return [] }
         return Set(cells.values.flatMap { ($0 as? [String]) ?? [] })
+    }
+
+    /// Pre-canonical v2 compatibility only. New packages use the lowercase,
+    /// bounded `MobilePriorMapCompiler.safeName` contract. Integrity remains
+    /// able to diagnose old uppercase v2 packages without rewriting their
+    /// exact ID/SHA authority.
+    private static func legacySafeName(_ value: String) -> String {
+        var result = ""
+        var pendingDash = false
+        for scalar in value.unicodeScalars {
+            let allowed = (scalar.value >= 0x30 && scalar.value <= 0x39)
+                || (scalar.value >= 0x41 && scalar.value <= 0x5A)
+                || (scalar.value >= 0x61 && scalar.value <= 0x7A)
+                || scalar.value == 0x2E || scalar.value == 0x5F
+                || scalar.value == 0x2D
+            if allowed {
+                if pendingDash {
+                    result.append("-")
+                    pendingDash = false
+                }
+                result.append(Character(scalar))
+            } else {
+                pendingDash = true
+            }
+        }
+        if pendingDash { result.append("-") }
+        while result.hasPrefix("-") { result.removeFirst() }
+        while result.hasSuffix("-") { result.removeLast() }
+        return result.isEmpty ? "map" : result
     }
 }

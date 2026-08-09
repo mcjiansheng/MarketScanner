@@ -247,6 +247,7 @@ A JSON numeric `0`/`1` is **not** a boolean. Swift Foundation bridges `NSNumber`
 | Localized price tag | `needs_review` / `user_confirmed` | `StrictJSONScalar.boolean` | `isinstance(value, bool)` |
 | Prior-map element | `visible` | `StrictJSONScalar.boolean` | PC producer writes real booleans |
 | Prior-map validation report | `valid` | `StrictJSONScalar.boolean` | PC producer writes real booleans |
+| Prior-map manifest/report | all count/statistics fields | `StrictJSONScalar.integer` | `type(value) is int`；`bool`/integral-float 均拒绝 |
 
 Stable categories: Swift `business_schema_invalid` / `trigger_records_invalid`; PC `recovery_business_schema_invalid` / `recovery_trigger_records_invalid`; shared fixture category `business_schema_invalid` / `trigger_records_invalid`. Genuine `true`/`false` still pass on both readers.
 
@@ -319,7 +320,7 @@ Directory identity is captured before and after the reads; symlinked/hard-linked
 
 ## Prior-map strict JSON schema (C5)
 
-All formal prior-map JSON documents go through the shared strict helpers (strict UTF-8, NaN rejection, `object_pairs_hook` duplicate rejection, iterative nesting depth). Integers, numbers, booleans, geometry coordinates and bounds are read with `StrictJSONScalar` on device, so fractional versions, boolean counts/bytes/visibility, boolean coordinates/bounds and duplicate or escaped-equivalent keys are rejected identically on both readers.
+All formal prior-map JSON documents go through the shared strict helpers (strict UTF-8, NaN rejection, `object_pairs_hook` duplicate rejection, iterative nesting depth). Integers, numbers, booleans, geometry coordinates and bounds are read with `StrictJSONScalar` on device, so fractional versions, boolean counts/bytes/visibility, boolean coordinates/bounds and duplicate or escaped-equivalent keys are rejected identically on both readers. `manifest.json` 的 element/visible/role/ignored/source/warning counts 与 `element_statistics`，以及 `validation_report.summary` 的 element/floor/node/edge/warning/malformed/role counts，都必须是严格 JSON integer；`warnings`/`malformed_rows` 必须是数组，count 必须与数组、manifest 和 `road_graph.json` 精确一致。legacy manifest v1 同样重新派生 `element_statistics` 和 visible/hidden counts，不能因历史版本放宽 token 类型。
 
 ## Status words
 

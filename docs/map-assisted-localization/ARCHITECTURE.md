@@ -92,6 +92,6 @@ PC prior-map localized
 - PC session input manifest v3 在 v2 Recovery 绑定之上纳入 `tag_observation_bursts.jsonl` 的 exact bytes/hash。共享 validator 统一 writer、bundle hash、snapshot/replay 与 output store：严格 integer version；v1/v2/v3 Recovery marker；case-insensitive filename uniqueness；source database 安全 basename、source-manifest 名称 cross-binding、single-link regular-file 身份，以及 non-empty WAL/journal 拒绝。现场选择与可靠离线关联一致时为 `NO_CONFLICT` 且保持 approved；可靠冲突为 `USER_CONFIRMATION_CONFLICT`，离线证据不足为 `OFFLINE_ASSOCIATION_UNAVAILABLE`，后两者都强制 review/rescan，且不覆盖用户或算法证据。
 - 人工编辑由服务端生成旧值、UUID、UTC 时间和 base revision；version/revision CAS 必填，重放成功后才提交新不可变版本。
 
-本轮未修改 MapCase02、地图坐标转换或任何 store/map/file-specific scale、offset、rotation 规则。真机/性能/现场矩阵和低影响增强见 [`ESL_CAPTURE_TODO.md`](ESL_CAPTURE_TODO.md)；当前整体仍为 **REJECTED / NO-GO / developer smoke only**，J-04 未关闭。
+本轮未修改 MapCase02 几何、地图坐标转换或任何 store/map/file-specific scale、offset、rotation 规则；只修改 canonical filesystem ID、package bytes、production validator 和 MobileMapLibrary 安装身份合同。真机/性能/现场矩阵和低影响增强见 [`ESL_CAPTURE_TODO.md`](ESL_CAPTURE_TODO.md)；当前整体仍为 **REJECTED / NO-GO / developer smoke only**，J-04 未关闭。
 
 阈值、线程所有权、恢复策略和失败矩阵的权威说明见 `STAGE_2_DESIGN.md`。

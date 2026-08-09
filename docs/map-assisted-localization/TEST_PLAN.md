@@ -6,7 +6,9 @@
 
 ### MapCase02 冻结回归
 
-正式输入 `map/mapcase02/mapcase02.xlsx` 的 SHA-256 必须为 `1ddf428fc4dd6e4e8bd33258d0cbfaab87b809c4dedd6b8baca9e167c14b5e6a`。Swift `--mapcase02-suite` 与 PC converter/schema 必须同时满足 1838/1630/1301/329/0/208 统计、0 active 越界、canonical `5ddfac7dc439afc45abdcf800b799c05d53704895b620d161ef08a442c55b2db`、Swift package `5cc223ca505d72158748caf5a0efc540f870ea6d9858fee1572e9f570a69b72a` 和 preview `d0c02be63dff3ab002dcf931ce7d0c5149152b78bea139fb1b0a2d86be196a18`。
+正式输入 `map/mapcase02/mapcase02.xlsx` 的 SHA-256 必须为 `1ddf428fc4dd6e4e8bd33258d0cbfaab87b809c4dedd6b8baca9e167c14b5e6a`。Swift `--mapcase02-suite <xlsx> <output> <canonical-sha> <swift-package-sha> [legacy-xlsx]` 与 PC converter/schema 必须同时满足 1838/1630/1301/329/0/208 统计、0 active 越界、canonical ID `piaseczno-5ddfac7dc439`、canonical SHA `5ddfac7dc439afc45abdcf800b799c05d53704895b620d161ef08a442c55b2db`、Swift package `8d3564ce68aadb087a2820a02b4747d15ea1f4d22b14e8776f913d33775b1b84`、PC package `41332d093e652ec2de94f0f86b8f15107cd6f67f3b2e5ddec1c0685ab4d7d3be` 和 PC preview `d0c02be63dff3ab002dcf931ce7d0c5149152b78bea139fb1b0a2d86be196a18`。Swift 套件必须继续执行 compile → integrity → content-addressed move → register → listMaps → exact map read，并对重签的旧 uppercase v2 包断言 production 默认拒绝、显式 diagnostic-only 允许；`validation_report.summary.node_count/edge_count` 必须绑定 road graph 且 Swift 输出须由 Python production validator 直接接受；PC 正式 golden 测试必须直接断言 source/canonical/ID/package/preview SHA。只做自洽 digest 或只验证编译包均不再足够。
+
+真实工作簿回归使用 Swift host `--xlsx-library-smoke <xlsx...>`，输出仅写入 `/private/tmp` 下的临时地图库。2026-08-09 已对 `map 2.xlsx`、TianHong 02402、北京昌平 6599 和 Kohl's 1224 共四张正式工作簿执行，四张均完成严格导入、编译、完整性、安装、注册、列表和 exact ID/SHA 读取。跨端 slug 负例覆盖 `Piaseczno`、`Kohl's 1224`、`İstanbul`、Kelvin sign、中文夹 ASCII 与 200-byte 合法地图名；最终 ID 必须匹配 `^[a-z0-9._-]+$` 且最长 128。
 
 负例覆盖关系别名/外部 target/namespace 伪 authority、缺失/重复/前导零 row 与 cell、非法 shared-string/boolean/公式/超大 cell、100001 元素、错误角色几何、重复 element ID、严格整数 token、距离场预算，以及重签名后 canonical/graph/spatial/distance/shelf 派生工件篡改。任一端接受集合不同即失败。
 

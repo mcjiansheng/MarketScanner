@@ -2365,14 +2365,21 @@ if CommandLine.arguments.count == 2,
     runESLBarcodeCaptureFocusedTests()
     exit(0)
 }
-if (CommandLine.arguments.count == 5 || CommandLine.arguments.count == 6),
+if (CommandLine.arguments.count == 6 || CommandLine.arguments.count == 7),
    CommandLine.arguments[1] == "--mapcase02-suite" {
     runMapCase02Suite(
         workbookPath: CommandLine.arguments[2],
         outputPath: CommandLine.arguments[3],
         expectedCanonicalSHA256: CommandLine.arguments[4],
-        legacyWorkbookPath: CommandLine.arguments.count == 6
-            ? CommandLine.arguments[5] : nil)
+        expectedPackageSHA256: CommandLine.arguments[5],
+        legacyWorkbookPath: CommandLine.arguments.count == 7
+            ? CommandLine.arguments[6] : nil)
+    exit(0)
+}
+if CommandLine.arguments.count >= 3,
+   CommandLine.arguments[1] == "--xlsx-library-smoke" {
+    runXLSXLibrarySmoke(
+        workbookPaths: Array(CommandLine.arguments.dropFirst(2)))
     exit(0)
 }
 if CommandLine.arguments.count == 4,
@@ -11643,6 +11650,7 @@ private func runMapCase02Suite(
     workbookPath: String,
     outputPath: String,
     expectedCanonicalSHA256: String,
+    expectedPackageSHA256: String,
     legacyWorkbookPath: String?
 ) {
     do {
@@ -12100,9 +12108,73 @@ private func runMapCase02Suite(
             outputDirectory: output)
         require(compiled.elementCount == 1_630 && compiled.floorCount == 1,
                 "MapCase02 compiler counts mismatch")
+        require(
+            compiled.priorMapID
+                == "piaseczno-\(String(expectedCanonicalSHA256.prefix(12)))",
+            "MapCase02 prior_map_id must use the canonical lowercase slug")
+        require(
+            MobileMapLibrary.isSafeIdentifier(compiled.priorMapID),
+            "MapCase02 compiler must emit a MobileMapLibrary-safe identifier")
+        require(
+            MobilePriorMapCompiler.safeName("İstanbul") == "stanbul"
+                && MobilePriorMapCompiler.safeName("Kelvin") == "elvin"
+                && MobilePriorMapCompiler.safeName("北京A9") == "a9",
+            "canonical slug must filter Unicode before ASCII lowercasing")
+        let maximumLengthID = MobilePriorMapCompiler.safeName(
+            String(repeating: "A", count: 200)) + "-" + String(
+                expectedCanonicalSHA256.prefix(12))
+        require(
+            maximumLengthID.count == 128
+                && MobileMapLibrary.isSafeIdentifier(maximumLengthID),
+            "maximum legal map name must still produce a safe 128-byte ID")
         let packageSHA = try PriorMapPackageIntegrity.validate(directory: output)
-        require(packageSHA == compiled.packageSHA256,
-                "MapCase02 production integrity digest mismatch")
+        require(
+            packageSHA == compiled.packageSHA256
+                && packageSHA == expectedPackageSHA256,
+            "MapCase02 frozen Swift package SHA mismatch: \(packageSHA)")
+        let legacyIntegrityPackage = output.deletingLastPathComponent()
+            .appendingPathComponent(
+                ".mapcase02-legacy-uppercase-v2-\(UUID().uuidString)",
+                isDirectory: true)
+        try FileManager.default.copyItem(
+            at: output, to: legacyIntegrityPackage)
+        defer { try? FileManager.default.removeItem(at: legacyIntegrityPackage) }
+        let legacyManifestURL = legacyIntegrityPackage.appendingPathComponent(
+            "manifest.json")
+        guard var legacyManifest = try JSONSerialization.jsonObject(
+                with: Data(contentsOf: legacyManifestURL)) as? [String: Any]
+        else {
+            throw MapSourceImportError.invalidJSON(
+                detail: "MapCase02 legacy v2 manifest fixture must decode")
+        }
+        let legacyPriorMapID = "Piaseczno-"
+            + String(expectedCanonicalSHA256.prefix(12))
+        legacyManifest["prior_map_id"] = legacyPriorMapID
+        try CanonicalJSONEncoder.encode(legacyManifest).write(
+            to: legacyManifestURL)
+        let legacyPackageManifest = try MobilePackageManifestBuilder
+            .buildManifest(directory: legacyIntegrityPackage)
+        try CanonicalJSONEncoder.encode(legacyPackageManifest).write(
+            to: legacyIntegrityPackage.appendingPathComponent(
+                MobilePackageManifestBuilder.manifestFileName))
+        var productionRejectedLegacyID = false
+        do {
+            _ = try PriorMapPackageIntegrity.validate(
+                directory: legacyIntegrityPackage)
+        } catch {
+            productionRejectedLegacyID = true
+        }
+        require(
+            productionRejectedLegacyID,
+            "production integrity must reject legacy uppercase v2 IDs")
+        let legacyIntegritySHA = try PriorMapPackageIntegrity.validate(
+            directory: legacyIntegrityPackage,
+            allowLegacyV2IdentifierForDiagnostics: true)
+        require(
+            legacyIntegritySHA
+                == (legacyPackageManifest["package_sha256"] as? String)
+                && !MobileMapLibrary.isSafeIdentifier(legacyPriorMapID),
+            "legacy uppercase v2 must be accepted only by explicit diagnostics")
         let manifest = try JSONSerialization.jsonObject(
             with: Data(contentsOf: output.appendingPathComponent("manifest.json")))
             as? [String: Any]
@@ -12387,7 +12459,40 @@ private func runMapCase02Suite(
         try requireReboundManifestRejection("claimed-canonical-hash") { payload in
             let forged = String(repeating: "0", count: 64)
             payload["canonical_source_sha256"] = forged
-            payload["prior_map_id"] = "Piaseczno-" + String(forged.prefix(12))
+            payload["prior_map_id"] = "piaseczno-" + String(forged.prefix(12))
+        }
+        try requireReboundManifestRejection(
+            "manifest-element-count-integral-float"
+        ) { payload in
+            payload["element_count"] = 1_630.0
+        }
+        try requireReboundManifestRejection(
+            "manifest-warning-count-integral-float"
+        ) { payload in
+            guard let warningCount = StrictJSONScalar.integer(
+                    payload["warning_count"]) else {
+                require(false, "manifest fixture missing warning_count")
+                return
+            }
+            payload["warning_count"] = Double(warningCount)
+        }
+        try requireReboundManifestRejection(
+            "manifest-hidden-count-boolean"
+        ) { payload in
+            payload["hidden_element_count"] = false
+        }
+        try requireReboundManifestRejection(
+            "manifest-statistics-integral-float"
+        ) { payload in
+            guard var statistics = payload["element_statistics"]
+                    as? [String: Any],
+                  let key = statistics.keys.sorted().first,
+                  let count = StrictJSONScalar.integer(statistics[key]) else {
+                require(false, "manifest fixture missing element statistics")
+                return
+            }
+            statistics[key] = Double(count)
+            payload["element_statistics"] = statistics
         }
 
         func requireReboundArtifactRejection(
@@ -12421,6 +12526,35 @@ private func runMapCase02Suite(
                 rejected = true
             }
             require(rejected, "\(label) must fail after package hashes are rebound")
+        }
+
+        try requireReboundArtifactRejection(
+            "validation-node-count-integral-float",
+            artifactName: "validation_report.json"
+        ) { payload in
+            guard var summary = payload["summary"] as? [String: Any] else {
+                require(false, "validation report fixture missing summary")
+                return
+            }
+            summary["node_count"] = 0.0
+            payload["summary"] = summary
+        }
+        try requireReboundArtifactRejection(
+            "validation-malformed-count-boolean",
+            artifactName: "validation_report.json"
+        ) { payload in
+            guard var summary = payload["summary"] as? [String: Any] else {
+                require(false, "validation report fixture missing summary")
+                return
+            }
+            summary["malformed_row_count"] = false
+            payload["summary"] = summary
+        }
+        try requireReboundArtifactRejection(
+            "validation-warnings-not-array",
+            artifactName: "validation_report.json"
+        ) { payload in
+            payload["warnings"] = ["invalid": true]
         }
 
         try requireReboundArtifactRejection(
@@ -12548,11 +12682,148 @@ private func runMapCase02Suite(
                             + error.localizedDescription)
             }
         }
+
+        // Regression for the real-device failure: formal XLSX compilation
+        // used to preserve uppercase map-name bytes while MobileMapLibrary
+        // accepts only canonical lowercase path identifiers. Exercise the
+        // same compile -> content-addressed move -> register -> list -> read
+        // chain as MobileOnlyWorkflowCoordinator.
+        let previousMapRoot = MobileMapLibrary.rootOverride
+        let libraryTemporary = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "mapcase02-library-\(UUID().uuidString)", isDirectory: true)
+        MobileMapLibrary.rootOverride = libraryTemporary
+        defer {
+            restoreMutablePermissions(libraryTemporary)
+            try? FileManager.default.removeItem(at: libraryTemporary)
+            MobileMapLibrary.rootOverride = previousMapRoot
+        }
+        let installStaging = try MobileMapLibrary.stagingDirectory(
+            for: "mapcase02-install")
+        try FileManager.default.removeItem(at: installStaging)
+        try FileManager.default.copyItem(at: output, to: installStaging)
+        let installTarget = try MobileMapLibrary.packageDirectory(
+            priorMapID: compiled.priorMapID,
+            packageSHA: compiled.packageSHA256)
+        try FileManager.default.createDirectory(
+            at: installTarget.deletingLastPathComponent(),
+            withIntermediateDirectories: true)
+        try FileManager.default.moveItem(at: installStaging, to: installTarget)
+        let installed = try MobileMapLibrary.register(
+            priorMapID: compiled.priorMapID,
+            name: report.mapName,
+            packageSHA256: compiled.packageSHA256,
+            packageURL: installTarget,
+            floorCount: compiled.floorCount,
+            elementCount: compiled.elementCount,
+            compilerVersion: "swift-v1",
+            canonicalSourceSHA256: report.canonicalSourceSha256)
+        let listed = try MobileMapLibrary.listMaps()
+        require(
+            listed.count == 1 && listed[0].priorMapID == compiled.priorMapID
+                && listed[0].packageSHA256 == compiled.packageSHA256,
+            "MapCase02 installed package must round-trip through registry listing")
+        let loaded = try MobileMapLibrary.map(
+            priorMapID: installed.priorMapID,
+            packageSHA256: installed.packageSHA256)
+        require(
+            loaded.priorMapID == installed.priorMapID
+                && loaded.packageSHA256 == installed.packageSHA256
+                && loaded.packageDirectory == installed.packageDirectory
+                && loaded.canonicalSourceSHA256
+                    == installed.canonicalSourceSHA256,
+            "MapCase02 installed package must load by exact ID/SHA authority")
         print("MapCase02 suite passed canonical=\(report.canonicalSourceSha256) package=\(packageSHA)")
     } catch {
         FileHandle.standardError.write(
             Data("MapCase02 suite failed: \(error)\n".utf8))
         exit(12)
+    }
+}
+
+/// Local real-workbook regression: every supplied formal XLSX must traverse
+/// the production import/compiler/integrity/library chain and remain readable
+/// by exact ID/SHA. This intentionally accepts paths at runtime so ignored
+/// customer fixtures never become repository or CI dependencies.
+private func runXLSXLibrarySmoke(workbookPaths: [String]) {
+    let previousMapRoot = MobileMapLibrary.rootOverride
+    let temporary = FileManager.default.temporaryDirectory
+        .appendingPathComponent(
+            "xlsx-library-smoke-\(UUID().uuidString)", isDirectory: true)
+    MobileMapLibrary.rootOverride = temporary.appendingPathComponent(
+        "Maps", isDirectory: true)
+    defer {
+        restoreMutablePermissions(temporary)
+        try? FileManager.default.removeItem(at: temporary)
+        MobileMapLibrary.rootOverride = previousMapRoot
+    }
+
+    do {
+        var expectedIdentities: Set<String> = []
+        for (index, workbookPath) in workbookPaths.enumerated() {
+            let workbook = URL(fileURLWithPath: workbookPath)
+            let report = try MapSourceImportCoordinator.importMap(
+                stagedURL: workbook,
+                originalFilename: workbook.lastPathComponent,
+                contract: .topLeft,
+                strict: true)
+            let staging = try MobileMapLibrary.stagingDirectory(
+                for: "xlsx-smoke-\(index)")
+            let compiled = try MobilePriorMapCompiler.compile(
+                canonicalSource: report.canonicalSource,
+                outputDirectory: staging)
+            require(
+                MobileMapLibrary.isSafeIdentifier(compiled.priorMapID),
+                "XLSX smoke emitted an unsafe ID for \(workbook.lastPathComponent)")
+            require(
+                compiled.priorMapID.hasPrefix(
+                    MobilePriorMapCompiler.safeName(report.mapName) + "-"),
+                "XLSX smoke ID slug mismatch for \(workbook.lastPathComponent)")
+            let validatedSHA = try PriorMapPackageIntegrity.validate(
+                directory: staging)
+            require(
+                validatedSHA == compiled.packageSHA256,
+                "XLSX smoke integrity mismatch for \(workbook.lastPathComponent)")
+            let target = try MobileMapLibrary.packageDirectory(
+                priorMapID: compiled.priorMapID,
+                packageSHA: compiled.packageSHA256)
+            try FileManager.default.createDirectory(
+                at: target.deletingLastPathComponent(),
+                withIntermediateDirectories: true)
+            try FileManager.default.moveItem(at: staging, to: target)
+            let installed = try MobileMapLibrary.register(
+                priorMapID: compiled.priorMapID,
+                name: report.mapName,
+                packageSHA256: compiled.packageSHA256,
+                packageURL: target,
+                floorCount: compiled.floorCount,
+                elementCount: compiled.elementCount,
+                compilerVersion: "swift-v1",
+                canonicalSourceSHA256: report.canonicalSourceSha256)
+            let loaded = try MobileMapLibrary.map(
+                priorMapID: installed.priorMapID,
+                packageSHA256: installed.packageSHA256)
+            require(
+                loaded.priorMapID == installed.priorMapID
+                    && loaded.packageSHA256 == installed.packageSHA256,
+                "XLSX smoke exact read failed for \(workbook.lastPathComponent)")
+            expectedIdentities.insert(installed.relativePackagePath)
+            print(
+                "XLSX library smoke file=\(workbook.lastPathComponent) "
+                    + "name=\(report.mapName) store=\(report.storeId) "
+                    + "elements=\(compiled.elementCount) "
+                    + "prior_map_id=\(compiled.priorMapID) "
+                    + "package_sha256=\(compiled.packageSHA256)")
+        }
+        let listed = try MobileMapLibrary.listMaps()
+        require(
+            Set(listed.map(\.relativePackagePath)) == expectedIdentities,
+            "XLSX smoke registry inventory mismatch")
+        print("XLSX library smoke passed count=\(workbookPaths.count)")
+    } catch {
+        FileHandle.standardError.write(
+            Data("XLSX library smoke failed: \(error)\n".utf8))
+        exit(14)
     }
 }
 
@@ -16145,12 +16416,50 @@ if CommandLine.arguments.count == 3,
             stagedURL: stagedMap,
             originalFilename: "cas-map.csv",
             contract: .topLeft,
-            storeId: "s1")
+            storeId: "s1",
+            mapName: "Piaseczno")
         require(report.elementCount == 3, "CAS import must yield 3 elements")
         let compileDir = try MobileMapLibrary.stagingDirectory(for: "cas-compile")
         let compileResult = try MobilePriorMapCompiler.compile(
             canonicalSource: report.canonicalSource,
             outputDirectory: compileDir)
+        require(
+            compileResult.priorMapID.hasPrefix("piaseczno-")
+                && MobileMapLibrary.isSafeIdentifier(compileResult.priorMapID),
+            "CAS mixed-case map name must compile to a lowercase safe ID")
+        require(
+            MobilePriorMapCompiler.safeName("İstanbul") == "stanbul"
+                && MobilePriorMapCompiler.safeName("Kelvin") == "elvin"
+                && MobilePriorMapCompiler.safeName("北京A9") == "a9",
+            "CAS slug parity must filter Unicode before ASCII lowercasing")
+        let longID = MobilePriorMapCompiler.safeName(
+            String(repeating: "A", count: 200)) + "-"
+            + String(report.canonicalSourceSha256.prefix(12))
+        require(
+            longID.count == 128 && MobileMapLibrary.isSafeIdentifier(longID),
+            "CAS 200-byte legal map name must produce a safe bounded ID")
+
+        let legacyCaseID = "Piaseczno-"
+            + String(report.canonicalSourceSha256.prefix(12))
+        let legacyCaseDirectory = try MobileMapLibrary.packagesRoot()
+            .appendingPathComponent(legacyCaseID, isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: legacyCaseDirectory, withIntermediateDirectories: true)
+        do {
+            _ = try MobileMapLibrary.packageDirectory(
+                priorMapID: compileResult.priorMapID,
+                packageSHA: compileResult.packageSHA256)
+            require(false, "CAS case-fold legacy directory must reject before write")
+        } catch let error as MobileMapLibrary.LibraryError {
+            guard case .noncanonicalPackageDirectorySpelling(
+                let expected, let actual) = error else {
+                throw error
+            }
+            require(
+                expected == compileResult.priorMapID && actual == legacyCaseID,
+                "CAS case-fold rejection must report exact expected/actual IDs")
+        }
+        try FileManager.default.removeItem(at: legacyCaseDirectory)
         let target = try MobileMapLibrary.packageDirectory(
             priorMapID: compileResult.priorMapID,
             packageSHA: compileResult.packageSHA256)

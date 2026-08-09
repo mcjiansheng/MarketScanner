@@ -44,6 +44,7 @@
 - I11：非法 UTF-8 拒绝。
 - I13：坐标预设 top_left / bottom_left y 轴符号。
 - I14：多楼层导入。
-- MapCase02：正式 `Basic Info + Element Info`、Shelf audit、1838→1630 active、角色几何、top-left anchor、canonical v3 round-trip、XML root/authority、sheet/relationship 上限、关系/row/cell/resource 负例与 MapCase01 legacy 兼容。
+- MapCase02：正式 `Basic Info + Element Info`、Shelf audit、1838→1630 active、角色几何、top-left anchor、canonical v3 round-trip、XML root/authority、sheet/relationship 上限、关系/row/cell/resource 负例与 MapCase01 legacy 兼容；同时执行小写/长度安全 ID、冻结 Swift package SHA、package integrity、MobileMapLibrary install/register/list/exact-read、manifest/report strict integer/array mutation，以及旧 uppercase v2 在 production validator 拒绝、diagnostic-only validator 接受的双向门。Swift 原样输出还必须通过 Python production validator。
+- `--xlsx-library-smoke`：运行时接收本地真实 XLSX 路径，不把被忽略的客户样本纳入仓库；2026-08-09 的 `map 2.xlsx`、TianHong、北京昌平与 Kohl's 四张地图全部通过手机端完整地图库链路。
 
 MapCase02 canonical SHA 冻结为 `5ddfac7dc439afc45abdcf800b799c05d53704895b620d161ef08a442c55b2db`。这是标准工作簿局部 PASS；整体仍为 **REJECTED / NO-GO / developer smoke only**，J-04 未关闭。

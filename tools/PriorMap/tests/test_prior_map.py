@@ -22,7 +22,11 @@ from tools.PriorMap.coordinate_system import (
     source_rotation_to_yaw,
 )
 from tools.PriorMap.distance_field import build_distance_fields, decode_level
-from tools.PriorMap.prior_map_schema import build_package_manifest, validate_package
+from tools.PriorMap.prior_map_schema import (
+    build_package_manifest,
+    canonical_safe_name,
+    validate_package,
+)
 from tools.PriorMap.render_prior_map import render_package
 from tools.PriorMap.replay_localization import replay
 from tools.PriorMap.replay_stage2 import (
@@ -499,6 +503,141 @@ class StandardWorkbookContractTests(unittest.TestCase):
             convert_workbook(workbook, self.root / "bad-store", store_id="OTHER")
         with self.assertRaises(ConversionError):
             convert_workbook(workbook, self.root / "bad-name", map_name="Other")
+
+    def test_prior_map_id_uses_canonical_lowercase_filesystem_slug(self) -> None:
+        cases = (
+            ("Piaseczno", "piaseczno-"),
+            ("Kohl's 1224", "kohl-s-1224-"),
+            ("TianHong.02402", "tianhong.02402-"),
+            ("北京昌平6599", "6599-"),
+            ("İstanbul", "stanbul-"),
+            ("北京A9", "a9-"),
+            ("A" * 200, f"{'a' * 115}-"),
+        )
+        self.assertEqual(canonical_safe_name("Kelvin"), "elvin")
+        for index, (map_name, expected_prefix) in enumerate(cases):
+            with self.subTest(map_name=map_name):
+                workbook = self.root / f"mixed-case-{index}.xlsx"
+                write_workbook(
+                    workbook,
+                    self.rows,
+                    basic_info={
+                        "map_name": map_name,
+                        "width": 2000,
+                        "height": 1000,
+                        "storeCode": f"store.{index}",
+                    },
+                )
+                package = convert_workbook(
+                    workbook, self.root / f"mixed-case-package-{index}")
+                manifest = json.loads(
+                    (package / "manifest.json").read_text(encoding="utf-8"))
+                prior_map_id = manifest["prior_map_id"]
+                self.assertTrue(prior_map_id.startswith(expected_prefix))
+                self.assertRegex(prior_map_id, r"^[a-z0-9._-]+$")
+                self.assertEqual(prior_map_id, prior_map_id.lower())
+                self.assertLessEqual(len(prior_map_id), 128)
+                self.assertTrue(validate_package(package)["valid"])
+
+        # Pre-canonical v2 packages keep their exact uppercase bytes only for
+        # explicit read-only diagnostics. Production validation/loading and
+        # MobileMapLibrary authority reject them and require re-import.
+        legacy_package = self.root / "mixed-case-package-0"
+        legacy_manifest_path = legacy_package / "manifest.json"
+        legacy_manifest = json.loads(
+            legacy_manifest_path.read_text(encoding="utf-8"))
+        legacy_manifest["prior_map_id"] = (
+            "Piaseczno-"
+            + legacy_manifest["canonical_source_sha256"][:12]
+        )
+        legacy_manifest_path.write_text(
+            json.dumps(
+                legacy_manifest,
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        (legacy_package / "package_manifest.json").write_text(
+            json.dumps(
+                build_package_manifest(legacy_package),
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        production_validation = validate_package(legacy_package)
+        self.assertFalse(production_validation["valid"])
+        self.assertIn(
+            "map_id",
+            {error["code"] for error in production_validation["errors"]},
+        )
+        self.assertTrue(
+            validate_package(
+                legacy_package,
+                allow_legacy_v2_identifier_for_diagnostics=True,
+            )["valid"]
+        )
+
+    def test_mapcase02_pc_frozen_golden_when_fixture_is_present(self) -> None:
+        repository = Path(__file__).resolve().parents[3]
+        workbook = repository / "map/mapcase02/mapcase02.xlsx"
+        if not workbook.is_file():
+            self.skipTest("ignored local MapCase02 workbook fixture is unavailable")
+
+        expected_source_sha = (
+            "1ddf428fc4dd6e4e8bd33258d0cbfaab87b809c4dedd6b8baca9e167c14b5e6a"
+        )
+        expected_canonical_sha = (
+            "5ddfac7dc439afc45abdcf800b799c05d53704895b620d161ef08a442c55b2db"
+        )
+        expected_package_sha = (
+            "41332d093e652ec2de94f0f86b8f15107cd6f67f3b2e5ddec1c0685ab4d7d3be"
+        )
+        expected_preview_sha = (
+            "d0c02be63dff3ab002dcf931ce7d0c5149152b78bea139fb1b0a2d86be196a18"
+        )
+
+        self.assertEqual(
+            hashlib.sha256(workbook.read_bytes()).hexdigest(),
+            expected_source_sha,
+            "the formal MapCase02 workbook bytes drifted",
+        )
+        package = convert_workbook(workbook, self.root / "mapcase02-pc-golden")
+        manifest = json.loads(
+            (package / "manifest.json").read_text(encoding="utf-8")
+        )
+        package_manifest = json.loads(
+            (package / "package_manifest.json").read_text(encoding="utf-8")
+        )
+        validation = validate_package(package)
+
+        self.assertTrue(validation["valid"], validation["errors"])
+        self.assertEqual(manifest["source_sha256"], expected_source_sha)
+        self.assertEqual(
+            manifest["canonical_source_sha256"], expected_canonical_sha
+        )
+        self.assertEqual(manifest["prior_map_id"], "piaseczno-5ddfac7dc439")
+        self.assertEqual(package_manifest["package_sha256"], expected_package_sha)
+        self.assertEqual(
+            hashlib.sha256((package / "preview.png").read_bytes()).hexdigest(),
+            expected_preview_sha,
+        )
+        self.assertEqual(
+            (
+                manifest["source_element_count"],
+                manifest["active_element_count"],
+                manifest["shelf_count"],
+                manifest["fixed_structure_count"],
+                manifest["road_element_count"],
+                manifest["presentation_ignored_count"],
+            ),
+            (1838, 1630, 1301, 329, 0, 208),
+        )
 
     def test_missing_basic_info_requires_explicit_legacy_mode(self) -> None:
         workbook = self.root / "legacy.xlsx"
@@ -1342,6 +1481,150 @@ class IOSCoreContractTests(unittest.TestCase):
             self.assertIn(
                 "Absolute prior/native targeted contract tests passed",
                 absolute_prior_contract_result.stdout,
+            )
+            mapcase02_workbook = repository / "map/mapcase02/mapcase02.xlsx"
+            if mapcase02_workbook.is_file():
+                mapcase02_output = Path(temporary) / "mapcase02-swift-golden"
+                mapcase02_command = [
+                    str(executable),
+                    "--mapcase02-suite",
+                    str(mapcase02_workbook),
+                    str(mapcase02_output),
+                    (
+                        "5ddfac7dc439afc45abdcf800b799c05d53704895b620d161"
+                        "ef08a442c55b2db"
+                    ),
+                    (
+                        "8d3564ce68aadb087a2820a02b4747d15ea1f4d22b14e877"
+                        "6f913d33775b1b84"
+                    ),
+                ]
+                legacy_workbook = repository / "map/mapcase01/mapcase01.xlsx"
+                if legacy_workbook.is_file():
+                    mapcase02_command.append(str(legacy_workbook))
+                mapcase02_result = subprocess.run(
+                    mapcase02_command,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(
+                    mapcase02_result.returncode,
+                    0,
+                    mapcase02_result.stderr,
+                )
+                self.assertIn(
+                    "MapCase02 suite passed",
+                    mapcase02_result.stdout,
+                )
+                cross_end_validation = validate_package(mapcase02_output)
+                self.assertTrue(
+                    cross_end_validation["valid"],
+                    "Python production validator rejected the Swift package: "
+                    + repr(cross_end_validation["errors"]),
+                )
+            else:
+                print(
+                    "MapCase02 Swift golden explicitly skipped: ignored local "
+                    "workbook fixture is unavailable"
+                )
+
+            legacy_v1_workbook = Path(temporary) / "legacy-v1.xlsx"
+            write_workbook(
+                legacy_v1_workbook,
+                fixture_rows(),
+                include_basic=False,
+            )
+            legacy_v1_package = convert_workbook(
+                legacy_v1_workbook,
+                Path(temporary) / "legacy-v1-package",
+                map_name="legacy-v1",
+                store_id="legacy-store",
+                allow_legacy_element_only=True,
+            )
+            self.assertTrue(validate_package(legacy_v1_package)["valid"])
+            legacy_v1_integrity_root = Path(temporary) / "legacy-v1-integrity"
+            legacy_v1_integrity_root.mkdir()
+            shutil.copytree(
+                legacy_v1_package,
+                legacy_v1_integrity_root / "baseline.pass",
+            )
+
+            def add_legacy_v1_mutation(
+                name: str, mutate: object
+            ) -> None:
+                destination = legacy_v1_integrity_root / f"{name}.fail"
+                shutil.copytree(legacy_v1_package, destination)
+                manifest_path = destination / "manifest.json"
+                payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+                mutate(payload)
+                manifest_path.write_text(
+                    json.dumps(
+                        payload,
+                        ensure_ascii=False,
+                        indent=2,
+                        sort_keys=True,
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+                (destination / "package_manifest.json").write_text(
+                    json.dumps(
+                        build_package_manifest(destination),
+                        ensure_ascii=False,
+                        indent=2,
+                        sort_keys=True,
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+
+            statistics_key = next(
+                iter(
+                    json.loads(
+                        (legacy_v1_package / "manifest.json").read_text(
+                            encoding="utf-8"
+                        )
+                    )["element_statistics"]
+                )
+            )
+            add_legacy_v1_mutation(
+                "statistics-integral-float",
+                lambda value: value["element_statistics"].__setitem__(
+                    statistics_key,
+                    float(value["element_statistics"][statistics_key]),
+                ),
+            )
+            add_legacy_v1_mutation(
+                "visible-integral-float",
+                lambda value: value.__setitem__(
+                    "visible_element_count",
+                    float(value["visible_element_count"]),
+                ),
+            )
+            add_legacy_v1_mutation(
+                "hidden-boolean",
+                lambda value: value.__setitem__(
+                    "hidden_element_count", False
+                ),
+            )
+            legacy_v1_result = subprocess.run(
+                [
+                    str(executable),
+                    "--integrity-suite",
+                    str(legacy_v1_integrity_root),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                legacy_v1_result.returncode,
+                0,
+                legacy_v1_result.stderr,
+            )
+            self.assertIn(
+                "Integrity suite passed", legacy_v1_result.stdout
             )
             run_result = subprocess.run(
                 [str(executable)],
@@ -5202,6 +5485,168 @@ class PriorMapConversionTests(unittest.TestCase):
         (invalid_png / "preview.png").write_bytes(b"\x89PNG\r\n\x1a\ntruncated")
         self.assertFalse(validate_package(invalid_png)["valid"])
 
+    def test_validation_report_counts_are_strict_json_integers(self) -> None:
+        package = convert_workbook(
+            self.workbook, self.root / "strict-report-package", store_id="s1"
+        )
+        report = json.loads(
+            (package / "validation_report.json").read_text(encoding="utf-8")
+        )
+        required_count_fields = (
+            "element_count",
+            "source_element_count",
+            "active_element_count",
+            "shelf_count",
+            "fixed_structure_count",
+            "road_element_count",
+            "presentation_ignored_count",
+            "unsupported_ignored_count",
+            "hidden_element_count",
+            "invalid_geometry_ignored_count",
+            "malformed_row_count",
+            "warning_count",
+            "floor_count",
+            "node_count",
+            "edge_count",
+        )
+
+        def assert_rejected(field: str, replacement: object, suffix: str) -> None:
+            corrupted = self.corrupted_package(
+                package, f"strict-report-{field}-{suffix}"
+            )
+            self.rewrite_json(
+                corrupted / "validation_report.json",
+                lambda value: value["summary"].__setitem__(field, replacement),
+            )
+            (corrupted / "package_manifest.json").write_text(
+                json.dumps(
+                    build_package_manifest(corrupted),
+                    ensure_ascii=False,
+                    indent=2,
+                    sort_keys=True,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            validation = validate_package(corrupted)
+            self.assertFalse(validation["valid"], (field, replacement, validation))
+            self.assertIn(
+                "validation_report",
+                {item["code"] for item in validation["errors"]},
+            )
+
+        for field in required_count_fields:
+            with self.subTest(field=field, token="integral-float"):
+                assert_rejected(
+                    field, float(report["summary"][field]), "integral-float"
+                )
+        for field, replacement in (
+            ("malformed_row_count", False),
+            ("floor_count", True),
+        ):
+            with self.subTest(field=field, token="boolean"):
+                assert_rejected(field, replacement, "boolean")
+
+        for field in ("warnings", "malformed_rows"):
+            with self.subTest(field=field, token="not-array"):
+                corrupted = self.corrupted_package(
+                    package, f"strict-report-{field}-not-array"
+                )
+                self.rewrite_json(
+                    corrupted / "validation_report.json",
+                    lambda value, key=field: value.__setitem__(
+                        key, {"invalid": True}
+                    ),
+                )
+                (corrupted / "package_manifest.json").write_text(
+                    json.dumps(
+                        build_package_manifest(corrupted),
+                        ensure_ascii=False,
+                        indent=2,
+                        sort_keys=True,
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+                validation = validate_package(corrupted)
+                self.assertFalse(validation["valid"], validation)
+                self.assertIn(
+                    "validation_report",
+                    {item["code"] for item in validation["errors"]},
+                )
+
+    def test_manifest_counts_are_strict_json_integers(self) -> None:
+        package = convert_workbook(
+            self.workbook, self.root / "strict-manifest-package", store_id="s1"
+        )
+        manifest = json.loads(
+            (package / "manifest.json").read_text(encoding="utf-8")
+        )
+        required_count_fields = (
+            "element_count",
+            "active_element_count",
+            "visible_element_count",
+            "shelf_count",
+            "fixed_structure_count",
+            "road_element_count",
+            "presentation_ignored_count",
+            "unsupported_ignored_count",
+            "hidden_element_count",
+            "invalid_geometry_ignored_count",
+            "source_element_count",
+            "warning_count",
+        )
+
+        def assert_rejected(
+            label: str, mutate: object
+        ) -> None:
+            corrupted = self.corrupted_package(
+                package, f"strict-manifest-{label}"
+            )
+            self.rewrite_json(corrupted / "manifest.json", mutate)
+            (corrupted / "package_manifest.json").write_text(
+                json.dumps(
+                    build_package_manifest(corrupted),
+                    ensure_ascii=False,
+                    indent=2,
+                    sort_keys=True,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            validation = validate_package(corrupted)
+            self.assertFalse(validation["valid"], (label, validation))
+
+        for field in required_count_fields:
+            with self.subTest(field=field, token="integral-float"):
+                assert_rejected(
+                    f"{field}-integral-float",
+                    lambda value, key=field: value.__setitem__(
+                        key, float(manifest[key])
+                    ),
+                )
+        for field, replacement in (
+            ("hidden_element_count", True),
+            ("invalid_geometry_ignored_count", False),
+        ):
+            with self.subTest(field=field, token="boolean"):
+                assert_rejected(
+                    f"{field}-boolean",
+                    lambda value, key=field, token=replacement: value.__setitem__(
+                        key, token
+                    ),
+                )
+
+        statistics_key = next(iter(manifest["element_statistics"]))
+        with self.subTest(field="element_statistics", token="integral-float"):
+            assert_rejected(
+                "element-statistics-integral-float",
+                lambda value: value["element_statistics"].__setitem__(
+                    statistics_key,
+                    float(value["element_statistics"][statistics_key]),
+                ),
+            )
+
     def test_v2_manifest_requires_strict_relation_bound_shelves_v2(self) -> None:
         package = convert_workbook(
             self.workbook, self.root / "shelves-v2-package", store_id="s1"
@@ -5726,12 +6171,7 @@ class PriorMapStrictSchemaTests(unittest.TestCase):
                     basic_info, elements_payload["elements"]
                 )
                 manifest["canonical_source_sha256"] = canonical_hash
-                base_name = (
-                    re.sub(
-                        r"[^A-Za-z0-9._-]+", "-", manifest["name"]
-                    ).strip("-")
-                    or "map"
-                )
+                base_name = canonical_safe_name(manifest["name"])
                 manifest["prior_map_id"] = f"{base_name}-{canonical_hash[:12]}"
                 manifest_path.write_text(
                     json.dumps(
@@ -5819,7 +6259,7 @@ class PriorMapStrictSchemaTests(unittest.TestCase):
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         forged_hash = "0" * 64
         manifest["canonical_source_sha256"] = forged_hash
-        base_name = re.sub(r"[^A-Za-z0-9._-]+", "-", manifest["name"]).strip("-") or "map"
+        base_name = canonical_safe_name(manifest["name"])
         manifest["prior_map_id"] = f"{base_name}-{forged_hash[:12]}"
         manifest_path.write_text(
             json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
@@ -5879,10 +6319,7 @@ class PriorMapStrictSchemaTests(unittest.TestCase):
             basic_info, elements_payload["elements"]
         )
         manifest["canonical_source_sha256"] = canonical_hash
-        base_name = (
-            re.sub(r"[^A-Za-z0-9._-]+", "-", manifest["name"]).strip("-")
-            or "map"
-        )
+        base_name = canonical_safe_name(manifest["name"])
         manifest["prior_map_id"] = f"{base_name}-{canonical_hash[:12]}"
         manifest_path.write_text(
             json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n",

@@ -66,7 +66,7 @@ Android 目录中的部分 C++ 原生实现也因共享移动渲染和数据库�
 
 ### MapCase02 标准工作簿状态（2026-08-09）
 
-`MAPCASE02 / STANDARD SUPERMARKET XLSX FORMAT PASS`：Swift/PC 对正式工作簿 top-left anchor、production role geometry、canonical v3、package v2、road/spatial/distance/shelf 派生工件与资源上限已完成阻断级收口。冻结统计为源 1838、active 1630、货架 1301、固定结构 329、展示审计 208、active 越界 0；canonical SHA `5ddfac7dc439afc45abdcf800b799c05d53704895b620d161ef08a442c55b2db`。
+`MAPCASE02 / STANDARD SUPERMARKET XLSX FORMAT PASS`：Swift/PC 对正式工作簿 top-left anchor、production role geometry、canonical v3、package v2、road/spatial/distance/shelf 派生工件与资源上限已完成阻断级收口。冻结统计为源 1838、active 1630、货架 1301、固定结构 329、展示审计 208、active 越界 0；canonical SHA `5ddfac7dc439afc45abdcf800b799c05d53704895b620d161ef08a442c55b2db`。2026-08-09 真机导入暴露编译器保留大写、地图库只接受小写的 `prior_map_id` 合同断层；当前新包统一生成小写且总长不超过 128 的 ID，正式 MapCase02 为 `piaseczno-5ddfac7dc439`，并已补齐 compile → integrity → MobileMapLibrary install/register/list/exact-read 回归。Swift/Python 还共同严格校验 manifest/report 计数、warnings/malformed rows 以及 road graph node/edge 绑定，手机原样生成包必须通过 PC production validator。旧 uppercase v2 开发包在普通 iOS/PC validator、旧向导和离线定位入口均默认拒绝，只能通过显式 diagnostic-only 参数做只读检查，不能参与新的扫描或处理。
 
 这是地图格式局部链路结论，不是产品发布结论。当前整体仍为 **REJECTED / NO-GO / developer smoke only**，J-04 为 **BLOCKER / NOT CLOSED**；Apple 双平台 clean link、完整 PriorMap discover、LiDAR 真机、Device Lab、Replay/FAR 和现场验收仍待执行。I10 exact-SHA 已通过完整 macOS host 合同，但在冷构建 iphoneos 依赖时暴露宿主 `rtabmap-res_tool` 未显式绑定；I11 已修复并等待新的 exact-SHA 复验，未创建冻结标签。
 

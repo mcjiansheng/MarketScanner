@@ -7,7 +7,6 @@ import argparse
 import hashlib
 import json
 import math
-import re
 import shutil
 import sys
 import tempfile
@@ -48,6 +47,7 @@ if __package__ in {None, ""}:
         PACKAGE_VERSION,
         PriorMapValidationError,
         build_package_manifest,
+        canonical_safe_name,
         validate_business_identity,
         validate_package,
     )
@@ -90,6 +90,7 @@ else:
         PACKAGE_VERSION,
         PriorMapValidationError,
         build_package_manifest,
+        canonical_safe_name,
         validate_business_identity,
         validate_package,
     )
@@ -97,7 +98,6 @@ else:
     from .xlsx_reader import BasicMapInfo, WorkbookElement, WorkbookError, read_workbook
 
 
-SAFE_NAME = re.compile(r"[^A-Za-z0-9._-]+")
 MAXIMUM_SPATIAL_CELL_ASSIGNMENTS = 8_000_000
 
 
@@ -1017,15 +1017,15 @@ def convert_workbook(
     if not floors:
         raise ConversionError("No valid geometry was found in the workbook.")
     for index, floor in enumerate(floors):
-        safe_floor = SAFE_NAME.sub("-", str(floor["id"])).strip("-") or "floor"
+        safe_floor = canonical_safe_name(floor["id"], fallback="floor")
         floor["preview_file"] = f"preview_floor_{index + 1:03d}_{safe_floor}.png"
     if basic_info is not None:
         canonical_source_hash = _canonical_business_sha256(basic_info, elements)
-        base_name = SAFE_NAME.sub("-", resolved_map_name).strip("-") or "map"
+        base_name = canonical_safe_name(resolved_map_name)
         prior_map_id = f"{base_name}-{canonical_source_hash[:12]}"
     else:
         canonical_source_hash = None
-        base_name = SAFE_NAME.sub("-", source_path.stem).strip("-") or "map"
+        base_name = canonical_safe_name(source_path.stem)
         prior_map_id = f"{base_name}-{source_hash[:12]}"
     output_path = (
         Path(output).resolve()
