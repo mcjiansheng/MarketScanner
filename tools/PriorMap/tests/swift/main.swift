@@ -16594,6 +16594,43 @@ do {
     let session = "S-1"
     let floor = "1"
 
+    // The 200k burst index stores the two finite string domains as compact
+    // codes. Exercise every accepted value and both rejection paths so the
+    // memory optimization cannot weaken exact observation matching.
+    let compactViews = ["front", "back", "unknown"]
+    let compactTracking = [
+        "uninitialized", "initializing", "stable", "usable",
+        "recovering", "weak", "lost", "manualCorrection", "unknown",
+    ]
+    for view in compactViews {
+        for tracking in compactTracking {
+            let sample = TagBurstFrameSample(
+                frameId: "compact-frame", observationId: "compact-observation",
+                boundNodeId: 1, frameTimestamp: 1, nodeTimestamp: 1,
+                depth: 0.9, view: view, tracking: tracking, confidence: 0.8)
+            guard let compact = VerifiedTagBurstFrame(
+                burstIndex: 0, sample: sample) else {
+                require(false, "valid compact burst-frame domain rejected")
+                continue
+            }
+            require(
+                compact.matches(view: view, tracking: tracking),
+                "compact burst-frame domain did not round-trip")
+            require(
+                !compact.matches(view: view == "front" ? "back" : "front",
+                                 tracking: tracking),
+                "compact burst-frame view mismatch was accepted")
+        }
+    }
+    let invalidCompactSample = TagBurstFrameSample(
+        frameId: "compact-invalid", observationId: "compact-invalid",
+        boundNodeId: 1, frameTimestamp: 1, nodeTimestamp: 1,
+        depth: 0.9, view: "side", tracking: "stable", confidence: 0.8)
+    require(
+        VerifiedTagBurstFrame(
+            burstIndex: 0, sample: invalidCompactSample) == nil,
+        "unknown compact burst-frame domain must fail closed")
+
     func jsonLine(_ object: [String: Any]) throws -> String {
         let data = try CanonicalJSONEncoder.encode(object)
         return String(data: data, encoding: .utf8)! + "\n"

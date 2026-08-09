@@ -378,21 +378,21 @@ enum TagObservationEvidenceParser {
                 guard let expectedBurst = bursts.burst(
                         at: expected.burstIndex),
                       expectedBurst.burstID == dto.burstID,
-                      expected.sample.frameId == dto.frameID,
-                      expected.sample.observationId == dto.observationID,
-                      expected.sample.boundNodeId == binding.node.nodeID,
-                      expected.sample.frameTimestamp == dto.frameTimestamp,
-                      expected.sample.nodeTimestamp == dto.nodeTimestamp,
+                      expected.frameID == dto.frameID,
+                      expected.boundNodeID == binding.node.nodeID,
+                      expected.frameTimestamp == dto.frameTimestamp,
+                      expected.nodeTimestamp == dto.nodeTimestamp,
                       expectedBurst.barcode == dto.barcode,
                       expectedBurst.symbology == dto.symbology,
                       expectedBurst.priorMapID == priorMapID,
                       expectedBurst.priorMapSHA256 == priorMapSHA256,
                       expectedBurst.floorID == floorID,
                       expectedBurst.trackingSessionID == trackingSessionID,
-                      expected.sample.depth == dto.depthInlierRatio,
-                      expected.sample.view == view(from: dto.surfaceNormal),
-                      expected.sample.tracking == dto.localizationState,
-                      expected.sample.confidence == dto.localizationConfidence else {
+                      expected.depth == dto.depthInlierRatio,
+                      expected.matches(
+                        view: view(from: dto.surfaceNormal),
+                        tracking: dto.localizationState),
+                      expected.confidence == dto.localizationConfidence else {
                     reject(
                         &audit, line.number, "observation_frame_exact_mismatch",
                         \.recordNodeBindingRejected)

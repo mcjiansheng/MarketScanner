@@ -102,7 +102,64 @@ struct VerifiedTagBurstFrame: Equatable {
     /// burst/map/session identity is stored once per burst, not repeated in
     /// every one of up to 200k frame dictionary values.
     let burstIndex: Int
-    let sample: TagBurstFrameSample
+    /// `observation_id` is already the dictionary key. Do not retain a
+    /// second String copy in every value at the 200k production ceiling.
+    let frameID: String
+    let boundNodeID: Int64
+    let frameTimestamp: Double
+    let nodeTimestamp: Double
+    let depth: Double
+    let confidence: Double
+    /// These two validated domains used to retain two additional Swift
+    /// Strings per frame. Compact codes preserve exact equality while
+    /// keeping the burst index below the frozen mobile RSS budget.
+    private let viewCode: UInt8
+    private let trackingCode: UInt8
+
+    init?(burstIndex: Int, sample: TagBurstFrameSample) {
+        guard let viewCode = Self.viewCode(sample.view),
+              let trackingCode = Self.trackingCode(sample.tracking) else {
+            return nil
+        }
+        self.burstIndex = burstIndex
+        self.frameID = sample.frameId
+        self.boundNodeID = sample.boundNodeId
+        self.frameTimestamp = sample.frameTimestamp
+        self.nodeTimestamp = sample.nodeTimestamp
+        self.depth = sample.depth
+        self.confidence = sample.confidence
+        self.viewCode = viewCode
+        self.trackingCode = trackingCode
+    }
+
+    func matches(view: String, tracking: String) -> Bool {
+        Self.viewCode(view) == viewCode
+            && Self.trackingCode(tracking) == trackingCode
+    }
+
+    private static func viewCode(_ value: String) -> UInt8? {
+        switch value {
+        case "front": return 0
+        case "back": return 1
+        case "unknown": return 2
+        default: return nil
+        }
+    }
+
+    private static func trackingCode(_ value: String) -> UInt8? {
+        switch value {
+        case "uninitialized": return 0
+        case "initializing": return 1
+        case "stable": return 2
+        case "usable": return 3
+        case "recovering": return 4
+        case "weak": return 5
+        case "lost": return 6
+        case "manualCorrection": return 7
+        case "unknown": return 8
+        default: return nil
+        }
+    }
 }
 
 final class TagObservationBurstEvidenceParseResult {
@@ -453,12 +510,17 @@ enum TagObservationBurstEvidenceParser {
                     complete: true)
                 bursts.append(burst)
                 for sample in parsedFrames {
+                    guard let verifiedFrame = VerifiedTagBurstFrame(
+                        burstIndex: burstIndex, sample: sample) else {
+                        // Every sample domain was validated above. Keep this
+                        // guard fail-closed if those domains ever drift.
+                        throw TagObservationBurstEvidenceParseError.framing(
+                            "validated frame domain could not be compacted")
+                    }
                     seenFrameIDs.insert(sample.frameId)
                     byObservationID[sample.observationId] =
                         TagObservationBurstEvidenceParseResult.StoredFrame(
-                            frame: VerifiedTagBurstFrame(
-                                burstIndex: burstIndex,
-                                sample: sample),
+                            frame: verifiedFrame,
                             consumed: false)
                 }
                 audit.recordAccepted += 1
