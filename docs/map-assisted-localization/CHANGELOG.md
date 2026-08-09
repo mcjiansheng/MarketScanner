@@ -2,6 +2,14 @@
 
 > 文档状态：**当前有效**。最后核对日期：2026-08-09。
 
+## 2026-08-09 — MapCase02 标准工作簿格式/几何阻断级收口
+
+- 正式 XLSX 以 `Basic Info + Element Info` 为权威，`Shelf Info` 仅审计；冻结 top-left anchor/pivot、生产角色集合、active/ignored 统计和 100,000 元素上限。
+- Swift/PC 同步关闭 relationship/worksheet alias、External/歧义 target、XML root/namespace 伪 authority、row/cell 引用、shared-string/boolean/公式、单元格大小、严格 JSON 数值与 duplicate element ID 的 fail-open/crash 路径；workbook sheet/relationship 各限制 4096 并使用线性索引。
+- prior-map v2 完整性从权威 active elements 重建 canonical identity、road graph、spatial index、distance fields 和 shelves-v2 segment；六字段 bounds、可选 `center_m/yaw_rad` 严格 finite 数值与 stable business identity uniqueness 均 fail closed。距离场在任何分配前执行 20k 单维、8m 单层、16m 包总 cells 上限与 RLE row budget。
+- `mapcase02.xlsx` 冻结结果：源 1838、active 1630、shelf 1301、fixed 329、road 0、presentation 208、active 越界 0；canonical `5ddfac…2db`、Swift package `5cc223…72a`、preview `d0c02b…a18` 未漂移。
+- 最终独立只读复审为 `P0=0 / P1=0`；低影响 parity/UX/visual/scale 项登记在 [`MAPCASE02_TODO.md`](MAPCASE02_TODO.md)。整体仍为 **REJECTED / NO-GO / developer smoke only**，J-04 仍为 **BLOCKER / NOT CLOSED**。
+
 ## 2026-08-09 — ESL Barcode Capture / Shelf Confirmation 阻断级收口
 
 - 核心 implementation I3：`fdcc5c87005a0128e0654eb43b1364898edd8f5d`；G3：`2a0a808554b9183cd76420b01135d5f6cdf7d38d`；证据 E3：`744cbb386403dbb548f4c27bf8988e85fa8c2c7e`；V3：`7dd42beac00a2144712503662147e77fee679ffc`。V3 exact-HEAD run `31276419986` 的 P0 job 暴露 Map Studio v1 manifest fixture 未同步新 Recovery/version/source-name 合同；生产 validator 未放宽。fixture 修复为 I4 `ec1fe96fc676c03514e591c40226112cde30fe76`，G4 `17871d839834487c777824c062980f3322521cdb` 已重新绑定 implementation；P0 四项与 Map Studio 106/106 本地 PASS，E4/V4 随后触发 run `31276999280`。

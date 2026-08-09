@@ -1,6 +1,8 @@
 # 手机地图导入（Mobile Map Import）
 
-> 状态：IMPLEMENTED / UNIT TESTED / INTEGRATION TESTED（Swift host 套件 I1-I14）
+> 文档状态：**当前有效**；IMPLEMENTED / UNIT TESTED / INTEGRATION TESTED（Swift host I1-I14 + MapCase02 正式套件）。最后核对日期：2026-08-09。
+
+正式超市 XLSX 使用 `Basic Info + Element Info` 权威合同；`Shelf Info` 只做审计。`Basic Info` 冻结门店、地图名、画布和 top-left anchor/pivot，调用方参数只能精确匹配，不能覆盖。历史 Element-only XLSX 只有在显式 legacy 模式下才可进入旧合同。
 
 ## 模块
 
@@ -10,7 +12,7 @@
 - `MapSourceImportCoordinator.swift`：格式识别 → 调用对应 importer → 计算 `sourceFileSha256` / `canonicalSourceSha256` → 产出 `MapSourceImportReport`。
 - `CanonicalPriorMapSource.swift` / `CanonicalJSONEncoder.swift`：三格式统一业务模型与确定性编码（sort keys、无空白、数值规范化、忽略原始文件名/格式）。
 - `XLSXZipReader.swift`（自研安全 ZIP 读取，系统 zlib raw inflate）：traversal/数量/大小/压缩比限制。
-- `XLSXWorkbookReader.swift` / `XLSXWorksheetReader.swift`：workbook relationships 定位 `Element Info` sheet、shared strings、流式行/单元格解析；公式（`<f>` 或 `t="str"`）拒绝。
+- `XLSXWorkbookReader.swift` / `XLSXWorksheetReader.swift`：按 OpenXML namespace、精确根/父层级和唯一 internal worksheet relationship 定位权威 sheet；sheet/relationship 各限制 4096 并建立线性索引；严格 shared strings、row/cell reference、布尔值与单元格大小；公式（`<f>` 或 `t="str"`）拒绝。
 - `RFC4180CSVReader.swift` / `CSVMapSourceImporter.swift`：流式 RFC 4180，quoted newline、`""` 转义、CRLF/LF/BOM、NUL/非法 UTF-8/字段数不一致拒绝。
 - `JSONMapSourceImporter.swift`：接受 `MarketScannerPriorMapSource` v1，复用严格解析器；缺 identity 时补入。
 - `SourceGeometry.swift` / `ElementNormalizer.swift`：坐标合同（top_left/bottom_left 预设）与元素规范化（与 PC `_normalized_element` 一致）。
@@ -42,3 +44,6 @@
 - I11：非法 UTF-8 拒绝。
 - I13：坐标预设 top_left / bottom_left y 轴符号。
 - I14：多楼层导入。
+- MapCase02：正式 `Basic Info + Element Info`、Shelf audit、1838→1630 active、角色几何、top-left anchor、canonical v3 round-trip、XML root/authority、sheet/relationship 上限、关系/row/cell/resource 负例与 MapCase01 legacy 兼容。
+
+MapCase02 canonical SHA 冻结为 `5ddfac7dc439afc45abdcf800b799c05d53704895b620d161ef08a442c55b2db`。这是标准工作簿局部 PASS；整体仍为 **REJECTED / NO-GO / developer smoke only**，J-04 未关闭。

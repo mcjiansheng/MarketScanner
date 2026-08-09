@@ -1,6 +1,6 @@
 # 手机端测试计划（Mobile Test Plan）
 
-> 状态：**当前有效**；I6 聚焦 ESL 回归已执行，I5 关键长时 host workflow 仅作为历史证据；I6 完整长方法、完整 discover、设备与现场详细测试仍按时间安排延期；V4 exact-SHA 为 7/8 FAIL，DEVICE 未完成。最后核对：2026-08-09。
+> 状态：**当前有效**；MapCase02 正式套件与非超长 PriorMap 分组已执行；超长 tag scale 后半段、设备与现场详细测试仍延期；V4 exact-SHA 为 7/8 FAIL，DEVICE 未完成。最后核对：2026-08-09。
 
 ## 自动测试（已实现，Swift host 默认模式 + 模式化套件）
 
@@ -8,7 +8,8 @@
 |---|---|---|
 | I1-I14 | 三格式导入、canonical parity、公式/ZIP/CSV/JSON 安全 | Swift host + --import-suite |
 | C5/C7/C9/C10 | 编译器路网统计、距离场 SHA、package self-load、PC parity | Swift host |
-| P1/P2/P7/P8/P12 | Fast Path 收敛、快照事务、任务状态机；Snapshot/Result durable intent、`0755→rename→bound-FD 0555/fsync`、root/lock descriptor/path最终复核、mismatched removal tombstone 永久 conflict quarantine | I5 长时 host workflow 943.159 s PASS；Qualification focused PASS；完整 PriorMap discover 延期；exact-SHA 待新 run |
+| MapCase02 | 正式 Basic/Element workbook、Shelf audit、top-left、1838→1630 active、role geometry、canonical/package/preview golden；XLSX authority、strict scalar、resource budget 与派生工件重签 mutation | Swift `--mapcase02-suite` + PC converter/schema **PASS**；独立复审 `P0=0/P1=0` |
+| P1/P2/P7/P8/P12 | Fast Path 收敛、快照事务、任务状态机；Snapshot/Result durable intent、`0755→rename→bound-FD 0555/fsync`、root/lock descriptor/path最终复核、mismatched removal tombstone 永久 conflict quarantine | I5 长时 host workflow 943.159 s 历史 PASS；当前非超长 PriorMap 217 项 PASS；完整 tag scale 后半段延期；exact-SHA 待新 run |
 | Native/AbsolutePrior contract | 4096/4097、RESOURCE_REQUIRED+error；quality v2 strict typed DTO 的 unknown/duplicate/wrong type/Bool、path/disposition/request identity、graph/factor SHA、runtime ABI、C trajectory/skeleton/publish/factor count mismatch；RunSummary 仅投影已验证 `solver.factor_count`；constraint/manual/recovery exact raw-line watermark、345,600 资格上限、accepted=false 非致命、manual ISO/Unix 与 v2/v3 nearest/second margin | Native executable + Swift host（合并后统一重跑） |
 | J-04 component identity | Graph Reader node mapID/link component derivation；constraint/manual 新 schema 的原子 bound node + RTAB-Map map ID；最终 component 重算与错 component 拒绝 | **BLOCKER：写侧 schema 尚无可核验证据，NOT RUN / NOT CLOSED** |
 | T1/T3/T4/T6/T7/T12 | 1 Hz 重采样、yaw 最短弧、lost/gap、100k 行 | Swift host |
@@ -24,20 +25,20 @@
 
 ## 未关闭（未写 PASS；逐项注明已运行/未运行）
 
-- I5 的长时 host workflow 已 PASS，但 I6 未重新完整运行，完整 PriorMap `discover` 也仍按时间要求延期。新 publication/ESL 合同仍需 committed exact-SHA run；host evidence 不是 Replay/FAR 或真机 PASS。
+- 2026-08-09 已完成 PriorMap 非超长分组 217 项与 Map Studio 108/108；长方法通过 300k finalization 和 1,728,000 trace 后主动停在 `tag-evidence-scale`，余项见 [`../map-assisted-localization/MAPCASE02_TODO.md`](../map-assisted-localization/MAPCASE02_TODO.md)。新 publication/ESL 合同仍需 committed exact-SHA run；host evidence 不是 Replay/FAR 或真机 PASS。
 - 三格式 canonical/编译语义 parity 已自动覆盖；真实业务大图 Replay/FAR 仍 NOT RUN。
 - E2E-3 真机短路线（5~10 分钟扫描、10 个价签、手机处理、手机导出）。
 - E2E-4 Sam 路线（100+ truth tags、现场控制点）。
 - Excel / Numbers / WPS 打开验证。
 - 资源门：peak RSS、处理时长、thermal、磁盘、电量、中断/崩溃恢复。macOS ACL、BSD `uchg`/`schg` file flags 和相关扩展属性仍未资格化；POSIX `0444/0555` 不能冒充这些边界的 PASS。
 - exact-final-SHA GitHub Actions：历史三次、V3 与 V4 均 FAIL。V4 run `31276999280@8ba2f697a8213a1bcd4bf6fb7197d155cb09b865` 为 7/8，仅 macOS/iOS host §18 contract FAIL；当前 I6/G6 需 E6/V6 后新的全量 rerun。
-- V4 已证明 P0、exact binding、ABI、Ubuntu/Windows native clean build 与 Python contracts PASS；I5 本地 P0 4/4、Map Studio 106/106、长 host 943.159 s PASS；I6 聚焦 120/120 PASS。新 exact-HEAD 全绿前仍不得声明 exact-SHA PASS。
+- V4 已证明 P0、exact binding、ABI、Ubuntu/Windows native clean build 与 Python contracts PASS；本轮 Map Studio 108/108、PriorMap 非超长 217 项、MapCase02 正式套件 PASS。新 exact-HEAD 全绿前仍不得声明 exact-SHA PASS。
 - Apple simulator/device 两套 cold native dependencies + 两次真实 clean compile/link：最新 run `31180693841` 中因前置 macOS host E2E 失败而全部 skipped，仍为 NOT RUN。
-- I5 Result recovery 与 I6 ESL follow-up 最终独立复审均为 `P0=0 / P1=0`；scanner 级可注入 hung-worker 集成测试、cadence/override 与更深 recovery evidence 断言已登记 TODO。Qualification 28/28、Map Studio 106/106、P0 4/4、I5 长 host workflow、I6 聚焦 120/120与关键 scale PASS。完整 PriorMap discover、I6 长方法重跑、新 exact-SHA、Apple/设备/现场与 J-04 仍未关闭，最终判断保持 **REJECTED / NO-GO / developer smoke only**。
+- I5 Result recovery、I6 ESL follow-up 和 MapCase02 最终独立复审均为 `P0=0 / P1=0`；低影响项分别登记 ESL/MapCase02 TODO。完整 tag scale 后半段、新 exact-SHA、Apple/设备/现场与 J-04 仍未关闭，最终判断保持 **REJECTED / NO-GO / developer smoke only**。
 
 ## 明日详细执行队列
 
-1. `python3 -m unittest discover -s tools/PriorMap/tests -v`；不得把已通过的单一长方法冒充全 discover。
+1. 完成 `python3 -m unittest discover -s tools/PriorMap/tests -v` 的 `tag-evidence-scale` 后半段；不得把已通过的 217 项和前置规模阶段冒充全 discover。
 2. 保留 XLSX 100k、Replay/FAR 与真实业务数据矩阵；workflow/finalization/trace/tag 主长路径已在 I5 执行。
 3. Map EEXIST、uppercase/noncanonical UUID、`.`/`..` CAS集成。
 4. Result hardlink/`0644` clone/post-hash mutation、manifest/receipt post-read、root final sweep、intent creation/temp/removal/staging replacement。
@@ -46,4 +47,5 @@
 7. 按 [`../map-assisted-localization/ESL_CAPTURE_TODO.md`](../map-assisted-localization/ESL_CAPTURE_TODO.md) 执行 LiDAR 真机 30 秒连续性、Vision p50/p95/CPU/memory/thermal、照明/反光/斜视/多价签、confirmation conflict 和 manifest v3 矩阵。
 8. 补齐 `Libraries/iphonesimulator` / `Libraries/iphoneos` platform dependencies 并完成两次 clean compile-link；当前缺失的 Eigen/PCL/OpenCV headers 只可记录为 build blocker。
 9. 完整运行 I6 的长时 PriorMap host workflow；测量 scan-stop finalization-owned audit/terminal Recovery stable-read 的 UI latency。
+10. 执行 [`../map-assisted-localization/MAPCASE02_TODO.md`](../map-assisted-localization/MAPCASE02_TODO.md) 的低影响 parity/UI/preview/visual baseline 与真机 MapCase02 矩阵。
 10. 深化 Windows portable basename 尾随点/空格和设备名拒绝，并评估 Debug illegal-transition assertion 前后的 audit 持久化顺序。

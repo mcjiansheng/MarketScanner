@@ -1,6 +1,6 @@
 # 手机 PriorMap 编译器（Mobile Prior Map Compiler）
 
-> 状态：**当前有效**；IMPLEMENTED / UNIT TESTED / INTEGRATION TESTED（C5/C7/C8/C9/C10）。最后核对：2026-08-07。
+> 状态：**当前有效**；IMPLEMENTED / UNIT TESTED / INTEGRATION TESTED（C5/C7/C8/C9/C10 + MapCase02）。最后核对：2026-08-09。
 
 ## 模块
 
@@ -27,6 +27,8 @@ MapShelf（货架）/ MapTable（桌）/ MapPillar（柱）/ MapTableFeature（�
 
 `shelves.json` 当前为 schema v2。每个货架物理段以 `shelf_segment_id` 唯一标识，并携带 start/end、longitudinal axis、front/back normal、side semantics version 和 orientation provenance；相同 `shelf_code` 的不同段不得合并或覆盖。loader 与 compiler 同时按 v2 验证，旧 v1 只作为明确的历史兼容输入处理。
 
+正式 workbook 生成 package manifest v2。完整性入口不信任重签后的派生 JSON：它从 active `elements.json` 重算 canonical identity、road graph、spatial index、distance fields 和 shelf segments，并精确比较；role/kind/point-count/nondegenerate、source coordinate、统计、ID 与 strict scalar 任一不一致均拒绝。距离场在 spatial grid 前构建并在任何 `Double→Int`/RLE 分配前执行单维 20,000、单层 8,000,000、包总计 16,000,000 cells 上限。
+
 ## 坐标变换（冻结）
 
 ```text
@@ -41,3 +43,4 @@ transform: x_m = x_cm/100; y_m = -y_cm/100 (top_left) 或 +y_cm/100 (bottom_left
 - C7：距离场 per-level `data_sha256` 与 PC oracle 一致（fixture 6 level 全匹配）。
 - C9：编译产物通过生产快照读取器自检（package self-load）。
 - C10：三格式 canonical parity 基础上的编译语义 parity。
+- MapCase02：Swift package self-load、重签 canonical/graph/spatial/distance/shelf mutation、strict integral-float token、OOM/overflow budget 与 duplicate element ID typed rejection；冻结 package SHA `5cc223ca505d72158748caf5a0efc540f870ea6d9858fee1572e9f570a69b72a`。

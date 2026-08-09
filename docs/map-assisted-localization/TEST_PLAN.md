@@ -1,8 +1,16 @@
 # 地图辅助定位阶段一至阶段三测试计划
 
-> 文档状态：**当前有效**。最后核对日期：2026-07-28。
+> 文档状态：**当前有效**。最后核对日期：2026-08-09。
 
 ## 自动测试
+
+### MapCase02 冻结回归
+
+正式输入 `map/mapcase02/mapcase02.xlsx` 的 SHA-256 必须为 `1ddf428fc4dd6e4e8bd33258d0cbfaab87b809c4dedd6b8baca9e167c14b5e6a`。Swift `--mapcase02-suite` 与 PC converter/schema 必须同时满足 1838/1630/1301/329/0/208 统计、0 active 越界、canonical `5ddfac7dc439afc45abdcf800b799c05d53704895b620d161ef08a442c55b2db`、Swift package `5cc223ca505d72158748caf5a0efc540f870ea6d9858fee1572e9f570a69b72a` 和 preview `d0c02be63dff3ab002dcf931ce7d0c5149152b78bea139fb1b0a2d86be196a18`。
+
+负例覆盖关系别名/外部 target/namespace 伪 authority、缺失/重复/前导零 row 与 cell、非法 shared-string/boolean/公式/超大 cell、100001 元素、错误角色几何、重复 element ID、严格整数 token、距离场预算，以及重签名后 canonical/graph/spatial/distance/shelf 派生工件篡改。任一端接受集合不同即失败。
+
+2026-08-09 本机证据：MapCase02 Swift 正式套件 PASS；PriorMap 非超长组 217 项 PASS；Map Studio 108/108 PASS；PC MapCase02 validator `valid=true`。完整 `tag-evidence-scale` 长路径、Apple clean link、真机/LiDAR/现场仍延期，不能用该局部 PASS 关闭 J-04 或产品 NO-GO。
 
 P0 生产安全不变量（CI 使用相同选择器，任一失败即失败关闭）：
 

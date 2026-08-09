@@ -1,7 +1,7 @@
 # Mobile-Only V1 产品契约
 
 > 状态：**当前有效**；DESIGNED / IMPLEMENTED / HOST TESTED（本文档冻结产品边界与数据合同）
-> 最后对齐：2026-08-07
+> 最后对齐：2026-08-09
 
 ## 1. 目标
 
@@ -33,14 +33,15 @@ Mobile V1 只承诺 `Fast reduced graph`，以及 Fast 质量失败后至多一�
 ## 3. 手机导入（Track B1）
 
 - 支持 `.xlsx` / `.csv` / `.json` 三种格式，从 Files 应用经 security-scoped document picker 选择。
-- 导入前必须显式提供 `store_id` 和地图名称；两者使用统一业务标识策略：NFC、非空、无首尾空白/控制字符/隐藏 basename/路径分隔符，`store_id` 最多 128 UTF-8 bytes，地图名称最多 200 UTF-8 bytes。PC XLSX 编译入口同样要求显式 `--store-id`。
+- 正式 `Basic Info + Element Info` XLSX 从 `Basic Info` 取得 `storeCode`、`map_name`、画布和可选 scale；UI/CLI 门店与名称只能省略或作为 exact assertion，不能覆盖。CSV、legacy Element-only XLSX 与缺少内嵌 identity 的 JSON 仍必须显式提供 `store_id` 和地图名称。业务标识统一要求 NFC、非空、无首尾空白/控制字符/隐藏 basename/路径分隔符，`store_id` 最多 128 UTF-8 bytes，地图名称最多 200 UTF-8 bytes。
 - 选中的文件通过 no-follow、regular-file、单 hardlink、前后 inode/size/mtime/ctime 一致性检查复制到 App 私有 staging；复制使用 bounded chunk、`O_EXCL`、data fsync 与 parent-directory fsync。后续不再读取 provider 原路径；复制失败只清理本次新建 staging 文件，不建立地图记录。
-- 三格式解析后统一为 `MarketScannerPriorMapSource` v1（`format = "MarketScannerPriorMapSource"`、`version = 1`）。
+- 正式 workbook 解析为 canonical source v3 并编译为 package manifest v2；历史输入保留 v1/v2 明确兼容，不能把旧坐标或身份规则隐式升级。
 - 坐标合同：源文件必须显式或通过用户预设得到 unit/origin/x_axis/y_axis/rotation。V1 提供两个用户可理解的预设：
   - 门店图：左上角为原点（unit=centimetre, origin=top_left, x=right, y=down, rotation=clockwise_degrees）
   - CAD 图：左下角为原点（origin=bottom_left, y=up）
 - 三格式等价性：同一业务地图分别制作为 xlsx/csv/json 后，必须得到相同的 `canonicalSourceSha256`、元素清单、规范化坐标、楼层、货架、结构与路网语义。`sourceFileSha256` 允许不同。
 - Canonical SHA 忽略：原始文件名、ZIP entry 顺序、XML attribute 顺序、CSV CRLF/LF、JSON key 顺序、非业务空白。
+- 正式 XLSX 的 active production element 上限为 100,000；workbook sheets 与 relationships 各限制 4096 并使用线性 authority 索引；relationship/worksheet authority、XML namespace/父层级、row/cell reference、shared strings、公式、strict scalar、1 MiB cell 和角色几何全部 fail closed。
 
 ### 3.1 导入安全（冻结上限）
 
@@ -50,6 +51,7 @@ Mobile V1 只承诺 `Fast reduced graph`，以及 Fast 质量失败后至多一�
 | ZIP entries | 4096 |
 | 总解压 | 256 MiB |
 | 单 XML | 64 MiB |
+| workbook sheets / relationships | 各 4096 |
 | 行 | 500,000 |
 | 单 cell | 1 MiB |
 | shared strings | 1,000,000 |

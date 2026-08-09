@@ -6,13 +6,15 @@ Map Studio 保留单设备、多设备和“导入/管理先验地图”入口�
 
 ## 地图导入
 
-1. 选择含 `Element Info` 的 XLSX。
-2. 可选输入业务地图名称。
+1. 选择含 `Basic Info + Element Info` 的正式 XLSX；`Shelf Info` 如存在只做审计。
+2. 正式工作簿的门店、地图名、画布和 top-left 合同来自 `Basic Info`；界面字段只能留空或提供精确断言，不能覆盖权威值。
 3. 选择空输出目录。
 4. 后台完成坐标/几何转换、逐文件 hash、跨文件 schema 校验和预览。
 5. 显示地图 ID、包 SHA‑256、楼层、范围、元素统计、道路连通和 warning。
 
 地图包成果只通过 artifact allowlist 读取；源 XLSX 不修改。界面说明阶段二有界 LiDAR 结构匹配已经实现，但真实 LiDAR 现场验收仍未完成。
+
+MapCase02 已在 2026-08-09 通过 PC 转换、v2 schema、确定性 canonical/preview 与跨端 golden；该结论只覆盖标准工作簿导入/编译链路。更广产品仍是 **REJECTED / NO-GO / developer smoke only**，J-04 未关闭。
 
 ## 地图辅助会话向导
 

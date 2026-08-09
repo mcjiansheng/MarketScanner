@@ -38,7 +38,7 @@
 - 对确认字段进入正式 XLSX/CSV schema bump，而不是依赖当前 JSON/GeoJSON/内部导出字段。
 - 继续 UI 视觉精修、Dynamic Type、VoiceOver focus order 和横竖屏真机检查。
 - 完整 PriorMap、scale、Replay/FAR 和现场控制点矩阵按主测试计划执行。
-- MapCase02 等待地图项目组提供正式规则；禁止猜测坐标、scale、offset、rotation 或加入 store/map/file-specific hack。
+- MapCase02 已按独立正式规则完成阻断级收口；后续低影响 parity/UI/visual/真机项转入 [`MAPCASE02_TODO.md`](MAPCASE02_TODO.md)。继续禁止 store/map/file-specific scale、offset、rotation hack。
 - 深化 Windows-portable source database basename：拒绝尾随点/空格别名和 `CON`、`NUL` 等保留设备名。当前已拒绝 slash、drive path 与 canonical casefold 冲突，macOS 当前生产路径风险较低，因此延期。
 - 评估 `PriceTagCaptureCoordinator.illegalTransitionLocked` 的 Debug 诊断顺序。当前 `assertionFailure` 可能在 diagnostic 被 ViewController 持久化前中止 Debug 进程；后续可采用非致命 assertion hook 或先持久化再触发的测试策略，Release 行为不受影响。
 - 为 `ProcessingResourceGovernor` host test 增加独立的约 250 ms cadence 合同，并用锁保护 `thermalStateOverride` 的测试 backing storage。当前 2 秒有界轮询只验证真实 production timer liveness；完全不触发仍会失败，但不把严格 cadence 或 Thread Sanitizer 资格写成已完成。

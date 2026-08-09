@@ -1,6 +1,6 @@
 # MarketScanner RepairV2 生产就绪当前代码审查
 
-> 文档状态：**当前有效**。最后核对日期：2026-08-07。
+> 文档状态：**当前有效**。最后核对日期：2026-08-09。
 > 当前增量审查输入：`MarketScanner_Mobile_Only_V1R5_Second_Independent_Full_Code_Review_NO_GO.md` 和 `MarketScanner_Mobile_Only_V1_Release_Candidate_Blocker_Closeout_Prompt_V2.md`；完整入口见 [`CURRENT_REVIEW.md`](CURRENT_REVIEW.md)。
 > 当前 RC 基线：`mobile-only-v1r5-field-qualification-integrity-scale-closeout@81b6dbb216e843d363fd0088f673076add78013f`。
 > 当前 wave：`mobile-only-v1-release-candidate-blocker-closeout`；实施分支同名。
@@ -10,9 +10,11 @@
 
 当前结论为 **NO-GO / NOT PRODUCTION READY**。W2R 的 evidence bundle、checkpoint cleanup、原子可见写入、复制后本地保留及 typed finalization disposition 已有自动化保护；这些能力是生产化工作的安全起点，不代表最终产品验收完成。
 
+MapCase02 正式工作簿/几何增量已完成独立 P0/P1 审查并修复全部发现，最终 `P0=0 / P1=0`；允许局部表述 `MAPCASE02 / STANDARD SUPERMARKET XLSX FORMAT PASS`。本机 MapCase02 Swift/PC golden、PriorMap 非超长分组 217 项和 Map Studio 108/108 均 PASS。完整长方法后半段、Apple clean link、exact-SHA、Replay/FAR、真机和现场仍未完成，因此本节不提升生产资格。
+
 当前 Mobile-Only RC 除 RC-B19/J-04 component identity 外，已完成 RC-B01…RC-B03、RC-B05…RC-B28 的本轮代码与本地主机自动化闭包，并同步处理影响正确性、事务、安全、规模和审计的 RC-H01…RC-H40。J-04 仍需冻结 prior-independent final-link component policy，并完成 node snapshot C ABI 与 constraint/manual evidence schema 的 breaking migration；现有记录不得追溯伪证 same-component。RC-B04 exact-SHA CI、RC-B29 Replay/FAR policy freeze、RC-B30 Apple clean build/Device Lab 也仍未关闭。Route A 固定为 Fast reduced graph → 至多一次 Full existing-graph optimization → `RESCAN_SESSION`；True sensor Deep 不属于 V1。当前最高允许表述是 **REJECTED / NO-GO / developer smoke only**。
 
-当前 RC diff 的独立只读代码审查已执行，状态为 **COMPLETED / BLOCKERS FOUND AND FIXED IN CURRENT DIFF**。ESL 核心 implementation I3 与 fixture I4/G4 历史绑定保持可追溯。V4 exact-HEAD run `31276999280@8ba2f697a8213a1bcd4bf6fb7197d155cb09b865` 为 7/8：除 macOS/iOS host contract 外全部 required jobs PASS；失败点是 §18 timer 固定等待。Result recovery I5 `4d78d4646c01fe50bc0ac07eb2266879a24348db` / G5 `d2eb9e2cb9b349179c410205d8eb9f44c2c30188` 关闭 timer/worker 抖动和 Result removal tombstone authority-laundering P1；其完整长 host 方法 943.159 s PASS。当前 ESL follow-up I6 `396097ea474be2e1155098cd709d1edfa9064a83` / G6 `f65dbb0a3d0337ca926f4142489555d409089939` 加入一秒 request deadline、bounded two-lane Vision executor、hung-lane quarantine/capacity fuse、cancel/evidence 线性化和 versioned tag node authority。I6 聚焦证据为 Stage-3 82/82、localized-output-store 28/28、session snapshot 10/10，合计 120/120；I5 长方法未在 I6 重新完整运行。I5 Result recovery 与 I6 ESL follow-up 最终独立复审均为 `P0=0 / P1=0`；scanner 级可注入 hung-worker 集成测试及其他低影响项已登记 `ESL_CAPTURE_TODO.md`。完整 PriorMap `discover` 仍按时间延期；V4 仍是失败证据，新 E6/V6 exact-HEAD 尚未形成 PASS。该审查不关闭 J-04，也不替代 exact-SHA、Apple、Replay/FAR 或设备/现场资格。
+当前 RC diff 的独立只读代码审查已执行，状态为 **COMPLETED / BLOCKERS FOUND AND FIXED IN CURRENT DIFF**。ESL 核心 implementation I3 与 fixture I4/G4 历史绑定保持可追溯；I5 Result recovery、I6 ESL follow-up 和 MapCase02 最终复审均为 `P0=0 / P1=0`。当前 MapCase02 worktree 证据为 PriorMap 非超长 217 项、Map Studio 108/108 和 Swift/PC 正式套件 PASS；长方法通过 300k finalization 与 1,728,000 trace 后按时间停在 `tag-evidence-scale`。V4 exact-HEAD 仍是 7/8 失败证据，新 committed exact-HEAD 尚未形成 PASS。该审查不关闭 J-04，也不替代 exact-SHA、Apple、Replay/FAR 或设备/现场资格。
 
 P7R1 增量已实现 production-only publish、publish 前即时 production selfcheck、package-bound release identity、Device App SHA 与 release SHA 精确绑定、从 immutable version 自动生成且可由 self-contained source bundle 重新派生的 typed trajectory evidence、Field Evidence v3、descriptor-bound JSON/CSV 读取、exact plan/release/policy/CSV/Device Evidence publication package、published manifest v4 自包含 evidence、package stable-read 和真实 About runtime mode。上述只能标记 **IMPLEMENTED / AUTOMATED TESTED**；最终精确 SHA 全矩阵成功后才是 **CI VERIFIED / READY FOR HUMAN QUALIFICATION**。真实 P5/P6/P7/P8 未执行，禁止标记 **HUMAN REVIEWED / REAL DEVICE PASS / FIELD PASS / PRODUCTION QUALIFIED**。
 

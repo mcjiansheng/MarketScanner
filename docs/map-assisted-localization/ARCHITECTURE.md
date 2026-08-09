@@ -6,10 +6,12 @@
 
 阶段二在阶段一先验地图和双模式采集基础上增加深度结构匹配与 Vision 价签定位；阶段三增加 PC 派生轨迹优化、质量门禁、人工复核和最终导出。现有自由扫描、连续 RTAB-Map 单库和 NFC 暂停策略保持不变。
 
+正式超市 XLSX 路径以 `Basic Info + Element Info` 为双权威输入，`Shelf Info` 只审计。iOS 与 PC 共用 production role、top-left anchor、strict XLSX、canonical v3 和 prior-map package v2 合同；包完整性从 active elements 确定性重建 canonical identity、road graph、spatial grid、distance fields 与 shelves-v2 方向语义。2026-08-09 MapCase02 局部链路结论为 `MAPCASE02 / STANDARD SUPERMARKET XLSX FORMAT PASS`，不改变整体 **REJECTED / NO-GO / developer smoke only** 或 J-04 **BLOCKER / NOT CLOSED**。
+
 阶段一定位范围限定为单次扫描绑定单一楼层。地图包可包含多个楼层供开始前选择，但扫描中不切换楼层，也不建立跨楼层约束。ARKit `x/z` 投影到地图 `x/y`；楼层内少量竖直位移不进入二维先验位姿，原始 ARKit/RTAB-Map 三维数据照常保存。
 
 ```text
-Element Info XLSX（只读）
+Basic Info + Element Info XLSX（只读；Shelf Info 仅审计）
   -> tools/PriorMap 统一坐标与几何
   -> 版本化 PriorMap-* 包
        ├─ PC Map Studio 导入、校验、缩放预览

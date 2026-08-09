@@ -51,8 +51,14 @@
 
 ## 本轮审查与回归证据
 
+### MapCase02 标准工作簿冻结候选
+
+- `MAPCASE02 / STANDARD SUPERMARKET XLSX FORMAT PASS`：正式 `Basic Info + Element Info`、Shelf audit-only、top-left anchor、production roles、canonical v3/package v2 和派生工件 exact binding 已在 Swift/PC 同步关闭阻断项。
+- 冻结统计为源 1838、active 1630、shelf 1301、fixed 329、road 0、presentation 208、active 越界 0；canonical `5ddfac7dc439afc45abdcf800b799c05d53704895b620d161ef08a442c55b2db`、Swift package `5cc223ca505d72158748caf5a0efc540f870ea6d9858fee1572e9f570a69b72a`、PC preview `d0c02be63dff3ab002dcf931ce7d0c5149152b78bea139fb1b0a2d86be196a18`。
+- 独立 MapCase02 复审发现的 P1 已全部修复，最终为 `P0=0 / P1=0`；P2 与延期资格项见 [`../map-assisted-localization/MAPCASE02_TODO.md`](../map-assisted-localization/MAPCASE02_TODO.md)。该局部 PASS 不关闭 J-04、Apple、Device Lab、现场或 exact-SHA 门。
+
 - 最终关键生产增量完成两轮只读审查，发现的 Map `.`/`..`、Result quarantine crash orphan、Snapshot process-lock binding和历史v1顶层symlink兼容均已修复；该事务增量最终 `P0=0 / P1=0 / 新的可修P2=0`。I6 ESL 最终独立复审关闭 callback/evidence timeout 误取消 fresh request 和 manifest v3 误强制历史 tag v1 使用 burst authority两个 P1，复审为 `P0=0 / P1=0`；scanner 级可注入 hung-worker 集成测试及其他低影响项已登记 [`../map-assisted-localization/ESL_CAPTURE_TODO.md`](../map-assisted-localization/ESL_CAPTURE_TODO.md)。这不是 release review PASS，J-04 仍是独立未关闭 blocker。
-- 当前 I6 证据：Stage-3 82/82、localized-output-store 28/28、session snapshot 10/10，合计 120/120 PASS；Qualification 28/28、Map Studio 106/106、P0 4/4、iOS/C4 12/12及 I5 长时 host workflow 943.159 s 是既有证据；85-source membership、SwiftPM exact pin、contract drift、pbxproj、Swift/Python compile和diff-check PASS。完整 PriorMap `discover` 与 I6 长方法重跑仍按时间要求延期，不复用历史 166/166 作为 I6 结论。
+- 当前 MapCase02 后证据：PriorMap 非超长分组 217 项 PASS、Map Studio 108/108 PASS、MapCase02 Swift/PC 正式套件 PASS；85-source membership、SwiftPM exact pin、contract drift、pbxproj、Swift/Python compile和diff-check PASS。完整长方法已通过 300k finalization 与 1,728,000 trace 阶段，但按时间主动停在 `tag-evidence-scale`，所以仍不登记完整 discover PASS。
 - 300,000 条 finalization：peak RSS 12,795,904 bytes；1,728,000 条 trace transition storm：保留 172,801 条，peak RSS 58,769,408 bytes。
 - 200,000 burst frames + 200,000 observations 全链路：243,952,646 input/temporary bytes，200,000 accepted observations，融合 1 个 accepted physical tag，884.922 s wall，peak RSS 670,662,656 bytes（约 639.6 MiB，低于 768 MiB host 门）。`StrictJSONLStreamReader` 通过每行 autorelease pool 消除长时 Foundation autorelease 累积，并保留完整 strict validator。
 - Map quarantine 当前 diagnostic v3 以 strict canonical bytes 绑定 transaction/prior-map/source/quarantine/payload-tree 和 payload dev/inode；真实子进程覆盖 source thaw、payload/diagnostic/publish 的七个 durable `_exit` 窗口，并验证 source replacement 在 intent 删除前被拒绝。legacy v2 仅兼容完整冻结的 `0555` final；v2 writable `0755` final 和 v2 incomplete source transaction 均保留现场并 fail closed。
@@ -70,7 +76,8 @@
 
 ## 明日 TODO（按 2026-08-09 时间收口决定延期）
 
-- 完整 `python3 -m unittest discover -s tools/PriorMap/tests -v`；I5 已完成其中最重的 host workflow/finalization/trace/tag 路径，但 I6 未重跑，不把历史单方法 PASS 冒充 I6 全 discover PASS。
+- 完整 `python3 -m unittest discover -s tools/PriorMap/tests -v` 的超长 `tag-evidence-scale` 后半段；本轮其他 217 项与前置 300k finalization/1,728,000 trace 已通过，仍不能冒充完整 discover PASS。
+- 按 [`../map-assisted-localization/MAPCASE02_TODO.md`](../map-assisted-localization/MAPCASE02_TODO.md) 执行低影响 parity/UI/visual baseline 与真机 MapCase02 矩阵。
 - 已写但未运行的 Map EEXIST、uppercase/noncanonical UUID、`.`/`..` CAS和 Result artifact/manifest/receipt/final-sweep/intent replacement完整集成断言。
 - 两个128 MiB delayed replacement场景增加精确测试hook，消除时序依赖。
 - `listResultsLocked()` root创建/枚举失败补持久可见的listing diagnostic与`NSLog`，不再静默等价于空库。

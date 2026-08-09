@@ -1,6 +1,8 @@
 # MarketScanner 可复现构建与依赖供应链
 
-> 文档状态：**当前有效**。最后核对日期：2026-08-07。
+> 文档状态：**当前有效**。最后核对日期：2026-08-09。
+
+MapCase02 reproducibility golden：source SHA `1ddf428fc4dd6e4e8bd33258d0cbfaab87b809c4dedd6b8baca9e167c14b5e6a`，canonical `5ddfac7dc439afc45abdcf800b799c05d53704895b620d161ef08a442c55b2db`，Swift package `5cc223ca505d72158748caf5a0efc540f870ea6d9858fee1572e9f570a69b72a`，PC preview `d0c02be63dff3ab002dcf931ce7d0c5149152b78bea139fb1b0a2d86be196a18`。这些 hash 只冻结标准工作簿链路，不能替代 exact-final-SHA CI 或产品资格。
 
 ## PC release preset
 
@@ -26,6 +28,8 @@ macOS 使用 `tools/SupermarketMapStudio/configure_pc_macos.sh` 安装/发现 Ho
 `tools/Qualification/market_scanner_build_identity.py` 是 Xcode 脚本阶段、CI 和字节复核共用的唯一生成/验证入口。当前 `MarketScannerBuildIdentity` 为 version 3，必须精确包含 `format`、`version`、`app_git_sha`、`native_core_sha256`、`wave`、`branch`、`base_branch`、`base_sha`、`implementation_sha`、`validation_sha`；多字段、少字段、JSON 重复 key 或任意字段格式错误均阻断构建/验证。
 
 `wave`、`branch`、`base_branch` 只接受 `^[a-z0-9][a-z0-9._-]{0,127}$`，当前 RC `mobile-only-v1-release-candidate-blocker-closeout` 是合法值，不得再用历史 `mobile-only-v1r4-` 前缀判断当前 wave。`app_git_sha`、`base_sha` 及已绑定的 implementation/validation SHA 必须是 40 位小写十六进制，`native_core_sha256` 必须是 64 位小写十六进制。implementation/validation 提交尚未产生时，Python 生成/治理验证阶段分别只允许精确占位符 `<CODE_CONTRACT_TEST_BUILD_SHA>` 和 `<EVIDENCE_DOCS_SHA>`；任意其他占位文本均 fail closed。Swift `MobileBuildIdentity` 可加载该 exact schema 供诊断，但运行时 `isUsable` 要求 implementation/validation 两个字段均已绑定为 40 位小写 SHA；包含任一占位符的 App 都不得进入 eligible processing session。
+
+共享 Xcode scheme 的 Run、Test 和 Analyze 使用 Debug；Profile 和 Archive 保持 Release。Debug 构建允许在开发中的脏工作区完成编译和启动，但构建阶段会删除目标 App 中可能残留的 `MarketScannerBuildIdentity.json`，不会用 `--allow-dirty` 伪造可用身份。因此 Debug App 可以执行普通 UI、相机和 native 调试，但 `MobileBuildIdentity.isUsable` 保持失败，移动端先验地图扫描和可发布处理路径继续 fail closed。Release、Profile 和 Archive 仍调用同一生成器并严格拒绝脏 tracked tree；需要资格验证时必须在已绑定治理字段的干净精确 SHA 上构建。
 
 ## iOS native dependency cache
 

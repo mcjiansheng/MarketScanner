@@ -58,11 +58,17 @@ Android 目录中的部分 C++ 原生实现也因共享移动渲染和数据库�
 项目现在保留两个并列入口：
 
 - **自由扫描建图**：继续使用既有 ARKit/RGB-D/LiDAR 连续单库采集和 PC 离线优化，默认行为与输出兼容不变。
-- **已有地图辅助扫描（阶段一/二与阶段三草稿复核链路）**：先把 `Element Info` XLSX 转换为带全文件完整性清单和多分辨率结构距离场的版本化地图包，在 iPhone 五步向导中选择地图、楼层、起点和朝向。手机只接受小幅、唯一且连续一致的结构修正；PC 必须先运行 RTAB‑Map 重处理，再生成先验地图派生修正轨迹、质量报告、人工复核和价签导出。当前 PC 求解器是有界修正场，不是完整相对 SE(2) 因子图，因此发布门强制关闭。
+- **已有地图辅助扫描（阶段一/二与阶段三草稿复核链路）**：正式超市地图使用 `Basic Info + Element Info` XLSX，`Shelf Info` 仅审计；转换后得到带全文件完整性清单和多分辨率结构距离场的版本化地图包。在 iPhone 五步向导中选择地图、楼层、起点和朝向。手机只接受小幅、唯一且连续一致的结构修正；PC 必须先运行 RTAB‑Map 重处理，再生成先验地图派生修正轨迹、质量报告、人工复核和价签导出。当前 PC 求解器是有界修正场，不是完整相对 SE(2) 因子图，因此发布门强制关闭。
 
 当前已有地图模式按**单次扫描、单一楼层**工作：开始前绑定一个楼层，扫描中不自动切层，也不支持跨楼层定位。楼层内部允许坡道、地面起伏等少量竖直位移；二维先验定位忽略 ARKit 高度分量，而原始 ARKit/RTAB-Map 数据仍完整保留三维运动。
 
 已有地图模式提供用户触发的 ESL Barcode Capture Mode，直接复用持续到达的 `ARFrame.capturedImage`，不启动第二路相机。进入该模式不会暂停 `ARSession`、RTAB-Map、连续 SQLite 数据库、节点创建、时钟/位姿记录或先验地图定位；相机画面只由 camera-only `MTKView` 预览覆盖，原扫描链继续在后台运行。Vision 使用屏幕固定 scan box 对应的真实 `regionOfInterest`，按最多 8 Hz 且 one-in-flight 执行；每个请求有独立的 1 秒 ARFrame deadline。底层使用固定两条 worker lane：超时请求会 best-effort cancel 并隔离旧 lane，fresh request 可在备用 lane 实际开始；两条 lane 都挂起时立即终止 ESL UX，不创建第三条 worker 或无界 backlog，原始扫描链继续。相机预览最多 24 Hz。候选需要连续 2 帧锁定，同一 burst 目标 4 个、最低 3 个独立帧；达到 2 秒上限时，已有 3 个合法持久帧即可进入解析，否则只保留原始证据并要求重扫。
+
+### MapCase02 标准工作簿状态（2026-08-09）
+
+`MAPCASE02 / STANDARD SUPERMARKET XLSX FORMAT PASS`：Swift/PC 对正式工作簿 top-left anchor、production role geometry、canonical v3、package v2、road/spatial/distance/shelf 派生工件与资源上限已完成阻断级收口。冻结统计为源 1838、active 1630、货架 1301、固定结构 329、展示审计 208、active 越界 0；canonical SHA `5ddfac7dc439afc45abdcf800b799c05d53704895b620d161ef08a442c55b2db`。
+
+这是地图格式局部链路结论，不是产品发布结论。当前整体仍为 **REJECTED / NO-GO / developer smoke only**，J-04 为 **BLOCKER / NOT CLOSED**；Apple clean link、超长 host 后半段、LiDAR 真机、Device Lab、Replay/FAR 和现场验收仍待执行。
 
 每个 frame observation 先写入 `tag_observations.jsonl`，完整 burst 再写入 `tag_observation_bursts.jsonl`，最终确认前必须证明 burst complete，并对 `observation_id / burst_id / frame_id / payload / symbology` 做精确磁盘交叉绑定。只有至少 3 个逐帧通过定位、测量、关联质量门且共同指向同一 `shelfSegmentId + side` 的独立证据，才能打开可提交的货架确认。确认页显示小地图、高亮货架、算法候选和替代侧面；`USER_CONFIRMED` / `USER_OVERRIDDEN` 作为 additive v2 用户证据保存，不能覆盖算法字段，更不能修改 SLAM、轨迹、node pose 或定位约束。
 
