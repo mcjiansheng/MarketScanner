@@ -20,9 +20,14 @@
 - Result exact-SHA 资格 observer 编入 production module、默认 `nil` 且当前安全；后续评估 host-test/debug gating，避免生产符号面无必要扩大。
 - 清理既有 Swift/Xcode warning，包括 always-succeeds cast、unused value、deprecated API 和 duplicate asset build-file 警告；不得与业务冻结改动混合。
 
+## 宿主测试深化
+
+- Map quarantine 的两个 descriptor-opened/read-before 确定性替换用例仍复用 `after_diagnostic_large` 创建 128 MiB payload；同步 observer 已不再依赖大文件延迟，后续改用小 fixture，并同步删除旧的 timing 说明。
+- 当前 crash-worker 断言生产拒绝、替换确实执行且原/替换证据均保留；后续再绑定稳定的 pathname/inode rejection category，防止未来由更下游校验代偿而假绿。该增强不改变现有 fail-closed 生产合同。
+
 ## 延期测试（2026-08-10 起执行）
 
-- 完整运行 `IOSCoreContractTests.test_swift_workflow_state_and_se2_projection`；2026-08-09 已通过 300k finalization 与 1,728,000 trace 阶段，主动停在超长 `tag-evidence-scale`，不能登记为本轮完整 PASS。
+- 在 I8 final exact SHA 上重新完整运行 `IOSCoreContractTests.test_swift_workflow_state_and_se2_projection`；run `31301693439` 已完成 300k finalization、1,728,000 trace 和 200k tag-evidence RSS，但被随后已修复的 quarantine fixture 94 退出阻断，不能登记为 final exact-SHA PASS。
 - 在依赖齐全的 clean runner 补齐 `Eigen/PCL/OpenCV` 后完成 iphoneos 与 iphonesimulator Release clean compile-link；当前本机只通过 Xcode project/SwiftPM 解析，完整 build 在缺失 `Eigen/Core` 处停止。
 - 执行真实 LiDAR iPhone、30 秒连续性、内存/thermal/background/provider、Device Lab、Replay/FAR、Sam 同路线和正式现场控制点矩阵。
 - 对 MapCase02 执行更多设备端 package discover/import、长时间 scan matcher 和真实地图点击/定位回放，不把 host suite 当作真机证据。

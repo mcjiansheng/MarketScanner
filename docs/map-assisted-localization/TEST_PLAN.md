@@ -10,7 +10,7 @@
 
 负例覆盖关系别名/外部 target/namespace 伪 authority、缺失/重复/前导零 row 与 cell、非法 shared-string/boolean/公式/超大 cell、100001 元素、错误角色几何、重复 element ID、严格整数 token、距离场预算，以及重签名后 canonical/graph/spatial/distance/shelf 派生工件篡改。任一端接受集合不同即失败。
 
-2026-08-09 本机证据：MapCase02 Swift 正式套件 PASS；PriorMap 非超长组 217 项 PASS；Map Studio 108/108 PASS；PC MapCase02 validator `valid=true`。exact-SHA run `31299358502@770d94b…` 的 200k tag-evidence 功能与时限通过，但峰值 RSS `812,892,160` bytes 超过 768 MiB 门；I7 compact index 修复后本地相同规模为 `629,735,424` bytes，默认 host suite 亦通过。I7 replacement exact-SHA、Apple clean link、真机/LiDAR/现场仍待执行，不能用该局部 PASS 关闭 J-04 或产品 NO-GO，也不得在 required jobs 全绿前冻结。
+2026-08-09 本机证据：MapCase02 Swift 正式套件 PASS；PriorMap 非超长组 217 项 PASS；Map Studio 108/108 PASS；PC MapCase02 validator `valid=true`。run `31301693439@a61920b…` 的 200k tag-evidence 峰值 RSS `790,839,296` bytes 已低于 768 MiB 门，但后续 Map quarantine 15 ms delayed fixture `_exit(94)`，Apple build 未执行。I8 改用 descriptor-opened/read-before 同步点后，两个原失败场景各 10 轮与默认 host suite PASS，独立复审 `P0=0 / P1=0`。I8 replacement exact-SHA、Apple clean link、真机/LiDAR/现场仍待执行，不能用该局部 PASS 关闭 J-04 或产品 NO-GO，也不得在 required jobs 全绿前冻结。
 
 P0 生产安全不变量（CI 使用相同选择器，任一失败即失败关闭）：
 

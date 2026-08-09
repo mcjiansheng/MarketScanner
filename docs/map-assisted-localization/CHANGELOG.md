@@ -4,6 +4,8 @@
 
 ## 2026-08-09 — MapCase02 标准工作簿格式/几何阻断级收口
 
+- replacement exact-SHA run [`31301693439`](https://github.com/mcjiansheng/MarketScanner/actions/runs/31301693439) 的 200k tag-evidence RSS 已以 `790,839,296 < 805,306,368` bytes 通过；随后 Map quarantine delayed-replacement fixture 因固定 15 ms 调度错位 `_exit(94)`，macOS/iOS job 失败且 Apple build 未执行，run 仍为 7/8、未冻结。
+- I8 `0a3606ecd4e06086ea95c0ab99d92f4e80fcc2dc` 在 payload/diagnostic descriptor 已 `O_NOFOLLOW` 打开并完成 fstat/expected identity 绑定之后、读取之前提供默认 `nil` 的 host observer；fixture 在该同步点确定性替换，production 仍沿原 FD 读取并执行 post-read path/inode/root sweep。两个场景 20 次重复与默认 host suite PASS，独立复审 `P0=0 / P1=0`；128 MiB fixture 缩小及精确 rejection category 断言仅登记 TODO。
 - validation HEAD `770d94b078a0dd94653b9d6b33576890f88f7296` 的 exact-SHA run [`31299358502`](https://github.com/mcjiansheng/MarketScanner/actions/runs/31299358502) 为 7/8：除 macOS/iOS 200k tag-evidence RSS 外全部 required jobs PASS；失败值 `812,892,160` bytes，比 768 MiB 门高 `7,585,792` bytes，因此未创建冻结标签。
 - RSS blocker implementation I7 `cbba284ad1b0694f5302ec3abbb9a446d9d3a970` 删除 burst frame dictionary value 中重复 observation ID，并把已严格验证的 view/tracking 有限域压缩为单射 `UInt8` code；observation key lookup、所有数值/身份 exact-match、duplicate/already-consumed 与 remaining-frame fail-closed 合同保持不变。新增全域 round-trip/mismatch/unknown 回归；本地同一 200k 规模为 `629,735,424` bytes，低于门约 167.4 MiB，独立复审 `P0=0 / P1=0`。replacement final exact-SHA 全绿前仍不冻结。
 - 正式 XLSX 以 `Basic Info + Element Info` 为权威，`Shelf Info` 仅审计；冻结 top-left anchor/pivot、生产角色集合、active/ignored 统计和 100,000 元素上限。
