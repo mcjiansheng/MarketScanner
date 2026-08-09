@@ -15958,8 +15958,6 @@ func runMapQuarantineCrashWorkerIfRequested() {
         if phase == "recover_replace_source_after_tombstone" {
             let sourceParent = source.deletingLastPathComponent()
             let replacement = sourceParent.appendingPathComponent(
-                "tombstone-replacement-\(packageSHA)", isDirectory: true)
-            let displaced = sourceParent.appendingPathComponent(
                 "tombstone-original-\(packageSHA)", isDirectory: true)
             try FileManager.default.copyItem(at: source, to: replacement)
             guard chmod(replacement.path, mode_t(0o755)) == 0 else {
@@ -15972,14 +15970,15 @@ func runMapQuarantineCrashWorkerIfRequested() {
                 guard case .afterRollbackSourceModeRestoreBeforeIntentRemoval = point
                 else { return }
                 _ = try publishRemovalTombstone()
+                // Atomically replace the authoritative pathname with the
+                // byte-identical clone. The original inode moves directly
+                // to the audit-evidence path, avoiding a two-rename window
+                // whose second RENAME_EXCL was scheduler/filesystem fragile
+                // on hosted APFS runners.
                 guard renameatx_np(
                     AT_FDCWD, source.path,
-                    AT_FDCWD, displaced.path,
-                    UInt32(RENAME_EXCL)) == 0,
-                      renameatx_np(
-                        AT_FDCWD, replacement.path,
-                        AT_FDCWD, source.path,
-                        UInt32(RENAME_EXCL)) == 0 else {
+                    AT_FDCWD, replacement.path,
+                    UInt32(RENAME_SWAP)) == 0 else {
                     Darwin._exit(91)
                 }
                 Darwin._exit(79)
