@@ -1,3 +1,4 @@
+import Darwin
 import UIKit
 
 /// The single entry point of the Mobile-Only product flow.
@@ -146,6 +147,9 @@ final class MobileOnlyWorkflowCoordinator {
     // MARK: - App identity (populated by the host app)
 
     var appGitSHA: String = "unknown"
+    /// Full runtime build identity. Scan admission checks the whole strict
+    /// contract instead of treating a lone app SHA as sufficient evidence.
+    var buildIdentity: MobileBuildIdentity?
     var appVersion: String = "1.0"
     var deviceModel: String = "iPhone"
     var osVersion: String = "unknown"
@@ -169,6 +173,8 @@ final class MobileOnlyWorkflowCoordinator {
         var sessionID: String = ""
         var segmentDirectory: String = ""
         var sourceDatabase: String = ""
+        var scanReceipt: String = ""
+        var scanReceiptSHA256: String = ""
         var resultID: String = ""
         var progress: Double = 0
         var checkpoint: String = ""
@@ -184,6 +190,7 @@ final class MobileOnlyWorkflowCoordinator {
 
     private var documentPicker: MapSourceDocumentPicker?
     private var importOperation: BlockOperation?
+    private var scanStartOperation: BlockOperation?
     private var processingOperation: BlockOperation?
     private var importBusy = false
     private var processingBusy = false
@@ -249,13 +256,22 @@ final class MobileOnlyWorkflowCoordinator {
             releaseImport()
             return
         }
+        notifyProgress(0, "等待选择地图文件")
         contextLock.lock()
         context.contractRaw = contract == .topLeft ? "top_left" : "bottom_left"
         context.storeID = storeID ?? ""
         contextLock.unlock()
         persistContext()
 
-        let picker = MapSourceDocumentPicker { [weak self] outcome in
+        let picker = MapSourceDocumentPicker(
+            onStagingStarted: { [weak self] in
+                guard let self = self else { return }
+                if self.transition(to: .stagingMapSource) {
+                    self.notifyProgress(
+                        0.02, "正在安全复制地图文件到应用私有目录")
+                }
+            }
+        ) { [weak self] outcome in
             guard let self = self else { return }
             switch outcome {
             case .staged(let url, let originalFilename):
@@ -264,7 +280,7 @@ final class MobileOnlyWorkflowCoordinator {
                 self.context.originalFilename = originalFilename
                 self.contextLock.unlock()
                 self.persistContext()
-                self.transition(to: .stagingMapSource)
+                self.notifyProgress(0.06, "地图文件已安全复制到应用目录")
                 self.runImportChain(
                     stagedURL: url,
                     filename: originalFilename,
@@ -358,7 +374,7 @@ final class MobileOnlyWorkflowCoordinator {
             releaseImport()
             return
         }
-        notifyProgress(0.15, "严格解析地图文件")
+        notifyProgress(0.10, "正在严格解析地图文件")
         let report: MapSourceImportReport
         do {
             report = try MapSourceImportCoordinator.importMap(
@@ -398,6 +414,9 @@ final class MobileOnlyWorkflowCoordinator {
         context.contractRaw = report.coordinateContractOrigin
         contextLock.unlock()
         persistContext()
+        notifyProgress(
+            0.25,
+            "解析完成：\(report.elementCount) 个源元素，\(report.floorCount) 层")
         self.notifyImport(.success(report))
 
         // 2. Compile into a staging directory.
@@ -405,7 +424,7 @@ final class MobileOnlyWorkflowCoordinator {
             releaseImport()
             return
         }
-        notifyProgress(0.60, "手机端编译地图")
+        notifyProgress(0.28, "开始手机端地图编译")
         do {
             let taskID = "compile-\(UUID().uuidString)"
             contextLock.lock()
@@ -416,11 +435,16 @@ final class MobileOnlyWorkflowCoordinator {
             let staging = try MobileMapLibrary.stagingDirectory(for: taskID)
             let compileResult = try MobilePriorMapCompiler.compile(
                 canonicalSource: report.canonicalSource,
-                outputDirectory: staging)
+                outputDirectory: staging,
+                progress: { [weak self] fraction, detail in
+                    let bounded = min(1, max(0, fraction))
+                    self?.notifyProgress(0.28 + bounded * 0.62, detail)
+                })
 
             // 3. Content-addressed immutable home (§7.3): when the same
             //    (map-id, sha) package already exists, re-verify and reuse
             //    it instead of deleting/overwriting.
+            notifyProgress(0.92, "正在安装已验证的地图包")
             let target = try MobileMapLibrary.packageDirectory(
                 priorMapID: compileResult.priorMapID,
                 packageSHA: compileResult.packageSHA256)
@@ -445,6 +469,7 @@ final class MobileOnlyWorkflowCoordinator {
             }
 
             // 4. Durable registry update.
+            notifyProgress(0.97, "正在更新门店地图库索引")
             let entry = try MobileMapLibrary.register(
                 priorMapID: compileResult.priorMapID,
                 name: report.mapName,
@@ -462,7 +487,7 @@ final class MobileOnlyWorkflowCoordinator {
             self.contextLock.unlock()
             self.persistContext()
             self.transition(to: .mapReady)
-            self.notifyProgress(1.0, "地图已注册")
+            self.notifyProgress(1.0, "地图已编译、验证并注册")
             self.notifyCompile(.success(entry))
         } catch let error as MobileOnlyWorkflowError {
             self.fail(with: error)
@@ -478,79 +503,239 @@ final class MobileOnlyWorkflowCoordinator {
     // MARK: - Scan flow
 
     func beginScanSetup(map: MobileMapLibrary.MapEntry) {
+        guard transition(to: .configuringScan) else { return }
         activeMap = map
         contextLock.lock()
         context.mapID = map.priorMapID
         context.mapSHA = map.packageSHA256
+        context.sessionID = ""
+        context.segmentDirectory = ""
+        context.sourceDatabase = ""
+        context.scanReceipt = ""
+        context.scanReceiptSHA256 = ""
+        context.checkpoint = "configuring_scan"
         contextLock.unlock()
-        transition(to: .configuringScan)
         persistContext()
     }
 
     func commitScanConfiguration(_ configuration: MobileScanConfiguration) {
-        // Transactional start (§4.3): validate -> require host ->
-        // host.start -> validate receipt -> persist receipt -> scanning.
-        // Any failure goes configuringScan -> failed; the workflow never
-        // enters `.scanning` before the receipt is validated.
-        guard state == .configuringScan else {
+        // Transactional asynchronous start (§4.3): validate on main ->
+        // background registry preflight -> host start on main -> background
+        // durable receipt -> scanning. The UI renders `startingScan`
+        // immediately and never blocks on package locks or fsync.
+        stateLock.lock()
+        let currentState = state
+        stateLock.unlock()
+        guard currentState == .configuringScan else {
             fail(with: .invalidState(
-                "scan commit requires configuringScan, got \(state.rawValue)"))
+                "scan commit requires configuringScan, got \(currentState.rawValue)"))
             return
         }
-        guard configuration.priorMap.packageSHA256 == activeMap?.packageSHA256 else {
+        guard configuration.priorMap.priorMapID == activeMap?.priorMapID,
+              configuration.priorMap.packageSHA256
+                == activeMap?.packageSHA256 else {
             fail(with: .invalidState("map identity mismatch"))
             return
         }
         guard !configuration.storeID.isEmpty,
-              !configuration.floorID.isEmpty else {
+              !configuration.floorID.isEmpty,
+              configuration.startXM.isFinite,
+              configuration.startYM.isFinite,
+              configuration.startYawRad.isFinite else {
             fail(with: .invalidState("store/floor identity missing"))
             return
         }
-        guard appGitSHA != "unknown", !appGitSHA.isEmpty else {
-            fail(with: .invalidState("app build identity unknown"))
+        guard buildIdentity?.isUsable == true else {
+            fail(with: .invalidState(
+                "当前构建没有可追踪身份；请使用 RTABMapApp-QualifiedDevice "
+                    + "scheme 从已提交且 tracked 文件干净的版本重新构建"))
             return
         }
-        guard let host = onStartScan else {
-            fail(with: .invalidState("scan host not registered"))
+        guard onStartScan != nil, onRollbackScan != nil else {
+            fail(with: .invalidState(
+                "scan host or rollback transaction not registered"))
             return
         }
-        let receipt: MobileScanStartReceipt
+        guard configuration.preparedPackage.manifest.priorMapId
+                == configuration.priorMap.priorMapID,
+              configuration.preparedPackage.packageSha256
+                == configuration.priorMap.packageSHA256,
+              configuration.preparedPackage.manifest.storeID
+                == configuration.storeID,
+              configuration.preparedPackage.manifest.floors.contains(where: {
+                  $0.id == configuration.floorID
+              }) else {
+            fail(with: .invalidState("prepared prior-map configuration mismatch"))
+            return
+        }
+
+        guard transition(to: .startingScan) else { return }
+        notifyProgress(0.05, "正在核对地图库注册身份")
+        let operation = BlockOperation()
+        operation.addExecutionBlock { [weak self, weak operation] in
+            guard let self = self, let operation = operation else { return }
+            self.executeScanStart(configuration, operation: operation)
+        }
+        operation.completionBlock = { [weak self, weak operation] in
+            guard let self = self, let operation = operation else { return }
+            self.coordinatorLock.lock()
+            if self.scanStartOperation === operation {
+                self.scanStartOperation = nil
+            }
+            self.coordinatorLock.unlock()
+            guard operation.isCancelled else { return }
+            self.stateLock.lock()
+            let stillStarting = self.state == .startingScan
+            self.stateLock.unlock()
+            if stillStarting {
+                self.transition(to: .cancelled)
+            }
+        }
+        coordinatorLock.lock()
+        scanStartOperation = operation
+        coordinatorLock.unlock()
+        workQueue.addOperation(operation)
+    }
+
+    func cancelScanStart() {
+        stateLock.lock()
+        let canCancel = state == .startingScan
+        stateLock.unlock()
+        guard canCancel else { return }
+        coordinatorLock.lock()
+        let operation = scanStartOperation
+        coordinatorLock.unlock()
+        operation?.cancel()
+    }
+
+    private func executeScanStart(
+        _ configuration: MobileScanConfiguration,
+        operation: BlockOperation
+    ) {
+        defer {
+            coordinatorLock.lock()
+            if scanStartOperation === operation {
+                scanStartOperation = nil
+            }
+            coordinatorLock.unlock()
+        }
+        guard !operation.isCancelled else {
+            transition(to: .cancelled)
+            return
+        }
+
         do {
-            receipt = try host(configuration)
+            let registered = try MobileMapLibrary.registeredMap(
+                priorMapID: configuration.priorMap.priorMapID,
+                packageSHA256: configuration.priorMap.packageSHA256)
+            guard registered.packageDirectory.standardizedFileURL
+                    == configuration.priorMap.packageDirectory
+                        .standardizedFileURL,
+                  configuration.preparedPackage.directory.standardizedFileURL
+                    == registered.packageDirectory.standardizedFileURL else {
+                throw MobileOnlyWorkflowError.invalidState(
+                    "registered prior-map path changed before scan start")
+            }
+            notifyProgress(0.30, "地图身份已核对，正在启动相机与连续数据库")
+
+            guard let host = onStartScan else {
+                throw MobileOnlyWorkflowError.invalidState(
+                    "scan host not registered")
+            }
+            let receipt = try host(configuration)
+            guard receipt.isComplete,
+                  receipt.priorMapID == configuration.priorMap.priorMapID,
+                  receipt.priorMapSHA256
+                    == configuration.priorMap.packageSHA256,
+                  receipt.floorID == configuration.floorID,
+                  receipt.storeID == configuration.storeID else {
+                rollbackStartedScan(receipt)
+                throw MobileOnlyWorkflowError.invalidState(
+                    "scan start receipt incomplete or inconsistent")
+            }
+            if operation.isCancelled {
+                rollbackStartedScan(receipt)
+                transition(to: .cancelled)
+                return
+            }
+
+            notifyProgress(0.78, "扫描已启动，正在持久化启动凭据")
+            let persistedReceipt: PersistedScanReceipt
+            do {
+                persistedReceipt = try persistScanReceipt(receipt)
+                contextLock.lock()
+                context.sessionID = receipt.trackingSessionID
+                context.segmentDirectory = receipt.segmentDirectory.path
+                context.sourceDatabase = receipt.databaseURL.path
+                context.storeID = receipt.storeID
+                context.mapID = receipt.priorMapID
+                context.mapSHA = receipt.priorMapSHA256
+                context.scanReceipt = persistedReceipt.relativePath
+                context.scanReceiptSHA256 = persistedReceipt.sha256
+                context.checkpoint = "scanning"
+                context.progress = 1
+                contextLock.unlock()
+                try persistContextRequired()
+            } catch {
+                rollbackStartedScan(receipt)
+                throw MobileOnlyWorkflowError.invalidState(
+                    "scan receipt/workflow persistence failed: "
+                        + error.localizedDescription)
+            }
+            lastScanReceipt = receipt
+            if operation.isCancelled {
+                rollbackStartedScan(receipt)
+                transition(to: .cancelled)
+                return
+            }
+            notifyProgress(1, "连续扫描已启动")
+            guard transition(to: .scanning) else {
+                rollbackStartedScan(receipt)
+                return
+            }
+        } catch let error as MobileOnlyWorkflowError {
+            fail(with: error)
         } catch {
-            fail(with: .invalidState("scan start failed: \(error.localizedDescription)"))
-            return
+            fail(with: .invalidState(
+                "scan start failed: \(error.localizedDescription)"))
         }
-        guard receipt.isComplete,
-              receipt.priorMapSHA256 == configuration.priorMap.packageSHA256,
-              receipt.floorID == configuration.floorID,
-              receipt.storeID == configuration.storeID else {
-            // B-09: the host reported a started scan; stop it before the
-            // workflow fails, otherwise the live capture outlives the
-            // failed workflow.
+    }
+
+    private func rollbackStartedScan(_ receipt: MobileScanStartReceipt) {
+        if Thread.isMainThread {
             onRollbackScan?(receipt)
-            fail(with: .invalidState("scan start receipt incomplete or inconsistent"))
-            return
+        } else {
+            DispatchQueue.main.sync {
+                self.onRollbackScan?(receipt)
+            }
         }
-        do {
-            try persistScanReceipt(receipt)
-        } catch {
-            // B-09: same rollback requirement on persistence failure.
-            onRollbackScan?(receipt)
-            fail(with: .invalidState("scan receipt persistence failed: \(error.localizedDescription)"))
-            return
-        }
-        lastScanReceipt = receipt
-        transition(to: .scanning)
+    }
+
+    private struct PersistedScanReceipt {
+        let relativePath: String
+        let sha256: String
     }
 
     /// Durably stores the validated receipt (§4.1) so a crash after host
-    /// start but before workflow commit is recoverable/auditable.
-    private func persistScanReceipt(_ receipt: MobileScanStartReceipt) throws {
-        let directory = stateFileURL.deletingLastPathComponent()
-            .appendingPathComponent("scan_receipts", isDirectory: true)
+    /// start but before workflow commit is recoverable/auditable. Receipts
+    /// are immutable: an existing tracking identity is never overwritten.
+    private func persistScanReceipt(
+        _ receipt: MobileScanStartReceipt
+    ) throws -> PersistedScanReceipt {
+        guard Self.isSafeReceiptIdentifier(receipt.trackingSessionID) else {
+            throw MobileOnlyWorkflowError.invalidState(
+                "unsafe scan receipt tracking identity")
+        }
+        let workflowRoot = stateFileURL.deletingLastPathComponent()
+        let directory = workflowRoot.appendingPathComponent(
+            "scan_receipts", isDirectory: true)
+        let directoryExisted = FileManager.default.fileExists(
+            atPath: directory.path)
         try FileManager.default.createDirectory(
             at: directory, withIntermediateDirectories: true)
+        if !directoryExisted {
+            try Self.fsyncDirectory(workflowRoot)
+        }
         let data = try CanonicalJSONEncoder.encode([
             "format": "MarketScannerScanStartReceipt",
             "version": 1,
@@ -568,13 +753,66 @@ final class MobileOnlyWorkflowCoordinator {
             "started_at_utc": receipt.startedAtUTC,
             "app_git_sha": receipt.appGitSHA,
         ])
-        let file = directory.appendingPathComponent(
-            "\(receipt.trackingSessionID).json")
-        try data.write(to: file, options: [.atomic])
+        let filename = "\(receipt.trackingSessionID).json"
+        let file = directory.appendingPathComponent(filename)
+        let descriptor = Darwin.open(
+            file.path,
+            O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW,
+            mode_t(S_IRUSR | S_IWUSR))
+        guard descriptor >= 0 else {
+            throw MobileOnlyWorkflowError.invalidState(
+                "scan receipt already exists or cannot be created")
+        }
+        var writeSucceeded = false
+        defer {
+            Darwin.close(descriptor)
+            if !writeSucceeded {
+                Darwin.unlink(file.path)
+            }
+        }
+        try data.withUnsafeBytes { buffer in
+            guard let baseAddress = buffer.baseAddress else { return }
+            var written = 0
+            while written < buffer.count {
+                let result = Darwin.write(
+                    descriptor,
+                    baseAddress.advanced(by: written),
+                    buffer.count - written)
+                guard result > 0 else {
+                    throw MobileOnlyWorkflowError.invalidState(
+                        "scan receipt write failed")
+                }
+                written += result
+            }
+        }
+        guard Darwin.fsync(descriptor) == 0 else {
+            throw MobileOnlyWorkflowError.invalidState(
+                "scan receipt fsync failed: \(filename)")
+        }
+        writeSucceeded = true
         // B-09: durability is proven by fsync, not assumed — the receipt
         // must survive a crash right after the workflow commits.
-        try Self.fsyncURL(file)
         try Self.fsyncDirectory(directory)
+        return PersistedScanReceipt(
+            relativePath: "scan_receipts/\(filename)",
+            sha256: CanonicalSourceHasher.sha256(data))
+    }
+
+    private static func isSafeReceiptIdentifier(_ value: String) -> Bool {
+        guard !value.isEmpty,
+              value.utf8.count <= 128,
+              value != ".",
+              value != "..",
+              URL(fileURLWithPath: value).lastPathComponent == value else {
+            return false
+        }
+        return value.unicodeScalars.allSatisfy { scalar in
+            let code = scalar.value
+            return (code >= 48 && code <= 57)
+                || (code >= 65 && code <= 90)
+                || (code >= 97 && code <= 122)
+                || scalar == "-" || scalar == "_" || scalar == "."
+        }
     }
 
     /// B-09: fsync a file (fail-closed; the receipt is not durable until
@@ -815,6 +1053,17 @@ final class MobileOnlyWorkflowCoordinator {
     // MARK: - Persistence (§5.2)
 
     private func persistContext() {
+        try? persistContextFile(requireDurability: false)
+    }
+
+    /// Scan-start commit uses this fail-closed variant. A host scan may not
+    /// enter `.scanning` unless its receipt binding and session paths are on
+    /// durable storage.
+    private func persistContextRequired() throws {
+        try persistContextFile(requireDurability: true)
+    }
+
+    private func persistContextFile(requireDurability: Bool) throws {
         stateLock.lock()
         let currentState = state
         stateLock.unlock()
@@ -825,7 +1074,7 @@ final class MobileOnlyWorkflowCoordinator {
         context.updatedAt = Date().timeIntervalSince1970
         let payload: [String: Any] = [
             "format": "MarketScannerWorkflowState",
-            "version": 2,
+            "version": 3,
             "state": currentState.rawValue,
             "task_id": context.taskID,
             "staged_source": context.stagedSource,
@@ -837,6 +1086,8 @@ final class MobileOnlyWorkflowCoordinator {
             "session_id": context.sessionID,
             "segment_directory": context.segmentDirectory,
             "source_database": context.sourceDatabase,
+            "scan_receipt": context.scanReceipt,
+            "scan_receipt_sha256": context.scanReceiptSHA256,
             "result_id": context.resultID,
             "progress": context.progress,
             "checkpoint": context.checkpoint,
@@ -846,14 +1097,19 @@ final class MobileOnlyWorkflowCoordinator {
             "updated_at": context.updatedAt,
         ]
         contextLock.unlock()
-        guard let data = try? CanonicalJSONEncoder.encode(payload) else { return }
-        do {
-            let directory = stateFileURL.deletingLastPathComponent()
-            try FileManager.default.createDirectory(
-                at: directory, withIntermediateDirectories: true)
-            try data.write(to: stateFileURL, options: [.atomic])
-        } catch {
-            // Non-fatal: in-memory state still drives the UI.
+        let data = try CanonicalJSONEncoder.encode(payload)
+        let directory = stateFileURL.deletingLastPathComponent()
+        let directoryExisted = FileManager.default.fileExists(
+            atPath: directory.path)
+        try FileManager.default.createDirectory(
+            at: directory, withIntermediateDirectories: true)
+        if requireDurability && !directoryExisted {
+            try Self.fsyncDirectory(directory.deletingLastPathComponent())
+        }
+        try data.write(to: stateFileURL, options: [.atomic])
+        if requireDurability {
+            try Self.fsyncURL(stateFileURL)
+            try Self.fsyncDirectory(directory)
         }
     }
 
@@ -881,6 +1137,8 @@ final class MobileOnlyWorkflowCoordinator {
         context.sessionID = object["session_id"] as? String ?? ""
         context.segmentDirectory = object["segment_directory"] as? String ?? ""
         context.sourceDatabase = object["source_database"] as? String ?? ""
+        context.scanReceipt = object["scan_receipt"] as? String ?? ""
+        context.scanReceiptSHA256 = object["scan_receipt_sha256"] as? String ?? ""
         context.resultID = object["result_id"] as? String ?? ""
         context.progress = object["progress"] as? Double ?? 0
         context.checkpoint = object["checkpoint"] as? String ?? ""
@@ -907,10 +1165,27 @@ final class MobileOnlyWorkflowCoordinator {
                 valid = false
                 reason = "staged source missing"
             }
-        case .configuringScan, .scanning, .finalizingScan:
+        case .configuringScan:
             if !isRegisteredMap(context.mapID, sha: context.mapSHA) {
                 valid = false
-                reason = "map registration missing"
+                reason = "map package missing or invalid"
+            }
+        case .startingScan:
+            if !isRegisteredMap(context.mapID, sha: context.mapSHA) {
+                valid = false
+                reason = "map package missing or invalid"
+            } else if context.checkpoint == "scanning"
+                        && !hasValidPersistedScanCommit() {
+                valid = false
+                reason = "scan receipt or session binding invalid"
+            }
+        case .scanning, .finalizingScan:
+            if !isRegisteredMap(context.mapID, sha: context.mapSHA) {
+                valid = false
+                reason = "map package missing or invalid"
+            } else if !hasValidPersistedScanCommit() {
+                valid = false
+                reason = "scan receipt or session binding invalid"
             }
         case .snapshotting, .fastProcessing, .deepProcessing,
              .buildingTrajectory, .resolvingTags, .exporting:
@@ -944,12 +1219,76 @@ final class MobileOnlyWorkflowCoordinator {
 
     private func isRegisteredMap(_ priorMapID: String, sha: String) -> Bool {
         guard !priorMapID.isEmpty, !sha.isEmpty else { return false }
-        guard let entry = try? MobileMapLibrary.map(priorMapID: priorMapID, packageSHA256: sha)
-        else { return false }
-        if activeMap == nil {
-            activeMap = entry
+        return (try? MobileMapLibrary.map(
+            priorMapID: priorMapID,
+            packageSHA256: sha)) != nil
+    }
+
+    private func hasValidPersistedScanCommit() -> Bool {
+        guard !context.sessionID.isEmpty,
+              !context.segmentDirectory.isEmpty,
+              !context.sourceDatabase.isEmpty,
+              !context.storeID.isEmpty,
+              !context.mapID.isEmpty,
+              !context.mapSHA.isEmpty,
+              context.scanReceiptSHA256.count == 64,
+              context.scanReceiptSHA256.allSatisfy({ $0.isHexDigit }) else {
+            return false
         }
-        return true
+        let components = context.scanReceipt.split(
+            separator: "/", omittingEmptySubsequences: false)
+        guard components.count == 2,
+              components[0] == "scan_receipts",
+              components[1].hasSuffix(".json") else {
+            return false
+        }
+        let filename = String(components[1])
+        let identifier = String(filename.dropLast(5))
+        guard Self.isSafeReceiptIdentifier(identifier),
+              identifier == context.sessionID else {
+            return false
+        }
+        let workflowRoot = stateFileURL.deletingLastPathComponent()
+        let receiptURL = workflowRoot.appendingPathComponent(
+            context.scanReceipt)
+        do {
+            let snapshot = try SafeSessionPath.readRegularFile(
+                receiptURL,
+                within: workflowRoot,
+                maximumBytes: 1024 * 1024)
+            guard snapshot.sha256 == context.scanReceiptSHA256,
+                  let receipt = try StrictJSONDocumentParser.object(
+                    from: snapshot.data,
+                    limits: StrictJSONDocumentLimits(
+                        maximumBytes: 1024 * 1024)) as? [String: Any],
+                  receipt["format"] as? String
+                    == "MarketScannerScanStartReceipt",
+                  StrictJSONScalar.integer(receipt["version"]) == 1,
+                  receipt["tracking_session_id"] as? String
+                    == context.sessionID,
+                  receipt["segment_directory"] as? String
+                    == context.segmentDirectory,
+                  receipt["database_url"] as? String
+                    == context.sourceDatabase,
+                  receipt["prior_map_id"] as? String == context.mapID,
+                  receipt["prior_map_sha256"] as? String == context.mapSHA,
+                  receipt["store_id"] as? String == context.storeID,
+                  StrictJSONScalar.boolean(receipt["ar_session_started"])
+                    == true,
+                  StrictJSONScalar.boolean(
+                    receipt["rtabmap_recording_started"]) == true,
+                  StrictJSONScalar.boolean(
+                    receipt["required_sidecar_writers_ready"]) == true,
+                  FileManager.default.fileExists(
+                    atPath: context.segmentDirectory),
+                  FileManager.default.fileExists(
+                    atPath: context.sourceDatabase) else {
+                return false
+            }
+            return true
+        } catch {
+            return false
+        }
     }
 
     /// Attempts to resume the interrupted run (called by the home screen
@@ -968,18 +1307,26 @@ final class MobileOnlyWorkflowCoordinator {
         let sessionID = context.sessionID
         let taskID = context.taskID
         contextLock.unlock()
+        guard let map = try? MobileMapLibrary.map(
+            priorMapID: mapID,
+            packageSHA256: mapSHA) else {
+            transition(to: .idle)
+            return false
+        }
         // B-08: the resumed run re-derives the floor identity from the
         // session metadata. An unreadable/missing floor flows as empty
         // and fails the snapshot eligibility check fail-closed instead
         // of silently defaulting.
         let floorID = Self.floorIDFromMetadata(segmentDirectory: segmentDirectory)
         switch checkpoint {
+        case "scanning" where !Self.sessionMetadataIsFinalized(
+                segmentDirectory: segmentDirectory):
+            // An interrupted live capture is recovered by the scanner's
+            // session/checkpoint path. It must never be submitted directly
+            // to post-processing as if it were finalized.
+            transition(to: .idle)
+            return false
         case _ where !segmentDirectory.isEmpty && !sourceDatabase.isEmpty:
-            guard let map = activeMap ?? (try? MobileMapLibrary.map(
-                priorMapID: mapID, packageSHA256: mapSHA)) else {
-                transition(to: .idle)
-                return false
-            }
             transition(to: .idle)
             beginProcessing(
                 finalizedSession: URL(fileURLWithPath: segmentDirectory),
@@ -994,6 +1341,22 @@ final class MobileOnlyWorkflowCoordinator {
             transition(to: .idle)
             return false
         }
+    }
+
+    private static func sessionMetadataIsFinalized(
+        segmentDirectory: String
+    ) -> Bool {
+        guard !segmentDirectory.isEmpty else { return false }
+        let url = URL(fileURLWithPath: segmentDirectory)
+            .appendingPathComponent("metadata.json")
+        guard let data = try? Data(contentsOf: url),
+              let object = try? StrictJSONDocumentParser.object(
+                from: data,
+                limits: StrictJSONDocumentLimits(maximumBytes: 1024 * 1024))
+                as? [String: Any] else {
+            return false
+        }
+        return StrictJSONScalar.boolean(object["finalized"]) == true
     }
 
     /// B-08: reads the floor identity recorded in the session metadata
@@ -1029,6 +1392,10 @@ extension MobileOnlyWorkflowState {
 /// only phone-compiled maps from the on-device library (V1R1 §8.1).
 struct MobileScanConfiguration {
     var priorMap: MobileMapLibrary.MapEntry
+    /// Fully decoded package from the scan-setup background preflight.
+    /// The scanner host consumes this exact object and does not re-open the
+    /// package three more times on the main thread.
+    var preparedPackage: PriorMapPackage
     var floorID: String
     var startXM: Double
     var startYM: Double

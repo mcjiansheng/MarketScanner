@@ -1,6 +1,6 @@
 # MapCase02 后续低影响修复与资格测试 TODO
 
-> 文档状态：**当前有效**。最后核对日期：2026-08-09。
+> 文档状态：**当前有效**。最后核对日期：2026-08-10。
 
 本清单只登记已审查为 P2/低影响、尚未开始的增强和延期资格测试。阻断级缺陷不得移入本清单规避修复。当前局部结论为 `MAPCASE02 / STANDARD SUPERMARKET XLSX FORMAT PASS`；整体仍为 **REJECTED / NO-GO / developer smoke only**，J-04 为 **BLOCKER / NOT CLOSED**。
 
@@ -24,6 +24,19 @@
 - 为 Device Lab、PC replay 和独立 hash 复核提供手机实际生成 prior-map package 的显式只读导出入口，或冻结一套可审计的 Xcode/App-container 提取步骤。Mobile-Only 最终用户链路本身不依赖 PC，因此这不阻断当前地图导入；但不能让资格操作者误用 PC 从同一 XLSX 重新生成的不同 package SHA 代替手机 exact package。
 - 清理既有 Swift/Xcode warning，包括 always-succeeds cast、unused value、deprecated API 和 duplicate asset build-file 警告；不得与业务冻结改动混合。
 
+## 统一扫描 UX 与启动事务深化
+
+- `beginScanSetup` 的 configuring state 与 map context 仍分两次持久化；极端断电恰好发生在两次写之间时可能显示一次不准确的 interrupted 提示，但不会绕过地图验证或自动开始扫描。后续合并为一个 required durable transaction。
+- workflow context v3 尚未直接持久化 `floor_id`；恢复时从 finalized session metadata 重新读取并由 processing eligibility 再校验。后续把 floor ID 加入 context/receipt 双向绑定，提升审计完整性。
+- receipt 恢复已对 receipt 本身执行 containment、regular-file、no-follow、strict JSON 和 SHA 校验；segment directory/database 的前置存在性检查仍可进一步升级为 containment + regular-file/directory + no-follow，尽管后续 snapshot/processing eligibility 会再次严格校验。
+- 将 scan receipt 父目录、已存在 receipt、partial write、fsync failure 和 `O_EXCL` 冲突扩展为真实文件系统故障注入；同时绑定 receipt 的 `app_git_sha`、floor 和 context 当前身份，避免只靠后续处理门发现审计不一致。
+- 对取消发生在 package preflight、localizer 构造、database open、main commit、receipt fsync 和 context fsync 各边界增加确定性 fault hook；当前实现均会在 host 返回或 commit 失败后强 rollback，但尚未形成完整边界矩阵。
+- 测量首页入口、地图库进入、setup 返回、selected-package 加载和 scan start 的真机 main-thread stall、p50/p95 与最大值；当前 9.36 秒 host 包校验证据只用于定位原冻结原因，不能冒充真机性能 PASS。
+- preview 大图后台下采样/预解码需要在真实设备基准后决定；当前 package 已在后台解码，主线程只安装 UIImage，但尚未冻结不同图片尺寸/内存压力下的 p95。
+- 起点障碍距离检查当前按候选 bounds 过滤后线性遍历；正常 MapCase02 可用，后续复用 spatial index 加速超大地图连续方向键操作。
+- 手机编译完成后的 verified package receipt 可评估直接复用到 registry register，减少一次完整复验；必须保持 exact bytes、不可变 freeze 和 fail-closed 语义，不能只缓存自声明 SHA。
+- package install 后增加 durable pending/intent，覆盖 crash 恰好发生在 staging→CAS move、package parent fsync 和 registry CAS 之间的恢复；现有 bytes 保留且 registry fail-closed，但恢复可观测性仍可深化。
+
 ## 宿主测试深化
 
 - 为 case-fold 路径冲突补充两条直接集成 fixture：伪造 lowercase registry entry + uppercase 实际父目录时 `listMaps()` 必须拒绝；packages root 仅存在 uppercase ID 时 `rebuildRegistry()` 必须拒绝。当前 `packageDirectory()` 写前拒绝、共享 verify 和静态调用链已经覆盖，不影响本轮四图导入。
@@ -33,6 +46,8 @@
 - Tombstone atomic-swap fixture 后续可在 Python 侧记录交换前 source/clone 双方 inode，并在边界后精确断言交换方向、原 inode 审计路径和 payload bytes 一致；当前 syscall 语义、50 次边界重复、restart return 19 与三方证据保留已足够关闭 P1。
 - Map quarantine 的 lock-path 替换负例仍用 `RENAME_EXCL` 后 `open(O_EXCL)` 安装新 inode；生产会在下一次 descriptor/path identity 校验 fail-closed，当前用例也已稳定通过，但后续可预制 replacement 并用 `RENAME_SWAP` 消除测试自身的短暂缺路径窗口。
 - iOS dependency 的 host `rtabmap-res_tool` prebuild 后续可显式设置 `CMAKE_BUILD_TYPE=Release`、把 cache 参数标注为 `FILEPATH`，并增加一次实际执行/动态库装载 smoke；I11 当前已验证产物可执行并完成 iOS configure，这些只属于构建一致性深化，不是当前阻断。
+- 为 50 张以上地图建立 registry/list/select/rebuild 锁竞争和时延基准；`readRegistryPayload()` 同时加入 registry 总字节、条目数和字符串长度上限，保持损坏输入 fail closed。
+- package snapshot/freeze 完成后增加一次最终全路径 inode sweep fixture，覆盖所有工件在最后一个 descriptor 检查之后、registry commit 之前的路径替换；当前 bound descriptor、文件集和 root/path identity 检查已关闭已知 P1。
 
 ## 延期测试（2026-08-10 起执行）
 

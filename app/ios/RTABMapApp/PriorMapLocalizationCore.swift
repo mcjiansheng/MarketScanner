@@ -192,7 +192,7 @@ struct PriorMapScanConfiguration: Codable {
         priorMapId: String?,
         priorMapSha256: String?,
         floorId: String?,
-        storeID: String? = nil,
+        storeID: String?,
         initialMapPose: PriorMapPose2D?
     ) {
         self.formatVersion = formatVersion

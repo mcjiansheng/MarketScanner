@@ -14,8 +14,21 @@ final class MapSourceDocumentPicker: NSObject, UIDocumentPickerDelegate {
     }
 
     private let onResult: (PickedOutcome) -> Void
+    private let onStagingStarted: (() -> Void)?
 
-    init(onResult: @escaping (PickedOutcome) -> Void) {
+    /// Provider copies can block on file-provider hydration, descriptor I/O
+    /// and fsync. UIDocumentPickerDelegate callbacks arrive on the main
+    /// thread, so the complete security-scoped staging transaction runs on
+    /// this dedicated serial queue and only its result returns to UIKit.
+    private static let stagingQueue = DispatchQueue(
+        label: "MarketScanner.MapSourceDocumentPicker.staging",
+        qos: .userInitiated)
+
+    init(
+        onStagingStarted: (() -> Void)? = nil,
+        onResult: @escaping (PickedOutcome) -> Void
+    ) {
+        self.onStagingStarted = onStagingStarted
         self.onResult = onResult
     }
 
@@ -43,37 +56,55 @@ final class MapSourceDocumentPicker: NSObject, UIDocumentPickerDelegate {
         didPickDocumentsAt urls: [URL]
     ) {
         guard let url = urls.first else {
-            onResult(.cancelled)
+            deliver(.cancelled)
             return
         }
-        let didAccess = url.startAccessingSecurityScopedResource()
-        defer {
-            if didAccess {
-                url.stopAccessingSecurityScopedResource()
-            }
-        }
         let originalFilename = url.lastPathComponent
-        do {
-            // Staging contract (V1R1 §6.1):
-            // security-scoped provider -> private temp file with exclusive
-            // creation -> stream copy -> fsync -> SHA from staged bytes ->
-            // close -> stop security scope.
-            let staging = try Self.stagingURL(originalFilename: originalFilename)
-            try Self.streamCopy(from: url, to: staging)
-            _ = CanonicalSourceHasher.sha256(
-                try StableMapSourceFileReader.read(staging))
-            onResult(.staged(staging, originalFilename: originalFilename))
-        } catch {
-            // Copy failed: NO map record is created and the provider URL
-            // is never returned to the pipeline.
-            let reason = (error as? MapSourceImportError)?.message
-                ?? error.localizedDescription
-            onResult(.failed(.copyFailed(reason: reason)))
+        onStagingStarted?()
+        Self.stagingQueue.async { [self] in
+            let didAccess = url.startAccessingSecurityScopedResource()
+            defer {
+                if didAccess {
+                    url.stopAccessingSecurityScopedResource()
+                }
+            }
+            let outcome: PickedOutcome
+            do {
+                // Staging contract (V1R1 §6.1):
+                // security-scoped provider -> private temp file with
+                // exclusive creation -> stream copy -> fsync -> close ->
+                // stop security scope. The importer performs the one
+                // authoritative stable read and source SHA calculation.
+                let staging = try Self.stagingURL(
+                    originalFilename: originalFilename)
+                try Self.streamCopy(from: url, to: staging)
+                outcome = .staged(
+                    staging, originalFilename: originalFilename)
+            } catch {
+                // Copy failed: NO map record is created and the provider URL
+                // is never returned to the pipeline.
+                let reason = (error as? MapSourceImportError)?.message
+                    ?? error.localizedDescription
+                outcome = .failed(.copyFailed(reason: reason))
+            }
+            deliver(outcome)
         }
     }
 
     func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) {
-        onResult(.cancelled)
+        deliver(.cancelled)
+    }
+
+    /// UI/coordinator callbacks keep their historical main-thread contract
+    /// even though staging now completes on a background queue.
+    private func deliver(_ outcome: PickedOutcome) {
+        if Thread.isMainThread {
+            onResult(outcome)
+        } else {
+            DispatchQueue.main.async { [self] in
+                onResult(outcome)
+            }
+        }
     }
 
     /// App-private staging directory:

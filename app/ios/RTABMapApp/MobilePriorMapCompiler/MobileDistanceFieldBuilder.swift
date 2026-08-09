@@ -14,6 +14,12 @@ enum MobileDistanceFieldBuilder {
     static let maximumTotalCells = 16_000_000
     static let maximumSeedSamplesPerSegment = 100_000
 
+    /// Reports deterministic work units without changing the generated
+    /// artifact. Fractions are monotonic in [0, 1] and are weighted by the
+    /// validated grid-cell counts, which closely track the expensive RLE and
+    /// distance propagation work.
+    typealias ProgressHandler = (_ fraction: Double, _ detail: String) -> Void
+
     struct Segment {
         var start: (Double, Double)
         var end: (Double, Double)
@@ -32,8 +38,10 @@ enum MobileDistanceFieldBuilder {
         elements: [PriorMapSourceElement],
         floors: [[String: Any]],
         resolutionsM: [Double] = defaultResolutionsM,
-        truncationM: Double = defaultTruncationM
+        truncationM: Double = defaultTruncationM,
+        progress: ProgressHandler? = nil
     ) throws -> [String: Any] {
+        progress?(0, "正在校验距离场网格")
         guard !resolutionsM.isEmpty,
               resolutionsM.allSatisfy({ $0.isFinite && $0 > 0 }),
               truncationM.isFinite,
@@ -70,6 +78,8 @@ enum MobileDistanceFieldBuilder {
         }
         let segmentsByFloor = segments(elements)
         var payloadFloors: [String: Any] = [:]
+        var completedCells: Int64 = 0
+        let denominator = max(Int64(1), totalCells)
         for floor in floors {
             guard let floorID = floor["id"] as? String,
                   let floorGrids = gridsByFloor[floorID] else {
@@ -79,17 +89,23 @@ enum MobileDistanceFieldBuilder {
             }
             var levels: [[String: Any]] = []
             for (resolution, grid) in zip(resolutionsM, floorGrids) {
-                levels.append(
-                    try level(
-                        segments: segmentsByFloor[floorID] ?? [],
-                        resolution: resolution,
-                        truncationM: truncationM,
-                        grid: grid
-                    )
-                )
+                let startingFraction = Double(completedCells) / Double(denominator)
+                progress?(
+                    startingFraction,
+                    String(format: "楼层 %@ · %.2f m 分辨率", floorID, resolution))
+                levels.append(try level(
+                    segments: segmentsByFloor[floorID] ?? [],
+                    resolution: resolution,
+                    truncationM: truncationM,
+                    grid: grid))
+                completedCells += Int64(grid.width) * Int64(grid.height)
+                progress?(
+                    min(1, Double(completedCells) / Double(denominator)),
+                    String(format: "楼层 %@ · %.2f m 距离场完成", floorID, resolution))
             }
             payloadFloors[floorID] = ["levels": levels]
         }
+        progress?(1, "结构距离场完成")
         return [
             "format": formatValue,
             "version": versionValue,

@@ -159,6 +159,52 @@ class MarketScannerBuildIdentityTests(unittest.TestCase):
             project,
         )
 
+    def test_xcode_qualified_device_launch_uses_release_identity(self) -> None:
+        scheme_path = (
+            ROOT
+            / "app/ios/RTABMapApp.xcodeproj/xcshareddata/xcschemes/"
+            "RTABMapApp-QualifiedDevice.xcscheme"
+        )
+        scheme = ET.parse(scheme_path).getroot()
+
+        build_entry = scheme.find("./BuildAction/BuildActionEntries/BuildActionEntry")
+        self.assertIsNotNone(build_entry)
+        self.assertEqual(build_entry.attrib.get("buildForRunning"), "YES")
+
+        launch = scheme.find("LaunchAction")
+        self.assertIsNotNone(launch)
+        self.assertEqual(launch.attrib.get("buildConfiguration"), "Release")
+
+        runnable = launch.find("./BuildableProductRunnable/BuildableReference")
+        self.assertIsNotNone(runnable)
+        self.assertEqual(
+            runnable.attrib.get("BlueprintIdentifier"),
+            "4EE015C1259A2AF0008CCE65",
+        )
+        self.assertEqual(runnable.attrib.get("BuildableName"), "RTABMapApp.app")
+        self.assertEqual(runnable.attrib.get("BlueprintName"), "RTABMapApp")
+        self.assertEqual(
+            runnable.attrib.get("ReferencedContainer"),
+            "container:RTABMapApp.xcodeproj",
+        )
+
+        for action in ("ProfileAction", "ArchiveAction"):
+            node = scheme.find(action)
+            self.assertIsNotNone(node)
+            self.assertEqual(node.attrib.get("buildConfiguration"), "Release")
+
+        project = (
+            ROOT / "app/ios/RTABMapApp.xcodeproj/project.pbxproj"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            "market_scanner_build_identity.py\\\" emit --repo",
+            project,
+        )
+        self.assertNotIn(
+            "market_scanner_build_identity.py\\\" emit --allow-dirty",
+            project,
+        )
+
     @unittest.skipUnless(shutil.which("xcrun"), "Swift host requires Xcode")
     def test_swift_host_matches_governance_and_pre_rename_freeze_contracts(self) -> None:
         xcrun = shutil.which("xcrun")

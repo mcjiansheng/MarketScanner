@@ -281,6 +281,10 @@ enum PriorMapShelvesSchema {
 /// only then atomically renamed into place — a failed compile never
 /// overwrites an existing map.
 enum MobilePriorMapCompiler {
+
+    /// Monotonic compiler progress. The callback is observational only and
+    /// cannot influence deterministic package bytes.
+    typealias ProgressHandler = (_ fraction: Double, _ detail: String) -> Void
     private static let maximumPriorMapSlugLength = 115
 
     struct CompileResult {
@@ -301,8 +305,10 @@ enum MobilePriorMapCompiler {
 
     static func compile(
         canonicalSource: MarketScannerPriorMapSource,
-        outputDirectory: URL
+        outputDirectory: URL,
+        progress: ProgressHandler? = nil
     ) throws -> CompileResult {
+        progress?(0, "校验地图业务身份")
         do {
             try MapSourceBusinessIdentityPolicy.validate(
                 storeID: canonicalSource.storeId,
@@ -311,6 +317,7 @@ enum MobilePriorMapCompiler {
             throw CompileError.outputNotUsable(
                 "invalid store/map identity: \(error)")
         }
+        progress?(0.04, "筛选生产地图元素")
         var warnings = canonicalSource.warnings
         let filtered = ElementRoleClassifier.productionElements(
             from: canonicalSource.elements, warnings: &warnings)
@@ -359,6 +366,7 @@ enum MobilePriorMapCompiler {
                     "active element \(element.id) is outside the Basic Info canvas")
             }
         }
+        progress?(0.10, "地图元素与几何校验完成")
 
         // Formal v3 packages use the immutable Basic Info canvas for every
         // floor. Legacy sources retain their frozen geometry-union behavior.
@@ -384,6 +392,7 @@ enum MobilePriorMapCompiler {
             floor["preview_file"] = "preview_floor_\(String(format: "%03d", floors.count + 1))_\(safeFloor).png"
             floors.append(floor)
         }
+        progress?(0.14, "楼层范围已生成")
 
         let sourceHash = canonicalSource.source.canonicalSourceSha256
         let safeBase = safeName(canonicalSource.mapName)
@@ -409,15 +418,25 @@ enum MobilePriorMapCompiler {
             try fileManager.createDirectory(at: staging, withIntermediateDirectories: true)
 
             var warningsCopy = warnings
+            progress?(0.17, "正在生成道路图结构")
             let graph = MobileRoadGraphBuilder.build(elements: elements, warnings: &warningsCopy)
             guard let graphNodes = graph["nodes"] as? [[String: Any]],
                   let graphEdges = graph["edges"] as? [[String: Any]] else {
                 throw CompileError.outputNotUsable(
                     "compiled road graph is missing nodes or edges")
             }
-            let distanceFields = try MobileDistanceFieldBuilder.build(elements: elements, floors: floors)
+            progress?(0.22, "道路图结构完成")
+            let distanceFields = try MobileDistanceFieldBuilder.build(
+                elements: elements,
+                floors: floors,
+                progress: { fraction, detail in
+                    progress?(0.22 + min(1, max(0, fraction)) * 0.33,
+                              "生成结构距离场 · \(detail)")
+                })
+            progress?(0.57, "正在生成空间索引")
             let spatial = try MobileSpatialIndexBuilder.build(
                 elements: elements, graph: graph, floors: floors)
+            progress?(0.63, "空间索引完成")
 
             let counts = Dictionary(grouping: elements, by: { $0.shapeType })
                 .mapValues { $0.count }
@@ -544,6 +563,7 @@ enum MobilePriorMapCompiler {
                 }
                 packageElementsByID[identifier] = payload
             }
+            progress?(0.66, "正在写入地图工件")
             try writeJSON(["format": "MarketScannerPriorMapElements", "version": 1, "elements": packageElements], to: staging, name: "elements.json")
             // V1R5 §12.2 (review B-14): the compiler emits EXPLICIT shelf
             // side semantics (front/back normals, longitudinal axis,
@@ -562,13 +582,19 @@ enum MobilePriorMapCompiler {
             try writeJSON(graph, to: staging, name: "road_graph.json")
             try writeJSON(spatial, to: staging, name: "spatial_index.json")
             try writeJSON(distanceFields, to: staging, name: "distance_fields.json")
+            progress?(0.73, "核心地图工件已写入")
 
             // Preview rendering (CoreGraphics PNGs).
             try MobilePreviewRenderer.render(
                 elements: elements,
                 floors: floors,
-                directory: staging)
+                directory: staging,
+                progress: { fraction, detail in
+                    progress?(0.73 + min(1, max(0, fraction)) * 0.11,
+                              "生成地图预览 · \(detail)")
+                })
 
+            progress?(0.85, "正在生成验证报告")
             let validationReport: [String: Any] = [
                 "format": "MarketScannerPriorMapValidation",
                 "version": 1,
@@ -600,11 +626,13 @@ enum MobilePriorMapCompiler {
             ]
             try writeJSON(validationReport, to: staging, name: "validation_report.json")
 
+            progress?(0.88, "正在生成完整性清单")
             let packageManifest = try MobilePackageManifestBuilder.buildManifest(directory: staging)
             let packageData = try CanonicalJSONEncoder.encode(packageManifest)
             try packageData.write(to: staging.appendingPathComponent(MobilePackageManifestBuilder.manifestFileName))
 
             // Self-validation with the production integrity validator.
+            progress?(0.91, "正在执行生产完整性校验")
             try MobilePackageManifestBuilder.requiredFilesPresent(directory: staging)
             let digest: String
             do {
@@ -617,11 +645,14 @@ enum MobilePriorMapCompiler {
             // previews and package_manifest.json) is individually fsynced,
             // then the staging directory, rename, and parent directory are
             // synced. open/fsync failures are fatal.
+            progress?(0.95, "正在同步地图工件到存储")
             try syncRegularFiles(in: staging)
             try syncDirectory(staging)
 
+            progress?(0.98, "正在提交不可变地图包")
             try fileManager.moveItem(at: staging, to: outputDirectory)
             try syncDirectory(outputDirectory.deletingLastPathComponent())
+            progress?(1, "手机端地图编译完成")
             return CompileResult(
                 priorMapID: priorMapID,
                 packageSHA256: digest,

@@ -1,8 +1,24 @@
 # 地图辅助定位阶段一至阶段三测试计划
 
-> 文档状态：**当前有效**。最后核对日期：2026-08-09。
+> 文档状态：**当前有效**。最后核对日期：2026-08-10。
 
 ## 自动测试
+
+### 统一扫描 UX、启动事务和 build identity
+
+生产入口、线程边界、导航、相机权限、启动 receipt/context、取消/回滚、地图包单快照/descriptor freeze、zoom/nudge/discrete heading 和 QualifiedDevice scheme 使用以下聚焦组：
+
+```bash
+python3 -m unittest \
+  tools.PriorMap.tests.test_mobile_scan_ux_contract \
+  tools.PriorMap.tests.test_yaw_arrow_geometry \
+  tools.Qualification.tests.test_market_scanner_build_identity \
+  -v
+```
+
+2026-08-10 当前源码结果为 **27/27 PASS**。它必须继续证明：首页和菜单不进入旧 `PriorMapWizardViewController`；地图库普通列表、完整刷新、provider copy/fsync、selected-package 加载和 scan-start preparation 不在主线程；手机编译地图与 PC v2 package 进入同一 registry/setup/coordinator；root Close 与 push Back 同时存在；首次权限在 workflow commit 前完成；旧 tmp-db recovery 不可绕过 receipt；取消/持久化失败会 rollback；地图设置支持 1×–8× zoom、方向键和离散朝向；普通 Debug 无 build identity，`RTABMapApp-QualifiedDevice` 的 Run 为 Release 且不存在 `--allow-dirty`。
+
+Swift 核心可执行长方法 `IOSCoreContractTests.test_swift_workflow_state_and_se2_projection` 在当前改动上 **1/1 PASS（1233.541 s）**，覆盖 map-library CAS、register/rebuild/freeze/quarantine、异常 symlink 外部目标权限保护和 workflow/SE(2) 合同。该单个长方法、27 个源码/几何合同和 host XLSX smoke 均不能冒充完整 discover、真机交互延迟或现场扫描 PASS。
 
 ### MapCase02 冻结回归
 
@@ -47,11 +63,13 @@ node --check tools/SupermarketMapStudio/web/app.js
 git diff --check
 
 xcodebuild -quiet -project app/ios/RTABMapApp.xcodeproj \
-  -scheme RTABMapApp -configuration Release \
+  -scheme RTABMapApp-QualifiedDevice -configuration Release \
   -sdk iphoneos -destination generic/platform=iOS \
   -derivedDataPath /private/tmp/marketscanner-derived \
   CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build
 ```
+
+普通 UI/导入 smoke 可另用 `RTABMapApp` Debug；该构建按设计删除 `MarketScannerBuildIdentity.json`，不得用于开始正式 prior-map 扫描。QualifiedDevice Release 构建必须在所有 tracked 代码与当前文档已提交、tracked tree 干净时执行；无签名 generic-device build 只证明编译/链接和 build-identity 生成，不证明真机权限、相机、LiDAR 或现场流程。
 
 覆盖：
 
@@ -135,14 +153,17 @@ python3 tools/PriorMap/replay_localization.py "$out" \
 
 无需超市场景：
 
-1. 构建到支持 ARKit 的 iPhone。
-2. 新建自由扫描，确认原连续单库和 sidecar 不变。
-3. 新建已有地图辅助扫描，完成五步向导。
-4. 在办公室步行，确认 HUD 轨迹连续；遮挡相机后变 weak/lost，但数据库继续增长。
-5. 人工确认/重新选择位置，检查两个 JSONL。
-6. 正常结束，确认 metadata 地图身份、`finalized=true`、capture health 完整、eligibility blockers 为空、无 checkpoint、NFC 不可见。
-7. 在测试构建中注入一次必需 sidecar 写失败，确认红色告警持续、停止新的先验地图修正/价签确认、原数据库继续增长、结束后 `finalized=false` 且 checkpoint 保留，PC 明确拒绝；不得在真实扫描目录上用权限破坏方式注入。
-8. 单独注入 metadata 已成功但 checkpoint 删除失败，确认数据库关闭、相机/映射不恢复、metadata 保持 `finalized=true`，启动后只显示严格校验的人工清理提示。
-9. 对实际业务文件提供者完成复制，核对 `copy_verification.json` 与源/目标复读清单；确认应用默认保留本地副本。分别记录普通完成、应用强退和设备重启后的可读性，不把前两者替代断电测试。
+1. 提交全部 tracked 改动并确认 tracked tree 干净；在 Xcode 选择 `RTABMapApp-QualifiedDevice`，clean build 后安装到支持 ARKit/LiDAR 的 iPhone。普通 Debug 只做 UI/地图导入 smoke。
+2. 从首页大型“新建扫描”进入统一配置页，确认左上角 Close；从“门店地图”选择同一地图进入，确认系统 Back/返回手势。进入、返回和重复切换不得再出现 3–4 秒主线程冻结，并记录 p50/p95。
+3. 分别导入手机 XLSX 和 PC 正式 v2 地图包，确认都进入同一地图库和同一配置页；编译/复制期间持续显示阶段、百分比与用时，完成后核对 store ID、map ID、package/canonical SHA、楼层、元素和 warning 摘要。
+4. 在配置页验证 1×–8× 捏合、平移、双击、点击选点、0.1/0.5/1.0 m 四方向微调，以及东/北/西/南和左右 15° 朝向；不得出现横向 yaw slider。
+5. 在首次权限未决定的干净安装上点击开始：授权前不得创建会话；授权后必须重新执行完整入口并成功启动。拒绝权限时恢复交互并提供系统设置入口，不能出现后台幽灵扫描。
+6. 选择有效起点开始扫描，确认配置页关闭后直接进入 `.STATE_MAPPING`，无需再点 Record；检查 session-scoped DB、receipt 和 workflow context 均存在且身份一致。随后测试启动页离开/取消、host 失败和持久化故障注入，确认 CameraMobile/ARSession/mapping/clock 全部停止、失败数据库被脱离且没有可继续录制的未提交会话。
+7. 在办公室步行，确认 HUD 轨迹连续；遮挡相机后变 weak/lost，但数据库继续增长。人工确认/重新选择位置，检查定位 JSONL。
+8. 另从“实验与兼容工具”新建自由扫描，确认旧连续单库和 sidecar 兼容行为不变，且它不再占据主入口。
+9. 正常结束，确认 metadata 地图身份、`finalized=true`、capture health 完整、eligibility blockers 为空、无 checkpoint、NFC 不可见。
+10. 在测试构建中注入一次必需 sidecar 写失败，确认红色告警持续、停止新的先验地图修正/价签确认、原数据库继续增长、结束后 `finalized=false` 且 checkpoint 保留，PC 明确拒绝；不得在真实扫描目录上用权限破坏方式注入。
+11. 单独注入 metadata 已成功但 checkpoint 删除失败，确认数据库关闭、相机/映射不恢复、metadata 保持 `finalized=true`，启动后只显示严格校验的人工清理提示。
+12. 对实际业务文件提供者完成复制，核对 `copy_verification.json` 与源/目标复读清单；确认应用默认保留本地副本。分别记录普通完成、应用强退和设备重启后的可读性，不把前两者替代断电测试。
 
 正式超市验收只按 `FIELD_TEST_PLAN.md` 执行；尚未执行时不得声称生产通过。

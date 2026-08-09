@@ -1,6 +1,6 @@
 # 手机地图导入（Mobile Map Import）
 
-> 文档状态：**当前有效**；IMPLEMENTED / UNIT TESTED / INTEGRATION TESTED（Swift host I1-I14 + MapCase02 正式套件）。最后核对日期：2026-08-09。
+> 文档状态：**当前有效**；IMPLEMENTED / UNIT TESTED / INTEGRATION TESTED（Swift host I1-I14 + MapCase02 正式套件 + 统一地图库/扫描入口）。最后核对日期：2026-08-10。
 
 正式超市 XLSX 使用 `Basic Info + Element Info` 权威合同；`Shelf Info` 只做审计。`Basic Info` 冻结门店、地图名、画布和 top-left anchor/pivot，调用方参数只能精确匹配，不能覆盖。历史 Element-only XLSX 只有在显式 legacy 模式下才可进入旧合同。
 
@@ -8,7 +8,7 @@
 
 `app/ios/RTABMapApp/MobileMapImport/`
 
-- `MapSourceDocumentPicker.swift`（UIKit）：Files 选择 XLSX/CSV/JSON，security-scoped，复制到私有 staging。
+- `MapSourceDocumentPicker.swift`（UIKit）：Files 选择 XLSX/CSV/JSON，security-scoped；provider stream copy、flush/fsync 和 staging 在专用后台队列执行，回调回到主线程，文件选择后立即显示复制状态。
 - `MapSourceImportCoordinator.swift`：格式识别 → 调用对应 importer → 计算 `sourceFileSha256` / `canonicalSourceSha256` → 产出 `MapSourceImportReport`。
 - `CanonicalPriorMapSource.swift` / `CanonicalJSONEncoder.swift`：三格式统一业务模型与确定性编码（sort keys、无空白、数值规范化、忽略原始文件名/格式）。
 - `XLSXZipReader.swift`（自研安全 ZIP 读取，系统 zlib raw inflate）：traversal/数量/大小/压缩比限制。
@@ -16,6 +16,15 @@
 - `RFC4180CSVReader.swift` / `CSVMapSourceImporter.swift`：流式 RFC 4180，quoted newline、`""` 转义、CRLF/LF/BOM、NUL/非法 UTF-8/字段数不一致拒绝。
 - `JSONMapSourceImporter.swift`：接受 `MarketScannerPriorMapSource` v1，复用严格解析器；缺 identity 时补入。
 - `SourceGeometry.swift` / `ElementNormalizer.swift`：坐标合同（top_left/bottom_left 预设）与元素规范化（与 PC `_normalized_element` 一致）。
+
+## 统一地图库与可观测进度
+
+- `MobileMapLibraryViewController` 的普通进入只读取轻量 registry，不在主线程逐包解析 manifest、JSON 和 PNG。下拉刷新才执行完整复验；扫描配置页在后台加载并复用一次 immutable package snapshot。
+- `+` 菜单支持两种来源：手机编译的 XLSX/CSV/JSON，以及 PC 已生成并通过 production validator 的正式 v2 prior-map package。两者安装后都进入同一个内容寻址地图库，并打开同一个 `MobileScanSetupViewController`。
+- PC package 导入按 provider folder snapshot → production integrity → 私有 staging exact copy → staging 复验 → CAS 安装 → registry 注册执行。缺少有效 `store_id`、canonical source identity 或文件完整性不合格的旧包 fail closed。
+- 手机编译进度必须来自实际阶段：复制、严格解析、业务身份/元素校验、楼层范围、道路图、逐楼层/逐分辨率距离场、空间索引、工件写入、逐楼层预览、validation report、manifest、production self-validation、fsync、不可变提交和 registry 注册。
+- 完成页显示地图名、store ID、prior-map ID、package SHA、canonical SHA、楼层数、source/effective/ignored element count、warning count、源格式和源大小；不再只显示“导入成功”。
+- registry 的 `name / floorCount / elementCount / canonicalSourceSHA256 / priorMapID / packageSHA256` 必须与同一次完整验证后的 manifest 精确一致。registry rebuild 只使用一个有界 descriptor-bound snapshot；包冻结只对精确扁平普通文件集执行 `openat(O_NOFOLLOW)` + `fchmod(fd)`，拒绝符号链接、目录、硬链接、FIFO、socket 和路径替换。
 
 ## 错误码（冻结）
 

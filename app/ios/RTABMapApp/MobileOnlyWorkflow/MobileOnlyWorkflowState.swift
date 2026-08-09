@@ -14,6 +14,7 @@ enum MobileOnlyWorkflowState: String, Codable, Equatable, CaseIterable {
     case compilingMap
     case mapReady
     case configuringScan
+    case startingScan
     case scanning
     case finalizingScan
     case snapshotting
@@ -58,7 +59,9 @@ enum MobileOnlyWorkflowState: String, Codable, Equatable, CaseIterable {
         case .mapReady:
             return [.configuringScan, .idle, .pickingMap, .interrupted]
         case .configuringScan:
-            return [.scanning, .idle, .failed, .interrupted]
+            return [.startingScan, .idle, .failed, .interrupted]
+        case .startingScan:
+            return [.scanning, .idle, .failed, .cancelled, .interrupted]
         case .scanning:
             return [.finalizingScan, .cancelled, .failed, .interrupted]
         case .finalizingScan:
@@ -102,6 +105,7 @@ enum MobileOnlyWorkflowState: String, Codable, Equatable, CaseIterable {
         case .compilingMap: return "编译地图"
         case .mapReady: return "地图就绪"
         case .configuringScan: return "配置扫描"
+        case .startingScan: return "验证地图并启动扫描"
         case .scanning: return "扫描中"
         case .finalizingScan: return "结束扫描"
         case .snapshotting: return "生成会话快照"

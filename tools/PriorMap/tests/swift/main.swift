@@ -16615,6 +16615,54 @@ if CommandLine.arguments.count == 3,
             dirMode & 0o777 == 0o555,
             "CAS: package directories must be 555, got \(String(format: "%o", dirMode))")
 
+        // P1-4: an undeclared symlink must be rejected before any package
+        // artifact is chmodded, and path-based chmod must never follow it
+        // to an external target.
+        let externalModeTarget = temporary.appendingPathComponent(
+            "package-freeze-external-target")
+        try Data("external-target\n".utf8).write(to: externalModeTarget)
+        guard chmod(externalModeTarget.path, mode_t(0o640)) == 0,
+              chmod(target.path, mode_t(0o755)) == 0 else {
+            throw NSError(
+                domain: "MapLibraryCAS", code: 30,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "cannot prepare package-freeze symlink fixture"])
+        }
+        let undeclaredLink = target.appendingPathComponent(
+            "undeclared-freeze-link")
+        guard Darwin.symlink(
+                externalModeTarget.path, undeclaredLink.path) == 0 else {
+            throw NSError(
+                domain: "MapLibraryCAS", code: 31,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "cannot create package-freeze symlink fixture"])
+        }
+        var symlinkFreezeRejected = false
+        do {
+            try casRegister()
+        } catch let error as MobileMapLibrary.LibraryError {
+            switch error {
+            case .cannotMakeImmutable, .packageVerificationFailed:
+                symlinkFreezeRejected = true
+            default:
+                throw error
+            }
+        }
+        let externalModeAfter = ((try FileManager.default.attributesOfItem(
+            atPath: externalModeTarget.path))[.posixPermissions]
+            as? NSNumber)?.intValue ?? 0
+        guard Darwin.unlink(undeclaredLink.path) == 0,
+              chmod(target.path, mode_t(0o555)) == 0 else {
+            throw NSError(
+                domain: "MapLibraryCAS", code: 32,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "cannot restore package-freeze symlink fixture"])
+        }
+        require(
+            symlinkFreezeRejected && externalModeAfter & 0o777 == 0o640,
+            "P1-4 package freeze must reject undeclared symlinks without "
+                + "chmodding their external targets")
+
         // 4) list/map re-verify; a path-escape registry record marks the
         //    WHOLE index corrupt (V1R5 §13.4 / review H-10: a persistent
         //    identity index never drops entries silently — list and map

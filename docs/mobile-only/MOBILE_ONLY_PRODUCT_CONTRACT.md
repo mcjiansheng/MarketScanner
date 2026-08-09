@@ -1,7 +1,7 @@
 # Mobile-Only V1 产品契约
 
 > 状态：**当前有效**；DESIGNED / IMPLEMENTED / HOST TESTED（本文档冻结产品边界与数据合同）
-> 最后对齐：2026-08-09
+> 最后对齐：2026-08-10
 
 ## 1. 目标
 
@@ -29,6 +29,16 @@
 ### 2.3 Route A 冻结范围
 
 Mobile V1 只承诺 `Fast reduced graph`，以及 Fast 质量失败后至多一次 `Full existing-graph optimization`；再次失败必须输出 `RESCAN_SESSION`。True sensor Deep（重新解码传感器并重建缺失视觉图证据）不属于 V1 功能，也不是本轮发布候选的隐藏 fallback。
+
+### 2.4 单一生产入口与启动事务
+
+- 首页“新建扫描”、菜单“开始门店扫描”和地图库记录必须汇合到同一个 `MobileScanSetupViewController`、`MobileOnlyWorkflowCoordinator` 和真实扫描 host。不得为手机编译地图与 PC 地图包维护两套楼层/起点/朝向/启动系统。
+- 手机 XLSX/CSV/JSON 编译包与正式 PC v2 package 只允许作为同一地图库的两种输入来源；注册后使用同一完整身份门和同一扫描配置。
+- 地图/包读取、localizer 构造、会话目录和 native SQLite 初始化不得作为长任务运行在主线程。主线程只执行有界 UIKit、ARSession 和状态切换事务。
+- workflow 进入 `.scanning` 前必须持久化完整 start receipt 和 workflow context。receipt 绑定 tracking session、segment、database、map/store/floor、启动状态、时间和 app SHA；context 绑定 receipt reference/SHA 和 scanning checkpoint。
+- 首次相机权限必须在 workflow commit 前完成；`.notDetermined` 只能请求权限并重新进入完整校验，不能允许旧相机 callback 在 workflow 已失败后自行启动。
+- 任何 host、receipt、context 或 cancellation 失败都必须有可调用 rollback，停止 mapping/camera/clock、清除 prior-map 状态、脱离失败数据库并释放 session identity。
+- 普通 Debug build identity 继续 fail closed。正式扫描入口只接受满足 `MobileBuildIdentity.isUsable` 的构建；Xcode 真机资格入口为 `RTABMapApp-QualifiedDevice` 的 Release Run，不提供 dirty bypass。
 
 ## 3. 手机导入（Track B1）
 

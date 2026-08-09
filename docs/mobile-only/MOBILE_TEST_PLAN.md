@@ -1,11 +1,12 @@
 # 手机端测试计划（Mobile Test Plan）
 
-> 状态：**当前有效**；MapCase02 正式套件、非超长 PriorMap 分组和完整 Swift host 长方法已执行；完整 discover、设备与现场详细测试仍延期；run `31307753672` 为 7/8 FAIL，Apple clean link 未完成。最后核对：2026-08-09。
+> 状态：**当前有效**；统一扫描 UX/startup 聚焦组、MapCase02 正式套件、非超长 PriorMap 分组和完整 Swift host 长方法已执行；完整 discover、QualifiedDevice 真机、设备与现场详细测试仍延期；run `31307753672` 为历史 7/8 FAIL。最后核对：2026-08-10。
 
 ## 自动测试（已实现，Swift host 默认模式 + 模式化套件）
 
 | 组 | 覆盖 | 状态 |
 |---|---|---|
+| Unified scan UX/startup | 首页/菜单统一路由、单一地图库/配置页/Coordinator、轻量 registry 与后台 package I/O、root Close/push Back、首次相机权限、旧 tmp-db 绕过关闭、receipt/context durable commit、取消/强 rollback、1×–8× zoom、方向键、离散朝向、QualifiedDevice scheme | 聚焦合同 **27/27 PASS**；Swift 核心长方法 **1/1 PASS（1233.541 s）**；unsigned iphoneos Debug build PASS；独立复审 `P0=0/P1=0`。QualifiedDevice 真机运行与交互 p50/p95 NOT RUN |
 | I1-I14 | 三格式导入、canonical parity、公式/ZIP/CSV/JSON 安全 | Swift host + --import-suite |
 | C5/C7/C9/C10 | 编译器路网统计、距离场 SHA、package self-load、PC parity | Swift host |
 | MapCase02 | 正式 Basic/Element workbook、Shelf audit、top-left、1838→1630 active、role geometry、canonical/package/preview golden；XLSX authority、strict scalar、resource budget 与派生工件重签 mutation | Swift `--mapcase02-suite` + PC converter/schema **PASS**；独立复审 `P0=0/P1=0` |
@@ -25,7 +26,7 @@
 
 ## 未关闭（未写 PASS；逐项注明已运行/未运行）
 
-- 2026-08-09 已完成 PriorMap 非超长分组 217 项、Map Studio 109/109 与 I10 完整外层 Swift host 长方法 1/1；run `31307753672` 也通过同一远端 host/RSS 门。完整 discover 仍未登记 PASS；host evidence 不是 Replay/FAR 或真机 PASS。
+- 2026-08-10 已完成统一 UX/startup 聚焦合同 27/27、当前 Swift 核心长方法 1/1（1233.541 s）、四张真实 XLSX 手机地图库与 PC validator 4/4、unsigned iphoneos Debug build；此前 PriorMap 非超长分组 217 项、Map Studio 109/109 与 I10/远端 host/RSS 证据仍有效。完整 discover 仍未登记 PASS；host evidence 不是 Replay/FAR、QualifiedDevice 真机或现场 PASS。
 - 三格式 canonical/编译语义 parity 已自动覆盖；真实业务大图 Replay/FAR 仍 NOT RUN。
 - E2E-3 真机短路线（5~10 分钟扫描、10 个价签、手机处理、手机导出）。
 - E2E-4 Sam 路线（100+ truth tags、现场控制点）。
@@ -33,8 +34,8 @@
 - 资源门：peak RSS、处理时长、thermal、磁盘、电量、中断/崩溃恢复。macOS ACL、BSD `uchg`/`schg` file flags 和相关扩展属性仍未资格化；POSIX `0444/0555` 不能冒充这些边界的 PASS。
 - exact-final-SHA GitHub Actions：最新 `31307753672@8f0e730d92773eea2ab58f56742d901ac02eead4` 为 7/8；七个非 Apple required jobs与 Apple job 内的 host/SwiftPM/Xcode metadata 均 PASS，iphoneos cold dependency configure 缺宿主 `rtabmap-res_tool` 显式绑定。I11/G11 已修复，等待新的全量 rerun。
 - run `31307753672` 已证明 P0、exact binding、ABI、Ubuntu/Windows native clean build、Python contracts 与 macOS host/RSS PASS；本轮 Map Studio 109/109、既有 PriorMap 非超长 217 项、正式 PC golden/canonical ID/strict manifest-report 相关 Python 52/52、MapCase02 正式套件和四张真实 XLSX library smoke PASS。新 exact-HEAD 全绿前仍不得声明 exact-SHA PASS。
-- Apple simulator/device 两套 cold native dependencies + 两次真实 clean compile/link：`31307753672` 的 iphoneos 依赖构建到 RTAB-Map configure 后失败，后续 simulator/device 步骤 skipped。I11 本地 iOS configure PASS，但远端双平台 clean link 仍为 NOT RUN。
-- I5 Result recovery、I6 ESL follow-up、MapCase02、I10 fixtures 与 I11 cold-build 修复最终独立复审均为 `P0=0 / P1=0`；低影响项登记 TODO。完整 discover、新 exact-SHA、Apple/设备/现场与 J-04 仍未关闭，最终判断保持 **REJECTED / NO-GO / developer smoke only**。
+- Apple simulator/device 两套 cold native dependencies + 两次真实 clean compile/link：`31307753672` 的 iphoneos 依赖构建到 RTAB-Map configure 后失败，后续 simulator/device 步骤 skipped。I11 本地 iOS configure PASS；当前 UX 分支的 unsigned Debug device build PASS，但不能替代双平台 cold clean link 或 QualifiedDevice 真机。
+- I5 Result recovery、I6 ESL follow-up、MapCase02、I10 fixtures、I11 cold-build、统一 UX/startup 和地图库安全复审最终均为 `P0=0 / P1=0`；低影响项登记 TODO。完整 discover、新 exact-SHA、Apple/设备/现场与 J-04 仍未关闭，最终判断保持 **REJECTED / NO-GO / developer smoke only**。
 
 ## 明日详细执行队列
 
@@ -49,3 +50,4 @@
 9. 完整运行 I6 的长时 PriorMap host workflow；测量 scan-stop finalization-owned audit/terminal Recovery stable-read 的 UI latency。
 10. 在真机重新导入 `map 2.xlsx`，确认显示 ID `piaseczno-5ddfac7dc439` 且地图出现在地图库；继续执行 [`../map-assisted-localization/MAPCASE02_TODO.md`](../map-assisted-localization/MAPCASE02_TODO.md) 的低影响 parity/UI/preview/visual baseline 与真机 MapCase02 矩阵。host `--xlsx-library-smoke` 四张真实地图 PASS 不能替代该真机复测。
 11. 深化 Windows portable basename 尾随点/空格和设备名拒绝，并评估 Debug illegal-transition assertion 前后的 audit 持久化顺序。
+12. 用 `RTABMapApp-QualifiedDevice` 在干净安装上执行统一入口/地图库入口、首次权限、zoom/nudge/heading、开始/取消/返回、真实连续扫描和停止；记录入口、返回、地图加载和启动事务的主线程 stall 与 p50/p95，不能用 Debug 或 host wall time替代。

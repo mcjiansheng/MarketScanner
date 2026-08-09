@@ -14,10 +14,17 @@ final class MobileMapImportViewController: UIViewController {
     private let coordinator = MobileOnlyWorkflowCoordinator.shared
     private let contractControl = UISegmentedControl(
         items: ["左上原点", "左下原点"])
+    private let percentLabel = UILabel()
     private let statusLabel = UILabel()
+    private let elapsedLabel = UILabel()
     private let progressView = UIProgressView(progressViewStyle: .default)
+    private let resultLabel = UILabel()
     private let importButton = UIButton(type: .system)
     private var observerTokens: [MobileOnlyWorkflowCoordinator.ObserverToken] = []
+    private var latestImportReport: MapSourceImportReport?
+    private var progressFraction = 0.0
+    private var startedAtUptime: TimeInterval?
+    private var elapsedTimer: Timer?
 
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -28,6 +35,7 @@ final class MobileMapImportViewController: UIViewController {
     }
 
     deinit {
+        elapsedTimer?.invalidate()
         for token in observerTokens {
             coordinator.removeObserver(token)
         }
@@ -38,35 +46,48 @@ final class MobileMapImportViewController: UIViewController {
             self?.updateStatus(state)
         })
         observerTokens.append(coordinator.addProgressObserver { [weak self] fraction, message in
-            self?.progressView.setProgress(Float(fraction), animated: true)
-            self?.statusLabel.text = message
+            self?.updateProgress(fraction: fraction, message: message)
         })
         observerTokens.append(coordinator.addImportObserver { [weak self] result in
             guard let self = self else { return }
             switch result {
             case .success(let report):
+                self.latestImportReport = report
                 self.statusLabel.text =
-                    "解析完成：\(report.elementCount) 个元素，\(report.floorCount) 层，\(report.warningCount) 条警告。正在编译…"
+                    "解析完成：\(report.elementCount) 个源元素，\(report.floorCount) 层，\(report.warningCount) 条警告。正在编译…"
             case .failure(let error):
                 self.statusLabel.text = "导入失败：\(error.localizedDescription)"
                 self.importButton.isEnabled = true
+                self.contractControl.isEnabled = true
+                self.stopElapsedTimer()
             }
         })
         observerTokens.append(coordinator.addCompileObserver { [weak self] result in
             guard let self = self else { return }
             self.importButton.isEnabled = true
+            self.contractControl.isEnabled = true
             switch result {
             case .success(let map):
-                self.statusLabel.text = "编译完成，已加入地图库。"
+                self.updateProgress(fraction: 1, message: "地图已编译、验证并加入地图库")
+                self.stopElapsedTimer()
+                let details = self.resultDetails(map: map, report: self.latestImportReport)
+                self.resultLabel.text = details
+                self.resultLabel.isHidden = false
+                self.importButton.setTitle("再次导入地图", for: .normal)
                 let alert = UIAlertController(
                     title: "地图已就绪",
-                    message: "「\(map.name)」已编译并注册（\(map.floorCount) 层 / \(map.elementCount) 元素）。",
+                    message: self.alertDetails(map: map, report: self.latestImportReport),
                     preferredStyle: .alert)
                 alert.addAction(UIAlertAction(title: "开始扫描", style: .default) { [weak self] _ in
                     guard let self = self else { return }
                     let setup = MobileScanSetupViewController()
                     setup.selectedMap = map
-                    self.navigationController?.setViewControllers([setup], animated: true)
+                    // Preserve the library/import back stack. Making setup
+                    // the only navigation root removed both Back and Close
+                    // and caused the inconsistent navigation in the field
+                    // screenshots.
+                    self.navigationController?.pushViewController(
+                        setup, animated: true)
                 })
                 alert.addAction(UIAlertAction(title: "完成", style: .cancel) { [weak self] _ in
                     self?.navigationController?.popToRootViewController(animated: true)
@@ -74,6 +95,7 @@ final class MobileMapImportViewController: UIViewController {
                 self.present(alert, animated: true)
             case .failure(let error):
                 self.statusLabel.text = "编译失败：\(error.localizedDescription)"
+                self.stopElapsedTimer()
             }
         })
     }
@@ -86,35 +108,95 @@ final class MobileMapImportViewController: UIViewController {
 
         let contractLabel = UILabel()
         contractLabel.text = "原始坐标合同"
+        contractLabel.font = UIFont.preferredFont(forTextStyle: .headline)
+        contractLabel.adjustsFontForContentSizeCategory = true
 
         contractControl.selectedSegmentIndex = 0
+        contractControl.accessibilityLabel = "原始坐标合同"
+
+        percentLabel.text = "0%"
+        percentLabel.font = UIFont.preferredFont(forTextStyle: .largeTitle)
+        percentLabel.adjustsFontForContentSizeCategory = true
+        percentLabel.textAlignment = .center
+        percentLabel.accessibilityTraits = .updatesFrequently
 
         statusLabel.numberOfLines = 0
-        statusLabel.text = ""
+        statusLabel.text = "选择文件后会显示当前解析、编译、验证和注册阶段。"
+        statusLabel.font = UIFont.preferredFont(forTextStyle: .headline)
+        statusLabel.adjustsFontForContentSizeCategory = true
+        statusLabel.textAlignment = .center
+
+        elapsedLabel.text = "尚未开始"
+        elapsedLabel.font = UIFont.preferredFont(forTextStyle: .caption1)
+        elapsedLabel.adjustsFontForContentSizeCategory = true
+        elapsedLabel.textColor = .secondaryLabel
+        elapsedLabel.textAlignment = .center
+
+        progressView.progress = 0
+        progressView.accessibilityLabel = "地图导入与编译进度"
+        progressView.accessibilityValue = "0%"
+
+        resultLabel.numberOfLines = 0
+        resultLabel.font = UIFont.preferredFont(forTextStyle: .footnote)
+        resultLabel.adjustsFontForContentSizeCategory = true
+        resultLabel.textColor = .secondaryLabel
+        resultLabel.isHidden = true
+        resultLabel.accessibilityLabel = "地图编译结果"
 
         importButton.setTitle("选择文件并导入", for: .normal)
+        importButton.titleLabel?.font = UIFont.preferredFont(forTextStyle: .headline)
+        importButton.titleLabel?.adjustsFontForContentSizeCategory = true
         importButton.addTarget(self, action: #selector(importTapped), for: .touchUpInside)
 
         let stack = UIStackView(arrangedSubviews: [
-            prompt, contractLabel, contractControl, progressView, statusLabel, importButton,
+            prompt,
+            contractLabel,
+            contractControl,
+            percentLabel,
+            progressView,
+            statusLabel,
+            elapsedLabel,
+            resultLabel,
+            importButton,
         ])
         stack.axis = .vertical
         stack.spacing = 16
         stack.translatesAutoresizingMaskIntoConstraints = false
-        view.addSubview(stack)
+
+        let scrollView = UIScrollView()
+        scrollView.alwaysBounceVertical = true
+        scrollView.keyboardDismissMode = .interactive
+        scrollView.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(scrollView)
+        scrollView.addSubview(stack)
         NSLayoutConstraint.activate([
-            stack.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 24),
-            stack.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 20),
-            stack.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -20),
+            scrollView.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor),
+            scrollView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+            scrollView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            scrollView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            stack.topAnchor.constraint(equalTo: scrollView.contentLayoutGuide.topAnchor, constant: 24),
+            stack.bottomAnchor.constraint(equalTo: scrollView.contentLayoutGuide.bottomAnchor, constant: -24),
+            stack.leadingAnchor.constraint(equalTo: scrollView.frameLayoutGuide.leadingAnchor, constant: 20),
+            stack.trailingAnchor.constraint(equalTo: scrollView.frameLayoutGuide.trailingAnchor, constant: -20),
+            importButton.heightAnchor.constraint(greaterThanOrEqualToConstant: 44),
         ])
     }
 
     @objc private func importTapped() {
         let contract: CoordinateContract = contractControl.selectedSegmentIndex == 0
             ? .topLeft : .bottomLeft
+        latestImportReport = nil
+        progressFraction = 0
         importButton.isEnabled = false
+        importButton.setTitle("导入处理中…", for: .normal)
+        contractControl.isEnabled = false
+        resultLabel.isHidden = true
+        resultLabel.text = nil
         progressView.setProgress(0, animated: false)
+        progressView.accessibilityValue = "0%"
+        percentLabel.text = "0%"
         statusLabel.text = "正在打开文件选择器…"
+        startElapsedTimer()
         // Single unified entry: the coordinator runs pick → stage →
         // import → compile → register without any further page calls
         // (V1R2 §4.1). Concurrent taps are rejected with a typed error.
@@ -123,6 +205,14 @@ final class MobileMapImportViewController: UIViewController {
 
     private func updateStatus(_ state: MobileOnlyWorkflowState) {
         switch state {
+        case .idle:
+            if progressFraction < 1 {
+                statusLabel.text = "未选择地图文件，可以重新开始。"
+                importButton.isEnabled = true
+                contractControl.isEnabled = true
+                importButton.setTitle("选择文件并导入", for: .normal)
+                stopElapsedTimer()
+            }
         case .pickingMap:
             statusLabel.text = "请在文件选择器中选择地图文件…"
         case .stagingMapSource:
@@ -134,13 +224,102 @@ final class MobileMapImportViewController: UIViewController {
         case .failed:
             statusLabel.text = coordinator.lastError?.errorDescription ?? "操作失败"
             importButton.isEnabled = true
+            contractControl.isEnabled = true
+            importButton.setTitle("重新选择文件", for: .normal)
+            stopElapsedTimer()
         case .mapReady:
             statusLabel.text = "地图就绪"
         case .cancelled:
             statusLabel.text = "导入已取消"
             importButton.isEnabled = true
+            contractControl.isEnabled = true
+            importButton.setTitle("选择文件并导入", for: .normal)
+            stopElapsedTimer()
         default:
             break
         }
+    }
+
+    private func updateProgress(fraction: Double, message: String) {
+        let bounded = min(1, max(0, fraction))
+        progressFraction = max(progressFraction, bounded)
+        progressView.setProgress(Float(progressFraction), animated: true)
+        let percent = Int((progressFraction * 100).rounded())
+        percentLabel.text = "\(percent)%"
+        progressView.accessibilityValue = "\(percent)%"
+        statusLabel.text = message
+    }
+
+    private func startElapsedTimer() {
+        elapsedTimer?.invalidate()
+        startedAtUptime = ProcessInfo.processInfo.systemUptime
+        updateElapsedLabel()
+        let timer = Timer(timeInterval: 0.5, repeats: true) { [weak self] _ in
+            self?.updateElapsedLabel()
+        }
+        elapsedTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
+    }
+
+    private func stopElapsedTimer() {
+        updateElapsedLabel()
+        elapsedTimer?.invalidate()
+        elapsedTimer = nil
+    }
+
+    private func updateElapsedLabel() {
+        guard let started = startedAtUptime else {
+            elapsedLabel.text = "尚未开始"
+            return
+        }
+        let elapsed = max(0, ProcessInfo.processInfo.systemUptime - started)
+        elapsedLabel.text = String(format: "已用时 %.1f 秒", elapsed)
+    }
+
+    private func resultDetails(
+        map: MobileMapLibrary.MapEntry,
+        report: MapSourceImportReport?
+    ) -> String {
+        var lines = [
+            "地图名称：\(map.name)",
+            "地图 ID：\(map.priorMapID)",
+            "地图包 SHA-256：\(map.packageSHA256)",
+            "楼层：\(map.floorCount)",
+            "编译后有效元素：\(map.elementCount)",
+        ]
+        if let report = report {
+            lines.insert("门店 ID：\(report.storeId)", at: 1)
+            lines.append("源格式：\(report.format.uppercased())")
+            lines.append("源元素：\(report.elementCount)")
+            lines.append("忽略元素：\(report.ignoredElementCount)")
+            lines.append("导入警告：\(report.warningCount)")
+            lines.append("源文件：\(formattedBytes(report.fileSizeBytes))")
+            lines.append("Canonical SHA-256：\(report.canonicalSourceSha256)")
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    private func alertDetails(
+        map: MobileMapLibrary.MapEntry,
+        report: MapSourceImportReport?
+    ) -> String {
+        var lines = [
+            "\(map.name)",
+            "地图 ID：\(map.priorMapID)",
+            "包 SHA：\(map.packageSHA256.prefix(16))…",
+            "\(map.floorCount) 层 · \(map.elementCount) 个有效元素",
+        ]
+        if let report = report {
+            lines.insert("门店：\(report.storeId)", at: 1)
+            lines.append("\(report.warningCount) 条导入警告 · \(report.ignoredElementCount) 个忽略元素")
+        }
+        lines.append("完整摘要已显示在导入页面。")
+        return lines.joined(separator: "\n")
+    }
+
+    private func formattedBytes(_ bytes: Int64) -> String {
+        return ByteCountFormatter.string(
+            fromByteCount: bytes,
+            countStyle: .file)
     }
 }

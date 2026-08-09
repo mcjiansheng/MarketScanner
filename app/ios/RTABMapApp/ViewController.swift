@@ -483,6 +483,7 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         // Exact build identity embedded by the Xcode script phase (V1R3
         // §4.4); an unusable identity blocks processing eligibility.
         let identity = MobileBuildIdentity.loadFromBundle()
+        coordinator.buildIdentity = identity
         coordinator.appGitSHA = identity.appGitSHA
         coordinator.policySHA = identity.wave
         coordinator.nativeCoreSHA256 = identity.nativeCoreSHA256
@@ -503,9 +504,82 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         // B-09: when the workflow cannot commit a validated host start
         // (receipt invalid or persistence failed), the host must stop the
         // already-running scan so it cannot outlive a failed workflow.
-        coordinator.onRollbackScan = { [weak self] _ in
-            self?.stopMapping(ignoreSaving: true)
+        coordinator.onRollbackScan = { [weak self] receipt in
+            self?.rollbackMobileOnlyScanStart(
+                receipt: receipt,
+                reason: "workflow_start_commit_failed")
         }
+    }
+
+    /// Transaction rollback for a mobile-only start that reached the host
+    /// but could not commit a durable receipt/workflow context. This is
+    /// intentionally stronger than `stopMapping(ignoreSaving:)`: it stops
+    /// every producer, detaches the native database, releases the failed
+    /// session identity and clears prior-map state so a retry cannot append
+    /// to the uncommitted session.
+    private func rollbackMobileOnlyScanStart(
+        receipt: MobileScanStartReceipt?,
+        reason: String
+    ) {
+        precondition(Thread.isMainThread)
+        cancelAutomaticCaptureResume()
+        stopMapping(ignoreSaving: true)
+        _ = stopClockCorrelationRecording(flush: false)
+
+        let failedSession = supermarketSession
+        failedSession?.appendScanEvent(
+            level: "error",
+            event: "mobile_only_scan_start_rolled_back",
+            message: "The live scan start did not reach its durable workflow commit",
+            fields: [
+                "reason": reason,
+                "trackingSessionId": receipt?.trackingSessionID
+                    ?? failedSession?.trackingSessionId
+                    ?? "",
+                "priorMapId": receipt?.priorMapID
+                    ?? activeScanConfiguration.priorMapId
+                    ?? "",
+            ])
+
+        // Persist/cancel any in-flight prior-map recovery evidence while the
+        // failed session identity is still available, then unbind it.
+        clearPriorMapLocalization()
+
+        // Opening a private scratch database closes the failed streaming DB
+        // inside the native core. Never reuse/delete the legacy
+        // Documents/rtabmap.tmp.db recovery file for this purpose.
+        if let rtabmap = rtabmap {
+            do {
+                let base = try FileManager.default.url(
+                    for: .applicationSupportDirectory,
+                    in: .userDomainMask,
+                    appropriateFor: nil,
+                    create: true)
+                let directory = base
+                    .appendingPathComponent("MarketScanner", isDirectory: true)
+                    .appendingPathComponent("FailedScanStart", isDirectory: true)
+                try FileManager.default.createDirectory(
+                    at: directory, withIntermediateDirectories: true)
+                let detachedDatabase = directory
+                    .appendingPathComponent("native_detached.db")
+                _ = rtabmap.openDatabase(
+                    databasePath: detachedDatabase.path,
+                    databaseInMemory: false,
+                    optimize: false,
+                    clearDatabase: true)
+            } catch {
+                print("Could not detach failed mobile-only database: \(error)")
+            }
+        }
+
+        failedSession?.completeCurrentSession()
+        activeScanConfiguration = .freeMapping
+        mDataRecording = false
+        openedDatabasePath = nil
+        mMapNodes = 0
+        mLatestDatabaseMemoryMB = 0
+        mLatestScanStorageBytes = 0
+        updateState(state: .STATE_IDLE)
     }
 
     private func persistScanConfiguration(_ configuration: MobileScanConfiguration) {
@@ -1601,9 +1675,16 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
 
         // Advanced menu
         let advancedMenu = UIMenu(title: localized("Advanced..."), children: [
+            UIAction(
+                title: localized("自由扫描建图（实验）"),
+                image: UIImage(systemName: "viewfinder"),
+                attributes: actionNewScanEnabled ? [] : .disabled,
+                handler: { _ in
+                    self.newScan(configuration: .freeMapping)
+                }),
             UIAction(title: localized("New Data Recording"), image: UIImage(systemName: "plus.app"), attributes: actionNewDataRecording ? [] : .disabled, state: .off, handler: { _ in
-            	self.newScan(dataRecordingMode: true)
-        	})
+                self.newScan(dataRecordingMode: true)
+            })
         ])
         
         // Measuring menu
@@ -1625,9 +1706,6 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         ])
                 
         var fileMenuChildren: [UIMenuElement] = []
-        fileMenuChildren.append(UIAction(title: localized("New Mapping Session"), image: UIImage(systemName: "plus.app"), attributes: actionNewScanEnabled ? [] : .disabled, state: .off, handler: { _ in
-            self.presentNewScanModePicker()
-        }))
         if supermarketNFCEnabled {
             fileMenuChildren.append(UIAction(title: localized("Read Price Tag NFC"), image: UIImage(systemName: "tag"), attributes: self.mState == .STATE_MAPPING ? [] : .disabled, state: .off, handler: { _ in
                 self.readPriceTagNFC()
@@ -1662,15 +1740,19 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         }
         fileMenuChildren.append(advancedMenu)
         
-        // Mobile-Only product entries (V1R1 Gate A §5.3): 门店地图 /
-        // 开始门店扫描 / 处理历史扫描 / 历史结果. Every action opens the
-        // corresponding mobile-only screen from the app menu.
-        let mobileOnlyMenu = UIMenu(title: localized("MarketScanner"), image: UIImage(systemName: "storefront"), children: [
+        // Current production product entries are top-level and ordered by
+        // operator priority. The legacy/free mapping tools remain under the
+        // experimental File menu instead of competing with the full-phone
+        // store workflow.
+        let mobileOnlyPrimary = UIMenu(
+            title: "",
+            options: .displayInline,
+            children: [
+            UIAction(title: localized("开始门店扫描"), image: UIImage(systemName: "camera.viewfinder"), attributes: actionNewScanEnabled ? [] : .disabled, handler: { _ in
+                self.presentMobileFlow(MobileScanSetupViewController())
+            }),
             UIAction(title: localized("门店地图"), image: UIImage(systemName: "map"), handler: { _ in
                 self.presentMobileFlow(MobileMapLibraryViewController())
-            }),
-            UIAction(title: localized("开始门店扫描"), image: UIImage(systemName: "camera.viewfinder"), handler: { _ in
-                self.presentMobileFlow(MobileScanSetupViewController())
             }),
             UIAction(title: localized("处理历史扫描"), image: UIImage(systemName: "wand.and.stars"), handler: { _ in
                 self.presentMobileFlow(MobileProcessingViewController())
@@ -1681,7 +1763,10 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         ])
         
         // File menu
-        let fileMenu = UIMenu(title: localized("File"), options: .displayInline, children: fileMenuChildren)
+        let fileMenu = UIMenu(
+            title: localized("实验与兼容工具"),
+            image: UIImage(systemName: "wrench.and.screwdriver"),
+            children: fileMenuChildren)
         
         // Visibility menu
         let visibilityMenu = UIMenu(title: localized("Visibility..."), children: [
@@ -1746,7 +1831,8 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
              })
         ])
 
-        menuButton.menu = UIMenu(title: "", children: [mobileOnlyMenu, fileMenu, settingsMenu])
+        menuButton.menu = UIMenu(
+            title: "", children: [mobileOnlyPrimary, fileMenu, settingsMenu])
         menuButton.addTarget(self, action: #selector(ViewController.menuOpened(_:)), for: .menuActionTriggered)
         
         // Camera menu
@@ -2758,44 +2844,17 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                 seconds: 4)
             return
         }
-        let message = """
-        自由扫描建图
-        无需已有地图，继续使用当前连续扫描流程。
-
-        已有地图辅助扫描
-        在已有货架图上显示位置，并实验性使用有界 LiDAR 结构匹配；真实超市验收尚未完成。
-        """
-        let alert = UIAlertController(
-            title: localized("新建扫描"),
-            message: message,
-            preferredStyle: .actionSheet)
-        alert.addAction(UIAlertAction(
-            title: localized("自由扫描建图"),
-            style: .default,
-            handler: { _ in
-                self.newScan(configuration: .freeMapping)
-            }))
-        alert.addAction(UIAlertAction(
-            title: localized("已有地图辅助扫描"),
-            style: .default,
-            handler: { _ in
-                let wizard = PriorMapWizardViewController(
-                    completion: { configuration in
-                        self.newScan(configuration: configuration)
-                    },
-                    onCancel: {})
-                self.present(wizard, animated: true)
-            }))
-        alert.addAction(UIAlertAction(title: localized("Cancel"), style: .cancel))
-        if let popover = alert.popoverPresentationController {
-            popover.sourceView = newScanButtonLarge
-            popover.sourceRect = newScanButtonLarge.bounds
-        }
-        present(alert, animated: true)
+        // The large primary action always enters the canonical full-phone
+        // store scan. Free mapping and raw recording remain available only
+        // under “实验与兼容工具”, and the production path does not
+        // bypass the canonical mobile-only coordinator.
+        presentMobileFlow(MobileScanSetupViewController())
     }
 
     private func preparePriorMapLocalization(
-        configuration: PriorMapScanConfiguration
+        configuration: PriorMapScanConfiguration,
+        preparedPackage: PriorMapPackage? = nil,
+        preparedLocalizer: PriorMapStageOneLocalizer? = nil
     ) -> Bool {
         clearPriorMapLocalization()
         activeScanConfiguration = configuration
@@ -2822,19 +2881,32 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
             return false
         }
         do {
-            let package = try PriorMapPackage.load(directory: directory)
+            // The canonical mobile setup performs the expensive immutable
+            // snapshot read and full package validation on a background
+            // queue. Reuse that exact typed package here; legacy/internal
+            // callers without a prepared package retain the fail-closed
+            // loader fallback.
+            let package = try preparedPackage
+                ?? PriorMapPackage.load(directory: directory)
             guard package.manifest.priorMapId == configuration.priorMapId,
                   package.packageSha256 == configuration.priorMapSha256,
+                  package.manifest.storeID == configuration.storeID,
+                  package.directory.standardizedFileURL
+                    == directory.standardizedFileURL,
                   package.manifest.floors.contains(where: { $0.id == floorId }) else {
                 throw NSError(
                     domain: "PriorMap",
                     code: 4,
                     userInfo: [NSLocalizedDescriptionKey: localized("The selected prior-map identity or floor no longer matches the setup.")])
             }
-            priorMapLocalizer = try PriorMapStageOneLocalizer(
-                package: package,
-                floorId: floorId,
-                initialMapPose: initialPose)
+            // The canonical mobile-only path constructs the matcher/localizer
+            // on the workflow background queue and installs it here. Legacy
+            // callers retain the synchronous fallback.
+            priorMapLocalizer = try preparedLocalizer
+                ?? PriorMapStageOneLocalizer(
+                    package: package,
+                    floorId: floorId,
+                    initialMapPose: initialPose)
             activePriorMapPackage = package
             let overlay = PriorMapLiveMapView(package: package, floorId: floorId)
             overlay.translatesAutoresizingMaskIntoConstraints = false
@@ -4880,7 +4952,8 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
     @discardableResult
     func newScan(
         dataRecordingMode: Bool = false,
-        configuration: PriorMapScanConfiguration = .freeMapping
+        configuration: PriorMapScanConfiguration = .freeMapping,
+        preparedPriorMapPackage: PriorMapPackage? = nil
     ) -> Bool
     {
         guard mState != .STATE_MAPPING else {
@@ -4893,7 +4966,9 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
             _ = preparePriorMapLocalization(configuration: .freeMapping)
         }
         else {
-            guard preparePriorMapLocalization(configuration: configuration) else {
+            guard preparePriorMapLocalization(
+                    configuration: configuration,
+                    preparedPackage: preparedPriorMapPackage) else {
                 return false
             }
         }
@@ -4913,7 +4988,13 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         mMapNodes = 0;
         self.openedDatabasePath = nil
         let tmpDatabase = self.getDocumentDirectory().appendingPathComponent(self.RTABMAP_TMP_DB)
-        if(!(self.mState == State.STATE_CAMERA || self.mState == State.STATE_MAPPING) &&
+        // The canonical mobile-only path writes to its session-scoped
+        // streaming database, never to the legacy Documents/rtabmap.tmp.db.
+        // Do not present the legacy asynchronous recovery continuation here:
+        // it would return `false` to the coordinator and could later start a
+        // scan outside the receipt transaction after the user taps Ignore.
+        if(preparedPriorMapPackage == nil &&
+           !(self.mState == State.STATE_CAMERA || self.mState == State.STATE_MAPPING) &&
            FileManager.default.fileExists(atPath: tmpDatabase.path) &&
            tmpDatabase.fileSize > 1024*1024) // > 1MB
         {
@@ -4930,7 +5011,8 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                     }
                     self.newScan(
                         dataRecordingMode: dataRecordingMode,
-                        configuration: configuration)
+                        configuration: configuration,
+                        preparedPriorMapPackage: preparedPriorMapPackage)
                 }
                 alert.addAction(alertActionNo)
                 let alertActionCancel = UIAlertAction(title: "Cancel", style: .cancel) {
@@ -7191,34 +7273,148 @@ extension SKStoreReviewController {
 /// drives the ARSession, the RTAB-Map recording and the session metadata.
 extension ViewController: MobileOnlyScanStarting {
 
+    private struct MobileOnlyStartResources {
+        let session: SupermarketScanSession
+        let segmentDirectory: URL
+        let databaseURL: URL
+        let sidecarWritersReady: Bool
+    }
+
+    /// The coordinator calls the host on its serial workflow queue. Only the
+    /// short UIKit/ARSession transactions are marshalled to the main thread;
+    /// localizer construction, session/file setup and native database open
+    /// remain off the main thread so progress UI can continue rendering.
+    private func performMobileOnlyMain<T>(
+        _ body: @escaping () throws -> T
+    ) throws -> T {
+        if Thread.isMainThread {
+            return try body()
+        }
+        var result: Result<T, Error>!
+        DispatchQueue.main.sync {
+            result = Result { try body() }
+        }
+        return try result.get()
+    }
+
+    private func prepareMobileOnlyStartResources(
+        configuration: PriorMapScanConfiguration
+    ) throws -> MobileOnlyStartResources {
+        guard !Thread.isMainThread else {
+            throw MobileOnlyWorkflowError.invalidState(
+                "mobile-only storage/database preparation must not run on the main thread")
+        }
+        guard let session = supermarketSession,
+              let rtabmap = rtabmap else {
+            throw MobileOnlyWorkflowError.invalidState(
+                "scan session or native host unavailable")
+        }
+
+        let didStartSecurityScope =
+            session.startAccessingBaseDirectorySecurityScope()
+        defer {
+            if didStartSecurityScope {
+                session.stopAccessingBaseDirectorySecurityScope()
+            }
+        }
+
+        try session.startNewSessionIfNeeded()
+        session.resetCurrentSegment()
+        session.configureScan(configuration)
+        let segmentDirectory = try session.currentSegmentDirectory()
+        let databaseURL = try session.streamingDatabaseURL()
+
+        mDataRecording = false
+        rtabmap.setDataRecorderMode(enabled: false)
+        applyStreamingMappingSettings()
+        rtabmap.setPreserveCameraOrigin(enabled: false)
+        optimizedGraphShown = true
+        let openStatus = rtabmap.openDatabase(
+            databasePath: databaseURL.path,
+            databaseInMemory: false,
+            optimize: false,
+            clearDatabase: true)
+        guard openStatus >= 0 else {
+            throw MobileOnlyWorkflowError.invalidState(
+                "native streaming database initialization failed")
+        }
+
+        mLatestDatabaseMemoryMB = 0
+        mLatestScanStorageBytes = 0
+        mLastStreamingCheckpointAt = 0
+        mStreamingCheckpointInFlight = false
+        mStreamingDiskWarningShown = false
+        mStreamingCriticalStopRequested = false
+        mStreamingThermalWarningShown = false
+        mStreamingThermalPolicyLevel = 0
+        mStreamingMemoryPressureLevel = 0
+        mLastLoggedTrackingState = ""
+        resetSoftwarePoseStabilizer()
+        resetSupermarketScanQualityAdvisors()
+
+        session.appendScanEvent(
+            event: "scan_started",
+            message: "Continuous streaming scan resources prepared",
+            fields: [
+                "database": databaseURL.lastPathComponent,
+                "workingMemoryNodes": "\(supermarketIntDefault(supermarketStreamingMemoryNodesKey, fallback: supermarketDefaultStreamingMemoryNodes))",
+                "errorOptimizationProfile": "software_only_no_fiducials",
+                "fiducialsEnabled": "false",
+                "onlinePoseCorrection": "rtabmap_map_to_odom_v1",
+                "reliableLoopMinimumNodeSpan":
+                    "\(mReliableLoopMinimumNodeSpan)",
+                "structureCoverageAdvisor": "map_frame_world_grid_v2",
+                "adaptiveDetectionRateHz": "1.0-2.0",
+                "workflowMode": configuration.workflowMode.rawValue,
+                "priorMapId": configuration.priorMapId ?? "",
+                "floorId": configuration.floorId ?? "",
+            ])
+
+        guard FileManager.default.fileExists(atPath: segmentDirectory.path),
+              FileManager.default.fileExists(atPath: databaseURL.path) else {
+            throw MobileOnlyWorkflowError.invalidState(
+                "streaming database or segment directory missing after initialization")
+        }
+        let probe = segmentDirectory.appendingPathComponent(
+            ".ms_sidecar_probe_\(UUID().uuidString)")
+        let writable = FileManager.default.createFile(
+            atPath: probe.path, contents: Data(), attributes: nil)
+        try? FileManager.default.removeItem(at: probe)
+        guard writable else {
+            throw MobileOnlyWorkflowError.invalidState(
+                "sidecar writers not ready (segment not writable)")
+        }
+        return MobileOnlyStartResources(
+            session: session,
+            segmentDirectory: segmentDirectory,
+            databaseURL: databaseURL,
+            sidecarWritersReady: true)
+    }
+
     func startMobileOnlyScan(
         _ configuration: MobileScanConfiguration
     ) throws -> MobileScanStartReceipt {
-        // Never start a second scan on top of an active one (newScan would
-        // refuse and the workflow would report a phantom success).
-        guard mState != .STATE_MAPPING else {
-            throw MobileOnlyWorkflowError.invalidState("a scan is already in progress")
-        }
-        // The embedded build identity must be usable (§4.4).
         let identity = MobileBuildIdentity.loadFromBundle()
         guard identity.isUsable else {
-            throw MobileOnlyWorkflowError.invalidState("app build identity unknown")
-        }
-        // 1. Production package load from the durable on-device library
-        //    (containment + registration verified by the library).
-        let entry = try MobileMapLibrary.map(
-            priorMapID: configuration.priorMap.priorMapID,
-            packageSHA256: configuration.priorMap.packageSHA256)
-
-        // 2. Integrity SHA verification before any scan state changes.
-        let verifiedSHA = try PriorMapPackageIntegrity.validate(
-            directory: entry.packageDirectory)
-        guard verifiedSHA == entry.packageSHA256 else {
             throw MobileOnlyWorkflowError.invalidState(
-                "package integrity SHA mismatch: \(verifiedSHA) != \(entry.packageSHA256)")
+                "当前构建没有可追踪身份；请使用 RTABMapApp-QualifiedDevice "
+                    + "scheme 从已提交且 tracked 文件干净的版本重新构建")
         }
 
-        // 3. PriorMap scan configuration with the committed initial pose.
+        let entry = configuration.priorMap
+        let package = configuration.preparedPackage
+        guard package.directory.standardizedFileURL
+                == entry.packageDirectory.standardizedFileURL,
+              package.manifest.priorMapId == entry.priorMapID,
+              package.packageSha256 == entry.packageSHA256,
+              package.manifest.storeID == configuration.storeID,
+              package.manifest.floors.contains(where: {
+                  $0.id == configuration.floorID
+              }) else {
+            throw MobileOnlyWorkflowError.invalidState(
+                "prepared prior-map identity, store or floor mismatch")
+        }
+
         let scanConfiguration = PriorMapScanConfiguration(
             formatVersion: 1,
             workflowMode: .priorMapLocalized,
@@ -7236,91 +7432,119 @@ extension ViewController: MobileOnlyScanStarting {
                 "prior-map scan configuration incomplete")
         }
 
-        // 4. Real scan start: ARSession + RTAB-Map recording + session
-        //    metadata. newScan reports false on every refused path
-        //    (V1R3 §4.2) — a refused start always throws here.
-        let started = newScan(dataRecordingMode: false, configuration: scanConfiguration)
-        guard started else {
+        let authorization = try performMobileOnlyMain {
+            () -> AVAuthorizationStatus in
+            guard self.mState != .STATE_MAPPING else {
+                throw MobileOnlyWorkflowError.invalidState(
+                    "a scan is already in progress")
+            }
+            if self.mState == .STATE_VISUALIZING {
+                self.closeVisualization()
+            }
+            self.applySupermarketSettings()
+            self.mMapNodes = 0
+            self.openedDatabasePath = nil
+            return AVCaptureDevice.authorizationStatus(for: .video)
+        }
+        guard authorization == .authorized else {
             throw MobileOnlyWorkflowError.invalidState(
-                "ARSession/RTAB-Map scan start was refused")
+                authorization == .notDetermined
+                    ? "camera permission must be granted before committing the scan start"
+                    : "camera permission is disabled; enable it in iOS Settings")
         }
 
-        // 5. Receipt postconditions: the session, segment directory,
-        //    streaming database and sidecar writers must actually exist.
-        //    B-09: any failure AFTER the host started the scan must roll
-        //    the scan back — a live capture must never outlive a failed
-        //    start.
-        let session: SupermarketScanSession
-        let segmentDirectory: URL
-        let databaseURL: URL
-        let sidecarWritersReady: Bool
-        do {
-            guard let startedSession = supermarketSession else {
-                throw MobileOnlyWorkflowError.invalidState("scan session unavailable after start")
-            }
-            session = startedSession
-            segmentDirectory = try session.currentSegmentDirectory()
-            guard FileManager.default.fileExists(atPath: segmentDirectory.path) else {
-                throw MobileOnlyWorkflowError.invalidState("segment directory missing after start")
-            }
-            databaseURL = try session.streamingDatabaseURL()
-            guard FileManager.default.fileExists(atPath: databaseURL.path) else {
-                throw MobileOnlyWorkflowError.invalidState("streaming database missing after start")
-            }
-            // Sidecar writer readiness probe: the segment directory must be
-            // writable for the required evidence sidecars (B-09: the
-            // receipt records the REAL probe result, never a constant).
-            let probe = segmentDirectory.appendingPathComponent(
-                ".ms_sidecar_probe_\(UUID().uuidString)")
-            let writable = FileManager.default.createFile(
-                atPath: probe.path, contents: Data(), attributes: nil)
-            try? FileManager.default.removeItem(at: probe)
-            guard writable else {
-                throw MobileOnlyWorkflowError.invalidState("sidecar writers not ready (segment not writable)")
-            }
-            sidecarWritersReady = writable
-        } catch {
-            // B-09: roll the already-started scan back so a workflow
-            // failure cannot leave a live capture running underneath.
-            stopMapping(ignoreSaving: true)
-            throw error
-        }
-
-        // V1R3 §7.1 / RC-B06: open the durable incremental clock writer
-        // before reporting a successful scan start. Parent-directory fsync or
-        // the first record append failing rolls the already-live scan back.
-        do {
-            try startClockCorrelationRecording(
-                segmentDirectory: segmentDirectory,
-                trackingSessionID: session.trackingSessionId)
-        } catch {
-            stopMapping(ignoreSaving: true)
+        guard let floorID = scanConfiguration.floorId,
+              let initialPose = scanConfiguration.initialMapPose else {
             throw MobileOnlyWorkflowError.invalidState(
-                "clock evidence writer not ready: \(error.localizedDescription)")
+                "prior-map floor or initial pose missing")
         }
-        self.persistScanConfiguration(configuration)
-        // B-09: "recording started" must be proven, not assumed: the
-        // camera pipeline must be live AND the streaming database must
-        // exist with a real header on disk.
-        let cameraActive = mState == .STATE_CAMERA || mState == .STATE_MAPPING
-        let databaseSize = (try? FileManager.default
-            .attributesOfItem(atPath: databaseURL.path)[.size] as? NSNumber)?.intValue ?? 0
-        let rtabMapRecordingStarted = rtabmap != nil
-            && cameraActive
-            && databaseSize > 0
-        return MobileScanStartReceipt(
-            trackingSessionID: session.trackingSessionId,
-            segmentDirectory: segmentDirectory,
-            databaseURL: databaseURL,
-            priorMapID: entry.priorMapID,
-            priorMapSHA256: entry.packageSHA256,
-            floorID: configuration.floorID,
-            storeID: configuration.storeID,
-            arSessionStarted: cameraActive,
-            rtabMapRecordingStarted: rtabMapRecordingStarted,
-            requiredSidecarWritersReady: sidecarWritersReady,
-            startedAtMonotonic: ProcessInfo.processInfo.systemUptime,
-            startedAtUTC: Date().timeIntervalSince1970,
-            appGitSHA: identity.appGitSHA)
+        let preparedLocalizer = try PriorMapStageOneLocalizer(
+            package: package,
+            floorId: floorID,
+            initialMapPose: initialPose)
+
+        var hostStateWasInstalled = false
+        do {
+            try performMobileOnlyMain {
+                guard self.preparePriorMapLocalization(
+                    configuration: scanConfiguration,
+                    preparedPackage: package,
+                    preparedLocalizer: preparedLocalizer) else {
+                    throw MobileOnlyWorkflowError.invalidState(
+                        "prior-map localizer installation failed")
+                }
+            }
+            hostStateWasInstalled = true
+
+            let resources = try prepareMobileOnlyStartResources(
+                configuration: scanConfiguration)
+
+            try performMobileOnlyMain {
+                self.setGLCamera(type: 0)
+                guard self.startCamera() else {
+                    throw MobileOnlyWorkflowError.invalidState(
+                        "ARSession/RTAB-Map camera start was refused")
+                }
+                // The product action starts real mapping immediately; there
+                // is no second hidden Record step after configuration.
+                self.rtabmap?.setPausedMapping(paused: false)
+                self.updateState(state: .STATE_MAPPING)
+                resources.session.appendScanEvent(
+                    event: "mapping_started",
+                    message: "Mobile-only workflow started continuous mapping",
+                    fields: ["nodeCount": "\(self.mMapNodes)"])
+                do {
+                    try self.startClockCorrelationRecording(
+                        segmentDirectory: resources.segmentDirectory,
+                        trackingSessionID:
+                            resources.session.trackingSessionId)
+                } catch {
+                    throw MobileOnlyWorkflowError.invalidState(
+                        "clock evidence writer not ready: "
+                            + error.localizedDescription)
+                }
+            }
+
+            let databaseSize = (try? FileManager.default
+                .attributesOfItem(atPath: resources.databaseURL.path)[.size]
+                as? NSNumber)?.intValue ?? 0
+            let cameraActive = try performMobileOnlyMain {
+                self.mState == .STATE_MAPPING
+            }
+            guard cameraActive, databaseSize > 0 else {
+                throw MobileOnlyWorkflowError.invalidState(
+                    "camera or streaming database did not reach the recording state")
+            }
+
+            return MobileScanStartReceipt(
+                trackingSessionID: resources.session.trackingSessionId,
+                segmentDirectory: resources.segmentDirectory,
+                databaseURL: resources.databaseURL,
+                priorMapID: entry.priorMapID,
+                priorMapSHA256: entry.packageSHA256,
+                floorID: configuration.floorID,
+                storeID: configuration.storeID,
+                arSessionStarted: cameraActive,
+                rtabMapRecordingStarted: true,
+                requiredSidecarWritersReady:
+                    resources.sidecarWritersReady,
+                startedAtMonotonic:
+                    ProcessInfo.processInfo.systemUptime,
+                startedAtUTC: Date().timeIntervalSince1970,
+                appGitSHA: identity.appGitSHA)
+        } catch {
+            if hostStateWasInstalled {
+                try? performMobileOnlyMain {
+                    self.rollbackMobileOnlyScanStart(
+                        receipt: nil,
+                        reason: "host_start_failed")
+                }
+            }
+            if let workflowError = error as? MobileOnlyWorkflowError {
+                throw workflowError
+            }
+            throw MobileOnlyWorkflowError.invalidState(
+                "scan start failed: \(error.localizedDescription)")
+        }
     }
 }

@@ -44,7 +44,9 @@ struct PriorMapManifest: Codable {
     let version: Int
     let priorMapId: String
     let name: String
+    let storeID: String
     let sourceSha256: String
+    let canonicalSourceSha256: String?
     let floors: [PriorMapFloor]
     let elementCount: Int
     let warningCount: Int
@@ -54,7 +56,9 @@ struct PriorMapManifest: Codable {
         case version
         case priorMapId = "prior_map_id"
         case name
+        case storeID = "store_id"
         case sourceSha256 = "source_sha256"
+        case canonicalSourceSha256 = "canonical_source_sha256"
         case floors
         case elementCount = "element_count"
         case warningCount = "warning_count"
@@ -168,6 +172,14 @@ struct PriorMapPackage {
         // can never describe content the loader never parsed.
         let snapshot = try PriorMapPackageSnapshotReader.read(
             directory: directory)
+        return try load(snapshot: snapshot)
+    }
+
+    /// Decodes a package from an already captured immutable snapshot.
+    /// Scan setup and scan start pass this typed object forward so the
+    /// UI never performs a second or third full package read on the main
+    /// thread.
+    static func load(snapshot: PriorMapPackageSnapshot) throws -> PriorMapPackage {
         let packageSha256 = try PriorMapPackageIntegrity.validate(
             snapshot: snapshot)
         let decoder = JSONDecoder()
@@ -216,6 +228,8 @@ struct PriorMapPackage {
         }
         guard !manifest.priorMapId.isEmpty,
               manifest.priorMapId.count <= 128,
+              MapSourceBusinessIdentityPolicy.isValidStoreID(
+                  manifest.storeID),
               manifest.sourceSha256.count == 64,
               manifest.sourceSha256.allSatisfy({ $0.isHexDigit }) else {
             throw NSError(
@@ -324,7 +338,7 @@ struct PriorMapPackage {
             previewsByFloor[floor.id] = floorPreview
         }
         return PriorMapPackage(
-            directory: directory,
+            directory: snapshot.directory,
             manifest: manifest,
             roadGraph: graph,
             spatialIndex: spatial,
@@ -1681,6 +1695,7 @@ final class PriorMapWizardViewController: UIViewController, UIDocumentPickerDele
             priorMapId: package.manifest.priorMapId,
             priorMapSha256: package.packageSha256,
             floorId: package.manifest.floors[selectedFloorIndex].id,
+            storeID: package.manifest.storeID,
             initialMapPose: selectedPose)
         dismiss(animated: true) {
             self.completion(configuration)

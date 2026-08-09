@@ -11,11 +11,17 @@ enum MobilePreviewRenderer {
     static let maximumPreviewPixels = 2_000 * 2_000
     static let maximumPreviewBytes = 8 * 1024 * 1024
 
+    typealias ProgressHandler = (_ fraction: Double, _ detail: String) -> Void
+
     static func render(
         elements: [PriorMapSourceElement],
         floors: [[String: Any]],
-        directory: URL
+        directory: URL,
+        progress: ProgressHandler? = nil
     ) throws {
+        let totalPreviews = max(1, floors.count + 1)
+        var completedPreviews = 0
+        progress?(0, "正在生成总览图")
         // Overall preview combining every floor's bounds.
         let allBounds = floors.compactMap { floor -> SourceGeometry.Bounds? in
             guard let value = floor["bounds"] as? [String: Double],
@@ -30,6 +36,10 @@ enum MobilePreviewRenderer {
             elements: elements, floors: nil, bounds: merged,
             canvasWidth: canvas.width, canvasHeight: canvas.height,
             to: directory.appendingPathComponent("preview.png"))
+        completedPreviews += 1
+        progress?(
+            Double(completedPreviews) / Double(totalPreviews),
+            "总览图已生成")
 
         for floor in floors {
             guard let floorID = floor["id"] as? String,
@@ -41,12 +51,20 @@ enum MobilePreviewRenderer {
             let floorBounds = SourceGeometry.Bounds(
                 minX_m: minX, minY_m: minY, maxX_m: maxX, maxY_m: maxY)
             let floorCanvas = try canvasSize(bounds: floorBounds)
+            progress?(
+                Double(completedPreviews) / Double(totalPreviews),
+                "正在生成楼层 \(floorID) 预览")
             try renderPNG(
                 elements: elements.filter { $0.floorId == floorID },
                 floors: nil, bounds: floorBounds,
                 canvasWidth: floorCanvas.width, canvasHeight: floorCanvas.height,
                 to: directory.appendingPathComponent(previewFile))
+            completedPreviews += 1
+            progress?(
+                Double(completedPreviews) / Double(totalPreviews),
+                "楼层 \(floorID) 预览已生成")
         }
+        progress?(1, "地图预览完成")
     }
 
     private struct CanvasSize {

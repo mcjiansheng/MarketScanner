@@ -3,12 +3,12 @@ artwork rotated with the frozen yaw contract, and the preview
 y-down chirality must be explicit.
 
 Mirrors the iOS implementation exactly:
-- `MobileScanSetupViewController.buildUI()`:
-  startMarker frame (0, 0, 44, 44); markerDot (16, 16, 12, 12);
-  arrow (29, 21, 14, 2)  ->  arrow center offset (+14, 0), endpoint
-  offset (+21, 0) from the marker center (22, 22);
+- `MobileScanSetupViewController.configureMapEditor()`:
+  startMarker frame (0, 0, 48, 48); markerDot (18, 18, 12, 12);
+  arrow (29, 22, 17, 4) -> a right-pointing horizontal heading;
 - `rotateMarker()`: `startMarker.transform =
-  CGAffineTransform(rotationAngle: CGFloat(-startYawRad))`.
+  CGAffineTransform(rotationAngle: CGFloat(-startYawRad))` plus inverse
+  zoom scaling so the marker keeps a stable touch-readable screen size.
 
 CGAffineTransform in UIKit (y-down screen coordinates) applies the
 standard rotation matrix
@@ -24,13 +24,15 @@ vertical artwork) fails the golden assertions below.
 from __future__ import annotations
 
 import math
+from pathlib import Path
 import unittest
 
-MARKER_SIZE = 44.0
-CENTER = (MARKER_SIZE / 2, MARKER_SIZE / 2)  # (22, 22)
+ROOT = Path(__file__).resolve().parents[3]
+MARKER_SIZE = 48.0
+CENTER = (MARKER_SIZE / 2, MARKER_SIZE / 2)  # (24, 24)
 
 # Arrow artwork: horizontal bar on the right side of the marker.
-ARROW_FRAME = (29.0, 21.0, 14.0, 2.0)
+ARROW_FRAME = (29.0, 22.0, 17.0, 4.0)
 ARROW_CENTER_OFFSET = (
     ARROW_FRAME[0] + ARROW_FRAME[2] / 2 - CENTER[0],
     ARROW_FRAME[1] + ARROW_FRAME[3] / 2 - CENTER[1],
@@ -77,8 +79,8 @@ class YawArrowGeometryGolden(unittest.TestCase):
     def test_artwork_is_horizontal_right_pointing(self) -> None:
         # The artwork itself must point along +X: a horizontal bar whose
         # far endpoint lies strictly to the right of its center.
-        self.assertEqual(ARROW_FRAME[3], 2.0)  # height, not a vertical shaft
-        self.assertEqual(ARROW_FRAME[2], 14.0)  # length along X
+        self.assertEqual(ARROW_FRAME[3], 4.0)  # height, not a vertical shaft
+        self.assertEqual(ARROW_FRAME[2], 17.0)  # length along X
         self.assertGreater(ARROW_ENDPOINT_OFFSET[0], 0.0)
         self.assertEqual(ARROW_ENDPOINT_OFFSET[1], 0.0)
 
@@ -127,6 +129,20 @@ class YawArrowGeometryGolden(unittest.TestCase):
             # -pi/2 always down across intermediate angles the endpoints
             # keep finite in-bounds when projected.
             self.assertTrue(math.isfinite(center[0]) and math.isfinite(center[1]))
+
+    def test_source_uses_zoom_nudges_and_discrete_heading_controls(self) -> None:
+        source = (
+            ROOT
+            / "app/ios/RTABMapApp/MobileOnlyWorkflow/UI/"
+            "MobileScanSetupViewController.swift"
+        ).read_text(encoding="utf-8")
+        self.assertIn("mapScrollView.maximumZoomScale = 8", source)
+        self.assertIn("@objc private func nudgeUp()", source)
+        self.assertIn("@objc private func nudgeRight()", source)
+        self.assertIn("@objc private func turnLeft()", source)
+        self.assertIn("@objc private func turnRight()", source)
+        self.assertIn("private let headingControl = UISegmentedControl", source)
+        self.assertNotIn("yawSlider", source)
 
 
 if __name__ == "__main__":

@@ -373,6 +373,146 @@ enum MobileMapLibrary {
         return try root().appendingPathComponent(registryFileName)
     }
 
+    /// Installs an already compiled formal v2 prior-map package (for
+    /// example one exported by the PC workstation) into the same immutable,
+    /// content-addressed library used by phone-compiled XLSX maps.
+    ///
+    /// The external folder is captured once as an immutable snapshot. The
+    /// exact validated bytes are copied into private staging, validated
+    /// again after publication, then registered. No production scan ever
+    /// uses the provider folder directly.
+    static func installVerifiedPackage(
+        from sourceDirectory: URL,
+        progress: ((Double, String) -> Void)? = nil
+    ) throws -> MapEntry {
+        progress?(0.05, "正在读取已有地图包")
+        let snapshot = try PriorMapPackageSnapshotReader.read(
+            directory: sourceDirectory)
+        let packageSHA = try PriorMapPackageIntegrity.validate(
+            snapshot: snapshot)
+        guard let manifest = snapshot.artifactsByName["manifest.json"]?
+                .parsedJSON,
+              StrictJSONScalar.integer(manifest["version"]) == 2,
+              let priorMapID = manifest["prior_map_id"] as? String,
+              let name = manifest["name"] as? String,
+              let storeID = manifest["store_id"] as? String,
+              let canonicalSourceSHA = manifest["canonical_source_sha256"]
+                as? String,
+              let floors = manifest["floors"] as? [[String: Any]],
+              let elementCount = StrictJSONScalar.integer(
+                manifest["element_count"]),
+              isSafeIdentifier(priorMapID),
+              isSHA256(packageSHA),
+              isSHA256(canonicalSourceSHA),
+              MapSourceBusinessIdentityPolicy.isValidStoreID(storeID),
+              MapSourceBusinessIdentityPolicy.isValidMapName(name),
+              !floors.isEmpty,
+              elementCount >= 0 else {
+            throw LibraryError.packageVerificationFailed(
+                "仅支持带正式 store_id/canonical identity 的 v2 地图包；"
+                    + "请在当前 PC 工作台重新生成后再导入")
+        }
+
+        progress?(0.28, "地图包完整性验证通过，正在复制到应用私有目录")
+        let taskID = "package-import-\(UUID().uuidString)"
+        let staging = try stagingDirectory(for: taskID)
+        let fileManager = FileManager.default
+        var keepStaging = false
+        defer {
+            if !keepStaging {
+                try? fileManager.removeItem(at: staging)
+            }
+        }
+
+        for name in snapshot.artifactNames.sorted() {
+            guard let artifact = snapshot.artifactsByName[name] else {
+                throw LibraryError.packageVerificationFailed(
+                    "地图包快照缺少 \(name)")
+            }
+            let destination = staging.appendingPathComponent(name)
+            try artifact.bytes.write(to: destination, options: [.atomic])
+            try syncFile(destination)
+        }
+        let packageManifestURL = staging.appendingPathComponent(
+            PriorMapPackageSnapshotReader.packageManifestName)
+        try CanonicalJSONEncoder.encode(snapshot.packageManifest)
+            .write(to: packageManifestURL, options: [.atomic])
+        try syncFile(packageManifestURL)
+        try syncDirectory(staging)
+
+        progress?(0.58, "正在校验私有副本")
+        _ = try verifyImportedStagingPackage(
+            staging,
+            priorMapID: priorMapID,
+            packageSHA: packageSHA,
+            floorCount: floors.count,
+            elementCount: elementCount,
+            canonicalSourceSHA: canonicalSourceSHA)
+
+        let target = try packageDirectory(
+            priorMapID: priorMapID, packageSHA: packageSHA)
+        if fileManager.fileExists(atPath: target.path) {
+            _ = try verifyPackage(
+                at: target,
+                priorMapID: priorMapID,
+                packageSHA256: packageSHA,
+                expectedName: name,
+                expectedFloorCount: floors.count,
+                expectedElementCount: elementCount,
+                expectedCanonicalSourceSHA256: canonicalSourceSHA)
+        } else {
+            try fileManager.createDirectory(
+                at: target.deletingLastPathComponent(),
+                withIntermediateDirectories: true)
+            try fileManager.moveItem(at: staging, to: target)
+            keepStaging = true
+            try syncDirectory(target.deletingLastPathComponent())
+        }
+
+        progress?(0.86, "正在注册到统一门店地图库")
+        let entry = try register(
+            priorMapID: priorMapID,
+            name: name,
+            packageSHA256: packageSHA,
+            packageURL: target,
+            floorCount: floors.count,
+            elementCount: elementCount,
+            compilerVersion: "imported-pc-v2",
+            canonicalSourceSHA256: canonicalSourceSHA)
+        progress?(1, "已有地图包已验证并加入门店地图库")
+        return entry
+    }
+
+    /// Staging is outside the canonical packages root, so use the same
+    /// single-snapshot identity checks without the final-path containment
+    /// requirement. The final target is rechecked by `register`.
+    private static func verifyImportedStagingPackage(
+        _ directory: URL,
+        priorMapID: String,
+        packageSHA: String,
+        floorCount: Int,
+        elementCount: Int,
+        canonicalSourceSHA: String
+    ) throws -> String {
+        let snapshot = try PriorMapPackageSnapshotReader.read(
+            directory: directory)
+        let digest = try PriorMapPackageIntegrity.validate(snapshot: snapshot)
+        guard digest == packageSHA,
+              let manifest = snapshot.artifactsByName["manifest.json"]?
+                .parsedJSON,
+              manifest["prior_map_id"] as? String == priorMapID,
+              manifest["canonical_source_sha256"] as? String
+                == canonicalSourceSHA,
+              (manifest["floors"] as? [[String: Any]])?.count
+                == floorCount,
+              StrictJSONScalar.integer(manifest["element_count"])
+                == elementCount else {
+            throw LibraryError.packageVerificationFailed(
+                "私有地图包副本与来源身份不一致")
+        }
+        return digest
+    }
+
     // MARK: - Registration
 
     /// Atomically registers a compiled package. The caller must have
@@ -422,17 +562,20 @@ enum MobileMapLibrary {
 
         // §14.2: register re-verifies the package manifest and digest;
         // a corrupt package must never enter the library.
-        _ = try verifyPackage(
+        let verifiedPackage = try readValidatedPackageSnapshot(
             at: packageURL,
             priorMapID: priorMapID,
             packageSHA256: packageSHA256,
+            expectedName: name,
             expectedFloorCount: floorCount,
             expectedElementCount: elementCount,
             expectedCanonicalSourceSHA256: canonicalSourceSHA256)
 
         // §14.2: a registered package is immutable. A failed chmod
         // aborts registration before the registry is touched.
-        try makeImmutable(at: packageURL)
+        try makePackageImmutable(
+            at: packageURL,
+            validatedSnapshot: verifiedPackage.snapshot)
         try verifyImmutable(at: packageURL)
 
         // read generation → build next registry → temp+fsync → compare →
@@ -496,10 +639,36 @@ enum MobileMapLibrary {
         at packageURL: URL,
         priorMapID: String,
         packageSHA256: String,
+        expectedName: String? = nil,
         expectedFloorCount: Int? = nil,
         expectedElementCount: Int? = nil,
         expectedCanonicalSourceSHA256: String? = nil
     ) throws -> String {
+        return try readValidatedPackageSnapshot(
+            at: packageURL,
+            priorMapID: priorMapID,
+            packageSHA256: packageSHA256,
+            expectedName: expectedName,
+            expectedFloorCount: expectedFloorCount,
+            expectedElementCount: expectedElementCount,
+            expectedCanonicalSourceSHA256:
+                expectedCanonicalSourceSHA256).digest
+    }
+
+    private struct ValidatedPackageSnapshot {
+        let snapshot: PriorMapPackageSnapshot
+        let digest: String
+    }
+
+    private static func readValidatedPackageSnapshot(
+        at packageURL: URL,
+        priorMapID: String,
+        packageSHA256: String,
+        expectedName: String? = nil,
+        expectedFloorCount: Int? = nil,
+        expectedElementCount: Int? = nil,
+        expectedCanonicalSourceSHA256: String? = nil
+    ) throws -> ValidatedPackageSnapshot {
         let expectedPackageURL = try packageDirectory(
             priorMapID: priorMapID, packageSHA: packageSHA256)
         guard packageURL.standardizedFileURL.path
@@ -509,9 +678,40 @@ enum MobileMapLibrary {
         try verifyContainment(
             at: packageURL, under: expectedPackageURL.deletingLastPathComponent()
                 .deletingLastPathComponent())
+        let snapshot: PriorMapPackageSnapshot
+        do {
+            snapshot = try PriorMapPackageSnapshotReader.read(
+                directory: packageURL)
+        } catch {
+            throw LibraryError.packageVerificationFailed("\(error)")
+        }
+        return try validatePackageSnapshot(
+            snapshot,
+            priorMapID: priorMapID,
+            packageSHA256: packageSHA256,
+            expectedName: expectedName,
+            expectedFloorCount: expectedFloorCount,
+            expectedElementCount: expectedElementCount,
+            expectedCanonicalSourceSHA256:
+                expectedCanonicalSourceSHA256)
+    }
+
+    /// Validates identity and business metadata against bytes already held
+    /// by one bounded snapshot. Rebuild uses this overload so it never
+    /// pre-reads or re-opens manifest.json outside the snapshot authority.
+    private static func validatePackageSnapshot(
+        _ snapshot: PriorMapPackageSnapshot,
+        priorMapID: String,
+        packageSHA256: String,
+        expectedName: String? = nil,
+        expectedFloorCount: Int? = nil,
+        expectedElementCount: Int? = nil,
+        expectedCanonicalSourceSHA256: String? = nil
+    ) throws -> ValidatedPackageSnapshot {
         let digest: String
         do {
-            digest = try PriorMapPackageIntegrity.validate(directory: packageURL)
+            digest = try PriorMapPackageIntegrity.validate(
+                snapshot: snapshot)
         } catch {
             throw LibraryError.packageVerificationFailed("\(error)")
         }
@@ -519,14 +719,36 @@ enum MobileMapLibrary {
             throw LibraryError.packageVerificationFailed(
                 "digest \(String(digest.prefix(16)))… != \(String(packageSHA256.prefix(16)))…")
         }
-        let manifest = try readManifest(in: packageURL)
+        guard let manifest = snapshot.artifactsByName["manifest.json"]?
+                .parsedJSON else {
+            throw LibraryError.packageVerificationFailed(
+                "manifest.json missing from verified package snapshot")
+        }
         guard manifest["prior_map_id"] as? String == priorMapID else {
             throw LibraryError.packageVerificationFailed("manifest prior_map_id 不匹配")
+        }
+        guard let name = manifest["name"] as? String,
+              MapSourceBusinessIdentityPolicy.isValidMapName(name),
+              let storeID = manifest["store_id"] as? String,
+              MapSourceBusinessIdentityPolicy.isValidStoreID(storeID),
+              let floors = manifest["floors"] as? [[String: Any]],
+              !floors.isEmpty,
+              let elementCount = StrictJSONScalar.integer(
+                manifest["element_count"]),
+              elementCount >= 0 else {
+            throw LibraryError.packageVerificationFailed(
+                "manifest name/store/floors/element_count 无效")
         }
         guard let canonicalSourceSHA256 = manifest["canonical_source_sha256"] as? String,
               isSHA256(canonicalSourceSHA256) else {
             throw LibraryError.packageVerificationFailed(
                 "manifest canonical_source_sha256 无效")
+        }
+        if let expectedName = expectedName {
+            guard name == expectedName else {
+                throw LibraryError.packageVerificationFailed(
+                    "manifest name 不匹配")
+            }
         }
         if let expectedCanonicalSourceSHA256 = expectedCanonicalSourceSHA256 {
             guard canonicalSourceSHA256 == expectedCanonicalSourceSHA256 else {
@@ -535,16 +757,18 @@ enum MobileMapLibrary {
             }
         }
         if let expectedFloorCount = expectedFloorCount {
-            guard (manifest["floors"] as? [[String: Any]])?.count == expectedFloorCount else {
+            guard floors.count == expectedFloorCount else {
                 throw LibraryError.packageVerificationFailed("manifest floor 数量不匹配")
             }
         }
         if let expectedElementCount = expectedElementCount {
-            guard StrictJSONScalar.integer(manifest["element_count"]) == expectedElementCount else {
+            guard elementCount == expectedElementCount else {
                 throw LibraryError.packageVerificationFailed("manifest element_count 不匹配")
             }
         }
-        return digest
+        return ValidatedPackageSnapshot(
+            snapshot: snapshot,
+            digest: digest)
     }
 
     /// Full per-entry re-check used by `listMaps()`. A self-declared hash
@@ -561,6 +785,7 @@ enum MobileMapLibrary {
             at: entry.packageDirectory,
             priorMapID: entry.priorMapID,
             packageSHA256: entry.packageSHA256,
+            expectedName: entry.name,
             expectedFloorCount: entry.floorCount,
             expectedElementCount: entry.elementCount,
             expectedCanonicalSourceSHA256: entry.canonicalSourceSHA256)
@@ -569,6 +794,49 @@ enum MobileMapLibrary {
     }
 
     // MARK: - Queries
+
+    /// Lightweight registry query for UI listing. It validates registry
+    /// schema, safe canonical paths and transaction recovery, but does not
+    /// hash/parse every multi-megabyte package. UI callers then load and
+    /// fully validate only the exact selected package on a background queue.
+    static func listRegisteredMaps() throws -> [MapEntry] {
+        libraryLock.lock()
+        defer { libraryLock.unlock() }
+        let processLock = try acquireProcessLock()
+        defer { releaseProcessLock(processLock) }
+        try recoverQuarantineTransactionsLocked(processLock: processLock)
+        let entries = try readRegistryPayload().entries.sorted {
+            $0.compiledAtUTC > $1.compiledAtUTC
+        }
+        try validateProcessLock(processLock)
+        return entries
+    }
+
+    /// Exact lightweight registry authority lookup. Consumers must still
+    /// fully validate/load the package before scanning or processing.
+    static func registeredMap(
+        priorMapID: String,
+        packageSHA256: String
+    ) throws -> MapEntry {
+        libraryLock.lock()
+        defer { libraryLock.unlock() }
+        let processLock = try acquireProcessLock()
+        defer { releaseProcessLock(processLock) }
+        try recoverQuarantineTransactionsLocked(processLock: processLock)
+        guard isSafeIdentifier(priorMapID), isSHA256(packageSHA256) else {
+            throw LibraryError.unsafeIdentifier(
+                "\(priorMapID)/\(packageSHA256)")
+        }
+        guard let entry = try readRegistryPayload().entries.first(where: {
+            $0.priorMapID == priorMapID
+                && $0.packageSHA256 == packageSHA256
+        }) else {
+            throw LibraryError.notRegistered(
+                "\(priorMapID)/\(packageSHA256)")
+        }
+        try validateProcessLock(processLock)
+        return entry
+    }
 
     static func listMaps() throws -> [MapEntry] {
         libraryLock.lock()
@@ -606,6 +874,7 @@ enum MobileMapLibrary {
             at: entry.packageDirectory,
             priorMapID: priorMapID,
             packageSHA256: packageSHA256,
+            expectedName: entry.name,
             expectedFloorCount: entry.floorCount,
             expectedElementCount: entry.elementCount,
             expectedCanonicalSourceSHA256: entry.canonicalSourceSHA256)
@@ -810,7 +1079,23 @@ enum MobileMapLibrary {
                       (try? fileManager.attributesOfItem(atPath: package.path)[.type] as? FileAttributeType) == .typeDirectory
                 else { continue }
                 do {
-                    let manifest = try readManifest(in: package)
+                    try verifyContainment(at: package, under: root)
+                    let snapshot: PriorMapPackageSnapshot
+                    do {
+                        snapshot = try PriorMapPackageSnapshotReader.read(
+                            directory: package)
+                    } catch {
+                        throw LibraryError.packageVerificationFailed("\(error)")
+                    }
+                    let verifiedPackage = try validatePackageSnapshot(
+                        snapshot,
+                        priorMapID: priorMapID,
+                        packageSHA256: sha)
+                    guard let manifest = snapshot.artifactsByName[
+                            "manifest.json"]?.parsedJSON else {
+                        throw LibraryError.packageVerificationFailed(
+                            "manifest.json missing from verified package snapshot")
+                    }
                     guard let name = manifest["name"] as? String,
                           MapSourceBusinessIdentityPolicy.isValidMapName(name),
                           let storeID = manifest["store_id"] as? String,
@@ -826,14 +1111,9 @@ enum MobileMapLibrary {
                         throw LibraryError.packageVerificationFailed(
                             "manifest identity/counts invalid")
                     }
-                    _ = try verifyPackage(
+                    try makePackageImmutable(
                         at: package,
-                        priorMapID: priorMapID,
-                        packageSHA256: sha,
-                        expectedFloorCount: floors.count,
-                        expectedElementCount: elementCount,
-                        expectedCanonicalSourceSHA256: canonicalSHA)
-                    try makeImmutable(at: package)
+                        validatedSnapshot: verifiedPackage.snapshot)
                     try verifyImmutable(at: package)
                     entries.append(MapEntry(
                         priorMapID: priorMapID,
@@ -865,16 +1145,6 @@ enum MobileMapLibrary {
             expectedGeneration: expectedGeneration,
             processLock: processLock)
         try validateProcessLock(processLock)
-    }
-
-    private static func readManifest(in package: URL) throws -> [String: Any] {
-        let url = package.appendingPathComponent("manifest.json")
-        let data = try Data(contentsOf: url)
-        guard let object = try? StrictJSONDocumentParser.object(
-            from: data,
-            limits: StrictJSONDocumentLimits(maximumBytes: data.count + 1)) as? [String: Any]
-        else { throw LibraryError.registryCorrupt(url.path) }
-        return object
     }
 
     // MARK: - Safety
@@ -951,62 +1221,313 @@ enum MobileMapLibrary {
 
     // MARK: - Immutability
 
-    /// §14.2: freezes a registered package — files 0o444, directories
-    /// 0o555, recursive. Any chmod failure aborts registration.
+    private struct BoundPackageFile {
+        let name: String
+        let descriptor: Int32
+        let metadata: stat
+    }
+
+    /// Freezes a fully validated formal prior-map package. The complete
+    /// direct-child set is checked before any mode changes, every file is
+    /// opened relative to one no-follow root descriptor, and only those
+    /// bound descriptors are passed to fchmod. An undeclared symlink,
+    /// nested directory, hardlink or special file therefore fails before
+    /// it can affect either package bytes or an external target.
+    private static func makePackageImmutable(
+        at root: URL,
+        validatedSnapshot: PriorMapPackageSnapshot
+    ) throws {
+        var expectedFileNames = validatedSnapshot.artifactNames
+        expectedFileNames.insert(
+            PriorMapPackageSnapshotReader.packageManifestName)
+
+        let openedRoot = try openStableDirectoryNoFollow(
+            root, context: "prior-map package freeze root")
+        defer { _ = close(openedRoot.descriptor) }
+        let names = try directoryEntryNames(
+            atBoundDirectoryDescriptor: openedRoot.descriptor,
+            maximumEntries:
+                PriorMapPackageSnapshotLimits.maximumArtifacts + 2)
+        guard names.count == expectedFileNames.count,
+              Set(names) == expectedFileNames else {
+            throw LibraryError.cannotMakeImmutable(
+                "\(root.path): package file set changed before freeze")
+        }
+
+        var boundFiles: [BoundPackageFile] = []
+        defer {
+            for file in boundFiles { _ = close(file.descriptor) }
+        }
+        for name in names {
+            var pathMetadata = stat()
+            guard fstatat(
+                    openedRoot.descriptor,
+                    name,
+                    &pathMetadata,
+                    AT_SYMLINK_NOFOLLOW) == 0,
+                  (pathMetadata.st_mode & S_IFMT) == S_IFREG,
+                  pathMetadata.st_nlink == 1 else {
+                throw LibraryError.cannotMakeImmutable(
+                    "\(root.path)/\(name): package entry is not a single-link regular file")
+            }
+            let descriptor = openat(
+                openedRoot.descriptor,
+                name,
+                O_RDONLY | O_CLOEXEC | O_NOFOLLOW)
+            guard descriptor >= 0 else {
+                throw LibraryError.cannotMakeImmutable(
+                    "\(root.path)/\(name): cannot open without following links")
+            }
+            var openedMetadata = stat()
+            guard fstat(descriptor, &openedMetadata) == 0,
+                  sameStableFileIdentity(pathMetadata, openedMetadata) else {
+                _ = close(descriptor)
+                throw LibraryError.cannotMakeImmutable(
+                    "\(root.path)/\(name): package entry changed during preflight")
+            }
+            boundFiles.append(BoundPackageFile(
+                name: name,
+                descriptor: descriptor,
+                metadata: openedMetadata))
+        }
+        try requireOpenDirectoryPath(
+            descriptor: openedRoot.descriptor,
+            url: root,
+            expectedMetadata: openedRoot.metadata,
+            context: "prior-map package before descriptor freeze")
+
+        for file in boundFiles {
+            guard fchmod(file.descriptor, mode_t(0o444)) == 0 else {
+                throw LibraryError.cannotMakeImmutable(
+                    "\(root.path)/\(file.name)")
+            }
+            var descriptorMetadata = stat()
+            var pathMetadata = stat()
+            guard fstat(file.descriptor, &descriptorMetadata) == 0,
+                  fstatat(
+                    openedRoot.descriptor,
+                    file.name,
+                    &pathMetadata,
+                    AT_SYMLINK_NOFOLLOW) == 0,
+                  sameRegularFileInode(
+                    file.metadata, descriptorMetadata),
+                  sameRegularFileInode(
+                    file.metadata, pathMetadata),
+                  descriptorMetadata.st_nlink == 1,
+                  pathMetadata.st_nlink == 1,
+                  descriptorMetadata.st_size == file.metadata.st_size,
+                  pathMetadata.st_size == file.metadata.st_size,
+                  descriptorMetadata.st_mode & mode_t(0o777)
+                    == mode_t(0o444),
+                  pathMetadata.st_mode & mode_t(0o777)
+                    == mode_t(0o444) else {
+                throw LibraryError.cannotMakeImmutable(
+                    "\(root.path)/\(file.name): descriptor/path binding changed during freeze")
+            }
+        }
+        let namesAfter = try directoryEntryNames(
+            atBoundDirectoryDescriptor: openedRoot.descriptor,
+            maximumEntries:
+                PriorMapPackageSnapshotLimits.maximumArtifacts + 2)
+        guard namesAfter == names,
+              fchmod(openedRoot.descriptor, mode_t(0o555)) == 0 else {
+            throw LibraryError.cannotMakeImmutable(
+                "\(root.path): package file set or root mode changed during freeze")
+        }
+        try requireOpenDirectoryPath(
+            descriptor: openedRoot.descriptor,
+            url: root,
+            expectedMetadata: openedRoot.metadata,
+            context: "prior-map package after descriptor freeze")
+        var rootDescriptorMetadata = stat()
+        var rootPathMetadata = stat()
+        guard fstat(openedRoot.descriptor, &rootDescriptorMetadata) == 0,
+              lstat(root.path, &rootPathMetadata) == 0,
+              sameDirectoryIdentity(
+                openedRoot.metadata, rootDescriptorMetadata),
+              sameDirectoryIdentity(openedRoot.metadata, rootPathMetadata),
+              rootDescriptorMetadata.st_mode & mode_t(0o777)
+                == mode_t(0o555),
+              rootPathMetadata.st_mode & mode_t(0o777)
+                == mode_t(0o555) else {
+            throw LibraryError.cannotMakeImmutable(
+                "\(root.path): package root binding changed during freeze")
+        }
+    }
+
+    /// Descriptor-safe recursive freezer used for quarantine evidence.
+    /// Unlike formal packages, quarantined invalid inputs may contain
+    /// nested directories; every descendant is still handled no-follow.
     static func makeImmutable(
         at root: URL,
         freezeRootDirectory: Bool = true
     ) throws {
-        var directories: [URL] = [root]
-        if let enumerator = FileManager.default.enumerator(
-            at: root,
-            includingPropertiesForKeys: [.isDirectoryKey],
-            options: []) {
-            for case let url as URL in enumerator {
-                let values = try? url.resourceValues(forKeys: [.isDirectoryKey])
-                if values?.isDirectory == true {
-                    directories.append(url)
-                } else {
-                    try setPermissions(0o444, on: url)
+        let openedRoot = try openStableDirectoryNoFollow(
+            root, context: "immutable evidence root")
+        defer { _ = close(openedRoot.descriptor) }
+        try freezeDirectoryTreeNoFollow(
+            directoryDescriptor: openedRoot.descriptor,
+            directoryMode: freezeRootDirectory ? 0o555 : 0o755,
+            context: root.path)
+        try requireOpenDirectoryPath(
+            descriptor: openedRoot.descriptor,
+            url: root,
+            expectedMetadata: openedRoot.metadata,
+            context: "immutable evidence root after freeze")
+    }
+
+    private static func freezeDirectoryTreeNoFollow(
+        directoryDescriptor: Int32,
+        directoryMode: mode_t,
+        context: String
+    ) throws {
+        let names = try directoryEntryNames(
+            atBoundDirectoryDescriptor: directoryDescriptor,
+            maximumEntries: maximumQuarantinePayloadEntries + 1)
+        for name in names {
+            var pathMetadata = stat()
+            guard fstatat(
+                    directoryDescriptor,
+                    name,
+                    &pathMetadata,
+                    AT_SYMLINK_NOFOLLOW) == 0 else {
+                throw LibraryError.cannotMakeImmutable(
+                    "\(context)/\(name): cannot inspect entry")
+            }
+            switch pathMetadata.st_mode & S_IFMT {
+            case S_IFREG:
+                guard pathMetadata.st_nlink == 1 else {
+                    throw LibraryError.cannotMakeImmutable(
+                        "\(context)/\(name): hardlinked evidence file")
                 }
+                let descriptor = openat(
+                    directoryDescriptor,
+                    name,
+                    O_RDONLY | O_CLOEXEC | O_NOFOLLOW)
+                guard descriptor >= 0 else {
+                    throw LibraryError.cannotMakeImmutable(
+                        "\(context)/\(name): cannot open evidence file no-follow")
+                }
+                defer { _ = close(descriptor) }
+                var openedMetadata = stat()
+                guard fstat(descriptor, &openedMetadata) == 0,
+                      sameStableFileIdentity(
+                        pathMetadata, openedMetadata),
+                      fchmod(descriptor, mode_t(0o444)) == 0 else {
+                    throw LibraryError.cannotMakeImmutable(
+                        "\(context)/\(name): evidence file changed during freeze")
+                }
+                var descriptorAfter = stat()
+                var pathAfter = stat()
+                guard fstat(descriptor, &descriptorAfter) == 0,
+                      fstatat(
+                        directoryDescriptor,
+                        name,
+                        &pathAfter,
+                        AT_SYMLINK_NOFOLLOW) == 0,
+                      sameRegularFileInode(
+                        openedMetadata, descriptorAfter),
+                      sameRegularFileInode(openedMetadata, pathAfter),
+                      descriptorAfter.st_nlink == 1,
+                      pathAfter.st_nlink == 1,
+                      descriptorAfter.st_mode & mode_t(0o777)
+                        == mode_t(0o444),
+                      pathAfter.st_mode & mode_t(0o777)
+                        == mode_t(0o444) else {
+                    throw LibraryError.cannotMakeImmutable(
+                        "\(context)/\(name): evidence file binding changed")
+                }
+            case S_IFDIR:
+                let descriptor = openat(
+                    directoryDescriptor,
+                    name,
+                    O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)
+                guard descriptor >= 0 else {
+                    throw LibraryError.cannotMakeImmutable(
+                        "\(context)/\(name): cannot open evidence directory no-follow")
+                }
+                defer { _ = close(descriptor) }
+                var openedMetadata = stat()
+                guard fstat(descriptor, &openedMetadata) == 0,
+                      sameStableFileIdentity(
+                        pathMetadata, openedMetadata) else {
+                    throw LibraryError.cannotMakeImmutable(
+                        "\(context)/\(name): evidence directory changed before freeze")
+                }
+                try freezeDirectoryTreeNoFollow(
+                    directoryDescriptor: descriptor,
+                    directoryMode: 0o555,
+                    context: "\(context)/\(name)")
+                var descriptorAfter = stat()
+                var pathAfter = stat()
+                guard fstat(descriptor, &descriptorAfter) == 0,
+                      fstatat(
+                        directoryDescriptor,
+                        name,
+                        &pathAfter,
+                        AT_SYMLINK_NOFOLLOW) == 0,
+                      sameDirectoryIdentity(
+                        openedMetadata, descriptorAfter),
+                      sameDirectoryIdentity(openedMetadata, pathAfter),
+                      descriptorAfter.st_mode & mode_t(0o777)
+                        == mode_t(0o555),
+                      pathAfter.st_mode & mode_t(0o777)
+                        == mode_t(0o555) else {
+                    throw LibraryError.cannotMakeImmutable(
+                        "\(context)/\(name): evidence directory binding changed")
+                }
+            default:
+                throw LibraryError.cannotMakeImmutable(
+                    "\(context)/\(name): symlink or special file rejected")
             }
         }
-        // Directories deepest-first so a parent write-bit removal never
-        // blocks chmodding its children.
-        for url in directories.reversed() where url != root {
-            try setPermissions(0o555, on: url)
+        let namesAfter = try directoryEntryNames(
+            atBoundDirectoryDescriptor: directoryDescriptor,
+            maximumEntries: maximumQuarantinePayloadEntries + 1)
+        guard namesAfter == names,
+              fchmod(directoryDescriptor, directoryMode) == 0 else {
+            throw LibraryError.cannotMakeImmutable(
+                "\(context): directory changed during freeze")
         }
-        try setPermissions(
-            freezeRootDirectory ? 0o555 : 0o755,
-            on: root)
     }
 
     /// Verifies the exact immutable mode/type contract after chmod and on
     /// every list/map/rebuild path. Prior-map packages are flat: any
     /// nested directory, symlink or non-regular artifact is invalid.
     static func verifyImmutable(at root: URL) throws {
-        let rootAttributes = try FileManager.default.attributesOfItem(
-            atPath: root.path)
-        guard rootAttributes[.type] as? FileAttributeType == .typeDirectory,
-              let rootMode = rootAttributes[.posixPermissions] as? NSNumber,
-              rootMode.intValue & 0o777 == 0o555 else {
+        let openedRoot = try openStableDirectoryNoFollow(
+            root, context: "immutable prior-map package root")
+        defer { _ = close(openedRoot.descriptor) }
+        var rootMetadata = stat()
+        guard fstat(openedRoot.descriptor, &rootMetadata) == 0,
+              rootMetadata.st_mode & mode_t(0o777) == mode_t(0o555) else {
             throw LibraryError.cannotMakeImmutable(
                 "\(root.path): directory mode/type is not 0555")
         }
-        let children = try FileManager.default.contentsOfDirectory(
-            at: root,
-            includingPropertiesForKeys: nil,
-            options: [])
-        for child in children {
-            let attributes = try FileManager.default.attributesOfItem(
-                atPath: child.path)
-            guard attributes[.type] as? FileAttributeType == .typeRegular,
-                  let mode = attributes[.posixPermissions] as? NSNumber,
-                  mode.intValue & 0o777 == 0o444 else {
+        let names = try directoryEntryNames(
+            atBoundDirectoryDescriptor: openedRoot.descriptor,
+            maximumEntries:
+                PriorMapPackageSnapshotLimits.maximumArtifacts + 2)
+        for name in names {
+            var pathMetadata = stat()
+            guard fstatat(
+                    openedRoot.descriptor,
+                    name,
+                    &pathMetadata,
+                    AT_SYMLINK_NOFOLLOW) == 0,
+                  (pathMetadata.st_mode & S_IFMT) == S_IFREG,
+                  pathMetadata.st_nlink == 1,
+                  pathMetadata.st_mode & mode_t(0o777)
+                    == mode_t(0o444) else {
                 throw LibraryError.cannotMakeImmutable(
-                    "\(child.path): artifact mode/type is not regular 0444")
+                    "\(root.path)/\(name): artifact is not single-link regular 0444")
             }
         }
+        try requireOpenDirectoryPath(
+            descriptor: openedRoot.descriptor,
+            url: root,
+            expectedMetadata: openedRoot.metadata,
+            context: "immutable prior-map package verification")
     }
 
     private struct QuarantineDiagnostic {
@@ -3112,12 +3633,6 @@ enum MobileMapLibrary {
                 "recreated quarantine diagnostic close")
         }
         needsClose = false
-    }
-
-    private static func setPermissions(_ mode: mode_t, on url: URL) throws {
-        guard chmod(url.path, mode) == 0 else {
-            throw LibraryError.cannotMakeImmutable(url.path)
-        }
     }
 
     // MARK: - File durability
