@@ -1058,6 +1058,12 @@ final class MobileOnlyWorkflowCoordinator {
                     self.fail(with: workflowError)
                 }
                 self.notifyProcessing(.failure(workflowError))
+            } else if let snapshotError =
+                        error as? SessionSnapshotTransaction.SessionError {
+                let wrapped = MobileOnlyWorkflowError.snapshotFailed(
+                    snapshotError.localizedDescription)
+                self.fail(with: wrapped)
+                self.notifyProcessing(.failure(wrapped))
             } else {
                 let wrapped = MobileOnlyWorkflowError.processingFailed(error.localizedDescription)
                 self.fail(with: wrapped)

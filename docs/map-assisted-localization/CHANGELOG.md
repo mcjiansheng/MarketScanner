@@ -2,6 +2,13 @@
 
 > 文档状态：**当前有效**。最后核对日期：2026-08-10。
 
+## 2026-08-10 — 真机历史处理 committed-file pre-open `ctime` 稳定化
+
+- 在 `core-mobile-v1@9a93fbd0ee52944eae5aebedf59ec6a08dedc934` 真机复现历史处理失败：`稳定复制失败：committed transaction file changed before open`。失败发生在 snapshot/task/intent 的 committed authority 稳定读取，尚未进入数据库图优化或扫描质量判定；简单/空白扫描应在事务通过后按证据得到 Result 或 `RESCAN_SESSION`，不应由该错误中止。
+- `SessionSnapshotTransaction` 对原子发布后 pathname/descriptor 可能出现的 pre-open `ctime`-only forward stabilization 增加窄兼容：dev/inode/mode/link/size/mtime 必须完全一致，并立即重新将 pathname 严格绑定到已打开 descriptor。读取后的完整 identity 与字节数门保持不变；inode replacement、mtime/content change、hardlink、symlink、writable authority、post-open metadata change 和 pathname replacement 仍 fail closed。
+- 新增确定性 fault points 与 Swift focused 回归，覆盖允许的 pre-open `ctime`-only 情况及七类必须拒绝的 mutation/authority 情况。workflow 将底层 snapshot error 映射为 `workflow.snapshot_failed`，处理页去除双重“处理失败”前缀，并在底层错误中报告 basename 和差异字段。
+- 当前证据为 mobile UX/source + sidecar health **41/41 PASS**、Qualification **30/30 PASS**、Swift parse 与 patch-format PASS；完整 Swift host **1/1 PASS（1270.619 s）**，新增 focused 模式已实际执行，400,000 条 tag evidence 峰值 RSS 553,189,376 bytes；unsigned generic iphoneos Debug 与 Release 均全量编译/链接 `BUILD SUCCEEDED`，Release 日志包含 `build identity verified`，包内 `app_git_sha` 已核对为构建时 exact HEAD。修复版真机复测仍待完成，不能据此声明 real-device PASS 或整体 GO。
+
 ## 2026-08-10 — 地图导入预热、近距离 ESL 识别与低置信度保留
 
 - 地图选择页首屏完成后，在主线程空闲轮次预热一次导入 action sheet、`MobileMapImportViewController`、XLSX `UTType` 和 `UIDocumentPickerViewController`。点击“导入新地图”与“导入 XLSX / CSV / JSON”不再承担这些一次性初始化；预热不触发 workflow transition、不访问 provider 文件，真实安全暂存和编译仍走原后台队列。

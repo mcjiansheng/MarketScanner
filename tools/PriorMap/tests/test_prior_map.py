@@ -1479,6 +1479,21 @@ class IOSCoreContractTests(unittest.TestCase):
                 "ESL finalization binding focused tests passed",
                 esl_finalization_result.stdout,
             )
+            snapshot_stable_read_result = subprocess.run(
+                [str(executable), "--snapshot-stable-read-focused"],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                snapshot_stable_read_result.returncode,
+                0,
+                snapshot_stable_read_result.stderr,
+            )
+            self.assertIn(
+                "Snapshot stable committed-file focused tests passed",
+                snapshot_stable_read_result.stdout,
+            )
             absolute_prior_contract_result = subprocess.run(
                 [str(executable), "--absolute-prior-contract", "run"],
                 check=False,

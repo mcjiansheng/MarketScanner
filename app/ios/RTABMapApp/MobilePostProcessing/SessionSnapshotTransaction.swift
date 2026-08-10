@@ -51,6 +51,8 @@ enum SessionSnapshotTransaction {
         case afterTransactionIntentAuthorityRecheckBeforeRemoval
         case afterTransactionIntentRemovalRenameBeforePostcheck
         case afterGenerationRootOpenBeforeValidation
+        case afterCommittedFileAuthorityReadBeforeOpen(String)
+        case afterCommittedFileOpenBeforeRead(String)
         case afterArtifactAuthorityReadBeforeOpen(String)
         case afterArtifactHashBeforeGenerationEnd(String)
     }
@@ -1514,6 +1516,60 @@ enum SessionSnapshotTransaction {
             lhs.st_mtimespec.tv_nsec == rhs.st_mtimespec.tv_nsec &&
             lhs.st_ctimespec.tv_sec == rhs.st_ctimespec.tv_sec &&
             lhs.st_ctimespec.tv_nsec == rhs.st_ctimespec.tv_nsec
+    }
+
+    /// APFS may expose a newly renamed immutable file through the directory
+    /// entry before the descriptor view has observed the rename's final ctime.
+    /// A read-only open can therefore see the same 0444 single-link inode,
+    /// size and mtime with a later ctime. This is not a content mutation.
+    ///
+    /// The exception is deliberately narrower than `sameCommittedFileObject`:
+    /// mtime remains exact, while every supported transaction writer publishes
+    /// a new inode and never mutates a committed file in place. The caller must
+    /// immediately re-stat the pathname and bind it exactly to the opened
+    /// descriptor, then retain the full strict checks through EOF.
+    private static func sameFileIdentityIgnoringChangeTime(
+        _ lhs: stat,
+        _ rhs: stat
+    ) -> Bool {
+        return lhs.st_dev == rhs.st_dev &&
+            lhs.st_ino == rhs.st_ino &&
+            lhs.st_mode == rhs.st_mode &&
+            lhs.st_nlink == rhs.st_nlink &&
+            lhs.st_size == rhs.st_size &&
+            lhs.st_mtimespec.tv_sec == rhs.st_mtimespec.tv_sec &&
+            lhs.st_mtimespec.tv_nsec == rhs.st_mtimespec.tv_nsec
+    }
+
+    private static func changeTimeDidNotMoveBackward(
+        _ before: stat,
+        _ after: stat
+    ) -> Bool {
+        if before.st_ctimespec.tv_sec != after.st_ctimespec.tv_sec {
+            return before.st_ctimespec.tv_sec < after.st_ctimespec.tv_sec
+        }
+        return before.st_ctimespec.tv_nsec <= after.st_ctimespec.tv_nsec
+    }
+
+    private static func fileIdentityDifferenceSummary(
+        _ lhs: stat,
+        _ rhs: stat
+    ) -> String {
+        var fields: [String] = []
+        if lhs.st_dev != rhs.st_dev { fields.append("device") }
+        if lhs.st_ino != rhs.st_ino { fields.append("inode") }
+        if lhs.st_mode != rhs.st_mode { fields.append("mode") }
+        if lhs.st_nlink != rhs.st_nlink { fields.append("link_count") }
+        if lhs.st_size != rhs.st_size { fields.append("size") }
+        if lhs.st_mtimespec.tv_sec != rhs.st_mtimespec.tv_sec ||
+            lhs.st_mtimespec.tv_nsec != rhs.st_mtimespec.tv_nsec {
+            fields.append("mtime")
+        }
+        if lhs.st_ctimespec.tv_sec != rhs.st_ctimespec.tv_sec ||
+            lhs.st_ctimespec.tv_nsec != rhs.st_ctimespec.tv_nsec {
+            fields.append("ctime")
+        }
+        return fields.isEmpty ? "none" : fields.joined(separator: ",")
     }
 
     private static func sameDirectoryIdentity(_ lhs: stat, _ rhs: stat) -> Bool {
@@ -3296,6 +3352,17 @@ enum SessionSnapshotTransaction {
         return result
     }
 
+    /// Host-test entry for the exact primitive used by task manifests,
+    /// snapshot commit markers and transaction intents. Production callers
+    /// continue through the private typed wrappers below.
+    static func readStableCommittedFileForTests(
+        _ url: URL,
+        maximumBytes: Int
+    ) throws -> Data? {
+        return try readStableCommittedFileIfPresent(
+            url, maximumBytes: maximumBytes)?.data
+    }
+
     private static func readStableCommittedFileIfPresent(
         parentDescriptor: Int32,
         basename: String,
@@ -3321,8 +3388,11 @@ enum SessionSnapshotTransaction {
               pathBefore.st_size > 0,
               pathBefore.st_size <= maximumBytes else {
             throw SessionError.copyFailed(
-                "committed transaction file type/mode/size is invalid")
+                "committed transaction file type/mode/size is invalid: "
+                    + basename)
         }
+        try faultInjector?(
+            .afterCommittedFileAuthorityReadBeforeOpen(basename))
         let descriptor = openat(
             parentDescriptor,
             basename,
@@ -3333,11 +3403,42 @@ enum SessionSnapshotTransaction {
         }
         defer { _ = close(descriptor) }
         var openedBefore = stat()
-        guard fstat(descriptor, &openedBefore) == 0,
-              sameFileIdentity(pathBefore, openedBefore) else {
+        guard fstat(descriptor, &openedBefore) == 0 else {
             throw SessionError.copyFailed(
-                "committed transaction file changed before open")
+                "cannot inspect opened committed transaction file: "
+                    + basename)
         }
+        if !sameFileIdentity(pathBefore, openedBefore) {
+            let preOpenDifference = fileIdentityDifferenceSummary(
+                pathBefore, openedBefore)
+            guard sameFileIdentityIgnoringChangeTime(
+                    pathBefore, openedBefore),
+                  changeTimeDidNotMoveBackward(pathBefore, openedBefore) else {
+                throw SessionError.copyFailed(
+                    "committed transaction file changed before open: "
+                        + basename + " [" + preOpenDifference + "]")
+            }
+
+            // Accept only the known iOS/APFS ctime stabilization. The
+            // namespace must now point exactly at the descriptor metadata;
+            // inode replacement, chmod, hardlink, size or mtime changes still
+            // fail closed before a byte is consumed.
+            var reboundPath = stat()
+            guard fstatat(
+                    parentDescriptor,
+                    basename,
+                    &reboundPath,
+                    AT_SYMLINK_NOFOLLOW) == 0,
+                  sameFileIdentity(openedBefore, reboundPath) else {
+                let reboundDifference = fileIdentityDifferenceSummary(
+                    openedBefore, reboundPath)
+                throw SessionError.copyFailed(
+                    "committed transaction file namespace changed while "
+                        + "stabilizing ctime: " + basename + " ["
+                        + reboundDifference + "]")
+            }
+        }
+        try faultInjector?(.afterCommittedFileOpenBeforeRead(basename))
         var data = Data()
         data.reserveCapacity(Int(openedBefore.st_size))
         var buffer = [UInt8](repeating: 0, count: 16 * 1024)
@@ -3360,17 +3461,34 @@ enum SessionSnapshotTransaction {
         }
         var openedAfter = stat()
         var pathAfter = stat()
-        guard fstat(descriptor, &openedAfter) == 0,
-              fstatat(
+        guard fstat(descriptor, &openedAfter) == 0 else {
+            throw SessionError.copyFailed(
+                "cannot inspect committed transaction file after read: "
+                    + basename)
+        }
+        guard fstatat(
                 parentDescriptor,
                 basename,
                 &pathAfter,
-                AT_SYMLINK_NOFOLLOW) == 0,
-              sameFileIdentity(openedBefore, openedAfter),
+                AT_SYMLINK_NOFOLLOW) == 0 else {
+            throw SessionError.copyFailed(
+                "committed transaction file disappeared during read: "
+                    + basename)
+        }
+        guard sameFileIdentity(openedBefore, openedAfter),
               sameFileIdentity(openedBefore, pathAfter),
               data.count == Int(openedBefore.st_size) else {
+            let descriptorDifference = fileIdentityDifferenceSummary(
+                openedBefore, openedAfter)
+            let pathDifference = fileIdentityDifferenceSummary(
+                openedBefore, pathAfter)
+            let byteDifference = data.count == Int(openedBefore.st_size)
+                ? "none" : "size"
             throw SessionError.copyFailed(
-                "committed transaction file changed during read")
+                "committed transaction file changed during read: "
+                    + basename + " [descriptor=" + descriptorDifference
+                    + ";path=" + pathDifference + ";bytes="
+                    + byteDifference + "]")
         }
         return (
             data,

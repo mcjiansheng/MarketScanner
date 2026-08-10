@@ -131,7 +131,10 @@ final class MobileProcessingViewController: UIViewController,
                         + "系统已安全保存 RESCAN_SESSION 记录；本次没有发布 "
                         + "PriceTags、DevicePositions 或普通结果。请重新扫描整个会话。")
                 } else {
-                    self.statusLabel.text = "处理失败：\(error.localizedDescription)"
+                    // MobileOnlyWorkflowError already owns the localized
+                    // stage prefix. Do not produce "处理失败：处理失败：…" or
+                    // hide a typed snapshot/export/state failure.
+                    self.statusLabel.text = error.localizedDescription
                 }
             }
             self.tableView.reloadData()

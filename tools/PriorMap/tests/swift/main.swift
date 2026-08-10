@@ -2624,6 +2624,305 @@ func runESLBarcodeCaptureFocusedTests() {
     print("ESL barcode capture focused tests passed")
 }
 
+func runSnapshotStableCommittedFileFocusedTests() {
+    let fileManager = FileManager.default
+    let root = fileManager.temporaryDirectory.appendingPathComponent(
+        "marketscanner-stable-committed-focused-"
+            + UUID().uuidString.lowercased(),
+        isDirectory: true)
+    do {
+        try fileManager.createDirectory(
+            at: root, withIntermediateDirectories: true)
+    } catch {
+        require(false, "cannot create stable committed-file fixture: \(error)")
+    }
+    defer {
+        SessionSnapshotTransaction.faultInjector = nil
+        try? fileManager.removeItem(at: root)
+    }
+
+    func makeCommittedFile(_ name: String, _ bytes: Data) throws -> URL {
+        let url = root.appendingPathComponent(name)
+        try bytes.write(to: url)
+        guard chmod(url.path, mode_t(0o444)) == 0 else {
+            throw NSError(
+                domain: "StableCommittedFixture",
+                code: Int(errno),
+                userInfo: [NSLocalizedDescriptionKey:
+                    "cannot freeze \(name)"])
+        }
+        return url
+    }
+
+    func rewriteInPlace(_ url: URL, bytes: Data) throws {
+        guard chmod(url.path, mode_t(0o644)) == 0 else {
+            throw NSError(
+                domain: "StableCommittedFixture",
+                code: Int(errno),
+                userInfo: [NSLocalizedDescriptionKey:
+                    "cannot thaw \(url.lastPathComponent)"])
+        }
+        let descriptor = open(
+            url.path, O_WRONLY | O_TRUNC | O_CLOEXEC | O_NOFOLLOW)
+        guard descriptor >= 0 else {
+            throw NSError(
+                domain: "StableCommittedFixture",
+                code: Int(errno),
+                userInfo: [NSLocalizedDescriptionKey:
+                    "cannot open \(url.lastPathComponent) for rewrite"])
+        }
+        defer { _ = close(descriptor) }
+        var offset = 0
+        while offset < bytes.count {
+            let count = bytes.withUnsafeBytes { rawBuffer -> Int in
+                guard let base = rawBuffer.baseAddress else { return -1 }
+                return Darwin.write(
+                    descriptor,
+                    base.advanced(by: offset),
+                    bytes.count - offset)
+            }
+            if count < 0 && errno == EINTR { continue }
+            guard count > 0 else {
+                throw NSError(
+                    domain: "StableCommittedFixture",
+                    code: Int(errno),
+                    userInfo: [NSLocalizedDescriptionKey:
+                        "cannot rewrite \(url.lastPathComponent)"])
+            }
+            offset += count
+        }
+        guard fsync(descriptor) == 0,
+              chmod(url.path, mode_t(0o444)) == 0 else {
+            throw NSError(
+                domain: "StableCommittedFixture",
+                code: Int(errno),
+                userInfo: [NSLocalizedDescriptionKey:
+                    "cannot refreeze \(url.lastPathComponent)"])
+        }
+    }
+
+    do {
+        let expected = Data("{\"ctime\":\"stable\"}\n".utf8)
+        let url = try makeCommittedFile("ctime-only.json", expected)
+        var injected = false
+        var confirmedCTimeOnlyDrift = false
+        SessionSnapshotTransaction.faultInjector = { point in
+            guard !injected,
+                  case let .afterCommittedFileAuthorityReadBeforeOpen(name)
+                    = point,
+                  name == url.lastPathComponent else { return }
+            var before = stat()
+            var after = stat()
+            guard lstat(url.path, &before) == 0 else {
+                throw NSError(
+                    domain: "StableCommittedFixture", code: 10)
+            }
+            usleep(20_000)
+            guard chmod(url.path, mode_t(0o644)) == 0,
+                  chmod(url.path, mode_t(0o444)) == 0,
+                  lstat(url.path, &after) == 0 else {
+                throw NSError(
+                    domain: "StableCommittedFixture", code: 11)
+            }
+            confirmedCTimeOnlyDrift =
+                before.st_dev == after.st_dev
+                && before.st_ino == after.st_ino
+                && before.st_mode == after.st_mode
+                && before.st_nlink == after.st_nlink
+                && before.st_size == after.st_size
+                && before.st_mtimespec.tv_sec == after.st_mtimespec.tv_sec
+                && before.st_mtimespec.tv_nsec == after.st_mtimespec.tv_nsec
+                && (before.st_ctimespec.tv_sec != after.st_ctimespec.tv_sec
+                    || before.st_ctimespec.tv_nsec
+                        != after.st_ctimespec.tv_nsec)
+            injected = true
+        }
+        let actual = try SessionSnapshotTransaction
+            .readStableCommittedFileForTests(
+                url, maximumBytes: 1024)
+        SessionSnapshotTransaction.faultInjector = nil
+        require(injected, "ctime-only fault point must execute")
+        require(
+            confirmedCTimeOnlyDrift,
+            "fixture must change only ctime before the stable open")
+        require(
+            actual == expected,
+            "same immutable inode with pre-open ctime advance must be readable")
+
+        let mtimeURL = try makeCommittedFile(
+            "mtime-change.json", Data("{\"value\":\"before\"}\n".utf8))
+        SessionSnapshotTransaction.faultInjector = { point in
+            guard case let .afterCommittedFileAuthorityReadBeforeOpen(name)
+                    = point,
+                  name == mtimeURL.lastPathComponent else { return }
+            usleep(20_000)
+            try rewriteInPlace(
+                mtimeURL,
+                bytes: Data("{\"value\":\"after!\"}\n".utf8))
+        }
+        var mtimeRejected = false
+        var mtimeFailure = ""
+        do {
+            _ = try SessionSnapshotTransaction
+                .readStableCommittedFileForTests(
+                    mtimeURL, maximumBytes: 1024)
+        } catch {
+            mtimeRejected = true
+            mtimeFailure = error.localizedDescription
+        }
+        SessionSnapshotTransaction.faultInjector = nil
+        require(
+            mtimeRejected && mtimeFailure.contains("mtime"),
+            "pre-open content/mtime change must remain fail-closed")
+
+        let replacementURL = try makeCommittedFile(
+            "atomic-replacement.json", Data("{\"value\":1}\n".utf8))
+        let replacement = try makeCommittedFile(
+            "atomic-replacement.prepared", Data("{\"value\":2}\n".utf8))
+        let displaced = root.appendingPathComponent(
+            "atomic-replacement.displaced")
+        SessionSnapshotTransaction.faultInjector = { point in
+            guard case let .afterCommittedFileAuthorityReadBeforeOpen(name)
+                    = point,
+                  name == replacementURL.lastPathComponent else { return }
+            guard rename(replacementURL.path, displaced.path) == 0,
+                  rename(replacement.path, replacementURL.path) == 0 else {
+                throw NSError(
+                    domain: "StableCommittedFixture", code: 12)
+            }
+        }
+        var replacementRejected = false
+        var replacementFailure = ""
+        do {
+            _ = try SessionSnapshotTransaction
+                .readStableCommittedFileForTests(
+                    replacementURL, maximumBytes: 1024)
+        } catch {
+            replacementRejected = true
+            replacementFailure = error.localizedDescription
+        }
+        SessionSnapshotTransaction.faultInjector = nil
+        require(
+            replacementRejected && replacementFailure.contains("inode"),
+            "pre-open atomic inode replacement must remain fail-closed")
+
+        let duringReadURL = try makeCommittedFile(
+            "during-read-ctime.json", Data("{\"value\":3}\n".utf8))
+        SessionSnapshotTransaction.faultInjector = { point in
+            guard case let .afterCommittedFileOpenBeforeRead(name) = point,
+                  name == duringReadURL.lastPathComponent else { return }
+            usleep(20_000)
+            guard chmod(duringReadURL.path, mode_t(0o644)) == 0,
+                  chmod(duringReadURL.path, mode_t(0o444)) == 0 else {
+                throw NSError(
+                    domain: "StableCommittedFixture", code: 13)
+            }
+        }
+        var duringReadCTimeRejected = false
+        do {
+            _ = try SessionSnapshotTransaction
+                .readStableCommittedFileForTests(
+                    duringReadURL, maximumBytes: 1024)
+        } catch {
+            duringReadCTimeRejected = true
+        }
+        SessionSnapshotTransaction.faultInjector = nil
+        require(
+            duringReadCTimeRejected,
+            "ctime changes after descriptor binding must remain fail-closed")
+
+        let postOpenURL = try makeCommittedFile(
+            "post-open-replacement.json", Data("{\"value\":4}\n".utf8))
+        let postOpenReplacement = try makeCommittedFile(
+            "post-open-replacement.prepared", Data("{\"value\":5}\n".utf8))
+        let postOpenDisplaced = root.appendingPathComponent(
+            "post-open-replacement.displaced")
+        SessionSnapshotTransaction.faultInjector = { point in
+            guard case let .afterCommittedFileOpenBeforeRead(name) = point,
+                  name == postOpenURL.lastPathComponent else { return }
+            guard rename(postOpenURL.path, postOpenDisplaced.path) == 0,
+                  rename(postOpenReplacement.path, postOpenURL.path) == 0 else {
+                throw NSError(
+                    domain: "StableCommittedFixture", code: 14)
+            }
+        }
+        var postOpenReplacementRejected = false
+        do {
+            _ = try SessionSnapshotTransaction
+                .readStableCommittedFileForTests(
+                    postOpenURL, maximumBytes: 1024)
+        } catch {
+            postOpenReplacementRejected = true
+        }
+        SessionSnapshotTransaction.faultInjector = nil
+        require(
+            postOpenReplacementRejected,
+            "post-open pathname replacement must remain fail-closed")
+
+        let hardlinkURL = try makeCommittedFile(
+            "hardlink-authority.json", Data("{\"value\":6}\n".utf8))
+        let hardlinkAlias = root.appendingPathComponent("hardlink-alias.json")
+        guard link(hardlinkURL.path, hardlinkAlias.path) == 0 else {
+            throw NSError(
+                domain: "StableCommittedFixture", code: 15)
+        }
+        var hardlinkRejected = false
+        do {
+            _ = try SessionSnapshotTransaction
+                .readStableCommittedFileForTests(
+                    hardlinkURL, maximumBytes: 1024)
+        } catch {
+            hardlinkRejected = true
+        }
+        require(
+            hardlinkRejected,
+            "multi-link committed authority must remain fail-closed")
+
+        let symlinkTarget = try makeCommittedFile(
+            "symlink-target.json", Data("{\"value\":7}\n".utf8))
+        let symlinkURL = root.appendingPathComponent("symlink-authority.json")
+        guard symlink(symlinkTarget.lastPathComponent, symlinkURL.path) == 0 else {
+            throw NSError(
+                domain: "StableCommittedFixture", code: 16)
+        }
+        var symlinkRejected = false
+        do {
+            _ = try SessionSnapshotTransaction
+                .readStableCommittedFileForTests(
+                    symlinkURL, maximumBytes: 1024)
+        } catch {
+            symlinkRejected = true
+        }
+        require(
+            symlinkRejected,
+            "symlink committed authority must remain fail-closed")
+
+        let modeURL = root.appendingPathComponent("mode-authority.json")
+        try Data("{\"value\":8}\n".utf8).write(to: modeURL)
+        guard chmod(modeURL.path, mode_t(0o644)) == 0 else {
+            throw NSError(
+                domain: "StableCommittedFixture", code: 17)
+        }
+        var modeRejected = false
+        do {
+            _ = try SessionSnapshotTransaction
+                .readStableCommittedFileForTests(
+                    modeURL, maximumBytes: 1024)
+        } catch {
+            modeRejected = true
+        }
+        require(
+            modeRejected,
+            "writable committed authority must remain fail-closed")
+    } catch {
+        SessionSnapshotTransaction.faultInjector = nil
+        require(
+            false,
+            "snapshot stable committed-file focused tests failed: \(error)")
+    }
+    print("Snapshot stable committed-file focused tests passed")
+}
+
 if CommandLine.arguments.count == 2,
    CommandLine.arguments[1] == "--esl-finalization-focused" {
     runESLFinalizationBindingFocusedTests()
@@ -2632,6 +2931,11 @@ if CommandLine.arguments.count == 2,
 if CommandLine.arguments.count == 2,
    CommandLine.arguments[1] == "--esl-capture-focused" {
     runESLBarcodeCaptureFocusedTests()
+    exit(0)
+}
+if CommandLine.arguments.count == 2,
+   CommandLine.arguments[1] == "--snapshot-stable-read-focused" {
+    runSnapshotStableCommittedFileFocusedTests()
     exit(0)
 }
 if (CommandLine.arguments.count == 6 || CommandLine.arguments.count == 7),

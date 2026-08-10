@@ -465,6 +465,41 @@ class MobileScanUXContractTests(unittest.TestCase):
         self.assertIn("file:/dev/fd/", snapshot)
         self.assertIn("forcePrivateDatabaseValidationCopyForTests", snapshot)
 
+    def test_snapshot_committed_file_open_allows_only_ctime_stabilization(
+        self,
+    ) -> None:
+        snapshot = self.source(
+            "app/ios/RTABMapApp/MobilePostProcessing/"
+            "SessionSnapshotTransaction.swift"
+        )
+        self.assertIn("sameFileIdentityIgnoringChangeTime", snapshot)
+        self.assertIn("changeTimeDidNotMoveBackward", snapshot)
+        self.assertIn(
+            ".afterCommittedFileAuthorityReadBeforeOpen(basename)",
+            snapshot,
+        )
+        self.assertIn(
+            "sameFileIdentity(openedBefore, reboundPath)",
+            snapshot,
+        )
+        self.assertIn(
+            ".afterCommittedFileOpenBeforeRead(basename)",
+            snapshot,
+        )
+        self.assertIn(
+            "sameFileIdentity(openedBefore, openedAfter)",
+            snapshot,
+        )
+        self.assertIn(
+            "sameFileIdentity(openedBefore, pathAfter)",
+            snapshot,
+        )
+        self.assertNotIn(
+            "sameCommittedFileObject(pathBefore, openedBefore)",
+            snapshot,
+        )
+        self.assertIn("fileIdentityDifferenceSummary", snapshot)
+
     def test_navigation_contract_has_root_close_and_push_back_stack(self) -> None:
         setup = self.source(
             "app/ios/RTABMapApp/MobileOnlyWorkflow/UI/"
@@ -639,6 +674,22 @@ class MobileScanUXContractTests(unittest.TestCase):
         )
         execute = coordinator[execute_start:execute_end]
         self.assertIn("notifyProcessing(.failure(.cancelled))", execute)
+        self.assertIn(
+            "error as? SessionSnapshotTransaction.SessionError",
+            execute,
+        )
+        self.assertIn(
+            "MobileOnlyWorkflowError.snapshotFailed(",
+            execute,
+        )
+        self.assertIn(
+            "self.statusLabel.text = error.localizedDescription",
+            processing_ui,
+        )
+        self.assertNotIn(
+            'self.statusLabel.text = "处理失败：\\(error.localizedDescription)"',
+            processing_ui,
+        )
 
 
 if __name__ == "__main__":
