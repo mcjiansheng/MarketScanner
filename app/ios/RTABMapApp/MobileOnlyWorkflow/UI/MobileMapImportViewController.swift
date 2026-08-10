@@ -26,6 +26,7 @@ final class MobileMapImportViewController: UIViewController {
     private var progressUIVisible = false
     private var startedAtUptime: TimeInterval?
     private var elapsedTimer: Timer?
+    private var preparedDocumentPicker: UIDocumentPickerViewController?
 
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -33,6 +34,22 @@ final class MobileMapImportViewController: UIViewController {
         view.backgroundColor = .systemBackground
         buildUI()
         registerObservers()
+    }
+
+    /// Called by the lightweight library page after it is visible. UIKit and
+    /// FileProvider initialization stay on the main thread, but no workflow
+    /// transition or provider access happens until the operator taps Import.
+    func prepareForPresentation() {
+        precondition(Thread.isMainThread)
+        loadViewIfNeeded()
+        prepareDocumentPickerIfNeeded()
+    }
+
+    override func viewDidAppear(_ animated: Bool) {
+        super.viewDidAppear(animated)
+        DispatchQueue.main.async { [weak self] in
+            self?.prepareDocumentPickerIfNeeded()
+        }
     }
 
     deinit {
@@ -203,7 +220,23 @@ final class MobileMapImportViewController: UIViewController {
         // Single unified entry: the coordinator runs pick → stage →
         // import → compile → register without any further page calls
         // (V1R2 §4.1). Concurrent taps are rejected with a typed error.
-        coordinator.beginMapImport(from: self, contract: contract)
+        let picker = preparedDocumentPicker
+        preparedDocumentPicker = nil
+        coordinator.beginMapImport(
+            from: self,
+            contract: contract,
+            preparedDocumentPicker: picker)
+    }
+
+    private func prepareDocumentPickerIfNeeded() {
+        precondition(Thread.isMainThread)
+        guard preparedDocumentPicker == nil,
+              coordinator.state == .idle,
+              presentedViewController == nil else {
+            return
+        }
+        preparedDocumentPicker = MapSourceDocumentPicker
+            .makePreparedViewController()
     }
 
     private func updateStatus(_ state: MobileOnlyWorkflowState) {
@@ -215,6 +248,9 @@ final class MobileMapImportViewController: UIViewController {
                 contractControl.isEnabled = true
                 importButton.setTitle("选择文件并导入", for: .normal)
                 stopElapsedTimer()
+                DispatchQueue.main.async { [weak self] in
+                    self?.prepareDocumentPickerIfNeeded()
+                }
             }
         case .pickingMap:
             statusLabel.text = "请在文件选择器中选择地图文件…"
@@ -242,6 +278,9 @@ final class MobileMapImportViewController: UIViewController {
             contractControl.isEnabled = true
             importButton.setTitle("选择文件并导入", for: .normal)
             stopElapsedTimer()
+            DispatchQueue.main.async { [weak self] in
+                self?.prepareDocumentPickerIfNeeded()
+            }
         default:
             break
         }

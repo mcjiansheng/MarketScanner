@@ -27,6 +27,8 @@ final class MobileMapLibraryViewController: UIViewController,
     private var hasLoaded = false
     private var loadGeneration = UUID()
     private var packagePicker: ExistingPriorMapPackagePicker?
+    private var preparedImportController: MobileMapImportViewController?
+    private var preparedImportMenu: UIAlertController?
     private var observerTokens: [MobileOnlyWorkflowCoordinator.ObserverToken] = []
 
     init(purpose: Purpose = .manageLibrary) {
@@ -141,6 +143,16 @@ final class MobileMapLibraryViewController: UIViewController,
         reloadRegistry()
     }
 
+    override func viewDidAppear(_ animated: Bool) {
+        super.viewDidAppear(animated)
+        // Defer cold UIKit/FileProvider work until the library page has
+        // painted. This removes it from both the "导入新地图" tap and the
+        // subsequent XLSX/CSV/JSON action without touching workflow state.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
+            self?.prepareImportFlowIfIdle()
+        }
+    }
+
     deinit {
         for token in observerTokens {
             coordinator.removeObserver(token)
@@ -244,6 +256,12 @@ final class MobileMapLibraryViewController: UIViewController,
     }
 
     @objc private func importMap() {
+        let alert = preparedImportMenu ?? makeImportMenu()
+        preparedImportMenu = nil
+        present(alert, animated: true)
+    }
+
+    private func makeImportMenu() -> UIAlertController {
         let alert = UIAlertController(
             title: "添加门店地图",
             message: "两种来源都会安装到同一地图库，并使用同一套起点配置和扫描启动流程。",
@@ -252,8 +270,13 @@ final class MobileMapLibraryViewController: UIViewController,
             title: "导入 XLSX / CSV / JSON",
             style: .default
         ) { [weak self] _ in
-            self?.navigationController?.pushViewController(
-                MobileMapImportViewController(), animated: true)
+            guard let self else { return }
+            let controller = self.preparedImportController
+                ?? MobileMapImportViewController()
+            self.preparedImportController = nil
+            controller.prepareForPresentation()
+            self.navigationController?.pushViewController(
+                controller, animated: true)
         })
         alert.addAction(UIAlertAction(
             title: "导入已有 PC 地图包",
@@ -261,7 +284,12 @@ final class MobileMapLibraryViewController: UIViewController,
         ) { [weak self] _ in
             self?.beginExistingPackageImport()
         })
-        alert.addAction(UIAlertAction(title: "取消", style: .cancel))
+        alert.addAction(UIAlertAction(
+            title: "取消",
+            style: .cancel
+        ) { [weak self] _ in
+            DispatchQueue.main.async { self?.prepareImportFlowIfIdle() }
+        })
         if let popover = alert.popoverPresentationController {
             if let barButtonItem = navigationItem.rightBarButtonItem {
                 popover.barButtonItem = barButtonItem
@@ -270,7 +298,37 @@ final class MobileMapLibraryViewController: UIViewController,
                 popover.sourceRect = importButton.bounds
             }
         }
-        present(alert, animated: true)
+        alert.loadViewIfNeeded()
+        return alert
+    }
+
+    private func prepareImportFlowIfIdle() {
+        precondition(Thread.isMainThread)
+        guard coordinator.state == .idle,
+              navigationController?.topViewController === self,
+              presentedViewController == nil else {
+            return
+        }
+        // Split the cold objects across separate main-run-loop turns so the
+        // already visible library page can process touches and rendering
+        // between UIKit/FileProvider initialization steps.
+        if preparedImportMenu == nil {
+            preparedImportMenu = makeImportMenu()
+            DispatchQueue.main.async { [weak self] in
+                self?.prepareImportFlowIfIdle()
+            }
+            return
+        }
+        if preparedImportController == nil {
+            let controller = MobileMapImportViewController()
+            controller.loadViewIfNeeded()
+            preparedImportController = controller
+            DispatchQueue.main.async { [weak self] in
+                self?.prepareImportFlowIfIdle()
+            }
+            return
+        }
+        preparedImportController?.prepareForPresentation()
     }
 
     private func beginExistingPackageImport() {

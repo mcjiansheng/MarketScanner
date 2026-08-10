@@ -239,7 +239,8 @@ final class MobileOnlyWorkflowCoordinator {
         from presenter: UIViewController,
         contract: CoordinateContract,
         storeID: String? = nil,
-        mapName: String? = nil
+        mapName: String? = nil,
+        preparedDocumentPicker: UIDocumentPickerViewController? = nil
     ) {
         coordinatorLock.lock()
         guard !importBusy else {
@@ -264,6 +265,7 @@ final class MobileOnlyWorkflowCoordinator {
         persistContext()
 
         let picker = MapSourceDocumentPicker(
+            preparedViewController: preparedDocumentPicker,
             onStagingStarted: { [weak self] in
                 guard let self = self else { return }
                 if self.transition(to: .stagingMapSource) {

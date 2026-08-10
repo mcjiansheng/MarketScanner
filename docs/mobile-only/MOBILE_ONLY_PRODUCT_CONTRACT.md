@@ -24,7 +24,7 @@
 
 ### 2.2 无人工编辑
 
-系统对每个价签只输出三种结论：`ACCEPTED`、`RESCAN_REQUIRED`、`UNAVAILABLE`。不确定结果进入补扫任务，不允许静默猜测，不允许用户手工拖动修复。
+系统对每个可解析价签输出三种质量结论：`ACCEPTED`、`LOW_CONFIDENCE`、`RESCAN_REQUIRED`；轨迹/会话层仍可输出 `UNAVAILABLE`。完整、exact-node 绑定且位置可重算、但质量不足的价签进入 `LOW_CONFIDENCE` 待复核，不自动创建补扫任务；权威证据缺失才进入 `RESCAN_REQUIRED`。不允许静默猜测，不允许把低置信度算成自动通过，也不允许用户手工拖动修复。
 
 ### 2.3 Route A 冻结范围
 
@@ -43,6 +43,7 @@ Mobile V1 只承诺 `Fast reduced graph`，以及 Fast 质量失败后至多一�
 ## 3. 手机导入（Track B1）
 
 - 支持 `.xlsx` / `.csv` / `.json` 三种格式，从 Files 应用经 security-scoped document picker 选择。
+- 地图选择页首屏绘制后可在主线程空闲轮次预热一次导入菜单、导入页、UTType 与 document picker view。预热不得改变 workflow state、访问 provider URL 或编译地图；文件选择后的安全暂存和编译继续在既有后台队列运行。
 - 正式 `Basic Info + Element Info` XLSX 从 `Basic Info` 取得 `storeCode`、`map_name`、画布和可选 scale；UI/CLI 门店与名称只能省略或作为 exact assertion，不能覆盖。CSV、legacy Element-only XLSX 与缺少内嵌 identity 的 JSON 仍必须显式提供 `store_id` 和地图名称。业务标识统一要求 NFC、非空、无首尾空白/控制字符/隐藏 basename/路径分隔符，`store_id` 最多 128 UTF-8 bytes，地图名称最多 200 UTF-8 bytes。
 - 选中的文件通过 no-follow、regular-file、单 hardlink、前后 inode/size/mtime/ctime 一致性检查复制到 App 私有 staging；复制使用 bounded chunk、`O_EXCL`、data fsync 与 parent-directory fsync。后续不再读取 provider 原路径；复制失败只清理本次新建 staging 文件，不建立地图记录。
 - 正式 workbook 解析为 canonical source v3 并编译为 package manifest v2。新生成 v2 的 `prior_map_id` 使用 lowercase、最长 115 字符的 ASCII slug 加 12 位 canonical SHA，最终路径 ID 不超过 128；Swift/PC 必须先过滤原始 Unicode 再做 ASCII lowercase。历史 v1 内容继续按冻结合同读取；pre-canonical uppercase v2 包只允许显式 diagnostic-only 完整性检查，普通 iOS/PC validator、旧向导、离线定位和 MobileMapLibrary 全部拒绝，不能隐式重写或复用 exact ID/SHA。旧包与无 generation 的旧开发 registry 必须保留原始证据并从原始地图重新导入。
@@ -89,6 +90,7 @@ XLSX 的 `floor` / `element` 单元格使用公式一律拒绝（`map_source_for
 - Final trajectory：优化节点 → 1 Hz 重采样（ceil/floor UTC 秒，XY 线性、yaw 最短角、uncertainty 保守上界），跨 lost / disconnected / floor change / 超大间隔 / 时钟不连续输出 `UNAVAILABLE`。
 - 当地时间：每行保留 `local_timestamp`（ISO 文本带 offset，如 `2026-08-05 21:06:23.000 +08:00`）、`utc_timestamp`、`unix_time_s`、`timezone_id`、`utc_offset`；业务主键用 `unix_time_s + sequence`。
 - 价签 observation 只有属于 verified complete burst v2，且与 burst frame 构成 exact observation/frame 一对一关系时才可消费；解析全程 true streaming。共享 64 KiB JSONL reader 对每行 caller body 建立独立 autorelease pool，避免 Foundation 临时对象在 200k 规模长时进程中累积；保留值仍按正常强引用生存，UTF-8/duplicate-key/nesting/schema 严格性不得放宽或重复解析。最终定位按 exact `boundNodeID` 使用 `P_final = T_final_node * inverse(T_raw_node) * P_raw`，不再按 5 秒窗口猜节点。多帧证据融合为物理实例；货架结果同时输出 `shelf_segment_id`、`distance_from_shelf_start_cm` 与 `position_ratio`。
+- 价签自动质量门为 `ACCEPTED / LOW_CONFIDENCE / RESCAN_REQUIRED`。recovering/weak、低 depth/view、node uncertainty、位置离散或无可靠货架候选，在 complete burst、exact node/raw pose 和可重算位置仍完整时输出 `LOW_CONFIDENCE`，保留 PriceTags 且不生成 RescanTask；burst/identity/graph/exact node/raw pose/measurement method/位置权威缺失仍 fail closed 为 `RESCAN_REQUIRED`。
 - `scan_events.jsonl`、clock、burst、trace 和其他证据均来自不可变 snapshot；坏行、缺 final newline、未知字段、身份/水位线不一致或 formal state 矛盾均 fail closed。scan event 的 `trackingSessionId` 必须逐行与当前处理 session 精确一致；当前 finalized metadata 尚未定义 scan-event count/last-ID，因此不得把 strict identity/framing 表述成 exact cardinality watermark。trace parser hard cap 为 2,000,000 records，产品资格 ceiling 为 48 h × 10 Hz = 1,728,000 records，两者不得混称。trace compactor 每秒保留保守最坏状态并保留 exact final sample；任何有限但无法安全映射到 `Int64` 秒轴或发生 subtraction overflow 的 timestamp 必须稳定返回 `compaction_axis_out_of_range`，不能 runtime trap。
 - `localization_constraints.jsonl` 按 48 h × 2 Hz 资格规模覆盖 345,600 条正式决策，parser hard cap 为 400,000、单条 64 KiB、文件 768 MiB；constraint/manual/recovery 实际 JSONL 原始行数必须分别精确等于 `captureHealth.localizationConstraintRecordCount`、`captureHealth.manualLocalizationEventCount`、`captureHealth.localizationRecoveryEventCount`。完整且身份一致的 `accepted=false` 是非致命负证据，不产生 absolute prior；schema/identity/disposition 矛盾或无效 accepted record 仍阻断。manual v2/v3 均要求最近节点、第二候选间隔和 ISO/Unix 时间交叉核对。
 - Native graph 的 skeleton/factor/prior 上限统一为 4096。Swift 先解析 disposition，再解释 error；`RESOURCE_REQUIRED` 保持资源暂停语义。C ABI v4 明确携带 quality byte count、runtime ABI、graph/factor SHA、factor/publish count；quality v2 必须作为完整 strict typed DTO 解析，并与 Fast/Full path、C disposition、request 的 map/SHA/session/projection policy、C trajectory/skeleton/publish/factor counts 精确一致。factor 数只认 `solver.factor_count`，RunSummary 不得使用宽松 JSON 数字强制转换或缺失字段 fallback。

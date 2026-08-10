@@ -67,7 +67,22 @@ final class PriceTagVisionScanner {
     private let workerExecutor = PriceTagVisionWorkerExecutor(
         maximumWorkers: 2)
     private var requestTokens = PriceTagVisionRequestTokenGate()
-    private var activeRequests: [UUID: VNDetectBarcodesRequest] = [:]
+    private var activeRequests: [UUID: [VNDetectBarcodesRequest]] = [:]
+
+    private static let baseSymbologies: [VNBarcodeSymbology] = [
+        .QR,
+        .EAN8,
+        .EAN13,
+        .Code128,
+        .Code39,
+        .Code93,
+        .I2of5,
+        .ITF14,
+        .UPCE,
+        .PDF417,
+        .DataMatrix,
+        .Aztec,
+    ]
 
     func activate(generation: UUID) {
         lock.lock()
@@ -118,23 +133,20 @@ final class PriceTagVisionScanner {
             completion(.failure(PriceTagVisionScannerError.invalidRegionOfInterest))
             return false
         }
-        let request = VNDetectBarcodesRequest()
-        request.symbologies = [
-            .QR,
-            .EAN8,
-            .EAN13,
-            .Code128,
-            .UPCE,
-            .PDF417,
-        ]
-        request.regionOfInterest = regionOfInterest
+        let request = Self.makeRequest(regionOfInterest: regionOfInterest)
+        // Very close labels often extend slightly outside the visible guide.
+        // Keep the fast exact ROI first, then perform one bounded expanded-ROI
+        // retry only when the primary request found nothing.
+        let expandedRegion = Self.expandedRegionOfInterest(regionOfInterest)
+        let expandedRequest = Self.makeRequest(
+            regionOfInterest: expandedRegion)
         lock.lock()
         guard let requestID = requestTokens.beginRequest(
                 generation: generation) else {
             lock.unlock()
             return false
         }
-        activeRequests[requestID] = request
+        activeRequests[requestID] = [request, expandedRequest]
         let started = workerExecutor.submit(requestID: requestID) {
             let result: Result<PriceTagVisionScanResult, Error>
             do {
@@ -143,17 +155,15 @@ final class PriceTagVisionScanner {
                     orientation: orientation,
                     options: [:])
                 try handler.perform([request])
-                let candidates = (request.results ?? [])
-                    .compactMap { observation -> PriceTagBarcodeCandidate? in
-                        guard let payload = observation.payloadStringValue,
-                              !payload.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-                            return nil
-                        }
-                        return PriceTagBarcodeCandidate(
-                            payload: payload,
-                            symbology: observation.symbology.rawValue,
-                            visionBounds: observation.boundingBox)
-                    }
+                var candidates = Self.candidates(from: request)
+                if candidates.isEmpty, expandedRegion != regionOfInterest {
+                    let fallbackHandler = VNImageRequestHandler(
+                        cvPixelBuffer: frame.capturedImage,
+                        orientation: orientation,
+                        options: [:])
+                    try fallbackHandler.perform([expandedRequest])
+                    candidates = Self.candidates(from: expandedRequest)
+                }
                 result = .success(
                     PriceTagVisionScanResult(
                         generation: generation,
@@ -201,11 +211,61 @@ final class PriceTagVisionScanner {
               let requestID = requestTokens.activeRequestID else {
             return
         }
-        activeRequests[requestID]?.cancel()
+        activeRequests[requestID]?.forEach { $0.cancel() }
         _ = workerExecutor.quarantine(requestID: requestID)
         _ = requestTokens.completeRequest(
             generation: generation,
             requestID: requestID)
+    }
+
+    private static func makeRequest(
+        regionOfInterest: CGRect
+    ) -> VNDetectBarcodesRequest {
+        let request = VNDetectBarcodesRequest()
+        if #available(iOS 17.0, *) {
+            request.revision = VNDetectBarcodesRequestRevision4
+            request.coalesceCompositeSymbologies = true
+        }
+        else if #available(iOS 16.0, *) {
+            request.revision = VNDetectBarcodesRequestRevision3
+        }
+        else if #available(iOS 15.0, *) {
+            request.revision = VNDetectBarcodesRequestRevision2
+        }
+        else {
+            request.revision = VNDetectBarcodesRequestRevision1
+        }
+        var symbologies = baseSymbologies
+        if #available(iOS 15.0, *) {
+            symbologies.append(.codabar)
+        }
+        request.symbologies = symbologies
+        request.regionOfInterest = regionOfInterest
+        return request
+    }
+
+    private static func expandedRegionOfInterest(_ region: CGRect) -> CGRect {
+        let horizontal = max(0.035, region.width * 0.16)
+        let vertical = max(0.035, region.height * 0.28)
+        return region.insetBy(dx: -horizontal, dy: -vertical)
+            .intersection(CGRect(x: 0, y: 0, width: 1, height: 1))
+    }
+
+    private static func candidates(
+        from request: VNDetectBarcodesRequest
+    ) -> [PriceTagBarcodeCandidate] {
+        return (request.results ?? [])
+            .compactMap { observation -> PriceTagBarcodeCandidate? in
+                guard let payload = observation.payloadStringValue,
+                      !payload.trimmingCharacters(
+                        in: .whitespacesAndNewlines).isEmpty else {
+                    return nil
+                }
+                return PriceTagBarcodeCandidate(
+                    payload: payload,
+                    symbology: observation.symbology.rawValue,
+                    visionBounds: observation.boundingBox)
+            }
     }
 
     static func captureOrientation(

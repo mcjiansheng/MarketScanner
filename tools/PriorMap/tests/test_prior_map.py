@@ -1172,6 +1172,9 @@ class IOSCoreContractTests(unittest.TestCase):
 
         self.assertIn("cvPixelBuffer: frame.capturedImage", scanner)
         self.assertIn("request.regionOfInterest = regionOfInterest", scanner)
+        self.assertIn("expandedRegionOfInterest", scanner)
+        self.assertIn("VNDetectBarcodesRequestRevision4", scanner)
+        self.assertIn("configuration.isAutoFocusEnabled = true", view_controller)
         self.assertIn("PriceTagVisionRequestTokenGate", scanner)
         self.assertIn("PriceTagVisionWorkerExecutor", scanner)
         self.assertIn("maximumWorkers: 2", scanner)
@@ -1193,6 +1196,11 @@ class IOSCoreContractTests(unittest.TestCase):
         self.assertIn("allowDuringFinalization: false", view_controller)
         self.assertIn("presentPriceTagCaptureStartFailure", barcode_flow)
         self.assertIn("required_localization_evidence_failed", barcode_flow)
+        self.assertIn("deferEvidenceUntilNodeBinding", barcode_flow)
+        self.assertIn("low_confidence_retained", barcode_flow)
+        self.assertIn("retainedForReview: true", barcode_flow)
+        self.assertIn("recomputableFrameCount >= 3", barcode_flow)
+        self.assertIn("capture_position_unresolvable", barcode_flow)
         self.assertIn("overlay.accessibilityViewIsModal = true", barcode_flow)
         self.assertIn("view.bringSubviewToFront(overlay)", barcode_flow)
         active_directory = re.search(

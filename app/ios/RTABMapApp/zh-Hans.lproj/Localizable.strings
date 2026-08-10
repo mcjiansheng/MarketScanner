@@ -87,6 +87,9 @@
 "Barcode detection failed. Hold steady and try again." = "条码检测失败。请保持稳定并重试。";
 "Not enough independent frames. Hold the ESL steady and try again." = "独立采集帧不足。请稳住 ESL 并重试。";
 "ESL evidence was saved, but the shelf result was not stable. Please rescan." = "ESL 观测证据已保存，但货架结果不稳定。请重新扫描。";
+"The barcode evidence was saved, but fewer than three frames had a recomputable ESL position. Move slightly back and rescan once." = "条码证据已保存，但少于 3 帧具有可重算的价签位置。请稍微后移并重新扫描一次。";
+"Barcode recognized. Waiting for an exact scan-node pose before saving low-confidence evidence (%d/%d)." = "已识别价签条码，正在等待精确扫描节点位姿后保存低置信度证据（%d/%d）。";
+"The ESL was saved as low confidence. Its position will be recomputed from the exact scan node during processing; no immediate rescan is required." = "价签已按低置信度保存。后处理会根据精确扫描节点重新计算位置，无需立即重复扫描。";
 "The ESL observations could not be saved. The tag was not created; raw RTAB-Map recording continues." = "无法保存 ESL 观测，因此未创建价签；RTAB-Map 原始扫描仍在继续。";
 "Shelf confirmation could not be shown. The observations were kept for review." = "无法显示货架确认界面。观测已保留，等待复核。";
 "The localized ESL could not be saved. The observations remain available for review." = "无法保存已定位的 ESL。观测仍保留，可供后续复核。";

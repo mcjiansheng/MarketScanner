@@ -16,7 +16,8 @@ import CryptoKit
 ///    localized nodes.
 /// 4. Final trajectory: one row per UTC second (1 Hz DevicePositions).
 /// 5. Tag finalization: resolve -> cluster -> shelf association ->
-///    automatic quality gate (ACCEPTED / RESCAN_REQUIRED).
+///    automatic quality gate (ACCEPTED / LOW_CONFIDENCE /
+///    RESCAN_REQUIRED).
 /// 6. Result package files + streaming four-sheet XLSX + external
 ///    manifest commit.
 enum MobileProcessingPipeline {
@@ -976,6 +977,9 @@ enum MobileProcessingPipeline {
             "tags": [
                 "observation_count": tagObservations.count,
                 "accepted_count": priceTags.filter { $0.qualityStatus == "ACCEPTED" }.count,
+                "low_confidence_count": priceTags.filter {
+                    $0.qualityStatus == "LOW_CONFIDENCE"
+                }.count,
                 "rescan_count": rescanTasks.count,
             ],
             "prior_evidence": priorEvidence.audit.reportPayload(
@@ -1681,9 +1685,10 @@ enum MobileProcessingPipeline {
     /// associated to a shelf/side candidate (first/second margin +
     /// occlusion) BEFORE any clustering, bucketed by the exact
     /// barcode+symbology+floor+shelf-segment+side+session identity, and
-    /// only then clustered with a bounded diameter. Unlocalized observations are counted and never
-    /// published; observations that fail resolution or association
-    /// become explicit RESCAN tasks — nothing is silently dropped.
+    /// only then clustered with a bounded diameter. Unlocalized observations
+    /// and observations that fail exact-node resolution become explicit
+    /// RESCAN tasks. A resolved position that cannot yet be associated with a
+    /// shelf is retained as LOW_CONFIDENCE instead of forcing another scan.
     static func finalizeTags(
         observations: [TagObservationEvidenceObservation],
         resolverIndex: TagObservationResolver.NodeIndex,
@@ -1702,24 +1707,34 @@ enum MobileProcessingPipeline {
 
         // Resolve each observation against the final optimized nodes.
         var resolved: [TagObservationResolver.ResolvedObservation] = []
-        // Exact identity + reason for every observation that cannot
-        // produce a price tag; surfaced as RESCAN tasks (never dropped).
+        // Exact identity + reason for every frame that cannot contribute a
+        // position. Hard authority failures always become RESCAN tasks; one
+        // soft measurement miss may be absorbed by a three-frame valid
+        // quorum from the same verified burst and marks that tag low confidence.
         typealias TagFailure = (
             barcode: String,
             symbology: String,
             floorID: String,
             trackingSessionID: String,
+            burstID: String?,
             reason: String)
         var resolutionFailures: [TagFailure] = []
+        var softFrameFailures: [TagFailure] = []
         for raw in observations {
-            guard let position = raw.rawPositionM else {
-                // Valid unlocalized evidence: never a price tag, never
-                // silently dropped — counted in the quality report.
-                resolutionFailures.append((
+            guard let position = raw.rawPositionM,
+                  raw.measurementMethod != "unavailable" else {
+                // A complete burst may contain one weak frame while three
+                // other exact-bound frames still provide a recomputable
+                // position quorum. Defer this frame-level decision until the
+                // whole burst has been resolved.
+                softFrameFailures.append((
                     barcode: raw.barcode, symbology: raw.symbology,
                     floorID: raw.floorID,
                     trackingSessionID: raw.trackingSessionID,
-                    reason: "unlocalized_observation"))
+                    burstID: raw.burstID,
+                    reason: raw.rawPositionM == nil
+                        ? "unlocalized_observation"
+                        : "measurement_method_unavailable"))
                 continue
             }
             guard let boundNodeID = raw.boundNodeID else {
@@ -1729,6 +1744,7 @@ enum MobileProcessingPipeline {
                     barcode: raw.barcode, symbology: raw.symbology,
                     floorID: raw.floorID,
                     trackingSessionID: raw.trackingSessionID,
+                    burstID: raw.burstID,
                     reason: "node_binding_missing"))
                 continue
             }
@@ -1739,6 +1755,7 @@ enum MobileProcessingPipeline {
                     barcode: raw.barcode, symbology: raw.symbology,
                     floorID: raw.floorID,
                     trackingSessionID: raw.trackingSessionID,
+                    burstID: raw.burstID,
                     reason: "raw_node_pose_missing"))
                 continue
             }
@@ -1779,7 +1796,34 @@ enum MobileProcessingPipeline {
                     barcode: raw.barcode, symbology: raw.symbology,
                     floorID: raw.floorID,
                     trackingSessionID: raw.trackingSessionID,
+                    burstID: raw.burstID,
                     reason: String(describing: error)))
+            }
+        }
+        var resolvedFrameCountByBurst: [String: Int] = [:]
+        for observation in resolved {
+            if let burstID = observation.burstID {
+                resolvedFrameCountByBurst[burstID, default: 0] += 1
+            }
+        }
+        var partialPositionBurstIDs = Set<String>()
+        var invalidBurstIDs = Set(resolutionFailures.compactMap { $0.burstID })
+        for failure in softFrameFailures {
+            if let burstID = failure.burstID,
+               (resolvedFrameCountByBurst[burstID] ?? 0) >= 3 {
+                partialPositionBurstIDs.insert(burstID)
+            }
+            else {
+                resolutionFailures.append(failure)
+                if let burstID = failure.burstID {
+                    invalidBurstIDs.insert(burstID)
+                }
+            }
+        }
+        if !invalidBurstIDs.isEmpty {
+            resolved.removeAll { observation in
+                guard let burstID = observation.burstID else { return false }
+                return invalidBurstIDs.contains(burstID)
             }
         }
 
@@ -1800,42 +1844,85 @@ enum MobileProcessingPipeline {
             shelfSide: String,
             observations: [TagObservationResolver.ResolvedObservation]
         )] = [:]
-        var associationFailures: [TagFailure] = []
-        for observation in resolved {
-            guard let association = ShelfAssociationEngine.bestAssociation(
-                point: (observation.mapXM, observation.mapYM),
-                shelves: shelves,
-                index: shelfIndex,
-                floorID: observation.floorID,
-                occludedByStructure: { shelf in
-                    ShelfAssociationEngine.isOccluded(
-                        tagPoint: (observation.mapXM, observation.mapYM),
-                        shelf: shelf,
-                        structures: structures)
-                }) else {
-                associationFailures.append((
+        do {
+            struct BurstBucketKey: Hashable {
+                let barcode: String
+                let symbology: String
+                let floorID: String
+                let trackingSessionID: String
+                let burstID: String?
+            }
+            struct AssociationIdentity: Hashable {
+                let shelfSegmentID: String
+                let shelfSide: String
+            }
+            var burstCandidates: [BurstBucketKey: [(
+                observationIndex: Int,
+                association: AssociationIdentity?
+            )]] = [:]
+            for (observationIndex, observation) in resolved.enumerated() {
+                let association = ShelfAssociationEngine.bestAssociation(
+                    point: (observation.mapXM, observation.mapYM),
+                    shelves: shelves,
+                    index: shelfIndex,
+                    floorID: observation.floorID,
+                    occludedByStructure: { shelf in
+                        ShelfAssociationEngine.isOccluded(
+                            tagPoint: (observation.mapXM, observation.mapYM),
+                            shelf: shelf,
+                            structures: structures)
+                    })
+                let burstKey = BurstBucketKey(
                     barcode: observation.barcode,
                     symbology: observation.symbology,
                     floorID: observation.floorID,
                     trackingSessionID: observation.trackingSessionID,
-                    reason: "no_shelf_association"))
-                continue
+                    burstID: observation.burstID)
+                burstCandidates[burstKey, default: []].append((
+                    observationIndex: observationIndex,
+                    association: association.map {
+                        AssociationIdentity(
+                            shelfSegmentID: $0.shelfSegmentID,
+                            shelfSide: $0.shelfSide)
+                    }))
             }
-            let key = TagBucketKey(
-                barcode: observation.barcode,
-                symbology: observation.symbology,
-                floorID: observation.floorID,
-                shelfSegmentID: association.shelfSegmentID,
-                shelfSide: association.shelfSide,
-                trackingSessionID: observation.trackingSessionID)
-            if var bucket = buckets[key] {
-                bucket.observations.append(observation)
-                buckets[key] = bucket
-            } else {
-                buckets[key] = (
-                    shelfSegmentID: association.shelfSegmentID,
-                    shelfSide: association.shelfSide,
-                    observations: [observation])
+            let orderedBurstKeys = burstCandidates.keys.sorted {
+                ($0.barcode, $0.symbology, $0.floorID,
+                 $0.trackingSessionID, $0.burstID ?? "")
+                    < ($1.barcode, $1.symbology, $1.floorID,
+                       $1.trackingSessionID, $1.burstID ?? "")
+            }
+            for burstKey in orderedBurstKeys {
+                guard let candidates = burstCandidates[burstKey] else {
+                    continue
+                }
+                // One burst is one operator capture of one physical tag. If
+                // its frames yield exactly one shelf identity, let frames
+                // with no candidate join that identity. If frames disagree
+                // across shelf identities, retain the whole burst in one
+                // unassociated bucket so it becomes one LOW_CONFIDENCE tag
+                // instead of duplicate partial tags or an immediate rescan.
+                let identities = Set(candidates.compactMap { $0.association })
+                let consensus = identities.count == 1 ? identities.first : nil
+                for candidate in candidates {
+                    let observation = resolved[candidate.observationIndex]
+                    let key = TagBucketKey(
+                        barcode: observation.barcode,
+                        symbology: observation.symbology,
+                        floorID: observation.floorID,
+                        shelfSegmentID: consensus?.shelfSegmentID ?? "",
+                        shelfSide: consensus?.shelfSide ?? "",
+                        trackingSessionID: observation.trackingSessionID)
+                    if var bucket = buckets[key] {
+                        bucket.observations.append(observation)
+                        buckets[key] = bucket
+                    } else {
+                        buckets[key] = (
+                            shelfSegmentID: consensus?.shelfSegmentID ?? "",
+                            shelfSide: consensus?.shelfSide ?? "",
+                            observations: [observation])
+                    }
+                }
             }
         }
 
@@ -1847,9 +1934,26 @@ enum MobileProcessingPipeline {
         let mapSessionIdentityConsistent = observations.allSatisfy {
             $0.trackingSessionID == sessionID
         }
-        // Resolution/association failures become explicit RESCAN tasks
-        // grouped in O(M) by exact observation identity + reason. The old
-        // firstIndex scan made a 200k-rejection run quadratic.
+        func authoritativeFailureReason(
+            for instance: TagObservationResolver.TagInstance
+        ) -> String? {
+            guard mapSessionIdentityConsistent else {
+                return "map_session_identity_mismatch"
+            }
+            guard graphQualityPassed else {
+                return "graph_quality_failed"
+            }
+            guard instance.uniqueVerifiedFrameCount >= 3 else {
+                return "insufficient_burst_samples"
+            }
+            guard instance.measurementMethodAccepted else {
+                return "measurement_method_unavailable"
+            }
+            return nil
+        }
+        // Exact-node/position resolution failures become explicit RESCAN
+        // tasks grouped in O(M) by observation identity + reason. Shelf
+        // uncertainty is handled separately as LOW_CONFIDENCE.
         struct FailureGroupKey: Hashable {
             let barcode: String
             let symbology: String
@@ -1858,9 +1962,8 @@ enum MobileProcessingPipeline {
             let reason: String
         }
         var failureGroups: [FailureGroupKey: Int] = [:]
-        failureGroups.reserveCapacity(
-            resolutionFailures.count + associationFailures.count)
-        for failure in resolutionFailures + associationFailures {
+        failureGroups.reserveCapacity(resolutionFailures.count)
+        for failure in resolutionFailures {
             let key = FailureGroupKey(
                 barcode: failure.barcode,
                 symbology: failure.symbology,
@@ -1919,6 +2022,10 @@ enum MobileProcessingPipeline {
                             shelf: shelf,
                             structures: structures)
                     }) else {
+                    let reason = authoritativeFailureReason(for: instance)
+                        ?? "no_shelf_association"
+                    let status = reason == "no_shelf_association"
+                        ? "LOW_CONFIDENCE" : "RESCAN_REQUIRED"
                     priceTags.append(FinalPriceTag(
                         tagInstanceID: "\(instance.barcode)-\(instance.floorID)-\(priceTags.count + 1)",
                         barcode: instance.barcode,
@@ -1939,34 +2046,44 @@ enum MobileProcessingPipeline {
                         positionSpreadCm: instance.positionSpreadM * 100.0,
                         localizationConfidence: instance.localizationConfidence,
                         associationConfidence: instance.associationConfidence,
-                        qualityStatus: "RESCAN_REQUIRED",
-                        reason: "no_shelf_association"))
-                    rescanTasks.append(RescanTask(
-                        taskID: "rescan-\(rescanTasks.count + 1)-\(instance.barcode)",
-                        taskType: .tagRescan,
-                        floorID: instance.floorID,
-                        barcode: instance.barcode,
-                        tagInstanceID: "\(instance.barcode)-\(instance.floorID)-\(priceTags.count)",
-                        shelfCode: "",
-                        shelfSegmentID: "",
-                        regionStartCm: nil,
-                        regionEndCm: nil,
-                        localStartTime: "",
-                        localEndTime: "",
-                        reasonCode: "no_shelf_association",
-                        humanMessage: "无法关联货架",
-                        suggestedAction: "重新扫描该价签",
-                        priority: 1))
+                        qualityStatus: status,
+                        reason: reason))
+                    if status == "RESCAN_REQUIRED" {
+                        rescanTasks.append(RescanTask(
+                            taskID: "rescan-\(rescanTasks.count + 1)-\(instance.barcode)",
+                            taskType: .tagRescan,
+                            floorID: instance.floorID,
+                            barcode: instance.barcode,
+                            tagInstanceID: "\(instance.barcode)-\(instance.floorID)-\(priceTags.count)",
+                            shelfCode: "",
+                            shelfSegmentID: "",
+                            regionStartCm: nil,
+                            regionEndCm: nil,
+                            localStartTime: "",
+                            localEndTime: "",
+                            reasonCode: reason,
+                            humanMessage: reason,
+                            suggestedAction: "重新扫描该价签",
+                            priority: 1))
+                    }
                     continue
                 }
                 let evaluation: (
                     AutomaticQualityGate.QualityStatus, String)
-                if association.shelfSegmentID != bucket.shelfSegmentID
+                if let reason = authoritativeFailureReason(for: instance) {
+                    evaluation = (.rescanRequired, reason)
+                } else if !partialPositionBurstIDs.isDisjoint(
+                        with: instance.burstIDs) {
+                    evaluation = (
+                        .lowConfidence,
+                        "partial_burst_position_unavailable")
+                } else if association.shelfSegmentID != bucket.shelfSegmentID
                     || association.shelfSide != bucket.shelfSide {
                     // The fused centroid crossed a segment/side boundary;
                     // never publish it as an automatic acceptance.
                     evaluation = (
-                        .rescanRequired, "shelf_centroid_reassociation_changed")
+                        .lowConfidence,
+                        "shelf_centroid_reassociation_changed")
                 } else {
                     evaluation = AutomaticQualityGate.evaluate(
                         AutomaticQualityGate.TagQualityInput(
@@ -2255,6 +2372,9 @@ enum MobileProcessingPipeline {
             "cancel_latency_seconds": String(format: "%.3f", cancelLatencySeconds),
             "graph_quality_status": nativeOutcome.disposition.reportValue,
             "accepted_tag_count": String(priceTags.filter { $0.qualityStatus == "ACCEPTED" }.count),
+            "low_confidence_tag_count": String(priceTags.filter {
+                $0.qualityStatus == "LOW_CONFIDENCE"
+            }.count),
             "rescan_tag_count": String(rescanTasks.count),
             "device_position_row_count": String(devicePositions.count),
             "available_position_count": String(available),

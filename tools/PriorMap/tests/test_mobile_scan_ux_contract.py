@@ -71,6 +71,53 @@ class MobileScanUXContractTests(unittest.TestCase):
         self.assertIn("stagingQueue.async", picker)
         self.assertNotIn("CanonicalSourceHasher.sha256", picker)
 
+    def test_import_cold_uikit_and_files_picker_are_prewarmed(self) -> None:
+        library = self.source(
+            "app/ios/RTABMapApp/MobileOnlyWorkflow/UI/"
+            "MobileMapLibraryViewController.swift"
+        )
+        importer = self.source(
+            "app/ios/RTABMapApp/MobileOnlyWorkflow/UI/"
+            "MobileMapImportViewController.swift"
+        )
+        picker = self.source(
+            "app/ios/RTABMapApp/MobileMapImport/MapSourceDocumentPicker.swift"
+        )
+        coordinator = self.source(
+            "app/ios/RTABMapApp/MobileOnlyWorkflow/"
+            "MobileOnlyWorkflowCoordinator.swift"
+        )
+        self.assertIn("prepareImportFlowIfIdle", library)
+        self.assertIn("preparedImportController", library)
+        self.assertIn("preparedImportMenu", library)
+        self.assertIn("controller.prepareForPresentation()", library)
+        self.assertIn("controller.loadViewIfNeeded()", library)
+        self.assertGreaterEqual(
+            library.count("self?.prepareImportFlowIfIdle()"),
+            3,
+        )
+        self.assertIn("prepareDocumentPickerIfNeeded", importer)
+        self.assertIn("preparedDocumentPicker", importer)
+        self.assertIn("preparedDocumentPicker: picker", importer)
+        self.assertIn("cachedSupportedTypes", picker)
+        self.assertIn("makePreparedViewController", picker)
+        self.assertIn("picker.loadViewIfNeeded()", picker)
+        self.assertIn("alert.loadViewIfNeeded()", library)
+        self.assertIn("preparedDocumentPicker:", coordinator)
+
+        tap_start = importer.index("@objc private func importTapped()")
+        tap_end = importer.index(
+            "private func prepareDocumentPickerIfNeeded", tap_start
+        )
+        tap = importer[tap_start:tap_end]
+        self.assertNotIn("UIDocumentPickerViewController(", tap)
+        present_start = picker.index("func present(from")
+        present_end = picker.index("func documentPicker(", present_start)
+        self.assertNotIn(
+            "UIDocumentPickerViewController(",
+            picker[present_start:present_end],
+        )
+
     def test_setup_binds_every_registry_identity_field_to_loaded_package(
         self,
     ) -> None:

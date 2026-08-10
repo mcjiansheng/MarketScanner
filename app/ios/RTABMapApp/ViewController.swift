@@ -1348,6 +1348,10 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                     return false
                 }
                 let configuration = ARWorldTrackingConfiguration()
+                // ESL capture reuses this ARSession. Keep continuous
+                // autofocus explicit so close-range barcode work cannot
+                // inherit a disabled camera configuration from another mode.
+                configuration.isAutoFocusEnabled = true
                 var message = ""
             	if(mState != .STATE_VISUALIZING_AND_MEASURING)
             	{
@@ -3694,13 +3698,7 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
             }
             return
         }
-        let binding = rtabmap?.latestNodeBinding(
-            frameTimestamp: frame.timestamp).map {
-                PriceTagCaptureNodeBinding(
-                    nodeID: Int64($0.nodeId),
-                    nodeTimebaseOffsetSeconds:
-                        $0.nodeTimebaseOffsetSeconds)
-            }
+        let binding = priceTagNodeBinding(frameTimestamp: frame.timestamp)
         let trackingSessionID = supermarketSession?.trackingSessionId ?? ""
         let submitted = priceTagVisionScanner.detect(
             frame: frame,
@@ -3774,6 +3772,34 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                 terminal: false,
                 minimumInterval: 1)
         }
+    }
+
+    /// Prefer the atomic live node snapshot. During a short native node
+    /// publication gap, reuse only the already-frozen snapshot that still
+    /// satisfies the same strict one-second node-timebase contract. This is
+    /// exact-ID authority reuse, never the removed nearest-node fallback.
+    private func priceTagNodeBinding(
+        frameTimestamp: TimeInterval
+    ) -> PriceTagCaptureNodeBinding? {
+        if let live = rtabmap?.latestNodeBinding(
+                frameTimestamp: frameTimestamp) {
+            return PriceTagCaptureNodeBinding(
+                nodeID: Int64(live.nodeId),
+                nodeTimebaseOffsetSeconds:
+                    live.nodeTimebaseOffsetSeconds)
+        }
+        guard let cached = priorMapLastNodeBinding else { return nil }
+        let nodeTimebaseFrameTimestamp = frameTimestamp
+            + cached.nodeTimebaseOffsetSeconds
+        let delta = abs(nodeTimebaseFrameTimestamp - cached.nodeStamp)
+        guard abs(frameTimestamp - cached.sampledFrameTimestamp) <= 1.0,
+              delta <= 1.0 else {
+            return nil
+        }
+        return PriceTagCaptureNodeBinding(
+            nodeID: Int64(cached.nodeId),
+            nodeTimebaseOffsetSeconds:
+                cached.nodeTimebaseOffsetSeconds)
     }
 
     @discardableResult
@@ -3988,13 +4014,13 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                 payload: detection.payload,
                 symbology: detection.symbology,
                 sourceReason: "native_node_binding_unavailable",
-                terminal: true)
-            let action = priceTagCaptureCoordinator.finishEvidence(
-                generation: result.generation,
-                captureID: captureID,
-                frameTimestamp: result.frame.timestamp,
-                observationID: detection.observationId,
-                succeeded: false)
+                terminal: false,
+                minimumInterval: 0.5)
+            let action = priceTagCaptureCoordinator
+                .deferEvidenceUntilNodeBinding(
+                    generation: result.generation,
+                    captureID: captureID,
+                    frameTimestamp: result.frame.timestamp)
             handlePriceTagEvidenceAction(
                 action,
                 generation: result.generation,
@@ -4133,8 +4159,21 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                     acceptedFrames: acceptedFrames,
                     requiredFrames: requiredFrames))
             }
+        case .waitingForNodeBinding(let acceptedFrames, let requiredFrames):
+            DispatchQueue.main.async {
+                guard self.priceTagCaptureCoordinator.isCurrent(generation) else {
+                    return
+                }
+                self.priceTagCaptureOverlay?.update(.error(
+                    message: String(
+                        format: self.localized("Barcode recognized. Waiting for an exact scan-node pose before saving low-confidence evidence (%d/%d)."),
+                        acceptedFrames,
+                        requiredFrames)))
+            }
         case .resolve(_, let observationIDs):
             priceTagVisionScanner.cancel(generation: generation)
+            let captureResults = priceTagCaptureResults(
+                captureID: captureID)
             guard let completion = supermarketSession?
                     .finalizeTagObservationCapture(
                         captureID: captureID,
@@ -4143,7 +4182,7 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                   completion.sufficient,
                   Set(completion.observationIDs) == Set(observationIDs),
                   let resolved = PriceTagCaptureResolver.resolve(
-                    priceTagCaptureResults(captureID: captureID),
+                    captureResults,
                     minimumEvidenceFrames: 3) else {
                 recordPriceTagCaptureAudit(
                     .shelfAmbiguous,
@@ -4176,6 +4215,59 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                     generation: generation,
                     captureID: captureID,
                     phase: "resolving_to_confirming")
+                return
+            }
+            if resolution.tag.needsReview
+                || !resolution.algorithmCandidateReliable {
+                let recomputableFrameCount = captureResults.filter {
+                    $0.tag.rawMapPosition != nil
+                        && $0.tag.measurementMethod != "unavailable"
+                }.count
+                guard recomputableFrameCount >= 3 else {
+                    recordPriceTagCaptureAudit(
+                        .measurementUnavailable,
+                        generation: generation,
+                        captureID: captureID,
+                        phase: "capture_resolution",
+                        payload: resolution.tag.payload,
+                        symbology: resolution.tag.symbology,
+                        sourceReason: "recomputable_position_quorum_missing",
+                        terminal: true)
+                    DispatchQueue.main.async {
+                        self.cancelPriceTagCapture(
+                            reason: "capture_position_unresolvable",
+                            userMessage: self.localized("The barcode evidence was saved, but fewer than three frames had a recomputable ESL position. Move slightly back and rescan once."),
+                            captureIDToFinalize: captureID)
+                    }
+                    return
+                }
+                // The exact complete burst is already durable. Retain it as
+                // low confidence and let post-processing reproject every
+                // observation through its exact boundNodeID and the final
+                // optimized phone pose. The operator should not have to scan
+                // the same physical tag repeatedly just to improve confidence.
+                DispatchQueue.main.async {
+                    guard self.priceTagCaptureCoordinator.isCurrent(generation) else {
+                        return
+                    }
+                    self.priceTagCaptureOverlay?.update(.success)
+                    UINotificationFeedbackGenerator()
+                        .notificationOccurred(.warning)
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+                        guard self.priceTagCaptureCoordinator.isCurrent(
+                            generation) else { return }
+                        _ = self.finishPriceTagCapture(
+                            generation: generation,
+                            payload: resolution.tag.payload,
+                            committed: false,
+                            retainedForReview: true,
+                            outcome: "low_confidence_retained")
+                        self.showToast(
+                            message: self.localized("The ESL was saved as low confidence. Its position will be recomputed from the exact scan node during processing; no immediate rescan is required."),
+                            seconds: 5,
+                            replacingCurrent: true)
+                    }
+                }
                 return
             }
             DispatchQueue.main.async {
@@ -4518,6 +4610,7 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         generation: UUID,
         payload: String,
         committed: Bool,
+        retainedForReview: Bool = false,
         outcome: String
     ) -> Bool {
         let completedAt = session.currentFrame?.timestamp
@@ -4526,7 +4619,8 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
             generation: generation,
             payload: payload,
             completedAt: completedAt,
-            committed: committed) else {
+            committed: committed,
+            retainedForReview: retainedForReview) else {
             persistPriceTagCaptureDiagnostics(
                 generation: generation,
                 captureID: nil,
@@ -4551,6 +4645,7 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                 "capture_generation": generation.uuidString.lowercased(),
                 "outcome": outcome,
                 "committed": committed ? "true" : "false",
+                "retained_for_review": retainedForReview ? "true" : "false",
             ])
         return true
     }

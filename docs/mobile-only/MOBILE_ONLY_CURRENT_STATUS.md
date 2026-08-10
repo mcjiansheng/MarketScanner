@@ -4,7 +4,15 @@
 
 ## 总体
 
-当前历史扫描/ESL 布局修复分支为 `fix/mobile-history-export-esl-layout`，不使用 `codex/` 前缀；它从现场阻断基线继续开发，核心分支 `core-mobile-v1@36f606c1fa05e92210f0189c804dadd1b09721a1` 和此前冻结分支均未修改。I10 final SHA `8f0e730d92773eea2ab58f56742d901ac02eead4` 的 exact-SHA run `31307753672` 为 7/8：P0、SHA/wave、ABI、Ubuntu/Windows native、Python/API/Web 与完整 macOS host 合同均 PASS，200k tag-evidence RSS 为 `794,099,712 < 805,306,368` bytes；唯一失败是 cold-cache iphoneos RTAB-Map 配置没有找到已生成在 `rtabmap/prebuild/bin/` 的宿主 `rtabmap-res_tool`，因此 simulator/device clean link 被跳过。I11 `37e6ed8c4afa00202693cd56919aea78fd4c7af5` 已在交叉编译前验证该宿主工具并通过 `RTABMAP_RES_TOOL` 显式绑定，G11 `7eef33e` 已绑定 implementation SHA；本地全新 host prebuild、全新 iOS CMake configure、Map Studio 109/109 和独立复审 `P0=0/P1=0` 均通过。新的 exact-SHA 8/8 前不冻结，当前发布判断仍为 **REJECTED / NO-GO / developer smoke only**。
+当前跟进分支为 `fix/mobile-import-prewarm-esl-deferred-tag`，基于已验证前序 `fix/mobile-history-export-esl-layout@eee1196714982972951122ca493f77669fcbdcee`，不使用 `codex/` 前缀；核心分支 `core-mobile-v1@36f606c1fa05e92210f0189c804dadd1b09721a1` 和此前冻结分支均未修改。I10 final SHA `8f0e730d92773eea2ab58f56742d901ac02eead4` 的 exact-SHA run `31307753672` 为 7/8：P0、SHA/wave、ABI、Ubuntu/Windows native、Python/API/Web 与完整 macOS host 合同均 PASS，200k tag-evidence RSS 为 `794,099,712 < 805,306,368` bytes；唯一失败是 cold-cache iphoneos RTAB-Map 配置没有找到已生成在 `rtabmap/prebuild/bin/` 的宿主 `rtabmap-res_tool`，因此 simulator/device clean link 被跳过。I11 `37e6ed8c4afa00202693cd56919aea78fd4c7af5` 已在交叉编译前验证该宿主工具并通过 `RTABMAP_RES_TOOL` 显式绑定，G11 `7eef33e` 已绑定 implementation SHA；本地全新 host prebuild、全新 iOS CMake configure、Map Studio 109/109 和独立复审 `P0=0/P1=0` 均通过。新的 exact-SHA 8/8 前不冻结，当前发布判断仍为 **REJECTED / NO-GO / developer smoke only**。
+
+## 2026-08-10 地图导入预热、近距离 ESL 与低置信度保留
+
+- 地图库首屏绘制后在主线程空闲轮次预加载一次导入 action sheet、导入页、XLSX `UTType` 和 document-picker view；不改变 workflow、不访问 provider 文件，真实暂存/编译继续在后台。
+- ARKit autofocus 显式启用；Vision 最多 10 Hz，主 ROI 无结果时只在同一 worker/ARFrame 上追加一次有界扩展 ROI，capture 窗口由 2 秒延长到 4 秒并扩充成熟条码类型。固定两条 worker、one-in-flight 和 1 秒 request deadline 不变。
+- live exact-node snapshot 短暂缺失只延期当前 evidence slot；只允许继续使用 live snapshot 或仍满足 1 秒合同的 frozen exact-ID snapshot，不恢复 nearest-time fallback。真实 sidecar、identity 与 burst 失败继续 sticky fail-closed。
+- 最终价签质量为 `ACCEPTED / LOW_CONFIDENCE / RESCAN_REQUIRED`。完整 burst、exact node/raw pose 和至少 3 帧可重算位置仍完整但定位/测量/关联不足时保留 `LOW_CONFIDENCE`，按最终 node pose 重投影且不自动生成 RescanTask；同一 burst 的多货架歧义合并为一条低置信度结果。缺失权威证据仍要求重扫，低置信度绝不计为 ACCEPTED。
+- 当前源码 focused UX/source **21/21 PASS**、全部修改 Swift `swiftc -parse` PASS、generated evidence contracts 11 文件无漂移、中文字符串与 Python 语法 PASS、unsigned generic iphoneos Debug 全量编译/链接 PASS。完整 Swift host 长方法 **1/1 PASS（1266.338 s）**：300,000 条 finalization 峰值 RSS 14,139,392 bytes；1,728,000 条 trace 保留 172,801 条、峰值 59,129,856 bytes；400,000 条 tag evidence 接受 200,000 条、峰值 589,463,552 bytes。上述仍不是签名真机、LiDAR、近距离聚焦、恢复期定位、Files/FileProvider 首开、热状态或现场 PASS。
 
 ## 2026-08-10 历史扫描处理、原始导出与 ESL 布局修复
 
@@ -53,7 +61,7 @@
 - Track B2 手机编译器：prior-map package 全产物；距离场 `data_sha256` 与 PC oracle 字节级一致；原子提交 + 生产自检。
 - Track C 后处理：session 快照事务；Fast Path 相对 SE(2) 因子图；持久任务状态机。
 - Track D 轨迹：时钟相关性记录；1 Hz 最终轨迹（本地时间 + UTC + offset；UNAVAILABLE 区间）。
-- Track E 价签：节点/时间绑定、位置传播、burst 融合、货架关联、自动质量门。
+- Track E 价签：节点/时间绑定、位置传播、burst 融合、货架关联、`ACCEPTED / LOW_CONFIDENCE / RESCAN_REQUIRED` 自动质量门。
 - Track F 导出：真 Open XML XLSX 四表流式导出、公式注入/控制字符防护、原子导出。
 - UI 接线：MapSourceDocumentPicker（security-scoped staging）、ResultShareController。
 - 工程登记：project.pbxproj（31 个新文件四段）、CI swiftc -parse 列表、Swift host 编译列表。
@@ -62,7 +70,7 @@
 ## ESL Barcode Capture / Shelf Confirmation 阻断级收口
 
 - iOS Capture Mode 只叠加 camera-only `MTKView` 预览、Vision 和 durable evidence；直接使用持续到达的 `ARFrame.capturedImage`，没有第二个 `AVCaptureSession`，没有暂停 ARSession、RTAB-Map、连续 SQLite、Clock、Pose、node creation 或 prior-map localization。
-- Vision 使用固定 scan box 的真实 ROI，最多 8 Hz、one-in-flight；每个请求有独立 1 秒 ARFrame deadline，预览最多 24 Hz。固定两条 worker lane；超时 lane 被 best-effort cancel/quarantine，fresh request 可在备用 lane 实际开始，两条 lane 都挂起时仅结束 ESL UX，不创建第三 worker，原扫描继续。candidate 需连续 2 帧锁定，同一 capture 目标 4 个、最低 3 个独立帧，最大 2 秒；deadline 时已有 3 个 durable frame 即解析，持续 no-detection/multiple 也不会无限 collecting。
+- 当前 Vision 使用固定 scan box 的真实 ROI与同帧一次有界扩展 ROI，最多 10 Hz、one-in-flight；每个请求有独立 1 秒 ARFrame deadline，预览最多 24 Hz。固定两条 worker lane；超时 lane 被 best-effort cancel/quarantine，fresh request 可在备用 lane 实际开始，两条 lane 都挂起时仅结束 ESL UX，不创建第三 worker，原扫描继续。candidate 需连续 2 帧锁定，同一 capture 目标 4 个、最低 3 个独立帧，最大 4 秒；下方其余 I6 条目为前序证据合同，当前参数以上述新增小节为准。
 - confirmation gate 只统计逐帧 `algorithmCandidateReliable=true` 且 `needsReview=false`、共同指向同一 `shelfSegmentId + side` 的独立证据；弱帧只保留 raw audit，不能凑足 3-frame reliable quorum。替代候选按 segment + side 精确绑定。
 - `tag_observations.jsonl` 与 `tag_observation_bursts.jsonl` 在最终化和 PC 上逐项核对 `observation_id / burst_id / frame_id / payload / symbology`；localized tag v2 的 frame set 必须精确等于一个 verified complete burst。capture cache 使用完成顺序 FIFO，超过 512 个 burst 时不会随机淘汰刚完成、正在确认的 capture。
 - iOS finalization 还要求 localized v2 tag 的 payload/symbology 与该 verified burst 完全一致；burst sequence 必须为正且严格递增，但不要求从 1 开始或连续。duplicate/decreasing sequence 使用稳定 blocker fail closed。

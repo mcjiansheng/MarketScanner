@@ -2,6 +2,13 @@
 
 > 文档状态：**当前有效**。最后核对日期：2026-08-10。
 
+## 2026-08-10 — 地图导入预热、近距离 ESL 识别与低置信度保留
+
+- 地图选择页首屏完成后，在主线程空闲轮次预热一次导入 action sheet、`MobileMapImportViewController`、XLSX `UTType` 和 `UIDocumentPickerViewController`。点击“导入新地图”与“导入 XLSX / CSV / JSON”不再承担这些一次性初始化；预热不触发 workflow transition、不访问 provider 文件，真实安全暂存和编译仍走原后台队列。
+- Barcode Capture 显式保持 ARKit autofocus，Vision 上限从 8 Hz 提升到 10 Hz，主 ROI 无结果时在同一 worker lane/ARFrame 上只执行一次扩展 ROI；加入 Code39/93、I2of5、ITF14、DataMatrix、Aztec 和 iOS 15+ Codabar。worker 仍固定两条、one-in-flight、1 秒 request deadline，不创建第二相机或 backlog。
+- exact node snapshot 的短暂 publication gap 不再伪装成 required sidecar write failure：当前 evidence frame 被延期，capture 保持锁定，并且只允许 live snapshot 或仍满足 1 秒 node-timebase 合同的已冻结 exact-ID snapshot。真实写入、身份和 burst 失败继续 sticky fail-closed。
+- 完整 verified burst 若仅定位/测量/关联质量不足，手机直接提示低置信度已保存并结束本次扫码；处理时继续按 exact `boundNodeID` 和最终优化 node pose 重投影，输出 `LOW_CONFIDENCE` PriceTag 而不自动创建 RescanTask。缺少完整 burst、身份/图质量、exact node/raw pose 或可解析位置仍为 `RESCAN_REQUIRED`，没有放宽 ACCEPTED 合同。
+
 ## 2026-08-10 — 历史扫描校验/导出、ESL 布局与 Xcode 启动假故障修复
 
 - 修复真机“处理历史扫描”在 snapshot 复核阶段报 `cannot open snapshot DB read-only`。根因是 iOS App sandbox 不保证 SQLite VFS 能通过 `/dev/fd/<descriptor>` 重新打开已绑定文件；当前保留 no-follow descriptor、完整 stat identity、WAL/journal、SHA、`quick_check`、Node/Link 和 graph BLOB 安全门，并在且仅在 `/dev/fd` 明确只读打开失败时，从已绑定 descriptor 流式复制到 App 私有 `0700/0400` 临时目录完成正常 immutable URI 校验。源身份在复制/校验前后精确复核，临时文件在所有退出路径清理；其他数据库完整性错误仍直接失败，不被 fallback 吞掉。

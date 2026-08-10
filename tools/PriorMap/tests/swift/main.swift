@@ -788,6 +788,57 @@ func runESLBarcodeCaptureFocusedTests() {
             require(false, "BC-04 A,A must lock")
         }
     }
+
+    // A transient missing exact node snapshot must release only the current
+    // evidence slot. It must not turn into the sticky required-write failure
+    // path or discard the already locked barcode/capture.
+    do {
+        let (coordinator, generation) = startCoordinator()
+        _ = submit(
+            coordinator, generation: generation,
+            timestamp: 0, candidates: [activeA])
+        let locked = submit(
+            coordinator, generation: generation,
+            timestamp: 0.2, candidates: [activeA])
+        guard case .candidateLocked(let captureID, _) = locked else {
+            require(false, "transient-binding test must lock the barcode")
+            return
+        }
+        let deferred = coordinator.deferEvidenceUntilNodeBinding(
+            generation: generation,
+            captureID: captureID,
+            frameTimestamp: 0.2)
+        require(
+            deferred == .waitingForNodeBinding(
+                acceptedFrames: 0, requiredFrames: 3),
+            "missing node binding must wait without cancelling the capture")
+        let resumed = submit(
+            coordinator, generation: generation,
+            timestamp: 0.4, candidates: [activeA])
+        if case .collect(let resumedID, _) = resumed {
+            require(
+                resumedID == captureID,
+                "the next exact-bound frame must resume the same capture")
+        }
+        else {
+            require(false, "the deferred capture must accept a later frame")
+        }
+        let saved = coordinator.finishEvidence(
+            generation: generation,
+            captureID: captureID,
+            frameTimestamp: 0.4,
+            observationID: "deferred-observation-1",
+            succeeded: true)
+        if case .continueCollecting(let accepted, _) = saved {
+            require(
+                accepted == 1,
+                "a later exact-bound frame must count normally")
+        }
+        else {
+            require(false, "deferred evidence must return to collection")
+        }
+        _ = coordinator.cancel(reason: "transient_binding_test_complete")
+    }
     do {
         let (coordinator, generation) = startCoordinator()
         _ = submit(
@@ -10283,23 +10334,23 @@ do {
     require(
         AutomaticQualityGate.evaluate(gateInput(
             count: 5, spread: 0.02, association: mid,
-            needsReview: true)).0 == .rescanRequired,
-        "G10 needs-review evidence must never be automatically accepted")
+            needsReview: true)).0 == .lowConfidence,
+        "G10 needs-review complete evidence must be retained as low confidence")
     require(
         AutomaticQualityGate.evaluate(gateInput(
             count: 5, spread: 0.02, association: mid,
-            depthQuality: 0.2)).0 == .rescanRequired,
-        "G10 low-depth complete burst must require a rescan")
+            depthQuality: 0.2)).0 == .lowConfidence,
+        "G10 low-depth complete burst must be retained as low confidence")
     require(
         AutomaticQualityGate.evaluate(gateInput(
             count: 5, spread: 0.02, association: mid,
-            nodeUncertaintyM: nil)).0 == .rescanRequired,
-        "G10 missing native node uncertainty must require a rescan")
+            nodeUncertaintyM: nil)).0 == .lowConfidence,
+        "G10 missing node uncertainty must be retained as low confidence")
     let endpointGate = AutomaticQualityGate.evaluate(gateInput(
         count: 5, spread: 0.02, association: endpoint))
     require(
-        endpointGate.0 == .rescanRequired,
-        "G7 endpoint-ambiguous tags must be RESCAN_REQUIRED, got \(endpointGate.0.rawValue)")
+        endpointGate.0 == .lowConfidence,
+        "G7 endpoint-ambiguous tags must be LOW_CONFIDENCE, got \(endpointGate.0.rawValue)")
     // Parallel-aisle ambiguity: a second shelf nearly as close collapses
     // the margin and must be RESCAN_REQUIRED.
     let aisle = ShelfAssociationEngine.ShelfSegment(
@@ -10326,9 +10377,9 @@ do {
     let aisleGate = AutomaticQualityGate.evaluate(gateInput(
         count: 5, spread: 0.02, association: between))
     require(
-        aisleGate.0 == .rescanRequired
+        aisleGate.0 == .lowConfidence
             && aisleGate.1 == "shelf_association_margin_insufficient",
-        "G7 parallel-aisle tags must be RESCAN_REQUIRED on margin, got \(aisleGate.0.rawValue)/\(aisleGate.1)")
+        "G7 parallel-aisle tags must be LOW_CONFIDENCE on margin, got \(aisleGate.0.rawValue)/\(aisleGate.1)")
     // Occlusion: a fixed structure between the tag and the shelf blocks
     // the sight line and must be RESCAN_REQUIRED.
     let structure = ShelfAssociationEngine.FixedStructure(
@@ -10390,9 +10441,9 @@ do {
     let occlusionGate = AutomaticQualityGate.evaluate(gateInput(
         count: 5, spread: 0.02, association: occludedAssociation))
     require(
-        occlusionGate.0 == .rescanRequired
+        occlusionGate.0 == .lowConfidence
             && occlusionGate.1 == "shelf_occluded_by_structure",
-        "G7 occluded tags must be RESCAN_REQUIRED, got \(occlusionGate.0.rawValue)/\(occlusionGate.1)")
+        "G7 occluded tags must be LOW_CONFIDENCE, got \(occlusionGate.0.rawValue)/\(occlusionGate.1)")
     // Rotated shelf geometry: the polygon axis drives the association.
     if let rotated = ShelfAssociationEngine.makeSegment(
         shelfCode: "A3", floorID: "1",
@@ -10486,7 +10537,12 @@ do {
         barcode: String,
         symbology: String,
         y: Double,
-        count: Int
+        count: Int,
+        localizationState: String = "stable",
+        localizationConfidence: Double = 1,
+        measurementConfidence: Double = 1,
+        needsReview: Bool = false,
+        burstID: String? = nil
     ) -> [TagObservationEvidenceObservation] {
         return (0..<count).map { index in
             TagObservationEvidenceObservation(
@@ -10497,16 +10553,17 @@ do {
                 frameTimestamp: Double(index),
                 nodeTimebaseTimestamp: 10,
                 rawPositionM: (5, y, 0),
-                measurementConfidence: 1,
-                localizationState: "stable",
-                localizationConfidence: 1,
-                needsReview: false,
+                measurementConfidence: measurementConfidence,
+                localizationState: localizationState,
+                localizationConfidence: localizationConfidence,
+                needsReview: needsReview,
                 trackingSessionID: "bucket-session",
                 boundNodeID: 77,
                 boundNodeDelta: 0,
                 secondCandidateDelta: 2,
-                burstID: "burst-\(barcode)-\(symbology)-\(y)",
-                frameID: "frame-\(index)",
+                burstID: burstID
+                    ?? "burst-\(barcode)-\(symbology)-\(y)",
+                frameID: "frame-\(y)-\(index)",
                 measurementMethod: "scene_depth",
                 depthSampleCount: 10,
                 depthInlierCount: 9,
@@ -10519,7 +10576,8 @@ do {
     }
     func finalizeBucketEvidence(
         _ observations: [TagObservationEvidenceObservation],
-        shelves: [ShelfAssociationEngine.ShelfSegment]
+        shelves: [ShelfAssociationEngine.ShelfSegment],
+        graphQualityPassed: Bool = true
     ) throws -> ([FinalPriceTag], [RescanTask]) {
         return try MobileProcessingPipeline.finalizeTags(
             observations: observations,
@@ -10532,7 +10590,7 @@ do {
             storeID: "STORE-BUCKET",
             priorMap: finalizerMap,
             floorID: "1",
-            graphQualityPassed: true,
+            graphQualityPassed: graphQualityPassed,
             rawNodePoses: [77: .identity],
             minimumAssociationMarginM: 0.5)
     }
@@ -10551,6 +10609,27 @@ do {
             && Set(segmentTags.map(\.shelfSegmentID))
                 == ["segment-shared-low", "segment-shared-high"],
         "RC-B17 same-code physical segments must finalize independently")
+
+    let ambiguousBurstEvidence =
+        finalizerEvidence(
+            barcode: "AMBIGUOUS-BURST",
+            symbology: "CODE128",
+            y: -0.1,
+            count: 3,
+            burstID: "burst-ambiguous")
+        + finalizerEvidence(
+            barcode: "AMBIGUOUS-BURST",
+            symbology: "CODE128",
+            y: 1.1,
+            count: 3,
+            burstID: "burst-ambiguous")
+    let (ambiguousTags, ambiguousRescans) = try finalizeBucketEvidence(
+        ambiguousBurstEvidence, shelves: [segmentLow, segmentHigh])
+    require(
+        ambiguousTags.count == 1
+            && ambiguousTags[0].qualityStatus == "LOW_CONFIDENCE"
+            && ambiguousRescans.isEmpty,
+        "one burst that disagrees across shelf identities must remain one low-confidence tag")
 
     let symbologyEvidence =
         finalizerEvidence(barcode: "MULTI", symbology: "CODE128", y: -0.1, count: 3)
@@ -10573,6 +10652,134 @@ do {
             && sparseRescans.count == 1
             && sparseRescans[0].shelfSegmentID == "segment-shared-low",
         "RC-B17 associated RESCAN rows must carry shelf_segment_id")
+
+    let (weakTags, weakRescans) = try finalizeBucketEvidence(
+        finalizerEvidence(
+            barcode: "WEAK-COMPLETE",
+            symbology: "CODE128",
+            y: -0.1,
+            count: 3,
+            localizationState: "recovering",
+            localizationConfidence: 0.45,
+            measurementConfidence: 0.55,
+            needsReview: true),
+        shelves: [segmentLow])
+    require(
+        weakTags.count == 1
+            && weakTags[0].qualityStatus == "LOW_CONFIDENCE"
+            && weakTags[0].reason == "measurement_needs_review"
+            && weakRescans.isEmpty,
+        "a complete exact-node burst with weak localization must be retained without an immediate rescan")
+
+    var partialPositionEvidence = finalizerEvidence(
+        barcode: "PARTIAL-POSITION",
+        symbology: "CODE128",
+        y: -0.1,
+        count: 4,
+        burstID: "burst-partial-position")
+    partialPositionEvidence[3].rawPositionM = nil
+    partialPositionEvidence[3].measurementMethod = "unavailable"
+    let (partialPositionTags, partialPositionRescans) =
+        try finalizeBucketEvidence(
+            partialPositionEvidence,
+            shelves: [segmentLow])
+    require(
+        partialPositionTags.count == 1
+            && partialPositionTags[0].qualityStatus == "LOW_CONFIDENCE"
+            && partialPositionTags[0].reason
+                == "partial_burst_position_unavailable"
+            && partialPositionRescans.isEmpty,
+        "three recomputable frames must retain a complete burst even when one frame has no position")
+
+    let (partialGraphFailureTags, partialGraphFailureRescans) =
+        try finalizeBucketEvidence(
+            partialPositionEvidence,
+            shelves: [segmentLow],
+            graphQualityPassed: false)
+    require(
+        partialGraphFailureTags.count == 1
+            && partialGraphFailureTags[0].qualityStatus == "RESCAN_REQUIRED"
+            && partialGraphFailureTags[0].reason == "graph_quality_failed"
+            && partialGraphFailureRescans.count == 1
+            && partialGraphFailureRescans[0].reasonCode
+                == "graph_quality_failed",
+        "a weak-frame quorum must never bypass the hard graph-quality gate")
+
+    var insufficientPositionEvidence = finalizerEvidence(
+        barcode: "INSUFFICIENT-POSITION",
+        symbology: "CODE128",
+        y: -0.1,
+        count: 3,
+        burstID: "burst-insufficient-position")
+    insufficientPositionEvidence[2].rawPositionM = nil
+    insufficientPositionEvidence[2].measurementMethod = "unavailable"
+    let (insufficientPositionTags, insufficientPositionRescans) =
+        try finalizeBucketEvidence(
+            insufficientPositionEvidence,
+            shelves: [segmentLow])
+    require(
+        insufficientPositionTags.isEmpty
+            && insufficientPositionRescans.count == 1
+            && insufficientPositionRescans[0].reasonCode
+                == "unlocalized_observation",
+        "fewer than three recomputable frames must keep the whole burst RESCAN_REQUIRED")
+
+    let (unassociatedTags, unassociatedRescans) = try finalizeBucketEvidence(
+        finalizerEvidence(
+            barcode: "NO-SHELF",
+            symbology: "CODE128",
+            y: -0.1,
+            count: 3),
+        shelves: [])
+    require(
+        unassociatedTags.count == 1
+            && unassociatedTags[0].qualityStatus == "LOW_CONFIDENCE"
+            && unassociatedTags[0].reason == "no_shelf_association"
+            && unassociatedRescans.isEmpty,
+        "a resolved complete burst without a shelf candidate must remain a low-confidence PriceTag")
+
+    let (unassociatedGraphFailureTags, unassociatedGraphFailureRescans) =
+        try finalizeBucketEvidence(
+            finalizerEvidence(
+                barcode: "NO-SHELF-GRAPH-FAIL",
+                symbology: "CODE128",
+                y: -0.1,
+                count: 3),
+            shelves: [],
+            graphQualityPassed: false)
+    require(
+        unassociatedGraphFailureTags.count == 1
+            && unassociatedGraphFailureTags[0].qualityStatus
+                == "RESCAN_REQUIRED"
+            && unassociatedGraphFailureTags[0].reason
+                == "graph_quality_failed"
+            && unassociatedGraphFailureRescans.count == 1
+            && unassociatedGraphFailureRescans[0].reasonCode
+                == "graph_quality_failed",
+        "missing shelf association must never bypass the hard graph-quality gate")
+
+    let (_, missingNodeRescans) = try MobileProcessingPipeline.finalizeTags(
+        observations: finalizerEvidence(
+            barcode: "MISSING-RAW-NODE",
+            symbology: "CODE128",
+            y: -0.1,
+            count: 3),
+        resolverIndex: finalizerIndex,
+        shelves: [segmentLow],
+        shelfIndex: ShelfAssociationEngine.ShelfSpatialIndex(
+            shelves: [segmentLow]),
+        structures: [],
+        sessionID: "bucket-session",
+        storeID: "STORE-BUCKET",
+        priorMap: finalizerMap,
+        floorID: "1",
+        graphQualityPassed: true,
+        rawNodePoses: [:],
+        minimumAssociationMarginM: 0.5)
+    require(
+        missingNodeRescans.count == 1
+            && missingNodeRescans[0].reasonCode == "raw_node_pose_missing",
+        "missing authoritative raw-node pose must remain RESCAN_REQUIRED")
 }
 catch {
     require(false, "RC-B17/H-07 finalization bucket tests failed: \(error)")

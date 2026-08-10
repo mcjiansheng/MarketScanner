@@ -321,11 +321,11 @@ struct PriceTagCapturePolicy: Equatable {
         minimumEvidenceFrames: 3,
         targetEvidenceFrames: 4,
         minimumCaptureDuration: 0.30,
-        maximumCaptureDuration: 2.0,
+        maximumCaptureDuration: 4.0,
         maximumVisionRequestDuration: 1.0,
-        visionRateHz: 8,
+        visionRateHz: 10,
         previewRateHz: 24,
-        minimumROIIntersectionRatio: 0.80,
+        minimumROIIntersectionRatio: 0.55,
         minimumCandidateNormalizedArea: 0.002,
         ambiguityScoreDelta: 0.08,
         completedDuplicateSuppressionSeconds: 2.0)
@@ -553,6 +553,7 @@ enum PriceTagCaptureVisionAction: Equatable {
 enum PriceTagCaptureEvidenceAction: Equatable {
     case ignored
     case continueCollecting(acceptedFrames: Int, requiredFrames: Int)
+    case waitingForNodeBinding(acceptedFrames: Int, requiredFrames: Int)
     case resolve(captureID: UUID, observationIDs: [String])
     case timedOut(captureID: UUID)
     case requiredEvidenceFailed(captureID: UUID)
@@ -1486,6 +1487,34 @@ final class PriceTagCaptureCoordinator {
             requiredFrames: requiredFrames)
     }
 
+    /// A missing node-time snapshot is transient authority unavailability,
+    /// not a durable evidence-write failure. Release this frame's in-flight
+    /// slot and keep the locked barcode/capture alive for the next exact node.
+    /// Required sidecar failures still use `finishEvidence` with `false` and
+    /// remain terminal fail-closed.
+    func deferEvidenceUntilNodeBinding(
+        generation: UUID,
+        captureID: UUID,
+        frameTimestamp: TimeInterval
+    ) -> PriceTagCaptureEvidenceAction {
+        lock.lock()
+        defer { lock.unlock() }
+        guard case .collecting(
+                let currentGeneration, let currentCaptureID,
+                _, _, let acceptedFrames, let requiredFrames) = stateValue,
+              currentGeneration == generation,
+              currentCaptureID == captureID,
+              evidenceInFlight,
+              pendingEvidenceFrameTimestamp == frameTimestamp else {
+            return .ignored
+        }
+        evidenceInFlight = false
+        pendingEvidenceFrameTimestamp = nil
+        return .waitingForNodeBinding(
+            acceptedFrames: acceptedFrames,
+            requiredFrames: requiredFrames)
+    }
+
     func markConfirming(generation: UUID, captureID: UUID) -> Bool {
         lock.lock()
         defer { lock.unlock() }
@@ -1572,7 +1601,8 @@ final class PriceTagCaptureCoordinator {
         generation: UUID,
         payload: String,
         completedAt: TimeInterval,
-        committed: Bool
+        committed: Bool,
+        retainedForReview: Bool = false
     ) -> Bool {
         lock.lock()
         defer { lock.unlock() }
@@ -1582,7 +1612,7 @@ final class PriceTagCaptureCoordinator {
             illegalTransitionLocked("confirming_to_idle", generation: generation)
             return false
         }
-        if committed {
+        if committed || retainedForReview {
             completedPayloads[payload] = completedAt
         }
         stateValue = .idle

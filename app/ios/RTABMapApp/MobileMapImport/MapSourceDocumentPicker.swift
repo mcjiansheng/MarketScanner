@@ -15,6 +15,7 @@ final class MapSourceDocumentPicker: NSObject, UIDocumentPickerDelegate {
 
     private let onResult: (PickedOutcome) -> Void
     private let onStagingStarted: (() -> Void)?
+    private let pickerViewController: UIDocumentPickerViewController
 
     /// Provider copies can block on file-provider hydration, descriptor I/O
     /// and fsync. UIDocumentPickerDelegate callbacks arrive on the main
@@ -25,30 +26,50 @@ final class MapSourceDocumentPicker: NSObject, UIDocumentPickerDelegate {
         qos: .userInitiated)
 
     init(
+        preparedViewController: UIDocumentPickerViewController? = nil,
         onStagingStarted: (() -> Void)? = nil,
         onResult: @escaping (PickedOutcome) -> Void
     ) {
+        precondition(Thread.isMainThread)
+        self.pickerViewController = preparedViewController
+            ?? Self.makePreparedViewController()
         self.onStagingStarted = onStagingStarted
         self.onResult = onResult
+        super.init()
+        pickerViewController.delegate = self
     }
 
+    /// UTType lookup and the Files/FileProvider controller both have a
+    /// measurable one-time initialization cost on real devices. Keep the
+    /// immutable type list cached and allow the import page to construct one
+    /// picker during an idle main-run-loop turn instead of inside the tap.
+    private static let cachedSupportedTypes: [UTType] = [
+        UTType(filenameExtension: "xlsx", conformingTo: .data) ?? .data,
+        .commaSeparatedText,
+        .json,
+    ]
+
     static func supportedTypes() -> [UTType] {
-        return [
-            UTType(filenameExtension: "xlsx", conformingTo: .data) ?? .data,
-            .commaSeparatedText,
-            .json,
-        ]
+        return cachedSupportedTypes
+    }
+
+    static func makePreparedViewController()
+        -> UIDocumentPickerViewController {
+        precondition(Thread.isMainThread)
+        let picker = UIDocumentPickerViewController(
+            forOpeningContentTypes: cachedSupportedTypes,
+            asCopy: true)
+        picker.allowsMultipleSelection = false
+        picker.loadViewIfNeeded()
+        return picker
     }
 
     /// Presents the document picker; the caller must keep a strong
     /// reference to the picker object until `onResult` fires.
     func present(from viewController: UIViewController) {
-        let picker = UIDocumentPickerViewController(
-            forOpeningContentTypes: Self.supportedTypes(),
-            asCopy: true)
-        picker.delegate = self
-        picker.allowsMultipleSelection = false
-        viewController.present(picker, animated: true)
+        precondition(Thread.isMainThread)
+        pickerViewController.delegate = self
+        viewController.present(pickerViewController, animated: true)
     }
 
     func documentPicker(
