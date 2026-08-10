@@ -14,9 +14,8 @@
 6. 覆盖正确货架、同 segment 不同 side、替代货架、无可靠候选、定位 weak/lost、prior-map unload、系统中断、低空间、thermal 和 required-write failure。
 7. 验证 `tag_observations.jsonl`、`tag_observation_bursts.jsonl`、`localized_price_tags.json`、metadata watermark 和 PC manifest v3 的 count、last ID、SHA-256 与 exact observation/burst binding。
 8. 在 PC 完成现场 A + optimized A、现场 A + optimized B、现场 A + offline unavailable 三类回放，分别验证 `NO_CONFLICT` approved、`USER_CONFIRMATION_CONFLICT` review/rescan、`OFFLINE_ASSOCIATION_UNAVAILABLE` review/rescan。
-9. 补齐平台 scoped `Libraries/iphonesimulator` / `Libraries/iphoneos` native dependencies，完成 simulator/device clean compile-link；当前本机 Xcode 已编译本轮 Swift 文件并 emit module，但最终被缺失的 Eigen/PCL/OpenCV headers（`Eigen/Core`、`pcl/point_cloud.h`、`opencv2/highgui/highgui.hpp`）阻断，不能记为 clean build PASS。
-10. 完整运行 `python3 -m unittest discover -s tools/PriorMap/tests -v`；I5 的关键长时 host workflow 已在 943.159 秒内 PASS（包括 Snapshot/Result/Map crash matrix、finalization/trace/tag scale），但不能把单方法结果冒充完整 discover PASS。
-11. 测量 scan-stop 期间 finalization-owned audit append、`persistTerminalRecoveryEvidence()` 与 `priorMapQueue.sync` 的主线程延迟；正确性和 snapshot 线性化已关闭，但慢盘或较大 Recovery sidecar 下的 UI latency 尚未资格化。
+9. 补齐平台 scoped `Libraries/iphonesimulator` / `Libraries/iphoneos` native dependencies，完成 simulator/device 两套 cold clean compile-link；当前修复源码的 unsigned generic iphoneos Debug 与 Release 已全量编译/链接 PASS，Release identity 也已精确验证，但不能替代两平台 cold dependency 或签名真机资格。
+10. 测量 scan-stop 期间 finalization-owned audit append、`persistTerminalRecoveryEvidence()` 与 `priorMapQueue.sync` 的主线程延迟；正确性和 snapshot 线性化已关闭，但慢盘或较大 Recovery sidecar 下的 UI latency 尚未资格化。
 
 ## 已延期的低影响实现
 
