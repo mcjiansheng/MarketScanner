@@ -8,13 +8,20 @@ final class MobileMapLibraryViewController: UIViewController,
     UITableViewDataSource,
     UITableViewDelegate {
 
+    enum Purpose {
+        case manageLibrary
+        case selectForScan
+    }
+
     private let tableView = UITableView(frame: .zero, style: .insetGrouped)
     private let activityIndicator = UIActivityIndicatorView(style: .medium)
     private let activityLabel = UILabel()
+    private let importButton = UIButton(type: .system)
     private let libraryQueue = DispatchQueue(
         label: "MarketScanner.MapLibrary.UI",
         qos: .userInitiated)
     private let coordinator = MobileOnlyWorkflowCoordinator.shared
+    private let purpose: Purpose
 
     private var maps: [MobileMapLibrary.MapEntry] = []
     private var hasLoaded = false
@@ -22,14 +29,29 @@ final class MobileMapLibraryViewController: UIViewController,
     private var packagePicker: ExistingPriorMapPackagePicker?
     private var observerTokens: [MobileOnlyWorkflowCoordinator.ObserverToken] = []
 
+    init(purpose: Purpose = .manageLibrary) {
+        self.purpose = purpose
+        super.init(nibName: nil, bundle: nil)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("MobileMapLibraryViewController is programmatic")
+    }
+
     override func viewDidLoad() {
         super.viewDidLoad()
-        title = "门店地图"
+        title = purpose == .selectForScan ? "选择门店地图" : "门店地图"
+        navigationItem.prompt = purpose == .selectForScan
+            ? "选择后才会验证并加载该地图"
+            : nil
         view.backgroundColor = .systemBackground
-        navigationItem.rightBarButtonItem = UIBarButtonItem(
-            barButtonSystemItem: .add,
-            target: self,
-            action: #selector(importMap))
+        if purpose == .manageLibrary {
+            navigationItem.rightBarButtonItem = UIBarButtonItem(
+                barButtonSystemItem: .add,
+                target: self,
+                action: #selector(importMap))
+        }
         if navigationController?.viewControllers.first === self {
             navigationItem.leftBarButtonItem = UIBarButtonItem(
                 barButtonSystemItem: .close,
@@ -48,6 +70,21 @@ final class MobileMapLibraryViewController: UIViewController,
         tableView.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(tableView)
 
+        importButton.setTitle("导入新地图", for: .normal)
+        importButton.setImage(UIImage(systemName: "plus.circle.fill"), for: .normal)
+        importButton.titleLabel?.font = UIFont.preferredFont(
+            forTextStyle: .headline)
+        importButton.titleLabel?.adjustsFontForContentSizeCategory = true
+        importButton.backgroundColor = .secondarySystemBackground
+        importButton.layer.cornerRadius = 12
+        importButton.contentEdgeInsets = UIEdgeInsets(
+            top: 12, left: 16, bottom: 12, right: 16)
+        importButton.addTarget(
+            self, action: #selector(importMap), for: .touchUpInside)
+        importButton.translatesAutoresizingMaskIntoConstraints = false
+        importButton.isHidden = purpose != .selectForScan
+        view.addSubview(importButton)
+
         activityLabel.font = UIFont.preferredFont(forTextStyle: .subheadline)
         activityLabel.adjustsFontForContentSizeCategory = true
         activityLabel.textColor = .secondaryLabel
@@ -61,9 +98,8 @@ final class MobileMapLibraryViewController: UIViewController,
         activityRow.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(activityRow)
 
-        NSLayoutConstraint.activate([
+        var constraints = [
             tableView.topAnchor.constraint(equalTo: view.topAnchor),
-            tableView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
             tableView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
             tableView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
             activityRow.centerXAnchor.constraint(equalTo: view.centerXAnchor),
@@ -72,7 +108,28 @@ final class MobileMapLibraryViewController: UIViewController,
                 greaterThanOrEqualTo: view.leadingAnchor, constant: 24),
             activityRow.trailingAnchor.constraint(
                 lessThanOrEqualTo: view.trailingAnchor, constant: -24),
-        ])
+        ]
+        if purpose == .selectForScan {
+            constraints.append(contentsOf: [
+                tableView.bottomAnchor.constraint(
+                    equalTo: importButton.topAnchor, constant: -8),
+                importButton.leadingAnchor.constraint(
+                    equalTo: view.safeAreaLayoutGuide.leadingAnchor,
+                    constant: 20),
+                importButton.trailingAnchor.constraint(
+                    equalTo: view.safeAreaLayoutGuide.trailingAnchor,
+                    constant: -20),
+                importButton.bottomAnchor.constraint(
+                    equalTo: view.safeAreaLayoutGuide.bottomAnchor,
+                    constant: -12),
+                importButton.heightAnchor.constraint(
+                    greaterThanOrEqualToConstant: 50),
+            ])
+        } else {
+            constraints.append(
+                tableView.bottomAnchor.constraint(equalTo: view.bottomAnchor))
+        }
+        NSLayoutConstraint.activate(constraints)
 
         observerTokens.append(coordinator.addCompileObserver {
             [weak self] result in
@@ -109,6 +166,7 @@ final class MobileMapLibraryViewController: UIViewController,
             activityIndicator.stopAnimating()
         }
         navigationItem.rightBarButtonItem?.isEnabled = !busy
+        importButton.isEnabled = !busy
         tableView.isUserInteractionEnabled = !busy
     }
 
@@ -205,7 +263,12 @@ final class MobileMapLibraryViewController: UIViewController,
         })
         alert.addAction(UIAlertAction(title: "取消", style: .cancel))
         if let popover = alert.popoverPresentationController {
-            popover.barButtonItem = navigationItem.rightBarButtonItem
+            if let barButtonItem = navigationItem.rightBarButtonItem {
+                popover.barButtonItem = barButtonItem
+            } else {
+                popover.sourceView = importButton
+                popover.sourceRect = importButton.bounds
+            }
         }
         present(alert, animated: true)
     }
@@ -252,10 +315,10 @@ final class MobileMapLibraryViewController: UIViewController,
             message: message,
             preferredStyle: .alert)
         alert.addAction(UIAlertAction(
-            title: "开始扫描", style: .default
+            title: purpose == .selectForScan ? "使用此地图" : "开始扫描",
+            style: .default
         ) { [weak self] _ in
-            let setup = MobileScanSetupViewController()
-            setup.selectedMap = map
+            let setup = MobileScanSetupViewController(selectedMap: map)
             self?.navigationController?.pushViewController(
                 setup, animated: true)
         })
@@ -289,9 +352,13 @@ final class MobileMapLibraryViewController: UIViewController,
     ) -> UITableViewCell {
         if maps.isEmpty {
             let cell = UITableViewCell(style: .default, reuseIdentifier: nil)
-            cell.textLabel?.text = hasLoaded
-                ? "暂无地图，点击右上角 + 导入"
-                : "正在读取地图库…"
+            if hasLoaded {
+                cell.textLabel?.text = purpose == .selectForScan
+                    ? "暂无地图，请点击下方“导入新地图”"
+                    : "暂无地图，请点击右上角 + 导入"
+            } else {
+                cell.textLabel?.text = "正在读取地图库…"
+            }
             cell.textLabel?.textColor = .secondaryLabel
             cell.selectionStyle = .none
             return cell
@@ -314,8 +381,8 @@ final class MobileMapLibraryViewController: UIViewController,
     ) {
         tableView.deselectRow(at: indexPath, animated: true)
         guard maps.indices.contains(indexPath.row) else { return }
-        let setup = MobileScanSetupViewController()
-        setup.selectedMap = maps[indexPath.row]
+        let setup = MobileScanSetupViewController(
+            selectedMap: maps[indexPath.row])
         navigationController?.pushViewController(setup, animated: true)
     }
 }

@@ -132,7 +132,8 @@ final class MobileOnlyHomeViewController: UIViewController {
 
     private func openScanSetup() {
         let navigation = UINavigationController(
-            rootViewController: MobileScanSetupViewController())
+            rootViewController: MobileMapLibraryViewController(
+                purpose: .selectForScan))
         present(navigation, animated: true)
     }
 

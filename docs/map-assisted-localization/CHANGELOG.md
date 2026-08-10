@@ -2,15 +2,23 @@
 
 > 文档状态：**当前有效**。最后核对日期：2026-08-10。
 
+## 2026-08-10 — 地图先选后载、导入初始状态与默认真机 Run 修复
+
+- 首页“新建扫描”和菜单“开始门店扫描”不再直接构造配置页并自动加载 registry 第一张地图，而是先打开 `MobileMapLibraryViewController(purpose: .selectForScan)`。选择页只读轻量 registry，提供明确的“导入新地图”按钮；用户点击某条记录后才创建 `MobileScanSetupViewController(selectedMap:)` 并完整验证/加载该 exact package。
+- 配置页的地图参数改为 immutable required initializer，删除内部地图 picker、registry reload 和切换回调。因此起点配置过程中不能因滑动 picker 反复触发大包验证；需要换图时使用系统 Back 返回轻量选择页。
+- 导入页初始隐藏百分比、进度条和计时。点击“选择文件并导入”只打开系统 picker；收到文件并进入 `stagingMapSource` 后才显示进度 UI，取消 picker 时继续保持隐藏。
+- 共享 `RTABMapApp` scheme 的默认 Launch/Run 从 Debug 改为 Release，普通 Xcode Run 会执行严格 build-identity 生成/验证并可进入扫描。Test/Analyze 和手动 Debug 构建仍为 Debug，仍删除身份文件并 fail closed；没有放宽 `MobileBuildIdentity.isUsable`，也没有加入 `--allow-dirty`。`RTABMapApp-QualifiedDevice` 继续保留。
+- 聚焦 UX/yaw/build-identity 合同扩展为 29 项，新增先选后载、配置页无 picker、导入进度延迟显示和默认 Run Release 回归。
+
 ## 2026-08-10 — 全手机扫描统一 UX 与启动事务阻断级收口
 
-- 首页大型“新建扫描”和菜单“开始门店扫描”现在都进入同一个 `MobileScanSetupViewController`；“门店地图”统一管理手机编译的 XLSX/CSV/JSON 和 PC production-validator 通过的 v2 prior-map package。两种来源最终复用同一个 `MobileMapLibrary`、配置页、`MobileOnlyWorkflowCoordinator` 和 `ViewController.startMobileOnlyScan()`，旧 `PriorMapWizardViewController` 不再从生产入口可达。自由扫描和原始数据录制降级到“实验与兼容工具”。
+- 首页大型“新建扫描”和菜单“开始门店扫描”统一进入同一套全手机流程；本日后续的“地图先选后载”修复将其入口调整为先打开轻量选择页，再以选定地图创建同一个 `MobileScanSetupViewController`。“门店地图”统一管理手机编译的 XLSX/CSV/JSON 和 PC production-validator 通过的 v2 prior-map package。两种来源最终复用同一个 `MobileMapLibrary`、配置页、`MobileOnlyWorkflowCoordinator` 和 `ViewController.startMobileOnlyScan()`，旧 `PriorMapWizardViewController` 不再从生产入口可达。自由扫描和原始数据录制降级到“实验与兼容工具”。
 - 卡顿根因是 UI 线程进入/返回时逐包执行完整 manifest/JSON/PNG/距离场校验，并在开始扫描时重复构造 package/localizer、创建会话和打开 native SQLite；MapCase02 单次完整包校验的本机 host 证据约为 9.36 秒。普通地图库进入现在只读轻量 registry，完整刷新、provider 复制/fsync、精确 package 加载、localizer 构造、会话/数据库准备均转入后台串行队列；主线程只执行短 UIKit、ARSession、CameraMobile 和状态切换事务。
 - 统一配置页支持 1×–8× 捏合缩放、单指平移、双击放大/复位、点击选点、0.1/0.5/1.0 m 方向键微调，以及东/北/西/南和左右 15° 离散朝向；删除横向 yaw slider。首页直达时显示 Close，从地图库 push 时保留系统 Back/返回手势，离开页面会取消 queued/running 启动。
-- 手机地图编译页面显示严格解析、身份/元素校验、道路图、逐楼层/逐分辨率距离场、空间索引、工件写入、逐楼层预览、验证报告、manifest、production self-validation、fsync、不可变提交和 registry 注册等真实阶段，并持续显示百分比和用时；完成页显示 store ID、prior-map ID、package/canonical SHA、楼层、源/有效/忽略元素和 warning 统计。
-- 新增共享 `RTABMapApp-QualifiedDevice` scheme：Run/Launch 使用 Release，Test/Analyze 使用 Debug，Profile/Archive 使用 Release；普通 `RTABMapApp` Debug 继续故意不携带 build identity 并 fail closed。正式真机门店扫描必须从已提交且 tracked tree 干净的 `RTABMapApp-QualifiedDevice` 构建，不允许 `--allow-dirty` 或放宽 `MobileBuildIdentity.isUsable`。
+- 手机地图编译页面在 provider 返回文件并进入安全暂存后，显示严格解析、身份/元素校验、道路图、逐楼层/逐分辨率距离场、空间索引、工件写入、逐楼层预览、验证报告、manifest、production self-validation、fsync、不可变提交和 registry 注册等真实阶段，并持续显示百分比和用时；文件选择前保持隐藏。完成页显示 store ID、prior-map ID、package/canonical SHA、楼层、源/有效/忽略元素和 warning 统计。
+- 新增共享 `RTABMapApp-QualifiedDevice` scheme：Run/Launch 使用 Release，Test/Analyze 使用 Debug，Profile/Archive 使用 Release；手动 Debug 继续故意不携带 build identity 并 fail closed。本日后续修复也把普通 `RTABMapApp` 的默认 Run/Launch 改为 Release，使两者都可从已提交且 tracked tree 干净的版本生成严格身份；不允许 `--allow-dirty` 或放宽 `MobileBuildIdentity.isUsable`。
 - 扫描启动改为可回滚 durable transaction：相机权限在 workflow commit 前完成；session-scoped streaming DB 跳过旧 `Documents/rtabmap.tmp.db` 异步 recovery continuation；host 启动成功后以 `O_EXCL|O_NOFOLLOW`、完整写、文件/目录 fsync 持久化 receipt，再以 workflow context v3 绑定 session、segment、database、map/store 和 receipt SHA。任一步失败或取消都会停止 CameraMobile/ARSession/mapping/clock、清 prior-map state、让 native core 脱离失败数据库并释放未提交会话，不能留下无 receipt 的“幽灵扫描”。
-- 地图库复审关闭 registry/manifest 全身份绑定、rebuild 单快照、正式 package descriptor/no-follow freeze 和异常 symlink 外部目标权限四组 P1。最终专项复审为 `P0=0 / P1=0`；聚焦 UX/build-identity/yaw 合同 27/27 PASS，Swift 核心长方法 1/1 PASS（1233.541 s），四张真实 XLSX 手机地图库链路 4/4 PASS，PC production validator 4/4 PASS，unsigned iphoneos Debug build PASS。真机重新安装、QualifiedDevice 设备运行、完整 discover、exact-final-SHA、Device Lab、LiDAR/现场矩阵仍未关闭，整体保持 **REJECTED / NO-GO / developer smoke only**。
+- 地图库复审关闭 registry/manifest 全身份绑定、rebuild 单快照、正式 package descriptor/no-follow freeze 和异常 symlink 外部目标权限四组 P1。最终专项复审为 `P0=0 / P1=0`；本日后续新增两项 UI/build-identity 合同后，聚焦 UX/build-identity/yaw 合同为 29/29 PASS；Swift 核心长方法 1/1 PASS（1233.541 s），四张真实 XLSX 手机地图库链路 4/4 PASS，PC production validator 4/4 PASS，此前 unsigned iphoneos Debug build PASS。真机重新安装、干净 Release 设备运行、完整 discover、exact-final-SHA、Device Lab、LiDAR/现场矩阵仍未关闭，整体保持 **REJECTED / NO-GO / developer smoke only**。
 
 - 修复真机 XLSX 地图导入的 `不安全的地图标识` 阻断：Swift/PC 新生成 `prior_map_id` 统一为先过滤原始 ASCII、再 ASCII lowercase、slug 最长 115、最终 ID 最长 128；同时拒绝 APFS 上旧 uppercase 目录与新 lowercase ID 的 case-fold 别名。旧 uppercase v2 包只保留只读 integrity 兼容，不自动改写 exact ID/SHA。
 - `map 2.xlsx` 与正式 MapCase02 source SHA 完全相同；修复后 MapCase02 ID 为 `piaseczno-5ddfac7dc439`、Swift package `8d3564ce68aadb087a2820a02b4747d15ea1f4d22b14e8776f913d33775b1b84`、PC package `41332d093e652ec2de94f0f86b8f15107cd6f67f3b2e5ddec1c0685ab4d7d3be`。Swift validation report 新增并强校验 road graph `node_count`/`edge_count`；Swift/Python 同步严格拒绝 v1/v2 manifest/report 计数中的 bool/integral-float、非数组 warnings/malformed rows，legacy v1 的 element statistics 与 visible/hidden 也重新派生，Python 外层测试直接以 production validator 验证 Swift 包。新增 `--xlsx-library-smoke`，MapCase02、TianHong、北京昌平与 Kohl's 四张真实地图全部通过 compile/integrity/install/register/list/exact-read。

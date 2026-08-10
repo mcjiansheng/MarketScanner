@@ -4,16 +4,16 @@
 
 ## 总体
 
-当前 UX/startup 修复分支为 `codex/fix-mobile-scan-ux-and-startup`，基线 `e6d2583e7c8bd59f2429003c21a4d2a29aeafd27`；此前冻结/候选分支未被修改。I10 final SHA `8f0e730d92773eea2ab58f56742d901ac02eead4` 的 exact-SHA run `31307753672` 为 7/8：P0、SHA/wave、ABI、Ubuntu/Windows native、Python/API/Web 与完整 macOS host 合同均 PASS，200k tag-evidence RSS 为 `794,099,712 < 805,306,368` bytes；唯一失败是 cold-cache iphoneos RTAB-Map 配置没有找到已生成在 `rtabmap/prebuild/bin/` 的宿主 `rtabmap-res_tool`，因此 simulator/device clean link 被跳过。I11 `37e6ed8c4afa00202693cd56919aea78fd4c7af5` 已在交叉编译前验证该宿主工具并通过 `RTABMAP_RES_TOOL` 显式绑定，G11 `7eef33e` 已绑定 implementation SHA；本地全新 host prebuild、全新 iOS CMake configure、Map Studio 109/109 和独立复审 `P0=0/P1=0` 均通过。新的 exact-SHA 8/8 前不冻结，当前发布判断仍为 **REJECTED / NO-GO / developer smoke only**。
+当前地图优先选择/默认真机 Run 修复分支为 `codex/fix-mobile-map-selection-debug-start`，基线为未修改的核心分支 `core-mobile-v1@36f606c1fa05e92210f0189c804dadd1b09721a1`；核心分支和此前冻结/候选分支均未修改。I10 final SHA `8f0e730d92773eea2ab58f56742d901ac02eead4` 的 exact-SHA run `31307753672` 为 7/8：P0、SHA/wave、ABI、Ubuntu/Windows native、Python/API/Web 与完整 macOS host 合同均 PASS，200k tag-evidence RSS 为 `794,099,712 < 805,306,368` bytes；唯一失败是 cold-cache iphoneos RTAB-Map 配置没有找到已生成在 `rtabmap/prebuild/bin/` 的宿主 `rtabmap-res_tool`，因此 simulator/device clean link 被跳过。I11 `37e6ed8c4afa00202693cd56919aea78fd4c7af5` 已在交叉编译前验证该宿主工具并通过 `RTABMAP_RES_TOOL` 显式绑定，G11 `7eef33e` 已绑定 implementation SHA；本地全新 host prebuild、全新 iOS CMake configure、Map Studio 109/109 和独立复审 `P0=0/P1=0` 均通过。新的 exact-SHA 8/8 前不冻结，当前发布判断仍为 **REJECTED / NO-GO / developer smoke only**。
 
 ## 2026-08-10 扫描 UX 与启动事务阻断级收口
 
-- 首页主入口、菜单“开始门店扫描”和“门店地图”现在使用一个地图库、一个配置页、一个 coordinator 和一个真实扫描 host；自由扫描/原始录制降级到“实验与兼容工具”。手机编译地图与正式 PC v2 package 是同一地图库的两种来源，不再维护两套楼层/起点/朝向/启动逻辑。
-- 地图编译显示实际阶段和完整结果；配置页支持 1×—8× zoom、pan、双击复位、方向键 0.1/0.5/1.0 m 微调，以及四方向和 ±15°朝向，不再使用 yaw slider。root/push 导航分别使用 Close 与系统 Back；返回会取消启动。
+- 首页“新建扫描”和菜单“开始门店扫描”现在先进入轻量地图选择页；用户可选择已注册地图或导入新地图，明确选择后才完整校验并加载该包。配置页只接收一张 immutable `selectedMap`，不再包含会导致每次切换都重复等待的地图 picker。手机编译地图与正式 PC v2 package 仍使用同一个地图库、配置页、coordinator 和真实扫描 host；自由扫描/原始录制降级到“实验与兼容工具”。
+- 地图编译显示实际阶段和完整结果；文件尚未选择时隐藏 0%、空进度条和计时，provider 返回文件并进入安全暂存后才显示。配置页支持 1×—8× zoom、pan、双击复位、方向键 0.1/0.5/1.0 m 微调，以及四方向和 ±15°朝向，不再使用 yaw slider。root/push 导航分别使用 Close 与系统 Back；返回会取消启动。
 - 主线程卡顿根因已关闭：地图库普通列表只读轻量 registry，完整 package I/O、PNG/JSON、localizer、会话和 native database preparation 在后台串行执行。主线程只处理短 UIKit/ARSession 事务。
 - 首次相机权限在 workflow commit 前完成；旧 tmp DB recovery continuation 不参与 canonical Mobile-Only；host/receipt/context/cancel 任一步失败都会强 rollback。start receipt 使用 `O_EXCL|O_NOFOLLOW`、完整写循环、file/dir fsync 和 SHA；workflow context v3 绑定 session/segment/database/map/store/receipt/checkpoint。
 - 地图库安全复审关闭 registry/manifest 身份不完整、rebuild 无上限预读和 pathname chmod 跟随符号链接三个 P1。完整 package load 绑定 name/floor/element/canonical/map/package；rebuild 使用同一有界 snapshot；freeze 使用 root FD、`fstatat/openat(O_NOFOLLOW)` 和 `fchmod(fd)`。
-- 聚焦 UX/geometry/build identity 自动测试 27/27 PASS；`IOSCoreContractTests.test_swift_workflow_state_and_se2_projection` 1/1 PASS（1233.541 s，含 map-library CAS 与 symlink 外部目标 mode 保护）；当前 unsigned generic iPhoneOS Debug build PASS。`RTABMapApp-QualifiedDevice` Release build 必须在本轮提交后、tracked tree 干净时重新执行，不能用 Debug build 代替。
+- 聚焦 UX/geometry/build identity 自动测试 29/29 PASS；`IOSCoreContractTests.test_swift_workflow_state_and_se2_projection` 1/1 PASS（1233.541 s，含 map-library CAS 与 symlink 外部目标 mode 保护）；当前修改的 unsigned generic iPhoneOS Debug 全量编译/链接 PASS，并明确验证 Debug 身份仍被移除。共享 `RTABMapApp` 的默认 Run/Launch 已改为 Release，`RTABMapApp-QualifiedDevice` 继续保持 Release；二者的最终干净无签名构建与真机安装必须在本轮提交后重新执行，不能用 Debug build 代替。
 
 新增明确 blocker：J-04 absolute-prior component identity 尚未关闭。最终 DB graph 可以由 node `mapID` 和 links 推导 component，但现行 constraint 写侧没有 atomic bound node/map ID，manual v3 也没有 RTAB-Map map ID；因此 reader 不能事后伪造 same-component 证明。需先完成正式 evidence schema 迁移，再进行 component 资格测试。
 

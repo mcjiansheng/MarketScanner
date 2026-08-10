@@ -1749,7 +1749,8 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
             options: .displayInline,
             children: [
             UIAction(title: localized("开始门店扫描"), image: UIImage(systemName: "camera.viewfinder"), attributes: actionNewScanEnabled ? [] : .disabled, handler: { _ in
-                self.presentMobileFlow(MobileScanSetupViewController())
+                self.presentMobileFlow(MobileMapLibraryViewController(
+                    purpose: .selectForScan))
             }),
             UIAction(title: localized("门店地图"), image: UIImage(systemName: "map"), handler: { _ in
                 self.presentMobileFlow(MobileMapLibraryViewController())
@@ -2844,11 +2845,11 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                 seconds: 4)
             return
         }
-        // The large primary action always enters the canonical full-phone
-        // store scan. Free mapping and raw recording remain available only
-        // under “实验与兼容工具”, and the production path does not
-        // bypass the canonical mobile-only coordinator.
-        presentMobileFlow(MobileScanSetupViewController())
+        // Select from the lightweight registry before loading a package.
+        // This avoids validating an arbitrary first map and then forcing the
+        // operator to wait again before choosing the intended store.
+        presentMobileFlow(MobileMapLibraryViewController(
+            purpose: .selectForScan))
     }
 
     private func preparePriorMapLocalization(
@@ -7397,8 +7398,8 @@ extension ViewController: MobileOnlyScanStarting {
         let identity = MobileBuildIdentity.loadFromBundle()
         guard identity.isUsable else {
             throw MobileOnlyWorkflowError.invalidState(
-                "当前构建没有可追踪身份；请使用 RTABMapApp-QualifiedDevice "
-                    + "scheme 从已提交且 tracked 文件干净的版本重新构建")
+                "当前构建没有可追踪身份；请使用 RTABMapApp 默认 Release Run "
+                    + "或 RTABMapApp-QualifiedDevice，从已提交且 tracked 文件干净的版本重新构建")
         }
 
         let entry = configuration.priorMap

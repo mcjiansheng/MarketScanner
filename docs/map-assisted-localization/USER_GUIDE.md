@@ -6,15 +6,15 @@
 
 ## 手机主流程：开始门店扫描
 
-1. 在首页点击大型“新建扫描”或右上角菜单的“开始门店扫描”。两处进入同一配置页。
-2. 选择地图库中的地图；如尚未导入，进入“门店地图”并从 `+` 选择 XLSX/CSV/JSON 或正式 PC v2 地图包。两种来源最终进入同一个地图库。
+1. 在首页点击大型“新建扫描”或右上角菜单的“开始门店扫描”。两处都先进入“选择门店地图”，不会自动加载列表第一张地图。
+2. 从轻量列表选择已导入地图，或点击页面下方“导入新地图”选择 XLSX/CSV/JSON 或正式 PC v2 地图包。确认使用哪张地图后，App 才验证并加载该地图并进入配置页；需要换图时点击 Back 返回列表。
 3. 手机编译地图时等待真实阶段进度；完成后检查 store ID、prior-map ID、package/canonical SHA、楼层、元素和警告统计。
 4. 选择楼层。在地图上捏合缩放、单指平移、双击放大/复位并点击起点；使用方向键按 0.1/0.5/1.0 m 微调；使用东/北/西/南和左右 15°设置朝向。
 5. 第一次使用相机时先完成系统权限授权。授权成功后 App 会重新执行地图、楼层、构建身份和权限校验；拒绝时不会建立扫描会话。
 6. 点击“开始扫描”。地图/localizer、会话目录、连续数据库和 sidecar 在后台准备；只有 ARSession、RTAB-Map、receipt 和 workflow context 都提交成功后才进入扫描。不要在启动进度中强退 App。
 7. 正常结束并等待落盘、数据库关闭和外部复制完成。
 
-普通 Debug 构建的 build identity 按设计不可用于正式扫描。真机扫描应从已提交且 tracked tree 干净的版本选择 `RTABMapApp-QualifiedDevice` scheme；该 scheme 的 Run 使用 Release。Debug 可用于地图导入和 UI smoke，但点击正式开始会 fail closed。
+共享 `RTABMapApp` scheme 的默认 Run 已使用 Release，因此从已提交且 tracked tree 干净的版本直接点击 Xcode Run 即会生成可追踪身份；也可以选择 `RTABMapApp-QualifiedDevice`。Test/Analyze 或手动改成 Debug 时仍只用于地图导入和 UI smoke，点击正式开始会 fail closed。
 
 ## 实验与兼容工具
 

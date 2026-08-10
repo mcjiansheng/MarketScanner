@@ -6,7 +6,7 @@
 
 ### 统一扫描 UX、启动事务和 build identity
 
-生产入口、线程边界、导航、相机权限、启动 receipt/context、取消/回滚、地图包单快照/descriptor freeze、zoom/nudge/discrete heading 和 QualifiedDevice scheme 使用以下聚焦组：
+生产入口、地图先选后载、导入进度可见性、线程边界、导航、相机权限、启动 receipt/context、取消/回滚、地图包单快照/descriptor freeze、zoom/nudge/discrete heading 和默认/QualifiedDevice Release scheme 使用以下聚焦组：
 
 ```bash
 python3 -m unittest \
@@ -16,9 +16,9 @@ python3 -m unittest \
   -v
 ```
 
-2026-08-10 当前源码结果为 **27/27 PASS**。它必须继续证明：首页和菜单不进入旧 `PriorMapWizardViewController`；地图库普通列表、完整刷新、provider copy/fsync、selected-package 加载和 scan-start preparation 不在主线程；手机编译地图与 PC v2 package 进入同一 registry/setup/coordinator；root Close 与 push Back 同时存在；首次权限在 workflow commit 前完成；旧 tmp-db recovery 不可绕过 receipt；取消/持久化失败会 rollback；地图设置支持 1×–8× zoom、方向键和离散朝向；普通 Debug 无 build identity，`RTABMapApp-QualifiedDevice` 的 Run 为 Release 且不存在 `--allow-dirty`。
+2026-08-10 当前源码结果为 **29/29 PASS**。它必须继续证明：首页和菜单不进入旧 `PriorMapWizardViewController`，而是先进入轻量地图选择页；用户可以导入新地图；配置页以 immutable required `selectedMap` 初始化，不自行列举地图、不自动加载第一张地图，也不存在 picker；文件选择前隐藏 0%、进度条和计时，进入 `.stagingMapSource` 后才显示；地图库普通列表、完整刷新、provider copy/fsync、selected-package 加载和 scan-start preparation 不在主线程；手机编译地图与 PC v2 package 进入同一 registry/setup/coordinator；root Close 与 push Back 同时存在；首次权限在 workflow commit 前完成；旧 tmp-db recovery 不可绕过 receipt；取消/持久化失败会 rollback；地图设置支持 1×–8× zoom、方向键和离散朝向；手动 Debug 无 build identity，共享 `RTABMapApp` 默认 Run 和 `RTABMapApp-QualifiedDevice` 的 Run 均为 Release，且不存在 `--allow-dirty`。
 
-Swift 核心可执行长方法 `IOSCoreContractTests.test_swift_workflow_state_and_se2_projection` 在当前改动上 **1/1 PASS（1233.541 s）**，覆盖 map-library CAS、register/rebuild/freeze/quarantine、异常 symlink 外部目标权限保护和 workflow/SE(2) 合同。该单个长方法、27 个源码/几何合同和 host XLSX smoke 均不能冒充完整 discover、真机交互延迟或现场扫描 PASS。
+Swift 核心可执行长方法 `IOSCoreContractTests.test_swift_workflow_state_and_se2_projection` 在核心基线上 **1/1 PASS（1233.541 s）**，覆盖 map-library CAS、register/rebuild/freeze/quarantine、异常 symlink 外部目标权限保护和 workflow/SE(2) 合同。该单个长方法、29 个源码/几何合同和 host XLSX smoke 均不能冒充完整 discover、真机交互延迟或现场扫描 PASS。
 
 ### MapCase02 冻结回归
 
@@ -63,13 +63,13 @@ node --check tools/SupermarketMapStudio/web/app.js
 git diff --check
 
 xcodebuild -quiet -project app/ios/RTABMapApp.xcodeproj \
-  -scheme RTABMapApp-QualifiedDevice -configuration Release \
+  -scheme RTABMapApp -configuration Release \
   -sdk iphoneos -destination generic/platform=iOS \
   -derivedDataPath /private/tmp/marketscanner-derived \
   CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build
 ```
 
-普通 UI/导入 smoke 可另用 `RTABMapApp` Debug；该构建按设计删除 `MarketScannerBuildIdentity.json`，不得用于开始正式 prior-map 扫描。QualifiedDevice Release 构建必须在所有 tracked 代码与当前文档已提交、tracked tree 干净时执行；无签名 generic-device build 只证明编译/链接和 build-identity 生成，不证明真机权限、相机、LiDAR 或现场流程。
+普通共享 `RTABMapApp` 的默认 Run 已是 Release；如需 UI/导入 smoke，可手动把构建配置切到 Debug，该构建按设计删除 `MarketScannerBuildIdentity.json`，不得用于开始正式 prior-map 扫描。默认 `RTABMapApp` 或 `RTABMapApp-QualifiedDevice` 的 Release 构建都必须在所有 tracked 代码与当前文档已提交、tracked tree 干净时执行；无签名 generic-device build只证明编译/链接和 build-identity 生成，不证明真机权限、相机、LiDAR 或现场流程。
 
 覆盖：
 

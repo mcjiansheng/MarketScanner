@@ -29,14 +29,14 @@ macOS 使用 `tools/SupermarketMapStudio/configure_pc_macos.sh` 安装/发现 Ho
 
 `wave`、`branch`、`base_branch` 只接受 `^[a-z0-9][a-z0-9._-]{0,127}$`，当前 RC `mobile-only-v1-release-candidate-blocker-closeout` 是合法值，不得再用历史 `mobile-only-v1r4-` 前缀判断当前 wave。`app_git_sha`、`base_sha` 及已绑定的 implementation/validation SHA 必须是 40 位小写十六进制，`native_core_sha256` 必须是 64 位小写十六进制。implementation/validation 提交尚未产生时，Python 生成/治理验证阶段分别只允许精确占位符 `<CODE_CONTRACT_TEST_BUILD_SHA>` 和 `<EVIDENCE_DOCS_SHA>`；任意其他占位文本均 fail closed。Swift `MobileBuildIdentity` 可加载该 exact schema 供诊断，但运行时 `isUsable` 要求 implementation/validation 两个字段均已绑定为 40 位小写 SHA；包含任一占位符的 App 都不得进入 eligible processing session。
 
-普通共享 `RTABMapApp` scheme 的 Run、Test 和 Analyze 使用 Debug；Profile 和 Archive 保持 Release。Debug 构建允许在开发中的脏工作区完成编译和启动，但构建阶段会删除目标 App 中可能残留的 `MarketScannerBuildIdentity.json`，不会用 `--allow-dirty` 伪造可用身份。因此 Debug App 可以执行普通 UI、相机和 native 调试，但 `MobileBuildIdentity.isUsable` 保持失败，移动端先验地图扫描和可发布处理路径继续 fail closed。
+普通共享 `RTABMapApp` scheme 的 Run、Profile 和 Archive 使用 Release；Test 和 Analyze 使用 Debug。这样开发者从 Xcode 默认直接 Run 到真机时会执行统一 build-identity 生成与验证，不再安装一个必然被扫描入口拒绝的 Debug App。手动 Debug、Test 和 Analyze 仍删除目标 App 中可能残留的 `MarketScannerBuildIdentity.json`，不会用 `--allow-dirty` 伪造可用身份；其 `MobileBuildIdentity.isUsable` 继续失败，只用于 UI、导入和调试。
 
-真机运行需要可用 build identity 时，必须在 Xcode scheme 选择器中改用共享的 `RTABMapApp-QualifiedDevice`。该 scheme 的 Run/Launch 明确使用 Release，因而执行统一 build-identity 生成和验证阶段；它没有任何 `allow-dirty` 旁路。运行前必须提交所有 tracked 代码和当前权威文档，确认 governance descriptor 中的 implementation/validation SHA 已完成绑定，并保持 tracked tree 干净。生成器会把当前 exact HEAD 和 native core digest 写入 App bundle；任一身份字段不合法、tracked tree 有未提交修改或生成后复核不一致，构建都会 fail closed。
+真机运行需要可用 build identity 时，可以直接使用共享 `RTABMapApp` 的默认 Run，也可以显式选择 `RTABMapApp-QualifiedDevice`；二者的 Launch 都使用 Release，执行同一个 build-identity 生成和验证阶段，且都没有 `allow-dirty` 旁路。运行前必须提交所有 tracked 代码和当前权威文档，确认 governance descriptor 中的 implementation/validation SHA 已完成绑定，并保持 tracked tree 干净。生成器会把当前 exact HEAD 和 native core digest 写入 App bundle；任一身份字段不合法、tracked tree 有未提交修改或生成后复核不一致，构建都会 fail closed。
 
 推荐真机步骤：
 
 1. 提交本轮代码、测试和当前文档，确认 `git status --porcelain --untracked-files=no` 无输出。
-2. 在 Xcode 顶部选择 `RTABMapApp-QualifiedDevice` 和目标 iPhone。
+2. 在 Xcode 顶部选择默认 `RTABMapApp`（或 `RTABMapApp-QualifiedDevice`）和目标 iPhone。
 3. 执行 Product → Clean Build Folder，然后 Run。
 4. 从构建日志确认 `build identity verified`，再进行先验地图扫描或可发布处理验证。
 
@@ -52,7 +52,7 @@ xcodebuild \
   clean build
 ```
 
-Debug 与 QualifiedDevice 使用同一 target 和 Bundle ID；再次用普通 Debug scheme 安装会替换设备上的 QualifiedDevice App，并按合同移除 build identity。若设备端随后报告 `app build identity unknown`，应先确认当前 Run scheme 是 `RTABMapApp-QualifiedDevice`，再 clean build；不得通过修改身份 JSON、使用 `--allow-dirty` 或放宽 `MobileBuildIdentity.isUsable` 绕过。Release、Profile、Archive 和 QualifiedDevice 仍调用同一生成器并严格拒绝脏 tracked tree；资格验证必须始终绑定已提交的干净精确 SHA。
+手动 Debug 与 Release Run 使用同一 target 和 Bundle ID；再次安装手动 Debug 会替换设备上的 Release App，并按合同移除 build identity。若设备端随后报告 `app build identity unknown`，应确认当前 Launch configuration 是默认 `RTABMapApp` Release 或 `RTABMapApp-QualifiedDevice`，再 clean build；不得通过修改身份 JSON、使用 `--allow-dirty` 或放宽 `MobileBuildIdentity.isUsable` 绕过。Release、Profile、Archive 和 QualifiedDevice 仍调用同一生成器并严格拒绝脏 tracked tree；资格验证必须始终绑定已提交的干净精确 SHA。
 
 ## iOS native dependency cache
 

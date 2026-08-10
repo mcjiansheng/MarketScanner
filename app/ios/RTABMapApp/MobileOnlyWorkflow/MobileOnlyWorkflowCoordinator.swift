@@ -547,8 +547,8 @@ final class MobileOnlyWorkflowCoordinator {
         }
         guard buildIdentity?.isUsable == true else {
             fail(with: .invalidState(
-                "当前构建没有可追踪身份；请使用 RTABMapApp-QualifiedDevice "
-                    + "scheme 从已提交且 tracked 文件干净的版本重新构建"))
+                "当前构建没有可追踪身份；请使用 RTABMapApp 默认 Release Run "
+                    + "或 RTABMapApp-QualifiedDevice，从已提交且 tracked 文件干净的版本重新构建"))
             return
         }
         guard onStartScan != nil, onRollbackScan != nil else {

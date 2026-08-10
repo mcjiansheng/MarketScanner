@@ -24,9 +24,32 @@ class MobileScanUXContractTests(unittest.TestCase):
         start = source.index("private func presentNewScanModePicker()")
         end = source.index("private func preparePriorMapLocalization", start)
         route = source[start:end]
-        self.assertIn("presentMobileFlow(MobileScanSetupViewController())", route)
+        self.assertIn("MobileMapLibraryViewController(", route)
+        self.assertIn("purpose: .selectForScan", route)
+        self.assertNotIn("MobileScanSetupViewController", route)
         self.assertNotIn("PriorMapWizardViewController", route)
         self.assertNotIn("self.newScan(configuration:", route)
+
+    def test_scan_selection_precedes_exact_package_loading(self) -> None:
+        library = self.source(
+            "app/ios/RTABMapApp/MobileOnlyWorkflow/UI/"
+            "MobileMapLibraryViewController.swift"
+        )
+        setup = self.source(
+            "app/ios/RTABMapApp/MobileOnlyWorkflow/UI/"
+            "MobileScanSetupViewController.swift"
+        )
+        self.assertIn("case selectForScan", library)
+        self.assertIn('importButton.setTitle("导入新地图"', library)
+        self.assertIn('title = purpose == .selectForScan ? "选择门店地图"', library)
+        self.assertIn("MobileScanSetupViewController(", library)
+        self.assertIn("selectedMap: maps[indexPath.row]", library)
+        self.assertIn("private let selectedMap: MobileMapLibrary.MapEntry", setup)
+        self.assertIn("init(selectedMap: MobileMapLibrary.MapEntry)", setup)
+        self.assertIn("loadMap(selectedMap)", setup)
+        self.assertNotIn("MobileMapLibrary.listRegisteredMaps()", setup)
+        self.assertNotIn("UIPickerViewDataSource", setup)
+        self.assertNotIn("private let mapPicker", setup)
 
     def test_map_library_and_setup_keep_heavy_io_off_main(self) -> None:
         library = self.source(
@@ -108,7 +131,7 @@ class MobileScanUXContractTests(unittest.TestCase):
         self.assertIn("installVerifiedPackage", library_ui)
         self.assertIn("static func installVerifiedPackage", library)
         self.assertIn("let entry = try register(", library)
-        self.assertIn("MobileScanSetupViewController()", library_ui)
+        self.assertIn("MobileScanSetupViewController(selectedMap:", library_ui)
 
     def test_scan_start_reuses_one_prepared_package(self) -> None:
         coordinator = self.source(
@@ -271,6 +294,24 @@ class MobileScanUXContractTests(unittest.TestCase):
             self.assertIn(stage, compiler)
         self.assertIn("bounded * 0.62", coordinator)
         self.assertIn("地图已编译、验证并注册", coordinator)
+
+    def test_import_progress_is_hidden_until_a_file_is_selected(self) -> None:
+        importer = self.source(
+            "app/ios/RTABMapApp/MobileOnlyWorkflow/UI/"
+            "MobileMapImportViewController.swift"
+        )
+        self.assertIn("percentLabel.isHidden = true", importer)
+        self.assertIn("progressView.isHidden = true", importer)
+        self.assertIn("elapsedLabel.isHidden = true", importer)
+        self.assertIn("case .stagingMapSource:", importer)
+        staging = importer.index("case .stagingMapSource:")
+        importing = importer.index("case .importingMap:", staging)
+        self.assertIn("setProgressUIVisible(true)", importer[staging:importing])
+        tap_start = importer.index("@objc private func importTapped()")
+        status_start = importer.index("private func updateStatus", tap_start)
+        tap = importer[tap_start:status_start]
+        self.assertIn("setProgressUIVisible(false)", tap)
+        self.assertNotIn("startElapsedTimer()", tap)
 
 
 if __name__ == "__main__":

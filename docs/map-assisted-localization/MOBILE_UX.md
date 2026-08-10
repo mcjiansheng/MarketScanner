@@ -4,18 +4,18 @@
 
 ## 主入口与地图库
 
-- 首页大型“新建扫描”和菜单首项“开始门店扫描”直接打开统一配置页，不再先展示自由扫描/已有地图辅助扫描二选一弹窗。
-- “门店地图”管理同一个地图库。手机现场编译的 XLSX/CSV/JSON 与 PC 生成的正式 v2 prior-map package 在完成严格验证后都注册到该地图库，并进入同一个配置页、同一个 coordinator 和同一个真实扫描 host。
+- 首页大型“新建扫描”和菜单首项“开始门店扫描”先打开轻量地图选择页，不再自动验证并加载 registry 第一张地图。用户可选择已注册地图或直接点击“导入新地图”；确认后才加载 exact package 并进入配置页。
+- “门店地图”和扫描选择页使用同一个地图库。手机现场编译的 XLSX/CSV/JSON 与 PC 生成的正式 v2 prior-map package 在完成严格验证后都注册到该地图库，并进入同一个配置页、同一个 coordinator 和同一个真实扫描 host。
 - 自由扫描建图和原始数据录制保留在“实验与兼容工具”，用于旧流程回归和诊断，不是发布版主要作业入口。NFC 入口继续保持关闭。
-- 从首页直接打开的配置页显示“关闭”；从地图库 push 打开的配置页保留系统返回按钮和返回手势。页面离开时会取消 queued/running 启动 operation；已成功进入 scanning 后不会误取消。
+- 地图选择页作为 modal root 显示“关闭”；配置页总是由选择页 push，保留系统返回按钮和返回手势。需要换图时先返回选择页，不在配置页内触发另一张地图的完整加载。页面离开时会取消 queued/running 启动 operation；已成功进入 scanning 后不会误取消。
 
 ## 统一扫描配置
 
-1. **选择地图**：后台读取 registry；若从地图库某条记录进入，则后台完整验证 exact package。不会在主线程逐包解析 JSON/PNG。
+1. **选择地图**：选择页后台只读轻量 registry，并提供导入入口；点击一条记录后才后台完整验证 exact package。配置页以 immutable initializer 绑定这一张地图，不包含地图 picker，也不会在主线程逐包解析 JSON/PNG。
 2. **选择楼层**：显示所选楼层的独立预览；本次扫描固定绑定该楼层，扫描中不能切层或跨楼层定位。同一楼层内少量坡道/地面起伏不影响二维先验位置。
 3. **确认起点**：地图支持 1×—8× pinch zoom、单指平移、双击放大/复位和点击选点。起点可以用上/下/左/右方向键微调，步长可选 0.1 m、0.5 m 或 1.0 m。
 4. **确认朝向**：使用东 0°、北 90°、西 180°、南 270°和左/右 15°微调；不再使用横向滑杆。方向箭头按地图坐标系实时更新。
-5. **启动门**：完整绑定 registry 与 manifest 的 name、floor count、element count、canonical source SHA、prior-map ID、package SHA 和 store ID。普通 Debug 构建只允许 UI/导入 smoke；正式开始扫描使用 `RTABMapApp-QualifiedDevice` Release Run。
+5. **启动门**：完整绑定 registry 与 manifest 的 name、floor count、element count、canonical source SHA、prior-map ID、package SHA 和 store ID。共享 `RTABMapApp` 默认 Run 与 `RTABMapApp-QualifiedDevice` 都使用 Release 并生成严格身份；Test/Analyze 或手动 Debug 构建仍只允许 UI/导入 smoke。
 6. **相机权限**：`.authorized` 才允许 workflow begin/commit；首次 `.notDetermined` 先请求权限，授权后重新走整个正式入口，拒绝/受限则恢复交互并提供“打开设置”。host 不允许旧 `startCamera()` permission callback 在 workflow 失败后自行启动。
 7. **开始扫描**：localizer、会话目录、连续 SQLite 数据库和 sidecar probe 在 workflow 串行后台队列准备；主线程只安装 UI/localizer、启动 ARSession/CameraMobile 并切换 mapping。ARSession、RTAB-Map、sidecar、receipt 和 workflow context 全部 durable commit 后才进入 `.scanning`。
 
@@ -59,5 +59,5 @@
 - 二维 HUD 忽略 ARKit 竖直高度；原始连续数据库仍保留三维运动。
 - 当前扫描绑定一个楼层，不支持楼梯、电梯或其他跨楼层过程。
 - 预定路线编辑和无条件全图搜索仍属于后续增强；当前只在持续 weak/lost 或可靠闭环后启用有界恢复。
-- unsigned iPhoneOS Debug build、聚焦 UX/权限/receipt/地图库合同和完整 Swift host 已通过；真实 `RTABMapApp-QualifiedDevice` 安装后的触控 p50/p95、首次权限、后台/前台、完整扫描和设备热/内存表现仍需真机复测。
+- 当前修改的 unsigned iPhoneOS Debug 全量编译/链接、聚焦 UX/权限/receipt/地图库合同和完整 Swift host 已通过；Debug 日志确认身份仍被移除。默认 `RTABMapApp` Release Run 或 `RTABMapApp-QualifiedDevice` 安装后的触控 p50/p95、首次权限、后台/前台、完整扫描和设备热/内存表现仍需真机复测。
 - 真实 LiDAR iPhone 的 30 秒性能、照明/反光/斜视/多价签矩阵和完整现场确认尚未执行；低影响增强与明日测试见 [`ESL_CAPTURE_TODO.md`](ESL_CAPTURE_TODO.md) 与 [`MAPCASE02_TODO.md`](MAPCASE02_TODO.md)。当前不得宣称 ESL FIELD CAPTURE UX COMPLETE 或 Production Ready。
