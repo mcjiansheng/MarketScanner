@@ -7,6 +7,7 @@
 //
 
 import Foundation
+import Darwin
 
 struct PriceTagRecord: Codable {
     let id: Int
@@ -1013,78 +1014,254 @@ final class SupermarketScanSession {
         guard let exportBaseDirectory = destinationBaseDirectory ?? customBaseDirectory else {
             return nil
         }
+        return try Self.exportFinalizedCapture(
+            from: localCaptureDirectory,
+            localDocumentsDirectory: documentsDirectory,
+            destinationBaseDirectory: exportBaseDirectory,
+            expectedTrackingSessionID: trackingSessionId,
+            sidecarWriter: sidecarWriter)
+    }
 
-        let sessionDirectoryName = localCaptureDirectory.deletingLastPathComponent().lastPathComponent
-        let exportRoot = exportBaseDirectory.appendingPathComponent(sessionDirectoryName, isDirectory: true)
-        // `segment_0001` remains an on-disk schema compatibility name. A
-        // continuous capture never rolls over to a second directory.
-        let exportCapture = exportRoot.appendingPathComponent(localCaptureDirectory.lastPathComponent, isDirectory: true)
+    /// Exports a finalized historical scan without requiring the session to
+    /// remain the active in-memory `SupermarketScanSession`. This is also the
+    /// shared implementation used by scan-finalization background copies.
+    ///
+    /// The source remains on device. The method independently revalidates the
+    /// finalized identity, rejects live/multi-segment/symlink/hardlink input,
+    /// copies into a collision-free package directory, and compares SHA-256
+    /// manifests before and after the provider copy. Call from a background
+    /// queue after obtaining security-scoped access to the destination.
+    @discardableResult
+    static func exportFinalizedCapture(
+        from localCaptureDirectory: URL,
+        localDocumentsDirectory: URL,
+        destinationBaseDirectory: URL,
+        expectedTrackingSessionID: String,
+        sidecarWriter: ScanSidecarFileWriting = FoundationScanSidecarWriter(),
+        progress: ((Double, String) -> Void)? = nil
+    ) throws -> URL {
+        let fileManager = FileManager.default
+        let sessionDirectory = localCaptureDirectory.deletingLastPathComponent()
+        let sessionDirectoryName = sessionDirectory.lastPathComponent
+        progress?(0.04, "正在校验历史扫描身份…")
+
+        guard sessionDirectoryName.hasPrefix("SupermarketSession-"),
+              localCaptureDirectory.lastPathComponent == "segment_0001",
+              sessionDirectory.deletingLastPathComponent().standardizedFileURL
+                == localDocumentsDirectory.standardizedFileURL,
+              localCaptureDirectory.deletingLastPathComponent().standardizedFileURL
+                == sessionDirectory.standardizedFileURL,
+              !expectedTrackingSessionID.isEmpty else {
+            throw NSError(
+                domain: "SupermarketScanSession",
+                code: 50,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "Refused to export a scan outside the finalized local-session layout."])
+        }
+        try SafeSessionPath.validateDirectory(
+            sessionDirectory,
+            within: localDocumentsDirectory)
+        try SafeSessionPath.validateDirectory(
+            localCaptureDirectory,
+            within: sessionDirectory)
+        let segmentNames = try fileManager.contentsOfDirectory(
+            at: sessionDirectory,
+            includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey],
+            options: [.skipsHiddenFiles])
+            .filter { $0.lastPathComponent.hasPrefix("segment_") }
+            .map(\.lastPathComponent)
+            .sorted()
+        guard segmentNames == ["segment_0001"] else {
+            throw NSError(
+                domain: "SupermarketScanSession",
+                code: 51,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "Only one finalized continuous segment can be exported automatically."])
+        }
+
+        let metadataURL = localCaptureDirectory.appendingPathComponent(
+            "metadata.json")
+        let metadataSnapshot = try SafeSessionPath.readRegularFile(
+            metadataURL,
+            within: sessionDirectory,
+            maximumBytes: 1024 * 1024)
+        let metadata = try StrictJSONDocumentParser.object(
+            from: metadataSnapshot.data,
+            limits: StrictJSONDocumentLimits(
+                maximumBytes: metadataSnapshot.data.count + 1))
+        guard metadata["finalized"] as? Bool == true,
+              metadata["scanMode"] as? String == "continuous_streaming",
+              metadata["trackingSessionId"] as? String
+                == expectedTrackingSessionID else {
+            throw NSError(
+                domain: "SupermarketScanSession",
+                code: 52,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "The historical scan is not finalized or its tracking identity changed."])
+        }
+        guard !fileManager.fileExists(atPath: localCaptureDirectory
+                .appendingPathComponent("live_checkpoint.json").path) else {
+            throw NSError(
+                domain: "SupermarketScanSession",
+                code: 53,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "The scan still has a live checkpoint and cannot be exported as finalized."])
+        }
+        let databaseURL = localCaptureDirectory.appendingPathComponent(
+            "rtabmap_segment_0001.db")
+        var databaseMetadata = stat()
+        guard lstat(databaseURL.path, &databaseMetadata) == 0,
+              (databaseMetadata.st_mode & S_IFMT) == S_IFREG,
+              databaseMetadata.st_nlink == 1 else {
+            throw NSError(
+                domain: "SupermarketScanSession",
+                code: 54,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "The finalized scan database is missing, linked, or unsafe to export."])
+        }
+
+        let destinationValues = try destinationBaseDirectory.resourceValues(
+            forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+        guard destinationValues.isDirectory == true,
+              destinationValues.isSymbolicLink != true else {
+            throw NSError(
+                domain: "SupermarketScanSession",
+                code: 55,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "The selected export destination is not a real directory."])
+        }
+
+        progress?(0.12, "正在计算原始扫描校验清单…")
         let localManifestBeforeCopy = try CaptureDirectoryIntegrity.manifest(
             for: localCaptureDirectory,
             fileManager: fileManager)
-        try fileManager.createDirectory(at: exportRoot, withIntermediateDirectories: true)
-        if fileManager.fileExists(atPath: exportCapture.path) {
-            try fileManager.removeItem(at: exportCapture)
-        }
-        try fileManager.copyItem(at: localCaptureDirectory, to: exportCapture)
-        let exportManifest = try CaptureDirectoryIntegrity.manifest(
-            for: exportCapture,
-            fileManager: fileManager)
-        let localManifestAfterCopy = try CaptureDirectoryIntegrity.manifest(
-            for: localCaptureDirectory,
-            fileManager: fileManager)
-        guard localManifestBeforeCopy == exportManifest,
-              localManifestBeforeCopy == localManifestAfterCopy else {
+        guard !localManifestBeforeCopy.isEmpty else {
             throw NSError(
                 domain: "SupermarketScanSession",
-                code: 1,
-                userInfo: [NSLocalizedDescriptionKey: NSLocalizedString("External copy SHA-256 verification failed or the source changed during copying. The local scan was kept.", comment: "Scan copy verification error")])
+                code: 56,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "The finalized scan contains no exportable files."])
         }
-        let packageId = UUID().uuidString.lowercased()
-        let packageContentSha256 = try CaptureDirectoryIntegrity.manifestSHA256(
-            exportManifest)
-        let receipt = ExternalCopyVerificationReceipt(
-            format: "MarketScannerExternalCopyVerification",
-            version: 2,
-            packageId: packageId,
-            sessionId: trackingSessionId,
-            verifiedAtUnix: Date().timeIntervalSince1970,
-            providerDisplayName: exportBaseDirectory.lastPathComponent,
-            sourceRelativePath: localCaptureDirectory.lastPathComponent,
-            destinationRelativePath:
-                "\(sessionDirectoryName)/\(exportCapture.lastPathComponent)",
-            files: exportManifest,
-            packageContentSha256: packageContentSha256,
-            localCopyRetained: true,
-            durabilityBoundary:
-                "provider_copy_closed_and_reread_no_power_loss_guarantee")
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        try sidecarWriter.writeAtomic(
-            try encoder.encode(receipt),
-            to: exportRoot.appendingPathComponent(
-                "copy_verification.json"))
-        let receiptAndCaptureManifest = try CaptureDirectoryIntegrity.manifest(
-            for: exportRoot,
+
+        let exportRoot = uniqueExternalExportRoot(
+            baseDirectory: destinationBaseDirectory,
+            sessionDirectoryName: sessionDirectoryName,
             fileManager: fileManager)
-        let packageManifest = ExternalCopyPackageManifest(
-            format: "MarketScannerExternalCopyPackageManifest",
-            version: 1,
-            packageId: packageId,
-            sessionId: trackingSessionId,
-            providerDisplayName: exportBaseDirectory.lastPathComponent,
-            packageContentSha256: try CaptureDirectoryIntegrity.manifestSHA256(
-                receiptAndCaptureManifest),
-            files: receiptAndCaptureManifest,
-            localCopyRetained: true,
-            durabilityQualificationStatus: "not_executed",
-            durabilityExperimentHook:
-                "reconnect_or_power_cycle_provider_then_rehash_manifest_on_real_device")
-        try sidecarWriter.writeAtomic(
-            try encoder.encode(packageManifest),
-            to: exportRoot.appendingPathComponent(
-                "copy_package_manifest.json"))
-        return exportCapture
+        let exportCapture = exportRoot.appendingPathComponent(
+            localCaptureDirectory.lastPathComponent,
+            isDirectory: true)
+        var exportRootCreated = false
+        do {
+            progress?(0.28, "正在复制完整原始扫描…")
+            try fileManager.createDirectory(
+                at: exportRoot,
+                withIntermediateDirectories: false)
+            exportRootCreated = true
+            try fileManager.copyItem(
+                at: localCaptureDirectory,
+                to: exportCapture)
+
+            progress?(0.74, "正在复核导出文件 SHA-256…")
+            let exportManifest = try CaptureDirectoryIntegrity.manifest(
+                for: exportCapture,
+                fileManager: fileManager)
+            let localManifestAfterCopy = try CaptureDirectoryIntegrity.manifest(
+                for: localCaptureDirectory,
+                fileManager: fileManager)
+            guard localManifestBeforeCopy == exportManifest,
+                  localManifestBeforeCopy == localManifestAfterCopy else {
+                throw NSError(
+                    domain: "SupermarketScanSession",
+                    code: 1,
+                    userInfo: [NSLocalizedDescriptionKey: NSLocalizedString(
+                        "External copy SHA-256 verification failed or the source changed during copying. The local scan was kept.",
+                        comment: "Scan copy verification error")])
+            }
+
+            progress?(0.90, "正在写入导出验证凭证…")
+            let packageId = UUID().uuidString.lowercased()
+            let packageContentSha256 = try CaptureDirectoryIntegrity
+                .manifestSHA256(exportManifest)
+            let receipt = ExternalCopyVerificationReceipt(
+                format: "MarketScannerExternalCopyVerification",
+                version: 2,
+                packageId: packageId,
+                sessionId: expectedTrackingSessionID,
+                verifiedAtUnix: Date().timeIntervalSince1970,
+                providerDisplayName: destinationBaseDirectory.lastPathComponent,
+                sourceRelativePath:
+                    "\(sessionDirectoryName)/\(localCaptureDirectory.lastPathComponent)",
+                destinationRelativePath:
+                    "\(exportRoot.lastPathComponent)/\(exportCapture.lastPathComponent)",
+                files: exportManifest,
+                packageContentSha256: packageContentSha256,
+                localCopyRetained: true,
+                durabilityBoundary:
+                    "provider_copy_closed_and_reread_no_power_loss_guarantee")
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+            try sidecarWriter.writeAtomic(
+                try encoder.encode(receipt),
+                to: exportRoot.appendingPathComponent(
+                    "copy_verification.json"))
+            let receiptAndCaptureManifest = try CaptureDirectoryIntegrity
+                .manifest(for: exportRoot, fileManager: fileManager)
+            let packageManifest = ExternalCopyPackageManifest(
+                format: "MarketScannerExternalCopyPackageManifest",
+                version: 1,
+                packageId: packageId,
+                sessionId: expectedTrackingSessionID,
+                providerDisplayName: destinationBaseDirectory.lastPathComponent,
+                packageContentSha256: try CaptureDirectoryIntegrity
+                    .manifestSHA256(receiptAndCaptureManifest),
+                files: receiptAndCaptureManifest,
+                localCopyRetained: true,
+                durabilityQualificationStatus: "not_executed",
+                durabilityExperimentHook:
+                    "reconnect_or_power_cycle_provider_then_rehash_manifest_on_real_device")
+            try sidecarWriter.writeAtomic(
+                try encoder.encode(packageManifest),
+                to: exportRoot.appendingPathComponent(
+                    "copy_package_manifest.json"))
+            progress?(1.0, "原始历史扫描已导出并通过校验")
+            exportRootCreated = false
+            return exportCapture
+        } catch {
+            if exportRootCreated {
+                try? fileManager.removeItem(at: exportRoot)
+            }
+            throw error
+        }
+    }
+
+    private static func uniqueExternalExportRoot(
+        baseDirectory: URL,
+        sessionDirectoryName: String,
+        fileManager: FileManager
+    ) -> URL {
+        let preferred = baseDirectory.appendingPathComponent(
+            sessionDirectoryName,
+            isDirectory: true)
+        guard fileManager.fileExists(atPath: preferred.path) else {
+            return preferred
+        }
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.calendar = Calendar(identifier: .gregorian)
+        formatter.dateFormat = "yyyyMMdd-HHmmss"
+        let baseName = sessionDirectoryName + "-Export-"
+            + formatter.string(from: Date())
+        var candidate = baseDirectory.appendingPathComponent(
+            baseName,
+            isDirectory: true)
+        var index = 2
+        while fileManager.fileExists(atPath: candidate.path) {
+            candidate = baseDirectory.appendingPathComponent(
+                "\(baseName)-\(index)",
+                isDirectory: true)
+            index += 1
+        }
+        return candidate
     }
 
     /// Device-qualification hook. Call only after the named real provider

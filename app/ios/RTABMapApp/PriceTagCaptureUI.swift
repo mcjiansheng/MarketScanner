@@ -134,6 +134,8 @@ final class PriceTagCaptureOverlayView: UIView {
     private let payloadLabel = UILabel()
     private let cancelButton = UIButton(type: .system)
     private let progressView = UIProgressView(progressViewStyle: .default)
+    private let scanTopGuide = UILayoutGuide()
+    private let scanBottomGuide = UILayoutGuide()
 
     override init(frame: CGRect) {
         super.init(frame: frame)
@@ -178,6 +180,12 @@ final class PriceTagCaptureOverlayView: UIView {
         progressView.progressTintColor = .systemGreen
         addSubview(progressView)
 
+        // The guides share the same normalized geometry as the border and
+        // Vision ROI. Labels therefore remain outside the scan box on every
+        // supported device height and Dynamic Type size.
+        addLayoutGuide(scanTopGuide)
+        addLayoutGuide(scanBottomGuide)
+
         cancelButton.translatesAutoresizingMaskIntoConstraints = false
         cancelButton.setTitle(NSLocalizedString("Cancel ESL scan", comment: ""), for: .normal)
         cancelButton.titleLabel?.font = .preferredFont(forTextStyle: .headline)
@@ -191,15 +199,33 @@ final class PriceTagCaptureOverlayView: UIView {
         addSubview(cancelButton)
 
         NSLayoutConstraint.activate([
+            scanTopGuide.topAnchor.constraint(equalTo: topAnchor),
+            scanTopGuide.heightAnchor.constraint(
+                equalTo: heightAnchor,
+                multiplier: PriceTagCaptureLayout.normalizedScanRect.minY),
+            scanBottomGuide.topAnchor.constraint(equalTo: topAnchor),
+            scanBottomGuide.heightAnchor.constraint(
+                equalTo: heightAnchor,
+                multiplier: PriceTagCaptureLayout.normalizedScanRect.maxY),
             statusLabel.leadingAnchor.constraint(equalTo: safeAreaLayoutGuide.leadingAnchor, constant: 24),
             statusLabel.trailingAnchor.constraint(equalTo: safeAreaLayoutGuide.trailingAnchor, constant: -24),
-            statusLabel.bottomAnchor.constraint(equalTo: centerYAnchor, constant: -120),
+            statusLabel.topAnchor.constraint(
+                greaterThanOrEqualTo: safeAreaLayoutGuide.topAnchor,
+                constant: 12),
+            statusLabel.bottomAnchor.constraint(
+                equalTo: scanTopGuide.bottomAnchor,
+                constant: -PriceTagCaptureLayout.statusClearancePoints),
             payloadLabel.leadingAnchor.constraint(equalTo: safeAreaLayoutGuide.leadingAnchor, constant: 24),
             payloadLabel.trailingAnchor.constraint(equalTo: safeAreaLayoutGuide.trailingAnchor, constant: -24),
-            payloadLabel.topAnchor.constraint(equalTo: centerYAnchor, constant: 92),
+            payloadLabel.topAnchor.constraint(
+                equalTo: scanBottomGuide.bottomAnchor,
+                constant: PriceTagCaptureLayout.payloadClearancePoints),
             progressView.leadingAnchor.constraint(equalTo: safeAreaLayoutGuide.leadingAnchor, constant: 52),
             progressView.trailingAnchor.constraint(equalTo: safeAreaLayoutGuide.trailingAnchor, constant: -52),
             progressView.topAnchor.constraint(equalTo: payloadLabel.bottomAnchor, constant: 14),
+            progressView.bottomAnchor.constraint(
+                lessThanOrEqualTo: cancelButton.topAnchor,
+                constant: -20),
             cancelButton.centerXAnchor.constraint(equalTo: centerXAnchor),
             cancelButton.bottomAnchor.constraint(equalTo: safeAreaLayoutGuide.bottomAnchor, constant: -24),
             cancelButton.heightAnchor.constraint(greaterThanOrEqualToConstant: 50),

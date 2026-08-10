@@ -2,6 +2,14 @@
 
 > 文档状态：**当前有效**。最后核对日期：2026-08-10。
 
+## 2026-08-10 — 历史扫描校验/导出、ESL 布局与 Xcode 启动假故障修复
+
+- 修复真机“处理历史扫描”在 snapshot 复核阶段报 `cannot open snapshot DB read-only`。根因是 iOS App sandbox 不保证 SQLite VFS 能通过 `/dev/fd/<descriptor>` 重新打开已绑定文件；当前保留 no-follow descriptor、完整 stat identity、WAL/journal、SHA、`quick_check`、Node/Link 和 graph BLOB 安全门，并在且仅在 `/dev/fd` 明确只读打开失败时，从已绑定 descriptor 流式复制到 App 私有 `0700/0400` 临时目录完成正常 immutable URI 校验。源身份在复制/校验前后精确复核，临时文件在所有退出路径清理；其他数据库完整性错误仍直接失败，不被 fallback 吞掉。
+- “处理历史扫描”列表新增独立“导出原始扫描”按钮。导出不依赖手机后处理成功，要求 finalized continuous-streaming、exact 单一 `segment_0001`、tracking identity 一致、无 live checkpoint、数据库非 symlink/hardlink；复制完整 capture 后执行源/目标/复制后源 SHA-256 manifest 三方复核，写复制验证凭证，手机原始数据始终保留，同名目标绝不覆盖。
+- ESL 全屏扫码层的状态文字和条码文字改为绑定真实扫码框的上、下边缘，并分别保留 18 pt 间距；边框、布局 guide 与 Vision ROI 继续使用同一个 normalized scan rect，关闭截图中的文字压线问题。
+- 构建后偶发的黑色残缺画面确认是 Xcode 文件断点 `ViewController.updateState(state:)` 暂停主线程，而非 App 随机初始化失败；本地断点已删除。文档加入辨识和恢复步骤，避免通过反复重启误判。
+- 本轮新增的源码合同为 `test_mobile_scan_ux_contract` **19/19 PASS**，UX + sidecar 快速组 **37/37 PASS**，修改 Swift 文件均通过 `swiftc -parse`。包含私有 DB 校验副本清理与连续两次历史导出的完整 Swift host 长方法 **1/1 PASS（1484.429 s）**；400,000 条 tag evidence 输入为 243,952,646 bytes、接受 200,000 条、峰值 RSS 520,077,312 bytes。最终 unsigned generic iPhoneOS Debug 与 tracked-clean exact-HEAD Release 均完成全量编译/链接；Debug App 不含正式 build identity，Release bundle 的 `app_git_sha` 与构建提交精确一致。无签名 generic build 不替代真机 Files provider、大型真实 DB、LiDAR 或现场验证。
+
 ## 2026-08-10 — 现场扫描证据、价签入口、结束事务与起点预览修复
 
 - 修复先验地图扫描刚启动时 native node timebase 尚未建立却向严格 sidecar writer 传入 `.nan` 的问题。当前 frame 在 offset 缺失或非有限时直接等待，最多每 2 秒记录一次 `prior_map_update_waiting_for_node_timebase`；只有拿到有限 native offset 后才执行定位和写入 `localization_trace/constraints/events`，不会再把一次短暂未就绪升级为整场粘性证据失败。

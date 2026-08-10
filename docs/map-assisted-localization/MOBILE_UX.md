@@ -42,7 +42,7 @@
 
 人工确认使用 native 一次性冻结的最近 node ID/stamp、CameraMobile timebase offset 和 generation。短暂无新快照时可使用最近 1 秒内、按当前 frame time 复核仍与 node 相差不超过 1 秒的缓存快照；超过边界仍拒绝，不会伪造 PC 锚点事件。
 
-“扫描价签条码”进入专用 camera-only Capture Mode，持续消费当前 `ARFrame.capturedImage`，支持 QR、EAN‑8/13、Code128、UPC‑E 和 PDF417，不启动第二路相机，也不暂停 ARSession、RTAB-Map、数据库、Clock、Pose、node creation 或 prior-map localization。固定 scan box 会映射成 Vision 的真实 ROI；Vision 最多 8 Hz、one-in-flight，每个 request 有 1 秒 ARFrame deadline，预览最多 24 Hz。Vision worker 固定为两条 lane：超时 lane 被 cancel/quarantine，备用 lane 可继续；两条都挂起时 Barcode UX fail closed，原扫描继续。候选连续 2 帧锁定，同一 capture 目标 4 个、最低 3 个独立 frame，最大窗口 2 秒；达到 deadline 时已有 3 个 durable frame 即进入解析，否则保留原始观测并要求重扫。
+“扫描价签条码”进入专用 camera-only Capture Mode，持续消费当前 `ARFrame.capturedImage`，支持 QR、EAN‑8/13、Code128、UPC‑E 和 PDF417，不启动第二路相机，也不暂停 ARSession、RTAB-Map、数据库、Clock、Pose、node creation 或 prior-map localization。固定 scan box 会映射成 Vision 的真实 ROI；状态文字固定在该框上边缘外 18 pt，条码文字固定在下边缘外 18 pt，边框、文字布局和 Vision ROI 共用同一个 `normalizedScanRect`，不再用 `centerY` 偏移。Vision 最多 8 Hz、one-in-flight，每个 request 有 1 秒 ARFrame deadline，预览最多 24 Hz。Vision worker 固定为两条 lane：超时 lane 被 cancel/quarantine，备用 lane 可继续；两条都挂起时 Barcode UX fail closed，原扫描继续。候选连续 2 帧锁定，同一 capture 目标 4 个、最低 3 个独立 frame，最大窗口 2 秒；达到 deadline 时已有 3 个 durable frame 即进入解析，否则保留原始观测并要求重扫。
 
 深度使用内缩 9×9 ROI，记录样本数、内点数/比例、中值、MAD、平面残差和法向；样本不足、前后景分层、反射/孔洞或平面不稳定时退化为货架射线或待复核，不能因为“有深度”就获得高置信。对齐快照超过 250 ms 降级，超过 600 ms 或版本落后强制 lost/review。只有至少 3 个逐帧可靠证据共同指向同一 `shelfSegmentId + side` 才允许确认；弱帧可以保留作 raw audit，但不能凑足确认 quorum。
 
@@ -52,6 +52,13 @@
 
 定位 trace、constraint、state、观测或已确认价签的必需写入失败时，HUD 持续显示红色“辅助定位证据写入失败”提示；首次失败另显示长 Toast。失败对当前会话是粘性的：立即停止新的先验地图修正、人工校正和价签确认，但原始 RTAB‑Map 数据库继续记录到用户结束。结束后数据库关闭，metadata 保存 `finalized=false`，checkpoint 保留，并可导出完整恢复包；应用不会回到 prior-map 录制。用户应开始新扫描，不要把红色告警会话交给 PC 强行优化。
 
+## 历史扫描处理与原始导出
+
+- “处理历史扫描”只发现 `metadata.finalized == true`、`scanMode == continuous_streaming` 且存在 exact `segment_0001/rtabmap_segment_0001.db` 的会话；点按行进入手机后处理，行尾的导出图标独立执行原始数据导出，两条操作互不依赖。
+- snapshot 的 WAL/journal、hardlink、文件身份、SHA、SQLite `quick_check`、Node/Link 和 graph BLOB 门保持失败关闭。macOS host 可用 `/dev/fd/<n>` 复核已绑定 descriptor；iOS SQLite VFS 若明确无法只读打开该路径，则从同一 descriptor 流式复制到 App 私有 `0700/0400` 临时目录校验，前后复核 source dev/inode/mode/link/size/mtime/ctime，完成或失败都删除临时副本。其他 SQLite/graph integrity 错误不会触发兼容回退。
+- 原始导出要求 exact 单一 `segment_0001`、finalized、连续单库、tracking identity 一致、无 `live_checkpoint.json`，且数据库为普通单链接文件。复制前、目标复制后和源复制后重新计算完整 SHA-256 manifest；三者一致后写 `copy_verification.json` 与 `copy_package_manifest.json`。手机源始终保留，目标重名时创建 `-Export-yyyyMMdd-HHmmss[-N]`，失败仅清理本次未完成目标。
+- 导出按钮在复制期间禁用页面关闭、再次处理和再次导出，并显示校验、复制、SHA 复核和凭证写入进度。选择 Files/iCloud/外接存储目录时使用 security-scoped access，结束后释放。
+
 ## 当前限制
 
 - 扫描中地图 HUD 仍以浮层叠加在现有相机/建图界面；本轮统一的是入口、地图库、配置和启动事务，不是对底层 RTAB-Map 渲染页面的整体重写。
@@ -60,4 +67,5 @@
 - 当前扫描绑定一个楼层，不支持楼梯、电梯或其他跨楼层过程。
 - 预定路线编辑和无条件全图搜索仍属于后续增强；当前只在持续 weak/lost 或可靠闭环后启用有界恢复。
 - 当前修改的 unsigned iPhoneOS Debug 全量编译/链接、聚焦 UX/权限/receipt/地图库合同和完整 Swift host 已通过；Debug 日志确认身份仍被移除。提交后默认 `RTABMapApp` unsigned Release 全量编译/链接也已通过，并输出 `build identity verified`。默认 Release Run 或 `RTABMapApp-QualifiedDevice` 安装后的触控 p50/p95、首次权限、后台/前台、完整扫描和设备热/内存表现仍需真机复测。
+- Xcode Debug Navigator 若显示主线程停在 `ViewController.updateState(state:)` 的文件断点，App 会表现为黑底、网格或残缺旧控件；删除/停用断点并 Continue 即可。该现象是调试器暂停，不属于 App 状态机恢复路径。
 - 真实 LiDAR iPhone 的 30 秒性能、照明/反光/斜视/多价签矩阵和完整现场确认尚未执行；低影响增强与明日测试见 [`ESL_CAPTURE_TODO.md`](ESL_CAPTURE_TODO.md) 与 [`MAPCASE02_TODO.md`](MAPCASE02_TODO.md)。当前不得宣称 ESL FIELD CAPTURE UX COMPLETE 或 Production Ready。

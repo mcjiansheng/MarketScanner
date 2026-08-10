@@ -4,7 +4,15 @@
 
 ## 总体
 
-当前现场阻断修复分支为 `codex/fix-mobile-field-scan-blockers`，基于上一轮已验证/推送基线 `559353edd699abf995c04b3daf83f2ba60ebff17`；核心分支 `core-mobile-v1@36f606c1fa05e92210f0189c804dadd1b09721a1` 和此前冻结分支均未修改。I10 final SHA `8f0e730d92773eea2ab58f56742d901ac02eead4` 的 exact-SHA run `31307753672` 为 7/8：P0、SHA/wave、ABI、Ubuntu/Windows native、Python/API/Web 与完整 macOS host 合同均 PASS，200k tag-evidence RSS 为 `794,099,712 < 805,306,368` bytes；唯一失败是 cold-cache iphoneos RTAB-Map 配置没有找到已生成在 `rtabmap/prebuild/bin/` 的宿主 `rtabmap-res_tool`，因此 simulator/device clean link 被跳过。I11 `37e6ed8c4afa00202693cd56919aea78fd4c7af5` 已在交叉编译前验证该宿主工具并通过 `RTABMAP_RES_TOOL` 显式绑定，G11 `7eef33e` 已绑定 implementation SHA；本地全新 host prebuild、全新 iOS CMake configure、Map Studio 109/109 和独立复审 `P0=0/P1=0` 均通过。新的 exact-SHA 8/8 前不冻结，当前发布判断仍为 **REJECTED / NO-GO / developer smoke only**。
+当前历史扫描/ESL 布局修复分支为 `fix/mobile-history-export-esl-layout`，不使用 `codex/` 前缀；它从现场阻断基线继续开发，核心分支 `core-mobile-v1@36f606c1fa05e92210f0189c804dadd1b09721a1` 和此前冻结分支均未修改。I10 final SHA `8f0e730d92773eea2ab58f56742d901ac02eead4` 的 exact-SHA run `31307753672` 为 7/8：P0、SHA/wave、ABI、Ubuntu/Windows native、Python/API/Web 与完整 macOS host 合同均 PASS，200k tag-evidence RSS 为 `794,099,712 < 805,306,368` bytes；唯一失败是 cold-cache iphoneos RTAB-Map 配置没有找到已生成在 `rtabmap/prebuild/bin/` 的宿主 `rtabmap-res_tool`，因此 simulator/device clean link 被跳过。I11 `37e6ed8c4afa00202693cd56919aea78fd4c7af5` 已在交叉编译前验证该宿主工具并通过 `RTABMAP_RES_TOOL` 显式绑定，G11 `7eef33e` 已绑定 implementation SHA；本地全新 host prebuild、全新 iOS CMake configure、Map Studio 109/109 和独立复审 `P0=0/P1=0` 均通过。新的 exact-SHA 8/8 前不冻结，当前发布判断仍为 **REJECTED / NO-GO / developer smoke only**。
+
+## 2026-08-10 历史扫描处理、原始导出与 ESL 布局修复
+
+- iOS snapshot DB 复核不再把 `/dev/fd/<descriptor>` 当作唯一 SQLite 入口。保留完整 descriptor/path stat identity、hardlink/WAL/journal/SHA/SQLite/graph 安全门；仅当 SQLite 明确无法只读打开 `/dev/fd` 时，从已绑定 descriptor 流式复制到 App 私有临时目录校验，前后复核源身份并在所有路径清理副本。进程内只缓存 exact dev/inode/mode/nlink/size/nanosecond mtime/ctime 已通过语义校验的不可变文件。
+- 历史扫描列表每行新增独立原始导出按钮，不要求后处理成功。导出严格要求 finalized continuous-streaming、单一 exact `segment_0001`、tracking identity、无 checkpoint、安全数据库；完整复制后执行三方 SHA manifest 复核并写两份 receipt，保留手机源且不覆盖已有目标。
+- ESL 状态/条码文字分别绑定扫码框精确上/下边缘外 18 pt，边框、布局和 Vision ROI 共用同一 normalized rect，修复文字压线。
+- 构建后黑色残缺界面已确认为 Xcode 本地文件断点暂停 `ViewController.updateState(state:)`；断点已删除。这项修复不产生产品源码差异，真机 smoke 需确认 Xcode 不再在该位置暂停。
+- 新增源码合同当前 **19/19 PASS**，UX + sidecar 快速组 **37/37 PASS**，修改 Swift 文件 `swiftc -parse` PASS。包含私有 DB copy 清理与连续两次历史导出的完整 Swift host 长方法 **1/1 PASS（1484.429 s）**；400,000 条 tag evidence 峰值 RSS 520,077,312 bytes。最终 unsigned generic iPhoneOS Debug 与 tracked-clean exact-HEAD Release 全量编译/链接 PASS；Debug App 不含正式 build identity，Release bundle `app_git_sha` 与构建提交精确一致。真机 Files provider/大型真实 DB 仍按测试计划继续收口，无签名 build 不能替代现场资格。
 
 ## 2026-08-10 现场扫描 blocker 修复
 

@@ -338,6 +338,86 @@ class MobileScanUXContractTests(unittest.TestCase):
         self.assertIn("priceTagCaptureStartFailureAlert = alert", presenter)
         self.assertIn("priceTagCaptureStartFailureAlert = nil", presenter)
 
+    def test_esl_overlay_text_is_anchored_outside_the_exact_scan_box(self) -> None:
+        core = self.source(
+            "app/ios/RTABMapApp/PriceTagCaptureCore.swift"
+        )
+        ui = self.source(
+            "app/ios/RTABMapApp/PriceTagCaptureUI.swift"
+        )
+        self.assertIn("static let statusClearancePoints", core)
+        self.assertIn("static let payloadClearancePoints", core)
+        self.assertIn("private let scanTopGuide = UILayoutGuide()", ui)
+        self.assertIn("private let scanBottomGuide = UILayoutGuide()", ui)
+        self.assertIn(
+            "multiplier: PriceTagCaptureLayout.normalizedScanRect.minY",
+            ui,
+        )
+        self.assertIn(
+            "multiplier: PriceTagCaptureLayout.normalizedScanRect.maxY",
+            ui,
+        )
+        self.assertIn(
+            "equalTo: scanTopGuide.bottomAnchor",
+            ui,
+        )
+        self.assertIn(
+            "equalTo: scanBottomGuide.bottomAnchor",
+            ui,
+        )
+        self.assertNotIn(
+            "statusLabel.bottomAnchor.constraint(equalTo: centerYAnchor",
+            ui,
+        )
+        self.assertNotIn(
+            "payloadLabel.topAnchor.constraint(equalTo: centerYAnchor",
+            ui,
+        )
+
+    def test_historical_scan_export_is_visible_and_independent_of_processing(
+        self,
+    ) -> None:
+        processing = self.source(
+            "app/ios/RTABMapApp/MobileOnlyWorkflow/UI/"
+            "MobileProcessingViewController.swift"
+        )
+        session = self.source(
+            "app/ios/RTABMapApp/SupermarketScanSession.swift"
+        )
+        self.assertIn("UIDocumentPickerDelegate", processing)
+        self.assertIn('UIImage(systemName: "square.and.arrow.up")', processing)
+        self.assertIn('exportButton.accessibilityLabel = "导出原始扫描"', processing)
+        self.assertIn("SupermarketScanSession.exportFinalizedCapture", processing)
+        export_start = session.index("static func exportFinalizedCapture(")
+        export_end = session.index(
+            "private static func uniqueExternalExportRoot", export_start
+        )
+        export = session[export_start:export_end]
+        self.assertIn('metadata["finalized"] as? Bool == true', export)
+        self.assertIn('"live_checkpoint.json"', export)
+        self.assertIn("databaseMetadata.st_nlink == 1", export)
+        self.assertIn("localManifestBeforeCopy == exportManifest", export)
+        self.assertIn("localManifestBeforeCopy == localManifestAfterCopy", export)
+        self.assertIn("localCopyRetained: true", export)
+        self.assertNotIn("removeLocalCaptureDirectory", export)
+
+    def test_snapshot_database_validation_has_an_ios_compatible_fallback(
+        self,
+    ) -> None:
+        snapshot = self.source(
+            "app/ios/RTABMapApp/MobilePostProcessing/"
+            "SessionSnapshotTransaction.swift"
+        )
+        self.assertIn("DatabaseValidationIdentity", snapshot)
+        self.assertIn("hasRememberedDatabaseValidation", snapshot)
+        self.assertIn("validateSnapshotDatabaseThroughPrivateCopy", snapshot)
+        self.assertIn(".marketscanner-db-validation-", snapshot)
+        self.assertIn("O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC | O_NOFOLLOW", snapshot)
+        self.assertIn("sameFileIdentity(sourceMetadata, sourceAfterValidation)", snapshot)
+        self.assertIn("unlinkat(directoryDescriptor, validationName, 0)", snapshot)
+        self.assertIn("file:/dev/fd/", snapshot)
+        self.assertIn("forcePrivateDatabaseValidationCopyForTests", snapshot)
+
     def test_navigation_contract_has_root_close_and_push_back_stack(self) -> None:
         setup = self.source(
             "app/ios/RTABMapApp/MobileOnlyWorkflow/UI/"

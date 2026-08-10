@@ -150,6 +150,11 @@ struct PriceTagCaptureLayout {
         y: 0.36,
         width: 0.76,
         height: 0.25)
+    /// Text/progress controls are anchored to the exact scan-box edges with
+    /// these clearances. They must never be positioned with centerY magic
+    /// numbers, which overlap the border on taller Dynamic Type/device sizes.
+    static let statusClearancePoints: CGFloat = 18
+    static let payloadClearancePoints: CGFloat = 18
 
     static func scanRect(in bounds: CGRect) -> CGRect {
         return CGRect(

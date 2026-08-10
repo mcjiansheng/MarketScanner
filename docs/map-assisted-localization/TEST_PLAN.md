@@ -18,7 +18,11 @@ python3 -m unittest \
 
 2026-08-10 当前源码结果为 **32/32 PASS**。它必须继续证明：首页和菜单不进入旧 `PriorMapWizardViewController`，而是先进入轻量地图选择页；用户可以导入新地图；配置页以 immutable required `selectedMap` 初始化，不自行列举地图、不自动加载第一张地图，也不存在 picker；文件选择前隐藏 0%、进度条和计时，进入 `.stagingMapSource` 后才显示；地图库普通列表、完整刷新、provider copy/fsync、selected-package 加载和 scan-start preparation 不在主线程；手机编译地图与 PC v2 package 进入同一 registry/setup/coordinator；root Close 与 push Back 同时存在；首次权限在 workflow commit 前完成；旧 tmp-db recovery 不可绕过 receipt；取消/持久化失败会 rollback；地图设置支持 1×–8× zoom、方向键和离散朝向；手动 Debug 无 build identity，共享 `RTABMapApp` 默认 Run 和 `RTABMapApp-QualifiedDevice` 的 Run 均为 Release，且不存在 `--allow-dirty`。新增合同还要求 setup transition 失败不得继续 commit、finalization 的 state/context 单次持久化、未完成的 `finalizing_scan` 不得直接进入后处理，以及条码失败 alert 去重。
 
+2026-08-10 历史扫描/ESL 布局增量中，`tools.PriorMap.tests.test_mobile_scan_ux_contract` 单组扩展为 **19/19 PASS**。新增断言要求：ESL status/payload 必须绑定 exact scan rect 上下边缘且不能恢复 `centerY` 魔数；历史列表必须显示独立导出按钮并使用 folder document picker；导出必须 finalized/live-checkpoint/hardlink/SHA/local-retention fail closed；snapshot 必须存在 iOS 私有 descriptor-copy fallback、exact stat identity cache 和临时副本清理。这个 19 项数字是该单组当前结果，不替代上面跨三个模块的历史 32/32 证据。
+
 Swift 核心可执行长方法 `IOSCoreContractTests.test_swift_workflow_state_and_se2_projection` 在当前源码上 **1/1 PASS（1212.429 s）**，覆盖 map-library CAS、register/rebuild/freeze/quarantine、异常 symlink 外部目标权限保护、300k finalization、1,728,000 trace、400k tag evidence、MapCase02 和 workflow/SE(2) 合同。现场阻断聚焦组 46/46、较广 PriorMap 拆分组 197/197、Map Studio 109/109 也已通过。拆分执行不等同于单命令完整 discover，这些 host 证据也不能冒充真机交互延迟或现场扫描 PASS。
+
+本轮在同一个 Swift executable 默认路径中增加两类运行时回归：强制走 iOS 私有 snapshot DB 校验副本并确认 `.marketscanner-db-validation-*` 无残留；构造 finalized `SupermarketSession-*/segment_0001` 后连续导出两次，确认源仍存在、源/目标 manifest 相等、两个 receipt 存在且第二次不覆盖第一次。2026-08-10 当前源码的完整长方法结果为 **1/1 PASS（1484.429 s）**；其中 400,000 条 tag evidence 输入 243,952,646 bytes、接受 200,000 条、峰值 RSS 520,077,312 bytes。只做 `swiftc -parse` 或 source-token contract 不算行为验证。
 
 ### MapCase02 冻结回归
 
@@ -70,6 +74,10 @@ xcodebuild -quiet -project app/ios/RTABMapApp.xcodeproj \
 ```
 
 普通共享 `RTABMapApp` 的默认 Run 已是 Release；如需 UI/导入 smoke，可手动把构建配置切到 Debug，该构建按设计删除 `MarketScannerBuildIdentity.json`，不得用于开始正式 prior-map 扫描。2026-08-10 已在 tracked tree 干净的提交上执行默认 `RTABMapApp` unsigned generic-device Release 全量编译/链接，日志包含 `build identity verified` 和 `BUILD SUCCEEDED`；Debug 全量编译/链接也 PASS 且确认身份被移除。无签名 build只证明编译/链接和 build-identity 生成，不证明真机权限、相机、LiDAR 或现场流程；`RTABMapApp-QualifiedDevice` 的静态 Release/无 bypass 合同已覆盖，真机仍需实际安装验证。
+
+本轮真机手测必须补充：删除/停用 Xcode 的 `ViewController.updateState(state:)` 文件断点后冷启动，确认不会再被调试器停在黑色残缺界面；打开 ESL 扫描确认状态文字位于框外且 Dynamic Type/短屏无约束冲突；对截图中的真实 finalized 会话执行手机后处理，确认不再出现 `/dev/fd` 只读打开错误；不处理或故意处理失败后仍可把完整原始扫描导出到 Files/iCloud/外接存储，并在第二次导出时保留第一次目录。大型真实 DB 还要记录私有校验副本的额外空间、耗时、取消/锁屏和低磁盘行为。
+
+本轮 unsigned generic iPhoneOS Debug 与 tracked-clean exact-HEAD Release 全量编译/链接均已 PASS；Debug 产物中没有 `MarketScannerBuildIdentity.json`，Release bundle 的 `app_git_sha` 与构建提交精确一致。该结果仍只是无签名编译/链接与身份生成 smoke，不是签名安装或真机运行资格。
 
 覆盖：
 

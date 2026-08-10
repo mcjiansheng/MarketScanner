@@ -10748,6 +10748,32 @@ do {
         "RC-B09 task reference must carry the committed generation")
     try SessionSnapshotTransaction.revalidateSnapshot(
         snapshot.snapshotDirectory)
+    // iOS does not guarantee that SQLite can reopen `/dev/fd/<n>`. Exercise
+    // the descriptor-bound private-copy fallback explicitly and prove that
+    // its unique temporary directory is removed after validation.
+    do {
+        let validationPrefix = ".marketscanner-db-validation-"
+        let temporaryRoot = fileManager.temporaryDirectory
+        let beforeNames = Set((try? fileManager.contentsOfDirectory(
+            atPath: temporaryRoot.path))?.filter {
+                $0.hasPrefix(validationPrefix)
+            } ?? [])
+        SessionSnapshotTransaction
+            .forcePrivateDatabaseValidationCopyForTests = true
+        defer {
+            SessionSnapshotTransaction
+                .forcePrivateDatabaseValidationCopyForTests = false
+        }
+        try SessionSnapshotTransaction.revalidateSnapshot(
+            snapshot.snapshotDirectory)
+        let afterNames = Set((try? fileManager.contentsOfDirectory(
+            atPath: temporaryRoot.path))?.filter {
+                $0.hasPrefix(validationPrefix)
+            } ?? [])
+        require(
+            beforeNames == afterNames,
+            "iOS snapshot DB validation fallback must not leave private copies")
+    }
     let snapshotMode = (try fileManager.attributesOfItem(
         atPath: snapshot.snapshotDirectory.path)[.posixPermissions]
         as? NSNumber)?.intValue
@@ -10758,6 +10784,64 @@ do {
     require(
         snapshotMode == 0o555 && databaseMode == 0o444,
         "RC-B09 committed snapshot directory/files must be 0555/0444")
+
+    // A finalized historical scan can be exported independently of mobile
+    // post-processing success. The verified package retains the phone copy
+    // and a second export must never overwrite the first provider package.
+    let historyDocuments = try p7r6FreshDirectory("history-export-documents")
+    let historyRoot = historyDocuments.appendingPathComponent(
+        "SupermarketSession-20260810-120000",
+        isDirectory: true)
+    let historySegment = historyRoot.appendingPathComponent(
+        "segment_0001",
+        isDirectory: true)
+    try fileManager.createDirectory(
+        at: historySegment,
+        withIntermediateDirectories: true)
+    for name in try fileManager.contentsOfDirectory(atPath: session.path) {
+        let source = session.appendingPathComponent(name)
+        let destinationName = name == "source.db"
+            ? "rtabmap_segment_0001.db" : name
+        try fileManager.copyItem(
+            at: source,
+            to: historySegment.appendingPathComponent(destinationName))
+    }
+    let historyExportDestination = try p7r6FreshDirectory(
+        "history-export-provider")
+    let firstHistoryExport = try SupermarketScanSession
+        .exportFinalizedCapture(
+            from: historySegment,
+            localDocumentsDirectory: historyDocuments,
+            destinationBaseDirectory: historyExportDestination,
+            expectedTrackingSessionID: "P7-SESSION")
+    require(
+        fileManager.fileExists(atPath: historySegment.path)
+            && fileManager.fileExists(atPath: firstHistoryExport.path),
+        "historical export must retain the local finalized scan")
+    let firstExportRoot = firstHistoryExport.deletingLastPathComponent()
+    require(
+        fileManager.fileExists(atPath: firstExportRoot.appendingPathComponent(
+            "copy_verification.json").path)
+            && fileManager.fileExists(atPath: firstExportRoot
+                .appendingPathComponent("copy_package_manifest.json").path),
+        "historical export must include verification receipts")
+    let historySourceManifest = try CaptureDirectoryIntegrity.manifest(
+        for: historySegment)
+    let historyExportManifest = try CaptureDirectoryIntegrity.manifest(
+        for: firstHistoryExport)
+    require(
+        historySourceManifest == historyExportManifest,
+        "historical export source and provider manifests must match")
+    let secondHistoryExport = try SupermarketScanSession
+        .exportFinalizedCapture(
+            from: historySegment,
+            localDocumentsDirectory: historyDocuments,
+            destinationBaseDirectory: historyExportDestination,
+            expectedTrackingSessionID: "P7-SESSION")
+    require(
+        firstHistoryExport.deletingLastPathComponent()
+            != secondHistoryExport.deletingLastPathComponent(),
+        "historical export must create a collision-free package instead of overwriting")
 
     // Resume rejects permission drift even when bytes and hashes match.
     let snapshotDatabase = snapshot.snapshotDirectory

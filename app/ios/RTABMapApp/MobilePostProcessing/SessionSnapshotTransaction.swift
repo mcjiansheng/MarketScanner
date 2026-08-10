@@ -63,7 +63,16 @@ enum SessionSnapshotTransaction {
     static var processLockAttemptObserver: (() throws -> Void)?
     static var processLockAcquiredObserver: (() throws -> Void)?
     static var processLockValidationObserver: (() throws -> Void)?
+    /// Executable host-test hook for the iOS compatibility path. Production
+    /// leaves this false. When enabled, descriptor validation bypasses both
+    /// the in-process semantic-validation cache and Darwin `/dev/fd` so the
+    /// private descriptor-copy fallback is exercised deterministically.
+    static var forcePrivateDatabaseValidationCopyForTests = false
     private static let transactionLock = NSLock()
+    private static let databaseValidationCacheLock = NSLock()
+    private static var databaseValidationCache = Set<DatabaseValidationIdentity>()
+    private static var databaseValidationCacheOrder: [DatabaseValidationIdentity] = []
+    private static let maximumDatabaseValidationCacheEntries = 64
 
     struct SessionSnapshot {
         var taskID: String
@@ -102,6 +111,34 @@ enum SessionSnapshotTransaction {
         let rootMetadata: stat
         let lockDescriptor: Int32
         let lockMetadata: stat
+    }
+
+    /// A semantic SQLite validation is reusable only for the exact immutable
+    /// file identity that was checked. Including size, mode, link count and
+    /// nanosecond mtime/ctime means chmod, in-place writes and replacements
+    /// cannot inherit a prior validation result.
+    private struct DatabaseValidationIdentity: Hashable {
+        let device: UInt64
+        let inode: UInt64
+        let mode: UInt32
+        let linkCount: UInt64
+        let size: Int64
+        let modificationSeconds: Int64
+        let modificationNanoseconds: Int64
+        let changeSeconds: Int64
+        let changeNanoseconds: Int64
+
+        init(_ metadata: stat) {
+            device = UInt64(metadata.st_dev)
+            inode = UInt64(metadata.st_ino)
+            mode = UInt32(metadata.st_mode)
+            linkCount = UInt64(metadata.st_nlink)
+            size = Int64(metadata.st_size)
+            modificationSeconds = Int64(metadata.st_mtimespec.tv_sec)
+            modificationNanoseconds = Int64(metadata.st_mtimespec.tv_nsec)
+            changeSeconds = Int64(metadata.st_ctimespec.tv_sec)
+            changeNanoseconds = Int64(metadata.st_ctimespec.tv_nsec)
+        }
     }
 
     /// Signals an authority CAS conflict whose pre-transaction state could
@@ -4119,21 +4156,47 @@ enum SessionSnapshotTransaction {
     // MARK: - DB validation (§8.5)
 
     private static func validateSnapshotDatabase(_ url: URL) throws {
+        let descriptor = open(
+            url.path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW)
+        guard descriptor >= 0 else {
+            throw SessionError.dbIntegrity(
+                "cannot open snapshot DB no-follow")
+        }
+        defer { _ = close(descriptor) }
+        var openedBefore = stat()
+        var pathBefore = stat()
+        guard fstat(descriptor, &openedBefore) == 0,
+              lstat(url.path, &pathBefore) == 0,
+              (openedBefore.st_mode & S_IFMT) == S_IFREG,
+              openedBefore.st_nlink == 1,
+              sameFileIdentity(openedBefore, pathBefore) else {
+            throw SessionError.dbIntegrity(
+                "snapshot DB changed while opening for validation")
+        }
         // Percent-encode the path so '%', '#', '?' in file names cannot
         // inject URI parameters/fragments (mirrors the C++ core's
         // uriEncodePath hardening).
-        var allowed = CharacterSet.alphanumerics
-        allowed.insert(charactersIn: "-._~/")
-        let encodedPath = url.path.addingPercentEncoding(withAllowedCharacters: allowed)
-            ?? url.path
-        let uri = "file:\(encodedPath)?mode=ro&immutable=1"
-        try validateSnapshotDatabase(uri: uri)
+        try validateSnapshotDatabase(uri: readOnlySQLiteURI(for: url))
+        var openedAfter = stat()
+        var pathAfter = stat()
+        guard fstat(descriptor, &openedAfter) == 0,
+              lstat(url.path, &pathAfter) == 0,
+              sameFileIdentity(openedBefore, openedAfter),
+              sameFileIdentity(openedBefore, pathAfter) else {
+            throw SessionError.dbIntegrity(
+                "snapshot DB changed during path validation")
+        }
+        rememberDatabaseValidation(openedBefore)
     }
 
     /// Opens the committed database relative to the bound snapshot root and
-    /// makes SQLite duplicate that exact descriptor through Darwin's
-    /// `/dev/fd` namespace. This prevents a pathname replacement between the
-    /// artifact hash and `quick_check` from redirecting SQLite to a clone.
+    /// validates the exact no-follow descriptor. macOS can duplicate that
+    /// descriptor through `/dev/fd`; iOS app sandboxes do not guarantee that
+    /// namespace is openable by SQLite. On iOS, the bytes are therefore copied
+    /// from the already-bound descriptor into a private 0700/0400 temporary
+    /// validation directory, checked through a normal immutable SQLite URI,
+    /// then destroyed. The source descriptor and its parent pathname are
+    /// revalidated before and after either route.
     private static func validateSnapshotDatabase(
         parentDescriptor: Int32,
         databaseName: String,
@@ -4150,12 +4213,41 @@ enum SessionSnapshotTransaction {
         defer { _ = close(descriptor) }
         var openedBefore = stat()
         guard fstat(descriptor, &openedBefore) == 0,
+              (openedBefore.st_mode & S_IFMT) == S_IFREG,
+              openedBefore.st_nlink == 1,
               sameFileIdentity(expectedMetadata, openedBefore) else {
             throw SessionError.dbIntegrity(
                 "committed snapshot DB changed before validation")
         }
-        try validateSnapshotDatabase(
-            uri: "file:/dev/fd/\(descriptor)?mode=ro&immutable=1")
+
+        let mayUseCachedValidation =
+            !forcePrivateDatabaseValidationCopyForTests
+            && hasRememberedDatabaseValidation(openedBefore)
+        if !mayUseCachedValidation {
+            var descriptorRouteSucceeded = false
+            if !forcePrivateDatabaseValidationCopyForTests {
+                do {
+                    try validateSnapshotDatabase(
+                        uri: "file:/dev/fd/\(descriptor)?mode=ro&immutable=1")
+                    descriptorRouteSucceeded = true
+                } catch let error as SessionError {
+                    // Expected on iOS: its sandboxed SQLite VFS may reject
+                    // `/dev/fd/<n>`. The descriptor-bound private-copy path
+                    // below retains the same fail-closed file-identity gates.
+                    guard case .dbIntegrity(let detail) = error,
+                          detail == "cannot open snapshot DB read-only" else {
+                        throw error
+                    }
+                } catch {
+                    throw error
+                }
+            }
+            if !descriptorRouteSucceeded {
+                try validateSnapshotDatabaseThroughPrivateCopy(
+                    sourceDescriptor: descriptor,
+                    sourceMetadata: openedBefore)
+            }
+        }
         var openedAfter = stat()
         var pathAfter = stat()
         guard fstat(descriptor, &openedAfter) == 0,
@@ -4168,6 +4260,218 @@ enum SessionSnapshotTransaction {
               sameFileIdentity(openedBefore, pathAfter) else {
             throw SessionError.dbIntegrity(
                 "committed snapshot DB changed during validation")
+        }
+        rememberDatabaseValidation(openedAfter)
+    }
+
+    private static func validateSnapshotDatabaseThroughPrivateCopy(
+        sourceDescriptor: Int32,
+        sourceMetadata: stat
+    ) throws {
+        let fileManager = FileManager.default
+        let temporaryRoot = fileManager.temporaryDirectory
+        try checkDiskBudget(
+            neededBytes: Int64(sourceMetadata.st_size),
+            at: temporaryRoot)
+        let directoryURL = temporaryRoot.appendingPathComponent(
+            ".marketscanner-db-validation-"
+                + UUID().uuidString.lowercased(),
+            isDirectory: true)
+        guard mkdir(directoryURL.path, mode_t(0o700)) == 0 else {
+            throw SessionError.dbIntegrity(
+                "cannot create private snapshot DB validation directory")
+        }
+
+        var directoryDescriptor: Int32 = -1
+        var directoryMetadata = stat()
+        guard lstat(directoryURL.path, &directoryMetadata) == 0,
+              (directoryMetadata.st_mode & S_IFMT) == S_IFDIR,
+              directoryMetadata.st_mode & mode_t(0o777) == 0o700 else {
+            _ = rmdir(directoryURL.path)
+            throw SessionError.dbIntegrity(
+                "private snapshot DB validation directory identity invalid")
+        }
+        let validationName = "snapshot-validation.db"
+        var validationFileCreated = false
+        defer {
+            if directoryDescriptor >= 0 {
+                _ = fchmod(directoryDescriptor, mode_t(0o700))
+                if validationFileCreated {
+                    _ = unlinkat(directoryDescriptor, validationName, 0)
+                }
+                _ = close(directoryDescriptor)
+            }
+            var currentDirectory = stat()
+            if lstat(directoryURL.path, &currentDirectory) == 0,
+               sameDirectoryIdentity(directoryMetadata, currentDirectory) {
+                _ = rmdir(directoryURL.path)
+            }
+        }
+
+        let openedDirectory = try openStableDirectoryNoFollow(
+            directoryURL,
+            context: "private snapshot DB validation directory")
+        directoryDescriptor = openedDirectory.descriptor
+        guard sameDirectoryIdentity(
+                directoryMetadata, openedDirectory.metadata),
+              openedDirectory.metadata.st_mode & mode_t(0o777) == 0o700 else {
+            throw SessionError.dbIntegrity(
+                "private snapshot DB validation directory mode invalid")
+        }
+
+        let destinationDescriptor = openat(
+            directoryDescriptor,
+            validationName,
+            O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC | O_NOFOLLOW,
+            mode_t(0o600))
+        guard destinationDescriptor >= 0 else {
+            throw SessionError.dbIntegrity(
+                "cannot create private snapshot DB validation copy")
+        }
+        validationFileCreated = true
+        var destinationOpen = true
+        defer {
+            if destinationOpen { _ = close(destinationDescriptor) }
+        }
+
+        guard lseek(sourceDescriptor, 0, SEEK_SET) == 0 else {
+            throw SessionError.dbIntegrity(
+                "cannot rewind committed snapshot DB for validation")
+        }
+        var totalBytes: Int64 = 0
+        var buffer = [UInt8](repeating: 0, count: copyChunkBytes)
+        while true {
+            let bytesRead = buffer.withUnsafeMutableBytes { rawBuffer -> Int in
+                guard let baseAddress = rawBuffer.baseAddress else { return -1 }
+                return read(sourceDescriptor, baseAddress, rawBuffer.count)
+            }
+            if bytesRead < 0 {
+                if errno == EINTR { continue }
+                throw SessionError.dbIntegrity(
+                    "cannot read committed snapshot DB validation bytes")
+            }
+            if bytesRead == 0 { break }
+            guard totalBytes <= Int64.max - Int64(bytesRead) else {
+                throw SessionError.dbIntegrity(
+                    "snapshot DB validation copy size overflow")
+            }
+            totalBytes += Int64(bytesRead)
+            guard totalBytes <= Int64(sourceMetadata.st_size) else {
+                throw SessionError.dbIntegrity(
+                    "snapshot DB grew during validation copy")
+            }
+            var written = 0
+            while written < bytesRead {
+                let count = buffer.withUnsafeBytes { rawBuffer -> Int in
+                    guard let baseAddress = rawBuffer.baseAddress else {
+                        return -1
+                    }
+                    return write(
+                        destinationDescriptor,
+                        baseAddress.advanced(by: written),
+                        bytesRead - written)
+                }
+                if count < 0 && errno == EINTR { continue }
+                guard count > 0 else {
+                    throw SessionError.dbIntegrity(
+                        "cannot write private snapshot DB validation copy")
+                }
+                written += count
+            }
+        }
+        guard totalBytes == Int64(sourceMetadata.st_size),
+              fsync(destinationDescriptor) == 0,
+              fchmod(destinationDescriptor, mode_t(0o400)) == 0,
+              fsync(destinationDescriptor) == 0 else {
+            throw SessionError.dbIntegrity(
+                "private snapshot DB validation copy is incomplete")
+        }
+        var destinationMetadata = stat()
+        guard fstat(destinationDescriptor, &destinationMetadata) == 0,
+              (destinationMetadata.st_mode & S_IFMT) == S_IFREG,
+              destinationMetadata.st_nlink == 1,
+              destinationMetadata.st_size == sourceMetadata.st_size,
+              destinationMetadata.st_mode & mode_t(0o777) == 0o400,
+              close(destinationDescriptor) == 0 else {
+            throw SessionError.dbIntegrity(
+                "private snapshot DB validation copy identity invalid")
+        }
+        destinationOpen = false
+
+        var sourceAfterCopy = stat()
+        guard fstat(sourceDescriptor, &sourceAfterCopy) == 0,
+              sameFileIdentity(sourceMetadata, sourceAfterCopy),
+              fchmod(directoryDescriptor, mode_t(0o500)) == 0,
+              fsync(directoryDescriptor) == 0 else {
+            throw SessionError.dbIntegrity(
+                "committed snapshot DB changed during validation copy")
+        }
+        try requireOpenDirectoryPath(
+            descriptor: directoryDescriptor,
+            url: directoryURL,
+            expectedMetadata: directoryMetadata,
+            context: "private snapshot DB validation directory before SQLite")
+        var validationPathMetadata = stat()
+        guard fstatat(
+                directoryDescriptor,
+                validationName,
+                &validationPathMetadata,
+                AT_SYMLINK_NOFOLLOW) == 0,
+              sameFileIdentity(destinationMetadata, validationPathMetadata) else {
+            throw SessionError.dbIntegrity(
+                "private snapshot DB validation path changed")
+        }
+
+        let validationURL = directoryURL.appendingPathComponent(validationName)
+        try validateSnapshotDatabase(uri: readOnlySQLiteURI(for: validationURL))
+
+        var validationAfter = stat()
+        var sourceAfterValidation = stat()
+        guard fstatat(
+                directoryDescriptor,
+                validationName,
+                &validationAfter,
+                AT_SYMLINK_NOFOLLOW) == 0,
+              sameFileIdentity(destinationMetadata, validationAfter),
+              fstat(sourceDescriptor, &sourceAfterValidation) == 0,
+              sameFileIdentity(sourceMetadata, sourceAfterValidation) else {
+            throw SessionError.dbIntegrity(
+                "snapshot DB identity changed during private validation")
+        }
+        try requireOpenDirectoryPath(
+            descriptor: directoryDescriptor,
+            url: directoryURL,
+            expectedMetadata: directoryMetadata,
+            context: "private snapshot DB validation directory after SQLite")
+    }
+
+    private static func readOnlySQLiteURI(for url: URL) -> String {
+        var allowed = CharacterSet.alphanumerics
+        allowed.insert(charactersIn: "-._~/")
+        let encodedPath = url.path.addingPercentEncoding(
+            withAllowedCharacters: allowed) ?? url.path
+        return "file:\(encodedPath)?mode=ro&immutable=1"
+    }
+
+    private static func hasRememberedDatabaseValidation(
+        _ metadata: stat
+    ) -> Bool {
+        let identity = DatabaseValidationIdentity(metadata)
+        databaseValidationCacheLock.lock()
+        defer { databaseValidationCacheLock.unlock() }
+        return databaseValidationCache.contains(identity)
+    }
+
+    private static func rememberDatabaseValidation(_ metadata: stat) {
+        let identity = DatabaseValidationIdentity(metadata)
+        databaseValidationCacheLock.lock()
+        defer { databaseValidationCacheLock.unlock() }
+        guard databaseValidationCache.insert(identity).inserted else { return }
+        databaseValidationCacheOrder.append(identity)
+        while databaseValidationCacheOrder.count
+                > maximumDatabaseValidationCacheEntries {
+            let evicted = databaseValidationCacheOrder.removeFirst()
+            databaseValidationCache.remove(evicted)
         }
     }
 

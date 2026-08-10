@@ -69,7 +69,9 @@ Android 目录中的部分 C++ 原生实现也因共享移动渲染和数据库�
 
 已有地图模式提供用户触发的 ESL Barcode Capture Mode，直接复用持续到达的 `ARFrame.capturedImage`，不启动第二路相机。进入该模式不会暂停 `ARSession`、RTAB-Map、连续 SQLite 数据库、节点创建、时钟/位姿记录或先验地图定位；相机画面只由 camera-only `MTKView` 预览覆盖，原扫描链继续在后台运行。Vision 使用屏幕固定 scan box 对应的真实 `regionOfInterest`，按最多 8 Hz 且 one-in-flight 执行；每个请求有独立的 1 秒 ARFrame deadline。底层使用固定两条 worker lane：超时请求会 best-effort cancel 并隔离旧 lane，fresh request 可在备用 lane 实际开始；两条 lane 都挂起时立即终止 ESL UX，不创建第三条 worker 或无界 backlog，原始扫描链继续。相机预览最多 24 Hz。候选需要连续 2 帧锁定，同一 burst 目标 4 个、最低 3 个独立帧；达到 2 秒上限时，已有 3 个合法持久帧即可进入解析，否则只保留原始证据并要求重扫。
 
-价签入口使用独立全屏扫码框、识别进度、成功/错误状态、触觉反馈和取消按钮；失败时按 ARFrame、定位对齐、扫描状态、地图身份和 required evidence 给出明确弹窗。native node timebase 在首个 RTAB-Map snapshot 前缺失属于暂时未就绪：该 frame 会等待而不写入非有限占位值，避免一次启动窗口同时毒化三份必要定位 sidecar。扫描结束会同步驱动 Mobile-Only workflow 的 `scanning → finalizingScan → idle`，可恢复保存失败则回到原扫描，避免下一次配置收到旧的 `scanning` 状态。
+价签入口使用独立全屏扫码框、识别进度、成功/错误状态、触觉反馈和取消按钮；状态文字和已识别条码分别绑定扫码框的精确上、下边缘并保持 18 pt 间距，不再依赖屏幕中心魔数，因此不会压住扫码框边线。失败时按 ARFrame、定位对齐、扫描状态、地图身份和 required evidence 给出明确弹窗。native node timebase 在首个 RTAB-Map snapshot 前缺失属于暂时未就绪：该 frame 会等待而不写入非有限占位值，避免一次启动窗口同时毒化三份必要定位 sidecar。扫描结束会同步驱动 Mobile-Only workflow 的 `scanning → finalizingScan → idle`，可恢复保存失败则回到原扫描，避免下一次配置收到旧的 `scanning` 状态。
+
+“处理历史扫描”只列出 `finalized=true` 的连续单库会话。手机后处理会先生成 immutable snapshot，并对 SQLite、Node/Link 和图位姿 BLOB 执行严格校验；iOS App sandbox 不再依赖 SQLite 重新打开 `/dev/fd/<n>`，而是从已绑定的 no-follow descriptor 流式复制到 App 私有临时目录进行只读完整性校验，复核源 inode 后立即清理。每个历史会话还提供独立“导出原始扫描”按钮：即使手机后处理失败，也可选择 Files 或外接存储目录，复制完整 `segment_0001`，对源/目标/复制后源执行 SHA-256 manifest 三方一致性检查，写入复制凭证，并始终保留手机中的原始会话；同名目标使用新的 `-Export-*` 目录，绝不覆盖已有导出。
 
 ### MapCase02 标准工作簿状态（2026-08-09）
 
@@ -304,6 +306,8 @@ python3 -m unittest discover -s tools/SupermarketMapStudio/tests -v
 ### 5. 构建 iOS 应用
 
 使用 Xcode 打开 `app/ios/RTABMapApp.xcodeproj`。完整扫描流程需要支持 ARKit 和 LiDAR 的真机，建议使用 iPhone Pro 系列设备。NFC 当前暂停，不属于构建或验收范围。
+
+若 Xcode 启动后画面只剩黑底和部分旧 RTAB-Map 控件，且 Debug Navigator 显示 `Thread 1: breakpoint` / `ViewController.updateState(state:)`，这是本机文件断点暂停了主线程，不是 App 随机启动失败。删除或停用该断点后点击 Continue；重新安装 App 不能从根本上消除仍启用的 Xcode 断点。
 
 首次构建前必须为目标平台生成独立的 native dependency prefix：
 
