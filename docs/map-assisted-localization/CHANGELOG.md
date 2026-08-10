@@ -9,6 +9,7 @@
 - 导入页初始隐藏百分比、进度条和计时。点击“选择文件并导入”只打开系统 picker；收到文件并进入 `stagingMapSource` 后才显示进度 UI，取消 picker 时继续保持隐藏。
 - 共享 `RTABMapApp` scheme 的默认 Launch/Run 从 Debug 改为 Release，普通 Xcode Run 会执行严格 build-identity 生成/验证并可进入扫描。Test/Analyze 和手动 Debug 构建仍为 Debug，仍删除身份文件并 fail closed；没有放宽 `MobileBuildIdentity.isUsable`，也没有加入 `--allow-dirty`。`RTABMapApp-QualifiedDevice` 继续保留。
 - 聚焦 UX/yaw/build-identity 合同扩展为 29 项，新增先选后载、配置页无 picker、导入进度延迟显示和默认 Run Release 回归。
+- 当前修改已通过 unsigned generic iPhoneOS Debug 全量编译/链接，且日志确认 Debug 身份被移除；提交后默认 `RTABMapApp` Release 全量编译/链接也通过，日志包含 `build identity verified` 和 `BUILD SUCCEEDED`。这仍不替代真机安装、相机/LiDAR 或现场扫描验证。
 
 ## 2026-08-10 — 全手机扫描统一 UX 与启动事务阻断级收口
 

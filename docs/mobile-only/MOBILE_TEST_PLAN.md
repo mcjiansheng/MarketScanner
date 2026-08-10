@@ -6,7 +6,7 @@
 
 | 组 | 覆盖 | 状态 |
 |---|---|---|
-| Unified scan UX/startup | 首页/菜单先进入轻量地图选择页、已导入地图/导入新地图、确认后才加载、配置页 immutable selectedMap 且无 picker、导入进度在 staging 后才显示、单一地图库/配置页/Coordinator、后台 package I/O、root Close/push Back、首次相机权限、旧 tmp-db 绕过关闭、receipt/context durable commit、取消/强 rollback、1×–8× zoom、方向键、离散朝向、默认/QualifiedDevice Release scheme | 聚焦合同 **29/29 PASS**；Swift 核心长方法 **1/1 PASS（1233.541 s）**；当前修改的 unsigned iphoneos Debug 全量编译/链接 PASS，且身份仍 fail closed；独立复审 `P0=0/P1=0`。最终干净 Release build、真机运行与交互 p50/p95 NOT RUN |
+| Unified scan UX/startup | 首页/菜单先进入轻量地图选择页、已导入地图/导入新地图、确认后才加载、配置页 immutable selectedMap 且无 picker、导入进度在 staging 后才显示、单一地图库/配置页/Coordinator、后台 package I/O、root Close/push Back、首次相机权限、旧 tmp-db 绕过关闭、receipt/context durable commit、取消/强 rollback、1×–8× zoom、方向键、离散朝向、默认/QualifiedDevice Release scheme | 聚焦合同 **29/29 PASS**；Swift 核心长方法 **1/1 PASS（1233.541 s）**；当前 unsigned iphoneos Debug 全量编译/链接 PASS 且身份 fail closed；提交后默认 `RTABMapApp` unsigned Release 全量编译/链接 PASS，输出 `build identity verified`；独立复审 `P0=0/P1=0`。真机运行与交互 p50/p95 NOT RUN |
 | I1-I14 | 三格式导入、canonical parity、公式/ZIP/CSV/JSON 安全 | Swift host + --import-suite |
 | C5/C7/C9/C10 | 编译器路网统计、距离场 SHA、package self-load、PC parity | Swift host |
 | MapCase02 | 正式 Basic/Element workbook、Shelf audit、top-left、1838→1630 active、role geometry、canonical/package/preview golden；XLSX authority、strict scalar、resource budget 与派生工件重签 mutation | Swift `--mapcase02-suite` + PC converter/schema **PASS**；独立复审 `P0=0/P1=0` |
@@ -34,7 +34,7 @@
 - 资源门：peak RSS、处理时长、thermal、磁盘、电量、中断/崩溃恢复。macOS ACL、BSD `uchg`/`schg` file flags 和相关扩展属性仍未资格化；POSIX `0444/0555` 不能冒充这些边界的 PASS。
 - exact-final-SHA GitHub Actions：最新 `31307753672@8f0e730d92773eea2ab58f56742d901ac02eead4` 为 7/8；七个非 Apple required jobs与 Apple job 内的 host/SwiftPM/Xcode metadata 均 PASS，iphoneos cold dependency configure 缺宿主 `rtabmap-res_tool` 显式绑定。I11/G11 已修复，等待新的全量 rerun。
 - run `31307753672` 已证明 P0、exact binding、ABI、Ubuntu/Windows native clean build、Python contracts 与 macOS host/RSS PASS；本轮 Map Studio 109/109、既有 PriorMap 非超长 217 项、正式 PC golden/canonical ID/strict manifest-report 相关 Python 52/52、MapCase02 正式套件和四张真实 XLSX library smoke PASS。新 exact-HEAD 全绿前仍不得声明 exact-SHA PASS。
-- Apple simulator/device 两套 cold native dependencies + 两次真实 clean compile/link：`31307753672` 的 iphoneos 依赖构建到 RTAB-Map configure 后失败，后续 simulator/device 步骤 skipped。I11 本地 iOS configure PASS；当前 unsigned Debug device build PASS，但不能替代双平台 cold clean link、当前默认 Release build或真机。
+- Apple simulator/device 两套 cold native dependencies + 两次真实 clean compile/link：`31307753672` 的 iphoneos 依赖构建到 RTAB-Map configure 后失败，后续 simulator/device 步骤 skipped。I11 本地 iOS configure PASS；当前 unsigned Debug 和默认 `RTABMapApp` Release device build均 PASS，Release 日志确认严格身份，但仍不能替代 simulator/device 双平台 cold clean link或真机安装。
 - I5 Result recovery、I6 ESL follow-up、MapCase02、I10 fixtures、I11 cold-build、统一 UX/startup 和地图库安全复审最终均为 `P0=0 / P1=0`；低影响项登记 TODO。完整 discover、新 exact-SHA、Apple/设备/现场与 J-04 仍未关闭，最终判断保持 **REJECTED / NO-GO / developer smoke only**。
 
 ## 明日详细执行队列

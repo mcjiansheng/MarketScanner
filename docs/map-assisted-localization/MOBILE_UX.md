@@ -59,5 +59,5 @@
 - 二维 HUD 忽略 ARKit 竖直高度；原始连续数据库仍保留三维运动。
 - 当前扫描绑定一个楼层，不支持楼梯、电梯或其他跨楼层过程。
 - 预定路线编辑和无条件全图搜索仍属于后续增强；当前只在持续 weak/lost 或可靠闭环后启用有界恢复。
-- 当前修改的 unsigned iPhoneOS Debug 全量编译/链接、聚焦 UX/权限/receipt/地图库合同和完整 Swift host 已通过；Debug 日志确认身份仍被移除。默认 `RTABMapApp` Release Run 或 `RTABMapApp-QualifiedDevice` 安装后的触控 p50/p95、首次权限、后台/前台、完整扫描和设备热/内存表现仍需真机复测。
+- 当前修改的 unsigned iPhoneOS Debug 全量编译/链接、聚焦 UX/权限/receipt/地图库合同和完整 Swift host 已通过；Debug 日志确认身份仍被移除。提交后默认 `RTABMapApp` unsigned Release 全量编译/链接也已通过，并输出 `build identity verified`。默认 Release Run 或 `RTABMapApp-QualifiedDevice` 安装后的触控 p50/p95、首次权限、后台/前台、完整扫描和设备热/内存表现仍需真机复测。
 - 真实 LiDAR iPhone 的 30 秒性能、照明/反光/斜视/多价签矩阵和完整现场确认尚未执行；低影响增强与明日测试见 [`ESL_CAPTURE_TODO.md`](ESL_CAPTURE_TODO.md) 与 [`MAPCASE02_TODO.md`](MAPCASE02_TODO.md)。当前不得宣称 ESL FIELD CAPTURE UX COMPLETE 或 Production Ready。

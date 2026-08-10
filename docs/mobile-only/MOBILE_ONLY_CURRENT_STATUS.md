@@ -13,7 +13,7 @@
 - 主线程卡顿根因已关闭：地图库普通列表只读轻量 registry，完整 package I/O、PNG/JSON、localizer、会话和 native database preparation 在后台串行执行。主线程只处理短 UIKit/ARSession 事务。
 - 首次相机权限在 workflow commit 前完成；旧 tmp DB recovery continuation 不参与 canonical Mobile-Only；host/receipt/context/cancel 任一步失败都会强 rollback。start receipt 使用 `O_EXCL|O_NOFOLLOW`、完整写循环、file/dir fsync 和 SHA；workflow context v3 绑定 session/segment/database/map/store/receipt/checkpoint。
 - 地图库安全复审关闭 registry/manifest 身份不完整、rebuild 无上限预读和 pathname chmod 跟随符号链接三个 P1。完整 package load 绑定 name/floor/element/canonical/map/package；rebuild 使用同一有界 snapshot；freeze 使用 root FD、`fstatat/openat(O_NOFOLLOW)` 和 `fchmod(fd)`。
-- 聚焦 UX/geometry/build identity 自动测试 29/29 PASS；`IOSCoreContractTests.test_swift_workflow_state_and_se2_projection` 1/1 PASS（1233.541 s，含 map-library CAS 与 symlink 外部目标 mode 保护）；当前修改的 unsigned generic iPhoneOS Debug 全量编译/链接 PASS，并明确验证 Debug 身份仍被移除。共享 `RTABMapApp` 的默认 Run/Launch 已改为 Release，`RTABMapApp-QualifiedDevice` 继续保持 Release；二者的最终干净无签名构建与真机安装必须在本轮提交后重新执行，不能用 Debug build 代替。
+- 聚焦 UX/geometry/build identity 自动测试 29/29 PASS；`IOSCoreContractTests.test_swift_workflow_state_and_se2_projection` 1/1 PASS（1233.541 s，含 map-library CAS 与 symlink 外部目标 mode 保护）；当前修改的 unsigned generic iPhoneOS Debug 全量编译/链接 PASS，并明确验证 Debug 身份仍被移除。提交后使用共享 `RTABMapApp` 默认 Release Run 执行 unsigned generic iPhoneOS 全量编译/链接，日志包含 `build identity verified` 和 `BUILD SUCCEEDED`。`RTABMapApp-QualifiedDevice` 继续保持等价 Release 合同；真机安装和实际点击开始扫描仍待执行，不能用无签名 build 代替。
 
 新增明确 blocker：J-04 absolute-prior component identity 尚未关闭。最终 DB graph 可以由 node `mapID` 和 links 推导 component，但现行 constraint 写侧没有 atomic bound node/map ID，manual v3 也没有 RTAB-Map map ID；因此 reader 不能事后伪造 same-component 证明。需先完成正式 evidence schema 迁移，再进行 component 资格测试。
 

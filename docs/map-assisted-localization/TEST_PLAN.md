@@ -69,7 +69,7 @@ xcodebuild -quiet -project app/ios/RTABMapApp.xcodeproj \
   CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build
 ```
 
-普通共享 `RTABMapApp` 的默认 Run 已是 Release；如需 UI/导入 smoke，可手动把构建配置切到 Debug，该构建按设计删除 `MarketScannerBuildIdentity.json`，不得用于开始正式 prior-map 扫描。默认 `RTABMapApp` 或 `RTABMapApp-QualifiedDevice` 的 Release 构建都必须在所有 tracked 代码与当前文档已提交、tracked tree 干净时执行；无签名 generic-device build只证明编译/链接和 build-identity 生成，不证明真机权限、相机、LiDAR 或现场流程。
+普通共享 `RTABMapApp` 的默认 Run 已是 Release；如需 UI/导入 smoke，可手动把构建配置切到 Debug，该构建按设计删除 `MarketScannerBuildIdentity.json`，不得用于开始正式 prior-map 扫描。2026-08-10 已在 tracked tree 干净的提交上执行默认 `RTABMapApp` unsigned generic-device Release 全量编译/链接，日志包含 `build identity verified` 和 `BUILD SUCCEEDED`；Debug 全量编译/链接也 PASS 且确认身份被移除。无签名 build只证明编译/链接和 build-identity 生成，不证明真机权限、相机、LiDAR 或现场流程；`RTABMapApp-QualifiedDevice` 的静态 Release/无 bypass 合同已覆盖，真机仍需实际安装验证。
 
 覆盖：
 
