@@ -65,7 +65,9 @@ enum MobileOnlyWorkflowState: String, Codable, Equatable, CaseIterable {
         case .scanning:
             return [.finalizingScan, .cancelled, .failed, .interrupted]
         case .finalizingScan:
-            return [.snapshotting, .idle, .failed, .interrupted]
+            // A recoverable database/sidecar finalization failure resumes the
+            // same still-open scan. Terminal close paths move to idle.
+            return [.scanning, .snapshotting, .idle, .failed, .interrupted]
         case .snapshotting:
             return [.fastProcessing, .rescanRequired, .failed, .cancelled, .interrupted]
         case .fastProcessing:
@@ -122,5 +124,28 @@ enum MobileOnlyWorkflowState: String, Codable, Equatable, CaseIterable {
         case .cancelled: return "已取消"
         case .interrupted: return "已中断"
         }
+    }
+}
+
+/// Pure admission authority for a user-requested historical-processing run.
+/// Active import/scan states are never reset or bypassed merely to make the
+/// history UI proceed. In particular, `.finalizingScan` keeps its internal
+/// state-table edge to `.snapshotting` for scan lifecycle compatibility, but
+/// is not a legal source for a separate historical session request.
+enum MobileHistoricalProcessingAdmission {
+    static func evaluate(
+        currentState: MobileOnlyWorkflowState,
+        processingBusy: Bool
+    ) -> Result<Void, MobileOnlyWorkflowError> {
+        if processingBusy {
+            return .failure(.invalidState("processing already running"))
+        }
+        guard currentState != .finalizingScan,
+              currentState.allowsTransition(to: .snapshotting) else {
+            return .failure(.illegalTransition(
+                "\(currentState.rawValue) -> "
+                    + MobileOnlyWorkflowState.snapshotting.rawValue))
+        }
+        return .success(())
     }
 }

@@ -2,18 +2,50 @@
 
 > 文档状态：**当前有效**。最后核对日期：2026-08-10。
 
+## 2026-08-10 — 地图导入预热、近距离 ESL 识别与低置信度保留
+
+- 地图选择页首屏完成后，在主线程空闲轮次预热一次导入 action sheet、`MobileMapImportViewController`、XLSX `UTType` 和 `UIDocumentPickerViewController`。点击“导入新地图”与“导入 XLSX / CSV / JSON”不再承担这些一次性初始化；预热不触发 workflow transition、不访问 provider 文件，真实安全暂存和编译仍走原后台队列。
+- Barcode Capture 显式保持 ARKit autofocus，Vision 上限从 8 Hz 提升到 10 Hz，主 ROI 无结果时在同一 worker lane/ARFrame 上只执行一次扩展 ROI；加入 Code39/93、I2of5、ITF14、DataMatrix、Aztec 和 iOS 15+ Codabar。worker 仍固定两条、one-in-flight、1 秒 request deadline，不创建第二相机或 backlog。
+- exact node snapshot 的短暂 publication gap 不再伪装成 required sidecar write failure：当前 evidence frame 被延期，capture 保持锁定，并且只允许 live snapshot 或仍满足 1 秒 node-timebase 合同的已冻结 exact-ID snapshot。真实写入、身份和 burst 失败继续 sticky fail-closed。
+- 完整 verified burst 若仅定位/测量/关联质量不足，手机直接提示低置信度已保存并结束本次扫码；处理时继续按 exact `boundNodeID` 和最终优化 node pose 重投影，输出 `LOW_CONFIDENCE` PriceTag 而不自动创建 RescanTask。缺少完整 burst、身份/图质量、exact node/raw pose 或可解析位置仍为 `RESCAN_REQUIRED`，没有放宽 ACCEPTED 合同。
+
+## 2026-08-10 — 历史扫描校验/导出、ESL 布局与 Xcode 启动假故障修复
+
+- 修复真机“处理历史扫描”在 snapshot 复核阶段报 `cannot open snapshot DB read-only`。根因是 iOS App sandbox 不保证 SQLite VFS 能通过 `/dev/fd/<descriptor>` 重新打开已绑定文件；当前保留 no-follow descriptor、完整 stat identity、WAL/journal、SHA、`quick_check`、Node/Link 和 graph BLOB 安全门，并在且仅在 `/dev/fd` 明确只读打开失败时，从已绑定 descriptor 流式复制到 App 私有 `0700/0400` 临时目录完成正常 immutable URI 校验。源身份在复制/校验前后精确复核，临时文件在所有退出路径清理；其他数据库完整性错误仍直接失败，不被 fallback 吞掉。
+- “处理历史扫描”列表新增独立“导出原始扫描”按钮。导出不依赖手机后处理成功，要求 finalized continuous-streaming、exact 单一 `segment_0001`、tracking identity 一致、无 live checkpoint、数据库非 symlink/hardlink；复制完整 capture 后执行源/目标/复制后源 SHA-256 manifest 三方复核，写复制验证凭证，手机原始数据始终保留，同名目标绝不覆盖。
+- ESL 全屏扫码层的状态文字和条码文字改为绑定真实扫码框的上、下边缘，并分别保留 18 pt 间距；边框、布局 guide 与 Vision ROI 继续使用同一个 normalized scan rect，关闭截图中的文字压线问题。
+- 构建后偶发的黑色残缺画面确认是 Xcode 文件断点 `ViewController.updateState(state:)` 暂停主线程，而非 App 随机初始化失败；本地断点已删除。文档加入辨识和恢复步骤，避免通过反复重启误判。
+- 本轮新增的源码合同为 `test_mobile_scan_ux_contract` **19/19 PASS**，UX + sidecar 快速组 **37/37 PASS**，修改 Swift 文件均通过 `swiftc -parse`。包含私有 DB 校验副本清理与连续两次历史导出的完整 Swift host 长方法 **1/1 PASS（1484.429 s）**；400,000 条 tag evidence 输入为 243,952,646 bytes、接受 200,000 条、峰值 RSS 520,077,312 bytes。最终 unsigned generic iPhoneOS Debug 与 tracked-clean exact-HEAD Release 均完成全量编译/链接；Debug App 不含正式 build identity，Release bundle 的 `app_git_sha` 与构建提交精确一致。无签名 generic build 不替代真机 Files provider、大型真实 DB、LiDAR 或现场验证。
+
+## 2026-08-10 — 现场扫描证据、价签入口、结束事务与起点预览修复
+
+- 修复先验地图扫描刚启动时 native node timebase 尚未建立却向严格 sidecar writer 传入 `.nan` 的问题。当前 frame 在 offset 缺失或非有限时直接等待，最多每 2 秒记录一次 `prior_map_update_waiting_for_node_timebase`；只有拿到有限 native offset 后才执行定位和写入 `localization_trace/constraints/events`，不会再把一次短暂未就绪升级为整场粘性证据失败。
+- Mobile-Only coordinator 现在显式执行 `scanning → finalizingScan → idle`，可恢复结束失败则回到同一 `scanning`；terminal close 清除 session/database/receipt 绑定。`beginScanSetup` 返回 Bool，配置页在已有扫描正在进行或结束时停止 commit 并恢复 UI，关闭 `scan commit requires configuringScan, got scanning` 的重复事务路径。
+- “扫描价签条码”继续复用已有的 ARFrame-only 全屏相机扫码层，不创建第二个 camera session。入口失败不再只显示易遗漏 toast，而是按 required-evidence、alignment、ARFrame、mapping state 和 prior-map identity 显示明确阻断原因；成功进入后 overlay 强制置顶并设为 accessibility modal，保留扫码框、识别进度、成功反馈和取消按钮。
+- 修复手机 `MobilePreviewRenderer` 在 Quartz bitmap 上重复翻转 Y 的问题。Quartz 投影现在保持 canonical +Y，UIKit touch 继续只做一次 `1-v`，因此画面、起点 marker 和障碍物验证同向。MapCase02 报告点 `(58.03,-18.13)` 不在结构内且 clearance ≥ 0.30 m，已知货架内部点仍拒绝；Swift package golden 更新为 `c6b6b2c00690998cfa9517374b9385f857cb3ee0efcbe3663f63ee76fee87959`，canonical/PC package/PC preview 不变。
+- finalization 的 state/checkpoint/context 现在合并为一次持久化；应用若在 `finalizing_scan` 且 metadata 尚未提交时中断，恢复入口不会把未完成会话直接送进后处理。当前验证为 UX/geometry/build identity 32/32、现场阻断聚焦 46/46、Swift 长方法 1/1（1212.429 s）、较广 PriorMap 197/197、Map Studio 109/109、四张真实 XLSX 4/4 和 unsigned generic iPhoneOS Debug `BUILD SUCCEEDED`；严格 Release identity build 留到提交后 clean tracked tree 执行。
+
+## 2026-08-10 — 地图先选后载、导入初始状态与默认真机 Run 修复
+
+- 首页“新建扫描”和菜单“开始门店扫描”不再直接构造配置页并自动加载 registry 第一张地图，而是先打开 `MobileMapLibraryViewController(purpose: .selectForScan)`。选择页只读轻量 registry，提供明确的“导入新地图”按钮；用户点击某条记录后才创建 `MobileScanSetupViewController(selectedMap:)` 并完整验证/加载该 exact package。
+- 配置页的地图参数改为 immutable required initializer，删除内部地图 picker、registry reload 和切换回调。因此起点配置过程中不能因滑动 picker 反复触发大包验证；需要换图时使用系统 Back 返回轻量选择页。
+- 导入页初始隐藏百分比、进度条和计时。点击“选择文件并导入”只打开系统 picker；收到文件并进入 `stagingMapSource` 后才显示进度 UI，取消 picker 时继续保持隐藏。
+- 共享 `RTABMapApp` scheme 的默认 Launch/Run 从 Debug 改为 Release，普通 Xcode Run 会执行严格 build-identity 生成/验证并可进入扫描。Test/Analyze 和手动 Debug 构建仍为 Debug，仍删除身份文件并 fail closed；没有放宽 `MobileBuildIdentity.isUsable`，也没有加入 `--allow-dirty`。`RTABMapApp-QualifiedDevice` 继续保留。
+- 聚焦 UX/yaw/build-identity 合同扩展为 29 项，新增先选后载、配置页无 picker、导入进度延迟显示和默认 Run Release 回归。
+- 当前修改已通过 unsigned generic iPhoneOS Debug 全量编译/链接，且日志确认 Debug 身份被移除；提交后默认 `RTABMapApp` Release 全量编译/链接也通过，日志包含 `build identity verified` 和 `BUILD SUCCEEDED`。这仍不替代真机安装、相机/LiDAR 或现场扫描验证。
+
 ## 2026-08-10 — 全手机扫描统一 UX 与启动事务阻断级收口
 
-- 首页大型“新建扫描”和菜单“开始门店扫描”现在都进入同一个 `MobileScanSetupViewController`；“门店地图”统一管理手机编译的 XLSX/CSV/JSON 和 PC production-validator 通过的 v2 prior-map package。两种来源最终复用同一个 `MobileMapLibrary`、配置页、`MobileOnlyWorkflowCoordinator` 和 `ViewController.startMobileOnlyScan()`，旧 `PriorMapWizardViewController` 不再从生产入口可达。自由扫描和原始数据录制降级到“实验与兼容工具”。
+- 首页大型“新建扫描”和菜单“开始门店扫描”统一进入同一套全手机流程；本日后续的“地图先选后载”修复将其入口调整为先打开轻量选择页，再以选定地图创建同一个 `MobileScanSetupViewController`。“门店地图”统一管理手机编译的 XLSX/CSV/JSON 和 PC production-validator 通过的 v2 prior-map package。两种来源最终复用同一个 `MobileMapLibrary`、配置页、`MobileOnlyWorkflowCoordinator` 和 `ViewController.startMobileOnlyScan()`，旧 `PriorMapWizardViewController` 不再从生产入口可达。自由扫描和原始数据录制降级到“实验与兼容工具”。
 - 卡顿根因是 UI 线程进入/返回时逐包执行完整 manifest/JSON/PNG/距离场校验，并在开始扫描时重复构造 package/localizer、创建会话和打开 native SQLite；MapCase02 单次完整包校验的本机 host 证据约为 9.36 秒。普通地图库进入现在只读轻量 registry，完整刷新、provider 复制/fsync、精确 package 加载、localizer 构造、会话/数据库准备均转入后台串行队列；主线程只执行短 UIKit、ARSession、CameraMobile 和状态切换事务。
 - 统一配置页支持 1×–8× 捏合缩放、单指平移、双击放大/复位、点击选点、0.1/0.5/1.0 m 方向键微调，以及东/北/西/南和左右 15° 离散朝向；删除横向 yaw slider。首页直达时显示 Close，从地图库 push 时保留系统 Back/返回手势，离开页面会取消 queued/running 启动。
-- 手机地图编译页面显示严格解析、身份/元素校验、道路图、逐楼层/逐分辨率距离场、空间索引、工件写入、逐楼层预览、验证报告、manifest、production self-validation、fsync、不可变提交和 registry 注册等真实阶段，并持续显示百分比和用时；完成页显示 store ID、prior-map ID、package/canonical SHA、楼层、源/有效/忽略元素和 warning 统计。
-- 新增共享 `RTABMapApp-QualifiedDevice` scheme：Run/Launch 使用 Release，Test/Analyze 使用 Debug，Profile/Archive 使用 Release；普通 `RTABMapApp` Debug 继续故意不携带 build identity 并 fail closed。正式真机门店扫描必须从已提交且 tracked tree 干净的 `RTABMapApp-QualifiedDevice` 构建，不允许 `--allow-dirty` 或放宽 `MobileBuildIdentity.isUsable`。
+- 手机地图编译页面在 provider 返回文件并进入安全暂存后，显示严格解析、身份/元素校验、道路图、逐楼层/逐分辨率距离场、空间索引、工件写入、逐楼层预览、验证报告、manifest、production self-validation、fsync、不可变提交和 registry 注册等真实阶段，并持续显示百分比和用时；文件选择前保持隐藏。完成页显示 store ID、prior-map ID、package/canonical SHA、楼层、源/有效/忽略元素和 warning 统计。
+- 新增共享 `RTABMapApp-QualifiedDevice` scheme：Run/Launch 使用 Release，Test/Analyze 使用 Debug，Profile/Archive 使用 Release；手动 Debug 继续故意不携带 build identity 并 fail closed。本日后续修复也把普通 `RTABMapApp` 的默认 Run/Launch 改为 Release，使两者都可从已提交且 tracked tree 干净的版本生成严格身份；不允许 `--allow-dirty` 或放宽 `MobileBuildIdentity.isUsable`。
 - 扫描启动改为可回滚 durable transaction：相机权限在 workflow commit 前完成；session-scoped streaming DB 跳过旧 `Documents/rtabmap.tmp.db` 异步 recovery continuation；host 启动成功后以 `O_EXCL|O_NOFOLLOW`、完整写、文件/目录 fsync 持久化 receipt，再以 workflow context v3 绑定 session、segment、database、map/store 和 receipt SHA。任一步失败或取消都会停止 CameraMobile/ARSession/mapping/clock、清 prior-map state、让 native core 脱离失败数据库并释放未提交会话，不能留下无 receipt 的“幽灵扫描”。
-- 地图库复审关闭 registry/manifest 全身份绑定、rebuild 单快照、正式 package descriptor/no-follow freeze 和异常 symlink 外部目标权限四组 P1。最终专项复审为 `P0=0 / P1=0`；聚焦 UX/build-identity/yaw 合同 27/27 PASS，Swift 核心长方法 1/1 PASS（1233.541 s），四张真实 XLSX 手机地图库链路 4/4 PASS，PC production validator 4/4 PASS，unsigned iphoneos Debug build PASS。真机重新安装、QualifiedDevice 设备运行、完整 discover、exact-final-SHA、Device Lab、LiDAR/现场矩阵仍未关闭，整体保持 **REJECTED / NO-GO / developer smoke only**。
+- 地图库复审关闭 registry/manifest 全身份绑定、rebuild 单快照、正式 package descriptor/no-follow freeze 和异常 symlink 外部目标权限四组 P1。最终专项复审为 `P0=0 / P1=0`；本日后续新增两项 UI/build-identity 合同后，聚焦 UX/build-identity/yaw 合同为 29/29 PASS；Swift 核心长方法 1/1 PASS（1233.541 s），四张真实 XLSX 手机地图库链路 4/4 PASS，PC production validator 4/4 PASS，此前 unsigned iphoneos Debug build PASS。真机重新安装、干净 Release 设备运行、完整 discover、exact-final-SHA、Device Lab、LiDAR/现场矩阵仍未关闭，整体保持 **REJECTED / NO-GO / developer smoke only**。
 
 - 修复真机 XLSX 地图导入的 `不安全的地图标识` 阻断：Swift/PC 新生成 `prior_map_id` 统一为先过滤原始 ASCII、再 ASCII lowercase、slug 最长 115、最终 ID 最长 128；同时拒绝 APFS 上旧 uppercase 目录与新 lowercase ID 的 case-fold 别名。旧 uppercase v2 包只保留只读 integrity 兼容，不自动改写 exact ID/SHA。
-- `map 2.xlsx` 与正式 MapCase02 source SHA 完全相同；修复后 MapCase02 ID 为 `piaseczno-5ddfac7dc439`、Swift package `8d3564ce68aadb087a2820a02b4747d15ea1f4d22b14e8776f913d33775b1b84`、PC package `41332d093e652ec2de94f0f86b8f15107cd6f67f3b2e5ddec1c0685ab4d7d3be`。Swift validation report 新增并强校验 road graph `node_count`/`edge_count`；Swift/Python 同步严格拒绝 v1/v2 manifest/report 计数中的 bool/integral-float、非数组 warnings/malformed rows，legacy v1 的 element statistics 与 visible/hidden 也重新派生，Python 外层测试直接以 production validator 验证 Swift 包。新增 `--xlsx-library-smoke`，MapCase02、TianHong、北京昌平与 Kohl's 四张真实地图全部通过 compile/integrity/install/register/list/exact-read。
+- `map 2.xlsx` 与正式 MapCase02 source SHA 完全相同；修复后 MapCase02 ID 为 `piaseczno-5ddfac7dc439`、Swift package `c6b6b2c00690998cfa9517374b9385f857cb3ee0efcbe3663f63ee76fee87959`、PC package `41332d093e652ec2de94f0f86b8f15107cd6f67f3b2e5ddec1c0685ab4d7d3be`。2026-08-10 修复手机 CoreGraphics 预览的重复 Y 翻转，使预览、选点和 canonical 障碍物几何同向；该修复只改变 Swift preview/package digest。Swift validation report 新增并强校验 road graph `node_count`/`edge_count`；Swift/Python 同步严格拒绝 v1/v2 manifest/report 计数中的 bool/integral-float、非数组 warnings/malformed rows，legacy v1 的 element statistics 与 visible/hidden 也重新派生，Python 外层测试直接以 production validator 验证 Swift 包。新增 `--xlsx-library-smoke`，MapCase02、TianHong、北京昌平与 Kohl's 四张真实地图全部通过 compile/integrity/install/register/list/exact-read。
 - Swift 正式套件和 Python MapCase02 回归现在直接绑定 source/canonical/Swift package/PC package/PC preview frozen SHA，消除“编译结果只与自身 digest 比较”的假绿。旧 uppercase v2 仅在显式 diagnostic-only 模式保留只读完整性结果；普通 iOS/PC validator、旧向导和离线定位默认拒绝。
 
 - I10 exact-SHA run [`31307753672`](https://github.com/mcjiansheng/MarketScanner/actions/runs/31307753672) 在 `8f0e730d92773eea2ab58f56742d901ac02eead4` 为 7/8：七个非 Apple required jobs、完整 macOS host、SwiftPM cold resolve、Xcode metadata 与 200k tag-evidence RSS `794,099,712 < 805,306,368` bytes 均 PASS；唯一失败是 iphoneos cold dependency 的 RTAB-Map configure 无法自动发现位于 `rtabmap/prebuild/bin/` 的宿主 `rtabmap-res_tool`，所以 simulator/device clean link skipped，未冻结。

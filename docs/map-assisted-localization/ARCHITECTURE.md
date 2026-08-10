@@ -28,7 +28,7 @@ iOS prior_map_localized
     -> localization trace / constraints / state events
     -> 人工确认 -> manual_localization_events.jsonl
   用户触发 ESL Capture Mode（持续复用 ARFrame，不暂停扫描）
-    -> camera-only preview + 真实 Vision ROI（8 Hz / one-in-flight）
+    -> camera-only preview + 真实/扩展 Vision ROI（10 Hz / one-in-flight）
     -> 2-frame candidate lock -> 3 minimum / 4 target durable frames
     -> 同帧 depth 中值/MAD 或货架平面射线
     -> 至少 3 个逐帧可靠的同 segment+side quorum
@@ -82,7 +82,7 @@ PC prior-map localized
 - Capture Mode 不暂停 ARSession、RTAB-Map、连续数据库、Clock、Pose、node creation 或 prior-map localization。Vision/preview/evidence/UI completion 全部受 generation gate；取消、系统中断、最终化和 prior-map unload 会统一失效旧工作。
 - session admission gate 是 localization/confirmation writer 与 finalization 的唯一线性化点。finalization 关闭新 admission 后等待所有已登记 transaction/reservation；已登记 writer 在取得序列化锁后不会被内部二次 finalization 检查误拒。finalization 排空在主线程之外完成，timeout 只改变等待提示，不允许在实际 drain 前半封口或发布 snapshot。
 - prior-map queue 在入队前和执行前都检查 generation 与 finalization；因此 drain sentinel 后排入的普通 ARFrame 任务不能更新 localizer 或写普通 Recovery。普通 frame-driven Recovery 显式使用 `allowDuringFinalization=false`，只有 terminal teardown/finalization Recovery 使用 true。
-- 原始价签观测先落盘，complete burst 再落盘，最终价签才允许用户明确确认。最终化与 PC reader 对每个 `observation_id / burst_id / frame_id / payload / symbology` 做精确交叉绑定，v2 tag 的 frame set 必须精确等于一个 verified complete burst，tag payload/symbology 必须与 burst 相等，burst sequence 必须为正且严格递增。weak/lost、低测量/低关联置信或不足 3 个逐帧可靠证据均不能授权确认。
+- 原始价签观测先落盘，complete burst 再落盘，最终价签才允许用户明确确认。最终化与 PC reader 对每个 `observation_id / burst_id / frame_id / payload / symbology` 做精确交叉绑定，v2 tag 的 frame set 必须精确等于一个 verified complete burst，tag payload/symbology 必须与 burst 相等，burst sequence 必须为正且严格递增。weak/recovering、低测量/低关联置信不能授权自动确认，但只要 complete burst、exact node 和可重算位置权威齐全，就保留为 `LOW_CONFIDENCE` 并由最终 node pose 重投影；不足 3 帧、身份/图质量、exact node/raw pose 或位置权威缺失仍为 `RESCAN_REQUIRED`。
 - capture generation 冻结 exact tracking session identity。ESL audit 只通过 active-only API 追加到已存在的 `segment_0001`，不隐式启动 session；普通迟到 audit 在 finalization 后拒绝，只有 scan-stop 自有 cancellation/continuity audit 可使用窄范围 override，因此旧 callback 不会创建空后继 session 或污染新扫描。
 - 算法候选与用户选择在 schema 中分离；用户确认不得修改算法字段、SLAM、地图对齐、node pose 或 localization constraint。替代候选使用 `shelfSegmentId + side` 精确 identity。
 - 阶段三求解器明确标记为 `bounded_correction_field`：x/y/yaw 带状平滑没有实现 RTAB‑Map 相对边/闭环边的耦合 SE(2) 残差，不具备正式发布资格。

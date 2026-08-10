@@ -20,6 +20,8 @@
 ## 统一地图库与可观测进度
 
 - `MobileMapLibraryViewController` 的普通进入只读取轻量 registry，不在主线程逐包解析 manifest、JSON 和 PNG。下拉刷新才执行完整复验；扫描配置页在后台加载并复用一次 immutable package snapshot。
+- 扫描入口使用 `selectForScan` 模式：先列出已注册地图并提供明确的“导入新地图”按钮，用户点击某条记录后才完整验证/加载该包。`MobileScanSetupViewController` 必须由 `selectedMap` initializer 创建，不再内部列出或切换地图。
+- 导入页在系统 picker 尚未返回文件时隐藏百分比、进度条和计时；进入 `stagingMapSource` 后才显示，取消选择不会留下 0% 空进度。
 - `+` 菜单支持两种来源：手机编译的 XLSX/CSV/JSON，以及 PC 已生成并通过 production validator 的正式 v2 prior-map package。两者安装后都进入同一个内容寻址地图库，并打开同一个 `MobileScanSetupViewController`。
 - PC package 导入按 provider folder snapshot → production integrity → 私有 staging exact copy → staging 复验 → CAS 安装 → registry 注册执行。缺少有效 `store_id`、canonical source identity 或文件完整性不合格的旧包 fail closed。
 - 手机编译进度必须来自实际阶段：复制、严格解析、业务身份/元素校验、楼层范围、道路图、逐楼层/逐分辨率距离场、空间索引、工件写入、逐楼层预览、validation report、manifest、production self-validation、fsync、不可变提交和 registry 注册。

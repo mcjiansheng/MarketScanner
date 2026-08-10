@@ -22,6 +22,80 @@ enum PriceTagScanROIError: Error, Equatable {
     case emptyIntersection
 }
 
+/// Normalizes Vision barcode observations into one downstream coordinate
+/// contract: oriented full-image normalized coordinates with a lower-left
+/// origin. Vision revision 1 already reports that contract when an ROI is
+/// used, while revision 2 and newer report bounds local to the request ROI.
+///
+/// This type deliberately lives in the platform-neutral capture core so the
+/// exact production conversion can be exercised by the macOS Swift host.
+enum PriceTagVisionBoundingBoxNormalizer {
+    private static let boundaryEpsilon: CGFloat = 1.0e-6
+
+    static func fullImageBounds(
+        observationBounds: CGRect,
+        requestRegionOfInterest: CGRect,
+        requestRevision: Int
+    ) -> CGRect? {
+        guard requestRevision >= 1,
+              let roi = validatedUnitRect(requestRegionOfInterest),
+              let observation = validatedUnitRect(observationBounds) else {
+            return nil
+        }
+        if requestRevision == 1 {
+            return observation
+        }
+        let converted = CGRect(
+            x: roi.origin.x + observation.origin.x * roi.width,
+            y: roi.origin.y + observation.origin.y * roi.height,
+            width: observation.width * roi.width,
+            height: observation.height * roi.height)
+        return validatedUnitRect(converted)
+    }
+
+    /// Validates without standardizing negative-size CGRect values. Only
+    /// sub-micro unit boundary drift is snapped; material out-of-range
+    /// evidence is rejected rather than hidden by an unconditional clamp.
+    private static func validatedUnitRect(_ rect: CGRect) -> CGRect? {
+        let values = [
+            rect.origin.x,
+            rect.origin.y,
+            rect.size.width,
+            rect.size.height,
+        ]
+        guard values.allSatisfy({ $0.isFinite }),
+              rect.size.width > 0,
+              rect.size.height > 0 else {
+            return nil
+        }
+        let rawMaximumX = rect.origin.x + rect.size.width
+        let rawMaximumY = rect.origin.y + rect.size.height
+        guard rawMaximumX.isFinite,
+              rawMaximumY.isFinite,
+              rect.origin.x >= -boundaryEpsilon,
+              rect.origin.y >= -boundaryEpsilon,
+              rawMaximumX <= 1 + boundaryEpsilon,
+              rawMaximumY <= 1 + boundaryEpsilon else {
+            return nil
+        }
+        let minimumX: CGFloat = rect.origin.x < 0 ? 0 : rect.origin.x
+        let minimumY: CGFloat = rect.origin.y < 0 ? 0 : rect.origin.y
+        let maximumX: CGFloat = rawMaximumX > 1 ? 1 : rawMaximumX
+        let maximumY: CGFloat = rawMaximumY > 1 ? 1 : rawMaximumY
+        guard minimumX <= 1,
+              minimumY <= 1,
+              maximumX > minimumX,
+              maximumY > minimumY else {
+            return nil
+        }
+        return CGRect(
+            x: minimumX,
+            y: minimumY,
+            width: maximumX - minimumX,
+            height: maximumY - minimumY)
+    }
+}
+
 enum PriceTagScanROIMapper {
     static func orientedImageSize(
         imageResolution: CGSize,
@@ -150,6 +224,11 @@ struct PriceTagCaptureLayout {
         y: 0.36,
         width: 0.76,
         height: 0.25)
+    /// Text/progress controls are anchored to the exact scan-box edges with
+    /// these clearances. They must never be positioned with centerY magic
+    /// numbers, which overlap the border on taller Dynamic Type/device sizes.
+    static let statusClearancePoints: CGFloat = 18
+    static let payloadClearancePoints: CGFloat = 18
 
     static func scanRect(in bounds: CGRect) -> CGRect {
         return CGRect(
@@ -316,9 +395,9 @@ struct PriceTagCapturePolicy: Equatable {
         minimumEvidenceFrames: 3,
         targetEvidenceFrames: 4,
         minimumCaptureDuration: 0.30,
-        maximumCaptureDuration: 2.0,
+        maximumCaptureDuration: 4.0,
         maximumVisionRequestDuration: 1.0,
-        visionRateHz: 8,
+        visionRateHz: 10,
         previewRateHz: 24,
         minimumROIIntersectionRatio: 0.80,
         minimumCandidateNormalizedArea: 0.002,
@@ -548,6 +627,7 @@ enum PriceTagCaptureVisionAction: Equatable {
 enum PriceTagCaptureEvidenceAction: Equatable {
     case ignored
     case continueCollecting(acceptedFrames: Int, requiredFrames: Int)
+    case waitingForNodeBinding(acceptedFrames: Int, requiredFrames: Int)
     case resolve(captureID: UUID, observationIDs: [String])
     case timedOut(captureID: UUID)
     case requiredEvidenceFailed(captureID: UUID)
@@ -1481,6 +1561,34 @@ final class PriceTagCaptureCoordinator {
             requiredFrames: requiredFrames)
     }
 
+    /// A missing node-time snapshot is transient authority unavailability,
+    /// not a durable evidence-write failure. Release this frame's in-flight
+    /// slot and keep the locked barcode/capture alive for the next exact node.
+    /// Required sidecar failures still use `finishEvidence` with `false` and
+    /// remain terminal fail-closed.
+    func deferEvidenceUntilNodeBinding(
+        generation: UUID,
+        captureID: UUID,
+        frameTimestamp: TimeInterval
+    ) -> PriceTagCaptureEvidenceAction {
+        lock.lock()
+        defer { lock.unlock() }
+        guard case .collecting(
+                let currentGeneration, let currentCaptureID,
+                _, _, let acceptedFrames, let requiredFrames) = stateValue,
+              currentGeneration == generation,
+              currentCaptureID == captureID,
+              evidenceInFlight,
+              pendingEvidenceFrameTimestamp == frameTimestamp else {
+            return .ignored
+        }
+        evidenceInFlight = false
+        pendingEvidenceFrameTimestamp = nil
+        return .waitingForNodeBinding(
+            acceptedFrames: acceptedFrames,
+            requiredFrames: requiredFrames)
+    }
+
     func markConfirming(generation: UUID, captureID: UUID) -> Bool {
         lock.lock()
         defer { lock.unlock() }
@@ -1567,7 +1675,8 @@ final class PriceTagCaptureCoordinator {
         generation: UUID,
         payload: String,
         completedAt: TimeInterval,
-        committed: Bool
+        committed: Bool,
+        retainedForReview: Bool = false
     ) -> Bool {
         lock.lock()
         defer { lock.unlock() }
@@ -1577,7 +1686,7 @@ final class PriceTagCaptureCoordinator {
             illegalTransitionLocked("confirming_to_idle", generation: generation)
             return false
         }
-        if committed {
+        if committed || retainedForReview {
             completedPayloads[payload] = completedAt
         }
         stateValue = .idle

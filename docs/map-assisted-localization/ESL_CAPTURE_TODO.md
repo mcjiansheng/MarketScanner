@@ -1,6 +1,6 @@
 # ESL Barcode Capture / Shelf Confirmation TODO
 
-> 文档状态：**当前有效**。最后核对日期：2026-08-09。
+> 文档状态：**当前有效**。最后核对日期：2026-08-10。
 >
 > 本清单只登记本轮未开始或明确延期的低影响增强与资格测试。阻断级实现缺陷必须在代码审查中立即处理，不能仅移入本清单。当前整体判断仍是 **REJECTED / NO-GO / developer smoke only**；J-04 为 **BLOCKER / NOT CLOSED**。
 
@@ -14,12 +14,15 @@
 6. 覆盖正确货架、同 segment 不同 side、替代货架、无可靠候选、定位 weak/lost、prior-map unload、系统中断、低空间、thermal 和 required-write failure。
 7. 验证 `tag_observations.jsonl`、`tag_observation_bursts.jsonl`、`localized_price_tags.json`、metadata watermark 和 PC manifest v3 的 count、last ID、SHA-256 与 exact observation/burst binding。
 8. 在 PC 完成现场 A + optimized A、现场 A + optimized B、现场 A + offline unavailable 三类回放，分别验证 `NO_CONFLICT` approved、`USER_CONFIRMATION_CONFLICT` review/rescan、`OFFLINE_ASSOCIATION_UNAVAILABLE` review/rescan。
-9. 补齐平台 scoped `Libraries/iphonesimulator` / `Libraries/iphoneos` native dependencies，完成 simulator/device clean compile-link；当前本机 Xcode 已编译本轮 Swift 文件并 emit module，但最终被缺失的 Eigen/PCL/OpenCV headers（`Eigen/Core`、`pcl/point_cloud.h`、`opencv2/highgui/highgui.hpp`）阻断，不能记为 clean build PASS。
-10. 完整运行 `python3 -m unittest discover -s tools/PriorMap/tests -v`；I5 的关键长时 host workflow 已在 943.159 秒内 PASS（包括 Snapshot/Result/Map crash matrix、finalization/trace/tag scale），但不能把单方法结果冒充完整 discover PASS。
-11. 测量 scan-stop 期间 finalization-owned audit append、`persistTerminalRecoveryEvidence()` 与 `priorMapQueue.sync` 的主线程延迟；正确性和 snapshot 线性化已关闭，但慢盘或较大 Recovery sidecar 下的 UI latency 尚未资格化。
+9. 补齐平台 scoped `Libraries/iphonesimulator` / `Libraries/iphoneos` native dependencies，完成 simulator/device 两套 cold clean compile-link；当前修复源码的 unsigned generic iphoneos Debug 与 Release 已全量编译/链接 PASS，Release identity 也已精确验证，但不能替代两平台 cold dependency 或签名真机资格。
+10. 测量 scan-stop 期间 finalization-owned audit append、`persistTerminalRecoveryEvidence()` 与 `priorMapQueue.sync` 的主线程延迟；正确性和 snapshot 线性化已关闭，但慢盘或较大 Recovery sidecar 下的 UI latency 尚未资格化。
 
 ## 已延期的低影响实现
 
+- S1（独立复审低影响项）：`MobileProcessingPipeline` 生成 `RescanTask` 时，将裸 machine reason code 映射为稳定、可本地化、面向操作员的 `humanMessage`；机器 reason 字段继续单独保留，不能用可读文案替代审计码。
+- S2（独立复审低影响项）：历史原始扫描导出在 `startAccessingSecurityScopedResource()` 返回 `false` 时立即给出明确的 provider/权限提示，而不是继续到后续写入失败；保持本地原始扫描不删除、目标不覆盖和 SHA 复核合同不变。
+- S3（本轮独立复审 P2）：成功导入地图并进入 `.mapReady` 后，提供显式且安全的“完成导入并返回空闲”生命周期收口，使同一 App 会话可以进入历史处理；只能在 import/compile operation 已真实释放且地图注册/上下文已持久化后执行 `.mapReady -> .idle`，不得以新增 `.mapReady -> .snapshotting`、强制重置活动流程或绕过 typed admission 实现。补充导入完成、关闭地图库、随后处理历史扫描的状态与 UI 回归。
+- S4（本轮独立复审 P2）：历史原始扫描导出在创建目标目录前拒绝目标目录等于或位于源 `segment_0001` / 会话目录内部的选择，避免 provider 递归自复制后才失败；使用标准化且可证明的祖先/后代关系检查，显示明确错误，并继续保证失败清理只删除本次新建的 export root、绝不删除本地原始扫描。补充同目录、子目录、合法外部目录和 provider alias 的回归。
 - Candidate lock 增加 maximum inter-frame gap，明确覆盖 `A → 长停顿/Vision error → A`，避免跨过长间隔直接锁定。
 - `didReceiveMemoryWarning` 和 host `ViewController` dismissal 路径增加 Barcode UX 的显式 generation invalidation、overlay/preview 清理回归。
 - candidate lock 增加一次 light haptic，错误状态增加 warning haptic；不得按 frame 重复震动。

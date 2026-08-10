@@ -1,4 +1,5 @@
 import UIKit
+import UniformTypeIdentifiers
 
 /// Historical-scan processing screen (V1R2 Gate 0 §4.2 / Gate A): lists
 /// finalized sessions discovered on device, lets the user pick one, then
@@ -12,7 +13,10 @@ import UIKit
 /// - Cells use the `.subtitle` style so `detailTextLabel` is real.
 /// - The prior map bound to the session metadata selects the map; the
 ///   first library entry is never picked blindly.
-final class MobileProcessingViewController: UIViewController, UITableViewDataSource, UITableViewDelegate {
+final class MobileProcessingViewController: UIViewController,
+    UITableViewDataSource,
+    UITableViewDelegate,
+    UIDocumentPickerDelegate {
 
     struct SessionCandidate {
         let sessionDirectory: URL
@@ -51,7 +55,11 @@ final class MobileProcessingViewController: UIViewController, UITableViewDataSou
     private let statusLabel = UILabel()
     private var candidates: [SessionCandidate] = []
     private var processing = false
+    private var exporting = false
+    private var pendingExportCandidate: SessionCandidate?
     private var observerTokens: [MobileOnlyWorkflowCoordinator.ObserverToken] = []
+
+    private var isBusy: Bool { processing || exporting }
 
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -106,6 +114,7 @@ final class MobileProcessingViewController: UIViewController, UITableViewDataSou
         observerTokens.append(coordinator.addProcessingObserver { [weak self] result in
             guard let self = self else { return }
             self.processing = false
+            self.updateBusyPresentation()
             switch result {
             case .success(let entry):
                 self.progressView.setProgress(1.0, animated: true)
@@ -176,6 +185,7 @@ final class MobileProcessingViewController: UIViewController, UITableViewDataSou
     }
 
     @objc private func close() {
+        guard !isBusy else { return }
         dismiss(animated: true)
     }
 
@@ -205,6 +215,7 @@ final class MobileProcessingViewController: UIViewController, UITableViewDataSou
             cell.textLabel?.textColor = .secondaryLabel
             cell.detailTextLabel?.text = nil
             cell.selectionStyle = .none
+            cell.accessoryView = nil
             return cell
         }
         let candidate = candidates[indexPath.row]
@@ -214,7 +225,22 @@ final class MobileProcessingViewController: UIViewController, UITableViewDataSou
         let boundMap = candidate.boundPriorMapID ?? "未绑定地图"
         cell.detailTextLabel?.text =
             "finalized · trace \(traceCount ?? 0) · \(boundMap)"
-        cell.accessoryType = processing ? .none : .disclosureIndicator
+        let exportButton = UIButton(type: .system)
+        exportButton.setImage(
+            UIImage(systemName: "square.and.arrow.up"),
+            for: .normal)
+        exportButton.frame = CGRect(x: 0, y: 0, width: 44, height: 44)
+        exportButton.tag = indexPath.row
+        exportButton.isEnabled = !isBusy
+        exportButton.accessibilityLabel = "导出原始扫描"
+        exportButton.accessibilityHint =
+            "无需先处理成功，直接复制并校验完整历史扫描目录"
+        exportButton.addTarget(
+            self,
+            action: #selector(exportButtonTapped(_:)),
+            for: .touchUpInside)
+        cell.accessoryView = exportButton
+        cell.selectionStyle = isBusy ? .none : .default
         return cell
     }
 
@@ -222,7 +248,7 @@ final class MobileProcessingViewController: UIViewController, UITableViewDataSou
 
     func tableView(_ tableView: UITableView, didSelectRowAt indexPath: IndexPath) {
         tableView.deselectRow(at: indexPath, animated: true)
-        guard !processing, !candidates.isEmpty else { return }
+        guard !isBusy, !candidates.isEmpty else { return }
         let candidate = candidates[indexPath.row]
 
         // The map bound to the session metadata selects the library entry
@@ -243,14 +269,121 @@ final class MobileProcessingViewController: UIViewController, UITableViewDataSou
         }
 
         processing = true
-        statusLabel.text = "开始处理…"
-        coordinator.beginProcessing(
+        updateBusyPresentation()
+        let admission = coordinator.beginProcessing(
             finalizedSession: candidate.segmentDirectory,
             sourceDatabase: candidate.databaseURL,
             priorMap: map,
             storeID: candidate.storeID,
             floorID: candidate.floorID,
             trackingSessionID: candidate.trackingSessionID)
+        switch admission {
+        case .success:
+            statusLabel.text = "开始处理…"
+        case .failure(let error):
+            processing = false
+            updateBusyPresentation()
+            progressView.setProgress(0, animated: false)
+            statusLabel.text = "无法开始处理：\(error.localizedDescription)"
+            presentNotice(
+                "无法开始处理该历史扫描：\n\(error.localizedDescription)\n\n"
+                    + "请先完成或退出当前地图导入、扫描或处理流程，然后重试。")
+        }
+    }
+
+    @objc private func exportButtonTapped(_ sender: UIButton) {
+        guard !isBusy,
+              candidates.indices.contains(sender.tag) else { return }
+        pendingExportCandidate = candidates[sender.tag]
+        let picker = UIDocumentPickerViewController(
+            forOpeningContentTypes: [.folder],
+            asCopy: false)
+        picker.delegate = self
+        picker.allowsMultipleSelection = false
+        picker.shouldShowFileExtensions = true
+        present(picker, animated: true)
+    }
+
+    func documentPicker(
+        _ controller: UIDocumentPickerViewController,
+        didPickDocumentsAt urls: [URL]
+    ) {
+        guard !isBusy,
+              let candidate = pendingExportCandidate,
+              let destination = urls.first else {
+            pendingExportCandidate = nil
+            return
+        }
+        pendingExportCandidate = nil
+        let didStartSecurityScope =
+            destination.startAccessingSecurityScopedResource()
+        exporting = true
+        updateBusyPresentation()
+        progressView.setProgress(0.02, animated: false)
+        statusLabel.text = "正在准备导出原始历史扫描…"
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let result: Result<URL, Error>
+            do {
+                let exported = try SupermarketScanSession.exportFinalizedCapture(
+                    from: candidate.segmentDirectory,
+                    localDocumentsDirectory:
+                        candidate.sessionDirectory.deletingLastPathComponent(),
+                    destinationBaseDirectory: destination,
+                    expectedTrackingSessionID: candidate.trackingSessionID,
+                    progress: { fraction, message in
+                        DispatchQueue.main.async { [weak self] in
+                            guard let self, self.exporting else { return }
+                            self.progressView.setProgress(
+                                Float(fraction),
+                                animated: true)
+                            self.statusLabel.text = message
+                        }
+                    })
+                result = .success(exported)
+            } catch {
+                result = .failure(error)
+            }
+            DispatchQueue.main.async { [weak self] in
+                if didStartSecurityScope {
+                    destination.stopAccessingSecurityScopedResource()
+                }
+                guard let self else { return }
+                self.exporting = false
+                self.updateBusyPresentation()
+                switch result {
+                case .success(let exported):
+                    self.progressView.setProgress(1.0, animated: true)
+                    self.statusLabel.text =
+                        "导出完成：\(exported.deletingLastPathComponent().lastPathComponent)"
+                    self.presentNotice(
+                        "完整原始扫描已复制并通过 SHA-256 复核。\n\n"
+                        + "导出目录：\(exported.deletingLastPathComponent().lastPathComponent)\n"
+                        + "手机中的本地原始扫描仍然保留。")
+                case .failure(let error):
+                    self.progressView.setProgress(0.0, animated: true)
+                    self.statusLabel.text =
+                        "导出失败：\(error.localizedDescription)"
+                    self.presentNotice(
+                        "原始历史扫描导出失败：\n\(error.localizedDescription)\n\n"
+                        + "手机中的本地原始扫描没有被删除。")
+                }
+                self.tableView.reloadData()
+            }
+        }
+    }
+
+    func documentPickerWasCancelled(
+        _ controller: UIDocumentPickerViewController
+    ) {
+        pendingExportCandidate = nil
+    }
+
+    private func updateBusyPresentation() {
+        navigationItem.leftBarButtonItem?.isEnabled = !isBusy
+        navigationController?.isModalInPresentation = isBusy
+        tableView.isUserInteractionEnabled = !isBusy
+        tableView.reloadData()
     }
 
     private func presentNotice(_ message: String) {

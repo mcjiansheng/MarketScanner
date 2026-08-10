@@ -10,8 +10,10 @@ import AVFoundation
 /// package-integrity gate.
 final class MobileScanSetupViewController: UIViewController {
 
-    /// Set by the map library/import result when a map is already chosen.
-    var selectedMap: MobileMapLibrary.MapEntry?
+    /// The setup screen is entered only after an explicit lightweight
+    /// library selection. Keeping this immutable prevents an accidental
+    /// picker change from starting another expensive package load.
+    private let selectedMap: MobileMapLibrary.MapEntry
 
     private struct Obstacle {
         let points: [(Double, Double)]
@@ -52,7 +54,6 @@ final class MobileScanSetupViewController: UIViewController {
 
     private let formScrollView = UIScrollView()
     private let contentStack = UIStackView()
-    private let mapPicker = UIPickerView()
     private let floorControl = UISegmentedControl()
     private let loadingIndicator = UIActivityIndicatorView(style: .medium)
     private let loadingLabel = UILabel()
@@ -72,7 +73,6 @@ final class MobileScanSetupViewController: UIViewController {
     private let summaryLabel = UILabel()
     private let startButton = UIButton(type: .system)
 
-    private var maps: [MobileMapLibrary.MapEntry] = []
     private var payload: SetupPayload?
     private var selectedFloorIndex = 0
     private var startXM: Double?
@@ -85,13 +85,23 @@ final class MobileScanSetupViewController: UIViewController {
     private var cameraPermissionRequestInFlight = false
     private var observerTokens: [MobileOnlyWorkflowCoordinator.ObserverToken] = []
 
+    init(selectedMap: MobileMapLibrary.MapEntry) {
+        self.selectedMap = selectedMap
+        super.init(nibName: nil, bundle: nil)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("MobileScanSetupViewController is programmatic")
+    }
+
     override func viewDidLoad() {
         super.viewDidLoad()
         title = "开始门店扫描"
         view.backgroundColor = .systemBackground
         buildUI()
         registerWorkflowObservers()
-        reloadMaps()
+        loadMap(selectedMap)
     }
 
     override func viewWillAppear(_ animated: Bool) {
@@ -153,11 +163,6 @@ final class MobileScanSetupViewController: UIViewController {
         contentStack.translatesAutoresizingMaskIntoConstraints = false
         formScrollView.addSubview(contentStack)
 
-        mapPicker.dataSource = self
-        mapPicker.delegate = self
-        mapPicker.accessibilityLabel = "门店地图"
-        mapPicker.heightAnchor.constraint(equalToConstant: 108).isActive = true
-
         floorControl.addTarget(
             self, action: #selector(floorChanged), for: .valueChanged)
         floorControl.accessibilityLabel = "扫描楼层"
@@ -209,7 +214,6 @@ final class MobileScanSetupViewController: UIViewController {
             .isActive = true
 
         [
-            mapPicker,
             floorControl,
             loadingRow,
             mapScrollView,
@@ -375,45 +379,6 @@ final class MobileScanSetupViewController: UIViewController {
 
     // MARK: - Background loading
 
-    private func reloadMaps() {
-        setLoading(true, message: "正在读取地图库…")
-        if let selectedMap = selectedMap {
-            maps = [selectedMap]
-            mapPicker.reloadAllComponents()
-            mapPicker.selectRow(0, inComponent: 0, animated: false)
-            loadMap(selectedMap)
-            return
-        }
-
-        let generation = UUID()
-        loadingGeneration = generation
-        loadQueue.async { [weak self] in
-            let result = Result { try MobileMapLibrary.listRegisteredMaps() }
-            DispatchQueue.main.async {
-                guard let self = self,
-                      self.loadingGeneration == generation else { return }
-                switch result {
-                case .success(let entries):
-                    self.maps = entries
-                    self.mapPicker.reloadAllComponents()
-                    if let first = entries.first {
-                        self.mapPicker.selectRow(0, inComponent: 0, animated: false)
-                        self.loadMap(first)
-                    } else {
-                        self.payload = nil
-                        self.setLoading(false, message: "地图库为空，请先导入地图。")
-                        self.updateSummary()
-                    }
-                case .failure(let error):
-                    self.payload = nil
-                    self.setLoading(false, message: "地图库读取失败")
-                    self.presentNotice(error.localizedDescription)
-                    self.updateSummary()
-                }
-            }
-        }
-    }
-
     private func loadMap(_ map: MobileMapLibrary.MapEntry) {
         let generation = UUID()
         loadingGeneration = generation
@@ -510,9 +475,6 @@ final class MobileScanSetupViewController: UIViewController {
         } else {
             loadingIndicator.stopAnimating()
         }
-        mapPicker.isUserInteractionEnabled = !loading
-            && !startInFlight
-            && !cameraPermissionRequestInFlight
         floorControl.isEnabled = !loading
             && !startInFlight
             && !cameraPermissionRequestInFlight
@@ -960,7 +922,18 @@ final class MobileScanSetupViewController: UIViewController {
             startYM: y,
             startYawRad: startYawRad,
             storeID: package.manifest.storeID)
-        coordinator.beginScanSetup(map: map)
+        guard coordinator.beginScanSetup(map: map) else {
+            startInFlight = false
+            formScrollView.isUserInteractionEnabled = true
+            navigationItem.leftBarButtonItem?.isEnabled = true
+            setLoading(
+                false,
+                message: "当前已有扫描正在进行或结束中，不能创建第二个扫描事务。")
+            presentNotice(
+                coordinator.lastError?.errorDescription
+                    ?? "当前已有扫描正在进行或结束中，请先返回扫描界面完成或结束当前扫描。")
+            return
+        }
         coordinator.commitScanConfiguration(configuration)
     }
 
@@ -1021,7 +994,7 @@ final class MobileScanSetupViewController: UIViewController {
     private static let unqualifiedBuildMessage = """
     当前构建没有可追踪的扫描身份，因此不能开始已有地图辅助扫描。
 
-    真机测试请在 Xcode 选择 RTABMapApp-QualifiedDevice scheme，并从已提交、tracked 文件干净的版本重新构建。普通 Debug 仍可用于界面调试，但不会生成可处理的正式扫描证据。
+    请使用 Xcode 共享的 RTABMapApp 默认 Run（当前配置为 Release），或 RTABMapApp-QualifiedDevice，从已提交且 tracked 文件干净的版本重新构建。手动改成 Debug 时仍只用于界面和导入调试。
     """
 
     private func updateSummary() {
@@ -1060,7 +1033,7 @@ final class MobileScanSetupViewController: UIViewController {
         let identityUsable = MobileBuildIdentity.loadFromBundle().isUsable
         let identityNote = identityUsable
             ? ""
-            : "\n当前为不可启动的 Debug 构建；请改用 RTABMapApp-QualifiedDevice。"
+            : "\n当前 App 缺少可追踪身份；请用 RTABMapApp 默认 Run 重新构建。"
         var displayDegrees = startYawRad * 180 / Double.pi
         if displayDegrees < 0 { displayDegrees += 360 }
         summaryLabel.text = String(
@@ -1076,9 +1049,7 @@ final class MobileScanSetupViewController: UIViewController {
     }
 
     private func currentMap() -> MobileMapLibrary.MapEntry? {
-        let row = mapPicker.selectedRow(inComponent: 0)
-        guard maps.indices.contains(row) else { return nil }
-        return maps[row]
+        return selectedMap
     }
 
     private func presentNotice(_ message: String) {
@@ -1087,36 +1058,6 @@ final class MobileScanSetupViewController: UIViewController {
             title: nil, message: message, preferredStyle: .alert)
         alert.addAction(UIAlertAction(title: "知道了", style: .default))
         present(alert, animated: true)
-    }
-}
-
-extension MobileScanSetupViewController: UIPickerViewDataSource, UIPickerViewDelegate {
-    func numberOfComponents(in pickerView: UIPickerView) -> Int { return 1 }
-
-    func pickerView(
-        _ pickerView: UIPickerView,
-        numberOfRowsInComponent component: Int
-    ) -> Int {
-        return max(maps.count, 1)
-    }
-
-    func pickerView(
-        _ pickerView: UIPickerView,
-        titleForRow row: Int,
-        forComponent component: Int
-    ) -> String? {
-        guard maps.indices.contains(row) else { return "地图库为空" }
-        return "\(maps[row].name)（\(maps[row].floorCount) 层）"
-    }
-
-    func pickerView(
-        _ pickerView: UIPickerView,
-        didSelectRow row: Int,
-        inComponent component: Int
-    ) {
-        guard maps.indices.contains(row) else { return }
-        selectedMap = maps[row]
-        loadMap(maps[row])
     }
 }
 

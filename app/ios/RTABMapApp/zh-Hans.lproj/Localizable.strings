@@ -73,6 +73,13 @@
 "Keep observations only" = "仅保留观测";
 "Select the shelf visible in the mini map, then save." = "请在小地图中选择现场可见的货架，然后保存。";
 "ARKit or prior-map localization is not ready, or required localization evidence has already failed." = "ARKit 或先验地图定位尚未就绪，或必要的定位证据写入已经失败。";
+"Unable to scan ESL barcode" = "无法扫描价签条码";
+"Required localization evidence has failed for this scan. Barcode capture is disabled to protect the result. End the scan, keep the recovery package, then start a new scan." = "本次扫描的必要定位证据写入已经失败。为保护结果，价签条码功能已停用；请结束当前扫描、保留恢复包，然后重新开始扫描。";
+"Prior-map alignment is not ready yet. Hold the device steady and try again after localization recovers." = "先验地图对齐尚未就绪。请保持设备稳定，等待定位恢复后再试。";
+"The camera frame is not ready. Keep the app in the foreground and try again in a moment." = "相机画面尚未就绪。请保持应用在前台，稍后重试。";
+"Barcode capture is available only while a store scan is actively recording." = "只有门店扫描正在连续录制时，才能扫描价签条码。";
+"This scan does not have a usable prior-map identity. End it and start again through Start Store Scan after selecting a map." = "当前扫描没有可用的先验地图身份。请结束扫描，然后在选择地图后通过“开始门店扫描”重新启动。";
+"Tracking or prior-map localization is temporarily unstable. Hold the device steady and try again after localization recovers." = "设备跟踪或先验地图定位暂时不稳定。请保持设备稳定，等待定位恢复后再试。";
 "An ESL capture or shelf confirmation is already active." = "当前已有 ESL 采集或货架确认正在进行。";
 "ESL capture cancelled. Raw scanning continued." = "已取消 ESL 采集，原始扫描仍在继续。";
 "ESL capture could not start." = "无法启动 ESL 采集。";
@@ -80,6 +87,9 @@
 "Barcode detection failed. Hold steady and try again." = "条码检测失败。请保持稳定并重试。";
 "Not enough independent frames. Hold the ESL steady and try again." = "独立采集帧不足。请稳住 ESL 并重试。";
 "ESL evidence was saved, but the shelf result was not stable. Please rescan." = "ESL 观测证据已保存，但货架结果不稳定。请重新扫描。";
+"The barcode evidence was saved, but fewer than three frames had a recomputable ESL position. Move slightly back and rescan once." = "条码证据已保存，但少于 3 帧具有可重算的价签位置。请稍微后移并重新扫描一次。";
+"Barcode recognized. Waiting for an exact scan-node pose before saving low-confidence evidence (%d/%d)." = "已识别价签条码，正在等待精确扫描节点位姿后保存低置信度证据（%d/%d）。";
+"The ESL was saved as low confidence. Its position will be recomputed from the exact scan node during processing; no immediate rescan is required." = "价签已按低置信度保存。后处理会根据精确扫描节点重新计算位置，无需立即重复扫描。";
 "The ESL observations could not be saved. The tag was not created; raw RTAB-Map recording continues." = "无法保存 ESL 观测，因此未创建价签；RTAB-Map 原始扫描仍在继续。";
 "Shelf confirmation could not be shown. The observations were kept for review." = "无法显示货架确认界面。观测已保留，等待复核。";
 "The localized ESL could not be saved. The observations remain available for review." = "无法保存已定位的 ESL。观测仍保留，可供后续复核。";

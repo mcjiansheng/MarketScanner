@@ -174,6 +174,96 @@ func close(_ first: Double, _ second: Double, tolerance: Double = 1.0e-9) -> Boo
     return abs(first - second) <= tolerance
 }
 
+require(
+    !PriorMapNodeTimebaseAdmission.accepts(offsetSeconds: nil),
+    "a missing native node timebase must wait without writing evidence")
+require(
+    !PriorMapNodeTimebaseAdmission.accepts(offsetSeconds: .nan)
+        && !PriorMapNodeTimebaseAdmission.accepts(offsetSeconds: .infinity),
+    "non-finite node-time offsets must never enter required evidence")
+require(
+    PriorMapNodeTimebaseAdmission.accepts(offsetSeconds: 0)
+        && PriorMapNodeTimebaseAdmission.accepts(offsetSeconds: -123.5),
+    "every finite native node-time offset must remain admissible")
+require(
+    MobileOnlyWorkflowState.scanning.allowsTransition(to: .finalizingScan)
+        && MobileOnlyWorkflowState.finalizingScan.allowsTransition(to: .scanning)
+        && MobileOnlyWorkflowState.finalizingScan.allowsTransition(to: .idle),
+    "scan finalization must support terminal close and recoverable resume")
+if case .success = MobileHistoricalProcessingAdmission.evaluate(
+    currentState: .idle,
+    processingBusy: false
+) {
+    // Expected.
+} else {
+    require(false, "idle must admit historical processing")
+}
+for rejectedState in [
+    MobileOnlyWorkflowState.pickingMap,
+    .stagingMapSource,
+    .importingMap,
+    .compilingMap,
+    MobileOnlyWorkflowState.mapReady,
+    .configuringScan,
+    .startingScan,
+    .scanning,
+    .finalizingScan,
+    .snapshotting,
+    .fastProcessing,
+    .deepProcessing,
+    .buildingTrajectory,
+    .resolvingTags,
+    .exporting,
+] {
+    if case .failure(.illegalTransition) =
+        MobileHistoricalProcessingAdmission.evaluate(
+            currentState: rejectedState,
+            processingBusy: false) {
+        // Expected.
+    } else {
+        require(
+            false,
+            "active state \(rejectedState.rawValue) must reject historical processing")
+    }
+}
+require(
+    !MobileOnlyWorkflowState.mapReady.allowsTransition(to: .snapshotting),
+    "historical-processing repair must not broaden mapReady -> snapshotting")
+require(
+    MobileOnlyWorkflowState.finalizingScan.allowsTransition(to: .snapshotting),
+    "scan lifecycle transition table must retain its internal finalization edge")
+if case .failure(.invalidState) =
+    MobileHistoricalProcessingAdmission.evaluate(
+        currentState: .idle,
+        processingBusy: true) {
+    // Expected.
+} else {
+    require(false, "duplicate historical processing admission must be rejected")
+}
+let previewProjectionBounds = SourceGeometry.Bounds(
+    minX_m: 0,
+    minY_m: -100,
+    maxX_m: 200,
+    maxY_m: 0)
+let previewLowerLeft = MobilePreviewRenderer.quartzPoint(
+    xM: 0,
+    yM: -100,
+    bounds: previewProjectionBounds,
+    canvasWidth: 1_000,
+    canvasHeight: 500)
+let previewUpperRight = MobilePreviewRenderer.quartzPoint(
+    xM: 200,
+    yM: 0,
+    bounds: previewProjectionBounds,
+    canvasWidth: 1_000,
+    canvasHeight: 500)
+require(
+    close(Double(previewLowerLeft.x), 0)
+        && close(Double(previewLowerLeft.y), 0)
+        && close(Double(previewUpperRight.x), 1_000)
+        && close(Double(previewUpperRight.y), 500),
+    "Quartz preview projection must preserve canonical map +Y without a second flip")
+
 func runESLFinalizationBindingFocusedTests() {
     do {
         let cleanDirectory = try p7r6FreshDirectory("esl-focused-clean")
@@ -359,6 +449,133 @@ func runESLBarcodeCaptureFocusedTests() {
         return false
     }
 
+    // BC-00: Vision revision 1 already reports full-image coordinates;
+    // revision 2+ reports request-ROI-local coordinates and must be converted
+    // with the exact request that produced the observation.
+    let primaryRequestROI = CGRect(
+        x: 0.2, y: 0.3, width: 0.5, height: 0.4)
+    let localObservation = CGRect(
+        x: 0.1, y: 0.2, width: 0.2, height: 0.2)
+    let revisionOne = PriceTagVisionBoundingBoxNormalizer.fullImageBounds(
+        observationBounds: localObservation,
+        requestRegionOfInterest: primaryRequestROI,
+        requestRevision: 1)
+    require(
+        revisionOne != nil
+            && closeRect(revisionOne!, localObservation),
+        "BC-00 revision 1 must preserve full-image observation bounds")
+    let convertedPrimary =
+        PriceTagVisionBoundingBoxNormalizer.fullImageBounds(
+            observationBounds: localObservation,
+            requestRegionOfInterest: primaryRequestROI,
+            requestRevision: 2)
+    let expectedPrimary = CGRect(
+        x: 0.25, y: 0.38, width: 0.10, height: 0.08)
+    require(
+        convertedPrimary != nil
+            && closeRect(convertedPrimary!, expectedPrimary),
+        "BC-00 revision 2 must affinely restore primary ROI-local bounds")
+
+    let operatorROI = CGRect(x: 0.3, y: 0.4, width: 0.4, height: 0.2)
+    let expandedRequestROI = CGRect(
+        x: 0.2, y: 0.3, width: 0.6, height: 0.4)
+    let expandedLocalInside = CGRect(
+        x: 0.4, y: 0.4, width: 0.2, height: 0.2)
+    let convertedExpanded =
+        PriceTagVisionBoundingBoxNormalizer.fullImageBounds(
+            observationBounds: expandedLocalInside,
+            requestRegionOfInterest: expandedRequestROI,
+            requestRevision: 4)
+    let expectedExpanded = CGRect(
+        x: 0.44, y: 0.46, width: 0.12, height: 0.08)
+    require(
+        convertedExpanded != nil
+            && closeRect(convertedExpanded!, expectedExpanded),
+        "BC-00 expanded fallback must use the expanded request ROI")
+    require(
+        isSelected(select([
+            barcode("expanded-inside", convertedExpanded!),
+        ], roi: operatorROI)),
+        "BC-00 expanded detection remains selectable only inside the operator ROI")
+    let expandedLocalMargin = CGRect(
+        x: 1.0 / 30.0,
+        y: 0.4,
+        width: 1.0 / 15.0,
+        height: 0.2)
+    let convertedMargin =
+        PriceTagVisionBoundingBoxNormalizer.fullImageBounds(
+            observationBounds: expandedLocalMargin,
+            requestRegionOfInterest: expandedRequestROI,
+            requestRevision: 2)
+    require(
+        convertedMargin != nil
+            && isNone(select([
+                barcode("expanded-margin", convertedMargin!),
+            ], roi: operatorROI)),
+        "BC-00 expanded-only margin detection must not enlarge the operator ROI")
+
+    let sameLocalBounds = CGRect(
+        x: 0.4, y: 0.4, width: 0.2, height: 0.2)
+    let leftFullBounds =
+        PriceTagVisionBoundingBoxNormalizer.fullImageBounds(
+            observationBounds: sameLocalBounds,
+            requestRegionOfInterest: CGRect(
+                x: 0.2, y: 0.4, width: 0.2, height: 0.2),
+            requestRevision: 2)!
+    let rightFullBounds =
+        PriceTagVisionBoundingBoxNormalizer.fullImageBounds(
+            observationBounds: sameLocalBounds,
+            requestRegionOfInterest: CGRect(
+                x: 0.6, y: 0.4, width: 0.2, height: 0.2),
+            requestRevision: 2)!
+    require(
+        isAmbiguous(select([
+            barcode("SAME-LOCAL", leftFullBounds),
+            barcode("SAME-LOCAL", rightFullBounds),
+        ], roi: CGRect(x: 0.2, y: 0.4, width: 0.6, height: 0.2))),
+        "BC-00 disjoint physical barcodes must not deduplicate by overlapping ROI-local boxes")
+
+    let expectedNativeCenters: [PriorMapCapturedImageOrientation: CGPoint] = [
+        .up: CGPoint(x: 0.30, y: 0.42),
+        .down: CGPoint(x: 0.70, y: 0.58),
+        .right: CGPoint(x: 0.58, y: 0.30),
+        .left: CGPoint(x: 0.42, y: 0.70),
+    ]
+    for (orientation, expectedCenter) in expectedNativeCenters {
+        let native = PriorMapImageGeometry.nativeSensorBounds(
+            visionBounds: convertedPrimary!,
+            orientation: orientation)
+        require(
+            close(Double(native.midX), Double(expectedCenter.x))
+                && close(Double(native.midY), Double(expectedCenter.y)),
+            "BC-00 \(orientation.rawValue) depth/ray center must use converted full-image bounds")
+    }
+    require(
+        !close(Double(convertedPrimary!.midX), Double(localObservation.midX))
+            && !close(
+                Double(convertedPrimary!.midY),
+                Double(localObservation.midY)),
+        "BC-00 integration geometry must consume the converted center, not the ROI-local center")
+    for invalid in [
+        CGRect(x: 0.1, y: 0.1, width: -0.1, height: 0.2),
+        CGRect(x: 0.1, y: 0.1, width: 0, height: 0.2),
+        CGRect(x: 0.95, y: 0.1, width: 0.1, height: 0.2),
+        CGRect(x: CGFloat.nan, y: 0.1, width: 0.1, height: 0.2),
+    ] {
+        require(
+            PriceTagVisionBoundingBoxNormalizer.fullImageBounds(
+                observationBounds: invalid,
+                requestRegionOfInterest: primaryRequestROI,
+                requestRevision: 2) == nil,
+            "BC-00 invalid Vision evidence must fail closed")
+    }
+    require(
+        PriceTagVisionBoundingBoxNormalizer.fullImageBounds(
+            observationBounds: localObservation,
+            requestRegionOfInterest: primaryRequestROI,
+            requestRevision: 0) == nil,
+        "BC-00 unsupported Vision revisions must fail closed")
+
     // BC-01: the visible scan box is also the actual detector ROI. Center,
     // containment and the 80% intersection threshold all apply.
     require(
@@ -475,8 +692,9 @@ func runESLBarcodeCaptureFocusedTests() {
             && PriceTagCapturePolicy.field.minimumEvidenceFrames == 3
             && PriceTagCapturePolicy.field.targetEvidenceFrames == 4
             && PriceTagCapturePolicy.field.visionRateHz >= 5
-            && PriceTagCapturePolicy.field.visionRateHz <= 10,
-        "field policy must retain 2-frame lock, 3-frame minimum, 4-frame target and bounded Vision")
+            && PriceTagCapturePolicy.field.visionRateHz <= 10
+            && PriceTagCapturePolicy.field.minimumROIIntersectionRatio == 0.80,
+        "field policy must retain the 2/3/4 frame contract, bounded Vision and exact 80% ROI gate")
     let stableAuditCodes = Set(
         PriceTagCaptureAuditCode.allCases.map(\.rawValue))
     for requiredCode in [
@@ -747,6 +965,57 @@ func runESLBarcodeCaptureFocusedTests() {
         } else {
             require(false, "BC-04 A,A must lock")
         }
+    }
+
+    // A transient missing exact node snapshot must release only the current
+    // evidence slot. It must not turn into the sticky required-write failure
+    // path or discard the already locked barcode/capture.
+    do {
+        let (coordinator, generation) = startCoordinator()
+        _ = submit(
+            coordinator, generation: generation,
+            timestamp: 0, candidates: [activeA])
+        let locked = submit(
+            coordinator, generation: generation,
+            timestamp: 0.2, candidates: [activeA])
+        guard case .candidateLocked(let captureID, _) = locked else {
+            require(false, "transient-binding test must lock the barcode")
+            return
+        }
+        let deferred = coordinator.deferEvidenceUntilNodeBinding(
+            generation: generation,
+            captureID: captureID,
+            frameTimestamp: 0.2)
+        require(
+            deferred == .waitingForNodeBinding(
+                acceptedFrames: 0, requiredFrames: 3),
+            "missing node binding must wait without cancelling the capture")
+        let resumed = submit(
+            coordinator, generation: generation,
+            timestamp: 0.4, candidates: [activeA])
+        if case .collect(let resumedID, _) = resumed {
+            require(
+                resumedID == captureID,
+                "the next exact-bound frame must resume the same capture")
+        }
+        else {
+            require(false, "the deferred capture must accept a later frame")
+        }
+        let saved = coordinator.finishEvidence(
+            generation: generation,
+            captureID: captureID,
+            frameTimestamp: 0.4,
+            observationID: "deferred-observation-1",
+            succeeded: true)
+        if case .continueCollecting(let accepted, _) = saved {
+            require(
+                accepted == 1,
+                "a later exact-bound frame must count normally")
+        }
+        else {
+            require(false, "deferred evidence must return to collection")
+        }
+        _ = coordinator.cancel(reason: "transient_binding_test_complete")
     }
     do {
         let (coordinator, generation) = startCoordinator()
@@ -10243,23 +10512,23 @@ do {
     require(
         AutomaticQualityGate.evaluate(gateInput(
             count: 5, spread: 0.02, association: mid,
-            needsReview: true)).0 == .rescanRequired,
-        "G10 needs-review evidence must never be automatically accepted")
+            needsReview: true)).0 == .lowConfidence,
+        "G10 needs-review complete evidence must be retained as low confidence")
     require(
         AutomaticQualityGate.evaluate(gateInput(
             count: 5, spread: 0.02, association: mid,
-            depthQuality: 0.2)).0 == .rescanRequired,
-        "G10 low-depth complete burst must require a rescan")
+            depthQuality: 0.2)).0 == .lowConfidence,
+        "G10 low-depth complete burst must be retained as low confidence")
     require(
         AutomaticQualityGate.evaluate(gateInput(
             count: 5, spread: 0.02, association: mid,
-            nodeUncertaintyM: nil)).0 == .rescanRequired,
-        "G10 missing native node uncertainty must require a rescan")
+            nodeUncertaintyM: nil)).0 == .lowConfidence,
+        "G10 missing node uncertainty must be retained as low confidence")
     let endpointGate = AutomaticQualityGate.evaluate(gateInput(
         count: 5, spread: 0.02, association: endpoint))
     require(
-        endpointGate.0 == .rescanRequired,
-        "G7 endpoint-ambiguous tags must be RESCAN_REQUIRED, got \(endpointGate.0.rawValue)")
+        endpointGate.0 == .lowConfidence,
+        "G7 endpoint-ambiguous tags must be LOW_CONFIDENCE, got \(endpointGate.0.rawValue)")
     // Parallel-aisle ambiguity: a second shelf nearly as close collapses
     // the margin and must be RESCAN_REQUIRED.
     let aisle = ShelfAssociationEngine.ShelfSegment(
@@ -10286,9 +10555,9 @@ do {
     let aisleGate = AutomaticQualityGate.evaluate(gateInput(
         count: 5, spread: 0.02, association: between))
     require(
-        aisleGate.0 == .rescanRequired
+        aisleGate.0 == .lowConfidence
             && aisleGate.1 == "shelf_association_margin_insufficient",
-        "G7 parallel-aisle tags must be RESCAN_REQUIRED on margin, got \(aisleGate.0.rawValue)/\(aisleGate.1)")
+        "G7 parallel-aisle tags must be LOW_CONFIDENCE on margin, got \(aisleGate.0.rawValue)/\(aisleGate.1)")
     // Occlusion: a fixed structure between the tag and the shelf blocks
     // the sight line and must be RESCAN_REQUIRED.
     let structure = ShelfAssociationEngine.FixedStructure(
@@ -10350,9 +10619,9 @@ do {
     let occlusionGate = AutomaticQualityGate.evaluate(gateInput(
         count: 5, spread: 0.02, association: occludedAssociation))
     require(
-        occlusionGate.0 == .rescanRequired
+        occlusionGate.0 == .lowConfidence
             && occlusionGate.1 == "shelf_occluded_by_structure",
-        "G7 occluded tags must be RESCAN_REQUIRED, got \(occlusionGate.0.rawValue)/\(occlusionGate.1)")
+        "G7 occluded tags must be LOW_CONFIDENCE, got \(occlusionGate.0.rawValue)/\(occlusionGate.1)")
     // Rotated shelf geometry: the polygon axis drives the association.
     if let rotated = ShelfAssociationEngine.makeSegment(
         shelfCode: "A3", floorID: "1",
@@ -10446,7 +10715,12 @@ do {
         barcode: String,
         symbology: String,
         y: Double,
-        count: Int
+        count: Int,
+        localizationState: String = "stable",
+        localizationConfidence: Double = 1,
+        measurementConfidence: Double = 1,
+        needsReview: Bool = false,
+        burstID: String? = nil
     ) -> [TagObservationEvidenceObservation] {
         return (0..<count).map { index in
             TagObservationEvidenceObservation(
@@ -10457,16 +10731,17 @@ do {
                 frameTimestamp: Double(index),
                 nodeTimebaseTimestamp: 10,
                 rawPositionM: (5, y, 0),
-                measurementConfidence: 1,
-                localizationState: "stable",
-                localizationConfidence: 1,
-                needsReview: false,
+                measurementConfidence: measurementConfidence,
+                localizationState: localizationState,
+                localizationConfidence: localizationConfidence,
+                needsReview: needsReview,
                 trackingSessionID: "bucket-session",
                 boundNodeID: 77,
                 boundNodeDelta: 0,
                 secondCandidateDelta: 2,
-                burstID: "burst-\(barcode)-\(symbology)-\(y)",
-                frameID: "frame-\(index)",
+                burstID: burstID
+                    ?? "burst-\(barcode)-\(symbology)-\(y)",
+                frameID: "frame-\(y)-\(index)",
                 measurementMethod: "scene_depth",
                 depthSampleCount: 10,
                 depthInlierCount: 9,
@@ -10479,7 +10754,8 @@ do {
     }
     func finalizeBucketEvidence(
         _ observations: [TagObservationEvidenceObservation],
-        shelves: [ShelfAssociationEngine.ShelfSegment]
+        shelves: [ShelfAssociationEngine.ShelfSegment],
+        graphQualityPassed: Bool = true
     ) throws -> ([FinalPriceTag], [RescanTask]) {
         return try MobileProcessingPipeline.finalizeTags(
             observations: observations,
@@ -10492,7 +10768,7 @@ do {
             storeID: "STORE-BUCKET",
             priorMap: finalizerMap,
             floorID: "1",
-            graphQualityPassed: true,
+            graphQualityPassed: graphQualityPassed,
             rawNodePoses: [77: .identity],
             minimumAssociationMarginM: 0.5)
     }
@@ -10511,6 +10787,27 @@ do {
             && Set(segmentTags.map(\.shelfSegmentID))
                 == ["segment-shared-low", "segment-shared-high"],
         "RC-B17 same-code physical segments must finalize independently")
+
+    let ambiguousBurstEvidence =
+        finalizerEvidence(
+            barcode: "AMBIGUOUS-BURST",
+            symbology: "CODE128",
+            y: -0.1,
+            count: 3,
+            burstID: "burst-ambiguous")
+        + finalizerEvidence(
+            barcode: "AMBIGUOUS-BURST",
+            symbology: "CODE128",
+            y: 1.1,
+            count: 3,
+            burstID: "burst-ambiguous")
+    let (ambiguousTags, ambiguousRescans) = try finalizeBucketEvidence(
+        ambiguousBurstEvidence, shelves: [segmentLow, segmentHigh])
+    require(
+        ambiguousTags.count == 1
+            && ambiguousTags[0].qualityStatus == "LOW_CONFIDENCE"
+            && ambiguousRescans.isEmpty,
+        "one burst that disagrees across shelf identities must remain one low-confidence tag")
 
     let symbologyEvidence =
         finalizerEvidence(barcode: "MULTI", symbology: "CODE128", y: -0.1, count: 3)
@@ -10533,6 +10830,134 @@ do {
             && sparseRescans.count == 1
             && sparseRescans[0].shelfSegmentID == "segment-shared-low",
         "RC-B17 associated RESCAN rows must carry shelf_segment_id")
+
+    let (weakTags, weakRescans) = try finalizeBucketEvidence(
+        finalizerEvidence(
+            barcode: "WEAK-COMPLETE",
+            symbology: "CODE128",
+            y: -0.1,
+            count: 3,
+            localizationState: "recovering",
+            localizationConfidence: 0.45,
+            measurementConfidence: 0.55,
+            needsReview: true),
+        shelves: [segmentLow])
+    require(
+        weakTags.count == 1
+            && weakTags[0].qualityStatus == "LOW_CONFIDENCE"
+            && weakTags[0].reason == "measurement_needs_review"
+            && weakRescans.isEmpty,
+        "a complete exact-node burst with weak localization must be retained without an immediate rescan")
+
+    var partialPositionEvidence = finalizerEvidence(
+        barcode: "PARTIAL-POSITION",
+        symbology: "CODE128",
+        y: -0.1,
+        count: 4,
+        burstID: "burst-partial-position")
+    partialPositionEvidence[3].rawPositionM = nil
+    partialPositionEvidence[3].measurementMethod = "unavailable"
+    let (partialPositionTags, partialPositionRescans) =
+        try finalizeBucketEvidence(
+            partialPositionEvidence,
+            shelves: [segmentLow])
+    require(
+        partialPositionTags.count == 1
+            && partialPositionTags[0].qualityStatus == "LOW_CONFIDENCE"
+            && partialPositionTags[0].reason
+                == "partial_burst_position_unavailable"
+            && partialPositionRescans.isEmpty,
+        "three recomputable frames must retain a complete burst even when one frame has no position")
+
+    let (partialGraphFailureTags, partialGraphFailureRescans) =
+        try finalizeBucketEvidence(
+            partialPositionEvidence,
+            shelves: [segmentLow],
+            graphQualityPassed: false)
+    require(
+        partialGraphFailureTags.count == 1
+            && partialGraphFailureTags[0].qualityStatus == "RESCAN_REQUIRED"
+            && partialGraphFailureTags[0].reason == "graph_quality_failed"
+            && partialGraphFailureRescans.count == 1
+            && partialGraphFailureRescans[0].reasonCode
+                == "graph_quality_failed",
+        "a weak-frame quorum must never bypass the hard graph-quality gate")
+
+    var insufficientPositionEvidence = finalizerEvidence(
+        barcode: "INSUFFICIENT-POSITION",
+        symbology: "CODE128",
+        y: -0.1,
+        count: 3,
+        burstID: "burst-insufficient-position")
+    insufficientPositionEvidence[2].rawPositionM = nil
+    insufficientPositionEvidence[2].measurementMethod = "unavailable"
+    let (insufficientPositionTags, insufficientPositionRescans) =
+        try finalizeBucketEvidence(
+            insufficientPositionEvidence,
+            shelves: [segmentLow])
+    require(
+        insufficientPositionTags.isEmpty
+            && insufficientPositionRescans.count == 1
+            && insufficientPositionRescans[0].reasonCode
+                == "unlocalized_observation",
+        "fewer than three recomputable frames must keep the whole burst RESCAN_REQUIRED")
+
+    let (unassociatedTags, unassociatedRescans) = try finalizeBucketEvidence(
+        finalizerEvidence(
+            barcode: "NO-SHELF",
+            symbology: "CODE128",
+            y: -0.1,
+            count: 3),
+        shelves: [])
+    require(
+        unassociatedTags.count == 1
+            && unassociatedTags[0].qualityStatus == "LOW_CONFIDENCE"
+            && unassociatedTags[0].reason == "no_shelf_association"
+            && unassociatedRescans.isEmpty,
+        "a resolved complete burst without a shelf candidate must remain a low-confidence PriceTag")
+
+    let (unassociatedGraphFailureTags, unassociatedGraphFailureRescans) =
+        try finalizeBucketEvidence(
+            finalizerEvidence(
+                barcode: "NO-SHELF-GRAPH-FAIL",
+                symbology: "CODE128",
+                y: -0.1,
+                count: 3),
+            shelves: [],
+            graphQualityPassed: false)
+    require(
+        unassociatedGraphFailureTags.count == 1
+            && unassociatedGraphFailureTags[0].qualityStatus
+                == "RESCAN_REQUIRED"
+            && unassociatedGraphFailureTags[0].reason
+                == "graph_quality_failed"
+            && unassociatedGraphFailureRescans.count == 1
+            && unassociatedGraphFailureRescans[0].reasonCode
+                == "graph_quality_failed",
+        "missing shelf association must never bypass the hard graph-quality gate")
+
+    let (_, missingNodeRescans) = try MobileProcessingPipeline.finalizeTags(
+        observations: finalizerEvidence(
+            barcode: "MISSING-RAW-NODE",
+            symbology: "CODE128",
+            y: -0.1,
+            count: 3),
+        resolverIndex: finalizerIndex,
+        shelves: [segmentLow],
+        shelfIndex: ShelfAssociationEngine.ShelfSpatialIndex(
+            shelves: [segmentLow]),
+        structures: [],
+        sessionID: "bucket-session",
+        storeID: "STORE-BUCKET",
+        priorMap: finalizerMap,
+        floorID: "1",
+        graphQualityPassed: true,
+        rawNodePoses: [:],
+        minimumAssociationMarginM: 0.5)
+    require(
+        missingNodeRescans.count == 1
+            && missingNodeRescans[0].reasonCode == "raw_node_pose_missing",
+        "missing authoritative raw-node pose must remain RESCAN_REQUIRED")
 }
 catch {
     require(false, "RC-B17/H-07 finalization bucket tests failed: \(error)")
@@ -10708,6 +11133,32 @@ do {
         "RC-B09 task reference must carry the committed generation")
     try SessionSnapshotTransaction.revalidateSnapshot(
         snapshot.snapshotDirectory)
+    // iOS does not guarantee that SQLite can reopen `/dev/fd/<n>`. Exercise
+    // the descriptor-bound private-copy fallback explicitly and prove that
+    // its unique temporary directory is removed after validation.
+    do {
+        let validationPrefix = ".marketscanner-db-validation-"
+        let temporaryRoot = fileManager.temporaryDirectory
+        let beforeNames = Set((try? fileManager.contentsOfDirectory(
+            atPath: temporaryRoot.path))?.filter {
+                $0.hasPrefix(validationPrefix)
+            } ?? [])
+        SessionSnapshotTransaction
+            .forcePrivateDatabaseValidationCopyForTests = true
+        defer {
+            SessionSnapshotTransaction
+                .forcePrivateDatabaseValidationCopyForTests = false
+        }
+        try SessionSnapshotTransaction.revalidateSnapshot(
+            snapshot.snapshotDirectory)
+        let afterNames = Set((try? fileManager.contentsOfDirectory(
+            atPath: temporaryRoot.path))?.filter {
+                $0.hasPrefix(validationPrefix)
+            } ?? [])
+        require(
+            beforeNames == afterNames,
+            "iOS snapshot DB validation fallback must not leave private copies")
+    }
     let snapshotMode = (try fileManager.attributesOfItem(
         atPath: snapshot.snapshotDirectory.path)[.posixPermissions]
         as? NSNumber)?.intValue
@@ -10718,6 +11169,64 @@ do {
     require(
         snapshotMode == 0o555 && databaseMode == 0o444,
         "RC-B09 committed snapshot directory/files must be 0555/0444")
+
+    // A finalized historical scan can be exported independently of mobile
+    // post-processing success. The verified package retains the phone copy
+    // and a second export must never overwrite the first provider package.
+    let historyDocuments = try p7r6FreshDirectory("history-export-documents")
+    let historyRoot = historyDocuments.appendingPathComponent(
+        "SupermarketSession-20260810-120000",
+        isDirectory: true)
+    let historySegment = historyRoot.appendingPathComponent(
+        "segment_0001",
+        isDirectory: true)
+    try fileManager.createDirectory(
+        at: historySegment,
+        withIntermediateDirectories: true)
+    for name in try fileManager.contentsOfDirectory(atPath: session.path) {
+        let source = session.appendingPathComponent(name)
+        let destinationName = name == "source.db"
+            ? "rtabmap_segment_0001.db" : name
+        try fileManager.copyItem(
+            at: source,
+            to: historySegment.appendingPathComponent(destinationName))
+    }
+    let historyExportDestination = try p7r6FreshDirectory(
+        "history-export-provider")
+    let firstHistoryExport = try SupermarketScanSession
+        .exportFinalizedCapture(
+            from: historySegment,
+            localDocumentsDirectory: historyDocuments,
+            destinationBaseDirectory: historyExportDestination,
+            expectedTrackingSessionID: "P7-SESSION")
+    require(
+        fileManager.fileExists(atPath: historySegment.path)
+            && fileManager.fileExists(atPath: firstHistoryExport.path),
+        "historical export must retain the local finalized scan")
+    let firstExportRoot = firstHistoryExport.deletingLastPathComponent()
+    require(
+        fileManager.fileExists(atPath: firstExportRoot.appendingPathComponent(
+            "copy_verification.json").path)
+            && fileManager.fileExists(atPath: firstExportRoot
+                .appendingPathComponent("copy_package_manifest.json").path),
+        "historical export must include verification receipts")
+    let historySourceManifest = try CaptureDirectoryIntegrity.manifest(
+        for: historySegment)
+    let historyExportManifest = try CaptureDirectoryIntegrity.manifest(
+        for: firstHistoryExport)
+    require(
+        historySourceManifest == historyExportManifest,
+        "historical export source and provider manifests must match")
+    let secondHistoryExport = try SupermarketScanSession
+        .exportFinalizedCapture(
+            from: historySegment,
+            localDocumentsDirectory: historyDocuments,
+            destinationBaseDirectory: historyExportDestination,
+            expectedTrackingSessionID: "P7-SESSION")
+    require(
+        firstHistoryExport.deletingLastPathComponent()
+            != secondHistoryExport.deletingLastPathComponent(),
+        "historical export must create a collision-free package instead of overwriting")
 
     // Resume rejects permission drift even when bytes and hashes match.
     let snapshotDatabase = snapshot.snapshotDirectory
@@ -11717,6 +12226,65 @@ private func runMapCase02Suite(
                         "MapCase02 landmark \(code) polygon mismatch: \(actual)")
             }
         }
+
+        let obstaclePolygons: [[(Double, Double)]] =
+            report.canonicalSource.elements.compactMap { element in
+                let role = ElementRoleClassifier.role(for: element.shapeType)
+                guard element.visible,
+                      role == .shelf || role == .fixedStructure,
+                      let coordinates = element.geometry?["coordinates"]
+                        as? [[Double]],
+                      coordinates.count >= 3 else {
+                    return nil
+                }
+                return coordinates.map { ($0[0], $0[1]) }
+            }
+        func distanceToPolygon(
+            point: (Double, Double),
+            polygon: [(Double, Double)]
+        ) -> Double {
+            var best = Double.greatestFiniteMagnitude
+            for index in polygon.indices {
+                let a = polygon[index]
+                let b = polygon[(index + 1) % polygon.count]
+                let dx = b.0 - a.0
+                let dy = b.1 - a.1
+                let lengthSquared = dx * dx + dy * dy
+                let ratio = lengthSquared > 1.0e-12
+                    ? max(0, min(1,
+                        ((point.0 - a.0) * dx + (point.1 - a.1) * dy)
+                            / lengthSquared))
+                    : 0
+                best = min(
+                    best,
+                    hypot(
+                        point.0 - (a.0 + ratio * dx),
+                        point.1 - (a.1 + ratio * dy)))
+            }
+            return best
+        }
+        let reportedFreeStart = (58.03, -18.13)
+        require(
+            !obstaclePolygons.contains(where: {
+                ShelfAssociationEngine.pointInPolygon(
+                    point: reportedFreeStart,
+                    polygon: $0)
+            }),
+            "reported MapCase02 start point must not be inside an obstacle")
+        let reportedFreeStartClearance = obstaclePolygons.map {
+            distanceToPolygon(point: reportedFreeStart, polygon: $0)
+        }.min() ?? .infinity
+        require(
+            reportedFreeStartClearance >= 0.30,
+            "reported MapCase02 start point must preserve the 0.30 m clearance gate")
+        let knownShelfInterior = (41.40, -9.70)
+        require(
+            obstaclePolygons.contains(where: {
+                ShelfAssociationEngine.pointInPolygon(
+                    point: knownShelfInterior,
+                    polygon: $0)
+            }),
+            "a known MapCase02 shelf interior must remain strictly rejected")
 
         let canonicalURL = try writeTemporary(
             canonicalData, named: "mapcase02-canonical-v3.json")

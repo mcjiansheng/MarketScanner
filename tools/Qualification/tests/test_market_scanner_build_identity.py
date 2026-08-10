@@ -133,17 +133,19 @@ class MarketScannerBuildIdentityTests(unittest.TestCase):
         unknown["unexpected"] = True
         self.assert_rejected(lambda: identity.validate_fields(unknown))
 
-    def test_xcode_debug_launch_omits_identity_without_weakening_release(self) -> None:
+    def test_xcode_default_launch_uses_release_identity_and_debug_stays_ineligible(
+        self,
+    ) -> None:
         scheme_path = (
             ROOT
             / "app/ios/RTABMapApp.xcodeproj/xcshareddata/xcschemes/RTABMapApp.xcscheme"
         )
         scheme = ET.parse(scheme_path).getroot()
-        for action in ("TestAction", "LaunchAction", "AnalyzeAction"):
+        for action in ("TestAction", "AnalyzeAction"):
             node = scheme.find(action)
             self.assertIsNotNone(node)
             self.assertEqual(node.attrib.get("buildConfiguration"), "Debug")
-        for action in ("ProfileAction", "ArchiveAction"):
+        for action in ("LaunchAction", "ProfileAction", "ArchiveAction"):
             node = scheme.find(action)
             self.assertIsNotNone(node)
             self.assertEqual(node.attrib.get("buildConfiguration"), "Release")

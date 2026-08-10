@@ -23,8 +23,10 @@ final class MobileMapImportViewController: UIViewController {
     private var observerTokens: [MobileOnlyWorkflowCoordinator.ObserverToken] = []
     private var latestImportReport: MapSourceImportReport?
     private var progressFraction = 0.0
+    private var progressUIVisible = false
     private var startedAtUptime: TimeInterval?
     private var elapsedTimer: Timer?
+    private var preparedDocumentPicker: UIDocumentPickerViewController?
 
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -32,6 +34,22 @@ final class MobileMapImportViewController: UIViewController {
         view.backgroundColor = .systemBackground
         buildUI()
         registerObservers()
+    }
+
+    /// Called by the lightweight library page after it is visible. UIKit and
+    /// FileProvider initialization stay on the main thread, but no workflow
+    /// transition or provider access happens until the operator taps Import.
+    func prepareForPresentation() {
+        precondition(Thread.isMainThread)
+        loadViewIfNeeded()
+        prepareDocumentPickerIfNeeded()
+    }
+
+    override func viewDidAppear(_ animated: Bool) {
+        super.viewDidAppear(animated)
+        DispatchQueue.main.async { [weak self] in
+            self?.prepareDocumentPickerIfNeeded()
+        }
     }
 
     deinit {
@@ -80,8 +98,7 @@ final class MobileMapImportViewController: UIViewController {
                     preferredStyle: .alert)
                 alert.addAction(UIAlertAction(title: "开始扫描", style: .default) { [weak self] _ in
                     guard let self = self else { return }
-                    let setup = MobileScanSetupViewController()
-                    setup.selectedMap = map
+                    let setup = MobileScanSetupViewController(selectedMap: map)
                     // Preserve the library/import back stack. Making setup
                     // the only navigation root removed both Back and Close
                     // and caused the inconsistent navigation in the field
@@ -119,6 +136,7 @@ final class MobileMapImportViewController: UIViewController {
         percentLabel.adjustsFontForContentSizeCategory = true
         percentLabel.textAlignment = .center
         percentLabel.accessibilityTraits = .updatesFrequently
+        percentLabel.isHidden = true
 
         statusLabel.numberOfLines = 0
         statusLabel.text = "选择文件后会显示当前解析、编译、验证和注册阶段。"
@@ -131,10 +149,12 @@ final class MobileMapImportViewController: UIViewController {
         elapsedLabel.adjustsFontForContentSizeCategory = true
         elapsedLabel.textColor = .secondaryLabel
         elapsedLabel.textAlignment = .center
+        elapsedLabel.isHidden = true
 
         progressView.progress = 0
         progressView.accessibilityLabel = "地图导入与编译进度"
         progressView.accessibilityValue = "0%"
+        progressView.isHidden = true
 
         resultLabel.numberOfLines = 0
         resultLabel.font = UIFont.preferredFont(forTextStyle: .footnote)
@@ -196,11 +216,27 @@ final class MobileMapImportViewController: UIViewController {
         progressView.accessibilityValue = "0%"
         percentLabel.text = "0%"
         statusLabel.text = "正在打开文件选择器…"
-        startElapsedTimer()
+        setProgressUIVisible(false)
         // Single unified entry: the coordinator runs pick → stage →
         // import → compile → register without any further page calls
         // (V1R2 §4.1). Concurrent taps are rejected with a typed error.
-        coordinator.beginMapImport(from: self, contract: contract)
+        let picker = preparedDocumentPicker
+        preparedDocumentPicker = nil
+        coordinator.beginMapImport(
+            from: self,
+            contract: contract,
+            preparedDocumentPicker: picker)
+    }
+
+    private func prepareDocumentPickerIfNeeded() {
+        precondition(Thread.isMainThread)
+        guard preparedDocumentPicker == nil,
+              coordinator.state == .idle,
+              presentedViewController == nil else {
+            return
+        }
+        preparedDocumentPicker = MapSourceDocumentPicker
+            .makePreparedViewController()
     }
 
     private func updateStatus(_ state: MobileOnlyWorkflowState) {
@@ -212,14 +248,20 @@ final class MobileMapImportViewController: UIViewController {
                 contractControl.isEnabled = true
                 importButton.setTitle("选择文件并导入", for: .normal)
                 stopElapsedTimer()
+                DispatchQueue.main.async { [weak self] in
+                    self?.prepareDocumentPickerIfNeeded()
+                }
             }
         case .pickingMap:
             statusLabel.text = "请在文件选择器中选择地图文件…"
         case .stagingMapSource:
+            setProgressUIVisible(true)
             statusLabel.text = "正在安全暂存地图文件…"
         case .importingMap:
+            setProgressUIVisible(true)
             statusLabel.text = "正在严格解析地图…"
         case .compilingMap:
+            setProgressUIVisible(true)
             statusLabel.text = "正在手机端编译地图…"
         case .failed:
             statusLabel.text = coordinator.lastError?.errorDescription ?? "操作失败"
@@ -231,16 +273,29 @@ final class MobileMapImportViewController: UIViewController {
             statusLabel.text = "地图就绪"
         case .cancelled:
             statusLabel.text = "导入已取消"
+            setProgressUIVisible(false)
             importButton.isEnabled = true
             contractControl.isEnabled = true
             importButton.setTitle("选择文件并导入", for: .normal)
             stopElapsedTimer()
+            DispatchQueue.main.async { [weak self] in
+                self?.prepareDocumentPickerIfNeeded()
+            }
         default:
             break
         }
     }
 
     private func updateProgress(fraction: Double, message: String) {
+        if !progressUIVisible {
+            switch coordinator.state {
+            case .stagingMapSource, .importingMap, .compilingMap, .mapReady:
+                setProgressUIVisible(true)
+            default:
+                statusLabel.text = message
+                return
+            }
+        }
         let bounded = min(1, max(0, fraction))
         progressFraction = max(progressFraction, bounded)
         progressView.setProgress(Float(progressFraction), animated: true)
@@ -248,6 +303,23 @@ final class MobileMapImportViewController: UIViewController {
         percentLabel.text = "\(percent)%"
         progressView.accessibilityValue = "\(percent)%"
         statusLabel.text = message
+    }
+
+    private func setProgressUIVisible(_ visible: Bool) {
+        progressUIVisible = visible
+        percentLabel.isHidden = !visible
+        progressView.isHidden = !visible
+        elapsedLabel.isHidden = !visible
+        if visible {
+            if elapsedTimer == nil {
+                startElapsedTimer()
+            }
+        } else {
+            elapsedTimer?.invalidate()
+            elapsedTimer = nil
+            startedAtUptime = nil
+            elapsedLabel.text = "尚未开始"
+        }
     }
 
     private func startElapsedTimer() {

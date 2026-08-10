@@ -6,7 +6,7 @@
 
 ### 统一扫描 UX、启动事务和 build identity
 
-生产入口、线程边界、导航、相机权限、启动 receipt/context、取消/回滚、地图包单快照/descriptor freeze、zoom/nudge/discrete heading 和 QualifiedDevice scheme 使用以下聚焦组：
+生产入口、地图先选后载、导入进度可见性、线程边界、导航、相机权限、启动 receipt/context、取消/回滚、地图包单快照/descriptor freeze、zoom/nudge/discrete heading 和默认/QualifiedDevice Release scheme 使用以下聚焦组：
 
 ```bash
 python3 -m unittest \
@@ -16,19 +16,23 @@ python3 -m unittest \
   -v
 ```
 
-2026-08-10 当前源码结果为 **27/27 PASS**。它必须继续证明：首页和菜单不进入旧 `PriorMapWizardViewController`；地图库普通列表、完整刷新、provider copy/fsync、selected-package 加载和 scan-start preparation 不在主线程；手机编译地图与 PC v2 package 进入同一 registry/setup/coordinator；root Close 与 push Back 同时存在；首次权限在 workflow commit 前完成；旧 tmp-db recovery 不可绕过 receipt；取消/持久化失败会 rollback；地图设置支持 1×–8× zoom、方向键和离散朝向；普通 Debug 无 build identity，`RTABMapApp-QualifiedDevice` 的 Run 为 Release 且不存在 `--allow-dirty`。
+2026-08-10 当前源码结果为 **32/32 PASS**。它必须继续证明：首页和菜单不进入旧 `PriorMapWizardViewController`，而是先进入轻量地图选择页；用户可以导入新地图；配置页以 immutable required `selectedMap` 初始化，不自行列举地图、不自动加载第一张地图，也不存在 picker；文件选择前隐藏 0%、进度条和计时，进入 `.stagingMapSource` 后才显示；地图库普通列表、完整刷新、provider copy/fsync、selected-package 加载和 scan-start preparation 不在主线程；手机编译地图与 PC v2 package 进入同一 registry/setup/coordinator；root Close 与 push Back 同时存在；首次权限在 workflow commit 前完成；旧 tmp-db recovery 不可绕过 receipt；取消/持久化失败会 rollback；地图设置支持 1×–8× zoom、方向键和离散朝向；手动 Debug 无 build identity，共享 `RTABMapApp` 默认 Run 和 `RTABMapApp-QualifiedDevice` 的 Run 均为 Release，且不存在 `--allow-dirty`。新增合同还要求 setup transition 失败不得继续 commit、finalization 的 state/context 单次持久化、未完成的 `finalizing_scan` 不得直接进入后处理，以及条码失败 alert 去重。
 
-Swift 核心可执行长方法 `IOSCoreContractTests.test_swift_workflow_state_and_se2_projection` 在当前改动上 **1/1 PASS（1233.541 s）**，覆盖 map-library CAS、register/rebuild/freeze/quarantine、异常 symlink 外部目标权限保护和 workflow/SE(2) 合同。该单个长方法、27 个源码/几何合同和 host XLSX smoke 均不能冒充完整 discover、真机交互延迟或现场扫描 PASS。
+2026-08-10 历史扫描/ESL 布局增量中，`tools.PriorMap.tests.test_mobile_scan_ux_contract` 单组扩展为 **19/19 PASS**。新增断言要求：ESL status/payload 必须绑定 exact scan rect 上下边缘且不能恢复 `centerY` 魔数；历史列表必须显示独立导出按钮并使用 folder document picker；导出必须 finalized/live-checkpoint/hardlink/SHA/local-retention fail closed；snapshot 必须存在 iOS 私有 descriptor-copy fallback、exact stat identity cache 和临时副本清理。这个 19 项数字是该单组当前结果，不替代上面跨三个模块的历史 32/32 证据。
+
+Swift 核心可执行长方法 `IOSCoreContractTests.test_swift_workflow_state_and_se2_projection` 在当前源码上 **1/1 PASS（1212.429 s）**，覆盖 map-library CAS、register/rebuild/freeze/quarantine、异常 symlink 外部目标权限保护、300k finalization、1,728,000 trace、400k tag evidence、MapCase02 和 workflow/SE(2) 合同。现场阻断聚焦组 46/46、较广 PriorMap 拆分组 197/197、Map Studio 109/109 也已通过。拆分执行不等同于单命令完整 discover，这些 host 证据也不能冒充真机交互延迟或现场扫描 PASS。
+
+本轮在同一个 Swift executable 默认路径中增加两类运行时回归：强制走 iOS 私有 snapshot DB 校验副本并确认 `.marketscanner-db-validation-*` 无残留；构造 finalized `SupermarketSession-*/segment_0001` 后连续导出两次，确认源仍存在、源/目标 manifest 相等、两个 receipt 存在且第二次不覆盖第一次。2026-08-10 当前源码的完整长方法结果为 **1/1 PASS（1484.429 s）**；其中 400,000 条 tag evidence 输入 243,952,646 bytes、接受 200,000 条、峰值 RSS 520,077,312 bytes。只做 `swiftc -parse` 或 source-token contract 不算行为验证。
 
 ### MapCase02 冻结回归
 
-正式输入 `map/mapcase02/mapcase02.xlsx` 的 SHA-256 必须为 `1ddf428fc4dd6e4e8bd33258d0cbfaab87b809c4dedd6b8baca9e167c14b5e6a`。Swift `--mapcase02-suite <xlsx> <output> <canonical-sha> <swift-package-sha> [legacy-xlsx]` 与 PC converter/schema 必须同时满足 1838/1630/1301/329/0/208 统计、0 active 越界、canonical ID `piaseczno-5ddfac7dc439`、canonical SHA `5ddfac7dc439afc45abdcf800b799c05d53704895b620d161ef08a442c55b2db`、Swift package `8d3564ce68aadb087a2820a02b4747d15ea1f4d22b14e8776f913d33775b1b84`、PC package `41332d093e652ec2de94f0f86b8f15107cd6f67f3b2e5ddec1c0685ab4d7d3be` 和 PC preview `d0c02be63dff3ab002dcf931ce7d0c5149152b78bea139fb1b0a2d86be196a18`。Swift 套件必须继续执行 compile → integrity → content-addressed move → register → listMaps → exact map read，并对重签的旧 uppercase v2 包断言 production 默认拒绝、显式 diagnostic-only 允许；`validation_report.summary.node_count/edge_count` 必须绑定 road graph 且 Swift 输出须由 Python production validator 直接接受；PC 正式 golden 测试必须直接断言 source/canonical/ID/package/preview SHA。只做自洽 digest 或只验证编译包均不再足够。
+正式输入 `map/mapcase02/mapcase02.xlsx` 的 SHA-256 必须为 `1ddf428fc4dd6e4e8bd33258d0cbfaab87b809c4dedd6b8baca9e167c14b5e6a`。Swift `--mapcase02-suite <xlsx> <output> <canonical-sha> <swift-package-sha> [legacy-xlsx]` 与 PC converter/schema 必须同时满足 1838/1630/1301/329/0/208 统计、0 active 越界、canonical ID `piaseczno-5ddfac7dc439`、canonical SHA `5ddfac7dc439afc45abdcf800b799c05d53704895b620d161ef08a442c55b2db`、Swift package `c6b6b2c00690998cfa9517374b9385f857cb3ee0efcbe3663f63ee76fee87959`、PC package `41332d093e652ec2de94f0f86b8f15107cd6f67f3b2e5ddec1c0685ab4d7d3be` 和 PC preview `d0c02be63dff3ab002dcf931ce7d0c5149152b78bea139fb1b0a2d86be196a18`。Swift 套件必须继续执行 compile → integrity → content-addressed move → register → listMaps → exact map read，并对重签的旧 uppercase v2 包断言 production 默认拒绝、显式 diagnostic-only 允许；`validation_report.summary.node_count/edge_count` 必须绑定 road graph 且 Swift 输出须由 Python production validator 直接接受；手机预览回归还必须证明 Quartz `minY→0/maxY→height`、UIKit touch `1-v`、`(58.03,-18.13)` 不在障碍物内且保持 0.30 m clearance、已知货架内部点继续拒绝。PC 正式 golden 测试必须直接断言 source/canonical/ID/package/preview SHA。只做自洽 digest 或只验证编译包均不再足够。
 
 真实工作簿回归使用 Swift host `--xlsx-library-smoke <xlsx...>`，输出仅写入 `/private/tmp` 下的临时地图库。2026-08-09 已对 `map 2.xlsx`、TianHong 02402、北京昌平 6599 和 Kohl's 1224 共四张正式工作簿执行，四张均完成严格导入、编译、完整性、安装、注册、列表和 exact ID/SHA 读取。跨端 slug 负例覆盖 `Piaseczno`、`Kohl's 1224`、`İstanbul`、Kelvin sign、中文夹 ASCII 与 200-byte 合法地图名；最终 ID 必须匹配 `^[a-z0-9._-]+$` 且最长 128。
 
 负例覆盖关系别名/外部 target/namespace 伪 authority、缺失/重复/前导零 row 与 cell、非法 shared-string/boolean/公式/超大 cell、100001 元素、错误角色几何、重复 element ID、严格整数 token、距离场预算，以及重签名后 canonical/graph/spatial/distance/shelf 派生工件篡改。任一端接受集合不同即失败。
 
-2026-08-09 本机证据：MapCase02 Swift 正式套件 PASS；PriorMap 非超长组 217 项 PASS；Map Studio 109/109 PASS；PC MapCase02 validator `valid=true`；I10 完整 Python 外层 Swift host 1/1 PASS（973.769 s）。run `31307753672@8f0e730d…` 的全部非 Apple jobs、完整 macOS host、SwiftPM/Xcode metadata 与 200k RSS `794,099,712 < 805,306,368` bytes 均 PASS，但 iphoneos cold dependency configure 未找到 host `rtabmap-res_tool`，整体仍为 7/8，双平台 clean link skipped。I11 `37e6ed8c4afa00202693cd56919aea78fd4c7af5` 显式绑定该工具，本地全新 prebuild/configure 与独立复审 `P0=0/P1=0` PASS；replacement exact-SHA、Apple clean link、完整 discover、真机/LiDAR/现场仍待执行，required jobs 全绿前不得冻结。
+2026-08-10 本机证据：MapCase02 Swift 正式套件 PASS；四张真实 XLSX 手机地图库 4/4；PC production validator 4/4；当前 Swift 长方法 1/1（1212.429 s）；较广 PriorMap 拆分组 197/197；Map Studio 109/109；unsigned generic iPhoneOS Debug 全量编译/链接 PASS。run `31307753672@8f0e730d…` 的全部非 Apple jobs、完整 macOS host、SwiftPM/Xcode metadata 与 200k RSS `794,099,712 < 805,306,368` bytes 均 PASS，但 iphoneos cold dependency configure 未找到 host `rtabmap-res_tool`，整体仍为 7/8，双平台 clean link skipped。I11 `37e6ed8c4afa00202693cd56919aea78fd4c7af5` 显式绑定该工具，本地全新 prebuild/configure 与独立复审 `P0=0/P1=0` PASS；replacement exact-SHA CI、成对 cold simulator/device link、真机/LiDAR/现场仍待执行，required jobs 全绿前不得冻结。
 
 P0 生产安全不变量（CI 使用相同选择器，任一失败即失败关闭）：
 
@@ -63,13 +67,17 @@ node --check tools/SupermarketMapStudio/web/app.js
 git diff --check
 
 xcodebuild -quiet -project app/ios/RTABMapApp.xcodeproj \
-  -scheme RTABMapApp-QualifiedDevice -configuration Release \
+  -scheme RTABMapApp -configuration Release \
   -sdk iphoneos -destination generic/platform=iOS \
   -derivedDataPath /private/tmp/marketscanner-derived \
   CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build
 ```
 
-普通 UI/导入 smoke 可另用 `RTABMapApp` Debug；该构建按设计删除 `MarketScannerBuildIdentity.json`，不得用于开始正式 prior-map 扫描。QualifiedDevice Release 构建必须在所有 tracked 代码与当前文档已提交、tracked tree 干净时执行；无签名 generic-device build 只证明编译/链接和 build-identity 生成，不证明真机权限、相机、LiDAR 或现场流程。
+普通共享 `RTABMapApp` 的默认 Run 已是 Release；如需 UI/导入 smoke，可手动把构建配置切到 Debug，该构建按设计删除 `MarketScannerBuildIdentity.json`，不得用于开始正式 prior-map 扫描。2026-08-10 已在 tracked tree 干净的提交上执行默认 `RTABMapApp` unsigned generic-device Release 全量编译/链接，日志包含 `build identity verified` 和 `BUILD SUCCEEDED`；Debug 全量编译/链接也 PASS 且确认身份被移除。无签名 build只证明编译/链接和 build-identity 生成，不证明真机权限、相机、LiDAR 或现场流程；`RTABMapApp-QualifiedDevice` 的静态 Release/无 bypass 合同已覆盖，真机仍需实际安装验证。
+
+本轮真机手测必须补充：删除/停用 Xcode 的 `ViewController.updateState(state:)` 文件断点后冷启动，确认不会再被调试器停在黑色残缺界面；打开 ESL 扫描确认状态文字位于框外且 Dynamic Type/短屏无约束冲突；对截图中的真实 finalized 会话执行手机后处理，确认不再出现 `/dev/fd` 只读打开错误；不处理或故意处理失败后仍可把完整原始扫描导出到 Files/iCloud/外接存储，并在第二次导出时保留第一次目录。大型真实 DB 还要记录私有校验副本的额外空间、耗时、取消/锁屏和低磁盘行为。
+
+本轮 unsigned generic iPhoneOS Debug 与 tracked-clean exact-HEAD Release 全量编译/链接均已 PASS；Debug 产物中没有 `MarketScannerBuildIdentity.json`，Release bundle 的 `app_git_sha` 与构建提交精确一致。该结果仍只是无签名编译/链接与身份生成 smoke，不是签名安装或真机运行资格。
 
 覆盖：
 

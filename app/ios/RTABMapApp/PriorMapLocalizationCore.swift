@@ -982,6 +982,19 @@ final class PriorMapRecoveryController {
     }
 }
 
+/// Admission gate for the native RTAB-Map node clock used by every required
+/// localization evidence record. The native offset is legitimately absent for
+/// the first AR frames before the first node-time snapshot exists. That is a
+/// transient "not ready" condition, not corrupt evidence: callers must wait
+/// instead of manufacturing a non-finite placeholder and poisoning the whole
+/// scan's sticky evidence health.
+enum PriorMapNodeTimebaseAdmission {
+    static func accepts(offsetSeconds: TimeInterval?) -> Bool {
+        guard let offsetSeconds else { return false }
+        return offsetSeconds.isFinite
+    }
+}
+
 /// Thread-safe latest-frame gate. At most one update may execute at a time;
 /// stale completions from a previous/reset generation cannot release a newer
 /// update.

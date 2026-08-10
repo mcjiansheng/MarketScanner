@@ -194,6 +194,10 @@ final class MobileOnlyWorkflowCoordinator {
     private var processingOperation: BlockOperation?
     private var importBusy = false
     private var processingBusy = false
+    /// Identifies the call that owns `processingBusy`. A rejected duplicate
+    /// invokes the same release path but cannot clear the accepted run's
+    /// ownership or allow a third operation to enter.
+    private var processingAdmissionOwner: UUID?
     private let coordinatorLock = NSLock()
     /// Guards `state` reads/writes; transitions may be requested from
     /// the main thread (UI) and the serial work queue.
@@ -239,7 +243,8 @@ final class MobileOnlyWorkflowCoordinator {
         from presenter: UIViewController,
         contract: CoordinateContract,
         storeID: String? = nil,
-        mapName: String? = nil
+        mapName: String? = nil,
+        preparedDocumentPicker: UIDocumentPickerViewController? = nil
     ) {
         coordinatorLock.lock()
         guard !importBusy else {
@@ -264,6 +269,7 @@ final class MobileOnlyWorkflowCoordinator {
         persistContext()
 
         let picker = MapSourceDocumentPicker(
+            preparedViewController: preparedDocumentPicker,
             onStagingStarted: { [weak self] in
                 guard let self = self else { return }
                 if self.transition(to: .stagingMapSource) {
@@ -502,20 +508,24 @@ final class MobileOnlyWorkflowCoordinator {
 
     // MARK: - Scan flow
 
-    func beginScanSetup(map: MobileMapLibrary.MapEntry) {
-        guard transition(to: .configuringScan) else { return }
+    @discardableResult
+    func beginScanSetup(map: MobileMapLibrary.MapEntry) -> Bool {
+        guard transition(
+                to: .configuringScan,
+                mutateContext: { context in
+                    context.mapID = map.priorMapID
+                    context.mapSHA = map.packageSHA256
+                    context.sessionID = ""
+                    context.segmentDirectory = ""
+                    context.sourceDatabase = ""
+                    context.scanReceipt = ""
+                    context.scanReceiptSHA256 = ""
+                    context.checkpoint = "configuring_scan"
+                }) else {
+            return false
+        }
         activeMap = map
-        contextLock.lock()
-        context.mapID = map.priorMapID
-        context.mapSHA = map.packageSHA256
-        context.sessionID = ""
-        context.segmentDirectory = ""
-        context.sourceDatabase = ""
-        context.scanReceipt = ""
-        context.scanReceiptSHA256 = ""
-        context.checkpoint = "configuring_scan"
-        contextLock.unlock()
-        persistContext()
+        return true
     }
 
     func commitScanConfiguration(_ configuration: MobileScanConfiguration) {
@@ -547,8 +557,8 @@ final class MobileOnlyWorkflowCoordinator {
         }
         guard buildIdentity?.isUsable == true else {
             fail(with: .invalidState(
-                "当前构建没有可追踪身份；请使用 RTABMapApp-QualifiedDevice "
-                    + "scheme 从已提交且 tracked 文件干净的版本重新构建"))
+                "当前构建没有可追踪身份；请使用 RTABMapApp 默认 Release Run "
+                    + "或 RTABMapApp-QualifiedDevice，从已提交且 tracked 文件干净的版本重新构建"))
             return
         }
         guard onStartScan != nil, onRollbackScan != nil else {
@@ -845,8 +855,59 @@ final class MobileOnlyWorkflowCoordinator {
         }
     }
 
-    func scanFinalized() {
-        transition(to: .finalizingScan)
+    /// The scanner host calls this only after its own finalization admission
+    /// gate has closed. Returning false means this scan was not owned by the
+    /// canonical Mobile-Only transaction; legacy/free scans still finalize
+    /// normally without mutating this coordinator.
+    @discardableResult
+    func scanFinalizationBegan() -> Bool {
+        stateLock.lock()
+        let currentState = state
+        stateLock.unlock()
+        guard currentState == .scanning else { return false }
+        return transition(
+            to: .finalizingScan,
+            mutateContext: { context in
+                context.checkpoint = "finalizing_scan"
+            })
+    }
+
+    /// A recoverable save/sidecar failure reopens the same scan. Keep the
+    /// durable receipt/session binding and restore the scanning checkpoint.
+    func scanFinalizationResumed() {
+        stateLock.lock()
+        let currentState = state
+        stateLock.unlock()
+        guard currentState == .finalizingScan else { return }
+        _ = transition(
+            to: .scanning,
+            mutateContext: { context in
+                context.checkpoint = "scanning"
+            })
+    }
+
+    /// The database and session are closed terminally (eligible, ineligible,
+    /// or finalized-needs-cleanup). Clear the active scan binding before the
+    /// next map/setup transaction is allowed.
+    func scanFinalizationCompleted() {
+        stateLock.lock()
+        let currentState = state
+        stateLock.unlock()
+        guard currentState == .finalizingScan else { return }
+        guard transition(
+                to: .idle,
+                mutateContext: { context in
+                    context.sessionID = ""
+                    context.segmentDirectory = ""
+                    context.sourceDatabase = ""
+                    context.scanReceipt = ""
+                    context.scanReceiptSHA256 = ""
+                    context.checkpoint = "idle"
+                    context.progress = 0
+                }) else {
+            return
+        }
+        lastScanReceipt = nil
     }
 
     /// Reported by the scanner host when the real scan start failed
@@ -865,6 +926,7 @@ final class MobileOnlyWorkflowCoordinator {
     /// Processes a finalized session end-to-end on the background work
     /// queue (§5.1): snapshot → graph → optimization → trajectory →
     /// tags → result package → streaming XLSX.
+    @discardableResult
     func beginProcessing(
         finalizedSession: URL,
         sourceDatabase: URL,
@@ -873,32 +935,52 @@ final class MobileOnlyWorkflowCoordinator {
         floorID: String,
         trackingSessionID: String,
         taskID: String? = nil
-    ) {
+    ) -> Result<String, MobileOnlyWorkflowError> {
+        let admissionID = UUID()
         coordinatorLock.lock()
-        guard !processingBusy else {
+        stateLock.lock()
+        let currentState = state
+        stateLock.unlock()
+        let admission = MobileHistoricalProcessingAdmission.evaluate(
+            currentState: currentState,
+            processingBusy: processingBusy)
+        switch admission {
+        case .failure(let error):
             coordinatorLock.unlock()
-            let error = MobileOnlyWorkflowError.invalidState("processing already running")
+            releaseProcessingAdmission(admissionID)
             lastError = error
-            notifyProcessing(.failure(error))
-            return
+            if case .illegalTransition = error {
+                contextLock.lock()
+                context.errorCode = error.code
+                contextLock.unlock()
+                persistContext()
+            }
+            return .failure(error)
+        case .success:
+            processingBusy = true
+            processingAdmissionOwner = admissionID
         }
-        processingBusy = true
         coordinatorLock.unlock()
 
         guard transition(to: .snapshotting) else {
-            coordinatorLock.lock(); processingBusy = false; coordinatorLock.unlock()
-            return
+            releaseProcessingAdmission(admissionID)
+            return .failure(lastError ?? .illegalTransition(
+                "\(currentState.rawValue) -> snapshotting"))
         }
         // V1R4 §15: a resumed run re-uses the persisted task ID — a new
         // task is never created to impersonate a resume. The pipeline
         // validates task.json and resumes from the last durable
         // checkpoint inside the same task directory.
         let taskID = taskID ?? "task-\(UUID().uuidString)"
-        guard let taskRoot = try? MobileProcessingTaskStore.createTask(taskID: taskID) else {
-            coordinatorLock.lock(); processingBusy = false; coordinatorLock.unlock()
-            fail(with: .snapshotFailed("cannot create task directory"))
-            notifyProcessing(.failure(lastError ?? .snapshotFailed("unknown")))
-            return
+        let taskRoot: URL
+        do {
+            taskRoot = try MobileProcessingTaskStore.createTask(taskID: taskID)
+        } catch {
+            let workflowError = MobileOnlyWorkflowError.snapshotFailed(
+                "cannot create task directory: \(error.localizedDescription)")
+            releaseProcessingAdmission(admissionID)
+            fail(with: workflowError)
+            return .failure(workflowError)
         }
         contextLock.lock()
         context.taskID = taskID
@@ -928,13 +1010,19 @@ final class MobileOnlyWorkflowCoordinator {
             policySHA: policySHA)
 
         let operation = BlockOperation { [weak self] in
-            self?.executeProcessing(request: request)
+            self?.executeProcessing(
+                request: request,
+                admissionID: admissionID)
         }
         processingOperation = operation
         workQueue.addOperation(operation)
+        return .success(taskID)
     }
 
-    private func executeProcessing(request: MobileProcessingPipeline.Request) {
+    private func executeProcessing(
+        request: MobileProcessingPipeline.Request,
+        admissionID: UUID
+    ) {
         do {
             let outcome = try MobileProcessingPipeline.run(
                 request: request,
@@ -962,6 +1050,7 @@ final class MobileOnlyWorkflowCoordinator {
         } catch {
             if (error as? MobileOnlyWorkflowError) == .cancelled {
                 self.transition(to: .cancelled)
+                self.notifyProcessing(.failure(.cancelled))
             } else if let workflowError = error as? MobileOnlyWorkflowError {
                 if case .rescanSessionRequired = workflowError {
                     self.markRescanRequired(with: workflowError)
@@ -976,7 +1065,16 @@ final class MobileOnlyWorkflowCoordinator {
             }
         }
         self.processingOperation = nil
-        self.coordinatorLock.lock(); self.processingBusy = false; self.coordinatorLock.unlock()
+        self.releaseProcessingAdmission(admissionID)
+    }
+
+    private func releaseProcessingAdmission(_ admissionID: UUID) {
+        coordinatorLock.lock()
+        if processingAdmissionOwner == admissionID {
+            processingAdmissionOwner = nil
+            processingBusy = false
+        }
+        coordinatorLock.unlock()
     }
 
     /// Maps the pipeline progress fraction onto the legal processing
@@ -1007,7 +1105,10 @@ final class MobileOnlyWorkflowCoordinator {
 
     // MARK: - State machine (§5.4)
 
-    private func transition(to newState: MobileOnlyWorkflowState) -> Bool {
+    private func transition(
+        to newState: MobileOnlyWorkflowState,
+        mutateContext: ((inout PersistedContext) -> Void)? = nil
+    ) -> Bool {
         stateLock.lock()
         let current = state
         guard current.allowsTransition(to: newState) else {
@@ -1023,11 +1124,12 @@ final class MobileOnlyWorkflowCoordinator {
         }
         state = newState
         stateLock.unlock()
+        contextLock.lock()
         if newState != .failed && newState != .rescanRequired {
-            contextLock.lock()
             context.errorCode = ""
-            contextLock.unlock()
         }
+        mutateContext?(&context)
+        contextLock.unlock()
         persistContext()
         notifyState(newState)
         return true
@@ -1319,16 +1421,21 @@ final class MobileOnlyWorkflowCoordinator {
         // of silently defaulting.
         let floorID = Self.floorIDFromMetadata(segmentDirectory: segmentDirectory)
         switch checkpoint {
-        case "scanning" where !Self.sessionMetadataIsFinalized(
-                segmentDirectory: segmentDirectory):
+        case let liveCheckpoint
+                where (liveCheckpoint == "scanning"
+                    || liveCheckpoint == "finalizing_scan")
+                    && !Self.sessionMetadataIsFinalized(
+                        segmentDirectory: segmentDirectory):
             // An interrupted live capture is recovered by the scanner's
-            // session/checkpoint path. It must never be submitted directly
-            // to post-processing as if it were finalized.
+            // session/checkpoint path. A crash during finalization may still
+            // have an open checkpoint and no committed metadata, so neither
+            // state may be submitted directly to post-processing as if it
+            // were finalized.
             transition(to: .idle)
             return false
         case _ where !segmentDirectory.isEmpty && !sourceDatabase.isEmpty:
             transition(to: .idle)
-            beginProcessing(
+            let admission = beginProcessing(
                 finalizedSession: URL(fileURLWithPath: segmentDirectory),
                 sourceDatabase: URL(fileURLWithPath: sourceDatabase),
                 priorMap: map,
@@ -1336,7 +1443,12 @@ final class MobileOnlyWorkflowCoordinator {
                 floorID: floorID,
                 trackingSessionID: sessionID,
                 taskID: taskID.isEmpty ? nil : taskID)
-            return true
+            switch admission {
+            case .success:
+                return true
+            case .failure:
+                return false
+            }
         default:
             transition(to: .idle)
             return false

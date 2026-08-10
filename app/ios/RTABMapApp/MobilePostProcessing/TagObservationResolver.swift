@@ -203,6 +203,7 @@ enum TagObservationResolver {
         var robustOutlierCount: Int
         var associationConfidence: Double
         var nodeIDs: [Int64]
+        var burstIDs: Set<String>
         var trackingSessionID: String
     }
 
@@ -305,6 +306,7 @@ enum TagObservationResolver {
             associationConfidence: max(0.0, min(1.0,
                 1.0 - maxSpread / max(maximumSpreadM, 1.0e-9))),
             nodeIDs: observations.map { $0.nodeID },
+            burstIDs: Set(observations.compactMap(\.burstID)),
             trackingSessionID: observations[0].trackingSessionID
         )
     }

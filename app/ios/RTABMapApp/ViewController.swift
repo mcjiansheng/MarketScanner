@@ -58,6 +58,7 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
     private var priorMapOverlay: PriorMapLiveMapView?
     private var priorMapLatestUpdate: PriorMapLocalizationUpdate?
     private var priorMapEvidenceWriteWarningShown = false
+    private var priorMapNodeTimebaseUnavailableNoticeAt: TimeInterval?
     private var priorMapLastNodeBinding: (
         nodeId: Int,
         nodeStamp: TimeInterval,
@@ -81,6 +82,7 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
     private var priceTagCaptureFrameResults:
         [UUID: [PriceTagShelfAssociationResult]] = [:]
     private var priceTagCaptureOverlay: PriceTagCaptureOverlayView?
+    private weak var priceTagCaptureStartFailureAlert: UIAlertController?
     private weak var priceTagShelfConfirmationController:
         PriceTagShelfConfirmationViewController?
     private var priceTagCapturePresentationGeneration: UUID?
@@ -1346,6 +1348,10 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                     return false
                 }
                 let configuration = ARWorldTrackingConfiguration()
+                // ESL capture reuses this ARSession. Keep continuous
+                // autofocus explicit so close-range barcode work cannot
+                // inherit a disabled camera configuration from another mode.
+                configuration.isAutoFocusEnabled = true
                 var message = ""
             	if(mState != .STATE_VISUALIZING_AND_MEASURING)
             	{
@@ -1749,7 +1755,8 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
             options: .displayInline,
             children: [
             UIAction(title: localized("开始门店扫描"), image: UIImage(systemName: "camera.viewfinder"), attributes: actionNewScanEnabled ? [] : .disabled, handler: { _ in
-                self.presentMobileFlow(MobileScanSetupViewController())
+                self.presentMobileFlow(MobileMapLibraryViewController(
+                    purpose: .selectForScan))
             }),
             UIAction(title: localized("门店地图"), image: UIImage(systemName: "map"), handler: { _ in
                 self.presentMobileFlow(MobileMapLibraryViewController())
@@ -2844,11 +2851,11 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                 seconds: 4)
             return
         }
-        // The large primary action always enters the canonical full-phone
-        // store scan. Free mapping and raw recording remain available only
-        // under “实验与兼容工具”, and the production path does not
-        // bypass the canonical mobile-only coordinator.
-        presentMobileFlow(MobileScanSetupViewController())
+        // Select from the lightweight registry before loading a package.
+        // This avoids validating an arbitrary first map and then forcing the
+        // operator to wait again before choosing the intended store.
+        presentMobileFlow(MobileMapLibraryViewController(
+            purpose: .selectForScan))
     }
 
     private func preparePriorMapLocalization(
@@ -2934,6 +2941,7 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
             ])
             priorMapOverlay = overlay
             priorMapEvidenceWriteWarningShown = false
+            priorMapNodeTimebaseUnavailableNoticeAt = nil
             priorMapGeneration = UUID()
             priorMapUpdateGate.reset()
             return true
@@ -2971,6 +2979,7 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         activePriorMapPackage = nil
         priorMapLatestUpdate = nil
         priorMapEvidenceWriteWarningShown = false
+        priorMapNodeTimebaseUnavailableNoticeAt = nil
         priorMapLastNodeBinding = nil
         priorMapUpdateGate.reset()
         if let localizerToCancel {
@@ -3112,6 +3121,31 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         let generation = priorMapGeneration
         let trackingSessionId = scanSession.trackingSessionId
         let nodeTimebase = rtabmap?.nodeTimebase(frameTimestamp: frame.timestamp)
+        guard PriorMapNodeTimebaseAdmission.accepts(
+                offsetSeconds: nodeTimebase?.offsetSeconds),
+              let nodeTimebase else {
+            let previousNotice = priorMapNodeTimebaseUnavailableNoticeAt
+            let shouldReport: Bool
+            if let previousNotice {
+                shouldReport = frame.timestamp - previousNotice >= 2.0
+            }
+            else {
+                shouldReport = true
+            }
+            if shouldReport {
+                priorMapNodeTimebaseUnavailableNoticeAt = frame.timestamp
+                scanSession.appendScanEvent(
+                    level: "warning",
+                    event: "prior_map_update_waiting_for_node_timebase",
+                    message: "Prior-map localization is waiting for the first native node-time snapshot",
+                    fields: [
+                        "frame_timestamp": String(
+                            format: "%.9f", frame.timestamp),
+                    ])
+            }
+            return
+        }
+        priorMapNodeTimebaseUnavailableNoticeAt = nil
         let priceTagNodeBinding = rtabmap?.latestNodeBinding(
             frameTimestamp: frame.timestamp)
         if let binding = priceTagNodeBinding {
@@ -3160,8 +3194,7 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
             let writeResult = scanSession.appendLocalizationTrace(
                 update,
                 expectedTrackingSessionId: trackingSessionId,
-                nodeTimebaseOffsetSeconds:
-                    nodeTimebase?.offsetSeconds ?? .nan)
+                nodeTimebaseOffsetSeconds: nodeTimebase.offsetSeconds)
             // F-02/P7R6: every terminal episode completion must leave the
             // device as persisted lifecycle evidence through the peek/ack
             // coordinator, including converged, timed out, and manual-reset
@@ -3343,6 +3376,40 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         }
     }
 
+    private func presentPriceTagCaptureStartFailure(_ reason: String?) {
+        guard priceTagCaptureStartFailureAlert == nil else { return }
+        let message: String
+        switch reason {
+        case "required_localization_evidence_failed":
+            message = localized("Required localization evidence has failed for this scan. Barcode capture is disabled to protect the result. End the scan, keep the recovery package, then start a new scan.")
+        case "alignment_snapshot_unavailable":
+            message = localized("Prior-map alignment is not ready yet. Hold the device steady and try again after localization recovers.")
+        case "arkit_frame_unavailable":
+            message = localized("The camera frame is not ready. Keep the app in the foreground and try again in a moment.")
+        case "mapping_state_unavailable":
+            message = localized("Barcode capture is available only while a store scan is actively recording.")
+        case "prior_map_localizer_unavailable",
+             "workflow_not_prior_map_localized",
+             "prior_map_scan_identity_unavailable",
+             "capture_authority_unavailable":
+            message = localized("This scan does not have a usable prior-map identity. End it and start again through Start Store Scan after selecting a map.")
+        default:
+            message = localized("Tracking or prior-map localization is temporarily unstable. Hold the device steady and try again after localization recovers.")
+        }
+        let alert = UIAlertController(
+            title: localized("Unable to scan ESL barcode"),
+            message: message,
+            preferredStyle: .alert)
+        alert.addAction(UIAlertAction(
+            title: "OK",
+            style: .default,
+            handler: { [weak self] _ in
+                self?.priceTagCaptureStartFailureAlert = nil
+            }))
+        priceTagCaptureStartFailureAlert = alert
+        present(alert, animated: true)
+    }
+
     private func startPriceTagCapture() {
         let currentFrame = session.currentFrame
         let currentAlignment = priorMapAlignmentSnapshots.snapshot()
@@ -3387,9 +3454,7 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                 phase: "start",
                 sourceReason: startFailure,
                 terminal: true)
-            showToast(
-                message: localized("ARKit or prior-map localization is not ready, or required localization evidence has already failed."),
-                seconds: 3)
+            presentPriceTagCaptureStartFailure(startFailure)
             return
         }
         guard !priceTagCaptureCoordinator.isActive() else {
@@ -3417,9 +3482,8 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                 phase: "start_identity",
                 sourceReason: "prior_map_scan_identity_unavailable",
                 terminal: true)
-            showToast(
-                message: localized("The prior-map scan identity is unavailable. ESL capture did not start."),
-                seconds: 3)
+            presentPriceTagCaptureStartFailure(
+                "prior_map_scan_identity_unavailable")
             return
         }
         let capturePriorMapGeneration = priorMapGeneration
@@ -3461,6 +3525,8 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
             overlay.bottomAnchor.constraint(equalTo: view.bottomAnchor),
         ])
         view.layoutIfNeeded()
+        overlay.accessibilityViewIsModal = true
+        view.bringSubviewToFront(overlay)
         priceTagCaptureOverlay = overlay
         priceTagCapturePresentationGeneration = generation
         priceTagCaptureCoordinator.updateGeometry(overlay.captureGeometry)
@@ -3488,6 +3554,7 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
             ])
         UINotificationFeedbackGenerator().notificationOccurred(.warning)
         overlay.update(.aiming)
+        UIAccessibility.post(notification: .screenChanged, argument: overlay)
     }
 
     private func priceTagImageOrientation() -> CGImagePropertyOrientation {
@@ -3631,13 +3698,7 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
             }
             return
         }
-        let binding = rtabmap?.latestNodeBinding(
-            frameTimestamp: frame.timestamp).map {
-                PriceTagCaptureNodeBinding(
-                    nodeID: Int64($0.nodeId),
-                    nodeTimebaseOffsetSeconds:
-                        $0.nodeTimebaseOffsetSeconds)
-            }
+        let binding = priceTagNodeBinding(frameTimestamp: frame.timestamp)
         let trackingSessionID = supermarketSession?.trackingSessionId ?? ""
         let submitted = priceTagVisionScanner.detect(
             frame: frame,
@@ -3711,6 +3772,34 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                 terminal: false,
                 minimumInterval: 1)
         }
+    }
+
+    /// Prefer the atomic live node snapshot. During a short native node
+    /// publication gap, reuse only the already-frozen snapshot that still
+    /// satisfies the same strict one-second node-timebase contract. This is
+    /// exact-ID authority reuse, never the removed nearest-node fallback.
+    private func priceTagNodeBinding(
+        frameTimestamp: TimeInterval
+    ) -> PriceTagCaptureNodeBinding? {
+        if let live = rtabmap?.latestNodeBinding(
+                frameTimestamp: frameTimestamp) {
+            return PriceTagCaptureNodeBinding(
+                nodeID: Int64(live.nodeId),
+                nodeTimebaseOffsetSeconds:
+                    live.nodeTimebaseOffsetSeconds)
+        }
+        guard let cached = priorMapLastNodeBinding else { return nil }
+        let nodeTimebaseFrameTimestamp = frameTimestamp
+            + cached.nodeTimebaseOffsetSeconds
+        let delta = abs(nodeTimebaseFrameTimestamp - cached.nodeStamp)
+        guard abs(frameTimestamp - cached.sampledFrameTimestamp) <= 1.0,
+              delta <= 1.0 else {
+            return nil
+        }
+        return PriceTagCaptureNodeBinding(
+            nodeID: Int64(cached.nodeId),
+            nodeTimebaseOffsetSeconds:
+                cached.nodeTimebaseOffsetSeconds)
     }
 
     @discardableResult
@@ -3925,13 +4014,13 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                 payload: detection.payload,
                 symbology: detection.symbology,
                 sourceReason: "native_node_binding_unavailable",
-                terminal: true)
-            let action = priceTagCaptureCoordinator.finishEvidence(
-                generation: result.generation,
-                captureID: captureID,
-                frameTimestamp: result.frame.timestamp,
-                observationID: detection.observationId,
-                succeeded: false)
+                terminal: false,
+                minimumInterval: 0.5)
+            let action = priceTagCaptureCoordinator
+                .deferEvidenceUntilNodeBinding(
+                    generation: result.generation,
+                    captureID: captureID,
+                    frameTimestamp: result.frame.timestamp)
             handlePriceTagEvidenceAction(
                 action,
                 generation: result.generation,
@@ -4070,8 +4159,21 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                     acceptedFrames: acceptedFrames,
                     requiredFrames: requiredFrames))
             }
+        case .waitingForNodeBinding(let acceptedFrames, let requiredFrames):
+            DispatchQueue.main.async {
+                guard self.priceTagCaptureCoordinator.isCurrent(generation) else {
+                    return
+                }
+                self.priceTagCaptureOverlay?.update(.error(
+                    message: String(
+                        format: self.localized("Barcode recognized. Waiting for an exact scan-node pose before saving low-confidence evidence (%d/%d)."),
+                        acceptedFrames,
+                        requiredFrames)))
+            }
         case .resolve(_, let observationIDs):
             priceTagVisionScanner.cancel(generation: generation)
+            let captureResults = priceTagCaptureResults(
+                captureID: captureID)
             guard let completion = supermarketSession?
                     .finalizeTagObservationCapture(
                         captureID: captureID,
@@ -4080,7 +4182,7 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                   completion.sufficient,
                   Set(completion.observationIDs) == Set(observationIDs),
                   let resolved = PriceTagCaptureResolver.resolve(
-                    priceTagCaptureResults(captureID: captureID),
+                    captureResults,
                     minimumEvidenceFrames: 3) else {
                 recordPriceTagCaptureAudit(
                     .shelfAmbiguous,
@@ -4113,6 +4215,59 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                     generation: generation,
                     captureID: captureID,
                     phase: "resolving_to_confirming")
+                return
+            }
+            if resolution.tag.needsReview
+                || !resolution.algorithmCandidateReliable {
+                let recomputableFrameCount = captureResults.filter {
+                    $0.tag.rawMapPosition != nil
+                        && $0.tag.measurementMethod != "unavailable"
+                }.count
+                guard recomputableFrameCount >= 3 else {
+                    recordPriceTagCaptureAudit(
+                        .measurementUnavailable,
+                        generation: generation,
+                        captureID: captureID,
+                        phase: "capture_resolution",
+                        payload: resolution.tag.payload,
+                        symbology: resolution.tag.symbology,
+                        sourceReason: "recomputable_position_quorum_missing",
+                        terminal: true)
+                    DispatchQueue.main.async {
+                        self.cancelPriceTagCapture(
+                            reason: "capture_position_unresolvable",
+                            userMessage: self.localized("The barcode evidence was saved, but fewer than three frames had a recomputable ESL position. Move slightly back and rescan once."),
+                            captureIDToFinalize: captureID)
+                    }
+                    return
+                }
+                // The exact complete burst is already durable. Retain it as
+                // low confidence and let post-processing reproject every
+                // observation through its exact boundNodeID and the final
+                // optimized phone pose. The operator should not have to scan
+                // the same physical tag repeatedly just to improve confidence.
+                DispatchQueue.main.async {
+                    guard self.priceTagCaptureCoordinator.isCurrent(generation) else {
+                        return
+                    }
+                    self.priceTagCaptureOverlay?.update(.success)
+                    UINotificationFeedbackGenerator()
+                        .notificationOccurred(.warning)
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+                        guard self.priceTagCaptureCoordinator.isCurrent(
+                            generation) else { return }
+                        _ = self.finishPriceTagCapture(
+                            generation: generation,
+                            payload: resolution.tag.payload,
+                            committed: false,
+                            retainedForReview: true,
+                            outcome: "low_confidence_retained")
+                        self.showToast(
+                            message: self.localized("The ESL was saved as low confidence. Its position will be recomputed from the exact scan node during processing; no immediate rescan is required."),
+                            seconds: 5,
+                            replacingCurrent: true)
+                    }
+                }
                 return
             }
             DispatchQueue.main.async {
@@ -4455,6 +4610,7 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         generation: UUID,
         payload: String,
         committed: Bool,
+        retainedForReview: Bool = false,
         outcome: String
     ) -> Bool {
         let completedAt = session.currentFrame?.timestamp
@@ -4463,7 +4619,8 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
             generation: generation,
             payload: payload,
             completedAt: completedAt,
-            committed: committed) else {
+            committed: committed,
+            retainedForReview: retainedForReview) else {
             persistPriceTagCaptureDiagnostics(
                 generation: generation,
                 captureID: nil,
@@ -4488,6 +4645,7 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                 "capture_generation": generation.uuidString.lowercased(),
                 "outcome": outcome,
                 "committed": committed ? "true" : "false",
+                "retained_for_review": retainedForReview ? "true" : "false",
             ])
         return true
     }
@@ -5721,6 +5879,14 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
             completion?(.resumeRecording)
             return
         }
+        let mobileWorkflowFinalizationActive =
+            scanSession.scanConfiguration.workflowMode == .priorMapLocalized
+                && MobileOnlyWorkflowCoordinator.shared.scanFinalizationBegan()
+        let resumeMobileWorkflowIfNeeded = {
+            if mobileWorkflowFinalizationActive {
+                MobileOnlyWorkflowCoordinator.shared.scanFinalizationResumed()
+            }
+        }
         cancelPriceTagCapture(
             reason: "scan_finalization_started",
             userMessage: nil)
@@ -5758,6 +5924,7 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         }
         catch {
             scanSession.endFinalization()
+            resumeMobileWorkflowIfNeeded()
             showToast(message: String(format: localized("Could not finalize streaming scan: %@"), error.localizedDescription), seconds: 4)
             completion?(.resumeRecording)
             return
@@ -5768,6 +5935,7 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
             localizationTransactionsDrainedWithinDeadline in
         guard let self else {
             scanSession.endFinalization()
+            resumeMobileWorkflowIfNeeded()
             completion?(.resumeRecording)
             return
         }
@@ -6040,6 +6208,7 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                     exportBaseDirectory?.stopAccessingSecurityScopedResource()
                 }
                 scanSession.endFinalization()
+                resumeMobileWorkflowIfNeeded()
                 scanSession.appendScanEvent(
                     level: "error",
                     event: "scan_finalization_failed",
@@ -6116,6 +6285,9 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
             // copy continues against captured immutable paths.
             scanSession.completeCurrentSession()
             scanSession.endFinalization()
+            if mobileWorkflowFinalizationActive {
+                MobileOnlyWorkflowCoordinator.shared.scanFinalizationCompleted()
+            }
             self.activeScanConfiguration = .freeMapping
             self.clearPriorMapLocalization()
             self.showToast(
@@ -7397,8 +7569,8 @@ extension ViewController: MobileOnlyScanStarting {
         let identity = MobileBuildIdentity.loadFromBundle()
         guard identity.isUsable else {
             throw MobileOnlyWorkflowError.invalidState(
-                "当前构建没有可追踪身份；请使用 RTABMapApp-QualifiedDevice "
-                    + "scheme 从已提交且 tracked 文件干净的版本重新构建")
+                "当前构建没有可追踪身份；请使用 RTABMapApp 默认 Release Run "
+                    + "或 RTABMapApp-QualifiedDevice，从已提交且 tracked 文件干净的版本重新构建")
         }
 
         let entry = configuration.priorMap

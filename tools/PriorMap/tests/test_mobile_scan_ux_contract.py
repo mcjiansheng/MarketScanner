@@ -24,9 +24,32 @@ class MobileScanUXContractTests(unittest.TestCase):
         start = source.index("private func presentNewScanModePicker()")
         end = source.index("private func preparePriorMapLocalization", start)
         route = source[start:end]
-        self.assertIn("presentMobileFlow(MobileScanSetupViewController())", route)
+        self.assertIn("MobileMapLibraryViewController(", route)
+        self.assertIn("purpose: .selectForScan", route)
+        self.assertNotIn("MobileScanSetupViewController", route)
         self.assertNotIn("PriorMapWizardViewController", route)
         self.assertNotIn("self.newScan(configuration:", route)
+
+    def test_scan_selection_precedes_exact_package_loading(self) -> None:
+        library = self.source(
+            "app/ios/RTABMapApp/MobileOnlyWorkflow/UI/"
+            "MobileMapLibraryViewController.swift"
+        )
+        setup = self.source(
+            "app/ios/RTABMapApp/MobileOnlyWorkflow/UI/"
+            "MobileScanSetupViewController.swift"
+        )
+        self.assertIn("case selectForScan", library)
+        self.assertIn('importButton.setTitle("导入新地图"', library)
+        self.assertIn('title = purpose == .selectForScan ? "选择门店地图"', library)
+        self.assertIn("MobileScanSetupViewController(", library)
+        self.assertIn("selectedMap: maps[indexPath.row]", library)
+        self.assertIn("private let selectedMap: MobileMapLibrary.MapEntry", setup)
+        self.assertIn("init(selectedMap: MobileMapLibrary.MapEntry)", setup)
+        self.assertIn("loadMap(selectedMap)", setup)
+        self.assertNotIn("MobileMapLibrary.listRegisteredMaps()", setup)
+        self.assertNotIn("UIPickerViewDataSource", setup)
+        self.assertNotIn("private let mapPicker", setup)
 
     def test_map_library_and_setup_keep_heavy_io_off_main(self) -> None:
         library = self.source(
@@ -47,6 +70,53 @@ class MobileScanUXContractTests(unittest.TestCase):
         self.assertIn("PriorMapPackage.load", setup)
         self.assertIn("stagingQueue.async", picker)
         self.assertNotIn("CanonicalSourceHasher.sha256", picker)
+
+    def test_import_cold_uikit_and_files_picker_are_prewarmed(self) -> None:
+        library = self.source(
+            "app/ios/RTABMapApp/MobileOnlyWorkflow/UI/"
+            "MobileMapLibraryViewController.swift"
+        )
+        importer = self.source(
+            "app/ios/RTABMapApp/MobileOnlyWorkflow/UI/"
+            "MobileMapImportViewController.swift"
+        )
+        picker = self.source(
+            "app/ios/RTABMapApp/MobileMapImport/MapSourceDocumentPicker.swift"
+        )
+        coordinator = self.source(
+            "app/ios/RTABMapApp/MobileOnlyWorkflow/"
+            "MobileOnlyWorkflowCoordinator.swift"
+        )
+        self.assertIn("prepareImportFlowIfIdle", library)
+        self.assertIn("preparedImportController", library)
+        self.assertIn("preparedImportMenu", library)
+        self.assertIn("controller.prepareForPresentation()", library)
+        self.assertIn("controller.loadViewIfNeeded()", library)
+        self.assertGreaterEqual(
+            library.count("self?.prepareImportFlowIfIdle()"),
+            3,
+        )
+        self.assertIn("prepareDocumentPickerIfNeeded", importer)
+        self.assertIn("preparedDocumentPicker", importer)
+        self.assertIn("preparedDocumentPicker: picker", importer)
+        self.assertIn("cachedSupportedTypes", picker)
+        self.assertIn("makePreparedViewController", picker)
+        self.assertIn("picker.loadViewIfNeeded()", picker)
+        self.assertIn("alert.loadViewIfNeeded()", library)
+        self.assertIn("preparedDocumentPicker:", coordinator)
+
+        tap_start = importer.index("@objc private func importTapped()")
+        tap_end = importer.index(
+            "private func prepareDocumentPickerIfNeeded", tap_start
+        )
+        tap = importer[tap_start:tap_end]
+        self.assertNotIn("UIDocumentPickerViewController(", tap)
+        present_start = picker.index("func present(from")
+        present_end = picker.index("func documentPicker(", present_start)
+        self.assertNotIn(
+            "UIDocumentPickerViewController(",
+            picker[present_start:present_end],
+        )
 
     def test_setup_binds_every_registry_identity_field_to_loaded_package(
         self,
@@ -108,7 +178,7 @@ class MobileScanUXContractTests(unittest.TestCase):
         self.assertIn("installVerifiedPackage", library_ui)
         self.assertIn("static func installVerifiedPackage", library)
         self.assertIn("let entry = try register(", library)
-        self.assertIn("MobileScanSetupViewController()", library_ui)
+        self.assertIn("MobileScanSetupViewController(selectedMap:", library_ui)
 
     def test_scan_start_reuses_one_prepared_package(self) -> None:
         coordinator = self.source(
@@ -159,6 +229,20 @@ class MobileScanUXContractTests(unittest.TestCase):
         self.assertIn("== .authorized", authorized)
         self.assertIn("coordinator.beginScanSetup", authorized)
         self.assertIn("coordinator.commitScanConfiguration", authorized)
+        self.assertIn("guard coordinator.beginScanSetup", authorized)
+        self.assertLess(
+            authorized.index("guard coordinator.beginScanSetup"),
+            authorized.index("coordinator.commitScanConfiguration"),
+        )
+        coordinator = self.source(
+            "app/ios/RTABMapApp/MobileOnlyWorkflow/"
+            "MobileOnlyWorkflowCoordinator.swift"
+        )
+        begin_setup = coordinator.split(
+            "func beginScanSetup(map:", 1
+        )[1].split("func commitScanConfiguration", 1)[0]
+        self.assertIn("mutateContext: { context in", begin_setup)
+        self.assertNotIn("persistContext()", begin_setup)
 
         notice_start = setup.index(
             "private func presentCameraPermissionNotice()", permission_start
@@ -237,6 +321,150 @@ class MobileScanUXContractTests(unittest.TestCase):
         self.assertIn("case .cancelled:", setup)
         self.assertIn("case .interrupted:", setup)
 
+    def test_scan_finalization_closes_or_restores_workflow_transaction(self) -> None:
+        coordinator = self.source(
+            "app/ios/RTABMapApp/MobileOnlyWorkflow/"
+            "MobileOnlyWorkflowCoordinator.swift"
+        )
+        state = self.source(
+            "app/ios/RTABMapApp/MobileOnlyWorkflow/"
+            "MobileOnlyWorkflowState.swift"
+        )
+        host = self.source("app/ios/RTABMapApp/ViewController.swift")
+        for method in (
+            "func scanFinalizationBegan() -> Bool",
+            "func scanFinalizationResumed()",
+            "func scanFinalizationCompleted()",
+        ):
+            self.assertIn(method, coordinator)
+        self.assertIn(
+            "mutateContext: ((inout PersistedContext) -> Void)? = nil",
+            coordinator,
+        )
+        self.assertIn(
+            "return [.scanning, .snapshotting, .idle, .failed, .interrupted]",
+            state,
+        )
+        finalization = host.split("private func finalizeStreamingScan(", 1)[1].split(
+            "func stopMapping(", 1
+        )[0]
+        self.assertIn("scanFinalizationBegan()", finalization)
+        self.assertIn("scanFinalizationResumed()", finalization)
+        self.assertIn("scanFinalizationCompleted()", finalization)
+        self.assertLess(
+            finalization.index("scanSession.completeCurrentSession()"),
+            finalization.index("scanFinalizationCompleted()"),
+        )
+        completed = coordinator.split(
+            "func scanFinalizationCompleted()", 1
+        )[1].split("func scanStartFailed", 1)[0]
+        self.assertIn("mutateContext: { context in", completed)
+        self.assertLess(
+            completed.index('context.scanReceipt = ""'),
+            completed.index("lastScanReceipt = nil"),
+        )
+        resume = coordinator.split("func attemptResume()", 1)[1].split(
+            "private static func sessionMetadataIsFinalized", 1
+        )[0]
+        self.assertIn('liveCheckpoint == "scanning"', resume)
+        self.assertIn('liveCheckpoint == "finalizing_scan"', resume)
+        self.assertLess(
+            resume.index('liveCheckpoint == "scanning"'),
+            resume.index("beginProcessing("),
+        )
+
+    def test_barcode_start_failure_alert_is_deduplicated(self) -> None:
+        host = self.source("app/ios/RTABMapApp/ViewController.swift")
+        presenter = host.split(
+            "private func presentPriceTagCaptureStartFailure", 1
+        )[1].split("private func startPriceTagCapture", 1)[0]
+        self.assertIn(
+            "guard priceTagCaptureStartFailureAlert == nil else { return }",
+            presenter,
+        )
+        self.assertIn("priceTagCaptureStartFailureAlert = alert", presenter)
+        self.assertIn("priceTagCaptureStartFailureAlert = nil", presenter)
+
+    def test_esl_overlay_text_is_anchored_outside_the_exact_scan_box(self) -> None:
+        core = self.source(
+            "app/ios/RTABMapApp/PriceTagCaptureCore.swift"
+        )
+        ui = self.source(
+            "app/ios/RTABMapApp/PriceTagCaptureUI.swift"
+        )
+        self.assertIn("static let statusClearancePoints", core)
+        self.assertIn("static let payloadClearancePoints", core)
+        self.assertIn("private let scanTopGuide = UILayoutGuide()", ui)
+        self.assertIn("private let scanBottomGuide = UILayoutGuide()", ui)
+        self.assertIn(
+            "multiplier: PriceTagCaptureLayout.normalizedScanRect.minY",
+            ui,
+        )
+        self.assertIn(
+            "multiplier: PriceTagCaptureLayout.normalizedScanRect.maxY",
+            ui,
+        )
+        self.assertIn(
+            "equalTo: scanTopGuide.bottomAnchor",
+            ui,
+        )
+        self.assertIn(
+            "equalTo: scanBottomGuide.bottomAnchor",
+            ui,
+        )
+        self.assertNotIn(
+            "statusLabel.bottomAnchor.constraint(equalTo: centerYAnchor",
+            ui,
+        )
+        self.assertNotIn(
+            "payloadLabel.topAnchor.constraint(equalTo: centerYAnchor",
+            ui,
+        )
+
+    def test_historical_scan_export_is_visible_and_independent_of_processing(
+        self,
+    ) -> None:
+        processing = self.source(
+            "app/ios/RTABMapApp/MobileOnlyWorkflow/UI/"
+            "MobileProcessingViewController.swift"
+        )
+        session = self.source(
+            "app/ios/RTABMapApp/SupermarketScanSession.swift"
+        )
+        self.assertIn("UIDocumentPickerDelegate", processing)
+        self.assertIn('UIImage(systemName: "square.and.arrow.up")', processing)
+        self.assertIn('exportButton.accessibilityLabel = "导出原始扫描"', processing)
+        self.assertIn("SupermarketScanSession.exportFinalizedCapture", processing)
+        export_start = session.index("static func exportFinalizedCapture(")
+        export_end = session.index(
+            "private static func uniqueExternalExportRoot", export_start
+        )
+        export = session[export_start:export_end]
+        self.assertIn('metadata["finalized"] as? Bool == true', export)
+        self.assertIn('"live_checkpoint.json"', export)
+        self.assertIn("databaseMetadata.st_nlink == 1", export)
+        self.assertIn("localManifestBeforeCopy == exportManifest", export)
+        self.assertIn("localManifestBeforeCopy == localManifestAfterCopy", export)
+        self.assertIn("localCopyRetained: true", export)
+        self.assertNotIn("removeLocalCaptureDirectory", export)
+
+    def test_snapshot_database_validation_has_an_ios_compatible_fallback(
+        self,
+    ) -> None:
+        snapshot = self.source(
+            "app/ios/RTABMapApp/MobilePostProcessing/"
+            "SessionSnapshotTransaction.swift"
+        )
+        self.assertIn("DatabaseValidationIdentity", snapshot)
+        self.assertIn("hasRememberedDatabaseValidation", snapshot)
+        self.assertIn("validateSnapshotDatabaseThroughPrivateCopy", snapshot)
+        self.assertIn(".marketscanner-db-validation-", snapshot)
+        self.assertIn("O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC | O_NOFOLLOW", snapshot)
+        self.assertIn("sameFileIdentity(sourceMetadata, sourceAfterValidation)", snapshot)
+        self.assertIn("unlinkat(directoryDescriptor, validationName, 0)", snapshot)
+        self.assertIn("file:/dev/fd/", snapshot)
+        self.assertIn("forcePrivateDatabaseValidationCopyForTests", snapshot)
+
     def test_navigation_contract_has_root_close_and_push_back_stack(self) -> None:
         setup = self.source(
             "app/ios/RTABMapApp/MobileOnlyWorkflow/UI/"
@@ -271,6 +499,146 @@ class MobileScanUXContractTests(unittest.TestCase):
             self.assertIn(stage, compiler)
         self.assertIn("bounded * 0.62", coordinator)
         self.assertIn("地图已编译、验证并注册", coordinator)
+
+    def test_import_progress_is_hidden_until_a_file_is_selected(self) -> None:
+        importer = self.source(
+            "app/ios/RTABMapApp/MobileOnlyWorkflow/UI/"
+            "MobileMapImportViewController.swift"
+        )
+        self.assertIn("percentLabel.isHidden = true", importer)
+        self.assertIn("progressView.isHidden = true", importer)
+        self.assertIn("elapsedLabel.isHidden = true", importer)
+        self.assertIn("case .stagingMapSource:", importer)
+        staging = importer.index("case .stagingMapSource:")
+        importing = importer.index("case .importingMap:", staging)
+        self.assertIn("setProgressUIVisible(true)", importer[staging:importing])
+        tap_start = importer.index("@objc private func importTapped()")
+        status_start = importer.index("private func updateStatus", tap_start)
+        tap = importer[tap_start:status_start]
+        self.assertIn("setProgressUIVisible(false)", tap)
+        self.assertNotIn("startElapsedTimer()", tap)
+
+    def test_vision_barcode_bounds_are_normalized_with_the_actual_request(
+        self,
+    ) -> None:
+        scanner = self.source(
+            "app/ios/RTABMapApp/PriceTagVisionScanner.swift"
+        )
+        capture = self.source(
+            "app/ios/RTABMapApp/PriceTagCaptureCore.swift"
+        )
+        candidates_start = scanner.index("private static func candidates(")
+        candidates_end = scanner.index(
+            "static func captureOrientation", candidates_start
+        )
+        candidates = scanner[candidates_start:candidates_end]
+        self.assertIn(
+            "PriceTagVisionBoundingBoxNormalizer.fullImageBounds",
+            candidates,
+        )
+        self.assertIn(
+            "requestRegionOfInterest: request.regionOfInterest",
+            candidates,
+        )
+        self.assertIn("requestRevision: Int(request.revision)", candidates)
+        self.assertIn("visionBounds: fullImageBounds", candidates)
+        self.assertNotIn("visionBounds: observation.boundingBox", candidates)
+        self.assertIn("if requestRevision == 1", capture)
+        self.assertIn(
+            "roi.origin.x + observation.origin.x * roi.width",
+            capture,
+        )
+        self.assertIn(
+            "roi.origin.y + observation.origin.y * roi.height",
+            capture,
+        )
+        self.assertIn("private static let boundaryEpsilon", capture)
+        self.assertNotIn(".standardized", capture)
+        self.assertIn("minimumROIIntersectionRatio: 0.80", capture)
+
+    def test_historical_processing_rejection_has_typed_admission_and_ui_rollback(
+        self,
+    ) -> None:
+        coordinator = self.source(
+            "app/ios/RTABMapApp/MobileOnlyWorkflow/"
+            "MobileOnlyWorkflowCoordinator.swift"
+        )
+        state = self.source(
+            "app/ios/RTABMapApp/MobileOnlyWorkflow/"
+            "MobileOnlyWorkflowState.swift"
+        )
+        processing_ui = self.source(
+            "app/ios/RTABMapApp/MobileOnlyWorkflow/UI/"
+            "MobileProcessingViewController.swift"
+        )
+
+        begin_start = coordinator.index("func beginProcessing(")
+        begin_end = coordinator.index(
+            "private func executeProcessing", begin_start
+        )
+        begin = coordinator[begin_start:begin_end]
+        self.assertIn(
+            ") -> Result<String, MobileOnlyWorkflowError>", begin
+        )
+        self.assertIn("MobileHistoricalProcessingAdmission.evaluate", begin)
+        self.assertGreaterEqual(
+            begin.count("releaseProcessingAdmission(admissionID)"), 3
+        )
+        self.assertIn("return .failure(error)", begin)
+        self.assertIn("return .failure(workflowError)", begin)
+        self.assertIn("return .success(taskID)", begin)
+        self.assertEqual(begin.count("workQueue.addOperation(operation)"), 1)
+        self.assertNotIn("notifyProcessing", begin)
+
+        release_start = coordinator.index(
+            "private func releaseProcessingAdmission"
+        )
+        release_end = coordinator.index(
+            "private func transitionToPipelineFraction", release_start
+        )
+        release = coordinator[release_start:release_end]
+        self.assertIn("processingAdmissionOwner == admissionID", release)
+        self.assertIn("processingAdmissionOwner = nil", release)
+        self.assertIn("processingBusy = false", release)
+
+        self.assertIn("enum MobileHistoricalProcessingAdmission", state)
+        self.assertIn("processingBusy: Bool", state)
+        self.assertIn("currentState != .finalizingScan", state)
+        map_ready_start = state.index("case .mapReady:")
+        map_ready_end = state.index("case .configuringScan:", map_ready_start)
+        self.assertNotIn(".snapshotting", state[map_ready_start:map_ready_end])
+
+        select_start = processing_ui.index(
+            "func tableView(_ tableView: UITableView, didSelectRowAt"
+        )
+        select_end = processing_ui.index(
+            "@objc private func exportButtonTapped", select_start
+        )
+        selection = processing_ui[select_start:select_end]
+        self.assertIn(
+            "let admission = coordinator.beginProcessing", selection
+        )
+        self.assertIn("switch admission", selection)
+        self.assertIn("case .failure(let error):", selection)
+        failure = selection.split("case .failure(let error):", 1)[1]
+        self.assertIn("processing = false", failure)
+        self.assertIn("updateBusyPresentation()", failure)
+        self.assertIn("progressView.setProgress(0", failure)
+        self.assertIn("无法开始处理", failure)
+
+        busy_start = processing_ui.index("private func updateBusyPresentation()")
+        busy_end = processing_ui.index("private func presentNotice", busy_start)
+        busy = processing_ui[busy_start:busy_end]
+        self.assertIn("leftBarButtonItem?.isEnabled = !isBusy", busy)
+        self.assertIn("isModalInPresentation = isBusy", busy)
+        self.assertIn("tableView.isUserInteractionEnabled = !isBusy", busy)
+
+        execute_start = coordinator.index("private func executeProcessing")
+        execute_end = coordinator.index(
+            "private func releaseProcessingAdmission", execute_start
+        )
+        execute = coordinator[execute_start:execute_end]
+        self.assertIn("notifyProcessing(.failure(.cancelled))", execute)
 
 
 if __name__ == "__main__":

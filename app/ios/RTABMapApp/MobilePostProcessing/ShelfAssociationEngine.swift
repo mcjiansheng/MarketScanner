@@ -1,8 +1,8 @@
 import Foundation
 
 /// Associates a finalized tag position with the nearest shelf segment
-/// and the automatic quality gate that decides ACCEPTED vs
-/// RESCAN_REQUIRED.
+/// and the automatic quality gate that decides ACCEPTED,
+/// LOW_CONFIDENCE or RESCAN_REQUIRED.
 ///
 /// Shelf geometry follows V1R4 §13.5: the longitudinal axis, start/end,
 /// front/back normals, closed polygon and side regions are computed from
@@ -605,7 +605,8 @@ enum ShelfAssociationEngine {
 }
 
 /// The automatic quality gate. Uncertain results become
-/// RESCAN_REQUIRED; the system never guesses.
+/// LOW_CONFIDENCE; the system never guesses or silently drops a complete,
+/// exactly bound observation burst.
 enum AutomaticQualityGate {
     struct TagQualityInput {
         var observationCount: Int
@@ -635,6 +636,7 @@ enum AutomaticQualityGate {
 
     enum QualityStatus: String {
         case accepted = "ACCEPTED"
+        case lowConfidence = "LOW_CONFIDENCE"
         case rescanRequired = "RESCAN_REQUIRED"
     }
 
@@ -658,40 +660,40 @@ enum AutomaticQualityGate {
             return (.rescanRequired, "insufficient_burst_samples")
         }
         guard input.effectiveSampleSize >= minimumEffectiveSampleSize else {
-            return (.rescanRequired, "insufficient_effective_samples")
+            return (.lowConfidence, "insufficient_effective_samples")
         }
         guard !input.needsReview else {
-            return (.rescanRequired, "measurement_needs_review")
+            return (.lowConfidence, "measurement_needs_review")
         }
         guard input.measurementMethodAccepted else {
             return (.rescanRequired, "measurement_method_unavailable")
         }
         guard input.trackingQualitySufficient else {
-            return (.rescanRequired, "tracking_quality_insufficient")
+            return (.lowConfidence, "tracking_quality_insufficient")
         }
         guard input.viewQualitySufficient else {
-            return (.rescanRequired, "view_quality_insufficient")
+            return (.lowConfidence, "view_quality_insufficient")
         }
         guard input.minimumDepthQuality >= minimumDepthQuality else {
-            return (.rescanRequired, "depth_quality_insufficient")
+            return (.lowConfidence, "depth_quality_insufficient")
         }
         guard input.localizationConfidence >= minimumLocalizationConfidence else {
-            return (.rescanRequired, "localization_confidence_insufficient")
+            return (.lowConfidence, "localization_confidence_insufficient")
         }
         guard input.measurementConfidence >= minimumMeasurementConfidence else {
-            return (.rescanRequired, "measurement_confidence_insufficient")
+            return (.lowConfidence, "measurement_confidence_insufficient")
         }
         guard let uncertainty = input.maximumNodeUncertaintyM else {
-            return (.rescanRequired, "node_uncertainty_unavailable")
+            return (.lowConfidence, "node_uncertainty_unavailable")
         }
         guard uncertainty <= maximumNodeUncertaintyM else {
-            return (.rescanRequired, "node_uncertainty_exceeded")
+            return (.lowConfidence, "node_uncertainty_exceeded")
         }
         guard input.positionSpreadM <= input.maximumSpreadM else {
-            return (.rescanRequired, "position_spread_exceeded")
+            return (.lowConfidence, "position_spread_exceeded")
         }
         guard input.association.distanceToSegmentM <= input.maximumAssociationDistanceM else {
-            return (.rescanRequired, "shelf_association_distance_exceeded")
+            return (.lowConfidence, "shelf_association_distance_exceeded")
         }
         // Parallel-aisle ambiguity: the second-closest shelf is nearly as
         // close as the first.
@@ -699,22 +701,22 @@ enum AutomaticQualityGate {
            let margin = input.association.marginM,
            second.isFinite,
            margin < input.minimumAssociationMarginM {
-            return (.rescanRequired, "shelf_association_margin_insufficient")
+            return (.lowConfidence, "shelf_association_margin_insufficient")
         }
         guard !input.association.atEndpoint else {
-            return (.rescanRequired, "shelf_endpoint_ambiguity")
+            return (.lowConfidence, "shelf_endpoint_ambiguity")
         }
         guard input.association.shelfSide == "front" || input.association.shelfSide == "back" else {
-            return (.rescanRequired, "shelf_side_ambiguous")
+            return (.lowConfidence, "shelf_side_ambiguous")
         }
         // V1R5 §12.2 (review B-14): a side derived WITHOUT business
         // semantics (source carried no orientation) can never be
         // ACCEPTED — the consumer must not guess front/back.
         guard input.association.orientationProvenance != "unavailable" else {
-            return (.rescanRequired, "shelf_side_unavailable")
+            return (.lowConfidence, "shelf_side_unavailable")
         }
         guard !input.association.occludedByStructure else {
-            return (.rescanRequired, "shelf_occluded_by_structure")
+            return (.lowConfidence, "shelf_occluded_by_structure")
         }
         return (.accepted, "")
     }
