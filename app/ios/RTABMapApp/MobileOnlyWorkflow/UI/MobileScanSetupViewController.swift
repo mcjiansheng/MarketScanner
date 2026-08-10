@@ -922,7 +922,18 @@ final class MobileScanSetupViewController: UIViewController {
             startYM: y,
             startYawRad: startYawRad,
             storeID: package.manifest.storeID)
-        coordinator.beginScanSetup(map: map)
+        guard coordinator.beginScanSetup(map: map) else {
+            startInFlight = false
+            formScrollView.isUserInteractionEnabled = true
+            navigationItem.leftBarButtonItem?.isEnabled = true
+            setLoading(
+                false,
+                message: "当前已有扫描正在进行或结束中，不能创建第二个扫描事务。")
+            presentNotice(
+                coordinator.lastError?.errorDescription
+                    ?? "当前已有扫描正在进行或结束中，请先返回扫描界面完成或结束当前扫描。")
+            return
+        }
         coordinator.commitScanConfiguration(configuration)
     }
 

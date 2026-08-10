@@ -59,7 +59,7 @@ Android 目录中的部分 C++ 原生实现也因共享移动渲染和数据库�
 
 正式超市 XLSX 使用 `Basic Info + Element Info`，`Shelf Info` 仅审计。文件尚未选择时不显示 0% 和空进度条；provider 已返回文件并开始安全暂存后，手机编译过程才显示复制、严格解析、身份/元素校验、道路图、逐楼层/逐分辨率距离场、空间索引、预览、manifest、自验证、提交和注册等真实阶段。完成页显示门店 ID、地图 ID、package SHA、canonical SHA、楼层和元素/警告统计，不再只提示“导入成功”。
 
-统一配置页只接收已经明确选择的一张地图，不再包含会触发重复加载的地图 picker。它支持 1×—8× 捏合缩放、单指平移、双击放大/复位和点击选点；起点可用方向键按 0.1 m / 0.5 m / 1.0 m 微调；朝向使用东/北/西/南和左右 15° 微调，不再使用横向滑杆。地图选择 root 页面有关闭按钮，配置页使用系统返回按钮/手势；离开页面会取消尚未完成的启动事务。
+统一配置页只接收已经明确选择的一张地图，不再包含会触发重复加载的地图 picker。它支持 1×—8× 捏合缩放、单指平移、双击放大/复位和点击选点；起点可用方向键按 0.1 m / 0.5 m / 1.0 m 微调；朝向使用东/北/西/南和左右 15° 微调，不再使用横向滑杆。手机 CoreGraphics 预览、UIKit 触点和 canonical 地图几何共享同一 +Y 合同，预览只在 UIKit 触点转换时执行一次纵向翻转，避免画面白色通道被误映射到货架。地图选择 root 页面有关闭按钮，配置页使用系统返回按钮/手势；离开页面会取消尚未完成的启动事务。
 
 开始扫描前先完成 build identity、地图身份和相机权限检查。包校验、localizer 构造、会话目录和 native SQLite 初始化在串行后台队列执行，主线程只承担短暂的 UIKit/ARSession 状态切换。扫描只有在 ARSession、RTAB-Map、sidecar writer、durable receipt 和 workflow context 全部提交后才进入 `scanning`；任一步失败或取消都会停止相机/映射、释放会话身份并脱离失败数据库，不能留下“幽灵扫描”。共享 `RTABMapApp` 的默认 Run 已改为严格 Release 身份构建，普通点击 Run 即可进行真机扫描；Test/Analyze 和手动 Debug 配置仍为 Debug 并继续 fail closed。`RTABMapApp-QualifiedDevice` 保留为等价的显式资格入口，二者都不提供 dirty bypass。
 
@@ -68,6 +68,8 @@ Android 目录中的部分 C++ 原生实现也因共享移动渲染和数据库�
 当前已有地图模式按**单次扫描、单一楼层**工作：开始前绑定一个楼层，扫描中不自动切层，也不支持跨楼层定位。楼层内部允许坡道、地面起伏等少量竖直位移；二维先验定位忽略 ARKit 高度分量，而原始 ARKit/RTAB-Map 数据仍完整保留三维运动。
 
 已有地图模式提供用户触发的 ESL Barcode Capture Mode，直接复用持续到达的 `ARFrame.capturedImage`，不启动第二路相机。进入该模式不会暂停 `ARSession`、RTAB-Map、连续 SQLite 数据库、节点创建、时钟/位姿记录或先验地图定位；相机画面只由 camera-only `MTKView` 预览覆盖，原扫描链继续在后台运行。Vision 使用屏幕固定 scan box 对应的真实 `regionOfInterest`，按最多 8 Hz 且 one-in-flight 执行；每个请求有独立的 1 秒 ARFrame deadline。底层使用固定两条 worker lane：超时请求会 best-effort cancel 并隔离旧 lane，fresh request 可在备用 lane 实际开始；两条 lane 都挂起时立即终止 ESL UX，不创建第三条 worker 或无界 backlog，原始扫描链继续。相机预览最多 24 Hz。候选需要连续 2 帧锁定，同一 burst 目标 4 个、最低 3 个独立帧；达到 2 秒上限时，已有 3 个合法持久帧即可进入解析，否则只保留原始证据并要求重扫。
+
+价签入口使用独立全屏扫码框、识别进度、成功/错误状态、触觉反馈和取消按钮；失败时按 ARFrame、定位对齐、扫描状态、地图身份和 required evidence 给出明确弹窗。native node timebase 在首个 RTAB-Map snapshot 前缺失属于暂时未就绪：该 frame 会等待而不写入非有限占位值，避免一次启动窗口同时毒化三份必要定位 sidecar。扫描结束会同步驱动 Mobile-Only workflow 的 `scanning → finalizingScan → idle`，可恢复保存失败则回到原扫描，避免下一次配置收到旧的 `scanning` 状态。
 
 ### MapCase02 标准工作簿状态（2026-08-09）
 

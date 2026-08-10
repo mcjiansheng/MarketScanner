@@ -502,20 +502,24 @@ final class MobileOnlyWorkflowCoordinator {
 
     // MARK: - Scan flow
 
-    func beginScanSetup(map: MobileMapLibrary.MapEntry) {
-        guard transition(to: .configuringScan) else { return }
+    @discardableResult
+    func beginScanSetup(map: MobileMapLibrary.MapEntry) -> Bool {
+        guard transition(
+                to: .configuringScan,
+                mutateContext: { context in
+                    context.mapID = map.priorMapID
+                    context.mapSHA = map.packageSHA256
+                    context.sessionID = ""
+                    context.segmentDirectory = ""
+                    context.sourceDatabase = ""
+                    context.scanReceipt = ""
+                    context.scanReceiptSHA256 = ""
+                    context.checkpoint = "configuring_scan"
+                }) else {
+            return false
+        }
         activeMap = map
-        contextLock.lock()
-        context.mapID = map.priorMapID
-        context.mapSHA = map.packageSHA256
-        context.sessionID = ""
-        context.segmentDirectory = ""
-        context.sourceDatabase = ""
-        context.scanReceipt = ""
-        context.scanReceiptSHA256 = ""
-        context.checkpoint = "configuring_scan"
-        contextLock.unlock()
-        persistContext()
+        return true
     }
 
     func commitScanConfiguration(_ configuration: MobileScanConfiguration) {
@@ -845,8 +849,59 @@ final class MobileOnlyWorkflowCoordinator {
         }
     }
 
-    func scanFinalized() {
-        transition(to: .finalizingScan)
+    /// The scanner host calls this only after its own finalization admission
+    /// gate has closed. Returning false means this scan was not owned by the
+    /// canonical Mobile-Only transaction; legacy/free scans still finalize
+    /// normally without mutating this coordinator.
+    @discardableResult
+    func scanFinalizationBegan() -> Bool {
+        stateLock.lock()
+        let currentState = state
+        stateLock.unlock()
+        guard currentState == .scanning else { return false }
+        return transition(
+            to: .finalizingScan,
+            mutateContext: { context in
+                context.checkpoint = "finalizing_scan"
+            })
+    }
+
+    /// A recoverable save/sidecar failure reopens the same scan. Keep the
+    /// durable receipt/session binding and restore the scanning checkpoint.
+    func scanFinalizationResumed() {
+        stateLock.lock()
+        let currentState = state
+        stateLock.unlock()
+        guard currentState == .finalizingScan else { return }
+        _ = transition(
+            to: .scanning,
+            mutateContext: { context in
+                context.checkpoint = "scanning"
+            })
+    }
+
+    /// The database and session are closed terminally (eligible, ineligible,
+    /// or finalized-needs-cleanup). Clear the active scan binding before the
+    /// next map/setup transaction is allowed.
+    func scanFinalizationCompleted() {
+        stateLock.lock()
+        let currentState = state
+        stateLock.unlock()
+        guard currentState == .finalizingScan else { return }
+        guard transition(
+                to: .idle,
+                mutateContext: { context in
+                    context.sessionID = ""
+                    context.segmentDirectory = ""
+                    context.sourceDatabase = ""
+                    context.scanReceipt = ""
+                    context.scanReceiptSHA256 = ""
+                    context.checkpoint = "idle"
+                    context.progress = 0
+                }) else {
+            return
+        }
+        lastScanReceipt = nil
     }
 
     /// Reported by the scanner host when the real scan start failed
@@ -1007,7 +1062,10 @@ final class MobileOnlyWorkflowCoordinator {
 
     // MARK: - State machine (§5.4)
 
-    private func transition(to newState: MobileOnlyWorkflowState) -> Bool {
+    private func transition(
+        to newState: MobileOnlyWorkflowState,
+        mutateContext: ((inout PersistedContext) -> Void)? = nil
+    ) -> Bool {
         stateLock.lock()
         let current = state
         guard current.allowsTransition(to: newState) else {
@@ -1023,11 +1081,12 @@ final class MobileOnlyWorkflowCoordinator {
         }
         state = newState
         stateLock.unlock()
+        contextLock.lock()
         if newState != .failed && newState != .rescanRequired {
-            contextLock.lock()
             context.errorCode = ""
-            contextLock.unlock()
         }
+        mutateContext?(&context)
+        contextLock.unlock()
         persistContext()
         notifyState(newState)
         return true
@@ -1319,11 +1378,16 @@ final class MobileOnlyWorkflowCoordinator {
         // of silently defaulting.
         let floorID = Self.floorIDFromMetadata(segmentDirectory: segmentDirectory)
         switch checkpoint {
-        case "scanning" where !Self.sessionMetadataIsFinalized(
-                segmentDirectory: segmentDirectory):
+        case let liveCheckpoint
+                where (liveCheckpoint == "scanning"
+                    || liveCheckpoint == "finalizing_scan")
+                    && !Self.sessionMetadataIsFinalized(
+                        segmentDirectory: segmentDirectory):
             // An interrupted live capture is recovered by the scanner's
-            // session/checkpoint path. It must never be submitted directly
-            // to post-processing as if it were finalized.
+            // session/checkpoint path. A crash during finalization may still
+            // have an open checkpoint and no committed metadata, so neither
+            // state may be submitted directly to post-processing as if it
+            // were finalized.
             transition(to: .idle)
             return false
         case _ where !segmentDirectory.isEmpty && !sourceDatabase.isEmpty:

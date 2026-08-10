@@ -1191,6 +1191,10 @@ class IOSCoreContractTests(unittest.TestCase):
         self.assertIn("matchesPriorMapAuthority", barcode_flow)
         self.assertIn("!scanSession.isFinalizingScan", view_controller)
         self.assertIn("allowDuringFinalization: false", view_controller)
+        self.assertIn("presentPriceTagCaptureStartFailure", barcode_flow)
+        self.assertIn("required_localization_evidence_failed", barcode_flow)
+        self.assertIn("overlay.accessibilityViewIsModal = true", barcode_flow)
+        self.assertIn("view.bringSubviewToFront(overlay)", barcode_flow)
         active_directory = re.search(
             r"private func activeLocalizationDirectory\([\s\S]*?\n    \}",
             scan_session,
@@ -1495,8 +1499,8 @@ class IOSCoreContractTests(unittest.TestCase):
                         "ef08a442c55b2db"
                     ),
                     (
-                        "8d3564ce68aadb087a2820a02b4747d15ea1f4d22b14e877"
-                        "6f913d33775b1b84"
+                        "c6b6b2c00690998cfa9517374b9385f857cb3ee0efcbe366"
+                        "3f63ee76fee87959"
                     ),
                 ]
                 legacy_workbook = repository / "map/mapcase01/mapcase01.xlsx"

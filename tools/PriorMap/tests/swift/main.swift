@@ -174,6 +174,46 @@ func close(_ first: Double, _ second: Double, tolerance: Double = 1.0e-9) -> Boo
     return abs(first - second) <= tolerance
 }
 
+require(
+    !PriorMapNodeTimebaseAdmission.accepts(offsetSeconds: nil),
+    "a missing native node timebase must wait without writing evidence")
+require(
+    !PriorMapNodeTimebaseAdmission.accepts(offsetSeconds: .nan)
+        && !PriorMapNodeTimebaseAdmission.accepts(offsetSeconds: .infinity),
+    "non-finite node-time offsets must never enter required evidence")
+require(
+    PriorMapNodeTimebaseAdmission.accepts(offsetSeconds: 0)
+        && PriorMapNodeTimebaseAdmission.accepts(offsetSeconds: -123.5),
+    "every finite native node-time offset must remain admissible")
+require(
+    MobileOnlyWorkflowState.scanning.allowsTransition(to: .finalizingScan)
+        && MobileOnlyWorkflowState.finalizingScan.allowsTransition(to: .scanning)
+        && MobileOnlyWorkflowState.finalizingScan.allowsTransition(to: .idle),
+    "scan finalization must support terminal close and recoverable resume")
+let previewProjectionBounds = SourceGeometry.Bounds(
+    minX_m: 0,
+    minY_m: -100,
+    maxX_m: 200,
+    maxY_m: 0)
+let previewLowerLeft = MobilePreviewRenderer.quartzPoint(
+    xM: 0,
+    yM: -100,
+    bounds: previewProjectionBounds,
+    canvasWidth: 1_000,
+    canvasHeight: 500)
+let previewUpperRight = MobilePreviewRenderer.quartzPoint(
+    xM: 200,
+    yM: 0,
+    bounds: previewProjectionBounds,
+    canvasWidth: 1_000,
+    canvasHeight: 500)
+require(
+    close(Double(previewLowerLeft.x), 0)
+        && close(Double(previewLowerLeft.y), 0)
+        && close(Double(previewUpperRight.x), 1_000)
+        && close(Double(previewUpperRight.y), 500),
+    "Quartz preview projection must preserve canonical map +Y without a second flip")
+
 func runESLFinalizationBindingFocusedTests() {
     do {
         let cleanDirectory = try p7r6FreshDirectory("esl-focused-clean")
@@ -11717,6 +11757,65 @@ private func runMapCase02Suite(
                         "MapCase02 landmark \(code) polygon mismatch: \(actual)")
             }
         }
+
+        let obstaclePolygons: [[(Double, Double)]] =
+            report.canonicalSource.elements.compactMap { element in
+                let role = ElementRoleClassifier.role(for: element.shapeType)
+                guard element.visible,
+                      role == .shelf || role == .fixedStructure,
+                      let coordinates = element.geometry?["coordinates"]
+                        as? [[Double]],
+                      coordinates.count >= 3 else {
+                    return nil
+                }
+                return coordinates.map { ($0[0], $0[1]) }
+            }
+        func distanceToPolygon(
+            point: (Double, Double),
+            polygon: [(Double, Double)]
+        ) -> Double {
+            var best = Double.greatestFiniteMagnitude
+            for index in polygon.indices {
+                let a = polygon[index]
+                let b = polygon[(index + 1) % polygon.count]
+                let dx = b.0 - a.0
+                let dy = b.1 - a.1
+                let lengthSquared = dx * dx + dy * dy
+                let ratio = lengthSquared > 1.0e-12
+                    ? max(0, min(1,
+                        ((point.0 - a.0) * dx + (point.1 - a.1) * dy)
+                            / lengthSquared))
+                    : 0
+                best = min(
+                    best,
+                    hypot(
+                        point.0 - (a.0 + ratio * dx),
+                        point.1 - (a.1 + ratio * dy)))
+            }
+            return best
+        }
+        let reportedFreeStart = (58.03, -18.13)
+        require(
+            !obstaclePolygons.contains(where: {
+                ShelfAssociationEngine.pointInPolygon(
+                    point: reportedFreeStart,
+                    polygon: $0)
+            }),
+            "reported MapCase02 start point must not be inside an obstacle")
+        let reportedFreeStartClearance = obstaclePolygons.map {
+            distanceToPolygon(point: reportedFreeStart, polygon: $0)
+        }.min() ?? .infinity
+        require(
+            reportedFreeStartClearance >= 0.30,
+            "reported MapCase02 start point must preserve the 0.30 m clearance gate")
+        let knownShelfInterior = (41.40, -9.70)
+        require(
+            obstaclePolygons.contains(where: {
+                ShelfAssociationEngine.pointInPolygon(
+                    point: knownShelfInterior,
+                    polygon: $0)
+            }),
+            "a known MapCase02 shelf interior must remain strictly rejected")
 
         let canonicalURL = try writeTemporary(
             canonicalData, named: "mapcase02-canonical-v3.json")

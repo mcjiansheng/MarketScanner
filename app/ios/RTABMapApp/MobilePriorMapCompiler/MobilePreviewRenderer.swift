@@ -13,6 +13,29 @@ enum MobilePreviewRenderer {
 
     typealias ProgressHandler = (_ fraction: Double, _ detail: String) -> Void
 
+    /// Converts canonical map metres into the default Quartz bitmap user
+    /// space. A bitmap `CGContext` has its origin at the lower-left, so map
+    /// +Y and Quartz +Y already have the same direction. UIKit displays the
+    /// resulting PNG with its top row at the top; callers that convert touch
+    /// coordinates back to map space therefore use `1 - v` exactly once.
+    ///
+    /// Keeping this transform explicit and host-testable prevents the prior
+    /// double-flip bug where the preview image was vertically mirrored while
+    /// start-pose validation continued to use the canonical geometry.
+    static func quartzPoint(
+        xM: Double,
+        yM: Double,
+        bounds: SourceGeometry.Bounds,
+        canvasWidth: Int,
+        canvasHeight: Int
+    ) -> CGPoint {
+        let sx = (xM - bounds.minX_m) / max(bounds.widthM, 1.0)
+        let sy = (yM - bounds.minY_m) / max(bounds.heightM, 1.0)
+        return CGPoint(
+            x: sx * Double(canvasWidth),
+            y: sy * Double(canvasHeight))
+    }
+
     static func render(
         elements: [PriorMapSourceElement],
         floors: [[String: Any]],
@@ -109,10 +132,13 @@ enum MobilePreviewRenderer {
         context.fill(CGRect(x: 0, y: 0, width: canvasWidth, height: canvasHeight))
 
         func project(_ xM: Double, _ yM: Double) -> (Double, Double) {
-            let sx = (xM - bounds.minX_m) / max(bounds.widthM, 1.0)
-            let sy = (yM - bounds.minY_m) / max(bounds.heightM, 1.0)
-            // Map y is up; image y is down.
-            return (sx * Double(canvasWidth), (1.0 - sy) * Double(canvasHeight))
+            let point = quartzPoint(
+                xM: xM,
+                yM: yM,
+                bounds: bounds,
+                canvasWidth: canvasWidth,
+                canvasHeight: canvasHeight)
+            return (Double(point.x), Double(point.y))
         }
 
         // Road nodes and crosses first (grey), then structures.

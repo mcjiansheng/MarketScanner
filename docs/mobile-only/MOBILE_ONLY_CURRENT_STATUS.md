@@ -1,10 +1,17 @@
 # Mobile-Only V1 当前状态
 
-> 文档状态：**当前有效**。最后核对日期：2026-08-10（扫描 UX/startup blocker 收口阶段）。
+> 文档状态：**当前有效**。最后核对日期：2026-08-10（现场扫描 blocker 收口阶段）。
 
 ## 总体
 
-当前地图优先选择/默认真机 Run 修复分支为 `codex/fix-mobile-map-selection-debug-start`，基线为未修改的核心分支 `core-mobile-v1@36f606c1fa05e92210f0189c804dadd1b09721a1`；核心分支和此前冻结/候选分支均未修改。I10 final SHA `8f0e730d92773eea2ab58f56742d901ac02eead4` 的 exact-SHA run `31307753672` 为 7/8：P0、SHA/wave、ABI、Ubuntu/Windows native、Python/API/Web 与完整 macOS host 合同均 PASS，200k tag-evidence RSS 为 `794,099,712 < 805,306,368` bytes；唯一失败是 cold-cache iphoneos RTAB-Map 配置没有找到已生成在 `rtabmap/prebuild/bin/` 的宿主 `rtabmap-res_tool`，因此 simulator/device clean link 被跳过。I11 `37e6ed8c4afa00202693cd56919aea78fd4c7af5` 已在交叉编译前验证该宿主工具并通过 `RTABMAP_RES_TOOL` 显式绑定，G11 `7eef33e` 已绑定 implementation SHA；本地全新 host prebuild、全新 iOS CMake configure、Map Studio 109/109 和独立复审 `P0=0/P1=0` 均通过。新的 exact-SHA 8/8 前不冻结，当前发布判断仍为 **REJECTED / NO-GO / developer smoke only**。
+当前现场阻断修复分支为 `codex/fix-mobile-field-scan-blockers`，基于上一轮已验证/推送基线 `559353edd699abf995c04b3daf83f2ba60ebff17`；核心分支 `core-mobile-v1@36f606c1fa05e92210f0189c804dadd1b09721a1` 和此前冻结分支均未修改。I10 final SHA `8f0e730d92773eea2ab58f56742d901ac02eead4` 的 exact-SHA run `31307753672` 为 7/8：P0、SHA/wave、ABI、Ubuntu/Windows native、Python/API/Web 与完整 macOS host 合同均 PASS，200k tag-evidence RSS 为 `794,099,712 < 805,306,368` bytes；唯一失败是 cold-cache iphoneos RTAB-Map 配置没有找到已生成在 `rtabmap/prebuild/bin/` 的宿主 `rtabmap-res_tool`，因此 simulator/device clean link 被跳过。I11 `37e6ed8c4afa00202693cd56919aea78fd4c7af5` 已在交叉编译前验证该宿主工具并通过 `RTABMAP_RES_TOOL` 显式绑定，G11 `7eef33e` 已绑定 implementation SHA；本地全新 host prebuild、全新 iOS CMake configure、Map Studio 109/109 和独立复审 `P0=0/P1=0` 均通过。新的 exact-SHA 8/8 前不冻结，当前发布判断仍为 **REJECTED / NO-GO / developer smoke only**。
+
+## 2026-08-10 现场扫描 blocker 修复
+
+- 首帧 native node timebase 未就绪不再写入 `.nan`；定位 frame 会等待有限 offset，并以限频 audit 记录等待。严格 JSONL writer 和 sticky fail-closed 规则保持不变，因此不会再由暂时未就绪同时毒化 trace/constraint/state。
+- coordinator 现在绑定真实扫描最终化生命周期；结束失败可恢复同一扫描，terminal close 回到 idle 并清除 receipt/session。已有扫描/结束事务存在时，新的 setup 不再继续 commit。
+- “扫描价签条码”继续使用全屏 camera-only ARFrame overlay；入口失败显示明确 alert，required evidence 失败会指示结束扫描并保留 recovery package，成功 overlay 置顶且无障碍模态。
+- 手机预览移除重复 Y 翻转，地图画面、点击/微调位置和 canonical 障碍物几何保持一致；新的 MapCase02 Swift package SHA 为 `c6b6b2c00690998cfa9517374b9385f857cb3ee0efcbe3663f63ee76fee87959`，canonical 与 PC golden 不变。
 
 ## 2026-08-10 扫描 UX 与启动事务阻断级收口
 
@@ -13,7 +20,7 @@
 - 主线程卡顿根因已关闭：地图库普通列表只读轻量 registry，完整 package I/O、PNG/JSON、localizer、会话和 native database preparation 在后台串行执行。主线程只处理短 UIKit/ARSession 事务。
 - 首次相机权限在 workflow commit 前完成；旧 tmp DB recovery continuation 不参与 canonical Mobile-Only；host/receipt/context/cancel 任一步失败都会强 rollback。start receipt 使用 `O_EXCL|O_NOFOLLOW`、完整写循环、file/dir fsync 和 SHA；workflow context v3 绑定 session/segment/database/map/store/receipt/checkpoint。
 - 地图库安全复审关闭 registry/manifest 身份不完整、rebuild 无上限预读和 pathname chmod 跟随符号链接三个 P1。完整 package load 绑定 name/floor/element/canonical/map/package；rebuild 使用同一有界 snapshot；freeze 使用 root FD、`fstatat/openat(O_NOFOLLOW)` 和 `fchmod(fd)`。
-- 聚焦 UX/geometry/build identity 自动测试 29/29 PASS；`IOSCoreContractTests.test_swift_workflow_state_and_se2_projection` 1/1 PASS（1233.541 s，含 map-library CAS 与 symlink 外部目标 mode 保护）；当前修改的 unsigned generic iPhoneOS Debug 全量编译/链接 PASS，并明确验证 Debug 身份仍被移除。提交后使用共享 `RTABMapApp` 默认 Release Run 执行 unsigned generic iPhoneOS 全量编译/链接，日志包含 `build identity verified` 和 `BUILD SUCCEEDED`。`RTABMapApp-QualifiedDevice` 继续保持等价 Release 合同；真机安装和实际点击开始扫描仍待执行，不能用无签名 build 代替。
+- 当前源码的 UX/geometry/build identity 自动测试 32/32 PASS；现场阻断聚焦（UX、sidecar health、Y 轴、文档治理）46/46 PASS；`IOSCoreContractTests.test_swift_workflow_state_and_se2_projection` 1/1 PASS（1212.429 s，含 300k finalization、1,728,000 trace、400k tag evidence 和 MapCase02/地图库链路）；较广 PriorMap 197/197、Map Studio 109/109、ESL ARFrame-only 1/1 PASS。当前修改的 unsigned generic iPhoneOS Debug 全量编译/链接 PASS，并明确验证 Debug 身份仍被移除。共享 `RTABMapApp` 默认 Release Run 的严格身份构建必须在提交后、tracked tree 干净状态执行并验证 bundle SHA；`RTABMapApp-QualifiedDevice` 继续保持等价 Release 合同。真机安装和实际点击开始扫描仍待执行，不能用无签名 build 代替。
 
 新增明确 blocker：J-04 absolute-prior component identity 尚未关闭。最终 DB graph 可以由 node `mapID` 和 links 推导 component，但现行 constraint 写侧没有 atomic bound node/map ID，manual v3 也没有 RTAB-Map map ID；因此 reader 不能事后伪造 same-component 证明。需先完成正式 evidence schema 迁移，再进行 component 资格测试。
 
@@ -63,7 +70,7 @@
 ### MapCase02 标准工作簿冻结候选
 
 - `MAPCASE02 / STANDARD SUPERMARKET XLSX FORMAT PASS`：正式 `Basic Info + Element Info`、Shelf audit-only、top-left anchor、production roles、canonical v3/package v2 和派生工件 exact binding 已在 Swift/PC 同步关闭阻断项。
-- 冻结统计为源 1838、active 1630、shelf 1301、fixed 329、road 0、presentation 208、active 越界 0；canonical ID `piaseczno-5ddfac7dc439`、canonical `5ddfac7dc439afc45abdcf800b799c05d53704895b620d161ef08a442c55b2db`、Swift package `8d3564ce68aadb087a2820a02b4747d15ea1f4d22b14e8776f913d33775b1b84`、PC package `41332d093e652ec2de94f0f86b8f15107cd6f67f3b2e5ddec1c0685ab4d7d3be`、PC preview `d0c02be63dff3ab002dcf931ce7d0c5149152b78bea139fb1b0a2d86be196a18`，均由 executable exact assertion 绑定。真机暴露的大写 ID 安装断层已关闭；Swift validation report 现绑定 road graph node/edge 计数并通过 Python production validator；Swift/Python 对 manifest/report count、warnings/malformed rows 执行相同 strict integer/array 检查；四张真实 XLSX 均通过 Swift 地图库完整 smoke；旧 uppercase v2 在 production iOS/PC 入口默认拒绝，只保留显式 diagnostic-only 只读检查。
+- 冻结统计为源 1838、active 1630、shelf 1301、fixed 329、road 0、presentation 208、active 越界 0；canonical ID `piaseczno-5ddfac7dc439`、canonical `5ddfac7dc439afc45abdcf800b799c05d53704895b620d161ef08a442c55b2db`、Swift package `c6b6b2c00690998cfa9517374b9385f857cb3ee0efcbe3663f63ee76fee87959`、PC package `41332d093e652ec2de94f0f86b8f15107cd6f67f3b2e5ddec1c0685ab4d7d3be`、PC preview `d0c02be63dff3ab002dcf931ce7d0c5149152b78bea139fb1b0a2d86be196a18`，均由 executable exact assertion 绑定。真机暴露的大写 ID 安装断层和手机预览重复 Y 翻转均已关闭；Swift validation report 现绑定 road graph node/edge 计数并通过 Python production validator；Swift/Python 对 manifest/report count、warnings/malformed rows 执行相同 strict integer/array 检查；四张真实 XLSX 均通过 Swift 地图库完整 smoke；旧 uppercase v2 在 production iOS/PC 入口默认拒绝，只保留显式 diagnostic-only 只读检查。
 - 独立 MapCase02 复审发现的 P1 已全部修复，最终为 `P0=0 / P1=0`；P2 与延期资格项见 [`../map-assisted-localization/MAPCASE02_TODO.md`](../map-assisted-localization/MAPCASE02_TODO.md)。该局部 PASS 不关闭 J-04、Apple、Device Lab、现场或 exact-SHA 门。
 
 - 最终关键生产增量完成两轮只读审查，发现的 Map `.`/`..`、Result quarantine crash orphan、Snapshot process-lock binding和历史v1顶层symlink兼容均已修复；该事务增量最终 `P0=0 / P1=0 / 新的可修P2=0`。I6 ESL 最终独立复审关闭 callback/evidence timeout 误取消 fresh request 和 manifest v3 误强制历史 tag v1 使用 burst authority两个 P1，复审为 `P0=0 / P1=0`；scanner 级可注入 hung-worker 集成测试及其他低影响项已登记 [`../map-assisted-localization/ESL_CAPTURE_TODO.md`](../map-assisted-localization/ESL_CAPTURE_TODO.md)。这不是 release review PASS，J-04 仍是独立未关闭 blocker。

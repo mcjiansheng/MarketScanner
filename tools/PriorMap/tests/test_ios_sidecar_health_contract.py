@@ -240,6 +240,25 @@ class IOSLocalizationSidecarHealthContractTests(unittest.TestCase):
         self.assertIn("recordLocalizationEvidenceFailures(result.failureReasons)", body)
         self.assertIn("return result", body)
 
+    def test_localization_waits_for_native_node_timebase_before_writer(self) -> None:
+        view = source(VIEW_SOURCE)
+        update = view.split(
+            "private func updatePriorMapLocalization(", 1
+        )[1].split("@objc private func scanPriorMapPriceTag", 1)[0]
+        admission = update.index("PriorMapNodeTimebaseAdmission.accepts")
+        writer = update.index("scanSession.appendLocalizationTrace")
+        self.assertLess(admission, writer)
+        self.assertIn(
+            'event: "prior_map_update_waiting_for_node_timebase"',
+            update,
+        )
+        self.assertIn("return\n        }", update[admission:writer])
+        self.assertNotIn(".nan", update)
+        self.assertIn(
+            "nodeTimebaseOffsetSeconds: nodeTimebase.offsetSeconds",
+            update,
+        )
+
     def test_state_watermark_advances_only_after_state_write_success(self) -> None:
         session = source(SESSION_SOURCE)
         guarded_assignment = re.compile(

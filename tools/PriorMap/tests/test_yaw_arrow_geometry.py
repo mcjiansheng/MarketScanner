@@ -144,6 +144,27 @@ class YawArrowGeometryGolden(unittest.TestCase):
         self.assertIn("private let headingControl = UISegmentedControl", source)
         self.assertNotIn("yawSlider", source)
 
+    def test_preview_renderer_and_touch_transform_flip_y_exactly_once(self) -> None:
+        renderer = (
+            ROOT
+            / "app/ios/RTABMapApp/MobilePriorMapCompiler/"
+            "MobilePreviewRenderer.swift"
+        ).read_text(encoding="utf-8")
+        setup = (
+            ROOT
+            / "app/ios/RTABMapApp/MobileOnlyWorkflow/UI/"
+            "MobileScanSetupViewController.swift"
+        ).read_text(encoding="utf-8")
+        projection = renderer.split("static func quartzPoint(", 1)[1].split(
+            "static func render(", 1
+        )[0]
+        self.assertIn("y: sy * Double(canvasHeight)", projection)
+        self.assertNotIn("1.0 - sy", projection)
+        touch_transform = setup.split(
+            "private func mapPoint(", 1
+        )[1].split("private func canvasPoint", 1)[0]
+        self.assertIn("+ (1 - Double(v))", touch_transform)
+
 
 if __name__ == "__main__":
     unittest.main()

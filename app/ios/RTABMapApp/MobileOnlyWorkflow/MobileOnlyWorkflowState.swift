@@ -65,7 +65,9 @@ enum MobileOnlyWorkflowState: String, Codable, Equatable, CaseIterable {
         case .scanning:
             return [.finalizingScan, .cancelled, .failed, .interrupted]
         case .finalizingScan:
-            return [.snapshotting, .idle, .failed, .interrupted]
+            // A recoverable database/sidecar finalization failure resumes the
+            // same still-open scan. Terminal close paths move to idle.
+            return [.scanning, .snapshotting, .idle, .failed, .interrupted]
         case .snapshotting:
             return [.fastProcessing, .rescanRequired, .failed, .cancelled, .interrupted]
         case .fastProcessing:

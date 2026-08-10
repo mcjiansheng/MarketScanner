@@ -182,6 +182,20 @@ class MobileScanUXContractTests(unittest.TestCase):
         self.assertIn("== .authorized", authorized)
         self.assertIn("coordinator.beginScanSetup", authorized)
         self.assertIn("coordinator.commitScanConfiguration", authorized)
+        self.assertIn("guard coordinator.beginScanSetup", authorized)
+        self.assertLess(
+            authorized.index("guard coordinator.beginScanSetup"),
+            authorized.index("coordinator.commitScanConfiguration"),
+        )
+        coordinator = self.source(
+            "app/ios/RTABMapApp/MobileOnlyWorkflow/"
+            "MobileOnlyWorkflowCoordinator.swift"
+        )
+        begin_setup = coordinator.split(
+            "func beginScanSetup(map:", 1
+        )[1].split("func commitScanConfiguration", 1)[0]
+        self.assertIn("mutateContext: { context in", begin_setup)
+        self.assertNotIn("persistContext()", begin_setup)
 
         notice_start = setup.index(
             "private func presentCameraPermissionNotice()", permission_start
@@ -259,6 +273,70 @@ class MobileScanUXContractTests(unittest.TestCase):
         self.assertIn("coordinator.cancelScanStart()", setup)
         self.assertIn("case .cancelled:", setup)
         self.assertIn("case .interrupted:", setup)
+
+    def test_scan_finalization_closes_or_restores_workflow_transaction(self) -> None:
+        coordinator = self.source(
+            "app/ios/RTABMapApp/MobileOnlyWorkflow/"
+            "MobileOnlyWorkflowCoordinator.swift"
+        )
+        state = self.source(
+            "app/ios/RTABMapApp/MobileOnlyWorkflow/"
+            "MobileOnlyWorkflowState.swift"
+        )
+        host = self.source("app/ios/RTABMapApp/ViewController.swift")
+        for method in (
+            "func scanFinalizationBegan() -> Bool",
+            "func scanFinalizationResumed()",
+            "func scanFinalizationCompleted()",
+        ):
+            self.assertIn(method, coordinator)
+        self.assertIn(
+            "mutateContext: ((inout PersistedContext) -> Void)? = nil",
+            coordinator,
+        )
+        self.assertIn(
+            "return [.scanning, .snapshotting, .idle, .failed, .interrupted]",
+            state,
+        )
+        finalization = host.split("private func finalizeStreamingScan(", 1)[1].split(
+            "func stopMapping(", 1
+        )[0]
+        self.assertIn("scanFinalizationBegan()", finalization)
+        self.assertIn("scanFinalizationResumed()", finalization)
+        self.assertIn("scanFinalizationCompleted()", finalization)
+        self.assertLess(
+            finalization.index("scanSession.completeCurrentSession()"),
+            finalization.index("scanFinalizationCompleted()"),
+        )
+        completed = coordinator.split(
+            "func scanFinalizationCompleted()", 1
+        )[1].split("func scanStartFailed", 1)[0]
+        self.assertIn("mutateContext: { context in", completed)
+        self.assertLess(
+            completed.index('context.scanReceipt = ""'),
+            completed.index("lastScanReceipt = nil"),
+        )
+        resume = coordinator.split("func attemptResume()", 1)[1].split(
+            "private static func sessionMetadataIsFinalized", 1
+        )[0]
+        self.assertIn('liveCheckpoint == "scanning"', resume)
+        self.assertIn('liveCheckpoint == "finalizing_scan"', resume)
+        self.assertLess(
+            resume.index('liveCheckpoint == "scanning"'),
+            resume.index("beginProcessing("),
+        )
+
+    def test_barcode_start_failure_alert_is_deduplicated(self) -> None:
+        host = self.source("app/ios/RTABMapApp/ViewController.swift")
+        presenter = host.split(
+            "private func presentPriceTagCaptureStartFailure", 1
+        )[1].split("private func startPriceTagCapture", 1)[0]
+        self.assertIn(
+            "guard priceTagCaptureStartFailureAlert == nil else { return }",
+            presenter,
+        )
+        self.assertIn("priceTagCaptureStartFailureAlert = alert", presenter)
+        self.assertIn("priceTagCaptureStartFailureAlert = nil", presenter)
 
     def test_navigation_contract_has_root_close_and_push_back_stack(self) -> None:
         setup = self.source(

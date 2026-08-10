@@ -1,6 +1,6 @@
 # 手机 PriorMap 编译器（Mobile Prior Map Compiler）
 
-> 状态：**当前有效**；IMPLEMENTED / UNIT TESTED / INTEGRATION TESTED（C5/C7/C8/C9/C10 + MapCase02）。最后核对：2026-08-09。
+> 状态：**当前有效**；IMPLEMENTED / UNIT TESTED / INTEGRATION TESTED（C5/C7/C8/C9/C10 + MapCase02）。最后核对：2026-08-10。
 
 ## 模块
 
@@ -45,4 +45,4 @@ transform: x_m = x_cm/100; y_m = -y_cm/100 (top_left) 或 +y_cm/100 (bottom_left
 - C7：距离场 per-level `data_sha256` 与 PC oracle 一致（fixture 6 level 全匹配）。
 - C9：编译产物通过生产快照读取器自检（package self-load）。
 - C10：三格式 canonical parity 基础上的编译语义 parity。
-- MapCase02：Swift package self-load、重签 canonical/graph/spatial/distance/shelf mutation、strict bool/integral-float v1/v2 manifest/report count、legacy v1 statistics/visible/hidden 派生、warnings/malformed array、OOM/overflow budget、duplicate element ID typed rejection，以及 MobileMapLibrary install/register/list/exact-read；`validation_report.summary` 的 `node_count`/`edge_count` 必须精确绑定 road graph，并由 Python production validator 直接复核 Swift 包。canonical ID `piaseczno-5ddfac7dc439`，冻结 package SHA `8d3564ce68aadb087a2820a02b4747d15ea1f4d22b14e8776f913d33775b1b84`。重签为旧 uppercase v2 ID 后，production validator 必须拒绝，显式 diagnostic-only validator 必须保留只读完整性结果。
+- MapCase02：Swift package self-load、重签 canonical/graph/spatial/distance/shelf mutation、strict bool/integral-float v1/v2 manifest/report count、legacy v1 statistics/visible/hidden 派生、warnings/malformed array、OOM/overflow budget、duplicate element ID typed rejection，以及 MobileMapLibrary install/register/list/exact-read；`validation_report.summary` 的 `node_count`/`edge_count` 必须精确绑定 road graph，并由 Python production validator 直接复核 Swift 包。预览使用 Quartz 左下原点，不再对 canonical +Y 重复翻转；UIKit 点击坐标只执行一次 `1-v`。canonical ID `piaseczno-5ddfac7dc439`，冻结 package SHA `c6b6b2c00690998cfa9517374b9385f857cb3ee0efcbe3663f63ee76fee87959`。重签为旧 uppercase v2 ID 后，production validator 必须拒绝，显式 diagnostic-only validator 必须保留只读完整性结果。
