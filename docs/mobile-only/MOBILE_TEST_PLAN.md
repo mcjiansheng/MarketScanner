@@ -1,8 +1,8 @@
 # 手机端测试计划（Mobile Test Plan）
 
-> 状态：**当前有效**；统一扫描 UX/startup 聚焦组、MapCase02 正式套件、非超长 PriorMap 分组和完整 Swift host 长方法已执行；完整 discover、QualifiedDevice 真机、设备与现场详细测试仍延期；run `31307753672` 为历史 7/8 FAIL。最后核对：2026-08-10。
+> 状态：**当前有效**；统一扫描 UX/startup 聚焦组、MapCase02 正式套件、完整 PriorMap discover 和 Swift host 长方法已执行；QualifiedDevice 真机、设备与现场详细测试仍延期；run `31307753672` 为历史 7/8 FAIL。最后核对：2026-08-10。
 
-> 独立复审状态：`fix/mobile-import-prewarm-esl-deferred-tag@673d8d3a714f8fb6be18acc44ca4dd32589f3e81` 为 **REJECTED / DO NOT MERGE**，发现 Vision ROI 坐标与历史处理同步准入两个 P1。`fix/mobile-import-esl-review-blockers` 包含修复和回归测试，但仍待独立只读复审；不得把本地修复或此前增量的 `P0=0/P1=0` 结论扩展为本增量已通过。
+> 独立复审状态：`fix/mobile-import-prewarm-esl-deferred-tag@673d8d3a714f8fb6be18acc44ca4dd32589f3e81` 为 **REJECTED / DO NOT MERGE**，发现 Vision ROI 坐标与历史处理同步准入两个 P1。`fix/mobile-import-esl-review-blockers` 包含修复和回归测试；修复代码提交 `8b8cbf4d9c8325986cde43c95391141473f2d336` 已通过 unsigned generic iphoneos Release 全量编译/链接和精确 build identity，但仍待独立只读复审；不得把本地修复或此前增量的 `P0=0/P1=0` 结论扩展为本增量已通过。
 
 ## 自动测试（已实现，Swift host 默认模式 + 模式化套件）
 
@@ -17,7 +17,7 @@
 | J-04 component identity | Graph Reader node mapID/link component derivation；constraint/manual 新 schema 的原子 bound node + RTAB-Map map ID；最终 component 重算与错 component 拒绝 | **BLOCKER：写侧 schema 尚无可核验证据，NOT RUN / NOT CLOSED** |
 | T1/T3/T4/T6/T7/T12 | 1 Hz 重采样、yaw 最短弧、lost/gap、100k 行 | Swift host |
 | G1-G10 | 价签绑定/传播/融合/货架/质量门 | Swift host |
-| ESL Capture / confirmation v2 | ARFrame-only camera preview、显式 autofocus、真实 ROI + 同帧一次扩展 ROI、10 Hz/one-in-flight、1 秒 request deadline、bounded two-lane Vision executor、2-frame lock、3 minimum/4 target、4 秒窗口、暂时 exact-node publication gap 延期、逐帧可靠 quorum、`ACCEPTED/LOW_CONFIDENCE/RESCAN_REQUIRED` 三态、durable observation↔burst exact binding、exact-node final-pose 重投影；session admission/drain、ordinary/terminal Recovery 权限、active-only exact-session audit | `673d8d3` 独立复审 **REJECTED**（ROI-local 坐标 P1）；修复分支的 actual request ROI/revision 还原、0.80 gate 与 host/source 回归已通过 mobile UX 22/22、完整 PriorMap 247/247、Qualification 30/30、Map Studio 109/109、Swift parse 和 unsigned generic iphoneos Debug build，仍待独立复审。真机 close-range focus、iOS 15/16/17+ ROI/depth-center、恢复期定位、LiDAR、性能和现场矩阵 NOT RUN |
+| ESL Capture / confirmation v2 | ARFrame-only camera preview、显式 autofocus、真实 ROI + 同帧一次扩展 ROI、10 Hz/one-in-flight、1 秒 request deadline、bounded two-lane Vision executor、2-frame lock、3 minimum/4 target、4 秒窗口、暂时 exact-node publication gap 延期、逐帧可靠 quorum、`ACCEPTED/LOW_CONFIDENCE/RESCAN_REQUIRED` 三态、durable observation↔burst exact binding、exact-node final-pose 重投影；session admission/drain、ordinary/terminal Recovery 权限、active-only exact-session audit | `673d8d3` 独立复审 **REJECTED**（ROI-local 坐标 P1）；修复分支的 actual request ROI/revision 还原、0.80 gate 与 host/source 回归已通过 mobile UX 22/22、完整 PriorMap 247/247、Qualification 30/30、Map Studio 109/109、Swift parse、unsigned generic iphoneos Debug，以及 `8b8cbf4d…` unsigned generic iphoneos Release full build + exact identity，仍待独立复审。真机 close-range focus、iOS 15/16/17+ ROI/depth-center、恢复期定位、LiDAR、性能和现场矩阵 NOT RUN |
 | X1-X9 | 工作簿结构、四表、公式注入、控制字符、100k | Swift host |
 | Scale/stream | 当前源码：300k finalization（14,139,392-byte peak RSS）；60k clock writer；1,728,000 trace transition storm（保留 172,801、59,129,856-byte peak RSS）；200k burst frames + 200k observations 经 parser/resolver/shelf/fusion/quality 全链路（589,463,552-byte peak RSS，低于 768 MiB host 门）；JSONL per-line autorelease pool | Swift host；未优化 macOS developer evidence，不是 target-device PASS |
 | Contract/parity | 11 份生成证据合同、scan-event mixed-session fail-closed、strict trace parity、85 shipping Swift source membership与Windows exact-case | Qualification 28/28 PASS；membership/SwiftPM lock/contracts PASS |
@@ -28,7 +28,7 @@
 
 ## 未关闭（未写 PASS；逐项注明已运行/未运行）
 
-- 2026-08-10 已完成统一 UX/startup 聚焦合同 29/29；本轮导入预热/近距离 ESL/低置信度保留 focused 21/21、当前源码完整 Swift host 长方法 1/1（1266.338 s）和 unsigned iphoneos Debug 全量编译/链接 PASS；四张真实 XLSX 手机地图库与 PC validator 4/4、PriorMap 非超长分组 217 项、Map Studio 109/109 与 I10/远端 host/RSS 证据仍有效。完整 discover 仍未登记 PASS；host evidence 不是 Replay/FAR、默认/QualifiedDevice Release 真机或现场 PASS。
+- 2026-08-10 已完成统一 UX/startup 聚焦合同 29/29；本轮审查修复的 mobile UX/source 22/22、完整 PriorMap discover 247/247（1262.239 s）、Qualification 30/30、Map Studio 109/109、Swift parse、unsigned iphoneos Debug 和修复代码提交 `8b8cbf4d…` unsigned iphoneos Release full build + exact identity 均 PASS。host/unsigned build evidence 不是 Replay/FAR、默认/QualifiedDevice Release 真机运行或现场 PASS。
 - 三格式 canonical/编译语义 parity 已自动覆盖；真实业务大图 Replay/FAR 仍 NOT RUN。
 - E2E-3 真机短路线（5~10 分钟扫描、10 个价签、手机处理、手机导出）。
 - E2E-4 Sam 路线（100+ truth tags、现场控制点）。
@@ -36,12 +36,12 @@
 - 资源门：peak RSS、处理时长、thermal、磁盘、电量、中断/崩溃恢复。macOS ACL、BSD `uchg`/`schg` file flags 和相关扩展属性仍未资格化；POSIX `0444/0555` 不能冒充这些边界的 PASS。
 - exact-final-SHA GitHub Actions：最新 `31307753672@8f0e730d92773eea2ab58f56742d901ac02eead4` 为 7/8；七个非 Apple required jobs与 Apple job 内的 host/SwiftPM/Xcode metadata 均 PASS，iphoneos cold dependency configure 缺宿主 `rtabmap-res_tool` 显式绑定。I11/G11 已修复，等待新的全量 rerun。
 - run `31307753672` 已证明 P0、exact binding、ABI、Ubuntu/Windows native clean build、Python contracts 与 macOS host/RSS PASS；本轮 Map Studio 109/109、既有 PriorMap 非超长 217 项、正式 PC golden/canonical ID/strict manifest-report 相关 Python 52/52、MapCase02 正式套件和四张真实 XLSX library smoke PASS。新 exact-HEAD 全绿前仍不得声明 exact-SHA PASS。
-- Apple simulator/device 两套 cold native dependencies + 两次真实 clean compile/link：`31307753672` 的 iphoneos 依赖构建到 RTAB-Map configure 后失败，后续 simulator/device 步骤 skipped。I11 本地 iOS configure PASS；当前 unsigned Debug 和默认 `RTABMapApp` Release device build均 PASS，Release 日志确认严格身份，但仍不能替代 simulator/device 双平台 cold clean link或真机安装。
-- I5 Result recovery、前序 I6 ESL、MapCase02、I10 fixtures、I11 cold-build、统一 UX/startup 和地图库安全复审的历史局部结论仍分别保留；它们不覆盖 `673d8d3`。该增量当前独立结论仍是两个 P1、**REJECTED / DO NOT MERGE**；修复分支待独立复审。完整 discover、新 exact-SHA、Apple/设备/现场与 J-04 仍未关闭，最终判断保持 **REJECTED / NO-GO / developer smoke only**。
+- Apple simulator/device 两套 cold native dependencies + 两次真实 clean compile/link：`31307753672` 的 iphoneos 依赖构建到 RTAB-Map configure 后失败，后续 simulator/device 步骤 skipped。I11 本地 iOS configure PASS；当前 unsigned Debug 与 `8b8cbf4d…` 默认 `RTABMapApp` Release generic-device build 均 PASS，Release 日志及包内 JSON 确认严格精确身份，但仍不能替代 simulator/device 双平台 cold clean link或真机安装。
+- I5 Result recovery、前序 I6 ESL、MapCase02、I10 fixtures、I11 cold-build、统一 UX/startup 和地图库安全复审的历史局部结论仍分别保留；它们不覆盖 `673d8d3`。该增量当前独立结论仍是两个 P1、**REJECTED / DO NOT MERGE**；修复分支待独立复审。新的 exact-SHA CI、Apple 双平台 cold clean link、设备/现场与 J-04 仍未关闭，最终判断保持 **REJECTED / NO-GO / developer smoke only**。
 
 ## 明日详细执行队列
 
-1. 完成 `python3 -m unittest discover -s tools/PriorMap/tests -v`；不得把已通过的 217 项、完整单个长方法或远端 host contract 冒充全 discover。
+1. 完整 PriorMap discover 已在当前修复源码上完成 247/247；后续若生产源码再变化则重跑，不以较小分组或旧远端 host contract 替代。
 2. 保留 XLSX 100k、Replay/FAR 与真实业务数据矩阵；workflow/finalization/trace/tag 主长路径已在 I5 执行。
 3. Map EEXIST、uppercase/noncanonical UUID、`.`/`..` CAS集成。
 4. Result hardlink/`0644` clone/post-hash mutation、manifest/receipt post-read、root final sweep、intent creation/temp/removal/staging replacement。

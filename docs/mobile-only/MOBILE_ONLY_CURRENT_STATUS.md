@@ -12,7 +12,7 @@
 - 还原后的 full-image 框才进入 operator ROI 选择、去重、`nativeSensorBounds`、深度采样和射线几何；expanded ROI 只扩大检测窗口，不扩大业务可选范围。字段策略的 ROI 交集门已从未经真机论证的 `0.55` 恢复为 `0.80`。
 - 历史处理 `beginProcessing` 返回 typed `Result<String, MobileOnlyWorkflowError>`；duplicate、非法状态和 task 目录创建失败均同步返回且不重复发送 observer failure。UI 在同一主线程调用栈清除 `processing` 并恢复 Close、interactive dismissal 和 table；accepted operation 的异步完成/失败/取消仍通过 observer exactly once 结束 UI busy。
 - `.mapReady -> .snapshotting` 状态表没有放宽；`.finalizingScan` 的内部生命周期边仍保留，但单独的历史处理准入策略拒绝活动 finalization。快速重复调用使用准入 owner，拒绝第二次调用时不会清除第一条已接受任务的 busy 所有权。
-- 当前修复源码验证：mobile UX/source **22/22 PASS**；完整 PriorMap discover **247/247 PASS（1262.239 s）**，400,000 条 tag evidence 峰值 RSS `574,849,024` bytes；Qualification **30/30 PASS**；Map Studio **109/109 PASS**；修改 Swift 文件 parse 与 `git diff --check` PASS；unsigned generic iphoneos Debug 全量编译/链接 `BUILD SUCCEEDED`，并按合同明确省略正式 build identity。
+- 当前修复源码验证：mobile UX/source **22/22 PASS**；完整 PriorMap discover **247/247 PASS（1262.239 s）**，400,000 条 tag evidence 峰值 RSS `574,849,024` bytes；Qualification **30/30 PASS**；Map Studio **109/109 PASS**；修改 Swift 文件 parse 与 `git diff --check` PASS；unsigned generic iphoneos Debug 全量编译/链接 `BUILD SUCCEEDED`，并按合同明确省略正式 build identity；修复代码提交 `8b8cbf4d9c8325986cde43c95391141473f2d336` 的 unsigned generic iphoneos Release 全量编译/链接 `BUILD SUCCEEDED`，日志包含 `build identity verified`，包内 `app_git_sha` 与该提交精确一致。
 - 上述内容是修复实现状态，不是独立复审 PASS。签名真机 iOS 15/16/17+ ROI 矩阵、已知像素/depth center 采集、`.mapReady` 手工复现、LiDAR/thermal/现场资格和独立复审仍为 NOT RUN。
 
 ## 2026-08-10 地图导入预热、近距离 ESL 与低置信度保留
