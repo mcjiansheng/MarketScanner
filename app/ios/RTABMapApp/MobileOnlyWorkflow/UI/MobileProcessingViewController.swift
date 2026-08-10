@@ -270,14 +270,25 @@ final class MobileProcessingViewController: UIViewController,
 
         processing = true
         updateBusyPresentation()
-        statusLabel.text = "开始处理…"
-        coordinator.beginProcessing(
+        let admission = coordinator.beginProcessing(
             finalizedSession: candidate.segmentDirectory,
             sourceDatabase: candidate.databaseURL,
             priorMap: map,
             storeID: candidate.storeID,
             floorID: candidate.floorID,
             trackingSessionID: candidate.trackingSessionID)
+        switch admission {
+        case .success:
+            statusLabel.text = "开始处理…"
+        case .failure(let error):
+            processing = false
+            updateBusyPresentation()
+            progressView.setProgress(0, animated: false)
+            statusLabel.text = "无法开始处理：\(error.localizedDescription)"
+            presentNotice(
+                "无法开始处理该历史扫描：\n\(error.localizedDescription)\n\n"
+                    + "请先完成或退出当前地图导入、扫描或处理流程，然后重试。")
+        }
     }
 
     @objc private func exportButtonTapped(_ sender: UIButton) {

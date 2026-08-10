@@ -1,6 +1,6 @@
 # ESL Barcode Capture / Shelf Confirmation TODO
 
-> 文档状态：**当前有效**。最后核对日期：2026-08-09。
+> 文档状态：**当前有效**。最后核对日期：2026-08-10。
 >
 > 本清单只登记本轮未开始或明确延期的低影响增强与资格测试。阻断级实现缺陷必须在代码审查中立即处理，不能仅移入本清单。当前整体判断仍是 **REJECTED / NO-GO / developer smoke only**；J-04 为 **BLOCKER / NOT CLOSED**。
 
@@ -20,6 +20,8 @@
 
 ## 已延期的低影响实现
 
+- S1（独立复审低影响项）：`MobileProcessingPipeline` 生成 `RescanTask` 时，将裸 machine reason code 映射为稳定、可本地化、面向操作员的 `humanMessage`；机器 reason 字段继续单独保留，不能用可读文案替代审计码。
+- S2（独立复审低影响项）：历史原始扫描导出在 `startAccessingSecurityScopedResource()` 返回 `false` 时立即给出明确的 provider/权限提示，而不是继续到后续写入失败；保持本地原始扫描不删除、目标不覆盖和 SHA 复核合同不变。
 - Candidate lock 增加 maximum inter-frame gap，明确覆盖 `A → 长停顿/Vision error → A`，避免跨过长间隔直接锁定。
 - `didReceiveMemoryWarning` 和 host `ViewController` dismissal 路径增加 Barcode UX 的显式 generation invalidation、overlay/preview 清理回归。
 - candidate lock 增加一次 light haptic，错误状态增加 warning haptic；不得按 frame 重复震动。

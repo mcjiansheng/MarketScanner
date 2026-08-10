@@ -126,3 +126,26 @@ enum MobileOnlyWorkflowState: String, Codable, Equatable, CaseIterable {
         }
     }
 }
+
+/// Pure admission authority for a user-requested historical-processing run.
+/// Active import/scan states are never reset or bypassed merely to make the
+/// history UI proceed. In particular, `.finalizingScan` keeps its internal
+/// state-table edge to `.snapshotting` for scan lifecycle compatibility, but
+/// is not a legal source for a separate historical session request.
+enum MobileHistoricalProcessingAdmission {
+    static func evaluate(
+        currentState: MobileOnlyWorkflowState,
+        processingBusy: Bool
+    ) -> Result<Void, MobileOnlyWorkflowError> {
+        if processingBusy {
+            return .failure(.invalidState("processing already running"))
+        }
+        guard currentState != .finalizingScan,
+              currentState.allowsTransition(to: .snapshotting) else {
+            return .failure(.illegalTransition(
+                "\(currentState.rawValue) -> "
+                    + MobileOnlyWorkflowState.snapshotting.rawValue))
+        }
+        return .success(())
+    }
+}

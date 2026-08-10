@@ -194,6 +194,10 @@ final class MobileOnlyWorkflowCoordinator {
     private var processingOperation: BlockOperation?
     private var importBusy = false
     private var processingBusy = false
+    /// Identifies the call that owns `processingBusy`. A rejected duplicate
+    /// invokes the same release path but cannot clear the accepted run's
+    /// ownership or allow a third operation to enter.
+    private var processingAdmissionOwner: UUID?
     private let coordinatorLock = NSLock()
     /// Guards `state` reads/writes; transitions may be requested from
     /// the main thread (UI) and the serial work queue.
@@ -922,6 +926,7 @@ final class MobileOnlyWorkflowCoordinator {
     /// Processes a finalized session end-to-end on the background work
     /// queue (§5.1): snapshot → graph → optimization → trajectory →
     /// tags → result package → streaming XLSX.
+    @discardableResult
     func beginProcessing(
         finalizedSession: URL,
         sourceDatabase: URL,
@@ -930,32 +935,52 @@ final class MobileOnlyWorkflowCoordinator {
         floorID: String,
         trackingSessionID: String,
         taskID: String? = nil
-    ) {
+    ) -> Result<String, MobileOnlyWorkflowError> {
+        let admissionID = UUID()
         coordinatorLock.lock()
-        guard !processingBusy else {
+        stateLock.lock()
+        let currentState = state
+        stateLock.unlock()
+        let admission = MobileHistoricalProcessingAdmission.evaluate(
+            currentState: currentState,
+            processingBusy: processingBusy)
+        switch admission {
+        case .failure(let error):
             coordinatorLock.unlock()
-            let error = MobileOnlyWorkflowError.invalidState("processing already running")
+            releaseProcessingAdmission(admissionID)
             lastError = error
-            notifyProcessing(.failure(error))
-            return
+            if case .illegalTransition = error {
+                contextLock.lock()
+                context.errorCode = error.code
+                contextLock.unlock()
+                persistContext()
+            }
+            return .failure(error)
+        case .success:
+            processingBusy = true
+            processingAdmissionOwner = admissionID
         }
-        processingBusy = true
         coordinatorLock.unlock()
 
         guard transition(to: .snapshotting) else {
-            coordinatorLock.lock(); processingBusy = false; coordinatorLock.unlock()
-            return
+            releaseProcessingAdmission(admissionID)
+            return .failure(lastError ?? .illegalTransition(
+                "\(currentState.rawValue) -> snapshotting"))
         }
         // V1R4 §15: a resumed run re-uses the persisted task ID — a new
         // task is never created to impersonate a resume. The pipeline
         // validates task.json and resumes from the last durable
         // checkpoint inside the same task directory.
         let taskID = taskID ?? "task-\(UUID().uuidString)"
-        guard let taskRoot = try? MobileProcessingTaskStore.createTask(taskID: taskID) else {
-            coordinatorLock.lock(); processingBusy = false; coordinatorLock.unlock()
-            fail(with: .snapshotFailed("cannot create task directory"))
-            notifyProcessing(.failure(lastError ?? .snapshotFailed("unknown")))
-            return
+        let taskRoot: URL
+        do {
+            taskRoot = try MobileProcessingTaskStore.createTask(taskID: taskID)
+        } catch {
+            let workflowError = MobileOnlyWorkflowError.snapshotFailed(
+                "cannot create task directory: \(error.localizedDescription)")
+            releaseProcessingAdmission(admissionID)
+            fail(with: workflowError)
+            return .failure(workflowError)
         }
         contextLock.lock()
         context.taskID = taskID
@@ -985,13 +1010,19 @@ final class MobileOnlyWorkflowCoordinator {
             policySHA: policySHA)
 
         let operation = BlockOperation { [weak self] in
-            self?.executeProcessing(request: request)
+            self?.executeProcessing(
+                request: request,
+                admissionID: admissionID)
         }
         processingOperation = operation
         workQueue.addOperation(operation)
+        return .success(taskID)
     }
 
-    private func executeProcessing(request: MobileProcessingPipeline.Request) {
+    private func executeProcessing(
+        request: MobileProcessingPipeline.Request,
+        admissionID: UUID
+    ) {
         do {
             let outcome = try MobileProcessingPipeline.run(
                 request: request,
@@ -1019,6 +1050,7 @@ final class MobileOnlyWorkflowCoordinator {
         } catch {
             if (error as? MobileOnlyWorkflowError) == .cancelled {
                 self.transition(to: .cancelled)
+                self.notifyProcessing(.failure(.cancelled))
             } else if let workflowError = error as? MobileOnlyWorkflowError {
                 if case .rescanSessionRequired = workflowError {
                     self.markRescanRequired(with: workflowError)
@@ -1033,7 +1065,16 @@ final class MobileOnlyWorkflowCoordinator {
             }
         }
         self.processingOperation = nil
-        self.coordinatorLock.lock(); self.processingBusy = false; self.coordinatorLock.unlock()
+        self.releaseProcessingAdmission(admissionID)
+    }
+
+    private func releaseProcessingAdmission(_ admissionID: UUID) {
+        coordinatorLock.lock()
+        if processingAdmissionOwner == admissionID {
+            processingAdmissionOwner = nil
+            processingBusy = false
+        }
+        coordinatorLock.unlock()
     }
 
     /// Maps the pipeline progress fraction onto the legal processing
@@ -1394,7 +1435,7 @@ final class MobileOnlyWorkflowCoordinator {
             return false
         case _ where !segmentDirectory.isEmpty && !sourceDatabase.isEmpty:
             transition(to: .idle)
-            beginProcessing(
+            let admission = beginProcessing(
                 finalizedSession: URL(fileURLWithPath: segmentDirectory),
                 sourceDatabase: URL(fileURLWithPath: sourceDatabase),
                 priorMap: map,
@@ -1402,7 +1443,12 @@ final class MobileOnlyWorkflowCoordinator {
                 floorID: floorID,
                 trackingSessionID: sessionID,
                 taskID: taskID.isEmpty ? nil : taskID)
-            return true
+            switch admission {
+            case .success:
+                return true
+            case .failure:
+                return false
+            }
         default:
             transition(to: .idle)
             return false

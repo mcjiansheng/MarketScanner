@@ -4,7 +4,16 @@
 
 ## 总体
 
-当前跟进分支为 `fix/mobile-import-prewarm-esl-deferred-tag`，基于已验证前序 `fix/mobile-history-export-esl-layout@eee1196714982972951122ca493f77669fcbdcee`，不使用 `codex/` 前缀；核心分支 `core-mobile-v1@36f606c1fa05e92210f0189c804dadd1b09721a1` 和此前冻结分支均未修改。I10 final SHA `8f0e730d92773eea2ab58f56742d901ac02eead4` 的 exact-SHA run `31307753672` 为 7/8：P0、SHA/wave、ABI、Ubuntu/Windows native、Python/API/Web 与完整 macOS host 合同均 PASS，200k tag-evidence RSS 为 `794,099,712 < 805,306,368` bytes；唯一失败是 cold-cache iphoneos RTAB-Map 配置没有找到已生成在 `rtabmap/prebuild/bin/` 的宿主 `rtabmap-res_tool`，因此 simulator/device clean link 被跳过。I11 `37e6ed8c4afa00202693cd56919aea78fd4c7af5` 已在交叉编译前验证该宿主工具并通过 `RTABMAP_RES_TOOL` 显式绑定，G11 `7eef33e` 已绑定 implementation SHA；本地全新 host prebuild、全新 iOS CMake configure、Map Studio 109/109 和独立复审 `P0=0/P1=0` 均通过。新的 exact-SHA 8/8 前不冻结，当前发布判断仍为 **REJECTED / NO-GO / developer smoke only**。
+被审跟进分支为 `fix/mobile-import-prewarm-esl-deferred-tag@673d8d3a714f8fb6be18acc44ca4dd32589f3e81`，当前修复分支为 `fix/mobile-import-esl-review-blockers`，均不使用 `codex/` 前缀；核心分支 `core-mobile-v1@36f606c1fa05e92210f0189c804dadd1b09721a1` 和此前冻结分支均未修改。独立复审对 `673d8d3` 的结论是 **REJECTED / DO NOT MERGE**，发现两个 P1：Vision revision 2+ ROI-local 条码框坐标合同断裂，以及历史处理同步准入拒绝后的永久 busy。当前修复分支已实现代码和回归测试，但仍等待独立只读复审，不能自行声明 `P0=0/P1=0`。I10 final SHA `8f0e730d92773eea2ab58f56742d901ac02eead4` 的 exact-SHA run `31307753672` 为 7/8：P0、SHA/wave、ABI、Ubuntu/Windows native、Python/API/Web 与完整 macOS host 合同均 PASS，200k tag-evidence RSS 为 `794,099,712 < 805,306,368` bytes；唯一失败是 cold-cache iphoneos RTAB-Map 配置没有找到已生成在 `rtabmap/prebuild/bin/` 的宿主 `rtabmap-res_tool`，因此 simulator/device clean link 被跳过。I11 `37e6ed8c4afa00202693cd56919aea78fd4c7af5` 已在交叉编译前验证该宿主工具并通过 `RTABMAP_RES_TOOL` 显式绑定，G11 `7eef33e` 已绑定 implementation SHA；新的 exact-SHA 8/8 前不冻结，当前发布判断仍为 **REJECTED / NO-GO / developer smoke only**。
+
+## 2026-08-10 独立复审 P1 修复状态
+
+- Vision 条码 observation 统一通过 platform-neutral normalizer 转换成 oriented full-image normalized coordinates：revision 1 原样验证，revision 2+ 使用产生 observation 的实际 request ROI 做仿射还原；主 ROI 和 expanded fallback 不再共享错误坐标解释。非法 revision、非有限、负/空尺寸和实质越界证据 fail closed，仅允许 `1e-6` 的边界浮点修正。
+- 还原后的 full-image 框才进入 operator ROI 选择、去重、`nativeSensorBounds`、深度采样和射线几何；expanded ROI 只扩大检测窗口，不扩大业务可选范围。字段策略的 ROI 交集门已从未经真机论证的 `0.55` 恢复为 `0.80`。
+- 历史处理 `beginProcessing` 返回 typed `Result<String, MobileOnlyWorkflowError>`；duplicate、非法状态和 task 目录创建失败均同步返回且不重复发送 observer failure。UI 在同一主线程调用栈清除 `processing` 并恢复 Close、interactive dismissal 和 table；accepted operation 的异步完成/失败/取消仍通过 observer exactly once 结束 UI busy。
+- `.mapReady -> .snapshotting` 状态表没有放宽；`.finalizingScan` 的内部生命周期边仍保留，但单独的历史处理准入策略拒绝活动 finalization。快速重复调用使用准入 owner，拒绝第二次调用时不会清除第一条已接受任务的 busy 所有权。
+- 当前修复源码验证：mobile UX/source **22/22 PASS**；完整 PriorMap discover **247/247 PASS（1262.239 s）**，400,000 条 tag evidence 峰值 RSS `574,849,024` bytes；Qualification **30/30 PASS**；Map Studio **109/109 PASS**；修改 Swift 文件 parse 与 `git diff --check` PASS；unsigned generic iphoneos Debug 全量编译/链接 `BUILD SUCCEEDED`，并按合同明确省略正式 build identity。
+- 上述内容是修复实现状态，不是独立复审 PASS。签名真机 iOS 15/16/17+ ROI 矩阵、已知像素/depth center 采集、`.mapReady` 手工复现、LiDAR/thermal/现场资格和独立复审仍为 NOT RUN。
 
 ## 2026-08-10 地图导入预热、近距离 ESL 与低置信度保留
 

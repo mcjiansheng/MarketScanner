@@ -190,6 +190,56 @@ require(
         && MobileOnlyWorkflowState.finalizingScan.allowsTransition(to: .scanning)
         && MobileOnlyWorkflowState.finalizingScan.allowsTransition(to: .idle),
     "scan finalization must support terminal close and recoverable resume")
+if case .success = MobileHistoricalProcessingAdmission.evaluate(
+    currentState: .idle,
+    processingBusy: false
+) {
+    // Expected.
+} else {
+    require(false, "idle must admit historical processing")
+}
+for rejectedState in [
+    MobileOnlyWorkflowState.pickingMap,
+    .stagingMapSource,
+    .importingMap,
+    .compilingMap,
+    MobileOnlyWorkflowState.mapReady,
+    .configuringScan,
+    .startingScan,
+    .scanning,
+    .finalizingScan,
+    .snapshotting,
+    .fastProcessing,
+    .deepProcessing,
+    .buildingTrajectory,
+    .resolvingTags,
+    .exporting,
+] {
+    if case .failure(.illegalTransition) =
+        MobileHistoricalProcessingAdmission.evaluate(
+            currentState: rejectedState,
+            processingBusy: false) {
+        // Expected.
+    } else {
+        require(
+            false,
+            "active state \(rejectedState.rawValue) must reject historical processing")
+    }
+}
+require(
+    !MobileOnlyWorkflowState.mapReady.allowsTransition(to: .snapshotting),
+    "historical-processing repair must not broaden mapReady -> snapshotting")
+require(
+    MobileOnlyWorkflowState.finalizingScan.allowsTransition(to: .snapshotting),
+    "scan lifecycle transition table must retain its internal finalization edge")
+if case .failure(.invalidState) =
+    MobileHistoricalProcessingAdmission.evaluate(
+        currentState: .idle,
+        processingBusy: true) {
+    // Expected.
+} else {
+    require(false, "duplicate historical processing admission must be rejected")
+}
 let previewProjectionBounds = SourceGeometry.Bounds(
     minX_m: 0,
     minY_m: -100,
@@ -399,6 +449,133 @@ func runESLBarcodeCaptureFocusedTests() {
         return false
     }
 
+    // BC-00: Vision revision 1 already reports full-image coordinates;
+    // revision 2+ reports request-ROI-local coordinates and must be converted
+    // with the exact request that produced the observation.
+    let primaryRequestROI = CGRect(
+        x: 0.2, y: 0.3, width: 0.5, height: 0.4)
+    let localObservation = CGRect(
+        x: 0.1, y: 0.2, width: 0.2, height: 0.2)
+    let revisionOne = PriceTagVisionBoundingBoxNormalizer.fullImageBounds(
+        observationBounds: localObservation,
+        requestRegionOfInterest: primaryRequestROI,
+        requestRevision: 1)
+    require(
+        revisionOne != nil
+            && closeRect(revisionOne!, localObservation),
+        "BC-00 revision 1 must preserve full-image observation bounds")
+    let convertedPrimary =
+        PriceTagVisionBoundingBoxNormalizer.fullImageBounds(
+            observationBounds: localObservation,
+            requestRegionOfInterest: primaryRequestROI,
+            requestRevision: 2)
+    let expectedPrimary = CGRect(
+        x: 0.25, y: 0.38, width: 0.10, height: 0.08)
+    require(
+        convertedPrimary != nil
+            && closeRect(convertedPrimary!, expectedPrimary),
+        "BC-00 revision 2 must affinely restore primary ROI-local bounds")
+
+    let operatorROI = CGRect(x: 0.3, y: 0.4, width: 0.4, height: 0.2)
+    let expandedRequestROI = CGRect(
+        x: 0.2, y: 0.3, width: 0.6, height: 0.4)
+    let expandedLocalInside = CGRect(
+        x: 0.4, y: 0.4, width: 0.2, height: 0.2)
+    let convertedExpanded =
+        PriceTagVisionBoundingBoxNormalizer.fullImageBounds(
+            observationBounds: expandedLocalInside,
+            requestRegionOfInterest: expandedRequestROI,
+            requestRevision: 4)
+    let expectedExpanded = CGRect(
+        x: 0.44, y: 0.46, width: 0.12, height: 0.08)
+    require(
+        convertedExpanded != nil
+            && closeRect(convertedExpanded!, expectedExpanded),
+        "BC-00 expanded fallback must use the expanded request ROI")
+    require(
+        isSelected(select([
+            barcode("expanded-inside", convertedExpanded!),
+        ], roi: operatorROI)),
+        "BC-00 expanded detection remains selectable only inside the operator ROI")
+    let expandedLocalMargin = CGRect(
+        x: 1.0 / 30.0,
+        y: 0.4,
+        width: 1.0 / 15.0,
+        height: 0.2)
+    let convertedMargin =
+        PriceTagVisionBoundingBoxNormalizer.fullImageBounds(
+            observationBounds: expandedLocalMargin,
+            requestRegionOfInterest: expandedRequestROI,
+            requestRevision: 2)
+    require(
+        convertedMargin != nil
+            && isNone(select([
+                barcode("expanded-margin", convertedMargin!),
+            ], roi: operatorROI)),
+        "BC-00 expanded-only margin detection must not enlarge the operator ROI")
+
+    let sameLocalBounds = CGRect(
+        x: 0.4, y: 0.4, width: 0.2, height: 0.2)
+    let leftFullBounds =
+        PriceTagVisionBoundingBoxNormalizer.fullImageBounds(
+            observationBounds: sameLocalBounds,
+            requestRegionOfInterest: CGRect(
+                x: 0.2, y: 0.4, width: 0.2, height: 0.2),
+            requestRevision: 2)!
+    let rightFullBounds =
+        PriceTagVisionBoundingBoxNormalizer.fullImageBounds(
+            observationBounds: sameLocalBounds,
+            requestRegionOfInterest: CGRect(
+                x: 0.6, y: 0.4, width: 0.2, height: 0.2),
+            requestRevision: 2)!
+    require(
+        isAmbiguous(select([
+            barcode("SAME-LOCAL", leftFullBounds),
+            barcode("SAME-LOCAL", rightFullBounds),
+        ], roi: CGRect(x: 0.2, y: 0.4, width: 0.6, height: 0.2))),
+        "BC-00 disjoint physical barcodes must not deduplicate by overlapping ROI-local boxes")
+
+    let expectedNativeCenters: [PriorMapCapturedImageOrientation: CGPoint] = [
+        .up: CGPoint(x: 0.30, y: 0.42),
+        .down: CGPoint(x: 0.70, y: 0.58),
+        .right: CGPoint(x: 0.58, y: 0.30),
+        .left: CGPoint(x: 0.42, y: 0.70),
+    ]
+    for (orientation, expectedCenter) in expectedNativeCenters {
+        let native = PriorMapImageGeometry.nativeSensorBounds(
+            visionBounds: convertedPrimary!,
+            orientation: orientation)
+        require(
+            close(Double(native.midX), Double(expectedCenter.x))
+                && close(Double(native.midY), Double(expectedCenter.y)),
+            "BC-00 \(orientation.rawValue) depth/ray center must use converted full-image bounds")
+    }
+    require(
+        !close(Double(convertedPrimary!.midX), Double(localObservation.midX))
+            && !close(
+                Double(convertedPrimary!.midY),
+                Double(localObservation.midY)),
+        "BC-00 integration geometry must consume the converted center, not the ROI-local center")
+    for invalid in [
+        CGRect(x: 0.1, y: 0.1, width: -0.1, height: 0.2),
+        CGRect(x: 0.1, y: 0.1, width: 0, height: 0.2),
+        CGRect(x: 0.95, y: 0.1, width: 0.1, height: 0.2),
+        CGRect(x: CGFloat.nan, y: 0.1, width: 0.1, height: 0.2),
+    ] {
+        require(
+            PriceTagVisionBoundingBoxNormalizer.fullImageBounds(
+                observationBounds: invalid,
+                requestRegionOfInterest: primaryRequestROI,
+                requestRevision: 2) == nil,
+            "BC-00 invalid Vision evidence must fail closed")
+    }
+    require(
+        PriceTagVisionBoundingBoxNormalizer.fullImageBounds(
+            observationBounds: localObservation,
+            requestRegionOfInterest: primaryRequestROI,
+            requestRevision: 0) == nil,
+        "BC-00 unsupported Vision revisions must fail closed")
+
     // BC-01: the visible scan box is also the actual detector ROI. Center,
     // containment and the 80% intersection threshold all apply.
     require(
@@ -515,8 +692,9 @@ func runESLBarcodeCaptureFocusedTests() {
             && PriceTagCapturePolicy.field.minimumEvidenceFrames == 3
             && PriceTagCapturePolicy.field.targetEvidenceFrames == 4
             && PriceTagCapturePolicy.field.visionRateHz >= 5
-            && PriceTagCapturePolicy.field.visionRateHz <= 10,
-        "field policy must retain 2-frame lock, 3-frame minimum, 4-frame target and bounded Vision")
+            && PriceTagCapturePolicy.field.visionRateHz <= 10
+            && PriceTagCapturePolicy.field.minimumROIIntersectionRatio == 0.80,
+        "field policy must retain the 2/3/4 frame contract, bounded Vision and exact 80% ROI gate")
     let stableAuditCodes = Set(
         PriceTagCaptureAuditCode.allCases.map(\.rawValue))
     for requiredCode in [

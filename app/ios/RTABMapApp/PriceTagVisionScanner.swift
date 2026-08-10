@@ -258,13 +258,18 @@ final class PriceTagVisionScanner {
             .compactMap { observation -> PriceTagBarcodeCandidate? in
                 guard let payload = observation.payloadStringValue,
                       !payload.trimmingCharacters(
-                        in: .whitespacesAndNewlines).isEmpty else {
+                        in: .whitespacesAndNewlines).isEmpty,
+                      let fullImageBounds =
+                        PriceTagVisionBoundingBoxNormalizer.fullImageBounds(
+                            observationBounds: observation.boundingBox,
+                            requestRegionOfInterest: request.regionOfInterest,
+                            requestRevision: Int(request.revision)) else {
                     return nil
                 }
                 return PriceTagBarcodeCandidate(
                     payload: payload,
                     symbology: observation.symbology.rawValue,
-                    visionBounds: observation.boundingBox)
+                    visionBounds: fullImageBounds)
             }
     }
 

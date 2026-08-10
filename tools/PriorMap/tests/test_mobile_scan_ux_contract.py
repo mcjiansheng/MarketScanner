@@ -518,6 +518,128 @@ class MobileScanUXContractTests(unittest.TestCase):
         self.assertIn("setProgressUIVisible(false)", tap)
         self.assertNotIn("startElapsedTimer()", tap)
 
+    def test_vision_barcode_bounds_are_normalized_with_the_actual_request(
+        self,
+    ) -> None:
+        scanner = self.source(
+            "app/ios/RTABMapApp/PriceTagVisionScanner.swift"
+        )
+        capture = self.source(
+            "app/ios/RTABMapApp/PriceTagCaptureCore.swift"
+        )
+        candidates_start = scanner.index("private static func candidates(")
+        candidates_end = scanner.index(
+            "static func captureOrientation", candidates_start
+        )
+        candidates = scanner[candidates_start:candidates_end]
+        self.assertIn(
+            "PriceTagVisionBoundingBoxNormalizer.fullImageBounds",
+            candidates,
+        )
+        self.assertIn(
+            "requestRegionOfInterest: request.regionOfInterest",
+            candidates,
+        )
+        self.assertIn("requestRevision: Int(request.revision)", candidates)
+        self.assertIn("visionBounds: fullImageBounds", candidates)
+        self.assertNotIn("visionBounds: observation.boundingBox", candidates)
+        self.assertIn("if requestRevision == 1", capture)
+        self.assertIn(
+            "roi.origin.x + observation.origin.x * roi.width",
+            capture,
+        )
+        self.assertIn(
+            "roi.origin.y + observation.origin.y * roi.height",
+            capture,
+        )
+        self.assertIn("private static let boundaryEpsilon", capture)
+        self.assertNotIn(".standardized", capture)
+        self.assertIn("minimumROIIntersectionRatio: 0.80", capture)
+
+    def test_historical_processing_rejection_has_typed_admission_and_ui_rollback(
+        self,
+    ) -> None:
+        coordinator = self.source(
+            "app/ios/RTABMapApp/MobileOnlyWorkflow/"
+            "MobileOnlyWorkflowCoordinator.swift"
+        )
+        state = self.source(
+            "app/ios/RTABMapApp/MobileOnlyWorkflow/"
+            "MobileOnlyWorkflowState.swift"
+        )
+        processing_ui = self.source(
+            "app/ios/RTABMapApp/MobileOnlyWorkflow/UI/"
+            "MobileProcessingViewController.swift"
+        )
+
+        begin_start = coordinator.index("func beginProcessing(")
+        begin_end = coordinator.index(
+            "private func executeProcessing", begin_start
+        )
+        begin = coordinator[begin_start:begin_end]
+        self.assertIn(
+            ") -> Result<String, MobileOnlyWorkflowError>", begin
+        )
+        self.assertIn("MobileHistoricalProcessingAdmission.evaluate", begin)
+        self.assertGreaterEqual(
+            begin.count("releaseProcessingAdmission(admissionID)"), 3
+        )
+        self.assertIn("return .failure(error)", begin)
+        self.assertIn("return .failure(workflowError)", begin)
+        self.assertIn("return .success(taskID)", begin)
+        self.assertEqual(begin.count("workQueue.addOperation(operation)"), 1)
+        self.assertNotIn("notifyProcessing", begin)
+
+        release_start = coordinator.index(
+            "private func releaseProcessingAdmission"
+        )
+        release_end = coordinator.index(
+            "private func transitionToPipelineFraction", release_start
+        )
+        release = coordinator[release_start:release_end]
+        self.assertIn("processingAdmissionOwner == admissionID", release)
+        self.assertIn("processingAdmissionOwner = nil", release)
+        self.assertIn("processingBusy = false", release)
+
+        self.assertIn("enum MobileHistoricalProcessingAdmission", state)
+        self.assertIn("processingBusy: Bool", state)
+        self.assertIn("currentState != .finalizingScan", state)
+        map_ready_start = state.index("case .mapReady:")
+        map_ready_end = state.index("case .configuringScan:", map_ready_start)
+        self.assertNotIn(".snapshotting", state[map_ready_start:map_ready_end])
+
+        select_start = processing_ui.index(
+            "func tableView(_ tableView: UITableView, didSelectRowAt"
+        )
+        select_end = processing_ui.index(
+            "@objc private func exportButtonTapped", select_start
+        )
+        selection = processing_ui[select_start:select_end]
+        self.assertIn(
+            "let admission = coordinator.beginProcessing", selection
+        )
+        self.assertIn("switch admission", selection)
+        self.assertIn("case .failure(let error):", selection)
+        failure = selection.split("case .failure(let error):", 1)[1]
+        self.assertIn("processing = false", failure)
+        self.assertIn("updateBusyPresentation()", failure)
+        self.assertIn("progressView.setProgress(0", failure)
+        self.assertIn("无法开始处理", failure)
+
+        busy_start = processing_ui.index("private func updateBusyPresentation()")
+        busy_end = processing_ui.index("private func presentNotice", busy_start)
+        busy = processing_ui[busy_start:busy_end]
+        self.assertIn("leftBarButtonItem?.isEnabled = !isBusy", busy)
+        self.assertIn("isModalInPresentation = isBusy", busy)
+        self.assertIn("tableView.isUserInteractionEnabled = !isBusy", busy)
+
+        execute_start = coordinator.index("private func executeProcessing")
+        execute_end = coordinator.index(
+            "private func releaseProcessingAdmission", execute_start
+        )
+        execute = coordinator[execute_start:execute_end]
+        self.assertIn("notifyProcessing(.failure(.cancelled))", execute)
+
 
 if __name__ == "__main__":
     unittest.main()

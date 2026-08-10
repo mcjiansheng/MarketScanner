@@ -22,6 +22,80 @@ enum PriceTagScanROIError: Error, Equatable {
     case emptyIntersection
 }
 
+/// Normalizes Vision barcode observations into one downstream coordinate
+/// contract: oriented full-image normalized coordinates with a lower-left
+/// origin. Vision revision 1 already reports that contract when an ROI is
+/// used, while revision 2 and newer report bounds local to the request ROI.
+///
+/// This type deliberately lives in the platform-neutral capture core so the
+/// exact production conversion can be exercised by the macOS Swift host.
+enum PriceTagVisionBoundingBoxNormalizer {
+    private static let boundaryEpsilon: CGFloat = 1.0e-6
+
+    static func fullImageBounds(
+        observationBounds: CGRect,
+        requestRegionOfInterest: CGRect,
+        requestRevision: Int
+    ) -> CGRect? {
+        guard requestRevision >= 1,
+              let roi = validatedUnitRect(requestRegionOfInterest),
+              let observation = validatedUnitRect(observationBounds) else {
+            return nil
+        }
+        if requestRevision == 1 {
+            return observation
+        }
+        let converted = CGRect(
+            x: roi.origin.x + observation.origin.x * roi.width,
+            y: roi.origin.y + observation.origin.y * roi.height,
+            width: observation.width * roi.width,
+            height: observation.height * roi.height)
+        return validatedUnitRect(converted)
+    }
+
+    /// Validates without standardizing negative-size CGRect values. Only
+    /// sub-micro unit boundary drift is snapped; material out-of-range
+    /// evidence is rejected rather than hidden by an unconditional clamp.
+    private static func validatedUnitRect(_ rect: CGRect) -> CGRect? {
+        let values = [
+            rect.origin.x,
+            rect.origin.y,
+            rect.size.width,
+            rect.size.height,
+        ]
+        guard values.allSatisfy({ $0.isFinite }),
+              rect.size.width > 0,
+              rect.size.height > 0 else {
+            return nil
+        }
+        let rawMaximumX = rect.origin.x + rect.size.width
+        let rawMaximumY = rect.origin.y + rect.size.height
+        guard rawMaximumX.isFinite,
+              rawMaximumY.isFinite,
+              rect.origin.x >= -boundaryEpsilon,
+              rect.origin.y >= -boundaryEpsilon,
+              rawMaximumX <= 1 + boundaryEpsilon,
+              rawMaximumY <= 1 + boundaryEpsilon else {
+            return nil
+        }
+        let minimumX: CGFloat = rect.origin.x < 0 ? 0 : rect.origin.x
+        let minimumY: CGFloat = rect.origin.y < 0 ? 0 : rect.origin.y
+        let maximumX: CGFloat = rawMaximumX > 1 ? 1 : rawMaximumX
+        let maximumY: CGFloat = rawMaximumY > 1 ? 1 : rawMaximumY
+        guard minimumX <= 1,
+              minimumY <= 1,
+              maximumX > minimumX,
+              maximumY > minimumY else {
+            return nil
+        }
+        return CGRect(
+            x: minimumX,
+            y: minimumY,
+            width: maximumX - minimumX,
+            height: maximumY - minimumY)
+    }
+}
+
 enum PriceTagScanROIMapper {
     static func orientedImageSize(
         imageResolution: CGSize,
@@ -325,7 +399,7 @@ struct PriceTagCapturePolicy: Equatable {
         maximumVisionRequestDuration: 1.0,
         visionRateHz: 10,
         previewRateHz: 24,
-        minimumROIIntersectionRatio: 0.55,
+        minimumROIIntersectionRatio: 0.80,
         minimumCandidateNormalizedArea: 0.002,
         ambiguityScoreDelta: 0.08,
         completedDuplicateSuppressionSeconds: 2.0)

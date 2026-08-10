@@ -2,6 +2,8 @@
 
 > 状态：**当前有效**；统一扫描 UX/startup 聚焦组、MapCase02 正式套件、非超长 PriorMap 分组和完整 Swift host 长方法已执行；完整 discover、QualifiedDevice 真机、设备与现场详细测试仍延期；run `31307753672` 为历史 7/8 FAIL。最后核对：2026-08-10。
 
+> 独立复审状态：`fix/mobile-import-prewarm-esl-deferred-tag@673d8d3a714f8fb6be18acc44ca4dd32589f3e81` 为 **REJECTED / DO NOT MERGE**，发现 Vision ROI 坐标与历史处理同步准入两个 P1。`fix/mobile-import-esl-review-blockers` 包含修复和回归测试，但仍待独立只读复审；不得把本地修复或此前增量的 `P0=0/P1=0` 结论扩展为本增量已通过。
+
 ## 自动测试（已实现，Swift host 默认模式 + 模式化套件）
 
 | 组 | 覆盖 | 状态 |
@@ -15,7 +17,7 @@
 | J-04 component identity | Graph Reader node mapID/link component derivation；constraint/manual 新 schema 的原子 bound node + RTAB-Map map ID；最终 component 重算与错 component 拒绝 | **BLOCKER：写侧 schema 尚无可核验证据，NOT RUN / NOT CLOSED** |
 | T1/T3/T4/T6/T7/T12 | 1 Hz 重采样、yaw 最短弧、lost/gap、100k 行 | Swift host |
 | G1-G10 | 价签绑定/传播/融合/货架/质量门 | Swift host |
-| ESL Capture / confirmation v2 | ARFrame-only camera preview、显式 autofocus、真实 ROI + 同帧一次扩展 ROI、10 Hz/one-in-flight、1 秒 request deadline、bounded two-lane Vision executor、2-frame lock、3 minimum/4 target、4 秒窗口、暂时 exact-node publication gap 延期、逐帧可靠 quorum、`ACCEPTED/LOW_CONFIDENCE/RESCAN_REQUIRED` 三态、durable observation↔burst exact binding、exact-node final-pose 重投影；session admission/drain、ordinary/terminal Recovery 权限、active-only exact-session audit | 当前源码 focused UX/source **21/21 PASS**、Swift parse PASS、unsigned generic iphoneos Debug compile/link PASS；完整 Swift host 长方法 **1/1 PASS（1266.338 s）**。真机 close-range focus、恢复期定位、LiDAR、性能和现场矩阵 NOT RUN |
+| ESL Capture / confirmation v2 | ARFrame-only camera preview、显式 autofocus、真实 ROI + 同帧一次扩展 ROI、10 Hz/one-in-flight、1 秒 request deadline、bounded two-lane Vision executor、2-frame lock、3 minimum/4 target、4 秒窗口、暂时 exact-node publication gap 延期、逐帧可靠 quorum、`ACCEPTED/LOW_CONFIDENCE/RESCAN_REQUIRED` 三态、durable observation↔burst exact binding、exact-node final-pose 重投影；session admission/drain、ordinary/terminal Recovery 权限、active-only exact-session audit | `673d8d3` 独立复审 **REJECTED**（ROI-local 坐标 P1）；修复分支的 actual request ROI/revision 还原、0.80 gate 与 host/source 回归已通过 mobile UX 22/22、完整 PriorMap 247/247、Qualification 30/30、Map Studio 109/109、Swift parse 和 unsigned generic iphoneos Debug build，仍待独立复审。真机 close-range focus、iOS 15/16/17+ ROI/depth-center、恢复期定位、LiDAR、性能和现场矩阵 NOT RUN |
 | X1-X9 | 工作簿结构、四表、公式注入、控制字符、100k | Swift host |
 | Scale/stream | 当前源码：300k finalization（14,139,392-byte peak RSS）；60k clock writer；1,728,000 trace transition storm（保留 172,801、59,129,856-byte peak RSS）；200k burst frames + 200k observations 经 parser/resolver/shelf/fusion/quality 全链路（589,463,552-byte peak RSS，低于 768 MiB host 门）；JSONL per-line autorelease pool | Swift host；未优化 macOS developer evidence，不是 target-device PASS |
 | Contract/parity | 11 份生成证据合同、scan-event mixed-session fail-closed、strict trace parity、85 shipping Swift source membership与Windows exact-case | Qualification 28/28 PASS；membership/SwiftPM lock/contracts PASS |
@@ -35,7 +37,7 @@
 - exact-final-SHA GitHub Actions：最新 `31307753672@8f0e730d92773eea2ab58f56742d901ac02eead4` 为 7/8；七个非 Apple required jobs与 Apple job 内的 host/SwiftPM/Xcode metadata 均 PASS，iphoneos cold dependency configure 缺宿主 `rtabmap-res_tool` 显式绑定。I11/G11 已修复，等待新的全量 rerun。
 - run `31307753672` 已证明 P0、exact binding、ABI、Ubuntu/Windows native clean build、Python contracts 与 macOS host/RSS PASS；本轮 Map Studio 109/109、既有 PriorMap 非超长 217 项、正式 PC golden/canonical ID/strict manifest-report 相关 Python 52/52、MapCase02 正式套件和四张真实 XLSX library smoke PASS。新 exact-HEAD 全绿前仍不得声明 exact-SHA PASS。
 - Apple simulator/device 两套 cold native dependencies + 两次真实 clean compile/link：`31307753672` 的 iphoneos 依赖构建到 RTAB-Map configure 后失败，后续 simulator/device 步骤 skipped。I11 本地 iOS configure PASS；当前 unsigned Debug 和默认 `RTABMapApp` Release device build均 PASS，Release 日志确认严格身份，但仍不能替代 simulator/device 双平台 cold clean link或真机安装。
-- I5 Result recovery、I6 ESL follow-up、MapCase02、I10 fixtures、I11 cold-build、统一 UX/startup 和地图库安全复审最终均为 `P0=0 / P1=0`；低影响项登记 TODO。完整 discover、新 exact-SHA、Apple/设备/现场与 J-04 仍未关闭，最终判断保持 **REJECTED / NO-GO / developer smoke only**。
+- I5 Result recovery、前序 I6 ESL、MapCase02、I10 fixtures、I11 cold-build、统一 UX/startup 和地图库安全复审的历史局部结论仍分别保留；它们不覆盖 `673d8d3`。该增量当前独立结论仍是两个 P1、**REJECTED / DO NOT MERGE**；修复分支待独立复审。完整 discover、新 exact-SHA、Apple/设备/现场与 J-04 仍未关闭，最终判断保持 **REJECTED / NO-GO / developer smoke only**。
 
 ## 明日详细执行队列
 
@@ -51,3 +53,5 @@
 10. 在真机重新导入 `map 2.xlsx`，确认显示 ID `piaseczno-5ddfac7dc439` 且地图出现在地图库；继续执行 [`../map-assisted-localization/MAPCASE02_TODO.md`](../map-assisted-localization/MAPCASE02_TODO.md) 的低影响 parity/UI/preview/visual baseline 与真机 MapCase02 矩阵。host `--xlsx-library-smoke` 四张真实地图 PASS 不能替代该真机复测。
 11. 深化 Windows portable basename 尾随点/空格和设备名拒绝，并评估 Debug illegal-transition assertion 前后的 audit 持久化顺序。
 12. 用默认 `RTABMapApp` Release（并可用 `RTABMapApp-QualifiedDevice` 交叉确认）在干净安装上执行：新建扫描先选图、导入新图、确认后单次加载、文件选择前隐藏进度、首次权限、zoom/nudge/heading、开始/取消/返回、真实连续扫描和停止；记录入口、返回、地图加载和启动事务的主线程 stall 与 p50/p95，不能用 Debug 或 host wall time替代。
+13. 在真机手工复现“成功导入地图后停留 `.mapReady` → 打开处理历史扫描 → 选择 finalized 会话”，确认同步拒绝后 Close、下拉 dismiss 和 table 立即恢复；再从 `.idle` 验证正常处理的完成、失败和取消都恢复 busy。
+14. 使用 iOS 15/16/17+ 或等价 Device Lab 覆盖主 ROI、expanded ROI、近距离、大条码、ROI 边缘和多条码，并保存已知像素中心 observation，核对最终 native sensor/depth sample center；host 几何测试不能替代真机 Vision revision 合同。
