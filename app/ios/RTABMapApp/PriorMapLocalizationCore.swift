@@ -209,7 +209,12 @@ struct PriorMapScanConfiguration: Codable {
 enum PriorMapStageOneMath {
     /// Convert ARKit's right-handed x/y/z world frame to the map's horizontal
     /// SE(2) frame. ARKit +x is map +x, ARKit -z is map +y, and map yaw zero
-    /// points toward +y. Positive yaw turns counter-clockwise in map space.
+    /// points toward +x. Positive yaw turns counter-clockwise in map space.
+    ///
+    /// The yaw definition must stay identical to imported map geometry,
+    /// MobileScanConfiguration and every map preview: 0 = east/right,
+    /// +pi/2 = north/up. ARKit's camera forward axis is local -z, so its
+    /// horizontal map-space direction is `(forwardX, -forwardZ)`.
     ///
     /// ARKit position y is deliberately absent: a scan is bound to one floor,
     /// and small height changes within that floor do not affect 2D location.
@@ -222,7 +227,7 @@ enum PriorMapStageOneMath {
         return PriorMapPose2D(
             xM: positionX,
             yM: -positionZ,
-            yawRad: normalizeAngle(atan2(-forwardX, -forwardZ)))
+            yawRad: normalizeAngle(atan2(-forwardZ, forwardX)))
     }
 
     static func project(

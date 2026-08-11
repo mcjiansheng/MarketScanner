@@ -1,14 +1,14 @@
-"""H-09 / §5.1: the start-pose yaw arrow must be a right-pointing
-artwork rotated with the frozen yaw contract, and the preview
-y-down chirality must be explicit.
+"""H-09 / §5.1: setup, ARKit alignment and the live HUD must share one
+canonical heading contract, and the preview y-down chirality must be explicit.
 
 Mirrors the iOS implementation exactly:
 - `MobileScanSetupViewController.configureMapEditor()`:
   startMarker frame (0, 0, 48, 48); markerDot (18, 18, 12, 12);
   arrow (29, 22, 17, 4) -> a right-pointing horizontal heading;
-- `rotateMarker()`: `startMarker.transform =
-  CGAffineTransform(rotationAngle: CGFloat(-startYawRad))` plus inverse
-  zoom scaling so the marker keeps a stable touch-readable screen size.
+- `PriorMapHeadingUI.screenTransform`: one `-yaw` UIKit chirality flip used by
+  setup, manual re-selection and the live HUD;
+- `PriorMapStageOneMath.arkitHorizontalPose`: camera forward is projected as
+  `(forwardX, -forwardZ)` and measured from map +X.
 
 CGAffineTransform in UIKit (y-down screen coordinates) applies the
 standard rotation matrix
@@ -17,8 +17,8 @@ standard rotation matrix
 
 so a positive `rotationAngle` is visually CLOCKWISE. With the arrow
 artwork pointing along +X, the map->image chirality flip is exactly
-the negation `-startYawRad`; any residual 90 deg bias (the old
-vertical artwork) fails the golden assertions below.
+the negation `-yawRad`; any residual 90 deg bias (the old vertical artwork or
+the old ARKit +Y-zero convention) fails the golden assertions below.
 """
 
 from __future__ import annotations
@@ -71,6 +71,22 @@ def arrow_endpoint(yaw_rad: float) -> tuple[float, float]:
 def arrow_center(yaw_rad: float) -> tuple[float, float]:
     v = rotated_offset(ARROW_CENTER_OFFSET, -yaw_rad)
     return (CENTER[0] + v[0], CENTER[1] + v[1])
+
+
+def normalize_angle(value: float) -> float:
+    return math.atan2(math.sin(value), math.cos(value))
+
+
+def arkit_yaw(forward_x: float, forward_z: float) -> float:
+    """ARKit camera-forward projected into canonical map SE(2)."""
+    return normalize_angle(math.atan2(-forward_z, forward_x))
+
+
+def project_forward_step(start_yaw: float) -> tuple[float, float]:
+    """Project one metre of ARKit -z travel from the first-frame anchor."""
+    arkit_origin_yaw = math.pi / 2
+    rotation = start_yaw - arkit_origin_yaw
+    return (-math.sin(rotation), math.cos(rotation))
 
 
 class YawArrowGeometryGolden(unittest.TestCase):
@@ -130,6 +146,32 @@ class YawArrowGeometryGolden(unittest.TestCase):
             # keep finite in-bounds when projected.
             self.assertTrue(math.isfinite(center[0]) and math.isfinite(center[1]))
 
+    def test_arkit_camera_forward_uses_standard_map_yaw(self) -> None:
+        directions = (
+            ((1.0, 0.0), 0.0),
+            ((0.0, -1.0), math.pi / 2),
+            ((-1.0, 0.0), math.pi),
+            ((0.0, 1.0), -math.pi / 2),
+        )
+        for (forward_x, forward_z), expected in directions:
+            actual = arkit_yaw(forward_x, forward_z)
+            delta = math.atan2(
+                math.sin(actual - expected), math.cos(actual - expected)
+            )
+            self.assertAlmostEqual(delta, 0.0)
+
+    def test_first_frame_alignment_preserves_selected_cardinal_heading(self) -> None:
+        expected_steps = (
+            (0.0, (1.0, 0.0)),
+            (math.pi / 2, (0.0, 1.0)),
+            (math.pi, (-1.0, 0.0)),
+            (-math.pi / 2, (0.0, -1.0)),
+        )
+        for yaw, expected in expected_steps:
+            actual = project_forward_step(yaw)
+            self.assertAlmostEqual(actual[0], expected[0], places=9)
+            self.assertAlmostEqual(actual[1], expected[1], places=9)
+
     def test_source_uses_zoom_nudges_and_discrete_heading_controls(self) -> None:
         source = (
             ROOT
@@ -143,6 +185,53 @@ class YawArrowGeometryGolden(unittest.TestCase):
         self.assertIn("@objc private func turnRight()", source)
         self.assertIn("private let headingControl = UISegmentedControl", source)
         self.assertNotIn("yawSlider", source)
+
+    def test_setup_localizer_and_live_hud_share_one_heading_contract(self) -> None:
+        setup = (
+            ROOT
+            / "app/ios/RTABMapApp/MobileOnlyWorkflow/UI/"
+            "MobileScanSetupViewController.swift"
+        ).read_text(encoding="utf-8")
+        overlay = (
+            ROOT / "app/ios/RTABMapApp/PriorMapLocalization.swift"
+        ).read_text(encoding="utf-8")
+        core = (
+            ROOT / "app/ios/RTABMapApp/PriorMapLocalizationCore.swift"
+        ).read_text(encoding="utf-8")
+        depth = (
+            ROOT / "app/ios/RTABMapApp/PriorMapDepthSampler.swift"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("PriorMapHeadingUI", setup)
+        self.assertIn(".screenTransform(yawRad: startYawRad)", setup)
+        self.assertIn("enum PriorMapHeadingUI", overlay)
+        self.assertIn(
+            "CGAffineTransform(rotationAngle: CGFloat(-yawRad))", overlay
+        )
+        self.assertGreaterEqual(
+            overlay.count("PriorMapHeadingUI.rightPointingArrowPath("), 2
+        )
+        self.assertGreaterEqual(
+            overlay.count("PriorMapHeadingUI.screenTransform("), 2
+        )
+        self.assertIn("path.move(to: CGPoint(x: length, y: 0))", overlay)
+        self.assertNotIn("path.move(to: CGPoint(x: 0, y: -8))", overlay)
+        self.assertNotIn("path.move(to: CGPoint(x: 0, y: -10))", overlay)
+        self.assertIn("atan2(-forwardZ, forwardX)", core)
+        self.assertNotIn("atan2(-forwardX, -forwardZ)", core)
+        self.assertIn("atan2(local.y, max(0.001, local.x))", depth)
+
+    def test_start_yaw_reaches_initial_map_pose_without_conversion(self) -> None:
+        setup = (
+            ROOT
+            / "app/ios/RTABMapApp/MobileOnlyWorkflow/UI/"
+            "MobileScanSetupViewController.swift"
+        ).read_text(encoding="utf-8")
+        host = (ROOT / "app/ios/RTABMapApp/ViewController.swift").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("startYawRad: startYawRad", setup)
+        self.assertIn("yawRad: configuration.startYawRad", host)
 
     def test_preview_renderer_and_touch_transform_flip_y_exactly_once(self) -> None:
         renderer = (

@@ -729,10 +729,11 @@ final class MobileScanSetupViewController: UIViewController {
     }
 
     private func rotateMarker() {
-        // Map +Y is image-up, so only chirality is inverted for rendering.
+        // Canonical map yaw is 0 = +X/right and +pi/2 = +Y/up. UIKit's
+        // y-down projection requires only the shared chirality inversion.
         let inverseZoom = 1 / max(mapScrollView.zoomScale, 0.001)
-        startMarker.transform = CGAffineTransform(
-            rotationAngle: CGFloat(-startYawRad))
+        startMarker.transform = PriorMapHeadingUI
+            .screenTransform(yawRad: startYawRad)
             .scaledBy(x: inverseZoom, y: inverseZoom)
     }
 

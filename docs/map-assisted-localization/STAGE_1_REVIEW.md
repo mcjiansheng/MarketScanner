@@ -18,7 +18,7 @@
 
 | 等级 | 审查问题 | 整改 |
 | --- | --- | --- |
-| HIGH | ARKit `x/z`、地图 `x/y`、yaw 和 UI 箭头定义不一致 | 统一为 ARKit `+x -> map +x`、ARKit `-z -> map +y`，map yaw 0 指向 `+y`、逆时针为正；增加恒等、前后左右和非零原点 Swift 金标 |
+| HIGH | ARKit `x/z`、地图 `x/y`、yaw 和 UI 箭头定义不一致 | 当前生产合同统一为 ARKit `+x -> map +x`、ARKit `-z -> map +y`，map yaw 0 指向 `+x`、`+π/2` 指向 `+y`、逆时针为正；配置、首帧对齐、深度局部点与 HUD 共享合同，并增加四方向、前进一步和非零原点 Swift 金标 |
 | MEDIUM | 校验器主要检查文件存在，缺少跨文件一致性 | 解析全部 JSON/PNG；核对 hash、count、bounds、子集、道路引用、结构/道路索引完整覆盖、验证报告统计和逐楼层预览；增加损坏包负向测试 |
 | MEDIUM | 旋转漂移只改 yaw，没有影响 XY，测试不足 | 回放改为逐段积分带旋转漂移的局部位移；报告 mean/max/p95 yaw 误差；测试断言旋转漂移改变 XY 误差 |
 | MEDIUM | iOS 未使用空间索引，in-flight 门控未生效 | 地图包增加 `road_cells`；iOS 只查询附近道路边；同一时刻只执行一个更新，忙时丢弃并记录计数 |

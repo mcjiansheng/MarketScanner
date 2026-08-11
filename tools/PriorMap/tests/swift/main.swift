@@ -4208,14 +4208,16 @@ let ready = PriorMapScanConfiguration(
     initialMapPose: PriorMapPose2D(xM: 2, yM: 3, yawRad: .pi / 2))
 require(ready.isReadyToStart, "complete prior-map setup must start")
 
-let identity = PriorMapStageOneMath.arkitHorizontalPose(
+let northFacing = PriorMapStageOneMath.arkitHorizontalPose(
     positionX: 0,
     positionZ: 0,
     forwardX: 0,
     forwardZ: -1)
-require(close(identity.xM, 0), "identity map x")
-require(close(identity.yM, 0), "identity map y")
-require(close(identity.yawRad, 0), "identity yaw must point toward map +y")
+require(close(northFacing.xM, 0), "north-facing map x")
+require(close(northFacing.yM, 0), "north-facing map y")
+require(
+    close(northFacing.yawRad, .pi / 2),
+    "ARKit -z forward must be canonical map north (+pi/2)")
 
 let forward = PriorMapStageOneMath.arkitHorizontalPose(
     positionX: 0,
@@ -4229,29 +4231,62 @@ let backward = PriorMapStageOneMath.arkitHorizontalPose(
     positionX: 0,
     positionZ: 1,
     forwardX: 0,
-    forwardZ: -1)
+    forwardZ: 1)
 require(close(backward.yM, -1), "ARKit +z backward must be map -y")
+require(
+    close(backward.yawRad, -.pi / 2),
+    "ARKit +z forward must be canonical map south (-pi/2)")
 
 let right = PriorMapStageOneMath.arkitHorizontalPose(
     positionX: 1,
     positionZ: 0,
-    forwardX: 0,
-    forwardZ: -1)
+    forwardX: 1,
+    forwardZ: 0)
 require(close(right.xM, 1), "ARKit +x must be map +x")
+require(close(right.yawRad, 0), "ARKit +x forward must be canonical map east")
 
 let leftTurn = PriorMapStageOneMath.arkitHorizontalPose(
     positionX: 0,
     positionZ: 0,
     forwardX: -1,
     forwardZ: 0)
-require(close(leftTurn.yawRad, .pi / 2), "left turn must be positive map yaw")
+require(
+    close(abs(leftTurn.yawRad), .pi),
+    "ARKit -x forward must be canonical map west")
 
 let rightTurn = PriorMapStageOneMath.arkitHorizontalPose(
     positionX: 0,
     positionZ: 0,
     forwardX: 1,
     forwardZ: 0)
-require(close(rightTurn.yawRad, -.pi / 2), "right turn must be negative map yaw")
+require(close(rightTurn.yawRad, 0), "ARKit +x forward must be canonical map east")
+
+// The first ARKit frame is the alignment origin. Walking straight ahead
+// after choosing a cardinal start heading must advance in that exact map
+// direction, not in a frame shifted by 90 degrees.
+let arkitOrigin = PriorMapPose2D(xM: 0, yM: 0, yawRad: .pi / 2)
+let arkitOneMetreForward = PriorMapPose2D(xM: 0, yM: 1, yawRad: .pi / 2)
+let cardinalStarts: [(Double, Double, Double, String)] = [
+    (0, 1, 0, "east"),
+    (.pi / 2, 0, 1, "north"),
+    (.pi, -1, 0, "west"),
+    (-.pi / 2, 0, -1, "south"),
+]
+for (startYaw, expectedDX, expectedDY, name) in cardinalStarts {
+    let start = PriorMapPose2D(xM: 10, yM: 20, yawRad: startYaw)
+    let first = PriorMapStageOneMath.project(
+        arkitPose: arkitOrigin,
+        arkitOrigin: arkitOrigin,
+        initialMapPose: start)
+    require(close(first.yawRad, startYaw), "\(name) first-frame yaw")
+    let advanced = PriorMapStageOneMath.project(
+        arkitPose: arkitOneMetreForward,
+        arkitOrigin: arkitOrigin,
+        initialMapPose: start)
+    require(close(advanced.xM, start.xM + expectedDX), "\(name) forward x")
+    require(close(advanced.yM, start.yM + expectedDY), "\(name) forward y")
+    require(close(advanced.yawRad, startYaw), "\(name) forward yaw")
+}
 
 let projected = PriorMapStageOneMath.project(
     arkitPose: PriorMapPose2D(xM: 11, yM: 20, yawRad: 0),

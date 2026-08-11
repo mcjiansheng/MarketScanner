@@ -1123,6 +1123,32 @@ final class PriorMapStageOneLocalizer {
 
 }
 
+/// One UIKit projection for the canonical map heading contract.
+///
+/// Map yaw is standard SE(2): 0 points along map +x (east/right) and +pi/2
+/// points along map +y (north/up). UIKit's y axis points down, therefore map
+/// yaw is rendered with exactly one sign inversion and no quarter-turn bias.
+enum PriorMapHeadingUI {
+    static func screenTransform(yawRad: Double) -> CGAffineTransform {
+        return CGAffineTransform(rotationAngle: CGFloat(-yawRad))
+    }
+
+    /// Returns a compact arrow whose unrotated tip points right (+x).
+    static func rightPointingArrowPath(
+        length: CGFloat,
+        halfWidth: CGFloat,
+        notch: CGFloat
+    ) -> CGPath {
+        let path = UIBezierPath()
+        path.move(to: CGPoint(x: length, y: 0))
+        path.addLine(to: CGPoint(x: -length * 0.75, y: halfWidth))
+        path.addLine(to: CGPoint(x: -notch, y: 0))
+        path.addLine(to: CGPoint(x: -length * 0.75, y: -halfWidth))
+        path.close()
+        return path.cgPath
+    }
+}
+
 final class PriorMapPosePickerView: UIView {
     private let imageView = UIImageView()
     private let arrow = CAShapeLayer()
@@ -1269,15 +1295,13 @@ final class PriorMapPosePickerView: UIView {
             + CGFloat((pose.xM - boundsM.minXM) / width) * imageRect.width
         let y = imageRect.minY
             + CGFloat((boundsM.maxYM - pose.yM) / height) * imageRect.height
-        let path = UIBezierPath()
-        path.move(to: CGPoint(x: 0, y: -10))
-        path.addLine(to: CGPoint(x: 6, y: 7))
-        path.addLine(to: CGPoint(x: 0, y: 4))
-        path.addLine(to: CGPoint(x: -6, y: 7))
-        path.close()
-        arrow.path = path.cgPath
+        arrow.path = PriorMapHeadingUI.rightPointingArrowPath(
+            length: 10,
+            halfWidth: 6,
+            notch: 4)
         arrow.position = CGPoint(x: x, y: y)
-        arrow.setAffineTransform(CGAffineTransform(rotationAngle: CGFloat(-pose.yawRad)))
+        arrow.setAffineTransform(
+            PriorMapHeadingUI.screenTransform(yawRad: pose.yawRad))
     }
 }
 
@@ -1734,13 +1758,10 @@ final class PriorMapLiveMapView: UIView {
         layer.borderWidth = 1
         previewView.image = package.preview(floorId: floorId)
         previewView.contentMode = .scaleAspectFit
-        let arrowPath = UIBezierPath()
-        arrowPath.move(to: CGPoint(x: 0, y: -8))
-        arrowPath.addLine(to: CGPoint(x: 5, y: 6))
-        arrowPath.addLine(to: CGPoint(x: 0, y: 3))
-        arrowPath.addLine(to: CGPoint(x: -5, y: 6))
-        arrowPath.close()
-        arrow.path = arrowPath.cgPath
+        arrow.path = PriorMapHeadingUI.rightPointingArrowPath(
+            length: 8,
+            halfWidth: 5,
+            notch: 3)
         routeLayer.strokeColor = UIColor.systemTeal.withAlphaComponent(0.65).cgColor
         routeLayer.fillColor = UIColor.clear.cgColor
         routeLayer.lineWidth = 2
@@ -1895,7 +1916,8 @@ final class PriorMapLiveMapView: UIView {
             yM: value.estimatedPose.yM)
         arrow.position = arrowPoint
         arrow.setAffineTransform(
-            CGAffineTransform(rotationAngle: CGFloat(-value.estimatedPose.yawRad)))
+            PriorMapHeadingUI.screenTransform(
+                yawRad: value.estimatedPose.yawRad))
     }
 
     func updateTagLayers(

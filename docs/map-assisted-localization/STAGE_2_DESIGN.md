@@ -62,7 +62,7 @@ SupermarketScanSession.swift
 
 ## 坐标
 
-- 地图二维：米，`+x` 向右、`+y` 向上、yaw 0 指向 `+y`、逆时针为正。
+- 地图二维：米，`+x` 向右/东、`+y` 向上/北、yaw 0 指向 `+x`、`+π/2` 指向 `+y`、逆时针为正。
 - ARKit 水平：`+x -> map +x`、`-z -> map +y`；ARKit 竖直 `y` 只用于标签高度和原始三维数据。
 - 深度像素先按对应帧内参反投影到相机坐标，再用该帧 camera transform 变到 ARKit 世界坐标，最后使用当前 `T_map_from_arkit`。
 - 任何 Vision observation 必须与创建它的 ARFrame 时间、相机 transform、内参和深度缓冲绑定，不使用“当前最新 pose”替代历史帧 pose。

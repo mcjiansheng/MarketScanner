@@ -1,6 +1,13 @@
 # 地图辅助定位变更记录
 
-> 文档状态：**当前有效**。最后核对日期：2026-08-10。
+> 文档状态：**当前有效**。最后核对日期：2026-08-11。
+
+## 2026-08-11 — 起点朝向、ARKit 首帧对齐与扫描 HUD 统一
+
+- 真机截图复现：配置页选择“东 0°”时 marker 向右，但进入扫描后 HUD 三角向上；继续向前会按旧的 `yaw 0 = +Y` 解释初始轨迹，属于实际定位与显示共同存在的固定 90° 合同断层，而不是单纯图标问题。
+- `PriorMapStageOneMath.arkitHorizontalPose` 改为对 map-space camera forward `(forwardX, -forwardZ)` 使用标准 `atan2(y, x)`；因此 `0 = +X/东`、`+π/2 = +Y/北`。深度点局部坐标的视场角同步改为从 local `+X` 计量，避免 matcher observation 再保留旧的 +Y 基轴。
+- 配置 marker、旧人工位姿选择器和扫描实时 HUD 统一使用 `PriorMapHeadingUI`：未旋转箭头全部向右，UIKit 只执行一次 `-yaw` 的 y-down 手性转换，不再额外带 90° 偏置。
+- 新增四个 ARKit camera-forward 金标、四个起点方向的首帧/前进一步投影金标，以及 setup → configuration → initial map pose → live HUD 源码合同。当前快速方向组 13/13 PASS，移动 UX/方向/sidecar 聚焦组 54/54 PASS，修改 Swift parse 和 `git diff --check` PASS；完整 Swift host 1/1 PASS（1398.238 s，400,000 条 tag evidence 峰值 RSS 533,495,808 bytes），unsigned generic iPhoneOS Debug clean build 编译/链接 PASS。提交后 Release identity build 与真机四方向复测仍为后续门。
 
 ## 2026-08-10 — 真机历史处理 committed-file pre-open `ctime` 稳定化
 

@@ -1,6 +1,6 @@
 # 地图辅助定位阶段一至阶段三测试计划
 
-> 文档状态：**当前有效**。最后核对日期：2026-08-10。
+> 文档状态：**当前有效**。最后核对日期：2026-08-11。
 
 ## 自动测试
 
@@ -15,6 +15,8 @@ python3 -m unittest \
   tools.Qualification.tests.test_market_scanner_build_identity \
   -v
 ```
+
+朝向回归必须额外证明：`0°/90°/180°/-90°` 分别对应东/北/西/南；ARKit `+X/-Z/-X/+Z` camera forward 分别产生 `0/+π/2/π/-π/2`；首帧锚定后向前移动 1 m 必须沿用户选择的地图方向；配置 marker、人工重选箭头和实时 HUD 均以右向 artwork 加单次 `-yaw` 渲染。无签名构建不能替代真机四方向复测。
 
 2026-08-10 当前源码结果为 **32/32 PASS**。它必须继续证明：首页和菜单不进入旧 `PriorMapWizardViewController`，而是先进入轻量地图选择页；用户可以导入新地图；配置页以 immutable required `selectedMap` 初始化，不自行列举地图、不自动加载第一张地图，也不存在 picker；文件选择前隐藏 0%、进度条和计时，进入 `.stagingMapSource` 后才显示；地图库普通列表、完整刷新、provider copy/fsync、selected-package 加载和 scan-start preparation 不在主线程；手机编译地图与 PC v2 package 进入同一 registry/setup/coordinator；root Close 与 push Back 同时存在；首次权限在 workflow commit 前完成；旧 tmp-db recovery 不可绕过 receipt；取消/持久化失败会 rollback；地图设置支持 1×–8× zoom、方向键和离散朝向；手动 Debug 无 build identity，共享 `RTABMapApp` 默认 Run 和 `RTABMapApp-QualifiedDevice` 的 Run 均为 Release，且不存在 `--allow-dirty`。新增合同还要求 setup transition 失败不得继续 commit、finalization 的 state/context 单次持久化、未完成的 `finalizing_scan` 不得直接进入后处理，以及条码失败 alert 去重。
 

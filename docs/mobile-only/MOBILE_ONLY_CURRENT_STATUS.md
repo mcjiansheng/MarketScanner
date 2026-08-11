@@ -1,10 +1,17 @@
 # Mobile-Only V1 当前状态
 
-> 文档状态：**当前有效**。最后核对日期：2026-08-10（现场扫描 blocker 收口阶段）。
+> 文档状态：**当前有效**。最后核对日期：2026-08-11（起点朝向合同修复阶段）。
 
 ## 总体
 
 当前核心基线已推进到 `core-mobile-v1@9a93fbd0ee52944eae5aebedf59ec6a08dedc934`。真机历史处理事务错误的工作分支为 `fix/mobile-snapshot-transaction-stable-read`，不使用 `codex/` 前缀。此前被审增量 `fix/mobile-import-prewarm-esl-deferred-tag@673d8d3a714f8fb6be18acc44ca4dd32589f3e81`、修复分支 `fix/mobile-import-esl-review-blockers` 及其独立复审状态保留为历史证据；它们已合入上述核心基线，但不能把局部结论扩展为整体发布通过。I10 final SHA `8f0e730d92773eea2ab58f56742d901ac02eead4` 的 exact-SHA run `31307753672` 为 7/8：P0、SHA/wave、ABI、Ubuntu/Windows native、Python/API/Web 与完整 macOS host 合同均 PASS，200k tag-evidence RSS 为 `794,099,712 < 805,306,368` bytes；唯一失败是 cold-cache iphoneos RTAB-Map 配置没有找到已生成在 `rtabmap/prebuild/bin/` 的宿主 `rtabmap-res_tool`，因此 simulator/device clean link 被跳过。I11 `37e6ed8c4afa00202693cd56919aea78fd4c7af5` 已在交叉编译前验证该宿主工具并通过 `RTABMAP_RES_TOOL` 显式绑定，G11 `7eef33e` 已绑定 implementation SHA；新的 exact-SHA 8/8 前不冻结，当前发布判断仍为 **REJECTED / NO-GO / developer smoke only**。
+
+## 2026-08-11 起点朝向与实际扫描方向修复
+
+- 真机截图确认配置页“东 0°”箭头向右，但扫描 HUD 初始三角向上。根因是 Mobile-Only V1R3 已冻结 `yaw 0 = map +X`，而 Stage One ARKit 水平位姿和两个扫描/重选箭头仍保留旧的 `yaw 0 = map +Y`；因此既有 90° 显示偏移，也会把首帧后的前进轨迹投影到错误地图方向。
+- 当前工作分支为 `fix/mobile-start-heading-alignment`，基于包含历史处理稳定读取修复的 `546866a9081938a4c3ba7fa3be8a9d7abc27b383`，不使用 `codex/` 前缀。ARKit camera forward 现在以 map-space `(forwardX, -forwardZ)` 计算标准 `atan2(y, x)`；深度 matcher local frame 同步改为 `+X` 前向。
+- 配置 marker、人工位姿选择器和实时 HUD 共享 `PriorMapHeadingUI`：未旋转 artwork 向右，UIKit 仅执行一次 `-yaw`。快速四方向/首帧/前进一步/源码合同 13/13 PASS，移动 UX/方向/sidecar 聚焦组 54/54 PASS，修改 Swift parse 与 `git diff --check` PASS。
+- 完整 Swift host 1/1 PASS（1398.238 s）：300,000 条 finalization 峰值 RSS 13,320,192 bytes、1,728,000 条 trace 峰值 59,228,160 bytes、400,000 条 tag evidence 峰值 533,495,808 bytes；unsigned generic iPhoneOS Debug clean build 已完成全量编译/链接。提交后 Release identity build 与真机东/北/西/南复测仍待执行；在真机复测前不得声明 real-device PASS 或整体 GO。
 
 ## 2026-08-10 真机历史处理 committed-file 稳定读取修复
 

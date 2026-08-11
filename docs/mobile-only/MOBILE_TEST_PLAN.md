@@ -1,6 +1,6 @@
 # 手机端测试计划（Mobile Test Plan）
 
-> 状态：**当前有效**；统一扫描 UX/startup 聚焦组、MapCase02 正式套件、完整 PriorMap discover 和 Swift host 长方法已执行；QualifiedDevice 真机、设备与现场详细测试仍延期；run `31307753672` 为历史 7/8 FAIL。最后核对：2026-08-10。
+> 状态：**当前有效**；统一扫描 UX/startup 聚焦组、MapCase02 正式套件、完整 PriorMap discover 和 Swift host 长方法已执行；QualifiedDevice 真机、设备与现场详细测试仍延期；run `31307753672` 为历史 7/8 FAIL。最后核对：2026-08-11。
 
 > 独立复审状态：`fix/mobile-import-prewarm-esl-deferred-tag@673d8d3a714f8fb6be18acc44ca4dd32589f3e81` 为 **REJECTED / DO NOT MERGE**，发现 Vision ROI 坐标与历史处理同步准入两个 P1。`fix/mobile-import-esl-review-blockers` 包含修复和回归测试；修复代码提交 `8b8cbf4d9c8325986cde43c95391141473f2d336` 已通过 unsigned generic iphoneos Release 全量编译/链接和精确 build identity，但仍待独立只读复审；不得把本地修复或此前增量的 `P0=0/P1=0` 结论扩展为本增量已通过。
 
@@ -9,6 +9,7 @@
 | 组 | 覆盖 | 状态 |
 |---|---|---|
 | Unified scan UX/startup | 首页/菜单先进入轻量地图选择页、已导入地图/导入新地图、确认后才加载、配置页 immutable selectedMap 且无 picker、导入进度在 staging 后才显示、单一地图库/配置页/Coordinator、后台 package I/O、root Close/push Back、首次相机权限、旧 tmp-db 绕过关闭、receipt/context durable commit、取消/强 rollback、1×–8× zoom、方向键、离散朝向、默认/QualifiedDevice Release scheme | 聚焦合同 **29/29 PASS**；Swift 核心长方法 **1/1 PASS（1233.541 s）**；当前 unsigned iphoneos Debug 全量编译/链接 PASS 且身份 fail closed；提交后默认 `RTABMapApp` unsigned Release 全量编译/链接 PASS，输出 `build identity verified`；独立复审 `P0=0/P1=0`。真机运行与交互 p50/p95 NOT RUN |
+| Start heading alignment | frozen yaw：`0=+X/东`、`+π/2=+Y/北`；配置值原样进入 initial map pose；ARKit camera forward、首帧 anchor、前进一步、depth local points、人工重选和 live HUD 同一合同 | 快速四方向/源码合同 **13/13 PASS**，移动 UX/方向/sidecar **54/54 PASS**，Swift parse 与 patch check PASS；完整 Swift host **1/1 PASS（1398.238 s）**，400,000 条 tag evidence 峰值 RSS 533,495,808 bytes；unsigned generic iPhoneOS Debug clean build PASS。提交后 Release identity build 与真机东/北/西/南复测仍待执行 |
 | I1-I14 | 三格式导入、canonical parity、公式/ZIP/CSV/JSON 安全 | Swift host + --import-suite |
 | C5/C7/C9/C10 | 编译器路网统计、距离场 SHA、package self-load、PC parity | Swift host |
 | MapCase02 | 正式 Basic/Element workbook、Shelf audit、top-left、1838→1630 active、role geometry、canonical/package/preview golden；XLSX authority、strict scalar、resource budget 与派生工件重签 mutation | Swift `--mapcase02-suite` + PC converter/schema **PASS**；独立复审 `P0=0/P1=0` |

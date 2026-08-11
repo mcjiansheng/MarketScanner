@@ -215,7 +215,11 @@ final class PriorMapDepthSampler {
                 let local = SIMD2<Double>(
                     inverseCosine * horizontalWorld.x - inverseSine * horizontalWorld.y,
                     inverseSine * horizontalWorld.x + inverseCosine * horizontalWorld.y)
-                let angle = atan2(local.x, max(0.001, local.y))
+                // Local +x is camera-forward under the canonical map yaw
+                // contract (0 = map +x). Measure field-of-view coverage from
+                // that axis; the previous +y reference belonged to the old
+                // 90-degree-shifted heading convention.
+                let angle = atan2(local.y, max(0.001, local.x))
                 candidates.append((local, angle))
             }
         }
