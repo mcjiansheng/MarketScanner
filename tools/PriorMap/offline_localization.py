@@ -140,6 +140,7 @@ LOCALIZED_TAG_V2_FIELDS = (
 _CANONICAL_LOWERCASE_UUID = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
 )
+_LOWERCASE_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 
 DEFAULT_REPLAY_PARAMETERS: dict[str, Any] = {
@@ -198,6 +199,141 @@ def normalize_replay_parameters(
     normalized["auto_align_segments"] = False
     normalized["diagnostic_mode"] = diagnostic_mode
     return normalized
+
+
+def _resolve_session_prior_map_identity(
+    metadata: dict[str, Any],
+    manifest: dict[str, Any],
+    package_manifest: dict[str, Any],
+) -> dict[str, Any]:
+    """Bind a phone session to the selected validated prior-map package.
+
+    ``priorMapSha256`` historically meant the package digest produced by the
+    compiler that ran on the device. Swift and Python intentionally share the
+    canonical source model, but their rendered package artifacts are not
+    byte-identical. Consequently an iPhone package digest cannot equal the PC
+    package digest even when both packages came from the same workbook.
+
+    New sessions carry the complete format-independent canonical source SHA.
+    Historical sessions are accepted only through a narrow compatibility
+    binding: exact map/store/floor identity plus the canonical SHA prefix that
+    is embedded in the frozen prior-map ID. The legacy mode is returned to the
+    caller so reports never present the weaker compatibility proof as an exact
+    package-hash match.
+    """
+
+    session_map_id = metadata.get("priorMapId")
+    selected_map_id = manifest.get("prior_map_id")
+    if not isinstance(session_map_id, str) or session_map_id != selected_map_id:
+        raise OfflineLocalizationError(
+            "Session prior_map_id does not match the selected map."
+        )
+
+    session_hash = metadata.get("priorMapSha256")
+    if not isinstance(session_hash, str) or _LOWERCASE_SHA256.fullmatch(
+        session_hash
+    ) is None:
+        raise OfflineLocalizationError("Session prior-map hash is invalid.")
+
+    source_hash = manifest.get("source_sha256")
+    package_hash = package_manifest.get("package_sha256")
+    canonical_hash = manifest.get("canonical_source_sha256")
+    if not isinstance(source_hash, str) or _LOWERCASE_SHA256.fullmatch(
+        source_hash
+    ) is None:
+        raise OfflineLocalizationError("Selected map source hash is invalid.")
+    if not isinstance(package_hash, str) or _LOWERCASE_SHA256.fullmatch(
+        package_hash
+    ) is None:
+        raise OfflineLocalizationError("Selected map package hash is invalid.")
+
+    session_store_id = metadata.get("storeId")
+    selected_store_id = manifest.get("store_id")
+    session_floor_id = metadata.get("floorId")
+    floor_ids = {
+        str(item.get("id"))
+        for item in manifest.get("floors", [])
+        if isinstance(item, dict) and isinstance(item.get("id"), str)
+    }
+    business_identity_matches = (
+        isinstance(session_store_id, str)
+        and bool(session_store_id)
+        and session_store_id == selected_store_id
+        and isinstance(session_floor_id, str)
+        and bool(session_floor_id)
+        and session_floor_id in floor_ids
+    )
+    canonical_field_present = (
+        "priorMapCanonicalSourceSha256" in metadata
+        or "prior_map_canonical_source_sha256" in metadata
+    )
+    session_canonical_hash = metadata.get(
+        "priorMapCanonicalSourceSha256",
+        metadata.get("prior_map_canonical_source_sha256"),
+    )
+    if canonical_field_present:
+        if (
+            not isinstance(session_canonical_hash, str)
+            or _LOWERCASE_SHA256.fullmatch(session_canonical_hash) is None
+            or not isinstance(canonical_hash, str)
+            or session_canonical_hash != canonical_hash
+        ):
+            raise OfflineLocalizationError(
+                "Session canonical prior-map source hash does not match "
+                "the selected map."
+            )
+        if not business_identity_matches:
+            raise OfflineLocalizationError(
+                "Session store/floor identity does not match the selected map."
+            )
+
+    if session_hash == source_hash:
+        mode = "source_sha256"
+        legacy = False
+    elif session_hash == package_hash:
+        mode = "package_sha256"
+        legacy = False
+    elif canonical_field_present:
+        mode = "canonical_source_sha256"
+        legacy = False
+    else:
+        if (
+            not isinstance(canonical_hash, str)
+            or _LOWERCASE_SHA256.fullmatch(canonical_hash) is None
+        ):
+            raise OfflineLocalizationError(
+                "Selected map canonical source hash is invalid."
+            )
+        map_hash_suffix = session_map_id.rsplit("-", 1)[-1]
+        if (
+            len(map_hash_suffix) != 12
+            or re.fullmatch(r"[0-9a-f]{12}", map_hash_suffix) is None
+            or map_hash_suffix != canonical_hash[:12]
+        ):
+            raise OfflineLocalizationError(
+                "Legacy session prior-map ID is not bound to the selected "
+                "canonical source."
+            )
+        if not business_identity_matches:
+            raise OfflineLocalizationError(
+                "Legacy session store/floor identity does not match the "
+                "selected map."
+            )
+        mode = "legacy_cross_compiler_map_identity"
+        legacy = True
+
+    return {
+        "mode": mode,
+        "legacy_compatibility": legacy,
+        "session_prior_map_sha256": session_hash,
+        "selected_source_sha256": source_hash,
+        "selected_package_sha256": package_hash,
+        "canonical_source_sha256": canonical_hash,
+        "prior_map_id": session_map_id,
+        "store_id": session_store_id,
+        "floor_id": session_floor_id,
+        "business_identity_exact": business_identity_matches,
+    }
 
 
 def processing_parameter_sha256(
@@ -4840,15 +4976,10 @@ def _render_localized_version(
         )
     manifest = load_json(prior_map / "manifest.json")
     package_manifest = load_json(prior_map / "package_manifest.json")
-    expected_map_id = metadata.get("priorMapId")
     expected_hash = metadata.get("priorMapSha256")
-    if expected_map_id != manifest.get("prior_map_id"):
-        raise OfflineLocalizationError("Session prior_map_id does not match the selected map.")
-    if expected_hash not in {
-        manifest.get("source_sha256"),
-        package_manifest.get("package_sha256"),
-    }:
-        raise OfflineLocalizationError("Session prior-map hash does not match the selected map.")
+    map_identity_binding = _resolve_session_prior_map_identity(
+        metadata, manifest, package_manifest
+    )
     # P7R6C: the snapshot identity is the byte-exact source database hash;
     # every downstream binding (local inputs, manual edits, manifests) uses
     # it instead of a second path-based hash pass.
@@ -5674,6 +5805,7 @@ def _render_localized_version(
         "version": FORMAT_VERSION,
         "prior_map_id": manifest.get("prior_map_id"),
         "prior_map_sha256": package_hash,
+        "prior_map_identity_binding": map_identity_binding,
         "session_input_bundle_sha256": expected_bundle_sha256,
         "session_input_manifest_version": input_manifest_version,
         "recovery_evidence_binding": recovery_evidence_binding,
@@ -5891,6 +6023,12 @@ def _render_localized_version(
     if has_critical_jsonl_damage:
         report["warnings"].append(
             "检测到 sidecar 文件损坏，结果可能不完整。不得自动发布。"
+        )
+    if map_identity_binding["legacy_compatibility"]:
+        report["warnings"].append(
+            "该历史手机会话未记录完整 canonical source SHA；本次通过地图 ID、"
+            "门店、楼层和 canonical SHA 前缀执行跨编译器兼容绑定。结果报告已"
+            "保留手机包哈希与电脑包哈希，后续新会话应使用完整 canonical 绑定。"
         )
     if diagnostic_mode:
         ignored_count = report["ignored_conflicting_source_constraint_count"]

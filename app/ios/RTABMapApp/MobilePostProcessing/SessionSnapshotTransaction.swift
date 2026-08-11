@@ -54,6 +54,7 @@ enum SessionSnapshotTransaction {
         case afterCommittedFileAuthorityReadBeforeOpen(String)
         case afterCommittedFileOpenBeforeRead(String)
         case afterArtifactAuthorityReadBeforeOpen(String)
+        case afterArtifactOpenBeforeHash(String)
         case afterArtifactHashBeforeGenerationEnd(String)
     }
 
@@ -75,6 +76,7 @@ enum SessionSnapshotTransaction {
     private static var databaseValidationCache = Set<DatabaseValidationIdentity>()
     private static var databaseValidationCacheOrder: [DatabaseValidationIdentity] = []
     private static let maximumDatabaseValidationCacheEntries = 64
+    private static let maximumCommittedArtifactStabilityAttempts = 2
 
     struct SessionSnapshot {
         var taskID: String
@@ -200,6 +202,7 @@ enum SessionSnapshotTransaction {
         var floorID: String
         var priorMapID: String
         var priorMapSHA256: String
+        var priorMapCanonicalSourceSHA256: String?
         var processingStatus: String
         var processingBlockers: [String]
         var captureHealth: CaptureHealth
@@ -1090,6 +1093,9 @@ enum SessionSnapshotTransaction {
         var expectedNames = Set(["input_manifest.json", "snapshot_commit.json"])
         var artifactNames = Set<String>()
         var artifactMetadata: [String: stat] = [:]
+        var artifactSHA256: [String: String] = [:]
+        var artifactBytes: [String: Int64] = [:]
+        var capturedMetadataData: Data?
         for artifact in artifacts {
             guard let name = artifact["file"] as? String,
                   isSafeTopLevelName(name),
@@ -1110,12 +1116,18 @@ enum SessionSnapshotTransaction {
             let stableArtifact = try sha256StableCommittedFile(
                 parentDescriptor: directoryDescriptor,
                 basename: name,
-                expectedBytes: expectedBytes)
+                expectedBytes: expectedBytes,
+                captureBytes: name == "metadata.json")
             guard stableArtifact.sha256 == expectedSHA else {
                 throw SessionError.copyFailed(
                     "resume sha mismatch: \(name)")
             }
             artifactMetadata[name] = stableArtifact.metadata
+            artifactSHA256[name] = expectedSHA
+            artifactBytes[name] = expectedBytes
+            if name == "metadata.json" {
+                capturedMetadataData = stableArtifact.data
+            }
             try faultInjector?(.afterArtifactHashBeforeGenerationEnd(name))
         }
 
@@ -1171,10 +1183,15 @@ enum SessionSnapshotTransaction {
                 "snapshot commit marker is missing or inconsistent")
         }
 
-        // Formal metadata is re-parsed on every resume. Legacy metadata,
-        // incomplete evidence and a changed eligibility status remain
-        // diagnostic-only even if artifact hashes happen to match.
-        guard let metadataBefore = artifactMetadata["metadata.json"] else {
+        // Formal metadata is re-parsed on every resume from the exact bytes
+        // that were just descriptor-bound and hashed above. Reopening it here
+        // created a false TOCTOU window on iOS/APFS: the same immutable inode
+        // can expose its final publication ctime only after the first read.
+        // Parse-and-hash-once keeps the eligibility decision and manifest SHA
+        // bound to one byte view while the final sweep below still catches
+        // every later inode/mode/link/size/mtime/content change.
+        guard artifactMetadata["metadata.json"] != nil,
+              let committedMetadataData = capturedMetadataData else {
             throw SessionError.notEligible(
                 "metadata.json is missing from the committed artifact set")
         }
@@ -1187,16 +1204,7 @@ enum SessionSnapshotTransaction {
             parentMetadata: openedParent.metadata,
             basename: directory.lastPathComponent,
             context: "snapshot generation before metadata validation")
-        guard let committedMetadata = try readStableCommittedFileIfPresent(
-            parentDescriptor: directoryDescriptor,
-            basename: "metadata.json",
-            maximumBytes: Int(maximumMetadataBytes)),
-              sameFileIdentity(
-                metadataBefore, committedMetadata.metadata) else {
-            throw SessionError.copyFailed(
-                "metadata.json changed during snapshot eligibility validation")
-        }
-        let metadata = try parseMetadataData(committedMetadata.data)
+        let metadata = try parseMetadataData(committedMetadataData)
         try checkEligibility(metadata.value, eligibility: nil)
 
         // DB quick-check + WAL contract on the snapshot copy.
@@ -1216,16 +1224,17 @@ enum SessionSnapshotTransaction {
             parentDescriptor: directoryDescriptor,
             databaseName: databaseName,
             expectedMetadata: databaseBefore)
-        var databaseAfter = stat()
-        guard fstatat(
-            directoryDescriptor,
-            databaseName,
-            &databaseAfter,
-            AT_SYMLINK_NOFOLLOW) == 0,
-              sameFileIdentity(databaseBefore, databaseAfter) else {
-            throw SessionError.dbIntegrity(
-                "snapshot database changed during read-only validation")
+        guard let databaseSHA = artifactSHA256[databaseName],
+              let databaseBytes = artifactBytes[databaseName] else {
+            throw SessionError.emptyInput
         }
+        artifactMetadata[databaseName] = try revalidateCommittedFile(
+            parentDescriptor: directoryDescriptor,
+            basename: databaseName,
+            expectedMetadata: databaseBefore,
+            expectedBytes: databaseBytes,
+            expectedSHA256: databaseSHA,
+            context: "snapshot database changed during read-only validation")
 
         // Extend every per-file stable-read/hash guarantee through the end
         // of the complete generation validation. Without this final sweep,
@@ -1234,18 +1243,23 @@ enum SessionSnapshotTransaction {
         var finalExpectedMetadata = artifactMetadata
         finalExpectedMetadata["input_manifest.json"] = stableManifest.metadata
         finalExpectedMetadata["snapshot_commit.json"] = stableCommit.metadata
+        var finalExpectedSHA256 = artifactSHA256
+        finalExpectedSHA256["input_manifest.json"] = sha256(manifestData)
+        finalExpectedSHA256["snapshot_commit.json"] = sha256(commitData)
+        var finalExpectedBytes = artifactBytes
+        finalExpectedBytes["input_manifest.json"] = Int64(manifestData.count)
+        finalExpectedBytes["snapshot_commit.json"] = Int64(commitData.count)
         for name in finalExpectedMetadata.keys.sorted() {
-            guard let expected = finalExpectedMetadata[name] else { continue }
-            var current = stat()
-            guard fstatat(
-                directoryDescriptor,
-                name,
-                &current,
-                AT_SYMLINK_NOFOLLOW) == 0,
-                  sameFileIdentity(expected, current) else {
-                throw SessionError.copyFailed(
-                    "snapshot generation file changed during validation: \(name)")
-            }
+            guard let expected = finalExpectedMetadata[name],
+                  let expectedSHA = finalExpectedSHA256[name],
+                  let expectedBytes = finalExpectedBytes[name] else { continue }
+            finalExpectedMetadata[name] = try revalidateCommittedFile(
+                parentDescriptor: directoryDescriptor,
+                basename: name,
+                expectedMetadata: expected,
+                expectedBytes: expectedBytes,
+                expectedSHA256: expectedSHA,
+                context: "snapshot generation file changed during validation")
         }
         try requireBoundDirectoryPath(
             descriptor: directoryDescriptor,
@@ -1370,6 +1384,19 @@ enum SessionSnapshotTransaction {
             throw SessionError.notEligible(
                 "formal tracking/store/floor/prior-map identity missing")
         }
+        let rawCanonicalSourceSHA = object["priorMapCanonicalSourceSha256"]
+        let priorMapCanonicalSourceSHA: String?
+        if rawCanonicalSourceSHA == nil || rawCanonicalSourceSHA is NSNull {
+            priorMapCanonicalSourceSHA = nil
+        } else {
+            guard let canonicalSourceSHA = nonEmptyString(
+                    rawCanonicalSourceSHA),
+                  isSHA256(canonicalSourceSHA) else {
+                throw SessionError.notEligible(
+                    "formal prior-map canonical source identity is invalid")
+            }
+            priorMapCanonicalSourceSHA = canonicalSourceSHA.lowercased()
+        }
         guard let processing = object["processingEligibility"]
                 as? [String: Any],
               let processingStatus = nonEmptyString(processing["status"]),
@@ -1482,6 +1509,7 @@ enum SessionSnapshotTransaction {
             floorID: floorID,
             priorMapID: priorMapID,
             priorMapSHA256: priorMapSHA.lowercased(),
+            priorMapCanonicalSourceSHA256: priorMapCanonicalSourceSHA,
             processingStatus: processingStatus,
             processingBlockers: processingBlockers,
             captureHealth: StrictFinalizedSessionMetadata.CaptureHealth(
@@ -3363,6 +3391,26 @@ enum SessionSnapshotTransaction {
             url, maximumBytes: maximumBytes)?.data
     }
 
+    /// Host-test entry for the immutable artifact hashing primitive used by
+    /// snapshot metadata, sidecars and the SQLite database.
+    static func sha256StableCommittedFileForTests(
+        _ url: URL,
+        expectedBytes: Int64
+    ) throws -> String {
+        let parent = url.deletingLastPathComponent()
+        let descriptor = open(
+            parent.path, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)
+        guard descriptor >= 0 else {
+            throw SessionError.copyFailed(
+                "cannot open committed artifact test parent")
+        }
+        defer { _ = close(descriptor) }
+        return try sha256StableCommittedFile(
+            parentDescriptor: descriptor,
+            basename: url.lastPathComponent,
+            expectedBytes: expectedBytes).sha256
+    }
+
     private static func readStableCommittedFileIfPresent(
         parentDescriptor: Int32,
         basename: String,
@@ -3505,85 +3553,218 @@ enum SessionSnapshotTransaction {
     private static func sha256StableCommittedFile(
         parentDescriptor: Int32,
         basename: String,
-        expectedBytes: Int64
-    ) throws -> (sha256: String, metadata: stat) {
+        expectedBytes: Int64,
+        captureBytes: Bool = false
+    ) throws -> (sha256: String, metadata: stat, data: Data?) {
         guard expectedBytes >= 0 else {
             throw SessionError.copyFailed(
                 "committed artifact has a negative expected size")
         }
-        var pathBefore = stat()
-        guard fstatat(
-            parentDescriptor,
-            basename,
-            &pathBefore,
-            AT_SYMLINK_NOFOLLOW) == 0,
-              (pathBefore.st_mode & S_IFMT) == S_IFREG,
-              (pathBefore.st_mode & mode_t(0o777)) == committedFileMode,
-              pathBefore.st_nlink == 1,
-              Int64(pathBefore.st_size) == expectedBytes else {
-            throw SessionError.copyFailed(
-                "committed artifact type/mode/link/size is invalid: \(basename)")
-        }
-        try faultInjector?(.afterArtifactAuthorityReadBeforeOpen(basename))
-        let descriptor = openat(
-            parentDescriptor,
-            basename,
-            O_RDONLY | O_CLOEXEC | O_NOFOLLOW)
-        guard descriptor >= 0 else {
-            throw SessionError.copyFailed(
-                "cannot open committed artifact no-follow: \(basename)")
-        }
-        defer { _ = close(descriptor) }
-        var openedBefore = stat()
-        guard fstat(descriptor, &openedBefore) == 0,
-              sameFileIdentity(pathBefore, openedBefore) else {
-            throw SessionError.copyFailed(
-                "committed artifact changed before open: \(basename)")
-        }
-
-        var hasher = SHA256()
-        var totalBytes: Int64 = 0
-        var buffer = [UInt8](repeating: 0, count: copyChunkBytes)
-        while true {
-            let count = buffer.withUnsafeMutableBytes { rawBuffer -> Int in
-                guard let base = rawBuffer.baseAddress else { return -1 }
-                return Darwin.read(descriptor, base, rawBuffer.count)
-            }
-            if count < 0 && errno == EINTR { continue }
-            guard count >= 0 else {
+        for attempt in 0..<maximumCommittedArtifactStabilityAttempts {
+            var pathBefore = stat()
+            guard fstatat(
+                parentDescriptor,
+                basename,
+                &pathBefore,
+                AT_SYMLINK_NOFOLLOW) == 0,
+                  (pathBefore.st_mode & S_IFMT) == S_IFREG,
+                  (pathBefore.st_mode & mode_t(0o777)) == committedFileMode,
+                  pathBefore.st_nlink == 1,
+                  Int64(pathBefore.st_size) == expectedBytes else {
                 throw SessionError.copyFailed(
-                    "committed artifact read failed: \(basename)")
+                    "committed artifact type/mode/link/size is invalid: \(basename)")
             }
-            if count == 0 { break }
-            guard totalBytes <= expectedBytes - Int64(count) else {
+            try faultInjector?(.afterArtifactAuthorityReadBeforeOpen(basename))
+            let descriptor = openat(
+                parentDescriptor,
+                basename,
+                O_RDONLY | O_CLOEXEC | O_NOFOLLOW)
+            guard descriptor >= 0 else {
                 throw SessionError.copyFailed(
-                    "committed artifact grew during hash: \(basename)")
+                    "cannot open committed artifact no-follow: \(basename)")
             }
-            let chunk = buffer.withUnsafeBytes { rawBuffer -> Data in
-                Data(bytes: rawBuffer.baseAddress!, count: count)
-            }
-            hasher.update(data: chunk)
-            totalBytes += Int64(count)
-        }
 
-        var openedAfter = stat()
-        var pathAfter = stat()
-        guard totalBytes == expectedBytes,
-              fstat(descriptor, &openedAfter) == 0,
-              fstatat(
+            var openedBefore = stat()
+            guard fstat(descriptor, &openedBefore) == 0 else {
+                _ = close(descriptor)
+                throw SessionError.copyFailed(
+                    "cannot inspect opened committed artifact: \(basename)")
+            }
+            if !sameFileIdentity(pathBefore, openedBefore) {
+                let difference = fileIdentityDifferenceSummary(
+                    pathBefore, openedBefore)
+                guard sameFileIdentityIgnoringChangeTime(
+                        pathBefore, openedBefore),
+                      changeTimeDidNotMoveBackward(
+                        pathBefore, openedBefore) else {
+                    _ = close(descriptor)
+                    throw SessionError.copyFailed(
+                        "committed artifact changed before open: \(basename) "
+                            + "[\(difference)]")
+                }
+                var reboundPath = stat()
+                guard fstatat(
+                        parentDescriptor,
+                        basename,
+                        &reboundPath,
+                        AT_SYMLINK_NOFOLLOW) == 0,
+                      sameFileIdentity(openedBefore, reboundPath) else {
+                    let reboundDifference = fileIdentityDifferenceSummary(
+                        openedBefore, reboundPath)
+                    _ = close(descriptor)
+                    throw SessionError.copyFailed(
+                        "committed artifact namespace changed while "
+                            + "stabilizing ctime: \(basename) "
+                            + "[\(reboundDifference)]")
+                }
+            }
+
+            do {
+                try faultInjector?(.afterArtifactOpenBeforeHash(basename))
+            } catch {
+                _ = close(descriptor)
+                throw error
+            }
+            var hasher = SHA256()
+            var totalBytes: Int64 = 0
+            var capturedData = Data()
+            if captureBytes {
+                guard expectedBytes <= Int64(Int.max) else {
+                    _ = close(descriptor)
+                    throw SessionError.copyFailed(
+                        "committed artifact capture size overflows: \(basename)")
+                }
+                capturedData.reserveCapacity(Int(expectedBytes))
+            }
+            var buffer = [UInt8](repeating: 0, count: copyChunkBytes)
+            while true {
+                let count = buffer.withUnsafeMutableBytes { rawBuffer -> Int in
+                    guard let base = rawBuffer.baseAddress else { return -1 }
+                    return Darwin.read(descriptor, base, rawBuffer.count)
+                }
+                if count < 0 && errno == EINTR { continue }
+                guard count >= 0 else {
+                    _ = close(descriptor)
+                    throw SessionError.copyFailed(
+                        "committed artifact read failed: \(basename)")
+                }
+                if count == 0 { break }
+                guard totalBytes <= expectedBytes - Int64(count) else {
+                    _ = close(descriptor)
+                    throw SessionError.copyFailed(
+                        "committed artifact grew during hash: \(basename)")
+                }
+                let chunk = buffer.withUnsafeBytes { rawBuffer -> Data in
+                    Data(bytes: rawBuffer.baseAddress!, count: count)
+                }
+                hasher.update(data: chunk)
+                if captureBytes { capturedData.append(chunk) }
+                totalBytes += Int64(count)
+            }
+
+            var openedAfter = stat()
+            var pathAfter = stat()
+            let descriptorStatSucceeded = fstat(descriptor, &openedAfter) == 0
+            let pathStatSucceeded = fstatat(
                 parentDescriptor,
                 basename,
                 &pathAfter,
-                AT_SYMLINK_NOFOLLOW) == 0,
-              sameFileIdentity(openedBefore, openedAfter),
-              sameFileIdentity(openedBefore, pathAfter) else {
+                AT_SYMLINK_NOFOLLOW) == 0
+            _ = close(descriptor)
+            guard totalBytes == expectedBytes,
+                  descriptorStatSucceeded,
+                  pathStatSucceeded else {
+                throw SessionError.copyFailed(
+                    "committed artifact changed during hash: \(basename) "
+                        + "[bytes_or_stat]")
+            }
+
+            if sameFileIdentity(openedBefore, openedAfter),
+               sameFileIdentity(openedBefore, pathAfter) {
+                let digest = hasher.finalize().map {
+                    String(format: "%02x", $0)
+                }.joined()
+                return (
+                    digest,
+                    openedAfter,
+                    captureBytes ? capturedData : nil)
+            }
+
+            let descriptorDifference = fileIdentityDifferenceSummary(
+                openedBefore, openedAfter)
+            let pathDifference = fileIdentityDifferenceSummary(
+                openedBefore, pathAfter)
+            let settledChangeTimeOnly =
+                sameFileIdentityIgnoringChangeTime(
+                    openedBefore, openedAfter)
+                && sameFileIdentityIgnoringChangeTime(
+                    openedBefore, pathAfter)
+                && changeTimeDidNotMoveBackward(openedBefore, openedAfter)
+                && changeTimeDidNotMoveBackward(openedBefore, pathAfter)
+                && sameFileIdentity(openedAfter, pathAfter)
+            if settledChangeTimeOnly,
+               attempt + 1 < maximumCommittedArtifactStabilityAttempts {
+                // APFS can expose the final ctime of a just-frozen inode only
+                // after a long sequential read. Discard that entire read and
+                // require a second descriptor/path/hash pass to be exact. A
+                // continuing chmod/write/replacement race therefore still
+                // fails closed, while a one-time publication-view settlement
+                // never contributes bytes to the accepted digest.
+                continue
+            }
             throw SessionError.copyFailed(
-                "committed artifact changed during hash: \(basename)")
+                "committed artifact changed during hash: \(basename) "
+                    + "[descriptor=\(descriptorDifference);"
+                    + "path=\(pathDifference);attempt=\(attempt + 1)]")
         }
-        let digest = hasher.finalize().map {
-            String(format: "%02x", $0)
-        }.joined()
-        return (digest, openedBefore)
+        throw SessionError.copyFailed(
+            "committed artifact did not stabilize during hash: \(basename)")
+    }
+
+    /// A committed file may reveal a later ctime after its initial stable
+    /// hash or a read-only SQLite validation. Accept that transition only by
+    /// re-reading the same immutable object through the bounded two-pass
+    /// primitive and proving its SHA still matches the committed manifest.
+    private static func revalidateCommittedFile(
+        parentDescriptor: Int32,
+        basename: String,
+        expectedMetadata: stat,
+        expectedBytes: Int64,
+        expectedSHA256: String,
+        context: String
+    ) throws -> stat {
+        var current = stat()
+        guard fstatat(
+            parentDescriptor,
+            basename,
+            &current,
+            AT_SYMLINK_NOFOLLOW) == 0 else {
+            throw SessionError.copyFailed(
+                "\(context): \(basename) [missing]")
+        }
+        if sameFileIdentity(expectedMetadata, current) {
+            return current
+        }
+        let difference = fileIdentityDifferenceSummary(
+            expectedMetadata, current)
+        guard sameFileIdentityIgnoringChangeTime(expectedMetadata, current),
+              changeTimeDidNotMoveBackward(expectedMetadata, current) else {
+            throw SessionError.copyFailed(
+                "\(context): \(basename) [\(difference)]")
+        }
+        let refreshed = try sha256StableCommittedFile(
+            parentDescriptor: parentDescriptor,
+            basename: basename,
+            expectedBytes: expectedBytes)
+        guard refreshed.sha256 == expectedSHA256,
+              sameFileIdentityIgnoringChangeTime(
+                expectedMetadata, refreshed.metadata),
+              changeTimeDidNotMoveBackward(
+                expectedMetadata, refreshed.metadata) else {
+            throw SessionError.copyFailed(
+                "\(context): \(basename) [ctime_rehash_mismatch]")
+        }
+        return refreshed.metadata
     }
 
     private static func openStableDirectoryNoFollow(

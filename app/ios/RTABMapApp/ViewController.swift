@@ -6132,6 +6132,8 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                         workflowMode: scanSession.scanConfiguration.workflowMode.rawValue,
                         priorMapId: scanSession.scanConfiguration.priorMapId,
                         priorMapSha256: scanSession.scanConfiguration.priorMapSha256,
+                        priorMapCanonicalSourceSha256: scanSession
+                            .scanConfiguration.priorMapCanonicalSourceSha256,
                         floorId: scanSession.scanConfiguration.floorId,
                         // B-08: the session records its store identity at
                         // finalization; the snapshot eligibility chain
@@ -7593,6 +7595,7 @@ extension ViewController: MobileOnlyScanStarting {
             packageDirectory: entry.packageDirectory,
             priorMapId: entry.priorMapID,
             priorMapSha256: entry.packageSHA256,
+            priorMapCanonicalSourceSha256: entry.canonicalSourceSHA256,
             floorId: configuration.floorID,
             storeID: configuration.storeID,
             initialMapPose: PriorMapPose2D(

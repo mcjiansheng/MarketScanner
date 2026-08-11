@@ -24,6 +24,7 @@ from tools.PriorMap.offline_localization import (
     VerifiedTagBurstFrameAuthority,
     OfflineLocalizationError,
     _read_jsonl,
+    _resolve_session_prior_map_identity,
     _validate_jsonl_business_record,
     _validate_recovery_event_sequence,
     _associate_tag,
@@ -69,6 +70,105 @@ def jsonl_write(path: Path, values: list[dict[str, object]]) -> None:
         "".join(json.dumps(value, sort_keys=True) + "\n" for value in values),
         encoding="utf-8",
     )
+
+
+class PriorMapIdentityBindingTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.source_sha = "1" * 64
+        self.package_sha = "2" * 64
+        self.canonical_sha = "abcdef123456" + "3" * 52
+        self.mobile_package_sha = "4" * 64
+        self.map_id = "hs.6599-" + self.canonical_sha[:12]
+        self.manifest = {
+            "prior_map_id": self.map_id,
+            "store_id": "hs.6599",
+            "source_sha256": self.source_sha,
+            "canonical_source_sha256": self.canonical_sha,
+            "floors": [{"id": "1"}, {"id": "2"}],
+        }
+        self.package_manifest = {"package_sha256": self.package_sha}
+        self.metadata = {
+            "priorMapId": self.map_id,
+            "priorMapSha256": self.mobile_package_sha,
+            "storeId": "hs.6599",
+            "floorId": "1",
+        }
+
+    def resolve(self, **updates: object) -> dict[str, object]:
+        return _resolve_session_prior_map_identity(
+            {**self.metadata, **updates},
+            self.manifest,
+            self.package_manifest,
+        )
+
+    def test_exact_source_and_package_hashes_remain_supported(self) -> None:
+        source = self.resolve(priorMapSha256=self.source_sha)
+        package = self.resolve(priorMapSha256=self.package_sha)
+        self.assertEqual(source["mode"], "source_sha256")
+        self.assertEqual(package["mode"], "package_sha256")
+        self.assertFalse(source["legacy_compatibility"])
+        self.assertFalse(package["legacy_compatibility"])
+
+    def test_full_canonical_hash_binds_cross_compiler_package(self) -> None:
+        binding = self.resolve(
+            priorMapCanonicalSourceSha256=self.canonical_sha
+        )
+        self.assertEqual(binding["mode"], "canonical_source_sha256")
+        self.assertFalse(binding["legacy_compatibility"])
+        self.assertEqual(
+            binding["session_prior_map_sha256"], self.mobile_package_sha
+        )
+
+    def test_legacy_cross_compiler_binding_is_explicit(self) -> None:
+        binding = self.resolve()
+        self.assertEqual(
+            binding["mode"], "legacy_cross_compiler_map_identity"
+        )
+        self.assertTrue(binding["legacy_compatibility"])
+        self.assertTrue(binding["business_identity_exact"])
+
+    def test_canonical_mismatch_never_falls_back_to_legacy(self) -> None:
+        with self.assertRaisesRegex(
+            OfflineLocalizationError, "canonical prior-map source hash"
+        ):
+            self.resolve(priorMapCanonicalSourceSha256="5" * 64)
+        with self.assertRaisesRegex(
+            OfflineLocalizationError, "canonical prior-map source hash"
+        ):
+            self.resolve(
+                priorMapSha256=self.package_sha,
+                priorMapCanonicalSourceSha256="5" * 64,
+            )
+
+    def test_legacy_binding_rejects_map_store_floor_and_prefix_mismatch(
+        self,
+    ) -> None:
+        cases = (
+            ({"priorMapId": "other-" + self.canonical_sha[:12]}, "prior_map_id"),
+            ({"storeId": "other-store"}, "store/floor"),
+            ({"floorId": "99"}, "store/floor"),
+        )
+        for updates, message in cases:
+            with self.subTest(updates=updates):
+                with self.assertRaisesRegex(OfflineLocalizationError, message):
+                    self.resolve(**updates)
+
+        forged_manifest = {
+            **self.manifest,
+            "canonical_source_sha256": "fedcba654321" + "6" * 52,
+        }
+        with self.assertRaisesRegex(
+            OfflineLocalizationError, "not bound to the selected canonical source"
+        ):
+            _resolve_session_prior_map_identity(
+                self.metadata, forged_manifest, self.package_manifest
+            )
+
+    def test_malformed_session_package_hash_is_rejected(self) -> None:
+        with self.assertRaisesRegex(
+            OfflineLocalizationError, "prior-map hash is invalid"
+        ):
+            self.resolve(priorMapSha256="not-a-sha")
 
 
 class RecoveryConstraintDispositionTests(unittest.TestCase):

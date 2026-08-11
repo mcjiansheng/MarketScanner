@@ -1,6 +1,6 @@
 # 已有地图辅助扫描数据格式
 
-> 文档状态：**当前有效**。最后核对日期：2026-08-09。
+> 文档状态：**当前有效**。最后核对日期：2026-08-11。
 
 ## 会话元数据
 
@@ -22,6 +22,8 @@
 {
   "priorMapId": "mapcase01-0cf6949652d4",
   "priorMapSha256": "<package_manifest.package_sha256, 64 hex>",
+  "priorMapCanonicalSourceSha256": "<manifest.canonical_source_sha256, 64 hex>",
+  "storeId": "store-001",
   "floorId": "1",
   "initialMapPose": {
     "x_m": 12.3,
@@ -54,6 +56,8 @@
   "processingEligibility": {"status": "eligible", "blockers": []}
 }
 ```
+
+`priorMapSha256` 是扫描时手机上 exact package artifact 的身份，仍用于全部实时 sidecar 的同会话一致性校验；Swift 与 Python 编译器生成的派生 package bytes 不承诺相同，因此它不再被解释为跨编译器通用身份。新会话同时写 `priorMapCanonicalSourceSha256`，PC 以完整 canonical source SHA 和 exact `priorMapId/storeId/floorId` 绑定同一源地图。缺失 canonical 字段的历史会话只能走显式 legacy cross-compiler compatibility：selected package 必须已通过 production validator，map/store/floor 必须精确一致，prior-map ID 的 12 位后缀必须等于 selected canonical SHA 前 12 位，手机 package SHA 必须为合法小写 SHA-256 且在 metadata/sidecar 内一致；输出报告必须标记 compatibility mode 并同时保留手机/PC/canonical/source SHA。
 
 `floorId` 在会话开始时固定，当前版本没有扫描中楼层切换事件。二维 `rawPose/estimatedPose` 只表达所选楼层内的 `x/y/yaw`：ARKit `+x` 对应地图 `+x`，ARKit `-z` 对应地图 `+y`，地图 yaw 0 指向 `+x`（东/右）、`+π/2` 指向 `+y`（北/上），且逆时针为正。ARKit 竖直 `y` 不写入二维定位 sidecar，但仍由原始 ARKit/RTAB-Map 三维链路保存。
 

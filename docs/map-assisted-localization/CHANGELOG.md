@@ -2,6 +2,13 @@
 
 > 文档状态：**当前有效**。最后核对日期：2026-08-11。
 
+## 2026-08-11 — 手机历史处理长哈希稳定性与 PC 跨编译器地图身份
+
+- 手机 immutable snapshot artifact 哈希增加有界两遍稳定读取：只在同 dev/inode/mode/nlink/size/mtime、`ctime` 单次向前且 descriptor/path 最终一致时丢弃首遍并完整重哈希；持续 `ctime`、内容/mtime、inode、mode、link、size 变化继续 fail closed。
+- `metadata.json` 改为同一次 descriptor-stable 读取同时 strict parse 与 SHA，消除 eligibility 的第二次打开窗口；SQLite 只读校验和 generation final sweep 对一次性 `ctime` 稳定必须重新完整哈希并匹配 committed manifest。
+- 新手机会话写 `priorMapCanonicalSourceSha256`。PC localized processing 支持 exact source SHA、exact PC package SHA、full canonical SHA，并为缺字段的历史 Swift 手机包提供 exact map/store/floor + canonical-ID-prefix 的显式兼容绑定；报告保留全部身份和 warning。
+- 真实 `扫描结果/0811` 的 13 个 finalized 会话通过 PC input snapshot/identity gate；5.9 MB、36 MB、约 995 MB 三档真实会话完成手机 snapshot host 验证和 PC 完整处理。未 finalized 且带 live checkpoint 的会话继续拒绝；大样本后续由正常质量门拒绝发布，而不是哈希/数据库错误。
+
 ## 2026-08-11 — 起点朝向、ARKit 首帧对齐与扫描 HUD 统一
 
 - 真机截图复现：配置页选择“东 0°”时 marker 向右，但进入扫描后 HUD 三角向上；继续向前会按旧的 `yaw 0 = +Y` 解释初始轨迹，属于实际定位与显示共同存在的固定 90° 合同断层，而不是单纯图标问题。

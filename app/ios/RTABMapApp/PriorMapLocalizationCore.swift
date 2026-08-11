@@ -143,6 +143,10 @@ struct PriorMapScanConfiguration: Codable {
     let packageDirectory: URL?
     let priorMapId: String?
     let priorMapSha256: String?
+    /// Format-independent identity shared by the Swift and Python map
+    /// compilers. The package digest remains the exact on-device artifact
+    /// identity; this digest binds a later PC build to the same source map.
+    let priorMapCanonicalSourceSha256: String?
     let floorId: String?
     /// Business identity committed by the Mobile-Only scan setup. Prior-map
     /// capture is not formally startable without it because finalized
@@ -156,6 +160,7 @@ struct PriorMapScanConfiguration: Codable {
         packageDirectory: nil,
         priorMapId: nil,
         priorMapSha256: nil,
+        priorMapCanonicalSourceSha256: nil,
         floorId: nil,
         storeID: nil,
         initialMapPose: nil)
@@ -180,6 +185,7 @@ struct PriorMapScanConfiguration: Codable {
         case packageDirectory
         case priorMapId
         case priorMapSha256
+        case priorMapCanonicalSourceSha256
         case floorId
         case storeID = "storeId"
         case initialMapPose
@@ -191,6 +197,7 @@ struct PriorMapScanConfiguration: Codable {
         packageDirectory: URL?,
         priorMapId: String?,
         priorMapSha256: String?,
+        priorMapCanonicalSourceSha256: String? = nil,
         floorId: String?,
         storeID: String?,
         initialMapPose: PriorMapPose2D?
@@ -200,6 +207,7 @@ struct PriorMapScanConfiguration: Codable {
         self.packageDirectory = packageDirectory
         self.priorMapId = priorMapId
         self.priorMapSha256 = priorMapSha256
+        self.priorMapCanonicalSourceSha256 = priorMapCanonicalSourceSha256
         self.floorId = floorId
         self.storeID = storeID
         self.initialMapPose = initialMapPose

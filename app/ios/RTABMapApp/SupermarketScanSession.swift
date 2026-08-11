@@ -76,6 +76,7 @@ struct ScanSegmentMetadata: Codable {
     let workflowMode: String?
     let priorMapId: String?
     let priorMapSha256: String?
+    let priorMapCanonicalSourceSha256: String?
     let floorId: String?
     /// Store identity of the scan (B-08): the snapshot eligibility
     /// chain validates it fail-closed against the processing request.
@@ -493,6 +494,7 @@ struct ScanLiveCheckpoint: Codable {
     let workflowMode: String?
     let priorMapId: String?
     let priorMapSha256: String?
+    let priorMapCanonicalSourceSha256: String?
     let floorId: String?
     let storeId: String?
     let initialMapPose: PriorMapPose2D?
@@ -1778,6 +1780,8 @@ final class SupermarketScanSession {
             workflowMode: scanConfiguration.workflowMode.rawValue,
             priorMapId: scanConfiguration.priorMapId,
             priorMapSha256: scanConfiguration.priorMapSha256,
+            priorMapCanonicalSourceSha256:
+                scanConfiguration.priorMapCanonicalSourceSha256,
             floorId: scanConfiguration.floorId,
             storeId: scanConfiguration.storeID,
             initialMapPose: scanConfiguration.initialMapPose)

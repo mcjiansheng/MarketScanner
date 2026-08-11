@@ -1718,6 +1718,8 @@ final class PriorMapWizardViewController: UIViewController, UIDocumentPickerDele
             packageDirectory: package.directory,
             priorMapId: package.manifest.priorMapId,
             priorMapSha256: package.packageSha256,
+            priorMapCanonicalSourceSha256:
+                package.manifest.canonicalSourceSha256,
             floorId: package.manifest.floors[selectedFloorIndex].id,
             storeID: package.manifest.storeID,
             initialMapPose: selectedPose)

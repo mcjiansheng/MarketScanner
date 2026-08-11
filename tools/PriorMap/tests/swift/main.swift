@@ -2859,6 +2859,90 @@ func runSnapshotStableCommittedFileFocusedTests() {
             postOpenReplacementRejected,
             "post-open pathname replacement must remain fail-closed")
 
+        let artifactBytes = Data(repeating: 0x61, count: 128 * 1024)
+        let artifactExpectedSHA = SHA256.hash(data: artifactBytes).map {
+            String(format: "%02x", $0)
+        }.joined()
+        let artifactURL = try makeCommittedFile(
+            "artifact-ctime-settlement.bin", artifactBytes)
+        var artifactSettlementCount = 0
+        SessionSnapshotTransaction.faultInjector = { point in
+            guard artifactSettlementCount == 0,
+                  case let .afterArtifactOpenBeforeHash(name) = point,
+                  name == artifactURL.lastPathComponent else { return }
+            usleep(20_000)
+            guard chmod(artifactURL.path, mode_t(0o644)) == 0,
+                  chmod(artifactURL.path, mode_t(0o444)) == 0 else {
+                throw NSError(
+                    domain: "StableCommittedFixture", code: 18)
+            }
+            artifactSettlementCount += 1
+        }
+        let artifactActualSHA = try SessionSnapshotTransaction
+            .sha256StableCommittedFileForTests(
+                artifactURL, expectedBytes: Int64(artifactBytes.count))
+        SessionSnapshotTransaction.faultInjector = nil
+        require(
+            artifactSettlementCount == 1
+                && artifactActualSHA == artifactExpectedSHA,
+            "one-time artifact ctime settlement must retry and preserve SHA")
+
+        let repeatedArtifactURL = try makeCommittedFile(
+            "artifact-continuing-ctime.bin", artifactBytes)
+        var repeatedArtifactSettlementCount = 0
+        SessionSnapshotTransaction.faultInjector = { point in
+            guard case let .afterArtifactOpenBeforeHash(name) = point,
+                  name == repeatedArtifactURL.lastPathComponent else { return }
+            usleep(20_000)
+            guard chmod(repeatedArtifactURL.path, mode_t(0o644)) == 0,
+                  chmod(repeatedArtifactURL.path, mode_t(0o444)) == 0 else {
+                throw NSError(
+                    domain: "StableCommittedFixture", code: 19)
+            }
+            repeatedArtifactSettlementCount += 1
+        }
+        var repeatedArtifactRejected = false
+        do {
+            _ = try SessionSnapshotTransaction
+                .sha256StableCommittedFileForTests(
+                    repeatedArtifactURL,
+                    expectedBytes: Int64(artifactBytes.count))
+        } catch {
+            repeatedArtifactRejected = true
+        }
+        SessionSnapshotTransaction.faultInjector = nil
+        require(
+            repeatedArtifactRejected
+                && repeatedArtifactSettlementCount == 2,
+            "continuing artifact ctime changes must remain fail-closed")
+
+        let changedArtifactURL = try makeCommittedFile(
+            "artifact-content-change.bin", artifactBytes)
+        var changedArtifactInjected = false
+        SessionSnapshotTransaction.faultInjector = { point in
+            guard !changedArtifactInjected,
+                  case let .afterArtifactOpenBeforeHash(name) = point,
+                  name == changedArtifactURL.lastPathComponent else { return }
+            try rewriteInPlace(
+                changedArtifactURL,
+                bytes: Data(repeating: 0x62, count: artifactBytes.count))
+            changedArtifactInjected = true
+        }
+        var changedArtifactRejected = false
+        do {
+            _ = try SessionSnapshotTransaction
+                .sha256StableCommittedFileForTests(
+                    changedArtifactURL,
+                    expectedBytes: Int64(artifactBytes.count))
+        } catch {
+            changedArtifactRejected = true
+        }
+        SessionSnapshotTransaction.faultInjector = nil
+        require(
+            changedArtifactInjected
+                && changedArtifactRejected,
+            "artifact content/mtime mutation must remain fail-closed")
+
         let hardlinkURL = try makeCommittedFile(
             "hardlink-authority.json", Data("{\"value\":6}\n".utf8))
         let hardlinkAlias = root.appendingPathComponent("hardlink-alias.json")
@@ -2937,6 +3021,104 @@ if CommandLine.arguments.count == 2,
    CommandLine.arguments[1] == "--snapshot-stable-read-focused" {
     runSnapshotStableCommittedFileFocusedTests()
     exit(0)
+}
+if (CommandLine.arguments.count == 4 || CommandLine.arguments.count == 5),
+   CommandLine.arguments[1] == "--snapshot-real-session" {
+    let segment = URL(
+        fileURLWithPath: CommandLine.arguments[2], isDirectory: true)
+    let taskRoot = URL(
+        fileURLWithPath: CommandLine.arguments[3], isDirectory: true)
+    let ctimeSettlementTarget = CommandLine.arguments.count == 5
+        ? CommandLine.arguments[4] : nil
+    var ctimeSettlementInjected = false
+    do {
+        let metadataURL = segment.appendingPathComponent("metadata.json")
+        let metadataData = try Data(contentsOf: metadataURL)
+        guard let metadata = try StrictJSONDocumentParser.object(
+                from: metadataData,
+                limits: StrictJSONDocumentLimits(
+                    maximumBytes: max(metadataData.count, 1)))
+                as? [String: Any],
+              let priorMapID = metadata["priorMapId"] as? String,
+              let priorMapSHA256 = metadata["priorMapSha256"] as? String,
+              let storeID = metadata["storeId"] as? String,
+              let floorID = metadata["floorId"] as? String else {
+            throw NSError(
+                domain: "RealSessionSnapshot",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "formal session identity is missing"])
+        }
+        let databaseNames = try FileManager.default.contentsOfDirectory(
+            atPath: segment.path).filter { $0.hasSuffix(".db") }
+        guard databaseNames.count == 1 else {
+            throw NSError(
+                domain: "RealSessionSnapshot",
+                code: 2,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "real session must contain exactly one database"])
+        }
+        if let ctimeSettlementTarget {
+            guard ctimeSettlementTarget == "metadata.json"
+                    || ctimeSettlementTarget == databaseNames[0] else {
+                throw NSError(
+                    domain: "RealSessionSnapshot",
+                    code: 3,
+                    userInfo: [NSLocalizedDescriptionKey:
+                        "ctime settlement target must be metadata or database"])
+            }
+            SessionSnapshotTransaction.faultInjector = { point in
+                guard !ctimeSettlementInjected,
+                      case let .afterArtifactOpenBeforeHash(name) = point,
+                      name == ctimeSettlementTarget else { return }
+                let artifact = taskRoot
+                    .appendingPathComponent(
+                        "input_snapshot.staging", isDirectory: true)
+                    .appendingPathComponent(name)
+                guard chmod(artifact.path, mode_t(0o644)) == 0,
+                      chmod(artifact.path, mode_t(0o444)) == 0 else {
+                    throw NSError(
+                        domain: "RealSessionSnapshot",
+                        code: Int(errno),
+                        userInfo: [NSLocalizedDescriptionKey:
+                            "cannot inject one-time artifact ctime settlement"])
+                }
+                ctimeSettlementInjected = true
+            }
+        }
+        let snapshot = try SessionSnapshotTransaction.snapshot(
+            finalizedSession: segment,
+            sourceDatabase: segment.appendingPathComponent(databaseNames[0]),
+            taskRoot: taskRoot,
+            eligibility: SessionSnapshotTransaction.Eligibility(
+                priorMapID: priorMapID,
+                priorMapSHA256: priorMapSHA256,
+                storeID: storeID,
+                floorID: floorID,
+                appGitSHA: "real-session-host-validation"))
+        try SessionSnapshotTransaction.revalidateSnapshot(
+            snapshot.snapshotDirectory)
+        SessionSnapshotTransaction.faultInjector = nil
+        if ctimeSettlementTarget != nil && !ctimeSettlementInjected {
+            throw NSError(
+                domain: "RealSessionSnapshot",
+                code: 4,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "requested ctime settlement fault point did not execute"])
+        }
+        let generation = snapshot.inputManifest["generation"] as? String
+            ?? "unknown"
+        print(
+            "Real session snapshot passed: "
+                + "bundle=\(snapshot.bundleSHA256) "
+                + "generation=\(generation)")
+        exit(0)
+    } catch {
+        SessionSnapshotTransaction.faultInjector = nil
+        FileHandle.standardError.write(
+            Data("Real session snapshot failed: \(error)\n".utf8))
+        exit(12)
+    }
 }
 if (CommandLine.arguments.count == 6 || CommandLine.arguments.count == 7),
    CommandLine.arguments[1] == "--mapcase02-suite" {
