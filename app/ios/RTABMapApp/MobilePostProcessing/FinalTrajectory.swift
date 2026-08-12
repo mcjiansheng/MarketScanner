@@ -25,6 +25,9 @@ enum FinalTrajectory {
         /// an AVAILABLE row).
         var uncertaintyM: Double?
         var floorID: String
+        /// Native connected-component identity. Interpolation never crosses
+        /// components even when their timestamps happen to be adjacent.
+        var componentID: Int64 = 0
     }
 
     struct LostInterval {
@@ -51,6 +54,16 @@ enum FinalTrajectory {
         var sessionEndUTC: Double
         /// V1R5 §11.3: real per-row business state source.
         var traceStates: [TraceState] = []
+        /// PASS produces map-frame business coordinates. A non-PASS graph
+        /// may still carry map-aligned diagnostic coordinates, or only local
+        /// frame coordinates when no safe map gauge was available.
+        var graphQualityStatus: String = "PASS"
+        var positionSource: String = "final_trajectory"
+        /// True only when node x/y/yaw are expressed in the selected prior
+        /// map coordinate system. Local-frame diagnostics are exported in
+        /// dedicated local_* fields and must never masquerade as map_x/map_y.
+        var coordinatesArePriorMapFrame: Bool = true
+        var allowUnverifiedCoordinatesWithoutUncertainty = false
     }
 
     /// One row of the DevicePositions worksheet.
@@ -67,6 +80,10 @@ enum FinalTrajectory {
         var mapXM: Double?
         var mapYM: Double?
         var yawDeg: Double?
+        var localXM: Double? = nil
+        var localYM: Double? = nil
+        var localYawDeg: Double? = nil
+        var coordinateFrame: String = "PRIOR_MAP"
         var positionStatus: String
         var positionSource: String
         var beforeNodeID: Int64?
@@ -93,6 +110,7 @@ enum FinalTrajectory {
                 "session_elapsed_s": SourceGeometry.rounded(sessionElapsedS),
                 "store_id": storeID,
                 "floor_id": floorID,
+                "coordinate_frame": coordinateFrame,
                 "position_status": positionStatus,
                 "position_source": positionSource,
                 "tracking_state": trackingState,
@@ -105,6 +123,11 @@ enum FinalTrajectory {
             if let mapXM = mapXM { payload["map_x_m"] = mapXM }
             if let mapYM = mapYM { payload["map_y_m"] = mapYM }
             if let yawDeg = yawDeg { payload["yaw_deg"] = yawDeg }
+            if let localXM = localXM { payload["local_x_m"] = localXM }
+            if let localYM = localYM { payload["local_y_m"] = localYM }
+            if let localYawDeg = localYawDeg {
+                payload["local_yaw_deg"] = localYawDeg
+            }
             if let before = beforeNodeID { payload["before_node_id"] = before }
             if let after = afterNodeID { payload["after_node_id"] = after }
             if let ratio = interpolationRatio { payload["interpolation_ratio"] = ratio }
@@ -219,6 +242,12 @@ enum FinalTrajectory {
                     position: position, context: context, storeID: storeID,
                     priorMapID: priorMapID, priorMapSha256: priorMapSha256,
                     trackingSessionID: trackingSessionID, appGitSHA: appGitSHA,
+                    graphQualityStatus: input.graphQualityStatus,
+                    positionSource: input.positionSource,
+                    coordinatesArePriorMapFrame:
+                        input.coordinatesArePriorMapFrame,
+                    allowUnverifiedCoordinatesWithoutUncertainty:
+                        input.allowUnverifiedCoordinatesWithoutUncertainty,
                     traceState: nearestTraceState(
                         monotonic: monotonic, traceStates: traceStates,
                         traceIndex: &traceIndex,
@@ -291,6 +320,9 @@ enum FinalTrajectory {
         }
         // Floor change: never interpolate across it.
         guard after.floorID == before.floorID else {
+            return nil
+        }
+        guard after.componentID == before.componentID else {
             return nil
         }
         let span = after.monotonicSeconds - before.monotonicSeconds
@@ -511,6 +543,10 @@ enum FinalTrajectory {
         priorMapSha256: String,
         trackingSessionID: String,
         appGitSHA: String,
+        graphQualityStatus: String,
+        positionSource: String,
+        coordinatesArePriorMapFrame: Bool,
+        allowUnverifiedCoordinatesWithoutUncertainty: Bool,
         traceState: TraceState?
     ) -> DevicePositionRow {
         let localTimestamp = formatLocalTimestamp(
@@ -521,7 +557,25 @@ enum FinalTrajectory {
         // conservative upper bound sourced as such; with no uncertainty
         // evidence at all the position is emitted as UNAVAILABLE.
         let uncertaintyM = position.uncertaintyM
-        let positionStatus = uncertaintyM.map { _ in "AVAILABLE" } ?? "UNAVAILABLE"
+        let coordinatesAvailable = uncertaintyM != nil
+            || allowUnverifiedCoordinatesWithoutUncertainty
+        let positionStatus: String
+        if coordinatesArePriorMapFrame,
+           graphQualityStatus == "PASS",
+           positionSource == "final_trajectory",
+           uncertaintyM != nil {
+            positionStatus = "AVAILABLE"
+        } else if coordinatesArePriorMapFrame, coordinatesAvailable {
+            positionStatus = "DEGRADED_MAP_ALIGNED"
+        } else if !coordinatesArePriorMapFrame, coordinatesAvailable {
+            positionStatus = "LOCAL_FRAME_ONLY"
+        } else {
+            positionStatus = "UNAVAILABLE"
+        }
+        let xM = coordinatesAvailable ? SourceGeometry.rounded(position.xM) : nil
+        let yM = coordinatesAvailable ? SourceGeometry.rounded(position.yM) : nil
+        let yawDeg = coordinatesAvailable
+            ? SourceGeometry.rounded(position.yawRad * 180.0 / Double.pi) : nil
         return DevicePositionRow(
             sequence: sequence,
             localTimestamp: localTimestamp,
@@ -532,21 +586,25 @@ enum FinalTrajectory {
             sessionElapsedS: monotonic,
             storeID: storeID,
             floorID: position.floorID ?? "",
-            mapXM: positionStatus == "AVAILABLE" ? SourceGeometry.rounded(position.xM) : nil,
-            mapYM: positionStatus == "AVAILABLE" ? SourceGeometry.rounded(position.yM) : nil,
-            yawDeg: positionStatus == "AVAILABLE"
-                ? SourceGeometry.rounded(position.yawRad * 180.0 / Double.pi) : nil,
+            mapXM: coordinatesArePriorMapFrame ? xM : nil,
+            mapYM: coordinatesArePriorMapFrame ? yM : nil,
+            yawDeg: coordinatesArePriorMapFrame ? yawDeg : nil,
+            localXM: coordinatesArePriorMapFrame ? nil : xM,
+            localYM: coordinatesArePriorMapFrame ? nil : yM,
+            localYawDeg: coordinatesArePriorMapFrame ? nil : yawDeg,
+            coordinateFrame: coordinatesArePriorMapFrame
+                ? "PRIOR_MAP" : "LOCAL_DIAGNOSTIC",
             positionStatus: positionStatus,
-            positionSource: "final_trajectory",
-            beforeNodeID: positionStatus == "AVAILABLE" ? position.beforeNodeID : nil,
-            afterNodeID: positionStatus == "AVAILABLE" ? position.afterNodeID : nil,
-            interpolationRatio: positionStatus == "AVAILABLE"
+            positionSource: positionSource,
+            beforeNodeID: coordinatesAvailable ? position.beforeNodeID : nil,
+            afterNodeID: coordinatesAvailable ? position.afterNodeID : nil,
+            interpolationRatio: coordinatesAvailable
                 ? SourceGeometry.rounded(position.ratio) : nil,
             localizationConfidence: traceState?.confidence,
             estimatedUncertaintyM: uncertaintyM.map { SourceGeometry.rounded($0) },
             uncertaintySource: uncertaintyM.map { _ in "native_covariance_upper_bound" },
             trackingState: traceState?.trackingState ?? "unknown",
-            graphQualityStatus: positionStatus == "AVAILABLE" ? "connected" : "unavailable",
+            graphQualityStatus: graphQualityStatus,
             priorMapID: priorMapID,
             priorMapSha256: priorMapSha256,
             trackingSessionID: trackingSessionID,
@@ -584,6 +642,10 @@ enum FinalTrajectory {
             mapXM: nil,
             mapYM: nil,
             yawDeg: nil,
+            localXM: nil,
+            localYM: nil,
+            localYawDeg: nil,
+            coordinateFrame: "UNAVAILABLE",
             positionStatus: "UNAVAILABLE",
             positionSource: "final_trajectory",
             beforeNodeID: nil,

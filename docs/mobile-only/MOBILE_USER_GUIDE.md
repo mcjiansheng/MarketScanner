@@ -1,6 +1,6 @@
 # 手机端用户指南（Mobile User Guide）
 
-> 状态：**当前有效 / IMPLEMENTED / HOST TESTED**（真机流畅度和完整扫描仍需 DEVICE SMOKE）。最后核对：2026-08-10。
+> 状态：**当前有效 / IMPLEMENTED / HOST TESTED**（真机流畅度和完整扫描仍需 DEVICE SMOKE）。最后核对：2026-08-13。
 
 ## 首页
 
@@ -37,12 +37,24 @@
 结束扫描 → 安全保存 → 自动处理 → 快速图优化 →（必要时一次现有全图优化）→ 最终轨迹 →
 价签最终定位 → 自动质量门 → 生成工作簿
 
-若两条优化路径均未通过，或优化结果没有任何可发布轨迹节点，App 会显示“需要重新扫描整个会话”，并生成持久的 `RESCAN_SESSION` 任务终态。该次处理不会在手机上进行 True sensor Deep，也不会生成 PriceTags、DevicePositions、工作簿或普通历史结果；即使 App 在 outcome、checkpoint 或 task 状态提交窗口中断，重启后也会先验证专用不可变 outcome 再恢复该终态，不会把同一任务静默重跑成低质量结果或改写成普通失败。
+处理原则是“能读出的结果必须保留，可靠性另行标记”：少量价签帧缺失、个别价签坏记录、个别人工校准未绑定到最终最近节点、图质量未通过，或没有 publish-eligible 节点，都不再让整份结果消失。App 会生成不可变的部分结果，并显示 `PARTIAL_REVIEW_REQUIRED` 或 `LOCAL_FRAME_ONLY`、保留的坐标数/价签数、降级原因和“不可直接发布”。
+
+- 有已选择起点时，非发布轨迹可按起点对齐到原始地图，坐标仍会标为 `DEGRADED_MAP_ALIGNED`，供人工复核。
+- 无法安全对齐地图时，手机本地坐标保存在专用 `local_*` 列，绝不伪装成地图坐标。
+- 少量 burst/observation 不完整时，条码仍保留在 PriceTags；可由至少 3 帧重算位置则为低置信度，否则坐标为空并标 `RESCAN_REQUIRED`。
+- 真正没有任何有限轨迹节点时才生成 `RESCAN_SESSION`；数据库/身份/必要文件/输出写盘损坏、用户取消和资源不足等无法安全继续的故障仍会终止。
 
 ## 结果页
 
-自动通过价签：N；需要补扫价签：N；有效手机位置秒数：N；不可用区间：N；处理耗时；结果地图预览。
+结果质量：`COMPLETE / PARTIAL_REVIEW_REQUIRED / LOCAL_FRAME_ONLY`；是否允许发布；自动通过/低置信度/需要补扫价签数；坐标总行数、有效/降级/不可用秒数；处理耗时；结果地图预览。
 操作：[导出 XLSX] [查看补扫任务] [查看诊断摘要]
+
+最终业务结果在同一 Result 目录中：
+
+- `final_trajectory.jsonl`，以及 XLSX 的 `DevicePositions`：相对于原始先验地图的每秒手机坐标、朝向、本地时间、UTC、置信度和状态；若仅有本地诊断坐标则明确写入 `local_*`。
+- `final_tags.json`，以及 XLSX 的 `PriceTags`：所有保留下来的条码、地图位置、`shelf_code`、唯一物理 `shelf_segment_id`、front/back、沿货架距离、位置比例和质量原因。
+- `quality_report.json` / `RunSummary`：为什么完整、为什么降级、是否允许发布。
+- `rescan_tasks.json` / `RescanRequired`：只列需要补扫/复核的局部任务。
 
 历史结果若校验失败会从正常列表隔离到审计 quarantine，并在诊断中显示；App 不会把损坏结果当作成功结果，也不会自动删除原 payload。
 

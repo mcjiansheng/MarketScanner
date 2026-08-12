@@ -1,6 +1,6 @@
 # 手机后处理（Mobile Post Processing）
 
-> 状态：**当前有效**；IMPLEMENTED / UNIT TESTED / INTEGRATION TESTED（P1/P2/P7/P8/P12）。最后核对：2026-08-12。
+> 状态：**当前有效**；IMPLEMENTED / UNIT TESTED / INTEGRATION TESTED（P1/P2/P7/P8/P12）。最后核对：2026-08-13。
 
 ## 模块
 
@@ -14,11 +14,13 @@
 
 ## Fast Path 安全
 
-bounded iterations（60）、convergence tolerance、确定性稀疏 CG、每步 finite 检查、solver 失败抛错不发布。Route A 允许 Fast reduced graph 后至多一次 Full existing-graph optimization；仍失败即 `RESCAN_SESSION`，不执行 True sensor Deep。因子图输入为快照解析结果；处理只读快照，绝不处理原始 session 路径。
+bounded iterations（60）、convergence tolerance、确定性稀疏 CG、每步 finite 检查。Route A 允许 Fast reduced graph 后至多一次 Full existing-graph optimization，不执行 True sensor Deep。两条路径仍非 PASS 时，只要 native 返回至少一个有限轨迹节点，就提交 `PARTIAL_REVIEW_REQUIRED` 或 `LOCAL_FRAME_ONLY` 的不可发布 Result；质量失败是结果属性，不再等同于“没有结果”。若 Full 求解器自身返回 `nativeFailed`，但 Fast outcome 已通过完整 strict outcome/quality 合同且含有限轨迹，则回退 Fast 并记录 `full_graph_failed_fallback_to_fast`；未知 ABI、坏指针/计数、身份/path/quality JSON 绑定失败等 `invalidOutcome` 仍终止，不能用 Fast 掩盖不可信 native 边界。因子图输入为快照解析结果；处理只读快照，绝不处理原始 session 路径。
 
 Native optimizer 的 skeleton/factor/prior 硬上限统一由生成合同固定为 4096。Swift 必须先严格解释 native disposition，再处理可选 error 字符串，因此 `RESOURCE_REQUIRED + error detail` 仍保持可恢复的资源暂停语义；未知 disposition 或未知 prior kind 都是 ABI/语义错误。C ABI v5 为 quality JSON 提供显式 bounded UTF-8 byte count，并独立携带 runtime ABI、graph/factor SHA、factor count 和 publish count。Swift 以完整 typed DTO 严格解析 quality v3：duplicate/unknown/missing field、Bool 冒充数字、错误类型或越界值均拒绝；随后把 path/disposition、prior-map/session/projection policy identity、graph/factor SHA、`solver.factor_count`、skeleton/trajectory/publish counts 与 request 和 C outcome 精确交叉核对。quality v3 明确记录 `initial_map_pose` gauge authority、普通 robust consensus prior 数和同分量长程闭环数。单一起点 x/y/yaw 只有在同一分量存在节点跨度至少 30 的 RTAB-Map 长程闭环时才具有发布授权；否则保持 `LOCAL_FRAME_ONLY`。顶层 `factor_count` 不得冒充唯一权威路径 `solver.factor_count`，RunSummary 只能从该已验证 DTO 投影，不能再以宽松 `JSONSerialization`/`NSNumber.intValue` 读取安全字段。
 
 `AbsolutePriorEvidenceParser` 为一次处理只构建一个 `NodeIndex`（ID 索引、按 stamp 排序数组、stamp 数组和 duplicate 集合）。constraint/manual 的 top-level、pose 和 candidate 子对象均拒绝未知字段，version/Bool/Int 使用严格 scalar；floor/map/SHA/session、node timebase 恒等式和 disposition 交叉语义必须一致。格式正确、身份一致且正式 `accepted=false` 的 constraint 是正常负证据：计入 `nonAcceptedDetails`、不生成 prior、也不污染 fatal clean gate；坏 schema、身份矛盾或 accepted record 无效仍阻断。manual v2/v3 都重算最近与第二近节点，v3 声明 ID 必须就是真实无歧义最近节点，并交叉核对 ISO/Unix wall time。
+
+记录级证据拒绝与文件/身份损坏严格分层：`manual_event_claimed_node_not_nearest` 等单条 prior 拒绝只排除该因子，写入 degradation audit，其他相对图、有效 prior、轨迹和价签继续处理；地图/楼层/会话身份串包仍终止。tag burst/observation 的单条 schema、node binding 或未消费 frame 同样降级：已有三帧位置 quorum 时保留低置信度价签，否则保留条码占位行、空地图坐标和 `RESCAN_REQUIRED`。JSONL framing、文件超限/不可读、identity mismatch 和不可证明的 durable watermark 仍是 fatal。
 
 `localization_constraints.jsonl` 的产品资格规模是 48 h × 2 Hz = 345,600 条；生成合同使用 400,000 条 parser hard cap、64 KiB 单条上限和 768 MiB 文件上限。处理必须从 `captureHealth.localizationConstraintRecordCount`、`captureHealth.manualLocalizationEventCount` 和 `captureHealth.localizationRecoveryEventCount` 读取严格非负整数，并分别与 constraint/manual/recovery JSONL 的实际原始行数精确一致，不能用已解析、已接受或恢复 episode 内存计数替代持久化行水位。manual 水位只在 durable append 成功后推进；有正水位时 finalization 不得用新建空文件掩盖缺失证据。
 
@@ -45,7 +47,9 @@ building_rescan_tasks → building_workbook → validating_result → committing
 
 Result 发布与 `task.json` 完成态是一个跨两个持久目录的有序事务：隐藏 staging 冻结并独占 rename 为不可变 final Result 后，`task.json` 才从 `committing_result` 推进到 `completed`。任何异常进入通用 terminal persistence 前，pipeline 必须先按 task ID 和 checkpoint 中唯一 result ID 搜索 committed receipt；候选 Result 必须重新验证 exact file set/modes、receipt/manifest、逐文件 bytes/SHA，以及 task/snapshot/map/session/native/policy/processing-path identity。若 final rename 已可见，则显式 fsync Result 与 library parent，并完成或精确重验 `completed` checkpoint，绝不改写为 `failed`；若 completed task writer 在 rename 前失败，状态保持 `committing_result`，重启按同一 receipt 恢复为 `completed`，不得重复导出。receipt 冲突、候选损坏、checkpoint identity 冲突或同一 task 出现多个 Result 一律保留证据并 fail closed，不能当作“没有 Result”继续处理。
 
-取消、系统中断、资源暂停、`RESCAN_SESSION` 和普通工作流失败共用 `MobileTerminalStatePersistence`。Route A 的 Fast 与至多一次 Full 仍不通过，或最终没有任何 publish-eligible trajectory node 时，先在 task root 写入专用 `rescan_session_outcome.json`：exclusive temp write → file fsync → read-only mode → `RENAME_EXCL` → task-root fsync；artifact 严格绑定 task/session/store/floor/prior-map/input-bundle/processing-path/disposition，并明确 `publish_permitted=false`、`result_published=false`。两个字段必须是 JSON Bool；`no_publish_eligible_trajectory` 只配 graph PASS，`graph_quality_failed` 只配 `RECOVERABLE_FAIL` / `NON_RECOVERABLE_FAIL` / `LOCAL_FRAME_ONLY`，`RESOURCE_REQUIRED` 不得伪装为图质量 RESCAN。随后 checkpoint 以 task namespace + SHA-256 引用 artifact，再通过 terminal intent 把 `task.json` 提交为 `rescan_required` / `rescan_session_required`。artifact writer 和 checkpoint writer 的 before-temp、after-temp-fsync、after-rename、after-parent-fsync 边界均有故障注入；rename 已可见后先 stable no-follow 重读并补 parent fsync，只有 exact identity/outcome/reference/SHA 才接受。pre-existing artifact 与 EEXIST race winner 必须在 processing path、graph disposition、reason code 和 human message 上完全等价。该路径不创建普通 Result，不生成 PriceTags、DevicePositions 或 workbook；若同 task 已有普通 committed Result 则保留现场并 fail closed。重启若看到已 fsync artifact 而 task 仍处于旧中间态，会在任何 evidence/native 重跑前恢复 typed `workflow.rescan_session_required`，terminal task 则拒绝原地重启。
+取消、系统中断、资源暂停、`RESCAN_SESSION` 和普通工作流失败共用 `MobileTerminalStatePersistence`。`RESCAN_SESSION` 现在只用于完全没有任何有限轨迹节点的会话（以及读取历史持久 artifact 的兼容路径）；非 PASS、没有 publish-eligible node、单条 prior/tag 证据拒绝都走普通不可变 Result 事务，并设置 `publish_permitted=false`。旧 `rescan_session_outcome.json` 仍按 strict Bool、identity、SHA、exclusive rename 和重启调和合同读取，不能被伪造或与普通 Result 冲突。
+
+普通 Result 的质量状态为 `COMPLETE / PARTIAL_REVIEW_REQUIRED / LOCAL_FRAME_ONLY`。`quality_report.json` v3、RunSummary 和 result manifest 同时记录 `result_quality_status`、`publish_permitted`、降级数量/原因、可用/降级/带坐标/不可用行数。`final_trajectory.jsonl` 与 DevicePositions 对地图坐标和本地诊断坐标使用互斥列；`final_tags.json` 与 PriceTags 即使无法定位也保留条码和失败原因。
 
 通用 terminal 生产调用顺序为：先原子写入并 fsync `terminal_state_intent.json`，再原子更新 `task.json`，成功后删除 intent 并 fsync task root，然后重新抛出原业务错误。`task.json` 在 before-temp-write、after-temp-fsync、after-rename 或 parent-fsync 边界失败时，调用方收到 `DurabilityFailure`，其中同时包含业务 outcome/code/detail、失败阶段、存储错误和当前可读 task state；不得把原业务终态静默报告为已经安全持久化。重启发现 intent 时，只有 task identity、目标 terminal state 和持久化 reason 全部精确一致才允许幂等清除，只有已知非终态阶段才允许推进到 intent 目标；completed、rescan_required、不同终态、同状态不同 reason 或 task identity 冲突一律不修改 `task.json`、不删除 intent 并 fail closed，intent 未调和前不得按普通中间态恢复。
 
@@ -60,7 +64,8 @@ Result 发布与 `task.json` 完成态是一个跨两个持久目录的有序事
 - P8：`task.json` 原子持久化 interrupted 状态。
 - P12：completed 为终态，interrupted 可恢复。
 - P1-11：cancelled / interrupted / resource_required / workflow_failed × before-write / after-temp-fsync / after-rename / parent-fsync 共 16 条真实文件系统故障路径，均验证 typed business+durability error、intent 留存、无 temp 泄漏和重启调和；另以真实文件覆盖 completed+failed intent、cancelled+failed intent、同状态不同 reason 和 task-ID 冲突四类拒绝矩阵。
-- RC RESCAN：Fast + 一次 Full 均失败，以及 graph PASS 但无 publish-eligible trajectory node，均验证专用 artifact 内容/权限/SHA checkpoint、`rescan_required` terminal state、重启不复跑 native、不发布普通 Result；artifact writer 4 边界 + checkpoint writer 4 边界 + terminal writer 4 边界均覆盖，并包含 numeric Bool、reason/disposition、RESOURCE_REQUIRED、EEXIST exact-equivalence 和普通 Result 共存的 adversarial fixture。
+- Partial Result：Fast + 一次 Full 均非 PASS 但存在有限轨迹时提交不可发布 Result；Full `nativeFailed` 回退已验证 Fast partial，Full `invalidOutcome` 继续 fail closed；graph PASS 但无 publish-eligible node 时保留 initial-pose 对齐或 local-frame 主 component，缺 covariance 也保留有限诊断坐标但 uncertainty 为空；验证 map/local 列隔离、跨 component 不插值、不完整 burst 保留条码和 rejected manual prior 不阻断。
+- Legacy RESCAN：strict parser/adversarial fixture 继续覆盖 numeric Bool、reason/disposition、RESOURCE_REQUIRED 和身份/SHA；真正零有限轨迹仍使用该终态。
 - RC committed Result：覆盖 Result commit 的 after-rename / after-parent-fsync，以及 `completed` task writer 的 before-temp-write / after-temp-fsync / after-rename / after-parent-fsync；验证恰好一个不可变 Result、无 failed intent、rename 前 task-write 故障保持 `committing_result` 并在重启精确完成、rename 后精确重读可完成，同时拒绝 receipt 冲突和同 task 多 Result。
 - RC stale task error：`system_interrupted` 与 `resource_pause` 两种恢复路径最终均验证 `completed` 且 `error == nil`。
-- RC scale：300,000 finalization records peak RSS 12,795,904 bytes；1,728,000 trace transition storm 保留 172,801 条且 peak RSS 58,769,408 bytes；200,000 burst frames + 200,000 observations 经 parser→resolver→shelf→fusion→quality gate，peak RSS 670,662,656 bytes，低于 768 MiB host 门。以上不是 target-device performance PASS。
+- RC scale：2026-08-13 最终增量源码完整 host 1/1 PASS（1250.897 s）：300,000 finalization records peak RSS 13,238,272 bytes；1,728,000 trace transition storm 保留 172,801 条且 peak RSS 59,162,624 bytes；200,000 burst frames + 200,000 observations 接受 200,000 条，peak RSS 654,753,792 bytes，低于 768 MiB host 门。以上不是 target-device performance PASS。

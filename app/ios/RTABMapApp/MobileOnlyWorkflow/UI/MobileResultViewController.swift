@@ -22,7 +22,6 @@ final class MobileResultViewController: UIViewController, UITableViewDataSource,
 
         tableView.dataSource = self
         tableView.delegate = self
-        tableView.register(UITableViewCell.self, forCellReuseIdentifier: "cell")
         tableView.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(tableView)
 
@@ -66,7 +65,8 @@ final class MobileResultViewController: UIViewController, UITableViewDataSource,
     }
 
     func tableView(_ tableView: UITableView, cellForRowAt indexPath: IndexPath) -> UITableViewCell {
-        let cell = tableView.dequeueReusableCell(withIdentifier: "cell", for: indexPath)
+        let cell = tableView.dequeueReusableCell(withIdentifier: "cell")
+            ?? UITableViewCell(style: .subtitle, reuseIdentifier: "cell")
         if results.isEmpty {
             cell.textLabel?.text = "暂无结果，请先处理一次扫描。"
             cell.textLabel?.textColor = .secondaryLabel
@@ -74,10 +74,23 @@ final class MobileResultViewController: UIViewController, UITableViewDataSource,
             return cell
         }
         let entry = results[indexPath.row]
-        cell.textLabel?.text = entry.resultID
+        let quality = entry.manifest["result_quality_status"] as? String
+            ?? "COMPLETE"
+        let publish = StrictJSONScalar.boolean(
+            entry.manifest["publish_permitted"]) ?? false
+        cell.textLabel?.text = publish
+            ? "\(entry.resultID) · 可发布"
+            : "\(entry.resultID) · 需要复核"
         cell.textLabel?.textColor = .label
+        let positions = StrictJSONScalar.integer(
+            entry.manifest["coordinate_position_count"])
+            ?? StrictJSONScalar.integer(
+                entry.manifest["available_position_count"]) ?? 0
+        let tags = StrictJSONScalar.integer(entry.manifest["tag_count"]) ?? 0
+        cell.detailTextLabel?.numberOfLines = 2
         cell.detailTextLabel?.text =
-            "workbook SHA \(String(entry.workbookSHA256.prefix(16))) · \(entry.manifest["task_id"] as? String ?? "")"
+            "\(quality) · 坐标 \(positions) · 价签 \(tags)\n"
+            + "workbook SHA \(String(entry.workbookSHA256.prefix(16)))"
         cell.accessoryType = .disclosureIndicator
         return cell
     }

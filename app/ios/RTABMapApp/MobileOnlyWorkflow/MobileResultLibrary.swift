@@ -218,7 +218,9 @@ enum MobileResultLibrary {
         "policy_sha", "projection_policy_version",
         "trajectory_sha256", "graph_quality_sha256",
         "device_position_count", "available_position_count",
-        "tag_count", "rescan_count",
+        "degraded_position_count", "coordinate_position_count",
+        "tag_count", "rescan_count", "result_quality_status",
+        "publish_permitted", "degradation_count",
     ]
 
     /// Test/embedding hook; see `MobileMapLibrary.rootOverride`.
@@ -2910,6 +2912,28 @@ enum MobileResultLibrary {
         // them.
         for key in manifest.keys where !allowedManifestKeys.contains(key) {
             throw ResultError.invalidManifest("unknown manifest field: \(key)")
+        }
+        if let rawStatus = manifest["result_quality_status"] {
+            guard let status = rawStatus as? String,
+                  ["COMPLETE", "PARTIAL_REVIEW_REQUIRED", "LOCAL_FRAME_ONLY"]
+                    .contains(status),
+                  let publish = StrictJSONScalar.boolean(
+                    manifest["publish_permitted"]),
+                  publish == (status == "COMPLETE"),
+                  let degradationCount = StrictJSONScalar.integer(
+                    manifest["degradation_count"]), degradationCount >= 0,
+                  let degradedPositionCount = StrictJSONScalar.integer(
+                    manifest["degraded_position_count"]),
+                  degradedPositionCount >= 0,
+                  let coordinatePositionCount = StrictJSONScalar.integer(
+                    manifest["coordinate_position_count"]),
+                  coordinatePositionCount >= 0,
+                  let devicePositionCount = StrictJSONScalar.integer(
+                    manifest["device_position_count"]),
+                  coordinatePositionCount <= devicePositionCount else {
+                throw ResultError.invalidManifest(
+                    "result quality/degradation fields invalid")
+            }
         }
         // Exact artifact contract: unique safe basenames, exact count and
         // an artifact file set that equals package_files exactly.

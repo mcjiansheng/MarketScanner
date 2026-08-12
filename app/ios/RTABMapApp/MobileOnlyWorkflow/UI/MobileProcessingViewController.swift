@@ -118,18 +118,33 @@ final class MobileProcessingViewController: UIViewController,
             switch result {
             case .success(let entry):
                 self.progressView.setProgress(1.0, animated: true)
-                self.statusLabel.text =
-                    "完成：\(entry.manifest["workbook"] as? String ?? "workbook")（SHA \(String(entry.workbookSHA256.prefix(12)))）"
+                let quality = entry.manifest["result_quality_status"] as? String
+                    ?? "COMPLETE"
+                let publish = StrictJSONScalar.boolean(
+                    entry.manifest["publish_permitted"]) ?? false
+                let positions = StrictJSONScalar.integer(
+                    entry.manifest["coordinate_position_count"])
+                    ?? StrictJSONScalar.integer(
+                        entry.manifest["available_position_count"]) ?? 0
+                let tags = StrictJSONScalar.integer(
+                    entry.manifest["tag_count"]) ?? 0
+                if publish {
+                    self.statusLabel.text =
+                        "处理完成：已保留 \(positions) 条每秒坐标、\(tags) 个价签。"
+                } else {
+                    self.statusLabel.text =
+                        "处理完成（\(quality)，需要复核）：已保留 "
+                        + "\(positions) 条坐标、\(tags) 个价签；结果不可直接发布。"
+                }
                 self.pushResult(entry)
             case .failure(let error):
                 self.progressView.setProgress(0.0, animated: true)
                 if case .rescanSessionRequired(let detail) = error {
                     self.statusLabel.text = "需要重新扫描整个会话：\(detail)"
                     self.presentNotice(
-                        "本会话的快速优化和一次全图优化仍未达到发布门槛，"
-                        + "或最终轨迹没有可发布节点。\n\n"
+                        "本会话没有任何可读取的有限轨迹节点。\n\n"
                         + "系统已安全保存 RESCAN_SESSION 记录；本次没有发布 "
-                        + "PriceTags、DevicePositions 或普通结果。请重新扫描整个会话。")
+                        + "普通结果。请重新扫描整个会话。")
                 } else {
                     // MobileOnlyWorkflowError already owns the localized
                     // stage prefix. Do not produce "处理失败：处理失败：…" or

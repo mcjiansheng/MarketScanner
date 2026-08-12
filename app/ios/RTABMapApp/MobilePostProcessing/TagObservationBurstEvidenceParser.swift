@@ -163,6 +163,15 @@ struct VerifiedTagBurstFrame: Equatable {
 }
 
 final class TagObservationBurstEvidenceParseResult {
+    struct UnconsumedBurstSummary: Equatable {
+        let burstID: String
+        let barcode: String
+        let symbology: String
+        let floorID: String
+        let trackingSessionID: String
+        let missingObservationCount: Int
+    }
+
     struct StoredFrame {
         let frame: VerifiedTagBurstFrame
         var consumed: Bool
@@ -229,6 +238,35 @@ final class TagObservationBurstEvidenceParseResult {
         guard remainingFrameCount == 0 else { return false }
         frameByObservationID.removeAll(keepingCapacity: false)
         return true
+    }
+
+    /// Returns one bounded diagnostic per affected burst, then releases the
+    /// full frame index regardless of whether every authoritative frame had a
+    /// matching observation. Missing observations make that tag incomplete;
+    /// they do not invalidate the phone trajectory or unrelated tags.
+    func releaseFramesWithIncompleteBurstAudit() -> [UnconsumedBurstSummary] {
+        var missingByBurstIndex: [Int: Int] = [:]
+        missingByBurstIndex.reserveCapacity(min(bursts.count, 64))
+        for stored in frameByObservationID.values where !stored.consumed {
+            missingByBurstIndex[stored.frame.burstIndex, default: 0] += 1
+        }
+        let summaries: [UnconsumedBurstSummary] = missingByBurstIndex.keys
+            .sorted().compactMap { index -> UnconsumedBurstSummary? in
+            guard let burst = burst(at: index),
+                  let count = missingByBurstIndex[index], count > 0 else {
+                return nil
+            }
+            return UnconsumedBurstSummary(
+                burstID: burst.burstID,
+                barcode: burst.barcode,
+                symbology: burst.symbology,
+                floorID: burst.floorID,
+                trackingSessionID: burst.trackingSessionID,
+                missingObservationCount: count)
+        }
+        frameByObservationID.removeAll(keepingCapacity: false)
+        remainingFrameCount = 0
+        return summaries
     }
 
     var clean: Bool {
@@ -333,6 +371,11 @@ enum TagObservationBurstEvidenceParser {
         var seenBurstIDs = Set<String>()
         var seenFrameIDs = Set<String>()
         var previousSequence: Int?
+        // Metadata count tracks durable JSONL records, not records that later
+        // pass semantic validation. Keep the raw watermark independent so a
+        // malformed burst becomes a bounded degradation instead of erasing
+        // the otherwise usable trajectory and unrelated tags.
+        var lastObservedBurstID: String?
 
         do {
             _ = try StrictJSONLStreamReader.forEachLine(
@@ -350,6 +393,9 @@ enum TagObservationBurstEvidenceParser {
                 } catch {
                     reject(&audit, line.number, "invalid_json", \.recordSchemaRejected)
                     return
+                }
+                if let observedBurstID = nonEmptyString(object["burst_id"]) {
+                    lastObservedBurstID = observedBurstID
                 }
                 guard object.keys.allSatisfy(knownFields.contains) else {
                     reject(&audit, line.number, "unknown_field", \.recordSchemaRejected)
@@ -530,12 +576,16 @@ enum TagObservationBurstEvidenceParser {
                 error.localizedDescription)
         }
 
-        guard bursts.count == expectedBurstCount else {
+        guard audit.recordTotal == expectedBurstCount else {
             throw TagObservationBurstEvidenceParseError
-                .expectedCountMismatch(bursts.count, expectedBurstCount)
+                .expectedCountMismatch(audit.recordTotal, expectedBurstCount)
         }
-        let actualLastID = bursts.last?.burstID
-        guard actualLastID == expectedLastBurstID else {
+        // Count plus strict final-newline framing still detects truncation. If
+        // the final persisted JSON is malformed and has no decodable ID, its
+        // record rejection already degrades the result; a parseable conflicting
+        // ID remains a hard watermark mismatch.
+        let actualLastID = lastObservedBurstID
+        guard actualLastID == nil || actualLastID == expectedLastBurstID else {
             throw TagObservationBurstEvidenceParseError
                 .expectedLastIDMismatch(actualLastID, expectedLastBurstID)
         }

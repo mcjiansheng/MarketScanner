@@ -5049,7 +5049,12 @@ enum PersistentTaskCoordinator {
                 return next == .deepReprocessing
                     || next == .buildingTrajectory
             case .deepReprocessing:
+                // The optional Full solver may fail after the Fast outcome
+                // has already been strictly validated. In that narrow case
+                // the pipeline continues with a non-publishable Fast partial
+                // result and legitimately advances straight to trajectory.
                 return next == .deepOptimizing
+                    || next == .buildingTrajectory
             case .deepOptimizing:
                 return next == .buildingTrajectory
             case .buildingTrajectory:

@@ -246,9 +246,12 @@ enum MobileNativeFactorGraph {
         var trajectory: [MobileNativeTrajectoryRow] = []
         trajectory.reserveCapacity(Int(count))
         var seenIDs = Set<Int64>()
-        // §10.4: stamps must be monotonic within each component.
-        var lastStampByComponent: [Int64: Double] = [:]
-        var lastGlobalStamp: Double?
+        // §10.4: stamps must be monotonic within each component. Different
+        // disconnected components are emitted in deterministic topology
+        // order, not necessarily in one global timestamp order; imposing a
+        // cross-component monotonic gate would reject a valid native result.
+        // The processing pipeline sorts the validated rows by stamp before
+        // building the one-hertz business trajectory.
         if count > 0, let rows = cOutcome.rows {
             for index in 0..<Int(count) {
                 let row = rows[index]
@@ -284,17 +287,6 @@ enum MobileNativeFactorGraph {
                     throw MobileNativeFactorGraphError.invalidOutcome(
                         "uncertainty invalid at id \(row.id): \(row.uncertainty_m)")
                 }
-                if let previous = lastStampByComponent[row.component_id],
-                   row.stamp < previous {
-                    throw MobileNativeFactorGraphError.invalidOutcome(
-                        "non-monotonic stamp at id \(row.id) in component \(row.component_id)")
-                }
-                if let previous = lastGlobalStamp, row.stamp < previous {
-                    throw MobileNativeFactorGraphError.invalidOutcome(
-                        "globally non-monotonic stamp at id \(row.id)")
-                }
-                lastStampByComponent[row.component_id] = row.stamp
-                lastGlobalStamp = row.stamp
                 trajectory.append(MobileNativeTrajectoryRow(
                     id: row.id,
                     stamp: row.stamp,
@@ -307,6 +299,8 @@ enum MobileNativeFactorGraph {
                     uncertaintyM: row.uncertainty_m.isNaN ? nil : row.uncertainty_m))
             }
         }
+        try MobileNativeOutcomeContract.validateComponentTimestampOrder(
+            trajectory)
 
         // §10.4: skeleton IDs are unique, a subset of the trajectory,
         // and carry finite poses.

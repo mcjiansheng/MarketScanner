@@ -688,6 +688,24 @@ enum MobileNativeOutcomeContract {
         GeneratedMobileEvidenceContracts.File_native_graph.max_priors)
     static let maximumQualityJSONBytes = 1024 * 1024
 
+    /// Native topology order may move between disconnected components whose
+    /// timestamp ranges overlap or run backwards globally. Only ordering
+    /// inside one component is authoritative. This Foundation-only contract
+    /// is shared by the C bridge and the host suite.
+    static func validateComponentTimestampOrder(
+        _ rows: [MobileNativeTrajectoryRow]
+    ) throws {
+        var lastStampByComponent: [Int64: Double] = [:]
+        for row in rows {
+            if let previous = lastStampByComponent[row.componentID],
+               row.stamp < previous {
+                throw MobileNativeFactorGraphError.invalidOutcome(
+                    "non-monotonic stamp at id \(row.id) in component \(row.componentID)")
+            }
+            lastStampByComponent[row.componentID] = row.stamp
+        }
+    }
+
     /// Disposition is the authoritative branch signal and must be decoded
     /// before interpreting the optional native error string. In particular,
     /// native resource failures commonly carry both RESOURCE_REQUIRED and an

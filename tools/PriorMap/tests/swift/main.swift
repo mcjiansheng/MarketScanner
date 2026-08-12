@@ -10157,6 +10157,147 @@ catch {
     require(false, "T1 basic 1 Hz resampling failed: \(error)")
 }
 
+// Partial-result coordinate contract: disconnected components never
+// interpolate into each other; unaligned diagnostics populate local_* only;
+// an initial-map pose may align one component for review without claiming it
+// is a publishable AVAILABLE trajectory.
+do {
+    let mapper = MonotonicUTCMapper(samples: [
+        .init(monotonicSeconds: 0, utcUnixSeconds: 1_785_762_100,
+              utcOffsetSeconds: 28_800, timezoneID: "Asia/Shanghai"),
+        .init(monotonicSeconds: 2, utcUnixSeconds: 1_785_762_102,
+              utcOffsetSeconds: 28_800, timezoneID: "Asia/Shanghai"),
+    ], discontinuityEdges: [])
+    let localRows = FinalTrajectory.resample(
+        input: FinalTrajectory.Input(
+            nodes: [
+                .init(id: 1, monotonicSeconds: 0, xM: 10, yM: 20,
+                      yawRad: 0, uncertaintyM: nil, floorID: "1",
+                      componentID: 1),
+                .init(id: 2, monotonicSeconds: 2, xM: 12, yM: 20,
+                      yawRad: 0, uncertaintyM: nil, floorID: "1",
+                      componentID: 1),
+            ],
+            lostIntervals: [],
+            sessionStartUTC: 1_785_762_100,
+            sessionEndUTC: 1_785_762_102,
+            graphQualityStatus: "RECOVERABLE_FAIL",
+            positionSource: "native_local_frame_diagnostic",
+            coordinatesArePriorMapFrame: false,
+            allowUnverifiedCoordinatesWithoutUncertainty: true),
+        utcMapper: mapper, storeID: "s1",
+        priorMapID: "m", priorMapSha256: "a",
+        trackingSessionID: "s", appGitSHA: "g")
+    require(
+        localRows.count == 3
+            && localRows.allSatisfy {
+                $0.positionStatus == "LOCAL_FRAME_ONLY"
+                    && $0.mapXM == nil && $0.mapYM == nil && $0.yawDeg == nil
+                    && $0.localXM != nil && $0.localYM != nil
+                    && $0.coordinateFrame == "LOCAL_DIAGNOSTIC"
+            },
+        "partial local trajectory must never masquerade as prior-map coordinates")
+
+    let componentRows = FinalTrajectory.resample(
+        input: FinalTrajectory.Input(
+            nodes: [
+                .init(id: 1, monotonicSeconds: 0, xM: 0, yM: 0,
+                      yawRad: 0, uncertaintyM: 0.1, floorID: "1",
+                      componentID: 1),
+                .init(id: 2, monotonicSeconds: 1, xM: 1, yM: 0,
+                      yawRad: 0, uncertaintyM: 0.1, floorID: "1",
+                      componentID: 1),
+                .init(id: 3, monotonicSeconds: 1.5, xM: 50, yM: 50,
+                      yawRad: 0, uncertaintyM: 0.1, floorID: "1",
+                      componentID: 2),
+            ],
+            lostIntervals: [],
+            sessionStartUTC: 1_785_762_100,
+            sessionEndUTC: 1_785_762_102),
+        utcMapper: mapper, storeID: "s1",
+        priorMapID: "m", priorMapSha256: "a",
+        trackingSessionID: "s", appGitSHA: "g")
+    require(
+        componentRows[2].positionStatus == "UNAVAILABLE",
+        "final trajectory must not interpolate across disconnected components")
+
+    let nativeRows = [
+        MobileNativeTrajectoryRow(
+            id: 1, stamp: 100, xM: 1, yM: 2, yawRad: 0,
+            mapID: 0, componentID: 7, publishEligible: false,
+            uncertaintyM: nil),
+        MobileNativeTrajectoryRow(
+            id: 2, stamp: 101, xM: 2, yM: 2, yawRad: 0,
+            mapID: 0, componentID: 7, publishEligible: false,
+            uncertaintyM: nil),
+        MobileNativeTrajectoryRow(
+            id: 3, stamp: 50, xM: 99, yM: 99, yawRad: 0,
+            mapID: 0, componentID: 8, publishEligible: false,
+            uncertaintyM: nil),
+    ]
+    let initial = MobileAbsolutePrior(
+        nodeID: 1, mapXM: 10, mapYM: 20, mapYawRad: Double.pi / 2,
+        information3x3: [1, 0, 0, 0, 1, 0, 0, 0, 1],
+        kind: 3, episodeID: 0)
+    let aligned = MobileProcessingPipeline.diagnosticTrajectorySelection(
+        rows: nativeRows, graphQualityPassed: true,
+        initialMapPose: initial, floorID: "1")
+    require(
+        aligned.rows.count == 2
+            && aligned.rows.allSatisfy { $0.componentID == 7 }
+            && aligned.coordinatesArePriorMapFrame
+            && aligned.positionSource == "diagnostic_initial_map_pose"
+            && close(aligned.rows[0].xM, 10)
+            && close(aligned.rows[0].yM, 20)
+            && !aligned.rows[0].publishEligible,
+        "PASS without publish nodes must retain a non-publishable map-aligned diagnostic component")
+    let alignedMapper = MonotonicUTCMapper(samples: [
+        .init(monotonicSeconds: 0, utcUnixSeconds: 1_785_762_200,
+              utcOffsetSeconds: 28_800, timezoneID: "Asia/Shanghai"),
+        .init(monotonicSeconds: 1, utcUnixSeconds: 1_785_762_201,
+              utcOffsetSeconds: 28_800, timezoneID: "Asia/Shanghai"),
+    ], discontinuityEdges: [])
+    let alignedRows = FinalTrajectory.resample(
+        input: FinalTrajectory.Input(
+            nodes: aligned.rows.map {
+                FinalTrajectory.Node(
+                    id: $0.id, monotonicSeconds: $0.stamp - 100,
+                    xM: $0.xM, yM: $0.yM, yawRad: $0.yawRad,
+                    uncertaintyM: $0.uncertaintyM, floorID: "1",
+                    componentID: $0.componentID)
+            },
+            lostIntervals: [],
+            sessionStartUTC: 1_785_762_200,
+            sessionEndUTC: 1_785_762_201,
+            graphQualityStatus: "PASS",
+            positionSource: aligned.positionSource,
+            coordinatesArePriorMapFrame: true,
+            allowUnverifiedCoordinatesWithoutUncertainty: true),
+        utcMapper: alignedMapper, storeID: "s1",
+        priorMapID: "m", priorMapSha256: "a",
+        trackingSessionID: "s", appGitSHA: "g")
+    require(
+        alignedRows.count == 2
+            && alignedRows.allSatisfy {
+                $0.positionStatus == "DEGRADED_MAP_ALIGNED"
+                    && $0.mapXM != nil && $0.mapYM != nil
+                    && $0.estimatedUncertaintyM == nil
+            },
+        "PASS without publish nodes must keep finite diagnostic coordinates even when covariance is unavailable")
+
+    let localSelection = MobileProcessingPipeline.diagnosticTrajectorySelection(
+        rows: nativeRows, graphQualityPassed: false,
+        initialMapPose: nil, floorID: "1")
+    require(
+        localSelection.rows.count == 2
+            && localSelection.rows.allSatisfy { $0.componentID == 7 }
+            && !localSelection.coordinatesArePriorMapFrame,
+        "local diagnostic selection must retain one deterministic primary component")
+}
+catch {
+    require(false, "partial-result coordinate contract failed: \(error)")
+}
+
 // T3: yaw crossing ±pi interpolates the shortest way.
 do {
     var records: [ClockCorrelationRecord] = []
@@ -11439,11 +11580,16 @@ do {
             insufficientPositionEvidence,
             shelves: [segmentLow])
     require(
-        insufficientPositionTags.isEmpty
+        insufficientPositionTags.count == 1
+            && insufficientPositionTags[0].qualityStatus == "RESCAN_REQUIRED"
+            && insufficientPositionTags[0].mapXM == nil
+            && insufficientPositionTags[0].mapYM == nil
+            && insufficientPositionTags[0].reason
+                == "unlocalized_observation"
             && insufficientPositionRescans.count == 1
             && insufficientPositionRescans[0].reasonCode
                 == "unlocalized_observation",
-        "fewer than three recomputable frames must keep the whole burst RESCAN_REQUIRED")
+        "fewer than three recomputable frames must preserve a RESCAN_REQUIRED tag row")
 
     let (unassociatedTags, unassociatedRescans) = try finalizeBucketEvidence(
         finalizerEvidence(
@@ -14554,10 +14700,9 @@ do {
         "RC-H24 quarantine must preserve payload plus durable diagnostic")
 
     // =================================================================
-    // RC RESCAN terminal outcome: Route A graph/no-trajectory rejection
-    // is a durable, restart-safe, product-visible RESCAN_SESSION state.
-    // It never publishes PriceTags, DevicePositions, workbook, or Result.
-    // Runs BEFORE §15 because that block deletes the source session.
+    // Historical RESCAN_SESSION transaction compatibility. New non-PASS
+    // runs publish a PARTIAL/NOT_PUBLISHABLE Result, but previously durable
+    // terminal artifacts still require strict immutable recovery semantics.
     // =================================================================
     do {
         let savedFast = MobileNativeFactorGraphGateway.runFastImplementation
@@ -14621,67 +14766,134 @@ do {
             osVersion: "macos",
             nativeCoreSHA256: "",
             policySHA: "host-policy-v1")
-        var typedRescanObserved = false
-        do {
-            _ = try MobileProcessingPipeline.run(
-                request: gateNRequest, progress: { _, _ in }, isCancelled: { false })
-        } catch let error as MobileOnlyWorkflowError {
-            if case .rescanSessionRequired = error {
-                typedRescanObserved = error.code == "workflow.rescan_session_required"
-            } else {
-                require(false, "RC RESCAN graph failure typed error wrong: \(error)")
-            }
-        }
-        require(typedRescanObserved, "RC RESCAN graph failure must use stable typed code")
+        let gateNOutcome = try MobileProcessingPipeline.run(
+            request: gateNRequest, progress: { _, _ in }, isCancelled: { false })
         require(
             fastInvocationCount == 1 && fullInvocationCount == 1,
-            "RC RESCAN Route A must run Fast once and Full at most once")
+            "partial-result Route A must run Fast once and Full at most once")
         let gateNRecord = try PersistentTaskCoordinator.read(taskRoot: gateNTaskRoot)
         require(
-            gateNRecord.state == .rescanRequired
-                && gateNRecord.error == "rescan_session_required",
-            "RC RESCAN task terminal state/reason must be exact")
-        require(!PersistentTaskCoordinator.isResumable(gateNRecord),
-            "RC RESCAN terminal task must not be resumed as ordinary work")
-        let gateNRescanURL = gateNTaskRoot.appendingPathComponent(
+            gateNRecord.state == .completed && gateNRecord.error == nil,
+            "non-PASS finite trajectory must commit a completed partial Result")
+        require(
+            MobileResultLibrary.listResults().count == resultCountBefore + 1
+                && gateNOutcome.resultEntry.manifest["result_quality_status"]
+                    as? String == "LOCAL_FRAME_ONLY"
+                && gateNOutcome.resultEntry.manifest["publish_permitted"]
+                    as? Bool == false
+                && (gateNOutcome.resultEntry.manifest["degradation_count"]
+                    as? Int ?? 0) > 0,
+            "non-PASS graph must preserve a non-publishable partial Result")
+
+        // A deeper-solver failure is not allowed to erase a Fast outcome
+        // that already passed the strict native contract. The result remains
+        // non-publishable and records the exact fallback reason. Conversely,
+        // invalid ABI/outcome memory is never eligible for this fallback.
+        MobileNativeFactorGraphGateway.runFullGraphImplementation = {
+            _, _ in
+            throw MobileNativeFactorGraphError.nativeFailed(
+                "host full solver did not converge")
+        }
+        let fullFallbackTaskRoot = try MobileProcessingTaskStore.createTask(
+            taskID: "gate-n-full-fallback")
+        var fullFallbackRequest = gateNRequest
+        fullFallbackRequest.taskRoot = fullFallbackTaskRoot
+        let fullFallbackOutcome = try MobileProcessingPipeline.run(
+            request: fullFallbackRequest,
+            progress: { _, _ in }, isCancelled: { false })
+        require(
+            fullFallbackOutcome.resultEntry.manifest["processing_path"]
+                as? String == "fast_fallback_after_full_graph_failure"
+                && fullFallbackOutcome.resultEntry.manifest[
+                    "result_quality_status"] as? String != "COMPLETE"
+                && fullFallbackOutcome.resultEntry.manifest[
+                    "publish_permitted"] as? Bool == false,
+            "Full solver failure must commit the validated Fast partial result")
+        let fullFallbackQuality = try JSONSerialization.jsonObject(
+            with: Data(contentsOf: fullFallbackOutcome.resultEntry.directory
+                .appendingPathComponent("quality_report.json"))) as! [String: Any]
+        let fullFallbackResult = fullFallbackQuality["result"]
+            as! [String: Any]
+        let fullFallbackDegradations = fullFallbackResult["degradations"]
+            as! [[String: Any]]
+        require(
+            fullFallbackDegradations.contains {
+                $0["code"] as? String
+                    == "full_graph_failed_fallback_to_fast"
+            },
+            "Full-to-Fast fallback must be explicit in quality_report.json")
+
+        MobileNativeFactorGraphGateway.runFullGraphImplementation = {
+            _, _ in
+            throw MobileNativeFactorGraphError.invalidOutcome(
+                "host forged trajectory pointer")
+        }
+        let invalidFullTaskRoot = try MobileProcessingTaskStore.createTask(
+            taskID: "gate-n-invalid-full-outcome")
+        var invalidFullRequest = gateNRequest
+        invalidFullRequest.taskRoot = invalidFullTaskRoot
+        var invalidFullRejected = false
+        do {
+            _ = try MobileProcessingPipeline.run(
+                request: invalidFullRequest,
+                progress: { _, _ in }, isCancelled: { false })
+        } catch let error as MobileOnlyWorkflowError {
+            if case .processingFailed(let detail) = error {
+                invalidFullRejected = detail.contains("结果不可信")
+            }
+        }
+        require(
+            invalidFullRejected,
+            "invalid Full ABI/outcome must remain fatal instead of falling back")
+
+        // Build a legacy terminal artifact payload directly so the immutable
+        // recovery/parser contract below remains covered.
+        let legacyTaskRoot = try MobileProcessingTaskStore.createTask(
+            taskID: "legacy-rescan-template")
+        var legacyRequest = gateNRequest
+        legacyRequest.taskRoot = legacyTaskRoot
+        let legacySnapshot = try SessionSnapshotTransaction.snapshot(
+            finalizedSession: session,
+            sourceDatabase: session.appendingPathComponent(
+                "rtabmap_segment_0001.db"),
+            taskRoot: legacyTaskRoot)
+        let legacyCheckpoint = PersistentTaskCheckpoint.snapshotCheckpoint(
+            request: legacyRequest, snapshot: legacySnapshot, retryCount: 0)
+        let legacyTask = RescanTask(
+            taskID: "legacy-rescan-task", taskType: .insufficientLoop,
+            floorID: "1", barcode: "", tagInstanceID: nil,
+            shelfCode: "", shelfSegmentID: "", regionStartCm: nil,
+            regionEndCm: nil, localStartTime: "", localEndTime: "",
+            reasonCode: "graph_quality_failed",
+            humanMessage: "legacy graph quality failed",
+            suggestedAction: "RESCAN_SESSION", priority: 1)
+        do {
+            try MobileProcessingPipeline.persistSessionRescanOutcome(
+                request: legacyRequest,
+                snapshot: legacySnapshot,
+                processingPath: "full_graph_optimization",
+                graphDisposition: "RECOVERABLE_FAIL",
+                reasonCode: "graph_quality_failed",
+                humanMessage: legacyTask.humanMessage,
+                rescanTask: legacyTask,
+                checkpoint: legacyCheckpoint)
+            require(false, "legacy RESCAN template must throw typed terminal outcome")
+        } catch MobileOnlyWorkflowError.rescanSessionRequired {
+            // Expected.
+        }
+        let gateNRescanURL = legacyTaskRoot.appendingPathComponent(
             MobileProcessingPipeline.sessionRescanArtifactFileName)
         let gateNRescanData = try Data(contentsOf: gateNRescanURL)
         let gateNRescan = try JSONSerialization.jsonObject(
             with: gateNRescanData) as! [String: Any]
-        require(
-            gateNRescan["terminal_outcome"] as? String == "RESCAN_SESSION"
-                && gateNRescan["reason_code"] as? String == "graph_quality_failed"
-                && gateNRescan["publish_permitted"] as? Bool == false
-                && gateNRescan["result_published"] as? Bool == false,
-            "RC RESCAN artifact must encode terminal action and no-publish invariant")
-        let gateNRescanTasks = gateNRescan["rescan_tasks"] as! [String: Any]
-        let gateNTasks = gateNRescanTasks["tasks"] as! [[String: Any]]
-        require(
-            gateNRescanTasks["count"] as? Int == 1
-                && gateNTasks[0]["task_type"] as? String == "INSUFFICIENT_LOOP"
-                && gateNTasks[0]["reason_code"] as? String == "graph_quality_failed"
-                && gateNTasks[0]["suggested_action"] as? String == "RESCAN_SESSION",
-            "RC RESCAN graph task payload must be complete")
-        var artifactStat = stat()
-        require(lstat(gateNRescanURL.path, &artifactStat) == 0
-                && (artifactStat.st_mode & S_IFMT) == S_IFREG
-                && artifactStat.st_nlink == 1
-                && (artifactStat.st_mode & mode_t(0o222)) == 0,
-            "RC RESCAN artifact must be one read-only regular file")
-        let artifactSHA = SHA256.hash(data: gateNRescanData).map {
+        let legacyArtifactSHA = SHA256.hash(data: gateNRescanData).map {
             String(format: "%02x", $0)
         }.joined()
-        let terminalBinding = gateNRecord.checkpoint?["terminal_outcome"]
-            as? [String: Any]
-        require(
-            terminalBinding?["code"] as? String == "RESCAN_SESSION"
-                && terminalBinding?["artifact"] as? String
-                    == "task:\(MobileProcessingPipeline.sessionRescanArtifactFileName)"
-                && terminalBinding?["sha256"] as? String == artifactSHA,
-            "RC RESCAN checkpoint must hash-bind the task-local artifact")
-        require(
-            MobileResultLibrary.listResults().count == resultCountBefore,
-            "RC RESCAN graph rejection must not publish an ordinary Result")
+        try MobileProcessingPipeline.validateSessionRescanArtifact(
+            taskRoot: legacyTaskRoot,
+            request: legacyRequest,
+            inputBundleSHA256: legacySnapshot.bundleSHA256,
+            expectedSHA256: legacyArtifactSHA)
 
         // Adversarial artifact parser fixtures: JSON numeric 0/1 cannot
         // impersonate Bool, and reason/disposition combinations are a
@@ -14790,388 +15002,12 @@ do {
             graphFailureResource,
             label: "graph-quality-failed + RESOURCE_REQUIRED")
 
-        // EEXIST race fixtures: after the production temp file is fsynced,
-        // publish a different but individually valid artifact at the final
-        // path. The writer must compare the race winner with its intended
-        // outcome field-for-field. Any conflict stays fail-closed without
-        // generic failed terminalization or mutation of the winning bytes.
-        enum RescanEquivalenceConflict {
-            case processingPath
-            case disposition
-            case reason
-            case humanMessage
-        }
-        let equivalenceConflicts: [(String, RescanEquivalenceConflict)] = [
-            ("processing-path", .processingPath),
-            ("disposition", .disposition),
-            ("reason", .reason),
-            ("human-message", .humanMessage),
-        ]
-        for (label, conflict) in equivalenceConflicts {
-            let taskRoot = try MobileProcessingTaskStore.createTask(
-                taskID: "rescan-eexist-conflict-\(label)")
-            var request = gateNRequest
-            request.taskRoot = taskRoot
-            var winningBytes: Data?
-            MobileProcessingPipeline.sessionRescanArtifactWriteFaultInjector = {
-                stage in
-                guard stage == .afterTemporaryFsync else { return }
-                let temporaryNames = try FileManager.default.contentsOfDirectory(
-                    atPath: taskRoot.path).filter {
-                        $0.hasPrefix(".rescan-session-outcome.tmp-")
-                    }
-                require(temporaryNames.count == 1,
-                    "RC RESCAN EEXIST fixture must find one production temp")
-                let temporaryURL = taskRoot.appendingPathComponent(
-                    temporaryNames[0])
-                var payload = try JSONSerialization.jsonObject(
-                    with: Data(contentsOf: temporaryURL)) as! [String: Any]
-                switch conflict {
-                case .processingPath:
-                    payload["processing_path"] = "fast"
-                case .disposition:
-                    payload["graph_disposition"] = "NON_RECOVERABLE_FAIL"
-                case .reason:
-                    payload["reason_code"] = "no_publish_eligible_trajectory"
-                    payload["graph_disposition"] = "PASS"
-                    updateRescanTaskPayload(
-                        &payload,
-                        reasonCode: "no_publish_eligible_trajectory",
-                        taskType: MobileWorksheets.RescanTaskType
-                            .weakLocalization.rawValue)
-                case .humanMessage:
-                    let message = "conflicting EEXIST outcome"
-                    payload["human_message"] = message
-                    updateRescanTaskPayload(
-                        &payload,
-                        reasonCode: "graph_quality_failed",
-                        taskType: MobileWorksheets.RescanTaskType
-                            .insufficientLoop.rawValue,
-                        humanMessage: message)
-                }
-                let data = try CanonicalJSONEncoder.encode(payload)
-                let finalURL = taskRoot.appendingPathComponent(
-                    MobileProcessingPipeline.sessionRescanArtifactFileName)
-                try data.write(to: finalURL, options: .withoutOverwriting)
-                require(chmod(finalURL.path, 0o400) == 0,
-                    "RC RESCAN EEXIST race winner must be read-only")
-                winningBytes = data
-            }
-            var observedCheckpointError = false
-            do {
-                _ = try MobileProcessingPipeline.run(
-                    request: request,
-                    progress: { _, _ in },
-                    isCancelled: { false })
-            } catch let error as PersistentTaskCheckpoint.CheckpointError {
-                if case .invalidRecord(let detail) = error {
-                    observedCheckpointError = detail.contains(
-                        "conflicting RESCAN_SESSION publication")
-                }
-            }
-            MobileProcessingPipeline.sessionRescanArtifactWriteFaultInjector = nil
-            let record = try PersistentTaskCoordinator.read(taskRoot: taskRoot)
-            let finalBytes = try Data(contentsOf: taskRoot.appendingPathComponent(
-                MobileProcessingPipeline.sessionRescanArtifactFileName))
-            let intent = try MobileTerminalStatePersistence.readIntentIfPresent(
-                taskRoot: taskRoot)
-            require(observedCheckpointError,
-                "RC RESCAN EEXIST \(label) conflict must fail closed")
-            require(record.state != .failed && record.state != .rescanRequired
-                    && record.error == nil && intent == nil,
-                "RC RESCAN EEXIST \(label) must not terminalize task")
-            require(winningBytes != nil && finalBytes == winningBytes,
-                "RC RESCAN EEXIST \(label) must not alter race winner")
-            require(MobileResultLibrary.listResults().count == resultCountBefore,
-                "RC RESCAN EEXIST \(label) must not publish Result")
-        }
-
-        // Real-filesystem restart simulation: retain the durable artifact
-        // but roll task.json back to the last pre-terminal graph stage,
-        // exactly as a process crash can expose after artifact fsync. The
-        // next run must detect the artifact before either native path.
-        var crashRecord = gateNRecord
-        crashRecord.state = .deepOptimizing
-        crashRecord.error = nil
-        if var checkpoint = crashRecord.checkpoint {
-            checkpoint.removeValue(forKey: "terminal_outcome")
-            checkpoint["durable_outputs"] = (checkpoint["durable_outputs"] as? [String] ?? [])
-                .filter { !$0.hasSuffix(
-                    MobileProcessingPipeline.sessionRescanArtifactFileName) }
-            crashRecord.checkpoint = checkpoint
-        }
-        try PersistentTaskCoordinator.write(crashRecord, taskRoot: gateNTaskRoot)
-        fastInvocationCount = 0
-        fullInvocationCount = 0
-        var restartRescanObserved = false
-        do {
-            _ = try MobileProcessingPipeline.run(
-                request: gateNRequest, progress: { _, _ in }, isCancelled: { false })
-        } catch let error as MobileOnlyWorkflowError {
-            if case .rescanSessionRequired = error { restartRescanObserved = true }
-        }
-        require(restartRescanObserved,
-            "RC RESCAN crash-leftover artifact must recover the typed outcome")
-        require(fastInvocationCount == 0 && fullInvocationCount == 0,
-            "RC RESCAN restart must not re-run Fast or Full")
-        let recoveredGateNRecord = try PersistentTaskCoordinator.read(
-            taskRoot: gateNTaskRoot)
-        require(
-            recoveredGateNRecord.state == .rescanRequired,
-            "RC RESCAN restart must restore terminal task state")
-
-        // A subsequent launch cannot restart the terminal task in place.
-        do {
-            _ = try MobileProcessingPipeline.run(
-                request: gateNRequest, progress: { _, _ in }, isCancelled: { false })
-            require(false, "RC RESCAN terminal task must reject in-place restart")
-        } catch let error as PersistentTaskCheckpoint.CheckpointError {
-            if case .notResumable = error {} else {
-                require(false, "RC RESCAN terminal restart error wrong: \(error)")
-            }
-        }
-        require(fastInvocationCount == 0 && fullInvocationCount == 0
-                && MobileResultLibrary.listResults().count == resultCountBefore,
-            "RC RESCAN terminal restart must neither process nor publish")
-
-        // Artifact write failure is fail-closed: no artifact, no Result,
-        // and the task is durably failed rather than falsely claiming a
-        // RESCAN_SESSION record that storage never committed.
-        let writeFailureRoot = try MobileProcessingTaskStore.createTask(
-            taskID: "gate-n-rescan-write-failure")
-        var writeFailureRequest = gateNRequest
-        writeFailureRequest.taskRoot = writeFailureRoot
-        MobileProcessingPipeline.sessionRescanArtifactWriteFaultInjector = { stage in
-            if stage == .beforeTemporaryWrite {
-                throw NSError(domain: "RescanArtifactFault", code: 1)
-            }
-        }
-        do {
-            _ = try MobileProcessingPipeline.run(
-                request: writeFailureRequest,
-                progress: { _, _ in },
-                isCancelled: { false })
-            require(false, "RC RESCAN injected artifact write failure must surface")
-        } catch let error as MobileProcessingPipeline.SessionRescanArtifactError {
-            if case .cannotWrite = error {} else {
-                require(false, "RC RESCAN write failure type wrong: \(error)")
-            }
-        }
-        MobileProcessingPipeline.sessionRescanArtifactWriteFaultInjector = nil
-        let writeFailureRecord = try PersistentTaskCoordinator.read(
-            taskRoot: writeFailureRoot)
-        require(writeFailureRecord.state == .failed,
-            "RC RESCAN artifact write failure must fail closed")
-        require(!FileManager.default.fileExists(atPath: writeFailureRoot
-                .appendingPathComponent(
-                    MobileProcessingPipeline.sessionRescanArtifactFileName).path)
-                && MobileResultLibrary.listResults().count == resultCountBefore,
-            "RC RESCAN write failure must not leave a claimed artifact or Result")
-
-        // Complete artifact-writer crash matrix. afterTemporaryFsync is
-        // still pre-rename and may become ordinary workflow failure; once
-        // final rename is visible, catch-path reconciliation must repair
-        // parent fsync, hash-bind the checkpoint and commit RESCAN_SESSION.
-        let remainingArtifactStages: [
-            MobileProcessingPipeline.SessionRescanArtifactWriteStage
-        ] = [.afterTemporaryFsync, .afterRename, .afterParentFsync]
-        for artifactStage in remainingArtifactStages {
-            let taskRoot = try MobileProcessingTaskStore.createTask(
-                taskID: "rescan-artifact-fault-\(artifactStage.rawValue)")
-            var request = gateNRequest
-            request.taskRoot = taskRoot
-            MobileProcessingPipeline.sessionRescanArtifactWriteFaultInjector = {
-                stage in
-                if stage == artifactStage {
-                    throw NSError(domain: "RescanArtifactMatrix", code: 2)
-                }
-            }
-            var observedError: Error?
-            do {
-                _ = try MobileProcessingPipeline.run(
-                    request: request,
-                    progress: { _, _ in },
-                    isCancelled: { false })
-            } catch {
-                observedError = error
-            }
-            MobileProcessingPipeline.sessionRescanArtifactWriteFaultInjector = nil
-            let record = try PersistentTaskCoordinator.read(taskRoot: taskRoot)
-            let artifactURL = taskRoot.appendingPathComponent(
-                MobileProcessingPipeline.sessionRescanArtifactFileName)
-            if artifactStage == .afterTemporaryFsync {
-                require(observedError is MobileProcessingPipeline.SessionRescanArtifactError,
-                    "RC RESCAN pre-rename artifact fault must surface writer error")
-                require(record.state == .failed
-                        && !FileManager.default.fileExists(atPath: artifactURL.path),
-                    "RC RESCAN pre-rename artifact fault may fail but cannot claim RESCAN")
-            } else {
-                guard let workflowError = observedError as? MobileOnlyWorkflowError,
-                      case .rescanSessionRequired = workflowError else {
-                    require(false,
-                        "RC RESCAN post-rename artifact fault must recover typed outcome")
-                    continue
-                }
-                require(record.state == .rescanRequired
-                        && record.error == "rescan_session_required"
-                        && FileManager.default.fileExists(atPath: artifactURL.path),
-                    "RC RESCAN post-rename artifact fault must finish exact terminal state")
-                let terminal = record.checkpoint?["terminal_outcome"] as? [String: Any]
-                require(terminal?["artifact"] as? String
-                        == "task:\(MobileProcessingPipeline.sessionRescanArtifactFileName)"
-                        && terminal?["sha256"] as? String != nil,
-                    "RC RESCAN post-rename artifact fault must hash-bind checkpoint")
-            }
-            require(MobileResultLibrary.listResults().count == resultCountBefore,
-                "RC RESCAN artifact matrix must never publish Result")
-        }
-
-        // Checkpoint writer crash matrix. The fault is armed only after
-        // the artifact parent fsync, so it targets the first task.json
-        // write that binds the artifact. Pre-rename task writes preserve a
-        // resumable intermediate state; restart detects the durable
-        // artifact before native work. Post-rename writes are accepted only
-        // through exact checkpoint/terminal reread.
-        let rescanCheckpointWriteStages: [PersistentTaskCoordinator.WriteStage] = [
-            .beforeTemporaryWrite, .afterTemporaryFsync,
-            .afterRename, .afterParentFsync,
-        ]
-        for writeStage in rescanCheckpointWriteStages {
-            let taskRoot = try MobileProcessingTaskStore.createTask(
-                taskID: "rescan-checkpoint-fault-\(writeStage.rawValue)")
-            var request = gateNRequest
-            request.taskRoot = taskRoot
-            MobileProcessingPipeline.sessionRescanArtifactWriteFaultInjector = {
-                stage in
-                if stage == .afterParentFsync {
-                    PersistentTaskCoordinator.writeFaultInjector = { actual in
-                        if actual == writeStage {
-                            throw NSError(
-                                domain: "RescanCheckpointMatrix", code: 3)
-                        }
-                    }
-                }
-            }
-            var firstError: Error?
-            do {
-                _ = try MobileProcessingPipeline.run(
-                    request: request,
-                    progress: { _, _ in },
-                    isCancelled: { false })
-            } catch {
-                firstError = error
-            }
-            MobileProcessingPipeline.sessionRescanArtifactWriteFaultInjector = nil
-            PersistentTaskCoordinator.writeFaultInjector = nil
-            var record = try PersistentTaskCoordinator.read(taskRoot: taskRoot)
-            let artifactURL = taskRoot.appendingPathComponent(
-                MobileProcessingPipeline.sessionRescanArtifactFileName)
-            require(FileManager.default.fileExists(atPath: artifactURL.path),
-                "RC RESCAN checkpoint fault must retain immutable artifact")
-            require(record.state != .failed,
-                "RC RESCAN checkpoint fault must never become generic failed")
-            let pendingIntent = try MobileTerminalStatePersistence
-                .readIntentIfPresent(taskRoot: taskRoot)
-            require(pendingIntent == nil,
-                "RC RESCAN checkpoint reconciliation must not leave failed intent")
-
-            switch writeStage {
-            case .beforeTemporaryWrite, .afterTemporaryFsync:
-                require(firstError is PersistentTaskCheckpoint.CheckpointError,
-                    "RC RESCAN checkpoint pre-rename fault must fail closed")
-                require(record.state != .rescanRequired,
-                    "RC RESCAN checkpoint pre-rename fault must await restart")
-                fastInvocationCount = 0
-                fullInvocationCount = 0
-                var restartTyped = false
-                do {
-                    _ = try MobileProcessingPipeline.run(
-                        request: request,
-                        progress: { _, _ in },
-                        isCancelled: { false })
-                } catch let error as MobileOnlyWorkflowError {
-                    if case .rescanSessionRequired = error {
-                        restartTyped = true
-                    }
-                }
-                record = try PersistentTaskCoordinator.read(taskRoot: taskRoot)
-                require(restartTyped && record.state == .rescanRequired,
-                    "RC RESCAN checkpoint pre-rename restart must complete terminal outcome")
-                require(fastInvocationCount == 0 && fullInvocationCount == 0,
-                    "RC RESCAN checkpoint restart must not rerun native graph")
-            case .afterRename, .afterParentFsync:
-                guard let workflowError = firstError as? MobileOnlyWorkflowError,
-                      case .rescanSessionRequired = workflowError else {
-                    require(false,
-                        "RC RESCAN checkpoint post-rename fault must return typed outcome")
-                    continue
-                }
-                require(record.state == .rescanRequired
-                        && record.error == "rescan_session_required",
-                    "RC RESCAN checkpoint post-rename fault must exact-reread terminal state")
-            }
-            let binding = record.checkpoint?["terminal_outcome"] as? [String: Any]
-            require(binding?["code"] as? String == "RESCAN_SESSION"
-                    && binding?["sha256"] as? String != nil
-                    && MobileResultLibrary.listResults().count == resultCountBefore,
-                "RC RESCAN checkpoint matrix must retain hash binding and no Result")
-        }
-
-        // Graph PASS with zero publish-eligible nodes is the same product
-        // outcome, not generic qualityGateRejected/processing_failed.
-        let noTrajectoryRoot = try MobileProcessingTaskStore.createTask(
-            taskID: "gate-n-no-publish-trajectory")
-        var noTrajectoryRequest = gateNRequest
-        noTrajectoryRequest.taskRoot = noTrajectoryRoot
-        MobileNativeFactorGraphGateway.runFastImplementation = { request, _ in
-            return MobileNativeGraphOutcome(
-                disposition: .pass,
-                qualityJSON: try nativeQualityFixture(
-                    request: request,
-                    path: "fast",
-                    disposition: .pass,
-                    trajectoryCount: 1,
-                    skeletonCount: 1,
-                    publishCount: 0),
-                trajectory: [MobileNativeTrajectoryRow(
-                    id: 1, stamp: now + 1.0,
-                    xM: 1.0, yM: 2.0, yawRad: 0.5,
-                    mapID: 0, componentID: 0,
-                    publishEligible: false, uncertaintyM: 0.05)],
-                skeletonIDs: [1])
-        }
-        MobileNativeFactorGraphGateway.runFullGraphImplementation = { request, cancelled in
-            require(false, "RC RESCAN graph PASS must not invoke Full")
-            return try failingGraph(
-                request: request, path: "full_graph_optimization")
-        }
-        var noTrajectoryRescanObserved = false
-        do {
-            _ = try MobileProcessingPipeline.run(
-                request: noTrajectoryRequest,
-                progress: { _, _ in },
-                isCancelled: { false })
-        } catch let error as MobileOnlyWorkflowError {
-            if case .rescanSessionRequired(let detail) = error {
-                noTrajectoryRescanObserved = detail.contains(
-                    "no_publish_eligible_trajectory")
-            }
-        }
-        require(noTrajectoryRescanObserved,
-            "RC RESCAN no publish-eligible trajectory must use typed outcome")
-        let noTrajectoryRecord = try PersistentTaskCoordinator.read(
-            taskRoot: noTrajectoryRoot)
-        let noTrajectoryArtifact = try JSONSerialization.jsonObject(
-            with: Data(contentsOf: noTrajectoryRoot.appendingPathComponent(
-                MobileProcessingPipeline.sessionRescanArtifactFileName)))
-            as! [String: Any]
-        require(noTrajectoryRecord.state == .rescanRequired
-                && noTrajectoryArtifact["reason_code"] as? String
-                    == "no_publish_eligible_trajectory"
-                && MobileResultLibrary.listResults().count == resultCountBefore,
-            "RC RESCAN no-trajectory branch must persist terminal no-publish evidence")
+        // The former graph-failure RESCAN writer/crash matrix was removed:
+        // finite non-PASS trajectories now use the ordinary immutable Result
+        // transaction, whose rename/checkpoint crash matrix is exercised in
+        // §15 below. Strict legacy artifact parsing remains covered above.
         print(
-            "RC RESCAN terminal outcome passed: artifact-writer=4 checkpoint-writer=4 restart/no-publish")
+            "partial Result + legacy RESCAN parser compatibility passed")
     } catch {
         require(false, "RC RESCAN terminal outcome failed: \(error)")
     }
@@ -18729,14 +18565,14 @@ do {
     tampered["depth_quality"] = 0.1
     let tamperedResult = try parseBurstFixture(
         name: "burst-tampered", object: tampered,
-        expectedCount: 0, expectedLastID: nil)
+        expectedCount: 1, expectedLastID: "BURST-TAMPER")
     require(
         tamperedResult.audit.rejectedDetails.map(\.reason).contains("summary_mismatch"),
         "tampered burst summary must reject")
     let zeroResult = try parseBurstFixture(
         name: "burst-zero",
         object: burst("BURST-ZERO", sequence: 1, frames: []),
-        expectedCount: 0, expectedLastID: nil)
+        expectedCount: 1, expectedLastID: "BURST-ZERO")
     require(
         zeroResult.audit.rejectedDetails.map(\.reason)
             .contains("frame_count_or_frames_invalid"),
@@ -18747,7 +18583,7 @@ do {
             "BURST-DUP", sequence: 1,
             frames: [frame(1, observationID: "OBS-DUP"),
                      frame(2, observationID: "OBS-DUP")]),
-        expectedCount: 0, expectedLastID: nil)
+        expectedCount: 1, expectedLastID: "BURST-DUP")
     require(
         duplicateResult.audit.rejectedDetails.map(\.reason)
             .contains("duplicate_observation_id"),
@@ -18905,6 +18741,10 @@ do {
     require(
         result.observations.count == 3,
         "tag parser observation count wrong: \(result.observations.count)")
+    require(
+        verifiedBursts.releaseFramesWithIncompleteBurstAudit().isEmpty
+            && verifiedBursts.remainingFrameCount == 0,
+        "fully consumed burst frames must release without degradation")
     let localized = result.observations[0]
     require(
         localized.boundNodeID == 1
@@ -18918,6 +18758,62 @@ do {
         result.observations[1].rawPositionM == nil
             && unlocalized.boundNodeID == 3 && unlocalized.rawPositionM == nil,
         "optional/absent height observations must remain legal review-only evidence")
+
+    let missingDirectory = temporary.appendingPathComponent(
+        "missing-observation-burst", isDirectory: true)
+    try FileManager.default.createDirectory(
+        at: missingDirectory, withIntermediateDirectories: true)
+    try jsonLine(burst("BURST-MISSING", sequence: 1, frames: mainFrames))
+        .data(using: .utf8)!.write(to: missingDirectory
+            .appendingPathComponent("tag_observation_bursts.jsonl"))
+    let missingBursts = try TagObservationBurstEvidenceParser.parse(
+        snapshotDirectory: missingDirectory, nodes: nodes,
+        priorMapID: mapID, priorMapSHA256: sha,
+        trackingSessionID: session, floorID: floor,
+        expectedBurstCount: 1, expectedLastBurstID: "BURST-MISSING")
+    let partialLines = lines.prefix(2).joined()
+        .replacingOccurrences(of: "BURST-MAIN", with: "BURST-MISSING")
+    try partialLines.data(using: .utf8)!.write(
+        to: missingDirectory.appendingPathComponent("tag_observations.jsonl"))
+    let partialObservations = try TagObservationEvidenceParser.parse(
+        snapshotDirectory: missingDirectory, nodes: nodes,
+        priorMapID: mapID, priorMapSHA256: sha,
+        trackingSessionID: session, floorID: floor,
+        verifiedBursts: missingBursts)
+    let incomplete = missingBursts.releaseFramesWithIncompleteBurstAudit()
+    require(
+        partialObservations.observations.count == 2
+            && incomplete.count == 1
+            && incomplete[0].burstID == "BURST-MISSING"
+            && incomplete[0].missingObservationCount == 1
+            && missingBursts.remainingFrameCount == 0,
+        "missing observation frames must become one bounded burst degradation")
+
+    let malformedDirectory = temporary.appendingPathComponent(
+        "malformed-burst-degradation", isDirectory: true)
+    try FileManager.default.createDirectory(
+        at: malformedDirectory, withIntermediateDirectories: true)
+    let validBurstLine = try jsonLine(
+        burst("BURST-VALID", sequence: 1, frames: mainFrames))
+    var malformedBurst = burst(
+        "BURST-MALFORMED", sequence: 2, frames: mainFrames)
+    malformedBurst["frame_count"] = 99
+    let malformedBurstLine = try jsonLine(malformedBurst)
+    try (validBurstLine + malformedBurstLine).data(using: .utf8)!.write(
+        to: malformedDirectory.appendingPathComponent(
+            "tag_observation_bursts.jsonl"))
+    let partiallyValidBursts = try TagObservationBurstEvidenceParser.parse(
+        snapshotDirectory: malformedDirectory, nodes: nodes,
+        priorMapID: mapID, priorMapSHA256: sha,
+        trackingSessionID: session, floorID: floor,
+        expectedBurstCount: 2, expectedLastBurstID: "BURST-MALFORMED")
+    require(
+        partiallyValidBursts.bursts.count == 1
+            && partiallyValidBursts.audit.recordTotal == 2
+            && partiallyValidBursts.audit.totalRejected == 1
+            && partiallyValidBursts.audit.rejectedDetails.first?.reason
+                == "frame_count_or_frames_invalid",
+        "one malformed burst must preserve other bursts and satisfy the durable record watermark")
     // Report payload round-trips through CanonicalJSONEncoder.
     let report = audit.reportPayload()
     let reportData = try CanonicalJSONEncoder.encode(report)
@@ -19058,6 +18954,39 @@ do {
         if case .invalidOutcome = error { priorOverflowRejected = true }
     }
     require(priorOverflowRejected, "4097 Swift priors must fail before native allocation")
+
+    let crossComponentBacktrack = [
+        MobileNativeTrajectoryRow(
+            id: 1, stamp: 100, xM: 0, yM: 0, yawRad: 0,
+            mapID: 0, componentID: 1, publishEligible: true,
+            uncertaintyM: 0.1),
+        MobileNativeTrajectoryRow(
+            id: 2, stamp: 10, xM: 1, yM: 0, yawRad: 0,
+            mapID: 0, componentID: 2, publishEligible: false,
+            uncertaintyM: 0.1),
+        MobileNativeTrajectoryRow(
+            id: 3, stamp: 101, xM: 2, yM: 0, yawRad: 0,
+            mapID: 0, componentID: 1, publishEligible: true,
+            uncertaintyM: 0.1),
+    ]
+    try MobileNativeOutcomeContract.validateComponentTimestampOrder(
+        crossComponentBacktrack)
+    var sameComponentBacktrackRejected = false
+    do {
+        var invalid = crossComponentBacktrack
+        invalid.append(MobileNativeTrajectoryRow(
+            id: 4, stamp: 99, xM: 3, yM: 0, yawRad: 0,
+            mapID: 0, componentID: 1, publishEligible: true,
+            uncertaintyM: 0.1))
+        try MobileNativeOutcomeContract.validateComponentTimestampOrder(invalid)
+    } catch let error as MobileNativeFactorGraphError {
+        if case .invalidOutcome(let detail) = error {
+            sameComponentBacktrackRejected = detail.contains("component 1")
+        }
+    }
+    require(
+        sameComponentBacktrackRejected,
+        "native timestamps may backtrack across components but never inside one component")
 
     var resourceSemanticsPreserved = false
     do {

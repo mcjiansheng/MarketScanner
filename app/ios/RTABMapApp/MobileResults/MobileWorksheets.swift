@@ -16,7 +16,9 @@ enum MobileWorksheets {
     static let devicePositionsHeaders = [
         "sequence", "local_timestamp", "utc_timestamp", "unix_time_s",
         "timezone_id", "utc_offset", "session_elapsed_s", "store_id",
-        "floor_id", "map_x_m", "map_y_m", "yaw_deg", "position_status",
+        "floor_id", "map_x_m", "map_y_m", "yaw_deg",
+        "local_x_m", "local_y_m", "local_yaw_deg", "coordinate_frame",
+        "position_status",
         "position_source", "before_node_id", "after_node_id",
         "interpolation_ratio", "localization_confidence",
         "estimated_uncertainty_m", "tracking_state",
@@ -37,8 +39,11 @@ enum MobileWorksheets {
         "cancel_latency_seconds",
         "graph_quality_status", "accepted_tag_count",
         "low_confidence_tag_count", "rescan_tag_count",
+        "result_quality_status", "publish_permitted",
+        "degradation_count", "degradation_reasons",
         "device_position_row_count",
-        "available_position_count", "unavailable_position_count",
+        "available_position_count", "degraded_position_count",
+        "coordinate_position_count", "unavailable_position_count",
         "result_id", "graph_input_sha256", "factor_set_sha256",
         "native_core_sha256", "policy_sha",
         "result_manifest_sha256", "workbook_sha256",
@@ -78,8 +83,11 @@ struct FinalPriceTag: Equatable {
     var shelfSide: String
     var distanceFromShelfStartCm: Double?
     var positionRatio: Double?
-    var mapXM: Double
-    var mapYM: Double
+    /// Nil when the barcode/burst identity is preserved but its map position
+    /// cannot be reconstructed. Such rows remain visible as
+    /// RESCAN_REQUIRED instead of disappearing from the result.
+    var mapXM: Double?
+    var mapYM: Double?
     var observationCount: Int
     var positionSpreadCm: Double
     var localizationConfidence: Double

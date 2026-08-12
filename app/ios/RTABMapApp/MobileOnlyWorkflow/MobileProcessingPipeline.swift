@@ -96,6 +96,31 @@ enum MobileProcessingPipeline {
         var rescanCount: Int
     }
 
+    struct ProcessingDegradation: Equatable {
+        var code: String
+        var stage: String
+        var count: Int
+        var detail: String
+        var affectedIDs: [String] = []
+
+        var reportPayload: [String: Any] {
+            [
+                "code": code,
+                "stage": stage,
+                "count": count,
+                "detail": detail,
+                "affected_ids": Array(affectedIDs.prefix(100)),
+                "affected_ids_truncated": affectedIDs.count > 100,
+            ]
+        }
+    }
+
+    enum ResultQualityStatus: String {
+        case complete = "COMPLETE"
+        case partialReviewRequired = "PARTIAL_REVIEW_REQUIRED"
+        case localFrameOnly = "LOCAL_FRAME_ONLY"
+    }
+
     enum PipelineError: Error, LocalizedError {
         case missingMetadata
         case emptyTrace
@@ -418,10 +443,12 @@ enum MobileProcessingPipeline {
         // optimization — every record is identity/format/pose checked and
         // bound to an exact snapshot-DB node via the node-timebase axis
         // (wired provider, §6.1). Bound node ids pin the adaptive skeleton
-        // (§11.3) so tag-bound nodes survive reconstruction (§13). Any
-        // rejected record blocks publish fail-closed; it is never silently
-        // dropped (the audit is counted and surfaced in the error).
+        // (§11.3) so tag-bound nodes survive reconstruction (§13). Rejected
+        // records are audited and degrade only their affected tags unless the
+        // rejection proves a map/floor/session identity conflict.
         let nodeInventory = Self.absolutePriorNodeInventoryProvider?(snapshotDatabase) ?? []
+        var degradations: [ProcessingDegradation] = []
+        var sessionRescanTasks: [RescanTask] = []
 
         // V1R5 §5.3/§5.4 (review B-02): the durable burst sidecar is
         // parsed with the strict burst parser BEFORE the observations;
@@ -436,25 +463,41 @@ enum MobileProcessingPipeline {
             floorID: floorID,
             expectedBurstCount: (metadata["tagObservationBurstCount"] as? NSNumber)?.intValue,
             expectedLastBurstID: metadata["tagObservationBurstLastID"] as? String)
-        guard burstEvidence.clean else {
+        if burstEvidence.audit.rejectedDetails.contains(where: {
+            $0.reason == "identity_missing_or_mismatch"
+        }) {
+            throw MobileOnlyWorkflowError.invalidState(
+                "价签 burst 存在地图/楼层/会话身份串包记录")
+        }
+        if !burstEvidence.audit.clean {
             let audit = burstEvidence.audit
-            throw PipelineError.tagEvidenceInvalid(
-                "\(audit.totalRejected) bad burst records of \(audit.recordTotal)"
-                + " (first: \(audit.rejectedDetails.prefix(3).map {"\($0.recordIndex):\($0.reason)" }.joined(separator: ", ")))")
+            degradations.append(ProcessingDegradation(
+                code: "tag_burst_records_rejected",
+                stage: "tag_evidence",
+                count: audit.totalRejected,
+                detail: audit.rejectedDetails.prefix(10).map {
+                    "\($0.recordIndex):\($0.reason)"
+                }.joined(separator: ", "),
+                affectedIDs: audit.rejectedDetails.map {
+                    String($0.recordIndex)
+                }))
         }
         if (metadata["tagObservationBurstCount"] as? NSNumber)?.intValue ?? 0 > 0
             && burstEvidence.bursts.isEmpty {
-            throw PipelineError.tagEvidenceInvalid(
-                "metadata declares bursts but the sidecar carries none")
+            degradations.append(ProcessingDegradation(
+                code: "no_valid_tag_bursts",
+                stage: "tag_evidence",
+                count: 1,
+                detail: "metadata 声明了价签 burst，但没有可用 burst"))
         }
 
         // V1R4 §13.2: tag observations are strict-parsed BEFORE
         // optimization — every record is identity/format/pose checked and
         // bound to an exact snapshot-DB node via the node-timebase axis
         // (wired provider, §6.1). Bound node ids pin the adaptive skeleton
-        // (§11.3) so tag-bound nodes survive reconstruction (§13). Any
-        // rejected record blocks publish fail-closed; it is never silently
-        // dropped (the audit is counted and surfaced in the error).
+        // (§11.3) so tag-bound nodes survive reconstruction (§13). Rejected
+        // records are audited and degrade only their affected tags unless the
+        // rejection proves a map/floor/session identity conflict.
         let tagEvidence = try TagObservationEvidenceParser.parse(
             snapshotDirectory: snapshot.snapshotDirectory,
             nodes: nodeInventory,
@@ -463,15 +506,36 @@ enum MobileProcessingPipeline {
             trackingSessionID: request.trackingSessionID,
             floorID: floorID,
             verifiedBursts: burstEvidence)
-        guard burstEvidence.releaseConsumedFrames() else {
-            throw PipelineError.tagEvidenceInvalid(
-                "verified burst frames were not consumed exactly once")
+        let incompleteBursts = burstEvidence
+            .releaseFramesWithIncompleteBurstAudit()
+        if !incompleteBursts.isEmpty {
+            degradations.append(ProcessingDegradation(
+                code: "tag_burst_observation_incomplete",
+                stage: "tag_evidence",
+                count: incompleteBursts.reduce(0) {
+                    $0 + $1.missingObservationCount
+                },
+                detail: "\(incompleteBursts.count) 个价签 burst 缺少逐帧 observation",
+                affectedIDs: incompleteBursts.map(\.burstID)))
         }
-        guard tagEvidence.audit.clean else {
+        if tagEvidence.audit.rejectedDetails.contains(where: {
+            $0.reason == "identity_missing_or_mismatch"
+        }) {
+            throw MobileOnlyWorkflowError.invalidState(
+                "价签 observation 存在地图/楼层/会话身份串包记录")
+        }
+        if !tagEvidence.audit.clean {
             let audit = tagEvidence.audit
-            throw PipelineError.tagEvidenceInvalid(
-                "\(audit.totalRejected) bad records of \(audit.recordTotal)"
-                + " (first: \(audit.rejectedDetails.prefix(3).map {"\($0.recordIndex):\($0.reason)" }.joined(separator: ", ")))")
+            degradations.append(ProcessingDegradation(
+                code: "tag_observation_records_rejected",
+                stage: "tag_evidence",
+                count: audit.totalRejected,
+                detail: audit.rejectedDetails.prefix(10).map {
+                    "\($0.recordIndex):\($0.reason)"
+                }.joined(separator: ", "),
+                affectedIDs: audit.rejectedDetails.map {
+                    String($0.recordIndex)
+                }))
         }
         let tagObservations = tagEvidence.observations
         let tagNodeIDs = tagEvidence.boundNodeIDs
@@ -510,21 +574,33 @@ enum MobileProcessingPipeline {
                 "localization_constraints qualification ceiling exceeded: "
                     + "\(actual) > \(maximum) records (48h @ 2 Hz)")
         }
-        // V1R5 §8.3 (review B-06): parser/schema/identity failures are
-        // fatal because absolute priors are authoritative map-frame anchors.
-        // A well-formed, identity-bound `accepted=false` constraint is a
-        // normal negative measurement: it is audited in nonAcceptedDetails,
-        // contributes no prior, and does not make an otherwise clean run fail.
-        guard priorEvidence.audit.clean else {
+        if priorEvidence.audit.rejectedDetails.contains(where: {
+            $0.reason.contains("identity_missing_or_mismatch")
+        }) {
+            throw MobileOnlyWorkflowError.invalidState(
+                "绝对定位证据存在地图/楼层/会话身份串包记录")
+        }
+        // Record-level prior rejection means that factor is excluded. It is
+        // not allowed to erase the relative graph, trajectory, unrelated
+        // priors or tags. File framing/count/read failures still throw from
+        // the strict parser before this point.
+        if !priorEvidence.audit.clean {
             let audit = priorEvidence.audit
-            throw PipelineError.tagEvidenceInvalid(
-                "\(audit.rejectedDetails.count) bad prior records"
-                + " (first: \(audit.rejectedDetails.prefix(3).map {"\($0.source):\($0.recordIndex):\($0.reason)" }.joined(separator: ", ")))")
+            degradations.append(ProcessingDegradation(
+                code: "absolute_prior_records_rejected",
+                stage: "absolute_prior",
+                count: audit.rejectedDetails.count,
+                detail: audit.rejectedDetails.prefix(10).map {
+                    "\($0.source):\($0.recordIndex):\($0.reason)"
+                }.joined(separator: ", "),
+                affectedIDs: audit.rejectedDetails.map {
+                    "\($0.source):\($0.recordIndex)"
+                }))
         }
         var absolutePriors = priorEvidence.priors
-        if let initialPose = initialMapPosePrior(
+        let initialPose = initialMapPosePrior(
             metadata: metadata, nodes: nodeInventory)
-        {
+        if let initialPose {
             // One prior and nine scalars are negligible compared with the DB
             // graph. Native treats this as an explicit SE(2) gauge authority,
             // but it may authorize publication only when the same connected
@@ -584,8 +660,11 @@ enum MobileProcessingPipeline {
                 "fast", in: snapshotCheckpoint))
 
         // One controlled full-graph optimization after a Fast
-        // RECOVERABLE_FAIL (§13). This is NOT a sensor reprocess; when it
-        // still cannot PASS the session needs a rescan, never a publish.
+        // RECOVERABLE_FAIL (§13). This is NOT a sensor reprocess. If the
+        // deeper solver itself fails, the already strict-validated Fast
+        // trajectory remains useful as a non-publishable partial result.
+        // ABI/outcome validation failures are different: they mean the
+        // native boundary is not trustworthy and must still stop the run.
         if nativeOutcome.disposition == .recoverableFail {
             try checkCancelled()
             try ProcessingResourceGovernor.checkBudget(
@@ -619,20 +698,32 @@ enum MobileProcessingPipeline {
                     checkpoint: PersistentTaskCheckpoint.withProcessingPath(
                         processingPath, in: snapshotCheckpoint))
             } catch let error as MobileNativeFactorGraphError {
-                throw MobileOnlyWorkflowError.processingFailed("全图优化失败：\(error.localizedDescription)")
+                switch error {
+                case .nativeFailed(let detail):
+                    // Fast already passed the complete strict outcome/quality
+                    // contract above. Preserve it rather than erasing every
+                    // coordinate/tag merely because the optional deeper solve
+                    // could not improve the graph.
+                    processingPath = "fast_fallback_after_full_graph_failure"
+                    degradations.append(ProcessingDegradation(
+                        code: "full_graph_failed_fallback_to_fast",
+                        stage: "graph",
+                        count: 1,
+                        detail: detail))
+                case .invalidOutcome, .notWired:
+                    throw MobileOnlyWorkflowError.processingFailed(
+                        "全图优化结果不可信：\(error.localizedDescription)")
+                }
             }
         }
 
-        // Strict quality gate: only PASS publishes (§2 / §11.5).
-        // LOCAL_FRAME_ONLY means no accepted global anchor: diagnostics
-        // only, never PriceTags/DevicePositions (§6.4).
-        guard nativeOutcome.disposition == .pass else {
-            // V1R4 §17 Gate N freeze: V1 has NO true sensor Deep on
-            // device (the snapshot carries no raw RGB/depth frames and
-            // the on-device core never runs a sensor reprocess). A
-            // graph that still fails after the controlled full-graph
-            // recovery turns into an EXPLICIT session-level RESCAN task
-            // — never a silent drop — and publish stays blocked.
+        let graphQualityPassed = nativeOutcome.disposition == .pass
+        if !graphQualityPassed {
+            degradations.append(ProcessingDegradation(
+                code: "graph_quality_not_pass",
+                stage: "graph",
+                count: 1,
+                detail: "\(processingPath)/\(nativeOutcome.disposition.reportValue)"))
             let graphRescan = RescanTask(
                 taskID: "rescan-\(request.trackingSessionID)-graph",
                 taskType: .insufficientLoop,
@@ -648,21 +739,23 @@ enum MobileProcessingPipeline {
                 reasonCode: "graph_quality_failed",
                 humanMessage: "图优化质量门未通过（\(processingPath)/"
                     + "\(nativeOutcome.disposition.reportValue)）；"
-                    + "V1 无设备端 sensor Deep，需要重新扫描",
-                suggestedAction: "RESCAN_SESSION",
+                    + "已保留可计算的诊断/部分结果，需要人工复核或补扫",
+                suggestedAction: "REVIEW_PARTIAL_RESULT",
                 priority: 1)
-            try persistSessionRescanOutcome(
-                request: request,
-                snapshot: snapshot,
-                processingPath: processingPath,
-                graphDisposition: nativeOutcome.disposition.reportValue,
-                reasonCode: "graph_quality_failed",
-                humanMessage: graphRescan.humanMessage,
-                rescanTask: graphRescan,
-                checkpoint: snapshotCheckpoint)
+            sessionRescanTasks.append(graphRescan)
         }
-        let graphQualityPassed = true
         try checkCancelled()
+
+        // Native emits disconnected components in deterministic topology
+        // order. Business time axes require deterministic stamp order, and
+        // interpolation is separately prohibited across component IDs.
+        nativeOutcome.trajectory.sort {
+            if $0.stamp != $1.stamp { return $0.stamp < $1.stamp }
+            if $0.componentID != $1.componentID {
+                return $0.componentID < $1.componentID
+            }
+            return $0.id < $1.id
+        }
 
         // --- Clock mapping on the native UTC stamp axis (§7/§13) -------
         progress(0.40, "构建时钟映射")
@@ -739,12 +832,20 @@ enum MobileProcessingPipeline {
             .buildingTrajectory, taskRoot: request.taskRoot, progress: 0.50,
             checkpoint: PersistentTaskCheckpoint.withProcessingPath(
                 processingPath, in: snapshotCheckpoint))
-        // Rows that are not publish-eligible (fragment components, gaps,
-        // other floors) become UNAVAILABLE intervals — never interpolated
-        // across (§15.2).
-        let eligibilityLost = lostIntervalsFromEligibility(
-            rows: nativeOutcome.trajectory, sessionStartStamp: sessionStartStamp)
-        let finalNodes = nativeOutcome.trajectory.filter { $0.publishEligible }.map {
+        // A clean PASS uses native map-frame publish nodes. Otherwise retain
+        // a diagnostic trajectory: prefer an explicit initial-map-pose
+        // alignment for its connected component; if no such gauge is
+        // available, preserve native local-frame coordinates in dedicated
+        // local_* columns. Neither diagnostic mode permits publication.
+        let selectedTrajectory = diagnosticTrajectorySelection(
+            rows: nativeOutcome.trajectory,
+            graphQualityPassed: graphQualityPassed,
+            initialMapPose: initialPose,
+            floorID: floorID)
+        if let degradation = selectedTrajectory.degradation {
+            degradations.append(degradation)
+        }
+        let finalNodes = selectedTrajectory.rows.map {
             FinalTrajectory.Node(
                 id: $0.id,
                 monotonicSeconds: $0.stamp - sessionStartStamp,
@@ -756,12 +857,11 @@ enum MobileProcessingPipeline {
                 // 0.0. A nil-uncertainty node cannot anchor an AVAILABLE
                 // row (the resampler emits UNAVAILABLE instead).
                 uncertaintyM: $0.uncertaintyM,
-                floorID: floorID)
+                floorID: floorID,
+                componentID: $0.componentID)
         }
         guard !finalNodes.isEmpty else {
-            let message = "图优化虽通过，但最终快照没有可发布的轨迹节点；"
-                + "本次不会生成 PriceTags、DevicePositions 或普通结果，"
-                + "需要重新扫描整个会话"
+            let message = "没有可读取的有限轨迹节点，无法生成每秒坐标表"
             let trajectoryRescan = RescanTask(
                 taskID: "rescan-\(request.trackingSessionID)-trajectory",
                 taskType: .weakLocalization,
@@ -788,8 +888,12 @@ enum MobileProcessingPipeline {
                 rescanTask: trajectoryRescan,
                 checkpoint: snapshotCheckpoint)
         }
+        // Only selected rows reach the resampler. Their natural timestamp
+        // gaps already become UNAVAILABLE. Projecting every non-selected
+        // component into one global lost interval would hide valid rows when
+        // disconnected components overlap on the timestamp axis.
         let lostIntervals = buildLostIntervals(
-            from: traces, sessionStartStamp: sessionStartStamp) + eligibilityLost
+            from: traces, sessionStartStamp: sessionStartStamp)
         let trajectoryInput = FinalTrajectory.Input(
             nodes: finalNodes,
             lostIntervals: lostIntervals,
@@ -804,7 +908,14 @@ enum MobileProcessingPipeline {
                     localizationState: $0.localizationState,
                     confidence: $0.confidence,
                     floorID: $0.floorID)
-            })
+            },
+            graphQualityStatus: nativeOutcome.disposition.reportValue,
+            positionSource: selectedTrajectory.positionSource,
+            coordinatesArePriorMapFrame:
+                selectedTrajectory.coordinatesArePriorMapFrame,
+            allowUnverifiedCoordinatesWithoutUncertainty:
+                !graphQualityPassed
+                    || selectedTrajectory.positionSource != "final_trajectory")
         let devicePositions = FinalTrajectory.resample(
             input: trajectoryInput,
             utcMapper: utcMapper,
@@ -853,7 +964,7 @@ enum MobileProcessingPipeline {
             },
             rawNodeStamps: Dictionary(
                 uniqueKeysWithValues: nodeInventory.map { ($0.nodeID, $0.stamp) }))
-        let (priceTags, rescanTasks) = try finalizeTags(
+        var (priceTags, rescanTasks) = try finalizeTags(
             observations: tagObservations,
             resolverIndex: resolverIndex,
             shelves: shelves,
@@ -865,8 +976,33 @@ enum MobileProcessingPipeline {
             floorID: floorID,
             graphQualityPassed: graphQualityPassed,
             rawNodePoses: rawNodePoses,
-            minimumAssociationMarginM: 0.5)
+            minimumAssociationMarginM: 0.5,
+            incompleteBursts: incompleteBursts,
+            coordinatesArePriorMapFrame:
+                selectedTrajectory.coordinatesArePriorMapFrame)
+        rescanTasks.append(contentsOf: sessionRescanTasks)
         try checkCancelled()
+
+        let resultQualityStatus: ResultQualityStatus
+        if !selectedTrajectory.coordinatesArePriorMapFrame {
+            resultQualityStatus = .localFrameOnly
+        } else if graphQualityPassed && degradations.isEmpty {
+            resultQualityStatus = .complete
+        } else {
+            resultQualityStatus = .partialReviewRequired
+        }
+        let publishPermitted = resultQualityStatus == .complete
+        let availablePositionCount = devicePositions.filter {
+            $0.positionStatus == "AVAILABLE"
+        }.count
+        let degradedPositionCount = devicePositions.filter {
+            $0.positionStatus == "DEGRADED_MAP_ALIGNED"
+                || $0.positionStatus == "LOCAL_FRAME_ONLY"
+        }.count
+        let coordinatePositionCount = devicePositions.filter {
+            ($0.mapXM != nil && $0.mapYM != nil)
+                || ($0.localXM != nil && $0.localYM != nil)
+        }.count
 
         // --- Result package (staged, then atomically committed, §20) ---
         progress(0.80, "生成结果包")
@@ -972,9 +1108,16 @@ enum MobileProcessingPipeline {
             to: resultDirectory.appendingPathComponent("rescan_tasks.json"))
         let qualityReport: [String: Any] = [
             "format": "MarketScannerQualityReport",
-            "version": 2,
+            "version": 3,
             "processing_path": processingPath,
             "graph_quality_disposition": nativeOutcome.disposition.reportValue,
+            "result": [
+                "quality_status": resultQualityStatus.rawValue,
+                "publish_permitted": publishPermitted,
+                "partial_result": resultQualityStatus != .complete,
+                "degradation_count": degradations.count,
+                "degradations": degradations.map(\.reportPayload),
+            ],
             "graph": [
                 "node_count": nativeOutcome.trajectory.count,
                 "skeleton_node_count": nativeOutcome.skeletonIDs.count,
@@ -984,8 +1127,14 @@ enum MobileProcessingPipeline {
             ],
             "trajectory": [
                 "device_position_count": devicePositions.count,
-                "available_count": devicePositions.filter { $0.positionStatus == "AVAILABLE" }.count,
-                "unavailable_count": devicePositions.filter { $0.positionStatus != "AVAILABLE" }.count,
+                "available_count": availablePositionCount,
+                "degraded_count": degradedPositionCount,
+                "coordinate_count": coordinatePositionCount,
+                "unavailable_count": devicePositions.count
+                    - coordinatePositionCount,
+                "coordinate_frame": selectedTrajectory
+                    .coordinatesArePriorMapFrame
+                    ? "PRIOR_MAP" : "LOCAL_DIAGNOSTIC",
             ],
             "tags": [
                 "observation_count": tagObservations.count,
@@ -997,6 +1146,16 @@ enum MobileProcessingPipeline {
             ],
             "prior_evidence": priorEvidence.audit.reportPayload(
                 priors: absolutePriors),
+            "tag_burst_evidence": [
+                "record_total": burstEvidence.audit.recordTotal,
+                "record_accepted": burstEvidence.audit.recordAccepted,
+                "record_rejected": burstEvidence.audit.totalRejected,
+                "incomplete_burst_count": incompleteBursts.count,
+                "missing_observation_count": incompleteBursts.reduce(0) {
+                    $0 + $1.missingObservationCount
+                },
+            ],
+            "tag_observation_evidence": tagEvidence.audit.reportPayload(),
         ]
         try CanonicalJSONEncoder.encode(qualityReport).write(
             to: resultDirectory.appendingPathComponent("quality_report.json"))
@@ -1042,7 +1201,10 @@ enum MobileProcessingPipeline {
             } ?? 0,
             devicePositions: devicePositions,
             priceTags: priceTags,
-            rescanTasks: rescanTasks)
+            rescanTasks: rescanTasks,
+            resultQualityStatus: resultQualityStatus,
+            publishPermitted: publishPermitted,
+            degradations: degradations)
         let workbookName = "\(resultID).xlsx"
         let workbookURL = resultDirectory.appendingPathComponent(workbookName)
         do {
@@ -1139,11 +1301,14 @@ enum MobileProcessingPipeline {
                 "graph_quality_sha256": CanonicalSourceHasher.sha256(
                     Data(nativeOutcome.qualityJSON.utf8)),
                 "device_position_count": devicePositions.count,
-                "available_position_count": devicePositions.filter {
-                    $0.positionStatus == "AVAILABLE"
-                }.count,
+                "available_position_count": availablePositionCount,
+                "degraded_position_count": degradedPositionCount,
+                "coordinate_position_count": coordinatePositionCount,
                 "tag_count": priceTags.count,
                 "rescan_count": rescanTasks.count,
+                "result_quality_status": resultQualityStatus.rawValue,
+                "publish_permitted": publishPermitted,
+                "degradation_count": degradations.count,
             ])
         committed = true
         // §15: terminal durable state — the committed result is the
@@ -1159,7 +1324,7 @@ enum MobileProcessingPipeline {
         return Outcome(
             resultEntry: entry,
             devicePositionCount: devicePositions.count,
-            availablePositionCount: devicePositions.filter { $0.positionStatus == "AVAILABLE" }.count,
+            availablePositionCount: availablePositionCount,
             tagCount: priceTags.count,
             rescanCount: rescanTasks.count)
     }
@@ -1357,6 +1522,112 @@ enum MobileProcessingPipeline {
             episodeID: 0)
     }
 
+    struct DiagnosticTrajectorySelection {
+        var rows: [MobileNativeTrajectoryRow]
+        var coordinatesArePriorMapFrame: Bool
+        var positionSource: String
+        var degradation: ProcessingDegradation?
+    }
+
+    /// Selects the business/diagnostic coordinate frame without weakening the
+    /// native PASS authority. A non-PASS result may still be aligned to the
+    /// prior map by the operator-selected initial pose, but it remains an
+    /// explicitly non-publishable diagnostic result. With no such gauge, raw
+    /// local coordinates are kept in local_* columns only.
+    static func diagnosticTrajectorySelection(
+        rows: [MobileNativeTrajectoryRow],
+        graphQualityPassed: Bool,
+        initialMapPose: MobileAbsolutePrior?,
+        floorID: String
+    ) -> DiagnosticTrajectorySelection {
+        let ordered = rows.sorted {
+            if $0.stamp != $1.stamp { return $0.stamp < $1.stamp }
+            if $0.componentID != $1.componentID {
+                return $0.componentID < $1.componentID
+            }
+            return $0.id < $1.id
+        }
+        let publishRows = ordered.filter(\.publishEligible)
+        if graphQualityPassed, !publishRows.isEmpty {
+            return DiagnosticTrajectorySelection(
+                rows: publishRows,
+                coordinatesArePriorMapFrame: true,
+                positionSource: "final_trajectory",
+                degradation: nil)
+        }
+        if let initialMapPose,
+           let initialRow = ordered.first(where: {
+               $0.id == initialMapPose.nodeID
+           }) {
+            let target = SE2Transform(
+                xM: initialMapPose.mapXM,
+                yM: initialMapPose.mapYM,
+                yawRad: initialMapPose.mapYawRad)
+            let nativeInitial = SE2Transform(
+                xM: initialRow.xM,
+                yM: initialRow.yM,
+                yawRad: initialRow.yawRad)
+            let mapFromNative = target.composed(with: nativeInitial.inverse)
+            let componentRows = ordered.filter {
+                $0.componentID == initialRow.componentID
+            }.map { row -> MobileNativeTrajectoryRow in
+                let transformed = mapFromNative.composed(with: SE2Transform(
+                    xM: row.xM, yM: row.yM, yawRad: row.yawRad))
+                var copy = row
+                copy.xM = transformed.xM
+                copy.yM = transformed.yM
+                copy.yawRad = transformed.yawRad
+                copy.publishEligible = false
+                return copy
+            }
+            if !componentRows.isEmpty {
+                return DiagnosticTrajectorySelection(
+                    rows: componentRows,
+                    coordinatesArePriorMapFrame: true,
+                    positionSource: "diagnostic_initial_map_pose",
+                    degradation: ProcessingDegradation(
+                        code: "diagnostic_initial_map_alignment",
+                        stage: "trajectory",
+                        count: componentRows.count,
+                        detail: graphQualityPassed
+                            ? "图结果没有可发布节点；使用已选择起点将主连通分量对齐到先验地图，仅供复核"
+                            : "使用已选择起点将非 PASS 连通分量对齐到先验地图；仅供复核，不允许发布",
+                        affectedIDs: [String(initialRow.componentID)]))
+            }
+        }
+        // Without a trustworthy map gauge, retain exactly one deterministic
+        // primary component in local coordinates. Interleaving disconnected
+        // components on one timestamp axis would create misleading jumps and
+        // can defeat the resampler's monotonic pointer.
+        let grouped = Dictionary(grouping: ordered, by: \.componentID)
+        let primaryComponent = grouped.keys.sorted { lhs, rhs in
+            let left = grouped[lhs] ?? []
+            let right = grouped[rhs] ?? []
+            if left.count != right.count { return left.count > right.count }
+            let leftStamp = left.first?.stamp ?? .infinity
+            let rightStamp = right.first?.stamp ?? .infinity
+            if leftStamp != rightStamp { return leftStamp < rightStamp }
+            return lhs < rhs
+        }.first
+        let primaryRows = primaryComponent.flatMap { grouped[$0] } ?? []
+        return DiagnosticTrajectorySelection(
+            rows: primaryRows.map { row in
+                var copy = row
+                copy.publishEligible = false
+                return copy
+            },
+            coordinatesArePriorMapFrame: false,
+            positionSource: "native_local_frame_diagnostic",
+            degradation: ProcessingDegradation(
+                code: "local_frame_only_trajectory",
+                stage: "trajectory",
+                count: primaryRows.count,
+                detail: graphQualityPassed
+                    ? "图结果没有可发布节点且没有可用地图 gauge；保留最大连通分量的 local_* 诊断坐标"
+                    : "没有可用的先验地图 gauge；保留最大连通分量的 local_* 诊断坐标",
+                affectedIDs: primaryComponent.map { [String($0)] } ?? []))
+    }
+
     // MARK: - Fast Path graph
 
     /// One sampled graph node together with its trace metadata needed by
@@ -1533,33 +1804,6 @@ enum MobileProcessingPipeline {
                 "session span outside the node-binding evidence span")
         }
         return mapper
-    }
-
-    /// Lost intervals covering trajectory rows that are not publish
-    /// eligible (fragment components / gaps / other floors). Runs of
-    /// ineligible rows become one interval on the stamp axis (§15.2).
-    static func lostIntervalsFromEligibility(
-        rows: [MobileNativeTrajectoryRow],
-        sessionStartStamp: Double
-    ) -> [FinalTrajectory.LostInterval] {
-        var intervals: [FinalTrajectory.LostInterval] = []
-        var start: Double?
-        for row in rows {
-            if !row.publishEligible {
-                if start == nil { start = row.stamp - sessionStartStamp }
-            } else if let s = start {
-                intervals.append(FinalTrajectory.LostInterval(
-                    fromMonotonic: s, toMonotonic: row.stamp - sessionStartStamp,
-                    reason: "unanchored_component"))
-                start = nil
-            }
-        }
-        if let s = start, let last = rows.last {
-            intervals.append(FinalTrajectory.LostInterval(
-                fromMonotonic: s, toMonotonic: last.stamp - sessionStartStamp,
-                reason: "unanchored_component"))
-        }
-        return intervals
     }
 
     // MARK: - Tags
@@ -1748,9 +1992,82 @@ enum MobileProcessingPipeline {
         floorID: String,
         graphQualityPassed: Bool,
         rawNodePoses: [Int64: SE2Transform],
-        minimumAssociationMarginM: Double
+        minimumAssociationMarginM: Double,
+        incompleteBursts: [TagObservationBurstEvidenceParseResult
+            .UnconsumedBurstSummary] = [],
+        coordinatesArePriorMapFrame: Bool = true
     ) throws -> ([FinalPriceTag], [RescanTask]) {
-        guard !observations.isEmpty else { return ([], []) }
+        guard !observations.isEmpty || !incompleteBursts.isEmpty else {
+            return ([], [])
+        }
+
+        if !coordinatesArePriorMapFrame {
+            struct LocalOnlyTagKey: Hashable {
+                let barcode: String
+                let symbology: String
+                let floorID: String
+            }
+            var counts: [LocalOnlyTagKey: Int] = [:]
+            for observation in observations {
+                counts[LocalOnlyTagKey(
+                    barcode: observation.barcode,
+                    symbology: observation.symbology,
+                    floorID: observation.floorID), default: 0] += 1
+            }
+            for burst in incompleteBursts {
+                counts[LocalOnlyTagKey(
+                    barcode: burst.barcode,
+                    symbology: burst.symbology,
+                    floorID: burst.floorID), default: 0] += 0
+            }
+            var tags: [FinalPriceTag] = []
+            var tasks: [RescanTask] = []
+            for key in counts.keys.sorted(by: {
+                ($0.barcode, $0.symbology, $0.floorID)
+                    < ($1.barcode, $1.symbology, $1.floorID)
+            }) {
+                let instanceID = "\(key.barcode)-\(key.floorID)-local-only"
+                tags.append(FinalPriceTag(
+                    tagInstanceID: instanceID,
+                    barcode: key.barcode,
+                    symbology: key.symbology,
+                    storeID: storeID,
+                    floorID: key.floorID,
+                    mapVersion: 1,
+                    priorMapSha256: priorMap.packageSHA256,
+                    trackingSessionID: sessionID,
+                    shelfCode: "",
+                    shelfSegmentID: "",
+                    shelfSide: "",
+                    distanceFromShelfStartCm: nil,
+                    positionRatio: nil,
+                    mapXM: nil,
+                    mapYM: nil,
+                    observationCount: counts[key] ?? 0,
+                    positionSpreadCm: 0,
+                    localizationConfidence: 0,
+                    associationConfidence: 0,
+                    qualityStatus: "RESCAN_REQUIRED",
+                    reason: "trajectory_local_frame_only"))
+                tasks.append(RescanTask(
+                    taskID: "rescan-\(tasks.count + 1)-\(key.barcode)-local-only",
+                    taskType: .tagRescan,
+                    floorID: key.floorID,
+                    barcode: key.barcode,
+                    tagInstanceID: instanceID,
+                    shelfCode: "",
+                    shelfSegmentID: "",
+                    regionStartCm: nil,
+                    regionEndCm: nil,
+                    localStartTime: "",
+                    localEndTime: "",
+                    reasonCode: "trajectory_local_frame_only",
+                    humanMessage: "已保留条码，但轨迹未对齐到先验地图，无法给出价签地图坐标",
+                    suggestedAction: "人工复核或补扫该价签",
+                    priority: 1))
+            }
+            return (tags, tasks)
+        }
 
         // Resolve each observation against the final optimized nodes.
         var resolved: [TagObservationResolver.ResolvedObservation] = []
@@ -1853,8 +2170,16 @@ enum MobileProcessingPipeline {
                 resolvedFrameCountByBurst[burstID, default: 0] += 1
             }
         }
+        let incompleteBurstIDs = Set(incompleteBursts.map(\.burstID))
         var partialPositionBurstIDs = Set<String>()
         var invalidBurstIDs = Set(resolutionFailures.compactMap { $0.burstID })
+        for burst in incompleteBursts {
+            if (resolvedFrameCountByBurst[burst.burstID] ?? 0) >= 3 {
+                partialPositionBurstIDs.insert(burst.burstID)
+            } else {
+                invalidBurstIDs.insert(burst.burstID)
+            }
+        }
         for failure in softFrameFailures {
             if let burstID = failure.burstID,
                (resolvedFrameCountByBurst[burstID] ?? 0) >= 3 {
@@ -1975,6 +2300,48 @@ enum MobileProcessingPipeline {
 
         var priceTags: [FinalPriceTag] = []
         var rescanTasks: [RescanTask] = []
+        for burst in incompleteBursts where
+            (resolvedFrameCountByBurst[burst.burstID] ?? 0) < 3 {
+            let instanceID = "\(burst.barcode)-\(burst.floorID)-incomplete-\(burst.burstID)"
+            priceTags.append(FinalPriceTag(
+                tagInstanceID: instanceID,
+                barcode: burst.barcode,
+                symbology: burst.symbology,
+                storeID: storeID,
+                floorID: burst.floorID,
+                mapVersion: 1,
+                priorMapSha256: priorMap.packageSHA256,
+                trackingSessionID: sessionID,
+                shelfCode: "",
+                shelfSegmentID: "",
+                shelfSide: "",
+                distanceFromShelfStartCm: nil,
+                positionRatio: nil,
+                mapXM: nil,
+                mapYM: nil,
+                observationCount: resolvedFrameCountByBurst[burst.burstID] ?? 0,
+                positionSpreadCm: 0,
+                localizationConfidence: 0,
+                associationConfidence: 0,
+                qualityStatus: "RESCAN_REQUIRED",
+                reason: "burst_observation_incomplete:\(burst.missingObservationCount)"))
+            rescanTasks.append(RescanTask(
+                taskID: "rescan-\(rescanTasks.count + 1)-\(burst.barcode)-incomplete",
+                taskType: .tagRescan,
+                floorID: burst.floorID,
+                barcode: burst.barcode,
+                tagInstanceID: instanceID,
+                shelfCode: "",
+                shelfSegmentID: "",
+                regionStartCm: nil,
+                regionEndCm: nil,
+                localStartTime: "",
+                localEndTime: "",
+                reasonCode: "burst_observation_incomplete",
+                humanMessage: "价签已保留，但缺少 \(burst.missingObservationCount) 帧逐帧观测",
+                suggestedAction: "人工复核或补扫该价签",
+                priority: 1))
+        }
         // The strict parser verified identity per record; the gate still
         // derives the flag from the actual observations instead of a
         // hard-coded constant.
@@ -2027,12 +2394,35 @@ enum MobileProcessingPipeline {
         }
         for group in orderedFailureKeys {
             let failureCount = failureGroups[group] ?? 0
+            let instanceID = "\(group.barcode)-\(group.floorID)-unresolved-\(priceTags.count + 1)"
+            priceTags.append(FinalPriceTag(
+                tagInstanceID: instanceID,
+                barcode: group.barcode,
+                symbology: group.symbology,
+                storeID: storeID,
+                floorID: group.floorID,
+                mapVersion: 1,
+                priorMapSha256: priorMap.packageSHA256,
+                trackingSessionID: sessionID,
+                shelfCode: "",
+                shelfSegmentID: "",
+                shelfSide: "",
+                distanceFromShelfStartCm: nil,
+                positionRatio: nil,
+                mapXM: nil,
+                mapYM: nil,
+                observationCount: failureCount,
+                positionSpreadCm: 0,
+                localizationConfidence: 0,
+                associationConfidence: 0,
+                qualityStatus: "RESCAN_REQUIRED",
+                reason: group.reason))
             rescanTasks.append(RescanTask(
                 taskID: "rescan-\(rescanTasks.count + 1)-\(group.barcode)-\(group.reason)",
                 taskType: .tagRescan,
                 floorID: group.floorID,
                 barcode: group.barcode,
-                tagInstanceID: "\(group.barcode)-\(group.floorID)-unresolved",
+                tagInstanceID: instanceID,
                 shelfCode: "",
                 shelfSegmentID: "",
                 regionStartCm: nil,
@@ -2119,6 +2509,11 @@ enum MobileProcessingPipeline {
                     AutomaticQualityGate.QualityStatus, String)
                 if let reason = authoritativeFailureReason(for: instance) {
                     evaluation = (.rescanRequired, reason)
+                } else if !incompleteBurstIDs.isDisjoint(
+                        with: instance.burstIDs) {
+                    evaluation = (
+                        .lowConfidence,
+                        "burst_observation_incomplete")
                 } else if !partialPositionBurstIDs.isDisjoint(
                         with: instance.burstIDs) {
                     evaluation = (
@@ -2372,12 +2767,23 @@ enum MobileProcessingPipeline {
         cancelLatencySeconds: Double,
         devicePositions: [FinalTrajectory.DevicePositionRow],
         priceTags: [FinalPriceTag],
-        rescanTasks: [RescanTask]
+        rescanTasks: [RescanTask],
+        resultQualityStatus: ResultQualityStatus = .complete,
+        publishPermitted: Bool = true,
+        degradations: [ProcessingDegradation] = []
     ) throws -> [String: String] {
         // Capture the completion boundary immediately before embedding
         // the run diagnostics into the workbook.
         ProcessingResourceGovernor.sampleRunDiagnostics()
         let available = devicePositions.filter { $0.positionStatus == "AVAILABLE" }.count
+        let degraded = devicePositions.filter {
+            $0.positionStatus == "DEGRADED_MAP_ALIGNED"
+                || $0.positionStatus == "LOCAL_FRAME_ONLY"
+        }.count
+        let coordinateCount = devicePositions.filter {
+            ($0.mapXM != nil && $0.mapYM != nil)
+                || ($0.localXM != nil && $0.localYM != nil)
+        }.count
         // V1R4 §12.4 / RC strict binding: every metric is mandatory in the
         // typed native report. Missing/coerced fields fail the run instead of
         // silently becoming empty strings or fabricated integer values.
@@ -2423,9 +2829,17 @@ enum MobileProcessingPipeline {
                 $0.qualityStatus == "LOW_CONFIDENCE"
             }.count),
             "rescan_tag_count": String(rescanTasks.count),
+            "result_quality_status": resultQualityStatus.rawValue,
+            "publish_permitted": publishPermitted ? "true" : "false",
+            "degradation_count": String(degradations.count),
+            "degradation_reasons": degradations.map(\.code)
+                .joined(separator: ","),
             "device_position_row_count": String(devicePositions.count),
             "available_position_count": String(available),
-            "unavailable_position_count": String(devicePositions.count - available),
+            "degraded_position_count": String(degraded),
+            "coordinate_position_count": String(coordinateCount),
+            "unavailable_position_count": String(
+                devicePositions.count - coordinateCount),
             // V1R1 §14.2: the workbook carries the result id; the final
             // manifest/workbook SHA256 live only in the external
             // result_manifest.json and stay empty here.
@@ -2746,7 +3160,7 @@ enum MobileProcessingPipeline {
         throw sessionRescanWorkflowError(artifact)
     }
 
-    private static func persistSessionRescanOutcome(
+    static func persistSessionRescanOutcome(
         request: Request,
         snapshot: SessionSnapshotTransaction.SessionSnapshot,
         processingPath: String,
@@ -3155,8 +3569,6 @@ enum MobileProcessingPipeline {
             "shelf_code": tag.shelfCode,
             "shelf_segment_id": tag.shelfSegmentID,
             "shelf_side": tag.shelfSide,
-            "map_x_m": tag.mapXM,
-            "map_y_m": tag.mapYM,
             "observation_count": tag.observationCount,
             "position_spread_cm": tag.positionSpreadCm,
             "localization_confidence": tag.localizationConfidence,
@@ -3164,6 +3576,8 @@ enum MobileProcessingPipeline {
             "quality_status": tag.qualityStatus,
             "reason": tag.reason,
         ]
+        if let mapXM = tag.mapXM { payload["map_x_m"] = mapXM }
+        if let mapYM = tag.mapYM { payload["map_y_m"] = mapYM }
         if let distance = tag.distanceFromShelfStartCm { payload["distance_from_shelf_start_cm"] = distance }
         if let ratio = tag.positionRatio { payload["position_ratio"] = ratio }
         return payload

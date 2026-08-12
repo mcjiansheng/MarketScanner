@@ -260,10 +260,6 @@ enum TagObservationEvidenceParser {
         var audit = TagObservationEvidenceAudit()
         let url = snapshotDirectory.appendingPathComponent("tag_observations.jsonl")
         guard FileManager.default.fileExists(atPath: url.path) else {
-            let unconsumed = verifiedBursts?.remainingFrameCount ?? 0
-            guard unconsumed == 0 else {
-                throw TagObservationEvidenceParseError.unconsumedBurstFrames(unconsumed)
-            }
             return TagObservationEvidenceParseResult(
                 observations: [], boundNodeIDs: [], audit: audit)
         }
@@ -449,11 +445,10 @@ enum TagObservationEvidenceParser {
                 error.localizedDescription)
         }
 
-        let remainingFrameCount = verifiedBursts?.remainingFrameCount ?? 0
-        guard remainingFrameCount == 0 else {
-            throw TagObservationEvidenceParseError.unconsumedBurstFrames(
-                remainingFrameCount)
-        }
+        // A complete burst can outlive one or more observation appends when
+        // finalization races a late sidecar write. The caller audits and
+        // releases those unconsumed frames as an incomplete tag result. They
+        // must not make the otherwise valid phone trajectory disappear.
         return TagObservationEvidenceParseResult(
             observations: observations,
             boundNodeIDs: boundIDs.sorted(),

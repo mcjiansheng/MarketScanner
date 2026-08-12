@@ -482,6 +482,23 @@ enum PersistentTaskCheckpoint {
             throw CheckpointError.identityMismatch(
                 "committed result manifest/checkpoint binding")
         }
+        if let resultQualityStatus = manifest["result_quality_status"] {
+            guard let status = resultQualityStatus as? String,
+                  ["COMPLETE", "PARTIAL_REVIEW_REQUIRED", "LOCAL_FRAME_ONLY"]
+                    .contains(status),
+                  let publish = StrictJSONScalar.boolean(
+                    manifest["publish_permitted"]),
+                  publish == (status == "COMPLETE"),
+                  exactNonnegativeCount(
+                    "degradation_count", in: manifest) != nil,
+                  exactNonnegativeCount(
+                    "degraded_position_count", in: manifest) != nil,
+                  exactNonnegativeCount(
+                    "coordinate_position_count", in: manifest) != nil else {
+                throw CheckpointError.identityMismatch(
+                    "committed result quality/degradation binding")
+            }
+        }
         let expectedIDs = try expectedCommittedResultIDs(
             in: checkpoint, taskID: entry.taskID)
         guard expectedIDs == Set([entry.resultID]) else {
