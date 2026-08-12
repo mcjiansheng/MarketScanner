@@ -427,8 +427,10 @@ void testSyntheticScenarios()
               std::strlen(outcome.factor_set_sha256) == 64,
               "factor-set SHA has an independent exact C-ABI copy");
         const std::string quality(outcome.quality_json);
-        CHECK(quality.find("\"abi_version\": 4") != std::string::npos,
-              "quality JSON runtime ABI matches C ABI v4");
+        CHECK(quality.find("\"version\": 3") != std::string::npos,
+              "quality JSON schema version matches initial-gauge audit v3");
+        CHECK(quality.find("\"abi_version\": 5") != std::string::npos,
+              "quality JSON runtime ABI matches C ABI v5");
         CHECK(quality.find(outcome.graph_input_sha256) != std::string::npos &&
               quality.find(outcome.factor_set_sha256) != std::string::npos,
               "quality JSON graph/factor SHAs match C outcome copies");
@@ -444,6 +446,92 @@ void testSyntheticScenarios()
             if(std::isfinite(outcome.rows[i].uncertainty_m)) uncertaintiesPresent = true;
         }
         CHECK(uncertaintiesPresent, "uncertainty must not be hardcoded 0/absent");
+        MSFactorGraphFree(&outcome);
+    }
+
+    // One operator-selected x/y/yaw start is a complete SE(2) gauge, but it
+    // may authorize publication only when the same graph contains a genuine
+    // long-range RTAB-Map loop. All ordinary residual/coverage gates remain.
+    {
+        SyntheticBuilder builder("initial_gauge_with_loop");
+        std::vector<MSAbsolutePriorC> ignored;
+        builder.buildSquareLoop(200, false, ignored);
+        std::vector<MSAbsolutePriorC> priors(1);
+        std::memset(&priors[0], 0, sizeof(priors[0]));
+        priors[0].node_id = 1;
+        priors[0].map_x = 0.0;
+        priors[0].map_y = 0.0;
+        priors[0].map_yaw = 0.0;
+        priors[0].information_3x3[0] = 1.0;
+        priors[0].information_3x3[4] = 1.0;
+        priors[0].information_3x3[8] = 1.0 / std::pow(M_PI / 12.0, 2.0);
+        priors[0].kind = MS_PRIOR_KIND_INITIAL_MAP_POSE;
+        MSFactorGraphRequestC request = makeRequest(builder.path, priors, noTags);
+        MSFactorGraphOutcomeC outcome = MSFactorGraphRunFast(&request);
+        CHECK(outcome.disposition == MS_FACTOR_GRAPH_PASS,
+              "initial map pose plus a long-range loop may PASS full gates");
+        const std::string quality = outcome.quality_json
+            ? outcome.quality_json : "";
+        CHECK(quality.find("\"gauge_authority\": \"initial_map_pose\"") !=
+                  std::string::npos &&
+              quality.find("\"long_range_loop_factor_count\": 1") !=
+                  std::string::npos,
+              "initial gauge and long-range loop authority are audited");
+        MSFactorGraphFree(&outcome);
+    }
+
+    // The same single start pose cannot publish an open odometry chain: no
+    // loop means the relative graph is not independently observable.
+    {
+        SyntheticBuilder builder("initial_gauge_without_loop");
+        sqlite3_exec(builder.db, "BEGIN IMMEDIATE", nullptr, nullptr, nullptr);
+        for(int64_t id = 1; id <= 80; ++id)
+        {
+            builder.addNode(id, 1700000000.0 + id * 0.1, id * 0.1, 0.0, 0.0);
+            if(id > 1)
+                builder.addLink(id - 1, id, 0, 0.1, 0.0, 0.0, 50, 50, 80);
+        }
+        sqlite3_exec(builder.db, "COMMIT", nullptr, nullptr, nullptr);
+        std::vector<MSAbsolutePriorC> priors(1);
+        std::memset(&priors[0], 0, sizeof(priors[0]));
+        priors[0].node_id = 1;
+        priors[0].map_x = 0.1;
+        priors[0].information_3x3[0] = 1.0;
+        priors[0].information_3x3[4] = 1.0;
+        priors[0].information_3x3[8] = 1.0 / std::pow(M_PI / 12.0, 2.0);
+        priors[0].kind = MS_PRIOR_KIND_INITIAL_MAP_POSE;
+        MSFactorGraphRequestC request = makeRequest(builder.path, priors, noTags);
+        MSFactorGraphOutcomeC outcome = MSFactorGraphRunFast(&request);
+        CHECK(outcome.disposition == MS_FACTOR_GRAPH_LOCAL_FRAME_ONLY,
+              "initial map pose without a long-range loop remains local-only");
+        const std::string quality = outcome.quality_json
+            ? outcome.quality_json : "";
+        CHECK(quality.find("initial_map_pose_requires_long_range_loop") !=
+                  std::string::npos,
+              "missing relative observability has an explicit reject reason");
+        MSFactorGraphFree(&outcome);
+    }
+
+    // Unknown C-ABI prior kinds are semantic corruption, never an optional
+    // record that can be silently skipped.
+    {
+        SyntheticBuilder builder("unknown_prior_kind");
+        std::vector<MSAbsolutePriorC> ignored;
+        builder.buildSquareLoop(80, false, ignored);
+        std::vector<MSAbsolutePriorC> priors(1);
+        std::memset(&priors[0], 0, sizeof(priors[0]));
+        priors[0].node_id = 1;
+        priors[0].information_3x3[0] = 1.0;
+        priors[0].information_3x3[4] = 1.0;
+        priors[0].information_3x3[8] = 1.0;
+        priors[0].kind = 99;
+        MSFactorGraphRequestC request = makeRequest(builder.path, priors, noTags);
+        MSFactorGraphOutcomeC outcome = MSFactorGraphRunFast(&request);
+        CHECK(outcome.disposition == MS_FACTOR_GRAPH_NON_RECOVERABLE_FAIL &&
+              outcome.error != nullptr &&
+              std::string(outcome.error).find("prior kind is unknown") !=
+                  std::string::npos,
+              "unknown prior kind fails closed at the C ABI");
         MSFactorGraphFree(&outcome);
     }
 

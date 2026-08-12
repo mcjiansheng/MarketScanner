@@ -215,7 +215,6 @@ def validate_factor_graph_result(
         or payload.get("full_factor_graph") is not True
         or payload.get("graph_quality_passed") is not False
         or payload.get("published_capable") is not False
-        or payload["final_objective"] > payload["initial_objective"] * (1.0 + 1.0e-7)
         or not isinstance(payload.get("iterations_done"), int)
         or payload["iterations_done"] <= 0
     ):
@@ -234,6 +233,78 @@ def validate_factor_graph_result(
     collapsed = payload.get("duplicate_reciprocal_collapsed")
     if isinstance(collapsed, bool) or not isinstance(collapsed, int) or collapsed < 0:
         raise FactorGraphValidationError("Duplicate reciprocal count is invalid.")
+    rejected_details = payload.get("rejected_factor_details")
+    if not isinstance(rejected_details, list):
+        raise FactorGraphValidationError("Rejected factor detail inventory is invalid.")
+    rejected_ids = set(payload["rejected_factor_ids"])
+    detail_ids: set[str] = set()
+    for detail in rejected_details:
+        if not isinstance(detail, dict):
+            raise FactorGraphValidationError("Rejected factor detail must be an object.")
+        identifier = detail.get("factor_id")
+        if not isinstance(identifier, str) or identifier in detail_ids or identifier not in rejected_ids:
+            raise FactorGraphValidationError("Rejected factor detail identity is invalid.")
+        detail_ids.add(identifier)
+        if not isinstance(detail.get("kind"), str) or not detail["kind"]:
+            raise FactorGraphValidationError("Rejected factor detail kind is invalid.")
+        _positive_int(detail.get("from_node_id"), "rejected factor from_node_id")
+        _positive_int(detail.get("to_node_id"), "rejected factor to_node_id")
+        for field in ("translation_residual_m", "yaw_residual_deg"):
+            if _finite(detail.get(field), f"rejected factor {field}") < 0.0:
+                raise FactorGraphValidationError("Rejected factor residual cannot be negative.")
+        if not isinstance(detail.get("reason"), str) or not detail["reason"]:
+            raise FactorGraphValidationError("Rejected factor detail reason is invalid.")
+    if not detail_ids.issubset(rejected_ids):
+        raise FactorGraphValidationError("Rejected factor detail inventory is incomplete.")
+    for field in ("quarantined_loop_count", "total_loop_count"):
+        value = payload.get(field)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise FactorGraphValidationError(f"{field} is invalid.")
+    ratio = _finite(payload.get("quarantined_loop_ratio"), "quarantined_loop_ratio")
+    if not 0.0 <= ratio <= 1.0:
+        raise FactorGraphValidationError("quarantined_loop_ratio is out of range.")
+    expected_ratio = payload["quarantined_loop_count"] / max(1, payload["total_loop_count"])
+    if not math.isclose(ratio, expected_ratio, rel_tol=1.0e-7, abs_tol=1.0e-9):
+        raise FactorGraphValidationError("quarantined loop ratio differs from counts.")
+    if payload["quarantined_loop_count"] != len(rejected_details):
+        raise FactorGraphValidationError("quarantined loop count differs from details.")
+    if any(item.get("kind") != "relative_loop" for item in rejected_details):
+        raise FactorGraphValidationError("Only relative loop factors may be quarantined.")
+    quarantine_translation = _finite(
+        payload.get("loop_quarantine_translation_m"),
+        "loop_quarantine_translation_m",
+    )
+    quarantine_yaw = _finite(
+        payload.get("loop_quarantine_yaw_deg"), "loop_quarantine_yaw_deg"
+    )
+    maximum_quarantine_ratio = _finite(
+        payload.get("maximum_quarantined_loop_ratio"),
+        "maximum_quarantined_loop_ratio",
+    )
+    limits = quality_policy.get("limits") if isinstance(quality_policy, dict) else None
+    if not isinstance(limits, dict):
+        raise FactorGraphValidationError("Factor graph quality policy is invalid.")
+    if not math.isclose(
+        quarantine_translation,
+        float(limits["high_residual_loop_translation_m"]),
+        rel_tol=1.0e-7,
+        abs_tol=1.0e-9,
+    ) or not math.isclose(
+        quarantine_yaw,
+        float(limits["high_residual_loop_yaw_deg"]),
+        rel_tol=1.0e-7,
+        abs_tol=1.0e-9,
+    ) or not math.isclose(
+        maximum_quarantine_ratio,
+        float(limits["high_residual_loop_ratio_max"]),
+        rel_tol=1.0e-7,
+        abs_tol=1.0e-9,
+    ):
+        raise FactorGraphValidationError("Loop quarantine gates differ from quality policy.")
+    if payload.get("quarantine_gate_passed") is not (
+        ratio <= maximum_quarantine_ratio
+    ):
+        raise FactorGraphValidationError("Quarantine gate attestation is invalid.")
     residuals = payload.get("loop_factor_residuals")
     if not isinstance(residuals, list):
         raise FactorGraphValidationError("Loop residual inventory is invalid.")
@@ -266,9 +337,6 @@ def validate_factor_graph_result(
         for name, value in expected_loop_metrics.items()
     ):
         raise FactorGraphValidationError("Loop residual aggregates differ from factor residuals.")
-    limits = quality_policy.get("limits") if isinstance(quality_policy, dict) else None
-    if not isinstance(limits, dict):
-        raise FactorGraphValidationError("Factor graph quality policy is invalid.")
     high_residual_ids = sorted(
         item["factor_id"]
         for item in residuals

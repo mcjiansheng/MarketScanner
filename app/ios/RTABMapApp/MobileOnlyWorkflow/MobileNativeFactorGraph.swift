@@ -121,7 +121,8 @@ enum MobileNativeFactorGraph {
             prior.nodeID > 0 && prior.mapXM.isFinite && prior.mapYM.isFinite &&
                 prior.mapYawRad.isFinite && prior.information3x3.count == 9 &&
                 prior.information3x3.allSatisfy({ $0.isFinite }) &&
-                (prior.kind == 0 || prior.kind == 1 || prior.kind == 2) &&
+                (prior.kind == 0 || prior.kind == 1 || prior.kind == 2 ||
+                    prior.kind == 3) &&
                 prior.episodeID >= 0
         }) else {
             throw MobileNativeFactorGraphError.invalidOutcome(

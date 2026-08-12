@@ -273,8 +273,12 @@ struct PriorMapHypothesisDecision {
 final class PriorMapHypothesisTracker {
     private enum Limits {
         static let candidateCount = 5
-        static let trackCount = 8
-        static let maximumMissedFrames = 3
+        static let trackCount = 24
+        static let maximumActiveMissedFrames = 3
+        /// Preserve dormant aisle hypotheses across long occlusions and
+        /// recovery episodes. At the 1–2 Hz adaptive localization rate this
+        /// covers roughly two to four minutes without unbounded memory.
+        static let maximumDormantFrames = 240
         static let associationTranslationM = 0.75
         static let associationYawRad = 12.0 * Double.pi / 180.0
         static let smoothingGain = 0.35
@@ -291,6 +295,10 @@ final class PriorMapHypothesisTracker {
         var mapFromArkit: PriorMapAlignmentTransform
         var candidate: PriorMapScanMatchCandidate
         var supportFrames: Int
+        /// Consecutive evidence in the current active/recovery verification
+        /// epoch. Historical support ranks dormant candidates but can never
+        /// authorize a correction without fresh confirmation.
+        var freshSupportFrames: Int
         var missedFrames: Int
         var meanScore: Double
     }
@@ -309,19 +317,26 @@ final class PriorMapHypothesisTracker {
         activeRecoveryEpisodeId = nil
     }
 
-    /// Recovery V1 intentionally discards lifetime local support. The currently
-    /// applied map/ARKit anchor lives in the localizer, so clearing hypotheses
-    /// cannot move the HUD; it only requires four fresh observations to move it.
+    /// Keep long-lived aisle basins across a recovery episode so a reliable
+    /// RTAB-Map loop can reactivate a previously observed shelf arrangement.
+    /// Lifetime support never authorizes a recovery correction by itself:
+    /// every track's episode-local support is reset and four fresh frames are
+    /// still required before the alignment can move.
     func beginRecoveryEpisode(id: Int) {
-        clearTracks()
+        for index in tracks.indices {
+            tracks[index].freshSupportFrames = 0
+        }
         activeRecoveryEpisodeId = id
     }
 
-    /// All wide-search hypotheses are temporary. The selected alignment has
-    /// already been applied to the localizer anchor before a converged exit.
+    /// Wide-search candidates become dormant historical hypotheses after the
+    /// episode. They remain bounded by `trackCount`/`maximumDormantFrames` and
+    /// must earn fresh support if a later loop reactivates them.
     func endRecoveryEpisode(id: Int, outcome _: PriorMapRecoveryOutcome) {
         guard activeRecoveryEpisodeId == id else { return }
-        clearTracks()
+        for index in tracks.indices {
+            tracks[index].freshSupportFrames = 0
+        }
         activeRecoveryEpisodeId = nil
     }
 
@@ -365,6 +380,9 @@ final class PriorMapHypothesisTracker {
                 tracks[index].supportFrames = min(
                     Limits.supportFrameCap,
                     tracks[index].supportFrames + 1)
+                tracks[index].freshSupportFrames = min(
+                    Limits.supportFrameCap,
+                    tracks[index].freshSupportFrames + 1)
                 tracks[index].missedFrames = 0
                 tracks[index].meanScore = tracks[index].meanScore * 0.7
                     + candidate.score * 0.3
@@ -377,6 +395,7 @@ final class PriorMapHypothesisTracker {
                         mapFromArkit: mapFromArkit,
                         candidate: candidate,
                         supportFrames: 1,
+                        freshSupportFrames: 1,
                         missedFrames: 0,
                         meanScore: candidate.score))
                 nextTrackId += 1
@@ -385,11 +404,21 @@ final class PriorMapHypothesisTracker {
         }
         for index in tracks.indices where !updated.contains(index) {
             tracks[index].missedFrames += 1
+            if tracks[index].missedFrames
+                == Limits.maximumActiveMissedFrames + 1
+            {
+                tracks[index].freshSupportFrames = 0
+            }
         }
         tracks = tracks.filter {
-            $0.missedFrames <= Limits.maximumMissedFrames
+            $0.missedFrames <= Limits.maximumDormantFrames
         }
             .sorted { first, second in
+                let firstActive = first.missedFrames
+                    <= Limits.maximumActiveMissedFrames
+                let secondActive = second.missedFrames
+                    <= Limits.maximumActiveMissedFrames
+                if firstActive != secondActive { return firstActive }
                 if first.supportFrames != second.supportFrames {
                     return first.supportFrames > second.supportFrames
                 }
@@ -404,7 +433,19 @@ final class PriorMapHypothesisTracker {
         if tracks.count > Limits.trackCount {
             tracks.removeLast(tracks.count - Limits.trackCount)
         }
-        let activeTracks = tracks.filter { $0.missedFrames == 0 }
+        let activeTracks = tracks.filter { $0.missedFrames == 0 }.sorted {
+            first, second in
+            if first.freshSupportFrames != second.freshSupportFrames {
+                return first.freshSupportFrames > second.freshSupportFrames
+            }
+            if first.meanScore != second.meanScore {
+                return first.meanScore > second.meanScore
+            }
+            if first.supportFrames != second.supportFrames {
+                return first.supportFrames > second.supportFrames
+            }
+            return first.id < second.id
+        }
         guard let best = activeTracks.first else {
             return PriorMapHypothesisDecision(
                 candidate: nil,
@@ -422,17 +463,20 @@ final class PriorMapHypothesisTracker {
         }
         let second = activeTracks.dropFirst().first
         let supportMargin = second.map {
-            Double(best.supportFrames - $0.supportFrames) * 0.05
+            // Lifetime support may rank a dormant hypothesis, but only
+            // current-epoch evidence may contribute to the trust margin.
+            Double(best.freshSupportFrames - $0.freshSupportFrames) * 0.05
         } ?? 0
         let scoreMargin = max(
             0,
             min(1, best.meanScore - (second?.meanScore ?? best.meanScore) + supportMargin))
         let requiredFrames = recoverySearch
             ? Limits.recoveryRequiredFrames : Limits.localRequiredFrames
+        let qualifyingSupportFrames = best.freshSupportFrames
         let recoveryEpisodeIsActive = !recoverySearch
             || activeRecoveryEpisodeId != nil
         let trusted = recoveryEpisodeIsActive
-            && best.supportFrames >= requiredFrames
+            && qualifyingSupportFrames >= requiredFrames
             && best.meanScore >= Limits.minimumMeanScore
             && (uniqueness >= Limits.minimumUniqueness
                 || scoreMargin >= Limits.minimumScoreMargin)
@@ -445,7 +489,7 @@ final class PriorMapHypothesisTracker {
             secondCost: second?.candidate.cost,
             trackerElapsedMs:
                 (ProcessInfo.processInfo.systemUptime - start) * 1000,
-            supportFrames: best.supportFrames,
+            supportFrames: qualifyingSupportFrames,
             scoreMargin: scoreMargin,
             trusted: trusted,
             reason: trusted

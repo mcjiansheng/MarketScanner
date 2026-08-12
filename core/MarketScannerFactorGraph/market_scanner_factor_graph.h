@@ -37,7 +37,7 @@ extern "C" {
 #endif
 
 /// Core ABI version; bumped on any semantic change.
-#define MS_FACTOR_GRAPH_ABI_VERSION 4
+#define MS_FACTOR_GRAPH_ABI_VERSION 5
 
 /// Policy version of the built-in quality thresholds. Thresholds are
 /// CANDIDATES until the Replay Pareto freezes a production policy
@@ -67,7 +67,10 @@ typedef enum {
 typedef enum {
     MS_PRIOR_KIND_LOCALIZATION = 0,
     MS_PRIOR_KIND_RECOVERY = 1,
-    MS_PRIOR_KIND_MANUAL = 2
+    MS_PRIOR_KIND_MANUAL = 2,
+    /// Operator-selected scan start and heading. This is a moderately
+    /// uncertain map-frame gauge, not a centimetre-accurate manual anchor.
+    MS_PRIOR_KIND_INITIAL_MAP_POSE = 3
 } MSPriorKind;
 
 /// One absolute prior: the node pose expressed in the PRIOR-MAP frame

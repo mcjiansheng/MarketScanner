@@ -1,6 +1,6 @@
 # 手机后处理（Mobile Post Processing）
 
-> 状态：**当前有效**；IMPLEMENTED / UNIT TESTED / INTEGRATION TESTED（P1/P2/P7/P8/P12）。最后核对：2026-08-07。
+> 状态：**当前有效**；IMPLEMENTED / UNIT TESTED / INTEGRATION TESTED（P1/P2/P7/P8/P12）。最后核对：2026-08-12。
 
 ## 模块
 
@@ -16,7 +16,7 @@
 
 bounded iterations（60）、convergence tolerance、确定性稀疏 CG、每步 finite 检查、solver 失败抛错不发布。Route A 允许 Fast reduced graph 后至多一次 Full existing-graph optimization；仍失败即 `RESCAN_SESSION`，不执行 True sensor Deep。因子图输入为快照解析结果；处理只读快照，绝不处理原始 session 路径。
 
-Native optimizer 的 skeleton/factor/prior 硬上限统一由生成合同固定为 4096。Swift 必须先严格解释 native disposition，再处理可选 error 字符串，因此 `RESOURCE_REQUIRED + error detail` 仍保持可恢复的资源暂停语义；未知 disposition 是 ABI 错误。C ABI v4 为 quality JSON 提供显式 bounded UTF-8 byte count，并独立携带 runtime ABI、graph/factor SHA、factor count 和 publish count。Swift 以完整 typed DTO 严格解析 quality v2：duplicate/unknown/missing field、Bool 冒充数字、错误类型或越界值均拒绝；随后把 path/disposition、prior-map/session/projection policy identity、graph/factor SHA、`solver.factor_count`、skeleton/trajectory/publish counts 与 request 和 C outcome 精确交叉核对。顶层 `factor_count` 不得冒充唯一权威路径 `solver.factor_count`，RunSummary 只能从该已验证 DTO 投影，不能再以宽松 `JSONSerialization`/`NSNumber.intValue` 读取安全字段。
+Native optimizer 的 skeleton/factor/prior 硬上限统一由生成合同固定为 4096。Swift 必须先严格解释 native disposition，再处理可选 error 字符串，因此 `RESOURCE_REQUIRED + error detail` 仍保持可恢复的资源暂停语义；未知 disposition 或未知 prior kind 都是 ABI/语义错误。C ABI v5 为 quality JSON 提供显式 bounded UTF-8 byte count，并独立携带 runtime ABI、graph/factor SHA、factor count 和 publish count。Swift 以完整 typed DTO 严格解析 quality v3：duplicate/unknown/missing field、Bool 冒充数字、错误类型或越界值均拒绝；随后把 path/disposition、prior-map/session/projection policy identity、graph/factor SHA、`solver.factor_count`、skeleton/trajectory/publish counts 与 request 和 C outcome 精确交叉核对。quality v3 明确记录 `initial_map_pose` gauge authority、普通 robust consensus prior 数和同分量长程闭环数。单一起点 x/y/yaw 只有在同一分量存在节点跨度至少 30 的 RTAB-Map 长程闭环时才具有发布授权；否则保持 `LOCAL_FRAME_ONLY`。顶层 `factor_count` 不得冒充唯一权威路径 `solver.factor_count`，RunSummary 只能从该已验证 DTO 投影，不能再以宽松 `JSONSerialization`/`NSNumber.intValue` 读取安全字段。
 
 `AbsolutePriorEvidenceParser` 为一次处理只构建一个 `NodeIndex`（ID 索引、按 stamp 排序数组、stamp 数组和 duplicate 集合）。constraint/manual 的 top-level、pose 和 candidate 子对象均拒绝未知字段，version/Bool/Int 使用严格 scalar；floor/map/SHA/session、node timebase 恒等式和 disposition 交叉语义必须一致。格式正确、身份一致且正式 `accepted=false` 的 constraint 是正常负证据：计入 `nonAcceptedDetails`、不生成 prior、也不污染 fatal clean gate；坏 schema、身份矛盾或 accepted record 无效仍阻断。manual v2/v3 都重算最近与第二近节点，v3 声明 ID 必须就是真实无歧义最近节点，并交叉核对 ISO/Unix wall time。
 

@@ -44,6 +44,13 @@ namespace {
 const char * kFormat = "MarketScannerRelativeSE2FactorGraphReport";
 const int kVersion = 2;
 
+// A loop closure is useful only when it is compatible with the already
+// optimized trajectory.  The native optimizer can robustly down-weight a
+// bad loop, but the helper must also keep the factor inventory auditable and
+// must not let a 180 degree false closure distort the whole route.  Odometry
+// (neighbor) links are never quarantined.  These limits are deliberately
+// conservative and are applied only to relative_loop factors.
+
 struct Sha256
 {
 	Sha256() : bitLength(0), bufferLength(0)
@@ -153,6 +160,9 @@ struct Options
 	double initialX = 0.0;
 	double initialY = 0.0;
 	double initialYaw = 0.0;
+	double loopQuarantineTranslationM = 1.0;
+	double loopQuarantineYawRad = 20.0 * M_PI / 180.0;
+	double maximumQuarantinedLoopRatio = 0.05;
 	int iterations = 100;
 	double epsilon = 1.0e-6;
 };
@@ -176,6 +186,17 @@ struct Prior
 	double yaw;
 	double translationSigma;
 	double yawSigma;
+};
+
+struct RejectedFactorDetail
+{
+	std::string id;
+	std::string kind;
+	int from = 0;
+	int to = 0;
+	double translation = 0.0;
+	double yawDeg = 0.0;
+	std::string reason;
 };
 
 double normalizeAngle(double angle)
@@ -280,6 +301,9 @@ Options parseOptions(int argc, char ** argv)
 		else if(name == "--initial-x") options.initialX = parseFinite(value, "initial-x");
 		else if(name == "--initial-y") options.initialY = parseFinite(value, "initial-y");
 		else if(name == "--initial-yaw") options.initialYaw = parseFinite(value, "initial-yaw");
+		else if(name == "--loop-quarantine-translation-m") options.loopQuarantineTranslationM = parseFinite(value, "loop-quarantine-translation-m");
+		else if(name == "--loop-quarantine-yaw-rad") options.loopQuarantineYawRad = parseFinite(value, "loop-quarantine-yaw-rad");
+		else if(name == "--maximum-quarantined-loop-ratio") options.maximumQuarantinedLoopRatio = parseFinite(value, "maximum-quarantined-loop-ratio");
 		else if(name == "--iterations") options.iterations = parseInteger(value, "iterations");
 		else if(name == "--epsilon") options.epsilon = parseFinite(value, "epsilon");
 		else throw std::runtime_error("Unknown argument " + name + ".");
@@ -291,6 +315,9 @@ Options parseOptions(int argc, char ** argv)
 		throw std::runtime_error("--database, --output and lowercase SHA-256 input/database identities are required.");
 	}
 	if(options.epsilon < 0.0) throw std::runtime_error("epsilon cannot be negative.");
+	if(options.loopQuarantineTranslationM <= 0.0 || options.loopQuarantineYawRad <= 0.0 || options.loopQuarantineYawRad > M_PI ||
+		options.maximumQuarantinedLoopRatio < 0.0 || options.maximumQuarantinedLoopRatio > 1.0)
+		throw std::runtime_error("Loop quarantine gates are outside the safe range.");
 	if(options.horizontalAxes != "xy" && options.horizontalAxes != "xz" && options.horizontalAxes != "ios_prior")
 		throw std::runtime_error("horizontal-axes must be xy, xz or ios_prior.");
 	return options;
@@ -546,6 +573,9 @@ void writeResult(
 	const std::map<int,Transform> & optimized,
 	const std::vector<Factor> & factors,
 	const std::vector<std::string> & rejected,
+	const std::vector<RejectedFactorDetail> & rejectedDetails,
+	int quarantinedLoopCount,
+	int totalLoopCount,
 	int rootId,
 	double initialObjective,
 	double finalObjective,
@@ -653,9 +683,32 @@ void writeResult(
 				<<"\",\"translation_m\":"<<std::get<1>(loopResidualRecords[i])
 				<<",\"yaw_deg\":"<<std::get<2>(loopResidualRecords[i])<<"}";
 		}
-		out << "],\n  \"rejected_factor_ids\":[";
+	out << "],\n  \"rejected_factor_ids\":[";
 	for(size_t i=0;i<rejected.size();++i){if(i)out<<',';out<<"\""<<jsonEscape(rejected[i])<<"\"";}
-	out << "],\n  \"factors\":[\n";
+	out << "],\n  \"rejected_factor_details\":[";
+	for(size_t i=0;i<rejectedDetails.size();++i)
+	{
+		if(i) out << ',';
+		const RejectedFactorDetail & detail = rejectedDetails[i];
+		out << "{\"factor_id\":\"" << jsonEscape(detail.id)
+			<< "\",\"kind\":\"" << jsonEscape(detail.kind)
+			<< "\",\"from_node_id\":" << detail.from
+			<< ",\"to_node_id\":" << detail.to
+			<< ",\"translation_residual_m\":" << detail.translation
+			<< ",\"yaw_residual_deg\":" << detail.yawDeg
+			<< ",\"reason\":\"" << jsonEscape(detail.reason) << "\"}";
+	}
+	const double quarantinedRatio = totalLoopCount > 0 ?
+		static_cast<double>(quarantinedLoopCount) / static_cast<double>(totalLoopCount) : 0.0;
+	out << "],\n  \"quarantined_loop_count\":" << quarantinedLoopCount
+		<< ",\n  \"total_loop_count\":" << totalLoopCount
+		<< ",\n  \"quarantined_loop_ratio\":" << quarantinedRatio
+		<< ",\n  \"quarantine_gate_passed\":"
+		<< (quarantinedRatio <= options.maximumQuarantinedLoopRatio ? "true" : "false")
+		<< ",\n  \"loop_quarantine_translation_m\":" << options.loopQuarantineTranslationM
+		<< ",\n  \"loop_quarantine_yaw_deg\":" << options.loopQuarantineYawRad * 180.0 / M_PI
+		<< ",\n  \"maximum_quarantined_loop_ratio\":" << options.maximumQuarantinedLoopRatio
+		<< ",\n  \"factors\":[\n";
 	for(size_t i=0;i<sortedFactors.size();++i)
 	{
 		const Factor & f=sortedFactors[i];
@@ -730,9 +783,12 @@ int main(int argc, char ** argv)
 
 		std::vector<Factor> factors;
 		std::vector<std::string> rejected;
+		std::vector<RejectedFactorDetail> rejectedFactorDetails;
 		std::multimap<int,Link> optimizerLinks;
 			std::map<std::tuple<int,int,int>, size_t> canonicalRelativeFactors;
 			int duplicateReciprocalCollapsed = 0;
+			int quarantinedLoopCount = 0;
+			int totalLoopCount = 0;
 		std::map<int,std::set<int> > adjacency;
 		for(std::multimap<int,Link>::const_iterator iter=databaseLinks.begin();iter!=databaseLinks.end();++iter)
 		{
@@ -772,6 +828,32 @@ int main(int argc, char ** argv)
 					continue;
 				}
 				canonicalRelativeFactors.insert(std::make_pair(key,factors.size()));
+				if(factor.kind == "relative_loop")
+				{
+					++totalLoopCount;
+					const std::array<double,3> baselineResidual = residual(
+						initial.at(canonicalFrom), initial.at(canonicalTo), measurement);
+					const double translationResidual = std::hypot(baselineResidual[0], baselineResidual[1]);
+					const double yawResidualDeg = std::fabs(baselineResidual[2]) * 180.0 / M_PI;
+					const bool extreme =
+						translationResidual > options.loopQuarantineTranslationM ||
+						yawResidualDeg > options.loopQuarantineYawRad * 180.0 / M_PI;
+					if(extreme)
+					{
+						++quarantinedLoopCount;
+						RejectedFactorDetail detail;
+						detail.id = factor.id;
+						detail.kind = factor.kind;
+						detail.from = canonicalFrom;
+						detail.to = canonicalTo;
+						detail.translation = translationResidual;
+						detail.yawDeg = yawResidualDeg;
+						detail.reason = "baseline_loop_residual_exceeds_quarantine_gate";
+						rejectedFactorDetails.push_back(detail);
+						rejected.push_back(factor.id);
+						continue;
+					}
+				}
 				factors.push_back(factor);
 				optimizerLinks.insert(std::make_pair(projectedLink.from(),projectedLink));
 				adjacency[canonicalFrom].insert(canonicalTo); adjacency[canonicalTo].insert(canonicalFrom);
@@ -817,8 +899,15 @@ int main(int argc, char ** argv)
 		if(optimized.size()!=poses.size()) throw std::runtime_error("Native optimizer returned an incomplete node inventory.");
 		for(std::map<int,Transform>::const_iterator iter=optimized.begin();iter!=optimized.end();++iter) if(!finiteTransform(iter->second)) throw std::runtime_error("Native optimizer returned a non-finite pose.");
 		double finalObjective=objective(optimized,factors);
-		bool converged=iterationsDone>0 && std::isfinite(nativeFinalError) && std::isfinite(finalObjective) && finalObjective<=initialObjective+std::max(1.0e-8,std::fabs(initialObjective)*1.0e-7);
-			writeResult(options,databaseVersion,initial,optimized,factors,rejected,rootId,initialObjective,finalObjective,nativeFinalError,iterationsDone,converged,hasAbsolutePriors,duplicateReciprocalCollapsed);
+		const double quarantinedLoopRatio = totalLoopCount > 0 ?
+			static_cast<double>(quarantinedLoopCount) / static_cast<double>(totalLoopCount) : 0.0;
+		// Optimizer::optimize() reports g2o's robust active chi2.  The helper's
+		// ordinary quadratic objective intentionally remains an audit metric and
+		// must not override native convergence when a quarantined/outlier loop is
+		// still present in the historical factor inventory.
+		bool converged = iterationsDone > 0 && std::isfinite(nativeFinalError) &&
+			std::isfinite(finalObjective) && quarantinedLoopRatio <= options.maximumQuarantinedLoopRatio;
+			writeResult(options,databaseVersion,initial,optimized,factors,rejected,rejectedFactorDetails,quarantinedLoopCount,totalLoopCount,rootId,initialObjective,finalObjective,nativeFinalError,iterationsDone,converged,hasAbsolutePriors,duplicateReciprocalCollapsed);
 		return converged?0:3;
 	}
 	catch(const std::exception & error)

@@ -106,6 +106,14 @@ def valid_report():
         "full_factor_graph": True,
         "published_capable": False,
         "rejected_factor_ids": [],
+        "rejected_factor_details": [],
+        "quarantined_loop_count": 0,
+        "total_loop_count": 0,
+        "quarantined_loop_ratio": 0.0,
+        "quarantine_gate_passed": True,
+        "loop_quarantine_translation_m": 1.0,
+        "loop_quarantine_yaw_deg": 20.0,
+        "maximum_quarantined_loop_ratio": 0.05,
     }
 
 

@@ -521,7 +521,20 @@ enum MobileProcessingPipeline {
                 "\(audit.rejectedDetails.count) bad prior records"
                 + " (first: \(audit.rejectedDetails.prefix(3).map {"\($0.source):\($0.recordIndex):\($0.reason)" }.joined(separator: ", ")))")
         }
-        let absolutePriors = priorEvidence.priors
+        var absolutePriors = priorEvidence.priors
+        if let initialPose = initialMapPosePrior(
+            metadata: metadata, nodes: nodeInventory)
+        {
+            // One prior and nine scalars are negligible compared with the DB
+            // graph. Native treats this as an explicit SE(2) gauge authority,
+            // but it may authorize publication only when the same connected
+            // component also contains a long-range RTAB-Map loop. Without
+            // that independent relative-graph observability the outcome stays
+            // LOCAL_FRAME_ONLY. The policy uncertainty represents map-tap and
+            // heading-selection error; later structure/manual priors can still
+            // refine the route.
+            absolutePriors.insert(initialPose, at: 0)
+        }
 
         // --- Fast Path: shared native factor-graph core (§2 / §11) -----
         // Real RTAB-Map nodes/links from the immutable snapshot DB drive
@@ -1308,6 +1321,40 @@ enum MobileProcessingPipeline {
             limits: StrictJSONDocumentLimits(maximumBytes: data.count + 1)) as? [String: Any]
         else { throw PipelineError.missingMetadata }
         return object
+    }
+
+    /// Builds the mobile equivalent of the PC `initial_map_pose` factor.
+    /// Hardware/VIO poses are not rewritten here; the native graph distributes
+    /// the map-frame correction over relative odometry and loop constraints.
+    static func initialMapPosePrior(
+        metadata: [String: Any],
+        nodes: [AbsolutePriorEvidenceNode]
+    ) -> MobileAbsolutePrior? {
+        guard let firstNode = nodes.min(by: {
+            if $0.stamp == $1.stamp { return $0.nodeID < $1.nodeID }
+            return $0.stamp < $1.stamp
+        }),
+              let raw = metadata["initialMapPose"] as? [String: Any],
+              let xM = StrictJSONScalar.number(raw["x_m"]),
+              let yM = StrictJSONScalar.number(raw["y_m"]),
+              let yawRad = StrictJSONScalar.number(raw["yaw_rad"]),
+              xM.isFinite, yM.isFinite, yawRad.isFinite else {
+            return nil
+        }
+        let translationSigmaM = 1.0
+        let yawSigmaRad = Double.pi / 12.0
+        return MobileAbsolutePrior(
+            nodeID: firstNode.nodeID,
+            mapXM: xM,
+            mapYM: yM,
+            mapYawRad: yawRad,
+            information3x3: [
+                1.0 / (translationSigmaM * translationSigmaM), 0, 0,
+                0, 1.0 / (translationSigmaM * translationSigmaM), 0,
+                0, 0, 1.0 / (yawSigmaRad * yawSigmaRad),
+            ],
+            kind: 3,
+            episodeID: 0)
     }
 
     // MARK: - Fast Path graph

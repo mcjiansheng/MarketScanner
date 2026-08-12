@@ -97,17 +97,12 @@ enum MobileRoadGraphBuilder {
             nodes.append(node)
             for code in crossCodes {
                 let key = "\(element.floorId)|\(code)"
-                if crossByKey[key] == nil {
-                    warnings.append(MapSourceWarning(
-                        code: "missing_cross",
-                        row: element.sourceRow,
-                        floor: element.floorId,
-                        shapeType: "MapRoadPoint",
-                        message: "道路点引用了不存在的道路 \(code)。"
-                    ))
-                } else {
-                    nodesByCross[key, default: []].append(node)
-                }
+                // Formal source maps may keep road centreline drawings hidden
+                // while visible road points still carry their `crossCodes`.
+                // Preserve the membership now; after the complete inventory is
+                // known we can deterministically recover a missing straight
+                // centreline from two or more member points.
+                nodesByCross[key, default: []].append(node)
             }
             if crossCodes.isEmpty {
                 warnings.append(MapSourceWarning(
@@ -118,6 +113,97 @@ enum MobileRoadGraphBuilder {
                     message: "道路点没有 crossCodes，已保留为孤立节点。"
                 ))
             }
+        }
+
+        // Mirror the PC compiler's `road_point_membership_v1` recovery. The
+        // active package manifest binds these visible road points. Hidden line
+        // geometry cannot become authoritative until a future package schema
+        // binds a dedicated topology source file.
+        for key in nodesByCross.keys.sorted() where crossByKey[key] == nil {
+            let crossNodes = (nodesByCross[key] ?? []).sorted {
+                (($0["id"] as? String) ?? "") < (($1["id"] as? String) ?? "")
+            }
+            let parts = key.split(separator: "|", maxSplits: 1, omittingEmptySubsequences: false)
+            let floorID = parts.first.map(String.init) ?? ""
+            let crossID = parts.count == 2 ? String(parts[1]) : ""
+            guard crossNodes.count >= 2 else {
+                let node = crossNodes.first
+                warnings.append(MapSourceWarning(
+                    code: "missing_cross",
+                    row: 0,
+                    floor: floorID,
+                    shapeType: "MapRoadPoint",
+                    message: "道路点引用了不存在的道路 \(crossID)，且成员不足，无法恢复道路边。"
+                ))
+                _ = node
+                continue
+            }
+            var endpointPair: ([String: Any], [String: Any])?
+            var endpointDistance = -Double.infinity
+            var endpointIDs = ("", "")
+            for firstIndex in 0..<(crossNodes.count - 1) {
+                for secondIndex in (firstIndex + 1)..<crossNodes.count {
+                    let first = crossNodes[firstIndex]
+                    let second = crossNodes[secondIndex]
+                    let firstPosition = (first["position_m"] as? [Double]) ?? []
+                    let secondPosition = (second["position_m"] as? [Double]) ?? []
+                    let candidateDistance = distance(firstPosition, secondPosition)
+                    let candidateIDs = [
+                        (first["id"] as? String) ?? "",
+                        (second["id"] as? String) ?? "",
+                    ].sorted()
+                    if candidateDistance > endpointDistance + 1.0e-12
+                        || (abs(candidateDistance - endpointDistance) <= 1.0e-12
+                            && (candidateIDs[0] < endpointIDs.0
+                                || (candidateIDs[0] == endpointIDs.0
+                                    && candidateIDs[1] < endpointIDs.1))) {
+                        endpointPair = (first, second)
+                        endpointDistance = candidateDistance
+                        endpointIDs = (candidateIDs[0], candidateIDs[1])
+                    }
+                }
+            }
+            guard let endpoints = endpointPair, endpointDistance > 1.0e-9,
+                  var firstPoint = endpoints.0["position_m"] as? [Double],
+                  var secondPoint = endpoints.1["position_m"] as? [Double],
+                  firstPoint.count >= 2, secondPoint.count >= 2 else {
+                warnings.append(MapSourceWarning(
+                    code: "missing_cross",
+                    row: 0,
+                    floor: floorID,
+                    shapeType: "MapRoadPoint",
+                    message: "道路 \(crossID) 的成员点全部重合，无法恢复道路边。"
+                ))
+                continue
+            }
+            firstPoint = Array(firstPoint.prefix(2))
+            secondPoint = Array(secondPoint.prefix(2))
+            let firstID = (endpoints.0["id"] as? String) ?? ""
+            let secondID = (endpoints.1["id"] as? String) ?? ""
+            if secondPoint[0] < firstPoint[0]
+                || (secondPoint[0] == firstPoint[0]
+                    && (secondPoint[1] < firstPoint[1]
+                        || (secondPoint[1] == firstPoint[1]
+                            && secondID < firstID))) {
+                swap(&firstPoint, &secondPoint)
+            }
+            let cross: [String: Any] = [
+                "id": crossID,
+                "element_id": "",
+                "floor_id": floorID,
+                "points_m": [firstPoint, secondPoint],
+                "width_m": 0.0,
+                "provenance": "road_point_membership_v1",
+            ]
+            crosses.append(cross)
+            crossByKey[key] = cross
+            warnings.append(MapSourceWarning(
+                code: "road_cross_inferred_from_points",
+                row: 0,
+                floor: floorID,
+                shapeType: "MapRoadPoint",
+                message: "道路 \(crossID) 的线元素不可见或缺失，已由 \(crossNodes.count) 个可见道路点恢复拓扑。"
+            ))
         }
 
         // Edges: consecutive nodes projected onto each cross polyline.

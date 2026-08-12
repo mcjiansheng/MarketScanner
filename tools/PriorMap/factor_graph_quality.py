@@ -142,6 +142,7 @@ def evaluate_graph_quality(
         (float(report["p95_loop_edge_yaw_residual_deg"]) <= float(limits["loop_yaw_p95_max_deg"]), "loop_yaw_p95_exceeded", report["p95_loop_edge_yaw_residual_deg"]),
         (float(report["maximum_loop_edge_yaw_residual_deg"]) <= float(limits["loop_yaw_max_deg"]), "loop_yaw_max_exceeded", report["maximum_loop_edge_yaw_residual_deg"]),
         (ratio <= float(limits["high_residual_loop_ratio_max"]), "high_residual_loop_ratio_exceeded", ratio),
+        (report.get("quarantine_gate_passed") is True, "loop_quarantine_gate_failed", report.get("quarantined_loop_ratio")),
         (absolute_prior_gauge or float(report["maximum_pose_update_m"]) <= float(limits["maximum_pose_update_m"]), "maximum_pose_update_exceeded", report["maximum_pose_update_m"]),
         (absolute_prior_gauge or float(report["maximum_pose_update_yaw_deg"]) <= float(limits["maximum_pose_update_yaw_deg"]), "maximum_pose_yaw_update_exceeded", report["maximum_pose_update_yaw_deg"]),
         (relative_count / node_count >= float(limits["minimum_relative_factor_to_node_ratio"]), "relative_factor_coverage_too_low", relative_count / node_count),

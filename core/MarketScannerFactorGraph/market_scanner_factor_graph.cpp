@@ -1411,6 +1411,11 @@ struct FactorRecord
     Mat3 information;
     /// "odometry", "loop", "prior", "recovery".
     std::string kind;
+    /// Meaningful only for kPosePrior factors. Keeping the evidence kind
+    /// after same-node fusion is required so the optimizer and quality gate
+    /// can distinguish a robust multi-prior consensus from the operator-
+    /// selected initial map-frame gauge.
+    int32_t priorKind = -1;
 };
 
 struct FactorSetAudit
@@ -1418,6 +1423,10 @@ struct FactorSetAudit
     int64_t gapSegments = 0;
     int64_t aggregatedChains = 0;
     int64_t priorCount = 0;
+    int64_t initialMapPosePriorCount = 0;
+    int64_t robustConsensusPriorCount = 0;
+    int64_t robustConsensusUniquePriorNodes = 0;
+    int64_t longRangeLoopFactorCount = 0;
     int64_t priorConflicts = 0;
     /// V1R4 §6.5 count contract: only evidence that ACTUALLY became a
     /// factor counts. Raw input counts must never gate the run.
@@ -1617,6 +1626,14 @@ bool buildSkeletonFactors(
         factor.kind = isLoopType(link.type) ? "loop"
             : (link.type == rtabmap::Link::kVirtualClosure ? "recovery" : "loop");
         factors.push_back(factor);
+        if((link.type == rtabmap::Link::kGlobalClosure ||
+            link.type == rtabmap::Link::kLocalSpaceClosure ||
+            link.type == rtabmap::Link::kLocalTimeClosure) &&
+           std::llabs(static_cast<long long>(model.nodeIndex.at(factor.from)) -
+                      static_cast<long long>(model.nodeIndex.at(factor.to))) >= 30)
+        {
+            ++audit.longRangeLoopFactorCount;
+        }
         char line[160];
         snprintf(line, sizeof(line), "f:rel:%d:%lld:%lld:%.9f:%.9f:%.9f\n",
                  link.type, (long long)factor.from, (long long)factor.to,
@@ -1632,7 +1649,11 @@ bool buildSkeletonFactors(
     {
         std::vector<const AbsolutePrior *> records;
     };
-    std::map<int64_t, NodePriorBundle> bundles;
+    // Initial map pose remains a distinct factor even if online evidence
+    // happens to bind the same first node. Otherwise ordinary same-node
+    // fusion would silently change the operator-selected gauge before its
+    // authority is audited.
+    std::map<std::pair<int64_t, int32_t>, NodePriorBundle> bundles;
     for(size_t i = 0; i < priors.size(); ++i)
     {
         const AbsolutePrior & prior = priors[i];
@@ -1647,11 +1668,15 @@ bool buildSkeletonFactors(
             ++audit.rejectedPriors;
             continue;
         }
-        bundles[prior.nodeId].records.push_back(&prior);
+        const int32_t authorityClass =
+            prior.kind == MS_PRIOR_KIND_INITIAL_MAP_POSE ? 1 : 0;
+        bundles[std::make_pair(prior.nodeId, authorityClass)].records.push_back(&prior);
     }
+    std::set<int64_t> appliedPriorNodes;
+    std::set<int64_t> robustConsensusPriorNodes;
     const double kPriorFusionTranslationM = 0.75;
     const double kPriorFusionYawRad = 0.35;
-    for(std::map<int64_t, NodePriorBundle>::const_iterator b = bundles.begin();
+    for(std::map<std::pair<int64_t, int32_t>, NodePriorBundle>::const_iterator b = bundles.begin();
         b != bundles.end(); ++b)
     {
         const std::vector<const AbsolutePrior *> & records = b->second.records;
@@ -1689,10 +1714,15 @@ bool buildSkeletonFactors(
         Mat3 fusedInfo;
         std::memset(fusedInfo, 0, sizeof(fusedInfo));
         double yawSin = 0.0, yawCos = 0.0;
+        int64_t initialAuthorityRecords = 0;
         bool usable = true;
         for(size_t k = 0; k < bestCluster.size(); ++k)
         {
             const AbsolutePrior & prior = *records[bestCluster[k]];
+            if(prior.kind == MS_PRIOR_KIND_INITIAL_MAP_POSE)
+            {
+                ++initialAuthorityRecords;
+            }
             Mat3 info;
             std::memcpy(info, prior.information, sizeof(Mat3));
             InfoPolicyAudit priorAudit;
@@ -1714,6 +1744,15 @@ bool buildSkeletonFactors(
             audit.rejectedPriors += static_cast<int64_t>(bestCluster.size());
             continue;
         }
+        // There is exactly one operator-selected scan start. Multiple
+        // initial authorities at one node are an invalid identity contract,
+        // not evidence to average. Reject the whole fused factor fail-closed.
+        if(initialAuthorityRecords > 1)
+        {
+            audit.rejectedPriors += static_cast<int64_t>(bestCluster.size());
+            audit.priorConflicts += initialAuthorityRecords - 1;
+            continue;
+        }
         fused.x /= wSum;
         fused.y /= wSum;
         fused.yaw = std::atan2(yawSin, yawCos);
@@ -1726,20 +1765,41 @@ bool buildSkeletonFactors(
             continue;
         }
         FactorRecord factor;
-        factor.from = b->first;
-        factor.to = b->first;
+        factor.from = b->first.first;
+        factor.to = b->first.first;
         factor.type = rtabmap::Link::kPosePrior;
         factor.measurement = fused;
         std::memcpy(factor.information, fusedInfo, sizeof(Mat3));
         factor.kind = "prior";
+        factor.priorKind = initialAuthorityRecords == 1
+            ? MS_PRIOR_KIND_INITIAL_MAP_POSE
+            : records[bestCluster[0]]->kind;
         factors.push_back(factor);
         ++audit.priorCount;
-        ++audit.appliedUniquePriorNodes;
+        if(factor.priorKind == MS_PRIOR_KIND_INITIAL_MAP_POSE)
+        {
+            ++audit.initialMapPosePriorCount;
+        }
+        else
+        {
+            ++audit.robustConsensusPriorCount;
+            robustConsensusPriorNodes.insert(factor.from);
+        }
+        appliedPriorNodes.insert(factor.from);
         char line[160];
-        snprintf(line, sizeof(line), "f:prior:%lld:%.9f:%.9f:%.9f\n",
-                 (long long)b->first, fused.x, fused.y, fused.yaw);
+        snprintf(line, sizeof(line), "f:prior:%d:%lld:%.9f:%.9f:%.9f\n",
+                 factor.priorKind, (long long)factor.from,
+                 fused.x, fused.y, fused.yaw);
         factorHash.update(line, strlen(line));
         hashInformation(factorHash, "f:prior:info", fusedInfo);
+    }
+    audit.appliedUniquePriorNodes =
+        static_cast<int64_t>(appliedPriorNodes.size());
+    audit.robustConsensusUniquePriorNodes =
+        static_cast<int64_t>(robustConsensusPriorNodes.size());
+    if(audit.initialMapPosePriorCount > 1)
+    {
+        audit.priorConflicts += audit.initialMapPosePriorCount - 1;
     }
 
     audit.factorSetSha256 = factorHash.hex();
@@ -1777,6 +1837,13 @@ struct GaugeDiagnostics
     /// Max pairwise yaw spread of the candidates (rad), diagnostic.
     double yawSpreadRad = 0.0;
     bool anchored = false;
+    /// "none", "robust_prior_consensus", or "initial_map_pose".
+    /// The last form is an explicit operator-selected SE(2) gauge and is
+    /// publish-authoritative only when a long-range RTAB-Map loop also makes
+    /// the relative graph observable.
+    std::string authority = "none";
+    int64_t initialAuthorityCandidateCount = 0;
+    int64_t longRangeLoopFactorCount = 0;
     /// Valid when anchored: T_map_local robust gauge.
     SE2 mapFromLocal;
     /// Machine-readable reason when not anchored ("no_priors",
@@ -2017,6 +2084,7 @@ void estimateRobustGauge(
         return;
     }
     out.anchored = true;
+    out.authority = "robust_prior_consensus";
 }
 
 // MARK: - RobustSE2Optimizer (§11.4/§12) ----------------------------------------
@@ -2175,18 +2243,32 @@ bool optimizeSkeleton(
         // --- Map-frame gauge estimation from applied priors (§6.4/§8.4) -
         std::vector<const FactorRecord *> priorsApplied;
         std::vector<const FactorRecord *> relativeFactors;
+        int64_t componentLongRangeLoopFactorCount = 0;
         for(size_t f = 0; f < compFactors.size(); ++f)
         {
             if(compFactors[f]->type == rtabmap::Link::kPosePrior)
                 priorsApplied.push_back(compFactors[f]);
             else
+            {
                 relativeFactors.push_back(compFactors[f]);
+                if((compFactors[f]->type == rtabmap::Link::kGlobalClosure ||
+                    compFactors[f]->type == rtabmap::Link::kLocalSpaceClosure ||
+                    compFactors[f]->type == rtabmap::Link::kLocalTimeClosure) &&
+                   std::llabs(static_cast<long long>(
+                       model.nodeIndex.at(compFactors[f]->from)) -
+                              static_cast<long long>(
+                       model.nodeIndex.at(compFactors[f]->to))) >= 30)
+                {
+                    ++componentLongRangeLoopFactorCount;
+                }
+            }
         }
         bool gaugeAnchored = false;
         SE2 mapFromLocal;
         mapFromLocal.x = mapFromLocal.y = mapFromLocal.yaw = 0.0;
         GaugeDiagnostics gaugeDiag;
         gaugeDiag.componentId = it->first;
+        gaugeDiag.longRangeLoopFactorCount = componentLongRangeLoopFactorCount;
         if(!priorsApplied.empty())
         {
             // V1R5 §8.4: robust SE(2) gauge. candidate_i = T_map_i ×
@@ -2197,6 +2279,8 @@ bool optimizeSkeleton(
             // without an ambiguity gate). Fail-closed: a rejected gauge
             // un-anchors the component instead of falling back.
             std::vector<GaugeCandidate> candidates;
+            std::vector<GaugeCandidate> robustCandidates;
+            std::vector<GaugeCandidate> initialAuthorityCandidates;
             bool finite = true;
             for(size_t p = 0; p < priorsApplied.size(); ++p)
             {
@@ -2211,14 +2295,59 @@ bool optimizeSkeleton(
                 c.weight = std::max(1.0e-9,
                     0.5 * (prior.information[0] + prior.information[4]));
                 candidates.push_back(c);
+                if(prior.priorKind == MS_PRIOR_KIND_INITIAL_MAP_POSE)
+                    initialAuthorityCandidates.push_back(c);
+                else
+                    robustCandidates.push_back(c);
             }
+            gaugeDiag.initialAuthorityCandidateCount =
+                static_cast<int64_t>(initialAuthorityCandidates.size());
             if(!finite || candidates.empty())
             {
                 gaugeDiag.rejectReason = "non_finite_candidates";
             }
             else
             {
-                estimateRobustGauge(candidates, gaugeDiag);
+                // Automatic localization/recovery/manual priors still need
+                // the V1R5 multi-node robust consensus. The operator-selected
+                // start pose is evaluated separately so its one explicit
+                // x/y/yaw authority cannot be mistaken for three independent
+                // observations or contaminate the RANSAC cluster.
+                estimateRobustGauge(robustCandidates, gaugeDiag);
+                gaugeDiag.initialAuthorityCandidateCount =
+                    static_cast<int64_t>(initialAuthorityCandidates.size());
+                gaugeDiag.longRangeLoopFactorCount =
+                    componentLongRangeLoopFactorCount;
+                if(!gaugeDiag.anchored && initialAuthorityCandidates.size() == 1)
+                {
+                    if(componentLongRangeLoopFactorCount > 0)
+                    {
+                        gaugeDiag.candidateCount = 1;
+                        gaugeDiag.inlierCount = 1;
+                        gaugeDiag.outlierCount = 0;
+                        gaugeDiag.consensusRatio = 1.0;
+                        gaugeDiag.secondClusterRatio = 0.0;
+                        gaugeDiag.translationSpreadM = 0.0;
+                        gaugeDiag.yawSpreadRad = 0.0;
+                        gaugeDiag.mapFromLocal = initialAuthorityCandidates[0].gauge;
+                        gaugeDiag.anchored = se2Finite(gaugeDiag.mapFromLocal);
+                        gaugeDiag.authority = gaugeDiag.anchored
+                            ? "initial_map_pose" : "none";
+                        gaugeDiag.rejectReason = gaugeDiag.anchored
+                            ? "" : "non_finite_gauge";
+                    }
+                    else
+                    {
+                        gaugeDiag.rejectReason =
+                            "initial_map_pose_requires_long_range_loop";
+                    }
+                }
+                else if(!gaugeDiag.anchored &&
+                        initialAuthorityCandidates.size() > 1)
+                {
+                    gaugeDiag.rejectReason =
+                        "multiple_initial_map_pose_authorities";
+                }
                 if(gaugeDiag.anchored)
                 {
                     gaugeAnchored = true;
@@ -2716,9 +2845,24 @@ MSFactorGraphDisposition decideDisposition(
     }
     // §6.5 count contract: only APPLIED priors (factors actually built
     // from valid evidence) count — never raw input counts.
-    const int64_t appliedPriors = metrics.factorAudit.priorCount;
-    const int64_t appliedUniqueNodes = metrics.factorAudit.appliedUniquePriorNodes;
-    if(appliedPriors < kMinimumAppliedPriors || appliedUniqueNodes < kMinimumAppliedPriors ||
+    const bool robustPriorAuthority =
+        metrics.factorAudit.robustConsensusPriorCount >= kMinimumAppliedPriors &&
+        metrics.factorAudit.robustConsensusUniquePriorNodes >= kMinimumAppliedPriors;
+    int64_t initialPoseGaugeAuthorityCount = 0;
+    for(size_t i = 0; i < metrics.gaugeDiagnostics.size(); ++i)
+    {
+        if(metrics.gaugeDiagnostics[i].anchored &&
+           metrics.gaugeDiagnostics[i].authority == "initial_map_pose" &&
+           metrics.gaugeDiagnostics[i].initialAuthorityCandidateCount == 1 &&
+           metrics.gaugeDiagnostics[i].longRangeLoopFactorCount > 0)
+        {
+            ++initialPoseGaugeAuthorityCount;
+        }
+    }
+    const bool initialPoseAuthority =
+        metrics.factorAudit.initialMapPosePriorCount == 1 &&
+        initialPoseGaugeAuthorityCount == 1;
+    if((!robustPriorAuthority && !initialPoseAuthority) ||
        metrics.anchoredComponents < 1)
     {
         return MS_FACTOR_GRAPH_LOCAL_FRAME_ONLY;
@@ -2860,7 +3004,7 @@ std::string qualityJSON(
     }
     std::ostringstream os;
     os.precision(9);
-    os << "{\"format\": \"MarketScannerGraphQuality\", \"version\": 2, "
+    os << "{\"format\": \"MarketScannerGraphQuality\", \"version\": 3, "
        << "\"policy_version\": \"" << MS_QUALITY_POLICY_VERSION << "\", "
        << "\"abi_version\": " << MS_FACTOR_GRAPH_ABI_VERSION << ", "
        << "\"path\": \"" << jsonEscape(path) << "\", "
@@ -2876,6 +3020,14 @@ std::string qualityJSON(
        << "\"applied_prior_factor_count\": " << m.factorAudit.priorCount << ", "
        << "\"unique_prior_node_count\": " << m.factorAudit.appliedUniquePriorNodes << ", "
        << "\"applied_prior_count\": " << m.factorAudit.priorCount << ", "
+       << "\"initial_map_pose_prior_count\": "
+       << m.factorAudit.initialMapPosePriorCount << ", "
+       << "\"robust_consensus_prior_count\": "
+       << m.factorAudit.robustConsensusPriorCount << ", "
+       << "\"robust_consensus_unique_prior_node_count\": "
+       << m.factorAudit.robustConsensusUniquePriorNodes << ", "
+       << "\"long_range_loop_factor_count\": "
+       << m.factorAudit.longRangeLoopFactorCount << ", "
        << "\"rejected_priors\": " << m.factorAudit.rejectedPriors << ", "
        << "\"fused_prior_duplicates\": " << m.factorAudit.fusedPriorDuplicates << ", "
        << "\"prior_conflicts\": " << m.factorAudit.priorConflicts << ", "
@@ -2942,6 +3094,11 @@ std::string qualityJSON(
            << ", \"gauge_second_cluster_ratio\": " << g.secondClusterRatio
            << ", \"gauge_translation_spread_m\": " << g.translationSpreadM
            << ", \"gauge_yaw_spread_rad\": " << g.yawSpreadRad
+           << ", \"gauge_authority\": \"" << jsonEscape(g.authority) << "\""
+           << ", \"initial_authority_candidate_count\": "
+           << g.initialAuthorityCandidateCount
+           << ", \"long_range_loop_factor_count\": "
+           << g.longRangeLoopFactorCount
            << ", \"gauge_anchored\": " << (g.anchored ? "true" : "false")
            << ", \"gauge_reject_reason\": \"" << jsonEscape(g.rejectReason) << "\"}";
     }
@@ -3242,6 +3399,15 @@ MSFactorGraphOutcomeC runPipeline(const MSFactorGraphRequestC * request, const R
     for(int64_t i = 0; request->absolute_priors && i < request->absolute_prior_count; ++i)
     {
         const MSAbsolutePriorC & src = request->absolute_priors[i];
+        if(src.kind != MS_PRIOR_KIND_LOCALIZATION &&
+           src.kind != MS_PRIOR_KIND_RECOVERY &&
+           src.kind != MS_PRIOR_KIND_MANUAL &&
+           src.kind != MS_PRIOR_KIND_INITIAL_MAP_POSE)
+        {
+            return makeErrorOutcome(
+                "absolute prior kind is unknown",
+                MS_FACTOR_GRAPH_NON_RECOVERABLE_FAIL);
+        }
         if(!std::isfinite(src.map_x) || !std::isfinite(src.map_y) || !std::isfinite(src.map_yaw))
         {
             continue; // non-finite evidence is rejected, never applied
@@ -3412,19 +3578,12 @@ MSFactorGraphOutcomeC runPipeline(const MSFactorGraphRequestC * request, const R
         // (or whose candidates were non-finite) lands in
         // gaugeFailedPriorNodes and is NOT anchored here, so its rows
         // are never publish eligible.
-        std::map<int64_t, int64_t> priorComponentOfNode;
         for(size_t s = 0; s < skeleton.size(); ++s)
         {
-            priorComponentOfNode[model.nodes[skeleton[s]].id] = skeletonComponent[s];
-        }
-        for(size_t i = 0; i < priors.size(); ++i)
-        {
-            if(gaugeFailedPriorNodes.count(priors[i].nodeId)) continue;
-            std::map<int64_t, int64_t>::const_iterator c =
-                priorComponentOfNode.find(priors[i].nodeId);
-            if(c != priorComponentOfNode.end())
+            const int64_t nodeId = model.nodes[skeleton[s]].id;
+            if(componentGauge.count(find(nodeId)))
             {
-                anchoredComponents.insert(c->second);
+                anchoredComponents.insert(skeletonComponent[s]);
             }
         }
         // Per-skeleton-node gauge mapping (§6.4): quality deformation

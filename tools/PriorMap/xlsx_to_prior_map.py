@@ -384,18 +384,13 @@ def _road_graph(
         nodes.append(node)
         for code in cross_codes:
             key = (element["floor_id"], code)
-            if key not in cross_by_key:
-                warnings.append(
-                    {
-                        "code": "missing_cross",
-                        "element_id": element["id"],
-                        "floor": element["floor_id"],
-                        "cross_id": code,
-                        "message": f"道路点引用了不存在的道路 {code}。",
-                    }
-                )
-            else:
-                nodes_by_cross[key].append(node)
+            # Some production workbooks intentionally mark every MapCross
+            # drawing hidden while keeping visible MapRoadPoint membership in
+            # `crossCodes`.  The old active-element filter consequently kept
+            # all nodes but deleted every edge.  Always retain membership here;
+            # after the complete node inventory is known, a missing line can be
+            # deterministically reconstructed from two or more member points.
+            nodes_by_cross[key].append(node)
         if not cross_codes:
             warnings.append(
                 {
@@ -406,9 +401,87 @@ def _road_graph(
                 }
             )
 
+    # Reconstruct an omitted/hidden straight road centreline from its visible
+    # member points. The active package manifest binds these road points, while
+    # hidden MapCross source rows are intentionally excluded. Using hidden
+    # geometry directly would make the derived graph impossible for package
+    # validators to reproduce until a future topology-source schema binds it.
+    for key, cross_nodes in sorted(nodes_by_cross.items()):
+        if key in cross_by_key:
+            continue
+        if len(cross_nodes) < 2:
+            node = cross_nodes[0]
+            warnings.append(
+                {
+                    "code": "missing_cross",
+                    "element_id": node["element_id"],
+                    "floor": key[0],
+                    "cross_id": key[1],
+                    "message": f"道路点引用了不存在的道路 {key[1]}，且成员不足，无法恢复道路边。",
+                }
+            )
+            continue
+        ordered_nodes = sorted(cross_nodes, key=lambda item: str(item["id"]))
+        endpoint_pair: tuple[dict[str, Any], dict[str, Any]] | None = None
+        endpoint_key: tuple[float, str, str] | None = None
+        for index, first in enumerate(ordered_nodes):
+            for second in ordered_nodes[index + 1 :]:
+                first_id, second_id = sorted((str(first["id"]), str(second["id"])))
+                candidate_key = (
+                    _distance(first["position_m"], second["position_m"]),
+                    first_id,
+                    second_id,
+                )
+                if endpoint_key is None or candidate_key[0] > endpoint_key[0] + 1.0e-12 or (
+                    abs(candidate_key[0] - endpoint_key[0]) <= 1.0e-12
+                    and candidate_key[1:] < endpoint_key[1:]
+                ):
+                    endpoint_key = candidate_key
+                    endpoint_pair = (first, second)
+        if endpoint_pair is None or endpoint_key is None or endpoint_key[0] <= 1.0e-9:
+            node = ordered_nodes[0]
+            warnings.append(
+                {
+                    "code": "missing_cross",
+                    "element_id": node["element_id"],
+                    "floor": key[0],
+                    "cross_id": key[1],
+                    "message": f"道路 {key[1]} 的成员点全部重合，无法恢复道路边。",
+                }
+            )
+            continue
+        first, second = endpoint_pair
+        first_point = list(map(float, first["position_m"][:2]))
+        second_point = list(map(float, second["position_m"][:2]))
+        if (second_point[0], second_point[1], str(second["id"])) < (
+            first_point[0], first_point[1], str(first["id"])
+        ):
+            first_point, second_point = second_point, first_point
+        cross = {
+            "id": key[1],
+            "element_id": "",
+            "floor_id": key[0],
+            "points_m": [first_point, second_point],
+            "width_m": 0.0,
+            "provenance": "road_point_membership_v1",
+        }
+        crosses.append(cross)
+        cross_by_key[key] = cross
+        warnings.append(
+            {
+                "code": "road_cross_inferred_from_points",
+                "floor": key[0],
+                "cross_id": key[1],
+                "member_count": len(cross_nodes),
+                "message": f"道路 {key[1]} 的线元素不可见或缺失，已由 {len(cross_nodes)} 个可见道路点恢复拓扑。",
+            }
+        )
+
     edges_by_key: dict[tuple[str, str], dict[str, Any]] = {}
     for key, cross_nodes in nodes_by_cross.items():
-        cross = cross_by_key[key]
+        cross = cross_by_key.get(key)
+        if cross is None:
+            continue
         ordered = sorted(
             cross_nodes,
             key=lambda item: (

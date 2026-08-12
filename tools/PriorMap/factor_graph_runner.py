@@ -94,8 +94,14 @@ def _select_absolute_priors(
         translation = math.hypot(constraint.x - current.x, constraint.y - current.y)
         yaw = abs(_normalize_angle(constraint.yaw - current.yaw))
         is_manual_anchor = constraint.kind == "manual_anchor"
+        is_initial_map_pose = constraint.kind == "initial_map_pose"
         trusted_manual_anchor = is_manual_anchor and constraint.trusted_absolute
-        if is_manual_anchor and not trusted_manual_anchor:
+        if is_initial_map_pose:
+            # The operator-selected start is the global gauge authority.  It
+            # is intentionally not compared with the drifted VIO baseline:
+            # that difference is the correction we are solving for.
+            exceeds_gate = False
+        elif is_manual_anchor and not trusted_manual_anchor:
             exceeds_gate = (
                 translation > UNVERIFIED_MANUAL_ANCHOR_MAX_TRANSLATION_M
                 or yaw > UNVERIFIED_MANUAL_ANCHOR_MAX_YAW_RAD
@@ -219,6 +225,7 @@ def run_relative_se2_factor_graph(
         hard_reject_translation_m=hard_reject_translation_m,
         hard_reject_yaw_rad=hard_reject_yaw_rad,
     )
+    limits = quality_policy["limits"]
     try:
         with tempfile.TemporaryDirectory(prefix="marketscanner-factor-graph-") as temporary:
             root = Path(temporary)
@@ -236,6 +243,15 @@ def run_relative_se2_factor_graph(
                 "--initial-x", format(float(baseline[0].x), ".17g"),
                 "--initial-y", format(float(baseline[0].y), ".17g"),
                 "--initial-yaw", format(float(baseline[0].yaw), ".17g"),
+                "--loop-quarantine-translation-m", format(
+                    float(limits["high_residual_loop_translation_m"]), ".17g"
+                ),
+                "--loop-quarantine-yaw-rad", format(
+                    math.radians(float(limits["high_residual_loop_yaw_deg"])), ".17g"
+                ),
+                "--maximum-quarantined-loop-ratio", format(
+                    float(limits["high_residual_loop_ratio_max"]), ".17g"
+                ),
                 "--iterations", str(DEFAULT_ITERATIONS),
                 "--epsilon", format(DEFAULT_EPSILON, ".17g"),
             ]
@@ -246,11 +262,6 @@ def run_relative_se2_factor_graph(
                 text=True,
                 timeout=timeout_seconds,
             )
-            if completed.returncode != 0:
-                detail = (completed.stderr or completed.stdout or "native solver failed").strip()
-                raise FactorGraphRunnerError(
-                    f"Native relative SE(2) factor graph failed ({completed.returncode}): {detail[-2000:]}"
-                )
             try:
                 payload = json.loads(
                     result_path.read_text(encoding="utf-8"),
@@ -259,7 +270,13 @@ def run_relative_se2_factor_graph(
                     ),
                 )
             except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+                detail = (completed.stderr or completed.stdout or "native solver failed").strip()
                 raise FactorGraphRunnerError("Native factor graph result is unreadable.") from exc
+            if completed.returncode not in {0, 3}:
+                detail = (completed.stderr or completed.stdout or "native solver failed").strip()
+                raise FactorGraphRunnerError(
+                    f"Native relative SE(2) factor graph failed ({completed.returncode}): {detail[-2000:]}"
+                )
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise FactorGraphRunnerError(f"Native factor graph execution failed: {exc}") from exc
     if _sha256(database) != database_hash:
@@ -273,8 +290,13 @@ def run_relative_se2_factor_graph(
             quality_policy=quality_policy,
             quality_policy_sha256=quality_policy_sha256,
             verified_absolute_gauge_authority=any(
-                constraint.kind == "manual_anchor"
-                and getattr(constraint, "trusted_absolute", False) is True
+                (
+                    constraint.kind == "initial_map_pose"
+                    or (
+                        constraint.kind == "manual_anchor"
+                        and getattr(constraint, "trusted_absolute", False) is True
+                    )
+                )
                 for constraint in selected
             ),
         )
@@ -331,9 +353,15 @@ def run_relative_se2_factor_graph(
         "absolute_constraint_rejected_count": len(rejected),
         "absolute_prior_uncertainty_schema": "translation_sigma_m_and_yaw_sigma_rad_v2",
         "verified_absolute_gauge_authority": any(
-            constraint.kind == "manual_anchor"
-            and getattr(constraint, "trusted_absolute", False) is True
+            constraint.kind == "initial_map_pose"
+            or (
+                constraint.kind == "manual_anchor"
+                and getattr(constraint, "trusted_absolute", False) is True
+            )
             for constraint in selected
+        ),
+        "initial_map_pose_constraint_count": sum(
+            constraint.kind == "initial_map_pose" for constraint in selected
         ),
     }
     return optimized, accepted, rejected, report

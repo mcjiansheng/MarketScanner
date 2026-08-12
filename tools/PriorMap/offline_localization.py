@@ -65,6 +65,8 @@ MANUAL_ANCHOR_YAW_SIGMA_RAD = math.radians(20.0)
 MANUAL_ANCHOR_WEIGHT = 1.0 / (
     MANUAL_ANCHOR_TRANSLATION_SIGMA_M * MANUAL_ANCHOR_TRANSLATION_SIGMA_M
 )
+INITIAL_MAP_POSE_TRANSLATION_SIGMA_M = 1.0
+INITIAL_MAP_POSE_YAW_SIGMA_RAD = math.radians(15.0)
 UNVERIFIED_MANUAL_ANCHOR_MAX_TRANSLATION_M = 5.0
 UNVERIFIED_MANUAL_ANCHOR_MAX_YAW_RAD = math.radians(30.0)
 SESSION_INPUT_FILE_NAMES_V1 = (
@@ -5391,6 +5393,43 @@ def _render_localized_version(
 
     constraints: list[AbsoluteConstraint] = []
     constraint_records: list[dict[str, Any]] = []
+    # The selected start and heading are the only map-frame information that
+    # exists even when online structure matching produced no accepted frame.
+    # Keep it as an explicit, moderately uncertain factor instead of merely
+    # pre-aligning the first pose.  This lets long routes distribute drift
+    # correction through the full relative graph while exposing the operator
+    # uncertainty in the report.
+    metadata_initial = _pose_from(metadata.get("initialMapPose"))
+    if metadata_initial is not None and baseline:
+        constraints.append(
+            AbsoluteConstraint(
+                identifier="initial-map-pose-000001",
+                node_index=0,
+                x=metadata_initial[0],
+                y=metadata_initial[1],
+                yaw=metadata_initial[2],
+                weight=1.0 / (INITIAL_MAP_POSE_TRANSLATION_SIGMA_M ** 2),
+                kind="initial_map_pose",
+                source={
+                    "uncertainty_source": "operator_selected_initial_pose_policy_v1",
+                    "metadata_key": "initialMapPose",
+                },
+                translation_sigma_m=INITIAL_MAP_POSE_TRANSLATION_SIGMA_M,
+                yaw_sigma_rad=INITIAL_MAP_POSE_YAW_SIGMA_RAD,
+                trusted_absolute=True,
+            )
+        )
+        constraint_records.append(
+            {
+                "constraint_id": "initial-map-pose-000001",
+                "kind": "initial_map_pose",
+                "status": "accepted",
+                "node_index": 0,
+                "uncertainty_source": "operator_selected_initial_pose_policy_v1",
+                "translation_sigma_m": INITIAL_MAP_POSE_TRANSLATION_SIGMA_M,
+                "yaw_sigma_deg": math.degrees(INITIAL_MAP_POSE_YAW_SIGMA_RAD),
+            }
+        )
     for sequence, record in enumerate(raw_constraints, start=1):
         pose = _pose_from(_field(record, "estimated_pose", "estimatedPose"))
         if pose is None:
@@ -6123,6 +6162,9 @@ def _render_localized_version(
             replay_parameters["rtabmap_global_graph_incomplete"]
         ),
         "manual_anchor_recovery": raw_manual_anchor_recovery,
+        "initial_map_pose_constraint_count": factor_graph_report.get(
+            "initial_map_pose_constraint_count", 0
+        ),
         "upstream_processing": upstream_processing_report,
         "ignored_conflicting_source_constraint_count": sum(
             item.get("kind") == "online_structure" for item in rejected

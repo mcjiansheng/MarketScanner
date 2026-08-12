@@ -5444,6 +5444,83 @@ class PriorMapConversionTests(unittest.TestCase):
         self.assertNotIn("f1-r3", identifiers)
         self.assertEqual(index.query_road_edge_ids("1", 5.0, -5.0, 0.5), ["1:1--2"])
 
+    def test_hidden_cross_topology_is_recovered_from_visible_road_points(self) -> None:
+        workbook = self.root / "hidden-cross.xlsx"
+        rows = [
+            (
+                "1",
+                json.dumps(
+                    {
+                        "shapeType": "MapShelf",
+                        "x": 100,
+                        "y": 100,
+                        "width": 200,
+                        "height": 80,
+                        "visible": True,
+                    }
+                ),
+            ),
+            (
+                "1",
+                json.dumps(
+                    {
+                        "shapeType": "MapCross",
+                        "points": [0, 500, 1000, 500],
+                        "lineWidth": 200,
+                        "code": "C-hidden",
+                        "visible": False,
+                    }
+                ),
+            ),
+            *(
+                (
+                    "1",
+                    json.dumps(
+                        {
+                            "shapeType": "MapRoadPoint",
+                            "x": x,
+                            "y": 500,
+                            "width": 20,
+                            "height": 20,
+                            "code": node_id,
+                            "crossCodes": ["C-hidden"],
+                            "visible": True,
+                        }
+                    ),
+                )
+                for node_id, x in (("A", 100), ("B", 500), ("C", 900))
+            ),
+        ]
+        write_workbook(workbook, rows)
+        package = convert_workbook(
+            workbook, self.root / "hidden-cross-package", store_id="s1"
+        )
+        graph = json.loads((package / "road_graph.json").read_text())
+        self.assertEqual({node["id"] for node in graph["nodes"]}, {"A", "B", "C"})
+        self.assertEqual(len(graph["edges"]), 2)
+        self.assertEqual(
+            graph["crosses"],
+            [
+                {
+                    "element_id": "",
+                    "floor_id": "1",
+                    "id": "C-hidden",
+                    "points_m": [[1.0, -5.0], [9.0, -5.0]],
+                    "provenance": "road_point_membership_v1",
+                    "width_m": 0.0,
+                }
+            ],
+        )
+        self.assertEqual(graph["statistics"]["isolated_node_count"], 0)
+        report = json.loads(
+            (package / "validation_report.json").read_text(encoding="utf-8")
+        )
+        self.assertIn(
+            "road_cross_inferred_from_points",
+            {warning["code"] for warning in report["warnings"]},
+        )
+        self.assertTrue(validate_package(package)["valid"])
+
     def test_spatial_road_query_does_not_scan_a_large_index(self) -> None:
         road_cells = {
             f"{cell_x},{cell_y}": [f"edge-{cell_x}-{cell_y}"]

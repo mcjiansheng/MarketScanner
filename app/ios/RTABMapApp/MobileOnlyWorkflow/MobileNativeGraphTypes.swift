@@ -40,7 +40,7 @@ struct MobileAbsolutePrior {
     var mapYawRad: Double
     /// Row-major 3x3 planar information.
     var information3x3: [Double]
-    /// 0 localization, 1 recovery, 2 manual.
+    /// 0 localization, 1 recovery, 2 manual, 3 operator-selected initial pose.
     var kind: Int32
     var episodeID: Int64
 }
@@ -92,8 +92,8 @@ enum MobileNativeFactorGraphError: Error, LocalizedError {
 /// native ABI or quality-format change cannot silently reach RunSummary.
 struct MobileNativeQualityReport {
     static let expectedFormat = "MarketScannerGraphQuality"
-    static let expectedVersion: Int64 = 2
-    static let expectedABIVersion: Int64 = 4
+    static let expectedVersion: Int64 = 3
+    static let expectedABIVersion: Int64 = 5
     static let expectedPolicyVersion = "candidate-1"
 
     struct ResidualTriple {
@@ -150,6 +150,9 @@ struct MobileNativeQualityReport {
         let secondClusterRatio: Double
         let translationSpreadM: Double
         let yawSpreadRad: Double
+        let authority: String
+        let initialAuthorityCandidateCount: Int64
+        let longRangeLoopFactorCount: Int64
         let anchored: Bool
         let rejectReason: String
     }
@@ -182,6 +185,10 @@ struct MobileNativeQualityReport {
     let appliedPriorFactorCount: Int64
     let uniquePriorNodeCount: Int64
     let appliedPriorCount: Int64
+    let initialMapPosePriorCount: Int64
+    let robustConsensusPriorCount: Int64
+    let robustConsensusUniquePriorNodeCount: Int64
+    let longRangeLoopFactorCount: Int64
     let rejectedPriors: Int64
     let fusedPriorDuplicates: Int64
     let priorConflicts: Int64
@@ -218,6 +225,9 @@ struct MobileNativeQualityReport {
         "tracking_session_id", "absolute_prior_count",
         "parsed_valid_prior_count", "applied_prior_factor_count",
         "unique_prior_node_count", "applied_prior_count", "rejected_priors",
+        "initial_map_pose_prior_count", "long_range_loop_factor_count",
+        "robust_consensus_prior_count",
+        "robust_consensus_unique_prior_node_count",
         "fused_prior_duplicates", "prior_conflicts", "component_count",
         "total_components", "anchored_components", "publish_nodes",
         "publish_ratio", "anchored_ratio", "isolated_count",
@@ -457,7 +467,9 @@ struct MobileNativeQualityReport {
             "component_id", "gauge_candidate_count", "gauge_inlier_count",
             "gauge_outlier_count", "gauge_consensus_ratio",
             "gauge_second_cluster_ratio", "gauge_translation_spread_m",
-            "gauge_yaw_spread_rad", "gauge_anchored", "gauge_reject_reason",
+            "gauge_yaw_spread_rad", "gauge_authority",
+            "initial_authority_candidate_count", "long_range_loop_factor_count",
+            "gauge_anchored", "gauge_reject_reason",
         ]
         for value in gaugeValues {
             guard let gaugeObject = value as? [String: Any] else {
@@ -476,6 +488,12 @@ struct MobileNativeQualityReport {
                 translationSpreadM: try number(
                     gaugeObject, "gauge_translation_spread_m"),
                 yawSpreadRad: try number(gaugeObject, "gauge_yaw_spread_rad"),
+                authority: try string(
+                    gaugeObject, "gauge_authority", maximumLength: 64),
+                initialAuthorityCandidateCount: try integer(
+                    gaugeObject, "initial_authority_candidate_count"),
+                longRangeLoopFactorCount: try integer(
+                    gaugeObject, "long_range_loop_factor_count"),
                 anchored: try boolean(gaugeObject, "gauge_anchored"),
                 rejectReason: try string(
                     gaugeObject, "gauge_reject_reason",
@@ -484,7 +502,13 @@ struct MobileNativeQualityReport {
                   gauge.inlierCount <= gauge.candidateCount,
                   gauge.outlierCount <= gauge.candidateCount,
                   gauge.inlierCount + gauge.outlierCount <= gauge.candidateCount,
-                  gauge.anchored == gauge.rejectReason.isEmpty else {
+                  ["none", "robust_prior_consensus", "initial_map_pose"]
+                    .contains(gauge.authority),
+                  gauge.anchored == gauge.rejectReason.isEmpty,
+                  gauge.anchored == (gauge.authority != "none"),
+                  gauge.authority != "initial_map_pose"
+                    || (gauge.initialAuthorityCandidateCount == 1
+                        && gauge.longRangeLoopFactorCount > 0) else {
                 throw invalid("gauge_by_component entry is inconsistent")
             }
             gauges.append(gauge)
@@ -536,6 +560,18 @@ struct MobileNativeQualityReport {
             appliedPriorCount: try integer(
                 root, "applied_prior_count",
                 maximum: MobileNativeOutcomeContract.maximumFactors),
+            initialMapPosePriorCount: try integer(
+                root, "initial_map_pose_prior_count",
+                maximum: MobileNativeOutcomeContract.maximumPriors),
+            robustConsensusPriorCount: try integer(
+                root, "robust_consensus_prior_count",
+                maximum: MobileNativeOutcomeContract.maximumPriors),
+            robustConsensusUniquePriorNodeCount: try integer(
+                root, "robust_consensus_unique_prior_node_count",
+                maximum: MobileNativeOutcomeContract.maximumPriors),
+            longRangeLoopFactorCount: try integer(
+                root, "long_range_loop_factor_count",
+                maximum: MobileNativeOutcomeContract.maximumFactors),
             rejectedPriors: try integer(
                 root, "rejected_priors",
                 maximum: MobileNativeOutcomeContract.maximumPriors),
@@ -579,6 +615,10 @@ struct MobileNativeQualityReport {
         guard report.parsedValidPriorCount == report.absolutePriorCount,
               report.appliedPriorFactorCount == report.appliedPriorCount,
               report.uniquePriorNodeCount <= report.appliedPriorCount,
+              report.initialMapPosePriorCount
+                + report.robustConsensusPriorCount == report.appliedPriorCount,
+              report.robustConsensusUniquePriorNodeCount
+                <= report.robustConsensusPriorCount,
               report.anchoredComponents <= report.totalComponents,
               report.publishNodes <= report.health.nodeCount else {
             throw invalid("cross-field counts are inconsistent")

@@ -4810,8 +4810,10 @@ let postReset = hypothesisTracker.observe(
 require(!postReset.trusted && postReset.supportFrames == 1,
         "manual reset must require fresh temporal support")
 
-// P7R3 R1: lifetime local support is discarded at episode start. The same
-// alignment must earn four new observations before Recovery can trust it.
+// P7R3 R1: lifetime local support remains dormant at episode start, while the
+// same alignment must still earn four new observations before Recovery trusts
+// it. This lets a reliable loop reactivate an old shelf hypothesis without
+// turning old support into authority.
 let staleAlignment = PriorMapAlignmentTransform(
     translationXM: 1.5, translationYM: -2.0, yawRad: 0.1)
 hypothesisTracker.reset()
@@ -4941,8 +4943,9 @@ require(recoveryController.activeEpisode?.validMatcherAttempts == 2,
 require(recoveryController.activeEpisode?.triggerCount == 2,
         "R5 repeated trigger must be bounded diagnostic evidence")
 
-// P7R3 R6/R7/R10: every exit clears wide-search tracks. The selected map
-// alignment is retained by the localizer anchor, never by a temporary track.
+// P7R3 R6/R7/R10: a timed-out wide-search track remains a bounded dormant
+// candidate, but local mode must still require three fresh frames before it
+// can authorize another correction.
 hypothesisTracker.endRecoveryEpisode(id: 42, outcome: .timedOut)
 let localAfterTimeout = hypothesisTracker.observe(
     arkitPose: safetyOrigin,
@@ -4955,7 +4958,7 @@ let localAfterTimeout = hypothesisTracker.observe(
     uniqueness: 0.5,
     recoverySearch: false)
 require(!localAfterTimeout.trusted && localAfterTimeout.supportFrames == 1,
-        "R6 local mode must not inherit a timed-out wide-search track")
+        "R6 local mode must require fresh support after a timed-out recovery")
 _ = recoveryController.finish(.manualReset, now: 112)
 require(recoveryController.activeEpisode == nil,
         "R10 manual reset must terminate the active episode")
@@ -9521,21 +9524,26 @@ do {
 // real .xlsx fixtures are produced by the Python harness).
 // =====================================================================
 
-// I2/I14: CSV baseline with two floors imports cleanly and produces the
-// expected element inventory.
+// I2/I14: CSV baseline with two floors imports cleanly and preserves the
+// complete canonical source inventory. Hidden source elements remain in the
+// import result for audit and are filtered only by the compiler's active
+// element stage.
 do {
     let csv = """
     floor,element
     1,"{""shapeType"":""MapShelf"",""x"":100,""y"":200,""width"":300,""height"":100,""code"":""S1"",""visible"":true}"
     1,"{""shapeType"":""MapCross"",""points"":[0,500,1000,500],""lineWidth"":200,""code"":""C1"",""visible"":true}"
     2,"{""shapeType"":""MapRoadPoint"",""x"":100,""y"":500,""width"":20,""height"":20,""code"":1,""crossCodes"":[""C1""]}"
+    1,"{""shapeType"":""MapCross"",""points"":[100,700,900,700],""lineWidth"":180,""code"":""C-hidden"",""visible"":false}"
+    1,"{""shapeType"":""MapRoadPoint"",""x"":100,""y"":700,""width"":20,""height"":20,""code"":""A"",""crossCodes"":[""C-hidden""]}"
+    1,"{""shapeType"":""MapRoadPoint"",""x"":900,""y"":700,""width"":20,""height"":20,""code"":""B"",""crossCodes"":[""C-hidden""]}"
     """
     let outcome = try CSVMapSourceImporter.importSource(
         data: Data(csv.utf8),
         contract: .topLeft)
     require(
-        outcome.elements.count == 3,
-        "I2 CSV must import 3 elements, got \(outcome.elements.count)")
+        outcome.elements.count == 6,
+        "I2 CSV must import 6 source elements, got \(outcome.elements.count)")
     let floors = Set(outcome.elements.map { $0.floorId })
     require(
         floors == ["1", "2"],
@@ -9550,7 +9558,7 @@ do {
         outcome.warnings.allSatisfy {
             $0.code == "unknown_shape_type"
                 || $0.code == "invalid_geometry"
-                || $0.code == "hidden_element"
+                || $0.code == "hidden_element_ignored"
         },
         "I2 importer warnings must be normalization-only, got \(outcome.warnings.map { $0.code })")
     // Shelf normalization: x=100,y=200,w=300,h=100 -> CCW map polygon
@@ -9896,6 +9904,9 @@ do {
     1,"{""shapeType"":""MapShelf"",""x"":100,""y"":200,""width"":300,""height"":100,""code"":""S1"",""visible"":true}"
     1,"{""shapeType"":""MapCross"",""points"":[0,500,1000,500],""lineWidth"":200,""code"":""C1"",""visible"":true}"
     2,"{""shapeType"":""MapRoadPoint"",""x"":100,""y"":500,""width"":20,""height"":20,""code"":1,""crossCodes"":[""C1""]}"
+    1,"{""shapeType"":""MapCross"",""points"":[100,700,900,700],""lineWidth"":180,""code"":""C-hidden"",""visible"":false}"
+    1,"{""shapeType"":""MapRoadPoint"",""x"":100,""y"":700,""width"":20,""height"":20,""code"":""A"",""crossCodes"":[""C-hidden""]}"
+    1,"{""shapeType"":""MapRoadPoint"",""x"":900,""y"":700,""width"":20,""height"":20,""code"":""B"",""crossCodes"":[""C-hidden""]}"
     """
     let outcome = try CSVMapSourceImporter.importSource(
         data: Data(csv.utf8), contract: .topLeft)
@@ -9911,8 +9922,8 @@ do {
     let result = try MobilePriorMapCompiler.compile(
         canonicalSource: source, outputDirectory: output)
     require(
-        result.floorCount == 2 && result.elementCount == 3,
-        "C7 mobile compile must yield 2 floors / 3 elements, got \(result.floorCount)/\(result.elementCount)")
+        result.floorCount == 2 && result.elementCount == 5,
+        "C7 mobile compile must yield 2 floors / 5 active elements, got \(result.floorCount)/\(result.elementCount)")
     require(
         !result.packageSHA256.isEmpty,
         "C7 mobile compile must self-validate and return a package SHA")
@@ -10027,7 +10038,7 @@ do {
        let level0 = levels.first,
        let sha = level0["data_sha256"] as? String {
         require(
-            sha == "05560ec893093efe06c0feef1f442fb685d8b935ef842654e2f7a1d6c4954437",
+            sha == "79b4d2bdb1469f45d629c686a633d4145b25ba1030dff1cfdc70ec82cbe85955",
             "C7 floor-1 level-0 distance field must match the PC oracle, got \(sha)")
     }
     else {
@@ -10040,11 +10051,22 @@ do {
         limits: StrictJSONDocumentLimits(maximumBytes: graphData.count + 1))
     if let statistics = graphObject["statistics"] as? [String: Any] {
         require(
-            (statistics["cross_count"] as? Int) == 1
-                && (statistics["node_count"] as? Int) == 1
-                && (statistics["edge_count"] as? Int) == 0
+            (statistics["cross_count"] as? Int) == 2
+                && (statistics["node_count"] as? Int) == 3
+                && (statistics["edge_count"] as? Int) == 1
                 && (statistics["isolated_node_count"] as? Int) == 1,
             "C5 road graph statistics must match the PC oracle: \(statistics)")
+        let crosses = graphObject["crosses"] as? [[String: Any]] ?? []
+        let inferred = crosses.first {
+            ($0["id"] as? String) == "C-hidden"
+        }
+        require(
+            (inferred?["element_id"] as? String) == ""
+                && (inferred?["provenance"] as? String)
+                    == "road_point_membership_v1"
+                && (inferred?["points_m"] as? [[Double]])
+                    == [[1.0, -7.0], [9.0, -7.0]],
+            "C5 hidden MapCross topology must be recovered from visible road points")
     }
     else {
         require(false, "C5 road graph statistics missing")
@@ -18232,6 +18254,29 @@ do {
     require(
         audit.acceptedPriorCount == 4,
         "accepted prior count wrong: \(audit.acceptedPriorCount)")
+
+    // The pipeline adds one independent, moderately uncertain start-pose
+    // gauge after strict sidecar parsing. It binds deterministically to the
+    // earliest graph node and must use the shared PC/mobile policy.
+    let initialPrior = MobileProcessingPipeline.initialMapPosePrior(
+        metadata: [
+            "initialMapPose": [
+                "x_m": 31.25,
+                "y_m": -79.0,
+                "yaw_rad": Double.pi / 2.0,
+            ],
+        ],
+        nodes: nodes)
+    require(initialPrior != nil, "valid initialMapPose must create a prior")
+    require(initialPrior!.nodeID == 1, "initial pose must bind earliest node")
+    require(initialPrior!.kind == 3, "initial pose prior kind must be 3")
+    require(
+        abs(initialPrior!.information3x3[0] - 1.0) < 1.0e-9,
+        "initial position sigma must be 1 metre")
+    require(
+        abs(initialPrior!.information3x3[8]
+            - 1.0 / pow(Double.pi / 12.0, 2)) < 1.0e-9,
+        "initial yaw sigma must be 15 degrees")
     // Uniqueness 0.9 -> weight = max(1.0, 6.0*0.9) = 5.4; the derived
     // information must equal the weight (sigma = 1/sqrt(weight)).
     let expectedWeight = AbsolutePriorEvidenceLimits.weightForUniqueness(0.9)
@@ -18911,11 +18956,12 @@ func nativeQualityFixture(
         "prior": residual, "recovery": residual,
     ]
     let appliedPriors = min(request.absolutePriors.count, factorCount)
+    let appliedPriorRecords = Array(request.absolutePriors.prefix(appliedPriors))
     let root: [String: Any] = [
         "format": "MarketScannerGraphQuality",
-        "version": 2,
+        "version": 3,
         "policy_version": "candidate-1",
-        "abi_version": 4,
+        "abi_version": 5,
         "path": path,
         "disposition": disposition.reportValue,
         "graph_input_sha256": graphSHA256,
@@ -18929,6 +18975,16 @@ func nativeQualityFixture(
         "applied_prior_factor_count": appliedPriors,
         "unique_prior_node_count": appliedPriors,
         "applied_prior_count": appliedPriors,
+        "initial_map_pose_prior_count": appliedPriorRecords.filter {
+            $0.kind == 3
+        }.count,
+        "robust_consensus_prior_count": appliedPriorRecords.filter {
+            $0.kind != 3
+        }.count,
+        "robust_consensus_unique_prior_node_count": Set(
+            appliedPriorRecords.filter { $0.kind != 3 }.map { $0.nodeID }
+        ).count,
+        "long_range_loop_factor_count": 0,
         "rejected_priors": 0,
         "fused_prior_duplicates": 0,
         "prior_conflicts": 0,
@@ -19108,8 +19164,8 @@ do {
         $0["solver"] = solver
     }
     let duplicate = qualityAtBoundary.replacingOccurrences(
-        of: "\"version\":2",
-        with: "\"version\":2,\"version\":2")
+        of: "\"version\":3",
+        with: "\"version\":3,\"version\":3")
     require(
         qualityRejected(unknown) && qualityRejected(wrongType)
             && qualityRejected(wrongBool) && qualityRejected(overflow)
@@ -19192,7 +19248,7 @@ do {
     var lenientMetricsRejected = false
     do {
         _ = try MobileProcessingPipeline.NativeQualityMetrics.parse(
-            qualityJSON: "{\"format\":\"MarketScannerGraphQuality\",\"version\":2}")
+            qualityJSON: "{\"format\":\"MarketScannerGraphQuality\",\"version\":3}")
     } catch {
         lenientMetricsRejected = true
     }
