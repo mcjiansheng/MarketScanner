@@ -22,6 +22,7 @@ import re
 import shutil
 import sqlite3
 import stat
+import struct
 import tempfile
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -53,8 +54,19 @@ HUBER_TRANSLATION_M = 0.45
 HUBER_YAW_RAD = math.radians(10)
 HARD_REJECT_TRANSLATION_M = 2.5
 HARD_REJECT_YAW_RAD = math.radians(45)
-MANUAL_ANCHOR_MAX_TRANSLATION_M = 5.0
-MANUAL_ANCHOR_MAX_YAW_RAD = math.radians(30.0)
+# A node-bound operator confirmation is an absolute map-frame observation,
+# not a claim that the phone physically moved from its current drifted pose.
+# The operator can be a few metres imprecise, while accumulated VIO drift over
+# a long route can be much larger. Give this evidence explicit uncertainty and
+# judge the gradient of the resulting correction field instead of rejecting an
+# absolute residual against a fixed distance.
+MANUAL_ANCHOR_TRANSLATION_SIGMA_M = 3.0
+MANUAL_ANCHOR_YAW_SIGMA_RAD = math.radians(20.0)
+MANUAL_ANCHOR_WEIGHT = 1.0 / (
+    MANUAL_ANCHOR_TRANSLATION_SIGMA_M * MANUAL_ANCHOR_TRANSLATION_SIGMA_M
+)
+UNVERIFIED_MANUAL_ANCHOR_MAX_TRANSLATION_M = 5.0
+UNVERIFIED_MANUAL_ANCHOR_MAX_YAW_RAD = math.radians(30.0)
 SESSION_INPUT_FILE_NAMES_V1 = (
     "metadata.json",
     "localization_trace.jsonl",
@@ -153,6 +165,8 @@ DEFAULT_REPLAY_PARAMETERS: dict[str, Any] = {
     "horizontal_axes": "xz",
     "auto_align_segments": False,
     "diagnostic_mode": False,
+    "relative_trajectory_authority": "rtabmap_reprocess_optimized_copy",
+    "rtabmap_global_graph_incomplete": False,
 }
 
 
@@ -198,6 +212,25 @@ def normalize_replay_parameters(
     normalized["horizontal_axes"] = axes
     normalized["auto_align_segments"] = False
     normalized["diagnostic_mode"] = diagnostic_mode
+    authority = values.get("relative_trajectory_authority")
+    if authority not in {
+        "rtabmap_reprocess_optimized_copy",
+        "raw_continuous_vio_manual_anchor_recovery",
+    }:
+        raise OfflineLocalizationError(
+            "Replay parameter relative_trajectory_authority is invalid."
+        )
+    graph_incomplete = values.get("rtabmap_global_graph_incomplete")
+    if not isinstance(graph_incomplete, bool):
+        raise OfflineLocalizationError(
+            "Replay parameter rtabmap_global_graph_incomplete is invalid."
+        )
+    if (authority == "raw_continuous_vio_manual_anchor_recovery") != graph_incomplete:
+        raise OfflineLocalizationError(
+            "Raw VIO recovery requires an explicitly incomplete RTAB-Map graph."
+        )
+    normalized["relative_trajectory_authority"] = authority
+    normalized["rtabmap_global_graph_incomplete"] = graph_incomplete
     return normalized
 
 
@@ -346,7 +379,9 @@ def processing_parameter_sha256(
             "hard_reject_yaw_rad": HARD_REJECT_YAW_RAD,
             "huber_translation_m": HUBER_TRANSLATION_M,
             "huber_yaw_rad": HUBER_YAW_RAD,
-            "solver": "bounded_correction_field_v1",
+            "manual_anchor_translation_sigma_m": MANUAL_ANCHOR_TRANSLATION_SIGMA_M,
+            "manual_anchor_yaw_sigma_rad": MANUAL_ANCHOR_YAW_SIGMA_RAD,
+            "solver": "bounded_correction_field_tridiagonal_v2",
         },
         "replay_parameters": normalize_replay_parameters(replay_parameters),
     }
@@ -1039,6 +1074,7 @@ class AbsoluteConstraint:
     source: dict[str, Any]
     translation_sigma_m: float | None = None
     yaw_sigma_rad: float | None = None
+    trusted_absolute: bool = False
 
 
 @dataclass(frozen=True)
@@ -1246,6 +1282,57 @@ def _database_node_inventory(path: Path) -> dict[str, Any]:
         "first_stamp": stamps[0],
         "last_stamp": stamps[-1],
     }
+
+
+def load_raw_continuous_vio_poses(path: Path, horizontal_axes: str) -> list[Pose]:
+    """Load every finite immutable Node.pose in the requested map plane."""
+    if horizontal_axes not in {"xy", "xz", "ios_prior"}:
+        raise OfflineLocalizationError("Raw VIO horizontal axes are invalid.")
+    try:
+        connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        try:
+            rows = connection.execute(
+                "SELECT id, stamp, pose FROM Node WHERE id>0 ORDER BY id"
+            ).fetchall()
+        finally:
+            connection.close()
+    except sqlite3.Error as exc:
+        raise OfflineLocalizationError(
+            f"Cannot read raw continuous VIO poses from {path.name}: {exc}"
+        ) from exc
+    poses: list[Pose] = []
+    previous_stamp: float | None = None
+    for node_id, stamp_value, blob in rows:
+        stamp = _strict_number(stamp_value)
+        if (
+            isinstance(node_id, bool)
+            or not isinstance(node_id, int)
+            or node_id <= 0
+            or stamp is None
+            or not isinstance(blob, bytes)
+            or len(blob) != 48
+        ):
+            raise OfflineLocalizationError("Raw continuous VIO pose inventory is invalid.")
+        if previous_stamp is not None and stamp <= previous_stamp:
+            raise OfflineLocalizationError(
+                "Raw continuous VIO timestamps are not strictly increasing."
+            )
+        values = struct.unpack("<12f", blob)
+        if not all(math.isfinite(value) for value in values):
+            raise OfflineLocalizationError("Raw continuous VIO pose is non-finite.")
+        tx, ty, tz = values[3], values[7], values[11]
+        yaw_xy = math.atan2(values[4], values[0])
+        if horizontal_axes == "xy":
+            x, y, yaw = tx, ty, yaw_xy
+        elif horizontal_axes == "xz":
+            x, y, yaw = -ty, -tx, math.atan2(-values[9], values[5])
+        else:
+            x, y, yaw = -ty, tx, yaw_xy
+        poses.append(Pose(node_id, stamp, x, y, _normalize_angle(yaw)))
+        previous_stamp = stamp
+    if not poses:
+        raise OfflineLocalizationError("Raw continuous VIO trajectory is empty.")
+    return poses
 
 
 def _normalize_angle(value: float) -> float:
@@ -3603,37 +3690,54 @@ def _solve_banded(
     smoothness: float,
     iterations: int = 120,
 ) -> list[float]:
-    """Solve a 1-D correction field with a Jacobi-stabilized Gauss-Seidel pass."""
-    values = [0.0] * count
-    by_index: dict[int, list[tuple[float, float]]] = {}
+    """Solve the tridiagonal smooth correction field exactly in O(N).
+
+    Fixed-iteration relaxation converged too slowly for thousand-node routes.
+    A remote manual anchor could therefore form a narrow correction spike and
+    look like a physical pose jump. This Thomas solve keeps the same quadratic
+    objective while propagating the correction across the complete connected
+    trajectory deterministically.
+    """
+    del iterations  # Kept in the signature for source compatibility.
+    if count <= 0:
+        return []
+    diagonal = [0.0] * count
+    lower = [0.0] * max(0, count - 1)
+    upper = [0.0] * max(0, count - 1)
+    right_hand_side = [0.0] * count
+    for index in range(count):
+        if index > 0:
+            diagonal[index] += smoothness
+            lower[index - 1] -= smoothness
+        if index + 1 < count:
+            diagonal[index] += smoothness
+            upper[index] -= smoothness
     for index, target, weight in observations:
-        by_index.setdefault(index, []).append((target, weight))
-    for _ in range(iterations):
-        maximum_change = 0.0
-        for index in range(count):
-            numerator = 0.0
-            denominator = 0.0
-            if index > 0:
-                numerator += smoothness * values[index - 1]
-                denominator += smoothness
-            if index + 1 < count:
-                numerator += smoothness * values[index + 1]
-                denominator += smoothness
-            for target, weight in by_index.get(index, ()):
-                numerator += weight * target
-                denominator += weight
-            if index == 0:
-                # Gauge/safety anchor: the initial map pose remains fixed
-                # unless an explicit manual anchor at node zero dominates it.
-                numerator += 2.0 * values[0]
-                denominator += 2.0
-            if denominator <= 0:
-                continue
-            updated = numerator / denominator
-            maximum_change = max(maximum_change, abs(updated - values[index]))
-            values[index] = updated
-        if maximum_change < 1.0e-7:
-            break
+        if not 0 <= index < count or not all(
+            math.isfinite(value) for value in (target, weight)
+        ) or weight <= 0.0:
+            raise OfflineLocalizationError("Correction-field observation is invalid.")
+        diagonal[index] += weight
+        right_hand_side[index] += weight * target
+    # Keep the selected scan start as a soft gauge. It must not freeze the
+    # route when later absolute evidence proves accumulated drift.
+    diagonal[0] += 2.0
+    if any(value <= 0.0 or not math.isfinite(value) for value in diagonal):
+        raise OfflineLocalizationError("Correction-field system is singular.")
+    for index in range(1, count):
+        multiplier = lower[index - 1] / diagonal[index - 1]
+        diagonal[index] -= multiplier * upper[index - 1]
+        right_hand_side[index] -= multiplier * right_hand_side[index - 1]
+        if diagonal[index] <= 0.0 or not math.isfinite(diagonal[index]):
+            raise OfflineLocalizationError("Correction-field system is singular.")
+    values = [0.0] * count
+    values[-1] = right_hand_side[-1] / diagonal[-1]
+    for index in range(count - 2, -1, -1):
+        values[index] = (
+            right_hand_side[index] - upper[index] * values[index + 1]
+        ) / diagonal[index]
+    if any(not math.isfinite(value) for value in values):
+        raise OfflineLocalizationError("Correction-field solution is non-finite.")
     return values
 
 
@@ -3660,13 +3764,14 @@ def optimize_trajectory(
             residual_xy = math.hypot(constraint.x - current[0], constraint.y - current[1])
             residual_yaw = abs(_normalize_angle(constraint.yaw - current[2]))
             is_manual_anchor = constraint.kind == "manual_anchor"
-            if is_manual_anchor:
+            trusted_manual_anchor = is_manual_anchor and constraint.trusted_absolute
+            if is_manual_anchor and not trusted_manual_anchor:
                 exceeds_gate = (
-                    residual_xy > MANUAL_ANCHOR_MAX_TRANSLATION_M
-                    or residual_yaw > MANUAL_ANCHOR_MAX_YAW_RAD
+                    residual_xy > UNVERIFIED_MANUAL_ANCHOR_MAX_TRANSLATION_M
+                    or residual_yaw > UNVERIFIED_MANUAL_ANCHOR_MAX_YAW_RAD
                 )
             else:
-                exceeds_gate = constraint.kind not in {
+                exceeds_gate = not trusted_manual_anchor and constraint.kind not in {
                     "manual_aisle_assignment",
                     "road_soft",
                 } and (
@@ -3681,7 +3786,7 @@ def optimize_trajectory(
                         "translation_residual_m": residual_xy,
                         "yaw_residual_deg": math.degrees(residual_yaw),
                         "reason": (
-                            "manual_anchor_safety_gate"
+                            "unverified_manual_anchor_safety_gate"
                             if is_manual_anchor
                             else "robust_hard_gate"
                         ),
@@ -3689,11 +3794,29 @@ def optimize_trajectory(
                 )
                 continue
             retained.append(constraint)
-            xy_weight = constraint.weight * _huber_weight(
-                residual_xy, HUBER_TRANSLATION_M
+            # A verified manual anchor is already uncertainty-bounded evidence.
+            # Huber-downweighting it by a large drift residual would make it
+            # weaker exactly when it is most useful. Automatic constraints
+            # remain robustly downweighted and hard-gated as before.
+            translation_weight = (
+                1.0 / (constraint.translation_sigma_m ** 2)
+                if constraint.translation_sigma_m is not None
+                else constraint.weight
             )
-            yaw_weight = constraint.weight * _huber_weight(
-                residual_yaw, HUBER_YAW_RAD
+            yaw_base_weight = (
+                1.0 / (constraint.yaw_sigma_rad ** 2)
+                if constraint.yaw_sigma_rad is not None
+                else constraint.weight
+            )
+            xy_weight = translation_weight * (
+                1.0
+                if trusted_manual_anchor
+                else _huber_weight(residual_xy, HUBER_TRANSLATION_M)
+            )
+            yaw_weight = yaw_base_weight * (
+                1.0
+                if trusted_manual_anchor
+                else _huber_weight(residual_yaw, HUBER_YAW_RAD)
             )
             observations[0].append((index, constraint.x - baseline[index].x, xy_weight))
             observations[1].append((index, constraint.y - baseline[index].y, xy_weight))
@@ -3724,6 +3847,14 @@ def optimize_trajectory(
             "kind": item.kind,
             "node_id": baseline[item.node_index].node_id,
             "weight": item.weight,
+            "translation_sigma_m": item.translation_sigma_m,
+            "yaw_sigma_rad": item.yaw_sigma_rad,
+            "uncertainty_source": (
+                "explicit_v2"
+                if item.translation_sigma_m is not None
+                else "legacy_scalar_weight_migration"
+            ),
+            "trusted_absolute": item.trusted_absolute,
             "translation_residual_m": math.hypot(
                 item.x - optimized[item.node_index].x,
                 item.y - optimized[item.node_index].y,
@@ -3764,6 +3895,8 @@ def bounded_correction_metrics(
 
     relative_translation_errors: list[float] = []
     relative_yaw_errors: list[float] = []
+    correction_translation_steps: list[float] = []
+    correction_yaw_steps: list[float] = []
     for base_first, base_second, opt_first, opt_second in zip(
         baseline, baseline[1:], optimized, optimized[1:]
     ):
@@ -3789,6 +3922,25 @@ def bounded_correction_metrics(
         relative_yaw_errors.append(
             abs(_normalize_angle(opt_relative[2] - base_relative[2]))
         )
+        first_correction = (
+            opt_first.x - base_first.x,
+            opt_first.y - base_first.y,
+            _normalize_angle(opt_first.yaw - base_first.yaw),
+        )
+        second_correction = (
+            opt_second.x - base_second.x,
+            opt_second.y - base_second.y,
+            _normalize_angle(opt_second.yaw - base_second.yaw),
+        )
+        correction_translation_steps.append(
+            math.hypot(
+                second_correction[0] - first_correction[0],
+                second_correction[1] - first_correction[1],
+            )
+        )
+        correction_yaw_steps.append(
+            abs(_normalize_angle(second_correction[2] - first_correction[2]))
+        )
     return {
         "absolute_constraint_residual_diagnostic_before": round(
             objective(baseline), 9
@@ -3806,6 +3958,12 @@ def bounded_correction_metrics(
         ),
         "maximum_local_relative_yaw_change_deg": round(
             math.degrees(max(relative_yaw_errors, default=0.0)), 9
+        ),
+        "maximum_neighbor_correction_translation_change_m": round(
+            max(correction_translation_steps, default=0.0), 9
+        ),
+        "maximum_neighbor_correction_yaw_change_deg": round(
+            math.degrees(max(correction_yaw_steps, default=0.0)), 9
         ),
     }
 
@@ -4904,6 +5062,7 @@ def _render_localized_version(
     factor_graph_binary: Path | None = None,
     manual_edits: dict[str, Any] | None = None,
     progress: Callable[[int, str, str], None] | None = None,
+    upstream_processing_report: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     validation = validate_package(prior_map)
     if not validation["valid"]:
@@ -5222,6 +5381,13 @@ def _render_localized_version(
         )
         initial = first_trace or (0.0, 0.0, 0.0)
     baseline = align_relative_trajectory(optimized_poses, initial)
+    relative_trajectory_authority = str(
+        replay_parameters["relative_trajectory_authority"]
+    )
+    raw_manual_anchor_recovery = (
+        relative_trajectory_authority
+        == "raw_continuous_vio_manual_anchor_recovery"
+    )
 
     constraints: list[AbsoluteConstraint] = []
     constraint_records: list[dict[str, Any]] = []
@@ -5313,6 +5479,11 @@ def _render_localized_version(
                 }
             )
             continue
+        trusted_absolute = (
+            record.get("version") == 3
+            and binding.binding_source == "nearest_node_id"
+            and record.get("node_binding_status") == "matched"
+        )
         constraints.append(
             AbsoluteConstraint(
                 identifier=identifier,
@@ -5320,9 +5491,20 @@ def _render_localized_version(
                 x=pose[0],
                 y=pose[1],
                 yaw=pose[2],
-                weight=80.0,
+                weight=(MANUAL_ANCHOR_WEIGHT if trusted_absolute else 80.0),
                 kind="manual_anchor",
                 source=record,
+                translation_sigma_m=(
+                    MANUAL_ANCHOR_TRANSLATION_SIGMA_M
+                    if trusted_absolute
+                    else None
+                ),
+                yaw_sigma_rad=(
+                    MANUAL_ANCHOR_YAW_SIGMA_RAD
+                    if trusted_absolute
+                    else None
+                ),
+                trusted_absolute=trusted_absolute,
             )
         )
         manual_event_audit.append(
@@ -5335,6 +5517,25 @@ def _render_localized_version(
                 "time_delta_seconds": binding.time_delta_seconds,
                 "binding_source": binding.binding_source,
                 "alignment_version": record.get("alignment_version"),
+                "trusted_absolute": trusted_absolute,
+                "trust_class": (
+                    "verified_v3_exact_node_absolute_anchor"
+                    if trusted_absolute
+                    else "legacy_or_timestamp_bound_manual_evidence"
+                ),
+                "translation_sigma_m": (
+                    MANUAL_ANCHOR_TRANSLATION_SIGMA_M
+                    if trusted_absolute
+                    else None
+                ),
+                "yaw_sigma_deg": (
+                    math.degrees(MANUAL_ANCHOR_YAW_SIGMA_RAD)
+                    if trusted_absolute
+                    else None
+                ),
+                "absolute_residual_is_physical_jump": (
+                    False if trusted_absolute else None
+                ),
             }
         )
     constraint_records, _, edit_audit = apply_manual_edits(
@@ -5370,6 +5571,7 @@ def _render_localized_version(
                 weight=100.0,
                 kind="manual_anchor",
                 source=event,
+                trusted_absolute=False,
             )
         )
     road_graph = load_json(prior_map / "road_graph.json")
@@ -5394,6 +5596,14 @@ def _render_localized_version(
             str(metadata.get("floorId") or metadata.get("floor_id") or ""),
         )
     )
+    trusted_manual_anchor_count = sum(
+        item.kind == "manual_anchor" and item.trusted_absolute
+        for item in constraints
+    )
+    if raw_manual_anchor_recovery and trusted_manual_anchor_count == 0:
+        raise OfflineLocalizationError(
+            "Raw continuous VIO recovery requires at least one verified manual anchor."
+        )
     factor_graph_report: dict[str, Any] = {
         "format": "MarketScannerRelativeSE2FactorGraphReport",
         "version": 2,
@@ -5406,7 +5616,7 @@ def _render_localized_version(
         "optimized_database_sha256": optimized_db_hash,
     }
     full_factor_graph = False
-    if factor_graph_binary is not None:
+    if factor_graph_binary is not None and not raw_manual_anchor_recovery:
         try:
             optimized, accepted, rejected, factor_graph_report = (
                 run_relative_se2_factor_graph(
@@ -5617,6 +5827,11 @@ def _render_localized_version(
     accepted_source_count = sum(
         item["kind"] == "online_structure" for item in accepted
     )
+    accepted_trusted_manual_anchor_count = sum(
+        item["kind"] == "manual_anchor"
+        and item.get("trusted_absolute") is True
+        for item in accepted
+    )
     source_accepted_count = sum(item.get("accepted") is True for item in raw_constraints)
     review_items: list[dict[str, Any]] = [
         {
@@ -5671,12 +5886,22 @@ def _render_localized_version(
     # Explicit diagnostic mode is development/test-only product semantics: it
     # keeps an unsafe working draft inspectable without relaxing review or
     # publication gates. Conflicting phone constraints remain in the audit and
-    # are excluded by the robust hard gate above.
+    # are excluded by the robust hard gate above. A verified v3/exact-node
+    # manual localization event is different: it is absolute map-frame evidence
+    # with explicit uncertainty, so a large accumulated gauge correction is
+    # allowed to become a reviewable draft even in strict mode. Local correction
+    # gradients, graph-relative residuals and all publication gates remain.
     diagnostic_mode = bool(replay_parameters["diagnostic_mode"])
+    diagnostic_only = diagnostic_mode or raw_manual_anchor_recovery
     allow_draft = (
         bool(optimized)
         and not has_critical_jsonl_damage
-        and (max_correction <= 2.0 or diagnostic_mode)
+        and (
+            max_correction <= 2.0
+            or diagnostic_mode
+            or raw_manual_anchor_recovery
+            or accepted_trusted_manual_anchor_count > 0
+        )
     )
     state_counts: dict[str, int] = {}
     for event in state_events:
@@ -5855,6 +6080,9 @@ def _render_localized_version(
         "accepted_manual_anchor_count": sum(
             item["kind"] == "manual_anchor" for item in accepted
         ),
+        "accepted_trusted_manual_anchor_count": (
+            accepted_trusted_manual_anchor_count
+        ),
         "road_soft_constraint_count": sum(
             item["kind"] == "road_soft" for item in accepted
         ),
@@ -5872,6 +6100,12 @@ def _render_localized_version(
             manual_events=active_edit_events,
         ),
         "manual_anchor_count": sum(item.kind == "manual_anchor" for item in constraints),
+        "trusted_manual_anchor_count": trusted_manual_anchor_count,
+        "absolute_correction_interpretation": (
+            "verified_manual_anchor_map_gauge_correction"
+            if accepted_trusted_manual_anchor_count > 0
+            else "ordinary_local_trajectory_update"
+        ),
         "manual_localization_event_audit": manual_event_audit,
         "tag_total": len(final_tags),
         "tag_confirmed": sum(tag.get("approval_status") in {"approved", "auto_approved"} for tag in final_tags),
@@ -5883,7 +6117,13 @@ def _render_localized_version(
         "publish_state": "draft" if allow_draft else "invalid",
         "allow_draft": allow_draft,
         "diagnostic_mode": diagnostic_mode,
-        "diagnostic_only": diagnostic_mode,
+        "diagnostic_only": diagnostic_only,
+        "relative_trajectory_authority": relative_trajectory_authority,
+        "rtabmap_global_graph_incomplete": bool(
+            replay_parameters["rtabmap_global_graph_incomplete"]
+        ),
+        "manual_anchor_recovery": raw_manual_anchor_recovery,
+        "upstream_processing": upstream_processing_report,
         "ignored_conflicting_source_constraint_count": sum(
             item.get("kind") == "online_structure" for item in rejected
         ),
@@ -5909,7 +6149,10 @@ def _render_localized_version(
             "factor_set_sha256": factor_graph_report.get("factor_set_sha256"),
             "huber_translation_m": HUBER_TRANSLATION_M,
             "huber_yaw_deg": math.degrees(HUBER_YAW_RAD),
-            "relative_trajectory_authority": "rtabmap_reprocess_optimized_copy",
+            "relative_trajectory_authority": relative_trajectory_authority,
+            "rtabmap_global_graph_incomplete": bool(
+                replay_parameters["rtabmap_global_graph_incomplete"]
+            ),
             **solver_metrics,
         },
     }
@@ -5945,17 +6188,37 @@ def _render_localized_version(
             "node_inventory_integrity_failed",
             node_inventory_audit,
         ),
-        (max_correction <= 2.0, "maximum_correction_above_2m", max_correction),
-        (correction_p95 <= 1.0, "p95_correction_above_1m", correction_p95),
         (
-            solver_metrics["maximum_local_relative_translation_change_m"] <= 0.5,
-            "local_deformation_above_0_5m",
-            solver_metrics["maximum_local_relative_translation_change_m"],
+            accepted_trusted_manual_anchor_count > 0
+            or raw_manual_anchor_recovery
+            or max_correction <= 2.0,
+            "maximum_correction_above_2m",
+            max_correction,
         ),
         (
-            solver_metrics["maximum_local_relative_yaw_change_deg"] <= 15.0,
-            "local_yaw_deformation_above_15deg",
-            solver_metrics["maximum_local_relative_yaw_change_deg"],
+            accepted_trusted_manual_anchor_count > 0
+            or raw_manual_anchor_recovery
+            or correction_p95 <= 1.0,
+            "p95_correction_above_1m",
+            correction_p95,
+        ),
+        (
+            solver_metrics[
+                "maximum_neighbor_correction_translation_change_m"
+            ] <= 0.5,
+            "neighbor_correction_gradient_above_0_5m",
+            solver_metrics[
+                "maximum_neighbor_correction_translation_change_m"
+            ],
+        ),
+        (
+            solver_metrics[
+                "maximum_neighbor_correction_yaw_change_deg"
+            ] <= 15.0,
+            "neighbor_correction_yaw_gradient_above_15deg",
+            solver_metrics[
+                "maximum_neighbor_correction_yaw_change_deg"
+            ],
         ),
         (
             report["weak_lost_duration_seconds"] <= 30.0,
@@ -5990,11 +6253,15 @@ def _render_localized_version(
         "blockers": review_blockers,
     }
     publish_blockers = list(review_blockers)
-    if diagnostic_mode:
+    if diagnostic_only:
         publish_blockers.insert(
             0,
             {
-                "code": "diagnostic_mode_enabled",
+                "code": (
+                    "raw_continuous_vio_manual_anchor_recovery"
+                    if raw_manual_anchor_recovery
+                    else "diagnostic_mode_enabled"
+                ),
                 "value": True,
             },
         )
@@ -6035,6 +6302,10 @@ def _render_localized_version(
         report["warnings"].append(
             "测试诊断模式已启用：冲突手机定位约束不会阻止生成可视化草稿，"
             f"本次忽略 {ignored_count} 条；全部门禁和误差指标仍保留，且结果禁止发布。"
+        )
+    if raw_manual_anchor_recovery:
+        report["warnings"].append(
+            "RTAB-Map 全局优化图不完整；本草稿使用完整原始连续 VIO、严格绑定的人工绝对锚点和地图结构约束重建。大绝对修正按地图坐标校准解释，相邻连续形变仍受门禁约束；结果仅供诊断与人工复核，禁止发布。"
         )
     if not allow_draft:
         report["warnings"].append(
@@ -6101,6 +6372,11 @@ def _render_localized_version(
             "publish_state": report["publish_state"],
             "allow_draft": report["allow_draft"],
             "diagnostic_mode": report["diagnostic_mode"],
+            "diagnostic_only": report["diagnostic_only"],
+            "relative_trajectory_authority": relative_trajectory_authority,
+            "rtabmap_global_graph_incomplete": report[
+                "rtabmap_global_graph_incomplete"
+            ],
             "source_database_sha256": source_hash_before,
             "optimized_database_sha256": optimized_db_hash,
             "prior_map_sha256": package_hash,
@@ -6114,7 +6390,7 @@ def _render_localized_version(
             "algorithm_version": (
                 "relative_se2_factor_graph_v2"
                 if full_factor_graph
-                else "bounded_correction_field_v1"
+                else "bounded_correction_field_tridiagonal_v2"
             ),
             "coordinate_contract_version": COORDINATE_CONTRACT_VERSION,
             "processing_parameter_sha256": processing_parameter_sha256(
@@ -6126,6 +6402,8 @@ def _render_localized_version(
                 "huber_yaw_rad": HUBER_YAW_RAD,
                 "hard_reject_translation_m": HARD_REJECT_TRANSLATION_M,
                 "hard_reject_yaw_rad": HARD_REJECT_YAW_RAD,
+                "manual_anchor_translation_sigma_m": MANUAL_ANCHOR_TRANSLATION_SIGMA_M,
+                "manual_anchor_yaw_sigma_rad": MANUAL_ANCHOR_YAW_SIGMA_RAD,
             },
         },
     )
@@ -6298,6 +6576,7 @@ def process_localized_session(
     expected_parent_version: str | None = None,
     replay_parameters: dict[str, Any] | None = None,
     factor_graph_binary: Path | None = None,
+    upstream_processing_report: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Render and atomically commit an immutable localized result version.
 
@@ -6399,6 +6678,7 @@ def process_localized_session(
             factor_graph_binary=factor_graph_binary,
             manual_edits=manual_edits,
             progress=progress,
+            upstream_processing_report=upstream_processing_report,
         )
         manifest = store.validate_staging(
             staging,

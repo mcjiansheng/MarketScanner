@@ -1,6 +1,15 @@
 # 地图辅助定位变更记录
 
-> 文档状态：**当前有效**。最后核对日期：2026-08-11。
+> 文档状态：**当前有效**。最后核对日期：2026-08-12。
+
+## 2026-08-12 — 长距离漂移人工绝对锚点与连续轨迹恢复
+
+- 将严格 `MarketScannerManualLocalizationEvent v3` 的人工重选位置定义为绝对地图 gauge 证据，而不是手机物理瞬移。只有 exact-node、tracking/map/floor identity、递增 alignment version、node stamp/time delta 和 atomic snapshot generation 全部通过时才设置 `trusted_absolute=true`；旧 v2 时间绑定和 PC `set_anchor` 仍受 5 m/30° `unverified_manual_anchor_safety_gate`。
+- 可信人工锚点使用约 3 m 平移、20°航向不确定度，不再按大累计漂移残差做 Huber 降权。bounded fallback 从固定 120 轮松弛改为 O(N) Thomas 三对角精确求解，使修正沿完整连接轨迹前后连续传播，避免在锚点处形成未收敛尖峰。
+- `maximum/P95 correction` 在可信人工锚点存在时改为 gauge 审计，不再单独阻断 current draft/review；新增相邻 correction-field 平移/航向梯度门。native 因子图只有在 runner 明确证明选中可信人工锚点时才允许大 pose update，普通自动 absolute prior 不能借用该权限；相对边、闭环、连通性和目标函数门保持不变。
+- `rtabmap-reprocess` 图不完整时新增 `raw_continuous_vio_manual_anchor_recovery`：仅在原始 `Node.pose` 全量有限、时间严格递增、相邻步长/旋转安全，且严格解析后至少有一个可信人工锚点时生成 diagnostic-only 草稿；不从不完整 `Admin.opt_poses` 渲染 2D/3D 成果、强制禁止发布、原始数据库只读。无人工证据的 `093330` 坏图继续拒绝。
+- 自适应 ORB discovery 若生成不安全图，不再覆盖已验证 fast pass。真实 `103343`（2284 nodes、2 个严格人工锚点）恢复后最大绝对修正约 6.17 m，相邻 correction 平移梯度约 0.057 m、航向梯度约 0.294°；仍因会话 weak/lost 和 rejected constraints 阻断发布。真实 `093330` 无人工事件，恢复按预期拒绝；两份原始 DB 前后 SHA-256 均未变化。
+- 自动测试新增长轨迹 35 m 漂移连续传播、可信/非可信人工权限分离、gauge-aware 因子图质量门、工作台恢复编排和 discovery fast-pass 保留。该修复不是生产发布 GO；真机/LiDAR/现场长距离矩阵和 exact-final-SHA 资格仍待执行。
 
 ## 2026-08-11 — 手机历史处理长哈希稳定性与 PC 跨编译器地图身份
 

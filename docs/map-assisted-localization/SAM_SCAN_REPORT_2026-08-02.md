@@ -1,6 +1,7 @@
-# Sam 先验地图辅助扫描诊断报告
+# Sam 先验地图辅助扫描诊断报告（历史归档）
 
-> 文档状态：**当前有效**。最后核对日期：2026-08-02。
+> 文档状态：**历史诊断归档**。原始分析日期：2026-08-02；最后标注日期：2026-08-12。
+> 当前权威行为见 [`PC_UX.md`](PC_UX.md)、[`ARCHITECTURE.md`](ARCHITECTURE.md) 和 [`CHANGELOG.md`](CHANGELOG.md) 的 2026-08-12 条目。下文 5 m/30° 人工锚点门和 `manual_anchor_safety_gate` 结论只记录当时实现，不再描述严格 v3/exact-node 人工校准的当前行为；历史数值与原始结论保留，不做回写篡改。
 > 适用数据：`SupermarketSession-20260802-093522`、`SamTestCase1`、`MapStudio-Localized-Diagnostic-20260802-183000`。
 > 结论边界：这是一次测试数据和只读数据库诊断，不构成生产资格验收。
 

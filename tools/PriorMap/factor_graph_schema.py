@@ -103,6 +103,7 @@ def validate_factor_graph_result(
     expected_node_ids: Iterable[int],
     quality_policy: dict[str, Any],
     quality_policy_sha256: str,
+    verified_absolute_gauge_authority: bool = False,
 ) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise FactorGraphValidationError("Factor graph result must be an object.")
@@ -274,7 +275,13 @@ def validate_factor_graph_result(
         if item["translation_m"] > float(limits["high_residual_loop_translation_m"])
         or item["yaw_deg"] > float(limits["high_residual_loop_yaw_deg"])
     )
-    enriched = {**payload, "high_residual_loop_factor_ids": high_residual_ids}
+    enriched = {
+        **payload,
+        "high_residual_loop_factor_ids": high_residual_ids,
+        "verified_absolute_gauge_authority": bool(
+            verified_absolute_gauge_authority
+        ),
+    }
     try:
         quality = evaluate_graph_quality(enriched, quality_policy, quality_policy_sha256)
     except (FactorGraphQualityError, KeyError, TypeError, ValueError) as exc:

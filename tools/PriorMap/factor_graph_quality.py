@@ -121,6 +121,15 @@ def evaluate_graph_quality(
         max(0.0, (initial - final) / initial) if initial > 0.0 else (1.0 if final == 0.0 else 0.0)
     )
     ratio = len(high_residual) / max(1, loop_count)
+    # A large update is interpreted as a map-frame/gauge correction only when
+    # the native graph used absolute priors *and* the trusted caller attests
+    # that at least one selected prior came from a verified v3 exact-node
+    # operator anchor. Automatic structure/road priors must never borrow this
+    # privilege merely because they are also encoded as absolute priors.
+    absolute_prior_gauge = (
+        report.get("gauge_mode") == "absolute_priors"
+        and report.get("verified_absolute_gauge_authority") is True
+    )
     checks = (
         (report.get("solver_converged") is True, "solver_not_converged", report.get("solver_converged")),
         (report.get("graph_integrity_passed") is True, "graph_integrity_failed", report.get("graph_integrity_passed")),
@@ -133,8 +142,8 @@ def evaluate_graph_quality(
         (float(report["p95_loop_edge_yaw_residual_deg"]) <= float(limits["loop_yaw_p95_max_deg"]), "loop_yaw_p95_exceeded", report["p95_loop_edge_yaw_residual_deg"]),
         (float(report["maximum_loop_edge_yaw_residual_deg"]) <= float(limits["loop_yaw_max_deg"]), "loop_yaw_max_exceeded", report["maximum_loop_edge_yaw_residual_deg"]),
         (ratio <= float(limits["high_residual_loop_ratio_max"]), "high_residual_loop_ratio_exceeded", ratio),
-        (float(report["maximum_pose_update_m"]) <= float(limits["maximum_pose_update_m"]), "maximum_pose_update_exceeded", report["maximum_pose_update_m"]),
-        (float(report["maximum_pose_update_yaw_deg"]) <= float(limits["maximum_pose_update_yaw_deg"]), "maximum_pose_yaw_update_exceeded", report["maximum_pose_update_yaw_deg"]),
+        (absolute_prior_gauge or float(report["maximum_pose_update_m"]) <= float(limits["maximum_pose_update_m"]), "maximum_pose_update_exceeded", report["maximum_pose_update_m"]),
+        (absolute_prior_gauge or float(report["maximum_pose_update_yaw_deg"]) <= float(limits["maximum_pose_update_yaw_deg"]), "maximum_pose_yaw_update_exceeded", report["maximum_pose_update_yaw_deg"]),
         (relative_count / node_count >= float(limits["minimum_relative_factor_to_node_ratio"]), "relative_factor_coverage_too_low", relative_count / node_count),
         (objective_improvement_ratio >= float(limits["minimum_objective_improvement_ratio"]), "objective_improvement_too_low", objective_improvement_ratio),
     )
@@ -153,6 +162,12 @@ def evaluate_graph_quality(
         "policy_sha256": policy_sha256,
         "objective_improvement_ratio": objective_improvement_ratio,
         "high_residual_loop_ratio": ratio,
+        "absolute_pose_update_gate_applied": not absolute_prior_gauge,
+        "pose_update_interpretation": (
+            "absolute_prior_gauge_correction_diagnostic_only"
+            if absolute_prior_gauge
+            else "fixed_root_local_update_gate"
+        ),
         "passed": policy_frozen and not blockers,
         "blockers": blockers,
     }

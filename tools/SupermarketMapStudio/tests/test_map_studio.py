@@ -2689,6 +2689,359 @@ class MapStudioApiTests(unittest.TestCase):
         self.assertFalse(result["adaptive"]["discovery_required"])
         self.assertEqual(result["adaptive"]["selected_pass"], server.offline.FAST_REUSE_PROFILE)
 
+    def test_adaptive_reprocess_keeps_valid_fast_result_when_discovery_is_unsafe(self) -> None:
+        fast = {
+            "elapsed_seconds": 10.0,
+            "execution": {"profile": server.offline.FAST_REUSE_PROFILE},
+            "runtime": {"processed_node_count": 1000, "node_time_ms": {}, "final_optimization": {}},
+            "output": {"node_count": 1000, "loop_closure_pair_count": 1, "long_range_loop_pair_count": 1},
+            "error_optimization": {
+                "status": "warning",
+                "quality_score": 80,
+                "constraints": {"input_long_range_loop_retention": 1.0},
+            },
+        }
+        with mock.patch.object(
+            server.offline,
+            "run_reprocess",
+            side_effect=[
+                fast,
+                server.offline.OfflineProcessingError(
+                    "Optimized neighbor step 15.34 m exceeds the safe limit"
+                ),
+            ],
+        ):
+            result = server.offline.run_adaptive_reprocess(
+                Path("input.db"), Path("output.db")
+            )
+        self.assertEqual(
+            result["adaptive"]["selected_pass"],
+            server.offline.FAST_REUSE_PROFILE,
+        )
+        self.assertEqual(result["adaptive"]["passes"][1]["quality_status"], "failed")
+
+    def test_localized_map_recovers_incomplete_graph_only_with_manual_evidence_and_continuous_raw_vio(self) -> None:
+        session = create_session(
+            self.root,
+            "SupermarketSession-ManualAnchorRecovery",
+            0.0,
+            "continuous_streaming",
+        )
+        segment_dir = session / "segment_0001"
+        (segment_dir / "manual_localization_events.jsonl").write_text(
+            '{"format":"MarketScannerManualLocalizationEvent"}\n',
+            encoding="utf-8",
+        )
+        source_database = segment_dir / "rtabmap_segment_0001.db"
+        prior_map = self.root / "PriorMap-recovery"
+        prior_map.mkdir()
+        output = self.root / "localized-recovery-output"
+        output.mkdir()
+        segment = SimpleNamespace(
+            index=1,
+            directory=segment_dir,
+            database_path=source_database,
+            poses=[],
+        )
+        raw_poses = [server.localized.Pose(1, 1.0, 0.0, 0.0, 0.0)]
+        selection = server.gpu.BackendSelection(
+            requested="cpu",
+            effective="cpu",
+            available=True,
+        )
+        reprocess_error = server.offline.OfflineProcessingError(
+            "Optimized pose coverage is incomplete"
+        )
+        with (
+            mock.patch.object(
+                server,
+                "validate_prior_map_package",
+                return_value={"valid": True, "errors": []},
+            ),
+            mock.patch.object(
+                server.base,
+                "discover_segments",
+                return_value=[segment],
+            ),
+            mock.patch.object(
+                server,
+                "acceleration_selection",
+                return_value=selection,
+            ),
+            mock.patch.object(
+                server,
+                "reprocess_single_session",
+                side_effect=reprocess_error,
+            ),
+            mock.patch.object(
+                server.offline,
+                "assess_raw_continuous_vio_recovery",
+                return_value={
+                    "status": "pass",
+                    "node_count": 2,
+                    "maximum_neighbor_translation_m": 1.0,
+                },
+            ) as assess,
+            mock.patch.object(
+                server.localized,
+                "load_raw_continuous_vio_poses",
+                return_value=raw_poses,
+            ) as load_raw,
+            mock.patch.object(
+                server.localized,
+                "process_localized_session",
+                return_value={"current_updated": True},
+            ) as process,
+            mock.patch.object(server, "attach_offline_reports"),
+            mock.patch.object(server, "attach_acceleration_report"),
+            mock.patch.object(server, "find_factor_graph_binary", return_value=None),
+            mock.patch.object(server.base, "generate") as generate,
+        ):
+            server.run_localized_map(
+                {
+                    "session": str(session),
+                    "prior_map": str(prior_map),
+                    "options": {"gpu_backend": "cpu"},
+                },
+                output,
+            )
+        assess.assert_called_once_with(source_database)
+        load_raw.assert_called_once_with(source_database, "ios_prior")
+        generate.assert_not_called()
+        replay = process.call_args.kwargs["replay_parameters"]
+        self.assertEqual(
+            replay["relative_trajectory_authority"],
+            "raw_continuous_vio_manual_anchor_recovery",
+        )
+        self.assertTrue(replay["rtabmap_global_graph_incomplete"])
+        upstream = process.call_args.kwargs["upstream_processing_report"]
+        self.assertTrue(upstream["diagnostic_only"])
+        self.assertEqual(upstream["rtabmap_reprocess_error"], str(reprocess_error))
+
+    def test_localized_map_does_not_recover_incomplete_graph_without_manual_evidence(self) -> None:
+        session = create_session(
+            self.root,
+            "SupermarketSession-NoManualAnchorRecovery",
+            0.0,
+            "continuous_streaming",
+        )
+        source_database = (
+            session / "segment_0001" / "rtabmap_segment_0001.db"
+        )
+        prior_map = self.root / "PriorMap-no-recovery"
+        prior_map.mkdir()
+        output = self.root / "localized-no-recovery-output"
+        output.mkdir()
+        segment = SimpleNamespace(
+            index=1,
+            directory=session / "segment_0001",
+            database_path=source_database,
+            poses=[],
+        )
+        reprocess_error = server.offline.OfflineProcessingError(
+            "Optimized pose coverage is incomplete"
+        )
+        with (
+            mock.patch.object(
+                server,
+                "validate_prior_map_package",
+                return_value={"valid": True, "errors": []},
+            ),
+            mock.patch.object(
+                server.base,
+                "discover_segments",
+                return_value=[segment],
+            ),
+            mock.patch.object(
+                server,
+                "acceleration_selection",
+                return_value=server.gpu.BackendSelection(
+                    requested="cpu",
+                    effective="cpu",
+                    available=True,
+                ),
+            ),
+            mock.patch.object(
+                server,
+                "reprocess_single_session",
+                side_effect=reprocess_error,
+            ),
+            mock.patch.object(
+                server.offline,
+                "assess_raw_continuous_vio_recovery",
+            ) as assess,
+        ):
+            with self.assertRaisesRegex(
+                server.offline.OfflineProcessingError,
+                "Optimized pose coverage is incomplete",
+            ):
+                server.run_localized_map(
+                    {
+                        "session": str(session),
+                        "prior_map": str(prior_map),
+                        "options": {"gpu_backend": "cpu"},
+                    },
+                    output,
+                )
+        assess.assert_not_called()
+
+    def test_localized_map_keeps_original_failure_when_raw_vio_is_not_continuous(self) -> None:
+        session = create_session(
+            self.root,
+            "SupermarketSession-RejectedRawVIORecovery",
+            0.0,
+            "continuous_streaming",
+        )
+        segment_dir = session / "segment_0001"
+        (segment_dir / "manual_localization_events.jsonl").write_text(
+            '{"format":"MarketScannerManualLocalizationEvent"}\n',
+            encoding="utf-8",
+        )
+        source_database = segment_dir / "rtabmap_segment_0001.db"
+        prior_map = self.root / "PriorMap-rejected-recovery"
+        prior_map.mkdir()
+        output = self.root / "localized-rejected-recovery-output"
+        output.mkdir()
+        segment = SimpleNamespace(
+            index=1,
+            directory=segment_dir,
+            database_path=source_database,
+            poses=[],
+        )
+        reprocess_error = server.offline.OfflineProcessingError(
+            "Optimized neighbor step 15.34 m exceeds the safe limit"
+        )
+        with (
+            mock.patch.object(
+                server,
+                "validate_prior_map_package",
+                return_value={"valid": True, "errors": []},
+            ),
+            mock.patch.object(
+                server.base,
+                "discover_segments",
+                return_value=[segment],
+            ),
+            mock.patch.object(
+                server,
+                "acceleration_selection",
+                return_value=server.gpu.BackendSelection(
+                    requested="cpu",
+                    effective="cpu",
+                    available=True,
+                ),
+            ),
+            mock.patch.object(
+                server,
+                "reprocess_single_session",
+                side_effect=reprocess_error,
+            ),
+            mock.patch.object(
+                server.offline,
+                "assess_raw_continuous_vio_recovery",
+                return_value={"status": "rejected", "reasons": ["step_jump"]},
+            ),
+        ):
+            with self.assertRaisesRegex(
+                server.offline.OfflineProcessingError,
+                "15.34 m",
+            ):
+                server.run_localized_map(
+                    {
+                        "session": str(session),
+                        "prior_map": str(prior_map),
+                        "options": {"gpu_backend": "cpu"},
+                    },
+                    output,
+                )
+
+    def test_raw_vio_recovery_still_requires_a_verified_anchor_after_strict_parse(self) -> None:
+        session = create_session(
+            self.root,
+            "SupermarketSession-UnverifiedManualRecovery",
+            0.0,
+            "continuous_streaming",
+        )
+        segment_dir = session / "segment_0001"
+        (segment_dir / "manual_localization_events.jsonl").write_text(
+            '{"format":"MarketScannerManualLocalizationEvent","version":2}\n',
+            encoding="utf-8",
+        )
+        source_database = segment_dir / "rtabmap_segment_0001.db"
+        prior_map = self.root / "PriorMap-unverified-recovery"
+        prior_map.mkdir()
+        output = self.root / "localized-unverified-recovery-output"
+        output.mkdir()
+        segment = SimpleNamespace(
+            index=1,
+            directory=segment_dir,
+            database_path=source_database,
+            poses=[],
+        )
+        selection = server.gpu.BackendSelection(
+            requested="cpu",
+            effective="cpu",
+            available=True,
+        )
+        with (
+            mock.patch.object(
+                server,
+                "validate_prior_map_package",
+                return_value={"valid": True, "errors": []},
+            ),
+            mock.patch.object(
+                server.base,
+                "discover_segments",
+                return_value=[segment],
+            ),
+            mock.patch.object(
+                server,
+                "acceleration_selection",
+                return_value=selection,
+            ),
+            mock.patch.object(
+                server,
+                "reprocess_single_session",
+                side_effect=server.offline.OfflineProcessingError(
+                    "Optimized pose coverage is incomplete"
+                ),
+            ),
+            mock.patch.object(
+                server.offline,
+                "assess_raw_continuous_vio_recovery",
+                return_value={"status": "pass", "node_count": 2},
+            ),
+            mock.patch.object(
+                server.localized,
+                "load_raw_continuous_vio_poses",
+                return_value=[server.localized.Pose(1, 1.0, 0.0, 0.0, 0.0)],
+            ),
+            mock.patch.object(
+                server.localized,
+                "process_localized_session",
+                side_effect=server.localized.OfflineLocalizationError(
+                    "Raw continuous VIO recovery requires at least one verified manual anchor."
+                ),
+            ),
+            mock.patch.object(server, "attach_offline_reports"),
+            mock.patch.object(server, "attach_acceleration_report"),
+            mock.patch.object(server, "find_factor_graph_binary", return_value=None),
+            mock.patch.object(server.base, "generate") as generate,
+        ):
+            with self.assertRaisesRegex(
+                server.localized.OfflineLocalizationError,
+                "verified manual anchor",
+            ):
+                server.run_localized_map(
+                    {
+                        "session": str(session),
+                        "prior_map": str(prior_map),
+                        "options": {"gpu_backend": "cpu"},
+                    },
+                    output,
+                )
+        generate.assert_not_called()
+
     def test_large_trajectory_without_loop_closure_requires_review(self) -> None:
         source = self.root / "large-source.db"
         optimized = self.root / "large-optimized.db"

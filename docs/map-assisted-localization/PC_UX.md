@@ -1,6 +1,6 @@
 # PC 先验地图工作台交互
 
-> 文档状态：**当前有效（阶段三草稿复核）**。最后核对日期：2026-08-09。
+> 文档状态：**当前有效（阶段三草稿复核）**。最后核对日期：2026-08-12。
 
 Map Studio 保留单设备、多设备和“导入/管理先验地图”入口，并新增“先验地图会话优化”。自由扫描不要求地图，也不显示无意义的价签复核步骤。
 
@@ -30,7 +30,13 @@ MapCase02 已在 2026-08-09 通过 PC 转换、v2 schema、确定性 canonical/p
 8. 运行质量门禁并进入轨迹/价签复核；
 9. 导出 JSON/CSV/GeoJSON 和审计日志。
 
-测试阶段默认显示“测试诊断模式”。该模式只放宽“是否保留并加载工作草稿”，不放宽 review/publish gate：稳健硬门拒绝的手机约束不会参与求解，但仍完整写入 `localization_constraints.json`、`review_items.json` 和接受率/残差统计；人工锚点允许 5 m/30°，超限即以 `manual_anchor_safety_gate` 忽略。累计修正超过严格草稿阈值时仍生成可视化 `draft`。报告固定写入 `diagnostic_mode=true`、`diagnostic_only=true` 和 `diagnostic_mode_enabled` 发布 blocker，因而不能提交为生产成果。关闭该选项时恢复严格行为，超限结果只保留不可见于 current 的 `invalid` 诊断版本。
+人工位置证据分为两类。手机持久化的 `MarketScannerManualLocalizationEvent v3` 只有在 tracking/map/floor 身份、递增 alignment version、exact node ID、node stamp、time delta 和 atomic snapshot generation 全部严格通过时，才成为“可信绝对地图锚点”；它按约 3 m 平移和 20°航向不确定度参与求解，不再因相对累计漂移超过 5 m/30°而被丢弃。旧 v2 时间绑定事件、缺少 exact-node 权威的事件以及 PC 复核页普通 `set_anchor` 不获得该权限，仍受 5 m/30°兼容门约束并以 `unverified_manual_anchor_safety_gate` 审计。
+
+可信人工锚点造成的大 `maximum/P95 correction` 表示地图 gauge 修正，不等价于相邻节点物理瞬移；严格模式会把结果保存并加载为可复核的 current `draft`。review gate 继续检查 correction-field 相邻平移/航向梯度、相对边和闭环残差、节点覆盖、weak/lost、拒绝约束与价签证据；native 因子图也只有在调用方证明已选择可信人工锚点时，才把大 pose update 解释为 gauge 修正，普通自动 absolute prior 不享受豁免。
+
+“测试诊断模式”仍只放宽其他不安全结果的草稿可见性，不放宽 review/publish gate：稳健硬门拒绝的手机约束不会参与求解，但仍完整写入 `localization_constraints.json`、`review_items.json` 和接受率/残差统计。报告固定写入 `diagnostic_mode=true`、`diagnostic_only=true` 和 `diagnostic_mode_enabled` 发布 blocker，因而不能提交为生产成果。
+
+若 `rtabmap-reprocess` 的优化图覆盖不完整或探索性补环产生不安全结果，普通会话仍按原错误拒绝。只有原始 `Node.pose` 全量有限、时间严格递增、相邻平移不超过 3 m、相邻旋转不超过 120°，且严格解析后至少存在一个上述可信 v3 人工锚点时，才使用 `raw_continuous_vio_manual_anchor_recovery` 生成 diagnostic-only 草稿。该路径不从不完整 `Admin.opt_poses` 渲染 2D/3D 点云成果，强制禁止发布，也不会修改原始数据库；文件非空但事件不可信时仍拒绝。
 
 数据库轨迹用于先验地图定位时固定采用 `ios_prior` 坐标契约：从 native `R × ARKit × R⁻¹` 恢复手机 `(x,-z)` 和 yaw；地图成果渲染仍保留原选项以兼容既有输出。native 因子图对 RTAB‑Map reciprocal loop 做 canonical 确定性折叠，不因正反向独立细化的小差异整体中止。
 

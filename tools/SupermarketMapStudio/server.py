@@ -2128,17 +2128,67 @@ def run_localized_map(
     original_segments = base.discover_segments(session, config)
     if len(original_segments) != 1 or original_segments[0].database_path is None:
         raise RequestError("先验地图离线优化只接受一个已完成的连续扫描数据库。")
-    database_overrides, offline_report = reprocess_single_session(
-        session,
-        output,
-        options["reprocess_binary"],
-        "optimized.db",
-        options["pc_threads"],
-        options["pc_local_staging"],
-        acceleration,
-        progress,
-        (10, 62),
-    )
+    raw_manual_events = original_segments[0].directory / "manual_localization_events.jsonl"
+    has_persisted_manual_events = raw_manual_events.is_file() and raw_manual_events.stat().st_size > 0
+    raw_vio_recovery = False
+    try:
+        database_overrides, offline_report = reprocess_single_session(
+            session,
+            output,
+            options["reprocess_binary"],
+            "optimized.db",
+            options["pc_threads"],
+            options["pc_local_staging"],
+            acceleration,
+            progress,
+            (10, 62),
+        )
+    except offline.OfflineProcessingError as exc:
+        if not has_persisted_manual_events:
+            raise
+        raw_recovery_assessment = offline.assess_raw_continuous_vio_recovery(
+            original_segments[0].database_path
+        )
+        if raw_recovery_assessment["status"] != "pass":
+            raise
+        raw_vio_recovery = True
+        database_overrides = {
+            original_segments[0].index: str(original_segments[0].database_path)
+        }
+        offline_report = {
+            "format": "SupermarketOfflineProcessingReport",
+            "version": 1,
+            "status": "diagnostic_recovery",
+            "strategy": "raw_continuous_vio_manual_anchor_recovery",
+            "diagnostic_only": True,
+            "rtabmap_global_graph_incomplete": True,
+            "rtabmap_reprocess_error": str(exc),
+            "raw_continuous_vio_assessment": raw_recovery_assessment,
+            "input": offline.inspect_database(original_segments[0].database_path),
+            "output": offline.inspect_database(original_segments[0].database_path),
+            "execution": {
+                "profile": "manual_anchor_recovery_v1",
+                "selected_pass_profile": None,
+            },
+            "adaptive": {
+                "profile": offline.ADAPTIVE_PROFILE,
+                "selected_pass": None,
+                "discovery_required": True,
+                "recovery_reason": "rtabmap_reprocess_unpublishable_with_persisted_manual_evidence",
+            },
+            "error_optimization": {
+                "status": "rejected",
+                "quality_score": 0,
+                "warnings": [],
+                "rejection_reasons": [str(exc)],
+            },
+        }
+        report_progress(
+            progress,
+            62,
+            "人工锚点连续轨迹恢复",
+            "RTAB-Map 全局图不完整，正在用完整原始 VIO 与严格人工锚点生成诊断草稿",
+        )
     report_progress(progress, 64, "生成 RTAB-Map 成果", "正在用优化数据库生成兼容的 2D/3D 地图成果")
     args = SimpleNamespace(
         session=str(session),
@@ -2149,10 +2199,20 @@ def run_localized_map(
         database_overrides=database_overrides,
         **options,
     )
-    with gpu.DepthProjector(acceleration) as projector:
-        args.depth_projector = projector
-        base.generate(args)
-        acceleration_report = projector.report()
+    if raw_vio_recovery:
+        # Never render point clouds or structure geometry from an incomplete
+        # Admin.opt_poses graph. The localized diagnostic trajectory below is
+        # still generated from the complete immutable Node.pose inventory.
+        acceleration_report = {
+            **acceleration.report(),
+            "skipped": True,
+            "reason": "rtabmap_global_graph_incomplete",
+        }
+    else:
+        with gpu.DepthProjector(acceleration) as projector:
+            args.depth_projector = projector
+            base.generate(args)
+            acceleration_report = projector.report()
     # Map rendering keeps the selected legacy axes for compatibility, while
     # prior-map localization must use the exact iOS ARKit x/-z contract.  The
     # native database stores R * ARKit * R^-1, so treating it as the historical
@@ -2173,16 +2233,23 @@ def run_localized_map(
         localization_config,
         {key: Path(value) for key, value in database_overrides.items()},
     )
-    poses = [
-        localized.Pose(
-            node_id=pose.node_id,
-            timestamp=pose.stamp,
-            x=pose.x,
-            y=pose.y,
-            yaw=pose.yaw,
+    poses = (
+        localized.load_raw_continuous_vio_poses(
+            original_segments[0].database_path,
+            localization_config.horizontal_axes,
         )
-        for pose in optimized_segments[0].poses
-    ]
+        if raw_vio_recovery
+        else [
+            localized.Pose(
+                node_id=pose.node_id,
+                timestamp=pose.stamp,
+                x=pose.x,
+                y=pose.y,
+                yaw=pose.yaw,
+            )
+            for pose in optimized_segments[0].poses
+        ]
+    )
     manual_edits = None
     raw_edits = data.get("manual_edits")
     if raw_edits not in (None, ""):
@@ -2215,7 +2282,14 @@ def run_localized_map(
             "horizontal_axes": localization_config.horizontal_axes,
             "auto_align_segments": config.auto_align_segments,
             "diagnostic_mode": data.get("diagnostic_mode") is True,
+            "relative_trajectory_authority": (
+                "raw_continuous_vio_manual_anchor_recovery"
+                if raw_vio_recovery
+                else "rtabmap_reprocess_optimized_copy"
+            ),
+            "rtabmap_global_graph_incomplete": raw_vio_recovery,
         },
+        upstream_processing_report=offline_report,
     )
     if not localized_result.get("current_updated"):
         raise RequestError(
@@ -2608,16 +2682,34 @@ def apply_localized_edit(job: Job, data: Dict[str, Any]) -> Dict[str, Any]:
         segments = base.discover_segments(session, config, {1: optimized_database})
         if len(segments) != 1:
             raise RequestError("优化轨迹无法重新读取。")
-        poses = [
-            localized.Pose(
-                node_id=pose.node_id,
-                timestamp=pose.stamp,
-                x=pose.x,
-                y=pose.y,
-                yaw=pose.yaw,
+        poses = (
+            localized.load_raw_continuous_vio_poses(
+                source_database,
+                replay_parameters["horizontal_axes"],
             )
-            for pose in segments[0].poses
-        ]
+            if replay_parameters["relative_trajectory_authority"]
+            == "raw_continuous_vio_manual_anchor_recovery"
+            else [
+                localized.Pose(
+                    node_id=pose.node_id,
+                    timestamp=pose.stamp,
+                    x=pose.x,
+                    y=pose.y,
+                    yaw=pose.yaw,
+                )
+                for pose in segments[0].poses
+            ]
+        )
+        upstream_processing_report = None
+        offline_bundle = load_json(
+            job.output_dir / "offline_processing_report.json", None
+        )
+        if isinstance(offline_bundle, dict):
+            databases = offline_bundle.get("databases")
+            if isinstance(databases, list) and databases and isinstance(
+                databases[0], dict
+            ):
+                upstream_processing_report = databases[0]
         try:
             result = localized.process_localized_session(
                 prior_map=prior_map,
@@ -2630,6 +2722,7 @@ def apply_localized_edit(job: Job, data: Dict[str, Any]) -> Dict[str, Any]:
                 expected_parent_version=current.version_id,
                 replay_parameters=replay_parameters,
                 factor_graph_binary=find_factor_graph_binary(),
+                upstream_processing_report=upstream_processing_report,
             )
         except localized.OfflineLocalizationError as exc:
             if "current version changed during replay" in str(exc):

@@ -1,6 +1,6 @@
 # 已有地图辅助定位架构
 
-> 文档状态：**当前有效（阶段一至阶段三草稿复核）**。最后核对日期：2026-08-09。
+> 文档状态：**当前有效（阶段一至阶段三草稿复核）**。最后核对日期：2026-08-12。
 
 ## 范围
 
@@ -40,8 +40,11 @@ PC prior-map localized
   原始 SQLite（只读）
     -> rtabmap-reprocess 新数据库副本
     -> RTAB-Map 全局一致相对轨迹
-    -> bounded correction field（非完整相对 SE(2) 因子图）
-       （在线结构约束 + 道路软约束 + 人工锚点/通道区间 + 鲁棒拒绝）
+    -> native 完整相对 SE(2) 因子图
+       （相对/闭环边 + 在线结构/道路软约束 + 严格人工绝对锚点）
+       -> helper 缺失/失败时 bounded correction field draft fallback
+       -> 图不完整但 raw Node.pose 连续且有严格人工锚点时
+          raw_continuous_vio_manual_anchor_recovery diagnostic draft
     -> manifest v3 绑定 Recovery + tag burst sidecar
     -> 全部价签重算/重关联并检查现场确认冲突
     -> 自动质量门禁
@@ -73,7 +76,7 @@ PC prior-map localized
 - prior-map 定位失败、较弱或丢失不会停止或改写 RTAB-Map 原始采集。
 - 结构匹配最多使用 600 点；距离残差、角覆盖、Top-K 唯一性、两帧一致性均通过后才允许修正。自动修正上限为 0.35 m/8°，应用增益 0.35。
 - 道路只作显示/弱先验，不把相似平行通道当作结构证据硬吸附。
-- 大幅修正只来自用户明确确认，并写入审计日志。
+- 大幅自动修正继续拒绝。手机人工位置只有在 v3、exact node、identity、node stamp/time delta、atomic snapshot generation 全部通过时，才作为约 3 m/20°不确定度的绝对地图锚点；旧 v2/时间绑定事件和 PC `set_anchor` 仍受 5 m/30°兼容门约束。
 - iOS ARFrame 回调按 0.5 s 节流；同一时刻只允许一个定位更新，忙时丢弃新更新并记录计数，避免队列积压。
 - iOS 使用道路网格索引只查询当前位置附近边；没有 `road_cells` 的旧包才兼容回退到全量道路。
 - 地图导入先复制并校验临时目录，再原子替换应用缓存；外部源包和已有可用缓存不会先被删除。
@@ -85,7 +88,9 @@ PC prior-map localized
 - 原始价签观测先落盘，complete burst 再落盘，最终价签才允许用户明确确认。最终化与 PC reader 对每个 `observation_id / burst_id / frame_id / payload / symbology` 做精确交叉绑定，v2 tag 的 frame set 必须精确等于一个 verified complete burst，tag payload/symbology 必须与 burst 相等，burst sequence 必须为正且严格递增。weak/recovering、低测量/低关联置信不能授权自动确认，但只要 complete burst、exact node 和可重算位置权威齐全，就保留为 `LOW_CONFIDENCE` 并由最终 node pose 重投影；不足 3 帧、身份/图质量、exact node/raw pose 或位置权威缺失仍为 `RESCAN_REQUIRED`。
 - capture generation 冻结 exact tracking session identity。ESL audit 只通过 active-only API 追加到已存在的 `segment_0001`，不隐式启动 session；普通迟到 audit 在 finalization 后拒绝，只有 scan-stop 自有 cancellation/continuity audit 可使用窄范围 override，因此旧 callback 不会创建空后继 session 或污染新扫描。
 - 算法候选与用户选择在 schema 中分离；用户确认不得修改算法字段、SLAM、地图对齐、node pose 或 localization constraint。替代候选使用 `shelfSegmentId + side` 精确 identity。
-- 阶段三求解器明确标记为 `bounded_correction_field`：x/y/yaw 带状平滑没有实现 RTAB‑Map 相对边/闭环边的耦合 SE(2) 残差，不具备正式发布资格。
+- native helper 可用时阶段三运行完整相对 SE(2) 因子图；只有 helper 缺失或失败才标记 `bounded_correction_field`，该 fallback 不具备正式发布资格。可信人工锚点造成的大绝对 pose update 只能在 native caller 明确证明 gauge authority 时跳过绝对更新量门，相对边、闭环残差、图连通与 correction-field 梯度仍 fail closed。
+- bounded fallback 使用 O(N) 三对角精确求解连续 correction field，避免固定迭代在千节点轨迹上形成锚点尖峰。可信人工锚点允许大 maximum/P95 绝对修正进入 current draft，但相邻 correction 平移超过 0.5 m 或航向超过 15°仍阻断 review。
+- RTAB-Map 图不完整时，恢复路径必须同时满足 raw `Node.pose` 全量连续安全和严格解析后至少一个可信 v3 人工锚点；结果固定 diagnostic-only、不从坏 `Admin.opt_poses` 生成点云、不发布。无人工证据的坏闭环/大跳变继续拒绝。
 - 阶段三每次处理前后核对原数据库 SHA-256；所有必需 sidecar 严格校验 UTF‑8、JSON、format/version、身份、时间戳、大小和唯一 ID。失败不切换旧 current。
 - iOS 必需定位 sidecar 的每次追加都返回结构化结果；失败会粘性写入 `captureHealth` 并持续显示红色告警，同时停止新的地图修正、人工校正和价签确认，原始 DB 继续录制到用户结束。`metadata.json` 是 sidecar bundle 的最后提交标记：提交前失败可恢复录制；`finalized=true` 提交后 checkpoint 清理失败只能进入关闭数据库的待清理终态；证据不完整则提交 `finalized=false` 恢复包并终止会话，不能恢复 prior-map 录制。
 - PC 对已有地图会话同时要求显式 `finalized=true`、`localizationEvidenceComplete=true`、零必需写失败和空 blocker 列表，缺失旧字段也按不可处理拒绝。

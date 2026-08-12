@@ -41,6 +41,7 @@ from tools.PriorMap.offline_localization import (
     build_session_input_manifest,
     build_road_soft_constraints,
     build_manual_aisle_constraints,
+    bounded_correction_metrics,
     infer_aisle_switch_sequence,
     apply_manual_edits,
     move_manual_edit_cursor,
@@ -617,7 +618,7 @@ class RobustSE2OptimizerTests(unittest.TestCase):
         self.assertEqual([item["constraint_id"] for item in rejected], ["wrong-basin"])
         self.assertEqual([item["constraint_id"] for item in accepted], ["good-end"])
 
-    def test_manual_anchor_is_tolerant_but_never_unbounded(self) -> None:
+    def test_only_strictly_verified_manual_anchor_can_apply_large_correction(self) -> None:
         baseline = [Pose(1, 0.0, 0.0, 0.0, 0.0)]
         constraints = [
             AbsoluteConstraint(
@@ -640,17 +641,62 @@ class RobustSE2OptimizerTests(unittest.TestCase):
                 kind="manual_anchor",
                 source={},
             ),
+            AbsoluteConstraint(
+                identifier="verified-node-bound-anchor",
+                node_index=0,
+                x=40.0,
+                y=0.0,
+                yaw=0.0,
+                weight=1.0 / 9.0,
+                kind="manual_anchor",
+                source={"version": 3, "node_binding_status": "matched"},
+                translation_sigma_m=3.0,
+                yaw_sigma_rad=math.radians(20.0),
+                trusted_absolute=True,
+            ),
         ]
         _optimized, accepted, rejected = optimize_trajectory(baseline, constraints)
         self.assertEqual(
             [item["constraint_id"] for item in accepted],
-            ["within-test-tolerance"],
+            ["within-test-tolerance", "verified-node-bound-anchor"],
         )
         self.assertEqual(
             [item["constraint_id"] for item in rejected],
             ["conflicting-phone-anchor"],
         )
-        self.assertEqual(rejected[0]["reason"], "manual_anchor_safety_gate")
+        self.assertEqual(rejected[0]["reason"], "unverified_manual_anchor_safety_gate")
+
+    def test_long_drift_manual_anchor_produces_continuous_correction_field(self) -> None:
+        baseline = [
+            Pose(index + 1, float(index), float(index) * 0.1, 0.0, 0.0)
+            for index in range(1200)
+        ]
+        constraint = AbsoluteConstraint(
+            identifier="verified-long-route-anchor",
+            node_index=900,
+            x=baseline[900].x + 35.0,
+            y=baseline[900].y - 12.0,
+            yaw=math.radians(8.0),
+            weight=1.0 / 9.0,
+            kind="manual_anchor",
+            source={"version": 3, "node_binding_status": "matched"},
+            translation_sigma_m=3.0,
+            yaw_sigma_rad=math.radians(20.0),
+            trusted_absolute=True,
+        )
+        optimized, accepted, rejected = optimize_trajectory(
+            baseline, [constraint]
+        )
+        metrics = bounded_correction_metrics(baseline, optimized, [constraint])
+        self.assertEqual(len(accepted), 1)
+        self.assertEqual(rejected, [])
+        self.assertGreater(optimized[900].x - baseline[900].x, 25.0)
+        self.assertLess(
+            metrics["maximum_neighbor_correction_translation_change_m"], 0.5
+        )
+        self.assertLess(
+            metrics["maximum_neighbor_correction_yaw_change_deg"], 15.0
+        )
 
     def test_road_soft_constraints_are_local_bounded_and_direction_aware(self) -> None:
         baseline = [
@@ -2720,8 +2766,12 @@ class LocalizedPipelineTests(unittest.TestCase):
         self.assertEqual(
             report["manual_localization_event_audit"][0]["status"], "accepted"
         )
+        self.assertTrue(
+            report["manual_localization_event_audit"][0]["trusted_absolute"]
+        )
+        self.assertEqual(report["accepted_trusted_manual_anchor_count"], 1)
 
-    def test_diagnostic_mode_ignores_unsafe_manual_anchor_and_phone_conflicts(self) -> None:
+    def test_verified_large_manual_anchor_advances_strict_reviewable_draft(self) -> None:
         manifest = json.loads((self.prior_map / "manifest.json").read_text())
         jsonl_write(
             self.segment / "manual_localization_events.jsonl",
@@ -2745,8 +2795,8 @@ class LocalizedPipelineTests(unittest.TestCase):
                 "floor_id": "1",
                 "arkit_pose": {"x_m": 5.0, "y_m": 0.0, "yaw_rad": 0.0},
                 "confirmed_map_pose": {
-                    "x_m": 100.0,
-                    "y_m": 100.0,
+                    "x_m": 80.0,
+                    "y_m": -2.0,
                     "yaw_rad": 0.0,
                 },
             }],
@@ -2760,14 +2810,30 @@ class LocalizedPipelineTests(unittest.TestCase):
             self.optimized_database,
             strict_output,
         )
-        self.assertLess(strict["maximum_correction_m"], 2.0)
-        self.assertIn(
-            "manual_anchor_safety_gate",
-            {item["reason"] for item in strict["high_residual_intervals"]},
+        self.assertGreater(strict["maximum_correction_m"], 2.0)
+        self.assertEqual(strict["accepted_manual_anchor_count"], 1)
+        self.assertEqual(strict["accepted_trusted_manual_anchor_count"], 1)
+        self.assertEqual(
+            strict["absolute_correction_interpretation"],
+            "verified_manual_anchor_map_gauge_correction",
         )
         self.assertTrue(strict["allow_draft"])
         self.assertTrue(strict["current_updated"])
         self.assertIsNotNone(LocalizedVersionStore(strict_output).current())
+        self.assertNotIn(
+            "maximum_correction_above_2m",
+            {item["code"] for item in strict["review_gate"]["blockers"]},
+        )
+        self.assertNotIn(
+            "p95_correction_above_1m",
+            {item["code"] for item in strict["review_gate"]["blockers"]},
+        )
+        self.assertLessEqual(
+            strict["solver"][
+                "maximum_neighbor_correction_translation_change_m"
+            ],
+            0.5,
+        )
 
         diagnostic_output = self.root / "localized-unsafe-diagnostic"
         diagnostic = process_localized_session(
@@ -2787,15 +2853,67 @@ class LocalizedPipelineTests(unittest.TestCase):
         self.assertTrue(diagnostic["allow_draft"])
         self.assertTrue(diagnostic["current_updated"])
         self.assertEqual(diagnostic["publish_state"], "draft")
-        self.assertEqual(
-            diagnostic["ignored_conflicting_source_constraint_count"], 1
-        )
+        self.assertGreater(diagnostic["maximum_correction_m"], 2.0)
+        self.assertEqual(diagnostic["accepted_manual_anchor_count"], 1)
+        self.assertEqual(diagnostic["accepted_trusted_manual_anchor_count"], 1)
         self.assertFalse(diagnostic["publish_gate"]["passed"])
         self.assertIn(
             "diagnostic_mode_enabled",
             {item["code"] for item in diagnostic["publish_gate"]["blockers"]},
         )
         self.assertIsNotNone(LocalizedVersionStore(diagnostic_output).current())
+
+    def test_pc_set_anchor_cannot_claim_verified_phone_anchor_trust(self) -> None:
+        initial_output = self.root / "localized-pc-anchor-base"
+        first = process_localized_session(
+            self.prior_map,
+            self.session,
+            self.poses,
+            self.source_database,
+            self.optimized_database,
+            initial_output,
+        )
+        current = LocalizedVersionStore(initial_output).current()
+        self.assertIsNotNone(current)
+        assert current is not None
+        journal = json.loads(
+            (current.version_dir / "manual_edits.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        journal = append_manual_edit(
+            journal,
+            {
+                "type": "set_anchor",
+                "new_value": {
+                    "timestamp": self.node_timebase_offset + 10.0,
+                    "x_m": 100.0,
+                    "y_m": 100.0,
+                    "yaw_rad": 0.0,
+                },
+            },
+        )
+        replayed = process_localized_session(
+            self.prior_map,
+            self.session,
+            self.poses,
+            self.source_database,
+            self.optimized_database,
+            initial_output,
+            manual_edits=journal,
+            expected_parent_version=first["version_id"],
+        )
+        self.assertEqual(replayed["accepted_trusted_manual_anchor_count"], 0)
+        pc_anchor_rejections = [
+            item
+            for item in replayed["high_residual_intervals"]
+            if item["constraint_id"] == "edit-000001"
+        ]
+        self.assertEqual(len(pc_anchor_rejections), 1)
+        self.assertEqual(
+            pc_anchor_rejections[0]["reason"],
+            "unverified_manual_anchor_safety_gate",
+        )
 
     def test_stale_or_duplicate_manual_alignment_version_is_rejected(self) -> None:
         manifest = json.loads((self.prior_map / "manifest.json").read_text())

@@ -24,8 +24,8 @@ FACTOR_GRAPH_ENV = "MARKETSCANNER_FACTOR_GRAPH_BIN"
 DEFAULT_ITERATIONS = 100
 DEFAULT_EPSILON = 1.0e-6
 SAFE_TEXT_RE = re.compile(r"[^\t\r\n]{1,500}")
-MANUAL_ANCHOR_MAX_TRANSLATION_M = 5.0
-MANUAL_ANCHOR_MAX_YAW_RAD = math.radians(30.0)
+UNVERIFIED_MANUAL_ANCHOR_MAX_TRANSLATION_M = 5.0
+UNVERIFIED_MANUAL_ANCHOR_MAX_YAW_RAD = math.radians(30.0)
 
 
 class FactorGraphRunnerError(ValueError):
@@ -94,13 +94,14 @@ def _select_absolute_priors(
         translation = math.hypot(constraint.x - current.x, constraint.y - current.y)
         yaw = abs(_normalize_angle(constraint.yaw - current.yaw))
         is_manual_anchor = constraint.kind == "manual_anchor"
-        if is_manual_anchor:
+        trusted_manual_anchor = is_manual_anchor and constraint.trusted_absolute
+        if is_manual_anchor and not trusted_manual_anchor:
             exceeds_gate = (
-                translation > MANUAL_ANCHOR_MAX_TRANSLATION_M
-                or yaw > MANUAL_ANCHOR_MAX_YAW_RAD
+                translation > UNVERIFIED_MANUAL_ANCHOR_MAX_TRANSLATION_M
+                or yaw > UNVERIFIED_MANUAL_ANCHOR_MAX_YAW_RAD
             )
         else:
-            exceeds_gate = constraint.kind not in {
+            exceeds_gate = not trusted_manual_anchor and constraint.kind not in {
                 "manual_aisle_assignment",
                 "road_soft",
             } and (
@@ -115,7 +116,7 @@ def _select_absolute_priors(
                     "translation_residual_m": translation,
                     "yaw_residual_deg": math.degrees(yaw),
                     "reason": (
-                        "manual_anchor_safety_gate"
+                        "unverified_manual_anchor_safety_gate"
                         if is_manual_anchor
                         else "factor_graph_robust_hard_gate"
                     ),
@@ -271,6 +272,11 @@ def run_relative_se2_factor_graph(
             expected_node_ids=(pose.node_id for pose in baseline),
             quality_policy=quality_policy,
             quality_policy_sha256=quality_policy_sha256,
+            verified_absolute_gauge_authority=any(
+                constraint.kind == "manual_anchor"
+                and getattr(constraint, "trusted_absolute", False) is True
+                for constraint in selected
+            ),
         )
     except FactorGraphValidationError as exc:
         raise FactorGraphRunnerError(str(exc)) from exc
@@ -306,6 +312,9 @@ def run_relative_se2_factor_graph(
                 if getattr(constraint, "translation_sigma_m", None) is not None
                 else "legacy_scalar_weight_migration"
             ),
+            "trusted_absolute": bool(
+                getattr(constraint, "trusted_absolute", False)
+            ),
             "translation_residual_m": math.hypot(
                 constraint.x - optimized[constraint.node_index].x,
                 constraint.y - optimized[constraint.node_index].y,
@@ -321,5 +330,10 @@ def run_relative_se2_factor_graph(
         "absolute_constraint_count": len(selected),
         "absolute_constraint_rejected_count": len(rejected),
         "absolute_prior_uncertainty_schema": "translation_sigma_m_and_yaw_sigma_rad_v2",
+        "verified_absolute_gauge_authority": any(
+            constraint.kind == "manual_anchor"
+            and getattr(constraint, "trusted_absolute", False) is True
+            for constraint in selected
+        ),
     }
     return optimized, accepted, rejected, report

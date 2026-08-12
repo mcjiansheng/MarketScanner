@@ -911,6 +911,43 @@ def assess_optimized_trajectory(input_database: Path, output_database: Path) -> 
     }
 
 
+def assess_raw_continuous_vio_recovery(input_database: Path) -> Dict[str, Any]:
+    """Validate the immutable full Node.pose chain as a diagnostic baseline.
+
+    This is intentionally stricter than accepting a partial Admin.opt_poses
+    graph and intentionally weaker than claiming global RTAB-Map optimization.
+    It exists only so exact node-bound manual map anchors can recover a long,
+    physically continuous VIO route when the replay graph is incomplete.
+    """
+    raw = _database_poses(input_database, optimized=False)
+    inspection = inspect_database(input_database)
+    metrics = trajectory_metrics(raw)
+    rejection_reasons: list[str] = []
+    if len(raw) != int(inspection.get("node_count", 0)):
+        rejection_reasons.append("Raw Node.pose coverage is incomplete.")
+    if metrics["nonfinite_pose_count"]:
+        rejection_reasons.append("Raw Node.pose contains non-finite transforms.")
+    if float(metrics["max_step_m"]) > 3.0:
+        rejection_reasons.append(
+            f"Raw VIO neighbor step {metrics['max_step_m']:.2f} m exceeds 3.00 m."
+        )
+    if float(metrics["max_step_rotation_deg"]) > 120.0:
+        rejection_reasons.append(
+            "Raw VIO neighbor rotation exceeds 120 degrees."
+        )
+    return {
+        "format": "SupermarketRawContinuousVIORecoveryAssessment",
+        "version": 1,
+        "status": "rejected" if rejection_reasons else "pass",
+        "source": "immutable_node_pose",
+        "diagnostic_only": True,
+        "pose_count": len(raw),
+        "node_count": inspection.get("node_count", 0),
+        "raw": metrics,
+        "rejection_reasons": rejection_reasons,
+    }
+
+
 def run_reprocess(
     input_database: Path,
     output_database: Path,
@@ -1356,26 +1393,45 @@ def run_adaptive_reprocess(
                     message,
                 )
 
-        selected_report = run_reprocess(
-            input_database,
-            output_database,
-            explicit_binary=explicit_binary,
-            timeout_seconds=timeout_seconds,
-            thread_count=thread_count,
-            use_local_staging=use_local_staging,
-            accelerator_backend=accelerator_backend,
-            extra_parameters=base_parameters,
-            progress_callback=discovery_progress,
-            profile_name=DISCOVERY_PROFILE,
-            cancel_event=cancel_event,
-            persistent_log_path=(
-                persistent_log_prefix.with_name(persistent_log_prefix.name + "-discovery.log")
-                if persistent_log_prefix is not None
-                else None
-            ),
-        )
-        passes.append(_adaptive_pass_summary(selected_report))
-        selected_pass = DISCOVERY_PROFILE
+        try:
+            discovered_report = run_reprocess(
+                input_database,
+                output_database,
+                explicit_binary=explicit_binary,
+                timeout_seconds=timeout_seconds,
+                thread_count=thread_count,
+                use_local_staging=use_local_staging,
+                accelerator_backend=accelerator_backend,
+                extra_parameters=base_parameters,
+                progress_callback=discovery_progress,
+                profile_name=DISCOVERY_PROFILE,
+                cancel_event=cancel_event,
+                persistent_log_path=(
+                    persistent_log_prefix.with_name(persistent_log_prefix.name + "-discovery.log")
+                    if persistent_log_prefix is not None
+                    else None
+                ),
+            )
+        except OfflineProcessingError as exc:
+            if cancel_event is not None and cancel_event.is_set():
+                raise
+            passes.append(
+                {
+                    "profile": DISCOVERY_PROFILE,
+                    "quality_status": "failed",
+                    "error": str(exc),
+                }
+            )
+            if fast_report is None:
+                raise
+            # The discovery pass is exploratory. A failed or unsafe discovery
+            # graph must not erase an already validated fast graph.
+            selected_report = fast_report
+            selected_pass = FAST_REUSE_PROFILE
+        else:
+            selected_report = discovered_report
+            passes.append(_adaptive_pass_summary(selected_report))
+            selected_pass = DISCOVERY_PROFILE
 
     if selected_report is None:
         raise OfflineProcessingError("Adaptive processing did not produce a publishable result.")

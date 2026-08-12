@@ -110,7 +110,7 @@ def valid_report():
 
 
 class FactorGraphSchemaTests(unittest.TestCase):
-    def validate(self, payload):
+    def validate(self, payload, *, verified_absolute_gauge_authority=False):
         return validate_factor_graph_result(
             payload,
             expected_input_identity_id=IDENTITY,
@@ -118,6 +118,9 @@ class FactorGraphSchemaTests(unittest.TestCase):
             expected_node_ids=(1, 2, 3),
             quality_policy=POLICY,
             quality_policy_sha256=POLICY_SHA,
+            verified_absolute_gauge_authority=(
+                verified_absolute_gauge_authority
+            ),
         )
 
     def test_valid_connected_graph_and_canonical_digest(self):
@@ -206,6 +209,46 @@ class FactorGraphSchemaTests(unittest.TestCase):
                 payload[field] = value
                 with self.assertRaisesRegex(FactorGraphValidationError, message):
                     self.validate(payload)
+
+    def test_absolute_prior_gauge_allows_large_global_update_but_keeps_relative_gates(self):
+        payload = valid_report()
+        payload["gauge_mode"] = "absolute_priors"
+        payload["maximum_pose_update_m"] = 40.0
+        payload["maximum_pose_update_yaw_deg"] = 90.0
+        report = self.validate(
+            payload, verified_absolute_gauge_authority=True
+        )
+        self.assertTrue(report["quality_policy"]["passed"])
+        self.assertFalse(
+            report["quality_policy"]["absolute_pose_update_gate_applied"]
+        )
+
+        payload = valid_report()
+        payload["gauge_mode"] = "absolute_priors"
+        payload["maximum_pose_update_m"] = 40.0
+        payload["maximum_relative_edge_translation_residual_m"] = 2.0
+        report = self.validate(
+            payload, verified_absolute_gauge_authority=True
+        )
+        self.assertFalse(report["quality_policy"]["passed"])
+        self.assertIn(
+            "relative_translation_max_exceeded",
+            {item["code"] for item in report["quality_policy"]["blockers"]},
+        )
+
+    def test_automatic_absolute_priors_cannot_bypass_pose_update_gate(self):
+        payload = valid_report()
+        payload["gauge_mode"] = "absolute_priors"
+        payload["maximum_pose_update_m"] = 40.0
+        report = self.validate(payload)
+        self.assertFalse(report["quality_policy"]["passed"])
+        self.assertTrue(
+            report["quality_policy"]["absolute_pose_update_gate_applied"]
+        )
+        self.assertIn(
+            "maximum_pose_update_exceeded",
+            {item["code"] for item in report["quality_policy"]["blockers"]},
+        )
 
 
 if __name__ == "__main__":
