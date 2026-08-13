@@ -7,6 +7,7 @@
   <link rel="stylesheet" href="/app.css">
 </head>
 <body>
+  <a class="skip-link" href="#main-content">跳到主要内容</a>
   <header class="app-header">
     <div>
       <p class="eyebrow">RTAB-Map Offline Workflow</p>
@@ -29,7 +30,7 @@
     <button id="cancel-job" class="secondary" type="button" hidden>取消任务</button>
   </section>
 
-  <main>
+  <main id="main-content" tabindex="-1">
     <nav class="mode-tabs" aria-label="处理模式">
       <button class="tab is-active" type="button" data-mode="single">单设备处理</button>
       <button class="tab" type="button" data-mode="multi">多设备合并</button>
@@ -319,8 +320,8 @@
               </label>
               <span class="localized-trajectory-legend">在线轨迹 · RTAB‑Map · 离线轨迹</span>
             </div>
-            <canvas id="localized-review-canvas" aria-label="先验地图、三条轨迹和价签联动复核；设置锚点时可直接点击和拖动"></canvas>
-            <div id="localized-map-anchor-help" class="field-hint">选择“设置轨迹锚点”后，直接点击离线轨迹并拖到正确地图位置。</div>
+            <canvas id="localized-review-canvas" tabindex="0" aria-label="先验地图、三条轨迹和价签联动复核；设置锚点时可点击轨迹、拖动位置，并用方向键微调"></canvas>
+            <div id="localized-map-anchor-help" class="field-hint">坐标合同：0° 为地图 +X（屏幕右），90° 为地图 +Y（屏幕上），逆时针为正。点击绿色离线轨迹选择 exact node；方向键微调位置，Shift 加速，方括号键旋转。</div>
           </div>
           <div>
             <h3>价签与问题列表</h3>
@@ -342,16 +343,53 @@
           <label id="localized-edit-value-field" class="localized-edit-value">高级新值（JSON）<textarea id="localized-edit-value" rows="3" placeholder='例如 {"timestamp":12.4,"x_m":3.2,"y_m":-5.1,"yaw_rad":0}'></textarea></label>
           <label>复核原因（可选）<input id="localized-edit-reason" type="text" maxlength="500" placeholder="说明人工修改或批准依据"></label>
         </div>
-        <div id="localized-map-anchor-controls" class="localized-map-anchor-controls">
-          <span id="localized-map-anchor-summary">尚未选择轨迹点</span>
-          <label>朝向修正 <input id="localized-map-anchor-yaw" type="range" min="-180" max="180" step="1" value="0"> <output id="localized-map-anchor-yaw-value">0°</output></label>
+        <div id="localized-map-anchor-controls" class="localized-map-anchor-controls" aria-label="人工地图锚点精确控制">
+          <div class="localized-anchor-header">
+            <strong id="localized-map-anchor-summary" aria-live="polite">尚未选择轨迹点</strong>
+            <span>内部 canonical SE(2) 与提交值完全一致</span>
+          </div>
+          <div class="localized-anchor-values">
+            <label>X（m）<input id="localized-map-anchor-x" name="manual_anchor_x_m" type="number" step="0.001" inputmode="decimal" autocomplete="off"></label>
+            <label>Y（m）<input id="localized-map-anchor-y" name="manual_anchor_y_m" type="number" step="0.001" inputmode="decimal" autocomplete="off"></label>
+            <label>朝向（°）<input id="localized-map-anchor-yaw-number" name="manual_anchor_yaw_deg" type="number" min="-180" max="180" step="0.1" inputmode="decimal" autocomplete="off"></label>
+            <label>平移步长
+              <select id="localized-map-anchor-step" name="manual_anchor_translation_step" autocomplete="off">
+                <option value="0.1">0.1 m</option>
+                <option value="0.5" selected>0.5 m</option>
+                <option value="1">1.0 m</option>
+              </select>
+            </label>
+          </div>
+          <div class="localized-anchor-pad" aria-label="位置微调">
+            <button class="secondary" type="button" data-anchor-move="0,1" aria-label="向地图北侧移动">↑ +Y</button>
+            <button class="secondary" type="button" data-anchor-move="-1,0" aria-label="向地图西侧移动">← −X</button>
+            <button class="secondary" type="button" data-anchor-reset>回到所选节点</button>
+            <button class="secondary" type="button" data-anchor-move="1,0" aria-label="向地图东侧移动">+X →</button>
+            <button class="secondary" type="button" data-anchor-move="0,-1" aria-label="向地图南侧移动">↓ −Y</button>
+          </div>
+          <div class="localized-anchor-rotation" aria-label="朝向微调">
+            <button class="secondary" type="button" data-anchor-rotate="-15">−15°</button>
+            <button class="secondary" type="button" data-anchor-rotate="-5">−5°</button>
+            <button class="secondary" type="button" data-anchor-rotate="-1">−1°</button>
+            <input id="localized-map-anchor-yaw" aria-label="朝向滑块" type="range" min="-180" max="180" step="0.1" value="0">
+            <output id="localized-map-anchor-yaw-value">0.0°</output>
+            <button class="secondary" type="button" data-anchor-rotate="1">+1°</button>
+            <button class="secondary" type="button" data-anchor-rotate="5">+5°</button>
+            <button class="secondary" type="button" data-anchor-rotate="15">+15°</button>
+          </div>
+          <div class="localized-anchor-cardinals" aria-label="快速设置朝向">
+            <button class="secondary" type="button" data-anchor-yaw="0">东 0°</button>
+            <button class="secondary" type="button" data-anchor-yaw="90">北 90°</button>
+            <button class="secondary" type="button" data-anchor-yaw="180">西 180°</button>
+            <button class="secondary" type="button" data-anchor-yaw="-90">南 −90°</button>
+          </div>
         </div>
         <div id="localized-edit-help" class="field-hint"></div>
         <div class="button-row">
           <button id="localized-undo" class="secondary" type="button">撤销</button>
           <button id="localized-redo" class="secondary" type="button">重做</button>
           <button id="localized-apply-edit" class="primary" type="button">应用并重算派生结果</button>
-          <span id="localized-edit-status"></span>
+          <span id="localized-edit-status" role="status" aria-live="polite"></span>
         </div>
         <div class="button-row">
           <button id="localized-field-evidence" class="secondary" type="button">选择并验证现场验收证据</button>
@@ -380,6 +418,7 @@
       </div>
     </section>
   </main>
+  <script src="/anchor_geometry.js"></script>
   <script src="/app.js"></script>
 </body>
 </html>

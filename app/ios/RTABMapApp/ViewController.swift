@@ -1127,6 +1127,48 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                         self.priorMapQueue.async {
                             guard generation == self.priorMapGeneration else { return }
                             localizer.requestRecovery(reason: "reliable_rtabmap_loop")
+                            let shelfCandidates = localizer
+                                .nearbyShelfIdentityCandidates()
+                            guard generation == self.priorMapGeneration else {
+                                return
+                            }
+                            let identityStatus: String
+                            if shelfCandidates.isEmpty {
+                                identityStatus = "unavailable"
+                            }
+                            else if shelfCandidates.count == 1 {
+                                identityStatus = "single_nearby_candidate"
+                            }
+                            else {
+                                identityStatus = "ambiguous_top_k_retained"
+                            }
+                            self.supermarketSession?.appendScanEvent(
+                                level: shelfCandidates.count == 1
+                                    ? "info" : "warning",
+                                event: "loop_opened_shelf_identity_candidates",
+                                message: "Reliable RTAB-Map loop opened bounded recovery; pose-neighborhood shelf top-K candidates were retained for later structure disambiguation",
+                                fields: [
+                                    "authority": "diagnostic_only_not_localization_factor",
+                                    "candidate_source": "latest_estimated_pose_before_post_loop_structure_search",
+                                    "identity_status": identityStatus,
+                                    "candidate_count": "\(shelfCandidates.count)",
+                                    "shelf_segment_ids": shelfCandidates
+                                        .map(\.shelfSegmentId)
+                                        .joined(separator: ","),
+                                    "shelf_codes": shelfCandidates
+                                        .map(\.shelfCode)
+                                        .joined(separator: ","),
+                                    "distances_m": shelfCandidates
+                                        .map { String(format: "%.3f", $0.distanceM) }
+                                        .joined(separator: ","),
+                                    "longitudinal_fractions": shelfCandidates
+                                        .map {
+                                            String(
+                                                format: "%.4f",
+                                                $0.longitudinalFraction)
+                                        }
+                                        .joined(separator: ","),
+                                ])
                         }
                     }
                 }

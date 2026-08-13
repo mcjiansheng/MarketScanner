@@ -52,8 +52,13 @@ import offline_processing as offline
 import gpu_acceleration as gpu
 import merge_processing as merge
 from PriorMap.prior_map_schema import validate_package as validate_prior_map_package
+from PriorMap.prior_map_compatibility import (
+    PriorMapCompatibilityError,
+    prepare_prior_map_for_processing,
+)
 from PriorMap.xlsx_to_prior_map import convert_workbook as convert_prior_map_workbook
 from PriorMap import offline_localization as localized
+from PriorMap.export_calibrated_trajectory import export as export_calibrated_trajectory
 from PriorMap.factor_graph_runner import find_factor_graph_binary
 from PriorMap.localized_output_store import (
     LocalizedSnapshot,
@@ -98,6 +103,13 @@ ARTIFACTS = (
     "spatial_index.json",
     "validation_report.json",
     "package_manifest.json",
+    "prior_map_compatibility_audit.json",
+    "calibrated_trajectory_export/calibrated_positions_by_node.csv",
+    "calibrated_trajectory_export/calibrated_positions_1s.csv",
+    "calibrated_trajectory_export/calibrated_trajectory_on_prior_map.png",
+    "calibrated_trajectory_export/calibrated_trajectory_timestamped.png",
+    "calibrated_trajectory_export/export_manifest.json",
+    "calibrated_trajectory_export_error.json",
     "prior_map_manifest.json",
     "processing_manifest.json",
     "online_localization_trace.json",
@@ -2105,12 +2117,46 @@ def run_localized_map(
     progress: Optional[ProgressCallback] = None,
 ) -> None:
     session = require_session(data.get("session"))
-    prior_map = resolve_path(data.get("prior_map"), "Prior-map package")
-    validation = validate_prior_map_package(prior_map)
-    if not validation["valid"]:
+    selected_prior_map = resolve_path(data.get("prior_map"), "Prior-map package")
+    try:
+        prior_map, compatibility_audit = prepare_prior_map_for_processing(
+            selected_prior_map, output
+        )
+    except PriorMapCompatibilityError:
+        validation = validate_prior_map_package(selected_prior_map)
+        messages = [
+            str(item.get("message"))
+            for item in validation.get("errors", [])
+            if isinstance(item, dict) and item.get("message")
+        ]
         raise RequestError(
             "先验地图校验失败："
-            + "；".join(item["message"] for item in validation["errors"])
+            + (
+                "；".join(messages)
+                if messages
+                else "地图包缺少可验证的正式工件，且不属于受支持的只读兼容迁移。"
+            )
+        )
+    if compatibility_audit is not None:
+        output.mkdir(parents=True, exist_ok=True)
+        (output / "prior_map_compatibility_audit.json").write_text(
+            json.dumps(
+                compatibility_audit,
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        report_progress(
+            progress,
+            3,
+            "兼容重建先验地图",
+            (
+                "旧地图包字节与业务身份完整；已在结果目录只读重建道路拓扑和空间索引，"
+                "原地图包未修改"
+            ),
         )
     options = map_options(data)
     acceleration = acceleration_selection(options, progress)
@@ -2299,10 +2345,55 @@ def run_localized_map(
         },
         upstream_processing_report=offline_report,
     )
+    version_id = localized_result.get("version_id")
+    if isinstance(version_id, str) and version_id:
+        version_directory = output / "localized" / "versions" / version_id
+        export_directory = output / "calibrated_trajectory_export"
+        try:
+            export_manifest = export_calibrated_trajectory(
+                prior_map,
+                version_directory,
+                export_directory,
+            )
+        except (OSError, ValueError, localized.OfflineLocalizationError) as exc:
+            (output / "calibrated_trajectory_export_error.json").write_text(
+                json.dumps(
+                    {
+                        "format": "MarketScannerCalibratedTrajectoryExportError",
+                        "version": 1,
+                        "source_version": version_id,
+                        "result_version_preserved": True,
+                        "message": str(exc),
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                    sort_keys=True,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            report_progress(
+                progress,
+                98,
+                "坐标表导出需复核",
+                "本地化版本已安全保留，但附加 CSV/PNG 导出未完成；错误审计已写入结果目录",
+            )
+        else:
+            report_progress(
+                progress,
+                98,
+                "导出校准坐标",
+                (
+                    f"已导出 {export_manifest.get('node_count', 0)} 个节点和 "
+                    f"{export_manifest.get('one_second_sample_count', 0)} 条逐秒手机坐标及路线预览"
+                ),
+            )
     if not localized_result.get("current_updated"):
-        raise RequestError(
-            "本地化质量门禁未通过；诊断版本已保留，但不会切换为 current 结果。"
-            "测试阶段可启用“测试诊断模式”以加载不可发布草稿和误差报告。"
+        report_progress(
+            progress,
+            98,
+            "已保留不可发布诊断结果",
+            "已生成身份绑定的诊断版本；结果不满足 current 草稿条件，但没有删除任何可解析轨迹或价签证据",
         )
 
 
@@ -2406,6 +2497,7 @@ def _authoritative_manual_event(
     constraints: List[Dict[str, Any]],
     elements: List[Dict[str, Any]],
     manifest: Dict[str, Any],
+    localized_review: Dict[str, Any],
 ) -> Dict[str, Any]:
     kind = str(request_event.get("type") or "")
     target = str(request_event.get("object_id") or "")
@@ -2416,7 +2508,91 @@ def _authoritative_manual_event(
     except localized.OfflineLocalizationError as exc:
         raise RequestError(str(exc)) from exc
     old_value: Any = None
-    if kind == "edit_tag":
+    if kind == "set_anchor":
+        if not isinstance(new_value, dict):
+            raise RequestError("人工锚点缺少 canonical SE(2) 数据。")
+        trajectory = localized_review.get("trajectory")
+        features = (
+            trajectory.get("features")
+            if isinstance(trajectory, dict)
+            else None
+        )
+        feature = next(
+            (
+                item
+                for item in (features or [])
+                if isinstance(item, dict)
+                and item.get("properties", {}).get("layer")
+                == "prior_map_offline_optimized"
+            ),
+            None,
+        )
+        properties = feature.get("properties") if isinstance(feature, dict) else None
+        coordinates = feature.get("geometry", {}).get("coordinates") if isinstance(feature, dict) else None
+        node_ids = properties.get("node_ids") if isinstance(properties, dict) else None
+        timestamps = properties.get("timestamps") if isinstance(properties, dict) else None
+        yaws = properties.get("yaws_rad") if isinstance(properties, dict) else None
+        if not all(isinstance(item, list) for item in (coordinates, node_ids, timestamps, yaws)):
+            raise RequestError("当前复核版本缺少 exact node/time/yaw 轨迹。")
+        if not (
+            len(coordinates) == len(node_ids) == len(timestamps) == len(yaws)
+            and coordinates
+        ):
+            raise RequestError("当前复核版本的轨迹索引不一致。")
+        node_id = new_value.get("node_id")
+        timestamp = new_value.get("timestamp")
+        if isinstance(node_id, bool) or not isinstance(node_id, int):
+            raise RequestError("人工锚点必须绑定 exact node ID。")
+        matches = [index for index, value in enumerate(node_ids) if value == node_id]
+        if len(matches) != 1:
+            raise RequestError("人工锚点 exact node 不存在或不唯一。")
+        index = matches[0]
+        try:
+            timestamp_value = float(timestamp)
+            stored_timestamp = float(timestamps[index])
+            x = float(new_value["x_m"])
+            y = float(new_value["y_m"])
+            yaw = float(new_value["yaw_rad"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RequestError("人工锚点必须包含有限 canonical x/y/yaw/time。") from exc
+        if (
+            not all(math.isfinite(value) for value in (timestamp_value, stored_timestamp, x, y, yaw))
+            or abs(timestamp_value - stored_timestamp) > 1.0e-6
+            or yaw <= -math.pi
+            or yaw > math.pi
+        ):
+            raise RequestError("人工锚点 node/time 绑定与当前版本不一致。")
+        if (
+            new_value.get("coordinate_contract_version")
+            != localized_review.get("coordinate_contract_version")
+            or str(new_value.get("floor_id") or "")
+            != str(localized_review.get("floor_id") or "")
+        ):
+            raise RequestError("人工锚点楼层或坐标合同与当前版本不一致。")
+        bounds = localized_review.get("bounds")
+        if not isinstance(bounds, dict):
+            raise RequestError("当前地图缺少 canonical bounds。")
+        try:
+            inside = (
+                float(bounds["min_x_m"]) <= x <= float(bounds["max_x_m"])
+                and float(bounds["min_y_m"]) <= y <= float(bounds["max_y_m"])
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RequestError("当前地图 canonical bounds 无效。") from exc
+        if not inside:
+            raise RequestError("人工锚点超出当前楼层 canonical bounds。")
+        old_value = {
+            "timestamp": stored_timestamp,
+            "node_id": node_id,
+            "floor_id": new_value["floor_id"],
+            "coordinate_contract_version": new_value[
+                "coordinate_contract_version"
+            ],
+            "x_m": float(coordinates[index][0]),
+            "y_m": float(coordinates[index][1]),
+            "yaw_rad": float(yaws[index]),
+        }
+    elif kind == "edit_tag":
         tag = _one_by_id(tags, "tag_id", target, "价签")
         assert isinstance(new_value, dict)
         old_value = {key: tag.get(key) for key in new_value}
@@ -2523,6 +2699,7 @@ def apply_localized_edit(job: Job, data: Dict[str, Any]) -> Dict[str, Any]:
                     "session_input_manifest.json",
                     "localized_price_tags.json",
                     "localization_constraints.json",
+                    "localized_review.json",
                 ),
             )
             verified = {
@@ -2540,9 +2717,16 @@ def apply_localized_edit(job: Job, data: Dict[str, Any]) -> Dict[str, Any]:
         session_input = verified["session_input_manifest.json"]
         tags_payload = verified["localized_price_tags.json"]
         constraints_payload = verified["localization_constraints.json"]
+        localized_review = verified["localized_review.json"]
         if not all(
             isinstance(item, dict)
-            for item in (journal, source, processing, session_input)
+            for item in (
+                journal,
+                source,
+                processing,
+                session_input,
+                localized_review,
+            )
         ):
             raise RequestError("当前版本缺少有效的重放身份文件。")
         if "expected_revision" not in data or "expected_version_id" not in data:
@@ -2662,6 +2846,7 @@ def apply_localized_edit(job: Job, data: Dict[str, Any]) -> Dict[str, Any]:
                 constraints=constraints,
                 elements=elements,
                 manifest=manifest,
+                localized_review=localized_review,
             )
             journal = localized.append_manual_edit(journal, event)
             edited_event_id = event["event_id"]
@@ -2742,15 +2927,22 @@ def apply_localized_edit(job: Job, data: Dict[str, Any]) -> Dict[str, Any]:
                         revision=latest.revision,
                     ) from exc
             raise
-        if not result.get("current_updated"):
-            raise RequestError(
-                "人工编辑重放未通过质量门禁；旧 current 版本保持不变。"
-            )
+        current_updated = bool(result.get("current_updated"))
+        retained_version_id = result.get("version_id")
+        if not isinstance(retained_version_id, str) or not retained_version_id:
+            raise RequestError("人工编辑重放没有生成可验证的不可变结果版本。")
     return {
         "cursor": journal["cursor"],
         "revision": journal["revision"],
         "event_count": len(journal["events"]),
-        "version_id": result["version_id"],
+        "version_id": retained_version_id,
+        "current_updated": current_updated,
+        "result_retained": True,
+        "message": (
+            "人工编辑已应用并更新 current 草稿。"
+            if current_updated
+            else "人工编辑版本已完整保留，但因低置信度或非完整性质量项未更新 current；轨迹、价签和审计结果均未删除。"
+        ),
         "job": job_payload(job),
     }
 
@@ -3595,6 +3787,7 @@ class StudioHandler(BaseHTTPRequestHandler):
             ".png": "image/png",
             ".jpg": "image/jpeg",
             ".jpeg": "image/jpeg",
+            ".csv": "text/csv; charset=utf-8",
             ".json": "application/json; charset=utf-8",
             ".geojson": "application/geo+json; charset=utf-8",
         }.get(Path(name).suffix, "application/octet-stream")
@@ -3608,7 +3801,12 @@ class StudioHandler(BaseHTTPRequestHandler):
 
     def serve_static(self, request_path: str) -> None:
         name = "index.html" if request_path in {"", "/"} else request_path.lstrip("/")
-        if name not in {"index.html", "app.css", "app.js"}:
+        if name not in {
+            "index.html",
+            "app.css",
+            "anchor_geometry.js",
+            "app.js",
+        }:
             self.send_error(HTTPStatus.NOT_FOUND)
             return
         path = WEB_DIR / name

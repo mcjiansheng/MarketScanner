@@ -381,6 +381,53 @@ def _normalize_angle(value: float) -> float:
     return math.atan2(math.sin(value), math.cos(value))
 
 
+def correction_continuity_metrics(
+    translation_deltas_m: Sequence[float],
+    yaw_deltas_deg: Sequence[float],
+    physical_travel_m: Sequence[float],
+) -> tuple[bool, list[float], list[float]]:
+    """Judge map-gauge correction continuity per metre of physical travel.
+
+    Absolute correction differences are intentionally not a validity gate.
+    A slowly accumulated five-metre correction over a long aisle is continuous,
+    while the same correction over one short step remains a discontinuity.
+    """
+
+    if not (
+        len(translation_deltas_m)
+        == len(yaw_deltas_deg)
+        == len(physical_travel_m)
+    ):
+        raise StructureWindowAlignmentError(
+            "Correction continuity inputs have inconsistent lengths."
+        )
+    values = [
+        *translation_deltas_m,
+        *yaw_deltas_deg,
+        *physical_travel_m,
+    ]
+    if any(not math.isfinite(value) or value < 0 for value in values):
+        raise StructureWindowAlignmentError(
+            "Correction continuity inputs must be finite and non-negative."
+        )
+    translation_gradient = [
+        delta / max(0.75, travel)
+        for delta, travel in zip(translation_deltas_m, physical_travel_m)
+    ]
+    yaw_gradient_deg_per_m = [
+        delta / max(0.75, travel)
+        for delta, travel in zip(yaw_deltas_deg, physical_travel_m)
+    ]
+    supported = (
+        not translation_deltas_m
+        or (
+            max(translation_gradient, default=0.0) <= 1.0
+            and max(yaw_gradient_deg_per_m, default=0.0) <= 8.0
+        )
+    )
+    return supported, translation_gradient, yaw_gradient_deg_per_m
+
+
 def _rotate(x: float, y: float, yaw: float) -> tuple[float, float]:
     cosine, sine = math.cos(yaw), math.sin(yaw)
     return cosine * x - sine * y, sine * x + cosine * y
@@ -1699,14 +1746,15 @@ def diagnostic_report(
         )
         for index in range(1, len(selected_candidates))
     ]
-    continuity_translation_gradient = [
-        delta / max(0.75, travel)
-        for delta, travel in zip(continuity_m, expected_window_travel_m)
-    ]
-    continuity_yaw_gradient_deg_per_m = [
-        delta / max(0.75, travel)
-        for delta, travel in zip(continuity_yaw_deg, expected_window_travel_m)
-    ]
+    (
+        continuity_supported,
+        continuity_translation_gradient,
+        continuity_yaw_gradient_deg_per_m,
+    ) = correction_continuity_metrics(
+        continuity_m,
+        continuity_yaw_deg,
+        expected_window_travel_m,
+    )
     window_records: list[dict[str, Any]] = []
     for index, window in enumerate(windows):
         candidates = candidate_sets[index]
@@ -1754,14 +1802,13 @@ def diagnostic_report(
     ]
     sequence_unique = sequence_margin is None or sequence_margin >= 0.03
     geometry_supported = mean_cost <= 0.10 and maximum_outside <= 0.20
-    continuity_supported = (
-        not continuity_m
-        or (
-            max(continuity_m) <= 3.0
-            and max(continuity_translation_gradient, default=0.0) <= 1.0
-            and max(continuity_yaw_gradient_deg_per_m, default=0.0) <= 8.0
-        )
-    )
+    # A large absolute correction change is expected when a long scan slowly
+    # accumulates drift. It is not a physical phone jump: each window carries
+    # a map-gauge correction and distant windows may legitimately differ by
+    # several metres. Continuity is therefore judged by correction change per
+    # metre of gauge-neutral physical travel. A real short-distance reset still
+    # produces a large gradient and remains unsupported. The absolute delta is
+    # retained below as an audit metric, but it is not a rejection threshold.
     return {
         "format": REPORT_FORMAT,
         "version": REPORT_VERSION,
@@ -1859,6 +1906,12 @@ def diagnostic_report(
             "maximum_adjacent_correction_yaw_gradient_deg_per_m": max(
                 continuity_yaw_gradient_deg_per_m, default=0.0
             ),
+            "continuity_thresholds": {
+                "authority": "gauge_neutral_gradient_v1",
+                "translation_gradient_max_m_per_m": 1.0,
+                "yaw_gradient_max_deg_per_m": 8.0,
+                "absolute_delta_is_audit_only": True,
+            },
             "sequence_unique": sequence_unique,
             "geometry_supported": geometry_supported,
             "continuity_supported": continuity_supported,

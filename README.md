@@ -65,7 +65,9 @@ Android 目录中的部分 C++ 原生实现也因共享移动渲染和数据库�
 
 已有地图模式的定位和 PC 草稿复核能力保持不变：手机只接受小幅、唯一且连续一致的自动结构修正；PC 先运行 RTAB‑Map 重处理，再运行 native 完整相对 SE(2) 因子图、质量报告、人工复核和价签导出。对于短兼容会话，native helper 缺失、执行失败或结果破坏已验证物理连续性时，仍可回退到不可发布的连续有界修正场并保留 native 审计。长距离会话则额外执行下述 gauge-neutral 自由空间道路恢复；当前质量策略仍是 candidate，且真机/现场资格未完成，因此不能据此宣称生产发布通过。
 
-长距离累计漂移后的手机人工重选位置按“严格绑定的绝对地图锚点”处理，而不是手机物理瞬移。更重要的是，`localization_trace.rawPose` 本身已经经过当时可变的 ARKit→地图 alignment 投影，自动结构校正、人工重定位和坐标 epoch 重置都会改变这个 map gauge。PC 因而先从相邻 `rawPose` 相对运动恢复 gauge-neutral 物理轨迹：自动 correction 后以下一帧相对前一帧 `estimatedPose` 计算增量，人工重定位后的首个 post-reset sample 物理位移记为零；人工锚点只改变整条连续路线在地图中的放置，不制造相邻节点跳变。恢复结果按数据库节点时间戳重采样，保留手机真实相对运动、回头和 U-turn。只有 v3/exact-node/身份与时间证据完整的人工事件可成为约 3 米平移不确定度的可信地图锚点；旧 v2/时间近邻事件和 PC 普通拖拽锚点仍受兼容门约束。若 RTAB‑Map 全局图不完整，完整、有限、时间有序的原始轨迹仍可进入明确禁止发布的诊断草稿；原始数据库始终只读。
+手机运行时的整图距离场匹配能够保持多个长期 alignment basin；可靠 RTAB‑Map 回环只开启有界宽搜索，不直接注入 pose prior。回环发生时，手机还会把当前位置附近最多 5 个 concrete `shelf_segment_id` 作为 diagnostic top-K 写入扫描日志，多解继续保留。当前仍未把局部货架结构快照、phone↔shelf 相对 SE(2) 和 concrete shelf identity 绑定进正式定位 sidecar/manifest，因此“回环后确认具体货架并持续用该货架校准”的完整闭环尚未完成，不能用整个距离场匹配冒充货架身份识别。
+
+长距离累计漂移后的手机人工重选位置按“严格绑定的绝对地图锚点”处理，而不是手机物理瞬移。更重要的是，`localization_trace.rawPose` 本身已经经过当时可变的 ARKit→地图 alignment 投影，自动结构校正、人工重定位和坐标 epoch 重置都会改变这个 map gauge。PC 因而先从相邻 `rawPose` 相对运动恢复 gauge-neutral 物理轨迹：自动 correction 后以下一帧相对前一帧 `estimatedPose` 计算增量，人工重定位后的首个 post-reset sample 物理位移记为零；人工锚点只改变整条连续路线在地图中的放置，不制造相邻节点跳变。恢复结果按数据库节点时间戳重采样，保留手机真实相对运动、回头和 U-turn。手机 v3/exact-node/身份与时间证据，以及 PC 从不可变复核轨迹重新验证唯一 exact node/time/floor/coordinate-contract/bounds 的锚点，都是约 3 米平移、20°航向不确定度的可信地图证据；旧 v2、历史 timestamp-only 或无 exact binding 的事件仍受兼容门约束。若 RTAB‑Map 全局图不完整，完整、有限、时间有序的原始轨迹仍可进入明确禁止发布的诊断草稿；原始数据库始终只读。
 
 长距离轨迹不再先使用通道方向场做整体旋转，也不再逐点吸附最近通道。PC 使用 gauge-neutral 物理移动、严格人工绝对锚点、`road_graph` 连通性以及货架/固定结构多边形的自由空间硬约束，执行全局道路序列匹配；不可达转移、进入结构的点和穿越结构的线段均不得成为匹配路线。选中的完整道路访问序列再按物理累计距离分段参数化，因此能够保留围绕货架的绕行、回头和 U-turn，而不会把人工重定位解释为横向瞬移。周期性平行通道无法唯一确定时保留完整结果并标记 `LOW_CONFIDENCE`；道路长度与物理里程的任一锚点分段偏差超过 5% 时同样保留 CSV/预览和全部审计，但强制 `PARTIAL_REVIEW_REQUIRED`、禁止发布。`optimized_map_trajectory.geojson` 显式保存每个节点的 `yaws_rad`；节点级/本地时间秒级 CSV 的 yaw 来自优化后的手机位姿，不能用路线切线冒充手机朝向。
 

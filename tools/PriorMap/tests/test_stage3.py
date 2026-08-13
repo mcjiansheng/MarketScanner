@@ -3481,8 +3481,74 @@ class LocalizedPipelineTests(unittest.TestCase):
             {item["code"] for item in report["publish_gate"]["blockers"]},
         )
 
-    def test_pc_set_anchor_cannot_claim_verified_phone_anchor_trust(self) -> None:
+    def test_pc_exact_node_anchor_is_trusted_absolute_map_evidence(self) -> None:
         initial_output = self.root / "localized-pc-anchor-base"
+        first = process_localized_session(
+            self.prior_map,
+            self.session,
+            self.poses,
+            self.source_database,
+            self.optimized_database,
+            initial_output,
+        )
+        current = LocalizedVersionStore(initial_output).current()
+        self.assertIsNotNone(current)
+        assert current is not None
+        journal = json.loads(
+            (current.version_dir / "manual_edits.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        journal = append_manual_edit(
+            journal,
+            {
+                "type": "set_anchor",
+                "new_value": {
+                    "timestamp": self.node_timebase_offset + 10.0,
+                    "node_id": 11,
+                    "floor_id": "1",
+                    "coordinate_contract_version": 1,
+                    "x_m": 18.0,
+                    "y_m": -9.0,
+                    "yaw_rad": math.radians(90.0),
+                },
+            },
+        )
+        replayed = process_localized_session(
+            self.prior_map,
+            self.session,
+            self.poses,
+            self.source_database,
+            self.optimized_database,
+            initial_output,
+            manual_edits=journal,
+            expected_parent_version=first["version_id"],
+        )
+        self.assertEqual(replayed["accepted_trusted_manual_anchor_count"], 1)
+        version = LocalizedVersionStore(initial_output).current()
+        self.assertIsNotNone(version)
+        assert version is not None
+        constraints = json.loads(
+            (version.version_dir / "localization_constraints.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        pc_anchor_rejections = [
+            item
+            for item in constraints["rejected"]
+            if item["constraint_id"] == "edit-000001"
+        ]
+        self.assertEqual(pc_anchor_rejections, [])
+        accepted_anchor = next(
+            item
+            for item in constraints["accepted"]
+            if item["constraint_id"] == "edit-000001"
+        )
+        self.assertTrue(accepted_anchor["trusted_absolute"])
+        self.assertEqual(accepted_anchor["node_id"], 11)
+
+    def test_pc_legacy_timestamp_only_anchor_keeps_compatibility_gate(self) -> None:
+        initial_output = self.root / "localized-pc-legacy-anchor-base"
         first = process_localized_session(
             self.prior_map,
             self.session,

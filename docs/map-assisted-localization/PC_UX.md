@@ -30,7 +30,7 @@ MapCase02 已在 2026-08-09 通过 PC 转换、v2 schema、确定性 canonical/p
 8. 运行轨迹点/线段碰撞、道路拓扑、物理步长、距离尺度、weak/lost 和证据质量门禁，再进入轨迹/价签复核；
 9. 导出 JSON/CSV/GeoJSON、节点级/秒级校准坐标和预览，以及审计日志。
 
-人工位置证据分为两类。手机持久化的 `MarketScannerManualLocalizationEvent v3` 只有在 tracking/map/floor 身份、递增 alignment version、exact node ID、node stamp、time delta 和 atomic snapshot generation 全部严格通过时，才成为“可信绝对地图锚点”；它按约 3 m 平移和 20°航向不确定度参与求解，不再因相对累计漂移超过 5 m/30°而被丢弃。旧 v2 时间绑定事件、缺少 exact-node 权威的事件以及 PC 复核页普通 `set_anchor` 不获得该权限，仍受 5 m/30°兼容门约束并以 `unverified_manual_anchor_safety_gate` 审计。
+人工位置证据分为两类。手机持久化的 `MarketScannerManualLocalizationEvent v3` 只有在 tracking/map/floor 身份、递增 alignment version、exact node ID、node stamp、time delta 和 atomic snapshot generation 全部严格通过时，才成为“可信绝对地图锚点”。PC 复核页的新 `set_anchor` 也必须由服务端从不可变 `localized_review.json` 重新绑定唯一 exact node ID、精确 timestamp、floor、coordinate-contract 和 canonical bounds，只有全项一致时才获得相同可信绝对语义。两者按约 3 m 平移和 20°航向不确定度参与求解，不再因相对累计漂移超过 5 m/30°而被丢弃。旧 v2 时间绑定事件、历史 timestamp-only PC 编辑和缺少 exact-node 权威的事件仍受 5 m/30°兼容门约束并以 `unverified_manual_anchor_safety_gate` 审计。
 
 可信人工锚点造成的大 `maximum/P95 correction` 表示地图 gauge 修正，不等价于相邻节点物理瞬移。长会话不会把 correction-field gradient 当作物理连续性的权威：PC 先按每帧 alignment 语义恢复 gauge-neutral 运动，自动 correction 后以此前 `estimatedPose` 为下一增量原点，人工重定位后的首个 post-reset sample 物理位移为零。严格模式把完整结果保存并加载为可复核的 current `draft`；review gate 检查自由空间碰撞、道路拓扑、物理相邻步长、路线/物理距离尺度、节点覆盖、weak/lost、拒绝约束与价签证据。旧 correction-field 指标在自由空间路线生效后仅为诊断。
 
@@ -48,7 +48,7 @@ MapCase02 已在 2026-08-09 通过 PC 转换、v2 schema、确定性 canonical/p
 
 质量摘要同时显示在线/RTAB‑Map/离线轨迹长度、gauge-neutral 物理里程、道路路线里程、货架内点数、穿越结构线段数、道路拓扑断裂、最大物理/路线步长、各人工锚点分段的距离尺度、平行通道多解区间、weak/lost 总时长、地图约束接受率和实际求解器类型。任一距离尺度偏差超过 5% 时，结果与全部坐标仍保留，但整体标记低置信度并阻断 review/publish。没有外部测量真值时，这些是内部一致性诊断，不等同于绝对定位准确率或唯一通道识别。
 
-独立导出工具会在不可变 version 之外写入 `calibrated_trajectory_exports/`：`calibrated_positions_by_node.csv`、`calibrated_positions_1s.csv`、`calibrated_trajectory_on_prior_map.png`、`calibrated_trajectory_timestamped.png` 和 `export_manifest.json`。两个 CSV 均输出标准地图坐标、本地时间、route edge/corridor、通道身份置信度、距离尺度置信度和人工锚点状态；yaw 必须来自 `optimized_phone_pose`。缺少 `yaws_rad` 的旧结果会明确拒绝该导出，避免用运动切线伪造手机朝向。
+独立导出工具会在不可变 version 之外写入 `calibrated_trajectory_export/`：`calibrated_positions_by_node.csv`、`calibrated_positions_1s.csv`、`calibrated_trajectory_on_prior_map.png`、`calibrated_trajectory_timestamped.png` 和 `export_manifest.json`。两个 CSV 均输出标准地图坐标、本地时间、route edge/corridor、通道身份置信度、距离尺度置信度和人工锚点状态；yaw 必须来自 `optimized_phone_pose`。缺少 `yaws_rad` 的旧结果会明确拒绝该导出，避免用运动切线伪造手机朝向。
 
 人工编辑区支持：
 
@@ -58,9 +58,9 @@ MapCase02 已在 2026-08-09 通过 PC 转换、v2 schema、确定性 canonical/p
 - 撤销/重做；
 - 保存并按相同地图/会话 hash 重放。
 
-联动复核画布同时显示先验结构、在线轨迹、RTAB‑Map 轨迹、离线轨迹与价签，并可按待复核/批准状态和货架筛选价签。选择“设置轨迹锚点”后直接点击绿色离线轨迹节点并拖到正确地图位置，再用朝向滑块调整；时间、node、对象 ID 和 JSON 由界面自动生成。其他高级编辑仍保留严格 ID/JSON 入口。
+联动复核画布同时显示先验结构、在线轨迹、RTAB‑Map 轨迹、离线轨迹与价签，并可按待复核/批准状态和货架筛选价签。选择“设置轨迹锚点”后直接点击绿色离线轨迹 exact node 并拖到正确地图位置；还可直接输入 canonical X/Y/yaw、选择 0.1/0.5/1.0 m 步长、用方向按钮或键盘方向键平移、用 `[`/`]` 或 ±1/±5/±15°按钮旋转，并用东/北/西/南快捷设置朝向。Shift+方向键使用 5 倍步长，Shift+方括号使用 15°；浏览器实际产生的 `{`/`}` 键值也按同一规则处理。数值字段在 change 和 blur 都提交并按 canonical bounds 钳制，避免辅助输入只改变显示值而未改变内部 payload。画布 y-down 只在投影边界转换一次，服务端提交值保持 canonical SE(2)，时间、node、floor、坐标合同、对象 ID 和 JSON 由界面自动生成。其他高级编辑仍保留严格 ID/JSON 入口。
 
-编辑器会按操作类型显示 JSON 示例并在服务端做字段白名单、有限值、地图范围、货架/侧面、边长、offset、位置一致性和批准前校验。服务端生成真实旧值、UUID、UTC 时间和审计事件；无效编辑不会写入新版本。
+编辑器会按操作类型显示 JSON 示例并在服务端做字段白名单、有限值、地图范围、exact node/time/floor/坐标合同、货架/侧面、边长、offset、位置一致性和批准前校验。服务端生成真实旧值、UUID、UTC 时间和审计事件；无效编辑不会写入新版本。合法人工编辑若生成了低置信度或其他非完整性门禁未通过的不可变版本，界面显示“结果已保留、current 未更新”而不是“处理失败”；原 current 保持可回滚，新的轨迹/价签/审计版本也不删除。
 
 ## 价签复核
 

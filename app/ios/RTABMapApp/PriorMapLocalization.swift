@@ -434,6 +434,15 @@ private struct PriorMapProjectedCandidate {
     let point: SIMD2<Double>
 }
 
+struct PriorMapShelfIdentityCandidate {
+    let shelfSegmentId: String
+    let shelfCode: String
+    let distanceM: Double
+    let nearestXM: Double
+    let nearestYM: Double
+    let longitudinalFraction: Double
+}
+
 final class PriorMapStageOneLocalizer {
     private let floorId: String
     private let alignmentAnchor: PriorMapLocalizationAnchor
@@ -453,6 +462,7 @@ final class PriorMapStageOneLocalizer {
     private let priorMapId: String
     private let priorMapSha256: String
     private let shelves: [PriorMapShelf]
+    private let shelfSegments: [PriorMapShelfSegmentV2]
     private let fixedStructures: [PriorMapFixedStructure]
     private var latestFloorEstimate: PriorMapFloorEstimate?
     private(set) var latestEstimatedPose: PriorMapPose2D
@@ -478,6 +488,9 @@ final class PriorMapStageOneLocalizer {
         self.priorMapId = package.manifest.priorMapId
         self.priorMapSha256 = package.packageSha256
         self.shelves = package.shelves
+        self.shelfSegments = package.shelfSegments.filter {
+            $0.floorID == floorId
+        }
         self.fixedStructures = package.fixedStructures
         guard let distanceFloor = package.distanceFields.floors[floorId] else {
             throw NSError(
@@ -576,6 +589,57 @@ final class PriorMapStageOneLocalizer {
         beginRecovery(
             reason: reason,
             now: monotonicClock.now)
+    }
+
+    /// Diagnostic-only top-K shelf identities near the current map pose.
+    ///
+    /// This does not alter the alignment and is deliberately separate from
+    /// strict localization sidecars. It proves which concrete shelf segments
+    /// are geometrically plausible after a reliable RTAB-Map loop so the
+    /// phone can retain ambiguity instead of pretending that a whole-map
+    /// distance-field basin already identifies one shelf.
+    func nearbyShelfIdentityCandidates(
+        limit: Int = 5,
+        radiusM: Double = 6.0
+    ) -> [PriorMapShelfIdentityCandidate] {
+        let pose = latestEstimatedPose
+        return shelfSegments.compactMap { segment in
+            guard segment.longitudinalStartM.count == 2,
+                  segment.longitudinalEndM.count == 2 else {
+                return nil
+            }
+            let start = SIMD2<Double>(
+                segment.longitudinalStartM[0],
+                segment.longitudinalStartM[1])
+            let end = SIMD2<Double>(
+                segment.longitudinalEndM[0],
+                segment.longitudinalEndM[1])
+            let point = SIMD2<Double>(pose.xM, pose.yM)
+            let delta = end - start
+            let lengthSquared = simd_length_squared(delta)
+            guard lengthSquared > 1.0e-12 else { return nil }
+            let fraction = min(
+                1.0,
+                max(0.0, simd_dot(point - start, delta) / lengthSquared))
+            let nearest = start + delta * fraction
+            let distance = simd_distance(point, nearest)
+            guard distance <= radiusM else { return nil }
+            return PriorMapShelfIdentityCandidate(
+                shelfSegmentId: segment.shelfSegmentID,
+                shelfCode: segment.shelfCode,
+                distanceM: distance,
+                nearestXM: nearest.x,
+                nearestYM: nearest.y,
+                longitudinalFraction: fraction)
+        }
+        .sorted { first, second in
+            if first.distanceM != second.distanceM {
+                return first.distanceM < second.distanceM
+            }
+            return first.shelfSegmentId < second.shelfSegmentId
+        }
+        .prefix(max(1, min(5, limit)))
+        .map { $0 }
     }
 
     /// Cancels the active Recovery episode and returns the terminal completion
@@ -1155,6 +1219,7 @@ final class PriorMapPosePickerView: UIView {
     private(set) var pose: PriorMapPose2D
     private let boundsM: PriorMapBounds
     private var markerDragging = false
+    var onPoseChanged: ((PriorMapPose2D) -> Void)?
 
     init(image: UIImage, bounds: PriorMapBounds, pose: PriorMapPose2D) {
         self.pose = pose
@@ -1199,13 +1264,29 @@ final class PriorMapPosePickerView: UIView {
     }
 
     func setYaw(_ yaw: Double) {
-        pose.yawRad = yaw
+        pose.yawRad = PriorMapStageOneMath.normalizeAngle(yaw)
         updateArrow()
+        onPoseChanged?(pose)
     }
 
     func setPose(_ value: PriorMapPose2D) {
-        pose = value
+        pose = PriorMapPose2D(
+            xM: min(boundsM.maxXM, max(boundsM.minXM, value.xM)),
+            yM: min(boundsM.maxYM, max(boundsM.minYM, value.yM)),
+            yawRad: PriorMapStageOneMath.normalizeAngle(value.yawRad))
         updateArrow()
+        onPoseChanged?(pose)
+    }
+
+    func nudge(dxM: Double, dyM: Double) {
+        setPose(PriorMapPose2D(
+            xM: pose.xM + dxM,
+            yM: pose.yM + dyM,
+            yawRad: pose.yawRad))
+    }
+
+    func rotate(byDegrees degrees: Double) {
+        setYaw(pose.yawRad + degrees * .pi / 180.0)
     }
 
     private func displayedImageRect() -> CGRect {
@@ -1250,6 +1331,7 @@ final class PriorMapPosePickerView: UIView {
         pose.xM = boundsM.minXM + xRatio * (boundsM.maxXM - boundsM.minXM)
         pose.yM = boundsM.maxYM - yRatio * (boundsM.maxYM - boundsM.minYM)
         updateArrow()
+        onPoseChanged?(pose)
     }
 
     @objc private func markerPanned(_ gesture: UIPanGestureRecognizer) {
@@ -1272,6 +1354,7 @@ final class PriorMapPosePickerView: UIView {
             pose.yawRad - Double(gesture.rotation))
         gesture.rotation = 0
         updateArrow()
+        onPoseChanged?(pose)
     }
 
     @objc private func pinched(_ gesture: UIPinchGestureRecognizer) {
@@ -1307,7 +1390,16 @@ final class PriorMapPosePickerView: UIView {
 
 final class PriorMapPoseSelectionViewController: UIViewController {
     private let picker: PriorMapPosePickerView
+    private let initialPose: PriorMapPose2D
     private let completion: (PriorMapPose2D) -> Void
+    private let coordinateLabel = UILabel()
+    private let xField = UITextField()
+    private let yField = UITextField()
+    private let yawField = UITextField()
+    private let stepControl = UISegmentedControl(
+        items: ["0.1 m", "0.5 m", "1.0 m"])
+    private let scrollView = UIScrollView()
+    private let contentStack = UIStackView()
 
     init(
         package: PriorMapPackage,
@@ -1320,10 +1412,11 @@ final class PriorMapPoseSelectionViewController: UIViewController {
             image: package.preview(floorId: floorId),
             bounds: floor.bounds,
             pose: pose)
+        self.initialPose = pose
         self.completion = completion
         super.init(nibName: nil, bundle: nil)
         modalPresentationStyle = .formSheet
-        preferredContentSize = CGSize(width: 600, height: 640)
+        preferredContentSize = CGSize(width: 620, height: 760)
     }
 
     required init?(coder: NSCoder) {
@@ -1339,7 +1432,42 @@ final class PriorMapPoseSelectionViewController: UIViewController {
         let instructions = UILabel()
         instructions.numberOfLines = 0
         instructions.textColor = .secondaryLabel
-        instructions.text = "点击地图设置位置；拖动红色箭头微调；双指平移、捏合缩放、双指旋转朝向。允许测试初值存在 3–5 m 和 20–30°误差，后续结构匹配会平滑收敛。"
+        instructions.text = "点击地图设置位置；拖动红色箭头或使用下方按钮精确微调。坐标合同固定为 0°=+X/东/屏幕右、90°=+Y/北/屏幕上，逆时针为正；界面数值就是写入审计记录的 canonical SE(2)，不会再次转换。"
+        coordinateLabel.font = UIFont.monospacedDigitSystemFont(
+            ofSize: UIFont.preferredFont(forTextStyle: .subheadline).pointSize,
+            weight: .semibold)
+        coordinateLabel.numberOfLines = 0
+        coordinateLabel.adjustsFontForContentSizeCategory = true
+        configureCoordinateField(xField, label: "X（m）")
+        configureCoordinateField(yField, label: "Y（m）")
+        configureCoordinateField(yawField, label: "朝向（°）")
+        // Commit after editing ends. Updating on every keystroke would clamp
+        // intermediate values (for example the first digit of "12.5") and
+        // make precise manual correction feel uncontrollable.
+        xField.addTarget(self, action: #selector(coordinateFieldChanged), for: .editingDidEnd)
+        yField.addTarget(self, action: #selector(coordinateFieldChanged), for: .editingDidEnd)
+        yawField.addTarget(self, action: #selector(coordinateFieldChanged), for: .editingDidEnd)
+        let coordinateFields = UIStackView(arrangedSubviews: [
+            labeledCoordinateField("X（m）", field: xField),
+            labeledCoordinateField("Y（m）", field: yField),
+            labeledCoordinateField("朝向（°）", field: yawField),
+        ])
+        coordinateFields.axis = .horizontal
+        coordinateFields.spacing = 8
+        coordinateFields.distribution = .fillEqually
+        stepControl.selectedSegmentIndex = 1
+        stepControl.accessibilityLabel = "人工定位平移步长"
+        let positionPad = makePositionPad()
+        let rotationRow = makeRotationRow()
+        let cardinalControl = UISegmentedControl(
+            items: ["东 0°", "北 90°", "西 180°", "南 −90°"])
+        cardinalControl.selectedSegmentIndex = UISegmentedControl.noSegment
+        cardinalControl.accessibilityLabel = "人工定位朝向快捷选择"
+        cardinalControl.addTarget(
+            self, action: #selector(cardinalChanged(_:)), for: .valueChanged)
+        picker.onPoseChanged = { [weak self] _ in
+            self?.refreshCoordinateControls()
+        }
         let cancel = UIButton(type: .system)
         cancel.setTitle("取消", for: .normal)
         cancel.addTarget(self, action: #selector(cancelled), for: .touchUpInside)
@@ -1348,18 +1476,191 @@ final class PriorMapPoseSelectionViewController: UIViewController {
         confirm.addTarget(self, action: #selector(confirmed), for: .touchUpInside)
         let buttons = UIStackView(arrangedSubviews: [cancel, UIView(), confirm])
         buttons.axis = .horizontal
-        let stack = UIStackView(arrangedSubviews: [title, instructions, picker, buttons])
-        stack.axis = .vertical
-        stack.spacing = 12
-        stack.translatesAutoresizingMaskIntoConstraints = false
-        view.addSubview(stack)
+        contentStack.axis = .vertical
+        contentStack.spacing = 12
+        contentStack.translatesAutoresizingMaskIntoConstraints = false
+        [
+            title,
+            instructions,
+            picker,
+            coordinateLabel,
+            coordinateFields,
+            stepControl,
+            positionPad,
+            cardinalControl,
+            rotationRow,
+            buttons,
+        ].forEach(contentStack.addArrangedSubview)
+        scrollView.alwaysBounceVertical = true
+        scrollView.keyboardDismissMode = .interactive
+        scrollView.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(scrollView)
+        scrollView.addSubview(contentStack)
         NSLayoutConstraint.activate([
-            stack.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 16),
-            stack.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -16),
-            stack.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 16),
-            stack.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -16),
-            picker.heightAnchor.constraint(greaterThanOrEqualToConstant: 360),
+            scrollView.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor),
+            scrollView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            scrollView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            scrollView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+            contentStack.topAnchor.constraint(
+                equalTo: scrollView.contentLayoutGuide.topAnchor,
+                constant: 16),
+            contentStack.leadingAnchor.constraint(
+                equalTo: scrollView.frameLayoutGuide.leadingAnchor,
+                constant: 16),
+            contentStack.trailingAnchor.constraint(
+                equalTo: scrollView.frameLayoutGuide.trailingAnchor,
+                constant: -16),
+            contentStack.bottomAnchor.constraint(
+                equalTo: scrollView.contentLayoutGuide.bottomAnchor,
+                constant: -24),
+            picker.heightAnchor.constraint(equalToConstant: 360),
         ])
+        refreshCoordinateControls()
+    }
+
+    private func configureCoordinateField(_ field: UITextField, label: String) {
+        field.borderStyle = .roundedRect
+        field.keyboardType = .numbersAndPunctuation
+        field.placeholder = label
+        field.accessibilityLabel = label
+        field.adjustsFontForContentSizeCategory = true
+        field.font = UIFont.monospacedDigitSystemFont(
+            ofSize: UIFont.preferredFont(forTextStyle: .body).pointSize,
+            weight: .regular)
+    }
+
+    private func labeledCoordinateField(
+        _ text: String,
+        field: UITextField
+    ) -> UIView {
+        let label = UILabel()
+        label.text = text
+        label.font = .preferredFont(forTextStyle: .caption1)
+        label.textColor = .secondaryLabel
+        label.adjustsFontForContentSizeCategory = true
+        let stack = UIStackView(arrangedSubviews: [label, field])
+        stack.axis = .vertical
+        stack.spacing = 4
+        return stack
+    }
+
+    private var translationStepM: Double {
+        switch stepControl.selectedSegmentIndex {
+        case 0: return 0.1
+        case 2: return 1.0
+        default: return 0.5
+        }
+    }
+
+    private func controlButton(
+        _ title: String,
+        accessibilityLabel: String,
+        action: Selector
+    ) -> UIButton {
+        let button = UIButton(type: .system)
+        button.setTitle(title, for: .normal)
+        button.accessibilityLabel = accessibilityLabel
+        button.backgroundColor = .tertiarySystemBackground
+        button.layer.cornerRadius = 9
+        button.heightAnchor.constraint(greaterThanOrEqualToConstant: 44).isActive = true
+        button.addTarget(self, action: action, for: .touchUpInside)
+        return button
+    }
+
+    private func makePositionPad() -> UIView {
+        let up = controlButton("↑ +Y", accessibilityLabel: "向地图北侧移动", action: #selector(nudgeUp))
+        let down = controlButton("↓ −Y", accessibilityLabel: "向地图南侧移动", action: #selector(nudgeDown))
+        let left = controlButton("← −X", accessibilityLabel: "向地图西侧移动", action: #selector(nudgeLeft))
+        let right = controlButton("+X →", accessibilityLabel: "向地图东侧移动", action: #selector(nudgeRight))
+        let centre = controlButton(
+            "复位",
+            accessibilityLabel: "恢复打开人工定位时的位置和朝向",
+            action: #selector(resetPose))
+        let top = UIStackView(arrangedSubviews: [UIView(), up, UIView()])
+        let middle = UIStackView(arrangedSubviews: [left, centre, right])
+        let bottom = UIStackView(arrangedSubviews: [UIView(), down, UIView()])
+        for row in [top, middle, bottom] {
+            row.axis = .horizontal
+            row.spacing = 8
+            row.distribution = .fillEqually
+        }
+        let result = UIStackView(arrangedSubviews: [top, middle, bottom])
+        result.axis = .vertical
+        result.spacing = 6
+        return result
+    }
+
+    private func makeRotationRow() -> UIView {
+        let values: [(String, String, Selector)] = [
+            ("−15°", "朝向顺时针旋转十五度", #selector(rotateMinus15)),
+            ("−5°", "朝向顺时针旋转五度", #selector(rotateMinus5)),
+            ("−1°", "朝向顺时针旋转一度", #selector(rotateMinus1)),
+            ("+1°", "朝向逆时针旋转一度", #selector(rotatePlus1)),
+            ("+5°", "朝向逆时针旋转五度", #selector(rotatePlus5)),
+            ("+15°", "朝向逆时针旋转十五度", #selector(rotatePlus15)),
+        ]
+        let row = UIStackView(arrangedSubviews: values.map {
+            controlButton($0.0, accessibilityLabel: $0.1, action: $0.2)
+        })
+        row.axis = .horizontal
+        row.spacing = 6
+        row.distribution = .fillEqually
+        return row
+    }
+
+    private func refreshCoordinateControls() {
+        let pose = picker.pose
+        xField.text = String(format: "%.3f", pose.xM)
+        yField.text = String(format: "%.3f", pose.yM)
+        let degrees = PriorMapStageOneMath.normalizeAngle(pose.yawRad) * 180.0 / .pi
+        yawField.text = String(format: "%.1f", degrees)
+        coordinateLabel.text = String(
+            format: "canonical SE(2)：X %.3f m · Y %.3f m · yaw %.1f°",
+            pose.xM,
+            pose.yM,
+            degrees)
+    }
+
+    @objc private func coordinateFieldChanged() {
+        guard let xText = xField.text,
+              let yText = yField.text,
+              let yawText = yawField.text,
+              let x = Double(xText),
+              let y = Double(yText),
+              let yawDegrees = Double(yawText),
+              x.isFinite, y.isFinite, yawDegrees.isFinite else {
+            // The visible form is part of the canonical coordinate contract:
+            // never leave an unparseable display value while the picker still
+            // holds a different authoritative pose.
+            refreshCoordinateControls()
+            return
+        }
+        picker.setPose(PriorMapPose2D(
+            xM: x,
+            yM: y,
+            yawRad: yawDegrees * .pi / 180.0))
+    }
+
+    @objc private func nudgeUp() { picker.nudge(dxM: 0, dyM: translationStepM) }
+    @objc private func nudgeDown() { picker.nudge(dxM: 0, dyM: -translationStepM) }
+    @objc private func nudgeLeft() { picker.nudge(dxM: -translationStepM, dyM: 0) }
+    @objc private func nudgeRight() { picker.nudge(dxM: translationStepM, dyM: 0) }
+    @objc private func rotateMinus15() { picker.rotate(byDegrees: -15) }
+    @objc private func rotateMinus5() { picker.rotate(byDegrees: -5) }
+    @objc private func rotateMinus1() { picker.rotate(byDegrees: -1) }
+    @objc private func rotatePlus1() { picker.rotate(byDegrees: 1) }
+    @objc private func rotatePlus5() { picker.rotate(byDegrees: 5) }
+    @objc private func rotatePlus15() { picker.rotate(byDegrees: 15) }
+    @objc private func resetPose() { picker.setPose(initialPose) }
+
+    @objc private func cardinalChanged(_ sender: UISegmentedControl) {
+        switch sender.selectedSegmentIndex {
+        case 1: picker.setYaw(.pi / 2)
+        case 2: picker.setYaw(.pi)
+        case 3: picker.setYaw(-.pi / 2)
+        default: picker.setYaw(0)
+        }
+        sender.selectedSegmentIndex = UISegmentedControl.noSegment
     }
 
     @objc private func cancelled() {

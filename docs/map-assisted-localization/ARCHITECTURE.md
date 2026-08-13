@@ -77,7 +77,7 @@ PC prior-map localized
 - prior-map 定位失败、较弱或丢失不会停止或改写 RTAB-Map 原始采集。
 - 结构匹配最多使用 600 点；距离残差、角覆盖、Top-K 唯一性、两帧一致性均通过后才允许修正。自动修正上限为 0.35 m/8°，应用增益 0.35。
 - 道路只作显示/弱先验，不把相似平行通道当作结构证据硬吸附。
-- 大幅自动修正继续拒绝。手机人工位置只有在 v3、exact node、identity、node stamp/time delta、atomic snapshot generation 全部通过时，才作为约 3 m/20°不确定度的绝对地图锚点；旧 v2/时间绑定事件和 PC `set_anchor` 仍受 5 m/30°兼容门约束。
+- 大幅自动修正继续拒绝。手机人工位置只有在 v3、exact node、identity、node stamp/time delta、atomic snapshot generation 全部通过时，才作为约 3 m/20°不确定度的绝对地图锚点；PC `set_anchor` 也必须从不可变复核版本 authoritative recheck 唯一 exact node/time/floor/coordinate-contract/bounds 后才取得相同语义。旧 v2、历史 timestamp-only 和无 exact binding 的编辑仍受 5 m/30°兼容门约束。
 - iOS ARFrame 回调按 0.5 s 节流；同一时刻只允许一个定位更新，忙时丢弃新更新并记录计数，避免队列积压。
 - iOS 使用道路网格索引只查询当前位置附近边；没有 `road_cells` 的旧包才兼容回退到全量道路。
 - 地图导入先复制并校验临时目录，再原子替换应用缓存；外部源包和已有可用缓存不会先被删除。

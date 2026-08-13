@@ -1,8 +1,8 @@
 # 先验地图全局对齐、长期回环与启动检查 TODO
 
-> 文档状态：**当前有效**。最后核对日期：2026-08-12。
+> 文档状态：**当前有效**。最后核对日期：2026-08-14。
 
-本清单记录 2026-08-12 Tianhong 两份真实会话复盘后，尚不能在当前安全合同内直接发布的增强。它不接收本轮已确认的核心缺陷：Tianhong 道路图丢失、显式初始位姿 prior、闭环异常边隔离、PC 道路/结构全局候选图和长期货架 hypothesis 保留已在源码修复并由自动测试覆盖。
+本清单记录 TianHong 两份真实会话复盘后，尚不能在当前安全合同内直接发布的增强。已完成的核心修复包括：旧 v2 包只读派生拓扑兼容、显式初始位姿 prior、闭环异常边隔离、PC 道路/结构全局候选图、长期 **alignment basin** 保留、低置信度结果保留和 exact-node 人工绝对锚点。这里必须区分 alignment basin 与 concrete shelf identity：后者的正式跨回环跟踪、相对位姿和输入身份绑定仍未完成。
 
 整体发布资格仍是 **NO-GO / NOT PRODUCTION READY**。以下任何 diagnostic 结果都不能替代 exact-final-SHA、签名真机、LiDAR、热/内存、Device Lab 或现场控制点验收。
 
@@ -19,11 +19,12 @@
 
 ## 已实现但仍为 diagnostic-only：PC 全轨迹结构—地图联合候选图
 
-- 当前 diagnostic 模块已联合使用：已知起点/初始方向、`Admin.opt_poses` 完整轨迹、三层货架距离场、24 候选 PC beam、道路中心线距离、相邻窗口行进切线、道路连通最短路径、优化轨迹弧长和 correction-field 梯度。
+- 当前 diagnostic 模块已联合使用：已知起点/初始方向、`Admin.opt_poses` 完整轨迹、三层货架距离场、有界 PC beam、道路中心线距离、相邻窗口行进切线、道路连通最短路径、优化轨迹弧长和 correction-field 梯度。候选预算属于算法参数，不能把某一个预算下的序列唯一性写成普遍业务事实。
 - 路线/道路证据全部为有上限软代价，不删除候选；独立 runner-up 要求跨窗口达到货架尺度差异，不再把 0.3 m/1° 的同路线网格邻居误报为另一条路线。
 - 真实 Tianhong 复测：
-  - `181158` 的独立路线 normalized margin 从约 0.12% 提升到 3.55%，最大相邻平移修正从约 4.05 m 降到 1.64 m，结构、连续性和路线唯一性均通过 diagnostic gate；
-  - `162937` 的 45/60/90/120 秒多尺度窗口中最佳独立路线 margin 仍只有约 1.7%，因此继续保留 `structure_window_sequence_ambiguous`，不通过调权重伪造确定货架；
+  - 使用与历史对比一致的 `candidate_limit=12` 时，`181158` 最大相邻 correction 总量为 4.080 m，但单位物理行进距离的平移/航向梯度仅为 0.176 m/m 和 1.242°/m，因此应判为长距离累计 gauge 修正连续，而不是手机瞬移；该预算下 `sequence_unique=true`；
+  - `162937` 的最大总修正为 2.927 m，梯度为 0.238 m/m 和 1.513°/m，连续性通过，但仍保留 `structure_window_sequence_ambiguous`，不通过调权重伪造确定货架；
+  - 将候选预算增至 24 时可能暴露新的平行序列多解，因此 `181158` 的“唯一”只属于该次固定预算诊断，不能升级为具体货架身份结论。
   - 两者都仍被 `structure_coverage_not_bound_by_localized_input_manifest` 阻断，`publishable_constraint_count=0`。
 - 后续 PC 工作是把同一候选图接入正式 manifest v4 和人工复核可视化，而不是再新增一套未绑定的因子生成器。
 - 在引入正式因子前，至少审核 Tianhong、北京昌平 hs.6599、MapCase02 和 Kohl's 的多会话分布并冻结质量策略。当前 factor graph policy 仍是 `candidate`，不得仅依据本次两个样本改为 `frozen`。
@@ -43,13 +44,16 @@
 
 ## P1：扫描时长期货架假设与回环恢复
 
-- 继续保留多排周期货架的 dormant hypotheses，历史 support 只能排序，重新激活必须重新累计 fresh support。
+- 当前手机 `PriorMapHypothesisTracker` 已继续保留多排周期结构的 dormant **alignment hypotheses**，历史 support 只能排序，重新激活必须重新累计 fresh support；它仍不是具体 `shelf_segment_id` 的 identity tracker。
+- 当前可靠 RTAB-Map 回环会打开有界 recovery，并把最新估计位姿附近最多 5 个 `shelf_segment_id` 写入普通 `scan_events.jsonl`。该 top-K 事件是 `diagnostic_only_not_localization_factor`：候选来自回环后的位姿邻域，不是回环绑定的局部货架结构快照，也没有 phone↔shelf SE(2)，不能改变定位或发布资格。
 - 在下列事件触发有界 recovery 搜索，而不是清空候选：
   - 跨至少 50 个节点的可靠 RTAB-Map 全局/邻近回环；
   - 多方向结构覆盖显著增长；
   - 轨迹回到历史道路/货架窗口附近；
   - 人工节点校准完成。
 - 扫描 UI 应提示“回看货架端头/交叉口/独特固定结构”，但不强迫反复扫描同一价签；回环目标是全局轨迹和货架 identity，不是让使用者重复扫码。
+- 正式闭环必须新增 manifest v4 绑定的 loop-window 结构证据：冻结回环前后 exact node/time 范围、局部货架/地面点、地图候选、所用 distance-field SHA 和 top-K margin；在此基础上建立 concrete shelf identity tracker，输出 phone↔shelf relative SE(2) 及其不确定度，再由 fresh multi-frame support 将已确认货架作为有界校准证据。不得直接给 strict `localization_trace` v1 增字段，也不得把当前邻域 top-K 当绝对因子。
+- manifest v4 必须同步手机 writer/finalization/snapshot、水位和生成合同、Swift/Python strict parser、PC immutable input identity、localized result identity、资源上限、mutation tests 和文档；任何一端缺失都只能保持 diagnostic。
 - 需要现场矩阵验证蛇形长通道、环绕同形货架、遮挡后恢复、人工校准前后、无可靠回环和错误回环隔离。
 
 ## P1：道路拓扑精确来源的 schema 升级

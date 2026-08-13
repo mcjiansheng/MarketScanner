@@ -1216,6 +1216,91 @@ class MapStudioApiTests(unittest.TestCase):
             stale.payload["current_revision"], first.revision + 1
         )
 
+    def test_localized_edit_retains_non_current_diagnostic_version(self) -> None:
+        output = self.root / "localized-edit-diagnostic-retained"
+        source_database = (
+            self.session_a / "segment_0001" / "rtabmap_segment_0001.db"
+        )
+        prior_map = self.root / "PriorMap-edit-diagnostic-retained"
+        prior_map.mkdir()
+        (prior_map / "package_manifest.json").write_text(
+            json.dumps({"package_sha256": "a" * 64}), encoding="utf-8"
+        )
+        source_manifest = {
+            "prior_map": str(prior_map),
+            "source_session": str(self.session_a),
+            "source_database": str(source_database),
+            "source_database_sha256_before": server.localized._sha256(
+                source_database
+            ),
+            "optimized_database": str(source_database),
+        }
+        journal = server.localized.new_manual_edits(
+            "a" * 64,
+            server.localized._sha256(source_database),
+            server.localized._sha256(source_database),
+        )
+        first = create_localized_store(
+            output, source_manifest=source_manifest, journal=journal
+        )
+        session_input = server.LocalizedVersionStore(output).read_verified_json(
+            first, "session_input_manifest.json"
+        )
+        job = server.STATE.add("localized", output)
+        server.STATE.set_status(job.identifier, "complete")
+        segment = SimpleNamespace(
+            poses=[
+                SimpleNamespace(
+                    node_id=1, stamp=1.0, x=0.0, y=0.0, yaw=0.0
+                )
+            ]
+        )
+        with (
+            mock.patch.object(
+                server,
+                "_manual_edit_context",
+                return_value=([], [], [], {"bounds": {}}),
+            ),
+            mock.patch.object(
+                server, "validate_prior_map_package", return_value={"valid": True}
+            ),
+            mock.patch.object(
+                server.localized,
+                "build_session_input_manifest",
+                return_value={
+                    key: value
+                    for key, value in session_input.items()
+                    if key != "input_identity_id"
+                },
+            ),
+            mock.patch.object(
+                server.base, "discover_segments", return_value=[segment]
+            ),
+            mock.patch.object(
+                server.localized,
+                "process_localized_session",
+                return_value={
+                    "current_updated": False,
+                    "version_id": "v000002",
+                    "revision": first.revision + 1,
+                },
+            ),
+        ):
+            result = server.apply_localized_edit(
+                job,
+                {
+                    "action": "undo",
+                    "expected_version_id": first.version_id,
+                    "expected_revision": first.revision,
+                },
+            )
+        self.assertFalse(result["current_updated"])
+        self.assertTrue(result["result_retained"])
+        self.assertEqual(result["version_id"], "v000002")
+        self.assertIn("未更新 current", result["message"])
+        current = server.LocalizedVersionStore(output).current()
+        self.assertEqual(current, first)
+
     def test_localized_replay_failure_keeps_revision_and_current(self) -> None:
         output = self.root / "localized-replay-failure"
         source_database = self.session_a / "segment_0001" / "rtabmap_segment_0001.db"
@@ -2765,6 +2850,7 @@ class MapStudioApiTests(unittest.TestCase):
     def test_map_studio_exposes_localized_stage_three_review_controls(self) -> None:
         html, _ = self.fetch("/")
         script, _ = self.fetch("/app.js")
+        geometry, _ = self.fetch("/anchor_geometry.js")
         for marker in (
             b'data-mode="localized"',
             b'id="localized-prior-map"',
@@ -2773,7 +2859,14 @@ class MapStudioApiTests(unittest.TestCase):
             b'id="localized-review-editor"',
             b'id="localized-review-canvas"',
             b'id="localized-map-anchor-controls"',
+            b'id="localized-map-anchor-x"',
+            b'id="localized-map-anchor-y"',
             b'id="localized-map-anchor-yaw"',
+            b'id="localized-map-anchor-yaw-number"',
+            b'id="localized-map-anchor-step"',
+            b'data-anchor-move="0,1"',
+            b'data-anchor-rotate="15"',
+            b'data-anchor-yaw="90"',
             b'id="localized-tag-filter"',
             b'id="localized-shelf-filter"',
             b'id="localized-undo"',
@@ -2783,11 +2876,19 @@ class MapStudioApiTests(unittest.TestCase):
             b'id="localized-submit-review"',
             b'id="localized-publish"',
             b'id="localized-revoke"',
+            b'class="skip-link" href="#main-content"',
+            b'<main id="main-content" tabindex="-1">',
         ):
             self.assertIn(marker, html)
         self.assertIn(b'kind: "localized"', script)
         self.assertIn(b"/localized/edit", script)
         self.assertIn(b"publish_gate", script)
+        self.assertIn(b"coordinate_contract_version", script)
+        self.assertIn(b"clampCanonicalPoint", geometry)
+        self.assertIn(b"canonicalBounds", geometry)
+        self.assertIn(b'role="status" aria-live="polite"', html)
+        self.assertIn(b"source_yaw_rad", script)
+        self.assertNotIn(b"directionEnd[1]", script)
         self.assertIn(b"expected_revision", script)
         self.assertIn(b"expected_version_id", script)
         self.assertIn(b"/localized/state", script)
@@ -2795,6 +2896,53 @@ class MapStudioApiTests(unittest.TestCase):
         self.assertIn(b"beginLocalizedAnchor", script)
         self.assertIn(b"anchorDraft", script)
         self.assertIn(b"prior_map_offline_optimized", script)
+        self.assertIn(b'if (geometryType === "point") include(coordinates);', script)
+        self.assertIn(b'if (geometryType === "point") return;', script)
+        self.assertIn(
+            "当前显示值就是将提交的 canonical SE(2)".encode("utf-8"),
+            script,
+        )
+        self.assertIn(b'event.key === "{"', script)
+        self.assertIn(b'event.key === "}"', script)
+        self.assertIn(b'addEventListener("blur", commitAnchorPosition)', script)
+        self.assertIn(b'addEventListener("blur", commitAnchorYaw)', script)
+        self.assertIn(
+            "人工编辑结果已保留，当前版本仍需复核".encode("utf-8"),
+            script,
+        )
+
+    def test_anchor_geometry_round_trip_and_heading_contract(self) -> None:
+        script_path = server.WEB_DIR / "anchor_geometry.js"
+        node_script = f"""
+const vm = require('vm');
+const fs = require('fs');
+const context = {{ globalThis: {{}} }};
+vm.createContext(context);
+vm.runInContext(fs.readFileSync({json.dumps(str(script_path))}, 'utf8'), context);
+const geometry = context.globalThis.MarketScannerAnchorGeometry;
+const projection = geometry.createProjection(
+  {{minX: 0, minY: -81.4, maxX: 90, maxY: 0}}, 1800, 1400, 32
+);
+const point = [37.125, -44.875];
+const restored = geometry.unproject(geometry.project(point, projection), projection);
+if (Math.abs(restored[0] - point[0]) > 1e-10 || Math.abs(restored[1] - point[1]) > 1e-10) process.exit(2);
+const east = geometry.canvasDirectionForCanonicalYaw(0);
+const north = geometry.canvasDirectionForCanonicalYaw(Math.PI / 2);
+if (Math.abs(east[0] - 1) > 1e-10 || Math.abs(east[1]) > 1e-10) process.exit(3);
+if (Math.abs(north[0]) > 1e-10 || Math.abs(north[1] + 1) > 1e-10) process.exit(4);
+if (Math.abs(geometry.normalizeDegrees(-180) - 180) > 1e-10) process.exit(5);
+const clamped = geometry.clampCanonicalPoint(
+  [-2, 5], {{min_x_m: 0, min_y_m: -81.4, max_x_m: 90, max_y_m: 0}}
+);
+if (clamped[0] !== 0 || clamped[1] !== 0) process.exit(6);
+"""
+        completed = subprocess.run(
+            ["node", "-e", node_script],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
 
     def test_unsafe_optimized_pose_jump_is_rejected_before_publication(self) -> None:
         session = create_session(self.root, "SupermarketSession-UnsafeOptimization", 0.0, "continuous_streaming")
@@ -2935,8 +3083,8 @@ class MapStudioApiTests(unittest.TestCase):
         with (
             mock.patch.object(
                 server,
-                "validate_prior_map_package",
-                return_value={"valid": True, "errors": []},
+                "prepare_prior_map_for_processing",
+                return_value=(prior_map, None),
             ),
             mock.patch.object(
                 server.base,
@@ -2999,6 +3147,289 @@ class MapStudioApiTests(unittest.TestCase):
         self.assertTrue(upstream["diagnostic_only"])
         self.assertEqual(upstream["rtabmap_reprocess_error"], str(reprocess_error))
 
+    def test_localized_map_keeps_non_current_diagnostic_version_as_completed_output(self) -> None:
+        session = create_session(
+            self.root,
+            "SupermarketSession-DiagnosticVersion",
+            0.0,
+            "continuous_streaming",
+        )
+        source_database = (
+            session / "segment_0001" / "rtabmap_segment_0001.db"
+        )
+        prior_map = self.root / "PriorMap-diagnostic-version"
+        prior_map.mkdir()
+        output = self.root / "localized-diagnostic-version-output"
+        output.mkdir()
+        segment = SimpleNamespace(
+            index=1,
+            directory=session / "segment_0001",
+            database_path=source_database,
+            poses=[SimpleNamespace(node_id=1, stamp=1.0, x=0.0, y=0.0, yaw=0.0)],
+        )
+        progress: list[tuple[int, str, str]] = []
+        with (
+            mock.patch.object(
+                server,
+                "prepare_prior_map_for_processing",
+                return_value=(prior_map, None),
+            ),
+            mock.patch.object(
+                server.base,
+                "discover_segments",
+                return_value=[segment],
+            ),
+            mock.patch.object(
+                server,
+                "acceleration_selection",
+                return_value=server.gpu.BackendSelection(
+                    requested="cpu",
+                    effective="cpu",
+                    available=True,
+                ),
+            ),
+            mock.patch.object(
+                server,
+                "reprocess_single_session",
+                return_value=(
+                    {1: str(source_database)},
+                    {"status": "diagnostic"},
+                ),
+            ),
+            mock.patch.object(server.base, "generate"),
+            mock.patch.object(
+                server.localized,
+                "process_localized_session",
+                return_value={
+                    "current_updated": False,
+                    "version_id": "diagnostic-version",
+                },
+            ),
+            mock.patch.object(
+                server,
+                "export_calibrated_trajectory",
+                side_effect=ValueError("fixture has no immutable version"),
+            ),
+            mock.patch.object(server, "attach_offline_reports"),
+            mock.patch.object(server, "attach_acceleration_report"),
+            mock.patch.object(server, "find_factor_graph_binary", return_value=None),
+        ):
+            server.run_localized_map(
+                {
+                    "session": str(session),
+                    "prior_map": str(prior_map),
+                    "options": {"gpu_backend": "cpu"},
+                },
+                output,
+                lambda value, stage, message: progress.append(
+                    (value, stage, message)
+                ),
+            )
+        self.assertIn(
+            "已保留不可发布诊断结果",
+            {stage for _, stage, _ in progress},
+        )
+        self.assertTrue(
+            (output / "calibrated_trajectory_export_error.json").is_file()
+        )
+
+    def test_localized_map_exports_calibrated_coordinates_after_version_commit(self) -> None:
+        session = create_session(
+            self.root,
+            "SupermarketSession-CalibratedExport",
+            0.0,
+            "continuous_streaming",
+        )
+        source_database = (
+            session / "segment_0001" / "rtabmap_segment_0001.db"
+        )
+        prior_map = self.root / "PriorMap-calibrated-export"
+        prior_map.mkdir()
+        output = self.root / "localized-calibrated-export-output"
+        output.mkdir()
+        version_directory = output / "localized" / "versions" / "v000007"
+        segment = SimpleNamespace(
+            index=1,
+            directory=session / "segment_0001",
+            database_path=source_database,
+            poses=[
+                SimpleNamespace(
+                    node_id=1,
+                    stamp=1.0,
+                    x=0.0,
+                    y=0.0,
+                    yaw=0.0,
+                )
+            ],
+        )
+        progress: list[tuple[int, str, str]] = []
+        export_manifest = {
+            "node_count": 1,
+            "one_second_sample_count": 1,
+        }
+        with (
+            mock.patch.object(
+                server,
+                "prepare_prior_map_for_processing",
+                return_value=(prior_map, None),
+            ),
+            mock.patch.object(
+                server.base,
+                "discover_segments",
+                return_value=[segment],
+            ),
+            mock.patch.object(
+                server,
+                "acceleration_selection",
+                return_value=server.gpu.BackendSelection(
+                    requested="cpu",
+                    effective="cpu",
+                    available=True,
+                ),
+            ),
+            mock.patch.object(
+                server,
+                "reprocess_single_session",
+                return_value=(
+                    {1: str(source_database)},
+                    {"status": "pass"},
+                ),
+            ),
+            mock.patch.object(server.base, "generate"),
+            mock.patch.object(
+                server.localized,
+                "process_localized_session",
+                return_value={
+                    "current_updated": True,
+                    "version_id": "v000007",
+                },
+            ),
+            mock.patch.object(
+                server,
+                "export_calibrated_trajectory",
+                return_value=export_manifest,
+            ) as export,
+            mock.patch.object(server, "attach_offline_reports"),
+            mock.patch.object(server, "attach_acceleration_report"),
+            mock.patch.object(
+                server, "find_factor_graph_binary", return_value=None
+            ),
+        ):
+            server.run_localized_map(
+                {
+                    "session": str(session),
+                    "prior_map": str(prior_map),
+                    "options": {"gpu_backend": "cpu"},
+                },
+                output,
+                lambda value, stage, message: progress.append(
+                    (value, stage, message)
+                ),
+            )
+        export.assert_called_once_with(
+            prior_map,
+            version_directory,
+            output / "calibrated_trajectory_export",
+        )
+        self.assertIn("导出校准坐标", {stage for _, stage, _ in progress})
+
+    def test_localized_map_records_compatibility_audit_in_result_root(self) -> None:
+        session = create_session(
+            self.root,
+            "SupermarketSession-PriorCompatibilityAudit",
+            0.0,
+            "continuous_streaming",
+        )
+        source_database = (
+            session / "segment_0001" / "rtabmap_segment_0001.db"
+        )
+        selected_prior_map = self.root / "PriorMap-legacy-selected"
+        selected_prior_map.mkdir()
+        effective_prior_map = self.root / "PriorMap-effective"
+        effective_prior_map.mkdir()
+        output = self.root / "localized-compatibility-audit-output"
+        output.mkdir()
+        segment = SimpleNamespace(
+            index=1,
+            directory=session / "segment_0001",
+            database_path=source_database,
+            poses=[
+                SimpleNamespace(
+                    node_id=1,
+                    stamp=1.0,
+                    x=0.0,
+                    y=0.0,
+                    yaw=0.0,
+                )
+            ],
+        )
+        audit = {
+            "format": "MarketScannerPriorMapCompatibilityAudit",
+            "version": 1,
+            "source_package_modified": False,
+            "repaired_error_codes": [
+                "road_graph_source_binding",
+                "spatial_source_binding",
+            ],
+        }
+        with (
+            mock.patch.object(
+                server,
+                "prepare_prior_map_for_processing",
+                return_value=(effective_prior_map, audit),
+            ),
+            mock.patch.object(
+                server.base,
+                "discover_segments",
+                return_value=[segment],
+            ),
+            mock.patch.object(
+                server,
+                "acceleration_selection",
+                return_value=server.gpu.BackendSelection(
+                    requested="cpu",
+                    effective="cpu",
+                    available=True,
+                ),
+            ),
+            mock.patch.object(
+                server,
+                "reprocess_single_session",
+                return_value=(
+                    {1: str(source_database)},
+                    {"status": "pass"},
+                ),
+            ),
+            mock.patch.object(server.base, "generate"),
+            mock.patch.object(
+                server.localized,
+                "process_localized_session",
+                return_value={"current_updated": True},
+            ) as process,
+            mock.patch.object(server, "attach_offline_reports"),
+            mock.patch.object(server, "attach_acceleration_report"),
+            mock.patch.object(
+                server, "find_factor_graph_binary", return_value=None
+            ),
+        ):
+            server.run_localized_map(
+                {
+                    "session": str(session),
+                    "prior_map": str(selected_prior_map),
+                    "options": {"gpu_backend": "cpu"},
+                },
+                output,
+            )
+        stored_audit = json.loads(
+            (output / "prior_map_compatibility_audit.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(stored_audit, audit)
+        self.assertEqual(
+            process.call_args.kwargs["prior_map"], effective_prior_map
+        )
+
     def test_localized_map_recovers_complete_raw_vio_without_manual_evidence(self) -> None:
         session = create_session(
             self.root,
@@ -3025,8 +3456,8 @@ class MapStudioApiTests(unittest.TestCase):
         with (
             mock.patch.object(
                 server,
-                "validate_prior_map_package",
-                return_value={"valid": True, "errors": []},
+                "prepare_prior_map_for_processing",
+                return_value=(prior_map, None),
             ),
             mock.patch.object(
                 server.base,
@@ -3117,8 +3548,8 @@ class MapStudioApiTests(unittest.TestCase):
         with (
             mock.patch.object(
                 server,
-                "validate_prior_map_package",
-                return_value={"valid": True, "errors": []},
+                "prepare_prior_map_for_processing",
+                return_value=(prior_map, None),
             ),
             mock.patch.object(
                 server.base,
@@ -3192,8 +3623,8 @@ class MapStudioApiTests(unittest.TestCase):
         with (
             mock.patch.object(
                 server,
-                "validate_prior_map_package",
-                return_value={"valid": True, "errors": []},
+                "prepare_prior_map_for_processing",
+                return_value=(prior_map, None),
             ),
             mock.patch.object(
                 server.base,
@@ -3963,6 +4394,45 @@ class MapStudioApiTests(unittest.TestCase):
         content, content_type = self.fetch(f"/api/jobs/{job.identifier}/artifact/preview_frames/node.jpg")
         self.assertEqual(content, image)
         self.assertEqual(content_type, "image/jpeg")
+
+    def test_nested_calibrated_csv_and_compatibility_audit_are_served(self) -> None:
+        output = self.root / "localized-artifact-output"
+        export_directory = output / "calibrated_trajectory_export"
+        export_directory.mkdir(parents=True)
+        csv_content = b"timestamp_local,x_m,y_m,yaw_deg\n2026-08-14 08:00:00,1,2,90\n"
+        (export_directory / "calibrated_positions_1s.csv").write_bytes(
+            csv_content
+        )
+        audit = {
+            "format": "MarketScannerPriorMapCompatibilityAudit",
+            "version": 1,
+            "source_package_modified": False,
+        }
+        (output / "prior_map_compatibility_audit.json").write_text(
+            json.dumps(audit), encoding="utf-8"
+        )
+        job = server.STATE.add("map", output)
+        server.STATE.set_status(job.identifier, "complete")
+
+        artifacts = server.job_artifacts(job)
+        self.assertIn(
+            "calibrated_trajectory_export/calibrated_positions_1s.csv",
+            artifacts,
+        )
+        self.assertIn(
+            "prior_map_compatibility_audit.json",
+            artifacts,
+        )
+        content, content_type = self.fetch(
+            f"/api/jobs/{job.identifier}/artifact/"
+            "calibrated_trajectory_export/calibrated_positions_1s.csv"
+        )
+        self.assertEqual(content, csv_content)
+        self.assertEqual(content_type, "text/csv")
+        self.assertEqual(
+            self.api(artifacts["prior_map_compatibility_audit.json"]),
+            audit,
+        )
 
     def test_trajectory_sidecar_is_used_when_database_is_missing(self) -> None:
         session = self.root / "SupermarketSession-Sidecar"

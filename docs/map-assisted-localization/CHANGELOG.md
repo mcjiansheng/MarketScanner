@@ -2,6 +2,15 @@
 
 > 文档状态：**当前有效**。最后核对日期：2026-08-14。
 
+## 2026-08-14 — TianHong 旧地图兼容、人工校准和结构连续性收口
+
+- TianHong 旧 v2 包的 `elements.json`/权威 XLSX 完整，但旧编译器过滤了隐藏 `MapCross`，又没有从 510 个有效 road-point `crossCodes` 恢复拓扑，导致 `road_graph` 只有 511 个孤立节点、0 条边，并连带触发 `road_graph_source_binding` / `spatial_source_binding`。Map Studio 现在仅在错误集合严格属于这组已知派生绑定问题时，将源包只读复制到结果目录并确定性重建 `road_graph/spatial_index/validation_report/package_manifest`；其他身份、schema、hash 或完整性错误仍终止。源包、权威 canonical SHA 和 prior-map ID 不修改。
+- `run_localized_map()` 与人工编辑重放统一采用“结果保留、发布从严”：低置信度或非完整性质量项不再抛通用“处理失败”；新不可变版本、轨迹、价签和审计完整保留，`current`/review/publish 指针是否推进继续由更严格门禁决定。真正的输入身份、数据库、JSON framing、水位、CAS 或原子提交错误仍失败。
+- PC Web 人工锚点和 iOS 人工重定位统一 canonical SE(2)：`0°=+X/东/屏幕右`、`90°=+Y/北/屏幕上`、逆时针为正。PC exact-node/floor/time/contract-bound `set_anchor` 与手机 v3 exact-node 事件都作为约 3 m / 20°不确定度的可信绝对地图 gauge 证据；历史 timestamp-only 编辑继续走兼容门。Web 与手机均提供 X/Y/yaw 数值、0.1/0.5/1.0 m 微调、东南西北和 ±1/±5/±15°旋转；Web 同时处理 Shift 后浏览器产生的 `{`/`}` 键值，数值字段在 change/blur 统一提交并按 canonical bounds 钳制。服务端从不可变轨迹复核 node/time/floor/bounds/yaw，界面数值就是提交数值，不存在隐藏二次坐标转换。
+- 结构窗口连续性不再用“相邻 correction 总量 ≤ 3 m”拒绝长距离累计漂移。权威诊断改为单位 gauge-neutral 物理行进距离的平移/航向 correction gradient，总变化量只保留审计；短距离大跳变仍因高梯度拒绝。真实 `181158` 在原 12 候选预算下最大总校正仍为 4.080 m，但梯度仅 0.176 m/m 和 1.242°/m，因此连续性通过；`162937` 连续性也通过，但平行货架序列仍多解，继续保留 top-K 和低置信度，绝不伪造唯一货架。
+- 手机可靠 RTAB-Map 回环现在会在开始有界 recovery 时，把当前估计位置附近最多 5 个 concrete `shelf_segment_id` 写入 `scan_events.jsonl`，多解显式标记 `ambiguous_top_k_retained`。该事件仅为诊断和后续结构消歧入口，尚未绑定局部结构快照、phone↔shelf SE(2) 或正式 localization input manifest，不能注入绝对因子，也不能据此宣称“具体货架闭环”已完成。
+- 两份真实 TianHong 会话已生成完整不可发布草稿：`162937` 保留 3663/3663 节点和 3804 条逐秒坐标，`181158` 保留 1054/1054 节点和 1128 条逐秒坐标；均有节点级/秒级 CSV 与两张路线 PNG，没有节点删除、结构内点、穿越结构线段或道路拓扑断裂。两份会话都没有价签观测，空价签不是失败。签名真机、LiDAR、现场货架 identity 真值和 exact-final-SHA 资格仍未执行。
+
 ## 2026-08-14 — Gauge-neutral 自由空间道路路线恢复
 
 - 修复长距离 `localization_trace.rawPose` 的坐标语义错误：该字段已经经过当时可变的 ARKit→地图 alignment 投影，自动结构 correction、人工重定位和坐标 epoch 重置属于 map gauge 变化，不是手机物理位移。PC 新增 gauge-neutral 恢复：普通帧累计相邻相对 SE(2)，自动 correction 后从前一 `estimatedPose` 续算，人工重定位后的首个 post-reset sample 物理位移记为零，再按数据库节点时间戳重采样。
@@ -19,7 +28,7 @@
 
 ## 2026-08-12 — 长距离漂移人工绝对锚点与连续轨迹恢复
 
-- 将严格 `MarketScannerManualLocalizationEvent v3` 的人工重选位置定义为绝对地图 gauge 证据，而不是手机物理瞬移。只有 exact-node、tracking/map/floor identity、递增 alignment version、node stamp/time delta 和 atomic snapshot generation 全部通过时才设置 `trusted_absolute=true`；旧 v2 时间绑定和 PC `set_anchor` 仍受 5 m/30° `unverified_manual_anchor_safety_gate`。
+- 将严格 `MarketScannerManualLocalizationEvent v3` 的人工重选位置定义为绝对地图 gauge 证据，而不是手机物理瞬移。只有 exact-node、tracking/map/floor identity、递增 alignment version、node stamp/time delta 和 atomic snapshot generation 全部通过时才设置 `trusted_absolute=true`；该日版本的旧 v2 时间绑定和 PC `set_anchor` 仍受 5 m/30° `unverified_manual_anchor_safety_gate`。PC exact-node 锚点随后已由 2026-08-14 条目升级为同等级可信绝对证据。
 - 可信人工锚点使用约 3 m 平移、20°航向不确定度，不再按大累计漂移残差做 Huber 降权。bounded fallback 从固定 120 轮松弛改为 O(N) Thomas 三对角精确求解，使修正沿完整连接轨迹前后连续传播，避免在锚点处形成未收敛尖峰。
 - `maximum/P95 correction` 在可信人工锚点存在时改为 gauge 审计，不再单独阻断 current draft/review；新增相邻 correction-field 平移/航向梯度门。native 因子图只有在 runner 明确证明选中可信人工锚点时才允许大 pose update，普通自动 absolute prior 不能借用该权限；相对边、闭环、连通性和目标函数门保持不变。
 - `rtabmap-reprocess` 图不完整时新增 `raw_continuous_vio_manual_anchor_recovery`：仅在原始 `Node.pose` 全量有限、时间严格递增、相邻步长/旋转安全，且严格解析后至少有一个可信人工锚点时生成 diagnostic-only 草稿；不从不完整 `Admin.opt_poses` 渲染 2D/3D 成果、强制禁止发布、原始数据库只读。无人工证据的 `093330` 坏图继续拒绝。

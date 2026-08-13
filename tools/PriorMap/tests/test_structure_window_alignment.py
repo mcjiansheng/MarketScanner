@@ -283,6 +283,30 @@ class StructureWindowAlignmentTests(unittest.TestCase):
         )
         self.assertEqual(selected, [0, 0, 0])
 
+    def test_long_distance_accumulated_correction_uses_gradient_not_total_delta(self) -> None:
+        supported, translation_gradient, yaw_gradient = (
+            alignment.correction_continuity_metrics(
+                [4.0804],
+                [28.7],
+                [23.17],
+            )
+        )
+        self.assertTrue(supported)
+        self.assertAlmostEqual(translation_gradient[0], 0.1761, places=3)
+        self.assertAlmostEqual(yaw_gradient[0], 1.2387, places=3)
+
+    def test_short_distance_correction_jump_remains_discontinuous(self) -> None:
+        supported, translation_gradient, yaw_gradient = (
+            alignment.correction_continuity_metrics(
+                [4.0],
+                [20.0],
+                [0.5],
+            )
+        )
+        self.assertFalse(supported)
+        self.assertGreater(translation_gradient[0], 1.0)
+        self.assertGreater(yaw_gradient[0], 8.0)
+
     def test_second_best_sequence_can_share_the_same_final_candidate(self) -> None:
         def candidate(x: float, cost: float = 0.0) -> AlignmentCandidate:
             return AlignmentCandidate(Pose2D(x, 0.0, 0.0), cost, 0.0)

@@ -122,6 +122,8 @@ P7R3 把宽搜索改为显式 Recovery episode。`inactive -> active -> converge
 
 `localization_trace` v1 继续用向后兼容可选字段记录 `recoveryEpisodeId/recoveryReason/recoveryOutcome/recoveryValidAttemptCount/recoveryRemainingValidAttempts/recoveryElapsedMs/recoveryFreshSupportFrames/recoveryTriggerCount`。active 记录使用 `recoveryOutcome=active`；结束该 episode 的记录使用终态字符串。数值均为有限小标量，不保存结构点；旧 reader 可忽略这些字段。
 
+可靠 RTAB-Map 回环还会在普通 `scan_events.jsonl` 写 `loop_opened_shelf_identity_candidates`。它包含 `authority=diagnostic_only_not_localization_factor`、候选来源、`identity_status`、最多 5 个 `shelf_segment_ids/shelf_codes/distances_m/longitudinal_fractions`。这些候选来自回环触发 recovery 前的最新估计位置邻域，仅用于证明“哪些具体货架仍可能”并保留多解；它不是正式定位 sidecar、没有局部结构快照或 phone↔shelf SE(2)，不能改变 alignment、constraint、trajectory 或发布资格。后续只有在 manifest v4 绑定结构窗口和 exact node 后，才能考虑把经多帧/回环确认的货架身份升级为正式因子。
+
 `timestamp` 保留原始 `ARFrame.timestamp`（设备单调时钟）；RTAB‑Map 的 `CameraMobile` 在写 `Node.stamp` 前会加 `stampEpochOffset`。因此所有当前定位 sidecar 同时保存 `nodeTimebaseTimestamp = timestamp + nodeTimebaseOffsetSeconds`，PC 只用换算后的 node timebase 绑定 SQLite node，并严格复算该等式。offset 由 native camera 原子读取；尚未初始化或非有限时该记录拒绝落盘，不能直接拿原始 ARFrame 时间与 epoch node stamp 比较。
 
 ## 阶段二定位审计

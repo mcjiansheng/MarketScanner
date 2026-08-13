@@ -221,6 +221,45 @@ class YawArrowGeometryGolden(unittest.TestCase):
         self.assertNotIn("atan2(-forwardX, -forwardZ)", core)
         self.assertIn("atan2(local.y, max(0.001, local.x))", depth)
 
+    def test_manual_relocalization_matches_setup_precision_controls(self) -> None:
+        overlay = (
+            ROOT / "app/ios/RTABMapApp/PriorMapLocalization.swift"
+        ).read_text(encoding="utf-8")
+        self.assertIn('items: ["0.1 m", "0.5 m", "1.0 m"]', overlay)
+        self.assertIn('@objc private func nudgeUp()', overlay)
+        self.assertIn('@objc private func nudgeDown()', overlay)
+        self.assertIn('@objc private func nudgeLeft()', overlay)
+        self.assertIn('@objc private func nudgeRight()', overlay)
+        for degrees in ("Minus15", "Minus5", "Minus1", "Plus1", "Plus5", "Plus15"):
+            self.assertIn(f'@objc private func rotate{degrees}()', overlay)
+        self.assertIn('items: ["东 0°", "北 90°", "西 180°", "南 −90°"]', overlay)
+        self.assertIn("private let scrollView = UIScrollView()", overlay)
+        self.assertIn("scrollView.contentLayoutGuide.bottomAnchor", overlay)
+        self.assertIn("界面数值就是写入审计记录的 canonical SE(2)", overlay)
+        self.assertIn("for: .editingDidEnd", overlay)
+        self.assertNotIn("for: .editingChanged", overlay)
+        self.assertIn(
+            "never leave an unparseable display value while the picker still",
+            overlay,
+        )
+        self.assertIn("refreshCoordinateControls()\n            return", overlay)
+        self.assertIn("@objc private func resetPose()", overlay)
+
+    def test_reliable_loop_retains_bounded_shelf_identity_candidates(self) -> None:
+        overlay = (
+            ROOT / "app/ios/RTABMapApp/PriorMapLocalization.swift"
+        ).read_text(encoding="utf-8")
+        host = (ROOT / "app/ios/RTABMapApp/ViewController.swift").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("self.shelfSegments = package.shelfSegments.filter", overlay)
+        self.assertIn("func nearbyShelfIdentityCandidates(", overlay)
+        self.assertIn(".prefix(max(1, min(5, limit)))", overlay)
+        self.assertIn("localizer.requestRecovery(reason: \"reliable_rtabmap_loop\")", host)
+        self.assertIn('event: "loop_opened_shelf_identity_candidates"', host)
+        self.assertIn('"ambiguous_top_k_retained"', host)
+        self.assertIn('"diagnostic_only_not_localization_factor"', host)
+
     def test_start_yaw_reaches_initial_map_pose_without_conversion(self) -> None:
         setup = (
             ROOT

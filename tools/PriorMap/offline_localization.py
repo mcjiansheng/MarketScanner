@@ -6435,6 +6435,45 @@ def validate_manual_edit_event(event: dict[str, Any]) -> None:
             valid_timestamp = False
         if not valid_timestamp:
             raise OfflineLocalizationError("set_anchor requires a finite timestamp.")
+        yaw_value = _strict_number(value.get("yaw_rad"))
+        if (
+            yaw_value is None
+            or yaw_value <= -math.pi
+            or yaw_value > math.pi
+        ):
+            raise OfflineLocalizationError(
+                "set_anchor yaw_rad must use canonical (-pi, pi] range."
+            )
+        allowed_anchor_fields = {
+            "timestamp",
+            "node_id",
+            "floor_id",
+            "coordinate_contract_version",
+            "x_m",
+            "y_m",
+            "yaw_rad",
+        }
+        if set(value) - allowed_anchor_fields:
+            raise OfflineLocalizationError("set_anchor contains unknown fields.")
+        node_id = value.get("node_id")
+        coordinate_version = value.get("coordinate_contract_version")
+        floor_id = value.get("floor_id")
+        exact_fields_present = any(
+            field in value
+            for field in ("node_id", "floor_id", "coordinate_contract_version")
+        )
+        if exact_fields_present and (
+            isinstance(node_id, bool)
+            or not isinstance(node_id, int)
+            or node_id <= 0
+            or not isinstance(floor_id, str)
+            or not floor_id
+            or isinstance(coordinate_version, bool)
+            or coordinate_version != COORDINATE_CONTRACT_VERSION
+        ):
+            raise OfflineLocalizationError(
+                "set_anchor exact node/floor/coordinate contract is invalid."
+            )
     elif kind == "disable_constraint":
         if not target:
             raise OfflineLocalizationError("disable_constraint requires object_id.")
@@ -7191,20 +7230,41 @@ def _render_localized_version(
         if pose is None or not isinstance(value, dict):
             continue
         timestamp = value.get("timestamp")
+        exact_node_bound = (
+            isinstance(value.get("node_id"), int)
+            and not isinstance(value.get("node_id"), bool)
+            and value.get("coordinate_contract_version")
+            == COORDINATE_CONTRACT_VERSION
+            and str(value.get("floor_id") or "")
+            == str(metadata.get("floorId") or metadata.get("floor_id") or "")
+        )
+        node_index = _nearest_pose_index(
+            baseline,
+            float(timestamp) if timestamp is not None else None,
+        )
+        if exact_node_bound and baseline[node_index].node_id != value["node_id"]:
+            raise OfflineLocalizationError(
+                "PC manual anchor exact node changed during replay."
+            )
         constraints.append(
             AbsoluteConstraint(
                 identifier=str(event.get("event_id") or "manual-edit-anchor"),
-                node_index=_nearest_pose_index(
-                    baseline,
-                    float(timestamp) if timestamp is not None else None,
-                ),
+                node_index=node_index,
                 x=pose[0],
                 y=pose[1],
                 yaw=pose[2],
-                weight=100.0,
+                weight=(MANUAL_ANCHOR_WEIGHT if exact_node_bound else 100.0),
                 kind="manual_anchor",
                 source=event,
-                trusted_absolute=False,
+                translation_sigma_m=(
+                    MANUAL_ANCHOR_TRANSLATION_SIGMA_M
+                    if exact_node_bound else None
+                ),
+                yaw_sigma_rad=(
+                    MANUAL_ANCHOR_YAW_SIGMA_RAD
+                    if exact_node_bound else None
+                ),
+                trusted_absolute=exact_node_bound,
             )
         )
     road_graph = load_json(prior_map / "road_graph.json")
@@ -8375,6 +8435,17 @@ def _render_localized_version(
         {
             "format": "MarketScannerLocalizedReview",
             "version": 1,
+            "floor_id": str(
+                metadata.get("floorId") or metadata.get("floor_id") or ""
+            ),
+            "coordinate_contract_version": COORDINATE_CONTRACT_VERSION,
+            "coordinate_contract": {
+                "x_axis": "+X east / screen right",
+                "y_axis": "+Y north / screen up",
+                "yaw_zero_axis": "+X",
+                "yaw_positive": "counterclockwise",
+                "view_y_conversion_count": 1,
+            },
             "bounds": manifest.get("bounds"),
             "elements": [
                 {
