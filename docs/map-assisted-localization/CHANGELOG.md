@@ -2,6 +2,12 @@
 
 > 文档状态：**当前有效**。最后核对日期：2026-08-12。
 
+## 2026-08-13 — 完整 raw VIO 草稿与坐标系重置缝合
+
+- `rtabmap-reprocess` 图不完整时，只要原始 `Node.pose` 全量有限、时间严格递增且能证明连续，即保留为不可发布的 `raw_continuous_vio_diagnostic_recovery` 草稿；无人工事件时由 `initialMapPose` 提供低置信度 gauge，不再把完整有限轨迹整体丢弃。
+- 对 ARKit/数据库局部坐标 epoch 重置引起的绝对跳变，新增只读多 Link 一致恢复：至少两条独立、短距离的 type 1/2/3 Link 必须推导出唯一一致的刚体变换，缝合后重新通过 3 m/120°连续性门。无桥接、多解、非有限位姿或真实大跳变仍 fail closed。
+- 诊断报告记录 reset 节点、时间间隙、候选与一致 Link、选择的边界桥、应用变换、修复前后步长和全轨迹指标；该路径不生成来自坏 `Admin.opt_poses` 的点云/地图，始终禁止发布。
+
 ## 2026-08-12 — 长距离漂移人工绝对锚点与连续轨迹恢复
 
 - 将严格 `MarketScannerManualLocalizationEvent v3` 的人工重选位置定义为绝对地图 gauge 证据，而不是手机物理瞬移。只有 exact-node、tracking/map/floor identity、递增 alignment version、node stamp/time delta 和 atomic snapshot generation 全部通过时才设置 `trusted_absolute=true`；旧 v2 时间绑定和 PC `set_anchor` 仍受 5 m/30° `unverified_manual_anchor_safety_gate`。

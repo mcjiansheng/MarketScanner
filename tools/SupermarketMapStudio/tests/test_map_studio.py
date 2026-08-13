@@ -680,6 +680,93 @@ class Map2DPriceTagRetentionTests(unittest.TestCase):
             self.assertIsNone(retained[1]["raw_x"])
 
 
+class RawVIORecoveryTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+
+    def tearDown(self) -> None:
+        self.temp.cleanup()
+
+    def create_recovery_database(
+        self,
+        *,
+        bridge_links: list[tuple[int, int, float]],
+    ) -> Path:
+        database = self.root / "raw-vio.db"
+        poses = {
+            1: transform_blob(4.0, 0.0, 0.0),
+            2: transform_blob(5.0, 0.0, 0.0),
+            3: transform_blob(0.0, 0.0, 0.0),
+            4: transform_blob(1.0, 0.0, 0.0),
+        }
+        with closing(sqlite3.connect(database)) as connection, connection:
+            connection.execute(
+                "CREATE TABLE Node (id INTEGER PRIMARY KEY, pose BLOB, stamp REAL)"
+            )
+            connection.execute(
+                "CREATE TABLE Data (id INTEGER PRIMARY KEY, image BLOB, depth BLOB, calibration BLOB)"
+            )
+            connection.execute(
+                "CREATE TABLE Link (from_id INTEGER, to_id INTEGER, type INTEGER, transform BLOB)"
+            )
+            connection.executemany(
+                "INSERT INTO Node VALUES (?, ?, ?)",
+                ((node_id, pose, float(node_id)) for node_id, pose in poses.items()),
+            )
+            connection.execute("INSERT INTO Data VALUES (1, x'01', x'01', x'01')")
+            connection.executemany(
+                "INSERT INTO Link VALUES (?, ?, 3, ?)",
+                (
+                    (from_id, to_id, transform_blob(translation, 0.0, 0.0))
+                    for from_id, to_id, translation in bridge_links
+                ),
+            )
+        return database
+
+    def test_coordinate_reset_requires_and_uses_multi_link_consensus(self) -> None:
+        database = self.create_recovery_database(
+            bridge_links=[(2, 3, 0.2), (2, 4, 1.2)]
+        )
+        poses, report = server.offline.recover_raw_continuous_vio_poses(database)
+        self.assertEqual(report["status"], "pass")
+        self.assertEqual(len(poses), 4)
+        self.assertEqual(report["coordinate_reset_count"], 1)
+        repair = report["coordinate_reset_repairs"][0]
+        self.assertEqual(repair["before_node_id"], 2)
+        self.assertEqual(repair["after_node_id"], 3)
+        self.assertEqual(repair["consensus_count"], 2)
+        self.assertAlmostEqual(repair["after_step_translation_m"], 0.2, places=5)
+        self.assertAlmostEqual(report["raw"]["max_step_m"], 1.0, places=5)
+
+    def test_coordinate_reset_without_two_independent_links_is_rejected(self) -> None:
+        database = self.create_recovery_database(bridge_links=[(2, 3, 0.2)])
+        poses, report = server.offline.recover_raw_continuous_vio_poses(database)
+        self.assertEqual(poses, [])
+        self.assertEqual(report["status"], "rejected")
+        self.assertIn(
+            "fewer_than_two_independent_short_links",
+            report["rejection_reasons"][0],
+        )
+
+    def test_conflicting_coordinate_reset_bridges_are_rejected(self) -> None:
+        database = self.create_recovery_database(
+            bridge_links=[
+                (2, 3, 0.2),
+                (2, 4, 1.2),
+                (1, 3, -0.8),
+                (1, 4, 0.2),
+            ]
+        )
+        poses, report = server.offline.recover_raw_continuous_vio_poses(database)
+        self.assertEqual(poses, [])
+        self.assertEqual(report["status"], "rejected")
+        self.assertIn(
+            "multiple_equal_transform_consensus_groups",
+            report["rejection_reasons"][0],
+        )
+
+
 class MapStudioApiTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -2814,7 +2901,7 @@ class MapStudioApiTests(unittest.TestCase):
         )
         self.assertEqual(result["adaptive"]["passes"][1]["quality_status"], "failed")
 
-    def test_localized_map_recovers_incomplete_graph_only_with_manual_evidence_and_continuous_raw_vio(self) -> None:
+    def test_localized_map_recovers_incomplete_graph_as_diagnostic_raw_vio_draft(self) -> None:
         session = create_session(
             self.root,
             "SupermarketSession-ManualAnchorRecovery",
@@ -2837,7 +2924,6 @@ class MapStudioApiTests(unittest.TestCase):
             database_path=source_database,
             poses=[],
         )
-        raw_poses = [server.localized.Pose(1, 1.0, 0.0, 0.0, 0.0)]
         selection = server.gpu.BackendSelection(
             requested="cpu",
             effective="cpu",
@@ -2869,18 +2955,20 @@ class MapStudioApiTests(unittest.TestCase):
             ),
             mock.patch.object(
                 server.offline,
-                "assess_raw_continuous_vio_recovery",
-                return_value={
-                    "status": "pass",
-                    "node_count": 2,
-                    "maximum_neighbor_translation_m": 1.0,
-                },
+                "recover_raw_continuous_vio_poses",
+                return_value=(
+                    [
+                        {
+                            "node_id": 1,
+                            "timestamp": 1.0,
+                            "x": 0.0,
+                            "y": 0.0,
+                            "yaw": 0.0,
+                        }
+                    ],
+                    {"status": "pass", "node_count": 2},
+                ),
             ) as assess,
-            mock.patch.object(
-                server.localized,
-                "load_raw_continuous_vio_poses",
-                return_value=raw_poses,
-            ) as load_raw,
             mock.patch.object(
                 server.localized,
                 "process_localized_session",
@@ -2899,20 +2987,19 @@ class MapStudioApiTests(unittest.TestCase):
                 },
                 output,
             )
-        assess.assert_called_once_with(source_database)
-        load_raw.assert_called_once_with(source_database, "ios_prior")
+        assess.assert_called_once_with(source_database, "ios_prior")
         generate.assert_not_called()
         replay = process.call_args.kwargs["replay_parameters"]
         self.assertEqual(
             replay["relative_trajectory_authority"],
-            "raw_continuous_vio_manual_anchor_recovery",
+            "raw_continuous_vio_diagnostic_recovery",
         )
         self.assertTrue(replay["rtabmap_global_graph_incomplete"])
         upstream = process.call_args.kwargs["upstream_processing_report"]
         self.assertTrue(upstream["diagnostic_only"])
         self.assertEqual(upstream["rtabmap_reprocess_error"], str(reprocess_error))
 
-    def test_localized_map_does_not_recover_incomplete_graph_without_manual_evidence(self) -> None:
+    def test_localized_map_recovers_complete_raw_vio_without_manual_evidence(self) -> None:
         session = create_session(
             self.root,
             "SupermarketSession-NoManualAnchorRecovery",
@@ -2962,22 +3049,44 @@ class MapStudioApiTests(unittest.TestCase):
             ),
             mock.patch.object(
                 server.offline,
-                "assess_raw_continuous_vio_recovery",
-            ) as assess,
+                "recover_raw_continuous_vio_poses",
+                return_value=(
+                    [
+                        {
+                            "node_id": 1,
+                            "timestamp": 1.0,
+                            "x": 0.0,
+                            "y": 0.0,
+                            "yaw": 0.0,
+                        }
+                    ],
+                    {"status": "pass", "node_count": 2},
+                ),
+            ) as recover,
+            mock.patch.object(
+                server.localized,
+                "process_localized_session",
+                return_value={"current_updated": True},
+            ) as process,
+            mock.patch.object(server, "attach_offline_reports"),
+            mock.patch.object(server, "attach_acceleration_report"),
+            mock.patch.object(server, "find_factor_graph_binary", return_value=None),
+            mock.patch.object(server.base, "generate") as generate,
         ):
-            with self.assertRaisesRegex(
-                server.offline.OfflineProcessingError,
-                "Optimized pose coverage is incomplete",
-            ):
-                server.run_localized_map(
-                    {
-                        "session": str(session),
-                        "prior_map": str(prior_map),
-                        "options": {"gpu_backend": "cpu"},
-                    },
-                    output,
-                )
-        assess.assert_not_called()
+            server.run_localized_map(
+                {
+                    "session": str(session),
+                    "prior_map": str(prior_map),
+                    "options": {"gpu_backend": "cpu"},
+                },
+                output,
+            )
+        recover.assert_called_once_with(source_database, "ios_prior")
+        generate.assert_not_called()
+        self.assertEqual(
+            process.call_args.kwargs["replay_parameters"]["relative_trajectory_authority"],
+            "raw_continuous_vio_diagnostic_recovery",
+        )
 
     def test_localized_map_keeps_original_failure_when_raw_vio_is_not_continuous(self) -> None:
         session = create_session(
@@ -3032,8 +3141,11 @@ class MapStudioApiTests(unittest.TestCase):
             ),
             mock.patch.object(
                 server.offline,
-                "assess_raw_continuous_vio_recovery",
-                return_value={"status": "rejected", "reasons": ["step_jump"]},
+                "recover_raw_continuous_vio_poses",
+                return_value=(
+                    [],
+                    {"status": "rejected", "rejection_reasons": ["step_jump"]},
+                ),
             ),
         ):
             with self.assertRaisesRegex(
@@ -3049,7 +3161,7 @@ class MapStudioApiTests(unittest.TestCase):
                     output,
                 )
 
-    def test_raw_vio_recovery_still_requires_a_verified_anchor_after_strict_parse(self) -> None:
+    def test_raw_vio_diagnostic_recovery_ignores_unverified_manual_event_as_anchor(self) -> None:
         session = create_session(
             self.root,
             "SupermarketSession-UnverifiedManualRecovery",
@@ -3102,38 +3214,38 @@ class MapStudioApiTests(unittest.TestCase):
             ),
             mock.patch.object(
                 server.offline,
-                "assess_raw_continuous_vio_recovery",
-                return_value={"status": "pass", "node_count": 2},
-            ),
-            mock.patch.object(
-                server.localized,
-                "load_raw_continuous_vio_poses",
-                return_value=[server.localized.Pose(1, 1.0, 0.0, 0.0, 0.0)],
+                "recover_raw_continuous_vio_poses",
+                return_value=(
+                    [
+                        {
+                            "node_id": 1,
+                            "timestamp": 1.0,
+                            "x": 0.0,
+                            "y": 0.0,
+                            "yaw": 0.0,
+                        }
+                    ],
+                    {"status": "pass", "node_count": 2},
+                ),
             ),
             mock.patch.object(
                 server.localized,
                 "process_localized_session",
-                side_effect=server.localized.OfflineLocalizationError(
-                    "Raw continuous VIO recovery requires at least one verified manual anchor."
-                ),
+                return_value={"current_updated": True},
             ),
             mock.patch.object(server, "attach_offline_reports"),
             mock.patch.object(server, "attach_acceleration_report"),
             mock.patch.object(server, "find_factor_graph_binary", return_value=None),
             mock.patch.object(server.base, "generate") as generate,
         ):
-            with self.assertRaisesRegex(
-                server.localized.OfflineLocalizationError,
-                "verified manual anchor",
-            ):
-                server.run_localized_map(
-                    {
-                        "session": str(session),
-                        "prior_map": str(prior_map),
-                        "options": {"gpu_backend": "cpu"},
-                    },
-                    output,
-                )
+            server.run_localized_map(
+                {
+                    "session": str(session),
+                    "prior_map": str(prior_map),
+                    "options": {"gpu_backend": "cpu"},
+                },
+                output,
+            )
         generate.assert_not_called()
 
     def test_large_trajectory_without_loop_closure_requires_review(self) -> None:

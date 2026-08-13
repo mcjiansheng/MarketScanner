@@ -36,7 +36,7 @@ MapCase02 已在 2026-08-09 通过 PC 转换、v2 schema、确定性 canonical/p
 
 “测试诊断模式”仍只放宽其他不安全结果的草稿可见性，不放宽 review/publish gate：稳健硬门拒绝的手机约束不会参与求解，但仍完整写入 `localization_constraints.json`、`review_items.json` 和接受率/残差统计。报告固定写入 `diagnostic_mode=true`、`diagnostic_only=true` 和 `diagnostic_mode_enabled` 发布 blocker，因而不能提交为生产成果。
 
-若 `rtabmap-reprocess` 的优化图覆盖不完整或探索性补环产生不安全结果，普通会话仍按原错误拒绝。只有原始 `Node.pose` 全量有限、时间严格递增、相邻平移不超过 3 m、相邻旋转不超过 120°，且严格解析后至少存在一个上述可信 v3 人工锚点时，才使用 `raw_continuous_vio_manual_anchor_recovery` 生成 diagnostic-only 草稿。该路径不从不完整 `Admin.opt_poses` 渲染 2D/3D 点云成果，强制禁止发布，也不会修改原始数据库；文件非空但事件不可信时仍拒绝。
+若 `rtabmap-reprocess` 的优化图覆盖不完整或探索性补环产生不安全结果，工作台会单独检查原始 `Node.pose`。全量位姿有限、时间严格递增且相邻平移不超过 3 m、相邻旋转不超过 120°时，可用 `initialMapPose` 生成 `raw_continuous_vio_diagnostic_recovery` 草稿；可信 v3 人工事件继续作为更强绝对锚点。若仅绝对坐标出现大跳变，必须有至少两条独立短距离结构 Link 推导出唯一一致的跨 epoch 刚体变换，且缝合后重新通过连续性门；无桥接、存在多解或真实运动不连续仍按原错误拒绝。该路径不从不完整 `Admin.opt_poses` 渲染 2D/3D 点云成果，强制禁止发布，也不会修改原始数据库；reset 节点、Link、变换与修复前后指标完整写入报告。
 
 数据库轨迹用于先验地图定位时固定采用 `ios_prior` 坐标契约：从 native `R × ARKit × R⁻¹` 恢复手机 `(x,-z)` 和 yaw；地图成果渲染仍保留原选项以兼容既有输出。native 因子图对 RTAB‑Map reciprocal loop 做 canonical 确定性折叠，不因正反向独立细化的小差异整体中止。
 

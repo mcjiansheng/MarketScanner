@@ -3027,6 +3027,38 @@ class LocalizedPipelineTests(unittest.TestCase):
         )
         self.assertIsNotNone(LocalizedVersionStore(diagnostic_output).current())
 
+    def test_raw_vio_diagnostic_recovery_does_not_require_manual_anchor(self) -> None:
+        manual_path = self.segment / "manual_localization_events.jsonl"
+        manual_path.write_text("", encoding="utf-8")
+        output = self.root / "localized-raw-vio-diagnostic-recovery"
+        report = process_localized_session(
+            self.prior_map,
+            self.session,
+            self.poses,
+            self.source_database,
+            self.optimized_database,
+            output,
+            replay_parameters={
+                **DEFAULT_REPLAY_PARAMETERS,
+                "relative_trajectory_authority":
+                    "raw_continuous_vio_diagnostic_recovery",
+                "rtabmap_global_graph_incomplete": True,
+            },
+        )
+        self.assertTrue(report["current_updated"])
+        self.assertTrue(report["diagnostic_only"])
+        self.assertTrue(report["raw_vio_diagnostic_recovery"])
+        self.assertFalse(report["manual_anchor_recovery"])
+        self.assertFalse(report["publish_permitted"])
+        self.assertEqual(
+            report["relative_trajectory_authority"],
+            "raw_continuous_vio_diagnostic_recovery",
+        )
+        self.assertIn(
+            "raw_continuous_vio_diagnostic_recovery",
+            {item["code"] for item in report["publish_gate"]["blockers"]},
+        )
+
     def test_pc_set_anchor_cannot_claim_verified_phone_anchor_trust(self) -> None:
         initial_output = self.root / "localized-pc-anchor-base"
         first = process_localized_session(

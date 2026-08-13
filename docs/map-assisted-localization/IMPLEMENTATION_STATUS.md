@@ -102,6 +102,7 @@ P7 已实现 loopback-only server、每次启动随机且不落盘的 token、PO
 | 能力 | 状态 | 代码/证据 |
 | --- | --- | --- |
 | RTAB-Map 重处理前置和源库只读 | 已实现 | `run_localized_map` 强制 `rtabmap-reprocess`；前后 SHA‑256 一致 |
+| 图不完整时的 raw VIO 诊断恢复 | 已实现（不可发布） | 完整有限/time-ordered Node.pose 可用 initialMapPose 保留；坐标 epoch reset 仅在多条独立短 Link 唯一一致时缝合，输出完整审计且不修改源库 |
 | 先验地图派生修正 | 已修复并完成 Sam 只读回归 | 精确 `ios_prior` 契约；reciprocal canonical 折叠；native RTAB-Map/g2o 完整相对 SE(2) 因子图 4,442 节点收敛，最大修正 2.9638 m；仍是诊断 draft |
 | 在线/道路/人工约束与拒绝审计 | 已实现 | 在线结构约束、道路区域/方向低权重软约束、accepted/rejected residual、禁用约束、人工锚点 |
 | 通道切换审计 | 已实现 | 最终轨迹几何投影输出进入/离开时间、候选 margin、方向、weak/lost overlap、人工 assignment 和可能静默切换 |

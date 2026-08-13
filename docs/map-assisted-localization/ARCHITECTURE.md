@@ -43,8 +43,9 @@ PC prior-map localized
     -> native 完整相对 SE(2) 因子图
        （相对/闭环边 + 在线结构/道路软约束 + 严格人工绝对锚点）
        -> helper 缺失/失败时 bounded correction field draft fallback
-       -> 图不完整但 raw Node.pose 连续且有严格人工锚点时
-          raw_continuous_vio_manual_anchor_recovery diagnostic draft
+       -> 图不完整但 raw Node.pose 完整可恢复时
+          raw_continuous_vio_diagnostic_recovery diagnostic draft
+          （坐标系 reset 需多条独立短 Link 的唯一一致桥接）
     -> manifest v3 绑定 Recovery + tag burst sidecar
     -> 全部价签重算/重关联并检查现场确认冲突
     -> 自动质量门禁
@@ -90,7 +91,7 @@ PC prior-map localized
 - 算法候选与用户选择在 schema 中分离；用户确认不得修改算法字段、SLAM、地图对齐、node pose 或 localization constraint。替代候选使用 `shelfSegmentId + side` 精确 identity。
 - native helper 可用时阶段三运行完整相对 SE(2) 因子图；只有 helper 缺失或失败才标记 `bounded_correction_field`，该 fallback 不具备正式发布资格。可信人工锚点造成的大绝对 pose update 只能在 native caller 明确证明 gauge authority 时跳过绝对更新量门，相对边、闭环残差、图连通与 correction-field 梯度仍 fail closed。
 - bounded fallback 使用 O(N) 三对角精确求解连续 correction field，避免固定迭代在千节点轨迹上形成锚点尖峰。可信人工锚点允许大 maximum/P95 绝对修正进入 current draft，但相邻 correction 平移超过 0.5 m 或航向超过 15°仍阻断 review。
-- RTAB-Map 图不完整时，恢复路径必须同时满足 raw `Node.pose` 全量连续安全和严格解析后至少一个可信 v3 人工锚点；结果固定 diagnostic-only、不从坏 `Admin.opt_poses` 生成点云、不发布。无人工证据的坏闭环/大跳变继续拒绝。
+- RTAB-Map 图不完整时，恢复路径要求 raw `Node.pose` 全量有限、时间严格递增；相邻运动连续时可用 `initialMapPose` 保留低置信度轨迹，严格 v3 人工锚点提供更强地图 gauge。若绝对 Node.pose 因坐标 epoch 重置发生大跳变，至少两条独立短距离结构 Link 必须对同一刚体变换形成唯一一致，且缝合后步长/旋转仍安全；缺少桥接、多解或真实大跳变继续拒绝。结果固定 diagnostic-only、不从坏 `Admin.opt_poses` 生成点云、不发布。
 - 阶段三每次处理前后核对原数据库 SHA-256；所有必需 sidecar 严格校验 UTF‑8、JSON、format/version、身份、时间戳、大小和唯一 ID。失败不切换旧 current。
 - iOS 必需定位 sidecar 的每次追加都返回结构化结果；失败会粘性写入 `captureHealth` 并持续显示红色告警，同时停止新的地图修正、人工校正和价签确认，原始 DB 继续录制到用户结束。`metadata.json` 是 sidecar bundle 的最后提交标记：提交前失败可恢复录制；`finalized=true` 提交后 checkpoint 清理失败只能进入关闭数据库的待清理终态；证据不完整则提交 `finalized=false` 恢复包并终止会话，不能恢复 prior-map 录制。
 - PC 对已有地图会话同时要求显式 `finalized=true`、`localizationEvidenceComplete=true`、零必需写失败和空 blocker 列表，缺失旧字段也按不可处理拒绝。

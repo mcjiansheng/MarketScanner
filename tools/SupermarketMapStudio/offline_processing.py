@@ -704,6 +704,424 @@ def trajectory_metrics(poses: Dict[int, tuple[float, ...]]) -> Dict[str, Any]:
     }
 
 
+def _matrix_multiply(
+    first: tuple[float, ...], second: tuple[float, ...]
+) -> tuple[float, ...]:
+    return tuple(
+        (
+            sum(first[row * 4 + k] * second[k * 4 + column] for k in range(3))
+            if column < 3
+            else first[row * 4 + 3]
+            + sum(first[row * 4 + k] * second[k * 4 + 3] for k in range(3))
+        )
+        for row in range(3)
+        for column in range(4)
+    )
+
+
+def _matrix_inverse(matrix: tuple[float, ...]) -> tuple[float, ...]:
+    return (
+        matrix[0], matrix[4], matrix[8],
+        -(matrix[0] * matrix[3] + matrix[4] * matrix[7] + matrix[8] * matrix[11]),
+        matrix[1], matrix[5], matrix[9],
+        -(matrix[1] * matrix[3] + matrix[5] * matrix[7] + matrix[9] * matrix[11]),
+        matrix[2], matrix[6], matrix[10],
+        -(matrix[2] * matrix[3] + matrix[6] * matrix[7] + matrix[10] * matrix[11]),
+    )
+
+
+def _relative_transform(
+    first: tuple[float, ...], second: tuple[float, ...]
+) -> tuple[float, ...]:
+    return _matrix_multiply(_matrix_inverse(first), second)
+
+
+def _transform_translation_m(matrix: tuple[float, ...]) -> float:
+    return math.sqrt(matrix[3] ** 2 + matrix[7] ** 2 + matrix[11] ** 2)
+
+
+def _transform_rotation_degrees(matrix: tuple[float, ...]) -> float:
+    cosine = min(
+        1.0,
+        max(-1.0, (matrix[0] + matrix[5] + matrix[10] - 1.0) / 2.0),
+    )
+    return math.degrees(math.acos(cosine))
+
+
+def _raw_pose_inventory(
+    path: Path,
+) -> tuple[list[int], Dict[int, float], Dict[int, tuple[float, ...]]]:
+    try:
+        with closing(
+            sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
+        ) as connection:
+            rows = connection.execute(
+                "SELECT id, stamp, pose FROM Node WHERE id>0 ORDER BY id"
+            ).fetchall()
+    except sqlite3.Error as exc:
+        raise OfflineProcessingError(
+            f"Cannot read immutable raw VIO poses from {path}: {exc}"
+        ) from exc
+    node_ids: list[int] = []
+    stamps: Dict[int, float] = {}
+    poses: Dict[int, tuple[float, ...]] = {}
+    previous_stamp: Optional[float] = None
+    for node_id_value, stamp_value, blob in rows:
+        if (
+            isinstance(node_id_value, bool)
+            or not isinstance(node_id_value, int)
+            or node_id_value <= 0
+            or isinstance(stamp_value, bool)
+        ):
+            raise OfflineProcessingError("Raw Node.pose inventory is invalid.")
+        try:
+            stamp = float(stamp_value)
+        except (TypeError, ValueError) as exc:
+            raise OfflineProcessingError("Raw Node.pose timestamp is invalid.") from exc
+        matrix = base.parse_transform_matrix(blob) if isinstance(blob, bytes) else None
+        if (
+            not math.isfinite(stamp)
+            or (previous_stamp is not None and stamp <= previous_stamp)
+            or matrix is None
+            or not all(math.isfinite(value) for value in matrix)
+        ):
+            raise OfflineProcessingError(
+                "Raw Node.pose inventory is incomplete, non-finite, or not time ordered."
+            )
+        node_ids.append(node_id_value)
+        stamps[node_id_value] = stamp
+        poses[node_id_value] = matrix
+        previous_stamp = stamp
+    if not node_ids:
+        raise OfflineProcessingError("Raw Node.pose trajectory is empty.")
+    return node_ids, stamps, poses
+
+
+def _reset_bridge_candidates(
+    path: Path,
+    *,
+    previous_segment_ids: set[int],
+    next_segment_ids: set[int],
+    stitched_poses: Dict[int, tuple[float, ...]],
+    raw_poses: Dict[int, tuple[float, ...]],
+) -> list[Dict[str, Any]]:
+    candidates: list[Dict[str, Any]] = []
+    seen: set[tuple[int, int, int]] = set()
+    try:
+        with closing(
+            sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
+        ) as connection:
+            if "Link" not in set(base.sqlite_tables(connection)):
+                return []
+            rows = connection.execute(
+                "SELECT from_id, to_id, type, transform FROM Link "
+                "WHERE type IN (1,2,3) AND length(transform)=48"
+            )
+            for from_id_value, to_id_value, link_type_value, blob in rows:
+                from_id = int(from_id_value)
+                to_id = int(to_id_value)
+                link_type = int(link_type_value)
+                pair_key = (min(from_id, to_id), max(from_id, to_id), link_type)
+                if pair_key in seen:
+                    continue
+                if not (
+                    (from_id in previous_segment_ids and to_id in next_segment_ids)
+                    or (to_id in previous_segment_ids and from_id in next_segment_ids)
+                ):
+                    continue
+                link = base.parse_transform_matrix(blob)
+                if link is None or not all(math.isfinite(value) for value in link):
+                    continue
+                link_translation = _transform_translation_m(link)
+                link_rotation = _transform_rotation_degrees(link)
+                if link_translation > 2.0 or link_rotation > 90.0:
+                    continue
+                if from_id in previous_segment_ids:
+                    previous_id = from_id
+                    next_id = to_id
+                    mapping = _matrix_multiply(
+                        _matrix_multiply(stitched_poses[previous_id], link),
+                        _matrix_inverse(raw_poses[next_id]),
+                    )
+                else:
+                    previous_id = to_id
+                    next_id = from_id
+                    mapping = _matrix_multiply(
+                        _matrix_multiply(
+                            stitched_poses[previous_id], _matrix_inverse(link)
+                        ),
+                        _matrix_inverse(raw_poses[next_id]),
+                    )
+                if not all(math.isfinite(value) for value in mapping):
+                    continue
+                seen.add(pair_key)
+                candidates.append(
+                    {
+                        "from_id": from_id,
+                        "to_id": to_id,
+                        "previous_node_id": previous_id,
+                        "next_node_id": next_id,
+                        "type": link_type,
+                        "link_translation_m": link_translation,
+                        "link_rotation_deg": link_rotation,
+                        "mapping": mapping,
+                    }
+                )
+    except sqlite3.Error as exc:
+        raise OfflineProcessingError(
+            f"Cannot audit Link evidence for raw VIO recovery: {exc}"
+        ) from exc
+    return candidates
+
+
+def _mapping_difference(
+    first: tuple[float, ...], second: tuple[float, ...]
+) -> tuple[float, float]:
+    difference = _relative_transform(first, second)
+    return (
+        _transform_translation_m(difference),
+        _transform_rotation_degrees(difference),
+    )
+
+
+def _select_reset_mapping(
+    candidates: list[Dict[str, Any]],
+) -> tuple[Optional[Dict[str, Any]], list[Dict[str, Any]], Dict[str, Any]]:
+    if len(candidates) < 2:
+        return None, [], {"reason": "fewer_than_two_independent_short_links"}
+    consensus_sets: list[list[Dict[str, Any]]] = []
+    for candidate in candidates:
+        mapping = candidate["mapping"]
+        consensus_sets.append(
+            [
+                other
+                for other in candidates
+                if _mapping_difference(mapping, other["mapping"])[0] <= 0.50
+                and _mapping_difference(mapping, other["mapping"])[1] <= 10.0
+            ]
+        )
+    consensus_sets.sort(key=len, reverse=True)
+    best = consensus_sets[0]
+    if len(best) < 2:
+        return None, [], {"reason": "no_multi_link_transform_consensus"}
+    competing = [
+        group
+        for group in consensus_sets[1:]
+        if len(group) == len(best)
+        and not any(item in best for item in group)
+    ]
+    if competing:
+        return None, [], {"reason": "multiple_equal_transform_consensus_groups"}
+    selected = min(
+        best,
+        key=lambda item: sum(
+            _mapping_difference(item["mapping"], other["mapping"])[0]
+            + _mapping_difference(item["mapping"], other["mapping"])[1] / 20.0
+            for other in best
+        ),
+    )
+    translation_spread = max(
+        (_mapping_difference(selected["mapping"], item["mapping"])[0] for item in best),
+        default=0.0,
+    )
+    rotation_spread = max(
+        (_mapping_difference(selected["mapping"], item["mapping"])[1] for item in best),
+        default=0.0,
+    )
+    return selected, best, {
+        "candidate_count": len(candidates),
+        "consensus_count": len(best),
+        "maximum_consensus_translation_spread_m": round(translation_spread, 6),
+        "maximum_consensus_rotation_spread_deg": round(rotation_spread, 6),
+    }
+
+
+def recover_raw_continuous_vio_poses(
+    input_database: Path, horizontal_axes: str = "ios_prior"
+) -> tuple[list[Dict[str, Any]], Dict[str, Any]]:
+    """Recover an auditable diagnostic raw-VIO chain without changing SQLite.
+
+    A large absolute Node.pose jump is stitched only when at least two
+    independent, short RTAB-Map structural links agree on one rigid mapping
+    between the adjacent coordinate epochs. Ambiguous or unsupported jumps
+    remain fatal. The returned result is diagnostic-only and is never a claim
+    that RTAB-Map produced a complete optimized graph.
+    """
+    if horizontal_axes not in {"xy", "xz", "ios_prior"}:
+        raise OfflineProcessingError("Raw VIO horizontal axes are invalid.")
+    inspection = validate_capture_database(input_database)
+    node_ids, stamps, raw_poses = _raw_pose_inventory(input_database)
+    before_metrics = trajectory_metrics(raw_poses)
+    rejection_reasons: list[str] = []
+    if len(node_ids) != int(inspection.get("node_count", 0)):
+        rejection_reasons.append("Raw Node.pose coverage is incomplete.")
+    jump_indexes = [
+        index
+        for index in range(1, len(node_ids))
+        if _transform_translation_m(
+            _relative_transform(raw_poses[node_ids[index - 1]], raw_poses[node_ids[index]])
+        )
+        > 3.0
+        or _transform_rotation_degrees(
+            _relative_transform(raw_poses[node_ids[index - 1]], raw_poses[node_ids[index]])
+        )
+        > 120.0
+    ]
+    stitched_poses = dict(raw_poses)
+    reset_repairs: list[Dict[str, Any]] = []
+    segment_start = 0
+    for jump_sequence, jump_index in enumerate(jump_indexes):
+        previous_id = node_ids[jump_index - 1]
+        next_id = node_ids[jump_index]
+        next_jump_index = (
+            jump_indexes[jump_sequence + 1]
+            if jump_sequence + 1 < len(jump_indexes)
+            else len(node_ids)
+        )
+        previous_segment_ids = set(node_ids[segment_start:jump_index])
+        next_segment_ids = set(node_ids[jump_index:next_jump_index])
+        candidates = _reset_bridge_candidates(
+            input_database,
+            previous_segment_ids=previous_segment_ids,
+            next_segment_ids=next_segment_ids,
+            stitched_poses=stitched_poses,
+            raw_poses=raw_poses,
+        )
+        selected, consensus, selection_audit = _select_reset_mapping(candidates)
+        before_relative = _relative_transform(
+            stitched_poses[previous_id], raw_poses[next_id]
+        )
+        if selected is None:
+            rejection_reasons.append(
+                f"Raw VIO jump {previous_id}->{next_id} has no unique multi-Link coordinate-reset bridge "
+                f"({selection_audit['reason']})."
+            )
+            break
+        # The consensus determines the coordinate-epoch mapping. Prefer the
+        # agreeing bridge closest to the actual reset boundary for the applied
+        # transform and audit record, instead of letting a distant loop with a
+        # nearly identical mapping obscure which local continuity was repaired.
+        selected = min(
+            consensus,
+            key=lambda item: (
+                abs(int(item["previous_node_id"]) - previous_id)
+                + abs(int(item["next_node_id"]) - next_id),
+                float(item["link_translation_m"]),
+            ),
+        )
+        mapping = selected["mapping"]
+        for node_id in node_ids[jump_index:next_jump_index]:
+            stitched_poses[node_id] = _matrix_multiply(mapping, raw_poses[node_id])
+        after_relative = _relative_transform(
+            stitched_poses[previous_id], stitched_poses[next_id]
+        )
+        after_translation = _transform_translation_m(after_relative)
+        after_rotation = _transform_rotation_degrees(after_relative)
+        if after_translation > 3.0 or after_rotation > 120.0:
+            rejection_reasons.append(
+                f"Raw VIO reset bridge for {previous_id}->{next_id} remains discontinuous."
+            )
+            break
+        reset_repairs.append(
+            {
+                "format": "SupermarketRawVIOCoordinateResetRepair",
+                "version": 1,
+                "before_node_id": previous_id,
+                "after_node_id": next_id,
+                "before_timestamp": stamps[previous_id],
+                "after_timestamp": stamps[next_id],
+                "timestamp_gap_seconds": round(stamps[next_id] - stamps[previous_id], 6),
+                "before_step_translation_m": round(
+                    _transform_translation_m(before_relative), 6
+                ),
+                "before_step_rotation_deg": round(
+                    _transform_rotation_degrees(before_relative), 6
+                ),
+                "after_step_translation_m": round(after_translation, 6),
+                "after_step_rotation_deg": round(after_rotation, 6),
+                "selected_bridge": {
+                    key: selected[key]
+                    for key in (
+                        "from_id",
+                        "to_id",
+                        "previous_node_id",
+                        "next_node_id",
+                        "type",
+                        "link_translation_m",
+                        "link_rotation_deg",
+                    )
+                },
+                "applied_mapping_translation": {
+                    "x": mapping[3],
+                    "y": mapping[7],
+                    "z": mapping[11],
+                },
+                "applied_mapping_rotation_deg": _transform_rotation_degrees(mapping),
+                "consensus_links": [
+                    {
+                        key: item[key]
+                        for key in (
+                            "from_id",
+                            "to_id",
+                            "previous_node_id",
+                            "next_node_id",
+                            "type",
+                            "link_translation_m",
+                            "link_rotation_deg",
+                        )
+                    }
+                    for item in consensus
+                ],
+                **selection_audit,
+            }
+        )
+        segment_start = jump_index
+    after_metrics = trajectory_metrics(stitched_poses)
+    if not rejection_reasons and float(after_metrics["max_step_m"]) > 3.0:
+        rejection_reasons.append(
+            f"Recovered raw VIO neighbor step {after_metrics['max_step_m']:.2f} m exceeds 3.00 m."
+        )
+    if not rejection_reasons and float(after_metrics["max_step_rotation_deg"]) > 120.0:
+        rejection_reasons.append("Recovered raw VIO neighbor rotation exceeds 120 degrees.")
+    assessment = {
+        "format": "SupermarketRawContinuousVIORecoveryAssessment",
+        "version": 2,
+        "status": "rejected" if rejection_reasons else "pass",
+        "source": (
+            "immutable_node_pose_with_verified_link_reset_stitch"
+            if reset_repairs
+            else "immutable_node_pose"
+        ),
+        "diagnostic_only": True,
+        "pose_count": len(stitched_poses),
+        "node_count": inspection.get("node_count", 0),
+        "raw_before_recovery": before_metrics,
+        "raw": after_metrics,
+        "coordinate_reset_count": len(reset_repairs),
+        "coordinate_reset_repairs": reset_repairs,
+        "rejection_reasons": rejection_reasons,
+    }
+    poses = []
+    if not rejection_reasons:
+        for node_id in node_ids:
+            parsed = base.parse_rtabmap_transform_3d(
+                struct.pack("<12f", *stitched_poses[node_id]), horizontal_axes
+            )
+            if parsed is None:
+                raise OfflineProcessingError("Recovered raw VIO pose conversion failed.")
+            x, y, _height, yaw = parsed
+            poses.append(
+                {
+                    "node_id": node_id,
+                    "timestamp": stamps[node_id],
+                    "x": x,
+                    "y": y,
+                    "yaw": yaw,
+                }
+            )
+    return poses, assessment
+
+
 def optimization_displacement_metrics(
     raw: Dict[int, tuple[float, ...]], optimized: Dict[int, tuple[float, ...]]
 ) -> Dict[str, Any]:
@@ -919,33 +1337,8 @@ def assess_raw_continuous_vio_recovery(input_database: Path) -> Dict[str, Any]:
     It exists only so exact node-bound manual map anchors can recover a long,
     physically continuous VIO route when the replay graph is incomplete.
     """
-    raw = _database_poses(input_database, optimized=False)
-    inspection = inspect_database(input_database)
-    metrics = trajectory_metrics(raw)
-    rejection_reasons: list[str] = []
-    if len(raw) != int(inspection.get("node_count", 0)):
-        rejection_reasons.append("Raw Node.pose coverage is incomplete.")
-    if metrics["nonfinite_pose_count"]:
-        rejection_reasons.append("Raw Node.pose contains non-finite transforms.")
-    if float(metrics["max_step_m"]) > 3.0:
-        rejection_reasons.append(
-            f"Raw VIO neighbor step {metrics['max_step_m']:.2f} m exceeds 3.00 m."
-        )
-    if float(metrics["max_step_rotation_deg"]) > 120.0:
-        rejection_reasons.append(
-            "Raw VIO neighbor rotation exceeds 120 degrees."
-        )
-    return {
-        "format": "SupermarketRawContinuousVIORecoveryAssessment",
-        "version": 1,
-        "status": "rejected" if rejection_reasons else "pass",
-        "source": "immutable_node_pose",
-        "diagnostic_only": True,
-        "pose_count": len(raw),
-        "node_count": inspection.get("node_count", 0),
-        "raw": metrics,
-        "rejection_reasons": rejection_reasons,
-    }
+    _poses, assessment = recover_raw_continuous_vio_poses(input_database)
+    return assessment
 
 
 def run_reprocess(

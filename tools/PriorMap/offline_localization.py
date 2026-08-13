@@ -218,6 +218,7 @@ def normalize_replay_parameters(
     if authority not in {
         "rtabmap_reprocess_optimized_copy",
         "raw_continuous_vio_manual_anchor_recovery",
+        "raw_continuous_vio_diagnostic_recovery",
     }:
         raise OfflineLocalizationError(
             "Replay parameter relative_trajectory_authority is invalid."
@@ -227,7 +228,11 @@ def normalize_replay_parameters(
         raise OfflineLocalizationError(
             "Replay parameter rtabmap_global_graph_incomplete is invalid."
         )
-    if (authority == "raw_continuous_vio_manual_anchor_recovery") != graph_incomplete:
+    raw_vio_recovery = authority in {
+        "raw_continuous_vio_manual_anchor_recovery",
+        "raw_continuous_vio_diagnostic_recovery",
+    }
+    if raw_vio_recovery != graph_incomplete:
         raise OfflineLocalizationError(
             "Raw VIO recovery requires an explicitly incomplete RTAB-Map graph."
         )
@@ -5853,6 +5858,11 @@ def _render_localized_version(
         relative_trajectory_authority
         == "raw_continuous_vio_manual_anchor_recovery"
     )
+    raw_diagnostic_recovery = (
+        relative_trajectory_authority
+        == "raw_continuous_vio_diagnostic_recovery"
+    )
+    raw_vio_recovery = raw_manual_anchor_recovery or raw_diagnostic_recovery
 
     constraints: list[AbsoluteConstraint] = []
     constraint_records: list[dict[str, Any]] = []
@@ -6118,7 +6128,7 @@ def _render_localized_version(
         "optimized_database_sha256": optimized_db_hash,
     }
     full_factor_graph = False
-    if factor_graph_binary is not None and not raw_manual_anchor_recovery:
+    if factor_graph_binary is not None and not raw_vio_recovery:
         try:
             optimized, accepted, rejected, factor_graph_report = (
                 run_relative_se2_factor_graph(
@@ -6403,7 +6413,7 @@ def _render_localized_version(
     # Explicit diagnostic mode still marks the result diagnostic-only; it does
     # not weaken any review or publication gate.
     diagnostic_mode = bool(replay_parameters["diagnostic_mode"])
-    diagnostic_only = diagnostic_mode or raw_manual_anchor_recovery
+    diagnostic_only = diagnostic_mode or raw_vio_recovery
     allow_draft = bool(optimized) and not has_critical_jsonl_damage
     state_counts: dict[str, int] = {}
     for event in state_events:
@@ -6647,6 +6657,7 @@ def _render_localized_version(
             replay_parameters["rtabmap_global_graph_incomplete"]
         ),
         "manual_anchor_recovery": raw_manual_anchor_recovery,
+        "raw_vio_diagnostic_recovery": raw_diagnostic_recovery,
         "initial_map_pose_constraint_count": factor_graph_report.get(
             "initial_map_pose_constraint_count", 0
         ),
@@ -6717,14 +6728,14 @@ def _render_localized_version(
         ),
         (
             accepted_trusted_manual_anchor_count > 0
-            or raw_manual_anchor_recovery
+            or raw_vio_recovery
             or max_correction <= 2.0,
             "maximum_correction_above_2m",
             max_correction,
         ),
         (
             accepted_trusted_manual_anchor_count > 0
-            or raw_manual_anchor_recovery
+            or raw_vio_recovery
             or correction_p95 <= 1.0,
             "p95_correction_above_1m",
             correction_p95,
@@ -6787,7 +6798,11 @@ def _render_localized_version(
                 "code": (
                     "raw_continuous_vio_manual_anchor_recovery"
                     if raw_manual_anchor_recovery
-                    else "diagnostic_mode_enabled"
+                    else (
+                        "raw_continuous_vio_diagnostic_recovery"
+                        if raw_diagnostic_recovery
+                        else "diagnostic_mode_enabled"
+                    )
                 ),
                 "value": True,
             },
@@ -6842,6 +6857,10 @@ def _render_localized_version(
     if raw_manual_anchor_recovery:
         report["warnings"].append(
             "RTAB-Map 全局优化图不完整；本草稿使用完整原始连续 VIO、严格绑定的人工绝对锚点和地图结构约束重建。大绝对修正按地图坐标校准解释，相邻连续形变仍受门禁约束；结果仅供诊断与人工复核，禁止发布。"
+        )
+    elif raw_diagnostic_recovery:
+        report["warnings"].append(
+            "RTAB-Map 全局优化图不完整；本草稿使用完整原始 VIO 与扫描起点地图位姿保留有限轨迹。若检测到采集坐标系重置，仅在多条独立短 Link 对同一刚体变换达成一致后缝合；结果仅供诊断与人工复核，禁止发布。"
         )
     if publish_blockers:
         report["warnings"].append(

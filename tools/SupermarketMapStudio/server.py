@@ -2128,9 +2128,9 @@ def run_localized_map(
     original_segments = base.discover_segments(session, config)
     if len(original_segments) != 1 or original_segments[0].database_path is None:
         raise RequestError("先验地图离线优化只接受一个已完成的连续扫描数据库。")
-    raw_manual_events = original_segments[0].directory / "manual_localization_events.jsonl"
-    has_persisted_manual_events = raw_manual_events.is_file() and raw_manual_events.stat().st_size > 0
     raw_vio_recovery = False
+    raw_vio_recovery_authority: Optional[str] = None
+    recovered_raw_pose_values: Optional[List[Dict[str, Any]]] = None
     try:
         database_overrides, offline_report = reprocess_single_session(
             session,
@@ -2144,14 +2144,16 @@ def run_localized_map(
             (10, 62),
         )
     except offline.OfflineProcessingError as exc:
-        if not has_persisted_manual_events:
-            raise
-        raw_recovery_assessment = offline.assess_raw_continuous_vio_recovery(
-            original_segments[0].database_path
+        recovered_raw_pose_values, raw_recovery_assessment = (
+            offline.recover_raw_continuous_vio_poses(
+                original_segments[0].database_path,
+                "ios_prior",
+            )
         )
         if raw_recovery_assessment["status"] != "pass":
             raise
         raw_vio_recovery = True
+        raw_vio_recovery_authority = "raw_continuous_vio_diagnostic_recovery"
         database_overrides = {
             original_segments[0].index: str(original_segments[0].database_path)
         }
@@ -2159,7 +2161,7 @@ def run_localized_map(
             "format": "SupermarketOfflineProcessingReport",
             "version": 1,
             "status": "diagnostic_recovery",
-            "strategy": "raw_continuous_vio_manual_anchor_recovery",
+            "strategy": raw_vio_recovery_authority,
             "diagnostic_only": True,
             "rtabmap_global_graph_incomplete": True,
             "rtabmap_reprocess_error": str(exc),
@@ -2167,14 +2169,14 @@ def run_localized_map(
             "input": offline.inspect_database(original_segments[0].database_path),
             "output": offline.inspect_database(original_segments[0].database_path),
             "execution": {
-                "profile": "manual_anchor_recovery_v1",
+                "profile": "raw_continuous_vio_diagnostic_recovery_v2",
                 "selected_pass_profile": None,
             },
             "adaptive": {
                 "profile": offline.ADAPTIVE_PROFILE,
                 "selected_pass": None,
                 "discovery_required": True,
-                "recovery_reason": "rtabmap_reprocess_unpublishable_with_persisted_manual_evidence",
+                "recovery_reason": "rtabmap_reprocess_unpublishable_but_raw_vio_recoverable",
             },
             "error_optimization": {
                 "status": "rejected",
@@ -2186,8 +2188,8 @@ def run_localized_map(
         report_progress(
             progress,
             62,
-            "人工锚点连续轨迹恢复",
-            "RTAB-Map 全局图不完整，正在用完整原始 VIO 与严格人工锚点生成诊断草稿",
+            "连续轨迹诊断恢复",
+            "RTAB-Map 全局图不完整，正在保留完整原始 VIO；坐标系重置只使用多 Link 一致证据缝合",
         )
     report_progress(progress, 64, "生成 RTAB-Map 成果", "正在用优化数据库生成兼容的 2D/3D 地图成果")
     args = SimpleNamespace(
@@ -2234,10 +2236,16 @@ def run_localized_map(
         {key: Path(value) for key, value in database_overrides.items()},
     )
     poses = (
-        localized.load_raw_continuous_vio_poses(
-            original_segments[0].database_path,
-            localization_config.horizontal_axes,
-        )
+        [
+            localized.Pose(
+                node_id=int(item["node_id"]),
+                timestamp=float(item["timestamp"]),
+                x=float(item["x"]),
+                y=float(item["y"]),
+                yaw=float(item["yaw"]),
+            )
+            for item in (recovered_raw_pose_values or [])
+        ]
         if raw_vio_recovery
         else [
             localized.Pose(
@@ -2283,7 +2291,7 @@ def run_localized_map(
             "auto_align_segments": config.auto_align_segments,
             "diagnostic_mode": data.get("diagnostic_mode") is True,
             "relative_trajectory_authority": (
-                "raw_continuous_vio_manual_anchor_recovery"
+                raw_vio_recovery_authority
                 if raw_vio_recovery
                 else "rtabmap_reprocess_optimized_copy"
             ),
