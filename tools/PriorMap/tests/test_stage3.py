@@ -43,6 +43,9 @@ from tools.PriorMap.offline_localization import (
     build_road_soft_constraints,
     build_manual_aisle_constraints,
     bounded_correction_metrics,
+    reconstruct_gauge_neutral_trace,
+    resample_pose_sequence,
+    calibrated_trajectory_rows,
     infer_aisle_switch_sequence,
     apply_manual_edits,
     move_manual_edit_cursor,
@@ -56,6 +59,12 @@ from tools.PriorMap.offline_localization import (
     upgrade_manual_edits_v2,
     AbsoluteConstraint,
 )
+from tools.PriorMap.corridor_route_matcher import (
+    ObstacleIndex,
+    RouteAnchor,
+    match_corridor_route,
+)
+from tools.PriorMap.export_calibrated_trajectory import _final_poses, export
 from tools.PriorMap.localized_output_store import LocalizedVersionStore
 from tools.PriorMap.tests.test_prior_map import fixture_rows, write_workbook
 from tools.PriorMap.xlsx_to_prior_map import convert_workbook
@@ -724,6 +733,333 @@ class RobustSE2OptimizerTests(unittest.TestCase):
         self.assertLess(
             metrics["maximum_neighbor_correction_yaw_change_deg"], 15.0
         )
+
+    def test_gauge_neutral_trace_removes_automatic_and_manual_resets(self) -> None:
+        trace = [
+            {
+                "nodeTimebaseTimestamp": 1.0,
+                "rawPose": {"x_m": 0.0, "y_m": 0.0, "yaw_rad": 0.0},
+                "estimatedPose": {"x_m": 0.0, "y_m": 0.0, "yaw_rad": 0.0},
+                "correctionStepApplied": False,
+            },
+            {
+                "nodeTimebaseTimestamp": 2.0,
+                "rawPose": {"x_m": 1.0, "y_m": 0.0, "yaw_rad": 0.0},
+                "estimatedPose": {"x_m": 11.0, "y_m": 0.0, "yaw_rad": 0.0},
+                "correctionStepApplied": True,
+            },
+            {
+                "nodeTimebaseTimestamp": 3.0,
+                "rawPose": {"x_m": 12.0, "y_m": 0.0, "yaw_rad": 0.0},
+                "estimatedPose": {"x_m": 12.0, "y_m": 0.0, "yaw_rad": 0.0},
+                "correctionStepApplied": False,
+            },
+            {
+                "nodeTimebaseTimestamp": 4.0,
+                "rawPose": {"x_m": 30.0, "y_m": 5.0, "yaw_rad": 0.0},
+                "estimatedPose": {"x_m": 30.0, "y_m": 5.0, "yaw_rad": 0.0},
+                "correctionStepApplied": False,
+            },
+            {
+                "nodeTimebaseTimestamp": 5.0,
+                "rawPose": {"x_m": 31.0, "y_m": 5.0, "yaw_rad": 0.0},
+                "estimatedPose": {"x_m": 31.0, "y_m": 5.0, "yaw_rad": 0.0},
+                "correctionStepApplied": False,
+            },
+        ]
+        recovered, audit = reconstruct_gauge_neutral_trace(
+            trace,
+            [
+                {
+                    "node_timebase_frame_timestamp": 3.5,
+                    "confirmed_map_pose": {
+                        "x_m": 30.0,
+                        "y_m": 5.0,
+                        "yaw_rad": 0.0,
+                    },
+                }
+            ],
+        )
+        self.assertEqual(audit["automatic_alignment_reset_count"], 1)
+        self.assertEqual(audit["manual_alignment_reset_count"], 1)
+        self.assertEqual([round(item.x, 6) for item in recovered], [0, 1, 2, 2, 3])
+        self.assertEqual(audit["maximum_recovered_physical_step_m"], 1.0)
+
+    def test_resample_pose_sequence_preserves_target_inventory(self) -> None:
+        source = [
+            Pose(1, 0.0, 0.0, 0.0, 0.0),
+            Pose(2, 2.0, 2.0, 0.0, math.pi / 2.0),
+        ]
+        targets = [
+            Pose(10, 0.0, 0.0, 0.0, 0.0),
+            Pose(11, 1.0, 0.0, 0.0, 0.0),
+            Pose(12, 2.0, 0.0, 0.0, 0.0),
+        ]
+        result = resample_pose_sequence(source, targets)
+        self.assertEqual([item.node_id for item in result], [10, 11, 12])
+        self.assertEqual([item.x for item in result], [0.0, 1.0, 2.0])
+        self.assertAlmostEqual(result[1].yaw, math.pi / 4.0)
+
+    def test_calibrated_trajectory_rows_mark_ambiguity_and_manual_anchor(self) -> None:
+        poses = [
+            Pose(10, 1_700_000_000.0, 1.0, -2.0, 0.0),
+            Pose(11, 1_700_000_001.0, 2.0, -2.0, 0.1),
+            Pose(12, 1_700_000_002.0, 3.0, -2.0, 0.2),
+        ]
+        rows = calibrated_trajectory_rows(
+            poses,
+            {
+                "status": "matched_low_confidence",
+                "edge_ids": ["e1", "e1", "e2"],
+                "corridor_ids": ["c1", "c1", "c2"],
+                "ambiguity_intervals": [{"start_index": 1, "end_index": 2}],
+            },
+            [
+                AbsoluteConstraint(
+                    "manual",
+                    1,
+                    2.0,
+                    -2.0,
+                    0.1,
+                    1.0,
+                    "manual_anchor",
+                    {},
+                    trusted_absolute=True,
+                )
+            ],
+        )
+        self.assertEqual([row["node_id"] for row in rows], [10, 11, 12])
+        self.assertEqual(rows[0]["route_confidence"], "resolved_within_draft")
+        self.assertEqual(rows[1]["route_confidence"], "low")
+        self.assertEqual(rows[0]["corridor_identity_confidence"], "resolved_within_draft")
+        self.assertEqual(rows[1]["corridor_identity_confidence"], "low")
+        self.assertEqual(rows[0]["distance_scale_confidence"], "high")
+        self.assertEqual(rows[1]["manual_anchor_status"], "trusted_manual_anchor")
+        self.assertEqual(rows[1]["yaw_source"], "optimized_phone_pose")
+        self.assertIn("+", rows[1]["local_time_iso8601"])
+
+    def test_distance_scale_low_confidence_marks_all_exported_rows(self) -> None:
+        poses = [
+            Pose(1, 1.0, 0.0, 0.0, 0.0),
+            Pose(2, 2.0, 1.0, 0.0, 0.0),
+        ]
+        rows = calibrated_trajectory_rows(
+            poses,
+            {
+                "status": "matched_low_confidence",
+                "distance_scale_confidence": "low",
+                "reparameterization": {
+                    "segments": [
+                        {
+                            "start_index": 0,
+                            "end_index": 1,
+                            "distance_scale": 1.1,
+                        }
+                    ]
+                },
+            },
+            [],
+        )
+        self.assertEqual([row["route_confidence"] for row in rows], ["low", "low"])
+        self.assertEqual(
+            [row["corridor_identity_confidence"] for row in rows],
+            ["resolved_within_draft", "resolved_within_draft"],
+        )
+        self.assertEqual([row["distance_scale"] for row in rows], [1.1, 1.1])
+
+    def test_trajectory_geojson_preserves_phone_yaw_through_review_sampling(self) -> None:
+        baseline = [
+            Pose(1, 1.0, 0.0, 0.0, 0.25),
+            Pose(2, 2.0, 1.0, 0.0, 0.75),
+            Pose(3, 3.0, 2.0, 0.0, 1.25),
+        ]
+        trajectory = offline_localization._trajectory_geojson(
+            baseline, baseline, []
+        )
+        bounded = offline_localization._bounded_review_trajectory(
+            trajectory, maximum_points_per_layer=2
+        )
+        feature = next(
+            item
+            for item in bounded["features"]
+            if item["properties"]["layer"] == "prior_map_offline_optimized"
+        )
+        self.assertEqual(feature["properties"]["yaws_rad"], [0.25, 1.25])
+        poses = _final_poses(trajectory)
+        self.assertEqual([pose.yaw for pose in poses], [0.25, 0.75, 1.25])
+
+    def test_calibrated_export_rejects_legacy_route_tangent_yaw_fallback(self) -> None:
+        trajectory = offline_localization._trajectory_geojson(
+            [Pose(1, 1.0, 0.0, 0.0, 0.5)],
+            [Pose(1, 1.0, 0.0, 0.0, 0.5)],
+            [],
+        )
+        feature = next(
+            item
+            for item in trajectory["features"]
+            if item["properties"]["layer"] == "prior_map_offline_optimized"
+        )
+        del feature["properties"]["yaws_rad"]
+        with self.assertRaisesRegex(
+            ValueError, "optimized_trajectory_inventory_invalid"
+        ):
+            _final_poses(trajectory)
+
+    def test_calibrated_export_manifest_preserves_review_qualification(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            root = Path(value)
+            prior_map = root / "prior"
+            version = root / "v000001"
+            output = root / "export"
+            prior_map.mkdir()
+            version.mkdir()
+            json_write(
+                prior_map / "manifest.json",
+                {
+                    "prior_map_id": "map",
+                    "floors": [
+                        {
+                            "id": "1",
+                            "bounds": {
+                                "min_x_m": -1.0,
+                                "min_y_m": -1.0,
+                                "max_x_m": 2.0,
+                                "max_y_m": 1.0,
+                            },
+                        }
+                    ],
+                },
+            )
+            json_write(prior_map / "elements.json", {"elements": []})
+            json_write(prior_map / "road_graph.json", {"crosses": []})
+            trajectory = offline_localization._trajectory_geojson(
+                [Pose(1, 1.0, 0.0, 0.0, 0.25), Pose(2, 2.0, 1.0, 0.0, 0.5)],
+                [Pose(1, 1.0, 0.0, 0.0, 0.25), Pose(2, 2.0, 1.0, 0.0, 0.5)],
+                [],
+            )
+            report = {
+                "prior_map_id": "map",
+                "floor_id": "1",
+                "corridor_route_match": {
+                    "status": "matched_low_confidence",
+                    "route_confidence": "low",
+                    "ambiguity_intervals": [{"start_index": 0, "end_index": 1}],
+                    "distance_scale_confidence": "low",
+                    "edge_ids": ["e", "e"],
+                    "corridor_ids": ["c", "c"],
+                    "reparameterization": {
+                        "segments": [
+                            {
+                                "start_index": 0,
+                                "end_index": 1,
+                                "distance_scale": 1.1,
+                            }
+                        ]
+                    },
+                },
+                "manual_localization_event_audit": [],
+                "result_quality_status": "PARTIAL_REVIEW_REQUIRED",
+                "partial_result": True,
+                "review_gate": {
+                    "passed": False,
+                    "blockers": [
+                        {"code": "corridor_route_distance_scale_above_5pct"}
+                    ],
+                },
+                "publish_permitted": False,
+            }
+            json_write(version / "optimized_map_trajectory.geojson", trajectory)
+            json_write(version / "localization_report.json", report)
+            files = []
+            for name in (
+                "optimized_map_trajectory.geojson",
+                "localization_report.json",
+            ):
+                path = version / name
+                files.append(
+                    {
+                        "file": name,
+                        "bytes": path.stat().st_size,
+                        "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                    }
+                )
+            json_write(
+                version / "version_manifest.json",
+                {
+                    "format": "MarketScannerLocalizedVersionManifest",
+                    "files": files,
+                },
+            )
+            manifest = export(prior_map, version, output)
+            self.assertEqual(
+                manifest["result_quality_status"], "PARTIAL_REVIEW_REQUIRED"
+            )
+            self.assertTrue(manifest["partial_result"])
+            self.assertFalse(manifest["review_gate_passed"])
+            self.assertFalse(manifest["publish_permitted"])
+            self.assertEqual(manifest["corridor_identity_confidence"], "low")
+            self.assertEqual(manifest["distance_scale_confidence"], "low")
+            self.assertEqual(
+                manifest["review_blocker_codes"],
+                ["corridor_route_distance_scale_above_5pct"],
+            )
+
+    def test_obstacle_index_rejects_points_and_crossing_segments(self) -> None:
+        index = ObstacleIndex(
+            [((1.0, -1.0), (2.0, -1.0), (2.0, 1.0), (1.0, 1.0))],
+            clearance_m=0.05,
+        )
+        self.assertTrue(index.point_blocked((1.5, 0.0)))
+        self.assertFalse(index.point_blocked((0.0, 0.0)))
+        self.assertTrue(index.segment_blocked((0.0, 0.0), (3.0, 0.0)))
+        self.assertFalse(index.segment_blocked((0.0, 2.0), (3.0, 2.0)))
+
+    def test_route_match_uses_connected_u_turn_and_never_crosses_shelf(self) -> None:
+        graph = {
+            "nodes": [
+                {"id": "a", "floor_id": "1", "position_m": [0.0, 0.0]},
+                {"id": "b", "floor_id": "1", "position_m": [0.0, 4.0]},
+                {"id": "c", "floor_id": "1", "position_m": [4.0, 4.0]},
+                {"id": "d", "floor_id": "1", "position_m": [4.0, 0.0]},
+            ],
+            "crosses": [
+                {"id": "left", "floor_id": "1", "width_m": 2.0},
+                {"id": "top", "floor_id": "1", "width_m": 2.0},
+                {"id": "right", "floor_id": "1", "width_m": 2.0},
+            ],
+            "edges": [
+                {"id": "ab", "floor_id": "1", "from": "a", "to": "b", "cross_ids": ["left"]},
+                {"id": "bc", "floor_id": "1", "from": "b", "to": "c", "cross_ids": ["top"]},
+                {"id": "cd", "floor_id": "1", "from": "c", "to": "d", "cross_ids": ["right"]},
+            ],
+        }
+        physical = [
+            Pose(index + 1, float(index), *point, 0.0)
+            for index, point in enumerate(
+                [(0, 0), (0, 2), (0, 4), (2, 4), (4, 4), (4, 2), (4, 0)]
+            )
+        ]
+        result = match_corridor_route(
+            physical,
+            physical,
+            graph,
+            "1",
+            [((1.0, -0.5), (3.0, -0.5), (3.0, 3.5), (1.0, 3.5))],
+            [RouteAnchor(6, 4.0, 0.0, 0.5, "end")],
+            maximum_candidates=8,
+            search_radius_m=3.0,
+            obstacle_clearance_m=0.05,
+        )
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result.audit["point_obstacle_penetration_count"], 0)
+        self.assertEqual(result.audit["obstacle_crossing_segment_count"], 0)
+        self.assertEqual(result.audit["topological_discontinuity_count"], 0)
+        self.assertLess(result.audit["maximum_step_m"], 2.1)
+        self.assertIn("maximum_physical_step_m", result.audit)
+        self.assertIn("maximum_step_excess_m", result.audit)
+        self.assertIn("distance_scale_confidence", result.audit)
+        self.assertIn("maximum_distance_scale_deviation", result.audit)
 
     def test_road_soft_constraints_are_local_bounded_and_direction_aware(self) -> None:
         baseline = [

@@ -1,6 +1,6 @@
 # 已有地图辅助扫描数据格式
 
-> 文档状态：**当前有效**。最后核对日期：2026-08-11。
+> 文档状态：**当前有效**。最后核对日期：2026-08-14。
 
 ## 会话元数据
 
@@ -184,7 +184,24 @@ localized/
 
 `localization_report.json` 包含地图/会话/数据库 hash、直接从 source/optimized SQLite `Node` 表和导出轨迹交叉计算的节点覆盖/缺失/重复/时间范围、三条轨迹长度、修正分布、绝对约束和相对边残差、weak/lost 时长、约束接受/拒绝、标签 observation coverage、review/publish blockers 和 `publish_state`。测试诊断结果还固定记录 `diagnostic_mode`、`diagnostic_only` 和 `ignored_conflicting_source_constraint_count`；它可以推进工作用 `draft/current` 以便加载复核，但 `publish_gate` 必含 `diagnostic_mode_enabled` blocker。`factor_graph_report.json` version 1 保存 native solver/DB 版本、input identity、optimized DB SHA-256、canonical factor digest、Node/Factor inventory、gauge/连通性、objective/iterations、残差分位数、拒绝/降权诊断及最终 poses。完整报告必须通过 Python 和 version store 两层复核。
 
-helper 可用且所有门通过时 `solver.type=relative_se2_factor_graph`、`full_factor_graph=true`；helper 缺失或失败时仍写报告，但回退为 `bounded_correction_field` draft，`published_capable=false`。旧 version manifest v1/v2 可继续只读解析；含 factor report 的普通 draft/review 使用 version manifest v3；正式 publication 把 exact Field Evidence v3 和 qualification manifest 纳入逐文件 hash tree，使用 version manifest v4。Field Evidence v3 的 `MarketScannerQualificationSourceBundle` v1 保存 exact plan/release/policy，`MarketScannerTrajectorySourceBundle` v1 保存 version manifest 与选定 source artifact bytes，`MarketScannerFieldRunInputBundle` v1 保存 exact 控制点 CSV 与 Device Evidence bytes；发布检查从这些 bytes 重新派生摘要。Field v3 stable-read 上限 128 MiB，单个 CSV/Device Evidence 各 16 MiB；Windows descriptor 使用 `O_BINARY` 保留包括 CRLF 在内的磁盘原始字节；路径元数据和已打开 descriptor/Windows handle 元数据只在各自 API 内做读取前后比较，避免跨 API 表示差异误拒绝；主 descriptor 在读取前后的同类 path descriptor 身份绑定完成前保持打开，因此路径替换、临时替换后恢复、descriptor 内容变化和部分读取继续失败关闭；v4 resolve 不允许回退到外部绝对 evidence 路径。
+长会话成功生成道路复核草稿时，`localization_report.json` 还包含 `gauge_neutral_physical_trace` 与 `corridor_route_match`。前者记录 trace/node 数、自动/人工 alignment reset 数、输入 map-gauge 最大跳变、恢复后最大物理步长和物理里程；后者使用 `MarketScannerCorridorRouteMatchAudit` version 1，记录 matcher、逐节点 `edge_ids/corridor_ids`、货架内点、穿越结构线段、道路拓扑断裂、最大路线/物理步长、路线/物理里程、`ambiguity_intervals`、通道身份置信度、人工锚点残差以及分段 `distance_scale`。任一分段尺度与 1.0 偏差超过 5% 时，`distance_scale_confidence=low` 并加入 `corridor_route_distance_scale_above_5pct`；结果文件仍完整写出，但 review/publish 均不得通过。
+
+`optimized_map_trajectory.geojson` 的 `rtabmap_optimized`、`prior_map_offline_optimized` 和可用时的 `online_localization` feature properties 均保存 `timestamps`、`node_ids` 与同长度 `yaws_rad`。`yaws_rad` 是对应地图 gauge 下的手机朝向；道路切线仅表示移动方向，不能代替手机 yaw。任何坐标、时间、node ID、yaw 长度不一致或非有限值都使校准坐标导出拒绝执行。
+
+helper 可用且所有门通过时 `solver.type=relative_se2_factor_graph`、`full_factor_graph=true`；helper 缺失或失败时仍写报告，但回退为 `bounded_correction_field` draft，`published_capable=false`。长会话的最终复核路线可使用 `solver.type=gauge_neutral_free_space_road_route`：native factor graph 报告继续保留，`full_factor_graph=false`、`published_capable=false`，`continuity_gate_authority=gauge_neutral_free_space_road_route`，旧 correction-field gradient 只作诊断。旧 version manifest v1/v2 可继续只读解析；含 factor report 的普通 draft/review 使用 version manifest v3；正式 publication 把 exact Field Evidence v3 和 qualification manifest 纳入逐文件 hash tree，使用 version manifest v4。Field Evidence v3 的 `MarketScannerQualificationSourceBundle` v1 保存 exact plan/release/policy，`MarketScannerTrajectorySourceBundle` v1 保存 version manifest 与选定 source artifact bytes，`MarketScannerFieldRunInputBundle` v1 保存 exact 控制点 CSV 与 Device Evidence bytes；发布检查从这些 bytes 重新派生摘要。Field v3 stable-read 上限 128 MiB，单个 CSV/Device Evidence 各 16 MiB；Windows descriptor 使用 `O_BINARY` 保留包括 CRLF 在内的磁盘原始字节；路径元数据和已打开 descriptor/Windows handle 元数据只在各自 API 内做读取前后比较，避免跨 API 表示差异误拒绝；主 descriptor 在读取前后的同类 path descriptor 身份绑定完成前保持打开，因此路径替换、临时替换后恢复、descriptor 内容变化和部分读取继续失败关闭；v4 resolve 不允许回退到外部绝对 evidence 路径。
+
+不可变 localized version 不被普通导出修改。`tools/PriorMap/export_calibrated_trajectory.py` 先复核 `version_manifest.json` 中的轨迹和定位报告字节数/SHA，再在 version 外的独立目录生成：
+
+```text
+calibrated_trajectory_exports/
+  calibrated_positions_by_node.csv
+  calibrated_positions_1s.csv
+  calibrated_trajectory_on_prior_map.png
+  calibrated_trajectory_timestamped.png
+  export_manifest.json
+```
+
+节点级与秒级 CSV 字段包括 Unix 秒、本地 ISO-8601 时间、`x_m/y_m`、`yaw_rad/yaw_deg`、`yaw_source=optimized_phone_pose`、nearest node、道路 edge/corridor、`route_confidence`、`corridor_identity_confidence`、`distance_scale`、`distance_scale_confidence` 和人工锚点状态。低置信度与不可发布状态必须原样传播到导出 manifest，不能因为能生成 PNG/CSV 就提升结果资格。
 
 `localized_review.json` 是 Map Studio 的有界联动复核视图数据，包含先验结构、三条轨迹、价签、问题列表和明确的 `view_limits`/截断标记；它是派生展示文件，不替代各权威成果文件。
 

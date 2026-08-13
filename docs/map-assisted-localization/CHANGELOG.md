@@ -1,6 +1,15 @@
 # 地图辅助定位变更记录
 
-> 文档状态：**当前有效**。最后核对日期：2026-08-12。
+> 文档状态：**当前有效**。最后核对日期：2026-08-14。
+
+## 2026-08-14 — Gauge-neutral 自由空间道路路线恢复
+
+- 修复长距离 `localization_trace.rawPose` 的坐标语义错误：该字段已经经过当时可变的 ARKit→地图 alignment 投影，自动结构 correction、人工重定位和坐标 epoch 重置属于 map gauge 变化，不是手机物理位移。PC 新增 gauge-neutral 恢复：普通帧累计相邻相对 SE(2)，自动 correction 后从前一 `estimatedPose` 续算，人工重定位后的首个 post-reset sample 物理位移记为零，再按数据库节点时间戳重采样。
+- 长会话不再先运行通道方向场整体旋转，也不再逐点吸附最近通道。新增 `bounded_free_space_road_hmm_v1`，联合 gauge-neutral 相对运动、严格 exact-node 人工绝对锚点、`road_graph` 连通性和货架/固定结构多边形；不可达转移、结构内节点和穿越结构的线段均拒绝。选中的完整道路访问序列按物理累计距离分段参数化，保留回头、U-turn 和围绕货架的绕行。
+- 平行通道身份多解通过 `ambiguity_intervals` 和 `corridor_identity_confidence=low` 保留；路线长度与物理里程任一锚点分段偏差超过 5% 时，输出继续生成但 `distance_scale_confidence=low`，review/publish gate 加入 `corridor_route_distance_scale_above_5pct`。低置信度不再等同于处理失败，也不得伪装成唯一正确通道。
+- `optimized_map_trajectory.geojson` 的三个轨迹层新增逐节点 `yaws_rad`。独立校准轨迹导出生成节点级 CSV、本地时间秒级 CSV、先验地图预览和时间标记预览；`yaw_source=optimized_phone_pose`，明确禁止用运动路线切线替代真实手机朝向。
+- 真实 `SupermarketSession-20260811-103343`（2284 nodes）验证：输入 map-gauge 最大跳变 6.570 m，恢复后 trace 最大物理步长 0.514 m，节点级最大物理步长 0.850 m；最终自由空间路线货架/固定结构内点 0、穿越结构线段 0、道路拓扑断裂 0，最大路线相邻步长 0.951 m。物理里程 820.029 m、路线里程 891.910 m，三个锚点分段尺度为 1.1188 / 1.0612 / 1.1054，因此结果正确保留为 `PARTIAL_REVIEW_REQUIRED`、`publish_permitted=false`，不能宣称生产发布 GO 或通道身份已经唯一确定。
+- 最终源码回归为 PriorMap 291/291、Map Studio 120/120，Python 语法和补丁格式通过；原始约 995 MB 数据库 SHA-256、inode、大小和 mtime 均未变化。真机/LiDAR/现场闭合路线与测量控制点验收仍待执行。
 
 ## 2026-08-13 — 完整 raw VIO 草稿与坐标系重置缝合
 

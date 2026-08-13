@@ -45,10 +45,15 @@ from .localized_output_store import (
 from .prior_map_schema import load_json, validate_package
 from .factor_graph_runner import FactorGraphRunnerError, run_relative_se2_factor_graph
 from .generated_mobile_evidence_contracts import MOBILE_EVIDENCE_CONTRACTS
+from .corridor_route_matcher import (
+    RouteAnchor,
+    match_corridor_route,
+    obstacle_polygons,
+)
 
 
 FORMAT_VERSION = 1
-TOOL_VERSION = "MarketScanner-RepairV2"
+TOOL_VERSION = "MarketScanner-RepairV3"
 COORDINATE_CONTRACT_VERSION = 1
 HUBER_TRANSLATION_M = 0.45
 HUBER_YAW_RAD = math.radians(10)
@@ -4600,6 +4605,231 @@ def align_relative_trajectory(
     return result
 
 
+def reconstruct_gauge_neutral_trace(
+    trace: Sequence[dict[str, Any]],
+    manual_events: Sequence[dict[str, Any]] = (),
+) -> tuple[list[Pose], dict[str, Any]]:
+    """Recover continuous physical motion from a mutable map-gauge trace.
+
+    ``rawPose`` is projected through the phone's current map/ARKit alignment.
+    Accepted structure corrections and manual relocalizations replace that
+    alignment, so the next raw pose can jump even while the operator is
+    stationary.  A correction frame publishes the pre-reset ``rawPose`` and
+    post-reset ``estimatedPose``.  The following physical increment must
+    therefore start at the previous estimated pose.  Exact manual anchors are
+    similar gauge resets, but have no correction-frame flag; their confirmed
+    map pose identifies the first post-reset raw sample.
+
+    The returned trajectory preserves only relative physical increments.  Its
+    first pose is kept in the current map frame so downstream route matching
+    can use the selected scan start as an initial hint.
+    """
+
+    records: list[tuple[float, tuple[float, float, float], tuple[float, float, float], bool]] = []
+    for record in trace:
+        if not isinstance(record, dict):
+            continue
+        timestamp = _strict_number(
+            _field(record, "node_timebase_timestamp", "nodeTimebaseTimestamp")
+        )
+        raw = _pose_from(_field(record, "raw_pose", "rawPose"))
+        estimated = _pose_from(_field(record, "estimated_pose", "estimatedPose"))
+        if timestamp is None or raw is None or estimated is None:
+            continue
+        records.append(
+            (
+                timestamp,
+                raw,
+                estimated,
+                record.get("correctionStepApplied") is True
+                or record.get("correction_step_applied") is True,
+            )
+        )
+    if not records:
+        return [], {
+            "format": "MarketScannerGaugeNeutralTraceAudit",
+            "version": 1,
+            "status": "unavailable",
+            "reason": "no_complete_trace_records",
+        }
+
+    manual_resets: dict[int, dict[str, Any]] = {}
+    timestamps = [record[0] for record in records]
+    for sequence, event in enumerate(manual_events, start=1):
+        if not isinstance(event, dict):
+            continue
+        event_timestamp = _strict_number(
+            event.get("node_timebase_frame_timestamp")
+            if event.get("node_timebase_frame_timestamp") is not None
+            else event.get("nodeTimebaseFrameTimestamp")
+        )
+        confirmed = _pose_from(event.get("confirmed_map_pose"))
+        if event_timestamp is None or confirmed is None:
+            continue
+        insertion = min(
+            range(len(timestamps)),
+            key=lambda index: abs(timestamps[index] - event_timestamp),
+        )
+        # The anchor reset may appear in the closest sample or the immediately
+        # following sample.  Select the raw pose nearest to the confirmed map
+        # pose; this uses the anchor only to identify a gauge boundary, never
+        # as a physical displacement measurement.
+        candidates = [
+            index
+            for index in range(max(1, insertion - 1), min(len(records), insertion + 3))
+        ]
+        if not candidates:
+            continue
+        reset_index = min(
+            candidates,
+            key=lambda index: math.hypot(
+                records[index][1][0] - confirmed[0],
+                records[index][1][1] - confirmed[1],
+            ),
+        )
+        manual_resets[reset_index] = {
+            "event_id": str(event.get("event_id") or f"manual-{sequence:06d}"),
+            "event_timestamp": event_timestamp,
+            "trace_timestamp": records[reset_index][0],
+            "confirmed_map_pose": confirmed,
+        }
+
+    first_raw = records[0][1]
+    recovered = [Pose(1, records[0][0], first_raw[0], first_raw[1], first_raw[2])]
+    automatic_reset_count = 0
+    manual_reset_count = 0
+    maximum_input_step = 0.0
+    maximum_output_step = 0.0
+    for index in range(1, len(records)):
+        previous_raw = records[index - 1][1]
+        previous_estimated = records[index - 1][2]
+        current_raw = records[index][1]
+        maximum_input_step = max(
+            maximum_input_step,
+            math.hypot(
+                current_raw[0] - previous_raw[0],
+                current_raw[1] - previous_raw[1],
+            ),
+        )
+        if index in manual_resets:
+            dx = 0.0
+            dy = 0.0
+            dyaw = 0.0
+            manual_reset_count += 1
+        else:
+            origin = previous_estimated if records[index - 1][3] else previous_raw
+            dx_map = current_raw[0] - origin[0]
+            dy_map = current_raw[1] - origin[1]
+            cosine = math.cos(-origin[2])
+            sine = math.sin(-origin[2])
+            dx = cosine * dx_map - sine * dy_map
+            dy = sine * dx_map + cosine * dy_map
+            dyaw = _normalize_angle(current_raw[2] - origin[2])
+            if records[index - 1][3]:
+                automatic_reset_count += 1
+        previous = recovered[-1]
+        cosine = math.cos(previous.yaw)
+        sine = math.sin(previous.yaw)
+        next_x = previous.x + cosine * dx - sine * dy
+        next_y = previous.y + sine * dx + cosine * dy
+        maximum_output_step = max(
+            maximum_output_step,
+            math.hypot(next_x - previous.x, next_y - previous.y),
+        )
+        recovered.append(
+            Pose(
+                node_id=index + 1,
+                timestamp=records[index][0],
+                x=next_x,
+                y=next_y,
+                yaw=_normalize_angle(previous.yaw + dyaw),
+            )
+        )
+    return recovered, {
+        "format": "MarketScannerGaugeNeutralTraceAudit",
+        "version": 1,
+        "status": "recovered",
+        "trace_sample_count": len(recovered),
+        "automatic_alignment_reset_count": automatic_reset_count,
+        "manual_alignment_reset_count": manual_reset_count,
+        "maximum_input_map_gauge_step_m": round(maximum_input_step, 9),
+        "maximum_recovered_physical_step_m": round(maximum_output_step, 9),
+        "input_trajectory_length_m": _trajectory_length(
+            [
+                Pose(index + 1, record[0], record[1][0], record[1][1], record[1][2])
+                for index, record in enumerate(records)
+            ]
+        ),
+        "physical_trajectory_length_m": _trajectory_length(recovered),
+        "manual_resets": [
+            {
+                **value,
+                "confirmed_map_pose": {
+                    "x_m": value["confirmed_map_pose"][0],
+                    "y_m": value["confirmed_map_pose"][1],
+                    "yaw_rad": value["confirmed_map_pose"][2],
+                },
+            }
+            for _, value in sorted(manual_resets.items())
+        ],
+    }
+
+
+def resample_pose_sequence(
+    source: Sequence[Pose], targets: Sequence[Pose]
+) -> list[Pose]:
+    """Interpolate one timestamped pose sequence at another pose inventory."""
+
+    if not source:
+        return []
+    valid_source = [
+        pose
+        for pose in source
+        if pose.timestamp is not None and math.isfinite(float(pose.timestamp))
+    ]
+    if not valid_source:
+        return []
+    timestamps = [float(pose.timestamp) for pose in valid_source]
+    result: list[Pose] = []
+    cursor = 0
+    for target in targets:
+        if target.timestamp is None or not math.isfinite(float(target.timestamp)):
+            return []
+        timestamp = float(target.timestamp)
+        while cursor + 1 < len(timestamps) and timestamps[cursor + 1] < timestamp:
+            cursor += 1
+        if timestamp <= timestamps[0]:
+            value = valid_source[0]
+        elif timestamp >= timestamps[-1]:
+            value = valid_source[-1]
+        else:
+            first = valid_source[cursor]
+            second = valid_source[cursor + 1]
+            denominator = float(second.timestamp) - float(first.timestamp)
+            fraction = max(
+                0.0,
+                min(1.0, (timestamp - float(first.timestamp)) / denominator),
+            )
+            delta_yaw = _normalize_angle(second.yaw - first.yaw)
+            value = Pose(
+                node_id=target.node_id,
+                timestamp=target.timestamp,
+                x=first.x + fraction * (second.x - first.x),
+                y=first.y + fraction * (second.y - first.y),
+                yaw=_normalize_angle(first.yaw + fraction * delta_yaw),
+            )
+        result.append(
+            Pose(
+                node_id=target.node_id,
+                timestamp=target.timestamp,
+                x=value.x,
+                y=value.y,
+                yaw=value.yaw,
+            )
+        )
+    return result
+
+
 def apply_pose_delta_to_point(
     baseline_pose: Pose,
     optimized_pose: Pose,
@@ -5142,6 +5372,7 @@ def _trajectory_geojson(
                 "layer": "rtabmap_optimized",
                 "timestamps": [pose.timestamp for pose in baseline],
                 "node_ids": [pose.node_id for pose in baseline],
+                "yaws_rad": [pose.yaw for pose in baseline],
             },
             "geometry": {
                 "type": "LineString",
@@ -5154,6 +5385,12 @@ def _trajectory_geojson(
                 "layer": "prior_map_offline_optimized",
                 "timestamps": [pose.timestamp for pose in optimized],
                 "node_ids": [pose.node_id for pose in optimized],
+                # The route matcher changes the map gauge while preserving
+                # the phone's physical orientation relative to that gauge.
+                # Export the solved phone yaw explicitly: a route tangent is
+                # movement direction, not necessarily the way the phone was
+                # facing while the operator scanned a shelf.
+                "yaws_rad": [pose.yaw for pose in optimized],
             },
             "geometry": {
                 "type": "LineString",
@@ -5174,6 +5411,7 @@ def _trajectory_geojson(
                         if _pose_from(_field(record, "estimated_pose", "estimatedPose"))
                         is not None
                     ],
+                    "yaws_rad": [pose[2] for pose in online_points],
                 },
                 "geometry": {
                     "type": "LineString",
@@ -5182,6 +5420,239 @@ def _trajectory_geojson(
             },
         )
     return {"type": "FeatureCollection", "features": features}
+
+
+def manual_anchor_statuses(
+    poses: Sequence[Pose], constraints: Sequence[AbsoluteConstraint]
+) -> list[str | None]:
+    """Mark exact-node operator anchors without treating them as movement."""
+
+    statuses: list[str | None] = [None] * len(poses)
+    for constraint in constraints:
+        if (
+            constraint.kind == "manual_anchor"
+            and constraint.trusted_absolute
+            and 0 <= constraint.node_index < len(statuses)
+        ):
+            statuses[constraint.node_index] = "trusted_manual_anchor"
+    return statuses
+
+
+def calibrated_trajectory_rows(
+    poses: Sequence[Pose],
+    route_audit: dict[str, Any],
+    constraints: Sequence[AbsoluteConstraint],
+) -> list[dict[str, Any]]:
+    edge_ids = route_audit.get("edge_ids")
+    corridor_ids = route_audit.get("corridor_ids")
+    ambiguity_intervals = route_audit.get("ambiguity_intervals")
+    ambiguous = [False] * len(poses)
+    if isinstance(ambiguity_intervals, list):
+        for interval in ambiguity_intervals:
+            if not isinstance(interval, dict):
+                continue
+            try:
+                start = max(0, int(interval.get("start_index")))
+                end = min(len(poses) - 1, int(interval.get("end_index")))
+            except (TypeError, ValueError):
+                continue
+            for index in range(start, end + 1):
+                ambiguous[index] = True
+    anchor_statuses = manual_anchor_statuses(poses, constraints)
+    route_status = str(route_audit.get("status") or "unavailable")
+    distance_scale_confidence = str(
+        route_audit.get("distance_scale_confidence") or "high"
+    )
+    scale_segments = route_audit.get("reparameterization", {}).get("segments")
+    rows: list[dict[str, Any]] = []
+    for index, pose in enumerate(poses):
+        distance_scale = None
+        if isinstance(scale_segments, list):
+            for segment in scale_segments:
+                if not isinstance(segment, dict):
+                    continue
+                try:
+                    if int(segment.get("start_index")) <= index <= int(
+                        segment.get("end_index")
+                    ):
+                        distance_scale = segment.get("distance_scale")
+                        break
+                except (TypeError, ValueError):
+                    continue
+        corridor_identity_confidence = (
+            "low" if ambiguous[index] else "resolved_within_draft"
+        )
+        rows.append(
+            {
+                "node_id": pose.node_id,
+                "timestamp_unix_s": pose.timestamp,
+                "local_time_iso8601": (
+                    datetime.fromtimestamp(float(pose.timestamp), timezone.utc)
+                    .astimezone()
+                    .isoformat(timespec="milliseconds")
+                    if pose.timestamp is not None
+                    else None
+                ),
+                "x_m": pose.x,
+                "y_m": pose.y,
+                "yaw_rad": pose.yaw,
+                "yaw_deg": math.degrees(pose.yaw),
+                "yaw_source": "optimized_phone_pose",
+                "route_edge_id": (
+                    edge_ids[index]
+                    if isinstance(edge_ids, list) and index < len(edge_ids)
+                    else None
+                ),
+                "corridor_id": (
+                    corridor_ids[index]
+                    if isinstance(corridor_ids, list)
+                    and index < len(corridor_ids)
+                    else None
+                ),
+                "route_status": route_status,
+                "route_confidence": (
+                    "low"
+                    if ambiguous[index] or distance_scale_confidence == "low"
+                    else "resolved_within_draft"
+                ),
+                "corridor_identity_confidence": corridor_identity_confidence,
+                "distance_scale": distance_scale,
+                "distance_scale_confidence": distance_scale_confidence,
+                "manual_anchor_status": anchor_statuses[index],
+            }
+        )
+    return rows
+
+
+def write_calibrated_trajectory_exports(
+    output: Path,
+    poses: Sequence[Pose],
+    route_audit: dict[str, Any],
+    constraints: Sequence[AbsoluteConstraint],
+) -> None:
+    """Write node-level and one-second calibrated phone coordinates.
+
+    These tables are ordinary result artifacts, not publication evidence.  A
+    LOW_CONFIDENCE route remains exportable for diagnosis and human review;
+    the publish gate continues to prohibit production publication.
+    """
+
+    rows = calibrated_trajectory_rows(poses, route_audit, constraints)
+    fieldnames = [
+        "node_id",
+        "timestamp_unix_s",
+        "local_time_iso8601",
+        "x_m",
+        "y_m",
+        "yaw_rad",
+        "yaw_deg",
+        "yaw_source",
+        "route_edge_id",
+        "corridor_id",
+        "route_status",
+        "route_confidence",
+        "corridor_identity_confidence",
+        "distance_scale",
+        "distance_scale_confidence",
+        "manual_anchor_status",
+    ]
+    with (output / "calibrated_positions_by_node.csv").open(
+        "w", encoding="utf-8", newline=""
+    ) as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    one_second: list[dict[str, Any]] = []
+    if rows:
+        first_second = math.ceil(float(rows[0]["timestamp_unix_s"]))
+        last_second = math.floor(float(rows[-1]["timestamp_unix_s"]))
+        cursor = 0
+        for timestamp in range(first_second, last_second + 1):
+            while (
+                cursor + 1 < len(poses)
+                and float(poses[cursor + 1].timestamp) < timestamp
+            ):
+                cursor += 1
+            if timestamp <= float(poses[0].timestamp):
+                first_index = second_index = 0
+                fraction = 0.0
+            elif timestamp >= float(poses[-1].timestamp):
+                first_index = second_index = len(poses) - 1
+                fraction = 0.0
+            else:
+                first_index = cursor
+                second_index = min(cursor + 1, len(poses) - 1)
+                first_pose = poses[first_index]
+                second_pose = poses[second_index]
+                span = float(second_pose.timestamp) - float(first_pose.timestamp)
+                fraction = 0.0 if span <= 0.0 else (
+                    timestamp - float(first_pose.timestamp)
+                ) / span
+            first_pose = poses[first_index]
+            second_pose = poses[second_index]
+            yaw = _normalize_angle(
+                first_pose.yaw
+                + fraction * _normalize_angle(second_pose.yaw - first_pose.yaw)
+            )
+            nearest_index = (
+                first_index if fraction < 0.5 else second_index
+            )
+            nearest = rows[nearest_index]
+            one_second.append(
+                {
+                    "timestamp_unix_s": timestamp,
+                    "local_time_iso8601": (
+                        datetime.fromtimestamp(timestamp, timezone.utc)
+                        .astimezone()
+                        .isoformat(timespec="seconds")
+                    ),
+                    "x_m": first_pose.x
+                    + fraction * (second_pose.x - first_pose.x),
+                    "y_m": first_pose.y
+                    + fraction * (second_pose.y - first_pose.y),
+                    "yaw_rad": yaw,
+                    "yaw_deg": math.degrees(yaw),
+                    "yaw_source": "optimized_phone_pose",
+                    "nearest_node_id": nearest["node_id"],
+                    "route_edge_id": nearest["route_edge_id"],
+                    "corridor_id": nearest["corridor_id"],
+                    "route_status": nearest["route_status"],
+                    "route_confidence": nearest["route_confidence"],
+                    "corridor_identity_confidence": nearest[
+                        "corridor_identity_confidence"
+                    ],
+                    "distance_scale": nearest["distance_scale"],
+                    "distance_scale_confidence": nearest[
+                        "distance_scale_confidence"
+                    ],
+                    "manual_anchor_status": nearest["manual_anchor_status"],
+                }
+            )
+    one_second_fields = [
+        "timestamp_unix_s",
+        "local_time_iso8601",
+        "x_m",
+        "y_m",
+        "yaw_rad",
+        "yaw_deg",
+        "yaw_source",
+        "nearest_node_id",
+        "route_edge_id",
+        "corridor_id",
+        "route_status",
+        "route_confidence",
+        "corridor_identity_confidence",
+        "distance_scale",
+        "distance_scale_confidence",
+        "manual_anchor_status",
+    ]
+    with (output / "calibrated_positions_1s.csv").open(
+        "w", encoding="utf-8", newline=""
+    ) as handle:
+        writer = csv.DictWriter(handle, fieldnames=one_second_fields)
+        writer.writeheader()
+        writer.writerows(one_second)
 
 
 def _bounded_review_trajectory(
@@ -5195,7 +5666,7 @@ def _bounded_review_trajectory(
         if coordinates and sampled[-1:] != coordinates[-1:]:
             sampled.append(coordinates[-1])
         properties = dict(feature.get("properties", {}))
-        for key in ("timestamps", "node_ids"):
+        for key in ("timestamps", "node_ids", "yaws_rad"):
             values = properties.get(key)
             if isinstance(values, list) and len(values) == len(coordinates):
                 sampled_values = values[::stride]
@@ -6752,21 +7223,22 @@ def _render_localized_version(
                 )
             )
     corridor_match_audit: list[dict[str, Any]] = []
-    constraints.extend(
-        build_corridor_heading_constraints(
-            baseline,
-            road_graph_payload,
-            str(metadata.get("floorId") or metadata.get("floor_id") or ""),
+    # A long scan needs one route-level hypothesis.  Feeding the legacy
+    # corridor orientation field and point-to-corridor soft priors into the
+    # preliminary factor graph first can rotate or translate the map hints
+    # across shelves before the hard free-space matcher runs.  Keep those
+    # bounded priors only for short compatibility sessions; long sessions are
+    # solved below from gauge-neutral physical motion, exact manual anchors,
+    # road connectivity and occupied-structure collision checks.
+    if len(baseline) < 64:
+        constraints.extend(
+            build_road_soft_constraints(
+                baseline,
+                road_graph_payload,
+                str(metadata.get("floorId") or metadata.get("floor_id") or ""),
+                match_audit=corridor_match_audit,
+            )
         )
-    )
-    constraints.extend(
-        build_road_soft_constraints(
-            baseline,
-            road_graph_payload,
-            str(metadata.get("floorId") or metadata.get("floor_id") or ""),
-            match_audit=corridor_match_audit,
-        )
-    )
     # Exact node-bound operator evidence is the highest-trust map-frame input.
     # Corridor identity is periodic and remains a soft automatic hypothesis;
     # it must not dilute a verified manual anchor or move a confirmed tag
@@ -6867,6 +7339,100 @@ def _render_localized_version(
         and graph_quality_passed
         and factor_graph_report.get("published_capable") is True
     )
+
+    gauge_neutral_trace, gauge_neutral_trace_audit = (
+        reconstruct_gauge_neutral_trace(trace, manual_events)
+    )
+    gauge_neutral_nodes = resample_pose_sequence(
+        gauge_neutral_trace, baseline
+    )
+    corridor_route_audit: dict[str, Any] = {
+        "format": "MarketScannerCorridorRouteMatchAudit",
+        "version": 1,
+        "matcher": "not_run",
+        "status": "unavailable",
+        "reason": "gauge_neutral_trace_unavailable",
+    }
+    # Very short sessions do not establish a route-level hypothesis.  Keeping
+    # their original SE(2) result also preserves exact synthetic/inspection
+    # semantics and prevents periodic aisles from creating false confidence.
+    if (
+        len(baseline) >= 64
+        and gauge_neutral_nodes
+        and len(gauge_neutral_nodes) == len(baseline)
+    ):
+        shelves_payload = load_json(prior_map / "shelves.json")
+        structures_payload = load_json(prior_map / "fixed_structures.json")
+        floor_id = str(metadata.get("floorId") or metadata.get("floor_id") or "")
+        route_anchors = [
+            RouteAnchor(
+                index=item.node_index,
+                x=item.x,
+                y=item.y,
+                translation_sigma_m=(
+                    item.translation_sigma_m
+                    if item.translation_sigma_m is not None
+                    else MANUAL_ANCHOR_TRANSLATION_SIGMA_M
+                ),
+                identifier=item.identifier,
+            )
+            for item in constraints
+            if item.kind == "manual_anchor" and item.trusted_absolute
+        ]
+        route_match = match_corridor_route(
+            gauge_neutral_nodes,
+            optimized,
+            road_graph_payload,
+            floor_id,
+            obstacle_polygons(
+                shelves_payload, structures_payload, floor_id
+            ),
+            route_anchors,
+        )
+        if route_match is not None:
+            optimized = [
+                Pose(
+                    node_id=baseline[index].node_id,
+                    timestamp=baseline[index].timestamp,
+                    x=route_pose.x,
+                    y=route_pose.y,
+                    yaw=route_pose.yaw,
+                )
+                for index, route_pose in enumerate(route_match.poses)
+            ]
+            corridor_route_audit = {
+                **route_match.audit,
+                "status": "matched_low_confidence"
+                if route_match.audit.get("route_confidence") == "low"
+                else "matched",
+            }
+            solver_metrics = bounded_correction_metrics(
+                baseline, optimized, constraints
+            )
+            solver_metrics["continuity_gate_authority"] = (
+                "gauge_neutral_free_space_road_route"
+            )
+            solver_metrics["legacy_correction_gradient_is_diagnostic_only"] = True
+            full_factor_graph = False
+            factor_graph_published_capable = False
+            continuity_fallback_reason = (
+                "free_space_corridor_route_review_draft"
+            )
+            factor_graph_report = {
+                **factor_graph_report,
+                "full_factor_graph": False,
+                "published_capable": False,
+                "corridor_route_review_applied": True,
+                "corridor_route_matcher": corridor_route_audit.get("matcher"),
+                "review_trajectory_solver": (
+                    "gauge_neutral_physical_motion_plus_free_space_road_route_v1"
+                ),
+            }
+        else:
+            corridor_route_audit = {
+                **corridor_route_audit,
+                "reason": "no_connected_collision_free_route_hypothesis",
+            }
 
     elements_payload = load_json(prior_map / "elements.json")
     elements = elements_payload.get("elements", []) if isinstance(elements_payload, dict) else []
@@ -7239,6 +7805,7 @@ def _render_localized_version(
         "format": "MarketScannerLocalizationReport",
         "version": FORMAT_VERSION,
         "prior_map_id": manifest.get("prior_map_id"),
+        "floor_id": str(metadata.get("floorId") or metadata.get("floor_id") or ""),
         "prior_map_sha256": package_hash,
         "prior_map_identity_binding": map_identity_binding,
         "session_input_bundle_sha256": expected_bundle_sha256,
@@ -7316,6 +7883,8 @@ def _render_localized_version(
             ),
             "samples": corridor_match_audit,
         },
+        "gauge_neutral_physical_trace": gauge_neutral_trace_audit,
+        "corridor_route_match": corridor_route_audit,
         "manual_aisle_constraint_count": sum(
             item.kind == "manual_aisle_assignment" for item in constraints
         ),
@@ -7389,7 +7958,12 @@ def _render_localized_version(
             "type": (
                 "relative_se2_factor_graph"
                 if full_factor_graph
-                else "bounded_correction_field"
+                else (
+                    "gauge_neutral_free_space_road_route"
+                    if corridor_route_audit.get("status")
+                    in {"matched", "matched_low_confidence"}
+                    else "bounded_correction_field"
+                )
             ),
             "full_factor_graph": full_factor_graph,
             "graph_integrity_passed": factor_graph_report.get("graph_integrity_passed") is True,
@@ -7400,9 +7974,15 @@ def _render_localized_version(
                 None
                 if full_factor_graph
                 else (
-                    "The native relative SE(2) graph violated recovered physical continuity; its report was preserved, and a continuous bounded correction field is used for draft/review only."
-                    if continuity_fallback_reason is not None
-                    else "The native relative SE(2) graph was unavailable or failed; bounded correction is draft/review only."
+                    "The final review trajectory is reconstructed from gauge-neutral physical motion, strict manual map anchors, connected road topology, and shelf/fixed-structure free-space constraints. The native factor graph remains available for audit; this route is a non-publishable review draft."
+                    if corridor_route_audit.get("status")
+                    in {"matched", "matched_low_confidence"}
+                    else (
+                        "The native relative SE(2) graph violated recovered physical continuity; its report was preserved, and a continuous bounded correction field is used for draft/review only."
+                        if continuity_fallback_reason
+                        == "native_graph_violated_recovered_physical_continuity"
+                        else "The native relative SE(2) graph was unavailable or failed; bounded correction is draft/review only."
+                    )
                 )
             ),
             "continuity_fallback_reason": continuity_fallback_reason,
@@ -7464,7 +8044,9 @@ def _render_localized_version(
             correction_p95,
         ),
         (
-            solver_metrics[
+            corridor_route_audit.get("status")
+            in {"matched", "matched_low_confidence"}
+            or solver_metrics[
                 "maximum_neighbor_correction_translation_change_m"
             ] <= 0.5,
             "neighbor_correction_gradient_above_0_5m",
@@ -7473,13 +8055,66 @@ def _render_localized_version(
             ],
         ),
         (
-            solver_metrics[
+            corridor_route_audit.get("status")
+            in {"matched", "matched_low_confidence"}
+            or solver_metrics[
                 "maximum_neighbor_correction_yaw_change_deg"
             ] <= 15.0,
             "neighbor_correction_yaw_gradient_above_15deg",
             solver_metrics[
                 "maximum_neighbor_correction_yaw_change_deg"
             ],
+        ),
+        (
+            corridor_route_audit.get("status")
+            in {"matched", "matched_low_confidence"},
+            "corridor_route_match_unavailable",
+            corridor_route_audit.get("reason"),
+        ),
+        (
+            corridor_route_audit.get("point_obstacle_penetration_count") == 0,
+            "corridor_route_obstacle_penetration_present",
+            corridor_route_audit.get("point_obstacle_penetration_count"),
+        ),
+        (
+            corridor_route_audit.get("obstacle_crossing_segment_count") == 0,
+            "corridor_route_obstacle_crossing_present",
+            corridor_route_audit.get("obstacle_crossing_segment_count"),
+        ),
+        (
+            corridor_route_audit.get("topological_discontinuity_count") == 0,
+            "corridor_route_topological_discontinuity_present",
+            corridor_route_audit.get("topological_discontinuity_count"),
+        ),
+        (
+            float(corridor_route_audit.get("maximum_step_m") or math.inf)
+            <= float(corridor_route_audit.get("maximum_physical_step_m") or 0.0)
+            + 0.25,
+            "corridor_route_nonphysical_step_present",
+            {
+                "route_maximum_step_m": corridor_route_audit.get(
+                    "maximum_step_m"
+                ),
+                "physical_maximum_step_m": corridor_route_audit.get(
+                    "maximum_physical_step_m"
+                ),
+            },
+        ),
+        (
+            float(
+                corridor_route_audit.get("maximum_distance_scale_deviation")
+                or 0.0
+            )
+            <= 0.05,
+            "corridor_route_distance_scale_above_5pct",
+            {
+                "maximum_distance_scale_deviation": corridor_route_audit.get(
+                    "maximum_distance_scale_deviation"
+                ),
+                "reparameterization": corridor_route_audit.get(
+                    "reparameterization"
+                ),
+            },
         ),
         (
             report["weak_lost_duration_seconds"] <= 30.0,
@@ -7560,6 +8195,19 @@ def _render_localized_version(
         report["warnings"].append(
             "部分价签 burst、节点绑定或确认材料不完整；轨迹和可恢复价签已保留，"
             "相关条目标记为 LOW_CONFIDENCE，结果禁止自动发布。"
+        )
+    if corridor_route_audit.get("route_confidence") == "low":
+        report["warnings"].append(
+            "轨迹已按连续物理移动、道路图连通性和货架/固定结构自由空间重建；"
+            "平行通道身份仍存在多解，结果保留为 LOW_CONFIDENCE 复核草稿，"
+            "但不会再用穿货架或非物理横移伪造确定路线。"
+        )
+    if float(
+        corridor_route_audit.get("maximum_distance_scale_deviation") or 0.0
+    ) > 0.05:
+        report["warnings"].append(
+            "候选道路路线与 gauge-neutral 物理累计距离存在超过 5% 的分段尺度差；"
+            "有限路线和坐标表仍保留，但距离尺度标记为 LOW_CONFIDENCE，必须人工复核。"
         )
     if has_critical_jsonl_damage:
         report["warnings"].append(
@@ -7642,6 +8290,8 @@ def _render_localized_version(
                     if full_factor_graph
                     else "bounded_draft_fallback"
                 ),
+                "gauge_neutral_physical_motion_reconstruction",
+                "free_space_road_route_matching",
                 "tag_reassociation",
                 "quality_gate",
                 "human_review",
@@ -7669,7 +8319,12 @@ def _render_localized_version(
             "algorithm_version": (
                 "relative_se2_factor_graph_v2"
                 if full_factor_graph
-                else "bounded_correction_field_banded_v3"
+                else (
+                    "gauge_neutral_free_space_road_route_v1"
+                    if corridor_route_audit.get("status")
+                    in {"matched", "matched_low_confidence"}
+                    else "bounded_correction_field_banded_v3"
+                )
             ),
             "coordinate_contract_version": COORDINATE_CONTRACT_VERSION,
             "processing_parameter_sha256": processing_parameter_sha256(
@@ -7683,6 +8338,12 @@ def _render_localized_version(
                 "hard_reject_yaw_rad": HARD_REJECT_YAW_RAD,
                 "manual_anchor_translation_sigma_m": MANUAL_ANCHOR_TRANSLATION_SIGMA_M,
                 "manual_anchor_yaw_sigma_rad": MANUAL_ANCHOR_YAW_SIGMA_RAD,
+                "corridor_route_obstacle_clearance_m": corridor_route_audit.get(
+                    "obstacle_clearance_m"
+                ),
+                "corridor_route_maximum_candidates": corridor_route_audit.get(
+                    "maximum_candidates"
+                ),
             },
         },
     )

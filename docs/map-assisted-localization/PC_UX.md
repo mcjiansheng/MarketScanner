@@ -1,6 +1,6 @@
 # PC 先验地图工作台交互
 
-> 文档状态：**当前有效（阶段三草稿复核）**。最后核对日期：2026-08-12。
+> 文档状态：**当前有效（阶段三草稿复核）**。最后核对日期：2026-08-14。
 
 Map Studio 保留单设备、多设备和“导入/管理先验地图”入口，并新增“先验地图会话优化”。自由扫描不要求地图，也不显示无意义的价签复核步骤。
 
@@ -24,15 +24,15 @@ MapCase02 已在 2026-08-09 通过 PC 转换、v2 schema、确定性 canonical/p
 2. 选择已正常结束、地图 ID/hash 一致的连续单库会话；服务端要求显式 `finalized=true`、零必需 sidecar 写失败、`localizationEvidenceComplete=true`、`processingEligibility.status=eligible` 且 blockers 为空，缺字段或存在 checkpoint 都拒绝；
 3. 对原 SQLite 计算 SHA‑256 并保持只读；
 4. `rtabmap-reprocess` 写入 `rtabmap_optimized/optimized.db`；
-5. 从优化副本读取全局一致相对轨迹；
-6. 运行 native 完整相对 SE(2) 因子图，并对 helper 报告、factor digest、连通性、gauge、收敛和 node coverage 做严格二次校验；仅在 helper 不可用时生成不可发布的 bounded draft；
-7. 对 ESL v2 输入先验证 session input manifest v3、complete burst watermark、observation/burst exact binding，再重算价签位置和结构关联；
-8. 运行质量门禁并进入轨迹/价签复核；
-9. 导出 JSON/CSV/GeoJSON 和审计日志。
+5. 从优化副本读取相对轨迹，并从 `localization_trace` 恢复不受 map alignment reset 污染的 gauge-neutral 物理移动；
+6. 运行 native 完整相对 SE(2) 因子图，并对 helper 报告、factor digest、连通性、gauge、收敛和 node coverage 做严格二次校验；长会话再以 gauge-neutral 运动、严格人工锚点、道路连通性和结构自由空间硬约束生成道路路线复核草稿，native 结果保留审计；
+7. 对 ESL v2 输入先验证 session input manifest v3、complete burst watermark、observation/burst exact binding，再按最终节点位姿重算价签位置和结构关联；
+8. 运行轨迹点/线段碰撞、道路拓扑、物理步长、距离尺度、weak/lost 和证据质量门禁，再进入轨迹/价签复核；
+9. 导出 JSON/CSV/GeoJSON、节点级/秒级校准坐标和预览，以及审计日志。
 
 人工位置证据分为两类。手机持久化的 `MarketScannerManualLocalizationEvent v3` 只有在 tracking/map/floor 身份、递增 alignment version、exact node ID、node stamp、time delta 和 atomic snapshot generation 全部严格通过时，才成为“可信绝对地图锚点”；它按约 3 m 平移和 20°航向不确定度参与求解，不再因相对累计漂移超过 5 m/30°而被丢弃。旧 v2 时间绑定事件、缺少 exact-node 权威的事件以及 PC 复核页普通 `set_anchor` 不获得该权限，仍受 5 m/30°兼容门约束并以 `unverified_manual_anchor_safety_gate` 审计。
 
-可信人工锚点造成的大 `maximum/P95 correction` 表示地图 gauge 修正，不等价于相邻节点物理瞬移；严格模式会把结果保存并加载为可复核的 current `draft`。review gate 继续检查 correction-field 相邻平移/航向梯度、相对边和闭环残差、节点覆盖、weak/lost、拒绝约束与价签证据；native 因子图也只有在调用方证明已选择可信人工锚点时，才把大 pose update 解释为 gauge 修正，普通自动 absolute prior 不享受豁免。
+可信人工锚点造成的大 `maximum/P95 correction` 表示地图 gauge 修正，不等价于相邻节点物理瞬移。长会话不会把 correction-field gradient 当作物理连续性的权威：PC 先按每帧 alignment 语义恢复 gauge-neutral 运动，自动 correction 后以此前 `estimatedPose` 为下一增量原点，人工重定位后的首个 post-reset sample 物理位移为零。严格模式把完整结果保存并加载为可复核的 current `draft`；review gate 检查自由空间碰撞、道路拓扑、物理相邻步长、路线/物理距离尺度、节点覆盖、weak/lost、拒绝约束与价签证据。旧 correction-field 指标在自由空间路线生效后仅为诊断。
 
 “测试诊断模式”仍只放宽其他不安全结果的草稿可见性，不放宽 review/publish gate：稳健硬门拒绝的手机约束不会参与求解，但仍完整写入 `localization_constraints.json`、`review_items.json` 和接受率/残差统计。报告固定写入 `diagnostic_mode=true`、`diagnostic_only=true` 和 `diagnostic_mode_enabled` 发布 blocker，因而不能提交为生产成果。
 
@@ -44,9 +44,11 @@ MapCase02 已在 2026-08-09 通过 PC 转换、v2 schema、确定性 canonical/p
 
 ## 轨迹复核
 
-`optimized_map_trajectory.geojson` 同时提供在线定位、RTAB‑Map 重处理和先验地图离线优化层；既有 Map Studio 预览继续显示 prior map/2D/3D 成果。`review_items.json` 列出被拒绝约束、高残差和待复核价签。
+`optimized_map_trajectory.geojson` 同时提供在线定位、RTAB‑Map 重处理和先验地图离线优化层，并在各层保存与坐标、node ID、时间戳一一对应的 `yaws_rad`。长路线层来自 gauge-neutral 物理运动、严格人工锚点、道路图连通性和货架/固定结构自由空间约束；它不是把原折线简单旋转或逐点投到最近通道。既有 Map Studio 预览继续显示 prior map/2D/3D 成果。`review_items.json` 列出被拒绝约束、高残差、通道多解、距离尺度偏差和待复核价签。
 
-质量摘要同时显示在线/RTAB‑Map/离线轨迹长度、累计平移修正中位/P95/最大值、weak/lost 总时长、地图约束接受率和实际求解器类型，用于测试阶段判断累计误差。没有外部测量真值时，这些是内部一致性诊断，不等同于绝对定位准确率。
+质量摘要同时显示在线/RTAB‑Map/离线轨迹长度、gauge-neutral 物理里程、道路路线里程、货架内点数、穿越结构线段数、道路拓扑断裂、最大物理/路线步长、各人工锚点分段的距离尺度、平行通道多解区间、weak/lost 总时长、地图约束接受率和实际求解器类型。任一距离尺度偏差超过 5% 时，结果与全部坐标仍保留，但整体标记低置信度并阻断 review/publish。没有外部测量真值时，这些是内部一致性诊断，不等同于绝对定位准确率或唯一通道识别。
+
+独立导出工具会在不可变 version 之外写入 `calibrated_trajectory_exports/`：`calibrated_positions_by_node.csv`、`calibrated_positions_1s.csv`、`calibrated_trajectory_on_prior_map.png`、`calibrated_trajectory_timestamped.png` 和 `export_manifest.json`。两个 CSV 均输出标准地图坐标、本地时间、route edge/corridor、通道身份置信度、距离尺度置信度和人工锚点状态；yaw 必须来自 `optimized_phone_pose`。缺少 `yaws_rad` 的旧结果会明确拒绝该导出，避免用运动切线伪造手机朝向。
 
 人工编辑区支持：
 
@@ -93,9 +95,9 @@ GET  /api/jobs/<id>/localized/versions/<version>/artifact/<allowlisted-name>
 
 ## 发布含义
 
-当前结果从 `draft` 可在 review gate 通过后生成新的 `review` 版本。只有严格验证通过的 `full_relative_se2_factor_graph` 才具备进入 `published` 状态的 solver capability；bounded fallback 仍固定包含 `solver_not_full_relative_se2_factor_graph` 并返回 422。真实设备与现场资格门在 P5/P6 完成前，产品整体仍为 NO-GO，当前也不向外部业务系统上传。
+当前结果从 `draft` 可在 review gate 通过后生成新的 `review` 版本。只有严格验证通过的 `full_relative_se2_factor_graph` 才具备进入 `published` 状态的 solver capability；`bounded_correction_field` 与 `gauge_neutral_free_space_road_route` 都是不可发布复核草稿，固定包含 solver capability blocker。通道身份多解、路线距离尺度超过 5%、weak/lost 或拒绝约束不会删除结果，但会阻断 review/publish。真实设备与现场资格门在 P5/P6 完成前，产品整体仍为 NO-GO，当前也不向外部业务系统上传。
 
-ESL capture 的 simulator build 已完成当前 App Swift module/文件编译证据，但最终 native C++ 编译被缺失的 platform-scoped Eigen/PCL/OpenCV headers 阻断；真机和现场测试见 [`ESL_CAPTURE_TODO.md`](ESL_CAPTURE_TODO.md)。该证据不是 Apple clean compile-link PASS。当前聚焦回归为 Stage-3 82/82、localized-output-store 28/28、session snapshot 10/10，合计 120/120 PASS；I5 关键长时 PriorMap host workflow 历史证据为 1/1（943.159 s）PASS，I6 未重跑该完整长方法，完整 `discover` 也尚未运行，不能把单方法结果或历史结果写成当前完整套件 PASS。
+ESL capture 的 simulator build 已完成当前 App Swift module/文件编译证据，但最终 native C++ 编译被缺失的 platform-scoped Eigen/PCL/OpenCV headers 阻断；真机和现场测试见 [`ESL_CAPTURE_TODO.md`](ESL_CAPTURE_TODO.md)。该证据不是 Apple clean compile-link PASS。本轮最终源码已执行完整 PriorMap 291/291 和 Map Studio 120/120；其中 PriorMap 包含大数据 Swift host 方法。真实样本 `103343` 的自由空间路线仍因 6%–12% 分段距离尺度偏差、weak/lost 和拒绝约束保持不可发布，不得把自动测试通过解释为现场准确率或生产 GO。
 
 ## 任务恢复与取消
 
