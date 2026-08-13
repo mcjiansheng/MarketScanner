@@ -1,10 +1,18 @@
 # Mobile-Only V1 当前状态
 
-> 文档状态：**当前有效**。最后核对日期：2026-08-11（起点朝向合同修复阶段）。
+> 文档状态：**当前有效**。最后核对日期：2026-08-13（手机/PC 部分结果与价签保留合同）。
 
 ## 总体
 
-当前核心分支仍为 `core-mobile-v1@9a93fbd0ee52944eae5aebedf59ec6a08dedc934`；本轮工作位于不带 `codex/` 前缀的 `fix/mobile-processing-stable-snapshot`，基于起点朝向修复提交 `b43f4d88c40e2eda2d09c39c08c87609dca10f74`，已形成独立本地提交但尚无签名真机构建证据。此前被审增量 `fix/mobile-import-prewarm-esl-deferred-tag@673d8d3a714f8fb6be18acc44ca4dd32589f3e81`、修复分支 `fix/mobile-import-esl-review-blockers` 及其独立复审状态保留为历史证据；它们已合入上述核心基线，但不能把局部结论扩展为整体发布通过。I10 final SHA `8f0e730d92773eea2ab58f56742d901ac02eead4` 的 exact-SHA run `31307753672` 为 7/8：P0、SHA/wave、ABI、Ubuntu/Windows native、Python/API/Web 与完整 macOS host 合同均 PASS，200k tag-evidence RSS 为 `794,099,712 < 805,306,368` bytes；唯一失败是 cold-cache iphoneos RTAB-Map 配置没有找到已生成在 `rtabmap/prebuild/bin/` 的宿主 `rtabmap-res_tool`，因此 simulator/device clean link 被跳过。I11 `37e6ed8c4afa00202693cd56919aea78fd4c7af5` 已在交叉编译前验证该宿主工具并通过 `RTABMAP_RES_TOOL` 显式绑定，G11 `7eef33e` 已绑定 implementation SHA；新的 exact-SHA 8/8 前不冻结，当前发布判断仍为 **REJECTED / NO-GO / developer smoke only**。
+当前冻结核心基线为 `core-mobile-v1@9a93fbd0ee52944eae5aebedf59ec6a08dedc934`；本轮工作位于不带 `codex/` 前缀的 `fix/manual-anchor-continuous-recovery`，在历史处理稳定读取、起点朝向、可信人工锚点连续恢复和手机部分结果提交修复之上统一手机/PC 的低置信度保留合同。此前被审增量 `fix/mobile-import-prewarm-esl-deferred-tag@673d8d3a714f8fb6be18acc44ca4dd32589f3e81`、修复分支 `fix/mobile-import-esl-review-blockers` 及其独立复审状态保留为历史证据；它们已合入上述核心基线，但不能把局部结论扩展为整体发布通过。I10 final SHA `8f0e730d92773eea2ab58f56742d901ac02eead4` 的 exact-SHA run `31307753672` 为 7/8：P0、SHA/wave、ABI、Ubuntu/Windows native、Python/API/Web 与完整 macOS host 合同均 PASS，200k tag-evidence RSS 为 `794,099,712 < 805,306,368` bytes；唯一失败是 cold-cache iphoneos RTAB-Map 配置没有找到已生成在 `rtabmap/prebuild/bin/` 的宿主 `rtabmap-res_tool`，因此 simulator/device clean link 被跳过。I11 `37e6ed8c4afa00202693cd56919aea78fd4c7af5` 已在交叉编译前验证该宿主工具并通过 `RTABMAP_RES_TOOL` 显式绑定，G11 `7eef33e` 已绑定 implementation SHA；新的 exact-SHA 8/8 前不冻结，当前发布判断仍为 **REJECTED / NO-GO / developer smoke only**。
+
+## 2026-08-13 手机与 PC 部分结果、价签保留合同
+
+- 手机和 PC 均采用“结果保留、发布从严”：只要存在有限轨迹，就提交 `COMPLETE`、`PARTIAL_REVIEW_REQUIRED` 或 `LOCAL_FRAME_ONLY` Result；低质量图、局部优化失败、拒绝的普通约束和局部价签证据问题不再被包装成整单“处理失败”。部分结果固定 `publish_permitted=false`。
+- 每个可解析价签的主结果只有 `ACCEPTED` 或 `LOW_CONFIDENCE`。burst/frame、节点绑定、位置、货架关联或确认材料不足时，保留条码、可恢复位置和精确原因；无位置时保留空坐标。`RESCAN_REQUIRED` 只作为独立、非阻断补扫任务，不替代 PriceTags 主结果。
+- PC Stage-3 的 `localized_price_tags.json/csv` 保存全量条码，GeoJSON 只保存有限位置子集；普通、历史 stage 和多设备地图同样输出全量 `price_tags.json/csv`。任何未知位置都不会伪造为 `(0,0)`。
+- JSON/JSONL framing、UTF-8、身份、hash/watermark、duplicate durable ID、SQLite/graph BLOB、WAL/journal/hardlink、完全无有限轨迹、源输入处理中变化和无法 fsync/原子提交仍是 fatal，不能降级。
+- 当前验证：PC Stage-3 **92/92**、Map Studio **117/117**、移动 UX/sidecar/yaw **54/54**、Qualification **30/30**、完整 Swift host **1/1 PASS（1257.334 s）**，以及 unsigned generic iPhoneOS Debug 全量编译/链接 PASS。该证据仍不代替签名真机、LiDAR、Device Lab 或现场扫描。
 
 ## 2026-08-11 手机快照长读取与 PC 跨编译器地图身份修复
 
@@ -44,7 +52,7 @@
 - 地图库首屏绘制后在主线程空闲轮次预加载一次导入 action sheet、导入页、XLSX `UTType` 和 document-picker view；不改变 workflow、不访问 provider 文件，真实暂存/编译继续在后台。
 - ARKit autofocus 显式启用；Vision 最多 10 Hz，主 ROI 无结果时只在同一 worker/ARFrame 上追加一次有界扩展 ROI，capture 窗口由 2 秒延长到 4 秒并扩充成熟条码类型。固定两条 worker、one-in-flight 和 1 秒 request deadline 不变。
 - live exact-node snapshot 短暂缺失只延期当前 evidence slot；只允许继续使用 live snapshot 或仍满足 1 秒合同的 frozen exact-ID snapshot，不恢复 nearest-time fallback。真实 sidecar、identity 与 burst 失败继续 sticky fail-closed。
-- 最终价签质量为 `ACCEPTED / LOW_CONFIDENCE / RESCAN_REQUIRED`。完整 burst、exact node/raw pose 和至少 3 帧可重算位置仍完整但定位/测量/关联不足时保留 `LOW_CONFIDENCE`，按最终 node pose 重投影且不自动生成 RescanTask；同一 burst 的多货架歧义合并为一条低置信度结果。缺失权威证据仍要求重扫，低置信度绝不计为 ACCEPTED。
+- 该历史增量当时仍使用 `ACCEPTED / LOW_CONFIDENCE / RESCAN_REQUIRED` 三态描述。当前合同已由本文顶部 2026-08-13 小节取代：价签主结果只有 `ACCEPTED / LOW_CONFIDENCE`，权威证据不足时保留条码/空坐标，并把 `RESCAN_REQUIRED` 作为独立补扫建议；低置信度绝不计为 ACCEPTED。
 - 当前源码 focused UX/source **21/21 PASS**、全部修改 Swift `swiftc -parse` PASS、generated evidence contracts 11 文件无漂移、中文字符串与 Python 语法 PASS、unsigned generic iphoneos Debug 全量编译/链接 PASS。完整 Swift host 长方法 **1/1 PASS（1266.338 s）**：300,000 条 finalization 峰值 RSS 14,139,392 bytes；1,728,000 条 trace 保留 172,801 条、峰值 59,129,856 bytes；400,000 条 tag evidence 接受 200,000 条、峰值 589,463,552 bytes。上述仍不是签名真机、LiDAR、近距离聚焦、恢复期定位、Files/FileProvider 首开、热状态或现场 PASS。
 
 ## 2026-08-10 历史扫描处理、原始导出与 ESL 布局修复
@@ -94,7 +102,7 @@
 - Track B2 手机编译器：prior-map package 全产物；距离场 `data_sha256` 与 PC oracle 字节级一致；原子提交 + 生产自检。
 - Track C 后处理：session 快照事务；Fast Path 相对 SE(2) 因子图；持久任务状态机。
 - Track D 轨迹：时钟相关性记录；1 Hz 最终轨迹（本地时间 + UTC + offset；UNAVAILABLE 区间）。
-- Track E 价签：节点/时间绑定、位置传播、burst 融合、货架关联、`ACCEPTED / LOW_CONFIDENCE / RESCAN_REQUIRED` 自动质量门。
+- Track E 价签：节点/时间绑定、位置传播、burst 融合、货架关联、`ACCEPTED / LOW_CONFIDENCE` 主结果质量门，以及独立非阻断 `RESCAN_REQUIRED` 补扫任务。
 - Track F 导出：真 Open XML XLSX 四表流式导出、公式注入/控制字符防护、原子导出。
 - UI 接线：MapSourceDocumentPicker（security-scoped staging）、ResultShareController。
 - 工程登记：project.pbxproj（31 个新文件四段）、CI swiftc -parse 列表、Swift host 编译列表。

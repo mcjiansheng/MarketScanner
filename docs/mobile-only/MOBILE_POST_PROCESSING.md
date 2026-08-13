@@ -20,7 +20,7 @@ Native optimizer 的 skeleton/factor/prior 硬上限统一由生成合同固定�
 
 `AbsolutePriorEvidenceParser` 为一次处理只构建一个 `NodeIndex`（ID 索引、按 stamp 排序数组、stamp 数组和 duplicate 集合）。constraint/manual 的 top-level、pose 和 candidate 子对象均拒绝未知字段，version/Bool/Int 使用严格 scalar；floor/map/SHA/session、node timebase 恒等式和 disposition 交叉语义必须一致。格式正确、身份一致且正式 `accepted=false` 的 constraint 是正常负证据：计入 `nonAcceptedDetails`、不生成 prior、也不污染 fatal clean gate；坏 schema、身份矛盾或 accepted record 无效仍阻断。manual v2/v3 都重算最近与第二近节点，v3 声明 ID 必须就是真实无歧义最近节点，并交叉核对 ISO/Unix wall time。
 
-记录级证据拒绝与文件/身份损坏严格分层：`manual_event_claimed_node_not_nearest` 等单条 prior 拒绝只排除该因子，写入 degradation audit，其他相对图、有效 prior、轨迹和价签继续处理；地图/楼层/会话身份串包仍终止。tag burst/observation 的单条 schema、node binding 或未消费 frame 同样降级：已有三帧位置 quorum 时保留低置信度价签，否则保留条码占位行、空地图坐标和 `RESCAN_REQUIRED`。JSONL framing、文件超限/不可读、identity mismatch 和不可证明的 durable watermark 仍是 fatal。
+记录级证据拒绝与文件/身份损坏严格分层：`manual_event_claimed_node_not_nearest` 等单条 prior 拒绝只排除该因子，写入 degradation audit，其他相对图、有效 prior、轨迹和价签继续处理；地图/楼层/会话身份串包仍终止。tag burst/observation 的单条 schema、node binding 或未消费 frame 同样降级：已有三帧位置 quorum 时保留低置信度位置，否则保留条码占位行和空地图坐标；两种情况的价签结果均为 `LOW_CONFIDENCE`，权威证据不足时可另附非阻断 `RescanTask`，但补扫建议不是处理失败，也不能删除 PriceTags 行。JSONL framing、文件超限/不可读、duplicate durable ID、identity mismatch 和不可证明的 durable watermark 仍是 fatal。
 
 `localization_constraints.jsonl` 的产品资格规模是 48 h × 2 Hz = 345,600 条；生成合同使用 400,000 条 parser hard cap、64 KiB 单条上限和 768 MiB 文件上限。处理必须从 `captureHealth.localizationConstraintRecordCount`、`captureHealth.manualLocalizationEventCount` 和 `captureHealth.localizationRecoveryEventCount` 读取严格非负整数，并分别与 constraint/manual/recovery JSONL 的实际原始行数精确一致，不能用已解析、已接受或恢复 episode 内存计数替代持久化行水位。manual 水位只在 durable append 成功后推进；有正水位时 finalization 不得用新建空文件掩盖缺失证据。
 
@@ -49,7 +49,7 @@ Result 发布与 `task.json` 完成态是一个跨两个持久目录的有序事
 
 取消、系统中断、资源暂停、`RESCAN_SESSION` 和普通工作流失败共用 `MobileTerminalStatePersistence`。`RESCAN_SESSION` 现在只用于完全没有任何有限轨迹节点的会话（以及读取历史持久 artifact 的兼容路径）；非 PASS、没有 publish-eligible node、单条 prior/tag 证据拒绝都走普通不可变 Result 事务，并设置 `publish_permitted=false`。旧 `rescan_session_outcome.json` 仍按 strict Bool、identity、SHA、exclusive rename 和重启调和合同读取，不能被伪造或与普通 Result 冲突。
 
-普通 Result 的质量状态为 `COMPLETE / PARTIAL_REVIEW_REQUIRED / LOCAL_FRAME_ONLY`。`quality_report.json` v3、RunSummary 和 result manifest 同时记录 `result_quality_status`、`publish_permitted`、降级数量/原因、可用/降级/带坐标/不可用行数。`final_trajectory.jsonl` 与 DevicePositions 对地图坐标和本地诊断坐标使用互斥列；`final_tags.json` 与 PriceTags 即使无法定位也保留条码和失败原因。
+普通 Result 的质量状态为 `COMPLETE / PARTIAL_REVIEW_REQUIRED / LOCAL_FRAME_ONLY`。`quality_report.json` v3、RunSummary 和 result manifest 同时记录 `result_quality_status`、`publish_permitted`、降级数量/原因、可用/降级/带坐标/不可用行数。`final_trajectory.jsonl` 与 DevicePositions 对地图坐标和本地诊断坐标使用互斥列；`final_tags.json` 与 PriceTags 即使无法定位也保留条码和失败原因。PC Stage-3 使用相同语义：局部 burst/tag evidence 问题生成不可发布草稿；JSON/CSV 保留全部条码，GeoJSON 仅包含有限坐标子集，绝不以 `(0,0)` 代替未知位置。
 
 通用 terminal 生产调用顺序为：先原子写入并 fsync `terminal_state_intent.json`，再原子更新 `task.json`，成功后删除 intent 并 fsync task root，然后重新抛出原业务错误。`task.json` 在 before-temp-write、after-temp-fsync、after-rename 或 parent-fsync 边界失败时，调用方收到 `DurabilityFailure`，其中同时包含业务 outcome/code/detail、失败阶段、存储错误和当前可读 task state；不得把原业务终态静默报告为已经安全持久化。重启发现 intent 时，只有 task identity、目标 terminal state 和持久化 reason 全部精确一致才允许幂等清除，只有已知非终态阶段才允许推进到 intent 目标；completed、rescan_required、不同终态、同状态不同 reason 或 task identity 冲突一律不修改 `task.json`、不删除 intent 并 fail closed，intent 未调和前不得按普通中间态恢复。
 

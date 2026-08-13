@@ -752,6 +752,11 @@ class FinalizedSessionInputSnapshot:
     jsonl_diagnostics: dict[str, dict[str, Any]]
     localized_tags_bytes: bytes
     localized_tag_count: int
+    verified_burst_observation_ids: dict[str, set[str]]
+    verified_burst_frame_authorities: dict[
+        str, "VerifiedTagBurstFrameAuthority"
+    ]
+    tag_evidence_degradations: list[dict[str, Any]]
     manifest: dict[str, Any]
 
 
@@ -848,7 +853,10 @@ def read_finalized_session_input_snapshot(
             contract = replace(
                 TAG_OBSERVATION_CONTRACT,
                 required=bool(raw_tags),
-                allow_empty=not bool(raw_tags),
+                # A finalized empty sidecar is still bounded immutable
+                # evidence. Preserve every tag barcode as LOW_CONFIDENCE
+                # instead of aborting the trajectory/map result.
+                allow_empty=True,
             )
         elif name == "tag_observation_bursts.jsonl":
             contract = replace(
@@ -879,6 +887,21 @@ def read_finalized_session_input_snapshot(
                     "sha256": identity["sha256"],
                 }
             )
+    verified_burst_observation_ids: dict[str, set[str]] = {}
+    verified_burst_frame_authorities: dict[
+        str, VerifiedTagBurstFrameAuthority
+    ] = {}
+    tag_evidence_degradations: list[dict[str, Any]] = []
+    for sidecar_name in (
+        "tag_observations.jsonl",
+        "tag_observation_bursts.jsonl",
+    ):
+        diagnostics = jsonl_diagnostics.get(sidecar_name, {})
+        sidecar_degradations = diagnostics.get("degradations")
+        if isinstance(sidecar_degradations, list):
+            tag_evidence_degradations.extend(
+                item for item in sidecar_degradations if isinstance(item, dict)
+            )
     if burst_bound:
         bursts = jsonl_values.get("tag_observation_bursts.jsonl", [])
         if len(bursts) != burst_count:
@@ -891,9 +914,13 @@ def read_finalized_session_input_snapshot(
             raise OfflineLocalizationError(
                 "Tag burst last ID does not match the finalized watermark."
             )
-        _verified_tag_burst_observation_ids(
+        (
+            verified_burst_observation_ids,
+            verified_burst_frame_authorities,
+        ) = _verified_tag_burst_evidence(
             bursts,
             jsonl_values.get("tag_observations.jsonl", []),
+            degradations=tag_evidence_degradations,
         )
     if not recovery_bound:
         # P7R6: legacy v1 sessions read the Recovery sidecar when it exists
@@ -943,6 +970,9 @@ def read_finalized_session_input_snapshot(
         jsonl_diagnostics=jsonl_diagnostics,
         localized_tags_bytes=tags_bytes,
         localized_tag_count=len(raw_tags),
+        verified_burst_observation_ids=verified_burst_observation_ids,
+        verified_burst_frame_authorities=verified_burst_frame_authorities,
+        tag_evidence_degradations=tag_evidence_degradations,
         manifest=manifest,
     )
 
@@ -2292,6 +2322,201 @@ def _read_jsonl_bytes(
     return values, diagnostics
 
 
+def _read_tag_jsonl_bytes_degraded(
+    data: bytes,
+    contract: JsonlContract,
+    *,
+    path_label: str,
+    session_id: str,
+    expected_map_hash: str,
+    expected_floor_id: str,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Parse immutable tag JSONL while isolating record-local evidence gaps.
+
+    Framing, UTF-8, JSON, duplicate durable IDs, identity mismatches and safety
+    limits remain fatal. Once a record is safely delimited and belongs to this
+    map/session/floor, its optional position/burst business contract may be
+    rejected independently and audited as LOW_CONFIDENCE.
+    """
+
+    diagnostics: dict[str, Any] = {
+        "file": path_label,
+        "contract": contract.name,
+        "total_lines": 0,
+        "valid_records": 0,
+        "degraded_records": 0,
+        "invalid_json_lines": 0,
+        "invalid_utf8_lines": 0,
+        "blank_lines": 0,
+        "non_object_lines": 0,
+        "oversized_lines": 0,
+        "format_mismatches": 0,
+        "version_mismatches": 0,
+        "session_mismatches": 0,
+        "map_hash_mismatches": 0,
+        "floor_mismatches": 0,
+        "timestamp_errors": 0,
+        "duplicate_ids": 0,
+        "degradations": [],
+    }
+    if contract.maximum_file_bytes is not None and len(data) > contract.maximum_file_bytes:
+        raise OfflineLocalizationError(
+            f"{path_label} exceeds the bounded file-size safety limit."
+        )
+    parts = data.split(b"\n")
+    if parts[-1] != b"":
+        raise OfflineLocalizationError(
+            f"Missing final newline at {path_label}:{len(parts)}"
+        )
+    parts.pop()
+    values: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for line_no, part in enumerate(parts, start=1):
+        raw_line = part + b"\n"
+        diagnostics["total_lines"] += 1
+        if (
+            contract.qualification_maximum_records is not None
+            and diagnostics["total_lines"]
+            > contract.qualification_maximum_records
+        ):
+            raise OfflineLocalizationError(
+                "qualification_limit_exceeded at "
+                f"{path_label}:{line_no}: {diagnostics['total_lines']} > "
+                f"{contract.qualification_maximum_records}",
+                reason="qualification_limit_exceeded",
+            )
+        if diagnostics["total_lines"] > contract.maximum_records:
+            raise OfflineLocalizationError(
+                f"{path_label} exceeds the bounded "
+                f"{contract.maximum_records}-record safety limit."
+            )
+        if len(raw_line) > contract.maximum_record_bytes:
+            diagnostics["oversized_lines"] += 1
+            raise OfflineLocalizationError(
+                f"Oversized record at {path_label}:{line_no}"
+            )
+        try:
+            line = raw_line.decode("utf-8", errors="strict")
+        except UnicodeDecodeError as exc:
+            diagnostics["invalid_utf8_lines"] += 1
+            raise OfflineLocalizationError(
+                f"Invalid UTF-8 at {path_label}:{line_no}"
+            ) from exc
+        if not line.strip():
+            diagnostics["blank_lines"] += 1
+            raise OfflineLocalizationError(
+                f"Blank JSONL record at {path_label}:{line_no}"
+            )
+        try:
+            value = json.loads(
+                line,
+                parse_constant=reject_nonfinite_json,
+                object_pairs_hook=reject_duplicate_object_pairs,
+            )
+        except (json.JSONDecodeError, ValueError, RecursionError) as exc:
+            diagnostics["invalid_json_lines"] += 1
+            raise OfflineLocalizationError(
+                f"Invalid JSON at {path_label}:{line_no}: {exc}"
+            ) from exc
+        if not isinstance(value, dict):
+            diagnostics["non_object_lines"] += 1
+            raise OfflineLocalizationError(
+                f"Non-object record at {path_label}:{line_no}"
+            )
+        if (
+            contract.maximum_nesting_depth is not None
+            and json_nesting_depth(value) > contract.maximum_nesting_depth
+        ):
+            diagnostics["invalid_json_lines"] += 1
+            raise OfflineLocalizationError(
+                f"{path_label}:{line_no} exceeds the bounded nesting-depth safety limit."
+            )
+        if value.get("format") != contract.record_format:
+            diagnostics["format_mismatches"] += 1
+            raise OfflineLocalizationError(
+                f"Format mismatch at {path_label}:{line_no}"
+            )
+        version = value.get("version")
+        if (
+            isinstance(version, bool)
+            or not isinstance(version, int)
+            or version not in contract.versions
+        ):
+            diagnostics["version_mismatches"] += 1
+            raise OfflineLocalizationError(
+                f"Version mismatch at {path_label}:{line_no}"
+            )
+        if _identity_field(
+            value, "tracking_session_id", "trackingSessionId"
+        ) != session_id:
+            diagnostics["session_mismatches"] += 1
+            raise OfflineLocalizationError(
+                f"Tracking-session mismatch at {path_label}:{line_no}"
+            )
+        if _identity_field(
+            value, "prior_map_sha256", "priorMapSha256"
+        ) != expected_map_hash:
+            diagnostics["map_hash_mismatches"] += 1
+            raise OfflineLocalizationError(
+                f"Prior-map hash mismatch at {path_label}:{line_no}"
+            )
+        if _identity_field(value, "floor_id", "floorId") != expected_floor_id:
+            diagnostics["floor_mismatches"] += 1
+            raise OfflineLocalizationError(
+                f"Floor mismatch at {path_label}:{line_no}"
+            )
+        record_id = str(value.get(contract.record_id_field or "") or "")
+        if not record_id or record_id in seen_ids:
+            diagnostics["duplicate_ids"] += 1
+            raise OfflineLocalizationError(
+                f"Missing or duplicate {contract.record_id_field} at {path_label}:{line_no}"
+            )
+        seen_ids.add(record_id)
+        timestamp = next(
+            (value.get(field) for field in contract.timestamp_fields if field in value),
+            None,
+        )
+        timestamp_number = _strict_number(timestamp)
+        try:
+            _validate_jsonl_business_record(
+                contract, value, f"{path_label}:{line_no}"
+            )
+        except OfflineLocalizationError as exc:
+            diagnostics["degraded_records"] += 1
+            diagnostics["degradations"].append(
+                {
+                    "code": f"{contract.name}_record_degraded",
+                    "severity": "warning",
+                    "disposition": "LOW_CONFIDENCE",
+                    "record_id": record_id,
+                    "record_index": line_no - 1,
+                    "barcode": value.get("payload") or value.get("barcode"),
+                    "detail": str(exc),
+                }
+            )
+            values.append(value)
+            continue
+        if timestamp_number is None:
+            diagnostics["timestamp_errors"] += 1
+            diagnostics["degraded_records"] += 1
+            diagnostics["degradations"].append(
+                {
+                    "code": f"{contract.name}_timestamp_degraded",
+                    "severity": "warning",
+                    "disposition": "LOW_CONFIDENCE",
+                    "record_id": record_id,
+                    "record_index": line_no - 1,
+                    "barcode": value.get("payload") or value.get("barcode"),
+                    "detail": f"Invalid timestamp at {path_label}:{line_no}",
+                }
+            )
+            values.append(value)
+            continue
+        values.append(value)
+        diagnostics["valid_records"] += 1
+    return values, diagnostics
+
+
 def _read_jsonl_stable(
     path: Path,
     contract: JsonlContract,
@@ -2329,14 +2554,24 @@ def _read_jsonl_stable(
             )
         return values, empty_diagnostics, {}
     data, identity = _stable_read_bytes(path, contract.name)
-    values, diagnostics = _read_jsonl_bytes(
-        data,
-        contract,
-        path_label=path.name,
-        session_id=session_id,
-        expected_map_hash=expected_map_hash,
-        expected_floor_id=expected_floor_id,
-    )
+    if contract.name in {"tag_observations", "tag_observation_bursts"}:
+        values, diagnostics = _read_tag_jsonl_bytes_degraded(
+            data,
+            contract,
+            path_label=path.name,
+            session_id=session_id,
+            expected_map_hash=expected_map_hash,
+            expected_floor_id=expected_floor_id,
+        )
+    else:
+        values, diagnostics = _read_jsonl_bytes(
+            data,
+            contract,
+            path_label=path.name,
+            session_id=session_id,
+            expected_map_hash=expected_map_hash,
+            expected_floor_id=expected_floor_id,
+        )
     diagnostics["file"] = str(path)
     return values, diagnostics, identity
 
@@ -2365,6 +2600,8 @@ def _read_jsonl(
 def _verified_tag_burst_evidence(
     bursts: Sequence[dict[str, Any]],
     observations: Sequence[dict[str, Any]],
+    *,
+    degradations: list[dict[str, Any]] | None = None,
 ) -> tuple[
     dict[str, set[str]],
     dict[str, VerifiedTagBurstFrameAuthority],
@@ -2377,17 +2614,47 @@ def _verified_tag_burst_evidence(
     observation may agree with it, but can never replace it.
     """
 
+    tolerant = degradations is not None
+
+    def reject(
+        code: str,
+        detail: str,
+        *,
+        burst_id: str | None = None,
+        observation_id: str | None = None,
+        frame_id: str | None = None,
+    ) -> None:
+        if not tolerant:
+            raise OfflineLocalizationError(detail)
+        assert degradations is not None
+        degradations.append(
+            {
+                "code": code,
+                "severity": "warning",
+                "disposition": "LOW_CONFIDENCE",
+                "burst_id": burst_id,
+                "observation_id": observation_id,
+                "frame_id": frame_id,
+                "detail": detail,
+            }
+        )
+
     observations_by_id: dict[str, dict[str, Any]] = {}
     for observation in observations:
         observation_id = observation.get("observation_id")
         if not isinstance(observation_id, str) or not observation_id:
-            raise OfflineLocalizationError(
-                "Tag observation is missing its durable observation ID."
+            reject(
+                "tag_observation_id_missing",
+                "Tag observation is missing its durable observation ID.",
             )
+            continue
         if observation_id in observations_by_id:
-            raise OfflineLocalizationError(
-                "Tag observation IDs must be globally unique."
+            reject(
+                "tag_observation_id_duplicate",
+                "Tag observation IDs must be globally unique.",
+                observation_id=observation_id,
             )
+            continue
         observations_by_id[observation_id] = observation
 
     verified: dict[str, set[str]] = {}
@@ -2407,14 +2674,27 @@ def _verified_tag_burst_evidence(
             or burst.get("complete") is not True
             or not isinstance(frames, list)
         ):
-            raise OfflineLocalizationError(
-                "Tag burst identity, order or completion state is invalid."
+            reject(
+                "tag_burst_identity_order_or_completion_invalid",
+                "Tag burst identity, order or completion state is invalid.",
+                burst_id=burst_id if isinstance(burst_id, str) else None,
             )
+            continue
         previous_sequence = sequence
         member_ids: set[str] = set()
+        candidate_authorities: dict[
+            str, VerifiedTagBurstFrameAuthority
+        ] = {}
+        burst_valid = True
         for frame in frames:
             if not isinstance(frame, dict):
-                raise OfflineLocalizationError("Tag burst frame is invalid.")
+                reject(
+                    "tag_burst_frame_invalid",
+                    "Tag burst frame is invalid.",
+                    burst_id=burst_id,
+                )
+                burst_valid = False
+                continue
             observation_id = frame.get("observation_id")
             frame_id = frame.get("frame_id")
             bound_node_id = _strict_integer(frame.get("bound_node_id"))
@@ -2445,20 +2725,39 @@ def _verified_tag_burst_evidence(
                     node_timestamp,
                 )
             ):
-                raise OfflineLocalizationError(
-                    "Tag burst frame does not match its durable observation."
+                reject(
+                    "tag_burst_frame_observation_mismatch",
+                    "Tag burst frame does not match its durable observation.",
+                    burst_id=burst_id,
+                    observation_id=(
+                        observation_id
+                        if isinstance(observation_id, str)
+                        else None
+                    ),
+                    frame_id=frame_id if isinstance(frame_id, str) else None,
                 )
+                burst_valid = False
+                continue
+            node_conflict = False
             for explicit_field in ("nearest_node_id", "node_id"):
                 if explicit_field not in observation:
                     continue
                 if _strict_integer(observation.get(explicit_field)) != bound_node_id:
-                    raise OfflineLocalizationError(
+                    reject(
+                        "tag_observation_node_conflicts_with_burst",
                         "Tag observation node field conflicts with its verified "
-                        "burst bound node."
+                        "burst bound node.",
+                        burst_id=burst_id,
+                        observation_id=observation_id,
+                        frame_id=frame_id,
                     )
+                    node_conflict = True
+                    burst_valid = False
+                    break
+            if node_conflict:
+                continue
             member_ids.add(observation_id)
-            globally_bound_observations.add(observation_id)
-            frame_authorities[observation_id] = VerifiedTagBurstFrameAuthority(
+            candidate_authorities[observation_id] = VerifiedTagBurstFrameAuthority(
                 burst_id=burst_id,
                 frame_id=frame_id,
                 observation_id=observation_id,
@@ -2468,7 +2767,17 @@ def _verified_tag_burst_evidence(
                 payload=str(burst.get("barcode")),
                 symbology=str(burst.get("symbology")),
             )
+        if not burst_valid or len(member_ids) != len(frames):
+            reject(
+                "tag_burst_incomplete_after_verification",
+                "Tag burst has incomplete or conflicting frame evidence and "
+                "was retained only as low-confidence tag identity.",
+                burst_id=burst_id,
+            )
+            continue
         verified[burst_id] = member_ids
+        globally_bound_observations.update(member_ids)
+        frame_authorities.update(candidate_authorities)
     for observation_id, observation in observations_by_id.items():
         burst_id = observation.get("burst_id")
         frame_id = observation.get("frame_id")
@@ -2479,9 +2788,13 @@ def _verified_tag_burst_evidence(
             or not frame_id
             or observation_id not in globally_bound_observations
         ):
-            raise OfflineLocalizationError(
+            reject(
+                "tag_observation_missing_verified_complete_burst",
                 "A durable burst-bound observation is missing from the "
-                "verified complete burst set."
+                "verified complete burst set.",
+                burst_id=burst_id if isinstance(burst_id, str) else None,
+                observation_id=observation_id,
+                frame_id=frame_id if isinstance(frame_id, str) else None,
             )
     return verified, frame_authorities
 
@@ -2498,6 +2811,69 @@ def _verified_tag_burst_observation_ids(
     return verified
 
 
+def _degraded_localized_tag(
+    item: dict[str, Any],
+    index: int,
+    reason: str,
+) -> dict[str, Any] | None:
+    """Preserve a readable barcode identity when optional tag evidence is bad.
+
+    Identity mismatches are rejected by the caller before this helper.  This
+    path deliberately removes malformed positions instead of fabricating a
+    map origin, retains the additive operator/algorithm fields for audit, and
+    prevents incomplete confirmation evidence from becoming authoritative.
+    """
+
+    version = item.get("version")
+    allowed_fields = (
+        LOCALIZED_TAG_V2_FIELDS
+        if version == 2
+        else LOCALIZED_TAG_V1_FIELDS
+    )
+    tag = {key: item[key] for key in allowed_fields if key in item}
+    payload = item.get("payload")
+    tag_id = item.get("tag_id")
+    if not isinstance(payload, str) or not payload:
+        payload = ""
+    if not isinstance(tag_id, str) or not tag_id:
+        if not payload:
+            return None
+        tag_id = "degraded-" + hashlib.sha256(
+            f"{index}:{payload}".encode("utf-8")
+        ).hexdigest()[:24]
+    tag["format"] = "MarketScannerLocalizedPriceTag"
+    tag["version"] = 2 if version == 2 else 1
+    tag["tag_id"] = tag_id
+    tag["payload"] = payload
+    tag["symbology"] = (
+        item.get("symbology")
+        if isinstance(item.get("symbology"), str)
+        else "unknown"
+    )
+    for position_field in ("raw_map_position", "snapped_map_position"):
+        if not _strict_pose_2d_or_3d(tag.get(position_field)):
+            tag.pop(position_field, None)
+    for confidence_field in (
+        "localization_confidence",
+        "measurement_confidence",
+        "association_confidence",
+    ):
+        value = _strict_number(tag.get(confidence_field))
+        tag[confidence_field] = (
+            max(0.0, min(1.0, value)) if value is not None else 0.0
+        )
+    timestamp = _strict_number(tag.get("timestamp"))
+    if timestamp is None:
+        tag.pop("timestamp", None)
+    tag["needs_review"] = True
+    tag["user_confirmed"] = False
+    tag["quality_status"] = "LOW_CONFIDENCE"
+    tag["input_evidence_status"] = "DEGRADED"
+    tag["review_reasons"] = [reason]
+    tag["approval_status"] = "pending"
+    return tag
+
+
 def _read_localized_price_tags_bytes(
     data: bytes,
     *,
@@ -2508,6 +2884,7 @@ def _read_localized_price_tags_bytes(
     expected_count: int,
     verified_burst_observation_ids: dict[str, set[str]] | None = None,
     verified_burst_identities: dict[str, tuple[str, str]] | None = None,
+    degradations: list[dict[str, Any]] | None = None,
     maximum_bytes: int = 128 * 1024 * 1024,
     maximum_records: int = 500_000,
 ) -> list[dict[str, Any]]:
@@ -2529,6 +2906,84 @@ def _read_localized_price_tags_bytes(
         raise OfflineLocalizationError(
             "localized_price_tags.json count does not match finalized metadata."
         )
+    if degradations is not None:
+        tags: list[dict[str, Any]] = []
+        tag_ids: set[str] = set()
+        observation_ids: set[str] = set()
+        for index, item in enumerate(payload):
+            if not isinstance(item, dict):
+                degradations.append(
+                    {
+                        "code": "localized_tag_record_not_object",
+                        "severity": "warning",
+                        "disposition": "LOW_CONFIDENCE",
+                        "record_index": index,
+                        "detail": "Localized tag record is not an object and has no recoverable barcode identity.",
+                    }
+                )
+                continue
+            if (
+                _identity_field(item, "tracking_session_id", "trackingSessionId")
+                != session_id
+                or _identity_field(item, "prior_map_sha256", "priorMapSha256")
+                != expected_map_hash
+                or _identity_field(item, "floor_id", "floorId")
+                != expected_floor_id
+            ):
+                raise OfflineLocalizationError(
+                    f"localized_price_tags.json item {index} has mismatched identity."
+                )
+            if item.get("prior_map_id") != expected_map_id:
+                raise OfflineLocalizationError(
+                    f"localized_price_tags.json item {index} has an invalid prior_map_id."
+                )
+            raw_tag_id = item.get("tag_id")
+            raw_observation_id = item.get("observation_id")
+            if isinstance(raw_tag_id, str) and raw_tag_id:
+                if raw_tag_id in tag_ids:
+                    raise OfflineLocalizationError(
+                        f"localized_price_tags.json item {index} has missing/duplicate IDs."
+                    )
+                tag_ids.add(raw_tag_id)
+            if isinstance(raw_observation_id, str) and raw_observation_id:
+                if raw_observation_id in observation_ids:
+                    raise OfflineLocalizationError(
+                        f"localized_price_tags.json item {index} has missing/duplicate IDs."
+                    )
+                observation_ids.add(raw_observation_id)
+            try:
+                parsed = _read_localized_price_tags_bytes(
+                    _canonical_json_bytes([item]),
+                    session_id=session_id,
+                    expected_map_id=expected_map_id,
+                    expected_map_hash=expected_map_hash,
+                    expected_floor_id=expected_floor_id,
+                    expected_count=1,
+                    verified_burst_observation_ids=verified_burst_observation_ids,
+                    verified_burst_identities=verified_burst_identities,
+                    maximum_bytes=maximum_bytes,
+                    maximum_records=maximum_records,
+                )[0]
+            except OfflineLocalizationError as exc:
+                reason = str(exc)
+                degraded = _degraded_localized_tag(item, index, reason)
+                degradations.append(
+                    {
+                        "code": "localized_tag_evidence_degraded",
+                        "severity": "warning",
+                        "disposition": "LOW_CONFIDENCE",
+                        "record_index": index,
+                        "tag_id": raw_tag_id,
+                        "observation_id": raw_observation_id,
+                        "detail": reason,
+                        "barcode_retained": degraded is not None,
+                    }
+                )
+                if degraded is not None:
+                    tags.append(degraded)
+            else:
+                tags.append(parsed)
+        return tags
     tags: list[dict[str, Any]] = []
     tag_ids: set[str] = set()
     observation_ids: set[str] = set()
@@ -4240,6 +4695,7 @@ def _mark_tag_for_review(tag: dict[str, Any], reason: str) -> None:
     if isinstance(reasons, list) and reason not in reasons:
         reasons.append(reason)
     tag["needs_review"] = True
+    tag["quality_status"] = "LOW_CONFIDENCE"
     if tag.get("approval_status") in {None, "approved", "auto_approved"}:
         tag["approval_status"] = "pending"
 
@@ -4267,6 +4723,7 @@ def _tag_has_publishable_fields(tag: dict[str, Any]) -> bool:
 def enforce_tag_state_invariants(tag: dict[str, Any]) -> dict[str, Any]:
     """Keep review and approval fields logically consistent."""
     if tag.get("needs_review") is True:
+        tag["quality_status"] = "LOW_CONFIDENCE"
         if tag.get("approval_status") not in {"pending", "rejected"}:
             tag["approval_status"] = "pending"
         return tag
@@ -4284,6 +4741,8 @@ def enforce_tag_state_invariants(tag: dict[str, Any]) -> dict[str, Any]:
         tag["approval_status"] = "auto_approved"
     else:
         _mark_tag_for_review(tag, "automatic_approval_has_no_safe_association_evidence")
+    if tag.get("needs_review") is not True:
+        tag["quality_status"] = "ACCEPTED"
     return tag
 
 
@@ -4296,7 +4755,7 @@ def _apply_on_device_confirmation_authority(
     PC output's legacy business columns follow the explicit on-device choice.
     """
 
-    if tag.get("version") != 2:
+    if tag.get("version") != 2 or tag.get("user_confirmed") is not True:
         return tag
     tag["final_shelf_segment_id"] = tag.get(
         "user_confirmed_shelf_segment_id"
@@ -5252,12 +5711,14 @@ def _render_localized_version(
     # snapshot. The tag bytes and the JSONL records below are the exact
     # bytes that produced the manifest identities, so the bundle SHA always
     # describes what localization actually parsed.
-    (
-        verified_burst_observation_ids,
-        verified_burst_frame_authorities,
-    ) = _verified_tag_burst_evidence(
-        input_snapshot.jsonl_values.get("tag_observation_bursts.jsonl", []),
-        input_snapshot.jsonl_values.get("tag_observations.jsonl", []),
+    verified_burst_observation_ids = (
+        input_snapshot.verified_burst_observation_ids
+    )
+    verified_burst_frame_authorities = (
+        input_snapshot.verified_burst_frame_authorities
+    )
+    tag_evidence_degradations = list(
+        input_snapshot.tag_evidence_degradations
     )
     verified_burst_identities = {
         str(burst.get("burst_id") or ""): (
@@ -5277,6 +5738,7 @@ def _render_localized_version(
         expected_count=localized_tag_count,
         verified_burst_observation_ids=verified_burst_observation_ids,
         verified_burst_identities=verified_burst_identities,
+        degradations=tag_evidence_degradations,
     )
     trace = input_snapshot.jsonl_values["localization_trace.jsonl"]
     trace_diag = input_snapshot.jsonl_diagnostics["localization_trace.jsonl"]
@@ -5369,6 +5831,7 @@ def _render_localized_version(
         ),
         "localization_events": state_diag,
         "localization_recovery_events": recovery_diag,
+        "tag_evidence_degradations": tag_evidence_degradations,
     }
     has_critical_jsonl_damage = False
     initial = _pose_from(metadata.get("initialMapPose"))
@@ -5909,6 +6372,17 @@ def _render_localized_version(
         for index, tag in enumerate(final_tags, start=1)
         if tag.get("needs_review") is True
     )
+    review_items.extend(
+        {
+            "id": f"tag-evidence-{index:06d}",
+            "type": "tag_evidence_degradation",
+            "severity": "warning",
+            "message": "局部价签证据不完整；条码已保留为低置信度结果。",
+            "object_id": item.get("tag_id"),
+            "details": item,
+        }
+        for index, item in enumerate(tag_evidence_degradations, start=1)
+    )
     max_correction = max(corrections, default=0.0)
     # Online constraint acceptance rate: only ÷ online source count,
     # never mix manual events into the denominator.
@@ -5921,27 +6395,16 @@ def _render_localized_version(
     # Publish gate: three explicit levels — draft, review, published.
     # REVIEW requires explicit user submission; PUBLISHED additionally requires
     # the full solver gate and evidence-bound field acceptance.
-    # Any critical JSONL damage or stale node binding prevents even draft.
-    # Explicit diagnostic mode is development/test-only product semantics: it
-    # keeps an unsafe working draft inspectable without relaxing review or
-    # publication gates. Conflicting phone constraints remain in the audit and
-    # are excluded by the robust hard gate above. A verified v3/exact-node
-    # manual localization event is different: it is absolute map-frame evidence
-    # with explicit uncertainty, so a large accumulated gauge correction is
-    # allowed to become a reviewable draft even in strict mode. Local correction
-    # gradients, graph-relative residuals and all publication gates remain.
+    # Any successfully produced finite trajectory is a reviewable draft. Large
+    # corrections, partial graph quality and tag degradations remain explicit
+    # review/publication blockers, but must not turn a safely committed result
+    # back into a generic processing failure. Framing/identity/database damage
+    # and an empty/non-finite trajectory fail earlier and never reach commit.
+    # Explicit diagnostic mode still marks the result diagnostic-only; it does
+    # not weaken any review or publication gate.
     diagnostic_mode = bool(replay_parameters["diagnostic_mode"])
     diagnostic_only = diagnostic_mode or raw_manual_anchor_recovery
-    allow_draft = (
-        bool(optimized)
-        and not has_critical_jsonl_damage
-        and (
-            max_correction <= 2.0
-            or diagnostic_mode
-            or raw_manual_anchor_recovery
-            or accepted_trusted_manual_anchor_count > 0
-        )
-    )
+    allow_draft = bool(optimized) and not has_critical_jsonl_damage
     state_counts: dict[str, int] = {}
     for event in state_events:
         state = str(event.get("state") or "unknown")
@@ -6147,6 +6610,22 @@ def _render_localized_version(
         ),
         "manual_localization_event_audit": manual_event_audit,
         "tag_total": len(final_tags),
+        "tag_source_record_count": localized_tag_count,
+        "tag_retained_count": len(final_tags),
+        "tag_positioned_count": sum(
+            isinstance(tag.get("final_map_position"), dict)
+            for tag in final_tags
+        ),
+        "tag_unpositioned_count": sum(
+            not isinstance(tag.get("final_map_position"), dict)
+            for tag in final_tags
+        ),
+        "tag_low_confidence_count": sum(
+            tag.get("quality_status") == "LOW_CONFIDENCE"
+            for tag in final_tags
+        ),
+        "tag_evidence_degradation_count": len(tag_evidence_degradations),
+        "tag_evidence_degradations": tag_evidence_degradations,
         "tag_confirmed": sum(tag.get("approval_status") in {"approved", "auto_approved"} for tag in final_tags),
         "tag_needs_review": needs_review_count,
         "mean_association_confidence": (
@@ -6154,6 +6633,12 @@ def _render_localized_version(
             / max(1, len(final_tags))
         ),
         "publish_state": "draft" if allow_draft else "invalid",
+        "result_quality_status": (
+            "PARTIAL_REVIEW_REQUIRED"
+            if tag_evidence_degradations or needs_review_count
+            else "COMPLETE"
+        ),
+        "partial_result": bool(tag_evidence_degradations or needs_review_count),
         "allow_draft": allow_draft,
         "diagnostic_mode": diagnostic_mode,
         "diagnostic_only": diagnostic_only,
@@ -6329,6 +6814,15 @@ def _render_localized_version(
         "passed": factor_graph_published_capable and not publish_blockers,
         "blockers": publish_blockers,
     }
+    report["publish_permitted"] = report["publish_gate"]["passed"]
+    if publish_blockers:
+        report["result_quality_status"] = "PARTIAL_REVIEW_REQUIRED"
+        report["partial_result"] = True
+    if tag_evidence_degradations:
+        report["warnings"].append(
+            "部分价签 burst、节点绑定或确认材料不完整；轨迹和可恢复价签已保留，"
+            "相关条目标记为 LOW_CONFIDENCE，结果禁止自动发布。"
+        )
     if has_critical_jsonl_damage:
         report["warnings"].append(
             "检测到 sidecar 文件损坏，结果可能不完整。不得自动发布。"
@@ -6349,9 +6843,10 @@ def _render_localized_version(
         report["warnings"].append(
             "RTAB-Map 全局优化图不完整；本草稿使用完整原始连续 VIO、严格绑定的人工绝对锚点和地图结构约束重建。大绝对修正按地图坐标校准解释，相邻连续形变仍受门禁约束；结果仅供诊断与人工复核，禁止发布。"
         )
-    if not allow_draft:
+    if publish_blockers:
         report["warnings"].append(
-            "处理未能生成有效草稿；检查输入文件和优化器状态。"
+            "质量或发布门禁未全部通过；有限轨迹和可恢复业务结果已作为"
+            "不可发布草稿保留，请按 blocker 和 review item 人工复核。"
         )
     source_hash_after = _regular_file_identity(source_database, "source_database")[
         "sha256"
@@ -6512,19 +7007,27 @@ def _render_localized_version(
             "localization_confidence", "measurement_confidence",
             "association_confidence", "manually_modified", "needs_review",
             "approval_status", "observation_id",
+            "quality_status", "input_evidence_status", "review_reasons",
         ]
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
         for tag in final_tags:
             position = tag.get("final_map_position") or {}
+            x_m = _strict_number(position.get("x_m"))
+            y_m = _strict_number(position.get("y_m"))
             writer.writerow(
                 {
                     **{key: tag.get(key) for key in fieldnames},
-                    "map_x_cm": float(position.get("x_m", 0)) * 100,
-                    "map_y_cm": float(position.get("y_m", 0)) * 100,
+                    "map_x_cm": x_m * 100 if x_m is not None else None,
+                    "map_y_cm": y_m * 100 if y_m is not None else None,
                     "height_cm": (
                         float(position["height_m"]) * 100
                         if position.get("height_m") is not None else None
+                    ),
+                    "review_reasons": json.dumps(
+                        tag.get("review_reasons", []),
+                        ensure_ascii=False,
+                        separators=(",", ":"),
                     ),
                 }
             )

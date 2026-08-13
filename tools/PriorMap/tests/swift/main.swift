@@ -11509,11 +11509,11 @@ do {
         shelves: [segmentLow])
     require(
         sparseTags.count == 1
-            && sparseTags[0].qualityStatus == "RESCAN_REQUIRED"
+            && sparseTags[0].qualityStatus == "LOW_CONFIDENCE"
             && sparseTags[0].shelfSegmentID == "segment-shared-low"
             && sparseRescans.count == 1
             && sparseRescans[0].shelfSegmentID == "segment-shared-low",
-        "RC-B17 associated RESCAN rows must carry shelf_segment_id")
+        "RC-B17 associated low-confidence rows and rescan suggestions must carry shelf_segment_id")
 
     let (weakTags, weakRescans) = try finalizeBucketEvidence(
         finalizerEvidence(
@@ -11560,12 +11560,12 @@ do {
             graphQualityPassed: false)
     require(
         partialGraphFailureTags.count == 1
-            && partialGraphFailureTags[0].qualityStatus == "RESCAN_REQUIRED"
+            && partialGraphFailureTags[0].qualityStatus == "LOW_CONFIDENCE"
             && partialGraphFailureTags[0].reason == "graph_quality_failed"
             && partialGraphFailureRescans.count == 1
             && partialGraphFailureRescans[0].reasonCode
                 == "graph_quality_failed",
-        "a weak-frame quorum must never bypass the hard graph-quality gate")
+        "a weak-frame quorum must retain a low-confidence row while the hard graph-quality gate adds a rescan suggestion")
 
     var insufficientPositionEvidence = finalizerEvidence(
         barcode: "INSUFFICIENT-POSITION",
@@ -11581,7 +11581,7 @@ do {
             shelves: [segmentLow])
     require(
         insufficientPositionTags.count == 1
-            && insufficientPositionTags[0].qualityStatus == "RESCAN_REQUIRED"
+            && insufficientPositionTags[0].qualityStatus == "LOW_CONFIDENCE"
             && insufficientPositionTags[0].mapXM == nil
             && insufficientPositionTags[0].mapYM == nil
             && insufficientPositionTags[0].reason
@@ -11589,7 +11589,7 @@ do {
             && insufficientPositionRescans.count == 1
             && insufficientPositionRescans[0].reasonCode
                 == "unlocalized_observation",
-        "fewer than three recomputable frames must preserve a RESCAN_REQUIRED tag row")
+        "fewer than three recomputable frames must preserve a LOW_CONFIDENCE tag row plus a rescan suggestion")
 
     let (unassociatedTags, unassociatedRescans) = try finalizeBucketEvidence(
         finalizerEvidence(
@@ -11617,7 +11617,7 @@ do {
     require(
         unassociatedGraphFailureTags.count == 1
             && unassociatedGraphFailureTags[0].qualityStatus
-                == "RESCAN_REQUIRED"
+                == "LOW_CONFIDENCE"
             && unassociatedGraphFailureTags[0].reason
                 == "graph_quality_failed"
             && unassociatedGraphFailureRescans.count == 1

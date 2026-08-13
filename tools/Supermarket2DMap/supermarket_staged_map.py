@@ -60,8 +60,12 @@ def apply_transform_to_pose(pose: base.Pose2D, transform: Dict[str, float]) -> N
 
 
 def apply_transform_to_tag(tag: base.PriceTag, transform: Dict[str, float]) -> None:
-    tag.raw_x, tag.raw_y = base.transform_point(tag.raw_x, tag.raw_y, transform["dx"], transform["dy"], transform["yaw"])
-    tag.yaw += transform["yaw"]
+    if tag.raw_x is not None and tag.raw_y is not None:
+        tag.raw_x, tag.raw_y = base.transform_point(
+            tag.raw_x, tag.raw_y, transform["dx"], transform["dy"], transform["yaw"]
+        )
+    if tag.yaw is not None:
+        tag.yaw += transform["yaw"]
 
 
 def apply_transform_to_point(point: base.ProjectedPoint, transform: Dict[str, float]) -> None:
@@ -255,9 +259,15 @@ def write_review_items(path: Path, base_report: Dict[str, Any], stage_warnings: 
                     "type": "price_tag",
                     "message": f"Price tag {tag.tag_id} needs position review",
                     "segment": tag.segment_index,
-                    "raw_xy": [tag.raw_x, tag.raw_y],
+                    "raw_xy": (
+                        [tag.raw_x, tag.raw_y]
+                        if tag.raw_x is not None and tag.raw_y is not None
+                        else None
+                    ),
                     "snapped_xy": [tag.snapped_x, tag.snapped_y],
                     "confidence": tag.confidence,
+                    "quality_status": tag.quality_status,
+                    "review_reasons": tag.review_reasons,
                 }
             )
     path.write_text(json.dumps({"items": items}, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -324,6 +334,7 @@ def generate(args: argparse.Namespace) -> Path:
     base.write_yaml(output_dir / "occupancy_grid.yaml", grid, "occupancy_grid.png")
     base.write_geojson(output_dir / "trajectory.geojson", base.trajectory_geojson(segments))
     base.write_geojson(output_dir / "price_tags.geojson", base.price_tags_geojson(tags))
+    base.write_price_tag_artifacts(output_dir, tags)
     base.write_geojson(output_dir / "vector_map.geojson", base.vector_map_geojson(grid))
     preview_3d_summary = base.write_preview_3d(
         output_dir / "preview_3d.json",
@@ -420,6 +431,8 @@ def generate(args: argparse.Namespace) -> Path:
             "preview_frames/",
             "trajectory.geojson",
             "price_tags.geojson",
+            "price_tags.json",
+            "price_tags.csv",
             "vector_map.geojson",
             "semantic_layers.json",
             "quality_report.json",

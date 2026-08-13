@@ -1977,9 +1977,10 @@ enum MobileProcessingPipeline {
     /// occlusion) BEFORE any clustering, bucketed by the exact
     /// barcode+symbology+floor+shelf-segment+side+session identity, and
     /// only then clustered with a bounded diameter. Unlocalized observations
-    /// and observations that fail exact-node resolution become explicit
-    /// RESCAN tasks. A resolved position that cannot yet be associated with a
-    /// shelf is retained as LOW_CONFIDENCE instead of forcing another scan.
+    /// and exact-node resolution failures remain explicit LOW_CONFIDENCE tag
+    /// rows. They may add a non-blocking rescan suggestion, but a local
+    /// evidence gap never deletes the barcode or turns the whole result into
+    /// a processing failure.
     static func finalizeTags(
         observations: [TagObservationEvidenceObservation],
         resolverIndex: TagObservationResolver.NodeIndex,
@@ -2047,7 +2048,7 @@ enum MobileProcessingPipeline {
                     positionSpreadCm: 0,
                     localizationConfidence: 0,
                     associationConfidence: 0,
-                    qualityStatus: "RESCAN_REQUIRED",
+                    qualityStatus: "LOW_CONFIDENCE",
                     reason: "trajectory_local_frame_only"))
                 tasks.append(RescanTask(
                     taskID: "rescan-\(tasks.count + 1)-\(key.barcode)-local-only",
@@ -2323,7 +2324,7 @@ enum MobileProcessingPipeline {
                 positionSpreadCm: 0,
                 localizationConfidence: 0,
                 associationConfidence: 0,
-                qualityStatus: "RESCAN_REQUIRED",
+                qualityStatus: "LOW_CONFIDENCE",
                 reason: "burst_observation_incomplete:\(burst.missingObservationCount)"))
             rescanTasks.append(RescanTask(
                 taskID: "rescan-\(rescanTasks.count + 1)-\(burst.barcode)-incomplete",
@@ -2415,7 +2416,7 @@ enum MobileProcessingPipeline {
                 positionSpreadCm: 0,
                 localizationConfidence: 0,
                 associationConfidence: 0,
-                qualityStatus: "RESCAN_REQUIRED",
+                qualityStatus: "LOW_CONFIDENCE",
                 reason: group.reason))
             rescanTasks.append(RescanTask(
                 taskID: "rescan-\(rescanTasks.count + 1)-\(group.barcode)-\(group.reason)",
@@ -2461,8 +2462,8 @@ enum MobileProcessingPipeline {
                     }) else {
                     let reason = authoritativeFailureReason(for: instance)
                         ?? "no_shelf_association"
-                    let status = reason == "no_shelf_association"
-                        ? "LOW_CONFIDENCE" : "RESCAN_REQUIRED"
+                    let rescanSuggested = reason != "no_shelf_association"
+                    let status = "LOW_CONFIDENCE"
                     priceTags.append(FinalPriceTag(
                         tagInstanceID: "\(instance.barcode)-\(instance.floorID)-\(priceTags.count + 1)",
                         barcode: instance.barcode,
@@ -2485,7 +2486,7 @@ enum MobileProcessingPipeline {
                         associationConfidence: instance.associationConfidence,
                         qualityStatus: status,
                         reason: reason))
-                    if status == "RESCAN_REQUIRED" {
+                    if rescanSuggested {
                         rescanTasks.append(RescanTask(
                             taskID: "rescan-\(rescanTasks.count + 1)-\(instance.barcode)",
                             taskType: .tagRescan,
@@ -2557,7 +2558,9 @@ enum MobileProcessingPipeline {
                             graphQualityPassed: graphQualityPassed,
                             mapSessionIdentityConsistent: mapSessionIdentityConsistent))
                 }
-                let status = evaluation.0.rawValue
+                let rescanSuggested = evaluation.0 == .rescanRequired
+                let status = rescanSuggested
+                    ? "LOW_CONFIDENCE" : evaluation.0.rawValue
                 let reason = evaluation.1
                 priceTags.append(FinalPriceTag(
                     tagInstanceID: "\(instance.barcode)-\(instance.floorID)-\(priceTags.count + 1)",
@@ -2581,7 +2584,7 @@ enum MobileProcessingPipeline {
                     associationConfidence: instance.associationConfidence,
                     qualityStatus: status,
                     reason: reason))
-                if status == "RESCAN_REQUIRED" {
+                if rescanSuggested {
                     rescanTasks.append(RescanTask(
                         taskID: "rescan-\(rescanTasks.count + 1)-\(instance.barcode)",
                         taskType: .tagRescan,

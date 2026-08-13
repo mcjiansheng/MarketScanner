@@ -1,6 +1,6 @@
 # RTAB-Map 大型超市扫描与地图工作台
 
-> 文档状态：**当前有效**。最后一次与源码交叉核对日期：2026-08-12。
+> 文档状态：**当前有效**。最后一次与源码交叉核对日期：2026-08-13。
 
 本项目是在开源 **RTAB-Map** 基础上进行的业务化改造，面向大型超市、仓储卖场等室内场景，形成从 iPhone Pro 连续采集，到 PC 端离线优化，再到二维地图、彩色俯视图和三维预览的一套本地工作流。
 
@@ -85,7 +85,7 @@ Android 目录中的部分 C++ 原生实现也因共享移动渲染和数据库�
 
 扫描最终化与证据 writer 通过统一 admission gate 线性化：finalization 关闭新 admission 后，会等待此前已登记的 localization/confirmation transaction 完成；已登记 writer 不会被内部二次 finalization 检查误拒。finalization sentinel 之后到达的普通 ARFrame 定位任务和普通 Recovery append 会被拒绝，只有终端 Recovery 与 scan-stop 自有 audit 使用窄范围 `allowDuringFinalization`。ESL audit 冻结 generation 对应的 exact tracking session，只能追加到仍存在的既有 `segment_0001`，不会创建空的后继会话，也不会把旧 capture audit 写入新会话。
 
-PC 输入 manifest v3 在既有 Recovery 证据之外绑定 burst sidecar。共享 validator 严格验证 v1/v2/v3 整数版本、Recovery binding、role/filename 顺序、大小写不敏感文件名唯一性、source database 安全 basename 及其与 `source_manifest` 的名称一致性；snapshot 与 verified copy 拒绝 source DB hardlink、非空 WAL 和 rollback journal。manifest v3 中只有 localized tag v2 使用 verified complete burst 的 `bound_node_id` 作为唯一节点权威；同一会话中的历史 tag v1 保持 legacy explicit-node/timestamp 兼容，不会被错误强制绑定到 burst。最终价签质量为 `ACCEPTED / LOW_CONFIDENCE / RESCAN_REQUIRED`：完整、精确绑定且可重算但质量不足的价签进入 `LOW_CONFIDENCE` 和 PriceTags 待复核，不自动生成重扫任务；身份、图质量、完整 burst、exact node 或位置权威缺失仍为 `RESCAN_REQUIRED`。离线优化与现场选择一致时输出 `NO_CONFLICT` 并保持批准；可靠优化结果冲突时输出 `USER_CONFIRMATION_CONFLICT`，离线证据不可用时输出 `OFFLINE_ASSOCIATION_UNAVAILABLE`，两者都强制 `REVIEW_REQUIRED` / rescan。MapCase02、地图坐标变换和任何 store/map/file-specific scale、offset、rotation 启发式均未在本轮 ESL 增量修改；其后续修复以独立正式规范和提交为准。真实 LiDAR iPhone 的 30 秒性能、强弱光/反光/斜视/多价签矩阵和完整现场验收仍未执行，因此项目判断仍是 **REJECTED / NO-GO / developer smoke only**，J-04 仍为 **BLOCKER / NOT CLOSED**。
+PC 输入 manifest v3 在既有 Recovery 证据之外绑定 burst sidecar。共享 validator 严格验证 v1/v2/v3 整数版本、Recovery binding、role/filename 顺序、大小写不敏感文件名唯一性、source database 安全 basename 及其与 `source_manifest` 的名称一致性；snapshot 与 verified copy 拒绝 source DB hardlink、非空 WAL 和 rollback journal。manifest v3 中只有 localized tag v2 使用 verified complete burst 的 `bound_node_id` 作为唯一节点权威；同一会话中的历史 tag v1 保持 legacy explicit-node/timestamp 兼容，不会被错误强制绑定到 burst。手机和 PC 现在统一采用“结果保留、发布从严”合同：单个 burst/frame、节点绑定、位置字段、货架关联或确认材料不完整，只降级对应价签为 `LOW_CONFIDENCE`，保留条码、可恢复位置和精确原因；必要时额外生成非阻断补扫建议。普通 PC 地图同时输出全量 `price_tags.json/csv`，无有限坐标的价签不会进入 GeoJSON，也不会被伪造为 `(0,0)`。文件 framing/UTF-8/JSON 不可界定、哈希或水位不一致、重复持久主键、地图/门店/楼层/会话身份串包、数据库损坏、完全没有有限轨迹或无法安全提交结果仍会终止。任何低置信度/部分结果都设置 `publish_permitted=false`，但不再等同于处理失败或价签删除。离线优化与现场选择一致时输出 `NO_CONFLICT` 并保持批准；可靠优化结果冲突时输出 `USER_CONFIRMATION_CONFLICT`，离线证据不可用时输出 `OFFLINE_ASSOCIATION_UNAVAILABLE`，两者都强制人工复核。MapCase02、地图坐标变换和任何 store/map/file-specific scale、offset、rotation 启发式均未在本轮 ESL 增量修改；其后续修复以独立正式规范和提交为准。真实 LiDAR iPhone 的 30 秒性能、强弱光/反光/斜视/多价签矩阵和完整现场验收仍未执行，因此项目判断仍是 **REJECTED / NO-GO / developer smoke only**，J-04 仍为 **BLOCKER / NOT CLOSED**。
 
 阶段一/二整改和阶段三草稿复核链路已有自动测试；真实 LiDAR iPhone 完整干跑和正式超市现场验收仍是发布前门槛。本文不把模拟指标表述为现场精度或生产批准。完整架构、格式、UI、测试和当前状态见 [docs/map-assisted-localization/](docs/map-assisted-localization/)，双模式操作、复核、备份和失败恢复见 [用户操作手册](docs/map-assisted-localization/USER_GUIDE.md)，本轮 RepairV2 审查闭环见 [当前审查记录](docs/map-assisted-localization/reviews/CURRENT_REVIEW.md)。
 
@@ -216,7 +216,9 @@ MapStudio-*/
   preview_3d.json
   preview_frames/
   trajectory.geojson
-  price_tags.geojson            # 仅在旧输入含价签记录时有数据
+  price_tags.json               # 全量价签；无位置条目也保留
+  price_tags.csv                # 全量价签表格导出
+  price_tags.geojson            # 仅包含具有有限地图坐标的价签
   vector_map.geojson
   semantic_layers.json
   quality_report.json

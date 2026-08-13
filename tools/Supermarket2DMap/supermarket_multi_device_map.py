@@ -315,6 +315,7 @@ def generate(args: argparse.Namespace) -> Path:
     base.write_yaml(output_dir / "occupancy_grid.yaml", grid, "occupancy_grid.png")
     base.write_geojson(output_dir / "trajectory.geojson", base.trajectory_geojson(all_segments))
     base.write_geojson(output_dir / "price_tags.geojson", base.price_tags_geojson(tags))
+    base.write_price_tag_artifacts(output_dir, tags)
     base.write_geojson(output_dir / "vector_map.geojson", base.vector_map_geojson(grid))
     preview_3d_summary = base.write_preview_3d(
         output_dir / "preview_3d.json",
@@ -431,6 +432,8 @@ def generate(args: argparse.Namespace) -> Path:
             "preview_frames/",
             "trajectory.geojson",
             "price_tags.geojson",
+            "price_tags.json",
+            "price_tags.csv",
             "vector_map.geojson",
             "semantic_layers.json",
             "quality_report.json",

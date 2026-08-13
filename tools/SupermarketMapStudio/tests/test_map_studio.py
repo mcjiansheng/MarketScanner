@@ -28,6 +28,7 @@ STUDIO_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(STUDIO_DIR))
 import server  # noqa: E402
 import folder_dialog  # noqa: E402
+from tools.Supermarket2DMap import supermarket_2d_map as map2d  # noqa: E402
 
 
 def immediate_popen(callback):
@@ -584,6 +585,99 @@ def create_manual_merge_result(root: Path) -> tuple[Path, Path, Path]:
         encoding="utf-8",
     )
     return session, database, output
+
+
+class Map2DPriceTagRetentionTests(unittest.TestCase):
+    def test_xz_position_does_not_require_unused_y_axis(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            tags_path = Path(temporary) / "price_tags.json"
+            tags_path.write_text(
+                json.dumps(
+                    [
+                        {
+                            "tagIdentifier": "tag-xz",
+                            "payload": "690000000003",
+                            "x": 1.25,
+                            "z": -3.5,
+                        }
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            tags, audit = map2d.load_price_tags(tags_path, "xz")
+            self.assertEqual(len(tags), 1)
+            self.assertAlmostEqual(tags[0].raw_x, 1.25)
+            self.assertAlmostEqual(tags[0].raw_y, -3.5)
+            self.assertEqual(audit["positioned_count"], 1)
+            self.assertEqual(audit["unpositioned_count"], 0)
+
+    def test_malformed_or_non_array_tag_document_is_not_silently_emptied(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            tags_path = Path(temporary) / "price_tags.json"
+            tags_path.write_text('[{"payload":"690000000004"}', encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "Cannot safely parse"):
+                map2d.load_price_tags(tags_path, "xz")
+
+            tags_path.write_text(
+                json.dumps({"payload": "690000000004"}), encoding="utf-8"
+            )
+            with self.assertRaisesRegex(ValueError, "expected a JSON array"):
+                map2d.load_price_tags(tags_path, "xz")
+
+    def test_map2d_retains_barcode_with_invalid_position_without_origin_fallback(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            tags_path = Path(temporary) / "price_tags.json"
+            tags_path.write_text(
+                json.dumps(
+                    [
+                        {
+                            "tagIdentifier": "tag-good",
+                            "payload": "690000000001",
+                            "x": 1.0,
+                            "y": 0.0,
+                            "z": 2.0,
+                        },
+                        {
+                            "tagIdentifier": "tag-partial",
+                            "payload": "690000000002",
+                            "x": "not-a-number",
+                            "y": 0.0,
+                            "z": 2.0,
+                        },
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            tags, audit = map2d.load_price_tags(tags_path, "xz")
+            self.assertEqual([tag.payload for tag in tags], [
+                "690000000001", "690000000002"
+            ])
+            self.assertEqual(audit["retained_count"], 2)
+            self.assertEqual(audit["unpositioned_count"], 1)
+            map2d.snap_price_tags(tags, [], 1.0)
+            partial = tags[1]
+            self.assertIsNone(partial.raw_x)
+            self.assertIsNone(partial.raw_y)
+            self.assertEqual(partial.quality_status, "LOW_CONFIDENCE")
+            geojson = map2d.price_tags_geojson(tags)
+            self.assertEqual(len(geojson["features"]), 1)
+            self.assertEqual(
+                geojson["features"][0]["properties"]["tag_id"],
+                "tag-good",
+            )
+            output = Path(temporary) / "output"
+            output.mkdir()
+            map2d.write_price_tag_artifacts(output, tags)
+            retained = json.loads(
+                (output / "price_tags.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(len(retained), 2)
+            self.assertEqual(retained[1]["position_status"], "UNAVAILABLE")
+            self.assertIsNone(retained[1]["raw_x"])
 
 
 class MapStudioApiTests(unittest.TestCase):

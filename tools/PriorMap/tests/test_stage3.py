@@ -1129,6 +1129,138 @@ class ESLConfirmationContractTests(unittest.TestCase):
         ):
             _verified_tag_burst_evidence([burst], observations)
 
+    def test_incomplete_burst_and_tag_contract_degrade_without_deleting_barcode(
+        self,
+    ) -> None:
+        tag, verified = self._fixture()
+        capture_id = str(tag["capture_id"])
+        observations = [
+            {
+                "observation_id": frame_id,
+                "burst_id": capture_id,
+                "frame_id": f"frame-{index}",
+                "frame_timestamp": 10.0 + index * 0.1,
+                "node_timebase_frame_timestamp": 110.0 + index * 0.1,
+                "nearest_node_id": 11,
+                "payload": tag["payload"],
+                "symbology": tag["symbology"],
+            }
+            for index, frame_id in enumerate(tag["frame_observation_ids"], start=1)
+        ]
+        burst = {
+            "burst_id": capture_id,
+            "sequence": 1,
+            "complete": True,
+            "barcode": tag["payload"],
+            "symbology": tag["symbology"],
+            "frames": [
+                {
+                    "observation_id": observation["observation_id"],
+                    "frame_id": observation["frame_id"],
+                    "bound_node_id": 11,
+                    "frame_timestamp": observation["frame_timestamp"],
+                    "node_timestamp": observation[
+                        "node_timebase_frame_timestamp"
+                    ],
+                }
+                for observation in observations
+            ],
+        }
+        observations[1]["nearest_node_id"] = 99
+        evidence_degradations: list[dict[str, object]] = []
+        verified_frames, authorities = _verified_tag_burst_evidence(
+            [burst], observations, degradations=evidence_degradations
+        )
+        self.assertEqual(verified_frames, {})
+        self.assertEqual(authorities, {})
+        self.assertIn(
+            "tag_observation_node_conflicts_with_burst",
+            {item["code"] for item in evidence_degradations},
+        )
+
+        tag_degradations: list[dict[str, object]] = []
+        parsed = _read_localized_price_tags_bytes(
+            json.dumps([tag]).encode("utf-8"),
+            session_id="session-1",
+            expected_map_id="map-1",
+            expected_map_hash="a" * 64,
+            expected_floor_id="floor-1",
+            expected_count=1,
+            verified_burst_observation_ids=verified_frames,
+            verified_burst_identities={
+                capture_id: (tag["payload"], tag["symbology"])
+            },
+            degradations=tag_degradations,
+        )
+        self.assertEqual(len(parsed), 1)
+        self.assertEqual(parsed[0]["payload"], "ESL-001")
+        self.assertEqual(parsed[0]["quality_status"], "LOW_CONFIDENCE")
+        self.assertTrue(parsed[0]["needs_review"])
+        self.assertEqual(parsed[0]["raw_map_position"], tag["raw_map_position"])
+        self.assertTrue(tag_degradations[0]["barcode_retained"])
+
+    def test_degraded_tag_records_still_obey_total_record_limits(self) -> None:
+        records = [
+            {
+                "format": "MarketScannerPriceTagObservation",
+                "version": 1,
+                "observation_id": f"obs-{index}",
+                "payload": "ESL-001",
+                "symbology": "VNBarcodeSymbologyCode128",
+                "tracking_session_id": "session-1",
+                "prior_map_sha256": "a" * 64,
+                "floor_id": "floor-1",
+                "node_timebase_frame_timestamp": float(index),
+                # Deliberately omit raw_map_position so every safely framed
+                # record follows the per-record LOW_CONFIDENCE path.
+            }
+            for index in (1, 2)
+        ]
+        data = b"".join(
+            json.dumps(record, sort_keys=True).encode("utf-8") + b"\n"
+            for record in records
+        )
+        cases = (
+            (
+                offline_localization.JsonlContract(
+                    "tag_observations",
+                    "MarketScannerPriceTagObservation",
+                    frozenset({1}),
+                    False,
+                    True,
+                    ("node_timebase_frame_timestamp",),
+                    record_id_field="observation_id",
+                    maximum_records=1,
+                ),
+                "bounded 1-record safety limit",
+            ),
+            (
+                offline_localization.JsonlContract(
+                    "tag_observations",
+                    "MarketScannerPriceTagObservation",
+                    frozenset({1}),
+                    False,
+                    True,
+                    ("node_timebase_frame_timestamp",),
+                    record_id_field="observation_id",
+                    maximum_records=10,
+                    qualification_maximum_records=1,
+                ),
+                "qualification_limit_exceeded",
+            ),
+        )
+        for contract, message in cases:
+            with self.subTest(message=message):
+                with self.assertRaisesRegex(OfflineLocalizationError, message):
+                    offline_localization._read_tag_jsonl_bytes_degraded(
+                        data,
+                        contract,
+                        path_label="tag_observations.jsonl",
+                        session_id="session-1",
+                        expected_map_hash="a" * 64,
+                        expected_floor_id="floor-1",
+                    )
+
     def test_offline_conflict_keeps_user_choice_and_requires_review(self) -> None:
         tag, _ = self._fixture()
         tag["final_map_position"] = {"x_m": 1.0, "y_m": 2.0, "height_m": 1.1}
@@ -1749,6 +1881,13 @@ class LocalizedPipelineTests(unittest.TestCase):
             )
         self.assertEqual(first["rejected_constraint_count"], 1)
         self.assertTrue(first["allow_draft"])
+        self.assertTrue(first["current_updated"])
+        self.assertEqual(first["publish_state"], "draft")
+        self.assertEqual(
+            first["result_quality_status"], "PARTIAL_REVIEW_REQUIRED"
+        )
+        self.assertTrue(first["partial_result"])
+        self.assertFalse(first["publish_permitted"])
         self.assertEqual(first["solver"]["type"], "bounded_correction_field")
         self.assertFalse(first["solver"]["published_capable"])
         self.assertIn(
@@ -2191,7 +2330,7 @@ class LocalizedPipelineTests(unittest.TestCase):
         self.assertTrue(tag["needs_review"])
         self.assertEqual(tag["approval_status"], "pending")
 
-    def test_esl_v3_observation_node_injection_fails_before_render(
+    def test_esl_v3_observation_node_injection_degrades_only_affected_tag(
         self,
     ) -> None:
         self._upgrade_fixture_to_esl_confirmation_v3()
@@ -2206,19 +2345,33 @@ class LocalizedPipelineTests(unittest.TestCase):
                 observations[0][field] = 999
                 jsonl_write(observations_path, observations)
                 output = self.root / f"localized-esl-node-injection-{field}"
-                with self.assertRaisesRegex(
-                    OfflineLocalizationError,
-                    "conflicts with its verified burst bound node",
-                ):
-                    process_localized_session(
-                        self.prior_map,
-                        self.session,
-                        self.poses,
-                        self.source_database,
-                        self.optimized_database,
-                        output,
-                    )
-                self.assertIsNone(LocalizedVersionStore(output).current())
+                report = process_localized_session(
+                    self.prior_map,
+                    self.session,
+                    self.poses,
+                    self.source_database,
+                    self.optimized_database,
+                    output,
+                )
+                snapshot = LocalizedVersionStore(output).current()
+                self.assertIsNotNone(snapshot)
+                assert snapshot is not None
+                tags = json.loads(
+                    (snapshot.version_dir / "localized_price_tags.json")
+                    .read_text(encoding="utf-8")
+                )
+                self.assertEqual(len(tags), 1)
+                self.assertEqual(tags[0]["quality_status"], "LOW_CONFIDENCE")
+                self.assertTrue(tags[0]["needs_review"])
+                self.assertNotIn("final_map_position", tags[0])
+                self.assertFalse(report["publish_permitted"])
+                self.assertIn(
+                    "tag_observation_node_conflicts_with_burst",
+                    {
+                        item["code"]
+                        for item in report["tag_evidence_degradations"]
+                    },
+                )
 
     def test_esl_confirmation_missing_raw_position_has_stable_unavailable_audit(
         self,
@@ -2680,18 +2833,29 @@ class LocalizedPipelineTests(unittest.TestCase):
     def test_missing_tag_observation_never_defaults_to_node_zero(self) -> None:
         jsonl_write(self.segment / "tag_observations.jsonl", [])
         output = self.root / "localized-missing-observation"
-        with self.assertRaisesRegex(
-            OfflineLocalizationError, "tag_observations.jsonl"
-        ):
-            process_localized_session(
-                self.prior_map,
-                self.session,
-                self.poses,
-                self.source_database,
-                self.optimized_database,
-                output,
+        report = process_localized_session(
+            self.prior_map,
+            self.session,
+            self.poses,
+            self.source_database,
+            self.optimized_database,
+            output,
+        )
+        snapshot = LocalizedVersionStore(output).current()
+        self.assertIsNotNone(snapshot)
+        assert snapshot is not None
+        tags = json.loads(
+            (snapshot.version_dir / "localized_price_tags.json").read_text(
+                encoding="utf-8"
             )
-        self.assertIsNone(LocalizedVersionStore(output).current())
+        )
+        self.assertEqual(len(tags), 1)
+        self.assertEqual(tags[0]["payload"], "690000000001")
+        self.assertEqual(tags[0]["quality_status"], "LOW_CONFIDENCE")
+        self.assertNotIn("final_map_position", tags[0])
+        self.assertTrue(tags[0]["needs_review"])
+        self.assertEqual(report["tag_unpositioned_count"], 1)
+        self.assertFalse(report["publish_permitted"])
 
     def test_legacy_manual_wall_clock_event_is_audited_not_applied(self) -> None:
         jsonl_write(
@@ -3177,15 +3341,33 @@ class LocalizedPipelineTests(unittest.TestCase):
 
         invalid_height = [dict(original[0], height_cm=True)]
         json_write(tags_path, invalid_height)
-        with self.assertRaisesRegex(OfflineLocalizationError, "height_cm"):
-            process_localized_session(
-                self.prior_map,
-                self.session,
-                self.poses,
-                self.source_database,
-                self.optimized_database,
-                self.root / "wrong-final-tag-height",
+        output = self.root / "wrong-final-tag-height"
+        report = process_localized_session(
+            self.prior_map,
+            self.session,
+            self.poses,
+            self.source_database,
+            self.optimized_database,
+            output,
+        )
+        snapshot = LocalizedVersionStore(output).current()
+        self.assertIsNotNone(snapshot)
+        assert snapshot is not None
+        tags = json.loads(
+            (snapshot.version_dir / "localized_price_tags.json").read_text(
+                encoding="utf-8"
             )
+        )
+        self.assertEqual(tags[0]["quality_status"], "LOW_CONFIDENCE")
+        self.assertEqual(tags[0]["payload"], original[0]["payload"])
+        self.assertIn("final_map_position", tags[0])
+        self.assertAlmostEqual(tags[0]["final_map_position"]["x_m"], 2.0)
+        self.assertAlmostEqual(tags[0]["final_map_position"]["y_m"], -2.534375)
+        self.assertEqual(
+            tags[0]["transform_audit"]["source_position_field"],
+            "tag.raw_map_position",
+        )
+        self.assertFalse(report["publish_permitted"])
 
 
 # P7R6A: shared recovery lifecycle fixtures. The device-side strict parser

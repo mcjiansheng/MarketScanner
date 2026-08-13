@@ -81,14 +81,17 @@ class PriceTag:
     payload: str
     segment_index: int
     node_count: Optional[int]
-    raw_x: float
-    raw_y: float
-    yaw: float
+    raw_x: Optional[float]
+    raw_y: Optional[float]
+    yaw: Optional[float]
     timestamp: Optional[float]
     snapped_x: Optional[float] = None
     snapped_y: Optional[float] = None
     confidence: float = 0.35
     needs_review: bool = True
+    quality_status: str = "LOW_CONFIDENCE"
+    review_reasons: List[str] = dataclasses.field(default_factory=list)
+    source_record_index: int = 0
 
 
 @dataclasses.dataclass
@@ -112,6 +115,7 @@ class Segment:
     price_tags: List[PriceTag]
     has_local_grid_blobs: bool = False
     sqlite_warnings: List[str] = dataclasses.field(default_factory=list)
+    price_tag_audit: Dict[str, Any] = dataclasses.field(default_factory=dict)
 
 
 @dataclasses.dataclass
@@ -680,31 +684,158 @@ def project_xy(x: float, y: float, z: float, axes: str) -> Tuple[float, float]:
     raise ValueError(f"Unsupported horizontal axes: {axes}")
 
 
-def load_price_tags(path: Path, axes: str) -> List[PriceTag]:
+def finite_number(value: Any) -> Optional[float]:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def load_price_tags(
+    path: Path, axes: str
+) -> Tuple[List[PriceTag], Dict[str, Any]]:
     raw_tags = read_json(path, [])
+    audit: Dict[str, Any] = {
+        "source_file": str(path),
+        "source_record_count": 0,
+        "retained_count": 0,
+        "positioned_count": 0,
+        "low_confidence_count": 0,
+        "unpositioned_count": 0,
+        "degradations": [],
+    }
+    if isinstance(raw_tags, dict) and isinstance(raw_tags.get("_error"), str):
+        raise ValueError(
+            f"Cannot safely parse price-tag input {path}: {raw_tags['_error']}"
+        )
     if not isinstance(raw_tags, list):
-        return []
+        raise ValueError(
+            f"Cannot safely parse price-tag input {path}: expected a JSON array."
+        )
+    audit["source_record_count"] = len(raw_tags)
     tags: List[PriceTag] = []
-    for raw in raw_tags:
+    used_ids: Set[str] = set()
+    for record_index, raw in enumerate(raw_tags):
         if not isinstance(raw, dict):
+            audit["degradations"].append(
+                {
+                    "code": "price_tag_record_not_object",
+                    "record_index": record_index,
+                    "barcode_retained": False,
+                }
+            )
             continue
-        x = float(raw.get("x", 0.0))
-        y = float(raw.get("y", 0.0))
-        z = float(raw.get("z", 0.0))
-        px, py = project_xy(x, y, z, axes)
+        payload = str(raw.get("payload") or "").strip()
+        tag_id = str(raw.get("tagIdentifier") or raw.get("id") or "").strip()
+        if not tag_id:
+            if not payload:
+                audit["degradations"].append(
+                    {
+                        "code": "price_tag_identity_missing",
+                        "record_index": record_index,
+                        "barcode_retained": False,
+                    }
+                )
+                continue
+            tag_id = "degraded-" + hashlib.sha256(
+                f"{record_index}:{payload}".encode("utf-8")
+            ).hexdigest()[:24]
+        if tag_id in used_ids:
+            original_id = tag_id
+            tag_id = f"{tag_id}-duplicate-{record_index + 1}"
+            audit["degradations"].append(
+                {
+                    "code": "price_tag_id_duplicate",
+                    "record_index": record_index,
+                    "tag_id": original_id,
+                    "retained_as": tag_id,
+                    "barcode_retained": True,
+                }
+            )
+        used_ids.add(tag_id)
+        coordinates = {
+            "x": finite_number(raw.get("x")),
+            "y": finite_number(raw.get("y")),
+            "z": finite_number(raw.get("z")),
+        }
+        reasons: List[str] = []
+        px: Optional[float] = None
+        py: Optional[float] = None
+        required_coordinates = {
+            "xy": ("x", "y"),
+            "xz": ("x", "z"),
+            "ios_prior": ("x", "y"),
+        }.get(axes)
+        if required_coordinates is None:
+            raise ValueError(f"Unsupported horizontal axes: {axes}")
+        if any(coordinates[name] is None for name in required_coordinates):
+            reasons.append("price_tag_position_missing_or_nonfinite")
+        else:
+            # The unused height axis is irrelevant to a recoverable 2-D tag
+            # position. Supply a finite placeholder only to the shared
+            # projection helper; it is never emitted as measured evidence.
+            px, py = project_xy(
+                coordinates["x"] if coordinates["x"] is not None else 0.0,
+                coordinates["y"] if coordinates["y"] is not None else 0.0,
+                coordinates["z"] if coordinates["z"] is not None else 0.0,
+                axes,
+            )
+        segment_raw = raw.get("segmentIndex")
+        if segment_raw is None:
+            segment_raw = raw.get("segment_index")
+        try:
+            segment_index = int(segment_raw or 0)
+        except (TypeError, ValueError):
+            segment_index = 0
+            reasons.append("price_tag_segment_index_invalid")
+        node_raw = raw.get("nodeCount")
+        try:
+            node_count = int(node_raw) if node_raw is not None else None
+        except (TypeError, ValueError):
+            node_count = None
+            reasons.append("price_tag_node_count_invalid")
+        yaw = finite_number(raw.get("yaw"))
+        if yaw is None and raw.get("yaw") is not None:
+            reasons.append("price_tag_yaw_invalid")
+        timestamp = finite_number(raw.get("timestamp"))
+        if timestamp is None and raw.get("timestamp") is not None:
+            reasons.append("price_tag_timestamp_invalid")
         tags.append(
             PriceTag(
-                tag_id=str(raw.get("tagIdentifier") or raw.get("id") or ""),
-                payload=str(raw.get("payload") or ""),
-                segment_index=int(raw.get("segmentIndex") or raw.get("segment_index") or 0),
-                node_count=int(raw["nodeCount"]) if raw.get("nodeCount") is not None else None,
+                tag_id=tag_id,
+                payload=payload,
+                segment_index=segment_index,
+                node_count=node_count,
                 raw_x=px,
                 raw_y=py,
-                yaw=float(raw.get("yaw", 0.0)),
-                timestamp=float(raw["timestamp"]) if raw.get("timestamp") is not None else None,
+                yaw=yaw,
+                timestamp=timestamp,
+                quality_status="LOW_CONFIDENCE",
+                review_reasons=reasons,
+                source_record_index=record_index,
             )
         )
-    return tags
+        for reason in reasons:
+            audit["degradations"].append(
+                {
+                    "code": reason,
+                    "record_index": record_index,
+                    "tag_id": tag_id,
+                    "barcode_retained": True,
+                }
+            )
+    audit["retained_count"] = len(tags)
+    audit["positioned_count"] = sum(
+        tag.raw_x is not None and tag.raw_y is not None for tag in tags
+    )
+    audit["unpositioned_count"] = (
+        audit["retained_count"] - audit["positioned_count"]
+    )
+    audit["low_confidence_count"] = len(tags)
+    return tags, audit
 
 
 def load_trajectory_samples(segment_dir: Path, segment_index: int, axes: str) -> List[Pose2D]:
@@ -786,7 +917,9 @@ def discover_segments(
             if sidecar_poses:
                 poses = sidecar_poses
                 warnings.append("Using trajectory_samples sidecar because database poses were unavailable.")
-        price_tags = load_price_tags(segment_dir / "price_tags.json", config.horizontal_axes)
+        price_tags, price_tag_audit = load_price_tags(
+            segment_dir / "price_tags.json", config.horizontal_axes
+        )
         for tag in price_tags:
             if tag.segment_index == 0:
                 tag.segment_index = segment_index
@@ -801,13 +934,26 @@ def discover_segments(
                 price_tags=price_tags,
                 has_local_grid_blobs=has_grids,
                 sqlite_warnings=warnings,
+                price_tag_audit=price_tag_audit,
             )
         )
 
     if not segments:
         metadata = read_json(session_dir / "metadata.json", {})
-        tags = load_price_tags(session_dir / "price_tags.json", config.horizontal_axes)
-        segments.append(Segment(1, session_dir, None, metadata if isinstance(metadata, dict) else {}, [], tags))
+        tags, price_tag_audit = load_price_tags(
+            session_dir / "price_tags.json", config.horizontal_axes
+        )
+        segments.append(
+            Segment(
+                1,
+                session_dir,
+                None,
+                metadata if isinstance(metadata, dict) else {},
+                [],
+                tags,
+                price_tag_audit=price_tag_audit,
+            )
+        )
 
     scan_summary = session_scan_summary(segments)
     if scan_summary["scan_mode"] == SCAN_MODE_MIXED:
@@ -908,8 +1054,12 @@ def apply_segment_transforms(
     for segment in segments:
         tr = transforms[segment.index]
         for tag in segment.price_tags:
-            tag.raw_x, tag.raw_y = transform_point(tag.raw_x, tag.raw_y, tr["dx"], tr["dy"], tr["yaw"])
-            tag.yaw += tr["yaw"]
+            if tag.raw_x is not None and tag.raw_y is not None:
+                tag.raw_x, tag.raw_y = transform_point(
+                    tag.raw_x, tag.raw_y, tr["dx"], tr["dy"], tr["yaw"]
+                )
+            if tag.yaw is not None:
+                tag.yaw += tr["yaw"]
     for point in points:
         tr = transforms[point.segment_index]
         point.x, point.y = transform_point(point.x, point.y, tr["dx"], tr["dy"], tr["yaw"])
@@ -1004,7 +1154,11 @@ def build_grid(segments: List[Segment], points: List[ProjectedPoint], config: Ma
     all_xy: List[Tuple[float, float]] = []
     for segment in segments:
         all_xy.extend((pose.x, pose.y) for pose in segment.poses)
-        all_xy.extend((tag.raw_x, tag.raw_y) for tag in segment.price_tags)
+        all_xy.extend(
+            (tag.raw_x, tag.raw_y)
+            for tag in segment.price_tags
+            if tag.raw_x is not None and tag.raw_y is not None
+        )
     all_xy.extend((point.x, point.y) for point in points)
     grid = OccupancyGrid(config.resolution, all_xy, margin=max(4.0, config.trajectory_radius * 2.0))
 
@@ -1046,6 +1200,15 @@ def nearest(x: float, y: float, poses: Sequence[Pose2D]) -> Optional[Pose2D]:
 def snap_price_tags(tags: Iterable[PriceTag], points: Sequence[ProjectedPoint], max_distance: float) -> None:
     occupied = [p for p in points if p.kind not in {"free", "empty", "ground"}]
     for tag in tags:
+        if tag.raw_x is None or tag.raw_y is None:
+            tag.snapped_x = None
+            tag.snapped_y = None
+            tag.confidence = 0.0
+            tag.needs_review = True
+            tag.quality_status = "LOW_CONFIDENCE"
+            if "price_tag_position_unavailable" not in tag.review_reasons:
+                tag.review_reasons.append("price_tag_position_unavailable")
+            continue
         best = None
         best_dist = max_distance
         for point in occupied:
@@ -1058,11 +1221,19 @@ def snap_price_tags(tags: Iterable[PriceTag], points: Sequence[ProjectedPoint], 
             tag.snapped_y = tag.raw_y
             tag.confidence = 0.35
             tag.needs_review = True
+            tag.quality_status = "LOW_CONFIDENCE"
+            if "price_tag_structure_match_unavailable" not in tag.review_reasons:
+                tag.review_reasons.append("price_tag_structure_match_unavailable")
         else:
             tag.snapped_x = best.x
             tag.snapped_y = best.y
             tag.confidence = max(0.5, 1.0 - best_dist / max_distance)
             tag.needs_review = tag.confidence < 0.7
+            tag.quality_status = (
+                "LOW_CONFIDENCE" if tag.needs_review else "ACCEPTED"
+            )
+            if tag.needs_review and "price_tag_structure_match_weak" not in tag.review_reasons:
+                tag.review_reasons.append("price_tag_structure_match_weak")
 
 
 def png_chunk(kind: bytes, data: bytes) -> bytes:
@@ -1129,6 +1300,8 @@ def render_grid(
                 paint_cell(*current_cell, (35, 110, 230), 1)
             previous_cell = current_cell
     for tag in tags:
+        if tag.raw_x is None or tag.raw_y is None:
+            continue
         tag_cell = grid.cell(
             tag.snapped_x if tag.snapped_x is not None else tag.raw_x,
             tag.snapped_y if tag.snapped_y is not None else tag.raw_y,
@@ -1181,6 +1354,8 @@ def write_preview_layers(
 
     tag_entries = []
     for tag in tags:
+        if tag.raw_x is None or tag.raw_y is None:
+            continue
         x = tag.snapped_x if tag.snapped_x is not None else tag.raw_x
         y = tag.snapped_y if tag.snapped_y is not None else tag.raw_y
         ix, iy = grid.cell(x, y)
@@ -3276,6 +3451,7 @@ def write_preview_3d(
                 "segment": tag.segment_index,
             }
             for tag in tags
+            if tag.raw_x is not None and tag.raw_y is not None
         ],
         "point_cloud": public_point_cloud,
     }
@@ -3290,6 +3466,8 @@ def write_preview_3d(
 def price_tags_geojson(tags: Sequence[PriceTag]) -> Dict[str, Any]:
     features = []
     for tag in tags:
+        if tag.raw_x is None or tag.raw_y is None:
+            continue
         x = tag.snapped_x if tag.snapped_x is not None else tag.raw_x
         y = tag.snapped_y if tag.snapped_y is not None else tag.raw_y
         features.append(
@@ -3304,12 +3482,70 @@ def price_tags_geojson(tags: Sequence[PriceTag]) -> Dict[str, Any]:
                     "raw_y": tag.raw_y,
                     "confidence": round(tag.confidence, 3),
                     "needs_review": tag.needs_review,
+                    "quality_status": tag.quality_status,
+                    "review_reasons": tag.review_reasons,
                     "timestamp": tag.timestamp,
                 },
                 "geometry": {"type": "Point", "coordinates": [x, y]},
             }
         )
     return feature_collection(features)
+
+
+def price_tag_records(tags: Sequence[PriceTag]) -> List[Dict[str, Any]]:
+    records: List[Dict[str, Any]] = []
+    for tag in tags:
+        positioned = tag.raw_x is not None and tag.raw_y is not None
+        records.append(
+            {
+                "tag_id": tag.tag_id,
+                "payload": tag.payload,
+                "segment": tag.segment_index,
+                "node_count": tag.node_count,
+                "source_record_index": tag.source_record_index,
+                "raw_x": tag.raw_x,
+                "raw_y": tag.raw_y,
+                "snapped_x": tag.snapped_x,
+                "snapped_y": tag.snapped_y,
+                "yaw": tag.yaw,
+                "timestamp": tag.timestamp,
+                "confidence": round(tag.confidence, 3),
+                "quality_status": tag.quality_status,
+                "needs_review": tag.needs_review,
+                "position_status": "POSITIONED" if positioned else "UNAVAILABLE",
+                "review_reasons": tag.review_reasons,
+            }
+        )
+    return records
+
+
+def write_price_tag_artifacts(output_dir: Path, tags: Sequence[PriceTag]) -> None:
+    records = price_tag_records(tags)
+    (output_dir / "price_tags.json").write_text(
+        json.dumps(records, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    fieldnames = [
+        "tag_id", "payload", "segment", "node_count", "source_record_index",
+        "raw_x", "raw_y", "snapped_x", "snapped_y", "yaw", "timestamp",
+        "confidence", "quality_status", "needs_review", "position_status",
+        "review_reasons",
+    ]
+    with (output_dir / "price_tags.csv").open(
+        "w", encoding="utf-8", newline=""
+    ) as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for record in records:
+            writer.writerow(
+                {
+                    **record,
+                    "review_reasons": json.dumps(
+                        record["review_reasons"],
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ),
+                }
+            )
 
 
 def vector_map_geojson(grid: OccupancyGrid) -> Dict[str, Any]:
@@ -3387,6 +3623,15 @@ def quality_report(
     total = grid.width * grid.height
     cell_area = grid.resolution * grid.resolution
     review_tags = sum(1 for tag in tags if tag.needs_review)
+    positioned_tags = sum(
+        tag.raw_x is not None and tag.raw_y is not None for tag in tags
+    )
+    tag_degradations = [
+        item
+        for segment in segments
+        for item in segment.price_tag_audit.get("degradations", [])
+        if isinstance(item, dict)
+    ]
     warnings = []
     depth_surface_segments = {point.segment_index for point in points if point.kind == "depth_surface"}
     for segment in segments:
@@ -3468,7 +3713,30 @@ def quality_report(
         },
         "projected_points": len(points),
         "shelf_outline": shelf_outline.summary(grid.resolution) if shelf_outline is not None else None,
-        "price_tags": {"total": len(tags), "needs_review": review_tags},
+        "price_tags": {
+            "source_record_count": sum(
+                int(segment.price_tag_audit.get("source_record_count", 0))
+                for segment in segments
+            ),
+            "retained": len(tags),
+            "positioned": positioned_tags,
+            "unpositioned": len(tags) - positioned_tags,
+            "low_confidence": sum(
+                tag.quality_status == "LOW_CONFIDENCE" for tag in tags
+            ),
+            "needs_review": review_tags,
+            "degradation_count": len(tag_degradations),
+            "degradations": tag_degradations,
+        },
+        "result_quality_status": (
+            "PARTIAL_REVIEW_REQUIRED"
+            if warnings or review_tags or tag_degradations
+            else "COMPLETE"
+        ),
+        "partial_result": bool(warnings or review_tags or tag_degradations),
+        "publish_permitted": not bool(
+            warnings or review_tags or tag_degradations
+        ),
         "segment_transforms": transforms,
         "warnings": warnings,
     }
@@ -3501,9 +3769,15 @@ def write_review_items(path: Path, report: Dict[str, Any], tags: Sequence[PriceT
                     "type": "price_tag",
                     "message": f"Price tag {tag.tag_id} needs position review",
                     "segment": tag.segment_index,
-                    "raw_xy": [tag.raw_x, tag.raw_y],
+                    "raw_xy": (
+                        [tag.raw_x, tag.raw_y]
+                        if tag.raw_x is not None and tag.raw_y is not None
+                        else None
+                    ),
                     "snapped_xy": [tag.snapped_x, tag.snapped_y],
                     "confidence": tag.confidence,
+                    "quality_status": tag.quality_status,
+                    "review_reasons": tag.review_reasons,
                 }
             )
     path.write_text(json.dumps({"items": items}, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -3571,6 +3845,7 @@ def generate(args: argparse.Namespace) -> Path:
     write_yaml(output_dir / "occupancy_grid.yaml", grid, "occupancy_grid.png")
     write_geojson(output_dir / "trajectory.geojson", trajectory_geojson(segments))
     write_geojson(output_dir / "price_tags.geojson", price_tags_geojson(tags))
+    write_price_tag_artifacts(output_dir, tags)
     write_geojson(output_dir / "vector_map.geojson", vector_map_geojson(grid))
     preview_3d_summary = write_preview_3d(
         output_dir / "preview_3d.json",
@@ -3616,6 +3891,8 @@ def generate(args: argparse.Namespace) -> Path:
             "vector_map.geojson",
             "semantic_layers.json",
             "price_tags.geojson",
+            "price_tags.json",
+            "price_tags.csv",
             "trajectory.geojson",
             "quality_report.json",
             "preview.png",
