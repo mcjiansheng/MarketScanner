@@ -154,6 +154,8 @@ struct Options
 	std::string database;
 	std::string output;
 	std::string priors;
+	std::string initialPoses;
+	std::string initialPosesSha256;
 	std::string inputIdentity;
 	std::string databaseSha256;
 	std::string horizontalAxes = "xz";
@@ -295,6 +297,8 @@ Options parseOptions(int argc, char ** argv)
 		if(name == "--database") options.database = value;
 		else if(name == "--output") options.output = value;
 		else if(name == "--priors") options.priors = value;
+		else if(name == "--initial-poses") options.initialPoses = value;
+		else if(name == "--initial-poses-sha256") options.initialPosesSha256 = value;
 		else if(name == "--input-identity") options.inputIdentity = value;
 		else if(name == "--database-sha256") options.databaseSha256 = value;
 		else if(name == "--horizontal-axes") options.horizontalAxes = value;
@@ -313,6 +317,11 @@ Options parseOptions(int argc, char ** argv)
 		!isLowerHexSha256(options.databaseSha256))
 	{
 		throw std::runtime_error("--database, --output and lowercase SHA-256 input/database identities are required.");
+	}
+	if(options.initialPoses.empty() != options.initialPosesSha256.empty() ||
+		(!options.initialPosesSha256.empty() && !isLowerHexSha256(options.initialPosesSha256)))
+	{
+		throw std::runtime_error("External initial poses require a lowercase SHA-256 identity.");
 	}
 	if(options.epsilon < 0.0) throw std::runtime_error("epsilon cannot be negative.");
 	if(options.loopQuarantineTranslationM <= 0.0 || options.loopQuarantineYawRad <= 0.0 || options.loopQuarantineYawRad > M_PI ||
@@ -372,6 +381,47 @@ std::vector<Prior> loadPriors(const Options & options)
 		priors.push_back(prior);
 	}
 	return priors;
+}
+
+std::map<int,Transform> loadInitialPoses(const Options & options)
+{
+	std::map<int,Transform> poses;
+	if(options.initialPoses.empty()) return poses;
+	std::ifstream input(options.initialPoses.c_str(), std::ios::binary);
+	if(!input) throw std::runtime_error("Cannot open external initial-pose input.");
+	std::string line;
+	if(!std::getline(input, line) ||
+		line != "MarketScannerInitialSE2Poses\t1\t" + options.inputIdentity + "\t" + options.initialPosesSha256)
+	{
+		throw std::runtime_error("External initial-pose header or identity is invalid.");
+	}
+	Sha256 digest;
+	int previousNodeId = 0;
+	while(std::getline(input, line))
+	{
+		if(line.empty()) throw std::runtime_error("External initial-pose input contains an empty record.");
+		digest.update(line + "\n");
+		std::vector<std::string> fields = splitTabs(line);
+		if(fields.size() != 4U) throw std::runtime_error("External initial-pose record has the wrong field count.");
+		const int nodeId = parseInteger(fields[0], "external initial-pose node id");
+		if(nodeId <= previousNodeId || poses.find(nodeId) != poses.end())
+		{
+			throw std::runtime_error("External initial-pose node IDs must be unique and strictly increasing.");
+		}
+		Transform pose(
+			static_cast<float>(parseFinite(fields[1], "external initial-pose x")),
+			static_cast<float>(parseFinite(fields[2], "external initial-pose y")),
+			static_cast<float>(parseFinite(fields[3], "external initial-pose yaw")));
+		if(!finiteTransform(pose)) throw std::runtime_error("External initial pose is non-finite or singular.");
+		poses.insert(std::make_pair(nodeId, pose));
+		previousNodeId = nodeId;
+	}
+	if(poses.empty()) throw std::runtime_error("External initial-pose inventory is empty.");
+	if(digest.finish() != options.initialPosesSha256)
+	{
+		throw std::runtime_error("External initial-pose SHA-256 does not match canonical records.");
+	}
+	return poses;
 }
 
 Transform projectTransform(const Transform & transform, const std::string & horizontalAxes)
@@ -583,7 +633,12 @@ void writeResult(
 	int iterationsDone,
 	bool converged,
 	bool hasAbsolutePriors,
-	int duplicateReciprocalCollapsed)
+	int duplicateReciprocalCollapsed,
+	int recoveryContinuityFactorCount,
+	int recoveryBridgeSupportFactorCount,
+	int preRecoveryComponentCount,
+	const std::vector<std::string> & externalNeighborResetRejected,
+	const std::vector<std::string> & externalNeighborLowInformationRejected)
 {
 	std::vector<double> translationResiduals;
 	std::vector<double> yawResiduals;
@@ -646,6 +701,9 @@ void writeResult(
 			<< ",\n  \"published_capable\":false"
 		<< ",\n  \"input_identity_id\":\"" << jsonEscape(options.inputIdentity) << "\""
 		<< ",\n  \"optimized_database_sha256\":\"" << jsonEscape(options.databaseSha256) << "\""
+		<< ",\n  \"initial_pose_source\":\"" << (options.initialPoses.empty()?"database_optimized_or_odometry":"verified_external_baseline") << "\""
+		<< ",\n  \"external_initial_poses_sha256\":" << (options.initialPoses.empty()?"null":("\"" + jsonEscape(options.initialPosesSha256) + "\""))
+		<< ",\n  \"external_initial_pose_count\":" << (options.initialPoses.empty()?0:initial.size())
 		<< ",\n  \"database_version\":\"" << jsonEscape(databaseVersion) << "\""
 		<< ",\n  \"factor_set_sha256\":\"" << factorSetSha256 << "\""
 		<< ",\n  \"node_count\":" << optimized.size() << ",\n  \"factor_count\":" << factors.size()
@@ -668,6 +726,23 @@ void writeResult(
 			<< ",\n  \"maximum_loop_edge_yaw_residual_deg\":" << maxLoopYaw*180.0/M_PI
 			<< ",\n  \"p95_loop_edge_yaw_residual_deg\":" << p95LoopYaw*180.0/M_PI
 			<< ",\n  \"duplicate_reciprocal_collapsed\":" << duplicateReciprocalCollapsed;
+	out << ",\n  \"recovery_continuity_factor_count\":" << recoveryContinuityFactorCount;
+	out << ",\n  \"recovery_bridge_support_factor_count\":" << recoveryBridgeSupportFactorCount;
+	out << ",\n  \"pre_recovery_component_count\":" << preRecoveryComponentCount;
+	out << ",\n  \"external_neighbor_reset_rejected_factor_ids\":[";
+	for(size_t i=0; i<externalNeighborResetRejected.size(); ++i)
+	{
+		if(i) out << ',';
+		out << "\"" << jsonEscape(externalNeighborResetRejected[i]) << "\"";
+	}
+	out << "]";
+	out << ",\n  \"external_neighbor_low_information_rejected_factor_ids\":[";
+	for(size_t i=0; i<externalNeighborLowInformationRejected.size(); ++i)
+	{
+		if(i) out << ',';
+		out << "\"" << jsonEscape(externalNeighborLowInformationRejected[i]) << "\"";
+	}
+	out << "]";
 	out << ",\n  \"factor_counts_by_type\":{";
 	bool first = true;
 	for(std::map<std::string,int>::const_iterator iter=counts.begin(); iter!=counts.end(); ++iter)
@@ -755,13 +830,17 @@ int main(int argc, char ** argv)
 		}
 		std::string databaseVersion = driver->getDatabaseVersion();
 		std::map<int,Transform> odomPoses;
-		driver->getAllOdomPoses(odomPoses, true, true);
+		// The external baseline contract is bound to the complete immutable Node
+		// inventory. Do not drop the first node merely because it has no incoming
+		// Link, and do not silently omit intermediate nodes used by recovery.
+		driver->getAllOdomPoses(odomPoses, false, false);
 		std::map<int,Transform> savedPoses = driver->loadOptimizedPoses();
 		std::multimap<int,Link> databaseLinks;
 		driver->getAllLinks(databaseLinks, true, false);
 		driver->closeConnection(false);
 		if(odomPoses.empty()) throw std::runtime_error("Optimized database contains no odometry poses.");
-		std::map<int,Transform> poses = savedPoses.empty()?odomPoses:savedPoses;
+		std::map<int,Transform> externalPoses = loadInitialPoses(options);
+		std::map<int,Transform> poses = externalPoses.empty()?(savedPoses.empty()?odomPoses:savedPoses):externalPoses;
 		if(poses.size()!=odomPoses.size()) throw std::runtime_error("Saved optimized pose inventory does not match odometry nodes.");
 		for(std::map<int,Transform>::const_iterator iter=odomPoses.begin();iter!=odomPoses.end();++iter)
 		{
@@ -769,16 +848,19 @@ int main(int argc, char ** argv)
 				throw std::runtime_error("Pose inventory contains a missing, non-positive or non-finite node.");
 		}
 
-		std::map<int,Transform> nativePoses=poses;
-		for(std::map<int,Transform>::iterator iter=poses.begin();iter!=poses.end();++iter)
+		std::map<int,Transform> nativePoses=odomPoses;
+		if(externalPoses.empty()) for(std::map<int,Transform>::iterator iter=poses.begin();iter!=poses.end();++iter)
 		{
 			iter->second = projectTransform(iter->second, options.horizontalAxes);
 		}
 		int rootId = poses.begin()->first;
-		Transform firstPose = poses.begin()->second;
-		Transform target(static_cast<float>(options.initialX), static_cast<float>(options.initialY), static_cast<float>(options.initialYaw));
-		Transform alignment = target * firstPose.inverse();
-		for(std::map<int,Transform>::iterator iter=poses.begin();iter!=poses.end();++iter) iter->second = alignment * iter->second;
+		if(externalPoses.empty())
+		{
+			Transform firstPose = poses.begin()->second;
+			Transform target(static_cast<float>(options.initialX), static_cast<float>(options.initialY), static_cast<float>(options.initialYaw));
+			Transform alignment = target * firstPose.inverse();
+			for(std::map<int,Transform>::iterator iter=poses.begin();iter!=poses.end();++iter) iter->second = alignment * iter->second;
+		}
 		std::map<int,Transform> initial = poses;
 
 		std::vector<Factor> factors;
@@ -789,6 +871,9 @@ int main(int argc, char ** argv)
 			int duplicateReciprocalCollapsed = 0;
 			int quarantinedLoopCount = 0;
 			int totalLoopCount = 0;
+			std::vector<std::string> externalNeighborResetRejected;
+			std::vector<std::string> externalNeighborLowInformationRejected;
+			std::vector<std::pair<int,int> > externalNeighborRecoveryPairs;
 		std::map<int,std::set<int> > adjacency;
 		for(std::multimap<int,Link>::const_iterator iter=databaseLinks.begin();iter!=databaseLinks.end();++iter)
 		{
@@ -828,6 +913,34 @@ int main(int argc, char ** argv)
 					continue;
 				}
 				canonicalRelativeFactors.insert(std::make_pair(key,factors.size()));
+				if(!externalPoses.empty() && factor.kind == "relative_neighbor")
+				{
+					const std::array<double,3> baselineResidual = residual(
+						initial.at(canonicalFrom), initial.at(canonicalTo), measurement);
+					const double translationResidual = std::hypot(baselineResidual[0], baselineResidual[1]);
+					const double yawResidualDeg = std::fabs(baselineResidual[2]) * 180.0 / M_PI;
+					if(translationResidual > 3.0 || yawResidualDeg > 120.0)
+					{
+						externalNeighborResetRejected.push_back(factor.id);
+						externalNeighborRecoveryPairs.push_back(std::make_pair(canonicalFrom, canonicalTo));
+						rejected.push_back(factor.id);
+						continue;
+					}
+					// A finalized capture can contain a bridge Link whose covariance was
+					// deliberately inflated during a tracking interruption.  Its nearly
+					// zero information makes it unusable as odometry, and g2o may move the
+					// two otherwise well-constrained sides independently.  Only the
+					// verified complete external baseline may replace such an edge.
+					const double minimumInformation = std::min(
+						information[8], std::min(information[0], information[4]));
+					if(!std::isfinite(minimumInformation) || minimumInformation < 1.0)
+					{
+						externalNeighborLowInformationRejected.push_back(factor.id);
+						externalNeighborRecoveryPairs.push_back(std::make_pair(canonicalFrom, canonicalTo));
+						rejected.push_back(factor.id);
+						continue;
+					}
+				}
 				if(factor.kind == "relative_loop")
 				{
 					++totalLoopCount;
@@ -859,6 +972,127 @@ int main(int argc, char ** argv)
 				adjacency[canonicalFrom].insert(canonicalTo); adjacency[canonicalTo].insert(canonicalFrom);
 		}
 		if(factors.empty()) throw std::runtime_error("The graph contains no accepted relative factors.");
+		int recoveryContinuityFactorCount = 0;
+		int recoveryBridgeSupportFactorCount = 0;
+		int preRecoveryComponentCount = 1;
+		if(!externalPoses.empty())
+		{
+			// A finalized mobile database can retain an otherwise valid pose whose
+			// relative Link write was skipped during a brief tracking interruption.
+			// The audited external baseline is the only authority allowed to bridge
+			// those components. Add the minimum deterministic set of low-weight
+			// adjacent-node factors; never manufacture them for the normal path.
+			std::map<int,int> component;
+			int componentId = 0;
+			for(std::map<int,Transform>::const_iterator pose=poses.begin(); pose!=poses.end(); ++pose)
+			{
+				if(component.find(pose->first) != component.end()) continue;
+				++componentId;
+				std::queue<int> queue;
+				queue.push(pose->first);
+				component[pose->first] = componentId;
+				while(!queue.empty())
+				{
+					const int node = queue.front(); queue.pop();
+					for(std::set<int>::const_iterator next=adjacency[node].begin(); next!=adjacency[node].end(); ++next)
+					{
+						if(component.insert(std::make_pair(*next, componentId)).second) queue.push(*next);
+					}
+				}
+			}
+			preRecoveryComponentCount = componentId;
+			std::map<int,Transform>::const_iterator previous = poses.begin();
+			std::map<int,Transform>::const_iterator current = poses.begin();
+			++current;
+			for(; current!=poses.end(); ++current)
+			{
+				const int from = previous->first;
+				const int to = current->first;
+				const int fromComponent = component[from];
+				const int toComponent = component[to];
+				if(fromComponent != toComponent)
+				{
+					const Transform measurement = initial.at(from).inverse() * initial.at(to);
+					const std::string databaseNeighborId =
+						"db:Neighbor:" + std::to_string(from) + ":" + std::to_string(to);
+					const bool replacesVerifiedReset = std::find(
+						externalNeighborResetRejected.begin(), externalNeighborResetRejected.end(), databaseNeighborId) != externalNeighborResetRejected.end();
+					const bool replacesLowInformation = std::find(
+						externalNeighborLowInformationRejected.begin(), externalNeighborLowInformationRejected.end(), databaseNeighborId) != externalNeighborLowInformationRejected.end();
+					// A rejected adjacent bridge is not the same as a node that never had
+					// a relative Link.  The former has a verified external relative step
+					// and must keep the two large graph sides together; otherwise several
+					// soft map priors can pull them metres apart.  Truly missing isolated
+					// links retain the deliberately weak continuity uncertainty.
+					const double translationSigma = replacesVerifiedReset ? 0.05 : (replacesLowInformation ? 0.08 : 0.75);
+					const double yawSigma = (replacesVerifiedReset ? 2.0 : (replacesLowInformation ? 4.0 : 20.0)) * M_PI / 180.0;
+					const std::array<double,9> information = priorInformation(translationSigma, yawSigma);
+					Link link(from,to,Link::kVirtualClosure,measurement,sixInformation(information));
+					Factor factor;
+					factor.id = "external:recovery_continuity:" + std::to_string(from) + ":" + std::to_string(to);
+					factor.kind = "relative_recovery_continuity";
+					factor.link = link;
+					factor.planarInformation = information;
+					factor.canonical = canonicalFactor(factor.id,factor.kind,factor.link,factor.planarInformation);
+					factors.push_back(factor);
+					optimizerLinks.insert(std::make_pair(from,link));
+					adjacency[from].insert(to); adjacency[to].insert(from);
+					for(std::map<int,int>::iterator value=component.begin(); value!=component.end(); ++value)
+					{
+						if(value->second == toComponent) value->second = fromComponent;
+					}
+					++recoveryContinuityFactorCount;
+				}
+				previous = current;
+			}
+
+			// A single robust edge can be down-weighted once the two graph sides
+			// have already separated.  For each explicitly rejected adjacent bridge,
+			// add a tiny redundant window of audited baseline measurements crossing
+			// the same boundary.  These factors exist only in external-baseline
+			// diagnostic recovery and do not alter the immutable database.
+			std::set<std::pair<int,int> > recoverySupportPairs;
+			for(size_t pairIndex=0; pairIndex<externalNeighborRecoveryPairs.size(); ++pairIndex)
+			{
+				const int from = externalNeighborRecoveryPairs[pairIndex].first;
+				const int to = externalNeighborRecoveryPairs[pairIndex].second;
+				std::map<int,Transform>::const_iterator fromIterator = poses.find(from);
+				std::map<int,Transform>::const_iterator toIterator = poses.find(to);
+				if(fromIterator == poses.end() || toIterator == poses.end()) continue;
+				std::vector<std::pair<int,int> > candidates;
+				if(fromIterator != poses.begin())
+				{
+					std::map<int,Transform>::const_iterator before = fromIterator;
+					--before;
+					candidates.push_back(std::make_pair(before->first, to));
+					std::map<int,Transform>::const_iterator after = toIterator;
+					++after;
+					if(after != poses.end()) candidates.push_back(std::make_pair(before->first, after->first));
+				}
+				std::map<int,Transform>::const_iterator after = toIterator;
+				++after;
+				if(after != poses.end()) candidates.push_back(std::make_pair(from, after->first));
+				for(size_t candidateIndex=0; candidateIndex<candidates.size(); ++candidateIndex)
+				{
+					const int supportFrom = candidates[candidateIndex].first;
+					const int supportTo = candidates[candidateIndex].second;
+					if(!recoverySupportPairs.insert(candidates[candidateIndex]).second) continue;
+					const Transform measurement = initial.at(supportFrom).inverse() * initial.at(supportTo);
+					const std::array<double,9> information = priorInformation(0.12, 4.0*M_PI/180.0);
+					Link link(supportFrom,supportTo,Link::kVirtualClosure,measurement,sixInformation(information));
+					Factor factor;
+					factor.id = "external:recovery_bridge_support:" + std::to_string(supportFrom) + ":" + std::to_string(supportTo);
+					factor.kind = "relative_recovery_bridge_support";
+					factor.link = link;
+					factor.planarInformation = information;
+					factor.canonical = canonicalFactor(factor.id,factor.kind,factor.link,factor.planarInformation);
+					factors.push_back(factor);
+					optimizerLinks.insert(std::make_pair(supportFrom,link));
+					adjacency[supportFrom].insert(supportTo); adjacency[supportTo].insert(supportFrom);
+					++recoveryBridgeSupportFactorCount;
+				}
+			}
+		}
 		std::set<int> visited; std::queue<int> pending; pending.push(rootId); visited.insert(rootId);
 		while(!pending.empty()){int node=pending.front();pending.pop();for(std::set<int>::const_iterator n=adjacency[node].begin();n!=adjacency[node].end();++n)if(visited.insert(*n).second)pending.push(*n);}
 		if(visited.size()!=poses.size()) throw std::runtime_error("Relative factor graph is disconnected.");
@@ -884,7 +1118,13 @@ int main(int argc, char ** argv)
 		parameters.insert(ParametersPair(Parameters::kOptimizerStrategy(),"1"));
 		parameters.insert(ParametersPair(Parameters::kOptimizerIterations(),std::to_string(options.iterations)));
 		parameters.insert(ParametersPair(Parameters::kOptimizerEpsilon(),std::to_string(options.epsilon)));
-		parameters.insert(ParametersPair(Parameters::kOptimizerRobust(),"true"));
+		// Extreme loop candidates have already been quarantined against the
+		// verified external baseline.  A second global robust kernel would also
+		// down-weight the recovery-continuity bridges after map priors start
+		// correcting a long drifted route, allowing metres of non-physical node
+		// separation.  Keep accepted factors in one ordinary least-squares graph;
+		// soft behaviour is expressed explicitly by each factor covariance.
+		parameters.insert(ParametersPair(Parameters::kOptimizerRobust(),"false"));
 		parameters.insert(ParametersPair(Parameters::kOptimizerPriorsIgnored(),"false"));
 		parameters.insert(ParametersPair(Parameters::kOptimizerLandmarksIgnored(),"true"));
 		parameters.insert(ParametersPair(Parameters::kRegForce3DoF(),"true"));
@@ -907,7 +1147,7 @@ int main(int argc, char ** argv)
 		// still present in the historical factor inventory.
 		bool converged = iterationsDone > 0 && std::isfinite(nativeFinalError) &&
 			std::isfinite(finalObjective) && quarantinedLoopRatio <= options.maximumQuarantinedLoopRatio;
-			writeResult(options,databaseVersion,initial,optimized,factors,rejected,rejectedFactorDetails,quarantinedLoopCount,totalLoopCount,rootId,initialObjective,finalObjective,nativeFinalError,iterationsDone,converged,hasAbsolutePriors,duplicateReciprocalCollapsed);
+			writeResult(options,databaseVersion,initial,optimized,factors,rejected,rejectedFactorDetails,quarantinedLoopCount,totalLoopCount,rootId,initialObjective,finalObjective,nativeFinalError,iterationsDone,converged,hasAbsolutePriors,duplicateReciprocalCollapsed,recoveryContinuityFactorCount,recoveryBridgeSupportFactorCount,preRecoveryComponentCount,externalNeighborResetRejected,externalNeighborLowInformationRejected);
 		return converged?0:3;
 	}
 	catch(const std::exception & error)

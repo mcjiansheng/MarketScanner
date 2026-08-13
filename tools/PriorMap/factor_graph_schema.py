@@ -104,6 +104,7 @@ def validate_factor_graph_result(
     quality_policy: dict[str, Any],
     quality_policy_sha256: str,
     verified_absolute_gauge_authority: bool = False,
+    expected_external_initial_poses_sha256: str | None = None,
 ) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise FactorGraphValidationError("Factor graph result must be an object.")
@@ -119,6 +120,17 @@ def validate_factor_graph_result(
         raise FactorGraphValidationError("Factor graph input identity changed.")
     if payload.get("optimized_database_sha256") != expected_database_sha256:
         raise FactorGraphValidationError("Factor graph database hash changed.")
+    if expected_external_initial_poses_sha256 is not None:
+        if (
+            SHA256_RE.fullmatch(expected_external_initial_poses_sha256) is None
+            or payload.get("initial_pose_source")
+            != "verified_external_baseline"
+            or payload.get("external_initial_poses_sha256")
+            != expected_external_initial_poses_sha256
+        ):
+            raise FactorGraphValidationError(
+                "Factor graph external initial-pose identity changed."
+            )
     if SHA256_RE.fullmatch(str(payload.get("factor_set_sha256") or "")) is None:
         raise FactorGraphValidationError("Factor graph digest is invalid.")
 
@@ -145,6 +157,12 @@ def validate_factor_graph_result(
         raise FactorGraphValidationError("Factor graph factor count differs from payload.")
     if payload.get("node_count") != len(node_ids):
         raise FactorGraphValidationError("Factor graph node count differs from payload.")
+    if expected_external_initial_poses_sha256 is not None and payload.get(
+        "external_initial_pose_count"
+    ) != len(node_ids):
+        raise FactorGraphValidationError(
+            "Factor graph external initial-pose inventory is incomplete."
+        )
     factor_ids: set[str] = set()
     actual_factor_counts: dict[str, int] = {}
     relative_adjacency = {node_id: set() for node_id in node_ids}
@@ -233,6 +251,99 @@ def validate_factor_graph_result(
     collapsed = payload.get("duplicate_reciprocal_collapsed")
     if isinstance(collapsed, bool) or not isinstance(collapsed, int) or collapsed < 0:
         raise FactorGraphValidationError("Duplicate reciprocal count is invalid.")
+    recovery_continuity = payload.get("recovery_continuity_factor_count", 0)
+    if (
+        isinstance(recovery_continuity, bool)
+        or not isinstance(recovery_continuity, int)
+        or recovery_continuity < 0
+    ):
+        raise FactorGraphValidationError("Recovery continuity factor count is invalid.")
+    actual_recovery_continuity = actual_factor_counts.get(
+        "relative_recovery_continuity", 0
+    )
+    if recovery_continuity != actual_recovery_continuity:
+        raise FactorGraphValidationError(
+            "Recovery continuity count differs from canonical factors."
+        )
+    if expected_external_initial_poses_sha256 is None and recovery_continuity:
+        raise FactorGraphValidationError(
+            "Recovery continuity factors require a verified external baseline."
+        )
+    pre_recovery_components = payload.get("pre_recovery_component_count", 1)
+    if (
+        isinstance(pre_recovery_components, bool)
+        or not isinstance(pre_recovery_components, int)
+        or pre_recovery_components < 1
+        or pre_recovery_components > len(node_ids)
+    ):
+        raise FactorGraphValidationError(
+            "Pre-recovery component count is invalid."
+        )
+    if expected_external_initial_poses_sha256 is None:
+        if pre_recovery_components != 1:
+            raise FactorGraphValidationError(
+                "Database relative graph is disconnected."
+            )
+    elif recovery_continuity != pre_recovery_components - 1:
+        raise FactorGraphValidationError(
+            "Recovery continuity inventory is not the minimum component bridge set."
+        )
+    recovery_bridge_support = payload.get(
+        "recovery_bridge_support_factor_count", 0
+    )
+    if (
+        isinstance(recovery_bridge_support, bool)
+        or not isinstance(recovery_bridge_support, int)
+        or recovery_bridge_support < 0
+        or recovery_bridge_support
+        != actual_factor_counts.get("relative_recovery_bridge_support", 0)
+    ):
+        raise FactorGraphValidationError(
+            "Recovery bridge-support factor count is invalid."
+        )
+    if expected_external_initial_poses_sha256 is None and recovery_bridge_support:
+        raise FactorGraphValidationError(
+            "Recovery bridge-support factors require a verified external baseline."
+        )
+    reset_rejected = payload.get("external_neighbor_reset_rejected_factor_ids", [])
+    if (
+        not isinstance(reset_rejected, list)
+        or any(not isinstance(value, str) for value in reset_rejected)
+        or len(set(reset_rejected)) != len(reset_rejected)
+        or not set(reset_rejected).issubset(set(payload["rejected_factor_ids"]))
+    ):
+        raise FactorGraphValidationError(
+            "External neighbor-reset rejection inventory is invalid."
+        )
+    if expected_external_initial_poses_sha256 is None and reset_rejected:
+        raise FactorGraphValidationError(
+            "Neighbor-reset rejection requires a verified external baseline."
+        )
+    low_information_rejected = payload.get(
+        "external_neighbor_low_information_rejected_factor_ids", []
+    )
+    if (
+        not isinstance(low_information_rejected, list)
+        or any(not isinstance(value, str) for value in low_information_rejected)
+        or len(set(low_information_rejected)) != len(low_information_rejected)
+        or not set(low_information_rejected).issubset(
+            set(payload["rejected_factor_ids"])
+        )
+        or set(low_information_rejected) & set(reset_rejected)
+    ):
+        raise FactorGraphValidationError(
+            "Low-information neighbor rejection inventory is invalid."
+        )
+    if expected_external_initial_poses_sha256 is None and low_information_rejected:
+        raise FactorGraphValidationError(
+            "Low-information neighbor rejection requires a verified external baseline."
+        )
+    if recovery_bridge_support > 3 * (
+        len(reset_rejected) + len(low_information_rejected)
+    ):
+        raise FactorGraphValidationError(
+            "Recovery bridge-support inventory exceeds the bounded boundary window."
+        )
     rejected_details = payload.get("rejected_factor_details")
     if not isinstance(rejected_details, list):
         raise FactorGraphValidationError("Rejected factor detail inventory is invalid.")

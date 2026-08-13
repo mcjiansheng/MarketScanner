@@ -109,6 +109,7 @@ def _select_absolute_priors(
         else:
             exceeds_gate = not trusted_manual_anchor and constraint.kind not in {
                 "manual_aisle_assignment",
+                "road_heading_soft",
                 "road_soft",
             } and (
                 translation > hard_reject_translation_m
@@ -183,6 +184,61 @@ def _write_priors(path: Path, input_identity_id: str, baseline: Sequence[Any], c
     path.write_text("".join(lines), encoding="utf-8")
 
 
+def _write_initial_poses(
+    path: Path,
+    input_identity_id: str,
+    baseline: Sequence[Any],
+) -> str:
+    """Write the audited complete map-frame baseline consumed by native g2o.
+
+    RTAB-Map's saved optimized-pose inventory can be incomplete after a raw
+    coordinate epoch reset.  The recovered trajectory is therefore passed as
+    an immutable, canonical side input while the database remains the sole
+    authority for node inventory and relative Link measurements.
+    """
+
+    records: list[str] = []
+    node_ids: set[int] = set()
+    previous_node_id = 0
+    for pose in baseline:
+        node_id = getattr(pose, "node_id", None)
+        if (
+            isinstance(node_id, bool)
+            or not isinstance(node_id, int)
+            or node_id <= previous_node_id
+            or node_id in node_ids
+        ):
+            raise FactorGraphRunnerError(
+                "External initial pose node IDs must be unique and strictly increasing."
+            )
+        values = (float(pose.x), float(pose.y), float(pose.yaw))
+        if not all(math.isfinite(value) for value in values):
+            raise FactorGraphRunnerError(
+                "External initial pose contains non-finite coordinates."
+            )
+        node_ids.add(node_id)
+        previous_node_id = node_id
+        records.append(
+            "\t".join(
+                (
+                    str(node_id),
+                    *(format(value, ".17g") for value in values),
+                )
+            )
+            + "\n"
+        )
+    if not records:
+        raise FactorGraphRunnerError("External initial pose inventory is empty.")
+    canonical = "".join(records).encode("utf-8")
+    baseline_sha256 = hashlib.sha256(canonical).hexdigest()
+    header = (
+        "MarketScannerInitialSE2Poses\t1\t"
+        f"{input_identity_id}\t{baseline_sha256}\n"
+    )
+    path.write_bytes(header.encode("utf-8") + canonical)
+    return baseline_sha256
+
+
 def run_relative_se2_factor_graph(
     *,
     binary: Path,
@@ -230,13 +286,19 @@ def run_relative_se2_factor_graph(
         with tempfile.TemporaryDirectory(prefix="marketscanner-factor-graph-") as temporary:
             root = Path(temporary)
             priors = root / "absolute_priors.tsv"
+            initial_poses = root / "initial_poses.tsv"
             result_path = root / "factor_graph_result.json"
             _write_priors(priors, input_identity_id, baseline, selected)
+            initial_poses_sha256 = _write_initial_poses(
+                initial_poses, input_identity_id, baseline
+            )
             command = [
                 str(executable),
                 "--database", str(database),
                 "--output", str(result_path),
                 "--priors", str(priors),
+                "--initial-poses", str(initial_poses),
+                "--initial-poses-sha256", initial_poses_sha256,
                 "--input-identity", input_identity_id,
                 "--database-sha256", database_hash,
                 "--horizontal-axes", horizontal_axes,
@@ -271,7 +333,9 @@ def run_relative_se2_factor_graph(
                 )
             except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
                 detail = (completed.stderr or completed.stdout or "native solver failed").strip()
-                raise FactorGraphRunnerError("Native factor graph result is unreadable.") from exc
+                raise FactorGraphRunnerError(
+                    "Native factor graph result is unreadable: " + detail[-2000:]
+                ) from exc
             if completed.returncode not in {0, 3}:
                 detail = (completed.stderr or completed.stdout or "native solver failed").strip()
                 raise FactorGraphRunnerError(
@@ -289,6 +353,7 @@ def run_relative_se2_factor_graph(
             expected_node_ids=(pose.node_id for pose in baseline),
             quality_policy=quality_policy,
             quality_policy_sha256=quality_policy_sha256,
+            expected_external_initial_poses_sha256=initial_poses_sha256,
             verified_absolute_gauge_authority=any(
                 (
                     constraint.kind == "initial_map_pose"

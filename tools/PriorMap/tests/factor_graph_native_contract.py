@@ -18,6 +18,7 @@ def main() -> None:
     required = (
         "openConnection(options.database, false, true)",
         "getAllOdomPoses",
+        "getAllOdomPoses(odomPoses, false, false)",
         "loadOptimizedPoses",
         "getAllLinks",
         "getDatabaseVersion",
@@ -31,6 +32,13 @@ def main() -> None:
         "absolute_priors",
         "horizontalAxes == \"ios_prior\"",
         "keep the first deterministic orientation",
+        "MarketScannerInitialSE2Poses",
+        "verified_external_baseline",
+        "relative_recovery_continuity",
+        "relative_recovery_bridge_support",
+        "external_neighbor_reset_rejected_factor_ids",
+        "external_neighbor_low_information_rejected_factor_ids",
+        "pre_recovery_component_count",
     )
     missing = [token for token in required if token not in source]
     if "prior-map-factor-graph" not in cmake:

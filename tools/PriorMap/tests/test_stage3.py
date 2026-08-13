@@ -39,6 +39,7 @@ from tools.PriorMap.offline_localization import (
     bind_manual_localization_event_to_pose,
     append_manual_edit,
     build_session_input_manifest,
+    build_corridor_heading_constraints,
     build_road_soft_constraints,
     build_manual_aisle_constraints,
     bounded_correction_metrics,
@@ -48,6 +49,7 @@ from tools.PriorMap.offline_localization import (
     new_manual_edits,
     optimize_trajectory,
     processing_parameter_sha256,
+    _solve_banded,
     _legacy_processing_parameter_sha256_v3,
     process_localized_session,
     session_input_bundle_sha256,
@@ -586,6 +588,31 @@ class ManualLocalizationTimebaseTests(unittest.TestCase):
 
 
 class RobustSE2OptimizerTests(unittest.TestCase):
+    def test_banded_solver_curvature_term_preserves_affine_rotation_field(
+        self,
+    ) -> None:
+        count = 180
+        observations = [
+            (index, 0.025 * index - 1.5, 2.0)
+            for index in range(20, 160)
+        ]
+        solved = _solve_banded(
+            count,
+            observations,
+            smoothness=0.25,
+            curvature_smoothness=80.0,
+        )
+        self.assertEqual(len(solved), count)
+        self.assertAlmostEqual(solved[40], -0.5, delta=0.12)
+        self.assertAlmostEqual(solved[140], 2.0, delta=0.12)
+        self.assertLess(
+            max(
+                abs(solved[index - 1] - 2 * solved[index] + solved[index + 1])
+                for index in range(25, 155)
+            ),
+            0.01,
+        )
+
     def test_drift_is_reduced_and_gross_map_constraint_is_rejected(self) -> None:
         baseline = [
             Pose(index, float(index), float(index), 0.08 * index, 0)
@@ -741,6 +768,65 @@ class RobustSE2OptimizerTests(unittest.TestCase):
             for index in range(10)
         ]
         self.assertEqual(build_road_soft_constraints(far, graph, "1"), [])
+
+    def test_long_corridor_heading_rotates_position_without_breaking_continuity(
+        self,
+    ) -> None:
+        skew = math.radians(10.0)
+        baseline = [
+            Pose(
+                index + 1,
+                float(index),
+                math.sin(skew) * index * 0.5,
+                math.cos(skew) * index * 0.5,
+                0.0,
+            )
+            for index in range(120)
+        ]
+        graph = {
+            "crosses": [
+                {
+                    "id": "long-aisle",
+                    "floor_id": "1",
+                    "width_m": 2.0,
+                    "points_m": [[0.0, -20.0], [0.0, 80.0]],
+                }
+            ]
+        }
+        constraints = build_corridor_heading_constraints(
+            baseline, graph, "1", stride=6
+        )
+        self.assertGreater(len(constraints), 10)
+        self.assertTrue(
+            all(
+                item.source.get("correction_field_contract")
+                == "continuous_rigid_run_se2_v1"
+                for item in constraints
+            )
+        )
+        optimized, accepted, rejected = optimize_trajectory(
+            baseline, constraints
+        )
+        self.assertEqual(rejected, [])
+        self.assertEqual(len(accepted), len(constraints))
+
+        def route_skew(poses: list[Pose]) -> float:
+            dx = poses[-1].x - poses[0].x
+            dy = poses[-1].y - poses[0].y
+            return abs(math.atan2(dx, dy))
+
+        self.assertLess(route_skew(optimized), math.radians(3.0))
+        metrics = bounded_correction_metrics(
+            baseline, optimized, constraints
+        )
+        self.assertLess(
+            metrics["maximum_neighbor_correction_translation_change_m"],
+            0.35,
+        )
+        self.assertLess(
+            metrics["maximum_neighbor_correction_yaw_change_deg"],
+            5.0,
+        )
 
     def test_aisle_sequence_uses_final_trajectory_geometry(self) -> None:
         road_graph = {

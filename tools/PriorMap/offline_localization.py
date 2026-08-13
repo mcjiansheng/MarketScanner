@@ -388,7 +388,7 @@ def processing_parameter_sha256(
             "huber_yaw_rad": HUBER_YAW_RAD,
             "manual_anchor_translation_sigma_m": MANUAL_ANCHOR_TRANSLATION_SIGMA_M,
             "manual_anchor_yaw_sigma_rad": MANUAL_ANCHOR_YAW_SIGMA_RAD,
-            "solver": "bounded_correction_field_tridiagonal_v2",
+            "solver": "bounded_correction_field_banded_v3",
         },
         "replay_parameters": normalize_replay_parameters(replay_parameters),
     }
@@ -3702,11 +3702,20 @@ def build_road_soft_constraints(
     road_graph: dict[str, Any],
     floor_id: str,
     stride: int = 8,
+    match_audit: list[dict[str, Any]] | None = None,
 ) -> list[AbsoluteConstraint]:
-    """Build bounded, low-weight road-area/direction priors.
+    """Build ambiguity-gated priors from one continuous corridor sequence.
 
-    These priors only attach when a sampled pose is already inside or close to
-    a declared road/cross corridor. They cannot introduce a remote basin.
+    The former implementation selected the nearest corridor independently at
+    every sample. A gradually rotated trajectory would therefore cross the
+    midpoint between two parallel aisles and start constraining itself to the
+    wrong aisle. This Viterbi-style matcher preserves a continuous correction
+    field, respects map corridor connectivity and leaves genuinely ambiguous
+    samples unconstrained.
+
+    Device yaw is not assumed to equal walking direction. The yaw prior applies
+    only the rotation needed to align the local trajectory tangent with the
+    selected corridor, preserving how the operator held the phone.
     """
     corridors: list[tuple[str, float, tuple[float, float], tuple[float, float]]] = []
     for cross in road_graph.get("crosses", []):
@@ -3716,7 +3725,7 @@ def build_road_soft_constraints(
         if not isinstance(points, list):
             continue
         width = max(0.2, float(cross.get("width_m", 1.0) or 1.0))
-        for segment_index, (first, second) in enumerate(zip(points, points[1:])):
+        for first, second in zip(points, points[1:]):
             if (
                 not isinstance(first, list)
                 or not isinstance(second, list)
@@ -3726,70 +3735,556 @@ def build_road_soft_constraints(
                 continue
             corridors.append(
                 (
-                    f"{cross.get('id', 'cross')}:{segment_index}",
+                    str(cross.get("id", "cross")),
                     width,
                     (float(first[0]), float(first[1])),
                     (float(second[0]), float(second[1])),
                 )
             )
+    if not baseline or not corridors:
+        return []
+
+    # The continuous sequence model needs enough travel history to establish
+    # a route-level hypothesis. Preserve the former bounded local prior for
+    # short sessions; this also prevents a tiny synthetic/inspection scan from
+    # acquiring a confident periodic-aisle sequence that it cannot support.
+    if len(baseline) < 64:
+        constraints: list[AbsoluteConstraint] = []
+        sample_stride = max(1, stride)
+        sampled_indices = list(range(0, len(baseline), sample_stride))
+        if sampled_indices[-1] != len(baseline) - 1:
+            sampled_indices.append(len(baseline) - 1)
+        for index in sampled_indices:
+            pose = baseline[index]
+            candidates: list[
+                tuple[float, str, float, float, float, float]
+            ] = []
+            for corridor_id, width, start, end in corridors:
+                projected = _project_to_segment(pose.x, pose.y, start, end)
+                if projected is None or projected[2] > width / 2 + 0.75:
+                    continue
+                candidates.append(
+                    (
+                        projected[2],
+                        corridor_id,
+                        projected[0],
+                        projected[1],
+                        projected[3],
+                        width,
+                    )
+                )
+            if not candidates:
+                continue
+            distance, corridor_id, x, y, road_yaw, width = min(candidates)
+            reverse_yaw = _normalize_angle(road_yaw + math.pi)
+            yaw = min(
+                (road_yaw, reverse_yaw),
+                key=lambda value: abs(_normalize_angle(value - pose.yaw)),
+            )
+            proximity = max(0.1, 1.0 - distance / (width / 2 + 0.75))
+            weight = 0.35 * proximity
+            legacy_sigma = 1.0 / math.sqrt(weight)
+            constraints.append(
+                AbsoluteConstraint(
+                    identifier=f"road-local-{corridor_id}-{pose.node_id}",
+                    node_index=index,
+                    x=x,
+                    y=y,
+                    yaw=yaw,
+                    weight=weight,
+                    kind="road_soft",
+                    source={
+                        "corridor_id": corridor_id,
+                        "distance_m": distance,
+                        "width_m": width,
+                        "matcher": "bounded_local_corridor_v1",
+                    },
+                    translation_sigma_m=legacy_sigma,
+                    yaw_sigma_rad=min(math.pi, legacy_sigma),
+                )
+            )
+        return constraints
+
+    adjacency: dict[str, set[str]] = {}
+    for cross in road_graph.get("crosses", []):
+        if isinstance(cross, dict) and str(cross.get("floor_id")) == floor_id:
+            identifier = str(cross.get("id") or "")
+            if identifier:
+                adjacency.setdefault(identifier, set()).add(identifier)
+    for node in road_graph.get("nodes", []):
+        if not isinstance(node, dict) or str(node.get("floor_id")) != floor_id:
+            continue
+        identifiers = sorted(
+            {
+                str(value)
+                for value in node.get("cross_ids", [])
+                if str(value) in adjacency
+            }
+        )
+        for first in identifiers:
+            adjacency[first].update(identifiers)
+
     constraints: list[AbsoluteConstraint] = []
     sample_stride = max(1, stride)
     sampled_indices = list(range(0, len(baseline), sample_stride))
     if baseline and sampled_indices[-1:] != [len(baseline) - 1]:
         sampled_indices.append(len(baseline) - 1)
+
+    def motion_yaw(index: int) -> tuple[float | None, float]:
+        left = index
+        right = index
+        maximum_radius = min(32, max(4, sample_stride * 2))
+        for radius in range(2, maximum_radius + 1, 2):
+            left = max(0, index - radius)
+            right = min(len(baseline) - 1, index + radius)
+            dx = baseline[right].x - baseline[left].x
+            dy = baseline[right].y - baseline[left].y
+            distance = math.hypot(dx, dy)
+            if distance >= 0.75:
+                return math.atan2(-dx, dy), distance
+        return None, math.hypot(
+            baseline[right].x - baseline[left].x,
+            baseline[right].y - baseline[left].y,
+        )
+
+    candidate_sets: list[list[dict[str, Any]]] = []
     for index in sampled_indices:
         pose = baseline[index]
-        candidates: list[tuple[float, str, float, float, float, float]] = []
+        travel_yaw, tangent_distance = motion_yaw(index)
+        by_corridor: dict[str, dict[str, Any]] = {}
         for corridor_id, width, start, end in corridors:
             projected = _project_to_segment(pose.x, pose.y, start, end)
-            if projected is None or projected[2] > width / 2 + 0.75:
+            if projected is None or projected[2] > width / 2 + 5.0:
                 continue
-            candidates.append(
+            road_yaw = projected[3]
+            yaw_delta = 0.0
+            yaw_residual = 0.0
+            if travel_yaw is not None:
+                selected_road_yaw = min(
+                    (road_yaw, _normalize_angle(road_yaw + math.pi)),
+                    key=lambda value: abs(_normalize_angle(value - travel_yaw)),
+                )
+                yaw_delta = _normalize_angle(selected_road_yaw - travel_yaw)
+                yaw_residual = abs(yaw_delta)
+                if yaw_residual > math.radians(50.0):
+                    continue
+            outside = max(0.0, projected[2] - width / 2.0)
+            emission = (outside / 1.35) ** 2 + 0.12 * (
+                projected[2] / (width / 2.0 + 1.0)
+            ) ** 2
+            if travel_yaw is not None:
+                emission += 0.35 * (yaw_residual / math.radians(15.0)) ** 2
+            candidate = {
+                "corridor_id": corridor_id,
+                "node_index": index,
+                "x": projected[0],
+                "y": projected[1],
+                "distance_m": projected[2],
+                "width_m": width,
+                "yaw_delta": yaw_delta,
+                "yaw_residual_deg": math.degrees(yaw_residual),
+                "travel_yaw_available": travel_yaw is not None,
+                "tangent_distance_m": tangent_distance,
+                "emission": emission,
+            }
+            previous = by_corridor.get(corridor_id)
+            if previous is None or (emission, projected[2]) < (
+                previous["emission"], previous["distance_m"]
+            ):
+                by_corridor[corridor_id] = candidate
+        candidates = sorted(
+            by_corridor.values(),
+            key=lambda value: (
+                value["emission"], value["distance_m"], value["corridor_id"]
+            ),
+        )[:12]
+        candidates.append(
+            {
+                "corridor_id": None,
+                "node_index": index,
+                "x": pose.x,
+                "y": pose.y,
+                "distance_m": None,
+                "width_m": None,
+                "yaw_delta": 0.0,
+                "yaw_residual_deg": None,
+                "travel_yaw_available": travel_yaw is not None,
+                "tangent_distance_m": tangent_distance,
+                "emission": 4.5,
+            }
+        )
+        candidate_sets.append(candidates)
+
+    def transition(previous: dict[str, Any], current: dict[str, Any]) -> float:
+        previous_id = previous["corridor_id"]
+        current_id = current["corridor_id"]
+        if previous_id is None or current_id is None:
+            return 0.35 if previous_id == current_id else 0.9
+        cost = 0.0 if previous_id == current_id else (
+            0.35 if current_id in adjacency.get(previous_id, set()) else 8.0
+        )
+        previous_pose = baseline[previous["node_index"]]
+        current_pose = baseline[current["node_index"]]
+        previous_correction = (
+            previous["x"] - previous_pose.x,
+            previous["y"] - previous_pose.y,
+        )
+        current_correction = (
+            current["x"] - current_pose.x,
+            current["y"] - current_pose.y,
+        )
+        correction_delta = math.hypot(
+            current_correction[0] - previous_correction[0],
+            current_correction[1] - previous_correction[1],
+        )
+        yaw_delta = abs(
+            _normalize_angle(current["yaw_delta"] - previous["yaw_delta"])
+        )
+        raw_travel = math.hypot(
+            current_pose.x - previous_pose.x, current_pose.y - previous_pose.y
+        )
+        projected_travel = math.hypot(
+            current["x"] - previous["x"], current["y"] - previous["y"]
+        )
+        return (
+            cost
+            + 0.30 * (correction_delta / 1.25) ** 2
+            + 0.30 * (yaw_delta / math.radians(12.0)) ** 2
+            + 0.08 * (abs(projected_travel - raw_travel) / 1.5) ** 2
+        )
+
+    forward: list[list[float]] = []
+    parents: list[list[int]] = []
+    for sample_index, candidates in enumerate(candidate_sets):
+        if sample_index == 0:
+            forward.append([float(value["emission"]) for value in candidates])
+            parents.append([-1] * len(candidates))
+            continue
+        costs: list[float] = []
+        links: list[int] = []
+        for candidate in candidates:
+            options = [
                 (
-                    projected[2],
-                    corridor_id,
-                    projected[0],
-                    projected[1],
-                    projected[3],
-                    width,
+                    forward[sample_index - 1][prior_index]
+                    + transition(prior, candidate),
+                    prior_index,
+                )
+                for prior_index, prior in enumerate(candidate_sets[sample_index - 1])
+            ]
+            best_cost, best_parent = min(options)
+            costs.append(best_cost + float(candidate["emission"]))
+            links.append(best_parent)
+        forward.append(costs)
+        parents.append(links)
+    selected_indices = [0] * len(candidate_sets)
+    selected_indices[-1] = min(
+        range(len(candidate_sets[-1])), key=forward[-1].__getitem__
+    )
+    for sample_index in range(len(candidate_sets) - 1, 0, -1):
+        selected_indices[sample_index - 1] = parents[sample_index][
+            selected_indices[sample_index]
+        ]
+
+    backward = [[0.0] * len(values) for values in candidate_sets]
+    for sample_index in range(len(candidate_sets) - 2, -1, -1):
+        for prior_index, prior in enumerate(candidate_sets[sample_index]):
+            backward[sample_index][prior_index] = min(
+                transition(prior, candidate)
+                + float(candidate["emission"])
+                + backward[sample_index + 1][candidate_index]
+                for candidate_index, candidate in enumerate(
+                    candidate_sets[sample_index + 1]
                 )
             )
-        if not candidates:
+
+    selected: list[dict[str, Any]] = []
+    for sample_index, candidate_index in enumerate(selected_indices):
+        candidate = dict(candidate_sets[sample_index][candidate_index])
+        totals = sorted(
+            forward[sample_index][index]
+            + backward[sample_index][index]
+            for index in range(len(candidate_sets[sample_index]))
+        )
+        candidate["path_margin"] = (
+            math.inf if len(totals) < 2 else max(0.0, totals[1] - totals[0])
+        )
+        selected.append(candidate)
+
+    run_start = 0
+    for run_end in range(1, len(selected) + 1):
+        if run_end < len(selected) and selected[run_end]["corridor_id"] == selected[
+            run_start
+        ]["corridor_id"]:
             continue
-        distance, corridor_id, x, y, road_yaw, width = min(candidates)
-        reverse_yaw = _normalize_angle(road_yaw + math.pi)
-        yaw = min(
-            (road_yaw, reverse_yaw),
-            key=lambda value: abs(_normalize_angle(value - pose.yaw)),
-        )
-        # Weak enough to preserve the RTAB-Map trajectory, but useful across a
-        # long aisle. Confidence tapers to zero outside the declared corridor.
-        proximity = max(0.1, 1.0 - distance / (width / 2 + 0.75))
-        weight = 0.35 * proximity
-        legacy_sigma = 1.0 / math.sqrt(weight)
-        constraints.append(
-            AbsoluteConstraint(
-                identifier=f"road-{corridor_id}-{pose.node_id}",
-                node_index=index,
-                x=x,
-                y=y,
-                yaw=yaw,
-                weight=weight,
-                kind="road_soft",
-                source={
-                    "corridor_id": corridor_id,
-                    "distance_m": distance,
-                    "width_m": width,
-                },
-                # The old scalar-weight migration used the same sigma for
-                # metres and radians. Very weak road priors could therefore
-                # derive yaw sigma > pi and abort the complete factor graph.
-                # Preserve the translation strength while making the yaw
-                # prior explicitly bounded and effectively non-directional.
-                translation_sigma_m=legacy_sigma,
-                yaw_sigma_rad=min(math.pi, legacy_sigma),
+        run_length = run_end - run_start
+        corridor_id = selected[run_start]["corridor_id"]
+        if corridor_id is not None and run_length >= 2:
+            for candidate in selected[run_start:run_end]:
+                margin = float(candidate["path_margin"])
+                if margin < 0.35:
+                    continue
+                pose = baseline[candidate["node_index"]]
+                high_confidence = (
+                    margin >= 1.5
+                    and float(candidate["distance_m"])
+                    <= float(candidate["width_m"]) / 2.0 + 2.5
+                )
+                translation_sigma = 0.65 if high_confidence else 0.95
+                yaw_sigma = (
+                    math.radians(8.0 if high_confidence else 12.0)
+                    if candidate["travel_yaw_available"]
+                    else math.pi
+                )
+                target_yaw = _normalize_angle(pose.yaw + candidate["yaw_delta"])
+                constraints.append(
+                    AbsoluteConstraint(
+                        identifier=(
+                            f"road-sequence-{corridor_id}-{pose.node_id}"
+                        ),
+                        node_index=candidate["node_index"],
+                        x=float(candidate["x"]),
+                        y=float(candidate["y"]),
+                        yaw=target_yaw,
+                        weight=1.0 / (translation_sigma * translation_sigma),
+                        kind="road_soft",
+                        source={
+                            "corridor_id": corridor_id,
+                            "distance_m": candidate["distance_m"],
+                            "width_m": candidate["width_m"],
+                            "path_margin": margin,
+                            "confidence": (
+                                "high" if high_confidence else "medium"
+                            ),
+                            "yaw_correction_deg": math.degrees(
+                                candidate["yaw_delta"]
+                            ),
+                            "matcher": "continuous_corridor_sequence_v2",
+                        },
+                        translation_sigma_m=translation_sigma,
+                        yaw_sigma_rad=yaw_sigma,
+                    )
+                )
+        run_start = run_end
+
+    if match_audit is not None:
+        for candidate in selected:
+            pose = baseline[candidate["node_index"]]
+            match_audit.append(
+                {
+                    "node_id": pose.node_id,
+                    "timestamp": pose.timestamp,
+                    "corridor_id": candidate["corridor_id"],
+                    "distance_m": candidate["distance_m"],
+                    "yaw_residual_deg": candidate["yaw_residual_deg"],
+                    "path_margin": (
+                        None
+                        if math.isinf(float(candidate["path_margin"]))
+                        else round(float(candidate["path_margin"]), 6)
+                    ),
+                    "status": (
+                        "unmatched"
+                        if candidate["corridor_id"] is None
+                        else (
+                            "ambiguous_low_confidence"
+                            if float(candidate["path_margin"]) < 0.35
+                            else "matched"
+                        )
+                    ),
+                }
             )
+    return constraints
+
+
+def build_corridor_heading_constraints(
+    baseline: Sequence[Pose],
+    road_graph: dict[str, Any],
+    floor_id: str,
+    stride: int = 8,
+) -> list[AbsoluteConstraint]:
+    """Align long straight motion to the prior-map corridor orientation field.
+
+    Parallel supermarket aisles make the exact aisle identity ambiguous while
+    their dominant orientation is still unambiguous. Point-to-corridor priors
+    must therefore not be the only source of yaw correction: a gradually
+    rotated route can be several metres from the right aisle before a unique
+    lateral association exists. This pass rotates each stable straight-motion
+    run around its own center, correcting both position and device yaw without
+    selecting a particular parallel aisle. The sequence matcher remains the
+    authority for the later lateral association.
+    """
+
+    # This is a low-frequency drift correction, not a local shape snap. Short
+    # sessions do not contain enough repeated aisle travel to distinguish a
+    # persistent map-axis bias from an ordinary turn, and applying it there
+    # would compete with exact anchors/tag fixtures. The real production case
+    # is a many-minute route with hundreds of nodes.
+    if len(baseline) < 64:
+        return []
+    axes: list[float] = []
+    for cross in road_graph.get("crosses", []):
+        if not isinstance(cross, dict) or str(cross.get("floor_id")) != floor_id:
+            continue
+        points = cross.get("points_m")
+        if not isinstance(points, list):
+            continue
+        for first, second in zip(points, points[1:]):
+            if (
+                not isinstance(first, list)
+                or not isinstance(second, list)
+                or len(first) < 2
+                or len(second) < 2
+            ):
+                continue
+            dx = float(second[0]) - float(first[0])
+            dy = float(second[1]) - float(first[1])
+            if math.hypot(dx, dy) < 2.0:
+                continue
+            axis = math.atan2(-dx, dy)
+            # An undirected corridor axis is canonical modulo pi.
+            axis = axis % math.pi
+            if all(
+                min(
+                    abs(_normalize_angle(axis - existing)),
+                    abs(_normalize_angle(axis - existing + math.pi)),
+                    abs(_normalize_angle(axis - existing - math.pi)),
+                )
+                > math.radians(10.0)
+                for existing in axes
+            ):
+                axes.append(axis)
+    if not axes:
+        return []
+
+    sample_stride = max(1, stride)
+    sampled_indices = list(range(0, len(baseline), sample_stride))
+    if sampled_indices[-1] != len(baseline) - 1:
+        sampled_indices.append(len(baseline) - 1)
+    cumulative_distance = [0.0]
+    for previous, current in zip(baseline, baseline[1:]):
+        cumulative_distance.append(
+            cumulative_distance[-1]
+            + math.hypot(current.x - previous.x, current.y - previous.y)
         )
+
+    samples: list[dict[str, Any]] = []
+    for index in sampled_indices:
+        left = index
+        right = index
+        travel_yaw: float | None = None
+        for radius in range(4, min(32, max(8, sample_stride * 2)) + 1, 2):
+            left = max(0, index - radius)
+            right = min(len(baseline) - 1, index + radius)
+            dx = baseline[right].x - baseline[left].x
+            dy = baseline[right].y - baseline[left].y
+            if math.hypot(dx, dy) >= 1.5:
+                travel_yaw = math.atan2(-dx, dy)
+                break
+        if travel_yaw is None:
+            samples.append({"node_index": index, "axis": None, "yaw_delta": 0.0})
+            continue
+        choices: list[tuple[float, float]] = []
+        for axis in axes:
+            directed = min(
+                (axis, _normalize_angle(axis + math.pi)),
+                key=lambda value: abs(_normalize_angle(value - travel_yaw)),
+            )
+            choices.append((abs(_normalize_angle(directed - travel_yaw)), directed))
+        residual, directed_axis = min(choices)
+        if residual > math.radians(28.0):
+            samples.append({"node_index": index, "axis": None, "yaw_delta": 0.0})
+            continue
+        samples.append(
+            {
+                "node_index": index,
+                "axis": round(directed_axis % math.pi, 6),
+                "yaw_delta": _normalize_angle(directed_axis - travel_yaw),
+                "residual_deg": math.degrees(residual),
+            }
+        )
+
+    constraints: list[AbsoluteConstraint] = []
+    run_start = 0
+    for run_end in range(1, len(samples) + 1):
+        if run_end < len(samples) and samples[run_end]["axis"] == samples[run_start]["axis"]:
+            continue
+        run = samples[run_start:run_end]
+        if run and run[0]["axis"] is not None:
+            first_index = int(run[0]["node_index"])
+            last_index = int(run[-1]["node_index"])
+            run_distance = cumulative_distance[last_index] - cumulative_distance[first_index]
+            if len(run) >= 3 and run_distance >= 6.0:
+                deltas = [float(item["yaw_delta"]) for item in run]
+                median_delta = min(
+                    deltas,
+                    key=lambda candidate: sum(
+                        abs(_normalize_angle(value - candidate))
+                        for value in deltas
+                    ),
+                )
+                deviations = [
+                    abs(_normalize_angle(float(item["yaw_delta"]) - median_delta))
+                    for item in run
+                ]
+                inliers = [
+                    item
+                    for item, deviation in zip(run, deviations)
+                    if deviation <= math.radians(12.0)
+                ]
+                if len(inliers) >= 3:
+                    run_identifier = (
+                        f"{baseline[first_index].node_id}-"
+                        f"{baseline[last_index].node_id}-"
+                        f"{run[0]['axis']}"
+                    )
+                    center_x = sum(
+                        baseline[int(item["node_index"])].x for item in inliers
+                    ) / len(inliers)
+                    center_y = sum(
+                        baseline[int(item["node_index"])].y for item in inliers
+                    ) / len(inliers)
+                    cosine = math.cos(median_delta)
+                    sine = math.sin(median_delta)
+                    for item in inliers:
+                        index = int(item["node_index"])
+                        pose = baseline[index]
+                        relative_x = pose.x - center_x
+                        relative_y = pose.y - center_y
+                        target_x = center_x + cosine * relative_x - sine * relative_y
+                        target_y = center_y + sine * relative_x + cosine * relative_y
+                        constraints.append(
+                            AbsoluteConstraint(
+                                identifier=f"road-heading-{pose.node_id}",
+                                node_index=index,
+                                x=target_x,
+                                y=target_y,
+                                yaw=_normalize_angle(pose.yaw + median_delta),
+                                weight=1.0,
+                                kind="road_heading_soft",
+                                source={
+                                    "matcher": "corridor_orientation_field_v2",
+                                    "correction_field_contract": (
+                                        "continuous_rigid_run_se2_v1"
+                                    ),
+                                    "run_id": run_identifier,
+                                    "run_start_node_index": first_index,
+                                    "run_end_node_index": last_index,
+                                    "run_start_node_id": baseline[first_index].node_id,
+                                    "run_end_node_id": baseline[last_index].node_id,
+                                    "field_sample_stride": sample_stride,
+                                    "run_distance_m": run_distance,
+                                    "run_sample_count": len(run),
+                                    "yaw_correction_deg": math.degrees(median_delta),
+                                    "position_rotation_center": {
+                                        "x_m": center_x,
+                                        "y_m": center_y,
+                                    },
+                                    "position_rotation_only": True,
+                                },
+                                translation_sigma_m=0.55,
+                                yaw_sigma_rad=math.radians(4.0),
+                            )
+                        )
+        run_start = run_end
     return constraints
 
 
@@ -4150,30 +4645,53 @@ def _solve_banded(
     count: int,
     observations: Sequence[tuple[int, float, float]],
     smoothness: float,
+    curvature_smoothness: float = 0.0,
     iterations: int = 120,
 ) -> list[float]:
-    """Solve the tridiagonal smooth correction field exactly in O(N).
+    """Solve a banded smooth correction field exactly in O(N).
 
     Fixed-iteration relaxation converged too slowly for thousand-node routes.
     A remote manual anchor could therefore form a narrow correction spike and
-    look like a physical pose jump. This Thomas solve keeps the same quadratic
-    objective while propagating the correction across the complete connected
-    trajectory deterministically.
+    look like a physical pose jump. First-difference regularization preserves
+    continuity, while the optional second-difference term permits an affine
+    correction over a long straight run. That distinction matters for heading
+    drift: a rigid rotation is a linear x/y correction along the aisle and
+    should not be suppressed as if it were a discontinuity.
+
+    The resulting symmetric positive-definite matrix has bandwidth two. A
+    deterministic banded Cholesky factorization replaces the former Thomas
+    solve without changing the O(N) memory or time bound.
     """
     del iterations  # Kept in the signature for source compatibility.
     if count <= 0:
         return []
+    if (
+        not math.isfinite(smoothness)
+        or not math.isfinite(curvature_smoothness)
+        or smoothness < 0.0
+        or curvature_smoothness < 0.0
+    ):
+        raise OfflineLocalizationError(
+            "Correction-field smoothness is invalid."
+        )
     diagonal = [0.0] * count
-    lower = [0.0] * max(0, count - 1)
-    upper = [0.0] * max(0, count - 1)
+    first_off_diagonal = [0.0] * max(0, count - 1)
+    second_off_diagonal = [0.0] * max(0, count - 2)
     right_hand_side = [0.0] * count
     for index in range(count):
         if index > 0:
             diagonal[index] += smoothness
-            lower[index - 1] -= smoothness
         if index + 1 < count:
             diagonal[index] += smoothness
-            upper[index] -= smoothness
+            first_off_diagonal[index] -= smoothness
+    for center in range(1, count - 1):
+        # curvature_smoothness * (c[i-1] - 2*c[i] + c[i+1])^2
+        diagonal[center - 1] += curvature_smoothness
+        diagonal[center] += 4.0 * curvature_smoothness
+        diagonal[center + 1] += curvature_smoothness
+        first_off_diagonal[center - 1] -= 2.0 * curvature_smoothness
+        first_off_diagonal[center] -= 2.0 * curvature_smoothness
+        second_off_diagonal[center - 1] += curvature_smoothness
     for index, target, weight in observations:
         if not 0 <= index < count or not all(
             math.isfinite(value) for value in (target, weight)
@@ -4186,18 +4704,50 @@ def _solve_banded(
     diagonal[0] += 2.0
     if any(value <= 0.0 or not math.isfinite(value) for value in diagonal):
         raise OfflineLocalizationError("Correction-field system is singular.")
-    for index in range(1, count):
-        multiplier = lower[index - 1] / diagonal[index - 1]
-        diagonal[index] -= multiplier * upper[index - 1]
-        right_hand_side[index] -= multiplier * right_hand_side[index - 1]
-        if diagonal[index] <= 0.0 or not math.isfinite(diagonal[index]):
+
+    cholesky_diagonal = [0.0] * count
+    cholesky_first = [0.0] * count
+    cholesky_second = [0.0] * count
+    for index in range(count):
+        if index >= 2:
+            cholesky_second[index] = (
+                second_off_diagonal[index - 2]
+                / cholesky_diagonal[index - 2]
+            )
+        if index >= 1:
+            overlap = (
+                cholesky_second[index] * cholesky_first[index - 1]
+                if index >= 2
+                else 0.0
+            )
+            cholesky_first[index] = (
+                first_off_diagonal[index - 1] - overlap
+            ) / cholesky_diagonal[index - 1]
+        pivot = (
+            diagonal[index]
+            - cholesky_first[index] * cholesky_first[index]
+            - cholesky_second[index] * cholesky_second[index]
+        )
+        if pivot <= 0.0 or not math.isfinite(pivot):
             raise OfflineLocalizationError("Correction-field system is singular.")
+        cholesky_diagonal[index] = math.sqrt(pivot)
+
+    forward = [0.0] * count
+    for index in range(count):
+        value = right_hand_side[index]
+        if index >= 1:
+            value -= cholesky_first[index] * forward[index - 1]
+        if index >= 2:
+            value -= cholesky_second[index] * forward[index - 2]
+        forward[index] = value / cholesky_diagonal[index]
     values = [0.0] * count
-    values[-1] = right_hand_side[-1] / diagonal[-1]
-    for index in range(count - 2, -1, -1):
-        values[index] = (
-            right_hand_side[index] - upper[index] * values[index + 1]
-        ) / diagonal[index]
+    for index in range(count - 1, -1, -1):
+        value = forward[index]
+        if index + 1 < count:
+            value -= cholesky_first[index + 1] * values[index + 1]
+        if index + 2 < count:
+            value -= cholesky_second[index + 2] * values[index + 2]
+        values[index] = value / cholesky_diagonal[index]
     if any(not math.isfinite(value) for value in values):
         raise OfflineLocalizationError("Correction-field solution is non-finite.")
     return values
@@ -4235,6 +4785,7 @@ def optimize_trajectory(
             else:
                 exceeds_gate = not trusted_manual_anchor and constraint.kind not in {
                     "manual_aisle_assignment",
+                    "road_heading_soft",
                     "road_soft",
                 } and (
                     residual_xy > HARD_REJECT_TRANSLATION_M
@@ -4273,13 +4824,25 @@ def optimize_trajectory(
             xy_weight = translation_weight * (
                 1.0
                 if trusted_manual_anchor
+                or constraint.kind in {"road_heading_soft", "road_soft"}
                 else _huber_weight(residual_xy, HUBER_TRANSLATION_M)
             )
             yaw_weight = yaw_base_weight * (
                 1.0
                 if trusted_manual_anchor
+                or constraint.kind in {"road_heading_soft", "road_soft"}
                 else _huber_weight(residual_yaw, HUBER_YAW_RAD)
             )
+            if (
+                constraint.kind == "road_heading_soft"
+                and constraint.source.get("correction_field_contract")
+                == "continuous_rigid_run_se2_v1"
+            ):
+                # The complete run is added below as one continuous low-rate
+                # field. Keeping only these sparse point observations would
+                # penalize a genuine rigid rotation through the first-order
+                # smoother and leave the long aisle visibly skewed.
+                continue
             observations[0].append((index, constraint.x - baseline[index].x, xy_weight))
             observations[1].append((index, constraint.y - baseline[index].y, xy_weight))
             observations[2].append(
@@ -4289,10 +4852,97 @@ def optimize_trajectory(
                     yaw_weight,
                 )
             )
+        heading_runs: dict[str, AbsoluteConstraint] = {}
+        for constraint in retained:
+            if (
+                constraint.kind == "road_heading_soft"
+                and constraint.source.get("correction_field_contract")
+                == "continuous_rigid_run_se2_v1"
+            ):
+                run_id = str(constraint.source.get("run_id") or "")
+                if run_id:
+                    heading_runs.setdefault(run_id, constraint)
+        for constraint in heading_runs.values():
+            source = constraint.source
+            start = source.get("run_start_node_index")
+            end = source.get("run_end_node_index")
+            center = source.get("position_rotation_center")
+            correction_deg = source.get("yaw_correction_deg")
+            stride = source.get("field_sample_stride")
+            if (
+                isinstance(start, bool)
+                or not isinstance(start, int)
+                or isinstance(end, bool)
+                or not isinstance(end, int)
+                or not 0 <= start <= end < len(baseline)
+                or not isinstance(center, dict)
+                or isinstance(stride, bool)
+                or not isinstance(stride, int)
+                or stride <= 0
+            ):
+                raise OfflineLocalizationError(
+                    "Corridor heading correction field is invalid."
+                )
+            try:
+                center_x = float(center["x_m"])
+                center_y = float(center["y_m"])
+                correction = math.radians(float(correction_deg))
+            except (KeyError, TypeError, ValueError) as exc:
+                raise OfflineLocalizationError(
+                    "Corridor heading correction field is invalid."
+                ) from exc
+            if not all(
+                math.isfinite(value)
+                for value in (center_x, center_y, correction)
+            ):
+                raise OfflineLocalizationError(
+                    "Corridor heading correction field is invalid."
+                )
+            cosine = math.cos(correction)
+            sine = math.sin(correction)
+            # Preserve the total evidence scale of the sparse matcher while
+            # distributing it over every node. The bounded translation boost
+            # lets a long rigid run overcome first-order damping without
+            # turning an ambiguous corridor into a hard lateral assignment.
+            translation_sigma = constraint.translation_sigma_m or 0.55
+            yaw_sigma = constraint.yaw_sigma_rad or math.radians(4.0)
+            translation_weight = 4.0 / (
+                translation_sigma * translation_sigma * stride
+            )
+            yaw_weight = 1.0 / (yaw_sigma * yaw_sigma * stride)
+            for index in range(start, end + 1):
+                pose = baseline[index]
+                relative_x = pose.x - center_x
+                relative_y = pose.y - center_y
+                target_x = center_x + cosine * relative_x - sine * relative_y
+                target_y = center_y + sine * relative_x + cosine * relative_y
+                observations[0].append(
+                    (index, target_x - pose.x, translation_weight)
+                )
+                observations[1].append(
+                    (index, target_y - pose.y, translation_weight)
+                )
+                observations[2].append((index, correction, yaw_weight))
         active = retained
-        corrections[0] = _solve_banded(len(baseline), observations[0], smoothness=24.0)
-        corrections[1] = _solve_banded(len(baseline), observations[1], smoothness=24.0)
-        corrections[2] = _solve_banded(len(baseline), observations[2], smoothness=36.0)
+        use_rigid_heading_field = bool(heading_runs)
+        corrections[0] = _solve_banded(
+            len(baseline),
+            observations[0],
+            smoothness=1.5 if use_rigid_heading_field else 24.0,
+            curvature_smoothness=96.0 if use_rigid_heading_field else 0.0,
+        )
+        corrections[1] = _solve_banded(
+            len(baseline),
+            observations[1],
+            smoothness=1.5 if use_rigid_heading_field else 24.0,
+            curvature_smoothness=96.0 if use_rigid_heading_field else 0.0,
+        )
+        corrections[2] = _solve_banded(
+            len(baseline),
+            observations[2],
+            smoothness=12.0 if use_rigid_heading_field else 36.0,
+            curvature_smoothness=72.0 if use_rigid_heading_field else 0.0,
+        )
     optimized = [
         Pose(
             node_id=pose.node_id,
@@ -6101,17 +6751,36 @@ def _render_localized_version(
                     event,
                 )
             )
+    corridor_match_audit: list[dict[str, Any]] = []
     constraints.extend(
-        build_road_soft_constraints(
+        build_corridor_heading_constraints(
             baseline,
             road_graph_payload,
             str(metadata.get("floorId") or metadata.get("floor_id") or ""),
         )
     )
-    trusted_manual_anchor_count = sum(
+    constraints.extend(
+        build_road_soft_constraints(
+            baseline,
+            road_graph_payload,
+            str(metadata.get("floorId") or metadata.get("floor_id") or ""),
+            match_audit=corridor_match_audit,
+        )
+    )
+    # Exact node-bound operator evidence is the highest-trust map-frame input.
+    # Corridor identity is periodic and remains a soft automatic hypothesis;
+    # it must not dilute a verified manual anchor or move a confirmed tag
+    # fixture merely because a nearby parallel aisle is geometrically valid.
+    if (trusted_manual_anchor_count := sum(
         item.kind == "manual_anchor" and item.trusted_absolute
         for item in constraints
-    )
+    )) and len(baseline) < 64:
+        constraints = [
+            item
+            for item in constraints
+            if item.kind not in {"road_heading_soft", "road_soft"}
+        ]
+        corridor_match_audit = []
     if raw_manual_anchor_recovery and trusted_manual_anchor_count == 0:
         raise OfflineLocalizationError(
             "Raw continuous VIO recovery requires at least one verified manual anchor."
@@ -6128,7 +6797,7 @@ def _render_localized_version(
         "optimized_database_sha256": optimized_db_hash,
     }
     full_factor_graph = False
-    if factor_graph_binary is not None and not raw_vio_recovery:
+    if factor_graph_binary is not None:
         try:
             optimized, accepted, rejected, factor_graph_report = (
                 run_relative_se2_factor_graph(
@@ -6163,6 +6832,35 @@ def _render_localized_version(
     solver_metrics = bounded_correction_metrics(
         baseline, optimized, constraints
     )
+    continuity_fallback_reason: str | None = None
+    if raw_vio_recovery and full_factor_graph and (
+        solver_metrics["maximum_neighbor_correction_translation_change_m"] > 1.0
+        or solver_metrics["maximum_neighbor_correction_yaw_change_deg"] > 30.0
+    ):
+        # Preserve the complete native report, but do not export a graph that
+        # violated the physically continuous recovered baseline. Automatic map
+        # priors are weaker than continuity. The bounded field is finite,
+        # continuous and remains explicitly draft/review only.
+        native_factor_graph_report = dict(factor_graph_report)
+        optimized, accepted, rejected = optimize_trajectory(
+            baseline, constraints
+        )
+        solver_metrics = bounded_correction_metrics(
+            baseline, optimized, constraints
+        )
+        full_factor_graph = False
+        continuity_fallback_reason = (
+            "native_graph_violated_recovered_physical_continuity"
+        )
+        factor_graph_report = {
+            **native_factor_graph_report,
+            "full_factor_graph": False,
+            "published_capable": False,
+            "continuity_fallback_applied": True,
+            "continuity_fallback_reason": continuity_fallback_reason,
+            "native_graph_preserved_for_audit": True,
+            "review_trajectory_solver": "bounded_correction_field_banded_v3",
+        }
     graph_quality_passed = factor_graph_report.get("graph_quality_passed") is True
     factor_graph_published_capable = (
         full_factor_graph
@@ -6598,6 +7296,26 @@ def _render_localized_version(
         "road_soft_constraint_count": sum(
             item["kind"] == "road_soft" for item in accepted
         ),
+        "road_heading_soft_constraint_count": sum(
+            item["kind"] == "road_heading_soft" for item in accepted
+        ),
+        "corridor_sequence_match": {
+            "format": "MarketScannerCorridorSequenceMatchAudit",
+            "version": 2,
+            "matcher": "continuous_corridor_sequence_v2",
+            "sample_count": len(corridor_match_audit),
+            "matched_sample_count": sum(
+                item["status"] == "matched" for item in corridor_match_audit
+            ),
+            "ambiguous_sample_count": sum(
+                item["status"] == "ambiguous_low_confidence"
+                for item in corridor_match_audit
+            ),
+            "unmatched_sample_count": sum(
+                item["status"] == "unmatched" for item in corridor_match_audit
+            ),
+            "samples": corridor_match_audit,
+        },
         "manual_aisle_constraint_count": sum(
             item.kind == "manual_aisle_assignment" for item in constraints
         ),
@@ -6681,8 +7399,13 @@ def _render_localized_version(
             "limitation": (
                 None
                 if full_factor_graph
-                else "The native relative SE(2) graph was unavailable or failed; bounded correction is draft/review only."
+                else (
+                    "The native relative SE(2) graph violated recovered physical continuity; its report was preserved, and a continuous bounded correction field is used for draft/review only."
+                    if continuity_fallback_reason is not None
+                    else "The native relative SE(2) graph was unavailable or failed; bounded correction is draft/review only."
+                )
             ),
+            "continuity_fallback_reason": continuity_fallback_reason,
             "native_solver": factor_graph_report.get("solver"),
             "factor_set_sha256": factor_graph_report.get("factor_set_sha256"),
             "huber_translation_m": HUBER_TRANSLATION_M,
@@ -6946,7 +7669,7 @@ def _render_localized_version(
             "algorithm_version": (
                 "relative_se2_factor_graph_v2"
                 if full_factor_graph
-                else "bounded_correction_field_tridiagonal_v2"
+                else "bounded_correction_field_banded_v3"
             ),
             "coordinate_contract_version": COORDINATE_CONTRACT_VERSION,
             "processing_parameter_sha256": processing_parameter_sha256(
