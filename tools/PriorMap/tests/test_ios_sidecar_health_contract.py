@@ -175,7 +175,7 @@ class IOSLocalizationSidecarHealthContractTests(unittest.TestCase):
     def test_loop_recovery_and_corrected_hud_are_fail_closed(self) -> None:
         overlay = source(OVERLAY_SOURCE)
         recovery = overlay.split("func requestRecovery(reason: String)", 1)[1].split(
-            "func update(frame:", 1
+            "func update(", 1
         )[0]
         self.assertIn("beginRecovery(", recovery)
         self.assertNotIn("arkitOrigin =", recovery)

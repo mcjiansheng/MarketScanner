@@ -1601,7 +1601,12 @@ final class SupermarketScanSession {
         return currentAreaM2
     }
 
-    func updateSensorPose(timestamp: TimeInterval, matrixColumnMajor: [Float], trackingState: String) {
+    func updateSensorPose(
+        timestamp: TimeInterval,
+        matrixColumnMajor: [Float],
+        trackingState: String,
+        acceptedForLocation: Bool = true
+    ) {
         guard matrixColumnMajor.count == 16 else {
             return
         }
@@ -1611,10 +1616,16 @@ final class SupermarketScanSession {
             timestamp: timestamp,
             matrixColumnMajor: matrixColumnMajor,
             trackingState: trackingState)
-        if sensorStartPose == nil {
-            sensorStartPose = pose
+        // Tracking-health counters include every callback, but location
+        // boundary poses must come only from the same continuity-gated pose
+        // authority used by RTAB-Map/prior-map/ESL. A rejected raw ARKit frame
+        // is therefore counted without becoming a location sidecar value.
+        if acceptedForLocation {
+            if sensorStartPose == nil {
+                sensorStartPose = pose
+            }
+            sensorEndPose = pose
         }
-        sensorEndPose = pose
         sensorPoseCount += 1
         if trackingState == "normal" {
             normalTrackingPoseCount += 1
@@ -1652,6 +1663,9 @@ final class SupermarketScanSession {
                 degradedTrackingRejectedFrameCount += 1
             case "tracking_recovery":
                 trackingRecoveryRejectedFrameCount += 1
+            case "tracking_recovery_epoch_rebase":
+                trackingRecoveryRejectedFrameCount += 1
+                poseDiscontinuityCompensationCount += 1
             case "pose_discontinuity":
                 poseDiscontinuityCompensationCount += 1
             default:
@@ -3097,6 +3111,17 @@ final class SupermarketScanSession {
         defer { captureLock.unlock() }
         return scanConfiguration.workflowMode == .priorMapLocalized
             && localizationRequiredWriteFailureCount > 0
+    }
+
+    /// A durable manual event followed by a failed in-memory CAS would make
+    /// that event ambiguous to downstream consumers. This is an integrity
+    /// failure, not a low-confidence localization result: preserve the raw
+    /// scan and event for diagnosis, but make certified processing ineligible.
+    func recordManualLocalizationCommitConflict() {
+        recordLocalizationEvidenceFailures([
+            "manual_localization_events.jsonl":
+                "manual_alignment_commit_conflict"
+        ])
     }
 
     /// P7R6: coordinator-level Recovery persistence failures (unreadable

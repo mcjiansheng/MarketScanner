@@ -2,6 +2,13 @@
 
 > 文档状态：**当前有效**。最后核对日期：2026-08-14。
 
+## 2026-08-14 — 现场反馈复核：人工重定位原子提交、统一位姿 authority 与崩溃诊断
+
+- iOS 人工重定位改为真正的 UIScrollView zoom/pan/双击和箭头聚焦；确认前同步最后一次 X/Y/yaw 编辑，弹窗保持到 fresh accepted node、manual JSONL durable append 和 alignment CAS commit 全部成功。写失败或 fresh-node 超时不改变 live alignment、不关闭弹窗、不丢用户输入。
+- RTAB-Map、prior-map localizer/depth、ESL depth/ray 和 location-bearing sensor boundary 统一消费同一 software-stabilized transform；被拒 raw frame只计 tracking health。tracking 恢复坐标 epoch 会重基准并拒绝边界帧，普通 callback gap 不再放宽到 6 m/360°。
+- 连续扫描 profile 的 `OptimizeMaxError=2.0`、`Vis/MinInliers=40` 成为可审计实际 authority；没有 Sam 真值 A/B 前未采用审查报告中的 4.0/0.18–0.20/30 建议。
+- 新增 MetricKit crash/hang 持久诊断和 Map Studio 有界摘要解析。单个原始 payload 在 8 MiB 合同内完整保留；超限时保留计数、原始大小和明确省略原因，不能突破文件上限。现场 4 次 crash 因缺少 `.ips`/符号化堆栈仍不能宣称根因关闭；冷启动跨 ARKit epoch 续采、WM 恢复、正式 shelf-loop/manifest v5 等后续项登记于 [`TESTER_FEEDBACK_TODO_2026-08-14.md`](TESTER_FEEDBACK_TODO_2026-08-14.md)。
+
 ## 2026-08-14 — 正常生命周期防崩溃与人工锚点交互收口
 
 - iOS 正常生命周期不再使用进程级强制终止：Core Location 空批次只写 `gps_empty_update_ignored` 并继续；暂时没有 active `UIWindowScene` 时朝向返回 `nil`；历史数据库 scroller 对索引和 `DatabaseView` 类型做可选检查；数据库文件日期与 Application Support 状态目录失败均进入可恢复分支；价签非法状态迁移只记录诊断；后处理不变量异常改为类型化 checkpoint/map 错误。完整性/身份损坏仍失败关闭，但普通 UIKit、Files、定位回调和算法竞态不能导致闪退。

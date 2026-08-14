@@ -2,6 +2,8 @@
 
 > 文档状态：**当前有效**。最后核对日期：2026-08-14。
 
+2026-08-14 现场反馈复核增量已修复人工重定位旧 transform 手势、最后文本编辑丢失、旧 node 缓存低成功率和“先改内存后写审计”的原子性缺口；人工 correction 现在等待 fresh accepted RTAB-Map node，并按 durable-first/CAS 提交。RTAB-Map、prior-map、ESL 和 location-bearing sensor boundary 使用统一 stabilized pose authority，tracking gap 不再放宽到 6 m/360°。连续 profile 的实际 OptimizeMaxError/MinInliers 已可审计，MetricKit crash/hang payload 可随本地会话导出并由 Map Studio 解析。由于现场 4 次异常尚无 `.ips`/符号化栈，且 crash 后跨 ARKit epoch 继续同一业务任务、Sam WM/LTM 召回 A/B 和正式 shelf-loop manifest v5 尚未完成，整体仍是 **NO-GO**；详细关闭条件见 [`TESTER_FEEDBACK_TODO_2026-08-14.md`](TESTER_FEEDBACK_TODO_2026-08-14.md)。
+
 2026-08-14 当前成果合同已从“质量门失败即没有结果”改为“先生成不可变业务成果，再独立判断发布资格”。PC 与手机都必须保留所有身份明确的源节点和 durable 价签业务记录；低置信度、部分优化图、局部时钟绑定缺口、平行通道多解、距离尺度偏差或货架关联不足只产生 `LOW_CONFIDENCE` / `PARTIAL_REVIEW_REQUIRED` 和 publish blocker。只有数据库/JSON framing 损坏、地图/会话身份串包、hash/watermark/CAS 不一致、重复 durable 主键导致身份不可界定、完全没有有限轨迹或无法安全原子提交时才允许终止。
 
 当前 PC 长距离道路匹配已废弃中心线重参数化。`bounded_free_space_road_hmm_v2` 只用道路图确定 corridor identity、有限边/路口时序和可达拓扑；最终 X/Y/yaw 保留优化手机位姿的局部几何，exact 人工锚点残差按 gauge-neutral 物理里程连续传播。货架/固定结构自由空间只施加最小低频修正：结构内点采用通道侧一致、邻域连续的安全出口；穿架段采用货架驱动的局部刚体平移；同轮建议合并后一次应用；最终尖刺和平台梯度只在完整自由空间验证通过且不增加局部最大步长时摊平。道路中心/切线不得写入位置或 yaw。TianHong `162937`/`181158` 最新回归分别保留 3663/1054 个节点和 3806/1132 行秒级表，结构内点、穿架段和拓扑断裂均为 0；结果仍因绝对修正、弱定位时长和部分无法安全摊平的修正梯度保留为不可发布低置信度草稿。手机端没有道路中心线投影实现，继续保存连续相对轨迹和证据；不得为了与 PC 对齐而在手机后处理中新增中心线吸附。

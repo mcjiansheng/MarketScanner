@@ -238,11 +238,10 @@ class YawArrowGeometryGolden(unittest.TestCase):
         self.assertIn("界面数值就是写入审计记录的 canonical SE(2)", overlay)
         self.assertIn("for: .editingDidEnd", overlay)
         self.assertNotIn("for: .editingChanged", overlay)
-        self.assertIn(
-            "never leave an unparseable display value while the picker still",
-            overlay,
-        )
-        self.assertIn("refreshCoordinateControls()\n            return", overlay)
+        self.assertIn("view.endEditing(true)", overlay)
+        self.assertIn("applyCoordinateFields(showError: true)", overlay)
+        self.assertIn("坐标或方向不是有效数字", overlay)
+        self.assertIn("当前位置尚未提交", overlay)
         self.assertIn("@objc private func resetPose()", overlay)
 
     def test_reliable_loop_retains_bounded_shelf_identity_candidates(self) -> None:

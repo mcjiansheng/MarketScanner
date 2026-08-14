@@ -1020,6 +1020,85 @@ def scan_event_logs(session: Path, limit: int = 1000) -> Dict[str, Any]:
     }
 
 
+def metrickit_diagnostic_logs(session: Path, limit: int = 100) -> Dict[str, Any]:
+    """Return bounded crash/hang summaries without sending call trees to UI."""
+    diagnostic_limit = max(1, int(limit))
+    recent: deque[Dict[str, Any]] = deque(maxlen=diagnostic_limit)
+    record_count = 0
+    malformed_lines = 0
+    files = sorted(
+        [
+            path
+            for path in session.glob("segment_*/metrickit_diagnostics*.jsonl")
+            if path.is_file()
+        ],
+        key=lambda path: (
+            path.parent.name,
+            path.name == "metrickit_diagnostics.jsonl",
+            path.name,
+        ),
+    )
+    for path in files:
+        try:
+            handle = path.open("r", encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        with handle:
+            for line in handle:
+                if not line.strip():
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    malformed_lines += 1
+                    continue
+                if not isinstance(record, dict):
+                    malformed_lines += 1
+                    continue
+                record_count += 1
+                recent.append(
+                    {
+                        "source": path.relative_to(session).as_posix(),
+                        "delivery_id": record.get("delivery_id"),
+                        "received_at_unix": record.get("received_at_unix"),
+                        "payload_begin_unix": record.get("payload_begin_unix"),
+                        "payload_end_unix": record.get("payload_end_unix"),
+                        "tracking_session_id": record.get("tracking_session_id"),
+                        "app_version": record.get("app_version"),
+                        "app_build": record.get("app_build"),
+                        "crash_count": record.get("crash_count", 0),
+                        "hang_count": record.get("hang_count", 0),
+                        "cpu_exception_count": record.get(
+                            "cpu_exception_count", 0
+                        ),
+                        "disk_write_exception_count": record.get(
+                            "disk_write_exception_count", 0
+                        ),
+                        "raw_payload_preserved": isinstance(
+                            record.get("diagnostic_payload"), dict
+                        ),
+                        "raw_payload_size_bytes": record.get(
+                            "raw_payload_size_bytes"
+                        ),
+                        "raw_payload_omitted_reason": record.get(
+                            "raw_payload_omitted_reason"
+                        ),
+                    }
+                )
+    records = sorted(
+        recent,
+        key=lambda item: float(item.get("received_at_unix", 0) or 0),
+    )
+    return {
+        "available": bool(files),
+        "files": [path.relative_to(session).as_posix() for path in files],
+        "record_count": record_count,
+        "malformed_lines": malformed_lines,
+        "records": records,
+        "truncated": record_count > diagnostic_limit,
+    }
+
+
 def structure_coverage_summary(session: Path) -> Dict[str, Any]:
     """Read the bounded phone-side coverage evidence without loading its cells."""
     files = sorted(session.glob("segment_*/structure_coverage_cells.json"))
@@ -1169,6 +1248,7 @@ def inspect_session(session: Path) -> Dict[str, Any]:
         "structure_coverage": structure_coverage_summary(session),
         "prior_map_localization": prior_map_localization_summary(session),
         "scan_logs": scan_event_logs(session),
+        "crash_diagnostics": metrickit_diagnostic_logs(session),
         "checkpoint_cleanup": checkpoint_cleanup_evidence(session),
         "active_job": job_payload(active_job) if active_job else None,
     }

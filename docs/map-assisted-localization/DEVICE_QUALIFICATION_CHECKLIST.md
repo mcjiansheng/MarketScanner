@@ -1,6 +1,6 @@
 # 真实 LiDAR iPhone 资格验证清单
 
-> 文档状态：**当前有效，尚未执行**。最后核对日期：2026-08-07。
+> 文档状态：**当前有效，尚未执行**。最后核对日期：2026-08-14。
 
 本清单用于 P5 人工真机执行。勾选、日志和 JSON 声明必须来自实际操作者；fixture、模拟器、本机 Swift 测试和 CI 均不能替代。本仓库目前没有真实设备证据，因此结论保持 **NOT EXECUTED / NO-GO**。
 
@@ -27,9 +27,12 @@
 | `dynamic_occlusion` | 行人或动态物体遮挡 | 状态可见，不错误自动确认 |
 | `tag_scan` | 至少 3 次 tag scan，一处靠近货架端点 | 不确定样本进入 review |
 | `manual_correction` | 人工确认一次位置 | correction 绑定 node/time 并可审计 |
+| `manual_reselection_20x` | 连续 20 次缩放、平移、选点、X/Y/yaw/离散旋转后确认 | fresh node 成功；UI/event/alignment/PC 值一致；失败保持弹窗和输入 |
+| `manual_persistence_failure` | 对 manual JSONL 做安全故障注入 | durable append 失败时 live alignment 不改变，raw DB 继续增长 |
 | `stop_finalization` | Stop 并等待 DB save/sidecar finalization | metadata 最后提交；required evidence 缺失时 fail closed |
 | `provider_copy` | 用实际 Files/iCloud/SMB provider 复制并复读 | receipt v2、package manifest、local retained；不宣称断电保证 |
 | `kill_relaunch` | 扫描中强杀并重新启动 | raw DB 不丢，checkpoint/恢复状态明确 |
+| `metrickit_delivery` | crash/hang 后等待系统交付 MetricKit，导出原始会话 | payload 绑定旧 tracking session；PC 显示摘要；8 MiB 内原始 call tree 保留，超限时有明确 omission 审计 |
 | `provider_failure` | 复制中取消或断开 provider | 失败可见，本地唯一副本保留 |
 | `low_disk` | 可用空间逼近产品阈值 | 资源保护、日志和最终状态一致 |
 | `thermal_serious` | 真机达到 serious 并记录系统状态 | 节流/告警有证据，数据库安全 |

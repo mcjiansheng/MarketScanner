@@ -2,6 +2,12 @@
 
 > 文档状态：**当前有效**。最后核对日期：2026-08-14。
 
+### 2026-08-14 现场反馈回归
+
+自动化必须证明：人工重定位 picker 不再直接修改 `imageView.transform`，支持真实 zoom/pan；确认前提交最后文本编辑；fresh-node 超时保持弹窗；`appendManualLocalizationEvent` 在 `commitManualPosition` 前完成；写失败不改变 alignment。ARFrame 同帧路径必须把同一 `correctedPose` 传给 native graph、prior-map 和 ESL，rejected frame 不写 location boundary；tracking gap 不得恢复 6 m/360° 门。连续 profile 日志必须报告实际 OptimizeMaxError/MinInliers。MetricKit parser 只向 UI 返回有界摘要；8 MiB 内原始 call tree 保留在导出 JSONL，超限记录必须明确报告原始大小和省略原因。
+
+真机必须新增：20 次连续“重新选择位置”成功率测试；每次覆盖 1×–8× zoom、放大后单指 pan、点击/箭头拖动、X/Y/yaw 最后一键确认、±1/5/15°和四方向；核对 UI 值、manual event、alignment snapshot、PC 解析一致。另执行审计写失败注入、6 秒无 fresh node、tracking loss/recovery、顾客碰撞、刚开始扫描 crash、长扫 crash、kill/relaunch 和 MetricKit 后续交付。没有 `.ips`/payload 时只能记录“未取得诊断”，不能判定无 crash。
+
 ## 自动测试
 
 ### 2026-08-14 跨端稳定性自检

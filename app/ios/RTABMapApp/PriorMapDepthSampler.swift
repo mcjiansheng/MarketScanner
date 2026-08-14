@@ -55,7 +55,10 @@ final class PriorMapDepthSampler {
         sampleResult(frame: frame).structureObservation
     }
 
-    func sampleResult(frame: ARFrame) -> PriorMapDepthSampleResult {
+    func sampleResult(
+        frame: ARFrame,
+        cameraTransform: simd_float4x4? = nil
+    ) -> PriorMapDepthSampleResult {
         let usesSmoothedDepth = frame.smoothedSceneDepth != nil
         guard let sceneDepth = frame.smoothedSceneDepth ?? frame.sceneDepth else {
             return .noDepth
@@ -95,7 +98,7 @@ final class PriorMapDepthSampler {
 
         frameIndex += 1
         let step = max(1, Int(sqrt(Double(width * height) / 3_600.0)))
-        let cameraTransform = frame.camera.transform
+        let cameraTransform = cameraTransform ?? frame.camera.transform
         let cameraPosition = SIMD3<Float>(
             cameraTransform.columns.3.x,
             cameraTransform.columns.3.y,

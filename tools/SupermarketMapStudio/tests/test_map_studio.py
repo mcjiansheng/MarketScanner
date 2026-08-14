@@ -2396,6 +2396,46 @@ class MapStudioApiTests(unittest.TestCase):
         self.assertTrue(result["truncated"])
         self.assertEqual([event["event"] for event in result["events"]], ["event_3", "event_4"])
 
+    def test_metrickit_diagnostic_reader_returns_bounded_summary(self) -> None:
+        segment = self.session_a / "segment_0001"
+        payload = {
+            "format": "MarketScannerMetricKitDiagnostic",
+            "version": 1,
+            "delivery_id": "delivery-1",
+            "received_at_unix": 10.0,
+            "payload_begin_unix": 1.0,
+            "payload_end_unix": 9.0,
+            "tracking_session_id": "tracking-a",
+            "app_version": "1.0",
+            "app_build": "7",
+            "crash_count": 1,
+            "hang_count": 2,
+            "cpu_exception_count": 0,
+            "disk_write_exception_count": 0,
+            "diagnostic_payload": {"callStackTree": {"large": "payload"}},
+        }
+        (segment / "metrickit_diagnostics.jsonl").write_text(
+            json.dumps(payload) + "\n", encoding="utf-8"
+        )
+        previous = dict(payload)
+        previous["delivery_id"] = "delivery-0"
+        previous["received_at_unix"] = 5.0
+        previous["crash_count"] = 9
+        (segment / "metrickit_diagnostics.previous.jsonl").write_text(
+            json.dumps(previous) + "\n", encoding="utf-8"
+        )
+
+        result = server.metrickit_diagnostic_logs(self.session_a, limit=1)
+
+        self.assertTrue(result["available"])
+        self.assertEqual(result["record_count"], 2)
+        self.assertTrue(result["truncated"])
+        self.assertEqual(result["records"][0]["delivery_id"], "delivery-1")
+        self.assertEqual(result["records"][0]["crash_count"], 1)
+        self.assertEqual(result["records"][0]["hang_count"], 2)
+        self.assertTrue(result["records"][0]["raw_payload_preserved"])
+        self.assertNotIn("diagnostic_payload", result["records"][0])
+
     def test_nfc_is_hidden_from_active_debug_information(self) -> None:
         log = self.session_a / "segment_0001" / "scan_events.jsonl"
         events = [

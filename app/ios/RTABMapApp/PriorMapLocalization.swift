@@ -443,6 +443,18 @@ struct PriorMapShelfIdentityCandidate {
     let longitudinalFraction: Double
 }
 
+/// Immutable two-phase manual-alignment proposal. Preparing a proposal never
+/// changes the live alignment. The caller must first durably append the manual
+/// localization event, then commit this exact proposal on the same serialized
+/// localizer queue. This prevents an evidence write failure from leaving an
+/// unaudited in-memory map correction behind.
+struct PriorMapManualPositionCandidate {
+    let arkitPose: PriorMapPose2D
+    let confirmedMapPose: PriorMapPose2D
+    let expectedAlignmentVersion: Int
+    let committedAlignmentVersion: Int
+}
+
 final class PriorMapStageOneLocalizer {
     private let floorId: String
     private let alignmentAnchor: PriorMapLocalizationAnchor
@@ -683,8 +695,15 @@ final class PriorMapStageOneLocalizer {
         terminalRecoveryCompletionsAwaitingEvidence.removeAll()
     }
 
-    func update(frame: ARFrame, trackingState: String) -> PriorMapLocalizationUpdate {
-        let transform = frame.camera.transform
+    func update(
+        frame: ARFrame,
+        trackingState: String,
+        poseOverride: simd_float4x4? = nil
+    ) -> PriorMapLocalizationUpdate {
+        // All location-bearing consumers of one accepted ARFrame must use the
+        // same software-stabilized pose. Falling back to ARKit is retained for
+        // isolated tests and non-production callers only.
+        let transform = poseOverride ?? frame.camera.transform
         let timestamp = frame.timestamp
         let arkitPose = Self.pose(from: transform)
         let rawPose = alignmentAnchor.project(arkitPose: arkitPose)
@@ -738,7 +757,9 @@ final class PriorMapStageOneLocalizer {
             ? "structure_depth_unavailable"
             : "tracking_not_normal"
         let depthSample = trackingState == "normal"
-            ? depthSampler.sampleResult(frame: frame)
+            ? depthSampler.sampleResult(
+                frame: frame,
+                cameraTransform: transform)
             : nil
         let observation = depthSample?.structureObservation
         var recoveryFrameDisposition: PriorMapRecoveryFrameDisposition =
@@ -1035,16 +1056,36 @@ final class PriorMapStageOneLocalizer {
             frameTimestamp: frameTimestamp)
     }
 
-    func confirmCurrentPosition(
+    func prepareManualPosition(
         transform: simd_float4x4,
         mapPose: PriorMapPose2D
-    ) -> (PriorMapPose2D, PriorMapPose2D) {
+    ) -> PriorMapManualPositionCandidate {
         let arkitPose = Self.pose(from: transform)
-        alignmentAnchor.retainAppliedCorrection(
+        return PriorMapManualPositionCandidate(
             arkitPose: arkitPose,
-            estimatedMapPose: mapPose)
-        alignmentVersion += 1
-        latestEstimatedPose = mapPose
+            confirmedMapPose: mapPose,
+            expectedAlignmentVersion: alignmentVersion,
+            committedAlignmentVersion: alignmentVersion + 1)
+    }
+
+    /// Applies a proposal only if no automatic localization update changed the
+    /// alignment after it was prepared. Callers serialize this with normal
+    /// updates on `priorMapQueue`; the compare-and-swap guard remains an
+    /// explicit defense against future queueing changes.
+    @discardableResult
+    func commitManualPosition(
+        _ candidate: PriorMapManualPositionCandidate
+    ) -> Bool {
+        guard alignmentVersion == candidate.expectedAlignmentVersion,
+              candidate.committedAlignmentVersion
+                == candidate.expectedAlignmentVersion + 1 else {
+            return false
+        }
+        alignmentAnchor.retainAppliedCorrection(
+            arkitPose: candidate.arkitPose,
+            estimatedMapPose: candidate.confirmedMapPose)
+        alignmentVersion = candidate.committedAlignmentVersion
+        latestEstimatedPose = candidate.confirmedMapPose
         confidenceManager.reset(manual: true)
         latestPhase = .manualCorrection
         latestConfidence = 0.35
@@ -1059,7 +1100,20 @@ final class PriorMapStageOneLocalizer {
             recoveryController.resetAutomaticCooldownAfterManualCorrection()
         }
         consecutiveUntrustedFrames = 0
-        return (arkitPose, mapPose)
+        return true
+    }
+
+    /// Compatibility helper for host tests and non-production callers. The
+    /// production UI uses prepare -> durable append -> commit instead.
+    func confirmCurrentPosition(
+        transform: simd_float4x4,
+        mapPose: PriorMapPose2D
+    ) -> (PriorMapPose2D, PriorMapPose2D) {
+        let candidate = prepareManualPosition(
+            transform: transform,
+            mapPose: mapPose)
+        precondition(commitManualPosition(candidate))
+        return (candidate.arkitPose, candidate.confirmedMapPose)
     }
 
     func localizePriceTag(
@@ -1213,44 +1267,76 @@ enum PriorMapHeadingUI {
     }
 }
 
-final class PriorMapPosePickerView: UIView {
+final class PriorMapPosePickerView: UIView,
+    UIScrollViewDelegate,
+    UIGestureRecognizerDelegate {
+    private let zoomScrollView = UIScrollView()
+    private let canvasView = UIView()
     private let imageView = UIImageView()
     private let arrow = CAShapeLayer()
     private(set) var pose: PriorMapPose2D
     private let boundsM: PriorMapBounds
-    private var markerDragging = false
+    private var baseCanvasSize = CGSize.zero
+    private lazy var markerPan = UIPanGestureRecognizer(
+        target: self,
+        action: #selector(markerPanned(_:)))
     var onPoseChanged: ((PriorMapPose2D) -> Void)?
 
     init(image: UIImage, bounds: PriorMapBounds, pose: PriorMapPose2D) {
         self.pose = pose
         self.boundsM = bounds
         super.init(frame: .zero)
+        zoomScrollView.delegate = self
+        zoomScrollView.minimumZoomScale = 1
+        zoomScrollView.maximumZoomScale = 8
+        zoomScrollView.bouncesZoom = true
+        zoomScrollView.alwaysBounceHorizontal = false
+        zoomScrollView.alwaysBounceVertical = false
+        zoomScrollView.showsHorizontalScrollIndicator = true
+        zoomScrollView.showsVerticalScrollIndicator = true
+        zoomScrollView.decelerationRate = .fast
+        addSubview(zoomScrollView)
+
+        zoomScrollView.addSubview(canvasView)
         imageView.image = image
-        imageView.contentMode = .scaleAspectFit
+        imageView.contentMode = .scaleToFill
         imageView.isUserInteractionEnabled = true
-        addSubview(imageView)
+        canvasView.addSubview(imageView)
         arrow.fillColor = UIColor.systemRed.cgColor
-        imageView.layer.addSublayer(arrow)
+        arrow.strokeColor = UIColor.white.withAlphaComponent(0.9).cgColor
+        arrow.lineWidth = 1.5
+        arrow.shadowColor = UIColor.black.cgColor
+        arrow.shadowOpacity = 0.45
+        arrow.shadowRadius = 2
+        canvasView.layer.addSublayer(arrow)
+
         let tap = UITapGestureRecognizer(target: self, action: #selector(tapped(_:)))
-        imageView.addGestureRecognizer(tap)
-        let pinch = UIPinchGestureRecognizer(target: self, action: #selector(pinched(_:)))
-        imageView.addGestureRecognizer(pinch)
-        let pan = UIPanGestureRecognizer(target: self, action: #selector(panned(_:)))
-        pan.minimumNumberOfTouches = 2
-        imageView.addGestureRecognizer(pan)
-        let markerPan = UIPanGestureRecognizer(
+        canvasView.addGestureRecognizer(tap)
+        let doubleTap = UITapGestureRecognizer(
             target: self,
-            action: #selector(markerPanned(_:)))
+            action: #selector(doubleTapped(_:)))
+        doubleTap.numberOfTapsRequired = 2
+        canvasView.addGestureRecognizer(doubleTap)
+        tap.require(toFail: doubleTap)
+
         markerPan.minimumNumberOfTouches = 1
         markerPan.maximumNumberOfTouches = 1
-        imageView.addGestureRecognizer(markerPan)
+        markerPan.delegate = self
+        canvasView.addGestureRecognizer(markerPan)
+        // A drag that starts on the red marker belongs to the marker. A drag
+        // elsewhere fails `markerPan` immediately and falls through to the
+        // scroll view, making one-finger map panning deterministic at zoom.
+        zoomScrollView.panGestureRecognizer.require(toFail: markerPan)
         let rotation = UIRotationGestureRecognizer(
             target: self,
             action: #selector(rotated(_:)))
-        imageView.addGestureRecognizer(rotation)
+        rotation.delegate = self
+        canvasView.addGestureRecognizer(rotation)
         backgroundColor = .secondarySystemBackground
         layer.cornerRadius = 10
         clipsToBounds = true
+        accessibilityLabel = "人工定位地图"
+        accessibilityHint = "双指缩放；放大后单指平移；点击或拖动红色箭头设置位置"
     }
 
     required init?(coder: NSCoder) {
@@ -1259,8 +1345,67 @@ final class PriorMapPosePickerView: UIView {
 
     override func layoutSubviews() {
         super.layoutSubviews()
-        imageView.frame = bounds
+        zoomScrollView.frame = bounds
+        guard let image = imageView.image,
+              image.size.width > 0,
+              image.size.height > 0,
+              bounds.width > 0,
+              bounds.height > 0 else {
+            return
+        }
+        let scale = min(
+            bounds.width / image.size.width,
+            bounds.height / image.size.height)
+        let fittedSize = CGSize(
+            width: max(1, image.size.width * scale),
+            height: max(1, image.size.height * scale))
+        if abs(fittedSize.width - baseCanvasSize.width) > 0.5
+            || abs(fittedSize.height - baseCanvasSize.height) > 0.5 {
+            baseCanvasSize = fittedSize
+            zoomScrollView.setZoomScale(1, animated: false)
+            canvasView.transform = .identity
+            canvasView.bounds = CGRect(origin: .zero, size: fittedSize)
+            canvasView.frame = CGRect(origin: .zero, size: fittedSize)
+            imageView.frame = canvasView.bounds
+            zoomScrollView.contentSize = fittedSize
+        }
+        centerCanvas()
         updateArrow()
+    }
+
+    func viewForZooming(in scrollView: UIScrollView) -> UIView? {
+        return canvasView
+    }
+
+    func scrollViewDidZoom(_ scrollView: UIScrollView) {
+        centerCanvas()
+    }
+
+    private func centerCanvas() {
+        let scaledWidth = canvasView.bounds.width * zoomScrollView.zoomScale
+        let scaledHeight = canvasView.bounds.height * zoomScrollView.zoomScale
+        zoomScrollView.contentInset = UIEdgeInsets(
+            top: max(0, (zoomScrollView.bounds.height - scaledHeight) / 2),
+            left: max(0, (zoomScrollView.bounds.width - scaledWidth) / 2),
+            bottom: max(0, (zoomScrollView.bounds.height - scaledHeight) / 2),
+            right: max(0, (zoomScrollView.bounds.width - scaledWidth) / 2))
+    }
+
+    func resetViewport(animated: Bool) {
+        zoomScrollView.setZoomScale(1, animated: animated)
+    }
+
+    func focusOnPose(animated: Bool) {
+        let visibleWidth = zoomScrollView.bounds.width
+            / max(1, zoomScrollView.zoomScale)
+        let visibleHeight = zoomScrollView.bounds.height
+            / max(1, zoomScrollView.zoomScale)
+        let rect = CGRect(
+            x: arrow.position.x - visibleWidth / 2,
+            y: arrow.position.y - visibleHeight / 2,
+            width: visibleWidth,
+            height: visibleHeight)
+        zoomScrollView.scrollRectToVisible(rect, animated: animated)
     }
 
     func setYaw(_ yaw: Double) {
@@ -1289,34 +1434,31 @@ final class PriorMapPosePickerView: UIView {
         setYaw(pose.yawRad + degrees * .pi / 180.0)
     }
 
-    private func displayedImageRect() -> CGRect {
-        guard let image = imageView.image,
-              image.size.width > 0,
-              image.size.height > 0,
-              imageView.bounds.width > 0,
-              imageView.bounds.height > 0 else {
-            return imageView.bounds
-        }
-        let scale = min(
-            imageView.bounds.width / image.size.width,
-            imageView.bounds.height / image.size.height)
-        let size = CGSize(
-            width: image.size.width * scale,
-            height: image.size.height * scale)
-        return CGRect(
-            x: (imageView.bounds.width - size.width) / 2.0,
-            y: (imageView.bounds.height - size.height) / 2.0,
-            width: size.width,
-            height: size.height)
-    }
-
     @objc private func tapped(_ gesture: UITapGestureRecognizer) {
-        let point = gesture.location(in: imageView)
+        let point = gesture.location(in: canvasView)
         setPose(at: point)
     }
 
+    @objc private func doubleTapped(_ gesture: UITapGestureRecognizer) {
+        if zoomScrollView.zoomScale > 1.05 {
+            resetViewport(animated: true)
+            return
+        }
+        let targetScale = min(3, zoomScrollView.maximumZoomScale)
+        let point = gesture.location(in: canvasView)
+        let width = zoomScrollView.bounds.width / targetScale
+        let height = zoomScrollView.bounds.height / targetScale
+        zoomScrollView.zoom(
+            to: CGRect(
+                x: point.x - width / 2,
+                y: point.y - height / 2,
+                width: width,
+                height: height),
+            animated: true)
+    }
+
     private func setPose(at point: CGPoint) {
-        let imageRect = displayedImageRect()
+        let imageRect = canvasView.bounds
         guard imageRect.width > 0,
               imageRect.height > 0,
               imageRect.contains(point) else {
@@ -1335,17 +1477,9 @@ final class PriorMapPosePickerView: UIView {
     }
 
     @objc private func markerPanned(_ gesture: UIPanGestureRecognizer) {
-        let point = gesture.location(in: imageView)
-        if gesture.state == .began {
-            markerDragging = hypot(
-                point.x - arrow.position.x,
-                point.y - arrow.position.y) <= 36
-        }
-        if markerDragging && (gesture.state == .began || gesture.state == .changed) {
+        let point = gesture.location(in: canvasView)
+        if gesture.state == .began || gesture.state == .changed {
             setPose(at: point)
-        }
-        if gesture.state == .ended || gesture.state == .cancelled {
-            markerDragging = false
         }
     }
 
@@ -1357,23 +1491,32 @@ final class PriorMapPosePickerView: UIView {
         onPoseChanged?(pose)
     }
 
-    @objc private func pinched(_ gesture: UIPinchGestureRecognizer) {
-        imageView.transform = imageView.transform.scaledBy(x: gesture.scale, y: gesture.scale)
-        gesture.scale = 1
+    override func gestureRecognizerShouldBegin(
+        _ gestureRecognizer: UIGestureRecognizer
+    ) -> Bool {
+        guard gestureRecognizer === markerPan else { return true }
+        let point = gestureRecognizer.location(in: canvasView)
+        let hitRadius = 44 / max(1, zoomScrollView.zoomScale)
+        return hypot(
+            point.x - arrow.position.x,
+            point.y - arrow.position.y) <= hitRadius
     }
 
-    @objc private func panned(_ gesture: UIPanGestureRecognizer) {
-        let translation = gesture.translation(in: self)
-        imageView.transform = imageView.transform.translatedBy(
-            x: translation.x / max(0.1, imageView.transform.a),
-            y: translation.y / max(0.1, imageView.transform.d))
-        gesture.setTranslation(.zero, in: self)
+    func gestureRecognizer(
+        _ gestureRecognizer: UIGestureRecognizer,
+        shouldRecognizeSimultaneouslyWith otherGestureRecognizer:
+            UIGestureRecognizer
+    ) -> Bool {
+        // UIScrollView owns translation and pinch. A two-finger rotation may
+        // update heading without disabling the map's native zoom behavior.
+        return gestureRecognizer is UIRotationGestureRecognizer
+            || otherGestureRecognizer is UIRotationGestureRecognizer
     }
 
     private func updateArrow() {
         let width = max(0.001, boundsM.maxXM - boundsM.minXM)
         let height = max(0.001, boundsM.maxYM - boundsM.minYM)
-        let imageRect = displayedImageRect()
+        let imageRect = canvasView.bounds
         let x = imageRect.minX
             + CGFloat((pose.xM - boundsM.minXM) / width) * imageRect.width
         let y = imageRect.minY
@@ -1388,10 +1531,18 @@ final class PriorMapPosePickerView: UIView {
     }
 }
 
+enum PriorMapManualPoseSubmissionOutcome {
+    case applied
+    case rejected(message: String)
+}
+
 final class PriorMapPoseSelectionViewController: UIViewController {
     private let picker: PriorMapPosePickerView
     private let initialPose: PriorMapPose2D
-    private let completion: (PriorMapPose2D) -> Void
+    private let completion: (
+        PriorMapPose2D,
+        @escaping (PriorMapManualPoseSubmissionOutcome) -> Void
+    ) -> Void
     private let coordinateLabel = UILabel()
     private let xField = UITextField()
     private let yField = UITextField()
@@ -1400,12 +1551,19 @@ final class PriorMapPoseSelectionViewController: UIViewController {
         items: ["0.1 m", "0.5 m", "1.0 m"])
     private let scrollView = UIScrollView()
     private let contentStack = UIStackView()
+    private let submissionStatusLabel = UILabel()
+    private let cancelButton = UIButton(type: .system)
+    private let confirmButton = UIButton(type: .system)
+    private var submissionInFlight = false
 
     init(
         package: PriorMapPackage,
         floorId: String,
         pose: PriorMapPose2D,
-        completion: @escaping (PriorMapPose2D) -> Void
+        completion: @escaping (
+            PriorMapPose2D,
+            @escaping (PriorMapManualPoseSubmissionOutcome) -> Void
+        ) -> Void
     ) {
         let floor = package.manifest.floors.first { $0.id == floorId }!
         picker = PriorMapPosePickerView(
@@ -1432,7 +1590,7 @@ final class PriorMapPoseSelectionViewController: UIViewController {
         let instructions = UILabel()
         instructions.numberOfLines = 0
         instructions.textColor = .secondaryLabel
-        instructions.text = "点击地图设置位置；拖动红色箭头或使用下方按钮精确微调。坐标合同固定为 0°=+X/东/屏幕右、90°=+Y/北/屏幕上，逆时针为正；界面数值就是写入审计记录的 canonical SE(2)，不会再次转换。"
+        instructions.text = "双指缩放地图，放大后单指平移；点击地图或拖动红色箭头设置位置。可用下方按钮精确平移和旋转。坐标合同固定为 0°=+X/东/屏幕右、90°=+Y/北/屏幕上，逆时针为正；界面数值就是写入审计记录的 canonical SE(2)，不会再次转换。"
         coordinateLabel.font = UIFont.monospacedDigitSystemFont(
             ofSize: UIFont.preferredFont(forTextStyle: .subheadline).pointSize,
             weight: .semibold)
@@ -1458,6 +1616,7 @@ final class PriorMapPoseSelectionViewController: UIViewController {
         stepControl.selectedSegmentIndex = 1
         stepControl.accessibilityLabel = "人工定位平移步长"
         let positionPad = makePositionPad()
+        let viewportControls = makeViewportControls()
         let rotationRow = makeRotationRow()
         let cardinalControl = UISegmentedControl(
             items: ["东 0°", "北 90°", "西 180°", "南 −90°"])
@@ -1468,13 +1627,15 @@ final class PriorMapPoseSelectionViewController: UIViewController {
         picker.onPoseChanged = { [weak self] _ in
             self?.refreshCoordinateControls()
         }
-        let cancel = UIButton(type: .system)
-        cancel.setTitle("取消", for: .normal)
-        cancel.addTarget(self, action: #selector(cancelled), for: .touchUpInside)
-        let confirm = UIButton(type: .system)
-        confirm.setTitle("确认位置", for: .normal)
-        confirm.addTarget(self, action: #selector(confirmed), for: .touchUpInside)
-        let buttons = UIStackView(arrangedSubviews: [cancel, UIView(), confirm])
+        submissionStatusLabel.font = .preferredFont(forTextStyle: .footnote)
+        submissionStatusLabel.textColor = .secondaryLabel
+        submissionStatusLabel.numberOfLines = 0
+        submissionStatusLabel.text = "确认后会等待与已接受帧严格时间匹配的 RTAB-Map 节点；只有审计记录成功落盘后，新的位置才会生效。"
+        cancelButton.setTitle("取消", for: .normal)
+        cancelButton.addTarget(self, action: #selector(cancelled), for: .touchUpInside)
+        confirmButton.setTitle("确认位置", for: .normal)
+        confirmButton.addTarget(self, action: #selector(confirmed), for: .touchUpInside)
+        let buttons = UIStackView(arrangedSubviews: [cancelButton, UIView(), confirmButton])
         buttons.axis = .horizontal
         contentStack.axis = .vertical
         contentStack.spacing = 12
@@ -1483,12 +1644,14 @@ final class PriorMapPoseSelectionViewController: UIViewController {
             title,
             instructions,
             picker,
+            viewportControls,
             coordinateLabel,
             coordinateFields,
             stepControl,
             positionPad,
             cardinalControl,
             rotationRow,
+            submissionStatusLabel,
             buttons,
         ].forEach(contentStack.addArrangedSubview)
         scrollView.alwaysBounceVertical = true
@@ -1608,6 +1771,22 @@ final class PriorMapPoseSelectionViewController: UIViewController {
         return row
     }
 
+    private func makeViewportControls() -> UIView {
+        let fit = controlButton(
+            "适配全图",
+            accessibilityLabel: "将地图缩放为完整可见",
+            action: #selector(resetViewport))
+        let focus = controlButton(
+            "定位红色箭头",
+            accessibilityLabel: "将当前人工定位箭头移到视图中央",
+            action: #selector(focusOnPose))
+        let row = UIStackView(arrangedSubviews: [fit, focus])
+        row.axis = .horizontal
+        row.spacing = 8
+        row.distribution = .fillEqually
+        return row
+    }
+
     private func refreshCoordinateControls() {
         let pose = picker.pose
         xField.text = String(format: "%.3f", pose.xM)
@@ -1621,24 +1800,31 @@ final class PriorMapPoseSelectionViewController: UIViewController {
             degrees)
     }
 
-    @objc private func coordinateFieldChanged() {
+    @discardableResult
+    private func applyCoordinateFields(showError: Bool) -> Bool {
         guard let xText = xField.text,
               let yText = yField.text,
               let yawText = yawField.text,
-              let x = Double(xText),
-              let y = Double(yText),
-              let yawDegrees = Double(yawText),
+              let x = Double(xText.replacingOccurrences(of: ",", with: ".")),
+              let y = Double(yText.replacingOccurrences(of: ",", with: ".")),
+              let yawDegrees = Double(
+                yawText.replacingOccurrences(of: ",", with: ".")),
               x.isFinite, y.isFinite, yawDegrees.isFinite else {
-            // The visible form is part of the canonical coordinate contract:
-            // never leave an unparseable display value while the picker still
-            // holds a different authoritative pose.
-            refreshCoordinateControls()
-            return
+            if showError {
+                submissionStatusLabel.textColor = .systemRed
+                submissionStatusLabel.text = "坐标或方向不是有效数字，请修正后再确认。当前位置尚未提交。"
+            }
+            return false
         }
         picker.setPose(PriorMapPose2D(
             xM: x,
             yM: y,
             yawRad: yawDegrees * .pi / 180.0))
+        return true
+    }
+
+    @objc private func coordinateFieldChanged() {
+        _ = applyCoordinateFields(showError: true)
     }
 
     @objc private func nudgeUp() { picker.nudge(dxM: 0, dyM: translationStepM) }
@@ -1652,6 +1838,8 @@ final class PriorMapPoseSelectionViewController: UIViewController {
     @objc private func rotatePlus5() { picker.rotate(byDegrees: 5) }
     @objc private func rotatePlus15() { picker.rotate(byDegrees: 15) }
     @objc private func resetPose() { picker.setPose(initialPose) }
+    @objc private func resetViewport() { picker.resetViewport(animated: true) }
+    @objc private func focusOnPose() { picker.focusOnPose(animated: true) }
 
     @objc private func cardinalChanged(_ sender: UISegmentedControl) {
         switch sender.selectedSegmentIndex {
@@ -1664,13 +1852,37 @@ final class PriorMapPoseSelectionViewController: UIViewController {
     }
 
     @objc private func cancelled() {
+        guard !submissionInFlight else { return }
         dismiss(animated: true)
     }
 
     @objc private func confirmed() {
+        guard !submissionInFlight else { return }
+        view.endEditing(true)
+        guard applyCoordinateFields(showError: true) else { return }
         let value = picker.pose
-        dismiss(animated: true) {
-            self.completion(value)
+        submissionInFlight = true
+        view.isUserInteractionEnabled = false
+        submissionStatusLabel.textColor = .systemOrange
+        submissionStatusLabel.text = "正在等待时间匹配的稳定节点并写入人工校准审计记录…"
+        completion(value) { [weak self] outcome in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                switch outcome {
+                case .applied:
+                    self.submissionStatusLabel.textColor = .systemGreen
+                    self.submissionStatusLabel.text = "位置和方向已写入审计记录并生效。"
+                    self.dismiss(animated: true)
+                case .rejected(let message):
+                    self.submissionInFlight = false
+                    self.view.isUserInteractionEnabled = true
+                    self.submissionStatusLabel.textColor = .systemRed
+                    self.submissionStatusLabel.text = message
+                    UIAccessibility.post(
+                        notification: .announcement,
+                        argument: message)
+                }
+            }
         }
     }
 }

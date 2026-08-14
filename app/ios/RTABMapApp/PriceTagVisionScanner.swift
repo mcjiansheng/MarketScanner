@@ -19,6 +19,10 @@ struct PriceTagVisionDetection {
     let symbology: String
     let normalizedBounds: CGRect
     let frame: ARFrame
+    /// Software-stabilized camera pose accepted for this exact capture frame.
+    /// Depth, ray fallback and prior-map localization must not re-read the raw
+    /// ARKit transform after the continuity gate has selected this authority.
+    let cameraTransform: simd_float4x4
     let alignmentSnapshot: PriorMapAlignmentSnapshot
     let imageOrientation: PriorMapCapturedImageOrientation
 }
@@ -26,6 +30,7 @@ struct PriceTagVisionDetection {
 struct PriceTagVisionScanResult {
     let generation: UUID
     let frame: ARFrame
+    let cameraTransform: simd_float4x4
     let orientation: CGImagePropertyOrientation
     let alignmentSnapshot: PriorMapAlignmentSnapshot
     let candidates: [PriceTagBarcodeCandidate]
@@ -40,6 +45,7 @@ struct PriceTagVisionScanResult {
                 visionBounds: selected.candidate.visionBounds,
                 orientation: PriceTagVisionScanner.captureOrientation(orientation)),
             frame: frame,
+            cameraTransform: cameraTransform,
             alignmentSnapshot: alignmentSnapshot,
             imageOrientation: PriceTagVisionScanner.captureOrientation(orientation))
     }
@@ -122,6 +128,7 @@ final class PriceTagVisionScanner {
         orientation: CGImagePropertyOrientation,
         regionOfInterest: CGRect,
         generation: UUID,
+        cameraTransform: simd_float4x4,
         alignmentSnapshot: PriorMapAlignmentSnapshot,
         completion: @escaping (Result<PriceTagVisionScanResult, Error>) -> Void
     ) -> Bool {
@@ -168,6 +175,7 @@ final class PriceTagVisionScanner {
                     PriceTagVisionScanResult(
                         generation: generation,
                         frame: frame,
+                        cameraTransform: cameraTransform,
                         orientation: orientation,
                         alignmentSnapshot: alignmentSnapshot,
                         candidates: candidates))
@@ -307,7 +315,7 @@ struct PriceTagFrameMeasurement {
         mapPoint: (SIMD3<Float>) -> PriorMapTagPoint3D
     ) -> PriceTagFrameMeasurement {
         let frame = detection.frame
-        let transform = frame.camera.transform
+        let transform = detection.cameraTransform
         let cameraWorld = SIMD3<Float>(
             transform.columns.3.x,
             transform.columns.3.y,
@@ -320,7 +328,8 @@ struct PriceTagFrameMeasurement {
             let estimate = robustWorldPoint(
                 frame: frame,
                 depth: depth,
-                bounds: detection.normalizedBounds)
+                bounds: detection.normalizedBounds,
+                cameraTransform: transform)
             rejectedDepthEvidence = estimate.evidence
             if let worldPoint = estimate.worldPoint,
                estimate.evidence.accepted {
@@ -382,7 +391,8 @@ struct PriceTagFrameMeasurement {
     private static func robustWorldPoint(
         frame: ARFrame,
         depth: ARDepthData,
-        bounds: CGRect
+        bounds: CGRect,
+        cameraTransform: simd_float4x4
     ) -> (worldPoint: SIMD3<Float>?, evidence: PriceTagDepthEvidence) {
         let buffer = depth.depthMap
         let width = CVPixelBufferGetWidth(buffer)
@@ -492,7 +502,7 @@ struct PriceTagFrameMeasurement {
             -(Float(chosen.y) - cy) / fy * chosen.depth,
             -chosen.depth,
             1)
-        let world = frame.camera.transform * cameraPoint
+        let world = cameraTransform * cameraPoint
         return (SIMD3<Float>(world.x, world.y, world.z), planeEvidence)
     }
 }

@@ -28,6 +28,19 @@ private struct PriceTagCaptureNodeBinding {
     let nodeTimebaseOffsetSeconds: TimeInterval
 }
 
+private struct PendingManualPriorMapPoseRequest {
+    let id: UUID
+    let mapPose: PriorMapPose2D
+    let reason: String
+    let requestedAtWallClock: Date
+    let requestedAtFrameTimestamp: TimeInterval?
+    let baselineNodeID: Int?
+    let baselineNodeStamp: TimeInterval?
+    let priorMapGeneration: UUID
+    let trackingSessionID: String
+    let completion: (PriorMapManualPoseSubmissionOutcome) -> Void
+}
+
 class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIPickerViewDataSource, UIPickerViewDelegate, CLLocationManagerDelegate, UIDocumentPickerDelegate {
     
     private let session = ARSession()
@@ -202,6 +215,10 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
     private var mStreamingMemoryPressureLevel = 0
     private var mLastLoggedTrackingState = ""
     private var mARPoseCorrection = matrix_identity_float4x4
+    /// Monotonic software-pose authority epoch. It advances whenever a raw
+    /// ARKit coordinate discontinuity is rebased so audit logs can distinguish
+    /// a continuous accepted trajectory from a new raw sensor coordinate era.
+    private var mCapturePoseEpoch: UInt64 = 1
     private let mMapCorrectionLock = NSLock()
     private var mMapToOdomCorrection = matrix_identity_float4x4
     private var mLastAcceptedARPose: simd_float4x4?
@@ -210,6 +227,13 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
     private var mConsecutiveNormalTrackingFrames = 0
     private var mLastTrackingGuidanceAt: TimeInterval = 0
     private let mRequiredNormalFramesAfterTrackingRecovery = 6
+    private let mManualPriorMapPoseRequestLock = NSLock()
+    private var mPendingManualPriorMapPoseRequest:
+        PendingManualPriorMapPoseRequest?
+    private let mManualPriorMapPoseTimeoutSeconds: TimeInterval = 6.0
+    private let mStreamingOptimizeMaxError = 2.0
+    private let mStreamingMinimumVisualInliers = 40
+    private var mLastStreamingSettingsAuditTrackingSessionID: String?
     private let mStructureCoverageAdvisor = SupermarketStructureCoverageAdvisor()
     private var mLastStructureCoverageGuidanceAt: TimeInterval = 0
     private var mLastStructureCoverageSummaryAt: TimeInterval = 0
@@ -574,7 +598,11 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
             }
         }
 
-        failedSession?.completeCurrentSession()
+        if let failedSession {
+            MarketScannerCrashDiagnostics.shared.markScanCompleted(
+                trackingSessionID: failedSession.trackingSessionId)
+            failedSession.completeCurrentSession()
+        }
         activeScanConfiguration = .freeMapping
         mDataRecording = false
         openedDatabasePath = nil
@@ -1191,11 +1219,17 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                     if let guidance = loopHealthGuidance {
                         self.showToast(message: guidance, seconds: 4)
                     }
-                    else if self.debugShown && inliers >= UserDefaults.standard.integer(forKey: "MinInliers")
+                    else if self.debugShown && inliers >= (self.mDataRecording
+                        ? UserDefaults.standard.integer(forKey: "MinInliers")
+                        : self.mStreamingMinimumVisualInliers)
                     {
                         if(optimizationMaxError > 0.0)
                         {
-                            self.showToast(message: String(format: self.localized("Loop closure rejected, too high graph optimization error (%.3fm: ratio=%.3f < factor=%.1fx)."), optimizationMaxError, optimizationMaxErrorRatio, UserDefaults.standard.float(forKey: "MaxOptimizationError")), seconds: 1);
+                            let appliedFactor = self.mDataRecording
+                                ? UserDefaults.standard.double(
+                                    forKey: "MaxOptimizationError")
+                                : self.mStreamingOptimizeMaxError
+                            self.showToast(message: String(format: self.localized("Loop closure rejected, too high graph optimization error (%.3fm: ratio=%.3f < factor=%.1fx)."), optimizationMaxError, optimizationMaxErrorRatio, appliedFactor), seconds: 1);
                         }
                         else
                         {
@@ -2008,6 +2042,7 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
     private func resetSoftwarePoseStabilizer()
     {
         mARPoseCorrection = matrix_identity_float4x4
+        mCapturePoseEpoch = 1
         mLastAcceptedARPose = nil
         mLastAcceptedARTimestamp = nil
         mTrackingWasDegraded = true
@@ -2203,6 +2238,7 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
             return nil
         }
 
+        var recoveredTrackingThisFrame = false
         if mTrackingWasDegraded {
             mConsecutiveNormalTrackingFrames += 1
             if mConsecutiveNormalTrackingFrames < mRequiredNormalFramesAfterTrackingRecovery {
@@ -2213,10 +2249,14 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                 return nil
             }
             mTrackingWasDegraded = false
+            recoveredTrackingThisFrame = true
             supermarketSession?.appendScanEvent(
                 event: "tracking_recovery_stabilized",
                 message: "ARKit tracking remained normal long enough to resume mapping frames",
-                fields: ["normalFrames": "\(mConsecutiveNormalTrackingFrames)"])
+                fields: [
+                    "normalFrames": "\(mConsecutiveNormalTrackingFrames)",
+                    "poseEpoch": "\(mCapturePoseEpoch)",
+                ])
         }
 
         let rawPose = frame.camera.transform
@@ -2237,13 +2277,48 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                 linearSpeed = distance / elapsed
                 angularSpeed = rotation / elapsed
 
+                // A recovered ARKit session may report `.normal` while its
+                // world origin has moved. Do not bridge that raw epoch with a
+                // large graph edge. Rebase the new raw epoch onto the last
+                // accepted pose, reject this boundary frame, then resume from
+                // subsequent relative motion.
+                if recoveredTrackingThisFrame,
+                   distance > 0.35 || rotation > 20.0 {
+                    mARPoseCorrection = simd_mul(
+                        previousPose,
+                        simd_inverse(rawPose))
+                    mCapturePoseEpoch &+= 1
+                    supermarketSession?.recordMappingFrameQuality(
+                        accepted: false,
+                        rejectionReason: "tracking_recovery_epoch_rebase",
+                        rawFeatureCount: rawFeatureCount,
+                        linearSpeedMps: linearSpeed,
+                        angularSpeedDegPerSecond: angularSpeed)
+                    supermarketSession?.appendScanEvent(
+                        level: "warning",
+                        event: "tracking_recovery_epoch_rebased",
+                        message: "A recovered ARKit coordinate epoch was rebased without creating a discontinuous graph edge",
+                        fields: [
+                            "distanceM": String(format: "%.4f", distance),
+                            "rotationDeg": String(format: "%.3f", rotation),
+                            "elapsedSeconds": String(format: "%.4f", elapsed),
+                            "poseEpoch": "\(mCapturePoseEpoch)",
+                        ])
+                    return nil
+                }
+
                 // A walking scanner cannot move this far between submitted
                 // frames. Treat it as an ARKit coordinate jump, keep the last
                 // continuous pose and rebase subsequent raw poses into that
                 // coordinate system. PC loop closures can then correct drift
                 // without inheriting a false neighbor edge.
-                let translationLimit = max(0.08, min(elapsed, 2.0) * 3.0)
-                let rotationLimit = max(12.0, min(elapsed, 2.0) * 180.0)
+                // Callback gaps must not widen this gate to the former
+                // 6 m / 360° allowance. A capped continuity interval keeps a
+                // delayed callback from turning a raw coordinate reset into a
+                // plausible long-distance human motion.
+                let continuityInterval = min(elapsed, 0.25)
+                let translationLimit = max(0.10, continuityInterval * 3.0)
+                let rotationLimit = max(12.0, continuityInterval * 180.0)
                 let impossibleLinearSpeed = (linearSpeed ?? 0) > 3.0 && distance > 0.08
                 let impossibleAngularSpeed = (angularSpeed ?? 0) > 180.0 && rotation > 12.0
                 if distance > translationLimit
@@ -2251,6 +2326,7 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                     || impossibleLinearSpeed
                     || impossibleAngularSpeed {
                     mARPoseCorrection = simd_mul(previousPose, simd_inverse(rawPose))
+                    mCapturePoseEpoch &+= 1
                     supermarketSession?.recordMappingFrameQuality(
                         accepted: false,
                         rejectionReason: "pose_discontinuity",
@@ -2266,7 +2342,10 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                             "rotationDeg": String(format: "%.3f", rotation),
                             "elapsedSeconds": String(format: "%.4f", elapsed),
                             "linearSpeedMps": String(format: "%.3f", linearSpeed ?? 0),
-                            "angularSpeedDegPerSecond": String(format: "%.2f", angularSpeed ?? 0)
+                            "angularSpeedDegPerSecond": String(format: "%.2f", angularSpeed ?? 0),
+                            "translationLimitM": String(format: "%.3f", translationLimit),
+                            "rotationLimitDeg": String(format: "%.2f", rotationLimit),
+                            "poseEpoch": "\(mCapturePoseEpoch)",
                         ])
                     return nil
                 }
@@ -2327,26 +2406,9 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
             status = "Camera Is Occluded Or Lighting Is Too Dark"
         }
 
+        var acceptedMappingPose: simd_float4x4?
         if let rotation = UIApplication.shared.windows.first?.windowScene?.interfaceOrientation
         {
-            let pose = frame.camera.transform
-            supermarketSession?.updateSensorPose(
-                timestamp: frame.timestamp,
-                matrixColumnMajor: [
-                    pose[0,0], pose[0,1], pose[0,2], pose[0,3],
-                    pose[1,0], pose[1,1], pose[1,2], pose[1,3],
-                    pose[2,0], pose[2,1], pose[2,2], pose[2,3],
-                    pose[3,0], pose[3,1], pose[3,2], pose[3,3]
-                ],
-                trackingState: trackingStateLabel)
-            if mState == .STATE_MAPPING && !mDataRecording {
-                updatePriorMapLocalization(
-                    frame: frame,
-                    trackingState: trackingStateLabel)
-                updatePriceTagCapture(
-                    frame: frame,
-                    trackingState: trackingStateLabel)
-            }
             if mState == .STATE_MAPPING && trackingStateLabel != mLastLoggedTrackingState {
                 let level = trackingStateLabel == "normal" ? "info" : "warning"
                 supermarketSession?.appendScanEvent(
@@ -2360,6 +2422,17 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                 if let correctedPose = stabilizedMappingPose(
                     for: frame,
                     trackingState: trackingStateLabel) {
+                    acceptedMappingPose = correctedPose
+                    supermarketSession?.updateSensorPose(
+                        timestamp: frame.timestamp,
+                        matrixColumnMajor: [
+                            correctedPose[0,0], correctedPose[0,1], correctedPose[0,2], correctedPose[0,3],
+                            correctedPose[1,0], correctedPose[1,1], correctedPose[1,2], correctedPose[1,3],
+                            correctedPose[2,0], correctedPose[2,1], correctedPose[2,2], correctedPose[2,3],
+                            correctedPose[3,0], correctedPose[3,1], correctedPose[3,2], correctedPose[3,3]
+                        ],
+                        trackingState: trackingStateLabel,
+                        acceptedForLocation: true)
                     // Coverage is a map-frame world grid. Reproject depth with
                     // RTAB-Map's latest map→odom correction so cells observed
                     // before and after a loop closure remain aligned. The
@@ -2380,9 +2453,43 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                         poseOverride: correctedPose) == true {
                         mOdometrySubmissionCount &+= 1
                     }
+                    // Prior-map localization, ESL depth/rays and the native
+                    // graph consume the exact same accepted transform. They
+                    // must never re-read a raw ARKit epoch jump from `frame`.
+                    updatePriorMapLocalization(
+                        frame: frame,
+                        trackingState: trackingStateLabel,
+                        poseOverride: correctedPose)
+                    updatePriceTagCapture(
+                        frame: frame,
+                        trackingState: trackingStateLabel,
+                        cameraTransform: correctedPose)
+                }
+                else {
+                    let rawPose = frame.camera.transform
+                    supermarketSession?.updateSensorPose(
+                        timestamp: frame.timestamp,
+                        matrixColumnMajor: [
+                            rawPose[0,0], rawPose[0,1], rawPose[0,2], rawPose[0,3],
+                            rawPose[1,0], rawPose[1,1], rawPose[1,2], rawPose[1,3],
+                            rawPose[2,0], rawPose[2,1], rawPose[2,2], rawPose[2,3],
+                            rawPose[3,0], rawPose[3,1], rawPose[3,2], rawPose[3,3]
+                        ],
+                        trackingState: trackingStateLabel,
+                        acceptedForLocation: false)
                 }
             }
             else if accept {
+                let pose = frame.camera.transform
+                supermarketSession?.updateSensorPose(
+                    timestamp: frame.timestamp,
+                    matrixColumnMajor: [
+                        pose[0,0], pose[0,1], pose[0,2], pose[0,3],
+                        pose[1,0], pose[1,1], pose[1,2], pose[1,3],
+                        pose[2,0], pose[2,1], pose[2,2], pose[2,3],
+                        pose[3,0], pose[3,1], pose[3,2], pose[3,3]
+                    ],
+                    trackingState: trackingStateLabel)
                 if rtabmap?.postOdometryEvent(
                     frame: frame,
                     orientation: rotation,
@@ -2395,10 +2502,11 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         // V1R4 §7.1: bind every newly created RTAB-Map node to the ARKit
         // frame timestamp, device uptime and UTC so post-processing can
         // map DB node stamps to UTC without assuming they are UTC.
-        if mState == .STATE_MAPPING,
-           let recorder = clockRecorder,
-           let binding = rtabmap?.latestNodeBinding(
-               frameTimestamp: frame.timestamp),
+        let latestNodeBinding = mState == .STATE_MAPPING
+            ? rtabmap?.latestNodeBinding(frameTimestamp: frame.timestamp)
+            : nil
+        if let recorder = clockRecorder,
+           let binding = latestNodeBinding,
            binding.nodeId != lastClockBoundNodeID {
             do {
                 try recorder.recordNodeBinding(
@@ -2415,6 +2523,13 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
             } catch {
                 recordClockSidecarFailure(error)
             }
+        }
+        if let acceptedMappingPose,
+           let binding = latestNodeBinding {
+            resolvePendingManualPriorMapPoseIfReady(
+                frameTimestamp: frame.timestamp,
+                acceptedTransform: acceptedMappingPose,
+                nodeBinding: binding)
         }
         
         if !status.isEmpty {
@@ -3013,6 +3128,7 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
 
     private func clearPriorMapLocalization()
     {
+        cancelPendingManualPriorMapPoseRequest(reason: "prior_map_unloaded")
         cancelPriceTagCapture(
             reason: "prior_map_unloaded",
             userMessage: nil)
@@ -3161,7 +3277,8 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
 
     private func updatePriorMapLocalization(
         frame: ARFrame,
-        trackingState: String
+        trackingState: String,
+        poseOverride: simd_float4x4
     ) {
         guard activeScanConfiguration.workflowMode == .priorMapLocalized,
               let localizer = priorMapLocalizer,
@@ -3235,7 +3352,10 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                 return
             }
             let update = autoreleasepool {
-                localizer.update(frame: frame, trackingState: trackingState)
+                localizer.update(
+                    frame: frame,
+                    trackingState: trackingState,
+                    poseOverride: poseOverride)
             }
             self.priorMapUpdateGate.finish(ticket: ticket)
             guard generation == self.priorMapGeneration else {
@@ -3647,7 +3767,8 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
 
     private func updatePriceTagCapture(
         frame: ARFrame,
-        trackingState: String
+        trackingState: String,
+        cameraTransform: simd_float4x4
     ) {
         guard priceTagCaptureCoordinator.isActive(),
               let capturePriorMapGeneration = priceTagCaptureCoordinator
@@ -3757,6 +3878,7 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
             orientation: orientation,
             regionOfInterest: regionOfInterest,
             generation: submission.generation,
+            cameraTransform: cameraTransform,
             alignmentSnapshot: alignmentSnapshot) { result in
                 guard self.priceTagCaptureCoordinator.matchesPriorMapAuthority(
                         generation: submission.generation,
@@ -5007,7 +5129,20 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         }
         applyManualPriorMapPose(
             update.estimatedPose,
-            reason: "user_confirmed_current_estimate")
+            reason: "user_confirmed_current_estimate") { [weak self] outcome in
+            guard let self else { return }
+            switch outcome {
+            case .applied:
+                self.showToast(
+                    message: self.localized("Position confirmed. The adjustment was added to the audit log."),
+                    seconds: 3)
+            case .rejected(let message):
+                self.showToast(
+                    message: message,
+                    seconds: 6,
+                    replacingCurrent: true)
+            }
+        }
     }
 
     @objc private func reselectPriorMapPosition()
@@ -5024,134 +5159,273 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
             package: package,
             floorId: floorId,
             pose: initial
-        ) { [weak self] pose in
-            self?.applyManualPriorMapPose(
+        ) { [weak self] pose, finished in
+            guard let self else {
+                finished(.rejected(message: "扫描界面已关闭，位置未更改。"))
+                return
+            }
+            self.applyManualPriorMapPose(
                 pose,
-                reason: "user_reselected_map_pose_on_map")
+                reason: "user_reselected_map_pose_on_map") { outcome in
+                finished(outcome)
+                if case .applied = outcome {
+                    self.showToast(
+                        message: self.localized("Position confirmed. The adjustment was added to the audit log."),
+                        seconds: 3)
+                }
+            }
         }
         present(picker, animated: true)
     }
 
     private func applyManualPriorMapPose(
         _ mapPose: PriorMapPose2D,
-        reason: String
+        reason: String,
+        completion: @escaping (PriorMapManualPoseSubmissionOutcome) -> Void
     ) {
-        guard supermarketSession?.hasLocalizationRequiredWriteFailure() != true else {
-            showToast(
-                message: localized("Required localization evidence has failed. New prior-map corrections are disabled; raw RTAB-Map recording continues."),
-                seconds: 6,
-                replacingCurrent: true)
+        guard mapPose.xM.isFinite,
+              mapPose.yM.isFinite,
+              mapPose.yawRad.isFinite else {
+            completion(.rejected(message: localized(
+                "The selected coordinates are invalid. The position was not changed.")))
             return
         }
-        guard let frame = session.currentFrame,
-              let localizer = priorMapLocalizer else {
-            showToast(
-                message: localized("ARKit is not ready. The position was not changed and scanning data remains safe."),
-                seconds: 4)
+        guard let scanSession = supermarketSession,
+              scanSession.hasLocalizationRequiredWriteFailure() != true else {
+            completion(.rejected(message: localized(
+                "Required localization evidence has failed. New prior-map corrections are disabled; raw RTAB-Map recording continues.")))
             return
         }
-        let generation = priorMapGeneration
-        let trackingSessionId = supermarketSession?.trackingSessionId ?? ""
-        let confirmationWallClock = Date()
-        let confirmationFrameTimestamp = frame.timestamp
-        let confirmationTransform = frame.camera.transform
-        let liveBinding = rtabmap?.latestNodeBinding(
-            frameTimestamp: confirmationFrameTimestamp)
-        let cachedBinding = priorMapLastNodeBinding.flatMap { cached -> (
+        guard mState == .STATE_MAPPING,
+              !mDataRecording,
+              priorMapLocalizer != nil else {
+            completion(.rejected(message: localized(
+                "Scanning or prior-map localization is not active. The position was not changed.")))
+            return
+        }
+
+        let currentFrame = session.currentFrame
+        let baselineBinding = currentFrame.flatMap {
+            rtabmap?.latestNodeBinding(frameTimestamp: $0.timestamp)
+        }
+        let request = PendingManualPriorMapPoseRequest(
+            id: UUID(),
+            mapPose: mapPose,
+            reason: reason,
+            requestedAtWallClock: Date(),
+            requestedAtFrameTimestamp: currentFrame?.timestamp,
+            baselineNodeID: baselineBinding?.nodeId,
+            baselineNodeStamp: baselineBinding?.nodeStamp,
+            priorMapGeneration: priorMapGeneration,
+            trackingSessionID: scanSession.trackingSessionId,
+            completion: completion)
+
+        mManualPriorMapPoseRequestLock.lock()
+        guard mPendingManualPriorMapPoseRequest == nil else {
+            mManualPriorMapPoseRequestLock.unlock()
+            completion(.rejected(message: localized(
+                "Another position correction is already waiting for a stable node.")))
+            return
+        }
+        mPendingManualPriorMapPoseRequest = request
+        mManualPriorMapPoseRequestLock.unlock()
+
+        scanSession.appendScanEvent(
+            event: "manual_localization_requested",
+            message: "User requested a durable manual prior-map correction",
+            fields: [
+                "reason": reason,
+                "xM": "\(mapPose.xM)",
+                "yM": "\(mapPose.yM)",
+                "yawRad": "\(mapPose.yawRad)",
+                "baselineNodeId": baselineBinding.map { "\($0.nodeId)" }
+                    ?? "unavailable",
+                "poseEpoch": "\(mCapturePoseEpoch)",
+            ])
+
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + mManualPriorMapPoseTimeoutSeconds) {
+            self.expirePendingManualPriorMapPoseRequest(requestID: request.id)
+        }
+    }
+
+    private func expirePendingManualPriorMapPoseRequest(requestID: UUID) {
+        mManualPriorMapPoseRequestLock.lock()
+        guard let request = mPendingManualPriorMapPoseRequest,
+              request.id == requestID else {
+            mManualPriorMapPoseRequestLock.unlock()
+            return
+        }
+        mPendingManualPriorMapPoseRequest = nil
+        mManualPriorMapPoseRequestLock.unlock()
+
+        supermarketSession?.appendScanEvent(
+            level: "warning",
+            event: "manual_localization_event_rejected",
+            message: "Manual localization timed out while waiting for a fresh accepted RTAB-Map node",
+            fields: ["reason": "fresh_node_timeout"])
+        request.completion(.rejected(message: localized(
+            "No new stable RTAB-Map node was created in time. Keep the phone steady with the scene visible, then confirm again; your selected coordinates are still shown.")))
+    }
+
+    private func cancelPendingManualPriorMapPoseRequest(reason: String) {
+        mManualPriorMapPoseRequestLock.lock()
+        let request = mPendingManualPriorMapPoseRequest
+        mPendingManualPriorMapPoseRequest = nil
+        mManualPriorMapPoseRequestLock.unlock()
+        guard let request else { return }
+        DispatchQueue.main.async {
+            request.completion(.rejected(message: self.localized(
+                "The scan state changed before the position could be committed. The position was not changed.")))
+        }
+        supermarketSession?.appendScanEvent(
+            level: "warning",
+            event: "manual_localization_event_rejected",
+            message: "Pending manual localization was cancelled before commit",
+            fields: ["reason": reason])
+    }
+
+    private func resolvePendingManualPriorMapPoseIfReady(
+        frameTimestamp: TimeInterval,
+        acceptedTransform: simd_float4x4,
+        nodeBinding: (
             nodeId: Int,
             nodeStamp: TimeInterval,
             nodeTimebaseFrameTimestamp: TimeInterval,
             nodeTimebaseOffsetSeconds: TimeInterval,
             deltaSeconds: TimeInterval,
             generation: UInt64
-        )? in
-            let nodeTimebaseFrameTimestamp = confirmationFrameTimestamp
-                + cached.nodeTimebaseOffsetSeconds
-            let delta = abs(nodeTimebaseFrameTimestamp - cached.nodeStamp)
-            guard abs(confirmationFrameTimestamp - cached.sampledFrameTimestamp) <= 1.0,
-                  delta <= 1.0 else {
-                return nil
-            }
-            return (
-                cached.nodeId,
-                cached.nodeStamp,
-                nodeTimebaseFrameTimestamp,
-                cached.nodeTimebaseOffsetSeconds,
-                delta,
-                cached.generation)
-        }
-        guard let confirmationNodeBinding = liveBinding ?? cachedBinding else {
-            supermarketSession?.appendScanEvent(
-                level: "warning",
-                event: "manual_localization_event_rejected",
-                message: "Manual localization was not applied because atomic node-time evidence was unavailable",
-                fields: ["reason": "native_node_time_snapshot_unavailable"])
-            showToast(
-                message: localized("RTAB-Map node evidence is not ready. The position was not changed; wait for mapping to stabilize and try again."),
-                seconds: 5,
-                replacingCurrent: true)
+        )
+    ) {
+        mManualPriorMapPoseRequestLock.lock()
+        guard let request = mPendingManualPriorMapPoseRequest else {
+            mManualPriorMapPoseRequestLock.unlock()
             return
         }
+        let frameIsNew = request.requestedAtFrameTimestamp.map {
+            frameTimestamp > $0
+        } ?? true
+        let bindingIsFresh: Bool
+        if let baselineNodeID = request.baselineNodeID,
+           let baselineNodeStamp = request.baselineNodeStamp {
+            let publishedAfterRequest = nodeBinding.nodeId != baselineNodeID
+                || nodeBinding.nodeStamp > baselineNodeStamp + 0.000_001
+            // A node published immediately before the tap is still an exact
+            // authority when the accepted frame is within 250 ms of its stamp.
+            // This avoids forcing a stationary operator to move merely to
+            // manufacture another node, while never reusing the old 1 s cache.
+            let sameNodeStillFresh = nodeBinding.nodeId == baselineNodeID
+                && nodeBinding.deltaSeconds <= 0.25
+            bindingIsFresh = publishedAfterRequest || sameNodeStillFresh
+        }
+        else {
+            bindingIsFresh = nodeBinding.deltaSeconds <= 0.25
+        }
+        guard frameIsNew, bindingIsFresh else {
+            mManualPriorMapPoseRequestLock.unlock()
+            return
+        }
+        mPendingManualPriorMapPoseRequest = nil
+        mManualPriorMapPoseRequestLock.unlock()
+
+        let localizer = priorMapLocalizer
+        let confirmationWallClock = Date()
+        let requestLatency = confirmationWallClock.timeIntervalSince(
+            request.requestedAtWallClock)
+        let poseEpoch = mCapturePoseEpoch
+        let generation = priorMapGeneration
         priorMapQueue.async {
-            let poses = localizer.confirmCurrentPosition(
-                transform: confirmationTransform,
-                mapPose: mapPose)
-            guard generation == self.priorMapGeneration else {
+            guard generation == request.priorMapGeneration,
+                  generation == self.priorMapGeneration,
+                  let localizer,
+                  let scanSession = self.supermarketSession,
+                  scanSession.trackingSessionId == request.trackingSessionID,
+                  !scanSession.isFinalizingScan,
+                  !scanSession.hasLocalizationRequiredWriteFailure() else {
+                DispatchQueue.main.async {
+                    request.completion(.rejected(message: self.localized(
+                        "The scan state changed before the position could be committed. The position was not changed.")))
+                }
                 return
             }
-            guard let snapshot = localizer.alignmentSnapshot(
-                frameTimestamp: confirmationFrameTimestamp) else {
-                self.supermarketSession?.appendScanEvent(
-                    event: "manual_localization_event_rejected",
-                    message: "Manual localization alignment snapshot was unavailable",
-                    fields: ["reason": "alignment_snapshot_unavailable"])
-                return
-            }
-            self.priorMapAlignmentSnapshots.publish(snapshot)
-            let eventPersisted = self.supermarketSession?.appendManualLocalizationEvent(
-                reason: reason,
-                arkitPose: poses.0,
-                confirmedMapPose: poses.1,
+            let candidate = localizer.prepareManualPosition(
+                transform: acceptedTransform,
+                mapPose: request.mapPose)
+            // Durable-first transaction: an append failure leaves the live
+            // alignment untouched. The old implementation mutated alignment
+            // before this call and could not roll it back safely.
+            let eventPersisted = scanSession.appendManualLocalizationEvent(
+                reason: request.reason,
+                arkitPose: candidate.arkitPose,
+                confirmedMapPose: candidate.confirmedMapPose,
                 wallClock: confirmationWallClock,
-                frameTimestamp: confirmationFrameTimestamp,
+                frameTimestamp: frameTimestamp,
                 nodeTimebaseFrameTimestamp:
-                    confirmationNodeBinding.nodeTimebaseFrameTimestamp,
+                    nodeBinding.nodeTimebaseFrameTimestamp,
                 nodeTimebaseOffsetSeconds:
-                    confirmationNodeBinding.nodeTimebaseOffsetSeconds,
-                nearestNodeId: confirmationNodeBinding.nodeId,
-                nearestNodeStamp: confirmationNodeBinding.nodeStamp,
-                nodeTimeDeltaSeconds: confirmationNodeBinding.deltaSeconds,
-                nodeTimeSnapshotGeneration: confirmationNodeBinding.generation,
-                alignmentVersion: snapshot.alignmentVersion,
-                expectedTrackingSessionId: trackingSessionId) == true
-            if eventPersisted {
-                self.supermarketSession?.appendScanEvent(
-                    event: "manual_localization_confirmed",
-                    message: "User confirmed a prior-map position",
-                    fields: [
-                        "reason": reason,
-                        "xM": "\(mapPose.xM)",
-                        "yM": "\(mapPose.yM)",
-                        "yawRad": "\(mapPose.yawRad)",
-                    ])
-            }
-            else {
-                self.supermarketSession?.appendScanEvent(
+                    nodeBinding.nodeTimebaseOffsetSeconds,
+                nearestNodeId: nodeBinding.nodeId,
+                nearestNodeStamp: nodeBinding.nodeStamp,
+                nodeTimeDeltaSeconds: nodeBinding.deltaSeconds,
+                nodeTimeSnapshotGeneration: nodeBinding.generation,
+                alignmentVersion: candidate.committedAlignmentVersion,
+                expectedTrackingSessionId: request.trackingSessionID)
+            guard eventPersisted else {
+                scanSession.appendScanEvent(
                     level: "error",
                     event: "manual_localization_event_write_failed",
-                    message: "Manual localization changed in memory but its audit event could not be persisted",
-                    fields: ["reason": reason])
-            }
-            DispatchQueue.main.async {
-                if !eventPersisted {
+                    message: "Manual localization audit persistence failed before the live alignment was changed",
+                    fields: ["reason": request.reason])
+                DispatchQueue.main.async {
                     self.presentLocalizationEvidenceWriteFailure(
                         ["manual_localization_events.jsonl"])
+                    request.completion(.rejected(message: self.localized(
+                        "The audit record could not be saved, so the position was not changed. Raw scanning remains safe; stop and recover this scan before another correction.")))
                 }
-                self.showToast(
-                    message: eventPersisted
-                        ? self.localized("Position confirmed. The adjustment was added to the audit log.")
-                        : self.localized("Position changed, but the audit record could not be saved. Stop and recover this scan before continuing."),
-                    seconds: eventPersisted ? 3 : 6)
+                return
+            }
+
+            guard localizer.commitManualPosition(candidate) else {
+                // This cannot occur while every mutation stays serialized on
+                // priorMapQueue. Keep it non-crashing and preserve evidence so
+                // the field report contains the exact integrity failure.
+                scanSession.recordManualLocalizationCommitConflict()
+                scanSession.appendScanEvent(
+                    level: "error",
+                    event: "manual_localization_commit_conflict",
+                    message: "A durable manual event could not be committed because the alignment version changed",
+                    fields: [
+                        "expectedAlignmentVersion":
+                            "\(candidate.expectedAlignmentVersion)",
+                        "committedAlignmentVersion":
+                            "\(candidate.committedAlignmentVersion)",
+                    ])
+                DispatchQueue.main.async {
+                    request.completion(.rejected(message: self.localized(
+                        "The correction encountered an internal alignment conflict. The audit evidence was preserved; continue raw scanning and export diagnostics.")))
+                }
+                return
+            }
+
+            if let snapshot = localizer.alignmentSnapshot(
+                    frameTimestamp: frameTimestamp) {
+                self.priorMapAlignmentSnapshots.publish(snapshot)
+            }
+            scanSession.appendScanEvent(
+                event: "manual_localization_confirmed",
+                message: "User confirmed a prior-map position after durable evidence commit",
+                fields: [
+                    "reason": request.reason,
+                    "xM": "\(request.mapPose.xM)",
+                    "yM": "\(request.mapPose.yM)",
+                    "yawRad": "\(request.mapPose.yawRad)",
+                    "nodeId": "\(nodeBinding.nodeId)",
+                    "requestLatencySeconds": String(
+                        format: "%.3f", requestLatency),
+                    "poseEpoch": "\(poseEpoch)",
+                ])
+            DispatchQueue.main.async {
+                request.completion(.applied)
             }
         }
     }
@@ -5319,6 +5593,11 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                 try supermarketSession?.startNewSessionIfNeeded()
                 supermarketSession?.resetCurrentSegment()
                 supermarketSession?.configureScan(configuration)
+                if let scanSession = supermarketSession {
+                    MarketScannerCrashDiagnostics.shared.markScanActive(
+                        trackingSessionID: scanSession.trackingSessionId,
+                        rootDirectory: scanSession.rootDirectory)
+                }
             }
             catch {
                 showToast(message: String(format: localized("Could not create supermarket session: %@"), error.localizedDescription), seconds: 4)
@@ -5378,6 +5657,10 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                         "reliableLoopMinimumNodeSpan": "\(self.mReliableLoopMinimumNodeSpan)",
                         "structureCoverageAdvisor": "map_frame_world_grid_v2",
                         "adaptiveDetectionRateHz": "1.0-2.0",
+                        "optimizeMaxErrorApplied": String(
+                            format: "%.1f", self.mStreamingOptimizeMaxError),
+                        "minimumVisualInliersApplied":
+                            "\(self.mStreamingMinimumVisualInliers)",
                         "workflowMode": configuration.workflowMode.rawValue,
                         "priorMapId": configuration.priorMapId ?? "",
                         "floorId": configuration.floorId ?? ""
@@ -5509,9 +5792,15 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
             rtabmap.setMappingParameter(key: "RGBD/ProximityByTime", value: "true")
             rtabmap.setMappingParameter(key: "RGBD/ProximityBySpace", value: "true")
             rtabmap.setMappingParameter(key: "RGBD/ProximityOdomGuess", value: "true")
-            rtabmap.setMappingParameter(key: "RGBD/OptimizeMaxError", value: "2.0")
+            let appliedOptimizeMaxError = String(
+                format: "%.1f", mStreamingOptimizeMaxError)
+            rtabmap.setMappingParameter(
+                key: "RGBD/OptimizeMaxError",
+                value: appliedOptimizeMaxError)
             rtabmap.setMappingParameter(key: "RGBD/OptimizeMaxErrorRepairRadius", value: "1.0")
-            rtabmap.setMappingParameter(key: "Vis/MinInliers", value: "40")
+            rtabmap.setMappingParameter(
+                key: "Vis/MinInliers",
+                value: "\(mStreamingMinimumVisualInliers)")
             rtabmap.setMappingParameter(key: "Mem/UseOdomGravity", value: "true")
             rtabmap.setMappingParameter(key: "Optimizer/Iterations", value: "30")
             rtabmap.setMappingParameter(key: "Optimizer/GravitySigma", value: "0.2")
@@ -5519,6 +5808,22 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
             rtabmap.setMappingParameter(key: "Optimizer/PriorsIgnored", value: "true")
             rtabmap.setMappingParameter(key: "Optimizer/LandmarksIgnored", value: "true")
             rtabmap.setMappingParameter(key: "RGBD/MarkerDetection", value: "false")
+            if let trackingSessionID = supermarketSession?.trackingSessionId,
+               trackingSessionID != mLastStreamingSettingsAuditTrackingSessionID {
+                mLastStreamingSettingsAuditTrackingSessionID = trackingSessionID
+                supermarketSession?.appendScanEvent(
+                    event: "streaming_mapping_profile_applied",
+                    message: "The authoritative continuous-scan mapping profile was applied",
+                    fields: [
+                        "optimizeMaxErrorApplied": appliedOptimizeMaxError,
+                        "optimizeMaxErrorUserSetting": defaults.string(
+                            forKey: "MaxOptimizationError") ?? "unset",
+                        "minimumVisualInliersApplied":
+                            "\(mStreamingMinimumVisualInliers)",
+                        "loopThresholdApplied": "0.15",
+                        "authority": "continuous_streaming_profile_v1",
+                    ])
+            }
         }
         else {
             rtabmap.setMappingParameter(
@@ -5942,6 +6247,8 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         cancelPriceTagCapture(
             reason: "scan_finalization_started",
             userMessage: nil)
+        cancelPendingManualPriorMapPoseRequest(
+            reason: "scan_finalization_started")
         // Close ordinary localization/tag admission immediately, then drain
         // both already-admitted session transactions and the serial prior-map
         // queue off the main thread. A two-second deadline changes the final
@@ -6337,6 +6644,8 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
             // The verified local database is already complete. Release this
             // session now so the next scan can start while a large external
             // copy continues against captured immutable paths.
+            MarketScannerCrashDiagnostics.shared.markScanCompleted(
+                trackingSessionID: scanSession.trackingSessionId)
             scanSession.completeCurrentSession()
             scanSession.endFinalization()
             if mobileWorkflowFinalizationActive {

@@ -1151,6 +1151,112 @@ class StandardWorkbookContractTests(unittest.TestCase):
 
 
 class IOSCoreContractTests(unittest.TestCase):
+    def test_manual_reselection_is_zoomable_durable_first_and_fresh_node_bound(
+        self,
+    ) -> None:
+        repository = Path(__file__).resolve().parents[3]
+        app = repository / "app/ios/RTABMapApp"
+        localization = (app / "PriorMapLocalization.swift").read_text(
+            encoding="utf-8"
+        )
+        view_controller = (app / "ViewController.swift").read_text(
+            encoding="utf-8"
+        )
+
+        picker_start = localization.index("final class PriorMapPosePickerView")
+        picker_end = localization.index(
+            "enum PriorMapManualPoseSubmissionOutcome", picker_start
+        )
+        picker = localization[picker_start:picker_end]
+        self.assertIn("UIScrollViewDelegate", picker)
+        self.assertIn("viewForZooming", picker)
+        self.assertIn("maximumZoomScale = 8", picker)
+        self.assertIn(
+            "zoomScrollView.panGestureRecognizer.require(toFail: markerPan)",
+            picker,
+        )
+        self.assertIn("scrollRectToVisible", picker)
+        self.assertNotIn("imageView.transform =", picker)
+
+        selector_start = localization.index(
+            "final class PriorMapPoseSelectionViewController"
+        )
+        selector_end = localization.index(
+            "final class PriorMapWizardViewController", selector_start
+        )
+        selector = localization[selector_start:selector_end]
+        self.assertIn("view.endEditing(true)", selector)
+        self.assertIn("submissionInFlight", selector)
+        self.assertIn("只有审计记录成功落盘后", selector)
+        self.assertIn("case .rejected(let message)", selector)
+
+        apply_start = view_controller.index(
+            "private func applyManualPriorMapPose("
+        )
+        apply_end = view_controller.index(
+            "func newScan(", apply_start
+        )
+        apply_flow = view_controller[apply_start:apply_end]
+        self.assertIn("baselineNodeID", apply_flow)
+        self.assertIn("bindingIsFresh", apply_flow)
+        self.assertIn("nodeBinding.deltaSeconds <= 0.25", apply_flow)
+        self.assertIn("fresh_node_timeout", apply_flow)
+        append_index = apply_flow.index("appendManualLocalizationEvent(")
+        commit_index = apply_flow.index("commitManualPosition(candidate)")
+        self.assertLess(append_index, commit_index)
+        self.assertIn("prepareManualPosition", apply_flow)
+        self.assertNotIn("confirmCurrentPosition(", apply_flow)
+
+    def test_mapping_location_consumers_share_stabilized_pose_authority(self) -> None:
+        repository = Path(__file__).resolve().parents[3]
+        app = repository / "app/ios/RTABMapApp"
+        view_controller = (app / "ViewController.swift").read_text(
+            encoding="utf-8"
+        )
+        localization = (app / "PriorMapLocalization.swift").read_text(
+            encoding="utf-8"
+        )
+        depth = (app / "PriorMapDepthSampler.swift").read_text(
+            encoding="utf-8"
+        )
+        scanner = (app / "PriceTagVisionScanner.swift").read_text(
+            encoding="utf-8"
+        )
+
+        frame_start = view_controller.index(
+            "func session(_ session: ARSession, didUpdate frame: ARFrame)"
+        )
+        frame_end = view_controller.index(
+            "func sessionWasInterrupted", frame_start
+        )
+        frame_flow = view_controller[frame_start:frame_end]
+        self.assertIn("poseOverride: correctedPose", frame_flow)
+        self.assertIn("cameraTransform: correctedPose", frame_flow)
+        self.assertIn("acceptedForLocation: false", frame_flow)
+        self.assertIn("resolvePendingManualPriorMapPoseIfReady", frame_flow)
+        self.assertIn("let continuityInterval = min(elapsed, 0.25)", view_controller)
+        self.assertNotIn("min(elapsed, 2.0) * 3.0", view_controller)
+        self.assertIn("poseOverride ?? frame.camera.transform", localization)
+        self.assertIn("cameraTransform: transform", localization)
+        self.assertIn("cameraTransform ?? frame.camera.transform", depth)
+        self.assertIn("let transform = detection.cameraTransform", scanner)
+
+    def test_metrickit_diagnostics_are_bound_to_abnormal_active_scan(self) -> None:
+        repository = Path(__file__).resolve().parents[3]
+        app = repository / "app/ios/RTABMapApp"
+        delegate = (app / "AppDelegate.swift").read_text(encoding="utf-8")
+        view_controller = (app / "ViewController.swift").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("MXMetricManagerSubscriber", delegate)
+        self.assertIn("func didReceive(_ payloads: [MXDiagnosticPayload])", delegate)
+        self.assertIn("metrickit_diagnostics.jsonl", delegate)
+        self.assertIn("payload.dictionaryRepresentation()", delegate)
+        self.assertIn("pendingTrackingSessionKey", delegate)
+        self.assertIn("record_exceeded_file_limit", delegate)
+        self.assertIn("markScanActive", view_controller)
+        self.assertIn("markScanCompleted", view_controller)
+
     def test_esl_capture_uses_arkit_frames_without_pausing_scan(self) -> None:
         repository = Path(__file__).resolve().parents[3]
         app = repository / "app/ios/RTABMapApp"
