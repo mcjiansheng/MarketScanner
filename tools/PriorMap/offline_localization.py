@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import csv
 from collections import Counter
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import math
@@ -24,6 +24,7 @@ import sqlite3
 import stat
 import struct
 import tempfile
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Iterable, Sequence
@@ -109,6 +110,24 @@ SESSION_INPUT_FILE_NAMES_V3 = (
     "tag_observation_bursts.jsonl",
     "localized_price_tags.json",
 )
+# Clock-bound finalized sessions use one superset contract.  The burst file is
+# still present (and may be an empty, watermark-bound file) so v4 has one exact
+# role/file inventory for sessions with and without captured ESLs.  This makes
+# the local-time tables part of the same immutable input identity as the map,
+# database and localization evidence; processing-machine timezone is never an
+# implicit input.
+SESSION_INPUT_FILE_NAMES_V4 = (
+    "metadata.json",
+    "clock_correlations.jsonl",
+    "localization_trace.jsonl",
+    "localization_constraints.jsonl",
+    "localization_events.jsonl",
+    "localization_recovery_events.jsonl",
+    "manual_localization_events.jsonl",
+    "tag_observations.jsonl",
+    "tag_observation_bursts.jsonl",
+    "localized_price_tags.json",
+)
 # Historical alias: v1 stays the legacy contract and never carries Recovery
 # evidence binding.
 SESSION_INPUT_FILE_NAMES = SESSION_INPUT_FILE_NAMES_V1
@@ -119,6 +138,12 @@ RECOVERY_MAXIMUM_FILE_BYTES = 16 * 1024 * 1024
 RECOVERY_MAXIMUM_RECORD_BYTES = 1_000_000
 RECOVERY_MAXIMUM_RECORDS = 100_000
 RECOVERY_MAXIMUM_NESTING_DEPTH = 32
+CLOCK_LIMITS = MOBILE_EVIDENCE_CONTRACTS["clock_correlations.jsonl"]
+CLOCK_DISCONTINUITY_TOLERANCE_SECONDS = 2.0
+CLOCK_BINDING_CROSS_CHECK_TOLERANCE_SECONDS = 2.0
+CLOCK_BINDING_FRAME_NODE_STAMP_TOLERANCE_SECONDS = 2.0
+CLOCK_MAXIMUM_OUTER_EXTRAPOLATION_SECONDS = 3.0
+POSITION_INTERPOLATION_MAXIMUM_GAP_SECONDS = 3.0
 TAG_EVIDENCE_NUMERIC_TOLERANCE = 1.0e-6
 TAG_EVIDENCE_MAXIMUM_NODE_TIME_DELTA_SECONDS = 1.0
 EDITABLE_TAG_FIELDS = frozenset(
@@ -224,6 +249,7 @@ def normalize_replay_parameters(
         "rtabmap_reprocess_optimized_copy",
         "raw_continuous_vio_manual_anchor_recovery",
         "raw_continuous_vio_diagnostic_recovery",
+        "partial_rtabmap_graph_continuous_vio_recovery",
     }:
         raise OfflineLocalizationError(
             "Replay parameter relative_trajectory_authority is invalid."
@@ -236,6 +262,7 @@ def normalize_replay_parameters(
     raw_vio_recovery = authority in {
         "raw_continuous_vio_manual_anchor_recovery",
         "raw_continuous_vio_diagnostic_recovery",
+        "partial_rtabmap_graph_continuous_vio_recovery",
     }
     if raw_vio_recovery != graph_incomplete:
         raise OfflineLocalizationError(
@@ -685,7 +712,30 @@ def build_session_input_manifest(
     if isinstance(burst_count, bool) or not isinstance(burst_count, int):
         burst_count = None
     burst_bound = has_v2_tags or (burst_count is not None and burst_count > 0)
-    if burst_bound:
+    clock_correlation_count = _strict_integer(
+        metadata.get("clockCorrelationCount")
+    )
+    clock_binding_count = _strict_integer(metadata.get("clockNodeBindingCount"))
+    clock_bound = (
+        metadata.get("clockEvidenceComplete") is True
+        or clock_correlation_count is not None
+        or clock_binding_count is not None
+    )
+    if clock_bound:
+        if (
+            not recovery_bound
+            or metadata.get("clockEvidenceComplete") is not True
+            or clock_correlation_count is None
+            or clock_correlation_count < 2
+            or clock_binding_count is None
+            or clock_binding_count < 2
+        ):
+            raise OfflineLocalizationError(
+                "Clock-bound localization requires complete v2 clock evidence."
+            )
+        manifest_version = 4
+        file_names = SESSION_INPUT_FILE_NAMES_V4
+    elif burst_bound:
         if (
             not recovery_bound
             or burst_count is None
@@ -766,8 +816,436 @@ class FinalizedSessionInputSnapshot:
     verified_burst_frame_authorities: dict[
         str, "VerifiedTagBurstFrameAuthority"
     ]
+    durable_tag_bursts: tuple["DurableTagBurstIdentity", ...]
     tag_evidence_degradations: list[dict[str, Any]]
+    clock_evidence: "ClockEvidence"
     manifest: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class ClockBinding:
+    node_id: int
+    node_stamp: float
+    system_uptime: float
+    utc_unix_seconds: float
+    timezone_id: str
+    utc_offset_seconds: int
+
+
+@dataclass(frozen=True)
+class ClockEvidence:
+    correlations: tuple[dict[str, Any], ...]
+    bindings: tuple[ClockBinding, ...]
+    discontinuity_binding_edges: frozenset[int]
+    bound_node_ids: frozenset[int]
+    degradation_codes: tuple[str, ...]
+
+    @property
+    def primary_timezone_id(self) -> str:
+        if self.bindings:
+            return self.bindings[0].timezone_id
+        value = self.correlations[0].get("timezone_id") if self.correlations else None
+        return value if isinstance(value, str) else ""
+
+    @property
+    def primary_utc_offset_seconds(self) -> int:
+        if self.bindings:
+            return self.bindings[0].utc_offset_seconds
+        value = (
+            self.correlations[0].get("utc_offset_seconds")
+            if self.correlations
+            else None
+        )
+        return value if isinstance(value, int) and not isinstance(value, bool) else 0
+
+
+def _timezone_offset_seconds(
+    timezone_id: str, utc_unix_seconds: float
+) -> int | None:
+    try:
+        zone = ZoneInfo(timezone_id)
+        offset = datetime.fromtimestamp(
+            utc_unix_seconds, timezone.utc
+        ).astimezone(zone).utcoffset()
+    except (OSError, OverflowError, ValueError, ZoneInfoNotFoundError):
+        return None
+    return int(offset.total_seconds()) if offset is not None else None
+
+
+def _clock_discontinuity_edges(
+    correlations: Sequence[dict[str, Any]],
+) -> set[int]:
+    ratios = [
+        (float(after["utc_unix_seconds"]) - float(before["utc_unix_seconds"]))
+        / (float(after["monotonic_seconds"]) - float(before["monotonic_seconds"]))
+        for before, after in zip(correlations, correlations[1:])
+        if abs(
+            float(after["monotonic_seconds"])
+            - float(before["monotonic_seconds"])
+        )
+        > 1.0e-9
+    ]
+    if not ratios:
+        return set()
+    ordered = sorted(ratios)
+    robust_scale = ordered[(len(ordered) - 1) // 2]
+    edges: set[int] = set()
+    for index, (before, after) in enumerate(
+        zip(correlations, correlations[1:])
+    ):
+        uptime_delta = float(after["monotonic_seconds"]) - float(
+            before["monotonic_seconds"]
+        )
+        utc_delta = float(after["utc_unix_seconds"]) - float(
+            before["utc_unix_seconds"]
+        )
+        explicit = after["reason"] in {"system_clock_change", "timezone_change"}
+        timezone_changed = (
+            before["timezone_id"] != after["timezone_id"]
+            or before["utc_offset_seconds"] != after["utc_offset_seconds"]
+        )
+        residual = abs(utc_delta - robust_scale * uptime_delta)
+        if (
+            explicit
+            or timezone_changed
+            or residual > CLOCK_DISCONTINUITY_TOLERANCE_SECONDS
+        ):
+            edges.add(index)
+    return edges
+
+
+def _mapped_clock_utc(
+    uptime: float,
+    correlations: Sequence[dict[str, Any]],
+    discontinuity_edges: set[int],
+) -> float | None:
+    for record in correlations:
+        if abs(float(record["monotonic_seconds"]) - uptime) <= 1.0e-9:
+            return float(record["utc_unix_seconds"])
+    if len(correlations) < 2:
+        return None
+    for index, (before, after) in enumerate(
+        zip(correlations, correlations[1:])
+    ):
+        first = float(before["monotonic_seconds"])
+        second = float(after["monotonic_seconds"])
+        if first <= uptime <= second:
+            if index in discontinuity_edges:
+                return None
+            ratio = (uptime - first) / (second - first)
+            return float(before["utc_unix_seconds"]) + ratio * (
+                float(after["utc_unix_seconds"])
+                - float(before["utc_unix_seconds"])
+            )
+    if uptime < float(correlations[0]["monotonic_seconds"]):
+        edge = 0
+        distance = float(correlations[0]["monotonic_seconds"]) - uptime
+        before, after = correlations[0], correlations[1]
+    else:
+        edge = len(correlations) - 2
+        distance = uptime - float(correlations[-1]["monotonic_seconds"])
+        before, after = correlations[-2], correlations[-1]
+    if (
+        edge in discontinuity_edges
+        or distance > CLOCK_MAXIMUM_OUTER_EXTRAPOLATION_SECONDS
+    ):
+        return None
+    first = float(before["monotonic_seconds"])
+    second = float(after["monotonic_seconds"])
+    ratio = (uptime - first) / (second - first)
+    return float(before["utc_unix_seconds"]) + ratio * (
+        float(after["utc_unix_seconds"])
+        - float(before["utc_unix_seconds"])
+    )
+
+
+def _clock_context_for_uptime(
+    uptime: float,
+    correlations: Sequence[dict[str, Any]],
+) -> tuple[str, int] | None:
+    """Return the scan-time timezone context active at one device uptime.
+
+    This mirrors ``StrictClockEvidenceParser.correlationContext`` on iOS:
+    an exact sample uses that sample, an interior value uses the immediately
+    preceding correlation, and bounded outer values use the nearest endpoint.
+    The processing computer's timezone is never consulted.
+    """
+
+    if not correlations:
+        return None
+    selected = correlations[0]
+    for record in correlations:
+        if float(record["monotonic_seconds"]) > uptime:
+            break
+        selected = record
+    return (
+        str(selected["timezone_id"]),
+        int(selected["utc_offset_seconds"]),
+    )
+
+
+def _read_clock_evidence_bytes(
+    data: bytes,
+    *,
+    metadata: dict[str, Any],
+    node_stamps_by_id: dict[int, float],
+) -> tuple[ClockEvidence, dict[str, Any]]:
+    """Strictly bind clock framing/identity while retaining sparse coverage.
+
+    A missing per-node binding is an algorithm/evidence coverage degradation,
+    not a corrupt session.  Durable duplicate IDs, watermark disagreement,
+    malformed framing and node-stamp identity conflicts remain fatal.
+    """
+
+    if len(data) > CLOCK_CORRELATION_CONTRACT.maximum_file_bytes:
+        raise OfflineLocalizationError("clock_correlations.jsonl exceeds its safety limit.")
+    parts = data.split(b"\n")
+    if not parts or parts[-1] != b"":
+        raise OfflineLocalizationError(
+            "Missing final newline at clock_correlations.jsonl."
+        )
+    parts.pop()
+    if not parts:
+        raise OfflineLocalizationError("clock_correlations.jsonl is empty.")
+    if len(parts) > CLOCK_CORRELATION_CONTRACT.maximum_records:
+        raise OfflineLocalizationError("clock_correlations.jsonl has too many records.")
+
+    expected_session = str(metadata.get("trackingSessionId") or "")
+    if not expected_session:
+        raise OfflineLocalizationError("Clock evidence has no tracking-session authority.")
+    correlation_keys = {
+        "format", "version", "record_kind", "tracking_session_id",
+        "monotonic_seconds", "utc_unix_seconds", "timezone_id",
+        "utc_offset_seconds", "reason",
+    }
+    binding_keys = {
+        "format", "version", "record_kind", "tracking_session_id",
+        "node_id", "node_stamp", "sampled_frame_timestamp",
+        "system_uptime", "utc_unix_seconds", "timezone_id",
+        "utc_offset_seconds", "reason",
+    }
+    correlation_reasons = {
+        "session_start", "periodic", "will_resign_active",
+        "did_become_active", "system_clock_change", "timezone_change",
+        "session_end",
+    }
+    correlations: list[dict[str, Any]] = []
+    pending_bindings: list[ClockBinding] = []
+    seen_node_ids: set[int] = set()
+    previous_monotonic: float | None = None
+    previous_correlation_utc: float | None = None
+    previous_binding_stamp: float | None = None
+    previous_binding_utc: float | None = None
+    for line_number, raw in enumerate(parts, start=1):
+        if not raw:
+            raise OfflineLocalizationError(
+                f"Blank JSONL record at clock_correlations.jsonl:{line_number}"
+            )
+        if len(raw) + 1 > CLOCK_CORRELATION_CONTRACT.maximum_record_bytes:
+            raise OfflineLocalizationError(
+                f"Oversized record at clock_correlations.jsonl:{line_number}"
+            )
+        try:
+            value = json.loads(
+                raw.decode("utf-8", errors="strict"),
+                parse_constant=reject_nonfinite_json,
+                object_pairs_hook=reject_duplicate_object_pairs,
+            )
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+            raise OfflineLocalizationError(
+                f"Invalid clock JSON at clock_correlations.jsonl:{line_number}"
+            ) from exc
+        if (
+            not isinstance(value, dict)
+            or json_nesting_depth(value) > CLOCK_CORRELATION_CONTRACT.maximum_nesting_depth
+            or value.get("format") != "MarketScannerClockCorrelation"
+            or type(value.get("version")) is not int
+            or value.get("version") != 2
+            or value.get("tracking_session_id") != expected_session
+        ):
+            raise OfflineLocalizationError(
+                f"Invalid clock identity at clock_correlations.jsonl:{line_number}"
+            )
+        kind = value.get("record_kind")
+        allowed_keys = correlation_keys if kind == "correlation" else binding_keys
+        if kind not in {"correlation", "node_binding"} or set(value) != allowed_keys:
+            raise OfflineLocalizationError(
+                f"Invalid clock schema at clock_correlations.jsonl:{line_number}"
+            )
+        numeric_fields = (
+            ("monotonic_seconds", "utc_unix_seconds")
+            if kind == "correlation"
+            else (
+                "node_stamp", "sampled_frame_timestamp", "system_uptime",
+                "utc_unix_seconds",
+            )
+        )
+        numeric_values = [_strict_number(value.get(name)) for name in numeric_fields]
+        offset = _strict_integer(value.get("utc_offset_seconds"))
+        timezone_id = value.get("timezone_id")
+        if (
+            any(number is None for number in numeric_values)
+            or offset is None
+            or not isinstance(timezone_id, str)
+            or not timezone_id
+        ):
+            raise OfflineLocalizationError(
+                f"Invalid clock scalar at clock_correlations.jsonl:{line_number}"
+            )
+        utc_value = float(value["utc_unix_seconds"])
+        if _timezone_offset_seconds(timezone_id, utc_value) != offset:
+            raise OfflineLocalizationError(
+                f"Clock timezone offset mismatch at clock_correlations.jsonl:{line_number}"
+            )
+        if kind == "correlation":
+            monotonic = float(value["monotonic_seconds"])
+            if (
+                value.get("reason") not in correlation_reasons
+                or (previous_monotonic is not None and monotonic <= previous_monotonic)
+                or (
+                    previous_correlation_utc is not None
+                    and utc_value <= previous_correlation_utc
+                )
+            ):
+                raise OfflineLocalizationError(
+                    f"Invalid clock correlation order at clock_correlations.jsonl:{line_number}"
+                )
+            previous_monotonic = monotonic
+            previous_correlation_utc = utc_value
+            correlations.append(value)
+            continue
+
+        node_id = _strict_integer(value.get("node_id"))
+        node_stamp = float(value["node_stamp"])
+        binding_utc = float(value["utc_unix_seconds"])
+        if (
+            value.get("reason") != "node_bound"
+            or node_id is None
+            or node_id <= 0
+            or node_id in seen_node_ids
+            or node_id not in node_stamps_by_id
+            or abs(node_stamps_by_id[node_id] - node_stamp) > 1.0e-6
+            or abs(float(value["sampled_frame_timestamp"]) - node_stamp)
+            > CLOCK_BINDING_FRAME_NODE_STAMP_TOLERANCE_SECONDS
+            or (previous_binding_stamp is not None and node_stamp <= previous_binding_stamp)
+            or (previous_binding_utc is not None and binding_utc <= previous_binding_utc)
+        ):
+            raise OfflineLocalizationError(
+                f"Invalid or duplicate clock node binding at clock_correlations.jsonl:{line_number}"
+            )
+        seen_node_ids.add(node_id)
+        previous_binding_stamp = node_stamp
+        previous_binding_utc = binding_utc
+        pending_bindings.append(
+            ClockBinding(
+                node_id=node_id,
+                node_stamp=node_stamp,
+                system_uptime=float(value["system_uptime"]),
+                utc_unix_seconds=binding_utc,
+                timezone_id=timezone_id,
+                utc_offset_seconds=offset,
+            )
+        )
+
+    expected_correlation_count = _strict_integer(metadata.get("clockCorrelationCount"))
+    expected_binding_count = _strict_integer(metadata.get("clockNodeBindingCount"))
+    if (
+        expected_correlation_count != len(correlations)
+        or expected_binding_count != len(pending_bindings)
+        or metadata.get("clockEvidenceComplete") is not True
+        or len(correlations) < 2
+        or len(pending_bindings) < 2
+    ):
+        raise OfflineLocalizationError(
+            "Clock evidence count/watermark contract is incomplete."
+        )
+
+    correlation_edges = _clock_discontinuity_edges(correlations)
+    retained_bindings: list[ClockBinding] = []
+    degradation_codes: set[str] = set()
+    for binding in pending_bindings:
+        mapped = _mapped_clock_utc(
+            binding.system_uptime, correlations, correlation_edges
+        )
+        context = _clock_context_for_uptime(
+            binding.system_uptime, correlations
+        )
+        if (
+            mapped is None
+            or abs(mapped - binding.utc_unix_seconds)
+            > CLOCK_BINDING_CROSS_CHECK_TOLERANCE_SECONDS
+            or context
+            != (binding.timezone_id, binding.utc_offset_seconds)
+        ):
+            degradation_codes.add("clock_binding_correlation_mismatch_retained_as_gap")
+            continue
+        retained_bindings.append(binding)
+    if len(retained_bindings) < 2:
+        # Framing, watermark, identity and snapshot-node binding were all
+        # validated above.  Fewer than two correlation-consistent bindings is
+        # therefore an evidence-coverage degradation, not a corrupt session.
+        # Keep the trajectory/tag result and emit the wall-clock seconds with
+        # unavailable positions instead of terminating the whole job.
+        degradation_codes.add(
+            "clock_mapping_insufficient_after_cross_check"
+        )
+
+    binding_edges: set[int] = set()
+    if correlation_edges:
+        spans = [
+            (
+                float(correlations[index]["monotonic_seconds"]),
+                float(correlations[index + 1]["monotonic_seconds"]),
+            )
+            for index in correlation_edges
+        ]
+        for index, (before, after) in enumerate(
+            zip(retained_bindings, retained_bindings[1:])
+        ):
+            if (
+                before.timezone_id != after.timezone_id
+                or before.utc_offset_seconds != after.utc_offset_seconds
+                or any(
+                    min(before.system_uptime, after.system_uptime) < end
+                    and max(before.system_uptime, after.system_uptime) > start
+                    for start, end in spans
+                )
+            ):
+                binding_edges.add(index)
+    missing = set(node_stamps_by_id) - {item.node_id for item in retained_bindings}
+    if missing:
+        degradation_codes.add("clock_node_binding_coverage_incomplete")
+    if (
+        not retained_bindings
+        or retained_bindings[0].node_id != min(node_stamps_by_id)
+    ):
+        degradation_codes.add("clock_start_node_unbound")
+    if (
+        not retained_bindings
+        or retained_bindings[-1].node_id != max(node_stamps_by_id)
+    ):
+        degradation_codes.add("clock_end_node_unbound")
+    diagnostics = {
+        "file": "clock_correlations.jsonl",
+        "contract": "clock_correlations_v2",
+        "correlation_count": len(correlations),
+        "declared_binding_count": len(pending_bindings),
+        "usable_binding_count": len(retained_bindings),
+        "database_node_count": len(node_stamps_by_id),
+        "unbound_database_node_count": len(missing),
+        "discontinuity_count": len(binding_edges),
+        "degradation_codes": sorted(degradation_codes),
+    }
+    return (
+        ClockEvidence(
+            correlations=tuple(correlations),
+            bindings=tuple(retained_bindings),
+            discontinuity_binding_edges=frozenset(binding_edges),
+            bound_node_ids=frozenset(item.node_id for item in retained_bindings),
+            degradation_codes=tuple(sorted(degradation_codes)),
+        ),
+        diagnostics,
+    )
 
 
 def read_finalized_session_input_snapshot(
@@ -831,7 +1309,30 @@ def read_finalized_session_input_snapshot(
     if isinstance(burst_count, bool) or not isinstance(burst_count, int):
         burst_count = None
     burst_bound = has_v2_tags or (burst_count is not None and burst_count > 0)
-    if burst_bound:
+    clock_correlation_count = _strict_integer(
+        metadata.get("clockCorrelationCount")
+    )
+    clock_binding_count = _strict_integer(metadata.get("clockNodeBindingCount"))
+    clock_bound = (
+        metadata.get("clockEvidenceComplete") is True
+        or clock_correlation_count is not None
+        or clock_binding_count is not None
+    )
+    if clock_bound:
+        if (
+            not recovery_bound
+            or metadata.get("clockEvidenceComplete") is not True
+            or clock_correlation_count is None
+            or clock_correlation_count < 2
+            or clock_binding_count is None
+            or clock_binding_count < 2
+        ):
+            raise OfflineLocalizationError(
+                "Clock-bound localization requires complete v2 clock evidence."
+            )
+        manifest_version = 4
+        file_names = SESSION_INPUT_FILE_NAMES_V4
+    elif burst_bound:
         if (
             not recovery_bound
             or burst_count is None
@@ -851,9 +1352,26 @@ def read_finalized_session_input_snapshot(
             if recovery_bound
             else SESSION_INPUT_FILE_NAMES_V1
         )
+    node_inventory = _database_node_inventory(source_database)
+    node_stamps_by_id = dict(
+        zip(node_inventory["ids"], node_inventory["stamps"], strict=True)
+    )
+    clock_evidence: ClockEvidence | None = None
     jsonl_names = [name for name in file_names[1:] if name != "localized_price_tags.json"]
     for name in jsonl_names:
-        if name == "localization_recovery_events.jsonl":
+        if name == "clock_correlations.jsonl":
+            clock_bytes, identity = _stable_read_bytes(
+                segment / name,
+                name,
+                maximum_bytes=CLOCK_CORRELATION_CONTRACT.maximum_file_bytes,
+            )
+            clock_evidence, diagnostics = _read_clock_evidence_bytes(
+                clock_bytes,
+                metadata=metadata,
+                node_stamps_by_id=node_stamps_by_id,
+            )
+            values = []
+        elif name == "localization_recovery_events.jsonl":
             contract = (
                 RECOVERY_EVENT_CONTRACT
                 if recovery_bound
@@ -872,17 +1390,18 @@ def read_finalized_session_input_snapshot(
             contract = replace(
                 TAG_OBSERVATION_BURST_CONTRACT,
                 required=True,
-                allow_empty=False,
+                allow_empty=not burst_bound,
             )
         else:
             contract = contracts[name]
-        values, diagnostics, identity = _read_jsonl_stable(
-            segment / name,
-            contract,
-            session_id=session_id,
-            expected_map_hash=map_hash,
-            expected_floor_id=floor_id,
-        )
+        if name != "clock_correlations.jsonl":
+            values, diagnostics, identity = _read_jsonl_stable(
+                segment / name,
+                contract,
+                session_id=session_id,
+                expected_map_hash=map_hash,
+                expected_floor_id=floor_id,
+            )
         jsonl_values[name] = values
         jsonl_diagnostics[name] = diagnostics
         if identity:
@@ -897,10 +1416,19 @@ def read_finalized_session_input_snapshot(
                     "sha256": identity["sha256"],
                 }
             )
+    if clock_bound and clock_evidence is None:
+        raise OfflineLocalizationError("Clock evidence was not parsed.")
+    if clock_evidence is None:
+        # Historical v1-v3 sessions remain readable. Their timestamps are not
+        # allowed to enter the new immutable calibrated-deliverables contract.
+        clock_evidence = ClockEvidence((), (), frozenset(), frozenset(), (
+            "clock_evidence_unbound_legacy",
+        ))
     verified_burst_observation_ids: dict[str, set[str]] = {}
     verified_burst_frame_authorities: dict[
         str, VerifiedTagBurstFrameAuthority
     ] = {}
+    durable_tag_bursts: tuple[DurableTagBurstIdentity, ...] = ()
     tag_evidence_degradations: list[dict[str, Any]] = []
     for sidecar_name in (
         "tag_observations.jsonl",
@@ -924,6 +1452,7 @@ def read_finalized_session_input_snapshot(
             raise OfflineLocalizationError(
                 "Tag burst last ID does not match the finalized watermark."
             )
+        durable_tag_bursts = _durable_tag_burst_inventory(bursts)
         (
             verified_burst_observation_ids,
             verified_burst_frame_authorities,
@@ -982,7 +1511,9 @@ def read_finalized_session_input_snapshot(
         localized_tag_count=len(raw_tags),
         verified_burst_observation_ids=verified_burst_observation_ids,
         verified_burst_frame_authorities=verified_burst_frame_authorities,
+        durable_tag_bursts=durable_tag_bursts,
         tag_evidence_degradations=tag_evidence_degradations,
+        clock_evidence=clock_evidence,
         manifest=manifest,
     )
 
@@ -1147,6 +1678,26 @@ class VerifiedTagBurstFrameAuthority:
 
 
 @dataclass(frozen=True)
+class DurableTagBurstIdentity:
+    """Business identity retained for every safely delimited burst record.
+
+    Frame/summary geometry may later degrade, but a uniquely identified
+    barcode capture still represents one business row that must reach the
+    final result.  Only missing or conflicting durable identity is fatal.
+    """
+
+    record_index: int
+    burst_id: str
+    barcode: str
+    symbology: str
+    prior_map_id: str
+    prior_map_sha256: str
+    floor_id: str
+    tracking_session_id: str
+    last_frame_timestamp: float | None
+
+
+@dataclass(frozen=True)
 class JsonlContract:
     name: str
     record_format: str
@@ -1219,6 +1770,19 @@ TAG_OBSERVATION_BURST_CONTRACT = JsonlContract(
     maximum_file_bytes=TAG_BURST_LIMITS["max_file_bytes"],
     maximum_nesting_depth=TAG_BURST_LIMITS["max_nesting_depth"],
     qualification_maximum_records=TAG_BURST_LIMITS.get("qualification_max_records"),
+)
+CLOCK_CORRELATION_CONTRACT = JsonlContract(
+    "clock_correlations",
+    "MarketScannerClockCorrelation",
+    frozenset({2}),
+    True,
+    False,
+    (),
+    identity_required=False,
+    maximum_record_bytes=CLOCK_LIMITS["max_record_bytes"],
+    maximum_records=CLOCK_LIMITS["max_records"],
+    maximum_file_bytes=CLOCK_LIMITS["max_file_bytes"],
+    maximum_nesting_depth=CLOCK_LIMITS["max_nesting_depth"],
 )
 MANUAL_EVENT_CONTRACT = JsonlContract(
     "manual_localization_events",
@@ -1318,6 +1882,7 @@ def _database_node_inventory(path: Path) -> dict[str, Any]:
     ]
     return {
         "ids": ids,
+        "stamps": stamps,
         "id_set": set(ids),
         "duplicate_ids": [int(row[0]) for row in duplicate_rows],
         "non_monotonic_stamp_node_ids": non_monotonic,
@@ -2607,6 +3172,59 @@ def _read_jsonl(
     return values, diagnostics
 
 
+def _durable_tag_burst_inventory(
+    bursts: Sequence[dict[str, Any]],
+) -> tuple[DurableTagBurstIdentity, ...]:
+    """Build the one-row-per-capture source inventory before localization.
+
+    The degraded JSONL reader has already established framing, format,
+    version, map/session/floor identity and globally unique ``burst_id``.
+    Barcode and symbology are the remaining business identity fields: if
+    either is absent there is no truthful tag row that can be synthesized.
+    """
+
+    inventory: list[DurableTagBurstIdentity] = []
+    for record_index, burst in enumerate(bursts):
+        burst_id = burst.get("burst_id")
+        barcode = burst.get("barcode")
+        symbology = burst.get("symbology")
+        prior_map_id = burst.get("prior_map_id")
+        prior_map_sha256 = burst.get("prior_map_sha256")
+        floor_id = burst.get("floor_id")
+        tracking_session_id = burst.get("tracking_session_id")
+        if any(
+            not isinstance(value, str) or not value
+            for value in (
+                burst_id,
+                barcode,
+                symbology,
+                prior_map_id,
+                prior_map_sha256,
+                floor_id,
+                tracking_session_id,
+            )
+        ):
+            raise OfflineLocalizationError(
+                "Tag burst has no safely recoverable durable business identity."
+            )
+        inventory.append(
+            DurableTagBurstIdentity(
+                record_index=record_index,
+                burst_id=burst_id,
+                barcode=barcode,
+                symbology=symbology,
+                prior_map_id=prior_map_id,
+                prior_map_sha256=prior_map_sha256,
+                floor_id=floor_id,
+                tracking_session_id=tracking_session_id,
+                last_frame_timestamp=_strict_number(
+                    burst.get("last_frame_timestamp")
+                ),
+            )
+        )
+    return tuple(inventory)
+
+
 def _verified_tag_burst_evidence(
     bursts: Sequence[dict[str, Any]],
     observations: Sequence[dict[str, Any]],
@@ -2659,13 +3277,56 @@ def _verified_tag_burst_evidence(
             )
             continue
         if observation_id in observations_by_id:
-            reject(
-                "tag_observation_id_duplicate",
-                "Tag observation IDs must be globally unique.",
-                observation_id=observation_id,
+            raise OfflineLocalizationError(
+                "Tag observation IDs must be globally unique."
             )
-            continue
         observations_by_id[observation_id] = observation
+
+    # Durable IDs are global inventory, not a property of a burst that later
+    # happens to pass its summary/geometry checks. Reserve them before semantic
+    # verification so a degraded first burst cannot hand its IDs to a later
+    # record and silently change capture identity.
+    seen_burst_ids: set[str] = set()
+    seen_frame_ids: set[str] = set()
+    seen_burst_observation_ids: set[str] = set()
+    for burst in bursts:
+        burst_id = burst.get("burst_id")
+        if isinstance(burst_id, str) and burst_id:
+            if burst_id in seen_burst_ids:
+                raise OfflineLocalizationError(
+                    "Tag burst IDs must be globally unique."
+                )
+            seen_burst_ids.add(burst_id)
+        frames = burst.get("frames")
+        if not isinstance(frames, list):
+            continue
+        for frame in frames:
+            if not isinstance(frame, dict):
+                continue
+            frame_id = frame.get("frame_id")
+            observation_id = frame.get("observation_id")
+            if isinstance(frame_id, str) and frame_id:
+                if frame_id in seen_frame_ids:
+                    raise OfflineLocalizationError(
+                        "Tag burst frame IDs must be globally unique."
+                    )
+                seen_frame_ids.add(frame_id)
+            if isinstance(observation_id, str) and observation_id:
+                if observation_id in seen_burst_observation_ids:
+                    raise OfflineLocalizationError(
+                        "Tag burst observation IDs must be globally unique."
+                    )
+                seen_burst_observation_ids.add(observation_id)
+
+    predegraded_burst_ids = {
+        str(item.get("record_id"))
+        for item in degradations or []
+        if isinstance(item, dict)
+        and str(item.get("code") or "").startswith(
+            "tag_observation_bursts_"
+        )
+        and item.get("record_id")
+    }
 
     verified: dict[str, set[str]] = {}
     frame_authorities: dict[str, VerifiedTagBurstFrameAuthority] = {}
@@ -2678,7 +3339,6 @@ def _verified_tag_burst_evidence(
         if (
             not isinstance(burst_id, str)
             or not burst_id
-            or burst_id in verified
             or sequence is None
             or (previous_sequence is not None and sequence <= previous_sequence)
             or burst.get("complete") is not True
@@ -2689,6 +3349,11 @@ def _verified_tag_burst_evidence(
                 "Tag burst identity, order or completion state is invalid.",
                 burst_id=burst_id if isinstance(burst_id, str) else None,
             )
+            continue
+        if burst_id in predegraded_burst_ids:
+            # Its unique barcode capture remains in the durable inventory and
+            # will become one LOW_CONFIDENCE result, but degraded summary or
+            # frame semantics cannot contribute a pose/shelf factor.
             continue
         previous_sequence = sequence
         member_ids: set[str] = set()
@@ -2715,7 +3380,6 @@ def _verified_tag_burst_evidence(
                 not isinstance(observation_id, str)
                 or not observation_id
                 or observation_id in member_ids
-                or observation_id in globally_bound_observations
                 or not isinstance(frame_id, str)
                 or not frame_id
                 or bound_node_id is None
@@ -2884,6 +3548,121 @@ def _degraded_localized_tag(
     return tag
 
 
+def _append_missing_durable_burst_tags(
+    tags: list[dict[str, Any]],
+    durable_bursts: Sequence[DurableTagBurstIdentity],
+    *,
+    expected_map_id: str,
+    expected_map_hash: str,
+    expected_floor_id: str,
+    expected_tracking_session_id: str,
+    degradations: list[dict[str, Any]],
+) -> int:
+    """Reconcile the finalized tag array with the durable burst inventory.
+
+    A writer/finalizer defect must not erase a safely identified barcode
+    capture. Every burst not represented by a non-empty ``capture_id`` gains
+    one explicit LOW_CONFIDENCE row with unavailable position/shelf fields.
+    Existing localized rows are retained independently; they are never merged
+    merely because their barcode text matches another capture.
+    """
+
+    represented_capture_ids = {
+        str(tag.get("capture_id"))
+        for tag in tags
+        if isinstance(tag.get("capture_id"), str) and tag.get("capture_id")
+    }
+    tag_ids = {
+        str(tag.get("tag_id"))
+        for tag in tags
+        if isinstance(tag.get("tag_id"), str) and tag.get("tag_id")
+    }
+    observation_ids = {
+        str(tag.get("observation_id"))
+        for tag in tags
+        if isinstance(tag.get("observation_id"), str)
+        and tag.get("observation_id")
+    }
+    appended = 0
+    for burst in durable_bursts:
+        if (
+            burst.prior_map_id != expected_map_id
+            or burst.prior_map_sha256 != expected_map_hash
+            or burst.floor_id != expected_floor_id
+            or burst.tracking_session_id != expected_tracking_session_id
+        ):
+            raise OfflineLocalizationError(
+                "Durable tag burst identity does not match the active map/session."
+            )
+        if burst.burst_id in represented_capture_ids:
+            continue
+        digest = hashlib.sha256(
+            (
+                f"{burst.tracking_session_id}\0{burst.prior_map_sha256}\0"
+                f"{burst.floor_id}\0{burst.burst_id}"
+            ).encode("utf-8")
+        ).hexdigest()
+        tag_id = f"durable-burst-{digest}"
+        observation_id = f"missing-final-tag-{digest}"
+        if tag_id in tag_ids or observation_id in observation_ids:
+            raise OfflineLocalizationError(
+                "Synthesized durable tag identity collides with finalized tag data."
+            )
+        tags.append(
+            {
+                "format": "MarketScannerLocalizedPriceTag",
+                "version": 1,
+                "tag_id": tag_id,
+                "observation_id": observation_id,
+                "capture_id": burst.burst_id,
+                "payload": burst.barcode,
+                "symbology": burst.symbology,
+                "floor_id": burst.floor_id,
+                "timestamp": burst.last_frame_timestamp or 0.0,
+                "tracking_session_id": burst.tracking_session_id,
+                "prior_map_id": burst.prior_map_id,
+                "prior_map_sha256": burst.prior_map_sha256,
+                "shelf_code": None,
+                "row_flag": None,
+                "cross_code": None,
+                "shelf_side": None,
+                "distance_from_shelf_start_cm": None,
+                "height_cm": None,
+                "raw_map_position": None,
+                "snapped_map_position": None,
+                "localization_confidence": 0.0,
+                "measurement_confidence": 0.0,
+                "association_confidence": 0.0,
+                "measurement_method": "durable_burst_inventory_recovery",
+                "needs_review": True,
+                "user_confirmed": False,
+                "quality_status": "LOW_CONFIDENCE",
+                "input_evidence_status": "DEGRADED",
+                "review_reasons": ["durable_burst_missing_final_tag"],
+                "approval_status": "pending",
+            }
+        )
+        tag_ids.add(tag_id)
+        observation_ids.add(observation_id)
+        represented_capture_ids.add(burst.burst_id)
+        appended += 1
+        degradations.append(
+            {
+                "code": "durable_burst_missing_final_tag",
+                "severity": "warning",
+                "disposition": "LOW_CONFIDENCE",
+                "record_index": burst.record_index,
+                "burst_id": burst.burst_id,
+                "barcode": burst.barcode,
+                "detail": (
+                    "Durable burst had no finalized localized tag row; one "
+                    "unpositioned business row was retained."
+                ),
+            }
+        )
+    return appended
+
+
 def _read_localized_price_tags_bytes(
     data: bytes,
     *,
@@ -2920,6 +3699,7 @@ def _read_localized_price_tags_bytes(
         tags: list[dict[str, Any]] = []
         tag_ids: set[str] = set()
         observation_ids: set[str] = set()
+        capture_ids: set[str] = set()
         for index, item in enumerate(payload):
             if not isinstance(item, dict):
                 degradations.append(
@@ -2949,6 +3729,7 @@ def _read_localized_price_tags_bytes(
                 )
             raw_tag_id = item.get("tag_id")
             raw_observation_id = item.get("observation_id")
+            raw_capture_id = item.get("capture_id")
             if isinstance(raw_tag_id, str) and raw_tag_id:
                 if raw_tag_id in tag_ids:
                     raise OfflineLocalizationError(
@@ -2961,6 +3742,12 @@ def _read_localized_price_tags_bytes(
                         f"localized_price_tags.json item {index} has missing/duplicate IDs."
                     )
                 observation_ids.add(raw_observation_id)
+            if isinstance(raw_capture_id, str) and raw_capture_id:
+                if raw_capture_id in capture_ids:
+                    raise OfflineLocalizationError(
+                        f"localized_price_tags.json item {index} has a duplicate capture_id."
+                    )
+                capture_ids.add(raw_capture_id)
             try:
                 parsed = _read_localized_price_tags_bytes(
                     _canonical_json_bytes([item]),
@@ -5438,11 +6225,155 @@ def manual_anchor_statuses(
     return statuses
 
 
+def _clock_value_for_node_stamp(
+    clock_evidence: ClockEvidence,
+    node_stamp: float,
+) -> dict[str, Any]:
+    bindings = clock_evidence.bindings
+    unavailable = {
+        "utc_unix_s": None,
+        "local_time_iso8601": None,
+        "timezone_id": None,
+        "utc_offset_seconds": None,
+        "clock_segment_index": None,
+        "clock_status": "UNAVAILABLE",
+        "clock_degradation_code": "clock_time_mapping_unavailable",
+    }
+    for binding_index, binding in enumerate(bindings):
+        if abs(binding.node_stamp - node_stamp) <= 1.0e-9:
+            utc_value = binding.utc_unix_seconds
+            return {
+                "utc_unix_s": utc_value,
+                "local_time_iso8601": _format_local_time(
+                    utc_value, binding.utc_offset_seconds, milliseconds=True
+                ),
+                "timezone_id": binding.timezone_id,
+                "utc_offset_seconds": binding.utc_offset_seconds,
+                "clock_segment_index": sum(
+                    edge < binding_index
+                    for edge in clock_evidence.discontinuity_binding_edges
+                ),
+                "clock_status": "EXACT_NODE_BINDING",
+                "clock_degradation_code": None,
+            }
+    if len(bindings) < 2:
+        return {
+            **unavailable,
+            "clock_degradation_code": (
+                "clock_mapping_insufficient_after_cross_check"
+                if bindings
+                else "clock_evidence_unbound_legacy"
+            ),
+        }
+    for index, (before, after) in enumerate(zip(bindings, bindings[1:])):
+        if before.node_stamp <= node_stamp <= after.node_stamp:
+            if index in clock_evidence.discontinuity_binding_edges:
+                return {
+                    **unavailable,
+                    "clock_degradation_code": "clock_discontinuity",
+                }
+            span = after.node_stamp - before.node_stamp
+            if span <= 1.0e-9:
+                return unavailable
+            fraction = (node_stamp - before.node_stamp) / span
+            utc_value = before.utc_unix_seconds + fraction * (
+                after.utc_unix_seconds - before.utc_unix_seconds
+            )
+            # A timezone transition always creates a discontinuity edge. Both
+            # endpoints therefore share one exact context here.
+            return {
+                "utc_unix_s": utc_value,
+                "local_time_iso8601": _format_local_time(
+                    utc_value, before.utc_offset_seconds, milliseconds=True
+                ),
+                "timezone_id": before.timezone_id,
+                "utc_offset_seconds": before.utc_offset_seconds,
+                "clock_segment_index": sum(
+                    edge < index
+                    for edge in clock_evidence.discontinuity_binding_edges
+                ),
+                "clock_status": "INTERPOLATED_BETWEEN_BINDINGS",
+                "clock_degradation_code": (
+                    "clock_node_binding_interpolated"
+                    if node_stamp not in {before.node_stamp, after.node_stamp}
+                    else None
+                ),
+            }
+    if node_stamp < bindings[0].node_stamp:
+        edge = 0
+        distance = bindings[0].node_stamp - node_stamp
+        before, after = bindings[0], bindings[1]
+    else:
+        edge = len(bindings) - 2
+        distance = node_stamp - bindings[-1].node_stamp
+        before, after = bindings[-2], bindings[-1]
+    if (
+        edge in clock_evidence.discontinuity_binding_edges
+        or distance > CLOCK_MAXIMUM_OUTER_EXTRAPOLATION_SECONDS
+    ):
+        return unavailable
+    span = after.node_stamp - before.node_stamp
+    if span <= 1.0e-9:
+        return unavailable
+    fraction = (node_stamp - before.node_stamp) / span
+    utc_value = before.utc_unix_seconds + fraction * (
+        after.utc_unix_seconds - before.utc_unix_seconds
+    )
+    context = before if node_stamp < bindings[0].node_stamp else after
+    context_binding_index = 0 if node_stamp < bindings[0].node_stamp else len(bindings) - 1
+    return {
+        "utc_unix_s": utc_value,
+        "local_time_iso8601": _format_local_time(
+            utc_value, context.utc_offset_seconds, milliseconds=True
+        ),
+        "timezone_id": context.timezone_id,
+        "utc_offset_seconds": context.utc_offset_seconds,
+        "clock_segment_index": sum(
+            discontinuity_edge < context_binding_index
+            for discontinuity_edge in clock_evidence.discontinuity_binding_edges
+        ),
+        "clock_status": "BOUNDED_EDGE_EXTRAPOLATION",
+        "clock_degradation_code": "clock_edge_extrapolated",
+    }
+
+
+def _format_local_time(
+    utc_unix_seconds: float,
+    utc_offset_seconds: int,
+    *,
+    milliseconds: bool,
+) -> str:
+    zone = timezone(timedelta(seconds=utc_offset_seconds))
+    return datetime.fromtimestamp(utc_unix_seconds, timezone.utc).astimezone(
+        zone
+    ).isoformat(timespec="milliseconds" if milliseconds else "seconds")
+
+
+def _algorithm_degradation_codes(report: dict[str, Any]) -> list[str]:
+    codes = {
+        str(item.get("code"))
+        for gate_name in ("review_gate", "publish_gate")
+        for item in report.get(gate_name, {}).get("blockers", [])
+        if isinstance(item, dict) and item.get("code")
+    }
+    clock_codes = report.get("clock_evidence", {}).get("degradation_codes", [])
+    if isinstance(clock_codes, list):
+        codes.update(str(code) for code in clock_codes if code)
+    return sorted(codes)
+
+
 def calibrated_trajectory_rows(
     poses: Sequence[Pose],
     route_audit: dict[str, Any],
     constraints: Sequence[AbsoluteConstraint],
+    *,
+    clock_evidence: ClockEvidence | None = None,
+    delivery_context: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
+    delivery_context = delivery_context or {}
+    clock_evidence = clock_evidence or ClockEvidence(
+        (), (), frozenset(), frozenset(), ("clock_evidence_unbound_legacy",)
+    )
     edge_ids = route_audit.get("edge_ids")
     corridor_ids = route_audit.get("corridor_ids")
     ambiguity_intervals = route_audit.get("ambiguity_intervals")
@@ -5485,19 +6416,18 @@ def calibrated_trajectory_rows(
         rows.append(
             {
                 "node_id": pose.node_id,
-                "timestamp_unix_s": pose.timestamp,
-                "local_time_iso8601": (
-                    datetime.fromtimestamp(float(pose.timestamp), timezone.utc)
-                    .astimezone()
-                    .isoformat(timespec="milliseconds")
-                    if pose.timestamp is not None
-                    else None
+                "node_timebase_timestamp": pose.timestamp,
+                **_clock_value_for_node_stamp(
+                    clock_evidence, float(pose.timestamp)
                 ),
                 "x_m": pose.x,
                 "y_m": pose.y,
                 "yaw_rad": pose.yaw,
                 "yaw_deg": math.degrees(pose.yaw),
                 "yaw_source": "optimized_phone_pose",
+                "position_source": delivery_context.get(
+                    "position_source", "prior_map_offline_optimized"
+                ),
                 "route_edge_id": (
                     edge_ids[index]
                     if isinstance(edge_ids, list) and index < len(edge_ids)
@@ -5519,6 +6449,40 @@ def calibrated_trajectory_rows(
                 "distance_scale": distance_scale,
                 "distance_scale_confidence": distance_scale_confidence,
                 "manual_anchor_status": anchor_statuses[index],
+                "store_id": delivery_context.get("store_id"),
+                "floor_id": delivery_context.get("floor_id"),
+                "prior_map_id": delivery_context.get("prior_map_id"),
+                "prior_map_package_sha256": delivery_context.get(
+                    "prior_map_package_sha256"
+                ),
+                "canonical_source_sha256": delivery_context.get(
+                    "canonical_source_sha256"
+                ),
+                "coordinate_contract_version": delivery_context.get(
+                    "coordinate_contract_version"
+                ),
+                "input_identity_id": delivery_context.get("input_identity_id"),
+                "position_confidence": (
+                    "LOW"
+                    if ambiguous[index]
+                    or distance_scale_confidence == "low"
+                    or delivery_context.get("result_quality_status")
+                    != "COMPLETE"
+                    else "REVIEWED_ALGORITHM_OUTPUT"
+                ),
+                "estimated_uncertainty_m": None,
+                "uncertainty_source": "unavailable_not_fabricated",
+                "quality_status": delivery_context.get(
+                    "result_quality_status", "PARTIAL_REVIEW_REQUIRED"
+                ),
+                "publish_permitted": delivery_context.get(
+                    "publish_permitted", False
+                ),
+                "algorithm_degradation_codes": json.dumps(
+                    delivery_context.get("algorithm_degradation_codes", []),
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
             }
         )
     return rows
@@ -5529,24 +6493,41 @@ def write_calibrated_trajectory_exports(
     poses: Sequence[Pose],
     route_audit: dict[str, Any],
     constraints: Sequence[AbsoluteConstraint],
-) -> None:
+    *,
+    clock_evidence: ClockEvidence | None = None,
+    delivery_context: dict[str, Any] | None = None,
+    unavailable_intervals: Sequence[dict[str, Any]] = (),
+) -> dict[str, Any]:
     """Write node-level and one-second calibrated phone coordinates.
 
-    These tables are ordinary result artifacts, not publication evidence.  A
-    LOW_CONFIDENCE route remains exportable for diagnosis and human review;
-    the publish gate continues to prohibit production publication.
+    These tables are core immutable business results. A LOW_CONFIDENCE route
+    remains exportable for diagnosis and human review; the publish gate still
+    prohibits production publication, but no finite source node is discarded.
     """
 
-    rows = calibrated_trajectory_rows(poses, route_audit, constraints)
+    rows = calibrated_trajectory_rows(
+        poses,
+        route_audit,
+        constraints,
+        clock_evidence=clock_evidence,
+        delivery_context=delivery_context,
+    )
     fieldnames = [
         "node_id",
-        "timestamp_unix_s",
+        "node_timebase_timestamp",
+        "utc_unix_s",
         "local_time_iso8601",
+        "timezone_id",
+        "utc_offset_seconds",
+        "clock_segment_index",
+        "clock_status",
+        "clock_degradation_code",
         "x_m",
         "y_m",
         "yaw_rad",
         "yaw_deg",
         "yaw_source",
+        "position_source",
         "route_edge_id",
         "corridor_id",
         "route_status",
@@ -5555,6 +6536,19 @@ def write_calibrated_trajectory_exports(
         "distance_scale",
         "distance_scale_confidence",
         "manual_anchor_status",
+        "store_id",
+        "floor_id",
+        "prior_map_id",
+        "prior_map_package_sha256",
+        "canonical_source_sha256",
+        "coordinate_contract_version",
+        "input_identity_id",
+        "position_confidence",
+        "estimated_uncertainty_m",
+        "uncertainty_source",
+        "quality_status",
+        "publish_permitted",
+        "algorithm_degradation_codes",
     ]
     with (output / "calibrated_positions_by_node.csv").open(
         "w", encoding="utf-8", newline=""
@@ -5564,80 +6558,266 @@ def write_calibrated_trajectory_exports(
         writer.writerows(rows)
 
     one_second: list[dict[str, Any]] = []
-    if rows:
-        first_second = math.ceil(float(rows[0]["timestamp_unix_s"]))
-        last_second = math.floor(float(rows[-1]["timestamp_unix_s"]))
+    mapped_rows = [row for row in rows if row["utc_unix_s"] is not None]
+    mapped_utc_values = [float(row["utc_unix_s"]) for row in mapped_rows]
+    if clock_evidence and len(clock_evidence.correlations) >= 2:
+        first_second = math.ceil(
+            float(clock_evidence.correlations[0]["utc_unix_seconds"])
+        )
+        last_second = math.floor(
+            float(clock_evidence.correlations[-1]["utc_unix_seconds"])
+        )
         cursor = 0
+        correlation_context_index = 0
         for timestamp in range(first_second, last_second + 1):
             while (
-                cursor + 1 < len(poses)
-                and float(poses[cursor + 1].timestamp) < timestamp
+                correlation_context_index + 1
+                < len(clock_evidence.correlations)
+                and float(
+                    clock_evidence.correlations[
+                        correlation_context_index + 1
+                    ]["utc_unix_seconds"]
+                )
+                <= timestamp
             ):
-                cursor += 1
-            if timestamp <= float(poses[0].timestamp):
-                first_index = second_index = 0
-                fraction = 0.0
-            elif timestamp >= float(poses[-1].timestamp):
-                first_index = second_index = len(poses) - 1
-                fraction = 0.0
+                correlation_context_index += 1
+            correlation_context = clock_evidence.correlations[
+                correlation_context_index
+            ]
+            if not mapped_rows:
+                offset = int(correlation_context["utc_offset_seconds"])
+                one_second.append(
+                    {
+                        "timestamp_unix_s": timestamp,
+                        "local_time_iso8601": _format_local_time(
+                            float(timestamp), offset, milliseconds=False
+                        ),
+                        "timezone_id": correlation_context["timezone_id"],
+                        "utc_offset_seconds": offset,
+                        "clock_segment_index": None,
+                        "x_m": None,
+                        "y_m": None,
+                        "yaw_rad": None,
+                        "yaw_deg": None,
+                        "yaw_source": None,
+                        "position_source": (delivery_context or {}).get(
+                            "position_source",
+                            "prior_map_offline_optimized",
+                        ),
+                        "position_status": "UNAVAILABLE",
+                        "position_degradation_code": (
+                            "clock_mapping_insufficient_after_cross_check"
+                        ),
+                        "nearest_node_id": None,
+                        "before_node_id": None,
+                        "after_node_id": None,
+                        "interpolation_ratio": None,
+                        "route_edge_id": None,
+                        "corridor_id": None,
+                        "route_status": "unavailable",
+                        "route_confidence": "low",
+                        "corridor_identity_confidence": "low",
+                        "distance_scale": None,
+                        "distance_scale_confidence": "low",
+                        "manual_anchor_status": "none",
+                        **{
+                            key: (
+                                json.dumps(
+                                    (delivery_context or {}).get(key, []),
+                                    ensure_ascii=False,
+                                    separators=(",", ":"),
+                                )
+                                if key == "algorithm_degradation_codes"
+                                else (delivery_context or {}).get(key)
+                            )
+                            for key in (
+                                "store_id", "floor_id", "prior_map_id",
+                                "prior_map_package_sha256",
+                                "canonical_source_sha256",
+                                "coordinate_contract_version",
+                                "input_identity_id", "position_confidence",
+                                "estimated_uncertainty_m",
+                                "uncertainty_source", "quality_status",
+                                "publish_permitted",
+                                "algorithm_degradation_codes",
+                            )
+                        },
+                    }
+                )
+                continue
+            # A session second can sit before the first or after the last
+            # mapped node binding. Keep the row, but never use a negative or
+            # >1 interpolation ratio to invent a position.
+            if timestamp < mapped_utc_values[0]:
+                before = after = mapped_rows[0]
+            elif timestamp > mapped_utc_values[-1]:
+                before = after = mapped_rows[-1]
             else:
-                first_index = cursor
-                second_index = min(cursor + 1, len(poses) - 1)
-                first_pose = poses[first_index]
-                second_pose = poses[second_index]
-                span = float(second_pose.timestamp) - float(first_pose.timestamp)
-                fraction = 0.0 if span <= 0.0 else (
-                    timestamp - float(first_pose.timestamp)
-                ) / span
-            first_pose = poses[first_index]
-            second_pose = poses[second_index]
+                while (
+                    cursor + 1 < len(mapped_rows)
+                    and mapped_utc_values[cursor + 1] < timestamp
+                ):
+                    cursor += 1
+                before = mapped_rows[cursor]
+                after = mapped_rows[min(cursor + 1, len(mapped_rows) - 1)]
+                # An exact node timestamp is authoritative even when the next
+                # node is farther than the bounded interpolation window. Only
+                # the unsupported interior seconds become UNAVAILABLE.
+                if abs(float(before["utc_unix_s"]) - timestamp) <= 1.0e-9:
+                    after = before
+                elif abs(float(after["utc_unix_s"]) - timestamp) <= 1.0e-9:
+                    before = after
+            span = float(after["utc_unix_s"]) - float(before["utc_unix_s"])
+            same_clock_segment = (
+                before["clock_segment_index"] is not None
+                and before["clock_segment_index"]
+                == after["clock_segment_index"]
+            )
+            safe_span = (
+                span >= 0
+                and span <= POSITION_INTERPOLATION_MAXIMUM_GAP_SECONDS
+                and float(before["utc_unix_s"]) <= timestamp
+                and timestamp <= float(after["utc_unix_s"])
+                and before["floor_id"] == after["floor_id"]
+                and before["clock_status"] != "UNAVAILABLE"
+                and after["clock_status"] != "UNAVAILABLE"
+                and same_clock_segment
+            )
+            fraction = (
+                0.0
+                if span <= 1.0e-9
+                else (timestamp - float(before["utc_unix_s"])) / span
+            )
+            target_node_stamp = float(before["node_timebase_timestamp"])
+            if span > 1.0e-9:
+                target_node_stamp += fraction * (
+                    float(after["node_timebase_timestamp"])
+                    - float(before["node_timebase_timestamp"])
+                )
+            interval_reason = next(
+                (
+                    str(interval.get("state") or "tracking_unavailable")
+                    for interval in unavailable_intervals
+                    if isinstance(interval, dict)
+                    and _strict_number(interval.get("start_timestamp")) is not None
+                    and _strict_number(interval.get("end_timestamp")) is not None
+                    and float(interval["start_timestamp"])
+                    <= target_node_stamp
+                    <= float(interval["end_timestamp"])
+                ),
+                None,
+            )
+            if interval_reason is not None:
+                safe_span = False
+            nearest = before if fraction < 0.5 else after
+            local_time = _format_local_time(
+                float(timestamp),
+                int(nearest["utc_offset_seconds"]),
+                milliseconds=False,
+            )
+            base = {
+                "timestamp_unix_s": timestamp,
+                "local_time_iso8601": local_time,
+                "timezone_id": nearest["timezone_id"],
+                "utc_offset_seconds": nearest["utc_offset_seconds"],
+                "clock_segment_index": nearest["clock_segment_index"],
+                "nearest_node_id": nearest["node_id"],
+                "before_node_id": before["node_id"],
+                "after_node_id": after["node_id"],
+                "interpolation_ratio": fraction if safe_span else None,
+                "route_edge_id": nearest["route_edge_id"],
+                "corridor_id": nearest["corridor_id"],
+                "route_status": nearest["route_status"],
+                "route_confidence": nearest["route_confidence"],
+                "corridor_identity_confidence": nearest[
+                    "corridor_identity_confidence"
+                ],
+                "distance_scale": nearest["distance_scale"],
+                "distance_scale_confidence": nearest[
+                    "distance_scale_confidence"
+                ],
+                "manual_anchor_status": nearest["manual_anchor_status"],
+                "position_source": nearest["position_source"],
+                **{
+                    key: nearest[key]
+                    for key in (
+                        "store_id", "floor_id", "prior_map_id",
+                        "prior_map_package_sha256", "canonical_source_sha256",
+                        "coordinate_contract_version", "input_identity_id",
+                        "position_confidence", "estimated_uncertainty_m",
+                        "uncertainty_source", "quality_status",
+                        "publish_permitted", "algorithm_degradation_codes",
+                    )
+                },
+            }
+            if not safe_span or not 0.0 <= fraction <= 1.0:
+                one_second.append(
+                    {
+                        **base,
+                        "x_m": None,
+                        "y_m": None,
+                        "yaw_rad": None,
+                        "yaw_deg": None,
+                        "yaw_source": None,
+                        "position_status": "UNAVAILABLE",
+                        "position_degradation_code": (
+                            f"localization_state_{interval_reason}"
+                            if interval_reason is not None
+                            else
+                            "clock_discontinuity"
+                            if not same_clock_segment
+                            else
+                            "position_outside_mapped_node_span"
+                            if timestamp < mapped_utc_values[0]
+                            or timestamp > mapped_utc_values[-1]
+                            else "position_interpolation_gap_above_3s"
+                        ),
+                    }
+                )
+                continue
             yaw = _normalize_angle(
-                first_pose.yaw
-                + fraction * _normalize_angle(second_pose.yaw - first_pose.yaw)
+                float(before["yaw_rad"])
+                + fraction
+                * _normalize_angle(
+                    float(after["yaw_rad"]) - float(before["yaw_rad"])
+                )
             )
-            nearest_index = (
-                first_index if fraction < 0.5 else second_index
-            )
-            nearest = rows[nearest_index]
             one_second.append(
                 {
-                    "timestamp_unix_s": timestamp,
-                    "local_time_iso8601": (
-                        datetime.fromtimestamp(timestamp, timezone.utc)
-                        .astimezone()
-                        .isoformat(timespec="seconds")
-                    ),
-                    "x_m": first_pose.x
-                    + fraction * (second_pose.x - first_pose.x),
-                    "y_m": first_pose.y
-                    + fraction * (second_pose.y - first_pose.y),
+                    **base,
+                    "x_m": float(before["x_m"])
+                    + fraction * (float(after["x_m"]) - float(before["x_m"])),
+                    "y_m": float(before["y_m"])
+                    + fraction * (float(after["y_m"]) - float(before["y_m"])),
                     "yaw_rad": yaw,
                     "yaw_deg": math.degrees(yaw),
                     "yaw_source": "optimized_phone_pose",
-                    "nearest_node_id": nearest["node_id"],
-                    "route_edge_id": nearest["route_edge_id"],
-                    "corridor_id": nearest["corridor_id"],
-                    "route_status": nearest["route_status"],
-                    "route_confidence": nearest["route_confidence"],
-                    "corridor_identity_confidence": nearest[
-                        "corridor_identity_confidence"
-                    ],
-                    "distance_scale": nearest["distance_scale"],
-                    "distance_scale_confidence": nearest[
-                        "distance_scale_confidence"
-                    ],
-                    "manual_anchor_status": nearest["manual_anchor_status"],
+                    "position_status": (
+                        "LOW_CONFIDENCE"
+                        if nearest["position_confidence"] == "LOW"
+                        else "AVAILABLE"
+                    ),
+                    "position_degradation_code": None,
                 }
             )
     one_second_fields = [
         "timestamp_unix_s",
         "local_time_iso8601",
+        "timezone_id",
+        "utc_offset_seconds",
+        "clock_segment_index",
         "x_m",
         "y_m",
         "yaw_rad",
         "yaw_deg",
         "yaw_source",
+        "position_source",
+        "position_status",
+        "position_degradation_code",
         "nearest_node_id",
+        "before_node_id",
+        "after_node_id",
+        "interpolation_ratio",
         "route_edge_id",
         "corridor_id",
         "route_status",
@@ -5646,6 +6826,19 @@ def write_calibrated_trajectory_exports(
         "distance_scale",
         "distance_scale_confidence",
         "manual_anchor_status",
+        "store_id",
+        "floor_id",
+        "prior_map_id",
+        "prior_map_package_sha256",
+        "canonical_source_sha256",
+        "coordinate_contract_version",
+        "input_identity_id",
+        "position_confidence",
+        "estimated_uncertainty_m",
+        "uncertainty_source",
+        "quality_status",
+        "publish_permitted",
+        "algorithm_degradation_codes",
     ]
     with (output / "calibrated_positions_1s.csv").open(
         "w", encoding="utf-8", newline=""
@@ -5653,6 +6846,117 @@ def write_calibrated_trajectory_exports(
         writer = csv.DictWriter(handle, fieldnames=one_second_fields)
         writer.writeheader()
         writer.writerows(one_second)
+    return {
+        "node_count": len(rows),
+        "one_second_row_count": len(one_second),
+        "one_second_unavailable_count": sum(
+            row["position_status"] == "UNAVAILABLE" for row in one_second
+        ),
+        "clock_unavailable_node_count": sum(
+            row["clock_status"] == "UNAVAILABLE" for row in rows
+        ),
+    }
+
+
+def write_calibrated_deliverables_manifest(
+    output: Path,
+    *,
+    report: dict[str, Any],
+    source_database_sha256: str,
+    optimized_database_sha256: str,
+    prior_map_package_sha256: str,
+    canonical_source_sha256: str,
+    trajectory_counts: dict[str, Any],
+) -> dict[str, Any]:
+    core_files = (
+        "calibrated_positions_by_node.csv",
+        "calibrated_positions_1s.csv",
+        "localized_price_tags.json",
+        "localized_price_tags.csv",
+    )
+
+    def csv_count(name: str) -> int:
+        with (output / name).open("r", encoding="utf-8", newline="") as handle:
+            return sum(1 for _ in csv.DictReader(handle))
+
+    tag_source_count = int(report.get("tag_source_record_count", -1))
+    tag_retained_count = int(report.get("tag_retained_count", -2))
+    source_node_count = int(report.get("source_node_count", -1))
+    exported_node_count = int(trajectory_counts.get("node_count", -2))
+    if tag_source_count != tag_retained_count:
+        raise OfflineLocalizationError(
+            "Core deliverables lost one or more safely parsed tag records."
+        )
+    if source_node_count != exported_node_count:
+        raise OfflineLocalizationError(
+            "Core deliverables do not contain every source trajectory node."
+        )
+    if csv_count("calibrated_positions_by_node.csv") != exported_node_count:
+        raise OfflineLocalizationError(
+            "Node coordinate CSV row count differs from its source inventory."
+        )
+    if csv_count("localized_price_tags.csv") != tag_retained_count:
+        raise OfflineLocalizationError(
+            "Tag CSV row count differs from retained tag JSON."
+        )
+    manifest = {
+        "format": "MarketScannerCalibratedDeliverablesManifest",
+        "version": 1,
+        "input_identity_id": report.get("input_identity_id"),
+        "session_input_bundle_sha256": report.get(
+            "session_input_bundle_sha256"
+        ),
+        "source_database_sha256": source_database_sha256,
+        "optimized_database_sha256": optimized_database_sha256,
+        "prior_map_id": report.get("prior_map_id"),
+        "prior_map_package_sha256": prior_map_package_sha256,
+        "canonical_source_sha256": canonical_source_sha256,
+        "coordinate_contract_version": COORDINATE_CONTRACT_VERSION,
+        "source_node_count": source_node_count,
+        "exported_node_count": exported_node_count,
+        "one_second_row_count": int(
+            trajectory_counts.get("one_second_row_count", 0)
+        ),
+        "one_second_unavailable_count": int(
+            trajectory_counts.get("one_second_unavailable_count", 0)
+        ),
+        "clock_unavailable_node_count": int(
+            trajectory_counts.get("clock_unavailable_node_count", 0)
+        ),
+        "source_tag_count": tag_source_count,
+        "retained_tag_count": tag_retained_count,
+        "positioned_tag_count": int(report.get("tag_positioned_count", 0)),
+        "unpositioned_tag_count": int(report.get("tag_unpositioned_count", 0)),
+        "shelf_associated_tag_count": int(
+            report.get("tag_shelf_associated_count", 0)
+        ),
+        "unassociated_tag_count": int(
+            report.get("tag_unassociated_count", 0)
+        ),
+        "low_confidence_tag_count": int(
+            report.get("tag_low_confidence_count", 0)
+        ),
+        "result_quality_status": report.get("result_quality_status"),
+        "publish_permitted": report.get("publish_permitted") is True,
+        "algorithm_degradation_codes": report.get(
+            "algorithm_degradation_codes", []
+        ),
+        "files": [
+            {
+                "file": name,
+                "bytes": (output / name).stat().st_size,
+                "sha256": _sha256(output / name),
+                "row_count": (
+                    csv_count(name)
+                    if name.endswith(".csv")
+                    else tag_retained_count
+                ),
+            }
+            for name in core_files
+        ],
+    }
+    _json_write(output / "calibrated_deliverables_manifest.json", manifest)
+    return manifest
 
 
 def _bounded_review_trajectory(
@@ -6135,6 +7439,7 @@ def _associate_tag(
     if can_auto_confirm:
         tag.update(
             {
+                "final_shelf_segment_id": best_element.get("id") or None,
                 "shelf_code": best_element.get("code") or None,
                 "row_flag": best_element.get("row_flag") or None,
                 "cross_code": best_element.get("cross_code") or None,
@@ -6152,6 +7457,7 @@ def _associate_tag(
     else:
         # Fail-closed: keep original position, provide suggestion only.
         tag["suggested_association"] = {
+            "shelf_segment_id": best_element.get("id") or None,
             "shelf_code": best_element.get("code") or None,
             "row_flag": best_element.get("row_flag") or None,
             "cross_code": best_element.get("cross_code") or None,
@@ -6905,6 +8211,22 @@ def _render_localized_version(
         verified_burst_identities=verified_burst_identities,
         degradations=tag_evidence_degradations,
     )
+    if len(raw_tags) != localized_tag_count:
+        raise OfflineLocalizationError(
+            "One or more finalized tag records has no recoverable durable business identity."
+        )
+    recovered_missing_burst_tag_count = _append_missing_durable_burst_tags(
+        raw_tags,
+        input_snapshot.durable_tag_bursts,
+        expected_map_id=str(manifest.get("prior_map_id") or ""),
+        expected_map_hash=sidecar_map_hash,
+        expected_floor_id=sidecar_floor_id,
+        expected_tracking_session_id=sidecar_session_id,
+        degradations=tag_evidence_degradations,
+    )
+    source_tag_count = (
+        localized_tag_count + recovered_missing_burst_tag_count
+    )
     trace = input_snapshot.jsonl_values["localization_trace.jsonl"]
     trace_diag = input_snapshot.jsonl_diagnostics["localization_trace.jsonl"]
     raw_constraints = input_snapshot.jsonl_values[
@@ -6933,14 +8255,14 @@ def _render_localized_version(
         if isinstance(capture_health, dict)
         else None
     )
-    if input_manifest_version in {2, 3}:
+    if input_manifest_version in {2, 3, 4}:
         if (
             isinstance(recovery_watermark, bool)
             or not isinstance(recovery_watermark, int)
             or recovery_watermark < 0
         ):
             raise OfflineLocalizationError(
-                "Input manifest v2 requires the recovery lifecycle watermark."
+                "Recovery-bound input manifests require the recovery lifecycle watermark."
             )
         recovery_events = input_snapshot.jsonl_values[
             "localization_recovery_events.jsonl"
@@ -6986,6 +8308,9 @@ def _render_localized_version(
         _validate_recovery_event_sequence(recovery_events)
         recovery_evidence_binding = RECOVERY_EVIDENCE_UNBOUND_LEGACY
     jsonl_diagnostics = {
+        "clock_correlations": input_snapshot.jsonl_diagnostics.get(
+            "clock_correlations.jsonl", {}
+        ),
         "localization_trace": trace_diag,
         "localization_constraints": constraint_diag,
         "manual_localization_events": manual_diag,
@@ -7022,7 +8347,15 @@ def _render_localized_version(
         relative_trajectory_authority
         == "raw_continuous_vio_diagnostic_recovery"
     )
-    raw_vio_recovery = raw_manual_anchor_recovery or raw_diagnostic_recovery
+    partial_graph_recovery = (
+        relative_trajectory_authority
+        == "partial_rtabmap_graph_continuous_vio_recovery"
+    )
+    raw_vio_recovery = (
+        raw_manual_anchor_recovery
+        or raw_diagnostic_recovery
+        or partial_graph_recovery
+    )
 
     constraints: list[AbsoluteConstraint] = []
     constraint_records: list[dict[str, Any]] = []
@@ -7515,7 +8848,7 @@ def _render_localized_version(
             # it does not retroactively convert every historical v1 tag in the
             # same finalized file into a burst-bound v2 confirmation. Only v2
             # tags use the complete burst frame as their exact node authority.
-            if input_manifest_version == 3 and tag.get("version") == 2:
+            if input_manifest_version in {3, 4} and tag.get("version") == 2:
                 verified_burst_frame = verified_burst_frame_authorities.get(
                     str(tag.get("observation_id") or "")
                 )
@@ -7967,7 +9300,11 @@ def _render_localized_version(
         ),
         "manual_localization_event_audit": manual_event_audit,
         "tag_total": len(final_tags),
-        "tag_source_record_count": localized_tag_count,
+        "tag_source_record_count": source_tag_count,
+        "localized_tag_source_record_count": localized_tag_count,
+        "durable_burst_missing_final_tag_count": (
+            recovered_missing_burst_tag_count
+        ),
         "tag_retained_count": len(final_tags),
         "tag_positioned_count": sum(
             isinstance(tag.get("final_map_position"), dict)
@@ -7975,6 +9312,26 @@ def _render_localized_version(
         ),
         "tag_unpositioned_count": sum(
             not isinstance(tag.get("final_map_position"), dict)
+            for tag in final_tags
+        ),
+        "tag_shelf_associated_count": sum(
+            bool(tag.get("shelf_code"))
+            and bool(
+                tag.get("final_shelf_segment_id")
+                or tag.get("shelf_segment_id")
+                or tag.get("algorithm_shelf_segment_id")
+                or tag.get("user_confirmed_shelf_segment_id")
+            )
+            for tag in final_tags
+        ),
+        "tag_unassociated_count": sum(
+            not bool(tag.get("shelf_code"))
+            or not bool(
+                tag.get("final_shelf_segment_id")
+                or tag.get("shelf_segment_id")
+                or tag.get("algorithm_shelf_segment_id")
+                or tag.get("user_confirmed_shelf_segment_id")
+            )
             for tag in final_tags
         ),
         "tag_low_confidence_count": sum(
@@ -8005,6 +9362,7 @@ def _render_localized_version(
         ),
         "manual_anchor_recovery": raw_manual_anchor_recovery,
         "raw_vio_diagnostic_recovery": raw_diagnostic_recovery,
+        "partial_rtabmap_graph_continuous_vio_recovery": partial_graph_recovery,
         "initial_map_pose_constraint_count": factor_graph_report.get(
             "initial_map_pose_constraint_count", 0
         ),
@@ -8219,7 +9577,11 @@ def _render_localized_version(
                     else (
                         "raw_continuous_vio_diagnostic_recovery"
                         if raw_diagnostic_recovery
-                        else "diagnostic_mode_enabled"
+                        else (
+                            "partial_rtabmap_graph_continuous_vio_recovery"
+                            if partial_graph_recovery
+                            else "diagnostic_mode_enabled"
+                        )
                     )
                 ),
                 "value": True,
@@ -8248,6 +9610,13 @@ def _render_localized_version(
         "blockers": publish_blockers,
     }
     report["publish_permitted"] = report["publish_gate"]["passed"]
+    report["clock_evidence"] = {
+        **input_snapshot.jsonl_diagnostics.get("clock_correlations.jsonl", {}),
+        "degradation_codes": list(input_snapshot.clock_evidence.degradation_codes),
+    }
+    report["algorithm_degradation_codes"] = _algorithm_degradation_codes(
+        report
+    )
     if publish_blockers:
         report["result_quality_status"] = "PARTIAL_REVIEW_REQUIRED"
         report["partial_result"] = True
@@ -8292,6 +9661,10 @@ def _render_localized_version(
     elif raw_diagnostic_recovery:
         report["warnings"].append(
             "RTAB-Map 全局优化图不完整；本草稿使用完整原始 VIO 与扫描起点地图位姿保留有限轨迹。若检测到采集坐标系重置，仅在多条独立短 Link 对同一刚体变换达成一致后缝合；结果仅供诊断与人工复核，禁止发布。"
+        )
+    elif partial_graph_recovery:
+        report["warnings"].append(
+            "RTAB-Map 只保存了部分节点的全局优化位姿；本草稿以完整、连续的原始 VIO 为相对运动骨架，并在已优化节点之间连续插值 SE(2) 校正。全部源节点和人工/地图修正证据均保留，但该结果不冒充完整全局图，禁止自动发布。"
         )
     if publish_blockers:
         report["warnings"].append(
@@ -8475,13 +9848,18 @@ def _render_localized_version(
         "w", encoding="utf-8", newline=""
     ) as handle:
         fieldnames = [
-            "tag_id", "payload", "map_x_cm", "map_y_cm", "height_cm",
-            "shelf_code", "row_flag", "cross_code", "shelf_side",
+            "tag_id", "capture_id", "observation_id", "payload", "symbology",
+            "map_x_cm", "map_y_cm", "height_cm",
+            "final_shelf_segment_id", "shelf_code", "row_flag", "cross_code", "shelf_side",
             "distance_from_shelf_start_cm", "online_offline_distance_cm",
             "localization_confidence", "measurement_confidence",
             "association_confidence", "manually_modified", "needs_review",
-            "approval_status", "observation_id",
+            "approval_status",
             "quality_status", "input_evidence_status", "review_reasons",
+            "store_id", "floor_id", "prior_map_id",
+            "prior_map_package_sha256", "canonical_source_sha256",
+            "coordinate_contract_version", "position_status",
+            "shelf_association_status", "algorithm_degradation_codes",
         ]
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
@@ -8497,6 +9875,41 @@ def _render_localized_version(
                     "height_cm": (
                         float(position["height_m"]) * 100
                         if position.get("height_m") is not None else None
+                    ),
+                    "final_shelf_segment_id": (
+                        tag.get("final_shelf_segment_id")
+                        or tag.get("shelf_segment_id")
+                        or tag.get("algorithm_shelf_segment_id")
+                        or tag.get("user_confirmed_shelf_segment_id")
+                    ),
+                    "store_id": metadata.get("storeId"),
+                    "floor_id": sidecar_floor_id,
+                    "prior_map_id": manifest.get("prior_map_id"),
+                    "prior_map_package_sha256": package_hash,
+                    "canonical_source_sha256": map_identity_binding.get(
+                        "canonical_source_sha256"
+                    ),
+                    "coordinate_contract_version": COORDINATE_CONTRACT_VERSION,
+                    "position_status": (
+                        "AVAILABLE"
+                        if isinstance(tag.get("final_map_position"), dict)
+                        else "UNAVAILABLE"
+                    ),
+                    "shelf_association_status": (
+                        "ASSOCIATED"
+                        if tag.get("shelf_code")
+                        and (
+                            tag.get("final_shelf_segment_id")
+                            or tag.get("shelf_segment_id")
+                            or tag.get("algorithm_shelf_segment_id")
+                            or tag.get("user_confirmed_shelf_segment_id")
+                        )
+                        else "UNASSOCIATED"
+                    ),
+                    "algorithm_degradation_codes": json.dumps(
+                        tag.get("review_reasons", []),
+                        ensure_ascii=False,
+                        separators=(",", ":"),
                     ),
                     "review_reasons": json.dumps(
                         tag.get("review_reasons", []),
@@ -8543,6 +9956,69 @@ def _render_localized_version(
             "shelves": {key: sorted(value) for key, value in sorted(shelf_index.items())},
         },
     )
+    delivery_context = {
+        "store_id": metadata.get("storeId"),
+        "floor_id": sidecar_floor_id,
+        "prior_map_id": manifest.get("prior_map_id"),
+        "prior_map_package_sha256": package_hash,
+        "canonical_source_sha256": map_identity_binding.get(
+            "canonical_source_sha256"
+        ),
+        "coordinate_contract_version": COORDINATE_CONTRACT_VERSION,
+        "input_identity_id": input_identity_id,
+        "result_quality_status": report.get("result_quality_status"),
+        "publish_permitted": report.get("publish_permitted") is True,
+        "algorithm_degradation_codes": report.get(
+            "algorithm_degradation_codes", []
+        ),
+        "position_source": (
+            "partial_rtabmap_graph_continuous_vio_map_corrected"
+            if partial_graph_recovery
+            else (
+                "raw_continuous_vio_map_corrected"
+                if raw_vio_recovery
+                else "rtabmap_reprocess_plus_prior_map_correction"
+            )
+        ),
+    }
+    trajectory_counts = write_calibrated_trajectory_exports(
+        output,
+        optimized,
+        corridor_route_audit,
+        constraints,
+        clock_evidence=input_snapshot.clock_evidence,
+        delivery_context=delivery_context,
+        unavailable_intervals=weak_lost_intervals,
+    )
+    deliverables_manifest = write_calibrated_deliverables_manifest(
+        output,
+        report=report,
+        source_database_sha256=source_hash_before,
+        optimized_database_sha256=optimized_db_hash,
+        prior_map_package_sha256=package_hash,
+        canonical_source_sha256=str(
+            map_identity_binding.get("canonical_source_sha256") or ""
+        ),
+        trajectory_counts=trajectory_counts,
+    )
+    report["calibrated_deliverables"] = {
+        key: deliverables_manifest[key]
+        for key in (
+            "source_node_count",
+            "exported_node_count",
+            "one_second_row_count",
+            "one_second_unavailable_count",
+            "source_tag_count",
+            "retained_tag_count",
+            "positioned_tag_count",
+            "unpositioned_tag_count",
+            "shelf_associated_tag_count",
+            "unassociated_tag_count",
+        )
+    }
+    # The report is itself an immutable artifact; rewrite it after the core
+    # deliverables pass their cross-file count/hash contract.
+    _json_write(output / "localization_report.json", report)
     _json_write(
         output / "audit_log.jsonl",
         [

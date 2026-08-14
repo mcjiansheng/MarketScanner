@@ -163,6 +163,21 @@ struct VerifiedTagBurstFrame: Equatable {
 }
 
 final class TagObservationBurstEvidenceParseResult {
+    /// One durable business capture whose map/session identity, burst ID,
+    /// barcode and symbology were all read unambiguously, but whose later
+    /// frame/summary semantics did not satisfy the strict v2 evidence
+    /// contract. The capture must survive as exactly one LOW_CONFIDENCE tag
+    /// row; it is not eligible to contribute a position or shelf factor.
+    struct RetainedDegradedBurstSummary: Equatable {
+        let recordIndex: Int
+        let burstID: String
+        let barcode: String
+        let symbology: String
+        let floorID: String
+        let trackingSessionID: String
+        let rejectionReason: String
+    }
+
     struct UnconsumedBurstSummary: Equatable {
         let burstID: String
         let barcode: String
@@ -184,6 +199,7 @@ final class TagObservationBurstEvidenceParseResult {
     }
 
     let bursts: [VerifiedTagBurst]
+    let retainedDegradedBursts: [RetainedDegradedBurstSummary]
     let audit: TagObservationBurstEvidenceAudit
     let frameCount: Int
     /// The only full-frame index retained after burst parsing. Consumption
@@ -194,10 +210,12 @@ final class TagObservationBurstEvidenceParseResult {
 
     init(
         bursts: [VerifiedTagBurst],
+        retainedDegradedBursts: [RetainedDegradedBurstSummary] = [],
         byObservationID: [String: StoredFrame],
         audit: TagObservationBurstEvidenceAudit
     ) {
         self.bursts = bursts
+        self.retainedDegradedBursts = retainedDegradedBursts
         self.audit = audit
         self.frameCount = byObservationID.count
         self.frameByObservationID = byObservationID
@@ -273,6 +291,15 @@ final class TagObservationBurstEvidenceParseResult {
         audit.clean && bursts.allSatisfy {
             $0.complete && $0.uniqueFrameCount > 0
         }
+    }
+
+
+    /// Independent durable source inventory. This count is established
+    /// before tag localization/fusion and is later reconciled against the
+    /// committed FinalPriceTag rows. It must never be derived from the final
+    /// array itself.
+    var sourceBusinessCaptureCount: Int {
+        bursts.count + retainedDegradedBursts.count
     }
 }
 
@@ -365,11 +392,15 @@ enum TagObservationBurstEvidenceParser {
 
         var audit = TagObservationBurstEvidenceAudit()
         var bursts: [VerifiedTagBurst] = []
+        var retainedDegradedBursts: [
+            TagObservationBurstEvidenceParseResult.RetainedDegradedBurstSummary
+        ] = []
         var byObservationID: [
             String: TagObservationBurstEvidenceParseResult.StoredFrame
         ] = [:]
         var seenBurstIDs = Set<String>()
         var seenFrameIDs = Set<String>()
+        var seenObservationIDs = Set<String>()
         var previousSequence: Int?
         // Metadata count tracks durable JSONL records, not records that later
         // pass semantic validation. Keep the raw watermark independent so a
@@ -397,10 +428,6 @@ enum TagObservationBurstEvidenceParser {
                 if let observedBurstID = nonEmptyString(object["burst_id"]) {
                     lastObservedBurstID = observedBurstID
                 }
-                guard object.keys.allSatisfy(knownFields.contains) else {
-                    reject(&audit, line.number, "unknown_field", \.recordSchemaRejected)
-                    return
-                }
                 guard object["format"] as? String == "MarketScannerPriceTagBurst" else {
                     reject(&audit, line.number, "format_invalid", \.recordFormatRejected)
                     return
@@ -421,38 +448,77 @@ enum TagObservationBurstEvidenceParser {
                     reject(&audit, line.number, "duplicate_burst_id", \.recordDuplicateBurstRejected)
                     return
                 }
+                guard let barcode = nonEmptyString(object["barcode"]),
+                      let symbology = nonEmptyString(object["symbology"]) else {
+                    reject(&audit, line.number, "business_identity_invalid", \.recordSchemaRejected)
+                    return
+                }
+                func retainDegraded(
+                    _ reason: String,
+                    _ counter: WritableKeyPath<
+                        TagObservationBurstEvidenceAudit, Int>
+                ) {
+                    reject(&audit, line.number, reason, counter)
+                    retainedDegradedBursts.append(
+                        TagObservationBurstEvidenceParseResult
+                            .RetainedDegradedBurstSummary(
+                                recordIndex: line.number,
+                                burstID: burstID,
+                                barcode: barcode,
+                                symbology: symbology,
+                                floorID: floorID,
+                                trackingSessionID: trackingSessionID,
+                                rejectionReason: reason))
+                }
+                guard object.keys.allSatisfy(knownFields.contains) else {
+                    retainDegraded("unknown_field", \.recordSchemaRejected)
+                    return
+                }
                 guard let sequence = StrictJSONScalar.integer(object["sequence"]),
                       sequence > 0,
                       previousSequence.map({ sequence > $0 }) ?? true else {
-                    reject(&audit, line.number, "sequence_invalid", \.recordDuplicateBurstRejected)
+                    retainDegraded("sequence_invalid", \.recordDuplicateBurstRejected)
                     return
                 }
                 previousSequence = sequence
                 guard StrictJSONScalar.boolean(object["complete"]) == true else {
-                    reject(&audit, line.number, "burst_incomplete", \.recordIncompleteRejected)
+                    retainDegraded("burst_incomplete", \.recordIncompleteRejected)
                     return
                 }
-                guard let barcode = nonEmptyString(object["barcode"]),
-                      let symbology = nonEmptyString(object["symbology"]),
-                      let declaredCount = StrictJSONScalar.integer(object["frame_count"]),
+                guard let declaredCount = StrictJSONScalar.integer(object["frame_count"]),
                       declaredCount >= 1,
                       declaredCount <= TagObservationBurstEvidenceLimits.maximumFrameSamplesPerBurst,
                       let rawFrames = object["frames"] as? [Any],
                       rawFrames.count == declaredCount else {
-                    reject(&audit, line.number, "frame_count_or_frames_invalid", \.recordSchemaRejected)
+                    retainDegraded(
+                        "frame_count_or_frames_invalid", \.recordSchemaRejected)
                     return
                 }
 
                 var parsedFrames: [TagBurstFrameSample] = []
                 parsedFrames.reserveCapacity(rawFrames.count)
-                var localFrameIDs = Set<String>()
-                var localObservationIDs = Set<String>()
                 var frameFailure: String?
                 for rawFrame in rawFrames {
-                    guard let frame = rawFrame as? [String: Any],
-                          frame.keys.allSatisfy(frameKeys.contains),
-                          let frameID = nonEmptyString(frame["frame_id"]),
-                          let observationID = nonEmptyString(frame["observation_id"]),
+                    guard let frame = rawFrame as? [String: Any] else {
+                        frameFailure = "frame_schema_invalid"
+                        break
+                    }
+                    let rawFrameID = nonEmptyString(frame["frame_id"])
+                    let rawObservationID = nonEmptyString(
+                        frame["observation_id"])
+                    if let rawFrameID,
+                       !seenFrameIDs.insert(rawFrameID).inserted {
+                        frameFailure = "duplicate_frame_id"
+                        break
+                    }
+                    if let rawObservationID,
+                       !seenObservationIDs.insert(rawObservationID).inserted {
+                        frameFailure = "duplicate_observation_id"
+                        break
+                    }
+                    guard frame.keys.allSatisfy(frameKeys.contains),
+                          let frameID = rawFrameID,
+                          let observationID = rawObservationID,
                           let boundNodeValue = StrictJSONScalar.integer(frame["bound_node_id"]),
                           boundNodeValue > 0,
                           let frameTimestamp = StrictJSONScalar.number(frame["frame_timestamp"]),
@@ -462,16 +528,6 @@ enum TagObservationBurstEvidenceParser {
                           let tracking = nonEmptyString(frame["tracking"]), allowedTracking.contains(tracking),
                           let confidence = boundedUnit(frame["confidence"]) else {
                         frameFailure = "frame_schema_invalid"
-                        break
-                    }
-                    guard localFrameIDs.insert(frameID).inserted,
-                          !seenFrameIDs.contains(frameID) else {
-                        frameFailure = "duplicate_frame_id"
-                        break
-                    }
-                    guard localObservationIDs.insert(observationID).inserted,
-                          byObservationID[observationID] == nil else {
-                        frameFailure = "duplicate_observation_id"
                         break
                     }
                     let boundNodeID = Int64(boundNodeValue)
@@ -501,7 +557,7 @@ enum TagObservationBurstEvidenceParser {
                             : frameFailure == "bound_node_invalid"
                                 ? \.recordNodeBindingRejected
                                 : \.recordSchemaRejected
-                    reject(&audit, line.number, frameFailure, counter)
+                    retainDegraded(frameFailure, counter)
                     return
                 }
 
@@ -515,7 +571,8 @@ enum TagObservationBurstEvidenceParser {
                       let declaredTracking = nonEmptyString(object["tracking_quality"]),
                       allowedTracking.contains(declaredTracking),
                       let declaredConfidence = boundedUnit(object["localization_confidence_mean"]) else {
-                    reject(&audit, line.number, "summary_schema_invalid", \.recordSchemaRejected)
+                    retainDegraded(
+                        "summary_schema_invalid", \.recordSchemaRejected)
                     return
                 }
                 let declaredNodeMin = Int64(declaredNodeMinValue)
@@ -530,7 +587,7 @@ enum TagObservationBurstEvidenceParser {
                       declaredView == recomputed.view,
                       declaredTracking == recomputed.tracking,
                       approximatelyEqual(declaredConfidence, recomputed.confidenceMean) else {
-                    reject(&audit, line.number, "summary_mismatch", \.recordSchemaRejected)
+                    retainDegraded("summary_mismatch", \.recordSchemaRejected)
                     return
                 }
 
@@ -563,7 +620,6 @@ enum TagObservationBurstEvidenceParser {
                         throw TagObservationBurstEvidenceParseError.framing(
                             "validated frame domain could not be compacted")
                     }
-                    seenFrameIDs.insert(sample.frameId)
                     byObservationID[sample.observationId] =
                         TagObservationBurstEvidenceParseResult.StoredFrame(
                             frame: verifiedFrame,
@@ -591,6 +647,7 @@ enum TagObservationBurstEvidenceParser {
         }
         return TagObservationBurstEvidenceParseResult(
             bursts: bursts,
+            retainedDegradedBursts: retainedDegradedBursts,
             byObservationID: byObservationID,
             audit: audit)
     }

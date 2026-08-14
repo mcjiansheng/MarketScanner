@@ -122,9 +122,17 @@ P7R3 把宽搜索改为显式 Recovery episode。`inactive -> active -> converge
 
 `localization_trace` v1 继续用向后兼容可选字段记录 `recoveryEpisodeId/recoveryReason/recoveryOutcome/recoveryValidAttemptCount/recoveryRemainingValidAttempts/recoveryElapsedMs/recoveryFreshSupportFrames/recoveryTriggerCount`。active 记录使用 `recoveryOutcome=active`；结束该 episode 的记录使用终态字符串。数值均为有限小标量，不保存结构点；旧 reader 可忽略这些字段。
 
-可靠 RTAB-Map 回环还会在普通 `scan_events.jsonl` 写 `loop_opened_shelf_identity_candidates`。它包含 `authority=diagnostic_only_not_localization_factor`、候选来源、`identity_status`、最多 5 个 `shelf_segment_ids/shelf_codes/distances_m/longitudinal_fractions`。这些候选来自回环触发 recovery 前的最新估计位置邻域，仅用于证明“哪些具体货架仍可能”并保留多解；它不是正式定位 sidecar、没有局部结构快照或 phone↔shelf SE(2)，不能改变 alignment、constraint、trajectory 或发布资格。后续只有在 manifest v4 绑定结构窗口和 exact node 后，才能考虑把经多帧/回环确认的货架身份升级为正式因子。
+可靠 RTAB-Map 回环还会在普通 `scan_events.jsonl` 写 `loop_opened_shelf_identity_candidates`。它包含 `authority=diagnostic_only_not_localization_factor`、候选来源、`identity_status`、最多 5 个 `shelf_segment_ids/shelf_codes/distances_m/longitudinal_fractions`。这些候选来自回环触发 recovery 前的最新估计位置邻域，仅用于证明“哪些具体货架仍可能”并保留多解；它不是正式定位 sidecar、没有局部结构快照或 phone↔shelf SE(2)，不能改变 alignment、constraint、trajectory 或发布资格。session input manifest v4 已由扫描期时钟证据占用；后续只有在未来 manifest v5 绑定结构窗口和 exact node 后，才能考虑把经多帧/回环确认的货架身份升级为正式因子。
 
 `timestamp` 保留原始 `ARFrame.timestamp`（设备单调时钟）；RTAB‑Map 的 `CameraMobile` 在写 `Node.stamp` 前会加 `stampEpochOffset`。因此所有当前定位 sidecar 同时保存 `nodeTimebaseTimestamp = timestamp + nodeTimebaseOffsetSeconds`，PC 只用换算后的 node timebase 绑定 SQLite node，并严格复算该等式。offset 由 native camera 原子读取；尚未初始化或非有限时该记录拒绝落盘，不能直接拿原始 ARFrame 时间与 epoch node stamp 比较。
+
+## clock_correlations.jsonl
+
+正式 session input manifest v4 绑定 `clock_correlations.jsonl`。文件同时包含 `MarketScannerClockCorrelation` v2 和 `MarketScannerClockNodeBinding` v2：前者保存 device monotonic uptime、UTC、IANA `timezone_id`、`utc_offset_seconds` 与采样原因；后者把 exact `node_id/node_stamp/sampled_frame_timestamp/system_uptime` 绑定到同一 UTC/时区上下文。metadata 的 `clockCorrelationCount` 与 `clockNodeBindingCount` 是严格水位，必须与 durable 行数一致。
+
+Swift 与 PC reader 统一要求 correlation uptime、correlation UTC、binding node stamp 和 binding UTC 严格递增；`sampled_frame_timestamp` 与 `node_stamp` 差值最多 2 秒，binding UTC 必须在 2 秒内吻合 correlation 插值，且 binding 的 timezone/offset 必须等于该 uptime 所属 correlation context。单个语义不一致 binding 会被排除并审计，不会抹掉其余合法时间线；少于两个合法 correlation 或 binding 时不能宣称权威时间映射，但这属于覆盖退化而不是整单失败。只要 framing、水位、身份和数据库仍完整，节点轨迹和价签继续提交，correlation 覆盖的秒级时间行全部保留，无法绑定位置的行写 `UNAVAILABLE`。历史无权威 clock evidence 时 node stamp 仅保留在 `node_timebase_timestamp`，不得伪装成 UTC。
+
+系统时钟跳变、timezone/offset 变化以及 UTC 相对 uptime 残差超过 2 秒都会切分 `clock_segment_index`。节点级 CSV 保存每个 node 的 segment；秒级 CSV 只允许在同一 segment 内插值。跨 segment 的秒必须保留业务行，但 `x_m/y_m/yaw_*` 为空，`position_status=UNAVAILABLE`、`position_degradation_code=clock_discontinuity`。任何处理机本地时区、当前 wall clock 或跨 discontinuity 插值都不是合法回退。
 
 ## 阶段二定位审计
 
@@ -137,6 +145,10 @@ P7R3 把宽搜索改为显式 Recovery episode。`inactive -> active -> converge
 只有至少 3 个逐帧 `algorithmCandidateReliable=true`、`needsReview=false` 的独立 observation 共同指向同一 `shelfSegmentId + side`，UI 才能提供可靠确认。确认提交使用一次性 capture authority，并在同一 session writer 事务中重新核对 workflow、required-write health、tracking session、prior-map ID/SHA-256、floor、capture ID 和 verified burst frame set；取消先于 claim 时不写，claim 先于取消时已接受的提交继续由持久化回调收口。
 
 手机结果 `FinalPriceTag.quality_status` 为三态：`ACCEPTED` 表示所有自动质量门通过；`LOW_CONFIDENCE` 表示 observation↔burst、tracking/map identity、exact `boundNodeID` 和可重算位置权威完整，但 recovering/weak、深度、node uncertainty、离散度或货架关联不足以自动批准；`RESCAN_REQUIRED` 仅用于完整 burst、身份/图质量、exact node/raw node pose、measurement method 或可解析位置等权威条件缺失。`LOW_CONFIDENCE` 必须保留在 PriceTags 和质量报告中，不自动生成 RescanTasks；PC 仍按 `P_final = T_final_node × inverse(T_raw_node) × P_raw` 使用 exact node O(1) 重投影，不允许 nearest-time fallback。
+
+durable burst 的业务库存独立于其最终置信度。`burst_id`、burst frame `frame_id`、burst/observation 两侧的 `observation_id` 都在读取原始身份后立即进入会话级全局唯一集合；即使该 burst 后续因为 summary、schema、node binding 或关联证据不足而退化，这些 ID 也不会被释放给后续 burst 复用。跨记录非空 `capture_id` 同样必须唯一。重复 durable 主键会使业务身份不可界定，因此属于少数仍可阻断的完整性错误，而不是普通低置信度。
+
+PC 以“原始 localized tag 数量 + 未被任何 final tag `capture_id` 表示的安全 durable burst 数量”计算 `tag_source_record_count`。若一个身份、barcode、symbology 和记录边界都明确的 durable burst 没有出现在 final tag 数组中，PC 必须补出 exactly one `LOW_CONFIDENCE` 业务记录，保留 `capture_id/barcode/symbology`，位置和货架为空，并写 `durable_burst_missing_final_tag`；不得按 barcode 合并不同 burst。最终 `tag_source_record_count == tag_retained_count`，否则不可提交不可变成果。
 
 JSONL 文件逐行独立编码和同步追加，禁止空行且最后一条记录也必须带换行；最终价签数组用同目录唯一 temp、完整写入、`synchronize()` 和原子 rename 替换。write/flush/rename 三个提交前阶段可故障注入，失败保留旧文件并清理 temp。该合同保证应用进程观察到旧文件或完整新文件，并为进程崩溃恢复提供 checkpoint；iOS 没有在此路径声明父目录 fsync/设备断电持久化保证，因此类型和文档只称“原子可见提交”，不能把它写成 power-loss durable。必需定位追加使用 throwing `FileHandle` I/O 并返回结构化的 trace/constraint/state 成败；任一 observation 已持久化但无法进入相同 burst 时立即增加 sticky required-write failure，不能只写 warning 等待最终化发现 orphan。写入前必须确认 tracking session ID 与活动会话一致且未进入 finalization，不允许日志接口自动创建新会话目录。PC 对每类文件使用正式 contract：严格 UTF‑8/JSON（禁止 NaN/Infinity 和未知 v2 tag/burst 字段）、format/version、会话/地图/floor 身份、有限且按契约单调的时间戳、业务必填字段、单行/记录上限、重复 ID 和 observation↔burst exact binding 检查。`localization_trace`、constraints、state events 为必需；最终 metadata 必须明确 `localizedPriceTags` 文件名与准确计数，即使为 0 也必须存在；有最终价签时 observations 必需且不得为空。manual v3 是当前格式，v2 仅作严格兼容；legacy v1 只允许进入拒绝审计和 review blocker，不能形成锚点。
 
@@ -178,10 +190,13 @@ localized/
     factor_graph_report.json
     review_items.json            localized_review.json
     manual_edits.json
+    calibrated_positions_by_node.csv
+    calibrated_positions_1s.csv
+    calibrated_deliverables_manifest.json
     localized_price_tags.json/.csv/.geojson
     shelf_tag_index.json         audit_log.jsonl
-    field_evidence.json          # 仅 published/revoked v4
-    qualification_manifest.json # 仅 published/revoked v4
+    field_evidence.json          # 仅 published/revoked v6
+    qualification_manifest.json # 仅 published/revoked v6
 ```
 
 `localization_report.json` 包含地图/会话/数据库 hash、直接从 source/optimized SQLite `Node` 表和导出轨迹交叉计算的节点覆盖/缺失/重复/时间范围、三条轨迹长度、修正分布、绝对约束和相对边残差、weak/lost 时长、约束接受/拒绝、标签 observation coverage、review/publish blockers 和 `publish_state`。测试诊断结果还固定记录 `diagnostic_mode`、`diagnostic_only` 和 `ignored_conflicting_source_constraint_count`；它可以推进工作用 `draft/current` 以便加载复核，但 `publish_gate` 必含 `diagnostic_mode_enabled` blocker。`factor_graph_report.json` version 1 保存 native solver/DB 版本、input identity、optimized DB SHA-256、canonical factor digest、Node/Factor inventory、gauge/连通性、objective/iterations、残差分位数、拒绝/降权诊断及最终 poses。完整报告必须通过 Python 和 version store 两层复核。
@@ -190,9 +205,19 @@ localized/
 
 `optimized_map_trajectory.geojson` 的 `rtabmap_optimized`、`prior_map_offline_optimized` 和可用时的 `online_localization` feature properties 均保存 `timestamps`、`node_ids` 与同长度 `yaws_rad`。`yaws_rad` 是对应地图 gauge 下的手机朝向；道路切线仅表示移动方向，不能代替手机 yaw。任何坐标、时间、node ID、yaw 长度不一致或非有限值都使校准坐标导出拒绝执行。
 
-helper 可用且所有门通过时 `solver.type=relative_se2_factor_graph`、`full_factor_graph=true`；helper 缺失或失败时仍写报告，但回退为 `bounded_correction_field` draft，`published_capable=false`。长会话的最终复核路线可使用 `solver.type=gauge_neutral_free_space_road_route`：native factor graph 报告继续保留，`full_factor_graph=false`、`published_capable=false`，`continuity_gate_authority=gauge_neutral_free_space_road_route`，旧 correction-field gradient 只作诊断。旧 version manifest v1/v2 可继续只读解析；含 factor report 的普通 draft/review 使用 version manifest v3；正式 publication 把 exact Field Evidence v3 和 qualification manifest 纳入逐文件 hash tree，使用 version manifest v4。Field Evidence v3 的 `MarketScannerQualificationSourceBundle` v1 保存 exact plan/release/policy，`MarketScannerTrajectorySourceBundle` v1 保存 version manifest 与选定 source artifact bytes，`MarketScannerFieldRunInputBundle` v1 保存 exact 控制点 CSV 与 Device Evidence bytes；发布检查从这些 bytes 重新派生摘要。Field v3 stable-read 上限 128 MiB，单个 CSV/Device Evidence 各 16 MiB；Windows descriptor 使用 `O_BINARY` 保留包括 CRLF 在内的磁盘原始字节；路径元数据和已打开 descriptor/Windows handle 元数据只在各自 API 内做读取前后比较，避免跨 API 表示差异误拒绝；主 descriptor 在读取前后的同类 path descriptor 身份绑定完成前保持打开，因此路径替换、临时替换后恢复、descriptor 内容变化和部分读取继续失败关闭；v4 resolve 不允许回退到外部绝对 evidence 路径。
+helper 可用且所有门通过时 `solver.type=relative_se2_factor_graph`、`full_factor_graph=true`；helper 缺失或失败时仍写报告，但回退为 `bounded_correction_field` draft，`published_capable=false`。长会话的最终复核路线可使用 `solver.type=gauge_neutral_free_space_road_route`：native factor graph 报告继续保留，`full_factor_graph=false`、`published_capable=false`，`continuity_gate_authority=gauge_neutral_free_space_road_route`，旧 correction-field gradient 只作诊断。旧 version manifest v1/v2 可继续只读解析；含 factor report、但还没有不可变业务表的历史 draft/review 使用 version manifest v3。当前 draft/review 将四个核心业务表和 `calibrated_deliverables_manifest.json` 纳入 exact file/hash tree，使用 version manifest v5；正式 publication 再把 exact Field Evidence v3 和 qualification manifest 纳入同一 hash tree，使用 version manifest v6。Field Evidence v3 的 `MarketScannerQualificationSourceBundle` v1 保存 exact plan/release/policy，`MarketScannerTrajectorySourceBundle` v1 保存 version manifest 与选定 source artifact bytes，`MarketScannerFieldRunInputBundle` v1 保存 exact 控制点 CSV 与 Device Evidence bytes；发布检查从这些 bytes 重新派生摘要。Field v3 stable-read 上限 128 MiB，单个 CSV/Device Evidence 各 16 MiB；Windows descriptor 使用 `O_BINARY` 保留包括 CRLF 在内的磁盘原始字节；路径元数据和已打开 descriptor/Windows handle 元数据只在各自 API 内做读取前后比较，避免跨 API 表示差异误拒绝；主 descriptor 在读取前后的同类 path descriptor 身份绑定完成前保持打开，因此路径替换、临时替换后恢复、descriptor 内容变化和部分读取继续失败关闭；v6 resolve 不允许回退到外部绝对 evidence 路径。
 
-不可变 localized version 不被普通导出修改。`tools/PriorMap/export_calibrated_trajectory.py` 先复核 `version_manifest.json` 中的轨迹和定位报告字节数/SHA，再在 version 外的独立目录生成：
+不可变 localized version 自身就是核心业务成果权威，包含：
+
+```text
+calibrated_positions_by_node.csv
+calibrated_positions_1s.csv
+localized_price_tags.json
+localized_price_tags.csv
+calibrated_deliverables_manifest.json
+```
+
+`calibrated_deliverables_manifest.json` 记录 source/exported node、source/retained tag、positioned/unpositioned/shelf-associated/unassociated tag 数量，并绑定四张表的 row count、字节数和 SHA-256。普通导出不得修改这些文件。`tools/PriorMap/export_calibrated_trajectory.py` 先按 `version_manifest.json` 验证核心 CSV，再逐字节复制到 version 外的兼容目录并额外生成复核 PNG：
 
 ```text
 calibrated_trajectory_exports/
@@ -203,13 +228,13 @@ calibrated_trajectory_exports/
   export_manifest.json
 ```
 
-节点级与秒级 CSV 字段包括 Unix 秒、本地 ISO-8601 时间、`x_m/y_m`、`yaw_rad/yaw_deg`、`yaw_source=optimized_phone_pose`、nearest node、道路 edge/corridor、`route_confidence`、`corridor_identity_confidence`、`distance_scale`、`distance_scale_confidence` 和人工锚点状态。低置信度与不可发布状态必须原样传播到导出 manifest，不能因为能生成 PNG/CSV 就提升结果资格。
+节点级与秒级 CSV 字段包括 Unix 秒、本地 ISO-8601 时间、IANA 时区、UTC offset、`clock_segment_index`、clock/position status、`x_m/y_m`、`yaw_rad/yaw_deg`、`yaw_source=optimized_phone_pose`、nearest node、道路 edge/corridor、`route_confidence`、`corridor_identity_confidence`、`distance_scale`、`distance_scale_confidence` 和人工锚点状态。时钟或位置不可用时业务行继续存在，未知坐标字段保持为空，不能写 `(0,0)`；低置信度与不可发布状态必须原样传播到导出 manifest，不能因为能生成 PNG/CSV 就提升结果资格。
 
 `localized_review.json` 是 Map Studio 的有界联动复核视图数据，包含先验结构、三条轨迹、价签、问题列表和明确的 `view_limits`/截断标记；它是派生展示文件，不替代各权威成果文件。
 
 `manual_edits.json` version 4 绑定 `input_identity_id/session_input_bundle_sha256/prior_map_sha256/source_database_sha256/optimized_database_sha256/processing_parameter_sha256/tool_version/coordinate_contract_version`。事件保存服务端生成的 `event_id/created_at_utc/base_revision/old_value/new_value/actor/reason`；`audit_events` 单独记录 append/undo/redo 的旧/新 cursor。API 强制 `expected_version_id + expected_revision`，冲突返回 409；只有完整重放和版本校验成功后才推进 current。
 
-可导出的 `source_manifest.json` 只保存会话/数据库文件名、地图 ID 和各输入 SHA‑256，不保存用户名或绝对路径。不可变 version 内的 `session_input_manifest.json` 按规范顺序绑定数据库、metadata 和全部必需 sidecar 的 role、规范文件名、大小及 SHA‑256，并生成 `input_identity_id`。v1 是 legacy 输入，v2 额外绑定 Recovery sidecar，v3 再绑定 `tag_observation_bursts.jsonl`。共享 manifest validator 强制 version 为非 Boolean 的严格 JSON integer；v1 对应 `recovery_lifecycle_evidence_unbound_legacy`，v2/v3 对应 `recovery_lifecycle_evidence_bound_v2`，并要求 processing/report 中的 manifest version 与 binding 一致。`metadata` role 只能指向 `metadata.json`，除 `source_database` 可保留实际数据库 basename 外，其余 role 的 `file` 必须与 role 完全相同；全部文件名按 case-insensitive 规则唯一。source database 名称必须非空、不是 `.`/`..`、不含 slash/backslash/NUL、不是 POSIX/Windows absolute 或 drive-relative path、不与 canonical sidecar 冲突，并与 `source_manifest.source_database_name` 完全一致。即使攻击者重算 bundle/cross-artifact hash，role→filename 改绑仍会 fail-closed。source database 在 manifest build、snapshot 和 verified copy 三个入口都必须是稳定的 single-link regular file，且相邻非空 WAL 或 rollback journal 会拒绝输入。人工复核重放所需的本机绝对路径按该身份单独写在 `localized/local_inputs/<input_identity_id>.json`；它不进入不可变 version、artifact allowlist 或导出包。读取时先验证 version 本身，再验证 local-input identity 和当前输入字节；不能用可变全局路径状态重放旧版本。
+可导出的 `source_manifest.json` 只保存会话/数据库文件名、地图 ID 和各输入 SHA‑256，不保存用户名或绝对路径。不可变 version 内的 `session_input_manifest.json` 按规范顺序绑定数据库、metadata 和全部必需 sidecar 的 role、规范文件名、大小及 SHA‑256，并生成 `input_identity_id`。v1 是 legacy 输入，v2 额外绑定 Recovery sidecar，v3 再绑定 `tag_observation_bursts.jsonl`，v4 再绑定 `clock_correlations.jsonl`。共享 manifest validator 强制 version 为非 Boolean 的严格 JSON integer；v1 对应 `recovery_lifecycle_evidence_unbound_legacy`，v2/v3/v4 对应 `recovery_lifecycle_evidence_bound_v2`，并要求 processing/report 中的 manifest version 与 binding 一致。v4 已是当前正式时钟合同，未来 loop-window 货架结构证据必须使用 v5，不能复用 v4。`metadata` role 只能指向 `metadata.json`，除 `source_database` 可保留实际数据库 basename 外，其余 role 的 `file` 必须与 role 完全相同；全部文件名按 case-insensitive 规则唯一。source database 名称必须非空、不是 `.`/`..`、不含 slash/backslash/NUL、不是 POSIX/Windows absolute 或 drive-relative path、不与 canonical sidecar 冲突，并与 `source_manifest.source_database_name` 完全一致。即使攻击者重算 bundle/cross-artifact hash，role→filename 改绑仍会 fail-closed。source database 在 manifest build、snapshot 和 verified copy 三个入口都必须是稳定的 single-link regular file，且相邻非空 WAL 或 rollback journal 会拒绝输入。人工复核重放所需的本机绝对路径按该身份单独写在 `localized/local_inputs/<input_identity_id>.json`；它不进入不可变 version、artifact allowlist 或导出包。读取时先验证 version 本身，再验证 local-input identity 和当前输入字节；不能用可变全局路径状态重放旧版本。
 
 PC 重关联不会静默覆盖操作员确认：optimized segment+side 与用户选择一致时写 `NO_CONFLICT` 并保持 approved；可靠 optimized 证据指向另一 segment/side 时写 `USER_CONFIRMATION_CONFLICT`；pose binding、raw map position 或 offline association 不可用/不可靠时统一写 `OFFLINE_ASSOCIATION_UNAVAILABLE`。后两者固定为 `REVIEW_REQUIRED`、`rescan_required=true`、`needs_review=true`、`approval_status=pending`，并保留全部 algorithm/user evidence。
 

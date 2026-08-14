@@ -1036,7 +1036,7 @@ def _trajectory_source_from_bundle(
     if (
         not isinstance(manifest, dict)
         or manifest.get("format") != "MarketScannerLocalizedVersionManifest"
-        or manifest.get("version") not in {3, 4}
+        or manifest.get("version") not in {3, 4, 5, 6}
         or re.fullmatch(r"v[0-9]{6}", str(manifest.get("version_id", ""))) is None
         or not SHA_RE.fullmatch(str(manifest.get("input_identity_id", "")))
         or not SHA_RE.fullmatch(
@@ -1056,12 +1056,18 @@ def _trajectory_source_from_bundle(
         by_name[entry["file"]] = entry
     try:
         from tools.PriorMap.localized_output_store import (
+            CURRENT_PUBLISHED_VERSION_FILES,
+            CURRENT_REQUIRED_VERSION_FILES,
             PUBLISHED_VERSION_FILES,
             REQUIRED_VERSION_FILES,
         )
 
         expected_files = (
-            PUBLISHED_VERSION_FILES
+            CURRENT_PUBLISHED_VERSION_FILES
+            if manifest.get("version") == 6
+            else CURRENT_REQUIRED_VERSION_FILES
+            if manifest.get("version") == 5
+            else PUBLISHED_VERSION_FILES
             if manifest.get("version") == 4
             else REQUIRED_VERSION_FILES
         )

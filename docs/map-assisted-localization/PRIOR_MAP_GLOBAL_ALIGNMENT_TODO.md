@@ -8,12 +8,12 @@
 
 ## P1：把跨窗口结构证据升级为正式输入
 
-- 当前 `structure_coverage_cells.json` 不属于 PC localized session input manifest v1/v2/v3，也未进入 parse-and-hash-once stable snapshot。本轮 `structure_window_alignment.py` 因此强制输出 `diagnostic_only_unbound_structure_coverage_v1`、`publishable_constraint_count=0` 和 `factor_injection_allowed=false`。
-- 若要生成正式绝对因子，必须同步设计 session input manifest v4：
-  - PC `SESSION_INPUT_FILE_NAMES_V4`、snapshot、localized output store 和结果恢复；
+- 当前 `structure_coverage_cells.json` 不属于 PC localized session input manifest v1/v2/v3/v4，也未进入 parse-and-hash-once stable snapshot。本轮 `structure_window_alignment.py` 因此强制输出 `diagnostic_only_unbound_structure_coverage_v1`、`publishable_constraint_count=0` 和 `factor_injection_allowed=false`。manifest v4 已用于绑定 `clock_correlations.jsonl`，不能再复用同一版本承载不同文件集合。
+- 若要生成正式绝对因子，必须同步设计 session input manifest v5：
+  - PC `SESSION_INPUT_FILE_NAMES_V5`、snapshot、localized output store 和结果恢复；
   - 手机 `SessionSnapshotTransaction` required/optional declaration、metadata watermark 和 finalization 校验；
   - 严格 coverage schema、文件/记录/栅格预算、final newline/JSON identity（若改为 JSONL）；
-  - v1/v2/v3 历史兼容和跨端 mutation tests；
+  - v1/v2/v3/v4 历史兼容和跨端 mutation tests；
   - 原始 DB、coverage、trace 和 prior-map package 的同一 input identity。
 - 正式因子必须绑定窗口时间范围、DB node IDs、使用的 coverage cell 集、distance-field SHA 和候选序列 margin。人工复核只能添加有不确定度的绝对证据，不能覆写原始 sidecar。
 
@@ -26,7 +26,7 @@
   - `162937` 的最大总修正为 2.927 m，梯度为 0.238 m/m 和 1.513°/m，连续性通过，但仍保留 `structure_window_sequence_ambiguous`，不通过调权重伪造确定货架；
   - 将候选预算增至 24 时可能暴露新的平行序列多解，因此 `181158` 的“唯一”只属于该次固定预算诊断，不能升级为具体货架身份结论。
   - 两者都仍被 `structure_coverage_not_bound_by_localized_input_manifest` 阻断，`publishable_constraint_count=0`。
-- 后续 PC 工作是把同一候选图接入正式 manifest v4 和人工复核可视化，而不是再新增一套未绑定的因子生成器。
+- 后续 PC 工作是把同一候选图接入正式 manifest v5 和人工复核可视化，而不是再新增一套未绑定的因子生成器。
 - 在引入正式因子前，至少审核 Tianhong、北京昌平 hs.6599、MapCase02 和 Kohl's 的多会话分布并冻结质量策略。当前 factor graph policy 仍是 `candidate`，不得仅依据本次两个样本改为 `frozen`。
 
 ## P1：手机后处理的资源有界版本
@@ -52,8 +52,8 @@
   - 轨迹回到历史道路/货架窗口附近；
   - 人工节点校准完成。
 - 扫描 UI 应提示“回看货架端头/交叉口/独特固定结构”，但不强迫反复扫描同一价签；回环目标是全局轨迹和货架 identity，不是让使用者重复扫码。
-- 正式闭环必须新增 manifest v4 绑定的 loop-window 结构证据：冻结回环前后 exact node/time 范围、局部货架/地面点、地图候选、所用 distance-field SHA 和 top-K margin；在此基础上建立 concrete shelf identity tracker，输出 phone↔shelf relative SE(2) 及其不确定度，再由 fresh multi-frame support 将已确认货架作为有界校准证据。不得直接给 strict `localization_trace` v1 增字段，也不得把当前邻域 top-K 当绝对因子。
-- manifest v4 必须同步手机 writer/finalization/snapshot、水位和生成合同、Swift/Python strict parser、PC immutable input identity、localized result identity、资源上限、mutation tests 和文档；任何一端缺失都只能保持 diagnostic。
+- 正式闭环必须新增 manifest v5 绑定的 loop-window 结构证据：冻结回环前后 exact node/time 范围、局部货架/地面点、地图候选、所用 distance-field SHA 和 top-K margin；在此基础上建立 concrete shelf identity tracker，输出 phone↔shelf relative SE(2) 及其不确定度，再由 fresh multi-frame support 将已确认货架作为有界校准证据。不得直接给 strict `localization_trace` v1 增字段，也不得把当前邻域 top-K 当绝对因子。
+- manifest v5 必须同步手机 writer/finalization/snapshot、水位和生成合同、Swift/Python strict parser、PC immutable input identity、localized result identity、资源上限、mutation tests 和文档；任何一端缺失都只能保持 diagnostic。
 - 需要现场矩阵验证蛇形长通道、环绕同形货架、遮挡后恢复、人工校准前后、无可靠回环和错误回环隔离。
 
 ## P1：道路拓扑精确来源的 schema 升级

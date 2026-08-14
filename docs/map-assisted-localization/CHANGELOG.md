@@ -2,6 +2,15 @@
 
 > 文档状态：**当前有效**。最后核对日期：2026-08-14。
 
+## 2026-08-14 — 不可变时间线/价签成果、时钟分段与 durable burst 核账
+
+- localized result 升级为 version manifest v5：`calibrated_positions_by_node.csv`、`calibrated_positions_1s.csv`、`localized_price_tags.json`、`localized_price_tags.csv` 和 `calibrated_deliverables_manifest.json` 成为不可变版本内的核心业务工件。正式发布版本为 v6。外部导出脚本验证并复制核心 CSV，只额外生成路线 PNG，不能重新解释或提升结果资格。
+- PC 和手机统一“成果生成”与“允许自动发布”两个决定。部分优化图、低覆盖率、weak/lost、道路/货架多解、距离尺度偏差、时钟局部缺口和价签关联不足会完整保留节点、秒级行、条码、审计和低置信度原因；未知坐标为空并标 `UNAVAILABLE` / `LOW_CONFIDENCE`，禁止伪造 `(0,0)`。数据库/证据 framing 损坏、身份串包、hash/watermark/CAS 不一致、重复 durable 主键、完全无有限轨迹和原子提交失败仍保持阻断。
+- session input manifest v4 正式绑定 `clock_correlations.jsonl`。PC 与 iOS 现在共同验证 correlation UTC 严格递增、node binding 的 frame/node stamp 2 秒合同、UTC 映射和 timezone/offset context。节点/秒级表增加 `clock_segment_index`；系统时钟跳变或时区变化切段，秒级导出不跨段插值，跨段行保留为空坐标并写 `clock_discontinuity`。局部 binding 交叉验证后不足两条时改为 `clock_mapping_insufficient_after_cross_check` 退化：轨迹与价签继续提交，correlation 覆盖的所有秒级行保留为 `UNAVAILABLE`；历史 node stamp 不再伪装成 UTC。
+- durable tag burst 的 `burst_id/frame_id/observation_id` 在读取原始身份后立即进入会话级全局唯一库存，burst 后续退化也不能释放 ID；tolerant final-tag reader 同时拒绝重复非空 `capture_id`。若身份明确的 durable burst 没有出现在 final tag 文件，PC 补 exactly one 保留 barcode/symbology/capture ID、位置/货架为空的 `LOW_CONFIDENCE` 记录，并要求 `tag_source_record_count == tag_retained_count`。
+- 自动回归通过 PriorMap 314/314、Map Studio 130/130、Qualification 30/30。Swift host 长规模仍覆盖 300,000 finalization、1,728,000 trace 和 400,000 tag evidence；新增 durable ID 库存的本轮峰值为 699,891,712 bytes，未突破 768 MiB host 门。签名真机、LiDAR、现场非空价签和 exact-final-SHA 资格仍未执行。
+- 复用既有只读优化数据库重新生成 TianHong 两份真实会话：`162937` 保留 3663/3663 节点、3806 行秒级表（1501 行位置不可用）；`181158` 保留 1054/1054 节点、1132 行秒级表（486 行位置不可用）。两份 `current` 都通过 version/file/hash 校验，源 DB、optimized DB、prior-map package SHA 与上轮一致，源地图包未修改；样本输入确实没有价签，因此 0/0 核账是输入事实，不能替代现场非空价签验证。
+
 ## 2026-08-14 — TianHong 旧地图兼容、人工校准和结构连续性收口
 
 - TianHong 旧 v2 包的 `elements.json`/权威 XLSX 完整，但旧编译器过滤了隐藏 `MapCross`，又没有从 510 个有效 road-point `crossCodes` 恢复拓扑，导致 `road_graph` 只有 511 个孤立节点、0 条边，并连带触发 `road_graph_source_binding` / `spatial_source_binding`。Map Studio 现在仅在错误集合严格属于这组已知派生绑定问题时，将源包只读复制到结果目录并确定性重建 `road_graph/spatial_index/validation_report/package_manifest`；其他身份、schema、hash 或完整性错误仍终止。源包、权威 canonical SHA 和 prior-map ID 不修改。
@@ -9,7 +18,7 @@
 - PC Web 人工锚点和 iOS 人工重定位统一 canonical SE(2)：`0°=+X/东/屏幕右`、`90°=+Y/北/屏幕上`、逆时针为正。PC exact-node/floor/time/contract-bound `set_anchor` 与手机 v3 exact-node 事件都作为约 3 m / 20°不确定度的可信绝对地图 gauge 证据；历史 timestamp-only 编辑继续走兼容门。Web 与手机均提供 X/Y/yaw 数值、0.1/0.5/1.0 m 微调、东南西北和 ±1/±5/±15°旋转；Web 同时处理 Shift 后浏览器产生的 `{`/`}` 键值，数值字段在 change/blur 统一提交并按 canonical bounds 钳制。服务端从不可变轨迹复核 node/time/floor/bounds/yaw，界面数值就是提交数值，不存在隐藏二次坐标转换。
 - 结构窗口连续性不再用“相邻 correction 总量 ≤ 3 m”拒绝长距离累计漂移。权威诊断改为单位 gauge-neutral 物理行进距离的平移/航向 correction gradient，总变化量只保留审计；短距离大跳变仍因高梯度拒绝。真实 `181158` 在原 12 候选预算下最大总校正仍为 4.080 m，但梯度仅 0.176 m/m 和 1.242°/m，因此连续性通过；`162937` 连续性也通过，但平行货架序列仍多解，继续保留 top-K 和低置信度，绝不伪造唯一货架。
 - 手机可靠 RTAB-Map 回环现在会在开始有界 recovery 时，把当前估计位置附近最多 5 个 concrete `shelf_segment_id` 写入 `scan_events.jsonl`，多解显式标记 `ambiguous_top_k_retained`。该事件仅为诊断和后续结构消歧入口，尚未绑定局部结构快照、phone↔shelf SE(2) 或正式 localization input manifest，不能注入绝对因子，也不能据此宣称“具体货架闭环”已完成。
-- 两份真实 TianHong 会话已生成完整不可发布草稿：`162937` 保留 3663/3663 节点和 3804 条逐秒坐标，`181158` 保留 1054/1054 节点和 1128 条逐秒坐标；均有节点级/秒级 CSV 与两张路线 PNG，没有节点删除、结构内点、穿越结构线段或道路拓扑断裂。两份会话都没有价签观测，空价签不是失败。签名真机、LiDAR、现场货架 identity 真值和 exact-final-SHA 资格仍未执行。
+- 两份真实 TianHong 会话已生成完整不可发布草稿：`162937` 保留 3663/3663 节点和 3806 条逐秒坐标，`181158` 保留 1054/1054 节点和 1132 条逐秒坐标；均有节点级/秒级 CSV 与两张路线 PNG，没有节点删除、结构内点、穿越结构线段或道路拓扑断裂。两份会话都没有价签观测，空价签不是失败。签名真机、LiDAR、现场货架 identity 真值和 exact-final-SHA 资格仍未执行。
 
 ## 2026-08-14 — Gauge-neutral 自由空间道路路线恢复
 

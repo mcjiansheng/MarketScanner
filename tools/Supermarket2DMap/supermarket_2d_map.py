@@ -640,9 +640,23 @@ def extract_db_poses(db_path: Path, segment_index: int, axes: str) -> Tuple[List
         optimized_pose_blobs = extract_optimized_pose_blobs(conn)
         stamp_expr = "stamp" if "stamp" in columns else "NULL AS stamp"
         query = f"SELECT id, pose, {stamp_expr} FROM Node ORDER BY id"
-        for node_id, pose_blob, stamp in conn.execute(query):
+        node_rows = list(conn.execute(query))
+        positive_node_ids = {
+            int(node_id) for node_id, _pose_blob, _stamp in node_rows
+            if int(node_id) > 0
+        }
+        use_optimized_graph = bool(optimized_pose_blobs) and (
+            positive_node_ids <= set(optimized_pose_blobs)
+        )
+        if optimized_pose_blobs and not use_optimized_graph:
+            warnings.append(
+                "Admin.opt_poses is incomplete; refusing to mix optimized and raw pose gauges. "
+                "This map preview uses the complete Node.pose trajectory."
+            )
+        for node_id, pose_blob, stamp in node_rows:
             optimized_blob = optimized_pose_blobs.get(int(node_id))
-            parsed = parse_rtabmap_transform_3d(optimized_blob or pose_blob, axes)
+            selected_blob = optimized_blob if use_optimized_graph else pose_blob
+            parsed = parse_rtabmap_transform_3d(selected_blob, axes)
             if parsed is None:
                 continue
             x, y, height, yaw = parsed
@@ -655,10 +669,14 @@ def extract_db_poses(db_path: Path, segment_index: int, axes: str) -> Tuple[List
                     yaw=yaw,
                     stamp=float(stamp) if stamp is not None else None,
                     height=height,
-                    source="db_optimized" if optimized_blob is not None else "db",
+                    source=(
+                        "db_optimized"
+                        if use_optimized_graph and optimized_blob is not None
+                        else "db"
+                    ),
                 )
             )
-        if optimized_pose_blobs:
+        if use_optimized_graph:
             optimized_count = sum(1 for pose in poses if pose.source == "db_optimized")
             warnings.append(
                 f"Using {optimized_count} globally optimized poses from Admin.opt_poses "

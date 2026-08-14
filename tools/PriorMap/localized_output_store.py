@@ -6,6 +6,7 @@ import csv
 from datetime import datetime, timezone
 import hashlib
 import json
+import math
 import ntpath
 import os
 import re
@@ -43,11 +44,23 @@ REQUIRED_VERSION_FILES = (
     "shelf_tag_index.json",
     "audit_log.jsonl",
 )
+CALIBRATED_DELIVERABLE_FILES = (
+    "calibrated_positions_by_node.csv",
+    "calibrated_positions_1s.csv",
+    "calibrated_deliverables_manifest.json",
+)
+CURRENT_REQUIRED_VERSION_FILES = (
+    REQUIRED_VERSION_FILES + CALIBRATED_DELIVERABLE_FILES
+)
 PUBLICATION_EVIDENCE_FILES = (
     "field_evidence.json",
     "qualification_manifest.json",
 )
 PUBLISHED_VERSION_FILES = REQUIRED_VERSION_FILES + PUBLICATION_EVIDENCE_FILES
+CURRENT_PUBLISHED_VERSION_FILES = (
+    CURRENT_REQUIRED_VERSION_FILES + PUBLICATION_EVIDENCE_FILES
+)
+ALL_LOCALIZED_VERSION_FILES = frozenset(CURRENT_PUBLISHED_VERSION_FILES)
 VERSION_2_REQUIRED_VERSION_FILES = tuple(
     name for name in REQUIRED_VERSION_FILES if name != "factor_graph_report.json"
 )
@@ -103,11 +116,28 @@ SESSION_INPUT_ROLE_FILES_BY_VERSION = {
         ("tag_observation_bursts.jsonl", "tag_observation_bursts.jsonl"),
         ("localized_price_tags.json", "localized_price_tags.json"),
     ),
+    4: (
+        ("metadata", "metadata.json"),
+        ("source_database", None),
+        ("clock_correlations.jsonl", "clock_correlations.jsonl"),
+        ("localization_trace.jsonl", "localization_trace.jsonl"),
+        ("localization_constraints.jsonl", "localization_constraints.jsonl"),
+        ("localization_events.jsonl", "localization_events.jsonl"),
+        (
+            "localization_recovery_events.jsonl",
+            "localization_recovery_events.jsonl",
+        ),
+        ("manual_localization_events.jsonl", "manual_localization_events.jsonl"),
+        ("tag_observations.jsonl", "tag_observations.jsonl"),
+        ("tag_observation_bursts.jsonl", "tag_observation_bursts.jsonl"),
+        ("localized_price_tags.json", "localized_price_tags.json"),
+    ),
 }
 RECOVERY_EVIDENCE_BINDING_BY_SESSION_VERSION = {
     1: RECOVERY_EVIDENCE_UNBOUND_LEGACY,
     2: RECOVERY_EVIDENCE_BOUND_V2,
     3: RECOVERY_EVIDENCE_BOUND_V2,
+    4: RECOVERY_EVIDENCE_BOUND_V2,
 }
 _CANONICAL_SESSION_SIDECAR_FILES = frozenset(
     file_name
@@ -178,7 +208,7 @@ def _safe_session_input_basename(value: Any) -> bool:
 def validate_session_input_manifest_contract(
     payload: Any,
 ) -> dict[str, Any]:
-    """Validate one canonical v1/v2/v3 finalized-session manifest.
+    """Validate one canonical v1/v2/v3/v4 finalized-session manifest.
 
     The returned fields are safe to use for cross-artifact binding.  In
     particular, version is a strict JSON integer (Bool, float and string are
@@ -709,9 +739,16 @@ class LocalizedVersionStore:
         publication_files_present = bool(
             set(actual_files) & set(PUBLICATION_EVIDENCE_FILES)
         )
+        calibrated_files_present = bool(
+            set(actual_files) & set(CALIBRATED_DELIVERABLE_FILES)
+        )
         version_files = (
-            PUBLISHED_VERSION_FILES
+            CURRENT_PUBLISHED_VERSION_FILES
+            if publication_files_present and calibrated_files_present
+            else PUBLISHED_VERSION_FILES
             if publication_files_present
+            else CURRENT_REQUIRED_VERSION_FILES
+            if calibrated_files_present
             else REQUIRED_VERSION_FILES
         )
         missing = sorted(set(version_files) - set(actual_files))
@@ -758,6 +795,11 @@ class LocalizedVersionStore:
             "manual_edits.json": ("MarketScannerManualEdits", 4),
             "shelf_tag_index.json": ("MarketScannerShelfTagIndex", 1),
         }
+        if calibrated_files_present:
+            expected_contracts["calibrated_deliverables_manifest.json"] = (
+                "MarketScannerCalibratedDeliverablesManifest",
+                1,
+            )
         if publication_files_present:
             expected_contracts.update(
                 {
@@ -837,12 +879,66 @@ class LocalizedVersionStore:
             csv_count = len(csv_ids)
         if csv_count != len(tags) or csv_ids != tag_ids:
             raise LocalizedStoreError("Localized tag CSV does not match tag JSON order.")
+        if calibrated_files_present:
+            self._validate_calibrated_deliverables(
+                staging,
+                parsed["calibrated_deliverables_manifest.json"],
+                tags=tags,
+                tag_ids=tag_ids,
+            )
         report = parsed["localization_report.json"]
         factor_graph = parsed["factor_graph_report.json"]
         source = parsed["source_manifest.json"]
         processing = parsed["processing_manifest.json"]
         session_input = parsed["session_input_manifest.json"]
         journal = parsed["manual_edits.json"]
+        if calibrated_files_present:
+            deliverables = parsed["calibrated_deliverables_manifest.json"]
+            delivery_identity_checks = {
+                "input_identity_id": report.get("input_identity_id"),
+                "session_input_bundle_sha256": report.get(
+                    "session_input_bundle_sha256"
+                ),
+                "source_database_sha256": report.get(
+                    "source_database_sha256"
+                ),
+                "optimized_database_sha256": report.get(
+                    "optimized_database_sha256"
+                ),
+                "prior_map_id": report.get("prior_map_id"),
+                "prior_map_package_sha256": report.get("prior_map_sha256"),
+                "canonical_source_sha256": (
+                    report.get("prior_map_identity_binding") or {}
+                ).get("canonical_source_sha256"),
+            }
+            if any(
+                deliverables.get(name) != expected
+                for name, expected in delivery_identity_checks.items()
+            ):
+                raise LocalizedStoreError(
+                    "Calibrated deliverables identity differs from localization report."
+                )
+            report_counts = {
+                "source_node_count": report.get("source_node_count"),
+                "source_tag_count": report.get("tag_source_record_count"),
+                "retained_tag_count": report.get("tag_retained_count"),
+                "positioned_tag_count": report.get("tag_positioned_count"),
+                "unpositioned_tag_count": report.get("tag_unpositioned_count"),
+                "shelf_associated_tag_count": report.get(
+                    "tag_shelf_associated_count"
+                ),
+                "unassociated_tag_count": report.get("tag_unassociated_count"),
+                "low_confidence_tag_count": report.get(
+                    "tag_low_confidence_count"
+                ),
+            }
+            if any(
+                deliverables.get(name) != expected
+                for name, expected in report_counts.items()
+            ):
+                raise LocalizedStoreError(
+                    "Calibrated deliverables counts differ from localization report."
+                )
         try:
             session_contract = validate_session_input_manifest_contract(
                 session_input
@@ -1010,7 +1106,15 @@ class LocalizedVersionStore:
         ]
         return {
             "format": "MarketScannerLocalizedVersionManifest",
-            "version": 4 if publication_files_present else 3,
+            "version": (
+                6
+                if publication_files_present and calibrated_files_present
+                else 4
+                if publication_files_present
+                else 5
+                if calibrated_files_present
+                else 3
+            ),
             "state": state,
             "revision": revision,
             "parent_version": parent_version,
@@ -1019,6 +1123,214 @@ class LocalizedVersionStore:
             **identity_fields,
             "files": files,
         }
+
+    @staticmethod
+    def _validate_calibrated_deliverables(
+        staging: Path,
+        manifest: dict[str, Any],
+        *,
+        tags: list[dict[str, Any]],
+        tag_ids: list[str],
+    ) -> None:
+        required_keys = {
+            "format", "version", "input_identity_id",
+            "session_input_bundle_sha256", "source_database_sha256",
+            "optimized_database_sha256", "prior_map_id",
+            "prior_map_package_sha256", "canonical_source_sha256",
+            "coordinate_contract_version", "source_node_count",
+            "exported_node_count", "one_second_row_count",
+            "one_second_unavailable_count", "clock_unavailable_node_count",
+            "source_tag_count", "retained_tag_count", "positioned_tag_count",
+            "unpositioned_tag_count", "shelf_associated_tag_count",
+            "unassociated_tag_count", "low_confidence_tag_count",
+            "result_quality_status", "publish_permitted",
+            "algorithm_degradation_codes", "files",
+        }
+        if set(manifest) != required_keys:
+            raise LocalizedStoreError(
+                "Calibrated deliverables manifest key set is invalid."
+            )
+        hashes = (
+            "input_identity_id", "session_input_bundle_sha256",
+            "source_database_sha256", "optimized_database_sha256",
+            "prior_map_package_sha256", "canonical_source_sha256",
+        )
+        if any(
+            not isinstance(manifest.get(name), str)
+            or re.fullmatch(r"[0-9a-f]{64}", manifest[name]) is None
+            for name in hashes
+        ):
+            raise LocalizedStoreError(
+                "Calibrated deliverables identity is invalid."
+            )
+        count_names = (
+            "source_node_count", "exported_node_count", "one_second_row_count",
+            "one_second_unavailable_count", "clock_unavailable_node_count",
+            "source_tag_count", "retained_tag_count", "positioned_tag_count",
+            "unpositioned_tag_count", "shelf_associated_tag_count",
+            "unassociated_tag_count", "low_confidence_tag_count",
+        )
+        if any(
+            isinstance(manifest.get(name), bool)
+            or not isinstance(manifest.get(name), int)
+            or manifest[name] < 0
+            for name in count_names
+        ):
+            raise LocalizedStoreError(
+                "Calibrated deliverables count is invalid."
+            )
+        if (
+            manifest["source_node_count"] != manifest["exported_node_count"]
+            or manifest["source_tag_count"] != manifest["retained_tag_count"]
+            or manifest["retained_tag_count"] != len(tags)
+            or manifest["positioned_tag_count"]
+            + manifest["unpositioned_tag_count"]
+            != len(tags)
+            or manifest["shelf_associated_tag_count"]
+            + manifest["unassociated_tag_count"]
+            != len(tags)
+            or manifest["low_confidence_tag_count"] > len(tags)
+        ):
+            raise LocalizedStoreError(
+                "Calibrated deliverables inventory is incomplete."
+            )
+        expected_files = {
+            "calibrated_positions_by_node.csv",
+            "calibrated_positions_1s.csv",
+            "localized_price_tags.json",
+            "localized_price_tags.csv",
+        }
+        entries = manifest.get("files")
+        if not isinstance(entries, list) or len(entries) != len(expected_files):
+            raise LocalizedStoreError(
+                "Calibrated deliverables file inventory is invalid."
+            )
+        by_name: dict[str, dict[str, Any]] = {}
+        for entry in entries:
+            if (
+                not isinstance(entry, dict)
+                or set(entry) != {"file", "bytes", "sha256", "row_count"}
+                or entry.get("file") in by_name
+            ):
+                raise LocalizedStoreError(
+                    "Calibrated deliverables file entry is invalid."
+                )
+            by_name[str(entry["file"])] = entry
+        if set(by_name) != expected_files:
+            raise LocalizedStoreError(
+                "Calibrated deliverables file set is invalid."
+            )
+        for name, entry in by_name.items():
+            path = staging / name
+            if (
+                not path.is_file()
+                or isinstance(entry.get("bytes"), bool)
+                or not isinstance(entry.get("bytes"), int)
+                or entry["bytes"] != path.stat().st_size
+                or not isinstance(entry.get("row_count"), int)
+                or entry["row_count"] < 0
+                or not isinstance(entry.get("sha256"), str)
+                or entry["sha256"] != _sha256(path)
+            ):
+                raise LocalizedStoreError(
+                    f"Calibrated deliverable identity mismatch: {name}"
+                )
+        with (staging / "calibrated_positions_by_node.csv").open(
+            "r", encoding="utf-8", newline=""
+        ) as handle:
+            node_rows = list(csv.DictReader(handle))
+        node_ids = [row.get("node_id") for row in node_rows]
+        try:
+            parsed_node_ids = [int(value) for value in node_ids]
+        except (TypeError, ValueError) as exc:
+            raise LocalizedStoreError(
+                "Calibrated node table IDs are invalid."
+            ) from exc
+        if (
+            len(node_rows) != manifest["exported_node_count"]
+            or len(set(parsed_node_ids)) != len(parsed_node_ids)
+            or any(value <= 0 for value in parsed_node_ids)
+        ):
+            raise LocalizedStoreError(
+                "Calibrated node table IDs or count are invalid."
+            )
+        for row in node_rows:
+            if (
+                row.get("prior_map_id") != manifest["prior_map_id"]
+                or row.get("canonical_source_sha256")
+                != manifest["canonical_source_sha256"]
+                or row.get("prior_map_package_sha256")
+                != manifest["prior_map_package_sha256"]
+                or row.get("input_identity_id") != manifest["input_identity_id"]
+            ):
+                raise LocalizedStoreError(
+                    "Calibrated node table map identity differs."
+                )
+            for field in ("x_m", "y_m", "yaw_rad"):
+                try:
+                    value = float(row[field])
+                except (KeyError, TypeError, ValueError) as exc:
+                    raise LocalizedStoreError(
+                        "Calibrated node table coordinate is invalid."
+                    ) from exc
+                if not math.isfinite(value):
+                    raise LocalizedStoreError(
+                        "Calibrated node table coordinate is non-finite."
+                    )
+        with (staging / "calibrated_positions_1s.csv").open(
+            "r", encoding="utf-8", newline=""
+        ) as handle:
+            second_rows = list(csv.DictReader(handle))
+        if len(second_rows) != manifest["one_second_row_count"]:
+            raise LocalizedStoreError(
+                "Calibrated one-second table count is invalid."
+            )
+        unavailable_count = 0
+        for row in second_rows:
+            status = row.get("position_status")
+            if status not in {"AVAILABLE", "LOW_CONFIDENCE", "UNAVAILABLE"}:
+                raise LocalizedStoreError(
+                    "Calibrated one-second position status is invalid."
+                )
+            available = status != "UNAVAILABLE"
+            if not available:
+                unavailable_count += 1
+            coordinate_values = [row.get(name) for name in ("x_m", "y_m", "yaw_rad")]
+            if available != all(value not in {None, ""} for value in coordinate_values):
+                raise LocalizedStoreError(
+                    "Calibrated one-second position status is inconsistent."
+                )
+            if available and any(
+                not math.isfinite(float(value)) for value in coordinate_values
+            ):
+                raise LocalizedStoreError(
+                    "Calibrated one-second coordinate is non-finite."
+                )
+            if not available and not row.get("position_degradation_code"):
+                raise LocalizedStoreError(
+                    "Unavailable calibrated second has no degradation reason."
+                )
+        if unavailable_count != manifest["one_second_unavailable_count"]:
+            raise LocalizedStoreError(
+                "Calibrated one-second unavailable count differs from manifest."
+            )
+        expected_row_counts = {
+            "calibrated_positions_by_node.csv": len(node_rows),
+            "calibrated_positions_1s.csv": len(second_rows),
+            "localized_price_tags.json": len(tag_ids),
+            "localized_price_tags.csv": len(tag_ids),
+        }
+        if any(
+            by_name[name]["row_count"] != count
+            for name, count in expected_row_counts.items()
+        ):
+            raise LocalizedStoreError(
+                "Calibrated deliverable row count differs from its artifact."
+            )
+        if by_name["localized_price_tags.json"]["row_count"] != len(tag_ids):
+            raise LocalizedStoreError(
+                "Calibrated tag manifest count differs from tag identities."
+            )
 
     def commit(
         self,
@@ -1315,13 +1627,27 @@ class LocalizedVersionStore:
                 (source.version_dir / name).is_file()
                 for name in PUBLICATION_EVIDENCE_FILES
             )
-            source_artifacts = self.read_verified_artifacts(
-                source,
-                (
+            source_manifest = json.loads(
+                (source.version_dir / "version_manifest.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            source_manifest_version = int(source_manifest["version"])
+            if source_manifest_version in {5, 6}:
+                inherited_files = (
+                    CURRENT_PUBLISHED_VERSION_FILES
+                    if source_has_publication_evidence
+                    else CURRENT_REQUIRED_VERSION_FILES
+                )
+            else:
+                inherited_files = (
                     PUBLISHED_VERSION_FILES
                     if source_has_publication_evidence
                     else REQUIRED_VERSION_FILES
-                ),
+                )
+            source_artifacts = self.read_verified_artifacts(
+                source,
+                inherited_files,
             )
             for name, content in source_artifacts.items():
                 (staging / name).write_bytes(content)
@@ -1603,7 +1929,7 @@ class LocalizedVersionStore:
         requested = tuple(names)
         if not requested or len(set(requested)) != len(requested):
             raise LocalizedStoreError("Localized artifact batch is invalid.")
-        if any(name not in PUBLISHED_VERSION_FILES for name in requested):
+        if any(name not in ALL_LOCALIZED_VERSION_FILES for name in requested):
             raise LocalizedStoreError("Localized artifact name is invalid.")
         verified = self.resolve_version(snapshot.version_id)
         if verified != snapshot:
@@ -1744,7 +2070,7 @@ class LocalizedVersionStore:
             ) from exc
         if (
             manifest.get("format") != "MarketScannerLocalizedVersionManifest"
-            or manifest.get("version") not in {1, 2, 3, 4}
+            or manifest.get("version") not in {1, 2, 3, 4, 5, 6}
             or manifest.get("version_id") != version_id
             or state not in VERSION_STATES
             or revision < 1
@@ -1754,7 +2080,11 @@ class LocalizedVersionStore:
             )
         manifest_version = int(manifest["version"])
         expected_files = (
-            PUBLISHED_VERSION_FILES
+            CURRENT_PUBLISHED_VERSION_FILES
+            if manifest_version == 6
+            else CURRENT_REQUIRED_VERSION_FILES
+            if manifest_version == 5
+            else PUBLISHED_VERSION_FILES
             if manifest_version == 4
             else REQUIRED_VERSION_FILES
             if manifest_version == 3
@@ -1764,7 +2094,7 @@ class LocalizedVersionStore:
         )
         input_identity_id: str | None = None
         session_input_bundle_sha256: str | None = None
-        if manifest_version in {2, 3, 4}:
+        if manifest_version in {2, 3, 4, 5, 6}:
             input_identity_id = manifest.get("input_identity_id")
             session_input_bundle_sha256 = manifest.get(
                 "session_input_bundle_sha256"

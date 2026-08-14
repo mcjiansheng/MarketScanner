@@ -1,6 +1,10 @@
 # 地图辅助定位实现状态
 
-> 文档状态：**当前有效**。最后核对日期：2026-08-10。
+> 文档状态：**当前有效**。最后核对日期：2026-08-14。
+
+2026-08-14 当前成果合同已从“质量门失败即没有结果”改为“先生成不可变业务成果，再独立判断发布资格”。PC 与手机都必须保留所有身份明确的源节点和 durable 价签业务记录；低置信度、部分优化图、局部时钟绑定缺口、平行通道多解、距离尺度偏差或货架关联不足只产生 `LOW_CONFIDENCE` / `PARTIAL_REVIEW_REQUIRED` 和 publish blocker。只有数据库/JSON framing 损坏、地图/会话身份串包、hash/watermark/CAS 不一致、重复 durable 主键导致身份不可界定、完全没有有限轨迹或无法安全原子提交时才允许终止。
+
+当前不可变 localized version v5 内直接包含 `calibrated_positions_by_node.csv`、`calibrated_positions_1s.csv`、`localized_price_tags.json`、`localized_price_tags.csv` 和 `calibrated_deliverables_manifest.json`；正式发布版本为 v6。session input manifest v4 已绑定 `clock_correlations.jsonl`，秒级表携带 `clock_segment_index` 并禁止跨系统时钟/时区 discontinuity 插值。局部 binding 过滤后不足两条时不再终止：手机和 PC 保留 correlation 时间范围内的全部秒级行并将位置标为 `UNAVAILABLE`，同时继续提交节点坐标和价签；无权威 clock evidence 的历史 node stamp 不会冒充 UTC。正式 concrete shelf-loop 因子仍未完成，未来证据合同必须使用 session input manifest v5。
 
 当前全手机发布目标已收敛为一条生产流程：首页大型入口和菜单入口先进入轻量地图选择页；用户可选择已注册地图或直接导入新地图，只有明确选定后才进入统一扫描配置页并完整校验/加载该包。手机编译 XLSX/CSV/JSON 与 PC 正式 v2 地图包都安装到同一个 `MobileMapLibrary`，再复用同一个楼层/起点/朝向页面、Coordinator 和真实扫描 host。配置页以 required initializer 接收 immutable `selectedMap`，不再持有地图 picker 或自行列举/自动加载第一张地图。旧向导不再从生产 UI 可达，自由扫描和原始数据录制只保留在“实验与兼容工具”。地图库普通进入使用轻量 registry，完整包读取、provider snapshot/copy、localizer 构造、会话目录和 native SQLite 初始化均在后台队列；主线程只保留短 UIKit/ARSession 事务。MapCase02 单次完整包校验约 9.36 秒的证据解释了原 3–9 秒冻结，当前实现不再在进入/返回路径同步重复该工作。
 
@@ -102,19 +106,20 @@ P7 已实现 loopback-only server、每次启动随机且不落盘的 token、PO
 | 能力 | 状态 | 代码/证据 |
 | --- | --- | --- |
 | RTAB-Map 重处理前置和源库只读 | 已实现 | `run_localized_map` 强制 `rtabmap-reprocess`；前后 SHA‑256 一致 |
-| 图不完整时的 raw VIO 诊断恢复 | 已实现（不可发布） | 完整有限/time-ordered Node.pose 可用 initialMapPose 保留；坐标 epoch reset 仅在多条独立短 Link 唯一一致时缝合，输出完整审计且不修改源库 |
+| 图不完整时的连续轨迹诊断恢复 | 已实现（不可发布） | 完整有限/time-ordered Node.pose 可用 initialMapPose 保留；坐标 epoch reset 仅在多条独立短 Link 唯一一致时缝合；部分 `Admin.opt_poses` 以全量连续 VIO 为骨架传播已优化 SE(2) 校正，禁止逐节点混合 gauge；输出完整审计且不修改源库 |
 | 先验地图派生修正 | 已修复并完成 Sam 只读回归 | 精确 `ios_prior` 契约；reciprocal canonical 折叠；native RTAB-Map/g2o 完整相对 SE(2) 因子图 4,442 节点收敛，最大修正 2.9638 m；仍是诊断 draft |
 | 在线/道路/人工约束与拒绝审计 | 已实现 | 在线结构约束、道路区域/方向低权重软约束、accepted/rejected residual、禁用约束、人工锚点 |
 | 通道切换审计 | 已实现 | 最终轨迹几何投影输出进入/离开时间、候选 margin、方向、weak/lost overlap、人工 assignment 和可能静默切换 |
-| 标签离线重算和结构关联 | 已实现（保守门控） | observation→真实 node/frame time 绑定、raw 位置 SE(2) 传播、独立次候选/遮挡/侧面/边长校验；失败进入 review 或阻断 current |
-| Sidecar 输入契约 | 已实现 | 每类 required/optional、format/version、严格 UTF‑8/JSON、身份/时间/业务 schema/大小/唯一 ID；legacy manual 仅审计；tag/observation 内容交叉验证；损坏 fail closed |
+| 标签离线重算和结构关联 | 已实现（结果保留、发布从严） | observation→exact node/frame time 绑定、raw 位置 SE(2) 传播、独立次候选/遮挡/侧面/边长校验；普通证据不足保留 `LOW_CONFIDENCE`，durable burst 漏写 final tag 时补一条空位置业务记录，source/retained 严格核账 |
+| Sidecar 输入契约 | 已实现 | manifest v1/v2/v3/v4；v4 绑定严格时钟证据；每类 required/optional、format/version、严格 UTF‑8/JSON、身份/时间/业务 schema/大小/全局 durable ID；legacy manual 仅审计；tag/observation/burst 内容交叉验证；不可界定损坏 fail closed |
+| 秒级本地时间位置表 | 已实现 | correlation/node binding 交叉验证 node/frame/UTC/timezone/offset；`clock_segment_index`；同段插值，跨系统时钟/时区 discontinuity 保留 `UNAVAILABLE` 空坐标行，不使用处理机时区伪造 |
 | 节点覆盖审计 | 已实现 | 只读查询 source/optimized SQLite Node，和导出 node ID 三方比较缺失、额外、重复、非单调 stamp 与首尾时间；metadata 仅交叉检查 |
 | 导出隐私与本机恢复 | 已实现 | version 内 `session_input_manifest.json`/input identity 绑定全部输入字节；绝对路径按 identity 隔离在不导出的 `localized/local_inputs/`，重放前验证 version、身份和当前输入 hash |
-| 不可变成果事务 | 已实现 | POSIX/Windows 跨进程锁内 staging→完整文件/hash 校验→`versions/vNNNNNN`→单指针提交；Windows write-through move、版本/指针 durability 故障注入；读取与已打开 fd 复核 hash；损坏状态拒绝降级 |
+| 不可变成果事务 | 已实现 | v5 draft/review 将节点级 CSV、秒级 CSV、全量价签 JSON/CSV 和 deliverables manifest 纳入 exact file/hash tree；v6 publication 再纳入现场证据；POSIX/Windows 跨进程锁内 staging→完整校验→单指针提交，读取与已打开 fd 复核 hash |
 | 质量报告和状态机 | 已实现（仍受现场发布门约束） | draft/review/published/revoked 事务框架和门禁；完整相对 SE(2) helper 报告通过严格能力校验后才允许进入发布判断 |
 | 人工编辑重放/撤销/重做 | 已实现 | manual_edits v4 与 input identity、强制 version/revision CAS、HTTP 409、服务端 old value/UTC/ID、字段/范围/地图校验、undo/redo audit |
 | PC 非专业向导 | 已实现 | 地图+会话选择、一键处理、三轨迹/价签联动画布、状态/货架筛选；轨迹锚点可直接点选/拖动并自动生成 node/time/JSON |
-| 确定性 E2E fixture | 已实现 | 源库不变、漂移降低、错误约束拒绝、事务/输入变更故障、双线程客户端同基准 CAS 冲突、409、发布硬门、严格 sidecar/capture-health 负例 |
+| 确定性 E2E fixture | 已实现 | 源库不变、漂移降低、错误约束拒绝、部分图全节点恢复、时钟分段不跨段插值、durable burst/tag 一对一保留、事务/输入变更故障、CAS 冲突、发布硬门和严格 sidecar 负例；当前 PriorMap 314/314、Map Studio 130/130、Qualification 30/30 |
 | 正式现场验收 | 未执行 | 只完成 `FIELD_TEST_PLAN.md`；不能用模拟或构建替代 |
 
 操作流程、弱/丢失定位、人工复核、备份和失败恢复见 `USER_GUIDE.md`。

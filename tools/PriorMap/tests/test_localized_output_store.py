@@ -24,6 +24,7 @@ from tools.PriorMap.localized_file_lock import (
     select_file_lock_backend,
 )
 from tools.PriorMap.localized_output_store import (
+    CURRENT_REQUIRED_VERSION_FILES,
     LocalizedStoreError,
     LocalizedVersionStore,
     REQUIRED_VERSION_FILES,
@@ -746,6 +747,294 @@ class LocalizedVersionStoreTests(unittest.TestCase):
             {path.name for path in staging.iterdir()},
         )
         return staging
+
+    def write_valid_current_staging(self, *, revision: int = 1) -> Path:
+        staging = self.write_valid_staging(revision=revision)
+        prior_map_id = "prior-test"
+        prior_map_package_sha = self.identity_hashes["prior_map_sha256"]
+        canonical_source_sha = "a" * 64
+        report_path = staging / "localization_report.json"
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+        report.update(
+            {
+                "input_identity_id": self.input_identity_id,
+                "session_input_bundle_sha256": self.identity_hashes[
+                    "session_input_bundle_sha256"
+                ],
+                "source_database_sha256": self.identity_hashes[
+                    "source_database_sha256"
+                ],
+                "optimized_database_sha256": self.identity_hashes[
+                    "optimized_database_sha256"
+                ],
+                "prior_map_id": prior_map_id,
+                "prior_map_sha256": prior_map_package_sha,
+                "prior_map_identity_binding": {
+                    "canonical_source_sha256": canonical_source_sha
+                },
+                "source_node_count": 2,
+                "tag_source_record_count": 0,
+                "tag_retained_count": 0,
+                "tag_positioned_count": 0,
+                "tag_unpositioned_count": 0,
+                "tag_shelf_associated_count": 0,
+                "tag_unassociated_count": 0,
+                "tag_low_confidence_count": 0,
+            }
+        )
+        report_path.write_text(json.dumps(report) + "\n", encoding="utf-8")
+        node_fieldnames = [
+            "node_id", "x_m", "y_m", "yaw_rad", "prior_map_id",
+            "prior_map_package_sha256", "canonical_source_sha256",
+            "input_identity_id",
+        ]
+        with (staging / "calibrated_positions_by_node.csv").open(
+            "w", encoding="utf-8", newline=""
+        ) as handle:
+            writer = csv.DictWriter(handle, fieldnames=node_fieldnames)
+            writer.writeheader()
+            for node_id, x_m in ((1, 0.0), (2, 1.0)):
+                writer.writerow(
+                    {
+                        "node_id": node_id,
+                        "x_m": x_m,
+                        "y_m": 0.0,
+                        "yaw_rad": 0.0,
+                        "prior_map_id": prior_map_id,
+                        "prior_map_package_sha256": prior_map_package_sha,
+                        "canonical_source_sha256": canonical_source_sha,
+                        "input_identity_id": self.input_identity_id,
+                    }
+                )
+        second_fieldnames = [
+            "timestamp_unix_s", "x_m", "y_m", "yaw_rad", "position_status",
+            "position_degradation_code",
+        ]
+        with (staging / "calibrated_positions_1s.csv").open(
+            "w", encoding="utf-8", newline=""
+        ) as handle:
+            writer = csv.DictWriter(handle, fieldnames=second_fieldnames)
+            writer.writeheader()
+            writer.writerow(
+                {
+                    "timestamp_unix_s": 1_700_000_000,
+                    "x_m": 0.0,
+                    "y_m": 0.0,
+                    "yaw_rad": 0.0,
+                    "position_status": "LOW_CONFIDENCE",
+                    "position_degradation_code": "",
+                }
+            )
+            writer.writerow(
+                {
+                    "timestamp_unix_s": 1_700_000_001,
+                    "x_m": "",
+                    "y_m": "",
+                    "yaw_rad": "",
+                    "position_status": "UNAVAILABLE",
+                    "position_degradation_code": "synthetic_gap",
+                }
+            )
+        def file_entry(name: str, row_count: int) -> dict[str, object]:
+            path = staging / name
+            return {
+                "file": name,
+                "bytes": path.stat().st_size,
+                "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                "row_count": row_count,
+            }
+        manifest = {
+            "format": "MarketScannerCalibratedDeliverablesManifest",
+            "version": 1,
+            "input_identity_id": self.input_identity_id,
+            "session_input_bundle_sha256": self.identity_hashes[
+                "session_input_bundle_sha256"
+            ],
+            "source_database_sha256": self.identity_hashes[
+                "source_database_sha256"
+            ],
+            "optimized_database_sha256": self.identity_hashes[
+                "optimized_database_sha256"
+            ],
+            "prior_map_id": prior_map_id,
+            "prior_map_package_sha256": prior_map_package_sha,
+            "canonical_source_sha256": canonical_source_sha,
+            "coordinate_contract_version": 1,
+            "source_node_count": 2,
+            "exported_node_count": 2,
+            "one_second_row_count": 2,
+            "one_second_unavailable_count": 1,
+            "clock_unavailable_node_count": 0,
+            "source_tag_count": 0,
+            "retained_tag_count": 0,
+            "positioned_tag_count": 0,
+            "unpositioned_tag_count": 0,
+            "shelf_associated_tag_count": 0,
+            "unassociated_tag_count": 0,
+            "low_confidence_tag_count": 0,
+            "result_quality_status": "PARTIAL_REVIEW_REQUIRED",
+            "publish_permitted": False,
+            "algorithm_degradation_codes": ["synthetic_low_confidence"],
+            "files": [
+                file_entry("calibrated_positions_by_node.csv", 2),
+                file_entry("calibrated_positions_1s.csv", 2),
+                file_entry("localized_price_tags.json", 0),
+                file_entry("localized_price_tags.csv", 0),
+            ],
+        }
+        (staging / "calibrated_deliverables_manifest.json").write_text(
+            json.dumps(manifest, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        self.assertEqual(
+            set(CURRENT_REQUIRED_VERSION_FILES),
+            {path.name for path in staging.iterdir()},
+        )
+        return staging
+
+    def test_current_v5_core_tables_are_required_and_tamper_evident(self) -> None:
+        staging = self.write_valid_current_staging()
+        manifest = self.store.validate_staging(staging, parent_version=None)
+        self.assertEqual(manifest["version"], 5)
+        self.store.abort(staging)
+
+        tampered = self.write_valid_current_staging(revision=2)
+        with (tampered / "calibrated_positions_by_node.csv").open(
+            "a", encoding="utf-8"
+        ) as handle:
+            handle.write("3,2,0,0,prior-test," + "d" * 64 + "," + "a" * 64 + "," + self.input_identity_id + "\n")
+        with self.assertRaisesRegex(
+            LocalizedStoreError, "Calibrated deliverable identity mismatch"
+        ):
+            self.store.validate_staging(tampered, parent_version=None)
+        self.store.abort(tampered)
+
+    def test_current_v5_rejects_missing_source_node_or_tag_inventory(self) -> None:
+        staging = self.write_valid_current_staging()
+        path = staging / "calibrated_deliverables_manifest.json"
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["exported_node_count"] = 1
+        path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+        with self.assertRaisesRegex(
+            LocalizedStoreError, "inventory is incomplete"
+        ):
+            self.store.validate_staging(staging, parent_version=None)
+        self.store.abort(staging)
+
+    def test_current_v5_rejects_duplicate_node_nonfinite_and_gap_count_drift(self) -> None:
+        duplicate = self.write_valid_current_staging()
+        node_path = duplicate / "calibrated_positions_by_node.csv"
+        with node_path.open(encoding="utf-8", newline="") as handle:
+            rows = list(csv.DictReader(handle))
+        rows[1]["node_id"] = rows[0]["node_id"]
+        with node_path.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
+            writer.writeheader()
+            writer.writerows(rows)
+        manifest_path = duplicate / "calibrated_deliverables_manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        entry = next(
+            item for item in manifest["files"]
+            if item["file"] == "calibrated_positions_by_node.csv"
+        )
+        entry["bytes"] = node_path.stat().st_size
+        entry["sha256"] = hashlib.sha256(node_path.read_bytes()).hexdigest()
+        manifest_path.write_text(json.dumps(manifest) + "\n", encoding="utf-8")
+        with self.assertRaisesRegex(
+            LocalizedStoreError, "node table IDs"
+        ):
+            self.store.validate_staging(duplicate, parent_version=None)
+        self.store.abort(duplicate)
+
+        nonfinite = self.write_valid_current_staging(revision=2)
+        node_path = nonfinite / "calibrated_positions_by_node.csv"
+        with node_path.open(encoding="utf-8", newline="") as handle:
+            rows = list(csv.DictReader(handle))
+        rows[0]["x_m"] = "nan"
+        with node_path.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
+            writer.writeheader()
+            writer.writerows(rows)
+        manifest_path = nonfinite / "calibrated_deliverables_manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        entry = next(
+            item for item in manifest["files"]
+            if item["file"] == "calibrated_positions_by_node.csv"
+        )
+        entry["bytes"] = node_path.stat().st_size
+        entry["sha256"] = hashlib.sha256(node_path.read_bytes()).hexdigest()
+        manifest_path.write_text(json.dumps(manifest) + "\n", encoding="utf-8")
+        with self.assertRaisesRegex(
+            LocalizedStoreError, "non-finite"
+        ):
+            self.store.validate_staging(nonfinite, parent_version=None)
+        self.store.abort(nonfinite)
+
+        gap_count = self.write_valid_current_staging(revision=3)
+        manifest_path = gap_count / "calibrated_deliverables_manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["one_second_unavailable_count"] = 0
+        manifest_path.write_text(json.dumps(manifest) + "\n", encoding="utf-8")
+        with self.assertRaisesRegex(
+            LocalizedStoreError, "unavailable count"
+        ):
+            self.store.validate_staging(gap_count, parent_version=None)
+        self.store.abort(gap_count)
+
+    def test_current_v5_rejects_tag_artifact_row_count_drift(self) -> None:
+        staging = self.write_valid_current_staging()
+        manifest_path = staging / "calibrated_deliverables_manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        entry = next(
+            item for item in manifest["files"]
+            if item["file"] == "localized_price_tags.csv"
+        )
+        entry["row_count"] = 1
+        manifest_path.write_text(json.dumps(manifest) + "\n", encoding="utf-8")
+        with self.assertRaisesRegex(
+            LocalizedStoreError, "row count differs"
+        ):
+            self.store.validate_staging(staging, parent_version=None)
+        self.store.abort(staging)
+
+    def test_current_v5_review_transition_preserves_core_calibrated_files(self) -> None:
+        staging = self.write_valid_current_staging()
+        manifest = self.store.validate_staging(staging, parent_version=None)
+        draft = self.store.commit(
+            staging,
+            manifest,
+            update_current=True,
+            local_input_record=self.local_input_record,
+        )
+        self.assertEqual(
+            json.loads(
+                (draft.version_dir / "version_manifest.json").read_text()
+            )["version"],
+            5,
+        )
+        expected = {
+            name: (draft.version_dir / name).read_bytes()
+            for name in (
+                "calibrated_positions_by_node.csv",
+                "calibrated_positions_1s.csv",
+                "calibrated_deliverables_manifest.json",
+            )
+        }
+        review = self.store.transition_current(
+            "review", actor="reviewer", reason="retain calibrated tables"
+        )
+        self.assertEqual(
+            json.loads(
+                (review.version_dir / "version_manifest.json").read_text()
+            )["version"],
+            5,
+        )
+        self.assertEqual(
+            {
+                name: (review.version_dir / name).read_bytes()
+                for name in expected
+            },
+            expected,
+        )
 
     def test_prior_map_manifest_accepts_frozen_v1_and_formal_v2_only(self) -> None:
         legacy = self.write_valid_staging()

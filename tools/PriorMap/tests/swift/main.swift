@@ -3574,10 +3574,12 @@ if CommandLine.arguments.count == 2,
             floorID: floorID,
             graphQualityPassed: true,
             rawNodePoses: [1: .identity],
-            minimumAssociationMarginM: 0.5)
+            minimumAssociationMarginM: 0.5,
+            sourceBursts: bursts.bursts)
         require(
-            finalized.0.count == 1 && finalized.1.isEmpty,
-            "200k full tag pipeline must fuse one accepted physical tag")
+            finalized.0.count == burstCount && finalized.1.isEmpty
+                && finalized.0.allSatisfy { $0.qualityStatus == "ACCEPTED" },
+            "200k full tag pipeline must retain exactly one accepted row per durable burst")
         var usage = rusage()
         require(getrusage(RUSAGE_SELF, &usage) == 0, "tag scale getrusage failed")
         let inputBytes = try regularFileBytes(in: directory)
@@ -10293,6 +10295,28 @@ do {
             && localSelection.rows.allSatisfy { $0.componentID == 7 }
             && !localSelection.coordinatesArePriorMapFrame,
         "local diagnostic selection must retain one deterministic primary component")
+
+    let clockUnavailableRows = FinalTrajectory.resample(
+        input: FinalTrajectory.Input(
+            nodes: [
+                .init(id: 1, monotonicSeconds: 0, xM: 0, yM: 0,
+                      yawRad: 0, uncertaintyM: 0.1, floorID: "1"),
+                .init(id: 2, monotonicSeconds: 2, xM: 2, yM: 0,
+                      yawRad: 0, uncertaintyM: 0.1, floorID: "1"),
+            ],
+            lostIntervals: [],
+            sessionStartUTC: 1_785_762_300,
+            sessionEndUTC: 1_785_762_302),
+        utcMapper: MonotonicUTCMapper(samples: [], discontinuityEdges: []),
+        storeID: "s1", priorMapID: "m", priorMapSha256: "a",
+        trackingSessionID: "s", appGitSHA: "g")
+    require(
+        clockUnavailableRows.count == 3
+            && clockUnavailableRows.allSatisfy {
+                $0.positionStatus == "UNAVAILABLE"
+                    && $0.mapXM == nil && $0.mapYM == nil
+            },
+        "insufficient clock binding coverage must retain every session second as UNAVAILABLE")
 }
 catch {
     require(false, "partial-result coordinate contract failed: \(error)")
@@ -14382,7 +14406,7 @@ do {
             "tracking_session_id": "E2E-SESSION",
             "node_id": index + 1,
             "node_stamp": now + Double(index + 1) * 0.5,
-            "sampled_frame_timestamp": 50000.0 + Double(index + 1) * 0.5,
+            "sampled_frame_timestamp": now + Double(index + 1) * 0.5,
             "system_uptime": 50000.0 + Double(index + 1) * 0.5,
             "utc_unix_seconds": now + Double(index + 1) * 0.5,
             "timezone_id": "UTC",
@@ -18569,6 +18593,51 @@ do {
     require(
         tamperedResult.audit.rejectedDetails.map(\.reason).contains("summary_mismatch"),
         "tampered burst summary must reject")
+    require(
+        tamperedResult.retainedDegradedBursts.count == 1
+            && tamperedResult.retainedDegradedBursts[0].burstID
+                == "BURST-TAMPER"
+            && tamperedResult.sourceBusinessCaptureCount == 1,
+        "identity-safe summary degradation must retain one business capture")
+    // A burst's durable frame/observation IDs remain globally reserved even
+    // when a later summary check degrades that burst. Otherwise a following
+    // record could reuse the IDs and silently replace the original capture.
+    let reuseDirectory = temporary.appendingPathComponent(
+        "degraded-burst-id-reuse", isDirectory: true)
+    try FileManager.default.createDirectory(
+        at: reuseDirectory, withIntermediateDirectories: true)
+    var degradedFirst = burst(
+        "BURST-DEGRADED-FIRST", sequence: 1,
+        frames: [frame(1, observationID: "OBS-1")])
+    degradedFirst["depth_quality"] = 0.1
+    var duplicateFrame = frame(2, observationID: "OBS-2")
+    duplicateFrame["frame_id"] = "frame-1"
+    let duplicateFrameBurst = burst(
+        "BURST-DUPLICATE-FRAME", sequence: 2,
+        frames: [duplicateFrame])
+    let duplicateObservationBurst = burst(
+        "BURST-DUPLICATE-OBSERVATION", sequence: 3,
+        frames: [frame(3, observationID: "OBS-1")])
+    try (
+        jsonLine(degradedFirst)
+            + jsonLine(duplicateFrameBurst)
+            + jsonLine(duplicateObservationBurst)
+    ).data(using: .utf8)!.write(
+        to: reuseDirectory.appendingPathComponent(
+            "tag_observation_bursts.jsonl"))
+    let reuseResult = try TagObservationBurstEvidenceParser.parse(
+        snapshotDirectory: reuseDirectory, nodes: nodes,
+        priorMapID: mapID, priorMapSHA256: sha,
+        trackingSessionID: session, floorID: floor,
+        expectedBurstCount: 3,
+        expectedLastBurstID: "BURST-DUPLICATE-OBSERVATION")
+    let reuseReasons = Set(reuseResult.audit.rejectedDetails.map(\.reason))
+    require(
+        reuseReasons.contains("summary_mismatch")
+            && reuseReasons.contains("duplicate_frame_id")
+            && reuseReasons.contains("duplicate_observation_id")
+            && reuseResult.sourceBusinessCaptureCount == 3,
+        "degraded bursts must reserve durable frame and observation IDs globally")
     let zeroResult = try parseBurstFixture(
         name: "burst-zero",
         object: burst("BURST-ZERO", sequence: 1, frames: []),
@@ -18809,11 +18878,56 @@ do {
         expectedBurstCount: 2, expectedLastBurstID: "BURST-MALFORMED")
     require(
         partiallyValidBursts.bursts.count == 1
+            && partiallyValidBursts.retainedDegradedBursts.count == 1
+            && partiallyValidBursts.retainedDegradedBursts[0].burstID
+                == "BURST-MALFORMED"
+            && partiallyValidBursts.retainedDegradedBursts[0]
+                .rejectionReason == "frame_count_or_frames_invalid"
+            && partiallyValidBursts.sourceBusinessCaptureCount == 2
             && partiallyValidBursts.audit.recordTotal == 2
             && partiallyValidBursts.audit.totalRejected == 1
             && partiallyValidBursts.audit.rejectedDetails.first?.reason
                 == "frame_count_or_frames_invalid",
-        "one malformed burst must preserve other bursts and satisfy the durable record watermark")
+        "one malformed burst must preserve its business identity, other bursts and the durable watermark")
+    let degradedPriorMap = MobileMapLibrary.MapEntry(
+        priorMapID: mapID,
+        name: "degraded-burst-map",
+        packageSHA256: sha,
+        packageDirectory: malformedDirectory,
+        floorCount: 1,
+        elementCount: 0,
+        compiledAtUTC: 0,
+        compilerVersion: "test",
+        canonicalSourceSHA256: String(repeating: "b", count: 64))
+    let retainedDegradedResult = try MobileProcessingPipeline.finalizeTags(
+        observations: [],
+        resolverIndex: TagObservationResolver.NodeIndex(
+            finalNodes: [], rawNodeStamps: [:]),
+        shelves: [],
+        shelfIndex: nil,
+        structures: [],
+        sessionID: session,
+        storeID: "STORE-DEGRADED",
+        priorMap: degradedPriorMap,
+        floorID: floor,
+        graphQualityPassed: false,
+        rawNodePoses: [:],
+        minimumAssociationMarginM: 0.5,
+        sourceBursts: partiallyValidBursts.bursts,
+        retainedDegradedBursts:
+            partiallyValidBursts.retainedDegradedBursts)
+    require(
+        retainedDegradedResult.0.count == 2
+            && retainedDegradedResult.0.allSatisfy {
+                $0.qualityStatus == "LOW_CONFIDENCE"
+            }
+            && retainedDegradedResult.0.contains {
+                $0.tagInstanceID.contains("BURST-MALFORMED")
+                    && $0.reason
+                        == "burst_schema_degraded:frame_count_or_frames_invalid"
+                    && $0.mapXM == nil && $0.mapYM == nil
+            },
+        "every identity-safe durable burst must produce exactly one retained tag row")
     // Report payload round-trips through CanonicalJSONEncoder.
     let report = audit.reportPayload()
     let reportData = try CanonicalJSONEncoder.encode(report)
@@ -19241,7 +19355,7 @@ do {
             "tracking_session_id": sessionID,
             "node_id": nodeID,
             "node_stamp": nodeStamp,
-            "sampled_frame_timestamp": uptime,
+            "sampled_frame_timestamp": nodeStamp,
             "system_uptime": uptime,
             "utc_unix_seconds": utc,
             "timezone_id": timezone,
@@ -19332,9 +19446,9 @@ do {
 
     // T3: manual clock jump +300 s mid-session -> explicit discontinuity
     // segment; interpolation across it is forbidden (UNAVAILABLE). V1R5
-    // §7.4: bindings INSIDE the jump segment cannot be attributed to
-    // either side and are rejected fail-closed; bindings on the
-    // continuous sides map exactly.
+    // Bindings inside the jump segment cannot be attributed to either side.
+    // Their strict business/node identity remains auditable, but only that
+    // local binding is excluded; valid bindings on both sides survive.
     var t3Lines: [String] = []
     let t3Correlations: [(Double, Double, String)] = [
         (980.0, now - 20.0, "session_start"),
@@ -19367,10 +19481,9 @@ do {
     require(
         abs((t3Mapper.utcSeconds(forMonotonic: 25.0) ?? -1) - (now + 315.5)) < 1.0e-6,
         "T3 post-jump mapping must be exact")
-    // T3b: a binding INSIDE the jump segment is not attributable and
-    // must fail closed (V1R5 §7.4).
-    expectRejection("T3b jump-segment binding", { if case .bindingUTCMismatch = $0 { return true }; return false }) {
-        try parseLines([
+    // T3b: a binding inside the jump segment is retained in the declared
+    // watermark audit but excluded from the usable mapper inventory.
+    let t3bEvidence = try parseLines([
             try clockLine(correlation(980.0, utc: now - 20.0, reason: "session_start")),
             try clockLine(correlation(1000.0, utc: now, reason: "periodic")),
             try clockLine(correlation(1015.0, utc: now + 315.0, reason: "system_clock_change")),
@@ -19379,7 +19492,10 @@ do {
             try clockLine(binding(2, nodeStamp: 1001.0, uptime: 1001.0, utc: now + 1.0)),
             try clockLine(binding(3, nodeStamp: 1015.5, uptime: 1015.5, utc: now + 315.5)),
         ])
-    }
+    require(
+        t3bEvidence.bindings.map(\.nodeID) == [1, 3]
+            && t3bEvidence.rejectedCorrelationBindingNodeIDs == [2],
+        "T3b must exclude only the unattributable jump-segment binding")
 
     // T4: DST transition (same timezone id, offset -18000 -> -14400);
     // absolute UTC stays continuous so no discontinuity edge, and the
@@ -19509,14 +19625,19 @@ do {
         boolOffset["utc_offset_seconds"] = true
         return try parseLines([try clockLine(boolOffset)])
     }
-    // T15: binding UTC inconsistent with the correlation mapping.
-    expectRejection("T15 binding mismatch", { if case .bindingUTCMismatch = $0 { return true }; return false }) {
-        try parseLines([
+    // T15: one locally inconsistent binding is excluded and audited. With
+    // no other binding the evidence is insufficient, but parsing the rest of
+    // the session is not falsely reported as corrupt.
+    let t15Evidence = try parseLines([
             try clockLine(correlation(1000.0, utc: now, reason: "session_start")),
             try clockLine(correlation(1030.0, utc: now + 30.0)),
             try clockLine(binding(1, nodeStamp: now, uptime: 1005.0, utc: now + 15.0)),
         ])
-    }
+    require(
+        t15Evidence.bindings.isEmpty
+            && t15Evidence.rejectedCorrelationBindingNodeIDs == [1]
+            && !StrictClockEvidenceParser.isEvidenceSufficient(t15Evidence),
+        "T15 mismatch must be audited locally and leave evidence insufficient")
     // T16: insufficient evidence (only one binding).
     let t16Evidence = try parseLines([
         try clockLine(correlation(1000.0, utc: now, reason: "session_start")),
@@ -19555,19 +19676,17 @@ do {
             try clockLine(correlation(1030.0, utc: now)),
         ])
     }
-    // RC-H09: errors report the original JSONL line, not the ordinal of
-    // the binding-only compact array.
-    expectRejection("T21 original binding line", {
-        if case .bindingUTCMismatch(let line) = $0 { return line == 3 }
-        return false
-    }) {
-        try parseLines([
+    // RC-H09: degradation audit reports the original JSONL line, not the
+    // ordinal of the compact binding array.
+    let t21Evidence = try parseLines([
             try clockLine(correlation(1000.0, utc: now, reason: "session_start")),
             try clockLine(correlation(1030.0, utc: now + 30.0)),
             try clockLine(binding(
                 1, nodeStamp: now, uptime: 1005.0, utc: now + 15.0)),
         ])
-    }
+    require(
+        t21Evidence.rejectedCorrelationBindingLines == [3],
+        "T21 mismatch audit must retain the original JSONL line")
     // RC-B21: IANA id alone is insufficient; the offset must match that
     // timezone's rules at the exact UTC instant.
     expectRejection("T22 timezone offset", {
@@ -19580,9 +19699,11 @@ do {
                 reason: "session_start")),
         ])
     }
-    // The two boot-relative clocks are sampled for one node binding.
-    expectRejection("T23 frame/uptime relation", {
-        if case .bindingFrameUptimeMismatch = $0 { return true }
+    // sampled_frame_timestamp and node_stamp share the RTAB-Map/node epoch
+    // timebase. system_uptime is independent and must not be compared to
+    // either of them directly.
+    expectRejection("T23 frame/node-stamp relation", {
+        if case .bindingFrameNodeStampMismatch = $0 { return true }
         return false
     }) {
         var badBinding = binding(
@@ -19595,8 +19716,33 @@ do {
             try clockLine(badBinding),
         ])
     }
-    // A self-consistent sidecar must still bind the exact snapshot DB
-    // node inventory; a fabricated id/stamp or missing coverage rejects.
+    // T24a: clock bindings are sampled and may be sparse. Every binding must
+    // exist in the DB and match its exact stamp, but an unbound DB node is a
+    // bounded interpolation/UNAVAILABLE concern, not corrupt evidence.
+    let sparseInventoryEvidence = try StrictClockEvidenceParser.parse(
+        content: [
+            try clockLine(correlation(
+                1000.0, utc: now, reason: "session_start")),
+            try clockLine(correlation(1030.0, utc: now + 30.0)),
+            try clockLine(binding(
+                1, nodeStamp: now, uptime: 1000.5, utc: now + 0.5)),
+            try clockLine(binding(
+                3, nodeStamp: now + 2.0, uptime: 1002.5,
+                utc: now + 2.5)),
+        ].joined(),
+        expectedTrackingSessionID: sessionID,
+        expectedCorrelationCount: 2,
+        expectedBindingCount: 2,
+        expectedNodeStampsByID: [
+            1: now,
+            2: now + 1.0,
+            3: now + 2.0,
+        ])
+    require(
+        sparseInventoryEvidence.bindings.count == 2,
+        "T24a sparse DB clock bindings must be accepted")
+    // A self-consistent sidecar must still bind every present clock record to
+    // the exact snapshot DB node inventory; a fabricated id/stamp rejects.
     expectRejection("T24 DB node inventory", {
         if case .nodeInventoryMismatch = $0 { return true }
         return false

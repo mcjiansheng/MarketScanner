@@ -302,7 +302,34 @@ def export(
         route_audit = {"status": "unavailable"}
     constraints = _manual_constraints(poses, report)
     output.mkdir(parents=True, exist_ok=False)
-    write_calibrated_trajectory_exports(output, poses, route_audit, constraints)
+    # Immutable v5/v6 versions already contain the authoritative CSV tables.
+    # Keep this command as a preview/export compatibility tool: copy verified
+    # core tables instead of regenerating local time from the processing host.
+    source_node_csv = version / "calibrated_positions_by_node.csv"
+    source_second_csv = version / "calibrated_positions_1s.csv"
+    if source_node_csv.is_file() and source_second_csv.is_file():
+        for source, name in (
+            (source_node_csv, "calibrated_positions_by_node.csv"),
+            (source_second_csv, "calibrated_positions_1s.csv"),
+        ):
+            entries = [
+                item
+                for item in json.loads(
+                    (version / "version_manifest.json").read_text(encoding="utf-8")
+                ).get("files", [])
+                if isinstance(item, dict) and item.get("file") == name
+            ]
+            if (
+                len(entries) != 1
+                or source.stat().st_size != entries[0].get("bytes")
+                or _sha256(source) != entries[0].get("sha256")
+            ):
+                raise ValueError(f"localized_artifact_identity_invalid:{name}")
+            (output / name).write_bytes(source.read_bytes())
+    else:
+        write_calibrated_trajectory_exports(
+            output, poses, route_audit, constraints
+        )
     rows = calibrated_trajectory_rows(poses, route_audit, constraints)
     floor_id = str(report.get("floor_id") or "")
     if not floor_id:

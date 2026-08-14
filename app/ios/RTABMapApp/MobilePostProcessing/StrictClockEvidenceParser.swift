@@ -17,7 +17,8 @@ import Foundation
 /// - correlation records must be internally consistent (utc advances
 ///   with uptime; a backward clock is rejected);
 /// - every node binding is cross-checked against the correlation
-///   uptime->UTC mapping within tolerance;
+///   uptime->UTC mapping within tolerance; a locally inconsistent binding is
+///   excluded and audited instead of erasing the otherwise valid timeline;
 /// - system clock jumps and timezone changes become explicit
 ///   discontinuity segments; the mapper never interpolates across them;
 /// - processing-time timezone is never used as a formal fallback.
@@ -44,9 +45,10 @@ enum StrictClockEvidenceParser {
     /// Cross-check tolerance between a node binding's utc and the
     /// correlation uptime->utc mapping (seconds).
     static let bindingCrossCheckToleranceSeconds = 2.0
-    /// ARKit frame timestamps and ProcessInfo.systemUptime are both
-    /// boot-relative clocks sampled for the same node binding.
-    static let bindingFrameUptimeToleranceSeconds = 2.0
+    /// `sampled_frame_timestamp` and `node_stamp` share the RTAB-Map node
+    /// timebase. `system_uptime` is a different boot-relative clock and must
+    /// only be used to cross-check the correlation timeline.
+    static let bindingFrameNodeStampToleranceSeconds = 2.0
     static let nodeStampIdentityToleranceSeconds = 1.0e-6
     /// Minimum evidence for an authoritative mapping.
     static let minimumCorrelationCount = 2
@@ -55,6 +57,8 @@ enum StrictClockEvidenceParser {
     struct ParsedEvidence {
         var correlations: [ClockCorrelationRecord]
         var bindings: [ClockNodeBindingRecord]
+        var rejectedCorrelationBindingLines: [Int]
+        var rejectedCorrelationBindingNodeIDs: [Int]
     }
 
     enum ParseError: Error, LocalizedError {
@@ -82,7 +86,7 @@ enum StrictClockEvidenceParser {
         case nonInjectiveUTC(Int)
         case countMismatch(String)
         case bindingUTCMismatch(Int)
-        case bindingFrameUptimeMismatch(Int)
+        case bindingFrameNodeStampMismatch(Int)
         case nodeInventoryMismatch(String)
 
         var errorDescription: String? {
@@ -111,7 +115,7 @@ enum StrictClockEvidenceParser {
             case .nonInjectiveUTC(let line): return "时钟侧车第 \(line) 行 UTC 非严格递增，无法建立单射"
             case .countMismatch(let detail): return "时钟侧车计数与 metadata 不一致：\(detail)"
             case .bindingUTCMismatch(let line): return "时钟侧车第 \(line) 行 node binding 与 correlation 映射不一致"
-            case .bindingFrameUptimeMismatch(let line): return "时钟侧车第 \(line) 行 frame timestamp 与 system uptime 不一致"
+            case .bindingFrameNodeStampMismatch(let line): return "时钟侧车第 \(line) 行 sampled frame timestamp 与 RTAB-Map node stamp 不一致"
             case .nodeInventoryMismatch(let detail): return "时钟侧车 node binding 与数据库节点清单不一致：\(detail)"
             }
         }
@@ -214,16 +218,18 @@ enum StrictClockEvidenceParser {
                     "node_binding \(bindings.count) != metadata \(expectedBindingCount)")
             }
         }
-        try crossCheckBindings(
-            correlations: correlations,
-            bindings: bindings,
-            bindingLineNumbers: bindingLineNumbers)
         try validateNodeInventory(
             bindings: bindings,
             expectedNodeStampsByID: expectedNodeStampsByID)
+        let crossCheck = crossCheckBindings(
+            correlations: correlations,
+            bindings: bindings,
+            bindingLineNumbers: bindingLineNumbers)
         return ParsedEvidence(
             correlations: correlations,
-            bindings: bindings)
+            bindings: crossCheck.retained,
+            rejectedCorrelationBindingLines: crossCheck.rejectedLines,
+            rejectedCorrelationBindingNodeIDs: crossCheck.rejectedNodeIDs)
     }
 
     /// Strictly parses the sidecar content (host-test entry point; the
@@ -299,16 +305,18 @@ enum StrictClockEvidenceParser {
                     "node_binding \(bindings.count) != metadata \(expectedBindingCount)")
             }
         }
-        try crossCheckBindings(
-            correlations: correlations,
-            bindings: bindings,
-            bindingLineNumbers: bindingLineNumbers)
         try validateNodeInventory(
             bindings: bindings,
             expectedNodeStampsByID: expectedNodeStampsByID)
+        let crossCheck = crossCheckBindings(
+            correlations: correlations,
+            bindings: bindings,
+            bindingLineNumbers: bindingLineNumbers)
         return ParsedEvidence(
             correlations: correlations,
-            bindings: bindings)
+            bindings: crossCheck.retained,
+            rejectedCorrelationBindingLines: crossCheck.rejectedLines,
+            rejectedCorrelationBindingNodeIDs: crossCheck.rejectedNodeIDs)
     }
 
     /// Shared per-record validation for both entry points.
@@ -432,9 +440,9 @@ enum StrictClockEvidenceParser {
             try validateTimezoneOffset(
                 timezoneID: timezoneID, utcOffset: utcOffset,
                 utcUnixSeconds: utc, lineNumber: lineNumber)
-            guard abs(frameTimestamp - uptime)
-                    <= bindingFrameUptimeToleranceSeconds else {
-                throw ParseError.bindingFrameUptimeMismatch(lineNumber)
+            guard abs(frameTimestamp - nodeStamp)
+                    <= bindingFrameNodeStampToleranceSeconds else {
+                throw ParseError.bindingFrameNodeStampMismatch(lineNumber)
             }
             guard !seenNodeIDs.contains(nodeID) else {
                 throw ParseError.duplicateNodeBinding(lineNumber)
@@ -469,38 +477,54 @@ enum StrictClockEvidenceParser {
         }
     }
 
-    /// V1R5 §7.4 (review B-07): every binding must cross-check against
-    /// the correlation uptime->UTC mapping. A binding that CANNOT be
-    /// cross-checked (sampled inside a discontinuity segment) is
-    /// REJECTED — it is never skipped "and the rest continues".
+    /// Every declared binding first passes strict framing, identity,
+    /// watermark, uniqueness and exact snapshot-node validation. This second
+    /// stage only asks whether that otherwise identified sample agrees with
+    /// the independent uptime->UTC correlation curve. A local disagreement
+    /// cannot invalidate unrelated bindings or the RTAB-Map trajectory: omit
+    /// it from the mapper and return an exact audit inventory. The caller
+    /// still requires at least two retained bindings before claiming an
+    /// authoritative node-timebase mapping.
     private static func crossCheckBindings(
         correlations: [ClockCorrelationRecord],
         bindings: [ClockNodeBindingRecord],
         bindingLineNumbers: [Int]
-    ) throws {
-        guard correlations.count >= 2, !bindings.isEmpty else { return }
+    ) -> (
+        retained: [ClockNodeBindingRecord],
+        rejectedLines: [Int],
+        rejectedNodeIDs: [Int]
+    ) {
+        guard correlations.count >= 2, !bindings.isEmpty else {
+            return (bindings, [], [])
+        }
         let correlationEdges = discontinuityEdges(of: correlations)
+        var retained: [ClockNodeBindingRecord] = []
+        retained.reserveCapacity(bindings.count)
+        var rejectedLines: [Int] = []
+        var rejectedNodeIDs: [Int] = []
         for (index, binding) in bindings.enumerated() {
-            guard let expected = mappedUTC(
+            let expected = mappedUTC(
                 uptime: binding.systemUptime,
                 correlations: correlations,
-                edges: correlationEdges) else {
-                // Inside a discontinuity segment: cannot attribute the
-                // binding to either side -> fail closed.
-                throw ParseError.bindingUTCMismatch(bindingLineNumbers[index])
-            }
-            if abs(expected - binding.utcUnixSeconds)
-                > bindingCrossCheckToleranceSeconds {
-                throw ParseError.bindingUTCMismatch(bindingLineNumbers[index])
-            }
-            guard let context = correlationContext(
+                edges: correlationEdges)
+            let context = correlationContext(
                 uptime: binding.systemUptime,
-                correlations: correlations),
-                  context.timezoneID == binding.timezoneID,
-                  context.utcOffsetSeconds == binding.utcOffsetSeconds else {
-                throw ParseError.bindingUTCMismatch(bindingLineNumbers[index])
+                correlations: correlations)
+            let agrees = expected.map {
+                abs($0 - binding.utcUnixSeconds)
+                    <= bindingCrossCheckToleranceSeconds
+            } ?? false
+            if agrees,
+               let context,
+               context.timezoneID == binding.timezoneID,
+               context.utcOffsetSeconds == binding.utcOffsetSeconds {
+                retained.append(binding)
+            } else {
+                rejectedLines.append(bindingLineNumbers[index])
+                rejectedNodeIDs.append(binding.nodeID)
             }
         }
+        return (retained, rejectedLines, rejectedNodeIDs)
     }
 
     private static func validateNodeInventory(
@@ -508,9 +532,13 @@ enum StrictClockEvidenceParser {
         expectedNodeStampsByID: [Int: Double]?
     ) throws {
         guard let expected = expectedNodeStampsByID else { return }
-        guard bindings.count == expected.count else {
+        // Node bindings are sampled evidence, not a promise that every stored
+        // RTAB-Map node has an individual clock record. Sparse coverage is
+        // deterministic between valid bindings; interpolation gaps become
+        // UNAVAILABLE rows in FinalTrajectory instead of aborting the Result.
+        guard bindings.count <= expected.count else {
             throw ParseError.nodeInventoryMismatch(
-                "binding count \(bindings.count) != DB node count \(expected.count)")
+                "binding count \(bindings.count) exceeds DB node count \(expected.count)")
         }
         var seen = Set<Int>()
         seen.reserveCapacity(bindings.count)
@@ -526,8 +554,8 @@ enum StrictClockEvidenceParser {
             }
             seen.insert(binding.nodeID)
         }
-        guard seen.count == expected.count else {
-            throw ParseError.nodeInventoryMismatch("DB node coverage incomplete")
+        guard seen.count == bindings.count else {
+            throw ParseError.nodeInventoryMismatch("binding identity set incomplete")
         }
     }
 

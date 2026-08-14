@@ -650,6 +650,14 @@ def _translation(matrix: tuple[float, ...]) -> tuple[float, float, float]:
     return matrix[3], matrix[7], matrix[11]
 
 
+def _normalize_angle_radians(value: float) -> float:
+    while value <= -math.pi:
+        value += 2.0 * math.pi
+    while value > math.pi:
+        value -= 2.0 * math.pi
+    return value
+
+
 def _rotation_difference_degrees(first: tuple[float, ...], second: tuple[float, ...]) -> float:
     # trace(Ra^T Rb) is the Frobenius inner product of the two 3x3 rotations.
     rotation_indices = (0, 1, 2, 4, 5, 6, 8, 9, 10)
@@ -1122,6 +1130,196 @@ def recover_raw_continuous_vio_poses(
     return poses, assessment
 
 
+def recover_partial_optimized_continuous_poses(
+    input_database: Path,
+    optimized_database: Path,
+    horizontal_axes: str = "ios_prior",
+) -> tuple[list[Dict[str, Any]], Dict[str, Any]]:
+    """Complete a partial Admin.opt_poses graph without mixing pose gauges.
+
+    RTAB-Map can save a valid optimized subgraph while omitting some source
+    nodes.  Reading ``Admin.opt_poses`` for present nodes and ``Node.pose`` for
+    absent nodes creates discontinuities because the two inventories are in
+    different gauges.  Instead, use the complete, reset-stitched immutable VIO
+    chain as the relative-motion skeleton, derive an SE(2) correction at every
+    optimized node, interpolate that correction continuously in capture time,
+    and apply it to every source node.  Exact optimized nodes remain exact;
+    missing nodes are retained as diagnostic, map-corrected VIO results.
+
+    The result is deliberately diagnostic-only.  It preserves all finite
+    source nodes and useful optimized evidence, but it never claims that a
+    complete RTAB-Map global graph existed.
+    """
+
+    raw_rows, raw_assessment = recover_raw_continuous_vio_poses(
+        input_database, horizontal_axes
+    )
+    if raw_assessment.get("status") != "pass":
+        return [], {
+            "format": "SupermarketPartialOptimizedContinuousRecoveryAssessment",
+            "version": 1,
+            "status": "rejected",
+            "diagnostic_only": True,
+            "reason": "raw_continuous_vio_unrecoverable",
+            "raw_continuous_vio_assessment": raw_assessment,
+        }
+
+    raw_by_id = {int(item["node_id"]): item for item in raw_rows}
+    optimized_matrices = _database_poses(optimized_database, optimized=True)
+    optimized_rows: Dict[int, tuple[float, float, float]] = {}
+    for node_id, matrix in optimized_matrices.items():
+        if node_id not in raw_by_id:
+            continue
+        parsed = base.parse_rtabmap_transform_3d(
+            struct.pack("<12f", *matrix), horizontal_axes
+        )
+        if parsed is None:
+            continue
+        x, y, _height, yaw = parsed
+        if all(math.isfinite(value) for value in (x, y, yaw)):
+            optimized_rows[node_id] = (x, y, yaw)
+    if not optimized_rows:
+        return raw_rows, {
+            "format": "SupermarketPartialOptimizedContinuousRecoveryAssessment",
+            "version": 1,
+            "status": "raw_only",
+            "diagnostic_only": True,
+            "reason": "no_usable_optimized_pose_anchor",
+            "source_node_count": len(raw_rows),
+            "optimized_anchor_count": 0,
+            "recovered_node_count": len(raw_rows),
+            "raw_continuous_vio_assessment": raw_assessment,
+        }
+
+    anchors: list[Dict[str, float | int]] = []
+    previous_unwrapped_yaw: Optional[float] = None
+    for node_id in sorted(optimized_rows, key=lambda value: float(raw_by_id[value]["timestamp"])):
+        raw = raw_by_id[node_id]
+        optimized_x, optimized_y, optimized_yaw = optimized_rows[node_id]
+        raw_x = float(raw["x"])
+        raw_y = float(raw["y"])
+        raw_yaw = float(raw["yaw"])
+        correction_yaw = _normalize_angle_radians(optimized_yaw - raw_yaw)
+        if previous_unwrapped_yaw is not None:
+            correction_yaw = previous_unwrapped_yaw + _normalize_angle_radians(
+                correction_yaw - previous_unwrapped_yaw
+            )
+        cosine = math.cos(correction_yaw)
+        sine = math.sin(correction_yaw)
+        correction_x = optimized_x - (cosine * raw_x - sine * raw_y)
+        correction_y = optimized_y - (sine * raw_x + cosine * raw_y)
+        anchors.append(
+            {
+                "node_id": node_id,
+                "timestamp": float(raw["timestamp"]),
+                "correction_x": correction_x,
+                "correction_y": correction_y,
+                "correction_yaw": correction_yaw,
+            }
+        )
+        previous_unwrapped_yaw = correction_yaw
+
+    recovered: list[Dict[str, Any]] = []
+    cursor = 0
+    maximum_correction_translation_change = 0.0
+    maximum_correction_yaw_change = 0.0
+    previous_correction: Optional[tuple[float, float, float]] = None
+    for raw in raw_rows:
+        timestamp = float(raw["timestamp"])
+        while cursor + 1 < len(anchors) and float(anchors[cursor + 1]["timestamp"]) < timestamp:
+            cursor += 1
+        if timestamp <= float(anchors[0]["timestamp"]):
+            before = after = anchors[0]
+        elif timestamp >= float(anchors[-1]["timestamp"]):
+            before = after = anchors[-1]
+        else:
+            before = anchors[cursor]
+            after = anchors[min(cursor + 1, len(anchors) - 1)]
+        span = float(after["timestamp"]) - float(before["timestamp"])
+        fraction = (
+            0.0
+            if span <= 1.0e-9
+            else (timestamp - float(before["timestamp"])) / span
+        )
+        correction_x = float(before["correction_x"]) + fraction * (
+            float(after["correction_x"]) - float(before["correction_x"])
+        )
+        correction_y = float(before["correction_y"]) + fraction * (
+            float(after["correction_y"]) - float(before["correction_y"])
+        )
+        correction_yaw = float(before["correction_yaw"]) + fraction * (
+            float(after["correction_yaw"]) - float(before["correction_yaw"])
+        )
+        raw_x = float(raw["x"])
+        raw_y = float(raw["y"])
+        cosine = math.cos(correction_yaw)
+        sine = math.sin(correction_yaw)
+        recovered.append(
+            {
+                "node_id": int(raw["node_id"]),
+                "timestamp": timestamp,
+                "x": correction_x + cosine * raw_x - sine * raw_y,
+                "y": correction_y + sine * raw_x + cosine * raw_y,
+                "yaw": _normalize_angle_radians(
+                    float(raw["yaw"]) + correction_yaw
+                ),
+            }
+        )
+        correction = (correction_x, correction_y, correction_yaw)
+        if previous_correction is not None:
+            maximum_correction_translation_change = max(
+                maximum_correction_translation_change,
+                math.hypot(
+                    correction[0] - previous_correction[0],
+                    correction[1] - previous_correction[1],
+                ),
+            )
+            maximum_correction_yaw_change = max(
+                maximum_correction_yaw_change,
+                abs(
+                    math.degrees(
+                        _normalize_angle_radians(
+                            correction[2] - previous_correction[2]
+                        )
+                    )
+                ),
+            )
+        previous_correction = correction
+
+    anchor_errors = []
+    recovered_by_id = {int(item["node_id"]): item for item in recovered}
+    for node_id, optimized in optimized_rows.items():
+        item = recovered_by_id[node_id]
+        anchor_errors.append(
+            max(
+                math.hypot(float(item["x"]) - optimized[0], float(item["y"]) - optimized[1]),
+                abs(
+                    _normalize_angle_radians(float(item["yaw"]) - optimized[2])
+                ),
+            )
+        )
+    return recovered, {
+        "format": "SupermarketPartialOptimizedContinuousRecoveryAssessment",
+        "version": 1,
+        "status": "pass",
+        "diagnostic_only": True,
+        "source": "complete_raw_vio_with_interpolated_partial_rtabmap_se2_correction",
+        "source_node_count": len(raw_rows),
+        "optimized_anchor_count": len(anchors),
+        "missing_optimized_node_count": len(raw_rows) - len(anchors),
+        "optimized_pose_coverage": round(len(anchors) / max(1, len(raw_rows)), 6),
+        "recovered_node_count": len(recovered),
+        "maximum_optimized_anchor_error": round(max(anchor_errors, default=0.0), 9),
+        "maximum_neighbor_correction_translation_change_m": round(
+            maximum_correction_translation_change, 6
+        ),
+        "maximum_neighbor_correction_yaw_change_deg": round(
+            maximum_correction_yaw_change, 6
+        ),
+        "raw_continuous_vio_assessment": raw_assessment,
+    }
+
+
 def optimization_displacement_metrics(
     raw: Dict[int, tuple[float, ...]], optimized: Dict[int, tuple[float, ...]]
 ) -> Dict[str, Any]:
@@ -1198,7 +1396,11 @@ def assess_optimized_trajectory(input_database: Path, output_database: Path) -> 
         warnings.append(f"Only {coverage * 100:.1f}% of input poses have optimized counterparts.")
         score -= 20
     if coverage < 0.90:
-        rejection_reasons.append("Optimized pose coverage is below 90%.")
+        warnings.append(
+            "The optimized graph is incomplete; retain its finite poses only "
+            "as SE(2) correction anchors over the complete continuous VIO skeleton."
+        )
+        score -= 25
     if optimized_metrics["nonfinite_pose_count"]:
         rejection_reasons.append("The optimized trajectory contains non-finite poses.")
 

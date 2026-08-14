@@ -19,6 +19,9 @@ from tools.PriorMap.offline_localization import (
     RECOVERY_EVENT_CONTRACT,
     SESSION_INPUT_FILE_NAMES_V2,
     SESSION_INPUT_FILE_NAMES_V3,
+    SESSION_INPUT_FILE_NAMES_V4,
+    ClockBinding,
+    ClockEvidence,
     Pose,
     TagPoseBinding,
     VerifiedTagBurstFrameAuthority,
@@ -31,6 +34,7 @@ from tools.PriorMap.offline_localization import (
     _apply_on_device_confirmation_authority,
     _enforce_on_device_confirmation_conflict,
     _read_localized_price_tags_bytes,
+    _read_clock_evidence_bytes,
     _verified_tag_burst_observation_ids,
     _verified_tag_burst_evidence,
     _segment_intersection,
@@ -46,6 +50,7 @@ from tools.PriorMap.offline_localization import (
     reconstruct_gauge_neutral_trace,
     resample_pose_sequence,
     calibrated_trajectory_rows,
+    write_calibrated_trajectory_exports,
     infer_aisle_switch_sequence,
     apply_manual_edits,
     move_manual_edit_cursor,
@@ -836,7 +841,331 @@ class RobustSE2OptimizerTests(unittest.TestCase):
         self.assertEqual(rows[0]["distance_scale_confidence"], "high")
         self.assertEqual(rows[1]["manual_anchor_status"], "trusted_manual_anchor")
         self.assertEqual(rows[1]["yaw_source"], "optimized_phone_pose")
-        self.assertIn("+", rows[1]["local_time_iso8601"])
+        self.assertIsNone(rows[1]["local_time_iso8601"])
+        self.assertEqual(rows[1]["clock_status"], "UNAVAILABLE")
+        self.assertEqual(
+            rows[1]["clock_degradation_code"],
+            "clock_evidence_unbound_legacy",
+        )
+
+    def test_clock_cross_check_shortfall_is_a_degradation_not_a_failure(self) -> None:
+        session_id = "clock-session"
+        records = [
+            {
+                "format": "MarketScannerClockCorrelation",
+                "version": 2,
+                "record_kind": "correlation",
+                "tracking_session_id": session_id,
+                "monotonic_seconds": 10.0,
+                "utc_unix_seconds": 1_700_000_000.0,
+                "timezone_id": "UTC",
+                "utc_offset_seconds": 0,
+                "reason": "session_start",
+            },
+            {
+                "format": "MarketScannerClockCorrelation",
+                "version": 2,
+                "record_kind": "correlation",
+                "tracking_session_id": session_id,
+                "monotonic_seconds": 20.0,
+                "utc_unix_seconds": 1_700_000_010.0,
+                "timezone_id": "UTC",
+                "utc_offset_seconds": 0,
+                "reason": "session_end",
+            },
+            {
+                "format": "MarketScannerClockCorrelation",
+                "version": 2,
+                "record_kind": "node_binding",
+                "tracking_session_id": session_id,
+                "node_id": 1,
+                "node_stamp": 100.0,
+                "sampled_frame_timestamp": 100.0,
+                "system_uptime": 15.0,
+                "utc_unix_seconds": 1_700_000_001.0,
+                "timezone_id": "UTC",
+                "utc_offset_seconds": 0,
+                "reason": "node_bound",
+            },
+            {
+                "format": "MarketScannerClockCorrelation",
+                "version": 2,
+                "record_kind": "node_binding",
+                "tracking_session_id": session_id,
+                "node_id": 2,
+                "node_stamp": 101.0,
+                "sampled_frame_timestamp": 101.0,
+                "system_uptime": 16.0,
+                "utc_unix_seconds": 1_700_000_006.0,
+                "timezone_id": "UTC",
+                "utc_offset_seconds": 0,
+                "reason": "node_bound",
+            },
+        ]
+        data = "".join(
+            json.dumps(record, sort_keys=True) + "\n" for record in records
+        ).encode("utf-8")
+        evidence, diagnostics = _read_clock_evidence_bytes(
+            data,
+            metadata={
+                "trackingSessionId": session_id,
+                "clockEvidenceComplete": True,
+                "clockCorrelationCount": 2,
+                "clockNodeBindingCount": 2,
+            },
+            node_stamps_by_id={1: 100.0, 2: 101.0},
+        )
+        self.assertEqual([binding.node_id for binding in evidence.bindings], [2])
+        self.assertIn(
+            "clock_mapping_insufficient_after_cross_check",
+            evidence.degradation_codes,
+        )
+        self.assertEqual(diagnostics["usable_binding_count"], 1)
+
+        records[3]["utc_unix_seconds"] = 1_700_000_002.0
+        data = "".join(
+            json.dumps(record, sort_keys=True) + "\n" for record in records
+        ).encode("utf-8")
+        evidence, diagnostics = _read_clock_evidence_bytes(
+            data,
+            metadata={
+                "trackingSessionId": session_id,
+                "clockEvidenceComplete": True,
+                "clockCorrelationCount": 2,
+                "clockNodeBindingCount": 2,
+            },
+            node_stamps_by_id={1: 100.0, 2: 101.0},
+        )
+        self.assertEqual(evidence.bindings, ())
+        self.assertEqual(diagnostics["usable_binding_count"], 0)
+        self.assertIn(
+            "clock_mapping_insufficient_after_cross_check",
+            evidence.degradation_codes,
+        )
+        self.assertIn("clock_start_node_unbound", evidence.degradation_codes)
+        self.assertIn("clock_end_node_unbound", evidence.degradation_codes)
+
+    def test_one_second_table_survives_without_usable_clock_bindings(self) -> None:
+        evidence = ClockEvidence(
+            correlations=(
+                {
+                    "utc_unix_seconds": 1_700_000_000.0,
+                    "monotonic_seconds": 10.0,
+                    "timezone_id": "Asia/Shanghai",
+                    "utc_offset_seconds": 28_800,
+                },
+                {
+                    "utc_unix_seconds": 1_700_000_002.0,
+                    "monotonic_seconds": 12.0,
+                    "timezone_id": "Asia/Shanghai",
+                    "utc_offset_seconds": 28_800,
+                },
+            ),
+            bindings=(),
+            discontinuity_binding_edges=frozenset(),
+            bound_node_ids=frozenset(),
+            degradation_codes=(
+                "clock_mapping_insufficient_after_cross_check",
+            ),
+        )
+        with tempfile.TemporaryDirectory() as value:
+            output = Path(value)
+            counts = write_calibrated_trajectory_exports(
+                output,
+                [
+                    Pose(1, 100.0, 0.0, 0.0, 0.0),
+                    Pose(2, 102.0, 2.0, 0.0, 0.1),
+                ],
+                {"status": "matched"},
+                [],
+                clock_evidence=evidence,
+                delivery_context={
+                    "floor_id": "1",
+                    "position_source": "prior_map_offline_optimized",
+                    "algorithm_degradation_codes": [
+                        "clock_mapping_insufficient_after_cross_check"
+                    ],
+                },
+            )
+            with (output / "calibrated_positions_by_node.csv").open(
+                encoding="utf-8", newline=""
+            ) as handle:
+                node_rows = list(__import__("csv").DictReader(handle))
+            with (output / "calibrated_positions_1s.csv").open(
+                encoding="utf-8", newline=""
+            ) as handle:
+                second_rows = list(__import__("csv").DictReader(handle))
+        self.assertEqual(counts["node_count"], 2)
+        self.assertEqual(counts["one_second_row_count"], 3)
+        self.assertEqual(counts["one_second_unavailable_count"], 3)
+        self.assertEqual(evidence.primary_timezone_id, "Asia/Shanghai")
+        self.assertEqual(evidence.primary_utc_offset_seconds, 28_800)
+        self.assertTrue(all(row["utc_unix_s"] == "" for row in node_rows))
+        self.assertTrue(
+            all(row["position_status"] == "UNAVAILABLE" for row in second_rows)
+        )
+        self.assertTrue(
+            all(
+                row["position_degradation_code"]
+                == "clock_mapping_insufficient_after_cross_check"
+                for row in second_rows
+            )
+        )
+        self.assertTrue(
+            all(row["local_time_iso8601"].endswith("+08:00") for row in second_rows)
+        )
+
+    def test_bound_scan_timezone_is_independent_of_processing_host_timezone(self) -> None:
+        bindings = (
+            ClockBinding(
+                node_id=1,
+                node_stamp=100.0,
+                system_uptime=10.0,
+                utc_unix_seconds=1_700_000_000.0,
+                timezone_id="Asia/Shanghai",
+                utc_offset_seconds=28_800,
+            ),
+            ClockBinding(
+                node_id=3,
+                node_stamp=102.0,
+                system_uptime=12.0,
+                utc_unix_seconds=1_700_000_002.0,
+                timezone_id="Asia/Shanghai",
+                utc_offset_seconds=28_800,
+            ),
+        )
+        evidence = ClockEvidence(
+            correlations=(
+                {
+                    "utc_unix_seconds": 1_700_000_000.0,
+                    "monotonic_seconds": 10.0,
+                },
+                {
+                    "utc_unix_seconds": 1_700_000_002.0,
+                    "monotonic_seconds": 12.0,
+                },
+            ),
+            bindings=bindings,
+            discontinuity_binding_edges=frozenset(),
+            bound_node_ids=frozenset({1, 3}),
+            degradation_codes=("clock_node_binding_coverage_incomplete",),
+        )
+        poses = [
+            Pose(1, 100.0, 0.0, 0.0, 0.0),
+            Pose(2, 101.0, 1.0, 0.0, 0.1),
+            Pose(3, 102.0, 2.0, 0.0, 0.2),
+        ]
+        with mock.patch.dict(os.environ, {"TZ": "America/Los_Angeles"}):
+            rows = calibrated_trajectory_rows(
+                poses, {"status": "matched"}, [], clock_evidence=evidence
+            )
+        self.assertEqual(rows[1]["clock_status"], "INTERPOLATED_BETWEEN_BINDINGS")
+        self.assertEqual(rows[1]["timezone_id"], "Asia/Shanghai")
+        self.assertEqual(rows[1]["utc_offset_seconds"], 28_800)
+        self.assertTrue(rows[1]["local_time_iso8601"].endswith("+08:00"))
+
+    def test_one_second_table_retains_unavailable_rows_across_long_gap(self) -> None:
+        evidence = ClockEvidence(
+            correlations=(
+                {
+                    "utc_unix_seconds": 1_700_000_000.0,
+                    "monotonic_seconds": 10.0,
+                },
+                {
+                    "utc_unix_seconds": 1_700_000_010.0,
+                    "monotonic_seconds": 20.0,
+                },
+            ),
+            bindings=(
+                ClockBinding(1, 100.0, 10.0, 1_700_000_000.0, "UTC", 0),
+                ClockBinding(2, 110.0, 20.0, 1_700_000_010.0, "UTC", 0),
+            ),
+            discontinuity_binding_edges=frozenset(),
+            bound_node_ids=frozenset({1, 2}),
+            degradation_codes=(),
+        )
+        with tempfile.TemporaryDirectory() as value:
+            output = Path(value)
+            counts = write_calibrated_trajectory_exports(
+                output,
+                [
+                    Pose(1, 100.0, 0.0, 0.0, 0.0),
+                    Pose(2, 110.0, 10.0, 0.0, 0.0),
+                ],
+                {"status": "matched"},
+                [],
+                clock_evidence=evidence,
+                delivery_context={
+                    "floor_id": "1",
+                    "prior_map_id": "map",
+                    "prior_map_package_sha256": "a" * 64,
+                    "canonical_source_sha256": "b" * 64,
+                    "coordinate_contract_version": 1,
+                    "input_identity_id": "c" * 64,
+                },
+            )
+            with (output / "calibrated_positions_1s.csv").open(
+                encoding="utf-8", newline=""
+            ) as handle:
+                rows = list(__import__("csv").DictReader(handle))
+        self.assertEqual(counts["one_second_row_count"], 11)
+        self.assertEqual(len(rows), 11)
+        self.assertEqual(rows[0]["position_status"], "LOW_CONFIDENCE")
+        self.assertEqual(rows[-1]["position_status"], "LOW_CONFIDENCE")
+        unavailable = [row for row in rows if row["position_status"] == "UNAVAILABLE"]
+        self.assertEqual(len(unavailable), 9)
+        self.assertTrue(all(row["x_m"] == "" and row["y_m"] == "" for row in unavailable))
+
+    def test_one_second_table_never_interpolates_across_clock_segment(self) -> None:
+        evidence = ClockEvidence(
+            correlations=(
+                {
+                    "utc_unix_seconds": 1_700_000_000.0,
+                    "monotonic_seconds": 10.0,
+                },
+                {
+                    "utc_unix_seconds": 1_700_000_003.0,
+                    "monotonic_seconds": 13.0,
+                },
+            ),
+            bindings=(
+                ClockBinding(1, 100.0, 10.0, 1_700_000_000.0, "UTC", 0),
+                ClockBinding(2, 101.0, 10.5, 1_700_000_000.5, "UTC", 0),
+                ClockBinding(3, 102.0, 12.5, 1_700_000_002.5, "UTC", 0),
+                ClockBinding(4, 103.0, 13.0, 1_700_000_003.0, "UTC", 0),
+            ),
+            discontinuity_binding_edges=frozenset({1}),
+            bound_node_ids=frozenset({1, 2, 3, 4}),
+            degradation_codes=(),
+        )
+        with tempfile.TemporaryDirectory() as value:
+            output = Path(value)
+            write_calibrated_trajectory_exports(
+                output,
+                [
+                    Pose(1, 100.0, 0.0, 0.0, 0.0),
+                    Pose(2, 101.0, 0.5, 0.0, 0.0),
+                    Pose(3, 102.0, 2.5, 0.0, 0.0),
+                    Pose(4, 103.0, 3.0, 0.0, 0.0),
+                ],
+                {"status": "matched"},
+                [],
+                clock_evidence=evidence,
+                delivery_context={"floor_id": "1"},
+            )
+            with (output / "calibrated_positions_1s.csv").open(
+                encoding="utf-8", newline=""
+            ) as handle:
+                rows = list(__import__("csv").DictReader(handle))
+        self.assertEqual([row["clock_segment_index"] for row in rows], ["0", "0", "1", "1"])
+        self.assertEqual(
+            [row["position_status"] for row in rows],
+            ["LOW_CONFIDENCE", "UNAVAILABLE", "UNAVAILABLE", "LOW_CONFIDENCE"],
+        )
+        self.assertEqual(
+            [row["position_degradation_code"] for row in rows[1:3]],
+            ["clock_discontinuity", "clock_discontinuity"],
+        )
 
     def test_distance_scale_low_confidence_marks_all_exported_rows(self) -> None:
         poses = [
@@ -1550,6 +1879,100 @@ class ESLConfirmationContractTests(unittest.TestCase):
             "conflicts with its verified burst bound node",
         ):
             _verified_tag_burst_evidence([burst], observations)
+
+    def test_degraded_burst_cannot_release_global_frame_identity(self) -> None:
+        observations = [
+            {
+                "observation_id": "obs-1",
+                "burst_id": "burst-1",
+                "frame_id": "frame-shared",
+                "frame_timestamp": 10.0,
+                "node_timebase_frame_timestamp": 110.0,
+                "payload": "ESL-001",
+                "symbology": "CODE128",
+            },
+            {
+                "observation_id": "obs-2",
+                "burst_id": "burst-2",
+                "frame_id": "frame-shared",
+                "frame_timestamp": 11.0,
+                "node_timebase_frame_timestamp": 111.0,
+                "payload": "ESL-002",
+                "symbology": "CODE128",
+            },
+        ]
+        bursts = [
+            {
+                "burst_id": "burst-1",
+                "sequence": 1,
+                "complete": True,
+                "barcode": "ESL-001",
+                "symbology": "CODE128",
+                "frames": [
+                    {
+                        "observation_id": "obs-1",
+                        "frame_id": "frame-shared",
+                        "bound_node_id": 11,
+                        "frame_timestamp": 10.0,
+                        "node_timestamp": 110.0,
+                    }
+                ],
+            },
+            {
+                "burst_id": "burst-2",
+                "sequence": 2,
+                "complete": True,
+                "barcode": "ESL-002",
+                "symbology": "CODE128",
+                "frames": [
+                    {
+                        "observation_id": "obs-2",
+                        "frame_id": "frame-shared",
+                        "bound_node_id": 12,
+                        "frame_timestamp": 11.0,
+                        "node_timestamp": 111.0,
+                    }
+                ],
+            },
+        ]
+        degradations: list[dict[str, object]] = [
+            {
+                "code": "tag_observation_bursts_record_degraded",
+                "record_id": "burst-1",
+            }
+        ]
+        with self.assertRaisesRegex(
+            OfflineLocalizationError, "frame IDs must be globally unique"
+        ):
+            _verified_tag_burst_evidence(
+                bursts, observations, degradations=degradations
+            )
+
+    def test_tolerant_localized_tags_still_reject_duplicate_capture_id(self) -> None:
+        tag, verified = self._fixture()
+        duplicate = dict(tag)
+        duplicate["tag_id"] = "tag-2"
+        duplicate["observation_id"] = "obs-2"
+        degradations: list[dict[str, object]] = []
+        with self.assertRaisesRegex(
+            OfflineLocalizationError, "duplicate capture_id"
+        ):
+            _read_localized_price_tags_bytes(
+                json.dumps([tag, duplicate]).encode("utf-8"),
+                session_id="session-1",
+                expected_map_id="map-1",
+                expected_map_hash="a" * 64,
+                expected_floor_id="floor-1",
+                expected_count=2,
+                verified_burst_observation_ids=verified,
+                verified_burst_identities={
+                    next(iter(verified)): (
+                        "ESL-001",
+                        "VNBarcodeSymbologyCode128",
+                    )
+                },
+                degradations=degradations,
+            )
 
     def test_incomplete_burst_and_tag_contract_degrade_without_deleting_barcode(
         self,
@@ -2519,6 +2942,194 @@ class LocalizedPipelineTests(unittest.TestCase):
         )
         return recovery_path
 
+    def _upgrade_fixture_to_clock_manifest_v4(self) -> Path:
+        self._upgrade_fixture_to_recovery_manifest_v2()
+        metadata_path = self.segment / "metadata.json"
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        metadata.update(
+            {
+                "clockEvidenceComplete": True,
+                "clockCorrelationCount": 2,
+                "clockNodeBindingCount": 2,
+            }
+        )
+        json_write(metadata_path, metadata)
+        node_first = self.node_timebase_offset
+        node_last = self.node_timebase_offset + 19.0
+        records = [
+            {
+                "format": "MarketScannerClockCorrelation",
+                "version": 2,
+                "record_kind": "correlation",
+                "tracking_session_id": "tracking-1",
+                "monotonic_seconds": 10.0,
+                "utc_unix_seconds": 1_700_000_000.0,
+                "timezone_id": "Asia/Shanghai",
+                "utc_offset_seconds": 28_800,
+                "reason": "session_start",
+            },
+            {
+                "format": "MarketScannerClockCorrelation",
+                "version": 2,
+                "record_kind": "node_binding",
+                "tracking_session_id": "tracking-1",
+                "node_id": 1,
+                "node_stamp": node_first,
+                "sampled_frame_timestamp": node_first,
+                "system_uptime": 10.0,
+                "utc_unix_seconds": 1_700_000_000.0,
+                "timezone_id": "Asia/Shanghai",
+                "utc_offset_seconds": 28_800,
+                "reason": "node_bound",
+            },
+            {
+                "format": "MarketScannerClockCorrelation",
+                "version": 2,
+                "record_kind": "correlation",
+                "tracking_session_id": "tracking-1",
+                "monotonic_seconds": 29.0,
+                "utc_unix_seconds": 1_700_000_019.0,
+                "timezone_id": "Asia/Shanghai",
+                "utc_offset_seconds": 28_800,
+                "reason": "session_end",
+            },
+            {
+                "format": "MarketScannerClockCorrelation",
+                "version": 2,
+                "record_kind": "node_binding",
+                "tracking_session_id": "tracking-1",
+                "node_id": 20,
+                "node_stamp": node_last,
+                "sampled_frame_timestamp": node_last,
+                "system_uptime": 29.0,
+                "utc_unix_seconds": 1_700_000_019.0,
+                "timezone_id": "Asia/Shanghai",
+                "utc_offset_seconds": 28_800,
+                "reason": "node_bound",
+            },
+        ]
+        path = self.segment / "clock_correlations.jsonl"
+        jsonl_write(path, records)
+        # v4 has one exact role inventory regardless of whether ESL capture
+        # occurred. The empty burst sidecar is still immutable and hashed.
+        (self.segment / "tag_observation_bursts.jsonl").write_text(
+            "", encoding="utf-8"
+        )
+        return path
+
+    def test_clock_manifest_v4_binds_exact_roles_and_sparse_node_coverage(self) -> None:
+        clock_path = self._upgrade_fixture_to_clock_manifest_v4()
+        manifest = build_session_input_manifest(
+            self.segment, self.source_database
+        )
+        self.assertEqual(manifest["version"], 4)
+        self.assertEqual(
+            [entry["role"] for entry in manifest["files"]],
+            [
+                "metadata",
+                "source_database",
+                *SESSION_INPUT_FILE_NAMES_V4[1:],
+            ],
+        )
+        snapshot = offline_localization.read_finalized_session_input_snapshot(
+            self.segment, self.source_database
+        )
+        self.assertEqual(snapshot.manifest, manifest)
+        self.assertEqual(
+            snapshot.clock_evidence.bound_node_ids, frozenset({1, 20})
+        )
+        self.assertIn(
+            "clock_node_binding_coverage_incomplete",
+            snapshot.clock_evidence.degradation_codes,
+        )
+        baseline_hash = manifest["bundle_sha256"]
+        original = clock_path.read_bytes()
+        clock_path.write_bytes(original.replace(b'"session_end"', b'"periodic"'))
+        changed = build_session_input_manifest(
+            self.segment, self.source_database
+        )
+        self.assertNotEqual(changed["bundle_sha256"], baseline_hash)
+
+    def test_clock_v4_integrity_failures_and_cross_check_degradation(self) -> None:
+        clock_path = self._upgrade_fixture_to_clock_manifest_v4()
+        original = clock_path.read_bytes()
+
+        clock_path.write_bytes(original.rstrip(b"\n"))
+        with self.assertRaisesRegex(
+            OfflineLocalizationError, "final newline"
+        ):
+            offline_localization.read_finalized_session_input_snapshot(
+                self.segment, self.source_database
+            )
+
+        clock_path.write_bytes(original)
+        records = [json.loads(line) for line in original.decode().splitlines()]
+        records[3]["node_id"] = 1
+        records[3]["node_stamp"] = self.node_timebase_offset
+        records[3]["sampled_frame_timestamp"] = self.node_timebase_offset
+        jsonl_write(clock_path, records)
+        with self.assertRaisesRegex(
+            OfflineLocalizationError, "duplicate clock node binding"
+        ):
+            offline_localization.read_finalized_session_input_snapshot(
+                self.segment, self.source_database
+            )
+
+        records = [json.loads(line) for line in original.decode().splitlines()]
+        records[3]["node_stamp"] += 0.25
+        records[3]["sampled_frame_timestamp"] += 0.25
+        jsonl_write(clock_path, records)
+        with self.assertRaisesRegex(
+            OfflineLocalizationError, "clock node binding"
+        ):
+            offline_localization.read_finalized_session_input_snapshot(
+                self.segment, self.source_database
+            )
+
+        records = [json.loads(line) for line in original.decode().splitlines()]
+        records[0]["utc_offset_seconds"] = 0
+        jsonl_write(clock_path, records)
+        with self.assertRaisesRegex(
+            OfflineLocalizationError, "timezone offset mismatch"
+        ):
+            offline_localization.read_finalized_session_input_snapshot(
+                self.segment, self.source_database
+            )
+
+        records = [json.loads(line) for line in original.decode().splitlines()]
+        records[1]["sampled_frame_timestamp"] += 2.01
+        jsonl_write(clock_path, records)
+        with self.assertRaisesRegex(
+            OfflineLocalizationError, "clock node binding"
+        ):
+            offline_localization.read_finalized_session_input_snapshot(
+                self.segment, self.source_database
+            )
+
+        records = [json.loads(line) for line in original.decode().splitlines()]
+        records[1]["timezone_id"] = "UTC"
+        records[1]["utc_offset_seconds"] = 0
+        jsonl_write(clock_path, records)
+        snapshot = offline_localization.read_finalized_session_input_snapshot(
+            self.segment, self.source_database
+        )
+        self.assertEqual(
+            [binding.node_id for binding in snapshot.clock_evidence.bindings],
+            [20],
+        )
+        self.assertIn(
+            "clock_binding_correlation_mismatch_retained_as_gap",
+            snapshot.clock_evidence.degradation_codes,
+        )
+        self.assertIn(
+            "clock_mapping_insufficient_after_cross_check",
+            snapshot.clock_evidence.degradation_codes,
+        )
+        self.assertIn(
+            "clock_start_node_unbound",
+            snapshot.clock_evidence.degradation_codes,
+        )
+
     def _upgrade_fixture_to_esl_confirmation_v3(self) -> None:
         self._upgrade_fixture_to_recovery_manifest_v2()
         manifest = json.loads((self.prior_map / "manifest.json").read_text())
@@ -2751,6 +3362,59 @@ class LocalizedPipelineTests(unittest.TestCase):
         self.assertTrue(tag["confirmation_conflict"]["rescan_required"])
         self.assertTrue(tag["needs_review"])
         self.assertEqual(tag["approval_status"], "pending")
+
+    def test_missing_final_tag_is_recovered_from_durable_burst_inventory(
+        self,
+    ) -> None:
+        self._upgrade_fixture_to_esl_confirmation_v3()
+        metadata_path = self.segment / "metadata.json"
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        metadata["localizedPriceTagCount"] = 0
+        json_write(metadata_path, metadata)
+        json_write(self.segment / "localized_price_tags.json", [])
+
+        output = self.root / "localized-missing-final-tag"
+        report = process_localized_session(
+            self.prior_map,
+            self.session,
+            self.poses,
+            self.source_database,
+            self.optimized_database,
+            output,
+        )
+        snapshot = LocalizedVersionStore(output).resolve_version(
+            str(report["version_id"])
+        )
+        tags = json.loads(
+            (snapshot.version_dir / "localized_price_tags.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(report["localized_tag_source_record_count"], 0)
+        self.assertEqual(report["durable_burst_missing_final_tag_count"], 1)
+        self.assertEqual(report["tag_source_record_count"], 1)
+        self.assertEqual(report["tag_retained_count"], 1)
+        self.assertEqual(len(tags), 1)
+        self.assertEqual(
+            tags[0]["capture_id"],
+            "12345678-1234-4234-8234-123456789abc",
+        )
+        self.assertEqual(tags[0]["payload"], "690000000001")
+        self.assertEqual(tags[0]["quality_status"], "LOW_CONFIDENCE")
+        self.assertTrue(tags[0]["needs_review"])
+        self.assertNotIn("final_map_position", tags[0])
+        self.assertFalse(tags[0].get("shelf_code"))
+        self.assertIn(
+            "durable_burst_missing_final_tag",
+            tags[0]["review_reasons"],
+        )
+        self.assertIn(
+            "durable_burst_missing_final_tag",
+            {
+                item["code"]
+                for item in report["tag_evidence_degradations"]
+            },
+        )
 
     def test_esl_v3_observation_node_injection_degrades_only_affected_tag(
         self,

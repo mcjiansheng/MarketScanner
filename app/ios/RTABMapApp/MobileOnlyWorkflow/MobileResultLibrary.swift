@@ -213,6 +213,8 @@ enum MobileResultLibrary {
         "workbook", "workbook_sha256", "workbook_bytes",
         "package_files", "artifacts",
         "store_id", "prior_map_id", "prior_map_sha256",
+        "canonical_source_sha256", "coordinate_contract_version",
+        "deliverable_contract_version",
         "tracking_session_id", "source_database", "input_bundle_sha256",
         "native_core_sha256", "processing_path",
         "policy_sha", "projection_policy_version",
@@ -220,6 +222,9 @@ enum MobileResultLibrary {
         "device_position_count", "available_position_count",
         "degraded_position_count", "coordinate_position_count",
         "tag_count", "rescan_count", "result_quality_status",
+        "source_tag_count", "retained_tag_count", "positioned_tag_count",
+        "unpositioned_tag_count", "shelf_associated_tag_count",
+        "unassociated_tag_count", "low_confidence_tag_count",
         "publish_permitted", "degradation_count",
     ]
 
@@ -2933,6 +2938,44 @@ enum MobileResultLibrary {
                   coordinatePositionCount <= devicePositionCount else {
                 throw ResultError.invalidManifest(
                     "result quality/degradation fields invalid")
+            }
+            if manifest["deliverable_contract_version"] != nil {
+                guard StrictJSONScalar.integer(
+                        manifest["deliverable_contract_version"]) == 1,
+                      StrictJSONScalar.integer(
+                        manifest["coordinate_contract_version"]) == 1,
+                      let canonicalSHA = manifest[
+                        "canonical_source_sha256"] as? String,
+                      isSHA256(canonicalSHA),
+                      let tagCount = StrictJSONScalar.integer(
+                        manifest["tag_count"]), tagCount >= 0,
+                      let sourceTagCount = StrictJSONScalar.integer(
+                        manifest["source_tag_count"]),
+                      let retainedTagCount = StrictJSONScalar.integer(
+                        manifest["retained_tag_count"]),
+                      let positionedTagCount = StrictJSONScalar.integer(
+                        manifest["positioned_tag_count"]),
+                      let unpositionedTagCount = StrictJSONScalar.integer(
+                        manifest["unpositioned_tag_count"]),
+                      let associatedTagCount = StrictJSONScalar.integer(
+                        manifest["shelf_associated_tag_count"]),
+                      let unassociatedTagCount = StrictJSONScalar.integer(
+                        manifest["unassociated_tag_count"]),
+                      let lowConfidenceTagCount = StrictJSONScalar.integer(
+                        manifest["low_confidence_tag_count"]),
+                      sourceTagCount == retainedTagCount,
+                      retainedTagCount == tagCount,
+                      positionedTagCount >= 0,
+                      unpositionedTagCount >= 0,
+                      positionedTagCount + unpositionedTagCount == tagCount,
+                      associatedTagCount >= 0,
+                      unassociatedTagCount >= 0,
+                      associatedTagCount + unassociatedTagCount == tagCount,
+                      lowConfidenceTagCount >= 0,
+                      lowConfidenceTagCount <= tagCount else {
+                    throw ResultError.invalidManifest(
+                        "calibrated deliverable counts/identity invalid")
+                }
             }
         }
         // Exact artifact contract: unique safe basenames, exact count and

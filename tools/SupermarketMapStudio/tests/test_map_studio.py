@@ -2535,6 +2535,117 @@ class MapStudioApiTests(unittest.TestCase):
         self.assertEqual([pose.source for pose in segments[0].poses], ["db_optimized", "db_optimized"])
         self.assertEqual([round(pose.x, 3) for pose in segments[0].poses], [10.0, 12.0])
 
+    def test_partial_admin_graph_never_mixes_optimized_and_raw_pose_gauges(self) -> None:
+        database = self.session_a / "segment_0001" / "rtabmap_segment_0001.db"
+        add_optimized_poses(
+            database,
+            {1: transform_blob(100.0, 1.1, 0.0)},
+        )
+        config = server.base.MapConfig(
+            0.05, 0.1, 1.25, 1.0, 0.08, 8.0, "xy", False
+        )
+        segments = server.base.discover_segments(self.session_a, config)
+        self.assertEqual([pose.source for pose in segments[0].poses], ["db", "db"])
+        self.assertEqual([round(pose.x, 3) for pose in segments[0].poses], [0.0, 2.0])
+        self.assertTrue(
+            any(
+                "refusing to mix optimized and raw pose gauges" in warning
+                for warning in segments[0].sqlite_warnings
+            )
+        )
+
+    def test_partial_optimized_graph_propagates_one_continuous_se2_correction(self) -> None:
+        session = create_session(
+            self.root,
+            "SupermarketSession-PartialOptimizedRecovery",
+            0.0,
+            "continuous_streaming",
+        )
+        database = session / "segment_0001" / "rtabmap_segment_0001.db"
+        add_rgbd_frame(session)
+        with closing(sqlite3.connect(database)) as conn, conn:
+            conn.execute(
+                "INSERT INTO Node VALUES (?, ?, ?)",
+                (3, transform_blob(4.0, 1.9, 2.0), 3.0),
+            )
+        optimized = self.root / "partial-optimized.db"
+        shutil.copy2(database, optimized)
+        add_optimized_poses(
+            optimized,
+            {
+                1: transform_blob(10.0, 1.1, 0.0),
+                3: transform_blob(14.0, 1.9, 2.0),
+            },
+        )
+        recovered, audit = server.offline.recover_partial_optimized_continuous_poses(
+            database, optimized, "xy"
+        )
+        self.assertEqual(audit["status"], "pass")
+        self.assertEqual(audit["source_node_count"], 3)
+        self.assertEqual(audit["optimized_anchor_count"], 2)
+        self.assertEqual(audit["recovered_node_count"], 3)
+        self.assertLess(audit["maximum_optimized_anchor_error"], 1.0e-6)
+        self.assertEqual(
+            [round(item["x"], 3) for item in recovered],
+            [10.0, 12.0, 14.0],
+        )
+        self.assertLess(
+            max(
+                math.hypot(
+                    recovered[index]["x"] - recovered[index - 1]["x"],
+                    recovered[index]["y"] - recovered[index - 1]["y"],
+                )
+                for index in range(1, len(recovered))
+            ),
+            3.0,
+        )
+
+    def test_partial_optimized_coverage_warns_instead_of_rejecting_results(self) -> None:
+        source = self.root / "partial-coverage-source.db"
+        optimized = self.root / "partial-coverage-optimized.db"
+        transforms = {
+            node_id: transform_blob(float(node_id - 1), 0.0, 0.0)
+            for node_id in range(1, 11)
+        }
+        with closing(sqlite3.connect(source)) as conn, conn:
+            conn.execute(
+                "CREATE TABLE Node (id INTEGER PRIMARY KEY, pose BLOB, stamp REAL)"
+            )
+            conn.executemany(
+                "INSERT INTO Node VALUES (?, ?, ?)",
+                (
+                    (node_id, transforms[node_id], float(node_id))
+                    for node_id in sorted(transforms)
+                ),
+            )
+        shutil.copy2(source, optimized)
+        add_optimized_poses(
+            optimized,
+            {
+                node_id: transform_blob(float(node_id - 1) + 10.0, 0.0, 0.0)
+                for node_id in range(1, 6)
+            },
+        )
+
+        assessment = server.offline.assess_optimized_trajectory(
+            source, optimized
+        )
+
+        self.assertEqual(assessment["status"], "warning")
+        self.assertEqual(assessment["optimized_pose_coverage"], 0.5)
+        self.assertFalse(
+            any(
+                "coverage is below" in reason
+                for reason in assessment["rejection_reasons"]
+            )
+        )
+        self.assertTrue(
+            any(
+                "SE(2) correction anchors" in warning
+                for warning in assessment["warnings"]
+            )
+        )
+
     def test_pc_offline_reprocess_is_used_for_map_generation(self) -> None:
         session = create_session(self.root, "SupermarketSession-PC", 0.0, "continuous_streaming")
         add_rgbd_frame(session)
@@ -2701,7 +2812,13 @@ class MapStudioApiTests(unittest.TestCase):
         add_rgbd_frame(self.session_a)
         database = self.session_a / "segment_0001" / "rtabmap_segment_0001.db"
         optimized = transform_blob(5.0, 6.0, 7.0)
-        add_optimized_poses(database, {1: optimized})
+        # Admin.opt_poses is authoritative only as one complete graph gauge.
+        # Include node 2 so this fixture tests full optimized SE(3)
+        # projection rather than the deliberate partial-graph raw fallback.
+        add_optimized_poses(
+            database,
+            {1: optimized, 2: transform_blob(7.0, 6.4, 8.0)},
+        )
         config = server.base.MapConfig(0.05, 0.1, 1.25, 1.0, 0.08, 8.0, "xz", False)
         segments = server.base.discover_segments(self.session_a, config)
 
@@ -3146,6 +3263,153 @@ if (clamped[0] !== 0 || clamped[1] !== 0) process.exit(6);
         upstream = process.call_args.kwargs["upstream_processing_report"]
         self.assertTrue(upstream["diagnostic_only"])
         self.assertEqual(upstream["rtabmap_reprocess_error"], str(reprocess_error))
+
+    def test_localized_map_recovers_successful_partial_graph_without_mixing_gauges(self) -> None:
+        session = create_session(
+            self.root,
+            "SupermarketSession-PartialGraphSuccess",
+            0.0,
+            "continuous_streaming",
+        )
+        source_database = (
+            session / "segment_0001" / "rtabmap_segment_0001.db"
+        )
+        optimized_database = self.root / "partial-success-optimized.db"
+        shutil.copy2(source_database, optimized_database)
+        prior_map = self.root / "PriorMap-partial-success"
+        prior_map.mkdir()
+        output = self.root / "localized-partial-success-output"
+        output.mkdir()
+        segment = SimpleNamespace(
+            index=1,
+            directory=session / "segment_0001",
+            database_path=source_database,
+            poses=[
+                SimpleNamespace(
+                    node_id=1, stamp=1.0, x=0.0, y=0.0, yaw=0.0
+                )
+            ],
+        )
+        recovered = [
+            {
+                "node_id": 1,
+                "timestamp": 1.0,
+                "x": 10.0,
+                "y": 2.0,
+                "yaw": 0.1,
+            },
+            {
+                "node_id": 2,
+                "timestamp": 2.0,
+                "x": 11.0,
+                "y": 2.0,
+                "yaw": 0.1,
+            },
+        ]
+        offline_report = {
+            "status": "warning",
+            "error_optimization": {
+                "status": "warning",
+                "optimized_pose_coverage": 0.5,
+            },
+        }
+        with (
+            mock.patch.object(
+                server,
+                "prepare_prior_map_for_processing",
+                return_value=(prior_map, None),
+            ),
+            mock.patch.object(
+                server.base,
+                "discover_segments",
+                return_value=[segment],
+            ),
+            mock.patch.object(
+                server,
+                "acceleration_selection",
+                return_value=server.gpu.BackendSelection(
+                    requested="cpu", effective="cpu", available=True
+                ),
+            ),
+            mock.patch.object(
+                server,
+                "reprocess_single_session",
+                return_value=(
+                    {1: str(optimized_database)},
+                    offline_report,
+                ),
+            ),
+            mock.patch.object(
+                server.offline,
+                "recover_partial_optimized_continuous_poses",
+                return_value=(
+                    recovered,
+                    {
+                        "status": "pass",
+                        "diagnostic_only": True,
+                        "source_node_count": 2,
+                        "optimized_anchor_count": 1,
+                        "recovered_node_count": 2,
+                    },
+                ),
+            ) as recover,
+            mock.patch.object(
+                server.localized,
+                "process_localized_session",
+                return_value={"current_updated": True},
+            ) as process,
+            mock.patch.object(server, "attach_offline_reports"),
+            mock.patch.object(server, "attach_acceleration_report"),
+            mock.patch.object(
+                server, "find_factor_graph_binary", return_value=None
+            ),
+            mock.patch.object(server.base, "generate") as generate,
+        ):
+            server.run_localized_map(
+                {
+                    "session": str(session),
+                    "prior_map": str(prior_map),
+                    "options": {"gpu_backend": "cpu"},
+                },
+                output,
+            )
+        recover.assert_called_once_with(
+            source_database, optimized_database, "ios_prior"
+        )
+        generate.assert_not_called()
+        self.assertEqual(
+            process.call_args.kwargs["optimized_poses"],
+            [
+                server.localized.Pose(
+                    node_id=1,
+                    timestamp=1.0,
+                    x=10.0,
+                    y=2.0,
+                    yaw=0.1,
+                ),
+                server.localized.Pose(
+                    node_id=2,
+                    timestamp=2.0,
+                    x=11.0,
+                    y=2.0,
+                    yaw=0.1,
+                ),
+            ],
+        )
+        replay = process.call_args.kwargs["replay_parameters"]
+        self.assertEqual(
+            replay["relative_trajectory_authority"],
+            "partial_rtabmap_graph_continuous_vio_recovery",
+        )
+        self.assertTrue(replay["rtabmap_global_graph_incomplete"])
+        upstream = process.call_args.kwargs["upstream_processing_report"]
+        self.assertTrue(upstream["diagnostic_only"])
+        self.assertTrue(upstream["rtabmap_global_graph_incomplete"])
+        self.assertEqual(
+            upstream["partial_optimized_continuous_recovery"]
+                ["recovered_node_count"],
+            2,
+        )
 
     def test_localized_map_keeps_non_current_diagnostic_version_as_completed_output(self) -> None:
         session = create_session(

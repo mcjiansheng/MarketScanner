@@ -61,6 +61,7 @@ from PriorMap import offline_localization as localized
 from PriorMap.export_calibrated_trajectory import export as export_calibrated_trajectory
 from PriorMap.factor_graph_runner import find_factor_graph_binary
 from PriorMap.localized_output_store import (
+    ALL_LOCALIZED_VERSION_FILES,
     LocalizedSnapshot,
     LocalizedStoreError,
     LocalizedVersionStore,
@@ -861,7 +862,7 @@ def job_artifacts(
                         f"/api/jobs/{job.identifier}/localized/versions/"
                         f"{snapshot.version_id}/artifact/{name}"
                     )
-                    for name in PUBLISHED_VERSION_FILES
+                    for name in ALL_LOCALIZED_VERSION_FILES
                     if (snapshot.version_dir / name).is_file()
                 }
             )
@@ -2237,6 +2238,51 @@ def run_localized_map(
             "连续轨迹诊断恢复",
             "RTAB-Map 全局图不完整，正在保留完整原始 VIO；坐标系重置只使用多 Link 一致证据缝合",
         )
+    else:
+        optimized_coverage = float(
+            offline_report.get("error_optimization", {}).get(
+                "optimized_pose_coverage", 1.0
+            )
+        )
+        if optimized_coverage < 1.0 - 1.0e-9:
+            optimized_database = Path(
+                database_overrides[original_segments[0].index]
+            )
+            recovered_raw_pose_values, partial_recovery_assessment = (
+                offline.recover_partial_optimized_continuous_poses(
+                    original_segments[0].database_path,
+                    optimized_database,
+                    "ios_prior",
+                )
+            )
+            if partial_recovery_assessment.get("status") not in {
+                "pass",
+                "raw_only",
+            }:
+                raise offline.OfflineProcessingError(
+                    "RTAB-Map optimized only part of the source trajectory and "
+                    "the complete continuous VIO skeleton could not be recovered: "
+                    + str(partial_recovery_assessment.get("reason") or "unknown")
+                )
+            raw_vio_recovery = True
+            raw_vio_recovery_authority = (
+                "partial_rtabmap_graph_continuous_vio_recovery"
+            )
+            offline_report["status"] = "diagnostic_recovery"
+            offline_report["diagnostic_only"] = True
+            offline_report["rtabmap_global_graph_incomplete"] = True
+            offline_report["partial_optimized_continuous_recovery"] = (
+                partial_recovery_assessment
+            )
+            report_progress(
+                progress,
+                62,
+                "补全优化轨迹",
+                (
+                    "RTAB-Map 仅保存了部分节点；正在以完整连续 VIO 为骨架，"
+                    "连续传播已优化节点的 SE(2) 校正，保留全部源节点"
+                ),
+            )
     report_progress(progress, 64, "生成 RTAB-Map 成果", "正在用优化数据库生成兼容的 2D/3D 地图成果")
     args = SimpleNamespace(
         session=str(session),
@@ -2348,6 +2394,11 @@ def run_localized_map(
     version_id = localized_result.get("version_id")
     if isinstance(version_id, str) and version_id:
         version_directory = output / "localized" / "versions" / version_id
+        # The immutable localized version already contains the authoritative
+        # node/one-second CSV tables and their cross-file manifest. This
+        # post-commit step only renders review PNGs (and compatibility copies
+        # of the verified CSVs); its failure can never erase or invalidate the
+        # committed business tables.
         export_directory = output / "calibrated_trajectory_export"
         try:
             export_manifest = export_calibrated_trajectory(
@@ -2363,6 +2414,7 @@ def run_localized_map(
                         "version": 1,
                         "source_version": version_id,
                         "result_version_preserved": True,
+                        "immutable_core_tables_preserved": True,
                         "message": str(exc),
                     },
                     ensure_ascii=False,
@@ -2376,7 +2428,7 @@ def run_localized_map(
                 progress,
                 98,
                 "坐标表导出需复核",
-                "本地化版本已安全保留，但附加 CSV/PNG 导出未完成；错误审计已写入结果目录",
+                "不可变位置表和价签表已安全提交，但附加路线 PNG 未完成；错误审计已写入结果目录",
             )
         else:
             report_progress(
@@ -2384,8 +2436,8 @@ def run_localized_map(
                 98,
                 "导出校准坐标",
                 (
-                    f"已导出 {export_manifest.get('node_count', 0)} 个节点和 "
-                    f"{export_manifest.get('one_second_sample_count', 0)} 条逐秒手机坐标及路线预览"
+                    f"不可变核心坐标表已提交；另生成 {export_manifest.get('node_count', 0)} 个节点和 "
+                    f"{export_manifest.get('one_second_sample_count', 0)} 条逐秒坐标的路线预览"
                 ),
             )
     if not localized_result.get("current_updated"):
@@ -2875,14 +2927,39 @@ def apply_localized_edit(job: Job, data: Dict[str, Any]) -> Dict[str, Any]:
         segments = base.discover_segments(session, config, {1: optimized_database})
         if len(segments) != 1:
             raise RequestError("优化轨迹无法重新读取。")
-        poses = (
-            localized.load_raw_continuous_vio_poses(
+        relative_authority = replay_parameters["relative_trajectory_authority"]
+        if relative_authority in {
+            "raw_continuous_vio_manual_anchor_recovery",
+            "raw_continuous_vio_diagnostic_recovery",
+        }:
+            poses = localized.load_raw_continuous_vio_poses(
                 source_database,
                 replay_parameters["horizontal_axes"],
             )
-            if replay_parameters["relative_trajectory_authority"]
-            == "raw_continuous_vio_manual_anchor_recovery"
-            else [
+        elif relative_authority == "partial_rtabmap_graph_continuous_vio_recovery":
+            recovered_values, recovery_assessment = (
+                offline.recover_partial_optimized_continuous_poses(
+                    source_database,
+                    optimized_database,
+                    replay_parameters["horizontal_axes"],
+                )
+            )
+            if recovery_assessment.get("status") not in {"pass", "raw_only"}:
+                raise RequestError(
+                    "部分优化图的完整连续轨迹无法重放；旧 current 保持不变。"
+                )
+            poses = [
+                localized.Pose(
+                    node_id=int(item["node_id"]),
+                    timestamp=float(item["timestamp"]),
+                    x=float(item["x"]),
+                    y=float(item["y"]),
+                    yaw=float(item["yaw"]),
+                )
+                for item in recovered_values
+            ]
+        else:
+            poses = [
                 localized.Pose(
                     node_id=pose.node_id,
                     timestamp=pose.stamp,
@@ -2892,7 +2969,6 @@ def apply_localized_edit(job: Job, data: Dict[str, Any]) -> Dict[str, Any]:
                 )
                 for pose in segments[0].poses
             ]
-        )
         upstream_processing_report = None
         offline_bundle = load_json(
             job.output_dir / "offline_processing_report.json", None
@@ -3757,7 +3833,7 @@ class StudioHandler(BaseHTTPRequestHandler):
     def serve_localized_artifact(
         self, job: Job, version_id: str, name: str
     ) -> None:
-        if job.kind != "localized" or name not in PUBLISHED_VERSION_FILES:
+        if job.kind != "localized" or name not in ALL_LOCALIZED_VERSION_FILES:
             self.send_json(HTTPStatus.NOT_FOUND, {"error": "Artifact is not available."})
             return
         try:

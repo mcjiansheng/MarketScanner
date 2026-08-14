@@ -464,10 +464,26 @@ enum MobileProcessingPipeline {
             expectedBurstCount: (metadata["tagObservationBurstCount"] as? NSNumber)?.intValue,
             expectedLastBurstID: metadata["tagObservationBurstLastID"] as? String)
         if burstEvidence.audit.rejectedDetails.contains(where: {
-            $0.reason == "identity_missing_or_mismatch"
+            [
+                "invalid_json", "format_invalid", "version_unsupported",
+                "identity_missing_or_mismatch", "business_identity_invalid",
+            ].contains($0.reason)
         }) {
             throw MobileOnlyWorkflowError.invalidState(
-                "价签 burst 存在地图/楼层/会话身份串包记录")
+                "价签 burst 存在无法界定的格式、版本或业务身份记录")
+        }
+        if burstEvidence.audit.rejectedDetails.contains(where: {
+            $0.reason == "duplicate_burst_id"
+                || $0.reason == "duplicate_frame_id"
+                || $0.reason == "duplicate_observation_id"
+        }) {
+            throw MobileOnlyWorkflowError.invalidState(
+                "价签 burst 存在重复 durable 主键，无法界定业务采集身份")
+        }
+        guard burstEvidence.sourceBusinessCaptureCount
+                == burstEvidence.audit.recordTotal else {
+            throw MobileOnlyWorkflowError.invalidState(
+                "价签 burst 源业务清单无法覆盖全部 durable 记录")
         }
         if !burstEvidence.audit.clean {
             let audit = burstEvidence.audit
@@ -803,18 +819,34 @@ enum MobileProcessingPipeline {
         // Missing/insufficient/inconsistent evidence fails the publish;
         // the identity stamp assumption and the processing-time
         // timezone are never used as fallbacks.
-        let utcMapper = try buildClockMapper(
+        let clockMapping = try buildClockMapper(
             snapshotDirectory: snapshot.snapshotDirectory,
             metadata: metadata,
             trackingSessionID: request.trackingSessionID,
             sessionStartStamp: sessionStartStamp,
             sessionEndStamp: sessionEndStamp,
             nodeInventory: nodeInventory)
-        guard let sessionStartUTC = utcMapper.utcSeconds(forMonotonic: 0),
-              let sessionEndUTC = utcMapper.utcSeconds(
-                  forMonotonic: sessionEndStamp - sessionStartStamp) else {
-            throw PipelineError.clockEvidenceIncomplete(
-                "session span outside the node-binding evidence span")
+        let utcMapper = clockMapping.mapper
+        let sessionStartUTC = clockMapping.sessionStartUTC
+        let sessionEndUTC = clockMapping.sessionEndUTC
+        if !clockMapping.rejectedBindingNodeIDs.isEmpty {
+            degradations.append(ProcessingDegradation(
+                code: "clock_binding_correlation_mismatch_retained_as_gap",
+                stage: "clock_evidence",
+                count: clockMapping.rejectedBindingNodeIDs.count,
+                detail: "局部 node binding 与独立 uptime→UTC 相关曲线不一致；"
+                    + "已排除这些绑定并保留其余逐秒结果",
+                affectedIDs: clockMapping.rejectedBindingNodeIDs.map(String.init)))
+        }
+        if !clockMapping.mappingSufficient {
+            degradations.append(ProcessingDegradation(
+                code: "clock_mapping_insufficient_after_cross_check",
+                stage: "clock_evidence",
+                count: 1,
+                detail: "时钟文件 framing、水位、会话身份和节点身份有效，"
+                    + "但可交叉验证的 node binding 少于两条；"
+                    + "完整秒级时间轴保留，位置写为 UNAVAILABLE",
+                affectedIDs: clockMapping.rejectedBindingNodeIDs.map(String.init)))
         }
 
         // --- Final trajectory (1 Hz) from the native reconstruction -----
@@ -977,9 +1009,16 @@ enum MobileProcessingPipeline {
             graphQualityPassed: graphQualityPassed,
             rawNodePoses: rawNodePoses,
             minimumAssociationMarginM: 0.5,
+            sourceBursts: burstEvidence.bursts,
+            retainedDegradedBursts: burstEvidence.retainedDegradedBursts,
             incompleteBursts: incompleteBursts,
             coordinatesArePriorMapFrame:
                 selectedTrajectory.coordinatesArePriorMapFrame)
+        let sourceTagCount = burstEvidence.sourceBusinessCaptureCount
+        guard priceTags.count == sourceTagCount else {
+            throw MobileOnlyWorkflowError.invalidState(
+                "价签结果核账失败：retained=\(priceTags.count) source=\(sourceTagCount)")
+        }
         rescanTasks.append(contentsOf: sessionRescanTasks)
         try checkCancelled()
 
@@ -1002,6 +1041,15 @@ enum MobileProcessingPipeline {
         let coordinatePositionCount = devicePositions.filter {
             ($0.mapXM != nil && $0.mapYM != nil)
                 || ($0.localXM != nil && $0.localYM != nil)
+        }.count
+        let positionedTagCount = priceTags.filter {
+            $0.mapXM != nil && $0.mapYM != nil
+        }.count
+        let shelfAssociatedTagCount = priceTags.filter {
+            !$0.shelfSegmentID.isEmpty && !$0.shelfCode.isEmpty
+        }.count
+        let lowConfidenceTagCount = priceTags.filter {
+            $0.qualityStatus == "LOW_CONFIDENCE"
         }.count
 
         // --- Result package (staged, then atomically committed, §20) ---
@@ -1138,6 +1186,8 @@ enum MobileProcessingPipeline {
             ],
             "tags": [
                 "observation_count": tagObservations.count,
+                "source_capture_count": sourceTagCount,
+                "retained_capture_count": priceTags.count,
                 "accepted_count": priceTags.filter { $0.qualityStatus == "ACCEPTED" }.count,
                 "low_confidence_count": priceTags.filter {
                     $0.qualityStatus == "LOW_CONFIDENCE"
@@ -1150,6 +1200,8 @@ enum MobileProcessingPipeline {
                 "record_total": burstEvidence.audit.recordTotal,
                 "record_accepted": burstEvidence.audit.recordAccepted,
                 "record_rejected": burstEvidence.audit.totalRejected,
+                "retained_degraded_burst_count":
+                    burstEvidence.retainedDegradedBursts.count,
                 "incomplete_burst_count": incompleteBursts.count,
                 "missing_observation_count": incompleteBursts.reduce(0) {
                     $0 + $1.missingObservationCount
@@ -1288,6 +1340,9 @@ enum MobileProcessingPipeline {
                 "store_id": request.storeID,
                 "prior_map_id": request.priorMap.priorMapID,
                 "prior_map_sha256": request.priorMap.packageSHA256,
+                "canonical_source_sha256": request.priorMap.canonicalSourceSHA256,
+                "coordinate_contract_version": 1,
+                "deliverable_contract_version": 1,
                 "tracking_session_id": request.trackingSessionID,
                 "source_database": request.sourceDatabase.lastPathComponent,
                 "input_bundle_sha256": snapshot.bundleSHA256,
@@ -1305,6 +1360,17 @@ enum MobileProcessingPipeline {
                 "degraded_position_count": degradedPositionCount,
                 "coordinate_position_count": coordinatePositionCount,
                 "tag_count": priceTags.count,
+                // The safely parsed business tag inventory is represented by
+                // exactly one retained FinalPriceTag row per capture/burst
+                // identity. Weak position or shelf evidence changes status,
+                // never record retention.
+                "source_tag_count": sourceTagCount,
+                "retained_tag_count": priceTags.count,
+                "positioned_tag_count": positionedTagCount,
+                "unpositioned_tag_count": priceTags.count - positionedTagCount,
+                "shelf_associated_tag_count": shelfAssociatedTagCount,
+                "unassociated_tag_count": priceTags.count - shelfAssociatedTagCount,
+                "low_confidence_tag_count": lowConfidenceTagCount,
                 "rescan_count": rescanTasks.count,
                 "result_quality_status": resultQualityStatus.rawValue,
                 "publish_permitted": publishPermitted,
@@ -1739,10 +1805,12 @@ enum MobileProcessingPipeline {
     /// Builds the authoritative monotonic(=stamp-sessionStart) -> UTC
     /// mapper from the recorded clock evidence (V1R4 §7.3). The sidecar
     /// is parsed strictly: exact schema/version/session identity/counts,
-    /// strictly increasing axes and per-binding UTC cross-checks. Any
-    /// failure throws `clockEvidenceIncomplete`; the identity stamp
-    /// assumption and the processing-time timezone are never used as
-    /// fallbacks.
+    /// strictly increasing axes and per-binding UTC cross-checks. Framing,
+    /// watermark, identity and snapshot-node conflicts throw
+    /// `clockEvidenceIncomplete`; insufficient correlation-consistent binding
+    /// coverage returns a mapper that yields UNAVAILABLE seconds so the rest
+    /// of the trajectory and tag result can still be committed. The identity
+    /// stamp assumption and processing-time timezone are never fallbacks.
     static func buildClockMapper(
         snapshotDirectory: URL,
         metadata: [String: Any],
@@ -1750,7 +1818,13 @@ enum MobileProcessingPipeline {
         sessionStartStamp: Double,
         sessionEndStamp: Double,
         nodeInventory: [AbsolutePriorEvidenceNode]
-    ) throws -> MonotonicUTCMapper {
+    ) throws -> (
+        mapper: MonotonicUTCMapper,
+        sessionStartUTC: Double,
+        sessionEndUTC: Double,
+        rejectedBindingNodeIDs: [Int],
+        mappingSufficient: Bool
+    ) {
         let clockURL = snapshotDirectory
             .appendingPathComponent("clock_correlations.jsonl")
         guard FileManager.default.fileExists(atPath: clockURL.path) else {
@@ -1790,20 +1864,29 @@ enum MobileProcessingPipeline {
             throw PipelineError.clockEvidenceIncomplete(
                 "invalid clock evidence: \(error.localizedDescription)")
         }
-        guard StrictClockEvidenceParser.isEvidenceSufficient(evidence) else {
-            throw PipelineError.clockEvidenceIncomplete(
-                "insufficient clock evidence: correlations=\(evidence.correlations.count) bindings=\(evidence.bindings.count)")
-        }
+        let mappingSufficient = StrictClockEvidenceParser
+            .isEvidenceSufficient(evidence)
         let mapper = StrictClockEvidenceParser.buildMapper(
             evidence: evidence, sessionStartStamp: sessionStartStamp)
-        guard let startUTC = mapper.utcSeconds(forMonotonic: 0),
-              let endUTC = mapper.utcSeconds(
-                  forMonotonic: sessionEndStamp - sessionStartStamp),
-              endUTC >= startUTC else {
+        // Correlation records bind the scan wall-clock boundaries even when
+        // the first/last RTAB-Map node lacks a usable node binding. The
+        // mapper is intentionally allowed to return nil outside its retained
+        // binding span; FinalTrajectory emits those seconds as UNAVAILABLE
+        // instead of aborting or extrapolating positions.
+        guard let firstCorrelation = evidence.correlations.first,
+              let lastCorrelation = evidence.correlations.last,
+              lastCorrelation.utcUnixSeconds
+                >= firstCorrelation.utcUnixSeconds else {
             throw PipelineError.clockEvidenceIncomplete(
-                "session span outside the node-binding evidence span")
+                "clock correlation session boundaries are unavailable")
         }
-        return mapper
+        return (
+            mapper: mapper,
+            sessionStartUTC: firstCorrelation.utcUnixSeconds,
+            sessionEndUTC: lastCorrelation.utcUnixSeconds,
+            rejectedBindingNodeIDs:
+                evidence.rejectedCorrelationBindingNodeIDs,
+            mappingSufficient: mappingSufficient)
     }
 
     // MARK: - Tags
@@ -1994,15 +2077,111 @@ enum MobileProcessingPipeline {
         graphQualityPassed: Bool,
         rawNodePoses: [Int64: SE2Transform],
         minimumAssociationMarginM: Double,
+        sourceBursts: [VerifiedTagBurst] = [],
+        retainedDegradedBursts: [TagObservationBurstEvidenceParseResult
+            .RetainedDegradedBurstSummary] = [],
         incompleteBursts: [TagObservationBurstEvidenceParseResult
             .UnconsumedBurstSummary] = [],
         coordinatesArePriorMapFrame: Bool = true
     ) throws -> ([FinalPriceTag], [RescanTask]) {
-        guard !observations.isEmpty || !incompleteBursts.isEmpty else {
+        guard !observations.isEmpty || !sourceBursts.isEmpty
+            || !retainedDegradedBursts.isEmpty || !incompleteBursts.isEmpty else {
             return ([], [])
         }
 
+        let sourceBurstIDs = Set(sourceBursts.map(\.burstID))
+        let degradedBurstIDs = Set(retainedDegradedBursts.map(\.burstID))
+        guard sourceBurstIDs.count == sourceBursts.count,
+              degradedBurstIDs.count == retainedDegradedBursts.count,
+              sourceBurstIDs.isDisjoint(with: degradedBurstIDs) else {
+            throw MobileOnlyWorkflowError.invalidState(
+                "价签 durable burst 身份清单重复或交叉")
+        }
+
         if !coordinatesArePriorMapFrame {
+            if !sourceBursts.isEmpty || !retainedDegradedBursts.isEmpty {
+                let observationCountByBurst = Dictionary(
+                    grouping: observations.compactMap { observation -> (
+                        String, TagObservationEvidenceObservation)? in
+                        guard let burstID = observation.burstID else {
+                            return nil
+                        }
+                        return (burstID, observation)
+                    },
+                    by: { $0.0 }).mapValues(\.count)
+                var tags: [FinalPriceTag] = []
+                var tasks: [RescanTask] = []
+                func appendLocalOnly(
+                    burstID: String,
+                    barcode: String,
+                    symbology: String,
+                    burstFloorID: String,
+                    observationCount: Int,
+                    reason: String
+                ) {
+                    let instanceID = "\(barcode)-\(burstFloorID)-\(burstID)"
+                    tags.append(FinalPriceTag(
+                        tagInstanceID: instanceID,
+                        barcode: barcode,
+                        symbology: symbology,
+                        storeID: storeID,
+                        floorID: burstFloorID,
+                        mapVersion: 1,
+                        priorMapSha256: priorMap.packageSHA256,
+                        trackingSessionID: sessionID,
+                        shelfCode: "",
+                        shelfSegmentID: "",
+                        shelfSide: "",
+                        distanceFromShelfStartCm: nil,
+                        positionRatio: nil,
+                        mapXM: nil,
+                        mapYM: nil,
+                        observationCount: observationCount,
+                        positionSpreadCm: 0,
+                        localizationConfidence: 0,
+                        associationConfidence: 0,
+                        qualityStatus: "LOW_CONFIDENCE",
+                        reason: reason))
+                    tasks.append(RescanTask(
+                        taskID: "rescan-\(tasks.count + 1)-\(burstID)-local-only",
+                        taskType: .tagRescan,
+                        floorID: burstFloorID,
+                        barcode: barcode,
+                        tagInstanceID: instanceID,
+                        shelfCode: "",
+                        shelfSegmentID: "",
+                        regionStartCm: nil,
+                        regionEndCm: nil,
+                        localStartTime: "",
+                        localEndTime: "",
+                        reasonCode: reason,
+                        humanMessage: "已保留条码，但轨迹未对齐到先验地图，无法给出价签地图坐标",
+                        suggestedAction: "人工复核或补扫该价签",
+                        priority: 1))
+                }
+                for burst in sourceBursts.sorted(by: { $0.sequence < $1.sequence }) {
+                    appendLocalOnly(
+                        burstID: burst.burstID,
+                        barcode: burst.barcode,
+                        symbology: burst.symbology,
+                        burstFloorID: burst.floorID,
+                        observationCount:
+                            observationCountByBurst[burst.burstID] ?? 0,
+                        reason: "trajectory_local_frame_only")
+                }
+                for burst in retainedDegradedBursts.sorted(by: {
+                    $0.recordIndex < $1.recordIndex
+                }) {
+                    appendLocalOnly(
+                        burstID: burst.burstID,
+                        barcode: burst.barcode,
+                        symbology: burst.symbology,
+                        burstFloorID: burst.floorID,
+                        observationCount: 0,
+                        reason: "burst_schema_degraded:\(burst.rejectionReason)")
+                }
+                return (tags, tasks)
+            }
             struct LocalOnlyTagKey: Hashable {
                 let barcode: String
                 let symbology: String
@@ -2208,6 +2387,7 @@ enum MobileProcessingPipeline {
             let barcode: String
             let symbology: String
             let floorID: String
+            let burstID: String?
             let shelfSegmentID: String
             let shelfSide: String
             let trackingSessionID: String
@@ -2283,6 +2463,7 @@ enum MobileProcessingPipeline {
                         barcode: observation.barcode,
                         symbology: observation.symbology,
                         floorID: observation.floorID,
+                        burstID: observation.burstID,
                         shelfSegmentID: consensus?.shelfSegmentID ?? "",
                         shelfSide: consensus?.shelfSide ?? "",
                         trackingSessionID: observation.trackingSessionID)
@@ -2301,6 +2482,51 @@ enum MobileProcessingPipeline {
 
         var priceTags: [FinalPriceTag] = []
         var rescanTasks: [RescanTask] = []
+        var emittedBurstIDs = Set<String>()
+        for burst in retainedDegradedBursts.sorted(by: {
+            $0.recordIndex < $1.recordIndex
+        }) {
+            let instanceID = "\(burst.barcode)-\(burst.floorID)-degraded-\(burst.burstID)"
+            priceTags.append(FinalPriceTag(
+                tagInstanceID: instanceID,
+                barcode: burst.barcode,
+                symbology: burst.symbology,
+                storeID: storeID,
+                floorID: burst.floorID,
+                mapVersion: 1,
+                priorMapSha256: priorMap.packageSHA256,
+                trackingSessionID: sessionID,
+                shelfCode: "",
+                shelfSegmentID: "",
+                shelfSide: "",
+                distanceFromShelfStartCm: nil,
+                positionRatio: nil,
+                mapXM: nil,
+                mapYM: nil,
+                observationCount: 0,
+                positionSpreadCm: 0,
+                localizationConfidence: 0,
+                associationConfidence: 0,
+                qualityStatus: "LOW_CONFIDENCE",
+                reason: "burst_schema_degraded:\(burst.rejectionReason)"))
+            rescanTasks.append(RescanTask(
+                taskID: "rescan-\(rescanTasks.count + 1)-\(burst.burstID)-degraded",
+                taskType: .tagRescan,
+                floorID: burst.floorID,
+                barcode: burst.barcode,
+                tagInstanceID: instanceID,
+                shelfCode: "",
+                shelfSegmentID: "",
+                regionStartCm: nil,
+                regionEndCm: nil,
+                localStartTime: "",
+                localEndTime: "",
+                reasonCode: "burst_schema_degraded",
+                humanMessage: "价签条码已保留，但 burst 证据退化：\(burst.rejectionReason)",
+                suggestedAction: "人工复核；需要更高精度时可补扫",
+                priority: 1))
+            emittedBurstIDs.insert(burst.burstID)
+        }
         for burst in incompleteBursts where
             (resolvedFrameCountByBurst[burst.burstID] ?? 0) < 3 {
             let instanceID = "\(burst.barcode)-\(burst.floorID)-incomplete-\(burst.burstID)"
@@ -2342,6 +2568,7 @@ enum MobileProcessingPipeline {
                 humanMessage: "价签已保留，但缺少 \(burst.missingObservationCount) 帧逐帧观测",
                 suggestedAction: "人工复核或补扫该价签",
                 priority: 1))
+            emittedBurstIDs.insert(burst.burstID)
         }
         // The strict parser verified identity per record; the gate still
         // derives the flag from the actual observations instead of a
@@ -2374,9 +2601,9 @@ enum MobileProcessingPipeline {
             let symbology: String
             let floorID: String
             let trackingSessionID: String
-            let reason: String
+            let burstID: String?
         }
-        var failureGroups: [FailureGroupKey: Int] = [:]
+        var failureGroups: [FailureGroupKey: (count: Int, reasons: Set<String>)] = [:]
         failureGroups.reserveCapacity(resolutionFailures.count)
         for failure in resolutionFailures {
             let key = FailureGroupKey(
@@ -2384,18 +2611,34 @@ enum MobileProcessingPipeline {
                 symbology: failure.symbology,
                 floorID: failure.floorID,
                 trackingSessionID: failure.trackingSessionID,
-                reason: failure.reason)
-            failureGroups[key, default: 0] += 1
+                burstID: failure.burstID)
+            var group = failureGroups[key]
+                ?? (count: 0, reasons: Set<String>())
+            group.count += 1
+            group.reasons.insert(failure.reason)
+            failureGroups[key] = group
         }
         let orderedFailureKeys = failureGroups.keys.sorted {
             ($0.barcode, $0.symbology, $0.floorID,
-             $0.trackingSessionID, $0.reason)
+             $0.trackingSessionID, $0.burstID ?? "")
                 < ($1.barcode, $1.symbology, $1.floorID,
-                   $1.trackingSessionID, $1.reason)
+                   $1.trackingSessionID, $1.burstID ?? "")
         }
         for group in orderedFailureKeys {
-            let failureCount = failureGroups[group] ?? 0
-            let instanceID = "\(group.barcode)-\(group.floorID)-unresolved-\(priceTags.count + 1)"
+            if let burstID = group.burstID,
+               emittedBurstIDs.contains(burstID) {
+                continue
+            }
+            let failure = failureGroups[group]
+                ?? (count: 0, reasons: Set<String>())
+            let failureCount = failure.count
+            let reasons = failure.reasons.sorted()
+            let reason = reasons.count == 1
+                ? reasons[0]
+                : "burst_resolution_degraded:\(reasons.joined(separator: "+"))"
+            let identitySuffix = group.burstID
+                ?? "legacy-\(priceTags.count + 1)"
+            let instanceID = "\(group.barcode)-\(group.floorID)-unresolved-\(identitySuffix)"
             priceTags.append(FinalPriceTag(
                 tagInstanceID: instanceID,
                 barcode: group.barcode,
@@ -2417,9 +2660,9 @@ enum MobileProcessingPipeline {
                 localizationConfidence: 0,
                 associationConfidence: 0,
                 qualityStatus: "LOW_CONFIDENCE",
-                reason: group.reason))
+                reason: reason))
             rescanTasks.append(RescanTask(
-                taskID: "rescan-\(rescanTasks.count + 1)-\(group.barcode)-\(group.reason)",
+                taskID: "rescan-\(rescanTasks.count + 1)-\(identitySuffix)-unresolved",
                 taskType: .tagRescan,
                 floorID: group.floorID,
                 barcode: group.barcode,
@@ -2430,25 +2673,45 @@ enum MobileProcessingPipeline {
                 regionEndCm: nil,
                 localStartTime: "",
                 localEndTime: "",
-                reasonCode: group.reason,
-                humanMessage: "价签观测无法解析（\(failureCount) 条）：\(group.reason)",
+                reasonCode: reason,
+                humanMessage: "价签观测无法解析（\(failureCount) 条）：\(reason)",
                 suggestedAction: "重新扫描该价签",
                 priority: 1))
+            if let burstID = group.burstID {
+                emittedBurstIDs.insert(burstID)
+            }
         }
         // Per bucket: bounded-diameter robust cluster -> burst fusion ->
         // quality gate (the gate re-associates the fused centroid for
         // first/second margin + occlusion).
         let orderedBucketKeys = buckets.keys.sorted {
-            ($0.barcode, $0.symbology, $0.floorID, $0.shelfSegmentID,
-             $0.shelfSide, $0.trackingSessionID)
-                < ($1.barcode, $1.symbology, $1.floorID, $1.shelfSegmentID,
-                   $1.shelfSide, $1.trackingSessionID)
+            let lhsPrimary = (
+                $0.barcode, $0.symbology, $0.floorID, $0.burstID ?? "",
+                $0.shelfSegmentID, $0.shelfSide)
+            let rhsPrimary = (
+                $1.barcode, $1.symbology, $1.floorID, $1.burstID ?? "",
+                $1.shelfSegmentID, $1.shelfSide)
+            return lhsPrimary == rhsPrimary
+                ? $0.trackingSessionID < $1.trackingSessionID
+                : lhsPrimary < rhsPrimary
         }
         for bucketKey in orderedBucketKeys {
             guard let bucket = buckets[bucketKey] else { continue }
-            let instances = TagObservationResolver.clusterInstances(
-                observations: bucket.observations, clusterRadiusM: 1.5)
+            if let burstID = bucketKey.burstID,
+               emittedBurstIDs.contains(burstID) {
+                continue
+            }
+            let instances: [TagObservationResolver.TagInstance]
+            if bucketKey.burstID != nil {
+                instances = TagObservationResolver.fuse(
+                    observations: bucket.observations).map { [$0] } ?? []
+            } else {
+                instances = TagObservationResolver.clusterInstances(
+                    observations: bucket.observations, clusterRadiusM: 1.5)
+            }
             for instance in instances {
+                let identitySuffix = bucketKey.burstID
+                    ?? "legacy-\(priceTags.count + 1)"
                 guard let association = ShelfAssociationEngine.bestAssociation(
                     point: (instance.mapXM, instance.mapYM),
                     shelves: shelves,
@@ -2465,7 +2728,7 @@ enum MobileProcessingPipeline {
                     let rescanSuggested = reason != "no_shelf_association"
                     let status = "LOW_CONFIDENCE"
                     priceTags.append(FinalPriceTag(
-                        tagInstanceID: "\(instance.barcode)-\(instance.floorID)-\(priceTags.count + 1)",
+                        tagInstanceID: "\(instance.barcode)-\(instance.floorID)-\(identitySuffix)",
                         barcode: instance.barcode,
                         symbology: instance.symbology,
                         storeID: storeID,
@@ -2492,7 +2755,7 @@ enum MobileProcessingPipeline {
                             taskType: .tagRescan,
                             floorID: instance.floorID,
                             barcode: instance.barcode,
-                            tagInstanceID: "\(instance.barcode)-\(instance.floorID)-\(priceTags.count)",
+                            tagInstanceID: "\(instance.barcode)-\(instance.floorID)-\(identitySuffix)",
                             shelfCode: "",
                             shelfSegmentID: "",
                             regionStartCm: nil,
@@ -2503,6 +2766,9 @@ enum MobileProcessingPipeline {
                             humanMessage: reason,
                             suggestedAction: "重新扫描该价签",
                             priority: 1))
+                    }
+                    if let burstID = bucketKey.burstID {
+                        emittedBurstIDs.insert(burstID)
                     }
                     continue
                 }
@@ -2563,7 +2829,7 @@ enum MobileProcessingPipeline {
                     ? "LOW_CONFIDENCE" : evaluation.0.rawValue
                 let reason = evaluation.1
                 priceTags.append(FinalPriceTag(
-                    tagInstanceID: "\(instance.barcode)-\(instance.floorID)-\(priceTags.count + 1)",
+                    tagInstanceID: "\(instance.barcode)-\(instance.floorID)-\(identitySuffix)",
                     barcode: instance.barcode,
                     symbology: instance.symbology,
                     storeID: storeID,
@@ -2590,7 +2856,7 @@ enum MobileProcessingPipeline {
                         taskType: .tagRescan,
                         floorID: instance.floorID,
                         barcode: instance.barcode,
-                        tagInstanceID: "\(instance.barcode)-\(instance.floorID)-\(priceTags.count)",
+                        tagInstanceID: "\(instance.barcode)-\(instance.floorID)-\(identitySuffix)",
                         shelfCode: association.shelfCode,
                         shelfSegmentID: association.shelfSegmentID,
                         regionStartCm: nil,
@@ -2602,6 +2868,61 @@ enum MobileProcessingPipeline {
                         suggestedAction: "重新扫描该价签",
                         priority: 1))
                 }
+                if let burstID = bucketKey.burstID {
+                    emittedBurstIDs.insert(burstID)
+                }
+            }
+        }
+        if !sourceBursts.isEmpty {
+            for burst in sourceBursts.sorted(by: { $0.sequence < $1.sequence })
+                where !emittedBurstIDs.contains(burst.burstID) {
+                let instanceID = "\(burst.barcode)-\(burst.floorID)-missing-\(burst.burstID)"
+                priceTags.append(FinalPriceTag(
+                    tagInstanceID: instanceID,
+                    barcode: burst.barcode,
+                    symbology: burst.symbology,
+                    storeID: storeID,
+                    floorID: burst.floorID,
+                    mapVersion: 1,
+                    priorMapSha256: priorMap.packageSHA256,
+                    trackingSessionID: sessionID,
+                    shelfCode: "",
+                    shelfSegmentID: "",
+                    shelfSide: "",
+                    distanceFromShelfStartCm: nil,
+                    positionRatio: nil,
+                    mapXM: nil,
+                    mapYM: nil,
+                    observationCount:
+                        resolvedFrameCountByBurst[burst.burstID] ?? 0,
+                    positionSpreadCm: 0,
+                    localizationConfidence: 0,
+                    associationConfidence: 0,
+                    qualityStatus: "LOW_CONFIDENCE",
+                    reason: "burst_result_unavailable"))
+                rescanTasks.append(RescanTask(
+                    taskID: "rescan-\(rescanTasks.count + 1)-\(burst.burstID)-missing",
+                    taskType: .tagRescan,
+                    floorID: burst.floorID,
+                    barcode: burst.barcode,
+                    tagInstanceID: instanceID,
+                    shelfCode: "",
+                    shelfSegmentID: "",
+                    regionStartCm: nil,
+                    regionEndCm: nil,
+                    localStartTime: "",
+                    localEndTime: "",
+                    reasonCode: "burst_result_unavailable",
+                    humanMessage: "价签业务记录已保留，但没有可提交的位置或货架结果",
+                    suggestedAction: "人工复核；需要更高精度时可补扫",
+                    priority: 1))
+                emittedBurstIDs.insert(burst.burstID)
+            }
+            guard emittedBurstIDs == sourceBurstIDs.union(degradedBurstIDs),
+                  priceTags.count == sourceBursts.count
+                    + retainedDegradedBursts.count else {
+                throw MobileOnlyWorkflowError.invalidState(
+                    "价签 durable burst 到结果行的一对一核账失败")
             }
         }
         return (priceTags, rescanTasks)
