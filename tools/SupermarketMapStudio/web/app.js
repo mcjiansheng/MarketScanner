@@ -1270,8 +1270,6 @@ function updateLocalizedAnchorSummary() {
     $("#localized-map-anchor-x").value = anchor.x_m.toFixed(3);
     $("#localized-map-anchor-y").value = anchor.y_m.toFixed(3);
     $("#localized-map-anchor-yaw-number").value = degrees.toFixed(1);
-    $("#localized-map-anchor-yaw").value = String(degrees);
-    $("#localized-map-anchor-yaw-value").value = `${degrees.toFixed(1)}°`;
   } else {
     for (const selector of [
       "#localized-map-anchor-x",
@@ -3654,9 +3652,6 @@ function bindEvents() {
   $("#localized-review-canvas").addEventListener("pointerup", endLocalizedAnchor);
   $("#localized-review-canvas").addEventListener("pointercancel", endLocalizedAnchor);
   $("#localized-review-canvas").addEventListener("keydown", handleLocalizedAnchorKey);
-  $("#localized-map-anchor-yaw").addEventListener("input", (event) => {
-    setLocalizedAnchorYawDegrees(event.target.value);
-  });
   for (const selector of ["#localized-map-anchor-x", "#localized-map-anchor-y"]) {
     const commitAnchorPosition = () => {
       setLocalizedAnchorPosition(

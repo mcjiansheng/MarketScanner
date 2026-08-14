@@ -1,8 +1,16 @@
 # 地图辅助定位阶段一至阶段三测试计划
 
-> 文档状态：**当前有效**。最后核对日期：2026-08-11。
+> 文档状态：**当前有效**。最后核对日期：2026-08-14。
 
 ## 自动测试
+
+### 2026-08-14 跨端稳定性自检
+
+除既有轨迹、价签、sidecar、snapshot、CAS 和发布门合同外，正常生命周期回归必须证明：Core Location 空批次、暂时无 active window scene、历史数据库列表越界/类型不符、文件修改时间不可读、Application Support 状态目录不可创建、价签状态竞态和已提交结果恢复分支均不会调用强制解包、强制转换、`fatalError`、`preconditionFailure` 或 Debug assertion 结束进程。普通低置信度/部分图/多解必须保留有限轨迹、逐秒行和 durable 价签；完整性、身份、水位、CAS、重复 durable 主键、完全无有限轨迹和原子提交损坏继续失败关闭。
+
+当前本机证据：PriorMap discover 322/322（363.760 s；300,000 finalization peak 14,254,080 bytes；1,728,000 trace retained 172,801 / peak 59,146,240 bytes；400,000 tag evidence accepted 200,000 / peak 449,871,872 bytes）、Qualification 30/30、Map Studio 完整 API 130/130、native 7884 checks / 0 failures、macOS Release `rtabmap-reprocess` build/launch、Swift parse、JavaScript/Python syntax 和 `git diff --check`。真实浏览器响应式自动化仍受 localhost 安全策略限制；权限不可得时必须报告为环境阻断，不能绕过浏览器安全限制或把 HTTP 单元测试冒充真实视觉交互。
+
+PC 人工锚点必须确认 HTML 中不存在连续 yaw range slider，并覆盖 X/Y/yaw 数值输入、平移步长、四向移动、离散旋转、四个基准朝向、键盘/Shift、canonical bounds、exact request/audit value 和 CAS。iOS 配置/重定位继续使用同一 canonical SE(2) 离散交互。最终提交后还必须运行 unsigned generic iphoneos Release 并核对 `MarketScannerBuildIdentity.json.app_git_sha == git rev-parse HEAD`；该结果仍不替代签名安装、LiDAR、Files provider、热/低磁盘或现场真值。
 
 ### 统一扫描 UX、启动事务和 build identity
 

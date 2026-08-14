@@ -87,11 +87,16 @@ class DatabaseView: UIView {
     
     //Text Label
     textLabel = UILabel()
-    textLabel.numberOfLines = 0 
-    textLabel.text  =
-        URL(fileURLWithPath: databasePath).lastPathComponent + "\n" +
-        URL(fileURLWithPath: databasePath).fileSizeString + "\n" +
-        (try! URL(fileURLWithPath: databasePath).resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate!.getFormattedDate(format: "yyyy-MM-dd HH:mm:ss"))
+    textLabel.numberOfLines = 0
+    let databaseURL = URL(fileURLWithPath: databasePath)
+    let modificationDate = (try? databaseURL.resourceValues(
+        forKeys: [.contentModificationDateKey]))?.contentModificationDate
+    let modificationText = modificationDate?.getFormattedDate(
+        format: "yyyy-MM-dd HH:mm:ss") ?? "-"
+    textLabel.text =
+        databaseURL.lastPathComponent + "\n" +
+        databaseURL.fileSizeString + "\n" +
+        modificationText
     textLabel.textColor = .white
     textLabel.textAlignment = .left
 

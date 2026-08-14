@@ -691,6 +691,75 @@ class MobileScanUXContractTests(unittest.TestCase):
             processing_ui,
         )
 
+    def test_normal_lifecycle_callbacks_do_not_force_crash(self) -> None:
+        host = self.source("app/ios/RTABMapApp/ViewController.swift")
+        scroller = self.source(
+            "app/ios/RTABMapApp/VerticalScrollerView.swift"
+        )
+        database_view = self.source("app/ios/RTABMapApp/DatabaseView.swift")
+        coordinator = self.source(
+            "app/ios/RTABMapApp/MobileOnlyWorkflow/"
+            "MobileOnlyWorkflowCoordinator.swift"
+        )
+        capture_core = self.source(
+            "app/ios/RTABMapApp/PriceTagCaptureCore.swift"
+        )
+        processing_pipeline = self.source(
+            "app/ios/RTABMapApp/MobileOnlyWorkflow/"
+            "MobileProcessingPipeline.swift"
+        )
+
+        location_start = host.index(
+            "func locationManager(_ manager: CLLocationManager, "
+            "didUpdateLocations locations: [CLLocation])"
+        )
+        location_end = host.index(
+            "func locationManager(_ manager: CLLocationManager, "
+            "didFailWithError error: Error)",
+            location_start,
+        )
+        location = host[location_start:location_end]
+        self.assertIn("guard let location = locations.last", location)
+        self.assertIn("gps_empty_update_ignored", location)
+        self.assertNotIn("locations.last!", location)
+
+        orientation_start = host.index(
+            "var statusBarOrientation: UIInterfaceOrientation?"
+        )
+        orientation_end = host.index("deinit {", orientation_start)
+        orientation = host[orientation_start:orientation_end]
+        self.assertIn("viewIfLoaded?.window?.windowScene", orientation)
+        self.assertIn("UIApplication.shared.connectedScenes", orientation)
+        self.assertNotIn("fatalError", orientation)
+        self.assertNotIn("UIApplication.shared.windows.first", orientation)
+
+        selection_start = host.index(
+            "func verticalScrollerView(_ horizontalScrollerView: "
+            "VerticalScrollerView, didSelectViewAt index: Int)"
+        )
+        selection_end = host.index(
+            "extension ViewController: VerticalViewDataSource",
+            selection_start,
+        )
+        selection = host[selection_start:selection_end]
+        self.assertIn("databases.indices.contains(index)", selection)
+        self.assertIn("as? DatabaseView", selection)
+        self.assertNotIn("as! DatabaseView", selection)
+
+        self.assertIn("contentViews.indices.contains(index)", scroller)
+        self.assertIn("func view(at index: Int) -> UIView?", scroller)
+
+        self.assertNotIn("try!", database_view)
+        self.assertNotIn("contentModificationDate!", database_view)
+        self.assertIn("try FileManager.default.url", coordinator)
+        self.assertNotIn("try! FileManager.default.url", coordinator)
+        self.assertNotIn("assertionFailure(message)", capture_core)
+        self.assertNotIn(
+            'preconditionFailure("committed result handled before snapshot switch")',
+            processing_pipeline,
+        )
+        self.assertNotIn('($0["id"] as! String, $0)', processing_pipeline)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1802,8 +1802,6 @@ final class PriceTagCaptureCoordinator {
         if diagnostics.count > 32 {
             diagnostics.removeFirst(diagnostics.count - 32)
         }
-        #if DEBUG
-        assertionFailure(message)
-        #endif
+        print(message)
     }
 }

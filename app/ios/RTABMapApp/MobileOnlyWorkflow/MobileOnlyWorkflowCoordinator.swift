@@ -218,8 +218,8 @@ final class MobileOnlyWorkflowCoordinator {
 
     // MARK: - Persistence
 
-    private var stateFileURL: URL {
-        let base = try! FileManager.default.url(
+    private func stateFileURL() throws -> URL {
+        let base = try FileManager.default.url(
             for: .applicationSupportDirectory,
             in: .userDomainMask,
             appropriateFor: nil,
@@ -736,7 +736,7 @@ final class MobileOnlyWorkflowCoordinator {
             throw MobileOnlyWorkflowError.invalidState(
                 "unsafe scan receipt tracking identity")
         }
-        let workflowRoot = stateFileURL.deletingLastPathComponent()
+        let workflowRoot = try stateFileURL().deletingLastPathComponent()
         let directory = workflowRoot.appendingPathComponent(
             "scan_receipts", isDirectory: true)
         let directoryExisted = FileManager.default.fileExists(
@@ -1206,7 +1206,8 @@ final class MobileOnlyWorkflowCoordinator {
         ]
         contextLock.unlock()
         let data = try CanonicalJSONEncoder.encode(payload)
-        let directory = stateFileURL.deletingLastPathComponent()
+        let stateURL = try stateFileURL()
+        let directory = stateURL.deletingLastPathComponent()
         let directoryExisted = FileManager.default.fileExists(
             atPath: directory.path)
         try FileManager.default.createDirectory(
@@ -1214,9 +1215,9 @@ final class MobileOnlyWorkflowCoordinator {
         if requireDurability && !directoryExisted {
             try Self.fsyncDirectory(directory.deletingLastPathComponent())
         }
-        try data.write(to: stateFileURL, options: [.atomic])
+        try data.write(to: stateURL, options: [.atomic])
         if requireDurability {
-            try Self.fsyncURL(stateFileURL)
+            try Self.fsyncURL(stateURL)
             try Self.fsyncDirectory(directory)
         }
     }
@@ -1225,7 +1226,8 @@ final class MobileOnlyWorkflowCoordinator {
     /// exposes a resumable `interrupted` state only when the referenced
     /// files/registrations still exist (§5.2).
     private func loadAndVerifyPersistedContext() {
-        guard let data = try? Data(contentsOf: stateFileURL),
+        guard let stateURL = try? stateFileURL(),
+              let data = try? Data(contentsOf: stateURL),
               let object = try? StrictJSONDocumentParser.object(
                   from: data,
                   limits: StrictJSONDocumentLimits(maximumBytes: data.count + 1)) as? [String: Any],
@@ -1356,7 +1358,10 @@ final class MobileOnlyWorkflowCoordinator {
               identifier == context.sessionID else {
             return false
         }
-        let workflowRoot = stateFileURL.deletingLastPathComponent()
+        guard let workflowRoot = try? stateFileURL()
+                .deletingLastPathComponent() else {
+            return false
+        }
         let receiptURL = workflowRoot.appendingPathComponent(
             context.scanReceipt)
         do {

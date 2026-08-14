@@ -2485,8 +2485,19 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
     
     func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation])
     {
-        mLastKnownLocation = locations.last!
-        rtabmap?.setGPS(location: locations.last!);
+        guard let location = locations.last else {
+            print("Ignoring empty Core Location update")
+            if let scanSession = supermarketSession {
+                _ = scanSession.appendScanEventIfSessionActive(
+                    expectedTrackingSessionId: scanSession.trackingSessionId,
+                    level: "warning",
+                    event: "gps_empty_update_ignored",
+                    message: "Core Location delivered an empty location batch; capture continued")
+            }
+            return
+        }
+        mLastKnownLocation = location
+        rtabmap?.setGPS(location: location)
     }
     
     func locationManager(_ manager: CLLocationManager, didFailWithError error: Error)
@@ -2571,14 +2582,13 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
     
     var statusBarOrientation: UIInterfaceOrientation? {
         get {
-            guard let orientation = UIApplication.shared.windows.first?.windowScene?.interfaceOrientation else {
-                #if DEBUG
-                fatalError("Could not obtain UIInterfaceOrientation from a valid windowScene")
-                #else
-                return nil
-                #endif
+            if let orientation = viewIfLoaded?.window?.windowScene?.interfaceOrientation {
+                return orientation
             }
-            return orientation
+            return UIApplication.shared.connectedScenes
+                .compactMap { $0 as? UIWindowScene }
+                .first(where: { $0.activationState == .foregroundActive })?
+                .interfaceOrientation
         }
     }
         
@@ -7376,15 +7386,17 @@ extension DispatchQueue {
 
 extension ViewController: VerticalScrollerViewDelegate {
     func verticalScrollerView(_ horizontalScrollerView: VerticalScrollerView, didSelectViewAt index: Int) {
-    //1
-    let previousDatabaseView = horizontalScrollerView.view(at: currentDatabaseIndex) as! DatabaseView
-    previousDatabaseView.highlightDatabase(false)
-    //2
-    currentDatabaseIndex = index
-    //3
-    let databaseView = horizontalScrollerView.view(at: currentDatabaseIndex) as! DatabaseView
-    databaseView.highlightDatabase(true)
-    //4
+        guard databases.indices.contains(index),
+              let databaseView = horizontalScrollerView.view(at: index) as? DatabaseView else {
+            print("Ignoring invalid database scroller selection at index \(index)")
+            return
+        }
+        if let previousDatabaseView = horizontalScrollerView.view(
+                at: currentDatabaseIndex) as? DatabaseView {
+            previousDatabaseView.highlightDatabase(false)
+        }
+        currentDatabaseIndex = index
+        databaseView.highlightDatabase(true)
   }
 }
 

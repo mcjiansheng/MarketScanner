@@ -2,6 +2,13 @@
 
 > 文档状态：**当前有效**。最后核对日期：2026-08-14。
 
+## 2026-08-14 — 正常生命周期防崩溃与人工锚点交互收口
+
+- iOS 正常生命周期不再使用进程级强制终止：Core Location 空批次只写 `gps_empty_update_ignored` 并继续；暂时没有 active `UIWindowScene` 时朝向返回 `nil`；历史数据库 scroller 对索引和 `DatabaseView` 类型做可选检查；数据库文件日期与 Application Support 状态目录失败均进入可恢复分支；价签非法状态迁移只记录诊断；后处理不变量异常改为类型化 checkpoint/map 错误。完整性/身份损坏仍失败关闭，但普通 UIKit、Files、定位回调和算法竞态不能导致闪退。
+- PC 人工地图锚点移除连续 yaw range slider，保留 canonical X/Y/yaw 数值、0.1/0.5/1.0 m 四向微调、±1/±5/±15°旋转、东/北/西/南和键盘/Shift 加速；显示值、请求值和审计值完全一致，服务端继续复核 exact node/time/floor/bounds/yaw。iOS 既有离散微调合同不变。
+- 源码和成果合同再次确认：存在有限轨迹时，普通图质量、weak/lost、平行通道或货架多解、时钟局部缺口、深度/位置离散度和关联不足只生成 `PARTIAL_REVIEW_REQUIRED` / `LOCAL_FRAME_ONLY` / `LOW_CONFIDENCE`；节点、逐秒行、barcode、主候选货架和 durable identity 必须保留。只有数据库/JSONL framing、身份、水位、CAS、重复 durable 主键、完全无有限轨迹或原子成果提交损坏可以阻断。
+- 当前主机证据为 PriorMap 322/322（363.760 s）、Qualification 30/30、Map Studio 完整 API 130/130、native 7884 checks / 0 failures、macOS Release `rtabmap-reprocess` build/launch、Swift parse、JavaScript/Python syntax 和 patch-format PASS。长规模测试处理 300,000 条 finalization（峰值 14,254,080 bytes）、1,728,000 条 trace（保留 172,801，峰值 59,146,240 bytes）和 400,000 条 tag evidence（接受 200,000，峰值 449,871,872 bytes）。真实浏览器响应式自动化受 localhost 安全策略限制；签名真机、LiDAR、Files provider、热/低磁盘和现场非空价签真值仍待执行，不能声明 Production GO。
+
 ## 2026-08-14 — 废弃道路中心线重参数化，保留通道内真实轨迹几何
 
 - 废弃 `bounded_free_space_road_hmm_v1` 的“选中道路序列后按物理累计里程在中心线上重新采样”行为。旧实现只保留累计路程，会把用户在通道内的横向位置、局部曲线、停顿和回头压成规则道路折线；TianHong 旧包的 road width 又全部为 0，历史 0.2 m 伪宽度进一步放大了错误。
@@ -9,7 +16,7 @@
 - 最终轨迹使用 `local_geometry_preserving_corridor_envelope_v2`：保留优化手机位姿的局部几何；exact 人工锚点残差按 gauge-neutral 物理里程连续传播；交替投影只产生最小低频自由空间修正。结构内孤立点按同一通道侧退出并用前后修正场消除错误侧选择；穿架线段使用货架驱动的局部刚体平移，同轮建议先合并再应用，禁止多个相邻穿架段向同一节点顺序累加；最终修正尖刺/平台切换只有在整个候选窗口的点和线段均不碰撞、且局部最大步长不增加时才平滑。
 - `MarketScannerCorridorRouteMatchAudit` 升级为 version 2，以 `geometry_preservation` 取代历史 `reparameterization`。审计显式保存 `centerline_snap_applied=false`、道路/手机几何角色、有限包络投影、anchor translation field、point escape continuity、shelf-driven rigid segment repair、collision-safe spike/gradient repair、中心线横向偏移和最终距离尺度。历史 version 1 继续只读兼容。
 - 复用既有只读 optimized DB 和同一 TianHong prior-map package 实测：`162937` 保留 3663 个节点与 3806 行秒级表，结构内点/穿架段/拓扑断裂为 `0/0/0`，最大输出/物理步长为 `1.091/1.070 m`，轨迹/物理里程为 `476.929/470.892 m`；`181158` 保留 1054 个节点与 1132 行秒级表，三项同为 `0/0/0`，最大输出/物理步长为 `0.848/0.952 m`，轨迹/物理里程为 `179.779/181.127 m`。两份结果都保留完整 CSV/PNG，但因绝对修正、弱定位时长和少数无法安全摊平的修正梯度继续标记 `PARTIAL_REVIEW_REQUIRED`、禁止发布；这不是处理失败，也不证明现场绝对坐标真值。
-- 当前自动回归通过 PriorMap 321/321、Map Studio 130/130、Qualification 30/30；新增/强化用例覆盖通道内横向移动、U-turn、有限道路端点/真实路口、exact 人工锚点连续传播、货架驱动穿架修复和自由空间修正梯度。相关 Python 入口全部通过 `py_compile`，`git diff --check` 通过。
+- 该轨迹修复基线曾通过 PriorMap 321/321、Map Studio 130/130、Qualification 30/30；本页上方跨端稳定性增量给出当前源码的更新证据。新增/强化用例覆盖通道内横向移动、U-turn、有限道路端点/真实路口、exact 人工锚点连续传播、货架驱动穿架修复和自由空间修正梯度。
 
 ## 2026-08-14 — 不可变时间线/价签成果、时钟分段与 durable burst 核账
 

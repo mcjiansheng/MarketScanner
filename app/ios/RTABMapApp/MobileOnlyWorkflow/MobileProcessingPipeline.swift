@@ -401,7 +401,8 @@ enum MobileProcessingPipeline {
                 clearError: true,
                 allowRecoveryReentry: true)
         case .committedResult:
-            preconditionFailure("committed result handled before snapshot switch")
+            throw PersistentTaskCheckpoint.CheckpointError.invalidRecord(
+                "committed result recovery reached snapshot switch")
         }
 
         // A crash may happen after the dedicated RESCAN_SESSION artifact
@@ -1954,9 +1955,16 @@ enum MobileProcessingPipeline {
             return nil
         }
 
-        let rawByID = Dictionary(uniqueKeysWithValues: parsed.rawShelves.map {
-            ($0["id"] as! String, $0)
-        })
+        var rawByID: [String: [String: Any]] = [:]
+        for raw in parsed.rawShelves {
+            guard let identifier = raw["id"] as? String,
+                  !identifier.isEmpty,
+                  rawByID[identifier] == nil else {
+                throw PipelineError.invalidPriorMap(
+                    "货架原始记录缺少唯一字符串 ID")
+            }
+            rawByID[identifier] = raw
+        }
         if parsed.version == 2 {
             var shelves: [ShelfAssociationEngine.ShelfSegment] = []
             for compiled in parsed.segments {

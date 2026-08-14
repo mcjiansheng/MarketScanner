@@ -92,6 +92,14 @@ session input manifest v4 将 `clock_correlations.jsonl` 与源数据库和其�
 
 “处理历史扫描”只列出 `finalized=true` 的连续单库会话。手机后处理会先生成 immutable snapshot，并对 SQLite、Node/Link 和图位姿 BLOB 执行严格校验；iOS App sandbox 不再依赖 SQLite 重新打开 `/dev/fd/<n>`，而是从已绑定的 no-follow descriptor 流式复制到 App 私有临时目录进行只读完整性校验，复核源 inode 后立即清理。每个历史会话还提供独立“导出原始扫描”按钮：即使手机后处理失败，也可选择 Files 或外接存储目录，复制完整 `segment_0001`，对源/目标/复制后源执行 SHA-256 manifest 三方一致性检查，写入复制凭证，并始终保留手机中的原始会话；同名目标使用新的 `-Export-*` 目录，绝不覆盖已有导出。
 
+### 2026-08-14 跨端稳定性自检基线
+
+正常生命周期不得通过强制解包、强制类型转换、`fatalError`、`preconditionFailure` 或 Debug assertion 结束进程。当前自检已覆盖 Core Location 空回调、窗口方向暂不可得、历史数据库列表越界/类型不符、数据库修改时间读取失败、Application Support 状态目录不可创建、价签状态竞态和已提交结果恢复分支；这些情况现在分别被忽略、返回可选值、记录诊断或转换为可恢复的类型化错误，不再让扫描/处理进程直接崩溃。真正的数据库、证据 framing、身份、水位、CAS 或原子提交损坏仍保持失败关闭，并保留扫描日志、任务 journal、恢复包或已经提交的不可变结果。
+
+人工地图锚点在 iOS 与 PC 统一为 canonical SE(2)。PC 工作台不再提供容易产生不可控跳变的连续 yaw slider，只保留 X/Y/yaw 数值输入、0.1/0.5/1.0 m 四向微调、±1/±5/±15°旋转、东/北/西/南和键盘操作；界面显示值就是服务端提交值，不进行隐藏坐标或朝向变换。低置信度、部分图、平行通道/货架多解、时钟局部缺口和可恢复的关联不足只降低发布资格，不得删除源节点、durable 价签或整个处理版本。
+
+本轮主机证据包括 PriorMap 全量 322/322、Qualification 30/30、Map Studio 完整 API 130/130、原生检查 7884/0，以及 macOS Release `rtabmap-reprocess` 构建/启动。真实浏览器响应式自动化仍受浏览器 localhost 安全策略限制；签名真机、LiDAR、Files provider、热/低磁盘和现场非空价签真值仍属于设备/现场验收，不能由上述主机结果替代。
+
 ### MapCase02 标准工作簿状态（2026-08-09）
 
 `MAPCASE02 / STANDARD SUPERMARKET XLSX FORMAT PASS`：Swift/PC 对正式工作簿 top-left anchor、production role geometry、canonical v3、package v2、road/spatial/distance/shelf 派生工件与资源上限已完成阻断级收口。冻结统计为源 1838、active 1630、货架 1301、固定结构 329、展示审计 208、active 越界 0；canonical SHA `5ddfac7dc439afc45abdcf800b799c05d53704895b620d161ef08a442c55b2db`。2026-08-09 真机导入暴露编译器保留大写、地图库只接受小写的 `prior_map_id` 合同断层；当前新包统一生成小写且总长不超过 128 的 ID，正式 MapCase02 为 `piaseczno-5ddfac7dc439`，并已补齐 compile → integrity → MobileMapLibrary install/register/list/exact-read 回归。Swift/Python 还共同严格校验 manifest/report 计数、warnings/malformed rows 以及 road graph node/edge 绑定，手机原样生成包必须通过 PC production validator。旧 uppercase v2 开发包在普通 iOS/PC validator、旧向导和离线定位入口均默认拒绝，只能通过显式 diagnostic-only 参数做只读检查，不能参与新的扫描或处理。

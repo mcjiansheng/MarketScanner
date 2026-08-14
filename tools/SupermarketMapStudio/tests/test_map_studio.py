@@ -2978,7 +2978,6 @@ class MapStudioApiTests(unittest.TestCase):
             b'id="localized-map-anchor-controls"',
             b'id="localized-map-anchor-x"',
             b'id="localized-map-anchor-y"',
-            b'id="localized-map-anchor-yaw"',
             b'id="localized-map-anchor-yaw-number"',
             b'id="localized-map-anchor-step"',
             b'data-anchor-move="0,1"',
@@ -3005,6 +3004,8 @@ class MapStudioApiTests(unittest.TestCase):
         self.assertIn(b"canonicalBounds", geometry)
         self.assertIn(b'role="status" aria-live="polite"', html)
         self.assertIn(b"source_yaw_rad", script)
+        self.assertNotIn(b'id="localized-map-anchor-yaw"', html)
+        self.assertNotIn(b'localized-map-anchor-yaw-value', script)
         self.assertNotIn(b"directionEnd[1]", script)
         self.assertIn(b"expected_revision", script)
         self.assertIn(b"expected_version_id", script)

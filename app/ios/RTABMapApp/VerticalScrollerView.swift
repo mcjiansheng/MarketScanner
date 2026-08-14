@@ -30,14 +30,14 @@
 
 import UIKit
 
-protocol VerticalViewDataSource: class {
+protocol VerticalViewDataSource: AnyObject {
     // Ask the data source how many views it wants to present inside the horizontal scroller
     func numberOfViews(in verticalScrollerView: VerticalScrollerView) -> Int
     // Ask the data source to return the view that should appear at <index>
     func getScrollerViewItem(_ verticalScrollerView: VerticalScrollerView, viewAt index: Int) -> UIView
 }
 
-protocol VerticalScrollerViewDelegate: class {
+protocol VerticalScrollerViewDelegate: AnyObject {
     // inform the delegate that the view at <index> has been selected
     func verticalScrollerView(_ verticalScrollerView: VerticalScrollerView, didSelectViewAt index: Int)
 }
@@ -87,6 +87,9 @@ class VerticalScrollerView: UIView {
     }
     
     func scrollToView(at index: Int, animated: Bool = true) {
+      guard contentViews.indices.contains(index) else {
+          return
+      }
       let centralView = contentViews[index]
       let targetCenter = centralView.center
       let targetOffsetY = targetCenter.y - (scroller.bounds.height / 2)
@@ -96,14 +99,19 @@ class VerticalScrollerView: UIView {
     @objc func scrollerTapped(gesture: UITapGestureRecognizer) {
         let location = gesture.location(in: scroller)
         guard
-            let index = contentViews.index(where: { $0.frame.contains(location)})
+            let index = contentViews.firstIndex(where: {
+                $0.frame.contains(location)
+            })
         else { return }
         
         delegate?.verticalScrollerView(self, didSelectViewAt: index)
         scrollToView(at: index)
     }
     
-    func view(at index :Int) -> UIView {
+    func view(at index: Int) -> UIView? {
+        guard contentViews.indices.contains(index) else {
+            return nil
+        }
         return contentViews[index]
     }
     
@@ -135,4 +143,3 @@ class VerticalScrollerView: UIView {
         scroller.contentSize = CGSize(width: frame.size.width, height: CGFloat(yValue + ViewConstants.Offset))
     }
 }
-
