@@ -2349,7 +2349,9 @@ final class SupermarketScanSession {
         defer { localizationAdmissionGate.endTransaction() }
         localizationTransactionLock.lock()
         defer { localizationTransactionLock.unlock() }
-        guard !hasLocalizationRequiredWriteFailure(), boundNodeID > 0 else {
+        guard !hasLocalizationRequiredWriteFailure(), boundNodeID > 0,
+              observation.version != 2
+                || observation.boundNodeId == boundNodeID else {
             return nil
         }
         // V1R5 §5.4: assign the durable burst/frame identity BEFORE the

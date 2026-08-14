@@ -2,7 +2,13 @@
 
 > 文档状态：**当前有效**。最后核对日期：2026-08-14。
 
-本文记录 `fix/manual-anchor-continuous-recovery@cab3afc` 的现场反馈与两份独立代码审查的复核结论。它不把“移除了已知 trap”写成“4 次现场 crash 已根治”，也不把未经同一真实 Sam 数据 A/B 的参数建议直接固化为生产默认值。
+本文记录 `fix/manual-anchor-continuous-recovery@bb09e1346a13945b1d4d8fa7eaf174959b528ab9` 的现场反馈，以及后续 `fix/tag-node-local-publication-gate` 设计审查整改。它不把“移除了已知 trap”写成“4 次现场 crash 已根治”，也不把未经同一真实 Sam 数据 A/B 的参数建议直接固化为生产默认值。
+
+## 通道/货架物理约束设计审查整改状态
+
+- **P0 坐标框重复变换：代码与自动化已关闭。** 新 observation v2 保存 exact-bound-node local 3D，手机/PC 使用 `P_final=T_final_node×P_node`；历史 v1 清空可发布坐标并要求重扫。尚缺签名真机、非零初始地图位姿、人工重定位/真实 loop correction 和货架控制点共同组成的现场端到端精度证明，因此不能把“算法错误已修”扩大为“最终价签现场精度已合格”。
+- **P1-A 发布门漏检：代码与自动化已关闭。** coordinate contract v2 把 degradation、coordinate audit、legacy、低置信、空坐标、未关联和 rescan 全部纳入 `COMPLETE/publish_permitted`，并在结果读取/任务恢复时二次验证。
+- **P1-B～P1-E 与 P2 未关闭。** 正式 capture-pose epoch/component、corridor/shelf/side Top-K、人体扫掠线段/胶囊体 free-space、手机实时歧义 UI、PC 混合因子图、concrete shelf-loop/manifest v5、沿长货架方向可观测性、动态顾客/购物车和 `map_mismatch` 仍按下文与整改报告执行。PC 现有 corridor matcher 继续是 review-only，不能因 P0/P1-A 修复而提升发布资格。
 
 ## 本轮已确认并修复的关键问题
 

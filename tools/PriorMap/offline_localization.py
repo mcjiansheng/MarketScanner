@@ -55,7 +55,7 @@ from .corridor_route_matcher import (
 
 FORMAT_VERSION = 1
 TOOL_VERSION = "MarketScanner-RepairV3"
-COORDINATE_CONTRACT_VERSION = 1
+COORDINATE_CONTRACT_VERSION = 2
 HUBER_TRANSLATION_M = 0.45
 HUBER_YAW_RAD = math.radians(10)
 HARD_REJECT_TRANSLATION_M = 2.5
@@ -146,6 +146,10 @@ CLOCK_MAXIMUM_OUTER_EXTRAPOLATION_SECONDS = 3.0
 POSITION_INTERPOLATION_MAXIMUM_GAP_SECONDS = 3.0
 TAG_EVIDENCE_NUMERIC_TOLERANCE = 1.0e-6
 TAG_EVIDENCE_MAXIMUM_NODE_TIME_DELTA_SECONDS = 1.0
+TAG_EVIDENCE_BOUND_NODE_STAMP_TOLERANCE_SECONDS = 1.0e-6
+TAG_EVIDENCE_MAXIMUM_POSITION_M = 5_000.0
+TAG_EVIDENCE_MAXIMUM_HEIGHT_M = 100.0
+TAG_EVIDENCE_NODE_LOCAL_FRAME = "RTABMAP_BOUND_NODE_LOCAL"
 EDITABLE_TAG_FIELDS = frozenset(
     {
         "shelf_code",
@@ -1750,7 +1754,7 @@ STATE_EVENT_CONTRACT = JsonlContract(
 TAG_OBSERVATION_CONTRACT = JsonlContract(
     "tag_observations",
     "MarketScannerPriceTagObservation",
-    frozenset({1}),
+    frozenset({1, 2}),
     False,
     True,
     ("node_timebase_frame_timestamp", "nodeTimebaseFrameTimestamp"),
@@ -1940,6 +1944,55 @@ def load_raw_continuous_vio_poses(path: Path, horizontal_axes: str) -> list[Pose
     if not poses:
         raise OfflineLocalizationError("Raw continuous VIO trajectory is empty.")
     return poses
+
+
+def load_node_identity_inventory(
+    path: Path,
+) -> dict[int, tuple[float, int | None]]:
+    """Read immutable node stamp/component identity from the source DB."""
+    try:
+        connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        try:
+            columns = {
+                str(row[1])
+                for row in connection.execute("PRAGMA table_info(Node)").fetchall()
+            }
+            map_id_expression = "map_id" if "map_id" in columns else "NULL"
+            rows = connection.execute(
+                f"SELECT id, stamp, {map_id_expression} "
+                "FROM Node WHERE id>0 ORDER BY id"
+            ).fetchall()
+        finally:
+            connection.close()
+    except sqlite3.Error as exc:
+        raise OfflineLocalizationError(
+            f"Cannot read source node identity inventory from {path.name}: {exc}"
+        ) from exc
+    inventory: dict[int, tuple[float, int | None]] = {}
+    for node_id, stamp_value, map_id in rows:
+        stamp = _strict_number(stamp_value)
+        if (
+            isinstance(node_id, bool)
+            or not isinstance(node_id, int)
+            or node_id <= 0
+            or node_id in inventory
+            or stamp is None
+            or (
+                map_id is not None
+                and (
+                    isinstance(map_id, bool)
+                    or not isinstance(map_id, int)
+                    or not -(2**31) <= map_id < 2**31
+                )
+            )
+        ):
+            raise OfflineLocalizationError(
+                "Source node identity inventory is invalid."
+            )
+        inventory[node_id] = (stamp, map_id)
+    if not inventory:
+        raise OfflineLocalizationError("Source node identity inventory is empty.")
+    return inventory
 
 
 def _normalize_angle(value: float) -> float:
@@ -2602,8 +2655,75 @@ def _validate_jsonl_business_record(
         for field in ("observation_id", "payload", "symbology"):
             if not isinstance(value.get(field), str) or not value.get(field):
                 raise OfflineLocalizationError(f"Missing tag observation {field} at {line_label}")
-        if not _strict_pose_2d_or_3d(value.get("raw_map_position")):
-            raise OfflineLocalizationError(f"Invalid tag observation raw position at {line_label}")
+        version = _strict_integer(value.get("version"))
+        if version == 1:
+            if not _strict_pose_2d_or_3d(value.get("raw_map_position")):
+                raise OfflineLocalizationError(
+                    f"Invalid tag observation raw position at {line_label}"
+                )
+        elif version == 2:
+            allowed_fields = {
+                "format", "version", "observation_id", "timestamp",
+                "payload", "symbology", "normalized_bounds",
+                "frame_timestamp", "node_timebase_frame_timestamp",
+                "node_timebase_offset_seconds", "pose_timestamp_delta_ms",
+                "alignment_version", "alignment_snapshot_timestamp",
+                "alignment_age_ms", "alignment_version_lag",
+                "alignment_freshness", "raw_map_position",
+                "measurement_method", "measurement_confidence",
+                "depth_sample_count", "depth_inlier_count",
+                "depth_inlier_ratio", "depth_median_m", "depth_mad_m",
+                "plane_residual_m", "surface_normal_camera",
+                "localization_state", "localization_confidence",
+                "prior_map_id", "prior_map_sha256", "floor_id",
+                "tracking_session_id", "needs_review", "burst_id",
+                "frame_id", "bound_node_id", "bound_node_stamp",
+                "bound_node_map_id", "coordinate_frame",
+                "point_in_bound_node_frame", "measurement_height_m",
+            }
+            bound_node_id = _strict_integer(value.get("bound_node_id"))
+            bound_node_stamp = _strict_number(value.get("bound_node_stamp"))
+            bound_node_map_id = _strict_integer(value.get("bound_node_map_id"))
+            point = value.get("point_in_bound_node_frame")
+            method = value.get("measurement_method")
+            point_valid = (
+                isinstance(point, dict)
+                and set(point) == {"x_m", "y_m", "z_m"}
+                and all(
+                    _strict_number(point.get(field)) is not None
+                    for field in ("x_m", "y_m", "z_m")
+                )
+                and abs(float(point["x_m"])) <= TAG_EVIDENCE_MAXIMUM_POSITION_M
+                and abs(float(point["y_m"])) <= TAG_EVIDENCE_MAXIMUM_POSITION_M
+                and abs(float(point["z_m"])) <= TAG_EVIDENCE_MAXIMUM_HEIGHT_M
+            )
+            measurement_height = value.get("measurement_height_m")
+            if (
+                not set(value).issubset(allowed_fields)
+                or bound_node_id is None
+                or bound_node_id <= 0
+                or bound_node_stamp is None
+                or bound_node_map_id is None
+                or not -(2**31) <= bound_node_map_id < 2**31
+                or value.get("coordinate_frame") != TAG_EVIDENCE_NODE_LOCAL_FRAME
+                or (
+                    measurement_height is not None
+                    and (
+                        _strict_number(measurement_height) is None
+                        or abs(float(measurement_height))
+                        > TAG_EVIDENCE_MAXIMUM_HEIGHT_M
+                    )
+                )
+                or (method in {"smoothed_scene_depth", "scene_depth"} and not point_valid)
+                or (method in {"shelf_plane_ray", "unavailable"} and point is not None)
+            ):
+                raise OfflineLocalizationError(
+                    f"Invalid tag observation node-local coordinate at {line_label}"
+                )
+        else:
+            raise OfflineLocalizationError(
+                f"Unsupported tag observation version at {line_label}"
+            )
     elif contract.name == "tag_observation_bursts":
         allowed_fields = {
             "format", "version", "burst_id", "sequence", "barcode",
@@ -3413,7 +3533,9 @@ def _verified_tag_burst_evidence(
                 burst_valid = False
                 continue
             node_conflict = False
-            for explicit_field in ("nearest_node_id", "node_id"):
+            for explicit_field in (
+                "nearest_node_id", "node_id", "bound_node_id"
+            ):
                 if explicit_field not in observation:
                     continue
                 if _strict_integer(observation.get(explicit_field)) != bound_node_id:
@@ -4104,6 +4226,7 @@ def bind_tag_observation_to_pose(
     expected_floor_id: str,
     maximum_time_delta_seconds: float = 1.5,
     verified_burst_frame: VerifiedTagBurstFrameAuthority | None = None,
+    source_node_inventory: dict[int, tuple[float, int | None]] | None = None,
 ) -> TagPoseBinding:
     """Bind one tag observation to a real RTAB-Map node, or fail closed.
 
@@ -4197,24 +4320,30 @@ def bind_tag_observation_to_pose(
                 raise OfflineLocalizationError(
                     f"tag_and_observation_{field}_mismatch"
                 )
-        tag_position = tag.get("raw_map_position")
-        observation_position = observation.get("raw_map_position")
-        if not _strict_pose_2d_or_3d(tag_position) or not _strict_pose_2d_or_3d(
-            observation_position
-        ):
-            raise OfflineLocalizationError("tag_and_observation_raw_position_missing")
-        compared_fields = ["x_m", "y_m"]
-        if tag_position.get("height_m") is not None or observation_position.get(
-            "height_m"
-        ) is not None:
-            compared_fields.append("height_m")
-        if any(
-            tag_position.get(field) is None
-            or observation_position.get(field) is None
-            or abs(float(tag_position[field]) - float(observation_position[field])) > 0.01
-            for field in compared_fields
-        ):
-            raise OfflineLocalizationError("tag_and_observation_raw_position_mismatch")
+        if observation.get("version") == 1:
+            tag_position = tag.get("raw_map_position")
+            observation_position = observation.get("raw_map_position")
+            if not _strict_pose_2d_or_3d(
+                tag_position
+            ) or not _strict_pose_2d_or_3d(observation_position):
+                raise OfflineLocalizationError(
+                    "tag_and_observation_raw_position_missing"
+                )
+            compared_fields = ["x_m", "y_m"]
+            if tag_position.get("height_m") is not None or observation_position.get(
+                "height_m"
+            ) is not None:
+                compared_fields.append("height_m")
+            if any(
+                tag_position.get(field) is None
+                or observation_position.get(field) is None
+                or abs(float(tag_position[field]) - float(observation_position[field]))
+                > 0.01
+                for field in compared_fields
+            ):
+                raise OfflineLocalizationError(
+                    "tag_and_observation_raw_position_mismatch"
+                )
 
     if verified_burst_frame is not None:
         observation_id = observation.get("observation_id")
@@ -4236,7 +4365,9 @@ def bind_tag_observation_to_pose(
             raise OfflineLocalizationError(
                 "tag_observation_verified_burst_frame_mismatch"
             )
-        for explicit_field in ("nearest_node_id", "node_id"):
+        for explicit_field in (
+            "nearest_node_id", "node_id", "bound_node_id"
+        ):
             if explicit_field not in observation:
                 continue
             if (
@@ -4290,6 +4421,35 @@ def bind_tag_observation_to_pose(
     if node_timestamp_value is None or not math.isfinite(float(node_timestamp_value)):
         raise OfflineLocalizationError("tag_observation_bound_node_stamp_invalid")
     node_timestamp = float(node_timestamp_value)
+    if observation.get("version") == 2:
+        bound_node_id = _strict_integer(observation.get("bound_node_id"))
+        bound_node_stamp = _strict_number(observation.get("bound_node_stamp"))
+        bound_node_map_id = _strict_integer(observation.get("bound_node_map_id"))
+        if (
+            source_node_inventory is None
+            or bound_node_id is None
+            or bound_node_id != poses[index].node_id
+            or bound_node_stamp is None
+            or bound_node_map_id is None
+            or observation.get("coordinate_frame")
+            != TAG_EVIDENCE_NODE_LOCAL_FRAME
+            or bound_node_id not in source_node_inventory
+        ):
+            raise OfflineLocalizationError(
+                "tag_observation_node_local_identity_invalid"
+            )
+        source_stamp, source_map_id = source_node_inventory[bound_node_id]
+        if (
+            abs(bound_node_stamp - source_stamp)
+            > TAG_EVIDENCE_BOUND_NODE_STAMP_TOLERANCE_SECONDS
+            or source_map_id is None
+            or bound_node_map_id != source_map_id
+            or abs(node_timestamp - source_stamp)
+            > TAG_EVIDENCE_BOUND_NODE_STAMP_TOLERANCE_SECONDS
+        ):
+            raise OfflineLocalizationError(
+                "tag_observation_node_local_identity_mismatch"
+            )
     if verified_burst_frame is not None and (
         abs(node_timestamp - verified_burst_frame.node_timestamp)
         > TAG_EVIDENCE_MAXIMUM_NODE_TIME_DELTA_SECONDS
@@ -5651,6 +5811,29 @@ def apply_pose_delta_to_point(
     delta_y = oy - (sin_d * bx + cos_d * by)
     # P_final = R_delta * P_online + delta_t
     return (cos_d * px - sin_d * py + delta_x, sin_d * px + cos_d * py + delta_y)
+
+
+def apply_bound_node_local_point(
+    final_node_pose: Pose,
+    point_xy: tuple[float, float],
+) -> tuple[float, float]:
+    """Apply one final node transform to a schema-v2 node-local tag point."""
+    px, py = point_xy
+    if not all(
+        math.isfinite(value)
+        for value in (
+            final_node_pose.x, final_node_pose.y, final_node_pose.yaw, px, py
+        )
+    ):
+        raise OfflineLocalizationError(
+            "Cannot apply a final node pose to a non-finite node-local point."
+        )
+    cos_yaw = math.cos(final_node_pose.yaw)
+    sin_yaw = math.sin(final_node_pose.yaw)
+    return (
+        final_node_pose.x + cos_yaw * px - sin_yaw * py,
+        final_node_pose.y + sin_yaw * px + cos_yaw * py,
+    )
 
 
 def _huber_weight(residual: float, threshold: float) -> float:
@@ -8846,10 +9029,18 @@ def _render_localized_version(
     )
     expected_floor_id = str(metadata.get("floorId") or metadata.get("floor_id") or "")
     expected_map_hashes = {str(expected_hash)} if expected_hash else set()
+    source_node_inventory = load_node_identity_inventory(source_database)
     for tag in raw_tags:
         tag = _apply_on_device_confirmation_authority(dict(tag))
         observation = observations_by_id.get(str(tag.get("observation_id")))
         try:
+            if (
+                isinstance(observation, dict)
+                and observation.get("version") == 1
+            ):
+                raise OfflineLocalizationError(
+                    "legacy_tag_coordinate_frame_rescan_required"
+                )
             verified_burst_frame = None
             # Manifest v3 means the session contains verified burst evidence;
             # it does not retroactively convert every historical v1 tag in the
@@ -8872,11 +9063,13 @@ def _render_localized_version(
                 expected_floor_id=expected_floor_id,
                 maximum_time_delta_seconds=max_node_time_delta_seconds,
                 verified_burst_frame=verified_burst_frame,
+                source_node_inventory=source_node_inventory,
             )
         except OfflineLocalizationError as exc:
             reason = str(exc)
             tag.pop("final_map_position", None)
             _mark_tag_for_review(tag, reason)
+            tag["rescan_required"] = True
             tag["transform_audit"] = {
                 "status": "not_applied",
                 "source_observation_id": str(tag.get("observation_id") or ""),
@@ -8892,74 +9085,76 @@ def _render_localized_version(
         index = binding.node_index
         baseline_node = baseline[index]
         optimized_node = optimized[index]
-        raw_observation_position = (
-            observation.get("raw_map_position")
+        node_local_position = (
+            observation.get("point_in_bound_node_frame")
             if isinstance(observation, dict)
             else None
         )
-        # The observation is the measurement authority.  The duplicate tag
-        # position was already checked above and must never override it.
-        original = raw_observation_position
-        if not isinstance(original, dict):
+        if not isinstance(node_local_position, dict):
             tag.pop("final_map_position", None)
-            _mark_tag_for_review(tag, "tag_raw_map_position_missing")
+            _mark_tag_for_review(tag, "tag_node_local_position_missing")
             tag["transform_audit"] = {
                 "status": "not_applied",
                 "source_observation_id": str(tag.get("observation_id") or ""),
                 "bound_node_id": baseline_node.node_id,
-                "reason": "tag_raw_map_position_missing",
+                "reason": "tag_node_local_position_missing",
             }
             final_tags.append(
                 _finalize_tag_with_unavailable_offline_association(
                     tag,
-                    "tag_raw_map_position_missing",
+                    "tag_node_local_position_missing",
                 )
             )
             continue
-        tag["online_map_position"] = dict(original)
+        raw_observation_position = observation.get("raw_map_position")
+        if isinstance(raw_observation_position, dict):
+            tag["online_map_position"] = dict(raw_observation_position)
         try:
-            final_x, final_y = apply_pose_delta_to_point(
-                baseline_node,
-                optimized_node,
-                (float(original.get("x_m")), float(original.get("y_m"))),
+            local_x = float(node_local_position.get("x_m"))
+            local_y = float(node_local_position.get("y_m"))
+            local_z = float(node_local_position.get("z_m"))
+            if not all(math.isfinite(value) for value in (local_x, local_y, local_z)):
+                raise ValueError("non-finite node-local point")
+            final_x, final_y = apply_bound_node_local_point(
+                optimized_node, (local_x, local_y)
             )
         except (OfflineLocalizationError, TypeError, ValueError):
             tag.pop("final_map_position", None)
-            _mark_tag_for_review(tag, "tag_raw_map_position_invalid")
+            _mark_tag_for_review(tag, "tag_node_local_position_invalid")
             tag["transform_audit"] = {
                 "status": "not_applied",
                 "source_observation_id": str(tag.get("observation_id") or ""),
                 "bound_node_id": baseline_node.node_id,
-                "reason": "tag_raw_map_position_invalid",
+                "reason": "tag_node_local_position_invalid",
             }
             final_tags.append(
                 _finalize_tag_with_unavailable_offline_association(
                     tag,
-                    "tag_raw_map_position_invalid",
+                    "tag_node_local_position_invalid",
                 )
             )
             continue
         tag["final_map_position"] = {
             "x_m": round(final_x, 6),
             "y_m": round(final_y, 6),
-            "height_m": original.get("height_m"),
+            "height_m": observation.get("measurement_height_m"),
         }
-        online_x = float(original.get("x_m"))
-        online_y = float(original.get("y_m"))
-        tag["online_offline_distance_cm"] = round(
-            math.hypot(final_x - online_x, final_y - online_y) * 100, 3
-        )
+        if _strict_pose_2d_or_3d(raw_observation_position):
+            online_x = float(raw_observation_position["x_m"])
+            online_y = float(raw_observation_position["y_m"])
+            tag["online_offline_distance_cm"] = round(
+                math.hypot(final_x - online_x, final_y - online_y) * 100, 3
+            )
         tag.setdefault("manually_modified", False)
         tag.setdefault("approval_status", "pending" if tag.get("needs_review") else "auto_approved")
         # Audit: record the binding node and SE(2) delta so reviewers can verify
         # the rigid transform that propagated this tag from online to final.
         tag["transform_audit"] = {
             "status": "applied",
-            "source_position_field": (
-                "tag.raw_map_position"
-                if isinstance(tag.get("raw_map_position"), dict)
-                else "observation.raw_map_position"
-            ),
+            "source_position_field":
+                "observation.point_in_bound_node_frame",
+            "coordinate_frame": TAG_EVIDENCE_NODE_LOCAL_FRAME,
+            "node_local_point": dict(node_local_position),
             "source_observation_id": str(tag.get("observation_id") or ""),
             "bound_node_id": baseline_node.node_id,
             "bound_node_stamp": baseline_node.timestamp,
@@ -9345,6 +9540,24 @@ def _render_localized_version(
             tag.get("quality_status") == "LOW_CONFIDENCE"
             for tag in final_tags
         ),
+        "tag_rescan_required_count": sum(
+            tag.get("rescan_required") is True
+            or (
+                isinstance(tag.get("confirmation_conflict"), dict)
+                and tag["confirmation_conflict"].get("rescan_required") is True
+            )
+            for tag in final_tags
+        ),
+        "legacy_tag_coordinate_frame_count": sum(
+            observation.get("version") == 1
+            for observation in tag_observations
+        ),
+        "coordinate_frame_audit_passed": all(
+            observation.get("version") == 2
+            and observation.get("coordinate_frame")
+            == TAG_EVIDENCE_NODE_LOCAL_FRAME
+            for observation in tag_observations
+        ),
         "tag_evidence_degradation_count": len(tag_evidence_degradations),
         "tag_evidence_degradations": tag_evidence_degradations,
         "tag_confirmed": sum(tag.get("approval_status") in {"approved", "auto_approved"} for tag in final_tags),
@@ -9564,6 +9777,35 @@ def _render_localized_version(
             tag_observation_coverage == 1.0,
             "tag_observation_coverage_incomplete",
             tag_observation_coverage,
+        ),
+        (
+            report["tag_unpositioned_count"] == 0,
+            "unpositioned_tag_present",
+            report["tag_unpositioned_count"],
+        ),
+        (
+            report["tag_unassociated_count"] == 0,
+            "unassociated_tag_present",
+            report["tag_unassociated_count"],
+        ),
+        (
+            report["tag_low_confidence_count"] == 0,
+            "low_confidence_tag_present",
+            report["tag_low_confidence_count"],
+        ),
+        (
+            report["tag_rescan_required_count"] == 0,
+            "tag_rescan_required",
+            report["tag_rescan_required_count"],
+        ),
+        (
+            report["coordinate_frame_audit_passed"]
+            and report["legacy_tag_coordinate_frame_count"] == 0,
+            "tag_coordinate_frame_audit_failed",
+            {
+                "audit_passed": report["coordinate_frame_audit_passed"],
+                "legacy_count": report["legacy_tag_coordinate_frame_count"],
+            },
         ),
         (needs_review_count == 0, "pending_tag_review", needs_review_count),
         (len(rejected) == 0, "rejected_constraints_present", len(rejected)),

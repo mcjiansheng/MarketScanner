@@ -2,6 +2,14 @@
 
 > 文档状态：**当前有效**。最后核对日期：2026-08-14。
 
+## 2026-08-14 — 价签 node-local 坐标合同 v2 与统一发布不变量
+
+- 关闭设计审查 P0：native node snapshot 在 camera/RTAB-Map 同一锁域内新增 node map/component ID 和 `T_opengl_world_from_node`；scene-depth 价签点在手机写入时转换为 exact bound-node local 3D，observation v2 持久化 `bound_node_id/stamp/map_id`、`coordinate_frame=RTABMAP_BOUND_NODE_LOCAL`、`point_in_bound_node_frame` 和独立 `measurement_height_m`。
+- Swift/Python strict parser 复核 verified complete burst、exact node ID/stamp/map ID 和 node-local 坐标范围；手机与 PC resolver 统一为 `P_final = T_final_node × P_node`。二维 `shelf_plane_ray` 不伪造 node-local 点。历史 v1 的 prior-map `raw_map_position` 不再参与坐标传播，条码/业务身份继续保留，坐标清空并标记 `legacy_tag_coordinate_frame_rescan_required`。
+- 关闭设计审查 P1-A：手机 result coordinate contract 升级为 v2，先统计 degradation、legacy frame、`LOW_CONFIDENCE`、unpositioned、unassociated 和 rescan，再决定 `COMPLETE/publish_permitted`；immutable result reader 与 committed-task recovery 重复检查同一不变量。旧 coordinate contract v1 仍可作为 review artifact 保留，但不能再声明 COMPLETE。
+- 新增非零 `(100 m, 50 m, 90°)` gauge、v1/v2 混合、raw display position 缺失/损坏、node-local 点缺失/非法、exact map ID/stamp、结果 manifest 篡改和源数据库只读回归。Stage-3 当前 126/126 通过；完整 PriorMap discover 329/329（378.876 s）通过。规模子进程为 300,000 finalization peak 13,287,424 bytes、1,728,000 trace retained 172,801 / peak 59,146,240 bytes、400,000 tag evidence accepted 200,000 / peak 747,192,320 bytes；tag 峰值仍低于冻结 768 MiB 门但余量有限，必须在 exact-SHA runner 继续监控。
+- 本次不包含正式 pose epoch/component sidecar、corridor/shelf/side tracker、人体扫掠体自由空间约束、PC 混合因子图、concrete shelf-loop/manifest v5、动态物体/地图失配或现场控制点资格。整体继续为 **NO-GO / NOT PRODUCTION READY**；范围与剩余项见 [`AISLE_SHELF_CONSTRAINED_LOCALIZATION_REMEDIATION_2026-08-14.md`](AISLE_SHELF_CONSTRAINED_LOCALIZATION_REMEDIATION_2026-08-14.md)。
+
 ## 2026-08-14 — 现场反馈复核：人工重定位原子提交、统一位姿 authority 与崩溃诊断
 
 - iOS 人工重定位改为真正的 UIScrollView zoom/pan/双击和箭头聚焦；确认前同步最后一次 X/Y/yaw 编辑，弹窗保持到 fresh accepted node、manual JSONL durable append 和 alignment CAS commit 全部成功。写失败或 fresh-node 超时不改变 live alignment、不关闭弹窗、不丢用户输入。
@@ -14,7 +22,7 @@
 - iOS 正常生命周期不再使用进程级强制终止：Core Location 空批次只写 `gps_empty_update_ignored` 并继续；暂时没有 active `UIWindowScene` 时朝向返回 `nil`；历史数据库 scroller 对索引和 `DatabaseView` 类型做可选检查；数据库文件日期与 Application Support 状态目录失败均进入可恢复分支；价签非法状态迁移只记录诊断；后处理不变量异常改为类型化 checkpoint/map 错误。完整性/身份损坏仍失败关闭，但普通 UIKit、Files、定位回调和算法竞态不能导致闪退。
 - PC 人工地图锚点移除连续 yaw range slider，保留 canonical X/Y/yaw 数值、0.1/0.5/1.0 m 四向微调、±1/±5/±15°旋转、东/北/西/南和键盘/Shift 加速；显示值、请求值和审计值完全一致，服务端继续复核 exact node/time/floor/bounds/yaw。iOS 既有离散微调合同不变。
 - 源码和成果合同再次确认：存在有限轨迹时，普通图质量、weak/lost、平行通道或货架多解、时钟局部缺口、深度/位置离散度和关联不足只生成 `PARTIAL_REVIEW_REQUIRED` / `LOCAL_FRAME_ONLY` / `LOW_CONFIDENCE`；节点、逐秒行、barcode、主候选货架和 durable identity 必须保留。只有数据库/JSONL framing、身份、水位、CAS、重复 durable 主键、完全无有限轨迹或原子成果提交损坏可以阻断。
-- 当前主机证据为 PriorMap 322/322（363.760 s）、Qualification 30/30、Map Studio 完整 API 130/130、native 7884 checks / 0 failures、macOS Release `rtabmap-reprocess` build/launch、Swift parse、JavaScript/Python syntax 和 patch-format PASS。长规模测试处理 300,000 条 finalization（峰值 14,254,080 bytes）、1,728,000 条 trace（保留 172,801，峰值 59,146,240 bytes）和 400,000 条 tag evidence（接受 200,000，峰值 449,871,872 bytes）。真实浏览器响应式自动化受 localhost 安全策略限制；签名真机、LiDAR、Files provider、热/低磁盘和现场非空价签真值仍待执行，不能声明 Production GO。
+- 该正常生命周期增量当时的主机证据为 PriorMap 322/322（363.760 s）、Qualification 30/30、Map Studio 完整 API 130/130、native 7884 checks / 0 failures、macOS Release `rtabmap-reprocess` build/launch、Swift parse、JavaScript/Python syntax 和 patch-format PASS。长规模测试处理 300,000 条 finalization（峰值 14,254,080 bytes）、1,728,000 条 trace（保留 172,801，峰值 59,146,240 bytes）和 400,000 条 tag evidence（接受 200,000，峰值 449,871,872 bytes）；当前整分支证据已由本页顶部 node-local v2 条目更新。真实浏览器响应式自动化受 localhost 安全策略限制；签名真机、LiDAR、Files provider、热/低磁盘和现场非空价签真值仍待执行，不能声明 Production GO。
 
 ## 2026-08-14 — 废弃道路中心线重参数化，保留通道内真实轨迹几何
 

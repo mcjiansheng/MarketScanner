@@ -79,7 +79,8 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 bool RTABMapApp::getNodeTimeSnapshot(NodeTimeSnapshot & snapshot)
 {
-	snapshot = NodeTimeSnapshot{0, 0.0, 0.0, 0};
+	snapshot = NodeTimeSnapshot{0, 0, 0.0, 0.0, 0,
+		0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
 	boost::unique_lock<boost::mutex> cameraLock(cameraMutex_, boost::defer_lock);
 	boost::unique_lock<boost::mutex> rtabmapLock(rtabmapMutex_, boost::defer_lock);
 	// openDatabase() already contains a rtabmap->camera nested path. boost::lock
@@ -91,16 +92,34 @@ bool RTABMapApp::getNodeTimeSnapshot(NodeTimeSnapshot & snapshot)
 		const double epochOffset = camera_->getStampEpochOffset();
 		const rtabmap::Signature * signature =
 				rtabmap_->getMemory()->getLastWorkingSignature(false);
+		const rtabmap::Transform nodePose = signature?
+				rtabmap::opengl_world_T_rtabmap_world * signature->getPose():
+				rtabmap::Transform();
 		if(signature && signature->id() > 0 &&
 			std::isfinite(signature->getStamp()) &&
 			std::isfinite(epochOffset) && epochOffset != 0.0 &&
+			!nodePose.isNull() && nodePose.isInvertible() &&
 			nodeTimeSnapshotGeneration_ < std::numeric_limits<std::uint64_t>::max())
 		{
+			const Eigen::Quaternionf nodeQuaternion = nodePose.getQuaternionf();
+			if(!std::isfinite(nodePose.x()) || !std::isfinite(nodePose.y()) ||
+				!std::isfinite(nodePose.z()) ||
+				!std::isfinite(nodeQuaternion.x()) ||
+				!std::isfinite(nodeQuaternion.y()) ||
+				!std::isfinite(nodeQuaternion.z()) ||
+				!std::isfinite(nodeQuaternion.w()))
+			{
+				return false;
+			}
 			const NodeTimeSnapshot frozen = {
 				static_cast<std::int32_t>(signature->id()),
+				static_cast<std::int32_t>(signature->mapId()),
 				signature->getStamp(),
 				epochOffset,
-				++nodeTimeSnapshotGeneration_};
+				++nodeTimeSnapshotGeneration_,
+				nodePose.x(), nodePose.y(), nodePose.z(),
+				nodeQuaternion.x(), nodeQuaternion.y(), nodeQuaternion.z(),
+				nodeQuaternion.w()};
 			snapshot = frozen;
 			return true;
 		}

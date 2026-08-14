@@ -75,6 +75,7 @@ enum AbsolutePriorEvidenceLimits {
 struct AbsolutePriorEvidenceNode: Equatable {
     let nodeID: Int64
     let stamp: Double
+    var mapID: Int32 = 0
 }
 
 /// One immutable index shared by every absolute-prior record in a run.

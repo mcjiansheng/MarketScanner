@@ -1,8 +1,8 @@
 import Foundation
 
-/// Minimal SE(2) transform with explicit pose algebra used by the tag
-/// position propagation: P_final = T_final_node * inverse(T_raw_node) *
-/// P_raw.
+/// Minimal SE(2) transform with explicit pose algebra. Schema-v2 tag
+/// propagation applies the final node transform directly to a node-local
+/// point; `inverse` remains available for the other relative-pose paths.
 struct SE2Transform: Equatable {
     var xM: Double
     var yM: Double

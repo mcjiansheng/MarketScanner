@@ -859,7 +859,7 @@ class LocalizedVersionStoreTests(unittest.TestCase):
             "prior_map_id": prior_map_id,
             "prior_map_package_sha256": prior_map_package_sha,
             "canonical_source_sha256": canonical_source_sha,
-            "coordinate_contract_version": 1,
+            "coordinate_contract_version": 2,
             "source_node_count": 2,
             "exported_node_count": 2,
             "one_second_row_count": 2,

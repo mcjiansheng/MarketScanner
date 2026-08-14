@@ -3494,9 +3494,14 @@ if CommandLine.arguments.count == 2,
                 + "\"prior_map_id\":\"\(mapID)\","
                 + "\"prior_map_sha256\":\"\(mapSHA)\","
                 + "\"raw_map_position\":{\"height_m\":0,\"x_m\":5,\"y_m\":-0.1},"
+                + "\"bound_node_id\":1,\"bound_node_map_id\":0,"
+                + "\"bound_node_stamp\":1000,"
+                + "\"coordinate_frame\":\"RTABMAP_BOUND_NODE_LOCAL\","
+                + "\"measurement_height_m\":0,"
+                + "\"point_in_bound_node_frame\":{\"x_m\":5,\"y_m\":-0.1,\"z_m\":0},"
                 + "\"surface_normal_camera\":[0,0,-1],"
                 + "\"symbology\":\"EAN13\",\"timestamp\":100,"
-                + "\"tracking_session_id\":\"\(sessionID)\",\"version\":1}\n"
+                + "\"tracking_session_id\":\"\(sessionID)\",\"version\":2}\n"
         }
 
         let nodes = [AbsolutePriorEvidenceNode(nodeID: 1, stamp: 1000)]
@@ -3573,7 +3578,6 @@ if CommandLine.arguments.count == 2,
             priorMap: priorMap,
             floorID: floorID,
             graphQualityPassed: true,
-            rawNodePoses: [1: .identity],
             minimumAssociationMarginM: 0.5,
             sourceBursts: bursts.bursts)
         require(
@@ -10945,32 +10949,47 @@ do {
     let index = TagObservationResolver.NodeIndex(
         finalNodes: finalNodes,
         rawNodeStamps: [10: 500.0, 11: 501.5])
-    // Explicit node 10, raw pose = identity, raw position (0, 0).
+    // Explicit node 10 with node-local position (0, 0).
     let resolved = try TagObservationResolver.resolve(
         observation: TagObservationResolver.RawObservation(
             barcode: "6901", symbology: "CODE128", floorID: "1",
             nodeID: 10, nodeTimestamp: 500.0, frameMonotonicSeconds: 500.0,
-            rawPositionM: (0, 0, 0), rawNodePose: .identity,
+            rawPositionM: (0, 0, 0),
             trackingSessionID: "s"),
         index: index, sessionID: "s")
     require(
         resolved.mapXM == 2 && resolved.mapYM == 3 && resolved.nodeID == 10
             && resolved.bindingMethod == "explicit_node",
         "G1 explicit-node binding must propagate to (2,3), got \(resolved.mapXM),\(resolved.mapYM)")
-    // Raw node pose with an offset: T_raw is identity so the tag local
-    // position is (-1, 0); T_final(node 11) = (2, 4, +90deg) rotates
+    // Node-local position is (-1, 0); T_final(node 11) = (2, 4, +90deg) rotates
     // (-1, 0) to (0, -1), so P_final = (2, 3).
     let resolved2 = try TagObservationResolver.resolve(
         observation: TagObservationResolver.RawObservation(
             barcode: "6902", symbology: "CODE128", floorID: "1",
             nodeID: 11, nodeTimestamp: 501.5, frameMonotonicSeconds: 501.5,
             rawPositionM: (-1, 0, 0),
-            rawNodePose: SE2Transform(xM: 0, yM: 0, yawRad: 0),
             trackingSessionID: "s"),
         index: index, sessionID: "s")
     require(
         close(resolved2.mapXM, 2.0) && close(resolved2.mapYM, 3.0),
-        "G1 position propagation must apply T_final*inv(T_raw)*P, got \(resolved2.mapXM),\(resolved2.mapYM)")
+        "G1 position propagation must apply T_final*P_node once, got \(resolved2.mapXM),\(resolved2.mapYM)")
+    let nonzeroGauge = try TagObservationResolver.resolve(
+        observation: TagObservationResolver.RawObservation(
+            barcode: "6902-gauge", symbology: "CODE128", floorID: "1",
+            nodeID: 12, nodeTimestamp: 502.0,
+            frameMonotonicSeconds: 502.0,
+            rawPositionM: (1, 0, 0), trackingSessionID: "s"),
+        index: TagObservationResolver.NodeIndex(
+            finalNodes: [TagObservationResolver.FinalNodePose(
+                id: 12, monotonicSeconds: 502.0,
+                pose: SE2Transform(
+                    xM: 100, yM: 50, yawRad: Double.pi / 2),
+                floorID: "1")],
+            rawNodeStamps: [12: 502.0]),
+        sessionID: "s")
+    require(
+        close(nonzeroGauge.mapXM, 100) && close(nonzeroGauge.mapYM, 51),
+        "nonzero 100m/50m/+90deg gauge must be applied exactly once")
     // Time-delta gate: the raw snapshot stamp must agree with the
     // parser-bound stamp within the frozen 1.0 s window (V1R5 §6.4).
     do {
@@ -10978,7 +10997,7 @@ do {
             observation: TagObservationResolver.RawObservation(
                 barcode: "6903", symbology: "CODE128", floorID: "1",
                 nodeID: 10, nodeTimestamp: 506.0, frameMonotonicSeconds: 506.0,
-                rawPositionM: (0, 0, 0), rawNodePose: .identity,
+                rawPositionM: (0, 0, 0),
                 trackingSessionID: "s"),
             index: index, sessionID: "s")
         require(false, "G2 time-delta gate must reject a stale binding")
@@ -10994,7 +11013,7 @@ do {
             observation: TagObservationResolver.RawObservation(
                 barcode: "6904", symbology: "CODE128", floorID: "1",
                 nodeID: 10, nodeTimestamp: 500.0, frameMonotonicSeconds: 500.0,
-                rawPositionM: nil, rawNodePose: .identity,
+                rawPositionM: nil,
                 trackingSessionID: "s"),
             index: index, sessionID: "s")
         require(false, "G2 unlocalized observations must be rejected")
@@ -11010,7 +11029,7 @@ do {
             observation: TagObservationResolver.RawObservation(
                 barcode: "x", symbology: "CODE128", floorID: "1",
                 nodeID: 10, nodeTimestamp: 500.0, frameMonotonicSeconds: 500.0,
-                rawPositionM: (0, 0, 0), rawNodePose: .identity,
+                rawPositionM: (0, 0, 0),
                 trackingSessionID: "other"),
             index: index, sessionID: "s")
         require(false, "G1 session mismatch must be rejected")
@@ -11477,7 +11496,6 @@ do {
             priorMap: finalizerMap,
             floorID: "1",
             graphQualityPassed: graphQualityPassed,
-            rawNodePoses: [77: .identity],
             minimumAssociationMarginM: 0.5)
     }
 
@@ -11649,12 +11667,15 @@ do {
                 == "graph_quality_failed",
         "missing shelf association must never bypass the hard graph-quality gate")
 
-    let (_, missingNodeRescans) = try MobileProcessingPipeline.finalizeTags(
-        observations: finalizerEvidence(
-            barcode: "MISSING-RAW-NODE",
-            symbology: "CODE128",
-            y: -0.1,
-            count: 3),
+    var legacyFrameEvidence = finalizerEvidence(
+        barcode: "LEGACY-FRAME", symbology: "CODE128", y: -0.1,
+        count: 3)
+    for index in legacyFrameEvidence.indices {
+        legacyFrameEvidence[index].legacyCoordinateFrame = true
+        legacyFrameEvidence[index].rawPositionM = nil
+    }
+    let (legacyTags, legacyRescans) = try MobileProcessingPipeline.finalizeTags(
+        observations: legacyFrameEvidence,
         resolverIndex: finalizerIndex,
         shelves: [segmentLow],
         shelfIndex: ShelfAssociationEngine.ShelfSpatialIndex(
@@ -11665,15 +11686,60 @@ do {
         priorMap: finalizerMap,
         floorID: "1",
         graphQualityPassed: true,
-        rawNodePoses: [:],
         minimumAssociationMarginM: 0.5)
     require(
-        missingNodeRescans.count == 1
-            && missingNodeRescans[0].reasonCode == "raw_node_pose_missing",
-        "missing authoritative raw-node pose must remain RESCAN_REQUIRED")
+        legacyTags.count == 1
+            && legacyTags[0].qualityStatus == "LOW_CONFIDENCE"
+            && legacyTags[0].mapXM == nil && legacyTags[0].mapYM == nil
+            && legacyRescans.count == 1
+            && legacyRescans[0].reasonCode
+                == "legacy_tag_coordinate_frame_rescan_required",
+        "legacy v1 coordinates must retain the barcode and require rescan")
 }
 catch {
     require(false, "RC-B17/H-07 finalization bucket tests failed: \(error)")
+}
+
+// Publication is a single shared invariant. Every business blocker must
+// independently prevent COMPLETE, including coordinate-contract v1 results.
+do {
+    func permits(
+        low: Int = 0, unpositioned: Int = 0, unassociated: Int = 0,
+        rescans: Int = 0, legacy: Int = 0
+    ) -> Bool {
+        MobileResultPublicationInvariant.permits(
+            coordinatesArePriorMapFrame: true,
+            graphQualityPassed: true,
+            degradationCount: 0,
+            coordinateFrameAuditPassed: legacy == 0,
+            legacyCoordinateFrameCount: legacy,
+            lowConfidenceTagCount: low,
+            unpositionedTagCount: unpositioned,
+            unassociatedTagCount: unassociated,
+            rescanTaskCount: rescans)
+    }
+    require(permits(), "clean publication invariant must permit COMPLETE")
+    require(!permits(low: 1), "low-confidence tag must block COMPLETE")
+    require(!permits(unpositioned: 1), "unpositioned tag must block COMPLETE")
+    require(!permits(unassociated: 1), "unassociated tag must block COMPLETE")
+    require(!permits(rescans: 1), "rescan task must block COMPLETE")
+    require(!permits(legacy: 1), "legacy coordinate frame must block COMPLETE")
+    let tamperedComplete: [String: Any] = [
+        "result_quality_status": "COMPLETE",
+        "publish_permitted": true,
+        "coordinate_contract_version": 2,
+        "coordinate_frame_audit_passed": true,
+        "legacy_tag_coordinate_frame_count": 0,
+        "degradation_count": 0,
+        "low_confidence_tag_count": 1,
+        "unpositioned_tag_count": 0,
+        "unassociated_tag_count": 0,
+        "rescan_count": 0,
+    ]
+    require(
+        !MobileResultPublicationInvariant.manifestIsConsistent(
+            tamperedComplete),
+        "reader must reject a tampered COMPLETE manifest with tag blockers")
 }
 
 // =====================================================================
@@ -18670,7 +18736,7 @@ do {
 
     let validRecord: [String: Any] = [
         "format": "MarketScannerPriceTagObservation",
-        "version": 1,
+        "version": 2,
         "observation_id": "OBS-1",
         "timestamp": 100.0,
         "payload": "6901234567890",
@@ -18705,6 +18771,12 @@ do {
         // V1R5 §5.4: durable burst linkage assigned at persistence time.
         "burst_id": "BURST-MAIN",
         "frame_id": "frame-1",
+        "bound_node_id": 1,
+        "bound_node_stamp": 1001.0,
+        "bound_node_map_id": 0,
+        "coordinate_frame": "RTABMAP_BOUND_NODE_LOCAL",
+        "point_in_bound_node_frame": ["x_m": 1.0, "y_m": 2.0, "z_m": 0.0],
+        "measurement_height_m": 1.5,
     ]
     func observation(
         _ edits: [String: Any], removing: [String] = []
@@ -18730,6 +18802,8 @@ do {
         "node_timebase_frame_timestamp": 1002.0,
         "alignment_snapshot_timestamp": 1000.998,
         "frame_id": "frame-2", "needs_review": true,
+        "bound_node_id": 2, "bound_node_stamp": 1002.0,
+        "point_in_bound_node_frame": ["x_m": 1.1, "y_m": 2.1, "z_m": 0.0],
         "raw_map_position": ["x_m": 1.1, "y_m": 2.1],
     ]))
     lines.append(try observation([
@@ -18738,8 +18812,10 @@ do {
         "node_timebase_frame_timestamp": 1003.0,
         "alignment_snapshot_timestamp": 1001.998,
         "frame_id": "frame-3", "needs_review": true,
+        "bound_node_id": 3, "bound_node_stamp": 1003.0,
         "measurement_method": "unavailable", "measurement_confidence": 0.0,
-    ], removing: ["raw_map_position"]))
+    ], removing: ["raw_map_position", "point_in_bound_node_frame",
+                  "measurement_height_m"]))
     lines.append(try observation([
         "observation_id": "OBS-NOT-IN-BURST", "frame_id": "frame-x",
     ]))
@@ -18786,7 +18862,7 @@ do {
         "tag parser record total wrong: \(audit.recordTotal)")
     require(
         audit.recordAccepted == 3
-            && audit.recordUnlocalizedSkipped == 2,
+            && audit.recordUnlocalizedSkipped == 1,
         "tag parser accepted/unlocalized wrong: \(audit.recordAccepted)/\(audit.recordUnlocalizedSkipped)")
     require(audit.totalRejected == 9, "tag parser total rejected wrong: \(audit.totalRejected)")
     require(
@@ -18824,9 +18900,9 @@ do {
         "tag parser first observation must bind node 1 with a position and burst linkage")
     let unlocalized = result.observations[2]
     require(
-        result.observations[1].rawPositionM == nil
+        result.observations[1].rawPositionM != nil
             && unlocalized.boundNodeID == 3 && unlocalized.rawPositionM == nil,
-        "optional/absent height observations must remain legal review-only evidence")
+        "height is independent of node-local position; unavailable evidence remains unlocalized")
 
     let missingDirectory = temporary.appendingPathComponent(
         "missing-observation-burst", isDirectory: true)
@@ -18911,7 +18987,6 @@ do {
         priorMap: degradedPriorMap,
         floorID: floor,
         graphQualityPassed: false,
-        rawNodePoses: [:],
         minimumAssociationMarginM: 0.5,
         sourceBursts: partiallyValidBursts.bursts,
         retainedDegradedBursts:

@@ -82,13 +82,17 @@ session input manifest v4 将 `clock_correlations.jsonl` 与源数据库和其�
 3. PC 优先使用完整 `Admin.opt_poses` 整图；若优化图部分覆盖，则以全量连续 VIO 为骨架传播已优化校正；若全局图不可用但原始 `Node.pose` 可证明连续，则只生成不可发布诊断草稿。任何路径都禁止逐节点混合两个 gauge。
 4. 起点与初始方向提供首个地图 gauge；严格 exact-node 人工校准提供可信绝对地图锚点。大绝对修正是长距离累计漂移的正常校正量，不能被当作手机瞬移；连续性检查针对相对运动、局部修正梯度、闭环残差和地图可达性。
 5. 道路连通性、通道、货架及固定结构自由空间约束把连续轨迹放回原始地图。结构内点、穿越结构和不可达转移不能成为结果；平行货架/通道多解保留候选和低置信度，不通过调权重伪造唯一货架。
-6. 最终无条件尝试生成节点级/秒级位置和全量价签业务表，再独立决定 `publish_permitted`。正式 concrete shelf-loop factor 尚未完成；在未来 v5 证据合同落地前，当前 top-K 只可用于诊断和人工复核。
+6. 最终无条件尝试生成节点级/秒级位置和全量价签业务表，再按统一发布不变量决定 `publish_permitted`：地图坐标框、图质量、pipeline degradation、coordinate-frame audit、legacy 坐标记录、低置信价签、空坐标、未关联货架和重扫任务必须全部通过/清零。正式 concrete shelf-loop factor 尚未完成；在未来 v5 证据合同落地前，当前 top-K 只可用于诊断和人工复核。
 
 当前已有地图模式按**单次扫描、单一楼层**工作：开始前绑定一个楼层，扫描中不自动切层，也不支持跨楼层定位。楼层内部允许坡道、地面起伏等少量竖直位移；二维先验定位忽略 ARKit 高度分量，而原始 ARKit/RTAB-Map 数据仍完整保留三维运动。
 
 已有地图模式提供用户触发的 ESL Barcode Capture Mode，直接复用持续到达的 `ARFrame.capturedImage`，不启动第二路相机。进入该模式不会暂停 `ARSession`、RTAB-Map、连续 SQLite 数据库、节点创建、时钟/位姿记录或先验地图定位；相机画面只由 camera-only `MTKView` 预览覆盖，原扫描链继续在后台运行。ARKit 连续自动对焦被显式保持启用。Vision 使用屏幕固定 scan box 对应的真实 `regionOfInterest`，按最多 10 Hz 且 one-in-flight 执行；主 ROI 无结果时只在同一 worker lane/同一 ARFrame 上追加一次有界扩展 ROI 检测，以覆盖贴近镜头时条码略超框的情况，同时增加 Code39/93、I2of5、ITF14、DataMatrix、Aztec 等成熟码制。每个请求仍有独立的 1 秒 ARFrame deadline。底层使用固定两条 worker lane：超时请求会 best-effort cancel 并隔离旧 lane，fresh request 可在备用 lane 实际开始；两条 lane 都挂起时立即终止 ESL UX，不创建第三条 worker 或无界 backlog，原始扫描链继续。相机预览最多 24 Hz。候选需要连续 2 帧锁定，同一 burst 目标 4 个、最低 3 个独立帧；采集窗口为 4 秒，给近距离重新对焦和短暂 node publication gap 留出时间。
 
-价签入口使用独立全屏扫码框、识别进度、成功/错误状态、触觉反馈和取消按钮；状态文字和已识别条码分别绑定扫码框的精确上、下边缘并保持 18 pt 间距，不再依赖屏幕中心魔数，因此不会压住扫码框边线。失败时按 ARFrame、定位对齐、扫描状态、地图身份和 required evidence 给出明确弹窗。native node timebase 在首个 RTAB-Map snapshot 前缺失属于暂时未就绪：该 frame 会等待而不写入非有限占位值，避免一次启动窗口同时毒化三份必要定位 sidecar。扫码过程中暂时拿不到 live node snapshot 时，会在同一 1 秒严格时间合同内复用已冻结 exact-ID snapshot 或等待下一帧，不再把它误报成 sidecar 写入失败；真实必需写入失败、身份错误和 burst 绑定失败仍保持粘性 fail-closed。完整 burst 若定位、深度或货架关联质量不足，会直接以低置信度保留并结束本次扫码，无需现场反复扫描；PC 后处理继续执行 `P_final = T_final_node × inverse(T_raw_node) × P_raw`，按 exact `boundNodeID` 和最终优化手机位姿重算位置。只有缺少完整 burst、exact node/原始节点位姿或可解析位置等权威证据时才产生重扫任务。扫描结束会同步驱动 Mobile-Only workflow 的 `scanning → finalizingScan → idle`，可恢复保存失败则回到原扫描，避免下一次配置收到旧的 `scanning` 状态。
+价签入口使用独立全屏扫码框、识别进度、成功/错误状态、触觉反馈和取消按钮；状态文字和已识别条码分别绑定扫码框的精确上、下边缘并保持 18 pt 间距，不再依赖屏幕中心魔数，因此不会压住扫码框边线。失败时按 ARFrame、定位对齐、扫描状态、地图身份和 required evidence 给出明确弹窗。native node timebase 在首个 RTAB-Map snapshot 前缺失属于暂时未就绪：该 frame 会等待而不写入非有限占位值，避免一次启动窗口同时毒化三份必要定位 sidecar。扫码过程中暂时拿不到 live node snapshot 时，会在同一 1 秒严格时间合同内复用已冻结 exact-ID snapshot 或等待下一帧，不再把它误报成 sidecar 写入失败；真实必需写入失败、身份错误和 burst 绑定失败仍保持粘性 fail-closed。
+
+价签 observation schema v2 由同一次 native 原子快照冻结 `bound_node_id`、`bound_node_stamp`、`bound_node_map_id` 和 `T_opengl_world_from_node`，把同帧 scene-depth 世界点转换为 `point_in_bound_node_frame`。手机与 PC 后处理只执行一次 `P_final = T_final_node × P_node`，不再把已经位于先验地图框的旧 `raw_map_position` 再与 raw-node inverse 组合，从而关闭非零地图平移/旋转下的重复变换。只有 scene depth 可形成正式 node-local 三维点；二维 `shelf_plane_ray` 不伪造该权威。历史 observation v1 仍保留条码和业务身份，但可发布坐标清空、质量降为低置信并生成 `legacy_tag_coordinate_frame_rescan_required`。完整 burst 若定位、深度或货架关联质量不足，业务记录继续保留；任何低置信、空坐标、未关联或 rescan 都会阻断 `COMPLETE/publish_permitted`。扫描结束会同步驱动 Mobile-Only workflow 的 `scanning → finalizingScan → idle`，可恢复保存失败则回到原扫描，避免下一次配置收到旧的 `scanning` 状态。
+
+上述修复只关闭设计审查中的 P0 坐标框错误和 P1-A 发布门漏检，不代表完整通道/具体货架连续配准已经实现。正式 capture-pose epoch/component 合同、手机 corridor/shelf/side Top-K 状态机、人体扫掠体不可穿架约束、PC 混合因子图、concrete shelf-loop/manifest v5、动态顾客/购物车和地图失配处理仍是后续 P1-B～P2；详见 [`AISLE_SHELF_CONSTRAINED_LOCALIZATION_REMEDIATION_2026-08-14.md`](docs/map-assisted-localization/AISLE_SHELF_CONSTRAINED_LOCALIZATION_REMEDIATION_2026-08-14.md)。整体状态继续为 **NO-GO / NOT PRODUCTION READY**。
 
 “处理历史扫描”只列出 `finalized=true` 的连续单库会话。手机后处理会先生成 immutable snapshot，并对 SQLite、Node/Link 和图位姿 BLOB 执行严格校验；iOS App sandbox 不再依赖 SQLite 重新打开 `/dev/fd/<n>`，而是从已绑定的 no-follow descriptor 流式复制到 App 私有临时目录进行只读完整性校验，复核源 inode 后立即清理。每个历史会话还提供独立“导出原始扫描”按钮：即使手机后处理失败，也可选择 Files 或外接存储目录，复制完整 `segment_0001`，对源/目标/复制后源执行 SHA-256 manifest 三方一致性检查，写入复制凭证，并始终保留手机中的原始会话；同名目标使用新的 `-Export-*` 目录，绝不覆盖已有导出。
 
@@ -98,13 +102,13 @@ session input manifest v4 将 `clock_correlations.jsonl` 与源数据库和其�
 
 人工地图锚点在 iOS 与 PC 统一为 canonical SE(2)。PC 工作台不再提供容易产生不可控跳变的连续 yaw slider，只保留 X/Y/yaw 数值输入、0.1/0.5/1.0 m 四向微调、±1/±5/±15°旋转、东/北/西/南和键盘操作；界面显示值就是服务端提交值，不进行隐藏坐标或朝向变换。低置信度、部分图、平行通道/货架多解、时钟局部缺口和可恢复的关联不足只降低发布资格，不得删除源节点、durable 价签或整个处理版本。
 
-本轮主机证据包括 PriorMap 全量 322/322、Qualification 30/30、Map Studio 完整 API 130/130、原生检查 7884/0，以及 macOS Release `rtabmap-reprocess` 构建/启动。真实浏览器响应式自动化仍受浏览器 localhost 安全策略限制；签名真机、LiDAR、Files provider、热/低磁盘和现场非空价签真值仍属于设备/现场验收，不能由上述主机结果替代。
+本轮主机证据包括 PriorMap 全量 329/329（378.876 s）、Qualification 30/30、Map Studio 完整 API 131/131、原生检查 7884/0，以及 macOS Release `rtabmap-reprocess` 构建。规模子进程处理 300,000 finalization（8.111 s，峰值 RSS 13,287,424 bytes）、1,728,000 trace（保留 172,801，0.405 s，峰值 59,146,240 bytes）和 400,000 tag evidence（输入 282,352,646 bytes，接受 200,000，29.046 s，峰值 747,192,320 bytes）；tag 路径仍低于冻结的 768 MiB host 门，但余量有限。真实浏览器响应式自动化仍受浏览器 localhost 安全策略限制；签名真机、LiDAR、Files provider、热/低磁盘和现场非空价签真值仍属于设备/现场验收，不能由上述主机结果替代。
 
 ### MapCase02 标准工作簿状态（2026-08-09）
 
 `MAPCASE02 / STANDARD SUPERMARKET XLSX FORMAT PASS`：Swift/PC 对正式工作簿 top-left anchor、production role geometry、canonical v3、package v2、road/spatial/distance/shelf 派生工件与资源上限已完成阻断级收口。冻结统计为源 1838、active 1630、货架 1301、固定结构 329、展示审计 208、active 越界 0；canonical SHA `5ddfac7dc439afc45abdcf800b799c05d53704895b620d161ef08a442c55b2db`。2026-08-09 真机导入暴露编译器保留大写、地图库只接受小写的 `prior_map_id` 合同断层；当前新包统一生成小写且总长不超过 128 的 ID，正式 MapCase02 为 `piaseczno-5ddfac7dc439`，并已补齐 compile → integrity → MobileMapLibrary install/register/list/exact-read 回归。Swift/Python 还共同严格校验 manifest/report 计数、warnings/malformed rows 以及 road graph node/edge 绑定，手机原样生成包必须通过 PC production validator。旧 uppercase v2 开发包在普通 iOS/PC validator、旧向导和离线定位入口均默认拒绝，只能通过显式 diagnostic-only 参数做只读检查，不能参与新的扫描或处理。
 
-这是地图格式局部链路结论，不是产品发布结论。当前整体仍为 **REJECTED / NO-GO / developer smoke only**，J-04 为 **BLOCKER / NOT CLOSED**；Apple 双平台 clean link、完整 PriorMap discover、LiDAR 真机、Device Lab、Replay/FAR 和现场验收仍待执行。I10 exact-SHA 已通过完整 macOS host 合同，但在冷构建 iphoneos 依赖时暴露宿主 `rtabmap-res_tool` 未显式绑定；I11 已修复并等待新的 exact-SHA 复验，未创建冻结标签。
+这是 2026-08-09 地图格式局部链路的历史结论，不是产品发布结论。完整 PriorMap discover 已在 2026-08-14 当前修复源码上完成 329/329；Apple 双平台 cold clean link、签名 LiDAR 真机、Device Lab、Replay/FAR 和现场验收仍待执行。I10 exact-SHA 的 iphoneos `rtabmap-res_tool` 历史阻断与 I11 修复仅作为演进记录保留，未创建冻结标签。当前整体仍为 **REJECTED / NO-GO / developer smoke only**，J-04 仍为 **BLOCKER / NOT CLOSED**。
 
 每个 frame observation 先写入 `tag_observations.jsonl`，完整 burst 再写入 `tag_observation_bursts.jsonl`，最终确认前必须证明 burst complete，并对 `observation_id / burst_id / frame_id / payload / symbology` 做精确磁盘交叉绑定。只有至少 3 个逐帧通过定位、测量、关联质量门且共同指向同一 `shelfSegmentId + side` 的独立证据，才能打开可提交的货架确认。确认页显示小地图、高亮货架、算法候选和替代侧面；`USER_CONFIRMED` / `USER_OVERRIDDEN` 作为 additive v2 用户证据保存，不能覆盖算法字段，更不能修改 SLAM、轨迹、node pose 或定位约束。
 

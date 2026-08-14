@@ -39,6 +39,7 @@ from tools.PriorMap.offline_localization import (
     _verified_tag_burst_evidence,
     _segment_intersection,
     apply_pose_delta_to_point,
+    apply_bound_node_local_point,
     bind_tag_observation_to_pose,
     bind_manual_localization_event_to_pose,
     append_manual_edit,
@@ -294,6 +295,12 @@ class SE2TagPropagationTests(unittest.TestCase):
         with self.assertRaises(OfflineLocalizationError):
             apply_pose_delta_to_point(base, opt, (1.0, 0.0))
 
+    def test_node_local_nonzero_gauge_applied_exactly_once(self) -> None:
+        final = self._pose(100.0, 50.0, math.pi / 2)
+        x, y = apply_bound_node_local_point(final, (1.0, 0.0))
+        self.assertAlmostEqual(x, 100.0, places=9)
+        self.assertAlmostEqual(y, 51.0, places=9)
+
 
 class TagObservationBindingTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -429,6 +436,51 @@ class TagObservationBindingTests(unittest.TestCase):
         self.assertEqual(binding.node_index, 0)
         self.assertEqual(binding.binding_source, "verified_burst_bound_node_id")
         self.assertAlmostEqual(binding.time_delta_seconds, 0.05)
+
+    def test_v2_exact_node_stamp_and_component_are_reverified(self) -> None:
+        observation = {
+            **self._verified_observation(),
+            "version": 2,
+            "frame_timestamp": 0.05,
+            "node_timebase_frame_timestamp": 100.05,
+            "bound_node_id": 10,
+            "bound_node_stamp": 100.0,
+            "bound_node_map_id": 7,
+            "coordinate_frame": "RTABMAP_BOUND_NODE_LOCAL",
+            "point_in_bound_node_frame": {"x_m": 1.0, "y_m": 0.0, "z_m": 0.0},
+        }
+        authority = VerifiedTagBurstFrameAuthority(
+            burst_id="burst-1",
+            frame_id="frame-1",
+            observation_id="obs-1",
+            bound_node_id=10,
+            frame_timestamp=0.05,
+            node_timestamp=100.05,
+            payload="ESL-001",
+            symbology="EAN13",
+        )
+        binding = bind_tag_observation_to_pose(
+            self.poses,
+            observation,
+            expected_tracking_session_id="tracking-1",
+            expected_map_hashes={"a" * 64},
+            expected_floor_id="1",
+            verified_burst_frame=authority,
+            source_node_inventory={10: (100.0, 7), 11: (101.0, 7)},
+        )
+        self.assertEqual(binding.node_index, 0)
+        with self.assertRaisesRegex(
+            OfflineLocalizationError, "node_local_identity_mismatch"
+        ):
+            bind_tag_observation_to_pose(
+                self.poses,
+                {**observation, "bound_node_map_id": 8},
+                expected_tracking_session_id="tracking-1",
+                expected_map_hashes={"a" * 64},
+                expected_floor_id="1",
+                verified_burst_frame=authority,
+                source_node_inventory={10: (100.0, 7), 11: (101.0, 7)},
+            )
 
     def test_verified_burst_observation_node_fields_cannot_override(self) -> None:
         for field in ("nearest_node_id", "node_id"):
@@ -1101,7 +1153,7 @@ class RobustSE2OptimizerTests(unittest.TestCase):
                     "prior_map_id": "map",
                     "prior_map_package_sha256": "a" * 64,
                     "canonical_source_sha256": "b" * 64,
-                    "coordinate_contract_version": 1,
+                    "coordinate_contract_version": 2,
                     "input_identity_id": "c" * 64,
                 },
             )
@@ -2732,9 +2784,12 @@ class LocalizedPipelineTests(unittest.TestCase):
         self.node_timebase_offset = 1_700_000_000.0
         connection = sqlite3.connect(self.source_database)
         try:
-            connection.execute("CREATE TABLE Node(id INTEGER PRIMARY KEY, stamp REAL NOT NULL)")
+            connection.execute(
+                "CREATE TABLE Node(id INTEGER PRIMARY KEY, "
+                "map_id INTEGER NOT NULL, stamp REAL NOT NULL)"
+            )
             connection.executemany(
-                "INSERT INTO Node(id, stamp) VALUES(?, ?)",
+                "INSERT INTO Node(id, map_id, stamp) VALUES(?, 0, ?)",
                 [
                     (index + 1, self.node_timebase_offset + float(index))
                     for index in range(20)
@@ -2746,9 +2801,12 @@ class LocalizedPipelineTests(unittest.TestCase):
         self.optimized_database = self.root / "optimized.db"
         connection = sqlite3.connect(self.optimized_database)
         try:
-            connection.execute("CREATE TABLE Node(id INTEGER PRIMARY KEY, stamp REAL NOT NULL)")
+            connection.execute(
+                "CREATE TABLE Node(id INTEGER PRIMARY KEY, "
+                "map_id INTEGER NOT NULL, stamp REAL NOT NULL)"
+            )
             connection.executemany(
-                "INSERT INTO Node(id, stamp) VALUES(?, ?)",
+                "INSERT INTO Node(id, map_id, stamp) VALUES(?, 0, ?)",
                 [
                     (index + 1, self.node_timebase_offset + float(index))
                     for index in range(20)
@@ -2855,7 +2913,7 @@ class LocalizedPipelineTests(unittest.TestCase):
             self.segment / "tag_observations.jsonl",
             [{
                 "format": "MarketScannerPriceTagObservation",
-                "version": 1,
+                "version": 2,
                 "observation_id": "obs-1",
                 "frame_timestamp": 10.0,
                 "node_timebase_frame_timestamp": self.node_timebase_offset + 10.0,
@@ -2864,6 +2922,14 @@ class LocalizedPipelineTests(unittest.TestCase):
                 "prior_map_sha256": manifest["source_sha256"],
                 "floor_id": "1",
                 "raw_map_position": {"x_m": 2.0, "y_m": -2.0, "height_m": 1.2},
+                "bound_node_id": 11,
+                "bound_node_stamp": self.node_timebase_offset + 10.0,
+                "bound_node_map_id": 0,
+                "coordinate_frame": "RTABMAP_BOUND_NODE_LOCAL",
+                "point_in_bound_node_frame": {
+                    "x_m": 0.5, "y_m": 0.0, "z_m": 1.2
+                },
+                "measurement_height_m": 1.2,
                 "payload": "690000000001",
                 "symbology": "EAN13",
             }],
@@ -2966,13 +3032,16 @@ class LocalizedPipelineTests(unittest.TestCase):
             "verified_burst_bound_node_id",
         )
         self.assertEqual(
-            by_id["tag-legacy"]["transform_audit"]["binding_source"],
-            "nearest_node_id",
+            by_id["tag-legacy"]["transform_audit"]["status"],
+            "not_applied",
         )
         self.assertEqual(
-            by_id["tag-legacy"]["transform_audit"]["bound_node_id"],
-            12,
+            by_id["tag-legacy"]["transform_audit"]["reason"],
+            "legacy_tag_coordinate_frame_rescan_required",
         )
+        self.assertNotIn("final_map_position", by_id["tag-legacy"])
+        self.assertEqual(by_id["tag-legacy"]["quality_status"], "LOW_CONFIDENCE")
+        self.assertTrue(by_id["tag-legacy"]["rescan_required"])
         self.assertNotIn(
             "tag_observation_verified_burst_frame_missing",
             by_id["tag-legacy"].get("review_reasons", []),
@@ -3016,11 +3085,13 @@ class LocalizedPipelineTests(unittest.TestCase):
                 encoding="utf-8"
             )
         )[0]
+        self.assertEqual(final_tag["transform_audit"]["status"], "not_applied")
         self.assertEqual(
-            final_tag["transform_audit"]["binding_source"],
-            "nearest_node_id",
+            final_tag["transform_audit"]["reason"],
+            "legacy_tag_coordinate_frame_rescan_required",
         )
-        self.assertEqual(final_tag["transform_audit"]["bound_node_id"], 12)
+        self.assertNotIn("final_map_position", final_tag)
+        self.assertTrue(final_tag["rescan_required"])
 
     def tearDown(self) -> None:
         self.temporary.cleanup()
@@ -3152,7 +3223,15 @@ class LocalizedPipelineTests(unittest.TestCase):
         self.assertEqual(tag["transform_audit"]["bound_node_id"], 11)
         self.assertEqual(
             tag["transform_audit"]["source_position_field"],
-            "tag.raw_map_position",
+            "observation.point_in_bound_node_frame",
+        )
+        self.assertEqual(
+            tag["transform_audit"]["coordinate_frame"],
+            "RTABMAP_BOUND_NODE_LOCAL",
+        )
+        self.assertEqual(
+            tag["transform_audit"]["node_local_point"],
+            {"x_m": 0.5, "y_m": 0.0, "z_m": 1.2},
         )
 
     def test_session_input_manifest_is_deterministic_and_binds_every_required_file(self) -> None:
@@ -3496,14 +3575,23 @@ class LocalizedPipelineTests(unittest.TestCase):
             observations.append(
                 {
                     "format": "MarketScannerPriceTagObservation",
-                    "version": 1,
+                    "version": 2,
                     "observation_id": observation_id,
                     "burst_id": capture_id,
                     "frame_id": frame_id,
                     "frame_timestamp": frame_timestamp,
                     "node_timebase_frame_timestamp": node_timestamp,
                     "node_timebase_offset_seconds": self.node_timebase_offset,
-                    "nearest_node_id": 11,
+                    "bound_node_id": 11,
+                    "bound_node_stamp": self.node_timebase_offset + 10.0,
+                    "bound_node_map_id": 0,
+                    "coordinate_frame": "RTABMAP_BOUND_NODE_LOCAL",
+                    "point_in_bound_node_frame": {
+                        "x_m": 0.5,
+                        "y_m": 0.0,
+                        "z_m": 1.2,
+                    },
+                    "measurement_height_m": 1.2,
                     "tracking_session_id": "tracking-1",
                     "prior_map_sha256": manifest["source_sha256"],
                     "floor_id": "1",
@@ -3811,7 +3899,7 @@ class LocalizedPipelineTests(unittest.TestCase):
                     },
                 )
 
-    def test_esl_confirmation_missing_raw_position_has_stable_unavailable_audit(
+    def test_esl_confirmation_missing_raw_position_keeps_node_local_authority(
         self,
     ) -> None:
         self._upgrade_fixture_to_esl_confirmation_v3()
@@ -3852,13 +3940,31 @@ class LocalizedPipelineTests(unittest.TestCase):
                 self.optimized_database,
                 output,
             )
-        self._assert_unavailable_confirmation_output(
-            output,
-            result,
-            "tag_raw_map_position_missing",
+        snapshot = LocalizedVersionStore(output).resolve_version(
+            str(result["version_id"])
+        )
+        tag = json.loads(
+            (snapshot.version_dir / "localized_price_tags.json").read_text(
+                encoding="utf-8"
+            )
+        )[0]
+        self.assertIn("final_map_position", tag)
+        self.assertNotIn("online_map_position", tag)
+        self.assertEqual(tag["association_audit"]["status"], "suggested_only")
+        self.assertEqual(tag["transform_audit"]["status"], "applied")
+        self.assertEqual(
+            tag["transform_audit"]["source_position_field"],
+            "observation.point_in_bound_node_frame",
+        )
+        self.assertEqual(
+            tag["transform_audit"]["coordinate_frame"],
+            "RTABMAP_BOUND_NODE_LOCAL",
+        )
+        self.assertNotIn(
+            "tag_raw_map_position_missing", tag.get("review_reasons", [])
         )
 
-    def test_esl_confirmation_invalid_raw_position_has_stable_unavailable_audit(
+    def test_esl_confirmation_invalid_raw_position_keeps_node_local_authority(
         self,
     ) -> None:
         self._upgrade_fixture_to_esl_confirmation_v3()
@@ -3899,10 +4005,95 @@ class LocalizedPipelineTests(unittest.TestCase):
                 self.optimized_database,
                 output,
             )
+        snapshot = LocalizedVersionStore(output).resolve_version(
+            str(result["version_id"])
+        )
+        tag = json.loads(
+            (snapshot.version_dir / "localized_price_tags.json").read_text(
+                encoding="utf-8"
+            )
+        )[0]
+        self.assertIn("final_map_position", tag)
+        self.assertEqual(tag["association_audit"]["status"], "suggested_only")
+        self.assertEqual(tag["transform_audit"]["status"], "applied")
+        self.assertEqual(
+            tag["transform_audit"]["source_position_field"],
+            "observation.point_in_bound_node_frame",
+        )
+        self.assertEqual(
+            tag["transform_audit"]["coordinate_frame"],
+            "RTABMAP_BOUND_NODE_LOCAL",
+        )
+        self.assertNotIn(
+            "tag_raw_map_position_invalid", tag.get("review_reasons", [])
+        )
+
+    def test_esl_confirmation_missing_node_local_position_requires_rescan(
+        self,
+    ) -> None:
+        self._upgrade_fixture_to_esl_confirmation_v3()
+        real_reader = offline_localization.read_finalized_session_input_snapshot
+
+        def snapshot_without_node_local_position(*args: object, **kwargs: object):
+            snapshot = real_reader(*args, **kwargs)
+            snapshot.jsonl_values["tag_observations.jsonl"][0].pop(
+                "point_in_bound_node_frame", None
+            )
+            return snapshot
+
+        output = self.root / "localized-esl-node-local-position-missing"
+        with mock.patch.object(
+            offline_localization,
+            "read_finalized_session_input_snapshot",
+            side_effect=snapshot_without_node_local_position,
+        ):
+            result = process_localized_session(
+                self.prior_map,
+                self.session,
+                self.poses,
+                self.source_database,
+                self.optimized_database,
+                output,
+            )
         self._assert_unavailable_confirmation_output(
             output,
             result,
-            "tag_raw_map_position_invalid",
+            "tag_node_local_position_missing",
+        )
+
+    def test_esl_confirmation_invalid_node_local_position_requires_rescan(
+        self,
+    ) -> None:
+        self._upgrade_fixture_to_esl_confirmation_v3()
+        real_reader = offline_localization.read_finalized_session_input_snapshot
+
+        def snapshot_with_invalid_node_local_position(
+            *args: object, **kwargs: object
+        ):
+            snapshot = real_reader(*args, **kwargs)
+            snapshot.jsonl_values["tag_observations.jsonl"][0][
+                "point_in_bound_node_frame"
+            ] = {"x_m": "invalid", "y_m": 0.0, "z_m": 1.2}
+            return snapshot
+
+        output = self.root / "localized-esl-node-local-position-invalid"
+        with mock.patch.object(
+            offline_localization,
+            "read_finalized_session_input_snapshot",
+            side_effect=snapshot_with_invalid_node_local_position,
+        ):
+            result = process_localized_session(
+                self.prior_map,
+                self.session,
+                self.poses,
+                self.source_database,
+                self.optimized_database,
+                output,
+            )
+        self._assert_unavailable_confirmation_output(
+            output,
+            result,
+            "tag_node_local_position_invalid",
         )
 
     def test_p1_p3_recovery_file_bytes_bind_the_v2_bundle_sha(self) -> None:
@@ -4523,7 +4714,7 @@ class LocalizedPipelineTests(unittest.TestCase):
                     "timestamp": self.node_timebase_offset + 10.0,
                     "node_id": 11,
                     "floor_id": "1",
-                    "coordinate_contract_version": 1,
+                    "coordinate_contract_version": 2,
                     "x_m": 18.0,
                     "y_m": -9.0,
                     "yaw_rad": math.radians(90.0),
@@ -4897,11 +5088,15 @@ class LocalizedPipelineTests(unittest.TestCase):
         self.assertEqual(tags[0]["quality_status"], "LOW_CONFIDENCE")
         self.assertEqual(tags[0]["payload"], original[0]["payload"])
         self.assertIn("final_map_position", tags[0])
-        self.assertAlmostEqual(tags[0]["final_map_position"]["x_m"], 2.0)
+        self.assertAlmostEqual(tags[0]["final_map_position"]["x_m"], 7.0)
         self.assertAlmostEqual(tags[0]["final_map_position"]["y_m"], -2.534375)
         self.assertEqual(
             tags[0]["transform_audit"]["source_position_field"],
-            "tag.raw_map_position",
+            "observation.point_in_bound_node_frame",
+        )
+        self.assertEqual(
+            tags[0]["transform_audit"]["coordinate_frame"],
+            "RTABMAP_BOUND_NODE_LOCAL",
         )
         self.assertFalse(report["publish_permitted"])
 

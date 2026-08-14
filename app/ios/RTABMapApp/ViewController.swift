@@ -25,7 +25,10 @@ extension SupermarketScanSession: RecoveryLifecycleWriting {
 
 private struct PriceTagCaptureNodeBinding {
     let nodeID: Int64
+    let nodeStamp: TimeInterval
+    let nodeMapID: Int32
     let nodeTimebaseOffsetSeconds: TimeInterval
+    let openGLWorldFromNode: simd_float4x4
 }
 
 private struct PendingManualPriorMapPoseRequest {
@@ -75,8 +78,10 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
     private var priorMapLastNodeBinding: (
         nodeId: Int,
         nodeStamp: TimeInterval,
+        nodeMapId: Int32,
         nodeTimebaseOffsetSeconds: TimeInterval,
         generation: UInt64,
+        openGLWorldFromNode: simd_float4x4,
         sampledFrameTimestamp: TimeInterval
     )?
     private var finalizedCleanupPromptShown = false
@@ -3321,8 +3326,10 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
             priorMapLastNodeBinding = (
                 binding.nodeId,
                 binding.nodeStamp,
+                binding.nodeMapId,
                 binding.nodeTimebaseOffsetSeconds,
                 binding.generation,
+                binding.openGLWorldFromNode,
                 frame.timestamp)
         }
         let ticket: Int
@@ -3959,8 +3966,11 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                 frameTimestamp: frameTimestamp) {
             return PriceTagCaptureNodeBinding(
                 nodeID: Int64(live.nodeId),
+                nodeStamp: live.nodeStamp,
+                nodeMapID: live.nodeMapId,
                 nodeTimebaseOffsetSeconds:
-                    live.nodeTimebaseOffsetSeconds)
+                    live.nodeTimebaseOffsetSeconds,
+                openGLWorldFromNode: live.openGLWorldFromNode)
         }
         guard let cached = priorMapLastNodeBinding else { return nil }
         let nodeTimebaseFrameTimestamp = frameTimestamp
@@ -3972,8 +3982,11 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         }
         return PriceTagCaptureNodeBinding(
             nodeID: Int64(cached.nodeId),
+            nodeStamp: cached.nodeStamp,
+            nodeMapID: cached.nodeMapId,
             nodeTimebaseOffsetSeconds:
-                cached.nodeTimebaseOffsetSeconds)
+                cached.nodeTimebaseOffsetSeconds,
+            openGLWorldFromNode: cached.openGLWorldFromNode)
     }
 
     @discardableResult
@@ -4237,9 +4250,13 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                     detection,
                     trackingSessionId: trackingSessionID,
                     nodeTimebaseOffsetSeconds:
-                        binding.nodeTimebaseOffsetSeconds)
+                        binding.nodeTimebaseOffsetSeconds,
+                    boundNodeID: binding.nodeID,
+                    boundNodeStamp: binding.nodeStamp,
+                    boundNodeMapID: binding.nodeMapID,
+                    openGLWorldFromNode: binding.openGLWorldFromNode)
             }
-            if localized.observation.rawMapPosition == nil
+            if localized.observation.pointInBoundNodeFrame == nil
                 || localized.observation.measurementMethod == "unavailable" {
                 self.recordPriceTagCaptureAudit(
                     .measurementUnavailable,
@@ -5288,14 +5305,7 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
     private func resolvePendingManualPriorMapPoseIfReady(
         frameTimestamp: TimeInterval,
         acceptedTransform: simd_float4x4,
-        nodeBinding: (
-            nodeId: Int,
-            nodeStamp: TimeInterval,
-            nodeTimebaseFrameTimestamp: TimeInterval,
-            nodeTimebaseOffsetSeconds: TimeInterval,
-            deltaSeconds: TimeInterval,
-            generation: UInt64
-        )
+        nodeBinding: RTABMapNodeBindingSnapshot
     ) {
         mManualPriorMapPoseRequestLock.lock()
         guard let request = mPendingManualPriorMapPoseRequest else {

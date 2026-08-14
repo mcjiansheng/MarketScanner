@@ -1222,6 +1222,7 @@ class IOSCoreContractTests(unittest.TestCase):
         scanner = (app / "PriceTagVisionScanner.swift").read_text(
             encoding="utf-8"
         )
+        rtabmap = (app / "RTABMap.swift").read_text(encoding="utf-8")
 
         frame_start = view_controller.index(
             "func session(_ session: ARSession, didUpdate frame: ARFrame)"
@@ -1234,6 +1235,10 @@ class IOSCoreContractTests(unittest.TestCase):
         self.assertIn("cameraTransform: correctedPose", frame_flow)
         self.assertIn("acceptedForLocation: false", frame_flow)
         self.assertIn("resolvePendingManualPriorMapPoseIfReady", frame_flow)
+        self.assertIn("struct RTABMapNodeBindingSnapshot", rtabmap)
+        self.assertIn(
+            "nodeBinding: RTABMapNodeBindingSnapshot", view_controller
+        )
         self.assertIn("let continuityInterval = min(elapsed, 0.25)", view_controller)
         self.assertNotIn("min(elapsed, 2.0) * 3.0", view_controller)
         self.assertIn("poseOverride ?? frame.camera.transform", localization)

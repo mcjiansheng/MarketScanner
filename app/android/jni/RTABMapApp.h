@@ -53,9 +53,17 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 struct NodeTimeSnapshot {
   std::int32_t nodeId;
+  std::int32_t nodeMapId;
   double nodeStamp;
   double epochOffset;
   std::uint64_t generation;
+  float nodeX;
+  float nodeY;
+  float nodeZ;
+  float nodeQx;
+  float nodeQy;
+  float nodeQz;
+  float nodeQw;
 };
 
 // RTABMapApp handles the application lifecycle and resources.

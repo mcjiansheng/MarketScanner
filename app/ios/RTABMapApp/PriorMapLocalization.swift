@@ -1119,7 +1119,11 @@ final class PriorMapStageOneLocalizer {
     func localizePriceTag(
         _ detection: PriceTagVisionDetection,
         trackingSessionId: String,
-        nodeTimebaseOffsetSeconds: TimeInterval
+        nodeTimebaseOffsetSeconds: TimeInterval,
+        boundNodeID: Int64,
+        boundNodeStamp: TimeInterval,
+        boundNodeMapID: Int32,
+        openGLWorldFromNode: simd_float4x4
     ) -> PriceTagLocalizedFrameResult {
         let snapshot = detection.alignmentSnapshot
         let origin = snapshot.arkitOrigin
@@ -1186,9 +1190,27 @@ final class PriorMapStageOneLocalizer {
         let nodeTimebaseFrameTimestamp =
             detection.frame.timestamp + nodeTimebaseOffsetSeconds
         let depthEvidence = measurement.depthEvidence
+        let pointInBoundNodeFrame: PriorMapTagNodeLocalPoint3D?
+        if let worldPoint = measurement.worldPoint {
+            let local = openGLWorldFromNode.inverse
+                * SIMD4<Float>(worldPoint.x, worldPoint.y, worldPoint.z, 1)
+            if local.x.isFinite, local.y.isFinite, local.z.isFinite,
+               local.w.isFinite, abs(local.w - 1) <= 1.0e-3 {
+                pointInBoundNodeFrame = PriorMapTagNodeLocalPoint3D(
+                    xM: Double(local.x),
+                    yM: Double(local.y),
+                    zM: Double(local.z))
+            }
+            else {
+                pointInBoundNodeFrame = nil
+            }
+        }
+        else {
+            pointInBoundNodeFrame = nil
+        }
         let observation = PriorMapTagObservationRecord(
             format: "MarketScannerPriceTagObservation",
-            version: 1,
+            version: 2,
             observationId: detection.observationId,
             timestamp: observationTimestamp,
             payload: detection.payload,
@@ -1221,7 +1243,13 @@ final class PriorMapStageOneLocalizer {
             trackingSessionId: trackingSessionId,
             needsReview: localized.tag.needsReview,
             burstId: nil,
-            frameId: nil)
+            frameId: nil,
+            boundNodeId: boundNodeID,
+            boundNodeStamp: boundNodeStamp,
+            boundNodeMapId: boundNodeMapID,
+            coordinateFrame: "RTABMAP_BOUND_NODE_LOCAL",
+            pointInBoundNodeFrame: pointInBoundNodeFrame,
+            measurementHeightM: measurement.rawMapPosition?.heightM)
         return PriceTagLocalizedFrameResult(
             observation: observation,
             association: localized)

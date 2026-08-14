@@ -4,6 +4,8 @@
 
 2026-08-14 现场反馈复核增量已修复人工重定位旧 transform 手势、最后文本编辑丢失、旧 node 缓存低成功率和“先改内存后写审计”的原子性缺口；人工 correction 现在等待 fresh accepted RTAB-Map node，并按 durable-first/CAS 提交。RTAB-Map、prior-map、ESL 和 location-bearing sensor boundary 使用统一 stabilized pose authority，tracking gap 不再放宽到 6 m/360°。连续 profile 的实际 OptimizeMaxError/MinInliers 已可审计，MetricKit crash/hang payload 可随本地会话导出并由 Map Studio 解析。由于现场 4 次异常尚无 `.ips`/符号化栈，且 crash 后跨 ARKit epoch 继续同一业务任务、Sam WM/LTM 召回 A/B 和正式 shelf-loop manifest v5 尚未完成，整体仍是 **NO-GO**；详细关闭条件见 [`TESTER_FEEDBACK_TODO_2026-08-14.md`](TESTER_FEEDBACK_TODO_2026-08-14.md)。
 
+2026-08-14 通道/货架物理约束设计审查发现的两个直接发布阻断已完成代码整改。P0：tag observation schema v2 通过 native 同锁快照冻结 exact node ID/stamp/map ID 和 node pose，把 scene-depth 点持久化为 `RTABMAP_BOUND_NODE_LOCAL` 的 `point_in_bound_node_frame`；手机与 PC 统一按 `P_final = T_final_node × P_node` 传播，历史 v1 只保留条码/业务身份、清空可发布坐标并要求重扫。P1-A：手机 coordinate contract v2 使用统一 publication invariant，任何 degradation、legacy frame、低置信、空坐标、未关联或 rescan 都禁止 `COMPLETE/publish_permitted`，结果库和任务恢复重复校验。自动化已覆盖非零 gauge、exact node stamp/map ID、v1/v2 混合、node-local 缺失/非法、源数据库只读和发布门；详细证据见 [`AISLE_SHELF_CONSTRAINED_LOCALIZATION_REMEDIATION_2026-08-14.md`](AISLE_SHELF_CONSTRAINED_LOCALIZATION_REMEDIATION_2026-08-14.md)。这不关闭正式 pose epoch/component、corridor/shelf/side 状态机、swept-segment free-space、PC 混合图、concrete shelf-loop/manifest v5 或现场控制点，因此整体仍为 **NO-GO / NOT PRODUCTION READY**。
+
 2026-08-14 当前成果合同已从“质量门失败即没有结果”改为“先生成不可变业务成果，再独立判断发布资格”。PC 与手机都必须保留所有身份明确的源节点和 durable 价签业务记录；低置信度、部分优化图、局部时钟绑定缺口、平行通道多解、距离尺度偏差或货架关联不足只产生 `LOW_CONFIDENCE` / `PARTIAL_REVIEW_REQUIRED` 和 publish blocker。只有数据库/JSON framing 损坏、地图/会话身份串包、hash/watermark/CAS 不一致、重复 durable 主键导致身份不可界定、完全没有有限轨迹或无法安全原子提交时才允许终止。
 
 当前 PC 长距离道路匹配已废弃中心线重参数化。`bounded_free_space_road_hmm_v2` 只用道路图确定 corridor identity、有限边/路口时序和可达拓扑；最终 X/Y/yaw 保留优化手机位姿的局部几何，exact 人工锚点残差按 gauge-neutral 物理里程连续传播。货架/固定结构自由空间只施加最小低频修正：结构内点采用通道侧一致、邻域连续的安全出口；穿架段采用货架驱动的局部刚体平移；同轮建议合并后一次应用；最终尖刺和平台梯度只在完整自由空间验证通过且不增加局部最大步长时摊平。道路中心/切线不得写入位置或 yaw。TianHong `162937`/`181158` 最新回归分别保留 3663/1054 个节点和 3806/1132 行秒级表，结构内点、穿架段和拓扑断裂均为 0；结果仍因绝对修正、弱定位时长和部分无法安全摊平的修正梯度保留为不可发布低置信度草稿。手机端没有道路中心线投影实现，继续保存连续相对轨迹和证据；不得为了与 PC 对齐而在手机后处理中新增中心线吸附。
@@ -16,7 +18,7 @@
 
 扫描启动现在是 background preparation + short main commit + durable receipt/context transaction。首次相机权限必须先完成；canonical Mobile-Only 使用 session-scoped streaming DB 并跳过旧 tmp-db 异步恢复；receipt 使用安全 ASCII tracking ID、`O_EXCL|O_NOFOLLOW`、完整写与文件/目录 fsync，workflow context v3 绑定 session/segment/database/map/store/receipt SHA。host 失败、持久化失败、状态提交失败或用户取消都会执行强 rollback，停止相机、映射和时钟，清理 prior-map 状态，打开私有 scratch DB 使 native core 脱离失败 streaming DB，并释放未提交会话。正常生产动作进入 `.STATE_MAPPING`，不再依赖隐藏的第二次 Record 操作。
 
-当前跨端修复分支为 `fix/manual-anchor-continuous-recovery`，核心远端基线是 `core-mobile-v1@9a93fbd0ee52944eae5aebedf59ec6a08dedc934`；本分支在该基线上继续保留长距离 gauge-neutral 恢复、道路只判定通道身份而不吸附中心线、低置信度成果保留、人工 exact-node 锚点和日志/任务恢复。2026-08-14 自检又移除了正常生命周期中的 Core Location、window scene、历史数据库 scroller、文件日期、workflow 状态目录、价签状态竞态和后处理强制假设崩溃点；PC 校准去掉连续 yaw slider，只保留 canonical 数值与离散微调。当前主机证据为 PriorMap 322/322、Qualification 30/30、Map Studio 完整 API 130/130、native 7884/0 和 macOS Release `rtabmap-reprocess` build/launch；真实浏览器响应式自动化仍受 localhost 安全策略限制。最终 unsigned generic iPhoneOS Release 必须在 tracked tree 干净的精确提交上运行并核对 bundle identity；签名真机、LiDAR、Files provider 与现场控制点仍必须重新执行，不能用 host/Xcode 构建冒充。
+当前整改分支为 `fix/tag-node-local-publication-gate`，锁定基线是 `fix/manual-anchor-continuous-recovery@bb09e1346a13945b1d4d8fa7eaf174959b528ab9`，核心远端基线仍是 `core-mobile-v1@9a93fbd0ee52944eae5aebedf59ec6a08dedc934`。本分支只在既有人工重定位、gauge-neutral 恢复、自由空间 review 和诊断链上关闭 tag 坐标 P0 与发布门 P1-A，不改写核心分支，也不把 review-only corridor matcher 升级为生产因子。最终 unsigned generic iPhoneOS Release 必须在 tracked tree 干净的精确提交上运行并核对 bundle identity；签名真机、LiDAR、Files provider、热/低磁盘、动态顾客/购物车和现场控制点仍必须重新执行，不能用 host/Xcode 构建冒充。
 
 本轮证据链根因是 `ViewController.updatePriorMapLocalization()` 在首个 native node-time snapshot 尚未产生时把 offset 替换为 `.nan`，严格 writer 因而同时把 trace/constraint/state 标成永久 required-write failure；该状态又让价签入口被拒，最终只能关闭为不可处理 recovery package。当前缺失/非有限 timebase 被视为 transient not-ready 并跳过 frame，不放宽任何 sidecar schema。扫描结束时 coordinator 同步进入 `finalizingScan`，可恢复失败返回 `scanning`，terminal close 清除 receipt/session；新的 setup 事务在状态迁移失败时不再继续 commit。全屏价签 overlay 保持 ARFrame-only，但入口失败改为明确 alert，成功进入后置顶并设为 accessibility modal。
 
@@ -24,7 +26,7 @@ MapCase02 标准超市 XLSX 局部链路已完成阻断级收口：Swift/PC 正�
 
 本轮真实样本证据：`map 2.xlsx` 与正式 MapCase02 source SHA 完全相同；另对 TianHong 02402、北京昌平 6599、Kohl's 1224 执行 PC converter/schema 和 Swift `--xlsx-library-smoke`，四张均通过。新增 slug 合同同时关闭大写、Unicode lowercase parity 和 200-byte 合法地图名超过 128 字符的同类安装风险。lowercase-ID 修复初版完整 Python 外层 Swift host 1/1 PASS（1020.058 s）；随后加入的 frozen SHA、diagnostic-only validator 与 manifest/report strict-count 收口已通过重编译 Swift host 的 Map Library CAS、MapCase02 正式套件、四图 smoke、Python 52/52、Map Studio 109/109 和 iphoneos Debug 无签名 build。该证据仍不替代 exact-SHA CI、真机或现场资格。
 
-除 RC-B19/J-04 component identity 外，第二次独立全量审查的 RC-B01…RC-B03、RC-B05…RC-B28 已完成代码和本地主机自动化闭包；J-04 仍需冻结 prior-independent final-link component policy，并完成 node snapshot C ABI 与 constraint/manual evidence schema 的 breaking migration。RC-B04 exact-SHA CI、RC-B29 Replay/FAR policy freeze、RC-B30 Device Lab 也仍未关闭。当前现场修复以拆分方式执行较广 PriorMap 197/197 与 Swift 核心长方法 1/1，并补充 Map Studio 109/109、MapCase02 Swift/PC 正式套件和历史 I10/I11 证据；这不是一次单命令完整 `discover`，也仍不替代 LiDAR、热/内存/后台/provider 或现场精度证据。
+除 RC-B19/J-04 component identity 外，第二次独立全量审查的 RC-B01…RC-B03、RC-B05…RC-B28 已完成代码和本地主机自动化闭包；J-04 仍需冻结 prior-independent final-link component policy，并完成 constraint/manual/trajectory 的正式 epoch/component evidence schema 迁移。RC-B04 exact-SHA CI、RC-B29 Replay/FAR policy freeze、RC-B30 Device Lab 也仍未关闭。当前 tag node-local/publication-gate 整改已执行单命令完整 PriorMap discover 329/329（378.876 s）、Map Studio 131/131、Qualification 30/30、native 7884/0；这仍不替代 LiDAR、热/内存/后台/provider、签名真机或现场精度证据。
 
 MapCase02 validation HEAD `770d94b078a0dd94653b9d6b33576890f88f7296` 的 exact-SHA run `31299358502` 为 7/8；唯一失败是 macOS/iOS 200k tag-evidence RSS `812,892,160` bytes 超过 768 MiB 门。I7 `cbba284ad1b0694f5302ec3abbb9a446d9d3a970` 已用 compact、单射的 view/tracking code 消除 burst index 中重复 String 保留，且保持 observation key、逐字段 exact binding、duplicate 与 unconsumed fail-closed；本地同一规模峰值为 `629,735,424` bytes，默认 host 峰值 `493,338,624` bytes，独立复审 `P0=0 / P1=0`。这些结果仍是本地证据；replacement final exact-SHA 全 required jobs PASS 前不创建冻结标签。
 
@@ -93,7 +95,7 @@ P7 已实现 loopback-only server、每次启动随机且不落盘的 token、PO
 | 深度结构提取和扫描匹配 | 已实现 | scene depth、4 帧近期 world-voxel 静态证据、600 点上限、粗中细 Top‑5 多盆地、平行通道跨帧消歧、周期结构保守拒绝 |
 | 状态和置信度滞回 | 已实现 | initializing/stable/usable/weak/lost/manualCorrection；连续可信和 stale 门限集中管理 |
 | Vision QR/条形码识别 | 已实现 | 用户触发；复用 `ARFrame.capturedImage`；捕获时对齐快照与版本；四方向 ROI；QR/EAN/Code128/UPCE/PDF417 |
-| 标签三维测量与结构关联 | 已实现 | 同帧 depth；楼面法向/残差/时序置信度；货架/柜台；跨结构遮挡；侧面、offset、高度和歧义门控 |
+| 标签三维测量与结构关联 | 已实现（schema v2 自动测试） | 同帧 stabilized pose + depth；atomic exact-node ID/stamp/map ID/pose；`point_in_bound_node_frame`；楼面法向/残差/时序置信度；货架/柜台；跨结构遮挡；侧面、offset、高度和歧义门控；v1 坐标不可发布 |
 | 阶段二 sidecar 和移动 UI | 已实现 | constraint/state/tag observation JSONL、localized tags JSON、结构指标 HUD、确认 UI 和必需证据写失败的持久红色告警 |
 | PC 会话检查 | 已实现 | `/api/session/inspect` 有界汇总约束、状态、观测、最终价签和 malformed 计数 |
 | 阶段二回放与指标 | 已实现 | iOS 同款校正门控/gain/锚点/状态；周期结构、动态干扰、错误初始位姿、tracking 恢复、yaw/通道/跳变和 matcher p50/p95 |
@@ -114,16 +116,16 @@ P7 已实现 loopback-only server、每次启动随机且不落盘的 token、PO
 | 先验地图派生修正 | 已修复并完成 Sam 只读回归 | 精确 `ios_prior` 契约；reciprocal canonical 折叠；native RTAB-Map/g2o 完整相对 SE(2) 因子图 4,442 节点收敛，最大修正 2.9638 m；仍是诊断 draft |
 | 在线/道路/人工约束与拒绝审计 | 已实现 | 在线结构约束、道路区域/方向低权重软约束、accepted/rejected residual、禁用约束、人工锚点 |
 | 通道切换审计 | 已实现 | 最终轨迹几何投影输出进入/离开时间、候选 margin、方向、weak/lost overlap、人工 assignment 和可能静默切换 |
-| 标签离线重算和结构关联 | 已实现（结果保留、发布从严） | observation→exact node/frame time 绑定、raw 位置 SE(2) 传播、独立次候选/遮挡/侧面/边长校验；普通证据不足保留 `LOW_CONFIDENCE`，durable burst 漏写 final tag 时补一条空位置业务记录，source/retained 严格核账 |
+| 标签离线重算和结构关联 | 已实现（coordinate contract v2；结果保留、发布从严） | observation→verified burst→exact node ID/stamp/map ID 绑定；`P_final=T_final_node×P_node` 单次 node-local 传播；legacy v1 清坐标并重扫；独立次候选/遮挡/侧面/边长校验；普通证据不足保留 `LOW_CONFIDENCE`，durable burst 漏写 final tag 时补一条空位置业务记录，source/retained 严格核账 |
 | Sidecar 输入契约 | 已实现 | manifest v1/v2/v3/v4；v4 绑定严格时钟证据；每类 required/optional、format/version、严格 UTF‑8/JSON、身份/时间/业务 schema/大小/全局 durable ID；legacy manual 仅审计；tag/observation/burst 内容交叉验证；不可界定损坏 fail closed |
 | 秒级本地时间位置表 | 已实现 | correlation/node binding 交叉验证 node/frame/UTC/timezone/offset；`clock_segment_index`；同段插值，跨系统时钟/时区 discontinuity 保留 `UNAVAILABLE` 空坐标行，不使用处理机时区伪造 |
 | 节点覆盖审计 | 已实现 | 只读查询 source/optimized SQLite Node，和导出 node ID 三方比较缺失、额外、重复、非单调 stamp 与首尾时间；metadata 仅交叉检查 |
 | 导出隐私与本机恢复 | 已实现 | version 内 `session_input_manifest.json`/input identity 绑定全部输入字节；绝对路径按 identity 隔离在不导出的 `localized/local_inputs/`，重放前验证 version、身份和当前输入 hash |
 | 不可变成果事务 | 已实现 | v5 draft/review 将节点级 CSV、秒级 CSV、全量价签 JSON/CSV 和 deliverables manifest 纳入 exact file/hash tree；v6 publication 再纳入现场证据；POSIX/Windows 跨进程锁内 staging→完整校验→单指针提交，读取与已打开 fd 复核 hash |
-| 质量报告和状态机 | 已实现（仍受现场发布门约束） | draft/review/published/revoked 事务框架和门禁；完整相对 SE(2) helper 报告通过严格能力校验后才允许进入发布判断 |
+| 质量报告和状态机 | 已实现（publication invariant v2；仍受现场发布门约束） | draft/review/published/revoked 事务框架；`COMPLETE` 同时要求 prior-map frame、图质量、零 degradation/legacy/LOW_CONFIDENCE/空坐标/未关联/rescan；immutable result read/recovery 二次校验；完整相对 SE(2) helper 报告通过严格能力校验后才允许进入发布判断 |
 | 人工编辑重放/撤销/重做 | 已实现 | manual_edits v4 与 input identity、强制 version/revision CAS、HTTP 409、服务端 old value/UTC/ID、字段/范围/地图校验、undo/redo audit |
 | PC 非专业向导 | 已实现 | 地图+会话选择、一键处理、三轨迹/价签联动画布、状态/货架筛选；轨迹锚点可直接点选/拖动并自动生成 node/time/JSON |
-| 确定性 E2E fixture | 已实现 | 源库不变、漂移降低、错误约束拒绝、部分图全节点恢复、时钟分段不跨段插值、durable burst/tag 一对一保留、事务/输入变更故障、CAS 冲突、发布硬门和严格 sidecar 负例；当前 PriorMap 314/314、Map Studio 130/130、Qualification 30/30 |
+| 确定性 E2E fixture | 已实现 | 源库不变、漂移降低、错误约束拒绝、部分图全节点恢复、时钟分段不跨段插值、durable burst/tag 一对一保留、node-local v2 单次传播、legacy 清坐标、事务/输入变更故障、CAS 冲突、发布硬门和严格 sidecar 负例；当前 PriorMap 329/329、Map Studio 131/131、Qualification 30/30、native 7884/0 |
 | 正式现场验收 | 未执行 | 只完成 `FIELD_TEST_PLAN.md`；不能用模拟或构建替代 |
 
 操作流程、弱/丢失定位、人工复核、备份和失败恢复见 `USER_GUIDE.md`。

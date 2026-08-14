@@ -486,9 +486,8 @@ enum PersistentTaskCheckpoint {
             guard let status = resultQualityStatus as? String,
                   ["COMPLETE", "PARTIAL_REVIEW_REQUIRED", "LOCAL_FRAME_ONLY"]
                     .contains(status),
-                  let publish = StrictJSONScalar.boolean(
-                    manifest["publish_permitted"]),
-                  publish == (status == "COMPLETE"),
+                  MobileResultPublicationInvariant.manifestIsConsistent(
+                    manifest),
                   exactNonnegativeCount(
                     "degradation_count", in: manifest) != nil,
                   exactNonnegativeCount(

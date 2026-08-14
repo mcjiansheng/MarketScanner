@@ -36,6 +36,7 @@ struct TagObservationEvidenceAudit: Equatable {
     var recordDuplicateRejected = 0
     var recordPoseRejected = 0
     var recordNodeBindingRejected = 0
+    var recordLegacyCoordinateFrame = 0
     var rejectedDetails: [TagObservationRejectedDetail] = []
 
     var totalRejected: Int {
@@ -52,6 +53,7 @@ struct TagObservationEvidenceAudit: Equatable {
             "total": recordTotal,
             "accepted": recordAccepted,
             "unlocalized_skipped": recordUnlocalizedSkipped,
+            "legacy_coordinate_frame": recordLegacyCoordinateFrame,
             "rejected": [
                 "format_invalid": recordFormatRejected,
                 "version_unsupported": recordVersionRejected,
@@ -81,6 +83,9 @@ struct TagObservationEvidenceObservation: Equatable {
     var floorID: String
     var frameTimestamp: Double
     var nodeTimebaseTimestamp: Double
+    /// Schema-v2 point in the exact capture-bound RTAB-Map node frame.
+    /// The historical property name is retained internally to avoid a
+    /// broad ABI churn; v1 `raw_map_position` is never assigned here.
     var rawPositionM: (Double, Double, Double)?
     var measurementConfidence: Double
     var localizationState: String
@@ -108,6 +113,10 @@ struct TagObservationEvidenceObservation: Equatable {
     var depthMadM: Double? = nil
     var planeResidualM: Double? = nil
     var surfaceNormalCamera: [Double]? = nil
+    var coordinateFrame: String = "RTABMAP_BOUND_NODE_LOCAL"
+    var boundNodeMapID: Int32? = nil
+    var measurementHeightM: Double? = nil
+    var legacyCoordinateFrame: Bool = false
 
     static func == (lhs: Self, rhs: Self) -> Bool {
         lhs.observationID == rhs.observationID
@@ -145,6 +154,10 @@ struct TagObservationEvidenceObservation: Equatable {
             && lhs.depthMadM == rhs.depthMadM
             && lhs.planeResidualM == rhs.planeResidualM
             && lhs.surfaceNormalCamera == rhs.surfaceNormalCamera
+            && lhs.coordinateFrame == rhs.coordinateFrame
+            && lhs.boundNodeMapID == rhs.boundNodeMapID
+            && lhs.measurementHeightM == rhs.measurementHeightM
+            && lhs.legacyCoordinateFrame == rhs.legacyCoordinateFrame
     }
 }
 
@@ -179,6 +192,7 @@ struct TagObservationEvidenceParseResult {
 }
 
 private struct StrictTagObservationDTO {
+    let version: Int
     let observationID: String
     let timestamp: Double
     let barcode: String
@@ -194,6 +208,12 @@ private struct StrictTagObservationDTO {
     let alignmentFreshness: String
     let rawPosition: (Double, Double, Double)?
     let hasPlanarPosition: Bool
+    let boundNodeID: Int64?
+    let boundNodeStamp: Double?
+    let boundNodeMapID: Int32?
+    let coordinateFrame: String?
+    let pointInBoundNodeFrame: (Double, Double, Double)?
+    let measurementHeightM: Double?
     let method: String
     let measurementConfidence: Double
     let depthSampleCount: Int
@@ -234,9 +254,12 @@ enum TagObservationEvidenceParser {
         "surface_normal_camera", "localization_state",
         "localization_confidence", "prior_map_id", "prior_map_sha256",
         "floor_id", "tracking_session_id", "needs_review", "burst_id",
-        "frame_id",
+        "frame_id", "bound_node_id", "bound_node_stamp",
+        "bound_node_map_id", "coordinate_frame",
+        "point_in_bound_node_frame", "measurement_height_m",
     ]
     private static let rawPositionKeys: Set<String> = ["x_m", "y_m", "height_m"]
+    private static let nodeLocalPointKeys: Set<String> = ["x_m", "y_m", "z_m"]
     private static let allowedMethods: Set<String> = [
         "smoothed_scene_depth", "scene_depth", "shelf_plane_ray", "unavailable",
     ]
@@ -271,6 +294,16 @@ enum TagObservationEvidenceParser {
 
         let sortedNodes = nodes.sorted { $0.stamp < $1.stamp }
         let sortedStamps = sortedNodes.map(\.stamp)
+        var nodesByID: [Int64: AbsolutePriorEvidenceNode] = [:]
+        var duplicateNodeIDs = Set<Int64>()
+        for node in nodes {
+            if nodesByID.updateValue(node, forKey: node.nodeID) != nil {
+                duplicateNodeIDs.insert(node.nodeID)
+            }
+        }
+        for duplicate in duplicateNodeIDs {
+            nodesByID.removeValue(forKey: duplicate)
+        }
         var observations: [TagObservationEvidenceObservation] = []
         var boundIDs = Set<Int64>()
         var seenObservationIDs: Set<String>? = verifiedBursts == nil
@@ -298,7 +331,8 @@ enum TagObservationEvidenceParser {
                     reject(&audit, line.number, "format_invalid", \.recordFormatRejected)
                     return
                 }
-                guard StrictJSONScalar.integer(object["version"]) == 1 else {
+                guard let version = StrictJSONScalar.integer(object["version"]),
+                      version == 1 || version == 2 else {
                     reject(&audit, line.number, "version_unsupported", \.recordVersionRejected)
                     return
                 }
@@ -335,19 +369,60 @@ enum TagObservationEvidenceParser {
                         \.recordDuplicateRejected)
                     return
                 }
-                guard let binding = nearestNodeBinding(
-                    nodes: sortedNodes, stamps: sortedStamps, stamp: dto.nodeTimestamp) else {
-                    reject(&audit, line.number, "node_binding_failed", \.recordNodeBindingRejected)
-                    return
+                let binding: (node: AbsolutePriorEvidenceNode,
+                    delta: Double, secondDelta: Double)
+                if dto.version == 2 {
+                    guard let boundNodeID = dto.boundNodeID,
+                          !duplicateNodeIDs.contains(boundNodeID),
+                          let node = nodesByID[boundNodeID],
+                          let boundNodeStamp = dto.boundNodeStamp,
+                          abs(node.stamp - boundNodeStamp)
+                            <= TagObservationEvidenceLimits.stampEpsilon,
+                          dto.boundNodeMapID == node.mapID else {
+                        reject(
+                            &audit, line.number,
+                            "exact_bound_node_identity_mismatch",
+                            \.recordNodeBindingRejected)
+                        return
+                    }
+                    let delta = abs(node.stamp - dto.nodeTimestamp)
+                    guard delta <= TagObservationEvidenceLimits
+                            .maximumNodeTimeDeltaSeconds else {
+                        reject(
+                            &audit, line.number, "node_time_delta_exceeded",
+                            \.recordNodeBindingRejected)
+                        return
+                    }
+                    let secondDelta = sortedNodes.lazy
+                        .filter { $0.nodeID != node.nodeID }
+                        .map { abs($0.stamp - dto.nodeTimestamp) }
+                        .min() ?? .infinity
+                    binding = (node, delta, secondDelta)
                 }
-                guard binding.delta <= TagObservationEvidenceLimits.maximumNodeTimeDeltaSeconds else {
-                    reject(&audit, line.number, "node_time_delta_exceeded", \.recordNodeBindingRejected)
-                    return
-                }
-                guard binding.secondDelta - binding.delta
-                    > TagObservationEvidenceLimits.minimumNodeMarginSeconds else {
-                    reject(&audit, line.number, "node_binding_ambiguous", \.recordNodeBindingRejected)
-                    return
+                else {
+                    guard let legacyBinding = nearestNodeBinding(
+                        nodes: sortedNodes, stamps: sortedStamps,
+                        stamp: dto.nodeTimestamp) else {
+                        reject(
+                            &audit, line.number, "node_binding_failed",
+                            \.recordNodeBindingRejected)
+                        return
+                    }
+                    guard legacyBinding.delta <= TagObservationEvidenceLimits
+                            .maximumNodeTimeDeltaSeconds else {
+                        reject(
+                            &audit, line.number, "node_time_delta_exceeded",
+                            \.recordNodeBindingRejected)
+                        return
+                    }
+                    guard legacyBinding.secondDelta - legacyBinding.delta
+                        > TagObservationEvidenceLimits.minimumNodeMarginSeconds else {
+                        reject(
+                            &audit, line.number, "node_binding_ambiguous",
+                            \.recordNodeBindingRejected)
+                        return
+                    }
+                    binding = legacyBinding
                 }
 
                 guard let bursts = verifiedBursts else {
@@ -400,7 +475,12 @@ enum TagObservationEvidenceParser {
                     return
                 }
 
-                if dto.rawPosition == nil { audit.recordUnlocalizedSkipped += 1 }
+                let nodeLocalPoint = dto.version == 2
+                    ? dto.pointInBoundNodeFrame : nil
+                if dto.version == 1 {
+                    audit.recordLegacyCoordinateFrame += 1
+                }
+                if nodeLocalPoint == nil { audit.recordUnlocalizedSkipped += 1 }
                 boundIDs.insert(binding.node.nodeID)
                 observations.append(TagObservationEvidenceObservation(
                     observationID: dto.observationID,
@@ -409,7 +489,7 @@ enum TagObservationEvidenceParser {
                     floorID: floorID,
                     frameTimestamp: dto.frameTimestamp,
                     nodeTimebaseTimestamp: dto.nodeTimestamp,
-                    rawPositionM: dto.rawPosition,
+                    rawPositionM: nodeLocalPoint,
                     measurementConfidence: dto.measurementConfidence,
                     localizationState: dto.localizationState,
                     localizationConfidence: dto.localizationConfidence,
@@ -435,7 +515,12 @@ enum TagObservationEvidenceParser {
                     depthMedianM: dto.depthMedianM,
                     depthMadM: dto.depthMadM,
                     planeResidualM: dto.planeResidualM,
-                    surfaceNormalCamera: dto.surfaceNormal))
+                    surfaceNormalCamera: dto.surfaceNormal,
+                    coordinateFrame: dto.coordinateFrame
+                        ?? "LEGACY_PRIOR_MAP_FRAME",
+                    boundNodeMapID: dto.boundNodeMapID,
+                    measurementHeightM: dto.measurementHeightM,
+                    legacyCoordinateFrame: dto.version == 1))
                 audit.recordAccepted += 1
             }
         } catch let error as TagObservationEvidenceParseError {
@@ -461,7 +546,9 @@ enum TagObservationEvidenceParser {
             throws -> Never {
             throw TagSchemaFailure(reason: reason, category: category)
         }
-        guard let observationID = nonEmptyString(object["observation_id"]),
+        guard let version = StrictJSONScalar.integer(object["version"]),
+              version == 1 || version == 2,
+              let observationID = nonEmptyString(object["observation_id"]),
               let timestamp = StrictJSONScalar.number(object["timestamp"]),
               let barcode = nonEmptyString(object["payload"]),
               let symbology = nonEmptyString(object["symbology"]),
@@ -591,7 +678,86 @@ enum TagObservationEvidenceParser {
                 rawPosition = nil
             }
         }
-        guard (method == "unavailable") == !hasPlanarPosition else {
+        let boundNodeID: Int64?
+        let boundNodeStamp: Double?
+        let boundNodeMapID: Int32?
+        let coordinateFrame: String?
+        let pointInBoundNodeFrame: (Double, Double, Double)?
+        let measurementHeightM: Double?
+        if version == 2 {
+            guard let rawBoundNodeID = StrictJSONScalar.integer(
+                    object["bound_node_id"]),
+                  rawBoundNodeID > 0,
+                  let rawBoundNodeStamp = StrictJSONScalar.number(
+                    object["bound_node_stamp"]),
+                  let rawBoundNodeMapID = StrictJSONScalar.integer(
+                    object["bound_node_map_id"]),
+                  rawBoundNodeMapID >= Int(Int32.min),
+                  rawBoundNodeMapID <= Int(Int32.max),
+                  object["coordinate_frame"] as? String
+                    == "RTABMAP_BOUND_NODE_LOCAL" else {
+                try fail("bound_node_coordinate_contract_invalid", .pose)
+            }
+            boundNodeID = Int64(rawBoundNodeID)
+            boundNodeStamp = rawBoundNodeStamp
+            boundNodeMapID = Int32(rawBoundNodeMapID)
+            coordinateFrame = "RTABMAP_BOUND_NODE_LOCAL"
+            if object.keys.contains("point_in_bound_node_frame") {
+                guard let rawPoint = object["point_in_bound_node_frame"]
+                        as? [String: Any],
+                      Set(rawPoint.keys) == nodeLocalPointKeys,
+                      let xM = bounded(
+                        rawPoint["x_m"],
+                        -TagObservationEvidenceLimits.maximumRawPositionM,
+                        TagObservationEvidenceLimits.maximumRawPositionM),
+                      let yM = bounded(
+                        rawPoint["y_m"],
+                        -TagObservationEvidenceLimits.maximumRawPositionM,
+                        TagObservationEvidenceLimits.maximumRawPositionM),
+                      let zM = bounded(
+                        rawPoint["z_m"],
+                        -TagObservationEvidenceLimits.maximumRawHeightM,
+                        TagObservationEvidenceLimits.maximumRawHeightM) else {
+                    try fail("bound_node_local_point_invalid", .pose)
+                }
+                pointInBoundNodeFrame = (xM, yM, zM)
+            }
+            else {
+                pointInBoundNodeFrame = nil
+            }
+            measurementHeightM = try optionalNumber(
+                object, key: "measurement_height_m",
+                minimum: -TagObservationEvidenceLimits.maximumRawHeightM,
+                maximum: TagObservationEvidenceLimits.maximumRawHeightM)
+            if method == "smoothed_scene_depth" || method == "scene_depth" {
+                guard pointInBoundNodeFrame != nil else {
+                    try fail("depth_measurement_node_local_point_missing", .pose)
+                }
+            }
+            if method == "shelf_plane_ray" || method == "unavailable" {
+                guard pointInBoundNodeFrame == nil else {
+                    try fail("non_depth_node_local_point_forbidden", .pose)
+                }
+            }
+        }
+        else {
+            let v2OnlyFields = [
+                "bound_node_id", "bound_node_stamp", "bound_node_map_id",
+                "coordinate_frame", "point_in_bound_node_frame",
+                "measurement_height_m",
+            ]
+            guard v2OnlyFields.allSatisfy({ !object.keys.contains($0) }) else {
+                try fail("legacy_record_contains_v2_coordinate_fields", .pose)
+            }
+            boundNodeID = nil
+            boundNodeStamp = nil
+            boundNodeMapID = nil
+            coordinateFrame = nil
+            pointInBoundNodeFrame = nil
+            measurementHeightM = rawPosition?.2
+        }
+        if version == 1,
+           (method == "unavailable") == hasPlanarPosition {
             try fail("measurement_method_position_inconsistent", .pose)
         }
         if method == "unavailable" {
@@ -601,13 +767,16 @@ enum TagObservationEvidenceParser {
         }
         if !needsReview {
             guard state == "stable", freshness == "fresh",
-                  rawPosition != nil, method != "unavailable",
+                  (version == 2
+                    ? pointInBoundNodeFrame != nil : rawPosition != nil),
+                  method != "unavailable",
                   measurementConfidence >= 0.65 else {
                 try fail("automatic_accept_invariant_invalid")
             }
         }
 
         return StrictTagObservationDTO(
+            version: version,
             observationID: observationID,
             timestamp: timestamp,
             barcode: barcode,
@@ -623,6 +792,12 @@ enum TagObservationEvidenceParser {
             alignmentFreshness: freshness,
             rawPosition: rawPosition,
             hasPlanarPosition: hasPlanarPosition,
+            boundNodeID: boundNodeID,
+            boundNodeStamp: boundNodeStamp,
+            boundNodeMapID: boundNodeMapID,
+            coordinateFrame: coordinateFrame,
+            pointInBoundNodeFrame: pointInBoundNodeFrame,
+            measurementHeightM: measurementHeightM,
             method: method,
             measurementConfidence: measurementConfidence,
             depthSampleCount: sampleCount,

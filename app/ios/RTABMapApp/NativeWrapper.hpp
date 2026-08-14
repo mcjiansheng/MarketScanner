@@ -74,8 +74,11 @@ void stopCameraNative(const void *object);
 void setPreserveCameraOriginNative(const void *object, bool enabled);
 bool getCameraOriginOffsetNative(const void *object, float * x, float * y, float * z, float * qx, float * qy, float * qz, float * qw);
 bool getNodeTimeSnapshotNative(const void *object, int32_t * nodeId,
-                               double * nodeStamp, double * epochOffset,
-                               uint64_t * generation);
+                               int32_t * nodeMapId, double * nodeStamp,
+                               double * epochOffset, uint64_t * generation,
+                               float * nodeX, float * nodeY, float * nodeZ,
+                               float * nodeQx, float * nodeQy, float * nodeQz,
+                               float * nodeQw);
 bool getNodeTimeOffsetNative(const void *object, double * offset);
 void setStreamingMapModeNative(const void *object, bool enabled, int maxRenderedNodes);
 void setCameraNative(const void *object, int type);

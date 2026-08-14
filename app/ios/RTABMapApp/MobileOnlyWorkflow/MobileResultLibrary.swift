@@ -2,6 +2,87 @@ import Darwin
 import CryptoKit
 import Foundation
 
+/// One fail-closed publication rule shared by result construction and every
+/// immutable-result reread. It lives with the result library so focused
+/// reader/recovery hosts compile the same invariant without depending on the
+/// full processing pipeline translation unit.
+enum MobileResultPublicationInvariant {
+    static let coordinateContractVersion = 2
+
+    static func permits(
+        coordinatesArePriorMapFrame: Bool,
+        graphQualityPassed: Bool,
+        degradationCount: Int,
+        coordinateFrameAuditPassed: Bool,
+        legacyCoordinateFrameCount: Int,
+        lowConfidenceTagCount: Int,
+        unpositionedTagCount: Int,
+        unassociatedTagCount: Int,
+        rescanTaskCount: Int
+    ) -> Bool {
+        coordinatesArePriorMapFrame
+            && graphQualityPassed
+            && degradationCount == 0
+            && coordinateFrameAuditPassed
+            && legacyCoordinateFrameCount == 0
+            && lowConfidenceTagCount == 0
+            && unpositionedTagCount == 0
+            && unassociatedTagCount == 0
+            && rescanTaskCount == 0
+    }
+
+    /// Reader/recovery-side invariant. It deliberately validates only
+    /// manifest facts; graph quality is already represented by the declared
+    /// status/degradation fields. A coordinate-contract-v1 result can still
+    /// be retained as a review artifact, but can never claim COMPLETE.
+    static func manifestIsConsistent(_ manifest: [String: Any]) -> Bool {
+        guard let status = manifest["result_quality_status"] as? String,
+              ["COMPLETE", "PARTIAL_REVIEW_REQUIRED", "LOCAL_FRAME_ONLY"]
+                .contains(status),
+              let publish = StrictJSONScalar.boolean(
+                manifest["publish_permitted"]),
+              publish == (status == "COMPLETE"),
+              let coordinateVersion = StrictJSONScalar.integer(
+                manifest["coordinate_contract_version"]),
+              coordinateVersion == 1
+                || coordinateVersion == coordinateContractVersion,
+              let degradationCount = StrictJSONScalar.integer(
+                manifest["degradation_count"]), degradationCount >= 0,
+              let lowConfidenceCount = StrictJSONScalar.integer(
+                manifest["low_confidence_tag_count"]),
+              let unpositionedCount = StrictJSONScalar.integer(
+                manifest["unpositioned_tag_count"]),
+              let unassociatedCount = StrictJSONScalar.integer(
+                manifest["unassociated_tag_count"]),
+              let rescanCount = StrictJSONScalar.integer(
+                manifest["rescan_count"]),
+              [lowConfidenceCount, unpositionedCount, unassociatedCount,
+               rescanCount].allSatisfy({ $0 >= 0 }) else {
+            return false
+        }
+        if coordinateVersion == 1 {
+            return !publish
+        }
+        guard let coordinateAuditPassed = StrictJSONScalar.boolean(
+                manifest["coordinate_frame_audit_passed"]),
+              let legacyCount = StrictJSONScalar.integer(
+                manifest["legacy_tag_coordinate_frame_count"]),
+              legacyCount >= 0 else {
+            return false
+        }
+        if publish {
+            return degradationCount == 0
+                && coordinateAuditPassed
+                && legacyCount == 0
+                && lowConfidenceCount == 0
+                && unpositionedCount == 0
+                && unassociatedCount == 0
+                && rescanCount == 0
+        }
+        return true
+    }
+}
+
 /// Immutable on-device result library (V1R3 Gate Q §20).
 ///
 /// Layout:
@@ -226,6 +307,8 @@ enum MobileResultLibrary {
         "unpositioned_tag_count", "shelf_associated_tag_count",
         "unassociated_tag_count", "low_confidence_tag_count",
         "publish_permitted", "degradation_count",
+        "coordinate_frame_audit_passed",
+        "legacy_tag_coordinate_frame_count",
     ]
 
     /// Test/embedding hook; see `MobileMapLibrary.rootOverride`.
@@ -2922,9 +3005,8 @@ enum MobileResultLibrary {
             guard let status = rawStatus as? String,
                   ["COMPLETE", "PARTIAL_REVIEW_REQUIRED", "LOCAL_FRAME_ONLY"]
                     .contains(status),
-                  let publish = StrictJSONScalar.boolean(
-                    manifest["publish_permitted"]),
-                  publish == (status == "COMPLETE"),
+                  MobileResultPublicationInvariant.manifestIsConsistent(
+                    manifest),
                   let degradationCount = StrictJSONScalar.integer(
                     manifest["degradation_count"]), degradationCount >= 0,
                   let degradedPositionCount = StrictJSONScalar.integer(
@@ -2942,8 +3024,12 @@ enum MobileResultLibrary {
             if manifest["deliverable_contract_version"] != nil {
                 guard StrictJSONScalar.integer(
                         manifest["deliverable_contract_version"]) == 1,
-                      StrictJSONScalar.integer(
-                        manifest["coordinate_contract_version"]) == 1,
+                      let coordinateContractVersion = StrictJSONScalar.integer(
+                        manifest["coordinate_contract_version"]),
+                      coordinateContractVersion == 1
+                        || coordinateContractVersion
+                            == MobileResultPublicationInvariant
+                                .coordinateContractVersion,
                       let canonicalSHA = manifest[
                         "canonical_source_sha256"] as? String,
                       isSHA256(canonicalSHA),

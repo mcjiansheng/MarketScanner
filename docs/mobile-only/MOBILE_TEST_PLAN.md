@@ -1,6 +1,8 @@
 # 手机端测试计划（Mobile Test Plan）
 
-> 状态：**当前有效**；统一扫描 UX/startup 聚焦组、MapCase02 正式套件、完整 PriorMap discover 和 Swift host 长方法已执行；QualifiedDevice 真机、设备与现场详细测试仍延期；run `31307753672` 为历史 7/8 FAIL。最后核对：2026-08-13。
+> 状态：**当前有效**；价签 node-local v2、统一 publication invariant、完整 PriorMap discover、Qualification、Map Studio 和 native 回归已执行；QualifiedDevice 真机、设备与现场详细测试仍延期；run `31307753672` 为历史 7/8 FAIL。最后核对：2026-08-14。
+
+> 2026-08-14 当前证据：PriorMap **329/329 PASS（378.876 s）**、Qualification **30/30 PASS**、Map Studio **131/131 PASS**、native **7884/0 PASS**。规模子进程为 300,000 finalization peak 13,287,424 bytes、1,728,000 trace retained 172,801 / peak 59,146,240 bytes、400,000 tag evidence accepted 200,000 / peak 747,192,320 bytes。P0 node-local v2 与 P1-A 发布不变量已进入当前回归；正式 epoch/component、corridor/shelf/side、swept-segment、混合因子图、concrete shelf-loop/manifest v5、动态物体/地图失配以及签名真机/现场资格仍为 NOT RUN / NOT CLOSED。下表中早于本段的数字作为对应历史增量证据保留。
 
 > 独立复审状态：`fix/mobile-import-prewarm-esl-deferred-tag@673d8d3a714f8fb6be18acc44ca4dd32589f3e81` 为 **REJECTED / DO NOT MERGE**，发现 Vision ROI 坐标与历史处理同步准入两个 P1。`fix/mobile-import-esl-review-blockers` 包含修复和回归测试；修复代码提交 `8b8cbf4d9c8325986cde43c95391141473f2d336` 已通过 unsigned generic iphoneos Release 全量编译/链接和精确 build identity，但仍待独立只读复审；不得把本地修复或此前增量的 `P0=0/P1=0` 结论扩展为本增量已通过。
 
@@ -18,6 +20,7 @@
 | PC 跨编译器地图身份 | exact source SHA、exact PC package SHA、新会话 full canonical SHA；旧手机会话仅 exact ID/store/floor + canonical 12 位 ID 后缀兼容，报告不得伪装 exact package match | 身份正反例 **6/6 PASS**；`0811` 的 13 个 finalized 会话 parse-and-hash-once + identity gate PASS；真实 5.9 MB、36 MB、995 MB 完整 localized processing 均越过身份门。大样本因质量门产生正常 blocker，不再是地图哈希/处理器异常 |
 | Native/AbsolutePrior contract | 4096/4097、RESOURCE_REQUIRED+error；quality v3 / C ABI v5 strict typed DTO；跨 component 全局 stamp 回退允许、component 内回退拒绝；单一 initial-map gauge；constraint/manual/recovery exact raw-line watermark、accepted=false 非致命、rejected manual prior 降级而非整单失败；Full `nativeFailed` 回退严格验证 Fast、Full `invalidOutcome` 仍终止 | 2026-08-12 既有 native 7,884 checks / 0 failures；2026-08-13 本轮最终完整 Swift host **1/1 PASS（1250.897 s）**；签名真机/现场仍 NOT RUN |
 | J-04 component identity | Graph Reader node mapID/link component derivation；constraint/manual 新 schema 的原子 bound node + RTAB-Map map ID；最终 component 重算与错 component 拒绝 | **BLOCKER：写侧 schema 尚无可核验证据，NOT RUN / NOT CLOSED** |
+| Tag node-local v2 / publication gate | native 同锁 exact node ID/stamp/map ID/pose 快照；scene-depth `point_in_bound_node_frame`；Swift/Python exact parser；单次 `T_final_node × P_node`；legacy v1 清坐标并重扫；degradation/legacy/low-confidence/unpositioned/unassociated/rescan 统一阻断发布 | Stage-3 **126/126 PASS**；focused **19/19 PASS**；完整 PriorMap **329/329 PASS（378.876 s）**；Qualification **30/30**；Map Studio **131/131**；native **7884/0**。签名真机、LiDAR 和现场控制点 NOT RUN |
 | T1/T3/T4/T6/T7/T12 + Partial | 1 Hz 重采样、yaw 最短弧、lost/gap、100k 行；map/local 列隔离、initial-pose 诊断对齐、主 component 选择、禁止跨 component 插值 | Swift host |
 | G1-G10 | 价签绑定/传播/融合/货架/质量门 | Swift host |
 | ESL Capture / confirmation v2 | ARFrame-only camera preview、显式 autofocus、真实 ROI + 同帧一次扩展 ROI、10 Hz/one-in-flight、1 秒 request deadline、bounded two-lane Vision executor、2-frame lock、3 minimum/4 target、4 秒窗口、暂时 exact-node publication gap 延期、逐帧可靠 quorum、价签主结果 `ACCEPTED/LOW_CONFIDENCE` + 独立非阻断 `RESCAN_REQUIRED` task、durable observation↔burst exact binding、exact-node final-pose 重投影；session admission/drain、ordinary/terminal Recovery 权限、active-only exact-session audit | `673d8d3` 独立复审 **REJECTED**（ROI-local 坐标 P1）；修复分支的 actual request ROI/revision 还原、0.80 gate 与 host/source 回归已通过 mobile UX 22/22、完整 PriorMap 247/247、Qualification 30/30、Map Studio 109/109、Swift parse、unsigned generic iphoneos Debug，以及 `8b8cbf4d…` unsigned generic iphoneos Release full build + exact identity，仍待独立复审。真机 close-range focus、iOS 15/16/17+ ROI/depth-center、恢复期定位、LiDAR、性能和现场矩阵 NOT RUN |
@@ -45,7 +48,7 @@
 
 ## 明日详细执行队列
 
-1. 完整 PriorMap discover 已在当前修复源码上完成 247/247；后续若生产源码再变化则重跑，不以较小分组或旧远端 host contract 替代。
+1. 完整 PriorMap discover 已在当前修复源码上完成 329/329；后续若生产源码再变化则重跑，不以较小分组或旧远端 host contract 替代。
 2. 保留 XLSX 100k、Replay/FAR 与真实业务数据矩阵；workflow/finalization/trace/tag 主长路径已在 I5 执行。
 3. Map EEXIST、uppercase/noncanonical UUID、`.`/`..` CAS集成。
 4. Result hardlink/`0644` clone/post-hash mutation、manifest/receipt post-read、root final sweep、intent creation/temp/removal/staging replacement。

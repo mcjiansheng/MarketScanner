@@ -62,12 +62,19 @@ void destroyNativeApplication(const void *object)
 }
 
 bool getNodeTimeSnapshotNative(const void *object, int32_t * nodeId,
-                               double * nodeStamp, double * epochOffset,
-                               uint64_t * generation)
+                               int32_t * nodeMapId, double * nodeStamp,
+                               double * epochOffset, uint64_t * generation,
+                               float * nodeX, float * nodeY, float * nodeZ,
+                               float * nodeQx, float * nodeQy, float * nodeQz,
+                               float * nodeQw)
 {
     if(nodeId)
     {
         *nodeId = 0;
+    }
+    if(nodeMapId)
+    {
+        *nodeMapId = 0;
     }
     if(nodeStamp)
     {
@@ -81,19 +88,40 @@ bool getNodeTimeSnapshotNative(const void *object, int32_t * nodeId,
     {
         *generation = 0;
     }
-    if(!object || !nodeId || !nodeStamp || !epochOffset || !generation)
+    float * poseOutputs[] = {
+        nodeX, nodeY, nodeZ, nodeQx, nodeQy, nodeQz, nodeQw};
+    for(float * output : poseOutputs)
+    {
+        if(output)
+        {
+            *output = 0.0f;
+        }
+    }
+    if(!object || !nodeId || !nodeMapId || !nodeStamp || !epochOffset ||
+       !generation || !nodeX || !nodeY || !nodeZ || !nodeQx || !nodeQy ||
+       !nodeQz || !nodeQw)
     {
         return false;
     }
-    NodeTimeSnapshot snapshot = {0, 0.0, 0.0, 0};
+    NodeTimeSnapshot snapshot = {0, 0, 0.0, 0.0, 0,
+                                 0.0f, 0.0f, 0.0f,
+                                 0.0f, 0.0f, 0.0f, 0.0f};
     if(!native(object)->getNodeTimeSnapshot(snapshot))
     {
         return false;
     }
     *nodeId = snapshot.nodeId;
+    *nodeMapId = snapshot.nodeMapId;
     *nodeStamp = snapshot.nodeStamp;
     *epochOffset = snapshot.epochOffset;
     *generation = snapshot.generation;
+    *nodeX = snapshot.nodeX;
+    *nodeY = snapshot.nodeY;
+    *nodeZ = snapshot.nodeZ;
+    *nodeQx = snapshot.nodeQx;
+    *nodeQy = snapshot.nodeQy;
+    *nodeQz = snapshot.nodeQz;
+    *nodeQw = snapshot.nodeQw;
     return true;
 }
 

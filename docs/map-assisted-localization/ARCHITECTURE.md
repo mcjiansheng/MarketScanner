@@ -1,6 +1,6 @@
 # 已有地图辅助定位架构
 
-> 文档状态：**当前有效（阶段一至阶段三草稿复核）**。最后核对日期：2026-08-12。
+> 文档状态：**当前有效（阶段一至阶段三草稿复核）**。最后核对日期：2026-08-14。
 
 ## 范围
 
@@ -32,7 +32,8 @@ iOS prior_map_localized
     -> 2-frame candidate lock -> 3 minimum / 4 target durable frames
     -> 同帧 depth 中值/MAD 或货架平面射线
     -> 至少 3 个逐帧可靠的同 segment+side quorum
-    -> raw observation -> complete burst -> 专用货架确认
+    -> 同一次 atomic node snapshot 生成 node-local observation v2
+    -> complete burst -> 专用货架确认
     -> algorithm evidence + additive user evidence v2
   同时继续写入原 RTAB-Map 连续数据库
 
@@ -63,8 +64,8 @@ PC prior-map localized
 - `tools/PriorMap/distance_field.py` 生成并验证逐层 RLE 距离场；`replay_stage2.py` 是确定性结构匹配回放。
 - `tools/PriorMap/stage1_localizer.py` 是回放使用的阶段一定位器。
 - `PriorMapScanMatcher.swift`、`PriorMapDepthSampler.swift` 和 `PriorMapLocalization.swift` 分别负责距离场匹配、深度证据与串行状态/地图对齐。
-- `RTABMap.swift`/`NativeWrapper.mm` 以一次原子快照返回最近 node ID、node stamp、CameraMobile timebase offset 和 generation；Swift 人工定位事件不得把分次 getter 拼成跨时刻证据。
-- `PriceTagVisionScanner.swift` 只消费 ARKit 当前帧并执行真实 ROI、串行 one-in-flight Vision；`PriceTagCaptureCore.swift` 负责 generation、节流、候选锁定、bounded capture 和可靠多帧 quorum；`PriceTagCaptureUI.swift` 提供 camera-only preview 与专用货架确认页；`PriceTagLocalizationCore.swift` 负责平台无关的货架关联、segment+side identity 和 additive v2 用户证据。
+- `RTABMap.swift`/`NativeWrapper.*` 以一次原子快照返回最近 node ID、node map/component ID、node stamp、CameraMobile timebase offset、generation 和 `T_opengl_world_from_node`；Swift 人工定位或价签证据不得把分次 getter 拼成跨时刻证据。
+- `PriceTagVisionScanner.swift` 只消费 ARKit 当前帧和同帧 software-stabilized camera transform，执行真实 ROI、串行 one-in-flight Vision；`PriceTagCaptureCore.swift` 负责 generation、节流、候选锁定、bounded capture 和可靠多帧 quorum；`PriceTagCaptureUI.swift` 提供 camera-only preview 与专用货架确认页；`PriorMapLocalization.swift` 用 atomic node pose 计算 `P_node = inverse(T_opengl_world_from_node) × P_opengl_world`，`PriceTagLocalizationCore.swift` 负责 schema-v2 node-local 记录、平台无关货架关联、segment+side identity 和 additive v2 用户证据。
 - `PriorMapPackageIntegrityCore.swift` 在 iOS 导入前核验包清单、逐文件摘要和跨文件关系。
 - `tools/PriorMap/offline_localization.py` 是阶段三派生 SE(2) 修正、价签重关联、质量门禁、人工编辑重放和导出实现。
 - `tools/PriorMap/localized_output_store.py` 在 POSIX/Windows 跨进程文件锁内管理 staging、不可变 version、成果 schema/hash 清单、输入身份和 current/published 单提交点原子指针；Windows 使用 write-through 原子移动，读取和 artifact 下载按 version 内清单及已打开文件字节再次复核完整性。
@@ -86,7 +87,8 @@ PC prior-map localized
 - Capture Mode 不暂停 ARSession、RTAB-Map、连续数据库、Clock、Pose、node creation 或 prior-map localization。Vision/preview/evidence/UI completion 全部受 generation gate；取消、系统中断、最终化和 prior-map unload 会统一失效旧工作。
 - session admission gate 是 localization/confirmation writer 与 finalization 的唯一线性化点。finalization 关闭新 admission 后等待所有已登记 transaction/reservation；已登记 writer 在取得序列化锁后不会被内部二次 finalization 检查误拒。finalization 排空在主线程之外完成，timeout 只改变等待提示，不允许在实际 drain 前半封口或发布 snapshot。
 - prior-map queue 在入队前和执行前都检查 generation 与 finalization；因此 drain sentinel 后排入的普通 ARFrame 任务不能更新 localizer 或写普通 Recovery。普通 frame-driven Recovery 显式使用 `allowDuringFinalization=false`，只有 terminal teardown/finalization Recovery 使用 true。
-- 原始价签观测先落盘，complete burst 再落盘，最终价签才允许用户明确确认。最终化与 PC reader 对每个 `observation_id / burst_id / frame_id / payload / symbology` 做精确交叉绑定，v2 tag 的 frame set 必须精确等于一个 verified complete burst，tag payload/symbology 必须与 burst 相等，burst sequence 必须为正且严格递增。weak/recovering、低测量/低关联置信不能授权自动确认，但只要 complete burst、exact node 和可重算位置权威齐全，就保留为 `LOW_CONFIDENCE` 并由最终 node pose 重投影；不足 3 帧、身份/图质量、exact node/raw pose 或位置权威缺失仍为 `RESCAN_REQUIRED`。
+- 原始价签观测先落盘，complete burst 再落盘，最终价签才允许用户明确确认。最终化与 PC reader 对每个 `observation_id / burst_id / frame_id / payload / symbology` 做精确交叉绑定，v2 tag 的 frame set 必须精确等于一个 verified complete burst，tag payload/symbology 必须与 burst 相等，burst sequence 必须为正且严格递增。schema-v2 depth observation 还必须精确匹配源数据库 node ID/stamp/map ID，并声明 `coordinate_frame=RTABMAP_BOUND_NODE_LOCAL`；最终位置只按 `P_final = T_final_node × P_node` 重投影。weak/recovering、低测量/低关联置信不能授权自动确认，但只要 complete burst、exact node 和 node-local 位置权威齐全，就保留为 `LOW_CONFIDENCE`；不足 3 帧、身份/图质量、exact node 或 node-local 位置权威缺失仍为 `RESCAN_REQUIRED`。历史 v1 的 prior-map `raw_map_position` 不再进入传播公式，只保留业务记录并要求重扫。
+- 手机 immutable result 使用 coordinate contract v2。`COMPLETE/publish_permitted=true` 必须同时满足：prior-map 坐标权威、图质量通过、无 pipeline degradation、coordinate-frame audit 通过、legacy coordinate count 为 0、低置信/空坐标/未关联价签均为 0、rescan task 为 0。结果库读取和任务恢复会重复检查该不变量；旧 coordinate contract v1 只可作为不可发布复核工件读取。
 - capture generation 冻结 exact tracking session identity。ESL audit 只通过 active-only API 追加到已存在的 `segment_0001`，不隐式启动 session；普通迟到 audit 在 finalization 后拒绝，只有 scan-stop 自有 cancellation/continuity audit 可使用窄范围 override，因此旧 callback 不会创建空后继 session 或污染新扫描。
 - 算法候选与用户选择在 schema 中分离；用户确认不得修改算法字段、SLAM、地图对齐、node pose 或 localization constraint。替代候选使用 `shelfSegmentId + side` 精确 identity。
 - native helper 可用时阶段三运行完整相对 SE(2) 因子图；只有 helper 缺失或失败才标记 `bounded_correction_field`，该 fallback 不具备正式发布资格。可信人工锚点造成的大绝对 pose update 只能在 native caller 明确证明 gauge authority 时跳过绝对更新量门，相对边、闭环残差、图连通与 correction-field 梯度仍 fail closed。
@@ -98,6 +100,6 @@ PC prior-map localized
 - PC session input manifest v3 在 v2 Recovery 绑定之上纳入 `tag_observation_bursts.jsonl` 的 exact bytes/hash。共享 validator 统一 writer、bundle hash、snapshot/replay 与 output store：严格 integer version；v1/v2/v3 Recovery marker；case-insensitive filename uniqueness；source database 安全 basename、source-manifest 名称 cross-binding、single-link regular-file 身份，以及 non-empty WAL/journal 拒绝。现场选择与可靠离线关联一致时为 `NO_CONFLICT` 且保持 approved；可靠冲突为 `USER_CONFIRMATION_CONFLICT`，离线证据不足为 `OFFLINE_ASSOCIATION_UNAVAILABLE`，后两者都强制 review/rescan，且不覆盖用户或算法证据。
 - 人工编辑由服务端生成旧值、UUID、UTC 时间和 base revision；version/revision CAS 必填，重放成功后才提交新不可变版本。
 
-本轮未修改 MapCase02 几何、地图坐标转换或任何 store/map/file-specific scale、offset、rotation 规则；只修改 canonical filesystem ID、package bytes、production validator 和 MobileMapLibrary 安装身份合同。真机/性能/现场矩阵和低影响增强见 [`ESL_CAPTURE_TODO.md`](ESL_CAPTURE_TODO.md)；当前整体仍为 **REJECTED / NO-GO / developer smoke only**，J-04 未关闭。
+本轮没有把 PC corridor route review、手机 alignment basin 或回环附近 diagnostic shelf Top-K 升级为正式通道/货架定位因子。P0 node-local tag schema v2 与 P1-A publication invariant 的整改范围、自动化证据和剩余 P1-B～P2 见 [`AISLE_SHELF_CONSTRAINED_LOCALIZATION_REMEDIATION_2026-08-14.md`](AISLE_SHELF_CONSTRAINED_LOCALIZATION_REMEDIATION_2026-08-14.md)。真机/性能/现场矩阵和低影响增强见 [`ESL_CAPTURE_TODO.md`](ESL_CAPTURE_TODO.md)；当前整体仍为 **REJECTED / NO-GO / NOT PRODUCTION READY**，J-04 未关闭。
 
 阈值、线程所有权、恢复策略和失败矩阵的权威说明见 `STAGE_2_DESIGN.md`。

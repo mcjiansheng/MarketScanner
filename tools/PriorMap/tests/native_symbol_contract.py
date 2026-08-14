@@ -90,16 +90,24 @@ def main() -> None:
     normalized_wrapper_header = re.sub(r"\s+", " ", wrapper_header)
     snapshot_abi = re.compile(
         r"bool getNodeTimeSnapshotNative\(const void \*object, int32_t \* nodeId, "
-        r"double \* nodeStamp, double \* epochOffset, uint64_t \* generation\);"
+        r"int32_t \* nodeMapId, double \* nodeStamp, double \* epochOffset, "
+        r"uint64_t \* generation, float \* nodeX, float \* nodeY, float \* nodeZ, "
+        r"float \* nodeQx, float \* nodeQy, float \* nodeQz, float \* nodeQw\);"
     )
     if snapshot_abi.search(normalized_wrapper_header) is None:
-        errors.append("atomic node-time C ABI types do not match int32/double/double/uint64")
-    for field in ("nodeId", "nodeStamp", "epochOffset", "generation"):
+        errors.append(
+            "atomic node-time C ABI types do not include exact node identity/pose"
+        )
+    for field in (
+        "nodeId", "nodeMapId", "nodeStamp", "epochOffset", "generation",
+        "nodeX", "nodeY", "nodeZ", "nodeQx", "nodeQy", "nodeQz", "nodeQw",
+    ):
         if field not in app_header:
             errors.append(f"NodeTimeSnapshot field {field} is missing")
     for required_source_token in (
         "boost::defer_lock",
         "boost::lock(cameraLock, rtabmapLock)",
+        "opengl_world_T_rtabmap_world * signature->getPose()",
         "++nodeTimeSnapshotGeneration_",
         "std::numeric_limits<std::uint64_t>::max()",
     ):
@@ -109,6 +117,7 @@ def main() -> None:
             )
     for zero_assignment in (
         "*nodeId = 0",
+        "*nodeMapId = 0",
         "*nodeStamp = 0.0",
         "*epochOffset = 0.0",
         "*generation = 0",

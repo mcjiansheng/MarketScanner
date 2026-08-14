@@ -28,7 +28,7 @@
 4. 完成 build identity、相机权限、地图身份和设备检查后开始扫描。
 5. 主界面关注定位状态、当前通道、最近轨迹和待复核价签；工程诊断默认折叠。
 6. 需要扫码时点击价签扫描按钮。专用 camera-only Capture Mode 会复用持续到达的 ARFrame，不会启动第二相机，也不会暂停 ARKit、RTAB-Map 或连续数据库。把一个 ESL 保持在固定框内；贴得很近时系统会自动尝试一次扩展识别范围，但镜头无法清晰成像时仍应略微后移。候选需要连续 2 帧锁定，通常采集 4 个独立帧，至少需要 3 个，最大窗口 4 秒。单次 Vision 请求超过 1 秒会自动隔离并重试；若两条有界 worker 都挂起，应用只结束本次 ESL UX 并提示重启后再试，原始扫描仍继续。条码、完整 burst 和 exact node 已安全保存但定位/测量置信度不足时，应用会提示“低置信度已保存”，无需立即重复扫描；处理结果的 PriceTags 中会标记 `LOW_CONFIDENCE` 供后续复核。
-7. 只有 3 个以上逐帧可靠证据共同指向同一货架和侧面时，应用才显示专用货架确认页并允许选择“正确”或具体替代货架/侧面。已有至少 3 帧可重算位置、但定位/深度/关联置信不足的完整 burst 会直接按 `LOW_CONFIDENCE` 保留；少于 3 帧具有可重算位置、完整 burst/身份/exact node/raw pose 缺失或必需写入失败时才提示重扫，且绝不能强行确认。
+7. 只有 3 个以上逐帧可靠证据共同指向同一货架和侧面时，应用才显示专用货架确认页并允许选择“正确”或具体替代货架/侧面。已有至少 3 帧 exact-node-local 可重算位置、但定位/深度/关联置信不足的完整 burst 会直接按 `LOW_CONFIDENCE` 保留；少于 3 帧具有可重算位置、完整 burst/身份/exact node/node-local point 缺失、legacy v1 coordinate frame 或必需写入失败时才提示重扫，且绝不能强行确认。
 8. 正常结束并等待落盘、数据库关闭和外部复制完成。结束时应用会先失效扫码 generation，再在后台排空已经登记的 observation/confirmation/localization writer；不要因短暂等待强退应用。迟到的旧扫码 callback 会被拒绝，不会创建新的空会话或写入下一次扫描。
 
 如果在启动进度中点击关闭、返回按钮或返回手势，App 会取消尚未完成的 operation；如果 host 已经启动但 receipt/context 还未提交，会强制回滚相机、mapping、clock writer、localizer、数据库和会话身份。不会出现页面已返回但扫描仍在后台继续的状态。

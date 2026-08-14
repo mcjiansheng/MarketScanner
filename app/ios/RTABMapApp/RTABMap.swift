@@ -9,6 +9,20 @@ import Foundation
 import ARKit
 import simd
 
+/// One atomic native publication snapshot. A named value prevents downstream
+/// consumers from silently retaining an older tuple shape when the C/Swift
+/// contract gains another identity or pose field.
+struct RTABMapNodeBindingSnapshot {
+    let nodeId: Int
+    let nodeMapId: Int32
+    let nodeStamp: TimeInterval
+    let nodeTimebaseFrameTimestamp: TimeInterval
+    let nodeTimebaseOffsetSeconds: TimeInterval
+    let deltaSeconds: TimeInterval
+    let generation: UInt64
+    let openGLWorldFromNode: simd_float4x4
+}
+
 class RTABMap {
     var native_rtabmap: UnsafeMutableRawPointer
     
@@ -112,37 +126,61 @@ class RTABMap {
         destroyNativeApplication(native_rtabmap)
     }
 
-    func latestNodeBinding(frameTimestamp: TimeInterval) -> (
-        nodeId: Int, nodeStamp: TimeInterval, nodeTimebaseFrameTimestamp: TimeInterval,
-        nodeTimebaseOffsetSeconds: TimeInterval, deltaSeconds: TimeInterval,
-        generation: UInt64
-    )? {
+    func latestNodeBinding(
+        frameTimestamp: TimeInterval
+    ) -> RTABMapNodeBindingSnapshot? {
         var nodeId: Int32 = 0
+        var nodeMapId: Int32 = 0
         var nodeStamp = 0.0
         var epochOffset = 0.0
         var generation: UInt64 = 0
+        var nodeX: Float = 0
+        var nodeY: Float = 0
+        var nodeZ: Float = 0
+        var nodeQx: Float = 0
+        var nodeQy: Float = 0
+        var nodeQz: Float = 0
+        var nodeQw: Float = 0
         guard frameTimestamp.isFinite,
               getNodeTimeSnapshotNative(
                 native_rtabmap,
                 &nodeId,
+                &nodeMapId,
                 &nodeStamp,
                 &epochOffset,
-                &generation),
+                &generation,
+                &nodeX, &nodeY, &nodeZ,
+                &nodeQx, &nodeQy, &nodeQz, &nodeQw),
               nodeId > 0,
               nodeStamp.isFinite,
               epochOffset.isFinite,
               epochOffset != 0,
-              generation > 0 else {
+              generation > 0,
+              [nodeX, nodeY, nodeZ, nodeQx, nodeQy, nodeQz, nodeQw]
+                .allSatisfy(\.isFinite) else {
             return nil
         }
+        let quaternion = simd_quatf(
+            ix: nodeQx, iy: nodeQy, iz: nodeQz, r: nodeQw)
+        guard abs(simd_length(quaternion.vector) - 1) <= 1.0e-3 else {
+            return nil
+        }
+        var openGLWorldFromNode = simd_float4x4(quaternion)
+        openGLWorldFromNode.columns.3 = SIMD4<Float>(nodeX, nodeY, nodeZ, 1)
         let nodeTimebaseFrameTimestamp = frameTimestamp + epochOffset
         let delta = abs(nodeTimebaseFrameTimestamp - nodeStamp)
         guard nodeTimebaseFrameTimestamp.isFinite, delta <= 1.0 else {
             return nil
         }
-        return (
-            Int(nodeId), nodeStamp, nodeTimebaseFrameTimestamp,
-            epochOffset, delta, generation)
+        return RTABMapNodeBindingSnapshot(
+            nodeId: Int(nodeId),
+            nodeMapId: nodeMapId,
+            nodeStamp: nodeStamp,
+            nodeTimebaseFrameTimestamp: nodeTimebaseFrameTimestamp,
+            nodeTimebaseOffsetSeconds: epochOffset,
+            deltaSeconds: delta,
+            generation: generation,
+            openGLWorldFromNode: openGLWorldFromNode)
     }
 
     func nodeTimebase(frameTimestamp: TimeInterval) -> (

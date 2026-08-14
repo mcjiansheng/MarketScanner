@@ -13,11 +13,14 @@ import Foundation
 ///   parser bound on).
 /// For each observation: O(1) lookup by `boundNodeID`, exact stamp
 /// re-verification (`|raw stamp - parser stamp| <= frozen delta`), then
-/// P_final = T_final_node * inverse(T_raw_node) * P_raw. The V1R4 5-second
+/// P_final = T_final_node * P_node. The V1R4 5-second
 /// nearest-node fallback is deleted from the formal path.
 ///
 /// Position propagation is
-/// P_final = T_final_node * inverse(T_raw_node) * P_raw; 3D is preserved
+/// P_final = T_final_node * P_node; the phone writer already expressed the
+/// measurement in the exact bound-node frame. Applying the raw-node inverse
+/// again would double-transform points when the prior-map gauge is nonzero.
+/// 3D is preserved
 /// internally, the business output is 2D. Same barcode on different
 /// shelves/floors stays distinct instances — barcodes are never globally
 /// deduplicated.
@@ -54,10 +57,9 @@ enum TagObservationResolver {
         /// used for the strict binding); always present.
         var nodeTimestamp: Double
         var frameMonotonicSeconds: Double
-        /// Raw map position in the snapshot (pre-optimization) frame;
-        /// nil = unlocalized evidence that never reaches resolution.
-        var rawPositionM: (Double, Double, Double)? // x, y, z
-        var rawNodePose: SE2Transform
+        /// Point in the exact capture-bound node frame; nil means legacy or
+        /// measurement-only evidence that never reaches resolution.
+        var rawPositionM: (Double, Double, Double)? // node-local x, y, z
         var trackingSessionID: String
         /// V1R5 §5.4: verified-burst linkage (optional at resolution; the
         /// burst gate is enforced by the quality policy).
@@ -70,6 +72,7 @@ enum TagObservationResolver {
         var localizationConfidence: Double = 0
         var needsReview: Bool = true
         var measurementMethod: String = "unavailable"
+        var measurementHeightM: Double? = nil
     }
 
     struct FinalNodePose {
@@ -152,17 +155,16 @@ enum TagObservationResolver {
         guard node.floorID == observation.floorID else {
             throw ResolutionError.staleAlignment
         }
-        // P_final = T_final_node * inverse(T_raw_node) * P_raw
-        let local = observation.rawNodePose.inverse.applied(
-            to: position.0, position.1)
-        let final = node.pose.applied(to: local.0, local.1)
+        // Schema v2 already stores P_node. Apply the final optimized node
+        // transform exactly once.
+        let final = node.pose.applied(to: position.0, position.1)
         return ResolvedObservation(
             barcode: observation.barcode,
             symbology: observation.symbology,
             floorID: observation.floorID,
             mapXM: final.0,
             mapYM: final.1,
-            mapZM: position.2,
+            mapZM: observation.measurementHeightM ?? position.2,
             nodeID: node.id,
             nodeTimestamp: node.monotonicSeconds,
             frameMonotonicSeconds: observation.frameMonotonicSeconds,

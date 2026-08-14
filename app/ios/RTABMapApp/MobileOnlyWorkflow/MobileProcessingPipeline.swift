@@ -980,9 +980,6 @@ enum MobileProcessingPipeline {
         let shelves = try readShelves(from: request.priorMap)
         let structures = try readFixedStructures(from: request.priorMap)
         let shelfIndex = ShelfAssociationEngine.ShelfSpatialIndex(shelves: shelves)
-        // Raw snapshot-DB node poses for the propagation chain
-        // P_final = T_final_node * inverse(T_raw_node) * P_raw (§13.2).
-        let rawNodePoses = Self.rawNodePoseProvider?(snapshotDatabase) ?? [:]
         // V1R5 §6.5 (review B-03): the resolver uses O(1) indexes — the
         // parser-bound node id is the only resolution path, and the raw
         // snapshot node stamps verify the exact node-timebase binding.
@@ -1008,7 +1005,6 @@ enum MobileProcessingPipeline {
             priorMap: request.priorMap,
             floorID: floorID,
             graphQualityPassed: graphQualityPassed,
-            rawNodePoses: rawNodePoses,
             minimumAssociationMarginM: 0.5,
             sourceBursts: burstEvidence.bursts,
             retainedDegradedBursts: burstEvidence.retainedDegradedBursts,
@@ -1023,15 +1019,6 @@ enum MobileProcessingPipeline {
         rescanTasks.append(contentsOf: sessionRescanTasks)
         try checkCancelled()
 
-        let resultQualityStatus: ResultQualityStatus
-        if !selectedTrajectory.coordinatesArePriorMapFrame {
-            resultQualityStatus = .localFrameOnly
-        } else if graphQualityPassed && degradations.isEmpty {
-            resultQualityStatus = .complete
-        } else {
-            resultQualityStatus = .partialReviewRequired
-        }
-        let publishPermitted = resultQualityStatus == .complete
         let availablePositionCount = devicePositions.filter {
             $0.positionStatus == "AVAILABLE"
         }.count
@@ -1052,6 +1039,30 @@ enum MobileProcessingPipeline {
         let lowConfidenceTagCount = priceTags.filter {
             $0.qualityStatus == "LOW_CONFIDENCE"
         }.count
+        let unpositionedTagCount = priceTags.count - positionedTagCount
+        let unassociatedTagCount = priceTags.count - shelfAssociatedTagCount
+        let legacyTagCoordinateFrameCount = tagObservations.filter(
+            \.legacyCoordinateFrame).count
+        let coordinateFrameAuditPassed = legacyTagCoordinateFrameCount == 0
+        let publishPermitted = MobileResultPublicationInvariant.permits(
+            coordinatesArePriorMapFrame:
+                selectedTrajectory.coordinatesArePriorMapFrame,
+            graphQualityPassed: graphQualityPassed,
+            degradationCount: degradations.count,
+            coordinateFrameAuditPassed: coordinateFrameAuditPassed,
+            legacyCoordinateFrameCount: legacyTagCoordinateFrameCount,
+            lowConfidenceTagCount: lowConfidenceTagCount,
+            unpositionedTagCount: unpositionedTagCount,
+            unassociatedTagCount: unassociatedTagCount,
+            rescanTaskCount: rescanTasks.count)
+        let resultQualityStatus: ResultQualityStatus
+        if !selectedTrajectory.coordinatesArePriorMapFrame {
+            resultQualityStatus = .localFrameOnly
+        } else if publishPermitted {
+            resultQualityStatus = .complete
+        } else {
+            resultQualityStatus = .partialReviewRequired
+        }
 
         // --- Result package (staged, then atomically committed, §20) ---
         progress(0.80, "生成结果包")
@@ -1194,6 +1205,10 @@ enum MobileProcessingPipeline {
                     $0.qualityStatus == "LOW_CONFIDENCE"
                 }.count,
                 "rescan_count": rescanTasks.count,
+                "coordinate_frame_audit_passed":
+                    coordinateFrameAuditPassed,
+                "legacy_coordinate_frame_count":
+                    legacyTagCoordinateFrameCount,
             ],
             "prior_evidence": priorEvidence.audit.reportPayload(
                 priors: absolutePriors),
@@ -1257,7 +1272,9 @@ enum MobileProcessingPipeline {
             rescanTasks: rescanTasks,
             resultQualityStatus: resultQualityStatus,
             publishPermitted: publishPermitted,
-            degradations: degradations)
+            degradations: degradations,
+            coordinateFrameAuditPassed: coordinateFrameAuditPassed,
+            legacyTagCoordinateFrameCount: legacyTagCoordinateFrameCount)
         let workbookName = "\(resultID).xlsx"
         let workbookURL = resultDirectory.appendingPathComponent(workbookName)
         do {
@@ -1342,7 +1359,8 @@ enum MobileProcessingPipeline {
                 "prior_map_id": request.priorMap.priorMapID,
                 "prior_map_sha256": request.priorMap.packageSHA256,
                 "canonical_source_sha256": request.priorMap.canonicalSourceSHA256,
-                "coordinate_contract_version": 1,
+                "coordinate_contract_version":
+                    MobileResultPublicationInvariant.coordinateContractVersion,
                 "deliverable_contract_version": 1,
                 "tracking_session_id": request.trackingSessionID,
                 "source_database": request.sourceDatabase.lastPathComponent,
@@ -1368,11 +1386,15 @@ enum MobileProcessingPipeline {
                 "source_tag_count": sourceTagCount,
                 "retained_tag_count": priceTags.count,
                 "positioned_tag_count": positionedTagCount,
-                "unpositioned_tag_count": priceTags.count - positionedTagCount,
+                "unpositioned_tag_count": unpositionedTagCount,
                 "shelf_associated_tag_count": shelfAssociatedTagCount,
-                "unassociated_tag_count": priceTags.count - shelfAssociatedTagCount,
+                "unassociated_tag_count": unassociatedTagCount,
                 "low_confidence_tag_count": lowConfidenceTagCount,
                 "rescan_count": rescanTasks.count,
+                "coordinate_frame_audit_passed":
+                    coordinateFrameAuditPassed,
+                "legacy_tag_coordinate_frame_count":
+                    legacyTagCoordinateFrameCount,
                 "result_quality_status": resultQualityStatus.rawValue,
                 "publish_permitted": publishPermitted,
                 "degradation_count": degradations.count,
@@ -1892,14 +1914,6 @@ enum MobileProcessingPipeline {
 
     // MARK: - Tags
 
-    /// Raw snapshot-DB node poses (pre-optimization, node frame) used to
-    /// propagate tag positions into the final optimized frame:
-    /// P_final = T_final_node * inverse(T_raw_node) * P_raw (V1R4 §13.2
-    /// raw-pose consistency). The app wires the native graph reader
-    /// (`MobileNativeFactorGraph.wireIntoGateway`); host tests inject a
-    /// reference implementation.
-    static var rawNodePoseProvider: ((URL) -> [Int64: SE2Transform])? = nil
-
     /// Shelf segments from the compiled prior-map package (`shelves.json`).
     /// V2 consumes compiler-authored start/end/axis/front/back values
     /// directly and uses the legacy element polygon only as an index
@@ -2063,7 +2077,7 @@ enum MobileProcessingPipeline {
     /// parser already bound every accepted observation to an exact
     /// snapshot-DB node; here each observation is propagated into the
     /// final optimized frame via
-    /// P_final = T_final_node * inverse(T_raw_node) * P_raw, then
+    /// P_final = T_final_node * P_node, then
     /// associated to a shelf/side candidate (first/second margin +
     /// occlusion) BEFORE any clustering, bucketed by the exact
     /// barcode+symbology+floor+shelf-segment+side+session identity, and
@@ -2083,7 +2097,6 @@ enum MobileProcessingPipeline {
         priorMap: MobileMapLibrary.MapEntry,
         floorID: String,
         graphQualityPassed: Bool,
-        rawNodePoses: [Int64: SE2Transform],
         minimumAssociationMarginM: Double,
         sourceBursts: [VerifiedTagBurst] = [],
         retainedDegradedBursts: [TagObservationBurstEvidenceParseResult
@@ -2273,6 +2286,15 @@ enum MobileProcessingPipeline {
         var resolutionFailures: [TagFailure] = []
         var softFrameFailures: [TagFailure] = []
         for raw in observations {
+            if raw.legacyCoordinateFrame {
+                resolutionFailures.append((
+                    barcode: raw.barcode, symbology: raw.symbology,
+                    floorID: raw.floorID,
+                    trackingSessionID: raw.trackingSessionID,
+                    burstID: raw.burstID,
+                    reason: "legacy_tag_coordinate_frame_rescan_required"))
+                continue
+            }
             guard let position = raw.rawPositionM,
                   raw.measurementMethod != "unavailable" else {
                 // A complete burst may contain one weak frame while three
@@ -2300,17 +2322,6 @@ enum MobileProcessingPipeline {
                     reason: "node_binding_missing"))
                 continue
             }
-            guard let rawNodePose = rawNodePoses[boundNodeID] else {
-                // The propagation chain cannot be built without the raw
-                // snapshot node pose; explicit RESCAN task below.
-                resolutionFailures.append((
-                    barcode: raw.barcode, symbology: raw.symbology,
-                    floorID: raw.floorID,
-                    trackingSessionID: raw.trackingSessionID,
-                    burstID: raw.burstID,
-                    reason: "raw_node_pose_missing"))
-                continue
-            }
             let viewQuality: String
             if let normal = raw.surfaceNormalCamera, normal.count == 3 {
                 if normal[2] < 0 { viewQuality = "front" }
@@ -2327,7 +2338,6 @@ enum MobileProcessingPipeline {
                 nodeTimestamp: raw.nodeTimebaseTimestamp,
                 frameMonotonicSeconds: raw.frameTimestamp,
                 rawPositionM: position,
-                rawNodePose: rawNodePose,
                 trackingSessionID: raw.trackingSessionID,
                 burstID: raw.burstID,
                 frameID: raw.frameID,
@@ -2337,7 +2347,8 @@ enum MobileProcessingPipeline {
                 measurementConfidence: raw.measurementConfidence,
                 localizationConfidence: raw.localizationConfidence,
                 needsReview: raw.needsReview,
-                measurementMethod: raw.measurementMethod)
+                measurementMethod: raw.measurementMethod,
+                measurementHeightM: raw.measurementHeightM)
             do {
                 resolved.append(try TagObservationResolver.resolve(
                     observation: observation,
@@ -3102,7 +3113,9 @@ enum MobileProcessingPipeline {
         rescanTasks: [RescanTask],
         resultQualityStatus: ResultQualityStatus = .complete,
         publishPermitted: Bool = true,
-        degradations: [ProcessingDegradation] = []
+        degradations: [ProcessingDegradation] = [],
+        coordinateFrameAuditPassed: Bool = true,
+        legacyTagCoordinateFrameCount: Int = 0
     ) throws -> [String: String] {
         // Capture the completion boundary immediately before embedding
         // the run diagnostics into the workbook.
@@ -3166,6 +3179,12 @@ enum MobileProcessingPipeline {
             "degradation_count": String(degradations.count),
             "degradation_reasons": degradations.map(\.code)
                 .joined(separator: ","),
+            "coordinate_contract_version": String(
+                MobileResultPublicationInvariant.coordinateContractVersion),
+            "coordinate_frame_audit_passed":
+                coordinateFrameAuditPassed ? "true" : "false",
+            "legacy_tag_coordinate_frame_count": String(
+                legacyTagCoordinateFrameCount),
             "device_position_row_count": String(devicePositions.count),
             "available_position_count": String(available),
             "degraded_position_count": String(degraded),

@@ -8,13 +8,21 @@
 
 真机必须新增：20 次连续“重新选择位置”成功率测试；每次覆盖 1×–8× zoom、放大后单指 pan、点击/箭头拖动、X/Y/yaw 最后一键确认、±1/5/15°和四方向；核对 UI 值、manual event、alignment snapshot、PC 解析一致。另执行审计写失败注入、6 秒无 fresh node、tracking loss/recovery、顾客碰撞、刚开始扫描 crash、长扫 crash、kill/relaunch 和 MetricKit 后续交付。没有 `.ips`/payload 时只能记录“未取得诊断”，不能判定无 crash。
 
+### 2026-08-14 通道/货架设计审查 P0/P1-A 回归
+
+P0 node-local tag contract 必须在 Swift 和 Python 两端共同证明：native 单次快照同时返回 exact node ID、map/component ID、stamp、timebase generation 和 `T_opengl_world_from_node`；scene-depth 世界点写成 `point_in_bound_node_frame`；parser 精确复核源数据库 node ID/stamp/map ID 和 verified complete burst；resolver 只执行 `P_final = T_final_node × P_node`。冻结的数值回归至少包含最终 node 位姿 `(100 m, 50 m, 90°)` 与 node-local 点 `(1 m, 0 m)`，期望 `(100 m, 51 m)`，禁止重新出现 `T_final × inverse(T_raw) × prior-map-point`。`raw_map_position` 缺失或损坏不得覆盖 node-local 权威；node-local 点缺失/非法必须清空最终坐标、标记低置信并生成重扫。历史 v1 必须保留条码和 durable identity，但不得输出可发布地图坐标。
+
+P1-A publication invariant 必须分别覆盖 writer、immutable result reader 和 committed-task recovery。coordinate contract v2 只有在 prior-map frame、图质量 PASS、零 degradation、coordinate-frame audit PASS、legacy count=0、`LOW_CONFIDENCE=0`、unpositioned=0、unassociated=0、rescan=0 时才能声明 `COMPLETE/publish_permitted=true`。任一字段被篡改、遗漏或改成不一致计数都必须拒绝或降为 review；coordinate contract v1 可保留为历史 review artifact，但不得继续声明 COMPLETE。
+
+当前已执行证据包括：Stage-3 **126/126 PASS**；非零 gauge/精确 node binding focused **19/19 PASS**；完整 PriorMap discover（含 Swift host 长方法）**329/329 PASS（378.876 s）**。规模子进程保留 300,000 finalization（输入 114,933,372 bytes，wall 8.111 s，CPU 8.076 s，峰值 RSS 13,287,424 bytes）、1,728,000 trace（保留 172,801，wall 0.405 s，CPU 0.407 s，峰值 59,146,240 bytes）和 400,000 tag evidence（输入 282,352,646 bytes，接受 200,000，wall 29.046 s，CPU 28.916 s，峰值 747,192,320 bytes）。v2 evidence 增加字段后 tag 峰值明显高于上一基线，仍低于冻结的 768 MiB 门但余量有限；后续 exact-SHA runner 必须继续报告真实输入字节、耗时和 RSS，不得沿用旧数字。签名真机、LiDAR、Files provider、热/低磁盘、动态顾客/购物车、错误 loop、平行通道多解和现场控制点精度仍未执行。
+
 ## 自动测试
 
 ### 2026-08-14 跨端稳定性自检
 
 除既有轨迹、价签、sidecar、snapshot、CAS 和发布门合同外，正常生命周期回归必须证明：Core Location 空批次、暂时无 active window scene、历史数据库列表越界/类型不符、文件修改时间不可读、Application Support 状态目录不可创建、价签状态竞态和已提交结果恢复分支均不会调用强制解包、强制转换、`fatalError`、`preconditionFailure` 或 Debug assertion 结束进程。普通低置信度/部分图/多解必须保留有限轨迹、逐秒行和 durable 价签；完整性、身份、水位、CAS、重复 durable 主键、完全无有限轨迹和原子提交损坏继续失败关闭。
 
-当前本机证据：PriorMap discover 322/322（363.760 s；300,000 finalization peak 14,254,080 bytes；1,728,000 trace retained 172,801 / peak 59,146,240 bytes；400,000 tag evidence accepted 200,000 / peak 449,871,872 bytes）、Qualification 30/30、Map Studio 完整 API 130/130、native 7884 checks / 0 failures、macOS Release `rtabmap-reprocess` build/launch、Swift parse、JavaScript/Python syntax 和 `git diff --check`。真实浏览器响应式自动化仍受 localhost 安全策略限制；权限不可得时必须报告为环境阻断，不能绕过浏览器安全限制或把 HTTP 单元测试冒充真实视觉交互。
+当前本机证据：PriorMap discover 329/329（378.876 s；300,000 finalization peak 13,287,424 bytes；1,728,000 trace retained 172,801 / peak 59,146,240 bytes；400,000 tag evidence accepted 200,000 / peak 747,192,320 bytes）、Qualification 30/30、Map Studio 完整 API 131/131、native 7884 checks / 0 failures、macOS Release `rtabmap-reprocess` build、Swift parse、JavaScript/Python syntax 和 `git diff --check`。真实浏览器响应式自动化仍受 localhost 安全策略限制；权限不可得时必须报告为环境阻断，不能绕过浏览器安全限制或把 HTTP 单元测试冒充真实视觉交互。
 
 PC 人工锚点必须确认 HTML 中不存在连续 yaw range slider，并覆盖 X/Y/yaw 数值输入、平移步长、四向移动、离散旋转、四个基准朝向、键盘/Shift、canonical bounds、exact request/audit value 和 CAS。iOS 配置/重定位继续使用同一 canonical SE(2) 离散交互。最终提交后还必须运行 unsigned generic iphoneos Release 并核对 `MarketScannerBuildIdentity.json.app_git_sha == git rev-parse HEAD`；该结果仍不替代签名安装、LiDAR、Files provider、热/低磁盘或现场真值。
 

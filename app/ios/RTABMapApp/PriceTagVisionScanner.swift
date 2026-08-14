@@ -299,6 +299,9 @@ final class PriceTagVisionScanner {
 
 struct PriceTagFrameMeasurement {
     let rawMapPosition: PriorMapTagPoint3D?
+    /// ARKit/OpenGL world point used to derive the durable exact-node-local
+    /// coordinate. Shelf-ray fallback deliberately has no 3D world point.
+    let worldPoint: SIMD3<Float>?
     let cameraMapPosition: SIMD2<Double>
     let method: String
     let confidence: Double
@@ -343,6 +346,7 @@ struct PriceTagFrameMeasurement {
                     xM: mapped.xM,
                     yM: mapped.yM,
                     heightM: height),
+                worldPoint: worldPoint,
                 cameraMapPosition: camera2D,
                 method: frame.smoothedSceneDepth != nil
                     ? "smoothed_scene_depth"
@@ -381,6 +385,7 @@ struct PriceTagFrameMeasurement {
             floorId: floorId)
         return PriceTagFrameMeasurement(
             rawMapPosition: fallback,
+            worldPoint: nil,
             cameraMapPosition: camera2D,
             method: fallback == nil ? "unavailable" : "shelf_plane_ray",
             confidence: fallback == nil ? 0 : 0.42,

@@ -392,6 +392,21 @@ struct PriorMapTagPoint3D: Codable, Equatable {
     }
 }
 
+/// Exact price-tag point expressed in the capture-bound RTAB-Map node frame.
+/// Unlike `PriorMapTagPoint3D`, `zM` is a geometric node-local coordinate;
+/// display height above the selected floor is carried separately.
+struct PriorMapTagNodeLocalPoint3D: Codable, Equatable {
+    let xM: Double
+    let yM: Double
+    let zM: Double
+
+    enum CodingKeys: String, CodingKey {
+        case xM = "x_m"
+        case yM = "y_m"
+        case zM = "z_m"
+    }
+}
+
 struct PriorMapTagObservationRecord: Codable {
     let format: String
     let version: Int
@@ -434,6 +449,16 @@ struct PriorMapTagObservationRecord: Codable {
     /// ACCEPTED price tags (they cannot satisfy the verified-burst gate).
     let burstId: String?
     let frameId: String?
+    /// Schema v2 coordinate authority. These values come from the same
+    /// atomic native node snapshot used for burst binding. Legacy v1 records
+    /// decode with nil values and are retained only as rescan-required
+    /// business evidence by post-processing.
+    let boundNodeId: Int64?
+    let boundNodeStamp: TimeInterval?
+    let boundNodeMapId: Int32?
+    let coordinateFrame: String?
+    let pointInBoundNodeFrame: PriorMapTagNodeLocalPoint3D?
+    let measurementHeightM: Double?
 
     enum CodingKeys: String, CodingKey {
         case format
@@ -471,6 +496,12 @@ struct PriorMapTagObservationRecord: Codable {
         case needsReview = "needs_review"
         case burstId = "burst_id"
         case frameId = "frame_id"
+        case boundNodeId = "bound_node_id"
+        case boundNodeStamp = "bound_node_stamp"
+        case boundNodeMapId = "bound_node_map_id"
+        case coordinateFrame = "coordinate_frame"
+        case pointInBoundNodeFrame = "point_in_bound_node_frame"
+        case measurementHeightM = "measurement_height_m"
     }
 
     /// V1R5: returns a copy bound to the durable burst/frame identity
@@ -511,7 +542,13 @@ struct PriorMapTagObservationRecord: Codable {
             trackingSessionId: trackingSessionId,
             needsReview: needsReview,
             burstId: burstId,
-            frameId: frameId)
+            frameId: frameId,
+            boundNodeId: boundNodeId,
+            boundNodeStamp: boundNodeStamp,
+            boundNodeMapId: boundNodeMapId,
+            coordinateFrame: coordinateFrame,
+            pointInBoundNodeFrame: pointInBoundNodeFrame,
+            measurementHeightM: measurementHeightM)
     }
 }
 

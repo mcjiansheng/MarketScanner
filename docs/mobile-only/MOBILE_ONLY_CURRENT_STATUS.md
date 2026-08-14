@@ -1,10 +1,12 @@
 # Mobile-Only V1 当前状态
 
-> 文档状态：**当前有效**。最后核对日期：2026-08-13（手机/PC 部分结果与价签保留合同）。
+> 文档状态：**当前有效**。最后核对日期：2026-08-14（价签 node-local 坐标合同 v2 与统一发布门）。
 
 ## 总体
 
-当前冻结核心基线为 `core-mobile-v1@9a93fbd0ee52944eae5aebedf59ec6a08dedc934`；本轮工作位于不带 `codex/` 前缀的 `fix/manual-anchor-continuous-recovery`，在历史处理稳定读取、起点朝向、可信人工锚点连续恢复和手机部分结果提交修复之上统一手机/PC 的低置信度保留合同。此前被审增量 `fix/mobile-import-prewarm-esl-deferred-tag@673d8d3a714f8fb6be18acc44ca4dd32589f3e81`、修复分支 `fix/mobile-import-esl-review-blockers` 及其独立复审状态保留为历史证据；它们已合入上述核心基线，但不能把局部结论扩展为整体发布通过。I10 final SHA `8f0e730d92773eea2ab58f56742d901ac02eead4` 的 exact-SHA run `31307753672` 为 7/8：P0、SHA/wave、ABI、Ubuntu/Windows native、Python/API/Web 与完整 macOS host 合同均 PASS，200k tag-evidence RSS 为 `794,099,712 < 805,306,368` bytes；唯一失败是 cold-cache iphoneos RTAB-Map 配置没有找到已生成在 `rtabmap/prebuild/bin/` 的宿主 `rtabmap-res_tool`，因此 simulator/device clean link 被跳过。I11 `37e6ed8c4afa00202693cd56919aea78fd4c7af5` 已在交叉编译前验证该宿主工具并通过 `RTABMAP_RES_TOOL` 显式绑定，G11 `7eef33e` 已绑定 implementation SHA；新的 exact-SHA 8/8 前不冻结，当前发布判断仍为 **REJECTED / NO-GO / developer smoke only**。
+当前冻结核心基线为 `core-mobile-v1@9a93fbd0ee52944eae5aebedf59ec6a08dedc934`，已验证前序为 `fix/manual-anchor-continuous-recovery@bb09e1346a13945b1d4d8fa7eaf174959b528ab9`；本轮整改分支为不带 `codex/` 前缀的 `fix/tag-node-local-publication-gate`。本轮关闭审查中的 P0 价签坐标重复变换和 P1-A 手机发布门漏检：observation v2 把 scene-depth 点绑定为 exact RTAB-Map node-local 3D，手机/PC 只执行一次 `T_final_node × P_node`；历史 v1 保留业务身份但清空可发布坐标并要求重扫；统一 publication invariant 将 degradation、legacy frame、低置信、空坐标、未关联和 rescan 全部纳入 `COMPLETE/publish_permitted`。当前完整证据为 PriorMap 329/329（378.876 s）、Qualification 30/30、Map Studio 131/131、native 7884/0；400,000 tag evidence 接受 200,000、峰值 RSS 747,192,320 bytes，仍低于 768 MiB host 门但余量有限。正式 pose epoch/component、corridor/shelf/side tracker、人体扫掠体、PC 混合因子图、concrete shelf-loop/manifest v5、动态物体/地图失配及签名真机/现场资格均未关闭，当前发布判断仍为 **NO-GO / NOT PRODUCTION READY**。
+
+下列按日期记录的段落是对应增量当时的历史证据；若测试数字或分支与上段冲突，以上述 2026-08-14 当前状态和当前源码为准。
 
 ## 2026-08-13 手机与 PC 部分结果、价签保留合同
 

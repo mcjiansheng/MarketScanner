@@ -48,27 +48,9 @@ enum MobileNativeFactorGraph {
                 return []
             }
             return readout.nodes.map {
-                AbsolutePriorEvidenceNode(nodeID: $0.id, stamp: $0.stamp)
+                AbsolutePriorEvidenceNode(
+                    nodeID: $0.id, stamp: $0.stamp, mapID: $0.mapID)
             }
-        }
-        // Wire the raw snapshot-DB node poses into the tag propagation
-        // chain (§13.2): P_final = T_final_node * inverse(T_raw_node) *
-        // P_raw needs T_raw_node per bound node id; without this wiring
-        // every observation fails resolution with an explicit RESCAN
-        // task (fail closed, never a default pose).
-        MobileProcessingPipeline.rawNodePoseProvider = { databaseURL in
-            guard let readout = try? MobileGraphReader.readGraph(databaseURL: databaseURL) else {
-                return [:]
-            }
-            var poses: [Int64: SE2Transform] = [:]
-            for node in readout.nodes {
-                guard let pose = try? MobileGraphReader.projectToSE2(
-                    poseRowMajor3x4: node.poseRowMajor3x4) else {
-                    return [:]
-                }
-                poses[node.id] = pose
-            }
-            return poses
         }
     }
 
