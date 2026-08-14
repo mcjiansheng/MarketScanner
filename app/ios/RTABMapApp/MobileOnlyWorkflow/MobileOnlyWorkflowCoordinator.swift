@@ -1524,6 +1524,83 @@ struct MobileScanConfiguration {
     var startYM: Double
     var startYawRad: Double
     var storeID: String
+    /// Resolved human-readable scan display name. Always non-empty: the
+    /// setup screen sanitizes user input and falls back to the deterministic
+    /// default before building this configuration.
+    var scanDisplayName: String
+}
+
+/// Human-readable display name for one scan session.
+///
+/// The name is strictly optional metadata: it never gates scan start, never
+/// changes session directory, database or sidecar naming, and a missing or
+/// invalid value always falls back to a deterministic default. It is written
+/// into `metadata.json` / `live_checkpoint.json` as the optional
+/// `scanDisplayName` field and displayed in the historical-scan list; older
+/// sessions without the field keep working unchanged.
+enum MarketScannerScanName {
+    static let maximumLength = 64
+    static let metadataKey = "scanDisplayName"
+
+    /// Slashes, wildcards, quotes, angle brackets, pipes and control
+    /// characters are removed so the value can never break file browsers,
+    /// export paths, logs or JSON/CSV transports. The name is never used as
+    /// a path component, so this is defense in depth.
+    private static let forbiddenCharacters = CharacterSet(
+        charactersIn: "/\\:*?\"<>|")
+        .union(CharacterSet.controlCharacters)
+        .union(CharacterSet.newlines)
+
+    /// Returns a cleaned display name, or nil when nothing usable remains.
+    /// Whitespace runs collapse to single spaces and the result is capped at
+    /// `maximumLength`; the operation is idempotent so the host can re-run
+    /// it on a UI-supplied value without changing an already-clean name.
+    static func sanitize(_ raw: String?) -> String? {
+        guard let raw = raw else { return nil }
+        var filteredScalars = String.UnicodeScalarView()
+        for scalar in raw.unicodeScalars where !forbiddenCharacters.contains(scalar) {
+            filteredScalars.append(scalar)
+        }
+        let filtered = String(filteredScalars)
+        let collapsed = filtered
+            .components(separatedBy: .whitespaces)
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+        var result = collapsed
+        if result.count > maximumLength {
+            result = String(result.prefix(maximumLength))
+                .trimmingCharacters(in: .whitespaces)
+        }
+        return result.isEmpty ? nil : result
+    }
+
+    /// Deterministic default: `<store>-<floor>-MMdd-HHmm`, e.g.
+    /// `hs6599-F1-0814-1530`. Parts that are empty are skipped.
+    static func defaultName(
+        storeID: String,
+        floorID: String,
+        at date: Date
+    ) -> String {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "MMdd-HHmm"
+        let stamp = formatter.string(from: date)
+        let parts = [storeID, floorID].filter { !$0.isEmpty }
+        let prefix = parts.isEmpty ? "Scan" : parts.joined(separator: "-")
+        return sanitize("\(prefix)-\(stamp)") ?? "Scan-\(stamp)"
+    }
+
+    /// The single resolution rule shared by the setup UI and the scanner
+    /// host: a cleaned user value wins; otherwise the default applies.
+    static func effectiveName(
+        userInput: String?,
+        storeID: String,
+        floorID: String,
+        at date: Date = Date()
+    ) -> String {
+        return sanitize(userInput)
+            ?? defaultName(storeID: storeID, floorID: floorID, at: date)
+    }
 }
 
 /// Receipt proving the real scan actually started (V1R3 §4.1). Produced

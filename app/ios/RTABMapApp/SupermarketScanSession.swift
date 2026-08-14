@@ -81,6 +81,10 @@ struct ScanSegmentMetadata: Codable {
     /// Store identity of the scan (B-08): the snapshot eligibility
     /// chain validates it fail-closed against the processing request.
     let storeId: String?
+    /// Optional human-readable scan display name chosen at scan start.
+    /// Display-only metadata: PC and mobile consumers read it with `.get`
+    /// semantics and older sessions simply decode it as nil.
+    let scanDisplayName: String?
     let initialMapPose: PriorMapPose2D?
     let localizationTrace: String?
     let manualLocalizationEvents: String?
@@ -497,6 +501,9 @@ struct ScanLiveCheckpoint: Codable {
     let priorMapCanonicalSourceSha256: String?
     let floorId: String?
     let storeId: String?
+    /// Optional human-readable scan display name; nil for older checkpoints
+    /// and unnamed scans.
+    let scanDisplayName: String?
     let initialMapPose: PriorMapPose2D?
 }
 
@@ -1798,6 +1805,7 @@ final class SupermarketScanSession {
                 scanConfiguration.priorMapCanonicalSourceSha256,
             floorId: scanConfiguration.floorId,
             storeId: scanConfiguration.storeID,
+            scanDisplayName: scanConfiguration.scanDisplayName,
             initialMapPose: scanConfiguration.initialMapPose)
     }
 

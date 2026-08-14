@@ -153,6 +153,10 @@ struct PriorMapScanConfiguration: Codable {
     /// metadata and later XLSX/result processing validate the store fail-closed.
     let storeID: String?
     let initialMapPose: PriorMapPose2D?
+    /// Optional human-readable scan display name committed by the scan
+    /// setup screen. Pure metadata: decoding older configurations without
+    /// the field yields nil and every consumer treats nil as "unnamed".
+    let scanDisplayName: String?
 
     static let freeMapping = PriorMapScanConfiguration(
         formatVersion: 1,
@@ -163,7 +167,8 @@ struct PriorMapScanConfiguration: Codable {
         priorMapCanonicalSourceSha256: nil,
         floorId: nil,
         storeID: nil,
-        initialMapPose: nil)
+        initialMapPose: nil,
+        scanDisplayName: nil)
 
     var isReadyToStart: Bool {
         switch workflowMode {
@@ -189,6 +194,7 @@ struct PriorMapScanConfiguration: Codable {
         case floorId
         case storeID = "storeId"
         case initialMapPose
+        case scanDisplayName
     }
 
     init(
@@ -200,7 +206,8 @@ struct PriorMapScanConfiguration: Codable {
         priorMapCanonicalSourceSha256: String? = nil,
         floorId: String?,
         storeID: String?,
-        initialMapPose: PriorMapPose2D?
+        initialMapPose: PriorMapPose2D?,
+        scanDisplayName: String? = nil
     ) {
         self.formatVersion = formatVersion
         self.workflowMode = workflowMode
@@ -211,6 +218,7 @@ struct PriorMapScanConfiguration: Codable {
         self.floorId = floorId
         self.storeID = storeID
         self.initialMapPose = initialMapPose
+        self.scanDisplayName = scanDisplayName
     }
 }
 
