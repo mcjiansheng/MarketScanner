@@ -2,6 +2,15 @@
 
 > 文档状态：**当前有效**。最后核对日期：2026-08-14。
 
+## 2026-08-14 — 废弃道路中心线重参数化，保留通道内真实轨迹几何
+
+- 废弃 `bounded_free_space_road_hmm_v1` 的“选中道路序列后按物理累计里程在中心线上重新采样”行为。旧实现只保留累计路程，会把用户在通道内的横向位置、局部曲线、停顿和回头压成规则道路折线；TianHong 旧包的 road width 又全部为 0，历史 0.2 m 伪宽度进一步放大了错误。
+- 新 `bounded_free_space_road_hmm_v2` 将 `road_graph` 限定为 corridor identity、有限边范围、真实 junction、连通性和可达转移证据。道路边的有限纵向范围参与 HMM 评分，但不会把自由空间中的手机点拖向道路端点；道路中心线和切线均不再写入最终 X/Y/yaw。未知或零道路宽度不再伪造，横向自由空间从货架/固定结构多边形确定性派生。
+- 最终轨迹使用 `local_geometry_preserving_corridor_envelope_v2`：保留优化手机位姿的局部几何；exact 人工锚点残差按 gauge-neutral 物理里程连续传播；交替投影只产生最小低频自由空间修正。结构内孤立点按同一通道侧退出并用前后修正场消除错误侧选择；穿架线段使用货架驱动的局部刚体平移，同轮建议先合并再应用，禁止多个相邻穿架段向同一节点顺序累加；最终修正尖刺/平台切换只有在整个候选窗口的点和线段均不碰撞、且局部最大步长不增加时才平滑。
+- `MarketScannerCorridorRouteMatchAudit` 升级为 version 2，以 `geometry_preservation` 取代历史 `reparameterization`。审计显式保存 `centerline_snap_applied=false`、道路/手机几何角色、有限包络投影、anchor translation field、point escape continuity、shelf-driven rigid segment repair、collision-safe spike/gradient repair、中心线横向偏移和最终距离尺度。历史 version 1 继续只读兼容。
+- 复用既有只读 optimized DB 和同一 TianHong prior-map package 实测：`162937` 保留 3663 个节点与 3806 行秒级表，结构内点/穿架段/拓扑断裂为 `0/0/0`，最大输出/物理步长为 `1.091/1.070 m`，轨迹/物理里程为 `476.929/470.892 m`；`181158` 保留 1054 个节点与 1132 行秒级表，三项同为 `0/0/0`，最大输出/物理步长为 `0.848/0.952 m`，轨迹/物理里程为 `179.779/181.127 m`。两份结果都保留完整 CSV/PNG，但因绝对修正、弱定位时长和少数无法安全摊平的修正梯度继续标记 `PARTIAL_REVIEW_REQUIRED`、禁止发布；这不是处理失败，也不证明现场绝对坐标真值。
+- 当前自动回归通过 PriorMap 321/321、Map Studio 130/130、Qualification 30/30；新增/强化用例覆盖通道内横向移动、U-turn、有限道路端点/真实路口、exact 人工锚点连续传播、货架驱动穿架修复和自由空间修正梯度。相关 Python 入口全部通过 `py_compile`，`git diff --check` 通过。
+
 ## 2026-08-14 — 不可变时间线/价签成果、时钟分段与 durable burst 核账
 
 - localized result 升级为 version manifest v5：`calibrated_positions_by_node.csv`、`calibrated_positions_1s.csv`、`localized_price_tags.json`、`localized_price_tags.csv` 和 `calibrated_deliverables_manifest.json` 成为不可变版本内的核心业务工件。正式发布版本为 v6。外部导出脚本验证并复制核心 CSV，只额外生成路线 PNG，不能重新解释或提升结果资格。

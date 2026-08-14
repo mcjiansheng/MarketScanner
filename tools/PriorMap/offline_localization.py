@@ -6394,7 +6394,14 @@ def calibrated_trajectory_rows(
     distance_scale_confidence = str(
         route_audit.get("distance_scale_confidence") or "high"
     )
-    scale_segments = route_audit.get("reparameterization", {}).get("segments")
+    geometry_audit = route_audit.get("geometry_preservation")
+    if not isinstance(geometry_audit, dict):
+        # Read-only compatibility for v1 route audits produced before corridor
+        # identity was separated from final phone geometry.
+        geometry_audit = route_audit.get("reparameterization")
+    scale_segments = (
+        geometry_audit.get("segments") if isinstance(geometry_audit, dict) else None
+    )
     rows: list[dict[str, Any]] = []
     for index, pose in enumerate(poses):
         distance_scale = None
@@ -8803,7 +8810,7 @@ def _render_localized_version(
                 baseline, optimized, constraints
             )
             solver_metrics["continuity_gate_authority"] = (
-                "gauge_neutral_free_space_road_route"
+                "gauge_neutral_corridor_envelope_correction"
             )
             solver_metrics["legacy_correction_gradient_is_diagnostic_only"] = True
             full_factor_graph = False
@@ -8818,7 +8825,7 @@ def _render_localized_version(
                 "corridor_route_review_applied": True,
                 "corridor_route_matcher": corridor_route_audit.get("matcher"),
                 "review_trajectory_solver": (
-                    "gauge_neutral_physical_motion_plus_free_space_road_route_v1"
+                    "gauge_neutral_motion_plus_corridor_envelope_correction_v2"
                 ),
             }
         else:
@@ -9377,7 +9384,7 @@ def _render_localized_version(
                 "relative_se2_factor_graph"
                 if full_factor_graph
                 else (
-                    "gauge_neutral_free_space_road_route"
+                    "gauge_neutral_corridor_envelope_correction"
                     if corridor_route_audit.get("status")
                     in {"matched", "matched_low_confidence"}
                     else "bounded_correction_field"
@@ -9392,7 +9399,7 @@ def _render_localized_version(
                 None
                 if full_factor_graph
                 else (
-                    "The final review trajectory is reconstructed from gauge-neutral physical motion, strict manual map anchors, connected road topology, and shelf/fixed-structure free-space constraints. The native factor graph remains available for audit; this route is a non-publishable review draft."
+                    "The final review trajectory preserves the optimized phone pose geometry. Connected road topology selects corridor identity only; exact manual anchors and a low-frequency minimum correction field keep the trajectory in shelf/fixed-structure free space without snapping it to a road center line. The native factor graph remains available for audit; this route is a non-publishable review draft."
                     if corridor_route_audit.get("status")
                     in {"matched", "matched_low_confidence"}
                     else (
@@ -9529,10 +9536,24 @@ def _render_localized_version(
                 "maximum_distance_scale_deviation": corridor_route_audit.get(
                     "maximum_distance_scale_deviation"
                 ),
-                "reparameterization": corridor_route_audit.get(
-                    "reparameterization"
-                ),
+                "geometry_preservation": corridor_route_audit.get(
+                    "geometry_preservation"
+                )
+                or corridor_route_audit.get("reparameterization"),
             },
+        ),
+        (
+            float(
+                (
+                    corridor_route_audit.get("geometry_preservation") or {}
+                ).get("maximum_neighbor_correction_change_m")
+                or 0.0
+            )
+            <= 0.5,
+            "corridor_envelope_correction_gradient_above_0_5m",
+            (
+                corridor_route_audit.get("geometry_preservation") or {}
+            ).get("maximum_neighbor_correction_change_m"),
         ),
         (
             report["weak_lost_duration_seconds"] <= 30.0,
@@ -9724,7 +9745,7 @@ def _render_localized_version(
                     else "bounded_draft_fallback"
                 ),
                 "gauge_neutral_physical_motion_reconstruction",
-                "free_space_road_route_matching",
+                "corridor_identity_and_free_space_envelope_matching",
                 "tag_reassociation",
                 "quality_gate",
                 "human_review",
@@ -9753,7 +9774,7 @@ def _render_localized_version(
                 "relative_se2_factor_graph_v2"
                 if full_factor_graph
                 else (
-                    "gauge_neutral_free_space_road_route_v1"
+                    "gauge_neutral_corridor_envelope_correction_v2"
                     if corridor_route_audit.get("status")
                     in {"matched", "matched_low_confidence"}
                     else "bounded_correction_field_banded_v3"

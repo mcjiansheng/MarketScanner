@@ -67,6 +67,7 @@ from tools.PriorMap.offline_localization import (
 from tools.PriorMap.corridor_route_matcher import (
     ObstacleIndex,
     RouteAnchor,
+    _repair_free_correction_gradient_steps,
     match_corridor_route,
 )
 from tools.PriorMap.export_calibrated_trajectory import _final_poses, export
@@ -1389,6 +1390,357 @@ class RobustSE2OptimizerTests(unittest.TestCase):
         self.assertIn("maximum_step_excess_m", result.audit)
         self.assertIn("distance_scale_confidence", result.audit)
         self.assertIn("maximum_distance_scale_deviation", result.audit)
+        for expected, actual in zip(physical, result.poses):
+            self.assertAlmostEqual(actual.x, expected.x, places=9)
+            self.assertAlmostEqual(actual.y, expected.y, places=9)
+            self.assertAlmostEqual(actual.yaw, expected.yaw, places=9)
+        geometry = result.audit["geometry_preservation"]
+        self.assertFalse(geometry["centerline_snap_applied"])
+        self.assertEqual(
+            geometry["road_geometry_role"],
+            "topology_and_free_space_constraint_only",
+        )
+
+    def test_corridor_match_preserves_in_aisle_lateral_phone_motion(self) -> None:
+        graph = {
+            "nodes": [
+                {"id": "a", "floor_id": "1", "position_m": [0.0, 0.0]},
+                {"id": "b", "floor_id": "1", "position_m": [10.0, 0.0]},
+            ],
+            # Zero means unknown in the legacy TianHong package.  Shelf geometry,
+            # not a fabricated 0.2 m strip, determines the usable aisle width.
+            "crosses": [{"id": "aisle", "floor_id": "1", "width_m": 0.0}],
+            "edges": [
+                {
+                    "id": "ab",
+                    "floor_id": "1",
+                    "from": "a",
+                    "to": "b",
+                    "cross_ids": ["aisle"],
+                }
+            ],
+        }
+        lateral_offsets = [0.4, 0.8, 1.1, 0.5, -0.3]
+        phone_yaws = [0.15, 0.25, 0.35, 0.45, 0.55]
+        poses = [
+            Pose(index + 1, float(index), 1.0 + index * 2.0, y, phone_yaws[index])
+            for index, y in enumerate(lateral_offsets)
+        ]
+        shelves = [
+            ((0.0, 2.0), (10.0, 2.0), (10.0, 3.0), (0.0, 3.0)),
+            ((0.0, -3.0), (10.0, -3.0), (10.0, -2.0), (0.0, -2.0)),
+        ]
+        result = match_corridor_route(
+            poses,
+            poses,
+            graph,
+            "1",
+            shelves,
+            maximum_candidates=4,
+            search_radius_m=4.0,
+            obstacle_clearance_m=0.05,
+        )
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result.audit["matcher"], "bounded_free_space_road_hmm_v2")
+        for expected, actual in zip(poses, result.poses):
+            self.assertAlmostEqual(actual.x, expected.x, places=9)
+            self.assertAlmostEqual(actual.y, expected.y, places=9)
+            self.assertAlmostEqual(actual.yaw, expected.yaw, places=9)
+        geometry = result.audit["geometry_preservation"]
+        self.assertFalse(geometry["centerline_snap_applied"])
+        self.assertEqual(geometry["initial_envelope_clamped_count"], 0)
+        self.assertEqual(geometry["final_envelope_clamped_count"], 0)
+        self.assertGreater(geometry["maximum_centerline_offset_m"], 1.0)
+
+    def test_corridor_match_uses_only_minimum_free_space_correction(self) -> None:
+        graph = {
+            "nodes": [
+                {"id": "a", "floor_id": "1", "position_m": [0.0, 0.0]},
+                {"id": "b", "floor_id": "1", "position_m": [8.0, 0.0]},
+            ],
+            "crosses": [{"id": "aisle", "floor_id": "1", "width_m": 0.0}],
+            "edges": [
+                {
+                    "id": "ab",
+                    "floor_id": "1",
+                    "from": "a",
+                    "to": "b",
+                    "cross_ids": ["aisle"],
+                }
+            ],
+        }
+        poses = [
+            Pose(index + 1, float(index), 1.0 + index * 2.0, 2.4, 0.2)
+            for index in range(4)
+        ]
+        shelf = [((0.0, 2.0), (8.0, 2.0), (8.0, 3.0), (0.0, 3.0))]
+        result = match_corridor_route(
+            poses,
+            poses,
+            graph,
+            "1",
+            shelf,
+            maximum_candidates=4,
+            search_radius_m=4.0,
+            obstacle_clearance_m=0.05,
+        )
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result.audit["point_obstacle_penetration_count"], 0)
+        self.assertEqual(result.audit["obstacle_crossing_segment_count"], 0)
+        # Leaving the shelf requires only a short move to the aisle-side edge;
+        # a center-line snap would incorrectly produce y == 0.
+        self.assertTrue(all(1.8 < pose.y < 2.0 for pose in result.poses))
+        self.assertTrue(all(abs(pose.y) > 1.0 for pose in result.poses))
+        self.assertTrue(all(abs(pose.yaw - 0.2) < 1.0e-9 for pose in result.poses))
+        self.assertEqual(
+            result.audit["geometry_preservation"]["point_obstacle_escape"],
+            "corridor_consistent_then_temporal_continuity_repair_v1",
+        )
+
+    def test_exact_manual_anchor_is_spread_continuously_not_snapped_to_road(self) -> None:
+        graph = {
+            "nodes": [
+                {"id": "a", "floor_id": "1", "position_m": [0.0, 0.0]},
+                {"id": "b", "floor_id": "1", "position_m": [8.0, 0.0]},
+            ],
+            "crosses": [{"id": "aisle", "floor_id": "1", "width_m": 4.0}],
+            "edges": [
+                {
+                    "id": "ab",
+                    "floor_id": "1",
+                    "from": "a",
+                    "to": "b",
+                    "cross_ids": ["aisle"],
+                }
+            ],
+        }
+        hints = [
+            Pose(index + 1, float(index), 1.0 + index * 1.5, 0.2, 0.3 + index * 0.1)
+            for index in range(5)
+        ]
+        anchor = RouteAnchor(2, hints[2].x, 0.9, 0.5, "operator-exact")
+        result = match_corridor_route(
+            hints,
+            hints,
+            graph,
+            "1",
+            [],
+            [anchor],
+            maximum_candidates=4,
+            search_radius_m=3.0,
+        )
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertAlmostEqual(result.poses[anchor.index].x, anchor.x, places=9)
+        self.assertAlmostEqual(result.poses[anchor.index].y, anchor.y, places=9)
+        self.assertGreater(abs(result.poses[anchor.index].y), 0.5)
+        self.assertTrue(
+            all(abs(second.y - first.y) < 0.25 for first, second in zip(result.poses, result.poses[1:]))
+        )
+        self.assertEqual(
+            [round(pose.yaw, 9) for pose in result.poses],
+            [round(pose.yaw, 9) for pose in hints],
+        )
+        geometry = result.audit["geometry_preservation"]
+        self.assertFalse(geometry["centerline_snap_applied"])
+        self.assertEqual(geometry["anchor_translation_field"]["anchor_count"], 1)
+        self.assertLess(geometry["maximum_neighbor_correction_change_m"], 0.25)
+
+    def test_corridor_transition_cannot_happen_far_before_finite_junction(self) -> None:
+        graph = {
+            "nodes": [
+                {"id": "west", "floor_id": "1", "position_m": [0.0, 0.0]},
+                {"id": "junction", "floor_id": "1", "position_m": [4.0, 0.0]},
+                {"id": "north", "floor_id": "1", "position_m": [4.0, 4.0]},
+            ],
+            "crosses": [
+                {"id": "horizontal", "floor_id": "1", "width_m": 3.0},
+                {"id": "vertical", "floor_id": "1", "width_m": 3.0},
+            ],
+            "edges": [
+                {
+                    "id": "west-junction",
+                    "floor_id": "1",
+                    "from": "west",
+                    "to": "junction",
+                    "cross_ids": ["horizontal"],
+                },
+                {
+                    "id": "junction-north",
+                    "floor_id": "1",
+                    "from": "junction",
+                    "to": "north",
+                    "cross_ids": ["vertical"],
+                },
+            ],
+        }
+        poses = [
+            Pose(index + 1, float(index), *point, yaw)
+            for index, (point, yaw) in enumerate(
+                [
+                    ((0.5, 0.6), 0.0),
+                    ((1.5, 0.7), 0.0),
+                    ((2.5, 0.5), 0.0),
+                    ((3.5, 0.4), math.pi / 4.0),
+                    ((4.4, 1.0), math.pi / 2.0),
+                    ((4.5, 2.0), math.pi / 2.0),
+                ]
+            )
+        ]
+        result = match_corridor_route(
+            poses,
+            poses,
+            graph,
+            "1",
+            [],
+            maximum_candidates=4,
+            search_radius_m=5.0,
+        )
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(
+            result.audit["edge_ids"][:3],
+            ["west-junction", "west-junction", "west-junction"],
+        )
+        self.assertEqual(
+            result.audit["edge_ids"][-2:],
+            ["junction-north", "junction-north"],
+        )
+        self.assertLessEqual(
+            result.audit["maximum_step_m"],
+            result.audit["maximum_physical_step_m"] + 0.25,
+        )
+        for expected, actual in zip(poses, result.poses):
+            self.assertAlmostEqual(actual.x, expected.x, places=9)
+            self.assertAlmostEqual(actual.y, expected.y, places=9)
+
+    def test_finite_edge_extent_scores_identity_without_moving_free_phone_pose(self) -> None:
+        graph = {
+            "nodes": [
+                {"id": "a", "floor_id": "1", "position_m": [0.0, 0.0]},
+                {"id": "b", "floor_id": "1", "position_m": [4.0, 0.0]},
+            ],
+            "crosses": [{"id": "aisle", "floor_id": "1", "width_m": 3.0}],
+            "edges": [
+                {
+                    "id": "ab",
+                    "floor_id": "1",
+                    "from": "a",
+                    "to": "b",
+                    "cross_ids": ["aisle"],
+                }
+            ],
+        }
+        poses = [
+            Pose(index + 1, float(index), x, 0.5, 0.2)
+            for index, x in enumerate((3.0, 4.5, 6.0, 7.0))
+        ]
+        result = match_corridor_route(
+            poses,
+            poses,
+            graph,
+            "1",
+            [],
+            maximum_candidates=4,
+            search_radius_m=5.0,
+        )
+        self.assertIsNotNone(result)
+        assert result is not None
+        # The finite road endpoint is useful evidence that this edge identity
+        # is becoming implausible.  It is not an instruction to replace the
+        # phone's valid x/y with the endpoint or its apron boundary.
+        self.assertEqual(
+            [(pose.x, pose.y) for pose in result.poses],
+            [(pose.x, pose.y) for pose in poses],
+        )
+        self.assertFalse(
+            result.audit["geometry_preservation"]["centerline_snap_applied"]
+        )
+
+    def test_blocked_segment_is_repaired_by_shelf_driven_rigid_local_field(self) -> None:
+        graph = {
+            "nodes": [
+                {"id": "a", "floor_id": "1", "position_m": [0.0, 0.0]},
+                {"id": "b", "floor_id": "1", "position_m": [8.0, 0.0]},
+            ],
+            "crosses": [{"id": "aisle", "floor_id": "1", "width_m": 0.0}],
+            "edges": [
+                {
+                    "id": "ab",
+                    "floor_id": "1",
+                    "from": "a",
+                    "to": "b",
+                    "cross_ids": ["aisle"],
+                }
+            ],
+        }
+        poses = [
+            Pose(index + 1, float(index), x, 1.8, 0.1)
+            for index, x in enumerate((0.5, 1.5, 3.5, 4.5, 5.5))
+        ]
+        shelf = [((2.3, 1.0), (2.7, 1.0), (2.7, 2.6), (2.3, 2.6))]
+        result = match_corridor_route(
+            poses,
+            poses,
+            graph,
+            "1",
+            shelf,
+            maximum_candidates=4,
+            search_radius_m=5.0,
+            obstacle_clearance_m=0.05,
+        )
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result.audit["point_obstacle_penetration_count"], 0)
+        self.assertEqual(result.audit["obstacle_crossing_segment_count"], 0)
+        repair = result.audit["geometry_preservation"]["segment_collision_repair"]
+        self.assertGreater(repair["rigid_translation_repair_count"], 0)
+        self.assertEqual(repair["anchor_endpoint_escape_count"], 0)
+        # A rigid local field preserves the blocked segment's measured length;
+        # it must not create a one-node detour toward the road center.
+        self.assertLess(result.audit["maximum_step_m"], 2.25)
+        self.assertLess(
+            result.audit["geometry_preservation"][
+                "maximum_neighbor_correction_change_m"
+            ],
+            0.75,
+        )
+        self.assertLessEqual(
+            result.audit["maximum_step_m"],
+            result.audit["maximum_physical_step_m"] + 0.25,
+        )
+
+    def test_free_correction_step_is_spread_without_road_snapping(self) -> None:
+        poses = [
+            Pose(index + 1, float(index), float(index), 0.0, 0.0)
+            for index in range(8)
+        ]
+        reference = [(pose.x, pose.y) for pose in poses]
+        stepped = [
+            (pose.x + (0.0 if index < 4 else 1.0), pose.y)
+            for index, pose in enumerate(poses)
+        ]
+        repaired, audit = _repair_free_correction_gradient_steps(
+            reference,
+            stepped,
+            poses,
+            ObstacleIndex([], clearance_m=0.05),
+            [],
+        )
+        corrections = [
+            (point[0] - source[0], point[1] - source[1])
+            for point, source in zip(repaired, reference)
+        ]
+        changes = [
+            math.hypot(second[0] - first[0], second[1] - first[1])
+            for first, second in zip(corrections, corrections[1:])
+        ]
+        self.assertGreater(audit["repaired_boundary_count"], 0)
+        self.assertLess(max(changes), 0.5)
+        self.assertEqual(repaired[0], stepped[0])
+        self.assertEqual(repaired[-1], stepped[-1])
 
     def test_road_soft_constraints_are_local_bounded_and_direction_aware(self) -> None:
         baseline = [

@@ -4,6 +4,8 @@
 
 本清单记录 TianHong 两份真实会话复盘后，尚不能在当前安全合同内直接发布的增强。已完成的核心修复包括：旧 v2 包只读派生拓扑兼容、显式初始位姿 prior、闭环异常边隔离、PC 道路/结构全局候选图、长期 **alignment basin** 保留、低置信度结果保留和 exact-node 人工绝对锚点。这里必须区分 alignment basin 与 concrete shelf identity：后者的正式跨回环跟踪、相对位姿和输入身份绑定仍未完成。
 
+2026-08-14 已完成的轨迹语义修复：道路中心线不再用于最终坐标重参数化。PC HMM 只选择 corridor identity、有限道路边、真实 junction 和可达顺序；优化手机位姿的局部横向位置、曲线、停顿和回头保留。货架几何负责结构内点/穿架段的最小连续自由空间修正，无法在不穿架条件下消除的修正梯度继续作为低置信度 blocker，而不是重新吸附道路或删除结果。该修复不等于 concrete shelf identity 已解决，也不提供现场绝对精度证明。
+
 整体发布资格仍是 **NO-GO / NOT PRODUCTION READY**。以下任何 diagnostic 结果都不能替代 exact-final-SHA、签名真机、LiDAR、热/内存、Device Lab 或现场控制点验收。
 
 ## P1：把跨窗口结构证据升级为正式输入
@@ -19,7 +21,7 @@
 
 ## 已实现但仍为 diagnostic-only：PC 全轨迹结构—地图联合候选图
 
-- 当前 diagnostic 模块已联合使用：已知起点/初始方向、`Admin.opt_poses` 完整轨迹、三层货架距离场、有界 PC beam、道路中心线距离、相邻窗口行进切线、道路连通最短路径、优化轨迹弧长和 correction-field 梯度。候选预算属于算法参数，不能把某一个预算下的序列唯一性写成普遍业务事实。
+- 当前 diagnostic 模块已联合使用：已知起点/初始方向、`Admin.opt_poses` 完整轨迹、三层货架距离场、有界 PC beam、道路中心线距离（仅 corridor identity/候选评分）、相邻窗口行进切线、道路连通最短路径、优化轨迹弧长和 correction-field 梯度。道路中心线不是手机位置观测，不得作为最终 X/Y/yaw 目标。候选预算属于算法参数，不能把某一个预算下的序列唯一性写成普遍业务事实。
 - 路线/道路证据全部为有上限软代价，不删除候选；独立 runner-up 要求跨窗口达到货架尺度差异，不再把 0.3 m/1° 的同路线网格邻居误报为另一条路线。
 - 真实 Tianhong 复测：
   - 使用与历史对比一致的 `candidate_limit=12` 时，`181158` 最大相邻 correction 总量为 4.080 m，但单位物理行进距离的平移/航向梯度仅为 0.176 m/m 和 1.242°/m，因此应判为长距离累计 gauge 修正连续，而不是手机瞬移；该预算下 `sequence_unique=true`；
