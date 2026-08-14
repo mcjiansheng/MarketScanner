@@ -887,6 +887,35 @@ class MapStudioApiTests(unittest.TestCase):
         self.assertEqual(payload["startup_diagnostics"]["mode"], "development")
         self.assertNotIn("session_token", json.dumps(payload))
 
+    def test_invalid_completed_localized_history_returns_structured_recovery_error(
+        self,
+    ) -> None:
+        output = self.root / "localized-complete-without-current"
+        output.mkdir()
+        job = server.STATE.add("localized", output)
+        server.STATE.set_status(job.identifier, "complete")
+
+        with self.assertRaises(HTTPError) as rejected:
+            self.api(f"/api/jobs/{job.identifier}")
+        self.assertEqual(rejected.exception.code, 409)
+        payload = json.loads(rejected.exception.read())
+        rejected.exception.close()
+        self.assertEqual(
+            payload["code"], "completed_job_artifacts_unavailable"
+        )
+        self.assertEqual(payload["job"]["id"], job.identifier)
+        self.assertEqual(payload["job"]["status"], "complete")
+        self.assertIn("new output directory", payload["recovery_action"])
+
+        # The bad historical record is isolated to this response. It must not
+        # terminate the request thread or make the local service unavailable.
+        about = self.api("/api/about")
+        self.assertEqual(about["product"], "Supermarket Map Studio")
+
+        script, _ = self.fetch("/app.js")
+        self.assertIn(b"completed_job_artifacts_unavailable", script)
+        self.assertIn("原输入和旧结果目录已保留".encode("utf-8"), script)
+
     def test_sensitive_get_requires_auth_and_bootstrap_sets_http_only_cookie(self) -> None:
         with self.assertRaises(HTTPError) as unauthorized:
             urlopen(f"http://127.0.0.1:{self.port}/api/jobs", timeout=10)

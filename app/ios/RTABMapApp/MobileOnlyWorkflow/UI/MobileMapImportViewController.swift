@@ -40,7 +40,12 @@ final class MobileMapImportViewController: UIViewController {
     /// FileProvider initialization stay on the main thread, but no workflow
     /// transition or provider access happens until the operator taps Import.
     func prepareForPresentation() {
-        precondition(Thread.isMainThread)
+        guard Thread.isMainThread else {
+            DispatchQueue.main.async { [weak self] in
+                self?.prepareForPresentation()
+            }
+            return
+        }
         loadViewIfNeeded()
         prepareDocumentPickerIfNeeded()
     }
@@ -229,7 +234,12 @@ final class MobileMapImportViewController: UIViewController {
     }
 
     private func prepareDocumentPickerIfNeeded() {
-        precondition(Thread.isMainThread)
+        guard Thread.isMainThread else {
+            DispatchQueue.main.async { [weak self] in
+                self?.prepareDocumentPickerIfNeeded()
+            }
+            return
+        }
         guard preparedDocumentPicker == nil,
               coordinator.state == .idle,
               presentedViewController == nil else {

@@ -1,10 +1,17 @@
 # Mobile-Only V1 当前状态
 
-> 文档状态：**当前有效**。最后核对日期：2026-08-15（手机性能结果证据已实现并完成主机/无签名 Debug 回归）。
+> 文档状态：**当前有效**。最后核对日期：2026-08-15（山姆现场前稳定性、exact-commit Release 与签名真机安装证据已核对；冷启动受锁屏阻断）。
 
 ## 总体
 
-当前冻结核心基线为 `core-mobile-v1@9a93fbd0ee52944eae5aebedf59ec6a08dedc934`，价签 node-local/publication-gate 前序为 `fix/tag-node-local-publication-gate@15b339dd1e3525157f3f85cf2210f22060887369`；当前独立功能分支为 `feature/mobile-performance-result-evidence`。本轮新增扫描期有界 `performance_samples.jsonl`、metadata 水位、immutable snapshot/Result 绑定、PC strict parser/CSV/summary/trend 和 Map Studio 性能区域。证据覆盖 CPU、物理/可用内存、磁盘、thermal、电池、FPS、RTAB-Map update 与数据库/目录增长；iOS GPU 利用率明确标记 unavailable。性能证据是 observability，不是定位或发布 authority，缺失/损坏只关闭 `performance_qualified`，不删除有限地图、轨迹和价签。当前源码已通过 PriorMap **330/330（374.856 s）**、Qualification **30/30**、Map Studio **141/141**、独立 Swift 主机长方法 **1/1（326.803 s）**、生成合同、Swift/Python/JavaScript 语法、补丁格式和 unsigned generic iphoneos Debug 全量编译/链接；浏览器 1600/1280/980 宽度无横向溢出且控制台无 warning/error。QualifiedDevice Release 继续由 clean tracked tree 与 exact commit identity 强制门控。签名真机 30 分钟/2 小时、热/低磁盘/强杀/crash/MetricKit 延迟投递和现场 LiDAR 未执行，因此发布判断仍为 **NO-GO / NOT PRODUCTION READY**。
+当前冻结核心基线为 `core-mobile-v1@9a93fbd0ee52944eae5aebedf59ec6a08dedc934`，性能证据前序为 `feature/mobile-performance-result-evidence@eb8e71e0e7f60fbcc35bbd7bcad7278c61524604`；当前现场候选分支为 `fix/sam-field-end-to-end-hardening`。本轮在既有有界 `performance_samples.jsonl`、immutable Result 和 PC 趋势分析之上，补齐冷启动 Settings fallback、UIKit/FileProvider 主线程恢复、strict parser/burst/floor 故障注入、ARKit/depth buffer fail-safe、finalization 先停 producer 后 drain writer，以及 Map Studio 坏历史 complete 任务的结构化恢复。生产 Swift 源码排除供应商库后不含显式进程终止原语。当前源码已通过 PriorMap **330/330（382.204 s）**、Qualification **30/30（11.140 s）**、Map Studio **142/142（10.017 s）**、native **7884/0**、Swift/Python/JavaScript 语法、补丁格式、unsigned generic iphoneos Debug、clean exact-commit macOS Release 和 QualifiedDevice Release 全量编译/链接；PC/App identity 精确绑定候选提交。30 万 finalization、172.8 万 trace、40 万 tag evidence 的峰值 RSS 分别为 13,205,504、59,129,856、746,455,040 bytes。浏览器受认证启动、四模式切换和 1600/1280/980 无溢出检查 PASS。已配对 iPhone 17 Pro Max（iOS 26.5.2）完成签名 Release、签名验证和安装；设备锁屏使自动冷启动失败，因此不能声明 device smoke PASS。真机 30 分钟/2 小时、热/低磁盘/强杀/crash/MetricKit 延迟投递、Files Provider 和现场 LiDAR 未执行，发布判断仍为 **NO-GO / NOT PRODUCTION READY**。
+
+## 2026-08-15 山姆现场前稳定性加固
+
+- 冷启动缺失/损坏设置不再强制解包；程序化 UI coder、地图导入/选择的错误线程调用、worker 数量错误和 workflow rollback 均有可恢复路径。recovery/trace/tag/canonical parser 的坏类型或空集合返回严格错误，不调用 `fatalError`/`precondition`/`as!`。
+- ARKit captured/depth/confidence pixel buffer 只有在 lock/base address 成功后提交；缺失深度和聚类不足返回 unavailable。未知 floor 的人工重定位不改变扫描，空 complete burst 记录 required-evidence failure。
+- Stop 在关闭新 admission 后立即暂停 ARSession、native mapping 和 camera，再等待已登记 writer、保存数据库和提交 metadata。早期路径错误恢复同一连续扫描，terminal commit 后 native host 丢失只写 warning。
+- Map Studio 对坏的历史 complete localized task 返回结构化可恢复错误；Web 保留原输入/旧结果并继续可用。主机验证不能证明真机不会被 iOS watchdog、驱动、内存压力或现场传感器条件终止。
 
 下列按日期记录的段落是对应增量当时的历史证据；若测试数字或分支与上段冲突，以上述 2026-08-15 当前状态和当前源码为准。
 

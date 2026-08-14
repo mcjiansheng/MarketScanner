@@ -362,12 +362,15 @@ enum TagObservationEvidenceParser {
                     reject(&audit, line.number, failure.reason, counter)
                     return
                 }
-                if seenObservationIDs != nil,
-                   !seenObservationIDs!.insert(dto.observationID).inserted {
+                if var seen = seenObservationIDs {
+                    let inserted = seen.insert(dto.observationID).inserted
+                    seenObservationIDs = seen
+                    guard inserted else {
                     reject(
                         &audit, line.number, "duplicate_observation_id",
                         \.recordDuplicateRejected)
                     return
+                    }
                 }
                 let binding: (node: AbsolutePriorEvidenceNode,
                     delta: Double, secondDelta: Double)

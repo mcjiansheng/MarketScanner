@@ -42,7 +42,24 @@ final class PriceTagCapturePreviewView: MTKView, MTKViewDelegate {
     }
 
     required init(coder: NSCoder) {
-        fatalError("init(coder:) has not been implemented")
+        let metalDevice = MTLCreateSystemDefaultDevice()
+        commandQueue = metalDevice?.makeCommandQueue()
+        ciContext = metalDevice.map {
+            CIContext(mtlDevice: $0, options: [
+                .cacheIntermediates: false,
+            ])
+        }
+        super.init(coder: coder)
+        device = metalDevice
+        framebufferOnly = false
+        enableSetNeedsDisplay = true
+        isPaused = true
+        autoResizeDrawable = true
+        clearColor = MTLClearColorMake(0, 0, 0, 1)
+        contentMode = .redraw
+        delegate = self
+        accessibilityLabel = NSLocalizedString(
+            "ESL camera preview", comment: "")
     }
 
     func enqueue(
@@ -234,7 +251,7 @@ final class PriceTagCaptureOverlayView: UIView {
     }
 
     required init?(coder: NSCoder) {
-        fatalError("init(coder:) has not been implemented")
+        return nil
     }
 
     override func layoutSubviews() {
@@ -337,7 +354,7 @@ final class PriceTagShelfMiniMapView: UIView {
     }
 
     required init?(coder: NSCoder) {
-        fatalError("init(coder:) has not been implemented")
+        return nil
     }
 
     override func draw(_ rect: CGRect) {
@@ -423,7 +440,7 @@ final class PriceTagShelfConfirmationViewController: UIViewController {
     }
 
     required init?(coder: NSCoder) {
-        fatalError("init(coder:) has not been implemented")
+        return nil
     }
 
     override func viewDidLoad() {

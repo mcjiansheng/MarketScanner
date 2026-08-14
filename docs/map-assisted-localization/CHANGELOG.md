@@ -2,6 +2,14 @@
 
 > 文档状态：**当前有效**。最后核对日期：2026-08-15。
 
+## 2026-08-15 — 山姆现场前端到端稳定性加固
+
+- 冷启动 Settings 读取不再强制解包；缺失或损坏值使用保守 fallback 并写诊断。生产 Swift 源码（排除供应商 `Libraries/`）清除显式 `fatalError`、`precondition`、`preconditionFailure` 和 `as!`，程序化 UIKit coder、地图导入主线程边界、worker 数量错误、人工定位提交失败和 workflow rollback 都改为可恢复路径。
+- recovery lifecycle、strict trace、tag observation/burst 和 canonical JSON 边界移除强制转换/解包。空 complete burst 写入 sticky required-evidence failure；unknown floor 人工重定位不改变扫描；ARKit captured/depth/confidence buffer lock 或 base address 失败时只丢弃对应 frame/证据，深度聚类不足返回 unavailable。
+- finalization 改为先关闭写入 admission并停止 ARSession/native mapping/camera producer，再 drain prior-map/localization transaction、flush clock、保存数据库和封口 sidecar，避免 producer 在 writer 关闭后继续创建节点。路径解析早期失败会结束 finalization 并恢复同一连续扫描；封口提交后 native host 缺失只记录警告并释放 session。
+- Map Studio 对“历史任务 complete 但 localized current 不可验证”返回 `completed_job_artifacts_unavailable` 结构化 409。Web 恢复逻辑保留原输入/旧结果、禁用打开输出并保持工作台可用，不再因未捕获 `LocalizedStoreError` 断开请求。
+- 当前证据：PriorMap **330/330（382.204 s）**、Qualification **30/30（11.140 s）**、Map Studio **142/142（10.017 s）**、native **7884/0**、unsigned generic iphoneos Debug、clean exact-commit macOS Release/QualifiedDevice Release、Swift parse、JavaScript/Python syntax 与 patch check PASS；`rtabmap-reprocess --version` 和 App bundle identity 精确绑定同一候选提交。规模回归处理 300,000 条 finalization（峰值 13,205,504 bytes）、1,728,000 条 trace（保留 172,801，峰值 59,129,856 bytes）和 400,000 条 tag evidence（接受 200,000，峰值 746,455,040 bytes）。浏览器受认证启动、四模式切换和 1600/1280/980 响应式检查 PASS。已配对 iPhone 17 Pro Max 完成 Apple Development 签名 Release 构建、签名验证和安装；冷启动因设备锁屏被系统拒绝，因此运行、相机、LiDAR、start/stop/finalize/export、Files Provider、热/低磁盘/内存压力、异常退出和山姆路线仍未资格化，整体保持 **NO-GO / NOT PRODUCTION READY**。
+
 ## 2026-08-15 — 手机性能时间线、不可变结果证据与 PC 趋势分析
 
 - iOS 连续扫描新增有界 `performance_samples.jsonl`：正常扫描约每 5 秒记录一次，数据库保存完成后再记录一条 `scan_state=finalizing` 终止样本。样本使用连续 sequence、严格递增 Unix 时间和 exact tracking-session identity，覆盖进程 CPU 时间与区间占用率、`phys_footprint`、进程可用内存、磁盘、电池/充电、thermal、FPS、RTAB-Map update time、节点数以及数据库/会话目录增长。CPU 百分比按相邻样本的进程 CPU 时间差除以 uptime 差计算，多核时可超过 100%。

@@ -1946,6 +1946,17 @@ func runESLBarcodeCaptureFocusedTests() {
     // start on the sole spare lane before A returns; two simultaneous hangs
     // must exhaust the fixed pool instead of queuing or creating worker C.
     do {
+        let clampedExecutor = PriceTagVisionWorkerExecutor(
+            maximumWorkers: 0,
+            labelPrefix: "marketscanner.tests.price-tag-vision-clamped")
+        require(
+            clampedExecutor.snapshot()
+                == PriceTagVisionWorkerExecutorSnapshot(
+                    availableWorkers: 1,
+                    activeWorkers: 0,
+                    quarantinedWorkers: 0),
+            "a non-positive worker configuration must clamp to one bounded lane")
+
         let executor = PriceTagVisionWorkerExecutor(
             maximumWorkers: 2,
             labelPrefix: "marketscanner.tests.price-tag-vision")
@@ -3505,6 +3516,9 @@ if CommandLine.arguments.count == 2,
         }
 
         let nodes = [AbsolutePriorEvidenceNode(nodeID: 1, stamp: 1000)]
+        require(
+            TagObservationBurstEvidenceParser.recomputeSummary([]) == nil,
+            "an empty burst summary must fail closed without terminating")
         let bursts = try TagObservationBurstEvidenceParser.parse(
             snapshotDirectory: directory,
             nodes: nodes,
@@ -4122,6 +4136,20 @@ try requireRecoveryRejected(
     { $0["automatic_trigger_count"] = 1 },
     reason: "recovery_business_schema_invalid",
     "trigger classification sums must reconcile")
+try requireRecoveryRejected(
+    { $0["reason"] = 42 },
+    reason: "recovery_business_schema_invalid",
+    "a non-string episode reason must fail closed without terminating")
+try requireRecoveryRejected(
+    { $0["last_trigger_reason"] = ["bad"] },
+    reason: "recovery_business_schema_invalid",
+    "a non-string trigger summary must fail closed without terminating")
+try requireRecoveryRejected(
+    { $0["trigger_records"] = [
+        ["reason": false, "automatic": false, "at_uptime": 10.0],
+    ] },
+    reason: "recovery_trigger_records_invalid",
+    "a non-string trigger record reason must fail closed without terminating")
 try requireRecoveryRejected(
     { $0["injected_unknown_field"] = true },
     reason: "recovery_unknown_field",

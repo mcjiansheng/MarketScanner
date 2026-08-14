@@ -708,6 +708,35 @@ class MobileScanUXContractTests(unittest.TestCase):
             "app/ios/RTABMapApp/MobileOnlyWorkflow/"
             "MobileProcessingPipeline.swift"
         )
+        recovery_parser = self.source(
+            "app/ios/RTABMapApp/RecoveryLifecycleEvidenceParser.swift"
+        )
+        session = self.source(
+            "app/ios/RTABMapApp/SupermarketScanSession.swift"
+        )
+        burst_parser = self.source(
+            "app/ios/RTABMapApp/MobilePostProcessing/"
+            "TagObservationBurstEvidenceParser.swift"
+        )
+        prior_map = self.source(
+            "app/ios/RTABMapApp/PriorMapLocalization.swift"
+        )
+        capture_ui = self.source(
+            "app/ios/RTABMapApp/PriceTagCaptureUI.swift"
+        )
+        library_ui = self.source(
+            "app/ios/RTABMapApp/MobileOnlyWorkflow/UI/"
+            "MobileMapLibraryViewController.swift"
+        )
+        setup_ui = self.source(
+            "app/ios/RTABMapApp/MobileOnlyWorkflow/UI/"
+            "MobileScanSetupViewController.swift"
+        )
+        native_bridge = self.source("app/ios/RTABMapApp/RTABMap.swift")
+        import_coordinator = self.source(
+            "app/ios/RTABMapApp/MobileMapImport/"
+            "MapSourceImportCoordinator.swift"
+        )
 
         location_start = host.index(
             "func locationManager(_ manager: CLLocationManager, "
@@ -759,6 +788,139 @@ class MobileScanUXContractTests(unittest.TestCase):
             processing_pipeline,
         )
         self.assertNotIn('($0["id"] as! String, $0)', processing_pipeline)
+
+        self.assertNotIn("as! String", recovery_parser)
+        self.assertNotIn("precondition(!frameSamples.isEmpty)", session)
+        self.assertIn("guard !frameSamples.isEmpty else { return nil }", session)
+        self.assertNotIn("precondition(!frames.isEmpty)", burst_parser)
+        self.assertIn("static func recomputeSummary", burst_parser)
+        self.assertIn(")? {", burst_parser)
+
+        self.assertNotIn("precondition(commitManualPosition", prior_map)
+        self.assertIn("guard commitManualPosition(candidate) else", prior_map)
+        self.assertIn("guard let floor = package.manifest.floors.first", prior_map)
+        for shipping_ui in (prior_map, capture_ui, library_ui, setup_ui):
+            self.assertNotIn("fatalError(\"init(coder:)", shipping_ui)
+        self.assertNotIn(
+            "fatalError(\"MobileMapLibraryViewController is programmatic\")",
+            library_ui,
+        )
+        self.assertNotIn(
+            "fatalError(\"MobileScanSetupViewController is programmatic\")",
+            setup_ui,
+        )
+
+        rollback_start = host.index(
+            "private func rollbackMobileOnlyScanStart("
+        )
+        rollback_end = host.index(
+            "private func persistScanConfiguration", rollback_start
+        )
+        rollback = host[rollback_start:rollback_end]
+        self.assertNotIn("precondition(Thread.isMainThread)", rollback)
+        self.assertIn("DispatchQueue.main.async", rollback)
+
+        defaults_start = host.index("func updateDisplayFromDefaults()")
+        defaults_end = host.index("func resumeScan()", defaults_start)
+        defaults_flow = host[defaults_start:defaults_end]
+        self.assertIn("guard let nativeHost = rtabmap", defaults_flow)
+        self.assertIn("func stringSetting(", defaults_flow)
+        self.assertNotIn("defaults.string(forKey:", defaults_flow.replace(
+            "defaults.string(forKey: key)", ""
+        ))
+        self.assertNotIn("rtabmap!", defaults_flow)
+        self.assertIn('fallback: "400"', defaults_flow)
+        self.assertIn('fallback: "25"', defaults_flow)
+        self.assertIn('fallback: "2"', defaults_flow)
+        self.assertIn('fallback: "6"', defaults_flow)
+
+        state_start = host.index("func updateState(state: State)")
+        state_end = host.index("func exportMesh(isOBJ: Bool)", state_start)
+        state_flow = host[state_start:state_end]
+        self.assertNotIn(
+            'string(forKey: "ExportPointCloudFormat")!', state_flow
+        )
+        self.assertIn('?? "ply"', state_flow)
+
+        stats_start = host.index("func statsUpdated(")
+        stats_end = host.index("func cameraInfoEventReceived", stats_start)
+        stats_flow = host[stats_start:stats_end]
+        self.assertNotIn("statusLabel.text!", stats_flow)
+        self.assertNotIn("mLastKnownLocation!", stats_flow)
+        self.assertNotIn("mLastLightEstimate!", stats_flow)
+
+        scan_start = host.index("func newScan(")
+        scan_start_end = host.index(
+            "private func applyStreamingMappingSettings", scan_start
+        )
+        scan_start_flow = host[scan_start:scan_start_end]
+        self.assertIn("guard let nativeHost = rtabmap", scan_start_flow)
+        self.assertNotIn("self.rtabmap!", scan_start_flow)
+
+        callbacks_start = native_bridge.index("func setupCallbacksWithCPP()")
+        callbacks_end = native_bridge.index("deinit {", callbacks_start)
+        callbacks = native_bridge[callbacks_start:callbacks_end]
+        for forced_pointer in ("observer!", "msg!", "key!", "value!"):
+            self.assertNotIn(forced_pointer, callbacks)
+        self.assertIn("guard let observer, let msg else", callbacks)
+        self.assertIn("guard let observer, let key, let value else", callbacks)
+        odometry_start = native_bridge.index("func postOdometryEvent(")
+        odometry_end = native_bridge.index(
+            "// Parameters", odometry_start
+        )
+        odometry = native_bridge[odometry_start:odometry_end]
+        self.assertIn(
+            "CVPixelBufferGetPlaneCount(frame.capturedImage) >= 2",
+            odometry,
+        )
+        self.assertIn("let capturedYPlane", odometry)
+        self.assertIn("let capturedUVPlane", odometry)
+
+        self.assertNotIn(
+            "rawBuffer.bindMemory(to: UInt8.self).baseAddress!",
+            import_coordinator,
+        )
+
+        finalization_start = host.index("private func finalizeStreamingScan(")
+        finalization_end = host.index(
+            "private func copyCaptureInBackground", finalization_start
+        )
+        finalization = host[finalization_start:finalization_end]
+        self.assertNotIn("self.rtabmap!", finalization)
+        self.assertIn("native_host_unavailable_after_finalization", finalization)
+        self.assertLess(
+            finalization.index("session.pause()"),
+            finalization.index("let priorMapDrain"),
+        )
+        self.assertLess(
+            finalization.index("rtabmap?.stopCamera()"),
+            finalization.index("waitForFinalizationTransactionDrain"),
+        )
+        self.assertGreaterEqual(
+            finalization.count(
+                "setPausedMapping(\n                    paused: false,\n"
+                "                    triggerNewMap: false)"
+            ),
+            1,
+        )
+
+        shipping_root = ROOT / "app/ios/RTABMapApp"
+        forbidden_process_terminators = (
+            "fatalError(",
+            "preconditionFailure(",
+            "precondition(",
+            "as!",
+        )
+        for swift_file in shipping_root.rglob("*.swift"):
+            if "Libraries" in swift_file.relative_to(shipping_root).parts:
+                continue
+            shipping_source = swift_file.read_text(encoding="utf-8")
+            for forbidden in forbidden_process_terminators:
+                self.assertNotIn(
+                    forbidden,
+                    shipping_source,
+                    f"{swift_file.relative_to(ROOT)} contains {forbidden}",
+                )
 
 
 if __name__ == "__main__":

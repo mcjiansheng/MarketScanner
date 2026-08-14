@@ -532,9 +532,13 @@ final class PriceTagVisionWorkerExecutor {
         maximumWorkers: Int = 2,
         labelPrefix: String = "com.introlab.rtabmap.price-tag-vision"
     ) {
-        precondition(maximumWorkers > 0)
-        states = Array(repeating: .available, count: maximumWorkers)
-        queues = (0..<maximumWorkers).map { index in
+        // A configuration or test harness mistake must fail bounded and
+        // usable, not terminate the scanning process. One worker preserves
+        // the executor's back-pressure semantics without creating an
+        // unbounded replacement pool.
+        let workerCount = max(1, maximumWorkers)
+        states = Array(repeating: .available, count: workerCount)
+        queues = (0..<workerCount).map { index in
             DispatchQueue(
                 label: "\(labelPrefix).worker-\(index)",
                 qos: .userInitiated)
@@ -1077,9 +1081,13 @@ enum PriceTagCaptureResolver {
         for frame in frames {
             for candidate in frame.candidates {
                 let identity = candidate.shelfSegmentId + "\u{0}" + candidate.side
-                if candidatesByIdentity[identity] == nil
-                    || candidate.associationConfidence
-                        > candidatesByIdentity[identity]!.associationConfidence {
+                if let existing = candidatesByIdentity[identity] {
+                    if candidate.associationConfidence
+                        > existing.associationConfidence {
+                        candidatesByIdentity[identity] = candidate
+                    }
+                }
+                else {
                     candidatesByIdentity[identity] = candidate
                 }
             }

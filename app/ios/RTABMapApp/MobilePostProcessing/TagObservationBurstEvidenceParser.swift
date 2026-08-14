@@ -577,7 +577,11 @@ enum TagObservationBurstEvidenceParser {
                 }
                 let declaredNodeMin = Int64(declaredNodeMinValue)
                 let declaredNodeMax = Int64(declaredNodeMaxValue)
-                let recomputed = recomputeSummary(parsedFrames)
+                guard let recomputed = recomputeSummary(parsedFrames) else {
+                    retainDegraded(
+                        "frame_count_or_frames_invalid", \.recordSchemaRejected)
+                    return
+                }
                 guard declaredCount == recomputed.count,
                       approximatelyEqual(declaredFirst, recomputed.firstFrameTimestamp),
                       approximatelyEqual(declaredLast, recomputed.lastFrameTimestamp),
@@ -662,14 +666,19 @@ enum TagObservationBurstEvidenceParser {
         view: String,
         tracking: String,
         confidenceMean: Double
-    ) {
-        precondition(!frames.isEmpty)
+    )? {
+        guard let firstFrameTimestamp = frames.map(\.frameTimestamp).min(),
+              let lastFrameTimestamp = frames.map(\.frameTimestamp).max(),
+              let boundNodeIDMin = frames.map(\.boundNodeId).min(),
+              let boundNodeIDMax = frames.map(\.boundNodeId).max() else {
+            return nil
+        }
         return (
             count: frames.count,
-            firstFrameTimestamp: frames.map(\.frameTimestamp).min()!,
-            lastFrameTimestamp: frames.map(\.frameTimestamp).max()!,
-            boundNodeIDMin: frames.map(\.boundNodeId).min()!,
-            boundNodeIDMax: frames.map(\.boundNodeId).max()!,
+            firstFrameTimestamp: firstFrameTimestamp,
+            lastFrameTimestamp: lastFrameTimestamp,
+            boundNodeIDMin: boundNodeIDMin,
+            boundNodeIDMax: boundNodeIDMax,
             depthQuality: frames.reduce(0) { $0 + $1.depth } / Double(frames.count),
             view: dominantVote(frames.map(\.view)),
             tracking: dominantVote(frames.map(\.tracking)),

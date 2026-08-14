@@ -506,12 +506,19 @@ private struct PendingTagBurst {
             return "unknown"
         }
         let winners = counts.filter { $0.value == maximum }
-        return winners.count == 1 ? winners.first!.key : "unknown"
+        guard winners.count == 1, let winner = winners.first else {
+            return "unknown"
+        }
+        return winner.key
     }
 
-    func record(complete: Bool) -> TagObservationBurstRecord {
-        precondition(!frameSamples.isEmpty)
+    func record(complete: Bool) -> TagObservationBurstRecord? {
+        guard !frameSamples.isEmpty else { return nil }
         let boundNodeIDs = frameSamples.map(\.boundNodeId)
+        guard let minimumBoundNodeID = boundNodeIDs.min(),
+              let maximumBoundNodeID = boundNodeIDs.max() else {
+            return nil
+        }
         return TagObservationBurstRecord(
             format: "MarketScannerPriceTagBurst",
             version: 2,
@@ -525,8 +532,8 @@ private struct PendingTagBurst {
             frameCount: frameCount,
             firstFrameTimestamp: firstFrameTimestamp,
             lastFrameTimestamp: lastFrameTimestamp,
-            boundNodeIdMin: boundNodeIDs.min()!,
-            boundNodeIdMax: boundNodeIDs.max()!,
+            boundNodeIdMin: minimumBoundNodeID,
+            boundNodeIdMax: maximumBoundNodeID,
             depthQuality: depthQuality(),
             viewAngle: dominantViewAngle(),
             trackingQuality: dominantLocalizationState(),
@@ -1130,7 +1137,16 @@ final class SupermarketScanSession {
 
     func currentSegmentDirectory() throws -> URL {
         try startNewSessionIfNeeded()
-        let dir = rootDirectory!.appendingPathComponent(String(format: "segment_%04d", segmentIndex), isDirectory: true)
+        guard let rootDirectory else {
+            throw NSError(
+                domain: "SupermarketScanSession",
+                code: 60,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "The scan session directory was not created."])
+        }
+        let dir = rootDirectory.appendingPathComponent(
+            String(format: "segment_%04d", segmentIndex),
+            isDirectory: true)
         try fileManager.createDirectory(at: dir, withIntermediateDirectories: true)
         return dir
     }
@@ -2669,15 +2685,16 @@ final class SupermarketScanSession {
             fileName: "tag_observations.jsonl",
             expectedTrackingSessionId: bound.trackingSessionId)
         if !result.succeeded {
+            let failureReason = result.errorReason ?? "write_failed"
             let failures = [
-                "tag_observations.jsonl": result.errorReason ?? "write_failed"
+                "tag_observations.jsonl": failureReason
             ]
             recordLocalizationEvidenceFailures(failures)
             appendScanEvent(
                 level: "error",
                 event: "tag_observation_write_failed",
                 message: "Required price-tag observation evidence was not persisted",
-                fields: ["reason": failures["tag_observations.jsonl"]!])
+                fields: ["reason": failureReason])
             return nil
         }
         // V1R4 §13.1: only observations durably persisted to the main
@@ -2801,7 +2818,10 @@ final class SupermarketScanSession {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
         do {
-            let record = pending.record(complete: true)
+            guard let record = pending.record(complete: true) else {
+                recordTagBurstWriteFailure("empty_complete_burst")
+                return nil
+            }
             var data = try encoder.encode(record)
             data.append(0x0A)
             sidecarWriteLock.lock()
@@ -3258,9 +3278,10 @@ final class SupermarketScanSession {
             captureLock.unlock()
         }
         if !result.succeeded {
+            let failureReason = result.errorReason ?? "write_failed"
             let failures = [
                 PriorMapRecoveryLifecycleRecord.fileName:
-                    result.errorReason ?? "write_failed"
+                    failureReason
             ]
             recordLocalizationEvidenceFailures(failures)
             appendScanEvent(
@@ -3268,8 +3289,7 @@ final class SupermarketScanSession {
                 event: "recovery_lifecycle_event_write_failed",
                 message: "Required recovery lifecycle evidence was not persisted",
                 fields: [
-                    "reason":
-                        failures[PriorMapRecoveryLifecycleRecord.fileName]!,
+                    "reason": failureReason,
                 ])
         }
         return result.succeeded

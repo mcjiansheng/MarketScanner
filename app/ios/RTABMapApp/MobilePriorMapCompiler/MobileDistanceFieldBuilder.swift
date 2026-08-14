@@ -125,9 +125,18 @@ enum MobileDistanceFieldBuilder {
                   let coordinates = geometry["coordinates"] as? [[Double]],
                   coordinates.count >= 2
             else { continue }
-            var points = coordinates
-            if points.first != points.last {
-                points.append(points.first!)
+            let validatedPoints = coordinates.compactMap { point -> [Double]? in
+                guard point.count >= 2,
+                      point[0].isFinite,
+                      point[1].isFinite else {
+                    return nil
+                }
+                return [point[0], point[1]]
+            }
+            guard validatedPoints.count == coordinates.count else { continue }
+            var points = validatedPoints
+            if let first = points.first, first != points.last {
+                points.append(first)
             }
             var floorSegments = result[element.floorId] ?? []
             for index in 0..<(points.count - 1) {
@@ -194,9 +203,10 @@ enum MobileDistanceFieldBuilder {
                 let value = min(truncationCm, Int((meters * 100.0).rounded()))
                 if previous == nil || value == previous {
                     count += 1
-                } else {
+                }
+                else if let previous {
                     encoded.append(count)
-                    encoded.append(previous!)
+                    encoded.append(previous)
                     count = 1
                 }
                 previous = value

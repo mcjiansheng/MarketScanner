@@ -38,31 +38,52 @@ enum CanonicalJSONEncoder {
         // explicitly last.
         let dynamicType = type(of: value)
         if dynamicType == Bool.self {
-            output.append(Data(((value as! Bool) ? "true" : "false").utf8))
+            guard let boolean = value as? Bool else {
+                throw CanonicalJSONError.unsupportedValue(dynamicType)
+            }
+            output.append(Data((boolean ? "true" : "false").utf8))
             return
         }
         if dynamicType == Int.self {
-            output.append(Data(String(value as! Int).utf8))
+            guard let integer = value as? Int else {
+                throw CanonicalJSONError.unsupportedValue(dynamicType)
+            }
+            output.append(Data(String(integer).utf8))
             return
         }
         if dynamicType == Int64.self {
-            output.append(Data(String(value as! Int64).utf8))
+            guard let integer = value as? Int64 else {
+                throw CanonicalJSONError.unsupportedValue(dynamicType)
+            }
+            output.append(Data(String(integer).utf8))
             return
         }
         if dynamicType == UInt.self {
-            output.append(Data(String(value as! UInt).utf8))
+            guard let integer = value as? UInt else {
+                throw CanonicalJSONError.unsupportedValue(dynamicType)
+            }
+            output.append(Data(String(integer).utf8))
             return
         }
         if dynamicType == UInt64.self {
-            output.append(Data(String(value as! UInt64).utf8))
+            guard let integer = value as? UInt64 else {
+                throw CanonicalJSONError.unsupportedValue(dynamicType)
+            }
+            output.append(Data(String(integer).utf8))
             return
         }
         if dynamicType == Double.self {
-            try writeFiniteNumber(value as! Double, into: &output)
+            guard let number = value as? Double else {
+                throw CanonicalJSONError.unsupportedValue(dynamicType)
+            }
+            try writeFiniteNumber(number, into: &output)
             return
         }
         if dynamicType == Float.self {
-            try writeFiniteNumber(Double(value as! Float), into: &output)
+            guard let number = value as? Float else {
+                throw CanonicalJSONError.unsupportedValue(dynamicType)
+            }
+            try writeFiniteNumber(Double(number), into: &output)
             return
         }
         if let text = value as? String {

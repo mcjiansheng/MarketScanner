@@ -562,7 +562,14 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         receipt: MobileScanStartReceipt?,
         reason: String
     ) {
-        precondition(Thread.isMainThread)
+        guard Thread.isMainThread else {
+            DispatchQueue.main.async { [weak self] in
+                self?.rollbackMobileOnlyScanStart(
+                    receipt: receipt,
+                    reason: reason)
+            }
+            return
+        }
         cancelAutomaticCaptureResume()
         stopMapping(ignoreSaving: true)
         _ = stopClockCorrelationRecording(flush: false)
@@ -1079,13 +1086,12 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
             self.statusLabel.text = ""
             if self.statusShown {
                 self.statusLabel.text =
-                    self.statusLabel.text! +
                     String(format: self.localized("Status: %@\n"), self.getStateString(state: self.mState)) +
                     String(format: self.localized("RAM Usage (MB): %d / %d"), usedMem, self.mMaximumMemory) +
                     String(format: self.localized("\nScan Storage: %@"), self.formattedStorageSize(scanStorageBytes)) +
                     String(format: self.localized("\nScanned Area: %.1f m2"), estimatedArea)
                 if let structureCoverage = structureCoverage {
-                    self.statusLabel.text = self.statusLabel.text! +
+                    self.statusLabel.text = (self.statusLabel.text ?? "") +
                         String(
                             format: self.localized("\nStructure coverage: %d stable / %d multi-view (%d%%)"),
                             structureCoverage.stableStructureCellCount,
@@ -1094,25 +1100,25 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                 }
             }
             if self.debugShown {
-                self.statusLabel.text =
-                    self.statusLabel.text! + "\n"
+                self.statusLabel.text = (self.statusLabel.text ?? "") + "\n"
                 var gpsString = "\n"
                 if(UserDefaults.standard.bool(forKey: "SaveGPS"))
                 {
-                    if(self.mLastKnownLocation != nil)
+                    if let lastKnownLocation = self.mLastKnownLocation
                     {
-                        let secondsOld = (Date().timeIntervalSince1970 - self.mLastKnownLocation!.timestamp.timeIntervalSince1970)
+                        let secondsOld = Date().timeIntervalSince1970
+                            - lastKnownLocation.timestamp.timeIntervalSince1970
                         var bearing = 0.0
-                        if(self.mLastKnownLocation!.course > 0.0) {
-                            bearing = self.mLastKnownLocation!.course
+                        if lastKnownLocation.course > 0.0 {
+                            bearing = lastKnownLocation.course
                             
                         }
                         gpsString = String(format: "GPS: %.2f %.2f %.2fm %ddeg %.0fm [%d sec old]\n",
-                                           self.mLastKnownLocation!.coordinate.longitude,
-                                           self.mLastKnownLocation!.coordinate.latitude,
-                                           self.mLastKnownLocation!.altitude,
+                                           lastKnownLocation.coordinate.longitude,
+                                           lastKnownLocation.coordinate.latitude,
+                                           lastKnownLocation.altitude,
                                            Int(bearing),
-                                           self.mLastKnownLocation!.horizontalAccuracy,
+                                           lastKnownLocation.horizontalAccuracy,
                                            Int(secondsOld));
                     }
                     else
@@ -1121,13 +1127,13 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                     }
                 }
                 var lightString = "\n"
-                if(self.mLastLightEstimate != nil)
+                if let lastLightEstimate = self.mLastLightEstimate
                 {
-                    lightString = String("Light (lm): \(Int(self.mLastLightEstimate!))\n")
+                    lightString = String("Light (lm): \(Int(lastLightEstimate))\n")
                 }
                 
                 self.statusLabel.text =
-                    self.statusLabel.text! +
+                    (self.statusLabel.text ?? "") +
                     gpsString + //gps
                     lightString + //env sensors
                     "Time: \(formattedDate)\n" +
@@ -1444,7 +1450,7 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
     func setGLCamera(type: Int)
     {
         cameraMode = type
-        rtabmap!.setCamera(type: type);
+        rtabmap?.setCamera(type: type);
     }
     
     @discardableResult
@@ -1719,7 +1725,8 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         // Update menus based on current state
         
         if(!exportOBJPLYButton.isHidden) {
-            let format = UserDefaults.standard.string(forKey: "ExportPointCloudFormat")!;
+            let format = UserDefaults.standard.string(
+                forKey: "ExportPointCloudFormat") ?? "ply"
             var title = "Export "
             if (self.visualizationType == 2) {
                 title += "OBJ";
@@ -1807,12 +1814,12 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         let measuringMenu = UIMenu(title: localized("Measuring..."), image: UIImage(systemName: "ruler"), children: [
             UIAction(title: localized("Plane to Plane Mode"), image: measuringMode == 0 ? UIImage(systemName: "checkmark.circle") : UIImage(systemName: "circle"), handler: { _ in
                 self.measuringMode = 0
-                self.rtabmap!.setMeasuringMode(self.measuringMode)
+                self.rtabmap?.setMeasuringMode(self.measuringMode)
                 self.resetNoTouchTimer(true)
             }),
             UIAction(title: localized("Point to Point Mode"), image: measuringMode == 2 ? UIImage(systemName: "checkmark.circle") : UIImage(systemName: "circle"), handler: { _ in
                 self.measuringMode = 2
-                self.rtabmap!.setMeasuringMode(self.measuringMode)
+                self.rtabmap?.setMeasuringMode(self.measuringMode)
                 self.resetNoTouchTimer(true)
             }),
             UIAction(title: localized("Clear All Measures"), image: UIImage(systemName: "trash"), state: .off, handler: { _ in
@@ -1897,22 +1904,22 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
             }),
             UIAction(title: localized("Odom Visible"), image: odomShown ? UIImage(systemName: "checkmark.circle") : UIImage(systemName: "circle"), attributes: (self.mState == .STATE_MAPPING || self.mState == .STATE_CAMERA || self.mState == .STATE_VISUALIZING_CAMERA || self.mState == .STATE_VISUALIZING_AND_MEASURING) ? [] : .disabled, handler: { _ in
                 self.odomShown = !self.odomShown
-                self.rtabmap!.setOdomCloudShown(shown: self.odomShown)
+                self.rtabmap?.setOdomCloudShown(shown: self.odomShown)
                 self.resetNoTouchTimer(true)
             }),
             UIAction(title: localized("Graph Visible"), image: graphShown ? UIImage(systemName: "checkmark.circle") : UIImage(systemName: "circle"), attributes: (self.mState == .STATE_MAPPING || self.mState == .STATE_CAMERA || self.mState == .STATE_IDLE) ? [] : .disabled, handler: { _ in
                 self.graphShown = !self.graphShown
-                self.rtabmap!.setGraphVisible(visible: self.graphShown)
+                self.rtabmap?.setGraphVisible(visible: self.graphShown)
                 self.resetNoTouchTimer(true)
             }),
             UIAction(title: localized("Grid Visible"), image: gridShown ? UIImage(systemName: "checkmark.circle") : UIImage(systemName: "circle"), handler: { _ in
                 self.gridShown = !self.gridShown
-                self.rtabmap!.setGridVisible(visible: self.gridShown)
+                self.rtabmap?.setGridVisible(visible: self.gridShown)
                 self.resetNoTouchTimer(true)
             }),
             UIAction(title: localized("Optimized Graph"), image: optimizedGraphShown ? UIImage(systemName: "checkmark.circle") : UIImage(systemName: "circle"), attributes: (self.mState == .STATE_IDLE) ? [] : .disabled, handler: { _ in
                 self.optimizedGraphShown = !self.optimizedGraphShown
-                self.rtabmap!.setGraphOptimization(enabled: self.optimizedGraphShown)
+                self.rtabmap?.setGraphOptimization(enabled: self.optimizedGraphShown)
                 self.resetNoTouchTimer(true)
             })
         ])
@@ -1956,22 +1963,22 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         let renderingMenu = UIMenu(title: "Rendering", options: .displayInline, children: [
             UIAction(title: "Texture/Color Blend", image: self.textureColorSeamsShown ? UIImage(systemName: "checkmark.circle") : UIImage(systemName: "circle"), attributes: self.mState == .STATE_VISUALIZING || self.mState == .STATE_VISUALIZING_CAMERA || self.mState == .STATE_VISUALIZING_AND_MEASURING || self.mState == .STATE_VISUALIZING_WHILE_LOADING ? [] : .disabled, handler: { _ in
                 self.textureColorSeamsShown = !self.textureColorSeamsShown
-                self.rtabmap!.setTextureColorSeamsHidden(hidden: !self.textureColorSeamsShown)
+                self.rtabmap?.setTextureColorSeamsHidden(hidden: !self.textureColorSeamsShown)
                 self.resetNoTouchTimer(true)
             }),
             UIAction(title: "Wireframe", image: self.wireframeShown ? UIImage(systemName: "checkmark.circle") : UIImage(systemName: "circle"), handler: { _ in
                 self.wireframeShown = !self.wireframeShown
-                self.rtabmap!.setWireframe(enabled: self.wireframeShown)
+                self.rtabmap?.setWireframe(enabled: self.wireframeShown)
                 self.resetNoTouchTimer(true)
             }),
             UIAction(title: "Lighting", image: self.lightingShown ? UIImage(systemName: "checkmark.circle") : UIImage(systemName: "circle"), attributes: self.mState == .STATE_VISUALIZING || self.mState == .STATE_VISUALIZING_CAMERA || self.mState == .STATE_VISUALIZING_AND_MEASURING || self.mState == .STATE_VISUALIZING_WHILE_LOADING ? [] : .disabled, handler: { _ in
                 self.lightingShown = !self.lightingShown
-                self.rtabmap!.setLighting(enabled: self.lightingShown)
+                self.rtabmap?.setLighting(enabled: self.lightingShown)
                 self.resetNoTouchTimer(true)
             }),
             UIAction(title: "Backface", image: self.backfaceShown ? UIImage(systemName: "checkmark.circle") : UIImage(systemName: "circle"), handler: { _ in
                 self.backfaceShown = !self.backfaceShown
-                self.rtabmap!.setBackfaceCulling(enabled: !self.backfaceShown)
+                self.rtabmap?.setBackfaceCulling(enabled: !self.backfaceShown)
                 self.resetNoTouchTimer(true)
             })
         ])
@@ -2436,7 +2443,10 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         
         mLastLightEstimate = frame.lightEstimate?.ambientIntensity
         
-        if !status.isEmpty && mLastLightEstimate != nil && mLastLightEstimate! < 100 && accept {
+        if !status.isEmpty,
+           let lastLightEstimate = mLastLightEstimate,
+           lastLightEstimate < 100,
+           accept {
             status = "Camera Is Occluded Or Lighting Is Too Dark"
         }
 
@@ -2690,8 +2700,8 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         }
         else if(status == .authorizedWhenInUse)
         {
-            if locationManager != nil {
-                if(locationManager!.accuracyAuthorization == .reducedAccuracy) {
+            if let locationManager {
+                if(locationManager.accuracyAuthorization == .reducedAccuracy) {
                     let alertController = UIAlertController(title: "GPS Reduced Accuracy", message: "Your location settings for this App is set to reduced accuracy. We recommend to use high accuracy.", preferredStyle: .alert)
 
                     let settingsAction = UIAlertAction(title: "Settings", style: .default) { (action) in
@@ -2849,9 +2859,9 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
             firstTouch = secondTouch
             secondTouch = nil
         }
-        if (firstTouch != nil && secondTouch == nil)
+        if let firstTouch, secondTouch == nil
         {
-            let pose = firstTouch!.location(in: self.view)
+            let pose = firstTouch.location(in: self.view)
             let normalizedX = pose.x / self.view.bounds.size.width;
             let normalizedY = pose.y / self.view.bounds.size.height;
             rtabmap?.onTouchEvent(touch_count: 1, event: 0, x0: Float(normalizedX), y0: Float(normalizedY), x1: 0.0, y1: 0.0);
@@ -2920,45 +2930,66 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         //Get the defaults
         let defaults = UserDefaults.standard
         applySupermarketSettings()
-        guard rtabmap != nil else {
+        guard let nativeHost = rtabmap else {
             return
+        }
+
+        // Settings.bundle normally registers every value before this method
+        // runs. Keep conservative fallbacks here so an incomplete upgrade,
+        // damaged preference domain or missing bundle entry cannot crash the
+        // app during cold start. The supermarket production overrides are
+        // applied below after these compatibility values.
+        func stringSetting(_ key: String, fallback: String) -> String {
+            if let value = defaults.string(forKey: key), !value.isEmpty {
+                return value
+            }
+            NSLog(
+                "MarketScanner setting %@ missing or invalid; using fallback %@",
+                key,
+                fallback)
+            return fallback
         }
  
         //let appendMode = defaults.bool(forKey: "AppendMode")
         
         // update preference
-        rtabmap!.setOnlineBlending(enabled: defaults.bool(forKey: "Blending"));
-        rtabmap!.setNodesFiltering(enabled: defaults.bool(forKey: "NodesFiltering"));
-        rtabmap!.setFullResolution(enabled: defaults.bool(forKey: "HDMode"));
-        rtabmap!.setSmoothing(enabled: defaults.bool(forKey: "Smoothing"));
-        rtabmap!.setDepthBleedingError(value: defaults.float(forKey: "DepthBleedingError"));
-        rtabmap!.setAppendMode(enabled: defaults.bool(forKey: "AppendMode"));
-        rtabmap!.setUpstreamRelocalizationAccThr(value: defaults.float(forKey: "UpstreamRelocalizationFilteringAccThr"));
-        rtabmap!.setExportPointCloudFormat(format: defaults.string(forKey: "ExportPointCloudFormat")!);
+        nativeHost.setOnlineBlending(enabled: defaults.bool(forKey: "Blending"));
+        nativeHost.setNodesFiltering(enabled: defaults.bool(forKey: "NodesFiltering"));
+        nativeHost.setFullResolution(enabled: defaults.bool(forKey: "HDMode"));
+        nativeHost.setSmoothing(enabled: defaults.bool(forKey: "Smoothing"));
+        nativeHost.setDepthBleedingError(value: defaults.float(forKey: "DepthBleedingError"));
+        nativeHost.setAppendMode(enabled: defaults.bool(forKey: "AppendMode"));
+        nativeHost.setUpstreamRelocalizationAccThr(value: defaults.float(forKey: "UpstreamRelocalizationFilteringAccThr"));
+        nativeHost.setExportPointCloudFormat(
+            format: stringSetting("ExportPointCloudFormat", fallback: "ply"));
         
-        mTimeThr = (defaults.string(forKey: "TimeLimit")! as NSString).integerValue
-        mMaxFeatures = (defaults.string(forKey: "MaxFeaturesExtractedLoopClosure")! as NSString).integerValue
+        mTimeThr = (stringSetting("TimeLimit", fallback: "0") as NSString).integerValue
+        mMaxFeatures = (stringSetting(
+            "MaxFeaturesExtractedLoopClosure",
+            fallback: "400") as NSString).integerValue
         
         // Mapping parameters
-        rtabmap!.setMappingParameter(key: "Rtabmap/DetectionRate", value: defaults.string(forKey: "UpdateRate")!);
-        rtabmap!.setMappingParameter(key: "Rtabmap/TimeThr", value: defaults.string(forKey: "TimeLimit")!);
-        rtabmap!.setMappingParameter(key: "Rtabmap/MemoryThr", value: defaults.string(forKey: "MemoryLimit")!);
-        rtabmap!.setMappingParameter(key: "RGBD/LinearSpeedUpdate", value: defaults.string(forKey: "MaximumMotionSpeed")!);
-        let motionSpeed = ((defaults.string(forKey: "MaximumMotionSpeed")!) as NSString).floatValue/2.0;
-        rtabmap!.setMappingParameter(key: "RGBD/AngularSpeedUpdate", value: NSString(format: "%.2f", motionSpeed) as String);
-        rtabmap!.setMappingParameter(key: "Rtabmap/LoopThr", value: defaults.string(forKey: "LoopClosureThreshold")!);
-        rtabmap!.setMappingParameter(key: "Mem/RehearsalSimilarity", value: defaults.string(forKey: "SimilarityThreshold")!);
-        rtabmap!.setMappingParameter(key: "Kp/MaxFeatures", value: defaults.string(forKey: "MaxFeaturesExtractedVocabulary")!);
-        rtabmap!.setMappingParameter(key: "Vis/MaxFeatures", value: defaults.string(forKey: "MaxFeaturesExtractedLoopClosure")!);
-        rtabmap!.setMappingParameter(key: "Vis/MinInliers", value: defaults.string(forKey: "MinInliers")!);
-        rtabmap!.setMappingParameter(key: "RGBD/OptimizeMaxError", value: defaults.string(forKey: "MaxOptimizationError")!);
-        rtabmap!.setMappingParameter(key: "Kp/DetectorStrategy", value: defaults.string(forKey: "FeatureType")!);
-        rtabmap!.setMappingParameter(key: "Vis/FeatureType", value: defaults.string(forKey: "FeatureType")!);
-        rtabmap!.setMappingParameter(key: "Mem/NotLinkedNodesKept", value: defaults.bool(forKey: "SaveAllFramesInDatabase") ? "true" : "false");
-        rtabmap!.setMappingParameter(key: "RGBD/OptimizeFromGraphEnd", value: defaults.bool(forKey: "OptimizationfromGraphEnd") ? "true" : "false");
-        rtabmap!.setMappingParameter(key: "RGBD/MaxOdomCacheSize", value: defaults.string(forKey: "MaximumOdometryCacheSize")!);
-        rtabmap!.setMappingParameter(key: "Optimizer/Strategy", value: defaults.string(forKey: "GraphOptimizer")!);
-        rtabmap!.setMappingParameter(key: "RGBD/ProximityBySpace", value: defaults.string(forKey: "ProximityDetection")!);
+        nativeHost.setMappingParameter(key: "Rtabmap/DetectionRate", value: stringSetting("UpdateRate", fallback: "1"));
+        nativeHost.setMappingParameter(key: "Rtabmap/TimeThr", value: stringSetting("TimeLimit", fallback: "0"));
+        nativeHost.setMappingParameter(key: "Rtabmap/MemoryThr", value: stringSetting("MemoryLimit", fallback: "0"));
+        let maximumMotionSpeed = stringSetting("MaximumMotionSpeed", fallback: "0")
+        nativeHost.setMappingParameter(key: "RGBD/LinearSpeedUpdate", value: maximumMotionSpeed);
+        let motionSpeed = (maximumMotionSpeed as NSString).floatValue/2.0;
+        nativeHost.setMappingParameter(key: "RGBD/AngularSpeedUpdate", value: NSString(format: "%.2f", motionSpeed) as String);
+        nativeHost.setMappingParameter(key: "Rtabmap/LoopThr", value: stringSetting("LoopClosureThreshold", fallback: "0.11"));
+        nativeHost.setMappingParameter(key: "Mem/RehearsalSimilarity", value: stringSetting("SimilarityThreshold", fallback: "0.3"));
+        nativeHost.setMappingParameter(key: "Kp/MaxFeatures", value: stringSetting("MaxFeaturesExtractedVocabulary", fallback: "400"));
+        nativeHost.setMappingParameter(key: "Vis/MaxFeatures", value: stringSetting("MaxFeaturesExtractedLoopClosure", fallback: "400"));
+        nativeHost.setMappingParameter(key: "Vis/MinInliers", value: stringSetting("MinInliers", fallback: "25"));
+        nativeHost.setMappingParameter(key: "RGBD/OptimizeMaxError", value: stringSetting("MaxOptimizationError", fallback: "2"));
+        let featureType = stringSetting("FeatureType", fallback: "6")
+        nativeHost.setMappingParameter(key: "Kp/DetectorStrategy", value: featureType);
+        nativeHost.setMappingParameter(key: "Vis/FeatureType", value: featureType);
+        nativeHost.setMappingParameter(key: "Mem/NotLinkedNodesKept", value: defaults.bool(forKey: "SaveAllFramesInDatabase") ? "true" : "false");
+        nativeHost.setMappingParameter(key: "RGBD/OptimizeFromGraphEnd", value: defaults.bool(forKey: "OptimizationfromGraphEnd") ? "true" : "false");
+        nativeHost.setMappingParameter(key: "RGBD/MaxOdomCacheSize", value: stringSetting("MaximumOdometryCacheSize", fallback: "10"));
+        nativeHost.setMappingParameter(key: "Optimizer/Strategy", value: stringSetting("GraphOptimizer", fallback: "2"));
+        nativeHost.setMappingParameter(key: "RGBD/ProximityBySpace", value: stringSetting("ProximityDetection", fallback: "true"));
         applyStreamingMappingSettings()
 
         let markerDetection = defaults.integer(forKey: "ArUcoMarkerDetection")
@@ -2967,46 +2998,47 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         // ArUco or landmark constraints to this graph.
         if(markerDetection == -1 || !mDataRecording)
         {
-            rtabmap!.setMappingParameter(key: "RGBD/MarkerDetection", value: "false");
+            nativeHost.setMappingParameter(key: "RGBD/MarkerDetection", value: "false");
         }
         else
         {
-            rtabmap!.setMappingParameter(key: "RGBD/MarkerDetection", value: "true");
-            rtabmap!.setMappingParameter(key: "Marker/Dictionary", value: defaults.string(forKey: "ArUcoMarkerDetection")!);
-            rtabmap!.setMappingParameter(key: "Marker/CornerRefinementMethod", value: (markerDetection > 16 ? "3":"0"));
-            rtabmap!.setMappingParameter(key: "Marker/MaxDepthError", value: defaults.string(forKey: "MarkerDepthErrorEstimation")!);
-            rtabmap!.setMappingParameter(key: "Marker/MaxRange", value: defaults.string(forKey: "MarkerMaxRange")!);
-            if let val = NumberFormatter().number(from: defaults.string(forKey: "MarkerSize")!)?.doubleValue
+            nativeHost.setMappingParameter(key: "RGBD/MarkerDetection", value: "true");
+            nativeHost.setMappingParameter(key: "Marker/Dictionary", value: stringSetting("ArUcoMarkerDetection", fallback: "0"));
+            nativeHost.setMappingParameter(key: "Marker/CornerRefinementMethod", value: (markerDetection > 16 ? "3":"0"));
+            nativeHost.setMappingParameter(key: "Marker/MaxDepthError", value: stringSetting("MarkerDepthErrorEstimation", fallback: "0"));
+            nativeHost.setMappingParameter(key: "Marker/MaxRange", value: stringSetting("MarkerMaxRange", fallback: "0"));
+            if let val = NumberFormatter().number(
+                from: stringSetting("MarkerSize", fallback: "0"))?.doubleValue
             {
-                rtabmap!.setMappingParameter(key: "Marker/Length", value: String(format: "%f", val/100.0))
+                nativeHost.setMappingParameter(key: "Marker/Length", value: String(format: "%f", val/100.0))
             }
             else{
-                rtabmap!.setMappingParameter(key: "Marker/Length", value: "0")
+                nativeHost.setMappingParameter(key: "Marker/Length", value: "0")
             }
         }
 
         // Rendering
-        rtabmap!.setCloudDensityLevel(value: defaults.integer(forKey: "PointCloudDensity"));
-        rtabmap!.setMaxCloudDepth(value: defaults.float(forKey: "MaxDepth"));
-        rtabmap!.setMinCloudDepth(value: defaults.float(forKey: "MinDepth"));
-        rtabmap!.setDepthConfidence(value: defaults.integer(forKey: "DepthConfidence"));
-        rtabmap!.setPointSize(value: defaults.float(forKey: "PointSize"));
-        rtabmap!.setMeshAngleTolerance(value: defaults.float(forKey: "MeshAngleTolerance"));
-        rtabmap!.setMeshTriangleSize(value: defaults.integer(forKey: "MeshTriangleSize"));
-        rtabmap!.setMeshDecimationFactor(value: defaults.float(forKey: "MeshDecimationFactor"));
+        nativeHost.setCloudDensityLevel(value: defaults.integer(forKey: "PointCloudDensity"));
+        nativeHost.setMaxCloudDepth(value: defaults.float(forKey: "MaxDepth"));
+        nativeHost.setMinCloudDepth(value: defaults.float(forKey: "MinDepth"));
+        nativeHost.setDepthConfidence(value: defaults.integer(forKey: "DepthConfidence"));
+        nativeHost.setPointSize(value: defaults.float(forKey: "PointSize"));
+        nativeHost.setMeshAngleTolerance(value: defaults.float(forKey: "MeshAngleTolerance"));
+        nativeHost.setMeshTriangleSize(value: defaults.integer(forKey: "MeshTriangleSize"));
+        nativeHost.setMeshDecimationFactor(value: defaults.float(forKey: "MeshDecimationFactor"));
         let bgColor = defaults.float(forKey: "BackgroundColor");
-        rtabmap!.setBackgroundColor(gray: bgColor);
+        nativeHost.setBackgroundColor(gray: bgColor);
         
         DispatchQueue.main.async {
             self.statusLabel.textColor = bgColor>=0.6 ? UIColor(white: 0.0, alpha: 1) : UIColor(white: 1.0, alpha: 1)
         }
     
-        rtabmap!.setClusterRatio(value: defaults.float(forKey: "NoiseFilteringRatio"));
-        rtabmap!.setMaxGainRadius(value: defaults.float(forKey: "ColorCorrectionRadius"));
-        rtabmap!.setRenderingTextureDecimation(value: defaults.integer(forKey: "TextureResolution"));
+        nativeHost.setClusterRatio(value: defaults.float(forKey: "NoiseFilteringRatio"));
+        nativeHost.setMaxGainRadius(value: defaults.float(forKey: "ColorCorrectionRadius"));
+        nativeHost.setRenderingTextureDecimation(value: defaults.integer(forKey: "TextureResolution"));
         
-        rtabmap!.setMetricSystem(defaults.integer(forKey: "MeasuringUnits") == 0);
-        rtabmap!.setMeasuringTextSize(defaults.float(forKey: "MeasuringTextSize"));
+        nativeHost.setMetricSystem(defaults.integer(forKey: "MeasuringUnits") == 0);
+        nativeHost.setMeasuringTextSize(defaults.float(forKey: "MeasuringTextSize"));
         
         if(locationManager != nil && !defaults.bool(forKey: "SaveGPS"))
         {
@@ -3027,7 +3059,7 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         if(mState == State.STATE_VISUALIZING)
         {
             closeVisualization()
-            rtabmap!.postExportation(visualize: false)
+            rtabmap?.postExportation(visualize: false)
         }
         
         if(!mDataRecording) {
@@ -3116,7 +3148,15 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                     floorId: floorId,
                     initialMapPose: initialPose)
             activePriorMapPackage = package
-            let overlay = PriorMapLiveMapView(package: package, floorId: floorId)
+            guard let overlay = PriorMapLiveMapView(
+                    package: package,
+                    floorId: floorId) else {
+                throw NSError(
+                    domain: "PriorMap",
+                    code: 5,
+                    userInfo: [NSLocalizedDescriptionKey: localized(
+                        "The selected floor is unavailable for the live map overlay.")])
+            }
             overlay.translatesAutoresizingMaskIntoConstraints = false
             overlay.confirmButton.addTarget(
                 self,
@@ -5201,11 +5241,11 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
             showToast(message: localized("The prior map is no longer available."), seconds: 3)
             return
         }
-        let picker = PriorMapPoseSelectionViewController(
+        guard let picker = PriorMapPoseSelectionViewController(
             package: package,
             floorId: floorId,
-            pose: initial
-        ) { [weak self] pose, finished in
+            pose: initial,
+            completion: { [weak self] pose, finished in
             guard let self else {
                 finished(.rejected(message: "扫描界面已关闭，位置未更改。"))
                 return
@@ -5220,6 +5260,14 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                         seconds: 3)
                 }
             }
+        })
+        else {
+            showToast(
+                message: localized(
+                    "The selected floor is no longer present in the verified map package. The scan was not changed."),
+                seconds: 6,
+                replacingCurrent: true)
+            return
         }
         present(picker, animated: true)
     }
@@ -5560,11 +5608,12 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                             indicator = UIActivityIndicatorView(style: .large)
                             indicator?.frame = CGRect(x: 0.0, y: 0.0, width: 60.0, height: 60.0)
                             indicator?.center = self.view.center
-                            self.view.addSubview(indicator!)
-                            indicator?.bringSubviewToFront(self.view)
-                            
-                            indicator?.startAnimating()
-                            self.rtabmap!.cancelProcessing();
+                            if let indicator {
+                                self.view.addSubview(indicator)
+                                indicator.bringSubviewToFront(self.view)
+                                indicator.startAnimating()
+                            }
+                            self.rtabmap?.cancelProcessing();
                         })
                     }
                     alertView.addAction(alertViewActionCancel)
@@ -5576,22 +5625,22 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                         //  Add your progressbar after alert is shown (and measured)
                         let margin:CGFloat = 8.0
                         let rect = CGRect(x: margin, y: 84.0, width: alertView.view.frame.width - margin * 2.0 , height: 2.0)
-                        self.progressView = UIProgressView(frame: rect)
-                        self.progressView!.progress = 0
-                        self.progressView!.tintColor = self.view.tintColor
-                        alertView.view.addSubview(self.progressView!)
+                        let progressView = UIProgressView(frame: rect)
+                        progressView.progress = 0
+                        progressView.tintColor = self.view.tintColor
+                        self.progressView = progressView
+                        alertView.view.addSubview(progressView)
                         
                         var success : Bool = false
                         DispatchQueue.background(background: {
                             
-                            success = self.rtabmap!.recover(from: tmpDatabase.path, to: outputDbPath)
+                            success = self.rtabmap?.recover(
+                                from: tmpDatabase.path,
+                                to: outputDbPath) ?? false
                             
                         }, completion:{
-                            if(indicator != nil)
-                            {
-                                indicator!.stopAnimating()
-                                indicator!.removeFromSuperview()
-                            }
+                            indicator?.stopAnimating()
+                            indicator?.removeFromSuperview()
                             if self.progressView != nil
                             {
                                 self.dismiss(animated: self.openedDatabasePath == nil, completion: {
@@ -5665,12 +5714,27 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                 }
             }
             let inMemory = dataRecordingMode ? UserDefaults.standard.bool(forKey: "DatabaseInMemory") : false
+            guard let nativeHost = rtabmap else {
+                showToast(
+                    message: localized(
+                        "The native scanning engine is unavailable. Restart the app before starting a scan."),
+                    seconds: 5)
+                supermarketSession?.appendScanEvent(
+                    level: "error",
+                    event: "native_host_unavailable_before_database_open",
+                    message: "Scan start stopped before opening the database")
+                return false
+            }
             mDataRecording = dataRecordingMode
-            self.rtabmap!.setDataRecorderMode(enabled: dataRecordingMode)
+            nativeHost.setDataRecorderMode(enabled: dataRecordingMode)
             applyStreamingMappingSettings()
-            self.rtabmap!.setPreserveCameraOrigin(enabled: false)
+            nativeHost.setPreserveCameraOrigin(enabled: false)
             self.optimizedGraphShown = true // Always reset to true when opening a database
-            self.rtabmap!.openDatabase(databasePath: activeDatabase.path, databaseInMemory: inMemory, optimize: false, clearDatabase: true)
+            nativeHost.openDatabase(
+                databasePath: activeDatabase.path,
+                databaseInMemory: inMemory,
+                optimize: false,
+                clearDatabase: true)
             self.mLatestDatabaseMemoryMB = 0
             self.mLatestScanStorageBytes = 0
             self.resetStreamingPerformanceTelemetry()
@@ -6435,6 +6499,39 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         priceTagVisionScanner.cancel()
         priorMapAlignmentSnapshots.reset()
         let finalizationDrainDeadline = DispatchTime.now() + 2.0
+
+        // Stop ARKit and native mapping at the same linearization boundary as
+        // write admission. Otherwise new RTAB-Map nodes could be produced
+        // while localization sidecars are already closed and the drain is
+        // waiting, creating an avoidable terminal evidence gap. The database
+        // stays open until save completes below.
+        session.pause()
+        locationManager?.stopUpdatingLocation()
+        rtabmap?.setPausedMapping(paused: true)
+        rtabmap?.stopCamera()
+        updateState(state: .STATE_PROCESSING)
+        showToast(
+            message: localized("Finalizing continuous streaming database..."),
+            seconds: 2)
+
+        let segmentDirectory: URL
+        let databaseURL: URL
+        do {
+            segmentDirectory = try scanSession.currentSegmentDirectory()
+            databaseURL = try scanSession.streamingDatabaseURL()
+        }
+        catch {
+            scanSession.endFinalization()
+            resumeMobileWorkflowIfNeeded()
+            setGLCamera(type: 0)
+            _ = startCamera(resetTracking: false)
+            rtabmap?.setPausedMapping(paused: false, triggerNewMap: false)
+            updateState(state: .STATE_MAPPING)
+            showToast(message: String(format: localized("Could not finalize streaming scan: %@"), error.localizedDescription), seconds: 4)
+            completion?(.resumeRecording)
+            return
+        }
+
         let priorMapDrain = DispatchSemaphore(value: 0)
         priorMapQueue.async {
             priorMapDrain.signal()
@@ -6449,20 +6546,6 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         // session. A failed write is captured (never `try?`-swallowed)
         // and blocks processing eligibility below.
         let clockSidecarResult = stopClockCorrelationRecording(flush: true)
-
-        let segmentDirectory: URL
-        let databaseURL: URL
-        do {
-            segmentDirectory = try scanSession.currentSegmentDirectory()
-            databaseURL = try scanSession.streamingDatabaseURL()
-        }
-        catch {
-            scanSession.endFinalization()
-            resumeMobileWorkflowIfNeeded()
-            showToast(message: String(format: localized("Could not finalize streaming scan: %@"), error.localizedDescription), seconds: 4)
-            completion?(.resumeRecording)
-            return
-        }
 
         let continueFinalization: (Bool, Bool) -> Void = {
             [weak self] priorMapDrainedWithinDeadline,
@@ -6543,13 +6626,6 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
             format: "yyyy-MM-dd HH:mm:ss")
         let availableBytesAtFinalization = availableDiskBytes(at: segmentDirectory)
         let thermalStateAtFinalization = currentThermalStateText()
-
-        session.pause()
-        locationManager?.stopUpdatingLocation()
-        rtabmap?.setPausedMapping(paused: true)
-        rtabmap?.stopCamera()
-        updateState(state: .STATE_PROCESSING)
-        showToast(message: localized("Finalizing continuous streaming database..."), seconds: 2)
 
         var saveSucceeded = false
         var sidecarError: String?
@@ -6795,7 +6871,9 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                 self.showToast(message: failureMessage, seconds: 7)
                 self.setGLCamera(type: 0)
                 self.startCamera(resetTracking: false)
-                self.rtabmap?.setPausedMapping(paused: false)
+                self.rtabmap?.setPausedMapping(
+                    paused: false,
+                    triggerNewMap: false)
                 self.updateState(state: .STATE_MAPPING)
                 completion?(.resumeRecording)
                 return
@@ -6840,7 +6918,23 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
             // Detach RTAB-Map from the completed database before a background
             // external copy is allowed to remove the local capture directory.
             let tmpDatabase = self.getDocumentDirectory().appendingPathComponent(self.RTABMAP_TMP_DB)
-            self.rtabmap!.openDatabase(databasePath: tmpDatabase.path, databaseInMemory: false, optimize: false, clearDatabase: true)
+            if let nativeHost = self.rtabmap {
+                nativeHost.openDatabase(
+                    databasePath: tmpDatabase.path,
+                    databaseInMemory: false,
+                    optimize: false,
+                    clearDatabase: true)
+            }
+            else {
+                // The completed database and metadata are already committed.
+                // Losing the native host must not turn a successfully sealed
+                // capture into a process crash; retain an explicit diagnostic
+                // and finish releasing the immutable session.
+                scanSession.appendScanEvent(
+                    level: "warning",
+                    event: "native_host_unavailable_after_finalization",
+                    message: "The scan was finalized, but the native host was unavailable during scratch-database detach")
+            }
             self.mMapNodes = 0
             self.mLatestDatabaseMemoryMB = 0
             self.mLatestScanStorageBytes = finalScanStorageBytes

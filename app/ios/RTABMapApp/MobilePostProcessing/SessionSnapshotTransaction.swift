@@ -3757,8 +3757,13 @@ enum SessionSnapshotTransaction {
                     throw SessionError.copyFailed(
                         "committed artifact grew during hash: \(basename)")
                 }
-                let chunk = buffer.withUnsafeBytes { rawBuffer -> Data in
-                    Data(bytes: rawBuffer.baseAddress!, count: count)
+                let chunk = try buffer.withUnsafeBytes {
+                    rawBuffer -> Data in
+                    guard let baseAddress = rawBuffer.baseAddress else {
+                        throw SessionError.copyFailed(
+                            "committed artifact buffer unavailable: \(basename)")
+                    }
+                    return Data(bytes: baseAddress, count: count)
                 }
                 hasher.update(data: chunk)
                 if captureBytes { capturedData.append(chunk) }
@@ -4472,8 +4477,25 @@ enum SessionSnapshotTransaction {
             if bytesRead == 0 {
                 break
             }
-            let chunk = buffer.withUnsafeBytes { rawBuffer -> Data in
-                return Data(bytes: rawBuffer.baseAddress!, count: bytesRead)
+            let chunk: Data
+            do {
+                chunk = try buffer.withUnsafeBytes { rawBuffer -> Data in
+                    guard let baseAddress = rawBuffer.baseAddress else {
+                        throw SessionError.copyFailed(
+                            "copy buffer unavailable for \(source.lastPathComponent)")
+                    }
+                    return Data(bytes: baseAddress, count: bytesRead)
+                }
+            }
+            catch let error as SessionError {
+                copyError = error
+                break
+            }
+            catch {
+                copyError = SessionError.copyFailed(
+                    "copy buffer failed for \(source.lastPathComponent): "
+                        + error.localizedDescription)
+                break
             }
             hasher.update(data: chunk)
             var written = 0
@@ -5044,8 +5066,12 @@ enum SessionSnapshotTransaction {
                 "\(label) must be an exact \(expectedBytes)-byte BLOB")
         }
         var values = [Float](repeating: 0, count: count)
-        values.withUnsafeMutableBytes { destination in
-            memcpy(destination.baseAddress!, blob, expectedBytes)
+        try values.withUnsafeMutableBytes { destination in
+            guard let baseAddress = destination.baseAddress else {
+                throw SessionError.dbIntegrity(
+                    "\(label) destination buffer is unavailable")
+            }
+            memcpy(baseAddress, blob, expectedBytes)
         }
         guard values.allSatisfy({ $0.isFinite }) else {
             throw SessionError.dbIntegrity(
@@ -5067,8 +5093,12 @@ enum SessionSnapshotTransaction {
                 "\(label) must be an exact \(expectedBytes)-byte BLOB")
         }
         var values = [Double](repeating: 0, count: count)
-        values.withUnsafeMutableBytes { destination in
-            memcpy(destination.baseAddress!, blob, expectedBytes)
+        try values.withUnsafeMutableBytes { destination in
+            guard let baseAddress = destination.baseAddress else {
+                throw SessionError.dbIntegrity(
+                    "\(label) destination buffer is unavailable")
+            }
+            memcpy(baseAddress, blob, expectedBytes)
         }
         guard values.allSatisfy({ $0.isFinite }) else {
             throw SessionError.dbIntegrity(

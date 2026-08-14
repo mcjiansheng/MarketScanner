@@ -103,16 +103,19 @@ struct PriceTagDepthEvidence: Codable, Equatable {
                 end += 1
             }
             let candidate = start..<end
-            if candidate.count >= 12
-                && (
-                    bestRange == nil
-                    || depths[candidate.lowerBound] < depths[bestRange!.lowerBound] - 0.02
-                    || (
-                        abs(depths[candidate.lowerBound] - depths[bestRange!.lowerBound]) <= 0.02
-                        && candidate.count > bestRange!.count
-                    )
-                ) {
-                bestRange = candidate
+            if candidate.count >= 12 {
+                if let currentBest = bestRange {
+                    let candidateDepth = depths[candidate.lowerBound]
+                    let currentDepth = depths[currentBest.lowerBound]
+                    if candidateDepth < currentDepth - 0.02
+                        || (abs(candidateDepth - currentDepth) <= 0.02
+                            && candidate.count > currentBest.count) {
+                        bestRange = candidate
+                    }
+                }
+                else {
+                    bestRange = candidate
+                }
             }
         }
         guard let range = bestRange, !range.isEmpty else {
@@ -125,8 +128,12 @@ struct PriceTagDepthEvidence: Codable, Equatable {
         let inlierThreshold = max(0.02, 3 * mad)
         let inliers = cluster.filter { abs($0 - median) <= inlierThreshold }
         let ratio = Double(inliers.count) / Double(depths.count)
-        let containsGlobalMedian = globalMedian >= cluster.first!
-            && globalMedian <= cluster.last!
+        guard let clusterFirst = cluster.first,
+              let clusterLast = cluster.last else {
+            return .unavailable
+        }
+        let containsGlobalMedian = globalMedian >= clusterFirst
+            && globalMedian <= clusterLast
         let accepted = inliers.count >= 12
             && ratio >= 0.55
             && mad <= 0.045
@@ -1223,7 +1230,7 @@ enum ShelfAssociation {
                     continue
                 }
                 let point = origin + ray * distance
-                if nearest == nil || distance < nearest!.distance {
+                if nearest.map({ distance < $0.distance }) ?? true {
                     nearest = (distance, point, structure.associateable)
                 }
             }

@@ -307,11 +307,15 @@ enum PriorMapPackageIntegrity {
             let hidden = StrictJSONScalar.integer(manifest["hidden_element_count"])
             let invalid = StrictJSONScalar.integer(
                 manifest["invalid_geometry_ignored_count"])
+            guard let unsupported, let hidden, let invalid else {
+                throw PriorMapPackageIntegrityError.invalid(
+                    "v2 ignored-element statistics are missing or invalid.")
+            }
             try require(
                 presentationCount >= 0
-                    && unsupported != nil && unsupported! >= 0
-                    && hidden != nil && hidden! >= 0
-                    && invalid != nil && invalid! >= 0
+                    && unsupported >= 0
+                    && hidden >= 0
+                    && invalid >= 0
                     && StrictJSONScalar.integer(manifest["active_element_count"])
                         == elements.count
                     && StrictJSONScalar.integer(manifest["visible_element_count"])
@@ -326,7 +330,7 @@ enum PriorMapPackageIntegrity {
                         == presentationCount
                     && StrictJSONScalar.integer(manifest["source_element_count"])
                         == elements.count + presentationCount
-                            + unsupported! + hidden! + invalid!,
+                            + unsupported + hidden + invalid,
                 "v2 source/active/role/ignored 元素统计不一致。")
         }
         try validateSubset(
@@ -921,12 +925,19 @@ enum PriorMapPackageIntegrity {
         _ value: Any?,
         points: [(Double, Double)]
     ) -> Bool {
-        guard !points.isEmpty, let bounds = value as? [String: Any] else { return false }
+        guard !points.isEmpty,
+              let bounds = value as? [String: Any],
+              let minX = points.map(\.0).min(),
+              let minY = points.map(\.1).min(),
+              let maxX = points.map(\.0).max(),
+              let maxY = points.map(\.1).max() else {
+            return false
+        }
         let expected = [
-            "min_x_m": points.map(\.0).min()!,
-            "min_y_m": points.map(\.1).min()!,
-            "max_x_m": points.map(\.0).max()!,
-            "max_y_m": points.map(\.1).max()!,
+            "min_x_m": minX,
+            "min_y_m": minY,
+            "max_x_m": maxX,
+            "max_y_m": maxY,
         ]
         return expected.allSatisfy {
             guard let actual = StrictJSONScalar.number(bounds[$0.key]) else {

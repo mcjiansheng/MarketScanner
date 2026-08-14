@@ -552,9 +552,11 @@ enum XLSXWorkbookVerifier {
     private static func columnLetters(_ column: Int) -> String {
         var value = column
         var result = ""
+        let alphabet = Array("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
         while value > 0 {
             let remainder = (value - 1) % 26
-            result = String(Character(UnicodeScalar(65 + remainder)!)) + result
+            guard alphabet.indices.contains(remainder) else { return "" }
+            result = String(alphabet[remainder]) + result
             value = (value - 1) / 26
         }
         return result

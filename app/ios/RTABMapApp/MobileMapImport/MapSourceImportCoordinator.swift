@@ -84,10 +84,17 @@ enum StableMapSourceFileReader {
             guard Int64(data.count) + Int64(count) <= maximumBytes else {
                 throw MapSourceImportError.fileTooLarge(limitBytes: maximumBytes)
             }
-            buffer.withUnsafeBytes { rawBuffer in
-                data.append(
-                    rawBuffer.bindMemory(to: UInt8.self).baseAddress!,
-                    count: count)
+            let appended = buffer.withUnsafeBytes { rawBuffer -> Bool in
+                guard let baseAddress = rawBuffer.bindMemory(
+                        to: UInt8.self).baseAddress else {
+                    return false
+                }
+                data.append(baseAddress, count: count)
+                return true
+            }
+            guard appended else {
+                throw MapSourceImportError.unreadableSource(
+                    reason: "staged source buffer was unavailable")
             }
         }
 

@@ -447,7 +447,7 @@ enum RecoveryLifecyclePersistedEvidenceParser {
         }
         guard let episodeId = strictInteger(object["episode_id"]),
               episodeId > 0,
-              nonEmptyString(object["reason"]),
+              let reason = nonEmptyString(object["reason"]),
               let episodeAutomatic =
                   StrictJSONScalar.boolean(object["episode_automatic"]),
               let startedAtUptime = strictNumber(object["started_at_uptime"]),
@@ -474,7 +474,8 @@ enum RecoveryLifecyclePersistedEvidenceParser {
               reliableLoopTriggerCount >= 0,
               automaticTriggerCount + reliableLoopTriggerCount
                   == triggerCount,
-              nonEmptyString(object["last_trigger_reason"]),
+              let lastTriggerReason =
+                  nonEmptyString(object["last_trigger_reason"]),
               let lastTriggerAtUptime =
                   strictNumber(object["last_trigger_at_uptime"]),
               lastTriggerAtUptime >= startedAtUptime,
@@ -522,7 +523,7 @@ enum RecoveryLifecyclePersistedEvidenceParser {
                 lineNumber: lineNumber,
                 startedAtUptime: startedAtUptime,
                 finishedAtUptime: finishedAtUptime,
-                lastTriggerReason: object["last_trigger_reason"] as? String,
+                lastTriggerReason: lastTriggerReason,
                 lastTriggerAtUptime: lastTriggerAtUptime)
         }
         let canonical = try canonicalBytes(
@@ -532,7 +533,7 @@ enum RecoveryLifecyclePersistedEvidenceParser {
             priorMapSha256: priorMapSha256,
             floorId: floorId,
             episodeId: episodeId,
-            reason: object["reason"] as! String,
+            reason: reason,
             outcomeRaw: outcomeRaw,
             cancellationReasonRaw: cancellationReason?.rawValue,
             episodeAutomatic: episodeAutomatic,
@@ -544,7 +545,7 @@ enum RecoveryLifecyclePersistedEvidenceParser {
             triggerCount: triggerCount,
             automaticTriggerCount: automaticTriggerCount,
             reliableLoopTriggerCount: reliableLoopTriggerCount,
-            lastTriggerReason: object["last_trigger_reason"] as! String,
+            lastTriggerReason: lastTriggerReason,
             lastTriggerAtUptime: lastTriggerAtUptime,
             selectedHypothesisId: selectedHypothesisId,
             freshSupportFrames: freshSupportFrames,
@@ -562,7 +563,7 @@ enum RecoveryLifecyclePersistedEvidenceParser {
             priorMapSha256: priorMapSha256,
             floorId: floorId,
             episodeId: episodeId,
-            reason: object["reason"] as! String,
+            reason: reason,
             outcome: outcome,
             cancellationReason: cancellationReason,
             episodeAutomatic: episodeAutomatic,
@@ -574,7 +575,7 @@ enum RecoveryLifecyclePersistedEvidenceParser {
             triggerCount: triggerCount,
             automaticTriggerCount: automaticTriggerCount,
             reliableLoopTriggerCount: reliableLoopTriggerCount,
-            lastTriggerReason: object["last_trigger_reason"] as! String,
+            lastTriggerReason: lastTriggerReason,
             lastTriggerAtUptime: lastTriggerAtUptime,
             selectedHypothesisId: selectedHypothesisId,
             freshSupportFrames: freshSupportFrames,
@@ -608,7 +609,7 @@ enum RecoveryLifecyclePersistedEvidenceParser {
         for record in rawRecords {
             guard Set(record.keys).isSubset(
                     of: ["reason", "automatic", "at_uptime"]),
-                  nonEmptyString(record["reason"]),
+                  let reason = nonEmptyString(record["reason"]),
                   let automatic =
                       StrictJSONScalar.boolean(record["automatic"]),
                   let uptime = strictNumber(record["at_uptime"]),
@@ -623,7 +624,7 @@ enum RecoveryLifecyclePersistedEvidenceParser {
             }
             previousUptime = uptime
             records.append(PriorMapRecoveryTriggerRecord(
-                reason: record["reason"] as! String,
+                reason: reason,
                 automatic: automatic,
                 atUptime: uptime))
         }
@@ -765,8 +766,11 @@ enum RecoveryLifecyclePersistedEvidenceParser {
         return result.isFinite ? result : nil
     }
 
-    private static func nonEmptyString(_ value: Any?) -> Bool {
-        return (value as? String)?.isEmpty == false
+    private static func nonEmptyString(_ value: Any?) -> String? {
+        guard let value = value as? String, !value.isEmpty else {
+            return nil
+        }
+        return value
     }
 }
 

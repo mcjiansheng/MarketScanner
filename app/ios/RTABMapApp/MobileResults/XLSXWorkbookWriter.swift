@@ -264,9 +264,11 @@ enum XLSXWorkbookWriter {
     private static func columnLetters(_ column: Int) -> String {
         var result = ""
         var value = column
+        let alphabet = Array("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
         while value > 0 {
             let remainder = (value - 1) % 26
-            result = String(Character(UnicodeScalar(65 + remainder)!)) + result
+            guard alphabet.indices.contains(remainder) else { return "" }
+            result = String(alphabet[remainder]) + result
             value = (value - 1) / 26
         }
         return result
@@ -596,7 +598,13 @@ enum XLSXWorkbookWriter {
         var written = 0
         while written < data.count {
             let result = data.withUnsafeBytes { buffer in
-                output.write(buffer.bindMemory(to: UInt8.self).baseAddress! + written, maxLength: data.count - written)
+                guard let baseAddress = buffer.bindMemory(
+                        to: UInt8.self).baseAddress else {
+                    return -1
+                }
+                return output.write(
+                    baseAddress.advanced(by: written),
+                    maxLength: data.count - written)
             }
             if result < 0 {
                 throw XLSXWriteError.zipFailed("output write failed")

@@ -51,8 +51,9 @@ class RTABMap {
              UnsafeMutableRawPointer(Unmanaged.passUnretained(self).toOpaque()),
              //progressCallback
              {(observer, count, max) -> Void in
-                         // Extract pointer to `self` from void pointer:
-                let mySelf = Unmanaged<RTABMap>.fromOpaque(observer!).takeUnretainedValue()
+                guard let observer else { return }
+                let mySelf = Unmanaged<RTABMap>.fromOpaque(observer)
+                    .takeUnretainedValue()
                          // Call instance method:
                          //mySelf.TestMethod();
                 for (id, observation) in mySelf.observations {
@@ -68,8 +69,9 @@ class RTABMap {
              },
              //initCallback
              {(observer, status, msg) -> Void in
-                         // Extract pointer to `self` from void pointer:
-                let mySelf = Unmanaged<RTABMap>.fromOpaque(observer!).takeUnretainedValue()
+                guard let observer, let msg else { return }
+                let mySelf = Unmanaged<RTABMap>.fromOpaque(observer)
+                    .takeUnretainedValue()
                          // Call instance method:
                          //mySelf.TestMethod();
                 for (id, observation) in mySelf.observations {
@@ -80,14 +82,15 @@ class RTABMap {
                         continue
                     }
 
-                    let str = String(cString: msg!)
+                    let str = String(cString: msg)
                     observer.initEventReceived(mySelf, status: Int(status), msg: str)
                 }
              },
              //statsUpdatedCallback
              {(observer, nodes, words, points, polygons, updateTime, loopClosureId, highestHypId, databaseMemoryUsed, inliers, matches, featuresExtracted, hypothesis, nodesDrawn, fps, rejected, rehearsalValue, optimizationMaxError, optimizationMaxErrorRatio, distanceTravelled, fastMovement, landmarkDetected, loopClosureType, loopClosureCurrentId, loopClosureTargetId, mapCorrectionX, mapCorrectionY, mapCorrectionZ, mapCorrectionQx, mapCorrectionQy, mapCorrectionQz, mapCorrectionQw, x, y, z, roll, pitch, yaw) -> Void in
-                         // Extract pointer to `self` from void pointer:
-                let mySelf = Unmanaged<RTABMap>.fromOpaque(observer!).takeUnretainedValue()
+                guard let observer else { return }
+                let mySelf = Unmanaged<RTABMap>.fromOpaque(observer)
+                    .takeUnretainedValue()
                          // Call instance method:
                          //mySelf.TestMethod();
                 for (id, observation) in mySelf.observations {
@@ -103,8 +106,9 @@ class RTABMap {
              },
              //cameraInfoEventCallback
              {(observer, type, key, value) -> Void in
-                         // Extract pointer to `self` from void pointer:
-                let mySelf = Unmanaged<RTABMap>.fromOpaque(observer!).takeUnretainedValue()
+                guard let observer, let key, let value else { return }
+                let mySelf = Unmanaged<RTABMap>.fromOpaque(observer)
+                    .takeUnretainedValue()
                          // Call instance method:
                          //mySelf.TestMethod();
                 for (id, observation) in mySelf.observations {
@@ -115,8 +119,8 @@ class RTABMap {
                         continue
                     }
 					
-                    let strKey = String(cString: key!)
-                    let strValue = String(cString: value!)
+                    let strKey = String(cString: key)
+                    let strValue = String(cString: value)
                     observer.cameraInfoEventReceived(mySelf, type: Int(type), key: strKey, value: strValue)
                 }
              })
@@ -394,7 +398,7 @@ class RTABMap {
         let points = frame.rawFeaturePoints?.points
 
         var submitted = false
-        if points != nil && (depthMap != nil || points!.count>0)
+        if let points, depthMap != nil || !points.isEmpty
         {
             var v = frame.camera.viewMatrix(for: orientation)
             if let poseOverride = poseOverride {
@@ -435,21 +439,48 @@ class RTABMap {
                 texCoord = [texX2, texY2, texX2, 1-texY2, 1-texX2, texY2, 1-texX2, 1-texY2]
             }
             
-            frame.rawFeaturePoints?.points.withUnsafeBufferPointer { bufferPoints in
-                
-                CVPixelBufferLockBaseAddress(frame.capturedImage, CVPixelBufferLockFlags.readOnly)
+            points.withUnsafeBufferPointer { bufferPoints in
+                let readOnly = CVPixelBufferLockFlags.readOnly
+                guard CVPixelBufferLockBaseAddress(
+                        frame.capturedImage, readOnly) == kCVReturnSuccess else {
+                    return
+                }
+                defer {
+                    CVPixelBufferUnlockBaseAddress(frame.capturedImage, readOnly)
+                }
+                guard CVPixelBufferGetPlaneCount(frame.capturedImage) >= 2,
+                      let capturedYPlane = CVPixelBufferGetBaseAddressOfPlane(
+                        frame.capturedImage, 0),
+                      let capturedUVPlane = CVPixelBufferGetBaseAddressOfPlane(
+                        frame.capturedImage, 1) else {
+                    return
+                }
                 var depthDataPtr: UnsafeMutableRawPointer?
                 var depthSize: Int32 = 0
                 var depthWidth: Int32 = 0
                 var depthHeight: Int32 = 0
                 var depthFormat: Int32 = 0
-                if depthMap != nil {
-                    CVPixelBufferLockBaseAddress(depthMap!, CVPixelBufferLockFlags.readOnly)
-                    depthDataPtr = CVPixelBufferGetBaseAddress(depthMap!)!
-                    depthSize = Int32(CVPixelBufferGetDataSize(depthMap!))
-                    depthWidth = Int32(CVPixelBufferGetWidth(depthMap!))
-                    depthHeight = Int32(CVPixelBufferGetHeight(depthMap!))
-                    depthFormat = Int32(CVPixelBufferGetPixelFormatType(depthMap!))
+                var lockedDepthMap: CVPixelBuffer?
+                if let depthMap,
+                   CVPixelBufferLockBaseAddress(depthMap, readOnly)
+                        == kCVReturnSuccess {
+                    if let baseAddress = CVPixelBufferGetBaseAddress(depthMap) {
+                        lockedDepthMap = depthMap
+                        depthDataPtr = baseAddress
+                        depthSize = Int32(CVPixelBufferGetDataSize(depthMap))
+                        depthWidth = Int32(CVPixelBufferGetWidth(depthMap))
+                        depthHeight = Int32(CVPixelBufferGetHeight(depthMap))
+                        depthFormat = Int32(
+                            CVPixelBufferGetPixelFormatType(depthMap))
+                    }
+                    else {
+                        CVPixelBufferUnlockBaseAddress(depthMap, readOnly)
+                    }
+                }
+                defer {
+                    if let lockedDepthMap {
+                        CVPixelBufferUnlockBaseAddress(lockedDepthMap, readOnly)
+                    }
                 }
                 
                 var confDataPtr: UnsafeMutableRawPointer?
@@ -457,17 +488,36 @@ class RTABMap {
                 var confWidth: Int32 = 0
                 var confHeight: Int32 = 0
                 var confFormat: Int32 = 0
-                if confMap != nil {
-                    CVPixelBufferLockBaseAddress(confMap!, CVPixelBufferLockFlags.readOnly)
-                    confDataPtr = CVPixelBufferGetBaseAddress(confMap!)!
-                    confSize = Int32(CVPixelBufferGetDataSize(confMap!))
-                    confWidth = Int32(CVPixelBufferGetWidth(confMap!))
-                    confHeight = Int32(CVPixelBufferGetHeight(confMap!))
-                    confFormat = Int32(CVPixelBufferGetPixelFormatType(confMap!))
+                var lockedConfidenceMap: CVPixelBuffer?
+                if let confMap,
+                   CVPixelBufferLockBaseAddress(confMap, readOnly)
+                        == kCVReturnSuccess {
+                    if let baseAddress = CVPixelBufferGetBaseAddress(confMap) {
+                        lockedConfidenceMap = confMap
+                        confDataPtr = baseAddress
+                        confSize = Int32(CVPixelBufferGetDataSize(confMap))
+                        confWidth = Int32(CVPixelBufferGetWidth(confMap))
+                        confHeight = Int32(CVPixelBufferGetHeight(confMap))
+                        confFormat = Int32(
+                            CVPixelBufferGetPixelFormatType(confMap))
+                    }
+                    else {
+                        CVPixelBufferUnlockBaseAddress(confMap, readOnly)
+                    }
                 }
+                defer {
+                    if let lockedConfidenceMap {
+                        CVPixelBufferUnlockBaseAddress(
+                            lockedConfidenceMap, readOnly)
+                    }
+                }
+
+                guard depthDataPtr != nil || !points.isEmpty else { return }
                 
-                if(frame.lightEstimate != nil) {
-                    addEnvSensor(type: 4, value: Float(frame.lightEstimate!.ambientIntensity))
+                if let lightEstimate = frame.lightEstimate {
+                    addEnvSensor(
+                        type: 4,
+                        value: Float(lightEstimate.ambientIntensity))
                 }
                 
                 var lost = false
@@ -490,9 +540,9 @@ class RTABMap {
                                         frame.camera.intrinsics[2,0], // cx
                                         frame.camera.intrinsics[2,1], // cy
                                         frame.timestamp,
-                                        CVPixelBufferGetBaseAddressOfPlane(frame.capturedImage, 0),  // y plane pointer
+                                        capturedYPlane,                                             // y plane pointer
                                         nil,                                                         // u plane pointer
-                                        CVPixelBufferGetBaseAddressOfPlane(frame.capturedImage, 1),  // v plane pointer
+                                        capturedUVPlane,                                            // v plane pointer
                                         Int32(CVPixelBufferGetBytesPerRowOfPlane(frame.capturedImage, 0)) * Int32(CVPixelBufferGetHeightOfPlane(frame.capturedImage, 0)),  // yPlaneLen
                                         Int32(CVPixelBufferGetWidth(frame.capturedImage)),           // rgb width
                                         Int32(CVPixelBufferGetHeight(frame.capturedImage)),          // rgb height
@@ -507,18 +557,11 @@ class RTABMap {
                                         confWidth,   // conf width
                                         confHeight,  // conf height
                                         confFormat,  // conf format
-                                        bufferPoints.baseAddress, Int32(frame.rawFeaturePoints!.points.count), 4,
+                                        bufferPoints.baseAddress, Int32(points.count), 4,
                                         v[3,0], v[3,1], v[3,2], quatv.x, quatv.y, quatv.z, quatv.w,
                                         p[0,0], p[1,1], p[2,0], p[2,1], p[2,2], p[2,3], p[3,2],
                                         texCoord[0],texCoord[1],texCoord[2],texCoord[3],texCoord[4],texCoord[5],texCoord[6],texCoord[7])
                 submitted = true
-                if depthMap != nil {
-                    CVPixelBufferUnlockBaseAddress(depthMap!, CVPixelBufferLockFlags.readOnly)
-                }
-                if confMap != nil {
-                    CVPixelBufferUnlockBaseAddress(confMap!, CVPixelBufferLockFlags.readOnly)
-                }
-                CVPixelBufferUnlockBaseAddress(frame.capturedImage, CVPixelBufferLockFlags.readOnly)
             }
         }
         return submitted

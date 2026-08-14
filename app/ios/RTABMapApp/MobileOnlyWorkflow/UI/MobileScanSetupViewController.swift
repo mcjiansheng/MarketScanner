@@ -92,7 +92,7 @@ final class MobileScanSetupViewController: UIViewController {
 
     @available(*, unavailable)
     required init?(coder: NSCoder) {
-        fatalError("MobileScanSetupViewController is programmatic")
+        return nil
     }
 
     override func viewDidLoad() {
@@ -442,18 +442,23 @@ final class MobileScanSetupViewController: UIViewController {
                       pair[1].isFinite else { return nil }
                 return (pair[0], pair[1])
             }
-            if points.count >= 2,
-               abs(points.first!.0 - points.last!.0) < 1e-9,
-               abs(points.first!.1 - points.last!.1) < 1e-9 {
+            if let first = points.first,
+               let last = points.last,
+               points.count >= 2,
+               abs(first.0 - last.0) < 1e-9,
+               abs(first.1 - last.1) < 1e-9 {
                 points.removeLast()
             }
             guard points.count >= 3 else { return }
             let xs = points.map { $0.0 }
             let ys = points.map { $0.1 }
+            guard let minX = xs.min(), let minY = ys.min(),
+                  let maxX = xs.max(), let maxY = ys.max() else {
+                return
+            }
             result[floorID, default: []].append(Obstacle(
                 points: points,
-                bounds: (
-                    xs.min()!, ys.min()!, xs.max()!, ys.max()!)))
+                bounds: (minX, minY, maxX, maxY)))
         }
         for shelf in package.shelves {
             append(
@@ -899,8 +904,8 @@ final class MobileScanSetupViewController: UIViewController {
             presentNotice("请等待地图加载完成，并选择楼层和起点。")
             return
         }
-        guard traversabilityFailure == nil else {
-            presentNotice("起点不可用：\(traversabilityFailure!.reason)")
+        if let traversabilityFailure {
+            presentNotice("起点不可用：\(traversabilityFailure.reason)")
             return
         }
         let identity = MobileBuildIdentity.loadFromBundle()

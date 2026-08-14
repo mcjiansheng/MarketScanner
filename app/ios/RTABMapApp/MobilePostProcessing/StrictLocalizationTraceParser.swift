@@ -368,27 +368,27 @@ enum StrictLocalizationTraceParser {
               object["roadCandidates"] is [Any],
               object["matchCandidates"] is [Any],
               let disposition = object["constraintDisposition"] as? String,
-              constraintDispositions.contains(disposition) else {
+              constraintDispositions.contains(disposition),
+              let constraintAccepted = StrictJSONScalar.boolean(
+                object["constraintAccepted"]),
+              let measurementAccepted = StrictJSONScalar.boolean(
+                object["measurementAccepted"]),
+              let hypothesisTrusted = StrictJSONScalar.boolean(
+                object["hypothesisTrusted"]),
+              let correctionStepApplied = StrictJSONScalar.boolean(
+                object["correctionStepApplied"]),
+              let recoveryConverged = StrictJSONScalar.boolean(
+                object["recoveryConvergedThisUpdate"]),
+              let confidenceAccepted = StrictJSONScalar.boolean(
+                object["confidenceAccepted"]),
+              let scanSearchPerformed = StrictJSONScalar.boolean(
+                object["scanSearchPerformed"]),
+              let recoverySearch = StrictJSONScalar.boolean(
+                object["recoverySearch"]),
+              let automaticTriggerSuppressed = StrictJSONScalar.boolean(
+                object["recoveryAutomaticTriggerSuppressed"]) else {
             throw ParseError.record(line, "formal_state_schema_invalid")
         }
-
-        let constraintAccepted = StrictJSONScalar.boolean(
-            object["constraintAccepted"])!
-        let measurementAccepted = StrictJSONScalar.boolean(
-            object["measurementAccepted"])!
-        let hypothesisTrusted = StrictJSONScalar.boolean(
-            object["hypothesisTrusted"])!
-        let correctionStepApplied = StrictJSONScalar.boolean(
-            object["correctionStepApplied"])!
-        let recoveryConverged = StrictJSONScalar.boolean(
-            object["recoveryConvergedThisUpdate"])!
-        let confidenceAccepted = StrictJSONScalar.boolean(
-            object["confidenceAccepted"])!
-        let scanSearchPerformed = StrictJSONScalar.boolean(
-            object["scanSearchPerformed"])!
-        let recoverySearch = StrictJSONScalar.boolean(object["recoverySearch"])!
-        let automaticTriggerSuppressed = StrictJSONScalar.boolean(
-            object["recoveryAutomaticTriggerSuppressed"])!
 
         let acceptedDisposition = disposition == "accepted_local"
             || disposition == "accepted_recovery_convergence"
@@ -619,9 +619,12 @@ enum StrictLocalizationTraceParser {
                     throw ParseError.record(lineNumber, "pose_invalid")
                 }
             }
-            let xM = StrictJSONScalar.number(estimated["x_m"])!
-            let yM = StrictJSONScalar.number(estimated["y_m"])!
-            let yawRad = StrictJSONScalar.number(estimated["yaw_rad"])!
+            guard let xM = StrictJSONScalar.number(estimated["x_m"]),
+                  let yM = StrictJSONScalar.number(estimated["y_m"]),
+                  let yawRad = StrictJSONScalar.number(
+                    estimated["yaw_rad"]) else {
+                throw ParseError.record(lineNumber, "pose_invalid")
+            }
             let record = TraceRecord(
                 timestamp: timestamp,
                 xM: xM, yM: yM, yawRad: yawRad,
@@ -631,8 +634,10 @@ enum StrictLocalizationTraceParser {
                 nodeTimebaseOffsetSeconds: nodeTimebaseOffset,
                 nodeTimebaseTimestamp: nodeTimebaseTimestamp,
                 confidence: confidence)
-            if retainedCompactor != nil {
-                guard retainedCompactor!.consume(record) else {
+            if var compactor = retainedCompactor {
+                let consumed = compactor.consume(record)
+                retainedCompactor = compactor
+                guard consumed else {
                     throw ParseError.record(
                         lineNumber, "compaction_axis_out_of_range")
                 }

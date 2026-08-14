@@ -1071,7 +1071,23 @@ async function restoreLatestJob() {
       return;
     }
     if (latest.status === "complete") {
-      const complete = await request(`/api/jobs/${latest.id}`);
+      let complete;
+      try {
+        complete = await request(`/api/jobs/${latest.id}`);
+      } catch (error) {
+        if (error.payload?.code === "completed_job_artifacts_unavailable") {
+          completedJobId = null;
+          completedJobKey = null;
+          $("#open-output").disabled = true;
+          setBusy(false);
+          setStatus(
+            "就绪；上次完成任务的已验证成果版本不可恢复。原输入和旧结果目录已保留，请使用新的输出目录重新处理。",
+            "",
+          );
+          return;
+        }
+        throw error;
+      }
       completedJobId = complete.id;
       $("#open-output").disabled = false;
       setStatus("已恢复上次完成任务", "complete");

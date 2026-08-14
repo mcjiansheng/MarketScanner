@@ -1108,11 +1108,11 @@ final class PriorMapStageOneLocalizer {
     func confirmCurrentPosition(
         transform: simd_float4x4,
         mapPose: PriorMapPose2D
-    ) -> (PriorMapPose2D, PriorMapPose2D) {
+    ) -> (PriorMapPose2D, PriorMapPose2D)? {
         let candidate = prepareManualPosition(
             transform: transform,
             mapPose: mapPose)
-        precondition(commitManualPosition(candidate))
+        guard commitManualPosition(candidate) else { return nil }
         return (candidate.arkitPose, candidate.confirmedMapPose)
     }
 
@@ -1368,7 +1368,7 @@ final class PriorMapPosePickerView: UIView,
     }
 
     required init?(coder: NSCoder) {
-        fatalError("init(coder:) has not been implemented")
+        return nil
     }
 
     override func layoutSubviews() {
@@ -1584,7 +1584,7 @@ final class PriorMapPoseSelectionViewController: UIViewController {
     private let confirmButton = UIButton(type: .system)
     private var submissionInFlight = false
 
-    init(
+    init?(
         package: PriorMapPackage,
         floorId: String,
         pose: PriorMapPose2D,
@@ -1593,7 +1593,11 @@ final class PriorMapPoseSelectionViewController: UIViewController {
             @escaping (PriorMapManualPoseSubmissionOutcome) -> Void
         ) -> Void
     ) {
-        let floor = package.manifest.floors.first { $0.id == floorId }!
+        guard let floor = package.manifest.floors.first(where: {
+            $0.id == floorId
+        }) else {
+            return nil
+        }
         picker = PriorMapPosePickerView(
             image: package.preview(floorId: floorId),
             bounds: floor.bounds,
@@ -1606,7 +1610,7 @@ final class PriorMapPoseSelectionViewController: UIViewController {
     }
 
     required init?(coder: NSCoder) {
-        fatalError("init(coder:) has not been implemented")
+        return nil
     }
 
     override func viewDidLoad() {
@@ -1948,7 +1952,7 @@ final class PriorMapWizardViewController: UIViewController, UIDocumentPickerDele
     }
 
     required init?(coder: NSCoder) {
-        fatalError("init(coder:) has not been implemented")
+        return nil
     }
 
     override func viewDidLoad() {
@@ -2292,8 +2296,13 @@ final class PriorMapLiveMapView: UIView {
     private var recentTrajectory: [PriorMapPose2D] = []
     private let boundsM: PriorMapBounds
 
-    init(package: PriorMapPackage, floorId: String) {
-        self.boundsM = package.manifest.floors.first(where: { $0.id == floorId })!.bounds
+    init?(package: PriorMapPackage, floorId: String) {
+        guard let floor = package.manifest.floors.first(where: {
+            $0.id == floorId
+        }) else {
+            return nil
+        }
+        self.boundsM = floor.bounds
         super.init(frame: .zero)
         backgroundColor = UIColor.systemBackground.withAlphaComponent(0.94)
         layer.cornerRadius = 12
@@ -2369,7 +2378,7 @@ final class PriorMapLiveMapView: UIView {
     }
 
     required init?(coder: NSCoder) {
-        fatalError("init(coder:) has not been implemented")
+        return nil
     }
 
     func showEvidenceWriteFailure(_ message: String) {

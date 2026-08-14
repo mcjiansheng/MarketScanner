@@ -734,7 +734,9 @@ final class PriorMapScanMatcher {
             centers: medium,
             fallback: predictedPose,
             points: points,
-            level: levels.last!,
+            // The throwing initializer accepts exactly the three canonical
+            // 0.40/0.20/0.10 m levels, so index 2 is the verified fine level.
+            level: levels[2],
             translationRadius: 0.2,
             translationStep: 0.1,
             yawRadiusDegrees: 2,

@@ -38,7 +38,7 @@ final class MobileMapLibraryViewController: UIViewController,
 
     @available(*, unavailable)
     required init?(coder: NSCoder) {
-        fatalError("MobileMapLibraryViewController is programmatic")
+        return nil
     }
 
     override func viewDidLoad() {
@@ -303,7 +303,12 @@ final class MobileMapLibraryViewController: UIViewController,
     }
 
     private func prepareImportFlowIfIdle() {
-        precondition(Thread.isMainThread)
+        guard Thread.isMainThread else {
+            DispatchQueue.main.async { [weak self] in
+                self?.prepareImportFlowIfIdle()
+            }
+            return
+        }
         guard coordinator.state == .idle,
               navigationController?.topViewController === self,
               presentedViewController == nil else {

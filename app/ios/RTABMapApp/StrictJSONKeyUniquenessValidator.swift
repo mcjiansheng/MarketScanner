@@ -317,7 +317,8 @@ enum StrictJSONKeyUniquenessValidator {
                 return // top-level value complete; trailing bytes are
                 // JSONSerialization's problem
             }
-            switch stack.last! {
+            guard let lastFrame = stack.last else { return }
+            switch lastFrame {
             case .object(let keys, _):
                 if byte == 0x2C { // ,
                     stack[stack.count - 1] = .object(

@@ -198,11 +198,16 @@ final class PriorMapDepthSampler {
                 let continuesRecentTrack = prior.map {
                     frameIndex - $0.lastFrame <= 2
                 } ?? false
-                let hits = prior?.lastFrame == frameIndex
-                    ? prior!.hits
-                    : continuesRecentTrack
-                        ? min(6, (prior?.hits ?? 0) + 1)
-                        : 1
+                let hits: Int
+                if let prior, prior.lastFrame == frameIndex {
+                    hits = prior.hits
+                }
+                else if continuesRecentTrack {
+                    hits = min(6, (prior?.hits ?? 0) + 1)
+                }
+                else {
+                    hits = 1
+                }
                 let firstFrame = continuesRecentTrack
                     ? (prior?.firstFrame ?? frameIndex)
                     : frameIndex

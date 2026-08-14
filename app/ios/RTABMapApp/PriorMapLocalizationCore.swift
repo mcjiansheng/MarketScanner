@@ -271,13 +271,16 @@ final class PriorMapLocalizationAnchor {
     }
 
     func project(arkitPose: PriorMapPose2D) -> PriorMapPose2D {
-        if arkitOrigin == nil {
-            arkitOrigin = arkitPose
+        if let arkitOrigin {
+            return PriorMapStageOneMath.project(
+                arkitPose: arkitPose,
+                arkitOrigin: arkitOrigin,
+                initialMapPose: initialMapPose)
         }
-        return PriorMapStageOneMath.project(
-            arkitPose: arkitPose,
-            arkitOrigin: arkitOrigin!,
-            initialMapPose: initialMapPose)
+        else {
+            arkitOrigin = arkitPose
+            return initialMapPose
+        }
     }
 
     func retainAppliedCorrection(

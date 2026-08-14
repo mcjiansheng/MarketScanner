@@ -348,7 +348,7 @@ enum MobileProcessingPipeline {
                 .completed, taskRoot: request.taskRoot, progress: 1.0,
                 checkpoint: completedCheckpoint,
                 clearError: true)
-            return outcome(from: reopened)
+            return try outcome(from: reopened)
         }
         // §16.4: remove crash-leftover uncommitted result staging of
         // this task (committed results are never touched).
@@ -1255,7 +1255,12 @@ enum MobileProcessingPipeline {
             to: resultDirectory.appendingPathComponent("quality_report.json"))
         // Verbatim native quality JSON for audit/replay parity with the
         // PC diagnostic CLI.
-        try nativeOutcome.qualityJSON.data(using: .utf8)!.write(
+        guard let graphQualityData = nativeOutcome.qualityJSON.data(
+                using: .utf8) else {
+            throw PersistentTaskCheckpoint.CheckpointError.invalidRecord(
+                "native graph quality is not encodable as UTF-8")
+        }
+        try graphQualityData.write(
             to: resultDirectory.appendingPathComponent("graph_quality.json"))
         // input_manifest.json copy from the snapshot transaction.
         let inputManifestURL = request.taskRoot.appendingPathComponent("input_manifest.json")
@@ -1588,7 +1593,7 @@ enum MobileProcessingPipeline {
             throw PersistentTaskCheckpoint.CheckpointError.invalidRecord(
                 "completed task/result checkpoint mismatch")
         }
-        return outcome(from: reopened)
+        return try outcome(from: reopened)
     }
 
     private static func exactCompletedRecord(
@@ -1609,17 +1614,26 @@ enum MobileProcessingPipeline {
 
     private static func outcome(
         from entry: MobileResultLibrary.ResultEntry
-    ) -> Outcome {
+    ) throws -> Outcome {
+        guard let devicePositionCount =
+                PersistentTaskCheckpoint.exactNonnegativeCount(
+                    "device_position_count", in: entry.manifest),
+              let availablePositionCount =
+                PersistentTaskCheckpoint.exactNonnegativeCount(
+                    "available_position_count", in: entry.manifest),
+              let tagCount = PersistentTaskCheckpoint.exactNonnegativeCount(
+                "tag_count", in: entry.manifest),
+              let rescanCount = PersistentTaskCheckpoint.exactNonnegativeCount(
+                "rescan_count", in: entry.manifest) else {
+            throw PersistentTaskCheckpoint.CheckpointError.invalidRecord(
+                "committed result manifest contains invalid outcome counts")
+        }
         return Outcome(
             resultEntry: entry,
-            devicePositionCount: PersistentTaskCheckpoint.exactNonnegativeCount(
-                "device_position_count", in: entry.manifest)!,
-            availablePositionCount: PersistentTaskCheckpoint.exactNonnegativeCount(
-                "available_position_count", in: entry.manifest)!,
-            tagCount: PersistentTaskCheckpoint.exactNonnegativeCount(
-                "tag_count", in: entry.manifest)!,
-            rescanCount: PersistentTaskCheckpoint.exactNonnegativeCount(
-                "rescan_count", in: entry.manifest)!)
+            devicePositionCount: devicePositionCount,
+            availablePositionCount: availablePositionCount,
+            tagCount: tagCount,
+            rescanCount: rescanCount)
     }
 
     // MARK: - Evidence readers

@@ -312,6 +312,11 @@ class CheckpointCleanupConflict(RequestError):
     code = "checkpoint_cleanup_conflict"
 
 
+class CompletedJobRecoveryError(RequestError):
+    status = HTTPStatus.CONFLICT
+    code = "completed_job_artifacts_unavailable"
+
+
 class QualityGateError(RequestError):
     status = HTTPStatus.UNPROCESSABLE_ENTITY
     code = "quality_gate_blocked"
@@ -4066,7 +4071,27 @@ class StudioHandler(BaseHTTPRequestHandler):
             self.send_json(HTTPStatus.NOT_FOUND, {"error": "Job not found."})
             return
         if len(parts) == 4:
-            self.send_json(HTTPStatus.OK, job_payload(job))
+            try:
+                payload = job_payload(job)
+            except LocalizedStoreError as exc:
+                error = CompletedJobRecoveryError(
+                    "The completed job cannot be restored because its "
+                    f"validated result version is unavailable: {exc}"
+                )
+                self.send_json(
+                    error.status,
+                    {
+                        **error.details(),
+                        "job": job_summary_payload(job),
+                        "recovery_action": (
+                            "Keep the original input and existing result "
+                            "directory, then run a new processing task into "
+                            "a new output directory."
+                        ),
+                    },
+                )
+                return
+            self.send_json(HTTPStatus.OK, payload)
             return
         if len(parts) >= 6 and parts[4] == "artifact":
             self.serve_artifact(job, "/".join(parts[5:]))

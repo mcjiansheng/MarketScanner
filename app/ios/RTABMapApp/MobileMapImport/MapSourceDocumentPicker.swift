@@ -30,13 +30,19 @@ final class MapSourceDocumentPicker: NSObject, UIDocumentPickerDelegate {
         onStagingStarted: (() -> Void)? = nil,
         onResult: @escaping (PickedOutcome) -> Void
     ) {
-        precondition(Thread.isMainThread)
         self.pickerViewController = preparedViewController
             ?? Self.makePreparedViewController()
         self.onStagingStarted = onStagingStarted
         self.onResult = onResult
         super.init()
-        pickerViewController.delegate = self
+        if Thread.isMainThread {
+            pickerViewController.delegate = self
+        }
+        else {
+            DispatchQueue.main.sync {
+                self.pickerViewController.delegate = self
+            }
+        }
     }
 
     /// UTType lookup and the Files/FileProvider controller both have a
@@ -55,7 +61,13 @@ final class MapSourceDocumentPicker: NSObject, UIDocumentPickerDelegate {
 
     static func makePreparedViewController()
         -> UIDocumentPickerViewController {
-        precondition(Thread.isMainThread)
+        if !Thread.isMainThread {
+            var prepared: UIDocumentPickerViewController?
+            DispatchQueue.main.sync {
+                prepared = makePreparedViewController()
+            }
+            if let prepared { return prepared }
+        }
         let picker = UIDocumentPickerViewController(
             forOpeningContentTypes: cachedSupportedTypes,
             asCopy: true)
@@ -67,7 +79,17 @@ final class MapSourceDocumentPicker: NSObject, UIDocumentPickerDelegate {
     /// Presents the document picker; the caller must keep a strong
     /// reference to the picker object until `onResult` fires.
     func present(from viewController: UIViewController) {
-        precondition(Thread.isMainThread)
+        guard Thread.isMainThread else {
+            DispatchQueue.main.async { [self, weak viewController] in
+                guard let viewController else {
+                    deliver(.failed(.copyFailed(
+                        reason: "document picker presenter was released")))
+                    return
+                }
+                present(from: viewController)
+            }
+            return
+        }
         pickerViewController.delegate = self
         viewController.present(pickerViewController, animated: true)
     }
@@ -217,7 +239,10 @@ final class MapSourceDocumentPicker: NSObject, UIDocumentPickerDelegate {
             while written < readCount {
                 let result = buffer.withUnsafeBytes { rawBuffer -> Int in
                     while true {
-                        let address = rawBuffer.baseAddress!.advanced(by: written)
+                        guard let baseAddress = rawBuffer.baseAddress else {
+                            return -1
+                        }
+                        let address = baseAddress.advanced(by: written)
                         let value = Darwin.write(
                             destinationDescriptor, address, readCount - written)
                         if value < 0 && errno == EINTR { continue }

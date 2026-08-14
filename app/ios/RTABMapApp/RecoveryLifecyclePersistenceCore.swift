@@ -345,15 +345,15 @@ final class RecoveryLifecyclePersistenceCoordinator {
                 return (.duplicateEpisode, episodeId)
             }
             if episodeId <= 0
-                || (previousEpisodeId != nil
-                    && episodeId <= previousEpisodeId!) {
+                || previousEpisodeId.map({ episodeId <= $0 }) == true {
                 return (.episodeOrderInvalid, episodeId)
             }
             if !startedAtUptime.isFinite
                 || !finishedAtUptime.isFinite
                 || finishedAtUptime < startedAtUptime
-                || (previousFinishedAtUptime != nil
-                    && finishedAtUptime < previousFinishedAtUptime!) {
+                || previousFinishedAtUptime.map({
+                    finishedAtUptime < $0
+                }) == true {
                 return (.finishOrderInvalid, episodeId)
             }
             previousEpisodeId = episodeId

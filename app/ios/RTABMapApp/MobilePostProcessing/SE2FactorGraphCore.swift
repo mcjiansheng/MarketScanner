@@ -71,7 +71,9 @@ enum SE2FactorGraphCore {
         }
         var state: [Double] = []
         for id in freeIDs {
-            let pose = byID[id]!.initialPose
+            guard let pose = byID[id]?.initialPose else {
+                throw FactorGraphError.unknownNode(id)
+            }
             state.append(pose.xM)
             state.append(pose.yM)
             state.append(pose.yawRad)
@@ -146,7 +148,10 @@ enum SE2FactorGraphCore {
         _ state: [Double],
         nodes: [Int64: Node],
         freeIDs: [Int64]
-    ) -> [Int64: SE2Transform] {
+    ) throws -> [Int64: SE2Transform] {
+        guard state.count == freeIDs.count * 3 else {
+            throw FactorGraphError.nonFiniteState
+        }
         var poses: [Int64: SE2Transform] = [:]
         for (id, node) in nodes {
             poses[id] = node.initialPose
@@ -177,12 +182,18 @@ enum SE2FactorGraphCore {
         nodes: [Int64: Node],
         freeIDs: [Int64],
         edges: [Edge]
-    ) -> [Double] {
-        let poses = posesForState(state, nodes: nodes, freeIDs: freeIDs)
+    ) throws -> [Double] {
+        let poses = try posesForState(
+            state, nodes: nodes, freeIDs: freeIDs)
         var rows: [Double] = []
         for edge in edges {
+            guard let fromPose = poses[edge.from],
+                  let toPose = poses[edge.to] else {
+                throw FactorGraphError.unknownNode(
+                    poses[edge.from] == nil ? edge.from : edge.to)
+            }
             let error = relativeError(
-                from: poses[edge.from]!, to: poses[edge.to]!,
+                from: fromPose, to: toPose,
                 measurement: edge.measurement)
             rows.append(error.dx)
             rows.append(error.dy)
@@ -197,7 +208,8 @@ enum SE2FactorGraphCore {
         freeIDs: [Int64],
         edges: [Edge]
     ) throws -> Double {
-        let rows = residualVector(state: state, nodes: nodes, freeIDs: freeIDs, edges: edges)
+        let rows = try residualVector(
+            state: state, nodes: nodes, freeIDs: freeIDs, edges: edges)
         guard rows.allSatisfy({ $0.isFinite }) else {
             throw FactorGraphError.nonFiniteState
         }
@@ -214,8 +226,10 @@ enum SE2FactorGraphCore {
         edges: [Edge]
     ) throws -> [Double] {
         let stateCount = freeIDs.count * 3
-        let poses = posesForState(state, nodes: nodes, freeIDs: freeIDs)
-        let rows = residualVector(state: state, nodes: nodes, freeIDs: freeIDs, edges: edges)
+        let poses = try posesForState(
+            state, nodes: nodes, freeIDs: freeIDs)
+        let rows = try residualVector(
+            state: state, nodes: nodes, freeIDs: freeIDs, edges: edges)
 
         // A = J^T W J (sparse rows), b = -J^T W r.
         var aRows: [[(col: Int, value: Double)]] = Array(repeating: [], count: stateCount)
