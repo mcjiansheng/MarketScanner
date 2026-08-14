@@ -74,6 +74,10 @@ CONTRACT = {
                                  "tagObservationBurstCount",
                                  "tagObservationBurstLastID",
                                  "tagObservationBurstComplete",
+                                 "performanceSampleCount",
+                                 "performanceLastSequence",
+                                 "performanceLastTimestampUnix",
+                                 "performanceEvidenceComplete",
                                  "captureHealth.localizationTraceRecordCount",
                                  "captureHealth.localizationConstraintRecordCount",
                                  "captureHealth.manualLocalizationEventCount",
@@ -108,6 +112,26 @@ CONTRACT = {
             "strict_integer": True,
             "identity_fields": ["trackingSessionId"],
             "watermark_fields": [],
+        },
+        "performance_samples.jsonl": {
+            # Five-second production cadence: 34,560 qualified samples over
+            # the 48-hour product ceiling. The larger hard cap bounds hostile
+            # or future higher-rate inputs without making them qualified.
+            "max_file_bytes": 256 * 1024 * 1024,
+            "max_records": 250000,
+            "qualification_max_records": 48 * 3600 // 5,
+            "qualification_record_rate_hz": 0.2,
+            "max_record_bytes": 64 * 1024,
+            "max_nesting_depth": 8,
+            "final_newline": True,
+            "blank_line_policy": "reject",
+            "strict_bool": True,
+            "strict_integer": True,
+            "identity_fields": ["tracking_session_id"],
+            "watermark_fields": ["performanceSampleCount",
+                                 "performanceLastSequence",
+                                 "performanceLastTimestampUnix",
+                                 "performanceEvidenceComplete"],
         },
         "localization_constraints.jsonl": {
             # 48 qualified hours × 2 formal decisions/s = 345,600 rows.
@@ -251,7 +275,7 @@ def swift_source() -> str:
             if isinstance(value, bool):
                 lines.append("        static let {} = {}".format(
                     key, str(value).lower()))
-            elif isinstance(value, int):
+            elif isinstance(value, (int, float)):
                 lines.append("        static let {} = {}".format(key, value))
             elif isinstance(value, list):
                 items = ", ".join('"{}"'.format(v) for v in value)
@@ -284,7 +308,7 @@ def python_source() -> str:
             value = spec[key]
             if isinstance(value, bool):
                 lines.append("        {!r}: {},".format(key, str(value).capitalize()))
-            elif isinstance(value, int):
+            elif isinstance(value, (int, float)):
                 lines.append("        {!r}: {},".format(key, value))
             else:
                 lines.append("        {!r}: {!r},".format(key, value))

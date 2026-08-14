@@ -102,6 +102,10 @@
         "tagObservationBurstCount",
         "tagObservationBurstLastID",
         "tagObservationBurstComplete",
+        "performanceSampleCount",
+        "performanceLastSequence",
+        "performanceLastTimestampUnix",
+        "performanceEvidenceComplete",
         "captureHealth.localizationTraceRecordCount",
         "captureHealth.localizationConstraintRecordCount",
         "captureHealth.manualLocalizationEventCount",
@@ -114,6 +118,27 @@
       "max_raw_nodes": 200000,
       "max_skeleton_nodes": 4096,
       "max_trajectory_rows": 200000
+    },
+    "performance_samples.jsonl": {
+      "blank_line_policy": "reject",
+      "final_newline": true,
+      "identity_fields": [
+        "tracking_session_id"
+      ],
+      "max_file_bytes": 268435456,
+      "max_nesting_depth": 8,
+      "max_record_bytes": 65536,
+      "max_records": 250000,
+      "qualification_max_records": 34560,
+      "qualification_record_rate_hz": 0.2,
+      "strict_bool": true,
+      "strict_integer": true,
+      "watermark_fields": [
+        "performanceSampleCount",
+        "performanceLastSequence",
+        "performanceLastTimestampUnix",
+        "performanceEvidenceComplete"
+      ]
     },
     "result_package": {
       "immutable": true,

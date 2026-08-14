@@ -11,6 +11,7 @@ import Zip
 import StoreKit
 import UniformTypeIdentifiers
 import simd
+import Darwin
 
 extension Array {
     func size() -> Int {
@@ -140,6 +141,15 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
     private var mMaximumMemory: Int = 0
     private var mLatestDatabaseMemoryMB: Int = 0
     private var mLatestScanStorageBytes: UInt64 = 0
+    private var mLatestPerformanceUpdateTimeMS: Double?
+    private var mLatestPerformanceFPS: Double?
+    private var mLatestPerformanceWordCount: Int?
+    private var mLatestPerformanceFeatureCount: Int?
+    private var mLatestPerformancePointCount: Int?
+    private var mLatestPerformancePolygonCount: Int?
+    private var mLastPerformanceSampleUptime: TimeInterval = 0
+    private var mLastPerformanceCPUTimeSeconds: Double?
+    private var mPerformanceWriteFailureReported = false
     private var mLatestPose = (x: Float(0), y: Float(0), z: Float(0), roll: Float(0), pitch: Float(0), yaw: Float(0))
     private let supermarketStreamingMemoryNodesKey = "SupermarketStreamingMemoryNodes"
     private let supermarketSaveLocationBookmarkKey = "SupermarketSaveLocationBookmark"
@@ -1029,10 +1039,29 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         mMapNodes = nodes;
         mLatestDatabaseMemoryMB = databaseMemoryUsed
         mLatestScanStorageBytes = scanStorageBytes
+        mLatestPerformanceUpdateTimeMS = max(0, Double(updateTime))
+        mLatestPerformanceFPS = max(0, Double(fps))
+        mLatestPerformanceWordCount = max(0, words)
+        mLatestPerformanceFeatureCount = max(0, featuresExtracted)
+        mLatestPerformancePointCount = max(0, points)
+        mLatestPerformancePolygonCount = max(0, polygons)
         mLatestPose = (x, y, z, roll, pitch, yaw)
         let estimatedArea = (self.mState == .STATE_MAPPING) ? (supermarketSession?.updateArea(timestamp: Date().timeIntervalSince1970, nodeCount: nodes, x: x, y: y, z: z, roll: roll, pitch: pitch, yaw: yaw) ?? 0.0) : (supermarketSession?.currentAreaM2 ?? 0.0)
         
         let formattedDate = Date().getFormattedDate(format: "HH:mm:ss.SSS")
+
+        if self.mState == .STATE_MAPPING {
+            self.recordStreamingPerformanceSample(
+                nodeCount: nodes,
+                databaseMemoryMB: databaseMemoryUsed,
+                scanStorageBytes: scanStorageBytes,
+                updateTimeMS: Double(updateTime),
+                renderingFPS: Double(fps),
+                wordCount: words,
+                featureCount: featuresExtracted,
+                pointCount: points,
+                polygonCount: polygons)
+        }
         
         DispatchQueue.main.async {
             if self.mState == .STATE_MAPPING {
@@ -5644,6 +5673,7 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
             self.rtabmap!.openDatabase(databasePath: activeDatabase.path, databaseInMemory: inMemory, optimize: false, clearDatabase: true)
             self.mLatestDatabaseMemoryMB = 0
             self.mLatestScanStorageBytes = 0
+            self.resetStreamingPerformanceTelemetry()
             self.mLastStreamingCheckpointAt = 0
             self.mStreamingCheckpointInFlight = false
             self.mStreamingDiskWarningShown = false
@@ -5940,6 +5970,141 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         formatter.includesUnit = true
         formatter.isAdaptive = true
         return formatter.string(fromByteCount: Int64(min(bytes, UInt64(Int64.max))))
+    }
+
+    private func processCPUTimeSeconds() -> Double?
+    {
+        var usage = rusage()
+        guard getrusage(RUSAGE_SELF, &usage) == 0 else {
+            return nil
+        }
+        let user = Double(usage.ru_utime.tv_sec)
+            + Double(usage.ru_utime.tv_usec) / 1_000_000.0
+        let system = Double(usage.ru_stime.tv_sec)
+            + Double(usage.ru_stime.tv_usec) / 1_000_000.0
+        let total = user + system
+        return total.isFinite && total >= 0 ? total : nil
+    }
+
+    private func resetStreamingPerformanceTelemetry()
+    {
+        mLatestPerformanceUpdateTimeMS = nil
+        mLatestPerformanceFPS = nil
+        mLatestPerformanceWordCount = nil
+        mLatestPerformanceFeatureCount = nil
+        mLatestPerformancePointCount = nil
+        mLatestPerformancePolygonCount = nil
+        mLastPerformanceSampleUptime = 0
+        mLastPerformanceCPUTimeSeconds = nil
+        mPerformanceWriteFailureReported = false
+    }
+
+    private func recordStreamingPerformanceSample(
+        nodeCount: Int? = nil,
+        databaseMemoryMB: Int? = nil,
+        scanStorageBytes: UInt64? = nil,
+        updateTimeMS: Double? = nil,
+        renderingFPS: Double? = nil,
+        wordCount: Int? = nil,
+        featureCount: Int? = nil,
+        pointCount: Int? = nil,
+        polygonCount: Int? = nil,
+        force: Bool = false,
+        scanState: String = "mapping"
+    ) {
+        guard !mDataRecording,
+              let scanSession = supermarketSession,
+              scanSession.rootDirectory != nil else {
+            return
+        }
+        let uptime = ProcessInfo.processInfo.systemUptime
+        guard force || mLastPerformanceSampleUptime == 0
+                || uptime - mLastPerformanceSampleUptime >= 5.0 else {
+            return
+        }
+        let cpuTime = processCPUTimeSeconds()
+        let cpuPercent: Double?
+        if let cpuTime,
+           let previousCPU = mLastPerformanceCPUTimeSeconds,
+           mLastPerformanceSampleUptime > 0,
+           uptime > mLastPerformanceSampleUptime,
+           cpuTime >= previousCPU {
+            cpuPercent = (cpuTime - previousCPU)
+                / (uptime - mLastPerformanceSampleUptime) * 100.0
+        } else {
+            cpuPercent = nil
+        }
+        mLastPerformanceSampleUptime = uptime
+        mLastPerformanceCPUTimeSeconds = cpuTime
+
+        let segmentDirectory: URL
+        let databaseURL: URL
+        do {
+            segmentDirectory = try scanSession.currentSegmentDirectory()
+            databaseURL = try scanSession.streamingDatabaseURL()
+        } catch {
+            if !mPerformanceWriteFailureReported {
+                mPerformanceWriteFailureReported = true
+                scanSession.appendScanEvent(
+                    level: "warning",
+                    event: "performance_sample_failed",
+                    message: "Performance evidence path was unavailable",
+                    fields: ["error": error.localizedDescription])
+            }
+            return
+        }
+        let availableMemoryBytes = ProcessingResourceGovernor.availableMemoryBytes()
+        let memoryFootprintMB = ProcessingResourceGovernor.currentMemoryFootprintMB()
+        let battery = ProcessingResourceGovernor.batteryPercent()
+        let persisted = scanSession.appendPerformanceSample(
+            ScanPerformanceSampleInput(
+                timestampUnix: Date().timeIntervalSince1970,
+                processUptimeSeconds: uptime,
+                scanState: scanState,
+                trackingState: mLastLoggedTrackingState.isEmpty
+                    ? "unknown" : mLastLoggedTrackingState,
+                nodeCount: max(0, nodeCount ?? mMapNodes),
+                databaseMemoryMB: max(
+                    0, databaseMemoryMB ?? mLatestDatabaseMemoryMB),
+                databaseBytes: databaseStorageBytes(at: databaseURL),
+                scanStorageBytes: scanStorageBytes
+                    ?? captureDirectoryStorageBytes(at: segmentDirectory),
+                processMemoryFootprintMB: memoryFootprintMB > 0
+                    ? memoryFootprintMB : nil,
+                availableMemoryMB: availableMemoryBytes >= 0
+                    ? availableMemoryBytes / (1024 * 1024) : nil,
+                processCPUTimeSeconds: cpuTime,
+                processCPUPercent: cpuPercent,
+                thermalState: currentThermalStateText(),
+                batteryPercent: battery >= 0 ? Double(battery) : nil,
+                batteryCharging: battery >= 0
+                    ? ProcessingResourceGovernor.isBatteryCharging() : nil,
+                availableDiskBytes: availableDiskBytes(at: segmentDirectory),
+                renderingFPS: max(0, renderingFPS
+                    ?? mLatestPerformanceFPS ?? 0),
+                rtabmapUpdateTimeMS: max(0, updateTimeMS
+                    ?? mLatestPerformanceUpdateTimeMS ?? 0),
+                wordCount: max(0, wordCount
+                    ?? mLatestPerformanceWordCount ?? 0),
+                featureCount: max(0, featureCount
+                    ?? mLatestPerformanceFeatureCount ?? 0),
+                pointCount: max(0, pointCount
+                    ?? mLatestPerformancePointCount ?? 0),
+                polygonCount: max(0, polygonCount
+                    ?? mLatestPerformancePolygonCount ?? 0),
+                onlineLoopClosureCount: max(0, mTotalLoopClosures),
+                reliableLoopClosureCount: max(0, mReliableLoopClosures)),
+            sealAfterAppend: force && scanState == "finalizing")
+        if !persisted && !mPerformanceWriteFailureReported {
+            mPerformanceWriteFailureReported = true
+            scanSession.appendScanEvent(
+                level: "warning",
+                event: "performance_sample_failed",
+                message: "Performance evidence could not be persisted",
+                fields: [
+                    "policy": "map_data_remains_valid_performance_qualification_closed"
+                ])
+        }
     }
 
     private func applyStreamingMemoryPressurePolicy(availableMemoryMB: Int)
@@ -6404,6 +6569,26 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                     // SQLite may flush WAL pages during save, so measure the
                     // database only after RTAB-Map has completed finalization.
                     finalDatabaseBytes = self.databaseStorageBytes(at: databaseURL)
+                    self.recordStreamingPerformanceSample(
+                        nodeCount: finalNodeCount,
+                        databaseMemoryMB: finalDatabaseMemoryMB,
+                        scanStorageBytes: self.captureDirectoryStorageBytes(
+                            at: segmentDirectory),
+                        force: true,
+                        scanState: "finalizing")
+                    let performanceWatermark =
+                        scanSession.performanceEvidenceWatermark()
+                    if !performanceWatermark.complete {
+                        scanSession.appendScanEvent(
+                            level: "warning",
+                            event: "performance_evidence_incomplete",
+                            message: "Map data was finalized, but performance qualification is incomplete",
+                            fields: [
+                                "sampleCount": "\(performanceWatermark.sampleCount)",
+                                "writeFailureCount": "\(performanceWatermark.writeFailureCount)",
+                                "mapDataPolicy": "retain_finite_map_and_close_performance_qualification",
+                            ])
+                    }
                     let isPriorMapScan =
                         scanSession.scanConfiguration.workflowMode == .priorMapLocalized
                     // V1R4 §7.2: a failed clock sidecar write blocks
@@ -6543,7 +6728,19 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                         // count/last-ID/complete fail-closed.
                         tagObservationBurstCount: burstFlushResult.count,
                         tagObservationBurstLastID: burstFlushResult.lastBurstID,
-                        tagObservationBurstComplete: burstFlushResult.complete)
+                        tagObservationBurstComplete: burstFlushResult.complete,
+                        performanceSamples: "performance_samples.jsonl",
+                        performanceSampleIntervalSeconds: 5.0,
+                        performanceSampleCount:
+                            performanceWatermark.sampleCount,
+                        performanceLastSequence:
+                            performanceWatermark.lastSequence,
+                        performanceLastTimestampUnix:
+                            performanceWatermark.lastTimestampUnix,
+                        performanceEvidenceComplete:
+                            performanceWatermark.complete,
+                        performanceWriteFailureCount:
+                            performanceWatermark.writeFailureCount)
                     let finalSnapshot = scanSession.makeSidecarSnapshot(metadata: metadata)
                     snapshot = finalSnapshot
                     sidecarCommitResult = try scanSession.writeSidecarFiles(
@@ -7888,6 +8085,7 @@ extension ViewController: MobileOnlyScanStarting {
 
         mLatestDatabaseMemoryMB = 0
         mLatestScanStorageBytes = 0
+        resetStreamingPerformanceTelemetry()
         mLastStreamingCheckpointAt = 0
         mStreamingCheckpointInFlight = false
         mStreamingDiskWarningShown = false

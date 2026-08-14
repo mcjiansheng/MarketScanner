@@ -1,6 +1,8 @@
 # 地图辅助定位实现状态
 
-> 文档状态：**当前有效**。最后核对日期：2026-08-14。
+> 文档状态：**当前有效**。最后核对日期：2026-08-15。
+
+2026-08-15 已实现扫描性能证据闭环：iOS 在连续扫描期间约每 5 秒持久化 CPU、物理/可用内存、磁盘、电池、热状态、FPS、RTAB-Map 更新时间、节点和数据库/会话目录增长，并在数据库保存后写终止样本；metadata 提交 exact count/last-sequence/last-time/write-failure 水位。Mobile-Only snapshot/result 保留 raw JSONL 与性能水位；Map Studio 对 framing、finite scalar、identity、sequence、timestamp、stat 和 metadata 水位执行严格流式校验，在最终地图目录生成 raw JSONL、CSV、摘要、MetricKit 诊断副本和有界 Web 趋势。iOS 公开 API 无法提供可靠整机 GPU 利用率，因此该指标显式 unavailable，不伪造。性能证据错误只关闭 performance qualification，不删除有限地图数据。当前源码已通过 PriorMap 330/330、Qualification 30/30、Map Studio 141/141、独立 Swift host 1/1、语法/合同/patch、unsigned generic iphoneos Debug 和浏览器响应式检查；QualifiedDevice Release 仍只接受 clean exact commit。该功能仍需签名真机两小时扫描、热/低电量/低磁盘/异常退出后的 MetricKit 延迟投递矩阵，不能据此提升整体 **NO-GO / NOT PRODUCTION READY** 状态。
 
 2026-08-14 现场反馈复核增量已修复人工重定位旧 transform 手势、最后文本编辑丢失、旧 node 缓存低成功率和“先改内存后写审计”的原子性缺口；人工 correction 现在等待 fresh accepted RTAB-Map node，并按 durable-first/CAS 提交。RTAB-Map、prior-map、ESL 和 location-bearing sensor boundary 使用统一 stabilized pose authority，tracking gap 不再放宽到 6 m/360°。连续 profile 的实际 OptimizeMaxError/MinInliers 已可审计，MetricKit crash/hang payload 可随本地会话导出并由 Map Studio 解析。由于现场 4 次异常尚无 `.ips`/符号化栈，且 crash 后跨 ARKit epoch 继续同一业务任务、Sam WM/LTM 召回 A/B 和正式 shelf-loop manifest v5 尚未完成，整体仍是 **NO-GO**；详细关闭条件见 [`TESTER_FEEDBACK_TODO_2026-08-14.md`](TESTER_FEEDBACK_TODO_2026-08-14.md)。
 

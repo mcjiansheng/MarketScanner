@@ -51,6 +51,7 @@ import supermarket_staged_map as staged
 import offline_processing as offline
 import gpu_acceleration as gpu
 import merge_processing as merge
+import performance_analysis as phone_performance
 from PriorMap.prior_map_schema import validate_package as validate_prior_map_package
 from PriorMap.prior_map_compatibility import (
     PriorMapCompatibilityError,
@@ -93,6 +94,11 @@ ARTIFACTS = (
     "source_manifest.json",
     "offline_processing_report.json",
     "pc_acceleration_report.json",
+    "performance/performance_manifest.json",
+    "performance/phone/phone_performance_summary.json",
+    "performance/phone/phone_performance_samples.csv",
+    "performance/phone/phone_performance_samples.jsonl",
+    "performance/phone/phone_performance_samples.invalid.jsonl",
     "merge_edits.json",
     "merge_manifest.json",
     "merge_report.json",
@@ -127,6 +133,64 @@ ARTIFACTS = (
     "field_evidence.json",
     "qualification_manifest.json",
 )
+
+PERFORMANCE_NAMESPACE_PATTERN = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
+PERFORMANCE_RESULT_FILES = frozenset(
+    {
+        "phone_performance_summary.json",
+        "phone_performance_samples.csv",
+        "phone_performance_samples.jsonl",
+        "phone_performance_samples.invalid.jsonl",
+    }
+)
+
+
+def is_performance_artifact_name(name: str) -> bool:
+    if "\\" in name or name.startswith("/"):
+        return False
+    parts = name.split("/")
+    if any(part in {"", ".", ".."} for part in parts):
+        return False
+    if parts == ["performance", "performance_manifest.json"]:
+        return True
+    if (
+        len(parts) == 3
+        and parts[0] == "performance"
+        and PERFORMANCE_NAMESPACE_PATTERN.fullmatch(parts[1]) is not None
+        and parts[2] in PERFORMANCE_RESULT_FILES
+    ):
+        return True
+    return bool(
+        len(parts) == 4
+        and parts[0] == "performance"
+        and PERFORMANCE_NAMESPACE_PATTERN.fullmatch(parts[1]) is not None
+        and parts[2] == "diagnostics"
+        and re.fullmatch(r"metrickit_diagnostics_[0-9]{3}\.jsonl", parts[3])
+    )
+
+
+def performance_artifact_names(output: Path) -> list[str]:
+    root = output / "performance"
+    try:
+        root_info = root.lstat()
+    except OSError:
+        return []
+    if not stat.S_ISDIR(root_info.st_mode) or root.is_symlink():
+        return []
+    names: list[str] = []
+    for path in sorted(root.rglob("*")):
+        name = path.relative_to(output).as_posix()
+        if not is_performance_artifact_name(name):
+            continue
+        try:
+            info = path.lstat()
+        except OSError:
+            continue
+        if stat.S_ISREG(info.st_mode) and info.st_nlink == 1 and not path.is_symlink():
+            names.append(name)
+    return names
+
+
 JOB_RUNTIME_TOOL_VERSION = "MarketScannerMapStudioJobRuntime/1"
 MAP_STUDIO_VERSION = "MarketScannerMapStudio/2"
 SESSION_TTL_SECONDS = 30 * 60
@@ -851,6 +915,12 @@ def job_artifacts(
         for name in ARTIFACTS
         if (job.output_dir / name).is_file()
     }
+    artifacts.update(
+        {
+            name: f"/api/jobs/{job.identifier}/artifact/{name}"
+            for name in performance_artifact_names(job.output_dir)
+        }
+    )
     if job.kind == "localized":
         snapshot = localized_snapshot
         if snapshot is None:
@@ -1249,6 +1319,7 @@ def inspect_session(session: Path) -> Dict[str, Any]:
         "prior_map_localization": prior_map_localization_summary(session),
         "scan_logs": scan_event_logs(session),
         "crash_diagnostics": metrickit_diagnostic_logs(session),
+        "phone_performance": phone_performance.analyze_session(session),
         "checkpoint_cleanup": checkpoint_cleanup_evidence(session),
         "active_job": job_payload(active_job) if active_job else None,
     }
@@ -1875,6 +1946,99 @@ def attach_acceleration_report(
             path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def attach_phone_performance_reports(
+    output: Path,
+    sources: Iterable[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Publish validated phone telemetry without invalidating usable map data.
+
+    Performance evidence is qualification/audit data. A missing or malformed
+    sidecar is made explicit in the map quality report, but it does not erase
+    an otherwise finite trajectory or prevent a diagnostic map from being
+    generated.
+    """
+
+    entries: list[Dict[str, Any]] = []
+    for source in sources:
+        namespace = str(source["namespace"])
+        session = Path(source["session"])
+        try:
+            summary = phone_performance.write_result_artifacts(
+                session,
+                output,
+                namespace=namespace,
+            )
+        except (OSError, phone_performance.PerformanceEvidenceError) as exc:
+            summary = phone_performance.unavailable_summary(
+                f"performance_evidence_invalid: {exc}"
+            )
+        entries.append(
+            {
+                "namespace": namespace,
+                "device_id": source.get("device_id"),
+                "session_name": session.name,
+                "summary": summary,
+            }
+        )
+
+    manifest = {
+        "format": "MarketScannerPerformanceResultManifest",
+        "version": 1,
+        "source_count": len(entries),
+        "performance_qualified": bool(entries)
+        and all(
+            entry["summary"].get("performance_qualified") is True
+            for entry in entries
+        ),
+        "entries": entries,
+        "gpu_measurement_note": (
+            "iOS has no general public whole-device GPU utilization API; "
+            "unavailable GPU utilization remains null and is never inferred "
+            "from CPU or renderer timing."
+        ),
+    }
+    performance_root = output / "performance"
+    performance_root.mkdir(parents=True, exist_ok=True)
+    manifest_path = performance_root / "performance_manifest.json"
+    manifest_path.write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2, allow_nan=False) + "\n",
+        encoding="utf-8",
+    )
+
+    compact_entries = []
+    for entry in entries:
+        compact_summary = dict(entry["summary"])
+        compact_summary.pop("series", None)
+        compact_entries.append({**entry, "summary": compact_summary})
+    compact_report = {
+        "performance_qualified": manifest["performance_qualified"],
+        "sources": compact_entries,
+        "manifest": "performance/performance_manifest.json",
+    }
+    for name in ("quality_report.json", "map.json"):
+        path = output / name
+        payload = load_json(path, {})
+        if not isinstance(payload, dict):
+            continue
+        payload["phone_performance"] = compact_report
+        if name == "quality_report.json" and not manifest["performance_qualified"]:
+            warnings = payload.get("warnings")
+            if not isinstance(warnings, list):
+                warnings = []
+            warning = (
+                "Phone performance evidence is missing, incomplete, malformed, "
+                "or contains qualification warnings; see performance/performance_manifest.json."
+            )
+            if warning not in warnings:
+                warnings.append(warning)
+            payload["warnings"] = warnings
+        path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2, allow_nan=False),
+            encoding="utf-8",
+        )
+    return manifest
+
+
 def find_existing_result(session: Path) -> Optional[Job]:
     required = ("map.json", "preview.png", "preview_3d.json", "quality_report.json")
     candidates = []
@@ -2054,6 +2218,10 @@ def run_manual_merge(
         base.generate(args)
         acceleration_report = projector.report()
     report_progress(progress, 94, "写入修复版本", "正在保存人工操作、约束和验证报告")
+    attach_phone_performance_reports(
+        output,
+        [{"namespace": "phone", "session": session}],
+    )
     attach_offline_reports(output, [report])
     attach_acceleration_report(output, acceleration_report, [report])
     merge.write_merge_artifacts(output, preview, validation, base_job.output_dir)
@@ -2142,6 +2310,10 @@ def run_stage(data: Dict[str, Any], output: Path, progress: Optional[ProgressCal
             staged.generate(args)
             acceleration_report = projector.report()
         report_progress(progress, 94, "整理成果", "阶段地图已生成，正在写入质量报告")
+        attach_phone_performance_reports(
+            output,
+            [{"namespace": "phone", "session": session}],
+        )
         attach_offline_reports(output, reports)
         attach_acceleration_report(output, acceleration_report, reports)
         report_progress(progress, 98, "校验成果", "阶段地图成果文件已写入")
@@ -2185,6 +2357,10 @@ def run_basic_map(data: Dict[str, Any], output: Path, progress: Optional[Progres
             base.generate(args)
             acceleration_report = projector.report()
         report_progress(progress, 94, "整理成果", "地图已生成，正在写入质量报告和清单")
+        attach_phone_performance_reports(
+            output,
+            [{"namespace": "phone", "session": session}],
+        )
         attach_offline_reports(output, reports)
         attach_acceleration_report(output, acceleration_report, reports)
         report_progress(progress, 98, "校验成果", "地图成果文件已写入")
@@ -2440,6 +2616,10 @@ def run_localized_map(
     # These root-level reports are part of successful job completion.  Finish
     # them before the immutable localized pointer commit so a post-processing
     # failure cannot leave a failed job with an advanced current pointer.
+    attach_phone_performance_reports(
+        output,
+        [{"namespace": "phone", "session": session}],
+    )
     attach_offline_reports(output, [offline_report])
     attach_acceleration_report(output, acceleration_report, [offline_report])
     localized_result = localized.process_localized_session(
@@ -3258,6 +3438,7 @@ def run_multi(data: Dict[str, Any], output: Path, progress: Optional[ProgressCal
         raise RequestError("At least two device sessions are required.")
     devices = []
     reports: List[Dict[str, Any]] = []
+    performance_sources: List[Dict[str, Any]] = []
     options = map_options(data)
     report_progress(progress, 4, "检查多设备输入", f"正在检查 {len(raw_devices)} 个设备会话")
     acceleration = acceleration_selection(options, progress)
@@ -3274,6 +3455,13 @@ def run_multi(data: Dict[str, Any], output: Path, progress: Optional[ProgressCal
             "yaw_deg": number(raw_device.get("yaw_deg"), f"{device_id} yaw", 0.0),
         }
         device: Dict[str, Any] = {"id": device_id, "session": str(session)}
+        performance_sources.append(
+            {
+                "namespace": f"device_{index:02d}",
+                "device_id": device_id,
+                "session": session,
+            }
+        )
         if any(abs(value) > 1e-12 for value in transform.values()):
             device["transform"] = transform
         if options["offline_optimize"]:
@@ -3318,6 +3506,7 @@ def run_multi(data: Dict[str, Any], output: Path, progress: Optional[ProgressCal
             multi.generate(args)
             acceleration_report = projector.report()
         report_progress(progress, 94, "整理成果", "多设备地图已生成，正在写入质量报告")
+        attach_phone_performance_reports(output, performance_sources)
         attach_offline_reports(output, reports)
         attach_acceleration_report(output, acceleration_report, reports)
         report_progress(progress, 98, "校验成果", "多设备地图成果文件已写入")
@@ -3926,27 +4115,73 @@ class StudioHandler(BaseHTTPRequestHandler):
         self.send_content(name, content)
 
     def serve_artifact(self, job: Job, name: str) -> None:
-        if name not in ARTIFACTS and not name.startswith("preview_frames/"):
+        if (
+            name not in ARTIFACTS
+            and not name.startswith("preview_frames/")
+            and not is_performance_artifact_name(name)
+        ):
             self.send_json(HTTPStatus.NOT_FOUND, {"error": "Artifact is not available."})
             return
         self.serve_file(job.output_dir, name)
 
     def serve_file(self, root: Path, name: str) -> None:
-        path = (root / name).resolve()
-        if root.resolve() not in path.parents or not path.is_file():
+        candidate = root / name
+        path = candidate.resolve()
+        if root.resolve() not in path.parents:
             self.send_json(HTTPStatus.NOT_FOUND, {"error": "Artifact was not found."})
             return
-        self.send_content(name, path.read_bytes())
+        try:
+            before = candidate.lstat()
+            if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+                raise OSError("artifact is not a single-link regular file")
+            flags = (
+                os.O_RDONLY
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_BINARY", 0)
+            )
+            descriptor = os.open(candidate, flags)
+            opened = os.fstat(descriptor)
+            if (
+                before.st_dev,
+                before.st_ino,
+                before.st_mode,
+                before.st_nlink,
+                before.st_size,
+                before.st_mtime_ns,
+            ) != (
+                opened.st_dev,
+                opened.st_ino,
+                opened.st_mode,
+                opened.st_nlink,
+                opened.st_size,
+                opened.st_mtime_ns,
+            ):
+                os.close(descriptor)
+                raise OSError("artifact changed while opening")
+        except OSError:
+            self.send_json(HTTPStatus.NOT_FOUND, {"error": "Artifact was not found."})
+            return
+        handle = os.fdopen(descriptor, "rb")
+        try:
+            content_type = self.content_type_for_name(name)
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(opened.st_size))
+            self.send_header("Cache-Control", "no-store")
+            self.send_security_headers()
+            self.end_headers()
+            while True:
+                chunk = handle.read(1024 * 1024)
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+        except (BrokenPipeError, ConnectionResetError):
+            return
+        finally:
+            handle.close()
 
     def send_content(self, name: str, content: bytes) -> None:
-        content_type = {
-            ".png": "image/png",
-            ".jpg": "image/jpeg",
-            ".jpeg": "image/jpeg",
-            ".csv": "text/csv; charset=utf-8",
-            ".json": "application/json; charset=utf-8",
-            ".geojson": "application/geo+json; charset=utf-8",
-        }.get(Path(name).suffix, "application/octet-stream")
+        content_type = self.content_type_for_name(name)
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(content)))
@@ -3954,6 +4189,18 @@ class StudioHandler(BaseHTTPRequestHandler):
         self.send_security_headers()
         self.end_headers()
         self.wfile.write(content)
+
+    @staticmethod
+    def content_type_for_name(name: str) -> str:
+        return {
+            ".png": "image/png",
+            ".jpg": "image/jpeg",
+            ".jpeg": "image/jpeg",
+            ".csv": "text/csv; charset=utf-8",
+            ".json": "application/json; charset=utf-8",
+            ".jsonl": "application/x-ndjson; charset=utf-8",
+            ".geojson": "application/geo+json; charset=utf-8",
+        }.get(Path(name).suffix, "application/octet-stream")
 
     def serve_static(self, request_path: str) -> None:
         name = "index.html" if request_path in {"", "/"} else request_path.lstrip("/")

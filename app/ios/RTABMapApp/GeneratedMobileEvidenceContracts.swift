@@ -80,7 +80,7 @@ enum GeneratedMobileEvidenceContracts {
         static let max_records = 1
         static let strict_bool = true
         static let strict_integer = true
-        static let watermark_fields: [String] = ["finalized", "clockCorrelationCount", "clockNodeBindingCount", "tagObservationBurstCount", "tagObservationBurstLastID", "tagObservationBurstComplete", "captureHealth.localizationTraceRecordCount", "captureHealth.localizationConstraintRecordCount", "captureHealth.manualLocalizationEventCount", "captureHealth.localizationRecoveryEventCount"]
+        static let watermark_fields: [String] = ["finalized", "clockCorrelationCount", "clockNodeBindingCount", "tagObservationBurstCount", "tagObservationBurstLastID", "tagObservationBurstComplete", "performanceSampleCount", "performanceLastSequence", "performanceLastTimestampUnix", "performanceEvidenceComplete", "captureHealth.localizationTraceRecordCount", "captureHealth.localizationConstraintRecordCount", "captureHealth.manualLocalizationEventCount", "captureHealth.localizationRecoveryEventCount"]
     }
 
     enum File_native_graph {
@@ -89,6 +89,21 @@ enum GeneratedMobileEvidenceContracts {
         static let max_raw_nodes = 200000
         static let max_skeleton_nodes = 4096
         static let max_trajectory_rows = 200000
+    }
+
+    enum File_performance_samples_jsonl {
+        static let blank_line_policy = "reject"
+        static let final_newline = true
+        static let identity_fields: [String] = ["tracking_session_id"]
+        static let max_file_bytes = 268435456
+        static let max_nesting_depth = 8
+        static let max_record_bytes = 65536
+        static let max_records = 250000
+        static let qualification_max_records = 34560
+        static let qualification_record_rate_hz = 0.2
+        static let strict_bool = true
+        static let strict_integer = true
+        static let watermark_fields: [String] = ["performanceSampleCount", "performanceLastSequence", "performanceLastTimestampUnix", "performanceEvidenceComplete"]
     }
 
     enum File_result_package {

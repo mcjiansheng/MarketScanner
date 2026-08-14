@@ -1,6 +1,6 @@
 # RTAB-Map 大型超市扫描与地图工作台
 
-> 文档状态：**当前有效**。最后一次与源码交叉核对日期：2026-08-14。
+> 文档状态：**当前有效**。最后一次与源码交叉核对日期：2026-08-15。
 
 本项目是在开源 **RTAB-Map** 基础上进行的业务化改造，面向大型超市、仓储卖场等室内场景，形成从 iPhone Pro 连续采集，到 PC 端离线优化，再到二维地图、彩色俯视图和三维预览的一套本地工作流。
 
@@ -15,7 +15,7 @@
 ```text
 iPhone Pro RGB-D / LiDAR / IMU / ARKit 采集
   -> 连续写入单个 RTAB-Map SQLite 数据库
-  -> 位姿质量门控、在线回环 map→odom 同步、跨帧结构覆盖提示、自适应关键帧与设备安全保护
+  -> 位姿质量门控、在线回环 map→odom 同步、跨帧结构覆盖提示、自适应关键帧、设备安全保护与有界性能时间线
   -> 完整会话导出到 PC
   -> 数据库检查与自适应离线闭环/全局优化
   -> 轨迹安全验证
@@ -43,7 +43,7 @@ iPhone Pro RGB-D / LiDAR / IMU / ARKit 采集
 | --- | --- |
 | iOS 采集 | 增加超市扫描会话、连续流式单库、跨帧结构覆盖顾问、自适应关键帧、中文界面、sidecar 数据和外部目录复制 |
 | 移动原生层 | 增加相机原点保持、连续地图模式、有界实时渲染、在线回环 map→odom 同步、数据库操作和 Swift/C++ 桥接能力 |
-| 稳定性 | 对 ARKit tracking 恢复和不合理位姿跳变进行质量门控；用跨时间/视角的深度证据抑制单帧行人噪声；按内存、磁盘和热状态降低预览、限制采样或安全结束 |
+| 稳定性与可观测性 | 对 ARKit tracking 恢复和不合理位姿跳变进行质量门控；用跨时间/视角的深度证据抑制单帧行人噪声；按内存、磁盘和热状态降低预览、限制采样或安全结束；约每 5 秒持久化 CPU、内存、磁盘、热、电池、FPS、RTAB-Map 更新时间和数据库增长 |
 | PC 优化 | 扩展 `rtabmap-reprocess` 的进度、约束统计和最终求解流程，支持工作台执行自适应离线优化 |
 | 地图生成 | 新增单设备、历史多阶段、多设备二维地图脚本，输出占据图、融合地板空缺、自由空间、竖直面与层板证据的货架实例闭合边界、轨迹、GeoJSON 和质量报告；保留旧价签数据兼容解析 |
 | 可视化工作台 | 新增仅监听本机的 Web 工作台，统一进行输入检查、处理编排、2D/3D 预览、日志和结果检查 |
@@ -156,6 +156,7 @@ PC 输入 manifest v3 在既有 Recovery 证据之外绑定 burst sidecar，v4 �
 - 设备进入 `fair` 热状态即先降低实时绘制并限制自适应采样；`serious` 时进一步缩小在线窗口。
 - 可用空间低于安全线或热状态达到 `critical` 时完成并关闭当前数据库，避免继续写入造成损坏。
 - 扫描期间周期写入 `live_checkpoint.json`；只有数据库保存、全部必需 sidecar 写入和最终元数据提交都成功后才删除 checkpoint。已有地图模式的定位证据若有任一必需写入失败，会保留红色告警、`finalized=false`、失败计数和 checkpoint，停止新的先验地图修正/价签确认，但原始 RTAB-Map 数据库仍继续安全记录。
+- 扫描期间约每 5 秒向 `performance_samples.jsonl` 追加一条有界结构化样本，数据库保存完成后再写终止样本。`metadata.json` 记录精确条数、末序号、末时间和写失败水位。性能证据缺失/损坏会关闭“性能资格通过”结论，但不会删除有限轨迹或让安全落盘的原始地图失效。
 - `metadata.json(finalized=true)` 是不可逆提交点。若其后仅 checkpoint 删除失败，应用进入“已完成、待清理”终态，绝不恢复相机或继续写库；手机启动恢复提示和 Map Studio 显式 API 只会在同一 tracking identity、checkpoint 时间不晚于提交时间时清理，并写审计事件。若 metadata 以 `finalized=false` 成功保存粘性证据失败，会话同样停止并作为不可处理的原始数据库恢复包导出，而不是回到永远无法恢复资格的 prior-map 录制。
 - 选择外部保存目录时，应用在数据库关闭后后台复制整个会话，关闭复制句柄后逐文件复读并核对相对路径、字节数和 SHA-256，再确认源目录未变化；输出 `copy_verification.json`，默认保留本地副本。文件提供者完成不等于设备断电持久化，真机 provider 验收前不会自动删除唯一副本。
 
@@ -175,6 +176,8 @@ SupermarketSession-YYYYMMDD-HHMMSS/
     trajectory_samples.json
     trajectory_samples.csv
     scan_events.jsonl
+    performance_samples.jsonl       # 约 5 秒一条的手机性能时间线
+    metrickit_diagnostics.jsonl      # 系统延迟投递时的 crash/hang/CPU/disk-write 诊断
     localization_trace.jsonl          # 仅已有地图辅助扫描
     localization_constraints.jsonl    # 仅已有地图辅助扫描
     localization_events.jsonl         # 仅已有地图辅助扫描
@@ -192,6 +195,8 @@ SupermarketSession-YYYYMMDD-HHMMSS/
 - `structure_coverage_cells.json`：跨帧深度结构证据、时间/视角重复次数和最终覆盖摘要；用于审计采集是否充分，不替代原始 RGB-D 数据库。
 - `trajectory_samples.*`：移动端采样轨迹，供检查和兼容流程使用。
 - `scan_events.jsonl`：tracking、中断恢复、自适应采样、结构覆盖提示、闭环健康、内存、热状态、磁盘和结束事件的结构化日志。
+- `performance_samples.jsonl`：严格递增的有界性能时间线，记录进程 CPU 时间/占用率、物理内存、可用内存/磁盘、电池/充电、热状态、FPS、RTAB-Map 更新时间、节点/数据库/会话目录增长。iOS 没有普通应用可用的可靠整机 GPU 利用率公开 API，因此明确写 `gpu_metric_status=not_available_public_ios_api`，绝不从 CPU 或渲染时间伪造 GPU 百分比。
+- `metrickit_diagnostics*.jsonl`：MetricKit 延迟投递的 crash、hang、CPU exception 和 disk-write exception 原始诊断；若系统已投递到该会话，PC 结果包会原样保留。
 - `tag_observations.jsonl` / `tag_observation_bursts.jsonl`：已有地图模式下的严格 ESL 逐帧与完整 burst 证据；两者必须在最终化和 PC parse-and-hash-once snapshot 中精确交叉绑定。
 - `localized_price_tags.json`：用户确认后的价签结果；v2 将 algorithm evidence 与 user-confirmed evidence 分开，现场确认不会回写或覆盖算法/SLAM 事实。
 
@@ -206,10 +211,12 @@ SupermarketSession-YYYYMMDD-HHMMSS/
 - 连续流式单库、旧版分段会话和多设备会话检查；
 - SQLite 完整性、RGB-D/标定、时间戳和节点统计检查；
 - 手机端稳定/多视角结构覆盖、地面冲突和自适应节点率摘要检查；
+- 手机性能时间线的严格 framing/身份/水位校验，以及 CPU、内存、磁盘增长、热、电池、FPS、RTAB-Map 更新时间的趋势、分位数、峰值和采样缺口分析；
 - `rtabmap-reprocess` 离线闭环与全局优化编排；
 - 优化前后轨迹覆盖率、步长、旋转、垂直跨度和尺度验证；
 - 二维结构图、白底黑色货架闭合边界、彩色 RGB-D 俯视图和 WebGL 三维预览；
 - 手机采集日志、PC 处理日志、质量结论与成果文件浏览；
+- 最终地图目录内生成 `performance/phone/phone_performance_samples.jsonl`、同名 CSV、`phone_performance_summary.json` 与总清单；坏日志不伪装成统计结果，但在安全大小范围内以 `.invalid.jsonl` 完整保留供取证；
 - 已完成结果发现和相同参数结果复用。
 - 对连续单库结果执行人工区域误差修复：框选重复区域、预览 `kUserClosure` 节点约束，确认后在数据库副本上重新全局优化；只有全部人工约束端点仍存在，且平移残差、旋转残差和全图位移均通过安全门，才发布新的 `MapStudio-Merge-*` 版本；原始扫描库和基线结果保持不变。
 

@@ -1,6 +1,16 @@
 # 地图辅助定位阶段一至阶段三测试计划
 
-> 文档状态：**当前有效**。最后核对日期：2026-08-14。
+> 文档状态：**当前有效**。最后核对日期：2026-08-15。
+
+### 2026-08-15 手机性能证据与结果包回归
+
+自动化必须覆盖：5 秒正常 cadence 与保存后的 `finalizing` 样本；CPU 首样本无区间百分比、后续按 `(delta user+system CPU)/(delta uptime)` 计算且允许多核超过 100%；`phys_footprint`、process-available-memory、磁盘、电池/充电、热状态、FPS、RTAB-Map update、节点/数据库/会话目录增长均使用有限非负值或明确 unavailable，禁止 NaN/Infinity 和用 0 冒充不可测量。写侧必须受 250,000 条、256 MiB、64 KiB/row 上限约束，metadata 的 count/last sequence/last timestamp/write-failure/complete 与落盘文件一致；性能写失败只关闭 performance qualification，不得把有限地图结果删除或伪装成定位证据失败。
+
+PC strict parser 必须覆盖 final newline、空行、坏 UTF-8/JSON、NaN、format/version、tracking identity、序号跳号/重复、时间倒退、metadata count/末序号/末时间漂移、symlink/hardlink/超限、分析期间 inode/size/mtime 变化。正常结果要生成 exact raw SHA-256 副本、CSV、summary 和最多 720 点的确定性浏览器序列；25,000+ 行测试证明序列/分位样本有界且重复运行一致。坏日志不得生成可信 CSV/趋势，但安全大小内的 exact bytes 必须以 `.invalid.jsonl` 保留。MetricKit 已投递日志按单文件 8 MiB 上限复制并记录 hash；未投递不得解释为“没有 crash”。
+
+真机资格矩阵至少包括：30 分钟、2 小时连续扫描；nominal/fair/serious 热状态；充电/不充电；低电量；可用内存压力；8 GiB/1 GiB 低磁盘门；前后台/系统中断；正常结束、强杀、watchdog/真实 crash 后重启及 MetricKit 延迟投递。将同一结果包导入 PC，核对原始 JSONL、metadata、CSV、summary、Web 图表和实际时间点一致，并检查性能采样自身未造成可见帧率周期性尖峰。没有上述设备证据时只能声明 host/Xcode 验证，不能声明性能生产资格或整体 GO。
+
+当前自动化证据：PriorMap **330/330 PASS（374.856 s）**、Qualification **30/30 PASS**、Map Studio **141/141 PASS**、独立 Swift 主机长方法 **1/1 PASS（326.803 s）**，并通过生成合同检查、Swift/Python/JavaScript 语法、patch-format 和 unsigned generic iphoneos Debug 全量编译/链接。浏览器在 1600/1280/980 宽度均无横向溢出，980 宽度切换为单列且控制台无 warning/error。QualifiedDevice Release 必须在 clean exact commit 上重新构建并核对 bundle identity；上述真机矩阵仍全部 NOT RUN。
 
 ### 2026-08-14 现场反馈回归
 

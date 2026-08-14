@@ -1,6 +1,6 @@
 # 已有地图辅助扫描数据格式
 
-> 文档状态：**当前有效**。最后核对日期：2026-08-14。
+> 文档状态：**当前有效**。最后核对日期：2026-08-15。
 
 ## 会话元数据
 
@@ -57,6 +57,22 @@
 }
 ```
 
+所有新完成会话（自由扫描与已有地图扫描）还声明独立性能证据：
+
+```json
+{
+  "performanceSamples": "performance_samples.jsonl",
+  "performanceSampleIntervalSeconds": 5.0,
+  "performanceSampleCount": 1441,
+  "performanceLastSequence": 1441,
+  "performanceLastTimestampUnix": 1786729800.125,
+  "performanceEvidenceComplete": true,
+  "performanceWriteFailureCount": 0
+}
+```
+
+`performanceEvidenceComplete=true` 要求至少一条样本、成功写入零失败，且 count/末序号/末时间与文件完全一致。性能证据是 observability，不是定位或坐标 authority：缺失、写失败或坏行会禁止宣称“性能资格通过”，但不会把本来有限、安全落盘的地图/轨迹删除。Mobile-Only immutable snapshot 在字段存在时必须绑定该文件的 exact bytes/hash；旧会话缺少这组字段仍可按旧定位证据合同处理。
+
 `priorMapSha256` 是扫描时手机上 exact package artifact 的身份，仍用于全部实时 sidecar 的同会话一致性校验；Swift 与 Python 编译器生成的派生 package bytes 不承诺相同，因此它不再被解释为跨编译器通用身份。新会话同时写 `priorMapCanonicalSourceSha256`，PC 以完整 canonical source SHA 和 exact `priorMapId/storeId/floorId` 绑定同一源地图。缺失 canonical 字段的历史会话只能走显式 legacy cross-compiler compatibility：selected package 必须已通过 production validator，map/store/floor 必须精确一致，prior-map ID 的 12 位后缀必须等于 selected canonical SHA 前 12 位，手机 package SHA 必须为合法小写 SHA-256 且在 metadata/sidecar 内一致；输出报告必须标记 compatibility mode 并同时保留手机/PC/canonical/source SHA。
 
 `floorId` 在会话开始时固定，当前版本没有扫描中楼层切换事件。二维 `rawPose/estimatedPose` 只表达所选楼层内的 `x/y/yaw`：ARKit `+x` 对应地图 `+x`，ARKit `-z` 对应地图 `+y`，地图 yaw 0 指向 `+x`（东/右）、`+π/2` 指向 `+y`（北/上），且逆时针为正。ARKit 竖直 `y` 不写入二维定位 sidecar，但仍由原始 ARKit/RTAB-Map 三维链路保存。
@@ -70,6 +86,61 @@ prior-map 会话提交 metadata 前，在 sidecar 写锁内重新读取实际文
 ESL audit 不是 session 创建 API。每个 capture generation 冻结 exact tracking session ID；`appendScanEventIfSessionActive` 只在 admission 后、`captureLock` 内核对该 identity、既有 root、`segmentIndex == 1` 和已存在的 `segment_0001`，从不调用隐式 `startNewSessionIfNeeded()`。因此无 active session、finalization 后的普通 audit、detach 后的旧 generation 和未知/已驱逐 generation 都 fail closed，不会创建空 successor session 或把旧事件写入新 session。
 
 checkpoint cleanup 是显式破坏性恢复事务。iOS 与 PC 都按 path component 验证 session/唯一 `segment_0001`，拒绝 symlink；Windows 额外拒绝 junction/reparse point。metadata、checkpoint 和既有 audit 文件以 no-follow descriptor 打开，`fstat` 证明 regular file 和设备/文件身份，授权审计后重新打开并比较身份、长度和字节，再删除同一 checkpoint；删除失败追加 `finalization_checkpoint_cleanup_failed`，审计自身失败会明确记录 degraded。Map Studio inspect 返回客户端看到的 tracking identity、finalized time 及 metadata/checkpoint SHA-256；POST 必须携带严格 `confirmed=true` 和全部 expected evidence，任何变化返回 HTTP 409 `checkpoint_cleanup_conflict`。普通 inspect/reprocess 从不自动删除。
+
+## performance_samples.jsonl
+
+生产写侧约每 5 秒追加一条 `MarketScannerPerformanceSample` version 1，数据库保存完成后追加 `scan_state=finalizing` 的终止样本。文件最大 256 MiB、250,000 条、单条 64 KiB；48 小时资格规模按 5 秒 cadence 为 34,560 条。每行必须是 UTF-8 JSON object、无空行、以 newline 结束，`sequence` 从 1 连续递增，`timestamp_unix` 严格递增，`tracking_session_id` 在全文件内固定并与 metadata 相等，所有数字必须有限且非负。
+
+```json
+{
+  "format": "MarketScannerPerformanceSample",
+  "version": 1,
+  "sequence": 42,
+  "timestamp_unix": 1786722600.123,
+  "process_uptime_seconds": 210.5,
+  "tracking_session_id": "...",
+  "scan_state": "mapping",
+  "tracking_state": "normal",
+  "node_count": 815,
+  "database_memory_mb": 286,
+  "database_bytes": 734003200,
+  "scan_storage_bytes": 741342208,
+  "process_memory_footprint_mb": 1480,
+  "available_memory_mb": 670,
+  "process_cpu_time_seconds": 88.4,
+  "process_cpu_percent": 172.1,
+  "thermal_state": "fair",
+  "battery_percent": 63.0,
+  "battery_charging": false,
+  "available_disk_bytes": 45781234567,
+  "rendering_fps": 23.8,
+  "rtabmap_update_time_ms": 43.1,
+  "word_count": 12000,
+  "feature_count": 1300,
+  "point_count": 280000,
+  "polygon_count": 0,
+  "online_loop_closure_count": 12,
+  "reliable_loop_closure_count": 4,
+  "gpu_metric_status": "not_available_public_ios_api",
+  "gpu_utilization_percent": null
+}
+```
+
+`process_cpu_percent` 是进程累计 user+system CPU 时间相对墙钟的区间比率，多核设备上可大于 100%，不是按单核归一后的整机 CPU。`process_memory_footprint_mb` 来自 `phys_footprint`，`available_memory_mb` 来自 iOS process-available-memory；测量不可用时相应可选字段为空/省略，不能写 0 冒充测量。普通 iOS App 无可靠公开整机 GPU utilization API，因此 GPU 百分比保持 null，并由 status 明确说明。
+
+Map Studio 对源文件执行单链接 regular-file、前后 stat、文件/行/条数、JSON finite scalar、identity、sequence、timestamp 和 metadata 水位校验；一次流式读取同时计算 SHA-256、写原始副本与 CSV，并使用有界确定性压缩生成浏览器趋势和近似分位数。最终单设备地图包包含：
+
+```text
+performance/
+  performance_manifest.json
+  phone/
+    phone_performance_samples.jsonl
+    phone_performance_samples.csv
+    phone_performance_summary.json
+    diagnostics/metrickit_diagnostics_*.jsonl   # 已投递时
+```
+
+坏日志不生成可信 CSV/趋势；若源文件仍是安全大小的单链接 regular file，则 exact 原始 bytes 以 `phone_performance_samples.invalid.jsonl` 保留并记录 SHA-256，便于 PC 取证。多设备结果使用 `performance/device_01/`、`device_02/` 等独立命名空间。
 
 ## localization_trace.jsonl
 

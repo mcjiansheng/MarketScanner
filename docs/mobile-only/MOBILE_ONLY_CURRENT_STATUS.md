@@ -1,12 +1,20 @@
 # Mobile-Only V1 当前状态
 
-> 文档状态：**当前有效**。最后核对日期：2026-08-14（价签 node-local 坐标合同 v2 与统一发布门）。
+> 文档状态：**当前有效**。最后核对日期：2026-08-15（手机性能结果证据已实现并完成主机/无签名 Debug 回归）。
 
 ## 总体
 
-当前冻结核心基线为 `core-mobile-v1@9a93fbd0ee52944eae5aebedf59ec6a08dedc934`，已验证前序为 `fix/manual-anchor-continuous-recovery@bb09e1346a13945b1d4d8fa7eaf174959b528ab9`；本轮整改分支为不带 `codex/` 前缀的 `fix/tag-node-local-publication-gate`。本轮关闭审查中的 P0 价签坐标重复变换和 P1-A 手机发布门漏检：observation v2 把 scene-depth 点绑定为 exact RTAB-Map node-local 3D，手机/PC 只执行一次 `T_final_node × P_node`；历史 v1 保留业务身份但清空可发布坐标并要求重扫；统一 publication invariant 将 degradation、legacy frame、低置信、空坐标、未关联和 rescan 全部纳入 `COMPLETE/publish_permitted`。当前完整证据为 PriorMap 329/329（378.876 s）、Qualification 30/30、Map Studio 131/131、native 7884/0；400,000 tag evidence 接受 200,000、峰值 RSS 747,192,320 bytes，仍低于 768 MiB host 门但余量有限。正式 pose epoch/component、corridor/shelf/side tracker、人体扫掠体、PC 混合因子图、concrete shelf-loop/manifest v5、动态物体/地图失配及签名真机/现场资格均未关闭，当前发布判断仍为 **NO-GO / NOT PRODUCTION READY**。
+当前冻结核心基线为 `core-mobile-v1@9a93fbd0ee52944eae5aebedf59ec6a08dedc934`，价签 node-local/publication-gate 前序为 `fix/tag-node-local-publication-gate@15b339dd1e3525157f3f85cf2210f22060887369`；当前独立功能分支为 `feature/mobile-performance-result-evidence`。本轮新增扫描期有界 `performance_samples.jsonl`、metadata 水位、immutable snapshot/Result 绑定、PC strict parser/CSV/summary/trend 和 Map Studio 性能区域。证据覆盖 CPU、物理/可用内存、磁盘、thermal、电池、FPS、RTAB-Map update 与数据库/目录增长；iOS GPU 利用率明确标记 unavailable。性能证据是 observability，不是定位或发布 authority，缺失/损坏只关闭 `performance_qualified`，不删除有限地图、轨迹和价签。当前源码已通过 PriorMap **330/330（374.856 s）**、Qualification **30/30**、Map Studio **141/141**、独立 Swift 主机长方法 **1/1（326.803 s）**、生成合同、Swift/Python/JavaScript 语法、补丁格式和 unsigned generic iphoneos Debug 全量编译/链接；浏览器 1600/1280/980 宽度无横向溢出且控制台无 warning/error。QualifiedDevice Release 继续由 clean tracked tree 与 exact commit identity 强制门控。签名真机 30 分钟/2 小时、热/低磁盘/强杀/crash/MetricKit 延迟投递和现场 LiDAR 未执行，因此发布判断仍为 **NO-GO / NOT PRODUCTION READY**。
 
-下列按日期记录的段落是对应增量当时的历史证据；若测试数字或分支与上段冲突，以上述 2026-08-14 当前状态和当前源码为准。
+下列按日期记录的段落是对应增量当时的历史证据；若测试数字或分支与上段冲突，以上述 2026-08-15 当前状态和当前源码为准。
+
+## 2026-08-15 手机性能证据与 PC 结果分析
+
+- iOS 正常扫描约每 5 秒 durable append 一条性能样本，保存数据库后写 finalizing 样本；sequence、timestamp 和 tracking identity 连续，metadata 提交 exact count/last/failure/complete 水位。写侧 hard cap 为 250,000 条、256 MiB 和 64 KiB/row，48 小时资格规模为 34,560 条。
+- snapshot 把性能文件作为 observability sidecar 冻结并绑定 hash；Mobile-Only Result 输出 raw 与 summary，manifest 严格验证样本数和 complete Bool。它不参与 node、pose、tag coordinate 或 publication invariant。
+- PC Map Studio 对单设备或多设备证据执行 streaming/no-follow/single-link/identity/framing/watermark 校验；有效输入生成 exact raw、CSV、summary、bounded series 和 manifest，坏输入只在安全大小内保存 `.invalid.jsonl` 供取证。Web 显示 CPU、内存、FPS、update-time 趋势与 thermal/资格摘要。
+- 会话内已投递的 MetricKit crash/hang payload 可复制到结果目录并记录 hash。没有 payload 不能证明没有 crash；被杀死前最后一批用户态样本也不保证落盘。普通 iOS 无公开可靠整机 GPU utilization，因此禁止推算。
+- 当前完整 PriorMap 处理 300,000 条 finalization（峰值 RSS 13,205,504 bytes）、1,728,000 条 trace（保留 172,801，峰值 59,146,240 bytes）和 400,000 条 tag evidence（接受 200,000，峰值 746,323,968 bytes）；峰值仍低于 768 MiB host 门但余量有限。代码、host 与 unsigned Debug 构建链路已验证；真机采样开销、两小时热稳定性、低磁盘/内存压力、强杀/watchdog/crash 后延迟诊断和 PC 对照分析仍未资格化。
 
 ## 2026-08-13 手机与 PC 部分结果、价签保留合同
 

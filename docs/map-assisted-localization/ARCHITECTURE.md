@@ -1,6 +1,6 @@
 # 已有地图辅助定位架构
 
-> 文档状态：**当前有效（阶段一至阶段三草稿复核）**。最后核对日期：2026-08-14。
+> 文档状态：**当前有效（阶段一至阶段三草稿复核）**。最后核对日期：2026-08-15。
 
 ## 范围
 
@@ -36,6 +36,9 @@ iOS prior_map_localized
     -> complete burst -> 专用货架确认
     -> algorithm evidence + additive user evidence v2
   同时继续写入原 RTAB-Map 连续数据库
+  同时约每 5 秒写 performance_samples.jsonl
+    -> CPU / 内存 / 磁盘 / 热 / 电池 / FPS / RTAB-Map update / 数据增长
+    -> final metadata 提交 count / last sequence / last timestamp / complete 水位
 
 PC prior-map localized
   原始 SQLite（只读）
@@ -54,6 +57,12 @@ PC prior-map localized
     -> localized/.staging-* 完整生成和校验
     -> localized/versions/vNNNNNN 不可变版本
     -> current.json 原子切换；published.json 受硬门控制
+
+PC Map Studio result
+  performance_samples.jsonl（只读）
+    -> strict framing / finite scalar / identity / sequence / timestamp / metadata watermark
+    -> performance/phone/ 原始 JSONL + CSV + summary
+    -> Web 有界降采样趋势、峰值、分位数、热状态与采样缺口
 ```
 
 ## 模块边界
@@ -70,10 +79,14 @@ PC prior-map localized
 - `tools/PriorMap/offline_localization.py` 是阶段三派生 SE(2) 修正、价签重关联、质量门禁、人工编辑重放和导出实现。
 - `tools/PriorMap/localized_output_store.py` 在 POSIX/Windows 跨进程文件锁内管理 staging、不可变 version、成果 schema/hash 清单、输入身份和 current/published 单提交点原子指针；Windows 使用 write-through 原子移动，读取和 artifact 下载按 version 内清单及已打开文件字节再次复核完整性。
 - `SupermarketScanSession.swift` 只负责安全落盘和审计 sidecar；原始数据库仍是权威输入。
+- `performance_samples.jsonl` 是独立可观测性 sidecar，不是 pose、地图坐标或发布授权。`tools/SupermarketMapStudio/performance_analysis.py` 流式校验并生成结果包性能工件；坏证据关闭性能资格但不删除有限地图数据。
 
 ## 安全边界
 
 - 源 XLSX 和扫描 SQLite 数据库只读。
+- 性能时间线受 250,000 条、256 MiB 文件和 64 KiB 单行硬上限约束；正常采样约 5 秒一条，48 小时资格规模为 34,560 条。序号/时间必须严格递增，tracking session 必须与 metadata 精确一致，禁止 NaN/Infinity、空行和缺 final newline。
+- iOS 不提供普通应用可用的可靠整机 GPU utilization 百分比。写侧固定声明 `not_available_public_ios_api`，PC 不允许用 CPU、FPS 或 Metal helper 是否存在推导手机 GPU 利用率。
+- 性能写失败只把 `performanceEvidenceComplete` 置为 false 并写审计；它不能升级为定位坐标损坏，也不能删除安全落盘的数据库。PC 对安全大小内的坏原始日志使用 `.invalid.jsonl` 完整保留，同时拒绝生成可信趋势。
 - 转换先写临时目录，通过 schema 校验后原子发布。
 - prior-map 定位失败、较弱或丢失不会停止或改写 RTAB-Map 原始采集。
 - 结构匹配最多使用 600 点；距离残差、角覆盖、Top-K 唯一性、两帧一致性均通过后才允许修正。自动修正上限为 0.35 m/8°，应用增益 0.35。

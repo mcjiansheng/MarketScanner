@@ -110,6 +110,118 @@ struct ScanSegmentMetadata: Codable {
     let tagObservationBurstCount: Int?
     let tagObservationBurstLastID: String?
     let tagObservationBurstComplete: Bool?
+    /// Bounded scan-performance evidence. Unlike localization evidence, a
+    /// telemetry failure does not invalidate finite map/trajectory data; it
+    /// closes only the performance-qualified claim. The PC verifies these
+    /// watermarks before publishing trends or aggregate statistics.
+    let performanceSamples: String?
+    let performanceSampleIntervalSeconds: Double?
+    let performanceSampleCount: Int?
+    let performanceLastSequence: Int?
+    let performanceLastTimestampUnix: TimeInterval?
+    let performanceEvidenceComplete: Bool?
+    let performanceWriteFailureCount: Int?
+}
+
+struct ScanPerformanceSampleInput {
+    let timestampUnix: TimeInterval
+    let processUptimeSeconds: TimeInterval
+    let scanState: String
+    let trackingState: String
+    let nodeCount: Int?
+    let databaseMemoryMB: Int?
+    let databaseBytes: UInt64?
+    let scanStorageBytes: UInt64?
+    let processMemoryFootprintMB: Int64?
+    let availableMemoryMB: Int64?
+    let processCPUTimeSeconds: Double?
+    let processCPUPercent: Double?
+    let thermalState: String
+    let batteryPercent: Double?
+    let batteryCharging: Bool?
+    let availableDiskBytes: Int64?
+    let renderingFPS: Double?
+    let rtabmapUpdateTimeMS: Double?
+    let wordCount: Int?
+    let featureCount: Int?
+    let pointCount: Int?
+    let polygonCount: Int?
+    let onlineLoopClosureCount: Int?
+    let reliableLoopClosureCount: Int?
+}
+
+private struct ScanPerformanceSampleRecord: Encodable {
+    let format: String
+    let version: Int
+    let sequence: Int
+    let timestampUnix: TimeInterval
+    let processUptimeSeconds: TimeInterval
+    let trackingSessionID: String
+    let scanState: String
+    let trackingState: String
+    let nodeCount: Int?
+    let databaseMemoryMB: Int?
+    let databaseBytes: UInt64?
+    let scanStorageBytes: UInt64?
+    let processMemoryFootprintMB: Int64?
+    let availableMemoryMB: Int64?
+    let processCPUTimeSeconds: Double?
+    let processCPUPercent: Double?
+    let thermalState: String
+    let batteryPercent: Double?
+    let batteryCharging: Bool?
+    let availableDiskBytes: Int64?
+    let renderingFPS: Double?
+    let rtabmapUpdateTimeMS: Double?
+    let wordCount: Int?
+    let featureCount: Int?
+    let pointCount: Int?
+    let polygonCount: Int?
+    let onlineLoopClosureCount: Int?
+    let reliableLoopClosureCount: Int?
+    let gpuMetricStatus: String
+    let gpuUtilizationPercent: Double?
+
+    enum CodingKeys: String, CodingKey {
+        case format
+        case version
+        case sequence
+        case timestampUnix = "timestamp_unix"
+        case processUptimeSeconds = "process_uptime_seconds"
+        case trackingSessionID = "tracking_session_id"
+        case scanState = "scan_state"
+        case trackingState = "tracking_state"
+        case nodeCount = "node_count"
+        case databaseMemoryMB = "database_memory_mb"
+        case databaseBytes = "database_bytes"
+        case scanStorageBytes = "scan_storage_bytes"
+        case processMemoryFootprintMB = "process_memory_footprint_mb"
+        case availableMemoryMB = "available_memory_mb"
+        case processCPUTimeSeconds = "process_cpu_time_seconds"
+        case processCPUPercent = "process_cpu_percent"
+        case thermalState = "thermal_state"
+        case batteryPercent = "battery_percent"
+        case batteryCharging = "battery_charging"
+        case availableDiskBytes = "available_disk_bytes"
+        case renderingFPS = "rendering_fps"
+        case rtabmapUpdateTimeMS = "rtabmap_update_time_ms"
+        case wordCount = "word_count"
+        case featureCount = "feature_count"
+        case pointCount = "point_count"
+        case polygonCount = "polygon_count"
+        case onlineLoopClosureCount = "online_loop_closure_count"
+        case reliableLoopClosureCount = "reliable_loop_closure_count"
+        case gpuMetricStatus = "gpu_metric_status"
+        case gpuUtilizationPercent = "gpu_utilization_percent"
+    }
+}
+
+struct PerformanceEvidenceWatermark {
+    let sampleCount: Int
+    let lastSequence: Int?
+    let lastTimestampUnix: TimeInterval?
+    let complete: Bool
+    let writeFailureCount: Int
 }
 
 /// A durable burst of price-tag observations (V1R4 §13.1, V1R5 §5.2):
@@ -734,6 +846,7 @@ final class SupermarketScanSession {
     private let captureLock = NSRecursiveLock()
     private let sidecarWriteLock = NSLock()
     private let eventLogLock = NSLock()
+    private let performanceLogLock = NSLock()
     private let localizationLogLock = NSLock()
     private let localizationTransactionLock = NSLock()
     private let localizationAdmissionGate = PriceTagSessionAdmissionGate()
@@ -775,7 +888,21 @@ final class SupermarketScanSession {
     private var localizationLastRecoveryFinishedAtUptime: TimeInterval?
     private var latestStructureCoverageSnapshot: ScanStructureCoverageSnapshot?
     private var latestStructureCoverageSummary: ScanStructureCoverageSummary?
+    private var performanceSampleCount = 0
+    private var performanceLastTimestampUnix: TimeInterval?
+    private var performanceBytesWritten = 0
+    private var performanceWriteFailureCount = 0
+    private var performanceEvidenceSealed = false
     private let maximumTrajectorySamples = 50_000
+    private let maximumPerformanceSampleCount =
+        GeneratedMobileEvidenceContracts.File_performance_samples_jsonl
+            .max_records
+    private let maximumPerformanceBytes =
+        GeneratedMobileEvidenceContracts.File_performance_samples_jsonl
+            .max_file_bytes
+    private let maximumPerformanceRecordBytes =
+        GeneratedMobileEvidenceContracts.File_performance_samples_jsonl
+            .max_record_bytes
     private var nextTagId: Int = 1
     private var lastLocalizationState: String?
     private(set) var scanConfiguration = PriorMapScanConfiguration.freeMapping
@@ -985,6 +1112,13 @@ final class SupermarketScanSession {
         localizationLastRecoveryFinishedAtUptime = nil
         latestStructureCoverageSnapshot = nil
         latestStructureCoverageSummary = nil
+        performanceLogLock.lock()
+        performanceSampleCount = 0
+        performanceLastTimestampUnix = nil
+        performanceBytesWritten = 0
+        performanceWriteFailureCount = 0
+        performanceEvidenceSealed = false
+        performanceLogLock.unlock()
         pendingTagBurst = nil
         completedTagCaptureFrames.removeAll()
         completedTagCaptureOrder.removeAll()
@@ -1898,6 +2032,19 @@ final class SupermarketScanSession {
                 to: segmentDirectory.appendingPathComponent("structure_coverage_cells.json"))
         }
 
+        // Performance evidence is observability, not coordinate authority.
+        // Keep the declared file present even when the first write failed so
+        // the false watermark is auditable instead of looking like an export
+        // omission. The PC will not qualify an empty/incomplete stream.
+        if snapshot.metadata.performanceSamples == "performance_samples.jsonl" {
+            let performanceURL = segmentDirectory.appendingPathComponent(
+                "performance_samples.jsonl")
+            if !sidecarWriter.fileExists(at: performanceURL),
+               snapshot.metadata.performanceSampleCount == 0 {
+                try sidecarWriter.writeAtomic(Data(), to: performanceURL)
+            }
+        }
+
         // Expected recovery watermark for this finalization. A legacy
         // checkpoint without the P7R6 watermark fields decodes nil and falls
         // back to the legacy zero expectation.
@@ -2062,6 +2209,160 @@ final class SupermarketScanSession {
             fields: fields,
             directory: directory,
             trackingSessionId: trackingSessionId)
+    }
+
+    /// Appends one durable, bounded performance sample. The caller rate-limits
+    /// normal samples; this writer enforces identity, finite values, sequence,
+    /// strictly increasing wall time, file/sample bounds and a sticky failure
+    /// watermark. Whole-device GPU utilization is deliberately unavailable:
+    /// iOS exposes no general public API for that metric.
+    @discardableResult
+    func appendPerformanceSample(
+        _ input: ScanPerformanceSampleInput,
+        sealAfterAppend: Bool = false
+    ) -> Bool {
+        guard input.timestampUnix.isFinite,
+              input.timestampUnix > 0,
+              input.processUptimeSeconds.isFinite,
+              input.processUptimeSeconds >= 0,
+              !input.scanState.isEmpty,
+              !input.trackingState.isEmpty,
+              !input.thermalState.isEmpty,
+              performanceInputIsFinite(input) else {
+            recordPerformanceWriteFailure(seal: sealAfterAppend)
+            return false
+        }
+        let directory: URL
+        do {
+            directory = try currentSegmentDirectory()
+        } catch {
+            recordPerformanceWriteFailure(seal: sealAfterAppend)
+            return false
+        }
+
+        performanceLogLock.lock()
+        defer {
+            if sealAfterAppend {
+                performanceEvidenceSealed = true
+            }
+            performanceLogLock.unlock()
+        }
+        // A callback racing after the finalizing sample is expected to be
+        // ignored. It must not mutate the terminal watermark or manufacture a
+        // write failure after the evidence stream has been sealed.
+        guard !performanceEvidenceSealed else {
+            return true
+        }
+        guard performanceSampleCount < maximumPerformanceSampleCount,
+              performanceLastTimestampUnix.map({ input.timestampUnix > $0 }) ?? true else {
+            performanceWriteFailureCount += 1
+            return false
+        }
+        let sequence = performanceSampleCount + 1
+        let record = ScanPerformanceSampleRecord(
+            format: "MarketScannerPerformanceSample",
+            version: 1,
+            sequence: sequence,
+            timestampUnix: input.timestampUnix,
+            processUptimeSeconds: input.processUptimeSeconds,
+            trackingSessionID: trackingSessionId,
+            scanState: input.scanState,
+            trackingState: input.trackingState,
+            nodeCount: input.nodeCount,
+            databaseMemoryMB: input.databaseMemoryMB,
+            databaseBytes: input.databaseBytes,
+            scanStorageBytes: input.scanStorageBytes,
+            processMemoryFootprintMB: input.processMemoryFootprintMB,
+            availableMemoryMB: input.availableMemoryMB,
+            processCPUTimeSeconds: input.processCPUTimeSeconds,
+            processCPUPercent: input.processCPUPercent,
+            thermalState: input.thermalState,
+            batteryPercent: input.batteryPercent,
+            batteryCharging: input.batteryCharging,
+            availableDiskBytes: input.availableDiskBytes,
+            renderingFPS: input.renderingFPS,
+            rtabmapUpdateTimeMS: input.rtabmapUpdateTimeMS,
+            wordCount: input.wordCount,
+            featureCount: input.featureCount,
+            pointCount: input.pointCount,
+            polygonCount: input.polygonCount,
+            onlineLoopClosureCount: input.onlineLoopClosureCount,
+            reliableLoopClosureCount: input.reliableLoopClosureCount,
+            gpuMetricStatus: "not_available_public_ios_api",
+            gpuUtilizationPercent: nil)
+        do {
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.sortedKeys]
+            var data = try encoder.encode(record)
+            data.append(0x0A)
+            guard data.count <= maximumPerformanceRecordBytes,
+                  data.count <= maximumPerformanceBytes - performanceBytesWritten else {
+                performanceWriteFailureCount += 1
+                return false
+            }
+            try sidecarWriter.append(
+                data,
+                to: directory.appendingPathComponent("performance_samples.jsonl"))
+            performanceSampleCount = sequence
+            performanceLastTimestampUnix = input.timestampUnix
+            performanceBytesWritten += data.count
+            return true
+        } catch {
+            performanceWriteFailureCount += 1
+            print("Could not append performance sample: \(error)")
+            return false
+        }
+    }
+
+    func performanceEvidenceWatermark() -> PerformanceEvidenceWatermark {
+        performanceLogLock.lock()
+        defer { performanceLogLock.unlock() }
+        return PerformanceEvidenceWatermark(
+            sampleCount: performanceSampleCount,
+            lastSequence: performanceSampleCount > 0 ? performanceSampleCount : nil,
+            lastTimestampUnix: performanceLastTimestampUnix,
+            complete: performanceSampleCount > 0
+                && performanceEvidenceSealed
+                && performanceWriteFailureCount == 0,
+            writeFailureCount: performanceWriteFailureCount)
+    }
+
+    private func recordPerformanceWriteFailure(seal: Bool) {
+        performanceLogLock.lock()
+        performanceWriteFailureCount += 1
+        if seal {
+            performanceEvidenceSealed = true
+        }
+        performanceLogLock.unlock()
+    }
+
+    private func performanceInputIsFinite(
+        _ input: ScanPerformanceSampleInput
+    ) -> Bool {
+        let optionalDoubles = [
+            input.processCPUTimeSeconds,
+            input.processCPUPercent,
+            input.batteryPercent,
+            input.renderingFPS,
+            input.rtabmapUpdateTimeMS,
+        ]
+        guard optionalDoubles.allSatisfy({ $0.map { $0.isFinite && $0 >= 0 } ?? true }) else {
+            return false
+        }
+        let optionalIntegers: [Int64?] = [
+            input.nodeCount.map(Int64.init),
+            input.databaseMemoryMB.map(Int64.init),
+            input.processMemoryFootprintMB,
+            input.availableMemoryMB,
+            input.availableDiskBytes,
+            input.wordCount.map(Int64.init),
+            input.featureCount.map(Int64.init),
+            input.pointCount.map(Int64.init),
+            input.polygonCount.map(Int64.init),
+            input.onlineLoopClosureCount.map(Int64.init),
+            input.reliableLoopClosureCount.map(Int64.init),
+        ]
+        return optionalIntegers.allSatisfy { $0.map { $0 >= 0 } ?? true }
     }
 
     /// Appends a late/asynchronous audit record only when the exact scan is

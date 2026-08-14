@@ -1,6 +1,6 @@
 # 手机后处理（Mobile Post Processing）
 
-> 状态：**当前有效**；IMPLEMENTED / UNIT TESTED / INTEGRATION TESTED（P1/P2/P7/P8/P12）。最后核对：2026-08-13。
+> 状态：**当前有效**；IMPLEMENTED / UNIT TESTED / INTEGRATION TESTED（P1/P2/P7/P8/P12 + 性能证据）。最后核对：2026-08-15。
 
 ## 模块
 
@@ -11,6 +11,18 @@
 - `FinalTrajectory.swift` / `ClockCorrelationRecorder.swift`：最终轨迹与 1 Hz 重采样（见 FINAL_DEVICE_TRAJECTORY.md）。
 - `TagObservationResolver.swift` / `ShelfAssociationEngine.swift`：价签最终定位（见 MOBILE_TAG_FINALIZATION.md）。
 - `StrictJSONLStreamReader.swift` / strict evidence parsers：64 KiB true-streaming、final newline、no blank line、strict scalar、unknown-field 和 immutable snapshot 合同；每行 caller body 在独立 autorelease pool 内执行，避免 Foundation 临时对象跨 200k 规模累积，同时由 strict document parser 保持 UTF-8、duplicate-key、nesting 和 JSON 校验。
+
+## 扫描性能证据
+
+原始连续会话在 `segment_0001/performance_samples.jsonl` 保存结构化手机性能时间线。正常扫描约每 5 秒采样一次，数据库保存完成后再写一条 `scan_state=finalizing` 样本。每行必须绑定同一个 tracking session，使用从 1 开始连续递增的 `sequence` 和严格递增的 `timestamp_unix`。写侧上限来自生成合同：250,000 条、256 MiB 文件、64 KiB 单行；48 小时资格规模按 0.2 Hz 为 34,560 条。
+
+CPU 占用率定义为相邻样本的 `delta(process user+system CPU seconds) / delta(process uptime) × 100`，因此多核负载可以超过 100%，首条样本没有区间 CPU 百分比。其他字段包括进程 `phys_footprint`、进程可用内存、可用磁盘、电池与充电、thermal state、渲染 FPS、RTAB-Map update time、节点/特征/点数、数据库内存/文件和会话目录增长。不可测量值必须缺省或显式 unavailable，禁止以 0、NaN 或 Infinity 冒充。iOS 没有普通 App 可用的可靠整机 GPU 利用率公开 API，因此只记录 `gpu_metric_status=not_available_public_ios_api`，不推导 GPU 百分比。
+
+`metadata.json` 以 `performanceSamples`、`performanceSampleIntervalSeconds`、`performanceSampleCount`、`performanceLastSequence`、`performanceLastTimestampUnix`、`performanceEvidenceComplete` 和 `performanceWriteFailureCount` 提交水位。首条写入即失败时仍创建空文件并提交 `complete=false`，以区分采集写失败和导出漏文件。性能写失败是粘性的资格降级，但性能证据是 observability，不是 localization、coordinate 或 publication authority；它不能删除有限轨迹、价签或已经安全落盘的数据库。
+
+`SessionSnapshotTransaction` 将 metadata 声明的性能文件放入 `observabilitySidecarPairs`，执行与其他不可变输入相同的 exact bytes/SHA、single-link、no-symlink 和稳定身份绑定，但不把它加入 `declaredSidecarPairs` 的定位证据集合。历史 finalized 会话没有性能字段时继续按历史定位合同处理，同时明确为 performance evidence unavailable。
+
+Mobile-Only Result 在快照含性能文件时输出 `phone_performance_samples.jsonl` 和 `phone_performance_summary.json`；manifest 记录 `performance_sample_count` 与 `performance_evidence_complete`，reader 对两者分别执行 strict non-negative integer 和 strict Bool 验证。质量报告的 `phone_performance` 只描述观测数据与资格状态，不提升图优化、坐标或价签发布资格。
 
 ## Fast Path 安全
 

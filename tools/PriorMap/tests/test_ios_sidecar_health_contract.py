@@ -66,6 +66,19 @@ class IOSLocalizationSidecarHealthContractTests(unittest.TestCase):
             "localizationTraceRecordCount",
             metadata["watermark_fields"],
         )
+        for watermark in (
+            "performanceSampleCount",
+            "performanceLastSequence",
+            "performanceLastTimestampUnix",
+            "performanceEvidenceComplete",
+        ):
+            self.assertIn(watermark, metadata["watermark_fields"])
+        performance = contract["evidence_files"]["performance_samples.jsonl"]
+        self.assertEqual(performance["max_file_bytes"], 256 * 1024 * 1024)
+        self.assertEqual(performance["max_record_bytes"], 64 * 1024)
+        self.assertEqual(performance["max_records"], 250_000)
+        self.assertEqual(performance["qualification_max_records"], 34_560)
+        self.assertEqual(performance["identity_fields"], ["tracking_session_id"])
 
         native = contract["evidence_files"]["native_graph"]
         self.assertEqual(native["max_raw_nodes"], 200_000)
@@ -73,6 +86,40 @@ class IOSLocalizationSidecarHealthContractTests(unittest.TestCase):
         self.assertEqual(native["max_factors"], 4_096)
         self.assertEqual(native["max_priors"], 4_096)
         self.assertEqual(native["max_trajectory_rows"], 200_000)
+
+    def test_bounded_performance_evidence_is_preserved_without_becoming_pose_authority(self) -> None:
+        session = source(SESSION_SOURCE)
+        view = source(VIEW_SOURCE)
+        snapshot = source(SNAPSHOT_SOURCE)
+        for token in (
+            "MarketScannerPerformanceSample",
+            "performance_samples.jsonl",
+            "File_performance_samples_jsonl",
+            ".max_records",
+            ".max_file_bytes",
+            ".max_record_bytes",
+            "performanceEvidenceWatermark",
+            "performanceEvidenceSealed",
+            'gpuMetricStatus: "not_available_public_ios_api"',
+        ):
+            self.assertIn(token, session)
+        for token in (
+            "recordStreamingPerformanceSample",
+            "processCPUTimeSeconds",
+            "ProcessingResourceGovernor.currentMemoryFootprintMB()",
+            "ProcessingResourceGovernor.batteryPercent()",
+            'scanState: "finalizing"',
+            "sealAfterAppend: force && scanState == \"finalizing\"",
+        ):
+            self.assertIn(token, view)
+        self.assertIn("observabilitySidecarPairs", snapshot)
+        self.assertIn(
+            '("performanceSamples", "performance_samples.jsonl")', snapshot
+        )
+        required_pairs = snapshot.split(
+            "static let declaredSidecarPairs", 1
+        )[1].split("static let observabilitySidecarPairs", 1)[0]
+        self.assertNotIn("performanceSamples", required_pairs)
 
     def test_sam_recovery_and_dynamic_filtering_contracts_are_wired(self) -> None:
         view = source(VIEW_SOURCE)

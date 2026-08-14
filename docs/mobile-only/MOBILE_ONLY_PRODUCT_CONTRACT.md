@@ -1,7 +1,7 @@
 # Mobile-Only V1 产品契约
 
 > 状态：**当前有效**；DESIGNED / IMPLEMENTED / HOST TESTED（本文档冻结产品边界与数据合同）
-> 最后对齐：2026-08-13
+> 最后对齐：2026-08-15
 
 ## 1. 目标
 
@@ -39,6 +39,16 @@ Mobile V1 只承诺 `Fast reduced graph`，以及 Fast 质量失败后至多一�
 - 首次相机权限必须在 workflow commit 前完成；`.notDetermined` 只能请求权限并重新进入完整校验，不能允许旧相机 callback 在 workflow 已失败后自行启动。
 - 任何 host、receipt、context 或 cancellation 失败都必须有可调用 rollback，停止 mapping/camera/clock、清除 prior-map 状态、脱离失败数据库并释放 session identity。
 - Test/Analyze 和手动 Debug build identity 继续 fail closed。正式扫描入口只接受满足 `MobileBuildIdentity.isUsable` 的构建；共享 `RTABMapApp` 默认 Run 与 `RTABMapApp-QualifiedDevice` 都使用 Release，不提供 dirty bypass，也不得放宽 runtime identity gate。
+
+### 2.5 性能观测、结果保留与资格边界
+
+- 生产扫描必须把有界结构化性能时间线写入会话，而不是仅依赖 Xcode 控制台。默认 cadence 约 5 秒，数据库保存完成后补一条 finalizing 样本；48 小时资格规模为 34,560 条，hard cap 为 250,000 条 / 256 MiB / 64 KiB 单行。
+- metadata 必须提交性能文件名、采样间隔、精确记录数、末序号、末时间、写失败数和 complete 水位。sequence、时间、tracking identity 或水位不一致时，不得生成可信统计或宣称性能资格通过。
+- 性能 sidecar 是 observability evidence，不是 pose prior、node binding、coordinate、publication 或 Result completeness 的权威。缺失/损坏使 `performance_qualified=false`，但只要数据库、轨迹、价签和其他权威证据仍有效，就必须保留其 Result，不得因性能日志单独损坏而删除业务成果。
+- 不可变 Mobile Result 在证据存在时保留 exact `phone_performance_samples.jsonl` 和 `phone_performance_summary.json`；PC 地图结果包进一步生成 CSV、摘要、趋势序列和 manifest。坏日志在安全大小范围内以原始 `.invalid.jsonl` 取证保存，不得伪装成部分统计。
+- 已由系统投递到会话的 MetricKit crash/hang payload 可以随最终结果包复制。MetricKit 是延迟投递机制；结果包没有 payload 不等于没有 crash，应用被杀死前也不能保证最后一批用户态样本已落盘。
+- 普通 iOS App 没有可靠公开的整机 GPU utilization API。产品合同只允许报告 `not_available_public_ios_api`；不得用 CPU、FPS、渲染耗时或是否启用 Metal 推算 GPU 百分比。
+- host 测试和 unsigned generic-device 构建只能证明合同与编译链路。签名真机 30 分钟/2 小时、thermal、电量、低磁盘、内存压力、前后台、中断/强杀/crash、MetricKit 延迟投递及采样 I/O 对 FPS 的影响完成前，性能资格和整体发布状态都保持 NO-GO。
 
 ## 3. 手机导入（Track B1）
 

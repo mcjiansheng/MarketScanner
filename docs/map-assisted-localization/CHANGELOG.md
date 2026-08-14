@@ -1,6 +1,15 @@
 # 地图辅助定位变更记录
 
-> 文档状态：**当前有效**。最后核对日期：2026-08-14。
+> 文档状态：**当前有效**。最后核对日期：2026-08-15。
+
+## 2026-08-15 — 手机性能时间线、不可变结果证据与 PC 趋势分析
+
+- iOS 连续扫描新增有界 `performance_samples.jsonl`：正常扫描约每 5 秒记录一次，数据库保存完成后再记录一条 `scan_state=finalizing` 终止样本。样本使用连续 sequence、严格递增 Unix 时间和 exact tracking-session identity，覆盖进程 CPU 时间与区间占用率、`phys_footprint`、进程可用内存、磁盘、电池/充电、thermal、FPS、RTAB-Map update time、节点数以及数据库/会话目录增长。CPU 百分比按相邻样本的进程 CPU 时间差除以 uptime 差计算，多核时可超过 100%。
+- 写侧统一受 250,000 条、256 MiB 文件和 64 KiB 单行上限约束；`metadata.json` 提交文件名、采样间隔、精确条数、末序号、末时间、写失败数和 complete 水位。性能日志属于 observability，不是 pose、constraint、tag 或 publication authority；缺失、写失败或损坏关闭 `performance_qualified`，但不删除已安全落盘的有限地图、轨迹或价签。
+- Mobile-Only snapshot 将性能日志作为 `observabilitySidecarPairs` 冻结并绑定 exact bytes/SHA，不把它加入定位权威 sidecar。手机不可变 Result 在证据存在时生成 `phone_performance_samples.jsonl`、`phone_performance_summary.json`，并把样本数与 complete 状态写入 result manifest 和质量报告。
+- Supermarket Map Studio 新增流式严格解析与最终地图包 `performance/`：验证 regular/single-link/no-follow、前后 inode/size/mtime、final newline、无空行、UTF-8/JSON、有限数字、format/version、identity、连续序号、严格时间和 metadata 水位；有效证据生成 exact raw、CSV、统计摘要、确定性有界趋势序列与性能 manifest。坏日志不生成可信趋势，但在安全大小范围内以 `.invalid.jsonl` 原样保留并记录 SHA-256。多设备结果按 `device_01`、`device_02` 分目录。
+- 已投递的有界 MetricKit crash/hang 诊断随性能目录复制并绑定 hash；没有 MetricKit 文件只表示当前结果包没有已投递 payload，不能解释为“没有闪退”。普通 iOS 应用没有可靠公开的整机 GPU 利用率 API，因此样本明确写 `gpu_metric_status=not_available_public_ios_api`，不从 CPU、FPS 或 Metal helper 状态伪造 GPU 百分比。
+- 本增量不等于真机性能资格。30 分钟/2 小时连续扫描、热/电量/低磁盘/内存压力、前后台、强杀/watchdog/crash 后 MetricKit 延迟投递、采样 fsync 对帧率的周期性影响和签名 LiDAR 现场矩阵仍须执行；整体继续为 **NO-GO / NOT PRODUCTION READY**。
 
 ## 2026-08-14 — 价签 node-local 坐标合同 v2 与统一发布不变量
 

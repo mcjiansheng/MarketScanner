@@ -506,6 +506,132 @@ function renderInspection(data) {
   });
   target.appendChild(list);
   renderScanLogs(data.scan_logs || {});
+  renderPhonePerformance(data.phone_performance || {});
+}
+
+function finitePerformanceValue(value) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
+}
+
+function appendPerformanceChart(parent, title, series, key, formatter) {
+  const values = series
+    .map((row, index) => ({ index, value: finitePerformanceValue(row?.[key]) }))
+    .filter((item) => item.value !== null);
+  const card = document.createElement("div");
+  card.className = "performance-chart";
+  appendText(card, "h3", title);
+  if (values.length < 2) {
+    appendText(card, "div", "该指标没有足够的有效采样", "warning");
+    parent.appendChild(card);
+    return;
+  }
+  const minimum = Math.min(...values.map((item) => item.value));
+  const maximum = Math.max(...values.map((item) => item.value));
+  const span = Math.max(1e-9, maximum - minimum);
+  const width = 320;
+  const height = 92;
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
+  svg.setAttribute("role", "img");
+  svg.setAttribute("aria-label", `${title}趋势，最小 ${formatter(minimum)}，最大 ${formatter(maximum)}`);
+  [0, 0.5, 1].forEach((fraction) => {
+    const line = document.createElementNS("http://www.w3.org/2000/svg", "line");
+    line.setAttribute("x1", "0");
+    line.setAttribute("x2", String(width));
+    line.setAttribute("y1", String(fraction * height));
+    line.setAttribute("y2", String(fraction * height));
+    svg.appendChild(line);
+  });
+  const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+  const lastIndex = Math.max(1, series.length - 1);
+  path.setAttribute(
+    "d",
+    values.map((item, index) => {
+      const x = (item.index / lastIndex) * width;
+      const y = height - ((item.value - minimum) / span) * height;
+      return `${index ? "L" : "M"}${x.toFixed(2)},${y.toFixed(2)}`;
+    }).join(" "),
+  );
+  svg.appendChild(path);
+  card.appendChild(svg);
+  const range = document.createElement("div");
+  range.className = "range";
+  appendText(range, "span", `最低 ${formatter(minimum)}`);
+  appendText(range, "span", `最高 ${formatter(maximum)}`);
+  card.appendChild(range);
+  parent.appendChild(card);
+}
+
+function appendPhonePerformance(target, data, label = null) {
+  if (label) appendText(target, "h3", label, "performance-source-title");
+  if (!data.available) {
+    appendText(
+      target,
+      "div",
+      `没有可验证的手机性能时间线：${data.reason || "performance_evidence_missing"}`,
+      "warning",
+    );
+    return;
+  }
+  const metrics = data.metrics || {};
+  const summary = document.createElement("div");
+  summary.className = "performance-summary";
+  const durationMinutes = Number(data.duration_seconds || 0) / 60;
+  appendText(summary, "span", `${Number(data.sample_count || 0).toLocaleString()} 个采样 · ${durationMinutes.toFixed(1)} 分钟`);
+  appendText(
+    summary,
+    "span",
+    data.performance_qualified ? "性能证据完整并通过资格检查" : "性能证据存在告警，不能声明性能资格通过",
+    data.performance_qualified ? "complete" : "warning",
+  );
+  const cpu = metrics.process_cpu_percent || {};
+  const memory = metrics.process_memory_footprint_mb || {};
+  const fps = metrics.rendering_fps || {};
+  const update = metrics.rtabmap_update_time_ms || {};
+  if (cpu.available) appendText(summary, "span", `CPU 均值 ${Number(cpu.mean).toFixed(1)}%，P95 ${Number(cpu.p95).toFixed(1)}%`);
+  if (memory.available) appendText(summary, "span", `内存峰值 ${Number(memory.max).toFixed(0)} MB`);
+  if (fps.available) appendText(summary, "span", `FPS P5 ${Number(fps.p05).toFixed(1)}`);
+  if (update.available) appendText(summary, "span", `RTAB-Map 更新 P95 ${Number(update.p95).toFixed(1)} ms`);
+  const thermalCount = Number(data.thermal?.serious_or_critical_sample_count || 0);
+  if (thermalCount) appendText(summary, "span", `严重/临界热采样 ${thermalCount}`, "warning");
+  target.appendChild(summary);
+
+  const charts = document.createElement("div");
+  charts.className = "performance-charts";
+  const series = Array.isArray(data.series) ? data.series : [];
+  appendPerformanceChart(charts, "进程 CPU", series, "process_cpu_percent", (value) => `${value.toFixed(1)}%`);
+  appendPerformanceChart(charts, "物理内存", series, "process_memory_footprint_mb", (value) => `${value.toFixed(0)} MB`);
+  appendPerformanceChart(charts, "渲染 FPS", series, "rendering_fps", (value) => value.toFixed(1));
+  appendPerformanceChart(charts, "RTAB-Map 更新时间", series, "rtabmap_update_time_ms", (value) => `${value.toFixed(1)} ms`);
+  target.appendChild(charts);
+}
+
+function renderPhonePerformance(data) {
+  const target = $("#phone-performance");
+  clearNode(target);
+  appendPhonePerformance(target, data);
+}
+
+function renderPhonePerformanceManifest(manifest) {
+  const target = $("#phone-performance");
+  clearNode(target);
+  const entries = Array.isArray(manifest?.entries) ? manifest.entries : [];
+  if (!entries.length) {
+    appendPhonePerformance(target, {
+      available: false,
+      reason: "performance_result_manifest_has_no_sources",
+    });
+    return;
+  }
+  entries.forEach((entry, index) => {
+    const label = entry.device_id
+      ? `设备 ${entry.device_id}`
+      : entries.length > 1
+        ? `设备 ${index + 1} · ${entry.session_name || entry.namespace || "unknown"}`
+        : entry.session_name || "手机性能趋势";
+    appendPhonePerformance(target, entry.summary || {}, label);
+  });
 }
 
 async function loadGpuCapabilities() {
@@ -999,6 +1125,24 @@ async function renderJob(job) {
   renderReview(job.quality_report || {}, job.review_items || { items: [] });
   renderArtifacts(job.artifacts || {});
   const artifacts = job.artifacts || {};
+  if (artifacts["performance/performance_manifest.json"]) {
+    try {
+      const performanceManifest = await request(
+        artifacts["performance/performance_manifest.json"],
+      );
+      renderPhonePerformanceManifest(performanceManifest);
+    } catch (error) {
+      renderPhonePerformance({
+        available: false,
+        reason: `performance_result_manifest_unreadable: ${error.message}`,
+      });
+    }
+  } else {
+    renderPhonePerformance({
+      available: false,
+      reason: "performance_result_manifest_missing",
+    });
+  }
   if (job.kind === "prior_map") {
     clearShelfTuning(false);
     $("#merge-toggle").hidden = true;

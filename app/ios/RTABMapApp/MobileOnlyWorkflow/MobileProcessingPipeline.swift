@@ -1080,6 +1080,20 @@ enum MobileProcessingPipeline {
             taskID: request.taskRoot.lastPathComponent, resultID: resultID)
         try FileManager.default.createDirectory(
             at: resultDirectory, withIntermediateDirectories: true)
+        let performanceSourceURL = snapshot.snapshotDirectory
+            .appendingPathComponent("performance_samples.jsonl")
+        let hasPerformanceEvidence = FileManager.default.fileExists(
+            atPath: performanceSourceURL.path)
+        let performanceSampleCount =
+            (metadata["performanceSampleCount"] as? NSNumber)?.intValue ?? 0
+        let performanceEvidenceComplete =
+            StrictJSONScalar.boolean(metadata["performanceEvidenceComplete"])
+                ?? false
+        let performanceResultFiles = hasPerformanceEvidence
+            ? [
+                "phone_performance_samples.jsonl",
+                "phone_performance_summary.json",
+            ] : []
         // V1R4 §16.4 rollback: any failure below removes the staging
         // package; a committed result (already renamed out of staging)
         // is never touched.
@@ -1224,6 +1238,18 @@ enum MobileProcessingPipeline {
                 },
             ],
             "tag_observation_evidence": tagEvidence.audit.reportPayload(),
+            "phone_performance": [
+                "available": hasPerformanceEvidence,
+                "sample_count": performanceSampleCount,
+                "evidence_complete": performanceEvidenceComplete,
+                "write_failure_count":
+                    (metadata["performanceWriteFailureCount"] as? NSNumber)?
+                        .intValue ?? 0,
+                "analysis_status": hasPerformanceEvidence
+                    ? "raw_evidence_preserved_pc_strict_analysis_required"
+                    : "missing",
+                "gpu_metric_status": "not_available_public_ios_api",
+            ],
         ]
         try CanonicalJSONEncoder.encode(qualityReport).write(
             to: resultDirectory.appendingPathComponent("quality_report.json"))
@@ -1237,6 +1263,34 @@ enum MobileProcessingPipeline {
             try FileManager.default.copyItem(
                 at: inputManifestURL,
                 to: resultDirectory.appendingPathComponent("input_manifest.json"))
+        }
+        if hasPerformanceEvidence {
+            try FileManager.default.copyItem(
+                at: performanceSourceURL,
+                to: resultDirectory.appendingPathComponent(
+                    "phone_performance_samples.jsonl"))
+            let performanceSummary: [String: Any] = [
+                "format": "MarketScannerPhonePerformanceEvidence",
+                "version": 1,
+                "tracking_session_id": request.trackingSessionID,
+                "sample_count": performanceSampleCount,
+                "last_sequence": metadata["performanceLastSequence"]
+                    ?? NSNull(),
+                "last_timestamp_unix":
+                    metadata["performanceLastTimestampUnix"] ?? NSNull(),
+                "sample_interval_seconds":
+                    metadata["performanceSampleIntervalSeconds"] ?? 5.0,
+                "evidence_complete": performanceEvidenceComplete,
+                "write_failure_count":
+                    metadata["performanceWriteFailureCount"] ?? 0,
+                "analysis_status":
+                    "raw_evidence_preserved_pc_strict_analysis_required",
+                "gpu_metric_status": "not_available_public_ios_api",
+                "input_bundle_sha256": snapshot.bundleSHA256,
+            ]
+            try CanonicalJSONEncoder.encode(performanceSummary).write(
+                to: resultDirectory.appendingPathComponent(
+                    "phone_performance_summary.json"))
         }
 
         // --- Streaming four-sheet XLSX ----------------------------------
@@ -1301,7 +1355,7 @@ enum MobileProcessingPipeline {
             "final_trajectory.jsonl", "final_tags.json",
             "quality_report.json", "graph_quality.json",
             "rescan_tasks.json", "input_manifest.json", workbookName,
-        ]
+        ] + performanceResultFiles
         let resultDurableOutputs = [
             PersistentTaskCheckpoint.taskReference("input_snapshot"),
             PersistentTaskCheckpoint.taskReference("input_manifest.json"),
@@ -1352,7 +1406,7 @@ enum MobileProcessingPipeline {
                 "graph_quality.json",
                 "rescan_tasks.json",
                 "input_manifest.json",
-            ],
+            ] + performanceResultFiles,
             workbookFilename: workbookName,
             manifestExtras: [
                 "store_id": request.storeID,
@@ -1398,6 +1452,9 @@ enum MobileProcessingPipeline {
                 "result_quality_status": resultQualityStatus.rawValue,
                 "publish_permitted": publishPermitted,
                 "degradation_count": degradations.count,
+                "performance_sample_count": performanceSampleCount,
+                "performance_evidence_complete":
+                    performanceEvidenceComplete,
             ])
         committed = true
         // §15: terminal durable state — the committed result is the

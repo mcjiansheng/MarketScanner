@@ -309,6 +309,7 @@ enum MobileResultLibrary {
         "publish_permitted", "degradation_count",
         "coordinate_frame_audit_passed",
         "legacy_tag_coordinate_frame_count",
+        "performance_sample_count", "performance_evidence_complete",
     ]
 
     /// Test/embedding hook; see `MobileMapLibrary.rootOverride`.
@@ -3000,6 +3001,17 @@ enum MobileResultLibrary {
         // them.
         for key in manifest.keys where !allowedManifestKeys.contains(key) {
             throw ResultError.invalidManifest("unknown manifest field: \(key)")
+        }
+        if manifest["performance_sample_count"] != nil
+            || manifest["performance_evidence_complete"] != nil {
+            guard let performanceSampleCount = StrictJSONScalar.integer(
+                    manifest["performance_sample_count"]),
+                  performanceSampleCount >= 0,
+                  StrictJSONScalar.boolean(
+                    manifest["performance_evidence_complete"]) != nil else {
+                throw ResultError.invalidManifest(
+                    "performance evidence manifest fields invalid")
+            }
         }
         if let rawStatus = manifest["result_quality_status"] {
             guard let status = rawStatus as? String,

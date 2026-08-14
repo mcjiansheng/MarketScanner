@@ -214,6 +214,12 @@ enum SessionSnapshotTransaction {
         var tagObservationBurstCount: Int64
         var tagObservationBurstLastID: String?
         var tagObservationBurstComplete: Bool
+        var performanceSamples: String?
+        var performanceSampleCount: Int64?
+        var performanceLastSequence: Int64?
+        var performanceLastTimestampUnix: Double?
+        var performanceEvidenceComplete: Bool?
+        var performanceWriteFailureCount: Int64?
 
         subscript(key: String) -> Any? { raw[key] }
     }
@@ -279,6 +285,7 @@ enum SessionSnapshotTransaction {
         "tag_observations.jsonl",
         "localization_recovery_events.jsonl",
         "localized_price_tags.json",
+        "performance_samples.jsonl",
     ]
     static let databaseFileName = "rtabmap_segment_0001.db"
     /// V1R5 §9.4: a non-empty WAL/journal beside the main DB means the
@@ -299,6 +306,13 @@ enum SessionSnapshotTransaction {
         ("localizationRecoveryEvents", "localization_recovery_events.jsonl"),
         ("tagObservations", "tag_observations.jsonl"),
         ("localizedPriceTags", "localized_price_tags.json"),
+    ]
+    /// Observability declarations are copied and identity-bound when present,
+    /// but are not localization/publication authority. Legacy finalized
+    /// sessions remain processable without them; new captures always declare
+    /// the performance stream and carry exact watermarks.
+    static let observabilitySidecarPairs: [(key: String, name: String)] = [
+        ("performanceSamples", "performance_samples.jsonl"),
     ]
 
     static let copyChunkBytes = 4 * 1024 * 1024
@@ -557,6 +571,20 @@ enum SessionSnapshotTransaction {
                 }
             }
         }
+        for (key, name) in Self.observabilitySidecarPairs {
+            let declared = metadata[key] as? String ?? ""
+            guard declared.isEmpty || declared == name else {
+                throw SessionError.notEligible(
+                    "metadata declares unexpected \(key): \(declared)")
+            }
+            if !declared.isEmpty {
+                let source = finalizedSession.appendingPathComponent(name)
+                guard fileManager.fileExists(atPath: source.path) else {
+                    throw SessionError.missingRequired(name)
+                }
+                filesToCopy.append((name, source, true))
+            }
+        }
         // Watermark sidecars: required when the metadata watermark says
         // the scan recorded them; their absence is evidence tampering.
         for name in watermarkFileNames {
@@ -699,6 +727,13 @@ enum SessionSnapshotTransaction {
                 throw SessionError.missingRequired("tag_observation_bursts.jsonl")
             }
             for (_, name) in Self.declaredSidecarPairs {
+                let declared = stagedMetadata[Self.nameKey(for: name)] as? String ?? ""
+                if !declared.isEmpty && !fileManager.fileExists(
+                    atPath: stagingDirectory.appendingPathComponent(name).path) {
+                    throw SessionError.missingRequired(name)
+                }
+            }
+            for (_, name) in Self.observabilitySidecarPairs {
                 let declared = stagedMetadata[Self.nameKey(for: name)] as? String ?? ""
                 if !declared.isEmpty && !fileManager.fileExists(
                     atPath: stagingDirectory.appendingPathComponent(name).path) {
@@ -934,7 +969,7 @@ enum SessionSnapshotTransaction {
     /// Maps a metadata sidecar-declaration key back to its artifact
     /// file name (used for the post-copy watermark re-check).
     private static func nameKey(for fileName: String) -> String {
-        return Self.declaredSidecarPairs
+        return (Self.declaredSidecarPairs + Self.observabilitySidecarPairs)
             .first(where: { $0.name == fileName })?.key ?? ""
     }
 
@@ -1495,6 +1530,68 @@ enum SessionSnapshotTransaction {
                 "tag burst count lacks an exact last-ID watermark")
         }
 
+        let rawPerformanceSamples = object["performanceSamples"]
+        let performanceSamples: String?
+        let performanceSampleCount: Int64?
+        let performanceLastSequence: Int64?
+        let performanceLastTimestampUnix: Double?
+        let performanceEvidenceComplete: Bool?
+        let performanceWriteFailureCount: Int64?
+        if rawPerformanceSamples == nil || rawPerformanceSamples is NSNull {
+            performanceSamples = nil
+            performanceSampleCount = nil
+            performanceLastSequence = nil
+            performanceLastTimestampUnix = nil
+            performanceEvidenceComplete = nil
+            performanceWriteFailureCount = nil
+        } else {
+            guard nonEmptyString(rawPerformanceSamples)
+                    == "performance_samples.jsonl",
+                  let interval = StrictJSONScalar.number(
+                    object["performanceSampleIntervalSeconds"]),
+                  interval >= 1, interval <= 300,
+                  let sampleCount = strictInteger(
+                    object["performanceSampleCount"]),
+                  sampleCount >= 0,
+                  let evidenceComplete = StrictJSONScalar.boolean(
+                    object["performanceEvidenceComplete"]),
+                  let writeFailureCount = strictInteger(
+                    object["performanceWriteFailureCount"]),
+                  writeFailureCount >= 0 else {
+                throw SessionError.notEligible(
+                    "performance evidence declaration/watermarks are invalid")
+            }
+            let lastSequence = optionalStrictInteger(
+                object["performanceLastSequence"])
+            let lastTimestamp = optionalStrictNumber(
+                object["performanceLastTimestampUnix"])
+            if sampleCount == 0 {
+                guard lastSequence == nil, lastTimestamp == nil,
+                      evidenceComplete == false else {
+                    throw SessionError.notEligible(
+                        "empty performance evidence has invalid watermarks")
+                }
+            } else {
+                guard lastSequence == sampleCount,
+                      let lastTimestamp, lastTimestamp > 0 else {
+                    throw SessionError.notEligible(
+                        "performance evidence lacks exact count/time watermarks")
+                }
+            }
+            if evidenceComplete {
+                guard sampleCount > 0, writeFailureCount == 0 else {
+                    throw SessionError.notEligible(
+                        "complete performance evidence conflicts with failures/count")
+                }
+            }
+            performanceSamples = "performance_samples.jsonl"
+            performanceSampleCount = sampleCount
+            performanceLastSequence = lastSequence
+            performanceLastTimestampUnix = lastTimestamp
+            performanceEvidenceComplete = evidenceComplete
+            performanceWriteFailureCount = writeFailureCount
+        }
+
         let value = StrictFinalizedSessionMetadata(
             raw: object,
             format: "MarketScannerFinalizedSessionMetadata",
@@ -1530,7 +1627,13 @@ enum SessionSnapshotTransaction {
             clockEvidenceComplete: clockComplete,
             tagObservationBurstCount: burstCount,
             tagObservationBurstLastID: burstLastID,
-            tagObservationBurstComplete: burstComplete)
+            tagObservationBurstComplete: burstComplete,
+            performanceSamples: performanceSamples,
+            performanceSampleCount: performanceSampleCount,
+            performanceLastSequence: performanceLastSequence,
+            performanceLastTimestampUnix: performanceLastTimestampUnix,
+            performanceEvidenceComplete: performanceEvidenceComplete,
+            performanceWriteFailureCount: performanceWriteFailureCount)
         return (value, sha256(data))
     }
 

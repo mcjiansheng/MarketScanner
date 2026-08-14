@@ -4739,6 +4739,58 @@ if (clamped[0] !== 0 || clamped[1] !== 0) process.exit(6);
             audit,
         )
 
+    def test_multi_device_performance_artifacts_are_listed_and_served(self) -> None:
+        output = self.root / "multi-performance-output"
+        performance = output / "performance"
+        device = performance / "device_01"
+        diagnostics = device / "diagnostics"
+        diagnostics.mkdir(parents=True)
+        manifest = {
+            "format": "MarketScannerPerformanceResultManifest",
+            "version": 1,
+            "entries": [],
+        }
+        summary = {
+            "format": "MarketScannerPhonePerformanceSummary",
+            "version": 1,
+            "available": True,
+            "series": [],
+        }
+        (performance / "performance_manifest.json").write_text(
+            json.dumps(manifest), encoding="utf-8"
+        )
+        (device / "phone_performance_summary.json").write_text(
+            json.dumps(summary), encoding="utf-8"
+        )
+        diagnostic = b'{"format":"MarketScannerMetricDiagnostic"}\n'
+        (diagnostics / "metrickit_diagnostics_001.jsonl").write_bytes(diagnostic)
+        job = server.STATE.add("multi", output)
+        server.STATE.set_status(job.identifier, "complete")
+
+        artifacts = server.job_artifacts(job)
+        for name in (
+            "performance/performance_manifest.json",
+            "performance/device_01/phone_performance_summary.json",
+            "performance/device_01/diagnostics/metrickit_diagnostics_001.jsonl",
+        ):
+            self.assertIn(name, artifacts)
+        self.assertEqual(
+            self.api(
+                artifacts[
+                    "performance/device_01/phone_performance_summary.json"
+                ]
+            ),
+            summary,
+        )
+        content, content_type = self.fetch(
+            artifacts[
+                "performance/device_01/diagnostics/"
+                "metrickit_diagnostics_001.jsonl"
+            ]
+        )
+        self.assertEqual(content, diagnostic)
+        self.assertEqual(content_type, "application/x-ndjson")
+
     def test_trajectory_sidecar_is_used_when_database_is_missing(self) -> None:
         session = self.root / "SupermarketSession-Sidecar"
         segment = session / "segment_0001"
