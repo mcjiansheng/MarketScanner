@@ -2,6 +2,14 @@
 
 > 文档状态：**当前有效**。最后核对日期：2026-08-15。
 
+### 2026-08-15 扫描前显示名称合并回归
+
+自动化必须执行真实 `MarketScannerScanName` 核心代码，覆盖路径/控制字符过滤、空白折叠、完全无有效字符、64 字符上限、幂等、用户名称优先和默认名称回退；`PriorMapScanConfiguration` 必须证明无字段的旧编码仍可解码为 nil，命名配置可 Codable round-trip。源码合同还要证明配置页只在相机授权和地图身份完成后把解析名称送入唯一 `MobileScanConfiguration`，host 再次清洗，live checkpoint/final metadata/scan event 使用同一值，历史列表对 metadata 再清洗并保留会话目录副标题。
+
+路径安全负例必须证明 `startNewSessionIfNeeded()`、`SupermarketSession-*`、SQLite、sidecar、snapshot、Result 和发布路径不消费 `scanDisplayName`；命名为空、只有非法字符或历史字段缺失均不得阻断启动、处理或导出。真机需手工覆盖中文/英文/emoji、64/65 字符、特殊字符、切换楼层后的默认 placeholder、键盘清空、连续两次同名扫描、Stop/finalization、历史列表、原始导出和 PC metadata 读取；host/Xcode 通过不能替代这一交互矩阵。
+
+当前合并证据：命名 UX/source **25/25 PASS**、完整 PriorMap **331/331 PASS（376.662 s）**、Qualification **30/30 PASS（12.128 s）**、Map Studio **142/142 PASS（9.671 s）**、生成合同检查、Swift parse、patch check 和 unsigned generic iPhoneOS QualifiedDevice Debug 全量编译/链接 PASS。真机交互矩阵仍为 NOT RUN。
+
 ### 2026-08-15 山姆现场前完整链路稳定性回归
 
 冷启动必须覆盖 Settings bundle 缺项、错误类型和 native host 暂不可用；地图入口必须覆盖 off-main prepare/present、Files provider staging 无 base address、包内 floor 消失和取消/rollback。严格证据必须对 recovery reason、last-trigger reason、trigger record reason 的非字符串值、空 complete burst、trace pose 二次读取失败、duplicate observation 和 canonical scalar 类型漂移返回稳定错误，任何路径不得调用显式进程终止原语。ARKit 提交必须故障注入 captured image/depth/confidence lock/base-address 失败和无 raw feature point；有限证据可降级，锁必须精确释放。

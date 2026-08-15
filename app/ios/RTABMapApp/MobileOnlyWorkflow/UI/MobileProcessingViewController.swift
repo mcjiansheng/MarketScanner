@@ -47,6 +47,16 @@ final class MobileProcessingViewController: UIViewController,
         var boundPriorMapSHA: String? {
             return metadata["priorMapSha256"] as? String
         }
+
+        /// Optional human-readable name recorded at scan start. Older
+        /// sessions never wrote the field and simply have no display name.
+        var scanDisplayName: String? {
+            guard let name = metadata[
+                MarketScannerScanName.metadataKey] as? String else {
+                return nil
+            }
+            return MarketScannerScanName.sanitize(name)
+        }
     }
 
     private let coordinator = MobileOnlyWorkflowCoordinator.shared
@@ -237,12 +247,22 @@ final class MobileProcessingViewController: UIViewController,
             return cell
         }
         let candidate = candidates[indexPath.row]
-        cell.textLabel?.text = candidate.sessionDirectory.lastPathComponent
+        // A committed display name becomes the primary title; the session
+        // directory stays visible so unnamed and older sessions keep the
+        // exact presentation they had before this feature.
+        if let displayName = candidate.scanDisplayName {
+            cell.textLabel?.text = displayName
+        } else {
+            cell.textLabel?.text = candidate.sessionDirectory.lastPathComponent
+        }
         cell.textLabel?.textColor = .label
         let traceCount = (candidate.metadata["captureHealth"] as? [String: Any])?["localizationTraceRecordCount"] as? Int
         let boundMap = candidate.boundPriorMapID ?? "未绑定地图"
+        let subtitlePrefix = candidate.scanDisplayName != nil
+            ? "\(candidate.sessionDirectory.lastPathComponent) · "
+            : ""
         cell.detailTextLabel?.text =
-            "finalized · trace \(traceCount ?? 0) · \(boundMap)"
+            "\(subtitlePrefix)finalized · trace \(traceCount ?? 0) · \(boundMap)"
         let exportButton = UIButton(type: .system)
         exportButton.setImage(
             UIImage(systemName: "square.and.arrow.up"),

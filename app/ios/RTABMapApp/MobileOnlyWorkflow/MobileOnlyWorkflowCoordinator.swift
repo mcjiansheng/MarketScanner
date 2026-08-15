@@ -1524,6 +1524,10 @@ struct MobileScanConfiguration {
     var startYM: Double
     var startYawRad: Double
     var storeID: String
+    /// Resolved human-readable scan display name. Always non-empty: the
+    /// setup screen sanitizes user input and falls back to the deterministic
+    /// default before building this configuration.
+    var scanDisplayName: String
 }
 
 /// Receipt proving the real scan actually started (V1R3 §4.1). Produced

@@ -4424,6 +4424,70 @@ let ready = PriorMapScanConfiguration(
     initialMapPose: PriorMapPose2D(xM: 2, yM: 3, yawRad: .pi / 2))
 require(ready.isReadyToStart, "complete prior-map setup must start")
 
+require(
+    MarketScannerScanName.sanitize("  Sam / F1 :*?  ") == "Sam F1",
+    "scan display name must remove forbidden characters and collapse whitespace")
+require(
+    MarketScannerScanName.sanitize(" /\\:*?\"<>|\n\t ") == nil,
+    "scan display name with no usable characters must become nil")
+let longScanDisplayName = MarketScannerScanName.sanitize(
+    String(repeating: "货", count: 80))
+require(
+    longScanDisplayName?.count == MarketScannerScanName.maximumLength,
+    "scan display name must be capped at the public character limit")
+require(
+    MarketScannerScanName.sanitize(longScanDisplayName) == longScanDisplayName,
+    "scan display name sanitization must be idempotent")
+let defaultScanDisplayName = MarketScannerScanName.defaultName(
+    storeID: "hs/6599",
+    floorID: "F:1",
+    at: Date(timeIntervalSince1970: 0))
+require(
+    defaultScanDisplayName.hasPrefix("hs6599-F1-"),
+    "default scan display name must sanitize store and floor identity")
+require(
+    MarketScannerScanName.effectiveName(
+        userInput: "  Sam Morning  ",
+        storeID: "ignored",
+        floorID: "ignored",
+        at: Date(timeIntervalSince1970: 0)) == "Sam Morning",
+    "a valid operator scan display name must win over the default")
+require(
+    MarketScannerScanName.effectiveName(
+        userInput: " /:*? ",
+        storeID: "store",
+        floorID: "floor",
+        at: Date(timeIntervalSince1970: 0)).hasPrefix("store-floor-"),
+    "an unusable operator scan display name must fall back without blocking")
+
+let unnamedScanConfigurationData = try JSONEncoder().encode(ready)
+require(
+    !String(decoding: unnamedScanConfigurationData, as: UTF8.self)
+        .contains("\"scanDisplayName\""),
+    "nil scan display name must preserve the legacy configuration encoding")
+let decodedUnnamedScanConfiguration = try JSONDecoder().decode(
+    PriorMapScanConfiguration.self,
+    from: unnamedScanConfigurationData)
+require(
+    decodedUnnamedScanConfiguration.scanDisplayName == nil,
+    "legacy configuration without a scan display name must remain decodable")
+let namedScanConfiguration = PriorMapScanConfiguration(
+    formatVersion: 1,
+    workflowMode: .priorMapLocalized,
+    packageDirectory: URL(fileURLWithPath: "/tmp/PriorMap-fixture"),
+    priorMapId: "fixture",
+    priorMapSha256: String(repeating: "a", count: 64),
+    floorId: "1",
+    storeID: "STORE-1",
+    initialMapPose: PriorMapPose2D(xM: 2, yM: 3, yawRad: .pi / 2),
+    scanDisplayName: "Sam Morning")
+let decodedNamedScanConfiguration = try JSONDecoder().decode(
+    PriorMapScanConfiguration.self,
+    from: JSONEncoder().encode(namedScanConfiguration))
+require(
+    decodedNamedScanConfiguration.scanDisplayName == "Sam Morning",
+    "scan display name must round-trip through the durable configuration")
+
 let northFacing = PriorMapStageOneMath.arkitHorizontalPose(
     positionX: 0,
     positionZ: 0,

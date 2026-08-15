@@ -19,6 +19,62 @@ class MobileScanUXContractTests(unittest.TestCase):
     def source(self, relative: str) -> str:
         return (ROOT / relative).read_text(encoding="utf-8")
 
+    def test_optional_scan_display_name_flows_without_becoming_path_authority(
+        self,
+    ) -> None:
+        coordinator = self.source(
+            "app/ios/RTABMapApp/MobileOnlyWorkflow/"
+            "MobileOnlyWorkflowCoordinator.swift"
+        )
+        setup = self.source(
+            "app/ios/RTABMapApp/MobileOnlyWorkflow/UI/"
+            "MobileScanSetupViewController.swift"
+        )
+        processing = self.source(
+            "app/ios/RTABMapApp/MobileOnlyWorkflow/UI/"
+            "MobileProcessingViewController.swift"
+        )
+        core = self.source(
+            "app/ios/RTABMapApp/PriorMapLocalizationCore.swift"
+        )
+        session = self.source(
+            "app/ios/RTABMapApp/SupermarketScanSession.swift"
+        )
+        host = self.source("app/ios/RTABMapApp/ViewController.swift")
+
+        self.assertIn("var scanDisplayName: String", coordinator)
+        self.assertIn("enum MarketScannerScanName", core)
+        self.assertIn("static let maximumLength = 64", core)
+        self.assertIn('static let metadataKey = "scanDisplayName"', core)
+        self.assertIn("static func sanitize(_ raw: String?)", core)
+        self.assertIn("static func effectiveName(", core)
+        self.assertIn("let scanDisplayName: String?", core)
+        self.assertIn("scanDisplayName: String? = nil", core)
+
+        self.assertIn('sectionLabel("扫描名称（可选）")', setup)
+        self.assertIn('scanNameField.accessibilityLabel = "扫描名称"', setup)
+        self.assertIn("MarketScannerScanName.effectiveName(", setup)
+        self.assertIn("scanDisplayName: scanDisplayName", setup)
+
+        self.assertGreaterEqual(
+            session.count("scanDisplayName: scanConfiguration.scanDisplayName"),
+            1,
+        )
+        self.assertIn(
+            "scanDisplayName: scanSession.scanConfiguration.scanDisplayName",
+            host,
+        )
+        self.assertIn("scanDisplayName: resolvedScanDisplayName", host)
+        self.assertIn("MarketScannerScanName.sanitize(name)", processing)
+
+        directory_start = session.index("func startNewSessionIfNeeded()")
+        directory_end = session.index("func resetCurrentSegment()", directory_start)
+        self.assertNotIn(
+            "scanDisplayName",
+            session[directory_start:directory_end],
+            "display metadata must never change the canonical session path",
+        )
+
     def test_primary_scan_route_does_not_reach_legacy_wizard(self) -> None:
         source = self.source("app/ios/RTABMapApp/ViewController.swift")
         start = source.index("private func presentNewScanModePicker()")

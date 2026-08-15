@@ -72,6 +72,11 @@ final class MobileScanSetupViewController: UIViewController {
     private let headingLabel = UILabel()
     private let summaryLabel = UILabel()
     private let startButton = UIButton(type: .system)
+    /// Optional human-readable name for this scan. Leaving it empty (or
+    /// clearing it) never blocks start: the resolved effective name always
+    /// falls back to `<store>-<floor>-MMdd-HHmm`.
+    private let scanNameField = UITextField()
+    private let scanNameHint = UILabel()
 
     private var payload: SetupPayload?
     private var selectedFloorIndex = 0
@@ -180,6 +185,21 @@ final class MobileScanSetupViewController: UIViewController {
 
         configureMapEditor()
 
+        let scanNameTitle = sectionLabel("扫描名称（可选）")
+        scanNameField.borderStyle = .roundedRect
+        scanNameField.placeholder = "留空将使用默认名称"
+        scanNameField.accessibilityLabel = "扫描名称"
+        scanNameField.accessibilityHint = "可选；留空时自动使用门店、楼层和时间生成的默认名称"
+        scanNameField.autocorrectionType = .no
+        scanNameField.returnKeyType = .done
+        scanNameField.clearButtonMode = .whileEditing
+        scanNameField.adjustsFontForContentSizeCategory = true
+        scanNameHint.text = "用于历史扫描列表和会话元数据展示，最多 64 个字符，特殊字符会被自动过滤；留空或清空时使用默认名称，不影响扫描启动。"
+        scanNameHint.font = UIFont.preferredFont(forTextStyle: .caption1)
+        scanNameHint.textColor = .secondaryLabel
+        scanNameHint.numberOfLines = 0
+        scanNameHint.adjustsFontForContentSizeCategory = true
+
         let positionTitle = sectionLabel("微调起点位置")
         positionStepControl.selectedSegmentIndex = 1
         positionStepControl.accessibilityLabel = "位置微调步长"
@@ -216,6 +236,9 @@ final class MobileScanSetupViewController: UIViewController {
         [
             floorControl,
             loadingRow,
+            scanNameTitle,
+            scanNameField,
+            scanNameHint,
             mapScrollView,
             positionTitle,
             positionStepControl,
@@ -414,6 +437,7 @@ final class MobileScanSetupViewController: UIViewController {
                     self.selectedFloorIndex = 0
                     self.rebuildFloorControl()
                     self.applySelectedFloor(resetZoom: true)
+                    self.refreshScanNamePlaceholder()
                     self.setLoading(false, message: "地图验证完成，可选择起点。")
                 case .failure(let error):
                     self.payload = nil
@@ -515,6 +539,18 @@ final class MobileScanSetupViewController: UIViewController {
     @objc private func floorChanged() {
         selectedFloorIndex = max(0, floorControl.selectedSegmentIndex)
         applySelectedFloor(resetZoom: true)
+        refreshScanNamePlaceholder()
+    }
+
+    /// Shows the live default name as placeholder so the operator always
+    /// knows exactly what will be recorded when the field stays empty.
+    private func refreshScanNamePlaceholder() {
+        guard let package = payload?.package,
+              let floor = currentFloor else { return }
+        scanNameField.placeholder = MarketScannerScanName.defaultName(
+            storeID: package.manifest.storeID,
+            floorID: floor.id,
+            at: Date())
     }
 
     private func applySelectedFloor(resetZoom: Bool) {
@@ -920,6 +956,12 @@ final class MobileScanSetupViewController: UIViewController {
         loadingLabel.text = "正在验证地图并启动扫描…"
         startButton.isEnabled = false
 
+        // Empty, whitespace-only or fully filtered input resolves to the
+        // deterministic default; a name problem can never block scan start.
+        let scanDisplayName = MarketScannerScanName.effectiveName(
+            userInput: scanNameField.text,
+            storeID: package.manifest.storeID,
+            floorID: floor.id)
         let configuration = MobileScanConfiguration(
             priorMap: map,
             preparedPackage: package,
@@ -927,7 +969,8 @@ final class MobileScanSetupViewController: UIViewController {
             startXM: x,
             startYM: y,
             startYawRad: startYawRad,
-            storeID: package.manifest.storeID)
+            storeID: package.manifest.storeID,
+            scanDisplayName: scanDisplayName)
         guard coordinator.beginScanSetup(map: map) else {
             startInFlight = false
             formScrollView.isUserInteractionEnabled = true

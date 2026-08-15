@@ -6769,6 +6769,7 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                         // finalization; the snapshot eligibility chain
                         // validates it fail-closed against the request.
                         storeId: scanSession.scanConfiguration.storeID,
+                        scanDisplayName: scanSession.scanConfiguration.scanDisplayName,
                         initialMapPose: scanSession.scanConfiguration.initialMapPose,
                         localizationTrace: scanSession.scanConfiguration.workflowMode == .priorMapLocalized
                             ? "localization_trace.jsonl"
@@ -8207,6 +8208,7 @@ extension ViewController: MobileOnlyScanStarting {
                 "workflowMode": configuration.workflowMode.rawValue,
                 "priorMapId": configuration.priorMapId ?? "",
                 "floorId": configuration.floorId ?? "",
+                "scanDisplayName": configuration.scanDisplayName ?? "",
             ])
 
         guard FileManager.default.fileExists(atPath: segmentDirectory.path),
@@ -8254,6 +8256,14 @@ extension ViewController: MobileOnlyScanStarting {
                 "prepared prior-map identity, store or floor mismatch")
         }
 
+        // Defense in depth: the setup screen already resolved the display
+        // name, but the host re-runs the idempotent sanitization so no
+        // caller path can inject an unsafe or empty value into session
+        // metadata. Legacy/free scans without a name keep nil.
+        let resolvedScanDisplayName = MarketScannerScanName.effectiveName(
+            userInput: configuration.scanDisplayName,
+            storeID: configuration.storeID,
+            floorID: configuration.floorID)
         let scanConfiguration = PriorMapScanConfiguration(
             formatVersion: 1,
             workflowMode: .priorMapLocalized,
@@ -8266,7 +8276,8 @@ extension ViewController: MobileOnlyScanStarting {
             initialMapPose: PriorMapPose2D(
                 xM: configuration.startXM,
                 yM: configuration.startYM,
-                yawRad: configuration.startYawRad))
+                yawRad: configuration.startYawRad),
+            scanDisplayName: resolvedScanDisplayName)
         guard scanConfiguration.isReadyToStart else {
             throw MobileOnlyWorkflowError.invalidState(
                 "prior-map scan configuration incomplete")

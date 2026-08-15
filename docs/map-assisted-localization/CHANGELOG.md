@@ -2,6 +2,13 @@
 
 > 文档状态：**当前有效**。最后核对日期：2026-08-15。
 
+## 2026-08-15 — 扫描前显示名称合并
+
+- 将 `feature/scan-display-name@389b8b0` 合并到山姆现场加固分支。地图配置页新增可选扫描名称；用户输入经过控制字符/路径特殊字符过滤、空白折叠和 64 字符上限，空值自动回退 `<store>-<floor>-MMdd-HHmm`，名称问题永不阻断扫描启动。
+- `scanDisplayName` 作为可选、向后兼容字段进入 `PriorMapScanConfiguration`、live checkpoint 和最终 metadata；扫描事件记录相同解析值。历史扫描列表优先显示再次清洗后的名称，同时保留 canonical `SupermarketSession-*` 目录名作为副标题。名称不参与目录、数据库、sidecar、地图身份、结果 ID 或发布路径。
+- 命名规则移入 platform-neutral core 并加入 Swift host 运行时测试，覆盖清洗、空值、长度、幂等、默认值、用户值优先及旧/新配置 Codable；移动 UX 合同覆盖 UI→host→checkpoint/metadata→历史列表全链路和“不得成为路径 authority”。
+- 合并回归通过命名 UX/source **25/25**、完整 PriorMap **331/331（376.662 s）**、Qualification **30/30（12.128 s）**、Map Studio **142/142（9.671 s）**、生成合同检查、Swift parse、patch check 和 unsigned generic iPhoneOS QualifiedDevice Debug 全量编译/链接。当前压力峰值为 finalization 13,139,968 bytes、trace 59,113,472 bytes、tag evidence 746,192,896 bytes。真机命名交互、Stop/finalization/export 和 PC metadata 人工核对仍为 NOT RUN。
+
 ## 2026-08-15 — 山姆现场前端到端稳定性加固
 
 - 冷启动 Settings 读取不再强制解包；缺失或损坏值使用保守 fallback 并写诊断。生产 Swift 源码（排除供应商 `Libraries/`）清除显式 `fatalError`、`precondition`、`preconditionFailure` 和 `as!`，程序化 UIKit coder、地图导入主线程边界、worker 数量错误、人工定位提交失败和 workflow rollback 都改为可恢复路径。
