@@ -1006,6 +1006,43 @@ class MapStudioApiTests(unittest.TestCase):
             Path(server.localized.__file__).read_bytes(),
         )
 
+    def test_manual_edit_context_keeps_only_the_review_floor(self) -> None:
+        prior_map = self.root / "floor-filter-prior-map"
+        prior_map.mkdir()
+        (prior_map / "elements.json").write_text(
+            json.dumps(
+                {
+                    "elements": [
+                        {"id": "floor-1-shelf", "floor_id": "1"},
+                        {"id": "floor-1-road", "floor_id": "1"},
+                        {"id": "floor-2-shelf", "floor_id": "2"},
+                    ]
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        (prior_map / "manifest.json").write_text(
+            json.dumps({"format": "PriorMapPackage", "version": 2}) + "\n",
+            encoding="utf-8",
+        )
+        tags, constraints, elements, manifest = server._manual_edit_context(
+            [], {"raw": []}, {"floor_id": "1"}, prior_map
+        )
+        self.assertEqual(tags, [])
+        self.assertEqual(constraints, [])
+        self.assertEqual(
+            [element["id"] for element in elements],
+            ["floor-1-shelf", "floor-1-road"],
+        )
+        self.assertEqual(manifest["format"], "PriorMapPackage")
+        with self.assertRaises(server.RequestError):
+            server._manual_edit_context([], {"raw": []}, {}, prior_map)
+        with self.assertRaises(server.RequestError):
+            server._manual_edit_context(
+                [], {"raw": []}, {"floor_id": "missing"}, prior_map
+            )
+
     def test_prior_map_frontend_uses_basic_info_with_optional_exact_assertions(self) -> None:
         page, _ = self.fetch("/")
         script, _ = self.fetch("/app.js")
@@ -3080,6 +3117,10 @@ class MapStudioApiTests(unittest.TestCase):
         self.assertIn(b"expected_version_id", script)
         self.assertIn(b"/localized/state", script)
         self.assertIn(b"drawLocalizedReview", script)
+        self.assertIn(b'element.role === "road"', script)
+        self.assertIn(b'element.shape_type === "MapCross"', script)
+        self.assertIn(b'element.shape_type === "MapRoadPoint"', script)
+        self.assertIn(b'cssColor("--road-helper", "#8fbcd4")', script)
         self.assertIn(b"beginLocalizedAnchor", script)
         self.assertIn(b"anchorDraft", script)
         self.assertIn(b"prior_map_offline_optimized", script)

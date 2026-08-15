@@ -466,6 +466,8 @@ struct PriorMapTagObservationRecord: Codable {
     let coordinateFrame: String?
     let pointInBoundNodeFrame: PriorMapTagNodeLocalPoint3D?
     let measurementHeightM: Double?
+    var epoch: Int? = nil
+    var component: Int64? = nil
 
     enum CodingKeys: String, CodingKey {
         case format
@@ -509,12 +511,14 @@ struct PriorMapTagObservationRecord: Codable {
         case coordinateFrame = "coordinate_frame"
         case pointInBoundNodeFrame = "point_in_bound_node_frame"
         case measurementHeightM = "measurement_height_m"
+        case epoch
+        case component
     }
 
     /// V1R5: returns a copy bound to the durable burst/frame identity
     /// assigned at persistence time. The original record never mutates.
     func bindingBurst(burstId: String?, frameId: String?) -> PriorMapTagObservationRecord {
-        return PriorMapTagObservationRecord(
+        var result = PriorMapTagObservationRecord(
             format: format,
             version: version,
             observationId: observationId,
@@ -556,6 +560,9 @@ struct PriorMapTagObservationRecord: Codable {
             coordinateFrame: coordinateFrame,
             pointInBoundNodeFrame: pointInBoundNodeFrame,
             measurementHeightM: measurementHeightM)
+        result.epoch = epoch
+        result.component = component
+        return result
     }
 }
 

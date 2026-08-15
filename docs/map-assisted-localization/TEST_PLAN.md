@@ -1,6 +1,14 @@
 # 地图辅助定位阶段一至阶段三测试计划
 
-> 文档状态：**当前有效**。最后核对日期：2026-08-15。
+> 文档状态：**当前有效**。最后核对日期：2026-08-16。
+
+## 2026-08-15 通道/货架约束增量
+
+自动化必须覆盖：manifest v5 四流空/非空水位、未知字段/重复键/半行/超限、epoch bridge 正反例、component/side/window 交叉引用、两侧法向与 0.5 m/10°/70% 门、非主导与主导动态样本、point+swept-segment 0.4 m 穿架、top1 低 margin 的非阻塞 `LOW_CONFIDENCE`、人工重定位恢复、corridor route 成功转正与任一自洽项失败降级、accepted loop 生成 shelf-face 因子并回溯整圈、以及价签 raw/optimized/shelf-projected 三坐标和采集侧长边投影。发布测试必须断言 shelf 法向残差 ≤0.5 m、纵向在段内、结构内点/穿架段为 0。
+
+当前主机执行结果：PriorMap **340/340（421.006 s）**、Map Studio **143/143（12.533 s）**、Qualification **30/30**、生成合同 16 文件、native factor-graph/reprocess 增量构建、Python/JavaScript 语法、patch check 和 unsigned generic iphoneos Debug 全量编译/链接 PASS。规模门为 finalization 300,000 条 peak **13,336,576 bytes**，trace 1,728,000 条保留 172,801 / peak **59,162,624 bytes**，tag evidence 400,000 条接受 200,000 / peak **793,395,200 bytes**。1280×720 真实浏览器检查通过；1024/390 的内置视口覆盖未生效，只能记为 CSS/源码合同覆盖，不能登记为真实视觉 PASS。
+
+签名 iPhone 17 Pro Max 的候选打分/穿架审计 cadence、30 分钟与 2 小时热/内存/电量矩阵、C-1/C-2/C-3 Replay Pareto、Sam WM/LTM A/B、动态顾客/购物车和现场控制点仍是外部必测项；这些未完成前不得把 host/unsigned build 写成 Production GO。
 
 ### 2026-08-15 扫描前显示名称合并回归
 

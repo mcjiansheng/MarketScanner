@@ -27,6 +27,21 @@ enum GeneratedMobileEvidenceContracts {
         static let watermark_fields: [String] = ["clockCorrelationCount", "clockNodeBindingCount"]
     }
 
+    enum File_corridor_hypotheses_jsonl {
+        static let blank_line_policy = "empty_file_allowed"
+        static let final_newline = true
+        static let identity_fields: [String] = ["tracking_session_id", "node_id", "epoch", "component", "sequence"]
+        static let max_file_bytes = 268435456
+        static let max_nesting_depth = 8
+        static let max_record_bytes = 65536
+        static let max_records = 60000
+        static let qualification_max_records = 60000
+        static let qualification_record_rate_hz = 2
+        static let strict_bool = true
+        static let strict_integer = true
+        static let watermark_fields: [String] = ["corridorHypothesisCount", "corridorHypothesisLastSequence"]
+    }
+
     enum File_localization_constraints_jsonl {
         static let blank_line_policy = "reject"
         static let final_newline = true
@@ -80,7 +95,7 @@ enum GeneratedMobileEvidenceContracts {
         static let max_records = 1
         static let strict_bool = true
         static let strict_integer = true
-        static let watermark_fields: [String] = ["finalized", "clockCorrelationCount", "clockNodeBindingCount", "tagObservationBurstCount", "tagObservationBurstLastID", "tagObservationBurstComplete", "performanceSampleCount", "performanceLastSequence", "performanceLastTimestampUnix", "performanceEvidenceComplete", "captureHealth.localizationTraceRecordCount", "captureHealth.localizationConstraintRecordCount", "captureHealth.manualLocalizationEventCount", "captureHealth.localizationRecoveryEventCount"]
+        static let watermark_fields: [String] = ["finalized", "clockCorrelationCount", "clockNodeBindingCount", "tagObservationBurstCount", "tagObservationBurstLastID", "tagObservationBurstComplete", "performanceSampleCount", "performanceLastSequence", "performanceLastTimestampUnix", "performanceEvidenceComplete", "poseEpochTransitionCount", "poseEpochTransitionLastSequence", "corridorHypothesisCount", "corridorHypothesisLastSequence", "shelfObservationWindowCount", "shelfObservationWindowLastSequence", "shelfLoopEventCount", "shelfLoopEventLastSequence", "shelfLocalizationEvidenceComplete", "captureHealth.localizationTraceRecordCount", "captureHealth.localizationConstraintRecordCount", "captureHealth.manualLocalizationEventCount", "captureHealth.localizationRecoveryEventCount"]
     }
 
     enum File_native_graph {
@@ -106,6 +121,20 @@ enum GeneratedMobileEvidenceContracts {
         static let watermark_fields: [String] = ["performanceSampleCount", "performanceLastSequence", "performanceLastTimestampUnix", "performanceEvidenceComplete"]
     }
 
+    enum File_pose_epoch_transitions_jsonl {
+        static let blank_line_policy = "empty_file_allowed"
+        static let final_newline = true
+        static let identity_fields: [String] = ["tracking_session_id", "sequence", "from_epoch", "to_epoch"]
+        static let max_file_bytes = 67108864
+        static let max_nesting_depth = 8
+        static let max_record_bytes = 65536
+        static let max_records = 60000
+        static let qualification_max_records = 60000
+        static let strict_bool = true
+        static let strict_integer = true
+        static let watermark_fields: [String] = ["poseEpochTransitionCount", "poseEpochTransitionLastSequence"]
+    }
+
     enum File_result_package {
         static let immutable = true
         static let max_manifest_bytes = 4194304
@@ -126,6 +155,34 @@ enum GeneratedMobileEvidenceContracts {
         static let strict_bool = true
         static let strict_integer = true
         static let watermark_fields: [String] = []
+    }
+
+    enum File_shelf_loop_events_jsonl {
+        static let blank_line_policy = "empty_file_allowed"
+        static let final_newline = true
+        static let identity_fields: [String] = ["tracking_session_id", "shelf_segment_id", "epoch", "component", "sequence"]
+        static let max_file_bytes = 268435456
+        static let max_nesting_depth = 8
+        static let max_record_bytes = 131072
+        static let max_records = 60000
+        static let qualification_max_records = 60000
+        static let strict_bool = true
+        static let strict_integer = true
+        static let watermark_fields: [String] = ["shelfLoopEventCount", "shelfLoopEventLastSequence"]
+    }
+
+    enum File_shelf_observation_windows_jsonl {
+        static let blank_line_policy = "empty_file_allowed"
+        static let final_newline = true
+        static let identity_fields: [String] = ["tracking_session_id", "window_id", "epoch", "component", "prior_map_sha256", "sequence"]
+        static let max_file_bytes = 268435456
+        static let max_nesting_depth = 8
+        static let max_record_bytes = 131072
+        static let max_records = 60000
+        static let qualification_max_records = 60000
+        static let strict_bool = true
+        static let strict_integer = true
+        static let watermark_fields: [String] = ["shelfObservationWindowCount", "shelfObservationWindowLastSequence"]
     }
 
     enum File_tag_observation_bursts_jsonl {

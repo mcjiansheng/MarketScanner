@@ -85,6 +85,28 @@ enum ShelfAssociationEngine {
             return lateralOffsetM(point: point) >= 0 ? "front" : "back"
         }
 
+        /// Signed centreline-to-face offset for the selected physical long
+        /// edge. Rotated polygon geometry is authoritative; the AABB corners
+        /// are a legacy-package fallback only.
+        func faceOffsetM(side: String) -> Double {
+            let vertices: [(Double, Double)]
+            if let polygonM, polygonM.count >= 3 {
+                vertices = polygonM
+            } else {
+                vertices = [
+                    boundsMinM,
+                    (boundsMinM.0, boundsMaxM.1),
+                    boundsMaxM,
+                    (boundsMaxM.0, boundsMinM.1),
+                ]
+            }
+            let offsets = vertices.map { lateralOffsetM(point: $0) }
+            guard let minimum = offsets.min(), let maximum = offsets.max() else {
+                return 0
+            }
+            return side == "front" ? maximum : minimum
+        }
+
         func boundsContains(x: Double, y: Double) -> Bool {
             return x >= boundsMinM.0 && x <= boundsMaxM.0
                 && y >= boundsMinM.1 && y <= boundsMaxM.1
@@ -351,6 +373,10 @@ enum ShelfAssociationEngine {
         var distanceFromStartM: Double
         var segmentLengthM: Double
         var atEndpoint: Bool
+        var projectedFaceXM: Double
+        var projectedFaceYM: Double
+        var normalResidualM: Double
+        var longitudinalWithinSegment: Bool
         /// Distance to the second-closest candidate (parallel aisle
         /// ambiguity), nil when fewer than two candidates exist.
         var secondCandidateDistanceM: Double?
@@ -370,6 +396,7 @@ enum ShelfAssociationEngine {
         point: (Double, Double),
         shelf: ShelfSegment,
         floorID: String,
+        observerPoint: (Double, Double)? = nil,
         endpointMarginM: Double = 0.15,
         occludedByStructure: Bool = false
     ) -> Association? {
@@ -380,22 +407,43 @@ enum ShelfAssociationEngine {
         guard length > 1.0e-9 else { return nil }
         let px = point.0 - shelf.startM.0
         let py = point.1 - shelf.startM.1
-        let ratio = max(0.0, min(1.0, (px * dx + py * dy) / (length * length)))
+        let unclampedRatio = (px * dx + py * dy) / (length * length)
+        let ratio = max(0.0, min(1.0, unclampedRatio))
         let s = ratio * length
+        let sidePoint: (Double, Double)
+        if let observerPoint,
+           observerPoint.0.isFinite, observerPoint.1.isFinite {
+            sidePoint = observerPoint
+        } else {
+            sidePoint = point
+        }
+        let shelfSide = shelf.side(for: sidePoint)
+        let faceOffset = shelf.faceOffsetM(side: shelfSide)
         let projectedX = shelf.startM.0 + ratio * dx
+            + shelf.frontNormalM.0 * faceOffset
         let projectedY = shelf.startM.1 + ratio * dy
+            + shelf.frontNormalM.1 * faceOffset
         let distanceToSegment = hypot(point.0 - projectedX, point.1 - projectedY)
+        let faceNormal = shelfSide == "front"
+            ? shelf.frontNormalM : shelf.backNormalM
+        let normalResidual = abs(
+            (point.0 - projectedX) * faceNormal.0
+                + (point.1 - projectedY) * faceNormal.1)
         let atEndpoint = s < endpointMarginM || s > length - endpointMarginM
         return Association(
             shelfSegmentID: shelf.shelfSegmentID,
             shelfCode: shelf.shelfCode,
-            shelfSide: shelf.side(for: point),
+            shelfSide: shelfSide,
             distanceFromShelfStartCm: SourceGeometry.rounded(s * 100.0),
             positionRatio: SourceGeometry.rounded(ratio),
             distanceToSegmentM: SourceGeometry.rounded(distanceToSegment),
             distanceFromStartM: SourceGeometry.rounded(s),
             segmentLengthM: SourceGeometry.rounded(length),
             atEndpoint: atEndpoint,
+            projectedFaceXM: SourceGeometry.rounded(projectedX),
+            projectedFaceYM: SourceGeometry.rounded(projectedY),
+            normalResidualM: SourceGeometry.rounded(normalResidual),
+            longitudinalWithinSegment: unclampedRatio >= 0 && unclampedRatio <= 1,
             secondCandidateDistanceM: nil,
             marginM: nil,
             occludedByStructure: occludedByStructure,
@@ -411,6 +459,7 @@ enum ShelfAssociationEngine {
         shelves: [ShelfSegment],
         index: ShelfSpatialIndex?,
         floorID: String,
+        observerPoint: (Double, Double)? = nil,
         occludedByStructure: (ShelfSegment) -> Bool
     ) -> Association? {
         let candidates = index?.candidates(point: point, floorID: floorID)
@@ -426,6 +475,7 @@ enum ShelfAssociationEngine {
                 point: point,
                 shelf: shelf,
                 floorID: floorID,
+                observerPoint: observerPoint,
                 occludedByStructure: occludedByStructure(shelf)) else {
                 continue
             }
@@ -692,8 +742,13 @@ enum AutomaticQualityGate {
         guard input.positionSpreadM <= input.maximumSpreadM else {
             return (.lowConfidence, "position_spread_exceeded")
         }
-        guard input.association.distanceToSegmentM <= input.maximumAssociationDistanceM else {
+        guard input.association.normalResidualM.isFinite,
+              input.association.normalResidualM
+                <= input.maximumAssociationDistanceM else {
             return (.lowConfidence, "shelf_association_distance_exceeded")
+        }
+        guard input.association.longitudinalWithinSegment else {
+            return (.lowConfidence, "shelf_association_longitudinal_out_of_segment")
         }
         // Parallel-aisle ambiguity: the second-closest shelf is nearly as
         // close as the first.

@@ -8,7 +8,12 @@ enum MobileWorksheets {
         "map_version", "prior_map_sha256", "tracking_session_id",
         "shelf_code", "shelf_segment_id", "shelf_side",
         "distance_from_shelf_start_cm", "position_ratio", "map_x_m",
-        "map_y_m", "observation_count", "position_spread_cm",
+        "map_y_m", "raw_map_x_m", "raw_map_y_m",
+        "optimized_map_x_m", "optimized_map_y_m",
+        "shelf_projected_map_x_m", "shelf_projected_map_y_m",
+        "shelf_face_normal_residual_m",
+        "shelf_face_longitudinal_within_segment",
+        "observation_count", "position_spread_cm",
         "localization_confidence", "association_confidence",
         "quality_status", "reason",
     ]
@@ -94,6 +99,17 @@ struct FinalPriceTag: Equatable {
     var associationConfidence: Double
     var qualityStatus: String
     var reason: String
+    /// Three-coordinate audit required by the frozen shelf contract.
+    /// `mapXM/mapYM` remain the backwards-compatible final coordinate and,
+    /// when publishable, equal the shelf-projected point.
+    var rawMapXM: Double? = nil
+    var rawMapYM: Double? = nil
+    var optimizedMapXM: Double? = nil
+    var optimizedMapYM: Double? = nil
+    var shelfProjectedMapXM: Double? = nil
+    var shelfProjectedMapYM: Double? = nil
+    var shelfFaceNormalResidualM: Double? = nil
+    var shelfFaceLongitudinalWithinSegment: Bool? = nil
 }
 
 /// A rescan task row for the RescanRequired worksheet.

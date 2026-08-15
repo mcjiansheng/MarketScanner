@@ -18,6 +18,29 @@
         "clockNodeBindingCount"
       ]
     },
+    "corridor_hypotheses.jsonl": {
+      "blank_line_policy": "empty_file_allowed",
+      "final_newline": true,
+      "identity_fields": [
+        "tracking_session_id",
+        "node_id",
+        "epoch",
+        "component",
+        "sequence"
+      ],
+      "max_file_bytes": 268435456,
+      "max_nesting_depth": 8,
+      "max_record_bytes": 65536,
+      "max_records": 60000,
+      "qualification_max_records": 60000,
+      "qualification_record_rate_hz": 2,
+      "strict_bool": true,
+      "strict_integer": true,
+      "watermark_fields": [
+        "corridorHypothesisCount",
+        "corridorHypothesisLastSequence"
+      ]
+    },
     "localization_constraints.jsonl": {
       "blank_line_policy": "reject",
       "final_newline": true,
@@ -106,6 +129,15 @@
         "performanceLastSequence",
         "performanceLastTimestampUnix",
         "performanceEvidenceComplete",
+        "poseEpochTransitionCount",
+        "poseEpochTransitionLastSequence",
+        "corridorHypothesisCount",
+        "corridorHypothesisLastSequence",
+        "shelfObservationWindowCount",
+        "shelfObservationWindowLastSequence",
+        "shelfLoopEventCount",
+        "shelfLoopEventLastSequence",
+        "shelfLocalizationEvidenceComplete",
         "captureHealth.localizationTraceRecordCount",
         "captureHealth.localizationConstraintRecordCount",
         "captureHealth.manualLocalizationEventCount",
@@ -140,6 +172,27 @@
         "performanceEvidenceComplete"
       ]
     },
+    "pose_epoch_transitions.jsonl": {
+      "blank_line_policy": "empty_file_allowed",
+      "final_newline": true,
+      "identity_fields": [
+        "tracking_session_id",
+        "sequence",
+        "from_epoch",
+        "to_epoch"
+      ],
+      "max_file_bytes": 67108864,
+      "max_nesting_depth": 8,
+      "max_record_bytes": 65536,
+      "max_records": 60000,
+      "qualification_max_records": 60000,
+      "strict_bool": true,
+      "strict_integer": true,
+      "watermark_fields": [
+        "poseEpochTransitionCount",
+        "poseEpochTransitionLastSequence"
+      ]
+    },
     "result_package": {
       "immutable": true,
       "max_manifest_bytes": 4194304,
@@ -161,6 +214,51 @@
       "strict_bool": true,
       "strict_integer": true,
       "watermark_fields": []
+    },
+    "shelf_loop_events.jsonl": {
+      "blank_line_policy": "empty_file_allowed",
+      "final_newline": true,
+      "identity_fields": [
+        "tracking_session_id",
+        "shelf_segment_id",
+        "epoch",
+        "component",
+        "sequence"
+      ],
+      "max_file_bytes": 268435456,
+      "max_nesting_depth": 8,
+      "max_record_bytes": 131072,
+      "max_records": 60000,
+      "qualification_max_records": 60000,
+      "strict_bool": true,
+      "strict_integer": true,
+      "watermark_fields": [
+        "shelfLoopEventCount",
+        "shelfLoopEventLastSequence"
+      ]
+    },
+    "shelf_observation_windows.jsonl": {
+      "blank_line_policy": "empty_file_allowed",
+      "final_newline": true,
+      "identity_fields": [
+        "tracking_session_id",
+        "window_id",
+        "epoch",
+        "component",
+        "prior_map_sha256",
+        "sequence"
+      ],
+      "max_file_bytes": 268435456,
+      "max_nesting_depth": 8,
+      "max_record_bytes": 131072,
+      "max_records": 60000,
+      "qualification_max_records": 60000,
+      "strict_bool": true,
+      "strict_integer": true,
+      "watermark_fields": [
+        "shelfObservationWindowCount",
+        "shelfObservationWindowLastSequence"
+      ]
     },
     "tag_observation_bursts.jsonl": {
       "blank_line_policy": "reject",
@@ -212,7 +310,11 @@
   },
   "product_scale": {
     "max_clock_node_bindings": 60000,
+    "max_corridor_hypotheses": 60000,
+    "max_pose_epoch_transitions": 60000,
     "max_raw_nodes": 60000,
+    "max_shelf_loop_events": 60000,
+    "max_shelf_observation_windows": 60000,
     "max_tag_observations": 200000,
     "scan_hours_upper_bound": 48
   },

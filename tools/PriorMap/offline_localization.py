@@ -51,6 +51,15 @@ from .corridor_route_matcher import (
     match_corridor_route,
     obstacle_polygons,
 )
+from .shelf_localization_evidence import (
+    CALIBRATION_STATUS as SHELF_LOCALIZATION_CALIBRATION_STATUS,
+    MANUAL_ANCHOR_TRANSLATION_SIGMA_M,
+    MANUAL_ANCHOR_YAW_SIGMA_RAD,
+    ShelfEvidenceBundle,
+    ShelfEvidenceError,
+    validate_shelf_evidence_record,
+    validate_shelf_localization_records,
+)
 
 
 FORMAT_VERSION = 1
@@ -66,12 +75,10 @@ HARD_REJECT_YAW_RAD = math.radians(45)
 # a long route can be much larger. Give this evidence explicit uncertainty and
 # judge the gradient of the resulting correction field instead of rejecting an
 # absolute residual against a fixed distance.
-MANUAL_ANCHOR_TRANSLATION_SIGMA_M = 3.0
-MANUAL_ANCHOR_YAW_SIGMA_RAD = math.radians(20.0)
 MANUAL_ANCHOR_WEIGHT = 1.0 / (
     MANUAL_ANCHOR_TRANSLATION_SIGMA_M * MANUAL_ANCHOR_TRANSLATION_SIGMA_M
 )
-INITIAL_MAP_POSE_TRANSLATION_SIGMA_M = 1.0
+INITIAL_MAP_POSE_TRANSLATION_SIGMA_M = 3.0
 INITIAL_MAP_POSE_YAW_SIGMA_RAD = math.radians(15.0)
 UNVERIFIED_MANUAL_ANCHOR_MAX_TRANSLATION_M = 5.0
 UNVERIFIED_MANUAL_ANCHOR_MAX_YAW_RAD = math.radians(30.0)
@@ -128,6 +135,25 @@ SESSION_INPUT_FILE_NAMES_V4 = (
     "tag_observation_bursts.jsonl",
     "localized_price_tags.json",
 )
+# P1-B: epoch/component and concrete shelf evidence join the same immutable
+# parse-and-hash-once input identity. Older v1-v4 sessions remain readable as
+# having no formal shelf evidence.
+SESSION_INPUT_FILE_NAMES_V5 = (
+    "metadata.json",
+    "clock_correlations.jsonl",
+    "localization_trace.jsonl",
+    "localization_constraints.jsonl",
+    "localization_events.jsonl",
+    "localization_recovery_events.jsonl",
+    "manual_localization_events.jsonl",
+    "tag_observations.jsonl",
+    "tag_observation_bursts.jsonl",
+    "pose_epoch_transitions.jsonl",
+    "corridor_hypotheses.jsonl",
+    "shelf_observation_windows.jsonl",
+    "shelf_loop_events.jsonl",
+    "localized_price_tags.json",
+)
 # Historical alias: v1 stays the legacy contract and never carries Recovery
 # evidence binding.
 SESSION_INPUT_FILE_NAMES = SESSION_INPUT_FILE_NAMES_V1
@@ -150,6 +176,58 @@ TAG_EVIDENCE_BOUND_NODE_STAMP_TOLERANCE_SECONDS = 1.0e-6
 TAG_EVIDENCE_MAXIMUM_POSITION_M = 5_000.0
 TAG_EVIDENCE_MAXIMUM_HEIGHT_M = 100.0
 TAG_EVIDENCE_NODE_LOCAL_FRAME = "RTABMAP_BOUND_NODE_LOCAL"
+
+
+def _shelf_evidence_bound(metadata: dict[str, Any]) -> bool:
+    declarations = (
+        metadata.get("poseEpochTransitions"),
+        metadata.get("corridorHypotheses"),
+        metadata.get("shelfObservationWindows"),
+        metadata.get("shelfLoopEvents"),
+    )
+    bound = metadata.get("shelfLocalizationEvidenceComplete") is not None or any(
+        isinstance(value, str) and value for value in declarations
+    )
+    if not bound:
+        return False
+    expected_names = (
+        "pose_epoch_transitions.jsonl",
+        "corridor_hypotheses.jsonl",
+        "shelf_observation_windows.jsonl",
+        "shelf_loop_events.jsonl",
+    )
+    if (
+        metadata.get("shelfLocalizationEvidenceComplete") is not True
+        or tuple(declarations) != expected_names
+        or metadata.get("shelfLocalizationCalibrationStatus")
+            != SHELF_LOCALIZATION_CALIBRATION_STATUS
+    ):
+        raise OfflineLocalizationError(
+            "Shelf-localization evidence declarations are incomplete."
+        )
+    for count_field, last_field in (
+        ("poseEpochTransitionCount", "poseEpochTransitionLastSequence"),
+        ("corridorHypothesisCount", "corridorHypothesisLastSequence"),
+        ("shelfObservationWindowCount", "shelfObservationWindowLastSequence"),
+        ("shelfLoopEventCount", "shelfLoopEventLastSequence"),
+    ):
+        value = metadata.get(count_field)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise OfflineLocalizationError(
+                f"Shelf-localization watermark is invalid: {count_field}."
+            )
+        last = metadata.get(last_field)
+        if last is not None and (
+            isinstance(last, bool) or not isinstance(last, int) or last < 1
+        ):
+            raise OfflineLocalizationError(
+                f"Shelf-localization watermark is invalid: {last_field}."
+            )
+        if last != (value if value else None):
+            raise OfflineLocalizationError(
+                f"Shelf-localization count/last mismatch: {count_field}."
+            )
+    return True
 EDITABLE_TAG_FIELDS = frozenset(
     {
         "shelf_code",
@@ -725,7 +803,22 @@ def build_session_input_manifest(
         or clock_correlation_count is not None
         or clock_binding_count is not None
     )
-    if clock_bound:
+    shelf_bound = _shelf_evidence_bound(metadata)
+    if shelf_bound:
+        if (
+            not recovery_bound
+            or metadata.get("clockEvidenceComplete") is not True
+            or clock_correlation_count is None
+            or clock_correlation_count < 2
+            or clock_binding_count is None
+            or clock_binding_count < 2
+        ):
+            raise OfflineLocalizationError(
+                "Manifest-v5 shelf localization requires complete v4 clock evidence."
+            )
+        manifest_version = 5
+        file_names = SESSION_INPUT_FILE_NAMES_V5
+    elif clock_bound:
         if (
             not recovery_bound
             or metadata.get("clockEvidenceComplete") is not True
@@ -823,6 +916,7 @@ class FinalizedSessionInputSnapshot:
     durable_tag_bursts: tuple["DurableTagBurstIdentity", ...]
     tag_evidence_degradations: list[dict[str, Any]]
     clock_evidence: "ClockEvidence"
+    shelf_evidence: ShelfEvidenceBundle | None
     manifest: dict[str, Any]
 
 
@@ -1289,6 +1383,10 @@ def read_finalized_session_input_snapshot(
         "localization_constraints.jsonl": CONSTRAINT_CONTRACT,
         "localization_events.jsonl": STATE_EVENT_CONTRACT,
         "manual_localization_events.jsonl": MANUAL_EVENT_CONTRACT,
+        "pose_epoch_transitions.jsonl": POSE_EPOCH_TRANSITION_CONTRACT,
+        "corridor_hypotheses.jsonl": CORRIDOR_HYPOTHESIS_CONTRACT,
+        "shelf_observation_windows.jsonl": SHELF_OBSERVATION_WINDOW_CONTRACT,
+        "shelf_loop_events.jsonl": SHELF_LOOP_EVENT_CONTRACT,
     }
     # localized_price_tags.json drives the tag-observation requirement;
     # read its bytes first so the observation contract matches the real
@@ -1322,7 +1420,22 @@ def read_finalized_session_input_snapshot(
         or clock_correlation_count is not None
         or clock_binding_count is not None
     )
-    if clock_bound:
+    shelf_bound = _shelf_evidence_bound(metadata)
+    if shelf_bound:
+        if (
+            not recovery_bound
+            or metadata.get("clockEvidenceComplete") is not True
+            or clock_correlation_count is None
+            or clock_correlation_count < 2
+            or clock_binding_count is None
+            or clock_binding_count < 2
+        ):
+            raise OfflineLocalizationError(
+                "Manifest-v5 shelf localization requires complete v4 clock evidence."
+            )
+        manifest_version = 5
+        file_names = SESSION_INPUT_FILE_NAMES_V5
+    elif clock_bound:
         if (
             not recovery_bound
             or metadata.get("clockEvidenceComplete") is not True
@@ -1362,6 +1475,12 @@ def read_finalized_session_input_snapshot(
     )
     clock_evidence: ClockEvidence | None = None
     jsonl_names = [name for name in file_names[1:] if name != "localized_price_tags.json"]
+    shelf_sidecar_names = frozenset(SESSION_INPUT_FILE_NAMES_V5) & frozenset(
+        {
+            "pose_epoch_transitions.jsonl", "corridor_hypotheses.jsonl",
+            "shelf_observation_windows.jsonl", "shelf_loop_events.jsonl",
+        }
+    )
     for name in jsonl_names:
         if name == "clock_correlations.jsonl":
             clock_bytes, identity = _stable_read_bytes(
@@ -1406,6 +1525,20 @@ def read_finalized_session_input_snapshot(
                 expected_map_hash=map_hash,
                 expected_floor_id=floor_id,
             )
+            if name in shelf_sidecar_names:
+                try:
+                    for line, record in enumerate(values, start=1):
+                        validate_shelf_evidence_record(
+                            name,
+                            line,
+                            record,
+                            tracking_session_id=session_id,
+                            prior_map_sha256=map_hash,
+                        )
+                except ShelfEvidenceError as exc:
+                    raise OfflineLocalizationError(
+                        f"Shelf-localization evidence is invalid: {exc}"
+                    ) from exc
         jsonl_values[name] = values
         jsonl_diagnostics[name] = diagnostics
         if identity:
@@ -1422,6 +1555,52 @@ def read_finalized_session_input_snapshot(
             )
     if clock_bound and clock_evidence is None:
         raise OfflineLocalizationError("Clock evidence was not parsed.")
+    shelf_evidence: ShelfEvidenceBundle | None = None
+    if manifest_version == 5:
+        try:
+            shelf_values = {
+                name: tuple(jsonl_values[name]) for name in shelf_sidecar_names
+            }
+            shelf_hashes = {
+                str(item["role"]): str(item["sha256"])
+                for item in files if item.get("role") in shelf_sidecar_names
+            }
+            shelf_evidence = validate_shelf_localization_records(
+                shelf_values, metadata, file_sha256=shelf_hashes
+            )
+            for index, record in enumerate(
+                jsonl_values["localization_trace.jsonl"], start=1
+            ):
+                epoch = record.get("epoch")
+                component = record.get("component")
+                if (
+                    isinstance(epoch, bool) or not isinstance(epoch, int) or epoch < 0
+                    or isinstance(component, bool)
+                    or not isinstance(component, int) or component < 0
+                ):
+                    raise ShelfEvidenceError(
+                        f"localization_trace.jsonl:{index} epoch/component missing"
+                    )
+            for index, record in enumerate(
+                jsonl_values["tag_observations.jsonl"], start=1
+            ):
+                if record.get("version") != 2:
+                    continue
+                epoch = record.get("epoch")
+                component = record.get("component")
+                if (
+                    isinstance(epoch, bool) or not isinstance(epoch, int) or epoch < 0
+                    or isinstance(component, bool)
+                    or not isinstance(component, int)
+                    or component != record.get("bound_node_map_id")
+                ):
+                    raise ShelfEvidenceError(
+                        f"tag_observations.jsonl:{index} epoch/component invalid"
+                    )
+        except (KeyError, ShelfEvidenceError) as exc:
+            raise OfflineLocalizationError(
+                f"Manifest-v5 shelf-localization bundle is invalid: {exc}"
+            ) from exc
     if clock_evidence is None:
         # Historical v1-v3 sessions remain readable. Their timestamps are not
         # allowed to enter the new immutable calibrated-deliverables contract.
@@ -1518,6 +1697,7 @@ def read_finalized_session_input_snapshot(
         durable_tag_bursts=durable_tag_bursts,
         tag_evidence_degradations=tag_evidence_degradations,
         clock_evidence=clock_evidence,
+        shelf_evidence=shelf_evidence,
         manifest=manifest,
     )
 
@@ -1774,6 +1954,52 @@ TAG_OBSERVATION_BURST_CONTRACT = JsonlContract(
     maximum_file_bytes=TAG_BURST_LIMITS["max_file_bytes"],
     maximum_nesting_depth=TAG_BURST_LIMITS["max_nesting_depth"],
     qualification_maximum_records=TAG_BURST_LIMITS.get("qualification_max_records"),
+)
+
+
+def _shelf_jsonl_contract(
+    file_name: str,
+    record_format: str,
+    timestamp_fields: tuple[str, ...],
+    record_id_field: str | None = None,
+) -> JsonlContract:
+    limits = MOBILE_EVIDENCE_CONTRACTS[file_name]
+    return JsonlContract(
+        file_name.removesuffix(".jsonl"),
+        record_format,
+        frozenset({1}),
+        True,
+        True,
+        timestamp_fields,
+        record_id_field=record_id_field,
+        maximum_record_bytes=limits["max_record_bytes"],
+        maximum_records=limits["max_records"],
+        maximum_file_bytes=limits["max_file_bytes"],
+        maximum_nesting_depth=limits["max_nesting_depth"],
+        qualification_maximum_records=limits.get("qualification_max_records"),
+    )
+
+
+POSE_EPOCH_TRANSITION_CONTRACT = _shelf_jsonl_contract(
+    "pose_epoch_transitions.jsonl",
+    "MarketScannerPoseEpochTransition",
+    ("after_frame_timestamp",),
+)
+CORRIDOR_HYPOTHESIS_CONTRACT = _shelf_jsonl_contract(
+    "corridor_hypotheses.jsonl",
+    "MarketScannerCorridorHypotheses",
+    ("node_timestamp",),
+)
+SHELF_OBSERVATION_WINDOW_CONTRACT = _shelf_jsonl_contract(
+    "shelf_observation_windows.jsonl",
+    "MarketScannerShelfObservationWindow",
+    (),
+    "window_id",
+)
+SHELF_LOOP_EVENT_CONTRACT = _shelf_jsonl_contract(
+    "shelf_loop_events.jsonl",
+    "MarketScannerShelfLoopEvent",
+    (),
 )
 CLOCK_CORRELATION_CONTRACT = JsonlContract(
     "clock_correlations",
@@ -4214,6 +4440,118 @@ def _nearest_pose_index(poses: Sequence[Pose], timestamp: float | None) -> int:
             "The optimized RTAB-Map trajectory has no finite node timestamps."
         )
     return min(stamped)[1]
+
+
+def build_shelf_face_constraints(
+    baseline: Sequence[Pose],
+    shelf_evidence: ShelfEvidenceBundle | None,
+    shelves_payload: dict[str, Any],
+    floor_id: str,
+) -> tuple[list[AbsoluteConstraint], list[dict[str, Any]]]:
+    """Convert accepted two-sided loops into explicit shelf-face priors."""
+    if shelf_evidence is None:
+        return [], []
+    segments_raw = shelves_payload.get("shelf_segments")
+    if not isinstance(segments_raw, list):
+        raise OfflineLocalizationError(
+            "Manifest-v5 shelf factors require shelves-v2 geometry."
+        )
+    segments = {
+        str(item.get("shelf_segment_id")): item
+        for item in segments_raw
+        if isinstance(item, dict) and item.get("floor_id") == floor_id
+    }
+    windows = {
+        str(item["window_id"]): item
+        for item in shelf_evidence.shelf_observation_windows
+    }
+    node_indices = {pose.node_id: index for index, pose in enumerate(baseline)}
+    constraints: list[AbsoluteConstraint] = []
+    audit: list[dict[str, Any]] = []
+    for sequence, loop in enumerate(shelf_evidence.accepted_shelf_loops, start=1):
+        segment_id = str(loop["shelf_segment_id"])
+        segment = segments.get(segment_id)
+        if segment is None:
+            raise OfflineLocalizationError(
+                f"Accepted shelf loop references unknown segment: {segment_id}."
+            )
+        try:
+            start = tuple(float(value) for value in segment["longitudinal_start_m"])
+            end = tuple(float(value) for value in segment["longitudinal_end_m"])
+            axis = tuple(float(value) for value in segment["longitudinal_axis"])
+            front = tuple(float(value) for value in segment["front_normal"])
+            back = tuple(float(value) for value in segment["back_normal"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise OfflineLocalizationError(
+                f"Shelf segment geometry is invalid: {segment_id}."
+            ) from exc
+        if any(
+            len(value) != 2 or not all(math.isfinite(item) for item in value)
+            for value in (start, end, axis, front, back)
+        ):
+            raise OfflineLocalizationError(
+                f"Shelf segment vectors are invalid: {segment_id}."
+            )
+        center = ((start[0] + end[0]) / 2.0, (start[1] + end[1]) / 2.0)
+        relative = loop["phone_shelf_se2"]
+        along = float(relative["dx_m"])
+        cross = abs(float(relative["dy_m"]))
+        relative_yaw = float(relative["dyaw_rad"])
+        loop_windows = [windows[str(identifier)] for identifier in loop["window_ids"]]
+        for window_index, window in enumerate(loop_windows):
+            node_id = int(window["node_range"][1])
+            node_index = node_indices.get(node_id)
+            if node_index is None:
+                raise OfflineLocalizationError(
+                    f"Shelf window node is absent from graph: {node_id}."
+                )
+            side = str(window["side"])
+            normal = front if side == "right" else back
+            target_x = center[0] + axis[0] * along + normal[0] * cross
+            target_y = center[1] + axis[1] * along + normal[1] * cross
+            target_yaw = _normalize_angle(
+                math.atan2(axis[1], axis[0])
+                + relative_yaw
+                + (math.pi if side == "left" else 0.0)
+            )
+            identifier = f"shelf-face-{sequence:06d}-{window_index + 1}"
+            constraints.append(
+                AbsoluteConstraint(
+                    identifier=identifier,
+                    node_index=node_index,
+                    x=target_x,
+                    y=target_y,
+                    yaw=target_yaw,
+                    weight=4.0,
+                    kind="shelf_face",
+                    source={
+                        "shelf_segment_id": segment_id,
+                        "window_id": window["window_id"],
+                        "loop_sequence": loop["sequence"],
+                        "calibration_status": loop["calibration_status"],
+                        "shelf_normal_map": [normal[0], normal[1]],
+                        # The frozen product contract deliberately leaves the
+                        # long-shelf axis weak; only face-normal distance and
+                        # relative yaw are authoritative.
+                        "shelf_along_sigma_m": 3.0,
+                    },
+                    translation_sigma_m=0.5,
+                    yaw_sigma_rad=math.radians(10.0),
+                    trusted_absolute=False,
+                )
+            )
+            audit.append(
+                {
+                    "constraint_id": identifier,
+                    "kind": "shelf_face",
+                    "shelf_segment_id": segment_id,
+                    "window_id": window["window_id"],
+                    "node_id": node_id,
+                    "normal_residual_gate_m": 0.5,
+                    "calibration_status": loop["calibration_status"],
+                }
+            )
+    return constraints, audit
 
 
 def bind_tag_observation_to_pose(
@@ -7177,6 +7515,42 @@ def _bounded_review_trajectory(
     return {"type": "FeatureCollection", "features": features}
 
 
+def _review_elements_for_floor(
+    elements: list[dict[str, Any]], floor_id: str
+) -> list[dict[str, Any]]:
+    """Return only geometry belonging to the session's authoritative floor.
+
+    A prior-map package may contain several floors in one ``elements.json``.
+    Drawing that file verbatim overlays unrelated shelves and road helpers in
+    one coordinate plane, which looks like a corrupted map even though each
+    floor is valid independently. Missing/unknown floor identity therefore
+    yields no review geometry instead of silently combining floors.
+    """
+    if not floor_id:
+        return []
+    return [
+        item
+        for item in elements
+        if isinstance(item, dict) and str(item.get("floor_id") or "") == floor_id
+    ]
+
+
+def _review_bounds_for_floor(
+    manifest: dict[str, Any], floor_id: str
+) -> dict[str, Any] | None:
+    floors = manifest.get("floors")
+    if isinstance(floors, list):
+        for floor in floors:
+            if (
+                isinstance(floor, dict)
+                and str(floor.get("id") or "") == floor_id
+                and isinstance(floor.get("bounds"), dict)
+            ):
+                return dict(floor["bounds"])
+    bounds = manifest.get("bounds")
+    return dict(bounds) if isinstance(bounds, dict) else None
+
+
 def _stable_edges(element: dict[str, Any]) -> list[tuple[str, tuple[float, float], tuple[float, float]]]:
     geometry = element.get("geometry")
     points = geometry.get("coordinates") if isinstance(geometry, dict) else None
@@ -7322,19 +7696,29 @@ def _mark_tag_for_review(tag: dict[str, Any], reason: str) -> None:
 
 def _tag_has_publishable_fields(tag: dict[str, Any]) -> bool:
     position = tag.get("final_map_position")
-    if not isinstance(position, dict):
+    projected = tag.get("shelf_projected_map_position")
+    if not isinstance(position, dict) or not isinstance(projected, dict):
         return False
     try:
         x = float(position.get("x_m"))
         y = float(position.get("y_m"))
+        projected_x = float(projected.get("x_m"))
+        projected_y = float(projected.get("y_m"))
         offset = float(tag.get("distance_from_shelf_start_cm"))
+        normal_residual = float(tag.get("shelf_face_normal_residual_m"))
     except (TypeError, ValueError):
         return False
     return (
         math.isfinite(x)
         and math.isfinite(y)
+        and math.isfinite(projected_x)
+        and math.isfinite(projected_y)
+        and math.hypot(x - projected_x, y - projected_y) <= 1.0e-6
         and math.isfinite(offset)
         and offset >= 0
+        and math.isfinite(normal_residual)
+        and normal_residual <= 0.50
+        and tag.get("shelf_face_longitudinal_within_segment") is True
         and bool(tag.get("shelf_code"))
         and bool(tag.get("shelf_side"))
     )
@@ -7419,6 +7803,26 @@ def _enforce_on_device_confirmation_conflict(
     if optimized_segment == user_segment and optimized_side == user_side:
         audit["offline_association_status"] = audit.get("status")
         audit["status"] = "user_confirmation_consistent"
+        projected = best.get("projected_map_position")
+        residual = best.get("normal_residual_m")
+        if (
+            isinstance(projected, dict)
+            and isinstance(residual, (int, float))
+            and not isinstance(residual, bool)
+            and math.isfinite(float(residual))
+            and float(residual) <= 0.50
+        ):
+            current = tag.get("final_map_position")
+            if isinstance(current, dict):
+                tag.setdefault("optimized_map_position", dict(current))
+            tag["shelf_projected_map_position"] = dict(projected)
+            tag["final_map_position"] = dict(projected)
+            tag["shelf_face_normal_residual_m"] = round(
+                float(residual), 6
+            )
+            tag["shelf_face_longitudinal_within_segment"] = True
+            tag["needs_review"] = False
+            tag["review_reasons"] = []
         tag["confirmation_conflict"] = {
             "code": "NO_CONFLICT",
             "disposition": "CONFIRMED",
@@ -7491,6 +7895,9 @@ def _associate_tag(
     if not isinstance(position, dict):
         return tag
     point = (float(position.get("x_m", 0)), float(position.get("y_m", 0)))
+    # Preserve all three coordinate stages. `final_map_position` becomes the
+    # business shelf projection only after the frozen face gate passes.
+    tag.setdefault("optimized_map_position", dict(position))
 
     candidate_radius = 1.2
     endpoint_ambiguity_m = 0.25
@@ -7501,12 +7908,69 @@ def _associate_tag(
     candidates: list[
         tuple[float, dict[str, Any], str, float, tuple[float, float], tuple[float, float]]
     ] = []
-    occlusion_edges: list[tuple[tuple[float, float], tuple[float, float]]] = []
+    occlusion_edges: list[
+        tuple[str, tuple[float, float], tuple[float, float]]
+    ] = []
     for element in elements:
         shape = element.get("shape_type")
         edges = _stable_edges(element)
         if shape in {"MapShelf", "MapTable", "MapTableFeature"}:
-            for edge_id, start, end in edges:
+            candidate_edges = edges
+            if camera_xy is not None and shape == "MapShelf" and len(edges) >= 2:
+                geometry = element.get("geometry")
+                coordinates = (
+                    geometry.get("coordinates")
+                    if isinstance(geometry, dict) else None
+                )
+                center = element.get("center_m") or element.get("center")
+                if not (isinstance(center, list) and len(center) >= 2):
+                    finite_points = [
+                        (float(value[0]), float(value[1]))
+                        for value in coordinates or []
+                        if isinstance(value, list) and len(value) >= 2
+                    ]
+                    center = (
+                        [
+                            sum(value[0] for value in finite_points)
+                            / len(finite_points),
+                            sum(value[1] for value in finite_points)
+                            / len(finite_points),
+                        ]
+                        if finite_points else None
+                    )
+                if isinstance(center, (list, tuple)) and len(center) >= 2:
+                    cx, cy = float(center[0]), float(center[1])
+
+                    def observer_faces_edge(
+                        edge: tuple[
+                            str, tuple[float, float], tuple[float, float]
+                        ],
+                    ) -> bool:
+                        _, start, end = edge
+                        dx_edge = end[0] - start[0]
+                        dy_edge = end[1] - start[1]
+                        edge_length = math.hypot(dx_edge, dy_edge)
+                        if edge_length <= 1.0e-9:
+                            return False
+                        normal = (-dy_edge / edge_length, dx_edge / edge_length)
+                        midpoint = (
+                            (start[0] + end[0]) / 2,
+                            (start[1] + end[1]) / 2,
+                        )
+                        if ((midpoint[0] - cx) * normal[0]
+                                + (midpoint[1] - cy) * normal[1]) < 0:
+                            normal = (-normal[0], -normal[1])
+                        return (
+                            (camera_xy[0] - midpoint[0]) * normal[0]
+                            + (camera_xy[1] - midpoint[1]) * normal[1]
+                        ) >= -0.05
+
+                    visible_edges = [
+                        edge for edge in edges if observer_faces_edge(edge)
+                    ]
+                    if visible_edges:
+                        candidate_edges = visible_edges
+            for edge_id, start, end in candidate_edges:
                 dx, dy = end[0] - start[0], end[1] - start[1]
                 length2 = dx * dx + dy * dy
                 if length2 <= 1.0e-12:
@@ -7524,7 +7988,7 @@ def _associate_tag(
         # All fixed structures participate in occlusion, including pillars.
         if shape in {"MapShelf", "MapTable", "MapTableFeature", "MapPillar"}:
             for _edge_id, start, end in edges:
-                occlusion_edges.append((start, end))
+                occlusion_edges.append((str(element.get("id") or ""), start, end))
 
     if not candidates:
         _mark_tag_for_review(tag, "no_shelf_association_candidate")
@@ -7566,7 +8030,11 @@ def _associate_tag(
             # Check if any occlusion edge intersects the camera→tag ray
             # closer than the tag itself.
             tag_dist = ray_length
-            for occ_start, occ_end in occlusion_edges:
+            for owner_id, occ_start, occ_end in occlusion_edges:
+                # The selected shelf face is the projection target, not an
+                # occluder. Other shelves, tables and pillars remain active.
+                if owner_id == str(best_element.get("id") or ""):
+                    continue
                 hit = _segment_intersection(cam, point, occ_start, occ_end)
                 if hit is not None and hit[2] < tag_dist - 0.05:
                     ray_clear = False
@@ -7590,7 +8058,7 @@ def _associate_tag(
                 # Camera and tag should both be on the outward side.
                 cam_side = (cam[0] - best_snapped[0]) * normal[0] + (cam[1] - best_snapped[1]) * normal[1]
                 tag_side = (point[0] - best_snapped[0]) * normal[0] + (point[1] - best_snapped[1]) * normal[1]
-                if cam_side < -0.05 or tag_side < -0.05:
+                if cam_side < -0.05 or tag_side < -0.50:
                     visible_side_consistent = False
 
     # Endpoint ambiguity: tag very close to a shelf end may match either side.
@@ -7611,7 +8079,7 @@ def _associate_tag(
 
     offline_evidence_reliable = (
         has_camera
-        and best_distance <= 0.45
+        and best_distance <= 0.50
         and ray_clear
         and visible_side_consistent
         and not near_endpoint
@@ -7640,6 +8108,13 @@ def _associate_tag(
                     "y_m": round(best_snapped[1], 6),
                     "height_m": position.get("height_m"),
                 },
+                "shelf_projected_map_position": {
+                    "x_m": round(best_snapped[0], 6),
+                    "y_m": round(best_snapped[1], 6),
+                    "height_m": position.get("height_m"),
+                },
+                "shelf_face_normal_residual_m": round(best_distance, 6),
+                "shelf_face_longitudinal_within_segment": True,
                 "association_confidence": round(max(0.0, 1 - best_distance / candidate_radius), 6),
             }
         )
@@ -7654,6 +8129,11 @@ def _associate_tag(
             "shelf_side": best_edge_id,
             "distance_from_shelf_start_cm": round(best_offset * 100, 3),
             "distance_m": round(best_distance, 6),
+            "projected_map_position": {
+                "x_m": round(best_snapped[0], 6),
+                "y_m": round(best_snapped[1], 6),
+                "height_m": position.get("height_m"),
+            },
             "reason": _association_reject_reason(
                 best_distance, ray_clear, visible_side_consistent, near_endpoint,
                 margin, second is not None, loc_conf, meas_conf, has_camera
@@ -7704,6 +8184,8 @@ def _associate_tag(
         "candidate_count": len(candidates),
         "independent_second_candidate_present": second is not None,
         "best_distance_m": round(best_distance, 6),
+        "shelf_face_normal_residual_m": round(best_distance, 6),
+        "shelf_face_longitudinal_within_segment": True,
         "second_distance_m": round(second[0], 6) if second is not None else None,
         "margin_m": round(margin, 6),
         "ray_clear": ray_clear,
@@ -7733,10 +8215,22 @@ def _associate_tag(
                 "shelf_code": item[1].get("code"),
                 "edge_id": item[2],
                 "distance_m": round(item[0], 6),
+                "normal_residual_m": round(item[0], 6),
+                "projected_map_position": {
+                    "x_m": round(item[4][0], 6),
+                    "y_m": round(item[4][1], 6),
+                    "height_m": position.get("height_m"),
+                },
             }
             for item in candidates[:100]
         ],
     }
+    if human_authoritative and tag.get("version") == 2:
+        # Additive v2 operator authority is adjudicated in the immediately
+        # following conflict pass. Applying the final projection invariant
+        # here would create a sticky review reason before that pass has had a
+        # chance to copy the verified candidate projection.
+        return tag
     return enforce_tag_state_invariants(tag)
 
 
@@ -7752,8 +8246,8 @@ def _association_reject_reason(
     has_camera: bool,
 ) -> str:
     reasons: list[str] = []
-    if distance > 0.45:
-        reasons.append(f"distance {distance:.2f}m exceeds 0.45m auto-confirm threshold")
+    if distance > 0.50:
+        reasons.append(f"distance {distance:.2f}m exceeds 0.50m shelf-face threshold")
     if not has_camera:
         reasons.append("no camera origin available for occlusion/visible-side check")
     if not ray_clear:
@@ -7805,7 +8299,11 @@ def apply_manual_edits(
         elif kind == "approve_tag":
             for tag in tags:
                 if str(tag.get("tag_id")) == target:
-                    if elements is not None and _tag_has_valid_map_association(tag, elements):
+                    if (
+                        elements is not None
+                        and _prepare_manual_tag_projection(tag, elements)
+                        and _tag_has_valid_map_association(tag, elements)
+                    ):
                         tag["user_confirmed"] = True
                         tag["approval_status"] = "approved"
                         tag["needs_review"] = False
@@ -7817,7 +8315,11 @@ def apply_manual_edits(
             approved = {str(value) for value in new_value}
             for tag in tags:
                 if str(tag.get("tag_id")) in approved:
-                    if elements is not None and _tag_has_valid_map_association(tag, elements):
+                    if (
+                        elements is not None
+                        and _prepare_manual_tag_projection(tag, elements)
+                        and _tag_has_valid_map_association(tag, elements)
+                    ):
                         tag["user_confirmed"] = True
                         tag["approval_status"] = "approved"
                         tag["needs_review"] = False
@@ -7840,6 +8342,73 @@ def apply_manual_edits(
             }
         )
     return constraints, tags, audit
+
+
+def _prepare_manual_tag_projection(
+    tag: dict[str, Any], elements: Sequence[dict[str, Any]]
+) -> bool:
+    """Project an explicitly approved tag to its declared physical edge.
+
+    Manual approval remains fail-closed: the shelf code must resolve to one
+    map element, the side must name a real long edge, the axial offset must be
+    in range, and the pre-projection point must be within the frozen 0.5 m
+    shelf-face tolerance. The pre-projection point is retained as optimized
+    audit evidence before the business coordinate is replaced.
+    """
+    shelves = [
+        element
+        for element in elements
+        if element.get("shape_type")
+            in {"MapShelf", "MapTable", "MapTableFeature"}
+        and str(element.get("code") or "") == str(tag.get("shelf_code") or "")
+    ]
+    if len(shelves) != 1:
+        return False
+    edge = next(
+        (
+            (start, end)
+            for edge_id, start, end in _stable_edges(shelves[0])
+            if edge_id == tag.get("shelf_side")
+        ),
+        None,
+    )
+    if edge is None:
+        return False
+    try:
+        offset_m = float(tag.get("distance_from_shelf_start_cm")) / 100
+        current = tag["final_map_position"]
+        current_x = float(current["x_m"])
+        current_y = float(current["y_m"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    length_m = math.hypot(
+        edge[1][0] - edge[0][0], edge[1][1] - edge[0][1]
+    )
+    if (
+        not all(math.isfinite(value) for value in (
+            offset_m, current_x, current_y, length_m
+        ))
+        or length_m <= 1.0e-9
+        or not 0 <= offset_m <= length_m + 1.0e-9
+    ):
+        return False
+    ratio = offset_m / length_m
+    projected_x = edge[0][0] + ratio * (edge[1][0] - edge[0][0])
+    projected_y = edge[0][1] + ratio * (edge[1][1] - edge[0][1])
+    residual = math.hypot(current_x - projected_x, current_y - projected_y)
+    if residual > 0.50 + 1.0e-9:
+        return False
+    tag.setdefault("optimized_map_position", dict(current))
+    projected = {
+        "x_m": round(projected_x, 6),
+        "y_m": round(projected_y, 6),
+        "height_m": current.get("height_m"),
+    }
+    tag["shelf_projected_map_position"] = projected
+    tag["final_map_position"] = dict(projected)
+    tag["shelf_face_normal_residual_m"] = round(residual, 6)
+    tag["shelf_face_longitudinal_within_segment"] = True
+    return True
 
 
 def _tag_has_valid_map_association(
@@ -7882,7 +8451,7 @@ def _tag_has_valid_map_association(
     ratio = offset_m / length_m
     shelf_x = edge[0][0] + ratio * (edge[1][0] - edge[0][0])
     shelf_y = edge[0][1] + ratio * (edge[1][1] - edge[0][1])
-    return math.hypot(x - shelf_x, y - shelf_y) <= 0.45 + 1.0e-9
+    return math.hypot(x - shelf_x, y - shelf_y) <= 0.50 + 1.0e-9
 
 
 def new_manual_edits(
@@ -8445,7 +9014,7 @@ def _render_localized_version(
         if isinstance(capture_health, dict)
         else None
     )
-    if input_manifest_version in {2, 3, 4}:
+    if input_manifest_version in {2, 3, 4, 5}:
         if (
             isinstance(recovery_watermark, bool)
             or not isinstance(recovery_watermark, int)
@@ -8792,6 +9361,18 @@ def _render_localized_version(
         )
     road_graph = load_json(prior_map / "road_graph.json")
     road_graph_payload = road_graph if isinstance(road_graph, dict) else {}
+    shelves_loaded = load_json(prior_map / "shelves.json")
+    shelves_payload = shelves_loaded if isinstance(shelves_loaded, dict) else {}
+    shelf_face_constraints, shelf_face_factor_audit = build_shelf_face_constraints(
+        baseline,
+        input_snapshot.shelf_evidence,
+        shelves_payload,
+        str(metadata.get("floorId") or metadata.get("floor_id") or ""),
+    )
+    constraints.extend(shelf_face_constraints)
+    constraint_records.extend(
+        {**item, "status": "accepted"} for item in shelf_face_factor_audit
+    )
     for event in active_edit_events:
         if (
             isinstance(event, dict)
@@ -8944,7 +9525,6 @@ def _render_localized_version(
         and gauge_neutral_nodes
         and len(gauge_neutral_nodes) == len(baseline)
     ):
-        shelves_payload = load_json(prior_map / "shelves.json")
         structures_payload = load_json(prior_map / "fixed_structures.json")
         floor_id = str(metadata.get("floorId") or metadata.get("floor_id") or "")
         route_anchors = [
@@ -8996,18 +9576,18 @@ def _render_localized_version(
                 "gauge_neutral_corridor_envelope_correction"
             )
             solver_metrics["legacy_correction_gradient_is_diagnostic_only"] = True
-            full_factor_graph = False
-            factor_graph_published_capable = False
-            continuity_fallback_reason = (
-                "free_space_corridor_route_review_draft"
-            )
+            # P1-D: a collision-free corridor result is now a formal
+            # validation/correction layer on top of the native relative SE(2)
+            # graph. It must not erase an already valid full-graph authority.
+            # Publication still fails closed below on every route
+            # self-consistency check and on low route confidence.
             factor_graph_report = {
                 **factor_graph_report,
-                "full_factor_graph": False,
-                "published_capable": False,
-                "corridor_route_review_applied": True,
+                "full_factor_graph": full_factor_graph,
+                "published_capable": factor_graph_published_capable,
+                "corridor_route_formal_validation": True,
                 "corridor_route_matcher": corridor_route_audit.get("matcher"),
-                "review_trajectory_solver": (
+                "trajectory_post_solver": (
                     "gauge_neutral_motion_plus_corridor_envelope_correction_v2"
                 ),
             }
@@ -9046,7 +9626,7 @@ def _render_localized_version(
             # it does not retroactively convert every historical v1 tag in the
             # same finalized file into a burst-bound v2 confirmation. Only v2
             # tags use the complete burst frame as their exact node authority.
-            if input_manifest_version in {3, 4} and tag.get("version") == 2:
+            if input_manifest_version in {3, 4, 5} and tag.get("version") == 2:
                 verified_burst_frame = verified_burst_frame_authorities.get(
                     str(tag.get("observation_id") or "")
                 )
@@ -9548,6 +10128,26 @@ def _render_localized_version(
             )
             for tag in final_tags
         ),
+        "tag_shelf_projected_count": sum(
+            isinstance(tag.get("shelf_projected_map_position"), dict)
+            for tag in final_tags
+        ),
+        "tag_shelf_face_gate_violation_count": sum(
+            not _tag_has_publishable_fields(tag) for tag in final_tags
+        ),
+        "tag_shelf_face_maximum_normal_residual_m": max(
+            (
+                float(tag["shelf_face_normal_residual_m"])
+                for tag in final_tags
+                if isinstance(
+                    tag.get("shelf_face_normal_residual_m"), (int, float)
+                )
+                and not isinstance(
+                    tag.get("shelf_face_normal_residual_m"), bool
+                )
+            ),
+            default=None,
+        ),
         "legacy_tag_coordinate_frame_count": sum(
             observation.get("version") == 1
             for observation in tag_observations
@@ -9710,6 +10310,18 @@ def _render_localized_version(
             corridor_route_audit.get("reason"),
         ),
         (
+            corridor_route_audit.get("route_confidence") != "low",
+            "corridor_route_low_confidence",
+            {
+                "route_confidence": corridor_route_audit.get(
+                    "route_confidence"
+                ),
+                "candidate_margin": corridor_route_audit.get(
+                    "candidate_margin"
+                ),
+            },
+        ),
+        (
             corridor_route_audit.get("point_obstacle_penetration_count") == 0,
             "corridor_route_obstacle_penetration_present",
             corridor_route_audit.get("point_obstacle_penetration_count"),
@@ -9797,6 +10409,33 @@ def _render_localized_version(
             report["tag_rescan_required_count"] == 0,
             "tag_rescan_required",
             report["tag_rescan_required_count"],
+        ),
+        (
+            report["tag_shelf_face_gate_violation_count"] == 0,
+            "tag_shelf_face_projection_gate_failed",
+            {
+                "violation_count": report[
+                    "tag_shelf_face_gate_violation_count"
+                ],
+                "maximum_normal_residual_m": report[
+                    "tag_shelf_face_maximum_normal_residual_m"
+                ],
+                "limit_m": 0.5,
+            },
+        ),
+        (
+            factor_graph_report.get("shelf_face_residual_gate_passed", True)
+            is True,
+            "shelf_face_factor_residual_above_0_5m",
+            {
+                "constraint_count": factor_graph_report.get(
+                    "shelf_face_constraint_count", 0
+                ),
+                "maximum_normal_residual_m": factor_graph_report.get(
+                    "shelf_face_maximum_normal_residual_m"
+                ),
+                "limit_m": 0.5,
+            },
         ),
         (
             report["coordinate_frame_audit_passed"]
@@ -10066,14 +10705,16 @@ def _render_localized_version(
             "items": review_items,
         },
     )
+    review_floor_id = str(
+        metadata.get("floorId") or metadata.get("floor_id") or ""
+    )
+    review_elements = _review_elements_for_floor(elements, review_floor_id)
     _json_write(
         output / "localized_review.json",
         {
             "format": "MarketScannerLocalizedReview",
             "version": 1,
-            "floor_id": str(
-                metadata.get("floorId") or metadata.get("floor_id") or ""
-            ),
+            "floor_id": review_floor_id,
             "coordinate_contract_version": COORDINATE_CONTRACT_VERSION,
             "coordinate_contract": {
                 "x_axis": "+X east / screen right",
@@ -10082,13 +10723,16 @@ def _render_localized_version(
                 "yaw_positive": "counterclockwise",
                 "view_y_conversion_count": 1,
             },
-            "bounds": manifest.get("bounds"),
+            "bounds": _review_bounds_for_floor(manifest, review_floor_id),
             "elements": [
                 {
                     key: element.get(key)
-                    for key in ("id", "code", "shape_type", "floor_id", "geometry")
+                    for key in (
+                        "id", "code", "shape_type", "role", "floor_id",
+                        "geometry",
+                    )
                 }
-                for element in elements[:50_000]
+                for element in review_elements[:50_000]
                 if element.get("geometry") is not None
             ],
             "trajectory": _bounded_review_trajectory(trajectory_payload),
@@ -10099,7 +10743,7 @@ def _render_localized_version(
                 "maximum_trajectory_points_per_layer": 20_000,
                 "maximum_tags": 50_000,
                 "maximum_review_items": 5_000,
-                "elements_truncated": len(elements) > 50_000,
+                "elements_truncated": len(review_elements) > 50_000,
                 "tags_truncated": len(final_tags) > 50_000,
                 "review_items_truncated": len(review_items) > 5_000,
             },
@@ -10113,6 +10757,11 @@ def _render_localized_version(
         fieldnames = [
             "tag_id", "capture_id", "observation_id", "payload", "symbology",
             "map_x_cm", "map_y_cm", "height_cm",
+            "raw_map_x_cm", "raw_map_y_cm",
+            "optimized_map_x_cm", "optimized_map_y_cm",
+            "shelf_projected_map_x_cm", "shelf_projected_map_y_cm",
+            "shelf_face_normal_residual_m",
+            "shelf_face_longitudinal_within_segment",
             "final_shelf_segment_id", "shelf_code", "row_flag", "cross_code", "shelf_side",
             "distance_from_shelf_start_cm", "online_offline_distance_cm",
             "localization_confidence", "measurement_confidence",
@@ -10130,6 +10779,19 @@ def _render_localized_version(
             position = tag.get("final_map_position") or {}
             x_m = _strict_number(position.get("x_m"))
             y_m = _strict_number(position.get("y_m"))
+            raw_position = (
+                tag.get("online_map_position")
+                or tag.get("raw_map_position")
+                or {}
+            )
+            optimized_position = tag.get("optimized_map_position") or {}
+            projected_position = tag.get("shelf_projected_map_position") or {}
+            raw_x_m = _strict_number(raw_position.get("x_m"))
+            raw_y_m = _strict_number(raw_position.get("y_m"))
+            optimized_x_m = _strict_number(optimized_position.get("x_m"))
+            optimized_y_m = _strict_number(optimized_position.get("y_m"))
+            projected_x_m = _strict_number(projected_position.get("x_m"))
+            projected_y_m = _strict_number(projected_position.get("y_m"))
             writer.writerow(
                 {
                     **{key: tag.get(key) for key in fieldnames},
@@ -10138,6 +10800,28 @@ def _render_localized_version(
                     "height_cm": (
                         float(position["height_m"]) * 100
                         if position.get("height_m") is not None else None
+                    ),
+                    "raw_map_x_cm": (
+                        raw_x_m * 100 if raw_x_m is not None else None
+                    ),
+                    "raw_map_y_cm": (
+                        raw_y_m * 100 if raw_y_m is not None else None
+                    ),
+                    "optimized_map_x_cm": (
+                        optimized_x_m * 100
+                        if optimized_x_m is not None else None
+                    ),
+                    "optimized_map_y_cm": (
+                        optimized_y_m * 100
+                        if optimized_y_m is not None else None
+                    ),
+                    "shelf_projected_map_x_cm": (
+                        projected_x_m * 100
+                        if projected_x_m is not None else None
+                    ),
+                    "shelf_projected_map_y_cm": (
+                        projected_y_m * 100
+                        if projected_y_m is not None else None
                     ),
                     "final_shelf_segment_id": (
                         tag.get("final_shelf_segment_id")

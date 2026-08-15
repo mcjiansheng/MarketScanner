@@ -226,6 +226,9 @@ enum StrictLocalizationTraceParser {
         "recoveryValidAttemptCount", "recoveryRemainingValidAttempts",
         "recoveryFreshSupportFrames", "recoveryTriggerCount",
         "recoverySelectedHypothesisId",
+        "epoch", "component",
+        "shelfNodePenetrationCount", "shelfSegmentCrossingCount",
+        "dynamicStructureRejectionCount",
     ]
 
     private static let constraintDispositions: Set<String> = [
@@ -272,6 +275,9 @@ enum StrictLocalizationTraceParser {
         "recoveryAutomaticTriggerReason", "trackingSessionId",
         "priorMapId", "priorMapSha256", "floorId",
         "nodeTimebaseTimestamp", "nodeTimebaseOffsetSeconds",
+        "epoch", "component",
+        "shelfNodePenetrationCount", "shelfSegmentCrossingCount",
+        "dynamicStructureRejectionCount",
     ]
 
     private static let poseKeys: Set<String> = [

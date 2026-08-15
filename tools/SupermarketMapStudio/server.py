@@ -2715,7 +2715,10 @@ def run_localized_map(
 
 
 def _manual_edit_context(
-    tags: Any, constraints_payload: Any, prior_map: Path
+    tags: Any,
+    constraints_payload: Any,
+    localized_review: Any,
+    prior_map: Path,
 ) -> tuple[list[Dict[str, Any]], list[Dict[str, Any]], list[Dict[str, Any]], Dict[str, Any]]:
     elements_payload = load_json(prior_map / "elements.json", None)
     manifest = load_json(prior_map / "manifest.json", None)
@@ -2729,6 +2732,11 @@ def _manual_edit_context(
         if isinstance(elements_payload, dict)
         else None
     )
+    review_floor_id = (
+        str(localized_review.get("floor_id") or "")
+        if isinstance(localized_review, dict)
+        else ""
+    )
     if (
         not isinstance(tags, list)
         or not isinstance(constraints, list)
@@ -2738,7 +2746,16 @@ def _manual_edit_context(
         raise RequestError("本地化结果缺少完整的人工编辑校验上下文。")
     if any(not isinstance(item, dict) for item in tags + constraints + elements):
         raise RequestError("本地化人工编辑校验上下文包含无效记录。")
-    return tags, constraints, elements, manifest
+    if not review_floor_id:
+        raise RequestError("本地化结果缺少当前楼层身份。")
+    floor_elements = [
+        item
+        for item in elements
+        if str(item.get("floor_id") or "") == review_floor_id
+    ]
+    if not floor_elements:
+        raise RequestError("本地化结果的当前楼层在地图包中不存在。")
+    return tags, constraints, floor_elements, manifest
 
 
 def _one_by_id(
@@ -3142,7 +3159,7 @@ def apply_localized_edit(job: Job, data: Dict[str, Any]) -> Dict[str, Any]:
                 "重放输入、参数或版本身份已变化；旧 current 保持不变。"
             )
         tags, constraints, elements, manifest = _manual_edit_context(
-            tags_payload, constraints_payload, prior_map
+            tags_payload, constraints_payload, localized_review, prior_map
         )
 
         action = str(data.get("action") or "append")

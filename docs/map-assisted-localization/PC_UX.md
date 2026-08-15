@@ -1,6 +1,6 @@
 # PC 先验地图工作台交互
 
-> 文档状态：**当前有效（阶段三草稿复核）**。最后核对日期：2026-08-14。
+> 文档状态：**当前有效（阶段三草稿复核）**。最后核对日期：2026-08-16。
 
 Map Studio 保留单设备、多设备和“导入/管理先验地图”入口，并新增“先验地图会话优化”。自由扫描不要求地图，也不显示无意义的价签复核步骤。
 
@@ -30,7 +30,7 @@ MapCase02 已在 2026-08-09 通过 PC 转换、v2 schema、确定性 canonical/p
 8. 运行轨迹点/线段碰撞、道路拓扑、物理步长、距离尺度、weak/lost 和证据质量门禁，再进入轨迹/价签复核；
 9. 导出 JSON/CSV/GeoJSON、节点级/秒级校准坐标和预览，以及审计日志。
 
-人工位置证据分为两类。手机持久化的 `MarketScannerManualLocalizationEvent v3` 只有在 tracking/map/floor 身份、递增 alignment version、exact node ID、node stamp、time delta 和 atomic snapshot generation 全部严格通过时，才成为“可信绝对地图锚点”。PC 复核页的新 `set_anchor` 也必须由服务端从不可变 `localized_review.json` 重新绑定唯一 exact node ID、精确 timestamp、floor、coordinate-contract 和 canonical bounds，只有全项一致时才获得相同可信绝对语义。两者按约 3 m 平移和 20°航向不确定度参与求解，不再因相对累计漂移超过 5 m/30°而被丢弃。旧 v2 时间绑定事件、历史 timestamp-only PC 编辑和缺少 exact-node 权威的事件仍受 5 m/30°兼容门约束并以 `unverified_manual_anchor_safety_gate` 审计。
+人工位置证据分为两类。手机持久化的 `MarketScannerManualLocalizationEvent v3` 只有在 tracking/map/floor 身份、递增 alignment version、exact node ID、node stamp、time delta 和 atomic snapshot generation 全部严格通过时，才成为“可信绝对地图锚点”。PC 复核页的新 `set_anchor` 也必须由服务端从不可变 `localized_review.json` 重新绑定唯一 exact node ID、精确 timestamp、floor、coordinate-contract 和 canonical bounds，只有全项一致时才获得相同可信绝对语义。两者按冻结规格的约 3 m 平移和 15°航向不确定度参与求解，不再因相对累计漂移超过 5 m/30°而被丢弃。旧 v2 时间绑定事件、历史 timestamp-only PC 编辑和缺少 exact-node 权威的事件仍受 5 m/30°兼容门约束并以 `unverified_manual_anchor_safety_gate` 审计。
 
 可信人工锚点造成的大 `maximum/P95 correction` 表示地图 gauge 修正，不等价于相邻节点物理瞬移。长会话不会把 correction-field gradient 当作物理连续性的权威：PC 先按每帧 alignment 语义恢复 gauge-neutral 运动，自动 correction 后以此前 `estimatedPose` 为下一增量原点，人工重定位后的首个 post-reset sample 物理位移为零。严格模式把完整结果保存并加载为可复核的 current `draft`；review gate 检查自由空间碰撞、道路拓扑、物理相邻步长、路线/物理距离尺度、节点覆盖、weak/lost、拒绝约束与价签证据。旧 correction-field 指标在自由空间路线生效后仅为诊断。
 

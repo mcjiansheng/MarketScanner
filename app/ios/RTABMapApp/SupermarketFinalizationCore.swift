@@ -84,6 +84,10 @@ struct LocalizationEvidenceBundleExpectation {
     let tagBurstCount: Int
     let tagBurstLastID: String?
     let tagBurstComplete: Bool
+    /// Manifest-v5 sessions require every trace and v2 tag record to carry
+    /// explicit epoch/component identity. Historical v1-v4 validation keeps
+    /// this disabled for compatibility.
+    let requiresShelfEpochComponent: Bool
 
     init(
         trackingSessionId: String,
@@ -101,7 +105,8 @@ struct LocalizationEvidenceBundleExpectation {
         lastRecoveryFinishedAtUptime: TimeInterval? = nil,
         tagBurstCount: Int = 0,
         tagBurstLastID: String? = nil,
-        tagBurstComplete: Bool = true
+        tagBurstComplete: Bool = true,
+        requiresShelfEpochComponent: Bool = false
     ) {
         self.trackingSessionId = trackingSessionId
         self.priorMapId = priorMapId
@@ -119,6 +124,7 @@ struct LocalizationEvidenceBundleExpectation {
         self.tagBurstCount = tagBurstCount
         self.tagBurstLastID = tagBurstLastID
         self.tagBurstComplete = tagBurstComplete
+        self.requiresShelfEpochComponent = requiresShelfEpochComponent
     }
 }
 
@@ -534,13 +540,17 @@ enum LocalizationEvidenceBundleValidator {
             throw validationError("format_or_version_mismatch")
         }
         let version = strictInteger(object["version"])
-        if version != contract.version {
+        let versionAccepted = contract.fileName == "tag_observations.jsonl"
+            ? version == 1 || version == 2
+            : version == contract.version
+        if !versionAccepted {
             throw validationError("format_or_version_mismatch")
         }
         try validateIdentity(object, expectation: expectation)
         let timestamp = try validateBusinessRecord(
             object,
             fileName: contract.fileName,
+            expectation: expectation,
             summary: &summary)
         if contract.strictlyIncreasingTimestamps,
            let previous = summary.previousTimestamp,
@@ -811,6 +821,7 @@ enum LocalizationEvidenceBundleValidator {
     private static func validateBusinessRecord(
         _ object: [String: Any],
         fileName: String,
+        expectation: LocalizationEvidenceBundleExpectation,
         summary: inout JSONLValidationSummary
     ) throws -> Double {
         if fileName == "tag_observation_bursts.jsonl" {
@@ -933,6 +944,14 @@ enum LocalizationEvidenceBundleValidator {
                   validUnitInterval(object["confidence"]) else {
                 throw validationError("trace_business_schema_invalid")
             }
+            if expectation.requiresShelfEpochComponent {
+                guard let epoch = strictInteger(object["epoch"]), epoch >= 0,
+                      let component = strictInteger(object["component"]),
+                      component >= 0 else {
+                    throw validationError(
+                        "trace_epoch_component_identity_invalid")
+                }
+            }
         case "localization_constraints.jsonl":
             guard let accepted =
                     StrictJSONScalar.boolean(object["accepted"]),
@@ -952,6 +971,17 @@ enum LocalizationEvidenceBundleValidator {
                   nonEmptyString(object["symbology"]),
                   validPosition(object["raw_map_position"]) else {
                 throw validationError("tag_business_schema_invalid")
+            }
+            if expectation.requiresShelfEpochComponent {
+                guard strictInteger(object["version"]) == 2,
+                      let epoch = strictInteger(object["epoch"]), epoch >= 0,
+                      let component = strictInteger(object["component"]),
+                      component >= 0,
+                      component == strictInteger(object["bound_node_map_id"])
+                else {
+                    throw validationError(
+                        "tag_epoch_component_identity_invalid")
+                }
             }
             let burstID = object["burst_id"] as? String
             let frameID = object["frame_id"] as? String

@@ -101,6 +101,10 @@ def _select_absolute_priors(
             # is intentionally not compared with the drifted VIO baseline:
             # that difference is the correction we are solving for.
             exceeds_gate = False
+        elif constraint.kind == "shelf_face":
+            exceeds_gate = (
+                translation > 3.0 or yaw > math.radians(15.0)
+            )
         elif is_manual_anchor and not trusted_manual_anchor:
             exceeds_gate = (
                 translation > UNVERIFIED_MANUAL_ANCHOR_MAX_TRANSLATION_M
@@ -135,7 +139,13 @@ def _select_absolute_priors(
 
 
 def _write_priors(path: Path, input_identity_id: str, baseline: Sequence[Any], constraints: Sequence[Any]) -> None:
-    lines = [f"MarketScannerAbsoluteSE2Priors\t2\t{input_identity_id}\n"]
+    anisotropic_v3 = any(
+        str(constraint.kind) == "shelf_face" for constraint in constraints
+    )
+    version = 3 if anisotropic_v3 else 2
+    lines = [
+        f"MarketScannerAbsoluteSE2Priors\t{version}\t{input_identity_id}\n"
+    ]
     identifiers: set[str] = set()
     for constraint in constraints:
         identifier = str(constraint.identifier)
@@ -168,7 +178,7 @@ def _write_priors(path: Path, input_identity_id: str, baseline: Sequence[Any], c
             or not 1.0e-5 <= yaw_sigma_rad <= math.pi
         ):
             raise FactorGraphRunnerError("Absolute constraint uncertainty is out of range.")
-        values = (
+        values: tuple[str, ...] = (
             identifier,
             kind,
             str(int(pose.node_id)),
@@ -180,6 +190,57 @@ def _write_priors(path: Path, input_identity_id: str, baseline: Sequence[Any], c
         )
         if any(not math.isfinite(float(value)) for value in values[3:]):
             raise FactorGraphRunnerError("Absolute constraint contains non-finite values.")
+        if anisotropic_v3:
+            information = 1.0 / (translation_sigma_m * translation_sigma_m)
+            information_xx = information
+            information_xy = 0.0
+            information_yy = information
+            if kind == "shelf_face":
+                source = getattr(constraint, "source", None)
+                normal = source.get("shelf_normal_map") if isinstance(source, dict) else None
+                along_sigma = source.get("shelf_along_sigma_m") if isinstance(source, dict) else None
+                if (
+                    not isinstance(normal, list)
+                    or len(normal) != 2
+                    or not all(
+                        isinstance(item, (int, float))
+                        and not isinstance(item, bool)
+                        and math.isfinite(float(item))
+                        for item in normal
+                    )
+                    or not isinstance(along_sigma, (int, float))
+                    or isinstance(along_sigma, bool)
+                    or not math.isfinite(float(along_sigma))
+                    or not 0.5 <= float(along_sigma) <= 1000.0
+                ):
+                    raise FactorGraphRunnerError(
+                        "Shelf-face constraint lacks finite normal/along uncertainty."
+                    )
+                nx, ny = float(normal[0]), float(normal[1])
+                length = math.hypot(nx, ny)
+                if abs(length - 1.0) > 0.05:
+                    raise FactorGraphRunnerError("Shelf-face normal is not unit length.")
+                nx, ny = nx / length, ny / length
+                ax, ay = -ny, nx
+                normal_information = information
+                along_information = 1.0 / (float(along_sigma) ** 2)
+                information_xx = (
+                    normal_information * nx * nx
+                    + along_information * ax * ax
+                )
+                information_xy = (
+                    normal_information * nx * ny
+                    + along_information * ax * ay
+                )
+                information_yy = (
+                    normal_information * ny * ny
+                    + along_information * ay * ay
+                )
+            values += (
+                format(information_xx, ".17g"),
+                format(information_xy, ".17g"),
+                format(information_yy, ".17g"),
+            )
         lines.append("\t".join(values) + "\n")
     path.write_text("".join(lines), encoding="utf-8")
 
@@ -406,11 +467,26 @@ def run_relative_se2_factor_graph(
                 constraint.x - optimized[constraint.node_index].x,
                 constraint.y - optimized[constraint.node_index].y,
             ),
+            "shelf_face_normal_residual_m": (
+                abs(
+                    (constraint.x - optimized[constraint.node_index].x)
+                    * float(constraint.source["shelf_normal_map"][0])
+                    + (constraint.y - optimized[constraint.node_index].y)
+                    * float(constraint.source["shelf_normal_map"][1])
+                )
+                if constraint.kind == "shelf_face"
+                else None
+            ),
             "yaw_residual_deg": math.degrees(
                 abs(_normalize_angle(constraint.yaw - optimized[constraint.node_index].yaw))
             ),
         }
         for constraint in selected
+    ]
+    shelf_face_residuals = [
+        float(item["shelf_face_normal_residual_m"])
+        for item in accepted
+        if item["kind"] == "shelf_face"
     ]
     report = {
         **report,
@@ -427,6 +503,13 @@ def run_relative_se2_factor_graph(
         ),
         "initial_map_pose_constraint_count": sum(
             constraint.kind == "initial_map_pose" for constraint in selected
+        ),
+        "shelf_face_constraint_count": len(shelf_face_residuals),
+        "shelf_face_maximum_normal_residual_m": max(
+            shelf_face_residuals, default=0.0
+        ),
+        "shelf_face_residual_gate_passed": all(
+            value <= 0.50 for value in shelf_face_residuals
         ),
     }
     return optimized, accepted, rejected, report

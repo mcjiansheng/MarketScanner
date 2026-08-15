@@ -1,6 +1,10 @@
 # 地图辅助定位实现状态
 
-> 文档状态：**当前有效**。最后核对日期：2026-08-15。
+> 文档状态：**当前有效**。最后核对日期：2026-08-16。
+
+2026-08-16 通道/货架约束定位已完成 P1-B、P1-C、P1-D、P1-E 与 P2（冻结规格允许的子集）的代码集成：新增 manifest v5 四类严格 JSONL（pose epoch transition、corridor hypotheses、shelf observation windows、shelf loop events）及 metadata exact count/last/complete 水位；trace/tag v2 持久化 epoch/component；手机以 `BOOTSTRAP/TRACKING/LOW_CONFIDENCE` 单最优状态机持续扫描，0.25 m 在线步长和手机点+扫掠线段 0.4 m 穿架门保持 fail-closed；两侧窗口按 >120°、0.5 m/10°、70% 初始值和非主导动态证据确认 concrete shelf loop；PC 将 accepted loop 转为 `shelf_face` 因子并回溯优化，corridor route 自洽通过后不再被死规则强制降级。价签最终业务坐标改为采集手机所在通道侧的货架物理长边投影，手机 `MarketScannerFinalTags` v2 和 PC 均同时保留 online/raw、optimized、shelf-projected 坐标及法向/纵向审计；法向残差 >0.5 m 或纵向越界关闭发布。C-1/C-2/C-3 仍明确标为 `CALIBRATION_PENDING`；签名真机性能、Sam WM/LTM A/B、现场阈值/控制点和完整山姆路线未执行，整体仍为 **NO-GO / NOT PRODUCTION READY**。
+
+本轮主机证据为 PriorMap **340/340（421.006 s）**、Map Studio **143/143（12.533 s）**、Qualification **30/30**、generated contracts 16 文件、Python/JavaScript 语法、patch check、native `rtabmap-prior-map-factor-graph`/`rtabmap-reprocess` 和 unsigned generic iPhoneOS Debug 全量编译/链接 PASS；Debug bundle 按合同不含正式 build identity。Swift host 压力峰值为 300,000 finalization **13,336,576 bytes**、1,728,000 trace（保留 172,801）**59,162,624 bytes**、400,000 tag evidence（接受 200,000）**793,395,200 bytes**，仍低于 768 MiB 门。真实浏览器 1280×720 启动、空状态、单楼层 Sam 诊断叠加和控制台检查通过；内置浏览器的临时 1024/390 视口覆盖未生效，因此窄屏只由现有 CSS/自动化合同覆盖，不能标为真实浏览器截图 PASS。
 
 2026-08-15 扫描前命名功能已并入当前山姆现场加固分支：配置页接受可选名称，纯核心规则执行特殊/控制字符过滤、空白折叠、64 字符上限和 `<store>-<floor>-MMdd-HHmm` 默认回退；host 在创建 session 前再次幂等清洗。解析值写入可选 `scanDisplayName` 配置、live checkpoint、最终 metadata 和扫描事件，历史页优先显示清洗后的名称并保留原会话目录作为副标题。名称明确不参与目录、数据库、sidecar、地图/追踪身份、Result 或发布路径；旧配置/metadata 缺字段继续解码并按原目录显示。合并回归已通过命名 UX/source **25/25**、完整 PriorMap **331/331（376.662 s）**、Qualification **30/30（12.128 s）**、Map Studio **142/142（9.671 s）**、Swift parse、生成合同、patch check 和 unsigned generic iPhoneOS QualifiedDevice Debug；真机命名交互和完整扫描仍为 NOT RUN。
 
@@ -14,9 +18,9 @@
 
 2026-08-14 当前成果合同已从“质量门失败即没有结果”改为“先生成不可变业务成果，再独立判断发布资格”。PC 与手机都必须保留所有身份明确的源节点和 durable 价签业务记录；低置信度、部分优化图、局部时钟绑定缺口、平行通道多解、距离尺度偏差或货架关联不足只产生 `LOW_CONFIDENCE` / `PARTIAL_REVIEW_REQUIRED` 和 publish blocker。只有数据库/JSON framing 损坏、地图/会话身份串包、hash/watermark/CAS 不一致、重复 durable 主键导致身份不可界定、完全没有有限轨迹或无法安全原子提交时才允许终止。
 
-当前 PC 长距离道路匹配已废弃中心线重参数化。`bounded_free_space_road_hmm_v2` 只用道路图确定 corridor identity、有限边/路口时序和可达拓扑；最终 X/Y/yaw 保留优化手机位姿的局部几何，exact 人工锚点残差按 gauge-neutral 物理里程连续传播。货架/固定结构自由空间只施加最小低频修正：结构内点采用通道侧一致、邻域连续的安全出口；穿架段采用货架驱动的局部刚体平移；同轮建议合并后一次应用；最终尖刺和平台梯度只在完整自由空间验证通过且不增加局部最大步长时摊平。道路中心/切线不得写入位置或 yaw。TianHong `162937`/`181158` 最新回归分别保留 3663/1054 个节点和 3806/1132 行秒级表，结构内点、穿架段和拓扑断裂均为 0；结果仍因绝对修正、弱定位时长和部分无法安全摊平的修正梯度保留为不可发布低置信度草稿。手机端没有道路中心线投影实现，继续保存连续相对轨迹和证据；不得为了与 PC 对齐而在手机后处理中新增中心线吸附。
+当前 PC 长距离道路匹配已废弃中心线重参数化。`bounded_free_space_road_hmm_v2` 只用道路图确定 corridor identity、有限边/路口时序和可达拓扑；最终 X/Y/yaw 保留优化手机位姿的局部几何，exact 人工锚点残差按 gauge-neutral 物理里程连续传播。货架/固定结构自由空间只施加最小低频修正。route 现在作为 full relative SE(2) graph 之后的正式自洽验证/修正层；只有 native full graph、本段全部自由空间/连续性/尺度指标、非低置信 route、P1-A invariant 和 shelf-face 残差门同时通过时才可能发布。手机端不做道路中心线吸附，继续保存连续相对轨迹、top-K 与低置信状态。
 
-当前不可变 localized version v5 内直接包含 `calibrated_positions_by_node.csv`、`calibrated_positions_1s.csv`、`localized_price_tags.json`、`localized_price_tags.csv` 和 `calibrated_deliverables_manifest.json`；正式发布版本为 v6。session input manifest v4 已绑定 `clock_correlations.jsonl`，秒级表携带 `clock_segment_index` 并禁止跨系统时钟/时区 discontinuity 插值。局部 binding 过滤后不足两条时不再终止：手机和 PC 保留 correlation 时间范围内的全部秒级行并将位置标为 `UNAVAILABLE`，同时继续提交节点坐标和价签；无权威 clock evidence 的历史 node stamp 不会冒充 UTC。正式 concrete shelf-loop 因子仍未完成，未来证据合同必须使用 session input manifest v5。
+当前不可变 localized version v5 内直接包含 `calibrated_positions_by_node.csv`、`calibrated_positions_1s.csv`、`localized_price_tags.json`、`localized_price_tags.csv` 和 `calibrated_deliverables_manifest.json`；正式发布版本为 v6。session input manifest v4 已绑定 `clock_correlations.jsonl`，秒级表携带 `clock_segment_index` 并禁止跨系统时钟/时区 discontinuity 插值。局部 binding 过滤后不足两条时不再终止：手机和 PC 保留 correlation 时间范围内的全部秒级行并将位置标为 `UNAVAILABLE`，同时继续提交节点坐标和价签；无权威 clock evidence 的历史 node stamp 不会冒充 UTC。session input manifest v5 已将 concrete shelf-loop 四流绑定进 snapshot；旧 v1-v4 继续兼容读取，但不会取得 shelf-loop authority。
 
 当前全手机发布目标已收敛为一条生产流程：首页大型入口和菜单入口先进入轻量地图选择页；用户可选择已注册地图或直接导入新地图，只有明确选定后才进入统一扫描配置页并完整校验/加载该包。手机编译 XLSX/CSV/JSON 与 PC 正式 v2 地图包都安装到同一个 `MobileMapLibrary`，再复用同一个楼层/起点/朝向页面、Coordinator 和真实扫描 host。配置页以 required initializer 接收 immutable `selectedMap`，不再持有地图 picker 或自行列举/自动加载第一张地图。旧向导不再从生产 UI 可达，自由扫描和原始数据录制只保留在“实验与兼容工具”。地图库普通进入使用轻量 registry，完整包读取、provider snapshot/copy、localizer 构造、会话目录和 native SQLite 初始化均在后台队列；主线程只保留短 UIKit/ARSession 事务。MapCase02 单次完整包校验约 9.36 秒的证据解释了原 3–9 秒冻结，当前实现不再在进入/返回路径同步重复该工作。
 

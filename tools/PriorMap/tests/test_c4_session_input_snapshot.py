@@ -218,6 +218,77 @@ class SessionInputSnapshotFixture(unittest.TestCase):
 
 
 class SnapshotConsistencyTests(SessionInputSnapshotFixture):
+    def test_complete_shelf_evidence_upgrades_manifest_to_v5(self) -> None:
+        metadata_path = self.segment / "metadata.json"
+        value = json.loads(metadata_path.read_text(encoding="utf-8"))
+        value.update(
+            {
+                "clockCorrelationCount": 2,
+                "clockNodeBindingCount": 2,
+                "clockEvidenceComplete": True,
+                "tagObservationBurstCount": 0,
+                "tagObservationBurstLastID": None,
+                "tagObservationBurstComplete": True,
+                "poseEpochTransitions": "pose_epoch_transitions.jsonl",
+                "corridorHypotheses": "corridor_hypotheses.jsonl",
+                "shelfObservationWindows": "shelf_observation_windows.jsonl",
+                "shelfLoopEvents": "shelf_loop_events.jsonl",
+                "poseEpochTransitionCount": 0,
+                "poseEpochTransitionLastSequence": None,
+                "corridorHypothesisCount": 0,
+                "corridorHypothesisLastSequence": None,
+                "shelfObservationWindowCount": 0,
+                "shelfObservationWindowLastSequence": None,
+                "shelfLoopEventCount": 0,
+                "shelfLoopEventLastSequence": None,
+                "shelfLocalizationEvidenceComplete": True,
+                "shelfLocalizationCalibrationStatus": "CALIBRATION_PENDING",
+            }
+        )
+        value["captureHealth"].update(
+            {
+                "localizationRecoveryEventCount": 0,
+                "localizationLastRecoveryEpisodeId": None,
+                "localizationLastRecoveryFinishedAtUptime": None,
+                "localizationRecoveryEvidenceComplete": True,
+            }
+        )
+        json_write(metadata_path, value)
+        for name in (
+            "clock_correlations.jsonl",
+            "localization_recovery_events.jsonl",
+            "tag_observation_bursts.jsonl",
+        ):
+            (self.segment / name).write_bytes(b"")
+        for name in (
+            "pose_epoch_transitions.jsonl",
+            "corridor_hypotheses.jsonl",
+            "shelf_observation_windows.jsonl",
+            "shelf_loop_events.jsonl",
+        ):
+            (self.segment / name).write_bytes(b"")
+        manifest = build_session_input_manifest(
+            self.segment, self.source_database
+        )
+        self.assertEqual(manifest["version"], 5)
+        self.assertEqual(
+            {
+                item["role"] for item in manifest["files"]
+                if item["role"] in {
+                    "pose_epoch_transitions.jsonl",
+                    "corridor_hypotheses.jsonl",
+                    "shelf_observation_windows.jsonl",
+                    "shelf_loop_events.jsonl",
+                }
+            },
+            {
+                "pose_epoch_transitions.jsonl",
+                "corridor_hypotheses.jsonl",
+                "shelf_observation_windows.jsonl",
+                "shelf_loop_events.jsonl",
+            },
+        )
+
     def test_snapshot_manifest_equals_build_manifest_and_recomputes_bundle(self) -> None:
         snapshot = self.snapshot()
         built = build_session_input_manifest(self.segment, self.source_database)

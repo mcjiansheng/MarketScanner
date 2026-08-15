@@ -87,6 +87,9 @@ struct TagObservationEvidenceObservation: Equatable {
     /// The historical property name is retained internally to avoid a
     /// broad ABI churn; v1 `raw_map_position` is never assigned here.
     var rawPositionM: (Double, Double, Double)?
+    /// Online prior-map estimate written at capture time. It is audit-only:
+    /// final propagation still uses the exact node-local point above.
+    var onlineMapPositionM: (Double, Double)? = nil
     var measurementConfidence: Double
     var localizationState: String
     var localizationConfidence: Double
@@ -128,6 +131,8 @@ struct TagObservationEvidenceObservation: Equatable {
             && lhs.rawPositionM?.0 == rhs.rawPositionM?.0
             && lhs.rawPositionM?.1 == rhs.rawPositionM?.1
             && lhs.rawPositionM?.2 == rhs.rawPositionM?.2
+            && lhs.onlineMapPositionM?.0 == rhs.onlineMapPositionM?.0
+            && lhs.onlineMapPositionM?.1 == rhs.onlineMapPositionM?.1
             && lhs.measurementConfidence == rhs.measurementConfidence
             && lhs.localizationState == rhs.localizationState
             && lhs.localizationConfidence == rhs.localizationConfidence
@@ -207,6 +212,7 @@ private struct StrictTagObservationDTO {
     let alignmentVersionLag: Int
     let alignmentFreshness: String
     let rawPosition: (Double, Double, Double)?
+    let onlineMapPosition: (Double, Double)?
     let hasPlanarPosition: Bool
     let boundNodeID: Int64?
     let boundNodeStamp: Double?
@@ -257,6 +263,7 @@ enum TagObservationEvidenceParser {
         "frame_id", "bound_node_id", "bound_node_stamp",
         "bound_node_map_id", "coordinate_frame",
         "point_in_bound_node_frame", "measurement_height_m",
+        "epoch", "component",
     ]
     private static let rawPositionKeys: Set<String> = ["x_m", "y_m", "height_m"]
     private static let nodeLocalPointKeys: Set<String> = ["x_m", "y_m", "z_m"]
@@ -493,6 +500,7 @@ enum TagObservationEvidenceParser {
                     frameTimestamp: dto.frameTimestamp,
                     nodeTimebaseTimestamp: dto.nodeTimestamp,
                     rawPositionM: nodeLocalPoint,
+                    onlineMapPositionM: dto.onlineMapPosition,
                     measurementConfidence: dto.measurementConfidence,
                     localizationState: dto.localizationState,
                     localizationConfidence: dto.localizationConfidence,
@@ -655,6 +663,7 @@ enum TagObservationEvidenceParser {
         }
 
         var rawPosition: (Double, Double, Double)?
+        var onlineMapPosition: (Double, Double)?
         var hasPlanarPosition = false
         if object.keys.contains("raw_map_position") {
             guard let raw = object["raw_map_position"] as? [String: Any],
@@ -668,6 +677,7 @@ enum TagObservationEvidenceParser {
                 try fail("raw_pose_invalid", .pose)
             }
             hasPlanarPosition = true
+            onlineMapPosition = (xM, yM)
             if raw.keys.contains("height_m") {
                 guard let heightM = bounded(
                     raw["height_m"], -TagObservationEvidenceLimits.maximumRawHeightM,
@@ -742,12 +752,21 @@ enum TagObservationEvidenceParser {
                     try fail("non_depth_node_local_point_forbidden", .pose)
                 }
             }
+            if object.keys.contains("epoch") || object.keys.contains("component") {
+                guard let epoch = StrictJSONScalar.integer(object["epoch"]),
+                      epoch >= 0,
+                      let component = StrictJSONScalar.integer(object["component"]),
+                      component == rawBoundNodeMapID else {
+                    try fail("epoch_component_identity_invalid", .pose)
+                }
+            }
         }
         else {
             let v2OnlyFields = [
                 "bound_node_id", "bound_node_stamp", "bound_node_map_id",
                 "coordinate_frame", "point_in_bound_node_frame",
                 "measurement_height_m",
+                "epoch", "component",
             ]
             guard v2OnlyFields.allSatisfy({ !object.keys.contains($0) }) else {
                 try fail("legacy_record_contains_v2_coordinate_fields", .pose)
@@ -794,6 +813,7 @@ enum TagObservationEvidenceParser {
             alignmentVersionLag: versionLag,
             alignmentFreshness: freshness,
             rawPosition: rawPosition,
+            onlineMapPosition: onlineMapPosition,
             hasPlanarPosition: hasPlanarPosition,
             boundNodeID: boundNodeID,
             boundNodeStamp: boundNodeStamp,

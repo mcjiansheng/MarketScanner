@@ -132,12 +132,33 @@ SESSION_INPUT_ROLE_FILES_BY_VERSION = {
         ("tag_observation_bursts.jsonl", "tag_observation_bursts.jsonl"),
         ("localized_price_tags.json", "localized_price_tags.json"),
     ),
+    5: (
+        ("metadata", "metadata.json"),
+        ("source_database", None),
+        ("clock_correlations.jsonl", "clock_correlations.jsonl"),
+        ("localization_trace.jsonl", "localization_trace.jsonl"),
+        ("localization_constraints.jsonl", "localization_constraints.jsonl"),
+        ("localization_events.jsonl", "localization_events.jsonl"),
+        (
+            "localization_recovery_events.jsonl",
+            "localization_recovery_events.jsonl",
+        ),
+        ("manual_localization_events.jsonl", "manual_localization_events.jsonl"),
+        ("tag_observations.jsonl", "tag_observations.jsonl"),
+        ("tag_observation_bursts.jsonl", "tag_observation_bursts.jsonl"),
+        ("pose_epoch_transitions.jsonl", "pose_epoch_transitions.jsonl"),
+        ("corridor_hypotheses.jsonl", "corridor_hypotheses.jsonl"),
+        ("shelf_observation_windows.jsonl", "shelf_observation_windows.jsonl"),
+        ("shelf_loop_events.jsonl", "shelf_loop_events.jsonl"),
+        ("localized_price_tags.json", "localized_price_tags.json"),
+    ),
 }
 RECOVERY_EVIDENCE_BINDING_BY_SESSION_VERSION = {
     1: RECOVERY_EVIDENCE_UNBOUND_LEGACY,
     2: RECOVERY_EVIDENCE_BOUND_V2,
     3: RECOVERY_EVIDENCE_BOUND_V2,
     4: RECOVERY_EVIDENCE_BOUND_V2,
+    5: RECOVERY_EVIDENCE_BOUND_V2,
 }
 _CANONICAL_SESSION_SIDECAR_FILES = frozenset(
     file_name

@@ -188,6 +188,10 @@ struct Prior
 	double yaw;
 	double translationSigma;
 	double yawSigma;
+	bool anisotropicTranslation = false;
+	double translationInformationXX = 0.0;
+	double translationInformationXY = 0.0;
+	double translationInformationYY = 0.0;
 };
 
 struct RejectedFactorDetail
@@ -345,13 +349,14 @@ std::vector<Prior> loadPriors(const Options & options)
 	}
 	const bool legacyV1 = line == "MarketScannerAbsoluteSE2Priors\t1\t" + options.inputIdentity;
 	const bool uncertaintyV2 = line == "MarketScannerAbsoluteSE2Priors\t2\t" + options.inputIdentity;
-	if(!legacyV1 && !uncertaintyV2) throw std::runtime_error("Absolute-prior header or input identity is invalid.");
+	const bool anisotropicV3 = line == "MarketScannerAbsoluteSE2Priors\t3\t" + options.inputIdentity;
+	if(!legacyV1 && !uncertaintyV2 && !anisotropicV3) throw std::runtime_error("Absolute-prior header or input identity is invalid.");
 	std::set<std::string> ids;
 	while(std::getline(input, line))
 	{
 		if(line.empty()) continue;
 		std::vector<std::string> fields = splitTabs(line);
-		if(fields.size() != (legacyV1?7U:8U)) throw std::runtime_error("Absolute-prior record has the wrong field count.");
+		if(fields.size() != (legacyV1?7U:(anisotropicV3?11U:8U))) throw std::runtime_error("Absolute-prior record has the wrong field count.");
 		if(fields[0].empty() || fields[1].empty() || !ids.insert(fields[0]).second)
 		{
 			throw std::runtime_error("Absolute-prior identifiers must be non-empty and unique.");
@@ -377,6 +382,19 @@ std::vector<Prior> loadPriors(const Options & options)
 			if(prior.translationSigma < 1.0e-4 || prior.translationSigma > 1000.0 ||
 				prior.yawSigma < 1.0e-5 || prior.yawSigma > M_PI)
 				throw std::runtime_error("Absolute-prior uncertainty is outside the safe range.");
+			if(anisotropicV3)
+			{
+				prior.translationInformationXX = parseFinite(fields[8], "prior translation information xx");
+				prior.translationInformationXY = parseFinite(fields[9], "prior translation information xy");
+				prior.translationInformationYY = parseFinite(fields[10], "prior translation information yy");
+				const double determinant = prior.translationInformationXX * prior.translationInformationYY -
+					prior.translationInformationXY * prior.translationInformationXY;
+				if(prior.translationInformationXX <= 0.0 || prior.translationInformationYY <= 0.0 ||
+					determinant <= 1.0e-12 || prior.translationInformationXX > 1.0e8 ||
+					prior.translationInformationYY > 1.0e8)
+					throw std::runtime_error("Absolute-prior anisotropic translation information is invalid.");
+				prior.anisotropicTranslation = true;
+			}
 		}
 		priors.push_back(prior);
 	}
@@ -1106,7 +1124,14 @@ int main(int argc, char ** argv)
 		{
 			const Prior & prior=priors[i];
 			if(poses.find(prior.nodeId)==poses.end()) throw std::runtime_error("Absolute prior references a missing node.");
-				std::array<double,9> information=priorInformation(prior.translationSigma,prior.yawSigma);
+			std::array<double,9> information=priorInformation(prior.translationSigma,prior.yawSigma);
+			if(prior.anisotropicTranslation)
+			{
+				information[0] = prior.translationInformationXX;
+				information[1] = prior.translationInformationXY;
+				information[3] = prior.translationInformationXY;
+				information[4] = prior.translationInformationYY;
+			}
 			cv::Mat full=sixInformation(information);
 			Link link(prior.nodeId,prior.nodeId,Link::kPosePrior,Transform(static_cast<float>(prior.x),static_cast<float>(prior.y),static_cast<float>(prior.yaw)),full);
 			Factor factor; factor.id="prior:"+prior.id; factor.kind=prior.kind; factor.link=link; factor.planarInformation=information;

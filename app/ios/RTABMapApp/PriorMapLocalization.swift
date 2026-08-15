@@ -160,6 +160,7 @@ struct PriorMapPackage {
     let preview: UIImage
     let previewsByFloor: [String: UIImage]
     let packageSha256: String
+    let distanceFieldSha256: String
 
     func preview(floorId: String) -> UIImage {
         return previewsByFloor[floorId] ?? preview
@@ -348,7 +349,9 @@ struct PriorMapPackage {
             fixedStructures: structuresPayload.structures,
             preview: preview,
             previewsByFloor: previewsByFloor,
-            packageSha256: packageSha256)
+            packageSha256: packageSha256,
+            distanceFieldSha256:
+                snapshot.artifactsByName["distance_fields.json"]?.sha256 ?? "")
     }
 }
 
@@ -420,6 +423,13 @@ struct PriorMapLocalizationUpdate: Codable {
     var floorId: String? = nil
     var nodeTimebaseTimestamp: TimeInterval? = nil
     var nodeTimebaseOffsetSeconds: TimeInterval? = nil
+    /// P1-B formal coordinate-epoch and native graph-component identity.
+    /// Legacy trace rows decode nil and are accepted only by manifest v1-v4.
+    var epoch: Int? = nil
+    var component: Int64? = nil
+    var shelfNodePenetrationCount: Int = 0
+    var shelfSegmentCrossingCount: Int = 0
+    var dynamicStructureRejectionCount: Int = 0
 }
 
 private struct PriorMapRoadSegment {
@@ -466,6 +476,7 @@ final class PriorMapStageOneLocalizer {
     private let ambiguityMarginM = 0.35
     private let candidateRadiusM = 3.0
     private let depthSampler = PriorMapDepthSampler()
+    private let dynamicShelfEvidenceFilter = DynamicShelfEvidenceFilter()
     private let matcher: PriorMapScanMatcher
     private let monotonicClock: PriorMapMonotonicClock
     private let confidenceManager = PriorMapConfidenceManager()
@@ -475,6 +486,7 @@ final class PriorMapStageOneLocalizer {
     private let priorMapSha256: String
     private let shelves: [PriorMapShelf]
     private let shelfSegments: [PriorMapShelfSegmentV2]
+    private let shelfPolygons: [[PriorMapPose2D]]
     private let fixedStructures: [PriorMapFixedStructure]
     private var latestFloorEstimate: PriorMapFloorEstimate?
     private(set) var latestEstimatedPose: PriorMapPose2D
@@ -502,6 +514,16 @@ final class PriorMapStageOneLocalizer {
         self.shelves = package.shelves
         self.shelfSegments = package.shelfSegments.filter {
             $0.floorID == floorId
+        }
+        self.shelfPolygons = package.shelves.compactMap { shelf in
+            guard shelf.floorId == floorId,
+                  shelf.geometry.coordinates.count >= 3,
+                  shelf.geometry.coordinates.allSatisfy({ $0.count >= 2 }) else {
+                return nil
+            }
+            return shelf.geometry.coordinates.map {
+                PriorMapPose2D(xM: $0[0], yM: $0[1], yawRad: 0)
+            }
         }
         self.fixedStructures = package.fixedStructures
         guard let distanceFloor = package.distanceFields.floors[floorId] else {
@@ -761,7 +783,28 @@ final class PriorMapStageOneLocalizer {
                 frame: frame,
                 cameraTransform: transform)
             : nil
-        let observation = depthSample?.structureObservation
+        var dynamicStructureRejectionCount = 0
+        let observation: PriorMapStructureObservation?
+        if let rawObservation = depthSample?.structureObservation {
+            let filtered = dynamicShelfEvidenceFilter.filter(
+                localPoints: rawObservation.points.map {
+                    PriorMapPose2D(xM: $0.x, yM: $0.y, yawRad: 0)
+                },
+                mapPose: rawPose,
+                timestamp: timestamp,
+                authoritativeShelfPolygons: shelfPolygons)
+            dynamicStructureRejectionCount = filtered.rejectedCount
+            observation = PriorMapStructureObservation(
+                points: filtered.points.map { SIMD2<Double>($0.xM, $0.yM) },
+                validPointCount: filtered.points.count,
+                coverageAngleRad: rawObservation.coverageAngleRad,
+                floorEstimate: rawObservation.floorEstimate,
+                source: dynamicStructureRejectionCount > 0
+                    ? rawObservation.source + "+temporal_static_filter"
+                    : rawObservation.source)
+        } else {
+            observation = nil
+        }
         var recoveryFrameDisposition: PriorMapRecoveryFrameDisposition =
             trackingState == "normal"
                 ? (depthSample?.recoveryFrameDisposition
@@ -825,6 +868,9 @@ final class PriorMapStageOneLocalizer {
         var correctionTarget: PriorMapPose2D?
         var geometryCandidate = false
         var geometryAndSafetyAccepted = false
+        var penetrationAudit = ShelfPenetrationAudit(
+            nodeInsideShelfCount: 0,
+            segmentCrossingCount: 0)
         if let best = hypothesis?.candidate,
            let mapFromArkit = hypothesis?.mapFromArkit {
             // Reconstruct the target from the smoothed global alignment. The
@@ -843,11 +889,17 @@ final class PriorMapStageOneLocalizer {
             geometryCandidate = best.cost <= 0.10
                 && (match?.effectivePointCount ?? 0) >= 45
                 && (observation?.coverageAngleRad ?? 0) >= 0.35
+            penetrationAudit = ShelfFreeSpaceAuditor.audit(
+                previous: latestEstimatedPose,
+                current: targetPose,
+                shelfPolygons: shelfPolygons)
             geometryAndSafetyAccepted = geometryCandidate
                 && PriorMapCorrectionSafety.isWithinGate(
                     current: rawPose,
                     target: targetPose,
                     recoverySearch: recoverySearch)
+                && penetrationAudit.nodeInsideShelfCount == 0
+                && penetrationAudit.segmentCrossingCount == 0
         }
         let residualCost = match?.candidates.first?.cost ?? 0.15
         let recoveryReduction = PriorMapRecoveryUpdateReducer.reduce(
@@ -983,6 +1035,9 @@ final class PriorMapStageOneLocalizer {
             decision.recoveryConvergedThisUpdate
         update.confidenceAccepted = decision.confidenceAccepted
         update.constraintDisposition = decision.constraintDisposition
+        update.shelfNodePenetrationCount = penetrationAudit.nodeInsideShelfCount
+        update.shelfSegmentCrossingCount = penetrationAudit.segmentCrossingCount
+        update.dynamicStructureRejectionCount = dynamicStructureRejectionCount
         update.postRecoveryTrustedLocalFrames =
             confidenceManager.postRecoveryTrustedLocalFrames
         update.scanSearchPerformed = match?.searchPerformed ?? false
@@ -1090,6 +1145,7 @@ final class PriorMapStageOneLocalizer {
         latestPhase = .manualCorrection
         latestConfidence = 0.35
         depthSampler.reset()
+        dynamicShelfEvidenceFilter.reset()
         if recoveryController.activeEpisode != nil {
             _ = finishRecovery(
                 outcome: .manualReset,
@@ -1123,6 +1179,7 @@ final class PriorMapStageOneLocalizer {
         boundNodeID: Int64,
         boundNodeStamp: TimeInterval,
         boundNodeMapID: Int32,
+        capturePoseEpoch: Int,
         openGLWorldFromNode: simd_float4x4
     ) -> PriceTagLocalizedFrameResult {
         let snapshot = detection.alignmentSnapshot
@@ -1208,7 +1265,7 @@ final class PriorMapStageOneLocalizer {
         else {
             pointInBoundNodeFrame = nil
         }
-        let observation = PriorMapTagObservationRecord(
+        var observation = PriorMapTagObservationRecord(
             format: "MarketScannerPriceTagObservation",
             version: 2,
             observationId: detection.observationId,
@@ -1250,6 +1307,8 @@ final class PriorMapStageOneLocalizer {
             coordinateFrame: "RTABMAP_BOUND_NODE_LOCAL",
             pointInBoundNodeFrame: pointInBoundNodeFrame,
             measurementHeightM: measurement.rawMapPosition?.heightM)
+        observation.epoch = capturePoseEpoch
+        observation.component = Int64(boundNodeMapID)
         return PriceTagLocalizedFrameResult(
             observation: observation,
             association: localized)
@@ -2285,6 +2344,7 @@ final class PriorMapLiveMapView: UIView {
     private let previewView = UIImageView()
     private let statusLabel = UILabel()
     private let evidenceWarningLabel = UILabel()
+    private let shelfConfidenceWarningLabel = UILabel()
     private let roadLabel = UILabel()
     private let diagnosticsButton = UIButton(type: .system)
     private let diagnosticsLabel = UILabel()
@@ -2334,6 +2394,10 @@ final class PriorMapLiveMapView: UIView {
         evidenceWarningLabel.textColor = .systemRed
         evidenceWarningLabel.numberOfLines = 0
         evidenceWarningLabel.isHidden = true
+        shelfConfidenceWarningLabel.font = .preferredFont(forTextStyle: .caption1)
+        shelfConfidenceWarningLabel.textColor = .systemOrange
+        shelfConfidenceWarningLabel.numberOfLines = 0
+        shelfConfidenceWarningLabel.isHidden = true
         roadLabel.font = .preferredFont(forTextStyle: .caption1)
         roadLabel.textColor = .secondaryLabel
         roadLabel.numberOfLines = 2
@@ -2357,6 +2421,7 @@ final class PriorMapLiveMapView: UIView {
             arrangedSubviews: [
                 statusLabel,
                 evidenceWarningLabel,
+                shelfConfidenceWarningLabel,
                 roadLabel,
                 diagnosticsButton,
                 diagnosticsLabel,
@@ -2384,6 +2449,14 @@ final class PriorMapLiveMapView: UIView {
     func showEvidenceWriteFailure(_ message: String) {
         evidenceWarningLabel.text = message
         evidenceWarningLabel.isHidden = false
+    }
+
+    func updateShelfTrackingDecision(_ decision: ShelfTrackingDecision) {
+        shelfConfidenceWarningLabel.isHidden = decision.state != .lowConfidence
+        shelfConfidenceWarningLabel.text = decision.state == .lowConfidence
+            ? "定位置信度低，建议核对位置（扫描继续）" : nil
+        accessibilityValue = decision.state == .lowConfidence
+            ? "定位置信度低，建议核对位置" : nil
     }
 
     @objc private func toggleDiagnostics() {

@@ -1344,9 +1344,16 @@ function drawLocalizedReview() {
       else context.moveTo(projected[0], projected[1]);
     });
     if (geometryType === "polygon") context.closePath();
-    context.strokeStyle = cssColor("--structure", "#343b40");
-    context.globalAlpha = 0.55;
-    context.lineWidth = Math.max(1, ratio);
+    const isRoadHelper = element.role === "road"
+      || element.shape_type === "MapCross"
+      || element.shape_type === "MapRoadPoint";
+    context.strokeStyle = isRoadHelper
+      ? cssColor("--road-helper", "#8fbcd4")
+      : cssColor("--structure", "#343b40");
+    context.globalAlpha = isRoadHelper ? 0.32 : 0.55;
+    context.lineWidth = isRoadHelper
+      ? Math.max(0.65, ratio * 0.65)
+      : Math.max(1, ratio);
     context.stroke();
   });
   context.globalAlpha = 1;

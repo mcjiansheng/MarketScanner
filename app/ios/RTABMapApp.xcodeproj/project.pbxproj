@@ -62,6 +62,7 @@
 		4EA700012F60002000100001 /* SessionSnapshotTransaction.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60002000100002 /* SessionSnapshotTransaction.swift */; };
 		4EA700012F60002000A00001 /* ImmutableDirectoryPublication.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60002000A00002 /* ImmutableDirectoryPublication.swift */; };
 		4EA700012F60002100100001 /* ShelfAssociationEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60002100100002 /* ShelfAssociationEngine.swift */; };
+		4EA700012F60003200100001 /* ShelfLocalizationEvidence.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60003200100002 /* ShelfLocalizationEvidence.swift */; };
 		4EA700012F60002200100001 /* TagObservationResolver.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60002200100002 /* TagObservationResolver.swift */; };
 		4EA700012F60002300100001 /* MobileResultExporter.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60002300100002 /* MobileResultExporter.swift */; };
 		4EA700012F60002400100001 /* MobileWorksheets.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA700012F60002400100002 /* MobileWorksheets.swift */; };
@@ -246,6 +247,7 @@
 		4EA700012F60002000100002 /* SessionSnapshotTransaction.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = SessionSnapshotTransaction.swift; path = RTABMapApp/MobilePostProcessing/SessionSnapshotTransaction.swift; sourceTree = "<group>"; };
 		4EA700012F60002000A00002 /* ImmutableDirectoryPublication.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = ImmutableDirectoryPublication.swift; path = RTABMapApp/MobilePostProcessing/ImmutableDirectoryPublication.swift; sourceTree = "<group>"; };
 		4EA700012F60002100100002 /* ShelfAssociationEngine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = ShelfAssociationEngine.swift; path = RTABMapApp/MobilePostProcessing/ShelfAssociationEngine.swift; sourceTree = "<group>"; };
+		4EA700012F60003200100002 /* ShelfLocalizationEvidence.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = ShelfLocalizationEvidence.swift; path = RTABMapApp/MobilePostProcessing/ShelfLocalizationEvidence.swift; sourceTree = "<group>"; };
 		4EA700012F60002200100002 /* TagObservationResolver.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = TagObservationResolver.swift; path = RTABMapApp/MobilePostProcessing/TagObservationResolver.swift; sourceTree = "<group>"; };
 		4EA700012F60002300100002 /* MobileResultExporter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = MobileResultExporter.swift; path = RTABMapApp/MobileResults/MobileResultExporter.swift; sourceTree = "<group>"; };
 		4EA700012F60002400100002 /* MobileWorksheets.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = MobileWorksheets.swift; path = RTABMapApp/MobileResults/MobileWorksheets.swift; sourceTree = "<group>"; };
@@ -533,6 +535,7 @@
 				4EA700012F60002300100002 /* MobileResultExporter.swift */,
 				4EA700012F60002200100002 /* TagObservationResolver.swift */,
 				4EA700012F60002100100002 /* ShelfAssociationEngine.swift */,
+				4EA700012F60003200100002 /* ShelfLocalizationEvidence.swift */,
 				4EA700012F60002000100002 /* SessionSnapshotTransaction.swift */,
 				4EA700012F60002000A00002 /* ImmutableDirectoryPublication.swift */,
 				4EA700012F60003000100002 /* AbsolutePriorEvidenceParser.swift */,
@@ -1018,6 +1021,7 @@
 				4EA700012F60002300100001 /* MobileResultExporter.swift in Sources */,
 				4EA700012F60002200100001 /* TagObservationResolver.swift in Sources */,
 				4EA700012F60002100100001 /* ShelfAssociationEngine.swift in Sources */,
+				4EA700012F60003200100001 /* ShelfLocalizationEvidence.swift in Sources */,
 				4EA700012F60002000100001 /* SessionSnapshotTransaction.swift in Sources */,
 				4EA700012F60002000A00001 /* ImmutableDirectoryPublication.swift in Sources */,
 				4EA700012F60003000100001 /* AbsolutePriorEvidenceParser.swift in Sources */,

@@ -1,6 +1,6 @@
 # 已有地图辅助扫描数据格式
 
-> 文档状态：**当前有效**。最后核对日期：2026-08-15。
+> 文档状态：**当前有效**。最后核对日期：2026-08-16。
 
 ## 会话元数据
 
@@ -189,11 +189,22 @@ performance/
 
 P7R2 的 hypothesis 统一跟踪全局 `T_map_from_arkit`，而不是手机自身坐标下的局部平移。对 ARKit 水平位姿 `A=(R_a,t_a)` 与候选地图位姿 `C=(R_c,t_c)`，记录的变换满足 `M=C×inverse(A)`：`theta=normalize(yaw_c-yaw_a)`、`t_m=t_c-R(theta)t_a`，且 `apply(M,A)` 必须重建 `C`。`mapFromArkitX/Y/YawDeg` 是所选 track 的平滑全局变换；`selectedHypothesisId` 只在本次 tracker 生命周期内稳定；active count 上限 8；best/second cost 对应当前排名前两条活动 track；reason 与 tracker elapsed 用于解释歧义和性能。无活动 hypothesis 时可选字段省略。以上是 version 1 的向后兼容附加诊断字段，不改变现有必填业务 schema；旧 reader 可忽略，最终证据校验仍要求原有身份、时间和 pose 字段。
 
-P7R3 把宽搜索改为显式 Recovery episode。`inactive -> active -> converged | timed_out | cancelled | manual_reset`；新 episode 开始时清空 hypothesis track，但保留已应用的 `T_map_from_arkit` anchor，因此 HUD 不会因触发 Recovery 瞬移。Recovery trust 的 `hypothesisSupportFrames`/`recoveryFreshSupportFrames` 只包含本 episode 的新观测，至少 4 帧；local lifetime support 不得参与。预算为最多 40 次有效 matcher search 和 30 秒 wall clock，只有 tracking normal、observation 非空且 matcher 有至少 30 个 effective points 时才增加 attempt；throttle、busy、limited/no-depth/nil/undersized observation 不消耗 attempt。所有 outcome 都清除宽搜索 tracks，已安全应用的 0.35 m/8° bounded anchor 保留。
+P7R3 把宽搜索改为显式 Recovery episode。`inactive -> active -> converged | timed_out | cancelled | manual_reset`；新 episode 开始时清空 hypothesis track，但保留已应用的 `T_map_from_arkit` anchor，因此 HUD 不会因触发 Recovery 瞬移。Recovery trust 的 `hypothesisSupportFrames`/`recoveryFreshSupportFrames` 只包含本 episode 的新观测，至少 4 帧；local lifetime support 不得参与。预算为最多 40 次有效 matcher search 和 30 秒 wall clock，只有 tracking normal、observation 非空且 matcher 有至少 30 个 effective points 时才增加 attempt；throttle、busy、limited/no-depth/nil/undersized observation 不消耗 attempt。所有 outcome 都清除宽搜索 tracks；2026-08-15 冻结规格将已应用 anchor 的平移单步上限收紧为 0.25 m，角度上限仍为 8°。
 
 `localization_trace` v1 继续用向后兼容可选字段记录 `recoveryEpisodeId/recoveryReason/recoveryOutcome/recoveryValidAttemptCount/recoveryRemainingValidAttempts/recoveryElapsedMs/recoveryFreshSupportFrames/recoveryTriggerCount`。active 记录使用 `recoveryOutcome=active`；结束该 episode 的记录使用终态字符串。数值均为有限小标量，不保存结构点；旧 reader 可忽略这些字段。
 
-可靠 RTAB-Map 回环还会在普通 `scan_events.jsonl` 写 `loop_opened_shelf_identity_candidates`。它包含 `authority=diagnostic_only_not_localization_factor`、候选来源、`identity_status`、最多 5 个 `shelf_segment_ids/shelf_codes/distances_m/longitudinal_fractions`。这些候选来自回环触发 recovery 前的最新估计位置邻域，仅用于证明“哪些具体货架仍可能”并保留多解；它不是正式定位 sidecar、没有局部结构快照或 phone↔shelf SE(2)，不能改变 alignment、constraint、trajectory 或发布资格。session input manifest v4 已由扫描期时钟证据占用；后续只有在未来 manifest v5 绑定结构窗口和 exact node 后，才能考虑把经多帧/回环确认的货架身份升级为正式因子。
+可靠 RTAB-Map 回环仍会在 `scan_events.jsonl` 写可读诊断摘要；正式 authority 已迁移到 manifest v5 的 `shelf_observation_windows.jsonl` 与 `shelf_loop_events.jsonl`。只有 exact node 区间、同 component、同 epoch 或正式 bridge、两侧法向 >120°、phone↔shelf 相对 SE(2) 差异不超过 0.5 m/10°、inlier ≥70% 且动态证据不主导时，loop 才可写 `accepted=true` 并进入 PC shelf-face 因子。C-1/C-2/C-3 数值必须随记录保留 `CALIBRATION_PENDING`，不得表述为现场冻结值。
+
+## Manifest v5 通道/货架证据
+
+- `pose_epoch_transitions.jsonl`：相邻 epoch、前后 exact node、有限 SE(2) 变换和可选正式 bridge evidence；跨 epoch loop 没有完整 bridge 链时不得接受。
+- `corridor_hypotheses.jsonl`：exact node/map/component/epoch、bounded top-K、top1/top2 margin、点/扫掠线段穿架计数和沿轴/横轴/yaw covariance。
+- `shelf_observation_windows.jsonl`：exact node/time range、component/epoch、left/right、地图法向、bounded shelf candidates、覆盖角、端头可见、动态剔除计数、prior-map 与 distance-field SHA。
+- `shelf_loop_events.jsonl`：两个窗口、具体 shelf segment、RTAB loop 身份/残差、phone↔shelf SE(2)、一致性指标、接受结果/原因和标定状态。
+
+四个文件允许 0 行但必须存在；严格 UTF-8 JSONL、无空行、末行换行、未知字段拒绝、sequence/write_watermark 从 1 连续增长。metadata 同时声明四个文件及 exact count/last-sequence、`shelfLocalizationEvidenceComplete=true` 和 `shelfLocalizationCalibrationStatus=CALIBRATION_PENDING`。manifest v5 的 trace 和 tag observation v2 必须逐记录携带 epoch/component；v1-v4 继续只读兼容但没有 formal shelf-loop authority。
+
+PC native helper 的 `MarketScannerAbsoluteSE2Priors` 在存在 shelf-face 因子时使用 version 3：保留 v2 的 target pose、平移 sigma 和 yaw sigma，并新增平移信息矩阵 `Ixx/Ixy/Iyy`。普通先验仍写等方差矩阵；shelf-face 以货架面法向 0.5 m、沿架 3 m 初始不确定度构造各向异性矩阵，因此只强约束法向和相对 yaw，不把长货架轴向位置伪装成厘米级真值。该 3 m 沿轴值随 C-1 保持 `CALIBRATION_PENDING`；v1/v2 prior 文件继续可读。
 
 `timestamp` 保留原始 `ARFrame.timestamp`（设备单调时钟）；RTAB‑Map 的 `CameraMobile` 在写 `Node.stamp` 前会加 `stampEpochOffset`。因此所有当前定位 sidecar 同时保存 `nodeTimebaseTimestamp = timestamp + nodeTimebaseOffsetSeconds`，PC 只用换算后的 node timebase 绑定 SQLite node，并严格复算该等式。offset 由 native camera 原子读取；尚未初始化或非有限时该记录拒绝落盘，不能直接拿原始 ARFrame 时间与 epoch node stamp 比较。
 
@@ -215,7 +226,7 @@ Swift 与 PC reader 统一要求 correlation uptime、correlation UTC、binding 
 
 只有至少 3 个逐帧 `algorithmCandidateReliable=true`、`needsReview=false` 的独立 observation 共同指向同一 `shelfSegmentId + side`，UI 才能提供可靠确认。确认提交使用一次性 capture authority，并在同一 session writer 事务中重新核对 workflow、required-write health、tracking session、prior-map ID/SHA-256、floor、capture ID 和 verified burst frame set；取消先于 claim 时不写，claim 先于取消时已接受的提交继续由持久化回调收口。
 
-手机结果 `FinalPriceTag.quality_status` 为三态：`ACCEPTED` 表示所有自动质量门通过；`LOW_CONFIDENCE` 表示 observation↔burst、tracking/map identity、exact `boundNodeID/stamp/map_id` 和 node-local 可重算位置权威完整，但 recovering/weak、深度、node uncertainty、离散度或货架关联不足以自动批准；`RESCAN_REQUIRED` 仅用于完整 burst、身份/图质量、exact node、node-local point、measurement method 或可解析位置等权威条件缺失。`LOW_CONFIDENCE` 必须保留在 PriceTags 和质量报告中。手机与 PC 均按 `P_final = T_final_node × P_node` 使用 exact node O(1) 重投影，不允许 nearest-time fallback，也不允许对已经在 prior-map frame 的 `raw_map_position` 再应用 raw-node inverse。历史 observation v1 只保留条码/业务身份并产生 `legacy_tag_coordinate_frame_rescan_required`，不得输出可发布地图坐标。
+手机结果 `FinalPriceTag.quality_status` 为三态：`ACCEPTED` 表示所有自动质量门通过；`LOW_CONFIDENCE` 表示 observation↔burst、tracking/map identity、exact `boundNodeID/stamp/map_id` 和 node-local 可重算位置权威完整，但 recovering/weak、深度、node uncertainty、离散度或货架关联不足以自动批准；`RESCAN_REQUIRED` 仅用于完整 burst、身份/图质量、exact node、node-local point、measurement method 或可解析位置等权威条件缺失。`LOW_CONFIDENCE` 必须保留在 PriceTags 和质量报告中。手机与 PC 均按 `P_final = T_final_node × P_node` 使用 exact node O(1) 重投影，不允许 nearest-time fallback，也不允许对已经在 prior-map frame 的 `raw_map_position` 再应用 raw-node inverse。手机 `MarketScannerFinalTags` version 2 与 PriceTags 工作表保留 online/raw、optimized、shelf-projected 三类平面坐标、法向投影残差和纵向段内标记；兼容字段 `map_x_m/map_y_m` 对可发布价签必须等于 shelf-projected。历史 observation v1 只保留条码/业务身份并产生 `legacy_tag_coordinate_frame_rescan_required`，不得输出可发布地图坐标。
 
 手机 result manifest 的 `coordinate_contract_version=2` 同时记录 `coordinate_frame_audit_passed` 和 `legacy_tag_coordinate_frame_count`。`COMPLETE/publish_permitted=true` 仅在地图坐标权威、图质量 PASS、零 degradation、coordinate audit PASS、零 legacy、零 `LOW_CONFIDENCE`、零 unpositioned、零 unassociated、零 rescan 时成立；immutable result reader 与任务恢复重复验证。历史 coordinate contract v1 只允许作为不可发布复核工件。
 
@@ -280,7 +291,7 @@ localized/
 
 `optimized_map_trajectory.geojson` 的 `rtabmap_optimized`、`prior_map_offline_optimized` 和可用时的 `online_localization` feature properties 均保存 `timestamps`、`node_ids` 与同长度 `yaws_rad`。`yaws_rad` 是对应地图 gauge 下的手机朝向；道路切线仅表示移动方向，不能代替手机 yaw。任何坐标、时间、node ID、yaw 长度不一致或非有限值都使校准坐标导出拒绝执行。
 
-helper 可用且所有门通过时 `solver.type=relative_se2_factor_graph`、`full_factor_graph=true`；helper 缺失或失败时仍写报告，但回退为 `bounded_correction_field` draft，`published_capable=false`。长会话的最终复核路线可使用 `solver.type=gauge_neutral_free_space_road_route`：native factor graph 报告继续保留，`full_factor_graph=false`、`published_capable=false`，`continuity_gate_authority=gauge_neutral_free_space_road_route`，旧 correction-field gradient 只作诊断。旧 version manifest v1/v2 可继续只读解析；含 factor report、但还没有不可变业务表的历史 draft/review 使用 version manifest v3。当前 draft/review 将四个核心业务表和 `calibrated_deliverables_manifest.json` 纳入 exact file/hash tree，使用 version manifest v5；正式 publication 再把 exact Field Evidence v3 和 qualification manifest 纳入同一 hash tree，使用 version manifest v6。Field Evidence v3 的 `MarketScannerQualificationSourceBundle` v1 保存 exact plan/release/policy，`MarketScannerTrajectorySourceBundle` v1 保存 version manifest 与选定 source artifact bytes，`MarketScannerFieldRunInputBundle` v1 保存 exact 控制点 CSV 与 Device Evidence bytes；发布检查从这些 bytes 重新派生摘要。Field v3 stable-read 上限 128 MiB，单个 CSV/Device Evidence 各 16 MiB；Windows descriptor 使用 `O_BINARY` 保留包括 CRLF 在内的磁盘原始字节；路径元数据和已打开 descriptor/Windows handle 元数据只在各自 API 内做读取前后比较，避免跨 API 表示差异误拒绝；主 descriptor 在读取前后的同类 path descriptor 身份绑定完成前保持打开，因此路径替换、临时替换后恢复、descriptor 内容变化和部分读取继续失败关闭；v6 resolve 不允许回退到外部绝对 evidence 路径。
+helper 可用且所有门通过时 `solver.type=relative_se2_factor_graph`、`full_factor_graph=true`；helper 缺失或失败时仍写报告，但回退为 `bounded_correction_field` draft，`published_capable=false`。长会话 corridor route 是 full graph 之后的正式自洽验证/修正层，不再把一次成功匹配强制改回 `full_factor_graph=false/published_capable=false`；低置信 route、结构内点、穿架段、拓扑断裂、非物理步长、>5% 尺度偏差或 >0.5 m 修正梯度仍 fail-closed。价签输出保留 `online/raw_map_position`、`optimized_map_position`、`shelf_projected_map_position`；发布坐标必须等于 shelf-projected，法向残差 ≤0.5 m 且纵向位于长边范围内。旧 version manifest v1/v2 可继续只读解析；含 factor report、但还没有不可变业务表的历史 draft/review 使用 version manifest v3。当前 draft/review 将四个核心业务表和 `calibrated_deliverables_manifest.json` 纳入 exact file/hash tree，使用 version manifest v5；正式 publication 使用 version manifest v6。
 
 不可变 localized version 自身就是核心业务成果权威，包含：
 

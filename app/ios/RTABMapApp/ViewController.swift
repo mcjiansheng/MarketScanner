@@ -45,6 +45,36 @@ private struct PendingManualPriorMapPoseRequest {
     let completion: (PriorMapManualPoseSubmissionOutcome) -> Void
 }
 
+private struct PendingPoseEpochTransition {
+    let fromEpoch: Int
+    let toEpoch: Int
+    let beforeFrameTimestamp: TimeInterval
+    let afterFrameTimestamp: TimeInterval
+    let beforeNodeID: Int64
+    let transform: ShelfEvidenceTransform
+    let reason: String
+}
+
+private struct PendingShelfObservationWindow {
+    let shelfSegmentID: String
+    let side: String
+    let faceNormal: ShelfFaceNormal
+    let epoch: Int
+    let component: Int64
+    let startNodeID: Int64
+    let startTimestamp: TimeInterval
+    var endNodeID: Int64
+    var endTimestamp: TimeInterval
+    var sampleCount: Int
+    var maximumCoverageAngleRad: Double
+    var dynamicRejectionCount: Int
+    var phonePoseXSum: Double
+    var phonePoseYSum: Double
+    var phonePoseSinYawSum: Double
+    var phonePoseCosYawSum: Double
+    var phonePoseSampleCount: Int
+}
+
 class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIPickerViewDataSource, UIPickerViewDelegate, CLLocationManagerDelegate, UIDocumentPickerDelegate {
     
     private let session = ARSession()
@@ -234,6 +264,19 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
     /// ARKit coordinate discontinuity is rebased so audit logs can distinguish
     /// a continuous accepted trajectory from a new raw sensor coordinate era.
     private var mCapturePoseEpoch: UInt64 = 1
+    private var pendingPoseEpochTransition: PendingPoseEpochTransition?
+    private var poseEpochTransitionSequence = 0
+    private var shelfTrackingStateMachine = ShelfTrackingStateMachine()
+    private var corridorHypothesisSequence = 0
+    private var lastCorridorHypothesisNodeID: Int64?
+    private var recentShelfTrackingDegradationCount = 0
+    private var pendingShelfObservationWindow: PendingShelfObservationWindow?
+    private var shelfObservationWindowSequence = 0
+    private var recentShelfObservationWindows:
+        [String: [ShelfObservationWindowRecord]] = [:]
+    private var recentShelfWindowRelativePoses:
+        [String: ShelfPhoneRelativePose] = [:]
+    private var shelfLoopEventSequence = 0
     private let mMapCorrectionLock = NSLock()
     private var mMapToOdomCorrection = matrix_identity_float4x4
     private var mLastAcceptedARPose: simd_float4x4?
@@ -260,6 +303,7 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
     private let mReliableLoopMinimumNodeSpan = 50
     private var mReliableLoopClosures = 0
     private var mLastReliableLoopClosureDistance: Float = 0
+    private var mCurrentDistanceTravelled: Float = 0
     private var mLastLoopHealthGuidanceAt: TimeInterval = 0
     private var mLastNotifiedLoopClosureSignature = ""
     private var mLastMapCorrectionTranslationM = 0.0
@@ -1004,6 +1048,7 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
             loopClosureTargetId > 0 &&
             (loopClosureType == 1 || loopClosureType == 2) &&
             loopNodeSpan >= mReliableLoopMinimumNodeSpan
+        mCurrentDistanceTravelled = distanceTravelled
         
         var loopHealthGuidance: String?
         if(loopClosureId > 0)
@@ -1210,13 +1255,24 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                             else {
                                 identityStatus = "ambiguous_top_k_retained"
                             }
+                            if let scanSession = self.supermarketSession {
+                                _ = self.persistShelfLoopEvent(
+                                    shelfCandidates: shelfCandidates,
+                                    scanSession: scanSession,
+                                    loopFromNode: loopClosureCurrentId,
+                                    loopToNode: loopClosureTargetId,
+                                    rtabLoopID: loopClosureId,
+                                    rtabLoopResidualM: Double(max(
+                                        0, optimizationMaxError)),
+                                    inlierRatio: loopInlierRatio)
+                            }
                             self.supermarketSession?.appendScanEvent(
                                 level: shelfCandidates.count == 1
                                     ? "info" : "warning",
                                 event: "loop_opened_shelf_identity_candidates",
                                 message: "Reliable RTAB-Map loop opened bounded recovery; pose-neighborhood shelf top-K candidates were retained for later structure disambiguation",
                                 fields: [
-                                    "authority": "diagnostic_only_not_localization_factor",
+                                    "authority": "manifest_v5_shelf_loop_candidate",
                                     "candidate_source": "latest_estimated_pose_before_post_loop_structure_search",
                                     "identity_status": identityStatus,
                                     "candidate_count": "\(shelfCandidates.count)",
@@ -2084,11 +2140,91 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
     {
         mARPoseCorrection = matrix_identity_float4x4
         mCapturePoseEpoch = 1
+        pendingPoseEpochTransition = nil
+        poseEpochTransitionSequence = 0
+        shelfTrackingStateMachine = ShelfTrackingStateMachine()
+        corridorHypothesisSequence = 0
+        lastCorridorHypothesisNodeID = nil
+        recentShelfTrackingDegradationCount = 0
+        pendingShelfObservationWindow = nil
+        shelfObservationWindowSequence = 0
+        recentShelfObservationWindows.removeAll()
+        recentShelfWindowRelativePoses.removeAll()
+        shelfLoopEventSequence = 0
         mLastAcceptedARPose = nil
         mLastAcceptedARTimestamp = nil
         mTrackingWasDegraded = true
         mConsecutiveNormalTrackingFrames = 0
         mLastTrackingGuidanceAt = 0
+    }
+
+    private func preparePoseEpochTransition(
+        fromEpoch: UInt64,
+        beforeFrameTimestamp: TimeInterval,
+        afterFrameTimestamp: TimeInterval,
+        transform: simd_float4x4,
+        reason: String
+    ) {
+        guard activeScanConfiguration.workflowMode == .priorMapLocalized,
+              let beforeNodeID = priorMapLastNodeBinding?.nodeId,
+              beforeNodeID > 0,
+              fromEpoch < UInt64(Int.max),
+              mCapturePoseEpoch < UInt64(Int.max) else {
+            supermarketSession?.appendScanEvent(
+                level: "error",
+                event: "pose_epoch_transition_identity_unavailable",
+                message: "Pose epoch changed before an exact prior node could be bound",
+                fields: ["reason": reason])
+            return
+        }
+        let horizontal = PriorMapStageOneMath.arkitHorizontalPose(
+            positionX: Double(transform.columns.3.x),
+            positionZ: Double(transform.columns.3.z),
+            forwardX: Double(-transform.columns.2.x),
+            forwardZ: Double(-transform.columns.2.z))
+        pendingPoseEpochTransition = PendingPoseEpochTransition(
+            fromEpoch: Int(fromEpoch),
+            toEpoch: Int(mCapturePoseEpoch),
+            beforeFrameTimestamp: beforeFrameTimestamp,
+            afterFrameTimestamp: afterFrameTimestamp,
+            beforeNodeID: Int64(beforeNodeID),
+            transform: ShelfEvidenceTransform(
+                dxM: horizontal.xM,
+                dyM: horizontal.yM,
+                dyawRad: horizontal.yawRad),
+            reason: reason)
+    }
+
+    private func persistPendingPoseEpochTransition(
+        afterNodeID: Int64,
+        scanSession: SupermarketScanSession,
+        trackingSessionID: String
+    ) {
+        guard let pending = pendingPoseEpochTransition,
+              afterNodeID > 0,
+              afterNodeID != pending.beforeNodeID else { return }
+        let sequence = poseEpochTransitionSequence + 1
+        let record = PoseEpochTransitionRecord(
+            format: PoseEpochTransitionRecord.formatName,
+            version: ShelfLocalizationPolicy.contractVersion,
+            trackingSessionID: trackingSessionID,
+            sequence: sequence,
+            fromEpoch: pending.fromEpoch,
+            toEpoch: pending.toEpoch,
+            beforeFrameTimestamp: pending.beforeFrameTimestamp,
+            afterFrameTimestamp: pending.afterFrameTimestamp,
+            beforeNodeID: pending.beforeNodeID,
+            afterNodeID: afterNodeID,
+            transform: pending.transform,
+            bridgeEvidence: [],
+            reason: pending.reason,
+            writeWatermark: sequence)
+        if scanSession.appendPoseEpochTransition(
+            record,
+            expectedTrackingSessionId: trackingSessionID) {
+            poseEpochTransitionSequence = sequence
+        }
+        pendingPoseEpochTransition = nil
     }
 
     private func resetSupermarketScanQualityAdvisors()
@@ -2325,10 +2461,17 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                 // subsequent relative motion.
                 if recoveredTrackingThisFrame,
                    distance > 0.35 || rotation > 20.0 {
+                    let previousEpoch = mCapturePoseEpoch
                     mARPoseCorrection = simd_mul(
                         previousPose,
                         simd_inverse(rawPose))
                     mCapturePoseEpoch &+= 1
+                    preparePoseEpochTransition(
+                        fromEpoch: previousEpoch,
+                        beforeFrameTimestamp: previousTimestamp,
+                        afterFrameTimestamp: frame.timestamp,
+                        transform: mARPoseCorrection,
+                        reason: "tracking_recovery_epoch_rebase")
                     supermarketSession?.recordMappingFrameQuality(
                         accepted: false,
                         rejectionReason: "tracking_recovery_epoch_rebase",
@@ -2366,8 +2509,15 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                     || rotation > rotationLimit
                     || impossibleLinearSpeed
                     || impossibleAngularSpeed {
+                    let previousEpoch = mCapturePoseEpoch
                     mARPoseCorrection = simd_mul(previousPose, simd_inverse(rawPose))
                     mCapturePoseEpoch &+= 1
+                    preparePoseEpochTransition(
+                        fromEpoch: previousEpoch,
+                        beforeFrameTimestamp: previousTimestamp,
+                        afterFrameTimestamp: frame.timestamp,
+                        transform: mARPoseCorrection,
+                        reason: "arkit_world_rebuild")
                     supermarketSession?.recordMappingFrameQuality(
                         accepted: false,
                         rejectionReason: "pose_discontinuity",
@@ -3349,6 +3499,370 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         }
     }
 
+    @discardableResult
+    private func persistCorridorHypotheses(
+        update: PriorMapLocalizationUpdate,
+        binding: RTABMapNodeBindingSnapshot,
+        scanSession: SupermarketScanSession,
+        trackingSessionID: String,
+        epoch: Int,
+        component: Int64
+    ) -> Bool {
+        let nodeID = Int64(binding.nodeId)
+        if lastCorridorHypothesisNodeID == nodeID { return true }
+        let limitedCandidates = Array(update.roadCandidates.prefix(
+            ShelfLocalizationPolicy.maximumCorridorHypotheses))
+        var hypotheses: [CorridorHypothesisEvidence] = limitedCandidates.map {
+            candidate in
+            let score = max(0.0, 1.0 - candidate.distanceM / 3.0)
+            return CorridorHypothesisEvidence(
+                corridorID: candidate.edgeId,
+                score: score)
+        }
+        hypotheses.sort { lhs, rhs in
+            if lhs.score == rhs.score {
+                return lhs.corridorID < rhs.corridorID
+            }
+            return lhs.score > rhs.score
+        }
+        let relativeMargin: Double
+        if hypotheses.count >= 2 {
+            relativeMargin = max(
+                0,
+                (hypotheses[0].score - hypotheses[1].score)
+                    / max(abs(hypotheses[0].score), 1.0e-9))
+        } else {
+            relativeMargin = hypotheses.isEmpty ? 0 : 1
+        }
+        if update.trackingState == "normal" {
+            recentShelfTrackingDegradationCount = max(
+                0, recentShelfTrackingDegradationCount - 1)
+        } else {
+            recentShelfTrackingDegradationCount = min(
+                100, recentShelfTrackingDegradationCount + 1)
+        }
+        let distanceSinceLoop = Double(max(
+            0, mCurrentDistanceTravelled - mLastReliableLoopClosureDistance))
+        let decision = shelfTrackingStateMachine.update(
+            hypotheses: hypotheses,
+            distanceSinceReliableLoopM: distanceSinceLoop,
+            recentTrackingDegradationCount:
+                recentShelfTrackingDegradationCount)
+        let sequence = corridorHypothesisSequence + 1
+        let crossSigma = max(
+            0.10, update.roadCandidates.first?.distanceM ?? 3.0)
+        let record = CorridorHypothesesRecord(
+            format: CorridorHypothesesRecord.formatName,
+            version: ShelfLocalizationPolicy.contractVersion,
+            trackingSessionID: trackingSessionID,
+            sequence: sequence,
+            nodeID: nodeID,
+            nodeTimestamp: binding.nodeStamp,
+            nodeMapID: Int(binding.nodeMapId),
+            epoch: epoch,
+            component: component,
+            hypotheses: hypotheses,
+            top1Top2Margin: relativeMargin,
+            penetrationAudit: ShelfPenetrationAudit(
+                nodeInsideShelfCount: update.shelfNodePenetrationCount,
+                segmentCrossingCount: update.shelfSegmentCrossingCount),
+            covariance: ShelfLocalizationCovariance(
+                alongM: max(0.35, distanceSinceLoop * 0.08),
+                crossM: crossSigma,
+                yawRad: max(0.03, abs(update.correctionYawDeg) * .pi / 180.0)),
+            writeWatermark: sequence)
+        let succeeded = scanSession.appendCorridorHypotheses(
+            record,
+            expectedTrackingSessionId: trackingSessionID)
+        if succeeded {
+            corridorHypothesisSequence = sequence
+            lastCorridorHypothesisNodeID = nodeID
+            DispatchQueue.main.async { [weak self] in
+                self?.priorMapOverlay?.updateShelfTrackingDecision(decision)
+            }
+        }
+        return succeeded
+    }
+
+    @discardableResult
+    private func consumeShelfObservationWindow(
+        update: PriorMapLocalizationUpdate,
+        binding: RTABMapNodeBindingSnapshot,
+        localizer: PriorMapStageOneLocalizer,
+        scanSession: SupermarketScanSession,
+        trackingSessionID: String,
+        epoch: Int,
+        component: Int64
+    ) -> Bool {
+        guard let package = activePriorMapPackage,
+              !package.distanceFieldSha256.isEmpty else { return false }
+        let candidates = localizer.nearbyShelfIdentityCandidates(
+            limit: ShelfLocalizationPolicy.maximumShelfCandidates,
+            radiusM: 6.0)
+        guard let top = candidates.first,
+              let segment = package.shelfSegments.first(where: {
+                $0.shelfSegmentID == top.shelfSegmentId
+                    && $0.floorID == activeScanConfiguration.floorId
+              }),
+              segment.frontNormal.count == 2,
+              segment.backNormal.count == 2 else {
+            pendingShelfObservationWindow = nil
+            return true
+        }
+        let toPhoneX = update.estimatedPose.xM - top.nearestXM
+        let toPhoneY = update.estimatedPose.yM - top.nearestYM
+        let onFront = toPhoneX * segment.frontNormal[0]
+            + toPhoneY * segment.frontNormal[1] >= 0
+        let side = onFront ? "right" : "left"
+        let rawNormal = onFront ? segment.frontNormal : segment.backNormal
+        let normalLength = hypot(rawNormal[0], rawNormal[1])
+        guard normalLength > 0 else { return false }
+        let normal = ShelfFaceNormal(
+            x: rawNormal[0] / normalLength,
+            y: rawNormal[1] / normalLength)
+        let nodeID = Int64(binding.nodeId)
+        guard update.estimatedPose.xM.isFinite,
+              update.estimatedPose.yM.isFinite,
+              update.estimatedPose.yawRad.isFinite else {
+            pendingShelfObservationWindow = nil
+            return true
+        }
+        let phonePose = update.estimatedPose
+        if var pending = pendingShelfObservationWindow,
+           pending.shelfSegmentID == top.shelfSegmentId,
+           pending.side == side,
+           pending.epoch == epoch,
+           pending.component == component,
+           nodeID > pending.endNodeID,
+           nodeID - pending.endNodeID <= 8 {
+            pending.endNodeID = nodeID
+            pending.endTimestamp = binding.nodeStamp
+            pending.sampleCount += 1
+            pending.maximumCoverageAngleRad = max(
+                pending.maximumCoverageAngleRad,
+                update.structureCoverageAngleRad)
+            // Window contract counts affected accepted-node samples, not raw
+            // depth points, so the dominant-dynamic ratio has one stable
+            // denominator across devices and depth resolutions.
+            pending.dynamicRejectionCount +=
+                update.dynamicStructureRejectionCount > 0 ? 1 : 0
+            pending.phonePoseXSum += phonePose.xM
+            pending.phonePoseYSum += phonePose.yM
+            pending.phonePoseSinYawSum += sin(phonePose.yawRad)
+            pending.phonePoseCosYawSum += cos(phonePose.yawRad)
+            pending.phonePoseSampleCount += 1
+            pendingShelfObservationWindow = pending
+        } else {
+            pendingShelfObservationWindow = PendingShelfObservationWindow(
+                shelfSegmentID: top.shelfSegmentId,
+                side: side,
+                faceNormal: normal,
+                epoch: epoch,
+                component: component,
+                startNodeID: nodeID,
+                startTimestamp: binding.nodeStamp,
+                endNodeID: nodeID,
+                endTimestamp: binding.nodeStamp,
+                sampleCount: 1,
+                maximumCoverageAngleRad: update.structureCoverageAngleRad,
+                dynamicRejectionCount:
+                    update.dynamicStructureRejectionCount > 0 ? 1 : 0,
+                phonePoseXSum: phonePose.xM,
+                phonePoseYSum: phonePose.yM,
+                phonePoseSinYawSum: sin(phonePose.yawRad),
+                phonePoseCosYawSum: cos(phonePose.yawRad),
+                phonePoseSampleCount: 1)
+        }
+        guard let completed = pendingShelfObservationWindow,
+              completed.sampleCount >= 5,
+              completed.endTimestamp - completed.startTimestamp >= 1.0 else {
+            return true
+        }
+        let sequence = shelfObservationWindowSequence + 1
+        let evidenceCandidates = candidates.map {
+            ShelfCandidateEvidence(
+                shelfSegmentID: $0.shelfSegmentId,
+                score: max(0, 1.0 - $0.distanceM / 6.0))
+        }
+        let record = ShelfObservationWindowRecord(
+            format: ShelfObservationWindowRecord.formatName,
+            version: ShelfLocalizationPolicy.contractVersion,
+            trackingSessionID: trackingSessionID,
+            sequence: sequence,
+            windowID: String(format: "sow-%06d", sequence),
+            nodeRange: [completed.startNodeID, completed.endNodeID],
+            timeRange: [completed.startTimestamp, completed.endTimestamp],
+            epoch: completed.epoch,
+            component: completed.component,
+            side: completed.side,
+            faceNormalMap: completed.faceNormal,
+            shelfCandidates: evidenceCandidates,
+            coverageAngleRad: completed.maximumCoverageAngleRad,
+            endcapVisible: top.longitudinalFraction <= 0.1
+                || top.longitudinalFraction >= 0.9,
+            dynamicRejectionCount: completed.dynamicRejectionCount,
+            priorMapSHA256: package.packageSha256,
+            distanceFieldSHA256: package.distanceFieldSha256,
+            writeWatermark: sequence)
+        let succeeded = scanSession.appendShelfObservationWindow(
+            record,
+            expectedTrackingSessionId: trackingSessionID)
+        pendingShelfObservationWindow = nil
+        if succeeded {
+            shelfObservationWindowSequence = sequence
+            let phonePoseCount = Double(max(1, completed.phonePoseSampleCount))
+            let meanPhoneX = completed.phonePoseXSum / phonePoseCount
+            let meanPhoneY = completed.phonePoseYSum / phonePoseCount
+            let meanPhoneYaw = atan2(
+                completed.phonePoseSinYawSum,
+                completed.phonePoseCosYawSum)
+            let shelfYaw = atan2(
+                segment.longitudinalAxis[1], segment.longitudinalAxis[0])
+            let shelfCenterX = (segment.longitudinalStartM[0]
+                + segment.longitudinalEndM[0]) / 2.0
+            let shelfCenterY = (segment.longitudinalStartM[1]
+                + segment.longitudinalEndM[1]) / 2.0
+            let deltaX = meanPhoneX - shelfCenterX
+            let deltaY = meanPhoneY - shelfCenterY
+            let outwardNormal = completed.side == "right"
+                ? segment.frontNormal : segment.backNormal
+            let canonicalReferenceYaw = shelfYaw
+                + (completed.side == "right" ? 0 : .pi)
+            recentShelfWindowRelativePoses[record.windowID] =
+                ShelfPhoneRelativePose(
+                    dxM: deltaX * segment.longitudinalAxis[0]
+                        + deltaY * segment.longitudinalAxis[1],
+                    dyM: deltaX * outwardNormal[0]
+                        + deltaY * outwardNormal[1],
+                    dyawRad: PriorMapStageOneMath.normalizeAngle(
+                        meanPhoneYaw - canonicalReferenceYaw))
+            var retained = recentShelfObservationWindows[
+                completed.shelfSegmentID, default: []]
+            retained.append(record)
+            if retained.count > 16 {
+                let removed = retained.prefix(retained.count - 16)
+                for item in removed {
+                    recentShelfWindowRelativePoses.removeValue(
+                        forKey: item.windowID)
+                }
+                retained.removeFirst(retained.count - 16)
+            }
+            recentShelfObservationWindows[completed.shelfSegmentID] = retained
+            if recentShelfObservationWindows.count > 64,
+               let oldest = recentShelfObservationWindows.keys.sorted().first {
+                for item in recentShelfObservationWindows[oldest] ?? [] {
+                    recentShelfWindowRelativePoses.removeValue(
+                        forKey: item.windowID)
+                }
+                recentShelfObservationWindows.removeValue(forKey: oldest)
+            }
+        }
+        return succeeded
+    }
+
+    @discardableResult
+    private func persistShelfLoopEvent(
+        shelfCandidates: [PriorMapShelfIdentityCandidate],
+        scanSession: SupermarketScanSession,
+        loopFromNode: Int,
+        loopToNode: Int,
+        rtabLoopID: Int,
+        rtabLoopResidualM: Double,
+        inlierRatio: Double
+    ) -> Bool {
+        guard let top = shelfCandidates.first,
+              let windows = recentShelfObservationWindows[top.shelfSegmentId],
+              let latest = windows.last,
+              let opposite = windows.reversed().first(where: {
+                $0.windowID != latest.windowID && $0.side != latest.side
+              }),
+              let oppositeRelative = recentShelfWindowRelativePoses[
+                opposite.windowID],
+              let latestRelative = recentShelfWindowRelativePoses[
+                latest.windowID],
+              loopFromNode > 0, loopToNode > 0 else {
+            return true
+        }
+        let relativeDeltaM = hypot(
+            latestRelative.dxM - oppositeRelative.dxM,
+            latestRelative.dyM - oppositeRelative.dyM)
+        let relativeDeltaYawRad = abs(
+            PriorMapStageOneMath.normalizeAngle(
+                latestRelative.dyawRad - oppositeRelative.dyawRad))
+        let accepted = ShelfLoopVerifier.accepts(
+            first: opposite,
+            second: latest,
+            relativePoseDeltaM: relativeDeltaM,
+            relativePoseDeltaYawRad: relativeDeltaYawRad,
+            inlierRatio: inlierRatio,
+            hasEpochBridge: opposite.epoch == latest.epoch,
+            dominantDynamicEvidence:
+                opposite.dynamicRejectionCount * 2
+                    > Int(opposite.nodeRange[1] - opposite.nodeRange[0] + 1)
+                || latest.dynamicRejectionCount * 2
+                    > Int(latest.nodeRange[1] - latest.nodeRange[0] + 1))
+        let reason: String
+        if accepted {
+            reason = "two_sided_consistency_confirmed"
+        } else if opposite.epoch != latest.epoch {
+            reason = "epoch_mismatch"
+        } else if ShelfLoopVerifier.candidateRelativeMargin(opposite)
+                    < ShelfLocalizationPolicy.calibrationPendingLowConfidenceMargin
+                    || ShelfLoopVerifier.candidateRelativeMargin(latest)
+                    < ShelfLocalizationPolicy.calibrationPendingLowConfidenceMargin {
+            reason = "margin_insufficient"
+        } else if opposite.dynamicRejectionCount * 2
+                    > Int(opposite.nodeRange[1] - opposite.nodeRange[0] + 1)
+                    || latest.dynamicRejectionCount * 2
+                    > Int(latest.nodeRange[1] - latest.nodeRange[0] + 1) {
+            reason = "dynamic_evidence_dominant"
+        } else if relativeDeltaM
+                    > ShelfLocalizationPolicy.calibrationPendingLoopTranslationM
+                    || relativeDeltaYawRad
+                    > ShelfLocalizationPolicy.calibrationPendingLoopYawRad {
+            reason = "phone_shelf_se2_inconsistent"
+        } else if inlierRatio
+                    < ShelfLocalizationPolicy.calibrationPendingLoopInlierRatio {
+            reason = "inlier_ratio_insufficient"
+        } else {
+            reason = "opposing_normal_insufficient"
+        }
+        let sequence = shelfLoopEventSequence + 1
+        let record = ShelfLoopEventRecord(
+            format: ShelfLoopEventRecord.formatName,
+            version: ShelfLocalizationPolicy.contractVersion,
+            trackingSessionID: scanSession.trackingSessionId,
+            sequence: sequence,
+            shelfSegmentID: top.shelfSegmentId,
+            windowIDs: [opposite.windowID, latest.windowID],
+            sides: [opposite.side, latest.side],
+            epoch: latest.epoch,
+            component: latest.component,
+            loopFromNode: Int64(loopFromNode),
+            loopToNode: Int64(loopToNode),
+            rtabLoopID: max(0, rtabLoopID),
+            rtabLoopResidualM: max(0, rtabLoopResidualM),
+            phoneShelfSE2: ShelfPhoneRelativePose(
+                dxM: latestRelative.dxM,
+                dyM: latestRelative.dyM,
+                dyawRad: latestRelative.dyawRad),
+            consistency: ShelfLoopConsistency(
+                relativePoseDeltaM: relativeDeltaM,
+                relativePoseDeltaYawRad: relativeDeltaYawRad,
+                inlierRatio: max(0, min(1, inlierRatio)),
+                residualMedianM: relativeDeltaM,
+                residualMaximumM: relativeDeltaM),
+            accepted: accepted,
+            reason: reason,
+            calibrationStatus: ShelfLocalizationPolicy.calibrationStatus,
+            writeWatermark: sequence)
+        let succeeded = scanSession.appendShelfLoopEvent(
+            record,
+            expectedTrackingSessionId: scanSession.trackingSessionId)
+        if succeeded { shelfLoopEventSequence = sequence }
+        return succeeded
+    }
+
     private func updatePriorMapLocalization(
         frame: ARFrame,
         trackingState: String,
@@ -3400,7 +3914,13 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                 binding.generation,
                 binding.openGLWorldFromNode,
                 frame.timestamp)
+            persistPendingPoseEpochTransition(
+                afterNodeID: Int64(binding.nodeId),
+                scanSession: scanSession,
+                trackingSessionID: trackingSessionId)
         }
+        let localizationEpoch = mCapturePoseEpoch
+        let localizationComponent = Int64(priceTagNodeBinding?.nodeMapId ?? 0)
         let ticket: Int
         switch priorMapUpdateGate.begin(timestamp: frame.timestamp) {
         case .throttled:
@@ -3427,11 +3947,30 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                 self.priorMapUpdateGate.finish(ticket: ticket)
                 return
             }
-            let update = autoreleasepool {
+            var update = autoreleasepool {
                 localizer.update(
                     frame: frame,
                     trackingState: trackingState,
                     poseOverride: poseOverride)
+            }
+            update.epoch = Int(localizationEpoch)
+            update.component = localizationComponent
+            if let binding = priceTagNodeBinding {
+                _ = self.persistCorridorHypotheses(
+                    update: update,
+                    binding: binding,
+                    scanSession: scanSession,
+                    trackingSessionID: trackingSessionId,
+                    epoch: Int(localizationEpoch),
+                    component: localizationComponent)
+                _ = self.consumeShelfObservationWindow(
+                    update: update,
+                    binding: binding,
+                    localizer: localizer,
+                    scanSession: scanSession,
+                    trackingSessionID: trackingSessionId,
+                    epoch: Int(localizationEpoch),
+                    component: localizationComponent)
             }
             self.priorMapUpdateGate.finish(ticket: ticket)
             guard generation == self.priorMapGeneration else {
@@ -4261,6 +4800,7 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         capturePriorMapGeneration: UUID
     ) {
         let detection = result.detection(for: selected)
+        let capturePoseEpoch = Int(mCapturePoseEpoch)
         guard let binding else {
             recordPriceTagCaptureAudit(
                 .trackingUnavailable,
@@ -4323,6 +4863,7 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                     boundNodeID: binding.nodeID,
                     boundNodeStamp: binding.nodeStamp,
                     boundNodeMapID: binding.nodeMapID,
+                    capturePoseEpoch: capturePoseEpoch,
                     openGLWorldFromNode: binding.openGLWorldFromNode)
             }
             if localized.observation.pointInBoundNodeFrame == nil
@@ -5498,6 +6039,8 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                     frameTimestamp: frameTimestamp) {
                 self.priorMapAlignmentSnapshots.publish(snapshot)
             }
+            self.shelfTrackingStateMachine = ShelfTrackingStateMachine()
+            self.recentShelfTrackingDegradationCount = 0
             scanSession.appendScanEvent(
                 event: "manual_localization_confirmed",
                 message: "User confirmed a prior-map position after durable evidence commit",
@@ -5512,6 +6055,11 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                     "poseEpoch": "\(poseEpoch)",
                 ])
             DispatchQueue.main.async {
+                self.priorMapOverlay?.updateShelfTrackingDecision(
+                    ShelfTrackingDecision(
+                        state: .tracking,
+                        selectedCorridorID: nil,
+                        lowConfidenceReasons: []))
                 request.completion(.applied)
             }
         }
@@ -6708,6 +7256,19 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                         processingBlockers.append(
                             "tag_observation_burst_write_failed")
                     }
+                    let shelfEvidenceWatermark: ShelfLocalizationEvidenceWatermark?
+                    if isPriorMapScan {
+                        let watermark = scanSession.sealShelfLocalizationEvidence(
+                            expectedTrackingSessionId: scanSession.trackingSessionId,
+                            allowDuringFinalization: true)
+                        shelfEvidenceWatermark = watermark
+                        if !watermark.complete {
+                            processingBlockers.append(
+                                "shelf_localization_evidence_write_failed")
+                        }
+                    } else {
+                        shelfEvidenceWatermark = nil
+                    }
                     // Clock evidence applies to every mode; prior-map
                     // evidence only to prior-map scans.
                     let metadataFinalized = processingBlockers.isEmpty
@@ -6806,6 +7367,34 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                         tagObservationBurstCount: burstFlushResult.count,
                         tagObservationBurstLastID: burstFlushResult.lastBurstID,
                         tagObservationBurstComplete: burstFlushResult.complete,
+                        poseEpochTransitions: isPriorMapScan
+                            ? PoseEpochTransitionRecord.fileName : nil,
+                        poseEpochTransitionCount:
+                            shelfEvidenceWatermark?.poseEpochTransitionCount,
+                        poseEpochTransitionLastSequence:
+                            shelfEvidenceWatermark?.poseEpochTransitionLastSequence,
+                        corridorHypotheses: isPriorMapScan
+                            ? CorridorHypothesesRecord.fileName : nil,
+                        corridorHypothesisCount:
+                            shelfEvidenceWatermark?.corridorHypothesisCount,
+                        corridorHypothesisLastSequence:
+                            shelfEvidenceWatermark?.corridorHypothesisLastSequence,
+                        shelfObservationWindows: isPriorMapScan
+                            ? ShelfObservationWindowRecord.fileName : nil,
+                        shelfObservationWindowCount:
+                            shelfEvidenceWatermark?.shelfObservationWindowCount,
+                        shelfObservationWindowLastSequence:
+                            shelfEvidenceWatermark?.shelfObservationWindowLastSequence,
+                        shelfLoopEvents: isPriorMapScan
+                            ? ShelfLoopEventRecord.fileName : nil,
+                        shelfLoopEventCount:
+                            shelfEvidenceWatermark?.shelfLoopEventCount,
+                        shelfLoopEventLastSequence:
+                            shelfEvidenceWatermark?.shelfLoopEventLastSequence,
+                        shelfLocalizationEvidenceComplete:
+                            shelfEvidenceWatermark?.complete,
+                        shelfLocalizationCalibrationStatus: isPriorMapScan
+                            ? ShelfLocalizationPolicy.calibrationStatus : nil,
                         performanceSamples: "performance_samples.jsonl",
                         performanceSampleIntervalSeconds: 5.0,
                         performanceSampleCount:

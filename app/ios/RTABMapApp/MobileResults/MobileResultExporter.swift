@@ -54,6 +54,16 @@ enum MobileResultExporter {
                     numberOrEmpty(tag.positionRatio),
                     numberOrEmpty(tag.mapXM),
                     numberOrEmpty(tag.mapYM),
+                    numberOrEmpty(tag.rawMapXM),
+                    numberOrEmpty(tag.rawMapYM),
+                    numberOrEmpty(tag.optimizedMapXM),
+                    numberOrEmpty(tag.optimizedMapYM),
+                    numberOrEmpty(tag.shelfProjectedMapXM),
+                    numberOrEmpty(tag.shelfProjectedMapYM),
+                    numberOrEmpty(tag.shelfFaceNormalResidualM),
+                    tag.shelfFaceLongitudinalWithinSegment.map {
+                        .text($0 ? "true" : "false")
+                    } ?? .empty,
                     .integer(Int64(tag.observationCount)),
                     .number(tag.positionSpreadCm),
                     .number(tag.localizationConfidence),

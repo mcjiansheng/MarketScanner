@@ -34,6 +34,8 @@ from tools.PriorMap.offline_localization import (
     _apply_on_device_confirmation_authority,
     _enforce_on_device_confirmation_conflict,
     _read_localized_price_tags_bytes,
+    _review_bounds_for_floor,
+    _review_elements_for_floor,
     _read_clock_evidence_bytes,
     _verified_tag_burst_observation_ids,
     _verified_tag_burst_evidence,
@@ -112,6 +114,33 @@ class PriorMapIdentityBindingTests(unittest.TestCase):
             "storeId": "hs.6599",
             "floorId": "1",
         }
+
+    def test_review_geometry_is_scoped_to_authoritative_floor(self) -> None:
+        elements = [
+            {"id": "f1-shelf", "floor_id": "1", "role": "shelf"},
+            {"id": "f1-road", "floor_id": "1", "role": "road"},
+            {"id": "f2-shelf", "floor_id": "2"},
+            {"id": "unbound"},
+        ]
+        self.assertEqual(
+            [item["id"] for item in _review_elements_for_floor(elements, "1")],
+            ["f1-shelf", "f1-road"],
+        )
+        self.assertEqual(
+            _review_elements_for_floor(elements, "1")[1]["role"], "road"
+        )
+        self.assertEqual(_review_elements_for_floor(elements, ""), [])
+        bounds = _review_bounds_for_floor(
+            {
+                "bounds": {"min_x_m": -99},
+                "floors": [
+                    {"id": "1", "bounds": {"min_x_m": 0}},
+                    {"id": "2", "bounds": {"min_x_m": 20}},
+                ],
+            },
+            "2",
+        )
+        self.assertEqual(bounds, {"min_x_m": 20})
 
     def resolve(self, **updates: object) -> dict[str, object]:
         return _resolve_session_prior_map_identity(
@@ -2001,12 +2030,40 @@ class ShelfAssociationSafetyTests(unittest.TestCase):
         result = _associate_tag(tag, [shelf, second], (2.0, 2.0))
         self.assertEqual(result.get("shelf_code"), "SHELF-01")
         self.assertFalse(result.get("needs_review"))
+        self.assertEqual(
+            result["optimized_map_position"],
+            {"x_m": 2.0, "y_m": 0.15, "height_m": 1.2},
+        )
+        self.assertEqual(result["final_map_position"]["x_m"], 2.0)
+        self.assertEqual(result["final_map_position"]["y_m"], 0.0)
+        self.assertEqual(
+            result["shelf_projected_map_position"],
+            result["final_map_position"],
+        )
+        self.assertAlmostEqual(result["shelf_face_normal_residual_m"], 0.15)
         self.assertEqual(result["association_audit"]["status"], "auto_confirmed")
         self.assertTrue(result["association_audit"]["candidate_search_complete"])
         self.assertEqual(
             result["association_audit"]["candidate_search_scope"],
             "all_stable_edges_within_radius",
         )
+
+    def test_inside_raw_point_projects_to_camera_facing_long_edge(self) -> None:
+        shelf = self._shelf_element(
+            "SHELF-01",
+            [(0.0, 0.0), (4.0, 0.0), (4.0, -0.5), (0.0, -0.5)],
+        )
+        second = self._shelf_element(
+            "SHELF-02",
+            [(0.0, -0.8), (4.0, -0.8), (4.0, -1.3), (0.0, -1.3)],
+        )
+        result = _associate_tag(
+            self._tag(2.0, -0.20), [shelf, second], (2.0, 2.0)
+        )
+        self.assertEqual(result["shelf_code"], "SHELF-01")
+        self.assertEqual(result["final_map_position"]["y_m"], 0.0)
+        self.assertAlmostEqual(result["shelf_face_normal_residual_m"], 0.20)
+        self.assertTrue(result["shelf_face_longitudinal_within_segment"])
 
     def test_no_independent_second_candidate_fails_closed(self) -> None:
         shelf = self._shelf_element("SHELF-01", [(0.0, 0.0), (4.0, 0.0), (4.0, -0.5), (0.0, -0.5)])
@@ -2534,7 +2591,12 @@ class ESLConfirmationContractTests(unittest.TestCase):
         consistent["association_audit"] = {
             "status": "suggested_only",
             "offline_evidence_reliable": True,
-            "candidates": [{"element_id": "shelf-B", "edge_id": "B"}],
+            "candidates": [{
+                "element_id": "shelf-B",
+                "edge_id": "B",
+                "normal_residual_m": 0.1,
+                "projected_map_position": {"x_m": 1.0, "y_m": 1.9},
+            }],
         }
         consistent_result = _enforce_on_device_confirmation_conflict(
             consistent
@@ -5089,7 +5151,11 @@ class LocalizedPipelineTests(unittest.TestCase):
         self.assertEqual(tags[0]["payload"], original[0]["payload"])
         self.assertIn("final_map_position", tags[0])
         self.assertAlmostEqual(tags[0]["final_map_position"]["x_m"], 7.0)
-        self.assertAlmostEqual(tags[0]["final_map_position"]["y_m"], -2.534375)
+        self.assertAlmostEqual(tags[0]["final_map_position"]["y_m"], -2.573958)
+        self.assertAlmostEqual(
+            tags[0]["optimized_map_position"]["y_m"], -2.573958
+        )
+        self.assertNotIn("shelf_projected_map_position", tags[0])
         self.assertEqual(
             tags[0]["transform_audit"]["source_position_field"],
             "observation.point_in_bound_node_frame",

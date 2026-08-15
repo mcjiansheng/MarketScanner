@@ -1166,7 +1166,7 @@ enum MobileProcessingPipeline {
         }
         try writeStreamingArrayFile(
             format: "MarketScannerFinalTags",
-            version: 1,
+            version: 2,
             count: priceTags.count,
             arrayKey: "tags",
             elements: priceTags,
@@ -2409,6 +2409,7 @@ enum MobileProcessingPipeline {
                 nodeTimestamp: raw.nodeTimebaseTimestamp,
                 frameMonotonicSeconds: raw.frameTimestamp,
                 rawPositionM: position,
+                onlineMapPositionM: raw.onlineMapPositionM,
                 trackingSessionID: raw.trackingSessionID,
                 burstID: raw.burstID,
                 frameID: raw.frameID,
@@ -2509,6 +2510,11 @@ enum MobileProcessingPipeline {
                     shelves: shelves,
                     index: shelfIndex,
                     floorID: observation.floorID,
+                    observerPoint: {
+                        guard let x = observation.observerMapXM,
+                              let y = observation.observerMapYM else { return nil }
+                        return (x, y)
+                    }(),
                     occludedByStructure: { shelf in
                         ShelfAssociationEngine.isOccluded(
                             tagPoint: (observation.mapXM, observation.mapYM),
@@ -2807,6 +2813,11 @@ enum MobileProcessingPipeline {
                     shelves: shelves,
                     index: shelfIndex,
                     floorID: instance.floorID,
+                    observerPoint: {
+                        guard let x = instance.observerMapXM,
+                              let y = instance.observerMapYM else { return nil }
+                        return (x, y)
+                    }(),
                     occludedByStructure: { shelf in
                         ShelfAssociationEngine.isOccluded(
                             tagPoint: (instance.mapXM, instance.mapYM),
@@ -2838,7 +2849,11 @@ enum MobileProcessingPipeline {
                         localizationConfidence: instance.localizationConfidence,
                         associationConfidence: instance.associationConfidence,
                         qualityStatus: status,
-                        reason: reason))
+                        reason: reason,
+                        rawMapXM: instance.rawMapXM,
+                        rawMapYM: instance.rawMapYM,
+                        optimizedMapXM: instance.mapXM,
+                        optimizedMapYM: instance.mapYM))
                     if rescanSuggested {
                         rescanTasks.append(RescanTask(
                             taskID: "rescan-\(rescanTasks.count + 1)-\(instance.barcode)",
@@ -2909,7 +2924,7 @@ enum MobileProcessingPipeline {
                             bindingMethod: "resolved",
                             association: association,
                             maximumEndpointDistanceM: 0.15,
-                            maximumAssociationDistanceM: 0.20,
+                            maximumAssociationDistanceM: 0.50,
                             minimumAssociationMarginM: minimumAssociationMarginM,
                             graphQualityPassed: graphQualityPassed,
                             mapSessionIdentityConsistent: mapSessionIdentityConsistent))
@@ -2932,14 +2947,23 @@ enum MobileProcessingPipeline {
                     shelfSide: association.shelfSide,
                     distanceFromShelfStartCm: association.distanceFromShelfStartCm,
                     positionRatio: association.positionRatio,
-                    mapXM: instance.mapXM,
-                    mapYM: instance.mapYM,
+                    mapXM: association.projectedFaceXM,
+                    mapYM: association.projectedFaceYM,
                     observationCount: instance.observationCount,
                     positionSpreadCm: instance.positionSpreadM * 100.0,
                     localizationConfidence: instance.localizationConfidence,
                     associationConfidence: instance.associationConfidence,
                     qualityStatus: status,
-                    reason: reason))
+                    reason: reason,
+                    rawMapXM: instance.rawMapXM,
+                    rawMapYM: instance.rawMapYM,
+                    optimizedMapXM: instance.mapXM,
+                    optimizedMapYM: instance.mapYM,
+                    shelfProjectedMapXM: association.projectedFaceXM,
+                    shelfProjectedMapYM: association.projectedFaceYM,
+                    shelfFaceNormalResidualM: association.normalResidualM,
+                    shelfFaceLongitudinalWithinSegment:
+                        association.longitudinalWithinSegment))
                 if rescanSuggested {
                     rescanTasks.append(RescanTask(
                         taskID: "rescan-\(rescanTasks.count + 1)-\(instance.barcode)",
@@ -4000,6 +4024,36 @@ enum MobileProcessingPipeline {
         ]
         if let mapXM = tag.mapXM { payload["map_x_m"] = mapXM }
         if let mapYM = tag.mapYM { payload["map_y_m"] = mapYM }
+        if let rawMapXM = tag.rawMapXM { payload["raw_map_x_m"] = rawMapXM }
+        if let rawMapYM = tag.rawMapYM { payload["raw_map_y_m"] = rawMapYM }
+        if let x = tag.rawMapXM, let y = tag.rawMapYM {
+            payload["online_map_position"] = ["x_m": x, "y_m": y]
+        }
+        if let optimizedMapXM = tag.optimizedMapXM {
+            payload["optimized_map_x_m"] = optimizedMapXM
+        }
+        if let optimizedMapYM = tag.optimizedMapYM {
+            payload["optimized_map_y_m"] = optimizedMapYM
+        }
+        if let x = tag.optimizedMapXM, let y = tag.optimizedMapYM {
+            payload["optimized_map_position"] = ["x_m": x, "y_m": y]
+        }
+        if let shelfProjectedMapXM = tag.shelfProjectedMapXM {
+            payload["shelf_projected_map_x_m"] = shelfProjectedMapXM
+        }
+        if let shelfProjectedMapYM = tag.shelfProjectedMapYM {
+            payload["shelf_projected_map_y_m"] = shelfProjectedMapYM
+        }
+        if let x = tag.shelfProjectedMapXM,
+           let y = tag.shelfProjectedMapYM {
+            payload["shelf_projected_map_position"] = ["x_m": x, "y_m": y]
+        }
+        if let residual = tag.shelfFaceNormalResidualM {
+            payload["shelf_face_normal_residual_m"] = residual
+        }
+        if let within = tag.shelfFaceLongitudinalWithinSegment {
+            payload["shelf_face_longitudinal_within_segment"] = within
+        }
         if let distance = tag.distanceFromShelfStartCm { payload["distance_from_shelf_start_cm"] = distance }
         if let ratio = tag.positionRatio { payload["position_ratio"] = ratio }
         return payload

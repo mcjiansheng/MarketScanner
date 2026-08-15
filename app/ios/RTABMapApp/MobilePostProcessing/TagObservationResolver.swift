@@ -60,6 +60,9 @@ enum TagObservationResolver {
         /// Point in the exact capture-bound node frame; nil means legacy or
         /// measurement-only evidence that never reaches resolution.
         var rawPositionM: (Double, Double, Double)? // node-local x, y, z
+        /// Online map estimate retained only for raw/optimized/projected
+        /// result audit. It is never used as propagation authority.
+        var onlineMapPositionM: (Double, Double)? = nil
         var trackingSessionID: String
         /// V1R5 §5.4: verified-burst linkage (optional at resolution; the
         /// burst gate is enforced by the quality policy).
@@ -105,6 +108,13 @@ enum TagObservationResolver {
         var needsReview: Bool = true
         var measurementMethod: String = "unavailable"
         var nodeUncertaintyM: Double? = nil
+        /// Final optimized phone/node position. This selects the physical
+        /// long face visible from the aisle; it is never emitted as the tag
+        /// coordinate itself.
+        var observerMapXM: Double? = nil
+        var observerMapYM: Double? = nil
+        var onlineMapXM: Double? = nil
+        var onlineMapYM: Double? = nil
     }
 
     enum ResolutionError: Error {
@@ -179,7 +189,11 @@ enum TagObservationResolver {
             localizationConfidence: observation.localizationConfidence,
             needsReview: observation.needsReview,
             measurementMethod: observation.measurementMethod,
-            nodeUncertaintyM: node.uncertaintyM
+            nodeUncertaintyM: node.uncertaintyM,
+            observerMapXM: node.pose.xM,
+            observerMapYM: node.pose.yM,
+            onlineMapXM: observation.onlineMapPositionM?.0,
+            onlineMapYM: observation.onlineMapPositionM?.1
         )
     }
 
@@ -207,6 +221,10 @@ enum TagObservationResolver {
         var nodeIDs: [Int64]
         var burstIDs: Set<String>
         var trackingSessionID: String
+        var observerMapXM: Double? = nil
+        var observerMapYM: Double? = nil
+        var rawMapXM: Double? = nil
+        var rawMapYM: Double? = nil
     }
 
     /// Fuses all resolved observations of one physical instance (same
@@ -256,6 +274,35 @@ enum TagObservationResolver {
         }
         let centerX = center.0
         let centerY = center.1
+        let observerPoints = observations.compactMap { observation -> (Double, Double)? in
+            guard let x = observation.observerMapXM,
+                  let y = observation.observerMapYM,
+                  x.isFinite, y.isFinite else { return nil }
+            return (x, y)
+        }
+        let observerCenter: (Double, Double)? = observerPoints.isEmpty
+            ? nil
+            : (
+                observerPoints.reduce(0.0) { $0 + $1.0 }
+                    / Double(observerPoints.count),
+                observerPoints.reduce(0.0) { $0 + $1.1 }
+                    / Double(observerPoints.count)
+            )
+        let onlineWeighted = zip(observations, robustWeights).compactMap {
+            observation, weight -> (Double, Double, Double)? in
+            guard let x = observation.onlineMapXM,
+                  let y = observation.onlineMapYM,
+                  x.isFinite, y.isFinite else { return nil }
+            return (x, y, weight)
+        }
+        let onlineWeightSum = onlineWeighted.reduce(0.0) { $0 + $1.2 }
+        let onlineCenter: (Double, Double)? = onlineWeightSum > 0
+            ? (
+                onlineWeighted.reduce(0.0) { $0 + $1.0 * $1.2 }
+                    / onlineWeightSum,
+                onlineWeighted.reduce(0.0) { $0 + $1.1 * $1.2 }
+                    / onlineWeightSum
+            ) : nil
         let maxSpread = observations.reduce(0.0) { current, observation in
             max(current, hypot(observation.mapXM - centerX, observation.mapYM - centerY))
         }
@@ -309,7 +356,11 @@ enum TagObservationResolver {
                 1.0 - maxSpread / max(maximumSpreadM, 1.0e-9))),
             nodeIDs: observations.map { $0.nodeID },
             burstIDs: Set(observations.compactMap(\.burstID)),
-            trackingSessionID: observations[0].trackingSessionID
+            trackingSessionID: observations[0].trackingSessionID,
+            observerMapXM: observerCenter?.0,
+            observerMapYM: observerCenter?.1,
+            rawMapXM: onlineCenter.map { SourceGeometry.rounded($0.0) },
+            rawMapYM: onlineCenter.map { SourceGeometry.rounded($0.1) }
         )
     }
 

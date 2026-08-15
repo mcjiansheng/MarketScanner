@@ -163,7 +163,7 @@ enum PriorMapCorrectionSafety {
     static let recoveryTranslationLimitM = 5.0
     static let recoveryYawLimitRad = 30.0 * Double.pi / 180.0
     static let stepGain = 0.35
-    static let maximumStepTranslationM = 0.35
+    static let maximumStepTranslationM = 0.25
     static let maximumStepYawRad = 8.0 * Double.pi / 180.0
 
     static func difference(

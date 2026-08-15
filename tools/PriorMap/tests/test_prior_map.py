@@ -1509,6 +1509,8 @@ class IOSCoreContractTests(unittest.TestCase):
             repository
             / "app/ios/RTABMapApp/MobilePostProcessing/StrictLocalizationTraceParser.swift",
             repository
+            / "app/ios/RTABMapApp/MobilePostProcessing/ShelfLocalizationEvidence.swift",
+            repository
             / "app/ios/RTABMapApp/MobileResults/MobileWorksheets.swift",
             repository
             / "app/ios/RTABMapApp/MobileResults/MobileResultExporter.swift",

@@ -257,7 +257,7 @@ class YawArrowGeometryGolden(unittest.TestCase):
         self.assertIn("localizer.requestRecovery(reason: \"reliable_rtabmap_loop\")", host)
         self.assertIn('event: "loop_opened_shelf_identity_candidates"', host)
         self.assertIn('"ambiguous_top_k_retained"', host)
-        self.assertIn('"diagnostic_only_not_localization_factor"', host)
+        self.assertIn('"manifest_v5_shelf_loop_candidate"', host)
 
     def test_start_yaw_reaches_initial_map_pose_without_conversion(self) -> None:
         setup = (

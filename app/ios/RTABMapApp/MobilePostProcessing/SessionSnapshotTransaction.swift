@@ -298,7 +298,7 @@ enum SessionSnapshotTransaction {
 
     /// Metadata sidecar declarations: metadata key -> artifact file name.
     /// A non-empty declaration makes the artifact REQUIRED (B-08).
-    static let declaredSidecarPairs: [(key: String, name: String)] = [
+    static let baseDeclaredSidecarPairs: [(key: String, name: String)] = [
         ("localizationTrace", "localization_trace.jsonl"),
         ("manualLocalizationEvents", "manual_localization_events.jsonl"),
         ("localizationConstraints", "localization_constraints.jsonl"),
@@ -307,6 +307,14 @@ enum SessionSnapshotTransaction {
         ("tagObservations", "tag_observations.jsonl"),
         ("localizedPriceTags", "localized_price_tags.json"),
     ]
+    static let shelfLocalizationSidecarPairs: [(key: String, name: String)] = [
+        ("poseEpochTransitions", "pose_epoch_transitions.jsonl"),
+        ("corridorHypotheses", "corridor_hypotheses.jsonl"),
+        ("shelfObservationWindows", "shelf_observation_windows.jsonl"),
+        ("shelfLoopEvents", "shelf_loop_events.jsonl"),
+    ]
+    static let declaredSidecarPairs =
+        baseDeclaredSidecarPairs + shelfLocalizationSidecarPairs
     /// Observability declarations are copied and identity-bound when present,
     /// but are not localization/publication authority. Legacy finalized
     /// sessions remain processable without them; new captures always declare
@@ -759,9 +767,11 @@ enum SessionSnapshotTransaction {
             // 7. Input manifest + atomic commit (§8.7).
             let bundleSHA = MobilePackageManifestBuilder.packageDigest(artifacts)
             let generation = UUID().uuidString.lowercased()
+            let manifestVersion = shelfLocalizationEvidenceIsBound(
+                stagedMetadata.raw) ? 5 : 3
             let manifest: [String: Any] = [
                 "format": "MarketScannerSessionInputManifest",
-                "version": 3,
+                "version": manifestVersion,
                 "generation": generation,
                 "task_id": taskID,
                 "snapshot_directory": "input_snapshot",
@@ -973,6 +983,19 @@ enum SessionSnapshotTransaction {
             .first(where: { $0.name == fileName })?.key ?? ""
     }
 
+    private static func shelfLocalizationEvidenceIsBound(
+        _ metadata: [String: Any]
+    ) -> Bool {
+        if metadata["shelfLocalizationEvidenceComplete"] != nil
+            || metadata["shelfLocalizationCalibrationStatus"] != nil {
+            return true
+        }
+        return shelfLocalizationSidecarPairs.contains { key, _ in
+            guard let value = metadata[key] else { return false }
+            return !(value is NSNull)
+        }
+    }
+
     /// V1R5 §13.6 (review H-14): full re-validation of a committed
     /// snapshot before a task resume — the manifest, every artifact's
     /// exact bytes + SHA-256, the DB quick-check and the WAL/journal
@@ -1090,7 +1113,8 @@ enum SessionSnapshotTransaction {
                 as? [String: Any],
               manifest["format"] as? String ==
                 "MarketScannerSessionInputManifest",
-              strictInteger(manifest["version"]) == 3,
+              let manifestVersion = strictInteger(manifest["version"]),
+              manifestVersion == 3 || manifestVersion == 5,
               let generation = nonEmptyString(manifest["generation"]),
               let taskID = nonEmptyString(manifest["task_id"]),
               manifest["snapshot_directory"] as? String == "input_snapshot",
@@ -1773,13 +1797,56 @@ enum SessionSnapshotTransaction {
             throw SessionError.notEligible(
                 "tag observation burst evidence is incomplete")
         }
-        for (key, name) in declaredSidecarPairs {
+        for (key, name) in baseDeclaredSidecarPairs {
             guard metadata[key] as? String == name else {
                 throw SessionError.notEligible(
                     "formal metadata must declare \(key)=\(name)")
             }
         }
+        guard shelfLocalizationEvidenceIsBound(metadata.raw) else {
+            if let eligibility = eligibility {
+                try checkExternalEligibility(metadata, eligibility: eligibility)
+            }
+            return
+        }
+        for (key, name) in shelfLocalizationSidecarPairs {
+            guard metadata[key] as? String == name else {
+                throw SessionError.notEligible(
+                    "formal metadata must declare \(key)=\(name)")
+            }
+        }
+        guard StrictJSONScalar.boolean(
+                metadata.raw["shelfLocalizationEvidenceComplete"]) == true,
+              metadata.raw["shelfLocalizationCalibrationStatus"] as? String
+                == "CALIBRATION_PENDING" else {
+            throw SessionError.notEligible(
+                "shelf localization evidence is incomplete or has an unknown calibration status")
+        }
+        for (countKey, lastKey) in [
+            ("poseEpochTransitionCount", "poseEpochTransitionLastSequence"),
+            ("corridorHypothesisCount", "corridorHypothesisLastSequence"),
+            ("shelfObservationWindowCount", "shelfObservationWindowLastSequence"),
+            ("shelfLoopEventCount", "shelfLoopEventLastSequence"),
+        ] {
+            guard let count = strictInteger(metadata.raw[countKey]),
+                  count >= 0 else {
+                throw SessionError.notEligible(
+                    "shelf localization count is missing: \(countKey)")
+            }
+            let last = optionalStrictInteger(metadata.raw[lastKey])
+            guard last == (count == 0 ? nil : count) else {
+                throw SessionError.notEligible(
+                    "shelf localization watermark mismatch: \(lastKey)")
+            }
+        }
         guard let eligibility = eligibility else { return }
+        try checkExternalEligibility(metadata, eligibility: eligibility)
+    }
+
+    private static func checkExternalEligibility(
+        _ metadata: StrictFinalizedSessionMetadata,
+        eligibility: Eligibility
+    ) throws {
         guard eligibility.appGitSHA != "unknown", !eligibility.appGitSHA.isEmpty else {
             throw SessionError.notEligible("app build identity unknown")
         }

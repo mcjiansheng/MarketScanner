@@ -4891,7 +4891,7 @@ require(!PriorMapCorrectionSafety.isWithinGate(
 let boundedRecoveryStep = PriorMapCorrectionSafety.boundedStep(
     current: safetyOrigin,
     target: PriorMapPose2D(xM: 4.8, yM: 0, yawRad: 29 * .pi / 180))
-require(close(boundedRecoveryStep.xM, 0.35), "S2 recovery step translation cap")
+require(close(boundedRecoveryStep.xM, 0.25), "S2 recovery step translation cap")
 require(close(boundedRecoveryStep.yawRad, 8 * .pi / 180),
         "S2 recovery step yaw cap")
 
@@ -5102,8 +5102,8 @@ require(worstPathController.lastCompletion?.outcome == .converged,
         "R8 worst-path Recovery must converge within the valid-attempt budget")
 require((worstPathController.lastCompletion?.episode.validMatcherAttempts ?? 41) <= 40,
         "R8 convergence must remain inside the configured budget")
-require(maximumStepTranslation <= 0.35 + 1.0e-9,
-        "R8 no Recovery translation step may exceed 0.35 m")
+require(maximumStepTranslation <= 0.25 + 1.0e-9,
+        "R8 no Recovery translation step may exceed 0.25 m")
 require(maximumStepYaw <= 8 * .pi / 180 + 1.0e-9,
         "R8 no Recovery yaw step may exceed 8 degrees")
 
@@ -10785,6 +10785,12 @@ do {
         sheet1.contains("shelf_segment_id")
             && sheet1.contains("segment-a1-main"),
         "RC-B17 PriceTags XLSX must carry the physical shelf segment ID")
+    require(
+        sheet1.contains("raw_map_x_m")
+            && sheet1.contains("optimized_map_x_m")
+            && sheet1.contains("shelf_projected_map_x_m")
+            && sheet1.contains("shelf_face_normal_residual_m"),
+        "frozen shelf contract requires the three coordinate stages and projection audit")
     let sheet4 = String(
         data: entries.first { $0.name == "xl/worksheets/sheet4.xml" }!.data,
         encoding: .utf8) ?? ""
@@ -11263,7 +11269,10 @@ do {
     require(
         close(mid.distanceFromShelfStartCm, 500.0, tolerance: 1.0e-6)
             && close(mid.positionRatio, 0.5, tolerance: 1.0e-6)
-            && close(mid.distanceToSegmentM, 0.05, tolerance: 1.0e-6)
+            && close(mid.distanceToSegmentM, 0.45, tolerance: 1.0e-6)
+            && close(mid.projectedFaceXM, 5.0, tolerance: 1.0e-6)
+            && close(mid.projectedFaceYM, 0.5, tolerance: 1.0e-6)
+            && close(mid.normalResidualM, 0.45, tolerance: 1.0e-6)
             && mid.shelfSide == "back",
         "G6 mid-shelf projection must be (500cm, 0.5) on the back side, got \(mid.distanceFromShelfStartCm),\(mid.positionRatio),\(mid.shelfSide)")
     require(!mid.atEndpoint, "G6 mid-shelf must not be endpoint-ambiguous")
@@ -11313,7 +11322,7 @@ do {
             bindingMethod: "explicit_node",
             association: association,
             maximumEndpointDistanceM: 0.15,
-            maximumAssociationDistanceM: 0.2,
+            maximumAssociationDistanceM: 0.5,
             minimumAssociationMarginM: 0.5,
             graphQualityPassed: graphOK,
             mapSessionIdentityConsistent: identityOK)
@@ -11367,10 +11376,10 @@ do {
     }
     require(
         between.shelfCode == "A1"
-            && between.shelfSegmentID == "segment-a1-main"
+            && between.shelfSegmentID == "segment-a1-parallel"
             && between.marginM != nil
             && between.marginM! < 0.5,
-        "RC-B18 same-code second segment must be retained by segment ID")
+        "RC-B18 face-nearest same-code segment must be retained by segment ID")
     let aisleGate = AutomaticQualityGate.evaluate(gateInput(
         count: 5, spread: 0.02, association: between))
     require(
@@ -11506,17 +11515,18 @@ do {
         shelfCode: "SHARED", floorID: "1",
         startM: (0, 0), endM: (10, 0),
         axisM: (1, 0), frontNormalM: (0, -1),
-        boundsMinM: (0, -0.5), boundsMaxM: (10, 0.5),
+        boundsMinM: (0, -0.2), boundsMaxM: (10, 0.2),
         polygonM: nil, orientationProvenance: "element_yaw")
     let segmentHigh = ShelfAssociationEngine.ShelfSegment(
         shelfSegmentID: "segment-shared-high",
         shelfCode: "SHARED", floorID: "1",
         startM: (0, 1), endM: (10, 1),
         axisM: (1, 0), frontNormalM: (0, 1),
-        boundsMinM: (0, 0.5), boundsMaxM: (10, 1.5),
+        boundsMinM: (0, 0.8), boundsMaxM: (10, 1.2),
         polygonM: nil, orientationProvenance: "element_yaw")
     let finalizerNode = TagObservationResolver.FinalNodePose(
-        id: 77, monotonicSeconds: 10, pose: .identity, floorID: "1",
+        id: 77, monotonicSeconds: 10,
+        pose: SE2Transform(xM: 5, yM: 0.5, yawRad: 0), floorID: "1",
         uncertaintyM: 0.1)
     let finalizerIndex = TagObservationResolver.NodeIndex(
         finalNodes: [finalizerNode], rawNodeStamps: [77: 10])
@@ -11549,7 +11559,8 @@ do {
                 floorID: "1",
                 frameTimestamp: Double(index),
                 nodeTimebaseTimestamp: 10,
-                rawPositionM: (5, y, 0),
+                rawPositionM: (0, y - 0.5, 0),
+                onlineMapPositionM: (4.8, y + 0.1),
                 measurementConfidence: measurementConfidence,
                 localizationState: localizationState,
                 localizationConfidence: localizationConfidence,
@@ -11591,19 +11602,29 @@ do {
             minimumAssociationMarginM: 0.5)
     }
 
-    // These centroids are only 1.2 m apart (inside the 1.5 m cluster
-    // radius). Segment-ID bucketing must keep them as two physical tags
-    // even though both business shelves share code SHARED and side front.
+    // These centroids are only 0.8 m apart (inside the 1.5 m cluster
+    // radius). The phone is in the aisle at y=0.5, so both observations
+    // project to the camera-facing long edges. Segment-ID bucketing must
+    // still keep them as two physical tags even though both business
+    // shelves share code SHARED and side back.
     let segmentEvidence =
-        finalizerEvidence(barcode: "SEGMENTED", symbology: "CODE128", y: -0.1, count: 3)
-        + finalizerEvidence(barcode: "SEGMENTED", symbology: "CODE128", y: 1.1, count: 3)
+        finalizerEvidence(barcode: "SEGMENTED", symbology: "CODE128", y: 0.1, count: 3)
+        + finalizerEvidence(barcode: "SEGMENTED", symbology: "CODE128", y: 0.9, count: 3)
     let (segmentTags, segmentRescans) = try finalizeBucketEvidence(
         segmentEvidence, shelves: [segmentLow, segmentHigh])
     require(
         segmentTags.count == 2 && segmentRescans.isEmpty
             && Set(segmentTags.map(\.shelfCode)) == ["SHARED"]
             && Set(segmentTags.map(\.shelfSegmentID))
-                == ["segment-shared-low", "segment-shared-high"],
+                == ["segment-shared-low", "segment-shared-high"]
+            && segmentTags.allSatisfy {
+                $0.rawMapXM != nil && $0.rawMapYM != nil
+                    && $0.optimizedMapXM != nil && $0.optimizedMapYM != nil
+                    && $0.shelfProjectedMapXM == $0.mapXM
+                    && $0.shelfProjectedMapYM == $0.mapYM
+                    && ($0.shelfFaceNormalResidualM ?? .infinity) <= 0.5
+                    && $0.shelfFaceLongitudinalWithinSegment == true
+            },
         "RC-B17 same-code physical segments must finalize independently")
 
     let ambiguousBurstEvidence =
@@ -19964,6 +19985,162 @@ catch {
     FileHandle.standardError.write(
         Data("strict clock parser failed: \(error)\n".utf8))
     exit(11)
+}
+
+// Frozen shelf-localization contract: strict manifest-v5 evidence parity,
+// non-blocking state behavior, shelf-loop criteria, S-7 penetration and C-3
+// map-authoritative dynamic filtering.
+do {
+    let evidenceDirectory = try p7r6FreshDirectory("shelf-evidence-v5")
+    let sessionID = "shelf-contract-session"
+    let shaA = String(repeating: "a", count: 64)
+    let shaB = String(repeating: "b", count: 64)
+    let corridor = CorridorHypothesesRecord(
+        format: CorridorHypothesesRecord.formatName, version: 1,
+        trackingSessionID: sessionID, sequence: 1, nodeID: 10,
+        nodeTimestamp: 10, nodeMapID: 0, epoch: 1, component: 0,
+        hypotheses: [
+            CorridorHypothesisEvidence(corridorID: "road-a", score: 0.9),
+            CorridorHypothesisEvidence(corridorID: "road-b", score: 0.4),
+        ],
+        top1Top2Margin: 0.555555,
+        penetrationAudit: ShelfPenetrationAudit(
+            nodeInsideShelfCount: 0, segmentCrossingCount: 0),
+        covariance: ShelfLocalizationCovariance(
+            alongM: 2, crossM: 0.3, yawRad: 0.05),
+        writeWatermark: 1)
+    func shelfWindow(
+        sequence: Int,
+        id: String,
+        side: String,
+        normal: ShelfFaceNormal,
+        nodeStart: Int64
+    ) -> ShelfObservationWindowRecord {
+        ShelfObservationWindowRecord(
+            format: ShelfObservationWindowRecord.formatName, version: 1,
+            trackingSessionID: sessionID, sequence: sequence,
+            windowID: id, nodeRange: [nodeStart, nodeStart + 4],
+            timeRange: [Double(nodeStart), Double(nodeStart) + 2],
+            epoch: 1, component: 0, side: side,
+            faceNormalMap: normal,
+            shelfCandidates: [
+                ShelfCandidateEvidence(shelfSegmentID: "shelf-12", score: 0.9),
+                ShelfCandidateEvidence(shelfSegmentID: "shelf-14", score: 0.5),
+            ],
+            coverageAngleRad: 1.9, endcapVisible: false,
+            dynamicRejectionCount: 1, priorMapSHA256: shaA,
+            distanceFieldSHA256: shaB, writeWatermark: sequence)
+    }
+    let firstWindow = shelfWindow(
+        sequence: 1, id: "sow-1", side: "right",
+        normal: ShelfFaceNormal(x: 0, y: 1), nodeStart: 20)
+    let secondWindow = shelfWindow(
+        sequence: 2, id: "sow-2", side: "left",
+        normal: ShelfFaceNormal(x: 0, y: -1), nodeStart: 30)
+    let loop = ShelfLoopEventRecord(
+        format: ShelfLoopEventRecord.formatName, version: 1,
+        trackingSessionID: sessionID, sequence: 1,
+        shelfSegmentID: "shelf-12", windowIDs: ["sow-1", "sow-2"],
+        sides: ["right", "left"], epoch: 1, component: 0,
+        loopFromNode: 24, loopToNode: 34, rtabLoopID: 7,
+        rtabLoopResidualM: 0.2,
+        phoneShelfSE2: ShelfPhoneRelativePose(
+            dxM: 1.2, dyM: 1.1, dyawRad: 0.02),
+        consistency: ShelfLoopConsistency(
+            relativePoseDeltaM: 0.2,
+            relativePoseDeltaYawRad: 0.04,
+            inlierRatio: 0.85, residualMedianM: 0.2,
+            residualMaximumM: 0.3),
+        accepted: true, reason: "two_sided_consistency_confirmed",
+        calibrationStatus: ShelfLocalizationPolicy.calibrationStatus,
+        writeWatermark: 1)
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.sortedKeys]
+    func writeJSONL<T: Encodable>(_ values: [T], name: String) throws {
+        var payload = Data()
+        for value in values {
+            payload.append(try encoder.encode(value))
+            payload.append(0x0a)
+        }
+        try payload.write(
+            to: evidenceDirectory.appendingPathComponent(name),
+            options: .atomic)
+    }
+    try writeJSONL([PoseEpochTransitionRecord](),
+                   name: PoseEpochTransitionRecord.fileName)
+    try writeJSONL([corridor], name: CorridorHypothesesRecord.fileName)
+    try writeJSONL([firstWindow, secondWindow],
+                   name: ShelfObservationWindowRecord.fileName)
+    try writeJSONL([loop], name: ShelfLoopEventRecord.fileName)
+    let summary = try ShelfLocalizationEvidenceParser.validateBundle(
+        directory: evidenceDirectory, trackingSessionID: sessionID,
+        poseEpochTransitionCount: 0, corridorHypothesisCount: 1,
+        shelfObservationWindowCount: 2, shelfLoopEventCount: 1)
+    require(
+        summary.corridorHypothesisCount == 1
+            && summary.shelfObservationWindowCount == 2
+            && summary.shelfLoopEventCount == 1,
+        "manifest-v5 Swift parser must accept a valid two-sided shelf loop")
+
+    var stateMachine = ShelfTrackingStateMachine()
+    let lowDecision = stateMachine.update(
+        hypotheses: [
+            CorridorHypothesisEvidence(corridorID: "road-a", score: 0.80),
+            CorridorHypothesisEvidence(corridorID: "road-b", score: 0.75),
+        ],
+        distanceSinceReliableLoopM: 5,
+        recentTrackingDegradationCount: 0)
+    require(
+        lowDecision.state == .lowConfidence
+            && lowDecision.selectedCorridorID == "road-a",
+        "S-8 must commit top1 while marking ambiguity LOW_CONFIDENCE")
+    let recoveredDecision = stateMachine.update(
+        hypotheses: [
+            CorridorHypothesisEvidence(corridorID: "road-a", score: 0.80),
+            CorridorHypothesisEvidence(corridorID: "road-b", score: 0.75),
+        ],
+        distanceSinceReliableLoopM: 5,
+        recentTrackingDegradationCount: 0,
+        manualRelocalizationConverged: true)
+    require(
+        recoveredDecision.state == .tracking,
+        "manual relocalization must clear the non-blocking low-confidence state")
+
+    let square = [
+        PriorMapPose2D(xM: 0, yM: 0, yawRad: 0),
+        PriorMapPose2D(xM: 2, yM: 0, yawRad: 0),
+        PriorMapPose2D(xM: 2, yM: 2, yawRad: 0),
+        PriorMapPose2D(xM: 0, yM: 2, yawRad: 0),
+    ]
+    let penetration = ShelfFreeSpaceAuditor.audit(
+        previous: PriorMapPose2D(xM: -1, yM: 1, yawRad: 0),
+        current: PriorMapPose2D(xM: 1, yM: 1, yawRad: 0),
+        shelfPolygons: [square])
+    require(
+        penetration.nodeInsideShelfCount == 1
+            && penetration.segmentCrossingCount == 1,
+        "S-7 must reject phone points and swept segments deeper than 0.4 m")
+
+    let dynamicFilter = DynamicShelfEvidenceFilter()
+    _ = dynamicFilter.filter(
+        localPoints: [PriorMapPose2D(xM: 10, yM: 10, yawRad: 0)],
+        mapPose: PriorMapPose2D(xM: 0, yM: 0, yawRad: 0), timestamp: 0,
+        authoritativeShelfPolygons: [square])
+    let dynamicResult = dynamicFilter.filter(
+        localPoints: [
+            PriorMapPose2D(xM: 11, yM: 11, yawRad: 0),
+            PriorMapPose2D(xM: 1, yM: 0.1, yawRad: 0),
+        ],
+        mapPose: PriorMapPose2D(xM: 0, yM: 0, yawRad: 0), timestamp: 11,
+        authoritativeShelfPolygons: [square])
+    require(
+        dynamicResult.rejectedCount == 1 && dynamicResult.points.count == 1,
+        "C-3 must reject new off-map transient structure but retain mapped shelf evidence")
+}
+catch {
+    FileHandle.standardError.write(
+        Data("shelf localization evidence tests failed: \(error)\n".utf8))
+    exit(12)
 }
 
 var finalizationResourceUsage = rusage()

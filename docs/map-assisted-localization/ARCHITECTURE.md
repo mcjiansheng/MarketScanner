@@ -1,6 +1,6 @@
 # 已有地图辅助定位架构
 
-> 文档状态：**当前有效（阶段一至阶段三草稿复核）**。最后核对日期：2026-08-15。
+> 文档状态：**当前有效（阶段一至阶段三草稿复核）**。最后核对日期：2026-08-16。
 
 ## 范围
 
@@ -89,9 +89,9 @@ PC Map Studio result
 - 性能写失败只把 `performanceEvidenceComplete` 置为 false 并写审计；它不能升级为定位坐标损坏，也不能删除安全落盘的数据库。PC 对安全大小内的坏原始日志使用 `.invalid.jsonl` 完整保留，同时拒绝生成可信趋势。
 - 转换先写临时目录，通过 schema 校验后原子发布。
 - prior-map 定位失败、较弱或丢失不会停止或改写 RTAB-Map 原始采集。
-- 结构匹配最多使用 600 点；距离残差、角覆盖、Top-K 唯一性、两帧一致性均通过后才允许修正。自动修正上限为 0.35 m/8°，应用增益 0.35。
+- 结构匹配最多使用 600 点；距离残差、角覆盖、Top-K 唯一性、两帧一致性均通过后才允许修正。自动结构修正平移上限按冻结规格收紧为 0.25 m（角度仍为 8°），应用增益 0.35。
 - 道路只作显示/弱先验，不把相似平行通道当作结构证据硬吸附。
-- 大幅自动修正继续拒绝。手机人工位置只有在 v3、exact node、identity、node stamp/time delta、atomic snapshot generation 全部通过时，才作为约 3 m/20°不确定度的绝对地图锚点；PC `set_anchor` 也必须从不可变复核版本 authoritative recheck 唯一 exact node/time/floor/coordinate-contract/bounds 后才取得相同语义。旧 v2、历史 timestamp-only 和无 exact binding 的编辑仍受 5 m/30°兼容门约束。
+- 大幅自动修正继续拒绝。手机人工位置只有在 v3、exact node、identity、node stamp/time delta、atomic snapshot generation 全部通过时，才作为约 3 m/15°不确定度的绝对地图锚点；PC `set_anchor` 也必须从不可变复核版本 authoritative recheck 唯一 exact node/time/floor/coordinate-contract/bounds 后才取得相同语义。旧 v2、历史 timestamp-only 和无 exact binding 的编辑仍受 5 m/30°兼容门约束，但不能取得冻结规格下的新锚点 authority。
 - iOS ARFrame 回调按 0.5 s 节流；同一时刻只允许一个定位更新，忙时丢弃新更新并记录计数，避免队列积压。
 - iOS 使用道路网格索引只查询当前位置附近边；没有 `road_cells` 的旧包才兼容回退到全量道路。
 - 地图导入先复制并校验临时目录，再原子替换应用缓存；外部源包和已有可用缓存不会先被删除。
@@ -113,6 +113,6 @@ PC Map Studio result
 - PC session input manifest v3 在 v2 Recovery 绑定之上纳入 `tag_observation_bursts.jsonl` 的 exact bytes/hash。共享 validator 统一 writer、bundle hash、snapshot/replay 与 output store：严格 integer version；v1/v2/v3 Recovery marker；case-insensitive filename uniqueness；source database 安全 basename、source-manifest 名称 cross-binding、single-link regular-file 身份，以及 non-empty WAL/journal 拒绝。现场选择与可靠离线关联一致时为 `NO_CONFLICT` 且保持 approved；可靠冲突为 `USER_CONFIRMATION_CONFLICT`，离线证据不足为 `OFFLINE_ASSOCIATION_UNAVAILABLE`，后两者都强制 review/rescan，且不覆盖用户或算法证据。
 - 人工编辑由服务端生成旧值、UUID、UTC 时间和 base revision；version/revision CAS 必填，重放成功后才提交新不可变版本。
 
-本轮没有把 PC corridor route review、手机 alignment basin 或回环附近 diagnostic shelf Top-K 升级为正式通道/货架定位因子。P0 node-local tag schema v2 与 P1-A publication invariant 的整改范围、自动化证据和剩余 P1-B～P2 见 [`AISLE_SHELF_CONSTRAINED_LOCALIZATION_REMEDIATION_2026-08-14.md`](AISLE_SHELF_CONSTRAINED_LOCALIZATION_REMEDIATION_2026-08-14.md)。真机/性能/现场矩阵和低影响增强见 [`ESL_CAPTURE_TODO.md`](ESL_CAPTURE_TODO.md)；当前整体仍为 **REJECTED / NO-GO / NOT PRODUCTION READY**，J-04 未关闭。
+2026-08-15 已将 PC corridor route、手机 top-K basin 和 concrete shelf identity 升级为正式证据链：manifest v5 绑定 epoch transition、corridor top-K、shelf observation window 和 shelf loop；手机提交单一 top1 并在多解时标记 `LOW_CONFIDENCE`，不阻塞扫描；PC 仅把冻结门接受的两侧 shelf loop 转成 shelf-face 因子，native helper 用各向异性平移信息矩阵只强约束货架面法向、弱化沿架方向，并在全图优化后执行 point/swept-segment free-space 与 corridor 自洽发布门。价签最终坐标是采集侧货架长边投影，不是货架中心线或原始融合点。阈值标定、真机性能和现场矩阵仍未关闭，因此整体仍为 **NO-GO / NOT PRODUCTION READY**。
 
 阈值、线程所有权、恢复策略和失败矩阵的权威说明见 `STAGE_2_DESIGN.md`。

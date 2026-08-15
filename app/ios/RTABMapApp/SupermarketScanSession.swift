@@ -114,6 +114,22 @@ struct ScanSegmentMetadata: Codable {
     let tagObservationBurstCount: Int?
     let tagObservationBurstLastID: String?
     let tagObservationBurstComplete: Bool?
+    /// P1-B manifest-v5 shelf localization evidence declarations and exact
+    /// durable watermarks. Legacy metadata decodes nil and remains v1-v4.
+    let poseEpochTransitions: String?
+    let poseEpochTransitionCount: Int?
+    let poseEpochTransitionLastSequence: Int?
+    let corridorHypotheses: String?
+    let corridorHypothesisCount: Int?
+    let corridorHypothesisLastSequence: Int?
+    let shelfObservationWindows: String?
+    let shelfObservationWindowCount: Int?
+    let shelfObservationWindowLastSequence: Int?
+    let shelfLoopEvents: String?
+    let shelfLoopEventCount: Int?
+    let shelfLoopEventLastSequence: Int?
+    let shelfLocalizationEvidenceComplete: Bool?
+    let shelfLocalizationCalibrationStatus: String?
     /// Bounded scan-performance evidence. Unlike localization evidence, a
     /// telemetry failure does not invalidate finite map/trajectory data; it
     /// closes only the performance-qualified claim. The PC verifies these
@@ -152,6 +168,19 @@ struct ScanPerformanceSampleInput {
     let polygonCount: Int?
     let onlineLoopClosureCount: Int?
     let reliableLoopClosureCount: Int?
+}
+
+struct ShelfLocalizationEvidenceWatermark: Equatable {
+    let poseEpochTransitionCount: Int
+    let poseEpochTransitionLastSequence: Int?
+    let corridorHypothesisCount: Int
+    let corridorHypothesisLastSequence: Int?
+    let shelfObservationWindowCount: Int
+    let shelfObservationWindowLastSequence: Int?
+    let shelfLoopEventCount: Int
+    let shelfLoopEventLastSequence: Int?
+    let writeFailureCount: Int
+    let complete: Bool
 }
 
 private struct ScanPerformanceSampleRecord: Encodable {
@@ -900,6 +929,12 @@ final class SupermarketScanSession {
     private var localizationRecoveryEventCount = 0
     private var localizationLastRecoveryEpisodeId: Int?
     private var localizationLastRecoveryFinishedAtUptime: TimeInterval?
+    private var poseEpochTransitionCount = 0
+    private var corridorHypothesisCount = 0
+    private var shelfObservationWindowCount = 0
+    private var shelfLoopEventCount = 0
+    private var shelfLocalizationEvidenceWriteFailureCount = 0
+    private var shelfLocalizationEvidenceSealed = false
     private var latestStructureCoverageSnapshot: ScanStructureCoverageSnapshot?
     private var latestStructureCoverageSummary: ScanStructureCoverageSummary?
     private var performanceSampleCount = 0
@@ -1124,6 +1159,12 @@ final class SupermarketScanSession {
         localizationRecoveryEventCount = 0
         localizationLastRecoveryEpisodeId = nil
         localizationLastRecoveryFinishedAtUptime = nil
+        poseEpochTransitionCount = 0
+        corridorHypothesisCount = 0
+        shelfObservationWindowCount = 0
+        shelfLoopEventCount = 0
+        shelfLocalizationEvidenceWriteFailureCount = 0
+        shelfLocalizationEvidenceSealed = false
         latestStructureCoverageSnapshot = nil
         latestStructureCoverageSummary = nil
         performanceLogLock.lock()
@@ -2180,7 +2221,31 @@ final class SupermarketScanSession {
                             tagBurstLastID:
                                 committedMetadata.tagObservationBurstLastID,
                             tagBurstComplete:
-                                committedMetadata.tagObservationBurstComplete ?? false))
+                                committedMetadata.tagObservationBurstComplete ?? false,
+                            requiresShelfEpochComponent:
+                                committedMetadata
+                                    .shelfLocalizationEvidenceComplete == true))
+                if committedMetadata.shelfLocalizationEvidenceComplete == true,
+                   let poseCount = committedMetadata.poseEpochTransitionCount,
+                   let corridorCount = committedMetadata.corridorHypothesisCount,
+                   let windowCount = committedMetadata.shelfObservationWindowCount,
+                   let loopCount = committedMetadata.shelfLoopEventCount {
+                    do {
+                        _ = try ShelfLocalizationEvidenceParser.validateBundle(
+                            directory: segmentDirectory,
+                            trackingSessionID: trackingSessionId,
+                            poseEpochTransitionCount: poseCount,
+                            corridorHypothesisCount: corridorCount,
+                            shelfObservationWindowCount: windowCount,
+                            shelfLoopEventCount: loopCount)
+                    } catch {
+                        evidenceValidationBlockers.append(
+                            "shelf_localization_evidence_invalid:\(error.localizedDescription)")
+                    }
+                } else {
+                    evidenceValidationBlockers.append(
+                        "shelf_localization_evidence_watermark_missing")
+                }
             }
             else {
                 evidenceValidationBlockers = [
@@ -2479,6 +2544,202 @@ final class SupermarketScanSession {
             print("Could not append scan event log: \(error)")
             return false
         }
+    }
+
+    @discardableResult
+    func appendPoseEpochTransition(
+        _ record: PoseEpochTransitionRecord,
+        expectedTrackingSessionId: String
+    ) -> Bool {
+        appendShelfLocalizationEvidence(
+            record,
+            fileName: PoseEpochTransitionRecord.fileName,
+            expectedTrackingSessionId: expectedTrackingSessionId,
+            sequence: record.sequence,
+            valid: record.isValid,
+            counter: .poseEpochTransition)
+    }
+
+    @discardableResult
+    func appendCorridorHypotheses(
+        _ record: CorridorHypothesesRecord,
+        expectedTrackingSessionId: String
+    ) -> Bool {
+        appendShelfLocalizationEvidence(
+            record,
+            fileName: CorridorHypothesesRecord.fileName,
+            expectedTrackingSessionId: expectedTrackingSessionId,
+            sequence: record.sequence,
+            valid: record.isValid,
+            counter: .corridorHypothesis)
+    }
+
+    @discardableResult
+    func appendShelfObservationWindow(
+        _ record: ShelfObservationWindowRecord,
+        expectedTrackingSessionId: String
+    ) -> Bool {
+        appendShelfLocalizationEvidence(
+            record,
+            fileName: ShelfObservationWindowRecord.fileName,
+            expectedTrackingSessionId: expectedTrackingSessionId,
+            sequence: record.sequence,
+            valid: record.isValid,
+            counter: .shelfObservationWindow)
+    }
+
+    @discardableResult
+    func appendShelfLoopEvent(
+        _ record: ShelfLoopEventRecord,
+        expectedTrackingSessionId: String
+    ) -> Bool {
+        appendShelfLocalizationEvidence(
+            record,
+            fileName: ShelfLoopEventRecord.fileName,
+            expectedTrackingSessionId: expectedTrackingSessionId,
+            sequence: record.sequence,
+            valid: record.isValid,
+            counter: .shelfLoopEvent)
+    }
+
+    private enum ShelfEvidenceCounter {
+        case poseEpochTransition
+        case corridorHypothesis
+        case shelfObservationWindow
+        case shelfLoopEvent
+    }
+
+    private func shelfEvidenceCountLocked(_ counter: ShelfEvidenceCounter) -> Int {
+        switch counter {
+        case .poseEpochTransition: return poseEpochTransitionCount
+        case .corridorHypothesis: return corridorHypothesisCount
+        case .shelfObservationWindow: return shelfObservationWindowCount
+        case .shelfLoopEvent: return shelfLoopEventCount
+        }
+    }
+
+    private func incrementShelfEvidenceCountLocked(_ counter: ShelfEvidenceCounter) {
+        switch counter {
+        case .poseEpochTransition: poseEpochTransitionCount += 1
+        case .corridorHypothesis: corridorHypothesisCount += 1
+        case .shelfObservationWindow: shelfObservationWindowCount += 1
+        case .shelfLoopEvent: shelfLoopEventCount += 1
+        }
+    }
+
+    private func appendShelfLocalizationEvidence<T: Encodable>(
+        _ record: T,
+        fileName: String,
+        expectedTrackingSessionId: String,
+        sequence: Int,
+        valid: Bool,
+        counter: ShelfEvidenceCounter
+    ) -> Bool {
+        guard localizationAdmissionGate.beginTransaction() == nil else {
+            return false
+        }
+        defer { localizationAdmissionGate.endTransaction() }
+        localizationTransactionLock.lock()
+        defer { localizationTransactionLock.unlock() }
+        captureLock.lock()
+        let expectedSequence = shelfEvidenceCountLocked(counter) + 1
+        let identityValid = expectedTrackingSessionId == trackingSessionId
+        let writable = !shelfLocalizationEvidenceSealed
+        captureLock.unlock()
+        guard valid, identityValid, writable, sequence == expectedSequence else {
+            captureLock.lock()
+            shelfLocalizationEvidenceWriteFailureCount += 1
+            captureLock.unlock()
+            recordLocalizationEvidenceFailures([
+                fileName: "invalid_identity_sequence_or_schema"
+            ])
+            return false
+        }
+        let result = appendLocalizationRecord(
+            record,
+            fileName: fileName,
+            expectedTrackingSessionId: expectedTrackingSessionId)
+        captureLock.lock()
+        if result.succeeded {
+            incrementShelfEvidenceCountLocked(counter)
+        } else {
+            shelfLocalizationEvidenceWriteFailureCount += 1
+        }
+        captureLock.unlock()
+        if !result.succeeded {
+            recordLocalizationEvidenceFailures([
+                fileName: result.errorReason ?? "write_failed"
+            ])
+        }
+        return result.succeeded
+    }
+
+    /// Makes all four v5 files explicit, including valid zero-record streams,
+    /// then freezes their exact count/sequence watermarks for metadata.
+    func sealShelfLocalizationEvidence(
+        expectedTrackingSessionId: String,
+        allowDuringFinalization: Bool = false
+    ) -> ShelfLocalizationEvidenceWatermark {
+        guard localizationAdmissionGate.beginTransaction(
+                allowDuringFinalization: allowDuringFinalization) == nil else {
+            captureLock.lock()
+            shelfLocalizationEvidenceWriteFailureCount += 1
+            let watermark = shelfLocalizationEvidenceWatermarkLocked(complete: false)
+            captureLock.unlock()
+            return watermark
+        }
+        defer { localizationAdmissionGate.endTransaction() }
+        localizationTransactionLock.lock()
+        defer { localizationTransactionLock.unlock() }
+        var failed = false
+        do {
+            let directory = try activeLocalizationDirectory(
+                expectedTrackingSessionId: expectedTrackingSessionId,
+                allowDuringFinalization: allowDuringFinalization)
+            for fileName in [
+                PoseEpochTransitionRecord.fileName,
+                CorridorHypothesesRecord.fileName,
+                ShelfObservationWindowRecord.fileName,
+                ShelfLoopEventRecord.fileName,
+            ] {
+                let url = directory.appendingPathComponent(fileName)
+                if !fileManager.fileExists(atPath: url.path) {
+                    try sidecarWriter.writeAtomic(Data(), to: url)
+                }
+            }
+        } catch {
+            failed = true
+            recordLocalizationEvidenceFailures([
+                "shelf_localization_evidence": error.localizedDescription
+            ])
+        }
+        captureLock.lock()
+        if failed { shelfLocalizationEvidenceWriteFailureCount += 1 }
+        shelfLocalizationEvidenceSealed = !failed
+        let watermark = shelfLocalizationEvidenceWatermarkLocked(
+            complete: !failed && shelfLocalizationEvidenceWriteFailureCount == 0)
+        captureLock.unlock()
+        return watermark
+    }
+
+    private func shelfLocalizationEvidenceWatermarkLocked(
+        complete: Bool
+    ) -> ShelfLocalizationEvidenceWatermark {
+        ShelfLocalizationEvidenceWatermark(
+            poseEpochTransitionCount: poseEpochTransitionCount,
+            poseEpochTransitionLastSequence: poseEpochTransitionCount > 0
+                ? poseEpochTransitionCount : nil,
+            corridorHypothesisCount: corridorHypothesisCount,
+            corridorHypothesisLastSequence: corridorHypothesisCount > 0
+                ? corridorHypothesisCount : nil,
+            shelfObservationWindowCount: shelfObservationWindowCount,
+            shelfObservationWindowLastSequence: shelfObservationWindowCount > 0
+                ? shelfObservationWindowCount : nil,
+            shelfLoopEventCount: shelfLoopEventCount,
+            shelfLoopEventLastSequence: shelfLoopEventCount > 0
+                ? shelfLoopEventCount : nil,
+            writeFailureCount: shelfLocalizationEvidenceWriteFailureCount,
+            complete: complete)
     }
 
     func appendLocalizationTrace(

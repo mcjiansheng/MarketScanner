@@ -1,6 +1,8 @@
 # 通道/货架物理约束定位审查整改记录
 
-> 文档状态：**当前有效**。最后核对日期：2026-08-14。
+> 文档状态：**当前有效**。最后核对日期：2026-08-16。
+
+> 2026-08-15 后续状态：本文第 1 节的 P1-B～P2“未完成”是 2026-08-14 整改快照。后续实现已按冻结规格进入代码：manifest v5 四流、epoch/component、三态状态机、点+扫掠线段穿架门、PC 正式 corridor route、accepted concrete shelf-loop/shelf-face 因子和动态结构过滤均已补齐；`map_mismatch` 仲裁按冻结规格不实现。C-1/C-2/C-3 仍为 `CALIBRATION_PENDING`，真机与现场资格仍 NO-GO。当前结论以 [`IMPLEMENTATION_STATUS.md`](IMPLEMENTATION_STATUS.md) 和冻结规格为准。
 
 ## 1. 范围与结论
 
