@@ -228,6 +228,22 @@ def _shelf_evidence_bound(metadata: dict[str, Any]) -> bool:
                 f"Shelf-localization count/last mismatch: {count_field}."
             )
     return True
+
+
+def _shelf_localization_calibration_gate(
+    metadata: dict[str, Any], *, evidence_bound: bool
+) -> tuple[str, bool]:
+    """Return the publication-only calibration disposition.
+
+    Shelf evidence remains useful for review and factor-graph diagnostics
+    while C-1/C-2/C-3 are pending, but it must not authorize publication.
+    Legacy sessions without this evidence contract remain not-applicable.
+    """
+
+    if not evidence_bound:
+        return "NOT_APPLICABLE", True
+    status = str(metadata.get("shelfLocalizationCalibrationStatus") or "MISSING")
+    return status, status == "CALIBRATED"
 EDITABLE_TAG_FIELDS = frozenset(
     {
         "shelf_code",
@@ -10469,6 +10485,23 @@ def _render_localized_version(
         "blockers": review_blockers,
     }
     publish_blockers = list(review_blockers)
+    shelf_calibration_status, shelf_calibration_qualified = (
+        _shelf_localization_calibration_gate(
+            metadata,
+            evidence_bound=input_snapshot.shelf_evidence is not None,
+        )
+    )
+    report["shelf_localization_calibration_status"] = shelf_calibration_status
+    report["shelf_localization_calibration_qualified"] = (
+        shelf_calibration_qualified
+    )
+    if not shelf_calibration_qualified:
+        publish_blockers.append(
+            {
+                "code": "shelf_localization_calibration_pending",
+                "value": shelf_calibration_status,
+            }
+        )
     if diagnostic_only:
         publish_blockers.insert(
             0,

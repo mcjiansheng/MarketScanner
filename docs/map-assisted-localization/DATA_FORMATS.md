@@ -193,14 +193,14 @@ P7R3 把宽搜索改为显式 Recovery episode。`inactive -> active -> converge
 
 `localization_trace` v1 继续用向后兼容可选字段记录 `recoveryEpisodeId/recoveryReason/recoveryOutcome/recoveryValidAttemptCount/recoveryRemainingValidAttempts/recoveryElapsedMs/recoveryFreshSupportFrames/recoveryTriggerCount`。active 记录使用 `recoveryOutcome=active`；结束该 episode 的记录使用终态字符串。数值均为有限小标量，不保存结构点；旧 reader 可忽略这些字段。
 
-可靠 RTAB-Map 回环仍会在 `scan_events.jsonl` 写可读诊断摘要；正式 authority 已迁移到 manifest v5 的 `shelf_observation_windows.jsonl` 与 `shelf_loop_events.jsonl`。只有 exact node 区间、同 component、同 epoch 或正式 bridge、两侧法向 >120°、phone↔shelf 相对 SE(2) 差异不超过 0.5 m/10°、inlier ≥70% 且动态证据不主导时，loop 才可写 `accepted=true` 并进入 PC shelf-face 因子。C-1/C-2/C-3 数值必须随记录保留 `CALIBRATION_PENDING`，不得表述为现场冻结值。
+可靠 RTAB-Map 回环仍会在 `scan_events.jsonl` 写可读诊断摘要；正式 authority 已迁移到 manifest v5 的 `shelf_observation_windows.jsonl` 与 `shelf_loop_events.jsonl`。sidecar v2 的闭环 inlier/median/max 只来自过滤深度点到权威货架物理长边的窗口残差；视觉 loop inlier 与 `optimizationMaxError` 只保留诊断，不参与货架接受。为保持字段只增不删，旧名 `rtab_loop_residual_m` 在 v2 中必须显式为 `null`，真实回调值写入 `rtab_graph_optimization_max_error`，禁止把它冒充 loop residual。只有 exact node 区间、同 component、同 epoch 或正式 bridge、两侧法向 >120°、phone↔shelf 相对 SE(2) 差异不超过 0.5 m/10°、inlier ≥70% 且动态证据不主导时，loop 才可写 `accepted=true` 并进入 PC shelf-face 因子。C-1/C-2/C-3 数值必须随记录保留 `CALIBRATION_PENDING`，不得表述为现场冻结值。
 
 ## Manifest v5 通道/货架证据
 
 - `pose_epoch_transitions.jsonl`：相邻 epoch、前后 exact node、有限 SE(2) 变换和可选正式 bridge evidence；跨 epoch loop 没有完整 bridge 链时不得接受。
-- `corridor_hypotheses.jsonl`：exact node/map/component/epoch、bounded top-K、top1/top2 margin、点/扫掠线段穿架计数和沿轴/横轴/yaw covariance。
-- `shelf_observation_windows.jsonl`：exact node/time range、component/epoch、left/right、地图法向、bounded shelf candidates、覆盖角、端头可见、动态剔除计数、prior-map 与 distance-field SHA。
-- `shelf_loop_events.jsonl`：两个窗口、具体 shelf segment、RTAB loop 身份/残差、phone↔shelf SE(2)、一致性指标、接受结果/原因和标定状态。
+- `corridor_hypotheses.jsonl`：exact node/map/component/epoch、bounded top-K、距离分/独立结构盆地分/拓扑可达性/组合分、top1/top2 margin、三态/当前通道/货架/侧/低置信原因、点/扫掠线段穿架计数和沿轴/横轴/yaw covariance。
+- `shelf_observation_windows.jsonl`：exact node/time range、component/epoch、left/right、地图法向、bounded shelf candidates、深度点到物理货架面的 sample/inlier/median/max、覆盖角、端头可见、动态剔除计数、prior-map 与 distance-field SHA。
+- `shelf_loop_events.jsonl`：两个窗口、具体 shelf segment、RTAB loop 身份、nullable 旧 residual 键、真实 graph optimization diagnostic、phone↔shelf SE(2)、由两窗口几何复算的一致性指标、接受结果/原因和标定状态。
 
 四个文件允许 0 行但必须存在；严格 UTF-8 JSONL、无空行、末行换行、未知字段拒绝、sequence/write_watermark 从 1 连续增长。metadata 同时声明四个文件及 exact count/last-sequence、`shelfLocalizationEvidenceComplete=true` 和 `shelfLocalizationCalibrationStatus=CALIBRATION_PENDING`。manifest v5 的 trace 和 tag observation v2 必须逐记录携带 epoch/component；v1-v4 继续只读兼容但没有 formal shelf-loop authority。
 

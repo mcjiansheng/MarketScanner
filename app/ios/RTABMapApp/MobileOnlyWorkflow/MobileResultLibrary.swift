@@ -8,11 +8,13 @@ import Foundation
 /// full processing pipeline translation unit.
 enum MobileResultPublicationInvariant {
     static let coordinateContractVersion = 2
+    static let publicationInvariantVersion = 2
 
     static func permits(
         coordinatesArePriorMapFrame: Bool,
         graphQualityPassed: Bool,
         degradationCount: Int,
+        shelfLocalizationCalibrationQualified: Bool,
         coordinateFrameAuditPassed: Bool,
         legacyCoordinateFrameCount: Int,
         lowConfidenceTagCount: Int,
@@ -23,6 +25,7 @@ enum MobileResultPublicationInvariant {
         coordinatesArePriorMapFrame
             && graphQualityPassed
             && degradationCount == 0
+            && shelfLocalizationCalibrationQualified
             && coordinateFrameAuditPassed
             && legacyCoordinateFrameCount == 0
             && lowConfidenceTagCount == 0
@@ -70,8 +73,30 @@ enum MobileResultPublicationInvariant {
               legacyCount >= 0 else {
             return false
         }
+        let publicationVersion = StrictJSONScalar.integer(
+            manifest["publication_invariant_version"]) ?? 1
+        guard publicationVersion == 1
+                || publicationVersion == publicationInvariantVersion else {
+            return false
+        }
+        let calibrationQualified: Bool
+        if publicationVersion >= 2 {
+            guard let qualified = StrictJSONScalar.boolean(
+                    manifest["shelf_localization_calibration_qualified"]),
+                  let calibrationStatus = manifest[
+                    "shelf_localization_calibration_status"] as? String,
+                  ["CALIBRATION_PENDING", "CALIBRATED", "NOT_APPLICABLE"]
+                    .contains(calibrationStatus),
+                  qualified == (calibrationStatus == "CALIBRATED"
+                    || calibrationStatus == "NOT_APPLICABLE") else {
+                return false
+            }
+            calibrationQualified = qualified
+        } else {
+            calibrationQualified = true
+        }
         if publish {
-            return degradationCount == 0
+            return degradationCount == 0 && calibrationQualified
                 && coordinateAuditPassed
                 && legacyCount == 0
                 && lowConfidenceCount == 0
@@ -295,6 +320,7 @@ enum MobileResultLibrary {
         "package_files", "artifacts",
         "store_id", "prior_map_id", "prior_map_sha256",
         "canonical_source_sha256", "coordinate_contract_version",
+        "publication_invariant_version",
         "deliverable_contract_version",
         "tracking_session_id", "source_database", "input_bundle_sha256",
         "native_core_sha256", "processing_path",
@@ -310,6 +336,8 @@ enum MobileResultLibrary {
         "coordinate_frame_audit_passed",
         "legacy_tag_coordinate_frame_count",
         "performance_sample_count", "performance_evidence_complete",
+        "shelf_localization_calibration_status",
+        "shelf_localization_calibration_qualified",
     ]
 
     /// Test/embedding hook; see `MobileMapLibrary.rootOverride`.

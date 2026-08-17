@@ -575,6 +575,26 @@ final class PriorMapScanMatcher {
         return total / Double(points.count)
     }
 
+    /// Independent structure-basin support used by the corridor tracker.
+    /// This evaluates the observed depth points at the corridor projection;
+    /// it is deliberately separate from phone-to-road distance so a nearby
+    /// parallel aisle cannot certify itself from pose proximity alone.
+    func evidenceScore(
+        pose: PriorMapPose2D,
+        observation: PriorMapStructureObservation
+    ) -> Double {
+        guard let finest = levels.last,
+              observation.points.count >= Self.minimumSearchPointCount else {
+            return 0
+        }
+        let strideValue = max(1, observation.points.count / maximumPoints)
+        let points = observation.points.enumerated().compactMap {
+            $0.offset % strideValue == 0 ? $0.element : nil
+        }
+        let value = cost(pose: pose, points: points, level: finest)
+        return max(0, min(1, exp(-value / 0.08)))
+    }
+
     private func search(
         around center: PriorMapPose2D,
         points: [SIMD2<Double>],

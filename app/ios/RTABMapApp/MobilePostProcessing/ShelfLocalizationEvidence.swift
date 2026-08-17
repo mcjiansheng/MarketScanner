@@ -6,7 +6,7 @@ import Foundation
 /// CALIBRATION_PENDING until a signed LiDAR device run freezes them in the
 /// product specification; callers must expose that status in quality output.
 enum ShelfLocalizationPolicy {
-    static let contractVersion = 1
+    static let contractVersion = 2
     static let calibrationStatus = "CALIBRATION_PENDING"
 
     // S-7 / S-11 / S-12 are frozen product values, not calibration knobs.
@@ -23,6 +23,15 @@ enum ShelfLocalizationPolicy {
     static let calibrationPendingMinimumOpposingNormalRad =
         120.0 * Double.pi / 180.0
     static let calibrationPendingLowConfidenceMargin = 0.15
+    // C-1 starting values. They remain publication-ineligible until a signed
+    // LiDAR field run freezes the calibration revision.
+    static let calibrationPendingGeometryInlierResidualM = 0.20
+    static let calibrationPendingGeometryScoreScaleM = 0.25
+    // Broad candidate-only bound; it cannot accept or publish a shelf loop.
+    static let maximumShelfGeometryCandidateResidualM = 0.75
+    // Require structural evidence to be present without inventing another
+    // field-calibration threshold beyond C-1/C-2/C-3.
+    static let minimumPresentStructureBasinScore = 1.0e-9
     static let calibrationPendingReliableLoopDistanceM = 30.0
     static let calibrationPendingDynamicPersistenceSeconds = 10.0
 
@@ -117,10 +126,16 @@ struct PoseEpochTransitionRecord: Codable, Equatable {
 
 struct CorridorHypothesisEvidence: Codable, Equatable {
     let corridorID: String
+    let distanceScore: Double
+    let structureBasinScore: Double
+    let topologyReachable: Bool
     let score: Double
 
     enum CodingKeys: String, CodingKey {
         case corridorID = "corridor_id"
+        case distanceScore = "distance_score"
+        case structureBasinScore = "structure_basin_score"
+        case topologyReachable = "topology_reachable"
         case score
     }
 }
@@ -162,6 +177,11 @@ struct CorridorHypothesesRecord: Codable, Equatable {
     let component: Int64
     let hypotheses: [CorridorHypothesisEvidence]
     let top1Top2Margin: Double
+    let trackingState: ShelfTrackingState
+    let selectedCorridorID: String
+    let selectedShelfSegmentID: String
+    let selectedShelfSide: String
+    let lowConfidenceReasons: [String]
     let penetrationAudit: ShelfPenetrationAudit
     let covariance: ShelfLocalizationCovariance
     let writeWatermark: Int
@@ -173,6 +193,11 @@ struct CorridorHypothesesRecord: Codable, Equatable {
         case nodeTimestamp = "node_timestamp"
         case nodeMapID = "node_map_id"
         case top1Top2Margin = "top1_top2_margin"
+        case trackingState = "tracking_state"
+        case selectedCorridorID = "selected_corridor_id"
+        case selectedShelfSegmentID = "selected_shelf_segment_id"
+        case selectedShelfSide = "selected_shelf_side"
+        case lowConfidenceReasons = "low_confidence_reasons"
         case penetrationAudit = "penetration_audit"
         case writeWatermark = "write_watermark"
     }
@@ -186,12 +211,39 @@ struct CorridorHypothesesRecord: Codable, Equatable {
             && hypotheses.allSatisfy {
                 !$0.corridorID.isEmpty && $0.score.isFinite
                     && (0.0...1.0).contains($0.score)
+                    && $0.distanceScore.isFinite
+                    && (0.0...1.0).contains($0.distanceScore)
+                    && $0.structureBasinScore.isFinite
+                    && (0.0...1.0).contains($0.structureBasinScore)
             }
             && Set(hypotheses.map(\.corridorID)).count == hypotheses.count
             && zip(hypotheses, hypotheses.dropFirst()).allSatisfy { pair in
                 pair.0.score >= pair.1.score
             }
             && top1Top2Margin.isFinite && top1Top2Margin >= 0
+            && (selectedCorridorID.isEmpty
+                || hypotheses.first?.corridorID == selectedCorridorID)
+            && (["unknown", "left", "right"].contains(selectedShelfSide))
+            && (selectedShelfSegmentID.isEmpty
+                == (selectedShelfSide == "unknown"))
+            && Set(lowConfidenceReasons).count == lowConfidenceReasons.count
+            && lowConfidenceReasons.allSatisfy { !$0.isEmpty }
+            && (hypotheses.first.map {
+                $0.structureBasinScore
+                    >= ShelfLocalizationPolicy
+                        .minimumPresentStructureBasinScore
+                    || lowConfidenceReasons.contains(
+                        "structure_basin_support_insufficient")
+            } ?? true)
+            && (hypotheses.first.map {
+                $0.topologyReachable
+                    || lowConfidenceReasons.contains(
+                        "topology_reachability_failed")
+            } ?? true)
+            && (trackingState == .tracking
+                ? lowConfidenceReasons.isEmpty
+                : !lowConfidenceReasons.isEmpty)
+            && (trackingState != .bootstrap || selectedCorridorID.isEmpty)
             && penetrationAudit.nodeInsideShelfCount >= 0
             && penetrationAudit.segmentCrossingCount >= 0
             && covariance.alongM.isFinite && covariance.alongM >= 0
@@ -221,6 +273,32 @@ struct ShelfCandidateEvidence: Codable, Equatable {
     }
 }
 
+struct ShelfWindowGeometryEvidence: Codable, Equatable {
+    let sampleCount: Int
+    let inlierCount: Int
+    let inlierRatio: Double
+    let residualMedianM: Double
+    let residualMaximumM: Double
+
+    enum CodingKeys: String, CodingKey {
+        case sampleCount = "sample_count"
+        case inlierCount = "inlier_count"
+        case inlierRatio = "inlier_ratio"
+        case residualMedianM = "residual_median_m"
+        case residualMaximumM = "residual_maximum_m"
+    }
+
+    var isValid: Bool {
+        sampleCount >= 12 && inlierCount >= 0 && inlierCount <= sampleCount
+            && inlierRatio.isFinite
+            && abs(inlierRatio - Double(inlierCount) / Double(sampleCount))
+                <= 1.0e-9
+            && residualMedianM.isFinite && residualMedianM >= 0
+            && residualMaximumM.isFinite
+            && residualMaximumM >= residualMedianM
+    }
+}
+
 struct ShelfObservationWindowRecord: Codable, Equatable {
     static let fileName = "shelf_observation_windows.jsonl"
     static let formatName = "MarketScannerShelfObservationWindow"
@@ -237,6 +315,7 @@ struct ShelfObservationWindowRecord: Codable, Equatable {
     let side: String
     let faceNormalMap: ShelfFaceNormal
     let shelfCandidates: [ShelfCandidateEvidence]
+    let geometry: ShelfWindowGeometryEvidence
     let coverageAngleRad: Double
     let endcapVisible: Bool
     let dynamicRejectionCount: Int
@@ -252,6 +331,7 @@ struct ShelfObservationWindowRecord: Codable, Equatable {
         case timeRange = "time_range"
         case faceNormalMap = "face_normal_map"
         case shelfCandidates = "shelf_candidates"
+        case geometry
         case coverageAngleRad = "coverage_angle_rad"
         case endcapVisible = "endcap_visible"
         case dynamicRejectionCount = "dynamic_rejection_count"
@@ -268,6 +348,7 @@ struct ShelfObservationWindowRecord: Codable, Equatable {
             && timeRange.allSatisfy(\.isFinite) && timeRange[1] >= timeRange[0]
             && epoch >= 0 && component >= 0 && ["left", "right"].contains(side)
             && faceNormalMap.isFiniteUnit && !shelfCandidates.isEmpty
+            && geometry.isValid
             && shelfCandidates.count <= ShelfLocalizationPolicy.maximumShelfCandidates
             && shelfCandidates.allSatisfy {
                 !$0.shelfSegmentID.isEmpty && $0.score.isFinite
@@ -314,6 +395,28 @@ struct ShelfLoopConsistency: Codable, Equatable {
     }
 }
 
+/// Encodes the v1 compatibility field as an explicit JSON null. A normal
+/// Optional would be omitted by synthesized Encodable and violate the strict
+/// field-set contract.
+struct ShelfLegacyLoopResidualNull: Codable, Equatable {
+    init() {}
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        guard container.decodeNil() else {
+            throw DecodingError.dataCorruptedError(
+                in: container,
+                debugDescription:
+                    "rtab_loop_residual_m must be null in shelf contract v2")
+        }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encodeNil()
+    }
+}
+
 struct ShelfLoopEventRecord: Codable, Equatable {
     static let fileName = "shelf_loop_events.jsonl"
     static let formatName = "MarketScannerShelfLoopEvent"
@@ -330,7 +433,10 @@ struct ShelfLoopEventRecord: Codable, Equatable {
     let loopFromNode: Int64
     let loopToNode: Int64
     let rtabLoopID: Int
-    let rtabLoopResidualM: Double
+    /// Version-1 compatibility key. Version 2 must encode this as null because
+    /// RTAB-Map's optimizationMaxError callback is not a loop residual.
+    let legacyRtabLoopResidualM: ShelfLegacyLoopResidualNull
+    let rtabGraphOptimizationMaxError: Double
     let phoneShelfSE2: ShelfPhoneRelativePose
     let consistency: ShelfLoopConsistency
     let accepted: Bool
@@ -347,14 +453,15 @@ struct ShelfLoopEventRecord: Codable, Equatable {
         case loopFromNode = "loop_from_node"
         case loopToNode = "loop_to_node"
         case rtabLoopID = "rtab_loop_id"
-        case rtabLoopResidualM = "rtab_loop_residual_m"
+        case legacyRtabLoopResidualM = "rtab_loop_residual_m"
+        case rtabGraphOptimizationMaxError = "rtab_graph_optimization_max_error"
         case phoneShelfSE2 = "phone_shelf_se2"
         case calibrationStatus = "calibration_status"
         case writeWatermark = "write_watermark"
     }
 
     var isValid: Bool {
-        let finite = rtabLoopResidualM.isFinite
+        let finite = rtabGraphOptimizationMaxError.isFinite
             && phoneShelfSE2.dxM.isFinite && phoneShelfSE2.dyM.isFinite
             && phoneShelfSE2.dyawRad.isFinite
             && consistency.relativePoseDeltaM.isFinite
@@ -370,7 +477,7 @@ struct ShelfLoopEventRecord: Codable, Equatable {
             && sides.count == 2 && sides.allSatisfy { ["left", "right"].contains($0) }
             && sides[0] != sides[1] && epoch >= 0 && component >= 0
             && loopFromNode > 0 && loopToNode > 0 && rtabLoopID >= 0
-            && finite && rtabLoopResidualM >= 0
+            && finite && rtabGraphOptimizationMaxError >= 0
             && (0.0...1.0).contains(consistency.inlierRatio)
             && consistency.residualMedianM >= 0 && consistency.residualMaximumM >= 0
             && !reason.isEmpty
@@ -420,6 +527,14 @@ struct ShelfTrackingStateMachine {
                 .calibrationPendingLowConfidenceMargin {
                 reasons.append("top1_top2_margin_below_calibration_pending_threshold")
             }
+        }
+        if let best = ordered.first,
+           best.structureBasinScore
+            < ShelfLocalizationPolicy.minimumPresentStructureBasinScore {
+            reasons.append("structure_basin_support_insufficient")
+        }
+        if let best = ordered.first, !best.topologyReachable {
+            reasons.append("topology_reachability_failed")
         }
         if distanceSinceReliableLoopM.isFinite
             && distanceSinceReliableLoopM
@@ -484,6 +599,10 @@ enum ShelfLoopVerifier {
                 >= ShelfLocalizationPolicy.calibrationPendingLowConfidenceMargin,
               candidateRelativeMargin(second)
                 >= ShelfLocalizationPolicy.calibrationPendingLowConfidenceMargin,
+              first.geometry.inlierRatio
+                >= ShelfLocalizationPolicy.calibrationPendingLoopInlierRatio,
+              second.geometry.inlierRatio
+                >= ShelfLocalizationPolicy.calibrationPendingLoopInlierRatio,
               !dominantDynamicEvidence,
               let angle = opposingNormalAngle(
                 first.faceNormalMap, second.faceNormalMap) else {
@@ -739,12 +858,16 @@ enum ShelfLocalizationEvidenceParser {
     private static let corridorFields: Set<String> = [
         "format", "version", "tracking_session_id", "sequence", "node_id",
         "node_timestamp", "node_map_id", "epoch", "component", "hypotheses",
-        "top1_top2_margin", "penetration_audit", "covariance", "write_watermark",
+        "top1_top2_margin", "tracking_state", "selected_corridor_id",
+        "selected_shelf_segment_id", "selected_shelf_side",
+        "low_confidence_reasons", "penetration_audit", "covariance",
+        "write_watermark",
     ]
     private static let windowFields: Set<String> = [
         "format", "version", "tracking_session_id", "sequence", "window_id",
         "node_range", "time_range", "epoch", "component", "side",
         "face_normal_map", "shelf_candidates", "coverage_angle_rad",
+        "geometry",
         "endcap_visible", "dynamic_rejection_count", "prior_map_sha256",
         "distance_field_sha256", "write_watermark",
     ]
@@ -752,7 +875,8 @@ enum ShelfLocalizationEvidenceParser {
         "format", "version", "tracking_session_id", "sequence",
         "shelf_segment_id", "window_ids", "sides", "epoch", "component",
         "loop_from_node", "loop_to_node", "rtab_loop_id",
-        "rtab_loop_residual_m", "phone_shelf_se2", "consistency", "accepted",
+        "rtab_loop_residual_m", "rtab_graph_optimization_max_error",
+        "phone_shelf_se2", "consistency", "accepted",
         "reason", "calibration_status", "write_watermark",
     ]
 
@@ -881,6 +1005,25 @@ enum ShelfLocalizationEvidenceParser {
                 inlierRatio: loop.consistency.inlierRatio,
                 hasEpochBridge: hasBridge,
                 dominantDynamicEvidence: dominantDynamicEvidence)
+            let expectedGeometryInlierRatio = min(
+                first.geometry.inlierRatio,
+                second.geometry.inlierRatio)
+            let expectedGeometryMedian = max(
+                first.geometry.residualMedianM,
+                second.geometry.residualMedianM)
+            let expectedGeometryMaximum = max(
+                first.geometry.residualMaximumM,
+                second.geometry.residualMaximumM)
+            guard abs(loop.consistency.inlierRatio
+                    - expectedGeometryInlierRatio) <= 1.0e-9,
+                  abs(loop.consistency.residualMedianM
+                    - expectedGeometryMedian) <= 1.0e-9,
+                  abs(loop.consistency.residualMaximumM
+                    - expectedGeometryMaximum) <= 1.0e-9 else {
+                throw ParseError.record(
+                    ShelfLoopEventRecord.fileName, loop.sequence,
+                    "loop_geometry_summary_mismatch")
+            }
             guard loop.accepted == qualifies else {
                 throw ParseError.record(
                     ShelfLoopEventRecord.fileName, loop.sequence,
@@ -956,7 +1099,10 @@ enum ShelfLocalizationEvidenceParser {
                     ["type", "independent_node_pairs", "consensus_inlier_ratio"])
         case CorridorHypothesesRecord.fileName:
             return exactObjects(
-                    object["hypotheses"], ["corridor_id", "score"])
+                    object["hypotheses"], [
+                        "corridor_id", "distance_score",
+                        "structure_basin_score", "topology_reachable", "score",
+                    ])
                 && exactObject(
                     object["penetration_audit"],
                     ["node_inside_shelf_count", "segment_crossing_count"])
@@ -966,6 +1112,11 @@ enum ShelfLocalizationEvidenceParser {
             return exactObject(object["face_normal_map"], ["x", "y"])
                 && exactObjects(
                     object["shelf_candidates"], ["shelf_segment_id", "score"])
+                && exactObject(
+                    object["geometry"], [
+                        "sample_count", "inlier_count", "inlier_ratio",
+                        "residual_median_m", "residual_maximum_m",
+                    ])
         case ShelfLoopEventRecord.fileName:
             return exactObject(
                     object["phone_shelf_se2"], ["dx_m", "dy_m", "dyaw_rad"])

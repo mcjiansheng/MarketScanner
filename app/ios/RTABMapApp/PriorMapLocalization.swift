@@ -358,6 +358,10 @@ struct PriorMapPackage {
 struct PriorMapRoadCandidate: Codable {
     let edgeId: String
     let distanceM: Double
+    let distanceScore: Double
+    let structureBasinScore: Double
+    let topologyReachable: Bool
+    let combinedScore: Double
 }
 
 struct PriorMapLocalizationUpdate: Codable {
@@ -434,6 +438,8 @@ struct PriorMapLocalizationUpdate: Codable {
 
 private struct PriorMapRoadSegment {
     let id: String
+    let fromNodeID: String
+    let toNodeID: String
     let start: SIMD2<Double>
     let end: SIMD2<Double>
 }
@@ -444,6 +450,18 @@ private struct PriorMapProjectedCandidate {
     let point: SIMD2<Double>
 }
 
+private struct PriorMapShelfFaceSegment {
+    let start: SIMD2<Double>
+    let end: SIMD2<Double>
+}
+
+private struct PriorMapEligibleShelfSegment {
+    let segment: PriorMapShelfSegmentV2
+    let distance: Double
+    let nearest: SIMD2<Double>
+    let fraction: Double
+}
+
 struct PriorMapShelfIdentityCandidate {
     let shelfSegmentId: String
     let shelfCode: String
@@ -451,6 +469,15 @@ struct PriorMapShelfIdentityCandidate {
     let nearestXM: Double
     let nearestYM: Double
     let longitudinalFraction: Double
+    let geometrySampleCount: Int
+    let geometryInlierCount: Int
+    let geometryInlierRatio: Double
+    let geometryResidualMedianM: Double
+    let geometryResidualMaximumM: Double
+    let geometryScore: Double
+    /// Bounded raw residuals retained only until a five-node observation
+    /// window has been summarized. They are never written to trace JSON.
+    let geometryResidualsM: [Double]
 }
 
 /// Immutable two-phase manual-alignment proposal. Preparing a proposal never
@@ -486,6 +513,7 @@ final class PriorMapStageOneLocalizer {
     private let priorMapSha256: String
     private let shelves: [PriorMapShelf]
     private let shelfSegments: [PriorMapShelfSegmentV2]
+    private let shelfFaceSegmentsByID: [String: [PriorMapShelfFaceSegment]]
     private let shelfPolygons: [[PriorMapPose2D]]
     private let fixedStructures: [PriorMapFixedStructure]
     private var latestFloorEstimate: PriorMapFloorEstimate?
@@ -497,6 +525,9 @@ final class PriorMapStageOneLocalizer {
     private var pendingRecoveryCompletion: PriorMapRecoveryCompletion?
     private var terminalRecoveryCompletionsAwaitingEvidence:
         [PriorMapRecoveryCompletion] = []
+    private var lastSelectedRoadEdgeID: String?
+    private var latestShelfGeometryCandidates:
+        [PriorMapShelfIdentityCandidate] = []
 
     init(
         package: PriorMapPackage,
@@ -512,9 +543,40 @@ final class PriorMapStageOneLocalizer {
         self.priorMapId = package.manifest.priorMapId
         self.priorMapSha256 = package.packageSha256
         self.shelves = package.shelves
-        self.shelfSegments = package.shelfSegments.filter {
+        let floorShelfSegments = package.shelfSegments.filter {
             $0.floorID == floorId
         }
+        self.shelfSegments = floorShelfSegments
+        var faceSegmentsByID: [String: [PriorMapShelfFaceSegment]] = [:]
+        for segment in floorShelfSegments {
+            guard segment.longitudinalAxis.count == 2,
+                  let shelf = package.shelves.first(where: {
+                    $0.id == segment.shelfSegmentID && $0.floorId == floorId
+                  }) else { continue }
+            let axis = SIMD2<Double>(
+                segment.longitudinalAxis[0],
+                segment.longitudinalAxis[1])
+            let points = shelf.geometry.coordinates.compactMap { value in
+                value.count >= 2
+                    ? SIMD2<Double>(value[0], value[1]) : nil
+            }
+            guard points.count >= 3 else { continue }
+            var faces: [PriorMapShelfFaceSegment] = []
+            for index in points.indices {
+                let start = points[index]
+                let end = points[(index + 1) % points.count]
+                let delta = end - start
+                let length = simd_length(delta)
+                guard length > 1.0e-6 else { continue }
+                let alignment = abs(simd_dot(delta / length, axis))
+                if alignment >= 0.90 {
+                    faces.append(PriorMapShelfFaceSegment(
+                        start: start, end: end))
+                }
+            }
+            if !faces.isEmpty { faceSegmentsByID[segment.shelfSegmentID] = faces }
+        }
+        self.shelfFaceSegmentsByID = faceSegmentsByID
         self.shelfPolygons = package.shelves.compactMap { shelf in
             guard shelf.floorId == floorId,
                   shelf.geometry.coordinates.count >= 3,
@@ -546,7 +608,12 @@ final class PriorMapStageOneLocalizer {
                   let end = positions[edge.to] else {
                 return nil
             }
-            return PriorMapRoadSegment(id: edge.id, start: start, end: end)
+            return PriorMapRoadSegment(
+                id: edge.id,
+                fromNodeID: edge.from,
+                toNodeID: edge.to,
+                start: start,
+                end: end)
         }
         self.segmentsById = Dictionary(
             uniqueKeysWithValues: segments.map { ($0.id, $0) })
@@ -625,19 +692,42 @@ final class PriorMapStageOneLocalizer {
             now: monotonicClock.now)
     }
 
-    /// Diagnostic-only top-K shelf identities near the current map pose.
-    ///
-    /// This does not alter the alignment and is deliberately separate from
-    /// strict localization sidecars. It proves which concrete shelf segments
-    /// are geometrically plausible after a reliable RTAB-Map loop so the
-    /// phone can retain ambiguity instead of pretending that a whole-map
-    /// distance-field basin already identifies one shelf.
+    /// Top-K shelf identities supported by the latest filtered depth geometry.
+    /// Pose proximity is only an eligibility radius; ordering and acceptance
+    /// come from point-to-segment residuals. An update without enough depth
+    /// support clears this list, preventing the current pose from certifying
+    /// its own shelf identity.
     func nearbyShelfIdentityCandidates(
         limit: Int = 5,
         radiusM: Double = 6.0
     ) -> [PriorMapShelfIdentityCandidate] {
-        let pose = latestEstimatedPose
-        return shelfSegments.compactMap { segment in
+        Array(latestShelfGeometryCandidates.filter {
+            $0.distanceM <= radiusM
+        }.prefix(max(1, min(ShelfLocalizationPolicy.maximumShelfCandidates, limit))))
+    }
+
+    private func shelfGeometryCandidates(
+        pose: PriorMapPose2D,
+        observation: PriorMapStructureObservation?,
+        candidateLimit: Int
+    ) -> [PriorMapShelfIdentityCandidate] {
+        guard let observation,
+              observation.points.count >= 12 else { return [] }
+        let cosine = cos(pose.yawRad)
+        let sine = sin(pose.yawRad)
+        let strideValue = max(1, observation.points.count / 600)
+        let mapPoints: [SIMD2<Double>] = observation.points.enumerated().compactMap {
+            item -> SIMD2<Double>? in
+            guard item.offset % strideValue == 0 else { return nil }
+            let point = item.element
+            return SIMD2<Double>(
+                pose.xM + cosine * point.x - sine * point.y,
+                pose.yM + sine * point.x + cosine * point.y)
+        }
+        let phone = SIMD2<Double>(pose.xM, pose.yM)
+        let eligibleSegments: [PriorMapEligibleShelfSegment] =
+            shelfSegments.compactMap {
+            segment -> PriorMapEligibleShelfSegment? in
             guard segment.longitudinalStartM.count == 2,
                   segment.longitudinalEndM.count == 2 else {
                 return nil
@@ -648,32 +738,98 @@ final class PriorMapStageOneLocalizer {
             let end = SIMD2<Double>(
                 segment.longitudinalEndM[0],
                 segment.longitudinalEndM[1])
-            let point = SIMD2<Double>(pose.xM, pose.yM)
             let delta = end - start
             let lengthSquared = simd_length_squared(delta)
             guard lengthSquared > 1.0e-12 else { return nil }
-            let fraction = min(
+            let phoneFraction = min(
                 1.0,
-                max(0.0, simd_dot(point - start, delta) / lengthSquared))
-            let nearest = start + delta * fraction
-            let distance = simd_distance(point, nearest)
-            guard distance <= radiusM else { return nil }
+                max(0.0, simd_dot(phone - start, delta) / lengthSquared))
+            let nearest = start + delta * phoneFraction
+            let distance = simd_distance(phone, nearest)
+            guard distance <= 6.0 else { return nil }
+            return PriorMapEligibleShelfSegment(
+                segment: segment,
+                distance: distance,
+                nearest: nearest,
+                fraction: phoneFraction)
+        }.sorted { first, second in
+            if first.distance != second.distance {
+                return first.distance < second.distance
+            }
+            return first.segment.shelfSegmentID < second.segment.shelfSegmentID
+        }
+        let boundedSegments = eligibleSegments.prefix(max(
+            1,
+            min(ShelfLocalizationPolicy.maximumCorridorHypotheses, candidateLimit)))
+        let candidates: [PriorMapShelfIdentityCandidate] = boundedSegments.compactMap {
+            eligible -> PriorMapShelfIdentityCandidate? in
+            let segment = eligible.segment
+            guard let shelfFaces = shelfFaceSegmentsByID[segment.shelfSegmentID],
+                  !shelfFaces.isEmpty else { return nil }
+            var residuals: [Double] = []
+            residuals.reserveCapacity(mapPoints.count)
+            for point in mapPoints {
+                let residual = shelfFaces.reduce(Double.greatestFiniteMagnitude) {
+                    current, face in
+                    let faceDelta = face.end - face.start
+                    let faceLengthSquared = simd_length_squared(faceDelta)
+                    guard faceLengthSquared > 1.0e-12 else { return current }
+                    let fraction = min(1, max(
+                        0,
+                        simd_dot(point - face.start, faceDelta)
+                            / faceLengthSquared))
+                    return min(
+                        current,
+                        simd_distance(
+                            point,
+                            face.start + faceDelta * fraction))
+                }
+                // Exclude unrelated distant structures before evaluating the
+                // two authoritative physical long faces.
+                if residual <= ShelfLocalizationPolicy
+                    .maximumShelfGeometryCandidateResidualM {
+                    residuals.append(residual)
+                }
+            }
+            guard residuals.count >= 12 else { return nil }
+            residuals.sort()
+            let inlierCount = residuals.filter {
+                $0 <= ShelfLocalizationPolicy
+                    .calibrationPendingGeometryInlierResidualM
+            }.count
+            let inlierRatio = Double(inlierCount) / Double(residuals.count)
+            let median = residuals[residuals.count / 2]
+            let maximum = residuals.last ?? median
+            let support = min(1, Double(residuals.count) / 45.0)
+            let score = inlierRatio * exp(
+                -median
+                    / ShelfLocalizationPolicy
+                        .calibrationPendingGeometryScoreScaleM) * support
             return PriorMapShelfIdentityCandidate(
                 shelfSegmentId: segment.shelfSegmentID,
                 shelfCode: segment.shelfCode,
-                distanceM: distance,
-                nearestXM: nearest.x,
-                nearestYM: nearest.y,
-                longitudinalFraction: fraction)
+                distanceM: eligible.distance,
+                nearestXM: eligible.nearest.x,
+                nearestYM: eligible.nearest.y,
+                longitudinalFraction: eligible.fraction,
+                geometrySampleCount: residuals.count,
+                geometryInlierCount: inlierCount,
+                geometryInlierRatio: inlierRatio,
+                geometryResidualMedianM: median,
+                geometryResidualMaximumM: maximum,
+                geometryScore: score,
+                geometryResidualsM: residuals)
         }
-        .sorted { first, second in
-            if first.distanceM != second.distanceM {
-                return first.distanceM < second.distanceM
+        return candidates.sorted { first, second in
+            if first.geometryScore != second.geometryScore {
+                return first.geometryScore > second.geometryScore
+            }
+            if first.geometryResidualMedianM != second.geometryResidualMedianM {
+                return first.geometryResidualMedianM
+                    < second.geometryResidualMedianM
             }
             return first.shelfSegmentId < second.shelfSegmentId
         }
-        .prefix(max(1, min(5, limit)))
-        .map { $0 }
     }
 
     /// Cancels the active Recovery episode and returns the terminal completion
@@ -720,7 +876,10 @@ final class PriorMapStageOneLocalizer {
     func update(
         frame: ARFrame,
         trackingState: String,
-        poseOverride: simd_float4x4? = nil
+        poseOverride: simd_float4x4? = nil,
+        shelfEvidenceCandidateLimit: Int =
+            ShelfLocalizationPolicy.maximumCorridorHypotheses,
+        computeShelfGeometryEvidence: Bool = true
     ) -> PriorMapLocalizationUpdate {
         // All location-bearing consumers of one accepted ARFrame must use the
         // same software-stabilized pose. Falling back to ARKit is retained for
@@ -1002,7 +1161,57 @@ final class PriorMapStageOneLocalizer {
             consecutiveUntrustedFrames += 1
         }
         let confidence = recoveryReduction.nextConfidence
+        let previousRoadEdgeID = lastSelectedRoadEdgeID
+        let previousRoadSegment = previousRoadEdgeID.flatMap { segmentsById[$0] }
+        let unsortedRoadEvidence: [PriorMapRoadCandidate] = topCandidates.map {
+            candidate -> PriorMapRoadCandidate in
+            let distanceScore = max(0, 1 - candidate.distanceM / candidateRadiusM)
+            let basinScore = observation.map {
+                matcher.evidenceScore(
+                    pose: PriorMapPose2D(
+                        xM: candidate.point.x,
+                        yM: candidate.point.y,
+                        yawRad: estimatedPose.yawRad),
+                    observation: $0)
+            } ?? 0
+            let topologyReachable: Bool
+            if let previousRoadSegment {
+                topologyReachable = candidate.segment.id == previousRoadSegment.id
+                    || candidate.segment.fromNodeID == previousRoadSegment.fromNodeID
+                    || candidate.segment.fromNodeID == previousRoadSegment.toNodeID
+                    || candidate.segment.toNodeID == previousRoadSegment.fromNodeID
+                    || candidate.segment.toNodeID == previousRoadSegment.toNodeID
+            } else {
+                topologyReachable = true
+            }
+            let combined: Double = 0.45 * distanceScore + 0.40 * basinScore
+                + (topologyReachable ? 0.15 : 0)
+            let clampedCombined = max(0.0, min(1.0, combined))
+            return PriorMapRoadCandidate(
+                edgeId: candidate.segment.id,
+                distanceM: candidate.distanceM,
+                distanceScore: distanceScore,
+                structureBasinScore: basinScore,
+                topologyReachable: topologyReachable,
+                combinedScore: clampedCombined)
+        }
+        let roadEvidence = unsortedRoadEvidence.sorted { first, second in
+            first.combinedScore == second.combinedScore
+                ? first.edgeId < second.edgeId
+                : first.combinedScore > second.combinedScore
+        }
+        lastSelectedRoadEdgeID = roadEvidence.first?.edgeId
         latestEstimatedPose = estimatedPose
+        if computeShelfGeometryEvidence {
+            latestShelfGeometryCandidates = shelfGeometryCandidates(
+                pose: estimatedPose,
+                observation: observation,
+                candidateLimit: shelfEvidenceCandidateLimit)
+        } else {
+            // Never let a skipped evidence tick expose stale geometry to a
+            // coincident RTAB loop callback.
+            latestShelfGeometryCandidates.removeAll()
+        }
         latestConfidence = confidence.confidence
         latestPhase = confidence.phase
         var update = PriorMapLocalizationUpdate(
@@ -1014,11 +1223,7 @@ final class PriorMapStageOneLocalizer {
             confidence: confidence.confidence,
             rawPose: rawPose,
             estimatedPose: estimatedPose,
-            roadCandidates: topCandidates.map {
-                PriorMapRoadCandidate(
-                    edgeId: $0.segment.id,
-                    distanceM: $0.distanceM)
-            },
+            roadCandidates: roadEvidence,
             structureSource: observation?.source ?? "unavailable",
             structurePointCount: observation?.validPointCount ?? 0,
             structureCoverageAngleRad: observation?.coverageAngleRad ?? 0,
@@ -1146,6 +1351,8 @@ final class PriorMapStageOneLocalizer {
         latestConfidence = 0.35
         depthSampler.reset()
         dynamicShelfEvidenceFilter.reset()
+        lastSelectedRoadEdgeID = nil
+        latestShelfGeometryCandidates.removeAll()
         if recoveryController.activeEpisode != nil {
             _ = finishRecovery(
                 outcome: .manualReset,

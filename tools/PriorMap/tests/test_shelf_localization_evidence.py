@@ -5,7 +5,11 @@ import tempfile
 from pathlib import Path
 import unittest
 
-from tools.PriorMap.offline_localization import Pose, build_shelf_face_constraints
+from tools.PriorMap.offline_localization import (
+    Pose,
+    _shelf_localization_calibration_gate,
+    build_shelf_face_constraints,
+)
 from tools.PriorMap.factor_graph_runner import _write_priors
 from tools.PriorMap.shelf_localization_evidence import (
     ShelfEvidenceError,
@@ -17,6 +21,11 @@ from tools.PriorMap.shelf_localization_evidence import (
 SESSION = "tracking-1"
 MAP_SHA = "a" * 64
 DISTANCE_SHA = "b" * 64
+SHARED_FIXTURE = (
+    Path(__file__).with_name("fixtures")
+    / "shelf_localization"
+    / "valid_v2.json"
+)
 
 
 def metadata(**updates: object) -> dict[str, object]:
@@ -40,7 +49,7 @@ def metadata(**updates: object) -> dict[str, object]:
 def corridor() -> dict[str, object]:
     return {
         "format": "MarketScannerCorridorHypotheses",
-        "version": 1,
+        "version": 2,
         "tracking_session_id": SESSION,
         "sequence": 1,
         "node_id": 1,
@@ -48,8 +57,17 @@ def corridor() -> dict[str, object]:
         "node_map_id": 0,
         "epoch": 1,
         "component": 0,
-        "hypotheses": [{"corridor_id": "aisle-1", "score": 0.9}],
+        "hypotheses": [{
+            "corridor_id": "aisle-1", "distance_score": 0.9,
+            "structure_basin_score": 0.8, "topology_reachable": True,
+            "score": 0.875,
+        }],
         "top1_top2_margin": 0.9,
+        "tracking_state": "TRACKING",
+        "selected_corridor_id": "aisle-1",
+        "selected_shelf_segment_id": "shelf-1",
+        "selected_shelf_side": "right",
+        "low_confidence_reasons": [],
         "penetration_audit": {
             "node_inside_shelf_count": 0,
             "segment_crossing_count": 0,
@@ -63,7 +81,7 @@ def window(sequence: int, side: str, normal_x: float) -> dict[str, object]:
     first_node = 1 if sequence == 1 else 6
     return {
         "format": "MarketScannerShelfObservationWindow",
-        "version": 1,
+        "version": 2,
         "tracking_session_id": SESSION,
         "sequence": sequence,
         "window_id": f"window-{sequence}",
@@ -74,6 +92,10 @@ def window(sequence: int, side: str, normal_x: float) -> dict[str, object]:
         "side": side,
         "face_normal_map": {"x": normal_x, "y": 0.0},
         "shelf_candidates": [{"shelf_segment_id": "shelf-1", "score": 0.9}],
+        "geometry": {
+            "sample_count": 20, "inlier_count": 16, "inlier_ratio": 0.8,
+            "residual_median_m": 0.1, "residual_maximum_m": 0.2,
+        },
         "coverage_angle_rad": 0.5,
         "endcap_visible": False,
         # One rejected dynamic sample out of five is not dominant.
@@ -87,7 +109,7 @@ def window(sequence: int, side: str, normal_x: float) -> dict[str, object]:
 def loop(*, accepted: bool = True) -> dict[str, object]:
     return {
         "format": "MarketScannerShelfLoopEvent",
-        "version": 1,
+        "version": 2,
         "tracking_session_id": SESSION,
         "sequence": 1,
         "shelf_segment_id": "shelf-1",
@@ -98,7 +120,8 @@ def loop(*, accepted: bool = True) -> dict[str, object]:
         "loop_from_node": 5,
         "loop_to_node": 10,
         "rtab_loop_id": 1,
-        "rtab_loop_residual_m": 0.1,
+        "rtab_loop_residual_m": None,
+        "rtab_graph_optimization_max_error": 0.1,
         "phone_shelf_se2": {"dx_m": 1.0, "dy_m": 1.2, "dyaw_rad": 0.0},
         "consistency": {
             "relative_pose_delta_m": 0.2,
@@ -127,6 +150,39 @@ def values() -> dict[str, tuple[dict[str, object], ...]]:
 
 
 class ShelfLocalizationEvidenceTests(unittest.TestCase):
+    def test_shared_v2_fixture_is_accepted_by_pc_reader(self) -> None:
+        fixture = json.loads(SHARED_FIXTURE.read_text(encoding="utf-8"))
+        records = {
+            name: tuple(items) for name, items in fixture["records"].items()
+        }
+        shared_metadata = {
+            "trackingSessionId": fixture["tracking_session_id"],
+            "priorMapSha256": fixture["prior_map_sha256"],
+            "shelfLocalizationEvidenceComplete": True,
+            "poseEpochTransitionCount": 0,
+            "poseEpochTransitionLastSequence": None,
+            "corridorHypothesisCount": 1,
+            "corridorHypothesisLastSequence": 1,
+            "shelfObservationWindowCount": 2,
+            "shelfObservationWindowLastSequence": 2,
+            "shelfLoopEventCount": 1,
+            "shelfLoopEventLastSequence": 1,
+        }
+        bundle = validate_shelf_localization_records(records, shared_metadata)
+        self.assertEqual(len(bundle.accepted_shelf_loops), 1)
+
+    def test_pending_calibration_is_a_publication_blocker(self) -> None:
+        status, qualified = _shelf_localization_calibration_gate(
+            {"shelfLocalizationCalibrationStatus": "CALIBRATION_PENDING"},
+            evidence_bound=True,
+        )
+        self.assertEqual(status, "CALIBRATION_PENDING")
+        self.assertFalse(qualified)
+        self.assertEqual(
+            _shelf_localization_calibration_gate({}, evidence_bound=False),
+            ("NOT_APPLICABLE", True),
+        )
+
     def test_strict_bundle_and_shelf_factors(self) -> None:
         bundle = validate_shelf_localization_records(values(), metadata())
         self.assertEqual(len(bundle.accepted_shelf_loops), 1)
@@ -187,6 +243,49 @@ class ShelfLocalizationEvidenceTests(unittest.TestCase):
             records["shelf_observation_windows.jsonl"][1],
         )
         with self.assertRaisesRegex(ShelfEvidenceError, "frozen criteria"):
+            validate_shelf_localization_records(records, metadata())
+
+    def test_depth_geometry_not_visual_graph_metric_controls_acceptance(self) -> None:
+        records = values()
+        damaged_windows = []
+        for source in records["shelf_observation_windows.jsonl"]:
+            item = dict(source)
+            item["geometry"] = {
+                "sample_count": 20,
+                "inlier_count": 12,
+                "inlier_ratio": 0.6,
+                "residual_median_m": 0.3,
+                "residual_maximum_m": 0.5,
+            }
+            damaged_windows.append(item)
+        event = dict(records["shelf_loop_events.jsonl"][0])
+        event["rtab_graph_optimization_max_error"] = 0.0
+        event["consistency"] = {
+            **event["consistency"],
+            "inlier_ratio": 0.6,
+            "residual_median_m": 0.3,
+            "residual_maximum_m": 0.5,
+        }
+        records["shelf_observation_windows.jsonl"] = tuple(damaged_windows)
+        records["shelf_loop_events.jsonl"] = (event,)
+        with self.assertRaisesRegex(ShelfEvidenceError, "frozen criteria"):
+            validate_shelf_localization_records(records, metadata())
+
+        # Conversely this diagnostic graph setting cannot veto an otherwise
+        # valid shelf-geometry loop; it is stored under its real name only.
+        valid_records = values()
+        diagnostic = dict(valid_records["shelf_loop_events.jsonl"][0])
+        diagnostic["rtab_graph_optimization_max_error"] = 99.0
+        valid_records["shelf_loop_events.jsonl"] = (diagnostic,)
+        bundle = validate_shelf_localization_records(valid_records, metadata())
+        self.assertEqual(len(bundle.accepted_shelf_loops), 1)
+
+    def test_legacy_loop_residual_key_is_retained_but_must_be_null(self) -> None:
+        records = values()
+        event = dict(records["shelf_loop_events.jsonl"][0])
+        event["rtab_loop_residual_m"] = 0.1
+        records["shelf_loop_events.jsonl"] = (event,)
+        with self.assertRaisesRegex(ShelfEvidenceError, "must be null"):
             validate_shelf_localization_records(records, metadata())
 
     def test_unknown_field_and_watermark_fail_closed(self) -> None:

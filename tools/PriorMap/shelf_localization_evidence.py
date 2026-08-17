@@ -15,7 +15,7 @@ from tools.PriorMap.generated_mobile_evidence_contracts import (
 )
 
 
-CONTRACT_VERSION = 1
+CONTRACT_VERSION = 2
 CALIBRATION_STATUS = "CALIBRATION_PENDING"
 SHA256_RE = re.compile(r"[0-9a-f]{64}")
 
@@ -59,12 +59,16 @@ ROOT_FIELDS: dict[str, frozenset[str]] = {
     "corridor_hypotheses.jsonl": frozenset({
         "format", "version", "tracking_session_id", "sequence", "node_id",
         "node_timestamp", "node_map_id", "epoch", "component", "hypotheses",
-        "top1_top2_margin", "penetration_audit", "covariance", "write_watermark",
+        "top1_top2_margin", "tracking_state", "selected_corridor_id",
+        "selected_shelf_segment_id", "selected_shelf_side",
+        "low_confidence_reasons", "penetration_audit", "covariance",
+        "write_watermark",
     }),
     "shelf_observation_windows.jsonl": frozenset({
         "format", "version", "tracking_session_id", "sequence", "window_id",
         "node_range", "time_range", "epoch", "component", "side",
         "face_normal_map", "shelf_candidates", "coverage_angle_rad",
+        "geometry",
         "endcap_visible", "dynamic_rejection_count", "prior_map_sha256",
         "distance_field_sha256", "write_watermark",
     }),
@@ -72,7 +76,8 @@ ROOT_FIELDS: dict[str, frozenset[str]] = {
         "format", "version", "tracking_session_id", "sequence",
         "shelf_segment_id", "window_ids", "sides", "epoch", "component",
         "loop_from_node", "loop_to_node", "rtab_loop_id",
-        "rtab_loop_residual_m", "phone_shelf_se2", "consistency", "accepted",
+        "rtab_loop_residual_m", "rtab_graph_optimization_max_error",
+        "phone_shelf_se2", "consistency", "accepted",
         "reason", "calibration_status", "write_watermark",
     }),
 }
@@ -251,12 +256,20 @@ def _validate_corridor(value: dict[str, Any]) -> None:
     corridor_scores: list[float] = []
     for hypothesis in hypotheses:
         hypothesis = _exact_object(
-            hypothesis, {"corridor_id", "score"}, "corridor hypothesis"
+            hypothesis,
+            {"corridor_id", "distance_score", "structure_basin_score",
+             "topology_reachable", "score"},
+            "corridor hypothesis",
         )
         corridor_ids.append(_string(hypothesis["corridor_id"], "corridor_id"))
         corridor_scores.append(
             _number(hypothesis["score"], "corridor score", minimum=0.0)
         )
+        for key in ("distance_score", "structure_basin_score"):
+            if _number(hypothesis[key], key, minimum=0.0) > 1.0:
+                raise ShelfEvidenceError(f"{key} exceeds one")
+        if type(hypothesis["topology_reachable"]) is not bool:
+            raise ShelfEvidenceError("topology_reachable must be boolean")
     if any(score > 1.0 for score in corridor_scores):
         raise ShelfEvidenceError("corridor score exceeds one")
     if len(set(corridor_ids)) != len(corridor_ids):
@@ -266,6 +279,40 @@ def _validate_corridor(value: dict[str, Any]) -> None:
     )):
         raise ShelfEvidenceError("corridor hypotheses are not score ordered")
     _number(value["top1_top2_margin"], "top1_top2_margin", minimum=0.0)
+    if value["tracking_state"] not in {"BOOTSTRAP", "TRACKING", "LOW_CONFIDENCE"}:
+        raise ShelfEvidenceError("tracking_state is invalid")
+    selected_corridor = value["selected_corridor_id"]
+    if not isinstance(selected_corridor, str) or (
+        selected_corridor and (not corridor_ids or selected_corridor != corridor_ids[0])
+    ):
+        raise ShelfEvidenceError("selected_corridor_id is invalid")
+    selected_shelf = value["selected_shelf_segment_id"]
+    selected_side = value["selected_shelf_side"]
+    if not isinstance(selected_shelf, str) or selected_side not in {
+        "unknown", "left", "right"
+    } or ((not selected_shelf) != (selected_side == "unknown")):
+        raise ShelfEvidenceError("selected shelf/side state is invalid")
+    reasons = value["low_confidence_reasons"]
+    if (
+        not isinstance(reasons, list)
+        or any(not isinstance(item, str) or not item for item in reasons)
+        or len(set(reasons)) != len(reasons)
+        or ((value["tracking_state"] == "TRACKING") == bool(reasons))
+        or (value["tracking_state"] == "BOOTSTRAP" and bool(selected_corridor))
+    ):
+        raise ShelfEvidenceError("low-confidence reasons are invalid")
+    if hypotheses:
+        best = hypotheses[0]
+        if (
+            float(best["structure_basin_score"]) < 1.0e-9
+            and "structure_basin_support_insufficient" not in reasons
+        ):
+            raise ShelfEvidenceError("weak structure basin was not persisted")
+        if (
+            best["topology_reachable"] is not True
+            and "topology_reachability_failed" not in reasons
+        ):
+            raise ShelfEvidenceError("topology failure was not persisted")
     audit = _exact_object(
         value["penetration_audit"],
         {"node_inside_shelf_count", "segment_crossing_count"},
@@ -337,6 +384,26 @@ def _validate_window(value: dict[str, Any], prior_map_sha256: str) -> None:
         raise ShelfEvidenceError("window prior-map identity mismatch")
     if SHA256_RE.fullmatch(str(value["distance_field_sha256"])) is None:
         raise ShelfEvidenceError("window distance-field identity is invalid")
+    geometry = _exact_object(
+        value["geometry"],
+        {"sample_count", "inlier_count", "inlier_ratio",
+         "residual_median_m", "residual_maximum_m"},
+        "geometry",
+    )
+    sample_count = _integer(geometry["sample_count"], "sample_count", minimum=12)
+    inlier_count = _integer(geometry["inlier_count"], "inlier_count")
+    ratio = _number(geometry["inlier_ratio"], "inlier_ratio", minimum=0.0)
+    median = _number(geometry["residual_median_m"], "residual_median_m", minimum=0.0)
+    maximum = _number(
+        geometry["residual_maximum_m"], "residual_maximum_m", minimum=0.0
+    )
+    if (
+        inlier_count > sample_count
+        or ratio > 1.0
+        or abs(ratio - inlier_count / sample_count) > 1.0e-9
+        or maximum < median
+    ):
+        raise ShelfEvidenceError("window geometry summary is invalid")
 
 
 def _validate_loop(value: dict[str, Any]) -> None:
@@ -354,7 +421,15 @@ def _validate_loop(value: dict[str, Any]) -> None:
     _integer(value["loop_from_node"], "loop_from_node", minimum=1)
     _integer(value["loop_to_node"], "loop_to_node", minimum=1)
     _integer(value["rtab_loop_id"], "rtab_loop_id")
-    _number(value["rtab_loop_residual_m"], "rtab_loop_residual_m", minimum=0.0)
+    if value["rtab_loop_residual_m"] is not None:
+        raise ShelfEvidenceError(
+            "v2 rtab_loop_residual_m must be null; optimizationMaxError is not a loop residual"
+        )
+    _number(
+        value["rtab_graph_optimization_max_error"],
+        "rtab_graph_optimization_max_error",
+        minimum=0.0,
+    )
     pose = _exact_object(
         value["phone_shelf_se2"], {"dx_m", "dy_m", "dyaw_rad"}, "phone_shelf_se2"
     )
@@ -450,6 +525,26 @@ def _validate_loop_references(
         a * b for a, b in zip(first_normal, second_normal)
     ))))
     consistency = loop["consistency"]
+    expected_inlier_ratio = min(
+        float(first["geometry"]["inlier_ratio"]),
+        float(second["geometry"]["inlier_ratio"]),
+    )
+    expected_median = max(
+        float(first["geometry"]["residual_median_m"]),
+        float(second["geometry"]["residual_median_m"]),
+    )
+    expected_maximum = max(
+        float(first["geometry"]["residual_maximum_m"]),
+        float(second["geometry"]["residual_maximum_m"]),
+    )
+    if (
+        abs(float(consistency["inlier_ratio"]) - expected_inlier_ratio) > 1.0e-9
+        or abs(float(consistency["residual_median_m"]) - expected_median)
+            > 1.0e-9
+        or abs(float(consistency["residual_maximum_m"]) - expected_maximum)
+            > 1.0e-9
+    ):
+        raise ShelfEvidenceError("loop geometry summary mismatch")
     first_sample_count = int(first["node_range"][1]) - int(
         first["node_range"][0]
     ) + 1
@@ -471,6 +566,10 @@ def _validate_loop_references(
         and consistency["relative_pose_delta_yaw_rad"]
             <= CALIBRATION_PENDING_LOOP_YAW_RAD
         and consistency["inlier_ratio"] >= CALIBRATION_PENDING_LOOP_INLIER_RATIO
+        and first["geometry"]["inlier_ratio"]
+            >= CALIBRATION_PENDING_LOOP_INLIER_RATIO
+        and second["geometry"]["inlier_ratio"]
+            >= CALIBRATION_PENDING_LOOP_INLIER_RATIO
         and not dominant_dynamic
     )
     if loop["accepted"] != qualifies:

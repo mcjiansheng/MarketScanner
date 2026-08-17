@@ -11818,12 +11818,13 @@ catch {
 do {
     func permits(
         low: Int = 0, unpositioned: Int = 0, unassociated: Int = 0,
-        rescans: Int = 0, legacy: Int = 0
+        rescans: Int = 0, legacy: Int = 0, calibrationQualified: Bool = true
     ) -> Bool {
         MobileResultPublicationInvariant.permits(
             coordinatesArePriorMapFrame: true,
             graphQualityPassed: true,
             degradationCount: 0,
+            shelfLocalizationCalibrationQualified: calibrationQualified,
             coordinateFrameAuditPassed: legacy == 0,
             legacyCoordinateFrameCount: legacy,
             lowConfidenceTagCount: low,
@@ -11837,6 +11838,9 @@ do {
     require(!permits(unassociated: 1), "unassociated tag must block COMPLETE")
     require(!permits(rescans: 1), "rescan task must block COMPLETE")
     require(!permits(legacy: 1), "legacy coordinate frame must block COMPLETE")
+    require(
+        !permits(calibrationQualified: false),
+        "CALIBRATION_PENDING shelf evidence must block COMPLETE")
     let tamperedComplete: [String: Any] = [
         "result_quality_status": "COMPLETE",
         "publish_permitted": true,
@@ -11853,6 +11857,25 @@ do {
         !MobileResultPublicationInvariant.manifestIsConsistent(
             tamperedComplete),
         "reader must reject a tampered COMPLETE manifest with tag blockers")
+    let pendingCalibrationComplete: [String: Any] = [
+        "result_quality_status": "COMPLETE",
+        "publish_permitted": true,
+        "coordinate_contract_version": 2,
+        "publication_invariant_version": 2,
+        "coordinate_frame_audit_passed": true,
+        "legacy_tag_coordinate_frame_count": 0,
+        "degradation_count": 0,
+        "low_confidence_tag_count": 0,
+        "unpositioned_tag_count": 0,
+        "unassociated_tag_count": 0,
+        "rescan_count": 0,
+        "shelf_localization_calibration_status": "CALIBRATION_PENDING",
+        "shelf_localization_calibration_qualified": false,
+    ]
+    require(
+        !MobileResultPublicationInvariant.manifestIsConsistent(
+            pendingCalibrationComplete),
+        "reader must reject COMPLETE while shelf calibration is pending")
 }
 
 // =====================================================================
@@ -19996,14 +20019,26 @@ do {
     let shaA = String(repeating: "a", count: 64)
     let shaB = String(repeating: "b", count: 64)
     let corridor = CorridorHypothesesRecord(
-        format: CorridorHypothesesRecord.formatName, version: 1,
+        format: CorridorHypothesesRecord.formatName,
+        version: ShelfLocalizationPolicy.contractVersion,
         trackingSessionID: sessionID, sequence: 1, nodeID: 10,
         nodeTimestamp: 10, nodeMapID: 0, epoch: 1, component: 0,
         hypotheses: [
-            CorridorHypothesisEvidence(corridorID: "road-a", score: 0.9),
-            CorridorHypothesisEvidence(corridorID: "road-b", score: 0.4),
+            CorridorHypothesisEvidence(
+                corridorID: "road-a", distanceScore: 0.9,
+                structureBasinScore: 0.9, topologyReachable: true,
+                score: 0.9),
+            CorridorHypothesisEvidence(
+                corridorID: "road-b", distanceScore: 0.5,
+                structureBasinScore: 0.3, topologyReachable: true,
+                score: 0.4),
         ],
         top1Top2Margin: 0.555555,
+        trackingState: .tracking,
+        selectedCorridorID: "road-a",
+        selectedShelfSegmentID: "shelf-12",
+        selectedShelfSide: "right",
+        lowConfidenceReasons: [],
         penetrationAudit: ShelfPenetrationAudit(
             nodeInsideShelfCount: 0, segmentCrossingCount: 0),
         covariance: ShelfLocalizationCovariance(
@@ -20017,7 +20052,8 @@ do {
         nodeStart: Int64
     ) -> ShelfObservationWindowRecord {
         ShelfObservationWindowRecord(
-            format: ShelfObservationWindowRecord.formatName, version: 1,
+            format: ShelfObservationWindowRecord.formatName,
+            version: ShelfLocalizationPolicy.contractVersion,
             trackingSessionID: sessionID, sequence: sequence,
             windowID: id, nodeRange: [nodeStart, nodeStart + 4],
             timeRange: [Double(nodeStart), Double(nodeStart) + 2],
@@ -20027,6 +20063,9 @@ do {
                 ShelfCandidateEvidence(shelfSegmentID: "shelf-12", score: 0.9),
                 ShelfCandidateEvidence(shelfSegmentID: "shelf-14", score: 0.5),
             ],
+            geometry: ShelfWindowGeometryEvidence(
+                sampleCount: 20, inlierCount: 17, inlierRatio: 0.85,
+                residualMedianM: 0.2, residualMaximumM: 0.3),
             coverageAngleRad: 1.9, endcapVisible: false,
             dynamicRejectionCount: 1, priorMapSHA256: shaA,
             distanceFieldSHA256: shaB, writeWatermark: sequence)
@@ -20038,12 +20077,14 @@ do {
         sequence: 2, id: "sow-2", side: "left",
         normal: ShelfFaceNormal(x: 0, y: -1), nodeStart: 30)
     let loop = ShelfLoopEventRecord(
-        format: ShelfLoopEventRecord.formatName, version: 1,
+        format: ShelfLoopEventRecord.formatName,
+        version: ShelfLocalizationPolicy.contractVersion,
         trackingSessionID: sessionID, sequence: 1,
         shelfSegmentID: "shelf-12", windowIDs: ["sow-1", "sow-2"],
         sides: ["right", "left"], epoch: 1, component: 0,
         loopFromNode: 24, loopToNode: 34, rtabLoopID: 7,
-        rtabLoopResidualM: 0.2,
+        legacyRtabLoopResidualM: ShelfLegacyLoopResidualNull(),
+        rtabGraphOptimizationMaxError: 0.2,
         phoneShelfSE2: ShelfPhoneRelativePose(
             dxM: 1.2, dyM: 1.1, dyawRad: 0.02),
         consistency: ShelfLoopConsistency(
@@ -20082,11 +20123,65 @@ do {
             && summary.shelfLoopEventCount == 1,
         "manifest-v5 Swift parser must accept a valid two-sided shelf loop")
 
+    // The same immutable fixture is consumed by the Python reader test.
+    // This guards field-set/version/category parity instead of maintaining
+    // two hand-authored positive graphs that can silently drift.
+    let sharedFixtureURL = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+        .appendingPathComponent("fixtures/shelf_localization/valid_v2.json")
+    let sharedFixtureData = try Data(contentsOf: sharedFixtureURL)
+    guard let sharedFixture = try JSONSerialization.jsonObject(
+            with: sharedFixtureData) as? [String: Any],
+          sharedFixture["format"] as? String
+            == "MarketScannerShelfLocalizationFixture",
+          let sharedRecords = sharedFixture["records"] as? [String: Any] else {
+        throw NSError(
+            domain: "ShelfFixture", code: 1,
+            userInfo: [NSLocalizedDescriptionKey: "shared fixture invalid"])
+    }
+    let sharedDirectory = try p7r6FreshDirectory("shelf-evidence-shared-v2")
+    for name in [
+        PoseEpochTransitionRecord.fileName,
+        CorridorHypothesesRecord.fileName,
+        ShelfObservationWindowRecord.fileName,
+        ShelfLoopEventRecord.fileName,
+    ] {
+        guard let rows = sharedRecords[name] as? [[String: Any]] else {
+            throw NSError(
+                domain: "ShelfFixture", code: 2,
+                userInfo: [NSLocalizedDescriptionKey: "shared rows invalid"])
+        }
+        var bytes = Data()
+        for row in rows {
+            bytes.append(try JSONSerialization.data(
+                withJSONObject: row, options: [.sortedKeys]))
+            bytes.append(0x0a)
+        }
+        try bytes.write(to: sharedDirectory.appendingPathComponent(name))
+    }
+    let sharedSummary = try ShelfLocalizationEvidenceParser.validateBundle(
+        directory: sharedDirectory,
+        trackingSessionID: "shelf-contract-session",
+        poseEpochTransitionCount: 0,
+        corridorHypothesisCount: 1,
+        shelfObservationWindowCount: 2,
+        shelfLoopEventCount: 1)
+    require(
+        sharedSummary.shelfLoopEventCount == 1,
+        "shared shelf v2 fixture must pass the Swift reader")
+
     var stateMachine = ShelfTrackingStateMachine()
     let lowDecision = stateMachine.update(
         hypotheses: [
-            CorridorHypothesisEvidence(corridorID: "road-a", score: 0.80),
-            CorridorHypothesisEvidence(corridorID: "road-b", score: 0.75),
+            CorridorHypothesisEvidence(
+                corridorID: "road-a", distanceScore: 0.8,
+                structureBasinScore: 0.8, topologyReachable: true,
+                score: 0.80),
+            CorridorHypothesisEvidence(
+                corridorID: "road-b", distanceScore: 0.75,
+                structureBasinScore: 0.75, topologyReachable: true,
+                score: 0.75),
         ],
         distanceSinceReliableLoopM: 5,
         recentTrackingDegradationCount: 0)
@@ -20096,8 +20191,14 @@ do {
         "S-8 must commit top1 while marking ambiguity LOW_CONFIDENCE")
     let recoveredDecision = stateMachine.update(
         hypotheses: [
-            CorridorHypothesisEvidence(corridorID: "road-a", score: 0.80),
-            CorridorHypothesisEvidence(corridorID: "road-b", score: 0.75),
+            CorridorHypothesisEvidence(
+                corridorID: "road-a", distanceScore: 0.8,
+                structureBasinScore: 0.8, topologyReachable: true,
+                score: 0.80),
+            CorridorHypothesisEvidence(
+                corridorID: "road-b", distanceScore: 0.75,
+                structureBasinScore: 0.75, topologyReachable: true,
+                score: 0.75),
         ],
         distanceSinceReliableLoopM: 5,
         recentTrackingDegradationCount: 0,

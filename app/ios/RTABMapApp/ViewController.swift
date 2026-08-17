@@ -68,6 +68,8 @@ private struct PendingShelfObservationWindow {
     var sampleCount: Int
     var maximumCoverageAngleRad: Double
     var dynamicRejectionCount: Int
+    var geometryResidualsM: [Double]
+    var geometryInlierCount: Int
     var phonePoseXSum: Double
     var phonePoseYSum: Double
     var phonePoseSinYawSum: Double
@@ -270,6 +272,8 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
     private var corridorHypothesisSequence = 0
     private var lastCorridorHypothesisNodeID: Int64?
     private var recentShelfTrackingDegradationCount = 0
+    private var selectedShelfSegmentID = ""
+    private var selectedShelfSide = "unknown"
     private var pendingShelfObservationWindow: PendingShelfObservationWindow?
     private var shelfObservationWindowSequence = 0
     private var recentShelfObservationWindows:
@@ -277,6 +281,7 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
     private var recentShelfWindowRelativePoses:
         [String: ShelfPhoneRelativePose] = [:]
     private var shelfLoopEventSequence = 0
+    private var lastShelfEvidenceResourcePolicyLevel = -1
     private let mMapCorrectionLock = NSLock()
     private var mMapToOdomCorrection = matrix_identity_float4x4
     private var mLastAcceptedARPose: simd_float4x4?
@@ -1262,18 +1267,18 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                                     loopFromNode: loopClosureCurrentId,
                                     loopToNode: loopClosureTargetId,
                                     rtabLoopID: loopClosureId,
-                                    rtabLoopResidualM: Double(max(
+                                    rtabGraphOptimizationMaxError: Double(max(
                                         0, optimizationMaxError)),
-                                    inlierRatio: loopInlierRatio)
+                                    visualLoopInlierRatio: loopInlierRatio)
                             }
                             self.supermarketSession?.appendScanEvent(
                                 level: shelfCandidates.count == 1
                                     ? "info" : "warning",
                                 event: "loop_opened_shelf_identity_candidates",
-                                message: "Reliable RTAB-Map loop opened bounded recovery; pose-neighborhood shelf top-K candidates were retained for later structure disambiguation",
+                                message: "Reliable RTAB-Map loop opened bounded recovery; the latest filtered depth-geometry shelf top-K was retained",
                                 fields: [
                                     "authority": "manifest_v5_shelf_loop_candidate",
-                                    "candidate_source": "latest_estimated_pose_before_post_loop_structure_search",
+                                    "candidate_source": "filtered_depth_point_to_shelf_segment_residuals",
                                     "identity_status": identityStatus,
                                     "candidate_count": "\(shelfCandidates.count)",
                                     "shelf_segment_ids": shelfCandidates
@@ -1284,6 +1289,9 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                                         .joined(separator: ","),
                                     "distances_m": shelfCandidates
                                         .map { String(format: "%.3f", $0.distanceM) }
+                                        .joined(separator: ","),
+                                    "geometry_scores": shelfCandidates
+                                        .map { String(format: "%.4f", $0.geometryScore) }
                                         .joined(separator: ","),
                                     "longitudinal_fractions": shelfCandidates
                                         .map {
@@ -2146,11 +2154,14 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         corridorHypothesisSequence = 0
         lastCorridorHypothesisNodeID = nil
         recentShelfTrackingDegradationCount = 0
+        selectedShelfSegmentID = ""
+        selectedShelfSide = "unknown"
         pendingShelfObservationWindow = nil
         shelfObservationWindowSequence = 0
         recentShelfObservationWindows.removeAll()
         recentShelfWindowRelativePoses.removeAll()
         shelfLoopEventSequence = 0
+        lastShelfEvidenceResourcePolicyLevel = -1
         mLastAcceptedARPose = nil
         mLastAcceptedARTimestamp = nil
         mTrackingWasDegraded = true
@@ -3499,6 +3510,41 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         }
     }
 
+    /// Frozen degradation order: retain the full 24-candidate evidence first,
+    /// then reduce to 12, and only under the next resource-pressure level
+    /// reduce observation frequency. Raw RTAB-Map capture is never throttled
+    /// by this diagnostic/constraint sidecar policy.
+    private func shelfEvidenceResourcePolicy()
+        -> (level: Int, candidateLimit: Int, nodeStride: Int) {
+        let level = max(
+            mStreamingThermalPolicyLevel,
+            mStreamingMemoryPressureLevel)
+        if level <= 0 { return (0, 24, 1) }
+        if level == 1 { return (1, 12, 1) }
+        if level == 2 { return (2, 12, 2) }
+        return (3, 12, 4)
+    }
+
+    private func auditShelfEvidenceResourcePolicyIfNeeded(
+        scanSession: SupermarketScanSession
+    ) {
+        let policy = shelfEvidenceResourcePolicy()
+        guard policy.level != lastShelfEvidenceResourcePolicyLevel else {
+            return
+        }
+        lastShelfEvidenceResourcePolicyLevel = policy.level
+        scanSession.appendScanEvent(
+            level: policy.level == 0 ? "info" : "warning",
+            event: "shelf_evidence_resource_policy",
+            message: "Shelf evidence resource policy changed without changing raw capture",
+            fields: [
+                "policy_level": String(policy.level),
+                "candidate_limit": String(policy.candidateLimit),
+                "accepted_node_stride": String(policy.nodeStride),
+                "order": "24_to_12_then_frequency",
+            ])
+    }
+
     @discardableResult
     private func persistCorridorHypotheses(
         update: PriorMapLocalizationUpdate,
@@ -3510,14 +3556,19 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
     ) -> Bool {
         let nodeID = Int64(binding.nodeId)
         if lastCorridorHypothesisNodeID == nodeID { return true }
+        let policy = shelfEvidenceResourcePolicy()
         let limitedCandidates = Array(update.roadCandidates.prefix(
-            ShelfLocalizationPolicy.maximumCorridorHypotheses))
+            min(
+                ShelfLocalizationPolicy.maximumCorridorHypotheses,
+                policy.candidateLimit)))
         var hypotheses: [CorridorHypothesisEvidence] = limitedCandidates.map {
             candidate in
-            let score = max(0.0, 1.0 - candidate.distanceM / 3.0)
             return CorridorHypothesisEvidence(
                 corridorID: candidate.edgeId,
-                score: score)
+                distanceScore: candidate.distanceScore,
+                structureBasinScore: candidate.structureBasinScore,
+                topologyReachable: candidate.topologyReachable,
+                score: candidate.combinedScore)
         }
         hypotheses.sort { lhs, rhs in
             if lhs.score == rhs.score {
@@ -3563,6 +3614,11 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
             component: component,
             hypotheses: hypotheses,
             top1Top2Margin: relativeMargin,
+            trackingState: decision.state,
+            selectedCorridorID: decision.selectedCorridorID ?? "",
+            selectedShelfSegmentID: selectedShelfSegmentID,
+            selectedShelfSide: selectedShelfSide,
+            lowConfidenceReasons: decision.lowConfidenceReasons,
             penetrationAudit: ShelfPenetrationAudit(
                 nodeInsideShelfCount: update.shelfNodePenetrationCount,
                 segmentCrossingCount: update.shelfSegmentCrossingCount),
@@ -3594,10 +3650,16 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         epoch: Int,
         component: Int64
     ) -> Bool {
+        let policy = shelfEvidenceResourcePolicy()
+        guard Int64(binding.nodeId) % Int64(policy.nodeStride) == 0 else {
+            return true
+        }
         guard let package = activePriorMapPackage,
               !package.distanceFieldSha256.isEmpty else { return false }
         let candidates = localizer.nearbyShelfIdentityCandidates(
-            limit: ShelfLocalizationPolicy.maximumShelfCandidates,
+            limit: min(
+                ShelfLocalizationPolicy.maximumShelfCandidates,
+                policy.candidateLimit),
             radiusM: 6.0)
         guard let top = candidates.first,
               let segment = package.shelfSegments.first(where: {
@@ -3646,6 +3708,9 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
             // denominator across devices and depth resolutions.
             pending.dynamicRejectionCount +=
                 update.dynamicStructureRejectionCount > 0 ? 1 : 0
+            pending.geometryResidualsM.append(
+                contentsOf: top.geometryResidualsM)
+            pending.geometryInlierCount += top.geometryInlierCount
             pending.phonePoseXSum += phonePose.xM
             pending.phonePoseYSum += phonePose.yM
             pending.phonePoseSinYawSum += sin(phonePose.yawRad)
@@ -3667,6 +3732,8 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                 maximumCoverageAngleRad: update.structureCoverageAngleRad,
                 dynamicRejectionCount:
                     update.dynamicStructureRejectionCount > 0 ? 1 : 0,
+                geometryResidualsM: top.geometryResidualsM,
+                geometryInlierCount: top.geometryInlierCount,
                 phonePoseXSum: phonePose.xM,
                 phonePoseYSum: phonePose.yM,
                 phonePoseSinYawSum: sin(phonePose.yawRad),
@@ -3682,8 +3749,18 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         let evidenceCandidates = candidates.map {
             ShelfCandidateEvidence(
                 shelfSegmentID: $0.shelfSegmentId,
-                score: max(0, 1.0 - $0.distanceM / 6.0))
+                score: $0.geometryScore)
         }
+        let orderedGeometryResiduals = completed.geometryResidualsM.sorted()
+        guard orderedGeometryResiduals.count >= 12 else {
+            pendingShelfObservationWindow = nil
+            return true
+        }
+        let geometryMedian = orderedGeometryResiduals[
+            orderedGeometryResiduals.count / 2]
+        let geometryMaximum = orderedGeometryResiduals.last ?? geometryMedian
+        let geometryInlierRatio = Double(completed.geometryInlierCount)
+            / Double(orderedGeometryResiduals.count)
         let record = ShelfObservationWindowRecord(
             format: ShelfObservationWindowRecord.formatName,
             version: ShelfLocalizationPolicy.contractVersion,
@@ -3697,6 +3774,12 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
             side: completed.side,
             faceNormalMap: completed.faceNormal,
             shelfCandidates: evidenceCandidates,
+            geometry: ShelfWindowGeometryEvidence(
+                sampleCount: orderedGeometryResiduals.count,
+                inlierCount: completed.geometryInlierCount,
+                inlierRatio: geometryInlierRatio,
+                residualMedianM: geometryMedian,
+                residualMaximumM: geometryMaximum),
             coverageAngleRad: completed.maximumCoverageAngleRad,
             endcapVisible: top.longitudinalFraction <= 0.1
                 || top.longitudinalFraction >= 0.9,
@@ -3710,6 +3793,8 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         pendingShelfObservationWindow = nil
         if succeeded {
             shelfObservationWindowSequence = sequence
+            selectedShelfSegmentID = completed.shelfSegmentID
+            selectedShelfSide = completed.side
             let phonePoseCount = Double(max(1, completed.phonePoseSampleCount))
             let meanPhoneX = completed.phonePoseXSum / phonePoseCount
             let meanPhoneY = completed.phonePoseYSum / phonePoseCount
@@ -3767,8 +3852,8 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         loopFromNode: Int,
         loopToNode: Int,
         rtabLoopID: Int,
-        rtabLoopResidualM: Double,
-        inlierRatio: Double
+        rtabGraphOptimizationMaxError: Double,
+        visualLoopInlierRatio: Double
     ) -> Bool {
         guard let top = shelfCandidates.first,
               let windows = recentShelfObservationWindows[top.shelfSegmentId],
@@ -3789,12 +3874,21 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         let relativeDeltaYawRad = abs(
             PriorMapStageOneMath.normalizeAngle(
                 latestRelative.dyawRad - oppositeRelative.dyawRad))
+        let geometryInlierRatio = min(
+            opposite.geometry.inlierRatio,
+            latest.geometry.inlierRatio)
+        let geometryResidualMedianM = max(
+            opposite.geometry.residualMedianM,
+            latest.geometry.residualMedianM)
+        let geometryResidualMaximumM = max(
+            opposite.geometry.residualMaximumM,
+            latest.geometry.residualMaximumM)
         let accepted = ShelfLoopVerifier.accepts(
             first: opposite,
             second: latest,
             relativePoseDeltaM: relativeDeltaM,
             relativePoseDeltaYawRad: relativeDeltaYawRad,
-            inlierRatio: inlierRatio,
+            inlierRatio: geometryInlierRatio,
             hasEpochBridge: opposite.epoch == latest.epoch,
             dominantDynamicEvidence:
                 opposite.dynamicRejectionCount * 2
@@ -3821,9 +3915,9 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                     || relativeDeltaYawRad
                     > ShelfLocalizationPolicy.calibrationPendingLoopYawRad {
             reason = "phone_shelf_se2_inconsistent"
-        } else if inlierRatio
+        } else if geometryInlierRatio
                     < ShelfLocalizationPolicy.calibrationPendingLoopInlierRatio {
-            reason = "inlier_ratio_insufficient"
+            reason = "shelf_geometry_inlier_ratio_insufficient"
         } else {
             reason = "opposing_normal_insufficient"
         }
@@ -3841,7 +3935,9 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
             loopFromNode: Int64(loopFromNode),
             loopToNode: Int64(loopToNode),
             rtabLoopID: max(0, rtabLoopID),
-            rtabLoopResidualM: max(0, rtabLoopResidualM),
+            legacyRtabLoopResidualM: ShelfLegacyLoopResidualNull(),
+            rtabGraphOptimizationMaxError: max(
+                0, rtabGraphOptimizationMaxError),
             phoneShelfSE2: ShelfPhoneRelativePose(
                 dxM: latestRelative.dxM,
                 dyM: latestRelative.dyM,
@@ -3849,9 +3945,9 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
             consistency: ShelfLoopConsistency(
                 relativePoseDeltaM: relativeDeltaM,
                 relativePoseDeltaYawRad: relativeDeltaYawRad,
-                inlierRatio: max(0, min(1, inlierRatio)),
-                residualMedianM: relativeDeltaM,
-                residualMaximumM: relativeDeltaM),
+                inlierRatio: max(0, min(1, geometryInlierRatio)),
+                residualMedianM: geometryResidualMedianM,
+                residualMaximumM: geometryResidualMaximumM),
             accepted: accepted,
             reason: reason,
             calibrationStatus: ShelfLocalizationPolicy.calibrationStatus,
@@ -3860,6 +3956,16 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
             record,
             expectedTrackingSessionId: scanSession.trackingSessionId)
         if succeeded { shelfLoopEventSequence = sequence }
+        scanSession.appendScanEvent(
+            level: accepted ? "info" : "warning",
+            event: "shelf_loop_geometry_verification",
+            message: "Shelf loop acceptance used independent depth-geometry window evidence; visual loop metrics remained diagnostic-only",
+            fields: [
+                "geometry_inlier_ratio": String(format: "%.4f", geometryInlierRatio),
+                "geometry_residual_median_m": String(format: "%.4f", geometryResidualMedianM),
+                "geometry_residual_maximum_m": String(format: "%.4f", geometryResidualMaximumM),
+                "visual_loop_inlier_ratio_diagnostic": String(format: "%.4f", visualLoopInlierRatio),
+            ])
         return succeeded
     }
 
@@ -3937,6 +4043,10 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         case .accepted(let acceptedTicket):
             ticket = acceptedTicket
         }
+        let shelfEvidencePolicy = shelfEvidenceResourcePolicy()
+        let computeShelfGeometryEvidence = priceTagNodeBinding.map {
+            Int64($0.nodeId) % Int64(shelfEvidencePolicy.nodeStride) == 0
+        } ?? false
         priorMapQueue.async {
             // A frame can race beginFinalization() after the main-thread
             // admission check and be enqueued behind the drain sentinel. Check
@@ -3951,11 +4061,17 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                 localizer.update(
                     frame: frame,
                     trackingState: trackingState,
-                    poseOverride: poseOverride)
+                    poseOverride: poseOverride,
+                    shelfEvidenceCandidateLimit:
+                        shelfEvidencePolicy.candidateLimit,
+                    computeShelfGeometryEvidence:
+                        computeShelfGeometryEvidence)
             }
             update.epoch = Int(localizationEpoch)
             update.component = localizationComponent
             if let binding = priceTagNodeBinding {
+                self.auditShelfEvidenceResourcePolicyIfNeeded(
+                    scanSession: scanSession)
                 _ = self.persistCorridorHypotheses(
                     update: update,
                     binding: binding,

@@ -251,13 +251,34 @@ class YawArrowGeometryGolden(unittest.TestCase):
         host = (ROOT / "app/ios/RTABMapApp/ViewController.swift").read_text(
             encoding="utf-8"
         )
-        self.assertIn("self.shelfSegments = package.shelfSegments.filter", overlay)
+        self.assertIn("let floorShelfSegments = package.shelfSegments.filter", overlay)
+        self.assertIn("self.shelfFaceSegmentsByID = faceSegmentsByID", overlay)
         self.assertIn("func nearbyShelfIdentityCandidates(", overlay)
-        self.assertIn(".prefix(max(1, min(5, limit)))", overlay)
+        self.assertIn("latestShelfGeometryCandidates.filter", overlay)
+        self.assertIn(
+            ".prefix(max(1, min(ShelfLocalizationPolicy.maximumShelfCandidates, limit)))",
+            overlay,
+        )
+        self.assertIn("filtered_depth_point_to_shelf_segment_residuals", host)
         self.assertIn("localizer.requestRecovery(reason: \"reliable_rtabmap_loop\")", host)
         self.assertIn('event: "loop_opened_shelf_identity_candidates"', host)
         self.assertIn('"ambiguous_top_k_retained"', host)
         self.assertIn('"manifest_v5_shelf_loop_candidate"', host)
+
+    def test_shelf_evidence_degrades_candidates_before_frequency(self) -> None:
+        host = (ROOT / "app/ios/RTABMapApp/ViewController.swift").read_text(
+            encoding="utf-8"
+        )
+        overlay = (ROOT / "app/ios/RTABMapApp/PriorMapLocalization.swift").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("if level <= 0 { return (0, 24, 1) }", host)
+        self.assertIn("if level == 1 { return (1, 12, 1) }", host)
+        self.assertIn("if level == 2 { return (2, 12, 2) }", host)
+        self.assertIn('"order": "24_to_12_then_frequency"', host)
+        self.assertIn("shelfEvidenceCandidateLimit:", host)
+        self.assertIn("computeShelfGeometryEvidence:", host)
+        self.assertIn("latestShelfGeometryCandidates.removeAll()", overlay)
 
     def test_start_yaw_reaches_initial_map_pose_without_conversion(self) -> None:
         setup = (

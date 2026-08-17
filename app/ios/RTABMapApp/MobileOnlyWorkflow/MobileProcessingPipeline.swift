@@ -1044,11 +1044,21 @@ enum MobileProcessingPipeline {
         let legacyTagCoordinateFrameCount = tagObservations.filter(
             \.legacyCoordinateFrame).count
         let coordinateFrameAuditPassed = legacyTagCoordinateFrameCount == 0
+        let shelfEvidenceBound = metadata["shelfLocalizationEvidenceComplete"]
+            != nil || metadata["shelfLocalizationCalibrationStatus"] != nil
+        let shelfLocalizationCalibrationStatus = shelfEvidenceBound
+            ? (metadata["shelfLocalizationCalibrationStatus"] as? String
+                ?? "MISSING")
+            : "NOT_APPLICABLE"
+        let shelfLocalizationCalibrationQualified = !shelfEvidenceBound
+            || shelfLocalizationCalibrationStatus == "CALIBRATED"
         let publishPermitted = MobileResultPublicationInvariant.permits(
             coordinatesArePriorMapFrame:
                 selectedTrajectory.coordinatesArePriorMapFrame,
             graphQualityPassed: graphQualityPassed,
             degradationCount: degradations.count,
+            shelfLocalizationCalibrationQualified:
+                shelfLocalizationCalibrationQualified,
             coordinateFrameAuditPassed: coordinateFrameAuditPassed,
             legacyCoordinateFrameCount: legacyTagCoordinateFrameCount,
             lowConfidenceTagCount: lowConfidenceTagCount,
@@ -1191,6 +1201,10 @@ enum MobileProcessingPipeline {
                 "partial_result": resultQualityStatus != .complete,
                 "degradation_count": degradations.count,
                 "degradations": degradations.map(\.reportPayload),
+                "shelf_localization_calibration_status":
+                    shelfLocalizationCalibrationStatus,
+                "shelf_localization_calibration_qualified":
+                    shelfLocalizationCalibrationQualified,
             ],
             "graph": [
                 "node_count": nativeOutcome.trajectory.count,
@@ -1420,6 +1434,8 @@ enum MobileProcessingPipeline {
                 "canonical_source_sha256": request.priorMap.canonicalSourceSHA256,
                 "coordinate_contract_version":
                     MobileResultPublicationInvariant.coordinateContractVersion,
+                "publication_invariant_version":
+                    MobileResultPublicationInvariant.publicationInvariantVersion,
                 "deliverable_contract_version": 1,
                 "tracking_session_id": request.trackingSessionID,
                 "source_database": request.sourceDatabase.lastPathComponent,
@@ -1460,6 +1476,10 @@ enum MobileProcessingPipeline {
                 "performance_sample_count": performanceSampleCount,
                 "performance_evidence_complete":
                     performanceEvidenceComplete,
+                "shelf_localization_calibration_status":
+                    shelfLocalizationCalibrationStatus,
+                "shelf_localization_calibration_qualified":
+                    shelfLocalizationCalibrationQualified,
             ])
         committed = true
         // §15: terminal durable state — the committed result is the
@@ -3276,6 +3296,8 @@ enum MobileProcessingPipeline {
                 .joined(separator: ","),
             "coordinate_contract_version": String(
                 MobileResultPublicationInvariant.coordinateContractVersion),
+            "publication_invariant_version": String(
+                MobileResultPublicationInvariant.publicationInvariantVersion),
             "coordinate_frame_audit_passed":
                 coordinateFrameAuditPassed ? "true" : "false",
             "legacy_tag_coordinate_frame_count": String(
