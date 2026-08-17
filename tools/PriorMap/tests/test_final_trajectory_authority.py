@@ -190,6 +190,44 @@ class FinalTrajectoryAuthorityTests(unittest.TestCase):
             {item["code"] for item in authority["blockers"]},
         )
 
+        shelf_y_normal = validated_native_report()
+        append_absolute_factor(
+            shelf_y_normal,
+            kind="shelf_face",
+            measurement=[0.0, 0.0, 0.0],
+            # Shelf normal is +Y; this axis-aligned orientation previously
+            # selected the zero principal eigenvector and failed closed.
+            information=[1.0 / 9.0, 0.0, 0.0, 0.0, 100.0, 0.0, 0.0, 0.0, 100.0],
+        )
+        along_y_normal_shelf = rigid_transform(
+            shelf_y_normal["poses"], x=2.0, y=0.0, yaw=0.0
+        )
+        authority = attest_final_trajectory(
+            shelf_y_normal,
+            along_y_normal_shelf,
+            post_solver="corridor_free_space_envelope_v2",
+        )
+        self.assertTrue(authority["passed"])
+        self.assertAlmostEqual(
+            authority["shelf_face_factor_metrics"][
+                "maximum_translation_residual_m"
+            ],
+            0.0,
+        )
+        across_y_normal_shelf = rigid_transform(
+            shelf_y_normal["poses"], x=2.0, y=0.6, yaw=0.0
+        )
+        authority = attest_final_trajectory(
+            shelf_y_normal,
+            across_y_normal_shelf,
+            post_solver="corridor_free_space_envelope_v2",
+        )
+        self.assertFalse(authority["passed"])
+        self.assertIn(
+            "shelf_face_normal_residual_within_existing_gate",
+            {item["code"] for item in authority["blockers"]},
+        )
+
     def test_node_inventory_and_nonfinite_values_fail_closed(self) -> None:
         report = validated_native_report()
         for poses in (

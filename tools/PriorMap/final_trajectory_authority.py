@@ -182,10 +182,18 @@ def _shelf_face_normal_residual(
     if discriminant <= 1.0e-12 * max(1.0, abs(xx), abs(yy)):
         return math.hypot(dx, dy)
     eigenvalue = 0.5 * (xx + yy + discriminant)
-    if abs(xy) > abs(eigenvalue - xx):
-        nx, ny = xy, eigenvalue - xx
-    else:
-        nx, ny = eigenvalue - yy, xy
+    # Both expressions below are valid eigenvectors for the principal
+    # eigenvalue.  Choose the one with the larger norm so axis-aligned
+    # matrices remain well-conditioned in both directions.  In particular,
+    # [[weak, 0], [0, normal]] must select (0, normal-weak), not the zero
+    # vector produced by (normal-normal, 0).
+    first = (xy, eigenvalue - xx)
+    second = (eigenvalue - yy, xy)
+    nx, ny = (
+        first
+        if math.hypot(*first) >= math.hypot(*second)
+        else second
+    )
     length = math.hypot(nx, ny)
     if length <= 0.0 or not math.isfinite(length):
         raise FinalTrajectoryAuthorityError("Shelf-face normal axis is invalid.")
