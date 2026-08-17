@@ -82,7 +82,10 @@ func placeholderIdentity() -> MobileBuildIdentity {
         baseSHA: String(repeating: "8", count: 40),
         implementationSHA: "<CODE_CONTRACT_TEST_BUILD_SHA>",
         validationSHA: "<EVIDENCE_DOCS_SHA>",
-        nativeCoreSHA256: String(repeating: "b", count: 64))
+        nativeCoreSHA256: String(repeating: "b", count: 64),
+        buildConfiguration: "release",
+        workingTreeState: "clean",
+        productionEligible: true)
 }
 
 do {
@@ -101,6 +104,29 @@ do {
         bound.isUsable,
         "current RC wave with fully bound governance SHAs must be usable "
             + "without the obsolete V1R4 prefix")
+    require(
+        bound.canStartScan && bound.isProductionQualified,
+        "clean Release identity must be scan-capable and qualified")
+
+    var debugClean = bound
+    debugClean.buildConfiguration = "debug"
+    debugClean.productionEligible = false
+    require(
+        debugClean.canStartScan && !debugClean.isProductionQualified,
+        "clean Debug identity must run the full scan path without claiming qualification")
+
+    var debugDirty = debugClean
+    debugDirty.workingTreeState = "dirty"
+    require(
+        debugDirty.canStartScan && !debugDirty.isProductionQualified,
+        "dirty Debug identity must remain scan-capable and auditable")
+
+    var releaseDirty = bound
+    releaseDirty.workingTreeState = "dirty"
+    releaseDirty.productionEligible = false
+    require(
+        !releaseDirty.canStartScan && !releaseDirty.isProductionQualified,
+        "dirty Release identity must remain invalid even if eligibility is false")
 
     let invalidMutations: [(String, (inout MobileBuildIdentity) -> Void)] = [
         ("wave", { $0.wave = "unsafe/wave" }),
@@ -111,6 +137,9 @@ do {
         ("validation SHA", { $0.validationSHA = String(repeating: "e", count: 39) }),
         ("app SHA", { $0.appGitSHA = String(repeating: "a", count: 39) }),
         ("native digest", { $0.nativeCoreSHA256 = String(repeating: "B", count: 64) }),
+        ("configuration", { $0.buildConfiguration = "profile" }),
+        ("tree state", { $0.workingTreeState = "unknown" }),
+        ("eligibility consistency", { $0.productionEligible = false }),
     ]
     for (field, mutate) in invalidMutations {
         var malformed = bound

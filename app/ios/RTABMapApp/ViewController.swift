@@ -589,8 +589,9 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         // gateway (V1R2 Gate G): production Fast/Deep runs never use the
         // Swift reference solver.
         MobileNativeFactorGraph.wireIntoGateway()
-        // Exact build identity embedded by the Xcode script phase (V1R3
-        // §4.4); an unusable identity blocks processing eligibility.
+        // Exact build identity embedded by the Xcode script phase. Debug and
+        // Release use the same scan path; configuration/tree state are audit
+        // labels and only a malformed/missing identity blocks admission.
         let identity = MobileBuildIdentity.loadFromBundle()
         coordinator.buildIdentity = identity
         coordinator.appGitSHA = identity.appGitSHA
@@ -7760,6 +7761,8 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                             "Required scan evidence is incomplete: "
                             + processingBlockers.joined(separator: ", ")
                     }
+                    let finalizationBuildIdentity =
+                        MobileBuildIdentity.loadFromBundle()
                     let metadata = ScanSegmentMetadata(
                         format: "MarketScannerFinalizedSessionMetadata",
                         version: 1,
@@ -7804,6 +7807,13 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                         // validates it fail-closed against the request.
                         storeId: scanSession.scanConfiguration.storeID,
                         scanDisplayName: scanSession.scanConfiguration.scanDisplayName,
+                        appGitSHA: finalizationBuildIdentity.appGitSHA,
+                        appBuildConfiguration:
+                            finalizationBuildIdentity.buildConfiguration,
+                        appWorkingTreeState:
+                            finalizationBuildIdentity.workingTreeState,
+                        appProductionEligible:
+                            finalizationBuildIdentity.productionEligible,
                         initialMapPose: scanSession.scanConfiguration.initialMapPose,
                         localizationTrace: scanSession.scanConfiguration.workflowMode == .priorMapLocalized
                             ? "localization_trace.jsonl"
@@ -9254,6 +9264,7 @@ extension ViewController: MobileOnlyScanStarting {
         resetSoftwarePoseStabilizer()
         resetSupermarketScanQualityAdvisors()
 
+        let buildIdentity = MobileBuildIdentity.loadFromBundle()
         session.appendScanEvent(
             event: "scan_started",
             message: "Continuous streaming scan resources prepared",
@@ -9271,6 +9282,11 @@ extension ViewController: MobileOnlyScanStarting {
                 "priorMapId": configuration.priorMapId ?? "",
                 "floorId": configuration.floorId ?? "",
                 "scanDisplayName": configuration.scanDisplayName ?? "",
+                "appGitSHA": buildIdentity.appGitSHA,
+                "buildConfiguration": buildIdentity.buildConfiguration,
+                "workingTreeState": buildIdentity.workingTreeState,
+                "productionEligible": buildIdentity.productionEligible
+                    ? "true" : "false",
             ])
 
         guard FileManager.default.fileExists(atPath: segmentDirectory.path),
@@ -9298,10 +9314,9 @@ extension ViewController: MobileOnlyScanStarting {
         _ configuration: MobileScanConfiguration
     ) throws -> MobileScanStartReceipt {
         let identity = MobileBuildIdentity.loadFromBundle()
-        guard identity.isUsable else {
+        guard identity.canStartScan else {
             throw MobileOnlyWorkflowError.invalidState(
-                "当前构建没有可追踪身份；请使用 RTABMapApp 默认 Release Run "
-                    + "或 RTABMapApp-QualifiedDevice，从已提交且 tracked 文件干净的版本重新构建")
+                "当前构建身份缺失、损坏或与身份合同不匹配；Debug 和 Release 均应重新构建后再开始扫描")
         }
 
         let entry = configuration.priorMap

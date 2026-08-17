@@ -147,8 +147,8 @@ final class MobileOnlyWorkflowCoordinator {
     // MARK: - App identity (populated by the host app)
 
     var appGitSHA: String = "unknown"
-    /// Full runtime build identity. Scan admission checks the whole strict
-    /// contract instead of treating a lone app SHA as sufficient evidence.
+    /// Full runtime build identity. Both Debug and Release execute the same
+    /// scan path; configuration/tree state remain available for audit.
     var buildIdentity: MobileBuildIdentity?
     var appVersion: String = "1.0"
     var deviceModel: String = "iPhone"
@@ -555,10 +555,9 @@ final class MobileOnlyWorkflowCoordinator {
             fail(with: .invalidState("store/floor identity missing"))
             return
         }
-        guard buildIdentity?.isUsable == true else {
+        guard buildIdentity?.canStartScan == true else {
             fail(with: .invalidState(
-                "当前构建没有可追踪身份；请使用 RTABMapApp 默认 Release Run "
-                    + "或 RTABMapApp-QualifiedDevice，从已提交且 tracked 文件干净的版本重新构建"))
+                "当前构建身份缺失、损坏或与身份合同不匹配；Debug 和 Release 均应重新构建后再开始扫描"))
             return
         }
         guard onStartScan != nil, onRollbackScan != nil else {

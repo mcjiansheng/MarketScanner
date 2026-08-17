@@ -1,7 +1,7 @@
 import Foundation
 
-/// Build identity embedded into the app bundle at build time (V1R3 §4.4,
-/// V1R4 §3.3 unified contract). The Xcode "MarketScanner Build Identity"
+/// Build identity embedded into the app bundle at build time. The Xcode
+/// "MarketScanner Build Identity"
 /// script phase calls `tools/Qualification/market_scanner_build_identity.py`
 /// — the SAME script CI uses — and writes
 /// `MarketScannerBuildIdentity.json` into the app resources. `unknown`
@@ -15,11 +15,14 @@ struct MobileBuildIdentity: Equatable {
     var implementationSHA: String
     var validationSHA: String
     var nativeCoreSHA256: String
+    var buildConfiguration: String
+    var workingTreeState: String
+    var productionEligible: Bool
 
-    /// Strict runtime validation (§3.3): every field must be fully
-    /// bound and well-formed. The build generator may carry the two exact
-    /// pre-governance placeholders, but an app containing either one is
-    /// deliberately ineligible for production processing.
+    /// Strict runtime validation (§3.3): every field must be fully bound,
+    /// well-formed and internally consistent. Debug and Release identities
+    /// are both usable so they execute the same scan/storage/processing path;
+    /// `productionEligible` is an audit label, not a scan-start gate.
     var isUsable: Bool {
         return MobileBuildIdentity.isLowercaseHex(appGitSHA, length: 40)
             && MobileBuildIdentity.isLowercaseHex(nativeCoreSHA256, length: 64)
@@ -30,6 +33,24 @@ struct MobileBuildIdentity: Equatable {
             && MobileBuildIdentity.isLowercaseHex(
                 implementationSHA, length: 40)
             && MobileBuildIdentity.isLowercaseHex(validationSHA, length: 40)
+            && (buildConfiguration == "debug"
+                || buildConfiguration == "release")
+            && (workingTreeState == "clean"
+                || workingTreeState == "dirty")
+            && !(buildConfiguration == "release"
+                && workingTreeState == "dirty")
+            && productionEligible
+                == (buildConfiguration == "release"
+                    && workingTreeState == "clean")
+    }
+
+    /// Full functional admission shared by Debug and Release.
+    var canStartScan: Bool { isUsable }
+
+    /// Qualification/reporting marker only. It never selects a different
+    /// scanner implementation or disables the end-to-end test path.
+    var isProductionQualified: Bool {
+        return isUsable && productionEligible
     }
 
     private static func isLowercaseHex(_ value: String, length: Int) -> Bool {
@@ -66,7 +87,10 @@ struct MobileBuildIdentity: Equatable {
             baseSHA: "unknown",
             implementationSHA: "unknown",
             validationSHA: "unknown",
-            nativeCoreSHA256: "unknown")
+            nativeCoreSHA256: "unknown",
+            buildConfiguration: "unknown",
+            workingTreeState: "unknown",
+            productionEligible: false)
     }
 
     /// Reads the bundled identity; returns an unusable identity when the
@@ -82,15 +106,20 @@ struct MobileBuildIdentity: Equatable {
             return unusable
         }
         // Version and exact fields must match the unified governance
-        // contract. Unknown or missing fields fail closed.
+        // contract. Unknown or missing fields fail closed, while a valid
+        // Debug identity remains fully scan-capable.
         let expectedKeys: Set<String> = [
             "format", "version", "app_git_sha", "native_core_sha256",
             "wave", "branch", "base_branch", "base_sha",
             "implementation_sha", "validation_sha",
+            "build_configuration", "working_tree_state",
+            "production_eligible",
         ]
         guard Set(object.keys) == expectedKeys,
-              StrictJSONScalar.integer(object["version"]) == 3,
-              (object["format"] as? String) == "MarketScannerBuildIdentity"
+              StrictJSONScalar.integer(object["version"]) == 4,
+              (object["format"] as? String) == "MarketScannerBuildIdentity",
+              let productionEligible = StrictJSONScalar.boolean(
+                object["production_eligible"])
         else {
             return unusable
         }
@@ -103,6 +132,11 @@ struct MobileBuildIdentity: Equatable {
             implementationSHA:
                 object["implementation_sha"] as? String ?? "unknown",
             validationSHA: object["validation_sha"] as? String ?? "unknown",
-            nativeCoreSHA256: object["native_core_sha256"] as? String ?? "unknown")
+            nativeCoreSHA256: object["native_core_sha256"] as? String ?? "unknown",
+            buildConfiguration:
+                object["build_configuration"] as? String ?? "unknown",
+            workingTreeState:
+                object["working_tree_state"] as? String ?? "unknown",
+            productionEligible: productionEligible)
     }
 }

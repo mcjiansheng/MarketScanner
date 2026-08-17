@@ -1,6 +1,6 @@
 # 手机端用户指南（Mobile User Guide）
 
-> 状态：**当前有效 / IMPLEMENTED / HOST TESTED**（真机流畅度和完整扫描仍需 DEVICE SMOKE）。最后核对：2026-08-13。
+> 状态：**当前有效 / IMPLEMENTED / HOST TESTED**（真机流畅度和完整扫描仍需 DEVICE SMOKE）。最后核对：2026-08-17。
 
 ## 首页
 
@@ -24,7 +24,7 @@
 - 朝向使用东 0°、北 90°、西 180°、南 270°以及左转/右转 15°，不使用横向滑杆。
 - 地图选择页左上角显示“关闭”；配置页使用系统返回按钮和返回手势。配置页不再提供地图 picker，需要换图时返回轻量列表；离开配置页会取消尚未完成的启动，不会让扫描在后台自行开始。
 - 第一次使用相机时，App 会先完成系统权限请求；授权后重新执行完整的地图/身份/权限检查，再提交启动。拒绝权限时保持在配置页并提供“打开设置”。
-- 普通 `RTABMapApp` scheme 的默认 Run 已改为 Release，会执行严格 build identity 生成与验证；从已提交且 tracked tree 干净的版本直接 Run 即可测试扫描。`RTABMapApp-QualifiedDevice` 仍可使用。Test/Analyze 或手动 Debug 配置仍没有正式身份，只用于导入和 UI 调试。
+- Debug 与 Release 都会生成 build identity，并运行同一套完整扫描、连续数据库、sidecar、finalization、处理和结果代码。手动 Debug 可直接做端到端测试；tracked tree 有修改时会显示/记录 `debug + dirty + production_eligible=false`，但不会禁用开始扫描。默认 `RTABMapApp` Run 与 `RTABMapApp-QualifiedDevice` 仍使用 clean Release，适合真实性能、签名真机和现场资格验证。
 
 点击开始后，地图匹配器、会话目录、连续 SQLite 数据库和 sidecar writer 在后台准备。只有相机、RTAB-Map 录制、receipt 和 workflow context 都成功后才进入扫描；失败或取消会自动停止并回滚，不会留下没有结果记录的后台扫描。
 

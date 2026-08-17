@@ -1,8 +1,10 @@
 # Mobile-Only V1 当前状态
 
-> 文档状态：**当前有效**。最后核对日期：2026-08-15（山姆现场前稳定性、exact-commit Release 与签名真机安装证据已核对；冷启动受锁屏阻断）。
+> 文档状态：**当前有效**。最后核对日期：2026-08-17（Debug/Release 完整功能等价身份合同已实现并通过主机与 unsigned Debug 构建回归；真机与现场证据仍沿用下述已注明边界）。
 
 ## 总体
+
+2026-08-17 构建身份合同升级为 version 4：Debug 和 Release 都生成 `MarketScannerBuildIdentity.json` 并执行同一套地图校验、ARKit/RTAB-Map、连续数据库、sidecar、finalization、处理和 Result 链路。Debug clean/dirty 均可开始扫描，dirty 状态被明确记录且 `production_eligible=false`；Release 继续要求 tracked tree clean，clean Release 才为 `production_eligible=true`。新合同已通过 Qualification **32/32**（包含 Swift host）、扫描 UX/sidecar/yaw **61/61**、Swift parse、Python compile、生成合同 16 文件和 patch check；unsigned generic iPhoneOS Debug 全量构建 `BUILD SUCCEEDED`，App bundle 身份经生成器复核为 version 4、`debug`、`dirty`、`production_eligible=false`。该变化解除的是测试功能阻断，不把 Debug 性能或未签名构建升级为真机/现场资格证据；clean exact-commit Release 身份仍须在最终提交后复核。
 
 当前冻结核心基线为 `core-mobile-v1@9a93fbd0ee52944eae5aebedf59ec6a08dedc934`，性能证据前序为 `feature/mobile-performance-result-evidence@eb8e71e0e7f60fbcc35bbd7bcad7278c61524604`；当前现场候选分支为 `fix/sam-field-end-to-end-hardening`。本轮在既有有界 `performance_samples.jsonl`、immutable Result 和 PC 趋势分析之上，补齐冷启动 Settings fallback、UIKit/FileProvider 主线程恢复、strict parser/burst/floor 故障注入、ARKit/depth buffer fail-safe、finalization 先停 producer 后 drain writer，以及 Map Studio 坏历史 complete 任务的结构化恢复。生产 Swift 源码排除供应商库后不含显式进程终止原语。合并扫描前命名后的当前源码已通过命名 UX/source **25/25**、PriorMap **331/331（376.662 s）**、Qualification **30/30（12.128 s）**、Map Studio **142/142（9.671 s）**、native **7884/0**、Swift parse、生成合同、补丁格式和 unsigned generic iphoneos QualifiedDevice Debug 全量编译/链接。当前压力回归的 finalization/trace/tag evidence 峰值 RSS 分别为 13,139,968、59,113,472、746,192,896 bytes。前序加固提交的 clean exact-commit macOS/iOS Release、签名验证和真机安装证据继续保留，但合并提交必须重新核对 Release identity；真机命名交互、30 分钟/2 小时、热/低磁盘/强杀/crash/MetricKit 延迟投递、Files Provider 和现场 LiDAR 未执行，发布判断仍为 **NO-GO / NOT PRODUCTION READY**。
 
@@ -102,7 +104,7 @@
 
 ## RC 最终治理和 Result 事务加固
 
-- iOS 内嵌 `MarketScannerBuildIdentity` 已升级为 version 3；Python 生成/验证器和 Swift 读取器必须接受完全一致的 exact schema：`format`、`version`、`app_git_sha`、`native_core_sha256`，以及 governance descriptor 的 `wave`、`branch`、`base_branch`、`base_sha`、`implementation_sha`、`validation_sha`。任何缺失、未知或重复字段均 fail closed。
+- iOS 内嵌 `MarketScannerBuildIdentity` 已升级为 version 4；Python 生成/验证器和 Swift 读取器必须接受完全一致的 exact schema：`format`、`version`、`app_git_sha`、`native_core_sha256`、governance descriptor 的 `wave`、`branch`、`base_branch`、`base_sha`、`implementation_sha`、`validation_sha`，以及 `build_configuration`、`working_tree_state`、`production_eligible`。任何缺失、未知、重复或内部矛盾字段均 fail closed；合法 Debug 身份不再被扫描入口拒绝。
 - `wave` / `branch` / `base_branch` 使用统一安全 ASCII 规则；implementation与evidence分别通过纯治理后继提交绑定，当前值以descriptor为准。Swift运行时只有implementation/validation均为40位小写SHA时才允许`isUsable`；即使完成绑定，也必须另有exact-SHA CI和资格证据。
 - Result 从 `Results/` 下同父目录隐藏 staging 提交：先 fsync 全部文件/清单/receipt，把 payload 文件冻结为 `0444`，root 保持 `0755`。durable publish intent 绑定 task/result/manifest 与 directory dev/inode；root-scoped cross-process advisory lock 覆盖 cleanup、commit、recovery、list 和 read，阻止这些受锁操作清理或误读 active publisher 的 intent。exclusive rename 后，通过仍打开的 inode-bound FD 执行 `0755→0555`、directory fsync、destination path/dev/inode 复核，再验证 exact set、receipt、manifest 和每个 artifact 哈希。rename 或 final pathname 出现均不是业务提交点；intent 清理前只允许按 exact identity 恢复。该 lock/lease 不覆盖 active staging 的长期写入阶段；生产依赖 `MobileProcessingPipeline` 单一主 App 串行，`cleanupStaging` 仅在 task pipeline 启动且 staging 创建前调用，同一 task 禁止跨进程并发构建。
 - Snapshot 的 task-root 与 `input_snapshot.lock`、Result 的 Results root 与 `.result-library.lock`、Map 的 Maps root 与 `.map-library.lock` 均绑定 descriptor/path dev/inode，并在公开成功返回前最终复核；pathname replacement不会继续返回成功。

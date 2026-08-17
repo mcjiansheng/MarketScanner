@@ -1,6 +1,6 @@
 # 手机端测试计划（Mobile Test Plan）
 
-> 状态：**当前有效**；价签 node-local v2、统一 publication invariant、手机性能结果证据与山姆现场前稳定性加固已实现；本分支完整 host、PC、exact-commit Release 和签名真机安装已通过，冷启动受锁屏阻断，运行与现场详细测试仍延期；run `31307753672` 为历史 7/8 FAIL。最后核对：2026-08-15。
+> 状态：**当前有效**；价签 node-local v2、统一 publication invariant、手机性能结果证据、山姆现场前稳定性加固，以及 Debug/Release 完整功能等价身份合同已实现；既有 exact-commit Release 和签名安装证据不替代本次身份变更后的真机重测。最后核对：2026-08-17。
 
 > 2026-08-15 当前现场候选证据：冷启动 fallback、严格 parser/burst/floor fault injection、ARKit/depth buffer fail-safe、finalization 先停 producer 后 drain writer、Map Studio 坏历史 complete 任务隔离，以及既有 `performance_samples.jsonl`/结果包链路已进入当前源码。当前证据为 PriorMap **330/330（382.204 s）**、Qualification **30/30（11.140 s）**、Map Studio **142/142（10.017 s）**、native **7884/0**、unsigned generic iphoneos Debug、clean exact-commit macOS Release/QualifiedDevice Release、受认证浏览器四模式/1600/1280/980 布局检查 PASS；PC/App identity 精确绑定同一候选提交。压力子进程峰值为 finalization 13,205,504 bytes、trace 59,129,856 bytes、tag evidence 746,455,040 bytes。已配对 iPhone 17 Pro Max 的 Apple Development 签名 Release、签名验证和安装 PASS；冷启动被锁屏阻断，进程存活、相机授权、30 分钟/2 小时、热/低磁盘/强杀/crash/MetricKit、Files Provider 与现场 LiDAR 仍为 NOT RUN。
 
@@ -15,7 +15,7 @@
 | 组 | 覆盖 | 状态 |
 |---|---|---|
 | Scan display name | 可选输入、非法/控制字符过滤、空白折叠、64 字符上限、默认 `<store>-<floor>-MMdd-HHmm`、host 二次清洗、configuration/checkpoint/metadata/event、历史列表与旧会话兼容；不得成为任何路径/身份 authority | mobile UX/source **25/25 PASS**；完整 PriorMap **331/331 PASS**；QualifiedDevice Debug build PASS；真机键盘、列表、Stop/export 与 PC metadata 交互 **NOT RUN** |
-| Unified scan UX/startup | 首页/菜单先进入轻量地图选择页、已导入地图/导入新地图、确认后才加载、配置页 immutable selectedMap 且无 picker、导入进度在 staging 后才显示、单一地图库/配置页/Coordinator、后台 package I/O、root Close/push Back、首次相机权限、旧 tmp-db 绕过关闭、receipt/context durable commit、取消/强 rollback、1×–8× zoom、方向键、离散朝向、默认/QualifiedDevice Release scheme | 聚焦合同 **29/29 PASS**；Swift 核心长方法 **1/1 PASS（1233.541 s）**；当前 unsigned iphoneos Debug 全量编译/链接 PASS 且身份 fail closed；提交后默认 `RTABMapApp` unsigned Release 全量编译/链接 PASS，输出 `build identity verified`；独立复审 `P0=0/P1=0`。真机运行与交互 p50/p95 NOT RUN |
+| Unified scan UX/startup | 首页/菜单先进入轻量地图选择页、已导入地图/导入新地图、确认后才加载、配置页 immutable selectedMap 且无 picker、导入进度在 staging 后才显示、单一地图库/配置页/Coordinator、后台 package I/O、root Close/push Back、首次相机权限、旧 tmp-db 绕过关闭、receipt/context durable commit、取消/强 rollback、1×–8× zoom、方向键、离散朝向、Debug/Release version 4 identity 与完整功能同路、默认/QualifiedDevice Release scheme | 历史聚焦合同 **29/29 PASS**、Swift 核心长方法 **1/1 PASS（1233.541 s）**和 Release identity build 证据保留；2026-08-17 新合同通过 Qualification **32/32**、扫描 UX/sidecar/yaw **61/61**、Swift/Python/生成合同/patch 检查及 unsigned generic iPhoneOS Debug 全量构建，包内身份为 `debug/dirty/production_eligible=false`。clean exact-commit Release 和真机运行/交互 p50/p95 仍需本次复核。 |
 | Start heading alignment | frozen yaw：`0=+X/东`、`+π/2=+Y/北`；配置值原样进入 initial map pose；ARKit camera forward、首帧 anchor、前进一步、depth local points、人工重选和 live HUD 同一合同 | 快速四方向/源码合同 **13/13 PASS**，移动 UX/方向/sidecar **54/54 PASS**，Swift parse 与 patch check PASS；完整 Swift host **1/1 PASS（1398.238 s）**，400,000 条 tag evidence 峰值 RSS 533,495,808 bytes；unsigned generic iPhoneOS Debug clean build PASS。提交后 Release identity build 与真机东/北/西/南复测仍待执行 |
 | I1-I14 | 三格式导入、canonical parity、公式/ZIP/CSV/JSON 安全 | Swift host + --import-suite |
 | C5/C7/C9/C10 | 编译器路网统计、距离场 SHA、package self-load、PC parity | Swift host |

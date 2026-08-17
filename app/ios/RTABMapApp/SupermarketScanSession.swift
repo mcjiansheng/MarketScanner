@@ -85,6 +85,12 @@ struct ScanSegmentMetadata: Codable {
     /// Display-only metadata: PC and mobile consumers read it with `.get`
     /// semantics and older sessions simply decode it as nil.
     let scanDisplayName: String?
+    /// Build provenance is informational and never selects a reduced scan
+    /// path. Debug and Release write the same session/evidence schema.
+    let appGitSHA: String?
+    let appBuildConfiguration: String?
+    let appWorkingTreeState: String?
+    let appProductionEligible: Bool?
     let initialMapPose: PriorMapPose2D?
     let localizationTrace: String?
     let manualLocalizationEvents: String?

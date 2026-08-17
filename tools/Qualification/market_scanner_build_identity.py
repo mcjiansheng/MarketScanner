@@ -13,14 +13,18 @@ Digest contract (byte-exact, frozen):
         b"market_scanner_factor_graph.h\\0"   + h_bytes
     )
 
-The embedded version-3 JSON carries the exact governance descriptor
+The embedded version-4 JSON carries the exact governance descriptor
 (`wave`, `branch`, `base_branch`, and its three SHA bindings), the app Git
-SHA (40 lowercase hex), and the native-core SHA-256 (64 lowercase hex).
-Unknown, missing, duplicate, unsafe, or malformed fields fail closed
-(exit != 0); `unknown` must never reach an eligible session.
+SHA (40 lowercase hex), the native-core SHA-256 (64 lowercase hex), and the
+build configuration / tracked-working-tree state. Debug and Release both
+receive a traceable identity and execute the same scan path. Release remains
+the only production-qualified configuration, while a dirty Debug build is
+explicitly labelled instead of being blocked from end-to-end testing.
+Unknown, missing, duplicate, unsafe, or malformed fields fail closed.
 
 Usage:
     market_scanner_build_identity.py emit --repo <root> [--out file]
+        [--configuration Debug|Release] [--allow-dirty]
     market_scanner_build_identity.py native-digest --repo <root>
     market_scanner_build_identity.py verify --repo <root> --identity <file>
 """
@@ -35,7 +39,7 @@ import sys
 import tempfile
 
 FORMAT = "MarketScannerBuildIdentity"
-VERSION = 3
+VERSION = 4
 CPP_REL = os.path.join("core", "MarketScannerFactorGraph", "market_scanner_factor_graph.cpp")
 H_REL = os.path.join("core", "MarketScannerFactorGraph", "market_scanner_factor_graph.h")
 WAVE_REL = os.path.join(".github", "marketscanner-repair-v2-wave.json")
@@ -52,6 +56,9 @@ IDENTITY_KEYS = GOVERNANCE_KEYS | {
     "version",
     "app_git_sha",
     "native_core_sha256",
+    "build_configuration",
+    "working_tree_state",
+    "production_eligible",
 }
 SAFE_GOVERNANCE_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,127}$")
 LOWER_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
@@ -60,6 +67,13 @@ UNBOUND_SHA_PLACEHOLDERS = {
     "implementation_sha": "<CODE_CONTRACT_TEST_BUILD_SHA>",
     "validation_sha": "<EVIDENCE_DOCS_SHA>",
 }
+BUILD_CONFIGURATIONS = {"debug", "release"}
+WORKING_TREE_STATES = {"clean", "dirty"}
+TRACKED_DIRTY_EXCLUSIONS = (
+    ".github/marketscanner-repair-v2-wave.json",
+    "docs/mobile-only/",
+    "docs/map-assisted-localization/reviews/CURRENT_REVIEW.md",
+)
 
 
 def fail(message: str) -> None:
@@ -83,6 +97,35 @@ def native_core_digest(repo_root: str) -> str:
     return hasher.hexdigest()
 
 
+def _tracked_dirty_lines(repo_root: str) -> list[str]:
+    try:
+        status = subprocess.run(
+            ["git", "status", "--porcelain", "--untracked-files=no"],
+            cwd=repo_root, check=True, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        ).stdout.decode()
+    except Exception:
+        fail("git status failed")
+    return [
+        line for line in status.splitlines()
+        if line.strip()
+        and not line[3:].strip().startswith(TRACKED_DIRTY_EXCLUSIONS)
+    ]
+
+
+def working_tree_state(repo_root: str) -> str:
+    return "dirty" if _tracked_dirty_lines(repo_root) else "clean"
+
+
+def canonical_build_configuration(value: object) -> str:
+    if not isinstance(value, str):
+        fail("build configuration is not a string: %r" % value)
+    canonical = value.strip().lower()
+    if canonical not in BUILD_CONFIGURATIONS:
+        fail("unsupported build configuration: %r" % value)
+    return canonical
+
+
 def git_sha(repo_root: str, allow_dirty: bool) -> str:
     try:
         sha = subprocess.run(
@@ -94,17 +137,7 @@ def git_sha(repo_root: str, allow_dirty: bool) -> str:
     if len(sha) != 40 or any(c not in "0123456789abcdef" for c in sha):
         fail("HEAD is not a 40-char lowercase SHA: %r" % sha)
     if not allow_dirty:
-        status = subprocess.run(
-            ["git", "status", "--porcelain", "--untracked-files=no"],
-            cwd=repo_root, check=True, stdout=subprocess.PIPE,
-        ).stdout.decode()
-        tracked_dirty = [
-            line for line in status.splitlines()
-            if line.strip() and not line[3:].strip().startswith(
-                (".github/marketscanner-repair-v2-wave.json",
-                 "docs/mobile-only/",
-                 "docs/map-assisted-localization/reviews/CURRENT_REVIEW.md"))
-        ]
+        tracked_dirty = _tracked_dirty_lines(repo_root)
         if tracked_dirty:
             fail("dirty tracked tree refuses build identity:\n%s"
                  % "\n".join(tracked_dirty[:10]))
@@ -185,13 +218,29 @@ def wave_name(repo_root: str) -> str:
     return governance_descriptor(repo_root)["wave"]
 
 
-def build_identity(repo_root: str, allow_dirty: bool) -> dict:
+def build_identity(
+    repo_root: str,
+    allow_dirty: bool,
+    build_configuration: str = "Release",
+) -> dict:
     governance = governance_descriptor(repo_root)
+    configuration = canonical_build_configuration(build_configuration)
+    tree_state = working_tree_state(repo_root)
+    if tree_state == "dirty" and (
+        configuration == "release" or not allow_dirty
+    ):
+        # Reuse the detailed path diagnostics from the canonical Git gate.
+        git_sha(repo_root, allow_dirty=False)
     identity = {
         "format": FORMAT,
         "version": VERSION,
-        "app_git_sha": git_sha(repo_root, allow_dirty),
+        "app_git_sha": git_sha(repo_root, allow_dirty=True),
         "native_core_sha256": native_core_digest(repo_root),
+        "build_configuration": configuration,
+        "working_tree_state": tree_state,
+        "production_eligible": (
+            configuration == "release" and tree_state == "clean"
+        ),
         **governance,
     }
     validate_fields(identity)
@@ -214,6 +263,24 @@ def validate_fields(identity: dict) -> None:
     digest = identity.get("native_core_sha256", "")
     if not isinstance(digest, str) or not LOWER_DIGEST_RE.fullmatch(digest):
         fail("native_core_sha256 not 64 lowercase hex: %r" % digest)
+    configuration = identity.get("build_configuration")
+    if configuration != canonical_build_configuration(configuration):
+        fail("build_configuration must use canonical lowercase form")
+    tree_state = identity.get("working_tree_state")
+    if tree_state not in WORKING_TREE_STATES:
+        fail("working_tree_state must be clean or dirty: %r" % tree_state)
+    if configuration == "release" and tree_state != "clean":
+        fail("Release identity requires a clean tracked tree")
+    production_eligible = identity.get("production_eligible")
+    if type(production_eligible) is not bool:
+        fail("production_eligible is not a Boolean")
+    expected_eligibility = (
+        configuration == "release" and tree_state == "clean"
+    )
+    if production_eligible != expected_eligibility:
+        fail(
+            "production_eligible inconsistent with configuration/tree state"
+        )
     validate_governance_descriptor({
         key: identity.get(key) for key in GOVERNANCE_KEYS
     })
@@ -246,6 +313,7 @@ def main() -> None:
     parser.add_argument("--out")
     parser.add_argument("--identity")
     parser.add_argument("--allow-dirty", action="store_true")
+    parser.add_argument("--configuration", default=None)
     args = parser.parse_args()
     repo = os.path.abspath(args.repo)
 
@@ -253,7 +321,11 @@ def main() -> None:
         print(native_core_digest(repo))
         return
     if args.command == "emit":
-        identity = build_identity(repo, args.allow_dirty)
+        identity = build_identity(
+            repo,
+            args.allow_dirty,
+            build_configuration=args.configuration or "Release",
+        )
         payload = (json.dumps(identity, indent=2, sort_keys=True) + "\n").encode()
         if args.out:
             atomic_write(args.out, payload)
@@ -270,7 +342,20 @@ def main() -> None:
     except (OSError, UnicodeError, json.JSONDecodeError) as error:
         fail("identity cannot be read: %s" % error)
     validate_fields(embedded)
-    expected = build_identity(repo, allow_dirty=True)
+    embedded_configuration = embedded.get("build_configuration")
+    if args.configuration is not None:
+        requested_configuration = canonical_build_configuration(
+            args.configuration)
+        if embedded_configuration != requested_configuration:
+            fail(
+                "embedded build_configuration=%r != requested %r"
+                % (embedded_configuration, requested_configuration)
+            )
+    expected = build_identity(
+        repo,
+        allow_dirty=True,
+        build_configuration=str(embedded_configuration),
+    )
     for key in sorted(IDENTITY_KEYS - {"format", "version"}):
         if embedded.get(key) != expected.get(key):
             fail("embedded %s=%r != checked-out %r" % (key, embedded.get(key), expected.get(key)))

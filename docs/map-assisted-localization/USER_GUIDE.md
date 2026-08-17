@@ -1,6 +1,6 @@
 # MarketScanner 地图辅助定位用户操作手册
 
-> 文档状态：**当前有效**。最后核对日期：2026-08-10。
+> 文档状态：**当前有效**。最后核对日期：2026-08-17。
 >
 > 当前范围是单一楼层；楼层内部少量竖直位移会保留在原始三维数据中，但不参与二维先验地图定位。NFC 入口保持关闭。
 
@@ -14,7 +14,7 @@
 6. 点击“开始扫描”。地图/localizer、会话目录、连续数据库和 sidecar 在后台准备；只有 ARSession、RTAB-Map、receipt 和 workflow context 都提交成功后才进入扫描。不要在启动进度中强退 App。
 7. 正常结束并等待落盘、数据库关闭和外部复制完成。
 
-共享 `RTABMapApp` scheme 的默认 Run 已使用 Release，因此从已提交且 tracked tree 干净的版本直接点击 Xcode Run 即会生成可追踪身份；也可以选择 `RTABMapApp-QualifiedDevice`。Test/Analyze 或手动改成 Debug 时仍只用于地图导入和 UI smoke，点击正式开始会 fail closed。
+Debug 与 Release 都生成可追踪身份并允许完整开始扫描。手动 Debug 会执行与 Release 相同的地图校验、ARKit/RTAB-Map、连续数据库、sidecar、finalization 和结果链路；若 tracked tree 有修改，身份会记录 `working_tree_state=dirty` 和 `production_eligible=false`，但不会阻断测试。默认 `RTABMapApp` Run 和 `RTABMapApp-QualifiedDevice` 仍使用 clean Release，适合真实性能和现场资格验证。
 
 ## 实验与兼容工具
 

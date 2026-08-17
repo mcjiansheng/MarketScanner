@@ -1,6 +1,6 @@
 # 地图辅助定位阶段一至阶段三测试计划
 
-> 文档状态：**当前有效**。最后核对日期：2026-08-16。
+> 文档状态：**当前有效**。最后核对日期：2026-08-17。
 
 ## 2026-08-15 通道/货架约束增量
 
@@ -74,7 +74,7 @@ python3 -m unittest \
 
 朝向回归必须额外证明：`0°/90°/180°/-90°` 分别对应东/北/西/南；ARKit `+X/-Z/-X/+Z` camera forward 分别产生 `0/+π/2/π/-π/2`；首帧锚定后向前移动 1 m 必须沿用户选择的地图方向；配置 marker、人工重选箭头和实时 HUD 均以右向 artwork 加单次 `-yaw` 渲染。无签名构建不能替代真机四方向复测。
 
-2026-08-10 当前源码结果为 **32/32 PASS**。它必须继续证明：首页和菜单不进入旧 `PriorMapWizardViewController`，而是先进入轻量地图选择页；用户可以导入新地图；配置页以 immutable required `selectedMap` 初始化，不自行列举地图、不自动加载第一张地图，也不存在 picker；文件选择前隐藏 0%、进度条和计时，进入 `.stagingMapSource` 后才显示；地图库普通列表、完整刷新、provider copy/fsync、selected-package 加载和 scan-start preparation 不在主线程；手机编译地图与 PC v2 package 进入同一 registry/setup/coordinator；root Close 与 push Back 同时存在；首次权限在 workflow commit 前完成；旧 tmp-db recovery 不可绕过 receipt；取消/持久化失败会 rollback；地图设置支持 1×–8× zoom、方向键和离散朝向；手动 Debug 无 build identity，共享 `RTABMapApp` 默认 Run 和 `RTABMapApp-QualifiedDevice` 的 Run 均为 Release，且不存在 `--allow-dirty`。新增合同还要求 setup transition 失败不得继续 commit、finalization 的 state/context 单次持久化、未完成的 `finalizing_scan` 不得直接进入后处理，以及条码失败 alert 去重。
+2026-08-10 的历史源码结果为 **32/32 PASS**；当前合同继续证明同一 UX/startup 项，并把构建身份要求更新为：Debug 和 Release 都生成 version 4 identity、进入同一完整扫描链路；Debug 可用 `--allow-dirty` 记录测试工作区但不得声称 production eligible；默认 `RTABMapApp` 和 `RTABMapApp-QualifiedDevice` 的 Run 均保持 clean Release。新增合同还要求 setup transition 失败不得继续 commit、finalization 的 state/context 单次持久化、未完成的 `finalizing_scan` 不得直接进入后处理，以及条码失败 alert 去重。
 
 2026-08-10 历史扫描/ESL 布局增量中，`tools.PriorMap.tests.test_mobile_scan_ux_contract` 单组扩展为 **19/19 PASS**。新增断言要求：ESL status/payload 必须绑定 exact scan rect 上下边缘且不能恢复 `centerY` 魔数；历史列表必须显示独立导出按钮并使用 folder document picker；导出必须 finalized/live-checkpoint/hardlink/SHA/local-retention fail closed；snapshot 必须存在 iOS 私有 descriptor-copy fallback、exact stat identity cache 和临时副本清理。这个 19 项数字是该单组当前结果，不替代上面跨三个模块的历史 32/32 证据。
 
@@ -131,11 +131,11 @@ xcodebuild -quiet -project app/ios/RTABMapApp.xcodeproj \
   CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build
 ```
 
-普通共享 `RTABMapApp` 的默认 Run 已是 Release；如需 UI/导入 smoke，可手动把构建配置切到 Debug，该构建按设计删除 `MarketScannerBuildIdentity.json`，不得用于开始正式 prior-map 扫描。2026-08-10 已在 tracked tree 干净的提交上执行默认 `RTABMapApp` unsigned generic-device Release 全量编译/链接，日志包含 `build identity verified` 和 `BUILD SUCCEEDED`；Debug 全量编译/链接也 PASS 且确认身份被移除。无签名 build只证明编译/链接和 build-identity 生成，不证明真机权限、相机、LiDAR 或现场流程；`RTABMapApp-QualifiedDevice` 的静态 Release/无 bypass 合同已覆盖，真机仍需实际安装验证。
+普通共享 `RTABMapApp` 的默认 Run 仍是 Release；手动 Debug 现在也生成身份并可用于完整 prior-map 扫描、落盘、finalization 和结果回归。Debug dirty 状态不得阻断功能测试，但必须在身份和会话审计中显示；真实性能、签名真机和现场资格仍使用 clean Release。2026-08-10 的旧 Debug“身份被移除”结果只描述历史版本，不能作为当前合同。
 
 本轮真机手测必须补充：删除/停用 Xcode 的 `ViewController.updateState(state:)` 文件断点后冷启动，确认不会再被调试器停在黑色残缺界面；打开 ESL 扫描确认状态文字位于框外且 Dynamic Type/短屏无约束冲突；对截图中的真实 finalized 会话执行手机后处理，确认不再出现 `/dev/fd` 只读打开错误；不处理或故意处理失败后仍可把完整原始扫描导出到 Files/iCloud/外接存储，并在第二次导出时保留第一次目录。大型真实 DB 还要记录私有校验副本的额外空间、耗时、取消/锁屏和低磁盘行为。
 
-本轮 unsigned generic iPhoneOS Debug 与 tracked-clean exact-HEAD Release 全量编译/链接均已 PASS；Debug 产物中没有 `MarketScannerBuildIdentity.json`，Release bundle 的 `app_git_sha` 与构建提交精确一致。该结果仍只是无签名编译/链接与身份生成 smoke，不是签名安装或真机运行资格。
+2026-08-10 的历史 unsigned generic iPhoneOS Debug 与 tracked-clean exact-HEAD Release 全量编译/链接均已 PASS；当时 Debug 产物没有 `MarketScannerBuildIdentity.json`。当前 version 4 合同要求 Debug/Release 两个产物都包含身份，因此必须重新执行至少一次 Debug 全量构建并检查 `debug/dirty-or-clean/production_eligible=false`，以及一次 clean Release 构建并检查 `release/clean/production_eligible=true`。无签名构建仍不是签名安装或真机运行资格。
 
 覆盖：
 
@@ -219,7 +219,7 @@ python3 tools/PriorMap/replay_localization.py "$out" \
 
 无需超市场景：
 
-1. 提交全部 tracked 改动并确认 tracked tree 干净；在 Xcode 选择 `RTABMapApp-QualifiedDevice`，clean build 后安装到支持 ARKit/LiDAR 的 iPhone。普通 Debug 只做 UI/地图导入 smoke。
+1. 功能端到端干跑可直接使用 Debug，包括 dirty tracked tree；确认页面和日志显示正确的 Debug/tree 状态，并完整执行 start/stop/finalization/处理。真实性能或现场资格测试再提交全部 tracked 改动、确认 tree clean，并选择 `RTABMapApp-QualifiedDevice` Release 安装到支持 ARKit/LiDAR 的 iPhone。
 2. 从首页大型“新建扫描”进入统一配置页，确认左上角 Close；从“门店地图”选择同一地图进入，确认系统 Back/返回手势。进入、返回和重复切换不得再出现 3–4 秒主线程冻结，并记录 p50/p95。
 3. 分别导入手机 XLSX 和 PC 正式 v2 地图包，确认都进入同一地图库和同一配置页；编译/复制期间持续显示阶段、百分比与用时，完成后核对 store ID、map ID、package/canonical SHA、楼层、元素和 warning 摘要。
 4. 在配置页验证 1×–8× 捏合、平移、双击、点击选点、0.1/0.5/1.0 m 四方向微调，以及东/北/西/南和左右 15° 朝向；不得出现横向 yaw slider。

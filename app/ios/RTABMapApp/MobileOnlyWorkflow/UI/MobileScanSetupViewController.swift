@@ -945,7 +945,7 @@ final class MobileScanSetupViewController: UIViewController {
             return
         }
         let identity = MobileBuildIdentity.loadFromBundle()
-        guard identity.isUsable else {
+        guard identity.canStartScan else {
             presentNotice(Self.unqualifiedBuildMessage)
             return
         }
@@ -1041,9 +1041,9 @@ final class MobileScanSetupViewController: UIViewController {
     }
 
     private static let unqualifiedBuildMessage = """
-    当前构建没有可追踪的扫描身份，因此不能开始已有地图辅助扫描。
+    当前 App 的构建身份文件缺失、损坏或与当前身份合同不匹配，因此不能开始扫描。
 
-    请使用 Xcode 共享的 RTABMapApp 默认 Run（当前配置为 Release），或 RTABMapApp-QualifiedDevice，从已提交且 tracked 文件干净的版本重新构建。手动改成 Debug 时仍只用于界面和导入调试。
+    Debug 和 Release 都支持完整扫描。请使用当前工程重新构建；Debug 会记录 clean/dirty 测试来源，Release 仍要求 tracked 文件干净。
     """
 
     private func updateSummary() {
@@ -1079,10 +1079,18 @@ final class MobileScanSetupViewController: UIViewController {
             startButton.isEnabled = false
             return
         }
-        let identityUsable = MobileBuildIdentity.loadFromBundle().isUsable
-        let identityNote = identityUsable
-            ? ""
-            : "\n当前 App 缺少可追踪身份；请用 RTABMapApp 默认 Run 重新构建。"
+        let identity = MobileBuildIdentity.loadFromBundle()
+        let identityUsable = identity.canStartScan
+        let identityNote: String
+        if !identityUsable {
+            identityNote = "\n当前 App 的构建身份缺失或损坏；请重新构建。"
+        } else if identity.buildConfiguration == "debug" {
+            identityNote = identity.workingTreeState == "dirty"
+                ? "\nDebug 完整链路测试 · tracked tree dirty"
+                : "\nDebug 完整链路测试 · tracked tree clean"
+        } else {
+            identityNote = ""
+        }
         var displayDegrees = startYawRad * 180 / Double.pi
         if displayDegrees < 0 { displayDegrees += 360 }
         summaryLabel.text = String(

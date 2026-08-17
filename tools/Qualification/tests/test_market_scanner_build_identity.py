@@ -3,6 +3,7 @@ from __future__ import annotations
 from contextlib import redirect_stderr
 import copy
 import io
+import json
 import os
 from pathlib import Path
 import shutil
@@ -34,6 +35,9 @@ def valid_embedded_identity() -> dict[str, object]:
         "version": identity.VERSION,
         "app_git_sha": "a" * 40,
         "native_core_sha256": "b" * 64,
+        "build_configuration": "release",
+        "working_tree_state": "clean",
+        "production_eligible": True,
         **valid_governance(),
     }
 
@@ -44,6 +48,37 @@ class MarketScannerBuildIdentityTests(unittest.TestCase):
             with self.assertRaises(SystemExit) as raised:
                 callback()
         self.assertEqual(raised.exception.code, 1)
+
+    def make_identity_repo(self, root: Path) -> None:
+        native = root / "core/MarketScannerFactorGraph"
+        native.mkdir(parents=True)
+        (native / "market_scanner_factor_graph.cpp").write_text(
+            "int market_scanner_test = 1;\n", encoding="utf-8")
+        (native / "market_scanner_factor_graph.h").write_text(
+            "#pragma once\n", encoding="utf-8")
+        governance = root / ".github/marketscanner-repair-v2-wave.json"
+        governance.parent.mkdir(parents=True)
+        governance.write_text(
+            json.dumps(valid_governance()) + "\n",
+            encoding="utf-8",
+        )
+        subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+        subprocess.run(
+            ["git", "config", "user.email", "identity-test@example.invalid"],
+            cwd=root,
+            check=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.name", "Identity Test"],
+            cwd=root,
+            check=True,
+        )
+        subprocess.run(["git", "add", "."], cwd=root, check=True)
+        subprocess.run(
+            ["git", "commit", "-q", "-m", "identity fixture"],
+            cwd=root,
+            check=True,
+        )
 
     def test_current_release_candidate_governance_is_accepted_without_v1r4_prefix(self) -> None:
         descriptor = identity.governance_descriptor(str(ROOT))
@@ -119,6 +154,9 @@ class MarketScannerBuildIdentityTests(unittest.TestCase):
             "validation_sha": "f" * 39,
             "app_git_sha": "a" * 39,
             "native_core_sha256": "B" * 64,
+            "build_configuration": "profile",
+            "working_tree_state": "unknown",
+            "production_eligible": False,
         }
         for field, bad_value in mutations.items():
             malformed = copy.deepcopy(valid)
@@ -133,7 +171,65 @@ class MarketScannerBuildIdentityTests(unittest.TestCase):
         unknown["unexpected"] = True
         self.assert_rejected(lambda: identity.validate_fields(unknown))
 
-    def test_xcode_default_launch_uses_release_identity_and_debug_stays_ineligible(
+    def test_debug_and_release_identity_eligibility_is_explicit(self) -> None:
+        release = valid_embedded_identity()
+        identity.validate_fields(release)
+
+        debug_clean = copy.deepcopy(release)
+        debug_clean["build_configuration"] = "debug"
+        debug_clean["production_eligible"] = False
+        identity.validate_fields(debug_clean)
+
+        debug_dirty = copy.deepcopy(debug_clean)
+        debug_dirty["working_tree_state"] = "dirty"
+        identity.validate_fields(debug_dirty)
+
+        release_dirty = copy.deepcopy(release)
+        release_dirty["working_tree_state"] = "dirty"
+        release_dirty["production_eligible"] = False
+        self.assert_rejected(lambda: identity.validate_fields(release_dirty))
+
+        inconsistent = copy.deepcopy(debug_dirty)
+        inconsistent["production_eligible"] = True
+        self.assert_rejected(lambda: identity.validate_fields(inconsistent))
+
+        numeric_boolean = copy.deepcopy(debug_dirty)
+        numeric_boolean["production_eligible"] = 0
+        self.assert_rejected(lambda: identity.validate_fields(numeric_boolean))
+
+    def test_dirty_debug_is_traceable_while_release_remains_clean_only(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = Path(temporary)
+            self.make_identity_repo(repo)
+
+            release = identity.build_identity(
+                str(repo), allow_dirty=False, build_configuration="Release")
+            self.assertEqual(release["build_configuration"], "release")
+            self.assertEqual(release["working_tree_state"], "clean")
+            self.assertIs(release["production_eligible"], True)
+
+            native = (
+                repo
+                / "core/MarketScannerFactorGraph/market_scanner_factor_graph.cpp"
+            )
+            native.write_text(
+                "int market_scanner_test = 2;\n", encoding="utf-8")
+            debug = identity.build_identity(
+                str(repo), allow_dirty=True, build_configuration="Debug")
+            self.assertEqual(debug["build_configuration"], "debug")
+            self.assertEqual(debug["working_tree_state"], "dirty")
+            self.assertIs(debug["production_eligible"], False)
+            self.assert_rejected(
+                lambda: identity.build_identity(
+                    str(repo),
+                    allow_dirty=True,
+                    build_configuration="Release",
+                )
+            )
+
+    def test_xcode_default_launch_uses_release_and_debug_emits_identity(
         self,
     ) -> None:
         scheme_path = (
@@ -154,10 +250,14 @@ class MarketScannerBuildIdentityTests(unittest.TestCase):
             ROOT / "app/ios/RTABMapApp.xcodeproj/project.pbxproj"
         ).read_text(encoding="utf-8")
         self.assertIn('if [ \\"$CONFIGURATION\\" = \\"Debug\\" ]', project)
-        self.assertIn('rm -f \\"$OUT\\"', project)
-        self.assertIn("production processing remains ineligible", project)
-        self.assertNotIn(
-            "market_scanner_build_identity.py\\\" emit --allow-dirty",
+        self.assertNotIn('rm -f \\"$OUT\\"', project)
+        self.assertIn(
+            '--configuration \\"$CONFIGURATION\\" --allow-dirty',
+            project,
+        )
+        self.assertIn(
+            'verify --repo \\"$REPO_ROOT\\" --identity \\"$OUT\\" '
+            '--configuration \\"$CONFIGURATION\\"',
             project,
         )
 
@@ -202,8 +302,8 @@ class MarketScannerBuildIdentityTests(unittest.TestCase):
             "market_scanner_build_identity.py\\\" emit --repo",
             project,
         )
-        self.assertNotIn(
-            "market_scanner_build_identity.py\\\" emit --allow-dirty",
+        self.assertIn(
+            '--configuration \\"$CONFIGURATION\\"',
             project,
         )
 

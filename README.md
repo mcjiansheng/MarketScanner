@@ -63,7 +63,7 @@ Android 目录中的部分 C++ 原生实现也因共享移动渲染和数据库�
 
 配置页还允许在启动前填写最多 64 个字符的可选“扫描名称”。斜杠、通配符、引号、控制字符等会被过滤，连续空白会折叠；留空或过滤后为空时自动使用 `<门店>-<楼层>-MMdd-HHmm`。该值只作为 `scanDisplayName` 写入扫描配置、`metadata.json` 和 `live_checkpoint.json`，并作为历史扫描列表的显示标题；它不参与会话目录、数据库、sidecar、地图身份、处理任务或发布路径命名。旧会话没有该字段时继续显示原 `SupermarketSession-*` 目录名并保持完全兼容。
 
-开始扫描前先完成 build identity、地图身份和相机权限检查。包校验、localizer 构造、会话目录和 native SQLite 初始化在串行后台队列执行，主线程只承担短暂的 UIKit/ARSession 状态切换。扫描只有在 ARSession、RTAB-Map、sidecar writer、durable receipt 和 workflow context 全部提交后才进入 `scanning`；任一步失败或取消都会停止相机/映射、释放会话身份并脱离失败数据库，不能留下“幽灵扫描”。共享 `RTABMapApp` 的默认 Run 已改为严格 Release 身份构建，普通点击 Run 即可进行真机扫描；Test/Analyze 和手动 Debug 配置仍为 Debug 并继续 fail closed。`RTABMapApp-QualifiedDevice` 保留为等价的显式资格入口，二者都不提供 dirty bypass。
+开始扫描前先完成 build identity、地图身份和相机权限检查。包校验、localizer 构造、会话目录和 native SQLite 初始化在串行后台队列执行，主线程只承担短暂的 UIKit/ARSession 状态切换。扫描只有在 ARSession、RTAB-Map、sidecar writer、durable receipt 和 workflow context 全部提交后才进入 `scanning`；任一步失败或取消都会停止相机/映射、释放会话身份并脱离失败数据库，不能留下“幽灵扫描”。Debug 与 Release 现在都生成可追踪 build identity，并执行完全相同的扫描、落盘、finalization、处理和结果链路；Debug 允许 tracked tree dirty 并在身份、scan event 和 metadata 中标明测试来源，Release 继续要求 tracked tree clean 并标记为 production eligible。共享 `RTABMapApp` 默认 Run 和 `RTABMapApp-QualifiedDevice` 仍使用 Release，便于进行真实性能和现场资格测试。
 
 已有地图模式的定位和 PC 草稿复核能力保持不变：手机只接受小幅、唯一且连续一致的自动结构修正；PC 先运行 RTAB‑Map 重处理，再运行 native 完整相对 SE(2) 因子图、质量报告、人工复核和价签导出。对于短兼容会话，native helper 缺失、执行失败或结果破坏已验证物理连续性时，仍可回退到不可发布的连续有界修正场并保留 native 审计。长距离会话则额外执行下述 gauge-neutral 自由空间道路恢复；当前质量策略仍是 candidate，且真机/现场资格未完成，因此不能据此宣称生产发布通过。
 

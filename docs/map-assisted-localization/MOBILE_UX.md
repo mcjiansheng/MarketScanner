@@ -1,6 +1,6 @@
 # iPhone 统一门店扫描交互
 
-> 文档状态：**当前有效（统一全手机扫描主流程）**。最后核对日期：2026-08-16。
+> 文档状态：**当前有效（统一全手机扫描主流程）**。最后核对日期：2026-08-17。
 
 ## 主入口与地图库
 
@@ -15,7 +15,7 @@
 2. **选择楼层**：显示所选楼层的独立预览；本次扫描固定绑定该楼层，扫描中不能切层或跨楼层定位。同一楼层内少量坡道/地面起伏不影响二维先验位置。
 3. **确认起点**：地图支持 1×—8× pinch zoom、单指平移、双击放大/复位和点击选点。起点可以用上/下/左/右方向键微调，步长可选 0.1 m、0.5 m 或 1.0 m。
 4. **确认朝向**：使用东 0°、北 90°、西 180°、南 270°和左/右 15°微调；不再使用横向滑杆。方向箭头按地图坐标系实时更新。
-5. **启动门**：完整绑定 registry 与 manifest 的 name、floor count、element count、canonical source SHA、prior-map ID、package SHA 和 store ID。共享 `RTABMapApp` 默认 Run 与 `RTABMapApp-QualifiedDevice` 都使用 Release 并生成严格身份；Test/Analyze 或手动 Debug 构建仍只允许 UI/导入 smoke。
+5. **启动门**：完整绑定 registry 与 manifest 的 name、floor count、element count、canonical source SHA、prior-map ID、package SHA 和 store ID。Debug 与 Release 都生成严格、可追踪身份并进入同一完整扫描链路；Debug clean/dirty 均可做端到端测试，配置页只展示其测试来源而不禁用开始按钮。默认 `RTABMapApp` Run 与 `RTABMapApp-QualifiedDevice` 仍使用 clean Release，供性能和现场资格验证。
 6. **相机权限**：`.authorized` 才允许 workflow begin/commit；首次 `.notDetermined` 先请求权限，授权后重新走整个正式入口，拒绝/受限则恢复交互并提供“打开设置”。host 不允许旧 `startCamera()` permission callback 在 workflow 失败后自行启动。
 7. **开始扫描**：localizer、会话目录、连续 SQLite 数据库和 sidecar probe 在 workflow 串行后台队列准备；主线程只安装 UI/localizer、启动 ARSession/CameraMobile 并切换 mapping。ARSession、RTAB-Map、sidecar、receipt 和 workflow context 全部 durable commit 后才进入 `.scanning`。
 
@@ -68,6 +68,6 @@
 - 二维 HUD 忽略 ARKit 竖直高度；原始连续数据库仍保留三维运动。
 - 当前扫描绑定一个楼层，不支持楼梯、电梯或其他跨楼层过程。
 - 预定路线编辑和无条件全图搜索仍属于后续增强；当前只在持续 weak/lost 或可靠闭环后启用有界恢复。
-- 当前修改的 unsigned iPhoneOS Debug 全量编译/链接、聚焦 UX/权限/receipt/地图库合同和完整 Swift host 已通过；Debug 日志确认身份仍被移除。提交后默认 `RTABMapApp` unsigned Release 全量编译/链接也已通过，并输出 `build identity verified`。默认 Release Run 或 `RTABMapApp-QualifiedDevice` 安装后的触控 p50/p95、首次权限、后台/前台、完整扫描和设备热/内存表现仍需真机复测。
+- 2026-08-10 的历史 unsigned iPhoneOS Debug/Release 编译证据仍保留，但当时“Debug 身份被移除”的行为已由 2026-08-17 version 4 合同取代。当前 Debug/Release 都必须输出 `build identity verified`，并由新的源码/host/Xcode 回归证明 Debug 可进入完整扫描；默认 Release Run 或 `RTABMapApp-QualifiedDevice` 安装后的触控 p50/p95、首次权限、后台/前台、完整扫描和设备热/内存表现仍需真机复测。
 - Xcode Debug Navigator 若显示主线程停在 `ViewController.updateState(state:)` 的文件断点，App 会表现为黑底、网格或残缺旧控件；删除/停用断点并 Continue 即可。该现象是调试器暂停，不属于 App 状态机恢复路径。
 - 真实 LiDAR iPhone 的 30 秒性能、照明/反光/斜视/多价签矩阵和完整现场确认尚未执行；低影响增强与明日测试见 [`ESL_CAPTURE_TODO.md`](ESL_CAPTURE_TODO.md) 与 [`MAPCASE02_TODO.md`](MAPCASE02_TODO.md)。当前不得宣称 ESL FIELD CAPTURE UX COMPLETE 或 Production Ready。
