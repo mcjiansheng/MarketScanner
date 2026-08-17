@@ -51,8 +51,21 @@ private struct PendingPoseEpochTransition {
     let beforeFrameTimestamp: TimeInterval
     let afterFrameTimestamp: TimeInterval
     let beforeNodeID: Int64
+    let fromComponent: Int64
     let transform: ShelfEvidenceTransform
     let reason: String
+    var afterNodeID: Int64?
+    var toComponent: Int64?
+    var bridgeCandidates: [PoseEpochBridgeLinkEvidence]
+}
+
+private struct PoseEpochBridgeNodeBinding {
+    let nodeID: Int64
+    let component: Int64
+    let epoch: Int
+    let nodeStamp: TimeInterval
+    let epochCorrection: simd_float4x4
+    let openGLWorldFromNode: simd_float4x4
 }
 
 private struct PendingShelfObservationWindow {
@@ -266,7 +279,13 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
     /// ARKit coordinate discontinuity is rebased so audit logs can distinguish
     /// a continuous accepted trajectory from a new raw sensor coordinate era.
     private var mCapturePoseEpoch: UInt64 = 1
-    private var pendingPoseEpochTransition: PendingPoseEpochTransition?
+    private let poseEpochBridgeLock = NSLock()
+    private var pendingPoseEpochTransitions: [PendingPoseEpochTransition] = []
+    private var poseEpochBridgeNodeBindings: [Int64: PoseEpochBridgeNodeBinding] = [:]
+    private var poseEpochBridgeNodeOrder: [Int64] = []
+    private var poseEpochBridgeNodeOrderStart = 0
+    private var lastConsumedNativeLoopSnapshotGeneration: UInt64 = 0
+    private var poseEpochBridgeStateFailure: String?
     private var poseEpochTransitionSequence = 0
     private var shelfTrackingStateMachine = ShelfTrackingStateMachine()
     private var corridorHypothesisSequence = 0
@@ -1241,6 +1260,9 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                     if reliableLoopClosure,
                        self.activeScanConfiguration.workflowMode == .priorMapLocalized,
                        let localizer = self.priorMapLocalizer {
+                        let nativeBridgeSnapshot = rtabmap.latestLoopClosureLink(
+                            fromNodeID: loopClosureCurrentId,
+                            toNodeID: loopClosureTargetId)
                         let generation = self.priorMapGeneration
                         self.priorMapQueue.async {
                             guard generation == self.priorMapGeneration else { return }
@@ -1261,6 +1283,11 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                                 identityStatus = "ambiguous_top_k_retained"
                             }
                             if let scanSession = self.supermarketSession {
+                                if let nativeBridgeSnapshot {
+                                    self.recordNativePoseEpochBridgeLink(
+                                        nativeBridgeSnapshot,
+                                        scanSession: scanSession)
+                                }
                                 _ = self.persistShelfLoopEvent(
                                     shelfCandidates: shelfCandidates,
                                     scanSession: scanSession,
@@ -2148,8 +2175,15 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
     {
         mARPoseCorrection = matrix_identity_float4x4
         mCapturePoseEpoch = 1
-        pendingPoseEpochTransition = nil
+        poseEpochBridgeLock.lock()
+        pendingPoseEpochTransitions.removeAll(keepingCapacity: true)
+        poseEpochBridgeNodeBindings.removeAll(keepingCapacity: true)
+        poseEpochBridgeNodeOrder.removeAll(keepingCapacity: true)
+        poseEpochBridgeNodeOrderStart = 0
+        lastConsumedNativeLoopSnapshotGeneration = 0
+        poseEpochBridgeStateFailure = nil
         poseEpochTransitionSequence = 0
+        poseEpochBridgeLock.unlock()
         shelfTrackingStateMachine = ShelfTrackingStateMachine()
         corridorHypothesisSequence = 0
         lastCorridorHypothesisNodeID = nil
@@ -2177,8 +2211,9 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         reason: String
     ) {
         guard activeScanConfiguration.workflowMode == .priorMapLocalized,
-              let beforeNodeID = priorMapLastNodeBinding?.nodeId,
-              beforeNodeID > 0,
+              let beforeBinding = priorMapLastNodeBinding,
+              beforeBinding.nodeId > 0,
+              beforeBinding.nodeMapId >= 0,
               fromEpoch < UInt64(Int.max),
               mCapturePoseEpoch < UInt64(Int.max) else {
             supermarketSession?.appendScanEvent(
@@ -2193,49 +2228,318 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
             positionZ: Double(transform.columns.3.z),
             forwardX: Double(-transform.columns.2.x),
             forwardZ: Double(-transform.columns.2.z))
-        pendingPoseEpochTransition = PendingPoseEpochTransition(
+        let pending = PendingPoseEpochTransition(
             fromEpoch: Int(fromEpoch),
             toEpoch: Int(mCapturePoseEpoch),
             beforeFrameTimestamp: beforeFrameTimestamp,
             afterFrameTimestamp: afterFrameTimestamp,
-            beforeNodeID: Int64(beforeNodeID),
+            beforeNodeID: Int64(beforeBinding.nodeId),
+            fromComponent: Int64(beforeBinding.nodeMapId),
             transform: ShelfEvidenceTransform(
                 dxM: horizontal.xM,
                 dyM: horizontal.yM,
                 dyawRad: horizontal.yawRad),
-            reason: reason)
+            reason: reason,
+            afterNodeID: nil,
+            toComponent: nil,
+            bridgeCandidates: [])
+        var failure: String?
+        poseEpochBridgeLock.lock()
+        if pending.toEpoch != pending.fromEpoch + 1 {
+            failure = "non_contiguous_epoch_transition"
+        } else if pendingPoseEpochTransitions.contains(where: {
+            $0.fromEpoch == pending.fromEpoch
+        }) {
+            failure = "duplicate_epoch_transition"
+        } else if pendingPoseEpochTransitions.count >=
+                    GeneratedMobileEvidenceContracts
+                        .File_pose_epoch_transitions_jsonl.max_records {
+            failure = "pose_epoch_transition_capacity_exceeded"
+        } else {
+            pendingPoseEpochTransitions.append(pending)
+        }
+        if let failure { poseEpochBridgeStateFailure = failure }
+        poseEpochBridgeLock.unlock()
+        if let failure {
+            supermarketSession?.appendScanEvent(
+                level: "error",
+                event: "pose_epoch_transition_buffer_failed",
+                message: "The append-only pose epoch transition buffer rejected a boundary",
+                fields: ["reason": failure])
+        }
     }
 
-    private func persistPendingPoseEpochTransition(
-        afterNodeID: Int64,
-        scanSession: SupermarketScanSession,
-        trackingSessionID: String
+    private func recordPoseEpochBridgeNodeBinding(
+        _ binding: RTABMapNodeBindingSnapshot,
+        epoch: Int,
+        epochCorrection: simd_float4x4
     ) {
-        guard let pending = pendingPoseEpochTransition,
-              afterNodeID > 0,
-              afterNodeID != pending.beforeNodeID else { return }
-        let sequence = poseEpochTransitionSequence + 1
-        let record = PoseEpochTransitionRecord(
-            format: PoseEpochTransitionRecord.formatName,
-            version: ShelfLocalizationPolicy.contractVersion,
-            trackingSessionID: trackingSessionID,
-            sequence: sequence,
-            fromEpoch: pending.fromEpoch,
-            toEpoch: pending.toEpoch,
-            beforeFrameTimestamp: pending.beforeFrameTimestamp,
-            afterFrameTimestamp: pending.afterFrameTimestamp,
-            beforeNodeID: pending.beforeNodeID,
-            afterNodeID: afterNodeID,
-            transform: pending.transform,
-            bridgeEvidence: [],
-            reason: pending.reason,
-            writeWatermark: sequence)
-        if scanSession.appendPoseEpochTransition(
-            record,
-            expectedTrackingSessionId: trackingSessionID) {
-            poseEpochTransitionSequence = sequence
+        let nodeID = Int64(binding.nodeId)
+        guard nodeID > 0, binding.nodeMapId >= 0, epoch >= 0 else { return }
+        let value = PoseEpochBridgeNodeBinding(
+            nodeID: nodeID,
+            component: Int64(binding.nodeMapId),
+            epoch: epoch,
+            nodeStamp: binding.nodeStamp,
+            epochCorrection: epochCorrection,
+            openGLWorldFromNode: binding.openGLWorldFromNode)
+        poseEpochBridgeLock.lock()
+        if poseEpochBridgeNodeBindings[nodeID] == nil {
+            let maximumBindings = GeneratedMobileEvidenceContracts
+                .ProductScale.maxRawNodes
+            while poseEpochBridgeNodeBindings.count >= maximumBindings,
+                  poseEpochBridgeNodeOrderStart < poseEpochBridgeNodeOrder.count {
+                let expired = poseEpochBridgeNodeOrder[poseEpochBridgeNodeOrderStart]
+                poseEpochBridgeNodeOrderStart += 1
+                poseEpochBridgeNodeBindings.removeValue(forKey: expired)
+            }
+            if poseEpochBridgeNodeOrderStart >= 4096,
+               poseEpochBridgeNodeOrderStart * 2
+                    >= poseEpochBridgeNodeOrder.count {
+                poseEpochBridgeNodeOrder.removeFirst(poseEpochBridgeNodeOrderStart)
+                poseEpochBridgeNodeOrderStart = 0
+            }
+            poseEpochBridgeNodeBindings[nodeID] = value
+            poseEpochBridgeNodeOrder.append(nodeID)
         }
-        pendingPoseEpochTransition = nil
+        for index in pendingPoseEpochTransitions.indices
+        where pendingPoseEpochTransitions[index].toEpoch == epoch
+            && pendingPoseEpochTransitions[index].afterNodeID == nil
+            && pendingPoseEpochTransitions[index].beforeNodeID != nodeID {
+            pendingPoseEpochTransitions[index].afterNodeID = nodeID
+            pendingPoseEpochTransitions[index].toComponent = value.component
+        }
+        poseEpochBridgeLock.unlock()
+    }
+
+    private func recordNativePoseEpochBridgeLink(
+        _ snapshot: RTABMapLoopClosureLinkSnapshot,
+        scanSession: SupermarketScanSession
+    ) {
+        let originalFrom: PoseEpochBridgeNodeBinding
+        let originalTo: PoseEpochBridgeNodeBinding
+        poseEpochBridgeLock.lock()
+        guard snapshot.generation > lastConsumedNativeLoopSnapshotGeneration else {
+            poseEpochBridgeLock.unlock()
+            return
+        }
+        lastConsumedNativeLoopSnapshotGeneration = snapshot.generation
+        guard let storedFrom = poseEpochBridgeNodeBindings[
+                Int64(snapshot.fromNodeID)],
+              let storedTo = poseEpochBridgeNodeBindings[
+                Int64(snapshot.toNodeID)] else {
+            poseEpochBridgeLock.unlock()
+            return
+        }
+        originalFrom = storedFrom
+        originalTo = storedTo
+        poseEpochBridgeLock.unlock()
+
+        guard originalFrom.component == Int64(snapshot.fromNodeMapID),
+              originalTo.component == Int64(snapshot.toNodeMapID),
+              originalFrom.epoch != originalTo.epoch else {
+            return
+        }
+        let earlier: PoseEpochBridgeNodeBinding
+        let later: PoseEpochBridgeNodeBinding
+        let measurement: simd_float4x4
+        if originalFrom.epoch < originalTo.epoch {
+            earlier = originalFrom
+            later = originalTo
+            measurement = snapshot.measurement
+        } else {
+            earlier = originalTo
+            later = originalFrom
+            measurement = simd_inverse(snapshot.measurement)
+        }
+        guard later.epoch == earlier.epoch + 1,
+              earlier.component == later.component else {
+            return
+        }
+        let earlierLocalFromNode = simd_mul(
+            simd_inverse(earlier.epochCorrection),
+            earlier.openGLWorldFromNode)
+        let laterLocalFromNode = simd_mul(
+            simd_inverse(later.epochCorrection),
+            later.openGLWorldFromNode)
+        let bridgeMatrix = simd_mul(
+            simd_mul(earlierLocalFromNode, measurement),
+            simd_inverse(laterLocalFromNode))
+        guard matrixIsFinite(measurement), matrixIsFinite(bridgeMatrix) else {
+            return
+        }
+        // RTAB-Map Link::transform uses its native planar x/y/theta frame.
+        // Keep that exact measurement for audit; only the epoch-frame bridge
+        // matrix below is projected through the ARKit x/z convention.
+        let measuredHorizontal = ShelfEvidenceTransform(
+            dxM: Double(measurement.columns.3.x),
+            dyM: Double(measurement.columns.3.y),
+            dyawRad: atan2(
+                Double(measurement.columns.0.y),
+                Double(measurement.columns.0.x)))
+        let bridgeHorizontal = PriorMapStageOneMath.arkitHorizontalPose(
+            positionX: Double(bridgeMatrix.columns.3.x),
+            positionZ: Double(bridgeMatrix.columns.3.z),
+            forwardX: Double(-bridgeMatrix.columns.2.x),
+            forwardZ: Double(-bridgeMatrix.columns.2.z))
+        let candidate = PoseEpochBridgeLinkEvidence(
+            fromNodeID: earlier.nodeID,
+            toNodeID: later.nodeID,
+            fromEpoch: earlier.epoch,
+            toEpoch: later.epoch,
+            fromComponent: earlier.component,
+            toComponent: later.component,
+            nativeLinkType: snapshot.nativeLinkType,
+            measurement: measuredHorizontal,
+            bridgeTransform: ShelfEvidenceTransform(
+                dxM: bridgeHorizontal.xM,
+                dyM: bridgeHorizontal.yM,
+                dyawRad: bridgeHorizontal.yawRad),
+            consensusInlier: false)
+
+        var diagnostic: String?
+        poseEpochBridgeLock.lock()
+        if let transitionIndex = pendingPoseEpochTransitions.firstIndex(where: {
+            $0.fromEpoch == earlier.epoch && $0.toEpoch == later.epoch
+        }),
+           let afterNodeID = pendingPoseEpochTransitions[transitionIndex].afterNodeID,
+           let toComponent = pendingPoseEpochTransitions[transitionIndex].toComponent,
+           candidate.fromNodeID
+                <= pendingPoseEpochTransitions[transitionIndex].beforeNodeID,
+           candidate.toNodeID >= afterNodeID,
+           pendingPoseEpochTransitions[transitionIndex].fromComponent
+                == candidate.fromComponent,
+           toComponent == candidate.toComponent {
+            let existing = pendingPoseEpochTransitions[transitionIndex]
+                .bridgeCandidates
+            let duplicateOrShared = existing.contains { link in
+                (min(link.fromNodeID, link.toNodeID)
+                    == min(candidate.fromNodeID, candidate.toNodeID)
+                    && max(link.fromNodeID, link.toNodeID)
+                    == max(candidate.fromNodeID, candidate.toNodeID))
+                    || link.fromNodeID == candidate.fromNodeID
+                    || link.fromNodeID == candidate.toNodeID
+                    || link.toNodeID == candidate.fromNodeID
+                    || link.toNodeID == candidate.toNodeID
+            }
+            if duplicateOrShared {
+                diagnostic = "duplicate_or_shared_endpoint"
+            } else if existing.count >= ShelfLocalizationPolicy.maximumBridgeLinks {
+                diagnostic = "bridge_candidate_capacity_reached"
+            } else {
+                pendingPoseEpochTransitions[transitionIndex]
+                    .bridgeCandidates.append(candidate)
+            }
+        }
+        poseEpochBridgeLock.unlock()
+        if let diagnostic {
+            scanSession.appendScanEvent(
+                level: "warning",
+                event: "pose_epoch_bridge_link_rejected",
+                message: "A native loop edge was retained as graph diagnostics but could not count as an independent epoch-bridge witness",
+                fields: [
+                    "reason": diagnostic,
+                    "from_node_id": "\(candidate.fromNodeID)",
+                    "to_node_id": "\(candidate.toNodeID)",
+                ])
+        }
+    }
+
+    private func hasFormalPoseEpochBridge(
+        firstEpoch: Int,
+        secondEpoch: Int,
+        component: Int64
+    ) -> Bool {
+        if firstEpoch == secondEpoch { return true }
+        let lower = min(firstEpoch, secondEpoch)
+        let upper = max(firstEpoch, secondEpoch)
+        poseEpochBridgeLock.lock()
+        defer { poseEpochBridgeLock.unlock() }
+        return (lower..<upper).allSatisfy { epoch in
+            guard let transition = pendingPoseEpochTransitions.first(where: {
+                $0.fromEpoch == epoch && $0.toEpoch == epoch + 1
+            }),
+            let afterNodeID = transition.afterNodeID,
+            let toComponent = transition.toComponent else {
+                return false
+            }
+            return PoseEpochBridgeConsensus.makeEvidence(
+                candidates: transition.bridgeCandidates,
+                fromEpoch: transition.fromEpoch,
+                toEpoch: transition.toEpoch,
+                beforeNodeID: transition.beforeNodeID,
+                afterNodeID: afterNodeID,
+                fromComponent: transition.fromComponent,
+                toComponent: toComponent,
+                expectedTransform: transition.transform)?.component == component
+        }
+    }
+
+    private func flushPoseEpochTransitionsForFinalization(
+        scanSession: SupermarketScanSession
+    ) -> Bool {
+        poseEpochBridgeLock.lock()
+        let pending = pendingPoseEpochTransitions.sorted {
+            ($0.fromEpoch, $0.beforeFrameTimestamp)
+                < ($1.fromEpoch, $1.beforeFrameTimestamp)
+        }
+        let stateFailure = poseEpochBridgeStateFailure
+        pendingPoseEpochTransitions.removeAll(keepingCapacity: true)
+        poseEpochBridgeLock.unlock()
+
+        var succeeded = stateFailure == nil
+        for transition in pending {
+            guard let afterNodeID = transition.afterNodeID,
+                  let toComponent = transition.toComponent else {
+                succeeded = false
+                continue
+            }
+            let bridgeEvidence = PoseEpochBridgeConsensus.makeEvidence(
+                candidates: transition.bridgeCandidates,
+                fromEpoch: transition.fromEpoch,
+                toEpoch: transition.toEpoch,
+                beforeNodeID: transition.beforeNodeID,
+                afterNodeID: afterNodeID,
+                fromComponent: transition.fromComponent,
+                toComponent: toComponent,
+                expectedTransform: transition.transform).map { [$0] } ?? []
+            let sequence = poseEpochTransitionSequence + 1
+            let record = PoseEpochTransitionRecord(
+                format: PoseEpochTransitionRecord.formatName,
+                version: ShelfLocalizationPolicy.contractVersion,
+                trackingSessionID: scanSession.trackingSessionId,
+                sequence: sequence,
+                fromEpoch: transition.fromEpoch,
+                toEpoch: transition.toEpoch,
+                beforeFrameTimestamp: transition.beforeFrameTimestamp,
+                afterFrameTimestamp: transition.afterFrameTimestamp,
+                beforeNodeID: transition.beforeNodeID,
+                afterNodeID: afterNodeID,
+                fromComponent: transition.fromComponent,
+                toComponent: toComponent,
+                transform: transition.transform,
+                bridgeEvidence: bridgeEvidence,
+                reason: transition.reason,
+                writeWatermark: sequence)
+            if scanSession.appendPoseEpochTransition(
+                record,
+                expectedTrackingSessionId: scanSession.trackingSessionId,
+                allowDuringFinalization: true) {
+                poseEpochTransitionSequence = sequence
+            } else {
+                succeeded = false
+            }
+        }
+        return succeeded
+    }
+
+    private func matrixIsFinite(_ matrix: simd_float4x4) -> Bool {
+        for column in 0..<4 {
+            for row in 0..<4 where !matrix[column, row].isFinite {
+                return false
+            }
+        }
+        return true
     }
 
     private func resetSupermarketScanQualityAdvisors()
@@ -2473,15 +2777,19 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                 if recoveredTrackingThisFrame,
                    distance > 0.35 || rotation > 20.0 {
                     let previousEpoch = mCapturePoseEpoch
-                    mARPoseCorrection = simd_mul(
+                    let previousCorrection = mARPoseCorrection
+                    let nextCorrection = simd_mul(
                         previousPose,
                         simd_inverse(rawPose))
+                    mARPoseCorrection = nextCorrection
                     mCapturePoseEpoch &+= 1
                     preparePoseEpochTransition(
                         fromEpoch: previousEpoch,
                         beforeFrameTimestamp: previousTimestamp,
                         afterFrameTimestamp: frame.timestamp,
-                        transform: mARPoseCorrection,
+                        transform: simd_mul(
+                            simd_inverse(previousCorrection),
+                            nextCorrection),
                         reason: "tracking_recovery_epoch_rebase")
                     supermarketSession?.recordMappingFrameQuality(
                         accepted: false,
@@ -2521,13 +2829,18 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                     || impossibleLinearSpeed
                     || impossibleAngularSpeed {
                     let previousEpoch = mCapturePoseEpoch
-                    mARPoseCorrection = simd_mul(previousPose, simd_inverse(rawPose))
+                    let previousCorrection = mARPoseCorrection
+                    let nextCorrection = simd_mul(
+                        previousPose, simd_inverse(rawPose))
+                    mARPoseCorrection = nextCorrection
                     mCapturePoseEpoch &+= 1
                     preparePoseEpochTransition(
                         fromEpoch: previousEpoch,
                         beforeFrameTimestamp: previousTimestamp,
                         afterFrameTimestamp: frame.timestamp,
-                        transform: mARPoseCorrection,
+                        transform: simd_mul(
+                            simd_inverse(previousCorrection),
+                            nextCorrection),
                         reason: "arkit_world_rebuild")
                     supermarketSession?.recordMappingFrameQuality(
                         accepted: false,
@@ -3916,13 +4229,17 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         let geometryResidualMaximumM = max(
             opposite.geometry.residualMaximumM,
             latest.geometry.residualMaximumM)
+        let hasEpochBridge = hasFormalPoseEpochBridge(
+            firstEpoch: opposite.epoch,
+            secondEpoch: latest.epoch,
+            component: latest.component)
         let accepted = ShelfLoopVerifier.accepts(
             first: opposite,
             second: latest,
             relativePoseDeltaM: relativeDeltaM,
             relativePoseDeltaYawRad: relativeDeltaYawRad,
             inlierRatio: geometryInlierRatio,
-            hasEpochBridge: opposite.epoch == latest.epoch,
+            hasEpochBridge: hasEpochBridge,
             dominantDynamicEvidence:
                 opposite.dynamicRejectionCount * 2
                     > opposite.observationNodeCount
@@ -3931,8 +4248,10 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         let reason: String
         if accepted {
             reason = "two_sided_consistency_confirmed"
-        } else if opposite.epoch != latest.epoch {
-            reason = "epoch_mismatch"
+        } else if opposite.component != latest.component {
+            reason = "component_mismatch"
+        } else if opposite.epoch != latest.epoch && !hasEpochBridge {
+            reason = "epoch_bridge_missing"
         } else if ShelfLoopVerifier.candidateRelativeMargin(opposite)
                     < ShelfLocalizationPolicy.calibrationPendingLowConfidenceMargin
                     || ShelfLoopVerifier.candidateRelativeMargin(latest)
@@ -4053,10 +4372,10 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                 binding.generation,
                 binding.openGLWorldFromNode,
                 frame.timestamp)
-            persistPendingPoseEpochTransition(
-                afterNodeID: Int64(binding.nodeId),
-                scanSession: scanSession,
-                trackingSessionID: trackingSessionId)
+            recordPoseEpochBridgeNodeBinding(
+                binding,
+                epoch: Int(mCapturePoseEpoch),
+                epochCorrection: mARPoseCorrection)
         }
         let localizationEpoch = mCapturePoseEpoch
         let localizationComponent = Int64(priceTagNodeBinding?.nodeMapId ?? 0)
@@ -7407,6 +7726,11 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                     }
                     let shelfEvidenceWatermark: ShelfLocalizationEvidenceWatermark?
                     if isPriorMapScan {
+                        if !self.flushPoseEpochTransitionsForFinalization(
+                            scanSession: scanSession) {
+                            processingBlockers.append(
+                                "pose_epoch_transition_flush_failed")
+                        }
                         let watermark = scanSession.sealShelfLocalizationEvidence(
                             expectedTrackingSessionId: scanSession.trackingSessionId,
                             allowDuringFinalization: true)

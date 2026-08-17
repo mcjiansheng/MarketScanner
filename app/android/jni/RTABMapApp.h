@@ -66,6 +66,30 @@ struct NodeTimeSnapshot {
   float nodeQw;
 };
 
+/// Exact accepted native graph edge frozen from the same Statistics event as
+/// the Swift loop callback. It intentionally contains only native authority:
+/// node/component identity, link type and the measured relative transform.
+struct LoopClosureLinkSnapshot {
+  LoopClosureLinkSnapshot() :
+    fromNodeId(0), toNodeId(0), fromNodeMapId(0), toNodeMapId(0),
+    linkType(0), generation(0), x(0.0f), y(0.0f), z(0.0f),
+    qx(0.0f), qy(0.0f), qz(0.0f), qw(0.0f) {}
+
+  std::int32_t fromNodeId;
+  std::int32_t toNodeId;
+  std::int32_t fromNodeMapId;
+  std::int32_t toNodeMapId;
+  std::int32_t linkType;
+  std::uint64_t generation;
+  float x;
+  float y;
+  float z;
+  float qx;
+  float qy;
+  float qz;
+  float qw;
+};
+
 // RTABMapApp handles the application lifecycle and resources.
 class RTABMapApp : public UEventsHandler {
  public:
@@ -120,6 +144,9 @@ class RTABMapApp : public UEventsHandler {
   void setStreamingMapMode(bool enabled, int maxRenderedNodes);
   bool getNodeTimeSnapshot(NodeTimeSnapshot & snapshot);
   bool getNodeTimeOffset(double & offset);
+  bool getLoopClosureLinkSnapshot(int expectedFromNodeId,
+                                  int expectedToNodeId,
+                                  LoopClosureLinkSnapshot & snapshot);
 
   // Set render camera's viewing angle, first person, third person or top down.
   //
@@ -338,9 +365,12 @@ class RTABMapApp : public UEventsHandler {
 
 	rtabmap::Transform mapToOdom_;
 	std::uint64_t nodeTimeSnapshotGeneration_;
+	LoopClosureLinkSnapshot loopClosureLinkSnapshot_;
+	std::uint64_t loopClosureLinkSnapshotGeneration_;
 
 	boost::mutex cameraMutex_;
 	boost::mutex rtabmapMutex_;
+	boost::mutex loopClosureSnapshotMutex_;
 	boost::mutex meshesMutex_;
 	boost::mutex sensorMutex_;
 	boost::mutex poseMutex_;

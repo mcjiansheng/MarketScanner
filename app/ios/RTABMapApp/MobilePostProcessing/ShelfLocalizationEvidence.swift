@@ -6,7 +6,12 @@ import Foundation
 /// CALIBRATION_PENDING until a signed LiDAR device run freezes them in the
 /// product specification; callers must expose that status in quality output.
 enum ShelfLocalizationPolicy {
-    static let contractVersion = 2
+    /// v2 is retained for already-finalized manifest-v5 sessions. Its
+    /// aggregate bridge counters are diagnostic-only and never authorize a
+    /// cross-epoch shelf loop. v3 adds the native node-pair witnesses needed
+    /// for a formally checkable bridge.
+    static let contractVersion = 3
+    static let supportedContractVersions = 2...contractVersion
     static let calibrationStatus = "CALIBRATION_PENDING"
 
     // S-7 / S-11 / S-12 are frozen product values, not calibration knobs.
@@ -38,6 +43,7 @@ enum ShelfLocalizationPolicy {
     static let maximumCorridorHypotheses = 24
     static let maximumShelfCandidates = 24
     static let maximumBridgeEvidence = 16
+    static let maximumBridgeLinks = 16
 
     static func isLowercaseSHA256(_ value: String) -> Bool {
         value.count == 64 && value.utf8.allSatisfy {
@@ -64,11 +70,43 @@ struct PoseEpochBridgeEvidence: Codable, Equatable {
     let type: String
     let independentNodePairs: Int
     let consensusInlierRatio: Double
+    let component: Int64?
+    let consensusTransform: ShelfEvidenceTransform?
+    let links: [PoseEpochBridgeLinkEvidence]?
 
     enum CodingKeys: String, CodingKey {
         case type
         case independentNodePairs = "independent_node_pairs"
         case consensusInlierRatio = "consensus_inlier_ratio"
+        case component
+        case consensusTransform = "consensus_transform"
+        case links
+    }
+}
+
+struct PoseEpochBridgeLinkEvidence: Codable, Equatable {
+    let fromNodeID: Int64
+    let toNodeID: Int64
+    let fromEpoch: Int
+    let toEpoch: Int
+    let fromComponent: Int64
+    let toComponent: Int64
+    let nativeLinkType: String
+    let measurement: ShelfEvidenceTransform
+    let bridgeTransform: ShelfEvidenceTransform
+    let consensusInlier: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case fromNodeID = "from_node_id"
+        case toNodeID = "to_node_id"
+        case fromEpoch = "from_epoch"
+        case toEpoch = "to_epoch"
+        case fromComponent = "from_component"
+        case toComponent = "to_component"
+        case nativeLinkType = "native_link_type"
+        case measurement
+        case bridgeTransform = "bridge_transform"
+        case consensusInlier = "consensus_inlier"
     }
 }
 
@@ -86,6 +124,8 @@ struct PoseEpochTransitionRecord: Codable, Equatable {
     let afterFrameTimestamp: TimeInterval
     let beforeNodeID: Int64
     let afterNodeID: Int64
+    let fromComponent: Int64?
+    let toComponent: Int64?
     let transform: ShelfEvidenceTransform
     let bridgeEvidence: [PoseEpochBridgeEvidence]
     let reason: String
@@ -100,27 +140,304 @@ struct PoseEpochTransitionRecord: Codable, Equatable {
         case afterFrameTimestamp = "after_frame_timestamp"
         case beforeNodeID = "before_node_id"
         case afterNodeID = "after_node_id"
+        case fromComponent = "from_component"
+        case toComponent = "to_component"
         case bridgeEvidence = "bridge_evidence"
         case writeWatermark = "write_watermark"
     }
 
     var isValid: Bool {
-        format == Self.formatName && version == ShelfLocalizationPolicy.contractVersion
+        let commonValid = format == Self.formatName
+            && ShelfLocalizationPolicy.supportedContractVersions.contains(version)
             && !trackingSessionID.isEmpty && sequence >= 1
             && fromEpoch >= 0 && toEpoch == fromEpoch + 1
             && beforeFrameTimestamp.isFinite && afterFrameTimestamp.isFinite
             && afterFrameTimestamp >= beforeFrameTimestamp
             && beforeNodeID > 0 && afterNodeID > 0 && transform.isFinite
             && bridgeEvidence.count <= ShelfLocalizationPolicy.maximumBridgeEvidence
-            && bridgeEvidence.allSatisfy {
-                $0.type == "multi_link_consensus"
-                    && $0.independentNodePairs >= 2
-                    && $0.consensusInlierRatio.isFinite
-                    && (ShelfLocalizationPolicy
-                        .calibrationPendingLoopInlierRatio...1.0)
-                        .contains($0.consensusInlierRatio)
-            }
             && !reason.isEmpty && writeWatermark == sequence
+        guard commonValid else { return false }
+        if version == 2 {
+            return fromComponent == nil && toComponent == nil
+                && bridgeEvidence.allSatisfy {
+                    $0.type == "multi_link_consensus"
+                        && $0.independentNodePairs >= 2
+                        && $0.consensusInlierRatio.isFinite
+                        && (ShelfLocalizationPolicy
+                            .calibrationPendingLoopInlierRatio...1.0)
+                            .contains($0.consensusInlierRatio)
+                        && $0.component == nil
+                        && $0.consensusTransform == nil
+                        && $0.links == nil
+                }
+        }
+        guard let fromComponent, let toComponent,
+              fromComponent >= 0, toComponent >= 0 else {
+            return false
+        }
+        let bridgeComponents = bridgeEvidence.compactMap(\.component)
+        return bridgeComponents.count == bridgeEvidence.count
+            && Set(bridgeComponents).count == bridgeComponents.count
+            && bridgeEvidence.reduce(0) {
+                $0 + ($1.links?.count ?? 0)
+            } <= ShelfLocalizationPolicy.maximumBridgeLinks
+            && bridgeEvidence.allSatisfy {
+                PoseEpochBridgeConsensus.isValid(
+                    evidence: $0,
+                    fromEpoch: fromEpoch,
+                    toEpoch: toEpoch,
+                    beforeNodeID: beforeNodeID,
+                    afterNodeID: afterNodeID,
+                    fromComponent: fromComponent,
+                    toComponent: toComponent,
+                    expectedTransform: transform)
+            }
+    }
+}
+
+/// Deterministic, cross-platform bridge consensus. The C-1 starting bounds
+/// are used only to decide whether independent native links agree with the
+/// recorded epoch transform. They do not make the calibration or publication
+/// gate pass: CALIBRATION_PENDING remains an unconditional blocker.
+enum PoseEpochBridgeConsensus {
+    private struct Selection {
+        let centerIndex: Int
+        let inlierIndices: Set<Int>
+    }
+
+    static func makeEvidence(
+        candidates: [PoseEpochBridgeLinkEvidence],
+        fromEpoch: Int,
+        toEpoch: Int,
+        beforeNodeID: Int64,
+        afterNodeID: Int64,
+        fromComponent: Int64,
+        toComponent: Int64,
+        expectedTransform: ShelfEvidenceTransform
+    ) -> PoseEpochBridgeEvidence? {
+        let ordered = candidates.sorted {
+            ($0.fromNodeID, $0.toNodeID) < ($1.fromNodeID, $1.toNodeID)
+        }
+        guard structurallyValid(
+                links: ordered,
+                fromEpoch: fromEpoch,
+                toEpoch: toEpoch,
+                beforeNodeID: beforeNodeID,
+                afterNodeID: afterNodeID,
+                component: fromComponent,
+                fromComponent: fromComponent,
+                toComponent: toComponent),
+              let selection = selection(
+                links: ordered,
+                expectedTransform: expectedTransform) else {
+            return nil
+        }
+        let inlierCount = selection.inlierIndices.count
+        let ratio = Double(inlierCount) / Double(ordered.count)
+        guard inlierCount >= 2,
+              ratio >= ShelfLocalizationPolicy
+                .calibrationPendingLoopInlierRatio else {
+            return nil
+        }
+        let finalizedLinks = ordered.enumerated().map { index, link in
+            PoseEpochBridgeLinkEvidence(
+                fromNodeID: link.fromNodeID,
+                toNodeID: link.toNodeID,
+                fromEpoch: link.fromEpoch,
+                toEpoch: link.toEpoch,
+                fromComponent: link.fromComponent,
+                toComponent: link.toComponent,
+                nativeLinkType: link.nativeLinkType,
+                measurement: link.measurement,
+                bridgeTransform: link.bridgeTransform,
+                consensusInlier: selection.inlierIndices.contains(index))
+        }
+        return PoseEpochBridgeEvidence(
+            type: "multi_link_consensus",
+            independentNodePairs: inlierCount,
+            consensusInlierRatio: ratio,
+            component: fromComponent,
+            consensusTransform:
+                ordered[selection.centerIndex].bridgeTransform,
+            links: finalizedLinks)
+    }
+
+    static func isValid(
+        evidence: PoseEpochBridgeEvidence,
+        fromEpoch: Int,
+        toEpoch: Int,
+        beforeNodeID: Int64,
+        afterNodeID: Int64,
+        fromComponent: Int64,
+        toComponent: Int64,
+        expectedTransform: ShelfEvidenceTransform
+    ) -> Bool {
+        guard evidence.type == "multi_link_consensus",
+              let component = evidence.component,
+              let consensusTransform = evidence.consensusTransform,
+              let links = evidence.links,
+              consensusTransform.isFinite,
+              structurallyValid(
+                links: links,
+                fromEpoch: fromEpoch,
+                toEpoch: toEpoch,
+                beforeNodeID: beforeNodeID,
+                afterNodeID: afterNodeID,
+                component: component,
+                fromComponent: fromComponent,
+                toComponent: toComponent),
+              let selection = selection(
+                links: links,
+                expectedTransform: expectedTransform) else {
+            return false
+        }
+        let expectedInlierCount = selection.inlierIndices.count
+        let expectedRatio = Double(expectedInlierCount) / Double(links.count)
+        guard expectedInlierCount >= 2,
+              expectedRatio >= ShelfLocalizationPolicy
+                .calibrationPendingLoopInlierRatio,
+              evidence.independentNodePairs == expectedInlierCount,
+              evidence.consensusInlierRatio.isFinite,
+              abs(evidence.consensusInlierRatio - expectedRatio) <= 1.0e-12,
+              transformEqual(
+                consensusTransform,
+                links[selection.centerIndex].bridgeTransform) else {
+            return false
+        }
+        return links.enumerated().allSatisfy { index, link in
+            link.consensusInlier == selection.inlierIndices.contains(index)
+        }
+    }
+
+    static func agrees(
+        _ first: ShelfEvidenceTransform,
+        _ second: ShelfEvidenceTransform
+    ) -> Bool {
+        hypot(first.dxM - second.dxM, first.dyM - second.dyM)
+                <= ShelfLocalizationPolicy.calibrationPendingLoopTranslationM
+            && angularDistance(first.dyawRad, second.dyawRad)
+                <= ShelfLocalizationPolicy.calibrationPendingLoopYawRad
+    }
+
+    private static func structurallyValid(
+        links: [PoseEpochBridgeLinkEvidence],
+        fromEpoch: Int,
+        toEpoch: Int,
+        beforeNodeID: Int64,
+        afterNodeID: Int64,
+        component: Int64,
+        fromComponent: Int64,
+        toComponent: Int64
+    ) -> Bool {
+        guard fromEpoch >= 0, toEpoch == fromEpoch + 1,
+              beforeNodeID > 0, afterNodeID > 0,
+              component >= 0,
+              fromComponent == component,
+              toComponent == component,
+              (2...ShelfLocalizationPolicy.maximumBridgeLinks)
+                .contains(links.count) else {
+            return false
+        }
+        var pairs = Set<String>()
+        var endpoints = Set<Int64>()
+        var previousNodePair: (Int64, Int64)?
+        for link in links {
+            guard link.fromNodeID > 0,
+                  link.toNodeID > 0,
+                  link.fromNodeID != link.toNodeID,
+                  link.fromNodeID <= beforeNodeID,
+                  link.toNodeID >= afterNodeID,
+                  link.fromEpoch == fromEpoch,
+                  link.toEpoch == toEpoch,
+                  link.fromComponent == component,
+                  link.toComponent == component,
+                  ["global_visual", "local_space"]
+                    .contains(link.nativeLinkType),
+                  link.measurement.isFinite,
+                  link.bridgeTransform.isFinite else {
+                return false
+            }
+            let nodePair = (link.fromNodeID, link.toNodeID)
+            if let previousNodePair,
+               nodePair < previousNodePair {
+                return false
+            }
+            previousNodePair = nodePair
+            let low = min(link.fromNodeID, link.toNodeID)
+            let high = max(link.fromNodeID, link.toNodeID)
+            let pair = "\(low):\(high)"
+            guard pairs.insert(pair).inserted,
+                  endpoints.insert(link.fromNodeID).inserted,
+                  endpoints.insert(link.toNodeID).inserted else {
+                return false
+            }
+        }
+        return true
+    }
+
+    private static func selection(
+        links: [PoseEpochBridgeLinkEvidence],
+        expectedTransform: ShelfEvidenceTransform
+    ) -> Selection? {
+        guard expectedTransform.isFinite else { return nil }
+        var best: (index: Int, count: Int, residual: Double)?
+        for (centerIndex, center) in links.enumerated() {
+            guard agrees(center.bridgeTransform, expectedTransform) else {
+                continue
+            }
+            var inliers = Set<Int>()
+            var residual = 0.0
+            for (index, candidate) in links.enumerated() {
+                let agreesWithExpected = agrees(
+                    candidate.bridgeTransform, expectedTransform)
+                let agreesWithCenter = agrees(
+                    candidate.bridgeTransform, center.bridgeTransform)
+                if agreesWithExpected && agreesWithCenter {
+                    inliers.insert(index)
+                }
+                residual += normalizedResidual(
+                    candidate.bridgeTransform,
+                    center.bridgeTransform)
+            }
+            if let existing = best {
+                if inliers.count < existing.count
+                    || (inliers.count == existing.count
+                        && residual >= existing.residual - 1.0e-12) {
+                    continue
+                }
+            }
+            best = (centerIndex, inliers.count, residual)
+        }
+        guard let best else { return nil }
+        let center = links[best.index].bridgeTransform
+        let inliers = Set(links.indices.filter {
+            agrees(links[$0].bridgeTransform, expectedTransform)
+                && agrees(links[$0].bridgeTransform, center)
+        })
+        return Selection(centerIndex: best.index, inlierIndices: inliers)
+    }
+
+    private static func normalizedResidual(
+        _ first: ShelfEvidenceTransform,
+        _ second: ShelfEvidenceTransform
+    ) -> Double {
+        hypot(first.dxM - second.dxM, first.dyM - second.dyM)
+                / ShelfLocalizationPolicy.calibrationPendingLoopTranslationM
+            + angularDistance(first.dyawRad, second.dyawRad)
+                / ShelfLocalizationPolicy.calibrationPendingLoopYawRad
+    }
+
+    private static func angularDistance(_ first: Double, _ second: Double) -> Double {
+        abs(atan2(sin(first - second), cos(first - second)))
+    }
+
+    private static func transformEqual(
+        _ first: ShelfEvidenceTransform,
+        _ second: ShelfEvidenceTransform
+    ) -> Bool {
+        abs(first.dxM - second.dxM) <= 1.0e-12
+            && abs(first.dyM - second.dyM) <= 1.0e-12
+            && angularDistance(first.dyawRad, second.dyawRad) <= 1.0e-12
     }
 }
 
@@ -203,7 +520,8 @@ struct CorridorHypothesesRecord: Codable, Equatable {
     }
 
     var isValid: Bool {
-        format == Self.formatName && version == ShelfLocalizationPolicy.contractVersion
+        format == Self.formatName
+            && ShelfLocalizationPolicy.supportedContractVersions.contains(version)
             && !trackingSessionID.isEmpty && sequence >= 1 && nodeID > 0
             && nodeTimestamp.isFinite && nodeMapID >= 0
             && epoch >= 0 && component == Int64(nodeMapID)
@@ -347,7 +665,8 @@ struct ShelfObservationWindowRecord: Codable, Equatable {
     }
 
     var isValid: Bool {
-        format == Self.formatName && version == ShelfLocalizationPolicy.contractVersion
+        format == Self.formatName
+            && ShelfLocalizationPolicy.supportedContractVersions.contains(version)
             && !trackingSessionID.isEmpty && sequence >= 1 && !windowID.isEmpty
             && nodeRange.count == 2 && nodeRange[0] > 0
             && nodeRange[1] >= nodeRange[0] && timeRange.count == 2
@@ -480,7 +799,7 @@ struct ShelfLoopEventRecord: Codable, Equatable {
             && consistency.residualMedianM.isFinite
             && consistency.residualMaximumM.isFinite
         return format == Self.formatName
-            && version == ShelfLocalizationPolicy.contractVersion
+            && ShelfLocalizationPolicy.supportedContractVersions.contains(version)
             && !trackingSessionID.isEmpty && sequence >= 1
             && !shelfSegmentID.isEmpty && windowIDs.count == 2
             && windowIDs.allSatisfy { !$0.isEmpty } && Set(windowIDs).count == 2
@@ -859,12 +1178,15 @@ enum ShelfLocalizationEvidenceParser {
         }
     }
 
-    private static let poseFields: Set<String> = [
+    private static let poseFieldsV2: Set<String> = [
         "format", "version", "tracking_session_id", "sequence",
         "from_epoch", "to_epoch", "before_frame_timestamp",
         "after_frame_timestamp", "before_node_id", "after_node_id",
         "transform", "bridge_evidence", "reason", "write_watermark",
     ]
+    private static let poseFieldsV3 = poseFieldsV2.union([
+        "from_component", "to_component",
+    ])
     private static let corridorFields: Set<String> = [
         "format", "version", "tracking_session_id", "sequence", "node_id",
         "node_timestamp", "node_map_id", "epoch", "component", "hypotheses",
@@ -910,8 +1232,8 @@ enum ShelfLocalizationEvidenceParser {
                     .File_pose_epoch_transitions_jsonl.max_record_bytes,
                 maximumLineCount: GeneratedMobileEvidenceContracts
                     .File_pose_epoch_transitions_jsonl.max_records),
-            knownFields: poseFields,
-            requiredFields: poseFields,
+            knownFields: poseFieldsV3,
+            requiredFields: poseFieldsV2,
             valid: { $0.isValid },
             sequence: { $0.sequence },
             session: { $0.trackingSessionID })
@@ -974,8 +1296,22 @@ enum ShelfLocalizationEvidenceParser {
                 ShelfObservationWindowRecord.fileName, 0,
                 "duplicate_window_identity")
         }
-        let bridgedFromEpochs = Set(poses.compactMap { record in
-            record.bridgeEvidence.isEmpty ? nil : record.fromEpoch
+        let transitionFromEpochs = poses.map(\.fromEpoch)
+        guard Set(transitionFromEpochs).count == transitionFromEpochs.count else {
+            throw ParseError.record(
+                PoseEpochTransitionRecord.fileName, 0,
+                "duplicate_pose_epoch_transition")
+        }
+        let bridgedEpochComponents = Set(poses.flatMap { record in
+            guard record.version >= 3 else {
+                // Legacy aggregate counters did not bind native node pairs,
+                // component identity or a reproducible transform.
+                return [String]()
+            }
+            return record.bridgeEvidence.compactMap { evidence in
+                guard let component = evidence.component else { return nil }
+                return "\(record.fromEpoch):\(component)"
+            }
         })
         for loop in loops {
             guard let first = windowsByID[loop.windowIDs[0]],
@@ -985,7 +1321,6 @@ enum ShelfLocalizationEvidenceParser {
                   second.shelfCandidates.first?.shelfSegmentID
                     == loop.shelfSegmentID,
                   loop.sides == [first.side, second.side],
-                  first.component == second.component,
                   loop.component == first.component,
                   loop.epoch == first.epoch || loop.epoch == second.epoch,
                   first.nodeRange[0] <= loop.loopFromNode,
@@ -996,11 +1331,19 @@ enum ShelfLocalizationEvidenceParser {
                     ShelfLoopEventRecord.fileName, loop.sequence,
                     "loop_window_identity_mismatch")
             }
+            if first.component != second.component {
+                guard !loop.accepted else {
+                    throw ParseError.record(
+                        ShelfLoopEventRecord.fileName, loop.sequence,
+                        "accepted_loop_crosses_graph_component")
+                }
+                continue
+            }
             let lowerEpoch = min(first.epoch, second.epoch)
             let upperEpoch = max(first.epoch, second.epoch)
             let hasBridge = lowerEpoch == upperEpoch
                 || (lowerEpoch..<upperEpoch).allSatisfy {
-                    bridgedFromEpochs.contains($0)
+                    bridgedEpochComponents.contains("\($0):\(loop.component)")
                 }
             let dominantDynamicEvidence =
                 first.dynamicRejectionCount * 2
@@ -1073,6 +1416,7 @@ enum ShelfLocalizationEvidenceParser {
             let observedFields = Set(object.keys)
             guard observedFields.isSubset(of: knownFields),
                   requiredFields.isSubset(of: observedFields),
+                  rootFieldsAreExact(fileName: fileName, object: object),
                   nestedFieldsAreExact(fileName: fileName, object: object) else {
                 throw ParseError.record(fileName, line.number, "field_set_mismatch")
             }
@@ -1104,11 +1448,49 @@ enum ShelfLocalizationEvidenceParser {
         }
         switch fileName {
         case PoseEpochTransitionRecord.fileName:
-            return exactObject(
-                    object["transform"], ["dx_m", "dy_m", "dyaw_rad"])
-                && exactObjects(
-                    object["bridge_evidence"],
-                    ["type", "independent_node_pairs", "consensus_inlier_ratio"])
+            guard exactObject(
+                    object["transform"], ["dx_m", "dy_m", "dyaw_rad"]),
+                  let version = object["version"] as? Int else {
+                return false
+            }
+            if version == 2 {
+                return exactObjects(
+                    object["bridge_evidence"], [
+                        "type", "independent_node_pairs",
+                        "consensus_inlier_ratio",
+                    ])
+            }
+            guard version == ShelfLocalizationPolicy.contractVersion,
+                  let evidence = object["bridge_evidence"] as? [[String: Any]] else {
+                return false
+            }
+            return evidence.allSatisfy { bridge in
+                guard Set(bridge.keys) == [
+                        "type", "independent_node_pairs",
+                        "consensus_inlier_ratio", "component",
+                        "consensus_transform", "links",
+                    ],
+                    exactObject(
+                        bridge["consensus_transform"],
+                        ["dx_m", "dy_m", "dyaw_rad"]),
+                    let links = bridge["links"] as? [[String: Any]] else {
+                    return false
+                }
+                return links.allSatisfy { link in
+                    Set(link.keys) == [
+                        "from_node_id", "to_node_id", "from_epoch",
+                        "to_epoch", "from_component", "to_component",
+                        "native_link_type", "measurement",
+                        "bridge_transform", "consensus_inlier",
+                    ]
+                        && exactObject(
+                            link["measurement"],
+                            ["dx_m", "dy_m", "dyaw_rad"])
+                        && exactObject(
+                            link["bridge_transform"],
+                            ["dx_m", "dy_m", "dyaw_rad"])
+                }
+            }
         case CorridorHypothesesRecord.fileName:
             return exactObjects(
                     object["hypotheses"], [
@@ -1138,6 +1520,31 @@ enum ShelfLocalizationEvidenceParser {
                         "inlier_ratio", "residual_median_m",
                         "residual_maximum_m",
                     ])
+        default:
+            return false
+        }
+    }
+
+    private static func rootFieldsAreExact(
+        fileName: String,
+        object: [String: Any]
+    ) -> Bool {
+        let observed = Set(object.keys)
+        guard let version = object["version"] as? Int,
+              ShelfLocalizationPolicy.supportedContractVersions
+                .contains(version) else {
+            return false
+        }
+        if fileName == PoseEpochTransitionRecord.fileName {
+            return observed == (version == 2 ? poseFieldsV2 : poseFieldsV3)
+        }
+        switch fileName {
+        case CorridorHypothesesRecord.fileName:
+            return observed == corridorFields
+        case ShelfObservationWindowRecord.fileName:
+            return observed == windowFields
+        case ShelfLoopEventRecord.fileName:
+            return observed == loopFields
         default:
             return false
         }

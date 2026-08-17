@@ -29,6 +29,14 @@ SNAPSHOT_SOURCE = (
     REPOSITORY
     / "app/ios/RTABMapApp/MobilePostProcessing/SessionSnapshotTransaction.swift"
 )
+SHELF_EVIDENCE_SOURCE = (
+    REPOSITORY
+    / "app/ios/RTABMapApp/MobilePostProcessing/ShelfLocalizationEvidence.swift"
+)
+NATIVE_APP_SOURCE = REPOSITORY / "app/android/jni/RTABMapApp.cpp"
+NATIVE_APP_HEADER = REPOSITORY / "app/android/jni/RTABMapApp.h"
+NATIVE_WRAPPER_SOURCE = REPOSITORY / "app/ios/RTABMapApp/NativeWrapper.cpp"
+RTABMAP_SWIFT_SOURCE = REPOSITORY / "app/ios/RTABMapApp/RTABMap.swift"
 
 
 def source(path: Path) -> str:
@@ -120,6 +128,53 @@ class IOSLocalizationSidecarHealthContractTests(unittest.TestCase):
             "static let declaredSidecarPairs", 1
         )[1].split("static let observabilitySidecarPairs", 1)[0]
         self.assertNotIn("performanceSamples", required_pairs)
+
+    def test_pose_epoch_bridge_uses_native_multilink_witnesses_and_append_only_flush(
+        self,
+    ) -> None:
+        native = source(NATIVE_APP_SOURCE) + source(NATIVE_APP_HEADER)
+        wrapper = source(NATIVE_WRAPPER_SOURCE)
+        rtabmap_swift = source(RTABMAP_SWIFT_SOURCE)
+        view = source(VIEW_SOURCE)
+        evidence = source(SHELF_EVIDENCE_SOURCE)
+        session = source(SESSION_SOURCE)
+        for token in (
+            "LoopClosureLinkSnapshot",
+            "stats.constraints()",
+            "loopClosureSnapshotMutex_",
+            "getLoopClosureLinkSnapshot",
+            "expectedFromNodeId",
+            "expectedToNodeId",
+        ):
+            self.assertIn(token, native)
+        self.assertIn("getLoopClosureLinkSnapshotNative", wrapper)
+        for token in (
+            "RTABMapLoopClosureLinkSnapshot",
+            "latestLoopClosureLink",
+            'nativeLinkType = "global_visual"',
+            'nativeLinkType = "local_space"',
+        ):
+            self.assertIn(token, rtabmap_swift)
+        for token in (
+            "recordPoseEpochBridgeNodeBinding",
+            "recordNativePoseEpochBridgeLink",
+            "hasFormalPoseEpochBridge",
+            "flushPoseEpochTransitionsForFinalization",
+            "PoseEpochBridgeConsensus.makeEvidence",
+            "simd_inverse(earlier.epochCorrection)",
+            "allowDuringFinalization: true",
+        ):
+            self.assertIn(token, view)
+        for token in (
+            "PoseEpochBridgeLinkEvidence",
+            "maximumBridgeLinks = 16",
+            "Legacy aggregate counters did not bind native node pairs",
+            "endpoints.insert(link.fromNodeID).inserted",
+            "CALIBRATION_PENDING remains an unconditional blocker",
+        ):
+            self.assertIn(token, evidence)
+        self.assertIn("allowDuringFinalization: Bool = false", session)
+        self.assertNotIn("bridgeEvidence: []", view)
 
     def test_sam_recovery_and_dynamic_filtering_contracts_are_wired(self) -> None:
         view = source(VIEW_SOURCE)

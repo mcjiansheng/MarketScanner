@@ -23,6 +23,16 @@ struct RTABMapNodeBindingSnapshot {
     let openGLWorldFromNode: simd_float4x4
 }
 
+struct RTABMapLoopClosureLinkSnapshot {
+    let fromNodeID: Int
+    let toNodeID: Int
+    let fromNodeMapID: Int32
+    let toNodeMapID: Int32
+    let nativeLinkType: String
+    let generation: UInt64
+    let measurement: simd_float4x4
+}
+
 class RTABMap {
     var native_rtabmap: UnsafeMutableRawPointer
     
@@ -197,6 +207,71 @@ class RTABMap {
             return nil
         }
         return (frameTimestamp + offset, offset)
+    }
+
+    /// Returns only the native graph edge frozen for the exact loop callback
+    /// IDs. A later event, a missing edge or an unsupported link type cannot
+    /// be substituted by mapCorrection or a visual inlier summary.
+    func latestLoopClosureLink(
+        fromNodeID expectedFromNodeID: Int,
+        toNodeID expectedToNodeID: Int
+    ) -> RTABMapLoopClosureLinkSnapshot? {
+        guard expectedFromNodeID > 0, expectedToNodeID > 0,
+              expectedFromNodeID <= Int(Int32.max),
+              expectedToNodeID <= Int(Int32.max) else {
+            return nil
+        }
+        var fromNodeID: Int32 = 0
+        var toNodeID: Int32 = 0
+        var fromNodeMapID: Int32 = 0
+        var toNodeMapID: Int32 = 0
+        var linkType: Int32 = 0
+        var generation: UInt64 = 0
+        var x: Float = 0
+        var y: Float = 0
+        var z: Float = 0
+        var qx: Float = 0
+        var qy: Float = 0
+        var qz: Float = 0
+        var qw: Float = 0
+        guard getLoopClosureLinkSnapshotNative(
+                native_rtabmap,
+                Int32(expectedFromNodeID),
+                Int32(expectedToNodeID),
+                &fromNodeID, &toNodeID,
+                &fromNodeMapID, &toNodeMapID,
+                &linkType, &generation,
+                &x, &y, &z, &qx, &qy, &qz, &qw),
+              Int(fromNodeID) == expectedFromNodeID,
+              Int(toNodeID) == expectedToNodeID,
+              fromNodeMapID >= 0, toNodeMapID >= 0,
+              generation > 0,
+              [x, y, z, qx, qy, qz, qw].allSatisfy(\.isFinite) else {
+            return nil
+        }
+        let nativeLinkType: String
+        switch linkType {
+        case 1:
+            nativeLinkType = "global_visual"
+        case 2:
+            nativeLinkType = "local_space"
+        default:
+            return nil
+        }
+        let quaternion = simd_quatf(ix: qx, iy: qy, iz: qz, r: qw)
+        guard abs(simd_length(quaternion.vector) - 1) <= 1.0e-3 else {
+            return nil
+        }
+        var measurement = simd_float4x4(quaternion)
+        measurement.columns.3 = SIMD4<Float>(x, y, z, 1)
+        return RTABMapLoopClosureLinkSnapshot(
+            fromNodeID: Int(fromNodeID),
+            toNodeID: Int(toNodeID),
+            fromNodeMapID: fromNodeMapID,
+            toNodeMapID: toNodeMapID,
+            nativeLinkType: nativeLinkType,
+            generation: generation,
+            measurement: measurement)
     }
     
     func initGlContent() {

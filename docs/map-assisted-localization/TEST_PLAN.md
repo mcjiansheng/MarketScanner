@@ -4,9 +4,9 @@
 
 ## 2026-08-15 通道/货架约束增量
 
-自动化必须覆盖：manifest v5 四流空/非空水位、未知字段/重复键/半行/超限、epoch bridge 正反例、component/side/window 交叉引用、两侧法向与 0.5 m/10°/70% 门、非主导与主导动态样本、point+swept-segment 0.4 m 穿架、top1 低 margin 的非阻塞 `LOW_CONFIDENCE`、人工重定位恢复、corridor route 成功转正与任一自洽项失败降级、accepted loop 生成 shelf-face 因子并回溯整圈、以及价签 raw/optimized/shelf-projected 三坐标和采集侧长边投影。发布测试必须断言 shelf 法向残差 ≤0.5 m、纵向在段内、结构内点/穿架段为 0。
+自动化必须覆盖：manifest v5 四流空/非空水位、未知字段/重复键/半行/超限、epoch bridge 正反例、component/side/window 交叉引用、两侧法向与 0.5 m/10°/70% 门、非主导与主导动态样本、point+swept-segment 0.4 m 穿架、top1 低 margin 的非阻塞 `LOW_CONFIDENCE`、人工重定位恢复、corridor route 成功转正与任一自洽项失败降级、accepted loop 生成 shelf-face 因子并回溯整圈、以及价签 raw/optimized/shelf-projected 三坐标和采集侧长边投影。epoch bridge 组必须同时证明：同一 native Statistics 事件的 exact Link 被 node/epoch/component 绑定；两组 node-disjoint 且 transform 一致的 global/local-space edge 可形成 v3 bridge；单 edge、重复或反向 pair、共享任一端点、错误 component、冲突 transform、旧 v2 aggregate counter 和多 epoch 链缺任一相邻 bridge 均拒绝；无 bridge transition 仍以空数组追加并保持 final newline/单调水位。发布测试必须断言 shelf 法向残差 ≤0.5 m、纵向在段内、结构内点/穿架段为 0，并继续断言 `CALIBRATION_PENDING` 使 `publish_permitted=false`。
 
-当前主机执行结果：PriorMap **340/340（421.006 s）**、Map Studio **143/143（12.533 s）**、Qualification **30/30**、生成合同 16 文件、native factor-graph/reprocess 增量构建、Python/JavaScript 语法、patch check 和 unsigned generic iphoneos Debug 全量编译/链接 PASS。规模门为 finalization 300,000 条 peak **13,336,576 bytes**，trace 1,728,000 条保留 172,801 / peak **59,162,624 bytes**，tag evidence 400,000 条接受 200,000 / peak **793,395,200 bytes**。1280×720 真实浏览器检查通过；1024/390 的内置视口覆盖未生效，只能记为 CSS/源码合同覆盖，不能登记为真实视觉 PASS。
+当前主机执行结果：PriorMap **369/369（385.868 s）**、Map Studio **143/143（9.539 s）**、Qualification **30/30（13.062 s）**、生成合同 16 文件、native factor-graph/reprocess 增量构建、Python/JavaScript 语法、patch check 和 unsigned generic iphoneos Debug 全量编译/链接 PASS。规模门为 finalization 300,000 条 peak **13,303,808 bytes**，trace 1,728,000 条保留 172,801 / peak **59,179,008 bytes**，tag evidence 400,000 条接受 200,000 / peak **792,821,760 bytes**；tag evidence 仍低于 768 MiB 门，但余量约 12.5 MB。1280×720 真实浏览器检查通过；1024/390 的内置视口覆盖未生效，只能记为 CSS/源码合同覆盖，不能登记为真实视觉 PASS。
 
 签名 iPhone 17 Pro Max 的候选打分/穿架审计 cadence、30 分钟与 2 小时热/内存/电量矩阵、C-1/C-2/C-3 Replay Pareto、Sam WM/LTM A/B、动态顾客/购物车和现场控制点仍是外部必测项；这些未完成前不得把 host/unsigned build 写成 Production GO。
 

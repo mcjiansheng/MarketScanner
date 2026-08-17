@@ -20051,6 +20051,8 @@ do {
         normal: ShelfFaceNormal,
         nodeStart: Int64,
         nodeEnd: Int64? = nil,
+        epoch: Int = 1,
+        component: Int64 = 0,
         observationNodeCount: Int = 5,
         dynamicRejectionCount: Int = 1
     ) -> ShelfObservationWindowRecord {
@@ -20061,7 +20063,7 @@ do {
             windowID: id,
             nodeRange: [nodeStart, nodeEnd ?? nodeStart + 4],
             timeRange: [Double(nodeStart), Double(nodeStart) + 2],
-            epoch: 1, component: 0, side: side,
+            epoch: epoch, component: component, side: side,
             faceNormalMap: normal,
             shelfCandidates: [
                 ShelfCandidateEvidence(shelfSegmentID: "shelf-12", score: 0.9),
@@ -20134,6 +20136,258 @@ do {
             && summary.shelfObservationWindowCount == 2
             && summary.shelfLoopEventCount == 1,
         "manifest-v5 Swift parser must accept a valid two-sided shelf loop")
+
+    func bridgeLink(
+        fromNodeID: Int64,
+        toNodeID: Int64,
+        dxM: Double,
+        dyM: Double = 0,
+        yawRad: Double = 0.01
+    ) -> PoseEpochBridgeLinkEvidence {
+        PoseEpochBridgeLinkEvidence(
+            fromNodeID: fromNodeID, toNodeID: toNodeID,
+            fromEpoch: 1, toEpoch: 2,
+            fromComponent: 0, toComponent: 0,
+            nativeLinkType: "global_visual",
+            measurement: ShelfEvidenceTransform(
+                dxM: 3, dyM: 0.1, dyawRad: 0.02),
+            bridgeTransform: ShelfEvidenceTransform(
+                dxM: dxM, dyM: dyM, dyawRad: yawRad),
+            consensusInlier: false)
+    }
+    let expectedEpochTransform = ShelfEvidenceTransform(
+        dxM: 0.1, dyM: 0, dyawRad: 0.01)
+    let bridgeCandidates = [
+        bridgeLink(fromNodeID: 22, toNodeID: 31, dxM: 0.10),
+        bridgeLink(
+            fromNodeID: 24, toNodeID: 33,
+            dxM: 0.12, dyM: 0.01, yawRad: 0.02),
+    ]
+    guard let bridgeEvidence = PoseEpochBridgeConsensus.makeEvidence(
+            candidates: bridgeCandidates,
+            fromEpoch: 1, toEpoch: 2,
+            beforeNodeID: 24, afterNodeID: 30,
+            fromComponent: 0, toComponent: 0,
+            expectedTransform: expectedEpochTransform) else {
+        throw NSError(
+            domain: "ShelfBridge", code: 1,
+            userInfo: [NSLocalizedDescriptionKey:
+                "two independent native links did not form a bridge"])
+    }
+    let epochTransition = PoseEpochTransitionRecord(
+        format: PoseEpochTransitionRecord.formatName,
+        version: ShelfLocalizationPolicy.contractVersion,
+        trackingSessionID: sessionID, sequence: 1,
+        fromEpoch: 1, toEpoch: 2,
+        beforeFrameTimestamp: 24, afterFrameTimestamp: 30,
+        beforeNodeID: 24, afterNodeID: 30,
+        fromComponent: 0, toComponent: 0,
+        transform: expectedEpochTransform,
+        bridgeEvidence: [bridgeEvidence],
+        reason: "arkit_world_rebuild", writeWatermark: 1)
+    require(
+        epochTransition.isValid,
+        "v3 pose transition must validate its exact native link witnesses")
+    let duplicateBridgeTransition = PoseEpochTransitionRecord(
+        format: epochTransition.format, version: epochTransition.version,
+        trackingSessionID: epochTransition.trackingSessionID,
+        sequence: epochTransition.sequence,
+        fromEpoch: epochTransition.fromEpoch, toEpoch: epochTransition.toEpoch,
+        beforeFrameTimestamp: epochTransition.beforeFrameTimestamp,
+        afterFrameTimestamp: epochTransition.afterFrameTimestamp,
+        beforeNodeID: epochTransition.beforeNodeID,
+        afterNodeID: epochTransition.afterNodeID,
+        fromComponent: epochTransition.fromComponent,
+        toComponent: epochTransition.toComponent,
+        transform: epochTransition.transform,
+        bridgeEvidence: [bridgeEvidence, bridgeEvidence],
+        reason: epochTransition.reason,
+        writeWatermark: epochTransition.writeWatermark)
+    require(
+        !duplicateBridgeTransition.isValid,
+        "duplicate aggregate bridges for one component must be rejected")
+    if let canonicalLinks = bridgeEvidence.links {
+        let noncanonicalBridge = PoseEpochBridgeEvidence(
+            type: bridgeEvidence.type,
+            independentNodePairs: bridgeEvidence.independentNodePairs,
+            consensusInlierRatio: bridgeEvidence.consensusInlierRatio,
+            component: bridgeEvidence.component,
+            consensusTransform: bridgeEvidence.consensusTransform,
+            links: Array(canonicalLinks.reversed()))
+        let noncanonicalTransition = PoseEpochTransitionRecord(
+            format: epochTransition.format, version: epochTransition.version,
+            trackingSessionID: epochTransition.trackingSessionID,
+            sequence: epochTransition.sequence,
+            fromEpoch: epochTransition.fromEpoch,
+            toEpoch: epochTransition.toEpoch,
+            beforeFrameTimestamp: epochTransition.beforeFrameTimestamp,
+            afterFrameTimestamp: epochTransition.afterFrameTimestamp,
+            beforeNodeID: epochTransition.beforeNodeID,
+            afterNodeID: epochTransition.afterNodeID,
+            fromComponent: epochTransition.fromComponent,
+            toComponent: epochTransition.toComponent,
+            transform: epochTransition.transform,
+            bridgeEvidence: [noncanonicalBridge],
+            reason: epochTransition.reason,
+            writeWatermark: epochTransition.writeWatermark)
+        require(
+            !noncanonicalTransition.isValid,
+            "bridge links must remain canonically ordered on disk")
+    }
+    let nearTieCandidates = [
+        bridgeLink(fromNodeID: 21, toNodeID: 31,
+                   dxM: 0.10000000000000),
+        bridgeLink(fromNodeID: 22, toNodeID: 32,
+                   dxM: 0.10000000000010),
+        bridgeLink(fromNodeID: 23, toNodeID: 33,
+                   dxM: 0.10000000000021),
+    ]
+    let nearTieEvidence = PoseEpochBridgeConsensus.makeEvidence(
+        candidates: nearTieCandidates,
+        fromEpoch: 1, toEpoch: 2,
+        beforeNodeID: 24, afterNodeID: 30,
+        fromComponent: 0, toComponent: 0,
+        expectedTransform: expectedEpochTransform)
+    require(
+        nearTieEvidence?.consensusTransform
+            == nearTieCandidates[0].bridgeTransform,
+        "sub-epsilon medoid ties must preserve canonical first-link order")
+    let crossEpochSecondWindow = shelfWindow(
+        sequence: 2, id: "sow-2", side: "left",
+        normal: ShelfFaceNormal(x: 0, y: -1), nodeStart: 30,
+        epoch: 2)
+    let crossEpochDirectory = try p7r6FreshDirectory(
+        "shelf-evidence-cross-epoch-v3")
+    try writeJSONL([epochTransition],
+                   name: PoseEpochTransitionRecord.fileName,
+                   directory: crossEpochDirectory)
+    try writeJSONL([corridor], name: CorridorHypothesesRecord.fileName,
+                   directory: crossEpochDirectory)
+    try writeJSONL([firstWindow, crossEpochSecondWindow],
+                   name: ShelfObservationWindowRecord.fileName,
+                   directory: crossEpochDirectory)
+    try writeJSONL([loop], name: ShelfLoopEventRecord.fileName,
+                   directory: crossEpochDirectory)
+    let crossEpochSummary = try ShelfLocalizationEvidenceParser.validateBundle(
+        directory: crossEpochDirectory, trackingSessionID: sessionID,
+        poseEpochTransitionCount: 1, corridorHypothesisCount: 1,
+        shelfObservationWindowCount: 2, shelfLoopEventCount: 1)
+    require(
+        crossEpochSummary.poseEpochTransitionCount == 1,
+        "two-link v3 bridge must authorize the otherwise valid cross-epoch loop")
+    require(
+        PoseEpochBridgeConsensus.makeEvidence(
+            candidates: [bridgeCandidates[0]],
+            fromEpoch: 1, toEpoch: 2,
+            beforeNodeID: 24, afterNodeID: 30,
+            fromComponent: 0, toComponent: 0,
+            expectedTransform: expectedEpochTransform) == nil,
+        "one native link must never form an epoch bridge")
+    let incompleteChainDirectory = try p7r6FreshDirectory(
+        "shelf-evidence-incomplete-epoch-chain-v3")
+    let epochThreeWindow = shelfWindow(
+        sequence: 2, id: "sow-2", side: "left",
+        normal: ShelfFaceNormal(x: 0, y: -1), nodeStart: 30,
+        epoch: 3)
+    try writeJSONL([epochTransition],
+                   name: PoseEpochTransitionRecord.fileName,
+                   directory: incompleteChainDirectory)
+    try writeJSONL([corridor], name: CorridorHypothesesRecord.fileName,
+                   directory: incompleteChainDirectory)
+    try writeJSONL([firstWindow, epochThreeWindow],
+                   name: ShelfObservationWindowRecord.fileName,
+                   directory: incompleteChainDirectory)
+    try writeJSONL([loop], name: ShelfLoopEventRecord.fileName,
+                   directory: incompleteChainDirectory)
+    var incompleteChainRejected = false
+    do {
+        _ = try ShelfLocalizationEvidenceParser.validateBundle(
+            directory: incompleteChainDirectory,
+            trackingSessionID: sessionID,
+            poseEpochTransitionCount: 1, corridorHypothesisCount: 1,
+            shelfObservationWindowCount: 2, shelfLoopEventCount: 1)
+    }
+    catch {
+        incompleteChainRejected = true
+    }
+    require(
+        incompleteChainRejected,
+        "a 1-to-3 loop must fail when the 2-to-3 bridge is absent")
+    let duplicateTransitionDirectory = try p7r6FreshDirectory(
+        "shelf-evidence-duplicate-epoch-transition-v3")
+    let duplicateEpochTransition = PoseEpochTransitionRecord(
+        format: epochTransition.format, version: epochTransition.version,
+        trackingSessionID: epochTransition.trackingSessionID,
+        sequence: 2,
+        fromEpoch: epochTransition.fromEpoch, toEpoch: epochTransition.toEpoch,
+        beforeFrameTimestamp: epochTransition.beforeFrameTimestamp,
+        afterFrameTimestamp: epochTransition.afterFrameTimestamp,
+        beforeNodeID: epochTransition.beforeNodeID,
+        afterNodeID: epochTransition.afterNodeID,
+        fromComponent: epochTransition.fromComponent,
+        toComponent: epochTransition.toComponent,
+        transform: epochTransition.transform,
+        bridgeEvidence: epochTransition.bridgeEvidence,
+        reason: epochTransition.reason, writeWatermark: 2)
+    try writeJSONL([epochTransition, duplicateEpochTransition],
+                   name: PoseEpochTransitionRecord.fileName,
+                   directory: duplicateTransitionDirectory)
+    try writeJSONL([corridor], name: CorridorHypothesesRecord.fileName,
+                   directory: duplicateTransitionDirectory)
+    try writeJSONL([firstWindow, crossEpochSecondWindow],
+                   name: ShelfObservationWindowRecord.fileName,
+                   directory: duplicateTransitionDirectory)
+    try writeJSONL([loop], name: ShelfLoopEventRecord.fileName,
+                   directory: duplicateTransitionDirectory)
+    var duplicateTransitionRejected = false
+    do {
+        _ = try ShelfLocalizationEvidenceParser.validateBundle(
+            directory: duplicateTransitionDirectory,
+            trackingSessionID: sessionID,
+            poseEpochTransitionCount: 2, corridorHypothesisCount: 1,
+            shelfObservationWindowCount: 2, shelfLoopEventCount: 1)
+    }
+    catch {
+        duplicateTransitionRejected = true
+    }
+    require(
+        duplicateTransitionRejected,
+        "duplicate transitions for one from_epoch must be rejected")
+    require(
+        PoseEpochBridgeConsensus.makeEvidence(
+            candidates: [
+                bridgeCandidates[0],
+                bridgeLink(
+                    fromNodeID: 23, toNodeID: 32,
+                    dxM: 2.0, yawRad: 1.0),
+            ],
+            fromEpoch: 1, toEpoch: 2,
+            beforeNodeID: 24, afterNodeID: 30,
+            fromComponent: 0, toComponent: 0,
+            expectedTransform: expectedEpochTransform) == nil,
+        "conflicting native transforms must not form an epoch bridge")
+    require(
+        PoseEpochBridgeConsensus.makeEvidence(
+            candidates: [
+                bridgeCandidates[0],
+                bridgeLink(fromNodeID: 22, toNodeID: 32, dxM: 0.11),
+            ],
+            fromEpoch: 1, toEpoch: 2,
+            beforeNodeID: 24, afterNodeID: 30,
+            fromComponent: 0, toComponent: 0,
+            expectedTransform: expectedEpochTransform) == nil,
+        "shared native endpoints must not count as independent pairs")
+    require(
+        PoseEpochBridgeConsensus.makeEvidence(
+            candidates: [
+                bridgeCandidates[0],
+                bridgeLink(fromNodeID: 31, toNodeID: 22, dxM: 0.11),
+            ],
+            fromEpoch: 1, toEpoch: 2,
+            beforeNodeID: 24, afterNodeID: 30,
+            fromComponent: 0, toComponent: 0,
+            expectedTransform: expectedEpochTransform) == nil,
+        "a reversed node pair must not count as a second bridge witness")
 
     func requireShelfBundleRejection(
         directoryName: String,

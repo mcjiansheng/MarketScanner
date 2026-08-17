@@ -139,6 +139,28 @@ bool RTABMapApp::getNodeTimeOffset(double & offset)
 	return false;
 }
 
+bool RTABMapApp::getLoopClosureLinkSnapshot(
+		int expectedFromNodeId,
+		int expectedToNodeId,
+		LoopClosureLinkSnapshot & snapshot)
+{
+	snapshot = LoopClosureLinkSnapshot();
+	if(expectedFromNodeId <= 0 || expectedToNodeId <= 0 ||
+		expectedFromNodeId == expectedToNodeId)
+	{
+		return false;
+	}
+	boost::mutex::scoped_lock lock(loopClosureSnapshotMutex_);
+	if(loopClosureLinkSnapshot_.generation == 0 ||
+		loopClosureLinkSnapshot_.fromNodeId != expectedFromNodeId ||
+		loopClosureLinkSnapshot_.toNodeId != expectedToNodeId)
+	{
+		return false;
+	}
+	snapshot = loopClosureLinkSnapshot_;
+	return true;
+}
+
 #ifdef RTABMAP_PDAL
 #include <rtabmap/core/PDALWriter.h>
 #elif defined(RTABMAP_LIBLAS)
@@ -356,9 +378,10 @@ RTABMapApp::RTABMapApp() :
         removeMeasureClicked_(false),
 		targetPoint_(new pcl::PointCloud<pcl::PointXYZRGB>),
         quadSample_(new pcl::PointCloud<pcl::PointXYZ>),
-        quadSamplePolygons_(2),
+		quadSamplePolygons_(2),
 		mapToOdom_(rtabmap::Transform::getIdentity()),
-		nodeTimeSnapshotGeneration_(0)
+		nodeTimeSnapshotGeneration_(0),
+		loopClosureLinkSnapshotGeneration_(0)
 
 {
     pcl::PointXYZRGB ptWhite;
@@ -5375,6 +5398,86 @@ bool RTABMapApp::handleEvent(UEvent * event)
 					stats.getLastSignatureData().id();
 			loopClosureId = loopClosureTargetId;
 			featuresExtracted = stats.getLastSignatureData().getWords().size();
+
+			// Freeze the exact accepted native graph link before invoking the
+			// Swift callback. The mobile bridge getter can then request the edge
+			// by the callback IDs without racing a later Statistics event. A
+			// missing, reversed, singular or non-finite edge clears the snapshot
+			// and therefore fails closed on the Swift side.
+			LoopClosureLinkSnapshot frozenLoopLink;
+			bool frozenLoopLinkValid = false;
+			if(loopClosureCurrentId > 0 && loopClosureTargetId > 0 &&
+				(loopClosureType == 1 || loopClosureType == 2))
+			{
+				const rtabmap::Link::Type expectedType = loopClosureType == 1?
+					rtabmap::Link::kGlobalClosure:
+					rtabmap::Link::kLocalSpaceClosure;
+				std::multimap<int, rtabmap::Link>::const_iterator linkIter =
+					rtabmap::graph::findLink(
+						stats.constraints(), loopClosureCurrentId,
+						loopClosureTargetId, true, expectedType);
+				if(linkIter != stats.constraints().end())
+				{
+					rtabmap::Link link = linkIter->second;
+					if(link.from() != loopClosureCurrentId)
+					{
+						link = link.inverse();
+					}
+					const rtabmap::Transform & measurement = link.transform();
+					const int fromMapId = stats.refImageId() > 0?
+						stats.refImageMapId():
+						stats.getLastSignatureData().mapId();
+					const int toMapId = loopClosureType == 1?
+						stats.loopClosureMapId():
+						stats.proximityDetectionMapId();
+					if(link.from() == loopClosureCurrentId &&
+						link.to() == loopClosureTargetId &&
+						fromMapId >= 0 && toMapId >= 0 &&
+						!measurement.isNull() && measurement.isInvertible())
+					{
+						const Eigen::Quaternionf quaternion =
+							measurement.getQuaternionf();
+						if(std::isfinite(measurement.x()) &&
+							std::isfinite(measurement.y()) &&
+							std::isfinite(measurement.z()) &&
+							std::isfinite(quaternion.x()) &&
+							std::isfinite(quaternion.y()) &&
+							std::isfinite(quaternion.z()) &&
+							std::isfinite(quaternion.w()))
+						{
+							frozenLoopLink.fromNodeId = loopClosureCurrentId;
+							frozenLoopLink.toNodeId = loopClosureTargetId;
+							frozenLoopLink.fromNodeMapId = fromMapId;
+							frozenLoopLink.toNodeMapId = toMapId;
+							frozenLoopLink.linkType =
+								static_cast<std::int32_t>(link.type());
+							frozenLoopLink.x = measurement.x();
+							frozenLoopLink.y = measurement.y();
+							frozenLoopLink.z = measurement.z();
+							frozenLoopLink.qx = quaternion.x();
+							frozenLoopLink.qy = quaternion.y();
+							frozenLoopLink.qz = quaternion.z();
+							frozenLoopLink.qw = quaternion.w();
+							frozenLoopLinkValid = true;
+						}
+					}
+				}
+			}
+			{
+				boost::mutex::scoped_lock lock(loopClosureSnapshotMutex_);
+				if(frozenLoopLinkValid &&
+					loopClosureLinkSnapshotGeneration_
+						< std::numeric_limits<std::uint64_t>::max())
+				{
+					frozenLoopLink.generation =
+						++loopClosureLinkSnapshotGeneration_;
+					loopClosureLinkSnapshot_ = frozenLoopLink;
+				}
+				else
+				{
+					loopClosureLinkSnapshot_ = LoopClosureLinkSnapshot();
+				}
+			}
 
 			uInsert(bufferedStatsData_, std::make_pair<std::string, float>(rtabmap::Statistics::kMemoryWorking_memory_size(), uValue(stats.data(), rtabmap::Statistics::kMemoryWorking_memory_size(), 0.0f)));
 			uInsert(bufferedStatsData_, std::make_pair<std::string, float>(rtabmap::Statistics::kMemoryShort_time_memory_size(), uValue(stats.data(), rtabmap::Statistics::kMemoryShort_time_memory_size(), 0.0f)));

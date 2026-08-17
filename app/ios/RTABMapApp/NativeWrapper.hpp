@@ -80,6 +80,18 @@ bool getNodeTimeSnapshotNative(const void *object, int32_t * nodeId,
                                float * nodeQx, float * nodeQy, float * nodeQz,
                                float * nodeQw);
 bool getNodeTimeOffsetNative(const void *object, double * offset);
+bool getLoopClosureLinkSnapshotNative(
+                               const void *object,
+                               int32_t expectedFromNodeId,
+                               int32_t expectedToNodeId,
+                               int32_t * fromNodeId,
+                               int32_t * toNodeId,
+                               int32_t * fromNodeMapId,
+                               int32_t * toNodeMapId,
+                               int32_t * linkType,
+                               uint64_t * generation,
+                               float * x, float * y, float * z,
+                               float * qx, float * qy, float * qz, float * qw);
 void setStreamingMapModeNative(const void *object, bool enabled, int maxRenderedNodes);
 void setCameraNative(const void *object, int type);
 void postOdometryEventNative(const void *object,

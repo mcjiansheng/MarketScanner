@@ -15,7 +15,8 @@ from tools.PriorMap.generated_mobile_evidence_contracts import (
 )
 
 
-CONTRACT_VERSION = 2
+CONTRACT_VERSION = 3
+SUPPORTED_CONTRACT_VERSIONS = frozenset({2, CONTRACT_VERSION})
 CALIBRATION_STATUS = "CALIBRATION_PENDING"
 SHA256_RE = re.compile(r"[0-9a-f]{64}")
 
@@ -49,7 +50,7 @@ class ShelfEvidenceBundle:
     file_sha256: dict[str, str]
 
 
-ROOT_FIELDS: dict[str, frozenset[str]] = {
+ROOT_FIELDS_V2: dict[str, frozenset[str]] = {
     "pose_epoch_transitions.jsonl": frozenset({
         "format", "version", "tracking_session_id", "sequence", "from_epoch",
         "to_epoch", "before_frame_timestamp", "after_frame_timestamp",
@@ -81,6 +82,12 @@ ROOT_FIELDS: dict[str, frozenset[str]] = {
         "reason", "calibration_status", "write_watermark",
     }),
 }
+
+ROOT_FIELDS_V3 = dict(ROOT_FIELDS_V2)
+ROOT_FIELDS_V3["pose_epoch_transitions.jsonl"] = frozenset({
+    *ROOT_FIELDS_V2["pose_epoch_transitions.jsonl"],
+    "from_component", "to_component",
+})
 
 FORMATS = {
     "pose_epoch_transitions.jsonl": "MarketScannerPoseEpochTransition",
@@ -192,9 +199,15 @@ def _file_sha256(path: Path) -> str:
 def _validate_common(
     name: str, line: int, value: dict[str, Any], tracking_session_id: str
 ) -> None:
-    if set(value) != ROOT_FIELDS[name]:
+    version = value.get("version")
+    if version not in SUPPORTED_CONTRACT_VERSIONS:
+        raise ShelfEvidenceError(f"{name}:{line} format/version mismatch")
+    expected_fields = (
+        ROOT_FIELDS_V2[name] if version == 2 else ROOT_FIELDS_V3[name]
+    )
+    if set(value) != expected_fields:
         raise ShelfEvidenceError(f"{name}:{line} root field set mismatch")
-    if value.get("format") != FORMATS[name] or value.get("version") != CONTRACT_VERSION:
+    if value.get("format") != FORMATS[name]:
         raise ShelfEvidenceError(f"{name}:{line} format/version mismatch")
     if value.get("tracking_session_id") != tracking_session_id:
         raise ShelfEvidenceError(f"{name}:{line} tracking identity mismatch")
@@ -204,24 +217,218 @@ def _validate_common(
         raise ShelfEvidenceError(f"{name}:{line} write watermark mismatch")
 
 
+def _evidence_transform(value: Any, field: str) -> dict[str, float]:
+    transform = _exact_object(
+        value, {"dx_m", "dy_m", "dyaw_rad"}, field
+    )
+    return {
+        key: _number(transform[key], f"{field}.{key}") for key in transform
+    }
+
+
+def _angle_distance(first: float, second: float) -> float:
+    return abs(math.atan2(math.sin(first - second), math.cos(first - second)))
+
+
+def _bridge_agrees(
+    first: dict[str, float], second: dict[str, float]
+) -> bool:
+    return (
+        math.hypot(first["dx_m"] - second["dx_m"],
+                   first["dy_m"] - second["dy_m"])
+        <= CALIBRATION_PENDING_LOOP_TRANSLATION_M
+        and _angle_distance(first["dyaw_rad"], second["dyaw_rad"])
+        <= CALIBRATION_PENDING_LOOP_YAW_RAD
+    )
+
+
+def _bridge_selection(
+    links: list[dict[str, Any]], expected: dict[str, float]
+) -> tuple[int, set[int]] | None:
+    best: tuple[int, int, float] | None = None
+    for center_index, center in enumerate(links):
+        center_transform = center["_bridge_transform"]
+        if not _bridge_agrees(center_transform, expected):
+            continue
+        inliers: set[int] = set()
+        residual = 0.0
+        for index, candidate in enumerate(links):
+            candidate_transform = candidate["_bridge_transform"]
+            if (
+                _bridge_agrees(candidate_transform, expected)
+                and _bridge_agrees(candidate_transform, center_transform)
+            ):
+                inliers.add(index)
+            residual += (
+                math.hypot(
+                    candidate_transform["dx_m"] - center_transform["dx_m"],
+                    candidate_transform["dy_m"] - center_transform["dy_m"],
+                ) / CALIBRATION_PENDING_LOOP_TRANSLATION_M
+                + _angle_distance(
+                    candidate_transform["dyaw_rad"],
+                    center_transform["dyaw_rad"],
+                ) / CALIBRATION_PENDING_LOOP_YAW_RAD
+            )
+        if best is not None and (
+            len(inliers) < best[1]
+            or (len(inliers) == best[1] and residual >= best[2] - 1.0e-12)
+        ):
+            continue
+        best = (center_index, len(inliers), residual)
+    if best is None:
+        return None
+    center_transform = links[best[0]]["_bridge_transform"]
+    return best[0], {
+        index for index, candidate in enumerate(links)
+        if _bridge_agrees(candidate["_bridge_transform"], expected)
+        and _bridge_agrees(candidate["_bridge_transform"], center_transform)
+    }
+
+
+def _validate_v3_bridge(
+    bridge: Any,
+    *,
+    from_epoch: int,
+    to_epoch: int,
+    before_node_id: int,
+    after_node_id: int,
+    from_component: int,
+    to_component: int,
+    expected_transform: dict[str, float],
+) -> int:
+    bridge = _exact_object(
+        bridge,
+        {"type", "independent_node_pairs", "consensus_inlier_ratio",
+         "component", "consensus_transform", "links"},
+        "bridge_evidence",
+    )
+    if _string(bridge["type"], "bridge type") != "multi_link_consensus":
+        raise ShelfEvidenceError("bridge evidence type is unsupported")
+    component = _integer(bridge["component"], "bridge component")
+    if from_component != component or to_component != component:
+        raise ShelfEvidenceError("bridge component does not bind transition endpoints")
+    consensus_transform = _evidence_transform(
+        bridge["consensus_transform"], "consensus_transform"
+    )
+    raw_links = bridge["links"]
+    if not isinstance(raw_links, list) or not 2 <= len(raw_links) <= 16:
+        raise ShelfEvidenceError("bridge links are invalid")
+    parsed_links: list[dict[str, Any]] = []
+    pairs: set[tuple[int, int]] = set()
+    endpoints: set[int] = set()
+    observed_order: list[tuple[int, int]] = []
+    for raw_link in raw_links:
+        link = _exact_object(
+            raw_link,
+            {"from_node_id", "to_node_id", "from_epoch", "to_epoch",
+             "from_component", "to_component", "native_link_type",
+             "measurement", "bridge_transform", "consensus_inlier"},
+            "bridge link",
+        )
+        from_node = _integer(link["from_node_id"], "from_node_id", minimum=1)
+        to_node = _integer(link["to_node_id"], "to_node_id", minimum=1)
+        if (
+            from_node == to_node
+            or from_node > before_node_id
+            or to_node < after_node_id
+            or _integer(link["from_epoch"], "link from_epoch") != from_epoch
+            or _integer(link["to_epoch"], "link to_epoch") != to_epoch
+            or _integer(link["from_component"], "link from_component")
+                != component
+            or _integer(link["to_component"], "link to_component")
+                != component
+            or link["native_link_type"] not in {"global_visual", "local_space"}
+            or type(link["consensus_inlier"]) is not bool
+        ):
+            raise ShelfEvidenceError("bridge link identity is invalid")
+        pair = (min(from_node, to_node), max(from_node, to_node))
+        if pair in pairs or from_node in endpoints or to_node in endpoints:
+            raise ShelfEvidenceError("bridge links are not independent")
+        pairs.add(pair)
+        endpoints.update((from_node, to_node))
+        observed_order.append((from_node, to_node))
+        parsed = dict(link)
+        parsed["_measurement"] = _evidence_transform(
+            link["measurement"], "measurement"
+        )
+        parsed["_bridge_transform"] = _evidence_transform(
+            link["bridge_transform"], "bridge_transform"
+        )
+        parsed_links.append(parsed)
+    if observed_order != sorted(observed_order):
+        raise ShelfEvidenceError("bridge links are not canonically ordered")
+    selection = _bridge_selection(parsed_links, expected_transform)
+    if selection is None:
+        raise ShelfEvidenceError("bridge consensus has no transition-bound center")
+    center_index, inliers = selection
+    expected_count = len(inliers)
+    expected_ratio = expected_count / len(parsed_links)
+    if (
+        expected_count < 2
+        or expected_ratio < CALIBRATION_PENDING_LOOP_INLIER_RATIO
+        or _integer(
+            bridge["independent_node_pairs"],
+            "independent_node_pairs", minimum=2,
+        ) != expected_count
+        or abs(_number(
+            bridge["consensus_inlier_ratio"], "consensus_inlier_ratio"
+        ) - expected_ratio) > 1.0e-12
+        or any(
+            link["consensus_inlier"] != (index in inliers)
+            for index, link in enumerate(parsed_links)
+        )
+        or any(
+            abs(consensus_transform[key]
+                - parsed_links[center_index]["_bridge_transform"][key]) > 1.0e-12
+            for key in ("dx_m", "dy_m")
+        )
+        or _angle_distance(
+            consensus_transform["dyaw_rad"],
+            parsed_links[center_index]["_bridge_transform"]["dyaw_rad"],
+        ) > 1.0e-12
+    ):
+        raise ShelfEvidenceError("bridge consensus summary is invalid")
+    return len(parsed_links)
+
+
 def _validate_pose(value: dict[str, Any]) -> None:
     source = _integer(value["from_epoch"], "from_epoch")
-    if _integer(value["to_epoch"], "to_epoch") != source + 1:
+    target = _integer(value["to_epoch"], "to_epoch")
+    if target != source + 1:
         raise ShelfEvidenceError("pose epoch transition is not contiguous")
     before = _number(value["before_frame_timestamp"], "before timestamp")
     after = _number(value["after_frame_timestamp"], "after timestamp")
     if after < before:
         raise ShelfEvidenceError("pose epoch timestamps are reversed")
-    _integer(value["before_node_id"], "before_node_id", minimum=1)
-    _integer(value["after_node_id"], "after_node_id", minimum=1)
-    transform = _exact_object(
-        value["transform"], {"dx_m", "dy_m", "dyaw_rad"}, "transform"
-    )
-    for key in transform:
-        _number(transform[key], f"transform.{key}")
+    before_node_id = _integer(value["before_node_id"], "before_node_id", minimum=1)
+    after_node_id = _integer(value["after_node_id"], "after_node_id", minimum=1)
+    transform = _evidence_transform(value["transform"], "transform")
     bridges = value["bridge_evidence"]
     if not isinstance(bridges, list) or len(bridges) > 16:
         raise ShelfEvidenceError("bridge_evidence is invalid")
+    if value["version"] == 3:
+        from_component = _integer(value["from_component"], "from_component")
+        to_component = _integer(value["to_component"], "to_component")
+        total_links = sum(
+            _validate_v3_bridge(
+                bridge,
+                from_epoch=source,
+                to_epoch=target,
+                before_node_id=before_node_id,
+                after_node_id=after_node_id,
+                from_component=from_component,
+                to_component=to_component,
+                expected_transform=transform,
+            )
+            for bridge in bridges
+        )
+        if total_links > 16:
+            raise ShelfEvidenceError("pose transition bridge-link capacity exceeded")
+        components = [bridge["component"] for bridge in bridges]
+        if len(set(components)) != len(components):
+            raise ShelfEvidenceError("duplicate bridge component")
+        _string(value["reason"], "reason")
+        return
     for bridge in bridges:
         bridge = _exact_object(
             bridge,
@@ -472,7 +679,7 @@ def validate_shelf_evidence_record(
     tracking_session_id: str,
     prior_map_sha256: str,
 ) -> None:
-    if name not in ROOT_FIELDS:
+    if name not in ROOT_FIELDS_V3:
         raise ShelfEvidenceError(f"unsupported shelf evidence file: {name}")
     _validate_common(name, line, record, tracking_session_id)
     if name == "pose_epoch_transitions.jsonl":
@@ -486,7 +693,8 @@ def validate_shelf_evidence_record(
 
 
 def _has_epoch_bridge(
-    transitions: tuple[dict[str, Any], ...], first_epoch: int, second_epoch: int
+    transitions: tuple[dict[str, Any], ...], first_epoch: int, second_epoch: int,
+    component: int,
 ) -> bool:
     if first_epoch == second_epoch:
         return True
@@ -494,7 +702,11 @@ def _has_epoch_bridge(
     bridged = {
         int(item["from_epoch"])
         for item in transitions
-        if item["bridge_evidence"]
+        if item["version"] >= 3
+        and any(
+            int(evidence["component"]) == component
+            for evidence in item["bridge_evidence"]
+        )
     }
     return all(epoch in bridged for epoch in range(low, high))
 
@@ -520,7 +732,6 @@ def _validate_loop_references(
     if (
         first["shelf_candidates"][0]["shelf_segment_id"] != shelf_id
         or second["shelf_candidates"][0]["shelf_segment_id"] != shelf_id
-        or first["component"] != second["component"]
         or loop["component"] != first["component"]
         or first["side"] == second["side"]
         or loop["sides"] != [first["side"], second["side"]]
@@ -537,7 +748,13 @@ def _validate_loop_references(
         )
     ):
         raise ShelfEvidenceError("loop shelf/side/component identity mismatch")
-    if not _has_epoch_bridge(transitions, first["epoch"], second["epoch"]):
+    if first["component"] != second["component"]:
+        if loop["accepted"]:
+            raise ShelfEvidenceError("accepted loop crosses graph component")
+        return
+    if not _has_epoch_bridge(
+        transitions, first["epoch"], second["epoch"], int(loop["component"])
+    ):
         if loop["accepted"]:
             raise ShelfEvidenceError("accepted loop crosses epoch without bridge")
         return
@@ -605,7 +822,7 @@ def read_shelf_localization_evidence(
     prior_map_sha256 = _string(metadata.get("priorMapSha256"), "priorMapSha256")
     values: dict[str, tuple[dict[str, Any], ...]] = {}
     hashes: dict[str, str] = {}
-    for name in ROOT_FIELDS:
+    for name in ROOT_FIELDS_V3:
         count_key, last_key = WATERMARKS[name]
         expected_count = _integer(metadata.get(count_key), count_key)
         expected_last = metadata.get(last_key)
@@ -648,7 +865,7 @@ def validate_shelf_localization_records(
     prior_map_sha256 = _string(
         metadata.get("priorMapSha256"), "priorMapSha256"
     )
-    for name in ROOT_FIELDS:
+    for name in ROOT_FIELDS_V3:
         if name not in values:
             raise ShelfEvidenceError(f"{name} is absent from manifest-v5 input")
         count_key, last_key = WATERMARKS[name]

@@ -134,6 +134,69 @@ bool getNodeTimeOffsetNative(const void *object, double * offset)
     return native(object)->getNodeTimeOffset(*offset);
 }
 
+bool getLoopClosureLinkSnapshotNative(
+        const void *object,
+        int32_t expectedFromNodeId,
+        int32_t expectedToNodeId,
+        int32_t * fromNodeId,
+        int32_t * toNodeId,
+        int32_t * fromNodeMapId,
+        int32_t * toNodeMapId,
+        int32_t * linkType,
+        uint64_t * generation,
+        float * x, float * y, float * z,
+        float * qx, float * qy, float * qz, float * qw)
+{
+    int32_t * integerOutputs[] = {
+        fromNodeId, toNodeId, fromNodeMapId, toNodeMapId, linkType};
+    for(int32_t * output : integerOutputs)
+    {
+        if(output)
+        {
+            *output = 0;
+        }
+    }
+    if(generation)
+    {
+        *generation = 0;
+    }
+    float * transformOutputs[] = {x, y, z, qx, qy, qz, qw};
+    for(float * output : transformOutputs)
+    {
+        if(output)
+        {
+            *output = 0.0f;
+        }
+    }
+    if(!object || expectedFromNodeId <= 0 || expectedToNodeId <= 0 ||
+       !fromNodeId || !toNodeId || !fromNodeMapId || !toNodeMapId ||
+       !linkType || !generation || !x || !y || !z || !qx || !qy || !qz ||
+       !qw)
+    {
+        return false;
+    }
+    LoopClosureLinkSnapshot snapshot;
+    if(!native(object)->getLoopClosureLinkSnapshot(
+            expectedFromNodeId, expectedToNodeId, snapshot))
+    {
+        return false;
+    }
+    *fromNodeId = snapshot.fromNodeId;
+    *toNodeId = snapshot.toNodeId;
+    *fromNodeMapId = snapshot.fromNodeMapId;
+    *toNodeMapId = snapshot.toNodeMapId;
+    *linkType = snapshot.linkType;
+    *generation = snapshot.generation;
+    *x = snapshot.x;
+    *y = snapshot.y;
+    *z = snapshot.z;
+    *qx = snapshot.qx;
+    *qy = snapshot.qy;
+    *qz = snapshot.qz;
+    *qw = snapshot.qw;
+    return true;
+}
+
 void setScreenRotationNative(const void *object, int displayRotation)
 {
     if(object)

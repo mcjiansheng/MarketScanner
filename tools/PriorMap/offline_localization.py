@@ -1988,7 +1988,7 @@ def _shelf_jsonl_contract(
     return JsonlContract(
         file_name.removesuffix(".jsonl"),
         record_format,
-        frozenset({1}),
+        frozenset({1, 2, 3}),
         True,
         True,
         timestamp_fields,

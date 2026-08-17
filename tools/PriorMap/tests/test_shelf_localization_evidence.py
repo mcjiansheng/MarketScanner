@@ -138,6 +138,74 @@ def loop(*, accepted: bool = True) -> dict[str, object]:
     }
 
 
+def bridge_link(
+    from_node: int,
+    to_node: int,
+    *,
+    dx: float,
+    dy: float = 0.0,
+    yaw: float = 0.01,
+    component: int = 0,
+    inlier: bool = True,
+) -> dict[str, object]:
+    return {
+        "from_node_id": from_node,
+        "to_node_id": to_node,
+        "from_epoch": 1,
+        "to_epoch": 2,
+        "from_component": component,
+        "to_component": component,
+        "native_link_type": "global_visual",
+        "measurement": {"dx_m": 3.0, "dy_m": 0.1, "dyaw_rad": 0.02},
+        "bridge_transform": {"dx_m": dx, "dy_m": dy, "dyaw_rad": yaw},
+        "consensus_inlier": inlier,
+    }
+
+
+def transition(
+    links: list[dict[str, object]],
+    *,
+    component: int = 0,
+    consensus_transform: dict[str, float] | None = None,
+    independent_node_pairs: int | None = None,
+    consensus_inlier_ratio: float | None = None,
+) -> dict[str, object]:
+    inlier_count = sum(item["consensus_inlier"] is True for item in links)
+    return {
+        "format": "MarketScannerPoseEpochTransition",
+        "version": 3,
+        "tracking_session_id": SESSION,
+        "sequence": 1,
+        "from_epoch": 1,
+        "to_epoch": 2,
+        "before_frame_timestamp": 5.0,
+        "after_frame_timestamp": 6.0,
+        "before_node_id": 5,
+        "after_node_id": 6,
+        "from_component": component,
+        "to_component": component,
+        "transform": {"dx_m": 0.1, "dy_m": 0.0, "dyaw_rad": 0.01},
+        "bridge_evidence": [{
+            "type": "multi_link_consensus",
+            "independent_node_pairs": (
+                inlier_count if independent_node_pairs is None
+                else independent_node_pairs
+            ),
+            "consensus_inlier_ratio": (
+                inlier_count / len(links) if consensus_inlier_ratio is None
+                else consensus_inlier_ratio
+            ),
+            "component": component,
+            "consensus_transform": consensus_transform or dict(
+                links[0]["bridge_transform"]
+            ),
+            "links": links,
+        }],
+        "reason": "arkit_world_rebuild",
+        "write_watermark": 1,
+    }
+
+
 def values() -> dict[str, tuple[dict[str, object], ...]]:
     return {
         "pose_epoch_transitions.jsonl": (),
@@ -231,6 +299,245 @@ class ShelfLocalizationEvidenceTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(ShelfEvidenceError, "without bridge"):
             validate_shelf_localization_records(records, metadata())
+
+    def test_cross_epoch_two_independent_consistent_native_links_are_accepted(
+        self,
+    ) -> None:
+        records = values()
+        second = dict(records["shelf_observation_windows.jsonl"][1])
+        second["epoch"] = 2
+        records["shelf_observation_windows.jsonl"] = (
+            records["shelf_observation_windows.jsonl"][0], second
+        )
+        records["pose_epoch_transitions.jsonl"] = (transition([
+            bridge_link(4, 7, dx=0.10),
+            bridge_link(5, 8, dx=0.12, dy=0.01, yaw=0.02),
+        ]),)
+        bundle = validate_shelf_localization_records(
+            records,
+            metadata(
+                poseEpochTransitionCount=1,
+                poseEpochTransitionLastSequence=1,
+            ),
+        )
+        self.assertEqual(len(bundle.accepted_shelf_loops), 1)
+
+    def test_cross_epoch_single_native_link_is_not_a_bridge(self) -> None:
+        records = values()
+        records["pose_epoch_transitions.jsonl"] = (transition(
+            [bridge_link(5, 7, dx=0.10)],
+            independent_node_pairs=1,
+            consensus_inlier_ratio=1.0,
+        ),)
+        with self.assertRaisesRegex(ShelfEvidenceError, "bridge links"):
+            validate_shelf_localization_records(
+                records,
+                metadata(
+                    poseEpochTransitionCount=1,
+                    poseEpochTransitionLastSequence=1,
+                ),
+            )
+
+    def test_cross_epoch_chain_requires_every_adjacent_bridge(self) -> None:
+        records = values()
+        second = dict(records["shelf_observation_windows.jsonl"][1])
+        second["epoch"] = 3
+        records["shelf_observation_windows.jsonl"] = (
+            records["shelf_observation_windows.jsonl"][0], second
+        )
+        records["pose_epoch_transitions.jsonl"] = (transition([
+            bridge_link(4, 7, dx=0.10),
+            bridge_link(5, 8, dx=0.12, dy=0.01, yaw=0.02),
+        ]),)
+        with self.assertRaisesRegex(ShelfEvidenceError, "without bridge"):
+            validate_shelf_localization_records(
+                records,
+                metadata(
+                    poseEpochTransitionCount=1,
+                    poseEpochTransitionLastSequence=1,
+                ),
+            )
+
+    def test_duplicate_or_shared_bridge_endpoints_are_rejected(self) -> None:
+        for links in (
+            [
+                bridge_link(4, 7, dx=0.10),
+                bridge_link(4, 7, dx=0.11),
+            ],
+            [
+                bridge_link(4, 7, dx=0.10),
+                bridge_link(5, 7, dx=0.11),
+            ],
+        ):
+            with self.subTest(links=links):
+                records = values()
+                records["pose_epoch_transitions.jsonl"] = (transition(links),)
+                with self.assertRaisesRegex(
+                    ShelfEvidenceError, "not independent"
+                ):
+                    validate_shelf_localization_records(
+                        records,
+                        metadata(
+                            poseEpochTransitionCount=1,
+                            poseEpochTransitionLastSequence=1,
+                        ),
+                    )
+
+    def test_reversed_node_pair_cannot_be_a_second_witness(self) -> None:
+        records = values()
+        records["pose_epoch_transitions.jsonl"] = (transition([
+            bridge_link(4, 7, dx=0.10),
+            bridge_link(7, 4, dx=0.11),
+        ]),)
+        with self.assertRaisesRegex(ShelfEvidenceError, "identity is invalid"):
+            validate_shelf_localization_records(
+                records,
+                metadata(
+                    poseEpochTransitionCount=1,
+                    poseEpochTransitionLastSequence=1,
+                ),
+            )
+
+    def test_conflicting_bridge_transforms_are_rejected(self) -> None:
+        records = values()
+        records["pose_epoch_transitions.jsonl"] = (transition([
+            bridge_link(4, 7, dx=0.10),
+            bridge_link(5, 8, dx=2.00, yaw=1.0),
+        ]),)
+        with self.assertRaisesRegex(ShelfEvidenceError, "consensus summary"):
+            validate_shelf_localization_records(
+                records,
+                metadata(
+                    poseEpochTransitionCount=1,
+                    poseEpochTransitionLastSequence=1,
+                ),
+            )
+
+    def test_bridge_links_must_be_canonically_ordered(self) -> None:
+        records = values()
+        records["pose_epoch_transitions.jsonl"] = (transition([
+            bridge_link(5, 8, dx=0.12, dy=0.01, yaw=0.02),
+            bridge_link(4, 7, dx=0.10),
+        ]),)
+        with self.assertRaisesRegex(ShelfEvidenceError, "canonically ordered"):
+            validate_shelf_localization_records(
+                records,
+                metadata(
+                    poseEpochTransitionCount=1,
+                    poseEpochTransitionLastSequence=1,
+                ),
+            )
+
+    def test_bridge_medoid_tie_break_matches_swift(self) -> None:
+        links = [
+            bridge_link(3, 7, dx=0.10000000000000),
+            bridge_link(4, 8, dx=0.10000000000010),
+            bridge_link(5, 9, dx=0.10000000000021),
+        ]
+        records = values()
+        records["pose_epoch_transitions.jsonl"] = (transition(
+            links,
+            consensus_transform=dict(links[0]["bridge_transform"]),
+            independent_node_pairs=3,
+            consensus_inlier_ratio=1.0,
+        ),)
+        validate_shelf_localization_records(
+            records,
+            metadata(
+                poseEpochTransitionCount=1,
+                poseEpochTransitionLastSequence=1,
+            ),
+        )
+
+    def test_duplicate_bridge_component_is_rejected(self) -> None:
+        record = transition([
+            bridge_link(4, 7, dx=0.10),
+            bridge_link(5, 8, dx=0.12, dy=0.01, yaw=0.02),
+        ])
+        record["bridge_evidence"].append(dict(record["bridge_evidence"][0]))
+        records = values()
+        records["pose_epoch_transitions.jsonl"] = (record,)
+        with self.assertRaisesRegex(ShelfEvidenceError, "duplicate bridge component"):
+            validate_shelf_localization_records(
+                records,
+                metadata(
+                    poseEpochTransitionCount=1,
+                    poseEpochTransitionLastSequence=1,
+                ),
+            )
+
+    def test_duplicate_pose_epoch_transition_is_rejected(self) -> None:
+        first = transition([
+            bridge_link(4, 7, dx=0.10),
+            bridge_link(5, 8, dx=0.12, dy=0.01, yaw=0.02),
+        ])
+        second = json.loads(json.dumps(first))
+        second["sequence"] = 2
+        second["write_watermark"] = 2
+        records = values()
+        records["pose_epoch_transitions.jsonl"] = (first, second)
+        with self.assertRaisesRegex(ShelfEvidenceError, "duplicate pose epoch"):
+            validate_shelf_localization_records(
+                records,
+                metadata(
+                    poseEpochTransitionCount=2,
+                    poseEpochTransitionLastSequence=2,
+                ),
+            )
+
+    def test_bridge_component_must_bind_transition_and_loop_component(self) -> None:
+        records = values()
+        bad_links = [
+            bridge_link(4, 7, dx=0.10, component=1),
+            bridge_link(5, 8, dx=0.12, component=1),
+        ]
+        records["pose_epoch_transitions.jsonl"] = (
+            transition(bad_links, component=0),
+        )
+        with self.assertRaisesRegex(ShelfEvidenceError, "identity is invalid"):
+            validate_shelf_localization_records(
+                records,
+                metadata(
+                    poseEpochTransitionCount=1,
+                    poseEpochTransitionLastSequence=1,
+                ),
+            )
+
+    def test_legacy_v2_aggregate_bridge_never_authorizes_cross_epoch(self) -> None:
+        records = values()
+        second = dict(records["shelf_observation_windows.jsonl"][1])
+        second["epoch"] = 2
+        records["shelf_observation_windows.jsonl"] = (
+            records["shelf_observation_windows.jsonl"][0], second
+        )
+        records["pose_epoch_transitions.jsonl"] = ({
+            "format": "MarketScannerPoseEpochTransition",
+            "version": 2,
+            "tracking_session_id": SESSION,
+            "sequence": 1,
+            "from_epoch": 1,
+            "to_epoch": 2,
+            "before_frame_timestamp": 5.0,
+            "after_frame_timestamp": 6.0,
+            "before_node_id": 5,
+            "after_node_id": 6,
+            "transform": {"dx_m": 0.1, "dy_m": 0.0, "dyaw_rad": 0.01},
+            "bridge_evidence": [{
+                "type": "multi_link_consensus",
+                "independent_node_pairs": 2,
+                "consensus_inlier_ratio": 1.0,
+            }],
+            "reason": "arkit_world_rebuild",
+            "write_watermark": 1,
+        },)
+        with self.assertRaisesRegex(ShelfEvidenceError, "without bridge"):
+            validate_shelf_localization_records(
+                records,
+                metadata(
+                    poseEpochTransitionCount=1,
+                    poseEpochTransitionLastSequence=1,
+                ),
+            )
 
     def test_ambiguous_shelf_margin_cannot_be_promoted_to_loop_factor(self) -> None:
         records = values()

@@ -2549,7 +2549,8 @@ final class SupermarketScanSession {
     @discardableResult
     func appendPoseEpochTransition(
         _ record: PoseEpochTransitionRecord,
-        expectedTrackingSessionId: String
+        expectedTrackingSessionId: String,
+        allowDuringFinalization: Bool = false
     ) -> Bool {
         appendShelfLocalizationEvidence(
             record,
@@ -2557,7 +2558,8 @@ final class SupermarketScanSession {
             expectedTrackingSessionId: expectedTrackingSessionId,
             sequence: record.sequence,
             valid: record.isValid,
-            counter: .poseEpochTransition)
+            counter: .poseEpochTransition,
+            allowDuringFinalization: allowDuringFinalization)
     }
 
     @discardableResult
@@ -2633,9 +2635,11 @@ final class SupermarketScanSession {
         expectedTrackingSessionId: String,
         sequence: Int,
         valid: Bool,
-        counter: ShelfEvidenceCounter
+        counter: ShelfEvidenceCounter,
+        allowDuringFinalization: Bool = false
     ) -> Bool {
-        guard localizationAdmissionGate.beginTransaction() == nil else {
+        guard localizationAdmissionGate.beginTransaction(
+                allowDuringFinalization: allowDuringFinalization) == nil else {
             return false
         }
         defer { localizationAdmissionGate.endTransaction() }
@@ -2658,7 +2662,8 @@ final class SupermarketScanSession {
         let result = appendLocalizationRecord(
             record,
             fileName: fileName,
-            expectedTrackingSessionId: expectedTrackingSessionId)
+            expectedTrackingSessionId: expectedTrackingSessionId,
+            allowDuringFinalization: allowDuringFinalization)
         captureLock.lock()
         if result.succeeded {
             incrementShelfEvidenceCountLocked(counter)
